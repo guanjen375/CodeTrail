@@ -12,7 +12,8 @@ import requests
 from pathlib import Path
 
 from config import (
-    OLLAMA_GENERATE_URL, MODEL, NUM_CTX, NUM_CTX_FULL_MODE,
+    OLLAMA_GENERATE_URL, OLLAMA_TAGS_URL, OLLAMA_PS_URL,
+    MODEL, NUM_CTX, NUM_CTX_FULL_MODE,
     CODE_EXTENSIONS, IGNORED_DIRS, IGNORED_FILES, IGNORED_PATTERNS,
     STRICT_MODE, STRICT_MODE_KEYWORDS, SPEC_QUESTION_KEYWORDS,
     STRICT_MODE_TEMPERATURE, WEAK_REF_THRESHOLD
@@ -22,11 +23,11 @@ from config import (
 def check_ollama_gpu() -> tuple[bool, str]:
     """檢查 Ollama GPU 狀態"""
     try:
-        resp = requests.get("http://localhost:11434/api/tags", timeout=5)
+        resp = requests.get(OLLAMA_TAGS_URL, timeout=5)
         if resp.status_code != 200:
             return False, "[ERROR] Ollama 服務異常"
 
-        resp = requests.get("http://localhost:11434/api/ps", timeout=5)
+        resp = requests.get(OLLAMA_PS_URL, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
             models = data.get("models", [])

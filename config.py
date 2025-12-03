@@ -7,8 +7,13 @@
 # ============================================================
 # Ollama 設定
 # ============================================================
-OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
-OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+# 所有 Ollama API URL 都從這裡集中管理，方便切換遠端或改 port
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_GENERATE_URL = f"{OLLAMA_BASE_URL}/api/generate"
+OLLAMA_CHAT_URL = f"{OLLAMA_BASE_URL}/api/chat"
+OLLAMA_EMBEDDINGS_URL = f"{OLLAMA_BASE_URL}/api/embeddings"
+OLLAMA_TAGS_URL = f"{OLLAMA_BASE_URL}/api/tags"
+OLLAMA_PS_URL = f"{OLLAMA_BASE_URL}/api/ps"
 MODEL = "qwen3-coder:30b"
 VL_MODEL = "qwen3-vl:30b-a3b"
 

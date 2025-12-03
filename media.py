@@ -29,13 +29,21 @@ def set_sandbox_root(root: str) -> None:
 
 
 def _safe_path(path: str) -> Optional[Path]:
-    """驗證路徑是否在 sandbox 內，防止讀取任意本機檔案"""
+    """驗證路徑是否在 sandbox 內，防止讀取任意本機檔案
+
+    相對路徑會以 _SANDBOX_ROOT 為基準解析，而非當前工作目錄
+    """
     if _SANDBOX_ROOT is None:
         # 未設定 sandbox 時，拒絕所有請求
         return None
 
     try:
-        full = Path(path).expanduser().resolve()
+        p = Path(path).expanduser()
+        # 相對路徑以 sandbox root 為基準，絕對路徑直接使用
+        if not p.is_absolute():
+            full = (_SANDBOX_ROOT / p).resolve()
+        else:
+            full = p.resolve()
         # 檢查是否在 sandbox 內
         full.relative_to(_SANDBOX_ROOT)
         return full

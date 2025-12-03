@@ -33,7 +33,7 @@ from utils import (
 # ============================================================
 # Native Tools 定義
 # ============================================================
-NATIVE_TOOLS = [
+_BASE_TOOLS = [
     {
         "type": "function",
         "function": {
@@ -95,22 +95,27 @@ NATIVE_TOOLS = [
             }
         }
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_command",
-            "description": "執行測試命令（白名單：pytest, ctest, npm test, cargo test, go test）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "要執行的命令，如 'pytest test_xxx.py -v' 或 'go test ./...'"},
-                    "timeout": {"type": "integer", "description": "超時秒數，預設 60"}
-                },
-                "required": ["command"]
-            }
+]
+
+_RUN_COMMAND_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "run_command",
+        "description": "執行測試命令（白名單：pytest, ctest, npm test, cargo test, go test）",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "要執行的命令，如 'pytest test_xxx.py -v' 或 'go test ./...'"},
+                "timeout": {"type": "integer", "description": "超時秒數，預設 60"}
+            },
+            "required": ["command"]
         }
     }
-]
+}
+
+# 根據 RUN_COMMAND_ENABLED 動態決定是否包含 run_command tool
+# 避免模型浪費回合去呼叫已停用的工具
+NATIVE_TOOLS = _BASE_TOOLS + ([_RUN_COMMAND_TOOL] if RUN_COMMAND_ENABLED else [])
 
 
 def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:

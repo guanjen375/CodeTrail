@@ -20,7 +20,8 @@ except ImportError:
 from config import (
     CODE_EXTENSIONS, IGNORED_DIRS, EMBEDDING_MODEL,
     CODE_RAG_ENABLED, CODE_RAG_TOP_K, CODE_RAG_CACHE_FILE,
-    CODE_RAG_THRESHOLD, CODE_RAG_THRESHOLD_BUG
+    CODE_RAG_THRESHOLD, CODE_RAG_THRESHOLD_BUG,
+    OLLAMA_EMBEDDINGS_URL
 )
 from utils import should_ignore_file
 
@@ -77,9 +78,18 @@ class CodeRAG:
                 if meta.get("folder_hash") != folder_hash:
                     return False
 
+                # 檢查 embedding model 是否一致，不一致則需重建
+                if meta.get("embedding_model") != EMBEDDING_MODEL:
+                    return False
+
                 self.index = meta.get("index", [])
                 emb_data = np.load(self.cache_emb_file)
                 self.embeddings = emb_data['embeddings']
+
+                # 驗證 embedding 維度與快取記錄一致
+                cached_dim = meta.get("embedding_dim")
+                if cached_dim is not None and self.embeddings.shape[1] != cached_dim:
+                    return False
 
                 if len(self.index) > 0 and self.embeddings is not None:
                     return True
@@ -129,9 +139,12 @@ class CodeRAG:
     def _save_cache(self):
         """儲存快取（新格式：metadata JSON + embedding npz）"""
         try:
-            # 準備 metadata（不含 embedding）
+            # 準備 metadata（不含 embedding），包含 embedding model 與維度資訊
+            emb_dim = self.embeddings.shape[1] if HAS_NUMPY and self.embeddings is not None else None
             meta = {
                 "folder_hash": self._compute_folder_hash(),
+                "embedding_model": EMBEDDING_MODEL,
+                "embedding_dim": emb_dim,
                 "index": self.index
             }
             with open(self.cache_meta_file, 'w', encoding='utf-8') as f:
@@ -249,7 +262,7 @@ class CodeRAG:
         """取得 embedding"""
         try:
             resp = requests.post(
-                "http://localhost:11434/api/embeddings",
+                OLLAMA_EMBEDDINGS_URL,
                 json={"model": EMBEDDING_MODEL, "prompt": text},
                 timeout=60
             )

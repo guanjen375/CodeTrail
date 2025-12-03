@@ -10,7 +10,8 @@ import requests
 from pathlib import Path
 
 from config import (
-    OLLAMA_GENERATE_URL, MODEL, KNOWLEDGE_FILE,
+    OLLAMA_GENERATE_URL, OLLAMA_EMBEDDINGS_URL, OLLAMA_TAGS_URL,
+    MODEL, KNOWLEDGE_FILE,
     KNOWLEDGE_TOP_K, KNOWLEDGE_CANDIDATE_K, KNOWLEDGE_THRESHOLD,
     KNOWLEDGE_THRESHOLD_SHORT, KNOWLEDGE_SHORT_QUERY_TOKENS,
     DYNAMIC_THRESHOLD_RATIO, DYNAMIC_TOP_K_HIGH_SCORE,
@@ -60,7 +61,7 @@ class KnowledgeBase:
             return self._reranker_available
 
         try:
-            resp = requests.get("http://localhost:11434/api/tags", timeout=5)
+            resp = requests.get(OLLAMA_TAGS_URL, timeout=5)
             if resp.status_code == 200:
                 models = [m.get("name", "") for m in resp.json().get("models", [])]
                 self._reranker_available = any(
@@ -87,7 +88,7 @@ class KnowledgeBase:
     def _get_embedding(self, text: str) -> list:
         try:
             resp = requests.post(
-                "http://localhost:11434/api/embeddings",
+                OLLAMA_EMBEDDINGS_URL,
                 json={"model": EMBEDDING_MODEL, "prompt": text},
                 timeout=120
             )
