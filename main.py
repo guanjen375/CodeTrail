@@ -258,7 +258,8 @@ def main():
                 result = analyze_full(ctx, clean_q, img_ctx, knowledge_ctx)
             elif is_followup:
                 print("[TIP] 偵測到追問\n")
-                result = handle_followup(clean_q, qa_history)
+                # 追問也傳入 knowledge_ctx，避免純聊天式回答
+                result = handle_followup(clean_q, qa_history, knowledge_ctx=knowledge_ctx)
             else:
                 result = run_agent(folder, clean_q, img_ctx, prev_qa=qa_history,
                                   knowledge_ctx=knowledge_ctx, code_rag=code_rag)

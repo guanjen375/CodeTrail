@@ -118,18 +118,20 @@ def scan_project_metadata(folder: str) -> list[dict]:
     """掃描專案取得檔案元資料（不讀取內容）"""
     files = []
     folder_path = Path(folder).resolve()
-    self_name = Path(sys.argv[0]).resolve().name
+    self_path = Path(sys.argv[0]).resolve()
 
     for dirpath, dirnames, filenames in os.walk(folder_path):
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith('.')]
 
         for filename in filenames:
-            if filename == self_name:
-                continue
             if filename.startswith('.'):
                 continue
 
             filepath = Path(dirpath) / filename
+
+            # 只排除「同一路徑的執行檔」，而非同名檔案
+            if filepath.resolve() == self_path:
+                continue
 
             if filepath.is_symlink() and not filepath.exists():
                 continue
@@ -162,18 +164,20 @@ def scan_project(folder: str) -> dict[str, str]:
     """掃描專案取得檔案內容"""
     files = {}
     folder_path = Path(folder).resolve()
-    self_name = Path(sys.argv[0]).resolve().name
+    self_path = Path(sys.argv[0]).resolve()
 
     for dirpath, dirnames, filenames in os.walk(folder_path):
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith('.')]
 
         for filename in filenames:
-            if filename == self_name:
-                continue
             if filename.startswith('.'):
                 continue
 
             filepath = Path(dirpath) / filename
+
+            # 只排除「同一路徑的執行檔」，而非同名檔案
+            if filepath.resolve() == self_path:
+                continue
 
             if filepath.is_symlink() and not filepath.exists():
                 continue

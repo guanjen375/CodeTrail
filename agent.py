@@ -99,11 +99,11 @@ NATIVE_TOOLS = [
         "type": "function",
         "function": {
             "name": "run_command",
-            "description": "執行測試或建置命令（白名單：pytest, make test, npm test, cargo test, go test 等）",
+            "description": "執行測試命令（白名單：pytest, ctest, npm test, cargo test, go test）",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "要執行的命令，如 'pytest test_xxx.py -v'"},
+                    "command": {"type": "string", "description": "要執行的命令，如 'pytest test_xxx.py -v' 或 'go test ./...'"},
                     "timeout": {"type": "integer", "description": "超時秒數，預設 60"}
                 },
                 "required": ["command"]
@@ -503,7 +503,8 @@ STACK_TRACE_PATTERNS = [
     r'(.+?):(\d+):(?:\d+:)?\s*warning',
     r'at (.+?):(\d+):',
     r'^\s+at .+?\((.+?):(\d+):\d+\)',
-    r'(.+?)\.(?:cpp|c|h|py|rs|go|java):(\d+)',
+    # 修正：把副檔名包含進 group(1)，避免取得缺副檔名的路徑
+    r'(.+?\.(?:cpp|c|h|py|rs|go|java)):(\d+)',
 ]
 
 
@@ -522,12 +523,32 @@ def extract_stack_locations(text: str) -> list[tuple[str, int]]:
     return locations
 
 
-def handle_followup(question: str, prev_qa: list) -> str:
-    """處理追問"""
+def handle_followup(question: str, prev_qa: list, knowledge_ctx: str = "",
+                    code_rag_context: str = "") -> str:
+    """處理追問
+
+    Args:
+        question: 追問內容
+        prev_qa: 歷史對話列表
+        knowledge_ctx: 知識庫上下文（REF 資料）
+        code_rag_context: Code RAG 預讀的程式碼上下文
+    """
     prev_q, prev_a = prev_qa[-1]
 
-    prompt = f"""你是程式碼分析助手。
+    # 構建上下文區塊（避免追問時變成純聊天）
+    context_parts = []
 
+    if knowledge_ctx:
+        context_parts.append(f"【參考資料】\n{knowledge_ctx}")
+
+    if code_rag_context:
+        context_parts.append(f"【相關程式碼】\n{code_rag_context}")
+
+    context_block = "\n\n".join(context_parts)
+    context_section = f"\n{context_block}\n" if context_block else ""
+
+    prompt = f"""你是程式碼分析助手。
+{context_section}
 【之前的對話】
 用戶問：{prev_q}
 
@@ -537,7 +558,8 @@ def handle_followup(question: str, prev_qa: list) -> str:
 【用戶現在補充】
 {question}
 
-請根據之前的回答，直接給出針對這個補充條件的具體答案。
+請根據之前的回答與上方的參考資料/程式碼，直接給出針對這個補充條件的具體答案。
+重要：若有 [REF] 參考資料，必須以 REF 為準；若有相關程式碼，回答需基於程式碼內容。
 用繁體中文回答，簡潔明瞭。"""
     return call_llm_stream(prompt)
 
@@ -648,7 +670,7 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
         task_hint = f"""{no_evidence_warning}
 【Bug 修復模式 - 重要】
 請務必嘗試以下步驟：
-1. 先用 run_command 執行測試命令來重現問題（如 pytest, make test, npm test, cargo test, go test）
+1. 先用 run_command 執行測試命令來重現問題（如 pytest, ctest, npm test, cargo test, go test）
 2. 分析測試輸出，找出具體的錯誤訊息和失敗點
 3. 根據錯誤訊息，定位問題程式碼
 4. 提出具體的修改建議
@@ -659,7 +681,7 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
         task_hint = ""
 
     run_cmd_hint = """
-8. 可用 run_command 執行測試（如 pytest, make test）來驗證想法""" if RUN_COMMAND_ENABLED else ""
+8. 可用 run_command 執行測試（如 pytest, ctest, npm test, cargo test, go test）來驗證想法""" if RUN_COMMAND_ENABLED else ""
 
     is_creative = any(kw in q_lower for kw in ['refactor', '重構', '設計', '架構', 'design', 'architecture', '建議', 'suggest'])
 

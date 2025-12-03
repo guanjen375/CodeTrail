@@ -11,6 +11,12 @@ import hashlib
 import requests
 from pathlib import Path
 
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
 from config import (
     CODE_EXTENSIONS, IGNORED_DIRS, EMBEDDING_MODEL,
     CODE_RAG_ENABLED, CODE_RAG_TOP_K, CODE_RAG_CACHE_FILE,
@@ -24,12 +30,23 @@ class CodeRAG:
     專案級程式碼 RAG：
     - 動態建立程式碼索引（函式/類別級別）
     - 用於 Agent 模式的「第一層縮小範圍」
+
+    快取優化：
+    - 使用 numpy .npz 二進位格式儲存 embedding 向量（壓縮率高）
+    - metadata (path, symbol, type, line, context) 單獨存 JSON
+    - 快取檔案大小降低約 5-10 倍
     """
 
     def __init__(self, folder: str):
         self.folder = Path(folder).resolve()
-        self.cache_file = self.folder / CODE_RAG_CACHE_FILE
+        # 新的快取檔案：metadata 用 JSON，embedding 用 npz
+        cache_base = CODE_RAG_CACHE_FILE.replace('.json', '')
+        self.cache_meta_file = self.folder / f"{cache_base}_meta.json"
+        self.cache_emb_file = self.folder / f"{cache_base}_emb.npz"
+        # 舊版快取檔案（用於向後相容）
+        self.legacy_cache_file = self.folder / CODE_RAG_CACHE_FILE
         self.index = []
+        self.embeddings = None  # numpy array, shape: (N, embedding_dim)
 
     def _compute_folder_hash(self) -> str:
         """計算資料夾的 hash（用於快取驗證）"""
@@ -48,31 +65,81 @@ class CodeRAG:
         return hashlib.md5("\n".join(files).encode()).hexdigest()
 
     def _load_cache(self) -> bool:
-        """嘗試載入快取"""
-        if not self.cache_file.exists():
-            return False
+        """嘗試載入快取（優先新格式，向後相容舊格式）"""
+        folder_hash = self._compute_folder_hash()
 
-        try:
-            with open(self.cache_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+        # 嘗試載入新格式快取（metadata JSON + embedding npz）
+        if self.cache_meta_file.exists() and self.cache_emb_file.exists() and HAS_NUMPY:
+            try:
+                with open(self.cache_meta_file, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
 
-            if data.get("folder_hash") != self._compute_folder_hash():
+                if meta.get("folder_hash") != folder_hash:
+                    return False
+
+                self.index = meta.get("index", [])
+                emb_data = np.load(self.cache_emb_file)
+                self.embeddings = emb_data['embeddings']
+
+                if len(self.index) > 0 and self.embeddings is not None:
+                    return True
+            except Exception:
+                pass
+
+        # 向後相容：嘗試載入舊格式快取
+        if self.legacy_cache_file.exists():
+            try:
+                with open(self.legacy_cache_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+                if data.get("folder_hash") != folder_hash:
+                    return False
+
+                old_index = data.get("index", [])
+                if not old_index:
+                    return False
+
+                # 從舊格式遷移：分離 embedding 到 numpy array
+                self.index = []
+                embeddings_list = []
+                for item in old_index:
+                    emb = item.pop('embedding', [])
+                    self.index.append(item)
+                    embeddings_list.append(emb if emb else [0.0] * 1024)  # 預設 1024 維
+
+                if HAS_NUMPY:
+                    self.embeddings = np.array(embeddings_list, dtype=np.float32)
+                    # 遷移後自動保存新格式並刪除舊檔案
+                    self._save_cache()
+                    try:
+                        self.legacy_cache_file.unlink()
+                    except Exception:
+                        pass
+                else:
+                    # 沒有 numpy，把 embedding 塞回 index
+                    for i, emb in enumerate(embeddings_list):
+                        self.index[i]['embedding'] = emb
+
+                return len(self.index) > 0
+            except Exception:
                 return False
 
-            self.index = data.get("index", [])
-            return len(self.index) > 0
-        except Exception:
-            return False
+        return False
 
     def _save_cache(self):
-        """儲存快取"""
+        """儲存快取（新格式：metadata JSON + embedding npz）"""
         try:
-            data = {
+            # 準備 metadata（不含 embedding）
+            meta = {
                 "folder_hash": self._compute_folder_hash(),
                 "index": self.index
             }
-            with open(self.cache_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False)
+            with open(self.cache_meta_file, 'w', encoding='utf-8') as f:
+                json.dump(meta, f, ensure_ascii=False)
+
+            # 儲存 embedding 為 npz（壓縮的 numpy 二進位格式）
+            if HAS_NUMPY and self.embeddings is not None:
+                np.savez_compressed(self.cache_emb_file, embeddings=self.embeddings)
         except Exception:
             pass
 
@@ -205,6 +272,7 @@ class CodeRAG:
             print("[CODE_RAG] 建立程式碼索引...")
 
         self.index = []
+        embeddings_list = []
 
         for dirpath, dirnames, filenames in os.walk(self.folder):
             dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith('.')]
@@ -224,16 +292,38 @@ class CodeRAG:
                         embed_text = f"{sym['symbol']} {sym['context'][:300]}"
                         emb = self._get_embedding(embed_text)
 
+                        # metadata 不含 embedding
                         self.index.append({
                             'path': sym['path'],
                             'symbol': sym['symbol'],
                             'type': sym['type'],
                             'line': sym['line'],
                             'context': sym['context'][:500],
-                            'embedding': emb
                         })
+                        # embedding 單獨收集
+                        embeddings_list.append(emb if emb else [])
                 except Exception:
                     continue
+
+        # 將 embedding 轉換為 numpy array
+        if HAS_NUMPY and embeddings_list:
+            # 確保所有 embedding 維度一致
+            emb_dim = max(len(e) for e in embeddings_list) if embeddings_list else 1024
+            normalized = []
+            for emb in embeddings_list:
+                if len(emb) == emb_dim:
+                    normalized.append(emb)
+                elif len(emb) == 0:
+                    normalized.append([0.0] * emb_dim)
+                else:
+                    # 維度不一致，填充或截斷
+                    normalized.append((emb + [0.0] * emb_dim)[:emb_dim])
+            self.embeddings = np.array(normalized, dtype=np.float32)
+        else:
+            self.embeddings = None
+            # 沒有 numpy 時，退回舊方式（embedding 存在 index 裡）
+            for i, emb in enumerate(embeddings_list):
+                self.index[i]['embedding'] = emb
 
         if verbose:
             print(f"[CODE_RAG] 索引完成: {len(self.index)} 個符號")
@@ -258,6 +348,16 @@ class CodeRAG:
         hits = sum(1 for t in code_tokens if t.lower() in text)
         return hits / len(code_tokens)
 
+    def _get_embedding_at(self, idx: int) -> list:
+        """取得指定索引的 embedding（相容新舊格式）"""
+        # 新格式：從 numpy array 取得
+        if HAS_NUMPY and self.embeddings is not None and idx < len(self.embeddings):
+            return self.embeddings[idx].tolist()
+        # 舊格式：從 index 取得
+        if idx < len(self.index):
+            return self.index[idx].get('embedding', [])
+        return []
+
     def query(self, question: str, top_k: int = CODE_RAG_TOP_K, is_bug_fix: bool = False) -> list[dict]:
         """查詢相關程式碼位置（動態門檻）"""
         if not self.index:
@@ -272,20 +372,32 @@ class CodeRAG:
         # 動態門檻：Bug 類問題稍微放寬
         threshold = CODE_RAG_THRESHOLD_BUG if is_bug_fix else CODE_RAG_THRESHOLD
 
-        scores = []
-        for item in self.index:
-            emb = item.get('embedding', [])
+        # 使用 numpy 向量化計算 cosine similarity（如果可用）
+        if HAS_NUMPY and self.embeddings is not None and len(self.embeddings) > 0:
+            q_vec = np.array(q_emb, dtype=np.float32)
+            # 計算所有 cosine similarity
+            dot_products = np.dot(self.embeddings, q_vec)
+            norms = np.linalg.norm(self.embeddings, axis=1) * np.linalg.norm(q_vec)
+            # 避免除零
+            norms = np.where(norms > 0, norms, 1.0)
+            emb_scores = dot_products / norms
+        else:
+            emb_scores = None
 
-            if emb:
-                sim = sum(a * b for a, b in zip(q_emb, emb))
-                norm_q = sum(x*x for x in q_emb) ** 0.5
-                norm_e = sum(x*x for x in emb) ** 0.5
-                if norm_q > 0 and norm_e > 0:
-                    emb_score = sim / (norm_q * norm_e)
+        scores = []
+        for i, item in enumerate(self.index):
+            # 取得 embedding score
+            if emb_scores is not None:
+                emb_score = float(emb_scores[i])
+            else:
+                emb = self._get_embedding_at(i)
+                if emb:
+                    sim = sum(a * b for a, b in zip(q_emb, emb))
+                    norm_q = sum(x*x for x in q_emb) ** 0.5
+                    norm_e = sum(x*x for x in emb) ** 0.5
+                    emb_score = sim / (norm_q * norm_e) if norm_q > 0 and norm_e > 0 else 0
                 else:
                     emb_score = 0
-            else:
-                emb_score = 0
 
             kw_score = self._token_match_score(code_tokens, item)
 
