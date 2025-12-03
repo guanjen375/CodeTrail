@@ -325,12 +325,13 @@ def answer_with_self_check(question: str, base_ctx: str, knowledge_ctx: str) -> 
 
 請直接給出清楚的回答。"""
 
-    print("   [1/2] 生成初稿...")
-    draft = call_llm(first_prompt, temperature=STRICT_MODE_TEMPERATURE)
+    print("   [1/2] 生成初稿...\n")
+    draft = call_llm_stream(first_prompt, temperature=STRICT_MODE_TEMPERATURE)
 
     if draft.startswith("[ERROR]"):
         return draft
 
+    print("\n" + "-" * 40)
     # 第二階段：自我檢查（溫度 0）
     second_prompt = f"""{knowledge_ctx}
 
@@ -350,7 +351,7 @@ def answer_with_self_check(question: str, base_ctx: str, knowledge_ctx: str) -> 
 - 完全沒根據 → 直接刪除，改成「文件未提及此點」
 - 不要解釋檢查過程，只輸出修正後的最終回答"""
 
-    print("   [2/2] 自我檢查...")
-    final = call_llm(second_prompt, temperature=0.0)
+    print("   [2/2] 自我檢查...\n")
+    final = call_llm_stream(second_prompt, temperature=0.0)
 
     return final.strip() if not final.startswith("[ERROR]") else draft
