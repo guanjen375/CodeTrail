@@ -12,7 +12,12 @@ OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 MODEL = "qwen3-coder:30b"
 VL_MODEL = "qwen3-vl:30b-a3b"
 
-NUM_CTX = 131072  # 128K（模型支援最大 262K）
+# Context 長度設定
+# - 5090 32GB + 192GB RAM: 可開 128K，VRAM 不足時自動 offload 到 RAM
+# - 純 GPU 模式: 建議 64K 以內避免 OOM
+# - 注意：Offload 到 RAM 會降低推理速度，但能處理更長 context
+NUM_CTX = 131072   # 128K，利用 192GB RAM offload
+NUM_CTX_FULL_MODE = 65536  # Full 模式 64K
 MAX_TOTAL_CHARS = 200000  # 200KB，讓中小型專案使用完整模式
 
 # ============================================================

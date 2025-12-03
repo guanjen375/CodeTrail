@@ -180,7 +180,10 @@ MODEL = "qwen3-coder:30b"              # 主模型
 VL_MODEL = "qwen3-vl:30b-a3b"          # VL 模型（圖片辨識）
 EMBEDDING_MODEL = "bge-m3"             # Embedding 模型
 RERANKER_MODEL = "qllama/bge-reranker-v2-m3"  # Reranker 模型
-NUM_CTX = 65536                        # Context 長度
+
+# Context 長度設定（重要！根據 GPU VRAM 調整）
+NUM_CTX = 65536                        # Agent 模式 Context（64K）
+NUM_CTX_FULL_MODE = 32768              # Full 模式 Context（32K）
 
 # 知識庫 RAG 設定
 KNOWLEDGE_THRESHOLD = 0.25             # 相關度門檻（短問題用 0.20）
@@ -197,6 +200,28 @@ STRICT_MODE = True                     # 啟用嚴格模式
 STRICT_MODE_TEMPERATURE = 0.0          # 嚴格模式溫度
 WEAK_REF_THRESHOLD = 0.30              # REF 太弱時拒答
 ```
+
+### Context 長度與 VRAM/RAM 建議
+
+`NUM_CTX` 會影響 KV cache 記憶體用量。當 VRAM 不足時，Ollama 會自動將部分 KV cache offload 到系統 RAM：
+
+| 配置 | 建議 NUM_CTX | 說明 |
+|------|-------------|------|
+| 24GB VRAM | 32768 (32K) | 保守設定，避免 OOM |
+| 32GB VRAM | 65536 (64K) | 純 GPU，速度最快 |
+| 32GB VRAM + 大 RAM | 131072 (128K) | 預設值，部分 offload 到 RAM |
+| 48GB+ VRAM | 131072+ | 可開更大 |
+
+**預設配置**（針對 5090 32GB + 192GB RAM）：
+- Agent 模式：`NUM_CTX = 131072`（128K）
+- Full 模式：`NUM_CTX_FULL_MODE = 65536`（64K）
+
+**檢查 offload 狀態**：
+```bash
+ollama ps  # 查看 GPU% 比例，低於 100% 表示有 offload
+```
+
+**注意**：Offload 到 RAM 會降低推理速度，但能避免 OOM 並處理更長 context。如果速度太慢，可調低 NUM_CTX。
 
 ## 檔案結構
 

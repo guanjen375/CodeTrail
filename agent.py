@@ -499,14 +499,17 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
         if stack_parts:
             stack_preread_context = "\n\n【Stack trace 相關程式碼 - 這些是錯誤發生的位置】:\n" + "\n\n".join(stack_parts)
 
-    # 構建對話歷史（壓縮版，放在上下文最後以節省注意力）
+    # 構建對話歷史（壓縮版）
+    # 注意：放在 prompt 前段，因為 LLM 對兩端注意力較強，
+    # 低優先級內容放前面，重要的當前任務/規則放後面
     history_context = ""
     if prev_qa:
-        history_context = "\n\n【對話歷史（僅供參考，優先級最低）】:\n"
+        history_context = "\n【對話歷史（僅供背景參考，優先級最低）】:\n"
         for i, (q, a) in enumerate(prev_qa[-2:], 1):
-            q_short = q[:100] + "..." if len(q) > 100 else q
-            a_short = a[:300] + "..." if len(a) > 300 else a
+            q_short = q[:80] + "..." if len(q) > 80 else q
+            a_short = a[:200] + "..." if len(a) > 200 else a
             history_context += f"Q{i}: {q_short}\nA{i}: {a_short}\n"
+        history_context += "---\n"
 
     # Code RAG 自動預讀
     code_rag_context = ""
@@ -579,15 +582,16 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
 
     is_creative = any(kw in q_lower for kw in ['refactor', '重構', '設計', '架構', 'design', 'architecture', '建議', 'suggest'])
 
-    # 上下文優先級：BIN/圖片 > REF知識庫 > Stack trace > Code RAG > 對話歷史
+    # 上下文排列：低優先級在前，高優先級在後（LLM 對兩端注意力較強）
+    # 順序：對話歷史(最低) -> Code RAG -> Stack trace -> REF知識庫 -> BIN/圖片(最高) -> 規則
     system_prompt = f"""你是程式碼分析 Agent。透過工具探索專案來回答用戶問題。
 
 專案路徑: {folder}
-{image_ctx}
-{knowledge_ctx}
-{stack_preread_context}
-{code_rag_context}
 {history_context}
+{code_rag_context}
+{stack_preread_context}
+{knowledge_ctx}
+{image_ctx}
 {task_hint}
 
 【回答規則 - 嚴格遵守】

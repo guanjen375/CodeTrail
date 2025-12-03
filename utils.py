@@ -12,7 +12,7 @@ import requests
 from pathlib import Path
 
 from config import (
-    OLLAMA_GENERATE_URL, MODEL, NUM_CTX,
+    OLLAMA_GENERATE_URL, MODEL, NUM_CTX, NUM_CTX_FULL_MODE,
     CODE_EXTENSIONS, IGNORED_DIRS, IGNORED_FILES, IGNORED_PATTERNS,
     STRICT_MODE, STRICT_MODE_KEYWORDS, SPEC_QUESTION_KEYWORDS,
     STRICT_MODE_TEMPERATURE, WEAK_REF_THRESHOLD
@@ -199,14 +199,21 @@ def scan_project(folder: str) -> dict[str, str]:
     return files
 
 
-def call_llm(prompt: str, temperature: float = 0.2) -> str:
-    """呼叫 LLM 生成回應"""
+def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None) -> str:
+    """呼叫 LLM 生成回應
+
+    Args:
+        prompt: 提示詞
+        temperature: 溫度參數
+        num_ctx: Context 長度，預設使用 NUM_CTX
+    """
+    ctx = num_ctx if num_ctx is not None else NUM_CTX
     try:
         resp = requests.post(OLLAMA_GENERATE_URL, json={
             "model": MODEL,
             "prompt": prompt,
             "stream": False,
-            "options": {"num_ctx": NUM_CTX, "temperature": temperature},
+            "options": {"num_ctx": ctx, "temperature": temperature},
         }, timeout=600)
         resp.raise_for_status()
         return resp.json().get("response", "")
@@ -218,14 +225,21 @@ def call_llm(prompt: str, temperature: float = 0.2) -> str:
         return f"[ERROR] 錯誤: {e}"
 
 
-def call_llm_stream(prompt: str, temperature: float = 0.2) -> str:
-    """呼叫 LLM 生成回應（串流輸出，逐字顯示）"""
+def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None) -> str:
+    """呼叫 LLM 生成回應（串流輸出，逐字顯示）
+
+    Args:
+        prompt: 提示詞
+        temperature: 溫度參數
+        num_ctx: Context 長度，預設使用 NUM_CTX
+    """
+    ctx = num_ctx if num_ctx is not None else NUM_CTX
     try:
         resp = requests.post(OLLAMA_GENERATE_URL, json={
             "model": MODEL,
             "prompt": prompt,
             "stream": True,
-            "options": {"num_ctx": NUM_CTX, "temperature": temperature},
+            "options": {"num_ctx": ctx, "temperature": temperature},
         }, timeout=600, stream=True)
         resp.raise_for_status()
 

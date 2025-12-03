@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 from config import (
     MAX_TOTAL_CHARS, BUDGET_HIGH, BUDGET_MID, BUDGET_LOW,
-    SKELETON_THRESHOLD, SKELETON_MAX_LINES
+    SKELETON_THRESHOLD, SKELETON_MAX_LINES, NUM_CTX_FULL_MODE
 )
 from utils import get_priority, call_llm, call_llm_stream, should_use_strict_mode, answer_with_self_check
 
@@ -185,9 +185,10 @@ def analyze_full(ctx: FullContext, question: str, image_ctx: str = "", knowledge
 
 用繁體中文回答。"""
 
+    # Full 模式使用較小的 context，因為程式碼已全部塞入 prompt
     if stream:
-        return call_llm_stream(prompt, temperature=temperature)
-    return call_llm(prompt, temperature=temperature)
+        return call_llm_stream(prompt, temperature=temperature, num_ctx=NUM_CTX_FULL_MODE)
+    return call_llm(prompt, temperature=temperature, num_ctx=NUM_CTX_FULL_MODE)
 
 
 def show_full_stats(ctx: FullContext):
