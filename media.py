@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+智能程式碼分析器 - 媒體檔案處理
+- 圖片 OCR（使用 VL 模型）
+- 二進位檔案分析（Hex dump + strings 提取）
+"""
+
+import re
+import base64
+import requests
+from pathlib import Path
+
+from config import OLLAMA_GENERATE_URL, VL_MODEL, IMAGE_EXTENSIONS
+
+
+# 支援的二進位檔案副檔名
+BINARY_EXTENSIONS = {".bin", ".dat", ".raw", ".fw", ".img", ".rom", ".hex"}
+
+
+def ocr_image(path: str) -> str:
+    """對圖片進行 OCR"""
+    p = Path(path).expanduser().resolve()
+
+    if not p.exists():
+        return f"[OCR 錯誤] 檔案不存在: {path}"
+
+    if p.suffix.lower() not in IMAGE_EXTENSIONS:
+        return f"[OCR 錯誤] 不支援的格式: {p.suffix}"
+
+    file_size = p.stat().st_size
+    if file_size > 20 * 1024 * 1024:
+        return f"[OCR 錯誤] 圖片過大: {file_size / 1024 / 1024:.1f}MB"
+
+    try:
+        with open(p, "rb") as f:
+            data = base64.b64encode(f.read()).decode()
+
+        resp = requests.post(OLLAMA_GENERATE_URL, json={
+            "model": VL_MODEL,
+            "prompt": "列出圖片中的所有文字，保持格式。",
+            "images": [data],
+            "stream": False,
+            "options": {"num_ctx": 4096, "temperature": 0.1},
+        }, timeout=120)
+        resp.raise_for_status()
+        return resp.json().get("response", "").strip()
+    except Exception as e:
+        return f"[OCR 錯誤] {type(e).__name__}: {e}"
+
+
+def read_binary(path: str, max_hex_bytes: int = 16384, max_strings: int = 200) -> str:
+    """讀取二進位檔案並轉換為可分析格式
+
+    使用 strings 提取整個檔案的可讀字串，並只讀取前 N bytes 做 hex dump
+    """
+    import subprocess
+
+    p = Path(path).expanduser().resolve()
+
+    if not p.exists():
+        return f"[BIN 錯誤] 檔案不存在: {path}"
+
+    file_size = p.stat().st_size
+    if file_size > 50 * 1024 * 1024:  # 50MB 限制
+        return f"[BIN 錯誤] 檔案過大: {file_size / 1024 / 1024:.1f}MB (上限 50MB)"
+
+    try:
+        # 基本資訊
+        info = [
+            f"檔案: {p.name}",
+            f"大小: {file_size:,} bytes",
+        ]
+
+        # Hex dump (前 1024 bytes，每行 16 bytes) - 用於分析 header/magic
+        with open(p, "rb") as f:
+            header_data = f.read(1024)
+
+        hex_lines = []
+        for i in range(0, len(header_data), 16):
+            chunk = header_data[i:i+16]
+            hex_part = ' '.join(f'{b:02x}' for b in chunk)
+            ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+            hex_lines.append(f"{i:08x}  {hex_part:<48}  |{ascii_part}|")
+
+        # 使用 strings 命令提取整個檔案的可讀字串（長度 >= 6）
+        try:
+            result_strings = subprocess.run(
+                ['strings', '-n', '6', str(p)],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            all_strings = result_strings.stdout.strip().split('\n') if result_strings.stdout else []
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            # fallback: 手動提取前 max_hex_bytes 的字串
+            with open(p, "rb") as f:
+                data = f.read(max_hex_bytes)
+            all_strings = []
+            current = []
+            for b in data:
+                if 32 <= b < 127:
+                    current.append(chr(b))
+                else:
+                    if len(current) >= 6:
+                        all_strings.append(''.join(current))
+                    current = []
+            if len(current) >= 6:
+                all_strings.append(''.join(current))
+
+        # 過濾有意義的字串（排除太短或純數字/符號的）
+        meaningful_strings = []
+        for s in all_strings:
+            s = s.strip()
+            if len(s) < 6:
+                continue
+            # 至少包含一個字母
+            if any(c.isalpha() for c in s):
+                meaningful_strings.append(s)
+
+        # 組合輸出
+        result = '\n'.join(info)
+        result += '\n\nHex Dump (前 1KB，用於識別檔案格式):\n' + '\n'.join(hex_lines)
+
+        if meaningful_strings:
+            # 優先顯示可能的版本/日期資訊
+            high_priority = []  # 非常重要：版本號、編譯日期
+            medium_priority = []  # 中等重要：boot 相關
+            normal_strings = []
+
+            for s in meaningful_strings:
+                s_lower = s.lower()
+                # 高優先：明確的版本號格式
+                if any(kw in s_lower for kw in ['version', '2024', '2025', '2023', 'compiled', 'gcc', 'clang', 'built']):
+                    high_priority.append(s)
+                elif any(kw in s for kw in ['U-Boot', 'u-boot']):
+                    high_priority.append(s)
+                # 中優先：boot 相關但不是版本
+                elif 'boot' in s_lower:
+                    medium_priority.append(s)
+                else:
+                    normal_strings.append(s)
+
+            result += f'\n\n可讀字串（整個檔案，共 {len(meaningful_strings)} 個）:\n'
+
+            if high_priority:
+                result += '\n[最重要 - 版本/編譯資訊]:\n'
+                for s in high_priority[:50]:
+                    result += f'  {s}\n'
+
+            if medium_priority:
+                result += '\n[Boot 相關]:\n'
+                for s in medium_priority[:20]:
+                    result += f'  {s}\n'
+                if len(medium_priority) > 20:
+                    result += f'  ... (還有 {len(medium_priority) - 20} 個)\n'
+
+            result += '\n[其他字串]:\n'
+            shown = 0
+            max_normal = max_strings - len(high_priority) - min(len(medium_priority), 20)
+            for s in normal_strings:
+                if shown >= max_normal:
+                    result += f'... (還有 {len(normal_strings) - shown} 個字串)\n'
+                    break
+                result += f'  {s}\n'
+                shown += 1
+
+        return result
+
+    except Exception as e:
+        return f"[BIN 錯誤] {type(e).__name__}: {e}"
+
+
+def process_binary(text: str) -> tuple[str, str]:
+    """處理文字中的二進位檔案引用 (bin:/path/to/file.bin)"""
+    pattern = r'bin:([^\s]+)'
+    matches = re.findall(pattern, text, re.IGNORECASE)
+    clean = re.sub(pattern, '', text, flags=re.IGNORECASE).strip()
+
+    if not matches:
+        return text, ""
+
+    ctx = """
+=== [重要] 二進位檔案分析 ===
+使用者提供了二進位檔案，請務必按照以下步驟處理：
+
+1. 首先分析 Hex dump 和可讀字串，檢查是否包含使用者需要的資訊
+2. 明確說明「在 bin 中找到了 XXX」或「在 bin 中沒有找到 XXX」
+3. 若 bin 中沒有找到，再根據程式碼或文件給出建議
+
+這些檔案的重要性等同於規格文件，不要跳過直接分析程式碼。
+"""
+    for m in matches:
+        print(f"[BIN] 讀取: {m}")
+        ctx += f"\n[BIN: {m}]\n{read_binary(m)}\n"
+
+    ctx += "\n=== 二進位檔案分析結束 ===\n"
+    return clean, ctx
+
+
+def process_images(text: str) -> tuple[str, str]:
+    """處理文字中的圖片引用"""
+    pattern = r'img:([^\s]+\.(?:png|jpg|jpeg|gif|webp))'
+    matches = re.findall(pattern, text, re.IGNORECASE)
+    clean = re.sub(pattern, '', text, flags=re.IGNORECASE).strip()
+
+    if not matches:
+        return text, ""
+
+    ctx = "\n附加圖片:\n"
+    for m in matches:
+        print(f"[IMG] OCR: {m}")
+        ctx += f"\n[{m}]:\n{ocr_image(m)}\n"
+
+    return clean, ctx

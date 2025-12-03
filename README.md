@@ -9,6 +9,7 @@
 - **知識庫 RAG**：整合技術文件（PDF/Markdown），回答時引用文件來源
 - **Code RAG**：自動索引程式碼符號（函式/類別），快速定位相關程式碼
 - **圖片 OCR**：支援截圖中的錯誤訊息辨識（使用 VL 模型）
+- **二進位分析**：韌體/執行檔的 Hex dump + 智能字串提取
 - **嚴格模式（兩階段）**：規格類問題強制引用文件，並透過自我檢查過濾幻覺
 
 ## 安裝需求
@@ -57,8 +58,6 @@ python main.py /path/to/project --full
 ```bash
 # 使用自訂知識庫
 python main.py /path/to/project --kb=/path/to/knowledge.json
-
-# 知識庫格式見下方說明
 ```
 
 ### 排除/包含目錄
@@ -88,9 +87,10 @@ python main.py . --include-dir=third_party
 - **圖片問題**：「img:/path/to/screenshot.png 這個錯誤怎麼解？」
 - **二進位分析**：「bin:/path/to/firmware.bin 這個檔案的結構是什麼？」
 
-### 圖片與二進位檔案
+## 圖片與二進位檔案
 
-**圖片 OCR**（使用 VL 模型）：
+### 圖片 OCR（使用 VL 模型）
+
 ```bash
 # 在問題中加入 img: 前綴
 >>> img:/path/to/error_screenshot.png 這個錯誤怎麼解？
@@ -100,16 +100,21 @@ python main.py . --include-dir=third_party
 # 大小限制：20MB
 ```
 
-**二進位檔案分析**：
+### 二進位檔案分析
+
 ```bash
 # 在問題中加入 bin: 前綴
->>> bin:/path/to/firmware.bin 這個韌體的 magic number 是什麼？
->>> bin:./output.dat 幫我分析這個檔案結構
+>>> bin:/path/to/firmware.bin 這個韌體的版本號是什麼？
+>>> bin:./u-boot.bin 幫我分析這個 U-Boot
 
 # 支援格式：.bin, .dat, .raw, .fw, .img, .rom, .hex
-# 大小限制：50MB（只讀取前 16KB 進行分析）
-# 輸出內容：Hex dump (前 1KB) + 可讀字串提取 (前 16KB)
+# 大小限制：50MB
 ```
+
+**分析內容**：
+- **Hex dump**：前 1KB，用於識別檔案格式和 magic number
+- **智能字串提取**：使用 `strings` 提取整個檔案的可讀字串
+- **優先分類**：版本號、編譯日期等重要資訊會優先顯示
 
 ## 知識庫格式
 
@@ -141,6 +146,12 @@ type 類型：
 - `guide`：使用指南
 - `warning`：警告/限制條件
 - `faq`：常見問題
+
+### 建立知識庫
+
+```bash
+python RAG.py /path/to/document.pdf /path/to/output.json
+```
 
 ## 嚴格模式（兩階段自我檢查）
 
@@ -190,15 +201,16 @@ WEAK_REF_THRESHOLD = 0.30              # REF 太弱時拒答
 ## 檔案結構
 
 ```
-AI/
+ai_code/
 ├── main.py          # 主程式入口
 ├── config.py        # 設定檔
+├── utils.py         # 共用工具（LLM 呼叫、檔案掃描、嚴格模式）
 ├── agent.py         # Agent 模式（動態探索）
 ├── context.py       # 完整模式（全量分析）
 ├── knowledge.py     # 知識庫 RAG
 ├── code_rag.py      # 程式碼索引 RAG
-├── utils.py         # 共用工具函式
-├── ocr.py           # 圖片 OCR 處理
+├── media.py         # 媒體處理（圖片 OCR、二進位分析）
+├── RAG.py           # 知識庫建立工具（獨立腳本）
 └── knowledge.json   # 知識庫（自行建立）
 ```
 
@@ -233,13 +245,11 @@ Agent 需要多輪工具呼叫，可以：
 - `DYNAMIC_TOP_K_MIN/MAX`：控制返回的參考資料數量
 - `KNOWLEDGE_THRESHOLD`：提高門檻可減少不相關內容，但可能漏掉有用資訊
 
-### Q: 如何建立知識庫？
+### Q: 二進位檔案找不到版本資訊？
 
-可以用 `RAG.py` 處理 PDF/Markdown 文件：
-
-```bash
-python RAG.py /path/to/doc /path/to/output
-```
+預設使用 `strings` 提取整個檔案的可讀字串。如果找不到：
+1. 確認版本資訊確實存在：`strings firmware.bin | grep -i version`
+2. 版本字串可能使用非標準格式，嘗試更具體的問法
 
 ## License
 

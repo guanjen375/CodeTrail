@@ -40,7 +40,7 @@ from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from context import build_full_context, analyze_full, show_full_stats
 from agent import run_agent, handle_followup
-from ocr import process_images, process_binary
+from media import process_images, process_binary
 
 
 def main():
