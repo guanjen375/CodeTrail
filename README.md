@@ -1,93 +1,182 @@
-# ai_code
+# 智能程式碼分析器
 
+基於 Ollama 的本地程式碼分析工具，支援 RAG（知識庫檢索）和 Agent 模式。
 
+## 功能特色
 
-## Getting started
+- **完整模式**：小型專案一次讀入全部程式碼分析
+- **Agent 模式**：大型專案動態探索，按需讀取檔案
+- **知識庫 RAG**：整合技術文件，回答時引用文件來源
+- **Code RAG**：自動索引程式碼符號（函式/類別），快速定位相關程式碼
+- **圖片 OCR**：支援截圖中的錯誤訊息辨識
+- **嚴格模式**：規格類問題強制引用文件，避免幻覺
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## 安裝需求
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+```bash
+# 安裝 Ollama
+# https://ollama.ai/download
 
-## Add your files
+# 拉取模型
+ollama pull qwen3-coder:30b      # 主模型
+ollama pull bge-m3               # Embedding 模型
+ollama pull qllama/bge-reranker-v2-m3   # Reranker 模型（可選）
 
-* [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+# 安裝 Python 依賴
+pip install requests
+```
+
+## 快速開始
+
+### 基本用法
+
+```bash
+# 分析當前目錄
+python main.py .
+
+# 分析指定目錄
+python main.py /path/to/project
+
+# 帶問題的單次分析
+python main.py /path/to/project "這個專案的主要功能是什麼？"
+```
+
+### 模式選擇
+
+```bash
+# 強制使用 Agent 模式（大型專案推薦）
+python main.py /path/to/project --agent
+
+# 強制使用完整模式（小型專案）
+python main.py /path/to/project --full
+```
+
+### 知識庫
+
+```bash
+# 使用自訂知識庫
+python main.py /path/to/project --kb=/path/to/knowledge.json
+
+# 知識庫格式見下方說明
+```
+
+### 排除/包含目錄
+
+```bash
+# 排除特定檔案
+python main.py . --exclude="*.test.py"
+
+# 包含預設排除的目錄（如 third_party）
+python main.py . --include-dir=third_party
+```
+
+## 互動模式
+
+啟動後進入互動模式：
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/pokedavid375/ai_code.git
-git branch -M main
-git push -uf origin main
+💬 輸入問題 (Enter=整體分析, q=離開, clear=清除歷史)
+>>> 這個函式 foo() 做了什麼？
 ```
 
-## Integrate with your tools
+### 支援的問題類型
 
-* [Set up project integrations](https://gitlab.com/pokedavid375/ai_code/-/settings/integrations)
+- **程式碼理解**：「這個類別的用途是什麼？」
+- **Bug 分析**：「這個錯誤是怎麼發生的？」（支援貼上 stack trace）
+- **規格查詢**：「這個 API 的最大值限制是多少？」（需要知識庫）
+- **圖片問題**：「img:/path/to/screenshot.png 這個錯誤怎麼解？」
 
-## Collaborate with your team
+## 知識庫格式
 
-* [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+`knowledge.json` 格式：
 
-## Test and Deploy
+```json
+{
+  "metadata": {
+    "documents": [
+      {"name": "API_Manual.pdf", "type": "spec"},
+      {"name": "FAQ.md", "type": "guide"}
+    ]
+  },
+  "chunks": [
+    {
+      "content": "文件內容片段...",
+      "source": "API_Manual.pdf",
+      "page": 15,
+      "type": "spec",
+      "section": "3.2 限制條件",
+      "embedding": [0.1, 0.2, ...]
+    }
+  ]
+}
+```
 
-Use the built-in continuous integration in GitLab.
+type 類型：
+- `spec`：規格文件（優先級最高）
+- `guide`：使用指南
+- `warning`：警告/限制條件
+- `faq`：常見問題
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+## 設定檔
 
-***
+編輯 `config.py` 調整參數：
 
-# Editing this README
+```python
+# 模型設定
+MODEL = "qwen3-coder:30b"        # 主模型
+EMBEDDING_MODEL = "bge-m3"       # Embedding 模型
+NUM_CTX = 65536                  # Context 長度
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+# RAG 設定
+KNOWLEDGE_THRESHOLD = 0.25       # 知識庫相關度門檻
+CODE_RAG_THRESHOLD = 0.30        # 程式碼 RAG 門檻
 
-## Suggestions for a good README
+# 嚴格模式
+STRICT_MODE = True               # 啟用嚴格模式
+WEAK_REF_THRESHOLD = 0.30        # REF 太弱時拒答
+```
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+## 檔案結構
 
-## Name
-Choose a self-explaining name for your project.
+```
+AI/
+├── main.py          # 主程式入口
+├── config.py        # 設定檔
+├── agent.py         # Agent 模式（動態探索）
+├── context.py       # 完整模式（全量分析）
+├── knowledge.py     # 知識庫 RAG
+├── code_rag.py      # 程式碼索引 RAG
+├── utils.py         # 共用工具函式
+├── ocr.py           # 圖片 OCR 處理
+└── knowledge.json   # 知識庫（自行建立）
+```
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+## 常見問題
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+### Q: 為什麼回答說「知識庫中沒有找到足夠相關的參考資料」？
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+這是嚴格模式的保護機制。當你問規格類問題（如「最大值是多少」）但知識庫沒有相關文件時，系統會拒答而非瞎猜。
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+解決方法：
+1. 確認知識庫有包含相關文件
+2. 改用不含規格關鍵字的問法
+3. 在 `config.py` 調低 `WEAK_REF_THRESHOLD`
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+### Q: Agent 模式很慢？
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+Agent 需要多輪工具呼叫，可以：
+1. 使用 `--full` 強制完整模式（如果專案不大）
+2. 調低 `MAX_TOOL_LOOPS`（預設 12）
+3. 問題描述更具體，減少探索範圍
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+### Q: 如何建立知識庫？
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+可以用 `RAG.py` 處理 PDF/Markdown 文件：
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+```bash
+python RAG.py /path/to/doc /path/to/output
+```
 
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+MIT
