@@ -51,10 +51,21 @@ class CodeRAG:
 
     def _compute_folder_hash(self) -> str:
         """計算資料夾的 hash（用於快取驗證）"""
+        # 排除快取檔案本身，避免快取寫入後導致 hash 變化
+        cache_base = CODE_RAG_CACHE_FILE.replace('.json', '')
+        skip_files = {
+            CODE_RAG_CACHE_FILE,
+            f"{cache_base}_meta.json",
+            f"{cache_base}_emb.npz",
+        }
+
         files = []
         for dirpath, dirnames, filenames in os.walk(self.folder):
             dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith('.')]
             for f in filenames:
+                # 跳過 dotfile 和快取檔案
+                if f.startswith('.') or f in skip_files:
+                    continue
                 if Path(f).suffix.lower() in CODE_EXTENSIONS:
                     fp = Path(dirpath) / f
                     try:
@@ -291,6 +302,9 @@ class CodeRAG:
             dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith('.')]
 
             for filename in filenames:
+                # 跳過 dotfile（包含快取檔案）
+                if filename.startswith('.'):
+                    continue
                 if Path(filename).suffix.lower() not in CODE_EXTENSIONS:
                     continue
                 if should_ignore_file(filename):
