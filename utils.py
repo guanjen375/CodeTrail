@@ -218,6 +218,41 @@ def call_llm(prompt: str, temperature: float = 0.2) -> str:
         return f"[ERROR] 錯誤: {e}"
 
 
+def call_llm_stream(prompt: str, temperature: float = 0.2) -> str:
+    """呼叫 LLM 生成回應（串流輸出，逐字顯示）"""
+    try:
+        resp = requests.post(OLLAMA_GENERATE_URL, json={
+            "model": MODEL,
+            "prompt": prompt,
+            "stream": True,
+            "options": {"num_ctx": NUM_CTX, "temperature": temperature},
+        }, timeout=600, stream=True)
+        resp.raise_for_status()
+
+        full_response = []
+        for line in resp.iter_lines():
+            if line:
+                try:
+                    import json
+                    chunk = json.loads(line)
+                    token = chunk.get("response", "")
+                    if token:
+                        print(token, end="", flush=True)
+                        full_response.append(token)
+                except json.JSONDecodeError:
+                    pass
+
+        print()  # 換行
+        return "".join(full_response)
+
+    except requests.exceptions.ConnectionError:
+        return "[ERROR] 無法連接 Ollama"
+    except requests.exceptions.Timeout:
+        return "[ERROR] 請求超時"
+    except Exception as e:
+        return f"[ERROR] 錯誤: {e}"
+
+
 def is_spec_question(question: str) -> bool:
     """判斷是否為規格/文件類問題"""
     q_lower = question.lower()

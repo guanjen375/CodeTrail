@@ -40,7 +40,7 @@ from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from context import build_full_context, analyze_full, show_full_stats
 from agent import run_agent, handle_followup
-from ocr import process_images
+from ocr import process_images, process_binary
 
 
 def main():
@@ -153,6 +153,8 @@ def main():
     # 單次模式
     if question:
         clean_q, img_ctx = process_images(question)
+        clean_q, bin_ctx = process_binary(clean_q)
+        img_ctx = img_ctx + bin_ctx  # 合併圖片和二進位上下文
         print("[KB] 查詢知識庫...")
         knowledge_ctx, knowledge_display, kb_metadata = kb.query(clean_q) if kb.loaded else ("", "", {})
         if knowledge_display:
@@ -169,15 +171,13 @@ def main():
             print("3. 若確定要用一般知識回答，請改用不含規格關鍵字的問法")
             return
 
-        print(f"\n⏳ 分析中...\n")
+        print("\n" + "=" * 50)
+        print("[NOTE] 回答:\n")
         if mode == "full":
             result = analyze_full(ctx, clean_q, img_ctx, knowledge_ctx)
         else:
             result = run_agent(folder, clean_q, img_ctx, knowledge_ctx=knowledge_ctx, code_rag=code_rag)
-
-        print("\n" + "=" * 50)
-        print("[NOTE] 回答:\n")
-        print(result)
+        # 串流輸出已在函數內完成，不需再次印出
         return
 
     # 互動模式
@@ -201,6 +201,8 @@ def main():
                 q = "請分析這個專案的整體架構和主要功能"
 
             clean_q, img_ctx = process_images(q)
+            clean_q, bin_ctx = process_binary(clean_q)
+            img_ctx = img_ctx + bin_ctx  # 合併圖片和二進位上下文
 
             # 構建 RAG 查詢
             if qa_history and kb.loaded:
@@ -246,6 +248,9 @@ def main():
                 )
             )
 
+            print("\n" + "=" * 50)
+            print("[NOTE] 回答:\n")
+
             if mode == "full":
                 result = analyze_full(ctx, clean_q, img_ctx, knowledge_ctx)
             elif is_followup:
@@ -258,10 +263,7 @@ def main():
             qa_history.append((clean_q, result))
             if len(qa_history) > 5:
                 qa_history.pop(0)
-
-            print("\n" + "=" * 50)
-            print("[NOTE] 回答:\n")
-            print(result)
+            # 串流輸出已在函數內完成
 
         except KeyboardInterrupt:
             print("\n[BYE] 再見!")

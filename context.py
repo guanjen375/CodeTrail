@@ -11,7 +11,7 @@ from config import (
     MAX_TOTAL_CHARS, BUDGET_HIGH, BUDGET_MID, BUDGET_LOW,
     SKELETON_THRESHOLD, SKELETON_MAX_LINES
 )
-from utils import get_priority, call_llm, should_use_strict_mode, answer_with_self_check
+from utils import get_priority, call_llm, call_llm_stream, should_use_strict_mode, answer_with_self_check
 
 
 @dataclass
@@ -146,7 +146,7 @@ def build_full_context(files: dict[str, str]) -> FullContext:
     return FullContext(entries, "".join(parts), total_chars, stats)
 
 
-def analyze_full(ctx: FullContext, question: str, image_ctx: str = "", knowledge_ctx: str = "") -> str:
+def analyze_full(ctx: FullContext, question: str, image_ctx: str = "", knowledge_ctx: str = "", stream: bool = True) -> str:
     """完整模式分析"""
     q_lower = question.lower() if question else ""
     is_creative = any(kw in q_lower for kw in ['refactor', '重構', '設計', '架構', 'design', 'architecture', '建議', 'suggest'])
@@ -184,6 +184,8 @@ def analyze_full(ctx: FullContext, question: str, image_ctx: str = "", knowledge
 
 用繁體中文回答。"""
 
+    if stream:
+        return call_llm_stream(prompt, temperature=temperature)
     return call_llm(prompt, temperature=temperature)
 
 

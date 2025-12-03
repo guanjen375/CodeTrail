@@ -24,7 +24,7 @@ from config import (
     ALLOWED_COMMANDS
 )
 from utils import (
-    should_ignore_dir, should_ignore_file, call_llm,
+    should_ignore_dir, should_ignore_file, call_llm, call_llm_stream,
     should_use_strict_mode, answer_with_self_check
 )
 
@@ -138,6 +138,42 @@ def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
         return {"content": "[ERROR] 請求超時", "tool_calls": [], "done_reason": "error"}
     except Exception as e:
         return {"content": f"[ERROR] 錯誤: {e}", "tool_calls": [], "done_reason": "error"}
+
+
+def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
+    """呼叫 LLM（帶工具，串流輸出，用於最終回答）"""
+    try:
+        resp = requests.post(OLLAMA_CHAT_URL, json={
+            "model": MODEL,
+            "messages": messages,
+            "tools": NATIVE_TOOLS,
+            "stream": True,
+            "options": {"num_ctx": NUM_CTX, "temperature": temperature},
+        }, timeout=600, stream=True)
+        resp.raise_for_status()
+
+        full_response = []
+        for line in resp.iter_lines():
+            if line:
+                try:
+                    chunk = json.loads(line)
+                    message = chunk.get("message", {})
+                    token = message.get("content", "")
+                    if token:
+                        print(token, end="", flush=True)
+                        full_response.append(token)
+                except json.JSONDecodeError:
+                    pass
+
+        print()  # 換行
+        return "".join(full_response)
+
+    except requests.exceptions.ConnectionError:
+        return "[ERROR] 無法連接 Ollama"
+    except requests.exceptions.Timeout:
+        return "[ERROR] 請求超時"
+    except Exception as e:
+        return f"[ERROR] 錯誤: {e}"
 
 
 # ============================================================
@@ -422,7 +458,7 @@ def handle_followup(question: str, prev_qa: list) -> str:
 
 請根據之前的回答，直接給出針對這個補充條件的具體答案。
 用繁體中文回答，簡潔明瞭。"""
-    return call_llm(prompt)
+    return call_llm_stream(prompt)
 
 
 def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = None,
@@ -609,7 +645,11 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
                     base_ctx = f"專案路徑: {folder}\n{code_rag_context}\n{stack_preread_context}"
                     content = answer_with_self_check(question, base_ctx, knowledge_ctx)
 
-                print(f"   [OK] Agent 完成分析")
+                print(f"   [OK] Agent 完成分析\n")
+                # 模擬串流輸出（逐字顯示）
+                for char in content:
+                    print(char, end="", flush=True)
+                print()  # 換行
                 return content
             else:
                 messages.append({"role": "assistant", "content": content or "..."})
@@ -663,15 +703,18 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
                 "content": result or "（無結果）"
             })
 
-    print("[WARN] 達到最大探索次數")
+    print("[WARN] 達到最大探索次數\n")
 
     summary_prompt = f"""請根據目前收集到的資訊，盡可能回答用戶的問題。
 如果資訊不足，請說明你已經知道什麼，還缺少什麼。"""
 
     messages.append({"role": "user", "content": summary_prompt})
-    final_response = call_llm_with_tools(messages, temperature=agent_temperature)
 
-    if final_response.get("content"):
-        return f"[NOTE] 根據已收集資訊回答：\n\n{final_response['content']}"
+    # 串流輸出最終回答
+    print("[NOTE] 根據已收集資訊回答：\n")
+    content = call_llm_with_tools_stream(messages, temperature=agent_temperature)
+
+    if content:
+        return content
 
     return "[WARN] 達到最大探索次數，請嘗試更具體的問題。"
