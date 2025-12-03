@@ -47,7 +47,7 @@ def ocr_image(path: str) -> str:
         return f"[OCR 錯誤] {type(e).__name__}: {e}"
 
 
-def read_binary(path: str, max_bytes: int = 4096) -> str:
+def read_binary(path: str, max_bytes: int = 16384) -> str:
     """讀取二進位檔案並轉換為可分析格式"""
     p = Path(path).expanduser().resolve()
 
@@ -69,9 +69,9 @@ def read_binary(path: str, max_bytes: int = 4096) -> str:
             f"讀取: 前 {len(data):,} bytes",
         ]
 
-        # Hex dump (前 512 bytes，每行 16 bytes)
+        # Hex dump (前 1024 bytes，每行 16 bytes)
         hex_lines = []
-        for i in range(0, min(len(data), 512), 16):
+        for i in range(0, min(len(data), 1024), 16):
             chunk = data[i:i+16]
             hex_part = ' '.join(f'{b:02x}' for b in chunk)
             # ASCII 可視字元

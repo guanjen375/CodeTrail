@@ -4,12 +4,12 @@
 
 ## 功能特色
 
-- **完整模式**：小型專案一次讀入全部程式碼分析
+- **完整模式**：小型專案（< 200KB）一次讀入全部程式碼分析
 - **Agent 模式**：大型專案動態探索，按需讀取檔案
-- **知識庫 RAG**：整合技術文件，回答時引用文件來源
+- **知識庫 RAG**：整合技術文件（PDF/Markdown），回答時引用文件來源
 - **Code RAG**：自動索引程式碼符號（函式/類別），快速定位相關程式碼
-- **圖片 OCR**：支援截圖中的錯誤訊息辨識
-- **嚴格模式**：規格類問題強制引用文件，避免幻覺
+- **圖片 OCR**：支援截圖中的錯誤訊息辨識（使用 VL 模型）
+- **嚴格模式（兩階段）**：規格類問題強制引用文件，並透過自我檢查過濾幻覺
 
 ## 安裝需求
 
@@ -18,9 +18,10 @@
 # https://ollama.ai/download
 
 # 拉取模型
-ollama pull qwen3-coder:30b      # 主模型
-ollama pull bge-m3               # Embedding 模型
-ollama pull qllama/bge-reranker-v2-m3   # Reranker 模型（可選）
+ollama pull qwen3-coder:30b              # 主模型
+ollama pull qwen3-vl:30b-a3b             # VL 模型（圖片辨識用）
+ollama pull bge-m3                       # Embedding 模型
+ollama pull qllama/bge-reranker-v2-m3    # Reranker 模型
 
 # 安裝 Python 依賴
 pip install requests
@@ -85,6 +86,30 @@ python main.py . --include-dir=third_party
 - **Bug 分析**：「這個錯誤是怎麼發生的？」（支援貼上 stack trace）
 - **規格查詢**：「這個 API 的最大值限制是多少？」（需要知識庫）
 - **圖片問題**：「img:/path/to/screenshot.png 這個錯誤怎麼解？」
+- **二進位分析**：「bin:/path/to/firmware.bin 這個檔案的結構是什麼？」
+
+### 圖片與二進位檔案
+
+**圖片 OCR**（使用 VL 模型）：
+```bash
+# 在問題中加入 img: 前綴
+>>> img:/path/to/error_screenshot.png 這個錯誤怎麼解？
+>>> img:~/Desktop/log.png 幫我分析這個 log
+
+# 支援格式：.png, .jpg, .jpeg, .gif, .webp
+# 大小限制：20MB
+```
+
+**二進位檔案分析**：
+```bash
+# 在問題中加入 bin: 前綴
+>>> bin:/path/to/firmware.bin 這個韌體的 magic number 是什麼？
+>>> bin:./output.dat 幫我分析這個檔案結構
+
+# 支援格式：.bin, .dat, .raw, .fw, .img, .rom, .hex
+# 大小限制：50MB（只讀取前 16KB 進行分析）
+# 輸出內容：Hex dump (前 1KB) + 可讀字串提取 (前 16KB)
+```
 
 ## 知識庫格式
 
@@ -117,23 +142,49 @@ type 類型：
 - `warning`：警告/限制條件
 - `faq`：常見問題
 
+## 嚴格模式（兩階段自我檢查）
+
+當問題涉及規格/文件類內容時，系統會自動啟用嚴格模式：
+
+**第一階段 - 生成初稿**：
+- 根據程式碼與 `[REF]` 參考資料生成答案
+- Temperature = 0.0（完全確定性）
+- 要求每個論述標註 REF 編號
+
+**第二階段 - 自我檢查**：
+- 逐句審核初稿，確認是否有 REF 根據
+- 有明確對應 → 保留並標註
+- 合理推論但沒明說 → 改成「推測：...」
+- 完全沒根據 → 刪除或標示「文件未提及」
+
+觸發條件：問題包含 `規格`、`spec`、`manual`、`根據文件` 等關鍵字。
+
 ## 設定檔
 
 編輯 `config.py` 調整參數：
 
 ```python
 # 模型設定
-MODEL = "qwen3-coder:30b"        # 主模型
-EMBEDDING_MODEL = "bge-m3"       # Embedding 模型
-NUM_CTX = 65536                  # Context 長度
+MODEL = "qwen3-coder:30b"              # 主模型
+VL_MODEL = "qwen3-vl:30b-a3b"          # VL 模型（圖片辨識）
+EMBEDDING_MODEL = "bge-m3"             # Embedding 模型
+RERANKER_MODEL = "qllama/bge-reranker-v2-m3"  # Reranker 模型
+NUM_CTX = 65536                        # Context 長度
 
-# RAG 設定
-KNOWLEDGE_THRESHOLD = 0.25       # 知識庫相關度門檻
-CODE_RAG_THRESHOLD = 0.30        # 程式碼 RAG 門檻
+# 知識庫 RAG 設定
+KNOWLEDGE_THRESHOLD = 0.25             # 相關度門檻（短問題用 0.20）
+KNOWLEDGE_CONTENT_MAX_CHARS = 2000     # 每個 chunk 最大字元數
+DYNAMIC_TOP_K_MIN = 3                  # 高相關度時返回數量
+DYNAMIC_TOP_K_MAX = 6                  # 低相關度時返回數量
+
+# 程式碼 RAG 設定
+CODE_RAG_THRESHOLD = 0.30              # 程式碼相關度門檻
+CODE_RAG_TOP_K = 8                     # 返回的程式碼片段數
 
 # 嚴格模式
-STRICT_MODE = True               # 啟用嚴格模式
-WEAK_REF_THRESHOLD = 0.30        # REF 太弱時拒答
+STRICT_MODE = True                     # 啟用嚴格模式
+STRICT_MODE_TEMPERATURE = 0.0          # 嚴格模式溫度
+WEAK_REF_THRESHOLD = 0.30              # REF 太弱時拒答
 ```
 
 ## 檔案結構
@@ -168,6 +219,19 @@ Agent 需要多輪工具呼叫，可以：
 1. 使用 `--full` 強制完整模式（如果專案不大）
 2. 調低 `MAX_TOOL_LOOPS`（預設 12）
 3. 問題描述更具體，減少探索範圍
+
+### Q: 嚴格模式兩階段都沒輸出？
+
+兩階段都使用串流輸出，應該可以即時看到生成過程。如果卡住：
+1. 確認 Ollama 服務正在運行：`ollama ps`
+2. 確認模型已載入（首次需要時間）
+3. 檢查 GPU VRAM 是否足夠
+
+### Q: 如何調整 RAG 返回的內容量？
+
+- `KNOWLEDGE_CONTENT_MAX_CHARS`：每個 chunk 最大字元數，增加可獲得更完整內容但佔用更多 context
+- `DYNAMIC_TOP_K_MIN/MAX`：控制返回的參考資料數量
+- `KNOWLEDGE_THRESHOLD`：提高門檻可減少不相關內容，但可能漏掉有用資訊
 
 ### Q: 如何建立知識庫？
 
