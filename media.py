@@ -10,6 +10,7 @@ import re
 import base64
 import requests
 from pathlib import Path
+from typing import Optional
 
 from config import OLLAMA_GENERATE_URL, VL_MODEL, IMAGE_EXTENSIONS
 
@@ -17,10 +18,38 @@ from config import OLLAMA_GENERATE_URL, VL_MODEL, IMAGE_EXTENSIONS
 # 支援的二進位檔案副檔名
 BINARY_EXTENSIONS = {".bin", ".dat", ".raw", ".fw", ".img", ".rom", ".hex"}
 
+# 全域 sandbox root（由 main.py 設定）
+_SANDBOX_ROOT: Optional[Path] = None
+
+
+def set_sandbox_root(root: str) -> None:
+    """設定 sandbox 根目錄，只允許讀取此目錄內的檔案"""
+    global _SANDBOX_ROOT
+    _SANDBOX_ROOT = Path(root).resolve()
+
+
+def _safe_path(path: str) -> Optional[Path]:
+    """驗證路徑是否在 sandbox 內，防止讀取任意本機檔案"""
+    if _SANDBOX_ROOT is None:
+        # 未設定 sandbox 時，拒絕所有請求
+        return None
+
+    try:
+        full = Path(path).expanduser().resolve()
+        # 檢查是否在 sandbox 內
+        full.relative_to(_SANDBOX_ROOT)
+        return full
+    except ValueError:
+        # 路徑逃逸 sandbox
+        return None
+
 
 def ocr_image(path: str) -> str:
     """對圖片進行 OCR"""
-    p = Path(path).expanduser().resolve()
+    p = _safe_path(path)
+
+    if p is None:
+        return f"[OCR 錯誤] 路徑不在專案目錄內或 sandbox 未設定: {path}"
 
     if not p.exists():
         return f"[OCR 錯誤] 檔案不存在: {path}"
@@ -56,7 +85,10 @@ def read_binary(path: str, max_hex_bytes: int = 16384, max_strings: int = 200) -
     """
     import subprocess
 
-    p = Path(path).expanduser().resolve()
+    p = _safe_path(path)
+
+    if p is None:
+        return f"[BIN 錯誤] 路徑不在專案目錄內或 sandbox 未設定: {path}"
 
     if not p.exists():
         return f"[BIN 錯誤] 檔案不存在: {path}"

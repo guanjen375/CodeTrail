@@ -15,9 +15,15 @@ VL_MODEL = "qwen3-vl:30b-a3b"
 # Context 長度設定
 # - 5090 32GB + 192GB RAM: 可開 128K，VRAM 不足時自動 offload 到 RAM
 # - 純 GPU 模式: 建議 64K 以內避免 OOM
-# - 注意：Offload 到 RAM 會降低推理速度，但能處理更長 context
+# - 注意：Offload 到 RAM 會降低推理速度（主要是首 token 延遲/prompt ingest）
+#         但輸出階段（decode）影響較小
 NUM_CTX = 131072   # 128K，利用 192GB RAM offload
-NUM_CTX_FULL_MODE = 65536  # Full 模式 64K
+
+# Full 模式 context：設成與 NUM_CTX 相同
+# Full 模式會把完整程式碼 + 知識庫 + 圖片/bin 上下文全部塞入 prompt
+# 需要足夠大的 context 才能避免截斷
+NUM_CTX_FULL_MODE = NUM_CTX
+
 MAX_TOTAL_CHARS = 200000  # 200KB，讓中小型專案使用完整模式
 
 # ============================================================
@@ -27,6 +33,12 @@ MAX_TOOL_LOOPS = 12
 MAX_FILE_READ_CHARS = 50000
 MAX_GREP_RESULTS = 30
 MAX_LIST_DEPTH = 3
+
+# Messages 總預算（字元數，粗估 1 token ≈ 3-4 chars）
+# 128K ctx ≈ 384K chars，保留一些空間給 system prompt 和回答
+MAX_MESSAGES_BUDGET = 300000  # 300KB
+# 保留最近 N 輪的 tool 輸出（刪除舊的時優先保留最近的）
+MIN_RECENT_TOOL_OUTPUTS = 4
 
 # ============================================================
 # 完整模式設定
@@ -50,6 +62,9 @@ CODE_EXTENSIONS = {
     ".js", ".ts", ".jsx", ".tsx",
     ".txt", ".md",
 }
+
+# grep 預設搜尋的檔案類型（避免掃到圖片/大型二進位檔，提升效能）
+GREP_DEFAULT_EXTENSIONS = "*.py,*.c,*.cpp,*.h,*.hpp,*.js,*.ts,*.jsx,*.tsx,*.go,*.rs,*.java,*.kt,*.sh,*.md,*.json,*.yaml,*.yml,*.toml"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 IGNORED_DIRS = {
@@ -137,20 +152,22 @@ SPEC_QUESTION_KEYWORDS = [
 # ============================================================
 # Run Command 設定
 # ============================================================
-RUN_COMMAND_ENABLED = True
+# ⚠️ 安全警告：對不信任的專案，run_command 有任意程式碼執行風險
+# 即使有白名單，make/cmake/npm 等都會執行專案內的腳本
+# 建議：分析陌生 repo 時保持 False，只對自己的專案開啟
+RUN_COMMAND_ENABLED = False
 RUN_COMMAND_TIMEOUT = 60
 RUN_COMMAND_MAX_OUTPUT = 8000
+# 白名單：移除了 make/cmake（可執行任意動作），只保留較安全的測試命令
 ALLOWED_COMMANDS = [
-    # Python
+    # Python（相對安全，但 conftest.py 仍可能有惡意程式碼）
     'pytest', 'python -m pytest', 'python -m unittest',
-    # C/C++
-    'make test', 'make check', 'ctest',
-    # Node.js
+    # C/C++（ctest 相對安全，make test/check 已移除）
+    'ctest',
+    # Node.js（⚠️ 仍有風險，package.json scripts 可執行任意程式碼）
     'npm test', 'npm run test', 'yarn test',
-    # Rust
+    # Rust（相對安全，build.rs 仍可能有風險）
     'cargo test',
-    # Go
+    # Go（最安全，不執行專案腳本）
     'go test',
-    # 通用
-    'make', 'cmake',
 ]

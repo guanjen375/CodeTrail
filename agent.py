@@ -16,7 +16,8 @@ from typing import Optional
 from config import (
     OLLAMA_CHAT_URL, MODEL, NUM_CTX,
     MAX_TOOL_LOOPS, MAX_FILE_READ_CHARS, MAX_GREP_RESULTS, MAX_LIST_DEPTH,
-    IGNORED_DIRS, IGNORED_PATTERNS,
+    MAX_MESSAGES_BUDGET, MIN_RECENT_TOOL_OUTPUTS,
+    IGNORED_DIRS, IGNORED_PATTERNS, GREP_DEFAULT_EXTENSIONS,
     CODE_RAG_ENABLED, CODE_RAG_TOP_K, CODE_RAG_TOP_K_BUG,
     CODE_RAG_PREREAD_TOP_K, CODE_RAG_PREREAD_TOP_K_BUG,
     CODE_RAG_PREREAD_LINES, CODE_RAG_PREREAD_LINES_BUG,
@@ -279,7 +280,15 @@ class ToolExecutor:
 
         return header + "\n".join(numbered) + footer
 
-    def grep(self, pattern: str, path: str = ".", include: str = "*") -> str:
+    def grep(self, pattern: str, path: str = ".", include: str = None) -> str:
+        """搜尋 pattern
+
+        Args:
+            pattern: 搜尋字串
+            path: 搜尋目錄
+            include: 檔案過濾，支持逗號分隔的多個 glob（如 "*.py,*.c"）
+                     預設只搜尋程式碼檔案，避免掃到圖片/二進位檔
+        """
         target = self._safe_path(path)
         if not target or not target.exists():
             return f"錯誤: 路徑不存在 '{path}'"
@@ -289,6 +298,13 @@ class ToolExecutor:
         except re.error:
             regex = re.compile(re.escape(pattern), re.IGNORECASE)
 
+        # 使用預設的程式碼檔案過濾，避免掃到圖片/二進位檔
+        if include is None:
+            include = GREP_DEFAULT_EXTENSIONS
+
+        # 支持逗號分隔的多個 glob
+        include_patterns = [p.strip() for p in include.split(',')]
+
         files = []
         if target.is_file():
             files = [target]
@@ -297,7 +313,8 @@ class ToolExecutor:
                 dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith('.')]
 
                 for fname in filenames:
-                    if fnmatch.fnmatch(fname, include):
+                    # 檢查是否符合任一 include pattern
+                    if any(fnmatch.fnmatch(fname, p) for p in include_patterns):
                         fp = Path(dirpath) / fname
                         if not should_ignore_file(fname):
                             files.append(fp)
@@ -404,13 +421,77 @@ class ToolExecutor:
         elif tool == "read_file":
             return self.read_file(args.get("path", ""), args.get("start_line", 1), args.get("end_line"))
         elif tool == "grep":
-            return self.grep(args.get("pattern", ""), args.get("path", "."), args.get("include", "*"))
+            return self.grep(args.get("pattern", ""), args.get("path", "."), args.get("include"))
         elif tool == "file_info":
             return self.file_info(args.get("path", ""))
         elif tool == "run_command":
             return self.run_command(args.get("command", ""), args.get("timeout", RUN_COMMAND_TIMEOUT))
         else:
             return f"錯誤: 未知工具 '{tool}'"
+
+
+# ============================================================
+# Messages Budget 管理
+# ============================================================
+def _calc_messages_size(messages: list) -> int:
+    """計算 messages 總字元數"""
+    total = 0
+    for m in messages:
+        content = m.get("content", "")
+        if isinstance(content, str):
+            total += len(content)
+    return total
+
+
+def _trim_messages_to_budget(messages: list, budget: int = MAX_MESSAGES_BUDGET) -> list:
+    """裁切 messages 使其總大小不超過預算
+
+    策略：
+    1. 保留 system message（第一個）
+    2. 保留 user 的原始問題（第二個）
+    3. 保留最近 MIN_RECENT_TOOL_OUTPUTS 輪的 tool 輸出
+    4. 將較舊的 tool 輸出摘要化（只保留前 200 字）
+    """
+    if _calc_messages_size(messages) <= budget:
+        return messages
+
+    if len(messages) <= 2:
+        return messages
+
+    # 找出所有 tool 輸出的位置
+    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+
+    if not tool_indices:
+        return messages
+
+    # 計算需要摘要化多少舊的 tool 輸出
+    num_to_summarize = max(0, len(tool_indices) - MIN_RECENT_TOOL_OUTPUTS)
+
+    if num_to_summarize == 0:
+        # 所有都是最近的，只能硬截斷
+        for i in tool_indices:
+            content = messages[i].get("content", "")
+            if len(content) > 500:
+                messages[i]["content"] = content[:400] + f"\n... [截斷 {len(content) - 400} 字元]"
+        return messages
+
+    # 摘要化較舊的 tool 輸出
+    for idx in tool_indices[:num_to_summarize]:
+        content = messages[idx].get("content", "")
+        if len(content) > 200:
+            messages[idx]["content"] = content[:150] + f"\n... [舊輸出已摘要，原 {len(content)} 字元]"
+
+    # 如果還是超過，繼續截斷
+    while _calc_messages_size(messages) > budget and tool_indices:
+        # 找最大的 tool 輸出來截斷
+        max_idx = max(tool_indices, key=lambda i: len(messages[i].get("content", "")))
+        content = messages[max_idx].get("content", "")
+        if len(content) > 200:
+            messages[max_idx]["content"] = content[:150] + f"\n... [超預算截斷，原 {len(content)} 字元]"
+        else:
+            break  # 都已經很短了，避免無限迴圈
+
+    return messages
 
 
 # ============================================================
@@ -708,6 +789,13 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
                 "tool_name": tool_name,
                 "content": result or "（無結果）"
             })
+
+        # 檢查並裁切 messages 以控制總大小
+        old_size = _calc_messages_size(messages)
+        if old_size > MAX_MESSAGES_BUDGET:
+            messages = _trim_messages_to_budget(messages)
+            new_size = _calc_messages_size(messages)
+            print(f"   [TRIM] Messages 超預算: {old_size:,} -> {new_size:,} chars")
 
     print("[WARN] 達到最大探索次數\n")
 

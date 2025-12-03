@@ -40,7 +40,7 @@ from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from context import build_full_context, analyze_full, show_full_stats
 from agent import run_agent, handle_followup
-from media import process_images, process_binary
+from media import process_images, process_binary, set_sandbox_root
 
 
 def main():
@@ -97,6 +97,9 @@ def main():
         sys.exit(1)
 
     folder = str(Path(folder).resolve())
+
+    # 設定 media.py 的 sandbox root，防止讀取專案目錄外的檔案
+    set_sandbox_root(folder)
 
     print(f"[DIR] 掃描: {folder}")
     file_metadata = scan_project_metadata(folder)
