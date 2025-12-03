@@ -12,7 +12,7 @@ OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 MODEL = "qwen3-coder:30b"
 VL_MODEL = "qwen3-vl:30b-a3b"
 
-NUM_CTX = 65536
+NUM_CTX = 131072  # 128K（模型支援最大 262K）
 MAX_TOTAL_CHARS = 200000  # 200KB，讓中小型專案使用完整模式
 
 # ============================================================
