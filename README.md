@@ -70,11 +70,11 @@ python main.py . --exclude="*.test.py"
 python main.py . --include-dir=third_party
 ```
 
-### 外部 bin 檔案
+### 外部檔案（圖片、bin）
 
 ```bash
-# 允許讀取專案目錄外的 bin 檔案
-python main.py /path/to/project --allow-external-bin
+# 允許讀取專案目錄外的圖片和 bin 檔案
+python main.py /path/to/project --allow-external
 ```
 
 ### 執行測試（run_command）
@@ -142,22 +142,25 @@ AI_CODE_RUN_TESTS=1 python main.py /path/to/project
 - **智能字串提取**：使用 `strings` 提取整個檔案的可讀字串
 - **優先分類**：版本號、編譯日期等重要資訊會優先顯示
 
-### 讀取專案目錄外的 bin 檔案
+### 讀取專案目錄外的檔案
 
-預設情況下，bin 檔案必須在專案目錄內。如需分析外部路徑的 bin 檔案，使用 `--allow-external-bin` 參數：
+預設情況下，圖片和 bin 檔案必須在專案目錄內。如需分析外部路徑的檔案，使用 `--allow-external` 參數：
 
 ```bash
-# 允許讀取任意路徑的 bin 檔案
-python main.py /path/to/project --allow-external-bin
+# 允許讀取任意路徑的圖片和 bin 檔案
+python main.py /path/to/project --allow-external
+
+# 範例：分析專案目錄外的截圖
+python main.py ./my_project --allow-external
+>>> img:/home/user/screenshots/error.png 這個錯誤怎麼解？
 
 # 範例：分析專案目錄外的 U-Boot
-python main.py ./my_project --kb=knowledge.json --allow-external-bin
+python main.py ./my_project --kb=knowledge.json --allow-external
 >>> bin:/home/user/u-boot/u-boot.bin 這個 U-Boot 的版本是？
 ```
 
 **安全說明**：
-- 此選項只影響 bin 檔案（`.bin`, `.dat`, `.raw`, `.fw`, `.img`, `.rom`, `.hex`）
-- 圖片 OCR 仍然只能讀取專案目錄內的檔案
+- 此選項影響圖片（`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`）和 bin 檔案（`.bin`, `.dat`, `.raw`, `.fw`, `.img`, `.rom`, `.hex`）
 - 預設關閉，需明確啟用
 
 ## 知識庫格式

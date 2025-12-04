@@ -57,7 +57,7 @@ def main():
     include_dirs = []
     run_tests = False
 
-    allow_external_bin = False
+    allow_external = False
 
     i = 0
     while i < len(args):
@@ -68,8 +68,8 @@ def main():
             force_mode = "full"
         elif arg == "--run-tests":
             run_tests = True
-        elif arg == "--allow-external-bin":
-            allow_external_bin = True
+        elif arg == "--allow-external":
+            allow_external = True
         elif arg == "--kb" and i + 1 < len(args):
             kb_path = args[i + 1]
             i += 1
@@ -115,9 +115,9 @@ def main():
     folder = str(Path(folder).resolve())
 
     # 設定 media.py 的 sandbox root，防止讀取專案目錄外的檔案
-    set_sandbox_root(folder, allow_external_bin=allow_external_bin)
-    if allow_external_bin:
-        print("[CFG] 允許讀取外部 bin 檔案 (--allow-external-bin)")
+    set_sandbox_root(folder, allow_external=allow_external)
+    if allow_external:
+        print("[CFG] 允許讀取外部圖片和 bin 檔案 (--allow-external)")
 
     print(f"[DIR] 掃描: {folder}")
     file_metadata = scan_project_metadata(folder)

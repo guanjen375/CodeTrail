@@ -20,29 +20,30 @@ BINARY_EXTENSIONS = {".bin", ".dat", ".raw", ".fw", ".img", ".rom", ".hex"}
 
 # 全域 sandbox root（由 main.py 設定）
 _SANDBOX_ROOT: Optional[Path] = None
-_ALLOW_EXTERNAL_BIN: bool = False
+_ALLOW_EXTERNAL: bool = False
 
 
-def set_sandbox_root(root: str, allow_external_bin: bool = False) -> None:
+def set_sandbox_root(root: str, allow_external: bool = False) -> None:
     """設定 sandbox 根目錄，只允許讀取此目錄內的檔案
 
     Args:
         root: sandbox 根目錄
-        allow_external_bin: 是否允許讀取外部的 bin 檔案（預設 False）
+        allow_external: 是否允許讀取外部的圖片和 bin 檔案（預設 False）
     """
-    global _SANDBOX_ROOT, _ALLOW_EXTERNAL_BIN
+    global _SANDBOX_ROOT, _ALLOW_EXTERNAL
     _SANDBOX_ROOT = Path(root).resolve()
-    _ALLOW_EXTERNAL_BIN = allow_external_bin
+    _ALLOW_EXTERNAL = allow_external
 
 
-def _safe_path(path: str, allow_external: bool = False) -> Optional[Path]:
+def _safe_path(path: str, allow_external: bool = False, allowed_extensions: set = None) -> Optional[Path]:
     """驗證路徑是否在 sandbox 內，防止讀取任意本機檔案
 
     相對路徑會以 _SANDBOX_ROOT 為基準解析，而非當前工作目錄
 
     Args:
         path: 檔案路徑
-        allow_external: 是否允許外部路徑（用於 bin 檔案）
+        allow_external: 是否允許外部路徑
+        allowed_extensions: 允許的外部檔案副檔名（None 表示不限制）
     """
     if _SANDBOX_ROOT is None:
         # 未設定 sandbox 時，拒絕所有請求
@@ -62,9 +63,9 @@ def _safe_path(path: str, allow_external: bool = False) -> Optional[Path]:
             return full
         except ValueError:
             # 路徑在 sandbox 外
-            if allow_external and _ALLOW_EXTERNAL_BIN:
-                # 允許外部 bin 檔案，但仍需檢查副檔名
-                if full.suffix.lower() in BINARY_EXTENSIONS and full.exists():
+            if allow_external and _ALLOW_EXTERNAL and full.exists():
+                # 檢查副檔名（如果有限制）
+                if allowed_extensions is None or full.suffix.lower() in allowed_extensions:
                     return full
             return None
     except Exception:
@@ -73,10 +74,13 @@ def _safe_path(path: str, allow_external: bool = False) -> Optional[Path]:
 
 def ocr_image(path: str) -> str:
     """對圖片進行 OCR"""
-    p = _safe_path(path)
+    p = _safe_path(path, allow_external=True, allowed_extensions=IMAGE_EXTENSIONS)
 
     if p is None:
-        return f"[OCR 錯誤] 路徑不在專案目錄內或 sandbox 未設定: {path}"
+        if _ALLOW_EXTERNAL:
+            return f"[OCR 錯誤] 檔案不存在或不是支援的圖片格式: {path}"
+        else:
+            return f"[OCR 錯誤] 路徑不在專案目錄內（使用 --allow-external 允許外部檔案）: {path}"
 
     if not p.exists():
         return f"[OCR 錯誤] 檔案不存在: {path}"
@@ -113,14 +117,14 @@ def read_binary(path: str, max_hex_bytes: int = 16384, max_strings: int = 200) -
     """
     import subprocess
 
-    # bin 檔案允許使用外部路徑（如果 _ALLOW_EXTERNAL_BIN 已啟用）
-    p = _safe_path(path, allow_external=True)
+    # bin 檔案允許使用外部路徑（如果 _ALLOW_EXTERNAL 已啟用）
+    p = _safe_path(path, allow_external=True, allowed_extensions=BINARY_EXTENSIONS)
 
     if p is None:
-        if _ALLOW_EXTERNAL_BIN:
+        if _ALLOW_EXTERNAL:
             return f"[BIN 錯誤] 檔案不存在或不是支援的二進位格式: {path}"
         else:
-            return f"[BIN 錯誤] 路徑不在專案目錄內（使用 --allow-external-bin 允許外部檔案）: {path}"
+            return f"[BIN 錯誤] 路徑不在專案目錄內（使用 --allow-external 允許外部檔案）: {path}"
 
     if not p.exists():
         return f"[BIN 錯誤] 檔案不存在: {path}"
