@@ -20,18 +20,29 @@ BINARY_EXTENSIONS = {".bin", ".dat", ".raw", ".fw", ".img", ".rom", ".hex"}
 
 # 全域 sandbox root（由 main.py 設定）
 _SANDBOX_ROOT: Optional[Path] = None
+_ALLOW_EXTERNAL_BIN: bool = False
 
 
-def set_sandbox_root(root: str) -> None:
-    """設定 sandbox 根目錄，只允許讀取此目錄內的檔案"""
-    global _SANDBOX_ROOT
+def set_sandbox_root(root: str, allow_external_bin: bool = False) -> None:
+    """設定 sandbox 根目錄，只允許讀取此目錄內的檔案
+
+    Args:
+        root: sandbox 根目錄
+        allow_external_bin: 是否允許讀取外部的 bin 檔案（預設 False）
+    """
+    global _SANDBOX_ROOT, _ALLOW_EXTERNAL_BIN
     _SANDBOX_ROOT = Path(root).resolve()
+    _ALLOW_EXTERNAL_BIN = allow_external_bin
 
 
-def _safe_path(path: str) -> Optional[Path]:
+def _safe_path(path: str, allow_external: bool = False) -> Optional[Path]:
     """驗證路徑是否在 sandbox 內，防止讀取任意本機檔案
 
     相對路徑會以 _SANDBOX_ROOT 為基準解析，而非當前工作目錄
+
+    Args:
+        path: 檔案路徑
+        allow_external: 是否允許外部路徑（用於 bin 檔案）
     """
     if _SANDBOX_ROOT is None:
         # 未設定 sandbox 時，拒絕所有請求
@@ -44,11 +55,19 @@ def _safe_path(path: str) -> Optional[Path]:
             full = (_SANDBOX_ROOT / p).resolve()
         else:
             full = p.resolve()
+
         # 檢查是否在 sandbox 內
-        full.relative_to(_SANDBOX_ROOT)
-        return full
-    except ValueError:
-        # 路徑逃逸 sandbox
+        try:
+            full.relative_to(_SANDBOX_ROOT)
+            return full
+        except ValueError:
+            # 路徑在 sandbox 外
+            if allow_external and _ALLOW_EXTERNAL_BIN:
+                # 允許外部 bin 檔案，但仍需檢查副檔名
+                if full.suffix.lower() in BINARY_EXTENSIONS and full.exists():
+                    return full
+            return None
+    except Exception:
         return None
 
 
@@ -94,10 +113,14 @@ def read_binary(path: str, max_hex_bytes: int = 16384, max_strings: int = 200) -
     """
     import subprocess
 
-    p = _safe_path(path)
+    # bin 檔案允許使用外部路徑（如果 _ALLOW_EXTERNAL_BIN 已啟用）
+    p = _safe_path(path, allow_external=True)
 
     if p is None:
-        return f"[BIN 錯誤] 路徑不在專案目錄內或 sandbox 未設定: {path}"
+        if _ALLOW_EXTERNAL_BIN:
+            return f"[BIN 錯誤] 檔案不存在或不是支援的二進位格式: {path}"
+        else:
+            return f"[BIN 錯誤] 路徑不在專案目錄內（使用 --allow-external-bin 允許外部檔案）: {path}"
 
     if not p.exists():
         return f"[BIN 錯誤] 檔案不存在: {path}"
