@@ -70,6 +70,25 @@ python main.py . --exclude="*.test.py"
 python main.py . --include-dir=third_party
 ```
 
+### 執行測試（run_command）
+
+```bash
+# 啟用 run_command 工具，允許 Agent 執行測試命令
+python main.py /path/to/project --run-tests
+
+# 也可以用環境變數啟用
+AI_CODE_RUN_TESTS=1 python main.py /path/to/project
+```
+
+**支援的測試命令**（白名單）：
+- Python: `pytest`, `python -m pytest`, `python -m unittest`
+- C/C++: `ctest`
+- Node.js: `npm test`, `npm run test`, `yarn test`
+- Rust: `cargo test`
+- Go: `go test`
+
+**安全警告**：`run_command` 會執行專案內的測試腳本，對不信任的專案有安全風險。預設關閉，需明確啟用。
+
 ## 互動模式
 
 啟動後進入互動模式：
@@ -182,8 +201,8 @@ EMBEDDING_MODEL = "bge-m3"             # Embedding 模型
 RERANKER_MODEL = "qllama/bge-reranker-v2-m3"  # Reranker 模型
 
 # Context 長度設定（重要！根據 GPU VRAM 調整）
-NUM_CTX = 65536                        # Agent 模式 Context（64K）
-NUM_CTX_FULL_MODE = 32768              # Full 模式 Context（32K）
+NUM_CTX = 131072                       # Context 長度（128K，會自動 offload 到 RAM）
+NUM_CTX_FULL_MODE = NUM_CTX            # Full 模式 Context（與 NUM_CTX 相同）
 
 # 知識庫 RAG 設定
 KNOWLEDGE_THRESHOLD = 0.25             # 相關度門檻（短問題用 0.20）
@@ -212,16 +231,16 @@ WEAK_REF_THRESHOLD = 0.30              # REF 太弱時拒答
 | 32GB VRAM + 大 RAM | 131072 (128K) | 預設值，部分 offload 到 RAM |
 | 48GB+ VRAM | 131072+ | 可開更大 |
 
-**預設配置**（針對 5090 32GB + 192GB RAM）：
-- Agent 模式：`NUM_CTX = 131072`（128K）
-- Full 模式：`NUM_CTX_FULL_MODE = 65536`（64K）
+**預設配置**（針對 32GB VRAM + 大 RAM）：
+- `NUM_CTX = 131072`（128K）
+- Full 模式與 Agent 模式使用相同 context 長度
 
 **檢查 offload 狀態**：
 ```bash
 ollama ps  # 查看 GPU% 比例，低於 100% 表示有 offload
 ```
 
-**注意**：Offload 到 RAM 會降低推理速度，但能避免 OOM 並處理更長 context。如果速度太慢，可調低 NUM_CTX。
+**注意**：Offload 到 RAM 會降低推理速度（主要影響首 token 延遲），但能避免 OOM 並處理更長 context。如果速度太慢，可調低 NUM_CTX。
 
 ## 檔案結構
 
@@ -230,11 +249,12 @@ ai_code/
 ├── main.py          # 主程式入口
 ├── config.py        # 設定檔
 ├── utils.py         # 共用工具（LLM 呼叫、檔案掃描、嚴格模式）
-├── agent.py         # Agent 模式（動態探索）
+├── agent.py         # Agent 模式（動態探索 + run_command）
 ├── context.py       # 完整模式（全量分析）
-├── knowledge.py     # 知識庫 RAG
-├── code_rag.py      # 程式碼索引 RAG
+├── knowledge.py     # 知識庫 RAG（Reranker + MMR）
+├── code_rag.py      # 程式碼索引 RAG（符號提取 + Embedding）
 ├── media.py         # 媒體處理（圖片 OCR、二進位分析）
+├── http_client.py   # HTTP 連線池管理
 ├── RAG.py           # 知識庫建立工具（獨立腳本）
 └── knowledge.json   # 知識庫（自行建立）
 ```

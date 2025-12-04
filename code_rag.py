@@ -6,10 +6,13 @@
 
 import os
 import re
+import sys
 import json
 import hashlib
-import requests
 from pathlib import Path
+from functools import lru_cache
+
+from http_client import get_session
 
 try:
     import numpy as np
@@ -18,12 +21,34 @@ except ImportError:
     HAS_NUMPY = False
 
 from config import (
-    CODE_EXTENSIONS, IGNORED_DIRS, EMBEDDING_MODEL,
+    CODE_EXTENSIONS, EMBEDDING_MODEL,
     CODE_RAG_ENABLED, CODE_RAG_TOP_K, CODE_RAG_CACHE_FILE,
     CODE_RAG_THRESHOLD, CODE_RAG_THRESHOLD_BUG,
     OLLAMA_EMBEDDINGS_URL
 )
-from utils import should_ignore_file
+from utils import should_ignore_file, should_ignore_dir
+
+
+def _normalize_text_for_cache(text: str) -> str:
+    """正規化文字以提高 cache 命中率"""
+    return ' '.join(text.split())
+
+
+@lru_cache(maxsize=256)
+def _cached_get_embedding(text: str) -> tuple:
+    """帶 LRU cache 的 embedding 查詢（CodeRAG 用）"""
+    try:
+        session = get_session()
+        resp = session.post(
+            OLLAMA_EMBEDDINGS_URL,
+            json={"model": EMBEDDING_MODEL, "prompt": text},
+            timeout=60
+        )
+        resp.raise_for_status()
+        emb = resp.json().get("embedding", [])
+        return tuple(emb) if emb else ()
+    except Exception:
+        return ()
 
 
 class CodeRAG:
@@ -60,8 +85,11 @@ class CodeRAG:
         }
 
         files = []
+        folder_path = Path(self.folder)
         for dirpath, dirnames, filenames in os.walk(self.folder):
-            dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith('.')]
+            # 使用統一的目錄過濾邏輯
+            rel_dir = Path(dirpath).relative_to(folder_path)
+            dirnames[:] = [d for d in dirnames if not should_ignore_dir(rel_dir / d)]
             for f in filenames:
                 # 跳過 dotfile 和快取檔案
                 if f.startswith('.') or f in skip_files:
@@ -168,119 +196,143 @@ class CodeRAG:
             pass
 
     def _extract_symbols(self, filepath: Path, content: str) -> list[dict]:
-        """從程式碼中提取符號（函式、類別）"""
+        """從程式碼中提取符號（函式、類別）
+
+        改進：
+        - Python：支援縮排的 class method、decorator
+        - JS/TS：支援 arrow function、object method
+        - C/C++：支援 template、namespace、複雜返回型別
+        """
         symbols = []
         lines = content.split('\n')
         ext = filepath.suffix.lower()
         rel_path = str(filepath.relative_to(self.folder))
 
-        # Python
+        def add_symbol(name: str, sym_type: str, line_num: int):
+            symbols.append({
+                'path': rel_path,
+                'symbol': name,
+                'type': sym_type,
+                'line': line_num,
+                'context': '\n'.join(lines[max(0, line_num-3):min(len(lines), line_num+10)])
+            })
+
+        # Python：支援縮排的 method 和 decorator
         if ext in ('.py', '.pyx', '.pyi'):
-            pattern = r'^(class|def|async def)\s+(\w+)'
+            # 支援縮排（前導空白）
+            pattern = r'^(\s*)(class|def|async\s+def)\s+(\w+)'
+            pending_decorator = None
             for i, line in enumerate(lines):
-                m = re.match(pattern, line)
-                if m:
-                    sym_type = 'class' if m.group(1) == 'class' else 'function'
-                    symbols.append({
-                        'path': rel_path,
-                        'symbol': m.group(2),
-                        'type': sym_type,
-                        'line': i + 1,
-                        'context': '\n'.join(lines[max(0, i-2):min(len(lines), i+10)])
-                    })
-
-        # C/C++
-        elif ext in ('.c', '.cpp', '.cc', '.cxx', '.h', '.hpp'):
-            func_pattern = r'^[\w\s\*\&\<\>\[\]]+\s+(\w+)\s*\([^;]*\)\s*(const)?\s*\{'
-            class_pattern = r'^(class|struct)\s+(\w+)'
-
-            for i, line in enumerate(lines):
-                m = re.match(class_pattern, line)
-                if m:
-                    symbols.append({
-                        'path': rel_path,
-                        'symbol': m.group(2),
-                        'type': 'class',
-                        'line': i + 1,
-                        'context': '\n'.join(lines[max(0, i-2):min(len(lines), i+10)])
-                    })
+                # 記住 decorator，下一個 def/class 會使用它
+                if re.match(r'^\s*@\w+', line):
+                    pending_decorator = i
                     continue
 
+                m = re.match(pattern, line)
+                if m:
+                    sym_type = 'class' if m.group(2) == 'class' else 'function'
+                    # 如果有 decorator，從 decorator 開始
+                    start_line = pending_decorator if pending_decorator is not None else i
+                    add_symbol(m.group(3), sym_type, start_line + 1)
+                    pending_decorator = None
+
+        # C/C++：支援 template、namespace、複雜返回型別（含 ::, <, >, ,）
+        elif ext in ('.c', '.cpp', '.cc', '.cxx', '.h', '.hpp'):
+            # class/struct（含 template）
+            class_pattern = r'^(?:template\s*<[^>]*>\s*)?(class|struct)\s+(\w+)'
+            # namespace
+            namespace_pattern = r'^namespace\s+(\w+)'
+            # 函式：放寬型別字元集（加入 :, ,，容忍 template）
+            # 支援：std::vector<int> ns::func(...) { 或 void func(...) const {
+            func_pattern = r'^(?:template\s*<[^>]*>\s*)?[\w\s\*\&\<\>\[\]:,]+\s+(?:(\w+)::)?(\w+)\s*\([^;]*\)\s*(?:const|override|noexcept|final|\s)*\{'
+
+            for i, line in enumerate(lines):
+                # namespace
+                m = re.match(namespace_pattern, line)
+                if m:
+                    add_symbol(m.group(1), 'namespace', i + 1)
+                    continue
+
+                # class/struct
+                m = re.match(class_pattern, line)
+                if m:
+                    add_symbol(m.group(2), 'class', i + 1)
+                    continue
+
+                # 函式
                 m = re.match(func_pattern, line)
                 if m:
-                    symbols.append({
-                        'path': rel_path,
-                        'symbol': m.group(1),
-                        'type': 'function',
-                        'line': i + 1,
-                        'context': '\n'.join(lines[max(0, i-2):min(len(lines), i+10)])
-                    })
+                    # group(1) = namespace/class prefix（可選）
+                    # group(2) = 函式名
+                    func_name = m.group(2)
+                    if m.group(1):  # 有 namespace::prefix
+                        func_name = f"{m.group(1)}::{func_name}"
+                    add_symbol(func_name, 'function', i + 1)
 
         # Rust
         elif ext == '.rs':
-            pattern = r'^(pub\s+)?(fn|struct|enum|impl)\s+(\w+)'
+            pattern = r'^(\s*)(pub\s+)?(fn|struct|enum|impl|trait|mod)\s+(\w+)'
             for i, line in enumerate(lines):
                 m = re.match(pattern, line)
                 if m:
-                    sym_type = {'fn': 'function', 'struct': 'class', 'enum': 'class', 'impl': 'impl'}[m.group(2)]
-                    symbols.append({
-                        'path': rel_path,
-                        'symbol': m.group(3),
-                        'type': sym_type,
-                        'line': i + 1,
-                        'context': '\n'.join(lines[max(0, i-2):min(len(lines), i+10)])
-                    })
+                    keyword = m.group(3)
+                    sym_type = {
+                        'fn': 'function', 'struct': 'class', 'enum': 'class',
+                        'impl': 'impl', 'trait': 'trait', 'mod': 'module'
+                    }.get(keyword, 'function')
+                    add_symbol(m.group(4), sym_type, i + 1)
 
         # Go
         elif ext == '.go':
-            pattern = r'^(func|type)\s+(\w+)'
+            # 支援 method receiver：func (r *Receiver) Name()
+            pattern = r'^func\s+(?:\([^)]+\)\s+)?(\w+)'
+            type_pattern = r'^type\s+(\w+)'
             for i, line in enumerate(lines):
                 m = re.match(pattern, line)
                 if m:
-                    sym_type = 'function' if m.group(1) == 'func' else 'class'
-                    symbols.append({
-                        'path': rel_path,
-                        'symbol': m.group(2),
-                        'type': sym_type,
-                        'line': i + 1,
-                        'context': '\n'.join(lines[max(0, i-2):min(len(lines), i+10)])
-                    })
+                    add_symbol(m.group(1), 'function', i + 1)
+                    continue
+                m = re.match(type_pattern, line)
+                if m:
+                    add_symbol(m.group(1), 'class', i + 1)
 
-        # JavaScript/TypeScript
+        # JavaScript/TypeScript：支援 arrow function、object method、export
         elif ext in ('.js', '.ts', '.jsx', '.tsx'):
             patterns = [
-                (r'^(class)\s+(\w+)', 'class'),
-                (r'^(function|async function)\s+(\w+)', 'function'),
-                (r'^(const|let|var)\s+(\w+)\s*=\s*(async\s+)?\(', 'function'),
-                (r'^export\s+(class|function|const|let)\s+(\w+)', 'function'),
+                # class Foo / export class Foo
+                (r'^(?:export\s+)?(?:default\s+)?(class)\s+(\w+)', 'class'),
+                # function foo / async function foo / export function foo
+                (r'^(?:export\s+)?(?:default\s+)?(async\s+)?function\s+(\w+)', 'function'),
+                # const foo = (...) => / const foo = async (...) =>
+                (r'^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\([^)]*\)\s*=>', 'function'),
+                # const foo = function / const foo = async function
+                (r'^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?function', 'function'),
+                # object method in object literal: foo: (...) => / foo: function
+                (r'^\s+(\w+)\s*:\s*(?:async\s+)?(?:function|\([^)]*\)\s*=>)', 'function'),
+                # class method (with indentation): async foo() { / foo() {
+                (r'^\s+(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{', 'function'),
+                # interface/type
+                (r'^(?:export\s+)?(?:interface|type)\s+(\w+)', 'class'),
             ]
             for i, line in enumerate(lines):
                 for pattern, sym_type in patterns:
                     m = re.match(pattern, line)
                     if m:
-                        symbols.append({
-                            'path': rel_path,
-                            'symbol': m.group(2),
-                            'type': sym_type,
-                            'line': i + 1,
-                            'context': '\n'.join(lines[max(0, i-2):min(len(lines), i+10)])
-                        })
+                        # 取最後一個 group 作為 symbol name
+                        symbol_name = m.group(m.lastindex)
+                        # 跳過常見的控制流關鍵字
+                        if symbol_name in ('if', 'else', 'for', 'while', 'switch', 'catch', 'try', 'finally'):
+                            continue
+                        add_symbol(symbol_name, sym_type, i + 1)
                         break
 
         return symbols
 
     def _get_embedding(self, text: str) -> list:
-        """取得 embedding"""
-        try:
-            resp = requests.post(
-                OLLAMA_EMBEDDINGS_URL,
-                json={"model": EMBEDDING_MODEL, "prompt": text},
-                timeout=60
-            )
-            resp.raise_for_status()
-            return resp.json().get("embedding", [])
-        except Exception:
-            return []
+        """取得 embedding（使用 LRU cache 加速重複查詢）"""
+        normalized = _normalize_text_for_cache(text)
+        result = _cached_get_embedding(normalized)
+        return list(result) if result else []
 
     def build_index(self, verbose: bool = True):
         """建立程式碼索引"""
@@ -297,9 +349,12 @@ class CodeRAG:
 
         self.index = []
         embeddings_list = []
+        folder_path = Path(self.folder)
 
         for dirpath, dirnames, filenames in os.walk(self.folder):
-            dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith('.')]
+            # 使用統一的目錄過濾邏輯
+            rel_dir = Path(dirpath).relative_to(folder_path)
+            dirnames[:] = [d for d in dirnames if not should_ignore_dir(rel_dir / d)]
 
             for filename in filenames:
                 # 跳過 dotfile（包含快取檔案）
@@ -307,16 +362,20 @@ class CodeRAG:
                     continue
                 if Path(filename).suffix.lower() not in CODE_EXTENSIONS:
                     continue
-                if should_ignore_file(filename):
-                    continue
 
                 filepath = Path(dirpath) / filename
+                # 使用相對路徑，讓 should_ignore_file 可匹配 docs/** 等 pattern
+                rel_path = str(filepath.relative_to(self.folder))
+                if should_ignore_file(rel_path):
+                    continue
                 try:
                     content = filepath.read_text(encoding='utf-8', errors='replace')
                     symbols = self._extract_symbols(filepath, content)
 
                     for sym in symbols:
-                        embed_text = f"{sym['symbol']} {sym['context'][:300]}"
+                        # 改進：embedding text 加入 path + type，提升搜尋精準度
+                        # 格式："{path} {type} {symbol} {context}"
+                        embed_text = f"{sym['path']} {sym['type']} {sym['symbol']} {sym['context'][:300]}"
                         emb = self._get_embedding(embed_text)
 
                         # metadata 不含 embedding
@@ -329,10 +388,12 @@ class CodeRAG:
                         })
                         # embedding 單獨收集
                         embeddings_list.append(emb if emb else [])
-                except Exception:
+                except Exception as e:
+                    # 記錄錯誤但不中斷索引建立
+                    print(f"[CODE_RAG] 索引 {rel_path} 時發生錯誤: {e}", file=sys.stderr)
                     continue
 
-        # 將 embedding 轉換為 numpy array
+        # 將 embedding 轉換為 numpy array 並預先 L2 normalize
         if HAS_NUMPY and embeddings_list:
             # 確保所有 embedding 維度一致
             emb_dim = max(len(e) for e in embeddings_list) if embeddings_list else 1024
@@ -346,6 +407,12 @@ class CodeRAG:
                     # 維度不一致，填充或截斷
                     normalized.append((emb + [0.0] * emb_dim)[:emb_dim])
             self.embeddings = np.array(normalized, dtype=np.float32)
+
+            # 預先 L2 normalize，query 時可省掉 norm 計算
+            norms = np.linalg.norm(self.embeddings, axis=1, keepdims=True)
+            norms = np.where(norms > 0, norms, 1.0)  # 避免除零
+            self.embeddings = self.embeddings / norms
+            self._embeddings_normalized = True
         else:
             self.embeddings = None
             # 沒有 numpy 時，退回舊方式（embedding 存在 index 裡）
@@ -358,22 +425,102 @@ class CodeRAG:
         self._save_cache()
 
     def _extract_code_tokens(self, text: str) -> set:
-        """從問題中提取可能是程式碼的 token"""
-        tokens = set(re.findall(r'[A-Za-z_][A-Za-z0-9_]{2,}', text))
+        """從問題中提取可能是程式碼的 token
+
+        改進：tokenize snake_case 和 camelCase
+        """
+        # 先提取完整的 identifier
+        raw_tokens = set(re.findall(r'[A-Za-z_][A-Za-z0-9_]{2,}', text))
         stopwords = {'the', 'and', 'for', 'this', 'that', 'with', 'from', 'are', 'was',
                      'how', 'why', 'what', 'where', 'when', 'which', 'can', 'could',
                      'should', 'would', 'will', 'have', 'has', 'had', 'does', 'did',
                      'not', 'but', 'use', 'using', 'used', 'function', 'class', 'method',
                      '這個', '那個', '如何', '為什麼', '什麼', '怎麼'}
-        return {t for t in tokens if t.lower() not in stopwords}
+
+        result = set()
+        for token in raw_tokens:
+            if token.lower() in stopwords:
+                continue
+            result.add(token)
+            # 分解 snake_case
+            if '_' in token:
+                for part in token.split('_'):
+                    if len(part) >= 3 and part.lower() not in stopwords:
+                        result.add(part)
+            # 分解 camelCase/PascalCase
+            camel_parts = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)', token)
+            for part in camel_parts:
+                if len(part) >= 3 and part.lower() not in stopwords:
+                    result.add(part)
+
+        return result
+
+    def _tokenize_identifier(self, identifier: str) -> set:
+        """將 identifier 分解為 token（snake_case、camelCase、數字切分）"""
+        tokens = {identifier.lower()}
+        # snake_case
+        if '_' in identifier:
+            for part in identifier.split('_'):
+                if len(part) >= 2:
+                    tokens.add(part.lower())
+        # camelCase/PascalCase
+        camel_parts = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+', identifier)
+        for part in camel_parts:
+            if len(part) >= 2:
+                tokens.add(part.lower())
+        return tokens
 
     def _token_match_score(self, code_tokens: set, item: dict) -> float:
-        """計算字面匹配分數"""
+        """計算字面匹配分數
+
+        改進：
+        - 使用 token boundary 匹配而非 substring，避免 'log' 命中 'catalog'
+        - 加入 context tokens 匹配，提高召回率
+        """
         if not code_tokens:
             return 0.0
-        text = (item.get("symbol", "") + " " + item.get("path", "")).lower()
-        hits = sum(1 for t in code_tokens if t.lower() in text)
-        return hits / len(code_tokens)
+
+        symbol = item.get("symbol", "")
+        path = item.get("path", "")
+        context = item.get("context", "")
+
+        # 將 symbol 和 path 分解為 tokens
+        target_tokens = self._tokenize_identifier(symbol)
+        # path 中提取檔名部分
+        path_name = Path(path).stem if path else ""
+        target_tokens.update(self._tokenize_identifier(path_name))
+
+        # 從 context 中提取 identifier tokens（限制數量避免太多雜訊）
+        context_tokens = set()
+        context_identifiers = re.findall(r'[A-Za-z_][A-Za-z0-9_]{2,}', context[:500])
+        for ident in context_identifiers[:30]:  # 最多取 30 個 identifier
+            context_tokens.update(self._tokenize_identifier(ident))
+
+        # 計算 token 級別的精確匹配
+        hits = 0
+        context_hits = 0
+        exact_symbol_match = False
+
+        for t in code_tokens:
+            t_lower = t.lower()
+            # 完全匹配 symbol（忽略大小寫）
+            if t_lower == symbol.lower():
+                exact_symbol_match = True
+                hits += 2  # 完全匹配加倍分數
+            elif t_lower in target_tokens:
+                hits += 1
+            elif t_lower in context_tokens:
+                context_hits += 1  # context 匹配分數較低
+
+        # 如果完全匹配 symbol，直接給高分
+        if exact_symbol_match:
+            return 1.0
+
+        # 計算最終分數：target_tokens 匹配優先，context 匹配作為補充
+        base_score = hits / len(code_tokens)
+        context_bonus = context_hits / len(code_tokens) * 0.3  # context 匹配只算 30% 權重
+
+        return min(1.0, base_score + context_bonus)
 
     def _get_embedding_at(self, idx: int) -> list:
         """取得指定索引的 embedding（相容新舊格式）"""
@@ -402,12 +549,19 @@ class CodeRAG:
         # 使用 numpy 向量化計算 cosine similarity（如果可用）
         if HAS_NUMPY and self.embeddings is not None and len(self.embeddings) > 0:
             q_vec = np.array(q_emb, dtype=np.float32)
-            # 計算所有 cosine similarity
-            dot_products = np.dot(self.embeddings, q_vec)
-            norms = np.linalg.norm(self.embeddings, axis=1) * np.linalg.norm(q_vec)
-            # 避免除零
-            norms = np.where(norms > 0, norms, 1.0)
-            emb_scores = dot_products / norms
+
+            # 如果 embeddings 已經預先 L2 normalize，只需要 normalize query 然後做 dot product
+            if getattr(self, '_embeddings_normalized', False):
+                q_norm = np.linalg.norm(q_vec)
+                if q_norm > 0:
+                    q_vec = q_vec / q_norm
+                emb_scores = np.dot(self.embeddings, q_vec)
+            else:
+                # 舊的方式：計算完整的 cosine similarity
+                dot_products = np.dot(self.embeddings, q_vec)
+                norms = np.linalg.norm(self.embeddings, axis=1) * np.linalg.norm(q_vec)
+                norms = np.where(norms > 0, norms, 1.0)
+                emb_scores = dot_products / norms
         else:
             emb_scores = None
 
@@ -429,9 +583,19 @@ class CodeRAG:
             kw_score = self._token_match_score(code_tokens, item)
 
             # 明確點名 symbol 時，大幅提高權重
-            # 如果 keyword 幾乎完全匹配（>0.8），認定為「明確點名」
-            if kw_score >= 0.8:
+            # 改進：用 symbol 精確匹配（正則邊界）而非單純 kw_score 門檻
+            # 避免短 query 或中文問題下 kw_score 門檻誤收噪音
+            symbol = item.get("symbol", "")
+            symbol_lower = symbol.lower()
+            is_explicit_mention = any(
+                t.lower() == symbol_lower for t in code_tokens
+            )
+
+            if is_explicit_mention:
                 # 明確點名：直接給很高分，即使 embedding 不太像
+                combined = 0.95
+            elif kw_score >= 0.8 and len(code_tokens) >= 2:
+                # 高 kw_score 但需要至少 2 個 code_tokens，避免短 query 誤判
                 combined = 0.9 + kw_score * 0.1
             else:
                 # 一般情況：function 類型給一點優先權
@@ -442,17 +606,36 @@ class CodeRAG:
 
         scores.sort(reverse=True, key=lambda x: x[0])
 
+        # 改進：短 query 判定使用 code_tokens 數量而非 split()
+        # 中文問題用 split() 會被判成 1 個字串，導致誤判
+        is_short_query = len(code_tokens) <= 2
+
         results = []
         for combined, emb_score, kw_score, item in scores[:top_k]:
-            # 使用動態門檻，或字面匹配高可以放寬
-            if combined >= threshold or kw_score >= 0.5:
-                results.append({
-                    'path': item['path'],
-                    'symbol': item['symbol'],
-                    'type': item['type'],
-                    'line': item['line'],
-                    'score': round(combined, 3)
-                })
+            # 使用動態門檻
+            # 改進：短 query 時更嚴格，避免混入噪音
+            if is_short_query:
+                # 短 query：只有 combined 夠高或 explicit symbol match 才加入
+                symbol_lower = item.get("symbol", "").lower()
+                is_explicit = any(t.lower() == symbol_lower for t in code_tokens)
+                if combined >= threshold or is_explicit:
+                    results.append({
+                        'path': item['path'],
+                        'symbol': item['symbol'],
+                        'type': item['type'],
+                        'line': item['line'],
+                        'score': round(combined, 3)
+                    })
+            else:
+                # 一般 query：kw_score 高分(>=0.85)也額外加入
+                if combined >= threshold or kw_score >= 0.85:
+                    results.append({
+                        'path': item['path'],
+                        'symbol': item['symbol'],
+                        'type': item['type'],
+                        'line': item['line'],
+                        'score': round(combined, 3)
+                    })
 
         return results
 

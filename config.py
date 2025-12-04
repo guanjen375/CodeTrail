@@ -86,12 +86,24 @@ IGNORED_FILES = {
     "news", "history", "todo",
 }
 
+# 完全忽略的檔案 pattern（不會被索引，也不會被搜尋）
 IGNORED_PATTERNS = [
-    "*_test.cpp", "*_test.c", "*_test.py", "*_test.go",
-    "test_*.py", "*_unittest.*", "*_mock.*", "*_stub.*",
     "*.bak", "*.orig", "*.swp", "*.tmp",
     "*.min.js", "*.min.css", "*.map",
 ]
+
+# 低優先級檔案 pattern（會被索引和搜尋，但在排序時優先級較低）
+# 這些檔案包含測試，測試常常定義了「規格=行為」，對 bug 類問題很重要
+LOW_PRIORITY_PATTERNS = [
+    "*_test.cpp", "*_test.c", "*_test.py", "*_test.go",
+    "test_*.py", "*_unittest.*", "*_mock.*", "*_stub.*",
+]
+
+# 允許的 dot 目錄（這些包含重要的 CI/CD 設定）
+ALLOWED_DOT_DIRS = {
+    ".github", ".gitlab", ".circleci", ".gitlab-ci",
+    ".travis", ".azure-pipelines", ".husky",
+}
 
 # ============================================================
 # 知識庫 (RAG) 設定
@@ -145,6 +157,8 @@ STRICT_MODE_KEYWORDS = [
 ]
 STRICT_MODE_TEMPERATURE = 0.0        # 嚴格模式下溫度壓到最低
 WEAK_REF_THRESHOLD = 0.30            # REF 分數低於此值視為「太弱」
+SKIP_LOW_CONFIDENCE_KB = True        # 是否跳過低信心度的 KB 上下文注入
+LOW_CONFIDENCE_KB_THRESHOLD = 0.25   # 低於此分數則不注入 KB context（避免雜訊）
 
 # Spec/規格類問題關鍵字（自動觸發嚴格模式）
 SPEC_QUESTION_KEYWORDS = [
@@ -160,10 +174,14 @@ SPEC_QUESTION_KEYWORDS = [
 # ⚠️ 安全警告：對不信任的專案，run_command 有任意程式碼執行風險
 # 即使有白名單，make/cmake/npm 等都會執行專案內的腳本
 # 建議：分析陌生 repo 時保持 False，只對自己的專案開啟
-RUN_COMMAND_ENABLED = False
+#
+# 可透過 CLI flag --run-tests 啟用，或環境變數 AI_CODE_RUN_TESTS=1
+import os as _os
+RUN_COMMAND_ENABLED = _os.environ.get('AI_CODE_RUN_TESTS', '').lower() in ('1', 'true', 'yes')
 RUN_COMMAND_TIMEOUT = 60
 RUN_COMMAND_MAX_OUTPUT = 8000
-# 白名單：移除了 make/cmake（可執行任意動作），只保留較安全的測試命令
+# 白名單：完整命令列表（用於 shlex.split 後的驗證）
+# 改進：使用 shell=False + shlex.split，更安全
 ALLOWED_COMMANDS = [
     # Python（相對安全，但 conftest.py 仍可能有惡意程式碼）
     'pytest', 'python -m pytest', 'python -m unittest',

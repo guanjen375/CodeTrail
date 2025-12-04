@@ -147,16 +147,19 @@ def split_by_semantic_with_sections(text: str, max_chars: int = CHUNK_SIZE) -> L
     for line in lines:
         line_len = len(line) + 1  # +1 for newline
 
-        # 遇到標題 → 更新章節 + 開始新 chunk
+        # 遇到標題 → 先 flush 舊 chunk（用舊 section），再更新 section
         if is_heading(line):
-            section_title = extract_section_title(line)
-            if section_title:
-                current_section = section_title
-
+            # 先 flush 舊 chunk（保持舊的 section）
             if current_chunk:
                 chunk_text = '\n'.join(current_chunk).strip()
                 if chunk_text:
                     chunks.append({"content": chunk_text, "section": current_section})
+
+            # 再更新 section
+            section_title = extract_section_title(line)
+            if section_title:
+                current_section = section_title
+
             current_chunk = [line]
             current_len = line_len
             continue

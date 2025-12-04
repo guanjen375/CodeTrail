@@ -8,13 +8,15 @@ import os
 import sys
 import re
 import fnmatch
-import requests
 from pathlib import Path
+
+from http_client import get_session
 
 from config import (
     OLLAMA_GENERATE_URL, OLLAMA_TAGS_URL, OLLAMA_PS_URL,
     MODEL, NUM_CTX, NUM_CTX_FULL_MODE,
     CODE_EXTENSIONS, IGNORED_DIRS, IGNORED_FILES, IGNORED_PATTERNS,
+    LOW_PRIORITY_PATTERNS, ALLOWED_DOT_DIRS,
     STRICT_MODE, STRICT_MODE_KEYWORDS, SPEC_QUESTION_KEYWORDS,
     STRICT_MODE_TEMPERATURE, WEAK_REF_THRESHOLD
 )
@@ -23,11 +25,12 @@ from config import (
 def check_ollama_gpu() -> tuple[bool, str]:
     """檢查 Ollama GPU 狀態"""
     try:
-        resp = requests.get(OLLAMA_TAGS_URL, timeout=5)
+        session = get_session()
+        resp = session.get(OLLAMA_TAGS_URL, timeout=5)
         if resp.status_code != 200:
             return False, "[ERROR] Ollama 服務異常"
 
-        resp = requests.get(OLLAMA_PS_URL, timeout=5)
+        resp = session.get(OLLAMA_PS_URL, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
             models = data.get("models", [])
@@ -52,39 +55,73 @@ def check_ollama_gpu() -> tuple[bool, str]:
 
         return True, "[GPU] 狀態查詢失敗"
 
-    except requests.exceptions.ConnectionError:
-        return False, "[ERROR] 無法連接 Ollama"
     except Exception as e:
-        return False, f"[WARN] GPU 檢測失敗: {type(e).__name__}"
+        err_type = type(e).__name__
+        if "ConnectionError" in err_type:
+            return False, "[ERROR] 無法連接 Ollama"
+        return False, f"[WARN] GPU 檢測失敗: {err_type}"
 
 
 def should_ignore_dir(path: Path) -> bool:
-    """判斷是否應忽略目錄"""
+    """判斷是否應忽略目錄
+
+    改進：dot 目錄不再一律排除，允許 .github/.gitlab/.circleci 等 CI 設定目錄
+    """
     for part in path.parts:
-        if part.lower() in IGNORED_DIRS or part.startswith('.'):
+        part_lower = part.lower()
+        if part_lower in IGNORED_DIRS:
+            return True
+        # dot 目錄：只有不在白名單中的才忽略
+        if part.startswith('.') and part_lower not in ALLOWED_DOT_DIRS:
             return True
     return False
 
 
-def should_ignore_file(filepath: str) -> bool:
-    """判斷是否應忽略檔案"""
+def is_low_priority_file(filepath: str) -> bool:
+    """判斷檔案是否為低優先級（測試檔案等）
+
+    低優先級檔案仍會被索引和搜尋，但在排序時優先級較低
+    """
     name = Path(filepath).name.lower()
-    stem = Path(filepath).stem.lower()
+    return any(fnmatch.fnmatch(name, pattern) for pattern in LOW_PRIORITY_PATTERNS)
+
+
+def should_ignore_file(filepath: str) -> bool:
+    """判斷是否應忽略檔案
+
+    改進：支援相對路徑匹配，可用 docs/** 這類 pattern
+    """
+    path = Path(filepath)
+    name = path.name.lower()
+    stem = path.stem.lower()
 
     if name in IGNORED_FILES or stem in IGNORED_FILES:
         return True
 
+    # 對 pattern 同時檢查檔名和相對路徑
+    filepath_lower = filepath.lower().replace('\\', '/')
     for pattern in IGNORED_PATTERNS:
+        # 檔名匹配
         if fnmatch.fnmatch(name, pattern):
+            return True
+        # 相對路徑匹配（支援 docs/** 這類 pattern）
+        if fnmatch.fnmatch(filepath_lower, pattern):
             return True
 
     return False
 
 
 def get_priority(filepath: str) -> int:
-    """取得檔案優先級（用於完整模式排序）"""
+    """取得檔案優先級（用於完整模式排序）
+
+    改進：測試檔案不再被忽略，而是給予較低優先級（6）
+    """
     name = Path(filepath).name.lower()
     path_lower = filepath.lower()
+
+    # 測試檔案：低優先級但不忽略（測試定義了規格/行為）
+    if is_low_priority_file(filepath):
+        return 6
 
     if name in ("main.cpp", "main.c", "main.py", "app.py", "index.py", "index.js"):
         return -10
@@ -116,16 +153,22 @@ def get_priority(filepath: str) -> int:
 
 
 def scan_project_metadata(folder: str) -> list[dict]:
-    """掃描專案取得檔案元資料（不讀取內容）"""
+    """掃描專案取得檔案元資料（不讀取內容）
+
+    改進：使用 should_ignore_dir 統一判斷，支援 ALLOWED_DOT_DIRS
+    """
     files = []
     folder_path = Path(folder).resolve()
     self_path = Path(sys.argv[0]).resolve()
 
     for dirpath, dirnames, filenames in os.walk(folder_path):
-        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith('.')]
+        # 使用 should_ignore_dir 統一判斷（包含 ALLOWED_DOT_DIRS 支援）
+        rel_dir = Path(dirpath).relative_to(folder_path) if dirpath != str(folder_path) else Path()
+        dirnames[:] = [d for d in dirnames if not should_ignore_dir(rel_dir / d)]
 
         for filename in filenames:
-            if filename.startswith('.'):
+            # 跳過隱藏檔（如 .env, .gitignore），但允許 ALLOWED_DOT_DIRS 內的檔案
+            if filename.startswith('.') and not any(part.lower() in ALLOWED_DOT_DIRS for part in rel_dir.parts):
                 continue
 
             filepath = Path(dirpath) / filename
@@ -162,16 +205,22 @@ def scan_project_metadata(folder: str) -> list[dict]:
 
 
 def scan_project(folder: str) -> dict[str, str]:
-    """掃描專案取得檔案內容"""
+    """掃描專案取得檔案內容
+
+    改進：使用 should_ignore_dir 統一判斷，支援 ALLOWED_DOT_DIRS
+    """
     files = {}
     folder_path = Path(folder).resolve()
     self_path = Path(sys.argv[0]).resolve()
 
     for dirpath, dirnames, filenames in os.walk(folder_path):
-        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith('.')]
+        # 使用 should_ignore_dir 統一判斷（包含 ALLOWED_DOT_DIRS 支援）
+        rel_dir = Path(dirpath).relative_to(folder_path) if dirpath != str(folder_path) else Path()
+        dirnames[:] = [d for d in dirnames if not should_ignore_dir(rel_dir / d)]
 
         for filename in filenames:
-            if filename.startswith('.'):
+            # 跳過隱藏檔（如 .env, .gitignore），但允許 ALLOWED_DOT_DIRS 內的檔案
+            if filename.startswith('.') and not any(part.lower() in ALLOWED_DOT_DIRS for part in rel_dir.parts):
                 continue
 
             filepath = Path(dirpath) / filename
@@ -214,7 +263,8 @@ def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None) -> str:
     """
     ctx = num_ctx if num_ctx is not None else NUM_CTX
     try:
-        resp = requests.post(OLLAMA_GENERATE_URL, json={
+        session = get_session()
+        resp = session.post(OLLAMA_GENERATE_URL, json={
             "model": MODEL,
             "prompt": prompt,
             "stream": False,
@@ -222,25 +272,33 @@ def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None) -> str:
         }, timeout=600)
         resp.raise_for_status()
         return resp.json().get("response", "")
-    except requests.exceptions.ConnectionError:
-        return "[ERROR] 無法連接 Ollama"
-    except requests.exceptions.Timeout:
-        return "[ERROR] 請求超時"
     except Exception as e:
-        return f"[ERROR] 錯誤: {e}"
+        err_type = type(e).__name__
+        if "ConnectionError" in err_type:
+            return "[ERROR] 無法連接 Ollama"
+        elif "Timeout" in err_type:
+            return "[ERROR] 請求超時"
+        else:
+            return f"[ERROR] 錯誤: {e}"
 
 
 def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None) -> str:
-    """呼叫 LLM 生成回應（串流輸出，逐字顯示）
+    """呼叫 LLM 生成回應（串流輸出，批次顯示）
+
+    改進：批次輸出減少 I/O 開銷，每累積一定字數或遇到換行時才 flush
 
     Args:
         prompt: 提示詞
         temperature: 溫度參數
         num_ctx: Context 長度，預設使用 NUM_CTX
     """
+    import json as json_module
+    import time
+
     ctx = num_ctx if num_ctx is not None else NUM_CTX
     try:
-        resp = requests.post(OLLAMA_GENERATE_URL, json={
+        session = get_session()
+        resp = session.post(OLLAMA_GENERATE_URL, json={
             "model": MODEL,
             "prompt": prompt,
             "stream": True,
@@ -249,27 +307,54 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None) 
         resp.raise_for_status()
 
         full_response = []
+        buffer = []
+        buffer_chars = 0
+        last_flush = time.time()
+        BATCH_SIZE = 20  # 累積 20 字元或 100ms 後 flush
+        FLUSH_INTERVAL = 0.1  # 100ms
+
         for line in resp.iter_lines():
             if line:
                 try:
-                    import json
-                    chunk = json.loads(line)
+                    chunk = json_module.loads(line)
                     token = chunk.get("response", "")
                     if token:
-                        print(token, end="", flush=True)
                         full_response.append(token)
-                except json.JSONDecodeError:
+                        buffer.append(token)
+                        buffer_chars += len(token)
+
+                        # 遇到換行、累積足夠字數、或超時則 flush
+                        now = time.time()
+                        should_flush = (
+                            '\n' in token or
+                            buffer_chars >= BATCH_SIZE or
+                            (now - last_flush) >= FLUSH_INTERVAL
+                        )
+
+                        if should_flush and buffer:
+                            print(''.join(buffer), end="", flush=True)
+                            buffer = []
+                            buffer_chars = 0
+                            last_flush = now
+
+                except json_module.JSONDecodeError:
                     pass
+
+        # 輸出剩餘的 buffer
+        if buffer:
+            print(''.join(buffer), end="", flush=True)
 
         print()  # 換行
         return "".join(full_response)
 
-    except requests.exceptions.ConnectionError:
-        return "[ERROR] 無法連接 Ollama"
-    except requests.exceptions.Timeout:
-        return "[ERROR] 請求超時"
     except Exception as e:
-        return f"[ERROR] 錯誤: {e}"
+        err_type = type(e).__name__
+        if "ConnectionError" in err_type:
+            return "[ERROR] 無法連接 Ollama"
+        elif "Timeout" in err_type:
+            return "[ERROR] 請求超時"
+        else:
+            return f"[ERROR] 錯誤: {e}"
 
 
 def is_spec_question(question: str) -> bool:
@@ -307,16 +392,34 @@ def should_use_strict_mode(question: str, knowledge_ctx: str, kb_metadata: dict 
 def should_refuse_answer(question: str, kb_metadata: dict) -> bool:
     """
     判斷是否應該拒絕回答（REF 太弱且是 spec 問題）
+
+    改進：
+    - spec 問題只看 embedding score（或 rerank score），不看 hybrid
+      因為 keyword 很容易把分數灌高，造成假陽性
+    - 額外檢查是否命中 type=spec 的 chunk
     """
     if not kb_metadata:
         return False
 
     is_spec = is_spec_question(question)
-    has_ref = kb_metadata.get("has_ref", False)
-    top_score = kb_metadata.get("top_score", 0.0)
+    if not is_spec:
+        return False
 
-    # spec 問題但沒有 REF 或 REF 太弱
-    if is_spec and (not has_ref or top_score < WEAK_REF_THRESHOLD):
+    has_ref = kb_metadata.get("has_ref", False)
+    if not has_ref:
+        return True
+
+    # 優先使用 embedding score（比 hybrid 更可靠）
+    top_emb_score = kb_metadata.get("top_emb_score", kb_metadata.get("top_score", 0.0))
+
+    # spec 問題：embedding score 太低視為弱證據
+    if top_emb_score < WEAK_REF_THRESHOLD:
+        return True
+
+    # 額外檢查：spec 問題最好要命中 type=spec 的 chunk
+    has_spec_chunk = kb_metadata.get("has_spec_chunk", True)  # 預設 True（向後相容）
+    if not has_spec_chunk and top_emb_score < WEAK_REF_THRESHOLD + 0.1:
+        # 沒有 spec chunk 且 embedding score 不夠高，視為弱證據
         return True
 
     return False

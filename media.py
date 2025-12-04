@@ -8,10 +8,10 @@
 
 import re
 import base64
-import requests
 from pathlib import Path
 from typing import Optional
 
+from http_client import get_session
 from config import OLLAMA_GENERATE_URL, VL_MODEL, IMAGE_EXTENSIONS
 
 
@@ -73,7 +73,8 @@ def ocr_image(path: str) -> str:
         with open(p, "rb") as f:
             data = base64.b64encode(f.read()).decode()
 
-        resp = requests.post(OLLAMA_GENERATE_URL, json={
+        session = get_session()
+        resp = session.post(OLLAMA_GENERATE_URL, json={
             "model": VL_MODEL,
             "prompt": "列出圖片中的所有文字，保持格式。",
             "images": [data],

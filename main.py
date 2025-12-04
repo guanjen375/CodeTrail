@@ -33,7 +33,8 @@ from pathlib import Path
 
 from config import (
     MODEL, NUM_CTX, MAX_TOTAL_CHARS, KNOWLEDGE_FILE,
-    CODE_RAG_ENABLED, IGNORED_DIRS, IGNORED_PATTERNS
+    CODE_RAG_ENABLED, IGNORED_DIRS, IGNORED_PATTERNS,
+    SKIP_LOW_CONFIDENCE_KB, LOW_CONFIDENCE_KB_THRESHOLD
 )
 from utils import check_ollama_gpu, scan_project_metadata, scan_project, should_refuse_answer
 from knowledge import KnowledgeBase
@@ -41,9 +42,12 @@ from code_rag import CodeRAG
 from context import build_full_context, analyze_full, show_full_stats
 from agent import run_agent, handle_followup
 from media import process_images, process_binary, set_sandbox_root
+from http_client import close_session
 
 
 def main():
+    import config  # 動態修改 config 用
+
     args = sys.argv[1:]
     folder = "."
     question = None
@@ -51,6 +55,7 @@ def main():
     kb_path = KNOWLEDGE_FILE
     extra_excludes = []
     include_dirs = []
+    run_tests = False
 
     i = 0
     while i < len(args):
@@ -59,6 +64,8 @@ def main():
             force_mode = "agent"
         elif arg == "--full":
             force_mode = "full"
+        elif arg == "--run-tests":
+            run_tests = True
         elif arg == "--kb" and i + 1 < len(args):
             kb_path = args[i + 1]
             i += 1
@@ -91,6 +98,11 @@ def main():
         for p in extra_excludes:
             IGNORED_PATTERNS.append(p)
             print(f"[CFG] 排除: {p}")
+
+    # 動態設定 RUN_COMMAND_ENABLED（必須在 import 後設定，否則 config 已固定）
+    if run_tests:
+        config.RUN_COMMAND_ENABLED = True
+        print("[CFG] 啟用 run_command 工具 (--run-tests)")
 
     if not os.path.isdir(folder):
         print(f"[ERROR] 資料夾不存在: {folder}")
@@ -160,6 +172,17 @@ def main():
         img_ctx = img_ctx + bin_ctx  # 合併圖片和二進位上下文
         print("[KB] 查詢知識庫...")
         knowledge_ctx, knowledge_display, kb_metadata = kb.query(clean_q) if kb.loaded else ("", "", {})
+
+        # 跳過低信心度的 KB context 注入，避免雜訊
+        # 改進：使用 top_emb_score（純 embedding 分數）而非 top_score（含 keyword）
+        # 這與 should_refuse_answer 的標準一致，避免 keyword 灌高分數造成假陽性
+        if SKIP_LOW_CONFIDENCE_KB and knowledge_ctx:
+            top_emb_score = kb_metadata.get("top_emb_score", kb_metadata.get("top_score", 0.0))
+            if top_emb_score < LOW_CONFIDENCE_KB_THRESHOLD:
+                print(f"[KB] 跳過低信心度上下文 (emb_score={top_emb_score:.2f} < {LOW_CONFIDENCE_KB_THRESHOLD})")
+                knowledge_ctx = ""
+                knowledge_display = ""
+
         if knowledge_display:
             print(knowledge_display)
 
@@ -217,6 +240,16 @@ def main():
             if kb.loaded:
                 print("[KB] 查詢知識庫...")
             knowledge_ctx, knowledge_display, kb_metadata = kb.query(rag_query) if kb.loaded else ("", "", {})
+
+            # 跳過低信心度的 KB context 注入，避免雜訊
+            # 改進：使用 top_emb_score（純 embedding 分數）而非 top_score（含 keyword）
+            if SKIP_LOW_CONFIDENCE_KB and knowledge_ctx:
+                top_emb_score = kb_metadata.get("top_emb_score", kb_metadata.get("top_score", 0.0))
+                if top_emb_score < LOW_CONFIDENCE_KB_THRESHOLD:
+                    print(f"[KB] 跳過低信心度上下文 (emb_score={top_emb_score:.2f} < {LOW_CONFIDENCE_KB_THRESHOLD})")
+                    knowledge_ctx = ""
+                    knowledge_display = ""
+
             if knowledge_display:
                 print(knowledge_display)
 
@@ -275,4 +308,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # 清理 HTTP session，釋放連線池資源
+        close_session()
