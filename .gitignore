@@ -12,9 +12,12 @@ venv/
 # IDE
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 
 # 快取
 .code_rag_cache.json
+.code_rag_cache_meta.json
+.code_rag_cache_emb.npz
 *.egg-info/

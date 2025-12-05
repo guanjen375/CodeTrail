@@ -43,6 +43,7 @@ from context import build_full_context, analyze_full, show_full_stats
 from agent import run_agent, handle_followup
 from media import process_images, process_binary, set_sandbox_root
 from http_client import close_session
+from web import fetch_from_url, cleanup_temp_dir
 
 
 def main():
@@ -56,8 +57,9 @@ def main():
     extra_excludes = []
     include_dirs = []
     run_tests = False
-
     allow_external = False
+    web_url = None  # 網頁模式 URL
+    temp_dir = None  # 網頁模式暫存目錄
 
     i = 0
     while i < len(args):
@@ -70,6 +72,11 @@ def main():
             run_tests = True
         elif arg == "--allow-external":
             allow_external = True
+        elif arg == "--web" and i + 1 < len(args):
+            web_url = args[i + 1]
+            i += 1
+        elif arg.startswith("--web="):
+            web_url = arg.split("=", 1)[1]
         elif arg == "--kb" and i + 1 < len(args):
             kb_path = args[i + 1]
             i += 1
@@ -87,9 +94,12 @@ def main():
             include_dirs.append(arg.split("=", 1)[1])
         elif arg.startswith("-"):
             pass
-        elif folder == ".":
+        elif web_url is None and folder == ".":
             folder = arg
+        elif web_url is None:
+            question = arg
         else:
+            # 網頁模式下，其餘參數為問題
             question = arg
         i += 1
 
@@ -107,6 +117,21 @@ def main():
     if run_tests:
         config.RUN_COMMAND_ENABLED = True
         print("[CFG] 啟用 run_command 工具 (--run-tests)")
+
+    # 網頁模式：從 Git URL 下載程式碼
+    if web_url:
+        print("=" * 50)
+        print("[MODE] 網頁模式 (Web Mode)")
+        print("=" * 50)
+
+        temp_dir, web_info = fetch_from_url(web_url)
+        if not temp_dir:
+            print("[ERROR] 無法從 URL 取得程式碼")
+            sys.exit(1)
+
+        folder = temp_dir
+        print(f"[WEB] 使用暫存目錄: {folder}")
+        print("-" * 50)
 
     if not os.path.isdir(folder):
         print(f"[ERROR] 資料夾不存在: {folder}")
@@ -207,7 +232,7 @@ def main():
             print("1. 確認知識庫中有包含相關的規格文件")
             print("2. 嘗試用更具體的關鍵字描述問題")
             print("3. 若確定要用一般知識回答，請改用不含規格關鍵字的問法")
-            return
+            return temp_dir
 
         print("\n" + "=" * 50)
         print("[NOTE] 回答:\n")
@@ -217,7 +242,7 @@ def main():
             # empty 模式和 agent 模式都使用 run_agent
             result = run_agent(folder, clean_q, img_ctx, knowledge_ctx=knowledge_ctx, code_rag=code_rag)
         # 串流輸出已在函數內完成，不需再次印出
-        return
+        return temp_dir
 
     # 互動模式
     qa_history = []
@@ -323,10 +348,16 @@ def main():
             print("\n[BYE] 再見!")
             break
 
+    return temp_dir
+
 
 if __name__ == "__main__":
+    _temp_dir = None
     try:
-        main()
+        _temp_dir = main()
     finally:
+        # 清理網頁模式的暫存目錄
+        if _temp_dir:
+            cleanup_temp_dir(_temp_dir)
         # 清理 HTTP session，釋放連線池資源
         close_session()

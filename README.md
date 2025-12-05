@@ -6,6 +6,7 @@
 
 - **完整模式**：小型專案（< 200KB）一次讀入全部程式碼分析
 - **Agent 模式**：大型專案動態探索，按需讀取檔案
+- **網頁模式**：直接分析 GitHub/GitLab/Bitbucket 上的程式碼（測試中）
 - **知識庫 RAG**：整合技術文件（PDF/Markdown），回答時引用文件來源
 - **Code RAG**：自動索引程式碼符號（函式/類別），快速定位相關程式碼
 - **圖片 OCR**：支援截圖中的錯誤訊息辨識（使用 VL 模型）
@@ -95,6 +96,40 @@ AI_CODE_RUN_TESTS=1 python main.py /path/to/project
 - Go: `go test`
 
 **安全警告**：`run_command` 會執行專案內的測試腳本，對不信任的專案有安全風險。預設關閉，需明確啟用。
+
+### 網頁模式（測試中）
+
+> **注意**：此功能目前處於測試階段，僅支援 Git 平台的公開 repo。
+
+```bash
+# 分析 GitHub repo
+python main.py --web https://github.com/user/repo
+
+# 分析特定分支
+python main.py --web https://github.com/user/repo/tree/develop
+
+# 分析特定目錄
+python main.py --web https://github.com/user/repo/tree/main/src
+
+# 分析單一檔案
+python main.py --web https://github.com/user/repo/blob/main/file.py
+
+# 帶問題的單次模式
+python main.py --web https://github.com/user/repo "這個專案的架構是什麼？"
+
+# 搭配其他參數
+python main.py --web https://github.com/user/repo --agent --kb=docs.json
+```
+
+**支援的平台**：
+- GitHub: `https://github.com/user/repo`
+- GitLab: `https://gitlab.com/user/repo`
+- Bitbucket: `https://bitbucket.org/user/repo`
+
+**限制**：
+- 僅支援公開 repo（不支援私有 repo 或需要認證的 URL）
+- 大型 repo 下載較慢，建議指定子目錄
+- 程式結束後暫存目錄會自動清理
 
 ## 互動模式
 
@@ -282,6 +317,7 @@ ai_code/
 ├── knowledge.py     # 知識庫 RAG（Reranker + MMR）
 ├── code_rag.py      # 程式碼索引 RAG（符號提取 + Embedding）
 ├── media.py         # 媒體處理（圖片 OCR、二進位分析）
+├── web.py           # 網頁模式（Git URL 下載，測試中）
 ├── http_client.py   # HTTP 連線池管理
 ├── RAG.py           # 知識庫建立工具（獨立腳本）
 └── knowledge.json   # 知識庫（自行建立）
