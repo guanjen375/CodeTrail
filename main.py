@@ -122,21 +122,25 @@ def main():
     print(f"[DIR] 掃描: {folder}")
     file_metadata = scan_project_metadata(folder)
 
-    if not file_metadata:
-        print("[ERROR] 沒有找到程式碼檔案")
-        sys.exit(1)
-
-    total_size = sum(f["size"] for f in file_metadata)
-    file_count = len(file_metadata)
-
-    print(f"[FILE] 找到 {file_count} 個檔案 (~{total_size:,} bytes)")
+    is_empty_project = not file_metadata
+    if is_empty_project:
+        print("[WARN] 專案是空的（沒有找到程式碼檔案）")
+        print("[INFO] 仍可使用知識庫查詢、圖片分析、bin 檔案分析等功能")
+        total_size = 0
+        file_count = 0
+    else:
+        total_size = sum(f["size"] for f in file_metadata)
+        file_count = len(file_metadata)
+        print(f"[FILE] 找到 {file_count} 個檔案 (~{total_size:,} bytes)")
 
     # 載入知識庫
     kb = KnowledgeBase(kb_path)
     print(kb.get_status())
 
     # 決定模式
-    if force_mode == "agent":
+    if is_empty_project:
+        mode = "empty"  # 空專案模式：只能使用知識庫和外部檔案分析
+    elif force_mode == "agent":
         mode = "agent"
     elif force_mode == "full":
         mode = "full"
@@ -159,7 +163,9 @@ def main():
 
     # 準備 context
     ctx = None
-    if mode == "full":
+    if mode == "empty":
+        print(f"[OK] 使用【空專案模式】- 僅知識庫/圖片/bin 分析")
+    elif mode == "full":
         print(f"[OK] 使用【完整模式】")
         files = scan_project(folder)
         actual_size = sum(len(c) for c in files.values())
@@ -208,6 +214,7 @@ def main():
         if mode == "full":
             result = analyze_full(ctx, clean_q, img_ctx, knowledge_ctx)
         else:
+            # empty 模式和 agent 模式都使用 run_agent
             result = run_agent(folder, clean_q, img_ctx, knowledge_ctx=knowledge_ctx, code_rag=code_rag)
         # 串流輸出已在函數內完成，不需再次印出
         return
@@ -230,6 +237,9 @@ def main():
                 continue
 
             if not q:
+                if mode == "empty":
+                    print("[WARN] 專案是空的，請輸入具體問題或使用 img:/bin: 分析外部檔案")
+                    continue
                 q = "請分析這個專案的整體架構和主要功能"
 
             clean_q, img_ctx = process_images(q)
@@ -300,6 +310,7 @@ def main():
                 # 追問也傳入 knowledge_ctx，避免純聊天式回答
                 result = handle_followup(clean_q, qa_history, knowledge_ctx=knowledge_ctx)
             else:
+                # empty 模式和 agent 模式都使用 run_agent
                 result = run_agent(folder, clean_q, img_ctx, prev_qa=qa_history,
                                   knowledge_ctx=knowledge_ctx, code_rag=code_rag)
 
