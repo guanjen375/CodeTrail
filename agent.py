@@ -25,8 +25,14 @@ from config import (
     CODE_RAG_PREREAD_TOP_K, CODE_RAG_PREREAD_TOP_K_BUG,
     CODE_RAG_PREREAD_LINES, CODE_RAG_PREREAD_LINES_BUG,
     RUN_COMMAND_TIMEOUT, RUN_COMMAND_MAX_OUTPUT,
-    ALLOWED_COMMANDS
+    ALLOWED_COMMANDS,
+    # 改碼閉環相關設定
+    PATCH_ENABLED, PATCH_MAX_FILES, PATCH_MAX_LINES_PER_FILE,
+    LINT_COMMANDS
 )
+
+# 容器執行支援
+from container_runner import CONTAINER_ENABLED, run_in_container
 from utils import (
     should_ignore_dir, should_ignore_file, call_llm, call_llm_stream,
     should_use_strict_mode, answer_with_self_check
@@ -117,14 +123,90 @@ _RUN_COMMAND_TOOL = {
     }
 }
 
-def _get_native_tools() -> list:
-    """動態決定是否包含 run_command tool
+# ============================================================
+# 改碼閉環工具定義
+# ============================================================
+_APPLY_PATCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "apply_patch",
+        "description": "套用 unified diff 格式的程式碼修改。修改會直接寫入檔案。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "patch": {
+                    "type": "string",
+                    "description": "unified diff 格式的修改內容，例如：\n--- a/file.py\n+++ b/file.py\n@@ -10,3 +10,4 @@\n context line\n-old line\n+new line\n+added line"
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "若為 true，只顯示會修改什麼，不實際寫入（預設 false）"
+                }
+            },
+            "required": ["patch"]
+        }
+    }
+}
 
-    改進：使用函數而非常量，讓 --run-tests 可以在 main.py 處理完參數後生效
+_GIT_STATUS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "git_status",
+        "description": "顯示 git 工作目錄狀態（已修改、已暫存、未追蹤的檔案）",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    }
+}
+
+_GIT_DIFF_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "git_diff",
+        "description": "顯示檔案的 git diff（工作目錄與 HEAD 的差異）",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "檔案路徑（可選，不指定則顯示所有差異）"},
+                "staged": {"type": "boolean", "description": "若為 true，顯示已暫存的差異（預設 false）"}
+            },
+            "required": []
+        }
+    }
+}
+
+_RUN_LINT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "run_lint",
+        "description": "對檔案執行 lint/format 工具（自動根據檔案類型選擇工具）",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "要 lint 的檔案路徑"},
+                "fix": {"type": "boolean", "description": "若為 true，自動修復問題（預設 true）"}
+            },
+            "required": ["path"]
+        }
+    }
+}
+
+def _get_native_tools() -> list:
+    """動態決定要包含哪些工具
+
+    改進：使用函數而非常量，讓 --run-tests/--patch 可以在 main.py 處理完參數後生效
     """
+    tools = list(_BASE_TOOLS)
+
     if config.RUN_COMMAND_ENABLED:
-        return _BASE_TOOLS + [_RUN_COMMAND_TOOL]
-    return _BASE_TOOLS
+        tools.append(_RUN_COMMAND_TOOL)
+
+    if config.PATCH_ENABLED:
+        tools.extend([_APPLY_PATCH_TOOL, _GIT_STATUS_TOOL, _GIT_DIFF_TOOL, _RUN_LINT_TOOL])
+
+    return tools
 
 
 def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
@@ -503,9 +585,14 @@ class ToolExecutor:
         安全改進：
         - 使用 shell=False + shlex.split()，避免 shell injection
         - 可透過環境變數 AI_CODE_RUN_TESTS=1 或 CLI flag --run-tests 啟用
+        - 支援容器化執行（AI_CODE_USE_CONTAINER=1 或 --container）
         """
         if not config.RUN_COMMAND_ENABLED:
             return "錯誤: run_command 功能已停用（可用 --run-tests 或設定 AI_CODE_RUN_TESTS=1 啟用）"
+
+        # 容器化執行模式
+        if CONTAINER_ENABLED:
+            return self._run_command_in_container(command, timeout)
 
         command = command.strip()
 
@@ -576,6 +663,417 @@ class ToolExecutor:
         except Exception as e:
             return f"錯誤: {type(e).__name__}: {e}"
 
+    def _run_command_in_container(self, command: str, timeout: int) -> str:
+        """在容器中執行命令（更安全）
+
+        特點：
+        - 專案目錄唯讀掛載
+        - 網路僅在需要時啟用
+        - 資源限制（CPU/記憶體）
+        """
+        command = command.strip()
+
+        # 簡單的命令驗證（容器環境較安全，但仍需基本檢查）
+        dangerous_patterns = ['rm -rf', 'mkfs', 'dd if=', ':(){ :|:& };:']
+        for pattern in dangerous_patterns:
+            if pattern in command:
+                return f"錯誤: 命令包含危險操作 '{pattern}'"
+
+        # 判斷是否需要網路（安裝依賴需要）
+        needs_network = any(kw in command for kw in ['npm install', 'pip install', 'go get', 'cargo fetch'])
+
+        print(f"   [CONTAINER] 執行: {command}")
+
+        result = run_in_container(
+            command=command,
+            folder=str(self.root),
+            timeout=timeout,
+            network=needs_network,
+            writable=False
+        )
+
+        if result['error']:
+            return f"錯誤: {result['error']}"
+
+        output = ""
+        if result['stdout']:
+            output += result['stdout']
+        if result['stderr']:
+            if output:
+                output += "\n--- stderr ---\n"
+            output += result['stderr']
+
+        if len(output) > RUN_COMMAND_MAX_OUTPUT:
+            half = RUN_COMMAND_MAX_OUTPUT // 2
+            output = (
+                output[:half] +
+                f"\n\n... [截斷 {len(output) - RUN_COMMAND_MAX_OUTPUT} 字元] ...\n\n" +
+                output[-half:]
+            )
+
+        status = "✓ 成功" if result['success'] else f"✗ 失敗 (exit {result['returncode']})"
+        return f"=== {status} (容器模式) ===\n{output}" if output else f"=== {status} (容器模式, 無輸出) ==="
+
+    # ============================================================
+    # 改碼閉環工具
+    # ============================================================
+    def apply_patch(self, patch: str, dry_run: bool = False) -> str:
+        """套用 unified diff 格式的 patch
+
+        安全措施：
+        - 路徑驗證：只能修改專案內的檔案
+        - 限制檔案數量和行數
+        - 自動備份原始檔案
+
+        Args:
+            patch: unified diff 格式的 patch 內容
+            dry_run: 若為 True，只顯示會修改什麼
+        """
+        if not config.PATCH_ENABLED:
+            return "錯誤: apply_patch 功能已停用（可用 --patch 或設定 AI_CODE_PATCH=1 啟用）"
+
+        try:
+            changes = self._parse_unified_diff(patch)
+        except ValueError as e:
+            return f"錯誤: patch 解析失敗 - {e}"
+
+        if not changes:
+            return "錯誤: 無法從 patch 中解析出任何修改"
+
+        # 檢查檔案數量限制
+        if len(changes) > PATCH_MAX_FILES:
+            return f"錯誤: 修改檔案數量超過限制（{len(changes)} > {PATCH_MAX_FILES}）"
+
+        results = []
+        for filepath, hunks in changes.items():
+            # 驗證路徑安全性
+            target = self._safe_path(filepath)
+            if not target:
+                results.append(f"✗ {filepath}: 路徑不在專案內或無效")
+                continue
+
+            # 檢查行數限制
+            total_lines = sum(len(h['add']) + len(h['remove']) for h in hunks)
+            if total_lines > PATCH_MAX_LINES_PER_FILE:
+                results.append(f"✗ {filepath}: 修改行數超過限制（{total_lines} > {PATCH_MAX_LINES_PER_FILE}）")
+                continue
+
+            if dry_run:
+                results.append(f"[DRY RUN] {filepath}: 將修改 {len(hunks)} 個區塊, {total_lines} 行")
+                for i, hunk in enumerate(hunks):
+                    results.append(f"  區塊 {i+1}: 行 {hunk['old_start']}-{hunk['old_start']+hunk['old_count']-1}")
+                continue
+
+            # 實際套用修改
+            try:
+                result = self._apply_hunks_to_file(target, hunks)
+                results.append(result)
+            except Exception as e:
+                results.append(f"✗ {filepath}: 套用失敗 - {e}")
+
+        return "\n".join(results) if results else "沒有修改"
+
+    def _parse_unified_diff(self, patch: str) -> dict:
+        """解析 unified diff 格式
+
+        Returns:
+            {filepath: [{'old_start': int, 'old_count': int, 'new_start': int, 'new_count': int,
+                        'context': [...], 'add': [...], 'remove': [...]}]}
+        """
+        changes = {}
+        lines = patch.split('\n')
+        i = 0
+        current_file = None
+
+        while i < len(lines):
+            line = lines[i]
+
+            # 解析檔案頭
+            if line.startswith('--- '):
+                # --- a/path/to/file 或 --- path/to/file
+                path = line[4:].strip()
+                if path.startswith('a/'):
+                    path = path[2:]
+                # 忽略時間戳記
+                path = path.split('\t')[0].strip()
+                current_file = path
+                i += 1
+                continue
+
+            if line.startswith('+++ '):
+                # +++ b/path/to/file
+                path = line[4:].strip()
+                if path.startswith('b/'):
+                    path = path[2:]
+                path = path.split('\t')[0].strip()
+                if current_file != path and current_file:
+                    # 如果 --- 和 +++ 的路徑不同，使用 +++ 的路徑
+                    pass
+                current_file = path
+                if current_file not in changes:
+                    changes[current_file] = []
+                i += 1
+                continue
+
+            # 解析 hunk header: @@ -old_start,old_count +new_start,new_count @@
+            if line.startswith('@@') and current_file:
+                match = re.match(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', line)
+                if match:
+                    old_start = int(match.group(1))
+                    old_count = int(match.group(2)) if match.group(2) else 1
+                    new_start = int(match.group(3))
+                    new_count = int(match.group(4)) if match.group(4) else 1
+
+                    hunk = {
+                        'old_start': old_start,
+                        'old_count': old_count,
+                        'new_start': new_start,
+                        'new_count': new_count,
+                        'lines': []  # (type, content): type = ' ', '+', '-'
+                    }
+
+                    i += 1
+                    # 讀取 hunk 內容
+                    while i < len(lines):
+                        hunk_line = lines[i]
+                        if not hunk_line:
+                            # 空行可能是 context
+                            hunk['lines'].append((' ', ''))
+                            i += 1
+                        elif hunk_line.startswith(' '):
+                            hunk['lines'].append((' ', hunk_line[1:]))
+                            i += 1
+                        elif hunk_line.startswith('+') and not hunk_line.startswith('+++'):
+                            hunk['lines'].append(('+', hunk_line[1:]))
+                            i += 1
+                        elif hunk_line.startswith('-') and not hunk_line.startswith('---'):
+                            hunk['lines'].append(('-', hunk_line[1:]))
+                            i += 1
+                        elif hunk_line.startswith('@@') or hunk_line.startswith('---'):
+                            break
+                        else:
+                            # 無效行，結束當前 hunk
+                            break
+
+                    changes[current_file].append(hunk)
+                    continue
+
+            i += 1
+
+        return changes
+
+    def _apply_hunks_to_file(self, filepath: Path, hunks: list) -> str:
+        """將 hunks 套用到檔案
+
+        策略：從後往前套用，避免行號偏移
+        """
+        if not filepath.exists():
+            # 新檔案：直接寫入所有 '+' 行
+            new_lines = []
+            for hunk in hunks:
+                for line_type, content in hunk['lines']:
+                    if line_type in (' ', '+'):
+                        new_lines.append(content)
+            filepath.write_text('\n'.join(new_lines) + '\n', encoding='utf-8')
+            return f"✓ {filepath.relative_to(self.root)}: 新建檔案"
+
+        # 讀取原始檔案
+        original = filepath.read_text(encoding='utf-8', errors='replace')
+        lines = original.split('\n')
+
+        # 備份原始檔案
+        backup_path = filepath.with_suffix(filepath.suffix + '.orig')
+        backup_path.write_text(original, encoding='utf-8')
+
+        # 從後往前套用（避免行號偏移）
+        sorted_hunks = sorted(hunks, key=lambda h: h['old_start'], reverse=True)
+
+        for hunk in sorted_hunks:
+            start_idx = hunk['old_start'] - 1  # 轉為 0-based index
+            old_count = hunk['old_count']
+
+            # 收集新行
+            new_lines = []
+            for line_type, content in hunk['lines']:
+                if line_type in (' ', '+'):
+                    new_lines.append(content)
+
+            # 替換
+            lines[start_idx:start_idx + old_count] = new_lines
+
+        # 寫入修改後的檔案
+        filepath.write_text('\n'.join(lines), encoding='utf-8')
+
+        # 刪除備份（如果成功）
+        try:
+            backup_path.unlink()
+        except Exception:
+            pass
+
+        rel_path = filepath.relative_to(self.root)
+        return f"✓ {rel_path}: 已修改 {len(hunks)} 個區塊"
+
+    def git_status(self) -> str:
+        """顯示 git 工作目錄狀態"""
+        try:
+            result = subprocess.run(
+                ['git', 'status', '--porcelain', '-uall'],
+                cwd=str(self.root),
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode != 0:
+                # 可能不是 git repo
+                return f"錯誤: {result.stderr.strip() or '不是 git 倉庫'}"
+
+            output = result.stdout.strip()
+            if not output:
+                return "工作目錄乾淨（沒有修改）"
+
+            # 解析狀態碼
+            lines = []
+            for line in output.split('\n'):
+                if len(line) >= 3:
+                    status = line[:2]
+                    path = line[3:]
+                    status_map = {
+                        'M ': '已暫存修改',
+                        ' M': '未暫存修改',
+                        'MM': '已暫存+未暫存修改',
+                        'A ': '已暫存新增',
+                        ' A': '未暫存新增',
+                        'D ': '已暫存刪除',
+                        ' D': '未暫存刪除',
+                        '??': '未追蹤',
+                        'R ': '已重命名',
+                        'C ': '已複製',
+                    }
+                    status_text = status_map.get(status, status)
+                    lines.append(f"  {status_text}: {path}")
+
+            return "=== Git 狀態 ===\n" + '\n'.join(lines)
+
+        except FileNotFoundError:
+            return "錯誤: 找不到 git 命令"
+        except subprocess.TimeoutExpired:
+            return "錯誤: git status 超時"
+        except Exception as e:
+            return f"錯誤: {type(e).__name__}: {e}"
+
+    def git_diff(self, path: str = None, staged: bool = False) -> str:
+        """顯示 git diff"""
+        try:
+            cmd = ['git', 'diff']
+            if staged:
+                cmd.append('--staged')
+            cmd.append('--')
+
+            if path:
+                target = self._safe_path(path)
+                if not target:
+                    return f"錯誤: 路徑不在專案內 '{path}'"
+                cmd.append(str(target.relative_to(self.root)))
+
+            result = subprocess.run(
+                cmd,
+                cwd=str(self.root),
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode != 0:
+                return f"錯誤: {result.stderr.strip() or '不是 git 倉庫'}"
+
+            output = result.stdout.strip()
+            if not output:
+                scope = f"'{path}'" if path else "工作目錄"
+                staged_text = "已暫存" if staged else ""
+                return f"{scope} 沒有{staged_text}差異"
+
+            # 限制輸出長度
+            if len(output) > RUN_COMMAND_MAX_OUTPUT:
+                half = RUN_COMMAND_MAX_OUTPUT // 2
+                output = (
+                    output[:half] +
+                    f"\n\n... [截斷 {len(output) - RUN_COMMAND_MAX_OUTPUT} 字元] ...\n\n" +
+                    output[-half:]
+                )
+
+            return f"=== Git Diff {'(staged)' if staged else ''} ===\n{output}"
+
+        except FileNotFoundError:
+            return "錯誤: 找不到 git 命令"
+        except subprocess.TimeoutExpired:
+            return "錯誤: git diff 超時"
+        except Exception as e:
+            return f"錯誤: {type(e).__name__}: {e}"
+
+    def run_lint(self, path: str, fix: bool = True) -> str:
+        """對檔案執行 lint/format 工具"""
+        target = self._safe_path(path)
+        if not target or not target.exists():
+            return f"錯誤: 檔案不存在 '{path}'"
+        if not target.is_file():
+            return f"錯誤: '{path}' 不是檔案"
+
+        ext = target.suffix.lower()
+        lint_cmds = LINT_COMMANDS.get(ext)
+        if not lint_cmds:
+            return f"錯誤: 不支援的檔案類型 '{ext}'（支援: {', '.join(LINT_COMMANDS.keys())}）"
+
+        results = []
+        rel_path = str(target.relative_to(self.root))
+
+        for cmd_template in lint_cmds:
+            # 嘗試執行每個 lint 命令
+            cmd_parts = shlex.split(cmd_template)
+            cmd_parts.append(rel_path)
+
+            try:
+                print(f"   [LINT] 執行: {' '.join(cmd_parts)}")
+                result = subprocess.run(
+                    cmd_parts,
+                    cwd=str(self.root),
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+
+                tool_name = cmd_parts[0]
+                if result.returncode == 0:
+                    output = result.stdout.strip() or result.stderr.strip()
+                    if output:
+                        results.append(f"✓ {tool_name}: {output[:200]}")
+                    else:
+                        results.append(f"✓ {tool_name}: 完成")
+                    break  # 成功就不嘗試下一個
+                else:
+                    # 工具不存在或執行失敗，嘗試下一個
+                    if "not found" in result.stderr.lower() or "not recognized" in result.stderr.lower():
+                        continue
+                    # 其他錯誤（如 lint 發現問題）
+                    output = result.stderr.strip() or result.stdout.strip()
+                    results.append(f"⚠ {tool_name}:\n{output[:500]}")
+                    break
+
+            except FileNotFoundError:
+                # 工具不存在，嘗試下一個
+                continue
+            except subprocess.TimeoutExpired:
+                results.append(f"✗ {cmd_parts[0]}: 超時")
+                break
+            except Exception as e:
+                results.append(f"✗ {cmd_parts[0]}: {e}")
+                break
+
+        if not results:
+            return f"錯誤: 沒有可用的 lint 工具（已嘗試: {', '.join(c.split()[0] for c in lint_cmds)}）"
+
+        return f"=== Lint {rel_path} ===\n" + '\n'.join(results)
+
     def execute(self, tool: str, args: dict) -> Optional[str]:
         if tool == "list_files":
             return self.list_files(args.get("path", "."), args.get("depth", 2))
@@ -588,6 +1086,15 @@ class ToolExecutor:
             return self.file_info(args.get("path", ""))
         elif tool == "run_command":
             return self.run_command(args.get("command", ""), args.get("timeout", RUN_COMMAND_TIMEOUT))
+        # 改碼閉環工具
+        elif tool == "apply_patch":
+            return self.apply_patch(args.get("patch", ""), args.get("dry_run", False))
+        elif tool == "git_status":
+            return self.git_status()
+        elif tool == "git_diff":
+            return self.git_diff(args.get("path"), args.get("staged", False))
+        elif tool == "run_lint":
+            return self.run_lint(args.get("path", ""), args.get("fix", True))
         else:
             return f"錯誤: 未知工具 '{tool}'"
 

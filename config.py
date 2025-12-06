@@ -169,6 +169,37 @@ SPEC_QUESTION_KEYWORDS = [
 ]
 
 # ============================================================
+# 改碼閉環設定 (Patch / Git / Lint)
+# ============================================================
+# ⚠️ 安全警告：apply_patch 會直接修改檔案，請謹慎使用
+# 可透過 CLI flag --patch 啟用，或環境變數 AI_CODE_PATCH=1
+PATCH_ENABLED = _os.environ.get('AI_CODE_PATCH', '').lower() in ('1', 'true', 'yes')
+PATCH_MAX_FILES = 5              # 單次 patch 最多修改 5 個檔案
+PATCH_MAX_LINES_PER_FILE = 200   # 單一檔案最多修改 200 行
+
+# Lint 命令白名單（按語言）
+LINT_COMMANDS = {
+    # Python
+    '.py': ['ruff check --fix', 'black', 'isort'],
+    '.pyx': ['ruff check --fix'],
+    '.pyi': ['ruff check --fix'],
+    # JavaScript/TypeScript
+    '.js': ['eslint --fix', 'prettier --write'],
+    '.jsx': ['eslint --fix', 'prettier --write'],
+    '.ts': ['eslint --fix', 'prettier --write'],
+    '.tsx': ['eslint --fix', 'prettier --write'],
+    # Go
+    '.go': ['gofmt -w', 'go vet'],
+    # Rust
+    '.rs': ['rustfmt', 'cargo clippy --fix --allow-dirty'],
+    # C/C++
+    '.c': ['clang-format -i'],
+    '.cpp': ['clang-format -i'],
+    '.h': ['clang-format -i'],
+    '.hpp': ['clang-format -i'],
+}
+
+# ============================================================
 # Run Command 設定
 # ============================================================
 # ⚠️ 安全警告：對不信任的專案，run_command 有任意程式碼執行風險

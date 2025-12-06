@@ -44,6 +44,7 @@ from agent import run_agent, handle_followup
 from media import process_images, process_binary, set_sandbox_root
 from http_client import close_session
 from web import fetch_from_url, cleanup_temp_dir
+from data_flywheel import record_interaction, DATA_COLLECT_ENABLED
 
 
 def main():
@@ -57,6 +58,8 @@ def main():
     extra_excludes = []
     include_dirs = []
     run_tests = False
+    enable_patch = False
+    use_container = False
     allow_external = False
     web_url = None  # 網頁模式 URL
     temp_dir = None  # 網頁模式暫存目錄
@@ -70,6 +73,10 @@ def main():
             force_mode = "full"
         elif arg == "--run-tests":
             run_tests = True
+        elif arg == "--patch":
+            enable_patch = True
+        elif arg == "--container":
+            use_container = True
         elif arg == "--allow-external":
             allow_external = True
         elif arg == "--web" and i + 1 < len(args):
@@ -117,6 +124,22 @@ def main():
     if run_tests:
         config.RUN_COMMAND_ENABLED = True
         print("[CFG] 啟用 run_command 工具 (--run-tests)")
+
+    # 動態設定 PATCH_ENABLED
+    if enable_patch:
+        config.PATCH_ENABLED = True
+        print("[CFG] 啟用改碼閉環工具 (--patch): apply_patch, git_status, git_diff, run_lint")
+
+    # 動態設定容器模式
+    if use_container:
+        import container_runner
+        container_runner.CONTAINER_ENABLED = True
+        available, msg = container_runner.check_container_available()
+        if available:
+            print(f"[CFG] 啟用容器化執行 (--container): {msg}")
+        else:
+            print(f"[WARN] 容器不可用: {msg}")
+            print("[WARN] 將使用普通模式執行")
 
     # 網頁模式：從 Git URL 下載程式碼
     if web_url:
@@ -241,6 +264,22 @@ def main():
         else:
             # empty 模式和 agent 模式都使用 run_agent
             result = run_agent(folder, clean_q, img_ctx, knowledge_ctx=knowledge_ctx, code_rag=code_rag)
+
+        # 資料飛輪：記錄互動
+        if DATA_COLLECT_ENABLED:
+            refs = kb_metadata.get('refs', []) if kb_metadata else []
+            code_snippets = []
+            if code_rag:
+                candidates = code_rag.query(clean_q, top_k=5)
+                code_snippets = [{'path': c['path'], 'line': c['line'], 'symbol': c['symbol']} for c in candidates]
+            record_interaction(
+                question=clean_q,
+                answer=result,
+                refs=refs,
+                code_snippets=code_snippets,
+                metadata={'mode': mode, 'kb_top_score': kb_metadata.get('top_score', 0)}
+            )
+
         # 串流輸出已在函數內完成，不需再次印出
         return temp_dir
 
@@ -342,6 +381,22 @@ def main():
             qa_history.append((clean_q, result))
             if len(qa_history) > 5:
                 qa_history.pop(0)
+
+            # 資料飛輪：記錄互動
+            if DATA_COLLECT_ENABLED:
+                refs = kb_metadata.get('refs', []) if kb_metadata else []
+                code_snippets = []
+                if code_rag:
+                    candidates = code_rag.query(clean_q, top_k=5)
+                    code_snippets = [{'path': c['path'], 'line': c['line'], 'symbol': c['symbol']} for c in candidates]
+                record_interaction(
+                    question=clean_q,
+                    answer=result,
+                    refs=refs,
+                    code_snippets=code_snippets,
+                    metadata={'mode': mode, 'is_followup': is_followup, 'kb_top_score': kb_metadata.get('top_score', 0)}
+                )
+
             # 串流輸出已在函數內完成
 
         except KeyboardInterrupt:

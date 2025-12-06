@@ -8,10 +8,13 @@
 - **Agent 模式**：大型專案動態探索，按需讀取檔案
 - **網頁模式**：直接分析 GitHub/GitLab/Bitbucket 上的程式碼（測試中）
 - **知識庫 RAG**：整合技術文件（PDF/Markdown），回答時引用文件來源
-- **Code RAG**：自動索引程式碼符號（函式/類別），快速定位相關程式碼
+- **Code RAG**：自動索引程式碼符號（函式/類別），支援 AST/Tree-sitter 解析
 - **圖片 OCR**：支援截圖中的錯誤訊息辨識（使用 VL 模型）
 - **二進位分析**：韌體/執行檔的 Hex dump + 智能字串提取
 - **嚴格模式（兩階段）**：規格類問題強制引用文件，並透過自我檢查過濾幻覺
+- **改碼閉環**：apply_patch、git_status、git_diff、run_lint 工具
+- **容器化執行**：在 Docker/Podman 中安全執行測試命令
+- **資料飛輪**：收集互動記錄用於後續 fine-tuning
 
 ## 安裝需求
 
@@ -27,6 +30,9 @@ ollama pull qllama/bge-reranker-v2-m3    # Reranker 模型
 
 # 安裝 Python 依賴
 pip install requests
+
+# 可選：安裝 Tree-sitter（提升多語言 AST 解析）
+pip install tree-sitter tree-sitter-javascript tree-sitter-typescript tree-sitter-go tree-sitter-rust tree-sitter-c
 ```
 
 ## 快速開始
@@ -96,6 +102,76 @@ AI_CODE_RUN_TESTS=1 python main.py /path/to/project
 - Go: `go test`
 
 **安全警告**：`run_command` 會執行專案內的測試腳本，對不信任的專案有安全風險。預設關閉，需明確啟用。
+
+### 改碼閉環（Patch 模式）
+
+```bash
+# 啟用改碼工具（apply_patch、git_status、git_diff、run_lint）
+python main.py /path/to/project --patch
+
+# 也可以用環境變數啟用
+AI_CODE_PATCH=1 python main.py /path/to/project
+```
+
+**新增工具**：
+- `apply_patch`：套用 unified diff 格式的修改
+- `git_status`：查看 Git 狀態
+- `git_diff`：查看變更內容
+- `run_lint`：執行 lint/format 工具
+
+**支援的 Lint 工具**（自動偵測）：
+- Python: `ruff check --fix`, `black`, `isort`
+- JavaScript/TypeScript: `eslint --fix`, `prettier --write`
+- Go: `gofmt -w`, `go vet`
+- Rust: `rustfmt`, `cargo clippy --fix`
+- C/C++: `clang-format -i`
+
+**安全限制**：
+- 每次最多修改 5 個檔案
+- 每個檔案最多修改 200 行
+- 需明確啟用
+
+### 容器化執行
+
+```bash
+# 在 Docker/Podman 容器中執行測試（更安全）
+python main.py /path/to/project --container
+
+# 也可以用環境變數啟用
+AI_CODE_USE_CONTAINER=1 python main.py /path/to/project
+
+# 結合 --run-tests 使用
+python main.py /path/to/project --run-tests --container
+```
+
+**容器安全設定**：
+- 網路：預設停用（`--network none`）
+- 檔案系統：專案目錄唯讀掛載
+- 資源限制：CPU/記憶體上限
+- 無特權執行
+
+**環境變數**：
+- `AI_CODE_CONTAINER_ENGINE`：指定容器引擎（`docker`/`podman`/`auto`）
+- `AI_CODE_CONTAINER_IMAGE`：自訂映像檔
+- `AI_CODE_CONTAINER_MEMORY`：記憶體限制（預設 `2g`）
+- `AI_CODE_CONTAINER_CPU`：CPU 限制（預設 `2`）
+- `AI_CODE_CONTAINER_TIMEOUT`：超時秒數（預設 `120`）
+
+**容器化執行器 CLI**：
+
+```bash
+# 檢查容器環境
+python container_runner.py check
+
+# 在容器中執行命令
+python container_runner.py run /path/to/project "pytest -v"
+
+# 在容器中執行測試（自動偵測）
+python container_runner.py test /path/to/project
+
+# 預拉取所有映像檔
+python container_runner.py pull --all
+```
 
 ### 網頁模式（測試中）
 
@@ -252,6 +328,111 @@ python RAG.py /path/to/document.pdf /path/to/output.json
 
 觸發條件：問題包含 `規格`、`spec`、`manual`、`根據文件` 等關鍵字。
 
+## Code RAG（AST/Tree-sitter）
+
+程式碼索引使用多層解析策略：
+
+1. **Python AST**：使用內建 `ast` 模組解析 Python 檔案
+2. **Tree-sitter**：解析 JavaScript/TypeScript/C/C++/Go/Rust
+3. **Regex 備援**：當 AST 解析失敗時使用正規表達式
+
+**新增功能**：
+- 符號包含 `end_line`（結束行號）和 `parent`（父符號）
+- 支援巢狀符號（類別內的方法）
+- 更精準的符號定位
+
+**檢查解析器狀態**：
+
+```python
+from ast_parser import get_parser_status
+print(get_parser_status())
+# {'python_ast': True, 'tree_sitter': True, 'tree_sitter_languages': ['javascript', 'typescript', ...]}
+```
+
+## 資料飛輪（Fine-tuning 資料收集）
+
+收集互動記錄用於後續模型微調：
+
+```bash
+# 啟用資料收集
+AI_CODE_COLLECT_DATA=1 python main.py /path/to/project
+
+# 資料儲存位置（預設）
+# data/interactions.jsonl
+```
+
+**資料格式**：
+```json
+{
+  "timestamp": "2024-01-01T12:00:00",
+  "question": "...",
+  "question_type": "spec|code|bug|general",
+  "refs": [{"source": "...", "score": 0.5, "content": "..."}],
+  "code_snippets": [{"path": "...", "line": 123, "symbol": "..."}],
+  "answer": "...",
+  "rating": null,
+  "metadata": {"mode": "agent", "kb_top_score": 0.5}
+}
+```
+
+**資料飛輪 CLI**：
+
+```bash
+# 手動評分互動記錄
+python data_flywheel.py rate --file data/interactions.jsonl
+
+# 顯示資料統計
+python data_flywheel.py stats
+
+# 匯出訓練資料
+python data_flywheel.py export --output data/training.jsonl --min-rating 0
+```
+
+**環境變數**：
+- `AI_CODE_COLLECT_DATA`：啟用資料收集（`1`/`true`/`yes`）
+- `AI_CODE_DATA_FILE`：資料檔案路徑（預設 `data/interactions.jsonl`）
+
+## 評測機制（Regression Harness）
+
+量化評估系統回答品質：
+
+```bash
+# 執行評測
+python eval/run_eval.py --project /path/to/project --kb knowledge.json
+
+# 指定測試集
+python eval/run_eval.py --test-set spec --project . --kb kb.json
+
+# 詳細輸出
+python eval/run_eval.py --project . --verbose
+```
+
+**測試集類型**：
+- `spec`：規格類問題（需要知識庫支援）
+- `code`：程式碼定位問題
+- `bug`：Bug 分析問題
+- `all`：執行所有測試
+
+**評分標準**：
+- Spec 問題：檢查是否包含預期關鍵字和引用來源
+- Code 問題：檢查是否定位到正確檔案和符號
+- Bug 問題：檢查是否識別問題原因並提供修復建議
+
+**測試案例格式**（`eval/spec_questions.json`）：
+```json
+[
+  {
+    "id": "spec_001",
+    "question": "API 的最大請求頻率是多少？",
+    "expected": {
+      "keywords": ["rate limit", "每秒", "次"],
+      "ref_required": true
+    },
+    "context": "."
+  }
+]
+```
+
 ## 設定檔
 
 編輯 `config.py` 調整參數：
@@ -281,6 +462,11 @@ CODE_RAG_TOP_K = 8                     # 返回的程式碼片段數
 STRICT_MODE = True                     # 啟用嚴格模式
 STRICT_MODE_TEMPERATURE = 0.0          # 嚴格模式溫度
 WEAK_REF_THRESHOLD = 0.30              # REF 太弱時拒答
+
+# 改碼閉環設定
+PATCH_ENABLED = False                  # 預設關閉，用 --patch 啟用
+PATCH_MAX_FILES = 5                    # 每次最多修改的檔案數
+PATCH_MAX_LINES_PER_FILE = 200         # 每個檔案最多修改的行數
 ```
 
 ### Context 長度與 VRAM/RAM 建議
@@ -309,19 +495,44 @@ ollama ps  # 查看 GPU% 比例，低於 100% 表示有 offload
 
 ```
 ai_code/
-├── main.py          # 主程式入口
-├── config.py        # 設定檔
-├── utils.py         # 共用工具（LLM 呼叫、檔案掃描、嚴格模式）
-├── agent.py         # Agent 模式（動態探索 + run_command）
-├── context.py       # 完整模式（全量分析）
-├── knowledge.py     # 知識庫 RAG（Reranker + MMR）
-├── code_rag.py      # 程式碼索引 RAG（符號提取 + Embedding）
-├── media.py         # 媒體處理（圖片 OCR、二進位分析）
-├── web.py           # 網頁模式（Git URL 下載，測試中）
-├── http_client.py   # HTTP 連線池管理
-├── RAG.py           # 知識庫建立工具（獨立腳本）
-└── knowledge.json   # 知識庫（自行建立）
+├── main.py              # 主程式入口
+├── config.py            # 設定檔
+├── utils.py             # 共用工具（LLM 呼叫、檔案掃描、嚴格模式）
+├── agent.py             # Agent 模式（動態探索 + run_command + patch 工具）
+├── context.py           # 完整模式（全量分析）
+├── knowledge.py         # 知識庫 RAG（Reranker + MMR）
+├── code_rag.py          # 程式碼索引 RAG（AST/Tree-sitter + Embedding）
+├── ast_parser.py        # AST 解析器（Python AST + Tree-sitter + Regex）
+├── media.py             # 媒體處理（圖片 OCR、二進位分析）
+├── web.py               # 網頁模式（Git URL 下載，測試中）
+├── http_client.py       # HTTP 連線池管理
+├── container_runner.py  # 容器化執行器（Docker/Podman）
+├── data_flywheel.py     # 資料飛輪收集器
+├── RAG.py               # 知識庫建立工具（獨立腳本）
+├── knowledge.json       # 知識庫（自行建立）
+├── data/                # 資料目錄
+│   └── interactions.jsonl  # 互動記錄
+└── eval/                # 評測模組
+    ├── run_eval.py      # 評測執行器
+    ├── spec_questions.json   # 規格類測試案例
+    ├── code_questions.json   # 程式碼類測試案例
+    └── bug_questions.json    # Bug 類測試案例
 ```
+
+## 環境變數總覽
+
+| 變數 | 說明 | 預設值 |
+|------|------|--------|
+| `AI_CODE_RUN_TESTS` | 啟用 run_command 工具 | 關閉 |
+| `AI_CODE_PATCH` | 啟用改碼工具 | 關閉 |
+| `AI_CODE_USE_CONTAINER` | 啟用容器化執行 | 關閉 |
+| `AI_CODE_CONTAINER_ENGINE` | 容器引擎 | `auto` |
+| `AI_CODE_CONTAINER_IMAGE` | 自訂映像檔 | 自動偵測 |
+| `AI_CODE_CONTAINER_MEMORY` | 容器記憶體限制 | `2g` |
+| `AI_CODE_CONTAINER_CPU` | 容器 CPU 限制 | `2` |
+| `AI_CODE_CONTAINER_TIMEOUT` | 容器超時秒數 | `120` |
+| `AI_CODE_COLLECT_DATA` | 啟用資料收集 | 關閉 |
+| `AI_CODE_DATA_FILE` | 資料檔案路徑 | `data/interactions.jsonl` |
 
 ## 常見問題
 
@@ -359,6 +570,30 @@ Agent 需要多輪工具呼叫，可以：
 預設使用 `strings` 提取整個檔案的可讀字串。如果找不到：
 1. 確認版本資訊確實存在：`strings firmware.bin | grep -i version`
 2. 版本字串可能使用非標準格式，嘗試更具體的問法
+
+### Q: apply_patch 失敗？
+
+可能的原因：
+1. diff 格式不正確（需要 unified diff 格式）
+2. 檔案內容已變更，context 不匹配
+3. 超出修改限制（最多 5 個檔案，每檔 200 行）
+
+解決方法：
+1. 使用 `git_diff` 查看當前變更
+2. 使用 `git_status` 確認狀態
+3. 確保 diff 的 context 行與實際檔案一致
+
+### Q: 容器化執行失敗？
+
+1. 確認 Docker 或 Podman 已安裝：`python container_runner.py check`
+2. 確認映像檔已拉取：`python container_runner.py pull --all`
+3. 檢查容器日誌查看詳細錯誤
+
+### Q: 資料收集沒有記錄？
+
+1. 確認環境變數已設定：`AI_CODE_COLLECT_DATA=1`
+2. 確認資料目錄存在且有寫入權限
+3. 使用 `python data_flywheel.py stats` 查看統計
 
 ## License
 

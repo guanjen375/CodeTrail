@@ -1,0 +1,32 @@
+[
+  {
+    "id": "code_001",
+    "question": "run_agent 函式在哪裡定義？",
+    "expected": {
+      "file": "agent.py",
+      "symbol": "run_agent",
+      "line": 945
+    },
+    "context": "."
+  },
+  {
+    "id": "code_002",
+    "question": "KnowledgeBase 的 query 方法是怎麼實作的？",
+    "expected": {
+      "file": "knowledge.py",
+      "symbol": "query",
+      "line": 0
+    },
+    "context": "."
+  },
+  {
+    "id": "code_003",
+    "question": "找出處理 unified diff 的程式碼位置",
+    "expected": {
+      "file": "agent.py",
+      "symbol": "_parse_unified_diff",
+      "line": 0
+    },
+    "context": "."
+  }
+]

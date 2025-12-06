@@ -1,0 +1,29 @@
+[
+  {
+    "id": "bug_001",
+    "question": "執行 pytest 時出現 IndexError: list index out of range，錯誤發生在 code_rag.py:456",
+    "expected": {
+      "cause": "索引超出範圍",
+      "fix_keywords": ["index", "len", "檢查", "邊界"]
+    },
+    "context": "."
+  },
+  {
+    "id": "bug_002",
+    "question": "File \"agent.py\", line 500, in run_command\nTypeError: 'NoneType' object is not iterable",
+    "expected": {
+      "cause": "None 值",
+      "fix_keywords": ["None", "檢查", "if", "預設值"]
+    },
+    "context": "."
+  },
+  {
+    "id": "bug_003",
+    "question": "程式執行時 VRAM 不斷增加，最終導致 OOM，懷疑是記憶體洩漏",
+    "expected": {
+      "cause": "記憶體洩漏",
+      "fix_keywords": ["cache", "清除", "釋放", "del", "gc"]
+    },
+    "context": "."
+  }
+]

@@ -2,6 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 智能程式碼分析器 - Code RAG (程式碼索引)
+
+改進：
+- 使用 AST/tree-sitter 解析程式碼符號（比 regex 更精準）
+- 符號包含完整範圍（start_line, end_line）
+- 支援讀取完整函式/類別區塊
 """
 
 import os
@@ -27,6 +32,9 @@ from config import (
     OLLAMA_EMBEDDINGS_URL
 )
 from utils import should_ignore_file, should_ignore_dir
+
+# 導入 AST 解析器
+from ast_parser import parse_file, get_parser_status
 
 
 def _normalize_text_for_cache(text: str) -> str:
@@ -198,133 +206,36 @@ class CodeRAG:
     def _extract_symbols(self, filepath: Path, content: str) -> list[dict]:
         """從程式碼中提取符號（函式、類別）
 
-        改進：
-        - Python：支援縮排的 class method、decorator
-        - JS/TS：支援 arrow function、object method
-        - C/C++：支援 template、namespace、複雜返回型別
+        改進（v2）：
+        - 使用 AST/tree-sitter 解析，比 regex 更精準
+        - 符號包含完整範圍（start_line, end_line）
+        - 支援 method 的 parent class 資訊
         """
-        symbols = []
-        lines = content.split('\n')
-        ext = filepath.suffix.lower()
         rel_path = str(filepath.relative_to(self.folder))
 
-        def add_symbol(name: str, sym_type: str, line_num: int):
-            symbols.append({
+        # 使用 AST 解析器
+        try:
+            ast_symbols = parse_file(filepath, content)
+        except Exception as e:
+            print(f"[CODE_RAG] AST 解析 {rel_path} 失敗: {e}", file=sys.stderr)
+            ast_symbols = []
+
+        # 轉換為內部格式
+        symbols = []
+        for sym in ast_symbols:
+            symbol_dict = {
                 'path': rel_path,
-                'symbol': name,
-                'type': sym_type,
-                'line': line_num,
-                'context': '\n'.join(lines[max(0, line_num-3):min(len(lines), line_num+10)])
-            })
+                'symbol': sym.name,
+                'type': sym.type,
+                'line': sym.start_line,
+                'end_line': sym.end_line,  # 新增：符號結束行
+                'context': sym.context[:500],
+            }
+            # 如果有 parent（method 屬於某個 class），記錄下來
+            if sym.parent:
+                symbol_dict['parent'] = sym.parent
 
-        # Python：支援縮排的 method 和 decorator
-        if ext in ('.py', '.pyx', '.pyi'):
-            # 支援縮排（前導空白）
-            pattern = r'^(\s*)(class|def|async\s+def)\s+(\w+)'
-            pending_decorator = None
-            for i, line in enumerate(lines):
-                # 記住 decorator，下一個 def/class 會使用它
-                if re.match(r'^\s*@\w+', line):
-                    pending_decorator = i
-                    continue
-
-                m = re.match(pattern, line)
-                if m:
-                    sym_type = 'class' if m.group(2) == 'class' else 'function'
-                    # 如果有 decorator，從 decorator 開始
-                    start_line = pending_decorator if pending_decorator is not None else i
-                    add_symbol(m.group(3), sym_type, start_line + 1)
-                    pending_decorator = None
-
-        # C/C++：支援 template、namespace、複雜返回型別（含 ::, <, >, ,）
-        elif ext in ('.c', '.cpp', '.cc', '.cxx', '.h', '.hpp'):
-            # class/struct（含 template）
-            class_pattern = r'^(?:template\s*<[^>]*>\s*)?(class|struct)\s+(\w+)'
-            # namespace
-            namespace_pattern = r'^namespace\s+(\w+)'
-            # 函式：放寬型別字元集（加入 :, ,，容忍 template）
-            # 支援：std::vector<int> ns::func(...) { 或 void func(...) const {
-            func_pattern = r'^(?:template\s*<[^>]*>\s*)?[\w\s\*\&\<\>\[\]:,]+\s+(?:(\w+)::)?(\w+)\s*\([^;]*\)\s*(?:const|override|noexcept|final|\s)*\{'
-
-            for i, line in enumerate(lines):
-                # namespace
-                m = re.match(namespace_pattern, line)
-                if m:
-                    add_symbol(m.group(1), 'namespace', i + 1)
-                    continue
-
-                # class/struct
-                m = re.match(class_pattern, line)
-                if m:
-                    add_symbol(m.group(2), 'class', i + 1)
-                    continue
-
-                # 函式
-                m = re.match(func_pattern, line)
-                if m:
-                    # group(1) = namespace/class prefix（可選）
-                    # group(2) = 函式名
-                    func_name = m.group(2)
-                    if m.group(1):  # 有 namespace::prefix
-                        func_name = f"{m.group(1)}::{func_name}"
-                    add_symbol(func_name, 'function', i + 1)
-
-        # Rust
-        elif ext == '.rs':
-            pattern = r'^(\s*)(pub\s+)?(fn|struct|enum|impl|trait|mod)\s+(\w+)'
-            for i, line in enumerate(lines):
-                m = re.match(pattern, line)
-                if m:
-                    keyword = m.group(3)
-                    sym_type = {
-                        'fn': 'function', 'struct': 'class', 'enum': 'class',
-                        'impl': 'impl', 'trait': 'trait', 'mod': 'module'
-                    }.get(keyword, 'function')
-                    add_symbol(m.group(4), sym_type, i + 1)
-
-        # Go
-        elif ext == '.go':
-            # 支援 method receiver：func (r *Receiver) Name()
-            pattern = r'^func\s+(?:\([^)]+\)\s+)?(\w+)'
-            type_pattern = r'^type\s+(\w+)'
-            for i, line in enumerate(lines):
-                m = re.match(pattern, line)
-                if m:
-                    add_symbol(m.group(1), 'function', i + 1)
-                    continue
-                m = re.match(type_pattern, line)
-                if m:
-                    add_symbol(m.group(1), 'class', i + 1)
-
-        # JavaScript/TypeScript：支援 arrow function、object method、export
-        elif ext in ('.js', '.ts', '.jsx', '.tsx'):
-            patterns = [
-                # class Foo / export class Foo
-                (r'^(?:export\s+)?(?:default\s+)?(class)\s+(\w+)', 'class'),
-                # function foo / async function foo / export function foo
-                (r'^(?:export\s+)?(?:default\s+)?(async\s+)?function\s+(\w+)', 'function'),
-                # const foo = (...) => / const foo = async (...) =>
-                (r'^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\([^)]*\)\s*=>', 'function'),
-                # const foo = function / const foo = async function
-                (r'^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?function', 'function'),
-                # object method in object literal: foo: (...) => / foo: function
-                (r'^\s+(\w+)\s*:\s*(?:async\s+)?(?:function|\([^)]*\)\s*=>)', 'function'),
-                # class method (with indentation): async foo() { / foo() {
-                (r'^\s+(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{', 'function'),
-                # interface/type
-                (r'^(?:export\s+)?(?:interface|type)\s+(\w+)', 'class'),
-            ]
-            for i, line in enumerate(lines):
-                for pattern, sym_type in patterns:
-                    m = re.match(pattern, line)
-                    if m:
-                        # 取最後一個 group 作為 symbol name
-                        symbol_name = m.group(m.lastindex)
-                        # 跳過常見的控制流關鍵字
-                        if symbol_name in ('if', 'else', 'for', 'while', 'switch', 'catch', 'try', 'finally'):
-                            continue
-                        add_symbol(symbol_name, sym_type, i + 1)
-                        break
+            symbols.append(symbol_dict)
 
         return symbols
 
@@ -345,6 +256,12 @@ class CodeRAG:
             return
 
         if verbose:
+            # 顯示解析器狀態
+            parser_status = get_parser_status()
+            if parser_status['has_tree_sitter']:
+                ts_langs = [k for k, v in parser_status['languages'].items() if v == 'tree-sitter']
+                if ts_langs:
+                    print(f"[CODE_RAG] 使用 tree-sitter: {', '.join(ts_langs)}")
             print("[CODE_RAG] 建立程式碼索引...")
 
         self.index = []
@@ -373,19 +290,26 @@ class CodeRAG:
                     symbols = self._extract_symbols(filepath, content)
 
                     for sym in symbols:
-                        # 改進：embedding text 加入 path + type，提升搜尋精準度
-                        # 格式："{path} {type} {symbol} {context}"
-                        embed_text = f"{sym['path']} {sym['type']} {sym['symbol']} {sym['context'][:300]}"
+                        # 改進：embedding text 加入 path + type + parent，提升搜尋精準度
+                        parent_info = f" in {sym.get('parent', '')}" if sym.get('parent') else ""
+                        embed_text = f"{sym['path']} {sym['type']} {sym['symbol']}{parent_info} {sym['context'][:300]}"
                         emb = self._get_embedding(embed_text)
 
                         # metadata 不含 embedding
-                        self.index.append({
+                        index_entry = {
                             'path': sym['path'],
                             'symbol': sym['symbol'],
                             'type': sym['type'],
                             'line': sym['line'],
                             'context': sym['context'][:500],
-                        })
+                        }
+                        # 新增 end_line 和 parent（如果有）
+                        if 'end_line' in sym:
+                            index_entry['end_line'] = sym['end_line']
+                        if 'parent' in sym:
+                            index_entry['parent'] = sym['parent']
+
+                        self.index.append(index_entry)
                         # embedding 單獨收集
                         embeddings_list.append(emb if emb else [])
                 except Exception as e:
@@ -619,23 +543,35 @@ class CodeRAG:
                 symbol_lower = item.get("symbol", "").lower()
                 is_explicit = any(t.lower() == symbol_lower for t in code_tokens)
                 if combined >= threshold or is_explicit:
-                    results.append({
+                    result_item = {
                         'path': item['path'],
                         'symbol': item['symbol'],
                         'type': item['type'],
                         'line': item['line'],
                         'score': round(combined, 3)
-                    })
+                    }
+                    # 新增 end_line 和 parent（如果有）
+                    if 'end_line' in item:
+                        result_item['end_line'] = item['end_line']
+                    if 'parent' in item:
+                        result_item['parent'] = item['parent']
+                    results.append(result_item)
             else:
                 # 一般 query：kw_score 高分(>=0.85)也額外加入
                 if combined >= threshold or kw_score >= 0.85:
-                    results.append({
+                    result_item = {
                         'path': item['path'],
                         'symbol': item['symbol'],
                         'type': item['type'],
                         'line': item['line'],
                         'score': round(combined, 3)
-                    })
+                    }
+                    # 新增 end_line 和 parent（如果有）
+                    if 'end_line' in item:
+                        result_item['end_line'] = item['end_line']
+                    if 'parent' in item:
+                        result_item['parent'] = item['parent']
+                    results.append(result_item)
 
         return results
 
@@ -647,8 +583,16 @@ class CodeRAG:
 
         lines = ["\n[CODE_RAG_CANDIDATES] 可能相關的程式碼位置:"]
         for r in results:
-            lines.append(f"  - {r['path']}:{r['line']} {r['type']} {r['symbol']} (score: {r['score']})")
+            # 顯示行號範圍（如果有 end_line）
+            line_info = f"{r['line']}"
+            if 'end_line' in r and r['end_line'] != r['line']:
+                line_info = f"{r['line']}-{r['end_line']}"
+
+            # 顯示 parent（如果有）
+            parent_info = f" in {r['parent']}" if r.get('parent') else ""
+
+            lines.append(f"  - {r['path']}:{line_info} {r['type']} {r['symbol']}{parent_info} (score: {r['score']})")
         lines.append("[/CODE_RAG_CANDIDATES]\n")
-        lines.append("TIP: 可用 read_file 查看上述檔案的具體內容")
+        lines.append("TIP: 可用 read_file 查看上述檔案的具體內容（行號範圍已標示）")
 
         return "\n".join(lines)
