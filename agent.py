@@ -15,7 +15,8 @@ from typing import Optional
 
 from http_client import get_session
 
-import config  # 用於動態存取 RUN_COMMAND_ENABLED
+import config  # 用於動態存取 RUN_COMMAND_ENABLED, PATCH_ENABLED 等旗標
+import container_runner  # 用於動態存取 CONTAINER_ENABLED
 from config import (
     OLLAMA_CHAT_URL, MODEL, NUM_CTX,
     MAX_TOOL_LOOPS, MAX_FILE_READ_CHARS, MAX_GREP_RESULTS, MAX_LIST_DEPTH,
@@ -26,13 +27,10 @@ from config import (
     CODE_RAG_PREREAD_LINES, CODE_RAG_PREREAD_LINES_BUG,
     RUN_COMMAND_TIMEOUT, RUN_COMMAND_MAX_OUTPUT,
     ALLOWED_COMMANDS,
-    # 改碼閉環相關設定
-    PATCH_ENABLED, PATCH_MAX_FILES, PATCH_MAX_LINES_PER_FILE,
+    # 改碼閉環相關設定（注意：PATCH_ENABLED 需用 config.PATCH_ENABLED 讀取）
+    PATCH_MAX_FILES, PATCH_MAX_LINES_PER_FILE,
     LINT_COMMANDS
 )
-
-# 容器執行支援
-from container_runner import CONTAINER_ENABLED, run_in_container
 from utils import (
     should_ignore_dir, should_ignore_file, call_llm, call_llm_stream,
     should_use_strict_mode, answer_with_self_check
@@ -590,8 +588,8 @@ class ToolExecutor:
         if not config.RUN_COMMAND_ENABLED:
             return "錯誤: run_command 功能已停用（可用 --run-tests 或設定 AI_CODE_RUN_TESTS=1 啟用）"
 
-        # 容器化執行模式
-        if CONTAINER_ENABLED:
+        # 容器化執行模式（讀取 module 變數，避免 import 快照問題）
+        if container_runner.CONTAINER_ENABLED:
             return self._run_command_in_container(command, timeout)
 
         command = command.strip()
@@ -684,7 +682,7 @@ class ToolExecutor:
 
         print(f"   [CONTAINER] 執行: {command}")
 
-        result = run_in_container(
+        result = container_runner.run_in_container(
             command=command,
             folder=str(self.root),
             timeout=timeout,

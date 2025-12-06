@@ -271,22 +271,25 @@ def run_in_container(
         }
 
 
-def run_tests_in_container(folder: str, test_command: str = None) -> dict:
+def run_tests_in_container(folder: str, test_command: str = None, network: bool = False) -> dict:
     """在容器中執行測試
 
     Args:
         folder: 專案目錄
         test_command: 測試命令（自動偵測如果未指定）
+        network: 是否允許網路存取（預設 False，分析不信任 repo 時更安全）
 
     Returns:
         執行結果 dict
 
     設計說明：
         - 專案目錄維持唯讀（安全）
+        - 網路預設關閉（安全優先，不信任的 repo 可能有惡意腳本）
         - build 輸出導向 /tmp/build（可寫 tmpfs）
         - pip 安裝到 /tmp/venv（透過 PIP_TARGET 環境變數）
         - npm 安裝到 /tmp/node_modules（透過 npm_config_prefix）
         - Makefile 的 make test 被排除（風險太高，會執行任意腳本）
+        - 若需安裝依賴，呼叫方需明確傳入 network=True
     """
     folder_path = Path(folder)
 
@@ -327,7 +330,7 @@ def run_tests_in_container(folder: str, test_command: str = None) -> dict:
     return run_in_container(
         command=test_command,
         folder=folder,
-        network=True,  # 安裝依賴可能需要網路
+        network=network,  # 預設關閉，呼叫方需明確啟用
         writable=False
     )
 
@@ -408,6 +411,7 @@ def main():
     test_parser = subparsers.add_parser('test', help='在容器中執行測試')
     test_parser.add_argument('folder', help='專案目錄')
     test_parser.add_argument('--cmd', help='測試命令（自動偵測如果未指定）')
+    test_parser.add_argument('--network', action='store_true', help='允許網路存取（安裝依賴時需要）')
 
     # pull 命令
     pull_parser = subparsers.add_parser('pull', help='拉取容器映像檔')
@@ -438,7 +442,7 @@ def main():
         exit(result['returncode'])
 
     elif args.command == 'test':
-        result = run_tests_in_container(args.folder, args.cmd)
+        result = run_tests_in_container(args.folder, args.cmd, network=args.network)
         if result['stdout']:
             print(result['stdout'])
         if result['stderr']:

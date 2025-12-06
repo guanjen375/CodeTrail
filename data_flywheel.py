@@ -76,14 +76,15 @@ def get_reproducibility_info(folder: str = None) -> dict:
         }
     """
     import subprocess
-    from config import MODEL, STRICT_MODE, PATCH_ENABLED
+    import config  # 用模組存取，避免 import 快照問題
+    import container_runner
 
     info = {
         'repo_commit': None,
-        'model_tag': MODEL,
-        'strict_mode': STRICT_MODE,
-        'patch_enabled': PATCH_ENABLED,
-        'container_enabled': False,
+        'model_tag': config.MODEL,
+        'strict_mode': config.STRICT_MODE,
+        'patch_enabled': config.PATCH_ENABLED,
+        'container_enabled': container_runner.CONTAINER_ENABLED,
         'tool_calls': [],  # 由 agent 補充
         'files_read': [],  # 由 agent 補充
     }
@@ -102,13 +103,6 @@ def get_reproducibility_info(folder: str = None) -> dict:
                 info['repo_commit'] = result.stdout.strip()[:12]  # 只取前 12 字元
         except Exception:
             pass
-
-    # 檢查容器模式
-    try:
-        from container_runner import CONTAINER_ENABLED
-        info['container_enabled'] = CONTAINER_ENABLED
-    except ImportError:
-        pass
 
     return info
 
