@@ -37,6 +37,16 @@ pip install tree-sitter tree-sitter-javascript tree-sitter-typescript tree-sitte
 
 ## 快速開始
 
+### 推薦用法
+
+| 情境 | 指令 |
+|------|------|
+| 日常問答 | `python main.py .` |
+| 有規格文件 | `python main.py . --kb=docs.json` |
+| 需要 AI 改 code | `python main.py . --patch` |
+| Debug + 跑測試 | `python main.py . --patch --run-tests` |
+| 分析外部專案 | `python main.py /path --run-tests --container` |
+
 ### 基本用法
 
 ```bash
