@@ -30,6 +30,17 @@ NUM_CTX = 131072   # 128K，利用 192GB RAM offload
 # 需要足夠大的 context 才能避免截斷
 NUM_CTX_FULL_MODE = NUM_CTX
 
+# ============================================================
+# 動態 num_ctx 設定
+# ============================================================
+# 根據 prompt 長度動態調整 context 大小，減少不必要的記憶體佔用和延遲
+# 1 token ≈ 3-4 chars（粗估）
+DYNAMIC_NUM_CTX_ENABLED = True
+DYNAMIC_NUM_CTX_MIN = 16384      # 最小 16K
+DYNAMIC_NUM_CTX_MAX = NUM_CTX    # 最大 = NUM_CTX
+DYNAMIC_NUM_CTX_BUFFER = 1.5     # 預留 1.5 倍空間給回答
+CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
+
 MAX_TOTAL_CHARS = 200000  # 200KB，讓中小型專案使用完整模式
 
 # ============================================================
@@ -144,6 +155,7 @@ CODE_RAG_PREREAD_TOP_K = 5
 CODE_RAG_PREREAD_TOP_K_BUG = 3       # Bug 模式預讀更少，靠 stack trace 補
 CODE_RAG_PREREAD_LINES = 120
 CODE_RAG_PREREAD_LINES_BUG = 160
+CODE_RAG_PREREAD_MAX_LINES = 300     # 預讀完整函式的最大行數上限（超過則退回窗口模式）
 CODE_RAG_THRESHOLD = 0.30            # 提高門檻，確保真的相關才進來
 CODE_RAG_THRESHOLD_BUG = 0.25        # Bug 類問題稍微放寬
 
@@ -211,6 +223,15 @@ LINT_COMMANDS = {
 RUN_COMMAND_ENABLED = _os.environ.get('AI_CODE_RUN_TESTS', '').lower() in ('1', 'true', 'yes')
 RUN_COMMAND_TIMEOUT = 60
 RUN_COMMAND_MAX_OUTPUT = 8000
+# 裁切策略：測試輸出保留尾巴（錯誤訊息通常在尾部）
+RUN_COMMAND_TAIL_RATIO = 0.7  # 超長輸出時，保留 70% 尾巴 + 30% 頭部
+# 關鍵錯誤 pattern（優先保留包含這些的行）
+RUN_COMMAND_ERROR_PATTERNS = [
+    'FAIL', 'FAILED', 'ERROR', 'Error', 'error:',
+    'Traceback', 'Exception', 'AssertionError',
+    'PASSED', 'passed', 'SKIPPED', 'skipped',
+    'expected', 'actual', 'assert', 'Assert',
+]
 # 白名單：完整命令列表（用於 shlex.split 後的驗證）
 # 改進：使用 shell=False + shlex.split，更安全
 ALLOWED_COMMANDS = [

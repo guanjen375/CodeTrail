@@ -19,13 +19,16 @@ import config  # 用於動態存取 RUN_COMMAND_ENABLED, PATCH_ENABLED 等旗標
 import container_runner  # 用於動態存取 CONTAINER_ENABLED
 from config import (
     OLLAMA_CHAT_URL, MODEL, NUM_CTX,
+    DYNAMIC_NUM_CTX_ENABLED, DYNAMIC_NUM_CTX_MIN, DYNAMIC_NUM_CTX_MAX,
+    DYNAMIC_NUM_CTX_BUFFER, CHARS_PER_TOKEN,
     MAX_TOOL_LOOPS, MAX_FILE_READ_CHARS, MAX_GREP_RESULTS, MAX_LIST_DEPTH,
     MAX_MESSAGES_BUDGET, MIN_RECENT_TOOL_OUTPUTS,
     IGNORED_PATTERNS, GREP_DEFAULT_EXTENSIONS, ALLOWED_DOT_DIRS,
     CODE_RAG_ENABLED, CODE_RAG_TOP_K, CODE_RAG_TOP_K_BUG,
     CODE_RAG_PREREAD_TOP_K, CODE_RAG_PREREAD_TOP_K_BUG,
-    CODE_RAG_PREREAD_LINES, CODE_RAG_PREREAD_LINES_BUG,
+    CODE_RAG_PREREAD_LINES, CODE_RAG_PREREAD_LINES_BUG, CODE_RAG_PREREAD_MAX_LINES,
     RUN_COMMAND_TIMEOUT, RUN_COMMAND_MAX_OUTPUT,
+    RUN_COMMAND_TAIL_RATIO, RUN_COMMAND_ERROR_PATTERNS,
     ALLOWED_COMMANDS,
     # 改碼閉環相關設定（注意：PATCH_ENABLED 需用 config.PATCH_ENABLED 讀取）
     PATCH_MAX_FILES, PATCH_MAX_LINES_PER_FILE,
@@ -35,6 +38,102 @@ from utils import (
     should_ignore_dir, should_ignore_file, call_llm, call_llm_stream,
     should_use_strict_mode, answer_with_self_check
 )
+
+
+# ============================================================
+# 智能輸出裁切
+# ============================================================
+def smart_truncate_output(output: str, max_chars: int, tail_ratio: float = 0.7,
+                          error_patterns: list = None) -> str:
+    """智能裁切輸出，保留重要的錯誤資訊
+
+    策略：
+    1. 測試輸出優先保留尾巴（錯誤訊息通常在尾部）
+    2. 優先保留包含 error_patterns 的行
+    3. 頭尾比例由 tail_ratio 決定
+
+    Args:
+        output: 原始輸出
+        max_chars: 最大字元數
+        tail_ratio: 尾巴保留比例（預設 0.7 = 保留 70% 尾巴）
+        error_patterns: 關鍵錯誤 pattern 列表
+    """
+    if len(output) <= max_chars:
+        return output
+
+    if error_patterns is None:
+        error_patterns = RUN_COMMAND_ERROR_PATTERNS
+
+    lines = output.split('\n')
+    total_lines = len(lines)
+
+    # 找出包含錯誤 pattern 的行
+    important_line_indices = set()
+    for i, line in enumerate(lines):
+        for pattern in error_patterns:
+            if pattern in line:
+                # 保留該行及其上下文（前後各 3 行）
+                for j in range(max(0, i - 3), min(total_lines, i + 4)):
+                    important_line_indices.add(j)
+                break
+
+    # 計算頭尾字元數
+    head_chars = int(max_chars * (1 - tail_ratio))
+    tail_chars = max_chars - head_chars
+
+    # 收集頭部內容
+    head_content = []
+    head_len = 0
+    head_line_end = 0
+    for i, line in enumerate(lines):
+        if head_len + len(line) + 1 > head_chars:
+            break
+        head_content.append(line)
+        head_len += len(line) + 1
+        head_line_end = i + 1
+
+    # 收集尾部內容（從尾巴往前）
+    tail_content = []
+    tail_len = 0
+    tail_line_start = total_lines
+    for i in range(total_lines - 1, -1, -1):
+        line = lines[i]
+        if tail_len + len(line) + 1 > tail_chars:
+            break
+        tail_content.insert(0, line)
+        tail_len += len(line) + 1
+        tail_line_start = i
+
+    # 檢查是否有重要行被截斷
+    skipped_important = []
+    for idx in sorted(important_line_indices):
+        if head_line_end <= idx < tail_line_start:
+            skipped_important.append((idx, lines[idx][:100]))
+
+    # 組合結果
+    skipped_count = tail_line_start - head_line_end
+    truncated = len(output) - head_len - tail_len
+
+    result_parts = []
+    result_parts.append('\n'.join(head_content))
+
+    if skipped_count > 0:
+        # 如果有重要行被截斷，顯示摘要
+        if skipped_important:
+            important_summary = '\n'.join(
+                f"  [{idx+1}] {line}..." for idx, line in skipped_important[:5]
+            )
+            result_parts.append(
+                f"\n\n... [略過 {skipped_count} 行，約 {truncated} 字元] ...\n"
+                f"[重要行摘要]:\n{important_summary}\n"
+            )
+        else:
+            result_parts.append(
+                f"\n\n... [略過 {skipped_count} 行，約 {truncated} 字元] ...\n\n"
+            )
+
+    result_parts.append('\n'.join(tail_content))
+    return ''.join(result_parts)
 
 
 # ============================================================
@@ -207,8 +306,50 @@ def _get_native_tools() -> list:
     return tools
 
 
+def _compute_dynamic_num_ctx(messages: list) -> int:
+    """根據 messages 長度動態計算 num_ctx
+
+    策略：
+    1. 估算 prompt token 數（chars / CHARS_PER_TOKEN）
+    2. 乘以 BUFFER 倍數預留回答空間
+    3. 向上取到 2048 的倍數
+    4. 限制在 MIN ~ MAX 範圍內
+    """
+    if not DYNAMIC_NUM_CTX_ENABLED:
+        return NUM_CTX
+
+    # 計算所有 messages 的總字元數
+    total_chars = 0
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            # multi-modal content
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    total_chars += len(part.get("text", ""))
+
+    # 估算 token 數
+    estimated_tokens = int(total_chars / CHARS_PER_TOKEN)
+
+    # 乘以 buffer 預留回答空間
+    target_ctx = int(estimated_tokens * DYNAMIC_NUM_CTX_BUFFER)
+
+    # 向上取到 2048 的倍數（減少 KV cache 重新分配）
+    target_ctx = ((target_ctx + 2047) // 2048) * 2048
+
+    # 限制範圍
+    target_ctx = max(DYNAMIC_NUM_CTX_MIN, min(DYNAMIC_NUM_CTX_MAX, target_ctx))
+
+    return target_ctx
+
+
 def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
     """呼叫 LLM（帶工具）"""
+    # 動態計算 num_ctx
+    num_ctx = _compute_dynamic_num_ctx(messages)
+
     try:
         session = get_session()
         resp = session.post(OLLAMA_CHAT_URL, json={
@@ -216,7 +357,7 @@ def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
             "messages": messages,
             "tools": _get_native_tools(),
             "stream": False,
-            "options": {"num_ctx": NUM_CTX, "temperature": temperature},
+            "options": {"num_ctx": num_ctx, "temperature": temperature},
         }, timeout=600)
         resp.raise_for_status()
         data = resp.json()
@@ -245,6 +386,9 @@ def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
     """
     import time
 
+    # 動態計算 num_ctx
+    num_ctx = _compute_dynamic_num_ctx(messages)
+
     try:
         session = get_session()
         resp = session.post(OLLAMA_CHAT_URL, json={
@@ -252,7 +396,7 @@ def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
             "messages": messages,
             "tools": _get_native_tools(),
             "stream": True,
-            "options": {"num_ctx": NUM_CTX, "temperature": temperature},
+            "options": {"num_ctx": num_ctx, "temperature": temperature},
         }, timeout=600, stream=True)
         resp.raise_for_status()
 
@@ -643,13 +787,8 @@ class ToolExecutor:
                     output += "\n--- stderr ---\n"
                 output += result.stderr
 
-            if len(output) > RUN_COMMAND_MAX_OUTPUT:
-                half = RUN_COMMAND_MAX_OUTPUT // 2
-                output = (
-                    output[:half] +
-                    f"\n\n... [截斷 {len(output) - RUN_COMMAND_MAX_OUTPUT} 字元] ...\n\n" +
-                    output[-half:]
-                )
+            # 智能裁切：保留尾巴（錯誤訊息通常在尾部）
+            output = smart_truncate_output(output, RUN_COMMAND_MAX_OUTPUT, RUN_COMMAND_TAIL_RATIO)
 
             status = "✓ 成功" if result.returncode == 0 else f"✗ 失敗 (exit {result.returncode})"
             return f"=== {status} ===\n{output}" if output else f"=== {status} (無輸出) ==="
@@ -701,13 +840,8 @@ class ToolExecutor:
                 output += "\n--- stderr ---\n"
             output += result['stderr']
 
-        if len(output) > RUN_COMMAND_MAX_OUTPUT:
-            half = RUN_COMMAND_MAX_OUTPUT // 2
-            output = (
-                output[:half] +
-                f"\n\n... [截斷 {len(output) - RUN_COMMAND_MAX_OUTPUT} 字元] ...\n\n" +
-                output[-half:]
-            )
+        # 智能裁切：保留尾巴（錯誤訊息通常在尾部）
+        output = smart_truncate_output(output, RUN_COMMAND_MAX_OUTPUT, RUN_COMMAND_TAIL_RATIO)
 
         status = "✓ 成功" if result['success'] else f"✗ 失敗 (exit {result['returncode']})"
         return f"=== {status} (容器模式) ===\n{output}" if output else f"=== {status} (容器模式, 無輸出) ==="
@@ -722,6 +856,10 @@ class ToolExecutor:
         - 路徑驗證：只能修改專案內的檔案
         - 限制檔案數量和行數
         - 自動備份原始檔案
+        - Context 驗證：套用前驗證 context 行匹配
+
+        改進：
+        - 成功套用後自動執行 lint
 
         Args:
             patch: unified diff 格式的 patch 內容
@@ -743,6 +881,8 @@ class ToolExecutor:
             return f"錯誤: 修改檔案數量超過限制（{len(changes)} > {PATCH_MAX_FILES}）"
 
         results = []
+        successfully_patched = []  # 記錄成功修改的檔案
+
         for filepath, hunks in changes.items():
             # 驗證路徑安全性
             target = self._safe_path(filepath)
@@ -766,8 +906,31 @@ class ToolExecutor:
             try:
                 result = self._apply_hunks_to_file(target, hunks)
                 results.append(result)
+                # 記錄成功修改的檔案
+                if result.startswith("✓"):
+                    successfully_patched.append(filepath)
             except Exception as e:
                 results.append(f"✗ {filepath}: 套用失敗 - {e}")
+
+        # 自動對成功修改的檔案執行 lint
+        if successfully_patched and not dry_run:
+            results.append("\n=== 自動 Lint ===")
+            for filepath in successfully_patched:
+                ext = Path(filepath).suffix.lower()
+                if ext in LINT_COMMANDS:
+                    try:
+                        lint_result = self.run_lint(filepath, fix=True)
+                        # 只顯示結果摘要
+                        if "✓" in lint_result:
+                            results.append(f"  ✓ {filepath}: lint 完成")
+                        elif "⚠" in lint_result:
+                            results.append(f"  ⚠ {filepath}: lint 有警告")
+                        elif "錯誤: 沒有可用的 lint" in lint_result:
+                            pass  # 沒有可用工具，跳過
+                        else:
+                            results.append(f"  {filepath}: {lint_result[:100]}")
+                    except Exception as e:
+                        results.append(f"  ⚠ {filepath}: lint 失敗 - {e}")
 
         return "\n".join(results) if results else "沒有修改"
 
@@ -860,10 +1023,45 @@ class ToolExecutor:
 
         return changes
 
+    def _verify_hunk_context(self, lines: list, hunk: dict) -> tuple[bool, str]:
+        """驗證 hunk 的 context 行是否與檔案內容匹配
+
+        Args:
+            lines: 檔案內容（每行一個元素）
+            hunk: 要驗證的 hunk
+
+        Returns:
+            (is_valid, error_message)
+        """
+        start_idx = hunk['old_start'] - 1  # 轉為 0-based index
+        file_line_idx = start_idx
+
+        for line_type, content in hunk['lines']:
+            if line_type in (' ', '-'):
+                # context 或要刪除的行，必須與檔案內容匹配
+                if file_line_idx >= len(lines):
+                    return False, f"行 {file_line_idx + 1}: 超出檔案範圍"
+
+                file_line = lines[file_line_idx]
+                # 比較時忽略尾部空白
+                if file_line.rstrip() != content.rstrip():
+                    # 嘗試模糊匹配（只比較非空白部分）
+                    if file_line.strip() != content.strip():
+                        return False, (
+                            f"行 {file_line_idx + 1} context 不匹配:\n"
+                            f"  期望: '{content[:60]}...'\n"
+                            f"  實際: '{file_line[:60]}...'"
+                        )
+                file_line_idx += 1
+
+        return True, ""
+
     def _apply_hunks_to_file(self, filepath: Path, hunks: list) -> str:
         """將 hunks 套用到檔案
 
-        策略：從後往前套用，避免行號偏移
+        改進：
+        - 套用前驗證 context 行是否匹配
+        - 從後往前套用，避免行號偏移
         """
         if not filepath.exists():
             # 新檔案：直接寫入所有 '+' 行
@@ -878,6 +1076,12 @@ class ToolExecutor:
         # 讀取原始檔案
         original = filepath.read_text(encoding='utf-8', errors='replace')
         lines = original.split('\n')
+
+        # 先驗證所有 hunk 的 context
+        for i, hunk in enumerate(hunks):
+            is_valid, error_msg = self._verify_hunk_context(lines, hunk)
+            if not is_valid:
+                return f"✗ {filepath.relative_to(self.root)}: 區塊 {i+1} {error_msg}"
 
         # 備份原始檔案
         backup_path = filepath.with_suffix(filepath.suffix + '.orig')
@@ -1448,15 +1652,35 @@ def handle_followup(question: str, prev_qa: list, knowledge_ctx: str = "",
 
 
 def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = None,
-              knowledge_ctx: str = "", code_rag=None, max_loops: int = None) -> str:
+              knowledge_ctx: str = "", code_rag=None, max_loops: int = None,
+              return_metadata: bool = False) -> str | tuple:
     """執行 Agent 模式
 
     Args:
         max_loops: 最大工具回合數，預設使用 MAX_TOOL_LOOPS
+        return_metadata: 若為 True，回傳 (answer, metadata) tuple，
+                        metadata 包含 tool_calls 和 files_read
+
+    Returns:
+        str: 回答（預設）
+        tuple: (answer, {"tool_calls": [...], "files_read": [...]}) 若 return_metadata=True
     """
     executor = ToolExecutor(folder)
     prev_qa = prev_qa or []
     effective_max_loops = max_loops if max_loops is not None else MAX_TOOL_LOOPS
+
+    # 追蹤工具呼叫和讀取的檔案（用於資料飛輪）
+    _tool_calls_record = []
+    _files_read_record = set()
+
+    def _make_return(answer: str):
+        """包裝返回值，支援 metadata"""
+        if return_metadata:
+            return answer, {
+                "tool_calls": _tool_calls_record,
+                "files_read": list(_files_read_record)
+            }
+        return answer
 
     q_lower = question.lower()
     is_bug_fix = any(kw in q_lower for kw in ['bug', '錯誤', 'error', 'crash', 'fail', '修', 'fix', '問題', 'issue', '不work', '不能'])
@@ -1536,10 +1760,22 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
                 if c['path'] in preread_files:
                     continue
 
-                center_line = c['line']
-                half_range = preread_lines // 2
-                start = max(1, center_line - half_range)
-                end = center_line + half_range
+                # 改進：優先使用 end_line 讀取完整函式/類別區塊
+                start_line = c['line']
+                end_line = c.get('end_line')
+
+                if end_line and (end_line - start_line + 1) <= CODE_RAG_PREREAD_MAX_LINES:
+                    # 有 end_line 且函式長度在限制內，讀取完整區塊
+                    start = start_line
+                    end = end_line
+                    read_mode = "完整區塊"
+                else:
+                    # 退回窗口模式：函式太長或沒有 end_line
+                    center_line = start_line
+                    half_range = preread_lines // 2
+                    start = max(1, center_line - half_range)
+                    end = center_line + half_range
+                    read_mode = f"窗口 {preread_lines} 行"
 
                 content = executor.read_file(c['path'], start, end)
                 if content and not content.startswith("錯誤"):
@@ -1547,7 +1783,8 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
                         f"[預讀: {c['path']} - {c['type']} {c['symbol']} (相關度: {c['score']})]\n{content}"
                     )
                     preread_files.add(c['path'])
-                    print(f"   [PREREAD] {c['path']}:{c['line']} ({c['symbol']}) [{preread_lines} 行]")
+                    actual_lines = end - start + 1
+                    print(f"   [PREREAD] {c['path']}:{start}-{end} ({c['symbol']}) [{read_mode}, {actual_lines} 行]")
 
             if preread_parts:
                 code_rag_context = "\n\n【Code RAG 自動預讀的相關程式碼 - 請優先根據這些內容分析】:\n" + "\n\n".join(preread_parts)
@@ -1660,7 +1897,7 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
                 print(f"   [OK] Agent 完成分析\n")
                 # 直接輸出結果（批次輸出，避免逐字 I/O 開銷）
                 print(content)
-                return content
+                return _make_return(content)
             else:
                 messages.append({"role": "assistant", "content": content or "..."})
                 messages.append({"role": "user", "content": "請繼續探索或直接回答問題。"})
@@ -1692,12 +1929,18 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
                 tool_history.append(call_key)
                 result = executor.execute(tool_name, args)
 
+                # 記錄工具呼叫（用於資料飛輪）
+                tool_call_summary = f"{tool_name}:{args.get('path', args.get('pattern', args.get('command', '')[:30]))}"
+                _tool_calls_record.append(tool_call_summary)
+
                 if tool_name == "read_file" and result:
                     line_match = re.search(r'行 (\d+)-(\d+) / 共 (\d+) 行', result)
                     if line_match:
                         start, end, total = map(int, line_match.groups())
                         if start == 1 and end >= total:
                             read_files_set.add(args.get("path", ""))
+                    # 記錄讀取的檔案（用於資料飛輪）
+                    _files_read_record.add(args.get("path", ""))
 
             preview = result[:150] + "..." if result and len(result) > 150 else result
             print(f"   [RESULT] {preview}")
@@ -1732,6 +1975,6 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
     content = call_llm_with_tools_stream(messages, temperature=agent_temperature)
 
     if content:
-        return content
+        return _make_return(content)
 
-    return "[WARN] 達到最大探索次數，請嘗試更具體的問題。"
+    return _make_return("[WARN] 達到最大探索次數，請嘗試更具體的問題。")

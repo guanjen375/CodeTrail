@@ -259,11 +259,19 @@ def main():
 
         print("\n" + "=" * 50)
         print("[NOTE] 回答:\n")
+        # 追蹤 agent metadata（tool_calls, files_read）
+        agent_metadata = None
         if mode == "full":
             result = analyze_full(ctx, clean_q, img_ctx, knowledge_ctx)
         else:
             # empty 模式和 agent 模式都使用 run_agent
-            result = run_agent(folder, clean_q, img_ctx, knowledge_ctx=knowledge_ctx, code_rag=code_rag)
+            # 啟用 return_metadata 以取得 tool_calls 和 files_read
+            agent_result = run_agent(folder, clean_q, img_ctx, knowledge_ctx=knowledge_ctx,
+                                     code_rag=code_rag, return_metadata=DATA_COLLECT_ENABLED)
+            if DATA_COLLECT_ENABLED and isinstance(agent_result, tuple):
+                result, agent_metadata = agent_result
+            else:
+                result = agent_result
 
         # 資料飛輪：記錄互動（含可重現性資訊）
         if DATA_COLLECT_ENABLED:
@@ -278,7 +286,9 @@ def main():
                 refs=refs,
                 code_snippets=code_snippets,
                 metadata={'mode': mode, 'kb_top_score': kb_metadata.get('top_score', 0)},
-                folder=folder  # 用於取得 git commit 等可重現性資訊
+                folder=folder,  # 用於取得 git commit 等可重現性資訊
+                tool_calls=agent_metadata.get('tool_calls') if agent_metadata else None,
+                files_read=agent_metadata.get('files_read') if agent_metadata else None
             )
 
         # 串流輸出已在函數內完成，不需再次印出
@@ -368,6 +378,8 @@ def main():
             print("\n" + "=" * 50)
             print("[NOTE] 回答:\n")
 
+            # 追蹤 agent metadata（tool_calls, files_read）
+            agent_metadata = None
             if mode == "full":
                 result = analyze_full(ctx, clean_q, img_ctx, knowledge_ctx)
             elif is_followup:
@@ -376,8 +388,14 @@ def main():
                 result = handle_followup(clean_q, qa_history, knowledge_ctx=knowledge_ctx)
             else:
                 # empty 模式和 agent 模式都使用 run_agent
-                result = run_agent(folder, clean_q, img_ctx, prev_qa=qa_history,
-                                  knowledge_ctx=knowledge_ctx, code_rag=code_rag)
+                # 啟用 return_metadata 以取得 tool_calls 和 files_read
+                agent_result = run_agent(folder, clean_q, img_ctx, prev_qa=qa_history,
+                                        knowledge_ctx=knowledge_ctx, code_rag=code_rag,
+                                        return_metadata=DATA_COLLECT_ENABLED)
+                if DATA_COLLECT_ENABLED and isinstance(agent_result, tuple):
+                    result, agent_metadata = agent_result
+                else:
+                    result = agent_result
 
             qa_history.append((clean_q, result))
             if len(qa_history) > 5:
@@ -396,7 +414,9 @@ def main():
                     refs=refs,
                     code_snippets=code_snippets,
                     metadata={'mode': mode, 'is_followup': is_followup, 'kb_top_score': kb_metadata.get('top_score', 0)},
-                    folder=folder  # 用於取得 git commit 等可重現性資訊
+                    folder=folder,  # 用於取得 git commit 等可重現性資訊
+                    tool_calls=agent_metadata.get('tool_calls') if agent_metadata else None,
+                    files_read=agent_metadata.get('files_read') if agent_metadata else None
                 )
 
             # 串流輸出已在函數內完成

@@ -29,7 +29,8 @@ from config import (
     CODE_EXTENSIONS, EMBEDDING_MODEL,
     CODE_RAG_ENABLED, CODE_RAG_TOP_K, CODE_RAG_CACHE_FILE,
     CODE_RAG_THRESHOLD, CODE_RAG_THRESHOLD_BUG,
-    OLLAMA_EMBEDDINGS_URL
+    OLLAMA_EMBEDDINGS_URL, OLLAMA_GENERATE_URL,
+    USE_RERANKER, RERANKER_MODEL
 )
 from utils import should_ignore_file, should_ignore_dir
 
@@ -65,15 +66,15 @@ class CodeRAG:
     - 動態建立程式碼索引（函式/類別級別）
     - 用於 Agent 模式的「第一層縮小範圍」
 
-    快取優化：
-    - 使用 numpy .npz 二進位格式儲存 embedding 向量（壓縮率高）
-    - metadata (path, symbol, type, line, context) 單獨存 JSON
-    - 快取檔案大小降低約 5-10 倍
+    快取優化 v3（增量更新）：
+    - 每檔案獨立快取：file_hash -> symbols + embeddings
+    - 只重建變更的檔案，大幅提升大型 repo 的速度
+    - embedding 使用 numpy .npz 二進位格式（壓縮率高）
     """
 
     def __init__(self, folder: str):
         self.folder = Path(folder).resolve()
-        # 新的快取檔案：metadata 用 JSON，embedding 用 npz
+        # 快取檔案
         cache_base = CODE_RAG_CACHE_FILE.replace('.json', '')
         self.cache_meta_file = self.folder / f"{cache_base}_meta.json"
         self.cache_emb_file = self.folder / f"{cache_base}_emb.npz"
@@ -81,9 +82,20 @@ class CodeRAG:
         self.legacy_cache_file = self.folder / CODE_RAG_CACHE_FILE
         self.index = []
         self.embeddings = None  # numpy array, shape: (N, embedding_dim)
+        # 增量快取：{file_rel_path: {"hash": str, "symbols": list, "embeddings": list}}
+        self._file_cache = {}
+
+    def _compute_file_hash(self, filepath: Path) -> str:
+        """計算單一檔案的 hash（用於增量快取驗證）"""
+        try:
+            stat = filepath.stat()
+            # 使用 size + mtime 作為快速 hash（比讀取內容快）
+            return hashlib.md5(f"{stat.st_size}:{stat.st_mtime}".encode()).hexdigest()
+        except OSError:
+            return ""
 
     def _compute_folder_hash(self) -> str:
-        """計算資料夾的 hash（用於快取驗證）"""
+        """計算資料夾的 hash（用於快取驗證，向後相容）"""
         # 排除快取檔案本身，避免快取寫入後導致 hash 變化
         cache_base = CODE_RAG_CACHE_FILE.replace('.json', '')
         skip_files = {
@@ -112,38 +124,88 @@ class CodeRAG:
         files.sort()
         return hashlib.md5("\n".join(files).encode()).hexdigest()
 
+    def _scan_code_files(self) -> dict:
+        """掃描所有程式碼檔案，返回 {rel_path: {"filepath": Path, "hash": str}}"""
+        cache_base = CODE_RAG_CACHE_FILE.replace('.json', '')
+        skip_files = {
+            CODE_RAG_CACHE_FILE,
+            f"{cache_base}_meta.json",
+            f"{cache_base}_emb.npz",
+        }
+
+        result = {}
+        folder_path = Path(self.folder)
+        for dirpath, dirnames, filenames in os.walk(self.folder):
+            rel_dir = Path(dirpath).relative_to(folder_path)
+            dirnames[:] = [d for d in dirnames if not should_ignore_dir(rel_dir / d)]
+
+            for filename in filenames:
+                if filename.startswith('.') or filename in skip_files:
+                    continue
+                if Path(filename).suffix.lower() not in CODE_EXTENSIONS:
+                    continue
+
+                filepath = Path(dirpath) / filename
+                rel_path = str(filepath.relative_to(self.folder))
+                if should_ignore_file(rel_path):
+                    continue
+
+                file_hash = self._compute_file_hash(filepath)
+                if file_hash:
+                    result[rel_path] = {"filepath": filepath, "hash": file_hash}
+
+        return result
+
+    def _load_file_cache(self) -> dict:
+        """載入增量快取（每檔案粒度）
+
+        Returns:
+            {rel_path: {"hash": str, "symbols": list, "embeddings": list}}
+        """
+        if not self.cache_meta_file.exists():
+            return {}
+
+        try:
+            with open(self.cache_meta_file, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+
+            # 檢查 embedding model 是否一致
+            if meta.get("embedding_model") != EMBEDDING_MODEL:
+                return {}
+
+            return meta.get("file_cache", {})
+        except Exception:
+            return {}
+
     def _load_cache(self) -> bool:
-        """嘗試載入快取（優先新格式，向後相容舊格式）"""
+        """嘗試載入快取（優先增量模式，向後相容舊格式）"""
+        # 載入增量快取
+        self._file_cache = self._load_file_cache()
+
+        # 如果有增量快取，使用增量模式
+        if self._file_cache:
+            return False  # 返回 False 讓 build_index 進行增量更新
+
+        # 向後相容：嘗試載入舊格式快取（folder_hash 模式）
         folder_hash = self._compute_folder_hash()
 
-        # 嘗試載入新格式快取（metadata JSON + embedding npz）
         if self.cache_meta_file.exists() and self.cache_emb_file.exists() and HAS_NUMPY:
             try:
                 with open(self.cache_meta_file, 'r', encoding='utf-8') as f:
                     meta = json.load(f)
 
-                if meta.get("folder_hash") != folder_hash:
-                    return False
+                # 舊格式用 folder_hash 驗證
+                if meta.get("folder_hash") == folder_hash and meta.get("embedding_model") == EMBEDDING_MODEL:
+                    self.index = meta.get("index", [])
+                    emb_data = np.load(self.cache_emb_file)
+                    self.embeddings = emb_data['embeddings']
 
-                # 檢查 embedding model 是否一致，不一致則需重建
-                if meta.get("embedding_model") != EMBEDDING_MODEL:
-                    return False
-
-                self.index = meta.get("index", [])
-                emb_data = np.load(self.cache_emb_file)
-                self.embeddings = emb_data['embeddings']
-
-                # 驗證 embedding 維度與快取記錄一致
-                cached_dim = meta.get("embedding_dim")
-                if cached_dim is not None and self.embeddings.shape[1] != cached_dim:
-                    return False
-
-                if len(self.index) > 0 and self.embeddings is not None:
-                    return True
+                    if len(self.index) > 0 and self.embeddings is not None:
+                        return True
             except Exception:
                 pass
 
-        # 向後相容：嘗試載入舊格式快取
+        # 向後相容：舊版 JSON 格式
         if self.legacy_cache_file.exists():
             try:
                 with open(self.legacy_cache_file, 'r', encoding='utf-8') as f:
@@ -156,24 +218,21 @@ class CodeRAG:
                 if not old_index:
                     return False
 
-                # 從舊格式遷移：分離 embedding 到 numpy array
                 self.index = []
                 embeddings_list = []
                 for item in old_index:
                     emb = item.pop('embedding', [])
                     self.index.append(item)
-                    embeddings_list.append(emb if emb else [0.0] * 1024)  # 預設 1024 維
+                    embeddings_list.append(emb if emb else [0.0] * 1024)
 
                 if HAS_NUMPY:
                     self.embeddings = np.array(embeddings_list, dtype=np.float32)
-                    # 遷移後自動保存新格式並刪除舊檔案
                     self._save_cache()
                     try:
                         self.legacy_cache_file.unlink()
                     except Exception:
                         pass
                 else:
-                    # 沒有 numpy，把 embedding 塞回 index
                     for i, emb in enumerate(embeddings_list):
                         self.index[i]['embedding'] = emb
 
@@ -184,20 +243,18 @@ class CodeRAG:
         return False
 
     def _save_cache(self):
-        """儲存快取（新格式：metadata JSON + embedding npz）"""
+        """儲存快取（增量模式：每檔案粒度）"""
         try:
-            # 準備 metadata（不含 embedding），包含 embedding model 與維度資訊
             emb_dim = self.embeddings.shape[1] if HAS_NUMPY and self.embeddings is not None else None
             meta = {
-                "folder_hash": self._compute_folder_hash(),
                 "embedding_model": EMBEDDING_MODEL,
                 "embedding_dim": emb_dim,
-                "index": self.index
+                "index": self.index,
+                "file_cache": self._file_cache  # 增量快取
             }
             with open(self.cache_meta_file, 'w', encoding='utf-8') as f:
                 json.dump(meta, f, ensure_ascii=False)
 
-            # 儲存 embedding 為 npz（壓縮的 numpy 二進位格式）
             if HAS_NUMPY and self.embeddings is not None:
                 np.savez_compressed(self.cache_emb_file, embeddings=self.embeddings)
         except Exception:
@@ -245,82 +302,118 @@ class CodeRAG:
         result = _cached_get_embedding(normalized)
         return list(result) if result else []
 
+    def _index_single_file(self, filepath: Path, rel_path: str) -> tuple:
+        """索引單一檔案，返回 (symbols, embeddings)"""
+        content = filepath.read_text(encoding='utf-8', errors='replace')
+        symbols = self._extract_symbols(filepath, content)
+
+        file_symbols = []
+        file_embeddings = []
+
+        for sym in symbols:
+            parent_info = f" in {sym.get('parent', '')}" if sym.get('parent') else ""
+            embed_text = f"{sym['path']} {sym['type']} {sym['symbol']}{parent_info} {sym['context'][:300]}"
+            emb = self._get_embedding(embed_text)
+
+            index_entry = {
+                'path': sym['path'],
+                'symbol': sym['symbol'],
+                'type': sym['type'],
+                'line': sym['line'],
+                'context': sym['context'][:500],
+            }
+            if 'end_line' in sym:
+                index_entry['end_line'] = sym['end_line']
+            if 'parent' in sym:
+                index_entry['parent'] = sym['parent']
+
+            file_symbols.append(index_entry)
+            file_embeddings.append(emb if emb else [])
+
+        return file_symbols, file_embeddings
+
     def build_index(self, verbose: bool = True):
-        """建立程式碼索引"""
+        """建立程式碼索引（支援增量更新）"""
         if not CODE_RAG_ENABLED:
             return
 
+        # 嘗試載入快取
         if self._load_cache():
             if verbose:
                 print(f"[CODE_RAG] 載入快取: {len(self.index)} 個符號")
             return
 
+        # 掃描所有程式碼檔案
+        current_files = self._scan_code_files()
+
+        # 計算需要更新的檔案
+        files_to_index = []
+        files_unchanged = []
+        files_deleted = set(self._file_cache.keys()) - set(current_files.keys())
+
+        for rel_path, info in current_files.items():
+            cached = self._file_cache.get(rel_path)
+            if cached and cached.get("hash") == info["hash"]:
+                files_unchanged.append(rel_path)
+            else:
+                files_to_index.append((rel_path, info["filepath"], info["hash"]))
+
+        # 判斷是增量還是全量
+        is_incremental = len(self._file_cache) > 0 and len(files_to_index) < len(current_files)
+
         if verbose:
-            # 顯示解析器狀態
             parser_status = get_parser_status()
             if parser_status['has_tree_sitter']:
                 ts_langs = [k for k, v in parser_status['languages'].items() if v == 'tree-sitter']
                 if ts_langs:
                     print(f"[CODE_RAG] 使用 tree-sitter: {', '.join(ts_langs)}")
-            print("[CODE_RAG] 建立程式碼索引...")
 
+            if is_incremental:
+                print(f"[CODE_RAG] 增量更新: {len(files_to_index)} 個檔案變更, "
+                      f"{len(files_unchanged)} 個未變, {len(files_deleted)} 個已刪除")
+            else:
+                print(f"[CODE_RAG] 建立程式碼索引... ({len(current_files)} 個檔案)")
+
+        # 收集所有符號和 embeddings
         self.index = []
         embeddings_list = []
-        folder_path = Path(self.folder)
+        new_file_cache = {}
 
-        for dirpath, dirnames, filenames in os.walk(self.folder):
-            # 使用統一的目錄過濾邏輯
-            rel_dir = Path(dirpath).relative_to(folder_path)
-            dirnames[:] = [d for d in dirnames if not should_ignore_dir(rel_dir / d)]
+        # 先加入未變更的檔案（從快取讀取）
+        for rel_path in files_unchanged:
+            cached = self._file_cache[rel_path]
+            for sym in cached.get("symbols", []):
+                self.index.append(sym)
+            embeddings_list.extend(cached.get("embeddings", []))
+            new_file_cache[rel_path] = cached
 
-            for filename in filenames:
-                # 跳過 dotfile（包含快取檔案）
-                if filename.startswith('.'):
-                    continue
-                if Path(filename).suffix.lower() not in CODE_EXTENSIONS:
-                    continue
+        # 索引變更的檔案
+        indexed_count = 0
+        for rel_path, filepath, file_hash in files_to_index:
+            try:
+                symbols, embeddings = self._index_single_file(filepath, rel_path)
+                self.index.extend(symbols)
+                embeddings_list.extend(embeddings)
 
-                filepath = Path(dirpath) / filename
-                # 使用相對路徑，讓 should_ignore_file 可匹配 docs/** 等 pattern
-                rel_path = str(filepath.relative_to(self.folder))
-                if should_ignore_file(rel_path):
-                    continue
-                try:
-                    content = filepath.read_text(encoding='utf-8', errors='replace')
-                    symbols = self._extract_symbols(filepath, content)
+                # 更新快取
+                new_file_cache[rel_path] = {
+                    "hash": file_hash,
+                    "symbols": symbols,
+                    "embeddings": embeddings
+                }
+                indexed_count += 1
 
-                    for sym in symbols:
-                        # 改進：embedding text 加入 path + type + parent，提升搜尋精準度
-                        parent_info = f" in {sym.get('parent', '')}" if sym.get('parent') else ""
-                        embed_text = f"{sym['path']} {sym['type']} {sym['symbol']}{parent_info} {sym['context'][:300]}"
-                        emb = self._get_embedding(embed_text)
+                if verbose and is_incremental:
+                    print(f"   [REINDEX] {rel_path} ({len(symbols)} 個符號)")
+            except Exception as e:
+                print(f"[CODE_RAG] 索引 {rel_path} 時發生錯誤: {e}", file=sys.stderr)
+                continue
 
-                        # metadata 不含 embedding
-                        index_entry = {
-                            'path': sym['path'],
-                            'symbol': sym['symbol'],
-                            'type': sym['type'],
-                            'line': sym['line'],
-                            'context': sym['context'][:500],
-                        }
-                        # 新增 end_line 和 parent（如果有）
-                        if 'end_line' in sym:
-                            index_entry['end_line'] = sym['end_line']
-                        if 'parent' in sym:
-                            index_entry['parent'] = sym['parent']
-
-                        self.index.append(index_entry)
-                        # embedding 單獨收集
-                        embeddings_list.append(emb if emb else [])
-                except Exception as e:
-                    # 記錄錯誤但不中斷索引建立
-                    print(f"[CODE_RAG] 索引 {rel_path} 時發生錯誤: {e}", file=sys.stderr)
-                    continue
+        self._file_cache = new_file_cache
 
         # 將 embedding 轉換為 numpy array 並預先 L2 normalize
         if HAS_NUMPY and embeddings_list:
-            # 確保所有 embedding 維度一致
-            emb_dim = max(len(e) for e in embeddings_list) if embeddings_list else 1024
+            emb_dim = max((len(e) for e in embeddings_list if e), default=1024)
             normalized = []
             for emb in embeddings_list:
                 if len(emb) == emb_dim:
@@ -328,23 +421,24 @@ class CodeRAG:
                 elif len(emb) == 0:
                     normalized.append([0.0] * emb_dim)
                 else:
-                    # 維度不一致，填充或截斷
                     normalized.append((emb + [0.0] * emb_dim)[:emb_dim])
             self.embeddings = np.array(normalized, dtype=np.float32)
 
-            # 預先 L2 normalize，query 時可省掉 norm 計算
             norms = np.linalg.norm(self.embeddings, axis=1, keepdims=True)
-            norms = np.where(norms > 0, norms, 1.0)  # 避免除零
+            norms = np.where(norms > 0, norms, 1.0)
             self.embeddings = self.embeddings / norms
             self._embeddings_normalized = True
         else:
             self.embeddings = None
-            # 沒有 numpy 時，退回舊方式（embedding 存在 index 裡）
             for i, emb in enumerate(embeddings_list):
-                self.index[i]['embedding'] = emb
+                if i < len(self.index):
+                    self.index[i]['embedding'] = emb
 
         if verbose:
-            print(f"[CODE_RAG] 索引完成: {len(self.index)} 個符號")
+            if is_incremental:
+                print(f"[CODE_RAG] 增量更新完成: 共 {len(self.index)} 個符號")
+            else:
+                print(f"[CODE_RAG] 索引完成: {len(self.index)} 個符號")
 
         self._save_cache()
 
@@ -456,8 +550,123 @@ class CodeRAG:
             return self.index[idx].get('embedding', [])
         return []
 
+    def _check_reranker_available(self) -> bool:
+        """檢查 reranker 模型是否可用"""
+        if not hasattr(self, '_reranker_available'):
+            try:
+                from config import OLLAMA_TAGS_URL
+                session = get_session()
+                resp = session.get(OLLAMA_TAGS_URL, timeout=5)
+                if resp.status_code == 200:
+                    models = resp.json().get("models", [])
+                    model_names = [m.get("name", "") for m in models]
+                    self._reranker_available = any(RERANKER_MODEL in n for n in model_names)
+                else:
+                    self._reranker_available = False
+            except Exception:
+                self._reranker_available = False
+        return self._reranker_available
+
+    def _should_rerank(self, candidates: list, top_k: int) -> bool:
+        """判斷是否需要 rerank（避免不必要的 API 呼叫）
+
+        觸發條件：
+        1. top_score < 0.6（不夠確信）
+        2. 前幾名分數太接近（差距 < 0.05）
+        """
+        if len(candidates) <= top_k:
+            return False
+
+        top_score = candidates[0][0] if candidates else 0
+        if top_score >= 0.85:
+            # 已經很有信心，不需要 rerank
+            return False
+
+        # 前幾名分數太接近需要 rerank
+        if len(candidates) >= 3:
+            score_diff = candidates[0][0] - candidates[2][0]
+            if score_diff < 0.05:
+                return True
+
+        return top_score < 0.6
+
+    def _rerank_code_candidates(self, question: str, candidates: list, top_k: int) -> list:
+        """使用 reranker 模型對程式碼候選進行二次排序
+
+        Args:
+            question: 使用者問題
+            candidates: [(combined_score, emb_score, kw_score, item), ...]
+            top_k: 返回數量
+
+        Returns:
+            重排後的 item list
+        """
+        if not candidates:
+            return []
+
+        if not USE_RERANKER or len(candidates) <= top_k:
+            return [c[3] for c in candidates[:top_k]]
+
+        # 條件觸發：判斷是否真的需要 rerank
+        if not self._should_rerank(candidates, top_k):
+            return [c[3] for c in candidates[:top_k]]
+
+        # 減少 rerank 的 candidates 數量
+        rerank_count = min(15, top_k * 3)
+
+        if self._check_reranker_available():
+            try:
+                session = get_session()
+                scored = []
+
+                for combined, emb_score, kw_score, item in candidates[:rerank_count]:
+                    # 建構 reranker 輸入：symbol + path + context
+                    symbol = item.get('symbol', '')
+                    path = item.get('path', '')
+                    context = item.get('context', '')[:600]
+                    parent_info = f" in {item.get('parent', '')}" if item.get('parent') else ""
+                    sym_type = item.get('type', 'function')
+
+                    passage = f"{sym_type} {symbol}{parent_info}\nFile: {path}\n{context}"
+
+                    resp = session.post(
+                        OLLAMA_GENERATE_URL,
+                        json={
+                            "model": RERANKER_MODEL,
+                            "prompt": f"Query: {question}\n\nPassage: {passage}",
+                            "stream": False,
+                            "options": {
+                                "num_ctx": 2048,
+                                "temperature": 0,
+                                "num_predict": 10,
+                                "stop": ["\n", " ", ",", "。", "，"]
+                            }
+                        },
+                        timeout=30
+                    )
+                    resp.raise_for_status()
+
+                    result = resp.json().get("response", "").strip()
+                    try:
+                        rerank_score = float(result)
+                    except ValueError:
+                        # Fallback: 嘗試提取數字
+                        match = re.search(r'-?[\d.]+', result)
+                        rerank_score = float(match.group()) if match else combined
+
+                    scored.append((rerank_score, item))
+
+                scored.sort(reverse=True, key=lambda x: x[0])
+                return [c[1] for c in scored[:top_k]]
+
+            except Exception:
+                pass
+
+        # Fallback: 不用 reranker，直接返回原始排序
+        return [c[3] for c in candidates[:top_k]]
+
     def query(self, question: str, top_k: int = CODE_RAG_TOP_K, is_bug_fix: bool = False) -> list[dict]:
-        """查詢相關程式碼位置（動態門檻）"""
+        """查詢相關程式碼位置（動態門檻 + reranker 二次排序）"""
         if not self.index:
             return []
 
@@ -534,44 +743,47 @@ class CodeRAG:
         # 中文問題用 split() 會被判成 1 個字串，導致誤判
         is_short_query = len(code_tokens) <= 2
 
-        results = []
-        for combined, emb_score, kw_score, item in scores[:top_k]:
-            # 使用動態門檻
-            # 改進：短 query 時更嚴格，避免混入噪音
+        # 先做初步過濾（門檻篩選）
+        candidates_for_rerank = []
+        for combined, emb_score, kw_score, item in scores:
             if is_short_query:
-                # 短 query：只有 combined 夠高或 explicit symbol match 才加入
                 symbol_lower = item.get("symbol", "").lower()
                 is_explicit = any(t.lower() == symbol_lower for t in code_tokens)
                 if combined >= threshold or is_explicit:
-                    result_item = {
-                        'path': item['path'],
-                        'symbol': item['symbol'],
-                        'type': item['type'],
-                        'line': item['line'],
-                        'score': round(combined, 3)
-                    }
-                    # 新增 end_line 和 parent（如果有）
-                    if 'end_line' in item:
-                        result_item['end_line'] = item['end_line']
-                    if 'parent' in item:
-                        result_item['parent'] = item['parent']
-                    results.append(result_item)
+                    candidates_for_rerank.append((combined, emb_score, kw_score, item))
             else:
-                # 一般 query：kw_score 高分(>=0.85)也額外加入
                 if combined >= threshold or kw_score >= 0.85:
-                    result_item = {
-                        'path': item['path'],
-                        'symbol': item['symbol'],
-                        'type': item['type'],
-                        'line': item['line'],
-                        'score': round(combined, 3)
-                    }
-                    # 新增 end_line 和 parent（如果有）
-                    if 'end_line' in item:
-                        result_item['end_line'] = item['end_line']
-                    if 'parent' in item:
-                        result_item['parent'] = item['parent']
-                    results.append(result_item)
+                    candidates_for_rerank.append((combined, emb_score, kw_score, item))
+
+            # 收集足夠的候選後停止（rerank 用）
+            if len(candidates_for_rerank) >= top_k * 3:
+                break
+
+        # 使用 reranker 二次排序（條件觸發）
+        reranked_items = self._rerank_code_candidates(question, candidates_for_rerank, top_k)
+
+        # 轉換為結果格式
+        results = []
+        for item in reranked_items:
+            result_item = {
+                'path': item['path'],
+                'symbol': item['symbol'],
+                'type': item['type'],
+                'line': item['line'],
+                'score': round(item.get('_rerank_score', 0), 3) if '_rerank_score' in item else 0.0
+            }
+            # 從原始 candidates 取得原始 combined score（如果沒有 rerank score）
+            if result_item['score'] == 0.0:
+                for combined, _, _, orig_item in candidates_for_rerank:
+                    if orig_item is item:
+                        result_item['score'] = round(combined, 3)
+                        break
+            # 新增 end_line 和 parent（如果有）
+            if 'end_line' in item:
+                result_item['end_line'] = item['end_line']
+            if 'parent' in item:
+                result_item['parent'] = item['parent']
+            results.append(result_item)
 
         return results
 
