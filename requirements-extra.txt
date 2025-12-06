@@ -1,0 +1,15 @@
+# 智能程式碼分析器 - 可選依賴
+# pip install -r requirements-extra.txt
+
+# RAG 知識庫建立（從 PDF/文件抽取）
+pymupdf4llm>=0.0.5
+ollama>=0.1.0
+
+# Tree-sitter 多語言 AST 解析（提升程式碼解析精準度）
+tree-sitter>=0.21.0
+tree-sitter-python>=0.21.0
+tree-sitter-javascript>=0.21.0
+tree-sitter-typescript>=0.21.0
+tree-sitter-go>=0.21.0
+tree-sitter-rust>=0.21.0
+tree-sitter-c>=0.21.0

@@ -1,0 +1,5 @@
+# 智能程式碼分析器 - 核心依賴
+# pip install -r requirements.txt
+
+requests>=2.28.0
+numpy>=1.21.0

@@ -8,44 +8,87 @@
 - **Agent 模式**：大型專案動態探索，按需讀取檔案
 - **網頁模式**：直接分析 GitHub/GitLab/Bitbucket 上的程式碼（測試中）
 - **知識庫 RAG**：整合技術文件（PDF/Markdown），回答時引用文件來源
-- **Code RAG**：自動索引程式碼符號（函式/類別），支援 AST/Tree-sitter 解析
+- **Code RAG**：自動索引程式碼符號（函式/類別），支援 AST/Tree-sitter 解析 + Reranker 二次排序
 - **圖片 OCR**：支援截圖中的錯誤訊息辨識（使用 VL 模型）
 - **二進位分析**：韌體/執行檔的 Hex dump + 智能字串提取
 - **嚴格模式（兩階段）**：規格類問題強制引用文件，並透過自我檢查過濾幻覺
-- **改碼閉環**：apply_patch、git_status、git_diff、run_lint 工具
+- **改碼閉環**：apply_patch（含 context 驗證）、git_status、git_diff、run_lint（自動執行）
 - **容器化執行**：在 Docker/Podman 中安全執行測試命令
-- **資料飛輪**：收集互動記錄用於後續 fine-tuning
+- **資料飛輪**：收集互動記錄（含 tool_calls/files_read）用於後續 fine-tuning
+- **動態 Context**：根據 prompt 長度自動調整 num_ctx，減少延遲
 
 ## 安裝需求
 
-```bash
-# 安裝 Ollama
-# https://ollama.ai/download
+### 1. 安裝 Ollama
 
-# 拉取模型
+前往 https://ollama.ai/download 下載安裝。
+
+### 2. 拉取模型
+
+```bash
 ollama pull qwen3-coder:30b              # 主模型
 ollama pull qwen3-vl:30b-a3b             # VL 模型（圖片辨識用）
 ollama pull bge-m3                       # Embedding 模型
 ollama pull qllama/bge-reranker-v2-m3    # Reranker 模型
-
-# 安裝 Python 依賴
-pip install requests
-
-# 可選：安裝 Tree-sitter（提升多語言 AST 解析）
-pip install tree-sitter tree-sitter-javascript tree-sitter-typescript tree-sitter-go tree-sitter-rust tree-sitter-c
 ```
+
+### 3. 安裝 Python 依賴
+
+```bash
+# 核心依賴
+pip install -r requirements.txt
+
+# 可選依賴（Tree-sitter 多語言解析、RAG 建立工具）
+pip install -r requirements-extra.txt
+```
+
+**核心依賴**（`requirements.txt`）：
+- `requests`：HTTP 請求
+- `numpy`：向量運算加速
+
+**可選依賴**（`requirements-extra.txt`）：
+- `tree-sitter` + 語言套件：提升多語言 AST 解析精準度
+- `pymupdf4llm` + `ollama`：從 PDF 建立知識庫
 
 ## 快速開始
 
 ### 推薦用法
 
-| 情境 | 指令 |
-|------|------|
-| 日常問答 | `python main.py .` |
-| 有規格文件 | `python main.py . --kb=docs.json` |
-| 需要 AI 改 code | `python main.py . --patch` |
-| Debug + 跑測試 | `python main.py . --patch --run-tests` |
-| 分析外部專案 | `python main.py /path --run-tests --container` |
+| 情境 | 指令 | 說明 |
+|------|------|------|
+| 日常問答 | `python main.py .` | 最基本用法，自動選擇模式 |
+| 有規格文件 | `python main.py . --kb=docs.json` | 搭配知識庫，回答會引用文件 |
+| 需要 AI 改 code | `python main.py . --patch` | 啟用 apply_patch + git 工具 |
+| Debug + 跑測試 | `python main.py . --patch --run-tests` | 完整改碼閉環，可執行測試 |
+| 分析外部專案 | `python main.py /path --run-tests --container` | 在容器中安全執行（推薦） |
+| 分析 GitHub repo | `python main.py --web https://github.com/user/repo` | 直接分析線上 repo |
+
+### 模式介紹
+
+本工具有三種主要運作模式：
+
+#### 1. 完整模式（Full Mode）
+- **適用**：小型專案（< 200KB 程式碼）
+- **原理**：一次讀入所有程式碼，整體分析
+- **優點**：回答最完整，不會遺漏關聯
+- **缺點**：大專案會超出 context 限制
+- **強制使用**：`python main.py . --full`
+
+#### 2. Agent 模式
+- **適用**：大型專案、需要精準定位的問題
+- **原理**：動態探索，按需讀取檔案（list_files → grep → read_file）
+- **優點**：可處理任意大小專案，精準定位問題
+- **缺點**：多輪工具呼叫較慢
+- **強制使用**：`python main.py . --agent`
+- **搭配功能**：
+  - `--run-tests`：允許執行測試命令（pytest、cargo test 等）
+  - `--patch`：允許修改程式碼（apply_patch + auto lint）
+  - `--container`：在容器中執行（安全隔離）
+
+#### 3. 網頁模式（測試中）
+- **適用**：分析 GitHub/GitLab/Bitbucket 上的公開 repo
+- **原理**：下載到暫存目錄後分析
+- **使用**：`python main.py --web https://github.com/user/repo`
 
 ### 基本用法
 
@@ -605,6 +648,14 @@ Agent 需要多輪工具呼叫，可以：
 2. 確認資料目錄存在且有寫入權限
 3. 使用 `python data_flywheel.py stats` 查看統計
 
+## 安全注意事項
+
+1. **知識庫檔案**（`knowledge.json`）可能包含內部文件內容，**請勿提交到公開 repo**
+2. **資料飛輪**（`data/interactions.jsonl`）包含使用者提問和回答，**請勿提交到公開 repo**
+3. **`--run-tests`** 會執行專案內的測試腳本，對不信任的專案有安全風險
+4. **`--patch`** 會直接修改檔案，建議先用 `dry_run=True` 預覽
+5. 分析外部/不信任的專案時，建議使用 **`--container`** 在容器中執行
+
 ## License
 
-MIT
+MIT License - 詳見 [LICENSE](LICENSE) 檔案

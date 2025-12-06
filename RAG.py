@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 RAG 知識庫建立工具（增量模式）
-用法：python rag_indexer.py <input_file> <output_json>
+用法：python RAG.py <input_file> <output_json>
+
+範例：
+    python RAG.py docs/manual.pdf knowledge.json
+    python RAG.py docs/ knowledge.json  # 處理整個目錄
 """
 
 import sys
