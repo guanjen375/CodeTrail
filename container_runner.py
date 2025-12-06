@@ -150,6 +150,13 @@ def run_in_container(
             'stderr': str,
             'error': str or None
         }
+
+    設計說明：
+        專案目錄預設為唯讀（ro），但提供可寫的臨時目錄：
+        - /tmp/build: 用於 CMake、Cargo 等 build 輸出
+        - /tmp/venv: 用於 Python virtualenv
+        - /tmp/node_modules: 用於 npm install
+        測試命令會被包裝，將 build 輸出導向這些臨時目錄
     """
     engine = get_container_engine()
     if not engine:
@@ -179,10 +186,16 @@ def run_in_container(
     if not network:
         cmd.extend(['--network', 'none'])
 
-    # 掛載專案目錄
+    # 掛載專案目錄（唯讀或可寫）
     mount_opt = 'rw' if writable else 'ro'
     cmd.extend(['-v', f'{folder_path}:/workspace:{mount_opt}'])
     cmd.extend(['-w', '/workspace'])
+
+    # 掛載臨時可寫目錄（用於 build 輸出、venv、node_modules 等）
+    # 使用 tmpfs 提升效能並確保容器結束後自動清理
+    cmd.extend(['--tmpfs', '/tmp/build:rw,size=1g'])
+    cmd.extend(['--tmpfs', '/tmp/venv:rw,size=500m'])
+    cmd.extend(['--tmpfs', '/tmp/node_modules:rw,size=1g'])
 
     # 非 root 用戶執行（更安全）
     if engine == 'podman':
@@ -202,6 +215,11 @@ def run_in_container(
     # 環境變數
     cmd.extend(['-e', 'PYTHONIOENCODING=utf-8'])
     cmd.extend(['-e', 'LANG=C.UTF-8'])
+    # 讓 pip 使用臨時 venv，避免寫入系統目錄
+    cmd.extend(['-e', 'PIP_TARGET=/tmp/venv'])
+    cmd.extend(['-e', 'PYTHONPATH=/tmp/venv'])
+    # 讓 npm 使用臨時目錄
+    cmd.extend(['-e', 'npm_config_prefix=/tmp/node_modules'])
 
     # 映像檔和命令
     cmd.append(image)
@@ -262,30 +280,48 @@ def run_tests_in_container(folder: str, test_command: str = None) -> dict:
 
     Returns:
         執行結果 dict
+
+    設計說明：
+        - 專案目錄維持唯讀（安全）
+        - build 輸出導向 /tmp/build（可寫 tmpfs）
+        - pip 安裝到 /tmp/venv（透過 PIP_TARGET 環境變數）
+        - npm 安裝到 /tmp/node_modules（透過 npm_config_prefix）
+        - Makefile 的 make test 被排除（風險太高，會執行任意腳本）
     """
     folder_path = Path(folder)
 
     # 自動偵測測試命令
     if not test_command:
         if (folder_path / 'pytest.ini').exists() or (folder_path / 'pyproject.toml').exists():
-            test_command = 'pip install -e . 2>/dev/null; pytest -v 2>&1 || python -m pytest -v 2>&1'
+            # Python：pip 會自動裝到 /tmp/venv（透過 PIP_TARGET 環境變數）
+            # 不用 pip install -e .（需要寫入專案目錄），改用 pip install -r 或直接跑測試
+            if (folder_path / 'requirements.txt').exists():
+                test_command = 'pip install -r requirements.txt && pytest -v 2>&1'
+            else:
+                test_command = 'pytest -v 2>&1 || python -m pytest -v 2>&1'
         elif (folder_path / 'package.json').exists():
-            test_command = 'npm install --silent && npm test'
+            # Node.js：npm 會自動裝到 /tmp/node_modules（透過 npm_config_prefix）
+            # 使用 --prefix 確保安裝到臨時目錄
+            test_command = 'npm install --prefix /tmp/node_modules --silent && npm test'
         elif (folder_path / 'go.mod').exists():
+            # Go：不需要額外安裝，go test 會自動處理
             test_command = 'go test ./...'
         elif (folder_path / 'Cargo.toml').exists():
-            test_command = 'cargo test'
+            # Rust：將 target 目錄導向 /tmp/build
+            test_command = 'CARGO_TARGET_DIR=/tmp/build cargo test'
         elif (folder_path / 'CMakeLists.txt').exists():
-            test_command = 'cmake -B build && cmake --build build && ctest --test-dir build'
-        elif (folder_path / 'Makefile').exists():
-            test_command = 'make test'
+            # CMake：build 目錄放在 /tmp/build
+            test_command = 'cmake -B /tmp/build && cmake --build /tmp/build && ctest --test-dir /tmp/build'
+        # 注意：故意不支援 make test，因為 Makefile 可能執行任意命令
+        # elif (folder_path / 'Makefile').exists():
+        #     test_command = 'make test'
         else:
             return {
                 'success': False,
                 'returncode': -1,
                 'stdout': '',
                 'stderr': '',
-                'error': '無法偵測測試命令'
+                'error': '無法偵測測試命令（注意：make test 因安全考量不支援）'
             }
 
     return run_in_container(

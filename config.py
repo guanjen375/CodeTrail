@@ -3,6 +3,7 @@
 """
 智能程式碼分析器 - 設定檔
 """
+import os as _os
 
 # ============================================================
 # Ollama 設定
@@ -207,7 +208,6 @@ LINT_COMMANDS = {
 # 建議：分析陌生 repo 時保持 False，只對自己的專案開啟
 #
 # 可透過 CLI flag --run-tests 啟用，或環境變數 AI_CODE_RUN_TESTS=1
-import os as _os
 RUN_COMMAND_ENABLED = _os.environ.get('AI_CODE_RUN_TESTS', '').lower() in ('1', 'true', 'yes')
 RUN_COMMAND_TIMEOUT = 60
 RUN_COMMAND_MAX_OUTPUT = 8000

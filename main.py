@@ -265,7 +265,7 @@ def main():
             # empty 模式和 agent 模式都使用 run_agent
             result = run_agent(folder, clean_q, img_ctx, knowledge_ctx=knowledge_ctx, code_rag=code_rag)
 
-        # 資料飛輪：記錄互動
+        # 資料飛輪：記錄互動（含可重現性資訊）
         if DATA_COLLECT_ENABLED:
             refs = kb_metadata.get('refs', []) if kb_metadata else []
             code_snippets = []
@@ -277,7 +277,8 @@ def main():
                 answer=result,
                 refs=refs,
                 code_snippets=code_snippets,
-                metadata={'mode': mode, 'kb_top_score': kb_metadata.get('top_score', 0)}
+                metadata={'mode': mode, 'kb_top_score': kb_metadata.get('top_score', 0)},
+                folder=folder  # 用於取得 git commit 等可重現性資訊
             )
 
         # 串流輸出已在函數內完成，不需再次印出
@@ -382,7 +383,7 @@ def main():
             if len(qa_history) > 5:
                 qa_history.pop(0)
 
-            # 資料飛輪：記錄互動
+            # 資料飛輪：記錄互動（含可重現性資訊）
             if DATA_COLLECT_ENABLED:
                 refs = kb_metadata.get('refs', []) if kb_metadata else []
                 code_snippets = []
@@ -394,7 +395,8 @@ def main():
                     answer=result,
                     refs=refs,
                     code_snippets=code_snippets,
-                    metadata={'mode': mode, 'is_followup': is_followup, 'kb_top_score': kb_metadata.get('top_score', 0)}
+                    metadata={'mode': mode, 'is_followup': is_followup, 'kb_top_score': kb_metadata.get('top_score', 0)},
+                    folder=folder  # 用於取得 git commit 等可重現性資訊
                 )
 
             # 串流輸出已在函數內完成

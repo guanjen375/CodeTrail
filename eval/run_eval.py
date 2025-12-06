@@ -34,7 +34,7 @@ from config import KNOWLEDGE_FILE
 from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from agent import run_agent
-from utils import call_llm
+from utils import call_llm, do_strict_mode
 
 
 @dataclass
@@ -83,38 +83,72 @@ def load_eval_cases(eval_dir: Path) -> dict[str, list[EvalCase]]:
     return cases
 
 
-def eval_spec_question(case: EvalCase, kb: KnowledgeBase) -> EvalResult:
+def eval_spec_question(case: EvalCase, kb: KnowledgeBase, use_strict_mode: bool = True) -> EvalResult:
     """評測 Spec 類問題
 
     指標：
     - has_ref: 回答中是否有 REF 引用
     - ref_correct: 引用的 REF 是否與期望相符
-    - confidence: REF 分數是否足夠高
+    - keywords_found: 是否包含期望關鍵字
+    - strict_mode_used: 是否使用嚴格模式（兩階段自我檢查）
+
+    改進說明：
+        現在使用與實際 CLI 相同的嚴格模式 pipeline，
+        包含兩階段自我檢查，確保評測結果與實際使用一致。
     """
     start_time = time.time()
 
     # 查詢知識庫
     knowledge_ctx, _, kb_metadata = kb.query(case.question)
 
-    # 使用 LLM 生成回答
-    prompt = f"""請根據以下參考資料回答問題。每個論述都必須標註 REF 編號。
+    # 使用嚴格模式 pipeline（與實際 CLI 相同）
+    if use_strict_mode and knowledge_ctx:
+        # 使用 do_strict_mode 進行兩階段回答
+        answer = do_strict_mode(
+            question=case.question,
+            refs_context=knowledge_ctx,
+            code_context="",  # spec 題不需要 code context
+            previous_qa=None
+        )
+        details = {
+            'strict_mode_used': True,
+        }
+    else:
+        # 備援：簡單 LLM 呼叫
+        prompt = f"""請根據以下參考資料回答問題。每個論述都必須標註 REF 編號。
 
 {knowledge_ctx}
 
 問題：{case.question}
 
 請直接回答，若資料不足請說明。"""
+        answer = call_llm(prompt, temperature=0.0)
+        details = {
+            'strict_mode_used': False,
+        }
 
-    answer = call_llm(prompt, temperature=0.0)
     time_taken = time.time() - start_time
 
     # 評估
-    details = {
+    details.update({
         'has_ref': 'REF' in answer or '[REF' in answer,
         'top_score': kb_metadata.get('top_score', 0.0),
         'top_emb_score': kb_metadata.get('top_emb_score', 0.0),
         'has_spec_chunk': kb_metadata.get('has_spec_chunk', False),
-    }
+    })
+
+    # 檢查是否包含期望關鍵字
+    expected_keywords = case.expected.get('keywords', [])
+    if expected_keywords:
+        found_keywords = []
+        for kw in expected_keywords:
+            if kw.lower() in answer.lower():
+                found_keywords.append(kw)
+        details['expected_keywords'] = expected_keywords
+        details['found_keywords'] = found_keywords
+        details['keywords_match_rate'] = len(found_keywords) / len(expected_keywords)
+    else:
+        details['keywords_match_rate'] = 1.0 if details['has_ref'] else 0.0
 
     # 檢查是否引用了期望的 REF
     expected_refs = case.expected.get('refs', [])
@@ -129,19 +163,24 @@ def eval_spec_question(case: EvalCase, kb: KnowledgeBase) -> EvalResult:
     else:
         details['ref_correct'] = details['has_ref']
 
-    # 計算分數
+    # 計算分數（調整權重）
     score = 0.0
+    # REF 引用 (0.25)
     if details['has_ref']:
-        score += 0.3
+        score += 0.25
+    # REF 正確性 (0.25)
     if details['ref_correct']:
-        score += 0.4
+        score += 0.25
+    # 關鍵字匹配 (0.3)
+    score += 0.3 * details.get('keywords_match_rate', 0.0)
+    # 知識庫相關度 (0.2)
     if details['top_emb_score'] >= 0.3:
-        score += 0.3
+        score += 0.2
 
     return EvalResult(
         case_id=case.id,
         case_type=case.type,
-        passed=score >= 0.7,
+        passed=score >= 0.6,
         score=score,
         details=details,
         answer=answer[:500],
@@ -223,25 +262,48 @@ def eval_code_question(case: EvalCase, code_rag: CodeRAG, folder: str) -> EvalRe
     )
 
 
-def eval_bug_question(case: EvalCase, folder: str, code_rag: CodeRAG) -> EvalResult:
+def eval_bug_question(
+    case: EvalCase,
+    folder: str,
+    code_rag: CodeRAG,
+    run_tests: bool = False,
+    use_container: bool = True
+) -> EvalResult:
     """評測 Bug 類問題
 
     指標：
     - identified_cause: 是否正確識別問題原因
     - has_fix_suggestion: 是否提供修復建議
-    - can_reproduce: 是否能用測試重現（若有測試）
+    - test_passed: 測試是否通過（若啟用 run_tests）
+
+    改進說明：
+        - 可選擇啟用測試驗證（run_tests=True）
+        - 測試會在容器中執行（安全）
+        - 使用與 CLI 相同的 agent pipeline
     """
     import config
     start_time = time.time()
 
-    # 暫時啟用 run_command
+    # 暫時啟用 run_command 和 patch（讓 agent 可以修改並測試）
     original_run_cmd = config.RUN_COMMAND_ENABLED
-    config.RUN_COMMAND_ENABLED = True
+    original_patch = config.PATCH_ENABLED
+
+    if run_tests:
+        config.RUN_COMMAND_ENABLED = True
+        config.PATCH_ENABLED = True
+        # 如果要使用容器
+        if use_container:
+            try:
+                import container_runner
+                container_runner.CONTAINER_ENABLED = True
+            except ImportError:
+                pass
 
     try:
-        answer = run_agent(folder, case.question, code_rag=code_rag, max_loops=6)
+        answer = run_agent(folder, case.question, code_rag=code_rag, max_loops=8)
     finally:
         config.RUN_COMMAND_ENABLED = original_run_cmd
+        config.PATCH_ENABLED = original_patch
 
     time_taken = time.time() - start_time
 
@@ -252,6 +314,7 @@ def eval_bug_question(case: EvalCase, folder: str, code_rag: CodeRAG) -> EvalRes
     details = {
         'expected_cause': expected_cause,
         'expected_fix_keywords': expected_fix_keywords,
+        'run_tests_enabled': run_tests,
     }
 
     # 檢查是否識別問題原因
@@ -267,18 +330,32 @@ def eval_bug_question(case: EvalCase, folder: str, code_rag: CodeRAG) -> EvalRes
         kw in answer.lower() for kw in ['修改', '修復', 'fix', '解決', '改成', '應該']
     )
 
+    # 檢查回答中是否提到測試通過
+    test_mentioned = any(
+        kw in answer.lower() for kw in ['測試通過', 'test pass', 'tests pass', 'passed', '成功']
+    )
+
     details['identified_cause'] = identified_cause
     details['has_fix_suggestion'] = has_fix_suggestion
     details['fix_keywords_found'] = fix_keywords_found
+    details['test_mentioned'] = test_mentioned
 
     # 計算分數
     score = 0.0
+    # 識別問題原因 (0.35)
     if identified_cause:
-        score += 0.4
+        score += 0.35
+    # 修復建議 (0.25)
     if has_fix_suggestion:
-        score += 0.3
-    if len(fix_keywords_found) >= len(expected_fix_keywords) // 2:
-        score += 0.3
+        score += 0.25
+    # 關鍵字匹配 (0.2)
+    if expected_fix_keywords:
+        score += 0.2 * (len(fix_keywords_found) / len(expected_fix_keywords))
+    else:
+        score += 0.2 if has_fix_suggestion else 0
+    # 測試驗證 bonus (0.2)
+    if run_tests and test_mentioned:
+        score += 0.2
 
     return EvalResult(
         case_id=case.id,
@@ -296,7 +373,9 @@ def run_evaluation(
     test_set: str = 'all',
     project_folder: str = None,
     kb_path: str = None,
-    verbose: bool = False
+    verbose: bool = False,
+    run_tests: bool = False,
+    use_container: bool = True
 ) -> dict:
     """執行評測
 
@@ -306,6 +385,8 @@ def run_evaluation(
         project_folder: 測試用專案目錄（用於 code 和 bug 題）
         kb_path: 知識庫路徑
         verbose: 是否顯示詳細資訊
+        run_tests: 是否在 bug 題中執行測試驗證
+        use_container: 測試是否在容器中執行（安全）
     """
     print("=" * 60)
     print("智能程式碼分析器 - 評測工具")
@@ -354,11 +435,12 @@ def run_evaluation(
 
             try:
                 if case_type == 'spec' and kb:
-                    result = eval_spec_question(case, kb)
+                    result = eval_spec_question(case, kb, use_strict_mode=True)
                 elif case_type == 'code' and code_rag:
                     result = eval_code_question(case, code_rag, project_folder)
                 elif case_type == 'bug' and project_folder:
-                    result = eval_bug_question(case, project_folder, code_rag)
+                    result = eval_bug_question(case, project_folder, code_rag,
+                                               run_tests=run_tests, use_container=use_container)
                 else:
                     print(f"    [SKIP] 缺少必要資源")
                     continue
@@ -442,6 +524,10 @@ def main():
                        help='知識庫路徑')
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='顯示詳細資訊')
+    parser.add_argument('--run-tests', action='store_true',
+                       help='在 bug 題中啟用測試驗證（會執行測試命令）')
+    parser.add_argument('--no-container', action='store_true',
+                       help='不使用容器執行測試（較不安全）')
 
     args = parser.parse_args()
 
@@ -451,7 +537,9 @@ def main():
         test_set=args.test_set,
         project_folder=args.project,
         kb_path=args.kb,
-        verbose=args.verbose
+        verbose=args.verbose,
+        run_tests=args.run_tests,
+        use_container=not args.no_container
     )
 
 

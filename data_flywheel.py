@@ -21,7 +21,16 @@
     "code_snippets": [{"path": "...", "line": 123, "symbol": "..."}],
     "answer": "...",
     "rating": null,  // 手動評分: 1=好, 0=普通, -1=差
-    "metadata": {"mode": "agent", "kb_top_score": 0.5, ...}
+    "metadata": {"mode": "agent", "kb_top_score": 0.5, ...},
+    "reproducibility": {
+        "repo_commit": "abc123",
+        "model_tag": "qwen3-coder:30b",
+        "strict_mode": true,
+        "patch_enabled": false,
+        "container_enabled": false,
+        "tool_calls": ["read_file:main.py", "grep:error"],
+        "files_read": ["main.py", "utils.py"]
+    }
 }
 """
 
@@ -49,6 +58,59 @@ class Interaction:
     code_snippets: list = field(default_factory=list)  # [{"path": str, "line": int, "symbol": str}]
     rating: Optional[int] = None  # 手動評分: 1=好, 0=普通, -1=差
     metadata: dict = field(default_factory=dict)
+    reproducibility: dict = field(default_factory=dict)  # 可重現性資訊
+
+
+def get_reproducibility_info(folder: str = None) -> dict:
+    """收集可重現性資訊
+
+    Returns:
+        {
+            'repo_commit': str or None,   # Git commit hash
+            'model_tag': str,             # 使用的模型
+            'strict_mode': bool,          # 是否啟用嚴格模式
+            'patch_enabled': bool,        # 是否啟用 patch 工具
+            'container_enabled': bool,    # 是否使用容器
+            'tool_calls': list,           # 工具呼叫摘要（由 agent 補充）
+            'files_read': list,           # 讀取的檔案列表（由 agent 補充）
+        }
+    """
+    import subprocess
+    from config import MODEL, STRICT_MODE, PATCH_ENABLED
+
+    info = {
+        'repo_commit': None,
+        'model_tag': MODEL,
+        'strict_mode': STRICT_MODE,
+        'patch_enabled': PATCH_ENABLED,
+        'container_enabled': False,
+        'tool_calls': [],  # 由 agent 補充
+        'files_read': [],  # 由 agent 補充
+    }
+
+    # 取得 git commit hash
+    if folder:
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', 'HEAD'],
+                cwd=folder,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                info['repo_commit'] = result.stdout.strip()[:12]  # 只取前 12 字元
+        except Exception:
+            pass
+
+    # 檢查容器模式
+    try:
+        from container_runner import CONTAINER_ENABLED
+        info['container_enabled'] = CONTAINER_ENABLED
+    except ImportError:
+        pass
+
+    return info
 
 
 class DataCollector:
@@ -94,7 +156,10 @@ class DataCollector:
         answer: str,
         refs: list = None,
         code_snippets: list = None,
-        metadata: dict = None
+        metadata: dict = None,
+        folder: str = None,
+        tool_calls: list = None,
+        files_read: list = None
     ):
         """記錄一次互動
 
@@ -104,9 +169,19 @@ class DataCollector:
             refs: 使用的 REF 資料 [{"source": str, "score": float, "content": str}]
             code_snippets: 使用的程式碼片段 [{"path": str, "line": int, "symbol": str}]
             metadata: 額外元資料 {"mode": str, "kb_top_score": float, ...}
+            folder: 專案目錄（用於取得 git commit）
+            tool_calls: 工具呼叫摘要 ["read_file:main.py", "grep:error"]
+            files_read: 讀取的檔案列表 ["main.py", "utils.py"]
         """
         if not self.enabled:
             return
+
+        # 收集可重現性資訊
+        repro_info = get_reproducibility_info(folder)
+        if tool_calls:
+            repro_info['tool_calls'] = tool_calls
+        if files_read:
+            repro_info['files_read'] = files_read
 
         interaction = Interaction(
             timestamp=datetime.now().isoformat(),
@@ -115,7 +190,8 @@ class DataCollector:
             answer=answer,
             refs=refs or [],
             code_snippets=code_snippets or [],
-            metadata=metadata or {}
+            metadata=metadata or {},
+            reproducibility=repro_info
         )
 
         try:
