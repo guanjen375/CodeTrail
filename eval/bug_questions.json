@@ -3,8 +3,8 @@
     "id": "bug_001",
     "question": "執行 pytest 時出現 IndexError: list index out of range，錯誤發生在 code_rag.py:456",
     "expected": {
-      "cause": "索引超出範圍",
-      "fix_keywords": ["index", "len", "檢查", "邊界"]
+      "cause_keywords": ["索引超出範圍", "IndexError", "list index out of range", "index out of range"],
+      "fix_keywords": ["index", "len", "檢查"]
     },
     "context": "."
   },

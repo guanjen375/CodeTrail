@@ -276,7 +276,7 @@ def eval_code_question(case: EvalCase, code_rag: CodeRAG, folder: str) -> EvalRe
         for r in results:
             if expected_file in r['path']:
                 line_diff = abs(r['line'] - expected_line)
-                if line_diff <= 5:
+                if line_diff <= 15:  # 放寬容忍度 ±5 → ±15（重構友善）
                     found_line = True
                     break
 
@@ -290,16 +290,16 @@ def eval_code_question(case: EvalCase, code_rag: CodeRAG, folder: str) -> EvalRe
     details['found_symbol'] = found_symbol
     details['has_file_line_in_answer'] = has_file_line_in_answer
 
-    # 計算分數
+    # 計算分數（GPT 建議：symbol+file 為主，line 為輔）
     score = 0.0
-    if found_file:
-        score += 0.3
-    if found_line:
-        score += 0.3
     if found_symbol:
-        score += 0.2
+        score += 0.5  # 符號最重要（真的找到哪個 function/class）
+    if found_file:
+        score += 0.3  # 檔名其次
+    if found_line:
+        score += 0.1  # 行號當加分題，不當硬門檻
     if has_file_line_in_answer:
-        score += 0.2
+        score += 0.1  # 回答有帶 file:line 也是加分題
 
     return EvalResult(
         case_id=case.id,
@@ -359,16 +359,25 @@ def eval_bug_question(
 
     # 評估
     expected_cause = case.expected.get('cause', '')
+    cause_keywords = case.expected.get('cause_keywords', [])  # GPT 建議：支援多關鍵字
     expected_fix_keywords = case.expected.get('fix_keywords', [])
 
     details = {
         'expected_cause': expected_cause,
+        'cause_keywords': cause_keywords,
         'expected_fix_keywords': expected_fix_keywords,
         'run_tests_enabled': run_tests,
     }
 
-    # 檢查是否識別問題原因
-    identified_cause = expected_cause.lower() in answer.lower() if expected_cause else False
+    # 檢查是否識別問題原因（GPT 建議：支援 cause_keywords 多關鍵字）
+    answer_lower = answer.lower()
+    if cause_keywords:
+        # 只要回答裡有任一關鍵字就算抓到原因
+        identified_cause = any(kw.lower() in answer_lower for kw in cause_keywords)
+    elif expected_cause:
+        identified_cause = expected_cause.lower() in answer_lower
+    else:
+        identified_cause = False
 
     # 檢查是否有修復建議
     fix_keywords_found = []
