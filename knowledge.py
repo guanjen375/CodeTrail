@@ -811,17 +811,22 @@ class KnowledgeBase:
             return "", "", empty_metadata
 
         # 動態門檻：短問題用較低門檻
+        # GPT建議：過濾時只看 embedding score，keyword 只用來排序
         query_tokens = self._estimate_tokens(question)
         base_threshold = KNOWLEDGE_THRESHOLD_SHORT if query_tokens < KNOWLEDGE_SHORT_QUERY_TOKENS else KNOWLEDGE_THRESHOLD
 
-        top_score = candidates[0][0]
-        min_score = max(base_threshold, top_score * DYNAMIC_THRESHOLD_RATIO)
+        # 改用 embedding score (candidates[i][1]) 作為過濾依據，而非 combined score
+        top_emb_score = candidates[0][1]  # (combined, emb, kw, chunk)
+        min_emb_score = max(base_threshold, top_emb_score * DYNAMIC_THRESHOLD_RATIO)
 
-        filtered = [(s, e, k, c) for s, e, k, c in candidates if s >= min_score]
+        # 過濾：只看 embedding score，避免 keyword 誤打誤撞拉高分數
+        filtered = [(s, e, k, c) for s, e, k, c in candidates if e >= min_emb_score]
         if not filtered:
             return "", "", empty_metadata
 
         # 動態 top_k：高相關度時少給，低相關度時多給
+        # 使用 combined score 來決定 top_k（排序仍用 combined）
+        top_score = candidates[0][0]
         if top_score >= DYNAMIC_TOP_K_HIGH_SCORE:
             effective_top_k = DYNAMIC_TOP_K_MIN
         else:

@@ -9,7 +9,9 @@ from dataclasses import dataclass, field
 
 from config import (
     MAX_TOTAL_CHARS, BUDGET_HIGH, BUDGET_MID, BUDGET_LOW,
-    SKELETON_THRESHOLD, SKELETON_MAX_LINES, NUM_CTX_FULL_MODE
+    SKELETON_THRESHOLD, SKELETON_MAX_LINES, NUM_CTX_FULL_MODE,
+    DYNAMIC_NUM_CTX_ENABLED, DYNAMIC_NUM_CTX_MIN, DYNAMIC_NUM_CTX_MAX,
+    DYNAMIC_NUM_CTX_BUFFER, CHARS_PER_TOKEN
 )
 from utils import get_priority, call_llm, call_llm_stream, should_use_strict_mode, answer_with_self_check
 
@@ -146,6 +148,33 @@ def build_full_context(files: dict[str, str]) -> FullContext:
     return FullContext(entries, "".join(parts), total_chars, stats)
 
 
+def _compute_full_num_ctx(ctx: FullContext, question: str, image_ctx: str, knowledge_ctx: str) -> int:
+    """根據 Full 模式的內容長度動態計算 num_ctx
+
+    GPT建議：Full 模式也用動態 num_ctx，小專案或短問題時不需開滿 128K
+    """
+    if not DYNAMIC_NUM_CTX_ENABLED:
+        return NUM_CTX_FULL_MODE
+
+    total_chars = (
+        len(ctx.context_str) +
+        len(question or "") +
+        len(image_ctx or "") +
+        len(knowledge_ctx or "")
+    )
+
+    # 估算 token 數
+    est_tokens = total_chars / CHARS_PER_TOKEN
+
+    # 乘以 buffer 預留回答空間
+    budget = int(est_tokens * DYNAMIC_NUM_CTX_BUFFER)
+
+    # 向上取 2048 的倍數（減少 KV cache 重新分配）
+    budget = ((budget + 2047) // 2048) * 2048
+
+    return max(DYNAMIC_NUM_CTX_MIN, min(budget, DYNAMIC_NUM_CTX_MAX))
+
+
 def analyze_full(ctx: FullContext, question: str, image_ctx: str = "", knowledge_ctx: str = "", stream: bool = True) -> str:
     """完整模式分析"""
     q_lower = question.lower() if question else ""
@@ -185,10 +214,11 @@ def analyze_full(ctx: FullContext, question: str, image_ctx: str = "", knowledge
 
 用繁體中文回答。"""
 
-    # Full 模式使用較小的 context，因為程式碼已全部塞入 prompt
+    # Full 模式使用動態 num_ctx（GPT建議）
+    num_ctx = _compute_full_num_ctx(ctx, question, image_ctx, knowledge_ctx)
     if stream:
-        return call_llm_stream(prompt, temperature=temperature, num_ctx=NUM_CTX_FULL_MODE)
-    return call_llm(prompt, temperature=temperature, num_ctx=NUM_CTX_FULL_MODE)
+        return call_llm_stream(prompt, temperature=temperature, num_ctx=num_ctx)
+    return call_llm(prompt, temperature=temperature, num_ctx=num_ctx)
 
 
 def show_full_stats(ctx: FullContext):

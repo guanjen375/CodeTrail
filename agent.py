@@ -1862,6 +1862,7 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
     read_files_set = set(preread_files)
     has_run_command = False
     bug_fix_reminder_sent = False
+    no_evidence_reminder_sent = False  # GPT建議：追蹤是否已發過無證據提醒
 
     for i in range(effective_max_loops):
         print(f"[LOOP] Agent 第 {i+1} 輪...")
@@ -1886,6 +1887,17 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
                     messages.append({
                         "role": "user",
                         "content": "在最終回答前，請先用 run_command 執行適當的測試命令（如 pytest、make test）來驗證你的分析是否正確，或重現問題。如果專案沒有測試或你確定不需要測試，請直接給出最終回答。"
+                    })
+                    continue
+
+                # GPT建議：若沒有讀到任何相關檔案且沒有預讀內容，提醒 LLM 偏向拒答（只提醒一次）
+                if not _files_read_record and not stack_preread_context and not code_rag_context and not no_evidence_reminder_sent:
+                    print(f"   [WARN] 沒有讀到任何相關檔案，重新提示偏向拒答...")
+                    no_evidence_reminder_sent = True
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": "注意：你目前沒有讀到任何程式碼檔案。若上述回答包含對程式碼的推測，請修正為「專案中沒有足夠資訊判斷」。若回答已經基於 [REF] 知識庫內容，則可以保留。請給出最終答案。"
                     })
                     continue
 
@@ -1965,8 +1977,13 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
 
     print("[WARN] 達到最大探索次數\n")
 
+    # GPT建議：若沒有讀到任何相關檔案，提示偏向拒答
+    no_evidence_hint = ""
+    if not _files_read_record and not stack_preread_context and not code_rag_context:
+        no_evidence_hint = "\n\n注意：目前沒有找到任何與問題強相關的程式碼。若無法確定答案，請直接說明「專案中沒有足夠資訊判斷」，不要想像不存在的函式或配置。"
+
     summary_prompt = f"""請根據目前收集到的資訊，盡可能回答用戶的問題。
-如果資訊不足，請說明你已經知道什麼，還缺少什麼。"""
+如果資訊不足，請說明你已經知道什麼，還缺少什麼。{no_evidence_hint}"""
 
     messages.append({"role": "user", "content": summary_prompt})
 

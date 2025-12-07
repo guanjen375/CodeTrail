@@ -38,7 +38,7 @@ NUM_CTX_FULL_MODE = NUM_CTX
 DYNAMIC_NUM_CTX_ENABLED = True
 DYNAMIC_NUM_CTX_MIN = 16384      # 最小 16K
 DYNAMIC_NUM_CTX_MAX = NUM_CTX    # 最大 = NUM_CTX
-DYNAMIC_NUM_CTX_BUFFER = 1.5     # 預留 1.5 倍空間給回答
+DYNAMIC_NUM_CTX_BUFFER = 1.3     # 預留空間給回答（GPT建議: 1.5->1.3）
 CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
 
 MAX_TOTAL_CHARS = 200000  # 200KB，讓中小型專案使用完整模式
@@ -46,14 +46,14 @@ MAX_TOTAL_CHARS = 200000  # 200KB，讓中小型專案使用完整模式
 # ============================================================
 # Agent 設定
 # ============================================================
-MAX_TOOL_LOOPS = 12
+MAX_TOOL_LOOPS = 10                  # Agent 最大工具回合數（GPT建議: 12->10）
 MAX_FILE_READ_CHARS = 50000
 MAX_GREP_RESULTS = 30
 MAX_LIST_DEPTH = 3
 
 # Messages 總預算（字元數，粗估 1 token ≈ 3-4 chars）
 # 128K ctx ≈ 384K chars，保留一些空間給 system prompt 和回答
-MAX_MESSAGES_BUDGET = 300000  # 300KB
+MAX_MESSAGES_BUDGET = 250000  # 250KB（GPT建議: 300000->250000）
 # 保留最近 N 輪的 tool 輸出（刪除舊的時優先保留最近的）
 MIN_RECENT_TOOL_OUTPUTS = 4
 
@@ -123,8 +123,8 @@ ALLOWED_DOT_DIRS = {
 KNOWLEDGE_FILE = "knowledge.json"
 KNOWLEDGE_TOP_K = 5
 KNOWLEDGE_CANDIDATE_K = 30
-KNOWLEDGE_THRESHOLD = 0.25           # 提高基礎門檻，寧缺勿濫
-KNOWLEDGE_THRESHOLD_SHORT = 0.20     # 短問題（<10 token）用較低門檻
+KNOWLEDGE_THRESHOLD = 0.30           # 提高基礎門檻，寧缺勿濫（GPT建議: 0.25->0.30）
+KNOWLEDGE_THRESHOLD_SHORT = 0.25     # 短問題（<10 token）用較低門檻（GPT建議: 0.20->0.25）
 KNOWLEDGE_SHORT_QUERY_TOKENS = 10    # 短問題定義
 DYNAMIC_THRESHOLD_RATIO = 0.5
 DYNAMIC_TOP_K_HIGH_SCORE = 0.5       # 高相關度門檻
@@ -153,11 +153,11 @@ CODE_RAG_CACHE_FILE = ".code_rag_cache.json"
 CODE_RAG_AUTO_PREREAD = True
 CODE_RAG_PREREAD_TOP_K = 5
 CODE_RAG_PREREAD_TOP_K_BUG = 3       # Bug 模式預讀更少，靠 stack trace 補
-CODE_RAG_PREREAD_LINES = 120
-CODE_RAG_PREREAD_LINES_BUG = 160
+CODE_RAG_PREREAD_LINES = 96          # 預讀行數縮小，換取更精準的中心（GPT建議: 120->96）
+CODE_RAG_PREREAD_LINES_BUG = 128     # Bug 模式預讀縮小（GPT建議: 160->128）
 CODE_RAG_PREREAD_MAX_LINES = 300     # 預讀完整函式的最大行數上限（超過則退回窗口模式）
-CODE_RAG_THRESHOLD = 0.30            # 提高門檻，確保真的相關才進來
-CODE_RAG_THRESHOLD_BUG = 0.25        # Bug 類問題稍微放寬
+CODE_RAG_THRESHOLD = 0.35            # 提高門檻，確保真的相關才進來（GPT建議: 0.30->0.35）
+CODE_RAG_THRESHOLD_BUG = 0.30        # Bug 類問題稍微放寬（GPT建議: 0.25->0.30）
 
 # ============================================================
 # 嚴格模式設定
@@ -169,9 +169,9 @@ STRICT_MODE_KEYWORDS = [
     'spec', 'manual', 'specification', 'according to'
 ]
 STRICT_MODE_TEMPERATURE = 0.0        # 嚴格模式下溫度壓到最低
-WEAK_REF_THRESHOLD = 0.30            # REF 分數低於此值視為「太弱」
+WEAK_REF_THRESHOLD = 0.35            # REF 分數低於此值視為「太弱」（GPT建議: 0.30->0.35）
 SKIP_LOW_CONFIDENCE_KB = True        # 是否跳過低信心度的 KB 上下文注入
-LOW_CONFIDENCE_KB_THRESHOLD = 0.25   # 低於此分數則不注入 KB context（避免雜訊）
+LOW_CONFIDENCE_KB_THRESHOLD = 0.30   # 低於此分數則不注入 KB context（GPT建議: 0.25->0.30）
 
 # Spec/規格類問題關鍵字（自動觸發嚴格模式）
 SPEC_QUESTION_KEYWORDS = [

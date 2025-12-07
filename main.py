@@ -36,7 +36,7 @@ from config import (
     CODE_RAG_ENABLED, IGNORED_DIRS, IGNORED_PATTERNS,
     SKIP_LOW_CONFIDENCE_KB, LOW_CONFIDENCE_KB_THRESHOLD
 )
-from utils import check_ollama_gpu, scan_project_metadata, scan_project, should_refuse_answer
+from utils import check_ollama_gpu, scan_project_metadata, scan_project, should_refuse_answer, should_use_strict_mode, answer_with_self_check
 from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from context import build_full_context, analyze_full, show_full_stats
@@ -204,10 +204,11 @@ def main():
     print(gpu_status)
 
     # 初始化 Code RAG（Agent 模式）
+    # GPT建議：改成 lazy build，第一次 query 時才建立索引
     code_rag = None
     if mode == "agent" and CODE_RAG_ENABLED:
         code_rag = CodeRAG(folder)
-        code_rag.build_index()
+        # 不再主動呼叫 build_index()，改成 lazy build（在 query 時自動建立）
 
     # 準備 context
     ctx = None
@@ -261,7 +262,13 @@ def main():
         print("[NOTE] 回答:\n")
         # 追蹤 agent metadata（tool_calls, files_read）
         agent_metadata = None
-        if mode == "full":
+
+        # GPT建議：規格題優先走嚴格模式，避免 Agent 多讀 code 來「補想像」
+        if should_use_strict_mode(clean_q, knowledge_ctx) and knowledge_ctx:
+            print("[STRICT] 規格類問題，直接走嚴格模式\n")
+            base_ctx = f"專案路徑: {folder}\n{img_ctx}" if img_ctx else f"專案路徑: {folder}"
+            result = answer_with_self_check(clean_q, base_ctx, knowledge_ctx)
+        elif mode == "full":
             result = analyze_full(ctx, clean_q, img_ctx, knowledge_ctx)
         else:
             # empty 模式和 agent 模式都使用 run_agent
@@ -380,7 +387,13 @@ def main():
 
             # 追蹤 agent metadata（tool_calls, files_read）
             agent_metadata = None
-            if mode == "full":
+
+            # GPT建議：規格題優先走嚴格模式，避免 Agent 多讀 code 來「補想像」
+            if should_use_strict_mode(clean_q, knowledge_ctx) and knowledge_ctx and not is_followup:
+                print("[STRICT] 規格類問題，直接走嚴格模式\n")
+                base_ctx = f"專案路徑: {folder}\n{img_ctx}" if img_ctx else f"專案路徑: {folder}"
+                result = answer_with_self_check(clean_q, base_ctx, knowledge_ctx)
+            elif mode == "full":
                 result = analyze_full(ctx, clean_q, img_ctx, knowledge_ctx)
             elif is_followup:
                 print("[TIP] 偵測到追問\n")
