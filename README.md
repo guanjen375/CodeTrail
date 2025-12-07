@@ -423,7 +423,21 @@ AI_CODE_COLLECT_DATA=1 python main.py /path/to/project
 
 # 資料儲存位置（預設）
 # data/interactions.jsonl
+
+# 長期啟用（加入 ~/.bashrc）
+export AI_CODE_COLLECT_DATA=1
 ```
+
+**使用建議**：
+
+啟用後，問題品質 = 資料品質。建議多問專業問題：
+
+- **高價值**：程式碼問題（debug、實作、架構）、技術判斷、領域知識
+- **低價值**：閒聊、基礎問題、模糊問題
+
+**Debug 用途**：
+
+記錄檔可用於事後分析，透過 `timestamp` 欄位判斷同一次對話的前後文。
 
 **資料格式**：
 ```json
