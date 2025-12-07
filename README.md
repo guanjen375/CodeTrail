@@ -72,6 +72,7 @@ pip install -r requirements-extra.txt
 | Debug + 跑測試 | `python main.py . --patch --run-tests` | 完整改碼閉環，可執行測試 |
 | 分析外部專案 | `python main.py /path --run-tests --container` | 在容器中安全執行（推薦） |
 | 分析 GitHub repo | `python main.py --web https://github.com/user/repo` | 直接分析線上 repo |
+| 收集訓練資料 | `AI_CODE_COLLECT_DATA=1 python main.py .` | 啟用資料飛輪，記錄互動 |
 
 ### 模式介紹
 

@@ -203,6 +203,10 @@ def main():
     print(f"[CTX] Context: {NUM_CTX:,} tokens")
     print(gpu_status)
 
+    # 資料收集模式提示
+    if DATA_COLLECT_ENABLED:
+        print("[DATA] 資料收集模式已啟用 (AI_CODE_COLLECT_DATA=1)")
+
     # 初始化 Code RAG（Agent 模式）
     # GPT建議：改成 lazy build，第一次 query 時才建立索引
     code_rag = None
