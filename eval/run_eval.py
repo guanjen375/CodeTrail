@@ -19,6 +19,16 @@
 
 import os
 import sys
+import io
+
+# 設定 UTF-8 編碼（解決 Windows cp950 問題）
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+if sys.stdout.encoding != 'utf-8':
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 import json
 import time
 import argparse
@@ -34,7 +44,7 @@ from config import KNOWLEDGE_FILE
 from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from agent import run_agent
-from utils import call_llm, do_strict_mode
+from utils import call_llm, answer_with_self_check
 
 
 @dataclass
@@ -103,13 +113,9 @@ def eval_spec_question(case: EvalCase, kb: KnowledgeBase, use_strict_mode: bool 
 
     # 使用嚴格模式 pipeline（與實際 CLI 相同）
     if use_strict_mode and knowledge_ctx:
-        # 使用 do_strict_mode 進行兩階段回答
-        answer = do_strict_mode(
-            question=case.question,
-            refs_context=knowledge_ctx,
-            code_context="",  # spec 題不需要 code context
-            previous_qa=None
-        )
+        # 使用 answer_with_self_check 進行兩階段回答
+        base_ctx = ""  # spec 題不需要 code context
+        answer = answer_with_self_check(case.question, base_ctx, knowledge_ctx)
         details = {
             'strict_mode_used': True,
         }
