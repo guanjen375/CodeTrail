@@ -2,6 +2,16 @@
 
 基於 Ollama 的本地程式碼分析工具，支援 RAG（知識庫檢索）和 Agent 模式。
 
+**版本：v0.2.0** - 穩定性與除錯體驗強化版
+
+## v0.2.0 版本亮點
+
+- **Stack trace 快路徑**：BUG 類問題自動解析 `file:line`，直接定位錯誤來源，跳過多輪工具迴圈
+- **Ollama 健康檢查**：eval 前自動檢測 Ollama 狀態，異常時可選擇自動重啟
+- **工具使用上限**：預設 `MAX_READ_FILE_CALLS=15`、`MAX_GREP_CALLS=10`，避免 Agent 無限制讀檔
+- **規格文件 RAG**：新增 `docs/spec.md` + `knowledge.json`，整理 NUM_CTX 設定建議、OOM 排解等規格
+- **評測 100% 通過**：14 題 regression 測試集（SPEC/CODE/BUG）全數通過，平均分數 0.86
+
 ## 功能特色
 
 - **完整模式**：小型專案（< 200KB）一次讀入全部程式碼分析
