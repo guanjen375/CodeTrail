@@ -36,6 +36,8 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict
 from typing import Optional
+import subprocess
+import requests
 
 # 將父目錄加入 path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -45,6 +47,48 @@ from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from agent import run_agent
 from utils import call_llm, answer_with_self_check
+
+
+def check_ollama_health(max_retries: int = 3, timeout: int = 10) -> bool:
+    """檢查 Ollama 是否正常運作，必要時自動重啟
+
+    Args:
+        max_retries: 最大重試次數
+        timeout: API 請求 timeout（秒）
+
+    Returns:
+        True 如果 Ollama 正常，False 如果無法恢復
+    """
+    ollama_url = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
+
+    for attempt in range(max_retries):
+        try:
+            # 嘗試呼叫 Ollama API
+            resp = requests.get(f"{ollama_url}/api/tags", timeout=timeout)
+            if resp.status_code == 200:
+                print(f"[HEALTH] Ollama 正常運作中")
+                return True
+        except requests.exceptions.RequestException as e:
+            print(f"[HEALTH] Ollama 無回應 (attempt {attempt + 1}/{max_retries}): {e}")
+
+        # 嘗試重啟 Ollama
+        if attempt < max_retries - 1:
+            print(f"[HEALTH] 嘗試重啟 Ollama...")
+            try:
+                subprocess.run(
+                    ['sudo', 'systemctl', 'restart', 'ollama'],
+                    timeout=30,
+                    capture_output=True
+                )
+                # 等待 Ollama 啟動
+                time.sleep(5)
+            except subprocess.TimeoutExpired:
+                print(f"[HEALTH] 重啟 Ollama 超時")
+            except Exception as e:
+                print(f"[HEALTH] 重啟 Ollama 失敗: {e}")
+
+    print(f"[HEALTH] Ollama 無法恢復，請手動檢查")
+    return False
 
 
 @dataclass
@@ -306,7 +350,7 @@ def eval_bug_question(
                 pass
 
     try:
-        answer = run_agent(folder, case.question, code_rag=code_rag, max_loops=8)
+        answer = run_agent(folder, case.question, code_rag=code_rag, max_loops=12)
     finally:
         config.RUN_COMMAND_ENABLED = original_run_cmd
         config.PATCH_ENABLED = original_patch
@@ -397,6 +441,11 @@ def run_evaluation(
     print("=" * 60)
     print("智能程式碼分析器 - 評測工具")
     print("=" * 60)
+
+    # 健康檢查 - 確保 Ollama 正常運作
+    if not check_ollama_health():
+        print("\n[ERROR] Ollama 無法啟動，評測中止")
+        return {}
 
     # 載入評測用例
     cases = load_eval_cases(eval_dir)

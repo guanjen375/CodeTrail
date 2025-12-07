@@ -1,26 +1,42 @@
 [
   {
     "id": "spec_001",
-    "question": "根據文件，這個系統的最大支援記憶體是多少？",
+    "question": "這個系統預設使用什麼模型？",
     "expected": {
-      "refs": ["REF1", "memory"],
-      "keywords": ["GB", "記憶體", "限制"]
+      "refs": ["spec", "模型"],
+      "keywords": ["qwen3-coder", "30b"]
     }
   },
   {
     "id": "spec_002",
-    "question": "依照規格，這個 API 的 timeout 預設值是多少？",
+    "question": "NUM_CTX 應該設多大才不會 OOM？",
     "expected": {
-      "refs": ["timeout", "default"],
-      "keywords": ["秒", "ms", "預設"]
+      "refs": ["spec", "context"],
+      "keywords": ["64K", "OOM", "offload"]
     }
   },
   {
     "id": "spec_003",
-    "question": "文件中有說明這個功能是否支援多執行緒嗎？",
+    "question": "Patch 功能預設是開啟還是關閉的？如何啟用？",
     "expected": {
-      "refs": ["thread", "concurrent"],
-      "keywords": ["執行緒", "thread-safe", "並行"]
+      "refs": ["spec", "patch"],
+      "keywords": ["停用", "--patch", "AI_CODE_PATCH"]
+    }
+  },
+  {
+    "id": "spec_004",
+    "question": "Code RAG 對 Bug 類問題的相關度門檻是多少？",
+    "expected": {
+      "refs": ["spec", "threshold"],
+      "keywords": ["0.25", "CODE_RAG_THRESHOLD_BUG"]
+    }
+  },
+  {
+    "id": "spec_005",
+    "question": "系統支援哪些程式語言？",
+    "expected": {
+      "refs": ["spec", "語言"],
+      "keywords": ["Python", "C++", "JavaScript", "Go", "Rust"]
     }
   }
 ]

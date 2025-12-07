@@ -154,10 +154,10 @@ CODE_RAG_AUTO_PREREAD = True
 CODE_RAG_PREREAD_TOP_K = 5
 CODE_RAG_PREREAD_TOP_K_BUG = 3       # Bug 模式預讀更少，靠 stack trace 補
 CODE_RAG_PREREAD_LINES = 96          # 預讀行數縮小，換取更精準的中心（GPT建議: 120->96）
-CODE_RAG_PREREAD_LINES_BUG = 128     # Bug 模式預讀縮小（GPT建議: 160->128）
+CODE_RAG_PREREAD_LINES_BUG = 160     # Bug 模式預讀增加（eval調優: 128->160）
 CODE_RAG_PREREAD_MAX_LINES = 300     # 預讀完整函式的最大行數上限（超過則退回窗口模式）
 CODE_RAG_THRESHOLD = 0.35            # 提高門檻，確保真的相關才進來（GPT建議: 0.30->0.35）
-CODE_RAG_THRESHOLD_BUG = 0.30        # Bug 類問題稍微放寬（GPT建議: 0.25->0.30）
+CODE_RAG_THRESHOLD_BUG = 0.25        # Bug 類問題放寬門檻（eval調優: 0.30->0.25）
 
 # ============================================================
 # 嚴格模式設定

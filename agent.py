@@ -1434,9 +1434,44 @@ STACK_TRACE_PATTERNS = [
     r'(.+?):(\d+):(?:\d+:)?\s*warning',
     r'at (.+?):(\d+):',
     r'^\s+at .+?\((.+?):(\d+):\d+\)',
-    # 修正：把副檔名包含進 group(1)，避免取得缺副檔名的路徑
-    r'(.+?\.(?:cpp|c|h|py|rs|go|java)):(\d+)',
+    # 修正：限制路徑字元，避免匹配到中文句子
+    # 路徑只能包含 word字元、/、\、.、-、空白前要斷開
+    r'(?:^|[\s,;:])([a-zA-Z0-9_./\\-]+\.(?:cpp|c|h|py|rs|go|java|js|ts)):(\d+)',
 ]
+
+
+def _normalize_stack_filepath(filepath: str) -> str:
+    """正規化 stack trace 中的檔案路徑
+
+    移除前綴雜訊，確保只剩下檔案路徑
+
+    Args:
+        filepath: 從 regex 提取的原始路徑字串
+
+    Returns:
+        清理後的檔案路徑
+    """
+    # 移除常見前綴
+    filepath = filepath.strip()
+
+    # 如果整個路徑看起來正常，直接返回
+    if '/' in filepath or '\\' in filepath:
+        # 有路徑分隔符，取最後一個看起來像路徑的部分
+        # 例如 "在 code_rag.py" -> "code_rag.py"
+        parts = filepath.split()
+        for part in reversed(parts):
+            if '.' in part and any(part.endswith(ext) for ext in ['.py', '.c', '.cpp', '.h', '.go', '.rs', '.java', '.js', '.ts']):
+                return part
+        return filepath
+
+    # 沒有路徑分隔符，可能是純檔名
+    # 找到最後一個看起來像檔名的部分
+    parts = filepath.split()
+    for part in reversed(parts):
+        if '.' in part and any(part.endswith(ext) for ext in ['.py', '.c', '.cpp', '.h', '.go', '.rs', '.java', '.js', '.ts']):
+            return part
+
+    return filepath
 
 
 def extract_stack_locations(text: str) -> list[tuple[str, int]]:
@@ -1446,6 +1481,8 @@ def extract_stack_locations(text: str) -> list[tuple[str, int]]:
         for m in re.finditer(pattern, text, re.MULTILINE):
             try:
                 filepath = m.group(1)
+                # 正規化路徑，移除前綴雜訊
+                filepath = _normalize_stack_filepath(filepath)
                 line_num = int(m.group(2))
                 if not filepath.startswith('/usr') and not filepath.startswith('C:\\Windows'):
                     locations.append((filepath, line_num))
@@ -1725,6 +1762,33 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
         if stack_parts:
             stack_preread_context = "\n\n【Stack trace 相關程式碼 - 這些是錯誤發生的位置】:\n" + "\n\n".join(stack_parts)
 
+            # === Stack Trace 快路徑 ===
+            # 有明確的 stack trace 時，直接一次 LLM 回答，不進 tool-loop
+            # 這大幅加速 bug 類問題的處理
+            if is_bug_fix and len(stack_parts) >= 1:
+                print(f"[FAST_PATH] 啟用 Stack Trace 快路徑模式")
+                fast_prompt = f"""你是除錯助手。以下是錯誤訊息以及對應檔案的相關程式碼：
+
+錯誤訊息：
+{question}
+
+{stack_preread_context}
+
+請回答：
+1. 造成錯誤的直接原因是什麼？
+2. 應該如何修改（描述修法即可，不用貼完整 patch）？
+
+【回答規則】
+- 必須根據上面的程式碼分析，不可憑經驗猜測
+- 若程式碼不足以判斷根因，請明確說明需要更多資訊
+- 所有判斷必須附上 file:line 位置（如 agent.py:123）
+- 使用繁體中文回答
+"""
+                from utils import call_llm_stream
+                fast_answer = call_llm_stream(fast_prompt, temperature=0.0)
+                print(f"   [OK] 快路徑完成")
+                return _make_return(fast_answer)
+
     # 構建對話歷史（壓縮版）
     # 注意：放在 prompt 前段，因為 LLM 對兩端注意力較強，
     # 低優先級內容放前面，重要的當前任務/規則放後面
@@ -1864,7 +1928,19 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
     bug_fix_reminder_sent = False
     no_evidence_reminder_sent = False  # GPT建議：追蹤是否已發過無證據提醒
 
+    # GPT建議：工具使用次數上限，避免無意義的亂逛
+    MAX_READ_FILE_CALLS = 15
+    MAX_GREP_CALLS = 10
+    read_file_count = 0
+    grep_count = 0
+    tool_limit_reached = False
+
     for i in range(effective_max_loops):
+        # 若已達工具上限，直接進入總結階段
+        if tool_limit_reached:
+            print(f"[LOOP] 工具上限已達，跳過剩餘迴圈")
+            break
+
         print(f"[LOOP] Agent 第 {i+1} 輪...")
 
         # 每輪開始前先裁切 messages，避免 context 超載
@@ -1932,6 +2008,25 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
 
             if tool_name == "run_command":
                 has_run_command = True
+
+            # GPT建議：工具使用次數計數
+            if tool_name == "read_file":
+                read_file_count += 1
+            elif tool_name == "grep":
+                grep_count += 1
+
+            # 檢查是否達到工具上限
+            if read_file_count > MAX_READ_FILE_CALLS or grep_count > MAX_GREP_CALLS:
+                if not tool_limit_reached:
+                    tool_limit_reached = True
+                    print(f"   [LIMIT] 工具使用達上限 (read_file: {read_file_count}, grep: {grep_count})")
+                    # 插入提示讓 LLM 收斂
+                    messages.append({
+                        "role": "user",
+                        "content": "已經讀了足夠多檔案，請根據目前掌握的資訊嘗試給出推論；若仍沒有把握，請明確說「原因不明」而不要亂猜。請直接給出最終回答。"
+                    })
+                    break  # 跳出 tool_calls 迴圈，讓下一輪不再執行工具
+                continue  # 跳過這個工具呼叫
 
             call_key = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
             if call_key in tool_history:

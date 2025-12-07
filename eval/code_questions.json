@@ -28,5 +28,25 @@
       "line": 937
     },
     "context": "."
+  },
+  {
+    "id": "code_004",
+    "question": "CodeRAG 的 build_index 方法做了什麼？",
+    "expected": {
+      "file": "code_rag.py",
+      "symbol": "build_index",
+      "line": 335
+    },
+    "context": "."
+  },
+  {
+    "id": "code_005",
+    "question": "call_llm 函式是怎麼呼叫 Ollama API 的？",
+    "expected": {
+      "file": "utils.py",
+      "symbol": "call_llm",
+      "line": 100
+    },
+    "context": "."
   }
 ]

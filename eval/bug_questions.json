@@ -12,17 +12,26 @@
     "id": "bug_002",
     "question": "File \"agent.py\", line 500, in run_command\nTypeError: 'NoneType' object is not iterable",
     "expected": {
-      "cause": "None 值",
+      "cause": "None",
       "fix_keywords": ["None", "檢查", "if", "預設值"]
     },
     "context": "."
   },
   {
     "id": "bug_003",
-    "question": "程式執行時 VRAM 不斷增加，最終導致 OOM，懷疑是記憶體洩漏",
+    "question": "在 5090 32GB 上使用 qwen3-coder:30b 並把 config.py 裡的 NUM_CTX 設成 131072 之後，多次執行程式時 VRAM 會一路漲到 OOM，應該調整哪些參數？",
     "expected": {
-      "cause": "記憶體洩漏",
-      "fix_keywords": ["cache", "清除", "釋放", "del", "gc"]
+      "cause": "NUM_CTX",
+      "fix_keywords": ["NUM_CTX", "64K", "32K", "offload", "降低"]
+    },
+    "context": "."
+  },
+  {
+    "id": "bug_004",
+    "question": "呼叫 Ollama API 時經常 timeout，錯誤訊息是 ReadTimeout",
+    "expected": {
+      "cause": "timeout",
+      "fix_keywords": ["timeout", "重試", "retry", "增加"]
     },
     "context": "."
   }
