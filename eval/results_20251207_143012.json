@@ -1,0 +1,107 @@
+{
+  "timestamp": "2025-12-07T14:30:12.738235",
+  "summary": {
+    "code": {
+      "total": 6,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "avg_score": 0.0,
+      "avg_time": 0.007043759028116862
+    },
+    "total": {
+      "cases": 6,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "avg_score": 0.0
+    }
+  },
+  "results": [
+    {
+      "case_id": "code_001",
+      "case_type": "code",
+      "passed": false,
+      "score": 0.0,
+      "details": {
+        "expected_file": "agent.py",
+        "expected_line": 945,
+        "expected_symbol": "run_agent",
+        "rag_results": [],
+        "found_file": false,
+        "found_line": false,
+        "found_symbol": false,
+        "has_file_line_in_answer": false
+      },
+      "answer": "[ERROR] 錯誤: 404 Client Error: Not Found for url: http://localhost:11434/api/chat",
+      "time_taken": 0.03411269187927246
+    },
+    {
+      "case_id": "code_001",
+      "case_type": "code",
+      "passed": false,
+      "score": 0.0,
+      "details": {
+        "error": "'cp950' codec can't encode character '\\u2717' in position 4: illegal multibyte sequence"
+      },
+      "answer": "",
+      "time_taken": 0.0
+    },
+    {
+      "case_id": "code_002",
+      "case_type": "code",
+      "passed": false,
+      "score": 0.0,
+      "details": {
+        "expected_file": "knowledge.py",
+        "expected_line": 0,
+        "expected_symbol": "query",
+        "rag_results": [],
+        "found_file": false,
+        "found_line": false,
+        "found_symbol": false,
+        "has_file_line_in_answer": false
+      },
+      "answer": "[ERROR] 錯誤: 404 Client Error: Not Found for url: http://localhost:11434/api/chat",
+      "time_taken": 0.0046329498291015625
+    },
+    {
+      "case_id": "code_002",
+      "case_type": "code",
+      "passed": false,
+      "score": 0.0,
+      "details": {
+        "error": "'cp950' codec can't encode character '\\u2717' in position 4: illegal multibyte sequence"
+      },
+      "answer": "",
+      "time_taken": 0.0
+    },
+    {
+      "case_id": "code_003",
+      "case_type": "code",
+      "passed": false,
+      "score": 0.0,
+      "details": {
+        "expected_file": "agent.py",
+        "expected_line": 0,
+        "expected_symbol": "_parse_unified_diff",
+        "rag_results": [],
+        "found_file": false,
+        "found_line": false,
+        "found_symbol": false,
+        "has_file_line_in_answer": false
+      },
+      "answer": "[ERROR] 錯誤: 404 Client Error: Not Found for url: http://localhost:11434/api/chat",
+      "time_taken": 0.0035169124603271484
+    },
+    {
+      "case_id": "code_003",
+      "case_type": "code",
+      "passed": false,
+      "score": 0.0,
+      "details": {
+        "error": "'cp950' codec can't encode character '\\u2717' in position 4: illegal multibyte sequence"
+      },
+      "answer": "",
+      "time_taken": 0.0
+    }
+  ]
+}

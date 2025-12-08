@@ -141,10 +141,10 @@ python main.py . --exclude="*.test.py"
 python main.py . --include-dir=third_party
 ```
 
-### 外部檔案（圖片、bin）
+### 外部檔案（圖片、bin、elf）
 
 ```bash
-# 允許讀取專案目錄外的圖片和 bin 檔案
+# 允許讀取專案目錄外的圖片、bin、elf 檔案
 python main.py /path/to/project --allow-external
 ```
 
@@ -286,7 +286,8 @@ python main.py --web https://github.com/user/repo --agent --kb=docs.json
 - **Bug 分析**：「這個錯誤是怎麼發生的？」（支援貼上 stack trace）
 - **規格查詢**：「這個 API 的最大值限制是多少？」（需要知識庫）
 - **圖片問題**：「img:/path/to/screenshot.png 這個錯誤怎麼解？」
-- **二進位分析**：「bin:/path/to/firmware.bin 這個檔案的結構是什麼？」
+- **二進位分析**：「bin:/path/to/firmware.bin 這個檔案的版本是什麼？」
+- **ELF 分析**：「elf:/path/to/app.elf 這個程式的 entry point 在哪？」
 
 ## 圖片與二進位檔案
 
@@ -313,16 +314,40 @@ python main.py --web https://github.com/user/repo --agent --kb=docs.json
 ```
 
 **分析內容**：
-- **Hex dump**：前 1KB，用於識別檔案格式和 magic number
-- **智能字串提取**：使用 `strings` 提取整個檔案的可讀字串
+- **Magic 偵測**：自動識別 ELF、uImage、gzip、squashfs 等格式
+- **Hex dump**：前 1KB，用於識別檔案格式和 header 結構
+- **智能字串提取**：純 Python 掃描整個檔案的可讀字串（含 file offset）
 - **優先分類**：版本號、編譯日期等重要資訊會優先顯示
+- **ELF 自動切換**：若偵測到 ELF magic，自動切換到 ELF 解析模式
+
+### ELF 檔案分析
+
+```bash
+# 在問題中加入 elf: 前綴
+>>> elf:/path/to/app.elf 這個程式的 entry point 在哪？
+>>> elf:./firmware.elf 幫我分析這個 ELF 的 sections
+
+# 支援格式：.elf, .so, .o, .axf, .out, .ko
+# 大小限制：50MB
+```
+
+**分析內容**（需要系統安裝 `readelf`）：
+- **ELF Header**：Class、Machine、Entry point、Flags 等
+- **Program Headers**：LOAD segment 等資訊
+- **Sections**：精選重要 sections（.text、.rodata、.data、.bss、.comment 等）
+- **Entry point 定位**：顯示 entry 對應的 section 和 file offset
+- **.comment**：編譯器資訊（GCC/Clang 版本、編譯參數）
+- **Symbols**：Top N functions 和 objects（按 size 排序）
+- **高優先字串**：版本/編譯相關字串（含 offset）
+
+**單檔規則**：每輪問答只分析第一個 `bin:` 或 `elf:`，避免 context 超出限制。
 
 ### 讀取專案目錄外的檔案
 
-預設情況下，圖片和 bin 檔案必須在專案目錄內。如需分析外部路徑的檔案，使用 `--allow-external` 參數：
+預設情況下，圖片、bin、elf 檔案必須在專案目錄內。如需分析外部路徑的檔案，使用 `--allow-external` 參數：
 
 ```bash
-# 允許讀取任意路徑的圖片和 bin 檔案
+# 允許讀取任意路徑的圖片、bin、elf 檔案
 python main.py /path/to/project --allow-external
 
 # 範例：分析專案目錄外的截圖
@@ -332,10 +357,14 @@ python main.py ./my_project --allow-external
 # 範例：分析專案目錄外的 U-Boot
 python main.py ./my_project --kb=knowledge.json --allow-external
 >>> bin:/home/user/u-boot/u-boot.bin 這個 U-Boot 的版本是？
+
+# 範例：分析專案目錄外的 ELF
+python main.py ./my_project --allow-external
+>>> elf:/home/user/build/app.elf 這個程式的 entry point 在哪？
 ```
 
 **安全說明**：
-- 此選項影響圖片（`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`）和 bin 檔案（`.bin`, `.dat`, `.raw`, `.fw`, `.img`, `.rom`, `.hex`）
+- 此選項影響圖片（`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`）、bin 檔案（`.bin`, `.dat`, `.raw`, `.fw`, `.img`, `.rom`, `.hex`）和 ELF 檔案（`.elf`, `.so`, `.o`, `.axf`, `.out`, `.ko`）
 - 預設關閉，需明確啟用
 
 ## 知識庫格式
@@ -643,11 +672,21 @@ Agent 需要多輪工具呼叫，可以：
 - `DYNAMIC_TOP_K_MIN/MAX`：控制返回的參考資料數量
 - `KNOWLEDGE_THRESHOLD`：提高門檻可減少不相關內容，但可能漏掉有用資訊
 
-### Q: 二進位檔案找不到版本資訊？
+### Q: 二進位/ELF 檔案找不到版本資訊？
 
-預設使用 `strings` 提取整個檔案的可讀字串。如果找不到：
+現在使用純 Python 掃描字串（含 file offset），不依賴外部 `strings` 命令。如果找不到：
 1. 確認版本資訊確實存在：`strings firmware.bin | grep -i version`
 2. 版本字串可能使用非標準格式，嘗試更具體的問法
+3. ELF 檔案可查看 `.comment` section 獲取編譯器資訊
+
+### Q: ELF 解析資訊不完整？
+
+ELF 詳細解析需要系統安裝 `readelf`（通常在 `binutils` 套件中）：
+- Linux: `sudo apt install binutils`
+- macOS: `brew install binutils`（或使用 Xcode command line tools）
+- Windows: 安裝 WSL 或 MinGW/MSYS2
+
+若缺少 `readelf`，仍會提供高優先字串掃描結果。
 
 ### Q: apply_patch 失敗？
 
