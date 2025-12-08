@@ -1,5 +1,29 @@
-# 智能程式碼分析器 - 核心依賴
+# 智能程式碼分析器 - 依賴套件
 # pip install -r requirements.txt
 
+# ============================================================
+# 核心依賴（必須安裝）
+# ============================================================
 requests>=2.28.0
 numpy>=1.21.0
+
+# ============================================================
+# 可選依賴（用到再裝）
+# ============================================================
+# 以下套件採用 lazy import，未安裝不影響核心功能
+# 執行對應功能時若缺少套件會提示安裝
+
+# RAG 知識庫建立（執行 RAG.py 從 PDF/文件建立知識庫時需要）
+# pip install pymupdf4llm ollama
+# pymupdf4llm>=0.0.5
+# ollama>=0.1.0
+
+# Tree-sitter AST 解析（提升程式碼解析精準度，目前未啟用）
+# pip install tree-sitter tree-sitter-python tree-sitter-javascript ...
+# tree-sitter>=0.21.0
+# tree-sitter-python>=0.21.0
+# tree-sitter-javascript>=0.21.0
+# tree-sitter-typescript>=0.21.0
+# tree-sitter-go>=0.21.0
+# tree-sitter-rust>=0.21.0
+# tree-sitter-c>=0.21.0
