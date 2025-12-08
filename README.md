@@ -5,23 +5,39 @@
 ## 快速開始
 
 ```bash
-# 最基本用法：分析當前目錄
+# 日常問答（預設進入多輪對話模式）
 python main.py .
 
-# 分析指定專案並提問
-python main.py /path/to/project "這個專案的主要功能是什麼？"
+# 單輪問答（加上問題參數，回答後直接結束）
+python main.py . "這個專案的主要功能是什麼？"
 
-# 搭配知識庫（技術文件）
-python main.py . --kb=knowledge.json
+# 有技術文件時（回答會引用文件）
+python main.py . --kb=docs.json
 
-# 分析韌體/二進位檔案
+# 需要 AI 幫忙改 code
+python main.py . --patch
+
+# Debug + 跑測試驗證
+python main.py . --patch --run-tests
+
+# 分析韌體/二進位檔案（需 --allow-external）
 python main.py . --allow-external
 >>> bin:/path/to/firmware.bin 這個韌體版本是什麼？
 
 # 分析錯誤截圖
 python main.py . --allow-external
 >>> img:/path/to/error.png 這個錯誤怎麼解？
+
+# 分析不信任的外部專案（容器隔離）
+python main.py /path/to/untrusted --run-tests --container
+
+# 分析 GitHub repo
+python main.py --web https://github.com/user/repo
 ```
+
+**重要提示**：
+- **預設是多輪對話模式**：不帶問題參數時，進入互動式對話，可連續提問
+- **單輪模式**：帶問題參數（用引號包住）則回答後直接結束
 
 ## 安裝
 
@@ -55,7 +71,7 @@ python main.py [專案路徑] [問題] [選項]
 | 參數 | 說明 | 範例 |
 |------|------|------|
 | `專案路徑` | 要分析的專案目錄（預設 `.`） | `python main.py /path/to/project` |
-| `問題` | 單次模式的問題（不帶則進入互動模式） | `python main.py . "main 函式做了什麼？"` |
+| `"問題"` | 單輪模式：帶問題（需引號）則回答後結束；不帶則進入多輪對話 | `python main.py . "main 函式做了什麼？"` |
 
 ### 模式選擇
 
@@ -81,28 +97,6 @@ python main.py [專案路徑] [問題] [選項]
 | `--run-tests` | 啟用測試執行工具（pytest, cargo test 等） |
 | `--patch` | 啟用改碼工具（apply_patch, git_status, git_diff） |
 | `--container` | 在 Docker/Podman 容器中安全執行測試 |
-
-### 常用組合
-
-```bash
-# 日常問答
-python main.py .
-
-# 有技術文件時（回答會引用文件）
-python main.py . --kb=docs.json
-
-# 需要 AI 幫忙改 code
-python main.py . --patch
-
-# Debug + 跑測試驗證
-python main.py . --patch --run-tests
-
-# 分析不信任的外部專案（容器隔離）
-python main.py /path/to/untrusted --run-tests --container
-
-# 分析 GitHub repo
-python main.py --web https://github.com/user/repo
-```
 
 ## 互動模式
 
