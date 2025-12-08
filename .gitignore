@@ -39,3 +39,6 @@ data/
 .pytest_cache/
 htmlcov/
 .coverage
+
+# Eval 執行結果（每次執行產生，非原始碼）
+eval/results_*.json
