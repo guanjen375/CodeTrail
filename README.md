@@ -98,15 +98,6 @@ python main.py [專案路徑] [問題] [選項]
 | `--patch` | 啟用改碼工具（apply_patch, git_status, git_diff） |
 | `--container` | 在 Docker/Podman 容器中安全執行測試 |
 
-## 互動模式
-
-啟動後進入互動模式，可連續提問：
-
-```
-💬 輸入問題 (Enter=整體分析, q=離開, clear=清除歷史)
->>> 這個函式 foo() 做了什麼？
-```
-
 ### 特殊前綴語法
 
 在問題中使用特殊前綴可以分析外部檔案：
@@ -216,6 +207,50 @@ python main.py . --run-tests
 ```bash
 python main.py /path/to/untrusted --run-tests --container
 ```
+
+## 其他功能
+
+### Code RAG（程式碼索引）
+
+自動建立專案級程式碼索引，加速 Agent 模式的檔案定位：
+
+- 使用 AST/tree-sitter 精準解析函式、類別等符號
+- 支援增量更新（只重建變更的檔案）
+- 快取儲存於 `.code_rag_cache_*.json` 和 `.npz`
+
+### 網頁模式（--web）
+
+直接分析 GitHub/GitLab/Bitbucket 上的公開專案：
+
+```bash
+python main.py --web https://github.com/user/repo
+python main.py --web https://github.com/user/repo/tree/main/src  # 只分析子目錄
+```
+
+### 資料收集（Fine-tuning 用）
+
+收集互動記錄，用於後續訓練 reranker 或微調模型：
+
+```bash
+# 啟用資料收集
+export AI_CODE_COLLECT_DATA=1
+python main.py .
+
+# 查看統計
+python data_flywheel.py stats
+
+# 手動評分
+python data_flywheel.py rate
+
+# 匯出訓練資料
+python data_flywheel.py export --output training.jsonl
+```
+
+### 追問偵測
+
+互動模式下自動偵測追問，保持對話上下文：
+- 觸發詞：`我是`、`我用的是`、`那這樣`、`那如果`、`所以是` 等
+- 短回答自動關聯上文（如回答 `a53`、`cortex` 等）
 
 ## 設定檔
 
