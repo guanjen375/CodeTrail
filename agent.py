@@ -32,7 +32,9 @@ from config import (
     ALLOWED_COMMANDS,
     # 改碼閉環相關設定（注意：PATCH_ENABLED 需用 config.PATCH_ENABLED 讀取）
     PATCH_MAX_FILES, PATCH_MAX_LINES_PER_FILE,
-    LINT_COMMANDS
+    LINT_COMMANDS,
+    # 中央化的回答優先級規則
+    PRIORITY_RULE_WITH_BINARY, get_answer_rules
 )
 from utils import (
     should_ignore_dir, should_ignore_file, call_llm, call_llm_stream,
@@ -1885,6 +1887,10 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
 
     is_creative = any(kw in q_lower for kw in ['refactor', '重構', '設計', '架構', 'design', 'architecture', '建議', 'suggest'])
 
+    # 偵測是否有 BIN/ELF context，使用中央化的回答規則
+    has_binary = image_ctx and ("[BIN]" in image_ctx or "[ELF]" in image_ctx)
+    answer_rules = get_answer_rules(has_binary)
+
     # 上下文排列：低優先級在前，高優先級在後（LLM 對兩端注意力較強）
     # 順序：對話歷史(最低) -> Code RAG -> Stack trace -> REF知識庫 -> BIN/圖片(最高) -> 規則
     system_prompt = f"""你是程式碼分析 Agent。透過工具探索專案來回答用戶問題。
@@ -1897,23 +1903,21 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
 {image_ctx}
 {task_hint}
 
-【回答規則 - 嚴格遵守】
-1. 若有 [BIN] 二進位檔案，必須優先分析其 Hex dump 和可讀字串，這是使用者最關心的內容
-2. 禁止憑常識或經驗猜測，只能根據程式碼與 [REF] 內容回答
-3. 若文件/程式碼沒有給出明確資訊，必須說「程式碼/文件中沒有明確說明」
-4. 若需要做推測，一定要明確標示「推測：...」，並說明推測依據
-5. 凡是來自 [REF] 的描述，句尾必須標註編號，如「...（REF1）」
-6. 如果回答中完全沒有 REF 引用，要主動說明「以下為一般經驗，文件未明寫」
-7. 若有「Code RAG 預讀程式碼」或「Stack trace 程式碼」，優先基於這些內容分析，不要想像其他檔案內容
-8. 若你的常識與 [REF] 內容衝突，一律以 [REF] 為準，不得自行修正
-9. 除非預讀程式碼不足以回答，否則不要猜測其他檔案內容；若需要其他檔案，用 read_file 精準讀取
-10. 【重要】所有基於程式碼的判斷，必須附上 file:line 位置（如 agent.py:123），讓用戶可以驗證
+【{answer_rules}】
+
+【補充規則 - Agent 模式專用】
+1. 凡是來自 [REF] 的描述，句尾必須標註編號，如「...（REF1）」
+2. 如果回答中完全沒有 REF 引用，要主動說明「以下為一般經驗，文件未明寫」
+3. 若有「Code RAG 預讀程式碼」或「Stack trace 程式碼」，優先基於這些內容分析，不要想像其他檔案內容
+4. 若你的常識與 [REF] 內容衝突，一律以 [REF] 為準，不得自行修正
+5. 除非預讀程式碼不足以回答，否則不要猜測其他檔案內容；若需要其他檔案，用 read_file 精準讀取
+6. 【重要】所有基於程式碼的判斷，必須附上 file:line 位置（如 agent.py:123），讓用戶可以驗證
 
 【工具使用規則】
-11. 優先使用預讀內容，不足時再用工具探索
-12. 不要重複呼叫相同的工具和參數
-13. 需要其他檔案時，用 read_file 精準讀取，不要亂 grep
-14. 收集到足夠資訊後，直接用文字回答，答案用繁體中文{run_cmd_hint}"""
+7. 優先使用預讀內容，不足時再用工具探索
+8. 不要重複呼叫相同的工具和參數
+9. 需要其他檔案時，用 read_file 精準讀取，不要亂 grep
+10. 收集到足夠資訊後，直接用文字回答，答案用繁體中文{run_cmd_hint}"""
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -1980,7 +1984,7 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
                 if should_use_strict_mode(question, knowledge_ctx):
                     print(f"   [STRICT] Agent 啟用嚴格模式自我檢查...")
                     base_ctx = f"專案路徑: {folder}\n{code_rag_context}\n{stack_preread_context}"
-                    content = answer_with_self_check(question, base_ctx, knowledge_ctx)
+                    content = answer_with_self_check(question, base_ctx, knowledge_ctx, binary_ctx=image_ctx)
 
                 print(f"   [OK] Agent 完成分析\n")
                 # 直接輸出結果（批次輸出，避免逐字 I/O 開銷）

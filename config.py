@@ -182,6 +182,51 @@ SPEC_QUESTION_KEYWORDS = [
 ]
 
 # ============================================================
+# BIN/ELF 報告限制（Hard Cap）
+# ============================================================
+# 保護重要資訊（Header、Entry point）不被截斷
+# GPT建議：設定 hard cap 避免 context 超載時丟失關鍵資訊
+BIN_ELF_REPORT_MAX_CHARS = 25000      # 報告總長度上限（約 6K tokens）
+BIN_ELF_HEADER_RESERVED = 3000        # Header + Entry point 保留空間
+BIN_ELF_MAX_SECTIONS = 30             # Section 數量上限（縮減）
+BIN_ELF_MAX_FUNCS = 25                # Function 數量上限（縮減）
+BIN_ELF_MAX_OBJS = 12                 # Object 數量上限
+BIN_ELF_MAX_STRINGS = 80              # 字串數量上限（大幅縮減）
+
+# ============================================================
+# 回答優先級規則（Single Source of Truth）
+# ============================================================
+# 所有模組統一引用這些規則，避免維護不一致
+
+# 有 BIN/ELF 時的優先級
+PRIORITY_RULE_WITH_BINARY = "優先級：[BIN]/[ELF] > [REF] > 程式碼"
+# 無 BIN/ELF 時的優先級
+PRIORITY_RULE_WITHOUT_BINARY = "優先級：[REF] > 程式碼"
+
+# 回答規則（統一版本）
+def get_answer_rules(has_binary: bool = False) -> str:
+    """取得回答規則字串，供各模組統一使用
+
+    Args:
+        has_binary: 是否有 [BIN]/[ELF] 上下文
+    """
+    if has_binary:
+        return f"""回答規則（{PRIORITY_RULE_WITH_BINARY}）：
+1. 若有 [BIN]/[ELF] 二進位檔案，必須優先分析其內容，這是使用者最關心的
+2. 其次根據 [REF] 參考資料，必須標註引用來源（如「根據 REF1...」）
+3. 最後才考慮程式碼內容
+4. 若文件/程式碼沒有給出明確資訊，直接說「文件/檔案中沒有明確說明」
+5. 不要憑常識或經驗補完沒有出現的條件
+6. 若需要做推測，一定要明確標示「推測：...」"""
+    else:
+        return f"""回答規則（{PRIORITY_RULE_WITHOUT_BINARY}）：
+1. 優先根據 [REF] 參考資料回答，必須標註引用來源（如「根據 REF1...」）
+2. 其次根據程式碼內容回答
+3. 若文件/程式碼沒有給出明確資訊，直接說「文件/檔案中沒有明確說明」
+4. 不要憑常識或經驗補完沒有出現的條件
+5. 若需要做推測，一定要明確標示「推測：...」"""
+
+# ============================================================
 # 改碼閉環設定 (Patch / Git / Lint)
 # ============================================================
 # ⚠️ 安全警告：apply_patch 會直接修改檔案，請謹慎使用

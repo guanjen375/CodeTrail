@@ -11,7 +11,8 @@ from config import (
     MAX_TOTAL_CHARS, BUDGET_HIGH, BUDGET_MID, BUDGET_LOW,
     SKELETON_THRESHOLD, SKELETON_MAX_LINES, NUM_CTX_FULL_MODE,
     DYNAMIC_NUM_CTX_ENABLED, DYNAMIC_NUM_CTX_MIN, DYNAMIC_NUM_CTX_MAX,
-    DYNAMIC_NUM_CTX_BUFFER, CHARS_PER_TOKEN
+    DYNAMIC_NUM_CTX_BUFFER, CHARS_PER_TOKEN,
+    get_answer_rules
 )
 from utils import get_priority, call_llm, call_llm_stream, should_use_strict_mode, answer_with_self_check
 
@@ -181,30 +182,30 @@ def analyze_full(ctx: FullContext, question: str, image_ctx: str = "", knowledge
     is_creative = any(kw in q_lower for kw in ['refactor', '重構', '設計', '架構', 'design', 'architecture', '建議', 'suggest'])
     temperature = 0.2 if is_creative else 0.0
 
+    # base_ctx 只放程式碼，image_ctx（bin/elf）獨立處理
     base_ctx = f"""你是程式碼審查專家。以下是專案的完整程式碼：
-{ctx.context_str}
-{image_ctx}"""
+{ctx.context_str}"""
 
     if question:
         if should_use_strict_mode(question, knowledge_ctx):
-            return answer_with_self_check(question, base_ctx, knowledge_ctx)
+            return answer_with_self_check(question, base_ctx, knowledge_ctx, binary_ctx=image_ctx)
+
+        # 偵測是否有 BIN/ELF context，使用中央化的回答規則
+        has_binary = image_ctx and ("[BIN]" in image_ctx or "[ELF]" in image_ctx)
+        answer_rules = get_answer_rules(has_binary)
 
         prompt = f"""{base_ctx}
+{image_ctx}
 {knowledge_ctx}
 
 用戶問題: {question}
 
-回答規則：
-1. 若有 [BIN] 二進位檔案，必須優先分析其 Hex dump 和可讀字串，這是使用者最關心的內容。
-2. 優先根據程式碼與 [REF] 內容回答。
-3. 若文件/程式碼沒有給出明確資訊，直接說「程式碼/文件中沒有寫清楚」。
-4. 不要憑常識或經驗補完沒有出現的條件。
-5. 若需要做推測，一定要標示是推測。
-6. 若有 [REF] 參考資料，請在回答中標註引用來源（如「根據 REF1...」）。
+{answer_rules}
 
 請用繁體中文詳細回答。"""
     else:
         prompt = f"""{base_ctx}
+{image_ctx}
 {knowledge_ctx}
 
 請分析這個專案：

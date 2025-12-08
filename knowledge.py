@@ -850,7 +850,17 @@ class KnowledgeBase:
         has_spec = any(chunk.get('type') == 'spec' for chunk in merged_chunks)
         has_warning = any(chunk.get('type') == 'warning' for chunk in merged_chunks)
 
-        model_lines = ["[REF] 相關知識參考（請在回答時引用 REF 編號）:"]
+        # GPT建議：在 REF header 加入信心分數提示，讓 LLM 了解參考資料的可靠度
+        confidence_label = ""
+        if top_emb_score >= 0.6:
+            confidence_label = "高信心"
+        elif top_emb_score >= 0.4:
+            confidence_label = "中信心"
+        else:
+            confidence_label = "低信心"
+
+        model_lines = [f"[REF] 相關知識參考（信心度: {confidence_label}, score={top_emb_score:.2f}）:"]
+        model_lines.append(f"※ 信心度說明：高信心(≥0.6)資料可直接引用，中信心(0.4-0.6)請謹慎使用，低信心(<0.4)僅供參考")
 
         for i, chunk in enumerate(merged_chunks, 1):
             source = chunk.get('source', '未知')
@@ -912,7 +922,8 @@ class KnowledgeBase:
             dtype = doc_types.get(src, 'doc')
             display_parts.append(f"{src} [{dtype}] p.{pages_str}")
 
-        display_output = "[REF] " + " | ".join(display_parts)
+        # GPT建議：display 也顯示信心度，讓用戶知道參考資料的可靠度
+        display_output = f"[REF {confidence_label}] " + " | ".join(display_parts)
 
         # 回傳 metadata 供上層判斷 REF 強度
         # 改進：分別回傳 embedding score 和 keyword score，讓 spec 題拒答只看 embedding

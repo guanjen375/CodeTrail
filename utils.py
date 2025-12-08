@@ -18,7 +18,9 @@ from config import (
     CODE_EXTENSIONS, IGNORED_DIRS, IGNORED_FILES, IGNORED_PATTERNS,
     LOW_PRIORITY_PATTERNS, ALLOWED_DOT_DIRS,
     STRICT_MODE, STRICT_MODE_KEYWORDS, SPEC_QUESTION_KEYWORDS,
-    STRICT_MODE_TEMPERATURE, WEAK_REF_THRESHOLD
+    STRICT_MODE_TEMPERATURE, WEAK_REF_THRESHOLD,
+    PRIORITY_RULE_WITH_BINARY, PRIORITY_RULE_WITHOUT_BINARY,
+    get_answer_rules
 )
 
 
@@ -425,25 +427,53 @@ def should_refuse_answer(question: str, kb_metadata: dict) -> bool:
     return False
 
 
-def answer_with_self_check(question: str, base_ctx: str, knowledge_ctx: str) -> str:
+def answer_with_self_check(question: str, base_ctx: str, knowledge_ctx: str,
+                          binary_ctx: str = "") -> str:
     """
     嚴格模式：兩階段回答 + 自我檢查
     1. 第一次：正常回答（使用極低溫度）
     2. 第二次：自我檢查，刪除無根據的推測
+
+    Args:
+        question: 使用者問題
+        base_ctx: 基礎上下文（程式碼等）
+        knowledge_ctx: 知識庫上下文（[REF]）
+        binary_ctx: 二進位/ELF 上下文（[BIN]/[ELF]），優先級最高
     """
     print("[STRICT] 啟用嚴格模式 - 兩階段自我檢查")
 
+    # 偵測是否有 BIN/ELF context
+    has_binary = binary_ctx and ("[BIN]" in binary_ctx or "[ELF]" in binary_ctx)
+
+    # 使用中央化的優先級規則（來自 config.py）
+    priority_rule = PRIORITY_RULE_WITH_BINARY if has_binary else PRIORITY_RULE_WITHOUT_BINARY
+
+    # 根據是否有 binary context 調整檢查規則
+    if has_binary:
+        source_rule = "- 必須優先根據 [BIN]/[ELF] 內容回答，其次是 [REF]"
+        check_rule = "1. 逐句檢查：每句話是否能在 [BIN]/[ELF] 或 [REF] 內容裡找到明確根據"
+        mark_rule = "- 有 [BIN]/[ELF] 或 [REF] 明確對應 → 保留並標註來源"
+    else:
+        source_rule = "- 只能根據 [REF] 內容回答，禁止使用常識或經驗補充"
+        check_rule = "1. 逐句檢查：每句話是否能在 [REF] 內容裡找到明確根據"
+        mark_rule = "- 有 [REF] 明確對應 → 保留並標註 REF 編號"
+
+    # 組合完整 context
+    full_ctx = base_ctx
+    if binary_ctx:
+        full_ctx += f"\n{binary_ctx}"
+
     # 第一階段：正常回答（嚴格模式用極低溫度）
-    first_prompt = f"""{base_ctx}
+    first_prompt = f"""{full_ctx}
 {knowledge_ctx}
 
-使用上面的程式碼與 [REF] 參考資料回答問題：
+使用上面的程式碼與參考資料回答問題：
 {question}
 
-重要規則：
-- 只能根據 [REF] 內容回答，禁止使用常識或經驗補充
-- 每個論述都必須標註 REF 編號
-- 若 REF 沒有提到，直接說「文件中沒有明確說明」
+重要規則（{priority_rule}）：
+{source_rule}
+- 每個論述都必須標註來源（[BIN]/[ELF] 或 REF 編號）
+- 若資料沒有提到，直接說「文件/檔案中沒有明確說明」
 
 請直接給出清楚的回答。"""
 
@@ -455,22 +485,26 @@ def answer_with_self_check(question: str, base_ctx: str, knowledge_ctx: str) -> 
 
     print("\n" + "-" * 40)
     # 第二階段：自我檢查（溫度 0）
-    second_prompt = f"""{knowledge_ctx}
+    check_ctx = knowledge_ctx
+    if binary_ctx:
+        check_ctx = f"{binary_ctx}\n{knowledge_ctx}"
 
-上面是你根據文件給出的初稿回答：
+    second_prompt = f"""{check_ctx}
+
+上面是你根據文件/檔案給出的初稿回答：
 
 [draft]
 {draft}
 [/draft]
 
 請嚴格檢查並修正：
-1. 逐句檢查：每句話是否能在 [REF] 內容裡找到明確根據
-2. 凡是答案中沒有出現 REFx 標註的句子，一律視為不可靠
+{check_rule}
+2. 凡是答案中沒有標註來源的句子，一律視為不可靠
 
 修正規則（嚴格執行）：
-- 有 [REF] 明確對應 → 保留並標註 REF 編號
-- 合理推論但文件沒明說 → 改成「推測：...」
-- 完全沒根據 → 直接刪除，改成「文件未提及此點」
+{mark_rule}
+- 合理推論但資料沒明說 → 改成「推測：...」
+- 完全沒根據 → 直接刪除，改成「文件/檔案未提及此點」
 - 不要解釋檢查過程，只輸出修正後的最終回答"""
 
     print("   [2/2] 自我檢查...\n")

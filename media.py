@@ -15,7 +15,11 @@ from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 
 from http_client import get_session
-from config import OLLAMA_GENERATE_URL, VL_MODEL, IMAGE_EXTENSIONS
+from config import (
+    OLLAMA_GENERATE_URL, VL_MODEL, IMAGE_EXTENSIONS,
+    BIN_ELF_REPORT_MAX_CHARS, BIN_ELF_HEADER_RESERVED,
+    BIN_ELF_MAX_SECTIONS, BIN_ELF_MAX_FUNCS, BIN_ELF_MAX_OBJS, BIN_ELF_MAX_STRINGS
+)
 
 
 # 支援的二進位檔案副檔名
@@ -72,6 +76,11 @@ def _safe_path(path: str, allow_external: bool = False, allowed_extensions: set 
 
     相對路徑會以 _SANDBOX_ROOT 為基準解析，而非當前工作目錄
 
+    GPT建議改進：
+    - 處理路徑空白（strip + 引號移除）
+    - 使用 is_file() 而非 exists()（避免目錄誤判）
+    - 更好的錯誤訊息
+
     Args:
         path: 檔案路徑
         allow_external: 是否允許外部路徑
@@ -79,6 +88,11 @@ def _safe_path(path: str, allow_external: bool = False, allowed_extensions: set 
     """
     if _SANDBOX_ROOT is None:
         # 未設定 sandbox 時，拒絕所有請求
+        return None
+
+    # 路徑預處理：去除空白和引號
+    path = path.strip().strip('"').strip("'")
+    if not path:
         return None
 
     try:
@@ -92,14 +106,25 @@ def _safe_path(path: str, allow_external: bool = False, allowed_extensions: set 
         # 檢查是否在 sandbox 內
         try:
             full.relative_to(_SANDBOX_ROOT)
-            return full
+            # 在 sandbox 內：只需要確認是檔案（不是目錄）
+            if full.is_file():
+                return full
+            # 檔案可能不存在但路徑有效（讓呼叫者處理）
+            if not full.exists():
+                return full
+            return None  # 是目錄，不是檔案
         except ValueError:
             # 路徑在 sandbox 外
-            if allow_external and _ALLOW_EXTERNAL and full.exists():
-                # 檢查副檔名（如果有限制）
-                if allowed_extensions is None or full.suffix.lower() in allowed_extensions:
-                    return full
+            if allow_external and _ALLOW_EXTERNAL:
+                # 外部檔案必須存在且是檔案
+                if full.is_file():
+                    # 檢查副檔名（如果有限制）
+                    if allowed_extensions is None or full.suffix.lower() in allowed_extensions:
+                        return full
             return None
+    except (OSError, ValueError) as e:
+        # 路徑格式錯誤（如 Windows 上的非法字元）
+        return None
     except Exception:
         return None
 
@@ -329,12 +354,20 @@ def _parse_elf_symbols(txt: str) -> List[Dict]:
 
 def _build_elf_report(
     filepath: Path,
-    max_sections: int = 40,
-    max_funcs: int = 30,
-    max_objs: int = 15,
-    max_strings: int = 30
+    max_sections: int = None,
+    max_funcs: int = None,
+    max_objs: int = None,
+    max_strings: int = None
 ) -> str:
-    """建立 ELF 檔案的完整分析報告"""
+    """建立 ELF 檔案的完整分析報告
+
+    使用 config 中的 hard cap 設定，優先保護重要資訊（Header、Entry point）
+    """
+    # 使用 config 的 hard cap 設定
+    max_sections = max_sections or BIN_ELF_MAX_SECTIONS
+    max_funcs = max_funcs or BIN_ELF_MAX_FUNCS
+    max_objs = max_objs or BIN_ELF_MAX_OBJS
+    max_strings = max_strings or BIN_ELF_MAX_STRINGS
     file_size = filepath.stat().st_size
 
     # 讀取檔頭確認是 ELF
@@ -544,7 +577,46 @@ def _build_elf_report(
         report.append(f"【高優先字串】({min(max_strings, len(high_priority))}/{len(high_priority)} 個)")
         report.append(_format_strings_with_offset(high_priority, limit=max_strings))
 
-    return "\n".join(report)
+    # Hard cap 保護：確保報告不超過上限，且保護重要資訊
+    full_report = "\n".join(report)
+
+    if len(full_report) > BIN_ELF_REPORT_MAX_CHARS:
+        # 找出重要段落的結束位置（Header + Entry point）
+        # 這些資訊在報告開頭，必須保留
+        critical_markers = ["Entry point 0x", "【Sections】", "【Program Headers】"]
+        critical_end = 0
+
+        for marker in critical_markers:
+            pos = full_report.find(marker)
+            if pos != -1:
+                # 找到該段落的結尾（下一個空行或下一個【】）
+                next_section = full_report.find("\n【", pos + len(marker))
+                if next_section != -1:
+                    critical_end = max(critical_end, next_section)
+                else:
+                    critical_end = max(critical_end, pos + 500)
+
+        # 確保至少保留 header 區域
+        critical_end = max(critical_end, min(BIN_ELF_HEADER_RESERVED, len(full_report)))
+
+        # 計算可用於後續內容的空間
+        remaining_budget = BIN_ELF_REPORT_MAX_CHARS - critical_end - 200  # 200 for truncation notice
+
+        if remaining_budget > 0:
+            truncated = (
+                full_report[:critical_end] +
+                full_report[critical_end:critical_end + remaining_budget] +
+                f"\n\n... [報告已截斷，原長度 {len(full_report):,} chars，保留關鍵 Header/Entry point 資訊]"
+            )
+        else:
+            truncated = (
+                full_report[:BIN_ELF_REPORT_MAX_CHARS - 100] +
+                f"\n\n... [報告已截斷，原長度 {len(full_report):,} chars]"
+            )
+
+        return truncated
+
+    return full_report
 
 
 # ============================================================================
@@ -736,7 +808,32 @@ def read_binary(path: str, max_strings: int = 200) -> str:
                     limit=remaining
                 ))
 
-        return "\n".join(report)
+        # Hard cap 保護：確保報告不超過上限，保護 Magic/Hex dump 等重要資訊
+        full_report = "\n".join(report)
+
+        if len(full_report) > BIN_ELF_REPORT_MAX_CHARS:
+            # BIN 報告的重要資訊在開頭：檔名、大小、Magic、Hex dump
+            # 找到 Hex dump 結束位置
+            hex_end = full_report.find("【可讀字串")
+            if hex_end == -1:
+                hex_end = min(BIN_ELF_HEADER_RESERVED, len(full_report))
+
+            remaining_budget = BIN_ELF_REPORT_MAX_CHARS - hex_end - 200
+
+            if remaining_budget > 0:
+                truncated = (
+                    full_report[:hex_end] +
+                    full_report[hex_end:hex_end + remaining_budget] +
+                    f"\n\n... [報告已截斷，原長度 {len(full_report):,} chars，保留 Magic/Hex dump 資訊]"
+                )
+            else:
+                truncated = (
+                    full_report[:BIN_ELF_REPORT_MAX_CHARS - 100] +
+                    f"\n\n... [報告已截斷，原長度 {len(full_report):,} chars]"
+                )
+            return truncated
+
+        return full_report
 
     except Exception as e:
         return f"[BIN 錯誤] {type(e).__name__}: {e}"
@@ -748,11 +845,19 @@ def process_binary(text: str) -> tuple[str, str]:
     支援：
     - elf:/path/to/file.elf - ELF 解析
     - bin:/path/to/file.bin - 二進位解析（自動偵測 ELF）
+    - elf:"/path with spaces/file.elf" - 帶引號的路徑（支援空白）
+    - bin:'path with spaces/file.bin' - 單引號也支援
 
     規則：每輪只分析第一個，避免 context 爆掉
     """
-    # 同時匹配 elf: 和 bin:
-    pattern = re.compile(r"(elf|bin):([^\s]+)", flags=re.IGNORECASE)
+    # 匹配 elf:/bin: 後面跟著：
+    # 1. 雙引號包圍的路徑 "..."
+    # 2. 單引號包圍的路徑 '...'
+    # 3. 無空白的路徑
+    pattern = re.compile(
+        r'(elf|bin):(?:"([^"]+)"|\'([^\']+)\'|([^\s]+))',
+        flags=re.IGNORECASE
+    )
     matches = list(pattern.finditer(text))
 
     if not matches:
@@ -761,15 +866,20 @@ def process_binary(text: str) -> tuple[str, str]:
     # 清除所有 elf:/bin: 標記
     clean = pattern.sub("", text).strip()
 
+    def extract_path(m) -> str:
+        """從 match 中提取路徑（處理引號和非引號格式）"""
+        # group(2) = 雙引號, group(3) = 單引號, group(4) = 無引號
+        return m.group(2) or m.group(3) or m.group(4) or ""
+
     # 只取第一個（單檔規則）
     first_match = matches[0]
     kind = first_match.group(1).lower()
-    target = first_match.group(2)
+    target = extract_path(first_match)
 
     # 多檔警告
     warn_msg = ""
     if len(matches) > 1:
-        others = [f"{m.group(1)}:{m.group(2)}" for m in matches[1:]]
+        others = [f"{m.group(1)}:{extract_path(m)}" for m in matches[1:]]
         warn_msg = f"\n[WARN] 偵測到 {len(matches)} 個 bin/elf 檔案，為避免超出 context，只分析第一個。\n"
         warn_msg += f"       已忽略: {', '.join(others[:3])}"
         if len(others) > 3:
