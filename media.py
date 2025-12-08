@@ -916,18 +916,50 @@ def process_binary(text: str) -> tuple[str, str]:
     return clean, ctx
 
 
-def process_images(text: str) -> tuple[str, str]:
-    """處理文字中的圖片引用"""
-    pattern = r'img:([^\s]+\.(?:png|jpg|jpeg|gif|webp))'
-    matches = re.findall(pattern, text, re.IGNORECASE)
-    clean = re.sub(pattern, '', text, flags=re.IGNORECASE).strip()
+def process_images(text: str, max_images: int = 3) -> tuple[str, str]:
+    """處理文字中的圖片引用
+
+    支援：
+    - img:/path/to/image.png - 標準路徑
+    - img:"/path with spaces/image.png" - 帶雙引號的路徑（支援空白）
+    - img:'path with spaces/image.png' - 帶單引號的路徑
+
+    Args:
+        text: 輸入文字
+        max_images: 每輪最多處理的圖片數量（控制 context 大小）
+    """
+    # 匹配 img: 後面跟著：
+    # 1. 雙引號包圍的路徑 "..."
+    # 2. 單引號包圍的路徑 '...'
+    # 3. 無空白的路徑（以圖片副檔名結尾）
+    pattern = re.compile(
+        r'img:(?:"([^"]+\.(?:png|jpg|jpeg|gif|webp))"|'
+        r"'([^']+\.(?:png|jpg|jpeg|gif|webp))'|"
+        r'([^\s]+\.(?:png|jpg|jpeg|gif|webp)))',
+        flags=re.IGNORECASE
+    )
+    matches = list(pattern.finditer(text))
 
     if not matches:
         return text, ""
 
+    # 清除所有 img: 標記
+    clean = pattern.sub("", text).strip()
+
+    def extract_path(m) -> str:
+        """從 match 中提取路徑（處理引號和非引號格式）"""
+        return m.group(1) or m.group(2) or m.group(3) or ""
+
+    # 多圖警告
+    if len(matches) > max_images:
+        others = [extract_path(m) for m in matches[max_images:]]
+        print(f"[WARN] 偵測到 {len(matches)} 個圖片，為避免超出 context，只處理前 {max_images} 個")
+        print(f"       已忽略: {', '.join(others[:3])}" + (f" ... 等 {len(others)} 個" if len(others) > 3 else ""))
+
     ctx = "\n附加圖片:\n"
-    for m in matches:
-        print(f"[IMG] OCR: {m}")
-        ctx += f"\n[{m}]:\n{ocr_image(m)}\n"
+    for m in matches[:max_images]:
+        path = extract_path(m)
+        print(f"[IMG] OCR: {path}")
+        ctx += f"\n[{path}]:\n{ocr_image(path)}\n"
 
     return clean, ctx

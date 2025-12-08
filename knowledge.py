@@ -887,15 +887,13 @@ class KnowledgeBase:
 
         model_lines.append("\n[/REF]")
 
-        model_lines.append("\n回答規則（嚴格遵守）:")
-        model_lines.append("1. 凡是來自文件的描述，句尾必須標註 REF 編號，如「...（REF1）」")
-        model_lines.append("2. 禁止憑常識或經驗猜測，若 REF 未提及，必須明講「文件中沒有明確說明」")
-        model_lines.append("3. 若你的常識與 [REF] 內容衝突，一律以 [REF] 為準，不得自行修正")
-        model_lines.append("4. 如果回答中完全沒有 REF 引用，要主動說明「以下為一般經驗，文件未明寫」")
+        # GPT建議：移除詳細回答規則，避免與 config.get_answer_rules() 重複/打架
+        # 只保留輕量提示，主要規則由呼叫端統一注入
+        model_lines.append("\n※ 引用 REF 內容時請標註編號（如 REF1）")
         if has_spec:
-            model_lines.append("5. 若 spec 與 guide/FAQ 衝突，以 type=spec 的 REF 為準")
+            model_lines.append("※ spec 類型的 REF 優先級較高")
         if has_warning:
-            model_lines.append("6. type=warning 的內容請優先引用並強調限制條件")
+            model_lines.append("※ warning 類型的 REF 請特別注意其限制條件")
 
         model_output = "\n".join(model_lines)
 

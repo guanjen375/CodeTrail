@@ -234,7 +234,8 @@ def main():
     if question:
         clean_q, img_ctx = process_images(question)
         clean_q, bin_ctx = process_binary(clean_q)
-        img_ctx = img_ctx + bin_ctx  # 合併圖片和二進位上下文
+        # 保留 bin_ctx 獨立，以便 strict mode 的 answer_with_self_check 能正確處理 BIN/ELF
+        media_ctx = img_ctx + bin_ctx  # 非 strict 模式使用的合併上下文
         print("[KB] 查詢知識庫...")
         knowledge_ctx, knowledge_display, kb_metadata = kb.query(clean_q) if kb.loaded else ("", "", {})
 
@@ -270,14 +271,15 @@ def main():
         # GPT建議：規格題優先走嚴格模式，避免 Agent 多讀 code 來「補想像」
         if should_use_strict_mode(clean_q, knowledge_ctx) and knowledge_ctx:
             print("[STRICT] 規格類問題，直接走嚴格模式\n")
+            # base_ctx 只放圖片 OCR，bin_ctx 獨立傳入讓 strict 自檢能正確處理 BIN/ELF 優先級
             base_ctx = f"專案路徑: {folder}\n{img_ctx}" if img_ctx else f"專案路徑: {folder}"
-            result = answer_with_self_check(clean_q, base_ctx, knowledge_ctx)
+            result = answer_with_self_check(clean_q, base_ctx, knowledge_ctx, binary_ctx=bin_ctx)
         elif mode == "full":
-            result = analyze_full(ctx, clean_q, img_ctx, knowledge_ctx)
+            result = analyze_full(ctx, clean_q, media_ctx, knowledge_ctx)
         else:
             # empty 模式和 agent 模式都使用 run_agent
             # 啟用 return_metadata 以取得 tool_calls 和 files_read
-            agent_result = run_agent(folder, clean_q, img_ctx, knowledge_ctx=knowledge_ctx,
+            agent_result = run_agent(folder, clean_q, media_ctx, knowledge_ctx=knowledge_ctx,
                                      code_rag=code_rag, return_metadata=DATA_COLLECT_ENABLED)
             if DATA_COLLECT_ENABLED and isinstance(agent_result, tuple):
                 result, agent_metadata = agent_result
@@ -330,7 +332,8 @@ def main():
 
             clean_q, img_ctx = process_images(q)
             clean_q, bin_ctx = process_binary(clean_q)
-            img_ctx = img_ctx + bin_ctx  # 合併圖片和二進位上下文
+            # 保留 bin_ctx 獨立，以便 strict mode 的 answer_with_self_check 能正確處理 BIN/ELF
+            media_ctx = img_ctx + bin_ctx  # 非 strict 模式使用的合併上下文
 
             # 構建 RAG 查詢
             if qa_history and kb.loaded:
@@ -395,10 +398,11 @@ def main():
             # GPT建議：規格題優先走嚴格模式，避免 Agent 多讀 code 來「補想像」
             if should_use_strict_mode(clean_q, knowledge_ctx) and knowledge_ctx and not is_followup:
                 print("[STRICT] 規格類問題，直接走嚴格模式\n")
+                # base_ctx 只放圖片 OCR，bin_ctx 獨立傳入讓 strict 自檢能正確處理 BIN/ELF 優先級
                 base_ctx = f"專案路徑: {folder}\n{img_ctx}" if img_ctx else f"專案路徑: {folder}"
-                result = answer_with_self_check(clean_q, base_ctx, knowledge_ctx)
+                result = answer_with_self_check(clean_q, base_ctx, knowledge_ctx, binary_ctx=bin_ctx)
             elif mode == "full":
-                result = analyze_full(ctx, clean_q, img_ctx, knowledge_ctx)
+                result = analyze_full(ctx, clean_q, media_ctx, knowledge_ctx)
             elif is_followup:
                 print("[TIP] 偵測到追問\n")
                 # 追問也傳入 knowledge_ctx，避免純聊天式回答
@@ -406,7 +410,7 @@ def main():
             else:
                 # empty 模式和 agent 模式都使用 run_agent
                 # 啟用 return_metadata 以取得 tool_calls 和 files_read
-                agent_result = run_agent(folder, clean_q, img_ctx, prev_qa=qa_history,
+                agent_result = run_agent(folder, clean_q, media_ctx, prev_qa=qa_history,
                                         knowledge_ctx=knowledge_ctx, code_rag=code_rag,
                                         return_metadata=DATA_COLLECT_ENABLED)
                 if DATA_COLLECT_ENABLED and isinstance(agent_result, tuple):
