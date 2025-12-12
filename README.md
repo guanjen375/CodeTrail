@@ -2,6 +2,13 @@
 
 基於 Ollama 的本地程式碼分析工具，支援知識庫檢索（RAG）、二進位/ELF 分析、圖片 OCR、Agent 動態探索等功能。
 
+> **⚠️ 注意：此專案為個人使用工具，不適合公開發布**
+>
+> - 程式碼未經完整測試和安全審計
+> - 部分功能依賴特定環境配置
+> - 錯誤處理可能不完善
+> - 僅供學習參考和個人使用
+
 ## 系統需求
 
 ### 軟體需求
@@ -45,23 +52,43 @@
 
 ### Python 套件
 
-**核心依賴**（必須安裝）：
+**核心依賴**（必須安裝，否則啟動會 `ModuleNotFoundError`）：
 
 ```
-requests>=2.28.0    # HTTP 請求
-numpy>=1.21.0       # 向量運算（RAG embedding）
+requests>=2.28.0    # HTTP 請求（與 Ollama API 通訊）
 ```
 
-**可選依賴**（用到再裝，採用 lazy import）：
+**強烈建議安裝**（lazy import，但大多數功能需要）：
 
 ```
-# RAG 知識庫建立（執行 RAG.py 時需要）
+numpy>=1.21.0       # 向量運算加速（RAG 搜尋、MMR 選擇）
+                    # 未安裝會 fallback 到純 Python 實作，但較慢
+```
+
+**可選依賴**（特定功能才需要）：
+
+```
+# RAG 知識庫建立（執行 RAG.py 從 PDF 建知識庫時需要）
 pymupdf4llm>=0.0.5  # PDF 解析
 ollama>=0.1.0       # Ollama Python SDK
 
 # ELF 分析（系統工具，非 Python 套件）
 # Linux: sudo apt install binutils
 # macOS: brew install binutils
+# Windows: 需安裝 MinGW 或 WSL
+```
+
+**安裝方式**：
+
+```bash
+# 最小安裝（僅核心功能）
+pip install requests
+
+# 建議安裝（完整功能）
+pip install requests numpy
+
+# 需要建立知識庫時
+pip install requests numpy pymupdf4llm ollama
 ```
 
 ## 快速開始
