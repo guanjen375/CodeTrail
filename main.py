@@ -250,14 +250,6 @@ def main():
         print("[MODE] QA 模式 (--qa)")
         print("=" * 50)
 
-        if not question:
-            print("[ERROR] QA 模式需要提供問題")
-            print("用法: python main.py --qa \"你的問題\"")
-            print("範例: python main.py --qa \"這個 compile error 是啥意思: undefined reference to 'foo'\"")
-            print("      python main.py --qa --kb=my_kb.json \"根據文件，這個 API 怎麼用？\"")
-            print("      python main.py --qa \"img:/path/to/screenshot.png 這個錯誤怎麼解？\"")
-            sys.exit(1)
-
         # 檢查 GPU
         gpu_ok, gpu_status = check_ollama_gpu()
         print(f"[AI] 模型: {MODEL}")
@@ -271,8 +263,31 @@ def main():
 
         print("-" * 50)
 
-        # 執行 QA 模式
-        run_qa_mode(question, kb, allow_external=True)
+        # 單輪模式：有問題就回答後結束
+        if question:
+            run_qa_mode(question, kb, allow_external=True)
+            return None
+
+        # 多輪模式：沒帶問題就進入互動式對話
+        print("進入 QA 互動模式（輸入 q 離開）\n")
+        while True:
+            try:
+                q = input(">>> ").strip()
+
+                if q.lower() in ('q', 'quit', 'exit'):
+                    print("[BYE] 再見!")
+                    break
+
+                if not q:
+                    continue
+
+                run_qa_mode(q, kb, allow_external=True)
+                print()  # 空行分隔
+
+            except KeyboardInterrupt:
+                print("\n[BYE] 再見!")
+                break
+
         return None  # QA 模式不需要清理 temp_dir
 
     # 網頁模式：從 Git URL 下載程式碼

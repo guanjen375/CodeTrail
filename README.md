@@ -34,10 +34,16 @@ python main.py /path/to/untrusted --run-tests --container
 # 分析 GitHub repo
 python main.py --web https://github.com/user/repo
 
-# === 不需要專案的快速問答 ===
+# === 不需要專案的快速問答（QA 模式）===
 
-# QA 模式：不掃專案，直接問答（適合解釋錯誤、一般問題）
+# QA 單輪：帶問題，回答後結束
 python main.py --qa "這個 compile error 是啥意思: undefined reference to 'foo'"
+
+# QA 多輪：不帶問題，進入互動模式
+python main.py --qa
+>>> 第一個問題
+>>> 第二個問題
+>>> q  # 離開
 
 # QA 模式 + 知識庫
 python main.py --qa --kb=docs.json "根據文件，這個 API 怎麼用？"
@@ -143,8 +149,14 @@ python main.py [專案路徑] [問題] [選項]
 - 搭配知識庫查詢文件
 
 ```bash
-# 解釋編譯錯誤
+# 單輪模式：帶問題，回答後結束
 python main.py --qa "這個 error 是什麼意思: expected ';' before '}' token"
+
+# 多輪模式：不帶問題，進入互動對話
+python main.py --qa
+>>> 第一個問題
+>>> 第二個問題
+>>> q  # 離開
 
 # 搭配知識庫
 python main.py --qa --kb=api_docs.json "這個 API 的 timeout 預設值是多少？"
@@ -159,6 +171,7 @@ python main.py --qa "bin:/path/to/core 這個 core dump 是什麼問題？"
 **優點**：
 - 啟動快（不掃專案目錄）
 - 不需要準備專案資料夾
+- 支援單輪和多輪對話
 - 仍保留圖片 OCR、bin 分析、知識庫查詢等功能
 
 ### 2. 知識庫 RAG（--kb）
