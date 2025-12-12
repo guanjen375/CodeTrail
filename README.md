@@ -8,9 +8,6 @@
 # 日常問答（預設進入多輪對話模式）
 python main.py .
 
-# 單輪問答（加上問題參數，回答後直接結束）
-python main.py . "這個專案的主要功能是什麼？"
-
 # 有技術文件時（回答會引用文件）
 python main.py . --kb=docs.json
 
@@ -36,23 +33,8 @@ python main.py --web https://github.com/user/repo
 
 # === 不需要專案的快速問答（QA 模式）===
 
-# QA 單輪：帶問題，回答後結束
-python main.py --qa "這個 compile error 是啥意思: undefined reference to 'foo'"
-
-# QA 多輪：不帶問題，進入互動模式
+# QA 模式：不掃專案，直接問答
 python main.py --qa
->>> 第一個問題
->>> 第二個問題
->>> q  # 離開
-
-# QA 模式 + 知識庫
-python main.py --qa --kb=docs.json "根據文件，這個 API 怎麼用？"
-
-# QA 模式 + 圖片分析
-python main.py --qa "img:/path/to/error.png 這個錯誤怎麼解？"
-
-# QA 模式 + 二進位分析
-python main.py --qa "bin:/path/to/firmware.bin 這個韌體的 magic number 是什麼？"
 ```
 
 **重要提示**：
@@ -141,38 +123,15 @@ python main.py [專案路徑] [問題] [選項]
 
 ### 1. QA 模式（--qa）
 
-不掃描專案、不建立 Code RAG，直接進行問答。適合：
-
-- 解釋 compile error / runtime error
-- 一般程式設計問題
-- 搭配圖片 OCR 分析錯誤截圖
-- 搭配知識庫查詢文件
+不掃描專案、不建立 Code RAG，直接進行問答。適合解釋錯誤、一般問題、搭配圖片/bin 分析。
 
 ```bash
-# 單輪模式：帶問題，回答後結束
 python main.py --qa "這個 error 是什麼意思: expected ';' before '}' token"
-
-# 多輪模式：不帶問題，進入互動對話
-python main.py --qa
->>> 第一個問題
->>> 第二個問題
->>> q  # 離開
-
-# 搭配知識庫
 python main.py --qa --kb=api_docs.json "這個 API 的 timeout 預設值是多少？"
-
-# 分析錯誤截圖
 python main.py --qa "img:/path/to/build_error.png 這個編譯錯誤怎麼修？"
-
-# 分析 core dump
-python main.py --qa "bin:/path/to/core 這個 core dump 是什麼問題？"
 ```
 
-**優點**：
-- 啟動快（不掃專案目錄）
-- 不需要準備專案資料夾
-- 支援單輪和多輪對話
-- 仍保留圖片 OCR、bin 分析、知識庫查詢等功能
+**優點**：啟動快、不需專案資料夾、仍保留 img/bin/知識庫功能
 
 ### 2. 知識庫 RAG（--kb）
 
