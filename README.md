@@ -2,6 +2,68 @@
 
 基於 Ollama 的本地程式碼分析工具，支援知識庫檢索（RAG）、二進位/ELF 分析、圖片 OCR、Agent 動態探索等功能。
 
+## 系統需求
+
+### 軟體需求
+
+| 項目 | 最低版本 | 建議版本 | 說明 |
+|------|---------|---------|------|
+| Python | 3.10+ | 3.11+ | 使用 type hints、match-case 等新語法 |
+| Ollama | 0.1.0+ | 最新版 | 本地 LLM 推理引擎 |
+| Git | 2.0+ | 最新版 | 用於專案分析和 `--web` 模式 |
+
+### 硬體需求
+
+#### 最低配置（可運行，但體驗較差）
+
+| 項目 | 規格 | 說明 |
+|------|------|------|
+| RAM | 16GB | 僅能使用較小模型（如 7B） |
+| VRAM | 8GB | 需大量 offload 到 RAM，速度慢 |
+| 儲存 | 50GB | 模型檔案佔用空間 |
+
+#### 建議配置（流暢使用 30B 模型）
+
+| 項目 | 規格 | 說明 |
+|------|------|------|
+| RAM | 32GB+ | 搭配 VRAM offload 使用 |
+| VRAM | 24GB+ | RTX 4090 / RTX 3090 / A5000 等 |
+| 儲存 | 100GB SSD | 模型載入更快 |
+
+#### 最佳配置（完整功能、大 context）
+
+| 項目 | 規格 | 說明 |
+|------|------|------|
+| RAM | 64GB+ | 支援 128K context offload |
+| VRAM | 32GB+ | A100 / RTX A6000 等 |
+| 儲存 | NVMe SSD | 最佳 I/O 效能 |
+
+> **Context 長度與記憶體對照**（以 30B 模型為例）：
+> - 32K context：約需 24GB VRAM
+> - 64K context：約需 32GB VRAM 或 24GB VRAM + 32GB RAM（offload）
+> - 128K context：約需 32GB VRAM + 64GB RAM（offload）
+
+### Python 套件
+
+**核心依賴**（必須安裝）：
+
+```
+requests>=2.28.0    # HTTP 請求
+numpy>=1.21.0       # 向量運算（RAG embedding）
+```
+
+**可選依賴**（用到再裝，採用 lazy import）：
+
+```
+# RAG 知識庫建立（執行 RAG.py 時需要）
+pymupdf4llm>=0.0.5  # PDF 解析
+ollama>=0.1.0       # Ollama Python SDK
+
+# ELF 分析（系統工具，非 Python 套件）
+# Linux: sudo apt install binutils
+# macOS: brew install binutils
+```
+
 ## 快速開始
 
 ```bash
