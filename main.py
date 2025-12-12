@@ -112,10 +112,11 @@ def run_qa_mode(question: str, kb: "KnowledgeBase", qa_history: list = None):
     # 規格類問題走嚴格模式 - 與一般模式行為一致
     if kb and kb.loaded and should_use_strict_mode(clean_q, knowledge_ctx) and knowledge_ctx:
         print("[STRICT] 規格類問題，啟用嚴格模式\n")
-        # QA 模式沒有專案路徑，base_ctx 只放圖片 OCR
-        base_ctx = img_ctx if img_ctx else ""
-        # binary_ctx：優先使用 file_ctx 中的 binary 部分，否則用舊語法的 bin_ctx
-        binary_ctx = file_ctx if file_meta.get("has_binary", False) else bin_ctx
+        # QA 模式沒有專案路徑，base_ctx 放所有圖片 OCR（file: 和 img: 都要）
+        all_img_ctx = file_meta.get("image_ctx", "") + img_ctx
+        base_ctx = all_img_ctx if all_img_ctx else ""
+        # binary_ctx：優先使用 file: 的 binary 部分，否則用舊語法的 bin_ctx
+        binary_ctx = file_meta.get("binary_ctx", "") or bin_ctx
         result = answer_with_self_check(clean_q, base_ctx, knowledge_ctx, binary_ctx=binary_ctx)
     else:
         # 一般問答：建構 prompt
@@ -427,12 +428,11 @@ def main():
         # 向後相容：處理舊的 img:/bin:/elf: 語法
         clean_q, img_ctx = process_images(clean_q)
         clean_q, bin_ctx = process_binary(clean_q)
-        # 保留 bin_ctx 獨立，以便 strict mode 的 answer_with_self_check 能正確處理 BIN/ELF
-        media_ctx = file_ctx + img_ctx + bin_ctx  # 非 strict 模式使用的合併上下文
-        # 判斷是否有 binary（file: 或舊語法都算）- 用於 answer_with_self_check
-        has_binary_from_file = file_meta.get("has_binary", False)
-        # 合併 binary_ctx：優先使用 file_ctx 中的 binary 部分，否則用舊語法的 bin_ctx
-        binary_ctx = file_ctx if has_binary_from_file else bin_ctx
+        # 合併上下文（非 strict 模式使用）
+        media_ctx = file_ctx + img_ctx + bin_ctx
+        # 獨立的圖片和 binary 上下文（strict mode 使用，避免混淆）
+        all_img_ctx = file_meta.get("image_ctx", "") + img_ctx  # file: 和 img: 的圖片都要
+        binary_ctx = file_meta.get("binary_ctx", "") or bin_ctx  # 優先 file:，否則用舊語法
         print("[KB] 查詢知識庫...")
         knowledge_ctx, knowledge_display, kb_metadata = kb.query(clean_q) if kb.loaded else ("", "", {})
 
@@ -468,8 +468,9 @@ def main():
         # GPT建議：規格題優先走嚴格模式，避免 Agent 多讀 code 來「補想像」
         if should_use_strict_mode(clean_q, knowledge_ctx) and knowledge_ctx:
             print("[STRICT] 規格類問題，直接走嚴格模式\n")
-            # base_ctx 只放圖片 OCR，binary_ctx 獨立傳入讓 strict 自檢能正確處理 BIN/ELF 優先級
-            base_ctx = f"專案路徑: {folder}\n{img_ctx}" if img_ctx else f"專案路徑: {folder}"
+            # base_ctx 放專案路徑 + 所有圖片 OCR（file: 和 img: 都要）
+            # binary_ctx 獨立傳入讓 strict 自檢能正確處理 BIN/ELF 優先級
+            base_ctx = f"專案路徑: {folder}\n{all_img_ctx}" if all_img_ctx else f"專案路徑: {folder}"
             result = answer_with_self_check(clean_q, base_ctx, knowledge_ctx, binary_ctx=binary_ctx)
         elif mode == "full":
             result = analyze_full(ctx, clean_q, media_ctx, knowledge_ctx)
@@ -532,12 +533,11 @@ def main():
             # 向後相容：處理舊的 img:/bin:/elf: 語法
             clean_q, img_ctx = process_images(clean_q)
             clean_q, bin_ctx = process_binary(clean_q)
-            # 保留 binary_ctx 獨立，以便 strict mode 的 answer_with_self_check 能正確處理 BIN/ELF
-            media_ctx = file_ctx + img_ctx + bin_ctx  # 非 strict 模式使用的合併上下文
-            # 判斷是否有 binary（file: 或舊語法都算）- 用於 answer_with_self_check
-            has_binary_from_file = file_meta.get("has_binary", False)
-            # 合併 binary_ctx：優先使用 file_ctx 中的 binary 部分，否則用舊語法的 bin_ctx
-            binary_ctx = file_ctx if has_binary_from_file else bin_ctx
+            # 合併上下文（非 strict 模式使用）
+            media_ctx = file_ctx + img_ctx + bin_ctx
+            # 獨立的圖片和 binary 上下文（strict mode 使用，避免混淆）
+            all_img_ctx = file_meta.get("image_ctx", "") + img_ctx  # file: 和 img: 的圖片都要
+            binary_ctx = file_meta.get("binary_ctx", "") or bin_ctx  # 優先 file:，否則用舊語法
 
             # 構建 RAG 查詢
             if qa_history and kb.loaded:
@@ -602,8 +602,9 @@ def main():
             # GPT建議：規格題優先走嚴格模式，避免 Agent 多讀 code 來「補想像」
             if should_use_strict_mode(clean_q, knowledge_ctx) and knowledge_ctx and not is_followup:
                 print("[STRICT] 規格類問題，直接走嚴格模式\n")
-                # base_ctx 只放圖片 OCR，binary_ctx 獨立傳入讓 strict 自檢能正確處理 BIN/ELF 優先級
-                base_ctx = f"專案路徑: {folder}\n{img_ctx}" if img_ctx else f"專案路徑: {folder}"
+                # base_ctx 放專案路徑 + 所有圖片 OCR（file: 和 img: 都要）
+                # binary_ctx 獨立傳入讓 strict 自檢能正確處理 BIN/ELF 優先級
+                base_ctx = f"專案路徑: {folder}\n{all_img_ctx}" if all_img_ctx else f"專案路徑: {folder}"
                 result = answer_with_self_check(clean_q, base_ctx, knowledge_ctx, binary_ctx=binary_ctx)
             elif mode == "full":
                 result = analyze_full(ctx, clean_q, media_ctx, knowledge_ctx)

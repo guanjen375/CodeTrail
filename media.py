@@ -672,9 +672,10 @@ def read_elf(path: str, max_sections: int = 40, max_funcs: int = 30,
         max_objs: 最多顯示的 object 數量
         max_strings: 最多顯示的高優先字串數量
     """
-    # 允許 ELF 和 BIN 副檔名（因為 .bin 可能是 ELF）
-    allowed = ELF_EXTENSIONS | BINARY_EXTENSIONS
-    p = _safe_path(path, allow_external=True, allowed_extensions=allowed)
+    # 外部檔案不限制副檔名（process_file 已做 header sniffing）
+    # sandbox 內檔案才檢查白名單（ELF + BIN，因為 .bin 可能是 ELF）
+    allowed_ext = None if _ALLOW_EXTERNAL else (ELF_EXTENSIONS | BINARY_EXTENSIONS)
+    p = _safe_path(path, allow_external=True, allowed_extensions=allowed_ext)
 
     if p is None:
         if _ALLOW_EXTERNAL:
@@ -705,12 +706,18 @@ def read_binary(path: str, max_strings: int = 200) -> str:
     """讀取二進位檔案並轉換為可分析格式
 
     使用純 Python 掃描字串（含 offset），若偵測到 ELF magic 會自動切換到 ELF 解析
+
+    注意：外部檔案（_ALLOW_EXTERNAL=True）不檢查副檔名，因為 process_file() 已經
+    用 magic header 做了類型判斷。這讓未知副檔名的檔案（如 firmware 無副檔名）也能分析。
     """
-    p = _safe_path(path, allow_external=True, allowed_extensions=BINARY_EXTENSIONS)
+    # 外部檔案不限制副檔名（process_file 已做 header sniffing）
+    # sandbox 內檔案才檢查白名單
+    allowed_ext = None if _ALLOW_EXTERNAL else BINARY_EXTENSIONS
+    p = _safe_path(path, allow_external=True, allowed_extensions=allowed_ext)
 
     if p is None:
         if _ALLOW_EXTERNAL:
-            return f"[BIN 錯誤] 檔案不存在或不是支援的二進位格式: {path}"
+            return f"[BIN 錯誤] 檔案不存在: {path}"
         else:
             return f"[BIN 錯誤] 路徑不在允許範圍內或檔案不存在: {path}"
 
@@ -1003,11 +1010,13 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str, dict]:
         max_images: 每輪最多處理的圖片數量（二進位檔只處理第一個）
 
     Returns:
-        (清理後的文字, 上下文字串, metadata)
+        (清理後的文字, 合併上下文字串, metadata)
         metadata 包含：
         - has_binary: bool - 是否有處理 BIN/ELF 檔案
         - has_image: bool - 是否有處理圖片
         - binary_type: str|None - 'bin' 或 'elf' 或 None
+        - image_ctx: str - 圖片 OCR 上下文（獨立，供 strict mode 使用）
+        - binary_ctx: str - BIN/ELF 上下文（獨立，供 strict mode 使用）
     """
     # 匹配 file: 後面跟著：
     # 1. 雙引號包圍的路徑 "..."
@@ -1019,7 +1028,10 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str, dict]:
     )
     matches = list(pattern.finditer(text))
 
-    empty_metadata = {"has_binary": False, "has_image": False, "binary_type": None}
+    empty_metadata = {
+        "has_binary": False, "has_image": False, "binary_type": None,
+        "image_ctx": "", "binary_ctx": ""
+    }
     if not matches:
         return text, "", empty_metadata
 
@@ -1067,6 +1079,8 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str, dict]:
 
     ctx_parts: List[str] = []
     processed_binary_type: Optional[str] = None  # 記錄處理的 binary 類型
+    file_image_ctx = ""  # 獨立的圖片 OCR 上下文
+    file_binary_ctx = ""  # 獨立的 BIN/ELF 上下文
 
     # 處理圖片
     if image_files:
@@ -1075,11 +1089,11 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str, dict]:
             print(f"[WARN] 偵測到 {len(image_files)} 個圖片，為避免超出 context，只處理前 {max_images} 個")
             print(f"       已忽略: {', '.join(others[:3])}" + (f" ... 等 {len(others)} 個" if len(others) > 3 else ""))
 
-        img_ctx = "\n附加圖片:\n"
+        file_image_ctx = "\n附加圖片:\n"
         for path in image_files[:max_images]:
             print(f"[IMG] OCR: {path}")
-            img_ctx += f"\n[{path}]:\n{ocr_image(path)}\n"
-        ctx_parts.append(img_ctx)
+            file_image_ctx += f"\n[{path}]:\n{ocr_image(path)}\n"
+        ctx_parts.append(file_image_ctx)
 
     # 處理二進位/ELF（只取第一個）
     if binary_files:
@@ -1104,14 +1118,16 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str, dict]:
         if len(binary_files) > 1:
             warn_msg = f"\n[WARN] 本輪只分析第一個檔案，已忽略其他 {len(binary_files) - 1} 個\n"
 
-        bin_ctx = _build_binary_context(tag, content, warn_msg)
-        ctx_parts.append(bin_ctx)
+        file_binary_ctx = _build_binary_context(tag, content, warn_msg)
+        ctx_parts.append(file_binary_ctx)
 
-    # 建立 metadata
+    # 建立 metadata（包含獨立的 image_ctx 和 binary_ctx 供 strict mode 使用）
     metadata = {
         "has_binary": processed_binary_type is not None,
         "has_image": len(image_files) > 0,
-        "binary_type": processed_binary_type
+        "binary_type": processed_binary_type,
+        "image_ctx": file_image_ctx,    # 獨立的圖片 OCR（供 strict mode 的 base_ctx）
+        "binary_ctx": file_binary_ctx   # 獨立的 BIN/ELF（供 strict mode 的 binary_ctx）
     }
 
     return clean, "\n".join(ctx_parts), metadata
