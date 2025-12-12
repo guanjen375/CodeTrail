@@ -33,6 +33,20 @@ python main.py /path/to/untrusted --run-tests --container
 
 # 分析 GitHub repo
 python main.py --web https://github.com/user/repo
+
+# === 不需要專案的快速問答 ===
+
+# QA 模式：不掃專案，直接問答（適合解釋錯誤、一般問題）
+python main.py --qa "這個 compile error 是啥意思: undefined reference to 'foo'"
+
+# QA 模式 + 知識庫
+python main.py --qa --kb=docs.json "根據文件，這個 API 怎麼用？"
+
+# QA 模式 + 圖片分析
+python main.py --qa "img:/path/to/error.png 這個錯誤怎麼解？"
+
+# QA 模式 + 二進位分析
+python main.py --qa "bin:/path/to/firmware.bin 這個韌體的 magic number 是什麼？"
 ```
 
 **重要提示**：
@@ -77,6 +91,7 @@ python main.py [專案路徑] [問題] [選項]
 
 | 參數 | 說明 |
 |------|------|
+| `--qa` | QA 模式：不掃專案、不建 Code RAG，直接問答（適合解釋錯誤、一般問題） |
 | `--full` | 強制完整模式（一次讀入所有程式碼，適合小專案 < 200KB） |
 | `--agent` | 強制 Agent 模式（動態探索，適合大專案） |
 | `--web URL` | 網頁模式，分析 GitHub/GitLab 上的公開 repo |
@@ -118,7 +133,35 @@ python main.py [專案路徑] [問題] [選項]
 
 ## 主要功能
 
-### 1. 知識庫 RAG
+### 1. QA 模式（--qa）
+
+不掃描專案、不建立 Code RAG，直接進行問答。適合：
+
+- 解釋 compile error / runtime error
+- 一般程式設計問題
+- 搭配圖片 OCR 分析錯誤截圖
+- 搭配知識庫查詢文件
+
+```bash
+# 解釋編譯錯誤
+python main.py --qa "這個 error 是什麼意思: expected ';' before '}' token"
+
+# 搭配知識庫
+python main.py --qa --kb=api_docs.json "這個 API 的 timeout 預設值是多少？"
+
+# 分析錯誤截圖
+python main.py --qa "img:/path/to/build_error.png 這個編譯錯誤怎麼修？"
+
+# 分析 core dump
+python main.py --qa "bin:/path/to/core 這個 core dump 是什麼問題？"
+```
+
+**優點**：
+- 啟動快（不掃專案目錄）
+- 不需要準備專案資料夾
+- 仍保留圖片 OCR、bin 分析、知識庫查詢等功能
+
+### 2. 知識庫 RAG（--kb）
 
 整合技術文件（PDF/Markdown），回答時自動引用文件來源：
 
@@ -132,7 +175,7 @@ python main.py . --kb=output.json
 # 回答會標註：根據 REF1（API_Manual.pdf 第 15 頁）...
 ```
 
-### 2. 二進位/ELF 分析
+### 3. 二進位/ELF 分析
 
 分析韌體、執行檔等二進位檔案：
 
@@ -153,7 +196,7 @@ python main.py . --allow-external
 - Symbols（Top N functions/objects）
 - .comment（編譯器資訊）
 
-### 3. 圖片 OCR
+### 4. 圖片 OCR
 
 辨識截圖中的錯誤訊息：
 
@@ -164,7 +207,7 @@ python main.py . --allow-external
 
 支援格式：`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`
 
-### 4. 嚴格模式（自動啟用）
+### 5. 嚴格模式（自動啟用）
 
 當問題涉及規格/文件內容時，自動啟用兩階段自我檢查：
 
@@ -173,7 +216,7 @@ python main.py . --allow-external
 
 觸發關鍵字：`規格`、`spec`、`manual`、`根據文件`、`最大值`、`限制` 等
 
-### 5. 改碼閉環（需 --patch）
+### 6. 改碼閉環（需 --patch）
 
 ```bash
 python main.py . --patch
@@ -186,7 +229,7 @@ python main.py . --patch
 - `git_status`/`git_diff`：查看變更
 - `run_lint`：自動格式化
 
-### 6. 測試執行（需 --run-tests）
+### 7. 測試執行（需 --run-tests）
 
 ```bash
 python main.py . --run-tests
@@ -200,7 +243,7 @@ python main.py . --run-tests
 - Rust: `cargo test`
 - Go: `go test`
 
-### 7. 容器化執行（需 --container）
+### 8. 容器化執行（需 --container）
 
 在 Docker/Podman 中安全執行，適合分析不信任的專案：
 

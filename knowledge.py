@@ -850,16 +850,28 @@ class KnowledgeBase:
         has_spec = any(chunk.get('type') == 'spec' for chunk in merged_chunks)
         has_warning = any(chunk.get('type') == 'warning' for chunk in merged_chunks)
 
+        # 修正：用「最終被選中的 chunks」重新計算 top_emb_score
+        # 避免 candidates[0] 被過濾/rerank 後，仍用它的低分來決定信心度
+        # 這會導致「有好 REF 卻被誤判為低信心而跳過」
+        q_emb_for_score = self._get_embedding(question) if not USE_MMR else q_emb
+        used_emb_scores = []
+        for c in merged_chunks:
+            c_emb = c.get("embedding", [])
+            if c_emb and q_emb_for_score:
+                used_emb_scores.append(self._cosine_similarity(q_emb_for_score, c_emb))
+        top_emb_score_used = max(used_emb_scores) if used_emb_scores else top_emb_score
+
         # GPT建議：在 REF header 加入信心分數提示，讓 LLM 了解參考資料的可靠度
+        # 使用修正後的 top_emb_score_used
         confidence_label = ""
-        if top_emb_score >= 0.6:
+        if top_emb_score_used >= 0.6:
             confidence_label = "高信心"
-        elif top_emb_score >= 0.4:
+        elif top_emb_score_used >= 0.4:
             confidence_label = "中信心"
         else:
             confidence_label = "低信心"
 
-        model_lines = [f"[REF] 相關知識參考（信心度: {confidence_label}, score={top_emb_score:.2f}）:"]
+        model_lines = [f"[REF] 相關知識參考（信心度: {confidence_label}, score={top_emb_score_used:.2f}）:"]
         model_lines.append(f"※ 信心度說明：高信心(≥0.6)資料可直接引用，中信心(0.4-0.6)請謹慎使用，低信心(<0.4)僅供參考")
 
         for i, chunk in enumerate(merged_chunks, 1):
@@ -925,17 +937,31 @@ class KnowledgeBase:
 
         # 回傳 metadata 供上層判斷 REF 強度
         # 改進：分別回傳 embedding score 和 keyword score，讓 spec 題拒答只看 embedding
-        top_emb_score = candidates[0][1] if candidates else 0.0  # (combined, emb, kw, chunk)
+        # 修正：top_emb_score 改用「最終被選中的 chunks」的最高分，而非 candidates[0]
+        # 這避免了「candidates[0] 被過濾掉，但 top_emb_score 仍用它的低分」的問題
         top_kw_score = candidates[0][2] if candidates else 0.0
         has_spec_chunk = any(chunk.get('type') == 'spec' for chunk in merged_chunks)
 
+        # 新增：回傳 refs 清單供 data_flywheel / eval 使用
+        # 這讓匯出的資料能記錄「用了哪些 REF」，方便訓練和回歸比較
+        refs = [
+            {
+                "source": c.get("source", ""),
+                "page": c.get("page", 0),
+                "type": c.get("type", "doc"),
+                "section": c.get("section", "")
+            }
+            for c in merged_chunks
+        ]
+
         metadata = {
             "has_ref": len(merged_chunks) > 0,
-            "top_score": top_score,           # combined score（向後相容）
-            "top_emb_score": top_emb_score,   # 純 embedding score
-            "top_kw_score": top_kw_score,     # 純 keyword score
-            "has_spec_chunk": has_spec_chunk, # 是否命中 spec 類型的 chunk
-            "ref_count": len(merged_chunks)
+            "top_score": top_score,               # combined score（向後相容）
+            "top_emb_score": top_emb_score_used,  # 修正：用最終選中 chunks 的最高 emb score
+            "top_kw_score": top_kw_score,         # 純 keyword score
+            "has_spec_chunk": has_spec_chunk,     # 是否命中 spec 類型的 chunk
+            "ref_count": len(merged_chunks),
+            "refs": refs                          # 新增：實際引用的 REF 清單
         }
 
         return model_output, display_output, metadata

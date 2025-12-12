@@ -36,7 +36,7 @@ from config import (
     CODE_RAG_ENABLED, IGNORED_DIRS, IGNORED_PATTERNS,
     SKIP_LOW_CONFIDENCE_KB, LOW_CONFIDENCE_KB_THRESHOLD
 )
-from utils import check_ollama_gpu, scan_project_metadata, scan_project, should_refuse_answer, should_use_strict_mode, answer_with_self_check
+from utils import check_ollama_gpu, scan_project_metadata, scan_project, should_refuse_answer, should_use_strict_mode, answer_with_self_check, call_llm_stream
 from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from context import build_full_context, analyze_full, show_full_stats
@@ -45,6 +45,98 @@ from media import process_images, process_binary, set_sandbox_root
 from http_client import close_session
 from web import fetch_from_url, cleanup_temp_dir
 from data_flywheel import record_interaction, DATA_COLLECT_ENABLED
+
+
+def run_qa_mode(question: str, kb: "KnowledgeBase", allow_external: bool = False):
+    """QA 模式：不掃專案、不建 Code RAG，直接問答
+
+    適用場景：
+    - 解釋 compile error / runtime error
+    - 一般程式設計問題
+    - 搭配 img:/bin: 分析外部檔案
+    - 搭配知識庫查詢
+
+    Args:
+        question: 使用者問題（可包含 img:/bin: 標記）
+        kb: 知識庫實例（可選）
+        allow_external: 是否允許讀取外部檔案
+    """
+    from config import get_answer_rules
+
+    # 設定 media.py 的 sandbox（QA 模式允許讀取任意路徑的圖片/bin）
+    set_sandbox_root(".", allow_external=True)
+
+    # 處理圖片和 bin 檔案
+    clean_q, img_ctx = process_images(question)
+    clean_q, bin_ctx = process_binary(clean_q)
+    media_ctx = img_ctx + bin_ctx
+
+    # 查詢知識庫
+    knowledge_ctx = ""
+    knowledge_display = ""
+    kb_metadata = {}
+    if kb and kb.loaded:
+        print("[KB] 查詢知識庫...")
+        knowledge_ctx, knowledge_display, kb_metadata = kb.query(clean_q)
+
+        # 跳過低信心度的 KB context
+        if SKIP_LOW_CONFIDENCE_KB and knowledge_ctx:
+            top_emb_score = kb_metadata.get("top_emb_score", kb_metadata.get("top_score", 0.0))
+            if top_emb_score < LOW_CONFIDENCE_KB_THRESHOLD:
+                print(f"[KB] 跳過低信心度上下文 (emb_score={top_emb_score:.2f} < {LOW_CONFIDENCE_KB_THRESHOLD})")
+                knowledge_ctx = ""
+                knowledge_display = ""
+
+    if knowledge_display:
+        print(knowledge_display)
+
+    # 建構 prompt
+    has_binary = bool(bin_ctx)
+    answer_rules = get_answer_rules(has_binary)
+
+    prompt_parts = [
+        "你是一個專業的程式設計助手。請根據以下資訊回答使用者的問題。",
+        "",
+        answer_rules,
+    ]
+
+    if media_ctx:
+        prompt_parts.append("")
+        prompt_parts.append("=== 附加資訊 ===")
+        prompt_parts.append(media_ctx)
+
+    if knowledge_ctx:
+        prompt_parts.append("")
+        prompt_parts.append("=== 知識庫參考 ===")
+        prompt_parts.append(knowledge_ctx)
+
+    prompt_parts.append("")
+    prompt_parts.append(f"使用者問題：{clean_q}")
+    prompt_parts.append("")
+    prompt_parts.append("請用繁體中文回答：")
+
+    prompt = "\n".join(prompt_parts)
+
+    print("\n" + "=" * 50)
+    print("[NOTE] 回答:\n")
+
+    result = call_llm_stream(prompt, temperature=0.3)
+
+    # 資料飛輪：記錄互動
+    if DATA_COLLECT_ENABLED:
+        refs = kb_metadata.get('refs', []) if kb_metadata else []
+        record_interaction(
+            question=clean_q,
+            answer=result,
+            refs=refs,
+            code_snippets=[],
+            metadata={'mode': 'qa', 'kb_top_score': kb_metadata.get('top_score', 0)},
+            folder=None,
+            tool_calls=None,
+            files_read=None
+        )
+
+    return result
 
 
 def main():
@@ -63,11 +155,14 @@ def main():
     allow_external = False
     web_url = None  # 網頁模式 URL
     temp_dir = None  # 網頁模式暫存目錄
+    qa_mode = False  # QA 模式：不掃專案、不建 Code RAG，直接問答
 
     i = 0
     while i < len(args):
         arg = args[i]
-        if arg == "--agent":
+        if arg in ("--qa", "--no-project"):
+            qa_mode = True
+        elif arg == "--agent":
             force_mode = "agent"
         elif arg == "--full":
             force_mode = "full"
@@ -101,6 +196,12 @@ def main():
             include_dirs.append(arg.split("=", 1)[1])
         elif arg.startswith("-"):
             pass
+        elif qa_mode:
+            # QA 模式下，非 flag 參數都視為問題（可以有空格）
+            if question is None:
+                question = arg
+            else:
+                question = question + " " + arg
         elif web_url is None and folder == ".":
             folder = arg
         elif web_url is None:
@@ -140,6 +241,39 @@ def main():
         else:
             print(f"[WARN] 容器不可用: {msg}")
             print("[WARN] 將使用普通模式執行")
+
+    # ============================================================
+    # QA 模式：快速路徑，不掃專案、不建 Code RAG
+    # ============================================================
+    if qa_mode:
+        print("=" * 50)
+        print("[MODE] QA 模式 (--qa)")
+        print("=" * 50)
+
+        if not question:
+            print("[ERROR] QA 模式需要提供問題")
+            print("用法: python main.py --qa \"你的問題\"")
+            print("範例: python main.py --qa \"這個 compile error 是啥意思: undefined reference to 'foo'\"")
+            print("      python main.py --qa --kb=my_kb.json \"根據文件，這個 API 怎麼用？\"")
+            print("      python main.py --qa \"img:/path/to/screenshot.png 這個錯誤怎麼解？\"")
+            sys.exit(1)
+
+        # 檢查 GPU
+        gpu_ok, gpu_status = check_ollama_gpu()
+        print(f"[AI] 模型: {MODEL}")
+        print(f"[CTX] Context: {NUM_CTX:,} tokens")
+        print(gpu_status)
+
+        # 載入知識庫（可選）
+        kb = KnowledgeBase(kb_path)
+        if kb.loaded:
+            print(kb.get_status())
+
+        print("-" * 50)
+
+        # 執行 QA 模式
+        run_qa_mode(question, kb, allow_external=True)
+        return None  # QA 模式不需要清理 temp_dir
 
     # 網頁模式：從 Git URL 下載程式碼
     if web_url:

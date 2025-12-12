@@ -46,7 +46,13 @@ import ollama
 # ============================================================
 # 設定
 # ============================================================
-EMBEDDING_MODEL = "bge-m3"  # Ollama embedding 模型
+# 改進：從 config.py 統一匯入 EMBEDDING_MODEL，避免兩處定義不一致
+# 這樣換 embedding model 時只需改 config.py 一處
+try:
+    from config import EMBEDDING_MODEL
+except ImportError:
+    EMBEDDING_MODEL = "bge-m3"  # Fallback：獨立執行時的預設值
+
 CHUNK_SIZE = 1200           # 每個 chunk 的最大字元數（增加以保留完整指令）
 
 # 支援的檔案類型
