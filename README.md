@@ -17,13 +17,9 @@ python main.py . --patch
 # Debug + 跑測試驗證
 python main.py . --patch --run-tests
 
-# 分析韌體/二進位檔案（需 --allow-external）
-python main.py . --allow-external
->>> bin:/path/to/firmware.bin 這個韌體版本是什麼？
-
-# 分析錯誤截圖
-python main.py . --allow-external
->>> img:/path/to/error.png 這個錯誤怎麼解？
+# 分析圖片/韌體/二進位檔案
+python main.py .
+>>> file:/path/to/file 這個韌體版本是什麼？
 
 # 分析不信任的外部專案（容器隔離）
 python main.py /path/to/untrusted --run-tests --container
@@ -96,42 +92,35 @@ python main.py [專案路徑] [問題] [選項]
 
 | 參數 | 說明 |
 |------|------|
-| `--allow-external` | 允許讀取專案目錄外的圖片、bin、elf 檔案 |
 | `--run-tests` | 啟用測試執行工具（pytest, cargo test 等） |
 | `--patch` | 啟用改碼工具（apply_patch, git_status, git_diff） |
 | `--container` | 在 Docker/Podman 容器中安全執行測試 |
 
-### 特殊前綴語法
+### 檔案分析（file:）
 
-在問題中使用特殊前綴可以分析外部檔案：
+使用 `file:` 前綴分析檔案，系統自動偵測類型並處理：
 
-| 前綴 | 用途 | 範例 |
-|------|------|------|
-| `img:路徑` | 圖片 OCR | `img:/path/to/error.png 這個錯誤怎麼解？` |
-| `bin:路徑` | 二進位分析 | `bin:/path/to/firmware.bin 版本號是什麼？` |
-| `elf:路徑` | ELF 檔案解析 | `elf:/path/to/app.elf entry point 在哪？` |
-
-**路徑含空白時使用引號**：
-```
->>> img:"/path with spaces/error.png" 這個錯誤是什麼？
->>> bin:'/my folder/firmware.bin' 幫我分析
+```bash
+>>> file:/path/to/error.png 這個錯誤怎麼解？
+>>> file:/path/to/firmware.bin 版本號是什麼？
+>>> file:/path/to/app.elf entry point 在哪？
 ```
 
-**注意**：讀取專案目錄外的檔案需要 `--allow-external` 參數。
+支援：圖片（OCR）、二進位、ELF 等格式。路徑含空白時用引號包住。詳見[主要功能 - 檔案分析](#3-檔案分析file)。
 
 ## 主要功能
 
 ### 1. QA 模式（--qa）
 
-不掃描專案、不建立 Code RAG，直接進行問答。適合解釋錯誤、一般問題、搭配圖片/bin 分析。
+不掃描專案、不建立 Code RAG，直接進行問答。適合解釋錯誤、一般問題、搭配檔案分析。
 
 ```bash
 python main.py --qa "這個 error 是什麼意思: expected ';' before '}' token"
 python main.py --qa --kb=api_docs.json "這個 API 的 timeout 預設值是多少？"
-python main.py --qa "img:/path/to/build_error.png 這個編譯錯誤怎麼修？"
+python main.py --qa "file:/path/to/build_error.png 這個編譯錯誤怎麼修？"
 ```
 
-**優點**：啟動快、不需專案資料夾、仍保留 img/bin/知識庫功能
+**優點**：啟動快、不需專案資料夾、仍保留 file:/知識庫功能
 
 ### 2. 知識庫 RAG（--kb）
 
@@ -147,39 +136,25 @@ python main.py . --kb=output.json
 # 回答會標註：根據 REF1（API_Manual.pdf 第 15 頁）...
 ```
 
-### 3. 二進位/ELF 分析
+詳細說明請參考 [RAG_README.md](RAG_README.md)。
 
-分析韌體、執行檔等二進位檔案：
+### 3. 檔案分析（file:）
 
-```bash
-python main.py . --allow-external
->>> bin:/path/to/u-boot.bin 這個 U-Boot 的版本？
-```
-
-**分析內容**：
-- Magic 偵測（ELF、uImage、gzip、squashfs 等）
-- Hex dump（前 1KB）
-- 智能字串提取（含 file offset）
-- 版本號、編譯日期等重要資訊優先顯示
-
-**ELF 專屬**（需系統安裝 `readelf`）：
-- ELF Header（Class、Machine、Entry point）
-- Sections（.text、.rodata、.data 等）
-- Symbols（Top N functions/objects）
-- .comment（編譯器資訊）
-
-### 4. 圖片 OCR
-
-辨識截圖中的錯誤訊息：
+使用 `file:` 前綴分析各種檔案，系統自動偵測類型：
 
 ```bash
-python main.py . --allow-external
->>> img:/path/to/error_screenshot.png 這個錯誤怎麼解？
+>>> file:/path/to/error.png 這個錯誤怎麼解？
+>>> file:/path/to/u-boot.bin 這個 U-Boot 的版本？
+>>> file:/path/to/app.elf entry point 在哪？
 ```
 
-支援格式：`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`
+**圖片**：OCR 辨識文字（支援 `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`）
 
-### 5. 嚴格模式（自動啟用）
+**二進位**：Magic 偵測、Hex dump、智能字串提取（含 offset）、版本號優先顯示
+
+**ELF**（需系統安裝 `readelf`）：Header、Sections、Symbols、.comment 編譯器資訊
+
+### 4. 嚴格模式（自動啟用）
 
 當問題涉及規格/文件內容時，自動啟用兩階段自我檢查：
 
@@ -188,7 +163,7 @@ python main.py . --allow-external
 
 觸發關鍵字：`規格`、`spec`、`manual`、`根據文件`、`最大值`、`限制` 等
 
-### 6. 改碼閉環（需 --patch）
+### 5. 改碼閉環（需 --patch）
 
 ```bash
 python main.py . --patch
@@ -201,7 +176,7 @@ python main.py . --patch
 - `git_status`/`git_diff`：查看變更
 - `run_lint`：自動格式化
 
-### 7. 測試執行（需 --run-tests）
+### 6. 測試執行（需 --run-tests）
 
 ```bash
 python main.py . --run-tests
@@ -215,7 +190,7 @@ python main.py . --run-tests
 - Rust: `cargo test`
 - Go: `go test`
 
-### 8. 容器化執行（需 --container）
+### 7. 容器化執行（需 --container）
 
 在 Docker/Podman 中安全執行，適合分析不信任的專案：
 

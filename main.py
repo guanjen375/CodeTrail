@@ -41,35 +41,36 @@ from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from context import build_full_context, analyze_full, show_full_stats
 from agent import run_agent, handle_followup
-from media import process_images, process_binary, set_sandbox_root
+from media import process_images, process_binary, process_file, set_sandbox_root
 from http_client import close_session
 from web import fetch_from_url, cleanup_temp_dir
 from data_flywheel import record_interaction, DATA_COLLECT_ENABLED
 
 
-def run_qa_mode(question: str, kb: "KnowledgeBase", allow_external: bool = False):
+def run_qa_mode(question: str, kb: "KnowledgeBase"):
     """QA 模式：不掃專案、不建 Code RAG，直接問答
 
     適用場景：
     - 解釋 compile error / runtime error
     - 一般程式設計問題
-    - 搭配 img:/bin: 分析外部檔案
+    - 搭配 file: 分析外部檔案（圖片/bin/elf）
     - 搭配知識庫查詢
 
     Args:
-        question: 使用者問題（可包含 img:/bin: 標記）
+        question: 使用者問題（可包含 file: 標記）
         kb: 知識庫實例（可選）
-        allow_external: 是否允許讀取外部檔案
     """
     from config import get_answer_rules
 
     # 設定 media.py 的 sandbox（QA 模式允許讀取任意路徑的圖片/bin）
-    set_sandbox_root(".", allow_external=True)
+    set_sandbox_root(".")
 
-    # 處理圖片和 bin 檔案
-    clean_q, img_ctx = process_images(question)
+    # 處理 file: 統一語法（優先）
+    clean_q, file_ctx = process_file(question)
+    # 向後相容：處理舊的 img:/bin:/elf: 語法
+    clean_q, img_ctx = process_images(clean_q)
     clean_q, bin_ctx = process_binary(clean_q)
-    media_ctx = img_ctx + bin_ctx
+    media_ctx = file_ctx + img_ctx + bin_ctx
 
     # 查詢知識庫
     knowledge_ctx = ""
@@ -152,7 +153,6 @@ def main():
     run_tests = False
     enable_patch = False
     use_container = False
-    allow_external = False
     web_url = None  # 網頁模式 URL
     temp_dir = None  # 網頁模式暫存目錄
     qa_mode = False  # QA 模式：不掃專案、不建 Code RAG，直接問答
@@ -172,8 +172,6 @@ def main():
             enable_patch = True
         elif arg == "--container":
             use_container = True
-        elif arg == "--allow-external":
-            allow_external = True
         elif arg == "--web" and i + 1 < len(args):
             web_url = args[i + 1]
             i += 1
@@ -265,7 +263,7 @@ def main():
 
         # 單輪模式：有問題就回答後結束
         if question:
-            run_qa_mode(question, kb, allow_external=True)
+            run_qa_mode(question, kb)
             return None
 
         # 多輪模式：沒帶問題就進入互動式對話
@@ -281,7 +279,7 @@ def main():
                 if not q:
                     continue
 
-                run_qa_mode(q, kb, allow_external=True)
+                run_qa_mode(q, kb)
                 print()  # 空行分隔
 
             except KeyboardInterrupt:
@@ -311,10 +309,8 @@ def main():
 
     folder = str(Path(folder).resolve())
 
-    # 設定 media.py 的 sandbox root，防止讀取專案目錄外的檔案
-    set_sandbox_root(folder, allow_external=allow_external)
-    if allow_external:
-        print("[CFG] 允許讀取外部圖片和 bin 檔案 (--allow-external)")
+    # 設定 media.py 的 sandbox root
+    set_sandbox_root(folder)
 
     print(f"[DIR] 掃描: {folder}")
     file_metadata = scan_project_metadata(folder)
@@ -381,10 +377,13 @@ def main():
 
     # 單次模式
     if question:
-        clean_q, img_ctx = process_images(question)
+        # 處理 file: 統一語法（優先）
+        clean_q, file_ctx = process_file(question)
+        # 向後相容：處理舊的 img:/bin:/elf: 語法
+        clean_q, img_ctx = process_images(clean_q)
         clean_q, bin_ctx = process_binary(clean_q)
         # 保留 bin_ctx 獨立，以便 strict mode 的 answer_with_self_check 能正確處理 BIN/ELF
-        media_ctx = img_ctx + bin_ctx  # 非 strict 模式使用的合併上下文
+        media_ctx = file_ctx + img_ctx + bin_ctx  # 非 strict 模式使用的合併上下文
         print("[KB] 查詢知識庫...")
         knowledge_ctx, knowledge_display, kb_metadata = kb.query(clean_q) if kb.loaded else ("", "", {})
 
@@ -475,14 +474,17 @@ def main():
 
             if not q:
                 if mode == "empty":
-                    print("[WARN] 專案是空的，請輸入具體問題或使用 img:/bin: 分析外部檔案")
+                    print("[WARN] 專案是空的，請輸入具體問題或使用 file: 分析外部檔案")
                     continue
                 q = "請分析這個專案的整體架構和主要功能"
 
-            clean_q, img_ctx = process_images(q)
+            # 處理 file: 統一語法（優先）
+            clean_q, file_ctx = process_file(q)
+            # 向後相容：處理舊的 img:/bin:/elf: 語法
+            clean_q, img_ctx = process_images(clean_q)
             clean_q, bin_ctx = process_binary(clean_q)
             # 保留 bin_ctx 獨立，以便 strict mode 的 answer_with_self_check 能正確處理 BIN/ELF
-            media_ctx = img_ctx + bin_ctx  # 非 strict 模式使用的合併上下文
+            media_ctx = file_ctx + img_ctx + bin_ctx  # 非 strict 模式使用的合併上下文
 
             # 構建 RAG 查詢
             if qa_history and kb.loaded:

@@ -157,19 +157,22 @@ ollama pull qllama/bge-reranker-v2-m3
 
 ```python
 # 知識庫設定
-KNOWLEDGE_FILE = "knowledge.json"      # 預設知識庫檔案
+KNOWLEDGE_FILE = "knowledge.json"       # 預設知識庫檔案
 KNOWLEDGE_TOP_K = 5                     # 返回的參考數量
 KNOWLEDGE_THRESHOLD = 0.30              # 相關度門檻
 
 # 嚴格模式
 STRICT_MODE = True                      # 是否啟用嚴格模式
 WEAK_REF_THRESHOLD = 0.35               # REF 太弱時拒答的門檻
+SKIP_LOW_CONFIDENCE_KB = True           # 低信心度時不注入 KB context
+LOW_CONFIDENCE_KB_THRESHOLD = 0.30      # 低信心度門檻
 
 # 搜尋優化
 USE_RERANKER = True                     # 啟用 Reranker
 USE_HYBRID_SEARCH = True                # 啟用混合搜尋
 USE_QUERY_EXPANSION = True              # 啟用 Query Expansion
 USE_MMR = True                          # 啟用 MMR 多樣性選擇
+MMR_LAMBDA = 0.7                        # MMR 多樣性權重（0=多樣 1=相關）
 ```
 
 ## 知識庫檔案格式

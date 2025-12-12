@@ -56,15 +56,15 @@ _PRINTABLE_CHARS = set(
 
 # 全域 sandbox root（由 main.py 設定）
 _SANDBOX_ROOT: Optional[Path] = None
-_ALLOW_EXTERNAL: bool = False
+_ALLOW_EXTERNAL: bool = True  # 預設允許外部檔案（大部分使用場景都是外部路徑）
 
 
-def set_sandbox_root(root: str, allow_external: bool = False) -> None:
+def set_sandbox_root(root: str, allow_external: bool = True) -> None:
     """設定 sandbox 根目錄，只允許讀取此目錄內的檔案
 
     Args:
         root: sandbox 根目錄
-        allow_external: 是否允許讀取外部的圖片和 bin 檔案（預設 False）
+        allow_external: 是否允許讀取外部的圖片和 bin 檔案（預設 True）
     """
     global _SANDBOX_ROOT, _ALLOW_EXTERNAL
     _SANDBOX_ROOT = Path(root).resolve()
@@ -843,10 +843,12 @@ def process_binary(text: str) -> tuple[str, str]:
     """處理文字中的二進位/ELF 檔案引用
 
     支援：
-    - elf:/path/to/file.elf - ELF 解析
+    - elf:/path/to/file.elf - ELF 解析（舊語法，向後相容）
     - bin:/path/to/file.bin - 二進位解析（自動偵測 ELF）
     - elf:"/path with spaces/file.elf" - 帶引號的路徑（支援空白）
     - bin:'path with spaces/file.bin' - 單引號也支援
+
+    注意：建議使用新的 file: 統一語法，見 process_file()
 
     規則：每輪只分析第一個，避免 context 爆掉
     """
@@ -920,9 +922,11 @@ def process_images(text: str, max_images: int = 3) -> tuple[str, str]:
     """處理文字中的圖片引用
 
     支援：
-    - img:/path/to/image.png - 標準路徑
+    - img:/path/to/image.png - 標準路徑（舊語法，向後相容）
     - img:"/path with spaces/image.png" - 帶雙引號的路徑（支援空白）
     - img:'path with spaces/image.png' - 帶單引號的路徑
+
+    注意：建議使用新的 file: 統一語法，見 process_file()
 
     Args:
         text: 輸入文字
@@ -963,3 +967,137 @@ def process_images(text: str, max_images: int = 3) -> tuple[str, str]:
         ctx += f"\n[{path}]:\n{ocr_image(path)}\n"
 
     return clean, ctx
+
+
+def process_file(text: str, max_images: int = 3) -> tuple[str, str]:
+    """統一處理文字中的 file: 檔案引用（自動偵測檔案類型）
+
+    支援：
+    - file:/path/to/image.png - 圖片 OCR（png/jpg/jpeg/gif/webp）
+    - file:/path/to/firmware.bin - 二進位分析（bin/dat/raw/fw/img/rom/hex）
+    - file:/path/to/app.elf - ELF 解析（elf/so/o/axf/out/ko）
+    - file:"/path with spaces/file.bin" - 帶引號的路徑（支援空白）
+    - file:'path with spaces/file.png' - 單引號也支援
+
+    自動偵測規則（優先級）：
+    1. 副檔名符合圖片格式 → OCR
+    2. 副檔名符合 ELF 格式 或 檔案開頭是 ELF magic → ELF 解析
+    3. 其他 → 二進位分析
+
+    Args:
+        text: 輸入文字
+        max_images: 每輪最多處理的圖片數量（二進位檔只處理第一個）
+
+    Returns:
+        (清理後的文字, 上下文字串)
+    """
+    # 匹配 file: 後面跟著：
+    # 1. 雙引號包圍的路徑 "..."
+    # 2. 單引號包圍的路徑 '...'
+    # 3. 無空白的路徑
+    pattern = re.compile(
+        r'file:(?:"([^"]+)"|\'([^\']+)\'|([^\s]+))',
+        flags=re.IGNORECASE
+    )
+    matches = list(pattern.finditer(text))
+
+    if not matches:
+        return text, ""
+
+    # 清除所有 file: 標記
+    clean = pattern.sub("", text).strip()
+
+    def extract_path(m) -> str:
+        """從 match 中提取路徑"""
+        return m.group(1) or m.group(2) or m.group(3) or ""
+
+    # 分類檔案
+    image_files: List[str] = []
+    binary_files: List[Tuple[str, str]] = []  # (path, type: 'bin'|'elf')
+
+    for m in matches:
+        path = extract_path(m)
+        if not path:
+            continue
+
+        suffix = Path(path).suffix.lower()
+
+        if suffix in IMAGE_EXTENSIONS:
+            image_files.append(path)
+        elif suffix in ELF_EXTENSIONS:
+            binary_files.append((path, 'elf'))
+        elif suffix in BINARY_EXTENSIONS:
+            binary_files.append((path, 'bin'))
+        else:
+            # 未知副檔名：嘗試讀取檔頭判斷
+            try:
+                p = Path(path).expanduser()
+                if p.is_file():
+                    with open(p, "rb") as f:
+                        header = f.read(4)
+                    if header.startswith(b"\x7fELF"):
+                        binary_files.append((path, 'elf'))
+                    else:
+                        binary_files.append((path, 'bin'))
+                else:
+                    # 檔案不存在，當作 bin 處理（讓錯誤訊息顯示）
+                    binary_files.append((path, 'bin'))
+            except Exception:
+                binary_files.append((path, 'bin'))
+
+    ctx_parts: List[str] = []
+
+    # 處理圖片
+    if image_files:
+        if len(image_files) > max_images:
+            others = image_files[max_images:]
+            print(f"[WARN] 偵測到 {len(image_files)} 個圖片，為避免超出 context，只處理前 {max_images} 個")
+            print(f"       已忽略: {', '.join(others[:3])}" + (f" ... 等 {len(others)} 個" if len(others) > 3 else ""))
+
+        img_ctx = "\n附加圖片:\n"
+        for path in image_files[:max_images]:
+            print(f"[IMG] OCR: {path}")
+            img_ctx += f"\n[{path}]:\n{ocr_image(path)}\n"
+        ctx_parts.append(img_ctx)
+
+    # 處理二進位/ELF（只取第一個）
+    if binary_files:
+        if len(binary_files) > 1:
+            others = [f"{p}" for p, _ in binary_files[1:]]
+            print(f"[WARN] 偵測到 {len(binary_files)} 個 bin/elf 檔案，為避免超出 context，只分析第一個")
+            print(f"       已忽略: {', '.join(others[:3])}" + (f" ... 等 {len(others)} 個" if len(others) > 3 else ""))
+
+        target, kind = binary_files[0]
+
+        if kind == 'elf':
+            print(f"[ELF] 讀取: {target}")
+            content = read_elf(target)
+            tag = "ELF"
+        else:
+            print(f"[BIN] 讀取: {target}")
+            content = read_binary(target)
+            tag = "BIN"
+
+        warn_msg = ""
+        if len(binary_files) > 1:
+            warn_msg = f"\n[WARN] 本輪只分析第一個檔案，已忽略其他 {len(binary_files) - 1} 個\n"
+
+        bin_ctx = f"""
+╔══════════════════════════════════════════════════════════════╗
+║ ⚠️ [{tag}] 本輪回答的最高優先依據：下方 {tag} 分析結果（含 offset/addr） ║
+╚══════════════════════════════════════════════════════════════╝
+
+【強制規則 - 違反將導致回答錯誤】
+1. 必須先使用下方 [{tag}] 內容判斷與推導
+2. 回答必須明確說明「在 {tag} 中找到…」或「在 {tag} 中沒有找到…」
+3. 重要性排序：{tag} > knowledge.json([REF]) > 程式碼 > 一般文件
+4. 若 {tag} 與程式碼/文件衝突，以 {tag} 為準
+5. 本輪只分析一個檔案（見下方 warning）
+{warn_msg}
+---------------- [{tag}] 解析結果開始 ----------------
+{content}
+---------------- [{tag}] 解析結果結束 ----------------
+"""
+        ctx_parts.append(bin_ctx)
+
+    return clean, "\n".join(ctx_parts)
