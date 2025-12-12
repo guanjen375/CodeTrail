@@ -47,7 +47,7 @@ from web import fetch_from_url, cleanup_temp_dir
 from data_flywheel import record_interaction, DATA_COLLECT_ENABLED
 
 
-def run_qa_mode(question: str, kb: "KnowledgeBase"):
+def run_qa_mode(question: str, kb: "KnowledgeBase", qa_history: list = None):
     """QA 模式：不掃專案、不建 Code RAG，直接問答
 
     適用場景：
@@ -59,6 +59,7 @@ def run_qa_mode(question: str, kb: "KnowledgeBase"):
     Args:
         question: 使用者問題（可包含 file: 標記）
         kb: 知識庫實例（可選）
+        qa_history: 對話歷史 [(question, answer), ...]（可選，用於多輪對話）
     """
     from config import get_answer_rules
 
@@ -66,11 +67,14 @@ def run_qa_mode(question: str, kb: "KnowledgeBase"):
     set_sandbox_root(".")
 
     # 處理 file: 統一語法（優先）
-    clean_q, file_ctx = process_file(question)
+    clean_q, file_ctx, file_meta = process_file(question)
     # 向後相容：處理舊的 img:/bin:/elf: 語法
     clean_q, img_ctx = process_images(clean_q)
     clean_q, bin_ctx = process_binary(clean_q)
     media_ctx = file_ctx + img_ctx + bin_ctx
+
+    # 判斷是否有 binary（file: 或舊語法都算）
+    has_binary = file_meta.get("has_binary", False) or bool(bin_ctx)
 
     # 查詢知識庫
     knowledge_ctx = ""
@@ -91,37 +95,67 @@ def run_qa_mode(question: str, kb: "KnowledgeBase"):
     if knowledge_display:
         print(knowledge_display)
 
-    # 建構 prompt
-    has_binary = bool(bin_ctx)
-    answer_rules = get_answer_rules(has_binary)
-
-    prompt_parts = [
-        "你是一個專業的程式設計助手。請根據以下資訊回答使用者的問題。",
-        "",
-        answer_rules,
-    ]
-
-    if media_ctx:
-        prompt_parts.append("")
-        prompt_parts.append("=== 附加資訊 ===")
-        prompt_parts.append(media_ctx)
-
-    if knowledge_ctx:
-        prompt_parts.append("")
-        prompt_parts.append("=== 知識庫參考 ===")
-        prompt_parts.append(knowledge_ctx)
-
-    prompt_parts.append("")
-    prompt_parts.append(f"使用者問題：{clean_q}")
-    prompt_parts.append("")
-    prompt_parts.append("請用繁體中文回答：")
-
-    prompt = "\n".join(prompt_parts)
+    # 檢查是否應該拒絕回答（spec 問題但 REF 太弱）- 與一般模式行為一致
+    if kb and kb.loaded and should_refuse_answer(clean_q, kb_metadata):
+        print("\n" + "=" * 50)
+        print("[WARN] 回答:\n")
+        print("這是規格/文件類問題，但知識庫中沒有找到足夠相關的參考資料。\n")
+        print("建議：")
+        print("1. 確認知識庫中有包含相關的規格文件")
+        print("2. 嘗試用更具體的關鍵字描述問題")
+        print("3. 若確定要用一般知識回答，請改用不含規格關鍵字的問法")
+        return None
 
     print("\n" + "=" * 50)
     print("[NOTE] 回答:\n")
 
-    result = call_llm_stream(prompt, temperature=0.3)
+    # 規格類問題走嚴格模式 - 與一般模式行為一致
+    if kb and kb.loaded and should_use_strict_mode(clean_q, knowledge_ctx) and knowledge_ctx:
+        print("[STRICT] 規格類問題，啟用嚴格模式\n")
+        # QA 模式沒有專案路徑，base_ctx 只放圖片 OCR
+        base_ctx = img_ctx if img_ctx else ""
+        # binary_ctx：優先使用 file_ctx 中的 binary 部分，否則用舊語法的 bin_ctx
+        binary_ctx = file_ctx if file_meta.get("has_binary", False) else bin_ctx
+        result = answer_with_self_check(clean_q, base_ctx, knowledge_ctx, binary_ctx=binary_ctx)
+    else:
+        # 一般問答：建構 prompt
+        answer_rules = get_answer_rules(has_binary)
+
+        prompt_parts = [
+            "你是一個專業的程式設計助手。請根據以下資訊回答使用者的問題。",
+            "",
+            answer_rules,
+        ]
+
+        # 加入對話歷史（如果有）
+        if qa_history:
+            prompt_parts.append("")
+            prompt_parts.append("=== 對話歷史 ===")
+            for prev_q, prev_a in qa_history[-3:]:  # 只取最近 3 輪
+                # 截斷過長的回答
+                prev_a_short = prev_a[:500] + "..." if len(prev_a) > 500 else prev_a
+                prompt_parts.append(f"使用者：{prev_q}")
+                prompt_parts.append(f"助手：{prev_a_short}")
+                prompt_parts.append("")
+
+        if media_ctx:
+            prompt_parts.append("")
+            prompt_parts.append("=== 附加資訊 ===")
+            prompt_parts.append(media_ctx)
+
+        if knowledge_ctx:
+            prompt_parts.append("")
+            prompt_parts.append("=== 知識庫參考 ===")
+            prompt_parts.append(knowledge_ctx)
+
+        prompt_parts.append("")
+        prompt_parts.append(f"使用者問題：{clean_q}")
+        prompt_parts.append("")
+        prompt_parts.append("請用繁體中文回答：")
+
+        prompt = "\n".join(prompt_parts)
+
+        result = call_llm_stream(prompt, temperature=0.3)
 
     # 資料飛輪：記錄互動
     if DATA_COLLECT_ENABLED:
@@ -267,7 +301,8 @@ def main():
             return None
 
         # 多輪模式：沒帶問題就進入互動式對話
-        print("進入 QA 互動模式（輸入 q 離開）\n")
+        print("進入 QA 互動模式（輸入 q 離開，輸入 clear 清除對話歷史）\n")
+        qa_history = []  # 保存對話上下文 [(question, answer), ...]
         while True:
             try:
                 q = input(">>> ").strip()
@@ -276,10 +311,20 @@ def main():
                     print("[BYE] 再見!")
                     break
 
+                if q.lower() == 'clear':
+                    qa_history.clear()
+                    print("[DEL] 對話歷史已清除")
+                    continue
+
                 if not q:
                     continue
 
-                run_qa_mode(q, kb)
+                result = run_qa_mode(q, kb, qa_history=qa_history)
+                if result:  # 只有成功回答時才加入歷史
+                    qa_history.append((q, result))
+                    # 限制歷史長度，避免 context 過長
+                    if len(qa_history) > 5:
+                        qa_history = qa_history[-5:]
                 print()  # 空行分隔
 
             except KeyboardInterrupt:
@@ -378,12 +423,16 @@ def main():
     # 單次模式
     if question:
         # 處理 file: 統一語法（優先）
-        clean_q, file_ctx = process_file(question)
+        clean_q, file_ctx, file_meta = process_file(question)
         # 向後相容：處理舊的 img:/bin:/elf: 語法
         clean_q, img_ctx = process_images(clean_q)
         clean_q, bin_ctx = process_binary(clean_q)
         # 保留 bin_ctx 獨立，以便 strict mode 的 answer_with_self_check 能正確處理 BIN/ELF
         media_ctx = file_ctx + img_ctx + bin_ctx  # 非 strict 模式使用的合併上下文
+        # 判斷是否有 binary（file: 或舊語法都算）- 用於 answer_with_self_check
+        has_binary_from_file = file_meta.get("has_binary", False)
+        # 合併 binary_ctx：優先使用 file_ctx 中的 binary 部分，否則用舊語法的 bin_ctx
+        binary_ctx = file_ctx if has_binary_from_file else bin_ctx
         print("[KB] 查詢知識庫...")
         knowledge_ctx, knowledge_display, kb_metadata = kb.query(clean_q) if kb.loaded else ("", "", {})
 
@@ -419,9 +468,9 @@ def main():
         # GPT建議：規格題優先走嚴格模式，避免 Agent 多讀 code 來「補想像」
         if should_use_strict_mode(clean_q, knowledge_ctx) and knowledge_ctx:
             print("[STRICT] 規格類問題，直接走嚴格模式\n")
-            # base_ctx 只放圖片 OCR，bin_ctx 獨立傳入讓 strict 自檢能正確處理 BIN/ELF 優先級
+            # base_ctx 只放圖片 OCR，binary_ctx 獨立傳入讓 strict 自檢能正確處理 BIN/ELF 優先級
             base_ctx = f"專案路徑: {folder}\n{img_ctx}" if img_ctx else f"專案路徑: {folder}"
-            result = answer_with_self_check(clean_q, base_ctx, knowledge_ctx, binary_ctx=bin_ctx)
+            result = answer_with_self_check(clean_q, base_ctx, knowledge_ctx, binary_ctx=binary_ctx)
         elif mode == "full":
             result = analyze_full(ctx, clean_q, media_ctx, knowledge_ctx)
         else:
@@ -479,12 +528,16 @@ def main():
                 q = "請分析這個專案的整體架構和主要功能"
 
             # 處理 file: 統一語法（優先）
-            clean_q, file_ctx = process_file(q)
+            clean_q, file_ctx, file_meta = process_file(q)
             # 向後相容：處理舊的 img:/bin:/elf: 語法
             clean_q, img_ctx = process_images(clean_q)
             clean_q, bin_ctx = process_binary(clean_q)
-            # 保留 bin_ctx 獨立，以便 strict mode 的 answer_with_self_check 能正確處理 BIN/ELF
+            # 保留 binary_ctx 獨立，以便 strict mode 的 answer_with_self_check 能正確處理 BIN/ELF
             media_ctx = file_ctx + img_ctx + bin_ctx  # 非 strict 模式使用的合併上下文
+            # 判斷是否有 binary（file: 或舊語法都算）- 用於 answer_with_self_check
+            has_binary_from_file = file_meta.get("has_binary", False)
+            # 合併 binary_ctx：優先使用 file_ctx 中的 binary 部分，否則用舊語法的 bin_ctx
+            binary_ctx = file_ctx if has_binary_from_file else bin_ctx
 
             # 構建 RAG 查詢
             if qa_history and kb.loaded:
@@ -549,9 +602,9 @@ def main():
             # GPT建議：規格題優先走嚴格模式，避免 Agent 多讀 code 來「補想像」
             if should_use_strict_mode(clean_q, knowledge_ctx) and knowledge_ctx and not is_followup:
                 print("[STRICT] 規格類問題，直接走嚴格模式\n")
-                # base_ctx 只放圖片 OCR，bin_ctx 獨立傳入讓 strict 自檢能正確處理 BIN/ELF 優先級
+                # base_ctx 只放圖片 OCR，binary_ctx 獨立傳入讓 strict 自檢能正確處理 BIN/ELF 優先級
                 base_ctx = f"專案路徑: {folder}\n{img_ctx}" if img_ctx else f"專案路徑: {folder}"
-                result = answer_with_self_check(clean_q, base_ctx, knowledge_ctx, binary_ctx=bin_ctx)
+                result = answer_with_self_check(clean_q, base_ctx, knowledge_ctx, binary_ctx=binary_ctx)
             elif mode == "full":
                 result = analyze_full(ctx, clean_q, media_ctx, knowledge_ctx)
             elif is_followup:

@@ -631,7 +631,7 @@ def ocr_image(path: str) -> str:
         if _ALLOW_EXTERNAL:
             return f"[OCR 錯誤] 檔案不存在或不是支援的圖片格式: {path}"
         else:
-            return f"[OCR 錯誤] 路徑不在專案目錄內（使用 --allow-external 允許外部檔案）: {path}"
+            return f"[OCR 錯誤] 路徑不在允許範圍內或檔案不存在: {path}"
 
     if not p.exists():
         return f"[OCR 錯誤] 檔案不存在: {path}"
@@ -680,7 +680,7 @@ def read_elf(path: str, max_sections: int = 40, max_funcs: int = 30,
         if _ALLOW_EXTERNAL:
             return f"[ELF 錯誤] 檔案不存在或不是支援的格式: {path}"
         else:
-            return f"[ELF 錯誤] 路徑不在專案目錄內（使用 --allow-external 允許外部檔案）: {path}"
+            return f"[ELF 錯誤] 路徑不在允許範圍內或檔案不存在: {path}"
 
     if not p.exists():
         return f"[ELF 錯誤] 檔案不存在: {path}"
@@ -712,7 +712,7 @@ def read_binary(path: str, max_strings: int = 200) -> str:
         if _ALLOW_EXTERNAL:
             return f"[BIN 錯誤] 檔案不存在或不是支援的二進位格式: {path}"
         else:
-            return f"[BIN 錯誤] 路徑不在專案目錄內（使用 --allow-external 允許外部檔案）: {path}"
+            return f"[BIN 錯誤] 路徑不在允許範圍內或檔案不存在: {path}"
 
     if not p.exists():
         return f"[BIN 錯誤] 檔案不存在: {path}"
@@ -839,6 +839,35 @@ def read_binary(path: str, max_strings: int = 200) -> str:
         return f"[BIN 錯誤] {type(e).__name__}: {e}"
 
 
+def _build_binary_context(tag: str, content: str, warn_msg: str = "") -> str:
+    """建立 BIN/ELF 分析結果的上下文字串（共用模板）
+
+    Args:
+        tag: 'BIN' 或 'ELF'
+        content: 分析結果內容
+        warn_msg: 警告訊息（可選）
+
+    Returns:
+        格式化的上下文字串
+    """
+    return f"""
+╔══════════════════════════════════════════════════════════════╗
+║ ⚠️ [{tag}] 本輪回答的最高優先依據：下方 {tag} 分析結果（含 offset/addr） ║
+╚══════════════════════════════════════════════════════════════╝
+
+【強制規則 - 違反將導致回答錯誤】
+1. 必須先使用下方 [{tag}] 內容判斷與推導
+2. 回答必須明確說明「在 {tag} 中找到…」或「在 {tag} 中沒有找到…」
+3. 重要性排序：{tag} > knowledge.json([REF]) > 程式碼 > 一般文件
+4. 若 {tag} 與程式碼/文件衝突，以 {tag} 為準
+5. 本輪只分析一個檔案（見下方 warning）
+{warn_msg}
+---------------- [{tag}] 解析結果開始 ----------------
+{content}
+---------------- [{tag}] 解析結果結束 ----------------
+"""
+
+
 def process_binary(text: str) -> tuple[str, str]:
     """處理文字中的二進位/ELF 檔案引用
 
@@ -899,22 +928,7 @@ def process_binary(text: str) -> tuple[str, str]:
         content = read_binary(target)
         tag = "BIN"
 
-    ctx = f"""
-╔══════════════════════════════════════════════════════════════╗
-║ ⚠️ [{tag}] 本輪回答的最高優先依據：下方 {tag} 分析結果（含 offset/addr） ║
-╚══════════════════════════════════════════════════════════════╝
-
-【強制規則 - 違反將導致回答錯誤】
-1. 必須先使用下方 [{tag}] 內容判斷與推導
-2. 回答必須明確說明「在 {tag} 中找到…」或「在 {tag} 中沒有找到…」
-3. 重要性排序：{tag} > knowledge.json([REF]) > 程式碼 > 一般文件
-4. 若 {tag} 與程式碼/文件衝突，以 {tag} 為準
-5. 本輪只分析一個檔案（見下方 warning）
-{warn_msg}
----------------- [{tag}] 解析結果開始 ----------------
-{content}
----------------- [{tag}] 解析結果結束 ----------------
-"""
+    ctx = _build_binary_context(tag, content, warn_msg)
     return clean, ctx
 
 
@@ -969,7 +983,7 @@ def process_images(text: str, max_images: int = 3) -> tuple[str, str]:
     return clean, ctx
 
 
-def process_file(text: str, max_images: int = 3) -> tuple[str, str]:
+def process_file(text: str, max_images: int = 3) -> tuple[str, str, dict]:
     """統一處理文字中的 file: 檔案引用（自動偵測檔案類型）
 
     支援：
@@ -989,7 +1003,11 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str]:
         max_images: 每輪最多處理的圖片數量（二進位檔只處理第一個）
 
     Returns:
-        (清理後的文字, 上下文字串)
+        (清理後的文字, 上下文字串, metadata)
+        metadata 包含：
+        - has_binary: bool - 是否有處理 BIN/ELF 檔案
+        - has_image: bool - 是否有處理圖片
+        - binary_type: str|None - 'bin' 或 'elf' 或 None
     """
     # 匹配 file: 後面跟著：
     # 1. 雙引號包圍的路徑 "..."
@@ -1001,8 +1019,9 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str]:
     )
     matches = list(pattern.finditer(text))
 
+    empty_metadata = {"has_binary": False, "has_image": False, "binary_type": None}
     if not matches:
-        return text, ""
+        return text, "", empty_metadata
 
     # 清除所有 file: 標記
     clean = pattern.sub("", text).strip()
@@ -1029,23 +1048,25 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str]:
         elif suffix in BINARY_EXTENSIONS:
             binary_files.append((path, 'bin'))
         else:
-            # 未知副檔名：嘗試讀取檔頭判斷
-            try:
-                p = Path(path).expanduser()
-                if p.is_file():
-                    with open(p, "rb") as f:
+            # 未知副檔名：先走 _safe_path 驗證，再嘗試讀取檔頭判斷
+            # 這確保「判斷檔案類型」與「實際讀取檔案」使用相同的路徑解析規則
+            safe_p = _safe_path(path, allow_external=True)
+            if safe_p and safe_p.is_file():
+                try:
+                    with open(safe_p, "rb") as f:
                         header = f.read(4)
                     if header.startswith(b"\x7fELF"):
                         binary_files.append((path, 'elf'))
                     else:
                         binary_files.append((path, 'bin'))
-                else:
-                    # 檔案不存在，當作 bin 處理（讓錯誤訊息顯示）
+                except Exception:
                     binary_files.append((path, 'bin'))
-            except Exception:
+            else:
+                # 檔案不存在或不在允許範圍內，當作 bin 處理（讓錯誤訊息顯示）
                 binary_files.append((path, 'bin'))
 
     ctx_parts: List[str] = []
+    processed_binary_type: Optional[str] = None  # 記錄處理的 binary 類型
 
     # 處理圖片
     if image_files:
@@ -1068,6 +1089,7 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str]:
             print(f"       已忽略: {', '.join(others[:3])}" + (f" ... 等 {len(others)} 個" if len(others) > 3 else ""))
 
         target, kind = binary_files[0]
+        processed_binary_type = kind  # 記錄類型供 metadata
 
         if kind == 'elf':
             print(f"[ELF] 讀取: {target}")
@@ -1082,22 +1104,14 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str]:
         if len(binary_files) > 1:
             warn_msg = f"\n[WARN] 本輪只分析第一個檔案，已忽略其他 {len(binary_files) - 1} 個\n"
 
-        bin_ctx = f"""
-╔══════════════════════════════════════════════════════════════╗
-║ ⚠️ [{tag}] 本輪回答的最高優先依據：下方 {tag} 分析結果（含 offset/addr） ║
-╚══════════════════════════════════════════════════════════════╝
-
-【強制規則 - 違反將導致回答錯誤】
-1. 必須先使用下方 [{tag}] 內容判斷與推導
-2. 回答必須明確說明「在 {tag} 中找到…」或「在 {tag} 中沒有找到…」
-3. 重要性排序：{tag} > knowledge.json([REF]) > 程式碼 > 一般文件
-4. 若 {tag} 與程式碼/文件衝突，以 {tag} 為準
-5. 本輪只分析一個檔案（見下方 warning）
-{warn_msg}
----------------- [{tag}] 解析結果開始 ----------------
-{content}
----------------- [{tag}] 解析結果結束 ----------------
-"""
+        bin_ctx = _build_binary_context(tag, content, warn_msg)
         ctx_parts.append(bin_ctx)
 
-    return clean, "\n".join(ctx_parts)
+    # 建立 metadata
+    metadata = {
+        "has_binary": processed_binary_type is not None,
+        "has_image": len(image_files) > 0,
+        "binary_type": processed_binary_type
+    }
+
+    return clean, "\n".join(ctx_parts), metadata
