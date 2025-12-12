@@ -63,8 +63,10 @@ def run_qa_mode(question: str, kb: "KnowledgeBase", qa_history: list = None):
     """
     from config import get_answer_rules
 
-    # 設定 media.py 的 sandbox（QA 模式允許讀取任意路徑的圖片/bin）
-    set_sandbox_root(".")
+    # 設定 media.py 的 sandbox
+    # QA 模式預設允許讀取外部檔案（file:/img:/bin:/elf: 語法可指向任意路徑）
+    # 這是因為 QA 模式主要用途是分析使用者提供的檔案（錯誤截圖、firmware 等）
+    set_sandbox_root(".", allow_external=True)
 
     # 處理 file: 統一語法（優先）
     clean_q, file_ctx, file_meta = process_file(question)
@@ -228,20 +230,28 @@ def main():
         elif arg.startswith("--include-dir="):
             include_dirs.append(arg.split("=", 1)[1])
         elif arg.startswith("-"):
-            pass
+            # 未知 flag：印出警告，避免使用者打錯參數卻不知道
+            print(f"[WARN] 未知參數: {arg}（已忽略）")
         elif qa_mode:
             # QA 模式下，非 flag 參數都視為問題（可以有空格）
             if question is None:
                 question = arg
             else:
                 question = question + " " + arg
-        elif web_url is None and folder == ".":
+        elif web_url is not None:
+            # 網頁模式下，非 flag 參數都視為問題（可以有空格，與 QA 模式一致）
+            if question is None:
+                question = arg
+            else:
+                question = question + " " + arg
+        elif folder == ".":
             folder = arg
-        elif web_url is None:
-            question = arg
         else:
-            # 網頁模式下，其餘參數為問題
-            question = arg
+            # 一般模式：folder 已設定，剩餘參數視為問題
+            if question is None:
+                question = arg
+            else:
+                question = question + " " + arg
         i += 1
 
     if include_dirs:
@@ -267,11 +277,13 @@ def main():
     # 動態設定容器模式
     if use_container:
         import container_runner
-        container_runner.CONTAINER_ENABLED = True
         available, msg = container_runner.check_container_available()
         if available:
+            container_runner.CONTAINER_ENABLED = True
             print(f"[CFG] 啟用容器化執行 (--container): {msg}")
         else:
+            # 不可用時確保開關是關的，避免後續程式誤判
+            container_runner.CONTAINER_ENABLED = False
             print(f"[WARN] 容器不可用: {msg}")
             print("[WARN] 將使用普通模式執行")
 
