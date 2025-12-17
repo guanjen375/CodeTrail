@@ -1,6 +1,6 @@
 # RAG 知識庫使用指南
 
-本工具支援 RAG（Retrieval-Augmented Generation）功能，可將技術文件（PDF、Markdown、純文字）整合到問答系統中，讓 AI 回答時能引用文件內容。
+本工具支援 RAG（Retrieval-Augmented Generation）功能，可將技術文件（PDF、Markdown、純文字）、**聊天截圖**及**技術圖片**整合到問答系統中，讓 AI 回答時能引用文件內容。
 
 ## 快速開始
 
@@ -8,7 +8,13 @@
 # 1. 建立知識庫（將 PDF 加入）
 python RAG.py manual.pdf knowledge.json
 
-# 2. 使用知識庫進行問答
+# 2. 從聊天截圖加入知識（Teams/Slack/Discord 對話等）
+python RAG.py --chat teams_chat.png knowledge.json
+
+# 3. 從技術圖片加入知識（架構圖/流程圖/記憶體映射等）
+python RAG.py --image npx6_arch.png knowledge.json
+
+# 4. 使用知識庫進行問答
 python main.py . --kb=knowledge.json
 >>> API 的 rate limit 是多少？
 # 回答會標註：根據 REF1（manual.pdf 第 15 頁）...
@@ -19,7 +25,14 @@ python main.py . --kb=knowledge.json
 ### 基本用法
 
 ```bash
+# 一般文件模式
 python RAG.py <輸入檔案> <輸出JSON>
+
+# 聊天截圖模式
+python RAG.py --chat <截圖檔案> <輸出JSON>
+
+# 技術圖片模式
+python RAG.py --image <圖片檔案> <輸出JSON>
 ```
 
 ### 支援的檔案類型
@@ -29,6 +42,7 @@ python RAG.py <輸入檔案> <輸出JSON>
 | PDF | `.pdf` | 使用 pymupdf4llm 提取，保留頁碼資訊 |
 | Markdown | `.md` | 保留標題結構 |
 | 純文字 | `.txt` | 按段落切分 |
+| 圖片 | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` | 聊天截圖（`--chat`）或技術圖片（`--image`） |
 
 ### 增量更新
 
@@ -41,6 +55,12 @@ python RAG.py api_manual.pdf knowledge.json
 # 第二次：加入更多文件（自動 append）
 python RAG.py hardware_spec.pdf knowledge.json
 python RAG.py faq.md knowledge.json
+
+# 加入聊天截圖
+python RAG.py --chat slack_discussion.png knowledge.json
+
+# 加入技術圖片
+python RAG.py --image memory_map.png knowledge.json
 
 # 更新已存在的文件（自動移除舊版再加入新版）
 python RAG.py api_manual_v2.pdf knowledge.json
@@ -58,6 +78,79 @@ python RAG.py api_manual_v2.pdf knowledge.json
 | `api` | `_api`, `reference` | API 文件 |
 | `faq` | `faq`, `q&a` | 常見問題 |
 | `warning` | 內容含 WARNING/CAUTION/危險 | 警告類，會特別標示 |
+| `chat` | 聊天截圖（`--chat` 模式） | 對話摘要 |
+| `diagram` | 技術圖片（`--image` 模式） | 架構/流程圖描述 |
+
+### 聊天截圖模式（--chat）
+
+將 Teams、Slack、Discord 等通訊軟體的對話截圖轉換為結構化知識：
+
+```bash
+python RAG.py --chat zebu_discussion.png knowledge.json
+```
+
+**處理流程**：
+1. 使用 VL 模型（config.py 中的 `VL_MODEL`）分析截圖
+2. 自動整理成結構化格式：
+   - 主題標題
+   - 背景/問題
+   - 重點摘要
+   - 詳細步驟
+   - 注意事項
+   - 相關檔案/工具
+3. 切分成 chunks 並生成 embedding
+4. 存入知識庫（來源標記為 `chat_<檔名>`）
+
+**使用場景**：
+- 同事分享的技術知識對話
+- 團隊討論的解決方案
+- 問題排查的經驗記錄
+- 專案會議的重點截圖
+
+**注意事項**：
+- 需要安裝支援視覺的模型（如 `qwen3-vl`、`llava` 等）
+- 截圖品質越清晰，識別效果越好
+- 建議一張截圖只包含一個主題的對話
+
+### 技術圖片模式（--image）
+
+將架構圖、流程圖、記憶體映射圖等技術圖片轉換為結構化知識：
+
+```bash
+python RAG.py --image npx6_architecture.png knowledge.json
+```
+
+**處理流程**：
+1. 使用 VL 模型分析圖片內容
+2. 自動整理成結構化格式：
+   - 圖片概述
+   - 主要元件/模組
+   - 連接關係/資料流
+   - 位址/數值資訊（如有）
+   - 重要細節
+   - 相關術語
+3. 切分成 chunks 並生成 embedding
+4. 存入知識庫（來源標記為 `image_<檔名>`）
+
+**適用類型**：
+- 系統架構圖 / 方塊圖
+- 記憶體映射圖 / 位址空間
+- 硬體連接圖 / 介面圖
+- 流程圖 / 狀態機
+- 資料流程圖
+- 時序圖
+
+**與 --chat 的差異**：
+
+| 模式 | 用途 | Prompt 重點 |
+|------|------|------------|
+| `--chat` | 聊天對話截圖 | 整理對話重點、步驟、注意事項 |
+| `--image` | 技術圖片 | 分析元件、連接關係、位址數值 |
+
+**注意事項**：
+- 複雜圖片（混合對話+架構圖）建議手動整理成 txt/md
+- VL 模型對圖形關係的理解有限，重要資訊建議人工確認
+- 位址、數值等精確資訊可能需要校正
 
 ## 使用知識庫
 
