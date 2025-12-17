@@ -677,6 +677,35 @@ def export_image_to_md(image_path: str) -> str:
     return str(output_path)
 
 
+def export_url_to_md(url: str) -> str:
+    """將網頁內容輸出為 .md 檔（不入庫，供手動校正）"""
+    print(f"[INFO] 正在抓取網頁...")
+    content, title = fetch_url_content(url)
+
+    if not content:
+        print("[ERROR] 網頁抓取失敗")
+        return ""
+
+    # 生成輸出檔名
+    url_name = generate_url_name(url)
+    output_path = Path.cwd() / f"url_{url_name}.md"
+
+    # 寫入檔案
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(f"<!-- 來源: {url} -->\n")
+        f.write(f"<!-- 標題: {title} -->\n")
+        f.write(f"<!-- 抓取時間: {datetime.now().isoformat()} -->\n")
+        f.write(f"<!-- 請校正後使用: python RAG.py {output_path} <knowledge.json> -->\n\n")
+        if title:
+            f.write(f"# {title}\n\n")
+        f.write(content)
+
+    print(f"[INFO] 網頁標題: {title or '(無標題)'}")
+    print(f"[INFO] 已輸出: {output_path}")
+    print(f"[INFO] 請檢查並校正內容後，執行: python RAG.py {output_path} <knowledge.json>")
+    return str(output_path)
+
+
 # ============================================================
 # Embedding
 # ============================================================
@@ -802,10 +831,148 @@ def add_document(input_file: str, output_file: str):
     save_knowledge_base(kb, output_path)
 
 # ============================================================
-# 聊天截圖模式
+# 互動式確認函式
 # ============================================================
+def ask_yes_no(prompt: str, default: bool = True) -> bool:
+    """詢問使用者 yes/no 問題"""
+    suffix = " [Y/n]: " if default else " [y/N]: "
+    while True:
+        response = input(prompt + suffix).strip().lower()
+        if not response:
+            return default
+        if response in ('y', 'yes', '是'):
+            return True
+        if response in ('n', 'no', '否'):
+            return False
+        print("請輸入 y 或 n")
+
+
+def ask_output_file(default: str = "knowledge.json") -> str:
+    """詢問使用者輸出檔案路徑"""
+    response = input(f"請輸入知識庫檔案路徑 [{default}]: ").strip()
+    return response if response else default
+
+
+# ============================================================
+# 聊天截圖模式（互動式）
+# ============================================================
+def interactive_chat_screenshot(image_file: str):
+    """
+    互動式處理聊天截圖：
+    1. 分析並顯示結果
+    2. 詢問是否加入知識庫
+    3. 若是，詢問輸出檔案並入庫
+    4. 若否，詢問是否存為 .md 檔
+    """
+    image_path = Path(image_file)
+
+    # 檢查輸入檔案
+    if not image_path.exists():
+        print(f"[ERROR] 檔案不存在: {image_file}")
+        sys.exit(1)
+
+    if image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+        print(f"[ERROR] 不支援的圖片類型: {image_path.suffix}")
+        print(f"        支援: {', '.join(IMAGE_EXTENSIONS)}")
+        sys.exit(1)
+
+    # 分析截圖
+    print(f"[INFO] 使用 VL 模型分析截圖: {image_path.name}")
+    content = extract_chat_from_screenshot(str(image_path))
+
+    if not content:
+        print("[ERROR] VL 模型分析失敗")
+        sys.exit(1)
+
+    # 顯示完整結果
+    print(f"\n[INFO] 分析完成，內容長度: {len(content)} 字元")
+    print("=" * 60)
+    print(content)
+    print("=" * 60)
+
+    # 詢問是否加入知識庫
+    print()
+    if ask_yes_no("是否將此內容加入知識庫？"):
+        output_file = ask_output_file()
+        _add_chat_content_to_kb(image_path, content, output_file)
+    else:
+        # 詢問是否存為 .md 檔
+        if ask_yes_no("是否存為 .md 檔供日後使用？"):
+            _save_chat_as_md(image_path, content)
+        else:
+            print("[INFO] 已取消，內容未儲存")
+
+
+def _add_chat_content_to_kb(image_path: Path, content: str, output_file: str):
+    """將已分析的聊天內容加入知識庫（內部函式）"""
+    output_path = Path(output_file)
+
+    # 切分成 chunks
+    chunk_results = split_by_semantic_with_sections(content)
+    new_chunks = []
+    for i, chunk_data in enumerate(chunk_results):
+        chunk_type = detect_content_type(chunk_data["content"], 'chat')
+        new_chunks.append({
+            "source": f"chat_{image_path.name}",
+            "page": 1,
+            "chunk_index": i,
+            "content": chunk_data["content"],
+            "type": chunk_type,
+            "section": chunk_data["section"],
+            "origin": "screenshot"
+        })
+
+    if not new_chunks:
+        print("[WARN] 沒有提取到任何內容")
+        return
+
+    # 載入現有知識庫
+    kb = load_knowledge_base(output_path)
+    doc_name = f"chat_{image_path.name}"
+
+    # 檢查是否已存在同名文件
+    if doc_name in kb["metadata"]["documents"]:
+        print(f"[INFO] 更新現有截圖知識: {doc_name}")
+        kb["chunks"] = [c for c in kb["chunks"] if c["source"] != doc_name]
+        kb["metadata"]["documents"].remove(doc_name)
+    else:
+        print(f"[INFO] 新增截圖知識: {doc_name}")
+
+    print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
+
+    # 生成 embeddings
+    print(f"[INFO] 使用 {EMBEDDING_MODEL} 生成 embeddings...")
+    new_chunks = generate_embeddings(new_chunks)
+
+    # 為每個 chunk 生成唯一 ID
+    for chunk in new_chunks:
+        content_hash = hashlib.md5(chunk['content'].encode()).hexdigest()[:8]
+        chunk['id'] = f"{chunk['source']}::p{chunk['page']}::c{chunk['chunk_index']}::{content_hash}"
+
+    # Append 到知識庫
+    kb["chunks"].extend(new_chunks)
+    kb["metadata"]["documents"].append(doc_name)
+
+    # 儲存
+    save_knowledge_base(kb, output_path)
+
+
+def _save_chat_as_md(image_path: Path, content: str):
+    """將聊天內容存為 .md 檔（內部函式）"""
+    output_path = image_path.parent / f"chat_{image_path.stem}.md"
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(f"<!-- 來源: {image_path} -->\n")
+        f.write(f"<!-- 生成時間: {datetime.now().isoformat()} -->\n")
+        f.write(f"<!-- 請校正後使用: python RAG.py {output_path} <knowledge.json> -->\n\n")
+        f.write(content)
+
+    print(f"[INFO] 已輸出: {output_path}")
+    print(f"[INFO] 請檢查並校正內容後，執行: python RAG.py {output_path} <knowledge.json>")
+
+
 def add_chat_screenshot(image_file: str, output_file: str):
-    """將聊天截圖加入知識庫"""
+    """將聊天截圖加入知識庫（相容舊 API，直接入庫不詢問）"""
     image_path = Path(image_file)
     output_path = Path(output_file)
 
@@ -978,6 +1145,28 @@ def clean_markdown_content(content: str) -> str:
     return '\n'.join(cleaned_lines).strip()
 
 
+def generate_url_name(url: str) -> str:
+    """
+    從 URL 生成唯一的名稱（避免撞名）
+    GPT 建議：使用 {netloc}_{last_path} 格式
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+
+    # 清理 netloc（移除 www. 和特殊字元）
+    netloc = parsed.netloc.replace('www.', '').replace('.', '_').replace(':', '_')
+
+    # 取 path 最後一段
+    path_parts = [p for p in parsed.path.split('/') if p]
+    if path_parts:
+        last_path = path_parts[-1]
+        # 清理特殊字元
+        last_path = re.sub(r'[^\w\-]', '_', last_path)
+        return f"{netloc}_{last_path}"
+    else:
+        return netloc
+
+
 def process_url(url: str) -> List[Dict]:
     """處理網頁 URL，提取內容並整理成知識區塊"""
     content, title = fetch_url_content(url)
@@ -991,15 +1180,9 @@ def process_url(url: str) -> List[Dict]:
     print(content[:500] + "..." if len(content) > 500 else content)
     print("-" * 40)
 
-    # 從 URL 生成檔名
-    from urllib.parse import urlparse
-    parsed = urlparse(url)
-    # 取 path 最後一段作為檔名，或用 domain
-    path_parts = [p for p in parsed.path.split('/') if p]
-    if path_parts:
-        url_name = path_parts[-1]
-    else:
-        url_name = parsed.netloc.replace('.', '_')
+    # GPT 建議：使用更穩定的命名避免撞名
+    url_name = generate_url_name(url)
+    fetched_at = datetime.now().isoformat()
 
     # 切分成 chunks
     results = []
@@ -1016,14 +1199,138 @@ def process_url(url: str) -> List[Dict]:
             "type": chunk_type,
             "section": chunk_data["section"],
             "origin": "url",
-            "url": url  # 保留原始 URL
+            "url": url,              # 保留原始 URL
+            "title": title,          # GPT 建議：補存標題
+            "fetched_at": fetched_at # GPT 建議：補存抓取時間
         })
 
-    return results
+    return results, url_name  # 回傳 url_name 供 add_url 使用
+
+
+# ============================================================
+# 網頁模式（互動式）
+# ============================================================
+def interactive_url(url: str):
+    """
+    互動式處理網頁：
+    1. 抓取並顯示結果
+    2. 詢問是否加入知識庫
+    3. 若是，詢問輸出檔案並入庫
+    4. 若否，詢問是否存為 .md 檔
+    """
+    # 簡單驗證 URL 格式
+    if not url.startswith(('http://', 'https://')):
+        print(f"[ERROR] 無效的 URL: {url}")
+        print("        URL 必須以 http:// 或 https:// 開頭")
+        sys.exit(1)
+
+    # 抓取網頁
+    print(f"[INFO] 正在抓取網頁: {url}")
+    content, title = fetch_url_content(url)
+
+    if not content:
+        print("[ERROR] 網頁抓取失敗")
+        sys.exit(1)
+
+    # 顯示完整結果
+    print(f"\n[INFO] 網頁標題: {title or '(無標題)'}")
+    print(f"[INFO] 抓取完成，內容長度: {len(content)} 字元")
+    print("=" * 60)
+    print(content)
+    print("=" * 60)
+
+    # 詢問是否加入知識庫
+    print()
+    if ask_yes_no("是否將此內容加入知識庫？"):
+        output_file = ask_output_file()
+        _add_url_content_to_kb(url, content, title, output_file)
+    else:
+        # 詢問是否存為 .md 檔
+        if ask_yes_no("是否存為 .md 檔供日後使用？"):
+            _save_url_as_md(url, content, title)
+        else:
+            print("[INFO] 已取消，內容未儲存")
+
+
+def _add_url_content_to_kb(url: str, content: str, title: str, output_file: str):
+    """將已抓取的網頁內容加入知識庫（內部函式）"""
+    output_path = Path(output_file)
+    url_name = generate_url_name(url)
+    fetched_at = datetime.now().isoformat()
+
+    # 切分成 chunks
+    chunk_results = split_by_semantic_with_sections(content)
+    new_chunks = []
+    for i, chunk_data in enumerate(chunk_results):
+        chunk_type = detect_content_type(chunk_data["content"], 'web')
+        new_chunks.append({
+            "source": f"url_{url_name}",
+            "page": 1,
+            "chunk_index": i,
+            "content": chunk_data["content"],
+            "type": chunk_type,
+            "section": chunk_data["section"],
+            "origin": "url",
+            "url": url,
+            "title": title,
+            "fetched_at": fetched_at
+        })
+
+    if not new_chunks:
+        print("[WARN] 沒有提取到任何內容")
+        return
+
+    # 載入現有知識庫
+    kb = load_knowledge_base(output_path)
+    doc_name = f"url_{url_name}"
+
+    # 檢查是否已存在同名文件
+    if doc_name in kb["metadata"]["documents"]:
+        print(f"[INFO] 更新現有網頁知識: {doc_name}")
+        kb["chunks"] = [c for c in kb["chunks"] if c["source"] != doc_name]
+        kb["metadata"]["documents"].remove(doc_name)
+    else:
+        print(f"[INFO] 新增網頁知識: {doc_name}")
+
+    print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
+
+    # 生成 embeddings
+    print(f"[INFO] 使用 {EMBEDDING_MODEL} 生成 embeddings...")
+    new_chunks = generate_embeddings(new_chunks)
+
+    # 為每個 chunk 生成唯一 ID
+    for chunk in new_chunks:
+        content_hash = hashlib.md5(chunk['content'].encode()).hexdigest()[:8]
+        chunk['id'] = f"{chunk['source']}::p{chunk['page']}::c{chunk['chunk_index']}::{content_hash}"
+
+    # Append 到知識庫
+    kb["chunks"].extend(new_chunks)
+    kb["metadata"]["documents"].append(doc_name)
+
+    # 儲存
+    save_knowledge_base(kb, output_path)
+
+
+def _save_url_as_md(url: str, content: str, title: str):
+    """將網頁內容存為 .md 檔（內部函式）"""
+    url_name = generate_url_name(url)
+    output_path = Path.cwd() / f"url_{url_name}.md"
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(f"<!-- 來源: {url} -->\n")
+        f.write(f"<!-- 標題: {title} -->\n")
+        f.write(f"<!-- 抓取時間: {datetime.now().isoformat()} -->\n")
+        f.write(f"<!-- 請校正後使用: python RAG.py {output_path} <knowledge.json> -->\n\n")
+        if title:
+            f.write(f"# {title}\n\n")
+        f.write(content)
+
+    print(f"[INFO] 已輸出: {output_path}")
+    print(f"[INFO] 請檢查並校正內容後，執行: python RAG.py {output_path} <knowledge.json>")
 
 
 def add_url(url: str, output_file: str):
-    """將網頁內容加入知識庫"""
+    """將網頁內容加入知識庫（相容舊 API，直接入庫不詢問）"""
     output_path = Path(output_file)
 
     # 簡單驗證 URL 格式
@@ -1035,15 +1342,14 @@ def add_url(url: str, output_file: str):
     # 載入現有知識庫
     kb = load_knowledge_base(output_path)
 
-    # 從 URL 生成文件名
-    from urllib.parse import urlparse
-    parsed = urlparse(url)
-    path_parts = [p for p in parsed.path.split('/') if p]
-    if path_parts:
-        url_name = path_parts[-1]
-    else:
-        url_name = parsed.netloc.replace('.', '_')
+    # 處理網頁（會回傳 chunks 和 url_name）
+    result = process_url(url)
 
+    if not result:
+        print("[ERROR] 無法從網頁提取內容，新增失敗")
+        sys.exit(1)
+
+    new_chunks, url_name = result
     doc_name = f"url_{url_name}"
 
     # 檢查是否已存在同名文件
@@ -1053,13 +1359,6 @@ def add_url(url: str, output_file: str):
         kb["metadata"]["documents"].remove(doc_name)
     else:
         print(f"[INFO] 新增網頁知識: {doc_name}")
-
-    # 處理網頁
-    new_chunks = process_url(url)
-
-    if not new_chunks:
-        print("[ERROR] 無法從網頁提取內容，新增失敗")
-        sys.exit(1)
 
     print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
 
@@ -1081,10 +1380,125 @@ def add_url(url: str, output_file: str):
 
 
 # ============================================================
-# 技術圖片模式
+# 技術圖片模式（互動式）
 # ============================================================
+def interactive_technical_image(image_file: str):
+    """
+    互動式處理技術圖片：
+    1. 分析並顯示結果
+    2. 詢問是否加入知識庫
+    3. 若是，詢問輸出檔案並入庫
+    4. 若否，詢問是否存為 .md 檔
+    """
+    image_path = Path(image_file)
+
+    # 檢查輸入檔案
+    if not image_path.exists():
+        print(f"[ERROR] 檔案不存在: {image_file}")
+        sys.exit(1)
+
+    if image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+        print(f"[ERROR] 不支援的圖片類型: {image_path.suffix}")
+        print(f"        支援: {', '.join(IMAGE_EXTENSIONS)}")
+        sys.exit(1)
+
+    # 分析圖片
+    print(f"[INFO] 使用 VL 模型分析技術圖片: {image_path.name}")
+    content = extract_info_from_image(str(image_path))
+
+    if not content:
+        print("[ERROR] VL 模型分析失敗")
+        sys.exit(1)
+
+    # 顯示完整結果
+    print(f"\n[INFO] 分析完成，內容長度: {len(content)} 字元")
+    print("=" * 60)
+    print(content)
+    print("=" * 60)
+
+    # 詢問是否加入知識庫
+    print()
+    if ask_yes_no("是否將此內容加入知識庫？"):
+        output_file = ask_output_file()
+        _add_image_content_to_kb(image_path, content, output_file)
+    else:
+        # 詢問是否存為 .md 檔
+        if ask_yes_no("是否存為 .md 檔供日後使用？"):
+            _save_image_as_md(image_path, content)
+        else:
+            print("[INFO] 已取消，內容未儲存")
+
+
+def _add_image_content_to_kb(image_path: Path, content: str, output_file: str):
+    """將已分析的技術圖片內容加入知識庫（內部函式）"""
+    output_path = Path(output_file)
+
+    # 切分成 chunks
+    chunk_results = split_by_semantic_with_sections(content)
+    new_chunks = []
+    for i, chunk_data in enumerate(chunk_results):
+        chunk_type = detect_content_type(chunk_data["content"], 'diagram')
+        new_chunks.append({
+            "source": f"image_{image_path.name}",
+            "page": 1,
+            "chunk_index": i,
+            "content": chunk_data["content"],
+            "type": chunk_type,
+            "section": chunk_data["section"],
+            "origin": "image"
+        })
+
+    if not new_chunks:
+        print("[WARN] 沒有提取到任何內容")
+        return
+
+    # 載入現有知識庫
+    kb = load_knowledge_base(output_path)
+    doc_name = f"image_{image_path.name}"
+
+    # 檢查是否已存在同名文件
+    if doc_name in kb["metadata"]["documents"]:
+        print(f"[INFO] 更新現有圖片知識: {doc_name}")
+        kb["chunks"] = [c for c in kb["chunks"] if c["source"] != doc_name]
+        kb["metadata"]["documents"].remove(doc_name)
+    else:
+        print(f"[INFO] 新增圖片知識: {doc_name}")
+
+    print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
+
+    # 生成 embeddings
+    print(f"[INFO] 使用 {EMBEDDING_MODEL} 生成 embeddings...")
+    new_chunks = generate_embeddings(new_chunks)
+
+    # 為每個 chunk 生成唯一 ID
+    for chunk in new_chunks:
+        content_hash = hashlib.md5(chunk['content'].encode()).hexdigest()[:8]
+        chunk['id'] = f"{chunk['source']}::p{chunk['page']}::c{chunk['chunk_index']}::{content_hash}"
+
+    # Append 到知識庫
+    kb["chunks"].extend(new_chunks)
+    kb["metadata"]["documents"].append(doc_name)
+
+    # 儲存
+    save_knowledge_base(kb, output_path)
+
+
+def _save_image_as_md(image_path: Path, content: str):
+    """將技術圖片內容存為 .md 檔（內部函式）"""
+    output_path = image_path.parent / f"image_{image_path.stem}.md"
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(f"<!-- 來源: {image_path} -->\n")
+        f.write(f"<!-- 生成時間: {datetime.now().isoformat()} -->\n")
+        f.write(f"<!-- 請校正後使用: python RAG.py {output_path} <knowledge.json> -->\n\n")
+        f.write(content)
+
+    print(f"[INFO] 已輸出: {output_path}")
+    print(f"[INFO] 請檢查並校正內容後，執行: python RAG.py {output_path} <knowledge.json>")
+
+
 def add_technical_image(image_file: str, output_file: str):
-    """將技術圖片加入知識庫"""
+    """將技術圖片加入知識庫（相容舊 API，直接入庫不詢問）"""
     image_path = Path(image_file)
     output_path = Path(output_file)
 
@@ -1144,14 +1558,19 @@ def print_usage():
     """印出使用說明"""
     print("用法:")
     print("  python RAG.py <input_file> <output_json>           # 一般文件模式")
-    print("  python RAG.py --chat <screenshot> <output_json>    # 聊天截圖模式")
-    print("  python RAG.py --image <image> <output_json>        # 技術圖片模式")
-    print("  python RAG.py --url <url> <output_json>            # 網頁模式")
+    print("  python RAG.py --chat <screenshot>                  # 聊天截圖（互動式）")
+    print("  python RAG.py --image <image>                      # 技術圖片（互動式）")
+    print("  python RAG.py --url <url>                          # 網頁（互動式）")
     print("")
-    print("選項:")
-    print("  --export-md   只輸出 VL 分析結果為 .md 檔，不入庫（供手動校正）")
-    print("                用法: python RAG.py --chat --export-md <screenshot>")
-    print("                      python RAG.py --image --export-md <image>")
+    print("互動式模式會：")
+    print("  1. 分析/抓取內容並顯示完整結果")
+    print("  2. 詢問是否加入知識庫（是→詢問知識庫路徑）")
+    print("  3. 若不入庫，詢問是否存為 .md 檔供日後使用")
+    print("")
+    print("直接入庫模式（跳過確認）：")
+    print("  python RAG.py --chat <screenshot> <output_json>    # 聊天截圖直接入庫")
+    print("  python RAG.py --image <image> <output_json>        # 技術圖片直接入庫")
+    print("  python RAG.py --url <url> <output_json>            # 網頁直接入庫")
     print("")
     print("參數:")
     print("  input_file   要加入的文件 (pdf/md/txt)")
@@ -1161,12 +1580,11 @@ def print_usage():
     print("  output_json  知識庫檔案 (不存在則建立，存在則 append)")
     print("")
     print("範例:")
-    print("  python RAG.py manual.pdf knowledge.json")
-    print("  python RAG.py guide.md knowledge.json")
-    print("  python RAG.py --chat teams_chat.png knowledge.json")
-    print("  python RAG.py --image npx6_arch.png knowledge.json")
-    print("  python RAG.py --url https://docs.example.com/guide knowledge.json")
-    print("  python RAG.py --chat --export-md chat_screenshot.png  # 只輸出 .md")
+    print("  python RAG.py manual.pdf knowledge.json            # 一般文件")
+    print("  python RAG.py --chat teams_chat.png                # 互動式：分析截圖")
+    print("  python RAG.py --image npx6_arch.png                # 互動式：分析圖片")
+    print("  python RAG.py --url https://docs.example.com/guide # 互動式：抓取網頁")
+    print("  python RAG.py --chat chat.png knowledge.json       # 直接入庫")
     print("")
     print(f"支援的文件類型: {', '.join(SUPPORTED_EXTENSIONS)}")
     print(f"支援的圖片類型: {', '.join(IMAGE_EXTENSIONS)}")
@@ -1178,60 +1596,56 @@ if __name__ == "__main__":
         print_usage()
         sys.exit(1)
 
-    # 檢查 --export-md 選項
-    export_md_mode = "--export-md" in sys.argv
-    if export_md_mode:
-        sys.argv.remove("--export-md")
-
     # 聊天截圖模式
     if sys.argv[1] == "--chat":
-        if export_md_mode:
-            # --chat --export-md <image>
-            if len(sys.argv) != 3:
-                print("[ERROR] --chat --export-md 模式需要 1 個參數")
-                print("用法: python RAG.py --chat --export-md <screenshot>")
-                sys.exit(1)
+        if len(sys.argv) == 3:
+            # --chat <image> → 互動式模式
             image_file = sys.argv[2]
-            export_chat_to_md(image_file)
-        else:
-            # --chat <image> <output_json>
-            if len(sys.argv) != 4:
-                print("[ERROR] --chat 模式需要 2 個參數")
-                print("用法: python RAG.py --chat <screenshot> <output_json>")
-                sys.exit(1)
+            interactive_chat_screenshot(image_file)
+        elif len(sys.argv) == 4:
+            # --chat <image> <output_json> → 直接入庫模式
             image_file = sys.argv[2]
             output_file = sys.argv[3]
             add_chat_screenshot(image_file, output_file)
+        else:
+            print("[ERROR] --chat 模式參數錯誤")
+            print("用法: python RAG.py --chat <screenshot>              # 互動式")
+            print("      python RAG.py --chat <screenshot> <output_json> # 直接入庫")
+            sys.exit(1)
 
     # 技術圖片模式
     elif sys.argv[1] == "--image":
-        if export_md_mode:
-            # --image --export-md <image>
-            if len(sys.argv) != 3:
-                print("[ERROR] --image --export-md 模式需要 1 個參數")
-                print("用法: python RAG.py --image --export-md <image>")
-                sys.exit(1)
+        if len(sys.argv) == 3:
+            # --image <image> → 互動式模式
             image_file = sys.argv[2]
-            export_image_to_md(image_file)
-        else:
-            # --image <image> <output_json>
-            if len(sys.argv) != 4:
-                print("[ERROR] --image 模式需要 2 個參數")
-                print("用法: python RAG.py --image <image> <output_json>")
-                sys.exit(1)
+            interactive_technical_image(image_file)
+        elif len(sys.argv) == 4:
+            # --image <image> <output_json> → 直接入庫模式
             image_file = sys.argv[2]
             output_file = sys.argv[3]
             add_technical_image(image_file, output_file)
+        else:
+            print("[ERROR] --image 模式參數錯誤")
+            print("用法: python RAG.py --image <image>              # 互動式")
+            print("      python RAG.py --image <image> <output_json> # 直接入庫")
+            sys.exit(1)
 
     # 網頁模式
     elif sys.argv[1] == "--url":
-        if len(sys.argv) != 4:
-            print("[ERROR] --url 模式需要 2 個參數")
-            print("用法: python RAG.py --url <url> <output_json>")
+        if len(sys.argv) == 3:
+            # --url <url> → 互動式模式
+            url = sys.argv[2]
+            interactive_url(url)
+        elif len(sys.argv) == 4:
+            # --url <url> <output_json> → 直接入庫模式
+            url = sys.argv[2]
+            output_file = sys.argv[3]
+            add_url(url, output_file)
+        else:
+            print("[ERROR] --url 模式參數錯誤")
+            print("用法: python RAG.py --url <url>              # 互動式")
+            print("      python RAG.py --url <url> <output_json> # 直接入庫")
             sys.exit(1)
-        url = sys.argv[2]
-        output_file = sys.argv[3]
-        add_url(url, output_file)
 
     # 一般文件模式
     else:
