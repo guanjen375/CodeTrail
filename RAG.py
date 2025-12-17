@@ -21,7 +21,7 @@ import json
 import hashlib
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple
 
 # ============================================================
 # 依賴檢查
@@ -624,85 +624,47 @@ def process_technical_image(image_path: str) -> List[Dict]:
 
 
 # ============================================================
-# Export MD（GPT 建議：輸出中間產物供手動校正）
+# 自動快取（追溯 VL/URL 分析的原始內容）
 # ============================================================
-def export_chat_to_md(image_path: str) -> str:
-    """將聊天截圖分析結果輸出為 .md 檔（不入庫，供手動校正）"""
-    print(f"[INFO] 使用 VL 模型分析截圖...")
-    content = extract_chat_from_screenshot(image_path)
+RAG_CACHE_DIR = ".rag_cache"
 
-    if not content:
-        print("[ERROR] VL 模型分析失敗")
-        return ""
 
-    # 生成輸出檔名
-    image_name = Path(image_path).stem
-    output_path = Path(image_path).parent / f"chat_{image_name}.md"
+def _ensure_cache_dir() -> Path:
+    """確保快取目錄存在"""
+    cache_dir = Path(RAG_CACHE_DIR)
+    cache_dir.mkdir(exist_ok=True)
+    return cache_dir
 
-    # 寫入檔案
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(f"<!-- 來源: {image_path} -->\n")
+
+def _save_to_cache(source_name: str, content: str, source_type: str, metadata: dict = None):
+    """
+    自動將分析結果存入快取目錄，供日後追溯
+
+    Args:
+        source_name: 來源名稱（如 teams_chat.png, https://...）
+        content: 分析後的 markdown 內容
+        source_type: 類型（chat/image/url）
+        metadata: 額外的 metadata（如 title, url 等）
+    """
+    cache_dir = _ensure_cache_dir()
+
+    # 生成快取檔名
+    safe_name = re.sub(r'[^\w\-.]', '_', source_name)[:80]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    cache_file = cache_dir / f"{source_type}_{safe_name}_{timestamp}.md"
+
+    # 寫入快取
+    with open(cache_file, 'w', encoding='utf-8') as f:
+        f.write(f"<!-- 來源: {source_name} -->\n")
+        f.write(f"<!-- 類型: {source_type} -->\n")
         f.write(f"<!-- 生成時間: {datetime.now().isoformat()} -->\n")
-        f.write(f"<!-- 請校正後使用: python RAG.py {output_path} <knowledge.json> -->\n\n")
+        if metadata:
+            for k, v in metadata.items():
+                f.write(f"<!-- {k}: {v} -->\n")
+        f.write("\n")
         f.write(content)
 
-    print(f"[INFO] 已輸出: {output_path}")
-    print(f"[INFO] 請檢查並校正內容後，執行: python RAG.py {output_path} <knowledge.json>")
-    return str(output_path)
-
-
-def export_image_to_md(image_path: str) -> str:
-    """將技術圖片分析結果輸出為 .md 檔（不入庫，供手動校正）"""
-    print(f"[INFO] 使用 VL 模型分析技術圖片...")
-    content = extract_info_from_image(image_path)
-
-    if not content:
-        print("[ERROR] VL 模型分析失敗")
-        return ""
-
-    # 生成輸出檔名
-    image_name = Path(image_path).stem
-    output_path = Path(image_path).parent / f"image_{image_name}.md"
-
-    # 寫入檔案
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(f"<!-- 來源: {image_path} -->\n")
-        f.write(f"<!-- 生成時間: {datetime.now().isoformat()} -->\n")
-        f.write(f"<!-- 請校正後使用: python RAG.py {output_path} <knowledge.json> -->\n\n")
-        f.write(content)
-
-    print(f"[INFO] 已輸出: {output_path}")
-    print(f"[INFO] 請檢查並校正內容後，執行: python RAG.py {output_path} <knowledge.json>")
-    return str(output_path)
-
-
-def export_url_to_md(url: str) -> str:
-    """將網頁內容輸出為 .md 檔（不入庫，供手動校正）"""
-    print(f"[INFO] 正在抓取網頁...")
-    content, title = fetch_url_content(url)
-
-    if not content:
-        print("[ERROR] 網頁抓取失敗")
-        return ""
-
-    # 生成輸出檔名
-    url_name = generate_url_name(url)
-    output_path = Path.cwd() / f"url_{url_name}.md"
-
-    # 寫入檔案
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(f"<!-- 來源: {url} -->\n")
-        f.write(f"<!-- 標題: {title} -->\n")
-        f.write(f"<!-- 抓取時間: {datetime.now().isoformat()} -->\n")
-        f.write(f"<!-- 請校正後使用: python RAG.py {output_path} <knowledge.json> -->\n\n")
-        if title:
-            f.write(f"# {title}\n\n")
-        f.write(content)
-
-    print(f"[INFO] 網頁標題: {title or '(無標題)'}")
-    print(f"[INFO] 已輸出: {output_path}")
-    print(f"[INFO] 請檢查並校正內容後，執行: python RAG.py {output_path} <knowledge.json>")
-    return str(output_path)
+    return cache_file
 
 
 # ============================================================
@@ -900,6 +862,10 @@ def _add_chat_content_to_kb(image_path: Path, content: str, output_file: str):
     """將已分析的聊天內容加入知識庫（內部函式）"""
     output_path = Path(output_file)
 
+    # 自動快取分析結果
+    cache_file = _save_to_cache(image_path.name, content, "chat")
+    print(f"[INFO] 快取已存: {cache_file}")
+
     # 切分成 chunks
     chunk_results = split_by_semantic_with_sections(content)
     new_chunks = []
@@ -948,20 +914,6 @@ def _add_chat_content_to_kb(image_path: Path, content: str, output_file: str):
 
     # 儲存
     save_knowledge_base(kb, output_path)
-
-
-def _save_chat_as_md(image_path: Path, content: str):
-    """將聊天內容存為 .md 檔（內部函式）"""
-    output_path = image_path.parent / f"chat_{image_path.stem}.md"
-
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(f"<!-- 來源: {image_path} -->\n")
-        f.write(f"<!-- 生成時間: {datetime.now().isoformat()} -->\n")
-        f.write(f"<!-- 請校正後使用: python RAG.py {output_path} <knowledge.json> -->\n\n")
-        f.write(content)
-
-    print(f"[INFO] 已輸出: {output_path}")
-    print(f"[INFO] 請檢查並校正內容後，執行: python RAG.py {output_path} <knowledge.json>")
 
 
 def add_chat_screenshot(image_file: str, output_file: str):
@@ -1160,12 +1112,17 @@ def generate_url_name(url: str) -> str:
         return netloc
 
 
-def process_url(url: str) -> List[Dict]:
-    """處理網頁 URL，提取內容並整理成知識區塊"""
+def process_url(url: str) -> Optional[Tuple[List[Dict], str]]:
+    """處理網頁 URL，提取內容並整理成知識區塊
+
+    Returns:
+        成功: (chunks, url_name) tuple
+        失敗: None
+    """
     content, title = fetch_url_content(url)
 
     if not content:
-        return []
+        return None
 
     print(f"[INFO] 網頁標題: {title or '(無標題)'}")
     print(f"[INFO] 提取完成，內容長度: {len(content)} 字元")
@@ -1245,6 +1202,10 @@ def _add_url_content_to_kb(url: str, content: str, title: str, output_file: str)
     url_name = generate_url_name(url)
     fetched_at = datetime.now().isoformat()
 
+    # 自動快取抓取結果
+    cache_file = _save_to_cache(url, content, "url", {"title": title})
+    print(f"[INFO] 快取已存: {cache_file}")
+
     # 切分成 chunks
     chunk_results = split_by_semantic_with_sections(content)
     new_chunks = []
@@ -1298,24 +1259,6 @@ def _add_url_content_to_kb(url: str, content: str, title: str, output_file: str)
     save_knowledge_base(kb, output_path)
 
 
-def _save_url_as_md(url: str, content: str, title: str):
-    """將網頁內容存為 .md 檔（內部函式）"""
-    url_name = generate_url_name(url)
-    output_path = Path.cwd() / f"url_{url_name}.md"
-
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(f"<!-- 來源: {url} -->\n")
-        f.write(f"<!-- 標題: {title} -->\n")
-        f.write(f"<!-- 抓取時間: {datetime.now().isoformat()} -->\n")
-        f.write(f"<!-- 請校正後使用: python RAG.py {output_path} <knowledge.json> -->\n\n")
-        if title:
-            f.write(f"# {title}\n\n")
-        f.write(content)
-
-    print(f"[INFO] 已輸出: {output_path}")
-    print(f"[INFO] 請檢查並校正內容後，執行: python RAG.py {output_path} <knowledge.json>")
-
-
 def add_url(url: str, output_file: str):
     """將網頁內容加入知識庫（相容舊 API，直接入庫不詢問）"""
     output_path = Path(output_file)
@@ -1329,10 +1272,10 @@ def add_url(url: str, output_file: str):
     # 載入現有知識庫
     kb = load_knowledge_base(output_path)
 
-    # 處理網頁（會回傳 chunks 和 url_name）
+    # 處理網頁（會回傳 (chunks, url_name) 或 None）
     result = process_url(url)
 
-    if not result:
+    if result is None:
         print("[ERROR] 無法從網頁提取內容，新增失敗")
         sys.exit(1)
 
@@ -1414,6 +1357,10 @@ def _add_image_content_to_kb(image_path: Path, content: str, output_file: str):
     """將已分析的技術圖片內容加入知識庫（內部函式）"""
     output_path = Path(output_file)
 
+    # 自動快取分析結果
+    cache_file = _save_to_cache(image_path.name, content, "image")
+    print(f"[INFO] 快取已存: {cache_file}")
+
     # 切分成 chunks
     chunk_results = split_by_semantic_with_sections(content)
     new_chunks = []
@@ -1462,20 +1409,6 @@ def _add_image_content_to_kb(image_path: Path, content: str, output_file: str):
 
     # 儲存
     save_knowledge_base(kb, output_path)
-
-
-def _save_image_as_md(image_path: Path, content: str):
-    """將技術圖片內容存為 .md 檔（內部函式）"""
-    output_path = image_path.parent / f"image_{image_path.stem}.md"
-
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(f"<!-- 來源: {image_path} -->\n")
-        f.write(f"<!-- 生成時間: {datetime.now().isoformat()} -->\n")
-        f.write(f"<!-- 請校正後使用: python RAG.py {output_path} <knowledge.json> -->\n\n")
-        f.write(content)
-
-    print(f"[INFO] 已輸出: {output_path}")
-    print(f"[INFO] 請檢查並校正內容後，執行: python RAG.py {output_path} <knowledge.json>")
 
 
 def add_technical_image(image_file: str, output_file: str):

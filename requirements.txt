@@ -23,6 +23,10 @@ numpy>=1.21.0       # 向量運算加速（RAG 搜尋、MMR 選擇）
 # pymupdf4llm>=0.0.5
 # ollama>=0.1.0
 
+# RAG 網頁模式（執行 RAG.py --url 抓取網頁時需要）
+# pip install html2text
+# html2text>=2020.1.16
+
 # Tree-sitter AST 解析（提升程式碼解析精準度，目前未啟用）
 # pip install tree-sitter tree-sitter-python tree-sitter-javascript ...
 # tree-sitter>=0.21.0
