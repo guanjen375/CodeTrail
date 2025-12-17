@@ -2,6 +2,33 @@
 
 本專案的版本變更記錄。
 
+## [3.0.0] - 2025-12-17
+
+重大架構升級與使用者體驗優化版（個人里程碑）
+
+### Added
+- **Context 完整性告示系統**：所有「上下文不完整」的情況都會明確提示
+  - Full 模式：LLM prompt 內加入 `[CTX_NOTICE]`，列出 skipped/skeleton 檔案清單
+  - Agent 模式：工具輸出被摘要/截斷時對 user 顯示一次警告
+  - QA 模式：對話歷史裁切時提示 user
+  - grep/read_file：達到上限時在結果尾端加警告
+  - REF 內容截斷時顯示原長度
+- **Context 使用量顯示**：每次呼叫 LLM 前顯示 `[CTX] ~N tokens (X%)`，方便調整 knowledge/附件長度
+  - 90% 以上顯示「接近上限」警告
+  - 100% 以上顯示「超出上限，將被截斷」警告
+- ELF 分析強化：新增 section 大小分析、symbol 統計、entry point 資訊
+- Binary 分析：ASCII 藝術檢測、重複模式識別
+
+### Changed
+- Context 使用量百分比改為相對於 `NUM_CTX`（而非 `MAX_MESSAGES_BUDGET`），更精確反映實際截斷風險
+- `_trim_messages_to_budget()` 回傳 `(messages, did_trim)` tuple，支援截斷警告
+
+### Fixed
+- 修正 eval 工具的 import 錯誤（`do_strict_mode` → `answer_with_self_check`）
+- 修正 Windows 環境下的 UTF-8 編碼問題
+
+---
+
 ## [0.2.0] - 2025-12-07
 
 穩定性與除錯體驗強化版
