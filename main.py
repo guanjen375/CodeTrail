@@ -36,7 +36,7 @@ from config import (
     CODE_RAG_ENABLED, IGNORED_DIRS, IGNORED_PATTERNS,
     SKIP_LOW_CONFIDENCE_KB, LOW_CONFIDENCE_KB_THRESHOLD
 )
-from utils import check_ollama_gpu, scan_project_metadata, scan_project, should_refuse_answer, should_use_strict_mode, answer_with_self_check, call_llm_stream
+from utils import check_ollama_gpu, scan_project_metadata, scan_project, should_refuse_answer, should_use_strict_mode, answer_with_self_check, call_llm_stream, print_ctx_usage
 from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from context import build_full_context, analyze_full, show_full_stats
@@ -158,6 +158,7 @@ def run_qa_mode(question: str, kb: "KnowledgeBase", qa_history: list = None):
 
         prompt = "\n".join(prompt_parts)
 
+        print_ctx_usage(len(prompt))
         result = call_llm_stream(prompt, temperature=0.3)
 
     # 資料飛輪：記錄互動

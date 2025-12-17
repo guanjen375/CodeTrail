@@ -24,7 +24,7 @@ from config import (
 )
 from utils import (
     call_llm_stream, should_use_strict_mode, answer_with_self_check,
-    scan_project_metadata
+    scan_project_metadata, print_ctx_usage
 )
 
 # 從拆分出的模組導入
@@ -435,6 +435,7 @@ def handle_followup(question: str, prev_qa: list, knowledge_ctx: str = "",
 請根據之前的回答與上方的參考資料/程式碼，直接給出針對這個補充條件的具體答案。
 重要：若有 [REF] 參考資料，必須以 REF 為準；若有相關程式碼，回答需基於程式碼內容。
 用繁體中文回答，簡潔明瞭。"""
+    print_ctx_usage(len(prompt))
     return call_llm_stream(prompt)
 
 
@@ -517,6 +518,7 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
 - 所有判斷必須附上 file:line 位置（如 agent.py:123）
 - 使用繁體中文回答
 """
+                print_ctx_usage(len(fast_prompt))
                 fast_answer = call_llm_stream(fast_prompt, temperature=0.0)
                 print(f"   [OK] 快路徑完成")
                 return _make_return(fast_answer)
@@ -666,6 +668,7 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
         print(f"[LOOP] Agent 第 {i+1} 輪...")
 
         messages = _trim_messages_to_budget(messages)
+        print_ctx_usage(_calc_messages_size(messages))
 
         response = call_llm_with_tools(messages, temperature=agent_temperature)
 
@@ -794,7 +797,9 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
 
     messages.append({"role": "user", "content": summary_prompt})
 
-    print("[NOTE] 根據已收集資訊回答：\n")
+    print("[NOTE] 根據已收集資訊回答：")
+    print_ctx_usage(_calc_messages_size(messages))
+    print()
     content = call_llm_with_tools_stream(messages, temperature=agent_temperature)
 
     if content:

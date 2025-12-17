@@ -14,7 +14,7 @@ from config import (
     DYNAMIC_NUM_CTX_BUFFER, CHARS_PER_TOKEN,
     get_answer_rules
 )
-from utils import get_priority, call_llm, call_llm_stream, should_use_strict_mode, answer_with_self_check
+from utils import get_priority, call_llm, call_llm_stream, should_use_strict_mode, answer_with_self_check, print_ctx_usage
 
 
 @dataclass
@@ -217,6 +217,7 @@ def analyze_full(ctx: FullContext, question: str, image_ctx: str = "", knowledge
 
     # Full 模式使用動態 num_ctx（GPT建議）
     num_ctx = _compute_full_num_ctx(ctx, question, image_ctx, knowledge_ctx)
+    print_ctx_usage(len(prompt))
     if stream:
         return call_llm_stream(prompt, temperature=temperature, num_ctx=num_ctx)
     return call_llm(prompt, temperature=temperature, num_ctx=num_ctx)

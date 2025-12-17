@@ -255,6 +255,20 @@ def scan_project(folder: str) -> dict[str, str]:
     return files
 
 
+def print_ctx_usage(chars: int, budget: int = None):
+    """顯示 context 使用量
+
+    Args:
+        chars: 字元數
+        budget: 預算上限（預設使用 MAX_MESSAGES_BUDGET）
+    """
+    from config import MAX_MESSAGES_BUDGET, CHARS_PER_TOKEN
+    budget = budget or MAX_MESSAGES_BUDGET
+    tokens = int(chars / CHARS_PER_TOKEN)
+    pct = chars * 100 / budget
+    print(f"   [CTX] ~{tokens:,} tokens ({pct:.0f}%)")
+
+
 def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None) -> str:
     """呼叫 LLM 生成回應
 
@@ -477,7 +491,9 @@ def answer_with_self_check(question: str, base_ctx: str, knowledge_ctx: str,
 
 請直接給出清楚的回答。"""
 
-    print("   [1/2] 生成初稿...\n")
+    print("   [1/2] 生成初稿...")
+    print_ctx_usage(len(first_prompt))
+    print()
     draft = call_llm_stream(first_prompt, temperature=STRICT_MODE_TEMPERATURE)
 
     if draft.startswith("[ERROR]"):
@@ -507,7 +523,9 @@ def answer_with_self_check(question: str, base_ctx: str, knowledge_ctx: str,
 - 完全沒根據 → 直接刪除，改成「文件/檔案未提及此點」
 - 不要解釋檢查過程，只輸出修正後的最終回答"""
 
-    print("   [2/2] 自我檢查...\n")
+    print("   [2/2] 自我檢查...")
+    print_ctx_usage(len(second_prompt))
+    print()
     final = call_llm_stream(second_prompt, temperature=0.0)
 
     return final.strip() if not final.startswith("[ERROR]") else draft
