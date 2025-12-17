@@ -3,17 +3,16 @@
 RAG 知識庫建立工具（增量模式）
 
 用法：
-    python RAG.py <input_file> <output_json>           # 一般文件模式
-    python RAG.py --chat <screenshot> <output_json>    # 聊天截圖模式
-    python RAG.py --image <image> <output_json>        # 技術圖片模式
-    python RAG.py --url <url> <output_json>            # 網頁模式
+    python RAG.py <input_file> <output_json>              # 一般文件（直接入庫）
+    python RAG.py <screenshot> <output_json> --chat       # 聊天截圖（互動式）
+    python RAG.py <image> <output_json> --image           # 技術圖片（互動式）
+    python RAG.py <url> <output_json> --url               # 網頁（互動式）
 
 範例：
-    python RAG.py docs/manual.pdf knowledge.json
-    python RAG.py guide.md knowledge.json
-    python RAG.py --chat chat_screenshot.png knowledge.json
-    python RAG.py --image architecture.png knowledge.json
-    python RAG.py --url https://docs.example.com/guide knowledge.json
+    python RAG.py manual.pdf knowledge.json
+    python RAG.py teams_chat.png knowledge.json --chat
+    python RAG.py npx6_arch.png knowledge.json --image
+    python RAG.py https://docs.example.com/guide knowledge.json --url
 """
 
 import sys

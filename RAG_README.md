@@ -64,14 +64,14 @@ python RAG.py api_manual.pdf knowledge.json
 python RAG.py hardware_spec.pdf knowledge.json
 python RAG.py faq.md knowledge.json
 
-# 加入聊天截圖
-python RAG.py --chat slack_discussion.png knowledge.json
+# 加入聊天截圖（互動式）
+python RAG.py slack_discussion.png knowledge.json --chat
 
-# 加入技術圖片
-python RAG.py --image memory_map.png knowledge.json
+# 加入技術圖片（互動式）
+python RAG.py memory_map.png knowledge.json --image
 
-# 加入網頁
-python RAG.py --url https://docs.banana-pi.org/zh/BPI-F3 knowledge.json
+# 加入網頁（互動式）
+python RAG.py https://docs.banana-pi.org/zh/BPI-F3 knowledge.json --url
 
 # 更新已存在的文件（自動移除舊版再加入新版）
 python RAG.py api_manual_v2.pdf knowledge.json
