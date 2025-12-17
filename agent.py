@@ -189,18 +189,22 @@ def _get_tool_priority(messages: list, tool_idx: int) -> int:
     return 3
 
 
-def _trim_messages_to_budget(messages: list, budget: int = MAX_MESSAGES_BUDGET) -> list:
-    """裁切 messages 使其總大小不超過預算"""
+def _trim_messages_to_budget(messages: list, budget: int = MAX_MESSAGES_BUDGET) -> tuple[list, bool]:
+    """裁切 messages 使其總大小不超過預算
+
+    Returns:
+        tuple: (messages, did_trim) - messages 和是否發生了裁切
+    """
     if _calc_messages_size(messages) <= budget:
-        return messages
+        return messages, False
 
     if len(messages) <= 2:
-        return messages
+        return messages, False
 
     tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
 
     if not tool_indices:
-        return messages
+        return messages, False
 
     num_to_summarize = max(0, len(tool_indices) - MIN_RECENT_TOOL_OUTPUTS)
 
@@ -214,7 +218,7 @@ def _trim_messages_to_budget(messages: list, budget: int = MAX_MESSAGES_BUDGET) 
                 messages[i]["content"] = content[:400] + f"\n... [截斷 {len(content) - 400} 字元]"
             elif priority == 1 and len(content) > 800:
                 messages[i]["content"] = content[:700] + f"\n... [截斷 {len(content) - 700} 字元]"
-        return messages
+        return messages, True
 
     summarize_candidates = tool_indices[:num_to_summarize]
     summarize_candidates.sort(key=lambda i: -_get_tool_priority(messages, i))
@@ -248,7 +252,7 @@ def _trim_messages_to_budget(messages: list, budget: int = MAX_MESSAGES_BUDGET) 
         else:
             tool_indices.remove(max_idx)
 
-    return messages
+    return messages, True
 
 
 # ============================================================
@@ -659,6 +663,7 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
     read_file_count = 0
     grep_count = 0
     tool_limit_reached = False
+    trim_warned = False  # 只警告一次
 
     for i in range(effective_max_loops):
         if tool_limit_reached:
@@ -667,7 +672,10 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
 
         print(f"[LOOP] Agent 第 {i+1} 輪...")
 
-        messages = _trim_messages_to_budget(messages)
+        messages, did_trim = _trim_messages_to_budget(messages)
+        if did_trim and not trim_warned:
+            print(f"   ⚠️ [CTX] 工具輸出已摘要/截斷，結論可能不完整；若需精確定位，請縮小問題範圍。")
+            trim_warned = True
         print_ctx_usage(_calc_messages_size(messages))
 
         response = call_llm_with_tools(messages, temperature=agent_temperature)
@@ -782,7 +790,7 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
 
         old_size = _calc_messages_size(messages)
         if old_size > MAX_MESSAGES_BUDGET:
-            messages = _trim_messages_to_budget(messages)
+            messages, _ = _trim_messages_to_budget(messages)
             new_size = _calc_messages_size(messages)
             print(f"   [TRIM] Messages 超預算: {old_size:,} -> {new_size:,} chars")
 

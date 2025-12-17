@@ -882,9 +882,10 @@ class KnowledgeBase:
 
             if KNOWLEDGE_INCLUDE_CONTENT:
                 content = chunk.get('content', '')
+                original_len = len(content)
                 max_chars = KNOWLEDGE_MERGE_MAX_CHARS if KNOWLEDGE_MERGE_ADJACENT else KNOWLEDGE_CONTENT_MAX_CHARS
-                if len(content) > max_chars:
-                    content = content[:max_chars] + "..."
+                if original_len > max_chars:
+                    content = content[:max_chars] + f"... [REF{i} 內容已截斷，原長度 {original_len} 字元]"
 
                 model_lines.append(f"\n[REF{i}]")
                 model_lines.append(f"  type: {doc_type}")

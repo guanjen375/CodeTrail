@@ -34,6 +34,8 @@ class FullContext:
     context_str: str
     code_chars: int
     stats: dict = field(default_factory=dict)
+    skipped_files: list[str] = field(default_factory=list)
+    skeleton_files: list[str] = field(default_factory=list)
 
 
 def extract_skeleton(content: str, max_lines: int = SKELETON_MAX_LINES) -> tuple[str, int]:
@@ -135,18 +137,22 @@ def build_full_context(files: dict[str, str]) -> FullContext:
 
     included = [e for e in entries if not e.is_skipped]
     skipped = [e for e in entries if e.is_skipped]
+    skeleton = [e for e in included if e.is_skeleton]
 
     stats = {
         "total_files": len(entries),
         "included": len(included),
         "skipped": len(skipped),
-        "skeleton": sum(1 for e in included if e.is_skeleton),
+        "skeleton": len(skeleton),
         "budget_high": budget_high, "used_high": used_high,
         "budget_mid": budget_mid, "used_mid": used_mid,
         "budget_low": budget_low, "used_low": used_low,
     }
 
-    return FullContext(entries, "".join(parts), total_chars, stats)
+    skipped_files = [e.path for e in skipped]
+    skeleton_files = [e.path for e in skeleton]
+
+    return FullContext(entries, "".join(parts), total_chars, stats, skipped_files, skeleton_files)
 
 
 def _compute_full_num_ctx(ctx: FullContext, question: str, image_ctx: str, knowledge_ctx: str) -> int:
@@ -176,14 +182,44 @@ def _compute_full_num_ctx(ctx: FullContext, question: str, image_ctx: str, knowl
     return max(DYNAMIC_NUM_CTX_MIN, min(budget, DYNAMIC_NUM_CTX_MAX))
 
 
+def _build_ctx_notice(ctx: FullContext) -> str:
+    """建立 context 完整性告示（給 LLM 看）"""
+    if not ctx.skipped_files and not ctx.skeleton_files:
+        return ""
+
+    lines = ["[CTX_NOTICE] 本次 Full Context 受 MAX_TOTAL_CHARS 限制："]
+
+    if ctx.skipped_files:
+        sample = ctx.skipped_files[:20]
+        lines.append(f"- 完全略過的檔案 ({len(ctx.skipped_files)} 個): {', '.join(sample)}")
+        if len(ctx.skipped_files) > 20:
+            lines.append(f"  ... 還有 {len(ctx.skipped_files) - 20} 個未列出")
+
+    if ctx.skeleton_files:
+        sample = ctx.skeleton_files[:20]
+        lines.append(f"- 只保留骨架的檔案 ({len(ctx.skeleton_files)} 個): {', '.join(sample)}")
+        if len(ctx.skeleton_files) > 20:
+            lines.append(f"  ... 還有 {len(ctx.skeleton_files) - 20} 個未列出")
+
+    lines.append("⚠️ 結論若涉及上述檔案，請明確說明「未讀到該檔案全文」，並建議使用者指定檔案/函式以補齊。")
+    lines.append("[/CTX_NOTICE]")
+
+    return "\n".join(lines)
+
+
 def analyze_full(ctx: FullContext, question: str, image_ctx: str = "", knowledge_ctx: str = "", stream: bool = True) -> str:
     """完整模式分析"""
     q_lower = question.lower() if question else ""
     is_creative = any(kw in q_lower for kw in ['refactor', '重構', '設計', '架構', 'design', 'architecture', '建議', 'suggest'])
     temperature = 0.2 if is_creative else 0.0
 
+    # 建立 context 完整性告示
+    ctx_notice = _build_ctx_notice(ctx)
+    notice_section = f"\n{ctx_notice}\n" if ctx_notice else ""
+
     # base_ctx 只放程式碼，image_ctx（bin/elf）獨立處理
-    base_ctx = f"""你是程式碼審查專家。以下是專案的完整程式碼：
+    base_ctx = f"""你是程式碼審查專家。{notice_section}
+以下是專案的程式碼（注意：可能並非全部檔案，見 CTX_NOTICE）：
 {ctx.context_str}"""
 
     if question:

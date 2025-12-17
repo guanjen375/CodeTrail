@@ -383,12 +383,14 @@ class ToolExecutor:
         total = len(lines)
 
         start_line = max(1, start_line)
+        truncated_by_limit = False
         if end_line is None:
             char_count = 0
             end_line = start_line
             for i in range(start_line - 1, total):
                 char_count += len(lines[i]) + 1
                 if char_count > MAX_FILE_READ_CHARS:
+                    truncated_by_limit = True
                     break
                 end_line = i + 1
         else:
@@ -398,7 +400,14 @@ class ToolExecutor:
         numbered = [f"{i:4d} | {line}" for i, line in enumerate(selected, start_line)]
 
         header = f"=== {path} (行 {start_line}-{end_line} / 共 {total} 行) ===\n"
-        footer = f"\n... 用 read_file('{path}', {end_line + 1}) 繼續" if end_line < total else ""
+
+        if end_line < total:
+            if truncated_by_limit:
+                footer = f"\n\n⚠️ [CTX] 因 MAX_FILE_READ_CHARS 限制只讀到第 {end_line} 行。用 read_file('{path}', {end_line + 1}) 繼續讀取。"
+            else:
+                footer = f"\n... 用 read_file('{path}', {end_line + 1}) 繼續"
+        else:
+            footer = ""
 
         return header + "\n".join(numbered) + footer
 
@@ -466,7 +475,13 @@ class ToolExecutor:
         if not results:
             return f"沒有找到 '{pattern}'"
 
-        return f"=== grep '{pattern}' ({len(results)} 結果) ===\n" + "\n".join(results)
+        header = f"=== grep '{pattern}' ({len(results)} 結果) ===\n"
+        body = "\n".join(results)
+
+        if len(results) >= MAX_GREP_RESULTS:
+            body += f"\n\n⚠️ [CTX] grep 已達 MAX_GREP_RESULTS={MAX_GREP_RESULTS}，結果可能不完整。建議縮小 path/include 或用更精準的 pattern。"
+
+        return header + body
 
     def _safe_regex_search(self, regex, text: str, timeout_chars: int = 10000) -> bool:
         """安全的 regex search，對超長行做截斷保護"""

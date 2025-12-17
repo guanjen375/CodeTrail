@@ -132,6 +132,15 @@ def run_qa_mode(question: str, kb: "KnowledgeBase", qa_history: list = None):
 
         # 加入對話歷史（如果有）
         if qa_history:
+            # 檢查是否有裁切
+            history_truncated = len(qa_history) > 3
+            answer_truncated = any(len(a) > 500 for _, a in qa_history[-3:])
+
+            if history_truncated:
+                print(f"   ⚠️ [CTX] 對話歷史過長，只保留最近 3 輪（已移除 {len(qa_history) - 3} 輪）")
+            if answer_truncated:
+                print(f"   ⚠️ [CTX] 部分回答過長已截斷，追問若依賴細節請重貼關鍵段落")
+
             prompt_parts.append("")
             prompt_parts.append("=== 對話歷史 ===")
             for prev_q, prev_a in qa_history[-3:]:  # 只取最近 3 輪
