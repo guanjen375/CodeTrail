@@ -653,18 +653,21 @@ def _save_to_cache(source_name: str, content: str, source_type: str, metadata: d
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     cache_file = cache_dir / f"{source_type}_{safe_name}_{timestamp}.md"
 
-    # 寫入快取
-    with open(cache_file, 'w', encoding='utf-8') as f:
-        f.write(f"<!-- 來源: {source_name} -->\n")
-        f.write(f"<!-- 類型: {source_type} -->\n")
-        f.write(f"<!-- 生成時間: {datetime.now().isoformat()} -->\n")
-        if metadata:
-            for k, v in metadata.items():
-                f.write(f"<!-- {k}: {v} -->\n")
-        f.write("\n")
-        f.write(content)
-
-    return cache_file
+    # 寫入快取（失敗時僅警告，不中斷流程）
+    try:
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            f.write(f"<!-- 來源: {source_name} -->\n")
+            f.write(f"<!-- 類型: {source_type} -->\n")
+            f.write(f"<!-- 生成時間: {datetime.now().isoformat()} -->\n")
+            if metadata:
+                for k, v in metadata.items():
+                    f.write(f"<!-- {k}: {v} -->\n")
+            f.write("\n")
+            f.write(content)
+        return cache_file
+    except Exception as e:
+        print(f"[WARN] 快取寫入失敗: {e}")
+        return None
 
 
 # ============================================================
@@ -864,7 +867,8 @@ def _add_chat_content_to_kb(image_path: Path, content: str, output_file: str):
 
     # 自動快取分析結果
     cache_file = _save_to_cache(image_path.name, content, "chat")
-    print(f"[INFO] 快取已存: {cache_file}")
+    if cache_file:
+        print(f"[INFO] 快取已存: {cache_file}")
 
     # 切分成 chunks
     chunk_results = split_by_semantic_with_sections(content)
@@ -1132,7 +1136,6 @@ def process_url(url: str) -> Optional[Tuple[List[Dict], str]]:
 
     # GPT 建議：使用更穩定的命名避免撞名
     url_name = generate_url_name(url)
-    fetched_at = datetime.now().isoformat()
 
     # 切分成 chunks
     results = []
@@ -1204,7 +1207,8 @@ def _add_url_content_to_kb(url: str, content: str, title: str, output_file: str)
 
     # 自動快取抓取結果
     cache_file = _save_to_cache(url, content, "url", {"title": title})
-    print(f"[INFO] 快取已存: {cache_file}")
+    if cache_file:
+        print(f"[INFO] 快取已存: {cache_file}")
 
     # 切分成 chunks
     chunk_results = split_by_semantic_with_sections(content)
@@ -1359,7 +1363,8 @@ def _add_image_content_to_kb(image_path: Path, content: str, output_file: str):
 
     # 自動快取分析結果
     cache_file = _save_to_cache(image_path.name, content, "image")
-    print(f"[INFO] 快取已存: {cache_file}")
+    if cache_file:
+        print(f"[INFO] 快取已存: {cache_file}")
 
     # 切分成 chunks
     chunk_results = split_by_semantic_with_sections(content)
