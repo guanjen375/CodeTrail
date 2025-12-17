@@ -255,18 +255,27 @@ def scan_project(folder: str) -> dict[str, str]:
     return files
 
 
-def print_ctx_usage(chars: int, budget: int = None):
-    """顯示 context 使用量
+def print_ctx_usage(chars: int) -> bool:
+    """顯示 context 使用量（相對於 NUM_CTX）
 
     Args:
         chars: 字元數
-        budget: 預算上限（預設使用 MAX_MESSAGES_BUDGET）
+
+    Returns:
+        bool: 是否超過 100%（會被截斷）
     """
-    from config import MAX_MESSAGES_BUDGET, CHARS_PER_TOKEN
-    budget = budget or MAX_MESSAGES_BUDGET
+    from config import NUM_CTX, CHARS_PER_TOKEN
     tokens = int(chars / CHARS_PER_TOKEN)
-    pct = chars * 100 / budget
-    print(f"   [CTX] ~{tokens:,} tokens ({pct:.0f}%)")
+    pct = tokens * 100 / NUM_CTX
+
+    if pct >= 100:
+        print(f"   [CTX] ~{tokens:,} tokens ({pct:.0f}%) ⚠️ 超出上限，將被截斷！")
+        return True
+    elif pct >= 90:
+        print(f"   [CTX] ~{tokens:,} tokens ({pct:.0f}%) ⚠️ 接近上限")
+    else:
+        print(f"   [CTX] ~{tokens:,} tokens ({pct:.0f}%)")
+    return False
 
 
 def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None) -> str:
