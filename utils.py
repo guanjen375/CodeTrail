@@ -441,10 +441,12 @@ def should_refuse_answer(question: str, kb_metadata: dict) -> bool:
     if top_emb_score < WEAK_REF_THRESHOLD:
         return True
 
-    # 額外檢查：spec 問題最好要命中 type=spec 的 chunk
-    has_spec_chunk = kb_metadata.get("has_spec_chunk", True)  # 預設 True（向後相容）
-    if not has_spec_chunk and top_emb_score < WEAK_REF_THRESHOLD + 0.1:
-        # 沒有 spec chunk 且 embedding score 不夠高，視為弱證據
+    # 額外檢查：spec 問題最好要命中權威類型（spec/manual/api）的 chunk
+    # GPT 建議：使用 has_authoritative_chunk（包含 manual/api），向後相容 has_spec_chunk
+    has_authoritative = kb_metadata.get("has_authoritative_chunk",
+                                        kb_metadata.get("has_spec_chunk", True))
+    if not has_authoritative and top_emb_score < WEAK_REF_THRESHOLD + 0.1:
+        # 沒有權威類型 chunk 且 embedding score 不夠高，視為弱證據
         return True
 
     return False

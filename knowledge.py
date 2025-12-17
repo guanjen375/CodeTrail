@@ -941,7 +941,14 @@ class KnowledgeBase:
         # 修正：top_emb_score 改用「最終被選中的 chunks」的最高分，而非 candidates[0]
         # 這避免了「candidates[0] 被過濾掉，但 top_emb_score 仍用它的低分」的問題
         top_kw_score = candidates[0][2] if candidates else 0.0
-        has_spec_chunk = any(chunk.get('type') == 'spec' for chunk in merged_chunks)
+        # GPT 建議：將 has_spec_chunk 改為 has_authoritative_chunk
+        # 權威類型：spec、manual、api（chat/diagram 不算權威）
+        authoritative_types = {'spec', 'manual', 'api'}
+        has_authoritative_chunk = any(
+            chunk.get('type') in authoritative_types for chunk in merged_chunks
+        )
+        # 保留舊名以向後相容
+        has_spec_chunk = has_authoritative_chunk
 
         # 新增：回傳 refs 清單供 data_flywheel / eval 使用
         # 這讓匯出的資料能記錄「用了哪些 REF」，方便訓練和回歸比較
@@ -960,7 +967,8 @@ class KnowledgeBase:
             "top_score": top_score,               # combined score（向後相容）
             "top_emb_score": top_emb_score_used,  # 修正：用最終選中 chunks 的最高 emb score
             "top_kw_score": top_kw_score,         # 純 keyword score
-            "has_spec_chunk": has_spec_chunk,     # 是否命中 spec 類型的 chunk
+            "has_spec_chunk": has_spec_chunk,     # 向後相容（等同 has_authoritative_chunk）
+            "has_authoritative_chunk": has_authoritative_chunk,  # 是否命中權威類型（spec/manual/api）
             "ref_count": len(merged_chunks),
             "refs": refs                          # 新增：實際引用的 REF 清單
         }

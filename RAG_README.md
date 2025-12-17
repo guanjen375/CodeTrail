@@ -1,6 +1,6 @@
 # RAG 知識庫使用指南
 
-本工具支援 RAG（Retrieval-Augmented Generation）功能，可將技術文件（PDF、Markdown、純文字）、**聊天截圖**及**技術圖片**整合到問答系統中，讓 AI 回答時能引用文件內容。
+本工具支援 RAG（Retrieval-Augmented Generation）功能，可將技術文件（PDF、Markdown、純文字）、**聊天截圖**、**技術圖片**及**網頁**整合到問答系統中，讓 AI 回答時能引用文件內容。
 
 ## 快速開始
 
@@ -14,7 +14,10 @@ python RAG.py --chat teams_chat.png knowledge.json
 # 3. 從技術圖片加入知識（架構圖/流程圖/記憶體映射等）
 python RAG.py --image npx6_arch.png knowledge.json
 
-# 4. 使用知識庫進行問答
+# 4. 從網頁加入知識（技術文件網站等）
+python RAG.py --url https://docs.example.com/api knowledge.json
+
+# 5. 使用知識庫進行問答
 python main.py . --kb=knowledge.json
 >>> API 的 rate limit 是多少？
 # 回答會標註：根據 REF1（manual.pdf 第 15 頁）...
@@ -33,6 +36,13 @@ python RAG.py --chat <截圖檔案> <輸出JSON>
 
 # 技術圖片模式
 python RAG.py --image <圖片檔案> <輸出JSON>
+
+# 網頁模式
+python RAG.py --url <網址> <輸出JSON>
+
+# 手動校正模式（只輸出 .md，不入庫）
+python RAG.py --chat --export-md <截圖檔案>
+python RAG.py --image --export-md <圖片檔案>
 ```
 
 ### 支援的檔案類型
@@ -43,6 +53,7 @@ python RAG.py --image <圖片檔案> <輸出JSON>
 | Markdown | `.md` | 保留標題結構 |
 | 純文字 | `.txt` | 按段落切分 |
 | 圖片 | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` | 聊天截圖（`--chat`）或技術圖片（`--image`） |
+| 網頁 | `http://`, `https://` | 網頁內容（`--url`），自動轉換為 Markdown |
 
 ### 增量更新
 
@@ -62,6 +73,9 @@ python RAG.py --chat slack_discussion.png knowledge.json
 # 加入技術圖片
 python RAG.py --image memory_map.png knowledge.json
 
+# 加入網頁
+python RAG.py --url https://docs.banana-pi.org/zh/BPI-F3 knowledge.json
+
 # 更新已存在的文件（自動移除舊版再加入新版）
 python RAG.py api_manual_v2.pdf knowledge.json
 ```
@@ -80,6 +94,7 @@ python RAG.py api_manual_v2.pdf knowledge.json
 | `warning` | 內容含 WARNING/CAUTION/危險 | 警告類，會特別標示 |
 | `chat` | 聊天截圖（`--chat` 模式） | 對話摘要 |
 | `diagram` | 技術圖片（`--image` 模式） | 架構/流程圖描述 |
+| `web` | 網頁（`--url` 模式） | 網頁內容 |
 
 ### 聊天截圖模式（--chat）
 
@@ -111,6 +126,19 @@ python RAG.py --chat zebu_discussion.png knowledge.json
 - 需要安裝支援視覺的模型（如 `qwen3-vl`、`llava` 等）
 - 截圖品質越清晰，識別效果越好
 - 建議一張截圖只包含一個主題的對話
+
+**手動校正模式**：
+
+若需要先檢查 VL 輸出再入庫，可使用 `--export-md`：
+
+```bash
+# 只輸出 .md 檔，不入庫
+python RAG.py --chat --export-md teams_chat.png
+# 產生 chat_teams_chat.md
+
+# 手動校正後再入庫
+python RAG.py chat_teams_chat.md knowledge.json
+```
 
 ### 技術圖片模式（--image）
 
@@ -151,6 +179,59 @@ python RAG.py --image npx6_architecture.png knowledge.json
 - 複雜圖片（混合對話+架構圖）建議手動整理成 txt/md
 - VL 模型對圖形關係的理解有限，重要資訊建議人工確認
 - 位址、數值等精確資訊可能需要校正
+
+**手動校正模式**：
+
+若需要先檢查 VL 輸出再入庫，可使用 `--export-md`：
+
+```bash
+# 只輸出 .md 檔，不入庫
+python RAG.py --image --export-md npx6_arch.png
+# 產生 image_npx6_arch.md
+
+# 手動校正後再入庫
+python RAG.py image_npx6_arch.md knowledge.json
+```
+
+### 網頁模式（--url）
+
+將網頁內容轉換為知識庫，適合技術文件網站、API 文件等：
+
+```bash
+python RAG.py --url https://docs.banana-pi.org/zh/BPI-F3 knowledge.json
+```
+
+**處理流程**：
+1. 檢查網路連線，若連線失敗會立即通知
+2. 使用 `html2text` 將 HTML 轉換為乾淨的 Markdown
+3. 自動清理：移除導航列、頁尾、JavaScript 連結等雜訊
+4. 切分成 chunks 並生成 embedding
+5. 存入知識庫（來源標記為 `web_<網域>`）
+
+**使用場景**：
+- 技術文件網站（API 文件、SDK 文件）
+- 產品規格頁面
+- Wiki 或知識庫頁面
+- 部落格技術文章
+
+**錯誤處理**：
+- **連線失敗**：無法連接到伺服器時，會顯示錯誤訊息並終止
+- **HTTP 錯誤**：404、403 等錯誤會明確提示
+- **逾時**：超過 30 秒未回應會自動終止
+
+**注意事項**：
+- 需要安裝 `html2text` 套件：`pip install html2text`
+- 僅擷取單一頁面，不會自動爬取子頁面
+- 動態載入的內容（JavaScript 渲染）可能無法擷取
+- 部分網站可能有反爬蟲機制，導致擷取失敗
+- 建議優先使用官方提供的 PDF/Markdown 文件
+
+**與手動複製的差異**：
+
+| 方式 | 優點 | 缺點 |
+|------|------|------|
+| `--url` 模式 | 自動清理雜訊、格式統一 | 動態內容可能遺漏 |
+| 手動複製貼上 | 可選擇性複製 | 常混入圖片檔名、導航連結等雜訊 |
 
 ## 使用知識庫
 

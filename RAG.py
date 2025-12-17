@@ -6,12 +6,14 @@ RAG 知識庫建立工具（增量模式）
     python RAG.py <input_file> <output_json>           # 一般文件模式
     python RAG.py --chat <screenshot> <output_json>    # 聊天截圖模式
     python RAG.py --image <image> <output_json>        # 技術圖片模式
+    python RAG.py --url <url> <output_json>            # 網頁模式
 
 範例：
     python RAG.py docs/manual.pdf knowledge.json
     python RAG.py guide.md knowledge.json
     python RAG.py --chat chat_screenshot.png knowledge.json
     python RAG.py --image architecture.png knowledge.json
+    python RAG.py --url https://docs.example.com/guide knowledge.json
 """
 
 import sys
@@ -25,29 +27,34 @@ from typing import List, Dict
 # ============================================================
 # 依賴檢查
 # ============================================================
-def check_dependencies():
-    """檢查必要套件"""
-    missing = []
-    
-    try:
-        import pymupdf4llm
-    except ImportError:
-        missing.append("pymupdf4llm")
-    
+# GPT 建議：條件式依賴檢查，按模式載入
+# - PDF 模式才需要 pymupdf4llm
+# - VL 模式（--chat/--image）需要 ollama
+# - --url 模式需要 html2text
+# - 所有模式都需要 ollama（用於 embedding）
+
+def check_ollama():
+    """檢查 ollama 套件（所有模式都需要）"""
     try:
         import ollama
+        return ollama
     except ImportError:
-        missing.append("ollama")
-    
-    if missing:
-        print(f"[ERROR] 缺少套件: {', '.join(missing)}")
-        print(f"請執行: pip install {' '.join(missing)}")
+        print("[ERROR] 缺少套件: ollama")
+        print("請執行: pip install ollama")
         sys.exit(1)
 
-check_dependencies()
+def check_pymupdf4llm():
+    """檢查 pymupdf4llm 套件（只有 PDF 模式需要）"""
+    try:
+        import pymupdf4llm
+        return pymupdf4llm
+    except ImportError:
+        print("[ERROR] 處理 PDF 需要 pymupdf4llm 套件")
+        print("請執行: pip install pymupdf4llm")
+        sys.exit(1)
 
-import pymupdf4llm
-import ollama
+# 延遲載入：ollama 在需要時才 import
+ollama = None
 
 # ============================================================
 # 設定
@@ -275,6 +282,9 @@ def split_text(text: str, max_chars: int = CHUNK_SIZE) -> List[str]:
 # ============================================================
 def extract_pdf(file_path: str) -> List[Dict]:
     """提取 PDF 內容，保留頁碼、文件類型、章節"""
+    # 延遲載入 pymupdf4llm（只有 PDF 模式需要）
+    pymupdf4llm = check_pymupdf4llm()
+
     try:
         pages = pymupdf4llm.to_markdown(file_path, page_chunks=True, write_images=False)
     except Exception as e:
@@ -379,11 +389,22 @@ def extract_chat_from_screenshot(image_path: str) -> str:
     ext = Path(image_path).suffix.lower()
 
     # 提示詞：要求 VL 模型提取並整理聊天內容
+    # GPT 建議：增加「原始摘錄」層，降低幻覺風險
     prompt = """請分析這張聊天截圖，並整理成結構化的技術知識文件。
+
+**重要**：請盡量忠實呈現原文，不要推測或補完看不清楚的內容。
 
 請按以下格式輸出：
 
 # [主題標題]
+
+## 原始對話摘錄
+（請盡量逐字轉錄對話內容，看不清楚的地方標註 [看不清楚] 或 [模糊]）
+```
+[人物A]: ...
+[人物B]: ...
+...
+```
 
 ## 背景/問題
 [簡述討論的背景或問題]
@@ -408,7 +429,13 @@ def extract_chat_from_screenshot(image_path: str) -> str:
 
 ---
 請用繁體中文輸出，保留原文中的專有名詞和指令。
-如果截圖內容不是聊天對話，請直接描述圖片中的技術資訊。"""
+如果截圖內容不是聊天對話，請直接描述圖片中的技術資訊。
+若有任何不確定的內容，請明確標註「推測」或「不確定」。"""
+
+    # 延遲載入 ollama
+    global ollama
+    if ollama is None:
+        ollama = check_ollama()
 
     try:
         response = ollama.chat(
@@ -482,7 +509,10 @@ def extract_info_from_image(image_path: str) -> str:
         image_data = base64.b64encode(f.read()).decode('utf-8')
 
     # 提示詞：針對技術圖片的分析
+    # GPT 建議：增加「原始文字摘錄」層，降低幻覺風險
     prompt = """請詳細分析這張技術圖片，並整理成結構化的技術文件。
+
+**重要**：請盡量忠實呈現圖中文字，不要推測或補完看不清楚的內容。
 
 這可能是以下類型的圖片：
 - 系統架構圖 / 方塊圖
@@ -496,6 +526,15 @@ def extract_info_from_image(image_path: str) -> str:
 請按以下格式輸出：
 
 # [圖片主題/名稱]
+
+## 原始文字摘錄
+（請列出圖中所有可辨識的文字標註，看不清楚的標註 [模糊]）
+```
+- [文字1]
+- [文字2]
+- [位址/數值]: [對應文字]
+...
+```
 
 ## 概述
 [簡述這張圖的用途和主要內容]
@@ -526,7 +565,13 @@ def extract_info_from_image(image_path: str) -> str:
 
 ---
 請用繁體中文輸出，保留原文中的專有名詞、位址、數值。
-盡可能完整描述圖中的所有資訊，包括文字標註、箭頭方向、顏色區分等。"""
+盡可能完整描述圖中的所有資訊，包括文字標註、箭頭方向、顏色區分等。
+若有任何不確定的內容，請明確標註「推測」或「不確定」。"""
+
+    # 延遲載入 ollama
+    global ollama
+    if ollama is None:
+        ollama = check_ollama()
 
     try:
         response = ollama.chat(
@@ -580,24 +625,81 @@ def process_technical_image(image_path: str) -> List[Dict]:
 
 
 # ============================================================
+# Export MD（GPT 建議：輸出中間產物供手動校正）
+# ============================================================
+def export_chat_to_md(image_path: str) -> str:
+    """將聊天截圖分析結果輸出為 .md 檔（不入庫，供手動校正）"""
+    print(f"[INFO] 使用 VL 模型分析截圖...")
+    content = extract_chat_from_screenshot(image_path)
+
+    if not content:
+        print("[ERROR] VL 模型分析失敗")
+        return ""
+
+    # 生成輸出檔名
+    image_name = Path(image_path).stem
+    output_path = Path(image_path).parent / f"chat_{image_name}.md"
+
+    # 寫入檔案
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(f"<!-- 來源: {image_path} -->\n")
+        f.write(f"<!-- 生成時間: {datetime.now().isoformat()} -->\n")
+        f.write(f"<!-- 請校正後使用: python RAG.py {output_path} <knowledge.json> -->\n\n")
+        f.write(content)
+
+    print(f"[INFO] 已輸出: {output_path}")
+    print(f"[INFO] 請檢查並校正內容後，執行: python RAG.py {output_path} <knowledge.json>")
+    return str(output_path)
+
+
+def export_image_to_md(image_path: str) -> str:
+    """將技術圖片分析結果輸出為 .md 檔（不入庫，供手動校正）"""
+    print(f"[INFO] 使用 VL 模型分析技術圖片...")
+    content = extract_info_from_image(image_path)
+
+    if not content:
+        print("[ERROR] VL 模型分析失敗")
+        return ""
+
+    # 生成輸出檔名
+    image_name = Path(image_path).stem
+    output_path = Path(image_path).parent / f"image_{image_name}.md"
+
+    # 寫入檔案
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(f"<!-- 來源: {image_path} -->\n")
+        f.write(f"<!-- 生成時間: {datetime.now().isoformat()} -->\n")
+        f.write(f"<!-- 請校正後使用: python RAG.py {output_path} <knowledge.json> -->\n\n")
+        f.write(content)
+
+    print(f"[INFO] 已輸出: {output_path}")
+    print(f"[INFO] 請檢查並校正內容後，執行: python RAG.py {output_path} <knowledge.json>")
+    return str(output_path)
+
+
+# ============================================================
 # Embedding
 # ============================================================
 def generate_embeddings(chunks: List[Dict]) -> List[Dict]:
     """為所有 chunks 生成 embeddings"""
+    global ollama
+    if ollama is None:
+        ollama = check_ollama()
+
     total = len(chunks)
-    
+
     for i, chunk in enumerate(chunks):
         # 進度顯示
         if (i + 1) % 10 == 0 or i == 0 or i == total - 1:
             print(f"  Embedding: {i + 1}/{total}", end='\r')
-        
+
         try:
             response = ollama.embeddings(model=EMBEDDING_MODEL, prompt=chunk['content'])
             chunk['embedding'] = response['embedding']
         except Exception as e:
             print(f"\n  [ERROR] Embedding 失敗: {e}")
             chunk['embedding'] = []
-    
+
     print()  # 換行
     return chunks
 
@@ -757,6 +859,228 @@ def add_chat_screenshot(image_file: str, output_file: str):
 
 
 # ============================================================
+# 網頁處理
+# ============================================================
+def fetch_url_content(url: str) -> tuple[str, str]:
+    """
+    抓取網頁內容並轉換成 Markdown
+
+    Returns: (content, title) 或 ("", "") 如果失敗
+    """
+    import requests
+
+    # 檢查是否有 html2text
+    try:
+        import html2text
+    except ImportError:
+        print("[ERROR] 需要安裝 html2text 套件")
+        print("請執行: pip install html2text")
+        return "", ""
+
+    print(f"[INFO] 正在連線: {url}")
+
+    # 設定 headers 模擬瀏覽器
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+    except requests.exceptions.ConnectionError:
+        print(f"[ERROR] 無法連線到 {url}")
+        print("        請檢查網路連線或網址是否正確")
+        return "", ""
+    except requests.exceptions.Timeout:
+        print(f"[ERROR] 連線逾時: {url}")
+        return "", ""
+    except requests.exceptions.HTTPError as e:
+        print(f"[ERROR] HTTP 錯誤: {e}")
+        return "", ""
+    except Exception as e:
+        print(f"[ERROR] 抓取失敗: {e}")
+        return "", ""
+
+    # 處理編碼
+    response.encoding = response.apparent_encoding or 'utf-8'
+    html_content = response.text
+
+    # 提取標題
+    title = ""
+    title_match = re.search(r'<title[^>]*>([^<]+)</title>', html_content, re.IGNORECASE)
+    if title_match:
+        title = title_match.group(1).strip()
+
+    # 轉換成 Markdown
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.ignore_images = True  # 忽略圖片
+    h.ignore_emphasis = False
+    h.body_width = 0  # 不換行
+    h.unicode_snob = True
+    h.skip_internal_links = True
+
+    markdown_content = h.handle(html_content)
+
+    # 清理內容
+    markdown_content = clean_markdown_content(markdown_content)
+
+    return markdown_content, title
+
+
+def clean_markdown_content(content: str) -> str:
+    """清理 Markdown 內容，移除雜訊"""
+    lines = content.split('\n')
+    cleaned_lines = []
+
+    # 常見的導航/頁尾關鍵字
+    skip_patterns = [
+        r'^(Skip to|跳到|跳至|導航|Navigation|Menu|選單)',
+        r'^(Copyright|©|版權|All rights reserved)',
+        r'^(Privacy|隱私|Terms|條款)',
+        r'^\[.*\]\(javascript:',  # JavaScript 連結
+        r'^(\s*\|\s*)+$',  # 空表格行
+    ]
+
+    skip_section = False
+    empty_count = 0
+
+    for line in lines:
+        stripped = line.strip()
+
+        # 跳過空行堆積
+        if not stripped:
+            empty_count += 1
+            if empty_count <= 2:  # 最多保留 2 個連續空行
+                cleaned_lines.append(line)
+            continue
+        else:
+            empty_count = 0
+
+        # 跳過匹配的雜訊
+        should_skip = False
+        for pattern in skip_patterns:
+            if re.match(pattern, stripped, re.IGNORECASE):
+                should_skip = True
+                break
+
+        if should_skip:
+            continue
+
+        # 跳過過短的行（可能是導航按鈕等）
+        if len(stripped) < 3 and not stripped.startswith('#'):
+            continue
+
+        cleaned_lines.append(line)
+
+    return '\n'.join(cleaned_lines).strip()
+
+
+def process_url(url: str) -> List[Dict]:
+    """處理網頁 URL，提取內容並整理成知識區塊"""
+    content, title = fetch_url_content(url)
+
+    if not content:
+        return []
+
+    print(f"[INFO] 網頁標題: {title or '(無標題)'}")
+    print(f"[INFO] 提取完成，內容長度: {len(content)} 字元")
+    print("-" * 40)
+    print(content[:500] + "..." if len(content) > 500 else content)
+    print("-" * 40)
+
+    # 從 URL 生成檔名
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    # 取 path 最後一段作為檔名，或用 domain
+    path_parts = [p for p in parsed.path.split('/') if p]
+    if path_parts:
+        url_name = path_parts[-1]
+    else:
+        url_name = parsed.netloc.replace('.', '_')
+
+    # 切分成 chunks
+    results = []
+    chunk_results = split_by_semantic_with_sections(content)
+
+    for i, chunk_data in enumerate(chunk_results):
+        chunk_type = detect_content_type(chunk_data["content"], 'web')
+
+        results.append({
+            "source": f"url_{url_name}",
+            "page": 1,
+            "chunk_index": i,
+            "content": chunk_data["content"],
+            "type": chunk_type,
+            "section": chunk_data["section"],
+            "origin": "url",
+            "url": url  # 保留原始 URL
+        })
+
+    return results
+
+
+def add_url(url: str, output_file: str):
+    """將網頁內容加入知識庫"""
+    output_path = Path(output_file)
+
+    # 簡單驗證 URL 格式
+    if not url.startswith(('http://', 'https://')):
+        print(f"[ERROR] 無效的 URL: {url}")
+        print("        URL 必須以 http:// 或 https:// 開頭")
+        sys.exit(1)
+
+    # 載入現有知識庫
+    kb = load_knowledge_base(output_path)
+
+    # 從 URL 生成文件名
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    path_parts = [p for p in parsed.path.split('/') if p]
+    if path_parts:
+        url_name = path_parts[-1]
+    else:
+        url_name = parsed.netloc.replace('.', '_')
+
+    doc_name = f"url_{url_name}"
+
+    # 檢查是否已存在同名文件
+    if doc_name in kb["metadata"]["documents"]:
+        print(f"[INFO] 更新現有網頁知識: {doc_name}")
+        kb["chunks"] = [c for c in kb["chunks"] if c["source"] != doc_name]
+        kb["metadata"]["documents"].remove(doc_name)
+    else:
+        print(f"[INFO] 新增網頁知識: {doc_name}")
+
+    # 處理網頁
+    new_chunks = process_url(url)
+
+    if not new_chunks:
+        print("[ERROR] 無法從網頁提取內容，新增失敗")
+        sys.exit(1)
+
+    print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
+
+    # 生成 embeddings
+    print(f"[INFO] 使用 {EMBEDDING_MODEL} 生成 embeddings...")
+    new_chunks = generate_embeddings(new_chunks)
+
+    # 為每個 chunk 生成唯一 ID
+    for chunk in new_chunks:
+        content_hash = hashlib.md5(chunk['content'].encode()).hexdigest()[:8]
+        chunk['id'] = f"{chunk['source']}::p{chunk['page']}::c{chunk['chunk_index']}::{content_hash}"
+
+    # Append 到知識庫
+    kb["chunks"].extend(new_chunks)
+    kb["metadata"]["documents"].append(doc_name)
+
+    # 儲存
+    save_knowledge_base(kb, output_path)
+
+
+# ============================================================
 # 技術圖片模式
 # ============================================================
 def add_technical_image(image_file: str, output_file: str):
@@ -822,11 +1146,18 @@ def print_usage():
     print("  python RAG.py <input_file> <output_json>           # 一般文件模式")
     print("  python RAG.py --chat <screenshot> <output_json>    # 聊天截圖模式")
     print("  python RAG.py --image <image> <output_json>        # 技術圖片模式")
+    print("  python RAG.py --url <url> <output_json>            # 網頁模式")
+    print("")
+    print("選項:")
+    print("  --export-md   只輸出 VL 分析結果為 .md 檔，不入庫（供手動校正）")
+    print("                用法: python RAG.py --chat --export-md <screenshot>")
+    print("                      python RAG.py --image --export-md <image>")
     print("")
     print("參數:")
     print("  input_file   要加入的文件 (pdf/md/txt)")
     print("  screenshot   聊天截圖圖片 (png/jpg/jpeg/gif/webp)")
     print("  image        技術圖片 (架構圖/流程圖/記憶體映射等)")
+    print("  url          網頁 URL (http:// 或 https://)")
     print("  output_json  知識庫檔案 (不存在則建立，存在則 append)")
     print("")
     print("範例:")
@@ -834,6 +1165,8 @@ def print_usage():
     print("  python RAG.py guide.md knowledge.json")
     print("  python RAG.py --chat teams_chat.png knowledge.json")
     print("  python RAG.py --image npx6_arch.png knowledge.json")
+    print("  python RAG.py --url https://docs.example.com/guide knowledge.json")
+    print("  python RAG.py --chat --export-md chat_screenshot.png  # 只輸出 .md")
     print("")
     print(f"支援的文件類型: {', '.join(SUPPORTED_EXTENSIONS)}")
     print(f"支援的圖片類型: {', '.join(IMAGE_EXTENSIONS)}")
@@ -841,29 +1174,64 @@ def print_usage():
 
 if __name__ == "__main__":
     # 解析參數
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         print_usage()
         sys.exit(1)
 
+    # 檢查 --export-md 選項
+    export_md_mode = "--export-md" in sys.argv
+    if export_md_mode:
+        sys.argv.remove("--export-md")
+
     # 聊天截圖模式
     if sys.argv[1] == "--chat":
-        if len(sys.argv) != 4:
-            print("[ERROR] --chat 模式需要 2 個參數")
-            print("用法: python RAG.py --chat <screenshot> <output_json>")
-            sys.exit(1)
-        image_file = sys.argv[2]
-        output_file = sys.argv[3]
-        add_chat_screenshot(image_file, output_file)
+        if export_md_mode:
+            # --chat --export-md <image>
+            if len(sys.argv) != 3:
+                print("[ERROR] --chat --export-md 模式需要 1 個參數")
+                print("用法: python RAG.py --chat --export-md <screenshot>")
+                sys.exit(1)
+            image_file = sys.argv[2]
+            export_chat_to_md(image_file)
+        else:
+            # --chat <image> <output_json>
+            if len(sys.argv) != 4:
+                print("[ERROR] --chat 模式需要 2 個參數")
+                print("用法: python RAG.py --chat <screenshot> <output_json>")
+                sys.exit(1)
+            image_file = sys.argv[2]
+            output_file = sys.argv[3]
+            add_chat_screenshot(image_file, output_file)
 
     # 技術圖片模式
     elif sys.argv[1] == "--image":
+        if export_md_mode:
+            # --image --export-md <image>
+            if len(sys.argv) != 3:
+                print("[ERROR] --image --export-md 模式需要 1 個參數")
+                print("用法: python RAG.py --image --export-md <image>")
+                sys.exit(1)
+            image_file = sys.argv[2]
+            export_image_to_md(image_file)
+        else:
+            # --image <image> <output_json>
+            if len(sys.argv) != 4:
+                print("[ERROR] --image 模式需要 2 個參數")
+                print("用法: python RAG.py --image <image> <output_json>")
+                sys.exit(1)
+            image_file = sys.argv[2]
+            output_file = sys.argv[3]
+            add_technical_image(image_file, output_file)
+
+    # 網頁模式
+    elif sys.argv[1] == "--url":
         if len(sys.argv) != 4:
-            print("[ERROR] --image 模式需要 2 個參數")
-            print("用法: python RAG.py --image <image> <output_json>")
+            print("[ERROR] --url 模式需要 2 個參數")
+            print("用法: python RAG.py --url <url> <output_json>")
             sys.exit(1)
-        image_file = sys.argv[2]
+        url = sys.argv[2]
         output_file = sys.argv[3]
-        add_technical_image(image_file, output_file)
+        add_url(url, output_file)
 
     # 一般文件模式
     else:
