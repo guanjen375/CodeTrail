@@ -9,13 +9,13 @@
 python RAG.py manual.pdf knowledge.json
 
 # 2. 從聊天截圖加入知識（互動式，會詢問是否入庫）
-python RAG.py --chat teams_chat.png
+python RAG.py teams_chat.png knowledge.json --chat
 
 # 3. 從技術圖片加入知識（互動式）
-python RAG.py --image npx6_arch.png
+python RAG.py npx6_arch.png knowledge.json --image
 
 # 4. 從網頁加入知識（互動式）
-python RAG.py --url https://docs.example.com/api
+python RAG.py https://docs.example.com/api knowledge.json --url
 
 # 5. 使用知識庫進行問答
 python main.py . --kb=knowledge.json
@@ -23,11 +23,10 @@ python main.py . --kb=knowledge.json
 # 回答會標註：根據 REF1（manual.pdf 第 15 頁）...
 ```
 
-**互動式模式**：執行 `--chat`、`--image`、`--url` 時，若不指定知識庫檔案，系統會：
+**互動式模式**：使用 `--chat`、`--image`、`--url` flag 時，系統會：
 1. 分析/抓取內容並顯示完整結果
-2. 詢問：「是否將此內容加入知識庫？[Y/n]」
-3. 若是，詢問知識庫檔案路徑（預設 `knowledge.json`）
-4. 若否，詢問是否存為 `.md` 檔供日後使用
+2. 詢問：「是否將此內容加入 knowledge.json？[Y/n]」
+3. 若是則入庫，若否則結束
 
 ## 建立知識庫
 
@@ -38,14 +37,9 @@ python main.py . --kb=knowledge.json
 python RAG.py <輸入檔案> <輸出JSON>
 
 # 互動式模式（分析後詢問是否入庫）
-python RAG.py --chat <截圖檔案>
-python RAG.py --image <圖片檔案>
-python RAG.py --url <網址>
-
-# 直接入庫模式（跳過確認）
-python RAG.py --chat <截圖檔案> <輸出JSON>
-python RAG.py --image <圖片檔案> <輸出JSON>
-python RAG.py --url <網址> <輸出JSON>
+python RAG.py <截圖檔案> <輸出JSON> --chat
+python RAG.py <圖片檔案> <輸出JSON> --image
+python RAG.py <網址> <輸出JSON> --url
 ```
 
 ### 支援的檔案類型
@@ -104,29 +98,25 @@ python RAG.py api_manual_v2.pdf knowledge.json
 將 Teams、Slack、Discord 等通訊軟體的對話截圖轉換為結構化知識：
 
 ```bash
-# 互動式（推薦）：分析後詢問是否入庫
-python RAG.py --chat zebu_discussion.png
+python RAG.py zebu_discussion.png knowledge.json --chat
 
 # 執行後會顯示：
+# [INFO] 使用 VL 模型分析截圖: zebu_discussion.png
 # ============================================================
 # [VL 模型分析結果完整內容]
 # ============================================================
 #
-# 是否將此內容加入知識庫？ [Y/n]: y
-# 請輸入知識庫檔案路徑 [knowledge.json]: <Enter>
+# 是否將此內容加入 knowledge.json？ [Y/n]: y
 # [INFO] 新增截圖知識: chat_zebu_discussion.png
 # ...
-
-# 直接入庫（跳過確認）
-python RAG.py --chat zebu_discussion.png knowledge.json
 ```
 
 **處理流程**：
 1. 使用 VL 模型（config.py 中的 `VL_MODEL`）分析截圖
 2. **顯示完整分析結果**（讓你確認內容正確）
 3. 詢問是否加入知識庫
-   - 是 → 詢問知識庫路徑，生成 embedding 並入庫
-   - 否 → 詢問是否存為 `.md` 檔供日後使用
+   - 是 → 生成 embedding 並入庫
+   - 否 → 結束
 4. 存入知識庫（來源標記為 `chat_<檔名>`）
 
 **自動整理格式**：
@@ -155,29 +145,25 @@ python RAG.py --chat zebu_discussion.png knowledge.json
 將架構圖、流程圖、記憶體映射圖等技術圖片轉換為結構化知識：
 
 ```bash
-# 互動式（推薦）：分析後詢問是否入庫
-python RAG.py --image npx6_architecture.png
+python RAG.py npx6_architecture.png knowledge.json --image
 
 # 執行後會顯示：
+# [INFO] 使用 VL 模型分析技術圖片: npx6_architecture.png
 # ============================================================
 # [VL 模型分析結果完整內容]
 # ============================================================
 #
-# 是否將此內容加入知識庫？ [Y/n]: y
-# 請輸入知識庫檔案路徑 [knowledge.json]: <Enter>
+# 是否將此內容加入 knowledge.json？ [Y/n]: y
 # [INFO] 新增圖片知識: image_npx6_architecture.png
 # ...
-
-# 直接入庫（跳過確認）
-python RAG.py --image npx6_architecture.png knowledge.json
 ```
 
 **處理流程**：
 1. 使用 VL 模型分析圖片內容
 2. **顯示完整分析結果**（讓你確認內容正確）
 3. 詢問是否加入知識庫
-   - 是 → 詢問知識庫路徑，生成 embedding 並入庫
-   - 否 → 詢問是否存為 `.md` 檔供日後使用
+   - 是 → 生成 embedding 並入庫
+   - 否 → 結束
 4. 存入知識庫（來源標記為 `image_<檔名>`）
 
 **自動整理格式**：
@@ -215,22 +201,18 @@ python RAG.py --image npx6_architecture.png knowledge.json
 將網頁內容轉換為知識庫，適合技術文件網站、API 文件等：
 
 ```bash
-# 互動式（推薦）：抓取後詢問是否入庫
-python RAG.py --url https://docs.banana-pi.org/zh/BPI-F3
+python RAG.py https://docs.banana-pi.org/zh/BPI-F3 knowledge.json --url
 
 # 執行後會顯示：
+# [INFO] 正在抓取網頁: https://docs.banana-pi.org/zh/BPI-F3
 # [INFO] 網頁標題: BPI-F3 - Banana Pi Wiki
 # ============================================================
 # [網頁 Markdown 內容完整顯示]
 # ============================================================
 #
-# 是否將此內容加入知識庫？ [Y/n]: y
-# 請輸入知識庫檔案路徑 [knowledge.json]: <Enter>
+# 是否將此內容加入 knowledge.json？ [Y/n]: y
 # [INFO] 新增網頁知識: url_docs_banana-pi_org_BPI-F3
 # ...
-
-# 直接入庫（跳過確認）
-python RAG.py --url https://docs.banana-pi.org/zh/BPI-F3 knowledge.json
 ```
 
 **處理流程**：
@@ -239,8 +221,8 @@ python RAG.py --url https://docs.banana-pi.org/zh/BPI-F3 knowledge.json
 3. 自動清理：移除導航列、頁尾、JavaScript 連結等雜訊
 4. **顯示完整抓取結果**（讓你確認內容正確）
 5. 詢問是否加入知識庫
-   - 是 → 詢問知識庫路徑，生成 embedding 並入庫
-   - 否 → 詢問是否存為 `.md` 檔供日後使用
+   - 是 → 生成 embedding 並入庫
+   - 否 → 結束
 6. 存入知識庫（來源標記為 `url_<網域>_<路徑>`，並保存標題和抓取時間）
 
 **使用場景**：

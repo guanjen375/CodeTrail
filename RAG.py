@@ -856,13 +856,12 @@ def ask_output_file(default: str = "knowledge.json") -> str:
 # ============================================================
 # 聊天截圖模式（互動式）
 # ============================================================
-def interactive_chat_screenshot(image_file: str):
+def interactive_chat_screenshot(image_file: str, output_file: str):
     """
     互動式處理聊天截圖：
     1. 分析並顯示結果
     2. 詢問是否加入知識庫
-    3. 若是，詢問輸出檔案並入庫
-    4. 若否，詢問是否存為 .md 檔
+    3. 若是，入庫；若否，結束
     """
     image_path = Path(image_file)
 
@@ -892,15 +891,10 @@ def interactive_chat_screenshot(image_file: str):
 
     # 詢問是否加入知識庫
     print()
-    if ask_yes_no("是否將此內容加入知識庫？"):
-        output_file = ask_output_file()
+    if ask_yes_no(f"是否將此內容加入 {output_file}？"):
         _add_chat_content_to_kb(image_path, content, output_file)
     else:
-        # 詢問是否存為 .md 檔
-        if ask_yes_no("是否存為 .md 檔供日後使用？"):
-            _save_chat_as_md(image_path, content)
-        else:
-            print("[INFO] 已取消，內容未儲存")
+        print("[INFO] 已取消，內容未儲存")
 
 
 def _add_chat_content_to_kb(image_path: Path, content: str, output_file: str):
@@ -1210,13 +1204,12 @@ def process_url(url: str) -> List[Dict]:
 # ============================================================
 # 網頁模式（互動式）
 # ============================================================
-def interactive_url(url: str):
+def interactive_url(url: str, output_file: str):
     """
     互動式處理網頁：
     1. 抓取並顯示結果
     2. 詢問是否加入知識庫
-    3. 若是，詢問輸出檔案並入庫
-    4. 若否，詢問是否存為 .md 檔
+    3. 若是，入庫；若否，結束
     """
     # 簡單驗證 URL 格式
     if not url.startswith(('http://', 'https://')):
@@ -1241,15 +1234,10 @@ def interactive_url(url: str):
 
     # 詢問是否加入知識庫
     print()
-    if ask_yes_no("是否將此內容加入知識庫？"):
-        output_file = ask_output_file()
+    if ask_yes_no(f"是否將此內容加入 {output_file}？"):
         _add_url_content_to_kb(url, content, title, output_file)
     else:
-        # 詢問是否存為 .md 檔
-        if ask_yes_no("是否存為 .md 檔供日後使用？"):
-            _save_url_as_md(url, content, title)
-        else:
-            print("[INFO] 已取消，內容未儲存")
+        print("[INFO] 已取消，內容未儲存")
 
 
 def _add_url_content_to_kb(url: str, content: str, title: str, output_file: str):
@@ -1382,13 +1370,12 @@ def add_url(url: str, output_file: str):
 # ============================================================
 # 技術圖片模式（互動式）
 # ============================================================
-def interactive_technical_image(image_file: str):
+def interactive_technical_image(image_file: str, output_file: str):
     """
     互動式處理技術圖片：
     1. 分析並顯示結果
     2. 詢問是否加入知識庫
-    3. 若是，詢問輸出檔案並入庫
-    4. 若否，詢問是否存為 .md 檔
+    3. 若是，入庫；若否，結束
     """
     image_path = Path(image_file)
 
@@ -1418,15 +1405,10 @@ def interactive_technical_image(image_file: str):
 
     # 詢問是否加入知識庫
     print()
-    if ask_yes_no("是否將此內容加入知識庫？"):
-        output_file = ask_output_file()
+    if ask_yes_no(f"是否將此內容加入 {output_file}？"):
         _add_image_content_to_kb(image_path, content, output_file)
     else:
-        # 詢問是否存為 .md 檔
-        if ask_yes_no("是否存為 .md 檔供日後使用？"):
-            _save_image_as_md(image_path, content)
-        else:
-            print("[INFO] 已取消，內容未儲存")
+        print("[INFO] 已取消，內容未儲存")
 
 
 def _add_image_content_to_kb(image_path: Path, content: str, output_file: str):
@@ -1557,20 +1539,15 @@ def add_technical_image(image_file: str, output_file: str):
 def print_usage():
     """印出使用說明"""
     print("用法:")
-    print("  python RAG.py <input_file> <output_json>           # 一般文件模式")
-    print("  python RAG.py --chat <screenshot>                  # 聊天截圖（互動式）")
-    print("  python RAG.py --image <image>                      # 技術圖片（互動式）")
-    print("  python RAG.py --url <url>                          # 網頁（互動式）")
+    print("  python RAG.py <input_file> <output_json>             # 一般文件（直接入庫）")
+    print("  python RAG.py <screenshot> <output_json> --chat      # 聊天截圖（互動式）")
+    print("  python RAG.py <image> <output_json> --image          # 技術圖片（互動式）")
+    print("  python RAG.py <url> <output_json> --url              # 網頁（互動式）")
     print("")
-    print("互動式模式會：")
+    print("互動式模式（--chat/--image/--url）會：")
     print("  1. 分析/抓取內容並顯示完整結果")
-    print("  2. 詢問是否加入知識庫（是→詢問知識庫路徑）")
-    print("  3. 若不入庫，詢問是否存為 .md 檔供日後使用")
-    print("")
-    print("直接入庫模式（跳過確認）：")
-    print("  python RAG.py --chat <screenshot> <output_json>    # 聊天截圖直接入庫")
-    print("  python RAG.py --image <image> <output_json>        # 技術圖片直接入庫")
-    print("  python RAG.py --url <url> <output_json>            # 網頁直接入庫")
+    print("  2. 詢問「是否將此內容加入 <output_json>？」")
+    print("  3. 若是則入庫，若否則結束")
     print("")
     print("參數:")
     print("  input_file   要加入的文件 (pdf/md/txt)")
@@ -1580,11 +1557,10 @@ def print_usage():
     print("  output_json  知識庫檔案 (不存在則建立，存在則 append)")
     print("")
     print("範例:")
-    print("  python RAG.py manual.pdf knowledge.json            # 一般文件")
-    print("  python RAG.py --chat teams_chat.png                # 互動式：分析截圖")
-    print("  python RAG.py --image npx6_arch.png                # 互動式：分析圖片")
-    print("  python RAG.py --url https://docs.example.com/guide # 互動式：抓取網頁")
-    print("  python RAG.py --chat chat.png knowledge.json       # 直接入庫")
+    print("  python RAG.py manual.pdf knowledge.json                       # PDF 直接入庫")
+    print("  python RAG.py teams_chat.png knowledge.json --chat            # 聊天截圖")
+    print("  python RAG.py npx6_arch.png knowledge.json --image            # 技術圖片")
+    print("  python RAG.py https://docs.example.com/guide knowledge.json --url  # 網頁")
     print("")
     print(f"支援的文件類型: {', '.join(SUPPORTED_EXTENSIONS)}")
     print(f"支援的圖片類型: {', '.join(IMAGE_EXTENSIONS)}")
@@ -1592,60 +1568,30 @@ def print_usage():
 
 if __name__ == "__main__":
     # 解析參數
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 3:
         print_usage()
         sys.exit(1)
 
-    # 聊天截圖模式
-    if sys.argv[1] == "--chat":
-        if len(sys.argv) == 3:
-            # --chat <image> → 互動式模式
-            image_file = sys.argv[2]
-            interactive_chat_screenshot(image_file)
-        elif len(sys.argv) == 4:
-            # --chat <image> <output_json> → 直接入庫模式
-            image_file = sys.argv[2]
-            output_file = sys.argv[3]
-            add_chat_screenshot(image_file, output_file)
-        else:
-            print("[ERROR] --chat 模式參數錯誤")
-            print("用法: python RAG.py --chat <screenshot>              # 互動式")
-            print("      python RAG.py --chat <screenshot> <output_json> # 直接入庫")
+    # 檢查模式 flag（在最後一個參數）
+    mode_flags = {"--chat", "--image", "--url"}
+    last_arg = sys.argv[-1]
+
+    if last_arg in mode_flags:
+        # 互動式模式：python RAG.py <input> <output> --chat/--image/--url
+        if len(sys.argv) != 4:
+            print_usage()
             sys.exit(1)
 
-    # 技術圖片模式
-    elif sys.argv[1] == "--image":
-        if len(sys.argv) == 3:
-            # --image <image> → 互動式模式
-            image_file = sys.argv[2]
-            interactive_technical_image(image_file)
-        elif len(sys.argv) == 4:
-            # --image <image> <output_json> → 直接入庫模式
-            image_file = sys.argv[2]
-            output_file = sys.argv[3]
-            add_technical_image(image_file, output_file)
-        else:
-            print("[ERROR] --image 模式參數錯誤")
-            print("用法: python RAG.py --image <image>              # 互動式")
-            print("      python RAG.py --image <image> <output_json> # 直接入庫")
-            sys.exit(1)
+        input_file = sys.argv[1]
+        output_file = sys.argv[2]
+        mode = last_arg
 
-    # 網頁模式
-    elif sys.argv[1] == "--url":
-        if len(sys.argv) == 3:
-            # --url <url> → 互動式模式
-            url = sys.argv[2]
-            interactive_url(url)
-        elif len(sys.argv) == 4:
-            # --url <url> <output_json> → 直接入庫模式
-            url = sys.argv[2]
-            output_file = sys.argv[3]
-            add_url(url, output_file)
-        else:
-            print("[ERROR] --url 模式參數錯誤")
-            print("用法: python RAG.py --url <url>              # 互動式")
-            print("      python RAG.py --url <url> <output_json> # 直接入庫")
-            sys.exit(1)
+        if mode == "--chat":
+            interactive_chat_screenshot(input_file, output_file)
+        elif mode == "--image":
+            interactive_technical_image(input_file, output_file)
+        elif mode == "--url":
+            interactive_url(input_file, output_file)
 
     # 一般文件模式
     else:
