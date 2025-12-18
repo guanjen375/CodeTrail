@@ -20,7 +20,9 @@ from config import (
     STRICT_MODE, STRICT_MODE_KEYWORDS, SPEC_QUESTION_KEYWORDS,
     STRICT_MODE_TEMPERATURE, WEAK_REF_THRESHOLD,
     PRIORITY_RULE_WITH_BINARY, PRIORITY_RULE_WITHOUT_BINARY,
-    get_answer_rules
+    get_answer_rules,
+    # P0 改進：Claim-to-Evidence 強制化
+    CLAIM_TO_EVIDENCE_ENABLED, CLAIM_EVIDENCE_STRICT, CLAIM_EVIDENCE_PATTERNS
 )
 
 
@@ -539,4 +541,180 @@ def answer_with_self_check(question: str, base_ctx: str, knowledge_ctx: str,
     print()
     final = call_llm_stream(second_prompt, temperature=0.0)
 
+    # P0 改進：Claim-to-Evidence 強制驗證
+    if CLAIM_TO_EVIDENCE_ENABLED and not final.startswith("[ERROR]"):
+        final = validate_claim_to_evidence(final, knowledge_ctx)
+
     return final.strip() if not final.startswith("[ERROR]") else draft
+
+
+# ============================================================
+# P0 改進：Claim-to-Evidence 強制化機制
+# ============================================================
+
+def validate_claim_to_evidence(answer: str, knowledge_ctx: str) -> str:
+    """驗證回答中的 claim 是否有 evidence 支持
+
+    核心規則：
+    1. 數字/限制/預設值等關鍵句必須有 REF 標註
+    2. 沒有 REF 的關鍵句會被標記為「未經驗證」
+
+    Args:
+        answer: LLM 生成的回答
+        knowledge_ctx: 知識庫上下文（用於驗證 REF 是否存在）
+
+    Returns:
+        驗證後的回答（可能包含警告標記）
+    """
+    if not CLAIM_EVIDENCE_STRICT:
+        return answer
+
+    # 編譯所有需要驗證的 pattern
+    compiled_patterns = [re.compile(p, re.IGNORECASE) for p in CLAIM_EVIDENCE_PATTERNS]
+
+    # 解析 knowledge_ctx 中的 REF 編號
+    available_refs = set(re.findall(r'REF(\d+)', knowledge_ctx, re.IGNORECASE))
+
+    # 分割回答為句子
+    sentences = re.split(r'(?<=[。.!?！？])\s*', answer)
+
+    validated_sentences = []
+    unverified_claims = []
+
+    for sentence in sentences:
+        if not sentence.strip():
+            validated_sentences.append(sentence)
+            continue
+
+        # 檢查句子是否包含需要驗證的 pattern
+        needs_verification = any(p.search(sentence) for p in compiled_patterns)
+
+        if not needs_verification:
+            validated_sentences.append(sentence)
+            continue
+
+        # 檢查句子是否有 REF 標註
+        ref_mentions = re.findall(r'REF\s*(\d+)', sentence, re.IGNORECASE)
+
+        if ref_mentions:
+            # 驗證提到的 REF 是否存在於 knowledge_ctx
+            valid_refs = [r for r in ref_mentions if r in available_refs]
+            if valid_refs:
+                validated_sentences.append(sentence)
+                continue
+
+        # 沒有有效的 REF → 記錄為未驗證 claim
+        unverified_claims.append(sentence.strip())
+        validated_sentences.append(sentence)
+
+    # 如果有未驗證的 claim，在回答末尾加上警告
+    result = ''.join(validated_sentences)
+
+    if unverified_claims and len(unverified_claims) <= 5:
+        warning = "\n\n⚠️ **未經文件驗證的陳述**（以下內容可能需要進一步確認）：\n"
+        for i, claim in enumerate(unverified_claims[:5], 1):
+            # 截斷過長的句子
+            truncated = claim[:100] + "..." if len(claim) > 100 else claim
+            warning += f"  {i}. {truncated}\n"
+        result += warning
+
+    return result
+
+
+def extract_evidence_mapping(answer: str, knowledge_ctx: str) -> dict:
+    """提取回答中的 claim-to-evidence 映射
+
+    用途：
+    1. 供 data_flywheel 評估使用
+    2. 產生結構化的證據追溯報告
+
+    Returns:
+        {
+            "claims": [{"sentence": str, "refs": [int], "verified": bool}, ...],
+            "coverage": float,  # 有證據支持的 claim 比例
+            "unverified_count": int
+        }
+    """
+    compiled_patterns = [re.compile(p, re.IGNORECASE) for p in CLAIM_EVIDENCE_PATTERNS]
+    available_refs = set(re.findall(r'REF(\d+)', knowledge_ctx, re.IGNORECASE))
+
+    sentences = re.split(r'(?<=[。.!?！？])\s*', answer)
+
+    claims = []
+    verified_count = 0
+    total_claims = 0
+
+    for sentence in sentences:
+        if not sentence.strip():
+            continue
+
+        needs_verification = any(p.search(sentence) for p in compiled_patterns)
+        if not needs_verification:
+            continue
+
+        total_claims += 1
+        ref_mentions = re.findall(r'REF\s*(\d+)', sentence, re.IGNORECASE)
+        valid_refs = [int(r) for r in ref_mentions if r in available_refs]
+
+        verified = len(valid_refs) > 0
+        if verified:
+            verified_count += 1
+
+        claims.append({
+            "sentence": sentence.strip()[:200],
+            "refs": valid_refs,
+            "verified": verified
+        })
+
+    coverage = verified_count / total_claims if total_claims > 0 else 1.0
+
+    return {
+        "claims": claims,
+        "coverage": coverage,
+        "unverified_count": total_claims - verified_count
+    }
+
+
+def format_evidence_report(answer: str, knowledge_ctx: str, refs_metadata: list = None) -> str:
+    """產生結構化的證據報告
+
+    格式：
+    ## Answer
+    [回答內容，每段後附 REF#]
+
+    ## Evidence
+    - REF1: source.pdf p.12 - "引用摘錄..."
+    - REF2: manual.pdf p.45 - "引用摘錄..."
+
+    ## Unknowns
+    - 以下問題文件未提及：...
+    """
+    evidence_map = extract_evidence_mapping(answer, knowledge_ctx)
+
+    report_lines = ["## Answer", answer, ""]
+
+    # Evidence section
+    if refs_metadata:
+        report_lines.append("## Evidence")
+        for i, ref in enumerate(refs_metadata, 1):
+            source = ref.get("source", "unknown")
+            page = ref.get("page", "?")
+            section = ref.get("section", "")
+            section_str = f" ({section})" if section else ""
+            report_lines.append(f"- REF{i}: {source} p.{page}{section_str}")
+        report_lines.append("")
+
+    # Unknowns section
+    if evidence_map["unverified_count"] > 0:
+        report_lines.append("## Unknowns")
+        report_lines.append(f"以下 {evidence_map['unverified_count']} 個陳述未找到文件支持：")
+        for claim in evidence_map["claims"]:
+            if not claim["verified"]:
+                report_lines.append(f"- {claim['sentence'][:80]}...")
+        report_lines.append("")
+
+    # Coverage summary
+    coverage_pct = evidence_map["coverage"] * 100
+    report_lines.append(f"---\n*證據覆蓋率: {coverage_pct:.0f}%*")
+
+    return "\n".join(report_lines)

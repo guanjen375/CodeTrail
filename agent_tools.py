@@ -695,26 +695,96 @@ class ToolExecutor:
             except Exception as e:
                 results.append(f"✗ {filepath}: 套用失敗 - {e}")
 
-        # 自動對成功修改的檔案執行 lint
+        # P2 改進：自動驗證流程
         if successfully_patched and not dry_run:
-            results.append("\n=== 自動 Lint ===")
-            for filepath in successfully_patched:
+            verify_results = self._verify_patched_files(successfully_patched)
+            results.extend(verify_results)
+
+        return "\n".join(results) if results else "沒有修改"
+
+    def _verify_patched_files(self, filepaths: list) -> list:
+        """P2 改進：驗證修改後的檔案
+
+        驗證步驟：
+        1. Lint/Format
+        2. 靜態分析（如 mypy）
+        3. 測試（若有）
+        """
+        results = []
+        all_passed = True
+
+        # Step 1: Lint
+        if "lint" in getattr(config, 'PATCH_VERIFY_STEPS', []):
+            results.append("\n=== [1/3] Lint ===")
+            for filepath in filepaths:
                 ext = Path(filepath).suffix.lower()
                 if ext in LINT_COMMANDS:
                     try:
                         lint_result = self.run_lint(filepath, fix=True)
                         if "✓" in lint_result:
-                            results.append(f"  ✓ {filepath}: lint 完成")
-                        elif "⚠" in lint_result:
-                            results.append(f"  ⚠ {filepath}: lint 有警告")
-                        elif "錯誤: 沒有可用的 lint" in lint_result:
-                            pass
-                        else:
-                            results.append(f"  {filepath}: {lint_result[:100]}")
+                            results.append(f"  ✓ {filepath}")
+                        elif "⚠" in lint_result or "錯誤" in lint_result:
+                            results.append(f"  ⚠ {filepath}: {lint_result[:80]}")
+                            all_passed = False
                     except Exception as e:
-                        results.append(f"  ⚠ {filepath}: lint 失敗 - {e}")
+                        results.append(f"  ✗ {filepath}: {e}")
+                        all_passed = False
 
-        return "\n".join(results) if results else "沒有修改"
+        # Step 2: Typecheck (靜態分析)
+        typecheck_cmds = getattr(config, 'TYPECHECK_COMMANDS', {})
+        if "typecheck" in getattr(config, 'PATCH_VERIFY_STEPS', []) and typecheck_cmds:
+            results.append("\n=== [2/3] 靜態分析 ===")
+            for filepath in filepaths:
+                ext = Path(filepath).suffix.lower()
+                if ext in typecheck_cmds:
+                    for cmd_template in typecheck_cmds[ext]:
+                        try:
+                            cmd = f"{cmd_template} {filepath}"
+                            result = self.run_command(cmd, timeout=30)
+                            if "error" in result.lower() or "Error" in result:
+                                results.append(f"  ⚠ {filepath}: 有型別錯誤")
+                                all_passed = False
+                            else:
+                                results.append(f"  ✓ {filepath}")
+                        except Exception as e:
+                            results.append(f"  ⚠ {filepath}: 跳過 ({e})")
+
+        # Step 3: 測試 (只執行相關測試，避免跑太久)
+        if "test" in getattr(config, 'PATCH_VERIFY_STEPS', []) and config.RUN_COMMAND_ENABLED:
+            results.append("\n=== [3/3] 測試 ===")
+            # 檢查是否有 pytest
+            test_patterns = []
+            for filepath in filepaths:
+                if filepath.endswith('.py'):
+                    # 嘗試找對應的測試檔案
+                    base = Path(filepath).stem
+                    test_patterns.append(f"test_{base}.py")
+                    test_patterns.append(f"{base}_test.py")
+
+            if test_patterns:
+                try:
+                    # 只執行相關測試（用 -k 過濾）
+                    keywords = " or ".join(p.replace('.py', '') for p in test_patterns[:3])
+                    test_cmd = f"pytest -x -q -k \"{keywords}\" --tb=short 2>&1 | head -20"
+                    test_result = self.run_command(test_cmd, timeout=60)
+                    if "FAILED" in test_result or "ERROR" in test_result:
+                        results.append(f"  ✗ 測試失敗")
+                        results.append(f"    {test_result[:200]}")
+                        all_passed = False
+                    elif "passed" in test_result:
+                        results.append(f"  ✓ 測試通過")
+                    else:
+                        results.append(f"  - 沒有找到相關測試")
+                except Exception as e:
+                    results.append(f"  ⚠ 測試跳過: {e}")
+
+        # 總結
+        if all_passed:
+            results.append("\n✓ 所有驗證通過")
+        else:
+            results.append("\n⚠ 有驗證項目未通過，建議檢查")
+
+        return results
 
     def _parse_unified_diff(self, patch: str) -> dict:
         """解析 unified diff 格式"""

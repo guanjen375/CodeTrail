@@ -28,7 +28,15 @@ from config import (
     KNOWLEDGE_MERGE_ADJACENT, KNOWLEDGE_MERGE_MAX_CHARS,
     EMBEDDING_MODEL, RERANKER_MODEL,
     USE_RERANKER, USE_HYBRID_SEARCH, USE_QUERY_EXPANSION,
-    USE_MMR, MMR_LAMBDA, KEYWORD_WEIGHT
+    USE_MMR, MMR_LAMBDA, KEYWORD_WEIGHT,
+    # P0 改進：BM25 + RRF + Reranker 強制啟用
+    BM25_K1, BM25_B, BM25_ENABLED,
+    RRF_K, RRF_ENABLED,
+    RERANKER_ALWAYS_ON, RERANKER_TOP_N,
+    MARGIN_ENABLED, MARGIN_MIN_GAP, MARGIN_LOW_SCORE,
+    STRICT_MODE_THRESHOLD, STRICT_MODE_RERANK_REQUIRED,
+    # P1 改進：Multi-Query
+    MULTI_QUERY_ENABLED, MULTI_QUERY_COUNT, MULTI_QUERY_TYPES
 )
 
 
@@ -64,10 +72,13 @@ def _cached_get_embedding(text: str) -> tuple:
 
 class KnowledgeBase:
     """
-    優化版知識庫：
-    1. 專用 Reranker 模型 (bge-reranker)
+    優化版知識庫（P0 改進版）：
+    1. 專用 Reranker 模型 (bge-reranker) - 預設啟用
     2. Query Expansion (LLM 生成搜尋關鍵字)
-    3. 結構化輸出格式
+    3. 真正的 BM25 lexical search（取代簡單 keyword matching）
+    4. RRF (Reciprocal Rank Fusion) 融合 embedding + BM25
+    5. Margin-based 動態門檻判斷
+    6. 結構化輸出格式
     """
 
     def __init__(self, json_path: str = KNOWLEDGE_FILE):
@@ -79,6 +90,11 @@ class KnowledgeBase:
         # Numpy 加速用的預計算陣列
         self._embeddings = None  # shape: (n_chunks, dim)
         self._embeddings_normalized = False
+        # BM25 索引（預計算）
+        self._bm25_index = None  # {term: {chunk_idx: tf}}
+        self._bm25_doc_lens = None  # [doc_len, ...]
+        self._bm25_avg_doc_len = 0.0
+        self._bm25_idf = None  # {term: idf}
 
         if Path(json_path).exists():
             self._load(json_path)
@@ -128,6 +144,17 @@ class KnowledgeBase:
             # 預計算 numpy embeddings（用於加速向量運算）
             self._precompute_embeddings()
 
+            # P0 改進：預計算 BM25 索引
+            if BM25_ENABLED:
+                self._precompute_bm25_index()
+
+            # 速度優化：記錄載入的 metadata 供快取驗證
+            self._cache_metadata = {
+                "embedding_model": EMBEDDING_MODEL,
+                "chunk_count": len(self.chunks),
+                "bm25_enabled": BM25_ENABLED,
+            }
+
         except Exception as e:
             print(f"[WARN] 知識庫載入失敗: {e}")
             self.loaded = False
@@ -171,6 +198,182 @@ class KnowledgeBase:
         norms = np.where(norms > 0, norms, 1.0)  # 避免除零
         self._embeddings = self._embeddings / norms
         self._embeddings_normalized = True
+
+    def _precompute_bm25_index(self):
+        """預計算 BM25 索引（inverted index + IDF）
+
+        BM25 公式：
+        score = sum( IDF(t) * (tf * (k1+1)) / (tf + k1 * (1 - b + b * dl/avgdl)) )
+
+        其中：
+        - tf: 詞在文件中出現的次數
+        - dl: 文件長度（token 數）
+        - avgdl: 平均文件長度
+        - IDF(t) = log((N - n(t) + 0.5) / (n(t) + 0.5) + 1)
+        - N: 文件總數
+        - n(t): 包含詞 t 的文件數
+        """
+        if not self.chunks:
+            return
+
+        import math
+        from collections import defaultdict
+
+        # 建立 inverted index: {term: {chunk_idx: tf}}
+        inverted_index = defaultdict(lambda: defaultdict(int))
+        doc_lens = []
+        doc_freqs = defaultdict(int)  # 每個 term 出現在多少文件中
+
+        for idx, chunk in enumerate(self.chunks):
+            content = chunk.get("content", "")
+            # 加入 title、section、source 提升 lexical 命中率
+            title = chunk.get("section", "")
+            source = chunk.get("source", "")
+            full_text = f"{title} {source} {content}"
+
+            # Tokenize（同時支援中英文）
+            tokens = self._tokenize_for_bm25(full_text)
+            doc_lens.append(len(tokens))
+
+            # 統計 term frequency
+            term_set = set()
+            for token in tokens:
+                inverted_index[token][idx] += 1
+                term_set.add(token)
+
+            # 統計 document frequency
+            for term in term_set:
+                doc_freqs[term] += 1
+
+        # 計算 IDF
+        N = len(self.chunks)
+        idf = {}
+        for term, df in doc_freqs.items():
+            # BM25 IDF 公式（加上 +1 避免負值）
+            idf[term] = math.log((N - df + 0.5) / (df + 0.5) + 1)
+
+        self._bm25_index = dict(inverted_index)
+        self._bm25_doc_lens = doc_lens
+        self._bm25_avg_doc_len = sum(doc_lens) / len(doc_lens) if doc_lens else 1.0
+        self._bm25_idf = idf
+
+    def _tokenize_for_bm25(self, text: str) -> list:
+        """BM25 專用的 tokenizer
+
+        改進：
+        - 支援中英文混合
+        - 保留程式碼 token（函式名、變數名）
+        - 移除 stopwords
+        """
+        # 先轉小寫
+        text = text.lower()
+
+        # 抽取所有 word-like tokens（英文、中文、數字底線）
+        # 英文 token
+        en_tokens = re.findall(r'\b[a-z_][a-z0-9_]*\b', text)
+        # 中文 token（單字或雙字詞）
+        zh_tokens = re.findall(r'[\u4e00-\u9fff]{1,2}', text)
+
+        all_tokens = en_tokens + zh_tokens
+
+        # 移除 stopwords
+        stopwords = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+                     'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+                     'would', 'could', 'should', 'may', 'might', 'must', 'shall',
+                     'can', 'need', 'to', 'of', 'in', 'for', 'on', 'with', 'at',
+                     'by', 'from', 'as', 'into', 'through', 'during', 'before',
+                     'after', 'above', 'below', 'between', 'under', 'again',
+                     'then', 'once', 'here', 'there', 'when', 'where', 'why',
+                     'how', 'all', 'each', 'few', 'more', 'most', 'other',
+                     'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same',
+                     'so', 'than', 'too', 'very', 'just', 'and', 'but', 'if',
+                     'or', 'because', 'until', 'while', 'this', 'that', 'these',
+                     'those', 'what', '的', '是', '在', '有', '和', '與', '了',
+                     '我', '你', '他', '她', '它', '們', '這', '那', '要', '會',
+                     '能', '可以', '一個', '什麼', '怎麼', '如何'}
+
+        return [t for t in all_tokens if len(t) > 1 and t not in stopwords]
+
+    def _bm25_score(self, query_tokens: list) -> list:
+        """計算所有 chunks 的 BM25 分數
+
+        返回: [(score, chunk_idx), ...] 按分數降序排列
+        """
+        if not self._bm25_index or not query_tokens:
+            return []
+
+        scores = [0.0] * len(self.chunks)
+        k1 = BM25_K1
+        b = BM25_B
+        avgdl = self._bm25_avg_doc_len
+
+        for token in query_tokens:
+            if token not in self._bm25_index:
+                continue
+
+            idf = self._bm25_idf.get(token, 0.0)
+            term_docs = self._bm25_index[token]
+
+            for chunk_idx, tf in term_docs.items():
+                dl = self._bm25_doc_lens[chunk_idx]
+                # BM25 公式
+                numerator = tf * (k1 + 1)
+                denominator = tf + k1 * (1 - b + b * dl / avgdl)
+                scores[chunk_idx] += idf * numerator / denominator
+
+        # 正規化到 0-1（用 max 正規化）
+        max_score = max(scores) if scores else 1.0
+        if max_score > 0:
+            scores = [s / max_score for s in scores]
+
+        # 返回 (score, chunk_idx) 列表，按分數降序
+        scored = [(scores[i], i) for i in range(len(scores)) if scores[i] > 0]
+        scored.sort(reverse=True, key=lambda x: x[0])
+        return scored
+
+    def _rrf_fusion(self, embedding_ranks: list, bm25_ranks: list, k: int = RRF_K) -> list:
+        """RRF (Reciprocal Rank Fusion) 融合兩個排名列表
+
+        RRF 公式：RRF(d) = sum( 1 / (k + rank(d)) )
+
+        Args:
+            embedding_ranks: [(emb_score, chunk_idx), ...] 按分數降序
+            bm25_ranks: [(bm25_score, chunk_idx), ...] 按分數降序
+            k: RRF 常數（預設 60）
+
+        Returns:
+            [(rrf_score, emb_score, bm25_score, chunk), ...] 按 RRF 分數降序
+        """
+        # 建立 chunk_idx -> rank 的映射
+        emb_rank_map = {chunk_idx: rank for rank, (_, chunk_idx) in enumerate(embedding_ranks)}
+        bm25_rank_map = {chunk_idx: rank for rank, (_, chunk_idx) in enumerate(bm25_ranks)}
+
+        # 建立 chunk_idx -> score 的映射
+        emb_score_map = {chunk_idx: score for score, chunk_idx in embedding_ranks}
+        bm25_score_map = {chunk_idx: score for score, chunk_idx in bm25_ranks}
+
+        # 取所有候選的 union
+        all_chunks = set(emb_rank_map.keys()) | set(bm25_rank_map.keys())
+
+        # 計算 RRF 分數
+        rrf_scores = []
+        for chunk_idx in all_chunks:
+            rrf = 0.0
+            # Embedding rank
+            if chunk_idx in emb_rank_map:
+                rrf += 1.0 / (k + emb_rank_map[chunk_idx])
+            # BM25 rank
+            if chunk_idx in bm25_rank_map:
+                rrf += 1.0 / (k + bm25_rank_map[chunk_idx])
+
+            emb_score = emb_score_map.get(chunk_idx, 0.0)
+            bm25_score = bm25_score_map.get(chunk_idx, 0.0)
+            chunk = self.chunks[chunk_idx]
+            rrf_scores.append((rrf, emb_score, bm25_score, chunk))
+
+        # 按 RRF 分數降序排列
+        rrf_scores.sort(reverse=True, key=lambda x: x[0])
+        return rrf_scores
 
     def _check_reranker_available(self) -> bool:
         """檢查 reranker 模型是否可用
@@ -262,7 +465,7 @@ class KnowledgeBase:
         return matches / len(query_keywords)
 
     def _expand_query(self, question: str, force: bool = False) -> list[str]:
-        """用 LLM 生成額外的搜尋關鍵字
+        """用 LLM 生成額外的搜尋關鍵字（基本版）
 
         改進：
         - 預設不啟動，只有 force=True 或候選不足時才啟用
@@ -314,6 +517,87 @@ class KnowledgeBase:
 
         return [question]
 
+    def _generate_multi_queries(self, question: str) -> list[str]:
+        """P1 改進：生成多個 query 變體以提高召回率
+
+        策略：
+        1. key_terms: 抽取關鍵術語
+        2. translate: 中英互譯（解決中文問/英文文件的問題）
+        3. code_hint: 猜測可能的函式名/旗標名
+
+        返回: [原始 query, 變體1, 變體2, ...]
+        """
+        if not MULTI_QUERY_ENABLED:
+            return [question]
+
+        queries = [question]
+
+        # 判斷問題語言
+        has_chinese = bool(re.search(r'[\u4e00-\u9fff]', question))
+
+        try:
+            session = get_session()
+
+            # 根據啟用的類型生成變體
+            for query_type in MULTI_QUERY_TYPES[:MULTI_QUERY_COUNT]:
+                if query_type == "key_terms":
+                    # 抽取關鍵術語
+                    prompt = f"""從以下問題中提取 3-5 個最重要的技術術語，用於搜尋技術文件。
+只輸出術語，用逗號分隔，不要解釋。
+
+問題: {question}
+
+術語:"""
+
+                elif query_type == "translate" and has_chinese:
+                    # 中文轉英文
+                    prompt = f"""把以下中文問題翻譯成簡潔的英文搜尋查詢，保留技術術語。
+只輸出英文查詢，不要解釋。
+
+中文: {question}
+
+English:"""
+
+                elif query_type == "code_hint":
+                    # 猜測可能的函式名/旗標名
+                    prompt = f"""根據以下問題，猜測可能相關的程式碼元素（函式名、變數名、旗標、struct 欄位等）。
+只輸出 3-5 個可能的程式碼元素名稱，用逗號分隔。
+
+問題: {question}
+
+程式碼元素:"""
+
+                else:
+                    continue
+
+                resp = session.post(
+                    OLLAMA_GENERATE_URL,
+                    json={
+                        "model": MODEL,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"num_ctx": 2048, "temperature": 0.3}
+                    },
+                    timeout=20
+                )
+
+                if resp.status_code == 200:
+                    result = resp.json().get("response", "").strip()
+                    if result and len(result) < 200:  # 避免太長的回應
+                        if query_type == "translate":
+                            queries.append(result)
+                        else:
+                            # 組合原始問題和術語
+                            terms = [t.strip() for t in re.split(r'[,，]', result)]
+                            terms = [t for t in terms if t and len(t) <= 30]
+                            if terms:
+                                queries.append(f"{question} {' '.join(terms[:5])}")
+
+        except Exception:
+            pass
+
+        return queries[:MULTI_QUERY_COUNT + 1]  # 原始 + N 個變體
+
     def _should_expand_query(self, candidates: list, threshold: float = 0.35) -> bool:
         """判斷是否需要 Query Expansion
 
@@ -327,11 +611,15 @@ class KnowledgeBase:
         return top_score < threshold
 
     def _hybrid_search(self, question: str, candidate_k: int = KNOWLEDGE_CANDIDATE_K) -> list:
-        """混合搜尋：Embedding + 關鍵字 + 條件式 Query Expansion
+        """混合搜尋：Embedding + BM25 + RRF 融合
 
-        改進：
-        1. 先用原始 query 搜一次，若候選不足/分數偏低，再啟用 expansion
-        2. 使用 numpy 向量化加速（若可用）
+        P0 改進：
+        1. 使用真正的 BM25（取代簡單 keyword matching）
+        2. 使用 RRF（取代線性加權）融合 embedding 和 BM25 排名
+        3. 支援 numpy 向量化加速
+        4. 條件式 Query Expansion
+
+        返回格式：[(rrf_score, emb_score, bm25_score, chunk), ...]
         """
         if not self.loaded or not self.chunks:
             return []
@@ -341,31 +629,104 @@ class KnowledgeBase:
         if not q_emb:
             return []
 
-        query_keywords = self._extract_keywords(question) if USE_HYBRID_SEARCH else set()
-
-        # 使用 numpy 向量化計算（若可用且已預計算）
+        # ===== Embedding 召回 =====
         if HAS_NUMPY and self._embeddings is not None and self._embeddings_normalized:
-            scores = self._hybrid_search_numpy(q_emb, query_keywords, candidate_k)
+            embedding_ranks = self._embedding_search_numpy(q_emb, candidate_k * 2)
         else:
-            scores = self._hybrid_search_fallback(q_emb, query_keywords)
+            embedding_ranks = self._embedding_search_fallback(q_emb, candidate_k * 2)
 
-        scores.sort(reverse=True, key=lambda x: x[0])
+        # ===== BM25 召回（P0 改進）=====
+        if BM25_ENABLED and self._bm25_index:
+            query_tokens = self._tokenize_for_bm25(question)
+            bm25_ranks = self._bm25_score(query_tokens)[:candidate_k * 2]
+        else:
+            # Fallback: 使用舊的 keyword matching
+            query_keywords = self._extract_keywords(question) if USE_HYBRID_SEARCH else set()
+            bm25_ranks = self._keyword_search_fallback(query_keywords, candidate_k * 2)
+
+        # ===== RRF 融合（P0 改進）=====
+        if RRF_ENABLED and embedding_ranks and bm25_ranks:
+            scores = self._rrf_fusion(embedding_ranks, bm25_ranks)
+        else:
+            # Fallback: 只用 embedding
+            scores = [(emb_score, emb_score, 0.0, self.chunks[idx])
+                      for emb_score, idx in embedding_ranks]
+
         first_round = scores[:candidate_k]
 
-        # 條件式 Query Expansion：只有候選不足或分數偏低時才啟用
-        if USE_QUERY_EXPANSION and self._should_expand_query(first_round):
-            expanded_queries = self._expand_query(question, force=True)
-            if len(expanded_queries) > 1:  # 有擴展的 query
-                # 用擴展的 query 重新搜尋
-                for eq in expanded_queries[1:]:  # 跳過原始 query
-                    eq_emb = self._get_embedding(eq)
-                    if eq_emb:
-                        self._update_scores_with_expansion(scores, eq_emb)
+        # P1 改進：Multi-Query - 候選不足或分數偏低時啟用
+        if self._should_expand_query(first_round):
+            if MULTI_QUERY_ENABLED:
+                # 使用完整的 multi-query
+                multi_queries = self._generate_multi_queries(question)
+            elif USE_QUERY_EXPANSION:
+                # Fallback: 使用簡單的 query expansion
+                multi_queries = self._expand_query(question, force=True)
+            else:
+                multi_queries = [question]
+
+            if len(multi_queries) > 1:
+                # 用額外的 queries 增強 embedding 召回
+                for mq in multi_queries[1:]:
+                    mq_emb = self._get_embedding(mq)
+                    if mq_emb:
+                        self._update_scores_with_expansion(scores, mq_emb)
 
                 # 重新排序
                 scores.sort(reverse=True, key=lambda x: x[0])
 
         return scores[:candidate_k]
+
+    def _embedding_search_numpy(self, q_emb: list, top_k: int) -> list:
+        """使用 numpy 向量化的 embedding 搜尋
+
+        返回: [(emb_score, chunk_idx), ...] 按分數降序
+        """
+        # 正規化 query embedding
+        q_vec = np.array(q_emb, dtype=np.float32)
+        q_norm = np.linalg.norm(q_vec)
+        if q_norm > 0:
+            q_vec = q_vec / q_norm
+
+        # 批次計算所有 cosine similarity
+        emb_scores = np.dot(self._embeddings, q_vec)
+
+        # 建立 (score, chunk_idx) 列表
+        results = [(float(emb_scores[arr_idx]), chunk_idx)
+                   for arr_idx, chunk_idx in enumerate(self._embedding_indices)]
+
+        results.sort(reverse=True, key=lambda x: x[0])
+        return results[:top_k]
+
+    def _embedding_search_fallback(self, q_emb: list, top_k: int) -> list:
+        """Fallback：Python 迴圈版 embedding 搜尋
+
+        返回: [(emb_score, chunk_idx), ...] 按分數降序
+        """
+        results = []
+        for idx, chunk in enumerate(self.chunks):
+            emb = chunk.get("embedding", [])
+            if emb:
+                score = self._cosine_similarity(q_emb, emb)
+                results.append((score, idx))
+
+        results.sort(reverse=True, key=lambda x: x[0])
+        return results[:top_k]
+
+    def _keyword_search_fallback(self, query_keywords: set, top_k: int) -> list:
+        """Fallback：舊的 keyword matching（當 BM25 未啟用時）
+
+        返回: [(kw_score, chunk_idx), ...] 按分數降序
+        """
+        results = []
+        for idx, chunk in enumerate(self.chunks):
+            content = chunk.get("content", "")
+            score = self._keyword_score(query_keywords, content)
+            if score > 0:
+                results.append((score, idx))
+
+        results.sort(reverse=True, key=lambda x: x[0])
+        return results[:top_k]
 
     def _hybrid_search_numpy(self, q_emb: list, query_keywords: set, candidate_k: int) -> list:
         """使用 numpy 向量化的混合搜尋"""
@@ -463,16 +824,37 @@ class KnowledgeBase:
                         new_combined = new_emb
                     scores[i] = (new_combined, new_emb, kw_score, chunk)
 
-    def _should_rerank(self, candidates: list, top_k: int) -> bool:
+    def _should_rerank(self, candidates: list, top_k: int, is_strict_mode: bool = False) -> bool:
         """判斷是否需要 rerank
 
-        條件觸發：只有在 top_score 不高 或 前幾名分數差距很小時才 rerank
-        這可以大幅減少 reranker 呼叫次數，提升速度
+        P0 改進：
+        - RERANKER_ALWAYS_ON = True 時，有 reranker 就一律使用
+        - 嚴格模式下強制 rerank（STRICT_MODE_RERANK_REQUIRED）
+        - 否則使用條件觸發
         """
         if len(candidates) <= top_k:
             return False
 
+        # P0 改進：強制啟用 reranker
+        if RERANKER_ALWAYS_ON:
+            return True
+
+        # 嚴格模式強制 rerank
+        if is_strict_mode and STRICT_MODE_RERANK_REQUIRED:
+            return True
+
         top_score = candidates[0][0] if candidates else 0
+
+        # Margin-based 判斷（P0 改進）
+        if MARGIN_ENABLED and len(candidates) >= 2:
+            gap = candidates[0][0] - candidates[1][0]
+            # top1-top2 差距太小 → 不確定，需要 rerank
+            if gap < MARGIN_MIN_GAP:
+                return True
+            # top1 分數太低 → 需要更精確判斷
+            if top_score < MARGIN_LOW_SCORE:
+                return True
+
         # 如果最高分很高（>0.6），且與第5名差距明顯（>0.1），不需要 rerank
         if top_score > 0.6:
             fifth_score = candidates[min(4, len(candidates)-1)][0] if len(candidates) > 4 else 0
@@ -488,12 +870,14 @@ class KnowledgeBase:
         # 其他情況：top_score 較低時，需要 rerank
         return top_score < 0.5
 
-    def _rerank_with_model(self, question: str, candidates: list, top_k: int) -> list:
+    def _rerank_with_model(self, question: str, candidates: list, top_k: int,
+                           is_strict_mode: bool = False) -> list:
         """使用專用 reranker 模型重排
 
-        改進：
-        1. 條件觸發：只有必要時才 rerank（提升速度）
-        2. 減少 candidates 數量：min(10, top_k*2) 而非固定 20
+        P0 改進：
+        1. RERANKER_ALWAYS_ON = True 時預設啟用
+        2. 使用 RERANKER_TOP_N 控制 rerank 後取幾個
+        3. 嚴格模式下強制 rerank
         """
         if not candidates:
             return []
@@ -502,11 +886,11 @@ class KnowledgeBase:
             return [c[3] for c in candidates[:top_k]]
 
         # 條件觸發：判斷是否真的需要 rerank
-        if not self._should_rerank(candidates, top_k):
+        if not self._should_rerank(candidates, top_k, is_strict_mode):
             return [c[3] for c in candidates[:top_k]]
 
-        # 減少 rerank 的 candidates 數量
-        rerank_count = min(10, top_k * 2)
+        # P0 改進：使用 RERANKER_TOP_N 控制候選數量
+        rerank_count = min(RERANKER_TOP_N, len(candidates))
 
         if self._check_reranker_available():
             try:
@@ -795,13 +1179,15 @@ class KnowledgeBase:
         other_chars = len(text) - chinese_chars
         return int(chinese_chars / 1.5 + other_chars / 4)
 
-    def query(self, question: str, top_k: int = KNOWLEDGE_TOP_K) -> tuple[str, str, dict]:
+    def query(self, question: str, top_k: int = KNOWLEDGE_TOP_K,
+              is_strict_mode: bool = False) -> tuple[str, str, dict]:
         """
-        查詢相關知識 - 結構化輸出版本（動態門檻 + 動態 top_k）
+        查詢相關知識 - 結構化輸出版本（P0 改進：Margin-based 動態門檻）
+
         回傳: (model_output, display_output, metadata)
-        metadata 包含: has_ref, top_score, ref_count
+        metadata 包含: has_ref, top_score, ref_count, is_high_risk
         """
-        empty_metadata = {"has_ref": False, "top_score": 0.0, "ref_count": 0}
+        empty_metadata = {"has_ref": False, "top_score": 0.0, "ref_count": 0, "is_high_risk": False}
 
         if not self.loaded or not self.chunks:
             return "", "", empty_metadata
@@ -810,14 +1196,28 @@ class KnowledgeBase:
         if not candidates:
             return "", "", empty_metadata
 
-        # 動態門檻：短問題用較低門檻
-        # GPT建議：過濾時只看 embedding score，keyword 只用來排序
+        # 動態門檻：短問題用較低門檻，嚴格模式用較高門檻
         query_tokens = self._estimate_tokens(question)
-        base_threshold = KNOWLEDGE_THRESHOLD_SHORT if query_tokens < KNOWLEDGE_SHORT_QUERY_TOKENS else KNOWLEDGE_THRESHOLD
+        if is_strict_mode:
+            base_threshold = STRICT_MODE_THRESHOLD
+        elif query_tokens < KNOWLEDGE_SHORT_QUERY_TOKENS:
+            base_threshold = KNOWLEDGE_THRESHOLD_SHORT
+        else:
+            base_threshold = KNOWLEDGE_THRESHOLD
 
         # 改用 embedding score (candidates[i][1]) 作為過濾依據，而非 combined score
-        top_emb_score = candidates[0][1]  # (combined, emb, kw, chunk)
+        # P0 改進：格式是 (rrf_score, emb_score, bm25_score, chunk)
+        top_emb_score = candidates[0][1]  # (rrf, emb, bm25, chunk)
         min_emb_score = max(base_threshold, top_emb_score * DYNAMIC_THRESHOLD_RATIO)
+
+        # P0 改進：Margin-based 風險判斷
+        is_high_risk = False
+        if MARGIN_ENABLED and len(candidates) >= 2:
+            gap = candidates[0][1] - candidates[1][1]  # 用 embedding score 算 gap
+            if gap < MARGIN_MIN_GAP:
+                is_high_risk = True  # top1-top2 差距太小，不確定
+            if top_emb_score < MARGIN_LOW_SCORE:
+                is_high_risk = True  # top1 分數太低
 
         # 過濾：只看 embedding score，避免 keyword 誤打誤撞拉高分數
         filtered = [(s, e, k, c) for s, e, k, c in candidates if e >= min_emb_score]
@@ -832,7 +1232,9 @@ class KnowledgeBase:
         else:
             effective_top_k = min(top_k, DYNAMIC_TOP_K_MAX)
 
-        reranked_chunks = self._rerank_with_model(question, filtered, effective_top_k * 2)
+        # P0 改進：傳入 is_strict_mode 給 reranker
+        reranked_chunks = self._rerank_with_model(question, filtered, effective_top_k * 2,
+                                                   is_strict_mode=is_strict_mode)
         if not reranked_chunks:
             return "", "", empty_metadata
 
@@ -934,7 +1336,9 @@ class KnowledgeBase:
             display_parts.append(f"{src} [{dtype}] p.{pages_str}")
 
         # GPT建議：display 也顯示信心度，讓用戶知道參考資料的可靠度
-        display_output = f"[REF {confidence_label}] " + " | ".join(display_parts)
+        # P0 改進：高風險時加上警告
+        risk_warning = " ⚠️" if is_high_risk else ""
+        display_output = f"[REF {confidence_label}{risk_warning}] " + " | ".join(display_parts)
 
         # 回傳 metadata 供上層判斷 REF 強度
         # 改進：分別回傳 embedding score 和 keyword score，讓 spec 題拒答只看 embedding
@@ -962,15 +1366,38 @@ class KnowledgeBase:
             for c in merged_chunks
         ]
 
+        # P1 改進：計算污染指標
+        unique_sources = set(c.get("source", "") for c in merged_chunks)
+        score_variance = 0.0
+        if len(used_emb_scores) >= 2:
+            mean_score = sum(used_emb_scores) / len(used_emb_scores)
+            score_variance = sum((s - mean_score) ** 2 for s in used_emb_scores) / len(used_emb_scores)
+
+        # 污染風險判斷
+        # - 來源太多（>3）且分數差距小 → 可能混入不相關內容
+        # - 分數變異太小（<0.01）→ 難以區分，可能都不太相關
+        context_pollution_risk = "low"
+        if len(unique_sources) > 3 and score_variance < 0.02:
+            context_pollution_risk = "high"
+        elif len(unique_sources) > 2 and is_high_risk:
+            context_pollution_risk = "medium"
+
         metadata = {
             "has_ref": len(merged_chunks) > 0,
             "top_score": top_score,               # combined score（向後相容）
             "top_emb_score": top_emb_score_used,  # 修正：用最終選中 chunks 的最高 emb score
-            "top_kw_score": top_kw_score,         # 純 keyword score
+            "top_kw_score": top_kw_score,         # 純 keyword/BM25 score
             "has_spec_chunk": has_spec_chunk,     # 向後相容（等同 has_authoritative_chunk）
             "has_authoritative_chunk": has_authoritative_chunk,  # 是否命中權威類型（spec/manual/api）
             "ref_count": len(merged_chunks),
-            "refs": refs                          # 新增：實際引用的 REF 清單
+            "refs": refs,                         # 實際引用的 REF 清單
+            # P0 改進：Margin-based 風險判斷
+            "is_high_risk": is_high_risk,         # True = top1-top2 差距太小或分數太低
+            "confidence_label": confidence_label, # 高信心/中信心/低信心
+            # P1 改進：Context 污染指標
+            "unique_sources": len(unique_sources),     # 引用了幾個不同來源
+            "score_variance": score_variance,          # 分數變異（越大越好）
+            "context_pollution_risk": context_pollution_risk  # low/medium/high
         }
 
         return model_output, display_output, metadata
@@ -982,12 +1409,26 @@ class KnowledgeBase:
         chunk_count = len(self.chunks)
         doc_count = len(self.documents)
         features = []
-        if USE_HYBRID_SEARCH:
+
+        # P0 改進：顯示 BM25 + RRF 狀態
+        if BM25_ENABLED and self._bm25_index:
+            features.append("BM25")
+        elif USE_HYBRID_SEARCH:
             features.append("Hybrid")
+
+        if RRF_ENABLED:
+            features.append("RRF")
+
         if USE_RERANKER:
             reranker_type = "Model" if self._check_reranker_available() else "LLM"
-            features.append(f"Rerank({reranker_type})")
+            always_on = "+" if RERANKER_ALWAYS_ON else ""
+            features.append(f"Rerank{always_on}({reranker_type})")
+
         if USE_QUERY_EXPANSION:
             features.append("QExp")
+
+        if USE_MMR:
+            features.append("MMR")
+
         feature_str = f" [{'+'.join(features)}]" if features else ""
         return f"[KB] 知識庫: {self.path} ({doc_count} 文件, {chunk_count} 區塊){feature_str}"

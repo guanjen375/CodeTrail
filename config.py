@@ -144,6 +144,75 @@ MMR_LAMBDA = 0.7
 KEYWORD_WEIGHT = 0.3
 
 # ============================================================
+# P0 改進：Hybrid Retrieval + BM25 + RRF + Reranker 設定
+# ============================================================
+# BM25 參數（經典 Okapi BM25）
+BM25_K1 = 1.5                        # 詞頻飽和度參數
+BM25_B = 0.75                        # 文件長度正規化參數
+BM25_ENABLED = True                  # 啟用真正的 BM25（取代簡單 keyword matching）
+
+# RRF (Reciprocal Rank Fusion) 參數
+RRF_K = 60                           # RRF 常數，控制排名衰減速度
+RRF_ENABLED = True                   # 啟用 RRF 融合（取代線性加權）
+
+# Reranker 強制啟用（精準度優先）
+RERANKER_ALWAYS_ON = True            # True = 有 reranker 就一律使用，不等分數模糊
+RERANKER_TOP_N = 10                  # Rerank 後取 top N（精準度優先時 N=4~10）
+
+# 動態門檻：Margin-based 判斷
+MARGIN_ENABLED = True                # 啟用 margin 判斷
+MARGIN_MIN_GAP = 0.05                # top1-top2 差距低於此值視為「不確定」
+MARGIN_LOW_SCORE = 0.4               # top1 分數低於此值時需要額外檢查
+
+# 嚴格模式門檻（spec/manual 類問題更保守）
+STRICT_MODE_THRESHOLD = 0.40         # 嚴格模式下的基礎門檻（比一般問題高）
+STRICT_MODE_RERANK_REQUIRED = True   # 嚴格模式強制 rerank
+
+# ============================================================
+# P0 改進：Claim-to-Evidence 強制化設定
+# ============================================================
+CLAIM_TO_EVIDENCE_ENABLED = True     # 啟用 Claim-to-Evidence 驗證
+CLAIM_EVIDENCE_STRICT = True         # 嚴格模式：數字/限制/預設值必須有 REF
+# 需要強制驗證的 pattern（數字、限制、預設值等）
+CLAIM_EVIDENCE_PATTERNS = [
+    r'\d+',                          # 任何數字
+    r'最[大小]',                      # 最大/最小
+    r'[上下]限',                      # 上限/下限
+    r'預設',                         # 預設值
+    r'default',                      # default
+    r'must|shall|should',            # 規範用語
+    r'thread-safe|atomic',           # 執行緒安全
+    r'overflow|underflow',           # 溢位
+]
+
+# ============================================================
+# P1 改進：Multi-Query / Query Rewrite 設定
+# ============================================================
+MULTI_QUERY_ENABLED = True           # 啟用 multi-query
+MULTI_QUERY_COUNT = 3                # 生成幾個 query 變體
+MULTI_QUERY_TYPES = [
+    "key_terms",                     # 抽取關鍵術語
+    "translate",                     # 中英互譯
+    "code_hint"                      # 加上可能的函式名/旗標猜測
+]
+
+# ============================================================
+# P2 改進：Patch 驗證策略設定
+# ============================================================
+PATCH_AUTO_VERIFY = True             # 自動驗證 patch
+PATCH_VERIFY_STEPS = [
+    "lint",                          # 1. 跑 lint/format
+    "typecheck",                     # 2. 跑靜態分析（如 mypy）
+    "test"                           # 3. 跑測試（如 pytest）
+]
+# 靜態分析命令（按語言）
+TYPECHECK_COMMANDS = {
+    '.py': ['mypy --ignore-missing-imports'],
+    '.ts': ['tsc --noEmit'],
+    '.tsx': ['tsc --noEmit'],
+}
+
+# ============================================================
 # Code RAG 設定
 # ============================================================
 CODE_RAG_ENABLED = True

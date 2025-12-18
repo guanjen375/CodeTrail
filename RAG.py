@@ -150,26 +150,97 @@ def extract_section_title(line: str) -> str:
     return ""
 
 
+def normalize_table_content(text: str) -> str:
+    """P1 改進：將表格/條列轉成 Key: Value 格式
+
+    提升「最大值/預設值/限制」等問題的命中率
+    """
+    lines = text.split('\n')
+    normalized = []
+
+    for line in lines:
+        # Markdown 表格行 (| col1 | col2 | col3 |)
+        if '|' in line and line.count('|') >= 2:
+            cells = [c.strip() for c in line.split('|') if c.strip()]
+            if len(cells) >= 2 and not all(c == '-' or c.startswith('-') for c in cells):
+                # 嘗試識別 key-value 對
+                if len(cells) == 2:
+                    normalized.append(f"{cells[0]}: {cells[1]}")
+                else:
+                    normalized.append(line)  # 保留原始格式
+            continue
+
+        # 條列格式 (- key: value 或 * key: value)
+        list_match = re.match(r'^[\-\*\•]\s*(.+?):\s*(.+)$', line.strip())
+        if list_match:
+            normalized.append(f"{list_match.group(1)}: {list_match.group(2)}")
+            continue
+
+        normalized.append(line)
+
+    return '\n'.join(normalized)
+
+
+def extract_heading_hierarchy(lines: list, current_idx: int) -> str:
+    """P1 改進：提取章節標題層級
+
+    返回格式：H1 > H2 > H3
+    """
+    hierarchy = []
+
+    for i in range(current_idx, -1, -1):
+        line = lines[i].strip()
+        if is_heading(line):
+            title = extract_section_title(line)
+            if title:
+                # 判斷層級
+                if line.startswith('### '):
+                    level = 3
+                elif line.startswith('## '):
+                    level = 2
+                elif line.startswith('# '):
+                    level = 1
+                elif line.isupper():
+                    level = 1
+                else:
+                    level = 2
+
+                # 插入到正確位置
+                while hierarchy and hierarchy[0][0] >= level:
+                    hierarchy.pop(0)
+                hierarchy.insert(0, (level, title))
+
+    return ' > '.join(h[1] for h in hierarchy)
+
+
 def split_by_semantic_with_sections(text: str, max_chars: int = CHUNK_SIZE) -> List[Dict]:
     """
     語意切分：按標題/段落切，保持語意完整性，同時追蹤章節標題
 
-    Returns: List[{content: str, section: str}]
+    P1 改進：
+    - 表格/條列轉成 Key: Value 格式
+    - 追蹤完整的標題層級
+
+    Returns: List[{content: str, section: str, heading_hierarchy: str}]
     """
     text = text.strip()
     if not text:
         return []
 
+    # P1 改進：正規化表格內容
+    text = normalize_table_content(text)
+
     if len(text) <= max_chars:
-        return [{"content": text, "section": ""}]
+        return [{"content": text, "section": "", "heading_hierarchy": ""}]
 
     lines = text.split('\n')
     chunks = []
     current_chunk = []
     current_len = 0
     current_section = ""  # 追蹤當前章節
+    chunk_start_idx = 0  # 用於計算 heading hierarchy
 
-    for line in lines:
+    for idx, line in enumerate(lines):
         line_len = len(line) + 1  # +1 for newline
 
         # 遇到標題 → 先 flush 舊 chunk（用舊 section），再更新 section
@@ -178,7 +249,12 @@ def split_by_semantic_with_sections(text: str, max_chars: int = CHUNK_SIZE) -> L
             if current_chunk:
                 chunk_text = '\n'.join(current_chunk).strip()
                 if chunk_text:
-                    chunks.append({"content": chunk_text, "section": current_section})
+                    hierarchy = extract_heading_hierarchy(lines, chunk_start_idx)
+                    chunks.append({
+                        "content": chunk_text,
+                        "section": current_section,
+                        "heading_hierarchy": hierarchy
+                    })
 
             # 再更新 section
             section_title = extract_section_title(line)
@@ -187,6 +263,7 @@ def split_by_semantic_with_sections(text: str, max_chars: int = CHUNK_SIZE) -> L
 
             current_chunk = [line]
             current_len = line_len
+            chunk_start_idx = idx
             continue
 
         # 空行 → 段落分界
@@ -194,9 +271,15 @@ def split_by_semantic_with_sections(text: str, max_chars: int = CHUNK_SIZE) -> L
             if current_len > max_chars * 0.7:  # 超過 70% 就切
                 chunk_text = '\n'.join(current_chunk).strip()
                 if chunk_text:
-                    chunks.append({"content": chunk_text, "section": current_section})
+                    hierarchy = extract_heading_hierarchy(lines, chunk_start_idx)
+                    chunks.append({
+                        "content": chunk_text,
+                        "section": current_section,
+                        "heading_hierarchy": hierarchy
+                    })
                 current_chunk = []
                 current_len = 0
+                chunk_start_idx = idx + 1
             else:
                 current_chunk.append(line)
                 current_len += line_len
@@ -207,18 +290,29 @@ def split_by_semantic_with_sections(text: str, max_chars: int = CHUNK_SIZE) -> L
             if current_chunk:
                 chunk_text = '\n'.join(current_chunk).strip()
                 if chunk_text:
-                    chunks.append({"content": chunk_text, "section": current_section})
+                    hierarchy = extract_heading_hierarchy(lines, chunk_start_idx)
+                    chunks.append({
+                        "content": chunk_text,
+                        "section": current_section,
+                        "heading_hierarchy": hierarchy
+                    })
 
             # 單行超長 → 按句子切
             if line_len > max_chars:
                 sub_chunks = split_long_paragraph(line, max_chars)
                 for i, sc in enumerate(sub_chunks[:-1]):
-                    chunks.append({"content": sc, "section": current_section})
+                    hierarchy = extract_heading_hierarchy(lines, idx)
+                    chunks.append({
+                        "content": sc,
+                        "section": current_section,
+                        "heading_hierarchy": hierarchy
+                    })
                 current_chunk = [sub_chunks[-1]] if sub_chunks else []
                 current_len = len(current_chunk[0]) if current_chunk else 0
             else:
                 current_chunk = [line]
                 current_len = line_len
+            chunk_start_idx = idx
         else:
             current_chunk.append(line)
             current_len += line_len
@@ -227,7 +321,12 @@ def split_by_semantic_with_sections(text: str, max_chars: int = CHUNK_SIZE) -> L
     if current_chunk:
         chunk_text = '\n'.join(current_chunk).strip()
         if chunk_text:
-            chunks.append({"content": chunk_text, "section": current_section})
+            hierarchy = extract_heading_hierarchy(lines, chunk_start_idx)
+            chunks.append({
+                "content": chunk_text,
+                "section": current_section,
+                "heading_hierarchy": hierarchy
+            })
 
     return [c for c in chunks if c["content"].strip()]
 
