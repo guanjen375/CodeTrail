@@ -92,7 +92,17 @@ class Symbol:
 
 
 class PythonASTParser:
-    """使用內建 ast 模組解析 Python"""
+    """使用內建 ast 模組解析 Python
+
+    改進：使用 NodeVisitor 追蹤父節點，正確排除巢狀函式（nested function）。
+    只收錄：
+    - 模組級別的 class
+    - 模組級別的 function
+    - class 內的第一層 method
+    不收錄：
+    - function 內的巢狀 function（如 decorator inner、closure helper）
+    - method 內的巢狀 function
+    """
 
     def parse(self, content: str, filepath: Path) -> list[Symbol]:
         """解析 Python 程式碼"""
@@ -101,85 +111,131 @@ class PythonASTParser:
         except SyntaxError:
             return []
 
-        symbols = []
         lines = content.split('\n')
+        visitor = _PythonSymbolVisitor(lines, self)
+        visitor.visit(tree)
+        return visitor.symbols
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                start_line = node.lineno
-                end_line = self._get_end_line(node)
-                context = self._get_context(lines, start_line, end_line)
-                symbols.append(Symbol(
-                    name=node.name,
-                    type='class',
-                    start_line=start_line,
-                    end_line=end_line,
-                    context=context
-                ))
 
-                # 解析 class 內的 methods
-                for item in node.body:
-                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        method_start = item.lineno
-                        method_end = self._get_end_line(item)
-                        method_context = self._get_context(lines, method_start, method_end)
-                        symbols.append(Symbol(
-                            name=item.name,
-                            type='method',
-                            start_line=method_start,
-                            end_line=method_end,
-                            context=method_context,
-                            parent=node.name
-                        ))
+class _PythonSymbolVisitor(ast.NodeVisitor):
+    """Python AST Visitor - 追蹤 scope 層級以排除巢狀函式"""
 
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                # 只處理模組級別的函式（class 內的已在上面處理）
-                if not any(
-                    isinstance(p, ast.ClassDef) and node in ast.walk(p)
-                    for p in ast.walk(tree) if isinstance(p, ast.ClassDef)
-                ):
-                    # 檢查是否在 class 內
-                    in_class = False
-                    for parent in ast.walk(tree):
-                        if isinstance(parent, ast.ClassDef):
-                            if node in ast.walk(parent):
-                                in_class = True
-                                break
-                    if not in_class:
-                        start_line = node.lineno
-                        end_line = self._get_end_line(node)
-                        context = self._get_context(lines, start_line, end_line)
-                        symbols.append(Symbol(
-                            name=node.name,
-                            type='function',
-                            start_line=start_line,
-                            end_line=end_line,
-                            context=context
-                        ))
+    def __init__(self, lines: list, parser: 'PythonASTParser'):
+        self.lines = lines
+        self.parser = parser
+        self.symbols = []
+        # scope_stack 記錄當前的 scope 類型：'module', 'class', 'function'
+        self.scope_stack = ['module']
 
-        return symbols
+    def visit_ClassDef(self, node: ast.ClassDef):
+        """處理 class 定義"""
+        # class 只在模組層級收錄
+        if self.scope_stack[-1] == 'module':
+            start_line = node.lineno
+            end_line = self.parser._get_end_line(node)
+            context = self.parser._get_context(self.lines, start_line, end_line)
+            self.symbols.append(Symbol(
+                name=node.name,
+                type='class',
+                start_line=start_line,
+                end_line=end_line,
+                context=context
+            ))
 
-    def _get_end_line(self, node) -> int:
-        """取得節點的結束行號"""
-        if hasattr(node, 'end_lineno') and node.end_lineno:
-            return node.end_lineno
-        # Fallback: 遍歷子節點找最大行號
-        max_line = node.lineno
-        for child in ast.walk(node):
-            if hasattr(child, 'lineno') and child.lineno:
-                max_line = max(max_line, child.lineno)
-            if hasattr(child, 'end_lineno') and child.end_lineno:
-                max_line = max(max_line, child.end_lineno)
-        return max_line
+            # 進入 class scope，處理其中的 methods
+            self.scope_stack.append('class')
+            self._current_class = node.name
+            self.generic_visit(node)
+            self.scope_stack.pop()
+            self._current_class = None
+        else:
+            # 巢狀 class（較少見），不收錄但仍遍歷
+            self.generic_visit(node)
 
-    def _get_context(self, lines: list, start_line: int, end_line: int, max_lines: int = 15) -> str:
-        """取得符號的上下文（定義區塊）"""
-        # 取得符號開頭 + 少量內容，用於 embedding
-        start_idx = start_line - 1
-        # 先取 signature + 前幾行，最多 max_lines
-        context_end = min(start_idx + max_lines, len(lines))
-        context_lines = lines[start_idx:context_end]
-        return '\n'.join(context_lines)
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        """處理 function/method 定義"""
+        self._handle_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        """處理 async function/method 定義"""
+        self._handle_function(node)
+
+    def _handle_function(self, node):
+        """統一處理 function 和 async function"""
+        current_scope = self.scope_stack[-1]
+
+        if current_scope == 'module':
+            # 模組級別的 function → 收錄
+            start_line = node.lineno
+            end_line = self.parser._get_end_line(node)
+            context = self.parser._get_context(self.lines, start_line, end_line)
+            self.symbols.append(Symbol(
+                name=node.name,
+                type='function',
+                start_line=start_line,
+                end_line=end_line,
+                context=context
+            ))
+            # 進入 function scope（其內的 function 不收錄）
+            self.scope_stack.append('function')
+            self.generic_visit(node)
+            self.scope_stack.pop()
+
+        elif current_scope == 'class':
+            # class 內的第一層 method → 收錄
+            start_line = node.lineno
+            end_line = self.parser._get_end_line(node)
+            context = self.parser._get_context(self.lines, start_line, end_line)
+            self.symbols.append(Symbol(
+                name=node.name,
+                type='method',
+                start_line=start_line,
+                end_line=end_line,
+                context=context,
+                parent=getattr(self, '_current_class', None)
+            ))
+            # 進入 function scope（method 內的 function 不收錄）
+            self.scope_stack.append('function')
+            self.generic_visit(node)
+            self.scope_stack.pop()
+
+        else:
+            # current_scope == 'function'
+            # 這是巢狀函式（nested function），不收錄
+            # 但仍要遍歷其子節點（可能有更深的巢狀）
+            self.scope_stack.append('function')
+            self.generic_visit(node)
+            self.scope_stack.pop()
+
+
+# PythonASTParser 的 helper methods（放在 class 外供 visitor 使用）
+def _get_end_line(node) -> int:
+    """取得節點的結束行號"""
+    if hasattr(node, 'end_lineno') and node.end_lineno:
+        return node.end_lineno
+    # Fallback: 遍歷子節點找最大行號
+    max_line = node.lineno
+    for child in ast.walk(node):
+        if hasattr(child, 'lineno') and child.lineno:
+            max_line = max(max_line, child.lineno)
+        if hasattr(child, 'end_lineno') and child.end_lineno:
+            max_line = max(max_line, child.end_lineno)
+    return max_line
+
+
+def _get_context(lines: list, start_line: int, end_line: int, max_lines: int = 15) -> str:
+    """取得符號的上下文（定義區塊）"""
+    # 取得符號開頭 + 少量內容，用於 embedding
+    start_idx = start_line - 1
+    # 先取 signature + 前幾行，最多 max_lines
+    context_end = min(start_idx + max_lines, len(lines))
+    context_lines = lines[start_idx:context_end]
+    return '\n'.join(context_lines)
+
+
+# 為 PythonASTParser 加上 instance methods（向後相容）
+PythonASTParser._get_end_line = staticmethod(_get_end_line)
+PythonASTParser._get_context = staticmethod(_get_context)
 
 
 class TreeSitterParser:

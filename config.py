@@ -416,6 +416,7 @@ RUN_COMMAND_ERROR_PATTERNS = [
 # 白名單：完整命令列表（用於 shlex.split 後的驗證）
 # 改進：使用 shell=False + shlex.split，更安全
 ALLOWED_COMMANDS = [
+    # === 測試命令 ===
     # Python（相對安全，但 conftest.py 仍可能有惡意程式碼）
     'pytest', 'python -m pytest', 'python -m unittest',
     # C/C++（ctest 相對安全，make test/check 已移除）
@@ -426,4 +427,22 @@ ALLOWED_COMMANDS = [
     'cargo test',
     # Go（最安全，不執行專案腳本）
     'go test',
+
+    # === 靜態分析命令（供 Patch 驗證使用）===
+    # Python 型別檢查
+    'mypy', 'python -m mypy',
+    # TypeScript 型別檢查
+    'tsc',
+    # Python Lint
+    'ruff', 'ruff check', 'python -m ruff',
+    'black', 'black --check', 'python -m black',
+    'isort', 'isort --check', 'python -m isort',
+    # JavaScript/TypeScript Lint
+    'eslint',
+    # Go
+    'go vet', 'gofmt',
+    # Rust
+    'cargo clippy', 'rustfmt',
+    # C/C++
+    'clang-format',
 ]

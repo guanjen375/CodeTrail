@@ -541,24 +541,21 @@ class ToolExecutor:
             count = sum(1 for _ in target.rglob("*") if _.is_file())
             return f"{path}: 目錄, {count} 個檔案"
 
-    def run_command(self, command: str, timeout: int = RUN_COMMAND_TIMEOUT) -> str:
-        """執行白名單內的測試/建置命令"""
-        if not config.RUN_COMMAND_ENABLED:
-            return "錯誤: run_command 功能已停用（可用 --run-tests 或設定 AI_CODE_RUN_TESTS=1 啟用）"
+    def _validate_command(self, command: str) -> tuple[bool, str, list]:
+        """驗證命令是否安全且在白名單中
 
-        # 容器化執行模式
-        if container_runner.CONTAINER_ENABLED:
-            return self._run_command_in_container(command, timeout)
-
+        Returns:
+            (is_valid, error_message, cmd_parts)
+        """
         command = command.strip()
 
         try:
             cmd_parts = shlex.split(command)
         except ValueError as e:
-            return f"錯誤: 命令解析失敗 - {e}"
+            return False, f"錯誤: 命令解析失敗 - {e}", []
 
         if not cmd_parts:
-            return "錯誤: 空命令"
+            return False, "錯誤: 空命令", []
 
         # 驗證命令是否在白名單中
         is_allowed = False
@@ -570,14 +567,30 @@ class ToolExecutor:
 
         if not is_allowed:
             allowed_list = ', '.join(ALLOWED_COMMANDS[:8])
-            return f"錯誤: 不允許的命令。\n允許的命令前綴: {allowed_list}..."
+            return False, f"錯誤: 不允許的命令。\n允許的命令前綴: {allowed_list}...", []
 
-        # 額外安全檢查
+        # 額外安全檢查：危險字元
         dangerous_patterns = ['$(', '`', '&&', '||', ';', '|', '>', '<']
         for part in cmd_parts:
             for pattern in dangerous_patterns:
                 if pattern in part:
-                    return f"錯誤: 參數包含不允許的字元 '{pattern}'"
+                    return False, f"錯誤: 參數包含不允許的字元 '{pattern}'", []
+
+        return True, "", cmd_parts
+
+    def run_command(self, command: str, timeout: int = RUN_COMMAND_TIMEOUT) -> str:
+        """執行白名單內的測試/建置命令"""
+        if not config.RUN_COMMAND_ENABLED:
+            return "錯誤: run_command 功能已停用（可用 --run-tests 或設定 AI_CODE_RUN_TESTS=1 啟用）"
+
+        # 統一驗證（容器/非容器模式都要過白名單）
+        is_valid, error_msg, cmd_parts = self._validate_command(command)
+        if not is_valid:
+            return error_msg
+
+        # 容器化執行模式
+        if container_runner.CONTAINER_ENABLED:
+            return self._run_command_in_container(command, timeout)
 
         try:
             print(f"   [RUN] 執行: {command}")
@@ -764,9 +777,15 @@ class ToolExecutor:
             if test_patterns:
                 try:
                     # 只執行相關測試（用 -k 過濾）
+                    # 注意：不使用 pipe（|）和重導向，因為會被安全檢查擋掉
+                    # 輸出截斷改由 Python 處理
                     keywords = " or ".join(p.replace('.py', '') for p in test_patterns[:3])
-                    test_cmd = f"pytest -x -q -k \"{keywords}\" --tb=short 2>&1 | head -20"
+                    test_cmd = f"pytest -x -q -k \"{keywords}\" --tb=short"
                     test_result = self.run_command(test_cmd, timeout=60)
+                    # 截斷過長輸出（原本用 head -20 的功能）
+                    test_lines = test_result.split('\n')
+                    if len(test_lines) > 25:
+                        test_result = '\n'.join(test_lines[:25]) + f"\n... (截斷，共 {len(test_lines)} 行)"
                     if "FAILED" in test_result or "ERROR" in test_result:
                         results.append(f"  ✗ 測試失敗")
                         results.append(f"    {test_result[:200]}")
