@@ -1223,6 +1223,7 @@ def process_url(url: str) -> Optional[Tuple[List[Dict], str]]:
         失敗: None
     """
     content, title = fetch_url_content(url)
+    fetched_at = datetime.now().isoformat()  # 記錄抓取時間
 
     if not content:
         return None
