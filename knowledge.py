@@ -1382,6 +1382,9 @@ English:"""
         elif len(unique_sources) > 2 and is_high_risk:
             context_pollution_risk = "medium"
 
+        # P0-Eval: 提取 retrieved_chunks 內容供 Layer 1 Retrieval Recall 計算
+        retrieved_chunks = [c.get("content", "") for c in merged_chunks]
+
         metadata = {
             "has_ref": len(merged_chunks) > 0,
             "top_score": top_score,               # combined score（向後相容）
@@ -1391,6 +1394,8 @@ English:"""
             "has_authoritative_chunk": has_authoritative_chunk,  # 是否命中權威類型（spec/manual/api）
             "ref_count": len(merged_chunks),
             "refs": refs,                         # 實際引用的 REF 清單
+            # P0-Eval: 供 eval 用的 retrieved_chunks 內容
+            "retrieved_chunks": retrieved_chunks, # chunk 內容列表，用於 Layer 1 Recall 評估
             # P0 改進：Margin-based 風險判斷
             "is_high_risk": is_high_risk,         # True = top1-top2 差距太小或分數太低
             "confidence_label": confidence_label, # 高信心/中信心/低信心

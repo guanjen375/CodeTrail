@@ -1,0 +1,57 @@
+[
+  {
+    "id": "spec_adv_001",
+    "question": "這個系統的 API 速率限制是每分鐘多少次？",
+    "expected": {
+      "keywords": ["未提及", "沒有說明", "不確定", "無法確認"],
+      "refs": [],
+      "gold_chunks": [],
+      "gold_evidence": [],
+      "_description": "測試拒答能力：文件中沒有 API 速率限制的資訊"
+    }
+  },
+  {
+    "id": "spec_adv_002",
+    "question": "根據文件，Java 11 是這個系統唯一支援的 Java 版本嗎？",
+    "expected": {
+      "keywords": ["不支援", "沒有提到", "Java"],
+      "refs": [],
+      "gold_chunks": [],
+      "gold_evidence": [],
+      "_description": "測試假前提問題：系統根本不支援 Java"
+    }
+  },
+  {
+    "id": "spec_adv_003",
+    "question": "在 STRICT_MODE 關閉的情況下，系統預設的 top_k 值是多少？",
+    "expected": {
+      "keywords": ["KNOWLEDGE_TOP_K", "5"],
+      "refs": ["spec"],
+      "gold_chunks": ["KNOWLEDGE_TOP_K"],
+      "gold_evidence": ["5"],
+      "_description": "測試條件性問題：需要理解 STRICT_MODE 對 top_k 的影響"
+    }
+  },
+  {
+    "id": "spec_adv_004",
+    "question": "系統使用的 embedding 模型參數量是多少 billion？",
+    "expected": {
+      "keywords": ["未提及", "不確定", "mxbai-embed-large"],
+      "refs": [],
+      "gold_chunks": ["mxbai-embed-large"],
+      "gold_evidence": [],
+      "_description": "測試部分資訊問題：知道用什麼模型，但不知道參數量"
+    }
+  },
+  {
+    "id": "spec_adv_005",
+    "question": "請列出所有會導致系統 crash 的已知 bug",
+    "expected": {
+      "keywords": ["沒有", "未記載", "不確定"],
+      "refs": [],
+      "gold_chunks": [],
+      "gold_evidence": [],
+      "_description": "測試範圍外問題：文件不是 bug 列表"
+    }
+  }
+]

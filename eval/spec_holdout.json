@@ -1,0 +1,32 @@
+[
+  {
+    "id": "spec_hold_001",
+    "question": "知識庫查詢的動態門檻比例 DYNAMIC_THRESHOLD_RATIO 預設值是多少？",
+    "expected": {
+      "refs": ["spec", "threshold"],
+      "keywords": ["0.8", "DYNAMIC_THRESHOLD_RATIO"],
+      "gold_chunks": ["DYNAMIC_THRESHOLD_RATIO"],
+      "gold_evidence": ["0.8"]
+    }
+  },
+  {
+    "id": "spec_hold_002",
+    "question": "Reranker 模型的預設 top_n 設定值是多少？",
+    "expected": {
+      "refs": ["spec", "reranker"],
+      "keywords": ["10", "RERANKER_TOP_N"],
+      "gold_chunks": ["RERANKER_TOP_N"],
+      "gold_evidence": ["10"]
+    }
+  },
+  {
+    "id": "spec_hold_003",
+    "question": "系統對 binary context 的預設最大行數限制是多少？",
+    "expected": {
+      "refs": ["spec", "binary"],
+      "keywords": ["50", "BINARY_MAX_CONTEXT_LINES"],
+      "gold_chunks": ["BINARY_MAX_CONTEXT_LINES"],
+      "gold_evidence": ["50"]
+    }
+  }
+]

@@ -4,7 +4,9 @@
     "question": "這個系統預設使用什麼模型？",
     "expected": {
       "refs": ["spec", "模型"],
-      "keywords": ["qwen3-coder", "30b"]
+      "keywords": ["qwen3-coder", "30b"],
+      "gold_chunks": ["MODEL", "qwen3"],
+      "gold_evidence": ["qwen3-coder:30b-instruct-q4_K_M"]
     }
   },
   {
@@ -12,7 +14,9 @@
     "question": "NUM_CTX 應該設多大才不會 OOM？",
     "expected": {
       "refs": ["spec", "context"],
-      "keywords": ["64K", "OOM", "offload"]
+      "keywords": ["64K", "OOM", "offload"],
+      "gold_chunks": ["NUM_CTX", "context"],
+      "gold_evidence": ["65536", "64K"]
     }
   },
   {
@@ -20,7 +24,9 @@
     "question": "Patch 功能預設是開啟還是關閉的？如何啟用？",
     "expected": {
       "refs": ["spec", "patch"],
-      "keywords": ["停用", "--patch", "AI_CODE_PATCH"]
+      "keywords": ["停用", "--patch", "AI_CODE_PATCH"],
+      "gold_chunks": ["PATCH_ENABLED", "patch"],
+      "gold_evidence": ["預設停用", "False"]
     }
   },
   {
@@ -28,7 +34,9 @@
     "question": "Code RAG 對 Bug 類問題的相關度門檻是多少？",
     "expected": {
       "refs": ["spec", "threshold"],
-      "keywords": ["0.25", "CODE_RAG_THRESHOLD_BUG"]
+      "keywords": ["0.25", "CODE_RAG_THRESHOLD_BUG"],
+      "gold_chunks": ["CODE_RAG_THRESHOLD", "BUG"],
+      "gold_evidence": ["0.25"]
     }
   },
   {
@@ -36,7 +44,9 @@
     "question": "系統支援哪些程式語言？",
     "expected": {
       "refs": ["spec", "語言"],
-      "keywords": ["Python", "C++", "JavaScript", "Go", "Rust"]
+      "keywords": ["Python", "C++", "JavaScript", "Go", "Rust"],
+      "gold_chunks": ["CODE_EXTENSIONS", "支援"],
+      "gold_evidence": [".py", ".cpp", ".js", ".go", ".rs"]
     }
   }
 ]
