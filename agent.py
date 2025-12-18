@@ -23,7 +23,7 @@ from config import (
     get_answer_rules
 )
 from utils import (
-    call_llm_stream, should_use_strict_mode, answer_with_self_check,
+    call_llm_stream, should_use_strict_mode, needs_grounding, answer_with_self_check,
     scan_project_metadata, print_ctx_usage
 )
 
@@ -708,8 +708,10 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
                     })
                     continue
 
+                # P0-1: 使用 needs_grounding 偵測器
+                grounding_needed, grounding_reason = needs_grounding(question)
                 if should_use_strict_mode(question, knowledge_ctx):
-                    print(f"   [STRICT] Agent 啟用嚴格模式自我檢查...")
+                    print(f"   [STRICT] Agent 啟用嚴格模式自我檢查 (reason: {grounding_reason})...")
                     base_ctx = f"專案路徑: {folder}\n{code_rag_context}\n{stack_preread_context}"
                     content = answer_with_self_check(question, base_ctx, knowledge_ctx, binary_ctx=image_ctx)
 

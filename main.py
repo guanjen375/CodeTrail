@@ -36,7 +36,7 @@ from config import (
     CODE_RAG_ENABLED, IGNORED_DIRS, IGNORED_PATTERNS,
     SKIP_LOW_CONFIDENCE_KB, LOW_CONFIDENCE_KB_THRESHOLD
 )
-from utils import check_ollama_gpu, scan_project_metadata, scan_project, should_refuse_answer, should_use_strict_mode, answer_with_self_check, call_llm_stream, print_ctx_usage
+from utils import check_ollama_gpu, scan_project_metadata, scan_project, should_refuse_answer, should_use_strict_mode, needs_grounding, answer_with_self_check, call_llm_stream, print_ctx_usage
 from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from context import build_full_context, analyze_full, show_full_stats
@@ -87,8 +87,10 @@ def run_qa_mode(question: str, kb: "KnowledgeBase", qa_history: list = None):
         knowledge_ctx, knowledge_display, kb_metadata = kb.query(clean_q)
 
         # 跳過低信心度的 KB context
+        # P0-5 修正：不再 fallback 到 top_score (RRF score 量級不同)
+        # 若無 top_emb_score 則預設 1.0（不觸發跳過）
         if SKIP_LOW_CONFIDENCE_KB and knowledge_ctx:
-            top_emb_score = kb_metadata.get("top_emb_score", kb_metadata.get("top_score", 0.0))
+            top_emb_score = kb_metadata.get("top_emb_score", 1.0)
             if top_emb_score < LOW_CONFIDENCE_KB_THRESHOLD:
                 print(f"[KB] 跳過低信心度上下文 (emb_score={top_emb_score:.2f} < {LOW_CONFIDENCE_KB_THRESHOLD})")
                 knowledge_ctx = ""
@@ -112,8 +114,10 @@ def run_qa_mode(question: str, kb: "KnowledgeBase", qa_history: list = None):
     print("[NOTE] 回答:\n")
 
     # 規格類問題走嚴格模式 - 與一般模式行為一致
+    # P0-1: 使用 needs_grounding 偵測器
+    grounding_needed, grounding_reason = needs_grounding(clean_q)
     if kb and kb.loaded and should_use_strict_mode(clean_q, knowledge_ctx) and knowledge_ctx:
-        print("[STRICT] 規格類問題，啟用嚴格模式\n")
+        print(f"[STRICT] 啟用嚴格模式 (reason: {grounding_reason})\n")
         # QA 模式沒有專案路徑，base_ctx 放所有圖片 OCR（file: 和 img: 都要）
         all_img_ctx = file_meta.get("image_ctx", "") + img_ctx
         base_ctx = all_img_ctx if all_img_ctx else ""
@@ -459,10 +463,10 @@ def main():
         knowledge_ctx, knowledge_display, kb_metadata = kb.query(clean_q) if kb.loaded else ("", "", {})
 
         # 跳過低信心度的 KB context 注入，避免雜訊
-        # 改進：使用 top_emb_score（純 embedding 分數）而非 top_score（含 keyword）
-        # 這與 should_refuse_answer 的標準一致，避免 keyword 灌高分數造成假陽性
+        # P0-5 修正：不再 fallback 到 top_score (RRF score 量級不同)
+        # 若無 top_emb_score 則預設 1.0（不觸發跳過）
         if SKIP_LOW_CONFIDENCE_KB and knowledge_ctx:
-            top_emb_score = kb_metadata.get("top_emb_score", kb_metadata.get("top_score", 0.0))
+            top_emb_score = kb_metadata.get("top_emb_score", 1.0)
             if top_emb_score < LOW_CONFIDENCE_KB_THRESHOLD:
                 print(f"[KB] 跳過低信心度上下文 (emb_score={top_emb_score:.2f} < {LOW_CONFIDENCE_KB_THRESHOLD})")
                 knowledge_ctx = ""
@@ -488,8 +492,10 @@ def main():
         agent_metadata = None
 
         # GPT建議：規格題優先走嚴格模式，避免 Agent 多讀 code 來「補想像」
+        # P0-1: 使用 needs_grounding 偵測器
+        grounding_needed, grounding_reason = needs_grounding(clean_q)
         if should_use_strict_mode(clean_q, knowledge_ctx) and knowledge_ctx:
-            print("[STRICT] 規格類問題，直接走嚴格模式\n")
+            print(f"[STRICT] 啟用嚴格模式 (reason: {grounding_reason})\n")
             # base_ctx 放專案路徑 + 所有圖片 OCR（file: 和 img: 都要）
             # binary_ctx 獨立傳入讓 strict 自檢能正確處理 BIN/ELF 優先級
             base_ctx = f"專案路徑: {folder}\n{all_img_ctx}" if all_img_ctx else f"專案路徑: {folder}"
@@ -573,9 +579,9 @@ def main():
             knowledge_ctx, knowledge_display, kb_metadata = kb.query(rag_query) if kb.loaded else ("", "", {})
 
             # 跳過低信心度的 KB context 注入，避免雜訊
-            # 改進：使用 top_emb_score（純 embedding 分數）而非 top_score（含 keyword）
+            # P0-5 修正：不再 fallback 到 top_score (RRF score 量級不同)
             if SKIP_LOW_CONFIDENCE_KB and knowledge_ctx:
-                top_emb_score = kb_metadata.get("top_emb_score", kb_metadata.get("top_score", 0.0))
+                top_emb_score = kb_metadata.get("top_emb_score", 1.0)
                 if top_emb_score < LOW_CONFIDENCE_KB_THRESHOLD:
                     print(f"[KB] 跳過低信心度上下文 (emb_score={top_emb_score:.2f} < {LOW_CONFIDENCE_KB_THRESHOLD})")
                     knowledge_ctx = ""
@@ -622,8 +628,10 @@ def main():
             agent_metadata = None
 
             # GPT建議：規格題優先走嚴格模式，避免 Agent 多讀 code 來「補想像」
+            # P0-1: 使用 needs_grounding 偵測器
+            grounding_needed, grounding_reason = needs_grounding(clean_q)
             if should_use_strict_mode(clean_q, knowledge_ctx) and knowledge_ctx and not is_followup:
-                print("[STRICT] 規格類問題，直接走嚴格模式\n")
+                print(f"[STRICT] 啟用嚴格模式 (reason: {grounding_reason})\n")
                 # base_ctx 放專案路徑 + 所有圖片 OCR（file: 和 img: 都要）
                 # binary_ctx 獨立傳入讓 strict 自檢能正確處理 BIN/ELF 優先級
                 base_ctx = f"專案路徑: {folder}\n{all_img_ctx}" if all_img_ctx else f"專案路徑: {folder}"

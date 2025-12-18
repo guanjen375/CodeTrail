@@ -22,7 +22,13 @@ from config import (
     PRIORITY_RULE_WITH_BINARY, PRIORITY_RULE_WITHOUT_BINARY,
     get_answer_rules,
     # P0 改進：Claim-to-Evidence 強制化
-    CLAIM_TO_EVIDENCE_ENABLED, CLAIM_EVIDENCE_STRICT, CLAIM_EVIDENCE_PATTERNS
+    CLAIM_TO_EVIDENCE_ENABLED, CLAIM_EVIDENCE_STRICT, CLAIM_EVIDENCE_PATTERNS,
+    # P0-1 改進：needs_grounding 偵測器
+    NEEDS_GROUNDING_ENABLED, GROUNDING_NUMERIC_PATTERNS, GROUNDING_SPEC_PATTERNS,
+    GROUNDING_COMPARE_PATTERNS, GROUNDING_FORCE_KEYWORDS, GROUNDING_EXCLUDE_PATTERNS,
+    # P0-2 改進：句子級證據覆蓋率
+    SENTENCE_EVIDENCE_ENABLED, SENTENCE_EVIDENCE_DELETE, SENTENCE_EVIDENCE_MIN_LEN,
+    SENTENCE_EVIDENCE_WHITELIST,
 )
 
 
@@ -390,27 +396,95 @@ def is_spec_question(question: str) -> bool:
     return any(kw.lower() in q_lower for kw in SPEC_QUESTION_KEYWORDS)
 
 
+def needs_grounding(question: str) -> tuple[bool, str]:
+    """
+    P0-1: 智能判斷問題是否需要證據支持（取代純關鍵字觸發）
+
+    偵測特徵：
+    - 數值詢問（多少、幾個、預設值、上限下限）
+    - 規格/標準詢問（RFC、API 參數、錯誤碼、版本對照）
+    - 比較/對照類問題
+    - 強制 grounding 關鍵字
+
+    Returns:
+        (needs_grounding: bool, reason: str)
+        reason 用於 debug 和日誌
+    """
+    if not NEEDS_GROUNDING_ENABLED:
+        # 降級到舊邏輯：純關鍵字檢查
+        is_spec = is_spec_question(question)
+        has_strict_kw = any(kw.lower() in question.lower() for kw in STRICT_MODE_KEYWORDS)
+        if is_spec or has_strict_kw:
+            return True, "legacy_keyword"
+        return False, ""
+
+    q_lower = question.lower()
+
+    # 1. 檢查排除模式（概念解釋、操作指引等通常不需要 grounding）
+    for pattern in GROUNDING_EXCLUDE_PATTERNS:
+        if re.search(pattern, q_lower, re.IGNORECASE):
+            # 排除模式命中，但如果同時有數值詢問則仍需 grounding
+            has_numeric = any(re.search(p, q_lower, re.IGNORECASE)
+                            for p in GROUNDING_NUMERIC_PATTERNS)
+            if not has_numeric:
+                return False, "excluded_pattern"
+
+    # 2. 強制 grounding 關鍵字（高優先級）
+    for kw in GROUNDING_FORCE_KEYWORDS:
+        if kw.lower() in q_lower:
+            return True, f"force_keyword:{kw}"
+
+    # 3. 數值詢問模式
+    for pattern in GROUNDING_NUMERIC_PATTERNS:
+        if re.search(pattern, q_lower, re.IGNORECASE):
+            return True, f"numeric:{pattern}"
+
+    # 4. 規格/標準詢問模式
+    for pattern in GROUNDING_SPEC_PATTERNS:
+        if re.search(pattern, q_lower, re.IGNORECASE):
+            return True, f"spec:{pattern}"
+
+    # 5. 比較/對照模式
+    for pattern in GROUNDING_COMPARE_PATTERNS:
+        if re.search(pattern, q_lower, re.IGNORECASE):
+            return True, f"compare:{pattern}"
+
+    # 6. 向後相容：舊的 spec 關鍵字檢查
+    if is_spec_question(question):
+        return True, "legacy_spec_keyword"
+
+    return False, ""
+
+
 def should_use_strict_mode(question: str, knowledge_ctx: str, kb_metadata: dict = None) -> bool:
     """
-    判斷是否應該啟用嚴格模式
+    判斷是否應該啟用嚴格模式（P0-1 升級版）
+
+    新邏輯使用 needs_grounding 偵測器，取代純關鍵字觸發
     條件：
     1. STRICT_MODE 開啟
-    2. 問題含有嚴格模式關鍵字 或 是 spec 類問題
-    3. 有 knowledge_ctx 或是 spec 問題（spec 問題即使沒 REF 也要嚴格）
+    2. needs_grounding 偵測器判定需要證據
+    3. 有 knowledge_ctx 或是高信心 grounding 需求
+
+    Returns:
+        bool: 是否啟用嚴格模式
     """
     if not STRICT_MODE:
         return False
 
-    q_lower = question.lower()
-    has_strict_keyword = any(kw.lower() in q_lower for kw in STRICT_MODE_KEYWORDS)
-    is_spec = is_spec_question(question)
+    # P0-1: 使用 needs_grounding 偵測器
+    grounding_needed, reason = needs_grounding(question)
 
-    # spec 問題一律嚴格模式
-    if is_spec:
+    if not grounding_needed:
+        return False
+
+    # 高信心觸發（force_keyword, spec）：即使沒有 knowledge_ctx 也啟用
+    high_confidence_triggers = ['force_keyword', 'legacy_spec_keyword', 'legacy_keyword']
+    if any(reason.startswith(t) for t in high_confidence_triggers):
         return True
 
-    # 有嚴格關鍵字且有 knowledge_ctx
-    if has_strict_keyword and knowledge_ctx:
+    # 其他情況：需要有 knowledge_ctx 才啟用
+    if knowledge_ctx:
         return True
 
     return False
@@ -436,8 +510,10 @@ def should_refuse_answer(question: str, kb_metadata: dict) -> bool:
     if not has_ref:
         return True
 
-    # 優先使用 embedding score（比 hybrid 更可靠）
-    top_emb_score = kb_metadata.get("top_emb_score", kb_metadata.get("top_score", 0.0))
+    # P0-5: 優先使用 embedding score（比 hybrid 更可靠）
+    # 若無 top_emb_score 則 fallback 到 0.0（保守：觸發拒答）
+    # 不再 fallback 到 top_score 因為那是 RRF score，量級不同
+    top_emb_score = kb_metadata.get("top_emb_score", 0.0)
 
     # spec 問題：embedding score 太低視為弱證據
     if top_emb_score < WEAK_REF_THRESHOLD:
@@ -555,9 +631,13 @@ def answer_with_self_check(question: str, base_ctx: str, knowledge_ctx: str,
 def validate_claim_to_evidence(answer: str, knowledge_ctx: str) -> str:
     """驗證回答中的 claim 是否有 evidence 支持
 
+    P0-2 升級：句子級證據覆蓋率
+    - 沒有 REF 的關鍵句會被刪除或降級（取決於 SENTENCE_EVIDENCE_DELETE 設定）
+    - 白名單句子（過渡語、結構語）不受影響
+
     核心規則：
     1. 數字/限制/預設值等關鍵句必須有 REF 標註
-    2. 沒有 REF 的關鍵句會被標記為「未經驗證」
+    2. 沒有 REF 的關鍵句會被刪除或標記為「未經驗證」
 
     Args:
         answer: LLM 生成的回答
@@ -572,6 +652,9 @@ def validate_claim_to_evidence(answer: str, knowledge_ctx: str) -> str:
     # 編譯所有需要驗證的 pattern
     compiled_patterns = [re.compile(p, re.IGNORECASE) for p in CLAIM_EVIDENCE_PATTERNS]
 
+    # P0-2: 編譯白名單 pattern
+    whitelist_patterns = [re.compile(p, re.IGNORECASE) for p in SENTENCE_EVIDENCE_WHITELIST]
+
     # 解析 knowledge_ctx 中的 REF 編號
     available_refs = set(re.findall(r'REF(\d+)', knowledge_ctx, re.IGNORECASE))
 
@@ -580,9 +663,23 @@ def validate_claim_to_evidence(answer: str, knowledge_ctx: str) -> str:
 
     validated_sentences = []
     unverified_claims = []
+    deleted_count = 0
 
     for sentence in sentences:
         if not sentence.strip():
+            validated_sentences.append(sentence)
+            continue
+
+        sentence_stripped = sentence.strip()
+
+        # P0-2: 短句不檢查
+        if len(sentence_stripped) < SENTENCE_EVIDENCE_MIN_LEN:
+            validated_sentences.append(sentence)
+            continue
+
+        # P0-2: 白名單句子不檢查
+        is_whitelisted = any(p.search(sentence_stripped) for p in whitelist_patterns)
+        if is_whitelisted:
             validated_sentences.append(sentence)
             continue
 
@@ -603,14 +700,29 @@ def validate_claim_to_evidence(answer: str, knowledge_ctx: str) -> str:
                 validated_sentences.append(sentence)
                 continue
 
-        # 沒有有效的 REF → 記錄為未驗證 claim
-        unverified_claims.append(sentence.strip())
-        validated_sentences.append(sentence)
+        # 沒有有效的 REF → 根據設定刪除或降級
+        if SENTENCE_EVIDENCE_ENABLED and SENTENCE_EVIDENCE_DELETE:
+            # P0-2 刪除模式：直接移除無證據句子
+            deleted_count += 1
+            # 不加入 validated_sentences（等同刪除）
+            unverified_claims.append(sentence_stripped)
+        else:
+            # 降級模式：標記為未驗證但保留
+            unverified_claims.append(sentence_stripped)
+            validated_sentences.append(sentence)
 
-    # 如果有未驗證的 claim，在回答末尾加上警告
+    # 重組回答
     result = ''.join(validated_sentences)
 
-    if unverified_claims and len(unverified_claims) <= 5:
+    # 處理刪除後可能的空白問題
+    result = re.sub(r'\n{3,}', '\n\n', result)  # 壓縮過多空行
+
+    # 如果有刪除的句子，附上說明
+    if SENTENCE_EVIDENCE_ENABLED and SENTENCE_EVIDENCE_DELETE and deleted_count > 0:
+        notice = f"\n\n📋 **證據覆蓋檢查**：已移除 {deleted_count} 個無文件支持的陳述。"
+        result += notice
+    elif unverified_claims and len(unverified_claims) <= 5:
+        # 降級模式：附上警告
         warning = "\n\n⚠️ **未經文件驗證的陳述**（以下內容可能需要進一步確認）：\n"
         for i, claim in enumerate(unverified_claims[:5], 1):
             # 截斷過長的句子

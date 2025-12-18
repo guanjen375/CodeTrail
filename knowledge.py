@@ -36,7 +36,9 @@ from config import (
     MARGIN_ENABLED, MARGIN_MIN_GAP, MARGIN_LOW_SCORE,
     STRICT_MODE_THRESHOLD, STRICT_MODE_RERANK_REQUIRED,
     # P1 改進：Multi-Query
-    MULTI_QUERY_ENABLED, MULTI_QUERY_COUNT, MULTI_QUERY_TYPES
+    MULTI_QUERY_ENABLED, MULTI_QUERY_COUNT, MULTI_QUERY_TYPES,
+    # P0-3 改進：雙語+符號友善
+    QUERY_BILINGUAL_ENABLED, QUERY_SYMBOL_FRIENDLY, QUERY_SYMBOL_PATTERN, QUERY_PRESERVE_SYMBOLS,
 )
 
 
@@ -465,18 +467,25 @@ class KnowledgeBase:
         return matches / len(query_keywords)
 
     def _expand_query(self, question: str, force: bool = False) -> list[str]:
-        """用 LLM 生成額外的搜尋關鍵字（基本版）
+        """用 LLM 生成額外的搜尋關鍵字（P0-3 升級版：雙語+符號友善）
 
-        改進：
-        - 預設不啟動，只有 force=True 或候選不足時才啟用
-        - 解析時同時支援 , 和 ，（全形逗號）
-        - 過濾非字母數字的 token
+        P0-3 改進：
+        - 保留原始符號（如 NUM_CTX, CODE_RAG_THRESHOLD）
+        - 支援中文和英文混合關鍵字
+        - 不再過濾掉非純英文 token
         """
         if not USE_QUERY_EXPANSION and not force:
             return [question]
 
+        # P0-3: 先提取問題中的符號（大寫+底線）
+        preserved_symbols = []
+        if QUERY_PRESERVE_SYMBOLS:
+            preserved_symbols = re.findall(QUERY_SYMBOL_PATTERN, question)
+
         try:
-            prompt = f"""從以下問題中提取 3-5 個適合用於搜尋技術文件的英文關鍵字。
+            # P0-3: 改進 prompt，允許中英文混合關鍵字
+            prompt = f"""從以下問題中提取 3-5 個適合用於搜尋技術文件的關鍵字。
+可以是中文或英文，保留原始的技術術語和符號名稱（如 NUM_CTX, THRESHOLD 等）。
 只輸出關鍵字，用逗號分隔，不要解釋。
 
 問題: {question}
@@ -502,11 +511,19 @@ class KnowledgeBase:
             keywords = []
             for kw in raw_keywords:
                 kw = kw.strip()
-                # 只保留字母數字 token，過濾句子或雜訊
-                if kw and re.match(r'^[A-Za-z0-9_\-]+$', kw) and len(kw) <= 30:
-                    keywords.append(kw)
+                # P0-3: 放寬過濾條件，允許中文和符號
+                # 只過濾過長或空的 token
+                if kw and len(kw) <= 40:
+                    # 避免整句被當作關鍵字（超過 4 個空格分隔的詞）
+                    if len(kw.split()) <= 4:
+                        keywords.append(kw)
 
             keywords = keywords[:5]
+
+            # P0-3: 確保原始符號被保留
+            for sym in preserved_symbols:
+                if sym not in keywords:
+                    keywords.append(sym)
 
             if keywords:
                 expanded = f"{question} {' '.join(keywords)}"
@@ -518,12 +535,17 @@ class KnowledgeBase:
         return [question]
 
     def _generate_multi_queries(self, question: str) -> list[str]:
-        """P1 改進：生成多個 query 變體以提高召回率
+        """P1 改進：生成多個 query 變體以提高召回率（P0-3 升級：雙語+符號友善）
 
         策略：
-        1. key_terms: 抽取關鍵術語
-        2. translate: 中英互譯（解決中文問/英文文件的問題）
+        1. key_terms: 抽取關鍵術語（保留原始符號）
+        2. translate: 雙語互譯（中→英 或 英→中）
         3. code_hint: 猜測可能的函式名/旗標名
+
+        P0-3 改進：
+        - 雙向翻譯：中文問題加英文版，英文問題加中文版
+        - 符號友善：保留 NUM_CTX 等大寫符號
+        - 放寬術語過濾，允許中英文混合
 
         返回: [原始 query, 變體1, 變體2, ...]
         """
@@ -534,6 +556,12 @@ class KnowledgeBase:
 
         # 判斷問題語言
         has_chinese = bool(re.search(r'[\u4e00-\u9fff]', question))
+        has_english = bool(re.search(r'[a-zA-Z]{3,}', question))  # 至少 3 個連續英文字母
+
+        # P0-3: 提取問題中的符號（供後續保留）
+        preserved_symbols = []
+        if QUERY_PRESERVE_SYMBOLS:
+            preserved_symbols = re.findall(QUERY_SYMBOL_PATTERN, question)
 
         try:
             session = get_session()
@@ -541,26 +569,59 @@ class KnowledgeBase:
             # 根據啟用的類型生成變體
             for query_type in MULTI_QUERY_TYPES[:MULTI_QUERY_COUNT]:
                 if query_type == "key_terms":
-                    # 抽取關鍵術語
+                    # P0-3: 改進 prompt，保留符號和允許中英文混合
                     prompt = f"""從以下問題中提取 3-5 個最重要的技術術語，用於搜尋技術文件。
-只輸出術語，用逗號分隔，不要解釋。
+保留原始的符號名稱（如 NUM_CTX, THRESHOLD）和技術術語。
+可以是中文或英文，只輸出術語，用逗號分隔，不要解釋。
 
 問題: {question}
 
 術語:"""
 
-                elif query_type == "translate" and has_chinese:
-                    # 中文轉英文
-                    prompt = f"""把以下中文問題翻譯成簡潔的英文搜尋查詢，保留技術術語。
+                elif query_type == "translate":
+                    # P0-3: 雙語互譯（不只是中→英）
+                    if QUERY_BILINGUAL_ENABLED:
+                        if has_chinese and not has_english:
+                            # 純中文問題 → 翻譯成英文
+                            prompt = f"""把以下中文問題翻譯成簡潔的英文搜尋查詢，保留技術術語和符號名稱。
 只輸出英文查詢，不要解釋。
 
 中文: {question}
 
 English:"""
+                        elif has_english and not has_chinese:
+                            # 純英文問題 → 翻譯成中文（增加中文文件召回）
+                            prompt = f"""把以下英文問題翻譯成簡潔的中文搜尋查詢，保留技術術語和符號名稱。
+只輸出中文查詢，不要解釋。
+
+English: {question}
+
+中文:"""
+                        elif has_chinese and has_english:
+                            # 中英混合 → 生成純英文版本
+                            prompt = f"""把以下問題轉換成純英文的搜尋查詢，保留所有技術術語和符號名稱。
+只輸出英文查詢，不要解釋。
+
+問題: {question}
+
+English:"""
+                        else:
+                            continue
+                    else:
+                        # 原有邏輯：只有中文才翻譯
+                        if has_chinese:
+                            prompt = f"""把以下中文問題翻譯成簡潔的英文搜尋查詢，保留技術術語。
+只輸出英文查詢，不要解釋。
+
+中文: {question}
+
+English:"""
+                        else:
+                            continue
 
                 elif query_type == "code_hint":
                     # 猜測可能的函式名/旗標名
-                    prompt = f"""根據以下問題，猜測可能相關的程式碼元素（函式名、變數名、旗標、struct 欄位等）。
+                    prompt = f"""根據以下問題，猜測可能相關的程式碼元素（函式名、變數名、旗標、常數名等）。
 只輸出 3-5 個可能的程式碼元素名稱，用逗號分隔。
 
 問題: {question}
@@ -585,13 +646,23 @@ English:"""
                     result = resp.json().get("response", "").strip()
                     if result and len(result) < 200:  # 避免太長的回應
                         if query_type == "translate":
-                            queries.append(result)
+                            # P0-3: 翻譯結果直接加入，並附上原始符號
+                            translated = result
+                            for sym in preserved_symbols:
+                                if sym not in translated:
+                                    translated = f"{translated} {sym}"
+                            queries.append(translated)
                         else:
                             # 組合原始問題和術語
                             terms = [t.strip() for t in re.split(r'[,，]', result)]
-                            terms = [t for t in terms if t and len(t) <= 30]
+                            # P0-3: 放寬過濾，允許中英文混合和符號
+                            terms = [t for t in terms if t and len(t) <= 40 and len(t.split()) <= 3]
+                            # 確保符號被保留
+                            for sym in preserved_symbols:
+                                if sym not in terms:
+                                    terms.append(sym)
                             if terms:
-                                queries.append(f"{question} {' '.join(terms[:5])}")
+                                queries.append(f"{question} {' '.join(terms[:6])}")
 
         except Exception:
             pass
@@ -601,14 +672,18 @@ English:"""
     def _should_expand_query(self, candidates: list, threshold: float = 0.35) -> bool:
         """判斷是否需要 Query Expansion
 
-        條件：候選數量不足 或 最高分數偏低
+        P0-4 修正：使用 embedding score (candidates[i][1]) 而非 RRF score (candidates[i][0])
+        因為 RRF score 範圍約 0.01-0.03，和門檻值 0.35 完全不在同一量級
+
+        條件：候選數量不足 或 最高 embedding 分數偏低
         """
         if not candidates:
             return True
         if len(candidates) < 3:
             return True
-        top_score = candidates[0][0] if candidates else 0
-        return top_score < threshold
+        # P0-4: 改用 embedding score，格式是 (rrf, emb, bm25, chunk)
+        top_emb_score = candidates[0][1] if candidates else 0
+        return top_emb_score < threshold
 
     def _hybrid_search(self, question: str, candidate_k: int = KNOWLEDGE_CANDIDATE_K) -> list:
         """混合搜尋：Embedding + BM25 + RRF 融合
@@ -843,32 +918,35 @@ English:"""
         if is_strict_mode and STRICT_MODE_RERANK_REQUIRED:
             return True
 
-        top_score = candidates[0][0] if candidates else 0
+        # P0-4 修正：使用 embedding score (candidates[i][1]) 而非 RRF score (candidates[i][0])
+        # RRF score 範圍約 0.01-0.03，和固定門檻完全不在同一量級
+        # 格式是 (rrf_score, emb_score, bm25_score, chunk)
+        top_emb_score = candidates[0][1] if candidates else 0
 
-        # Margin-based 判斷（P0 改進）
+        # Margin-based 判斷（P0 改進）- 改用 embedding score
         if MARGIN_ENABLED and len(candidates) >= 2:
-            gap = candidates[0][0] - candidates[1][0]
+            gap = candidates[0][1] - candidates[1][1]  # P0-4: 用 emb score 差距
             # top1-top2 差距太小 → 不確定，需要 rerank
             if gap < MARGIN_MIN_GAP:
                 return True
             # top1 分數太低 → 需要更精確判斷
-            if top_score < MARGIN_LOW_SCORE:
+            if top_emb_score < MARGIN_LOW_SCORE:
                 return True
 
         # 如果最高分很高（>0.6），且與第5名差距明顯（>0.1），不需要 rerank
-        if top_score > 0.6:
-            fifth_score = candidates[min(4, len(candidates)-1)][0] if len(candidates) > 4 else 0
-            if top_score - fifth_score > 0.1:
+        if top_emb_score > 0.6:
+            fifth_emb_score = candidates[min(4, len(candidates)-1)][1] if len(candidates) > 4 else 0
+            if top_emb_score - fifth_emb_score > 0.1:
                 return False
 
         # 如果前幾名分數太接近（差距 < 0.05），需要 rerank 來區分
         if len(candidates) >= 3:
-            score_diff = candidates[0][0] - candidates[2][0]
+            score_diff = candidates[0][1] - candidates[2][1]  # P0-4: 用 emb score
             if score_diff < 0.05:
                 return True
 
-        # 其他情況：top_score 較低時，需要 rerank
-        return top_score < 0.5
+        # 其他情況：top_emb_score 較低時，需要 rerank
+        return top_emb_score < 0.5
 
     def _rerank_with_model(self, question: str, candidates: list, top_k: int,
                            is_strict_mode: bool = False) -> list:
@@ -1225,9 +1303,11 @@ English:"""
             return "", "", empty_metadata
 
         # 動態 top_k：高相關度時少給，低相關度時多給
-        # 使用 combined score 來決定 top_k（排序仍用 combined）
-        top_score = candidates[0][0]
-        if top_score >= DYNAMIC_TOP_K_HIGH_SCORE:
+        # P0-4 修正：使用 embedding score 來決定 top_k，避免 RRF score 量級問題
+        # top_emb_score 在上面已經取得
+        # P0-4: 保留 RRF score 供 metadata 向後相容
+        top_score = candidates[0][0]  # RRF score，僅供 metadata 記錄
+        if top_emb_score >= DYNAMIC_TOP_K_HIGH_SCORE:
             effective_top_k = DYNAMIC_TOP_K_MIN
         else:
             effective_top_k = min(top_k, DYNAMIC_TOP_K_MAX)
