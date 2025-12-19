@@ -29,6 +29,7 @@ from config import (
     CODE_EXTENSIONS, EMBEDDING_MODEL,
     CODE_RAG_ENABLED, CODE_RAG_TOP_K, CODE_RAG_CACHE_FILE,
     CODE_RAG_THRESHOLD, CODE_RAG_THRESHOLD_BUG,
+    CODE_RAG_LAZY_EMBED, CODE_RAG_LAZY_EMBED_MAX_SYMBOLS, CODE_RAG_LAZY_EMBED_QUERY_TOP_K,
     OLLAMA_EMBEDDINGS_URL, OLLAMA_GENERATE_URL,
     USE_RERANKER, RERANKER_MODEL
 )
@@ -84,6 +85,8 @@ class CodeRAG:
         self.embeddings = None  # numpy array, shape: (N, embedding_dim)
         # 增量快取：{file_rel_path: {"hash": str, "symbols": list, "embeddings": list}}
         self._file_cache = {}
+        self._lazy_embed = False
+        self._lazy_embed_top_k = CODE_RAG_LAZY_EMBED_QUERY_TOP_K
 
     def _compute_file_hash(self, filepath: Path) -> str:
         """計算單一檔案的 hash（用於增量快取驗證）"""
@@ -302,7 +305,14 @@ class CodeRAG:
         result = _cached_get_embedding(normalized)
         return list(result) if result else []
 
-    def _index_single_file(self, filepath: Path, rel_path: str) -> tuple:
+    def _build_embed_text(self, item: dict) -> str:
+        """Build embed text from a symbol/item dict."""
+        parent_info = f" in {item.get('parent', '')}" if item.get('parent') else ""
+        context = item.get('context', '')[:300]
+        return f"{item.get('path', '')} {item.get('type', '')} {item.get('symbol', '')}{parent_info} {context}"
+
+    def _index_single_file(self, filepath: Path, rel_path: str,
+                           compute_embeddings: bool = True) -> tuple:
         """索引單一檔案，返回 (symbols, embeddings)"""
         content = filepath.read_text(encoding='utf-8', errors='replace')
         symbols = self._extract_symbols(filepath, content)
@@ -311,9 +321,8 @@ class CodeRAG:
         file_embeddings = []
 
         for sym in symbols:
-            parent_info = f" in {sym.get('parent', '')}" if sym.get('parent') else ""
-            embed_text = f"{sym['path']} {sym['type']} {sym['symbol']}{parent_info} {sym['context'][:300]}"
-            emb = self._get_embedding(embed_text)
+            embed_text = self._build_embed_text(sym)
+            emb = self._get_embedding(embed_text) if compute_embeddings else []
 
             index_entry = {
                 'path': sym['path'],
@@ -378,6 +387,9 @@ class CodeRAG:
         self.index = []
         embeddings_list = []
         new_file_cache = {}
+        total_symbols = 0
+        lazy_enabled = CODE_RAG_LAZY_EMBED
+        self._lazy_embed = False
 
         # 先加入未變更的檔案（從快取讀取）
         for rel_path in files_unchanged:
@@ -385,15 +397,27 @@ class CodeRAG:
             for sym in cached.get("symbols", []):
                 self.index.append(sym)
             embeddings_list.extend(cached.get("embeddings", []))
+            total_symbols += len(cached.get("symbols", []))
             new_file_cache[rel_path] = cached
+
+        if lazy_enabled and total_symbols > CODE_RAG_LAZY_EMBED_MAX_SYMBOLS:
+            self._lazy_embed = True
 
         # 索引變更的檔案
         indexed_count = 0
         for rel_path, filepath, file_hash in files_to_index:
             try:
-                symbols, embeddings = self._index_single_file(filepath, rel_path)
+                compute_embeddings = not (lazy_enabled and self._lazy_embed)
+                symbols, embeddings = self._index_single_file(
+                    filepath, rel_path, compute_embeddings=compute_embeddings
+                )
                 self.index.extend(symbols)
                 embeddings_list.extend(embeddings)
+                total_symbols += len(symbols)
+
+                if lazy_enabled and not self._lazy_embed:
+                    if total_symbols > CODE_RAG_LAZY_EMBED_MAX_SYMBOLS:
+                        self._lazy_embed = True
 
                 # 更新快取
                 new_file_cache[rel_path] = {
@@ -412,7 +436,7 @@ class CodeRAG:
         self._file_cache = new_file_cache
 
         # 將 embedding 轉換為 numpy array 並預先 L2 normalize
-        if HAS_NUMPY and embeddings_list:
+        if HAS_NUMPY and embeddings_list and not self._lazy_embed:
             emb_dim = max((len(e) for e in embeddings_list if e), default=1024)
             normalized = []
             for emb in embeddings_list:
@@ -431,7 +455,7 @@ class CodeRAG:
         else:
             self.embeddings = None
             for i, emb in enumerate(embeddings_list):
-                if i < len(self.index):
+                if i < len(self.index) and emb:
                     self.index[i]['embedding'] = emb
 
         if verbose:
@@ -439,6 +463,8 @@ class CodeRAG:
                 print(f"[CODE_RAG] 增量更新完成: 共 {len(self.index)} 個符號")
             else:
                 print(f"[CODE_RAG] 索引完成: {len(self.index)} 個符號")
+            if self._lazy_embed:
+                print(f"[CODE_RAG] lazy embed on: >{CODE_RAG_LAZY_EMBED_MAX_SYMBOLS} symbols")
 
         self._save_cache()
 
@@ -682,12 +708,44 @@ class CodeRAG:
             return []
 
         code_tokens = self._extract_code_tokens(question)
+        code_tokens_lower = {t.lower() for t in code_tokens}
+        kw_scores = None
+
+        if self._lazy_embed:
+            kw_scores = []
+            explicit_indices = []
+            for i, item in enumerate(self.index):
+                kw_score = self._token_match_score(code_tokens, item)
+                kw_scores.append(kw_score)
+                symbol_lower = item.get("symbol", "").lower()
+                if symbol_lower and symbol_lower in code_tokens_lower:
+                    explicit_indices.append(i)
+
+            if self._lazy_embed_top_k > 0 and self.index:
+                import heapq
+                lazy_top_k = min(self._lazy_embed_top_k, len(self.index))
+                cand_indices = heapq.nlargest(
+                    lazy_top_k, range(len(self.index)), key=lambda idx: kw_scores[idx]
+                )
+            else:
+                cand_indices = []
+
+            cand_set = {i for i in cand_indices if kw_scores[i] > 0}
+            if not cand_set:
+                cand_set = set(cand_indices)
+            cand_set.update(explicit_indices)
+            for idx in cand_set:
+                item = self.index[idx]
+                if not item.get("embedding"):
+                    emb = self._get_embedding(self._build_embed_text(item))
+                    if emb:
+                        item["embedding"] = emb
 
         # 動態門檻：Bug 類問題稍微放寬
         threshold = CODE_RAG_THRESHOLD_BUG if is_bug_fix else CODE_RAG_THRESHOLD
 
         # 使用 numpy 向量化計算 cosine similarity（如果可用）
-        if HAS_NUMPY and self.embeddings is not None and len(self.embeddings) > 0:
+        if HAS_NUMPY and self.embeddings is not None and len(self.embeddings) > 0 and not self._lazy_embed:
             q_vec = np.array(q_emb, dtype=np.float32)
 
             # 如果 embeddings 已經預先 L2 normalize，只需要 normalize query 然後做 dot product
@@ -720,16 +778,14 @@ class CodeRAG:
                 else:
                     emb_score = 0
 
-            kw_score = self._token_match_score(code_tokens, item)
+            kw_score = kw_scores[i] if kw_scores is not None else self._token_match_score(code_tokens, item)
 
             # 明確點名 symbol 時，大幅提高權重
             # 改進：用 symbol 精確匹配（正則邊界）而非單純 kw_score 門檻
             # 避免短 query 或中文問題下 kw_score 門檻誤收噪音
             symbol = item.get("symbol", "")
             symbol_lower = symbol.lower()
-            is_explicit_mention = any(
-                t.lower() == symbol_lower for t in code_tokens
-            )
+            is_explicit_mention = symbol_lower in code_tokens_lower
 
             if is_explicit_mention:
                 # 明確點名：直接給很高分，即使 embedding 不太像

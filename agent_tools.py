@@ -10,6 +10,7 @@ import json
 import fnmatch
 import shlex
 import subprocess
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -424,6 +425,65 @@ class ToolExecutor:
             return True
         return False
 
+    def _rg_available(self) -> bool:
+        if not hasattr(self, "_has_rg"):
+            self._has_rg = shutil.which("rg") is not None
+        return self._has_rg
+
+    def _grep_with_rg(self, pattern: str, target: Path, include_patterns: list,
+                      context: int, use_literal: bool) -> tuple[list, int, bool] | str:
+        def _run(case_insensitive: bool):
+            cmd = ["rg", "--no-heading", "--color", "never", "--line-number"]
+            if context > 0:
+                cmd += ["-C", str(context)]
+            for p in include_patterns:
+                if p:
+                    cmd += ["-g", p]
+            if use_literal:
+                cmd.append("-F")
+            if case_insensitive:
+                cmd.append("-i")
+            cmd += ["--", pattern, str(target)]
+            try:
+                result = subprocess.run(
+                    cmd,
+                    cwd=str(self.root),
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                return result.returncode, result.stdout, result.stderr
+            except FileNotFoundError:
+                return 2, "", "rg not found"
+            except subprocess.TimeoutExpired:
+                return 2, "", "rg timeout"
+
+        rc, stdout, stderr = _run(False)
+        if rc == 1 and not stdout:
+            rc, stdout, stderr = _run(True)
+
+        if rc not in (0, 1):
+            return f"錯誤: rg 執行失敗 - {stderr.strip() or 'unknown'}"
+
+        if not stdout.strip():
+            return [], 0, False
+
+        lines = stdout.splitlines()
+        results = []
+        match_count = 0
+        truncated = False
+        match_line_re = re.compile(r'^.+?:\d+:')
+
+        for line in lines:
+            if match_line_re.match(line):
+                match_count += 1
+            if match_count > MAX_GREP_RESULTS:
+                truncated = True
+                break
+            results.append(line)
+
+        return results, match_count, truncated
+
     def grep(self, pattern: str, path: str = ".", include: str = None, context: int = 0) -> str:
         """搜尋 pattern"""
         target = self._safe_path(path)
@@ -449,6 +509,24 @@ class ToolExecutor:
             include = GREP_DEFAULT_EXTENSIONS
 
         include_patterns = [p.strip() for p in include.split(',')]
+
+        # Fast path: ripgrep
+        if self._rg_available():
+            rg_result = self._grep_with_rg(pattern, target, include_patterns, context, use_literal)
+            if isinstance(rg_result, str):
+                return rg_result
+            results, match_count, truncated = rg_result
+            if not results:
+                return f"沒有找到 '{pattern}'"
+
+            header = f"=== rg '{pattern}' ({match_count} matches) ===\n"
+            body = "\n".join(results)
+            if truncated or match_count >= MAX_GREP_RESULTS:
+                body += (
+                    f"\n\n[CTX] rg 已達 MAX_GREP_RESULTS={MAX_GREP_RESULTS}，結果可能不完整，"
+                    f"建議縮小 path/include 或用更精準的 pattern。"
+                )
+            return header + body
 
         files = []
         if target.is_file():

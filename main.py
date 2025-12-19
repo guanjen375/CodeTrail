@@ -371,7 +371,7 @@ def main():
             print("[ERROR] 無法從 URL 取得程式碼")
             sys.exit(1)
 
-        folder = temp_dir
+        folder = web_info.get("workdir", temp_dir) if web_info else temp_dir
         print(f"[WEB] 使用暫存目錄: {folder}")
         print("-" * 50)
 

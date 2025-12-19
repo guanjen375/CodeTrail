@@ -11,6 +11,7 @@ import re
 import base64
 import shutil
 import subprocess
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 
@@ -57,6 +58,14 @@ _PRINTABLE_CHARS = set(
 # 全域 sandbox root（由 main.py 設定）
 _SANDBOX_ROOT: Optional[Path] = None
 _ALLOW_EXTERNAL: bool = True  # 預設允許外部檔案（大部分使用場景都是外部路徑）
+
+# Small LRU caches to avoid repeated OCR/BIN/ELF work in a session.
+_OCR_CACHE = OrderedDict()
+_BIN_CACHE = OrderedDict()
+_ELF_CACHE = OrderedDict()
+_OCR_CACHE_MAX = 8
+_BIN_CACHE_MAX = 6
+_ELF_CACHE_MAX = 6
 
 
 def set_sandbox_root(root: str, allow_external: bool = True) -> None:
@@ -127,6 +136,33 @@ def _safe_path(path: str, allow_external: bool = False, allowed_extensions: set 
         return None
     except Exception:
         return None
+
+
+# ============================================================================
+# Cache helpers
+# ============================================================================
+
+def _cache_key(path: Path, extra: tuple = ()) -> tuple:
+    try:
+        stat = path.stat()
+        base = (str(path), stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        base = (str(path), None, None)
+    return base + extra
+
+
+def _cache_get(cache: OrderedDict, key: tuple):
+    if key in cache:
+        cache.move_to_end(key)
+        return cache[key]
+    return None
+
+
+def _cache_set(cache: OrderedDict, key: tuple, value: str, max_items: int):
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_items:
+        cache.popitem(last=False)
 
 
 # ============================================================================
@@ -643,6 +679,11 @@ def ocr_image(path: str) -> str:
     if file_size > 20 * 1024 * 1024:
         return f"[OCR 錯誤] 圖片過大: {file_size / 1024 / 1024:.1f}MB"
 
+    cache_key = _cache_key(p)
+    cached = _cache_get(_OCR_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
     try:
         with open(p, "rb") as f:
             data = base64.b64encode(f.read()).decode()
@@ -656,7 +697,9 @@ def ocr_image(path: str) -> str:
             "options": {"num_ctx": 4096, "temperature": 0.1},
         }, timeout=120)
         resp.raise_for_status()
-        return resp.json().get("response", "").strip()
+        result = resp.json().get("response", "").strip()
+        _cache_set(_OCR_CACHE, cache_key, result, _OCR_CACHE_MAX)
+        return result
     except Exception as e:
         return f"[OCR 錯誤] {type(e).__name__}: {e}"
 
@@ -690,14 +733,21 @@ def read_elf(path: str, max_sections: int = 40, max_funcs: int = 30,
     if file_size > MAX_BINARY_SIZE:
         return f"[ELF 錯誤] 檔案過大: {file_size / 1024 / 1024:.1f}MB (上限 {MAX_BINARY_SIZE // 1024 // 1024}MB)"
 
+    cache_key = _cache_key(p, (max_sections, max_funcs, max_objs, max_strings))
+    cached = _cache_get(_ELF_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        return _build_elf_report(
+        result = _build_elf_report(
             p,
             max_sections=max_sections,
             max_funcs=max_funcs,
             max_objs=max_objs,
             max_strings=max_strings
         )
+        _cache_set(_ELF_CACHE, cache_key, result, _ELF_CACHE_MAX)
+        return result
     except Exception as e:
         return f"[ELF 錯誤] {type(e).__name__}: {e}"
 
@@ -728,6 +778,11 @@ def read_binary(path: str, max_strings: int = 200) -> str:
     if file_size > MAX_BINARY_SIZE:
         return f"[BIN 錯誤] 檔案過大: {file_size / 1024 / 1024:.1f}MB (上限 {MAX_BINARY_SIZE // 1024 // 1024}MB)"
 
+    cache_key = _cache_key(p, (max_strings,))
+    cached = _cache_get(_BIN_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
     try:
         # 讀取檔頭
         with open(p, "rb") as f:
@@ -735,7 +790,9 @@ def read_binary(path: str, max_strings: int = 200) -> str:
 
         # 自動偵測 ELF：若是 ELF 則切換到 ELF 解析
         if header.startswith(b"\x7fELF"):
-            return "[BIN→ELF] 偵測到 ELF magic，自動切換 ELF 解析模式:\n\n" + _build_elf_report(p)
+            result = "[BIN→ELF] 偵測到 ELF magic，自動切換 ELF 解析模式:\n\n" + _build_elf_report(p)
+            _cache_set(_BIN_CACHE, cache_key, result, _BIN_CACHE_MAX)
+            return result
 
         # 基本資訊
         report: List[str] = [
@@ -838,8 +895,10 @@ def read_binary(path: str, max_strings: int = 200) -> str:
                     full_report[:BIN_ELF_REPORT_MAX_CHARS - 100] +
                     f"\n\n... [報告已截斷，原長度 {len(full_report):,} chars]"
                 )
+            _cache_set(_BIN_CACHE, cache_key, truncated, _BIN_CACHE_MAX)
             return truncated
 
+        _cache_set(_BIN_CACHE, cache_key, full_report, _BIN_CACHE_MAX)
         return full_report
 
     except Exception as e:

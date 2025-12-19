@@ -17,6 +17,12 @@ try:
 except ImportError:
     HAS_NUMPY = False
 
+try:
+    import jieba
+    HAS_JIEBA = True
+except ImportError:
+    HAS_JIEBA = False
+
 from config import (
     OLLAMA_GENERATE_URL, OLLAMA_EMBEDDINGS_URL, OLLAMA_TAGS_URL,
     MODEL, KNOWLEDGE_FILE,
@@ -274,7 +280,11 @@ class KnowledgeBase:
         # 英文 token
         en_tokens = re.findall(r'\b[a-z_][a-z0-9_]*\b', text)
         # 中文 token（單字或雙字詞）
-        zh_tokens = re.findall(r'[\u4e00-\u9fff]{1,2}', text)
+        if HAS_JIEBA:
+            zh_tokens = [t for t in jieba.cut(text, cut_all=False)
+                         if re.search(r'[\u4e00-\u9fff]', t)]
+        else:
+            zh_tokens = re.findall(r'[\u4e00-\u9fff]{1,2}', text)
 
         all_tokens = en_tokens + zh_tokens
 
@@ -441,7 +451,16 @@ class KnowledgeBase:
                      'those', 'what', '的', '是', '在', '有', '和', '與', '了',
                      '我', '你', '他', '她', '它', '們', '這', '那', '要', '會',
                      '能', '可以'}
-        return {w for w in words if len(w) > 2 and w not in stopwords}
+        keywords = {w for w in words if len(w) > 2 and w not in stopwords}
+        if HAS_JIEBA:
+            for token in jieba.cut(text, cut_all=False):
+                if len(token) > 1 and re.search(r'[\u4e00-\u9fff]', token) and token not in stopwords:
+                    keywords.add(token)
+        else:
+            for token in re.findall(r'[\u4e00-\u9fff]{2,}', text):
+                if token not in stopwords:
+                    keywords.add(token)
+        return keywords
 
     def _keyword_score(self, query_keywords: set, chunk_content: str) -> float:
         """計算關鍵字匹配分數
@@ -757,6 +776,8 @@ English:"""
 
         返回: [(emb_score, chunk_idx), ...] 按分數降序
         """
+        if top_k <= 0:
+            return []
         # 正規化 query embedding
         q_vec = np.array(q_emb, dtype=np.float32)
         q_norm = np.linalg.norm(q_vec)
@@ -765,19 +786,25 @@ English:"""
 
         # 批次計算所有 cosine similarity
         emb_scores = np.dot(self._embeddings, q_vec)
-
-        # 建立 (score, chunk_idx) 列表
-        results = [(float(emb_scores[arr_idx]), chunk_idx)
-                   for arr_idx, chunk_idx in enumerate(self._embedding_indices)]
-
-        results.sort(reverse=True, key=lambda x: x[0])
-        return results[:top_k]
+        total = emb_scores.shape[0]
+        if total == 0:
+            return []
+        k = min(top_k, total)
+        if total <= k:
+            idxs = np.arange(total)
+        else:
+            idxs = np.argpartition(-emb_scores, k - 1)[:k]
+        idxs = idxs[np.argsort(-emb_scores[idxs])]
+        return [(float(emb_scores[i]), self._embedding_indices[i]) for i in idxs]
 
     def _embedding_search_fallback(self, q_emb: list, top_k: int) -> list:
         """Fallback：Python 迴圈版 embedding 搜尋
 
         返回: [(emb_score, chunk_idx), ...] 按分數降序
         """
+        if top_k <= 0:
+            return []
+        import heapq
         results = []
         for idx, chunk in enumerate(self.chunks):
             emb = chunk.get("embedding", [])
@@ -785,8 +812,7 @@ English:"""
                 score = self._cosine_similarity(q_emb, emb)
                 results.append((score, idx))
 
-        results.sort(reverse=True, key=lambda x: x[0])
-        return results[:top_k]
+        return heapq.nlargest(top_k, results, key=lambda x: x[0])
 
     def _keyword_search_fallback(self, query_keywords: set, top_k: int) -> list:
         """Fallback：舊的 keyword matching（當 BM25 未啟用時）
@@ -1190,6 +1216,12 @@ English:"""
             return new_type
         return current_type
 
+    def _average_embeddings(self, emb_sum: list, emb_count: int) -> list:
+        """Average embeddings from sum/count."""
+        if not emb_sum or emb_count <= 0:
+            return []
+        return [v / emb_count for v in emb_sum]
+
     def _merge_adjacent_chunks(self, chunks: list) -> list:
         """合併同一頁的相鄰 chunk
 
@@ -1208,13 +1240,31 @@ English:"""
         merged = []
         buffer = None
 
+        def _init_emb(emb):
+            if not emb:
+                return [], 0
+            return emb[:], 1
+
+        def _add_emb(emb_sum, emb_count, emb):
+            if not emb:
+                return emb_sum, emb_count
+            if not emb_sum:
+                return emb[:], 1
+            if len(emb) != len(emb_sum):
+                return emb_sum, emb_count
+            for i, v in enumerate(emb):
+                emb_sum[i] += v
+            return emb_sum, emb_count + 1
+
         for c in sorted_chunks:
             key = (c.get("source", ""), c.get("page", 0))
             chunk_idx = c.get("chunk_index", 0)
             chunk_type = c.get("type", "doc")
             chunk_section = c.get("section", "")
+            c_emb = c.get("embedding", [])
 
             if buffer is None:
+                emb_sum, emb_count = _init_emb(c_emb)
                 buffer = {
                     "key": key,
                     "source": c.get("source", ""),
@@ -1223,7 +1273,9 @@ English:"""
                     "type": chunk_type,
                     "section": chunk_section,
                     "last_idx": chunk_idx,
-                    "embedding": c.get("embedding", []),
+                    "embedding": c_emb,
+                    "_emb_sum": emb_sum,
+                    "_emb_count": emb_count,
                 }
             elif (buffer["key"] == key and
                   chunk_idx == buffer["last_idx"] + 1 and
@@ -1233,8 +1285,19 @@ English:"""
                 buffer["last_idx"] = chunk_idx
                 # 升級 type（warning > spec > doc）
                 buffer["type"] = self._upgrade_type(buffer["type"], chunk_type)
+                emb_sum, emb_count = _add_emb(buffer.get("_emb_sum", []),
+                                              buffer.get("_emb_count", 0), c_emb)
+                buffer["_emb_sum"] = emb_sum
+                buffer["_emb_count"] = emb_count
             else:
+                if buffer.get("_emb_count", 0) > 1:
+                    buffer["embedding"] = self._average_embeddings(
+                        buffer.get("_emb_sum", []), buffer.get("_emb_count", 0)
+                    )
+                buffer.pop("_emb_sum", None)
+                buffer.pop("_emb_count", None)
                 merged.append(buffer)
+                emb_sum, emb_count = _init_emb(c_emb)
                 buffer = {
                     "key": key,
                     "source": c.get("source", ""),
@@ -1244,9 +1307,17 @@ English:"""
                     "section": chunk_section,
                     "last_idx": chunk_idx,
                     "embedding": c.get("embedding", []),
+                    "_emb_sum": emb_sum,
+                    "_emb_count": emb_count,
                 }
 
         if buffer:
+            if buffer.get("_emb_count", 0) > 1:
+                buffer["embedding"] = self._average_embeddings(
+                    buffer.get("_emb_sum", []), buffer.get("_emb_count", 0)
+                )
+            buffer.pop("_emb_sum", None)
+            buffer.pop("_emb_count", None)
             merged.append(buffer)
 
         return merged

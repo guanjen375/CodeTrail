@@ -249,6 +249,10 @@ CODE_RAG_PREREAD_LINES_BUG = 160     # Bug 模式預讀增加（eval調優: 128-
 CODE_RAG_PREREAD_MAX_LINES = 300     # 預讀完整函式的最大行數上限（超過則退回窗口模式）
 CODE_RAG_THRESHOLD = 0.35            # 提高門檻，確保真的相關才進來（GPT建議: 0.30->0.35）
 CODE_RAG_THRESHOLD_BUG = 0.25        # Bug 類問題放寬門檻（eval調優: 0.30->0.25）
+# Lazy embed to cut initial index time on large repos.
+CODE_RAG_LAZY_EMBED = True
+CODE_RAG_LAZY_EMBED_MAX_SYMBOLS = 1500
+CODE_RAG_LAZY_EMBED_QUERY_TOP_K = 200
 
 # ============================================================
 # 嚴格模式設定

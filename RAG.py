@@ -66,6 +66,8 @@ except ImportError:
     EMBEDDING_MODEL = "bge-m3"  # Fallback：獨立執行時的預設值
 
 CHUNK_SIZE = 1200           # 每個 chunk 的最大字元數（增加以保留完整指令）
+CHUNK_OVERLAP = 200         # Overlap chars between chunks for better recall
+INCLUDE_HEADING_IN_CONTENT = True
 
 # 支援的檔案類型
 SUPPORTED_EXTENSIONS = {".pdf", ".md", ".txt"}
@@ -213,7 +215,12 @@ def extract_heading_hierarchy(lines: list, current_idx: int) -> str:
     return ' > '.join(h[1] for h in hierarchy)
 
 
-def split_by_semantic_with_sections(text: str, max_chars: int = CHUNK_SIZE) -> List[Dict]:
+def split_by_semantic_with_sections(
+    text: str,
+    max_chars: int = CHUNK_SIZE,
+    overlap_chars: int = CHUNK_OVERLAP,
+    include_heading: bool = INCLUDE_HEADING_IN_CONTENT
+) -> List[Dict]:
     """
     語意切分：按標題/段落切，保持語意完整性，同時追蹤章節標題
 
@@ -328,7 +335,34 @@ def split_by_semantic_with_sections(text: str, max_chars: int = CHUNK_SIZE) -> L
                 "heading_hierarchy": hierarchy
             })
 
-    return [c for c in chunks if c["content"].strip()]
+    chunks = [c for c in chunks if c["content"].strip()]
+
+    # Add overlap for better recall.
+    if overlap_chars and len(chunks) > 1:
+        for i in range(1, len(chunks)):
+            prev = chunks[i - 1]["content"]
+            tail = prev[-overlap_chars:] if prev else ""
+            if tail:
+                curr = chunks[i]["content"]
+                if len(tail) + len(curr) > max_chars:
+                    curr = curr[:max(0, max_chars - len(tail))]
+                chunks[i]["content"] = tail + "\n" + curr
+
+    # Inject heading hierarchy into content to improve retrieval.
+    if include_heading:
+        for chunk in chunks:
+            header_lines = []
+            if chunk.get("heading_hierarchy"):
+                header_lines.append(f"[HEADING] {chunk['heading_hierarchy']}")
+            if chunk.get("section"):
+                header_lines.append(f"[SECTION] {chunk['section']}")
+            if header_lines:
+                content = "\n".join(header_lines) + "\n" + chunk["content"]
+                if len(content) > max_chars:
+                    content = content[:max_chars] + "..."
+                chunk["content"] = content
+
+    return chunks
 
 
 def split_by_semantic(text: str, max_chars: int = CHUNK_SIZE) -> List[str]:
@@ -417,7 +451,8 @@ def extract_pdf(file_path: str) -> List[Dict]:
                 "chunk_index": i,
                 "content": chunk_data["content"],
                 "type": chunk_type,
-                "section": section
+                "section": section,
+                "heading_hierarchy": chunk_data.get("heading_hierarchy", "")
             })
 
     return results
@@ -448,7 +483,8 @@ def extract_text_file(file_path: str) -> List[Dict]:
             "chunk_index": i,
             "content": chunk_data["content"],
             "type": chunk_type,
-            "section": chunk_data["section"]
+            "section": chunk_data["section"],
+            "heading_hierarchy": chunk_data.get("heading_hierarchy", "")
         })
 
     return results
@@ -580,6 +616,7 @@ def process_chat_screenshot(image_path: str) -> List[Dict]:
             "content": chunk_data["content"],
             "type": chunk_type,
             "section": chunk_data["section"],
+            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
             "origin": "screenshot"  # 標記來源是截圖
         })
 
@@ -716,6 +753,7 @@ def process_technical_image(image_path: str) -> List[Dict]:
             "content": chunk_data["content"],
             "type": chunk_type,
             "section": chunk_data["section"],
+            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
             "origin": "image"  # 標記來源是技術圖片
         })
 
@@ -981,6 +1019,7 @@ def _add_chat_content_to_kb(image_path: Path, content: str, output_file: str):
             "content": chunk_data["content"],
             "type": chunk_type,
             "section": chunk_data["section"],
+            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
             "origin": "screenshot"
         })
 
@@ -1251,6 +1290,7 @@ def process_url(url: str) -> Optional[Tuple[List[Dict], str]]:
             "content": chunk_data["content"],
             "type": chunk_type,
             "section": chunk_data["section"],
+            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
             "origin": "url",
             "url": url,              # 保留原始 URL
             "title": title,          # GPT 建議：補存標題
@@ -1322,6 +1362,7 @@ def _add_url_content_to_kb(url: str, content: str, title: str, output_file: str)
             "content": chunk_data["content"],
             "type": chunk_type,
             "section": chunk_data["section"],
+            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
             "origin": "url",
             "url": url,
             "title": title,
@@ -1478,6 +1519,7 @@ def _add_image_content_to_kb(image_path: Path, content: str, output_file: str):
             "content": chunk_data["content"],
             "type": chunk_type,
             "section": chunk_data["section"],
+            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
             "origin": "image"
         })
 

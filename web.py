@@ -17,6 +17,7 @@ import re
 import tempfile
 import shutil
 import os
+import zipfile
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
 from urllib.parse import urlparse, unquote
@@ -135,6 +136,62 @@ def parse_git_url(url: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         print(f"[WEB] URL 解析錯誤: {e}")
         return None
+
+
+# ============================================================
+# Archive download (zip)
+# ============================================================
+
+def _get_archive_url(info: Dict[str, Any]) -> str:
+    platform = info["platform"]
+    owner = info["owner"]
+    repo = info["repo"]
+    branch = info["branch"]
+
+    if platform == "github":
+        return f"{GITHUB_API_BASE}/repos/{owner}/{repo}/zipball/{branch}"
+    if platform == "gitlab":
+        return f"{GITLAB_RAW_BASE}/{owner}/{repo}/-/archive/{branch}/{repo}-{branch}.zip"
+    if platform == "bitbucket":
+        return f"{BITBUCKET_RAW_BASE}/{owner}/{repo}/get/{branch}.zip"
+
+    return ""
+
+
+def _download_repo_archive(info: Dict[str, Any], temp_dir: str) -> bool:
+    """Download and extract repo archive into temp_dir."""
+    url = _get_archive_url(info)
+    if not url:
+        return False
+
+    session = get_session()
+    try:
+        resp = session.get(url, timeout=60)
+        if resp.status_code != 200:
+            return False
+
+        archive_path = Path(temp_dir) / "repo.zip"
+        archive_path.write_bytes(resp.content)
+
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            zf.extractall(temp_dir)
+
+        # Find extracted root dir
+        root_dirs = [p for p in Path(temp_dir).iterdir()
+                     if p.is_dir() and p.name != "__MACOSX"]
+        if not root_dirs:
+            return False
+        root = root_dirs[0]
+
+        work_dir = root
+        if info.get("path"):
+            work_dir = root / info["path"]
+            if not work_dir.exists():
+                return False
+        info["workdir"] = str(work_dir)
+        return True
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -370,6 +427,11 @@ def fetch_from_url(url: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
                 return None, None
 
         else:
+            # Try archive download first (faster than per-file raw download).
+            if _download_repo_archive(info, temp_dir):
+                print("[WEB] 使用 archive 下載完成")
+                return temp_dir, info
+
             # 目錄或整個 repo
             print("[WEB] 取得檔案列表...")
             files = list_repo_files(info, info.get("path", ""))

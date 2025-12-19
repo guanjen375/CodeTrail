@@ -55,6 +55,10 @@ def extract_skeleton(content: str, max_lines: int = SKELETON_MAX_LINES) -> tuple
             keep = True
         if re.match(r'^(class |struct |enum |typedef |namespace |def |async def |fn |func |pub fn |impl )', stripped):
             keep = True
+        if re.match(r'^(export\s+)?(interface|type|class|enum|function)\b', stripped):
+            keep = True
+        if re.match(r'^(export\s+)?(const|let|var)\s+\w+\s*=\s*(async\s+)?\(?[^)]*\)?\s*=>', stripped):
+            keep = True
         if re.match(r'^[\w\s\*\&\<\>\[\]]+\s+\w+\s*\([^;]*\)\s*(const)?\s*(\{|;|$)', stripped):
             keep = True
         if stripped.startswith(('/**', '///', '# TODO', '# NOTE')):

@@ -34,6 +34,7 @@ from agent_tools import ToolExecutor, get_native_tools
 # ============================================================
 # LLM 呼叫（帶工具）
 # ============================================================
+_BASENAME_MAP_CACHE = {}
 def _compute_dynamic_num_ctx(messages: list) -> int:
     """根據 messages 長度動態計算 num_ctx"""
     if not DYNAMIC_NUM_CTX_ENABLED:
@@ -305,6 +306,11 @@ def extract_stack_locations(text: str) -> list:
 
 def _build_basename_map(folder: str) -> dict:
     """建立 basename -> [relative_paths...] 的對照表"""
+    cache_key = str(Path(folder).resolve())
+    cached = _BASENAME_MAP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     basename_map = {}
     for file_info in scan_project_metadata(folder):
         rel_path = file_info["path"]
@@ -313,6 +319,7 @@ def _build_basename_map(folder: str) -> dict:
             basename_map[basename] = []
         basename_map[basename].append(rel_path)
 
+    _BASENAME_MAP_CACHE[cache_key] = basename_map
     return basename_map
 
 
