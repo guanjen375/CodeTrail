@@ -626,6 +626,11 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
     has_binary = image_ctx and ("[BIN]" in image_ctx or "[ELF]" in image_ctx)
     answer_rules = get_answer_rules(has_binary)
 
+    # 組建自定義規則區塊
+    custom_rules_section = ""
+    if config.CUSTOM_SYSTEM_RULES:
+        custom_rules_section = f"\n【自定義規則】\n{config.CUSTOM_SYSTEM_RULES}\n"
+
     system_prompt = f"""你是程式碼分析 Agent。透過工具探索專案來回答用戶問題。
 
 專案路徑: {folder}
@@ -635,6 +640,7 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
 {knowledge_ctx}
 {image_ctx}
 {task_hint}
+{custom_rules_section}
 
 【{answer_rules}】
 

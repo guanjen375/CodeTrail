@@ -7,6 +7,7 @@
 import re
 from dataclasses import dataclass, field
 
+import config
 from config import (
     MAX_TOTAL_CHARS, BUDGET_HIGH, BUDGET_MID, BUDGET_LOW,
     SKELETON_THRESHOLD, SKELETON_MAX_LINES, NUM_CTX_FULL_MODE,
@@ -234,10 +235,15 @@ def analyze_full(ctx: FullContext, question: str, image_ctx: str = "", knowledge
         has_binary = image_ctx and ("[BIN]" in image_ctx or "[ELF]" in image_ctx)
         answer_rules = get_answer_rules(has_binary)
 
+        # 組建自定義規則區塊
+        custom_rules_section = ""
+        if config.CUSTOM_SYSTEM_RULES:
+            custom_rules_section = f"\n【自定義規則】\n{config.CUSTOM_SYSTEM_RULES}\n"
+
         prompt = f"""{base_ctx}
 {image_ctx}
 {knowledge_ctx}
-
+{custom_rules_section}
 用戶問題: {question}
 
 {answer_rules}

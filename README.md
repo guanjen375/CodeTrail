@@ -184,6 +184,34 @@ python main.py [專案路徑] [問題] [選項]
 | `--run-tests` | 啟用測試執行工具（pytest, cargo test 等） |
 | `--patch` | 啟用改碼工具（apply_patch, git_status, git_diff） |
 | `--container` | 在 Docker/Podman 容器中安全執行測試 |
+| `--sk=檔案` | 載入自定義系統規則（詳見下方說明） |
+
+### 自定義系統規則（--sk）
+
+載入自定義規則檔案，讓 AI 遵循特定的開發規範或回答風格：
+
+```bash
+# 使用自定義規則
+python main.py . --sk=rules.md
+
+# 也可用於 QA 模式
+python main.py --qa --sk=rules.md
+```
+
+**規則檔案範例**（`rules.md`）：
+
+```markdown
+# 開發規則
+- 使用繁體中文回答
+- Agent 邏輯放 agent.py，工具實作放 agent_tools.py
+- 所有 config 集中在 config.py
+- 優先使用現有的工具函式，避免重複造輪子
+```
+
+**注意事項**：
+- 規則檔案最大 4000 字元（超過會截斷）
+- 規則會注入到所有模式（QA、Full、Agent）的 system prompt 中
+- 上下文佔用極小（< 1%），不影響效能
 
 ### 檔案分析（file:）
 

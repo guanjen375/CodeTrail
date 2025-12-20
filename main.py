@@ -34,7 +34,8 @@ from pathlib import Path
 from config import (
     MODEL, NUM_CTX, MAX_TOTAL_CHARS, KNOWLEDGE_FILE,
     CODE_RAG_ENABLED, IGNORED_DIRS, IGNORED_PATTERNS,
-    SKIP_LOW_CONFIDENCE_KB, LOW_CONFIDENCE_KB_THRESHOLD
+    SKIP_LOW_CONFIDENCE_KB, LOW_CONFIDENCE_KB_THRESHOLD,
+    CUSTOM_SYSTEM_RULES_MAX_CHARS
 )
 from utils import check_ollama_gpu, scan_project_metadata, scan_project, should_refuse_answer, should_use_strict_mode, needs_grounding, answer_with_self_check, call_llm_stream, print_ctx_usage
 from knowledge import KnowledgeBase
@@ -134,6 +135,12 @@ def run_qa_mode(question: str, kb: "KnowledgeBase", qa_history: list = None):
             answer_rules,
         ]
 
+        # 加入自定義規則（如果有）
+        if config.CUSTOM_SYSTEM_RULES:
+            prompt_parts.append("")
+            prompt_parts.append("【自定義規則】")
+            prompt_parts.append(config.CUSTOM_SYSTEM_RULES)
+
         # 加入對話歷史（如果有）
         if qa_history:
             # 檢查是否有裁切
@@ -207,6 +214,7 @@ def main():
     web_url = None  # 網頁模式 URL
     temp_dir = None  # 網頁模式暫存目錄
     qa_mode = False  # QA 模式：不掃專案、不建 Code RAG，直接問答
+    system_rules_file = None  # 自定義規則檔案路徑
 
     i = 0
     while i < len(args):
@@ -243,6 +251,11 @@ def main():
             i += 1
         elif arg.startswith("--include-dir="):
             include_dirs.append(arg.split("=", 1)[1])
+        elif arg == "--sk" and i + 1 < len(args):
+            system_rules_file = args[i + 1]
+            i += 1
+        elif arg.startswith("--sk="):
+            system_rules_file = arg.split("=", 1)[1]
         elif arg.startswith("-"):
             # 未知 flag：印出警告，避免使用者打錯參數卻不知道
             print(f"[WARN] 未知參數: {arg}（已忽略）")
@@ -277,6 +290,22 @@ def main():
         for p in extra_excludes:
             IGNORED_PATTERNS.append(p)
             print(f"[CFG] 排除: {p}")
+
+    # 載入自定義系統規則
+    if system_rules_file:
+        rules_path = Path(system_rules_file)
+        if rules_path.exists():
+            try:
+                rules_content = rules_path.read_text(encoding='utf-8').strip()
+                if len(rules_content) > CUSTOM_SYSTEM_RULES_MAX_CHARS:
+                    print(f"[WARN] 規則檔過大，已截斷至 {CUSTOM_SYSTEM_RULES_MAX_CHARS} 字元")
+                    rules_content = rules_content[:CUSTOM_SYSTEM_RULES_MAX_CHARS]
+                config.CUSTOM_SYSTEM_RULES = rules_content
+                print(f"[CFG] 載入自定義規則: {system_rules_file} ({len(rules_content)} chars)")
+            except Exception as e:
+                print(f"[WARN] 無法讀取規則檔 {system_rules_file}: {e}")
+        else:
+            print(f"[WARN] 規則檔不存在: {system_rules_file}")
 
     # 動態設定 RUN_COMMAND_ENABLED（必須在 import 後設定，否則 config 已固定）
     if run_tests:
