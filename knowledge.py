@@ -25,7 +25,7 @@ except ImportError:
 
 from config import (
     OLLAMA_GENERATE_URL, OLLAMA_EMBEDDINGS_URL, OLLAMA_TAGS_URL,
-    MODEL, KNOWLEDGE_FILE,
+    MODEL, KNOWLEDGE_FILE, KNOWLEDGE_EMB_FILE,
     KNOWLEDGE_TOP_K, KNOWLEDGE_CANDIDATE_K, KNOWLEDGE_THRESHOLD,
     KNOWLEDGE_THRESHOLD_SHORT, KNOWLEDGE_SHORT_QUERY_TOKENS,
     DYNAMIC_THRESHOLD_RATIO, DYNAMIC_TOP_K_HIGH_SCORE,
@@ -35,14 +35,15 @@ from config import (
     EMBEDDING_MODEL, RERANKER_MODEL,
     USE_RERANKER, USE_HYBRID_SEARCH, USE_QUERY_EXPANSION,
     USE_MMR, MMR_LAMBDA, KEYWORD_WEIGHT,
-    # P0 改進：BM25 + RRF + Reranker 強制啟用
+    # P0 改進：BM25 + RRF + Reranker 條件式觸發
     BM25_K1, BM25_B, BM25_ENABLED,
     RRF_K, RRF_ENABLED,
-    RERANKER_ALWAYS_ON, RERANKER_TOP_N,
+    RERANKER_ALWAYS_ON, RERANKER_TOP_N, RERANKER_SKIP_THRESHOLD,
     MARGIN_ENABLED, MARGIN_MIN_GAP, MARGIN_LOW_SCORE,
     STRICT_MODE_THRESHOLD, STRICT_MODE_RERANK_REQUIRED,
-    # P1 改進：Multi-Query
+    # P1 改進：Multi-Query（條件式啟用）
     MULTI_QUERY_ENABLED, MULTI_QUERY_COUNT, MULTI_QUERY_TYPES,
+    MULTI_QUERY_MIN_SCORE_TRIGGER, MULTI_QUERY_SKIP_NUMERIC,
     # P0-3 改進：雙語+符號友善
     QUERY_BILINGUAL_ENABLED, QUERY_SYMBOL_FRIENDLY, QUERY_SYMBOL_PATTERN, QUERY_PRESERVE_SYMBOLS,
 )
@@ -103,6 +104,9 @@ class KnowledgeBase:
         self._bm25_doc_lens = None  # [doc_len, ...]
         self._bm25_avg_doc_len = 0.0
         self._bm25_idf = None  # {term: idf}
+        # .npz embeddings 路徑（與 json 同目錄）
+        json_dir = Path(json_path).parent
+        self._emb_path = json_dir / KNOWLEDGE_EMB_FILE
 
         if Path(json_path).exists():
             self._load(json_path)
@@ -149,8 +153,14 @@ class KnowledgeBase:
 
             self.loaded = True
 
-            # 預計算 numpy embeddings（用於加速向量運算）
-            self._precompute_embeddings()
+            # 優先從 .npz 載入 embeddings（加速載入）
+            npz_loaded = self._load_embeddings_from_npz()
+
+            if not npz_loaded:
+                # Fallback：從 JSON 重建 numpy embeddings
+                self._precompute_embeddings()
+                # 儲存為 .npz 供下次使用
+                self._save_embeddings_to_npz()
 
             # P0 改進：預計算 BM25 索引
             if BM25_ENABLED:
@@ -166,6 +176,52 @@ class KnowledgeBase:
         except Exception as e:
             print(f"[WARN] 知識庫載入失敗: {e}")
             self.loaded = False
+
+    def _load_embeddings_from_npz(self) -> bool:
+        """從 .npz 檔案載入 embeddings（加速載入）
+
+        Returns:
+            True 如果成功載入，False 如果需要從 JSON 重建
+        """
+        if not HAS_NUMPY or not self._emb_path.exists():
+            return False
+
+        try:
+            data = np.load(self._emb_path)
+            embeddings = data['embeddings']
+            emb_model = str(data.get('embedding_model', ''))
+            chunk_count = int(data.get('chunk_count', 0))
+
+            # 驗證一致性
+            if emb_model and emb_model != EMBEDDING_MODEL:
+                print(f"[WARN] .npz embedding model 不一致，將重建")
+                return False
+            if chunk_count != len(self.chunks):
+                print(f"[WARN] .npz chunk 數量不一致，將重建")
+                return False
+
+            self._embeddings = embeddings
+            self._embeddings_normalized = True  # .npz 已預先正規化
+            self._embedding_indices = list(range(len(self.chunks)))
+            return True
+        except Exception as e:
+            print(f"[WARN] 載入 .npz 失敗: {e}")
+            return False
+
+    def _save_embeddings_to_npz(self):
+        """將 embeddings 儲存為 .npz（加速下次載入）"""
+        if not HAS_NUMPY or self._embeddings is None:
+            return
+
+        try:
+            np.savez_compressed(
+                self._emb_path,
+                embeddings=self._embeddings,
+                embedding_model=EMBEDDING_MODEL,
+                chunk_count=len(self.chunks)
+            )
+        except Exception as e:
+            print(f"[WARN] 儲存 .npz 失敗: {e}")
 
     def _precompute_embeddings(self):
         """預計算並正規化 embeddings 到 numpy array"""
@@ -688,20 +744,53 @@ English:"""
 
         return queries[:MULTI_QUERY_COUNT + 1]  # 原始 + N 個變體
 
-    def _should_expand_query(self, candidates: list, threshold: float = 0.35) -> bool:
+    def _is_numeric_query(self, question: str) -> bool:
+        """判斷是否為數值查詢（含數字/最大/預設等）
+
+        這類查詢通常有精確答案，不適合 query expansion 避免 drift
+        """
+        numeric_patterns = [
+            r'\d+',           # 任何數字
+            r'最[大小]',       # 最大/最小
+            r'[上下]限',       # 上限/下限
+            r'預設',          # 預設值
+            r'default',       # default
+            r'多少',          # 多少
+            r'幾[個條筆次]',   # 幾個/幾條
+        ]
+        for pattern in numeric_patterns:
+            if re.search(pattern, question, re.IGNORECASE):
+                return True
+        return False
+
+    def _should_expand_query(self, candidates: list, question: str = "",
+                             threshold: float = None) -> bool:
         """判斷是否需要 Query Expansion
 
-        P0-4 修正：使用 embedding score (candidates[i][1]) 而非 RRF score (candidates[i][0])
-        因為 RRF score 範圍約 0.01-0.03，和門檻值 0.35 完全不在同一量級
+        改進：
+        1. 使用 MULTI_QUERY_MIN_SCORE_TRIGGER 作為門檻（條件式啟用）
+        2. 數值查詢跳過 expansion（避免 query drift）
+        3. 高信心時跳過（top_emb_score > 門檻）
 
         條件：候選數量不足 或 最高 embedding 分數偏低
         """
+        # 使用 config 中的門檻
+        if threshold is None:
+            threshold = MULTI_QUERY_MIN_SCORE_TRIGGER
+
+        # 數值查詢跳過 expansion（避免 drift）
+        if MULTI_QUERY_SKIP_NUMERIC and question and self._is_numeric_query(question):
+            return False
+
         if not candidates:
             return True
         if len(candidates) < 3:
             return True
+
         # P0-4: 改用 embedding score，格式是 (rrf, emb, bm25, chunk)
         top_emb_score = candidates[0][1] if candidates else 0
+
+        # 高信心時跳過 expansion
         return top_emb_score < threshold
 
     def _hybrid_search(self, question: str, candidate_k: int = KNOWLEDGE_CANDIDATE_K) -> list:
@@ -748,8 +837,8 @@ English:"""
 
         first_round = scores[:candidate_k]
 
-        # P1 改進：Multi-Query - 候選不足或分數偏低時啟用
-        if self._should_expand_query(first_round):
+        # P1 改進：Multi-Query - 條件式啟用（候選不足/分數偏低/非數值查詢）
+        if self._should_expand_query(first_round, question=question):
             if MULTI_QUERY_ENABLED:
                 # 使用完整的 multi-query
                 multi_queries = self._generate_multi_queries(question)
@@ -928,13 +1017,25 @@ English:"""
     def _should_rerank(self, candidates: list, top_k: int, is_strict_mode: bool = False) -> bool:
         """判斷是否需要 rerank
 
-        P0 改進：
+        改進：
         - RERANKER_ALWAYS_ON = True 時，有 reranker 就一律使用
         - 嚴格模式下強制 rerank（STRICT_MODE_RERANK_REQUIRED）
+        - 高信心時跳過 rerank（top_emb_score > RERANKER_SKIP_THRESHOLD）
         - 否則使用條件觸發
         """
         if len(candidates) <= top_k:
             return False
+
+        # P0-4 修正：使用 embedding score (candidates[i][1]) 而非 RRF score (candidates[i][0])
+        # RRF score 範圍約 0.01-0.03，和固定門檻完全不在同一量級
+        # 格式是 (rrf_score, emb_score, bm25_score, chunk)
+        top_emb_score = candidates[0][1] if candidates else 0
+
+        # 改進：高信心時跳過 rerank（減少不必要的延遲）
+        # 但嚴格模式和 ALWAYS_ON 除外
+        if not RERANKER_ALWAYS_ON and not is_strict_mode:
+            if top_emb_score >= RERANKER_SKIP_THRESHOLD:
+                return False
 
         # P0 改進：強制啟用 reranker
         if RERANKER_ALWAYS_ON:
@@ -943,11 +1044,6 @@ English:"""
         # 嚴格模式強制 rerank
         if is_strict_mode and STRICT_MODE_RERANK_REQUIRED:
             return True
-
-        # P0-4 修正：使用 embedding score (candidates[i][1]) 而非 RRF score (candidates[i][0])
-        # RRF score 範圍約 0.01-0.03，和固定門檻完全不在同一量級
-        # 格式是 (rrf_score, emb_score, bm25_score, chunk)
-        top_emb_score = candidates[0][1] if candidates else 0
 
         # Margin-based 判斷（P0 改進）- 改用 embedding score
         if MARGIN_ENABLED and len(candidates) >= 2:

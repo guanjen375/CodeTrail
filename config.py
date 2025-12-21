@@ -127,6 +127,18 @@ ALLOWED_DOT_DIRS = {
 # 知識庫 (RAG) 設定
 # ============================================================
 KNOWLEDGE_FILE = "knowledge.json"
+KNOWLEDGE_EMB_FILE = "knowledge_emb.npz"  # 獨立儲存 embeddings（加速載入）
+
+# 分類型 Chunk 設定（依文件類型調整 chunk 大小與重疊）
+# 規格書/API 參考需要精細切分，手冊/一般文件可用較大區塊
+CHUNK_SETTINGS = {
+    'spec': {'size': 800, 'overlap': 150},      # 規格書：精細切分
+    'api': {'size': 600, 'overlap': 100},       # API 參考：短區塊
+    'manual': {'size': 1000, 'overlap': 200},   # 手冊：適中
+    'guide': {'size': 1200, 'overlap': 200},    # 教學指南：較大區塊
+    'faq': {'size': 800, 'overlap': 100},       # FAQ：問答獨立
+    'default': {'size': 1200, 'overlap': 200},  # 預設
+}
 KNOWLEDGE_TOP_K = 5
 KNOWLEDGE_CANDIDATE_K = 30
 KNOWLEDGE_THRESHOLD = 0.30           # 提高基礎門檻，寧缺勿濫（GPT建議: 0.25->0.30）
@@ -161,9 +173,11 @@ BM25_ENABLED = True                  # 啟用真正的 BM25（取代簡單 keywo
 RRF_K = 60                           # RRF 常數，控制排名衰減速度
 RRF_ENABLED = True                   # 啟用 RRF 融合（取代線性加權）
 
-# Reranker 強制啟用（精準度優先）
-RERANKER_ALWAYS_ON = True            # True = 有 reranker 就一律使用，不等分數模糊
+# Reranker 條件式觸發（平衡精準度與速度）
+# 改進：高信心時跳過 rerank，減少不必要的延遲
+RERANKER_ALWAYS_ON = False           # False = 條件式觸發，高信心時跳過
 RERANKER_TOP_N = 10                  # Rerank 後取 top N（精準度優先時 N=4~10）
+RERANKER_SKIP_THRESHOLD = 0.65       # top_emb_score > 此值時跳過 rerank（信心夠高）
 
 # 動態門檻：Margin-based 判斷
 MARGIN_ENABLED = True                # 啟用 margin 判斷
@@ -209,7 +223,10 @@ SENTENCE_EVIDENCE_WHITELIST = [
 # P1 改進：Multi-Query / Query Rewrite 設定
 # ============================================================
 MULTI_QUERY_ENABLED = True           # 啟用 multi-query
-MULTI_QUERY_COUNT = 3                # 生成幾個 query 變體
+MULTI_QUERY_COUNT = 2                # 生成幾個 query 變體（降低延遲：3->2）
+# 條件式啟用：避免 query drift
+MULTI_QUERY_MIN_SCORE_TRIGGER = 0.50 # top_emb_score < 此值才啟用 multi-query
+MULTI_QUERY_SKIP_NUMERIC = True      # 數值查詢（含數字/最大/預設）跳過 expansion
 MULTI_QUERY_TYPES = [
     "key_terms",                     # 抽取關鍵術語
     "translate",                     # 中英互譯
@@ -248,17 +265,17 @@ CODE_RAG_TOP_K = 8
 CODE_RAG_TOP_K_BUG = 5               # Bug 模式縮小 top_k，減少噪音
 CODE_RAG_CACHE_FILE = ".code_rag_cache.json"
 CODE_RAG_AUTO_PREREAD = True
-CODE_RAG_PREREAD_TOP_K = 5
+CODE_RAG_PREREAD_TOP_K = 3           # 減少預讀數量，降低 I/O（優化：5->3）
 CODE_RAG_PREREAD_TOP_K_BUG = 3       # Bug 模式預讀更少，靠 stack trace 補
-CODE_RAG_PREREAD_LINES = 96          # 預讀行數縮小，換取更精準的中心（GPT建議: 120->96）
-CODE_RAG_PREREAD_LINES_BUG = 160     # Bug 模式預讀增加（eval調優: 128->160）
-CODE_RAG_PREREAD_MAX_LINES = 300     # 預讀完整函式的最大行數上限（超過則退回窗口模式）
+CODE_RAG_PREREAD_LINES = 64          # 縮小預讀窗口，減少 I/O（優化：96->64）
+CODE_RAG_PREREAD_LINES_BUG = 128     # Bug 模式預讀適中（優化：160->128）
+CODE_RAG_PREREAD_MAX_LINES = 250     # 預讀完整函式的最大行數上限（優化：300->250）
 CODE_RAG_THRESHOLD = 0.35            # 提高門檻，確保真的相關才進來（GPT建議: 0.30->0.35）
 CODE_RAG_THRESHOLD_BUG = 0.25        # Bug 類問題放寬門檻（eval調優: 0.30->0.25）
 # Lazy embed to cut initial index time on large repos.
 CODE_RAG_LAZY_EMBED = True
-CODE_RAG_LAZY_EMBED_MAX_SYMBOLS = 1500
-CODE_RAG_LAZY_EMBED_QUERY_TOP_K = 200
+CODE_RAG_LAZY_EMBED_MAX_SYMBOLS = 2000  # 放寬 lazy 門檻，減少即時 embedding（優化：1500->2000）
+CODE_RAG_LAZY_EMBED_QUERY_TOP_K = 150   # 減少候選數量（優化：200->150）
 
 # ============================================================
 # 嚴格模式設定

@@ -27,6 +27,11 @@ numpy>=1.21.0       # 向量運算加速（RAG 搜尋、MMR 選擇）
 # pip install html2text
 # html2text>=2020.1.16
 
+# 中文切詞（提升 BM25 中文查準/查全率）
+# 未安裝仍可運作，但中文搜尋精準度較低
+# pip install jieba
+# jieba>=0.42.1
+
 # Tree-sitter AST 解析（提升程式碼解析精準度，目前未啟用）
 # pip install tree-sitter tree-sitter-python tree-sitter-javascript ...
 # tree-sitter>=0.21.0

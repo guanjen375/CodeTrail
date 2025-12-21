@@ -58,16 +58,20 @@ ollama = None
 # ============================================================
 # 設定
 # ============================================================
-# 改進：從 config.py 統一匯入 EMBEDDING_MODEL，避免兩處定義不一致
-# 這樣換 embedding model 時只需改 config.py 一處
+# 改進：從 config.py 統一匯入設定，避免兩處定義不一致
 try:
-    from config import EMBEDDING_MODEL
+    from config import EMBEDDING_MODEL, CHUNK_SETTINGS
 except ImportError:
     EMBEDDING_MODEL = "bge-m3"  # Fallback：獨立執行時的預設值
+    CHUNK_SETTINGS = {'default': {'size': 1200, 'overlap': 200}}
 
-CHUNK_SIZE = 1200           # 每個 chunk 的最大字元數（增加以保留完整指令）
-CHUNK_OVERLAP = 200         # Overlap chars between chunks for better recall
+# 預設 Chunk 設定（從 CHUNK_SETTINGS 取得）
+CHUNK_SIZE = CHUNK_SETTINGS.get('default', {}).get('size', 1200)
+CHUNK_OVERLAP = CHUNK_SETTINGS.get('default', {}).get('overlap', 200)
 INCLUDE_HEADING_IN_CONTENT = True
+
+# Embedding 增量快取檔案
+EMBEDDING_CACHE_FILE = ".rag_embedding_cache.json"
 
 # 支援的檔案類型
 SUPPORTED_EXTENSIONS = {".pdf", ".md", ".txt"}
@@ -101,6 +105,21 @@ def detect_doc_type(filename: str) -> str:
         if any(p in name_lower for p in patterns):
             return doc_type
     return 'doc'  # 預設類型
+
+
+def get_chunk_settings(doc_type: str) -> tuple:
+    """根據文件類型取得 chunk 設定
+
+    Args:
+        doc_type: 文件類型（spec, api, manual, guide, faq, doc）
+
+    Returns:
+        (chunk_size, chunk_overlap) tuple
+    """
+    settings = CHUNK_SETTINGS.get(doc_type, CHUNK_SETTINGS.get('default', {}))
+    size = settings.get('size', CHUNK_SIZE)
+    overlap = settings.get('overlap', CHUNK_OVERLAP)
+    return size, overlap
 
 
 def detect_content_type(content: str, base_type: str) -> str:
@@ -428,6 +447,9 @@ def extract_pdf(file_path: str) -> List[Dict]:
     doc_type = detect_doc_type(filename)
     last_section = ""  # 跨頁追蹤章節
 
+    # 根據文件類型取得 chunk 設定
+    chunk_size, chunk_overlap = get_chunk_settings(doc_type)
+
     for page_info in pages:
         page_num = page_info.get('metadata', {}).get('page', 0) + 1
         content = page_info.get('text', '').strip()
@@ -435,8 +457,10 @@ def extract_pdf(file_path: str) -> List[Dict]:
         if not content:
             continue
 
-        # 使用帶章節的切分
-        chunk_results = split_by_semantic_with_sections(content)
+        # 使用帶章節的切分（根據文件類型調整 chunk 大小）
+        chunk_results = split_by_semantic_with_sections(
+            content, max_chars=chunk_size, overlap_chars=chunk_overlap
+        )
         for i, chunk_data in enumerate(chunk_results):
             section = chunk_data["section"] or last_section
             if chunk_data["section"]:
@@ -471,8 +495,13 @@ def extract_text_file(file_path: str) -> List[Dict]:
     filename = Path(file_path).name
     doc_type = detect_doc_type(filename)
 
-    # 使用帶章節的切分
-    chunk_results = split_by_semantic_with_sections(content)
+    # 根據文件類型取得 chunk 設定
+    chunk_size, chunk_overlap = get_chunk_settings(doc_type)
+
+    # 使用帶章節的切分（根據文件類型調整 chunk 大小）
+    chunk_results = split_by_semantic_with_sections(
+        content, max_chars=chunk_size, overlap_chars=chunk_overlap
+    )
     for i, chunk_data in enumerate(chunk_results):
         # 根據內容判斷是否為警告類型
         chunk_type = detect_content_type(chunk_data["content"], doc_type)
@@ -810,27 +839,106 @@ def _save_to_cache(source_name: str, content: str, source_type: str, metadata: d
 # ============================================================
 # Embedding
 # ============================================================
-def generate_embeddings(chunks: List[Dict]) -> List[Dict]:
-    """為所有 chunks 生成 embeddings"""
+def _load_embedding_cache(cache_path: Path) -> Dict[str, List[float]]:
+    """載入 embedding 快取
+
+    快取格式：{content_hash: embedding}
+    使用內容雜湊作為 key，避免重複計算相同內容的 embedding
+    """
+    if not cache_path.exists():
+        return {}
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        # 驗證 embedding model 一致
+        if data.get('model') != EMBEDDING_MODEL:
+            print(f"  [INFO] Embedding model 變更，清除快取")
+            return {}
+        return data.get('cache', {})
+    except Exception as e:
+        print(f"  [WARN] 載入 embedding 快取失敗: {e}")
+        return {}
+
+
+def _save_embedding_cache(cache_path: Path, cache: Dict[str, List[float]]):
+    """儲存 embedding 快取"""
+    try:
+        data = {
+            'model': EMBEDDING_MODEL,
+            'updated_at': datetime.now().isoformat(),
+            'count': len(cache),
+            'cache': cache
+        }
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"  [WARN] 儲存 embedding 快取失敗: {e}")
+
+
+def _content_hash(content: str) -> str:
+    """計算內容雜湊（用於快取 key）"""
+    import hashlib
+    return hashlib.md5(content.encode('utf-8')).hexdigest()
+
+
+def generate_embeddings(chunks: List[Dict], cache_dir: Path = None) -> List[Dict]:
+    """為所有 chunks 生成 embeddings
+
+    改進：使用內容雜湊快取，避免重複計算相同內容的 embedding
+    - 快取 key = content 的 MD5 雜湊
+    - 相同內容直接從快取取得 embedding
+    - 新內容計算後存入快取
+    """
     global ollama
     if ollama is None:
         ollama = check_ollama()
 
     total = len(chunks)
 
+    # 載入快取
+    if cache_dir is None:
+        cache_dir = Path.cwd()
+    cache_path = cache_dir / EMBEDDING_CACHE_FILE
+    cache = _load_embedding_cache(cache_path)
+    cache_hits = 0
+    cache_updated = False
+
     for i, chunk in enumerate(chunks):
         # 進度顯示
         if (i + 1) % 10 == 0 or i == 0 or i == total - 1:
-            print(f"  Embedding: {i + 1}/{total}", end='\r')
+            status = f"(快取命中: {cache_hits})" if cache_hits > 0 else ""
+            print(f"  Embedding: {i + 1}/{total} {status}", end='\r')
 
+        content = chunk['content']
+        content_key = _content_hash(content)
+
+        # 檢查快取
+        if content_key in cache:
+            chunk['embedding'] = cache[content_key]
+            cache_hits += 1
+            continue
+
+        # 計算新的 embedding
         try:
-            response = ollama.embeddings(model=EMBEDDING_MODEL, prompt=chunk['content'])
-            chunk['embedding'] = response['embedding']
+            response = ollama.embeddings(model=EMBEDDING_MODEL, prompt=content)
+            embedding = response['embedding']
+            chunk['embedding'] = embedding
+            # 存入快取
+            cache[content_key] = embedding
+            cache_updated = True
         except Exception as e:
             print(f"\n  [ERROR] Embedding 失敗: {e}")
             chunk['embedding'] = []
 
-    print()  # 換行
+    # 儲存更新後的快取
+    if cache_updated:
+        _save_embedding_cache(cache_path, cache)
+        print(f"\n  [INFO] Embedding 快取已更新 ({len(cache)} 項)")
+    elif cache_hits > 0:
+        print(f"\n  [INFO] 快取命中 {cache_hits}/{total} ({cache_hits*100//total}%)")
+    else:
+        print()  # 換行
+
     return chunks
 
 # ============================================================
