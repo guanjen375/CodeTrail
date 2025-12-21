@@ -90,6 +90,51 @@ DOC_TYPE_PATTERNS = {
     'manual': ['manual', '_manual', 'handbook'],
 }
 
+# 內容特徵關鍵字（用於輔助文件類型識別）
+CONTENT_TYPE_PATTERNS = {
+    'spec': [
+        r'(?i)specification',
+        r'(?i)electrical\s+characteristics',
+        r'(?i)absolute\s+maximum\s+ratings',
+        r'(?i)timing\s+diagram',
+        r'(?i)pin\s+configuration',
+        r'(?i)register\s+map',
+        r'(?i)typical\s+application',
+    ],
+    'api': [
+        r'(?i)api\s+reference',
+        r'(?i)endpoint[s]?\s*:',
+        r'(?i)request\s+body',
+        r'(?i)response\s+format',
+        r'(?i)parameters?\s*:',
+        r'(?i)returns?\s*:',
+        r'def\s+\w+\s*\(',           # Python function def
+        r'function\s+\w+\s*\(',       # JS function
+    ],
+    'guide': [
+        r'(?i)getting\s+started',
+        r'(?i)step\s+\d+',
+        r'(?i)tutorial',
+        r'(?i)example[s]?\s*:',
+        r'(?i)how\s+to',
+        r'(?i)quick\s*start',
+    ],
+    'faq': [
+        r'(?i)frequently\s+asked',
+        r'(?i)Q\s*:\s*',
+        r'(?i)A\s*:\s*',
+        r'(?i)問\s*[:：]',
+        r'(?i)答\s*[:：]',
+    ],
+    'manual': [
+        r'(?i)user\s+manual',
+        r'(?i)操作\s*手冊',
+        r'(?i)使用\s*說明',
+        r'(?i)installation\s+guide',
+        r'(?i)configuration',
+    ],
+}
+
 # 警告/注意類內容的關鍵字
 WARNING_KEYWORDS = [
     'WARNING', 'CAUTION', 'DANGER', 'NOTE:', 'IMPORTANT:',
@@ -105,6 +150,47 @@ def detect_doc_type(filename: str) -> str:
         if any(p in name_lower for p in patterns):
             return doc_type
     return 'doc'  # 預設類型
+
+
+def detect_doc_type_by_content(content: str, filename_type: str = 'doc') -> str:
+    """根據內容特徵輔助判斷文件類型
+
+    改進：當檔名無法識別類型時，使用內容特徵來判斷
+    這可以提高 chunk 設定的準確性
+
+    Args:
+        content: 文件內容（前 2000 字元即可）
+        filename_type: 從檔名推斷的類型（作為 fallback）
+
+    Returns:
+        文件類型
+    """
+    import re
+
+    # 如果檔名已經識別出類型，直接返回
+    if filename_type != 'doc':
+        return filename_type
+
+    # 只檢查前 2000 字元（效能考量）
+    sample = content[:2000]
+
+    # 計算各類型的匹配分數
+    scores = {}
+    for doc_type, patterns in CONTENT_TYPE_PATTERNS.items():
+        score = 0
+        for pattern in patterns:
+            if re.search(pattern, sample):
+                score += 1
+        if score > 0:
+            scores[doc_type] = score
+
+    # 返回分數最高的類型，或 fallback 到 filename_type
+    if scores:
+        best_type = max(scores, key=scores.get)
+        if scores[best_type] >= 2:  # 至少匹配 2 個特徵才認定
+            return best_type
+
+    return filename_type
 
 
 def get_chunk_settings(doc_type: str) -> tuple:
@@ -447,6 +533,12 @@ def extract_pdf(file_path: str) -> List[Dict]:
     doc_type = detect_doc_type(filename)
     last_section = ""  # 跨頁追蹤章節
 
+    # 改進：若檔名無法識別類型，使用內容特徵輔助判斷
+    if doc_type == 'doc' and pages:
+        # 取第一頁內容作為特徵樣本
+        first_page_content = pages[0].get('text', '') if pages else ''
+        doc_type = detect_doc_type_by_content(first_page_content, doc_type)
+
     # 根據文件類型取得 chunk 設定
     chunk_size, chunk_overlap = get_chunk_settings(doc_type)
 
@@ -494,6 +586,10 @@ def extract_text_file(file_path: str) -> List[Dict]:
     results = []
     filename = Path(file_path).name
     doc_type = detect_doc_type(filename)
+
+    # 改進：若檔名無法識別類型，使用內容特徵輔助判斷
+    if doc_type == 'doc':
+        doc_type = detect_doc_type_by_content(content, doc_type)
 
     # 根據文件類型取得 chunk 設定
     chunk_size, chunk_overlap = get_chunk_settings(doc_type)
@@ -969,15 +1065,84 @@ def load_knowledge_base(output_path: Path) -> Dict:
     }
 
 def save_knowledge_base(kb: Dict, output_path: Path):
-    """儲存知識庫"""
+    """儲存知識庫
+
+    改進：將 embeddings 完全移到 .npz，JSON 只存文字與 metadata
+    - 大幅減少 JSON 檔案大小
+    - 加速 JSON 解析
+    - .npz 使用壓縮格式，整體儲存更有效率
+    """
     # 更新 metadata
     kb["metadata"]["updated_at"] = datetime.now().isoformat()
     kb["metadata"]["total_documents"] = len(kb["metadata"]["documents"])
     kb["metadata"]["total_chunks"] = len(kb["chunks"])
-    
+
+    # 分離 embeddings（從 chunks 移除，存到 .npz）
+    embeddings = []
+    chunks_without_emb = []
+    for chunk in kb["chunks"]:
+        emb = chunk.pop("embedding", [])
+        embeddings.append(emb)
+        chunks_without_emb.append(chunk)
+
+    # 儲存 JSON（不含 embedding）
+    kb_to_save = {
+        "metadata": kb["metadata"],
+        "chunks": chunks_without_emb
+    }
     with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(kb, f, ensure_ascii=False, indent=2)
-    
+        json.dump(kb_to_save, f, ensure_ascii=False, indent=2)
+
+    # 儲存 embeddings 到 .npz
+    try:
+        import numpy as np
+        from config import KNOWLEDGE_EMB_FILE
+        emb_path = output_path.parent / KNOWLEDGE_EMB_FILE
+
+        # 計算 content hash（用於載入時驗證）
+        import hashlib
+        hasher = hashlib.md5()
+        for chunk in chunks_without_emb:
+            hasher.update(chunk.get('content', '').encode('utf-8'))
+        content_hash = hasher.hexdigest()
+
+        # 確保 embeddings 維度一致
+        if embeddings:
+            emb_dim = max(len(e) for e in embeddings if e)
+            normalized = []
+            for emb in embeddings:
+                if len(emb) == emb_dim:
+                    normalized.append(emb)
+                elif len(emb) == 0:
+                    normalized.append([0.0] * emb_dim)
+                else:
+                    normalized.append((emb + [0.0] * emb_dim)[:emb_dim])
+
+            emb_array = np.array(normalized, dtype=np.float32)
+            # L2 正規化
+            norms = np.linalg.norm(emb_array, axis=1, keepdims=True)
+            norms = np.where(norms > 0, norms, 1.0)
+            emb_array = emb_array / norms
+
+            np.savez_compressed(
+                emb_path,
+                embeddings=emb_array,
+                embedding_model=EMBEDDING_MODEL,
+                chunk_count=len(chunks_without_emb),
+                content_hash=content_hash
+            )
+            emb_size = emb_path.stat().st_size / 1024 / 1024
+            print(f"     Embeddings: {emb_path.name} ({emb_size:.2f} MB)")
+    except ImportError:
+        # numpy 不可用，將 embedding 放回 JSON（向後相容）
+        for i, emb in enumerate(embeddings):
+            if i < len(kb["chunks"]):
+                kb["chunks"][i]["embedding"] = emb
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(kb, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"     [WARN] 儲存 .npz 失敗: {e}")
+
     file_size = output_path.stat().st_size / 1024 / 1024  # MB
     print(f"\n[OK] 知識庫已更新!")
     print(f"     檔案: {output_path.absolute()}")

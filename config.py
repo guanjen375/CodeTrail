@@ -37,7 +37,7 @@ NUM_CTX_FULL_MODE = NUM_CTX
 # 1 token ≈ 3-4 chars（粗估）
 DYNAMIC_NUM_CTX_ENABLED = True
 DYNAMIC_NUM_CTX_MIN = 16384      # 最小 16K
-DYNAMIC_NUM_CTX_MAX = NUM_CTX    # 最大 = NUM_CTX
+DYNAMIC_NUM_CTX_MAX = 65536      # 最大 64K（速度優先：128K->64K）
 DYNAMIC_NUM_CTX_BUFFER = 1.3     # 預留空間給回答（GPT建議: 1.5->1.3）
 CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
 
@@ -176,8 +176,8 @@ RRF_ENABLED = True                   # 啟用 RRF 融合（取代線性加權）
 # Reranker 條件式觸發（平衡精準度與速度）
 # 改進：高信心時跳過 rerank，減少不必要的延遲
 RERANKER_ALWAYS_ON = False           # False = 條件式觸發，高信心時跳過
-RERANKER_TOP_N = 10                  # Rerank 後取 top N（精準度優先時 N=4~10）
-RERANKER_SKIP_THRESHOLD = 0.65       # top_emb_score > 此值時跳過 rerank（信心夠高）
+RERANKER_TOP_N = 8                   # Rerank 後取 top N（速度優先：10->8）
+RERANKER_SKIP_THRESHOLD = 0.55       # top_emb_score > 此值時跳過 rerank（放寬：0.65->0.55）
 
 # 動態門檻：Margin-based 判斷
 MARGIN_ENABLED = True                # 啟用 margin 判斷

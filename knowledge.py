@@ -22,6 +22,10 @@ try:
     HAS_JIEBA = True
 except ImportError:
     HAS_JIEBA = False
+    # 提示：jieba 對中文 BM25 搜尋精準度很重要
+    import sys
+    print("[WARN] jieba 未安裝，中文 BM25 搜尋精準度可能較低", file=sys.stderr)
+    print("       建議執行: pip install jieba", file=sys.stderr)
 
 from config import (
     OLLAMA_GENERATE_URL, OLLAMA_EMBEDDINGS_URL, OLLAMA_TAGS_URL,
@@ -58,7 +62,7 @@ def _normalize_text_for_cache(text: str) -> str:
     return ' '.join(text.split())
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=512)  # 提高快取大小（速度優化：256->512）
 def _cached_get_embedding(text: str) -> tuple:
     """帶 LRU cache 的 embedding 查詢
 
@@ -177,8 +181,23 @@ class KnowledgeBase:
             print(f"[WARN] 知識庫載入失敗: {e}")
             self.loaded = False
 
+    def _compute_content_hash(self) -> str:
+        """計算所有 chunk 內容的雜湊（用於 .npz 快取驗證）
+
+        改進：使用內容雜湊確保 .npz 與 JSON 內容一致，
+        避免 chunk 數量相同但內容變更時讀到舊 embedding
+        """
+        import hashlib
+        hasher = hashlib.md5()
+        for chunk in self.chunks:
+            content = chunk.get('content', '')
+            hasher.update(content.encode('utf-8'))
+        return hasher.hexdigest()
+
     def _load_embeddings_from_npz(self) -> bool:
         """從 .npz 檔案載入 embeddings（加速載入）
+
+        改進：加入內容雜湊驗證，確保 .npz 與 JSON 內容一致
 
         Returns:
             True 如果成功載入，False 如果需要從 JSON 重建
@@ -187,17 +206,26 @@ class KnowledgeBase:
             return False
 
         try:
-            data = np.load(self._emb_path)
+            data = np.load(self._emb_path, allow_pickle=True)
             embeddings = data['embeddings']
             emb_model = str(data.get('embedding_model', ''))
             chunk_count = int(data.get('chunk_count', 0))
+            content_hash = str(data.get('content_hash', ''))
 
-            # 驗證一致性
+            # 驗證 embedding model 一致
             if emb_model and emb_model != EMBEDDING_MODEL:
                 print(f"[WARN] .npz embedding model 不一致，將重建")
                 return False
+
+            # 驗證 chunk 數量一致
             if chunk_count != len(self.chunks):
                 print(f"[WARN] .npz chunk 數量不一致，將重建")
+                return False
+
+            # 驗證內容雜湊一致（避免內容變更但數量相同的情況）
+            current_hash = self._compute_content_hash()
+            if content_hash and content_hash != current_hash:
+                print(f"[WARN] .npz 內容雜湊不一致，將重建")
                 return False
 
             self._embeddings = embeddings
@@ -209,16 +237,21 @@ class KnowledgeBase:
             return False
 
     def _save_embeddings_to_npz(self):
-        """將 embeddings 儲存為 .npz（加速下次載入）"""
+        """將 embeddings 儲存為 .npz（加速下次載入）
+
+        改進：儲存內容雜湊用於驗證
+        """
         if not HAS_NUMPY or self._embeddings is None:
             return
 
         try:
+            content_hash = self._compute_content_hash()
             np.savez_compressed(
                 self._emb_path,
                 embeddings=self._embeddings,
                 embedding_model=EMBEDDING_MODEL,
-                chunk_count=len(self.chunks)
+                chunk_count=len(self.chunks),
+                content_hash=content_hash
             )
         except Exception as e:
             print(f"[WARN] 儲存 .npz 失敗: {e}")
