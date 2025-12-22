@@ -32,6 +32,51 @@ from config import (
 )
 
 
+# ============================================================
+# P0 改進：Directory Scan Cache（共用掃描結果）
+# ============================================================
+_SCAN_CACHE = {}  # {folder_path: {"files": list, "mtime": float}}
+_SCAN_CACHE_TTL = 30  # 快取有效期（秒）
+
+import time as _time
+
+
+def _get_folder_mtime(folder: str) -> float:
+    """取得資料夾的最新修改時間（用於快取驗證）"""
+    folder_path = Path(folder).resolve()
+    try:
+        # 只檢查資料夾本身的 mtime（不遞迴）
+        return folder_path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def get_cached_scan_result(folder: str) -> list[dict] | None:
+    """P0 改進：取得快取的掃描結果（如果有效）
+
+    Returns:
+        list[dict] 如果快取有效，否則 None
+    """
+    folder_path = str(Path(folder).resolve())
+    cached = _SCAN_CACHE.get(folder_path)
+
+    if cached:
+        # 檢查 TTL
+        if _time.time() - cached.get("timestamp", 0) < _SCAN_CACHE_TTL:
+            return cached.get("files")
+
+    return None
+
+
+def set_scan_cache(folder: str, files: list[dict]):
+    """P0 改進：設定掃描結果快取"""
+    folder_path = str(Path(folder).resolve())
+    _SCAN_CACHE[folder_path] = {
+        "files": files,
+        "timestamp": _time.time(),
+    }
+
+
 def check_ollama_gpu() -> tuple[bool, str]:
     """檢查 Ollama GPU 狀態"""
     try:
@@ -165,8 +210,15 @@ def get_priority(filepath: str) -> int:
 def scan_project_metadata(folder: str) -> list[dict]:
     """掃描專案取得檔案元資料（不讀取內容）
 
-    改進：使用 should_ignore_dir 統一判斷，支援 ALLOWED_DOT_DIRS
+    改進：
+    - 使用 should_ignore_dir 統一判斷，支援 ALLOWED_DOT_DIRS
+    - P0 改進：使用快取避免重複掃描
     """
+    # P0 改進：檢查快取
+    cached = get_cached_scan_result(folder)
+    if cached is not None:
+        return cached
+
     files = []
     folder_path = Path(folder).resolve()
     self_path = Path(sys.argv[0]).resolve()
@@ -211,6 +263,8 @@ def scan_project_metadata(folder: str) -> list[dict]:
             except (OSError, FileNotFoundError):
                 continue
 
+    # P0 改進：設定快取
+    set_scan_cache(folder, files)
     return files
 
 
@@ -785,6 +839,154 @@ def extract_evidence_mapping(answer: str, knowledge_ctx: str) -> dict:
         "coverage": coverage,
         "unverified_count": total_claims - verified_count
     }
+
+
+# ============================================================
+# P0 改進：Post-Answer Verification（回答後驗證）
+# ============================================================
+
+# Code claim patterns - 描述程式碼行為/實作的句子
+CODE_CLAIM_PATTERNS = [
+    r'函[式數]',           # 函式/函數
+    r'變[數量]',           # 變數/變量
+    r'class\s',            # class
+    r'定義在',             # 定義在
+    r'實[作現]',           # 實作/實現
+    r'程式碼',             # 程式碼
+    r'原始碼',             # 原始碼
+    r'source\s*code',      # source code
+    r'呼叫',               # 呼叫
+    r'返回',               # 返回
+    r'回傳',               # 回傳
+    r'參數',               # 參數
+    r'傳入',               # 傳入
+    r'method',             # method
+    r'function',           # function
+]
+
+# REF claim patterns - 描述文件/規格內容的句子
+REF_CLAIM_PATTERNS = [
+    r'根據',               # 根據
+    r'依據',               # 依據
+    r'文件.*說明',         # 文件說明
+    r'規格.*定義',         # 規格定義
+    r'官方',               # 官方
+    r'說明書',             # 說明書
+    r'手冊',               # 手冊
+    r'文檔',               # 文檔
+    r'documentation',      # documentation
+    r'spec\b',             # spec
+    r'manual\b',           # manual
+]
+
+
+def verify_answer_claims(answer: str, has_code_context: bool = False,
+                         has_ref_context: bool = False) -> tuple[str, dict]:
+    """P0 改進：回答後驗證層
+
+    驗證規則：
+    1. 描述程式碼行為的句子必須有 file:line 引用（如 agent.py:123）
+    2. 描述文件內容的句子必須有 REF# 引用
+
+    否則標記為推測或要求補充
+
+    Args:
+        answer: LLM 生成的回答
+        has_code_context: 是否有程式碼上下文
+        has_ref_context: 是否有 REF 知識庫上下文
+
+    Returns:
+        (verified_answer, metadata) where metadata includes:
+        - code_claims_verified: 有 file:line 的程式碼聲明數
+        - code_claims_unverified: 沒有 file:line 的程式碼聲明數
+        - ref_claims_verified: 有 REF# 的文件聲明數
+        - ref_claims_unverified: 沒有 REF# 的文件聲明數
+        - warnings: 警告訊息列表
+    """
+    # 編譯 patterns
+    code_patterns = [re.compile(p, re.IGNORECASE) for p in CODE_CLAIM_PATTERNS]
+    ref_patterns = [re.compile(p, re.IGNORECASE) for p in REF_CLAIM_PATTERNS]
+
+    # file:line 引用 pattern（如 agent.py:123, src/utils.py:45）
+    file_line_pattern = re.compile(r'[\w\/\\.-]+\.[a-z]+:\d+', re.IGNORECASE)
+    # REF# 引用 pattern（如 REF1, REF 2, (REF3)）
+    ref_pattern = re.compile(r'REF\s*#?\s*\d+', re.IGNORECASE)
+
+    # 分割回答為句子
+    sentences = re.split(r'(?<=[。.!?！？])\s*', answer)
+
+    metadata = {
+        "code_claims_verified": 0,
+        "code_claims_unverified": 0,
+        "ref_claims_verified": 0,
+        "ref_claims_unverified": 0,
+        "warnings": [],
+    }
+
+    unverified_code_claims = []
+    unverified_ref_claims = []
+
+    for sentence in sentences:
+        if not sentence.strip() or len(sentence.strip()) < 15:
+            continue
+
+        # 檢查是否為程式碼聲明
+        is_code_claim = any(p.search(sentence) for p in code_patterns)
+        # 檢查是否為文件聲明
+        is_ref_claim = any(p.search(sentence) for p in ref_patterns)
+
+        # 檢查是否有 file:line 引用
+        has_file_line = bool(file_line_pattern.search(sentence))
+        # 檢查是否有 REF# 引用
+        has_ref_num = bool(ref_pattern.search(sentence))
+
+        # 程式碼聲明驗證
+        if is_code_claim and has_code_context:
+            if has_file_line:
+                metadata["code_claims_verified"] += 1
+            else:
+                metadata["code_claims_unverified"] += 1
+                unverified_code_claims.append(sentence.strip()[:80])
+
+        # 文件聲明驗證
+        if is_ref_claim and has_ref_context:
+            if has_ref_num:
+                metadata["ref_claims_verified"] += 1
+            else:
+                metadata["ref_claims_unverified"] += 1
+                unverified_ref_claims.append(sentence.strip()[:80])
+
+    # 生成警告訊息
+    if unverified_code_claims:
+        metadata["warnings"].append(
+            f"⚠️ 發現 {len(unverified_code_claims)} 個程式碼相關描述沒有 file:line 引用"
+        )
+
+    if unverified_ref_claims:
+        metadata["warnings"].append(
+            f"⚠️ 發現 {len(unverified_ref_claims)} 個文件引用沒有 REF# 標註"
+        )
+
+    # 如果有未驗證的聲明，附加警告到回答
+    verified_answer = answer
+    if metadata["warnings"]:
+        warning_section = "\n\n---\n**引用驗證提醒**：\n"
+        for w in metadata["warnings"]:
+            warning_section += f"- {w}\n"
+
+        if unverified_code_claims:
+            warning_section += "\n需要 file:line 引用的句子（部分）：\n"
+            for claim in unverified_code_claims[:3]:
+                warning_section += f"  • {claim}...\n"
+
+        if unverified_ref_claims:
+            warning_section += "\n需要 REF# 標註的句子（部分）：\n"
+            for claim in unverified_ref_claims[:3]:
+                warning_section += f"  • {claim}...\n"
+
+        verified_answer = answer + warning_section
+
+    return verified_answer, metadata
 
 
 def format_evidence_report(answer: str, knowledge_ctx: str, refs_metadata: list = None) -> str:

@@ -82,13 +82,18 @@ def _try_load_tree_sitter_language(lang_name: str):
 
 @dataclass
 class Symbol:
-    """程式碼符號"""
+    """程式碼符號 - P0 改進：擴充 embedding 內容"""
     name: str
     type: str  # 'function', 'class', 'method', 'interface', 'struct', etc.
     start_line: int  # 1-based
     end_line: int    # 1-based, 包含
     context: str     # 符號定義的上下文（前幾行）
     parent: Optional[str] = None  # 父類別名稱（如果是 method）
+    # P0 改進：擴充欄位
+    signature: Optional[str] = None  # 函式簽名（含參數和返回值）
+    docstring: Optional[str] = None  # 文檔字串
+    type_hints: Optional[str] = None  # 類型提示
+    comments: Optional[str] = None  # 相關註解
 
 
 class PythonASTParser:
@@ -134,12 +139,33 @@ class _PythonSymbolVisitor(ast.NodeVisitor):
             start_line = node.lineno
             end_line = self.parser._get_end_line(node)
             context = self.parser._get_context(self.lines, start_line, end_line)
+
+            # P0 改進：提取 docstring
+            docstring = ast.get_docstring(node)
+
+            # P0 改進：提取父類名稱（繼承）
+            bases = []
+            for base in node.bases:
+                if isinstance(base, ast.Name):
+                    bases.append(base.id)
+                elif isinstance(base, ast.Attribute):
+                    bases.append(f"{base.attr}")
+            parent_classes = ', '.join(bases) if bases else None
+
+            # P0 改進：提取 class 簽名（含繼承）
+            signature = f"class {node.name}"
+            if bases:
+                signature += f"({', '.join(bases)})"
+
             self.symbols.append(Symbol(
                 name=node.name,
                 type='class',
                 start_line=start_line,
                 end_line=end_line,
-                context=context
+                context=context,
+                signature=signature,
+                docstring=docstring[:300] if docstring else None,
+                parent=parent_classes
             ))
 
             # 進入 class scope，處理其中的 methods
@@ -169,12 +195,22 @@ class _PythonSymbolVisitor(ast.NodeVisitor):
             start_line = node.lineno
             end_line = self.parser._get_end_line(node)
             context = self.parser._get_context(self.lines, start_line, end_line)
+
+            # P0 改進：提取 docstring
+            docstring = ast.get_docstring(node)
+
+            # P0 改進：提取函式簽名（含參數和類型提示）
+            signature, type_hints = self._extract_function_signature(node)
+
             self.symbols.append(Symbol(
                 name=node.name,
                 type='function',
                 start_line=start_line,
                 end_line=end_line,
-                context=context
+                context=context,
+                signature=signature,
+                docstring=docstring[:300] if docstring else None,
+                type_hints=type_hints
             ))
             # 進入 function scope（其內的 function 不收錄）
             self.scope_stack.append('function')
@@ -186,13 +222,23 @@ class _PythonSymbolVisitor(ast.NodeVisitor):
             start_line = node.lineno
             end_line = self.parser._get_end_line(node)
             context = self.parser._get_context(self.lines, start_line, end_line)
+
+            # P0 改進：提取 docstring
+            docstring = ast.get_docstring(node)
+
+            # P0 改進：提取函式簽名（含參數和類型提示）
+            signature, type_hints = self._extract_function_signature(node)
+
             self.symbols.append(Symbol(
                 name=node.name,
                 type='method',
                 start_line=start_line,
                 end_line=end_line,
                 context=context,
-                parent=getattr(self, '_current_class', None)
+                parent=getattr(self, '_current_class', None),
+                signature=signature,
+                docstring=docstring[:300] if docstring else None,
+                type_hints=type_hints
             ))
             # 進入 function scope（method 內的 function 不收錄）
             self.scope_stack.append('function')
@@ -206,6 +252,80 @@ class _PythonSymbolVisitor(ast.NodeVisitor):
             self.scope_stack.append('function')
             self.generic_visit(node)
             self.scope_stack.pop()
+
+    def _extract_function_signature(self, node) -> tuple[str, str]:
+        """P0 改進：提取函式簽名和類型提示"""
+        # 建構簽名
+        is_async = isinstance(node, ast.AsyncFunctionDef)
+        prefix = "async def" if is_async else "def"
+
+        # 提取參數
+        args = node.args
+        params = []
+        type_hints_parts = []
+
+        # 處理一般參數
+        for i, arg in enumerate(args.args):
+            param_str = arg.arg
+            if arg.annotation:
+                ann = self._annotation_to_str(arg.annotation)
+                param_str += f": {ann}"
+                type_hints_parts.append(f"{arg.arg}: {ann}")
+            params.append(param_str)
+
+        # 處理 *args
+        if args.vararg:
+            param_str = f"*{args.vararg.arg}"
+            if args.vararg.annotation:
+                ann = self._annotation_to_str(args.vararg.annotation)
+                param_str += f": {ann}"
+            params.append(param_str)
+
+        # 處理 **kwargs
+        if args.kwarg:
+            param_str = f"**{args.kwarg.arg}"
+            if args.kwarg.annotation:
+                ann = self._annotation_to_str(args.kwarg.annotation)
+                param_str += f": {ann}"
+            params.append(param_str)
+
+        # 建構完整簽名
+        signature = f"{prefix} {node.name}({', '.join(params)})"
+
+        # 返回類型
+        if node.returns:
+            ret_ann = self._annotation_to_str(node.returns)
+            signature += f" -> {ret_ann}"
+            type_hints_parts.append(f"return: {ret_ann}")
+
+        type_hints = ", ".join(type_hints_parts) if type_hints_parts else None
+        return signature, type_hints
+
+    def _annotation_to_str(self, annotation) -> str:
+        """將 AST annotation 轉換為字串"""
+        if isinstance(annotation, ast.Name):
+            return annotation.id
+        elif isinstance(annotation, ast.Constant):
+            return str(annotation.value)
+        elif isinstance(annotation, ast.Subscript):
+            value = self._annotation_to_str(annotation.value)
+            slice_val = self._annotation_to_str(annotation.slice)
+            return f"{value}[{slice_val}]"
+        elif isinstance(annotation, ast.Attribute):
+            return f"{self._annotation_to_str(annotation.value)}.{annotation.attr}"
+        elif isinstance(annotation, ast.Tuple):
+            elts = [self._annotation_to_str(e) for e in annotation.elts]
+            return f"({', '.join(elts)})"
+        elif isinstance(annotation, ast.List):
+            elts = [self._annotation_to_str(e) for e in annotation.elts]
+            return f"[{', '.join(elts)}]"
+        elif isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+            # Union type: X | Y
+            left = self._annotation_to_str(annotation.left)
+            right = self._annotation_to_str(annotation.right)
+            return f"{left} | {right}"
+        else:
+            return "..."
 
 
 # PythonASTParser 的 helper methods（放在 class 外供 visitor 使用）
@@ -765,16 +885,247 @@ class RegexFallbackParser:
         return len(lines)
 
 
+class CtagsFallbackParser:
+    """P0 改進：使用 ctags 解析 Java/Kotlin（當 tree-sitter 不可用時）
+
+    需要系統安裝 universal-ctags：
+    - macOS: brew install universal-ctags
+    - Ubuntu: apt install universal-ctags
+    """
+
+    def __init__(self, language: str):
+        self.language = language
+        self._ctags_available = None
+
+    def _check_ctags_available(self) -> bool:
+        """檢查 ctags 是否可用"""
+        if self._ctags_available is not None:
+            return self._ctags_available
+
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['ctags', '--version'],
+                capture_output=True, text=True, timeout=5
+            )
+            self._ctags_available = result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            self._ctags_available = False
+
+        return self._ctags_available
+
+    def parse(self, content: str, filepath: Path) -> list[Symbol]:
+        """使用 ctags 解析 Java/Kotlin"""
+        if not self._check_ctags_available():
+            # Fallback 到 regex
+            return self._parse_with_regex(content, filepath)
+
+        import subprocess
+        import tempfile
+
+        # 寫入臨時檔案
+        ext = filepath.suffix
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix=ext, delete=False, encoding='utf-8') as f:
+                f.write(content)
+                temp_path = f.name
+
+            # 執行 ctags
+            result = subprocess.run(
+                ['ctags', '-f', '-', '--output-format=json', '--fields=+n+e', temp_path],
+                capture_output=True, text=True, timeout=30
+            )
+
+            if result.returncode != 0:
+                return self._parse_with_regex(content, filepath)
+
+            # 解析 ctags JSON 輸出
+            import json
+            symbols = []
+            lines = content.split('\n')
+
+            for line in result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+                try:
+                    tag = json.loads(line)
+                    name = tag.get('name', '')
+                    kind = tag.get('kind', '')
+                    line_num = tag.get('line', 1)
+                    end_line = tag.get('end', line_num)
+
+                    # 映射 ctags kind 到我們的 type
+                    sym_type = self._map_kind(kind)
+                    if not sym_type:
+                        continue
+
+                    # 取得 context
+                    start_idx = line_num - 1
+                    context_end = min(start_idx + 15, len(lines))
+                    context = '\n'.join(lines[start_idx:context_end])
+
+                    # 取得 parent（class/interface）
+                    parent = tag.get('scope', None)
+                    if parent and ':' in parent:
+                        parent = parent.split(':')[-1]
+
+                    symbols.append(Symbol(
+                        name=name,
+                        type=sym_type,
+                        start_line=line_num,
+                        end_line=end_line,
+                        context=context,
+                        parent=parent
+                    ))
+                except json.JSONDecodeError:
+                    continue
+
+            return symbols
+
+        except Exception:
+            return self._parse_with_regex(content, filepath)
+        finally:
+            import os
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+
+    def _map_kind(self, kind: str) -> Optional[str]:
+        """映射 ctags kind 到 Symbol type"""
+        kind_map = {
+            'class': 'class',
+            'interface': 'interface',
+            'method': 'method',
+            'function': 'function',
+            'field': None,  # 不收錄 field
+            'variable': None,
+            'enum': 'enum',
+            'enumConstant': None,
+            'constructor': 'method',
+        }
+        return kind_map.get(kind)
+
+    def _parse_with_regex(self, content: str, filepath: Path) -> list[Symbol]:
+        """Regex fallback for Java/Kotlin"""
+        symbols = []
+        lines = content.split('\n')
+        ext = filepath.suffix.lower()
+
+        if ext in ('.java',):
+            symbols = self._parse_java(lines)
+        elif ext in ('.kt', '.kts'):
+            symbols = self._parse_kotlin(lines)
+
+        return symbols
+
+    def _parse_java(self, lines: list) -> list[Symbol]:
+        """解析 Java"""
+        symbols = []
+        class_pattern = r'^\s*(?:public|private|protected)?\s*(?:static)?\s*(?:final)?\s*(class|interface|enum)\s+(\w+)'
+        method_pattern = r'^\s*(?:public|private|protected)?\s*(?:static)?\s*(?:final)?\s*(?:<[^>]+>\s*)?(\w+(?:\[\])?)\s+(\w+)\s*\('
+        current_class = None
+
+        for i, line in enumerate(lines):
+            m = re.match(class_pattern, line)
+            if m:
+                sym_type = m.group(1)  # class, interface, or enum
+                name = m.group(2)
+                current_class = name
+                symbols.append(Symbol(
+                    name=name,
+                    type=sym_type,
+                    start_line=i + 1,
+                    end_line=self._find_brace_end(lines, i),
+                    context='\n'.join(lines[i:min(i+15, len(lines))])
+                ))
+                continue
+
+            m = re.match(method_pattern, line)
+            if m and current_class:
+                return_type = m.group(1)
+                name = m.group(2)
+                # 排除 Java 關鍵字
+                if name in ('if', 'else', 'for', 'while', 'switch', 'catch', 'try', 'new', 'return'):
+                    continue
+                symbols.append(Symbol(
+                    name=name,
+                    type='method',
+                    start_line=i + 1,
+                    end_line=self._find_brace_end(lines, i),
+                    context='\n'.join(lines[i:min(i+15, len(lines))]),
+                    parent=current_class,
+                    signature=f"{return_type} {name}(...)"
+                ))
+
+        return symbols
+
+    def _parse_kotlin(self, lines: list) -> list[Symbol]:
+        """解析 Kotlin"""
+        symbols = []
+        class_pattern = r'^\s*(?:open|data|sealed|abstract)?\s*(class|interface|object|enum\s+class)\s+(\w+)'
+        func_pattern = r'^\s*(?:private|public|internal|protected)?\s*(?:suspend)?\s*fun\s+(?:<[^>]+>\s*)?(\w+)\s*\('
+
+        current_class = None
+
+        for i, line in enumerate(lines):
+            m = re.match(class_pattern, line)
+            if m:
+                kind = m.group(1).split()[0]  # 'class', 'interface', 'object', 'enum'
+                name = m.group(2)
+                current_class = name
+                symbols.append(Symbol(
+                    name=name,
+                    type=kind if kind != 'object' else 'class',
+                    start_line=i + 1,
+                    end_line=self._find_brace_end(lines, i),
+                    context='\n'.join(lines[i:min(i+15, len(lines))])
+                ))
+                continue
+
+            m = re.match(func_pattern, line)
+            if m:
+                name = m.group(1)
+                sym_type = 'method' if current_class else 'function'
+                symbols.append(Symbol(
+                    name=name,
+                    type=sym_type,
+                    start_line=i + 1,
+                    end_line=self._find_brace_end(lines, i),
+                    context='\n'.join(lines[i:min(i+15, len(lines))]),
+                    parent=current_class
+                ))
+
+        return symbols
+
+    def _find_brace_end(self, lines: list, start: int) -> int:
+        """找大括號配對的結尾"""
+        depth = 0
+        for i in range(start, len(lines)):
+            for ch in lines[i]:
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        return i + 1
+        return len(lines)
+
+
 def get_parser(filepath: Path):
     """取得適合檔案類型的解析器
 
-    優先使用 AST/tree-sitter，fallback 到 regex
+    優先使用 AST/tree-sitter，fallback 到 regex/ctags
     """
     ext = filepath.suffix.lower()
 
     # Python: 使用內建 ast 模組
     if ext in ('.py', '.pyx', '.pyi'):
         return PythonASTParser()
+
+    # Java/Kotlin: 使用 ctags fallback
+    if ext in ('.java', '.kt', '.kts'):
+        return CtagsFallbackParser('java' if ext == '.java' else 'kotlin')
 
     # 嘗試使用 tree-sitter
     if HAS_TREE_SITTER:

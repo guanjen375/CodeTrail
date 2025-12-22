@@ -368,6 +368,9 @@ class ToolExecutor:
                 continue
 
     def read_file(self, path: str, start_line: int = 1, end_line: Optional[int] = None) -> str:
+        """P0 改進：使用 line-based streaming 避免載入整個檔案"""
+        import linecache
+
         target = self._safe_path(path)
 
         if not target or not target.exists():
@@ -375,29 +378,43 @@ class ToolExecutor:
         if not target.is_file():
             return f"錯誤: '{path}' 不是檔案"
 
+        target_str = str(target)
+        start_line = max(1, start_line)
+        truncated_by_limit = False
+
+        # P0 改進：使用 linecache 進行 line-based 讀取
+        # linecache 會快取檔案，對重複讀取同一檔案更有效率
+        # 先清除舊的快取（避免檔案變更後讀到舊內容）
+        linecache.checkcache(target_str)
+
+        # 計算總行數（使用 generator 避免一次載入整個檔案）
         try:
-            content = target.read_text(encoding="utf-8", errors="replace")
+            with open(target, 'r', encoding='utf-8', errors='replace') as f:
+                total = sum(1 for _ in f)
         except Exception as e:
             return f"錯誤: {e}"
 
-        lines = content.split('\n')
-        total = len(lines)
-
-        start_line = max(1, start_line)
-        truncated_by_limit = False
+        # 計算 end_line
         if end_line is None:
             char_count = 0
             end_line = start_line
-            for i in range(start_line - 1, total):
-                char_count += len(lines[i]) + 1
+            for i in range(start_line, total + 1):
+                line = linecache.getline(target_str, i)
+                char_count += len(line)
                 if char_count > MAX_FILE_READ_CHARS:
                     truncated_by_limit = True
                     break
-                end_line = i + 1
+                end_line = i
         else:
             end_line = min(end_line, total)
 
-        selected = lines[start_line - 1:end_line]
+        # 讀取指定範圍的行
+        selected = []
+        for i in range(start_line, end_line + 1):
+            line = linecache.getline(target_str, i)
+            # getline 返回含 \n 的行，需要 rstrip
+            selected.append(line.rstrip('\n\r'))
+
         numbered = [f"{i:4d} | {line}" for i, line in enumerate(selected, start_line)]
 
         header = f"=== {path} (行 {start_line}-{end_line} / 共 {total} 行) ===\n"

@@ -24,7 +24,7 @@ from config import (
 )
 from utils import (
     call_llm_stream, should_use_strict_mode, needs_grounding, answer_with_self_check,
-    scan_project_metadata, print_ctx_usage
+    scan_project_metadata, print_ctx_usage, verify_answer_claims
 )
 
 # 從拆分出的模組導入
@@ -470,7 +470,27 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
         return answer
 
     q_lower = question.lower()
-    is_bug_fix = any(kw in q_lower for kw in ['bug', '錯誤', 'error', 'crash', 'fail', '修', 'fix', '問題', 'issue', '不work', '不能'])
+    # P0 改進：Bug 模式判定擴充（加入 stack trace / log 模式特徵）
+    bug_keywords = ['bug', '錯誤', 'error', 'crash', 'fail', '修', 'fix', '問題', 'issue', '不work', '不能']
+    is_bug_fix = any(kw in q_lower for kw in bug_keywords)
+
+    # P0 改進：Stack trace / log 模式偵測
+    stack_trace_patterns = [
+        r'File ".*?", line \d+',           # Python stack trace
+        r'at \w+\.\w+\(.*?:\d+\)',          # Java/Kotlin stack trace
+        r'\w+:\d+:\d+:?\s*error',           # C/C++/Go error
+        r'panic:',                           # Go panic
+        r'Traceback \(most recent call',    # Python traceback header
+        r'Exception in thread',              # Java exception header
+        r'\[ERROR\]',                        # Log level
+        r'FAILED|PASSED|ERROR',             # Test output
+        r'AssertionError',                   # Python assertion
+        r'NullPointerException',            # Java NPE
+        r'undefined is not',                # JavaScript error
+    ]
+    has_stack_trace = any(re.search(pat, question, re.IGNORECASE) for pat in stack_trace_patterns)
+    if has_stack_trace and not is_bug_fix:
+        is_bug_fix = True
 
     # Stack trace 位置提取
     stack_locations = extract_stack_locations(question)
@@ -728,6 +748,15 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
                     base_ctx = f"專案路徑: {folder}\n{code_rag_context}\n{stack_preread_context}"
                     content = answer_with_self_check(question, base_ctx, knowledge_ctx, binary_ctx=image_ctx)
 
+                # P0 改進：Post-Answer Verification（回答後驗證）
+                has_code_ctx = bool(code_rag_context or stack_preread_context or _files_read_record)
+                has_ref_ctx = bool(knowledge_ctx)
+                verified_content, verify_metadata = verify_answer_claims(content, has_code_ctx, has_ref_ctx)
+
+                if verify_metadata["warnings"]:
+                    print(f"   [VERIFY] {len(verify_metadata['warnings'])} 個驗證提醒")
+                    content = verified_content
+
                 print(f"   [OK] Agent 完成分析\n")
                 print(content)
                 return _make_return(content)
@@ -826,6 +855,15 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
     content = call_llm_with_tools_stream(messages, temperature=agent_temperature)
 
     if content:
+        # P0 改進：Post-Answer Verification（回答後驗證）
+        has_code_ctx = bool(code_rag_context or stack_preread_context or _files_read_record)
+        has_ref_ctx = bool(knowledge_ctx)
+        verified_content, verify_metadata = verify_answer_claims(content, has_code_ctx, has_ref_ctx)
+
+        if verify_metadata["warnings"]:
+            print(f"   [VERIFY] {len(verify_metadata['warnings'])} 個驗證提醒")
+            content = verified_content
+
         return _make_return(content)
 
     return _make_return("[WARN] 達到最大探索次數，請嘗試更具體的問題。")

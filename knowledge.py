@@ -39,6 +39,8 @@ from config import (
     EMBEDDING_MODEL, RERANKER_MODEL,
     USE_RERANKER, USE_HYBRID_SEARCH, USE_QUERY_EXPANSION,
     USE_MMR, MMR_LAMBDA, KEYWORD_WEIGHT,
+    # P0 改進：Source Type Weighting（來源權重）
+    SOURCE_TYPE_WEIGHTS, POLLUTION_RISK_TOP_K, POLLUTION_RISK_MIN_SCORE,
     # P0 改進：BM25 + RRF + Reranker 條件式觸發
     BM25_K1, BM25_B, BM25_ENABLED,
     RRF_K, RRF_ENABLED,
@@ -796,6 +798,168 @@ English:"""
                 return True
         return False
 
+    def _get_source_weight(self, chunk: dict) -> float:
+        """取得 chunk 的來源權重
+
+        權威來源（spec/manual/api）權重較高
+        低可靠來源（chat/diagram/web）權重較低
+        """
+        chunk_type = chunk.get('type', 'default')
+        return SOURCE_TYPE_WEIGHTS.get(chunk_type, SOURCE_TYPE_WEIGHTS['default'])
+
+    def _apply_source_weighting(self, candidates: list) -> list:
+        """對候選結果應用來源權重
+
+        Args:
+            candidates: [(rrf_score, emb_score, bm25_score, chunk), ...]
+
+        Returns:
+            [(weighted_score, emb_score, bm25_score, chunk), ...] 按加權分數排序
+        """
+        weighted = []
+        for rrf_score, emb_score, bm25_score, chunk in candidates:
+            weight = self._get_source_weight(chunk)
+            # 加權分數 = 原始分數 * 來源權重
+            weighted_emb = emb_score * weight
+            weighted_rrf = rrf_score * weight
+            weighted.append((weighted_rrf, weighted_emb, bm25_score, chunk))
+
+        # 按加權 RRF 分數重新排序
+        weighted.sort(reverse=True, key=lambda x: x[0])
+        return weighted
+
+    def _select_with_pollution_control(self, chunks: list, pollution_risk: str,
+                                        emb_scores: list) -> list:
+        """根據污染風險選擇 REF，寧缺勿濫
+
+        高污染風險時：
+        1. 減少 REF 數量
+        2. 提高最低分數門檻
+        3. 優先選擇權威來源
+
+        Args:
+            chunks: 候選 chunk 列表
+            pollution_risk: "low" / "medium" / "high"
+            emb_scores: 對應的 embedding scores
+
+        Returns:
+            篩選後的 chunk 列表
+        """
+        if not chunks:
+            return []
+
+        # 根據污染風險決定最大數量
+        max_count = POLLUTION_RISK_TOP_K.get(pollution_risk, POLLUTION_RISK_TOP_K['low'])
+
+        # 高污染風險時，提高最低分數門檻
+        min_score = 0.0
+        if pollution_risk in ('medium', 'high'):
+            min_score = POLLUTION_RISK_MIN_SCORE
+
+        # 篩選：只保留分數足夠高的
+        selected = []
+        for chunk, score in zip(chunks, emb_scores):
+            if score >= min_score:
+                selected.append((chunk, score))
+
+        # 按（來源權重 * 分數）重新排序
+        selected.sort(key=lambda x: self._get_source_weight(x[0]) * x[1], reverse=True)
+
+        # 截取前 max_count 個
+        return [c for c, _ in selected[:max_count]]
+
+    def _deduplicate_chunks(self, chunks: list, similarity_threshold: float = 0.85) -> list:
+        """P0 改進：Chunk 去重（尤其 web/OCR 來源容易重複）
+
+        使用 jaccard similarity 判斷兩個 chunk 是否重複
+
+        Args:
+            chunks: chunk 列表
+            similarity_threshold: 相似度門檻，超過則視為重複
+
+        Returns:
+            去重後的 chunk 列表
+        """
+        if not chunks or len(chunks) <= 1:
+            return chunks
+
+        def get_tokens(text: str) -> set:
+            """將文字轉換為 token set"""
+            words = re.findall(r'\b[a-zA-Z0-9_]+\b', text.lower())
+            return set(words)
+
+        def jaccard_similarity(set1: set, set2: set) -> float:
+            """計算 Jaccard 相似度"""
+            if not set1 or not set2:
+                return 0.0
+            intersection = len(set1 & set2)
+            union = len(set1 | set2)
+            return intersection / union if union > 0 else 0.0
+
+        # 預計算所有 chunk 的 token set
+        chunk_tokens = []
+        for chunk in chunks:
+            content = chunk.get('content', '')
+            tokens = get_tokens(content)
+            chunk_tokens.append(tokens)
+
+        # 去重：保留每組相似 chunks 中的第一個
+        keep_indices = []
+        for i in range(len(chunks)):
+            is_duplicate = False
+            for kept_idx in keep_indices:
+                sim = jaccard_similarity(chunk_tokens[i], chunk_tokens[kept_idx])
+                if sim >= similarity_threshold:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                keep_indices.append(i)
+
+        return [chunks[i] for i in keep_indices]
+
+    def _filter_noisy_chunks(self, chunks: list) -> list:
+        """P0 改進：過濾噪音 chunk（web/OCR 來源的常見問題）
+
+        過濾條件：
+        1. 內容太短（< 50 字元）
+        2. 重複字元比例過高（OCR 錯誤特徵）
+        3. 幾乎全是標點或數字（無意義內容）
+        """
+        if not chunks:
+            return chunks
+
+        MIN_CONTENT_LEN = 50
+        MAX_REPEAT_RATIO = 0.5  # 重複字元比例上限
+        MIN_TEXT_RATIO = 0.3    # 有意義文字比例下限
+
+        filtered = []
+        for chunk in chunks:
+            content = chunk.get('content', '')
+
+            # 檢查 1：內容長度
+            if len(content) < MIN_CONTENT_LEN:
+                continue
+
+            # 檢查 2：重複字元比例（偵測 OCR 錯誤如 "......." 或 "======"）
+            char_counts = {}
+            for c in content:
+                char_counts[c] = char_counts.get(c, 0) + 1
+            if char_counts:
+                max_char_count = max(char_counts.values())
+                repeat_ratio = max_char_count / len(content)
+                if repeat_ratio > MAX_REPEAT_RATIO:
+                    continue
+
+            # 檢查 3：有意義文字比例（字母+中文）
+            meaningful_chars = sum(1 for c in content if c.isalpha() or '\u4e00' <= c <= '\u9fff')
+            text_ratio = meaningful_chars / len(content)
+            if text_ratio < MIN_TEXT_RATIO:
+                continue
+
+            filtered.append(chunk)
+
+        return filtered
+
     def _should_expand_query(self, candidates: list, question: str = "",
                              threshold: float = None) -> bool:
         """判斷是否需要 Query Expansion
@@ -1474,6 +1638,9 @@ English:"""
         if not candidates:
             return "", "", empty_metadata
 
+        # P0 改進：應用來源權重（spec/manual/api 優先）
+        candidates = self._apply_source_weighting(candidates)
+
         # 動態門檻：短問題用較低門檻，嚴格模式用較高門檻
         query_tokens = self._estimate_tokens(question)
         if is_strict_mode:
@@ -1527,7 +1694,40 @@ English:"""
         if not top_chunks:
             return "", "", empty_metadata
 
+        # P0 改進：計算 embedding scores 供污染風險控制使用
+        q_emb_prelim = q_emb if USE_MMR else self._get_embedding(question)
+        prelim_emb_scores = []
+        for c in top_chunks:
+            c_emb = c.get("embedding", [])
+            if c_emb and q_emb_prelim:
+                prelim_emb_scores.append(self._cosine_similarity(q_emb_prelim, c_emb))
+            else:
+                prelim_emb_scores.append(0.0)
+
+        # P0 改進：預估污染風險
+        prelim_unique_sources = set(c.get("source", "") for c in top_chunks)
+        prelim_variance = 0.0
+        if len(prelim_emb_scores) >= 2:
+            prelim_mean = sum(prelim_emb_scores) / len(prelim_emb_scores)
+            prelim_variance = sum((s - prelim_mean) ** 2 for s in prelim_emb_scores) / len(prelim_emb_scores)
+
+        prelim_pollution_risk = "low"
+        if len(prelim_unique_sources) > 3 and prelim_variance < 0.02:
+            prelim_pollution_risk = "high"
+        elif len(prelim_unique_sources) > 2 and is_high_risk:
+            prelim_pollution_risk = "medium"
+
+        # P0 改進：根據污染風險控制 REF 數量，寧缺勿濫
+        if prelim_pollution_risk in ('medium', 'high'):
+            top_chunks = self._select_with_pollution_control(
+                top_chunks, prelim_pollution_risk, prelim_emb_scores
+            )
+
         merged_chunks = self._merge_adjacent_chunks(top_chunks)
+
+        # P0 改進：去重和噪音過濾（尤其 web/OCR 來源）
+        merged_chunks = self._filter_noisy_chunks(merged_chunks)
+        merged_chunks = self._deduplicate_chunks(merged_chunks)
 
         has_spec = any(chunk.get('type') == 'spec' for chunk in merged_chunks)
         has_warning = any(chunk.get('type') == 'warning' for chunk in merged_chunks)

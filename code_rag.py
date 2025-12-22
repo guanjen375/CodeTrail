@@ -33,7 +33,7 @@ from config import (
     OLLAMA_EMBEDDINGS_URL, OLLAMA_GENERATE_URL,
     USE_RERANKER, RERANKER_MODEL
 )
-from utils import should_ignore_file, should_ignore_dir
+from utils import should_ignore_file, should_ignore_dir, get_cached_scan_result, set_scan_cache
 
 # 導入 AST 解析器
 from ast_parser import parse_file, get_parser_status
@@ -128,7 +128,10 @@ class CodeRAG:
         return hashlib.md5("\n".join(files).encode()).hexdigest()
 
     def _scan_code_files(self) -> dict:
-        """掃描所有程式碼檔案，返回 {rel_path: {"filepath": Path, "hash": str}}"""
+        """掃描所有程式碼檔案，返回 {rel_path: {"filepath": Path, "hash": str}}
+
+        P0 改進：使用共用快取減少重複掃描
+        """
         cache_base = CODE_RAG_CACHE_FILE.replace('.json', '')
         skip_files = {
             CODE_RAG_CACHE_FILE,
@@ -136,8 +139,26 @@ class CodeRAG:
             f"{cache_base}_emb.npz",
         }
 
+        # P0 改進：檢查共用快取
+        cached = get_cached_scan_result(str(self.folder))
+        if cached is not None:
+            # 快取格式是 [{"path": str, "size": int}, ...]
+            # 轉換為我們需要的格式並計算 hash
+            result = {}
+            for item in cached:
+                rel_path = item["path"]
+                if Path(rel_path).name in skip_files:
+                    continue
+                filepath = self.folder / rel_path
+                file_hash = self._compute_file_hash(filepath)
+                if file_hash:
+                    result[rel_path] = {"filepath": filepath, "hash": file_hash}
+            return result
+
         result = {}
         folder_path = Path(self.folder)
+        files_for_cache = []
+
         for dirpath, dirnames, filenames in os.walk(self.folder):
             rel_dir = Path(dirpath).relative_to(folder_path)
             dirnames[:] = [d for d in dirnames if not should_ignore_dir(rel_dir / d)]
@@ -156,6 +177,16 @@ class CodeRAG:
                 file_hash = self._compute_file_hash(filepath)
                 if file_hash:
                     result[rel_path] = {"filepath": filepath, "hash": file_hash}
+                    # 加入快取格式
+                    try:
+                        stat = filepath.stat()
+                        files_for_cache.append({"path": rel_path, "size": stat.st_size})
+                    except OSError:
+                        pass
+
+        # P0 改進：設定共用快取
+        if files_for_cache:
+            set_scan_cache(str(self.folder), files_for_cache)
 
         return result
 
@@ -270,6 +301,9 @@ class CodeRAG:
         - 使用 AST/tree-sitter 解析，比 regex 更精準
         - 符號包含完整範圍（start_line, end_line）
         - 支援 method 的 parent class 資訊
+
+        P0 改進（v3）：
+        - 支援 signature, docstring, type_hints
         """
         rel_path = str(filepath.relative_to(self.folder))
 
@@ -294,6 +328,13 @@ class CodeRAG:
             # 如果有 parent（method 屬於某個 class），記錄下來
             if sym.parent:
                 symbol_dict['parent'] = sym.parent
+            # P0 改進：擴充欄位
+            if sym.signature:
+                symbol_dict['signature'] = sym.signature
+            if sym.docstring:
+                symbol_dict['docstring'] = sym.docstring[:300]
+            if sym.type_hints:
+                symbol_dict['type_hints'] = sym.type_hints
 
             symbols.append(symbol_dict)
 
@@ -306,10 +347,42 @@ class CodeRAG:
         return list(result) if result else []
 
     def _build_embed_text(self, item: dict) -> str:
-        """Build embed text from a symbol/item dict."""
-        parent_info = f" in {item.get('parent', '')}" if item.get('parent') else ""
-        context = item.get('context', '')[:300]
-        return f"{item.get('path', '')} {item.get('type', '')} {item.get('symbol', '')}{parent_info} {context}"
+        """Build embed text from a symbol/item dict.
+
+        P0 改進：擴充 embedding 內容（signature, docstring, type_hints, parent）
+        """
+        parts = []
+
+        # 基本資訊
+        parts.append(item.get('path', ''))
+        parts.append(item.get('type', ''))
+        parts.append(item.get('symbol', ''))
+
+        # P0 改進：加入 parent（類別/繼承）
+        if item.get('parent'):
+            parts.append(f"in {item['parent']}")
+
+        # P0 改進：加入 signature（函式簽名，優先於 context）
+        if item.get('signature'):
+            parts.append(item['signature'])
+
+        # P0 改進：加入 docstring（截取前 200 字元）
+        if item.get('docstring'):
+            parts.append(item['docstring'][:200])
+
+        # P0 改進：加入 type hints
+        if item.get('type_hints'):
+            parts.append(f"types: {item['type_hints']}")
+
+        # Context（補充剩餘空間）
+        context = item.get('context', '')
+        # 計算已用長度，調整 context 截取
+        used_len = sum(len(p) for p in parts)
+        max_context = max(100, 400 - used_len)
+        if context:
+            parts.append(context[:max_context])
+
+        return ' '.join(parts)
 
     def _index_single_file(self, filepath: Path, rel_path: str,
                            compute_embeddings: bool = True) -> tuple:
@@ -335,6 +408,13 @@ class CodeRAG:
                 index_entry['end_line'] = sym['end_line']
             if 'parent' in sym:
                 index_entry['parent'] = sym['parent']
+            # P0 改進：儲存擴充欄位
+            if 'signature' in sym and sym['signature']:
+                index_entry['signature'] = sym['signature']
+            if 'docstring' in sym and sym['docstring']:
+                index_entry['docstring'] = sym['docstring'][:300]
+            if 'type_hints' in sym and sym['type_hints']:
+                index_entry['type_hints'] = sym['type_hints']
 
             file_symbols.append(index_entry)
             file_embeddings.append(emb if emb else [])

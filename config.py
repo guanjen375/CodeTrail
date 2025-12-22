@@ -162,6 +162,35 @@ MMR_LAMBDA = 0.7
 KEYWORD_WEIGHT = 0.3
 
 # ============================================================
+# P0 改進：Source Type Weighting（來源權重）
+# ============================================================
+# 權威來源（spec/manual/api）權重提高，讓高品質資料優先
+# 低可靠來源（chat/diagram/web）權重降低，避免噪音污染
+SOURCE_TYPE_WEIGHTS = {
+    'spec': 1.3,        # 規格書：最權威
+    'api': 1.25,        # API 參考：權威
+    'manual': 1.2,      # 手冊：權威
+    'warning': 1.15,    # 警告/限制：重要
+    'guide': 1.0,       # 教學指南：標準
+    'faq': 1.0,         # FAQ：標準
+    'doc': 1.0,         # 一般文件：標準
+    'chat': 0.75,       # 聊天記錄：降權（容易有錯誤或過時資訊）
+    'diagram': 0.8,     # 圖表/截圖：降權（OCR 可能不準）
+    'web': 0.85,        # 網頁內容：降權（品質不一）
+    'default': 1.0,     # 未知類型：標準
+}
+
+# Context 污染風險控制
+# 當污染風險高時，減少 REF 數量，寧缺勿濫
+POLLUTION_RISK_TOP_K = {
+    'low': 5,           # 低風險：標準數量
+    'medium': 4,        # 中風險：減少一些
+    'high': 3,          # 高風險：只取最相關的
+}
+# 高污染風險時的最低 embedding score 門檻
+POLLUTION_RISK_MIN_SCORE = 0.40
+
+# ============================================================
 # P0 改進：Hybrid Retrieval + BM25 + RRF + Reranker 設定
 # ============================================================
 # BM25 參數（經典 Okapi BM25）
@@ -176,7 +205,7 @@ RRF_ENABLED = True                   # 啟用 RRF 融合（取代線性加權）
 # Reranker 條件式觸發（平衡精準度與速度）
 # 改進：高信心時跳過 rerank，減少不必要的延遲
 RERANKER_ALWAYS_ON = False           # False = 條件式觸發，高信心時跳過
-RERANKER_TOP_N = 8                   # Rerank 後取 top N（速度優先：10->8）
+RERANKER_TOP_N = 6                   # P0 改進：Rerank 後取 top N（速度優先：8->6）
 RERANKER_SKIP_THRESHOLD = 0.55       # top_emb_score > 此值時跳過 rerank（放寬：0.65->0.55）
 
 # 動態門檻：Margin-based 判斷
@@ -225,7 +254,7 @@ SENTENCE_EVIDENCE_WHITELIST = [
 MULTI_QUERY_ENABLED = True           # 啟用 multi-query
 MULTI_QUERY_COUNT = 2                # 生成幾個 query 變體（降低延遲：3->2）
 # 條件式啟用：避免 query drift
-MULTI_QUERY_MIN_SCORE_TRIGGER = 0.50 # top_emb_score < 此值才啟用 multi-query
+MULTI_QUERY_MIN_SCORE_TRIGGER = 0.45 # P0 改進：top_emb_score < 此值才啟用 multi-query（更嚴格：0.50->0.45）
 MULTI_QUERY_SKIP_NUMERIC = True      # 數值查詢（含數字/最大/預設）跳過 expansion
 MULTI_QUERY_TYPES = [
     "key_terms",                     # 抽取關鍵術語
