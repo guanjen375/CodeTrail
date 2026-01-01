@@ -135,7 +135,7 @@ python main.py --qa
 ### 2. 拉取模型
 
 ```bash
-ollama pull qwen3-coder:30b              # 主模型
+ollama pull qwen3:30b-a3b                # 主模型（2507 版，含 thinking 能力）
 ollama pull qwen3-vl:30b-a3b             # VL 模型（圖片辨識）
 ollama pull bge-m3                       # Embedding 模型
 ollama pull qllama/bge-reranker-v2-m3    # Reranker 模型（可選）
@@ -375,7 +375,7 @@ python data_flywheel.py export --output training.jsonl
 
 ```python
 # 模型設定
-MODEL = "qwen3-coder:30b"
+MODEL = "qwen3:30b-a3b"      # 2507 版，推理能力更強
 VL_MODEL = "qwen3-vl:30b-a3b"
 
 # Context 長度（根據 GPU VRAM 調整）

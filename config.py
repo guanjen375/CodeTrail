@@ -15,7 +15,7 @@ OLLAMA_CHAT_URL = f"{OLLAMA_BASE_URL}/api/chat"
 OLLAMA_EMBEDDINGS_URL = f"{OLLAMA_BASE_URL}/api/embeddings"
 OLLAMA_TAGS_URL = f"{OLLAMA_BASE_URL}/api/tags"
 OLLAMA_PS_URL = f"{OLLAMA_BASE_URL}/api/ps"
-MODEL = "qwen3-coder:30b"
+MODEL = "qwen3:30b-a3b"
 VL_MODEL = "qwen3-vl:30b-a3b"
 
 # Context 長度設定
