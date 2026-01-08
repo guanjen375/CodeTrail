@@ -74,6 +74,12 @@ def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
         resp.raise_for_status()
         data = resp.json()
 
+        # 檢查 Ollama 錯誤（如模型不存在）
+        if "error" in data:
+            error_msg = data["error"]
+            print(f"[ERROR] Ollama 錯誤: {error_msg}")
+            return {"content": f"[ERROR] Ollama 錯誤: {error_msg}", "tool_calls": [], "done_reason": "error"}
+
         message = data.get("message", {})
 
         return {
