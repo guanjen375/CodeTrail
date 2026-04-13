@@ -45,7 +45,7 @@ from agent import run_agent, handle_followup
 from media import process_images, process_binary, process_file, set_sandbox_root
 from http_client import close_session
 from web import fetch_from_url, cleanup_temp_dir
-from remote import parse_mcp_uri, RemoteToolExecutor
+from remote import parse_mcp_uri, RemoteToolExecutor, run_mcp_agent
 from data_flywheel import record_interaction, DATA_COLLECT_ENABLED
 
 
@@ -396,7 +396,7 @@ def main():
 
         return None  # QA 模式不需要清理 temp_dir
 
-    # MCP 遠端模式：透過 SSH 按需存取遠端檔案
+    # MCP 遠端模式：完全獨立，透過 SSH 按需存取遠端檔案
     if mcp_uri:
         print("=" * 50)
         print("[MODE] MCP 遠端模式 (--mcp)")
@@ -420,8 +420,10 @@ def main():
             sys.exit(1)
         print(f"[MCP] {msg}")
 
-        # 設定 MCP 模式 flag（讓 get_native_tools 只回傳基本工具）
-        config.MCP_MODE = True
+        # 預掃描遠端目錄結構（給模型一個起點地圖）
+        print("[MCP] 掃描遠端目錄結構...")
+        dir_listing = remote_exec.list_files(".", depth=2)
+        print(f"[MCP] 掃描完成")
 
         # 檢查 GPU
         gpu_ok, gpu_status = check_ollama_gpu()
@@ -429,35 +431,31 @@ def main():
         print(f"[CTX] Context: {NUM_CTX:,} tokens")
         print(gpu_status)
 
-        # 載入本地知識庫（可選，搭配 --kb 使用）
+        # 載入本地知識庫（唯一可搭配 MCP 的功能）
         kb = KnowledgeBase(kb_path)
         if kb.loaded:
             print(kb.get_status())
 
         print("-" * 50)
 
-        mcp_label = f"{ssh_info['user']}@{ssh_info['host']}"
-
         # 單次模式
         if question:
             knowledge_ctx = ""
-            knowledge_display = ""
             if kb and kb.loaded:
                 print("[KB] 查詢知識庫...")
-                knowledge_ctx, knowledge_display, _ = kb.query(question)
-            if knowledge_display:
-                print(knowledge_display)
+                knowledge_ctx, display, _ = kb.query(question)
+                if display:
+                    print(display)
 
             print("\n" + "=" * 50)
             print("[NOTE] 回答:\n")
-            result = run_agent(mcp_label, question,
-                             knowledge_ctx=knowledge_ctx,
-                             remote_executor=remote_exec)
+            run_mcp_agent(remote_exec, question,
+                         dir_listing=dir_listing,
+                         knowledge_ctx=knowledge_ctx)
             return None
 
         # 互動模式
-        print(f"進入 MCP 互動模式（遠端: {mcp_label}）")
-        print("輸入問題讓模型自行探索遠端檔案（輸入 q 離開）\n")
+        print(f"進入 MCP 互動模式（輸入 q 離開）\n")
 
         while True:
             try:
@@ -469,25 +467,24 @@ def main():
                     continue
 
                 knowledge_ctx = ""
-                knowledge_display = ""
                 if kb and kb.loaded:
                     print("[KB] 查詢知識庫...")
-                    knowledge_ctx, knowledge_display, _ = kb.query(q)
-                if knowledge_display:
-                    print(knowledge_display)
+                    knowledge_ctx, display, _ = kb.query(q)
+                    if display:
+                        print(display)
 
                 print("\n" + "=" * 50)
                 print("[NOTE] 回答:\n")
-                run_agent(mcp_label, q,
-                         knowledge_ctx=knowledge_ctx,
-                         remote_executor=remote_exec)
+                run_mcp_agent(remote_exec, q,
+                             dir_listing=dir_listing,
+                             knowledge_ctx=knowledge_ctx)
                 print()
 
             except KeyboardInterrupt:
                 print("\n[BYE] 再見!")
                 break
 
-        return None  # MCP 模式不需要清理 temp_dir
+        return None
 
     # 網頁模式：從 Git URL 下載程式碼
     if web_url:
