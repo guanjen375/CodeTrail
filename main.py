@@ -45,6 +45,7 @@ from agent import run_agent, handle_followup
 from media import process_images, process_binary, process_file, set_sandbox_root
 from http_client import close_session
 from web import fetch_from_url, cleanup_temp_dir
+from remote import fetch_from_remote, cleanup_remote_temp
 from data_flywheel import record_interaction, DATA_COLLECT_ENABLED
 
 
@@ -212,7 +213,8 @@ def main():
     enable_patch = False
     use_container = False
     web_url = None  # 網頁模式 URL
-    temp_dir = None  # 網頁模式暫存目錄
+    mcp_uri = None  # MCP 遠端模式 URI (user@host:/path)
+    temp_dir = None  # 網頁/MCP 模式暫存目錄
     qa_mode = False  # QA 模式：不掃專案、不建 Code RAG，直接問答
     system_rules_file = None  # 自定義規則檔案路徑
 
@@ -231,6 +233,11 @@ def main():
             enable_patch = True
         elif arg == "--container":
             use_container = True
+        elif arg == "--mcp" and i + 1 < len(args):
+            mcp_uri = args[i + 1]
+            i += 1
+        elif arg.startswith("--mcp="):
+            mcp_uri = arg.split("=", 1)[1]
         elif arg == "--web" and i + 1 < len(args):
             web_url = args[i + 1]
             i += 1
@@ -265,8 +272,8 @@ def main():
                 question = arg
             else:
                 question = question + " " + arg
-        elif web_url is not None:
-            # 網頁模式下，非 flag 參數都視為問題（可以有空格，與 QA 模式一致）
+        elif web_url is not None or mcp_uri is not None:
+            # 網頁/MCP 模式下，非 flag 參數都視為問題（可以有空格，與 QA 模式一致）
             if question is None:
                 question = arg
             else:
@@ -388,6 +395,21 @@ def main():
                 break
 
         return None  # QA 模式不需要清理 temp_dir
+
+    # MCP 遠端模式：從 SSH 同步檔案
+    if mcp_uri:
+        print("=" * 50)
+        print("[MODE] MCP 遠端模式 (--mcp)")
+        print("=" * 50)
+
+        temp_dir, ssh_info = fetch_from_remote(mcp_uri)
+        if not temp_dir:
+            print("[ERROR] 無法從遠端同步檔案")
+            sys.exit(1)
+
+        folder = temp_dir
+        print(f"[MCP] 使用暫存目錄: {folder}")
+        print("-" * 50)
 
     # 網頁模式：從 Git URL 下載程式碼
     if web_url:

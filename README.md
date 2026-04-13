@@ -18,6 +18,7 @@
 | Python | 3.10+ | 3.11+ | 使用 type hints、match-case 等新語法 |
 | Ollama | 0.1.0+ | 最新版 | 本地 LLM 推理引擎 |
 | Git | 2.0+ | 最新版 | 用於專案分析和 `--web` 模式 |
+| rsync 或 scp | - | 最新版 | `--mcp` 遠端模式需要（透過 SSH 同步檔案） |
 
 ### 硬體需求
 
@@ -116,6 +117,9 @@ python main.py /path/to/untrusted --run-tests --container
 # 分析 GitHub repo
 python main.py --web https://github.com/user/repo
 
+# 分析遠端主機上的專案（透過 SSH）
+python main.py --mcp user@host:/path/to/project
+
 # === 不需要專案的快速問答（QA 模式）===
 
 # QA 模式：不掃專案，直接問答
@@ -168,6 +172,7 @@ python main.py [專案路徑] [問題] [選項]
 | `--full` | 強制完整模式（一次讀入所有程式碼，適合小專案 < 200KB） |
 | `--agent` | 強制 Agent 模式（動態探索，適合大專案） |
 | `--web URL` | 網頁模式，分析 GitHub/GitLab 上的公開 repo |
+| `--mcp URI` | 遠端模式，透過 SSH 同步遠端主機的檔案進行分析 |
 
 ### 知識庫與規則
 
@@ -343,6 +348,37 @@ python main.py /path/to/untrusted --run-tests --container
 python main.py --web https://github.com/user/repo
 python main.py --web https://github.com/user/repo/tree/main/src  # 只分析子目錄
 ```
+
+### 遠端模式（--mcp）
+
+透過 SSH 同步遠端主機上的檔案到本地暫存目錄，然後進行分析。適合分析部署在遠端伺服器上的專案程式碼：
+
+```bash
+# 基本用法：同步遠端目錄並進入互動模式
+python main.py --mcp kjwang@140.96.28.10:/home/kjwang
+
+# 帶問題的單次分析
+python main.py --mcp kjwang@140.96.28.10:/home/kjwang "這個專案的架構是什麼"
+
+# 搭配知識庫
+python main.py --mcp kjwang@140.96.28.10:/home/kjwang --kb my_kb.json "查詢相關文件"
+
+# 指定 SSH port（非預設 22）
+python main.py --mcp kjwang@140.96.28.10:2222:/home/kjwang
+
+# 搭配 Agent 模式
+python main.py --mcp kjwang@140.96.28.10:/home/kjwang --agent "分析這個 bug"
+```
+
+**URI 格式**：
+- `user@host:/path` — 使用 SSH 預設 port（22）
+- `user@host:port:/path` — 指定 port
+
+**前提條件**：
+- 系統需要有 `rsync`（優先）或 `scp`
+- SSH key 已設定好免密碼登入到目標主機
+- 同步時會自動排除 `.git`、`node_modules`、`__pycache__` 等目錄
+- 程式結束後暫存目錄會自動清理
 
 ### 資料收集（Fine-tuning 用）
 
