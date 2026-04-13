@@ -12,9 +12,12 @@
     python main.py --mcp user@host --kb docs.json
 """
 
+import os
 import re
 import json
+import atexit
 import subprocess
+import tempfile
 from typing import Optional, Dict
 
 from config import (
@@ -57,24 +60,51 @@ def parse_mcp_uri(uri: str) -> Optional[Dict[str, str]]:
 # SSH 遠端工具執行器
 # ============================================================
 class RemoteToolExecutor:
-    """透過 SSH 在遠端執行工具，提供 list_files / read_file / grep / file_info"""
+    """透過 SSH 在遠端執行工具，提供 list_files / read_file / grep / file_info
+
+    使用 SSH ControlMaster 機制：
+    - 第一次連線（test_connection）為互動式，可輸入密碼
+    - 建立 ControlMaster socket 後，後續所有工具呼叫都複用同一條連線
+    - 程式結束時自動關閉 socket
+    """
 
     def __init__(self, ssh_info: Dict[str, str]):
         self.user = ssh_info["user"]
         self.host = ssh_info["host"]
         self.port = ssh_info["port"]
         self._home_dir = None
+        # ControlMaster socket 路徑
+        self._socket_path = os.path.join(
+            tempfile.gettempdir(),
+            f"mcp_ssh_{self.user}_{self.host}_{self.port}"
+        )
+        # 程式結束時自動清理 socket
+        atexit.register(self._cleanup_socket)
+
+    def _cleanup_socket(self):
+        """關閉 ControlMaster 連線"""
+        try:
+            subprocess.run(
+                ["ssh", "-O", "exit",
+                 "-o", f"ControlPath={self._socket_path}",
+                 f"{self.user}@{self.host}"],
+                capture_output=True, timeout=5
+            )
+        except Exception:
+            pass
 
     def _ssh_cmd_base(self) -> list:
+        """SSH 命令前綴（複用 ControlMaster socket）"""
         return [
             "ssh", "-p", self.port,
             "-o", "StrictHostKeyChecking=no",
             "-o", "ConnectTimeout=10",
-            "-o", "BatchMode=yes",
+            "-o", f"ControlPath={self._socket_path}",
             f"{self.user}@{self.host}",
         ]
 
     def _run_ssh(self, remote_cmd: str, timeout: int = 30) -> tuple:
+        """透過已建立的 ControlMaster 執行遠端命令"""
         cmd = self._ssh_cmd_base() + [remote_cmd]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -85,12 +115,40 @@ class RemoteToolExecutor:
             return -1, "", str(e)
 
     def test_connection(self) -> tuple:
-        rc, stdout, stderr = self._run_ssh("echo ok && whoami && pwd", timeout=15)
-        if rc == 0:
-            lines = stdout.strip().split('\n')
-            self._home_dir = lines[2] if len(lines) >= 3 else "~"
-            return True, f"連線成功（home: {self._home_dir}）"
-        return False, f"連線失敗: {stderr.strip()}"
+        """建立 SSH 連線（互動式，支援密碼輸入）
+
+        此方法會建立 ControlMaster socket，後續所有工具呼叫都複用這條連線。
+        如果需要密碼，會在終端機顯示密碼提示。
+        """
+        # 建立 ControlMaster 連線（互動式，stdin/stderr 不攔截，讓密碼提示顯示在終端）
+        master_cmd = [
+            "ssh", "-p", self.port,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=15",
+            "-o", "ControlMaster=yes",
+            "-o", f"ControlPath={self._socket_path}",
+            "-o", "ControlPersist=600",
+            f"{self.user}@{self.host}",
+            "echo ok && whoami && pwd",
+        ]
+        try:
+            # 不攔截 stdin/stderr → 密碼提示會顯示在終端
+            # 只攔截 stdout → 取得 whoami/pwd 結果
+            result = subprocess.run(
+                master_cmd,
+                stdout=subprocess.PIPE,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                self._home_dir = lines[2] if len(lines) >= 3 else "~"
+                return True, f"連線成功（home: {self._home_dir}）"
+            return False, "連線失敗（密碼錯誤或主機無法連線）"
+        except subprocess.TimeoutExpired:
+            return False, "連線逾時（60s）"
+        except Exception as e:
+            return False, f"連線失敗: {e}"
 
     @property
     def home_dir(self) -> str:

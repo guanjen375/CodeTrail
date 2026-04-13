@@ -18,7 +18,7 @@
 | Python | 3.10+ | 3.11+ | 使用 type hints、match-case 等新語法 |
 | Ollama | 0.1.0+ | 最新版 | 本地 LLM 推理引擎 |
 | Git | 2.0+ | 最新版 | 用於專案分析和 `--web` 模式 |
-| SSH | - | 最新版 | `--mcp` 遠端模式需要（透過 SSH 按需存取遠端檔案） |
+| OpenSSH | 6.7+ | 最新版 | `--mcp` 遠端模式需要（需支援 ControlMaster 連線複用） |
 
 ### 硬體需求
 
@@ -411,7 +411,10 @@ python main.py --mcp kjwang@140.96.28.10:2222
 
 **可用工具**：`list_files`、`read_file`、`grep`、`file_info`（皆透過 SSH 在遠端執行）
 
-**前提條件**：本地需有 `ssh`，且 SSH key 已設定免密碼登入
+**前提條件**：
+- 本地需安裝 OpenSSH 6.7+（需支援 ControlMaster）
+- 首次連線時會提示輸入密碼（或自動使用 SSH key）
+- 連線建立後透過 ControlMaster 複用，後續工具呼叫不再重複驗證
 
 ### 資料收集（Fine-tuning 用）
 
