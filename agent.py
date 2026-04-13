@@ -458,9 +458,13 @@ def handle_followup(question: str, prev_qa: list, knowledge_ctx: str = "",
 
 def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = None,
               knowledge_ctx: str = "", code_rag=None, max_loops: int = None,
-              return_metadata: bool = False) -> str | tuple:
-    """執行 Agent 模式"""
-    executor = ToolExecutor(folder)
+              return_metadata: bool = False, remote_executor=None) -> str | tuple:
+    """執行 Agent 模式
+
+    Args:
+        remote_executor: 若提供，使用遠端 executor（MCP 模式）而非本地 ToolExecutor
+    """
+    executor = remote_executor if remote_executor is not None else ToolExecutor(folder)
     prev_qa = prev_qa or []
     effective_max_loops = max_loops if max_loops is not None else MAX_TOOL_LOOPS
 
@@ -498,8 +502,9 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
     if has_stack_trace and not is_bug_fix:
         is_bug_fix = True
 
-    # Stack trace 位置提取
-    stack_locations = extract_stack_locations(question)
+    # Stack trace 位置提取（MCP 遠端模式跳過，因為無法本地解析路徑）
+    is_remote = remote_executor is not None
+    stack_locations = extract_stack_locations(question) if not is_remote else []
     stack_preread_context = ""
 
     if stack_locations:
@@ -577,7 +582,7 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
         preread_files.add(filepath)
         preread_files.add(Path(filepath).name)
 
-    if code_rag and CODE_RAG_ENABLED:
+    if code_rag and CODE_RAG_ENABLED and not is_remote:
         rag_top_k = CODE_RAG_TOP_K_BUG if is_bug_fix else CODE_RAG_TOP_K
         candidates = code_rag.query(question, top_k=rag_top_k, is_bug_fix=is_bug_fix)
 
@@ -657,9 +662,15 @@ def run_agent(folder: str, question: str, image_ctx: str = "", prev_qa: list = N
     if config.CUSTOM_SYSTEM_RULES:
         custom_rules_section = f"\n【自定義規則】\n{config.CUSTOM_SYSTEM_RULES}\n"
 
+    # MCP 遠端模式的說明
+    if is_remote:
+        location_desc = f"遠端主機: {folder}（透過 SSH 存取，所有工具操作都在遠端執行）"
+    else:
+        location_desc = f"專案路徑: {folder}"
+
     system_prompt = f"""你是程式碼分析 Agent。透過工具探索專案來回答用戶問題。
 
-專案路徑: {folder}
+{location_desc}
 {history_context}
 {code_rag_context}
 {stack_preread_context}

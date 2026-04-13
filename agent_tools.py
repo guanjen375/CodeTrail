@@ -283,7 +283,12 @@ def get_native_tools() -> list:
     """動態決定要包含哪些工具
 
     改進：使用函數而非常量，讓 --run-tests/--patch 可以在 main.py 處理完參數後生效
+    MCP 遠端模式：只提供基本工具（list_files, read_file, grep, file_info）
     """
+    # MCP 模式只提供基本工具
+    if getattr(config, 'MCP_MODE', False):
+        return list(_BASE_TOOLS)
+
     tools = list(_BASE_TOOLS)
 
     if config.RUN_COMMAND_ENABLED:
