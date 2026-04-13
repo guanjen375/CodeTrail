@@ -66,7 +66,7 @@ class RemoteToolExecutor:
     使用 SSH ControlMaster 機制：
     - 第一次連線（test_connection）為互動式，可輸入密碼
     - 建立 ControlMaster socket 後，後續所有工具呼叫都複用同一條連線
-    - 預設探索範圍是遠端根目錄 `/`，可用 `~` 回到使用者 home
+    - 預設探索範圍是使用者 home 目錄，可用絕對路徑存取其他位置
     - 程式結束時自動關閉 socket
     """
 
@@ -74,7 +74,6 @@ class RemoteToolExecutor:
         self.user = ssh_info["user"]
         self.host = ssh_info["host"]
         self.port = ssh_info["port"]
-        self._root_dir = "/"
         self._home_dir = None
         # ControlMaster socket 路徑
         self._socket_path = os.path.join(
@@ -160,20 +159,15 @@ class RemoteToolExecutor:
             self._home_dir = stdout.strip() if rc == 0 else "~"
         return self._home_dir
 
-    @property
-    def server_root(self) -> str:
-        return self._root_dir
-
     def _resolve_path(self, path: str) -> str:
-        if not path or path == ".":
-            return self.server_root
-        if path == "~":
+        """解析路徑：相對路徑基於 home，絕對路徑直接使用"""
+        if not path or path == "." or path == "~":
             return self.home_dir
         if path.startswith("~/"):
             suffix = path[2:].lstrip("/")
             return self.home_dir if not suffix else f"{self.home_dir}/{suffix}"
         if not path.startswith("/"):
-            return f"{self.server_root.rstrip('/')}/{path.lstrip('/')}"
+            return f"{self.home_dir.rstrip('/')}/{path.lstrip('/')}"
         return path
 
     def list_files(self, path: str = ".", depth: int = 2) -> str:
@@ -343,7 +337,7 @@ _MCP_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "目錄路徑，預設 '.'（伺服器根目錄 /）；可用 '~' 表示 home"},
+                    "path": {"type": "string", "description": "目錄路徑，預設 '.'（home 目錄）；可用絕對路徑如 '/etc' 存取其他位置"},
                     "depth": {"type": "integer", "description": "遞迴深度，預設 2"}
                 },
                 "required": []
@@ -358,7 +352,7 @@ _MCP_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "檔案路徑（相對於伺服器根目錄 /、絕對路徑，或 ~/...）"},
+                    "path": {"type": "string", "description": "檔案路徑（相對於 home 目錄或絕對路徑）"},
                     "start_line": {"type": "integer", "description": "起始行號"},
                     "end_line": {"type": "integer", "description": "結束行號"}
                 },
@@ -375,7 +369,7 @@ _MCP_TOOLS = [
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "搜尋字串"},
-                    "path": {"type": "string", "description": "搜尋目錄（預設從伺服器根目錄 / 開始）"},
+                    "path": {"type": "string", "description": "搜尋目錄（預設 home 目錄，可用絕對路徑）"},
                     "include": {"type": "string", "description": "檔案過濾，如 '*.py,*.c'"},
                     "context": {"type": "integer", "description": "顯示前後各 N 行上下文（預設 0）"}
                 },
@@ -488,24 +482,22 @@ def run_mcp_agent(executor: RemoteToolExecutor, question: str,
         knowledge_ctx: 知識庫上下文（可選，來自 --kb）
     """
     host_label = f"{executor.user}@{executor.host}"
-    root = executor.server_root
     home = executor.home_dir
 
     kb_section = f"\n【知識庫參考】\n{knowledge_ctx}\n" if knowledge_ctx else ""
 
-    system_prompt = f"""你是遠端主機分析 Agent。透過 SSH 工具探索 {host_label} 上你有權限讀取的檔案來回答用戶問題。
+    system_prompt = f"""你是遠端主機分析 Agent。透過 SSH 工具探索 {host_label} 上的檔案來回答用戶問題。
 
 遠端主機: {host_label}
-伺服器根目錄: {root}
-使用者 home 目錄: {home}
+工作目錄（home）: {home}
 
-【初始目錄摘要（從伺服器根目錄開始）】
+【目錄結構】
 {dir_listing}
 {kb_section}
 【路徑規則】
-1. 相對路徑一律視為相對於伺服器根目錄 `/`
-2. `~` 或 `~/...` 代表使用者 home 目錄
-3. grep/read_file 若回傳絕對路徑，後續直接沿用原路徑
+1. 相對路徑（如 `project/main.py`）基於 home 目錄 `{home}`
+2. 絕對路徑（如 `/etc/nginx/nginx.conf`）直接存取
+3. `~` 或 `~/...` 等同 home 目錄
 
 【回答規則】
 1. 優先根據工具取得的實際檔案內容回答，不要猜測
@@ -514,10 +506,10 @@ def run_mcp_agent(executor: RemoteToolExecutor, question: str,
 4. 使用繁體中文回答
 
 【工具使用規則】
-1. 你已經有伺服器根目錄的初始摘要，不要重複列出 `/`
-2. 需要縮小範圍時，用 list_files 探索特定子目錄
-3. 需要看某個檔案時，用 read_file 精準讀取
-4. 需要搜尋時，用 grep 並盡量加上適當路徑範圍
+1. 你已經有上面的目錄結構，不需要重複 list_files home 目錄
+2. 需要看某個檔案時，用 read_file 精準讀取
+3. 需要搜尋時，用 grep 加上適當的路徑範圍
+4. 需要看 home 以外的位置時，用絕對路徑（如 `/var/log`）
 5. 收集到足夠資訊後，直接用文字回答"""
 
     messages = [

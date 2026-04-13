@@ -420,9 +420,9 @@ def main():
             sys.exit(1)
         print(f"[MCP] {msg}")
 
-        # 預掃描伺服器根目錄（給模型一個全機器的起點地圖）
-        print("[MCP] 掃描伺服器根目錄結構...")
-        dir_listing = remote_exec.list_files("/", depth=2)
+        # 預掃描 home 目錄（模型的工作起點）
+        print("[MCP] 掃描 home 目錄結構...")
+        dir_listing = remote_exec.list_files(".", depth=3)
         print(f"[MCP] 掃描完成")
 
         # 檢查 GPU
