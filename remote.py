@@ -16,6 +16,7 @@ import os
 import re
 import json
 import atexit
+import shlex
 import subprocess
 import tempfile
 from typing import Optional, Dict
@@ -65,6 +66,7 @@ class RemoteToolExecutor:
     使用 SSH ControlMaster 機制：
     - 第一次連線（test_connection）為互動式，可輸入密碼
     - 建立 ControlMaster socket 後，後續所有工具呼叫都複用同一條連線
+    - 預設探索範圍是遠端根目錄 `/`，可用 `~` 回到使用者 home
     - 程式結束時自動關閉 socket
     """
 
@@ -72,6 +74,7 @@ class RemoteToolExecutor:
         self.user = ssh_info["user"]
         self.host = ssh_info["host"]
         self.port = ssh_info["port"]
+        self._root_dir = "/"
         self._home_dir = None
         # ControlMaster socket 路徑
         self._socket_path = os.path.join(
@@ -157,16 +160,26 @@ class RemoteToolExecutor:
             self._home_dir = stdout.strip() if rc == 0 else "~"
         return self._home_dir
 
+    @property
+    def server_root(self) -> str:
+        return self._root_dir
+
     def _resolve_path(self, path: str) -> str:
         if not path or path == ".":
+            return self.server_root
+        if path == "~":
             return self.home_dir
+        if path.startswith("~/"):
+            suffix = path[2:].lstrip("/")
+            return self.home_dir if not suffix else f"{self.home_dir}/{suffix}"
         if not path.startswith("/"):
-            return f"{self.home_dir}/{path}"
+            return f"{self.server_root.rstrip('/')}/{path.lstrip('/')}"
         return path
 
     def list_files(self, path: str = ".", depth: int = 2) -> str:
         depth = min(depth, 4)
         remote_path = self._resolve_path(path)
+        quoted_remote_path = shlex.quote(remote_path)
 
         excludes = (
             r" -name .git -o -name __pycache__ -o -name node_modules"
@@ -174,7 +187,7 @@ class RemoteToolExecutor:
             r" -o -name .cache -o -name .tox"
         )
         cmd = (
-            f"find {remote_path} -maxdepth {depth}"
+            f"find {quoted_remote_path} -maxdepth {depth}"
             f" \\( {excludes} \\) -prune -o -print"
             f" 2>/dev/null | head -500 | sort"
         )
@@ -202,8 +215,9 @@ class RemoteToolExecutor:
 
     def read_file(self, path: str, start_line: int = 1, end_line: Optional[int] = None) -> str:
         remote_path = self._resolve_path(path)
+        quoted_remote_path = shlex.quote(remote_path)
 
-        rc, stdout, _ = self._run_ssh(f"wc -l < {remote_path} 2>/dev/null")
+        rc, stdout, _ = self._run_ssh(f"wc -l < {quoted_remote_path} 2>/dev/null")
         if rc != 0:
             return f"錯誤: 檔案不存在或無法讀取 '{path}'"
         total = int(stdout.strip()) if stdout.strip().isdigit() else 0
@@ -215,7 +229,7 @@ class RemoteToolExecutor:
         else:
             end_line = min(end_line, total)
 
-        cmd = f"sed -n '{start_line},{end_line}p' {remote_path} 2>/dev/null"
+        cmd = f"sed -n '{start_line},{end_line}p' {quoted_remote_path} 2>/dev/null"
         rc, stdout, stderr = self._run_ssh(cmd, timeout=30)
         if rc != 0:
             return f"錯誤: 無法讀取 '{path}' - {stderr.strip()}"
@@ -238,6 +252,8 @@ class RemoteToolExecutor:
 
     def grep(self, pattern: str, path: str = ".", include: str = None, context: int = 0) -> str:
         remote_path = self._resolve_path(path)
+        quoted_remote_path = shlex.quote(remote_path)
+        quoted_pattern = shlex.quote(pattern)
         context = min(context, 5)
 
         rc, _, _ = self._run_ssh("which rg 2>/dev/null")
@@ -247,35 +263,32 @@ class RemoteToolExecutor:
             parts = ["rg", "--no-heading", "--color", "never", "--line-number",
                      f"--max-count={MAX_GREP_RESULTS}"]
             if context > 0:
-                parts.append(f"-C {context}")
+                parts.extend(["-C", str(context)])
             if include:
                 for p in include.split(','):
                     p = p.strip()
                     if p:
-                        parts.append(f"-g '{p}'")
-            parts += ["-g '!.git/'", "-g '!node_modules/'", "-g '!__pycache__/'",
-                      "-g '!.venv/'", "-g '!build/'", "-g '!dist/'"]
-            cmd = " ".join(parts) + f" -- '{pattern}' {remote_path} 2>/dev/null | head -200"
+                        parts.extend(["-g", shlex.quote(p)])
+            for exclude in ("!.git/", "!node_modules/", "!__pycache__/", "!.venv/", "!build/", "!dist/"):
+                parts.extend(["-g", shlex.quote(exclude)])
+            cmd = " ".join(parts) + f" -- {quoted_pattern} {quoted_remote_path} 2>/dev/null | head -200"
         else:
             parts = ["grep", "-rn", "--color=never"]
             if context > 0:
-                parts.append(f"-C {context}")
+                parts.extend(["-C", str(context)])
             if include:
                 for p in include.split(','):
                     p = p.strip()
                     if p:
-                        parts.append(f"--include='{p}'")
+                        parts.append(f"--include={shlex.quote(p)}")
             parts += ["--exclude-dir=.git", "--exclude-dir=node_modules",
                        "--exclude-dir=__pycache__", "--exclude-dir=.venv",
                        "--exclude-dir=build", "--exclude-dir=dist"]
-            cmd = " ".join(parts) + f" '{pattern}' {remote_path} 2>/dev/null | head -200"
+            cmd = " ".join(parts) + f" -- {quoted_pattern} {quoted_remote_path} 2>/dev/null | head -200"
 
         rc, stdout, _ = self._run_ssh(cmd, timeout=30)
         if not stdout.strip():
             return f"沒有找到 '{pattern}'"
-
-        base = self.home_dir.rstrip('/') + '/'
-        stdout = stdout.replace(base, '')
 
         lines = stdout.strip().split('\n')
         match_count = len([l for l in lines if re.match(r'^.+?:\d+:', l)])
@@ -283,11 +296,12 @@ class RemoteToolExecutor:
 
     def file_info(self, path: str) -> str:
         remote_path = self._resolve_path(path)
+        quoted_remote_path = shlex.quote(remote_path)
         cmd = (
-            f"if [ -f {remote_path} ]; then"
-            f"  wc -lc < {remote_path} | awk '{{print \"file\", $1, $2}}';"
-            f"elif [ -d {remote_path} ]; then"
-            f"  find {remote_path} -type f 2>/dev/null | wc -l | awk '{{print \"dir\", $1}}';"
+            f"if [ -f {quoted_remote_path} ]; then"
+            f"  wc -lc < {quoted_remote_path} | awk '{{print \"file\", $1, $2}}';"
+            f"elif [ -d {quoted_remote_path} ]; then"
+            f"  find {quoted_remote_path} -type f 2>/dev/null | wc -l | awk '{{print \"dir\", $1}}';"
             f"else"
             f"  echo 'notfound';"
             f"fi"
@@ -329,7 +343,7 @@ _MCP_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "目錄路徑，預設 '.'（home 目錄）"},
+                    "path": {"type": "string", "description": "目錄路徑，預設 '.'（伺服器根目錄 /）；可用 '~' 表示 home"},
                     "depth": {"type": "integer", "description": "遞迴深度，預設 2"}
                 },
                 "required": []
@@ -344,7 +358,7 @@ _MCP_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "檔案路徑（相對於 home 目錄或絕對路徑）"},
+                    "path": {"type": "string", "description": "檔案路徑（相對於伺服器根目錄 /、絕對路徑，或 ~/...）"},
                     "start_line": {"type": "integer", "description": "起始行號"},
                     "end_line": {"type": "integer", "description": "結束行號"}
                 },
@@ -361,7 +375,7 @@ _MCP_TOOLS = [
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "搜尋字串"},
-                    "path": {"type": "string", "description": "搜尋目錄"},
+                    "path": {"type": "string", "description": "搜尋目錄（預設從伺服器根目錄 / 開始）"},
                     "include": {"type": "string", "description": "檔案過濾，如 '*.py,*.c'"},
                     "context": {"type": "integer", "description": "顯示前後各 N 行上下文（預設 0）"}
                 },
@@ -474,18 +488,25 @@ def run_mcp_agent(executor: RemoteToolExecutor, question: str,
         knowledge_ctx: 知識庫上下文（可選，來自 --kb）
     """
     host_label = f"{executor.user}@{executor.host}"
+    root = executor.server_root
     home = executor.home_dir
 
     kb_section = f"\n【知識庫參考】\n{knowledge_ctx}\n" if knowledge_ctx else ""
 
-    system_prompt = f"""你是遠端主機分析 Agent。透過 SSH 工具探索 {host_label} 上的檔案來回答用戶問題。
+    system_prompt = f"""你是遠端主機分析 Agent。透過 SSH 工具探索 {host_label} 上你有權限讀取的檔案來回答用戶問題。
 
 遠端主機: {host_label}
-Home 目錄: {home}
+伺服器根目錄: {root}
+使用者 home 目錄: {home}
 
-【目錄結構】
+【初始目錄摘要（從伺服器根目錄開始）】
 {dir_listing}
 {kb_section}
+【路徑規則】
+1. 相對路徑一律視為相對於伺服器根目錄 `/`
+2. `~` 或 `~/...` 代表使用者 home 目錄
+3. grep/read_file 若回傳絕對路徑，後續直接沿用原路徑
+
 【回答規則】
 1. 優先根據工具取得的實際檔案內容回答，不要猜測
 2. 若有 [REF] 知識庫參考，必須標註引用來源
@@ -493,10 +514,11 @@ Home 目錄: {home}
 4. 使用繁體中文回答
 
 【工具使用規則】
-1. 你已經有上面的目錄結構，不需要重複 list_files home 目錄
-2. 需要看某個檔案時，用 read_file 精準讀取
-3. 需要搜尋時，用 grep 加上適當的路徑範圍
-4. 收集到足夠資訊後，直接用文字回答"""
+1. 你已經有伺服器根目錄的初始摘要，不要重複列出 `/`
+2. 需要縮小範圍時，用 list_files 探索特定子目錄
+3. 需要看某個檔案時，用 read_file 精準讀取
+4. 需要搜尋時，用 grep 並盡量加上適當路徑範圍
+5. 收集到足夠資訊後，直接用文字回答"""
 
     messages = [
         {"role": "system", "content": system_prompt},
