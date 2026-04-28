@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ai_code MCP server — 把 KnowledgeBase / CodeRAG / agent_tools 包成 MCP tools,
+讓 OpenCode (或任何 MCP client) 可以接進來用。
+
+啟動:
+    AICODE_ROOT=/path/to/project python mcp_server.py
+
+不取代 main.py 的 CLI 模式,獨立 entry point。
+"""
+
+import os
+import sys
+import io
+from pathlib import Path
+from typing import Optional
+
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+if sys.stdout.encoding != 'utf-8':
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+
+def _log(msg: str) -> None:
+    sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
+    sys.stderr.flush()
+
+
+_root_env = os.environ.get("AICODE_ROOT")
+if not _root_env:
+    _log(
+        "[FATAL] 未設定 AICODE_ROOT 環境變數。\n"
+        "        為避免誤掃 cwd 或洩漏 NDA 內容,server 拒絕啟動。\n"
+        "        範例:  AICODE_ROOT=/path/to/project python mcp_server.py"
+    )
+    sys.exit(2)
+
+AICODE_ROOT = str(Path(_root_env).resolve())
+if not Path(AICODE_ROOT).is_dir():
+    _log(f"[FATAL] AICODE_ROOT 不是目錄: {AICODE_ROOT}")
+    sys.exit(2)
+
+import config
+from config import KNOWLEDGE_FILE, RUN_COMMAND_TIMEOUT
+from knowledge import KnowledgeBase
+from code_rag import CodeRAG
+from agent_tools import ToolExecutor
+from media import set_sandbox_root, ocr_image, read_elf, read_binary, IMAGE_EXTENSIONS, ELF_EXTENSIONS, BINARY_EXTENSIONS
+from http_client import close_session
+
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError:
+    _log(
+        "[FATAL] 找不到 mcp 套件。請先安裝:\n"
+        "        pip install mcp"
+    )
+    sys.exit(3)
+
+
+config.PATCH_ENABLED = True
+config.RUN_COMMAND_ENABLED = True
+
+# Build 命令白名單擴充(OpenCode build 模式會用到)
+# 直接 mutate config.ALLOWED_COMMANDS,agent_tools 透過 from-import 共用同一個 list 物件
+_EXTRA_BUILD_COMMANDS = [
+    "make",
+    "cmake",
+    "cmake --build",
+    "ninja",
+    "meson",
+    "meson setup",
+    "meson compile",
+    "bazel build",
+]
+for _c in _EXTRA_BUILD_COMMANDS:
+    if _c not in config.ALLOWED_COMMANDS:
+        config.ALLOWED_COMMANDS.append(_c)
+
+set_sandbox_root(AICODE_ROOT, allow_external=False)
+
+_log(f"[MCP] AICODE_ROOT = {AICODE_ROOT}")
+# knowledge.json 綁 AICODE_ROOT,不依賴 cwd
+_kb_path = str(Path(AICODE_ROOT) / KNOWLEDGE_FILE)
+_log(f"[MCP] 載入 KnowledgeBase ({_kb_path}) ...")
+KB = KnowledgeBase(_kb_path)
+_log(f"[MCP] {KB.get_status()}")
+
+_log("[MCP] 初始化 CodeRAG (lazy index — 第一次 code_rag_search 才建索引) ...")
+CODE_RAG = CodeRAG(AICODE_ROOT)
+
+_log("[MCP] 初始化 ToolExecutor ...")
+EXEC = ToolExecutor(AICODE_ROOT)
+
+_log(f"[MCP] PATCH_ENABLED = {config.PATCH_ENABLED}, RUN_COMMAND_ENABLED = {config.RUN_COMMAND_ENABLED}")
+_log(f"[MCP] ALLOWED_COMMANDS 共 {len(config.ALLOWED_COMMANDS)} 條(已 append build 命令)")
+
+mcp = FastMCP("ai_code")
+
+
+@mcp.tool()
+def query_knowledge(question: str) -> dict:
+    """Query the project knowledge base (PDF/spec/manual RAG).
+
+    Use this when the user asks about specs, datasheets, manuals, or any
+    domain knowledge that was indexed into knowledge.json. Returns the
+    matched reference text plus a list of source refs the LLM can cite.
+
+    Args:
+        question: 自然語言問題,中英文皆可。
+
+    Returns:
+        {
+            "text": str,          # 拼好的 [REF1] ... 上下文,可直接貼進 prompt
+            "display": str,       # 給人看的摘要(REF 來源列表)
+            "refs": list[dict],   # [{source, page/section, score}, ...]
+            "top_score": float,
+            "has_ref": bool
+        }
+    """
+    if not KB.loaded:
+        return {
+            "text": "",
+            "display": "",
+            "refs": [],
+            "top_score": 0.0,
+            "has_ref": False,
+            "error": "knowledge base not loaded",
+        }
+    text, display, meta = KB.query(question)
+    return {
+        "text": text,
+        "display": display,
+        "refs": meta.get("refs", []),
+        "top_score": meta.get("top_score", 0.0),
+        "has_ref": meta.get("has_ref", False),
+    }
+
+
+@mcp.tool()
+def code_rag_search(query: str, top_k: int = 5) -> list[dict]:
+    """Find relevant code locations (file:line + symbol) inside AICODE_ROOT.
+
+    Use this BEFORE read_file when you need to locate a function/class
+    by intent rather than exact name. CodeRAG indexes symbols (functions,
+    classes, methods) with embeddings + keyword matching.
+
+    Args:
+        query: 想找的程式碼行為,例如 "conv2d 的 padding 計算"。
+        top_k: 回傳前幾名(預設 5)。
+
+    Returns:
+        [{"path": str, "line": int, "symbol": str, "score": float, ...}, ...]
+    """
+    return CODE_RAG.query(query, top_k=top_k)
+
+
+@mcp.tool()
+def read_file(path: str, max_chars: int = 50000) -> str:
+    """Read a file inside AICODE_ROOT (sandbox-protected, returns numbered lines).
+
+    Args:
+        path: 相對於 AICODE_ROOT 的檔案路徑。
+        max_chars: 截斷上限,避免炸 context(預設 50000)。
+
+    Returns:
+        帶行號的檔案內容。超過 max_chars 會在尾端標示截斷字數。
+    """
+    out = EXEC.read_file(path)
+    if len(out) > max_chars:
+        out = out[:max_chars] + f"\n\n... [MCP wrapper 截斷,原始 {len(out)} 字元] ..."
+    return out
+
+
+@mcp.tool()
+def grep_code(pattern: str, path: Optional[str] = ".") -> str:
+    """Grep for a pattern across AICODE_ROOT (uses ripgrep if available).
+
+    Args:
+        pattern: regex 或字面字串。複雜 pattern 會自動退回字面比對(ReDoS 保護)。
+        path: 限定搜尋的子目錄,預設 "." 表示整個 AICODE_ROOT。
+
+    Returns:
+        匹配行(file:line:text)。結果會限制數量避免爆 context。
+    """
+    return EXEC.grep(pattern, path=path or ".")
+
+
+@mcp.tool()
+def apply_patch(diff: str) -> str:
+    """Apply a unified-diff patch to files inside AICODE_ROOT (writes to disk).
+
+    ⚠ 這會直接寫入檔案。每次最多改 PATCH_MAX_FILES 個檔案、單檔最多
+    PATCH_MAX_LINES_PER_FILE 行。Patch 的 context 行必須與檔案實際內容相符,
+    否則整個 hunk 會被拒絕。套用後會自動跑 lint / typecheck / 相關測試。
+
+    Args:
+        diff: unified diff 內容(--- a/file / +++ b/file / @@ ... @@)。
+
+    Returns:
+        套用結果摘要 + 自動驗證輸出。
+    """
+    return EXEC.apply_patch(patch=diff, dry_run=False)
+
+
+@mcp.tool()
+def analyze_file(path: str) -> str:
+    """Analyze a non-text file (image / ELF / binary firmware) inside AICODE_ROOT.
+
+    依副檔名自動 dispatch:
+      - 圖片(.png/.jpg/.jpeg/.gif/.webp) → 用 VL_MODEL 做 OCR,回傳圖中文字
+        (要先 ollama pull config.VL_MODEL,預設是 qwen3-vl:30b-a3b)
+      - ELF(.elf/.so/.o/.axf/.out/.ko) → 解析 header / sections / symbols
+        (需要系統有 binutils 的 readelf / objdump)
+      - 二進位(.bin/.dat/.raw/.fw/.img/.rom/.hex) → hex dump + 字串提取 + magic 偵測
+        (若內容是 ELF magic 會自動切到 ELF 解析)
+
+    用途:OpenCode 對話中想分析錯誤截圖、firmware blob、ELF binary 時呼叫。
+    對純文字檔(.py/.c/.md...)請改用 read_file。
+
+    沙箱:檔案必須在 AICODE_ROOT 內。要分析 root 外的檔案請先複製進來。
+
+    Args:
+        path: 檔案路徑(絕對或相對 AICODE_ROOT)。
+
+    Returns:
+        對應類型的分析報告(OCR 文字 / ELF symbol 表 / binary 字串列)。
+    """
+    p = Path(path)
+    if not p.is_absolute():
+        p = Path(AICODE_ROOT) / path
+    if not p.is_file():
+        return f"錯誤: 檔案不存在 {p}"
+
+    ext = p.suffix.lower()
+    path_str = str(p)
+
+    if ext in IMAGE_EXTENSIONS:
+        return ocr_image(path_str)
+    if ext in ELF_EXTENSIONS:
+        return read_elf(path_str)
+    if ext in BINARY_EXTENSIONS:
+        return read_binary(path_str)
+
+    return (
+        f"錯誤: 不支援的副檔名 {ext}\n"
+        f"支援:image {sorted(IMAGE_EXTENSIONS)}, ELF {sorted(ELF_EXTENSIONS)}, "
+        f"binary {sorted(BINARY_EXTENSIONS)}\n"
+        f"純文字檔請用 read_file。"
+    )
+
+
+@mcp.tool()
+def ingest_document(path: str) -> str:
+    """Ingest a PDF / Markdown / TXT file into the project knowledge base.
+
+    呼叫 AICODE_ROOT/RAG.py 把指定文件切 chunk + 算 embedding,append 到
+    AICODE_ROOT/knowledge.json。**完成後必須再呼叫 reload_knowledge_base()
+    才會被 query_knowledge 看到**(KB 是啟動時載入的 singleton)。
+
+    依 RAG.py 的檔名類型偵測:檔名含 `_spec` / `datasheet` 會被當成 spec(權重最高),
+    `manual` 當 manual,`_api` / `reference` 當 api,以此類推。所以檔名取貼切一點。
+
+    互動模式(`--chat` 截圖 / `--image` 圖片 / `--url` 網頁)不支援經 MCP,
+    請改用 CLI: `python RAG.py file.png knowledge.json --chat`。
+
+    Args:
+        path: 文件路徑。可以是絕對路徑、或相對 AICODE_ROOT 的路徑。
+              支援副檔名:.pdf / .md / .txt
+
+    Returns:
+        RAG.py 的執行輸出(含 chunk 數、頁數等)+ 提醒呼叫 reload_knowledge_base。
+    """
+    import subprocess
+
+    # RAG.py 跟 mcp_server.py 同一個 repo(ai_code),不是在 AICODE_ROOT
+    rag_script = Path(__file__).parent / "RAG.py"
+    if not rag_script.exists():
+        return f"錯誤: 找不到 RAG.py 於 {rag_script}"
+
+    doc_path = Path(path)
+    if not doc_path.is_absolute():
+        doc_path = Path(AICODE_ROOT) / path
+    doc_path = doc_path.resolve()
+
+    # NDA 沙箱:輸入文件必須在 AICODE_ROOT 內(與 analyze_file 行為一致)
+    try:
+        doc_path.relative_to(Path(AICODE_ROOT).resolve())
+    except ValueError:
+        return (
+            f"錯誤: 文件必須在 AICODE_ROOT 內(NDA 沙箱)。\n"
+            f"      要灌外部 PDF,請先複製進 {AICODE_ROOT}。\n"
+            f"      你給的路徑: {doc_path}"
+        )
+
+    if not doc_path.is_file():
+        return f"錯誤: 文件不存在 {doc_path}"
+    if doc_path.suffix.lower() not in {".pdf", ".md", ".txt"}:
+        return f"錯誤: 不支援的副檔名 {doc_path.suffix}(只支援 .pdf / .md / .txt)"
+
+    kb_path = Path(AICODE_ROOT) / KNOWLEDGE_FILE
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(rag_script), str(doc_path), str(kb_path)],
+            cwd=AICODE_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        )
+    except subprocess.TimeoutExpired:
+        return "錯誤: ingest 超時 10 分鐘。大型 PDF 請用 CLI: python RAG.py <pdf> knowledge.json"
+    except Exception as e:
+        return f"錯誤: {type(e).__name__}: {e}"
+
+    out = result.stdout or ""
+    if result.stderr:
+        out += "\n--- stderr ---\n" + result.stderr
+    if len(out) > 8000:
+        out = out[:4000] + "\n\n...[截斷中段]...\n\n" + out[-4000:]
+
+    status = "✓ 完成" if result.returncode == 0 else f"✗ 失敗 (exit {result.returncode})"
+    hint = "\n\n提醒: 呼叫 reload_knowledge_base() 讓新內容立即生效。"
+    return f"=== ingest_document {status} ===\n{out}{hint}"
+
+
+@mcp.tool()
+def reload_knowledge_base() -> str:
+    """Reload the in-memory KnowledgeBase from AICODE_ROOT/knowledge.json.
+
+    KB 是 module-level singleton,只在 server 啟動時載入。剛跑完 ingest_document
+    或外面手動編輯過 knowledge.json,要呼叫這個才看得到變更。
+
+    Returns:
+        重新載入後的狀態訊息(chunk 數量等)。
+    """
+    global KB
+    KB = KnowledgeBase(_kb_path)
+    return f"[KB reloaded] {KB.get_status()}"
+
+
+@mcp.tool()
+def run_command(cmd: str) -> str:
+    """Run a whitelisted command inside AICODE_ROOT.
+
+    白名單範圍(config.ALLOWED_COMMANDS):
+      - 測試: pytest / ctest / npm test / cargo test / go test
+      - 靜態: mypy / tsc / ruff / black / isort / eslint / clang-format
+      - 建置: make / cmake / ninja / meson / bazel build
+    輸出超長會 smart-truncate(優先保留含 FAIL/ERROR/Traceback 的段落)。
+
+    Args:
+        cmd: 完整命令,例如 "pytest tests/test_x.py -v" 或 "make all"。
+
+    Returns:
+        stdout + stderr(截斷後)+ 退出狀態。
+    """
+    return EXEC.run_command(cmd, timeout=RUN_COMMAND_TIMEOUT)
+
+
+if __name__ == "__main__":
+    _log("[MCP] server ready, listening on stdio.")
+    try:
+        mcp.run()
+    finally:
+        close_session()

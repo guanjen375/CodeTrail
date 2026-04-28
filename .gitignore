@@ -21,7 +21,11 @@ venv/
 .code_rag_cache_meta.json
 .code_rag_cache_emb.npz
 .rag_cache/
+.rag_embedding_cache.json
 *.egg-info/
+
+# OpenCode session 紀錄（可能含問題/回答的快取，勿提交）
+.opencode/
 
 # 知識庫（可能含內部文件內容與 embedding，勿提交）
 knowledge.json
@@ -35,6 +39,12 @@ data/
 # 備份檔案
 *.orig
 *.bak
+*~
+
+# OS 檔案
+Thumbs.db
+Desktop.ini
+.DS_Store
 
 # 測試輸出
 .pytest_cache/
