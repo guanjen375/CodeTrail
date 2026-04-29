@@ -191,6 +191,31 @@ def grep_code(pattern: str, path: Optional[str] = ".") -> str:
 
 
 @mcp.tool()
+def list_dir(path: str = ".", depth: int = 2, max_chars: int = 20000) -> str:
+    """List the directory tree under AICODE_ROOT/<path> (sandbox-protected).
+
+    Use this when the user asks "what files are here", "show project structure",
+    or any directory-listing intent — instead of trying to invoke a shell `ls`,
+    which is not in the run_command whitelist.
+
+    Hidden / noise dirs (.git, .venv, node_modules, __pycache__, ...) are
+    skipped by default via should_ignore_dir.
+
+    Args:
+        path: 相對於 AICODE_ROOT 的目錄,預設 "." 表示 root 本身。
+        depth: 遞迴層數(預設 2,上限受 config.MAX_LIST_DEPTH 限制)。
+        max_chars: 截斷上限,避免炸 context(預設 20000)。
+
+    Returns:
+        Tree-style 列表,每行 `[DIR] name/` 或 `[FILE] name (size)`。
+    """
+    out = EXEC.list_files(path=path, depth=depth)
+    if len(out) > max_chars:
+        out = out[:max_chars] + f"\n\n... [MCP wrapper 截斷,原始 {len(out)} 字元] ..."
+    return out
+
+
+@mcp.tool()
 def apply_patch(diff: str) -> str:
     """Apply a unified-diff patch to files inside AICODE_ROOT (writes to disk).
 

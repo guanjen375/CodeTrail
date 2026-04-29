@@ -2,7 +2,7 @@
 
 把 ai_code 包成 **MCP server**,接到 OpenCode TUI。在 OpenCode 對話框問問題,
 背後 LLM(Devstral / Qwen3-coder / GPT-OSS 等本地 Ollama 模型)會自動呼叫
-ai_code 提供的 9 個工具:查 RAG 知識庫、語意搜程式碼、讀檔、grep、改檔、
+ai_code 提供的 10 個工具:查 RAG 知識庫、語意搜程式碼、列目錄、讀檔、grep、改檔、
 跑命令、分析圖片/firmware、灌新文件進 KB。
 
 > **部署目標:5090 32GB VRAM + 192GB RAM**,本地全離線推理,適合 NDA / 內部 firmware repo。
@@ -16,7 +16,7 @@ ai_code 提供的 9 個工具:查 RAG 知識庫、語意搜程式碼、讀檔、
 ┌──────────────┐  stdio   ┌──────────────────┐  HTTP   ┌─────────┐
 │   OpenCode   │ ───────▶ │  mcp_server.py   │ ──────▶ │ Ollama  │
 │   TUI (你)   │  ◀────── │   (FastMCP)      │ ◀────── │ (LLM)   │
-└──────────────┘  9 tools └──────────────────┘ embed   └─────────┘
+└──────────────┘ 10 tools └──────────────────┘ embed   └─────────┘
                                   │
                                   ▼
                   ┌─────────────────────────────────┐
@@ -177,12 +177,13 @@ TUI。要分析 ai_code 倉庫之外的專案,就 `cd` 到那個專案再跑。
 
 ---
 
-## 4. 暴露的 9 個工具
+## 4. 暴露的 10 個工具
 
 | Tool | 用途 |
 |---|---|
 | `query_knowledge(question)` | 查 RAG 知識庫(PDF/spec/manual),回 refs + 引用文字 |
 | `code_rag_search(query, top_k=5)` | 依語意找程式碼位置(file:line + symbol) |
+| `list_dir(path=".", depth=2)` | 列目錄樹(`ls`/tree 替代品,自動跳過 .git/.venv 等噪音) |
 | `read_file(path, max_chars=50000)` | 讀檔(沙箱內,帶行號) |
 | `grep_code(pattern, path=".")` | grep / ripgrep 搜程式碼 |
 | `apply_patch(diff)` | 套 unified diff,**直接寫檔** |
@@ -411,7 +412,7 @@ python eval/run_eval.py
 ### 已驗證的 ai_code 程式碼掃描結果
 - 0 個 hardcoded API key / token / password
 - 0 個 NDA 客戶名 / 產品名 / 規格書檔名
-- 9 個 MCP 工具皆走 sandbox `_safe_path` 驗證
+- 10 個 MCP 工具皆走 sandbox `_safe_path` 驗證
 
 ---
 
