@@ -37,17 +37,20 @@ OpenCode 是前端,模型自選工具,所有檔案操作都被沙箱在 `AICODE_
 
 ## 1. 安裝
 
+> 主要在 Linux 上測試(Ubuntu / Arch 都跑過),Windows 順便支援。
+> 以下指令預設 bash;PowerShell 等價寫法寫在「Windows 備註」區塊。
+
 ### 軟體
 - **Python 3.10+**
-- **Ollama**(<https://ollama.com/download>),裝完會自動背景常駐
+- **Ollama**(<https://ollama.com/download>),裝完會自動背景常駐(Linux 上 `systemctl --user status ollama` 可看狀態)
 - **Node.js LTS**(<https://nodejs.org/>),為了 npm 裝 OpenCode
 - **OpenCode**:
-  ```powershell
+  ```bash
   npm install -g opencode-ai
   ```
 
 ### Python 套件
-```powershell
+```bash
 cd <AICODE_REPO>
 pip install -r requirements.txt
 pip install pymupdf4llm ollama   # RAG / KB ingestion 才需要
@@ -55,7 +58,7 @@ pip install pymupdf4llm ollama   # RAG / KB ingestion 才需要
 
 ### Ollama 模型
 推薦組合(5090 上跑得很順):
-```powershell
+```bash
 # 主力 LLM(挑一個)
 ollama pull qwen3-coder:30b
 ollama pull devstral:24b
@@ -82,18 +85,22 @@ ollama pull qwen3-vl:30b-a3b
 ### `mcp_server.py` 啟動環境
 **`AICODE_ROOT` 是必填**,沒設 server 直接拒絕啟動(避免誤掃 cwd 或洩漏 NDA 內容):
 
-```powershell
-$env:AICODE_ROOT = "<PATH_TO_PROJECT_TO_ANALYZE>"
+```bash
+export AICODE_ROOT="<PATH_TO_PROJECT_TO_ANALYZE>"
 ```
+
+> Windows PowerShell:`$env:AICODE_ROOT = "<PATH_TO_PROJECT_TO_ANALYZE>"`
 
 `AICODE_ROOT` 應該指向**你要分析的專案**(firmware repo / 你的 codebase),
 而不是 ai_code 自己。
 
 ### OpenCode `opencode.json`
 
-```powershell
-notepad "$HOME\.config\opencode\opencode.json"
+```bash
+${EDITOR:-vi} "$HOME/.config/opencode/opencode.json"
 ```
+
+> Windows:`notepad "$HOME\.config\opencode\opencode.json"`
 
 整個檔案內容:
 
@@ -127,18 +134,22 @@ notepad "$HOME\.config\opencode\opencode.json"
 }
 ```
 
-把兩個 `<...>` placeholder 換成實際路徑。JSON 路徑用 **正斜線 `/`**,Windows 接受。
+把兩個 `<...>` placeholder 換成實際路徑。Linux 直接用 `/`;Windows 也建議用正斜線(JSON 兩種都吃,反斜線要轉義)。
 
 驗證 JSON:
-```powershell
-Get-Content "$HOME\.config\opencode\opencode.json" -Raw | ConvertFrom-Json
+```bash
+python -m json.tool "$HOME/.config/opencode/opencode.json" >/dev/null && echo OK
+# 或
+jq . "$HOME/.config/opencode/opencode.json" >/dev/null
 ```
+
+> Windows PowerShell:`Get-Content "$HOME\.config\opencode\opencode.json" -Raw | ConvertFrom-Json`
 
 ---
 
 ## 3. 啟動
 
-```powershell
+```bash
 cd <PATH_TO_PROJECT_TO_ANALYZE>
 opencode
 ```
@@ -269,11 +280,11 @@ analyze error.png 那是什麼錯誤
 
 `--chat` / `--image` / `--url` 模式要 Y/n 互動,沒辦法走 MCP。手動:
 
-```powershell
+```bash
 cd <AICODE_REPO>
-python RAG.py teams_chat.png      <AICODE_ROOT>/knowledge.json --chat
-python RAG.py memory_map.png      <AICODE_ROOT>/knowledge.json --image
-python RAG.py https://docs.x/api  <AICODE_ROOT>/knowledge.json --url
+python RAG.py teams_chat.png      "$AICODE_ROOT/knowledge.json" --chat
+python RAG.py memory_map.png      "$AICODE_ROOT/knowledge.json" --image
+python RAG.py https://docs.x/api  "$AICODE_ROOT/knowledge.json" --url
 ```
 
 跑完回 OpenCode 打:
@@ -298,8 +309,8 @@ RAG.py 看檔名決定文件類型,影響 query_knowledge 排序:
 ### 6.4 確認 KB 狀態
 
 CLI:
-```powershell
-python -c "from knowledge import KnowledgeBase; kb = KnowledgeBase('<AICODE_ROOT>/knowledge.json'); print(kb.get_status())"
+```bash
+python -c "from knowledge import KnowledgeBase; kb = KnowledgeBase('$AICODE_ROOT/knowledge.json'); print(kb.get_status())"
 ```
 
 或在 OpenCode 內:
@@ -319,10 +330,12 @@ reload knowledge base
 
 ## 7. 沒接 OpenCode 也想跑 — Inspector 單測
 
-```powershell
-$env:AICODE_ROOT = "<PATH_TO_PROJECT_TO_ANALYZE>"
+```bash
+export AICODE_ROOT="<PATH_TO_PROJECT_TO_ANALYZE>"
 npx @modelcontextprotocol/inspector python <AICODE_REPO>/mcp_server.py
 ```
+
+> Windows PowerShell:把 `export` 改成 `$env:AICODE_ROOT = "..."`。
 
 開瀏覽器 `http://127.0.0.1:6274`,**Tools** 分頁逐個工具帶參數測。
 連線設定:
@@ -339,18 +352,18 @@ npx @modelcontextprotocol/inspector python <AICODE_REPO>/mcp_server.py
 
 `mcp_server.py` 完全獨立,跟 `main.py` 不衝突:
 
-```powershell
+```bash
 # QA 模式(不掃專案)
 python main.py --qa "解釋這個 compile error"
 
 # 一般模式(掃完整專案,自動選 full / agent)
-python main.py <AICODE_ROOT>
+python main.py "$AICODE_ROOT"
 
 # 接知識庫問答
-python main.py <AICODE_ROOT> --kb <AICODE_ROOT>/knowledge.json
+python main.py "$AICODE_ROOT" --kb "$AICODE_ROOT/knowledge.json"
 
 # 啟用改碼閉環
-python main.py <AICODE_ROOT> --patch --run-tests
+python main.py "$AICODE_ROOT" --patch --run-tests
 
 # 遠端 SSH(透過 SSH 按需讀遠端檔案)
 python main.py --mcp user@host "問題"
@@ -371,7 +384,7 @@ python eval/run_eval.py
 - `data/` / `*.jsonl` — 資料飛輪紀錄
 
 ### NDA 環境部署 checklist
-- [ ] 5090 機器確認**不會自動 sync 到 OneDrive / git remote / 任何雲端**
+- [ ] 5090 機器確認**不會自動 sync 到雲端**(rclone / Nextcloud / OneDrive / Dropbox / git remote 等)
 - [ ] `AICODE_ROOT` 指向真實 NDA 專案,不是測試目錄
 - [ ] `opencode.json` 路徑改成那台機器的實際路徑
 - [ ] 灌完 RAG 後 `git status` 確認 `knowledge.json` 顯示 ignored
@@ -393,7 +406,7 @@ python eval/run_eval.py
 
 | 症狀 | 解法 |
 |---|---|
-| `[FATAL] 未設定 AICODE_ROOT` | 先 `$env:AICODE_ROOT = "<path>"` 再啟 OpenCode |
+| `[FATAL] 未設定 AICODE_ROOT` | 先 `export AICODE_ROOT="<path>"`(Windows:`$env:AICODE_ROOT = "<path>"`)再啟 OpenCode |
 | OpenCode 看不到 ai_code 工具 | `opencode.json` JSON 格式或路徑寫錯,重新驗證 |
 | `model 'xxx' not found` | `ollama list` 確認模型 tag,改 config 對齊 |
 | 模型回 `multi_tool_use.parallel invalid` | gpt-oss 的 quirk,把問題拆成單步問,或換 Mistral-Small |
