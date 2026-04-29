@@ -78,21 +78,30 @@ ollama pull qwen3-vl:30b-a3b
 > **5090 速度上來後 context 不漂移,大多模型都能用**。先試 GPT-OSS 20B 或
 > Mistral-Small3.2 24B。
 
+### `aicode` 啟動腳本(讓 cwd 自動成為 AICODE_ROOT)
+
+倉庫附了 [bin/aicode](bin/aicode) — 它會把當前目錄設成 `AICODE_ROOT` 再 exec
+`opencode`,UX 等同 Claude Code:`cd <project> && aicode`,不必每個專案改
+`opencode.json`。
+
+把它 symlink 到 PATH 裡(一次性):
+```bash
+ln -s "$PWD/bin/aicode" "$HOME/.local/bin/aicode"   # 在 ai_code repo 根目錄執行
+which aicode   # → ~/.local/bin/aicode
+```
+
+> Windows:把 `bin/aicode` 翻成 `aicode.cmd` 包一個 `set AICODE_ROOT=%CD%` 再
+> `opencode %*`,丟到 PATH 任一目錄。或直接沿用舊做法,在
+> `opencode.json` hardcode `environment.AICODE_ROOT`。
+
+腳本內建的安全網:
+- `AICODE_ROOT=/` 或 `=$HOME` → 拒絕啟動(避免把整個 home 餵進沙箱)
+- `opencode` 不在 PATH → 直接報錯不繼續
+- 想覆寫自動偵測:`AICODE_ROOT=/some/other/path aicode`
+
 ---
 
 ## 2. 設定
-
-### `mcp_server.py` 啟動環境
-**`AICODE_ROOT` 是必填**,沒設 server 直接拒絕啟動(避免誤掃 cwd 或洩漏 NDA 內容):
-
-```bash
-export AICODE_ROOT="<PATH_TO_PROJECT_TO_ANALYZE>"
-```
-
-> Windows PowerShell:`$env:AICODE_ROOT = "<PATH_TO_PROJECT_TO_ANALYZE>"`
-
-`AICODE_ROOT` 應該指向**你要分析的專案**(firmware repo / 你的 codebase),
-而不是 ai_code 自己。
 
 ### OpenCode `opencode.json`
 
@@ -125,16 +134,17 @@ ${EDITOR:-vi} "$HOME/.config/opencode/opencode.json"
     "ai_code": {
       "type": "local",
       "command": ["python", "<AICODE_REPO>/mcp_server.py"],
-      "environment": {
-        "AICODE_ROOT": "<PATH_TO_PROJECT_TO_ANALYZE>"
-      },
       "enabled": true
     }
   }
 }
 ```
 
-把兩個 `<...>` placeholder 換成實際路徑。Linux 直接用 `/`;Windows 也建議用正斜線(JSON 兩種都吃,反斜線要轉義)。
+把 `<AICODE_REPO>` 換成 ai_code 倉庫的實際路徑。Linux 直接用 `/`;Windows 也建議用正斜線(JSON 兩種都吃,反斜線要轉義)。
+
+**`AICODE_ROOT` 不再寫死在這裡** — `aicode` 啟動腳本會用 `$PWD` export 給
+MCP 子行程繼承,所以同一份 `opencode.json` 跨專案通用。如果你執意手跑
+`opencode`(不走 wrapper),就要自己 `export AICODE_ROOT=...` 再啟動。
 
 驗證 JSON:
 ```bash
@@ -151,8 +161,11 @@ jq . "$HOME/.config/opencode/opencode.json" >/dev/null
 
 ```bash
 cd <PATH_TO_PROJECT_TO_ANALYZE>
-opencode
+aicode
 ```
+
+啟動時會印 `[aicode] AICODE_ROOT=<那個路徑>` 一行,確認沙箱根目錄無誤後再進
+TUI。要分析 ai_code 倉庫之外的專案,就 `cd` 到那個專案再跑。
 
 進 TUI 後:
 - 左下顯示 `⊙ 1 MCP /status` 綠燈 = ai_code MCP 接上
@@ -406,8 +419,10 @@ python eval/run_eval.py
 
 | 症狀 | 解法 |
 |---|---|
-| `[FATAL] 未設定 AICODE_ROOT` | 先 `export AICODE_ROOT="<path>"`(Windows:`$env:AICODE_ROOT = "<path>"`)再啟 OpenCode |
-| OpenCode 看不到 ai_code 工具 | `opencode.json` JSON 格式或路徑寫錯,重新驗證 |
+| `[FATAL] 未設定 AICODE_ROOT` | 改用 `aicode`(自動帶 cwd);要手跑 `opencode` 就先 `export AICODE_ROOT="<path>"`(Windows:`$env:AICODE_ROOT = "<path>"`) |
+| `aicode: command not found` | symlink 沒做或 `~/.local/bin` 不在 PATH。重跑 `ln -s "$PWD/bin/aicode" "$HOME/.local/bin/aicode"` 並確認 `echo $PATH` 含 `~/.local/bin` |
+| `[aicode] refusing AICODE_ROOT=$HOME` | 你在 `$HOME` 直接跑 `aicode`,先 `cd` 進專案目錄 |
+| OpenCode 看不到 ai_code 工具 | `opencode.json` JSON 格式或路徑寫錯,重新驗證;或 `mcp_server.py` 路徑不對 |
 | `model 'xxx' not found` | `ollama list` 確認模型 tag,改 config 對齊 |
 | 模型回 `multi_tool_use.parallel invalid` | gpt-oss 的 quirk,把問題拆成單步問,或換 Mistral-Small |
 | `ingest_document` 超時 | 大型 PDF(>500 頁)請改 CLI:`python RAG.py xxx.pdf knowledge.json` |

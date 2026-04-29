@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# aicode — launch OpenCode with $PWD as the ai_code MCP sandbox root.
+#
+# Usage:
+#   cd <project-to-analyze>
+#   aicode               # opens OpenCode TUI here, AICODE_ROOT=$PWD
+#   aicode <args...>     # extra args are forwarded to `opencode`
+#
+# Override the auto-detected root:
+#   AICODE_ROOT=/some/other/path aicode
+#
+# Designed to mirror the `claude` UX: cd into a project, run one command,
+# done. No per-project edits to opencode.json required.
+
+set -euo pipefail
+
+# Allow explicit override via env, else use cwd (canonicalised).
+if [ -n "${AICODE_ROOT:-}" ]; then
+  ROOT="$AICODE_ROOT"
+else
+  ROOT="$(pwd -P)"
+fi
+
+# Resolve to absolute, canonical path (handles symlinks, ~, etc.).
+ROOT="$(cd "$ROOT" 2>/dev/null && pwd -P)" || {
+  echo "[aicode] root is not a readable directory: $ROOT" >&2
+  exit 2
+}
+
+# Refuse roots that are almost certainly a mistake — these would expose
+# the entire home / filesystem to the MCP sandbox.
+case "$ROOT" in
+  /)
+    echo "[aicode] refusing AICODE_ROOT=/ (would expose entire filesystem)" >&2
+    exit 2
+    ;;
+  "$HOME")
+    echo "[aicode] refusing AICODE_ROOT=\$HOME ($HOME)" >&2
+    echo "         cd into a specific project directory first." >&2
+    exit 2
+    ;;
+esac
+
+if ! command -v opencode >/dev/null 2>&1; then
+  echo "[aicode] 'opencode' not found in PATH — install with: npm install -g opencode-ai" >&2
+  exit 127
+fi
+
+export AICODE_ROOT="$ROOT"
+echo "[aicode] AICODE_ROOT=$AICODE_ROOT"
+exec opencode "$@"
