@@ -389,21 +389,35 @@ def remove_document(source: str) -> str:
         return f"錯誤: 讀 knowledge.json 失敗: {type(e).__name__}: {e}"
 
     chunks = kb_data.get("chunks", [])
-    if not chunks:
-        return "知識庫是空的,沒東西可以刪。"
+    md = kb_data.setdefault("metadata", {})
+    md_docs = list(md.get("documents", []))
 
-    before = len(chunks)
-    kept = [c for c in chunks if Path(str(c.get("source", ""))).name != target]
-    removed = before - len(kept)
+    before_chunks = len(chunks)
+    kept_chunks = [c for c in chunks if Path(str(c.get("source", ""))).name != target]
+    removed_chunks = before_chunks - len(kept_chunks)
 
-    if removed == 0:
-        sources = sorted({Path(str(c.get("source", ""))).name for c in chunks if c.get("source")})
+    before_docs = len(md_docs)
+    kept_docs = [d for d in md_docs if Path(str(d)).name != target]
+    removed_docs = before_docs - len(kept_docs)
+
+    if removed_chunks == 0 and removed_docs == 0:
+        sources = sorted(
+            {Path(str(c.get("source", ""))).name for c in chunks if c.get("source")}
+            | {Path(str(d)).name for d in md_docs if d}
+        )
         return (
-            f"找不到 source = '{target}' 的 chunk(共 {before} 個 chunk 都沒命中)。\n"
+            f"找不到 source = '{target}'(chunks {before_chunks} 個、metadata.documents "
+            f"{before_docs} 筆都沒命中)。\n"
             f"目前 KB 內的 sources:\n  - " + "\n  - ".join(sources or ["(無)"])
         )
 
-    kb_data["chunks"] = kept
+    kb_data["chunks"] = kept_chunks
+    md["documents"] = kept_docs
+    md["total_documents"] = len(kept_docs)
+    md["total_chunks"] = len(kept_chunks)
+    from datetime import datetime, timezone
+    md["updated_at"] = datetime.now(timezone.utc).isoformat()
+
     try:
         kb_path.write_text(json.dumps(kb_data, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as e:
@@ -419,10 +433,15 @@ def remove_document(source: str) -> str:
         except OSError as e:
             npz_note = f" (注意: 刪 {KNOWLEDGE_EMB_FILE} 失敗: {e},下次 reload 會 warn 並自動 rebuild)"
 
-    remain_sources = sorted({Path(str(c.get("source", ""))).name for c in kept if c.get("source")})
+    remain_sources = sorted(
+        {Path(str(c.get("source", ""))).name for c in kept_chunks if c.get("source")}
+        | {Path(str(d)).name for d in kept_docs if d}
+    )
     return (
         f"=== remove_document ✓ ===\n"
-        f"刪了 {removed} 個 chunk(source = '{target}'),剩 {len(kept)} 個{npz_note}。\n"
+        f"刪了 {removed_chunks} 個 chunk + {removed_docs} 筆 metadata.documents 紀錄"
+        f"(source = '{target}'),剩 {len(kept_chunks)} 個 chunk / "
+        f"{len(kept_docs)} 個文件{npz_note}。\n"
         f"剩餘 sources: {remain_sources or '(無)'}\n\n"
         f"提醒: 呼叫 reload_knowledge_base() 讓變更立即生效。"
     )
