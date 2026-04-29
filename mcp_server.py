@@ -45,7 +45,7 @@ if not Path(AICODE_ROOT).is_dir():
     sys.exit(2)
 
 import config
-from config import KNOWLEDGE_FILE, RUN_COMMAND_TIMEOUT
+from config import KNOWLEDGE_FILE, KNOWLEDGE_EMB_FILE, RUN_COMMAND_TIMEOUT
 from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from agent_tools import ToolExecutor
@@ -352,6 +352,80 @@ def ingest_document(path: str) -> str:
     status = "✓ 完成" if result.returncode == 0 else f"✗ 失敗 (exit {result.returncode})"
     hint = "\n\n提醒: 呼叫 reload_knowledge_base() 讓新內容立即生效。"
     return f"=== ingest_document {status} ===\n{out}{hint}"
+
+
+@mcp.tool()
+def remove_document(source: str) -> str:
+    """Remove all chunks of a given source file from the knowledge base.
+
+    Use this to undo an `ingest_document` call, or to drop an outdated
+    spec/PDF from the KB. Match is by basename of the `source` field stored
+    in each chunk (the same string ingest_document recorded).
+
+    操作對象是 AICODE_ROOT/knowledge.json,順便刪 knowledge_emb.npz 強迫下次
+    reload 重算 embeddings(否則 hash 不一致 KB 會 warn 自動重建,效果一樣
+    只是少一次 warn)。
+
+    **完成後必須再呼叫 reload_knowledge_base() 才會被 query_knowledge 看到**
+    (KB 是啟動時載入的 singleton,跟 ingest_document 一樣)。
+
+    Args:
+        source: 要刪的檔案名(basename),例如 "spec.pdf"。傳絕對路徑也行,
+                會自動取 basename 比對。
+
+    Returns:
+        刪了幾個 chunk + 剩餘的 source 清單 + 提醒呼叫 reload。
+    """
+    import json
+
+    target = Path(source).name  # basename only, ignore any directory part
+    kb_path = Path(AICODE_ROOT) / KNOWLEDGE_FILE
+    if not kb_path.is_file():
+        return f"錯誤: knowledge.json 不存在於 {kb_path}"
+
+    try:
+        kb_data = json.loads(kb_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        return f"錯誤: 讀 knowledge.json 失敗: {type(e).__name__}: {e}"
+
+    chunks = kb_data.get("chunks", [])
+    if not chunks:
+        return "知識庫是空的,沒東西可以刪。"
+
+    before = len(chunks)
+    kept = [c for c in chunks if Path(str(c.get("source", ""))).name != target]
+    removed = before - len(kept)
+
+    if removed == 0:
+        sources = sorted({Path(str(c.get("source", ""))).name for c in chunks if c.get("source")})
+        return (
+            f"找不到 source = '{target}' 的 chunk(共 {before} 個 chunk 都沒命中)。\n"
+            f"目前 KB 內的 sources:\n  - " + "\n  - ".join(sources or ["(無)"])
+        )
+
+    kb_data["chunks"] = kept
+    try:
+        kb_path.write_text(json.dumps(kb_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        return f"錯誤: 寫回 knowledge.json 失敗: {e}"
+
+    # 清掉 .npz cache(內容雜湊已不一致,留著也是要 rebuild)
+    npz_path = Path(AICODE_ROOT) / KNOWLEDGE_EMB_FILE
+    npz_note = ""
+    if npz_path.is_file():
+        try:
+            npz_path.unlink()
+            npz_note = f" + 已刪 {KNOWLEDGE_EMB_FILE} 快取"
+        except OSError as e:
+            npz_note = f" (注意: 刪 {KNOWLEDGE_EMB_FILE} 失敗: {e},下次 reload 會 warn 並自動 rebuild)"
+
+    remain_sources = sorted({Path(str(c.get("source", ""))).name for c in kept if c.get("source")})
+    return (
+        f"=== remove_document ✓ ===\n"
+        f"刪了 {removed} 個 chunk(source = '{target}'),剩 {len(kept)} 個{npz_note}。\n"
+        f"剩餘 sources: {remain_sources or '(無)'}\n\n"
+        f"提醒: 呼叫 reload_knowledge_base() 讓變更立即生效。"
+    )
 
 
 @mcp.tool()
