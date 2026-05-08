@@ -6,7 +6,7 @@
       "refs": ["spec", "模型"],
       "keywords": ["qwen3-coder", "30b"],
       "gold_chunks": ["MODEL", "qwen3"],
-      "gold_evidence": ["qwen3-coder:30b-instruct-q4_K_M"]
+      "gold_evidence": ["qwen3-coder:30b"]
     }
   },
   {
@@ -35,7 +35,7 @@
     "expected": {
       "refs": ["spec", "threshold"],
       "keywords": ["0.25", "CODE_RAG_THRESHOLD_BUG"],
-      "gold_chunks": ["CODE_RAG_THRESHOLD", "BUG"],
+      "gold_chunks": ["CODE_RAG_THRESHOLD_BUG"],
       "gold_evidence": ["0.25"]
     }
   },

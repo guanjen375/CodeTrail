@@ -30,7 +30,11 @@ if sys.stdout.encoding != 'utf-8':
         pass
 
 from pathlib import Path
+from typing import Optional
 
+# Use `import config` exclusively so runtime mutations
+# (CUSTOM_SYSTEM_RULES / PATCH_ENABLED / RUN_COMMAND_ENABLED) are visible everywhere.
+import config
 from config import (
     MODEL, NUM_CTX, MAX_TOTAL_CHARS, KNOWLEDGE_FILE,
     CODE_RAG_ENABLED, IGNORED_DIRS, IGNORED_PATTERNS,
@@ -199,94 +203,151 @@ def run_qa_mode(question: str, kb: "KnowledgeBase", qa_history: list = None):
     return result
 
 
-def main():
-    import config  # 動態修改 config 用
+USAGE = """\
+用法: python main.py [folder] [question ...] [options]
 
-    args = sys.argv[1:]
-    folder = "."
-    question = None
-    force_mode = None
-    kb_path = KNOWLEDGE_FILE
-    extra_excludes = []
-    include_dirs = []
-    run_tests = False
-    enable_patch = False
-    use_container = False
-    web_url = None  # 網頁模式 URL
-    mcp_uri = None  # MCP 遠端模式 URI (user@host)
-    temp_dir = None  # 網頁模式暫存目錄
-    qa_mode = False  # QA 模式：不掃專案、不建 Code RAG，直接問答
-    system_rules_file = None  # 自定義規則檔案路徑
+模式:
+  (預設)              掃描 folder，依大小自動選 full / agent 模式回答 question
+  --qa, --no-project  QA 模式：不掃專案、不建 Code RAG，直接問答（可搭 file:/img:/bin:）
+  --agent             強制 agent 模式（動態探索）
+  --full              強制 full 模式（整包餵 LLM）
+  --mcp USER@HOST     遠端 SSH 模式（按需讀遠端檔案）
+  --web URL           從 Git URL 抓程式碼分析
+
+選項:
+  --kb PATH           指定知識庫檔（預設 knowledge.json）
+  --sk PATH           載入自定義系統規則檔（≤ CUSTOM_SYSTEM_RULES_MAX_CHARS）
+  --exclude PATTERN   再追加排除 pattern（可重複）
+  --include-dir DIR   從預設忽略清單拿掉某個目錄（可重複）
+  --run-tests         啟用 run_command 工具（白名單命令；對不信任 repo 不要開）
+  --patch             啟用改碼閉環工具（apply_patch / git_status / git_diff / run_lint）
+  --container         以容器（podman/docker）執行 run_command
+  -h, --help          顯示這份說明後退出
+
+範例:
+  python main.py --qa "解釋這個 compile error"
+  python main.py /path/to/repo "整體架構"
+  python main.py --agent --kb spec.json /path/to/repo "conv2d padding"
+  python main.py --mcp user@host "看 ~/proj 下的錯誤"
+"""
+
+
+def _print_help() -> None:
+    """印出 usage（不做任何昂貴初始化、不啟動模型）。"""
+    print(USAGE)
+
+
+def _safe_input(prompt: str) -> Optional[str]:
+    """互動式輸入；非互動環境（無 stdin）會回 None 而不是 crash。"""
+    try:
+        return input(prompt)
+    except EOFError:
+        return None
+
+
+def _parse_args(argv):
+    """解析 argv → namespace dict。
+
+    回傳 (parsed_dict, want_help, error_msg)。
+    保持手寫 parser 以維持原本「question 可以有空格」的彈性，但加入 --help 短路。
+    """
+    args = list(argv)
+    want_help = False
+    error = None
+
+    parsed = {
+        "folder": ".",
+        "question": None,
+        "force_mode": None,
+        "kb_path": KNOWLEDGE_FILE,
+        "extra_excludes": [],
+        "include_dirs": [],
+        "run_tests": False,
+        "enable_patch": False,
+        "use_container": False,
+        "web_url": None,
+        "mcp_uri": None,
+        "qa_mode": False,
+        "system_rules_file": None,
+    }
 
     i = 0
     while i < len(args):
         arg = args[i]
+        if arg in ("-h", "--help"):
+            want_help = True
+            return parsed, want_help, None
         if arg in ("--qa", "--no-project"):
-            qa_mode = True
+            parsed["qa_mode"] = True
         elif arg == "--agent":
-            force_mode = "agent"
+            parsed["force_mode"] = "agent"
         elif arg == "--full":
-            force_mode = "full"
+            parsed["force_mode"] = "full"
         elif arg == "--run-tests":
-            run_tests = True
+            parsed["run_tests"] = True
         elif arg == "--patch":
-            enable_patch = True
+            parsed["enable_patch"] = True
         elif arg == "--container":
-            use_container = True
+            parsed["use_container"] = True
         elif arg == "--mcp" and i + 1 < len(args):
-            mcp_uri = args[i + 1]
-            i += 1
+            parsed["mcp_uri"] = args[i + 1]; i += 1
         elif arg.startswith("--mcp="):
-            mcp_uri = arg.split("=", 1)[1]
+            parsed["mcp_uri"] = arg.split("=", 1)[1]
         elif arg == "--web" and i + 1 < len(args):
-            web_url = args[i + 1]
-            i += 1
+            parsed["web_url"] = args[i + 1]; i += 1
         elif arg.startswith("--web="):
-            web_url = arg.split("=", 1)[1]
+            parsed["web_url"] = arg.split("=", 1)[1]
         elif arg == "--kb" and i + 1 < len(args):
-            kb_path = args[i + 1]
-            i += 1
+            parsed["kb_path"] = args[i + 1]; i += 1
         elif arg.startswith("--kb="):
-            kb_path = arg.split("=", 1)[1]
+            parsed["kb_path"] = arg.split("=", 1)[1]
         elif arg == "--exclude" and i + 1 < len(args):
-            extra_excludes.append(args[i + 1])
-            i += 1
+            parsed["extra_excludes"].append(args[i + 1]); i += 1
         elif arg.startswith("--exclude="):
-            extra_excludes.append(arg.split("=", 1)[1])
+            parsed["extra_excludes"].append(arg.split("=", 1)[1])
         elif arg == "--include-dir" and i + 1 < len(args):
-            include_dirs.append(args[i + 1])
-            i += 1
+            parsed["include_dirs"].append(args[i + 1]); i += 1
         elif arg.startswith("--include-dir="):
-            include_dirs.append(arg.split("=", 1)[1])
+            parsed["include_dirs"].append(arg.split("=", 1)[1])
         elif arg == "--sk" and i + 1 < len(args):
-            system_rules_file = args[i + 1]
-            i += 1
+            parsed["system_rules_file"] = args[i + 1]; i += 1
         elif arg.startswith("--sk="):
-            system_rules_file = arg.split("=", 1)[1]
+            parsed["system_rules_file"] = arg.split("=", 1)[1]
         elif arg.startswith("-"):
-            # 未知 flag：印出警告，避免使用者打錯參數卻不知道
-            print(f"[WARN] 未知參數: {arg}（已忽略）")
-        elif qa_mode:
-            # QA 模式下，非 flag 參數都視為問題（可以有空格）
-            if question is None:
-                question = arg
-            else:
-                question = question + " " + arg
-        elif web_url is not None or mcp_uri is not None:
-            # 網頁/MCP 模式下，非 flag 參數都視為問題（可以有空格，與 QA 模式一致）
-            if question is None:
-                question = arg
-            else:
-                question = question + " " + arg
-        elif folder == ".":
-            folder = arg
+            print(f"[WARN] 未知參數: {arg}（已忽略，請見 --help）")
+        elif parsed["qa_mode"]:
+            parsed["question"] = arg if parsed["question"] is None else parsed["question"] + " " + arg
+        elif parsed["web_url"] is not None or parsed["mcp_uri"] is not None:
+            parsed["question"] = arg if parsed["question"] is None else parsed["question"] + " " + arg
+        elif parsed["folder"] == ".":
+            parsed["folder"] = arg
         else:
-            # 一般模式：folder 已設定，剩餘參數視為問題
-            if question is None:
-                question = arg
-            else:
-                question = question + " " + arg
+            parsed["question"] = arg if parsed["question"] is None else parsed["question"] + " " + arg
         i += 1
+
+    return parsed, want_help, error
+
+
+def main():
+    parsed, want_help, _err = _parse_args(sys.argv[1:])
+    if want_help:
+        _print_help()
+        return None
+
+    folder = parsed["folder"]
+    question = parsed["question"]
+    force_mode = parsed["force_mode"]
+    kb_path = parsed["kb_path"]
+    extra_excludes = parsed["extra_excludes"]
+    include_dirs = parsed["include_dirs"]
+    run_tests = parsed["run_tests"]
+    enable_patch = parsed["enable_patch"]
+    use_container = parsed["use_container"]
+    web_url = parsed["web_url"]
+    mcp_uri = parsed["mcp_uri"]
+    qa_mode = parsed["qa_mode"]
+    system_rules_file = parsed["system_rules_file"]
+    temp_dir = None  # 網頁模式暫存目錄
 
     if include_dirs:
         for d in include_dirs:
@@ -364,11 +425,19 @@ def main():
             return None
 
         # 多輪模式：沒帶問題就進入互動式對話
+        if not sys.stdin.isatty():
+            print("[ERROR] QA 互動模式需要 TTY，但目前 stdin 不是互動的。")
+            print("        請改帶問題：python main.py --qa \"你的問題\"")
+            return None
         print("進入 QA 互動模式（輸入 q 離開，輸入 clear 清除對話歷史）\n")
         qa_history = []  # 保存對話上下文 [(question, answer), ...]
         while True:
             try:
-                q = input(">>> ").strip()
+                _raw = _safe_input(">>> ")
+                if _raw is None:
+                    print("\n[BYE] stdin 結束，離開 QA 互動模式。")
+                    break
+                q = _raw.strip()
 
                 if q.lower() in ('q', 'quit', 'exit'):
                     print("[BYE] 再見!")
@@ -455,11 +524,19 @@ def main():
             return None
 
         # 互動模式
+        if not sys.stdin.isatty():
+            print("[ERROR] MCP 互動模式需要 TTY，但目前 stdin 不是互動的。")
+            print("        請改帶問題：python main.py --mcp user@host \"你的問題\"")
+            return None
         print(f"進入 MCP 互動模式（輸入 q 離開）\n")
 
         while True:
             try:
-                q = input(">>> ").strip()
+                _raw = _safe_input(">>> ")
+                if _raw is None:
+                    print("\n[BYE] stdin 結束，離開 MCP 互動模式。")
+                    break
+                q = _raw.strip()
                 if q.lower() in ('q', 'quit', 'exit'):
                     print("[BYE] 再見!")
                     break
@@ -660,12 +737,20 @@ def main():
         return temp_dir
 
     # 互動模式
+    if not sys.stdin.isatty():
+        print("[ERROR] 互動模式需要 TTY，但目前 stdin 不是互動的。")
+        print("        請帶問題或使用 --qa：python main.py [folder] \"你的問題\"")
+        return temp_dir
     qa_history = []
 
     while True:
         try:
             print(f"\n💬 輸入問題 (Enter=整體分析, q=離開, clear=清除歷史)")
-            q = input(">>> ").strip()
+            _raw = _safe_input(">>> ")
+            if _raw is None:
+                print("\n[BYE] stdin 結束，離開互動模式。")
+                break
+            q = _raw.strip()
 
             if q.lower() in ('q', 'quit', 'exit'):
                 print("[BYE] 再見!")

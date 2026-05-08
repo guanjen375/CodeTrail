@@ -4,9 +4,9 @@
     "question": "知識庫查詢的動態門檻比例 DYNAMIC_THRESHOLD_RATIO 預設值是多少？",
     "expected": {
       "refs": ["spec", "threshold"],
-      "keywords": ["0.8", "DYNAMIC_THRESHOLD_RATIO"],
+      "keywords": ["0.5", "DYNAMIC_THRESHOLD_RATIO"],
       "gold_chunks": ["DYNAMIC_THRESHOLD_RATIO"],
-      "gold_evidence": ["0.8"]
+      "gold_evidence": ["0.5"]
     }
   },
   {
@@ -14,19 +14,19 @@
     "question": "Reranker 模型的預設 top_n 設定值是多少？",
     "expected": {
       "refs": ["spec", "reranker"],
-      "keywords": ["10", "RERANKER_TOP_N"],
+      "keywords": ["6", "RERANKER_TOP_N"],
       "gold_chunks": ["RERANKER_TOP_N"],
-      "gold_evidence": ["10"]
+      "gold_evidence": ["6"]
     }
   },
   {
     "id": "spec_hold_003",
-    "question": "系統對 binary context 的預設最大行數限制是多少？",
+    "question": "BIN/ELF 報告的字元數上限是多少？",
     "expected": {
       "refs": ["spec", "binary"],
-      "keywords": ["50", "BINARY_MAX_CONTEXT_LINES"],
-      "gold_chunks": ["BINARY_MAX_CONTEXT_LINES"],
-      "gold_evidence": ["50"]
+      "keywords": ["25000", "BIN_ELF_REPORT_MAX_CHARS"],
+      "gold_chunks": ["BIN_ELF_REPORT_MAX_CHARS"],
+      "gold_evidence": ["25000"]
     }
   }
 ]

@@ -36,9 +36,9 @@
     "id": "spec_adv_004",
     "question": "系統使用的 embedding 模型參數量是多少 billion？",
     "expected": {
-      "keywords": ["未提及", "不確定", "mxbai-embed-large"],
+      "keywords": ["未提及", "不確定", "bge-m3"],
       "refs": [],
-      "gold_chunks": ["mxbai-embed-large"],
+      "gold_chunks": ["bge-m3"],
       "gold_evidence": [],
       "_description": "測試部分資訊問題：知道用什麼模型，但不知道參數量"
     }

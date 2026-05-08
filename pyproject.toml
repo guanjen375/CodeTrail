@@ -1,0 +1,38 @@
+# 不發 PyPI、不打包 — 這份檔只配置 pytest / ruff。
+# 套件 metadata 維持最小，避免搞 src/ layout 大重構。
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--tb=short",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+# 漸進式 lint：先只在 tests/ 與 scripts/ 強制。
+# 主程式碼歷史包袱大，等專屬清理 PR 再開。
+extend-exclude = [
+    ".venv",
+    "build",
+    "dist",
+    "node_modules",
+    "data",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+# E501 (line too long) 對歷史檔太吵；ruff format 會自動處理新檔。
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# 主要 Python 檔以 advisory 模式跑（不擋 CI），所以這裡不放嚴格規則。
+"tests/*" = []
+"scripts/*" = []

@@ -389,7 +389,40 @@ python eval/run_eval.py
 
 ---
 
-## 9. 安全 / NDA 注意
+## 9. 開發 / 工程治理
+
+repo 從個人研發工具升級成可維護的工程專案。改 code 之前先讀 [AGENTS.md](AGENTS.md)。
+
+### 9.1 本地驗證(不需要 Ollama)
+```bash
+python -m compileall -q .                      # syntax sanity
+python -m pytest                               # 31 個 smoke + 安全 test
+python scripts/check_eval_consistency.py       # eval ↔ config / source 不漂移
+ruff check tests scripts                       # lint(advisory)
+```
+
+### 9.2 測試覆蓋
+- `tests/test_cli.py` — `--help` / `-h` exit 0、未知 flag warn 不 crash、非 TTY 環境的 `--qa` 不 EOFError
+- `tests/test_config.py` — config 數值範圍、危險開關預設關閉、ALLOWED_COMMANDS 沒 rm/sudo/curl
+- `tests/test_sandbox.py` — `_safe_path` 擋下 `..` / 絕對路徑 / symlink 逃逸(agent_tools + media 兩條獨立 sandbox)
+- `tests/test_patch.py` — apply_patch 的 happy path、`../` 逃逸、context 不符、max files / max lines
+- `tests/test_run_command.py` — 白名單、shell 元字元(`; && | $() \``)、空命令
+- `tests/test_eval_consistency.py` — eval 提到的 symbol/file/config key 真的存在,gold_evidence 與當前 default 對齊
+
+### 9.3 改 config / docs / eval 的 SOP
+任何 `config.py`、`README.md`、`eval/*.json` 異動都要跑:
+```bash
+python scripts/check_eval_consistency.py
+python -m pytest tests/test_eval_consistency.py
+```
+歷史漂移範例(已修):`RERANKER_TOP_N` 改了但 eval 沒改、`_parse_unified_diff` 從 `agent.py` 搬到 `agent_tools.py`、`EMBEDDING_MODEL` 從 `mxbai-embed-large` 換成 `bge-m3`。
+
+### 9.4 CI
+`.github/workflows/ci.yml` 在 push / PR 上跑:`compileall → eval-consistency → pytest → ruff(advisory)`。**不依賴 Ollama / GPU / 大型模型下載** — 純靜態檢查,落地 ≤ 1 分鐘。
+
+---
+
+## 10. 安全 / NDA 注意
 
 ### 不會 commit 的衍生物(`.gitignore` 已涵蓋)
 - `knowledge.json` / `knowledge*.json` — RAG 知識庫(含 PDF chunks 全文)
@@ -417,7 +450,7 @@ python eval/run_eval.py
 
 ---
 
-## 10. 疑難排解
+## 11. 疑難排解
 
 | 症狀 | 解法 |
 |---|---|

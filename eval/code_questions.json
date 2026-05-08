@@ -5,7 +5,7 @@
     "expected": {
       "file": "agent.py",
       "symbol": "run_agent",
-      "line": 1654
+      "line": 459
     },
     "context": "."
   },
@@ -15,7 +15,7 @@
     "expected": {
       "file": "knowledge.py",
       "symbol": "query",
-      "line": 798
+      "line": 1624
     },
     "context": "."
   },
@@ -23,9 +23,9 @@
     "id": "code_003",
     "question": "找出處理 unified diff 的程式碼位置",
     "expected": {
-      "file": "agent.py",
+      "file": "agent_tools.py",
       "symbol": "_parse_unified_diff",
-      "line": 937
+      "line": 903
     },
     "context": "."
   },
@@ -35,7 +35,7 @@
     "expected": {
       "file": "code_rag.py",
       "symbol": "build_index",
-      "line": 335
+      "line": 424
     },
     "context": "."
   },
@@ -45,7 +45,7 @@
     "expected": {
       "file": "utils.py",
       "symbol": "call_llm",
-      "line": 100
+      "line": 343
     },
     "context": "."
   }
