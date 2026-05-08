@@ -32,15 +32,31 @@ def test_aicode_root_rejects_slash(tmp_path: Path):
     assert any("/" in m for m in r.fails)
 
 
-def test_aicode_root_warns_on_home(monkeypatch, tmp_path: Path):
-    """root=$HOME 在沒有 override env 時必須是 warn(不致命但要提醒)。"""
+def test_aicode_root_fails_on_home_by_default(monkeypatch, tmp_path: Path):
+    """root=$HOME 在沒有 AI_CODE_ALLOW_HOME_ROOT=1 時必須 FAIL。
+
+    與 mcp_server.py / bin/aicode 行為對齊 — 三者都拒絕,doctor 不能光給 warn。
+    """
     fake_home = tmp_path / "fakehome"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("AI_CODE_ALLOW_HOME_ROOT", raising=False)
     r = doc.Result()
     doc.check_aicode_root(r, str(fake_home))
-    assert r.warns, r.warns
+    assert r.fails, "AICODE_ROOT=$HOME 沒有 override 時應該 FAIL"
+    assert any("$HOME" in m or str(fake_home) in m for m in r.fails)
+
+
+def test_aicode_root_passes_home_with_override(monkeypatch, tmp_path: Path):
+    """root=$HOME + AI_CODE_ALLOW_HOME_ROOT=1 時可通過 (但帶 warn)。"""
+    fake_home = tmp_path / "fakehome"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("AI_CODE_ALLOW_HOME_ROOT", "1")
+    r = doc.Result()
+    doc.check_aicode_root(r, str(fake_home))
     assert not r.fails
+    assert r.warns, "override 後仍應該印高風險 warning"
 
 
 def test_aicode_root_passes_on_normal_dir(tmp_path: Path):

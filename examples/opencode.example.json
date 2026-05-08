@@ -10,7 +10,7 @@
       "models": {
         "qwen3-coder:30b": { "name": "Qwen3 Coder 30B" },
         "devstral:24b":    { "name": "Devstral 24B" },
-        "gpt-oss:latest":  { "name": "GPT-OSS 20B" }
+        "gpt-oss:20b":     { "name": "GPT-OSS 20B" }
       }
     }
   },

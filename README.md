@@ -1,11 +1,15 @@
 # ai_code — OpenCode + Ollama 的本地 MCP 後端
 
+> **設計初衷**:讓初學者(以及私人專案開發者)在自己的 repo 上,用本地 LLM 拿到
+> 具體的**程式碼修改建議** — 看架構、找 bug、查 spec、產 patch、跑測試 — 完全不用把程式碼送上雲。
+
 把 ai_code 包成 **MCP server**，接到 OpenCode TUI。在 OpenCode 對話框問問題，
 背後本地 Ollama 模型(Qwen3-coder / Devstral / GPT-OSS)會自動呼叫 ai_code
 提供的 11 個工具:查 RAG 知識庫、語意搜程式碼、列目錄、讀檔、grep、改檔、跑命令、
 分析圖片 / firmware / ELF、灌新文件進 KB。
 
 主要部署目標:**5090 32GB VRAM + 192GB RAM**，本地全離線推理，適合 NDA / 內部 firmware repo。
+較小的 GPU 也能跑(模型 offload 到 RAM,首 token 慢但可用)。
 
 ---
 
@@ -40,6 +44,29 @@ ai_code 目前是**成熟私有部署版**:
 - 改 bug 並驗證 — `apply_patch` + `run_command`(跑測試 / lint / build)
 - 分析錯誤截圖 / firmware blob / ELF — `analyze_file`
 - 把新 PDF / spec 灌進 KB — `ingest_document` + `reload_knowledge_base`
+
+---
+
+## 新手第一輪能拿到的「程式碼修改建議」
+
+裝好之後,你可以直接這樣問(完整範例見 [examples/first-prompts.md](examples/first-prompts.md)):
+
+```
+> 請列出這個 repo 的目錄結構,告訴我主要 entry point。
+
+> 找一下處理錯誤的相關程式,給我 file:line。
+
+> 這個 utils.py 的 should_ignore_dir 對大寫資料夾名沒 normalize,
+  幫我改成 case-insensitive,然後跑相關測試確認沒爆。
+
+> 把 spec.pdf 灌進知識庫並 reload,然後告訴我 conv2d 最大輸入大小。
+
+> analyze error.png 那是什麼錯誤,該怎麼修?
+```
+
+模型會自己決定用 `code_rag_search` / `read_file` / `apply_patch` / `run_command` /
+`query_knowledge` / `analyze_file` 等工具完成任務。**`apply_patch` 真的會寫檔**;
+建議在 git 控管下使用,出錯可 `git checkout -- .`。
 
 ---
 
@@ -218,7 +245,7 @@ ${EDITOR:-vi} "$HOME/.config/opencode/opencode.json"
       "models": {
         "qwen3-coder:30b": { "name": "Qwen3 Coder 30B" },
         "devstral:24b":    { "name": "Devstral 24B" },
-        "gpt-oss:latest":  { "name": "GPT-OSS 20B" }
+        "gpt-oss:20b":     { "name": "GPT-OSS 20B" }
       }
     }
   },
@@ -487,11 +514,18 @@ repo 從個人研發工具升級成可維護的工程專案。改 code 之前先
 
 ### 9.1 本地驗證(不需要 Ollama)
 ```bash
-python -m compileall -q .                      # syntax sanity
-python -m pytest                               # 31 個 smoke + 安全 test
-python scripts/check_eval_consistency.py       # eval ↔ config / source 不漂移
-ruff check tests scripts                       # lint(advisory)
+python -m compileall -q .                          # syntax sanity
+python scripts/run_tests.py                        # 51 個 smoke + 安全 test (deterministic)
+python scripts/check_eval_consistency.py           # eval ↔ config / source 不漂移
+python scripts/check_readme_consistency.py         # README ↔ mcp_server.py / config.py 不漂移
+python scripts/doctor.py --no-network              # preflight 檢查(本地)
+ruff check tests scripts                           # lint(advisory)
 ```
+
+> 為何用 `scripts/run_tests.py` 而不是直接 `python -m pytest`:
+> 它會設 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`,避免使用者環境裡全域裝的 pytest
+> plugin(ddtrace、xdist 等)在 collect 階段卡住或干擾 deterministic 結果。
+> 直接 `python -m pytest` 在乾淨環境下也能跑,但**遇到 hang 請改用 wrapper**。
 
 ### 9.2 測試覆蓋
 - `tests/test_cli.py` — `--help` / `-h` exit 0、未知 flag warn 不 crash、非 TTY 環境的 `--qa` 不 EOFError
@@ -555,7 +589,7 @@ python -m pytest tests/test_eval_consistency.py
 | `opencode: command not found` | `npm install -g opencode-ai`,確認 `npm bin -g` 在 PATH。 |
 | `[FATAL] 未設定 AICODE_ROOT` | 改用 `aicode` wrapper(自動帶 cwd);手跑 `opencode` 就先 `export AICODE_ROOT="<path>"`(Windows: `$env:AICODE_ROOT = "<path>"`)。 |
 | `[FATAL] 拒絕 AICODE_ROOT=/` | 故意擋的;cd 到具體 project 再跑。 |
-| `[FATAL] 拒絕 AICODE_ROOT=$HOME` | 故意擋的(範圍太大易漏資料);cd 到具體 project 再跑。真有需要設 `AI_CODE_ALLOW_HOME_ROOT=1`(高風險)。 |
+| `[FATAL] 拒絕 AICODE_ROOT=$HOME` | 故意擋的(範圍太大易漏資料);cd 到具體 project 再跑。真有需要設 `AI_CODE_ALLOW_HOME_ROOT=1`(高風險)。`bin/aicode`、`mcp_server.py`、`scripts/doctor.py --project $HOME` 三者行為一致。 |
 | `aicode: command not found` | symlink 沒做或 `~/.local/bin` 不在 PATH。重跑 `ln -s "$PWD/bin/aicode" "$HOME/.local/bin/aicode"`,`echo $PATH` 確認含 `~/.local/bin`。 |
 | OpenCode 看不到 ai_code 工具 | `opencode.json` JSON 格式錯、`<AICODE_REPO>` 沒換、或 `mcp_server.py` 路徑不對。`/status` 在 TUI 確認。 |
 | `query_knowledge` 永遠回 `not loaded` | `<AICODE_ROOT>/knowledge.json` 不存在;先 `ingest_document` 灌 PDF,再 `reload_knowledge_base`。 |
@@ -567,4 +601,4 @@ python -m pytest tests/test_eval_consistency.py
 | 模型回 `multi_tool_use.parallel invalid` | gpt-oss 的 quirk,把問題拆成單步問,或換 Qwen3-coder / Mistral-Small。 |
 | 模型亂選 `run_command` 跑 `dir` | 模型抽風;prompt 寫具體點(指定工具名:`code_rag_search` / `read_file`)。 |
 | VRAM 不夠跑 30B 很慢(部分 offload 到 CPU) | 預期行為;目標部署是 5090(32GB VRAM),小卡只能當測試。 |
-| pytest 卡住 / hang | 不應該發生(子行程都帶 timeout + stdin pipe)。若真發生請 file issue 並貼 `pytest -q --tb=long`。 |
+| `python -m pytest` 卡住 / hang | 你的環境裝了會自動載入 collect-time hook 的 pytest plugin(ddtrace、xdist 等)。改用 `python scripts/run_tests.py`,內部會 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`。 |

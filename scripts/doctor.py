@@ -218,10 +218,20 @@ def check_aicode_root(r: Result, project: str | None) -> None:
         return
 
     home = os.environ.get("HOME")
+    allow_home = os.environ.get("AI_CODE_ALLOW_HOME_ROOT", "").lower() in ("1", "true", "yes")
     if home and str(resolved) == str(Path(home).resolve()):
-        r.warn(
-            f"AICODE_ROOT=$HOME ({resolved}) 範圍很大，建議 cd 到具體 project；"
-            "要繼續可設 AI_CODE_ALLOW_HOME_ROOT=1 (高風險)"
+        if allow_home:
+            r.warn(
+                f"AICODE_ROOT=$HOME ({resolved}) — 已透過 AI_CODE_ALLOW_HOME_ROOT=1 放行，"
+                "高風險，請確認你真的知道在做什麼"
+            )
+            return
+        # 預設行為：與 mcp_server.py / bin/aicode 一致 → FAIL
+        r.fail(
+            f"AICODE_ROOT=$HOME ({resolved}) — 範圍太大、容易意外洩漏個人資料。\n"
+            "        cd 到具體 project 目錄再啟動。\n"
+            "        若真的有需要 (高風險，自行承擔), 設定環境變數:\n"
+            "        AI_CODE_ALLOW_HOME_ROOT=1"
         )
         return
 

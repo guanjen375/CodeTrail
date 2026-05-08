@@ -636,6 +636,78 @@ class ToolExecutor:
             count = sum(1 for _ in target.rglob("*") if _.is_file())
             return f"{path}: 目錄, {count} 個檔案"
 
+    # ============================================================
+    # Path containment for run_command
+    # ============================================================
+    # 帶路徑的常見 flag(下一個 token 是 path)
+    _PATH_FLAGS_NEXT = {
+        "-C", "--directory",
+        "-f", "--file",
+        "--build",
+        "--project", "--project-dir",
+        "--config", "-c",
+        "-S",  # cmake source
+        "-B",  # cmake build
+    }
+    # 形如 --foo=path 的 flag
+    _PATH_FLAGS_INLINE = {
+        "--directory", "--build", "--project", "--project-dir",
+        "--config", "-S", "-B", "--file",
+    }
+    # 看起來像 path 的 token(用來判斷哪些 free arg 要做 containment 檢查)
+    @staticmethod
+    def _looks_like_path(s: str) -> bool:
+        if not s or s.startswith("-"):
+            return False
+        # 絕對路徑、~ 開頭、含 /、含 .. — 都當 path 處理
+        if s.startswith(("/", "~", ".")) or "/" in s or "\\" in s:
+            return True
+        return False
+
+    def _path_arg_in_root(self, raw: str) -> tuple[bool, str]:
+        """判斷一個 path-like 參數是否在 sandbox root 內。
+
+        回傳 (ok, resolved_str)。
+        """
+        try:
+            p = Path(raw).expanduser()
+            if not p.is_absolute():
+                resolved = (self.root / p).resolve()
+            else:
+                resolved = p.resolve()
+            resolved.relative_to(self.root)
+            return True, str(resolved)
+        except (ValueError, OSError):
+            return False, raw
+
+    def _check_path_containment(self, cmd_parts: list) -> tuple[bool, str]:
+        """檢查白名單命令的所有 path-like 參數都在 root 內。"""
+        i = 0
+        while i < len(cmd_parts):
+            tok = cmd_parts[i]
+            # --foo=path 形式
+            if "=" in tok and tok.startswith("-"):
+                flag, _, val = tok.partition("=")
+                if flag in self._PATH_FLAGS_INLINE and self._looks_like_path(val):
+                    ok, _ = self._path_arg_in_root(val)
+                    if not ok:
+                        return False, f"路徑超出 sandbox: {flag}={val}"
+            # 帶下一個 token 的 path flag
+            elif tok in self._PATH_FLAGS_NEXT and i + 1 < len(cmd_parts):
+                nxt = cmd_parts[i + 1]
+                if self._looks_like_path(nxt):
+                    ok, _ = self._path_arg_in_root(nxt)
+                    if not ok:
+                        return False, f"路徑超出 sandbox: {tok} {nxt}"
+                i += 1  # consume value
+            # 自由 arg(不是 flag),看起來像 path 就檢查
+            elif not tok.startswith("-") and self._looks_like_path(tok):
+                ok, _ = self._path_arg_in_root(tok)
+                if not ok:
+                    return False, f"路徑超出 sandbox: {tok}"
+            i += 1
+        return True, ""
+
     def _validate_command(self, command: str) -> tuple[bool, str, list]:
         """驗證命令是否安全且在白名單中
 
@@ -670,6 +742,12 @@ class ToolExecutor:
             for pattern in dangerous_patterns:
                 if pattern in part:
                     return False, f"錯誤: 參數包含不允許的字元 '{pattern}'", []
+
+        # Path containment：白名單命令的參數不能逃出 AICODE_ROOT。
+        # 阻擋 `pytest /tmp/x.py`、`make -C /tmp`、`cmake --build /abs/build` 之類。
+        ok, why = self._check_path_containment(cmd_parts)
+        if not ok:
+            return False, f"錯誤: {why}（命令參數必須指向 AICODE_ROOT 內的路徑）", []
 
         return True, "", cmd_parts
 

@@ -25,7 +25,7 @@
     "expected": {
       "file": "agent_tools.py",
       "symbol": "_parse_unified_diff",
-      "line": 903
+      "line": 981
     },
     "context": "."
   },

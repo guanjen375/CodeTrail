@@ -25,7 +25,7 @@ python main.py --help
 
 # 本地驗證（不需要 Ollama）
 python -m compileall -q .
-python -m pytest
+python scripts/run_tests.py
 python scripts/check_eval_consistency.py
 
 # Lint（advisory，CI 不擋）
@@ -46,7 +46,7 @@ python main.py /path/to/repo "整體架構"
 
 ```bash
 python scripts/check_eval_consistency.py
-python -m pytest tests/test_eval_consistency.py
+python scripts/run_tests.py tests/test_eval_consistency.py
 ```
 
 漂移範例（已修，避免再犯）：
@@ -88,7 +88,7 @@ python -m pytest tests/test_eval_consistency.py
 
 1. 改程式碼。
 2. 新加或更新 tests（至少：CLI smoke、安全邏輯、edge case）。
-3. 跑 `python -m pytest`、`python scripts/check_eval_consistency.py`、
+3. 跑 `python scripts/run_tests.py`、`python scripts/check_eval_consistency.py`、
    `python -m compileall -q .` — 三個都過才送 PR / 提交。
 4. 如果改了 `config.py` / MCP tool schema / `README.md`，再跑一次 eval consistency。
 

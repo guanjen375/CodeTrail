@@ -15,10 +15,16 @@
 要同步改的地方:
 
 - [ ] `config.py` — `MODEL` / `EMBEDDING_MODEL` / `RERANKER_MODEL` / `VL_MODEL`
-- [ ] `README.md` — 模型 pull 指令、`opencode.json` model 列表、§4 工具說明若有引用
-- [ ] `examples/opencode.example.json` — 若 OpenCode UI 列出的 model 名要更新
+- [ ] `README.md` 內 `ollama pull <model>:<tag>` 指令
+- [ ] `README.md` 內嵌的 `opencode.json` 範例的 `models` 區塊
+- [ ] `examples/opencode.example.json` 的 `models` 區塊
 - [ ] `eval/spec_questions.json` / `spec_holdout.json` / `spec_adversarial.json` —
       若任何 `gold_evidence` 對應到舊模型名
+
+**重點**:`README.md` 的 `ollama pull` 指令、README 內嵌 opencode JSON、
+`examples/opencode.example.json` 三處的 **model:tag 必須完全一致**。
+不要 README 寫 `gpt-oss:20b` 而 example 寫 `gpt-oss:latest` — 新手會 pull 錯。
+`scripts/check_readme_consistency.py` 會偵測到這種 drift,CI 會 fail。
 
 跑這些確認沒漏:
 
@@ -46,7 +52,7 @@ python scripts/doctor.py            # 確認 ollama 真的 pull 了新模型
 
 ```bash
 python scripts/check_readme_consistency.py     # 工具數字 + 名字必須一致
-python -m pytest -q
+python scripts/run_tests.py -q
 ```
 
 ---
@@ -60,15 +66,21 @@ python -m pytest -q
 - [ ] `config.py` — `ALLOWED_COMMANDS`(基本測試 / 靜態分析)
 - [ ] `mcp_server.py` — `_EXTRA_BUILD_COMMANDS`(build 系列;OpenCode + MCP 特有)
 - [ ] `README.md` §4「`run_command` 白名單」描述
-- [ ] `tests/test_run_command.py` — 為新命令補 happy / 拒絕 path
+- [ ] `tests/test_run_command.py` — 為新命令補 happy / 拒絕 path,**含 path containment**
 - [ ] `tests/test_config.py` 內的危險命令黑名單仍然要拒絕 `rm/sudo/curl/...`
 
 **禁忌**:不要加 `rm` / `sudo` / `curl` / `wget` / `bash` / `sh` / `chmod` / `mkfs` / `dd`。
 
+**Path containment**:新命令若會吃路徑參數(`-C`、`--directory`、`--build`、
+`--config` 之類),`agent_tools._validate_command` 會檢查路徑必須在 `AICODE_ROOT` 內,
+擋掉 `pytest /tmp/x.py`、`make -C /tmp` 之類的逃逸。若新命令用了非標準的 path flag,
+把它加進 `agent_tools._PATH_FLAGS_NEXT` 或 `_PATH_FLAGS_INLINE`,並補一條拒絕測試 +
+一條 root 內 happy 測試。
+
 跑:
 
 ```bash
-python -m pytest tests/test_run_command.py tests/test_config.py
+python scripts/run_tests.py tests/test_run_command.py tests/test_config.py
 ```
 
 ---
@@ -89,7 +101,7 @@ python -m pytest tests/test_run_command.py tests/test_config.py
 
 ```bash
 python RAG.py --help                           # 必須 0 即返回
-python -m pytest -q
+python scripts/run_tests.py -q
 ```
 
 ---
@@ -123,7 +135,7 @@ python -m pytest -q
 python scripts/check_readme_consistency.py
 python scripts/check_eval_consistency.py
 python scripts/doctor.py --no-network
-python -m pytest -q
+python scripts/run_tests.py -q
 ```
 
 四條都過才算完成。
