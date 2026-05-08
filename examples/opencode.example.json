@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama",
+      "options": {
+        "baseURL": "http://localhost:11434/v1"
+      },
+      "models": {
+        "qwen3-coder:30b": { "name": "Qwen3 Coder 30B" },
+        "devstral:24b":    { "name": "Devstral 24B" },
+        "gpt-oss:latest":  { "name": "GPT-OSS 20B" }
+      }
+    }
+  },
+  "mcp": {
+    "ai_code": {
+      "type": "local",
+      "command": ["python", "<AICODE_REPO>/mcp_server.py"],
+      "enabled": true
+    }
+  }
+}

@@ -185,6 +185,10 @@ def run_qa_mode(question: str, kb: "KnowledgeBase", qa_history: list = None):
 
         print_ctx_usage(len(prompt))
         result = call_llm_stream(prompt, temperature=0.3)
+        # call_llm_stream 在錯誤時會把錯誤印到 stderr，但 stdout 上「[NOTE] 回答:」
+        # 之後一片空白會讓使用者誤以為卡住 — 補一行 stdout 提示。
+        if isinstance(result, str) and result.startswith("[ERROR]"):
+            print("\n(模型呼叫失敗，詳見上方錯誤訊息)")
 
     # 資料飛輪：記錄互動
     if DATA_COLLECT_ENABLED:

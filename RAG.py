@@ -1919,6 +1919,11 @@ def print_usage():
 
 
 if __name__ == "__main__":
+    # --help / -h 短路:cheap path,不需要 Ollama / 不讀檔
+    if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help"):
+        print_usage()
+        sys.exit(0)
+
     # 解析參數
     if len(sys.argv) < 3:
         print_usage()

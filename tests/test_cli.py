@@ -13,9 +13,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _run(args, timeout=30, stdin_data: str | None = ""):
-    """把 main.py 當子行程跑，避免污染當前 process（main.py import 時會改 stdout encoding）。"""
+    """把 main.py 當子行程跑。
+
+    - 強制 stdin 為 PIPE 並餵 stdin_data，避免繼承 tty 而卡在 input()。
+    - 強制 capture stdout/stderr，避免測試 runner 卡在 pipe buffer。
+    - 帶 timeout，永遠不會 hang。
+    """
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
+    # 防止子行程意外連到 Ollama 卡住（測試本身應該都是 cheap path）。
+    env["AICODE_OLLAMA_BASE_URL"] = env.get("AICODE_OLLAMA_BASE_URL", "http://127.0.0.1:1")
     return subprocess.run(
         [sys.executable, str(REPO_ROOT / "main.py"), *args],
         cwd=str(REPO_ROOT),
@@ -70,6 +77,52 @@ def test_main_module_import_does_not_run_interactive():
         "m = importlib.import_module('main');"
         "assert hasattr(m, 'main')"
     )
-    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30,
+                       stdin=subprocess.DEVNULL)
     assert r.returncode == 0, r.stderr
+
+
+def test_rag_help_exits_zero():
+    """`python RAG.py --help` 必須能 cheap return 0。"""
+    r = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "RAG.py"), "--help"],
+        capture_output=True, text=True, timeout=15,
+        stdin=subprocess.DEVNULL,
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+    )
+    assert r.returncode == 0, f"exit={r.returncode}\n{r.stderr}"
+    assert "用法" in r.stdout or "usage" in r.stdout.lower()
+    assert "Traceback" not in r.stderr
+
+
+def test_run_eval_help_exits_zero():
+    """`python eval/run_eval.py --help` 必須能 cheap return 0,不需要 Ollama。"""
+    r = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "eval" / "run_eval.py"), "--help"],
+        capture_output=True, text=True, timeout=15,
+        stdin=subprocess.DEVNULL,
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+    )
+    assert r.returncode == 0, f"exit={r.returncode}\n{r.stderr}"
+    assert "usage" in r.stdout.lower() or "用法" in r.stdout
+    assert "Traceback" not in r.stderr
+
+
+def test_qa_with_question_when_ollama_down_shows_error_not_traceback():
+    """Ollama 不可連時,使用者必須看到清楚的 error,不是 traceback,不是 silent。"""
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["AICODE_OLLAMA_BASE_URL"] = "http://127.0.0.1:1"  # 確定關閉的 port
+    r = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "main.py"), "--qa", "測試"],
+        capture_output=True, text=True, timeout=30,
+        stdin=subprocess.DEVNULL,
+        cwd=str(REPO_ROOT),
+        env=env,
+    )
+    assert "Traceback (most recent call last)" not in r.stderr, r.stderr
+    combined = r.stdout + r.stderr
+    # 應該看到我們新的 ERROR 訊息(對使用者交代得很清楚)
+    assert "[ERROR]" in combined
+    assert "Ollama" in combined
     assert ">>> " not in r.stdout

@@ -30,19 +30,56 @@ def _log(msg: str) -> None:
     sys.stderr.flush()
 
 
-_root_env = os.environ.get("AICODE_ROOT")
-if not _root_env:
-    _log(
-        "[FATAL] 未設定 AICODE_ROOT 環境變數。\n"
-        "        為避免誤掃 cwd 或洩漏 NDA 內容,server 拒絕啟動。\n"
-        "        範例:  AICODE_ROOT=/path/to/project python mcp_server.py"
-    )
-    sys.exit(2)
+def _validate_aicode_root(root_env: str | None, home: str | None,
+                          allow_home_override: bool) -> tuple[str | None, str | None]:
+    """純函式：判斷 AICODE_ROOT 是否安全。回傳 (resolved_root, error_msg)。
 
-AICODE_ROOT = str(Path(_root_env).resolve())
-if not Path(AICODE_ROOT).is_dir():
-    _log(f"[FATAL] AICODE_ROOT 不是目錄: {AICODE_ROOT}")
+    抽出來方便 tests 不啟動 FastMCP / mcp 套件就能驗證。
+    """
+    if not root_env:
+        return None, (
+            "[FATAL] 未設定 AICODE_ROOT 環境變數。\n"
+            "        為避免誤掃 cwd 或洩漏 NDA 內容, server 拒絕啟動。\n"
+            "        範例:  AICODE_ROOT=/path/to/project python mcp_server.py"
+        )
+    try:
+        resolved = str(Path(root_env).resolve())
+    except (OSError, ValueError) as e:
+        return None, f"[FATAL] AICODE_ROOT 無法解析: {e}"
+
+    if not Path(resolved).is_dir():
+        return None, f"[FATAL] AICODE_ROOT 不是目錄: {resolved}"
+
+    if resolved == "/":
+        return None, (
+            "[FATAL] 拒絕 AICODE_ROOT=/ — 會把整個檔案系統暴露給 MCP sandbox。\n"
+            "        cd 到具體 project 目錄再啟動 mcp_server.py。"
+        )
+    if home:
+        try:
+            home_resolved = str(Path(home).resolve())
+        except (OSError, ValueError):
+            home_resolved = home
+        if resolved == home_resolved and not allow_home_override:
+            return None, (
+                f"[FATAL] 拒絕 AICODE_ROOT=$HOME ({home_resolved})。\n"
+                "        $HOME 範圍太大且很容易意外洩漏個人資料。\n"
+                "        cd 到具體 project 目錄再啟動。\n"
+                "        若真的有需要 (高風險，自行承擔), 設定:\n"
+                "        AI_CODE_ALLOW_HOME_ROOT=1"
+            )
+    return resolved, None
+
+
+AICODE_ROOT, _err = _validate_aicode_root(
+    os.environ.get("AICODE_ROOT"),
+    os.environ.get("HOME"),
+    allow_home_override=os.environ.get("AI_CODE_ALLOW_HOME_ROOT", "").lower() in ("1", "true", "yes"),
+)
+if _err:
+    _log(_err)
     sys.exit(2)
+assert AICODE_ROOT is not None  # for type checkers
 
 import config
 from config import KNOWLEDGE_FILE, KNOWLEDGE_EMB_FILE, RUN_COMMAND_TIMEOUT

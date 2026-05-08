@@ -360,13 +360,38 @@ def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None) -> str:
         resp.raise_for_status()
         return resp.json().get("response", "")
     except Exception as e:
-        err_type = type(e).__name__
-        if "ConnectionError" in err_type:
-            return "[ERROR] 無法連接 Ollama"
-        elif "Timeout" in err_type:
-            return "[ERROR] 請求超時"
-        else:
-            return f"[ERROR] 錯誤: {e}"
+        return _llm_error_message(e)
+
+
+def _llm_error_message(e: Exception) -> str:
+    """把底層例外轉成新手看得懂的多行錯誤字串。
+
+    呼叫端拿到的字串都以 '[ERROR]' 開頭，方便上層 detect 與 propagate。
+    """
+    from config import OLLAMA_BASE_URL
+    err_type = type(e).__name__
+    if "ConnectionError" in err_type or "ConnectionRefused" in err_type:
+        return (
+            f"[ERROR] 無法連接 Ollama ({OLLAMA_BASE_URL})。\n"
+            "   1. ollama serve 是否正在執行？(Linux: systemctl --user status ollama)\n"
+            "   2. 防火牆 / port 是否被擋？\n"
+            "   3. config.py 的 OLLAMA_BASE_URL 或環境變數 AICODE_OLLAMA_BASE_URL 是否正確？\n"
+            f"   可先執行: curl -s {OLLAMA_BASE_URL}/api/tags"
+        )
+    if "Timeout" in err_type or "ReadTimeout" in err_type:
+        return (
+            "[ERROR] Ollama 請求超時。\n"
+            "   首次載入 30B 模型可能要 10–30 秒；若仍持續，模型可能太大、VRAM 不夠或 server 卡住。\n"
+            "   檢查: ollama ps  /  nvidia-smi"
+        )
+    if "HTTPError" in err_type or "404" in str(e):
+        from config import MODEL as _M
+        return (
+            f"[ERROR] Ollama 回 HTTP 錯誤: {e}\n"
+            f"   常見原因：模型 {_M!r} 沒有 pull。\n"
+            f"   檢查: ollama list  /  必要時 ollama pull {_M}"
+        )
+    return f"[ERROR] LLM 呼叫失敗 ({err_type}): {e}"
 
 
 def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None) -> str:
@@ -435,13 +460,14 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None) 
         return "".join(full_response)
 
     except Exception as e:
-        err_type = type(e).__name__
-        if "ConnectionError" in err_type:
-            return "[ERROR] 無法連接 Ollama"
-        elif "Timeout" in err_type:
-            return "[ERROR] 請求超時"
-        else:
-            return f"[ERROR] 錯誤: {e}"
+        msg = _llm_error_message(e)
+        # 串流模式下要主動 print，否則使用者看不到：等於是「卡住」的觀感。
+        # 用 stderr 避免污染呼叫端可能要 capture 的 stdout 內容。
+        try:
+            print(msg, file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        return msg
 
 
 def is_spec_question(question: str) -> bool:

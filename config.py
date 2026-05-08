@@ -9,7 +9,8 @@ import os as _os
 # Ollama 設定
 # ============================================================
 # 所有 Ollama API URL 都從這裡集中管理，方便切換遠端或改 port
-OLLAMA_BASE_URL = "http://localhost:11434"
+# 可用 AICODE_OLLAMA_BASE_URL 環境變數覆寫（測試 / 遠端 Ollama 用）
+OLLAMA_BASE_URL = _os.environ.get("AICODE_OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_GENERATE_URL = f"{OLLAMA_BASE_URL}/api/generate"
 OLLAMA_CHAT_URL = f"{OLLAMA_BASE_URL}/api/chat"
 OLLAMA_EMBEDDINGS_URL = f"{OLLAMA_BASE_URL}/api/embeddings"

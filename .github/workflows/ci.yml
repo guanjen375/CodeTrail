@@ -31,8 +31,14 @@ jobs:
       - name: Eval consistency
         run: python scripts/check_eval_consistency.py
 
+      - name: README consistency
+        run: python scripts/check_readme_consistency.py
+
+      - name: Doctor (no-network)
+        run: python scripts/doctor.py --no-network
+
       - name: Pytest
-        run: python -m pytest
+        run: python -m pytest -q
 
       - name: Ruff (advisory — does not fail CI yet)
         run: ruff check tests scripts || true

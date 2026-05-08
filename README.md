@@ -1,12 +1,104 @@
-# ai_code — OpenCode 後端工具集
+# ai_code — OpenCode + Ollama 的本地 MCP 後端
 
-把 ai_code 包成 **MCP server**,接到 OpenCode TUI。在 OpenCode 對話框問問題,
-背後 LLM(Devstral / Qwen3-coder / GPT-OSS 等本地 Ollama 模型)會自動呼叫
-ai_code 提供的 11 個工具:查 RAG 知識庫、語意搜程式碼、列目錄、讀檔、grep、改檔、
-跑命令、分析圖片/firmware、灌新文件進 KB。
+把 ai_code 包成 **MCP server**，接到 OpenCode TUI。在 OpenCode 對話框問問題，
+背後本地 Ollama 模型(Qwen3-coder / Devstral / GPT-OSS)會自動呼叫 ai_code
+提供的 11 個工具:查 RAG 知識庫、語意搜程式碼、列目錄、讀檔、grep、改檔、跑命令、
+分析圖片 / firmware / ELF、灌新文件進 KB。
 
-> **部署目標:5090 32GB VRAM + 192GB RAM**,本地全離線推理,適合 NDA / 內部 firmware repo。
-> **個人使用工具,沒做完整安全審計**,不建議公開部署。
+主要部署目標:**5090 32GB VRAM + 192GB RAM**，本地全離線推理，適合 NDA / 內部 firmware repo。
+
+---
+
+## 專案狀態:成熟私有部署版,但不打算公開發布
+
+ai_code 目前是**成熟私有部署版**:
+
+- 主要使用路線是 **OpenCode + Ollama + MCP**;CLI(`main.py`)模式也保留可用。
+- 適合本機、離線、NDA / firmware / private repo 分析。
+- **不打算公開發布**,不是 PyPI package、不是 Docker image、也不是 SaaS。
+- repo 內有 smoke tests、sandbox safety tests、eval consistency check、README
+  consistency check 與 GitHub Actions CI。
+- 上面這些測試代表**基本功能與安全邊界有自檢**,但**未做公開產品級安全審計**,
+  也未經大規模實戰驗證。
+- 部分 advanced path(特定模型 tool-calling 行為、大型 PDF ingestion、
+  firmware binary 分析)仍依部署環境實測為準。
+
+未來要改 README 請看 [docs/README_EDITING.md](docs/README_EDITING.md)。
+未來給 AI agent 改 code 的規範看 [AGENTS.md](AGENTS.md)。
+
+---
+
+## 你可以用它做什麼
+
+從 OpenCode 對話框,模型會自動連出去叫這些工具:
+
+- 問 repo 架構 — `code_rag_search` + `read_file` + `list_dir`
+- 找特定函式位置 — `code_rag_search` 語意搜尋
+- 查 spec / PDF 規格 — `query_knowledge`(走 RAG 知識庫)
+- 比對「規格 vs 實作」 — `query_knowledge` + `code_rag_search`
+- grep 程式碼 — `grep_code`
+- 改 bug 並驗證 — `apply_patch` + `run_command`(跑測試 / lint / build)
+- 分析錯誤截圖 / firmware blob / ELF — `analyze_file`
+- 把新 PDF / spec 灌進 KB — `ingest_document` + `reload_knowledge_base`
+
+---
+
+## 最短使用路線(5 分鐘版)
+
+> 假設你 Linux,已安裝 Python 3.10+ 和 Node.js LTS。Windows / macOS 細節在
+> 各章節「備註」段。
+
+```bash
+# 1. 安裝 Ollama (本地推理引擎)
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull qwen3-coder:30b
+ollama pull bge-m3
+ollama pull qllama/bge-reranker-v2-m3
+
+# 2. 安裝 OpenCode TUI
+npm install -g opencode-ai
+
+# 3. 安裝 ai_code 的 Python 依賴
+cd <AICODE_REPO>
+pip install -r requirements.txt
+pip install mcp           # MCP server 必裝
+
+# 4. 自檢(關鍵 — 沒過先別繼續)
+python scripts/doctor.py
+
+# 5. 設定 OpenCode → 把 examples/opencode.example.json 抄到
+#    ~/.config/opencode/opencode.json,把 <AICODE_REPO> 換掉
+cp examples/opencode.example.json ~/.config/opencode/opencode.json
+${EDITOR:-vi} ~/.config/opencode/opencode.json   # 改裡面的 <AICODE_REPO>
+
+# 6. 把 aicode wrapper 放進 PATH
+ln -s "$PWD/bin/aicode" "$HOME/.local/bin/aicode"
+
+# 7. 跳到要分析的 project,啟動
+cd <PATH_TO_PROJECT_TO_ANALYZE>
+aicode
+
+# 8. 在 TUI 裡問第一個問題,例如:
+#    > 請列出這個 repo 的目錄結構,告訴我主要 entry point
+```
+
+**這樣就完成了。** 細節 / 出錯排查 / 進階用法看下面各章節。
+新手第一輪可以問什麼:看 [examples/first-prompts.md](examples/first-prompts.md)。
+
+---
+
+## 安裝前檢查 — `doctor.py`
+
+`scripts/doctor.py` 是新手最該先跑的檢查工具。會印 PASS / WARN / FAIL,
+告訴你哪一步沒做。
+
+```bash
+python scripts/doctor.py                       # 全檢(會試連 Ollama)
+python scripts/doctor.py --no-network          # 只檢查本地檔案
+python scripts/doctor.py --project /path/proj  # 順便檢查那個 project 是否安全的 root
+```
+
+`exit=0` 表示沒有 FAIL(可以直接用);`exit=1` 表示有 FAIL,跟著訊息修。
 
 ---
 
@@ -452,16 +544,27 @@ python -m pytest tests/test_eval_consistency.py
 
 ## 11. 疑難排解
 
+> **第一個動作:跑 `python scripts/doctor.py`** — 大部分問題會在那裡告訴你哪一步壞了。
+
 | 症狀 | 解法 |
 |---|---|
-| `[FATAL] 未設定 AICODE_ROOT` | 改用 `aicode`(自動帶 cwd);要手跑 `opencode` 就先 `export AICODE_ROOT="<path>"`(Windows:`$env:AICODE_ROOT = "<path>"`) |
-| `aicode: command not found` | symlink 沒做或 `~/.local/bin` 不在 PATH。重跑 `ln -s "$PWD/bin/aicode" "$HOME/.local/bin/aicode"` 並確認 `echo $PATH` 含 `~/.local/bin` |
-| `[aicode] refusing AICODE_ROOT=$HOME` | 你在 `$HOME` 直接跑 `aicode`,先 `cd` 進專案目錄 |
-| OpenCode 看不到 ai_code 工具 | `opencode.json` JSON 格式或路徑寫錯,重新驗證;或 `mcp_server.py` 路徑不對 |
-| `model 'xxx' not found` | `ollama list` 確認模型 tag,改 config 對齊 |
-| 模型回 `multi_tool_use.parallel invalid` | gpt-oss 的 quirk,把問題拆成單步問,或換 Mistral-Small |
-| `ingest_document` 超時 | 大型 PDF(>500 頁)請改 CLI:`python RAG.py xxx.pdf knowledge.json` |
-| `query_knowledge` 永遠回 `not loaded` | 確認 `<AICODE_ROOT>/knowledge.json` 存在,server 啟動 log 應該印 `已載入 N chunks` |
-| `analyze_file` 對截圖 OCR 失敗 | 檢查 `ollama pull qwen3-vl:30b-a3b` 跑過、`config.VL_MODEL` 對得上 |
-| 模型亂選 `run_command` 跑 `dir` | 模型抽風,prompt 寫具體點(指定工具名) |
-| VRAM 不夠跑 30B 很慢(部分 offload 到 CPU) | 預期行為;目標部署是 5090(32GB VRAM),小卡只當測試 |
+| `[ERROR] 無法連接 Ollama` | `ollama serve` 沒開;`systemctl --user status ollama`(Linux);測連線 `curl -s http://localhost:11434/api/tags`。也可用 `AICODE_OLLAMA_BASE_URL` 環境變數指到別的 host。 |
+| `[ERROR] Ollama 請求超時` | 首次 30B 模型 cold start 要 10–30 秒。仍持續就 `ollama ps` 看是否模型卡住、VRAM 不夠;改小 `config.NUM_CTX` 或換模型。 |
+| `[ERROR] Ollama 回 HTTP 錯誤 ... model not found` | `ollama pull <model>`。`config.py` 內 `MODEL` / `EMBEDDING_MODEL` / `RERANKER_MODEL` 都要 pull 過。 |
+| `mcp` package missing | `pip install mcp`。CLI 模式不需要 mcp,只有 OpenCode + MCP 路線需要。 |
+| `opencode: command not found` | `npm install -g opencode-ai`,確認 `npm bin -g` 在 PATH。 |
+| `[FATAL] 未設定 AICODE_ROOT` | 改用 `aicode` wrapper(自動帶 cwd);手跑 `opencode` 就先 `export AICODE_ROOT="<path>"`(Windows: `$env:AICODE_ROOT = "<path>"`)。 |
+| `[FATAL] 拒絕 AICODE_ROOT=/` | 故意擋的;cd 到具體 project 再跑。 |
+| `[FATAL] 拒絕 AICODE_ROOT=$HOME` | 故意擋的(範圍太大易漏資料);cd 到具體 project 再跑。真有需要設 `AI_CODE_ALLOW_HOME_ROOT=1`(高風險)。 |
+| `aicode: command not found` | symlink 沒做或 `~/.local/bin` 不在 PATH。重跑 `ln -s "$PWD/bin/aicode" "$HOME/.local/bin/aicode"`,`echo $PATH` 確認含 `~/.local/bin`。 |
+| OpenCode 看不到 ai_code 工具 | `opencode.json` JSON 格式錯、`<AICODE_REPO>` 沒換、或 `mcp_server.py` 路徑不對。`/status` 在 TUI 確認。 |
+| `query_knowledge` 永遠回 `not loaded` | `<AICODE_ROOT>/knowledge.json` 不存在;先 `ingest_document` 灌 PDF,再 `reload_knowledge_base`。 |
+| `query_knowledge` 有 KB 但回不到答案 | 灌的 PDF 跟問題無關,或 query 太抽象;翻翻 KB chunks。 |
+| `ingest_document` 超時 | 大型 PDF(>500 頁)改 CLI:`python RAG.py xxx.pdf knowledge.json`。 |
+| `analyze_file` 對截圖 OCR 失敗 | `ollama pull qwen3-vl:30b-a3b`、確認 `config.VL_MODEL` 對得上。 |
+| `run_command 不允許的命令` | 故意擋的;只有 `config.ALLOWED_COMMANDS` 內的命令可跑。要加白名單請改 `config.py` 並補測試。 |
+| `apply_patch` 失敗:context 不符 | Patch 的 ` ` / `-` 行必須與檔案實際內容對得上;讓模型 `read_file` 重看一次再產 patch。 |
+| 模型回 `multi_tool_use.parallel invalid` | gpt-oss 的 quirk,把問題拆成單步問,或換 Qwen3-coder / Mistral-Small。 |
+| 模型亂選 `run_command` 跑 `dir` | 模型抽風;prompt 寫具體點(指定工具名:`code_rag_search` / `read_file`)。 |
+| VRAM 不夠跑 30B 很慢(部分 offload 到 CPU) | 預期行為;目標部署是 5090(32GB VRAM),小卡只能當測試。 |
+| pytest 卡住 / hang | 不應該發生(子行程都帶 timeout + stdin pipe)。若真發生請 file issue 並貼 `pytest -q --tb=long`。 |
