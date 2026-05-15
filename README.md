@@ -17,7 +17,7 @@ ai_code 目前定位是**成熟私有部署版**：適合本機、離線、NDA /
 
 - **OpenCode**：對話式 TUI，負責跟模型互動、顯示工具呼叫。
 - **Ollama**：在本機跑主要 coding model、embedding model、reranker 和視覺模型。
-- **ai_code MCP server**：把目前專案限制在 `AICODE_ROOT` 沙箱內，提供 11 個 MCP 工具給 OpenCode。
+- **ai_code MCP server**：把目前專案限制在 `AICODE_ROOT` 沙箱內，提供 16 個 MCP 工具給 OpenCode。
 - **`aicode` wrapper**：從目前目錄啟動 OpenCode，並把目前目錄自動設成 `AICODE_ROOT`。
 
 資料流：
@@ -274,6 +274,14 @@ docs/npu_spec.pdf
 請用 query_knowledge 查 conv2d 輸入大小限制，回答時附 REF 來源。
 ```
 
+如果是「答錯比不答更糟」的數值/規格題（例如 timing、寄存器位寬、預設值），改走嚴格模式：
+
+```text
+請用 query_knowledge_strict 查 reset assert 最小持續時間，KB 證據不夠就直接拒答，不要靠常識補。
+```
+
+`query_knowledge_strict(...)` 會在 server 端跑兩階段自我檢查（用 `AICODE_MODEL` 那顆模型），定稿才回傳；OpenCode TUI 看不到中間 streaming，但 server stderr 有完整日誌。
+
 ### 4.5 看截圖、ELF、firmware
 
 檔案一樣要先放進 `AICODE_ROOT` 內：
@@ -296,16 +304,21 @@ build/output.elf
 
 ---
 
-## 5. ai_code 暴露的 11 個 MCP 工具
+## 5. ai_code 暴露的 16 個 MCP 工具
 
 | 工具 | 何時用 |
 |---|---|
 | `query_knowledge(question)` | 查已匯入的 PDF / spec / manual / TXT，回傳 refs 與引用文字 |
+| `query_knowledge_strict(question)` | 規格題嚴格模式：server 端跑 KB 自我檢查，弱證據自動拒答 |
 | `code_rag_search(query, top_k=5)` | 不知道函式在哪時，用行為描述找相關 symbol 與 file:line |
 | `list_dir(path=".", depth=2)` | 看專案目錄樹，替代直接跑 `ls` |
-| `read_file(path, max_chars=50000)` | 讀沙箱內文字檔，輸出帶行號 |
-| `grep_code(pattern, path=".")` | 在沙箱內搜尋 regex 或字串 |
-| `apply_patch(diff)` | 套 unified diff，會直接寫檔 |
+| `read_file(path, start_line=1, end_line=None, max_chars=50000)` | 讀沙箱內文字檔，輸出帶行號；長檔可分段讀 |
+| `grep_code(pattern, path=".", include=None, context=0)` | 在沙箱內搜尋 regex 或字串，可限副檔名、附上下文 |
+| `file_info(path)` | 取得檔案行數/字元數或目錄底下檔案數，`read_file` 前先衡量大小 |
+| `apply_patch(diff, dry_run=False)` | 套 unified diff；`dry_run=True` 只預覽不寫檔 |
+| `git_status()` | git 工作樹狀態（已修改 / 未追蹤），人類可讀標籤 |
+| `git_diff(path=None, staged=False)` | git diff，可限路徑或看已暫存內容 |
+| `run_lint(path, fix=True)` | 依副檔名挑工具 lint/format 單一檔案 |
 | `run_command(cmd)` | 跑白名單內的 test / lint / build 命令 |
 | `analyze_file(path)` | 分析圖片 OCR、ELF、binary / firmware |
 | `ingest_document(path)` | 將 PDF / MD / TXT 加進 `knowledge.json` |
@@ -315,8 +328,11 @@ build/output.elf
 工具使用原則：
 
 - 先 `code_rag_search(...)` 再 `read_file(...)`，可以少讀很多不相關檔案。
-- 查 spec 先 `query_knowledge(...)`，不要直接讓模型憑記憶回答限制值。
+- 長檔用 `file_info(...)` 先看大小，再用 `read_file(path, start_line, end_line)` 分段讀。
+- 查 spec 先 `query_knowledge(...)`；只要是「答錯比不答更糟」的規格/數值/限制題，改用 `query_knowledge_strict(...)` 走嚴格模式 + 自動拒答。
+- 改檔前可以 `apply_patch(diff, dry_run=True)` 先預覽，再正式套用。
 - 新增或刪除文件後一定要 `reload_knowledge_base()`。
+- 查 git 變更用 `git_status` / `git_diff`，不要透過 `run_command` 跑 git（不在白名單）。
 - `apply_patch(...)` 和 `run_command(...)` 有副作用；需要改檔或執行專案腳本時才允許。
 
 ---
@@ -451,6 +467,16 @@ set_sandbox_root(AICODE_ROOT, allow_external=False)
 - `.opencode/`
 - `data/`
 - `*.jsonl`
+
+### 8.5 資料飛輪（選用）
+
+設 `AI_CODE_COLLECT_DATA=1` 啟動 `aicode`，KB-shaped 工具（`query_knowledge` / `query_knowledge_strict` / `code_rag_search`）的每次呼叫會 append 一筆到 `data/interactions.jsonl`，含問題、回答（或 `[REFUSED]` / `[SKIPPED_STRICT:...]`）、refs、KB 分數與當下 git commit。預設關閉。
+
+該檔在 NDA 場景必然含敏感片段，已在 §8.4 列入「不要 commit 的資料」。要看統計或匯出訓練語料，跑：
+
+```bash
+python data_flywheel.py stats
+```
 
 ---
 

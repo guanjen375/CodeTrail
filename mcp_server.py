@@ -10,6 +10,7 @@ ai_code MCP server — 把 KnowledgeBase / CodeRAG / agent_tools 包成 MCP tool
 不取代 main.py 的 CLI 模式,獨立 entry point。
 """
 
+import contextlib
 import os
 import sys
 import io
@@ -88,6 +89,13 @@ from code_rag import CodeRAG
 from agent_tools import ToolExecutor
 from media import set_sandbox_root, ocr_image, read_elf, read_binary, IMAGE_EXTENSIONS, ELF_EXTENSIONS, BINARY_EXTENSIONS
 from http_client import close_session
+from utils import (
+    answer_with_self_check,
+    needs_grounding,
+    should_refuse_answer,
+    should_use_strict_mode,
+)
+import data_flywheel
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -140,6 +148,49 @@ EXEC = ToolExecutor(AICODE_ROOT)
 
 _log(f"[MCP] PATCH_ENABLED = {config.PATCH_ENABLED}, RUN_COMMAND_ENABLED = {config.RUN_COMMAND_ENABLED}")
 _log(f"[MCP] ALLOWED_COMMANDS 共 {len(config.ALLOWED_COMMANDS)} 條(已 append build 命令)")
+if data_flywheel.DATA_COLLECT_ENABLED:
+    _log(
+        "[MCP] DATA_COLLECT_ENABLED = True (AI_CODE_COLLECT_DATA) — "
+        f"KB-shaped tools 會 append 到 {data_flywheel.DATA_FILE}"
+    )
+
+
+def _record_kb_interaction(
+    *,
+    mode: str,
+    question: str,
+    answer: str,
+    refs: list,
+    top_score: float,
+    code_snippets: list | None = None,
+    extra_meta: dict | None = None,
+) -> None:
+    """Append a data_flywheel Interaction for a KB-shaped MCP tool call.
+
+    Plumbing tools (read_file/grep_code/...) 不呼叫這個,因為 MCP 沒有 turn
+    邊界、湊不出 main.py 那種「完整 Q&A」結構,硬塞會污染訓練語料。
+
+    沒設 AI_CODE_COLLECT_DATA 時 record_interaction 自己會 no-op。
+    """
+    if not data_flywheel.DATA_COLLECT_ENABLED:
+        return
+    meta = {"mode": mode, "kb_top_score": top_score, "source": "mcp_server"}
+    if extra_meta:
+        meta.update(extra_meta)
+    try:
+        data_flywheel.record_interaction(
+            question=question,
+            answer=answer if answer is not None else "[REFUSED]",
+            refs=refs or [],
+            code_snippets=code_snippets or [],
+            metadata=meta,
+            folder=AICODE_ROOT,
+            tool_calls=None,  # MCP 看不到 cross-tool 序列,留空
+            files_read=None,
+        )
+    except Exception as e:
+        _log(f"[MCP] record_interaction 失敗 ({mode}): {type(e).__name__}: {e}")
+
 
 mcp = FastMCP("ai_code")
 
@@ -174,13 +225,152 @@ def query_knowledge(question: str) -> dict:
             "error": "knowledge base not loaded",
         }
     text, display, meta = KB.query(question)
+    refs = meta.get("refs", [])
+    top_score = meta.get("top_score", 0.0)
+    _record_kb_interaction(
+        mode="mcp_query_knowledge",
+        question=question,
+        answer=display or text,
+        refs=refs,
+        top_score=top_score,
+    )
     return {
         "text": text,
         "display": display,
-        "refs": meta.get("refs", []),
-        "top_score": meta.get("top_score", 0.0),
+        "refs": refs,
+        "top_score": top_score,
         "has_ref": meta.get("has_ref", False),
     }
+
+
+@mcp.tool()
+def query_knowledge_strict(question: str) -> dict:
+    """Strict-mode KB query: server-side LLM with refuse + 2-stage self-check.
+
+    這是 main.py 嚴格模式(answer_with_self_check)的 MCP 對等品 — 把
+    `should_refuse_answer` + `should_use_strict_mode` + 兩階段自我檢查打包成
+    一個工具。用於規格/數值/限制類問題,要求模型只用 KB 內容回答,並逐句
+    檢查是否有 [REF] 根據。
+
+    跟一般 `query_knowledge` 的差別:
+      - `query_knowledge` 只回傳 KB 上下文,要 OpenCode 的模型自己組答案;
+      - `query_knowledge_strict` 在 server-side 直接呼叫 Ollama
+        (用 `AICODE_MODEL`,不是 OpenCode 選的那顆),套用嚴格模式 prompt
+        並做自我檢查,然後回傳定稿答案。
+
+    什麼時候用:
+      - 問規格、上限、預設值、錯誤碼這類「答錯比不答更糟」的問題。
+      - 一般概念解釋、操作指引、找 code 位置 → 用 `query_knowledge` 就好。
+
+    Returns:
+        {
+          "answer": str,           # 嚴格模式定稿;refused 時為 None
+          "refused": bool,         # True 時代表 KB 證據太弱已拒答
+          "strict": bool,          # True 時代表跑了兩階段自我檢查
+          "reason": str,           # grounding 偵測理由 / refuse 理由
+          "refs": list[dict],      # 用到的 REF 摘要
+          "top_score": float,      # KB top hybrid score
+          "top_emb_score": float,  # KB top embedding score(refuse 判斷用)
+        }
+
+    注意:
+      - 這個 tool 會占用 server 端的 Ollama 算力;OpenCode TUI 看不到中間
+        streaming(會被導向 stderr,只有最終定稿經 MCP 回來)。
+      - Ollama 不可用時 answer 會以 "[ERROR] ..." 開頭。
+    """
+    if not KB.loaded:
+        result = {
+            "answer": None,
+            "refused": True,
+            "strict": False,
+            "reason": "knowledge_base_not_loaded",
+            "refs": [],
+            "top_score": 0.0,
+            "top_emb_score": 0.0,
+        }
+        _record_kb_interaction(
+            mode="mcp_query_knowledge_strict",
+            question=question,
+            answer="[KB_NOT_LOADED]",
+            refs=[],
+            top_score=0.0,
+            extra_meta={"refused": True, "strict": False, "reason": result["reason"]},
+        )
+        return result
+
+    knowledge_ctx, _display, meta = KB.query(question)
+    refs = meta.get("refs", [])
+    top_score = meta.get("top_score", 0.0)
+    top_emb_score = meta.get("top_emb_score", 0.0)
+
+    if should_refuse_answer(question, meta):
+        result = {
+            "answer": None,
+            "refused": True,
+            "strict": True,
+            "reason": "weak_ref_for_spec_question",
+            "refs": refs,
+            "top_score": top_score,
+            "top_emb_score": top_emb_score,
+        }
+        _record_kb_interaction(
+            mode="mcp_query_knowledge_strict",
+            question=question,
+            answer="[REFUSED:weak_ref]",
+            refs=refs,
+            top_score=top_score,
+            extra_meta={"refused": True, "strict": True, "top_emb_score": top_emb_score},
+        )
+        return result
+
+    grounding_needed, reason = needs_grounding(question)
+    use_strict = should_use_strict_mode(question, knowledge_ctx, meta)
+
+    if not use_strict or not knowledge_ctx:
+        result = {
+            "answer": None,
+            "refused": False,
+            "strict": False,
+            "reason": "not_a_grounding_question" if not grounding_needed else "no_kb_ctx",
+            "refs": refs,
+            "top_score": top_score,
+            "top_emb_score": top_emb_score,
+        }
+        _record_kb_interaction(
+            mode="mcp_query_knowledge_strict",
+            question=question,
+            answer=f"[SKIPPED_STRICT:{result['reason']}]",
+            refs=refs,
+            top_score=top_score,
+            extra_meta={"refused": False, "strict": False, "top_emb_score": top_emb_score},
+        )
+        return result
+
+    base_ctx = f"專案路徑: {AICODE_ROOT}"
+    _log(f"[MCP] query_knowledge_strict: strict mode on (reason={reason})")
+    # answer_with_self_check 會 stream 到 stdout — MCP stdio 不能讓它污染協定
+    # 通道。把 stdout 暫時導到 stderr(會跟 _log 一起顯示在 server 日誌)。
+    with contextlib.redirect_stdout(sys.stderr):
+        answer = answer_with_self_check(question, base_ctx, knowledge_ctx, binary_ctx="")
+
+    result = {
+        "answer": answer,
+        "refused": False,
+        "strict": True,
+        "reason": reason or "strict_mode",
+        "refs": refs,
+        "top_score": top_score,
+        "top_emb_score": top_emb_score,
+    }
+    _record_kb_interaction(
+        mode="mcp_query_knowledge_strict",
+        question=question,
+        answer=answer or "[EMPTY]",
+        refs=refs,
+        top_score=top_score,
+        extra_meta={"refused": False, "strict": True, "top_emb_score": top_emb_score},
+    )
+    return result
 
 
 @mcp.tool()
@@ -198,38 +388,83 @@ def code_rag_search(query: str, top_k: int = 5) -> list[dict]:
     Returns:
         [{"path": str, "line": int, "symbol": str, "score": float, ...}, ...]
     """
-    return CODE_RAG.query(query, top_k=top_k)
+    results = CODE_RAG.query(query, top_k=top_k)
+    if data_flywheel.DATA_COLLECT_ENABLED:
+        snippets = [
+            {
+                "path": r.get("path", ""),
+                "line": r.get("line", 0),
+                "symbol": r.get("symbol", ""),
+            }
+            for r in (results or [])
+        ]
+        top_score = (results[0].get("score", 0.0) if results else 0.0)
+        _record_kb_interaction(
+            mode="mcp_code_rag_search",
+            question=query,
+            answer=f"[code_rag hits={len(results or [])}]",
+            refs=[],
+            top_score=top_score,
+            code_snippets=snippets,
+            extra_meta={"top_k": top_k},
+        )
+    return results
 
 
 @mcp.tool()
-def read_file(path: str, max_chars: int = 50000) -> str:
+def read_file(
+    path: str,
+    start_line: int = 1,
+    end_line: Optional[int] = None,
+    max_chars: int = 50000,
+) -> str:
     """Read a file inside AICODE_ROOT (sandbox-protected, returns numbered lines).
 
     Args:
         path: 相對於 AICODE_ROOT 的檔案路徑。
-        max_chars: 截斷上限,避免炸 context(預設 50000)。
+        start_line: 起始行(1-based,預設 1)。
+        end_line: 結束行(含)。None 表示從 start_line 一路讀到檔尾或
+                  MAX_FILE_READ_CHARS 限制。長檔分頁時傳 (start, end) 區段比
+                  整檔讀再截字元更省 context。
+        max_chars: MCP wrapper 截斷上限,避免炸 OpenCode context(預設 50000)。
+                   ToolExecutor.read_file 內部還有 config.MAX_FILE_READ_CHARS
+                   一道保險。
 
     Returns:
-        帶行號的檔案內容。超過 max_chars 會在尾端標示截斷字數。
+        帶行號的檔案內容。超過 max_chars 會在尾端標示截斷字數,並提示如何用
+        start_line 接續往下讀。
     """
-    out = EXEC.read_file(path)
+    out = EXEC.read_file(path, start_line=start_line, end_line=end_line)
     if len(out) > max_chars:
-        out = out[:max_chars] + f"\n\n... [MCP wrapper 截斷,原始 {len(out)} 字元] ..."
+        out = (
+            out[:max_chars]
+            + f"\n\n... [MCP wrapper 截斷,原始 {len(out)} 字元] ..."
+            + f"\n[HINT] 用 read_file('{path}', start_line=<下一段起始>) 接續讀。"
+        )
     return out
 
 
 @mcp.tool()
-def grep_code(pattern: str, path: Optional[str] = ".") -> str:
+def grep_code(
+    pattern: str,
+    path: Optional[str] = ".",
+    include: Optional[str] = None,
+    context: int = 0,
+) -> str:
     """Grep for a pattern across AICODE_ROOT (uses ripgrep if available).
 
     Args:
         pattern: regex 或字面字串。複雜 pattern 會自動退回字面比對(ReDoS 保護)。
         path: 限定搜尋的子目錄,預設 "." 表示整個 AICODE_ROOT。
+        include: 副檔名/glob 過濾(逗號分隔),例如 "*.py,*.pyi" 或 "*.c,*.h"。
+                 None 走預設(GREP_DEFAULT_EXTENSIONS)。縮窄搜尋範圍最省 context。
+        context: 顯示每筆 match 前後各 N 行上下文(預設 0;上限 5)。
+                 找疑似定義/呼叫點時 context=3 很有用,但會放大輸出。
 
     Returns:
-        匹配行(file:line:text)。結果會限制數量避免爆 context。
+        匹配行(file:line:text 或附 context 的區塊)。結果會限制數量避免爆 context。
     """
-    return EXEC.grep(pattern, path=path or ".")
+    return EXEC.grep(pattern, path=path or ".", include=include, context=context)
 
 
 @mcp.tool()
@@ -258,20 +493,86 @@ def list_dir(path: str = ".", depth: int = 2, max_chars: int = 20000) -> str:
 
 
 @mcp.tool()
-def apply_patch(diff: str) -> str:
+def apply_patch(diff: str, dry_run: bool = False) -> str:
     """Apply a unified-diff patch to files inside AICODE_ROOT (writes to disk).
 
-    ⚠ 這會直接寫入檔案。每次最多改 PATCH_MAX_FILES 個檔案、單檔最多
+    ⚠ 預設會直接寫入檔案。每次最多改 PATCH_MAX_FILES 個檔案、單檔最多
     PATCH_MAX_LINES_PER_FILE 行。Patch 的 context 行必須與檔案實際內容相符,
     否則整個 hunk 會被拒絕。套用後會自動跑 lint / typecheck / 相關測試。
 
     Args:
         diff: unified diff 內容(--- a/file / +++ b/file / @@ ... @@)。
+        dry_run: True 時只解析 diff、檢查 context、列出將改的檔案/行數,
+                 但不寫檔、不跑驗證。先 dry_run 一次再正式 apply 是好習慣,
+                 尤其當前面的 read_file 跟 patch 之間隔了多個工具呼叫時。
 
     Returns:
-        套用結果摘要 + 自動驗證輸出。
+        套用結果摘要 + 自動驗證輸出(dry_run 時只有預覽)。
     """
-    return EXEC.apply_patch(patch=diff, dry_run=False)
+    return EXEC.apply_patch(patch=diff, dry_run=dry_run)
+
+
+@mcp.tool()
+def file_info(path: str) -> str:
+    """Get quick metadata about a file or directory inside AICODE_ROOT.
+
+    用來在 read_file 之前先衡量檔案大小、判斷要不要分段讀。對目錄會回報底下
+    遞迴的檔案數。輸出格式是一行文字,適合塞進 prompt。
+
+    Args:
+        path: 相對於 AICODE_ROOT 的路徑。
+
+    Returns:
+        檔案:`<path>: 檔案, <lines> 行, <chars> 字元`
+        目錄:`<path>: 目錄, <n> 個檔案`
+    """
+    return EXEC.file_info(path)
+
+
+@mcp.tool()
+def git_status() -> str:
+    """git status --porcelain for AICODE_ROOT, with human-readable status labels.
+
+    比讓模型自己呼 `run_command('git status')` 好,因為 `git` 不在白名單裡 ——
+    那條路會被擋掉。需要 AICODE_ROOT 是 git working tree,不是就會回錯誤訊息。
+
+    Returns:
+        每個變更檔案一行:`<狀態文字>: <path>`。乾淨時回固定字串。
+    """
+    return EXEC.git_status()
+
+
+@mcp.tool()
+def git_diff(path: Optional[str] = None, staged: bool = False) -> str:
+    """git diff inside AICODE_ROOT, optionally scoped to a path or to the index.
+
+    Args:
+        path: 限定到單一檔案/子目錄(必須在 AICODE_ROOT 內);None 表示整個工作樹。
+        staged: True → `git diff --staged`(已暫存內容 vs HEAD);
+                False → 工作樹 vs HEAD(預設)。
+
+    Returns:
+        diff 文字。過長會頭尾保留、中段截斷。沒有差異時回固定字串。
+    """
+    return EXEC.git_diff(path=path, staged=staged)
+
+
+@mcp.tool()
+def run_lint(path: str, fix: bool = True) -> str:
+    """Run lint/format on a file using the toolchain configured in LINT_COMMANDS.
+
+    依副檔名自動挑工具(例如 .py → ruff / black,.c/.cpp → clang-format,
+    詳見 config.LINT_COMMANDS)。`fix=True` 時會就地修正可以自動修的問題;
+    `fix=False` 走 check-only 模式(若工具支援的話)。
+
+    Args:
+        path: 要 lint 的單一檔案路徑(必須在 AICODE_ROOT 內)。
+        fix: 是否就地自動修正(預設 True)。
+
+    Returns:
+        Lint 工具的輸出(已截斷)。多工具時會依序嘗試到有可用工具為止。
+    """
+    return EXEC.run_lint(path=path, fix=fix)
 
 
 @mcp.tool()
