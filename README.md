@@ -11,6 +11,8 @@ aicode
 
 ai_code 目前定位是**成熟私有部署版**：適合本機、離線、NDA / firmware / private repo 分析；**不打算公開發布**成 PyPI package、Docker image 或 SaaS。安全邊界有自動測試保護，但未做公開產品級安全審計。
 
+開發者用的回歸評測、資料飛輪、文件一致性檢查不屬於 OpenCode 日常工具；需要維護或清理這些基礎設施時看 [README_DEV.md](README_DEV.md)。
+
 ---
 
 ## 你會用到什麼
@@ -517,7 +519,9 @@ set_sandbox_root(AICODE_ROOT, allow_external=False)
 - `data/`
 - `*.jsonl`
 
-### 8.5 資料飛輪（選用）
+### 8.5 開發者資料飛輪（選用）
+
+這不是 OpenCode 日常必用功能。只有在你想收集互動樣本、日後做 reranker / fine-tuning / prompt regression 時才開。
 
 設 `AI_CODE_COLLECT_DATA=1` 啟動 `aicode`，KB-shaped 工具（`query_knowledge` / `query_knowledge_strict` / `code_rag_search`）的每次呼叫會 append 一筆到 `data/interactions.jsonl`，含問題、回答（或 `[REFUSED]` / `[SKIPPED_STRICT:...]`）、refs、KB 分數與當下 git commit。預設關閉。
 
@@ -526,6 +530,8 @@ set_sandbox_root(AICODE_ROOT, allow_external=False)
 ```bash
 python data_flywheel.py stats
 ```
+
+`eval/` 也是開發者用的固定題庫 / 回歸評測，不會自動記錄對話。兩者差異與清理方式見 [README_DEV.md](README_DEV.md)。
 
 ---
 
