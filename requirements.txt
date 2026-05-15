@@ -1,44 +1,11 @@
-# 智能程式碼分析器 - 依賴套件
 # pip install -r requirements.txt
 
-# ============================================================
-# 核心依賴（必須安裝，否則啟動會 ModuleNotFoundError）
-# ============================================================
-requests>=2.28.0    # HTTP 請求（與 Ollama API 通訊）
-mcp>=1.0.0          # FastMCP server（mcp_server.py 用，CLI 模式不需要）
+# 核心
+requests>=2.28.0    # Ollama HTTP
+mcp>=1.0.0          # MCP server（mcp_server.py 用，CLI 不需要）
+numpy>=1.21.0       # RAG / MMR 向量運算
 
-# ============================================================
-# 強烈建議安裝（未安裝不會報錯，但效能較差）
-# ============================================================
-numpy>=1.21.0       # 向量運算加速（RAG 搜尋、MMR 選擇）
-                    # 未安裝仍可運作，但速度較慢
-
-# ============================================================
-# 可選依賴（特定功能才需要）
-# ============================================================
-# 以下套件未安裝不影響核心功能
-# 用到時若缺少會提示安裝
-
-# RAG 知識庫建立（執行 RAG.py 從 PDF/文件建立知識庫時需要）
-# pip install pymupdf4llm ollama
-# pymupdf4llm>=0.0.5
-# ollama>=0.1.0
-
-# RAG 網頁模式（執行 RAG.py --url 抓取網頁時需要）
-# pip install html2text
-# html2text>=2020.1.16
-
-# 中文切詞（提升 BM25 中文查準/查全率）
-# 未安裝仍可運作，但中文搜尋精準度較低
-# pip install jieba
-# jieba>=0.42.1
-
-# Tree-sitter AST 解析（提升程式碼解析精準度，目前未啟用）
-# pip install tree-sitter tree-sitter-python tree-sitter-javascript ...
-# tree-sitter>=0.21.0
-# tree-sitter-python>=0.21.0
-# tree-sitter-javascript>=0.21.0
-# tree-sitter-typescript>=0.21.0
-# tree-sitter-go>=0.21.0
-# tree-sitter-rust>=0.21.0
-# tree-sitter-c>=0.21.0
+# 可選：缺了會由各功能 graceful skip，doctor 會提示
+# pip install pymupdf4llm ollama   # RAG.py 從 PDF/MD 建知識庫
+# pip install html2text            # RAG.py --url 抓網頁
+# pip install jieba                # 中文 BM25 切詞
