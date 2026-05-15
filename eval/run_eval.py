@@ -817,6 +817,12 @@ def run_evaluation(
         print(f"  穩定性測試模式：{num_runs} 次重跑")
     print("=" * 60)
 
+    # 印出目前 MODEL,避免 silent fallback 後查不到實際跑哪個模型
+    import config as _eval_config
+    _override = " (AICODE_MODEL override)" if _eval_config.MODEL != _eval_config.DEFAULT_MODEL else " (default)"
+    print(f"Using model: {_eval_config.MODEL}{_override}")
+    print(f"NUM_CTX: {_eval_config.NUM_CTX}")
+
     # 健康檢查 - 確保 Ollama 正常運作
     if not check_ollama_health():
         print("\n[ERROR] Ollama 無法啟動，評測中止")

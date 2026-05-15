@@ -16,15 +16,20 @@ OLLAMA_CHAT_URL = f"{OLLAMA_BASE_URL}/api/chat"
 OLLAMA_EMBEDDINGS_URL = f"{OLLAMA_BASE_URL}/api/embeddings"
 OLLAMA_TAGS_URL = f"{OLLAMA_BASE_URL}/api/tags"
 OLLAMA_PS_URL = f"{OLLAMA_BASE_URL}/api/ps"
-MODEL = "qwen3-coder:30b"  # 使用程式碼專用模型
-VL_MODEL = "qwen3-vl:30b-a3b"
+# 主 LLM:可用 AICODE_MODEL 環境變數覆寫(切換模型用,不改 source code)
+# baseline: qwen3-coder:30b
+# 候選    : qwen3.6:35b-a3b-coding-nvfp4
+DEFAULT_MODEL = "qwen3-coder:30b"
+MODEL = _os.environ.get("AICODE_MODEL", DEFAULT_MODEL)
+VL_MODEL = _os.environ.get("AICODE_VL_MODEL", "qwen3-vl:30b-a3b")
 
 # Context 長度設定
 # - 5090 32GB + 192GB RAM: 可開 128K，VRAM 不足時自動 offload 到 RAM
 # - 純 GPU 模式: 建議 64K 以內避免 OOM
 # - 注意：Offload 到 RAM 會降低推理速度（主要是首 token 延遲/prompt ingest）
 #         但輸出階段（decode）影響較小
-NUM_CTX = 131072   # 128K，利用 192GB RAM offload
+# 可用環境變數 AICODE_NUM_CTX 覆寫（測試新模型 / 不同顯卡時用）。
+NUM_CTX = int(_os.environ.get("AICODE_NUM_CTX", "131072"))
 
 # Full 模式 context：設成與 NUM_CTX 相同
 # Full 模式會把完整程式碼 + 知識庫 + 圖片/bin 上下文全部塞入 prompt

@@ -79,6 +79,8 @@ ai_code 目前是**成熟私有部署版**:
 # 1. 安裝 Ollama (本地推理引擎)
 curl -fsSL https://ollama.com/install.sh | sh
 ollama pull qwen3-coder:30b
+# 候選測試模型(非必須,要切過去再 pull):
+# ollama pull qwen3.6:35b-a3b-coding-nvfp4
 ollama pull bge-m3
 ollama pull qllama/bge-reranker-v2-m3
 
@@ -179,7 +181,8 @@ pip install pymupdf4llm ollama   # RAG / KB ingestion 才需要
 推薦組合(5090 上跑得很順):
 ```bash
 # 主力 LLM(挑一個)
-ollama pull qwen3-coder:30b
+ollama pull qwen3-coder:30b                  # baseline
+ollama pull qwen3.6:35b-a3b-coding-nvfp4     # 候選 (用 AICODE_MODEL 切換)
 ollama pull devstral:24b
 ollama pull gpt-oss:20b
 
@@ -243,9 +246,10 @@ ${EDITOR:-vi} "$HOME/.config/opencode/opencode.json"
         "baseURL": "http://localhost:11434/v1"
       },
       "models": {
-        "qwen3-coder:30b": { "name": "Qwen3 Coder 30B" },
-        "devstral:24b":    { "name": "Devstral 24B" },
-        "gpt-oss:20b":     { "name": "GPT-OSS 20B" }
+        "qwen3-coder:30b":              { "name": "Qwen3 Coder 30B" },
+        "qwen3.6:35b-a3b-coding-nvfp4": { "name": "Qwen3.6 35B Coding NVFP4" },
+        "devstral:24b":                 { "name": "Devstral 24B" },
+        "gpt-oss:20b":                  { "name": "GPT-OSS 20B" }
       }
     }
   },
@@ -281,6 +285,33 @@ jq . "$HOME/.config/opencode/opencode.json" >/dev/null
 ```bash
 cd <PATH_TO_PROJECT_TO_ANALYZE>
 aicode
+```
+
+### 3.1 切換模型(不改 source code)
+
+`config.py` 的 `MODEL` 預設讀 `AICODE_MODEL` 環境變數,沒設才用 baseline
+`qwen3-coder:30b`。要測候選模型一行指令:
+
+```bash
+# pull 一次
+ollama pull qwen3.6:35b-a3b-coding-nvfp4
+
+# 用環境變數切過去(只影響當次 process)
+AICODE_MODEL=qwen3.6:35b-a3b-coding-nvfp4 aicode
+
+# 或:跑 eval / CLI / mcp_server 都吃同一個變數
+AICODE_MODEL=qwen3.6:35b-a3b-coding-nvfp4 python eval/run_eval.py --test-set code --verbose
+AICODE_MODEL=qwen3.6:35b-a3b-coding-nvfp4 python main.py --qa "問題"
+```
+
+模型沒 pull 時,呼叫 LLM 會收到 HTTP 404,錯誤訊息會印出當前 `MODEL` 值並提示
+`ollama pull <model>` 命令 — 不會 silent fallback 到 baseline。
+
+Context 大小同樣可用 `AICODE_NUM_CTX` 覆寫(預設 131072):
+```bash
+# 5090 32GB,單卡跑得舒服一點(避免 offload 到 RAM)
+OLLAMA_CONTEXT_LENGTH=64000 ollama serve   # 另一個 shell
+AICODE_NUM_CTX=65536 AICODE_MODEL=qwen3.6:35b-a3b-coding-nvfp4 aicode
 ```
 
 啟動時會印 `[aicode] AICODE_ROOT=<那個路徑>` 一行,確認沙箱根目錄無誤後再進

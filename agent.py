@@ -93,8 +93,15 @@ def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
             return {"content": "[ERROR] 無法連接 Ollama", "tool_calls": [], "done_reason": "error"}
         elif "Timeout" in err_type:
             return {"content": "[ERROR] 請求超時", "tool_calls": [], "done_reason": "error"}
+        elif "HTTPError" in err_type or "404" in str(e):
+            msg = (
+                f"[ERROR] Ollama 回 HTTP 錯誤: {e}\n"
+                f"   常見原因：模型 {MODEL!r} 沒有 pull。\n"
+                f"   檢查: ollama list  /  必要時 ollama pull {MODEL}"
+            )
+            return {"content": msg, "tool_calls": [], "done_reason": "error"}
         else:
-            return {"content": f"[ERROR] 錯誤: {e}", "tool_calls": [], "done_reason": "error"}
+            return {"content": f"[ERROR] 錯誤: {e} (model={MODEL})", "tool_calls": [], "done_reason": "error"}
 
 
 def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
@@ -160,8 +167,14 @@ def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
             return "[ERROR] 無法連接 Ollama"
         elif "Timeout" in err_type:
             return "[ERROR] 請求超時"
+        elif "HTTPError" in err_type or "404" in str(e):
+            return (
+                f"[ERROR] Ollama 回 HTTP 錯誤: {e}\n"
+                f"   常見原因：模型 {MODEL!r} 沒有 pull。\n"
+                f"   檢查: ollama list  /  必要時 ollama pull {MODEL}"
+            )
         else:
-            return f"[ERROR] 錯誤: {e}"
+            return f"[ERROR] 錯誤: {e} (model={MODEL})"
 
 
 # ============================================================

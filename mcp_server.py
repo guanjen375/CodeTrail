@@ -121,6 +121,11 @@ for _c in _EXTRA_BUILD_COMMANDS:
 set_sandbox_root(AICODE_ROOT, allow_external=False)
 
 _log(f"[MCP] AICODE_ROOT = {AICODE_ROOT}")
+_log(
+    f"[MCP] Using model: {config.MODEL}"
+    + (f" (AICODE_MODEL override, default={config.DEFAULT_MODEL})"
+       if config.MODEL != config.DEFAULT_MODEL else " (default)")
+)
 # knowledge.json 綁 AICODE_ROOT,不依賴 cwd
 _kb_path = str(Path(AICODE_ROOT) / KNOWLEDGE_FILE)
 _log(f"[MCP] 載入 KnowledgeBase ({_kb_path}) ...")

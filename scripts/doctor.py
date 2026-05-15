@@ -160,18 +160,24 @@ def check_models(r: Result, tags: set[str] | None) -> None:
         ("VL_MODEL", "圖片 OCR — 不分析圖片就不需要"),
     ]
 
+    # 標示 MODEL 是否被 AICODE_MODEL 覆寫,避免使用者誤以為 silent fallback
+    default_model = getattr(cfg, "DEFAULT_MODEL", None)
+
     for attr, desc in required:
         name = getattr(cfg, attr, None)
         if not name:
             r.warn(f"config.py 沒有 {attr}")
             continue
+        suffix = ""
+        if attr == "MODEL" and default_model and name != default_model:
+            suffix = f" [AICODE_MODEL override, default={default_model}]"
         if tags is None:
-            r.info(f"{attr}={name} ({desc}) — 未檢查 ollama 是否 pull")
+            r.info(f"{attr}={name}{suffix} ({desc}) — 未檢查 ollama 是否 pull")
             continue
         if name in tags:
-            r.ok(f"{attr}={name} 已 pull")
+            r.ok(f"{attr}={name}{suffix} 已 pull")
         else:
-            r.fail(f"{attr}={name} 尚未 pull — 執行: ollama pull {name}")
+            r.fail(f"{attr}={name}{suffix} 尚未 pull — 執行: ollama pull {name}")
 
     for attr, desc in optional:
         name = getattr(cfg, attr, None)
