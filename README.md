@@ -330,34 +330,56 @@ build/output.elf
 
 ## 5. ai_code 暴露的 17 個 MCP 工具
 
-| 工具 | 何時用 |
-|---|---|
-| `query_knowledge(question)` | 查已匯入的 PDF / spec / manual / TXT，回傳 refs 與引用文字 |
-| `query_knowledge_strict(question)` | 規格題嚴格模式：server 端跑 KB 自我檢查，弱證據自動拒答 |
-| `code_rag_search(query, top_k=5)` | 不知道函式在哪時，用行為描述找相關 symbol 與 file:line |
-| `list_dir(path=".", depth=2)` | 看專案目錄樹，替代直接跑 `ls` |
-| `read_file(path, start_line=1, end_line=None, max_chars=50000)` | 讀沙箱內文字檔，輸出帶行號；長檔可分段讀 |
-| `grep_code(pattern, path=".", include=None, context=0)` | 在沙箱內搜尋 regex 或字串，可限副檔名、附上下文 |
-| `file_info(path)` | 取得檔案行數/字元數或目錄底下檔案數，`read_file` 前先衡量大小 |
-| `apply_patch(diff, dry_run=False)` | 套 unified diff；`dry_run=True` 只預覽不寫檔 |
-| `git_status()` | git 工作樹狀態（已修改 / 未追蹤），人類可讀標籤 |
-| `git_diff(path=None, staged=False)` | git diff，可限路徑或看已暫存內容 |
-| `run_lint(path, fix=True)` | 依副檔名挑工具 lint/format 單一檔案 |
-| `run_command(cmd)` | 跑白名單內的 test / lint / build 命令 |
-| `import_external_file(path, dest_name=None)` | 將允許來源目錄內的外部檔案複製到 `.aicode_uploads/` |
-| `analyze_file(path)` | 分析圖片 OCR、ELF、binary / firmware |
-| `ingest_document(path)` | 將 PDF / MD / TXT 加進 `knowledge.json` |
-| `remove_document(source)` | 從 knowledge base 移除某份文件，依 basename 比對 |
-| `reload_knowledge_base()` | 重新載入 `knowledge.json`，讓新增或移除的文件生效 |
+你不用手動寫 JSON 或自己呼 API。這些工具會出現在 OpenCode 的工具列表裡；日常用法是在對話中直接要求模型「用某個工具做某件事」。如果你怕模型亂猜，直接點名工具名最有效。
 
-工具使用原則：
+### 5.1 最常用講法
 
-- 先 `code_rag_search(...)` 再 `read_file(...)`，可以少讀很多不相關檔案。
-- 長檔用 `file_info(...)` 先看大小，再用 `read_file(path, start_line, end_line)` 分段讀。
-- 查 spec 先 `query_knowledge(...)`；只要是「答錯比不答更糟」的規格/數值/限制題，改用 `query_knowledge_strict(...)` 走嚴格模式 + 自動拒答。
-- 改檔前可以 `apply_patch(diff, dry_run=True)` 先預覽，再正式套用。
+| 你想做什麼 | 在 OpenCode 裡可以這樣說 | 主要工具 |
+|---|---|---|
+| 先看 repo 長什麼樣 | 請用 `list_dir(path=".", depth=2)` 看專案結構，找 entry point、測試和設定檔。 | `list_dir(...)` |
+| 不知道程式在哪 | 請先用 `code_rag_search("初始化流程")` 找相關 symbol，再讀最相關檔案。 | `code_rag_search(...)`、`read_file(...)` |
+| 找某個字串或錯誤訊息 | 請用 `grep_code("panic: xxx", path=".", include="*.c,*.h", context=3)` 找位置。 | `grep_code(...)` |
+| 讀一個已知檔案 | 請用 `file_info("src/main.py")` 看大小，再用 `read_file("src/main.py", start_line=1, end_line=120)` 讀。 | `file_info(...)`、`read_file(...)` |
+| 查已匯入的 spec | 請用 `query_knowledge("reset timing 限制")` 查 KB，回答要附 REF。 | `query_knowledge(...)` |
+| 查不能答錯的規格數字 | 請用 `query_knowledge_strict("reset assert 最小時間")`，證據不夠就拒答。 | `query_knowledge_strict(...)` |
+| 看專案外的截圖/PDF/log | 請先用 `import_external_file("~/Downloads/error.png")` 匯入，再分析回傳的新路徑。 | `import_external_file(...)` |
+| 看圖片、ELF、firmware | 請用 `analyze_file(".aicode_uploads/error.png")` OCR 或分析 binary。 | `analyze_file(...)` |
+| 把 PDF/MD/TXT 加進 KB | 請用 `ingest_document("docs/spec.pdf")`，完成後 `reload_knowledge_base()`。 | `ingest_document(...)`、`reload_knowledge_base()` |
+| 移除舊文件 | 請用 `remove_document("old_spec.pdf")`，完成後 `reload_knowledge_base()`。 | `remove_document(...)` |
+| 準備改檔 | 請先用 `git_status()` 和 `git_diff()` 確認目前變更，再說明要改哪些檔案。 | `git_status(...)`、`git_diff(...)` |
+| 套修改 | 請產生最小 unified diff，先用 `apply_patch(diff, dry_run=True)` 預覽，再正式套用。 | `apply_patch(...)` |
+| 修改後檢查 | 請用 `run_lint("src/main.py", fix=True)`，再用 `run_command("pytest tests/test_x.py")` 跑最小測試。 | `run_lint(...)`、`run_command(...)` |
+
+### 5.2 依任務分類
+
+| 類型 | 工具 | 白話用途 |
+|---|---|---|
+| 專案探索 | `list_dir(path=".", depth=2)` | 看目錄樹，不要叫模型跑 `ls` |
+| 專案探索 | `code_rag_search(query, top_k=5)` | 用「這段程式在做什麼」去找可能的函式/class |
+| 專案探索 | `grep_code(pattern, path=".", include=None, context=0)` | 搜錯誤訊息、函式名、設定名 |
+| 專案探索 | `file_info(path)` | 讀檔前先看大小，避免一次塞爆 context |
+| 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=50000)` | 讀檔案內容，長檔要分段 |
+| 文件/外部檔案 | `import_external_file(path, dest_name=None)` | 把允許來源的外部檔案複製進 `.aicode_uploads/` |
+| 文件/外部檔案 | `analyze_file(path)` | OCR 圖片、分析 ELF 或 firmware blob |
+| 文件/外部檔案 | `ingest_document(path)` | 把 PDF / MD / TXT 匯入 `knowledge.json` |
+| 文件/外部檔案 | `remove_document(source)` | 從 KB 移除過期文件 |
+| 文件/外部檔案 | `reload_knowledge_base()` | 讓剛匯入或刪除的 KB 內容立即生效 |
+| 文件/外部檔案 | `query_knowledge(question)` | 查 KB，適合 spec / manual / datasheet |
+| 文件/外部檔案 | `query_knowledge_strict(question)` | 查高風險規格題，弱證據會拒答 |
+| 修改/驗證 | `git_status()` | 看工作樹目前有沒有改動 |
+| 修改/驗證 | `git_diff(path=None, staged=False)` | 看修改內容，不需要用 `run_command` 跑 git |
+| 修改/驗證 | `apply_patch(diff, dry_run=False)` | 套 unified diff，會真的寫檔 |
+| 修改/驗證 | `run_lint(path, fix=True)` | 對單一檔案跑格式化/lint |
+| 修改/驗證 | `run_command(cmd)` | 跑白名單內的測試、lint、build |
+
+### 5.3 使用原則
+
+- 找程式碼時，先 `code_rag_search(...)` 或 `grep_code(...)`，再 `read_file(...)`。
+- 長檔先 `file_info(...)`，再用 `read_file(path, start_line, end_line)` 分段讀。
+- 查 spec 先 `query_knowledge(...)`；數字、限制、預設值這類答錯很糟的題目，用 `query_knowledge_strict(...)`。
+- 外部檔案先 `import_external_file(...)`，再用 `analyze_file(...)`、`ingest_document(...)` 或 `read_file(...)` 處理匯入後路徑。
 - 新增或刪除文件後一定要 `reload_knowledge_base()`。
-- 查 git 變更用 `git_status` / `git_diff`，不要透過 `run_command` 跑 git（不在白名單）。
+- 改檔前先看 `git_status(...)` / `git_diff(...)`；改檔用 `apply_patch(...)`。
 - `apply_patch(...)` 和 `run_command(...)` 有副作用；需要改檔或執行專案腳本時才允許。
 
 ---
