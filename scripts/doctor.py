@@ -232,7 +232,7 @@ def check_aicode_root(r: Result, project: str | None) -> None:
                 "高風險，請確認你真的知道在做什麼"
             )
             return
-        # 預設行為：與 mcp_server.py / bin/aicode 一致 → FAIL
+        # 預設行為：與 mcp_server.py / aicode wrapper 一致 → FAIL
         r.fail(
             f"AICODE_ROOT=$HOME ({resolved}) — 範圍太大、容易意外洩漏個人資料。\n"
             "        cd 到具體 project 目錄再啟動。\n"
@@ -264,14 +264,14 @@ def check_repo_artifacts(r: Result) -> None:
         else:
             r.fail(f"{rel} 不存在 — repo 是否完整？")
 
-    aicode_bin = REPO_ROOT / "bin" / "aicode"
+    aicode_bin = REPO_ROOT / "aicode"
     if aicode_bin.is_file():
         if os.access(aicode_bin, os.X_OK):
-            r.ok("bin/aicode 存在且可執行")
+            r.ok("aicode 存在且可執行")
         else:
-            r.warn("bin/aicode 存在但沒有執行權 — chmod +x bin/aicode")
+            r.warn("aicode 存在但沒有執行權 — chmod +x aicode")
     else:
-        r.warn("bin/aicode 不存在 — symlink 啟動方式無法用，但可手動跑 mcp_server.py")
+        r.warn("aicode 不存在 — symlink 啟動方式無法用，但可手動跑 mcp_server.py")
 
 
 def check_knowledge_base(r: Result, project: str | None) -> None:

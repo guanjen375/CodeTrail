@@ -76,7 +76,7 @@ python data_flywheel.py export --file data/interactions.jsonl --output data/trai
 - `scripts/check_eval_consistency.py`
 - `tests/test_eval_consistency.py`
 - `tests/test_cli.py` 裡 `eval/run_eval.py --help` 的 smoke test
-- `README.md`、`README_DEV.md`、`AGENTS.md`、`docs/README_EDITING.md` 裡的 eval 說明
+- `README.md`、`README_DEV.md`、`AGENTS.md` 裡的 eval 說明
 
 若刪 data flywheel，至少同步處理：
 

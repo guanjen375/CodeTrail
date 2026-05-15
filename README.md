@@ -109,7 +109,7 @@ python scripts/doctor.py
 python scripts/doctor.py --no-network
 ```
 
-`PASS` 可以先略過；`FAIL` 要處理。常見問題是 OpenCode 不在 PATH、Ollama 沒啟動、模型還沒 pull、`bin/aicode` 沒有執行權。
+`PASS` 可以先略過；`FAIL` 要處理。常見問題是 OpenCode 不在 PATH、Ollama 沒啟動、模型還沒 pull、`aicode` 沒有執行權。
 
 ---
 
@@ -119,11 +119,10 @@ python scripts/doctor.py --no-network
 
 ```bash
 mkdir -p ~/.config/opencode
-cp examples/opencode.example.json ~/.config/opencode/opencode.json
 ${EDITOR:-vi} ~/.config/opencode/opencode.json
 ```
 
-把 `<AICODE_REPO>` 換成 ai_code repo 的實際絕對路徑。完整內容如下：
+在檔案裡貼上下方內容，並把 `<AICODE_REPO>` 換成 ai_code repo 的實際絕對路徑：
 
 ```json
 {
@@ -170,9 +169,9 @@ python -m json.tool ~/.config/opencode/opencode.json >/dev/null
 在 ai_code repo 根目錄執行：
 
 ```bash
-chmod +x bin/aicode
+chmod +x aicode
 mkdir -p "$HOME/.local/bin"
-ln -s "$PWD/bin/aicode" "$HOME/.local/bin/aicode"
+ln -s "$PWD/aicode" "$HOME/.local/bin/aicode"
 ```
 
 確認 shell 找得到它：

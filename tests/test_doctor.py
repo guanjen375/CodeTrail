@@ -35,7 +35,7 @@ def test_aicode_root_rejects_slash(tmp_path: Path):
 def test_aicode_root_fails_on_home_by_default(monkeypatch, tmp_path: Path):
     """root=$HOME 在沒有 AI_CODE_ALLOW_HOME_ROOT=1 時必須 FAIL。
 
-    與 mcp_server.py / bin/aicode 行為對齊 — 三者都拒絕,doctor 不能光給 warn。
+    與 mcp_server.py / aicode wrapper 行為對齊 — 三者都拒絕,doctor 不能光給 warn。
     """
     fake_home = tmp_path / "fakehome"
     fake_home.mkdir()
