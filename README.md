@@ -1,262 +1,127 @@
-# ai_code — OpenCode + Ollama 的本地 MCP 後端
+# ai_code - OpenCode + Ollama 本地 MCP 工作台
 
-> 在自己的 repo 上,用本地 LLM 完成「讀專案 → 找證據 → 查規格 → 推導原因 →
-> 產 patch → 跑驗證」。程式碼、規格書、firmware、截圖都留在本機。
+ai_code 是一個給 OpenCode 使用的本地 MCP 後端。你在 OpenCode TUI 裡提問，模型可以透過 ai_code 讀專案、找程式碼、查已匯入的 spec、分析截圖或 binary、產生 patch，並在允許的白名單內跑驗證命令。
 
-ai_code 把本地 RAG、CodeRAG、檔案讀寫、patch、測試命令、圖片 / binary 分析包成
-**MCP server**，接到 OpenCode TUI。你在對話框提出任務，Ollama 模型會自動呼叫
-ai_code 提供的 11 個工具完成查證與修改。
-
-主要部署目標:**5090 32GB VRAM + 192GB RAM**，本地全離線推理，適合 NDA / 內部 firmware repo。
-較小的 GPU 也能跑(模型 offload 到 RAM,首 token 慢但可用)。
-
----
-
-## 快速啟動
-
-> 以下用 `python` 表示 Python 3；如果系統沒有 `python` shim，改用 `python3`。
+這份 README 只說明 **OpenCode + Ollama + ai_code MCP** 的使用方式。照順序完成設定後，日常操作就是：
 
 ```bash
-# 1. 安裝 Ollama + 基本模型
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull qwen3-coder:30b
-ollama pull bge-m3
-ollama pull qllama/bge-reranker-v2-m3
-
-# 2. 安裝 OpenCode TUI
-npm install -g opencode-ai
-
-# 3. 安裝 ai_code 依賴
-cd <AICODE_REPO>
-pip install -r requirements.txt
-pip install mcp pymupdf4llm ollama
-
-# 4. 自檢
-python scripts/doctor.py
-
-# 5. 設定 OpenCode
-mkdir -p ~/.config/opencode
-cp examples/opencode.example.json ~/.config/opencode/opencode.json
-${EDITOR:-vi} ~/.config/opencode/opencode.json   # 把 <AICODE_REPO> 換成實際路徑
-
-# 6. 安裝 wrapper,讓目前目錄自動成為 AICODE_ROOT
-mkdir -p "$HOME/.local/bin"
-ln -s "$PWD/bin/aicode" "$HOME/.local/bin/aicode"
-
-# 7. 啟動要分析的專案
-cd <PATH_TO_PROJECT_TO_ANALYZE>
+cd <要分析或修改的專案>
 aicode
 ```
 
-進入 OpenCode 後確認:
-- 左下角 `/status` 顯示 `ai_code Connected`
-- 右下角模型是 Ollama provider 的 coding model
-- 啟動訊息中的 `AICODE_ROOT` 是你要分析的專案,不是 `$HOME` 或 `/`
+ai_code 目前定位是**成熟私有部署版**：適合本機、離線、NDA / firmware / private repo 分析；**不打算公開發布**成 PyPI package、Docker image 或 SaaS。安全邊界有自動測試保護，但未做公開產品級安全審計。
 
 ---
 
-## 操作流程:先推導,再改檔
+## 你會用到什麼
 
-### 建立 repo map
+- **OpenCode**：對話式 TUI，負責跟模型互動、顯示工具呼叫。
+- **Ollama**：在本機跑主要 coding model、embedding model、reranker 和視覺模型。
+- **ai_code MCP server**：把目前專案限制在 `AICODE_ROOT` 沙箱內，提供 11 個 MCP 工具給 OpenCode。
+- **`aicode` wrapper**：從目前目錄啟動 OpenCode，並把目前目錄自動設成 `AICODE_ROOT`。
 
-先讓模型只讀不改,並要求它把推導和證據分開:
+資料流：
 
-```
-請先不要改檔。
-用 list_dir 看兩層目錄,找出主要 entry point。
-再用 code_rag_search 找初始化、設定、工具呼叫相關程式。
-最後用 file:line 列出你對這個 repo 架構的推導,並標明哪些是證據、哪些是猜測。
-```
-
-### 加入外部上下文
-
-把 PDF、截圖、log、firmware 放進 `<AICODE_ROOT>` 後再問:
-
-```
-> 我已把 docs/npu_spec.pdf 放進 repo。請 ingest, reload,然後查 conv2d 最大輸入大小。
-
-> analyze screenshots/error.png,先 OCR 錯誤訊息,再找可能相關的 source file。
-
-> read_file logs/build_fail.txt,根據錯誤訊息用 code_rag_search 找最可能的 bug 位置。
+```text
+OpenCode TUI
+  -> Ollama coding model
+  -> ai_code MCP server
+  -> AICODE_ROOT 內的程式碼 / spec / log / 圖片 / firmware
 ```
 
-### 允許修改與驗證
-
-```
-根據上面的證據,如果你判斷是 bug,請產生最小 patch 並套用。
-修改後跑最小相關測試;如果找不到測試,請說明你會跑哪個驗證命令。
-```
-
-`apply_patch` 會直接寫檔。建議在 git 控管下使用；只想看分析時明確寫
-「不要改檔、不要 apply_patch」。
-
----
-
-## RAG / Attachment / CodeRAG
-
-| 來源 | 推薦工具 | 何時用 |
-|---|---|---|
-| repo 內程式碼 | `code_rag_search` → `read_file` | 不知道函式在哪裡,用行為描述反查實作 |
-| 單一文字檔 / log | `read_file` | 一次性看錯誤訊息、設定、短文件 |
-| PDF spec / datasheet / manual | `ingest_document` → `reload_knowledge_base` → `query_knowledge` | 會反覆查,或要跟實作比對 |
-| 截圖 / UI error / 圖片 | `analyze_file` | OCR 錯誤訊息、讀圖中文字 |
-| Teams/Slack 截圖 | `analyze_file` 快速看；`RAG.py --chat` 後 reload | 有結論的討論想長期查 |
-| firmware `.bin` / ELF | `analyze_file` | 看 magic、strings、ELF sections / symbols |
-
-分工原則:
-- **Attachment**:把外部檔案複製到 `<AICODE_ROOT>`，讓模型一次性讀取或分析。
-- **RAG**:把可重複查詢的 PDF/MD/TXT 灌成 `knowledge.json`，用 `query_knowledge` 查。
-- **CodeRAG**:不需要手動灌庫，對目前 repo 的 symbol / code 做語意搜尋。
-
----
-
-## 模型選擇
-
-| 模型 | 適合 | 優點 | 注意 |
-|---|---|---|---|
-| `qwen3-coder:30b` | 預設主力、改 code、跑 patch/test 閉環 | 程式碼推導穩,對 `read_file` / `apply_patch` 這類工具比較可靠 | 長工具鏈第二輪偶爾吐 XML 文字;遇到時把任務拆短 |
-| `qwen3.6:35b-a3b-coding-nvfp4` | 較深的 repo 推導、跨檔重構、規格 vs 實作比對 | 推理與 coding 上限較高,適合 5090 32GB + 大 context | 較吃 VRAM / context;不穩時把 `AICODE_NUM_CTX` 降到 65536 |
-| `devstral:24b` | 快速 code review、找 bug、簡單修改 | 速度與 coding 能力平衡,agentic coding 語氣明確 | 有 OpenHands fine-tune,不一定穩定吐標準 tool calls |
-| `gpt-oss:20b` | 快速讀 repo、摘要、第一次探索 | 輕量、啟動快、硬體壓力低 | 工具紀律較弱,偶爾呼叫不存在的 `multi_tool_use.parallel`;複雜修改建議換 Qwen |
-| `qwen3-vl:30b-a3b` | `analyze_file` 分析截圖 / 圖片 | OCR 與畫面文字理解較好 | 不是主聊天模型;只需要圖片分析時 pull |
-| `bge-m3` + `qllama/bge-reranker-v2-m3` | RAG / CodeRAG 檢索 | 讓 `query_knowledge` 與 `code_rag_search` 找得到資料 | 不是聊天模型,不要在 OpenCode model selector 裡選它們 |
-
-實務建議:
-- 想要穩定完成「推導 → patch → test」:先用 `qwen3-coder:30b`
-- 任務跨很多檔或要做 spec 對照:切 `qwen3.6:35b-a3b-coding-nvfp4`
-- 只想快速理解陌生 repo:可用 `gpt-oss:20b` 或 `devstral:24b`,但修改前建議切回 Qwen 系列
-- RAG 問答品質差時,先檢查文件是否已 `ingest_document` + `reload_knowledge_base`,不要先換主模型
-
----
-
-## 專案狀態
-
-ai_code 目前是**成熟私有部署版**:
-
-- 主要使用路線是 **OpenCode + Ollama + MCP**;CLI(`main.py`)模式也保留可用。
-- 適合本機、離線、NDA / firmware / private repo 分析。
-- **不打算公開發布**,不是 PyPI package、不是 Docker image、也不是 SaaS。
-- repo 內有 smoke tests、sandbox safety tests、eval consistency check、README
-  consistency check 與 GitHub Actions CI。
-- 上面這些測試代表**基本功能與安全邊界有自檢**,但**未做公開產品級安全審計**,
-  也未經大規模實戰驗證。
-- 部分 advanced path(特定模型 tool-calling 行為、大型 PDF ingestion、
-  firmware binary 分析)仍依部署環境實測為準。
-
----
-
-## 安裝檢查 — `doctor.py`
-
-`scripts/doctor.py` 會印 PASS / WARN / FAIL,用來確認 runtime、依賴、Ollama、
-OpenCode wrapper、`AICODE_ROOT` 和 README 一致性。
-
-```bash
-python scripts/doctor.py                       # 全檢(會試連 Ollama)
-python scripts/doctor.py --no-network          # 只檢查本地檔案
-python scripts/doctor.py --project /path/proj  # 順便檢查那個 project 是否安全的 root
-```
-
-`exit=0` 表示沒有 FAIL;`exit=1` 表示有 FAIL,跟著訊息修。
-
----
-
-## 系統架構
-
-```
-┌──────────────┐  stdio   ┌──────────────────┐  HTTP   ┌─────────┐
-│   OpenCode   │ ───────▶ │  mcp_server.py   │ ──────▶ │ Ollama  │
-│   TUI (你)   │  ◀────── │   (FastMCP)      │ ◀────── │ (LLM)   │
-└──────────────┘ 11 tools └──────────────────┘ embed   └─────────┘
-                                  │
-                                  ▼
-                  ┌─────────────────────────────────┐
-                  │  AICODE_ROOT(NDA 沙箱)         │
-                  │  - 程式碼(read_file/grep)     │
-                  │  - knowledge.json(RAG 知識庫)  │
-                  │  - firmware.bin / .elf          │
-                  │  - 螢幕截圖 / 規格 PDF          │
-                  └─────────────────────────────────┘
-```
-
-OpenCode 是前端,模型自選工具,所有檔案操作都被沙箱在 `AICODE_ROOT` 內。
-
-`main.py` CLI 模式(`--qa` / `--agent` / `--mcp` 遠端 SSH)仍保留可用,但
-**這份文件只講 OpenCode + MCP 的玩法**。CLI 用法看 git log 與 `python main.py --help`。
+重點是 `AICODE_ROOT`。它就是這次 OpenCode 可以讀寫的專案根目錄。不要從 `$HOME` 或 `/` 啟動。
 
 ---
 
 ## 1. 安裝
 
-> 主要在 Linux 上測試(Ubuntu / Arch 都跑過),Windows 順便支援。
-> 以下指令預設 bash;PowerShell 等價寫法寫在「Windows 備註」區塊。
+以下用 `python` 表示 Python 3。如果你的系統只有 `python3`，把指令中的 `python` 改成 `python3`。
 
-### 軟體
-- **Python 3.10+**
-- **Ollama**(<https://ollama.com/download>),裝完會自動背景常駐(Linux 上 `systemctl --user status ollama` 可看狀態)
-- **Node.js LTS**(<https://nodejs.org/>),為了 npm 裝 OpenCode
-- **OpenCode**:
-  ```bash
-  npm install -g opencode-ai
-  ```
+### 1.1 準備軟體
 
-### Python 套件
+需要：
+
+- Python 3.10+
+- Node.js LTS + npm
+- Ollama
+- git
+- ripgrep `rg`，建議安裝，搜尋會快很多
+
+安裝 OpenCode：
+
+```bash
+npm install -g opencode-ai
+```
+
+安裝 Ollama 後確認服務可用：
+
+```bash
+ollama list
+```
+
+### 1.2 安裝 ai_code Python 依賴
+
 ```bash
 cd <AICODE_REPO>
 pip install -r requirements.txt
 pip install mcp pymupdf4llm ollama
 ```
 
-### Ollama 模型
-先 pull baseline + RAG 兩顆模型;其他主模型等要切換比較時再 pull。模型優劣看上面的「模型選擇」。
-```bash
-# 主力 LLM(挑一個)
-ollama pull qwen3-coder:30b                  # baseline
-ollama pull qwen3.6:35b-a3b-coding-nvfp4     # 候選 (用 AICODE_MODEL 切換)
-ollama pull devstral:24b
-ollama pull gpt-oss:20b
+`<AICODE_REPO>` 是這個 ai_code repo 的路徑，不是你要分析的 firmware repo。
 
-# RAG 用(必要)
+### 1.3 下載模型
+
+先下載預設主模型與 RAG 必要模型：
+
+```bash
+ollama pull qwen3-coder:30b
 ollama pull bge-m3
 ollama pull qllama/bge-reranker-v2-m3
+```
 
-# 圖片 OCR 用(若你會用 analyze_file 分析截圖)
+建議也把 OpenCode 設定檔列出的候選模型下載好，之後可以直接在 TUI 裡切換：
+
+```bash
+ollama pull qwen3.6:35b-a3b-coding-nvfp4
+ollama pull devstral:24b
+ollama pull gpt-oss:20b
+```
+
+如果會讓 OpenCode 分析截圖、UI error 或圖片，另外下載視覺模型：
+
+```bash
 ollama pull qwen3-vl:30b-a3b
 ```
 
-### `aicode` 啟動腳本(讓 cwd 自動成為 AICODE_ROOT)
+模型怎麼選，見「模型比較」。
 
-倉庫附了 [bin/aicode](bin/aicode) — 它會把當前目錄設成 `AICODE_ROOT` 再 exec
-`opencode`,UX 等同 Claude Code:`cd <project> && aicode`,不必每個專案改
-`opencode.json`。
+### 1.4 自檢
 
-把它 symlink 到 PATH 裡(一次性):
 ```bash
-ln -s "$PWD/bin/aicode" "$HOME/.local/bin/aicode"   # 在 ai_code repo 根目錄執行
-which aicode   # → ~/.local/bin/aicode
+python scripts/doctor.py
 ```
 
-> Windows:把 `bin/aicode` 翻成 `aicode.cmd` 包一個 `set AICODE_ROOT=%CD%` 再
-> `opencode %*`,丟到 PATH 任一目錄。或直接沿用舊做法,在
-> `opencode.json` hardcode `environment.AICODE_ROOT`。
+如果只想檢查本地檔案與設定，不連 Ollama：
 
-腳本內建的安全網:
-- `AICODE_ROOT=/` 或 `=$HOME` → 拒絕啟動(避免把整個 home 餵進沙箱)
-- `opencode` 不在 PATH → 直接報錯不繼續
-- 想覆寫自動偵測:`AICODE_ROOT=/some/other/path aicode`
+```bash
+python scripts/doctor.py --no-network
+```
+
+`PASS` 可以先略過；`FAIL` 要處理。常見問題是 OpenCode 不在 PATH、Ollama 沒啟動、模型還沒 pull、`bin/aicode` 沒有執行權。
 
 ---
 
-## 2. 設定
+## 2. 設定 OpenCode
 
-### OpenCode `opencode.json`
+### 2.1 建立 OpenCode config
 
 ```bash
-${EDITOR:-vi} "$HOME/.config/opencode/opencode.json"
+mkdir -p ~/.config/opencode
+cp examples/opencode.example.json ~/.config/opencode/opencode.json
+${EDITOR:-vi} ~/.config/opencode/opencode.json
 ```
 
-> Windows:`notepad "$HOME\.config\opencode\opencode.json"`
-
-整個檔案內容:
+把 `<AICODE_REPO>` 換成 ai_code repo 的實際絕對路徑。完整內容如下：
 
 ```json
 {
@@ -286,374 +151,382 @@ ${EDITOR:-vi} "$HOME/.config/opencode/opencode.json"
 }
 ```
 
-把 `<AICODE_REPO>` 換成 ai_code 倉庫的實際路徑。Linux 直接用 `/`;Windows 也建議用正斜線(JSON 兩種都吃,反斜線要轉義)。
-如果系統沒有 `python` 指令,把 `command` 改成 `["python3", "<AICODE_REPO>/mcp_server.py"]`。
+如果系統沒有 `python` 指令，把 `command` 改成：
 
-**`AICODE_ROOT` 不再寫死在這裡** — `aicode` 啟動腳本會用 `$PWD` export 給
-MCP 子行程繼承,所以同一份 `opencode.json` 跨專案通用。如果你執意手跑
-`opencode`(不走 wrapper),就要自己 `export AICODE_ROOT=...` 再啟動。
-
-驗證 JSON:
-```bash
-python -m json.tool "$HOME/.config/opencode/opencode.json" >/dev/null && echo OK
-# 或
-jq . "$HOME/.config/opencode/opencode.json" >/dev/null
+```json
+"command": ["python3", "<AICODE_REPO>/mcp_server.py"]
 ```
 
-> Windows PowerShell:`Get-Content "$HOME\.config\opencode\opencode.json" -Raw | ConvertFrom-Json`
+檢查 JSON 格式：
+
+```bash
+python -m json.tool ~/.config/opencode/opencode.json >/dev/null
+```
+
+### 2.2 安裝 `aicode` 啟動指令
+
+在 ai_code repo 根目錄執行：
+
+```bash
+chmod +x bin/aicode
+mkdir -p "$HOME/.local/bin"
+ln -s "$PWD/bin/aicode" "$HOME/.local/bin/aicode"
+```
+
+確認 shell 找得到它：
+
+```bash
+which aicode
+```
+
+`aicode` 會做三件事：
+
+- 將目前目錄設成 `AICODE_ROOT`
+- 拒絕 `AICODE_ROOT=/` 和 `AICODE_ROOT=$HOME`
+- 啟動 `opencode`，讓 OpenCode 子行程繼承同一個沙箱根目錄
 
 ---
 
-## 3. 啟動
+## 3. 啟動專案
+
+切到你要分析或修改的專案，再啟動 OpenCode：
 
 ```bash
-cd <PATH_TO_PROJECT_TO_ANALYZE>
+cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-### 3.1 切換模型(不改 source code)
+進入 TUI 後先確認：
 
-`config.py` 的 `MODEL` 預設讀 `AICODE_MODEL` 環境變數,沒設才用 baseline
-`qwen3-coder:30b`。要測候選模型一行指令:
+- 啟動畫面有 `[aicode] AICODE_ROOT=<PROJECT_TO_ANALYZE>`
+- `/status` 顯示 `ai_code Connected`
+- model selector 裡選的是 Ollama provider 的 coding model
+- 第一輪工具呼叫沒有嘗試讀 `$HOME` 或 `/`
+
+如果要讓 MCP server 內部也使用同一顆主模型，可以啟動時帶 `AICODE_MODEL`：
 
 ```bash
-# pull 一次
-ollama pull qwen3.6:35b-a3b-coding-nvfp4
-
-# 用環境變數切過去(只影響當次 process)
-AICODE_MODEL=qwen3.6:35b-a3b-coding-nvfp4 aicode
-
-# 或:跑 eval / CLI / mcp_server 都吃同一個變數
-AICODE_MODEL=qwen3.6:35b-a3b-coding-nvfp4 python eval/run_eval.py --test-set code --verbose
-AICODE_MODEL=qwen3.6:35b-a3b-coding-nvfp4 python main.py --qa "問題"
+AICODE_MODEL=qwen3-coder:30b aicode
 ```
 
-模型沒 pull 時,呼叫 LLM 會收到 HTTP 404,錯誤訊息會印出當前 `MODEL` 值並提示
-`ollama pull <model>` 命令 — 不會 silent fallback 到 baseline。
-
-Context 大小同樣可用 `AICODE_NUM_CTX` 覆寫(預設 131072):
-```bash
-# 5090 32GB,單卡跑得舒服一點(避免 offload 到 RAM)
-OLLAMA_CONTEXT_LENGTH=64000 ollama serve   # 另一個 shell
-AICODE_NUM_CTX=65536 AICODE_MODEL=qwen3.6:35b-a3b-coding-nvfp4 aicode
-```
-
-啟動時會印 `[aicode] AICODE_ROOT=<那個路徑>` 一行,確認沙箱根目錄無誤後再進
-TUI。要分析 ai_code 倉庫之外的專案,就 `cd` 到那個專案再跑。
-
-進 TUI 後:
-- 左下顯示 `⊙ 1 MCP /status` 綠燈 = ai_code MCP 接上
-- `Ctrl+P` → `model` → 選你要用的 Ollama 模型
-- 右下會顯示 `Qwen3 Coder 30B · Ollama`(或你選的)
-- `/status` 可以確認 `ai_code Connected`
-
-第一次跑問問題會等模型 load 進 VRAM(5090 上 5~10 秒;若 VRAM 不夠會 offload 到 RAM,首 token 延遲明顯增加)。
+OpenCode 右下角選到的模型負責主要對話與工具決策；`AICODE_MODEL` 影響 ai_code 內部需要直接呼叫 Ollama 的流程。通常兩邊用同一顆比較好排查。
 
 ---
 
-## 4. 暴露的 11 個工具
+## 4. 第一輪操作方式
 
-| Tool | 用途 |
+### 4.1 先建立專案地圖
+
+第一次接到一個 repo，先要求模型只讀不改：
+
+```text
+先不要改檔。
+請用 list_dir 看兩層目錄，找出主要 entry point、測試目錄、設定檔。
+再用 code_rag_search 找初始化流程、工具呼叫、資料載入相關程式。
+最後用 file:line 列出這個 repo 的架構判斷，分成「證據」和「推測」。
+```
+
+這會逼模型先走 `list_dir(...)`、`code_rag_search(...)`、`read_file(...)`，避免一開始就憑印象回答。
+
+### 4.2 查 bug 或行為
+
+```text
+請追這個錯誤的來源：<貼錯誤訊息>
+先用 grep_code / code_rag_search 找可能位置，再讀檔確認。
+不要改檔，先列出最可能的 3 個原因與 file:line 證據。
+```
+
+如果有 log 檔，先放進專案內，例如 `logs/build_fail.txt`，再問：
+
+```text
+請 read_file logs/build_fail.txt，根據錯誤訊息找最可能的實作位置。
+```
+
+### 4.3 要它改檔
+
+等模型已經列出證據，再允許 patch：
+
+```text
+根據上面的證據，請做最小修改。
+套用 patch 前先說會改哪些檔案；套用後跑最小相關測試。
+如果 run_command 被白名單拒絕，請列出你原本想跑的命令。
+```
+
+`apply_patch(...)` 會真的寫檔。建議在 git worktree 乾淨時使用；不想改檔時要明講「不要 apply_patch」。
+
+### 4.4 查規格或文件
+
+先把 PDF / Markdown / TXT 放進 `<PROJECT_TO_ANALYZE>` 裡，例如：
+
+```text
+docs/npu_spec.pdf
+```
+
+然後在 OpenCode 裡說：
+
+```text
+請用 ingest_document 把 docs/npu_spec.pdf 加進 knowledge base，完成後 reload_knowledge_base。
+```
+
+之後查規格：
+
+```text
+請用 query_knowledge 查 conv2d 輸入大小限制，回答時附 REF 來源。
+```
+
+### 4.5 看截圖、ELF、firmware
+
+檔案一樣要先放進 `AICODE_ROOT` 內：
+
+```text
+screenshots/error.png
+firmware/boot.bin
+build/output.elf
+```
+
+在 OpenCode 裡問：
+
+```text
+請 analyze_file screenshots/error.png，先 OCR 錯誤文字，再找相關 source file。
+```
+
+```text
+請 analyze_file firmware/boot.bin，列出 magic、可讀字串與可能格式。
+```
+
+---
+
+## 5. ai_code 暴露的 11 個 MCP 工具
+
+| 工具 | 何時用 |
 |---|---|
-| `query_knowledge(question)` | 查 RAG 知識庫(PDF/spec/manual),回 refs + 引用文字 |
-| `code_rag_search(query, top_k=5)` | 依語意找程式碼位置(file:line + symbol) |
-| `list_dir(path=".", depth=2)` | 列目錄樹(`ls`/tree 替代品,自動跳過 .git/.venv 等噪音) |
-| `read_file(path, max_chars=50000)` | 讀檔(沙箱內,帶行號) |
-| `grep_code(pattern, path=".")` | grep / ripgrep 搜程式碼 |
-| `apply_patch(diff)` | 套 unified diff,**直接寫檔** |
-| `run_command(cmd)` | 跑白名單命令(test / lint / build) |
-| `analyze_file(path)` | 分析非文字檔:圖片 OCR、ELF 解析、binary 字串提取 |
-| `ingest_document(path)` | 把 PDF / MD / TXT 灌進 knowledge.json |
-| `remove_document(source)` | 從 KB 刪掉某份 source(by basename),順便清 embedding 快取 |
-| `reload_knowledge_base()` | 重載 KB singleton(灌完/刪完 KB 後呼叫才會生效) |
+| `query_knowledge(question)` | 查已匯入的 PDF / spec / manual / TXT，回傳 refs 與引用文字 |
+| `code_rag_search(query, top_k=5)` | 不知道函式在哪時，用行為描述找相關 symbol 與 file:line |
+| `list_dir(path=".", depth=2)` | 看專案目錄樹，替代直接跑 `ls` |
+| `read_file(path, max_chars=50000)` | 讀沙箱內文字檔，輸出帶行號 |
+| `grep_code(pattern, path=".")` | 在沙箱內搜尋 regex 或字串 |
+| `apply_patch(diff)` | 套 unified diff，會直接寫檔 |
+| `run_command(cmd)` | 跑白名單內的 test / lint / build 命令 |
+| `analyze_file(path)` | 分析圖片 OCR、ELF、binary / firmware |
+| `ingest_document(path)` | 將 PDF / MD / TXT 加進 `knowledge.json` |
+| `remove_document(source)` | 從 knowledge base 移除某份文件，依 basename 比對 |
+| `reload_knowledge_base()` | 重新載入 `knowledge.json`，讓新增或移除的文件生效 |
 
-### 沙箱
-- 所有檔案操作鎖在 `AICODE_ROOT` 內
-- `set_sandbox_root(AICODE_ROOT, allow_external=False)` —— root 之外讀不到
-- `apply_patch` 的 hunk context 必須與檔案實際內容相符,不符整個 hunk 拒絕
-- `run_command` 走 `config.ALLOWED_COMMANDS` 白名單,`shell=False` + `shlex.split`
+工具使用原則：
 
-### `run_command` 白名單(啟動時 mcp_server.py 已自動加 build 系列)
-- 測試:`pytest` / `ctest` / `npm test` / `cargo test` / `go test`
-- 靜態:`mypy` / `tsc` / `ruff` / `black` / `isort` / `eslint` / `clang-format`
-- 建置:`make` / `cmake` / `cmake --build` / `ninja` / `meson` / `bazel build`
-
-要再加要編 `mcp_server.py` 的 `_EXTRA_BUILD_COMMANDS` 或 `config.py` 的 `ALLOWED_COMMANDS`。
+- 先 `code_rag_search(...)` 再 `read_file(...)`，可以少讀很多不相關檔案。
+- 查 spec 先 `query_knowledge(...)`，不要直接讓模型憑記憶回答限制值。
+- 新增或刪除文件後一定要 `reload_knowledge_base()`。
+- `apply_patch(...)` 和 `run_command(...)` 有副作用；需要改檔或執行專案腳本時才允許。
 
 ---
 
-## 5. 用法 — 對話範例
+## 6. 文件與知識庫
 
-### 5.1 找程式碼位置
-```
-幫我找 conv2d 的 padding 怎麼算
-```
-模型會自動連發:
-- ⚙ `code_rag_search(query="conv2d padding")` → 找到 src/ops/conv2d.c:142
-- ⚙ `read_file(path="src/ops/conv2d.c", max_chars=...)` → 讀內容
-- 中文總結
+`knowledge.json` 放在 `AICODE_ROOT` 裡，通常會被 `.gitignore` 忽略。它保存匯入文件切 chunk 後的文字內容，所以不要 commit。
 
-### 5.2 查 spec 文件
-**前提:`knowledge.json` 已灌過 spec PDF**(見 §6)
-```
-這顆 NPU 的 conv2d 最大輸入大小是多少
-```
-- ⚙ `query_knowledge(question="conv2d 輸入上限")` → 從 PDF 抓 §A.2
-- 模型用「根據 REF1 (xxx-spec.pdf p.45)...」格式引用
+### 6.1 匯入文件
 
-### 5.3 對比規格 vs 實作
-```
-看 conv2d 在規格書跟我們實作有什麼差
-```
-這就是 `example.png` 那張圖。模型會:
-- ⚙ `query_knowledge` → 規格說 NHWC layout
-- ⚙ `code_rag_search` → 找實作位置
-- ⚙ `read_file` → 看實作
-- 比對寫出差異
+支援：
 
-### 5.4 改 bug
-```
-ai_code/utils.py 的 should_ignore_dir 對大寫資料夾名沒 normalize,
-幫我改成 case-insensitive
-```
-- ⚙ `read_file(path="utils.py")`
-- 模型生成 unified diff
-- ⚙ `apply_patch(diff=...)` ← 真的寫檔
-- ⚙ `run_command(cmd="pytest tests/test_utils.py")` ← 跑測試
+- `.pdf`
+- `.md`
+- `.txt`
 
-### 5.5 分析韌體
-```
-analyze firmware/boot.bin
-```
-- ⚙ `analyze_file(path="firmware/boot.bin")` → hex dump + magic + 字串
-- 模型告訴你 magic header / 主要字串 / 推測格式
+操作：
 
-### 5.6 看截圖
-複製 compile error 截圖到 `<AICODE_ROOT>/error.png`,然後:
-```
-analyze error.png 那是什麼錯誤
-```
-- ⚙ `analyze_file(path="error.png")` → VL 模型 OCR
-- 模型解釋錯誤原因 + 建議修法
-
-> **沙箱限制**:檔案必須在 AICODE_ROOT 內。`AICODE_ROOT/screenshots/` 之類的
-> 子目錄是慣用做法。
-
----
-
-## 6. RAG 知識庫(讓 `query_knowledge` 有東西可查)
-
-### 6.1 從 OpenCode 內灌 PDF / MD / TXT(推薦)
-
-把 PDF 放進 `<AICODE_ROOT>` 任何位置,在對話框打:
-```
-幫我把 <YOUR_SPEC>.pdf 灌進知識庫,完了重新載入
+```text
+請 ingest_document docs/spec.pdf，完成後 reload_knowledge_base。
 ```
 
-模型會:
-1. ⚙ `ingest_document(path="<YOUR_SPEC>.pdf")` ← subprocess 跑 RAG.py,2~5 分鐘
-2. ⚙ `reload_knowledge_base()` ← KB singleton 重載
-3. 回報新的 chunk 數
+匯入完成後，查詢時要求模型引用 REF：
 
-之後 `query_knowledge` 立即看得到新內容。
-
-> 模型若不會自己連兩個 call,分兩句話講:
-> ```
-> ingest <YOUR_SPEC>.pdf
-> ```
-> ```
-> reload kb
-> ```
-
-### 6.2 互動式來源(截圖 / 圖片 / 網頁)— 必須 CLI 跑
-
-`--chat` / `--image` / `--url` 模式要 Y/n 互動,沒辦法走 MCP。手動:
-
-```bash
-cd <AICODE_REPO>
-python RAG.py teams_chat.png      "$AICODE_ROOT/knowledge.json" --chat
-python RAG.py memory_map.png      "$AICODE_ROOT/knowledge.json" --image
-python RAG.py https://docs.x/api  "$AICODE_ROOT/knowledge.json" --url
+```text
+請 query_knowledge 查 reset timing 的限制，回答每個數字都要附 REF。
 ```
 
-跑完回 OpenCode 打:
-```
-reload knowledge base
-```
+### 6.2 檔名會影響權重
 
-### 6.3 文件分類自動權重(取個好檔名)
+RAG 會根據檔名推斷來源類型。檔名越清楚，排序越穩：
 
-RAG.py 看檔名決定文件類型,影響 query_knowledge 排序:
-
-| 檔名含 | 類型 | 權重 |
+| 檔名包含 | 來源類型 | 適合內容 |
 |---|---|---|
-| `*_spec*` / `*datasheet*` | spec | **1.30**(最高) |
-| `*_api*` / `*reference*` | api | 1.25 |
-| `*manual*` / `*handbook*` | manual | 1.20 |
-| `*guide*` / `*tutorial*` | guide | 1.0 |
-| `*faq*` | faq | 1.0 |
+| `spec` / `datasheet` | spec | 規格、限制、硬體行為 |
+| `api` / `reference` | api | API 定義、參數、return code |
+| `manual` / `handbook` | manual | 使用手冊、操作流程 |
+| `guide` / `tutorial` | guide | 教學文件 |
+| `faq` | faq | 常見問題 |
 
-**檔名取貼切,query_knowledge 才會優先撈那份**。`xxx-spec.pdf` 比 `xxx.pdf` 好。
+例如 `npu_spec.pdf` 通常比 `doc.pdf` 更容易被排在前面。
 
-### 6.4 確認 KB 狀態
+### 6.3 移除過期文件
 
-CLI:
-```bash
-python -c "from knowledge import KnowledgeBase; kb = KnowledgeBase('$AICODE_ROOT/knowledge.json'); print(kb.get_status())"
+```text
+請 remove_document old_spec.pdf，完成後 reload_knowledge_base。
 ```
 
-或在 OpenCode 內:
-```
-reload knowledge base
-```
-回應會顯示 `已載入 N 個 chunks`。
-
-### 6.5 推薦灌庫順序(NDA firmware 場景)
-
-1. **Spec / datasheet**(權重 1.30)— 一定要,查詢主力靠這個
-2. **API reference / Manual**(權重 1.20~1.25)
-3. **Guide / Tutorial / FAQ**(1.0)
-4. **(可選)團隊 Teams/Slack 討論截圖** — 用 `--chat` 互動式入庫,只挑有結論的對話
+`remove_document(...)` 用 basename 比對，所以傳 `docs/old_spec.pdf` 或 `old_spec.pdf` 都可以。
 
 ---
 
-## 7. 沒接 OpenCode 也想跑 — Inspector 單測
+## 7. 模型比較
+
+下面比較的是這個 repo 的 OpenCode 設定檔已列出的模型，以及 ai_code 內部會用到的 RAG / 視覺模型。
+
+| 模型 | 建議用途 | 優點 | 注意事項 |
+|---|---|---|---|
+| `qwen3-coder:30b` | 預設主力；讀 repo、改 code、產 patch、跑驗證閉環 | coding 能力和工具使用穩定度最均衡；適合作為日常預設 | 比 20B 模型慢；長工具鏈任務建議拆成「先查證、再修改」 |
+| `qwen3.6:35b-a3b-coding-nvfp4` | 跨檔推理、規格 vs 實作比對、較複雜重構 | 推理上限較高；大 context 任務表現較好 | 更吃 VRAM / RAM；不穩或太慢時把 `AICODE_NUM_CTX` 降到 `65536` |
+| `devstral:24b` | 快速 code review、找 bug、簡單 patch | 速度和 coding 能力平衡；回答通常直接 | 工具呼叫格式不一定比 Qwen Coder 穩；大型修改前建議切回 Qwen |
+| `gpt-oss:20b` | 快速理解陌生 repo、摘要、初步定位 | 輕量、啟動快、硬體壓力低 | 複雜改檔與長工具鏈較弱；適合探索，不適合作為最終 patch 主力 |
+| `qwen3-vl:30b-a3b` | `analyze_file(...)` 處理截圖、圖片 OCR、UI error | 讀圖中文字與畫面資訊較好 | 不是主要 coding model；只有需要圖片分析時才必須 pull |
+| `bge-m3` | `query_knowledge(...)` / `code_rag_search(...)` 的 embedding | 多語檢索穩定；中文 spec 與英文程式碼混用時有幫助 | 不是聊天模型，不要在 OpenCode model selector 裡選 |
+| `qllama/bge-reranker-v2-m3` | RAG rerank | 能改善 spec 查詢排序，降低抓到弱相關 chunk 的機率 | 會增加查詢延遲；模型未 pull 時 RAG 品質會下降或報錯 |
+
+實務選法：
+
+- 要穩定完成「查證 -> patch -> test」：用 `qwen3-coder:30b`。
+- 任務跨很多檔、要比對規格或做設計判斷：用 `qwen3.6:35b-a3b-coding-nvfp4`。
+- 只想先看懂 repo 或做初步 review：用 `gpt-oss:20b` 或 `devstral:24b`。
+- 要讀截圖：保留主聊天模型不變，讓 `analyze_file(...)` 使用 `qwen3-vl:30b-a3b`。
+
+Context 建議：
 
 ```bash
-export AICODE_ROOT="<PATH_TO_PROJECT_TO_ANALYZE>"
-npx @modelcontextprotocol/inspector python <AICODE_REPO>/mcp_server.py
+AICODE_NUM_CTX=65536 aicode
 ```
 
-> Windows PowerShell:把 `export` 改成 `$env:AICODE_ROOT = "..."`。
-
-開瀏覽器 `http://127.0.0.1:6274`,**Tools** 分頁逐個工具帶參數測。
-連線設定:
-- Transport: STDIO
-- Command: `python`
-- Arguments: `<AICODE_REPO>/mcp_server.py`
-- Environment Variables: `AICODE_ROOT = <PATH>`
-
-按 Connect。`apply_patch` 跳過(會真寫檔)。
+64K 通常比較穩；128K 適合 32GB VRAM + 大 RAM 的機器，但 prompt ingest 和首 token 會變慢。
 
 ---
 
-## 8. 沒接 MCP 也想用 — `main.py` CLI 模式仍可用
+## 8. 安全邊界
 
-`mcp_server.py` 完全獨立,跟 `main.py` 不衝突:
+### 8.1 沙箱
+
+MCP server 啟動時會執行：
+
+```text
+set_sandbox_root(AICODE_ROOT, allow_external=False)
+```
+
+結果：
+
+- `read_file(...)`、`grep_code(...)`、`list_dir(...)` 只能看 `AICODE_ROOT` 內的檔案。
+- `analyze_file(...)`、`ingest_document(...)` 的輸入也必須在 `AICODE_ROOT` 內。
+- `apply_patch(...)` 只能改沙箱內檔案，且 patch context 必須跟現有檔案相符。
+- `aicode` 會拒絕把 `/` 或 `$HOME` 當 root。
+
+### 8.2 Patch
+
+`apply_patch(...)` 限制：
+
+- 單次最多 5 個檔案
+- 單檔最多 200 行修改
+- hunk context 不符會拒絕
+
+這些限制是保護用的，不要為了方便把它拿掉。大型修改請拆小步。
+
+### 8.3 Run Command
+
+`run_command(...)` 只允許白名單命令，例如：
+
+- Python：`pytest`、`python -m pytest`、`python -m unittest`
+- C/C++：`ctest`、`make`、`cmake`、`cmake --build`、`ninja`
+- Node：`npm test`、`npm run test`、`yarn test`
+- Rust：`cargo test`、`cargo clippy`
+- Go：`go test`、`go vet`
+- Lint / format：`ruff`、`black`、`isort`、`eslint`、`clang-format`
+
+即使有白名單，`make`、`cmake`、`npm test` 仍可能執行專案內腳本。只在可信專案使用。
+
+### 8.4 不要 commit 的資料
+
+這些通常含有 NDA 內容或本地快取，應留在 `.gitignore`：
+
+- `knowledge.json`
+- `knowledge_emb.npz`
+- `.code_rag_cache_*`
+- `.rag_embedding_cache.json`
+- `.opencode/`
+- `data/`
+- `*.jsonl`
+
+---
+
+## 9. 常見問題
+
+### `/status` 沒看到 `ai_code Connected`
+
+檢查：
 
 ```bash
-# QA 模式(不掃專案)
-python main.py --qa "解釋這個 compile error"
+python -m json.tool ~/.config/opencode/opencode.json >/dev/null
+which aicode
+which opencode
+```
 
-# 一般模式(掃完整專案,自動選 full / agent)
-python main.py "$AICODE_ROOT"
+再確認 `opencode.json` 裡的 `<AICODE_REPO>/mcp_server.py` 是實際路徑。
 
-# 接知識庫問答
-python main.py "$AICODE_ROOT" --kb "$AICODE_ROOT/knowledge.json"
+### 啟動時拒絕 `AICODE_ROOT`
 
-# 啟用改碼閉環
-python main.py "$AICODE_ROOT" --patch --run-tests
+你可能在 `$HOME` 或 `/` 執行了 `aicode`。切到具體專案：
 
-# 遠端 SSH(透過 SSH 按需讀遠端檔案)
-python main.py --mcp user@host "問題"
+```bash
+cd ~/work/some-firmware-repo
+aicode
+```
 
-# 評測回歸
-python eval/run_eval.py
+### 模型 404 或找不到模型
+
+代表 Ollama 沒有該 tag：
+
+```bash
+ollama pull qwen3-coder:30b
+ollama pull qwen3.6:35b-a3b-coding-nvfp4
+ollama pull devstral:24b
+ollama pull gpt-oss:20b
+```
+
+### 查 spec 沒結果
+
+先確認文件已經匯入並 reload：
+
+```text
+請 reload_knowledge_base，回報目前載入幾個 chunks。
+```
+
+如果 chunks 是 0，重新要求：
+
+```text
+請 ingest_document docs/spec.pdf，完成後 reload_knowledge_base。
+```
+
+### `apply_patch(...)` 被拒絕
+
+常見原因：
+
+- 模型讀到的是舊內容，先 `read_file(...)` 重讀目標區段。
+- patch context 不夠或不匹配。
+- 一次改超過檔案數或行數限制。
+
+把任務拆小，要求模型一次只改一個行為。
+
+### `run_command(...)` 被拒絕
+
+命令不在白名單，或含 shell metacharacter。請模型改用已允許的最小命令，例如：
+
+```text
+請改跑 python -m pytest tests/test_x.py，不要使用 &&、|、; 或 shell script。
 ```
 
 ---
 
-## 9. 開發 / 工程治理
+## 10. 建議工作節奏
 
-repo 從個人研發工具升級成可維護的工程專案。改 code 之前先讀 [AGENTS.md](AGENTS.md)。
-
-### 9.1 本地驗證(不需要 Ollama)
-```bash
-python -m compileall -q .                          # syntax sanity
-python scripts/run_tests.py                        # 51 個 smoke + 安全 test (deterministic)
-python scripts/check_eval_consistency.py           # eval ↔ config / source 不漂移
-python scripts/check_readme_consistency.py         # README ↔ mcp_server.py / config.py 不漂移
-python scripts/doctor.py --no-network              # preflight 檢查(本地)
-ruff check tests scripts                           # lint(advisory)
-```
-
-> 為何用 `scripts/run_tests.py` 而不是直接 `python -m pytest`:
-> 它會設 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`,避免使用者環境裡全域裝的 pytest
-> plugin(ddtrace、xdist 等)在 collect 階段卡住或干擾 deterministic 結果。
-> 直接 `python -m pytest` 在乾淨環境下也能跑,但**遇到 hang 請改用 wrapper**。
-
-### 9.2 測試覆蓋
-- `tests/test_cli.py` — `--help` / `-h` exit 0、未知 flag warn 不 crash、非 TTY 環境的 `--qa` 不 EOFError
-- `tests/test_config.py` — config 數值範圍、危險開關預設關閉、ALLOWED_COMMANDS 沒 rm/sudo/curl
-- `tests/test_sandbox.py` — `_safe_path` 擋下 `..` / 絕對路徑 / symlink 逃逸(agent_tools + media 兩條獨立 sandbox)
-- `tests/test_patch.py` — apply_patch 的 happy path、`../` 逃逸、context 不符、max files / max lines
-- `tests/test_run_command.py` — 白名單、shell 元字元(`; && | $() \``)、空命令
-- `tests/test_eval_consistency.py` — eval 提到的 symbol/file/config key 真的存在,gold_evidence 與當前 default 對齊
-
-### 9.3 改 config / docs / eval 的 SOP
-任何 `config.py`、`README.md`、`eval/*.json` 異動都要跑:
-```bash
-python scripts/check_eval_consistency.py
-python -m pytest tests/test_eval_consistency.py
-```
-歷史漂移範例(已修):`RERANKER_TOP_N` 改了但 eval 沒改、`_parse_unified_diff` 從 `agent.py` 搬到 `agent_tools.py`、`EMBEDDING_MODEL` 從 `mxbai-embed-large` 換成 `bge-m3`。
-
-### 9.4 CI
-`.github/workflows/ci.yml` 在 push / PR 上跑:`compileall → eval-consistency → pytest → ruff(advisory)`。**不依賴 Ollama / GPU / 大型模型下載** — 純靜態檢查,落地 ≤ 1 分鐘。
-
----
-
-## 10. 安全 / NDA 注意
-
-### 不會 commit 的衍生物(`.gitignore` 已涵蓋)
-- `knowledge.json` / `knowledge*.json` — RAG 知識庫(含 PDF chunks 全文)
-- `.code_rag_cache_*` — Code RAG 索引快取
-- `.rag_embedding_cache.json` — RAG 建索引時的 embedding 快取
-- `.opencode/` — OpenCode session 紀錄
-- `data/` / `*.jsonl` — 資料飛輪紀錄
-
-### NDA 環境部署 checklist
-- [ ] 5090 機器確認**不會自動 sync 到雲端**(rclone / Nextcloud / OneDrive / Dropbox / git remote 等)
-- [ ] `AICODE_ROOT` 指向真實 NDA 專案,不是測試目錄
-- [ ] `opencode.json` 路徑改成那台機器的實際路徑
-- [ ] 灌完 RAG 後 `git status` 確認 `knowledge.json` 顯示 ignored
-- [ ] `apply_patch` 寫檔前確認 NDA repo 在 git 控管下,出事可 `git checkout -- .`
-
-### 風險點
-- `apply_patch` 沒有 dry-run 介面,直接寫
-- `run_command` 的 `make` / `npm install` 等會執行專案內腳本,**不要對不信任 repo 用**
-- `analyze_file` 對 firmware blob 做 OCR/字串提取會把內容塞進 LLM context — 確認模型也是本地的(Ollama)不會外送
-
-### 已驗證的 ai_code 程式碼掃描結果
-- 0 個 hardcoded API key / token / password
-- 0 個 NDA 客戶名 / 產品名 / 規格書檔名
-- 11 個 MCP 工具皆走 sandbox `_safe_path` 驗證
-
----
-
-## 11. 疑難排解
-
-> **第一個動作:跑 `python scripts/doctor.py`** — 大部分問題會在那裡告訴你哪一步壞了。
-
-| 症狀 | 解法 |
-|---|---|
-| `[ERROR] 無法連接 Ollama` | `ollama serve` 沒開;`systemctl --user status ollama`(Linux);測連線 `curl -s http://localhost:11434/api/tags`。也可用 `AICODE_OLLAMA_BASE_URL` 環境變數指到別的 host。 |
-| `[ERROR] Ollama 請求超時` | 首次 30B 模型 cold start 要 10–30 秒。仍持續就 `ollama ps` 看是否模型卡住、VRAM 不夠;改小 `config.NUM_CTX` 或換模型。 |
-| `[ERROR] Ollama 回 HTTP 錯誤 ... model not found` | `ollama pull <model>`。`config.py` 內 `MODEL` / `EMBEDDING_MODEL` / `RERANKER_MODEL` 都要 pull 過。 |
-| `mcp` package missing | `pip install mcp`。CLI 模式不需要 mcp,只有 OpenCode + MCP 路線需要。 |
-| `opencode: command not found` | `npm install -g opencode-ai`,確認 `npm bin -g` 在 PATH。 |
-| `[FATAL] 未設定 AICODE_ROOT` | 改用 `aicode` wrapper(自動帶 cwd);手跑 `opencode` 就先 `export AICODE_ROOT="<path>"`(Windows: `$env:AICODE_ROOT = "<path>"`)。 |
-| `[FATAL] 拒絕 AICODE_ROOT=/` | 故意擋的;cd 到具體 project 再跑。 |
-| `[FATAL] 拒絕 AICODE_ROOT=$HOME` | 故意擋的(範圍太大易漏資料);cd 到具體 project 再跑。真有需要設 `AI_CODE_ALLOW_HOME_ROOT=1`(高風險)。`bin/aicode`、`mcp_server.py`、`scripts/doctor.py --project $HOME` 三者行為一致。 |
-| `aicode: command not found` | symlink 沒做或 `~/.local/bin` 不在 PATH。重跑 `ln -s "$PWD/bin/aicode" "$HOME/.local/bin/aicode"`,`echo $PATH` 確認含 `~/.local/bin`。 |
-| OpenCode 看不到 ai_code 工具 | `opencode.json` JSON 格式錯、`<AICODE_REPO>` 沒換、或 `mcp_server.py` 路徑不對。`/status` 在 TUI 確認。 |
-| `query_knowledge` 永遠回 `not loaded` | `<AICODE_ROOT>/knowledge.json` 不存在;先 `ingest_document` 灌 PDF,再 `reload_knowledge_base`。 |
-| `query_knowledge` 有 KB 但回不到答案 | 灌的 PDF 跟問題無關,或 query 太抽象;翻翻 KB chunks。 |
-| `ingest_document` 超時 | 大型 PDF(>500 頁)改 CLI:`python RAG.py xxx.pdf knowledge.json`。 |
-| `analyze_file` 對截圖 OCR 失敗 | `ollama pull qwen3-vl:30b-a3b`、確認 `config.VL_MODEL` 對得上。 |
-| `run_command 不允許的命令` | 故意擋的;只有 `config.ALLOWED_COMMANDS` 內的命令可跑。要加白名單請改 `config.py` 並補測試。 |
-| `apply_patch` 失敗:context 不符 | Patch 的 ` ` / `-` 行必須與檔案實際內容對得上;讓模型 `read_file` 重看一次再產 patch。 |
-| 模型回 `multi_tool_use.parallel invalid` | gpt-oss 的 quirk,把問題拆成單步問,或換 Qwen3-coder / Devstral。 |
-| 模型亂選 `run_command` 跑 `dir` | 模型抽風;prompt 寫具體點(指定工具名:`code_rag_search` / `read_file`)。 |
-| VRAM 不夠跑 30B 很慢(部分 offload 到 CPU) | 預期行為;目標部署是 5090(32GB VRAM),小卡只能當測試。 |
-| `python -m pytest` 卡住 / hang | 你的環境裝了會自動載入 collect-time hook 的 pytest plugin(ddtrace、xdist 等)。改用 `python scripts/run_tests.py`,內部會 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`。 |
+1. `cd <PROJECT_TO_ANALYZE>` 後跑 `aicode`。
+2. 第一輪只允許讀取，要求列 file:line 證據。
+3. 有 spec 先 `ingest_document(...)` + `reload_knowledge_base()`。
+4. 修改前要求模型說明將改哪些檔案與原因。
+5. 修改後要求模型跑最小相關驗證。
+6. 結束前自己看一次 git diff，確認沒有把 `knowledge.json`、cache、log 或 NDA 衍生資料納入 commit。
