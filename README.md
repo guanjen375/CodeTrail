@@ -330,25 +330,25 @@ build/output.elf
 
 ## 5. ai_code 暴露的 17 個 MCP 工具
 
-你不用手動寫 JSON 或自己呼 API。這些工具會出現在 OpenCode 的工具列表裡；日常用法是在對話中直接要求模型「用某個工具做某件事」。如果你怕模型亂猜，直接點名工具名最有效。
+你不用手動寫 JSON 或自己呼 API。這些工具會出現在 OpenCode 的工具列表裡；日常用法是在對話中直接要求模型「用工具 `<工具名>` 做某件事」。多數情況只講工具名就夠了，模型會自己補預設參數；需要指定檔案、行號、搜尋範圍時，再把那些條件寫進自然語言。
 
 ### 5.1 最常用講法
 
 | 你想做什麼 | 在 OpenCode 裡可以這樣說 | 主要工具 |
 |---|---|---|
-| 先看 repo 長什麼樣 | 請用 `list_dir(path=".", depth=2)` 看專案結構，找 entry point、測試和設定檔。 | `list_dir(...)` |
-| 不知道程式在哪 | 請先用 `code_rag_search("初始化流程")` 找相關 symbol，再讀最相關檔案。 | `code_rag_search(...)`、`read_file(...)` |
-| 找某個字串或錯誤訊息 | 請用 `grep_code("panic: xxx", path=".", include="*.c,*.h", context=3)` 找位置。 | `grep_code(...)` |
-| 讀一個已知檔案 | 請用 `file_info("src/main.py")` 看大小，再用 `read_file("src/main.py", start_line=1, end_line=120)` 讀。 | `file_info(...)`、`read_file(...)` |
-| 查已匯入的 spec | 請用 `query_knowledge("reset timing 限制")` 查 KB，回答要附 REF。 | `query_knowledge(...)` |
-| 查不能答錯的規格數字 | 請用 `query_knowledge_strict("reset assert 最小時間")`，證據不夠就拒答。 | `query_knowledge_strict(...)` |
-| 看專案外的截圖/PDF/log | 請先用 `import_external_file("~/Downloads/error.png")` 匯入，再分析回傳的新路徑。 | `import_external_file(...)` |
-| 看圖片、ELF、firmware | 請用 `analyze_file(".aicode_uploads/error.png")` OCR 或分析 binary。 | `analyze_file(...)` |
-| 把 PDF/MD/TXT 加進 KB | 請用 `ingest_document("docs/spec.pdf")`，完成後 `reload_knowledge_base()`。 | `ingest_document(...)`、`reload_knowledge_base()` |
-| 移除舊文件 | 請用 `remove_document("old_spec.pdf")`，完成後 `reload_knowledge_base()`。 | `remove_document(...)` |
-| 準備改檔 | 請先用 `git_status()` 和 `git_diff()` 確認目前變更，再說明要改哪些檔案。 | `git_status(...)`、`git_diff(...)` |
-| 套修改 | 請產生最小 unified diff，先用 `apply_patch(diff, dry_run=True)` 預覽，再正式套用。 | `apply_patch(...)` |
-| 修改後檢查 | 請用 `run_lint("src/main.py", fix=True)`，再用 `run_command("pytest tests/test_x.py")` 跑最小測試。 | `run_lint(...)`、`run_command(...)` |
+| 先看 repo 長什麼樣 | 請用工具 `list_dir` 看專案結構，找 entry point、測試和設定檔。 | `list_dir(...)` |
+| 不知道程式在哪 | 請先用工具 `code_rag_search` 搜尋「初始化流程」，再用工具 `read_file` 讀最相關檔案。 | `code_rag_search(...)`、`read_file(...)` |
+| 找某個字串或錯誤訊息 | 請用工具 `grep_code` 搜尋錯誤訊息「panic: xxx」，範圍限 C/C++ 檔，並顯示上下文。 | `grep_code(...)` |
+| 讀一個已知檔案 | 請用工具 `file_info` 看 `src/main.py` 大小，再用工具 `read_file` 讀前 120 行。 | `file_info(...)`、`read_file(...)` |
+| 查已匯入的 spec | 請用工具 `query_knowledge` 查 reset timing 限制，回答要附 REF。 | `query_knowledge(...)` |
+| 查不能答錯的規格數字 | 請用工具 `query_knowledge_strict` 查 reset assert 最小時間，證據不夠就拒答。 | `query_knowledge_strict(...)` |
+| 看專案外的截圖/PDF/log | 請先用工具 `import_external_file` 匯入 `~/Downloads/error.png`，再分析回傳的新路徑。 | `import_external_file(...)` |
+| 看圖片、ELF、firmware | 請用工具 `analyze_file` 分析 `.aicode_uploads/error.png`，做 OCR 或 binary 分析。 | `analyze_file(...)` |
+| 把 PDF/MD/TXT 加進 KB | 請用工具 `ingest_document` 匯入 `docs/spec.pdf`，完成後用工具 `reload_knowledge_base`。 | `ingest_document(...)`、`reload_knowledge_base()` |
+| 移除舊文件 | 請用工具 `remove_document` 移除 `old_spec.pdf`，完成後用工具 `reload_knowledge_base`。 | `remove_document(...)` |
+| 準備改檔 | 請先用工具 `git_status` 和 `git_diff` 確認目前變更，再說明要改哪些檔案。 | `git_status(...)`、`git_diff(...)` |
+| 套修改 | 請產生最小 unified diff，先用工具 `apply_patch` 預覽，再正式套用。 | `apply_patch(...)` |
+| 修改後檢查 | 請用工具 `run_lint` 檢查剛改的檔案，再用工具 `run_command` 跑最小相關測試。 | `run_lint(...)`、`run_command(...)` |
 
 ### 5.2 依任務分類
 
@@ -374,13 +374,13 @@ build/output.elf
 
 ### 5.3 使用原則
 
-- 找程式碼時，先 `code_rag_search(...)` 或 `grep_code(...)`，再 `read_file(...)`。
-- 長檔先 `file_info(...)`，再用 `read_file(path, start_line, end_line)` 分段讀。
-- 查 spec 先 `query_knowledge(...)`；數字、限制、預設值這類答錯很糟的題目，用 `query_knowledge_strict(...)`。
-- 外部檔案先 `import_external_file(...)`，再用 `analyze_file(...)`、`ingest_document(...)` 或 `read_file(...)` 處理匯入後路徑。
-- 新增或刪除文件後一定要 `reload_knowledge_base()`。
-- 改檔前先看 `git_status(...)` / `git_diff(...)`；改檔用 `apply_patch(...)`。
-- `apply_patch(...)` 和 `run_command(...)` 有副作用；需要改檔或執行專案腳本時才允許。
+- 找程式碼時，先請模型用工具 `code_rag_search` 或 `grep_code`，再用工具 `read_file`。
+- 長檔先用工具 `file_info` 看大小，再要求工具 `read_file` 分段讀。
+- 查 spec 先用工具 `query_knowledge`；數字、限制、預設值這類答錯很糟的題目，用工具 `query_knowledge_strict`。
+- 外部檔案先用工具 `import_external_file`，再用工具 `analyze_file`、`ingest_document` 或 `read_file` 處理匯入後路徑。
+- 新增或刪除文件後一定要用工具 `reload_knowledge_base`。
+- 改檔前先看工具 `git_status` / `git_diff`；改檔用工具 `apply_patch`。
+- 工具 `apply_patch` 和 `run_command` 有副作用；需要改檔或執行專案腳本時才允許。
 
 ---
 
