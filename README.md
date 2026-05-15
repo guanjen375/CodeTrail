@@ -17,7 +17,7 @@ ai_code 目前定位是**成熟私有部署版**：適合本機、離線、NDA /
 
 - **OpenCode**：對話式 TUI，負責跟模型互動、顯示工具呼叫。
 - **Ollama**：在本機跑主要 coding model、embedding model、reranker 和視覺模型。
-- **ai_code MCP server**：把目前專案限制在 `AICODE_ROOT` 沙箱內，提供 16 個 MCP 工具給 OpenCode。
+- **ai_code MCP server**：把目前專案限制在 `AICODE_ROOT` 沙箱內，提供 17 個 MCP 工具給 OpenCode。
 - **`aicode` wrapper**：從目前目錄啟動 OpenCode，並把目前目錄自動設成 `AICODE_ROOT`。
 
 資料流：
@@ -211,6 +211,18 @@ AICODE_MODEL=qwen3-coder:30b aicode
 
 OpenCode 右下角選到的模型負責主要對話與工具決策；`AICODE_MODEL` 影響 ai_code 內部需要直接呼叫 Ollama 的流程。通常兩邊用同一顆比較好排查。
 
+如果要讓 OpenCode 匯入專案外的截圖、PDF、log 或 firmware blob，啟動時明確開啟外部匯入入口：
+
+```bash
+AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
+```
+
+預設只允許從 `~/Downloads` 和 `/tmp` 匯入。要加其他來源，用 `AI_CODE_IMPORT_ROOTS` 指定：
+
+```bash
+AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/mnt/share" aicode
+```
+
 ---
 
 ## 4. 第一輪操作方式
@@ -268,6 +280,12 @@ docs/npu_spec.pdf
 請用 ingest_document 把 docs/npu_spec.pdf 加進 knowledge base，完成後 reload_knowledge_base。
 ```
 
+如果文件在專案外，且啟動時已設 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1`，可以先要求：
+
+```text
+請 import_external_file ~/Downloads/npu_spec.pdf，然後用回傳的新路徑 ingest_document，完成後 reload_knowledge_base。
+```
+
 之後查規格：
 
 ```text
@@ -284,7 +302,7 @@ docs/npu_spec.pdf
 
 ### 4.5 看截圖、ELF、firmware
 
-檔案一樣要先放進 `AICODE_ROOT` 內：
+檔案一樣要先放進 `AICODE_ROOT` 內，或先用 `import_external_file(...)` 受控匯入：
 
 ```text
 screenshots/error.png
@@ -302,9 +320,15 @@ build/output.elf
 請 analyze_file firmware/boot.bin，列出 magic、可讀字串與可能格式。
 ```
 
+外部檔案範例：
+
+```text
+請 import_external_file /tmp/error.png，然後 analyze_file 它回傳的 .aicode_uploads 路徑。
+```
+
 ---
 
-## 5. ai_code 暴露的 16 個 MCP 工具
+## 5. ai_code 暴露的 17 個 MCP 工具
 
 | 工具 | 何時用 |
 |---|---|
@@ -320,6 +344,7 @@ build/output.elf
 | `git_diff(path=None, staged=False)` | git diff，可限路徑或看已暫存內容 |
 | `run_lint(path, fix=True)` | 依副檔名挑工具 lint/format 單一檔案 |
 | `run_command(cmd)` | 跑白名單內的 test / lint / build 命令 |
+| `import_external_file(path, dest_name=None)` | 將允許來源目錄內的外部檔案複製到 `.aicode_uploads/` |
 | `analyze_file(path)` | 分析圖片 OCR、ELF、binary / firmware |
 | `ingest_document(path)` | 將 PDF / MD / TXT 加進 `knowledge.json` |
 | `remove_document(source)` | 從 knowledge base 移除某份文件，依 basename 比對 |
@@ -430,6 +455,7 @@ set_sandbox_root(AICODE_ROOT, allow_external=False)
 
 - `read_file(...)`、`grep_code(...)`、`list_dir(...)` 只能看 `AICODE_ROOT` 內的檔案。
 - `analyze_file(...)`、`ingest_document(...)` 的輸入也必須在 `AICODE_ROOT` 內。
+- `import_external_file(...)` 是唯一外部入口，預設關閉；開啟後也只會把允許來源目錄內的檔案複製進 `.aicode_uploads/`。
 - `apply_patch(...)` 只能改沙箱內檔案，且 patch context 必須跟現有檔案相符。
 - `aicode` 會拒絕把 `/` 或 `$HOME` 當 root。
 
@@ -465,6 +491,7 @@ set_sandbox_root(AICODE_ROOT, allow_external=False)
 - `.code_rag_cache_*`
 - `.rag_embedding_cache.json`
 - `.opencode/`
+- `.aicode_uploads/`
 - `data/`
 - `*.jsonl`
 

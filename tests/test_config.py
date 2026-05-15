@@ -45,6 +45,8 @@ def test_dangerous_features_default_off():
         assert config.PATCH_ENABLED is False
     if os.environ.get("AI_CODE_RUN_TESTS", "").lower() not in ("1", "true", "yes"):
         assert config.RUN_COMMAND_ENABLED is False
+    if os.environ.get("AI_CODE_ALLOW_EXTERNAL_IMPORT", "").lower() not in ("1", "true", "yes"):
+        assert config.EXTERNAL_IMPORT_ENABLED is False
 
 
 def test_allowed_commands_no_dangerous_entries():

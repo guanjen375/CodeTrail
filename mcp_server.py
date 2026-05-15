@@ -88,6 +88,7 @@ from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from agent_tools import ToolExecutor
 from media import set_sandbox_root, ocr_image, read_elf, read_binary, IMAGE_EXTENSIONS, ELF_EXTENSIONS, BINARY_EXTENSIONS
+from external_import import import_external_file as _import_external_file
 from http_client import close_session
 from utils import (
     answer_with_self_check,
@@ -148,6 +149,7 @@ EXEC = ToolExecutor(AICODE_ROOT)
 
 _log(f"[MCP] PATCH_ENABLED = {config.PATCH_ENABLED}, RUN_COMMAND_ENABLED = {config.RUN_COMMAND_ENABLED}")
 _log(f"[MCP] ALLOWED_COMMANDS 共 {len(config.ALLOWED_COMMANDS)} 條(已 append build 命令)")
+_log(f"[MCP] EXTERNAL_IMPORT_ENABLED = {config.EXTERNAL_IMPORT_ENABLED}")
 if data_flywheel.DATA_COLLECT_ENABLED:
     _log(
         "[MCP] DATA_COLLECT_ENABLED = True (AI_CODE_COLLECT_DATA) — "
@@ -573,6 +575,28 @@ def run_lint(path: str, fix: bool = True) -> str:
         Lint 工具的輸出(已截斷)。多工具時會依序嘗試到有可用工具為止。
     """
     return EXEC.run_lint(path=path, fix=fix)
+
+
+@mcp.tool()
+def import_external_file(path: str, dest_name: Optional[str] = None) -> str:
+    """Copy an allowed external file into AICODE_ROOT/.aicode_uploads/.
+
+    This is the controlled "upload/import"入口 for OpenCode users who have a
+    screenshot, PDF, log, ELF, or firmware blob outside the project. General
+    tools still cannot read outside AICODE_ROOT. This tool only works when the
+    server was started with AI_CODE_ALLOW_EXTERNAL_IMPORT=1, and the source path
+    is inside an allowed import root (default: ~/Downloads and /tmp; override
+    with AI_CODE_IMPORT_ROOTS).
+
+    Args:
+        path: 外部檔案路徑。支援絕對路徑或 ~ 展開。
+        dest_name: 可選的新檔名(只能是 basename,不能含目錄)。
+
+    Returns:
+        匯入結果與 AICODE_ROOT 內的新相對路徑。接著可用 analyze_file /
+        ingest_document / read_file 處理該路徑。
+    """
+    return _import_external_file(path, AICODE_ROOT, dest_name=dest_name)
 
 
 @mcp.tool()

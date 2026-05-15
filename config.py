@@ -96,6 +96,32 @@ CODE_EXTENSIONS = {
 GREP_DEFAULT_EXTENSIONS = "*.py,*.c,*.cpp,*.h,*.hpp,*.js,*.ts,*.jsx,*.tsx,*.go,*.rs,*.java,*.kt,*.sh,*.md,*.json,*.yaml,*.yml,*.toml"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
+# ============================================================
+# MCP 外部檔案匯入設定
+# ============================================================
+# OpenCode MCP server 預設只能讀 AICODE_ROOT 內的檔案。若使用者要分析
+# Downloads/tmp 裡的截圖、PDF、firmware blob，先透過 import_external_file
+# 複製進 AICODE_ROOT/.aicode_uploads/，再交給 read_file / analyze_file /
+# ingest_document。此入口預設關閉，避免 MCP server 任意讀本機檔案。
+EXTERNAL_IMPORT_ENABLED = _os.environ.get("AI_CODE_ALLOW_EXTERNAL_IMPORT", "").lower() in (
+    "1", "true", "yes"
+)
+EXTERNAL_IMPORT_ROOTS = [
+    p.strip()
+    for p in _os.environ.get("AI_CODE_IMPORT_ROOTS", "").split(_os.pathsep)
+    if p.strip()
+]
+EXTERNAL_IMPORT_DEST_DIR = _os.environ.get("AI_CODE_EXTERNAL_IMPORT_DIR", ".aicode_uploads")
+EXTERNAL_IMPORT_MAX_BYTES = int(
+    float(_os.environ.get("AI_CODE_EXTERNAL_IMPORT_MAX_MB", "100")) * 1024 * 1024
+)
+EXTERNAL_IMPORT_ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | {
+    ".pdf", ".md", ".txt", ".log",
+    ".json", ".jsonl", ".yaml", ".yml", ".toml", ".csv",
+    ".elf", ".so", ".o", ".axf", ".out", ".ko",
+    ".bin", ".dat", ".raw", ".fw", ".img", ".rom", ".hex",
+}
+
 IGNORED_DIRS = {
     ".git", "__pycache__", ".venv", "venv", "node_modules",
     ".idea", ".vscode", "build", "dist", ".cache", ".tox",
