@@ -285,16 +285,35 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/mnt/share
 
 預設情況下系統不能讀專案目錄以外的東西。這是安全限制：避免分析陌生程式碼時模型意外讀到家目錄裡的 SSH key、密碼、別的專案這類敏感資料。
 
-要讓外部檔案進到對話，啟動 aicode 時打開外部匯入開關：
+要讓外部檔案進到對話，要設兩個 env var，這兩個分工不同，**一起設才會生效**：
+
+| Env var | 角色 | 預設 |
+|---|---|---|
+| `AI_CODE_ALLOW_EXTERNAL_IMPORT=1` | **總開關**。決定外部匯入功能能不能用 | 關閉 |
+| `AI_CODE_IMPORT_ROOTS="<目錄1>:<目錄2>:..."` | **白名單**。決定哪些目錄底下的檔案可以匯入 | `~/Downloads:/tmp` |
+
+只打開總開關，預設白名單只有 `~/Downloads` 和 `/tmp`，其他目錄底下的檔案還是拿不到。`AI_CODE_IMPORT_ROOTS` 一旦自己設了就**完全取代**預設清單 — 要保留 Downloads/tmp 記得自己列上。
+
+幾種常見組合：
 
 ```bash
+# 只用預設來源 (~/Downloads + /tmp)
 AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
+
+# 保留預設 + 加一個自己的目錄
+AI_CODE_ALLOW_EXTERNAL_IMPORT=1 \
+AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot" \
+aicode
+
+# 整個家目錄都放開（最寬鬆，沒敏感檔的話最省事）
+AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME" aicode
 ```
 
-預設只允許從 `~/Downloads` 和 `/tmp` 拿檔案。要加其他來源，用 `AI_CODE_IMPORT_ROOTS` 列出，多個用冒號分隔：
+多個目錄用冒號分隔（跟 `$PATH` 一樣）。如果每次都用同一組設定，加進 `~/.bashrc` 就不用每次帶：
 
 ```bash
-AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/mnt/share" aicode
+export AI_CODE_ALLOW_EXTERNAL_IMPORT=1
+export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 ```
 
 開啟後，對話裡先請模型把檔案複製進專案再分析：
@@ -305,6 +324,8 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/mnt/share
 ```
 
 複製進來的檔案會放在專案根目錄底下的 `.aicode_uploads/` 資料夾，原始檔案不會被搬走或修改。後續對話就把它當成專案內檔案處理。
+
+匯入被拒絕時錯誤訊息會印出目前生效的白名單，如果看到拒絕但不確定原因，第一件事先確認檔案路徑有沒有真的在白名單裡的某個目錄底下。
 
 #### 完整範例
 
@@ -589,9 +610,11 @@ set_sandbox_root(AICODE_ROOT, allow_external=False)
 
 - `read_file(...)`、`grep_code(...)`、`list_dir(...)` 只能看 `AICODE_ROOT` 內的檔案。
 - `analyze_file(...)`、`ingest_document(...)` 的輸入也必須在 `AICODE_ROOT` 內。
-- `import_external_file(...)` 是唯一外部入口，預設關閉；開啟後也只會把允許來源目錄內的檔案複製進 `.aicode_uploads/`。
+- `import_external_file(...)` 是唯一外部入口，預設關閉；開啟後也只會把允許來源目錄內的檔案複製進 `.aicode_uploads/`。設定方式見 §4.1 場景二。
 - `apply_patch(...)` 只能改沙箱內檔案，且 patch context 必須跟現有檔案相符。
 - `aicode` 會拒絕把 `/` 或 `$HOME` 當 root。
+
+注意這層沙箱**只蓋 ai_code 的 17 個 MCP 工具**。OpenCode 自己內建了 `bash`、`read`、`write` 等工具，這些是 OpenCode 的東西，不走 ai_code 的沙箱，因此能讀寫整個檔案系統（在目前 user 權限範圍內）。實務上常碰到的場景：ai_code 的 `import_external_file` 因為白名單擋下時，模型有時會 fallback 去用 OpenCode 內建的 `$ cp` 把檔案搬進專案目錄，照樣達到目的。要徹底鎖死，得從 OpenCode 設定那邊關掉它的內建工具，ai_code 沙箱層面控制不到。
 
 ### 8.2 Patch
 
