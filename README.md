@@ -184,11 +184,12 @@ ln -s "$PWD/aicode" "$HOME/.local/bin/aicode"
 which aicode
 ```
 
-`aicode` 會做三件事：
+`aicode` 會做四件事：
 
 - 將目前目錄設成 `AICODE_ROOT`
 - 拒絕 `AICODE_ROOT=/` 和 `AICODE_ROOT=$HOME`
 - 啟動 `opencode`，讓 OpenCode 子行程繼承同一個沙箱根目錄
+- 如果有 `AICODE_MODEL`，自動把它轉成 OpenCode 的 `--model` 參數，讓 TUI 對話模型也預設成這顆（命令列自己帶 `-m` / `--model` 時不覆蓋）
 
 ---
 
@@ -208,13 +209,15 @@ aicode
 - model selector 裡選的是 Ollama provider 的 coding model
 - 第一輪工具呼叫沒有嘗試讀 `$HOME` 或 `/`
 
-如果要讓 MCP server 內部也使用同一顆主模型，可以啟動時帶 `AICODE_MODEL`：
+啟動時帶 `AICODE_MODEL`，TUI 右下角的對話模型跟 ai_code 後台用的模型會一起切到這顆：
 
 ```bash
 AICODE_MODEL=qwen3-coder:30b aicode
 ```
 
-OpenCode 右下角選到的模型負責主要對話與工具決策；`AICODE_MODEL` 影響 ai_code 內部需要直接呼叫 Ollama 的流程。通常兩邊用同一顆比較好排查。
+`aicode` wrapper 會把這個值轉成 `opencode --model ollama/<名字>` 一起傳進去，所以一個 env var 兩邊對齊。要選別顆只切其中一邊的話，命令列自己帶 `-m / --model` 就會蓋過 wrapper 的自動行為。
+
+OpenCode 右下角的選擇主要管整個對話和工具決策；`AICODE_MODEL` 額外影響 ai_code 內部少數需要直接呼叫 Ollama 的流程（主要是 `query_knowledge_strict`）。通常兩邊用同一顆比較好排查。
 
 換成 35B 級的模型時，第一次跑建議搭配比較小的 `AICODE_NUM_CTX`。模型本身的權重就佔掉一大塊顯卡記憶體，如果 context 開太大，剩下的空間不夠用，模型會被自動拆一部分放到一般記憶體跑，速度會變很慢。
 

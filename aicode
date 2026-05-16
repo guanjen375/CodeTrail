@@ -48,4 +48,28 @@ fi
 
 export AICODE_ROOT="$ROOT"
 echo "[aicode] AICODE_ROOT=$AICODE_ROOT"
-exec opencode "$@"
+
+# If AICODE_MODEL is set, propagate it to OpenCode's --model flag so the
+# TUI conversation defaults to the same model the MCP server uses. Users
+# can still override with an explicit -m/--model in their own args.
+EXTRA_OPENCODE_ARGS=()
+USER_PASSED_MODEL=0
+for arg in "$@"; do
+  case "$arg" in
+    -m|--model|-m=*|--model=*) USER_PASSED_MODEL=1; break ;;
+  esac
+done
+
+if [ -n "${AICODE_MODEL:-}" ] && [ "$USER_PASSED_MODEL" -eq 0 ]; then
+  # AICODE_MODEL may be bare ("qwen3.6:35b-a3b-q4_K_M") or already
+  # provider-qualified ("ollama/qwen3.6:..."). Only prepend "ollama/"
+  # when the value has no provider prefix.
+  case "$AICODE_MODEL" in
+    */*) OC_MODEL="$AICODE_MODEL" ;;
+    *)   OC_MODEL="ollama/$AICODE_MODEL" ;;
+  esac
+  EXTRA_OPENCODE_ARGS+=(--model "$OC_MODEL")
+  echo "[aicode] OpenCode --model=$OC_MODEL"
+fi
+
+exec opencode ${EXTRA_OPENCODE_ARGS[@]+"${EXTRA_OPENCODE_ARGS[@]}"} "$@"
