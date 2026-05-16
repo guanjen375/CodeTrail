@@ -147,6 +147,16 @@ def check_ollama(r: Result, no_network: bool) -> set[str] | None:
     return tags
 
 
+def _tag_present(name: str, tags: set[str]) -> bool:
+    # ollama 對裸名 (`bge-m3`) 隱含 `:latest`；config 用裸名,registry 列的是
+    # 完整 tag,直接比對會誤判成「沒 pull」。
+    if name in tags:
+        return True
+    if ":" not in name and f"{name}:latest" in tags:
+        return True
+    return False
+
+
 def check_models(r: Result, tags: set[str] | None) -> None:
     cfg = _read_config()
     if isinstance(cfg, Exception):
@@ -174,7 +184,7 @@ def check_models(r: Result, tags: set[str] | None) -> None:
         if tags is None:
             r.info(f"{attr}={name}{suffix} ({desc}) — 未檢查 ollama 是否 pull")
             continue
-        if name in tags:
+        if _tag_present(name, tags):
             r.ok(f"{attr}={name}{suffix} 已 pull")
         else:
             r.fail(f"{attr}={name}{suffix} 尚未 pull — 執行: ollama pull {name}")
@@ -186,7 +196,7 @@ def check_models(r: Result, tags: set[str] | None) -> None:
         if tags is None:
             r.info(f"{attr}={name} ({desc}) — 未檢查")
             continue
-        if name in tags:
+        if _tag_present(name, tags):
             r.ok(f"{attr}={name} 已 pull (optional)")
         else:
             r.warn(f"{attr}={name} 沒 pull ({desc}) — 需要時: ollama pull {name}")

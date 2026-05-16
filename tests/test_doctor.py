@@ -87,3 +87,33 @@ def test_python_version_pass():
     # 而我們在 CI 用 3.11)
     assert r.passes
     assert not r.fails
+
+
+def test_tag_present_matches_latest_for_bare_name():
+    # config 用裸名 'bge-m3',ollama 只列 'bge-m3:latest' — 應視為已安裝。
+    assert doc._tag_present("bge-m3", {"bge-m3:latest"})
+
+
+def test_tag_present_matches_explicit_tag():
+    assert doc._tag_present("qwen3-coder:30b", {"qwen3-coder:30b"})
+
+
+def test_tag_present_rejects_missing():
+    assert not doc._tag_present("does-not-exist", {"bge-m3:latest"})
+
+
+def test_tag_present_explicit_tag_not_in_latest():
+    # 帶 ':<tag>' 的名字不要做 latest fallback —— 否則會誤判 :30b 為 :latest。
+    assert not doc._tag_present("qwen3-coder:30b", {"qwen3-coder:latest"})
+
+
+def test_check_models_accepts_latest_tag_for_bare_config_name():
+    """模擬使用者只裝 bge-m3:latest 的情況。修補前會 FAIL,修補後應 PASS。"""
+    tags = {
+        "qwen3-coder:30b",
+        "bge-m3:latest",
+        "qllama/bge-reranker-v2-m3:latest",
+    }
+    r = doc.Result()
+    doc.check_models(r, tags)
+    assert not r.fails, f"應該沒有 FAIL,實際: {r.fails}"
