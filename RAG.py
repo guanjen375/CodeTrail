@@ -73,11 +73,15 @@ INCLUDE_HEADING_IN_CONTENT = True
 # Embedding 增量快取檔案
 EMBEDDING_CACHE_FILE = ".rag_embedding_cache.json"
 
-# 支援的檔案類型
+# 支援的檔案類型（文字類，process_file 走純文字抽取）
 SUPPORTED_EXTENSIONS = {".pdf", ".md", ".txt"}
 
 # 支援的圖片類型（聊天截圖模式）
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+# 支援的二進位/ELF 副檔名（與 media.py 對齊；走 media.read_binary 抽報告）
+BINARY_EXTENSIONS = {".bin", ".dat", ".raw", ".fw", ".img", ".rom", ".hex"}
+ELF_EXTENSIONS = {".elf", ".so", ".o", ".axf", ".out", ".ko"}
 
 # ============================================================
 # 文件類型識別
@@ -614,14 +618,74 @@ def extract_text_file(file_path: str) -> List[Dict]:
 
     return results
 
+def extract_binary(file_path: str) -> List[Dict]:
+    """提取 binary/ELF 內容（hex dump、magic、可讀字串、ELF symbol 等）。
+
+    用 media.read_binary 抽出可分析的 Markdown 報告（遇到 ELF magic 會自動切到
+    ELF 解析）。報告裡 【...】 章節標記會被轉成 ## 標題，方便語意切分。
+    """
+    # 延遲載入 media（其他模式不需要）
+    try:
+        from media import read_binary, set_sandbox_root
+    except ImportError as e:
+        print(f"[ERROR] binary/ELF 模式需要 media 模組: {e}")
+        return []
+
+    p = Path(file_path).resolve()
+    if not p.is_file():
+        print(f"  [WARN] 檔案不存在: {file_path}")
+        return []
+
+    # read_binary 內建沙箱（_SANDBOX_ROOT），這裡設成檔案所在目錄即可
+    set_sandbox_root(str(p.parent), allow_external=False)
+
+    content = read_binary(str(p))
+    if (not content
+            or content.startswith("[BIN 錯誤]")
+            or content.startswith("[ELF 錯誤]")):
+        print(f"  [WARN] binary 分析失敗: {content[:200] if content else '空結果'}")
+        return []
+
+    # 把 【標題】(尾巴) 轉成 ## 標題 尾巴，讓 split_by_semantic_with_sections 抓得到章節
+    # （media.py 的報告會出現「【可讀字串（含 offset）】共 3 個」這種尾巴帶文字的行）
+    content = re.sub(r'^【(.+?)】(.*)$', r'## \1\2', content, flags=re.MULTILINE)
+
+    filename = p.name
+    chunk_results = split_by_semantic_with_sections(content)
+
+    results: List[Dict] = []
+    last_section = ""
+    for i, chunk_data in enumerate(chunk_results):
+        section = chunk_data["section"] or last_section
+        if chunk_data["section"]:
+            last_section = chunk_data["section"]
+
+        chunk_type = detect_content_type(chunk_data["content"], "binary")
+
+        results.append({
+            "source": filename,
+            "page": 1,
+            "chunk_index": i,
+            "content": chunk_data["content"],
+            "type": chunk_type,
+            "section": section,
+            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
+            "origin": "binary",
+        })
+
+    return results
+
+
 def process_file(file_path: str) -> List[Dict]:
     """根據檔案類型選擇處理方式"""
     ext = Path(file_path).suffix.lower()
-    
+
     if ext == ".pdf":
         return extract_pdf(file_path)
     elif ext in {".md", ".txt"}:
         return extract_text_file(file_path)
+    elif ext in BINARY_EXTENSIONS or ext in ELF_EXTENSIONS:
+        return extract_binary(file_path)
     else:
         return []
 
@@ -1160,14 +1224,17 @@ def add_document(input_file: str, output_file: str):
         print(f"[ERROR] 檔案不存在: {input_file}")
         sys.exit(1)
     
-    if input_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+    allowed = SUPPORTED_EXTENSIONS | BINARY_EXTENSIONS | ELF_EXTENSIONS
+    if input_path.suffix.lower() not in allowed:
         print(f"[ERROR] 不支援的檔案類型: {input_path.suffix}")
-        print(f"        支援: {', '.join(SUPPORTED_EXTENSIONS)}")
+        print(f"        文字: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
+        print(f"        二進位: {', '.join(sorted(BINARY_EXTENSIONS))}")
+        print(f"        ELF: {', '.join(sorted(ELF_EXTENSIONS))}")
         sys.exit(1)
-    
+
     # 載入現有知識庫
     kb = load_knowledge_base(output_path)
-    
+
     # 檢查是否已存在同名文件（若有則先移除舊的）
     doc_name = input_path.name
     if doc_name in kb["metadata"]["documents"]:
@@ -1902,7 +1969,7 @@ def print_usage():
     print("  3. 若是則入庫，若否則結束")
     print("")
     print("參數:")
-    print("  input_file   要加入的文件 (pdf/md/txt)")
+    print("  input_file   要加入的文件 (pdf/md/txt/bin/elf/...)")
     print("  screenshot   聊天截圖圖片 (png/jpg/jpeg/gif/webp)")
     print("  image        技術圖片 (架構圖/流程圖/記憶體映射等)")
     print("  url          網頁 URL (http:// 或 https://)")
@@ -1910,12 +1977,16 @@ def print_usage():
     print("")
     print("範例:")
     print("  python RAG.py manual.pdf knowledge.json                       # PDF 直接入庫")
+    print("  python RAG.py firmware.bin knowledge.json                     # binary/ELF 直接入庫")
     print("  python RAG.py teams_chat.png knowledge.json --chat            # 聊天截圖")
     print("  python RAG.py npx6_arch.png knowledge.json --image            # 技術圖片")
+    print("  python RAG.py teams_chat.png knowledge.json --chat -y         # 同上但不問")
     print("  python RAG.py https://docs.example.com/guide knowledge.json --url  # 網頁")
     print("")
-    print(f"支援的文件類型: {', '.join(SUPPORTED_EXTENSIONS)}")
-    print(f"支援的圖片類型: {', '.join(IMAGE_EXTENSIONS)}")
+    print(f"支援的文字類型: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
+    print(f"支援的圖片類型: {', '.join(sorted(IMAGE_EXTENSIONS))}")
+    print(f"支援的二進位類型: {', '.join(sorted(BINARY_EXTENSIONS))}")
+    print(f"支援的 ELF 類型: {', '.join(sorted(ELF_EXTENSIONS))}")
 
 
 if __name__ == "__main__":
@@ -1924,37 +1995,50 @@ if __name__ == "__main__":
         print_usage()
         sys.exit(0)
 
+    # 抽出 -y / --yes 旗標（位置不限），剩下的當作正常參數
+    args = [a for a in sys.argv[1:] if a not in ("-y", "--yes")]
+    auto_yes = len(args) != len(sys.argv) - 1
+
     # 解析參數
-    if len(sys.argv) < 3:
+    if len(args) < 2:
         print_usage()
         sys.exit(1)
 
     # 檢查模式 flag（在最後一個參數）
     mode_flags = {"--chat", "--image", "--url"}
-    last_arg = sys.argv[-1]
+    last_arg = args[-1]
 
     if last_arg in mode_flags:
-        # 互動式模式：python RAG.py <input> <output> --chat/--image/--url
-        if len(sys.argv) != 4:
+        # 模式：python RAG.py <input> <output> --chat/--image/--url [-y]
+        if len(args) != 3:
             print_usage()
             sys.exit(1)
 
-        input_file = sys.argv[1]
-        output_file = sys.argv[2]
+        input_file = args[0]
+        output_file = args[1]
         mode = last_arg
 
         if mode == "--chat":
-            interactive_chat_screenshot(input_file, output_file)
+            if auto_yes:
+                add_chat_screenshot(input_file, output_file)
+            else:
+                interactive_chat_screenshot(input_file, output_file)
         elif mode == "--image":
-            interactive_technical_image(input_file, output_file)
+            if auto_yes:
+                add_technical_image(input_file, output_file)
+            else:
+                interactive_technical_image(input_file, output_file)
         elif mode == "--url":
-            interactive_url(input_file, output_file)
+            if auto_yes:
+                add_url(input_file, output_file)
+            else:
+                interactive_url(input_file, output_file)
 
-    # 一般文件模式
+    # 一般文件模式（pdf/md/txt/bin/elf...）
     else:
-        if len(sys.argv) != 3:
+        if len(args) != 2:
             print_usage()
             sys.exit(1)
-        input_file = sys.argv[1]
-        output_file = sys.argv[2]
+        input_file = args[0]
+        output_file = args[1]
         add_document(input_file, output_file)

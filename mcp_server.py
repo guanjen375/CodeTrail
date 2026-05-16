@@ -647,25 +647,35 @@ def analyze_file(path: str) -> str:
 
 
 @mcp.tool()
-def ingest_document(path: str) -> str:
-    """Ingest a PDF / Markdown / TXT file into the project knowledge base.
+def ingest_document(path: str, mode: str = "auto") -> str:
+    """Ingest a file into the project knowledge base.
 
-    呼叫 AICODE_ROOT/RAG.py 把指定文件切 chunk + 算 embedding,append 到
+    呼叫 AICODE_ROOT/RAG.py 把指定檔案切 chunk + 算 embedding,append 到
     AICODE_ROOT/knowledge.json。**完成後必須再呼叫 reload_knowledge_base()
     才會被 query_knowledge 看到**(KB 是啟動時載入的 singleton)。
 
     依 RAG.py 的檔名類型偵測:檔名含 `_spec` / `datasheet` 會被當成 spec(權重最高),
     `manual` 當 manual,`_api` / `reference` 當 api,以此類推。所以檔名取貼切一點。
 
-    互動模式(`--chat` 截圖 / `--image` 圖片 / `--url` 網頁)不支援經 MCP,
-    請改用 CLI: `python RAG.py file.png knowledge.json --chat`。
+    支援副檔名:
+      - 文字: .pdf / .md / .txt(直接抽文字)
+      - 圖片: .png / .jpg / .jpeg / .gif / .webp(經 VL 模型抽說明,需要 ollama VL_MODEL)
+      - binary: .bin / .dat / .raw / .fw / .img / .rom / .hex
+                (hex dump + 可讀字串 + magic 偵測;偵測到 ELF magic 會自動切 ELF 解析)
+      - ELF: .elf / .so / .o / .axf / .out / .ko(header / sections / symbols)
 
     Args:
-        path: 文件路徑。可以是絕對路徑、或相對 AICODE_ROOT 的路徑。
-              支援副檔名:.pdf / .md / .txt
+        path: 檔案路徑(絕對或相對 AICODE_ROOT)。檔案必須在 AICODE_ROOT 內,
+              外部檔案請先用 import_external_file 複製進來。
+        mode: ingestion 模式,預設 "auto" 依副檔名選:
+              "auto"     – pdf/md/txt → document, 圖片 → image, binary/ELF → binary
+              "document" – 強制純文字路徑(限 .pdf/.md/.txt)
+              "image"    – 強制技術圖片(VL 分析,限圖片副檔名)
+              "chat"     – 強制聊天截圖(VL 分析,限圖片副檔名)
+              "binary"   – 強制 binary/ELF 路徑
 
     Returns:
-        RAG.py 的執行輸出(含 chunk 數、頁數等)+ 提醒呼叫 reload_knowledge_base。
+        RAG.py 的執行輸出+ 提醒呼叫 reload_knowledge_base。
     """
     import subprocess
 
@@ -679,26 +689,67 @@ def ingest_document(path: str) -> str:
         doc_path = Path(AICODE_ROOT) / path
     doc_path = doc_path.resolve()
 
-    # NDA 沙箱:輸入文件必須在 AICODE_ROOT 內(與 analyze_file 行為一致)
+    # NDA 沙箱:輸入檔案必須在 AICODE_ROOT 內
     try:
         doc_path.relative_to(Path(AICODE_ROOT).resolve())
     except ValueError:
         return (
-            f"錯誤: 文件必須在 AICODE_ROOT 內(NDA 沙箱)。\n"
-            f"      要灌外部 PDF,請先複製進 {AICODE_ROOT}。\n"
+            f"錯誤: 檔案必須在 AICODE_ROOT 內(NDA 沙箱)。\n"
+            f"      要灌外部檔案,請先用 import_external_file 複製進 {AICODE_ROOT}。\n"
             f"      你給的路徑: {doc_path}"
         )
 
     if not doc_path.is_file():
-        return f"錯誤: 文件不存在 {doc_path}"
-    if doc_path.suffix.lower() not in {".pdf", ".md", ".txt"}:
-        return f"錯誤: 不支援的副檔名 {doc_path.suffix}(只支援 .pdf / .md / .txt)"
+        return f"錯誤: 檔案不存在 {doc_path}"
+
+    TEXT_EXTENSIONS = {".pdf", ".md", ".txt"}
+    ext = doc_path.suffix.lower()
+    all_supported = TEXT_EXTENSIONS | IMAGE_EXTENSIONS | BINARY_EXTENSIONS | ELF_EXTENSIONS
+    if ext not in all_supported:
+        return (
+            f"錯誤: 不支援的副檔名 {ext}\n"
+            f"      文字: {sorted(TEXT_EXTENSIONS)}\n"
+            f"      圖片: {sorted(IMAGE_EXTENSIONS)}\n"
+            f"      binary: {sorted(BINARY_EXTENSIONS)}\n"
+            f"      ELF: {sorted(ELF_EXTENSIONS)}"
+        )
+
+    # 決定要走哪個 RAG.py 模式
+    valid_modes = {"auto", "document", "image", "chat", "binary"}
+    if mode not in valid_modes:
+        return f"錯誤: 不支援的 mode={mode!r}(支援:{sorted(valid_modes)})"
+
+    if mode == "auto":
+        if ext in TEXT_EXTENSIONS:
+            resolved_mode = "document"
+        elif ext in IMAGE_EXTENSIONS:
+            resolved_mode = "image"
+        else:
+            resolved_mode = "binary"
+    else:
+        resolved_mode = mode
+
+    # 校驗 mode 與副檔名搭配
+    if resolved_mode == "document" and ext not in TEXT_EXTENSIONS:
+        return f"錯誤: mode='document' 需要 .pdf/.md/.txt(你給的是 {ext})"
+    if resolved_mode in ("image", "chat") and ext not in IMAGE_EXTENSIONS:
+        return f"錯誤: mode={resolved_mode!r} 需要圖片副檔名(你給的是 {ext})"
+    if resolved_mode == "binary" and ext not in (BINARY_EXTENSIONS | ELF_EXTENSIONS):
+        return f"錯誤: mode='binary' 需要 binary/ELF 副檔名(你給的是 {ext})"
 
     kb_path = Path(AICODE_ROOT) / KNOWLEDGE_FILE
 
+    # 組 CLI args
+    cmd = [sys.executable, str(rag_script), str(doc_path), str(kb_path)]
+    if resolved_mode == "image":
+        cmd += ["--image", "-y"]
+    elif resolved_mode == "chat":
+        cmd += ["--chat", "-y"]
+    # document / binary: 無額外 flag(走 add_document)
+
     try:
         result = subprocess.run(
-            [sys.executable, str(rag_script), str(doc_path), str(kb_path)],
+            cmd,
             cwd=AICODE_ROOT,
             capture_output=True,
             text=True,
@@ -706,7 +757,7 @@ def ingest_document(path: str) -> str:
             env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
     except subprocess.TimeoutExpired:
-        return "錯誤: ingest 超時 10 分鐘。大型 PDF 請用 CLI: python RAG.py <pdf> knowledge.json"
+        return "錯誤: ingest 超時 10 分鐘。大型檔案請用 CLI: python RAG.py <file> knowledge.json"
     except Exception as e:
         return f"錯誤: {type(e).__name__}: {e}"
 

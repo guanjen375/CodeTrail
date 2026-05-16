@@ -281,6 +281,8 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/mnt/share
 - `read_file` 直接把純文字內容讀進對話。
 - `analyze_file` 會先做處理 — 圖片做文字辨識、二進位檔抓出檔頭格式和可讀字串 — 再把整理後的結果丟給模型。
 
+`analyze_file` 是「這一輪看一次就丟」，看完不會留在 KB 裡，未來其他對話查不到。如果想把這張截圖／這份 firmware 永久保存供之後查詢，改用 `ingest_document`（見 §4.2），它接受相同的圖片／binary／ELF 副檔名，並會切 chunk、算 embedding 寫進 `knowledge.json`。
+
 #### 場景二：檔案在專案目錄外
 
 預設情況下系統不能讀專案目錄以外的東西。這是安全限制：避免分析陌生程式碼時模型意外讀到家目錄裡的 SSH key、密碼、別的專案這類敏感資料。
@@ -344,11 +346,12 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 
 #### 支援格式
 
-- `.pdf`
-- `.md`
-- `.txt`
+- **文字**：`.pdf` / `.md` / `.txt`（直接抽文字）
+- **圖片**：`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp`（用 VL 模型看圖、抽出文字描述後切 chunk，需要先 `ollama pull` 設定的 VL_MODEL，預設 `qwen3-vl:30b-a3b`）
+- **binary**：`.bin` / `.dat` / `.raw` / `.fw` / `.img` / `.rom` / `.hex`（抽 hex dump、可讀字串、magic 偵測；遇到 ELF magic 自動切到 ELF 解析）
+- **ELF**：`.elf` / `.so` / `.o` / `.axf` / `.out` / `.ko`（抽 header / sections / symbols）
 
-純圖片掃描的 PDF（沒有可選文字）切不出內容，需要先用 OCR 工具轉成文字檔再匯入。
+純圖片掃描的 PDF（沒有可選文字）切不出內容，先把每頁存成 `.png` 再用 `ingest_document` 走圖片路徑，或先用 OCR 工具轉成文字檔再匯入。
 
 #### 三個步驟
 
@@ -377,6 +380,8 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 
 `ingest_document` 會把整份文件切成多段、算出每段的向量、存進專案根目錄的 `knowledge.json`。`reload_knowledge_base` 把剛存進去的內容立刻吃進記憶體 — **每次匯入或刪除文件後都要呼叫**，不然查不到。
 
+預設依副檔名自動分派到對應的處理路徑（見上方「支援格式」清單）。圖片預設走「技術圖片」路徑（架構圖／流程圖／記憶體圖），抽出的是畫面說明；若這張是聊天截圖、想抽出對話內容，要顯式傳 `mode="chat"`：`ingest_document("teams.png", mode="chat")`。
+
 一次匯入多份：
 
 ```text
@@ -388,7 +393,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 最後回報目前載入幾個 chunks。
 ```
 
-`chunks` 是「切好的文件段落」。回報 0 代表沒匯入到任何內容，或是檔案切不出文字（純圖片 PDF）。
+`chunks` 是「切好的文件段落」。回報 0 代表沒匯入到任何內容 — 常見原因：純圖片掃描的 PDF（沒可選文字）、binary 太小或全是 0xff、VL 模型沒 pull 導致圖片分析失敗。
 
 **步驟 3：查**
 
@@ -503,7 +508,7 @@ batch size 上限是 32 (REF1)。
 | 查不能答錯的規格數字 | 請用工具 `query_knowledge_strict` 查 reset assert 最小時間，證據不夠就拒答。 | `query_knowledge_strict(...)` |
 | 看專案外的截圖/PDF/log | 請先用工具 `import_external_file` 匯入 `~/Downloads/error.png`，再分析回傳的新路徑。 | `import_external_file(...)` |
 | 看圖片、ELF、firmware | 請用工具 `analyze_file` 分析 `.aicode_uploads/error.png`，做 OCR 或 binary 分析。 | `analyze_file(...)` |
-| 把 PDF/MD/TXT 加進 KB | 請用工具 `ingest_document` 匯入 `docs/spec.pdf`，完成後用工具 `reload_knowledge_base`。 | `ingest_document(...)`、`reload_knowledge_base()` |
+| 把文件/圖片/binary 加進 KB | 請用工具 `ingest_document` 匯入 `docs/spec.pdf`（或 `arch.png`、`firmware.bin`），完成後用工具 `reload_knowledge_base`。 | `ingest_document(...)`、`reload_knowledge_base()` |
 | 移除舊文件 | 請用工具 `remove_document` 移除 `old_spec.pdf`，完成後用工具 `reload_knowledge_base`。 | `remove_document(...)` |
 | 準備改檔 | 請先用工具 `git_status` 和 `git_diff` 確認目前變更，再說明要改哪些檔案。 | `git_status(...)`、`git_diff(...)` |
 | 套修改 | 請產生最小 unified diff，先用工具 `apply_patch` 預覽，再正式套用。 | `apply_patch(...)` |
@@ -520,7 +525,7 @@ batch size 上限是 32 (REF1)。
 | 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=50000)` | 讀檔案內容，長檔要分段 |
 | 文件/外部檔案 | `import_external_file(path, dest_name=None)` | 把允許來源的外部檔案複製進 `.aicode_uploads/` |
 | 文件/外部檔案 | `analyze_file(path)` | OCR 圖片、分析 ELF 或 firmware blob |
-| 文件/外部檔案 | `ingest_document(path)` | 把 PDF / MD / TXT 匯入 `knowledge.json` |
+| 文件/外部檔案 | `ingest_document(path, mode="auto")` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document` |
 | 文件/外部檔案 | `remove_document(source)` | 從 KB 移除過期文件 |
 | 文件/外部檔案 | `reload_knowledge_base()` | 讓剛匯入或刪除的 KB 內容立即生效 |
 | 文件/外部檔案 | `query_knowledge(question)` | 查 KB，適合 spec / manual / datasheet |
@@ -563,7 +568,7 @@ batch size 上限是 32 (REF1)。
 | `qwen3.6:35b-a3b-q4_K_M` | 跨檔推理、規格 vs 實作比對、較複雜重構 | 推理上限較高；大 context 任務表現較好 | 顯卡 32GB 的話第一次跑先設 `AICODE_NUM_CTX=32768`，用一陣子沒問題再升到 `65536`。**不要**用 `qwen3.6:35b-a3b-coding-nvfp4`（macOS 限定的版本，Linux 拉會報錯 412） |
 | `devstral:24b` | 快速 code review、找 bug、簡單 patch | 速度和 coding 能力平衡；回答通常直接 | 工具呼叫格式不一定比 Qwen Coder 穩；大型修改前建議切回 Qwen |
 | `gpt-oss:20b` | 快速理解陌生 repo、摘要、初步定位 | 輕量、啟動快、硬體壓力低 | 複雜改檔與長工具鏈較弱；適合探索，不適合作為最終 patch 主力 |
-| `qwen3-vl:30b-a3b` | `analyze_file(...)` 處理截圖、圖片 OCR、UI error | 讀圖中文字與畫面資訊較好 | 不是主要 coding model；只有需要圖片分析時才必須 pull |
+| `qwen3-vl:30b-a3b` | `analyze_file(...)` 處理截圖、UI error；`ingest_document(...)` 把圖片切 chunk 進 KB 也用它 | 讀圖中文字與畫面資訊較好 | 不是主要 coding model；不分析圖片、也不把圖片進 KB 就不用 pull |
 | `bge-m3` | `query_knowledge(...)` / `code_rag_search(...)` 的 embedding | 多語檢索穩定；中文 spec 與英文程式碼混用時有幫助 | 不是聊天模型，不要在 OpenCode model selector 裡選 |
 | `qllama/bge-reranker-v2-m3` | RAG rerank | 能改善 spec 查詢排序，降低抓到弱相關 chunk 的機率 | 會增加查詢延遲；模型未 pull 時 RAG 品質會下降或報錯 |
 
@@ -572,7 +577,7 @@ batch size 上限是 32 (REF1)。
 - 要穩定完成「查證 -> patch -> test」：用 `qwen3-coder:30b`。
 - 任務跨很多檔、要比對規格或做設計判斷：用 `qwen3.6:35b-a3b-q4_K_M`（Linux 上能用的版本；`qwen3.6:35b-a3b-coding-nvfp4` 是 macOS 限定，不要用）。
 - 只想先看懂 repo 或做初步 review：用 `gpt-oss:20b` 或 `devstral:24b`。
-- 要讀截圖：保留主聊天模型不變，讓 `analyze_file(...)` 使用 `qwen3-vl:30b-a3b`。
+- 要讀截圖或把圖片進 KB：保留主聊天模型不變，讓 `analyze_file(...)` / `ingest_document(...)` 使用 `qwen3-vl:30b-a3b`。
 
 Context 建議：
 
