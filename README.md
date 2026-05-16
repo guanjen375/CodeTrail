@@ -249,7 +249,7 @@ ollama ps
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
-AICODE_WEB_USER=david AICODE_WEB_PASSWORD='換成你的密碼' python <AICODE_REPO>/web_server.py --project .
+AICODE_WEB_USER=aiuser AICODE_WEB_PASSWORD='換成你的密碼' python <AICODE_REPO>/web_server.py --project .
 ```
 
 打開：
@@ -262,7 +262,7 @@ http://127.0.0.1:8088/
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
-AICODE_WEB_USER=david AICODE_WEB_PASSWORD='換成你的密碼' \
+AICODE_WEB_USER=aiuser AICODE_WEB_PASSWORD='換成你的密碼' \
   python <AICODE_REPO>/web_server.py --project . --host 0.0.0.0 --port 8088
 ```
 
@@ -277,13 +277,13 @@ http://192.168.1.23:8088/
 沒有設定 `AICODE_WEB_PASSWORD` 時，server 會在終端機印出一次性的臨時密碼。需要固定密碼但不想放 shell history，可以用：
 
 ```bash
-AICODE_WEB_USER=david AICODE_WEB_PASSWORD_FILE=/path/to/password.txt python <AICODE_REPO>/web_server.py --project .
+AICODE_WEB_USER=aiuser AICODE_WEB_PASSWORD_FILE=/path/to/password.txt python <AICODE_REPO>/web_server.py --project .
 ```
 
 也可以直接用 CLI 指定帳密，但密碼會出現在本機 `ps` 行程列表，只有在可信任機器上才建議這樣用：
 
 ```bash
-python <AICODE_REPO>/web_server.py --project . --host 0.0.0.0 --user david --password '換成你的密碼'
+python <AICODE_REPO>/web_server.py --project . --host 0.0.0.0 --user aiuser --password '換成你的密碼'
 ```
 
 要從真正公網連進來，不能只改 `--host 0.0.0.0`。還需要：
