@@ -744,3 +744,31 @@ ollama pull gpt-oss:20b
 4. 修改前要求模型說明將改哪些檔案與原因。
 5. 修改後要求模型跑最小相關驗證。
 6. 結束前自己看一次 git diff，確認沒有把 `knowledge.json`、cache、log 或 NDA 衍生資料納入 commit。
+
+---
+
+## License
+
+本專案以 MIT 授權釋出，程式碼以「現狀」（AS IS）提供，不附帶任何明示或默示的保證，
+包括但不限於可商用性、特定用途適用性、不侵權、資安、隱私、合規、或 NDA 適用性。
+完整法律文字見 [LICENSE](LICENSE)；補充免責說明見 [DISCLAIMER.md](DISCLAIMER.md)。
+
+This project is licensed under the MIT License. See [LICENSE](./LICENSE).
+
+## Responsible use
+
+This project is provided for lawful software development, research, education,
+and code reasoning workflows.
+
+Users are solely responsible for how they use, modify, deploy, combine, or
+redistribute this software, including compliance with applicable laws,
+contracts, licenses, NDAs, platform terms, model-provider terms, and third-party
+rights.
+
+The authors do not guarantee that any particular workflow is legally compliant,
+NDA-compliant, secure, private, or suitable for a specific use case.
+
+The software is provided "as is", without warranty of any kind. The authors do
+not encourage, endorse, or provide support for unlawful use.
+
+See [DISCLAIMER.md](./DISCLAIMER.md) for the full disclaimer.
