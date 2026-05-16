@@ -18,7 +18,8 @@ OLLAMA_TAGS_URL = f"{OLLAMA_BASE_URL}/api/tags"
 OLLAMA_PS_URL = f"{OLLAMA_BASE_URL}/api/ps"
 # 主 LLM:可用 AICODE_MODEL 環境變數覆寫(切換模型用,不改 source code)
 # baseline: qwen3-coder:30b
-# 候選    : qwen3.6:35b-a3b-coding-nvfp4
+# 候選    : qwen3.6:35b-a3b-q4_K_M   (Linux + 5090 32GB 可跑)
+# 注意     : qwen3.6:35b-a3b-coding-nvfp4 是 macOS 專用 quant,Linux 無法 pull
 DEFAULT_MODEL = "qwen3-coder:30b"
 MODEL = _os.environ.get("AICODE_MODEL", DEFAULT_MODEL)
 VL_MODEL = _os.environ.get("AICODE_VL_MODEL", "qwen3-vl:30b-a3b")

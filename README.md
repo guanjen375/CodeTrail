@@ -84,10 +84,14 @@ ollama pull qllama/bge-reranker-v2-m3
 建議也把 OpenCode 設定檔列出的候選模型下載好，之後可以直接在 TUI 裡切換：
 
 ```bash
-ollama pull qwen3.6:35b-a3b-coding-nvfp4
+ollama pull qwen3.6:35b-a3b-q4_K_M
 ollama pull devstral:24b
 ollama pull gpt-oss:20b
 ```
+
+這幾個名字後面的「:」加上一串符號代表模型不同的壓縮格式（影響大小、速度、品質）。同一個模型可以有多個版本，Ollama 上挑哪個版本就用對應的名字 pull。
+
+`qwen3.6:35b-a3b-q4_K_M` 是 Linux 上能用的版本。另一個看起來很像的名字 `qwen3.6:35b-a3b-coding-nvfp4` 是 macOS 限定，Linux 下載會直接報錯 `412: this model requires macOS`，不要用這個。
 
 如果會讓 OpenCode 分析截圖、UI error 或圖片，另外下載視覺模型：
 
@@ -135,10 +139,10 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
         "baseURL": "http://localhost:11434/v1"
       },
       "models": {
-        "qwen3-coder:30b":              { "name": "Qwen3 Coder 30B" },
-        "qwen3.6:35b-a3b-coding-nvfp4": { "name": "Qwen3.6 35B Coding NVFP4" },
-        "devstral:24b":                 { "name": "Devstral 24B" },
-        "gpt-oss:20b":                  { "name": "GPT-OSS 20B" }
+        "qwen3-coder:30b":          { "name": "Qwen3 Coder 30B" },
+        "qwen3.6:35b-a3b-q4_K_M":   { "name": "Qwen3.6 35B A3B Q4_K_M" },
+        "devstral:24b":             { "name": "Devstral 24B" },
+        "gpt-oss:20b":              { "name": "GPT-OSS 20B" }
       }
     }
   },
@@ -212,6 +216,28 @@ AICODE_MODEL=qwen3-coder:30b aicode
 
 OpenCode 右下角選到的模型負責主要對話與工具決策；`AICODE_MODEL` 影響 ai_code 內部需要直接呼叫 Ollama 的流程。通常兩邊用同一顆比較好排查。
 
+換成 35B 級的模型時，第一次跑建議搭配比較小的 `AICODE_NUM_CTX`。模型本身的權重就佔掉一大塊顯卡記憶體，如果 context 開太大，剩下的空間不夠用，模型會被自動拆一部分放到一般記憶體跑，速度會變很慢。
+
+```bash
+# 第一次跑 35B：把 context 開到 32K
+AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_NUM_CTX=32768 aicode
+
+# 用一陣子確定沒問題，再升到 64K
+AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_NUM_CTX=65536 aicode
+```
+
+啟動前可以先確認模型已經下載完成，並看一下載入位置：
+
+```bash
+ollama pull qwen3.6:35b-a3b-q4_K_M
+ollama ps
+```
+
+`ollama ps` 列出目前載入中的模型，最後一欄 `PROCESSOR`：
+
+- `100% GPU`：完全放在顯卡裡，速度正常。
+- `xx% / xx% CPU`：有一部分被搬到一般記憶體跑，回應會明顯變慢。出現這個就把 `AICODE_NUM_CTX` 再調小。
+
 如果要讓 OpenCode 匯入專案外的截圖、PDF、log 或 firmware blob，啟動時明確開啟外部匯入入口：
 
 ```bash
@@ -226,11 +252,177 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/mnt/share
 
 ---
 
-## 4. 第一輪操作方式
+## 4. 重點教學
 
-### 4.1 先建立專案地圖
+啟動 aicode 進到對話之後，最常碰到兩件事：
 
-第一次接到一個 repo，先要求模型只讀不改：
+1. 有一張錯誤截圖／一份韌體 binary／一段 log，想讓對話幫忙看。
+2. 有一份產品規格書／datasheet／設計手冊，想讓之後對話遇到相關問題時答得準。
+
+這兩件事分別對應 §4.1 和 §4.2。讀完這兩節就能開始實用。
+
+### 4.1 在對話裡讓模型看到一個檔案
+
+#### 場景一：檔案在當前專案目錄裡
+
+最簡單。放到 `cd` 進去那個目錄底下任何位置，然後在對話裡點名工具和檔案路徑：
+
+| 檔案類型 | 對話可以這樣說 |
+|---|---|
+| 程式碼 / log / 純文字 | 「請用工具 `read_file` 讀 `logs/build_fail.txt`」 |
+| 截圖 / 圖片 | 「請用工具 `analyze_file` 分析 `screenshots/error.png`」 |
+| 韌體 / 執行檔 / 二進位（.bin / .elf / .img） | 「請用工具 `analyze_file` 分析 `firmware/boot.bin`」 |
+
+兩個工具差別：
+
+- `read_file` 直接把純文字內容讀進對話。
+- `analyze_file` 會先做處理 — 圖片做文字辨識、二進位檔抓出檔頭格式和可讀字串 — 再把整理後的結果丟給模型。
+
+#### 場景二：檔案在專案目錄外
+
+預設情況下系統不能讀專案目錄以外的東西。這是安全限制：避免分析陌生程式碼時模型意外讀到家目錄裡的 SSH key、密碼、別的專案這類敏感資料。
+
+要讓外部檔案進到對話，啟動 aicode 時打開外部匯入開關：
+
+```bash
+AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
+```
+
+預設只允許從 `~/Downloads` 和 `/tmp` 拿檔案。要加其他來源，用 `AI_CODE_IMPORT_ROOTS` 列出，多個用冒號分隔：
+
+```bash
+AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/mnt/share" aicode
+```
+
+開啟後，對話裡先請模型把檔案複製進專案再分析：
+
+```text
+請用工具 import_external_file 匯入 ~/Downloads/error.png，
+然後用回傳的新路徑做 analyze_file。
+```
+
+複製進來的檔案會放在專案根目錄底下的 `.aicode_uploads/` 資料夾，原始檔案不會被搬走或修改。後續對話就把它當成專案內檔案處理。
+
+#### 完整範例
+
+```text
+我在 ~/Downloads/oops.png 拍到一個錯誤訊息畫面，
+請先用 import_external_file 匯入，
+再用 analyze_file 認出畫面上的錯誤文字，
+最後用 grep_code 在當前專案找這串錯誤可能來自哪個 .c 檔。
+```
+
+### 4.2 把附件做成知識庫讓模型隨時能查
+
+「知識庫」是這個專案放規格書、手冊、設計文件的地方。一旦把文件匯進去，之後對話遇到相關問題時，系統會自動找出最相關的幾段內容當作回答依據，並用 `REF1` `REF2` 標出每段是引用自哪份文件的哪個位置。
+
+比起每次都重新貼一份 PDF 給對話，這樣比較不會超出上下文長度限制，也比較不會記錯。
+
+#### 支援格式
+
+- `.pdf`
+- `.md`
+- `.txt`
+
+純圖片掃描的 PDF（沒有可選文字）切不出內容，需要先用 OCR 工具轉成文字檔再匯入。
+
+#### 三個步驟
+
+**步驟 1：檔名取對**
+
+檔名會直接影響搜尋排序。同樣內容檔名清楚會排得比較前面：
+
+| 檔名裡有這些字 | 系統當成 | 適合裝的內容 |
+|---|---|---|
+| `spec` / `datasheet` | 規格書（最權威） | 規格、限制、硬體行為 |
+| `api` / `reference` | API 文件 | 函式定義、參數、回傳值 |
+| `manual` / `handbook` | 手冊 | 操作流程 |
+| `guide` / `tutorial` | 教學 | 上手指南 |
+| `faq` | 常見問題 | 問答對 |
+
+例如把 NPU 規格書命名成 `npu_spec.pdf`，會比叫 `doc.pdf` 在「最大張量大小是多少」這類規格問題裡更容易被優先找到。
+
+**步驟 2：匯入並重新載入**
+
+把檔案放進專案目錄（建議統一放在 `docs/`），對話裡：
+
+```text
+請用工具 ingest_document 匯入 docs/npu_spec.pdf，
+完成後用工具 reload_knowledge_base 重新載入。
+```
+
+`ingest_document` 會把整份文件切成多段、算出每段的向量、存進專案根目錄的 `knowledge.json`。`reload_knowledge_base` 把剛存進去的內容立刻吃進記憶體 — **每次匯入或刪除文件後都要呼叫**，不然查不到。
+
+一次匯入多份：
+
+```text
+請依序執行：
+1. ingest_document docs/npu_spec.pdf
+2. ingest_document docs/api_reference.md
+3. ingest_document docs/faq.txt
+4. reload_knowledge_base
+最後回報目前載入幾個 chunks。
+```
+
+`chunks` 是「切好的文件段落」。回報 0 代表沒匯入到任何內容，或是檔案切不出文字（純圖片 PDF）。
+
+**步驟 3：查**
+
+匯進去之後用 `query_knowledge`：
+
+```text
+請用工具 query_knowledge 查 conv2d 的輸入大小限制，
+回答時每個數字都要附 REF 標記。
+```
+
+回答長這樣：
+
+```text
+根據 REF1，conv2d 輸入張量的高/寬上限是 4096 (REF1: npu_spec.pdf §3.2.1)。
+batch size 上限是 32 (REF1)。
+```
+
+#### 規格題、數字題用嚴格模式
+
+「最大值是多少」「預設值是什麼」「reset 訊號最少要拉幾毫秒」這種**答錯比不答更糟**的題目，改用 `query_knowledge_strict`：
+
+```text
+請用工具 query_knowledge_strict 查 reset assert 最小持續時間，
+證據不夠就直接拒答，不要用常識補。
+```
+
+兩者差別：
+
+- `query_knowledge`：把找到的文件段落丟給對話模型，模型自己組答案。
+- `query_knowledge_strict`：在背後跑兩階段檢查 — 先看找到的內容是不是真的足以回答；確認後再驗證最終答案每一句話都有對應的 `REF` 出處；任何一句沒對到的會被刪掉，證據真的太弱就直接回「拒答」而不是亂編。
+
+代價是後者比較慢，而且因為是後台跑，TUI 不會顯示中間過程，只看得到定稿後的答案。
+
+#### 維護
+
+文件改版時把舊版刪掉再加新的：
+
+```text
+請用工具 remove_document 移除 old_spec.pdf，
+完成後 ingest_document docs/new_spec.pdf，
+最後 reload_knowledge_base。
+```
+
+想看目前知識庫有多少內容：
+
+```text
+請用工具 reload_knowledge_base，回報目前載入幾個 chunks。
+```
+
+#### 三件容易踩的事
+
+1. **知識庫綁專案目錄**：`knowledge.json` 存在當前專案根目錄裡，換到另一個專案就要重新匯入。同一份規格書在多個專案要用就匯入多次。
+2. **不要 commit**：`knowledge.json` 切碎了原始文件內容，NDA 場景幾乎一定包含敏感片段。已經在 §8.4 列入不該 commit 的清單，建議在專案的 `.gitignore` 也加一行。
+3. **越具體越好**：把一整份 500 頁的手冊原封不動塞進去，不如先抽出實際會問到的章節整理成 markdown 再匯入。雜訊少，答案準。
+
+### 4.3 先建立專案地圖
+
+第一次接到一個 repo，先要求對話只讀不改：
 
 ```text
 先不要改檔。
@@ -239,9 +431,11 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/mnt/share
 最後用 file:line 列出這個 repo 的架構判斷，分成「證據」和「推測」。
 ```
 
-這會逼模型先走 `list_dir(...)`、`code_rag_search(...)`、`read_file(...)`，避免一開始就憑印象回答。
+這會逼對話先走 `list_dir(...)`、`code_rag_search(...)`、`read_file(...)`，避免一開始就憑印象回答。
 
-### 4.2 查 bug 或行為
+很大的 repo（例如 U-Boot 這種數萬檔的）第一次跑 `code_rag_search` 要先建索引，可能會超時。這類情況先用 `list_dir` + `grep_code` 縮小範圍，把問題鎖在一兩個子目錄裡再用 `code_rag_search`。
+
+### 4.4 查 bug 或行為
 
 ```text
 請追這個錯誤的來源：<貼錯誤訊息>
@@ -255,9 +449,9 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/mnt/share
 請 read_file logs/build_fail.txt，根據錯誤訊息找最可能的實作位置。
 ```
 
-### 4.3 要它改檔
+### 4.5 要它改檔
 
-等模型已經列出證據，再允許 patch：
+等對話已經列出證據，再允許 patch：
 
 ```text
 根據上面的證據，請做最小修改。
@@ -266,66 +460,6 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/mnt/share
 ```
 
 `apply_patch(...)` 會真的寫檔。建議在 git worktree 乾淨時使用；不想改檔時要明講「不要 apply_patch」。
-
-### 4.4 查規格或文件
-
-先把 PDF / Markdown / TXT 放進 `<PROJECT_TO_ANALYZE>` 裡，例如：
-
-```text
-docs/npu_spec.pdf
-```
-
-然後在 OpenCode 裡說：
-
-```text
-請用 ingest_document 把 docs/npu_spec.pdf 加進 knowledge base，完成後 reload_knowledge_base。
-```
-
-如果文件在專案外，且啟動時已設 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1`，可以先要求：
-
-```text
-請 import_external_file ~/Downloads/npu_spec.pdf，然後用回傳的新路徑 ingest_document，完成後 reload_knowledge_base。
-```
-
-之後查規格：
-
-```text
-請用 query_knowledge 查 conv2d 輸入大小限制，回答時附 REF 來源。
-```
-
-如果是「答錯比不答更糟」的數值/規格題（例如 timing、寄存器位寬、預設值），改走嚴格模式：
-
-```text
-請用 query_knowledge_strict 查 reset assert 最小持續時間，KB 證據不夠就直接拒答，不要靠常識補。
-```
-
-`query_knowledge_strict(...)` 會在 server 端跑兩階段自我檢查（用 `AICODE_MODEL` 那顆模型），定稿才回傳；OpenCode TUI 看不到中間 streaming，但 server stderr 有完整日誌。
-
-### 4.5 看截圖、ELF、firmware
-
-檔案一樣要先放進 `AICODE_ROOT` 內，或先用 `import_external_file(...)` 受控匯入：
-
-```text
-screenshots/error.png
-firmware/boot.bin
-build/output.elf
-```
-
-在 OpenCode 裡問：
-
-```text
-請 analyze_file screenshots/error.png，先 OCR 錯誤文字，再找相關 source file。
-```
-
-```text
-請 analyze_file firmware/boot.bin，列出 magic、可讀字串與可能格式。
-```
-
-外部檔案範例：
-
-```text
-請 import_external_file /tmp/error.png，然後 analyze_file 它回傳的 .aicode_uploads 路徑。
-```
 
 ---
 
@@ -385,51 +519,13 @@ build/output.elf
 
 ---
 
-## 6. 文件與知識庫
+## 6. 文件與知識庫補充
 
-`knowledge.json` 放在 `AICODE_ROOT` 裡，通常會被 `.gitignore` 忽略。它保存匯入文件切 chunk 後的文字內容，所以不要 commit。
+操作流程的主體寫在 §4.2，這節只列幾個補充細節：
 
-### 6.1 匯入文件
-
-支援：
-
-- `.pdf`
-- `.md`
-- `.txt`
-
-操作：
-
-```text
-請 ingest_document docs/spec.pdf，完成後 reload_knowledge_base。
-```
-
-匯入完成後，查詢時要求模型引用 REF：
-
-```text
-請 query_knowledge 查 reset timing 的限制，回答每個數字都要附 REF。
-```
-
-### 6.2 檔名會影響權重
-
-RAG 會根據檔名推斷來源類型。檔名越清楚，排序越穩：
-
-| 檔名包含 | 來源類型 | 適合內容 |
-|---|---|---|
-| `spec` / `datasheet` | spec | 規格、限制、硬體行為 |
-| `api` / `reference` | api | API 定義、參數、return code |
-| `manual` / `handbook` | manual | 使用手冊、操作流程 |
-| `guide` / `tutorial` | guide | 教學文件 |
-| `faq` | faq | 常見問題 |
-
-例如 `npu_spec.pdf` 通常比 `doc.pdf` 更容易被排在前面。
-
-### 6.3 移除過期文件
-
-```text
-請 remove_document old_spec.pdf，完成後 reload_knowledge_base。
-```
-
-`remove_document(...)` 用 basename 比對，所以傳 `docs/old_spec.pdf` 或 `old_spec.pdf` 都可以。
+- `knowledge.json` 存在當前專案根目錄下，預設會被 `.gitignore` 忽略。它保存切碎後的文件內容，NDA 場景下幾乎一定有敏感片段，**不要 commit**。
+- `remove_document(...)` 用檔名 basename 比對，所以傳完整路徑（`docs/old_spec.pdf`）或單純檔名（`old_spec.pdf`）都可以。
+- 文件切段的大小、不同來源類型的搜尋權重，這些可調參數放在 `config.py` 的 `CHUNK_SETTINGS` 和 `SOURCE_TYPE_WEIGHTS`，預設值在大多數情境下已經夠用，要微調再去動。
 
 ---
 
@@ -440,7 +536,7 @@ RAG 會根據檔名推斷來源類型。檔名越清楚，排序越穩：
 | 模型 | 建議用途 | 優點 | 注意事項 |
 |---|---|---|---|
 | `qwen3-coder:30b` | 預設主力；讀 repo、改 code、產 patch、跑驗證閉環 | coding 能力和工具使用穩定度最均衡；適合作為日常預設 | 比 20B 模型慢；長工具鏈任務建議拆成「先查證、再修改」 |
-| `qwen3.6:35b-a3b-coding-nvfp4` | 跨檔推理、規格 vs 實作比對、較複雜重構 | 推理上限較高；大 context 任務表現較好 | 更吃 VRAM / RAM；不穩或太慢時把 `AICODE_NUM_CTX` 降到 `65536` |
+| `qwen3.6:35b-a3b-q4_K_M` | 跨檔推理、規格 vs 實作比對、較複雜重構 | 推理上限較高；大 context 任務表現較好 | 顯卡 32GB 的話第一次跑先設 `AICODE_NUM_CTX=32768`，用一陣子沒問題再升到 `65536`。**不要**用 `qwen3.6:35b-a3b-coding-nvfp4`（macOS 限定的版本，Linux 拉會報錯 412） |
 | `devstral:24b` | 快速 code review、找 bug、簡單 patch | 速度和 coding 能力平衡；回答通常直接 | 工具呼叫格式不一定比 Qwen Coder 穩；大型修改前建議切回 Qwen |
 | `gpt-oss:20b` | 快速理解陌生 repo、摘要、初步定位 | 輕量、啟動快、硬體壓力低 | 複雜改檔與長工具鏈較弱；適合探索，不適合作為最終 patch 主力 |
 | `qwen3-vl:30b-a3b` | `analyze_file(...)` 處理截圖、圖片 OCR、UI error | 讀圖中文字與畫面資訊較好 | 不是主要 coding model；只有需要圖片分析時才必須 pull |
@@ -450,17 +546,29 @@ RAG 會根據檔名推斷來源類型。檔名越清楚，排序越穩：
 實務選法：
 
 - 要穩定完成「查證 -> patch -> test」：用 `qwen3-coder:30b`。
-- 任務跨很多檔、要比對規格或做設計判斷：用 `qwen3.6:35b-a3b-coding-nvfp4`。
+- 任務跨很多檔、要比對規格或做設計判斷：用 `qwen3.6:35b-a3b-q4_K_M`（Linux 上能用的版本；`qwen3.6:35b-a3b-coding-nvfp4` 是 macOS 限定，不要用）。
 - 只想先看懂 repo 或做初步 review：用 `gpt-oss:20b` 或 `devstral:24b`。
 - 要讀截圖：保留主聊天模型不變，讓 `analyze_file(...)` 使用 `qwen3-vl:30b-a3b`。
 
 Context 建議：
 
+`AICODE_NUM_CTX` 控制每次能塞給模型的文字量上限（單位是 token，1 token 大約 3–4 個字元）。值越大可以一次給越多檔案內容或對話歷史，但模型在 VRAM 裡要額外佔的空間也越大。
+
 ```bash
+# 30B 以下模型：直接 64K 通常最穩
 AICODE_NUM_CTX=65536 aicode
+
+# 35B 級的模型（如 qwen3.6:35b-a3b-q4_K_M）：先用 32K 跑一次，確認沒問題再升
+AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_NUM_CTX=32768 aicode
 ```
 
-64K 通常比較穩；128K 適合 32GB VRAM + 大 RAM 的機器，但 prompt ingest 和首 token 會變慢。
+判斷要不要升上去：
+
+- 開新的視窗跑 `ollama ps`，看載入中模型那行的 `PROCESSOR` 欄位。
+- 顯示 `100% GPU`：模型完全放在顯卡裡，速度正常，可以考慮把 `AICODE_NUM_CTX` 升到 65536 再跑一輪。
+- 顯示 `xx% / xx% CPU`：顯卡記憶體不夠，模型有一部分被搬到一般記憶體跑，回應會明顯變慢（首字出來特別久）。這時把 `AICODE_NUM_CTX` 改小一點再啟動。
+
+128K（131072）需要顯卡記憶體 + 系統記憶體都很充裕才合理，35B 級的模型不建議直接開到 128K。
 
 ---
 
@@ -563,7 +671,7 @@ aicode
 
 ```bash
 ollama pull qwen3-coder:30b
-ollama pull qwen3.6:35b-a3b-coding-nvfp4
+ollama pull qwen3.6:35b-a3b-q4_K_M
 ollama pull devstral:24b
 ollama pull gpt-oss:20b
 ```
