@@ -1,4 +1,4 @@
-# ai_code 開發者備忘
+# CodeTrail 開發者備忘
 
 這份文件說明 OpenCode 日常使用以外的開發者基礎設施。專案首頁主要看 `README.md`；
 AI agent 改 repo 前看 `AGENTS.md`（安全紅線與禁止事項）；這裡只放維護命令與內部工具。
