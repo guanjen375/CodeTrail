@@ -660,7 +660,7 @@ def _build_elf_report(
 # ============================================================================
 
 def ocr_image(path: str) -> str:
-    """對圖片進行 OCR"""
+    """對圖片進行視覺分析與 OCR。"""
     p = _safe_path(path, allow_external=True, allowed_extensions=IMAGE_EXTENSIONS)
 
     if p is None:
@@ -679,7 +679,7 @@ def ocr_image(path: str) -> str:
     if file_size > 20 * 1024 * 1024:
         return f"[OCR 錯誤] 圖片過大: {file_size / 1024 / 1024:.1f}MB"
 
-    cache_key = _cache_key(p)
+    cache_key = _cache_key(p, extra=("vision-v2",))
     cached = _cache_get(_OCR_CACHE, cache_key)
     if cached is not None:
         return cached
@@ -691,7 +691,13 @@ def ocr_image(path: str) -> str:
         session = get_session()
         resp = session.post(OLLAMA_GENERATE_URL, json={
             "model": VL_MODEL,
-            "prompt": "列出圖片中的所有文字，保持格式。",
+            "prompt": (
+                "請完整分析這張圖片，使用繁體中文輸出。\n"
+                "1. 先用 3-6 句描述主要畫面、物件、人物/角色、背景與風格。\n"
+                "2. 若圖片中有文字或數字，另列「可見文字」並保持原文。\n"
+                "3. 若是 UI、終端機、錯誤截圖、表格或圖表，請整理關鍵資訊與可能含義。\n"
+                "4. 若幾乎沒有文字，也不要只回答空白；仍要描述視覺內容。"
+            ),
             "images": [data],
             "stream": False,
             "options": {"num_ctx": 4096, "temperature": 0.1},

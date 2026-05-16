@@ -1110,6 +1110,7 @@ def load_knowledge_base(output_path: Path) -> Dict:
         try:
             with open(output_path, 'r', encoding='utf-8') as f:
                 kb = json.load(f)
+            _restore_embeddings_from_npz(kb, output_path)
             print(f"[INFO] 載入現有知識庫: {len(kb.get('chunks', []))} 個區塊")
             return kb
         except Exception as e:
@@ -1128,6 +1129,60 @@ def load_knowledge_base(output_path: Path) -> Dict:
         "chunks": []
     }
 
+def _chunks_content_hash(chunks: List[Dict]) -> str:
+    """計算 chunks 內容 hash，需與 save_knowledge_base 的 .npz metadata 一致。"""
+    hasher = hashlib.md5()
+    for chunk in chunks:
+        hasher.update(chunk.get('content', '').encode('utf-8'))
+    return hasher.hexdigest()
+
+
+def _restore_embeddings_from_npz(kb: Dict, output_path: Path) -> bool:
+    """把 JSON 外掛的 .npz embeddings 補回 chunks。
+
+    RAG JSON 為了減少體積不再保存 embedding；增量新增文件前必須先把舊
+    embeddings 還原，否則下一次 save 會把舊 chunks 寫成零向量。
+    """
+    chunks = kb.get("chunks", [])
+    if not chunks:
+        return False
+    if all(chunk.get("embedding") for chunk in chunks):
+        return True
+
+    try:
+        import numpy as np
+        from config import KNOWLEDGE_EMB_FILE
+    except ImportError:
+        return False
+
+    emb_path = output_path.parent / KNOWLEDGE_EMB_FILE
+    if not emb_path.exists():
+        return False
+
+    try:
+        data = np.load(emb_path, allow_pickle=True)
+        embeddings = data["embeddings"]
+        chunk_count = int(data.get("chunk_count", 0))
+        content_hash = str(data.get("content_hash", ""))
+    except Exception as e:
+        print(f"[WARN] 載入既有 .npz embeddings 失敗，將在儲存時重算缺失向量: {e}")
+        return False
+
+    if chunk_count != len(chunks):
+        print("[WARN] 既有 .npz chunk 數量不一致，將在儲存時重算缺失向量")
+        return False
+
+    current_hash = _chunks_content_hash(chunks)
+    if content_hash and content_hash != current_hash:
+        print("[WARN] 既有 .npz 內容 hash 不一致，將在儲存時重算缺失向量")
+        return False
+
+    for chunk, emb in zip(chunks, embeddings):
+        if not chunk.get("embedding"):
+            chunk["embedding"] = emb.tolist() if hasattr(emb, "tolist") else list(emb)
+    return True
+
+
 def save_knowledge_base(kb: Dict, output_path: Path):
     """儲存知識庫
 
@@ -1136,6 +1191,11 @@ def save_knowledge_base(kb: Dict, output_path: Path):
     - 加速 JSON 解析
     - .npz 使用壓縮格式，整體儲存更有效率
     """
+    missing_embeddings = [chunk for chunk in kb.get("chunks", []) if not chunk.get("embedding")]
+    if missing_embeddings:
+        print(f"[WARN] {len(missing_embeddings)} 個舊 chunks 缺少 embedding，將重算以避免寫入零向量")
+        generate_embeddings(missing_embeddings)
+
     # 更新 metadata
     kb["metadata"]["updated_at"] = datetime.now().isoformat()
     kb["metadata"]["total_documents"] = len(kb["metadata"]["documents"])
@@ -1164,15 +1224,12 @@ def save_knowledge_base(kb: Dict, output_path: Path):
         emb_path = output_path.parent / KNOWLEDGE_EMB_FILE
 
         # 計算 content hash（用於載入時驗證）
-        import hashlib
-        hasher = hashlib.md5()
-        for chunk in chunks_without_emb:
-            hasher.update(chunk.get('content', '').encode('utf-8'))
-        content_hash = hasher.hexdigest()
+        content_hash = _chunks_content_hash(chunks_without_emb)
 
         # 確保 embeddings 維度一致
-        if embeddings:
-            emb_dim = max(len(e) for e in embeddings if e)
+        non_empty_embeddings = [e for e in embeddings if e]
+        if non_empty_embeddings:
+            emb_dim = max(len(e) for e in non_empty_embeddings)
             normalized = []
             for emb in embeddings:
                 if len(emb) == emb_dim:
@@ -1197,6 +1254,9 @@ def save_knowledge_base(kb: Dict, output_path: Path):
             )
             emb_size = emb_path.stat().st_size / 1024 / 1024
             print(f"     Embeddings: {emb_path.name} ({emb_size:.2f} MB)")
+        elif emb_path.exists():
+            emb_path.unlink()
+            print(f"     Embeddings: 已移除空知識庫的 {emb_path.name}")
     except ImportError:
         # numpy 不可用，將 embedding 放回 JSON（向後相容）
         for i, emb in enumerate(embeddings):
