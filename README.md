@@ -126,11 +126,19 @@ mkdir -p ~/.config/opencode
 ${EDITOR:-vi} ~/.config/opencode/opencode.json
 ```
 
-在檔案裡貼上下方內容，並把 `<CODETRAIL_REPO>` 換成 CodeTrail repo 的實際絕對路徑：
+在檔案裡貼上下方內容。MCP command 會從 OpenCode 啟動目錄找 git root，然後執行該 root 內的 `.opencode/run-codetrail-mcp`：
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
+
+  "share": "disabled",
+  "autoupdate": false,
+
+  "enabled_providers": ["ollama"],
+  "model": "ollama/qwen3-coder:30b",
+  "small_model": "ollama/qwen3-coder:30b",
+
   "provider": {
     "ollama": {
       "npm": "@ai-sdk/openai-compatible",
@@ -139,30 +147,65 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
         "baseURL": "http://localhost:11434/v1"
       },
       "models": {
-        "qwen3-coder:30b":          { "name": "Qwen3 Coder 30B" },
-        "qwen3.6:35b-a3b-q4_K_M":   { "name": "Qwen3.6 35B A3B Q4_K_M" },
-        "devstral:24b":             { "name": "Devstral 24B" },
-        "gpt-oss:20b":              { "name": "GPT-OSS 20B" }
+        "qwen3-coder:30b": {
+          "name": "Qwen3 Coder 30B"
+        },
+        "qwen3.6:35b-a3b-q4_K_M": {
+          "name": "Qwen3.6 35B A3B Q4_K_M"
+        },
+        "devstral:24b": {
+          "name": "Devstral 24B"
+        },
+        "gpt-oss:20b": {
+          "name": "GPT-OSS 20B"
+        }
       }
     }
   },
+
   "mcp": {
     "codetrail": {
       "type": "local",
-      "command": ["python", "<CODETRAIL_REPO>/mcp_server.py"],
-      "enabled": true
+      "command": [
+        "bash",
+        "-lc",
+        "root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P); exec \"$root/.opencode/run-codetrail-mcp\""
+      ],
+      "enabled": true,
+      "timeout": 10000
     }
+  },
+
+  "permission": {
+    "*": "deny",
+
+    "question": "allow",
+    "todowrite": "allow",
+
+    "codetrail_*": "allow",
+    "codetrail_apply_patch": "ask",
+    "codetrail_run_lint": "ask",
+    "codetrail_run_command": "ask",
+    "codetrail_import_external_file": "deny",
+
+    "webfetch": "deny",
+    "websearch": "deny",
+    "bash": "deny",
+    "read": "deny",
+    "grep": "deny",
+    "glob": "deny",
+    "edit": "deny",
+    "write": "deny",
+    "apply_patch": "deny",
+    "external_directory": "deny",
+    "task": "deny",
+    "skill": "deny",
+    "lsp": "deny"
   }
 }
 ```
 
-如果系統沒有 `python` 指令，把 `command` 改成：
-
-```json
-"command": ["python3", "<CODETRAIL_REPO>/mcp_server.py"]
-```
-
-`mcp` 裡的 key 會影響 OpenCode `/status` 顯示的名字。上面用 `codetrail`；如果你沿用舊設定的 `ai_code` key，看到 `ai_code Connected` 也正常。
+`mcp` 裡的 key 會影響 OpenCode `/status` 顯示的名字。上面用 `codetrail`，所以應該看到 `codetrail Connected`。
 
 檢查 JSON 格式：
 
@@ -195,10 +238,11 @@ command -v aicode
 
 如果這樣有輸出，再把同一行 `export PATH="$HOME/.local/bin:$PATH"` 加到 `~/.bashrc` 或你的 shell 設定檔，之後新開終端機就會生效。
 
-`aicode` 會做四件事：
+`aicode` 會做五件事：
 
 - 將目前目錄設成 `AICODE_ROOT`
 - 拒絕 `AICODE_ROOT=/` 和 `AICODE_ROOT=$HOME`
+- 在目前專案準備 `.opencode/run-codetrail-mcp`，讓 OpenCode config 裡的 MCP command 能啟動 CodeTrail server
 - 啟動 `opencode`，讓 OpenCode 子行程繼承同一個沙箱根目錄
 - 如果有 `AICODE_MODEL`，自動把它轉成 OpenCode 的 `--model` 參數，讓 TUI 對話模型也預設成這顆（命令列自己帶 `-m` / `--model` 時不覆蓋）
 
@@ -806,7 +850,7 @@ command -v aicode
 command -v opencode
 ```
 
-再確認 `opencode.json` 裡的 `<CODETRAIL_REPO>/mcp_server.py` 是實際路徑，且 `/status` 裡的名字會跟 `mcp` key 一致；如果 key 是 `codetrail`，應該看到 `codetrail Connected`。
+再確認 `opencode.json` 裡的 MCP command 能找到目前 git root 內的 `.opencode/run-codetrail-mcp`，且 `/status` 裡的名字會跟 `mcp` key 一致；如果 key 是 `codetrail`，應該看到 `codetrail Connected`。
 
 ### 啟動時拒絕 `AICODE_ROOT`
 
