@@ -483,7 +483,8 @@ def get_answer_rules(has_binary: bool = False) -> str:
 # 改碼閉環設定 (Patch / Git / Lint)
 # ============================================================
 # ⚠️ 安全警告：apply_patch 會直接修改檔案，請謹慎使用
-# 可透過 CLI flag --patch 啟用，或環境變數 AI_CODE_PATCH=1
+# 預設關閉；mcp_server.py 會在 OpenCode runtime 明確啟用。
+# 其他 runtime / 測試可透過環境變數 AI_CODE_PATCH=1 啟用。
 PATCH_ENABLED = _os.environ.get('AI_CODE_PATCH', '').lower() in ('1', 'true', 'yes')
 PATCH_MAX_FILES = 5              # 單次 patch 最多修改 5 個檔案
 PATCH_MAX_LINES_PER_FILE = 200   # 單一檔案最多修改 200 行
@@ -517,7 +518,8 @@ LINT_COMMANDS = {
 # 即使有白名單，make/cmake/npm 等都會執行專案內的腳本
 # 建議：分析陌生 repo 時保持 False，只對自己的專案開啟
 #
-# 可透過 CLI flag --run-tests 啟用，或環境變數 AI_CODE_RUN_TESTS=1
+# 預設關閉；mcp_server.py 會在 OpenCode runtime 明確啟用。
+# 其他 runtime / 測試可透過環境變數 AI_CODE_RUN_TESTS=1 啟用。
 RUN_COMMAND_ENABLED = _os.environ.get('AI_CODE_RUN_TESTS', '').lower() in ('1', 'true', 'yes')
 RUN_COMMAND_TIMEOUT = 60
 RUN_COMMAND_MAX_OUTPUT = 8000

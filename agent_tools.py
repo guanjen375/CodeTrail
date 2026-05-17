@@ -282,7 +282,8 @@ _RUN_LINT_TOOL = {
 def get_native_tools() -> list:
     """動態決定要包含哪些工具
 
-    改進：使用函數而非常量，讓 --run-tests/--patch 可以在 main.py 處理完參數後生效
+    使用函數而非常量，讓 env/MCP runtime 對 RUN_COMMAND_ENABLED/PATCH_ENABLED
+    的明確設定能在組工具清單時生效。
     """
     tools = list(_BASE_TOOLS)
 
@@ -754,7 +755,7 @@ class ToolExecutor:
     def run_command(self, command: str, timeout: int = RUN_COMMAND_TIMEOUT) -> str:
         """執行白名單內的測試/建置命令"""
         if not config.RUN_COMMAND_ENABLED:
-            return "錯誤: run_command 功能已停用（可用 --run-tests 或設定 AI_CODE_RUN_TESTS=1 啟用）"
+            return "錯誤: run_command 功能已停用（設定 AI_CODE_RUN_TESTS=1 才會啟用）"
 
         # 統一驗證（容器/非容器模式都要過白名單）
         is_valid, error_msg, cmd_parts = self._validate_command(command)
@@ -840,7 +841,7 @@ class ToolExecutor:
     def apply_patch(self, patch: str, dry_run: bool = False) -> str:
         """套用 unified diff 格式的 patch"""
         if not config.PATCH_ENABLED:
-            return "錯誤: apply_patch 功能已停用（可用 --patch 或設定 AI_CODE_PATCH=1 啟用）"
+            return "錯誤: apply_patch 功能已停用（設定 AI_CODE_PATCH=1 才會啟用）"
 
         try:
             changes = self._parse_unified_diff(patch)

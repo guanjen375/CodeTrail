@@ -7,7 +7,8 @@ ai_code MCP server — 把 KnowledgeBase / CodeRAG / agent_tools 包成 MCP tool
 啟動:
     AICODE_ROOT=/path/to/project python mcp_server.py
 
-不取代 main.py 的 CLI 模式,獨立 entry point。
+一般使用者不要直接跑這個檔案；請從專案目錄執行 `aicode`,
+由 OpenCode 透過 stdio 啟動 MCP server。
 """
 
 import contextlib
@@ -180,7 +181,7 @@ def _record_kb_interaction(
     """Append a data_flywheel Interaction for a KB-shaped MCP tool call.
 
     Plumbing tools (read_file/grep_code/...) 不呼叫這個,因為 MCP 沒有 turn
-    邊界、湊不出 main.py 那種「完整 Q&A」結構,硬塞會污染訓練語料。
+    邊界、湊不出完整 Q&A 結構,硬塞會污染訓練語料。
 
     沒設 AI_CODE_COLLECT_DATA 時 record_interaction 自己會 no-op。
     """
@@ -259,7 +260,7 @@ def query_knowledge(question: str) -> dict:
 def query_knowledge_strict(question: str) -> dict:
     """Strict-mode KB query: server-side LLM with refuse + 2-stage self-check.
 
-    這是 main.py 嚴格模式(answer_with_self_check)的 MCP 對等品 — 把
+    這是 server-side 嚴格模式(answer_with_self_check) — 把
     `should_refuse_answer` + `should_use_strict_mode` + 兩階段自我檢查打包成
     一個工具。用於規格/數值/限制類問題,要求模型只用 KB 內容回答,並逐句
     檢查是否有 [REF] 根據。

@@ -2,7 +2,7 @@
 """ai_code 安裝 / 啟動前自檢工具（preflight）。
 
 一次跑完就知道：Python 版本對不對、必要套件裝了沒、Ollama 通不通、
-模型 pull 了沒、AICODE_ROOT 安不安全、MCP 入口都在不在、KB 有沒有資料。
+模型 pull 了沒、AICODE_ROOT 安不安全、OpenCode/MCP 入口都在不在、KB 有沒有資料。
 
 使用：
     python scripts/doctor.py                       # 全檢
@@ -77,7 +77,7 @@ _REQUIRED_PACKAGES = [
     ("requests", "必要 — HTTP 請求"),
 ]
 _OPTIONAL_PACKAGES = [
-    ("mcp", "MCP server 模式才需要 — pip install mcp"),
+    ("mcp", "MCP server 需要 — pip install mcp"),
     ("numpy", "提升 RAG/MMR 速度，非必要 — pip install numpy"),
     ("jieba", "中文 BM25 精準度，非必要 — pip install jieba"),
     ("pymupdf4llm", "PDF ingestion 才需要 — pip install pymupdf4llm"),
@@ -207,7 +207,7 @@ def check_opencode_in_path(r: Result) -> None:
         r.ok("opencode 在 PATH")
     else:
         r.warn(
-            "opencode 不在 PATH — 純 CLI 模式不需要；要走 OpenCode TUI 路線請：\n"
+            "opencode 不在 PATH — 日常入口需要 OpenCode TUI，請：\n"
             "        npm install -g opencode-ai"
         )
 
@@ -474,7 +474,6 @@ def check_repo_artifacts(r: Result) -> None:
     """ai_code repo 自身應該存在的關鍵檔。"""
     must_exist = [
         ("mcp_server.py", "MCP server 入口"),
-        ("main.py", "CLI 入口"),
         ("config.py", "設定檔"),
         ("RAG.py", "知識庫 ingestion"),
     ]
@@ -489,9 +488,9 @@ def check_repo_artifacts(r: Result) -> None:
         if os.access(aicode_bin, os.X_OK):
             r.ok("aicode 存在且可執行")
         else:
-            r.warn("aicode 存在但沒有執行權 — chmod +x aicode")
+            r.fail("aicode 存在但沒有執行權 — chmod +x aicode")
     else:
-        r.warn("aicode 不存在 — symlink 啟動方式無法用，但可手動跑 mcp_server.py")
+        r.fail("aicode 不存在 — 使用者入口不可用")
 
 
 def check_knowledge_base(r: Result, project: str | None) -> None:

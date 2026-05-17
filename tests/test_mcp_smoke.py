@@ -20,7 +20,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# CI 沒裝 mcp 時 skip — README 也說明 "純 CLI 模式不需要 mcp"
+# CI 沒裝 mcp 時 skip；日常 OpenCode 路線需要 mcp。
 mcp = pytest.importorskip("mcp", reason="mcp 套件未安裝;OpenCode + MCP 路線才需要")
 
 

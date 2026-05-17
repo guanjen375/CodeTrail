@@ -24,7 +24,7 @@
     "question": "Patch 功能預設是開啟還是關閉的？如何啟用？",
     "expected": {
       "refs": ["spec", "patch"],
-      "keywords": ["停用", "--patch", "AI_CODE_PATCH"],
+      "keywords": ["停用", "AI_CODE_PATCH"],
       "gold_chunks": ["PATCH_ENABLED", "patch"],
       "gold_evidence": ["預設停用", "False"]
     }

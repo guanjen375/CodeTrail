@@ -107,8 +107,14 @@ def test_tag_present_explicit_tag_not_in_latest():
     assert not doc._tag_present("qwen3-coder:30b", {"qwen3-coder:latest"})
 
 
-def test_check_models_accepts_latest_tag_for_bare_config_name():
+def test_check_models_accepts_latest_tag_for_bare_config_name(monkeypatch):
     """模擬使用者只裝 bge-m3:latest 的情況。修補前會 FAIL,修補後應 PASS。"""
+    import config as cfg
+
+    monkeypatch.setattr(cfg, "MODEL", "qwen3-coder:30b")
+    monkeypatch.setattr(cfg, "DEFAULT_MODEL", "qwen3-coder:30b")
+    monkeypatch.setattr(cfg, "EMBEDDING_MODEL", "bge-m3")
+    monkeypatch.setattr(cfg, "RERANKER_MODEL", "qllama/bge-reranker-v2-m3")
     tags = {
         "qwen3-coder:30b",
         "bge-m3:latest",

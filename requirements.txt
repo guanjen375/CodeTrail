@@ -2,7 +2,7 @@
 
 # 核心
 requests>=2.28.0    # Ollama HTTP
-mcp>=1.0.0          # MCP server（mcp_server.py 用，CLI 不需要）
+mcp>=1.0.0          # MCP server（mcp_server.py 用）
 numpy>=1.21.0       # RAG / MMR 向量運算
 
 # 可選：缺了會由各功能 graceful skip，doctor 會提示

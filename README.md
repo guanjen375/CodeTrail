@@ -260,67 +260,6 @@ ollama ps
 - `100% GPU`：完全放在顯卡裡，速度正常。
 - `xx% / xx% CPU`：有一部分被搬到一般記憶體跑，回應會明顯變慢。出現這個就把 `AICODE_NUM_CTX` 再調小。
 
-### 3.1 瀏覽器介面（測試中）
-
-web 介面目前是測試中的輔助入口，適合在內網或 Tailscale 裡讓其他人上傳截圖、PDF、log、firmware，或做簡單的 RAG 問答。需要深入讀專案檔案、grep、產生 patch 或長時間除錯時，仍建議回到 OpenCode TUI。
-
-只給本機自己連：
-
-```bash
-cd <PROJECT_TO_ANALYZE>
-AICODE_WEB_USER=aiuser AICODE_WEB_PASSWORD='換成你的密碼' python <CODETRAIL_REPO>/web_server.py --project .
-```
-
-打開：
-
-```text
-http://127.0.0.1:8088/
-```
-
-要讓同一個 LAN / Wi-Fi 裡其他電腦也能連，listen `0.0.0.0`：
-
-```bash
-cd <PROJECT_TO_ANALYZE>
-AICODE_WEB_USER=aiuser AICODE_WEB_PASSWORD='換成你的密碼' \
-  python <CODETRAIL_REPO>/web_server.py --project . --host 0.0.0.0 --port 8088
-```
-
-server 會印出可嘗試的 LAN URL，例如：
-
-```text
-http://192.168.1.23:8088/
-```
-
-其他人用瀏覽器開這個網址，輸入你設定的帳號密碼。若連不上，先確認本機防火牆有放行 `8088/tcp`，以及對方跟你在同一個網段。這個 web server 是 plain HTTP，適合信任的內網；不要直接曝露到公網，公網請放在 HTTPS reverse proxy 或 VPN 後面。
-
-沒有設定 `AICODE_WEB_PASSWORD` 時，server 會在終端機印出一次性的臨時密碼。需要固定密碼但不想放 shell history，可以用：
-
-```bash
-AICODE_WEB_USER=aiuser AICODE_WEB_PASSWORD_FILE=/path/to/password.txt python <CODETRAIL_REPO>/web_server.py --project .
-```
-
-也可以直接用 CLI 指定帳密，但密碼會出現在本機 `ps` 行程列表，只有在可信任機器上才建議這樣用：
-
-```bash
-python <CODETRAIL_REPO>/web_server.py --project . --host 0.0.0.0 --user aiuser --password '換成你的密碼'
-```
-
-要從真正公網連進來，不能只改 `--host 0.0.0.0`。還需要：
-
-- 路由器做 port forwarding：`<公網 IP>:8088` → `<PROJECT_HOST_LAN_IP>:8088`
-- Linux 防火牆放行：`sudo ufw allow 8088/tcp`
-- 若 ISP 沒給可被連入的公網 IP（CGNAT），改用 Tailscale / VPN / reverse proxy
-
-Tailscale 方式不需要路由器轉發，直接用 `http://<PROJECT_HOST_TAILSCALE_IP>:8088/`。
-
-web 介面的檔案處理方式：
-
-- 上傳檔案會先存到目前專案底下的 `.aicode_web/uploads/`，這個目錄已在 `.gitignore`，避免 NDA 檔案被 commit。
-- 在對話中勾選「附加到問題」時，文字 / log / 程式碼檔會直接讀入本輪上下文；圖片、ELF、binary 會轉成既有的 `file:"..."` 流程交給 `media.py`；PDF 會嘗試用 `RAG.py` 的文件抽取流程做一次性上下文。
-- 預設送出是快速問答，會用本輪問題、附件與 RAG 回答，且使用較小的 web context 以降低等待時間；如果要讓模型讀專案檔案、grep 或做 Code RAG 探索，勾選「專案 Agent 探索」再送出。
-- 點「加入 RAG」時，server 會呼叫既有 `RAG.py` 入庫流程，更新專案內的 `knowledge.json` / `knowledge_emb.npz`，再重新載入知識庫。
-- web 模式不允許直接讀專案外的任意路徑；瀏覽器檔案必須先上傳進專案內的暫存目錄。
-
 如果要讓 OpenCode 匯入專案外的截圖、PDF、log 或 firmware blob，啟動時明確開啟外部匯入入口：
 
 ```bash
@@ -335,7 +274,7 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/mnt/share
 
 ---
 
-## 3.2 Context、Offload 與 Silent Truncation
+### 3.1 Context、Offload 與 Silent Truncation
 
 模型「看不到」想看到的內容，有兩種完全不同的原因，常常被混在一起談：
 

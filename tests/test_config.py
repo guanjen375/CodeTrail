@@ -38,7 +38,7 @@ def test_context_sizes_positive():
 
 
 def test_dangerous_features_default_off():
-    """改碼/跑命令類預設應為 False（要靠 CLI flag 或 env 開）。"""
+    """改碼/跑命令類預設應為 False（要靠明確 env 開）。"""
     # 這些值在 import 時若 env 不為 truthy 就應該是 False
     import os
     if os.environ.get("AI_CODE_PATCH", "").lower() not in ("1", "true", "yes"):

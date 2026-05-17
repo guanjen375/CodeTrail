@@ -55,7 +55,7 @@ _PRINTABLE_CHARS = set(
     " .,_-/:;()[]{}+=@#%$'\"\\|<>!?*&^~`"
 )
 
-# 全域 sandbox root（由 main.py 設定）
+# 全域 sandbox root（由 mcp_server.py 設定）
 _SANDBOX_ROOT: Optional[Path] = None
 _ALLOW_EXTERNAL: bool = True  # 預設允許外部檔案（大部分使用場景都是外部路徑）
 
