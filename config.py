@@ -48,6 +48,28 @@ DYNAMIC_NUM_CTX_MAX = 65536      # 最大 64K（速度優先：128K->64K）
 DYNAMIC_NUM_CTX_BUFFER = 1.3     # 預留空間給回答（GPT建議: 1.5->1.3）
 CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
 
+# ============================================================
+# Context Budget / Hard Gate（P0：避免 silent truncation）
+# ============================================================
+# CodeTrail 自己呼叫 Ollama native /api/generate 與 /api/chat 時，
+# 必須在送出前估算 prompt token 數、保留輸出空間，並在超過硬上限時拒絕送出。
+# 這些設定只影響 CodeTrail internal LLM calls；OpenCode TUI 走 /v1，不在這裡管。
+#
+# - AICODE_RESERVED_OUTPUT_TOKENS: 估算時保留給模型輸出的 token 數
+# - AICODE_CTX_SOFT_THRESHOLD: 使用率超過此值時輸出 WARN
+# - AICODE_CTX_HARD_THRESHOLD: 使用率超過此值時拒絕送出
+# - AICODE_CTX_GATE_ENABLED: 設成 0 可暫時停用 gate（除錯用，不建議生產關閉）
+RESERVED_OUTPUT_TOKENS = int(_os.environ.get("AICODE_RESERVED_OUTPUT_TOKENS", "4096"))
+CTX_SOFT_THRESHOLD = float(_os.environ.get("AICODE_CTX_SOFT_THRESHOLD", "0.80"))
+CTX_HARD_THRESHOLD = float(_os.environ.get("AICODE_CTX_HARD_THRESHOLD", "0.90"))
+CTX_GATE_ENABLED = _os.environ.get("AICODE_CTX_GATE_ENABLED", "1").lower() in ("1", "true", "yes")
+
+# Telemetry：每次 LLM call 寫一行 metadata 到 JSONL。
+# 嚴格只記 count/metadata，不寫 prompt / tool output / 檔案內容，避免 NDA 外洩。
+# 預設路徑 .codetrail/context_metrics.jsonl，已被 .gitignore 的 *.jsonl 規則涵蓋。
+CTX_METRICS_ENABLED = _os.environ.get("AICODE_CTX_METRICS_ENABLED", "1").lower() in ("1", "true", "yes")
+CTX_METRICS_PATH = _os.environ.get("AICODE_CTX_METRICS_PATH", ".codetrail/context_metrics.jsonl")
+
 MAX_TOTAL_CHARS = 200000  # 200KB，讓中小型專案使用完整模式
 
 # ============================================================

@@ -117,3 +117,154 @@ def test_check_models_accepts_latest_tag_for_bare_config_name():
     r = doc.Result()
     doc.check_models(r, tags)
     assert not r.fails, f"應該沒有 FAIL,實際: {r.fails}"
+
+
+# ============================================================
+# P2: context / offload checks
+# ============================================================
+
+def test_check_context_settings_prints_pipelines(monkeypatch):
+    """check_context_settings 不該 FAIL,但應該印出兩條 context 管線的設定。"""
+    monkeypatch.delenv("OLLAMA_CONTEXT_LENGTH", raising=False)
+    r = doc.Result()
+    doc.check_context_settings(r)
+    assert not r.fails
+    # 至少有幾個 INFO 行(passes/warns/fails 都不會記 info 到屬性裡,但有印到 stdout)
+    # 反之確認:不會誤判而 FAIL
+    assert isinstance(r.fails, list)
+
+
+def test_check_context_settings_warns_when_num_ctx_exceeds_dynamic_max(monkeypatch):
+    """AICODE_NUM_CTX=131072 但 DYNAMIC_NUM_CTX_MAX=65536 + dynamic on
+    時應該 WARN 提醒使用者實際 internal call 會被 clamp。"""
+    import config as cfg
+    monkeypatch.setattr(cfg, "NUM_CTX", 131072)
+    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", True)
+    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_MAX", 65536)
+    r = doc.Result()
+    doc.check_context_settings(r)
+    assert r.warns, "應該有 WARN 提醒 dynamic max clamp"
+    assert any("DYNAMIC_NUM_CTX_MAX" in w for w in r.warns)
+
+
+def test_check_context_settings_warns_on_server_ctx_smaller_than_aicode(monkeypatch):
+    """OLLAMA_CONTEXT_LENGTH=4096 < AICODE_NUM_CTX=32768 時提醒 OpenCode TUI 可能被截。"""
+    import config as cfg
+    monkeypatch.setattr(cfg, "NUM_CTX", 32768)
+    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", True)
+    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_MAX", 65536)
+    monkeypatch.setenv("OLLAMA_CONTEXT_LENGTH", "4096")
+    r = doc.Result()
+    doc.check_context_settings(r)
+    assert any("OLLAMA_CONTEXT_LENGTH" in w for w in r.warns)
+
+
+def test_check_context_settings_warns_when_hard_below_soft(monkeypatch):
+    import config as cfg
+    monkeypatch.setattr(cfg, "CTX_SOFT_THRESHOLD", 0.90)
+    monkeypatch.setattr(cfg, "CTX_HARD_THRESHOLD", 0.80)
+    r = doc.Result()
+    doc.check_context_settings(r)
+    assert any("HARD_THRESHOLD" in w for w in r.warns)
+
+
+def test_check_ollama_runtime_skipped_when_no_network():
+    """--no-network 模式下不該 raise,也不會去打 /api/ps。"""
+    r = doc.Result()
+    doc.check_ollama_runtime(r, no_network=True)
+    # No-op: no passes/warns/fails added
+    assert not r.fails
+
+
+def test_check_ollama_runtime_handles_unreachable_silently(monkeypatch):
+    """Ollama 不可連時 check_ollama_runtime 不該爆 — check_ollama 會先報。"""
+    import config as cfg
+    monkeypatch.setattr(cfg, "OLLAMA_BASE_URL", "http://127.0.0.1:1")
+    r = doc.Result()
+    doc.check_ollama_runtime(r, no_network=False)
+    # connection refused → silent skip
+    assert not r.fails
+
+
+def test_check_ollama_runtime_warns_on_cpu_gpu_split(monkeypatch):
+    """模擬 /api/ps 回 30% GPU 的 split 情境;應該觸發 WARN。"""
+    import config as cfg
+    import requests
+
+    class FakeResp:
+        status_code = 200
+        def raise_for_status(self):
+            return None
+        def json(self):
+            # 30B 模型 18GB,只放 5.4GB 進 VRAM (30% GPU)
+            return {
+                "models": [
+                    {
+                        "name": "qwen3.6:35b-a3b-q4_K_M",
+                        "size": 18 * 1024**3,
+                        "size_vram": int(0.3 * 18 * 1024**3),
+                        "context_length": 32768,
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(cfg, "OLLAMA_BASE_URL", "http://localhost:11434")
+    monkeypatch.setattr(cfg, "MODEL", "qwen3.6:35b-a3b-q4_K_M")
+    monkeypatch.setattr(requests, "get", lambda *a, **kw: FakeResp())
+    r = doc.Result()
+    doc.check_ollama_runtime(r, no_network=False)
+    assert any("CPU/GPU 混合" in w for w in r.warns), r.warns
+
+
+def test_check_ollama_runtime_ok_on_full_gpu(monkeypatch):
+    import config as cfg
+    import requests
+
+    class FakeResp:
+        status_code = 200
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {
+                "models": [
+                    {
+                        "name": "qwen3-coder:30b",
+                        "size": 17 * 1024**3,
+                        "size_vram": 17 * 1024**3,
+                        "context_length": 32768,
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(cfg, "OLLAMA_BASE_URL", "http://localhost:11434")
+    monkeypatch.setattr(cfg, "MODEL", "qwen3-coder:30b")
+    monkeypatch.setattr(requests, "get", lambda *a, **kw: FakeResp())
+    r = doc.Result()
+    doc.check_ollama_runtime(r, no_network=False)
+    assert r.passes
+    assert not any("CPU/GPU 混合" in w for w in r.warns)
+
+
+def test_check_opencode_config_drift_warns_on_mismatch(monkeypatch, tmp_path):
+    import config as cfg
+    monkeypatch.setattr(cfg, "NUM_CTX", 32768)
+    # opencode.json with limit.context = 4096 (huge gap)
+    oc_path = tmp_path / "opencode.json"
+    oc_path.write_text(
+        '{"models": {"qwen3-coder:30b": {"name": "X", "limit": {"context": 4096}}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AICODE_ROOT", str(tmp_path))
+    r = doc.Result()
+    doc.check_opencode_config_drift(r, str(tmp_path))
+    assert any("limit.context" in w for w in r.warns), r.warns
+
+
+def test_check_opencode_config_drift_silent_when_absent(tmp_path):
+    """專案沒有 opencode.json 時應該只給 INFO,不 WARN/FAIL。"""
+    r = doc.Result()
+    # No opencode.json anywhere related to this project
+    doc.check_opencode_config_drift(r, str(tmp_path))
+    # info doesn't go to passes/warns/fails; expect no warns/fails
+    # (we may still hit one if repo root or $HOME has one — skip if so)
+    assert not r.fails

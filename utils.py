@@ -12,6 +12,8 @@ from pathlib import Path
 
 from http_client import get_session
 
+import context_budget
+
 from config import (
     OLLAMA_GENERATE_URL, OLLAMA_TAGS_URL, OLLAMA_PS_URL,
     MODEL, NUM_CTX, NUM_CTX_FULL_MODE,
@@ -340,15 +342,29 @@ def print_ctx_usage(chars: int) -> bool:
     return False
 
 
-def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None) -> str:
+def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None,
+             source: str = "generate") -> str:
     """呼叫 LLM 生成回應
 
     Args:
         prompt: 提示詞
         temperature: 溫度參數
         num_ctx: Context 長度，預設使用 NUM_CTX
+        source: 標記呼叫來源（寫入 telemetry，純 metadata）
     """
     ctx = num_ctx if num_ctx is not None else NUM_CTX
+
+    # Context gate：先估算 token、做硬性 gate、紀錄 metadata
+    try:
+        usage = context_budget.check_and_log(
+            source=source,
+            requested_num_ctx=ctx,
+            prompt=prompt,
+            model=MODEL,
+        )
+    except context_budget.ContextOverflowError as exc:
+        return str(exc)
+
     try:
         session = get_session()
         resp = session.post(OLLAMA_GENERATE_URL, json={
@@ -358,8 +374,14 @@ def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None) -> str:
             "options": {"num_ctx": ctx, "temperature": temperature},
         }, timeout=600)
         resp.raise_for_status()
-        return resp.json().get("response", "")
+        data = resp.json()
+        context_budget.parse_usage_from_response(data, usage)
+        context_budget.emit_post_call_line(usage)
+        context_budget.log_metrics(usage)
+        return data.get("response", "")
     except Exception as e:
+        usage.error_type = type(e).__name__
+        context_budget.log_metrics(usage)
         return _llm_error_message(e)
 
 
@@ -394,7 +416,8 @@ def _llm_error_message(e: Exception) -> str:
     return f"[ERROR] LLM 呼叫失敗 ({err_type}): {e}"
 
 
-def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None) -> str:
+def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
+                    source: str = "generate_stream") -> str:
     """呼叫 LLM 生成回應（串流輸出，批次顯示）
 
     改進：批次輸出減少 I/O 開銷，每累積一定字數或遇到換行時才 flush
@@ -403,11 +426,30 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None) 
         prompt: 提示詞
         temperature: 溫度參數
         num_ctx: Context 長度，預設使用 NUM_CTX
+        source: 標記呼叫來源（寫入 telemetry，純 metadata）
     """
     import json as json_module
     import time
 
     ctx = num_ctx if num_ctx is not None else NUM_CTX
+
+    # Context gate：超過 hard threshold 直接拒絕，不送 prompt 給 Ollama
+    try:
+        usage = context_budget.check_and_log(
+            source=source,
+            requested_num_ctx=ctx,
+            prompt=prompt,
+            model=MODEL,
+        )
+    except context_budget.ContextOverflowError as exc:
+        # 與其他 error 一樣，在 stderr 印出讓使用者看到
+        msg = str(exc)
+        try:
+            print(msg, file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        return msg
+
     try:
         session = get_session()
         resp = session.post(OLLAMA_GENERATE_URL, json={
@@ -449,6 +491,9 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None) 
                             buffer_chars = 0
                             last_flush = now
 
+                    # Final chunk usually carries prompt_eval_count/eval_count
+                    context_budget.parse_usage_from_stream_chunk(chunk, usage)
+
                 except json_module.JSONDecodeError:
                     pass
 
@@ -457,9 +502,13 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None) 
             print(''.join(buffer), end="", flush=True)
 
         print()  # 換行
+        context_budget.emit_post_call_line(usage)
+        context_budget.log_metrics(usage)
         return "".join(full_response)
 
     except Exception as e:
+        usage.error_type = type(e).__name__
+        context_budget.log_metrics(usage)
         msg = _llm_error_message(e)
         # 串流模式下要主動 print，否則使用者看不到：等於是「卡住」的觀感。
         # 用 stderr 避免污染呼叫端可能要 capture 的 stdout 內容。

@@ -5,7 +5,7 @@
     "expected": {
       "file": "agent.py",
       "symbol": "run_agent",
-      "line": 459
+      "line": 556
     },
     "context": "."
   },

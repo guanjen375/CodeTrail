@@ -212,6 +212,202 @@ def check_opencode_in_path(r: Result) -> None:
         )
 
 
+# ============================================================
+# Context / offload checks（P2：避免 silent truncation / 速度退化）
+# ============================================================
+def check_context_settings(r: Result) -> None:
+    """印出 CodeTrail-internal 與 Ollama-server 兩條 context 管線的設定,
+    並提示常見錯配。
+
+    這個檢查只看 config + env,不需要連 Ollama,所以也適用 --no-network。
+    """
+    cfg = _read_config()
+    if isinstance(cfg, Exception):
+        return
+
+    num_ctx = int(getattr(cfg, "NUM_CTX", 0) or 0)
+    dyn_on = bool(getattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", False))
+    dyn_min = int(getattr(cfg, "DYNAMIC_NUM_CTX_MIN", 0) or 0)
+    dyn_max = int(getattr(cfg, "DYNAMIC_NUM_CTX_MAX", 0) or 0)
+    reserved = int(getattr(cfg, "RESERVED_OUTPUT_TOKENS", 0) or 0)
+    soft = float(getattr(cfg, "CTX_SOFT_THRESHOLD", 0.80) or 0.80)
+    hard = float(getattr(cfg, "CTX_HARD_THRESHOLD", 0.90) or 0.90)
+    gate_on = bool(getattr(cfg, "CTX_GATE_ENABLED", True))
+
+    r.info(f"AICODE_NUM_CTX={num_ctx}（CodeTrail internal native Ollama call 用）")
+    r.info(
+        f"DYNAMIC_NUM_CTX: enabled={dyn_on} min={dyn_min} max={dyn_max} "
+        "（agent loop 會根據 messages 大小動態壓低 num_ctx,避免占用 VRAM）"
+    )
+    r.info(
+        f"AICODE_RESERVED_OUTPUT_TOKENS={reserved} "
+        f"soft={int(soft*100)}% hard={int(hard*100)}% gate_on={gate_on}"
+    )
+
+    # 常見錯配 1：AICODE_NUM_CTX > DYNAMIC_NUM_CTX_MAX（dynamic 開啟時）
+    if dyn_on and num_ctx > 0 and dyn_max > 0 and num_ctx > dyn_max:
+        r.warn(
+            f"AICODE_NUM_CTX={num_ctx} 比 DYNAMIC_NUM_CTX_MAX={dyn_max} 大;"
+            "dynamic 啟用時實際 internal call 會被 clamp 到 dynamic max。\n"
+            "        要真的用更大的 ctx,請同步調高 DYNAMIC_NUM_CTX_MAX,"
+            "或設 DYNAMIC_NUM_CTX_ENABLED=False。"
+        )
+
+    # 常見錯配 2：hard < soft（人為設錯）
+    if hard < soft:
+        r.warn(
+            f"CTX_HARD_THRESHOLD={hard:.2f} 低於 CTX_SOFT_THRESHOLD={soft:.2f}—"
+            "代表 hard gate 永遠先於 soft warning 觸發,通常不是你要的。"
+        )
+
+    # OLLAMA_CONTEXT_LENGTH（server 層）只有設環境變數時看得到,我們不能
+    # 隔著 process 邊界讀別人的 systemd Environment=;能看的時候給個 hint。
+    server_ctx_env = os.environ.get("OLLAMA_CONTEXT_LENGTH")
+    if server_ctx_env:
+        try:
+            sc = int(server_ctx_env)
+            r.info(f"OLLAMA_CONTEXT_LENGTH={sc}（server 層,影響 OpenCode TUI /v1 路徑）")
+            if num_ctx and sc < num_ctx:
+                r.warn(
+                    f"OLLAMA_CONTEXT_LENGTH={sc} 比 AICODE_NUM_CTX={num_ctx} 小;"
+                    "OpenCode TUI 主對話可能會被 server 端裁掉。建議調高 server context "
+                    "或縮小 CodeTrail num_ctx 對齊。"
+                )
+        except ValueError:
+            r.warn(f"OLLAMA_CONTEXT_LENGTH={server_ctx_env!r} 不是數字")
+    else:
+        r.info(
+            "OLLAMA_CONTEXT_LENGTH 環境變數未設;"
+            "OpenCode TUI 的 server context 由 Ollama 預設值決定(通常 4096-8192)。"
+            "若 TUI 對話被截,請設 OLLAMA_CONTEXT_LENGTH 並 restart ollama。"
+        )
+
+
+def check_ollama_runtime(r: Result, no_network: bool) -> None:
+    """讀 /api/ps,顯示目前載入的模型 + processor split + context。
+
+    處理三種情況:
+      - --no-network 直接 skip
+      - Ollama 不可連 → 已由 check_ollama 報過,這裡 silent skip
+      - Ollama OK 但沒載入任何模型 → INFO
+
+    處理器分裂(CPU/GPU 混合)只 WARN,不 FAIL — 這通常是速度問題,不是
+    正確性問題。但若使用者預設應該 100% GPU 還 split,值得提醒。
+    """
+    if no_network:
+        return
+    cfg = _read_config()
+    if isinstance(cfg, Exception):
+        return
+    base_url = getattr(cfg, "OLLAMA_BASE_URL", "http://localhost:11434")
+    try:
+        import requests  # noqa: F401
+        import requests as _req
+        resp = _req.get(f"{base_url}/api/ps", timeout=3)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return  # check_ollama 已經報過連線問題
+
+    models = data.get("models", []) if isinstance(data, dict) else []
+    if not models:
+        r.info("Ollama 目前沒有載入任何模型(首次呼叫會自動載入)")
+        return
+
+    main_model = str(getattr(cfg, "MODEL", "") or "")
+    for m in models:
+        name = m.get("name", "?")
+        size = m.get("size", 0) or 0
+        size_vram = m.get("size_vram", 0) or 0
+        ctx_size = m.get("context_length") or m.get("context") or "?"
+        gpu_pct = (size_vram / size * 100) if size > 0 else 0.0
+
+        # 把 byte 換成 GB 給人類看
+        size_gb = size / (1024**3) if size else 0.0
+        vram_gb = size_vram / (1024**3) if size_vram else 0.0
+
+        line = (
+            f"ollama ps: {name} size={size_gb:.1f}GB vram={vram_gb:.1f}GB "
+            f"({gpu_pct:.0f}% GPU) ctx={ctx_size}"
+        )
+        if size > 0 and gpu_pct < 99:
+            # CPU/GPU split — 速度警告,不是正確性問題
+            extra = (
+                "        CPU/GPU 混合;首 token 延遲會明顯增加。\n"
+                "        若這是日常 30B/35B 模型,建議:\n"
+                "          1) 確認 OLLAMA_FLASH_ATTENTION=1 + OLLAMA_KV_CACHE_TYPE=q8_0\n"
+                "          2) 降低 OLLAMA_CONTEXT_LENGTH / AICODE_NUM_CTX 讓 KV cache 進 VRAM\n"
+                "          3) 若是 70B Q4 reviewer,split 是正常的"
+            )
+            r.warn(line + "\n" + extra)
+        else:
+            r.ok(line)
+
+        if main_model and name and main_model not in name and name.split(":")[0] != main_model.split(":")[0]:
+            r.info(
+                f"注意:已載入 {name} 與 AICODE_MODEL={main_model} 不同;"
+                "下次 CodeTrail call 會觸發載入"
+            )
+
+
+def check_opencode_config_drift(r: Result, project: str | None) -> None:
+    """看 opencode.json 內 model.limit.context 跟 AICODE_NUM_CTX 是否大致對齊。
+
+    僅 warn,絕不自動改使用者設定。
+    """
+    candidates = []
+    if project:
+        candidates.append(Path(project) / "opencode.json")
+    if os.environ.get("AICODE_ROOT"):
+        candidates.append(Path(os.environ["AICODE_ROOT"]) / "opencode.json")
+    candidates.append(REPO_ROOT / "opencode.json")
+    # 全域設定
+    home = os.environ.get("HOME")
+    if home:
+        candidates.append(Path(home) / ".config" / "opencode" / "opencode.json")
+
+    found = next((p for p in candidates if p.is_file()), None)
+    if not found:
+        r.info("找不到 opencode.json(沒走 OpenCode TUI 路線可忽略)")
+        return
+
+    try:
+        oc = json.loads(found.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        r.warn(f"opencode.json 讀取失敗: {found} — {e}")
+        return
+
+    cfg = _read_config()
+    if isinstance(cfg, Exception):
+        return
+    aicode_num_ctx = int(getattr(cfg, "NUM_CTX", 0) or 0)
+
+    models = oc.get("models") or oc.get("model") or {}
+    if not isinstance(models, dict) or not models:
+        r.info(f"opencode.json={found} — 未設定 models.limit.context,OpenCode 會用內建預設")
+        return
+
+    mismatches = []
+    for model_id, spec in models.items():
+        if not isinstance(spec, dict):
+            continue
+        limit = spec.get("limit") or {}
+        ctx = limit.get("context") if isinstance(limit, dict) else None
+        if isinstance(ctx, int) and aicode_num_ctx and abs(ctx - aicode_num_ctx) > aicode_num_ctx * 0.5:
+            mismatches.append(
+                f"        model={model_id} limit.context={ctx} 與 AICODE_NUM_CTX={aicode_num_ctx} 差距 > 50%"
+            )
+    if mismatches:
+        r.warn(
+            f"opencode.json={found} 與 CodeTrail num_ctx 設定差距大:\n"
+            + "\n".join(mismatches)
+            + "\n        提醒:兩條管線(OpenCode /v1 與 CodeTrail native)各自獨立,"
+              "不會自動同步;手動對齊或接受兩邊的不同。"
+        )
+    else:
+        r.ok(f"opencode.json={found} model limit.context 與 AICODE_NUM_CTX 一致")
+
+
 def check_aicode_root(r: Result, project: str | None) -> None:
     """檢查傳入的 project (或環境變數 AICODE_ROOT) 是否安全。"""
     candidate = project or os.environ.get("AICODE_ROOT")
@@ -358,6 +554,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n-- opencode wrapper --")
     check_opencode_in_path(r)
+
+    print("\n-- context / offload --")
+    check_context_settings(r)
+    check_ollama_runtime(r, no_network=args.no_network)
+    check_opencode_config_drift(r, args.project)
 
     print("\n-- AICODE_ROOT / project --")
     check_aicode_root(r, args.project)

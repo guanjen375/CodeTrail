@@ -49,6 +49,30 @@ fi
 export AICODE_ROOT="$ROOT"
 echo "[aicode] AICODE_ROOT=$AICODE_ROOT"
 
+# Surface the two-context-pipeline distinction so users know which knob
+# controls what. AICODE_NUM_CTX only affects CodeTrail-internal Ollama
+# native /api/chat | /api/generate calls (agent loop, RAG-related prompts).
+# OpenCode TUI uses Ollama /v1 (OpenAI-compatible), whose effective context
+# is determined by Ollama's OLLAMA_CONTEXT_LENGTH server setting + the
+# OpenCode model limit.context value — neither of which AICODE_NUM_CTX
+# can override.
+if [ -n "${AICODE_MODEL:-}" ]; then
+  echo "[aicode] AICODE_MODEL=${AICODE_MODEL}"
+fi
+if [ -n "${AICODE_NUM_CTX:-}" ]; then
+  echo "[aicode] AICODE_NUM_CTX=${AICODE_NUM_CTX} (CodeTrail internal calls only)"
+fi
+if [ -n "${AICODE_RESERVED_OUTPUT_TOKENS:-}" ]; then
+  echo "[aicode] AICODE_RESERVED_OUTPUT_TOKENS=${AICODE_RESERVED_OUTPUT_TOKENS}"
+fi
+if [ -n "${OLLAMA_CONTEXT_LENGTH:-}" ]; then
+  echo "[aicode] OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH} (server-side, affects OpenCode TUI /v1)"
+fi
+echo "[aicode] NOTE: AICODE_NUM_CTX controls CodeTrail native Ollama calls."
+echo "         OpenCode TUI uses /v1 + model limit.context + OLLAMA_CONTEXT_LENGTH."
+echo "         Check loaded model size/ctx with: ollama ps"
+echo "         CodeTrail context overflow attempts are logged to .codetrail/context_metrics.jsonl"
+
 # If AICODE_MODEL is set, propagate it to OpenCode's --model flag so the
 # TUI conversation defaults to the same model the MCP server uses. Users
 # can still override with an explicit -m/--model in their own args.

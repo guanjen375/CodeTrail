@@ -11,6 +11,8 @@ from pathlib import Path
 from http_client import get_session
 
 import config
+import context_budget
+import trim as trim_module
 from config import (
     OLLAMA_CHAT_URL, MODEL, NUM_CTX,
     DYNAMIC_NUM_CTX_ENABLED, DYNAMIC_NUM_CTX_MIN, DYNAMIC_NUM_CTX_MAX,
@@ -58,16 +60,108 @@ def _compute_dynamic_num_ctx(messages: list) -> int:
     return target_ctx
 
 
+def _pre_send_trim_if_needed(messages: list, num_ctx: int, tools: list,
+                             source: str) -> tuple[context_budget.ContextUsage, dict]:
+    """Estimate context use; if at/above soft threshold, run an aggressive
+    trim pass to try to stay below the hard threshold.
+
+    Returns (usage, trim_summary_dict). On hard overflow, the caller is still
+    responsible for calling enforce_gate() — we do not raise here.
+    """
+    trim_summary: dict = {}
+
+    usage = context_budget.build_usage(
+        source=source,
+        requested_num_ctx=num_ctx,
+        messages=messages,
+        tools=tools,
+        model=MODEL,
+    )
+
+    # Below soft threshold: nothing to do.
+    if not (usage.soft_warning or usage.hard_overflow):
+        return usage, trim_summary
+
+    # Aggressive pre-send trim. Compute a char budget consistent with the
+    # current num_ctx, leaving room for reserved output. We translate the
+    # token budget back to chars via CHARS_PER_TOKEN so trim.py stays
+    # token-agnostic.
+    cpt = float(getattr(config, "CHARS_PER_TOKEN", 3.5) or 3.5)
+    reserved = int(getattr(config, "RESERVED_OUTPUT_TOKENS", 4096) or 0)
+    hard = float(getattr(config, "CTX_HARD_THRESHOLD", 0.90) or 0.90)
+    soft = float(getattr(config, "CTX_SOFT_THRESHOLD", 0.80) or 0.80)
+    # Target staying below the *soft* threshold after trim so we don't oscillate.
+    target_input_tokens = max(0, int(soft * num_ctx) - reserved)
+    target_chars = int(target_input_tokens * cpt)
+    if target_chars < 1000:
+        target_chars = 1000  # never trim below something usable
+
+    print(
+        f"[CTX] pre-send trim engaged (use={usage.utilization_pct:.0f}% >= "
+        f"soft={int(soft*100)}%); targeting {target_chars} chars of messages",
+        flush=True,
+    )
+    _, ts = trim_module.trim_messages(messages, budget=target_chars)
+    trim_summary = ts.to_dict()
+    _LAST_TRIM_SUMMARY.clear()
+    _LAST_TRIM_SUMMARY.update(trim_summary)
+
+    # Re-evaluate after trim.
+    usage = context_budget.build_usage(
+        source=source,
+        requested_num_ctx=num_ctx,
+        messages=messages,
+        tools=tools,
+        model=MODEL,
+        did_trim=True,
+        trim_summary=trim_summary,
+    )
+    if usage.hard_overflow:
+        print(
+            f"[CTX] WARNING trim could not bring use below hard={int(hard*100)}%; "
+            f"now use={usage.utilization_pct:.0f}%",
+            flush=True,
+        )
+    elif usage.soft_warning:
+        print(
+            f"[CTX] trimmed to use={usage.utilization_pct:.0f}% "
+            f"(summarized={ts.summarized_tool_outputs} truncated={ts.truncated_tool_outputs})",
+            flush=True,
+        )
+    else:
+        print(
+            f"[CTX] trim brought use under soft threshold: {usage.utilization_pct:.0f}%",
+            flush=True,
+        )
+    return usage, trim_summary
+
+
 def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
     """呼叫 LLM（帶工具）"""
     num_ctx = _compute_dynamic_num_ctx(messages)
+    tools = get_native_tools()
+
+    # Context gate：先估算,若觸發 soft 則先做一輪 aggressive trim;最後 hard 拒絕
+    usage, trim_summary = _pre_send_trim_if_needed(messages, num_ctx, tools, "agent_tools")
+    if not trim_summary:
+        # 沒有 pre-send trim,記入上一次 batch-trim 的 summary(若有)
+        trim_summary = _last_trim_summary()
+    if trim_summary:
+        usage.did_trim = True
+        usage.trim_summary = trim_summary
+    context_budget.emit_pre_call_lines(usage)
+    try:
+        context_budget.enforce_gate(usage)
+    except context_budget.ContextOverflowError as exc:
+        context_budget.log_metrics(usage)
+        return {"content": str(exc), "tool_calls": [], "done_reason": "error"}
 
     try:
         session = get_session()
         resp = session.post(OLLAMA_CHAT_URL, json={
             "model": MODEL,
             "messages": messages,
-            "tools": get_native_tools(),
+            "tools": tools,
             "stream": False,
             "options": {"num_ctx": num_ctx, "temperature": temperature},
         }, timeout=600)
@@ -77,10 +171,15 @@ def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
         # 檢查 Ollama 錯誤（如模型不存在）
         if "error" in data:
             error_msg = data["error"]
+            usage.error_type = "ollama_error"
+            context_budget.log_metrics(usage)
             print(f"[ERROR] Ollama 錯誤: {error_msg}")
             return {"content": f"[ERROR] Ollama 錯誤: {error_msg}", "tool_calls": [], "done_reason": "error"}
 
         message = data.get("message", {})
+        context_budget.parse_usage_from_response(data, usage)
+        context_budget.emit_post_call_line(usage)
+        context_budget.log_metrics(usage)
 
         return {
             "content": message.get("content", ""),
@@ -89,6 +188,8 @@ def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
         }
     except Exception as e:
         err_type = type(e).__name__
+        usage.error_type = err_type
+        context_budget.log_metrics(usage)
         if "ConnectionError" in err_type:
             return {"content": "[ERROR] 無法連接 Ollama", "tool_calls": [], "done_reason": "error"}
         elif "Timeout" in err_type:
@@ -109,13 +210,27 @@ def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
     import time
 
     num_ctx = _compute_dynamic_num_ctx(messages)
+    tools = get_native_tools()
+
+    usage, trim_summary = _pre_send_trim_if_needed(messages, num_ctx, tools, "agent_tools_stream")
+    if not trim_summary:
+        trim_summary = _last_trim_summary()
+    if trim_summary:
+        usage.did_trim = True
+        usage.trim_summary = trim_summary
+    context_budget.emit_pre_call_lines(usage)
+    try:
+        context_budget.enforce_gate(usage)
+    except context_budget.ContextOverflowError as exc:
+        context_budget.log_metrics(usage)
+        return str(exc)
 
     try:
         session = get_session()
         resp = session.post(OLLAMA_CHAT_URL, json={
             "model": MODEL,
             "messages": messages,
-            "tools": get_native_tools(),
+            "tools": tools,
             "stream": True,
             "options": {"num_ctx": num_ctx, "temperature": temperature},
         }, timeout=600, stream=True)
@@ -152,6 +267,8 @@ def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
                             buffer_chars = 0
                             last_flush = now
 
+                    context_budget.parse_usage_from_stream_chunk(chunk, usage)
+
                 except json.JSONDecodeError:
                     pass
 
@@ -159,10 +276,14 @@ def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
             print(''.join(buffer), end="", flush=True)
 
         print()
+        context_budget.emit_post_call_line(usage)
+        context_budget.log_metrics(usage)
         return "".join(full_response)
 
     except Exception as e:
         err_type = type(e).__name__
+        usage.error_type = err_type
+        context_budget.log_metrics(usage)
         if "ConnectionError" in err_type:
             return "[ERROR] 無法連接 Ollama"
         elif "Timeout" in err_type:
@@ -210,69 +331,32 @@ def _get_tool_priority(messages: list, tool_idx: int) -> int:
 
 
 def _trim_messages_to_budget(messages: list, budget: int = MAX_MESSAGES_BUDGET) -> tuple[list, bool]:
-    """裁切 messages 使其總大小不超過預算
+    """裁切 messages 使其總大小不超過預算（P1：委派給 trim.py，加入明確 marker）
 
     Returns:
         tuple: (messages, did_trim) - messages 和是否發生了裁切
     """
-    if _calc_messages_size(messages) <= budget:
-        return messages, False
+    _, summary = trim_module.trim_messages(messages, budget=budget)
+    did = bool(summary.summarized_tool_outputs or summary.truncated_tool_outputs)
+    # 把詳細 metadata 存到 message list 上,讓 LLM call site 拿來附到 ContextUsage。
+    # 用一個獨立屬性,不污染 messages 內容。
+    try:
+        messages.__dict__["_trim_summary"] = summary.to_dict()  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass  # list 本身沒有 __dict__,改用 module-level 暫存
+    _LAST_TRIM_SUMMARY.clear()
+    _LAST_TRIM_SUMMARY.update(summary.to_dict())
+    return messages, did
 
-    if len(messages) <= 2:
-        return messages, False
 
-    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+# Module-level holder so the LLM call sites can read the most-recent trim
+# summary without us threading it through call_llm_with_tools()'s public
+# signature. Single-threaded agent loops so a simple dict is fine.
+_LAST_TRIM_SUMMARY: dict = {}
 
-    if not tool_indices:
-        return messages, False
 
-    num_to_summarize = max(0, len(tool_indices) - MIN_RECENT_TOOL_OUTPUTS)
-
-    if num_to_summarize == 0:
-        for i in tool_indices:
-            priority = _get_tool_priority(messages, i)
-            content = messages[i].get("content", "")
-            if priority == 3 and len(content) > 300:
-                messages[i]["content"] = content[:250] + f"\n... [截斷 {len(content) - 250} 字元]"
-            elif priority == 2 and len(content) > 500:
-                messages[i]["content"] = content[:400] + f"\n... [截斷 {len(content) - 400} 字元]"
-            elif priority == 1 and len(content) > 800:
-                messages[i]["content"] = content[:700] + f"\n... [截斷 {len(content) - 700} 字元]"
-        return messages, True
-
-    summarize_candidates = tool_indices[:num_to_summarize]
-    summarize_candidates.sort(key=lambda i: -_get_tool_priority(messages, i))
-
-    for idx in summarize_candidates:
-        priority = _get_tool_priority(messages, idx)
-        content = messages[idx].get("content", "")
-        if priority == 3:
-            if len(content) > 100:
-                messages[idx]["content"] = content[:80] + f"\n... [舊輸出已摘要，原 {len(content)} 字元]"
-        elif priority == 2:
-            if len(content) > 200:
-                messages[idx]["content"] = content[:150] + f"\n... [舊輸出已摘要，原 {len(content)} 字元]"
-        else:
-            if len(content) > 400:
-                messages[idx]["content"] = content[:350] + f"\n... [舊輸出已摘要，原 {len(content)} 字元]"
-
-    while _calc_messages_size(messages) > budget and tool_indices:
-        low_priority = [i for i in tool_indices if _get_tool_priority(messages, i) == 3]
-        mid_priority = [i for i in tool_indices if _get_tool_priority(messages, i) == 2]
-        high_priority = [i for i in tool_indices if _get_tool_priority(messages, i) == 1]
-
-        candidates = low_priority if low_priority else (mid_priority if mid_priority else high_priority)
-        if not candidates:
-            break
-
-        max_idx = max(candidates, key=lambda i: len(messages[i].get("content", "")))
-        content = messages[max_idx].get("content", "")
-        if len(content) > 100:
-            messages[max_idx]["content"] = content[:80] + f"\n... [超預算截斷，原 {len(content)} 字元]"
-        else:
-            tool_indices.remove(max_idx)
-
-    return messages, True
+def _last_trim_summary() -> dict:
+    return dict(_LAST_TRIM_SUMMARY)
 
 
 # ============================================================

@@ -331,6 +331,105 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/mnt/share
 
 ---
 
+## 3.2 Context、Offload 與 Silent Truncation
+
+模型「看不到」想看到的內容，有兩種完全不同的原因，常常被混在一起談：
+
+| 現象 | 是什麼問題 | 怎麼看出來 |
+|---|---|---|
+| **Context overflow**（爆 ctx）| **正確性問題**。Prompt 比模型 context 還大,後面被裁掉,模型實際上沒讀到。 | CodeTrail 的 `[CTX]` log、`.codetrail/context_metrics.jsonl`、`[CTX_OVERFLOW]` 錯誤訊息 |
+| **Offload**（CPU/GPU split）| **速度問題**。權重或 KV cache 被放到 RAM 而不是 VRAM,首 token 延遲拉長,但內容看得到。 | `ollama ps` 的 `PROCESSOR` 欄;只看這個 **無法** 判斷有沒有 ctx overflow |
+
+**只看 `ollama ps` 不會發現 prompt overflow** — `ollama ps` 報告的是模型權重和 KV cache 的擺放位置,跟使用者送進去的 prompt 大小無關。CodeTrail 自己會在送 prompt 前估算大小,觸發三個機制:
+
+- 使用率低於 ~25% → 安靜過;
+- 80–90% → 印 `[CTX] WARNING use=...%; consider trimming...`;
+- ≥ 90% → 印 `[CTX_OVERFLOW] ... Refusing to send to avoid silent truncation.`,**不會** 把 prompt 送出去。
+
+每次呼叫的 metadata(model、效能數據、是否裁切等,**不含 prompt 內容**)會寫進 `.codetrail/context_metrics.jsonl`,已被 `.gitignore` 涵蓋。
+
+### 兩條獨立的 context 管線
+
+CodeTrail 與 OpenCode TUI 用兩條不同的 Ollama 路徑,context 設定**不會自動同步**:
+
+| 路徑 | 用什麼控制 context | 影響什麼 |
+|---|---|---|
+| CodeTrail 內部 native call(`/api/generate` / `/api/chat`)| `AICODE_NUM_CTX` + `DYNAMIC_NUM_CTX_MIN/MAX` | RAG strict 模式、agent 工具迴圈、`query_knowledge_strict` |
+| OpenCode TUI 主對話(走 Ollama `/v1` OpenAI-compatible)| Ollama server 的 `OLLAMA_CONTEXT_LENGTH` + OpenCode `model.limit.context` | 你在 TUI 裡 chat 看到的那個對話本身 |
+
+要讓 OpenCode TUI 的 context 真的變大,光改 `AICODE_NUM_CTX` 是不夠的:server 端也要設,而且要 restart Ollama 才會生效。
+
+```bash
+OLLAMA_CONTEXT_LENGTH=65536 \
+OLLAMA_FLASH_ATTENTION=1 \
+OLLAMA_KV_CACHE_TYPE=q8_0 \
+OLLAMA_NUM_PARALLEL=1 \
+ollama serve
+```
+
+systemd 版本:
+
+```bash
+sudo systemctl edit ollama.service
+```
+
+```
+[Service]
+Environment="OLLAMA_CONTEXT_LENGTH=65536"
+Environment="OLLAMA_FLASH_ATTENTION=1"
+Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
+Environment="OLLAMA_NUM_PARALLEL=1"
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+ollama ps
+```
+
+### 三種典型啟動組合
+
+```bash
+# 日常 35B(穩、快、夠用)
+AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_NUM_CTX=32768 aicode
+
+# 深度 35B(要看比較長的 context,速度會慢一點)
+AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_NUM_CTX=65536 aicode
+
+# 70B Q4 當 reviewer(慢但精準;不適合快速 agent loop)
+AICODE_MODEL=<70B-Q4-model> AICODE_NUM_CTX=16384 aicode
+```
+
+`ollama ps` 看 `PROCESSOR`:
+
+- `100% GPU` → 速度正常。
+- `xx% CPU / xx% GPU` → 速度退化但內容完整。日常 30B/35B 出現這個就把 `AICODE_NUM_CTX` / `OLLAMA_CONTEXT_LENGTH` 調小,或檢查 `OLLAMA_FLASH_ATTENTION=1` 跟 `OLLAMA_KV_CACHE_TYPE=q8_0`。70B Q4 split 是預期行為,不用追求 100% GPU。
+
+如果看到 CodeTrail 印 `[CTX_OVERFLOW]`,就是**正確性問題**了,要做的事:
+
+- 縮小問題範圍,把任務拆成多步;
+- 工具呼叫指定 `path` + `start/end_line`,不要一次 dump 整個檔案;
+- 降低 RAG 的 `KNOWLEDGE_TOP_K`,讓 query 更具體;
+- 設定 `AICODE_RESERVED_OUTPUT_TOKENS=2048`(若你只需要短回答);
+- 確認 `AICODE_NUM_CTX` 並沒有比 `DYNAMIC_NUM_CTX_MAX` 大(否則實際只用後者)。
+
+可以調整的 env vars:
+
+| Env var | 預設 | 作用 |
+|---|---|---|
+| `AICODE_NUM_CTX` | 131072 | CodeTrail internal call 的最大 ctx(會被 dynamic max clamp)|
+| `AICODE_RESERVED_OUTPUT_TOKENS` | 4096 | 估算時保留給輸出的 token,影響 gate 觸發點 |
+| `AICODE_CTX_SOFT_THRESHOLD` | 0.80 | 印 WARN 的使用率門檻 |
+| `AICODE_CTX_HARD_THRESHOLD` | 0.90 | 拒絕送出的使用率門檻 |
+| `AICODE_CTX_GATE_ENABLED` | 1 | 設 0 可暫時關閉硬性 gate(僅供除錯)|
+| `AICODE_CTX_METRICS_ENABLED` | 1 | 是否寫 telemetry |
+| `AICODE_CTX_METRICS_PATH` | `.codetrail/context_metrics.jsonl` | telemetry 路徑 |
+| `OLLAMA_CONTEXT_LENGTH` | (Ollama 預設)| Ollama server 層,影響 OpenCode TUI 主對話 |
+
+`scripts/doctor.py` 會自動檢查上面這些設定是否相互打架,以及 `ollama ps` 上的模型是否 CPU/GPU split。任何錯配都會印 `[WARN]`,但**不會** 自動改動使用者的設定。
+
+---
+
 ## 4. 重點教學
 
 啟動 aicode 進到對話之後，最常碰到兩件事：

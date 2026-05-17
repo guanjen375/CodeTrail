@@ -41,6 +41,10 @@ knowledge_emb.npz
 data/
 *.jsonl
 
+# Context budget / telemetry（只記 token/char count + 模型設定 metadata，
+# 不含 prompt 或文件內容，但仍視為私有遙測資料，勿提交）
+.codetrail/
+
 # 備份檔案
 *.orig
 *.bak
