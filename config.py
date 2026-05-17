@@ -42,9 +42,15 @@ NUM_CTX_FULL_MODE = NUM_CTX
 # ============================================================
 # 根據 prompt 長度動態調整 context 大小，減少不必要的記憶體佔用和延遲
 # 1 token ≈ 3-4 chars（粗估）
+#
+# 為什麼有 AICODE_DYNAMIC_NUM_CTX_MAX 而不是直接用 AICODE_NUM_CTX:
+#   dynamic 開啟時(預設),每次 call 的真實上限由 DYNAMIC_NUM_CTX_MAX 決定,
+#   NUM_CTX 只在 dynamic 關閉時當 fallback 用。早期的 AICODE_NUM_CTX 看起來
+#   像是「主上限」其實大多時候沒效,造成使用者調了卻沒感覺。新名稱讓
+#   「調 env var = 真的改上限」這件事語意一致。
 DYNAMIC_NUM_CTX_ENABLED = True
 DYNAMIC_NUM_CTX_MIN = 16384      # 最小 16K
-DYNAMIC_NUM_CTX_MAX = 65536      # 最大 64K（速度優先：128K->64K）
+DYNAMIC_NUM_CTX_MAX = int(_os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX", "65536"))
 DYNAMIC_NUM_CTX_BUFFER = 1.3     # 預留空間給回答（GPT建議: 1.5->1.3）
 CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
 

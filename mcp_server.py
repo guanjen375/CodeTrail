@@ -135,6 +135,16 @@ _log(
     + (f" (AICODE_MODEL override, default={config.DEFAULT_MODEL})"
        if config.MODEL != config.DEFAULT_MODEL else " (default)")
 )
+
+# Warn if user set AICODE_NUM_CTX expecting it to cap per-call context, but
+# dynamic mode (the default) ignores it and uses DYNAMIC_NUM_CTX_MAX instead.
+# This is a common bashrc-level misconfiguration that silently does nothing.
+if os.environ.get("AICODE_NUM_CTX") and config.DYNAMIC_NUM_CTX_ENABLED:
+    _log(
+        f"[MCP] WARN: AICODE_NUM_CTX={config.NUM_CTX} 在 dynamic mode 下不影響"
+        f"per-call 上限;實際上限由 DYNAMIC_NUM_CTX_MAX={config.DYNAMIC_NUM_CTX_MAX} "
+        "決定。要真的改上限請設 AICODE_DYNAMIC_NUM_CTX_MAX。"
+    )
 # knowledge.json 綁 AICODE_ROOT,不依賴 cwd
 _kb_path = str(Path(AICODE_ROOT) / KNOWLEDGE_FILE)
 _log(f"[MCP] 載入 KnowledgeBase ({_kb_path}) ...")

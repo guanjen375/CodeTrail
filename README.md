@@ -234,14 +234,18 @@ AICODE_MODEL=qwen3-coder:30b aicode
 
 OpenCode 右下角的選擇主要管整個對話和工具決策；`AICODE_MODEL` 額外影響 CodeTrail 內部少數需要直接呼叫 Ollama 的流程（主要是 `query_knowledge_strict`）。通常兩邊用同一顆比較好排查。
 
-換成 35B 級的模型時，第一次跑建議搭配比較小的 `AICODE_NUM_CTX`。模型本身的權重就佔掉一大塊顯卡記憶體，如果 context 開太大，剩下的空間不夠用，模型會被自動拆一部分放到一般記憶體跑，速度會變很慢。
+> ⚠️ **不要在 TUI 內按 `/models` 換模型**。`/models` 只會換 OpenCode 對話那邊那顆,**不會通知 MCP server**,後者仍然用 `AICODE_MODEL` 啟動時的那顆跑 RAG / `query_knowledge_strict`。兩邊不一致時 Ollama 會反覆 swap 模型進 VRAM,首 token 延遲明顯變高,而且不會有任何錯誤訊息提示這件事。
+>
+> **要換模型的正確流程**:退出 `aicode` → 改 `AICODE_MODEL` 環境變數 → 重新啟動 `aicode`。這樣 launcher 會把 OpenCode 跟 MCP server 兩邊一起對齊。
+
+換成 35B 級的模型時，第一次跑建議搭配比較小的 `AICODE_DYNAMIC_NUM_CTX_MAX`。模型本身的權重就佔掉一大塊顯卡記憶體，如果 context 開太大，剩下的空間不夠用，模型會被自動拆一部分放到一般記憶體跑，速度會變很慢。
 
 ```bash
 # 第一次跑 35B：把 context 開到 32K
-AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_NUM_CTX=32768 aicode
+AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
 
 # 用一陣子確定沒問題，再升到 64K
-AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_NUM_CTX=65536 aicode
+AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_DYNAMIC_NUM_CTX_MAX=65536 aicode
 ```
 
 啟動前可以先確認模型已經下載完成，並看一下載入位置：
@@ -391,19 +395,19 @@ ollama ps
 
 ```bash
 # 日常 35B(穩、快、夠用)
-AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_NUM_CTX=32768 aicode
+AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
 
 # 深度 35B(要看比較長的 context,速度會慢一點)
-AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_NUM_CTX=65536 aicode
+AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_DYNAMIC_NUM_CTX_MAX=65536 aicode
 
 # 70B Q4 當 reviewer(慢但精準;不適合快速 agent loop)
-AICODE_MODEL=<70B-Q4-model> AICODE_NUM_CTX=16384 aicode
+AICODE_MODEL=<70B-Q4-model> AICODE_DYNAMIC_NUM_CTX_MAX=16384 aicode
 ```
 
 `ollama ps` 看 `PROCESSOR`:
 
 - `100% GPU` → 速度正常。
-- `xx% CPU / xx% GPU` → 速度退化但內容完整。日常 30B/35B 出現這個就把 `AICODE_NUM_CTX` / `OLLAMA_CONTEXT_LENGTH` 調小,或檢查 `OLLAMA_FLASH_ATTENTION=1` 跟 `OLLAMA_KV_CACHE_TYPE=q8_0`。70B Q4 split 是預期行為,不用追求 100% GPU。
+- `xx% CPU / xx% GPU` → 速度退化但內容完整。日常 30B/35B 出現這個就把 `AICODE_DYNAMIC_NUM_CTX_MAX`(dynamic 模式下真正生效的上限)/ `OLLAMA_CONTEXT_LENGTH` 調小,或檢查 `OLLAMA_FLASH_ATTENTION=1` 跟 `OLLAMA_KV_CACHE_TYPE=q8_0`。70B Q4 split 是預期行為,不用追求 100% GPU。
 
 如果看到 CodeTrail 印 `[CTX_OVERFLOW]`,就是**正確性問題**了,要做的事:
 
@@ -411,13 +415,14 @@ AICODE_MODEL=<70B-Q4-model> AICODE_NUM_CTX=16384 aicode
 - 工具呼叫指定 `path` + `start/end_line`,不要一次 dump 整個檔案;
 - 降低 RAG 的 `KNOWLEDGE_TOP_K`,讓 query 更具體;
 - 設定 `AICODE_RESERVED_OUTPUT_TOKENS=2048`(若你只需要短回答);
-- 確認 `AICODE_NUM_CTX` 並沒有比 `DYNAMIC_NUM_CTX_MAX` 大(否則實際只用後者)。
+- 確認你改的是 `AICODE_DYNAMIC_NUM_CTX_MAX`(dynamic 啟用時真正的上限),`AICODE_NUM_CTX` 在這個模式下不影響 per-call ctx。
 
 可以調整的 env vars:
 
 | Env var | 預設 | 作用 |
 |---|---|---|
-| `AICODE_NUM_CTX` | 131072 | CodeTrail internal call 的最大 ctx(會被 dynamic max clamp)|
+| `AICODE_DYNAMIC_NUM_CTX_MAX` | 65536 | **動態 ctx 上限**。dynamic 開啟(預設)時,真正的 per-call ctx 上限,要調 ctx 改這個 |
+| `AICODE_NUM_CTX` | 131072 | dynamic **關閉**時的 fallback 上限;dynamic 開啟時只影響 banner 顯示,不影響實際 per-call ctx |
 | `AICODE_RESERVED_OUTPUT_TOKENS` | 4096 | 估算時保留給輸出的 token,影響 gate 觸發點 |
 | `AICODE_CTX_SOFT_THRESHOLD` | 0.80 | 印 WARN 的使用率門檻 |
 | `AICODE_CTX_HARD_THRESHOLD` | 0.90 | 拒絕送出的使用率門檻 |
@@ -740,7 +745,7 @@ batch size 上限是 32 (REF1)。
 | 模型 | 建議用途 | 優點 | 注意事項 |
 |---|---|---|---|
 | `qwen3-coder:30b` | 預設主力；讀 repo、改 code、產 patch、跑驗證閉環 | coding 能力和工具使用穩定度最均衡；適合作為日常預設 | 比 20B 模型慢；長工具鏈任務建議拆成「先查證、再修改」 |
-| `qwen3.6:35b-a3b-q4_K_M` | 跨檔推理、規格 vs 實作比對、較複雜重構 | 推理上限較高；大 context 任務表現較好 | 顯卡 32GB 的話第一次跑先設 `AICODE_NUM_CTX=32768`，用一陣子沒問題再升到 `65536`。**不要**用 `qwen3.6:35b-a3b-coding-nvfp4`（macOS 限定的版本，Linux 拉會報錯 412） |
+| `qwen3.6:35b-a3b-q4_K_M` | 跨檔推理、規格 vs 實作比對、較複雜重構 | 推理上限較高；大 context 任務表現較好 | 顯卡 32GB 的話第一次跑先設 `AICODE_DYNAMIC_NUM_CTX_MAX=32768`，用一陣子沒問題再升到 `65536`。**不要**用 `qwen3.6:35b-a3b-coding-nvfp4`（macOS 限定的版本，Linux 拉會報錯 412） |
 | `devstral:24b` | 快速 code review、找 bug、簡單 patch | 速度和 coding 能力平衡；回答通常直接 | 工具呼叫格式不一定比 Qwen Coder 穩；大型修改前建議切回 Qwen |
 | `gpt-oss:20b` | 快速理解陌生 repo、摘要、初步定位 | 輕量、啟動快、硬體壓力低 | 複雜改檔與長工具鏈較弱；適合探索，不適合作為最終 patch 主力 |
 | `qwen3-vl:30b-a3b` | `analyze_file(...)` 處理截圖、UI error；`ingest_document(...)` 把圖片切 chunk 進 KB 也用它 | 讀圖中文字與畫面資訊較好 | 不是主要 coding model；不分析圖片、也不把圖片進 KB 就不用 pull |
@@ -756,14 +761,16 @@ batch size 上限是 32 (REF1)。
 
 Context 建議：
 
-`AICODE_NUM_CTX` 控制每次能塞給模型的文字量上限（單位是 token，1 token 大約 3–4 個字元）。值越大可以一次給越多檔案內容或對話歷史，但模型在 VRAM 裡要額外佔的空間也越大。
+`AICODE_DYNAMIC_NUM_CTX_MAX` 控制每次能塞給模型的文字量上限（單位是 token，1 token 大約 3–4 個字元）。值越大可以一次給越多檔案內容或對話歷史，但模型在 VRAM 裡要額外佔的空間也越大。
+
+> 註：早期文件叫使用者調 `AICODE_NUM_CTX`，但那個變數在 dynamic mode 開啟（預設）時只是 banner 顯示與 dynamic-off fallback，不會真正影響 per-call ctx。要實際改上限請用 `AICODE_DYNAMIC_NUM_CTX_MAX`。
 
 ```bash
 # 30B 以下模型：直接 64K 通常最穩
-AICODE_NUM_CTX=65536 aicode
+AICODE_DYNAMIC_NUM_CTX_MAX=65536 aicode
 
 # 35B 級的模型（如 qwen3.6:35b-a3b-q4_K_M）：先用 32K 跑一次，確認沒問題再升
-AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_NUM_CTX=32768 aicode
+AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
 ```
 
 判斷要不要升上去：

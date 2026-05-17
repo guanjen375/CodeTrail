@@ -53,6 +53,19 @@ from remote import parse_mcp_uri, RemoteToolExecutor, run_mcp_agent
 from data_flywheel import record_interaction, DATA_COLLECT_ENABLED
 
 
+def _warn_aicode_num_ctx_no_op() -> None:
+    """Print a one-line warning if user set AICODE_NUM_CTX but dynamic mode is
+    on (the default) — in that case AICODE_NUM_CTX does NOT cap per-call ctx,
+    DYNAMIC_NUM_CTX_MAX does. Common bashrc misconfiguration that silently
+    does nothing."""
+    if os.environ.get("AICODE_NUM_CTX") and config.DYNAMIC_NUM_CTX_ENABLED:
+        print(
+            f"[CTX] WARN: AICODE_NUM_CTX={config.NUM_CTX} 在 dynamic mode 下無效;"
+            f"實際上限 = DYNAMIC_NUM_CTX_MAX={config.DYNAMIC_NUM_CTX_MAX}。"
+            "要真的改上限請設 AICODE_DYNAMIC_NUM_CTX_MAX。"
+        )
+
+
 def run_qa_mode(question: str, kb: "KnowledgeBase", qa_history: list = None):
     """QA 模式：不掃專案、不建 Code RAG，直接問答
 
@@ -414,6 +427,7 @@ def main():
         gpu_ok, gpu_status = check_ollama_gpu()
         print(f"[AI] 模型: {MODEL}")
         print(f"[CTX] Context: {NUM_CTX:,} tokens")
+        _warn_aicode_num_ctx_no_op()
         print(gpu_status)
 
         # 載入知識庫（可選）
@@ -502,6 +516,7 @@ def main():
         gpu_ok, gpu_status = check_ollama_gpu()
         print(f"[AI] 模型: {MODEL}")
         print(f"[CTX] Context: {NUM_CTX:,} tokens")
+        _warn_aicode_num_ctx_no_op()
         print(gpu_status)
 
         # 載入本地知識庫（唯一可搭配 MCP 的功能）
@@ -625,6 +640,7 @@ def main():
     gpu_ok, gpu_status = check_ollama_gpu()
     print(f"\n[AI] 模型: {MODEL}")
     print(f"[CTX] Context: {NUM_CTX:,} tokens")
+    _warn_aicode_num_ctx_no_op()
     print(gpu_status)
 
     # 資料收集模式提示

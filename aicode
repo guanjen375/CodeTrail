@@ -60,7 +60,10 @@ if [ -n "${AICODE_MODEL:-}" ]; then
   echo "[aicode] AICODE_MODEL=${AICODE_MODEL}"
 fi
 if [ -n "${AICODE_NUM_CTX:-}" ]; then
-  echo "[aicode] AICODE_NUM_CTX=${AICODE_NUM_CTX} (CodeTrail internal calls only)"
+  echo "[aicode] AICODE_NUM_CTX=${AICODE_NUM_CTX} (僅在 dynamic 關閉時當 fallback 上限;dynamic 開啟時不影響 per-call ctx)"
+fi
+if [ -n "${AICODE_DYNAMIC_NUM_CTX_MAX:-}" ]; then
+  echo "[aicode] AICODE_DYNAMIC_NUM_CTX_MAX=${AICODE_DYNAMIC_NUM_CTX_MAX} (dynamic 模式真正生效的 per-call ctx 上限)"
 fi
 if [ -n "${AICODE_RESERVED_OUTPUT_TOKENS:-}" ]; then
   echo "[aicode] AICODE_RESERVED_OUTPUT_TOKENS=${AICODE_RESERVED_OUTPUT_TOKENS}"
@@ -68,10 +71,22 @@ fi
 if [ -n "${OLLAMA_CONTEXT_LENGTH:-}" ]; then
   echo "[aicode] OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH} (server-side, affects OpenCode TUI /v1)"
 fi
-echo "[aicode] NOTE: AICODE_NUM_CTX controls CodeTrail native Ollama calls."
-echo "         OpenCode TUI uses /v1 + model limit.context + OLLAMA_CONTEXT_LENGTH."
+echo "[aicode] NOTE: 要調 CodeTrail native Ollama call 的 per-call ctx 上限,改 AICODE_DYNAMIC_NUM_CTX_MAX。"
+echo "         OpenCode TUI 走 /v1,context 由 model limit.context + OLLAMA_CONTEXT_LENGTH 決定。"
 echo "         Check loaded model size/ctx with: ollama ps"
 echo "         CodeTrail context overflow attempts are logged to .codetrail/context_metrics.jsonl"
+
+# Pitfall warning: /models in TUI silently desyncs from MCP server's background
+# model. There's no MCP hook to propagate the switch, so RAG/strict tools keep
+# using AICODE_MODEL while the conversation uses something else — Ollama ends
+# up swapping two models in/out of VRAM, latency spikes, and the user has no
+# idea why. Surface this once at launch so non-experts don't fall into it.
+echo "[aicode] TIP: 換模型請退出後改 AICODE_MODEL 再重新啟動 aicode。"
+echo "         在 TUI 內按 /models 只會換對話那顆,背景 RAG / query_knowledge_strict"
+echo "         仍會用 AICODE_MODEL=${AICODE_MODEL:-<default>},兩邊不會自動同步。"
+
+# Point new users at the health check so they don't have to discover it via README.
+echo "[aicode] TIP: 設定有疑慮時可跑 \`python scripts/doctor.py\` 做健檢。"
 
 # If AICODE_MODEL is set, propagate it to OpenCode's --model flag so the
 # TUI conversation defaults to the same model the MCP server uses. Users

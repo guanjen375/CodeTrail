@@ -234,10 +234,14 @@ def check_context_settings(r: Result) -> None:
     hard = float(getattr(cfg, "CTX_HARD_THRESHOLD", 0.90) or 0.90)
     gate_on = bool(getattr(cfg, "CTX_GATE_ENABLED", True))
 
-    r.info(f"AICODE_NUM_CTX={num_ctx}（CodeTrail internal native Ollama call 用）")
+    r.info(
+        f"AICODE_NUM_CTX={num_ctx}（dynamic 關閉時的 fallback 上限;"
+        "dynamic 開啟時不影響 per-call 上限,由 DYNAMIC_NUM_CTX_MAX 決定）"
+    )
     r.info(
         f"DYNAMIC_NUM_CTX: enabled={dyn_on} min={dyn_min} max={dyn_max} "
-        "（agent loop 會根據 messages 大小動態壓低 num_ctx,避免占用 VRAM）"
+        "（agent loop 會根據 messages 大小動態壓低 num_ctx,避免占用 VRAM。"
+        "max 可用 AICODE_DYNAMIC_NUM_CTX_MAX 環境變數覆寫）"
     )
     r.info(
         f"AICODE_RESERVED_OUTPUT_TOKENS={reserved} "
@@ -249,8 +253,18 @@ def check_context_settings(r: Result) -> None:
         r.warn(
             f"AICODE_NUM_CTX={num_ctx} 比 DYNAMIC_NUM_CTX_MAX={dyn_max} 大;"
             "dynamic 啟用時實際 internal call 會被 clamp 到 dynamic max。\n"
-            "        要真的用更大的 ctx,請同步調高 DYNAMIC_NUM_CTX_MAX,"
-            "或設 DYNAMIC_NUM_CTX_ENABLED=False。"
+            "        要真的用更大的 ctx,請設 AICODE_DYNAMIC_NUM_CTX_MAX,"
+            "或設 DYNAMIC_NUM_CTX_ENABLED=False 走 NUM_CTX 路徑。"
+        )
+
+    # 常見錯配 1b：AICODE_NUM_CTX 有設、但 dynamic 開啟 → 多數情況下這個 env
+    # var 完全沒效果,使用者調了不會感覺到任何差別。明確告訴他要改的是哪顆。
+    if dyn_on and os.environ.get("AICODE_NUM_CTX"):
+        r.warn(
+            f"AICODE_NUM_CTX 環境變數有設 (={num_ctx}) 但 dynamic 啟用,"
+            "在這種模式下它不影響 per-call 上限。\n"
+            "        要真的改 per-call 上限請改設 AICODE_DYNAMIC_NUM_CTX_MAX;"
+            "或如果只是想要個 banner 顯示值,留著沒關係但會誤導你自己。"
         )
 
     # 常見錯配 2：hard < soft（人為設錯）
