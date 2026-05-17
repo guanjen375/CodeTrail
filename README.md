@@ -186,7 +186,7 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
     "codetrail_apply_patch": "ask",
     "codetrail_run_lint": "ask",
     "codetrail_run_command": "ask",
-    "codetrail_import_external_file": "deny",
+    "codetrail_import_external_file": "allow",
 
     "webfetch": "deny",
     "websearch": "deny",
@@ -315,6 +315,8 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 ```bash
 AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/mnt/share" aicode
 ```
+
+`opencode.json` 範例已允許 `codetrail_import_external_file`，方便模型直接使用這個受控匯入入口；真正能匯入哪些外部檔案仍由 `AI_CODE_ALLOW_EXTERNAL_IMPORT` 和 `AI_CODE_IMPORT_ROOTS` 決定。
 
 ---
 
