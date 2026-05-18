@@ -1748,7 +1748,7 @@ English:"""
                 used_emb_scores.append(self._cosine_similarity(q_emb_for_score, c_emb))
         top_emb_score_used = max(used_emb_scores) if used_emb_scores else top_emb_score
 
-        # GPT建議：在 REF header 加入信心分數提示，讓 LLM 了解參考資料的可靠度
+        # 在 REF header 加入信心分數提示，讓 LLM 了解參考資料的可靠度
         # 使用修正後的 top_emb_score_used
         confidence_label = ""
         if top_emb_score_used >= 0.6:
@@ -1787,7 +1787,7 @@ English:"""
 
         model_lines.append("\n[/REF]")
 
-        # GPT建議：移除詳細回答規則，避免與 config.get_answer_rules() 重複/打架
+        # 移除詳細回答規則，避免與 config.get_answer_rules() 重複/打架
         # 只保留輕量提示，主要規則由呼叫端統一注入
         model_lines.append("\n※ 引用 REF 內容時請標註編號（如 REF1）")
         if has_spec:
@@ -1820,7 +1820,7 @@ English:"""
             dtype = doc_types.get(src, 'doc')
             display_parts.append(f"{src} [{dtype}] p.{pages_str}")
 
-        # GPT建議：display 也顯示信心度，讓用戶知道參考資料的可靠度
+        # display 也顯示信心度，讓用戶知道參考資料的可靠度
         # P0 改進：高風險時加上警告
         risk_warning = " ⚠️" if is_high_risk else ""
         display_output = f"[REF {confidence_label}{risk_warning}] " + " | ".join(display_parts)
@@ -1830,7 +1830,7 @@ English:"""
         # 修正：top_emb_score 改用「最終被選中的 chunks」的最高分，而非 candidates[0]
         # 這避免了「candidates[0] 被過濾掉，但 top_emb_score 仍用它的低分」的問題
         top_kw_score = candidates[0][2] if candidates else 0.0
-        # GPT 建議：將 has_spec_chunk 改為 has_authoritative_chunk
+        # 將 has_spec_chunk 改為 has_authoritative_chunk
         # 權威類型：spec、manual、api（chat/diagram 不算權威）
         authoritative_types = {'spec', 'manual', 'api'}
         has_authoritative_chunk = any(

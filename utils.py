@@ -651,7 +651,7 @@ def should_refuse_answer(question: str, kb_metadata: dict) -> bool:
         return True
 
     # 額外檢查：spec 問題最好要命中權威類型（spec/manual/api）的 chunk
-    # GPT 建議：使用 has_authoritative_chunk（包含 manual/api），向後相容 has_spec_chunk
+    # 使用 has_authoritative_chunk（包含 manual/api），向後相容 has_spec_chunk
     has_authoritative = kb_metadata.get("has_authoritative_chunk",
                                         kb_metadata.get("has_spec_chunk", True))
     if not has_authoritative and top_emb_score < WEAK_REF_THRESHOLD + 0.1:

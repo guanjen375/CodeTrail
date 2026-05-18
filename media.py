@@ -85,7 +85,7 @@ def _safe_path(path: str, allow_external: bool = False, allowed_extensions: set 
 
     相對路徑會以 _SANDBOX_ROOT 為基準解析，而非當前工作目錄
 
-    GPT建議改進：
+    路徑處理改進：
     - 處理路徑空白（strip + 引號移除）
     - 使用 is_file() 而非 exists()（避免目錄誤判）
     - 更好的錯誤訊息

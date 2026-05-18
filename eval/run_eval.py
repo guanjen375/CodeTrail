@@ -598,7 +598,7 @@ def eval_bug_question(
 
     # 評估
     expected_cause = case.expected.get('cause', '')
-    cause_keywords = case.expected.get('cause_keywords', [])  # GPT 建議：支援多關鍵字
+    cause_keywords = case.expected.get('cause_keywords', [])  # 支援多關鍵字
     expected_fix_keywords = case.expected.get('fix_keywords', [])
     # P0-Eval: 新增 gold_frames（期望找到的根因相關 frame/file）
     gold_frames = case.expected.get('gold_frames', [])
@@ -611,7 +611,7 @@ def eval_bug_question(
         'run_tests_enabled': run_tests,
     }
 
-    # 檢查是否識別問題原因（GPT 建議：支援 cause_keywords 多關鍵字）
+    # 檢查是否識別問題原因（支援 cause_keywords 多關鍵字）
     answer_lower = answer.lower()
     if cause_keywords:
         # 只要回答裡有任一關鍵字就算抓到原因

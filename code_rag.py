@@ -787,7 +787,7 @@ class CodeRAG:
     def query(self, question: str, top_k: int = CODE_RAG_TOP_K, is_bug_fix: bool = False) -> list[dict]:
         """查詢相關程式碼位置（動態門檻 + reranker 二次排序）
 
-        GPT建議：Lazy build - 第一次 query 時才建立索引，避免不需要 CodeRAG 時浪費時間
+        Lazy build：第一次 query 時才建立索引，避免不需要 CodeRAG 時浪費時間
         """
         # Lazy build：第一次 query 時才建立索引
         if not self.index:

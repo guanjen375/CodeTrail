@@ -124,7 +124,7 @@ NUM_CTX_FULL_MODE = NUM_CTX
 DYNAMIC_NUM_CTX_ENABLED = True
 DYNAMIC_NUM_CTX_MIN = 16384      # 最小 16K
 DYNAMIC_NUM_CTX_MAX = int(_os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX", "65536"))
-DYNAMIC_NUM_CTX_BUFFER = 1.3     # 預留空間給回答（GPT建議: 1.5->1.3）
+DYNAMIC_NUM_CTX_BUFFER = 1.3     # 預留空間給回答（調整: 1.5->1.3）
 CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
 
 # ============================================================
@@ -160,14 +160,14 @@ CUSTOM_SYSTEM_RULES_MAX_CHARS = 4000 # 規則檔案最大字元數
 # ============================================================
 # Agent 設定
 # ============================================================
-MAX_TOOL_LOOPS = 10                  # Agent 最大工具回合數（GPT建議: 12->10）
+MAX_TOOL_LOOPS = 10                  # Agent 最大工具回合數（調整: 12->10）
 MAX_FILE_READ_CHARS = 50000
 MAX_GREP_RESULTS = 30
 MAX_LIST_DEPTH = 3
 
 # Messages 總預算（字元數，粗估 1 token ≈ 3-4 chars）
 # 128K ctx ≈ 384K chars，保留一些空間給 system prompt 和回答
-MAX_MESSAGES_BUDGET = 250000  # 250KB（GPT建議: 300000->250000）
+MAX_MESSAGES_BUDGET = 250000  # 250KB（調整: 300000->250000）
 # 保留最近 N 輪的 tool 輸出（刪除舊的時優先保留最近的）
 MIN_RECENT_TOOL_OUTPUTS = 4
 
@@ -275,8 +275,8 @@ CHUNK_SETTINGS = {
 }
 KNOWLEDGE_TOP_K = 5
 KNOWLEDGE_CANDIDATE_K = 30
-KNOWLEDGE_THRESHOLD = 0.30           # 提高基礎門檻，寧缺勿濫（GPT建議: 0.25->0.30）
-KNOWLEDGE_THRESHOLD_SHORT = 0.25     # 短問題（<10 token）用較低門檻（GPT建議: 0.20->0.25）
+KNOWLEDGE_THRESHOLD = 0.30           # 提高基礎門檻，寧缺勿濫（調整: 0.25->0.30）
+KNOWLEDGE_THRESHOLD_SHORT = 0.25     # 短問題（<10 token）用較低門檻（調整: 0.20->0.25）
 KNOWLEDGE_SHORT_QUERY_TOKENS = 10    # 短問題定義
 DYNAMIC_THRESHOLD_RATIO = 0.5
 DYNAMIC_TOP_K_HIGH_SCORE = 0.5       # 高相關度門檻
@@ -433,7 +433,7 @@ CODE_RAG_PREREAD_TOP_K_BUG = 3       # Bug 模式預讀更少，靠 stack trace 
 CODE_RAG_PREREAD_LINES = 64          # 縮小預讀窗口，減少 I/O（優化：96->64）
 CODE_RAG_PREREAD_LINES_BUG = 128     # Bug 模式預讀適中（優化：160->128）
 CODE_RAG_PREREAD_MAX_LINES = 250     # 預讀完整函式的最大行數上限（優化：300->250）
-CODE_RAG_THRESHOLD = 0.35            # 提高門檻，確保真的相關才進來（GPT建議: 0.30->0.35）
+CODE_RAG_THRESHOLD = 0.35            # 提高門檻，確保真的相關才進來（調整: 0.30->0.35）
 CODE_RAG_THRESHOLD_BUG = 0.25        # Bug 類問題放寬門檻（eval調優: 0.30->0.25）
 # Lazy embed to cut initial index time on large repos.
 CODE_RAG_LAZY_EMBED = True
@@ -450,9 +450,9 @@ STRICT_MODE_KEYWORDS = [
     'spec', 'manual', 'specification', 'according to'
 ]
 STRICT_MODE_TEMPERATURE = 0.0        # 嚴格模式下溫度壓到最低
-WEAK_REF_THRESHOLD = 0.35            # REF 分數低於此值視為「太弱」（GPT建議: 0.30->0.35）
+WEAK_REF_THRESHOLD = 0.35            # REF 分數低於此值視為「太弱」（調整: 0.30->0.35）
 SKIP_LOW_CONFIDENCE_KB = True        # 是否跳過低信心度的 KB 上下文注入
-LOW_CONFIDENCE_KB_THRESHOLD = 0.30   # 低於此分數則不注入 KB context（GPT建議: 0.25->0.30）
+LOW_CONFIDENCE_KB_THRESHOLD = 0.30   # 低於此分數則不注入 KB context（調整: 0.25->0.30）
 
 # Spec/規格類問題關鍵字（向後相容，新邏輯使用 needs_grounding 偵測器）
 SPEC_QUESTION_KEYWORDS = [
@@ -511,7 +511,7 @@ GROUNDING_EXCLUDE_PATTERNS = [
 # BIN/ELF 報告限制（Hard Cap）
 # ============================================================
 # 保護重要資訊（Header、Entry point）不被截斷
-# GPT建議：設定 hard cap 避免 context 超載時丟失關鍵資訊
+# 設定 hard cap，避免 context 超載時丟失關鍵資訊
 BIN_ELF_REPORT_MAX_CHARS = 25000      # 報告總長度上限（約 6K tokens）
 BIN_ELF_HEADER_RESERVED = 3000        # Header + Entry point 保留空間
 BIN_ELF_MAX_SECTIONS = 30             # Section 數量上限（縮減）

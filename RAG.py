@@ -26,7 +26,7 @@ from typing import List, Dict, Optional, Tuple
 # ============================================================
 # 依賴檢查
 # ============================================================
-# GPT 建議：條件式依賴檢查，按模式載入
+# 條件式依賴檢查，按模式載入
 # - PDF 模式才需要 pymupdf4llm
 # - VL 模式（--chat/--image）需要 ollama
 # - --url 模式需要 html2text
@@ -712,7 +712,7 @@ def extract_chat_from_screenshot(image_path: str) -> str:
     ext = Path(image_path).suffix.lower()
 
     # 提示詞：要求 VL 模型提取並整理聊天內容
-    # GPT 建議：增加「原始摘錄」層，降低幻覺風險
+    # 增加「原始摘錄」層，降低幻覺風險
     prompt = """請分析這張聊天截圖，並整理成結構化的技術知識文件。
 
 **重要**：請盡量忠實呈現原文，不要推測或補完看不清楚的內容。
@@ -833,7 +833,7 @@ def extract_info_from_image(image_path: str) -> str:
         image_data = base64.b64encode(f.read()).decode('utf-8')
 
     # 提示詞：針對技術圖片的分析
-    # GPT 建議：增加「原始文字摘錄」層，降低幻覺風險
+    # 增加「原始文字摘錄」層，降低幻覺風險
     prompt = """請詳細分析這張技術圖片，並整理成結構化的技術文件。
 
 **重要**：請盡量忠實呈現圖中文字，不要推測或補完看不清楚的內容。
@@ -1635,7 +1635,7 @@ def clean_markdown_content(content: str) -> str:
 def generate_url_name(url: str) -> str:
     """
     從 URL 生成唯一的名稱（避免撞名）
-    GPT 建議：使用 {netloc}_{last_path} 格式
+    使用 {netloc}_{last_path} 格式，避免撞名
     """
     from urllib.parse import urlparse
     parsed = urlparse(url)
@@ -1673,7 +1673,7 @@ def process_url(url: str) -> Optional[Tuple[List[Dict], str]]:
     print(content[:500] + "..." if len(content) > 500 else content)
     print("-" * 40)
 
-    # GPT 建議：使用更穩定的命名避免撞名
+    # 使用更穩定的命名避免撞名
     url_name = generate_url_name(url)
 
     # 切分成 chunks
@@ -1693,8 +1693,8 @@ def process_url(url: str) -> Optional[Tuple[List[Dict], str]]:
             "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
             "origin": "url",
             "url": url,              # 保留原始 URL
-            "title": title,          # GPT 建議：補存標題
-            "fetched_at": fetched_at # GPT 建議：補存抓取時間
+            "title": title,          # 補存標題
+            "fetched_at": fetched_at # 補存抓取時間
         })
 
     return results, url_name  # 回傳 url_name 供 add_url 使用

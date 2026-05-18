@@ -9,8 +9,8 @@
 # Override the auto-detected root:
 #   AICODE_ROOT=/some/other/path aicode
 #
-# Designed to mirror the `claude` UX: cd into a project, run one command,
-# done. No per-project edits to opencode.json required.
+# Designed as a one-command CLI: cd into a project, run one command, done.
+# No per-project edits to opencode.json required.
 
 set -euo pipefail
 

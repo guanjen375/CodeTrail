@@ -65,7 +65,7 @@ def test_validate_rejects_path_traversal_via_arg(runner: ToolExecutor):
 # Phase 3: path containment — 白名單命令的參數不能逃出 AICODE_ROOT
 # ============================================================
 class TestPathContainment:
-    """這些 case 是 GPT review 找出的真實逃逸路徑。"""
+    """這些 case 是 review 找出的真實逃逸路徑。"""
 
     def test_rejects_absolute_outside_path(self, runner: ToolExecutor):
         ok, msg, _ = runner._validate_command("pytest /tmp/some_test.py")

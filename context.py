@@ -163,7 +163,7 @@ def build_full_context(files: dict[str, str]) -> FullContext:
 def _compute_full_num_ctx(ctx: FullContext, question: str, image_ctx: str, knowledge_ctx: str) -> int:
     """根據 Full 模式的內容長度動態計算 num_ctx
 
-    GPT建議：Full 模式也用動態 num_ctx，小專案或短問題時不需開滿 128K
+    Full 模式也用動態 num_ctx，小專案或短問題時不需開滿 128K
     """
     if not DYNAMIC_NUM_CTX_ENABLED:
         return NUM_CTX_FULL_MODE
@@ -261,7 +261,7 @@ def analyze_full(ctx: FullContext, question: str, image_ctx: str = "", knowledge
 
 用繁體中文回答。"""
 
-    # Full 模式使用動態 num_ctx（GPT建議）
+    # Full 模式使用動態 num_ctx
     num_ctx = _compute_full_num_ctx(ctx, question, image_ctx, knowledge_ctx)
     print_ctx_usage(len(prompt))
     if stream:
