@@ -919,6 +919,86 @@ ollama pull gpt-oss:20b
 
 ---
 
+## 11. 換顯卡 / 換模型建議
+
+CodeTrail 的模型選擇以環境變數為主，不需要改 source code。換到其他顯卡或其他機器時，先在那台 Ollama 主機下載模型，再用同一個 `AICODE_MODEL` 啟動 `aicode`，讓 OpenCode TUI 與 MCP server 內部呼叫保持一致：
+
+```bash
+ollama pull <MODEL>
+
+AICODE_MODEL=<MODEL> \
+AICODE_DYNAMIC_NUM_CTX_MAX=32768 \
+aicode
+```
+
+不要只在 OpenCode TUI 裡用 `/models` 換模型。那只會換前台對話模型，不會通知 CodeTrail MCP server；後台的 `query_knowledge_strict` 等內部流程仍會使用啟動時的 `AICODE_MODEL`。正確流程是退出 `aicode`，改環境變數，重新啟動。
+
+常見組合：
+
+```bash
+# 5090 / 32GB VRAM：35B 先用 32K，穩定後再試 64K
+AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
+
+# 24GB VRAM：優先用 30B / 24B，或把 35B context 降低
+AICODE_MODEL=qwen3-coder:30b AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
+
+# 16GB 以下：建議用 20B / 24B 或更小模型，不要硬開大 context
+AICODE_MODEL=gpt-oss:20b AICODE_DYNAMIC_NUM_CTX_MAX=16384 aicode
+```
+
+換硬體或模型後，用另一個終端機看 Ollama 實際載入狀態：
+
+```bash
+ollama ps
+```
+
+`PROCESSOR` 欄位的判斷：
+
+- `100% GPU`：模型與 KV cache 都放在顯卡，速度正常。
+- `xx% CPU / xx% GPU`：VRAM 不夠，部分資料被搬到系統 RAM，通常首 token 會明顯變慢。先把 `AICODE_DYNAMIC_NUM_CTX_MAX` 從 `65536` 降到 `32768`，再不行降到 `16384`。
+
+這些後果要分清楚：
+
+| 變更 | 主要後果 |
+|---|---|
+| 換小顯卡 | 可能 CPU/GPU split、變慢、甚至 OOM；先降低 `AICODE_DYNAMIC_NUM_CTX_MAX` |
+| 換小模型 | 速度快、硬體壓力小，但跨檔推理、工具呼叫和 patch 穩定度可能下降 |
+| 換大模型 | 推理上限較高，但更慢、更吃 VRAM；context 不宜一開始就開太大 |
+| context 開太大 | 多半是速度問題，容易 offload 到 RAM；用 `ollama ps` 看得出來 |
+| context 開太小 | 是正確性問題，長 spec / 大 repo 可能塞不進 prompt；CodeTrail 會用 `[CTX_OVERFLOW]` 阻止 silent truncation |
+
+如果 Ollama 跑在另一台 GPU 主機上，CodeTrail 這台可以把 API 指過去：
+
+```bash
+AICODE_OLLAMA_BASE_URL=http://<GPU_HOST>:11434 \
+AICODE_MODEL=<MODEL> \
+AICODE_DYNAMIC_NUM_CTX_MAX=32768 \
+aicode
+```
+
+同時也要把 `~/.config/opencode/opencode.json` 裡 Ollama provider 的 `baseURL` 改到同一台主機：
+
+```json
+"baseURL": "http://<GPU_HOST>:11434/v1"
+```
+
+NDA 場景要特別注意：遠端 Ollama 會收到 prompt、程式碼片段、spec 摘要與工具輸出。只把它指向你信任的內網 / VPN 主機，不要把 Ollama API 暴露到公開網路。
+
+RAG 相關模型也要在新機器上準備好：
+
+```bash
+ollama pull bge-m3
+ollama pull qllama/bge-reranker-v2-m3
+```
+
+如果要分析截圖、UI error 或把圖片匯入 KB，再下載視覺模型：
+
+```bash
+ollama pull qwen3-vl:30b-a3b
+```
+
+---
+
 ## License
 
 本專案以 MIT 授權釋出，程式碼以「現狀」（AS IS）提供，不附帶任何明示或默示的保證，
