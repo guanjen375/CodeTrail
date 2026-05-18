@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""README ↔ mcp_server.py / config.py 一致性檢查。
+"""README / docs ↔ mcp_server.py / config.py 一致性檢查。
 
-不解析 markdown，只用 regex 抓出 README 上需要對齊的事實，
+不解析 markdown，只用 regex 抓出使用者文件上需要對齊的事實，
 和原始碼比對：
-  1. mcp_server.py 內 @mcp.tool() 的工具數 == README 提到的「N 個工具」
-  2. README 工具表內每個 backtick 工具名都在 mcp_server.py 裡定義
-  3. config.py 的 MODEL / EMBEDDING_MODEL / RERANKER_MODEL / VL_MODEL 在 README 出現
+  1. mcp_server.py 內 @mcp.tool() 的工具數 == 文件提到的「N 個工具」
+  2. 文件工具表內每個 backtick 工具名都在 mcp_server.py 裡定義
+  3. config.py 的 MODEL / EMBEDDING_MODEL / RERANKER_MODEL / VL_MODEL 在文件出現
   4. README 必須包含「成熟私有部署版」/「不公開發布」之類產品狀態語句
-  5. README 的 ollama pull 指令與內嵌 OpenCode JSON model tag 不打架
+  5. 文件的 ollama pull 指令與內嵌 OpenCode JSON model tag 不打架
 
 退出碼：0=OK, 1=有 drift。
 """
@@ -19,12 +19,22 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 README = REPO_ROOT / "README.md"
+DOCS_DIR = REPO_ROOT / "docs"
 MCP = REPO_ROOT / "mcp_server.py"
 CONFIG = REPO_ROOT / "config.py"
 
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+
+def _documentation_text() -> str:
+    """合併 README 與 docs/*.md，讓細節搬到 docs 後仍能做 drift check。"""
+    parts = [_read(README)]
+    if DOCS_DIR.is_dir():
+        for path in sorted(DOCS_DIR.glob("*.md")):
+            parts.append(_read(path))
+    return "\n\n".join(parts)
 
 
 def _mcp_tool_names(mcp_text: str) -> list[str]:
@@ -142,32 +152,33 @@ def check_all() -> list[str]:
         return ["mcp_server.py 不存在"]
 
     readme_text = _read(README)
+    docs_text = _documentation_text()
     mcp_text = _read(MCP)
     config_text = _read(CONFIG)
 
     # 1. tool count
     mcp_tools = _mcp_tool_names(mcp_text)
-    claimed = _readme_claimed_tool_count(readme_text)
+    claimed = _readme_claimed_tool_count(docs_text)
     if claimed is None:
-        issues.append("README 沒寫「N 個 MCP 工具」/「暴露的 N 個工具」字樣 — 新手會不知道要連幾個")
+        issues.append("文件沒寫「N 個 MCP 工具」/「暴露的 N 個工具」字樣 — 新手會不知道要連幾個")
     elif claimed != len(mcp_tools):
         issues.append(
             f"README 說「{claimed} 個工具」但 mcp_server.py 實際有 {len(mcp_tools)} 個："
             f"{mcp_tools}"
         )
 
-    # 2. tool names in README ⊇ all mcp tools
-    readme_names = _readme_tool_names_in_table(readme_text)
+    # 2. tool names in user docs ⊇ all mcp tools
+    readme_names = _readme_tool_names_in_table(docs_text)
     missing = [t for t in mcp_tools if t not in readme_names]
     if missing:
-        issues.append(f"README 沒提到的 MCP 工具: {missing}")
+        issues.append(f"文件沒提到的 MCP 工具: {missing}")
 
     # 3. model name drift
     cfg_models = _config_model_values(config_text)
     for attr, value in cfg_models.items():
-        if value not in readme_text:
+        if value not in docs_text:
             issues.append(
-                f"config.py 的 {attr}={value!r} 沒出現在 README — 改了模型？"
+                f"config.py 的 {attr}={value!r} 沒出現在文件 — 改了模型？"
             )
 
     # 4. 產品狀態段落
@@ -176,8 +187,8 @@ def check_all() -> list[str]:
             "README 缺少產品狀態說明（任一：" + " / ".join(_PRODUCT_STATUS_PHRASES) + "）"
         )
 
-    # 5. model tag drift(README pull ↔ README opencode JSON)
-    _check_model_tag_consistency(readme_text, issues)
+    # 5. model tag drift(ollama pull ↔ opencode JSON)
+    _check_model_tag_consistency(docs_text, issues)
 
     return issues
 
@@ -185,7 +196,7 @@ def check_all() -> list[str]:
 def main() -> int:
     issues = check_all()
     if not issues:
-        print("[readme-consistency] OK — README ↔ mcp_server.py / config.py 一致")
+        print("[readme-consistency] OK — README/docs ↔ mcp_server.py / config.py 一致")
         return 0
     print(f"[readme-consistency] 發現 {len(issues)} 個 drift：")
     for it in issues:

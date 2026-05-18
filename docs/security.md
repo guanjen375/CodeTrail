@@ -1,0 +1,91 @@
+# 安全邊界與工作節奏
+
+這份文件整理 sandbox、patch、run command、NDA 資料、資料飛輪與建議工作節奏。
+
+[回到 README](../README.md)。
+
+---
+
+## 安全邊界
+
+### 沙箱
+
+MCP server 啟動時會執行：
+
+```text
+set_sandbox_root(AICODE_ROOT, allow_external=False)
+```
+
+結果：
+
+- `read_file(...)`、`grep_code(...)`、`list_dir(...)` 只能看 `AICODE_ROOT` 內的檔案。
+- `analyze_file(...)`、`ingest_document(...)` 的輸入也必須在 `AICODE_ROOT` 內。
+- `import_external_file(...)` 是唯一外部入口，預設關閉；開啟後也只會把允許來源目錄內的檔案複製進 `.aicode_uploads/`。設定方式見 [RAG、附件與知識庫操作](rag.md) 的匯入附件場景。
+- `apply_patch(...)` 只能改沙箱內檔案，且 patch context 必須跟現有檔案相符。
+- `aicode` 會拒絕把 `/` 或 `$HOME` 當 root。
+
+注意這層沙箱**只蓋 CodeTrail 的 17 個 MCP 工具**。OpenCode 自己內建了 `bash`、`read`、`write` 等工具，這些是 OpenCode 的東西，不走 CodeTrail 的 MCP 沙箱，因此能讀寫整個檔案系統（在目前 user 權限範圍內）。實務上常碰到的場景：CodeTrail 的 `import_external_file` 因為白名單擋下時，模型有時會 fallback 去用 OpenCode 內建的 `$ cp` 把檔案搬進專案目錄，照樣達到目的。要徹底鎖死，得從 OpenCode 設定那邊關掉它的內建工具，CodeTrail 沙箱層面控制不到。
+
+### Patch
+
+`apply_patch(...)` 限制：
+
+- 單次最多 5 個檔案
+- 單檔最多 200 行修改
+- hunk context 不符會拒絕
+
+這些限制是保護用的，不要為了方便把它拿掉。大型修改請拆小步。
+
+### Run Command
+
+`run_command(...)` 只允許白名單命令，例如：
+
+- Python：`pytest`、`python -m pytest`、`python -m unittest`
+- C/C++：`ctest`、`make`、`cmake`、`cmake --build`、`ninja`
+- Node：`npm test`、`npm run test`、`yarn test`
+- Rust：`cargo test`、`cargo clippy`
+- Go：`go test`、`go vet`
+- Lint / format：`ruff`、`black`、`isort`、`eslint`、`clang-format`
+
+即使有白名單，`make`、`cmake`、`npm test` 仍可能執行專案內腳本。只在可信專案使用。
+
+### 不要 commit 的資料
+
+這些通常含有 NDA 內容或本地快取，應留在 `.gitignore`：
+
+- `knowledge.json`
+- `knowledge_emb.npz`
+- `.code_rag_cache_*`
+- `.rag_embedding_cache.json`
+- `.opencode/`
+- `.aicode_uploads/`
+- `data/`
+- `*.jsonl`
+
+### 開發者資料飛輪（選用）
+
+這不是 OpenCode 日常必用功能。只有在你想收集互動樣本、日後做 reranker / fine-tuning / prompt regression 時才開。
+
+設 `AI_CODE_COLLECT_DATA=1` 啟動 `aicode`，KB-shaped 工具（`query_knowledge` / `query_knowledge_strict` / `code_rag_search`）的每次呼叫會 append 一筆到 `data/interactions.jsonl`，含問題、回答（或 `[REFUSED]` / `[SKIPPED_STRICT:...]`）、refs、KB 分數與當下 git commit。預設關閉。
+
+該檔在 NDA 場景必然含敏感片段，已在本文件「不要 commit 的資料」列入禁止 commit。要看統計或匯出訓練語料，跑：
+
+```bash
+python data_flywheel.py stats
+```
+
+`eval/` 也是開發者用的固定題庫 / 回歸評測，不會自動記錄對話。兩者差異與清理方式見 [README_DEV.md](../README_DEV.md)。
+
+---
+
+
+## 建議工作節奏
+
+1. `cd <PROJECT_TO_ANALYZE>` 後跑 `aicode`。
+2. 第一輪只允許讀取，要求列 file:line 證據。
+3. 有 spec 先 `ingest_document(...)` + `reload_knowledge_base()`。
+4. 修改前要求模型說明將改哪些檔案與原因。
+5. 修改後要求模型跑最小相關驗證。
+6. 結束前自己看一次 git diff，確認沒有把 `knowledge.json`、cache、log 或 NDA 衍生資料納入 commit。
+
+---

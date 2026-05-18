@@ -46,7 +46,7 @@ aicode
 - `tests/test_patch.py` — apply_patch 的 happy path、逃逸、context 不符、max 限制
 - `tests/test_run_command.py` — 白名單 + shell 元字元 + 注入防護
 - `tests/test_eval_consistency.py` — eval ↔ config / source 不漂移
-- `tests/test_readme_consistency.py` — README ↔ mcp_server.py / config.py 不漂移
+- `tests/test_readme_consistency.py` — README / docs ↔ mcp_server.py / config.py 不漂移
 - `tests/test_doctor.py` — doctor 各 check 的 happy / fail / skip 路徑(含 context/offload)
 - `tests/test_context_budget.py` — token 估算、hard gate、metrics 解析、telemetry 隱私
 - `tests/test_trim.py` — per-tool trim 策略、`[CTX_TRIMMED]`/`[TOOL_SUMMARY]` 標記、優先級
@@ -58,7 +58,7 @@ aicode
 
 ## 改 config / docs / eval 時要同步檢查
 
-`config.py`、`README.md`、`eval/*.json`、`mcp_server.py` 的工具清單必須對齊。
+`config.py`、`README.md`、`docs/*.md`、`eval/*.json`、`mcp_server.py` 的工具清單必須對齊。
 改這些任一處都要跑：
 
 ```bash

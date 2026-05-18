@@ -1,4 +1,4 @@
-"""README ↔ mcp_server.py / config.py 一致性測試。"""
+"""README / docs ↔ mcp_server.py / config.py 一致性測試。"""
 from __future__ import annotations
 
 from scripts.check_readme_consistency import (
@@ -11,7 +11,7 @@ from scripts.check_readme_consistency import (
 
 def test_no_readme_drift():
     issues = check_all()
-    assert not issues, "README drift:\n" + "\n".join(f"  - {i}" for i in issues)
+    assert not issues, "README/docs drift:\n" + "\n".join(f"  - {i}" for i in issues)
 
 
 def test_mcp_tool_names_extraction_works_on_a_known_pattern():
