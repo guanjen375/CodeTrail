@@ -21,7 +21,7 @@ def _unknown_verdict(requested: int) -> SafetyVerdict:
 
 def test_ctx_safety_fails_loud_when_env_missing(monkeypatch, capsys):
     """CodeTrail 不內建主模型: AICODE_MODEL 未設時必須 fail-loud (exit 2),
-    不能 silent fallback 到某個預設模型。"""
+    不能 silent fallback 到某個內建主模型。"""
     monkeypatch.delenv("AICODE_MODEL", raising=False)
     monkeypatch.delenv("AICODE_DYNAMIC_NUM_CTX_MAX", raising=False)
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)

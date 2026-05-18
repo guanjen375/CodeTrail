@@ -302,7 +302,7 @@ def test_log_writes_metadata_only_no_prompt(tmp_path, monkeypatch):
         source="generate",
         requested_num_ctx=32768,
         messages=messages,
-        model="qwen3.6:35b-a3b-q4_K_M",
+        model="example-large-model:35b",
     )
     context_budget.log_metrics(usage)
 
@@ -310,7 +310,7 @@ def test_log_writes_metadata_only_no_prompt(tmp_path, monkeypatch):
     assert secret not in body, "Telemetry log leaked prompt content"
     # The metadata we DO want should be present
     line = json.loads(body.strip().splitlines()[0])
-    assert line["model"] == "qwen3.6:35b-a3b-q4_K_M"
+    assert line["model"] == "example-large-model:35b"
     assert line["source"] == "generate"
     assert line["estimated_input_tokens"] > 0
     assert line["effective_num_ctx"] == 32768

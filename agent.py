@@ -14,7 +14,7 @@ import config
 import context_budget
 import trim as trim_module
 from config import (
-    OLLAMA_CHAT_URL, MODEL, NUM_CTX,
+    OLLAMA_CHAT_URL, NUM_CTX,
     DYNAMIC_NUM_CTX_ENABLED, DYNAMIC_NUM_CTX_MIN, DYNAMIC_NUM_CTX_MAX,
     DYNAMIC_NUM_CTX_BUFFER, CHARS_PER_TOKEN,
     MAX_TOOL_LOOPS,
@@ -61,7 +61,7 @@ def _compute_dynamic_num_ctx(messages: list) -> int:
 
 
 def _pre_send_trim_if_needed(messages: list, num_ctx: int, tools: list,
-                             source: str) -> tuple[context_budget.ContextUsage, dict]:
+                             source: str, model: str) -> tuple[context_budget.ContextUsage, dict]:
     """Estimate context use; if at/above soft threshold, run an aggressive
     trim pass to try to stay below the hard threshold.
 
@@ -75,7 +75,7 @@ def _pre_send_trim_if_needed(messages: list, num_ctx: int, tools: list,
         requested_num_ctx=num_ctx,
         messages=messages,
         tools=tools,
-        model=MODEL,
+        model=model,
     )
 
     # Below soft threshold: nothing to do.
@@ -112,7 +112,7 @@ def _pre_send_trim_if_needed(messages: list, num_ctx: int, tools: list,
         requested_num_ctx=num_ctx,
         messages=messages,
         tools=tools,
-        model=MODEL,
+        model=model,
         did_trim=True,
         trim_summary=trim_summary,
     )
@@ -138,11 +138,12 @@ def _pre_send_trim_if_needed(messages: list, num_ctx: int, tools: list,
 
 def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
     """呼叫 LLM（帶工具）"""
+    model = config.require_main_model()
     num_ctx = _compute_dynamic_num_ctx(messages)
     tools = get_native_tools()
 
     # Context gate：先估算,若觸發 soft 則先做一輪 aggressive trim;最後 hard 拒絕
-    usage, trim_summary = _pre_send_trim_if_needed(messages, num_ctx, tools, "agent_tools")
+    usage, trim_summary = _pre_send_trim_if_needed(messages, num_ctx, tools, "agent_tools", model)
     if not trim_summary:
         # 沒有 pre-send trim,記入上一次 batch-trim 的 summary(若有)
         trim_summary = _last_trim_summary()
@@ -159,7 +160,7 @@ def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
     try:
         session = get_session()
         resp = session.post(OLLAMA_CHAT_URL, json={
-            "model": MODEL,
+            "model": model,
             "messages": messages,
             "tools": tools,
             "stream": False,
@@ -197,22 +198,23 @@ def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
         elif "HTTPError" in err_type or "404" in str(e):
             msg = (
                 f"[ERROR] Ollama 回 HTTP 錯誤: {e}\n"
-                f"   常見原因：模型 {MODEL!r} 沒有 pull。\n"
-                f"   檢查: ollama list  /  必要時 ollama pull {MODEL}"
+                f"   常見原因：模型 {model!r} 沒有 pull。\n"
+                f"   檢查: ollama list  /  必要時 ollama pull {model}"
             )
             return {"content": msg, "tool_calls": [], "done_reason": "error"}
         else:
-            return {"content": f"[ERROR] 錯誤: {e} (model={MODEL})", "tool_calls": [], "done_reason": "error"}
+            return {"content": f"[ERROR] 錯誤: {e} (model={model})", "tool_calls": [], "done_reason": "error"}
 
 
 def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
     """呼叫 LLM（帶工具，串流輸出，批次顯示）"""
     import time
 
+    model = config.require_main_model()
     num_ctx = _compute_dynamic_num_ctx(messages)
     tools = get_native_tools()
 
-    usage, trim_summary = _pre_send_trim_if_needed(messages, num_ctx, tools, "agent_tools_stream")
+    usage, trim_summary = _pre_send_trim_if_needed(messages, num_ctx, tools, "agent_tools_stream", model)
     if not trim_summary:
         trim_summary = _last_trim_summary()
     if trim_summary:
@@ -228,7 +230,7 @@ def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
     try:
         session = get_session()
         resp = session.post(OLLAMA_CHAT_URL, json={
-            "model": MODEL,
+            "model": model,
             "messages": messages,
             "tools": tools,
             "stream": True,
@@ -291,11 +293,11 @@ def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
         elif "HTTPError" in err_type or "404" in str(e):
             return (
                 f"[ERROR] Ollama 回 HTTP 錯誤: {e}\n"
-                f"   常見原因：模型 {MODEL!r} 沒有 pull。\n"
-                f"   檢查: ollama list  /  必要時 ollama pull {MODEL}"
+                f"   常見原因：模型 {model!r} 沒有 pull。\n"
+                f"   檢查: ollama list  /  必要時 ollama pull {model}"
             )
         else:
-            return f"[ERROR] 錯誤: {e} (model={MODEL})"
+            return f"[ERROR] 錯誤: {e} (model={model})"
 
 
 # ============================================================

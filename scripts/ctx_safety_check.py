@@ -36,6 +36,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import gpu_safety  # noqa: E402
+from model_resolution import normalize_main_model  # noqa: E402
 
 
 # 跟 config.py 的 DYNAMIC_NUM_CTX_MAX 預設保持一致。這個啟動前檢查刻意不
@@ -53,18 +54,17 @@ def _print_block(prefix: str, lines: list[str]) -> None:
         print(f"[ctx-safety] {prefix} {ln}", flush=True)
 
 
-def _is_placeholder_model(value: str) -> bool:
-    return "<" in value or ">" in value
-
-
 def main() -> int:
     if os.environ.get("AICODE_CTX_SAFETY_DISABLE", "").lower() in ("1", "true", "yes"):
         _print("disabled via AICODE_CTX_SAFETY_DISABLE")
         return 0
 
-    model = os.environ.get("AICODE_MODEL", "").strip()
-    if not model or _is_placeholder_model(model):
-        _print("AICODE_MODEL 未設 (或仍是 <CODE_MODEL> 之類的 placeholder)。")
+    model_res = normalize_main_model(os.environ.get("AICODE_MODEL", ""), "AICODE_MODEL")
+    model = model_res.model
+    if not model:
+        _print("AICODE_MODEL 未設或無效 (例如 <CODE_MODEL> placeholder / 非 Ollama provider)。")
+        if model_res.error:
+            _print(f"        {model_res.error}")
         _print("        CodeTrail 不內建預設主模型, 無法做 ctx 安全檢查。")
         _print("        請先 ollama pull 一顆 Ollama 模型, 然後設定:")
         _print("          export AICODE_MODEL=<CODE_MODEL>")
@@ -114,7 +114,7 @@ def main() -> int:
         _print(f"          (a) export AICODE_DYNAMIC_NUM_CTX_MAX={suggested}")
     else:
         _print(
-            "          (a) 換較小的模型 (e.g. devstral:24b / gpt-oss:20b)"
+            "          (a) 換成較小的 <CODE_MODEL>"
             " — 這台 GPU 連此模型 weights 都裝不下"
         )
     _print("          (b) export AICODE_ACCEPT_CTX_RISK=1 (我知道會 offload,還是要跑)")

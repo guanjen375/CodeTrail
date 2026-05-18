@@ -3,9 +3,12 @@
 """
 智能程式碼分析器 - 設定檔
 """
-import json as _json
 import os as _os
-from pathlib import Path as _Path
+
+from model_resolution import (
+    resolve_main_model_from_env as _resolve_main_model_from_env,
+    resolve_opencode_main_model as _resolve_opencode_main_model,
+)
 
 # ============================================================
 # Ollama 設定
@@ -27,7 +30,8 @@ OLLAMA_PS_URL = f"{OLLAMA_BASE_URL}/api/ps"
 #
 #   1. AICODE_MODEL=<MODEL>                 (環境變數,最優先)
 #   2. aicode -m <MODEL> / --model <MODEL>  (CLI 旗標,只接受 ollama/<MODEL> 或 bare Ollama name)
-#   3. ~/.config/opencode/opencode.json     ("model": "ollama/<MODEL>")
+#   3. OPENCODE_CONFIG or ~/.config/opencode/opencode.json
+#      ("model": "ollama/<MODEL>")
 #
 # 三個都找不到、或值是 placeholder (含 '<' / '>') 時, MODEL 為空字串;
 # 要實際呼叫 LLM 的呼叫端必須先用 require_main_model() 取值,沒設好就 fail-loud。
@@ -38,49 +42,16 @@ OLLAMA_PS_URL = f"{OLLAMA_BASE_URL}/api/ps"
 VL_MODEL = _os.environ.get("AICODE_VL_MODEL", "qwen3-vl:30b-a3b")
 
 
-def _is_placeholder_model(value: str) -> bool:
-    """`<CODE_MODEL>` / `<MODEL>` / `<...>` 形式視為未設定。"""
-    if not value:
-        return True
-    return "<" in value or ">" in value
-
-
-def _strip_ollama_prefix(value: str) -> str:
-    """只移除開頭的 `ollama/`;Ollama model name 本身可以含 namespace slash
-    (例如 `qllama/bge-reranker-v2-m3`),不能用 `*/*` 判斷 provider prefix。"""
-    if value.startswith("ollama/"):
-        return value[len("ollama/"):]
-    return value
-
-
 def _read_opencode_main_model() -> str:
     """讀使用者 OpenCode global config 的 `model` 欄位 (第三優先 fallback)。
 
-    刻意只讀 `~/.config/opencode/opencode.json`,不掃描其他位置 (例如專案
-    local opencode.json) — 主模型是使用者帳號級別的偏好, 不是 per-project 設定。
+    刻意只讀 OPENCODE_CONFIG 或 `~/.config/opencode/opencode.json`,不掃描其他
+    位置 (例如專案 local opencode.json) — 主模型是使用者帳號級別的偏好, 不是
+    per-project 設定。
     讀不到、parse 失敗、值是 placeholder 都回空字串, 留給呼叫端 fail-loud。
     """
-    candidates = []
-    home = _os.environ.get("HOME") or _os.environ.get("USERPROFILE")
-    if home:
-        candidates.append(_Path(home) / ".config" / "opencode" / "opencode.json")
-    for path in candidates:
-        try:
-            if not path.is_file():
-                continue
-            data = _json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        raw = data.get("model")
-        if not isinstance(raw, str):
-            continue
-        raw = raw.strip()
-        if _is_placeholder_model(raw):
-            continue
-        return _strip_ollama_prefix(raw)
-    return ""
+    resolved = _resolve_opencode_main_model(_os.environ)
+    return resolved.model if resolved.ok else ""
 
 
 def _resolve_main_model() -> str:
@@ -90,10 +61,8 @@ def _resolve_main_model() -> str:
     `aicode` wrapper 會另外處理 `-m` / `--model` CLI 旗標 (在這裡看不到),
     它應該在啟動子行程前把 AICODE_MODEL 設好。
     """
-    raw = _os.environ.get("AICODE_MODEL", "").strip()
-    if raw and not _is_placeholder_model(raw):
-        return _strip_ollama_prefix(raw)
-    return _read_opencode_main_model()
+    resolved = _resolve_main_model_from_env(_os.environ)
+    return resolved.model if resolved.ok else ""
 
 
 MODEL = _resolve_main_model()
@@ -101,17 +70,21 @@ MODEL = _resolve_main_model()
 
 def require_main_model() -> str:
     """取目前的主模型,沒設就 fail-loud。 LLM 呼叫端進入點都該先呼這個。"""
-    if not MODEL:
+    resolved = _resolve_main_model_from_env(_os.environ)
+    model = resolved.model if resolved.ok else ""
+    if not model:
+        detail = f"\n解析錯誤: {resolved.error}" if resolved.error else ""
         raise RuntimeError(
-            "CodeTrail 找不到主聊天 / 程式推導模型 (CODE_MODEL)。\n"
+            "CodeTrail 找不到主聊天 / 程式推導模型 (CODE_MODEL)。"
+            f"{detail}\n"
             "請先選擇一顆 Ollama 模型 (例如 ollama pull <CODE_MODEL>),然後任選一種方式設定:\n"
-            "  1) export AICODE_MODEL=<CODE_MODEL>               (最優先,recommended)\n"
+            "  1) export AICODE_MODEL=<CODE_MODEL>               (最優先)\n"
             "  2) aicode -m ollama/<CODE_MODEL>                  (per-run CLI 旗標)\n"
-            "  3) 在 ~/.config/opencode/opencode.json 設 \"model\": \"ollama/<CODE_MODEL>\"\n"
-            "<CODE_MODEL> 是佔位符,必須替換成實際模型名稱 (例如 qwen3-coder:30b、\n"
-            "devstral:24b、qllama/some-model:tag 等)。CodeTrail 不會替你預設或推薦。"
+            "  3) 在 OPENCODE_CONFIG 或 ~/.config/opencode/opencode.json 設 \"model\": \"ollama/<CODE_MODEL>\"\n"
+            "<CODE_MODEL> 是佔位符,必須替換成實際模型名稱。\n"
+            "CodeTrail 不會替你預設或推薦。"
         )
-    return MODEL
+    return model
 
 
 def to_opencode_model_id(bare_model: str) -> str:

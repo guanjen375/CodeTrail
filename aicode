@@ -131,7 +131,7 @@ if [ -z "$PYBIN" ]; then
   exit 2
 fi
 
-# 主模型解析:env > -m/--model arg > ~/.config/opencode/opencode.json。
+# 主模型解析:env > -m/--model arg > OPENCODE_CONFIG / ~/.config/opencode/opencode.json。
 # 三個都找不到、是 placeholder、或被指到非 Ollama provider 時, resolve_main_model.py
 # 會印 fail-loud 訊息到 stderr 並 exit 2。CodeTrail 不內建 / 不 fallback 任何
 # 預設主模型 — 使用者必須先選一顆 Ollama 模型。

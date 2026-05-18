@@ -18,19 +18,16 @@ CodeTrail **不替你決定主聊天 / 程式推導模型**，也不會 fallback
 
 | 候選模型 | 適合任務 | 取捨 |
 |---|---|---|
-| `qwen3-coder:30b` | 讀 repo、改 code、產 patch、跑驗證閉環 | coding 與工具使用穩定度均衡；比 20B 慢；長工具鏈建議拆成「先查證、再修改」 |
-| `qwen3.6:35b-a3b-q4_K_M` | 跨檔推理、規格 vs 實作比對、較複雜重構 | 推理上限較高；32GB 顯卡先用 `AICODE_DYNAMIC_NUM_CTX_MAX=32768`，穩定再升 `65536`。**不要**用 `qwen3.6:35b-a3b-coding-nvfp4`（macOS 限定，Linux 拉會 412） |
-| `devstral:24b` | 快速 code review、找 bug、簡單 patch | 較快；工具呼叫格式不一定比 Qwen Coder 穩 |
-| `gpt-oss:20b` | 快速理解陌生 repo、摘要、初步定位 | 輕量、啟動快；複雜改檔與長工具鏈較弱 |
+| `<CODE_MODEL>` | 主聊天 / 程式推導模型 | 由你自行選擇並 pull；CodeTrail 不內建、不推薦、不 fallback |
 | `qwen3-vl:30b-a3b` | `analyze_file(...)` 處理截圖、UI error；`ingest_document(...)` 把圖片切 chunk 進 KB 也用它 | 不是主要 coding model；不分析圖片、也不把圖片進 KB 就不用 pull |
 | `bge-m3` (CodeTrail 內部固定附屬模型) | `query_knowledge(...)` / `code_rag_search(...)` 的 embedding | 不是聊天模型，不要在 OpenCode model selector 裡選 |
 | `qllama/bge-reranker-v2-m3` (CodeTrail 內部固定附屬模型) | RAG rerank | 同上；模型未 pull 時 RAG 品質會下降或報錯 |
 
 挑選方向（自己判斷）：
 
-- 要穩定完成「查證 → patch → test」：候選 `qwen3-coder:30b` 或同級 coding 模型。
-- 任務跨很多檔、要比對規格或做設計判斷：候選 `qwen3.6:35b-a3b-q4_K_M`（Linux 版本；`qwen3.6:35b-a3b-coding-nvfp4` 是 macOS 限定，不要用）。
-- 只想先看懂 repo 或做初步 review：候選 `gpt-oss:20b` / `devstral:24b`。
+- 要穩定完成「查證 → patch → test」：選一顆你已 pull 並實測過的 coding 模型。
+- 任務跨很多檔、要比對規格或做設計判斷：選較大的模型，但先用較小 context 驗證 VRAM。
+- 只想先看懂 repo 或做初步 review：選較小模型，確認 latency 與工具格式穩定後再固定下來。
 - 要讀截圖或把圖片進 KB：保留主聊天模型不變，讓 `analyze_file(...)` / `ingest_document(...)` 使用 `qwen3-vl:30b-a3b`。
 
 Context 建議：
@@ -43,8 +40,8 @@ Context 建議：
 # 30B 以下模型：直接 64K 通常最穩
 AICODE_DYNAMIC_NUM_CTX_MAX=65536 aicode
 
-# 35B 級的模型（如 qwen3.6:35b-a3b-q4_K_M）：先用 32K 跑一次，確認沒問題再升
-AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
+# 35B 級模型：先用 32K 跑一次，確認沒問題再升
+AICODE_MODEL=<CODE_MODEL> AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
 ```
 
 判斷要不要升上去：
@@ -153,13 +150,13 @@ aicode
 
 ```bash
 # 32GB VRAM：35B 先用 32K，穩定後再試 64K (示意 — 自己挑模型)
-AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
+AICODE_MODEL=<CODE_MODEL> AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
 
 # 24GB VRAM：優先用 30B / 24B，或把 35B context 降低
-AICODE_MODEL=qwen3-coder:30b AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
+AICODE_MODEL=<CODE_MODEL> AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
 
 # 16GB 以下：自己選 20B / 24B 或更小模型，不要硬開大 context
-AICODE_MODEL=gpt-oss:20b AICODE_DYNAMIC_NUM_CTX_MAX=16384 aicode
+AICODE_MODEL=<CODE_MODEL> AICODE_DYNAMIC_NUM_CTX_MAX=16384 aicode
 ```
 
 換硬體或模型後，用另一個終端機看 Ollama 實際載入狀態：

@@ -30,6 +30,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from model_resolution import (  # noqa: E402
+    load_first_opencode_config,
+    opencode_config_candidates,
+    resolve_main_model_from_env,
+    resolve_opencode_main_model,
+)
+
 OK = "[PASS]"
 WARN = "[WARN]"
 FAIL = "[FAIL]"
@@ -164,29 +171,26 @@ def check_models(r: Result, tags: set[str] | None) -> None:
         return
 
     # 主模型 (MODEL) 不再有 baked-in 預設; 沒設就 FAIL, 不做 silent fallback。
-    main_model = getattr(cfg, "MODEL", "") or ""
-    if not main_model:
+    try:
+        main_model = cfg.require_main_model()
+    except RuntimeError as exc:
+        main_model = ""
         r.fail(
-            "config.MODEL 沒設 — CodeTrail 不內建主聊天 / 程式推導模型。\n"
-            "        請先 ollama pull 一顆 Ollama 模型, 然後任選一種方式設定:\n"
-            "          1) export AICODE_MODEL=<CODE_MODEL>            (最優先)\n"
-            "          2) aicode -m ollama/<CODE_MODEL>               (per-run CLI 旗標)\n"
-            "          3) ~/.config/opencode/opencode.json 設\n"
-            '                \"model\": \"ollama/<CODE_MODEL>\"\n'
-            "        <CODE_MODEL> 是佔位符, 必須替換成實際模型名稱。"
+            "main model is missing or invalid. CodeTrail does not ship a "
+            f"default main model.\n        {exc}"
         )
-    else:
-        env_model = os.environ.get("AICODE_MODEL", "").strip()
-        if env_model:
-            suffix = " [from AICODE_MODEL env]"
-        else:
-            suffix = " [resolved from ~/.config/opencode/opencode.json]"
+
+    if main_model:
+        resolved = resolve_main_model_from_env(os.environ)
+        suffix = f" [from {resolved.source or 'runtime'}]"
+        if resolved.path:
+            suffix += f" {resolved.path}"
         if tags is None:
-            r.info(f"MODEL={main_model}{suffix} (主 LLM) — 未檢查 ollama 是否 pull")
+            r.info(f"MODEL={main_model}{suffix} (main LLM) -- ollama tags not checked")
         elif _tag_present(main_model, tags):
-            r.ok(f"MODEL={main_model}{suffix} 已 pull")
+            r.ok(f"MODEL={main_model}{suffix} is pulled")
         else:
-            r.fail(f"MODEL={main_model}{suffix} 尚未 pull — 執行: ollama pull {main_model}")
+            r.fail(f"MODEL={main_model}{suffix} is not pulled -- run: ollama pull {main_model}")
 
     # Embedding / reranker 是 RAG 內部固定附屬模型 (跟主模型分開), 預設值保留。
     rag_required = [
@@ -423,7 +427,10 @@ def check_ollama_runtime(r: Result, no_network: bool) -> None:
         r.info("Ollama 目前沒有載入任何模型(首次呼叫會自動載入)")
         return
 
-    main_model = str(getattr(cfg, "MODEL", "") or "")
+    try:
+        main_model = cfg.require_main_model()
+    except RuntimeError:
+        main_model = ""
     for m in models:
         name = m.get("name", "?")
         size = m.get("size", 0) or 0
@@ -459,22 +466,96 @@ def check_ollama_runtime(r: Result, no_network: bool) -> None:
             )
 
 
+def _opencode_provider_ollama_models(oc: dict) -> dict | None:
+    provider = oc.get("provider")
+    if isinstance(provider, dict):
+        ollama = provider.get("ollama")
+        if isinstance(ollama, dict):
+            models = ollama.get("models")
+            if isinstance(models, dict):
+                return models
+    return None
+
+
+def _opencode_ollama_models(oc: dict) -> dict | None:
+    provider_models = _opencode_provider_ollama_models(oc)
+    if provider_models is not None:
+        return provider_models
+
+    models = oc.get("models")
+    if isinstance(models, dict):
+        return models
+
+    return None
+
+
+def check_opencode_model_config(r: Result) -> None:
+    """Validate the OpenCode config model binding without contacting Ollama."""
+    cfg = _read_config()
+    if isinstance(cfg, Exception):
+        return
+
+    try:
+        main_model = cfg.require_main_model()
+    except RuntimeError as exc:
+        r.fail(f"main model is missing or invalid: {exc}")
+        return
+
+    path, oc, error = load_first_opencode_config(os.environ)
+    if error:
+        r.fail(f"OpenCode config read failed: {path} -- {error}")
+        return
+    if not oc:
+        r.info("OpenCode config not found; skipping provider.ollama.models validation")
+        return
+
+    oc_res = resolve_opencode_main_model(os.environ)
+    if oc_res.error:
+        where = f" {oc_res.path}" if oc_res.path else ""
+        r.fail(f"OpenCode config model invalid{where}: {oc_res.error}")
+        return
+    if not oc_res.model:
+        r.fail(f"OpenCode config {path} must set model=\"ollama/<CODE_MODEL>\"")
+        return
+
+    if oc_res.model != main_model:
+        r.fail(
+            f"OpenCode config model={oc_res.model!r} does not match "
+            f"CodeTrail main model={main_model!r}"
+        )
+        return
+
+    models = _opencode_provider_ollama_models(oc)
+    if not models:
+        r.fail(f"OpenCode config {path} must define provider.ollama.models")
+        return
+
+    if main_model not in models:
+        r.fail(
+            f"OpenCode config {path} provider.ollama.models is missing "
+            f"bare key {main_model!r}"
+        )
+        return
+
+    r.ok(f"OpenCode config {path} binds ollama/{main_model} and provider.ollama.models")
+
+
 def check_opencode_config_drift(r: Result, project: str | None) -> None:
     """看 opencode.json 內 model.limit.context 跟 CodeTrail internal ctx cap 是否大致對齊。
 
     僅 warn,絕不自動改使用者設定。
     """
     candidates = []
-    if project:
-        candidates.append(Path(project) / "opencode.json")
-    if os.environ.get("AICODE_ROOT"):
-        candidates.append(Path(os.environ["AICODE_ROOT"]) / "opencode.json")
-    candidates.append(REPO_ROOT / "opencode.json")
+    if os.environ.get("OPENCODE_CONFIG"):
+        candidates.extend(opencode_config_candidates(os.environ))
+    else:
+        if project:
+            candidates.append(Path(project) / "opencode.json")
+        if os.environ.get("AICODE_ROOT"):
+            candidates.append(Path(os.environ["AICODE_ROOT"]) / "opencode.json")
+        candidates.append(REPO_ROOT / "opencode.json")
+        candidates.extend(opencode_config_candidates(os.environ))
     # 全域設定
-    home = os.environ.get("HOME")
-    if home:
-        candidates.append(Path(home) / ".config" / "opencode" / "opencode.json")
-
     found = next((p for p in candidates if p.is_file()), None)
     if not found:
         r.info("找不到 opencode.json(沒走 OpenCode TUI 路線可忽略)")
@@ -494,7 +575,7 @@ def check_opencode_config_drift(r: Result, project: str | None) -> None:
     dyn_max = int(getattr(cfg, "DYNAMIC_NUM_CTX_MAX", 0) or 0)
     internal_ctx_cap = dyn_max if dyn_on and dyn_max > 0 else num_ctx
 
-    models = oc.get("models") or oc.get("model") or {}
+    models = _opencode_ollama_models(oc) or {}
     if not isinstance(models, dict) or not models:
         r.info(f"opencode.json={found} — 未設定 models.limit.context,OpenCode 會用內建預設")
         return
@@ -669,6 +750,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n-- opencode-ai entry --")
     check_opencode_ai_entry(r)
+    check_opencode_model_config(r)
 
     print("\n-- context / offload --")
     check_context_settings(r)

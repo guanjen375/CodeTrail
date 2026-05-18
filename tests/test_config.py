@@ -14,25 +14,36 @@ def test_model_strings_non_empty():
     assert isinstance(config.RERANKER_MODEL, str) and config.RERANKER_MODEL.strip()
 
 
-def test_require_main_model_fails_when_unset(monkeypatch):
+def test_require_main_model_fails_when_unset(monkeypatch, tmp_path):
     """MODEL 為空時 require_main_model 必須 raise (fail-loud, 不 fallback)。"""
     import pytest
-    monkeypatch.setattr(config, "MODEL", "")
+    monkeypatch.delenv("AICODE_MODEL", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     with pytest.raises(RuntimeError) as exc:
         config.require_main_model()
     assert "AICODE_MODEL" in str(exc.value)
 
 
 def test_require_main_model_returns_value_when_set(monkeypatch):
-    monkeypatch.setattr(config, "MODEL", "some-org/some-model:tag")
+    monkeypatch.setenv("AICODE_MODEL", "some-org/some-model:tag")
     assert config.require_main_model() == "some-org/some-model:tag"
+
+
+def test_require_main_model_rejects_non_ollama_provider(monkeypatch):
+    import pytest
+    monkeypatch.setenv("AICODE_MODEL", "anthropic/claude-sonnet-4")
+    with pytest.raises(RuntimeError) as exc:
+        config.require_main_model()
+    assert "non-Ollama provider" in str(exc.value)
 
 
 def test_to_opencode_model_id_normalization():
     # bare name → 加 ollama/ prefix
-    assert config.to_opencode_model_id("qwen3-coder:30b") == "ollama/qwen3-coder:30b"
+    assert config.to_opencode_model_id("example-code-model:30b") == "ollama/example-code-model:30b"
     # 已含 ollama/ → 不重複加
-    assert config.to_opencode_model_id("ollama/qwen3-coder:30b") == "ollama/qwen3-coder:30b"
+    assert config.to_opencode_model_id("ollama/example-code-model:30b") == "ollama/example-code-model:30b"
     # 含 namespace slash 也視為 bare ollama name (qllama/, hf.co/ 等)
     assert (
         config.to_opencode_model_id("qllama/bge-reranker-v2-m3")

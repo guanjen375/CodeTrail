@@ -27,47 +27,47 @@ from gpu_safety import (
 # ============================================================
 # fixtures：典型模型架構（直接從 Ollama /api/show 上抓真實值）
 # ============================================================
-def _qwen3_coder_30b_show_payload() -> dict:
+def _dense_transformer_30b_show_payload() -> dict:
     # 標準 dense transformer，MHA-ish
     return {
         "details": {
-            "family": "qwen3",
+            "family": "densearch",
             "parameter_size": "30.5B",
             "quantization_level": "Q4_K_M",
         },
         "model_info": {
-            "general.architecture": "qwen3",
+            "general.architecture": "densearch",
             "general.parameter_count": 30_532_122_624,
-            "qwen3.block_count": 48,
-            "qwen3.attention.head_count": 32,
-            "qwen3.attention.head_count_kv": 4,
-            "qwen3.attention.key_length": 128,
-            "qwen3.attention.value_length": 128,
-            "qwen3.embedding_length": 5120,
+            "densearch.block_count": 48,
+            "densearch.attention.head_count": 32,
+            "densearch.attention.head_count_kv": 4,
+            "densearch.attention.key_length": 128,
+            "densearch.attention.value_length": 128,
+            "densearch.embedding_length": 5120,
         },
     }
 
 
-def _qwen35moe_show_payload() -> dict:
+def _hybrid_moe_show_payload() -> dict:
     # MoE + 混 SSM；head_count_kv 是 null，公式應 fallback 到 head_count；
     # full_attention_interval=4 表示每 4 層才一層 full attention，KV cache
     # 只算 attention 層
     return {
         "details": {
-            "family": "qwen35moe",
+            "family": "hybridmoe",
             "parameter_size": "36.0B",
             "quantization_level": "Q4_K_M",
         },
         "model_info": {
-            "general.architecture": "qwen35moe",
+            "general.architecture": "hybridmoe",
             "general.parameter_count": 35_951_822_704,
-            "qwen35moe.block_count": 40,
-            "qwen35moe.attention.head_count": 16,
-            "qwen35moe.attention.head_count_kv": None,
-            "qwen35moe.attention.key_length": 256,
-            "qwen35moe.attention.value_length": 256,
-            "qwen35moe.embedding_length": 2048,
-            "qwen35moe.full_attention_interval": 4,
+            "hybridmoe.block_count": 40,
+            "hybridmoe.attention.head_count": 16,
+            "hybridmoe.attention.head_count_kv": None,
+            "hybridmoe.attention.key_length": 256,
+            "hybridmoe.attention.value_length": 256,
+            "hybridmoe.embedding_length": 2048,
+            "hybridmoe.full_attention_interval": 4,
         },
     }
 
@@ -121,12 +121,12 @@ class TestEstimateWeights:
 # estimate_kv_per_token_bytes
 # ============================================================
 class TestEstimateKvCache:
-    def test_qwen3_coder_gqa(self):
+    def test_dense_transformer_gqa(self):
         # GQA: kv_heads=4, head_dim=128 (key+value), 48 layers, fp16
         # per_layer = (4 * 128 + 4 * 128) * 2 = 2048 bytes
         # total = 48 * 2048 = 98304 bytes/token
         m = ModelInfo(
-            name="qwen3-coder:30b",
+            name="example-code-model:30b",
             num_layers=48,
             num_heads=32,
             num_kv_heads=4,
@@ -137,13 +137,13 @@ class TestEstimateKvCache:
         per_token = estimate_kv_per_token_bytes(m)
         assert per_token == 48 * (4 * 128 * 2 + 4 * 128 * 2)
 
-    def test_qwen35moe_null_kv_heads_falls_back_to_head_count(self):
+    def test_hybrid_moe_null_kv_heads_falls_back_to_head_count(self):
         # head_count_kv 是 None → fallback 到 num_heads=16 (MHA 假設,保守)
         # 純 transformer 假設 (full_attention_interval=1):
         #   per_layer = (16 * 256 + 16 * 256) * 2 = 16384 bytes
         #   total = 40 * 16384 = 655360 bytes/token
         m = ModelInfo(
-            name="qwen3.6:35b-a3b-q4_K_M",
+            name="example-hybrid-model:35b",
             num_layers=40,
             num_heads=16,
             num_kv_heads=None,
@@ -156,9 +156,9 @@ class TestEstimateKvCache:
         assert per_token == 40 * (16 * 256 * 2 + 16 * 256 * 2)
 
     def test_ssm_hybrid_only_counts_attention_layers(self):
-        # qwen35moe 真實: full_attention_interval=4 → 只 40/4=10 層算 KV cache
+        # SSM hybrid: full_attention_interval=4 → 只 40/4=10 層算 KV cache
         m = ModelInfo(
-            name="qwen3.6:35b-a3b-q4_K_M",
+            name="example-hybrid-model:35b",
             num_layers=40,
             num_heads=16,
             num_kv_heads=None,
@@ -225,12 +225,12 @@ class TestEstimateKvCache:
 # compute_safe_ctx
 # ============================================================
 class TestComputeSafeCtx:
-    def test_qwen3_coder_on_5090_easily_fits_64k(self):
+    def test_dense_30b_on_5090_easily_fits_64k(self):
         # 30B Q4_K_M (~18.5GB) + 48*2048=98KB/token * 64K = ~6GB
         # 18.5 + 6 + 2(headroom) = 26.5 GB < 32 GB → fits
         gpu = GPUInfo(name="RTX 5090", total_bytes=32 * 1024 ** 3, free_bytes=30 * 1024 ** 3)
         model = ModelInfo(
-            name="qwen3-coder:30b",
+            name="example-code-model:30b",
             parameter_count=30_500_000_000,
             quantization="Q4_K_M",
             num_layers=48,
@@ -244,14 +244,14 @@ class TestComputeSafeCtx:
         assert safe is not None
         assert safe >= 64 * 1024
 
-    def test_qwen35moe_on_5090_with_ssm_hybrid_fits_around_32k(self):
+    def test_hybrid_moe_on_5090_with_ssm_hybrid_fits_around_32k(self):
         # 36B Q4_K_M (~21.8GB) + 約 160KB/token (10 attn layers) → 32K KV ≈ 5GB
         # 21.8 + 5 + 2 headroom = 28.8 GB < 32 GB → 32K 應該 SAFE
         # 但 64K 會吃 10GB KV → 33.8 GB > 32 GB → 64K UNSAFE
         # （這跟 README 的「32GB VRAM 先用 32768，穩定後再試 65536」一致）
         gpu = GPUInfo(name="RTX 5090", total_bytes=32 * 1024 ** 3, free_bytes=30 * 1024 ** 3)
         model = ModelInfo(
-            name="qwen3.6:35b-a3b-q4_K_M",
+            name="example-hybrid-model:35b",
             parameter_count=35_951_822_704,
             quantization="Q4_K_M",
             num_layers=40,
@@ -267,12 +267,12 @@ class TestComputeSafeCtx:
         # 32K 範圍內: safe cap 應介於 32K 與 64K 之間
         assert 32 * 1024 <= safe < 64 * 1024
 
-    def test_qwen35moe_without_ssm_hint_is_conservative(self):
+    def test_hybrid_moe_without_ssm_hint_is_conservative(self):
         # 沒抓到 full_attention_interval → 退回保守估算 → safe cap 變很低
         # 這驗證「metadata 缺欄位時偏向 refuse to start」
         gpu = GPUInfo(name="RTX 5090", total_bytes=32 * 1024 ** 3, free_bytes=30 * 1024 ** 3)
         model = ModelInfo(
-            name="qwen3.6:35b-a3b-q4_K_M",
+            name="example-hybrid-model:35b",
             parameter_count=35_951_822_704,
             quantization="Q4_K_M",
             num_layers=40,
@@ -341,10 +341,10 @@ class TestCheckSafety:
 
     def test_safe_when_within_cap(self):
         v = check_safety(
-            "qwen3-coder:30b",
+            "example-code-model:30b",
             32 * 1024,
             _gpu=self._gpu(32),
-            _model_info=self._model_from_payload(_qwen3_coder_30b_show_payload()),
+            _model_info=self._model_from_payload(_dense_transformer_30b_show_payload()),
         )
         assert v.status == "SAFE"
         assert v.computed_max_ctx is not None
@@ -353,10 +353,10 @@ class TestCheckSafety:
 
     def test_unsafe_when_over_cap(self):
         v = check_safety(
-            "qwen3.6:35b-a3b-q4_K_M",
+            "example-hybrid-model:35b",
             65536,
             _gpu=self._gpu(32),
-            _model_info=self._model_from_payload(_qwen35moe_show_payload()),
+            _model_info=self._model_from_payload(_hybrid_moe_show_payload()),
         )
         assert v.status == "UNSAFE"
         assert v.computed_max_ctx is not None
@@ -429,21 +429,21 @@ class TestQueryGpuInfo:
 # query_model_info: HTTP 用 _http_get_json hook
 # ============================================================
 class TestQueryModelInfo:
-    def test_parses_qwen3_coder(self):
+    def test_parses_dense_transformer(self):
         m = query_model_info(
-            "qwen3-coder:30b",
-            _http_get_json=lambda url, body: _qwen3_coder_30b_show_payload(),
+            "example-code-model:30b",
+            _http_get_json=lambda url, body: _dense_transformer_30b_show_payload(),
         )
         assert m is not None
-        assert m.architecture == "qwen3"
+        assert m.architecture == "densearch"
         assert m.num_layers == 48
         assert m.num_kv_heads == 4
         assert m.quantization == "Q4_K_M"
 
     def test_handles_null_head_count_kv(self):
         m = query_model_info(
-            "qwen3.6:35b",
-            _http_get_json=lambda url, body: _qwen35moe_show_payload(),
+            "example-hybrid-model:35b",
+            _http_get_json=lambda url, body: _hybrid_moe_show_payload(),
         )
         assert m is not None
         assert m.num_kv_heads is None  # null in metadata → None
@@ -451,8 +451,8 @@ class TestQueryModelInfo:
 
     def test_full_attention_interval_default_1_when_missing(self):
         m = query_model_info(
-            "qwen3-coder:30b",
-            _http_get_json=lambda url, body: _qwen3_coder_30b_show_payload(),
+            "example-code-model:30b",
+            _http_get_json=lambda url, body: _dense_transformer_30b_show_payload(),
         )
         assert m.full_attention_interval == 1  # 純 transformer
 
@@ -481,7 +481,7 @@ class TestRuntimeOffloadCheck:
         def hook(url):
             return {
                 "models": [{
-                    "name": "qwen3-coder:30b",
+                    "name": "example-code-model:30b",
                     "size": 30 * 1024 ** 3,
                     "size_vram": 18 * 1024 ** 3,  # 60% GPU
                     "context_length": 65536,
@@ -497,7 +497,7 @@ class TestRuntimeOffloadCheck:
         def hook(url):
             return {
                 "models": [{
-                    "name": "qwen3-coder:30b",
+                    "name": "example-code-model:30b",
                     "size": 20 * 1024 ** 3,
                     "size_vram": 20 * 1024 ** 3,
                     "context_length": 32768,
@@ -522,11 +522,11 @@ class TestRuntimeOffloadCheck:
             return {
                 "models": [
                     {"name": "bge-m3:latest", "size": 1 * 1024 ** 3, "size_vram": 1 * 1024 ** 3},
-                    {"name": "qwen3-coder:30b", "size": 20 * 1024 ** 3, "size_vram": 18 * 1024 ** 3},
+                    {"name": "example-code-model:30b", "size": 20 * 1024 ** 3, "size_vram": 18 * 1024 ** 3},
                 ]
             }
         s = runtime_offload_check(
-            preferred_model="qwen3-coder:30b",
+            preferred_model="example-code-model:30b",
             _http_get_json=hook,
         )
-        assert s.model_name == "qwen3-coder:30b"
+        assert s.model_name == "example-code-model:30b"

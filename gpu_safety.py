@@ -82,12 +82,12 @@ class ModelInfo:
     # head_count_kv 在 GQA / MQA 時 < num_heads；MHA 時 = num_heads；
     # 有些模型 GGUF 寫 null，這裡就 fallback 到 num_heads。
     num_kv_heads: Optional[int] = None
-    # key_length / value_length 多數模型一樣，但 qwen35moe 之類分開定義；
+    # key_length / value_length 多數模型一樣，但有些 hybrid arch 會分開定義；
     # 若 metadata 沒給就 fallback 到 embedding_length / num_heads。
     key_length: Optional[int] = None
     value_length: Optional[int] = None
     embedding_length: Optional[int] = None
-    # SSM/Mamba hybrid 模型 (例: qwen35moe) 只有 1/N 的層是 full attention,
+    # SSM/Mamba hybrid 模型只有 1/N 的層是 full attention,
     # 其他層是 SSM,KV cache 為 O(1) 不隨 ctx 成長。GGUF metadata 用
     # `<arch>.full_attention_interval = N` 表示。沒設或設為 1 = 純 transformer。
     full_attention_interval: int = 1
@@ -214,7 +214,7 @@ def query_model_info(
     quant = details.get("quantization_level") or info.get("general.file_type")
 
     # 從 architecture-prefixed key 抽欄位（每個模型 namespace 不同）：
-    # qwen35moe.block_count / llama.block_count / qwen2.block_count …
+    # hybridmoe.block_count / llama.block_count / densearch.block_count …
     def _arch_key(suffix: str):
         if not arch:
             return None
@@ -321,7 +321,7 @@ def estimate_kv_per_token_bytes(
     else:
         return None
 
-    # SSM hybrid (qwen35moe 等): 只有 num_layers // full_attention_interval 層
+    # SSM hybrid: 只有 num_layers // full_attention_interval 層
     # 是 full attention,其他是 SSM (固定大小,不隨 ctx 成長,可忽略)。
     fai = max(1, getattr(model, "full_attention_interval", 1) or 1)
     attn_layers = max(1, model.num_layers // fai)

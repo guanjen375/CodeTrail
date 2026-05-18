@@ -48,7 +48,7 @@ def test_aicode_prepares_opencode_mcp_wrapper(tmp_path):
         "AICODE_CTX_SAFETY_DISABLE": "1",
         # CodeTrail 不再內建預設主模型, 啟動時要先解析。給個假值讓 resolve_main_model
         # 通過; 真正的主模型解析邏輯有自己的單元測試覆蓋。
-        "AICODE_MODEL": "qwen3-coder:30b",
+        "AICODE_MODEL": "example-code-model:30b",
     }
     r = subprocess.run(
         [str(aicode_link)],

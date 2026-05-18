@@ -47,7 +47,7 @@ pip install mcp pymupdf4llm ollama
 CodeTrail 不內建主聊天 / 程式推導模型 — 你必須自己挑一顆 Ollama 模型，下面用 `<CODE_MODEL>` 當佔位符代表它。**`<CODE_MODEL>` 不是真實 tag**，請替換成實際模型名稱（候選比較見 [模型與硬體建議](models.md)）：
 
 ```bash
-ollama pull <CODE_MODEL>            # 自己選的主模型 (例如 qwen3-coder:30b、devstral:24b、...)
+ollama pull <CODE_MODEL>            # 自己選的主模型
 ollama pull bge-m3                  # CodeTrail RAG embedding
 ollama pull qllama/bge-reranker-v2-m3  # CodeTrail RAG reranker
 ```
@@ -57,15 +57,10 @@ ollama pull qllama/bge-reranker-v2-m3  # CodeTrail RAG reranker
 如果想在 TUI 裡之後可以快速切換模型，可以把多顆候選都先 pull 下來（一樣是自己選）：
 
 ```bash
-ollama pull qwen3-coder:30b
-ollama pull qwen3.6:35b-a3b-q4_K_M
-ollama pull devstral:24b
-ollama pull gpt-oss:20b
+ollama pull <ANOTHER_CODE_MODEL>
 ```
 
 這幾個名字後面的「:」加上一串符號代表模型不同的壓縮格式（影響大小、速度、品質）。同一個模型可以有多個版本，Ollama 上挑哪個版本就用對應的名字 pull。
-
-`qwen3.6:35b-a3b-q4_K_M` 是 Linux 上能用的版本。另一個看起來很像的名字 `qwen3.6:35b-a3b-coding-nvfp4` 是 macOS 限定，Linux 下載會直接報錯 `412: this model requires macOS`，不要用這個。
 
 如果會讓 OpenCode 分析截圖、UI error 或圖片，另外下載視覺模型：
 
@@ -174,7 +169,7 @@ aicode
 AICODE_MODEL=<CODE_MODEL> aicode
 ```
 
-主模型解析優先順序：`AICODE_MODEL` env > `aicode -m / --model` CLI 旗標 > `~/.config/opencode/opencode.json` 的 `"model"` 欄位。三個都沒有、或值是 `<CODE_MODEL>` 之類的 placeholder 時，`aicode` 會 fail-loud，不會 fallback 任何內建預設模型。
+主模型解析優先順序：`AICODE_MODEL` env > `aicode -m / --model` CLI 旗標 > `OPENCODE_CONFIG` / `~/.config/opencode/opencode.json` 的 `"model"` 欄位。三個都沒有、或值是 `<CODE_MODEL>` 之類的 placeholder 時，`aicode` 會 fail-loud，不會 fallback 任何內建主模型。
 
 換模型、context、offload、遠端 Ollama 的細節集中在 [模型與硬體建議](models.md)。不要只在 TUI 裡用 `/models` 切換；那只會換 OpenCode 前台對話模型，不會同步 CodeTrail MCP server 的內部呼叫。
 

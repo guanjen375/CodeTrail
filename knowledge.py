@@ -11,6 +11,8 @@ from functools import lru_cache
 
 from http_client import get_session
 
+import config
+
 try:
     import numpy as np
     HAS_NUMPY = True
@@ -29,7 +31,7 @@ except ImportError:
 
 from config import (
     OLLAMA_GENERATE_URL, OLLAMA_EMBEDDINGS_URL, OLLAMA_TAGS_URL,
-    MODEL, KNOWLEDGE_FILE, KNOWLEDGE_EMB_FILE,
+    KNOWLEDGE_FILE, KNOWLEDGE_EMB_FILE,
     KNOWLEDGE_TOP_K, KNOWLEDGE_CANDIDATE_K, KNOWLEDGE_THRESHOLD,
     KNOWLEDGE_THRESHOLD_SHORT, KNOWLEDGE_SHORT_QUERY_TOKENS,
     DYNAMIC_THRESHOLD_RATIO, DYNAMIC_TOP_K_HIGH_SCORE,
@@ -603,10 +605,11 @@ class KnowledgeBase:
 關鍵字:"""
 
             session = get_session()
+            model = config.require_main_model()
             resp = session.post(
                 OLLAMA_GENERATE_URL,
                 json={
-                    "model": MODEL,
+                    "model": model,
                     "prompt": prompt,
                     "stream": False,
                     "options": {"num_ctx": 2048, "temperature": 0}
@@ -675,6 +678,7 @@ class KnowledgeBase:
 
         try:
             session = get_session()
+            model = config.require_main_model()
 
             # 根據啟用的類型生成變體
             for query_type in MULTI_QUERY_TYPES[:MULTI_QUERY_COUNT]:
@@ -744,7 +748,7 @@ English:"""
                 resp = session.post(
                     OLLAMA_GENERATE_URL,
                     json={
-                        "model": MODEL,
+                        "model": model,
                         "prompt": prompt,
                         "stream": False,
                         "options": {"num_ctx": 2048, "temperature": 0.3}
@@ -1360,10 +1364,11 @@ English:"""
 
         try:
             session = get_session()
+            model = config.require_main_model()
             resp = session.post(
                 OLLAMA_GENERATE_URL,
                 json={
-                    "model": MODEL,
+                    "model": model,
                     "prompt": rerank_prompt,
                     "stream": False,
                     "options": {"num_ctx": 8192, "temperature": 0}

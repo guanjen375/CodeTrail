@@ -12,11 +12,12 @@ from pathlib import Path
 
 from http_client import get_session
 
+import config
 import context_budget
 
 from config import (
     OLLAMA_GENERATE_URL, OLLAMA_TAGS_URL, OLLAMA_PS_URL,
-    MODEL, NUM_CTX, NUM_CTX_FULL_MODE,
+    NUM_CTX, NUM_CTX_FULL_MODE,
     CODE_EXTENSIONS, IGNORED_DIRS, IGNORED_FILES, IGNORED_PATTERNS,
     LOW_PRIORITY_PATTERNS, ALLOWED_DOT_DIRS,
     STRICT_MODE, STRICT_MODE_KEYWORDS, SPEC_QUESTION_KEYWORDS,
@@ -353,6 +354,7 @@ def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None,
         source: 標記呼叫來源（寫入 telemetry，純 metadata）
     """
     ctx = num_ctx if num_ctx is not None else NUM_CTX
+    model = config.require_main_model()
 
     # Context gate：先估算 token、做硬性 gate、紀錄 metadata
     try:
@@ -360,7 +362,7 @@ def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None,
             source=source,
             requested_num_ctx=ctx,
             prompt=prompt,
-            model=MODEL,
+            model=model,
         )
     except context_budget.ContextOverflowError as exc:
         return str(exc)
@@ -368,7 +370,7 @@ def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None,
     try:
         session = get_session()
         resp = session.post(OLLAMA_GENERATE_URL, json={
-            "model": MODEL,
+            "model": model,
             "prompt": prompt,
             "stream": False,
             "options": {"num_ctx": ctx, "temperature": temperature},
@@ -382,10 +384,10 @@ def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None,
     except Exception as e:
         usage.error_type = type(e).__name__
         context_budget.log_metrics(usage)
-        return _llm_error_message(e)
+        return _llm_error_message(e, model)
 
 
-def _llm_error_message(e: Exception) -> str:
+def _llm_error_message(e: Exception, model: str) -> str:
     """把底層例外轉成新手看得懂的多行錯誤字串。
 
     呼叫端拿到的字串都以 '[ERROR]' 開頭，方便上層 detect 與 propagate。
@@ -407,11 +409,10 @@ def _llm_error_message(e: Exception) -> str:
             "   檢查: ollama ps  /  nvidia-smi"
         )
     if "HTTPError" in err_type or "404" in str(e):
-        from config import MODEL as _M
         return (
             f"[ERROR] Ollama 回 HTTP 錯誤: {e}\n"
-            f"   常見原因：模型 {_M!r} 沒有 pull。\n"
-            f"   檢查: ollama list  /  必要時 ollama pull {_M}"
+            f"   常見原因：模型 {model!r} 沒有 pull。\n"
+            f"   檢查: ollama list  /  必要時 ollama pull {model}"
         )
     return f"[ERROR] LLM 呼叫失敗 ({err_type}): {e}"
 
@@ -432,6 +433,7 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
     import time
 
     ctx = num_ctx if num_ctx is not None else NUM_CTX
+    model = config.require_main_model()
 
     # Context gate：超過 hard threshold 直接拒絕，不送 prompt 給 Ollama
     try:
@@ -439,7 +441,7 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
             source=source,
             requested_num_ctx=ctx,
             prompt=prompt,
-            model=MODEL,
+            model=model,
         )
     except context_budget.ContextOverflowError as exc:
         # 與其他 error 一樣，在 stderr 印出讓使用者看到
@@ -453,7 +455,7 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
     try:
         session = get_session()
         resp = session.post(OLLAMA_GENERATE_URL, json={
-            "model": MODEL,
+            "model": model,
             "prompt": prompt,
             "stream": True,
             "options": {"num_ctx": ctx, "temperature": temperature},
@@ -509,7 +511,7 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
     except Exception as e:
         usage.error_type = type(e).__name__
         context_budget.log_metrics(usage)
-        msg = _llm_error_message(e)
+        msg = _llm_error_message(e, model)
         # 串流模式下要主動 print，否則使用者看不到：等於是「卡住」的觀感。
         # 用 stderr 避免污染呼叫端可能要 capture 的 stdout 內容。
         try:
