@@ -7,7 +7,7 @@
     python3 scripts/ctx_safety_check.py
 
 讀取的環境變數:
-    AICODE_MODEL                  必要;沒設則跳過檢查 (exit 0)
+    AICODE_MODEL                  可選;沒設則用 config.py 的預設模型
     AICODE_DYNAMIC_NUM_CTX_MAX    要檢查的 ctx 上限;預設 65536 (跟 config.py 同)
     AICODE_OLLAMA_BASE_URL        Ollama URL;預設 http://localhost:11434
     AICODE_ACCEPT_CTX_RISK        =1 時即使預測 UNSAFE 也 exit 0 (使用者覆蓋)
@@ -36,9 +36,11 @@ if str(REPO_ROOT) not in sys.path:
 import gpu_safety  # noqa: E402
 
 
-# 跟 config.py 的 DYNAMIC_NUM_CTX_MAX 預設保持一致。
-# 若 config.py 改了預設,這裡也要改 (或乾脆 import config — 但 import config
-# 會牽連 sys 模組,在 wrapper 啟動的瞬間多載入幾個 module 不划算)。
+# 跟 config.py 的 DEFAULT_MODEL / DYNAMIC_NUM_CTX_MAX 預設保持一致。
+# 若 config.py 改了預設,這裡也要改。這個啟動前檢查刻意不 import config:
+# config.py 會 parse 多個 env var,其中任一使用者填錯都可能讓這個 safety gate
+# 在印出可讀訊息前先爆掉。
+DEFAULT_MODEL = "qwen3-coder:30b"
 DEFAULT_CTX_MAX = 65536
 
 
@@ -58,11 +60,8 @@ def main() -> int:
 
     model = os.environ.get("AICODE_MODEL", "").strip()
     if not model:
-        # 沒指定模型代表使用者走 config.py 預設;這個檢查不是 doctor,
-        # 用 AICODE_MODEL 當訊號表示「使用者有意識在用某個模型」
-        # 否則跳過,避免綁死 config.DEFAULT_MODEL。
-        _print("AICODE_MODEL 未設,跳過 ctx 安全檢查")
-        return 0
+        model = DEFAULT_MODEL
+        _print(f"AICODE_MODEL 未設,使用預設模型 {model} 做 ctx 安全檢查")
 
     try:
         requested = int(os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX", "") or DEFAULT_CTX_MAX)

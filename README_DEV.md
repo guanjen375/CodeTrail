@@ -220,7 +220,7 @@ context_budget.log_metrics(usage)
 | 模組 / 入口 | 責任 |
 |---|---|
 | `gpu_safety.py` | 純 library:`query_gpu_info()` 跑 nvidia-smi、`query_model_info()` 打 Ollama `/api/show`、`estimate_kv_per_token_bytes()` 用標準 transformer 公式(含 SSM hybrid `full_attention_interval` 折算)、`compute_safe_ctx()` 算 fit 在 VRAM 內的最大 ctx、`check_safety()` 包成 `SafetyVerdict` 給呼叫端決策。所有 I/O 都用 hook 參數注入,測試可完全離線 mock。 |
-| `scripts/ctx_safety_check.py` | CLI 入口。讀 env (`AICODE_MODEL` / `AICODE_DYNAMIC_NUM_CTX_MAX` / `AICODE_OLLAMA_BASE_URL`),呼 `gpu_safety.check_safety()`,根據 verdict 與 `AICODE_ACCEPT_CTX_RISK` / `AICODE_CTX_SAFETY_DISABLE` 決定 exit code。`aicode` wrapper 在 exec opencode 前跑這個,exit 2 = refuse to start。 |
+| `scripts/ctx_safety_check.py` | CLI 入口。讀 env (`AICODE_MODEL` 未設時用 `config.py` 預設模型 / `AICODE_DYNAMIC_NUM_CTX_MAX` / `AICODE_OLLAMA_BASE_URL`),呼 `gpu_safety.check_safety()`,根據 verdict 與 `AICODE_ACCEPT_CTX_RISK` / `AICODE_CTX_SAFETY_DISABLE` 決定 exit code。`aicode` wrapper 在 exec opencode 前跑這個,exit 2 = refuse to start。 |
 | `context_budget.py::_emit_runtime_offload_check_once` | runtime 驗證 hook:`[CTX] WARNING` 或 `[CTX_OVERFLOW]` 觸發時順手查一次 `/api/ps`,把實測 GPU% 黏在 log 後面。每個 process 只跑一次,任何錯誤靜默吞掉。 |
 
 ### 設計守則

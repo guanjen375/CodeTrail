@@ -107,6 +107,77 @@ def test_tag_present_explicit_tag_not_in_latest():
     assert not doc._tag_present("qwen3-coder:30b", {"qwen3-coder:latest"})
 
 
+def test_check_opencode_ai_entry_warns_when_cli_missing(monkeypatch):
+    monkeypatch.setattr(doc.shutil, "which", lambda name: None)
+    r = doc.Result()
+    doc.check_opencode_ai_entry(r)
+    assert not r.fails
+    assert any("opencode-ai CLI `opencode` 不在 PATH" in w for w in r.warns)
+
+
+def test_check_opencode_ai_entry_warns_when_cli_is_not_npm_package(monkeypatch):
+    def fake_which(name: str):
+        return {
+            "opencode": "/usr/local/bin/opencode",
+            "npm": "/usr/local/bin/npm",
+        }.get(name)
+
+    class FakeProc:
+        returncode = 1
+        stdout = '{"dependencies": {}}'
+        stderr = ""
+
+    monkeypatch.setattr(doc.shutil, "which", fake_which)
+    monkeypatch.setattr(doc.subprocess, "run", lambda *args, **kwargs: FakeProc())
+
+    r = doc.Result()
+    doc.check_opencode_ai_entry(r)
+    assert any("opencode-ai CLI `opencode` 在 PATH" in p for p in r.passes)
+    assert any("opencode-ai" in w and "未偵測到" in w for w in r.warns)
+
+
+def test_check_opencode_ai_entry_rejects_npm_missing_marker(monkeypatch):
+    def fake_which(name: str):
+        return {
+            "opencode": "/usr/local/bin/opencode",
+            "npm": "/usr/local/bin/npm",
+        }.get(name)
+
+    class FakeProc:
+        returncode = 1
+        stdout = '{"dependencies": {"opencode-ai": {"missing": true}}}'
+        stderr = ""
+
+    monkeypatch.setattr(doc.shutil, "which", fake_which)
+    monkeypatch.setattr(doc.subprocess, "run", lambda *args, **kwargs: FakeProc())
+
+    r = doc.Result()
+    doc.check_opencode_ai_entry(r)
+    assert any("opencode-ai" in w and "未偵測到" in w for w in r.warns)
+
+
+def test_check_opencode_ai_entry_accepts_npm_package(monkeypatch):
+    def fake_which(name: str):
+        return {
+            "opencode": "/usr/local/bin/opencode",
+            "npm": "/usr/local/bin/npm",
+        }.get(name)
+
+    class FakeProc:
+        returncode = 0
+        stdout = '{"dependencies": {"opencode-ai": {"version": "1.2.3"}}}'
+        stderr = ""
+
+    monkeypatch.setattr(doc.shutil, "which", fake_which)
+    monkeypatch.setattr(doc.subprocess, "run", lambda *args, **kwargs: FakeProc())
+
+    r = doc.Result()
+    doc.check_opencode_ai_entry(r)
+    assert not r.fails
+    assert not r.warns
+    assert any("npm package opencode-ai 已安裝 (1.2.3)" in p for p in r.passes)
+
+
 def test_check_models_accepts_latest_tag_for_bare_config_name(monkeypatch):
     """模擬使用者只裝 bge-m3:latest 的情況。修補前會 FAIL,修補後應 PASS。"""
     import config as cfg

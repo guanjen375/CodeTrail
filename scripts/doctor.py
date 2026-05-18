@@ -20,6 +20,7 @@ import importlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -202,14 +203,83 @@ def check_models(r: Result, tags: set[str] | None) -> None:
             r.warn(f"{attr}={name} 沒 pull ({desc}) — 需要時: ollama pull {name}")
 
 
-def check_opencode_in_path(r: Result) -> None:
-    if shutil.which("opencode"):
-        r.ok("opencode 在 PATH")
+def _npm_global_package_status(package: str) -> tuple[bool | None, str]:
+    """Return whether a global npm package is installed.
+
+    None means npm/package metadata could not be checked locally. This never
+    talks to the registry; `npm list -g` only inspects the local install tree.
+    """
+    npm = shutil.which("npm")
+    if not npm:
+        return None, "npm 不在 PATH"
+
+    try:
+        proc = subprocess.run(
+            [npm, "list", "-g", package, "--depth=0", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "npm list -g timeout"
+    except OSError as e:
+        return None, str(e)
+
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        data = {}
+
+    deps = data.get("dependencies") if isinstance(data, dict) else None
+    if isinstance(deps, dict) and package in deps:
+        meta = deps.get(package)
+        if isinstance(meta, dict) and meta.get("missing"):
+            detail = (proc.stderr or proc.stdout or "").strip()
+            return False, detail
+        version = meta.get("version") if isinstance(meta, dict) else None
+        if proc.returncode == 0 or version:
+            return True, str(version) if version else ""
+
+    if proc.returncode == 0:
+        return True, ""
+
+    detail = (proc.stderr or proc.stdout or "").strip()
+    return False, detail
+
+
+def check_opencode_ai_entry(r: Result) -> None:
+    opencode = shutil.which("opencode")
+    if opencode:
+        r.ok(f"opencode-ai CLI `opencode` 在 PATH: {opencode}")
     else:
         r.warn(
-            "opencode 不在 PATH — 日常入口需要 OpenCode TUI，請：\n"
+            "opencode-ai CLI `opencode` 不在 PATH — 日常唯一入口需要 OpenCode TUI，請：\n"
             "        npm install -g opencode-ai"
         )
+
+    installed, detail = _npm_global_package_status("opencode-ai")
+    if installed is True:
+        suffix = f" ({detail})" if detail else ""
+        r.ok(f"npm package opencode-ai 已安裝{suffix}")
+    elif installed is False:
+        if opencode:
+            r.warn(
+                "找到 `opencode`，但 npm global package `opencode-ai` 未偵測到；"
+                "若這是舊套件或其他同名 CLI，請改用: npm install -g opencode-ai"
+            )
+        else:
+            r.warn(
+                "npm global package `opencode-ai` 未偵測到 — 請：\n"
+                "        npm install -g opencode-ai"
+            )
+    else:
+        r.info(f"npm package opencode-ai 未檢查 ({detail})")
+
+
+def check_opencode_in_path(r: Result) -> None:
+    """Backward-compatible wrapper for older tests/imports."""
+    check_opencode_ai_entry(r)
 
 
 # ============================================================
@@ -577,8 +647,8 @@ def main(argv: list[str] | None = None) -> int:
     tags = check_ollama(r, no_network=args.no_network)
     check_models(r, tags)
 
-    print("\n-- opencode wrapper --")
-    check_opencode_in_path(r)
+    print("\n-- opencode-ai entry --")
+    check_opencode_ai_entry(r)
 
     print("\n-- context / offload --")
     check_context_settings(r)
