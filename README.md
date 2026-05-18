@@ -99,7 +99,52 @@ aicode
 | `qllama/bge-reranker-v2-m3` | RAG rerank | 建議安裝，查 spec 排序更穩 |
 | `qwen3-vl:30b-a3b` | 截圖、UI error、圖片進 KB | 需要分析圖片時再 pull |
 
-換模型時不要只在 TUI 裡 `/models` 切換。正確方式是退出 `aicode`，用 `AICODE_MODEL=<MODEL>` 重新啟動，讓 OpenCode TUI 與 CodeTrail MCP server 內部呼叫一致。硬體、context、遠端 Ollama 設定見 [docs/models.md](docs/models.md)。
+換模型時不要只在 TUI 裡 `/models` 切換。正確方式是退出 `aicode`，用 `AICODE_MODEL=<MODEL>` 重新啟動，讓 OpenCode TUI 與 CodeTrail MCP server 內部呼叫一致。
+
+---
+
+## 換顯卡 / 換模型
+
+先在 Ollama 下載模型，再用同一個 `AICODE_MODEL` 啟動：
+
+```bash
+ollama pull <MODEL>
+
+AICODE_MODEL=<MODEL> \
+AICODE_DYNAMIC_NUM_CTX_MAX=32768 \
+aicode
+```
+
+常見起點：
+
+| 硬體 | 建議 |
+|---|---|
+| 32GB VRAM | `qwen3.6:35b-a3b-q4_K_M` 先配 `AICODE_DYNAMIC_NUM_CTX_MAX=32768`，穩定後再試 `65536` |
+| 24GB VRAM | 優先 `qwen3-coder:30b` / `devstral:24b`，35B 要先降 context |
+| 16GB 以下 | 用 `gpt-oss:20b` 或更小模型，避免大模型加大 context |
+
+啟動後用另一個終端機看實際載入狀態：
+
+```bash
+ollama ps
+```
+
+- `100% GPU`：速度正常。
+- `xx% CPU / xx% GPU`：VRAM 不夠，會明顯變慢；先把 `AICODE_DYNAMIC_NUM_CTX_MAX` 降到 `32768` 或 `16384`。
+- `[CTX_OVERFLOW]`：正確性問題，代表 prompt 太大；拆小任務或縮小工具讀取範圍。
+
+如果 Ollama 跑在另一台 GPU 主機上：
+
+```bash
+AICODE_OLLAMA_BASE_URL=http://<GPU_HOST>:11434 \
+AICODE_MODEL=<MODEL> \
+AICODE_DYNAMIC_NUM_CTX_MAX=32768 \
+aicode
+```
+
+同時把 `~/.config/opencode/opencode.json` 的 Ollama `baseURL` 改成 `http://<GPU_HOST>:11434/v1`。遠端 Ollama 會收到 prompt、程式碼片段和 spec 摘要，只能指向可信內網 / VPN 主機。
+
+完整模型、context、offload 說明見 [docs/models.md](docs/models.md)。
 
 ---
 
