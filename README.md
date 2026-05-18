@@ -201,7 +201,7 @@ aicode
 | 模型 | 用途 | 建議 |
 |---|---|---|
 | `qwen3-coder:30b` | 日常讀 repo、改 code、產 patch | 預設主力，穩定優先 |
-| `qwen3.6:35b-a3b-q4_K_M` | 跨檔推理、規格 vs 實作比對 | 32GB VRAM 先用 `AICODE_DYNAMIC_NUM_CTX_MAX=32768` |
+| `qwen3.6:35b-a3b-q4_K_M` | 跨檔推理、規格 vs 實作比對 | 較吃 VRAM，啟動時 `aicode` 會自動判斷你的顯卡能不能撐這個 context |
 | `devstral:24b` | 快速 review、簡單 patch | 快，但工具鏈穩定度要再確認 |
 | `gpt-oss:20b` | 快速理解、摘要、初步定位 | 適合探索，不適合作為最終 patch 主力 |
 | `bge-m3` | RAG / Code-RAG embedding | 必要模型，不要當聊天模型選 |
@@ -209,6 +209,20 @@ aicode
 | `qwen3-vl:30b-a3b` | 截圖、UI error、圖片進 KB | 需要分析圖片時再 pull |
 
 換模型時不要只在 TUI 裡 `/models` 切換。正確方式是退出 `aicode`，用 `AICODE_MODEL=<MODEL>` 重新啟動，讓 OpenCode TUI 與 CodeTrail MCP server 內部呼叫一致。
+
+啟動 `aicode` 時會自動跑一次 VRAM 安全檢查：根據你選的模型 + 顯卡，預估這次的 context 上限會不會把模型推到一般記憶體跑（會嚴重變慢）。如果會，啟動會直接中止，並列出可以複製貼上的修法：
+
+```
+[ctx-safety] UNSAFE: model=qwen3.6:35b-a3b-q4_K_M ctx=65536
+        Requested ctx=65536 → est VRAM needed ≈ 33.3GB (vs total 31.8GB)
+        Computed safe ctx cap ≈ 55296
+        建議任一處理:
+          (a) export AICODE_DYNAMIC_NUM_CTX_MAX=55296    ← 用建議的安全值
+          (b) export AICODE_ACCEPT_CTX_RISK=1            ← 我知道會慢，照樣跑
+          (c) export AICODE_CTX_SAFETY_DISABLE=1         ← 永久關掉這個檢查
+```
+
+照 (a) 跑通常就解了。檢查只在啟動時跑一次，不會拖慢日常使用。詳細估算原理見 [docs/models.md](docs/models.md)。
 
 ---
 
@@ -239,8 +253,9 @@ ollama ps
 ```
 
 - `100% GPU`：速度正常。
-- `xx% CPU / xx% GPU`：VRAM 不夠，會明顯變慢；先把 `AICODE_DYNAMIC_NUM_CTX_MAX` 降到 `32768` 或 `16384`。
+- `xx% CPU / xx% GPU`：VRAM 不夠，會明顯變慢；先把 `AICODE_DYNAMIC_NUM_CTX_MAX` 降到 `32768` 或 `16384`。理論上啟動時的安全檢查會先擋下，但你若用 `AICODE_ACCEPT_CTX_RISK=1` 強跑就會看到。
 - `[CTX_OVERFLOW]`：正確性問題，代表 prompt 太大；拆小任務或縮小工具讀取範圍。
+- `[CTX] runtime: ... → 模型已 offload`：對話途中如果 context 壓力觸發 `[CTX] WARNING`，CodeTrail 會順手查一次 `ollama ps` 並把結果黏在後面。看到這行就代表「實測確認 offload」，把 `AICODE_DYNAMIC_NUM_CTX_MAX` 改小是最直接的解法。
 
 如果 Ollama 跑在另一台 GPU 主機上：
 

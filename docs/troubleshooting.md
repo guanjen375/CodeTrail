@@ -29,6 +29,37 @@ cd ~/work/some-firmware-repo
 aicode
 ```
 
+### `[ctx-safety] refuse to start.` 啟動被擋
+
+代表啟動時的安全檢查預估：你選的模型 + 目前 GPU + 要求的 ctx 上限，會把模型推到 CPU offload（會嚴重變慢）。輸出長這樣：
+
+```
+[ctx-safety] UNSAFE: model=qwen3.6:35b-a3b-q4_K_M ctx=65536
+        Requested ctx=65536 → est VRAM needed ≈ 33.3GB (vs total 31.8GB)
+        Computed safe ctx cap ≈ 55296
+```
+
+照建議 cap 設環境變數重新啟動：
+
+```bash
+export AICODE_DYNAMIC_NUM_CTX_MAX=55296
+aicode
+```
+
+如果你確認要硬跑（例如想實測 offload 的影響），用一次性放行：
+
+```bash
+AICODE_ACCEPT_CTX_RISK=1 aicode
+```
+
+如果不想再看到這個檢查（例如自動化、CI、知道自己在做什麼）：
+
+```bash
+export AICODE_CTX_SAFETY_DISABLE=1
+```
+
+檢查跑不準的情況也會發生 —— 拿不到 `nvidia-smi`、跑遠端 Ollama、模型架構特殊 —— 這時會印 `[ctx-safety] UNKNOWN` 並放行，不會擋啟動。手動驗證可以單跑 `python scripts/ctx_safety_check.py`。
+
 ### 模型 404 或找不到模型
 
 代表 Ollama 沒有該 tag：

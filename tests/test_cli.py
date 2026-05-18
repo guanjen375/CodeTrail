@@ -42,6 +42,10 @@ def test_aicode_prepares_opencode_mcp_wrapper(tmp_path):
         "HOME": str(home),
         "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
         "PYTHONIOENCODING": "utf-8",
+        # aicode 啟動會跑 ctx 安全閘,在 CI / 沒 GPU / inherited AICODE_MODEL
+        # 的環境下會 refuse to start。這個 smoke test 只關心 MCP wrapper
+        # 生成,不該被安全閘擋下。
+        "AICODE_CTX_SAFETY_DISABLE": "1",
     }
     r = subprocess.run(
         [str(aicode_link)],

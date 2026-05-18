@@ -118,6 +118,27 @@ if ! command -v opencode >/dev/null 2>&1; then
   exit 127
 fi
 
+# Predict VRAM offload BEFORE we exec opencode. ctx_safety_check.py exits 2
+# when the requested ctx cap (AICODE_DYNAMIC_NUM_CTX_MAX, default 65536) won't
+# fit alongside model weights on the visible GPU. It prints concrete remedies
+# (lower the cap, or AICODE_ACCEPT_CTX_RISK=1) so this is fail-loud — we don't
+# silently clamp anything. UNKNOWN cases (no nvidia-smi, remote Ollama,
+# unfamiliar model arch) exit 0 with a warning, so this won't block CI or
+# remote-GPU setups.
+if command -v python3 >/dev/null 2>&1; then
+  PYBIN=python3
+elif command -v python >/dev/null 2>&1; then
+  PYBIN=python
+else
+  PYBIN=""
+fi
+if [ -n "$PYBIN" ] && [ -f "$CODETRAIL_HOME/scripts/ctx_safety_check.py" ]; then
+  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/ctx_safety_check.py"; then
+    echo "[aicode] ctx safety check refused to start (see [ctx-safety] above)." >&2
+    exit 2
+  fi
+fi
+
 export AICODE_ROOT="$ROOT"
 echo "[aicode] AICODE_ROOT=$AICODE_ROOT"
 

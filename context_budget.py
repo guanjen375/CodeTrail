@@ -383,6 +383,43 @@ def format_actual_line(usage: ContextUsage) -> str | None:
     )
 
 
+_OFFLOAD_CHECK_FIRED = False
+
+
+def _emit_runtime_offload_check_once() -> None:
+    """Soft/hard threshold 觸發時順手查 /api/ps,看是不是真的 offload 了。
+    一個 process 只查一次,避免每個 call 都打 HTTP。
+
+    這是 ground-truth 驗證:啟動時的 gpu_safety 是「估算」,這裡是「實測」。
+    若實測 offload，把訊息跟 [CTX] WARN 黏在一起，使用者就知道兩件事相關
+    (ctx 大 → VRAM 滿 → CPU offload → 慢)。
+
+    任何 import / I/O 失敗都靜默吞掉:這層是輔助診斷,絕不能擋使用者。
+    """
+    global _OFFLOAD_CHECK_FIRED
+    if _OFFLOAD_CHECK_FIRED:
+        return
+    _OFFLOAD_CHECK_FIRED = True
+    try:
+        import gpu_safety
+        base_url = getattr(config, "OLLAMA_BASE_URL", "http://localhost:11434")
+        preferred = getattr(config, "MODEL", None)
+        status = gpu_safety.runtime_offload_check(base_url, preferred_model=preferred)
+    except Exception:
+        return
+    if not status.available:
+        return
+    if status.is_offloaded:
+        print(
+            f"[CTX] runtime: {status.short()} → 模型已 offload 到 CPU,"
+            " ctx 拉大就是這個原因。建議:export AICODE_DYNAMIC_NUM_CTX_MAX=<更小值>"
+            " 或退到較小的模型。",
+            flush=True,
+        )
+    else:
+        print(f"[CTX] runtime: {status.short()} (模型仍在 GPU,ctx 壓力不是 offload 造成)", flush=True)
+
+
 def emit_pre_call_lines(usage: ContextUsage) -> None:
     """Print [CTX] lines around a call. Quiet by default for low-risk calls
     so simple chats stay clean; warn/overflow always print.
@@ -390,6 +427,7 @@ def emit_pre_call_lines(usage: ContextUsage) -> None:
     if usage.hard_overflow:
         # The caller will also surface the structured overflow message.
         print(overflow_message(usage), file=sys.stderr, flush=True)
+        _emit_runtime_offload_check_once()
         return
     if usage.soft_warning:
         print(format_ctx_line(usage), flush=True)
@@ -398,6 +436,7 @@ def emit_pre_call_lines(usage: ContextUsage) -> None:
             "consider trimming tool outputs or narrowing the question",
             flush=True,
         )
+        _emit_runtime_offload_check_once()
         return
     # Below the soft threshold — still print the budget line at INFO level
     # if utilization is non-trivial. Below 25% we stay silent to keep simple

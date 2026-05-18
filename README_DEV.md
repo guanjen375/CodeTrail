@@ -53,6 +53,7 @@ aicode
 - `tests/test_external_import.py` — `import_external_file` 白名單、副檔名、大小限制
 - `tests/test_mcp_root_safety.py` — MCP 啟動拒絕 `/` 或 `$HOME` 當 root
 - `tests/test_mcp_smoke.py` — MCP server stdio 啟動與基本 tool 呼叫
+- `tests/test_gpu_safety.py` — `gpu_safety.py` 的 KV cache 公式、weights 估算、SafetyVerdict 分支；完全離線(nvidia-smi 與 Ollama HTTP 都用 hook 注入 fixture)
 
 ---
 
@@ -205,6 +206,37 @@ context_budget.log_metrics(usage)
 ```
 
 如果你的 call site 也會累積 messages(像 agent loop),記得也接 `_pre_send_trim_if_needed`(或自己呼 `trim.trim_messages`)以便 soft warning 觸發時可以自動降載,而不是直接 hard refuse。低風險 / 一次性 prompt(如 RAG embedding query 之類)可以省略 trim,但**不能省略 gate**。
+
+---
+
+## gpu_safety.py / ctx_safety_check.py 設計
+
+`context_budget.py` 守的是「prompt 會不會超出 ctx 上限」(正確性);
+`gpu_safety.py` 守的是「ctx 上限 + 模型 weights 加起來會不會超出 VRAM」(速度,offload 到 CPU)。
+兩者不重疊。
+
+### 模組分工
+
+| 模組 / 入口 | 責任 |
+|---|---|
+| `gpu_safety.py` | 純 library:`query_gpu_info()` 跑 nvidia-smi、`query_model_info()` 打 Ollama `/api/show`、`estimate_kv_per_token_bytes()` 用標準 transformer 公式(含 SSM hybrid `full_attention_interval` 折算)、`compute_safe_ctx()` 算 fit 在 VRAM 內的最大 ctx、`check_safety()` 包成 `SafetyVerdict` 給呼叫端決策。所有 I/O 都用 hook 參數注入,測試可完全離線 mock。 |
+| `scripts/ctx_safety_check.py` | CLI 入口。讀 env (`AICODE_MODEL` / `AICODE_DYNAMIC_NUM_CTX_MAX` / `AICODE_OLLAMA_BASE_URL`),呼 `gpu_safety.check_safety()`,根據 verdict 與 `AICODE_ACCEPT_CTX_RISK` / `AICODE_CTX_SAFETY_DISABLE` 決定 exit code。`aicode` wrapper 在 exec opencode 前跑這個,exit 2 = refuse to start。 |
+| `context_budget.py::_emit_runtime_offload_check_once` | runtime 驗證 hook:`[CTX] WARNING` 或 `[CTX_OVERFLOW]` 觸發時順手查一次 `/api/ps`,把實測 GPU% 黏在 log 後面。每個 process 只跑一次,任何錯誤靜默吞掉。 |
+
+### 設計守則
+
+- **fail-loud,不偷偷 clamp**:`UNSAFE` 一定 print verdict + 建議數字 + 三個 escape env var,然後 `exit 2`。不會自動把 `DYNAMIC_NUM_CTX_MAX` 改掉 — 這違背使用者的「prefer visible failure over defensive defaults」原則。
+- **UNKNOWN 一律放行**:拿不到 GPU / Ollama / metadata 任一項 → 只 warn 不擋。否則 CI、遠端 Ollama、新模型出來時會被卡住。
+- **保守估算**:未知 quant fallback 到 Q8_0、`head_count_kv=null` fallback 到 `head_count` (MHA 假設)、SSM hybrid 沒抓到 `full_attention_interval` 就當純 transformer 算。這樣偏向 refuse to start,使用者可以用 `AICODE_ACCEPT_CTX_RISK=1` 覆蓋。
+- **公式優於查表**:不維護 (GPU, 模型) → safe_ctx 對照表,新模型出來不用改 source。
+
+### 三個 escape env var
+
+| Env | 行為 | 何時用 |
+|---|---|---|
+| `AICODE_DYNAMIC_NUM_CTX_MAX=<N>` | 顯式指定 ctx 上限;檢查通過了就放行 | 預期解法 — 直接用 verdict 建議的數字 |
+| `AICODE_ACCEPT_CTX_RISK=1` | 預測 UNSAFE 也 exit 0,但仍印完整 verdict | 一次性實測 offload 影響 |
+| `AICODE_CTX_SAFETY_DISABLE=1` | 整個 check 跳過,連 verdict 都不算 | CI / 自動化、緊急逃生 |
 
 ### 沒有解的事(刻意留)
 

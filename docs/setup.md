@@ -136,11 +136,12 @@ command -v aicode
 
 如果這樣有輸出，再把同一行 `export PATH="$HOME/.local/bin:$PATH"` 加到 `~/.bashrc` 或你的 shell 設定檔，之後新開終端機就會生效。
 
-`aicode` 會做五件事：
+`aicode` 會做六件事：
 
 - 將目前目錄設成 `AICODE_ROOT`
 - 拒絕 `AICODE_ROOT=/` 和 `AICODE_ROOT=$HOME`
 - 在目前專案準備 `.opencode/run-codetrail-mcp`，讓 OpenCode config 裡的 MCP command 能啟動 CodeTrail server
+- 啟動前跑 `scripts/ctx_safety_check.py` 預估「目前模型 + 目前 GPU + 要求的 ctx 上限」會不會把模型推到 CPU offload；預估會 offload 就直接 `exit 2` 拒絕啟動並提示安全 cap 值（拿不到 GPU 或 Ollama 時 graceful 放行，只 warn）
 - 啟動 `opencode`，讓 OpenCode 子行程繼承同一個沙箱根目錄
 - 如果有 `AICODE_MODEL`，自動把它轉成 OpenCode 的 `--model` 參數，讓 TUI 對話模型也預設成這顆（命令列自己帶 `-m` / `--model` 時不覆蓋）
 

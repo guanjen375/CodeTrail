@@ -49,6 +49,27 @@ AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
 
 128K（131072）需要顯卡記憶體 + 系統記憶體都很充裕才合理，35B 級的模型不建議直接開到 128K。
 
+### 啟動時自動安全檢查
+
+`aicode` 啟動時會跑 `scripts/ctx_safety_check.py`，事先預估「目前模型 + 目前 GPU + 要求的 ctx 上限」會不會把 Ollama 推到 CPU offload。預估方式：
+
+1. 跑 `nvidia-smi` 拿到 GPU 總 VRAM。
+2. 查 Ollama `/api/show` 取得模型架構（層數、attention heads、KV head 數、key/value length、quantization、SSM hybrid 比例）。
+3. 用標準 transformer KV cache 公式算 `weights_bytes + kv_per_token × requested_ctx + 2GB headroom`，跟總 VRAM 比。
+4. 超過就 `UNSAFE`、`exit 2` 拒絕啟動；同時印出建議的安全 cap 數字。
+
+刻意保守的設計：拿不到 `nvidia-smi` / Ollama / 模型 metadata 任一項 → 一律回 `UNKNOWN` 放行，只 warn 不擋（CI、遠端 Ollama、新模型出來時不會被卡住）。
+
+三個 escape env var 用途：
+
+| 變數 | 用途 | 何時用 |
+|---|---|---|
+| `AICODE_DYNAMIC_NUM_CTX_MAX=<N>` | 顯式指定 ctx 上限 | 安全閘建議的數字直接照用，這是預期解法 |
+| `AICODE_ACCEPT_CTX_RISK=1` | 知道會 offload 也要跑 | 確認 offload 影響可接受、或要實測對比時用，一次性 |
+| `AICODE_CTX_SAFETY_DISABLE=1` | 永久關掉檢查 | 你已經非常清楚自己在幹嘛、或在 CI / 自動化環境裡，不想看到 banner |
+
+`dynamic_num_ctx` 是「per-call 動態縮小」，安全檢查 cap 是「物理上限」，兩者不互斥：dynamic 會根據實際 prompt 大小選 16K–`MAX` 之間的值（避免浪費 VRAM），但只要 prompt 夠大就會撞到 `MAX`，所以 `MAX` 必須 fit 在 VRAM 裡，這就是安全檢查在守的東西。
+
 ---
 
 ## Context / Offload 判斷
@@ -58,7 +79,7 @@ AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
 | 現象 | 性質 | 怎麼看 |
 |---|---|---|
 | Context overflow | 正確性問題。Prompt 太大，模型實際沒讀到完整內容。 | CodeTrail 的 `[CTX]` log、`.codetrail/context_metrics.jsonl`、`[CTX_OVERFLOW]` |
-| CPU/GPU offload | 速度問題。權重或 KV cache 被搬到 RAM。 | `ollama ps` 的 `PROCESSOR` 欄 |
+| CPU/GPU offload | 速度問題。權重或 KV cache 被搬到 RAM。 | 啟動時 `[ctx-safety] UNSAFE` 預測；對話途中 `[CTX] runtime: ... → 模型已 offload` 實測；隨時 `ollama ps` 的 `PROCESSOR` 欄 |
 
 CodeTrail 與 OpenCode TUI 的 context 也不是同一條管線：
 
@@ -98,6 +119,12 @@ ollama ps
 ```
 
 `scripts/doctor.py` 會檢查 context 設定是否打架，以及 `ollama ps` 上的模型是否 CPU/GPU split；它只報告，不會自動改設定。
+
+`scripts/ctx_safety_check.py` 是另一個更窄的入口：`aicode` 啟動時自動跑，只看「目前模型 + 目前 GPU + 要求的 ctx 上限」會不會 offload，不安全會直接 `exit 2` 擋下啟動。可以手動跑來測：
+
+```bash
+AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M python scripts/ctx_safety_check.py
+```
 
 ---
 
