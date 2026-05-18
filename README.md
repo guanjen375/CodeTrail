@@ -224,6 +224,8 @@ aicode
 
 照 (a) 跑通常就解了。檢查只在啟動時跑一次，不會拖慢日常使用。詳細估算原理見 [docs/models.md](docs/models.md)。
 
+注意：這個啟動前預測目前只支援能用 `nvidia-smi` 讀取 VRAM 的 NVIDIA 顯卡；AMD 顯卡、內顯或沒有 GPU telemetry 的環境會顯示 `[ctx-safety] UNKNOWN` 並放行，之後請用 `ollama ps` 看實際是否 offload。
+
 如果你把 35B 級模型固定寫進 `~/.bashrc`，也建議一起固定安全的 dynamic cap，例如：
 
 ```bash
