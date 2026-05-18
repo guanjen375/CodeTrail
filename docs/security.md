@@ -63,7 +63,12 @@ AI_CODE_ENABLE_BUILD_COMMANDS=1 aicode
 AI_CODE_PATCH=0 AI_CODE_RUN_TESTS=0 aicode
 ```
 
-兩個變數獨立：`AI_CODE_PATCH=0` 只關 `apply_patch`，仍可跑 `pytest`；反之亦然。
+兩個變數獨立：
+
+- `AI_CODE_PATCH=0` — 擋下 `apply_patch(...)` 和 `run_lint(..., fix=True)`（兩者都會改檔）。`run_lint(..., fix=False)` 走 check-only 仍可用，所以唯讀模式下還能做 lint 檢查。
+- `AI_CODE_RUN_TESTS=0` — 擋下 `run_command(...)`，連 `pytest` / `cargo test` 都關掉。
+
+兩個分開設，可以做出「只看 / 只跑測試不改檔 / 改檔但不跑命令」等不同信任邊界。
 
 ### 不要 commit 的資料
 

@@ -47,7 +47,10 @@ class TestRunLintMode:
     """run_lint(fix=...) 必須依 fix 選對命令組,絕對不能偷偷跑 fix 組。"""
 
     @pytest.fixture
-    def runner_and_file(self, tmp_path: Path):
+    def runner_and_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        # mode 選擇測試需要 PATCH_ENABLED=True,否則 fix=True 會在 gate 階段
+        # 就被擋掉,根本走不到 subprocess。唯讀模式的行為由 TestRunLintReadonlyMode 覆蓋。
+        monkeypatch.setattr(config, "PATCH_ENABLED", True)
         runner = ToolExecutor(str(tmp_path))
         f = tmp_path / "x.py"
         f.write_text("x = 1\n", encoding="utf-8")
@@ -119,3 +122,59 @@ class TestRunLintMode:
             f"fix=False 沒 check 命令時應回錯誤,實際: {out}"
         )
         assert not called, "fix=False 沒 check 命令時不能 fallback 跑 fix"
+
+
+class TestRunLintReadonlyMode:
+    """AI_CODE_PATCH=0 完全唯讀模式: fix=True 必須被擋,fix=False 仍可用。
+
+    Review 後續發現的 gap: 文件承諾「AI_CODE_PATCH=0 = 完全唯讀」,但
+    舊版 run_lint 不檢查 PATCH_ENABLED,fix=True 仍會無視旗標改檔。
+    """
+
+    def test_fix_true_blocked_when_patch_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(config, "PATCH_ENABLED", False)
+        runner = ToolExecutor(str(tmp_path))
+        f = tmp_path / "x.py"
+        f.write_text("x = 1\n", encoding="utf-8")
+
+        # subprocess 都不該被叫到 — 應在 stat / spawn 之前提早拒絕
+        def fake_run(*a, **kw):
+            raise AssertionError("PATCH_ENABLED=False 時不能跑 lint subprocess")
+
+        monkeypatch.setattr("agent_tools.subprocess.run", fake_run)
+
+        out = runner.run_lint("x.py", fix=True)
+        assert "AI_CODE_PATCH" in out or "唯讀" in out, out
+        # 檔案不能被動到
+        assert f.read_text(encoding="utf-8") == "x = 1\n"
+
+    def test_fix_false_still_works_when_patch_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """唯讀模式下 check-only 仍要可用 — 不然就無法 lint 確認了。"""
+        monkeypatch.setattr(config, "PATCH_ENABLED", False)
+        runner = ToolExecutor(str(tmp_path))
+        f = tmp_path / "x.py"
+        f.write_text("x = 1\n", encoding="utf-8")
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd_parts, **kwargs):
+            calls.append(list(cmd_parts))
+
+            class R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return R()
+
+        monkeypatch.setattr("agent_tools.subprocess.run", fake_run)
+
+        runner.run_lint("x.py", fix=False)
+        assert calls, "fix=False 在 PATCH_ENABLED=False 時應該仍能跑 check"
+        for parts in calls:
+            for bad in ("--fix", "-w", "--write", "-i"):
+                assert bad not in parts, parts

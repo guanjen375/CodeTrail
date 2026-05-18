@@ -88,12 +88,25 @@ class CodeRAG:
         self._lazy_embed = False
         self._lazy_embed_top_k = CODE_RAG_LAZY_EMBED_QUERY_TOP_K
 
+    # 小檔走 content hash 的門檻 — 256 KiB 以下直接 hash 內容,
+    # 大於這個值 fallback 到 size + mtime_ns 的快路徑。
+    _CONTENT_HASH_MAX_BYTES = 256 * 1024
+
     def _compute_file_hash(self, filepath: Path) -> str:
-        """計算單一檔案的 hash（用於增量快取驗證）"""
+        """計算單一檔案的 hash（用於增量快取驗證）。
+
+        小檔(≤256 KiB)直接 hash content,避開「同秒多次寫入 / preserve-timestamp
+        同步工具」造成的 mis-hit;大檔走 size + mtime_ns 快路徑,平衡 I/O 與
+        正確性。mtime_ns 比 mtime(秒解析度)更穩,在快速 edit-save 場景下不會
+        誤判 cache hit。
+        """
         try:
             stat = filepath.stat()
-            # 使用 size + mtime 作為快速 hash（比讀取內容快）
-            return hashlib.md5(f"{stat.st_size}:{stat.st_mtime}".encode()).hexdigest()
+            if stat.st_size <= self._CONTENT_HASH_MAX_BYTES:
+                return hashlib.md5(filepath.read_bytes()).hexdigest()
+            return hashlib.md5(
+                f"{stat.st_size}:{stat.st_mtime_ns}".encode()
+            ).hexdigest()
         except OSError:
             return ""
 

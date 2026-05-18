@@ -1236,7 +1236,16 @@ class ToolExecutor:
         fix=True  → 走 LINT_COMMANDS[ext]['fix']（會就地改檔）
         fix=False → 走 LINT_COMMANDS[ext]['check']（只回報、不改檔）；
                     若該副檔名沒提供 check 命令，回錯誤而不是回頭跑 fix。
+
+        AI_CODE_PATCH=0 完全唯讀模式: fix=True 會改檔,必須一起擋下;
+        check-only(fix=False) 仍允許,只回報不寫檔。
         """
+        if fix and not config.PATCH_ENABLED:
+            return (
+                "錯誤: run_lint(fix=True) 已停用 (AI_CODE_PATCH=0,唯讀模式)。"
+                "若只要檢查,改用 fix=False 跑 check-only。"
+            )
+
         target = self._safe_path(path)
         if not target or not target.exists():
             return f"錯誤: 檔案不存在 '{path}'"
