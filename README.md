@@ -6,7 +6,7 @@ CodeTrail 目前定位是**成熟私有部署版**：適合本機、離線、NDA
 
 ---
 
-## 快速開始
+## 安裝與啟動
 
 先安裝 OpenCode、Ollama、Python 依賴，完整步驟見 [docs/setup.md](docs/setup.md)。最小流程是：
 
@@ -29,7 +29,90 @@ mkdir -p ~/.config/opencode
 ${EDITOR:-vi} ~/.config/opencode/opencode.json
 ```
 
-把 [docs/setup.md](docs/setup.md) 裡的建議 `opencode.json` 貼進去；它會設定 Ollama provider、CodeTrail MCP server 和 OpenCode 權限。
+把下面內容貼進 `~/.config/opencode/opencode.json`；它會設定 Ollama provider、CodeTrail MCP server 和 OpenCode 權限：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "share": "disabled",
+  "autoupdate": false,
+
+  "enabled_providers": ["ollama"],
+  "model": "ollama/qwen3-coder:30b",
+  "small_model": "ollama/qwen3-coder:30b",
+
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama",
+      "options": {
+        "baseURL": "http://localhost:11434/v1"
+      },
+      "models": {
+        "qwen3-coder:30b": {
+          "name": "Qwen3 Coder 30B"
+        },
+        "qwen3.6:35b-a3b-q4_K_M": {
+          "name": "Qwen3.6 35B A3B Q4_K_M"
+        },
+        "devstral:24b": {
+          "name": "Devstral 24B"
+        },
+        "gpt-oss:20b": {
+          "name": "GPT-OSS 20B"
+        }
+      }
+    }
+  },
+
+  "mcp": {
+    "codetrail": {
+      "type": "local",
+      "command": [
+        "bash",
+        "-lc",
+        "root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P); exec \"$root/.opencode/run-codetrail-mcp\""
+      ],
+      "enabled": true,
+      "timeout": 10000
+    }
+  },
+
+  "permission": {
+    "*": "deny",
+
+    "question": "allow",
+    "todowrite": "allow",
+
+    "codetrail_*": "allow",
+    "codetrail_apply_patch": "ask",
+    "codetrail_run_lint": "ask",
+    "codetrail_run_command": "ask",
+    "codetrail_import_external_file": "allow",
+
+    "webfetch": "deny",
+    "websearch": "deny",
+    "bash": "deny",
+    "read": "deny",
+    "grep": "deny",
+    "glob": "deny",
+    "edit": "deny",
+    "write": "deny",
+    "apply_patch": "deny",
+    "external_directory": "deny",
+    "task": "deny",
+    "skill": "deny",
+    "lsp": "deny"
+  }
+}
+```
+
+貼完先確認 JSON 格式：
+
+```bash
+python3 -m json.tool ~/.config/opencode/opencode.json >/dev/null
+```
 
 再把 `aicode` 放進 PATH：
 
@@ -47,18 +130,38 @@ cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-進入 TUI 後確認：
+如果要讓模型讀專案外的附件，例如 `~/Downloads` 裡的 log、截圖、spec 或 firmware blob，啟動時先打開外部匯入：
 
-- 啟動畫面有 `[aicode] AICODE_ROOT=<PROJECT_TO_ANALYZE>`。
-- `/status` 顯示 `codetrail Connected`。
-- model selector 選的是 Ollama provider 的 coding model。
-- 第一輪工具呼叫沒有嘗試讀 `$HOME` 或 `/`。
+```bash
+AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
+```
+
+注意：上面的 `opencode.json` 裡 `"codetrail_import_external_file": "allow"` 只是允許 OpenCode 呼叫這個工具；真正讓 CodeTrail 後端接受專案外檔案，仍要在啟動時設定 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1`。
+
+預設可匯入來源是 `~/Downloads` 和 `/tmp`。如果附件放在其他目錄，用 `AI_CODE_IMPORT_ROOTS` 指定白名單；多個目錄用冒號分隔：
+
+```bash
+AI_CODE_ALLOW_EXTERNAL_IMPORT=1 \
+AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/specs" \
+aicode
+```
+
+兩個變數分工：
+
+| 變數 | 用途 |
+|---|---|
+| `AI_CODE_ALLOW_EXTERNAL_IMPORT=1` | 外部附件匯入總開關；沒開時不能讀專案外檔案 |
+| `AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/specs"` | 外部附件來源白名單；一旦設定就會取代預設清單 |
+
+進入 TUI 後就可以照下一節做基本操作。若工具看起來沒接上，再用 `/status` 檢查是否有 `codetrail Connected`；完整逐步版見 [docs/basic-usage.md](docs/basic-usage.md)。
 
 ---
 
-## 快速導覽
+## 基本操作
 
-進入 OpenCode 後，可以先用幾句話確認工具有接好。下面的路徑請換成你專案裡真的存在的檔案；如果附件在專案外，啟動時先開 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1`。
+進入 OpenCode 後，基本工作分成三類：正常對話、夾帶附件、注入 RAG。完整逐步說明見 [docs/basic-usage.md](docs/basic-usage.md)；這裡只保留最小 smoke test。下面的路徑請換成你專案裡真的存在的檔案；如果附件在專案外，啟動時先開 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1`。
+
+### 1. 正常對話
 
 ```text
 請用工具 list_dir 看專案結構，找出可能的 entry point、測試目錄和設定檔。
@@ -68,10 +171,16 @@ aicode
 請用工具 read_file 讀 README.md 前 80 行，整理這個專案怎麼啟動。
 ```
 
+### 2. 夾帶附件
+
 ```text
 請先用工具 import_external_file 匯入 ~/Downloads/error.log，
 再用 read_file 讀回傳的新路徑，找出最重要的錯誤訊息。
 ```
+
+如果檔案已經在專案內，直接要求 `read_file` 或 `analyze_file` 即可。完整附件規則見 [docs/rag.md](docs/rag.md#在對話裡讓模型看到一個檔案)。
+
+### 3. 注入 RAG
 
 ```text
 請用工具 ingest_document 匯入 docs/spec.pdf，
@@ -83,7 +192,7 @@ aicode
 證據不足就拒答，回答要附 REF。
 ```
 
-附件與 RAG 的完整用法見 [docs/rag.md](docs/rag.md)。
+`ingest_document` 會把文件切 chunk 寫進專案的 `knowledge.json`；`reload_knowledge_base` 後，才能用 `query_knowledge` / `query_knowledge_strict` 查。完整 RAG 用法見 [docs/rag.md](docs/rag.md#把附件做成知識庫讓模型隨時能查)。
 
 ---
 
@@ -166,6 +275,7 @@ aicode
 | 文件 | 內容 |
 |---|---|
 | [docs/setup.md](docs/setup.md) | 安裝、OpenCode config、`aicode`、啟動 |
+| [docs/basic-usage.md](docs/basic-usage.md) | 基本操作：正常對話、夾帶附件、RAG 注入、最小驗收流程 |
 | [docs/models.md](docs/models.md) | 模型比較、顯卡建議、遠端 Ollama、context / offload 後果 |
 | [docs/rag.md](docs/rag.md) | 讀檔、匯入附件、建立知識庫、Code-RAG、查 spec |
 | [docs/mcp-tools.md](docs/mcp-tools.md) | CodeTrail 暴露的 17 個 MCP 工具與使用原則 |

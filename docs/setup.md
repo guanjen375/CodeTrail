@@ -98,86 +98,12 @@ mkdir -p ~/.config/opencode
 ${EDITOR:-vi} ~/.config/opencode/opencode.json
 ```
 
-在檔案裡貼上下方內容。MCP command 會從 OpenCode 啟動目錄找 git root，然後執行該 root 內的 `.opencode/run-codetrail-mcp`：
+直接可貼的 `opencode.json` 放在 [README 的安裝與啟動](../README.md#安裝與啟動)。這裡只補充它的幾個關鍵點：
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-
-  "share": "disabled",
-  "autoupdate": false,
-
-  "enabled_providers": ["ollama"],
-  "model": "ollama/qwen3-coder:30b",
-  "small_model": "ollama/qwen3-coder:30b",
-
-  "provider": {
-    "ollama": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Ollama",
-      "options": {
-        "baseURL": "http://localhost:11434/v1"
-      },
-      "models": {
-        "qwen3-coder:30b": {
-          "name": "Qwen3 Coder 30B"
-        },
-        "qwen3.6:35b-a3b-q4_K_M": {
-          "name": "Qwen3.6 35B A3B Q4_K_M"
-        },
-        "devstral:24b": {
-          "name": "Devstral 24B"
-        },
-        "gpt-oss:20b": {
-          "name": "GPT-OSS 20B"
-        }
-      }
-    }
-  },
-
-  "mcp": {
-    "codetrail": {
-      "type": "local",
-      "command": [
-        "bash",
-        "-lc",
-        "root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P); exec \"$root/.opencode/run-codetrail-mcp\""
-      ],
-      "enabled": true,
-      "timeout": 10000
-    }
-  },
-
-  "permission": {
-    "*": "deny",
-
-    "question": "allow",
-    "todowrite": "allow",
-
-    "codetrail_*": "allow",
-    "codetrail_apply_patch": "ask",
-    "codetrail_run_lint": "ask",
-    "codetrail_run_command": "ask",
-    "codetrail_import_external_file": "allow",
-
-    "webfetch": "deny",
-    "websearch": "deny",
-    "bash": "deny",
-    "read": "deny",
-    "grep": "deny",
-    "glob": "deny",
-    "edit": "deny",
-    "write": "deny",
-    "apply_patch": "deny",
-    "external_directory": "deny",
-    "task": "deny",
-    "skill": "deny",
-    "lsp": "deny"
-  }
-}
-```
-
-`mcp` 裡的 key 會影響 OpenCode `/status` 顯示的名字。上面用 `codetrail`，所以應該看到 `codetrail Connected`。
+- Ollama provider 指到 `http://localhost:11434/v1`；遠端 Ollama 要同步改這裡，見 [模型與硬體建議](models.md)。
+- MCP key 用 `codetrail`，所以 `/status` 會顯示 `codetrail Connected`。
+- MCP command 會從 OpenCode 啟動目錄找 git root，然後執行該 root 內的 `.opencode/run-codetrail-mcp`。
+- OpenCode 內建的 `bash` / `read` / `write` / `apply_patch` 預設 deny；日常讀檔、搜尋、patch 走 `codetrail_*` 工具。
 
 檢查 JSON 格式：
 
@@ -234,12 +160,9 @@ aicode
 
 進入後可以直接問「請分析這個專案的整體架構」、「這個錯誤可能在哪裡」、「請查 RAG 裡某個規格限制」這類問題。涉及專案內容的問題，優先讓模型用工具讀實際檔案，不要只靠一般經驗回答。
 
-進入 TUI 後先確認：
+如果要讀專案外的 log、截圖、spec 或 firmware blob，啟動參數見 [README 的安裝與啟動](../README.md#安裝與啟動)；完整附件流程見 [RAG、附件與知識庫操作](rag.md)。
 
-- 啟動畫面有 `[aicode] AICODE_ROOT=<PROJECT_TO_ANALYZE>`
-- `/status` 顯示 `codetrail Connected`（或你在 `opencode.json` 裡設定的 MCP key）
-- model selector 裡選的是 Ollama provider 的 coding model
-- 第一輪工具呼叫沒有嘗試讀 `$HOME` 或 `/`
+若工具看起來沒接上，再用 `/status` 檢查是否有 `codetrail Connected`（或你在 `opencode.json` 裡設定的 MCP key）。若啟動 root 不如預期，再看啟動畫面的 `[aicode] AICODE_ROOT=...`。
 
 啟動時帶 `AICODE_MODEL`，TUI 右下角的對話模型跟 CodeTrail 後台用的模型會一起切到這顆：
 
@@ -249,6 +172,6 @@ AICODE_MODEL=qwen3-coder:30b aicode
 
 換模型、context、offload、遠端 Ollama 的細節集中在 [模型與硬體建議](models.md)。不要只在 TUI 裡用 `/models` 切換；那只會換 OpenCode 前台對話模型，不會同步 CodeTrail MCP server 的內部呼叫。
 
-外部附件匯入與 RAG 流程不在這裡重複；可先照 README 的 smoke test 跑一輪，完整說明見 [RAG、附件與知識庫操作](rag.md)。
+RAG 流程不在這裡重複；可先照 README 的 smoke test 跑一輪，完整說明見 [RAG、附件與知識庫操作](rag.md)。
 
 ---

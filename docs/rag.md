@@ -1,6 +1,6 @@
 # RAG、附件與知識庫操作
 
-這份文件整理日常對話、附件匯入、知識庫建立、Code-RAG 搜尋與規格查詢方式。
+這份文件整理附件匯入、知識庫建立、Code-RAG 搜尋與規格查詢方式。
 
 [回到 README](../README.md)。
 
@@ -200,46 +200,7 @@ batch size 上限是 32 (REF1)。
 2. **不要 commit**：`knowledge.json` 切碎了原始文件內容，NDA 場景幾乎一定包含敏感片段。已經在 [安全邊界與工作節奏](security.md) 的「不要 commit 的資料」列入不該 commit 的清單，建議在專案的 `.gitignore` 也加一行。
 3. **越具體越好**：把一整份 500 頁的手冊原封不動塞進去，不如先抽出實際會問到的章節整理成 markdown 再匯入。雜訊少，答案準。
 
-### 先建立專案地圖
-
-第一次接到一個 repo，先要求對話只讀不改：
-
-```text
-先不要改檔。
-請用 list_dir 看兩層目錄，找出主要 entry point、測試目錄、設定檔。
-再用 code_rag_search 找初始化流程、工具呼叫、資料載入相關程式。
-最後用 file:line 列出這個 repo 的架構判斷，分成「證據」和「推測」。
-```
-
-這會逼對話先走 `list_dir(...)`、`code_rag_search(...)`、`read_file(...)`，避免一開始就憑印象回答。
-
-很大的 repo（例如 U-Boot 這種數萬檔的）第一次跑 `code_rag_search` 要先建索引，可能會超時。這類情況先用 `list_dir` + `grep_code` 縮小範圍，把問題鎖在一兩個子目錄裡再用 `code_rag_search`。
-
-### 查 bug 或行為
-
-```text
-請追這個錯誤的來源：<貼錯誤訊息>
-先用 grep_code / code_rag_search 找可能位置，再讀檔確認。
-不要改檔，先列出最可能的 3 個原因與 file:line 證據。
-```
-
-如果有 log 檔，先放進專案內，例如 `logs/build_fail.txt`，再問：
-
-```text
-請 read_file logs/build_fail.txt，根據錯誤訊息找最可能的實作位置。
-```
-
-### 要它改檔
-
-等對話已經列出證據，再允許 patch：
-
-```text
-根據上面的證據，請做最小修改。
-套用 patch 前先說會改哪些檔案；套用後跑最小相關測試。
-如果 run_command 被白名單拒絕，請列出你原本想跑的命令。
-```
-
-`apply_patch(...)` 會真的寫檔。建議在 git worktree 乾淨時使用；不想改檔時要明講「不要 apply_patch」。
+一般 repo 對話、查 bug、改檔前的工作節奏放在 [基本操作](basic-usage.md)，這份文件只保留附件與知識庫細節。
 
 ---
 
@@ -253,4 +214,3 @@ batch size 上限是 32 (REF1)。
 - 文件切段的大小、不同來源類型的搜尋權重，這些可調參數放在 `config.py` 的 `CHUNK_SETTINGS` 和 `SOURCE_TYPE_WEIGHTS`，預設值在大多數情境下已經夠用，要微調再去動。
 
 ---
-
