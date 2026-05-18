@@ -109,11 +109,30 @@ except ImportError:
     sys.exit(3)
 
 
-config.PATCH_ENABLED = True
-config.RUN_COMMAND_ENABLED = True
+# OpenCode runtime defaults: patch/run_tests 預設開,但尊重 env 顯式關閉。
+# 早期版本是無條件 force-on,使用者設 AI_CODE_PATCH=0 也會被吞掉 — 那違反
+# CodeTrail 「fail loud over silent fallback」 的原則。改成 env-aware default。
+_TRUTHY = ("1", "true", "yes")
+_FALSY = ("0", "false", "no")
 
-# Build 命令白名單擴充(OpenCode build 模式會用到)
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").lower()
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    return default
+
+
+config.PATCH_ENABLED = _env_bool("AI_CODE_PATCH", default=True)
+config.RUN_COMMAND_ENABLED = _env_bool("AI_CODE_RUN_TESTS", default=True)
+
+# Build 命令(make/cmake/ninja/meson/bazel)會跑專案內的 build script,
+# 風險面比 pytest/cargo test 大。預設不掛白名單,要分析自己的專案再
+# 顯式打開 AI_CODE_ENABLE_BUILD_COMMANDS=1。
 # 直接 mutate config.ALLOWED_COMMANDS,agent_tools 透過 from-import 共用同一個 list 物件
+_BUILD_COMMANDS_ENABLED = _env_bool("AI_CODE_ENABLE_BUILD_COMMANDS", default=False)
 _EXTRA_BUILD_COMMANDS = [
     "make",
     "cmake",
@@ -124,9 +143,10 @@ _EXTRA_BUILD_COMMANDS = [
     "meson compile",
     "bazel build",
 ]
-for _c in _EXTRA_BUILD_COMMANDS:
-    if _c not in config.ALLOWED_COMMANDS:
-        config.ALLOWED_COMMANDS.append(_c)
+if _BUILD_COMMANDS_ENABLED:
+    for _c in _EXTRA_BUILD_COMMANDS:
+        if _c not in config.ALLOWED_COMMANDS:
+            config.ALLOWED_COMMANDS.append(_c)
 
 set_sandbox_root(AICODE_ROOT, allow_external=False)
 
@@ -158,8 +178,21 @@ CODE_RAG = CodeRAG(AICODE_ROOT)
 _log("[MCP] 初始化 ToolExecutor ...")
 EXEC = ToolExecutor(AICODE_ROOT)
 
-_log(f"[MCP] PATCH_ENABLED = {config.PATCH_ENABLED}, RUN_COMMAND_ENABLED = {config.RUN_COMMAND_ENABLED}")
-_log(f"[MCP] ALLOWED_COMMANDS 共 {len(config.ALLOWED_COMMANDS)} 條(已 append build 命令)")
+_log(
+    f"[MCP] PATCH_ENABLED = {config.PATCH_ENABLED} (AI_CODE_PATCH), "
+    f"RUN_COMMAND_ENABLED = {config.RUN_COMMAND_ENABLED} (AI_CODE_RUN_TESTS)"
+)
+if _BUILD_COMMANDS_ENABLED:
+    _log(
+        f"[MCP] ALLOWED_COMMANDS 共 {len(config.ALLOWED_COMMANDS)} 條"
+        " (AI_CODE_ENABLE_BUILD_COMMANDS=1 已 append build 命令: "
+        f"{', '.join(_EXTRA_BUILD_COMMANDS)})"
+    )
+else:
+    _log(
+        f"[MCP] ALLOWED_COMMANDS 共 {len(config.ALLOWED_COMMANDS)} 條 "
+        "(build 命令未掛白名單;要分析自己的專案請設 AI_CODE_ENABLE_BUILD_COMMANDS=1)"
+    )
 _log(f"[MCP] EXTERNAL_IMPORT_ENABLED = {config.EXTERNAL_IMPORT_ENABLED}")
 if data_flywheel.DATA_COLLECT_ENABLED:
     _log(
@@ -575,12 +608,14 @@ def run_lint(path: str, fix: bool = True) -> str:
     """Run lint/format on a file using the toolchain configured in LINT_COMMANDS.
 
     依副檔名自動挑工具(例如 .py → ruff / black,.c/.cpp → clang-format,
-    詳見 config.LINT_COMMANDS)。`fix=True` 時會就地修正可以自動修的問題;
-    `fix=False` 走 check-only 模式(若工具支援的話)。
+    詳見 config.LINT_COMMANDS)。每個副檔名分 fix / check 兩組命令:
+      - `fix=True`  跑 fix 組(--fix / -w / -i / --write),會就地改檔。
+      - `fix=False` 跑 check 組(--check / --dry-run / -l),只回報、不改檔。
+        該副檔名沒提供 check 組時直接回錯誤,不會 fallback 回 fix。
 
     Args:
         path: 要 lint 的單一檔案路徑(必須在 AICODE_ROOT 內)。
-        fix: 是否就地自動修正(預設 True)。
+        fix: 是否就地自動修正(預設 True)。check-only 請傳 False。
 
     Returns:
         Lint 工具的輸出(已截斷)。多工具時會依序嘗試到有可用工具為止。
@@ -633,11 +668,18 @@ def analyze_file(path: str) -> str:
     Returns:
         對應類型的分析報告(OCR 文字 / ELF symbol 表 / binary 字串列)。
     """
-    p = Path(path)
-    if not p.is_absolute():
-        p = Path(AICODE_ROOT) / path
+    # Sandbox: 路徑必須在 AICODE_ROOT 內,且必須是檔案。
+    # 兩種失敗合併回同一句訊息,避免透過錯誤訊息的差異 probe 外部路徑是否存在
+    # (review: path-existence side channel)。`.resolve()` 同時處理 symlink / .. 逃逸。
+    root = Path(AICODE_ROOT).resolve()
+    try:
+        p = Path(path)
+        p = (root / p).resolve() if not p.is_absolute() else p.resolve()
+        p.relative_to(root)
+    except (ValueError, OSError):
+        return "錯誤: 路徑不在 AICODE_ROOT 內或檔案不存在"
     if not p.is_file():
-        return f"錯誤: 檔案不存在 {p}"
+        return "錯誤: 路徑不在 AICODE_ROOT 內或檔案不存在"
 
     ext = p.suffix.lower()
     path_str = str(p)

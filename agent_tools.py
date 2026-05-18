@@ -1030,10 +1030,22 @@ class ToolExecutor:
                     i += 1
                     while i < len(lines):
                         hunk_line = lines[i]
-                        if not hunk_line:
-                            hunk['lines'].append((' ', ''))
+
+                        # 合法 unified-diff context blank line 是 " "(單一空格)。
+                        # `""` 是 split('\n') 對結尾 newline 產生的 sentinel,或
+                        # hunk 結束後的空白分隔 — 都不該被當成 context blank line
+                        # (舊版會在 context verify 階段算成 file 行,造成 EOF 附近
+                        # 的合法 patch 誤判為 context mismatch)。
+                        if hunk_line == "":
+                            break
+
+                        # `\ No newline at end of file` — git / unified diff 對沒尾
+                        # 換行檔案的標記,跳過不影響 hunk 內容。
+                        if hunk_line.startswith('\\'):
                             i += 1
-                        elif hunk_line.startswith(' '):
+                            continue
+
+                        if hunk_line.startswith(' '):
                             hunk['lines'].append((' ', hunk_line[1:]))
                             i += 1
                         elif hunk_line.startswith('+') and not hunk_line.startswith('+++'):
@@ -1219,7 +1231,12 @@ class ToolExecutor:
             return f"錯誤: {type(e).__name__}: {e}"
 
     def run_lint(self, path: str, fix: bool = True) -> str:
-        """對檔案執行 lint/format 工具"""
+        """對檔案執行 lint/format 工具。
+
+        fix=True  → 走 LINT_COMMANDS[ext]['fix']（會就地改檔）
+        fix=False → 走 LINT_COMMANDS[ext]['check']（只回報、不改檔）；
+                    若該副檔名沒提供 check 命令，回錯誤而不是回頭跑 fix。
+        """
         target = self._safe_path(path)
         if not target or not target.exists():
             return f"錯誤: 檔案不存在 '{path}'"
@@ -1227,9 +1244,17 @@ class ToolExecutor:
             return f"錯誤: '{path}' 不是檔案"
 
         ext = target.suffix.lower()
-        lint_cmds = LINT_COMMANDS.get(ext)
-        if not lint_cmds:
+        lint_spec = LINT_COMMANDS.get(ext)
+        if not lint_spec:
             return f"錯誤: 不支援的檔案類型 '{ext}'（支援: {', '.join(LINT_COMMANDS.keys())}）"
+
+        mode = 'fix' if fix else 'check'
+        lint_cmds = lint_spec.get(mode)
+        if not lint_cmds:
+            return (
+                f"錯誤: '{ext}' 沒有 {mode} 模式的命令設定。"
+                f"要 check-only 但目前工具鏈不支援，請改用 fix=True，或在 config.LINT_COMMANDS 補上 '{mode}' key。"
+            )
 
         results = []
         rel_path = str(target.relative_to(self.root))

@@ -47,8 +47,8 @@
 | 修改/驗證 | `git_status()` | 看工作樹目前有沒有改動 |
 | 修改/驗證 | `git_diff(path=None, staged=False)` | 看修改內容，不需要用 `run_command` 跑 git |
 | 修改/驗證 | `apply_patch(diff, dry_run=False)` | 套 unified diff，會真的寫檔 |
-| 修改/驗證 | `run_lint(path, fix=True)` | 對單一檔案跑格式化/lint |
-| 修改/驗證 | `run_command(cmd)` | 跑白名單內的測試、lint、build |
+| 修改/驗證 | `run_lint(path, fix=True)` | 對單一檔案跑格式化/lint；`fix=False` 走 check-only(不改檔) |
+| 修改/驗證 | `run_command(cmd)` | 跑白名單內的測試 / lint;build 命令(make/cmake/ninja/meson/bazel)需設 `AI_CODE_ENABLE_BUILD_COMMANDS=1` |
 
 ### 使用原則
 

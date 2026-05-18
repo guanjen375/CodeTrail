@@ -490,25 +490,41 @@ PATCH_MAX_FILES = 5              # 單次 patch 最多修改 5 個檔案
 PATCH_MAX_LINES_PER_FILE = 200   # 單一檔案最多修改 200 行
 
 # Lint 命令白名單（按語言）
+# 每個副檔名分 fix / check 兩組命令：
+#   fix   — 會就地修改檔案（--fix / -w / -i / --write）
+#   check — 只回報、不改檔（--check / --dry-run / -l）
+# run_lint(fix=False) 走 check；該語言沒 check 命令時拒絕（不偷偷改檔）。
 LINT_COMMANDS = {
     # Python
-    '.py': ['ruff check --fix', 'black', 'isort'],
-    '.pyx': ['ruff check --fix'],
-    '.pyi': ['ruff check --fix'],
+    '.py': {
+        'fix':   ['ruff check --fix', 'black', 'isort'],
+        'check': ['ruff check', 'black --check', 'isort --check'],
+    },
+    '.pyx': {
+        'fix':   ['ruff check --fix'],
+        'check': ['ruff check'],
+    },
+    '.pyi': {
+        'fix':   ['ruff check --fix'],
+        'check': ['ruff check'],
+    },
     # JavaScript/TypeScript
-    '.js': ['eslint --fix', 'prettier --write'],
-    '.jsx': ['eslint --fix', 'prettier --write'],
-    '.ts': ['eslint --fix', 'prettier --write'],
-    '.tsx': ['eslint --fix', 'prettier --write'],
+    '.js':  {'fix': ['eslint --fix', 'prettier --write'], 'check': ['eslint', 'prettier --check']},
+    '.jsx': {'fix': ['eslint --fix', 'prettier --write'], 'check': ['eslint', 'prettier --check']},
+    '.ts':  {'fix': ['eslint --fix', 'prettier --write'], 'check': ['eslint', 'prettier --check']},
+    '.tsx': {'fix': ['eslint --fix', 'prettier --write'], 'check': ['eslint', 'prettier --check']},
     # Go
-    '.go': ['gofmt -w', 'go vet'],
+    '.go': {'fix': ['gofmt -w', 'go vet'], 'check': ['gofmt -l', 'go vet']},
     # Rust
-    '.rs': ['rustfmt', 'cargo clippy --fix --allow-dirty'],
+    '.rs': {
+        'fix':   ['rustfmt', 'cargo clippy --fix --allow-dirty'],
+        'check': ['rustfmt --check', 'cargo clippy'],
+    },
     # C/C++
-    '.c': ['clang-format -i'],
-    '.cpp': ['clang-format -i'],
-    '.h': ['clang-format -i'],
-    '.hpp': ['clang-format -i'],
+    '.c':   {'fix': ['clang-format -i'], 'check': ['clang-format --dry-run --Werror']},
+    '.cpp': {'fix': ['clang-format -i'], 'check': ['clang-format --dry-run --Werror']},
+    '.h':   {'fix': ['clang-format -i'], 'check': ['clang-format --dry-run --Werror']},
+    '.hpp': {'fix': ['clang-format -i'], 'check': ['clang-format --dry-run --Werror']},
 }
 
 # ============================================================

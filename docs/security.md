@@ -38,16 +38,32 @@ set_sandbox_root(AICODE_ROOT, allow_external=False)
 
 ### Run Command
 
-`run_command(...)` 只允許白名單命令，例如：
+`run_command(...)` 只允許白名單命令。預設白名單：
 
 - Python：`pytest`、`python -m pytest`、`python -m unittest`
-- C/C++：`ctest`、`make`、`cmake`、`cmake --build`、`ninja`
+- C/C++：`ctest`
 - Node：`npm test`、`npm run test`、`yarn test`
 - Rust：`cargo test`、`cargo clippy`
 - Go：`go test`、`go vet`
-- Lint / format：`ruff`、`black`、`isort`、`eslint`、`clang-format`
+- Lint / format：`ruff`、`black`、`isort`、`eslint`、`clang-format`、`gofmt`、`rustfmt`
 
-即使有白名單，`make`、`cmake`、`npm test` 仍可能執行專案內腳本。只在可信專案使用。
+Build 命令（`make`、`cmake`、`cmake --build`、`ninja`、`meson`、`meson setup`、`meson compile`、`bazel build`）**預設不在白名單**，因為它們會跑專案內的 build script，等於任意程式碼執行；分析陌生 repo 時不該預設可用。要分析自己的專案，啟動 `aicode` 時顯式打開：
+
+```bash
+AI_CODE_ENABLE_BUILD_COMMANDS=1 aicode
+```
+
+即使有白名單，`make`、`cmake`、`npm test` 仍可能執行專案內腳本。分析不信任的 repo 時保持預設關閉。
+
+### 完全唯讀模式
+
+預設 `apply_patch` 和 `run_command` 都是開的（OpenCode 主流場景）。要把 CodeTrail 切成純分析、不改檔、不跑命令：
+
+```bash
+AI_CODE_PATCH=0 AI_CODE_RUN_TESTS=0 aicode
+```
+
+兩個變數獨立：`AI_CODE_PATCH=0` 只關 `apply_patch`，仍可跑 `pytest`；反之亦然。
 
 ### 不要 commit 的資料
 

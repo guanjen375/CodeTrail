@@ -153,8 +153,8 @@ aicode
 - `AICODE_ROOT` 是本次 OpenCode 可讀寫的 sandbox 根目錄；不要從 `$HOME` 或 `/` 啟動。
 - MCP server 啟動時會拒絕危險 root，並把工具限制在 `AICODE_ROOT` 內。
 - `knowledge.json`、`knowledge_emb.npz`、`data/`、`.codetrail/`、`*.jsonl` 和 `.code_rag_cache_*` 通常含 NDA 片段，不要 commit。
-- `apply_patch(...)` 有 context matching、max files、max lines 限制；不要放寬安全層。
-- `run_command(...)` 只允許白名單命令，不支援 shell metacharacter。
+- `apply_patch(...)` 有 context matching、max files、max lines 限制；不要放寬安全層。要完全關閉改檔，啟動時設 `AI_CODE_PATCH=0`。
+- `run_command(...)` 只允許白名單命令，不支援 shell metacharacter。預設白名單只含測試 / lint；`make` / `cmake` / `ninja` / `meson` / `bazel build` 等 build 命令需要顯式 `AI_CODE_ENABLE_BUILD_COMMANDS=1` 才會掛上，避免在陌生 repo 上一鍵跑專案 build script。要完全關閉命令執行，設 `AI_CODE_RUN_TESTS=0`。
 - 遠端 Ollama 會收到 prompt、程式碼片段、spec 摘要與工具輸出，只能指向可信內網 / VPN 主機。
 
 完整安全說明見 [docs/security.md](docs/security.md)。
