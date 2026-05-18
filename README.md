@@ -19,7 +19,7 @@ ollama pull qwen3-coder:30b
 ollama pull bge-m3
 ollama pull qllama/bge-reranker-v2-m3
 
-python scripts/doctor.py
+python3 scripts/doctor.py
 ```
 
 接著做兩個一次性設定：
