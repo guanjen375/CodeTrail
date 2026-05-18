@@ -210,7 +210,7 @@ aicode
 
 換模型時不要只在 TUI 裡 `/models` 切換。正確方式是退出 `aicode`，用 `AICODE_MODEL=<MODEL>` 重新啟動，讓 OpenCode TUI 與 CodeTrail MCP server 內部呼叫一致。
 
-啟動 `aicode` 時會自動跑一次 VRAM 安全檢查：根據你選的模型 + 顯卡，預估這次的 context 上限會不會把模型推到一般記憶體跑（會嚴重變慢）。如果會，啟動會直接中止，並列出可以複製貼上的修法：
+啟動 `aicode` 時如果有設定 `AICODE_MODEL`，會自動跑一次 VRAM 安全檢查：根據你選的模型 + 顯卡，預估這次的 context 上限會不會把模型推到一般記憶體跑（會嚴重變慢）。如果會，啟動會直接中止，並列出可以複製貼上的修法：
 
 ```
 [ctx-safety] UNSAFE: model=qwen3.6:35b-a3b-q4_K_M ctx=65536
@@ -223,6 +223,13 @@ aicode
 ```
 
 照 (a) 跑通常就解了。檢查只在啟動時跑一次，不會拖慢日常使用。詳細估算原理見 [docs/models.md](docs/models.md)。
+
+如果你把 35B 級模型固定寫進 `~/.bashrc`，也建議一起固定安全的 dynamic cap，例如：
+
+```bash
+export AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M
+export AICODE_DYNAMIC_NUM_CTX_MAX=32768
+```
 
 ---
 

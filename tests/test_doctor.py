@@ -141,9 +141,10 @@ def test_check_context_settings_prints_pipelines(monkeypatch):
 
 
 def test_check_context_settings_warns_when_num_ctx_exceeds_dynamic_max(monkeypatch):
-    """AICODE_NUM_CTX=131072 但 DYNAMIC_NUM_CTX_MAX=65536 + dynamic on
+    """使用者明確設 AICODE_NUM_CTX=131072,但 DYNAMIC_NUM_CTX_MAX=65536 + dynamic on
     時應該 WARN 提醒使用者實際 internal call 會被 clamp。"""
     import config as cfg
+    monkeypatch.setenv("AICODE_NUM_CTX", "131072")
     monkeypatch.setattr(cfg, "NUM_CTX", 131072)
     monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", True)
     monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_MAX", 65536)
@@ -151,6 +152,19 @@ def test_check_context_settings_warns_when_num_ctx_exceeds_dynamic_max(monkeypat
     doc.check_context_settings(r)
     assert r.warns, "應該有 WARN 提醒 dynamic max clamp"
     assert any("DYNAMIC_NUM_CTX_MAX" in w for w in r.warns)
+
+
+def test_check_context_settings_does_not_warn_on_default_num_ctx_fallback(monkeypatch):
+    """config 預設 NUM_CTX 大於 dynamic max 是正常狀態;沒設 env 時不要誤報。"""
+    import config as cfg
+    monkeypatch.delenv("AICODE_NUM_CTX", raising=False)
+    monkeypatch.delenv("OLLAMA_CONTEXT_LENGTH", raising=False)
+    monkeypatch.setattr(cfg, "NUM_CTX", 131072)
+    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", True)
+    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_MAX", 65536)
+    r = doc.Result()
+    doc.check_context_settings(r)
+    assert not any("比 DYNAMIC_NUM_CTX_MAX" in w for w in r.warns)
 
 
 def test_check_context_settings_warns_on_server_ctx_smaller_than_aicode(monkeypatch):

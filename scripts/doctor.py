@@ -233,6 +233,8 @@ def check_context_settings(r: Result) -> None:
     soft = float(getattr(cfg, "CTX_SOFT_THRESHOLD", 0.80) or 0.80)
     hard = float(getattr(cfg, "CTX_HARD_THRESHOLD", 0.90) or 0.90)
     gate_on = bool(getattr(cfg, "CTX_GATE_ENABLED", True))
+    num_ctx_env_set = bool(os.environ.get("AICODE_NUM_CTX"))
+    effective_internal_ctx = dyn_max if dyn_on and dyn_max > 0 else num_ctx
 
     r.info(
         f"AICODE_NUM_CTX={num_ctx}（dynamic 關閉時的 fallback 上限;"
@@ -248,8 +250,10 @@ def check_context_settings(r: Result) -> None:
         f"soft={int(soft*100)}% hard={int(hard*100)}% gate_on={gate_on}"
     )
 
-    # 常見錯配 1：AICODE_NUM_CTX > DYNAMIC_NUM_CTX_MAX（dynamic 開啟時）
-    if dyn_on and num_ctx > 0 and dyn_max > 0 and num_ctx > dyn_max:
+    # 常見錯配 1：使用者明確設定 AICODE_NUM_CTX,且它大於 dynamic max。
+    # config.py 的預設 NUM_CTX 本來就可能比 dynamic max 大;dynamic 開啟時
+    # 它只是 fallback,不要把這種預設狀態誤報成使用者設定錯誤。
+    if num_ctx_env_set and dyn_on and num_ctx > 0 and dyn_max > 0 and num_ctx > dyn_max:
         r.warn(
             f"AICODE_NUM_CTX={num_ctx} 比 DYNAMIC_NUM_CTX_MAX={dyn_max} 大;"
             "dynamic 啟用時實際 internal call 會被 clamp 到 dynamic max。\n"
@@ -259,7 +263,7 @@ def check_context_settings(r: Result) -> None:
 
     # 常見錯配 1b：AICODE_NUM_CTX 有設、但 dynamic 開啟 → 多數情況下這個 env
     # var 完全沒效果,使用者調了不會感覺到任何差別。明確告訴他要改的是哪顆。
-    if dyn_on and os.environ.get("AICODE_NUM_CTX"):
+    if dyn_on and num_ctx_env_set:
         r.warn(
             f"AICODE_NUM_CTX 環境變數有設 (={num_ctx}) 但 dynamic 啟用,"
             "在這種模式下它不影響 per-call 上限。\n"
@@ -281,11 +285,12 @@ def check_context_settings(r: Result) -> None:
         try:
             sc = int(server_ctx_env)
             r.info(f"OLLAMA_CONTEXT_LENGTH={sc}（server 層,影響 OpenCode TUI /v1 路徑）")
-            if num_ctx and sc < num_ctx:
+            if effective_internal_ctx and sc < effective_internal_ctx:
                 r.warn(
-                    f"OLLAMA_CONTEXT_LENGTH={sc} 比 AICODE_NUM_CTX={num_ctx} 小;"
-                    "OpenCode TUI 主對話可能會被 server 端裁掉。建議調高 server context "
-                    "或縮小 CodeTrail num_ctx 對齊。"
+                    f"OLLAMA_CONTEXT_LENGTH={sc} 比 CodeTrail internal ctx cap="
+                    f"{effective_internal_ctx} 小;OpenCode TUI 主對話的 context "
+                    "會比 CodeTrail 工具/RAG 路徑小。若非刻意分開,建議調高 "
+                    "OLLAMA_CONTEXT_LENGTH 或降低 AICODE_DYNAMIC_NUM_CTX_MAX 對齊。"
                 )
         except ValueError:
             r.warn(f"OLLAMA_CONTEXT_LENGTH={server_ctx_env!r} 不是數字")
@@ -365,7 +370,7 @@ def check_ollama_runtime(r: Result, no_network: bool) -> None:
 
 
 def check_opencode_config_drift(r: Result, project: str | None) -> None:
-    """看 opencode.json 內 model.limit.context 跟 AICODE_NUM_CTX 是否大致對齊。
+    """看 opencode.json 內 model.limit.context 跟 CodeTrail internal ctx cap 是否大致對齊。
 
     僅 warn,絕不自動改使用者設定。
     """
@@ -394,7 +399,10 @@ def check_opencode_config_drift(r: Result, project: str | None) -> None:
     cfg = _read_config()
     if isinstance(cfg, Exception):
         return
-    aicode_num_ctx = int(getattr(cfg, "NUM_CTX", 0) or 0)
+    num_ctx = int(getattr(cfg, "NUM_CTX", 0) or 0)
+    dyn_on = bool(getattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", False))
+    dyn_max = int(getattr(cfg, "DYNAMIC_NUM_CTX_MAX", 0) or 0)
+    internal_ctx_cap = dyn_max if dyn_on and dyn_max > 0 else num_ctx
 
     models = oc.get("models") or oc.get("model") or {}
     if not isinstance(models, dict) or not models:
@@ -407,9 +415,13 @@ def check_opencode_config_drift(r: Result, project: str | None) -> None:
             continue
         limit = spec.get("limit") or {}
         ctx = limit.get("context") if isinstance(limit, dict) else None
-        if isinstance(ctx, int) and aicode_num_ctx and abs(ctx - aicode_num_ctx) > aicode_num_ctx * 0.5:
+        if (
+            isinstance(ctx, int)
+            and internal_ctx_cap
+            and abs(ctx - internal_ctx_cap) > internal_ctx_cap * 0.5
+        ):
             mismatches.append(
-                f"        model={model_id} limit.context={ctx} 與 AICODE_NUM_CTX={aicode_num_ctx} 差距 > 50%"
+                f"        model={model_id} limit.context={ctx} 與 CodeTrail internal ctx cap={internal_ctx_cap} 差距 > 50%"
             )
     if mismatches:
         r.warn(
