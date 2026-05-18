@@ -14,13 +14,25 @@ CodeTrail 目前定位是**成熟私有部署版**：適合本機、離線、NDA
 cd <CODETRAIL_REPO>
 pip install -r requirements.txt
 pip install mcp pymupdf4llm ollama
+```
 
-ollama pull qwen3-coder:30b
+### 選一顆程式推導模型
+
+CodeTrail 不內建、也不替你預設任何「主聊天 / 程式推導模型」。你必須自己從 Ollama
+上挑一顆模型，下文用 `<CODE_MODEL>` 當佔位符代表它（**所有指令、JSON、env var 裡的
+`<CODE_MODEL>` 都要替換成實際 tag**，例如 `qwen3-coder:30b`、`devstral:24b`、
+`qllama/some-model:tag`）。比較見 [docs/models.md](docs/models.md)。
+
+```bash
+ollama pull <CODE_MODEL>
 ollama pull bge-m3
 ollama pull qllama/bge-reranker-v2-m3
 
 python3 scripts/doctor.py
 ```
+
+`bge-m3` 與 `qllama/bge-reranker-v2-m3` 是 CodeTrail 內部 RAG embedding / reranker
+用的附屬模型，不是聊天模型，請不要在 OpenCode model selector 裡選它們。
 
 接著做兩個一次性設定：
 
@@ -29,7 +41,7 @@ mkdir -p ~/.config/opencode
 ${EDITOR:-vi} ~/.config/opencode/opencode.json
 ```
 
-把下面內容貼進 `~/.config/opencode/opencode.json`；它會設定 Ollama provider、CodeTrail MCP server 和 OpenCode 權限：
+把下面內容貼進 `~/.config/opencode/opencode.json`；它會設定 Ollama provider、CodeTrail MCP server 和 OpenCode 權限。**把所有 `<CODE_MODEL>` 都替換成你剛 `ollama pull` 的那顆模型 tag**：
 
 ```json
 {
@@ -39,8 +51,8 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
   "autoupdate": false,
 
   "enabled_providers": ["ollama"],
-  "model": "ollama/qwen3-coder:30b",
-  "small_model": "ollama/qwen3-coder:30b",
+  "model": "ollama/<CODE_MODEL>",
+  "small_model": "ollama/<CODE_MODEL>",
 
   "provider": {
     "ollama": {
@@ -50,17 +62,8 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
         "baseURL": "http://localhost:11434/v1"
       },
       "models": {
-        "qwen3-coder:30b": {
-          "name": "Qwen3 Coder 30B"
-        },
-        "qwen3.6:35b-a3b-q4_K_M": {
-          "name": "Qwen3.6 35B A3B Q4_K_M"
-        },
-        "devstral:24b": {
-          "name": "Devstral 24B"
-        },
-        "gpt-oss:20b": {
-          "name": "GPT-OSS 20B"
+        "<CODE_MODEL>": {
+          "name": "<CODE_MODEL>"
         }
       }
     }
@@ -198,22 +201,30 @@ aicode
 
 ## 常用模型
 
-| 模型 | 用途 | 建議 |
+CodeTrail 不替你決定主聊天 / 程式推導模型 — 下表只是常見候選的比較，請依照硬體與任務自己挑一顆當 `<CODE_MODEL>`。要看更詳細的選擇邏輯與 context 建議，見 [docs/models.md](docs/models.md)。
+
+| 模型 | 用途 | 取捨 |
 |---|---|---|
-| `qwen3-coder:30b` | 日常讀 repo、改 code、產 patch | 預設主力，穩定優先 |
-| `qwen3.6:35b-a3b-q4_K_M` | 跨檔推理、規格 vs 實作比對 | 較吃 VRAM，啟動時 `aicode` 會自動判斷你的顯卡能不能撐這個 context |
-| `devstral:24b` | 快速 review、簡單 patch | 快，但工具鏈穩定度要再確認 |
-| `gpt-oss:20b` | 快速理解、摘要、初步定位 | 適合探索，不適合作為最終 patch 主力 |
-| `bge-m3` | RAG / Code-RAG embedding | 必要模型，不要當聊天模型選 |
-| `qllama/bge-reranker-v2-m3` | RAG rerank | 建議安裝，查 spec 排序更穩 |
+| `qwen3-coder:30b` | 日常讀 repo、改 code、產 patch | coding 與工具呼叫穩定度較均衡；比 20B 慢 |
+| `qwen3.6:35b-a3b-q4_K_M` | 跨檔推理、規格 vs 實作比對 | 較吃 VRAM；啟動時 `aicode` 會自動判斷顯卡能不能撐這個 context |
+| `devstral:24b` | 快速 review、簡單 patch | 快；長工具鏈穩定度要實測 |
+| `gpt-oss:20b` | 快速理解、摘要、初步定位 | 啟動快；不適合作為最終 patch 主力 |
+| `bge-m3` | RAG / Code-RAG embedding（內部固定附屬模型） | 不要在 OpenCode model selector 裡選來聊天 |
+| `qllama/bge-reranker-v2-m3` | RAG rerank（內部固定附屬模型） | 同上，不是聊天模型 |
 | `qwen3-vl:30b-a3b` | 截圖、UI error、圖片進 KB | 需要分析圖片時再 pull |
 
-換模型時不要只在 TUI 裡 `/models` 切換。正確方式是退出 `aicode`，用 `AICODE_MODEL=<MODEL>` 重新啟動，讓 OpenCode TUI 與 CodeTrail MCP server 內部呼叫一致。
+主模型解析優先順序（找不到、是 placeholder、或被指到非 Ollama provider 時 `aicode` 會 fail-loud，**不會** fallback 任何內建預設）：
 
-啟動 `aicode` 時會自動跑一次 VRAM 安全檢查：根據有效模型（`AICODE_MODEL`，未設時用 `config.py` 預設模型）+ 顯卡，預估這次的 context 上限會不會把模型推到一般記憶體跑（會嚴重變慢）。如果會，啟動會直接中止，並列出可以複製貼上的修法：
+1. `AICODE_MODEL` 環境變數。
+2. `aicode -m <MODEL>` / `--model <MODEL>` CLI 旗標（只接受 `ollama/<MODEL>` 或 bare Ollama model name）。
+3. `~/.config/opencode/opencode.json` 的 `"model"` 欄位（必須是 `ollama/<MODEL>`）。
+
+換模型時不要只在 TUI 裡 `/models` 切換。正確方式是退出 `aicode`，用 `AICODE_MODEL=<CODE_MODEL>` 重新啟動，讓 OpenCode TUI 與 CodeTrail MCP server 內部呼叫一致。
+
+啟動 `aicode` 時會自動跑一次 VRAM 安全檢查：根據解析後的有效模型 + 顯卡，預估這次的 context 上限會不會把模型推到一般記憶體跑（會嚴重變慢）。如果會，啟動會直接中止，並列出可以複製貼上的修法：
 
 ```
-[ctx-safety] UNSAFE: model=qwen3.6:35b-a3b-q4_K_M ctx=65536
+[ctx-safety] UNSAFE: model=<CODE_MODEL> ctx=65536
         Requested ctx=65536 → est VRAM needed ≈ 33.3GB (vs total 31.8GB)
         Computed safe ctx cap ≈ 55296
         建議任一處理:
@@ -226,10 +237,10 @@ aicode
 
 注意：這個啟動前預測目前只支援能用 `nvidia-smi` 讀取 VRAM 的 NVIDIA 顯卡；AMD 顯卡、內顯或沒有 GPU telemetry 的環境會顯示 `[ctx-safety] UNKNOWN` 並放行，之後請用 `ollama ps` 看實際是否 offload。
 
-如果你把 35B 級模型固定寫進 `~/.bashrc`，也建議一起固定安全的 dynamic cap，例如：
+如果你把大模型固定寫進 `~/.bashrc`，也建議一起固定安全的 dynamic cap，例如：
 
 ```bash
-export AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M
+export AICODE_MODEL=<CODE_MODEL>
 export AICODE_DYNAMIC_NUM_CTX_MAX=32768
 ```
 
@@ -240,20 +251,20 @@ export AICODE_DYNAMIC_NUM_CTX_MAX=32768
 先在 Ollama 下載模型，再用同一個 `AICODE_MODEL` 啟動：
 
 ```bash
-ollama pull <MODEL>
+ollama pull <CODE_MODEL>
 
-AICODE_MODEL=<MODEL> \
+AICODE_MODEL=<CODE_MODEL> \
 AICODE_DYNAMIC_NUM_CTX_MAX=32768 \
 aicode
 ```
 
-常見起點：
+常見起點（請把 `<CODE_MODEL>` 換成下表中你實際 pull 的那顆 tag）：
 
-| 硬體 | 建議 |
+| 硬體 | 候選 |
 |---|---|
-| 32GB VRAM | `qwen3.6:35b-a3b-q4_K_M` 先配 `AICODE_DYNAMIC_NUM_CTX_MAX=32768`，穩定後再試 `65536` |
-| 24GB VRAM | 優先 `qwen3-coder:30b` / `devstral:24b`，35B 要先降 context |
-| 16GB 以下 | 用 `gpt-oss:20b` 或更小模型，避免大模型加大 context |
+| 32GB VRAM | 35B 級模型 (例如 `qwen3.6:35b-a3b-q4_K_M`) 先配 `AICODE_DYNAMIC_NUM_CTX_MAX=32768`，穩定後再試 `65536` |
+| 24GB VRAM | 30B / 24B 級 (例如 `qwen3-coder:30b` / `devstral:24b`)；35B 要先降 context |
+| 16GB 以下 | 20B 級或更小 (例如 `gpt-oss:20b`)，不要硬開大 context |
 
 啟動後用另一個終端機看實際載入狀態：
 
@@ -270,7 +281,7 @@ ollama ps
 
 ```bash
 AICODE_OLLAMA_BASE_URL=http://<GPU_HOST>:11434 \
-AICODE_MODEL=<MODEL> \
+AICODE_MODEL=<CODE_MODEL> \
 AICODE_DYNAMIC_NUM_CTX_MAX=32768 \
 aicode
 ```

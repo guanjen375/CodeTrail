@@ -151,11 +151,23 @@ if _BUILD_COMMANDS_ENABLED:
 set_sandbox_root(AICODE_ROOT, allow_external=False)
 
 _log(f"[MCP] AICODE_ROOT = {AICODE_ROOT}")
-_log(
-    f"[MCP] Using model: {config.MODEL}"
-    + (f" (AICODE_MODEL override, default={config.DEFAULT_MODEL})"
-       if config.MODEL != config.DEFAULT_MODEL else " (default)")
-)
+
+# fail-loud: CodeTrail 不內建主聊天模型, 沒設好就直接退出, 避免 silent 跑到底
+# 才在 Ollama 那邊 404。aicode wrapper 已經做過一次解析 + export, 走到這裡
+# 還是空表示使用者繞過了 wrapper (例如手動 spawn MCP 子行程)。
+try:
+    _resolved_main_model = config.require_main_model()
+except RuntimeError as _model_err:
+    _log("[MCP][FATAL] " + str(_model_err))
+    sys.exit(3)
+
+if os.environ.get("AICODE_MODEL", "").strip():
+    _log(f"[MCP] Using model: {_resolved_main_model} (from AICODE_MODEL env)")
+else:
+    _log(
+        f"[MCP] Using model: {_resolved_main_model} "
+        "(resolved from ~/.config/opencode/opencode.json)"
+    )
 
 # Warn if user set AICODE_NUM_CTX expecting it to cap per-call context, but
 # dynamic mode (the default) ignores it and uses DYNAMIC_NUM_CTX_MAX instead.

@@ -28,6 +28,11 @@ def _spawn_mcp(tmp_root: Path, env_overrides: dict[str, str] | None = None) -> s
     env["AICODE_ROOT"] = str(tmp_root)
     env["PYTHONIOENCODING"] = "utf-8"
     env["AICODE_OLLAMA_BASE_URL"] = "http://127.0.0.1:1"
+    # mcp_server.py 啟動時會 require_main_model(); 沒設會 fail-loud exit 3。
+    # 這個 test file 在意的是 patch / run_command policy, 不是 model resolution,
+    # 所以給一個合理的假值讓 server 起得來。AICODE_MODEL resolution 邏輯有
+    # tests/test_resolve_main_model.py + tests/test_config.py 各自覆蓋。
+    env.setdefault("AICODE_MODEL", "qwen3-coder:30b")
     env["PYTHONPATH"] = os.pathsep.join(
         [p for p in sys.path if p]
         + [env.get("PYTHONPATH", "")]

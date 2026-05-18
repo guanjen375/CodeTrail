@@ -1,12 +1,12 @@
 [
   {
     "id": "spec_001",
-    "question": "這個系統預設使用什麼模型？",
+    "question": "CodeTrail 預設使用哪一個主聊天 / 程式推導模型？",
     "expected": {
       "refs": ["spec", "模型"],
-      "keywords": ["qwen3-coder", "30b"],
-      "gold_chunks": ["MODEL", "qwen3"],
-      "gold_evidence": ["qwen3-coder:30b"]
+      "keywords": ["不內建", "AICODE_MODEL", "CODE_MODEL"],
+      "gold_chunks": ["MODEL", "AICODE_MODEL"],
+      "gold_evidence": ["不內建", "AICODE_MODEL", "CODE_MODEL"]
     }
   },
   {

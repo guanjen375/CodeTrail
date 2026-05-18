@@ -5,9 +5,41 @@ import config
 
 
 def test_model_strings_non_empty():
-    assert isinstance(config.MODEL, str) and config.MODEL.strip()
+    # MODEL 由 AICODE_MODEL / opencode.json 動態解析; CodeTrail 不內建預設,
+    # 沒設好時是 "" — 這是刻意的 fail-loud 狀態。型別仍應是 str。
+    # 真實 LLM 呼叫端必須先呼 config.require_main_model() (沒設就 raise)。
+    assert isinstance(config.MODEL, str)
+    # EMBEDDING / RERANKER 是 RAG 內部固定附屬模型, 預設值保留, 必須非空。
     assert isinstance(config.EMBEDDING_MODEL, str) and config.EMBEDDING_MODEL.strip()
     assert isinstance(config.RERANKER_MODEL, str) and config.RERANKER_MODEL.strip()
+
+
+def test_require_main_model_fails_when_unset(monkeypatch):
+    """MODEL 為空時 require_main_model 必須 raise (fail-loud, 不 fallback)。"""
+    import pytest
+    monkeypatch.setattr(config, "MODEL", "")
+    with pytest.raises(RuntimeError) as exc:
+        config.require_main_model()
+    assert "AICODE_MODEL" in str(exc.value)
+
+
+def test_require_main_model_returns_value_when_set(monkeypatch):
+    monkeypatch.setattr(config, "MODEL", "some-org/some-model:tag")
+    assert config.require_main_model() == "some-org/some-model:tag"
+
+
+def test_to_opencode_model_id_normalization():
+    # bare name → 加 ollama/ prefix
+    assert config.to_opencode_model_id("qwen3-coder:30b") == "ollama/qwen3-coder:30b"
+    # 已含 ollama/ → 不重複加
+    assert config.to_opencode_model_id("ollama/qwen3-coder:30b") == "ollama/qwen3-coder:30b"
+    # 含 namespace slash 也視為 bare ollama name (qllama/, hf.co/ 等)
+    assert (
+        config.to_opencode_model_id("qllama/bge-reranker-v2-m3")
+        == "ollama/qllama/bge-reranker-v2-m3"
+    )
+    # 空字串 → 空字串 (呼叫端應該先用 require_main_model fail-loud)
+    assert config.to_opencode_model_id("") == ""
 
 
 def test_numeric_thresholds_in_unit_range():

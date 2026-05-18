@@ -7,18 +7,20 @@
     python3 scripts/ctx_safety_check.py
 
 讀取的環境變數:
-    AICODE_MODEL                  可選;沒設則用 config.py 的預設模型
+    AICODE_MODEL                  必填;aicode wrapper 會用 resolve_main_model.py 解析
+                                  好以後再 export。沒設 → 直接 fail-loud, CodeTrail
+                                  不假定任何預設主模型。
     AICODE_DYNAMIC_NUM_CTX_MAX    要檢查的 ctx 上限;預設 65536 (跟 config.py 同)
     AICODE_OLLAMA_BASE_URL        Ollama URL;預設 http://localhost:11434
     AICODE_ACCEPT_CTX_RISK        =1 時即使預測 UNSAFE 也 exit 0 (使用者覆蓋)
     AICODE_CTX_SAFETY_DISABLE     =1 時整個檢查跳過 (除錯 / 緊急逃生)
 
 退出碼:
-    0  SAFE / UNKNOWN / 使用者覆蓋  → 可以繼續 exec opencode
-    2  UNSAFE 且使用者沒覆蓋        → wrapper 應該 abort
+    0  SAFE / UNKNOWN / 使用者覆蓋          → 可以繼續 exec opencode
+    2  UNSAFE 或 AICODE_MODEL 未設且使用者沒覆蓋 → wrapper 應該 abort
 
 設計守則:
-- fail-loud:UNSAFE 一定明確 print 出來,不偷偷 clamp。
+- fail-loud:UNSAFE / 模型未設一定明確 print 出來,不偷偷 clamp / fallback。
 - UNKNOWN (拿不到 GPU / Ollama / metadata) 一律放行,只 warn — 不能因為
   CI 環境或遠端 Ollama 沒辦法估算就 block 使用者。
 - 給可複製貼上的 export 指令,方便使用者一行修好。
@@ -36,11 +38,9 @@ if str(REPO_ROOT) not in sys.path:
 import gpu_safety  # noqa: E402
 
 
-# 跟 config.py 的 DEFAULT_MODEL / DYNAMIC_NUM_CTX_MAX 預設保持一致。
-# 若 config.py 改了預設,這裡也要改。這個啟動前檢查刻意不 import config:
-# config.py 會 parse 多個 env var,其中任一使用者填錯都可能讓這個 safety gate
-# 在印出可讀訊息前先爆掉。
-DEFAULT_MODEL = "qwen3-coder:30b"
+# 跟 config.py 的 DYNAMIC_NUM_CTX_MAX 預設保持一致。這個啟動前檢查刻意不
+# import config: config.py 會 parse 多個 env var, 任一使用者填錯都可能讓這個
+# safety gate 在印出可讀訊息前先爆掉。
 DEFAULT_CTX_MAX = 65536
 
 
@@ -53,15 +53,26 @@ def _print_block(prefix: str, lines: list[str]) -> None:
         print(f"[ctx-safety] {prefix} {ln}", flush=True)
 
 
+def _is_placeholder_model(value: str) -> bool:
+    return "<" in value or ">" in value
+
+
 def main() -> int:
     if os.environ.get("AICODE_CTX_SAFETY_DISABLE", "").lower() in ("1", "true", "yes"):
         _print("disabled via AICODE_CTX_SAFETY_DISABLE")
         return 0
 
     model = os.environ.get("AICODE_MODEL", "").strip()
-    if not model:
-        model = DEFAULT_MODEL
-        _print(f"AICODE_MODEL 未設,使用預設模型 {model} 做 ctx 安全檢查")
+    if not model or _is_placeholder_model(model):
+        _print("AICODE_MODEL 未設 (或仍是 <CODE_MODEL> 之類的 placeholder)。")
+        _print("        CodeTrail 不內建預設主模型, 無法做 ctx 安全檢查。")
+        _print("        請先 ollama pull 一顆 Ollama 模型, 然後設定:")
+        _print("          export AICODE_MODEL=<CODE_MODEL>")
+        _print("        或透過 aicode wrapper 自動解析 (aicode 會讀 opencode.json 主模型)。")
+        _print("        若刻意要跳過檢查 (例如 CI), 設 AICODE_CTX_SAFETY_DISABLE=1。")
+        _print("refuse to start.")
+        return 2
+    # 已通過 placeholder 檢查, 後續邏輯不需要再判定 model 是否為空。
 
     try:
         requested = int(os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX", "") or DEFAULT_CTX_MAX)

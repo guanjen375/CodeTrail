@@ -112,15 +112,21 @@ def check_code_questions(issues: list[str]) -> None:
 
 
 # 真正的 config key 都長這樣：至少一個底線，總長度 ≥ 6
-# 排除單詞縮寫（BUG / OOM / GPU）和環境變數命名（AI_CODE_*）
+# 排除單詞縮寫（BUG / OOM / GPU）和環境變數命名（AI_CODE_* / AICODE_*）以及
+# README 用的 placeholder token (例如 CODE_MODEL — 主模型佔位符)。
 _CONFIG_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+(?:_[A-Z0-9]+){1,}$")
-_ENV_VAR_PREFIXES = ("AI_CODE_",)
+_ENV_VAR_PREFIXES = ("AI_CODE_", "AICODE_")
+# 文件用的 placeholder, 不是 config.py 內的真實 key。CodeTrail 不再內建主模型,
+# spec eval 會把 CODE_MODEL 當答案 keyword, 必須排除避免被誤判為 config drift。
+_DOC_PLACEHOLDER_TOKENS = {"CODE_MODEL"}
 
 
 def _is_config_key_like(token: str) -> bool:
     if not _CONFIG_KEY_RE.match(token):
         return False
     if any(token.startswith(p) for p in _ENV_VAR_PREFIXES):
+        return False
+    if token in _DOC_PLACEHOLDER_TOKENS:
         return False
     if len(token) < 6:
         return False

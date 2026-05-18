@@ -62,14 +62,31 @@ export AICODE_CTX_SAFETY_DISABLE=1
 
 ### 模型 404 或找不到模型
 
-代表 Ollama 沒有該 tag：
+代表 Ollama 沒有該 tag。先 `ollama list` 看裝了什麼，沒有的話再 pull（CodeTrail 不會替你預設任何主模型，下面只是常見候選舉例 — 自己挑要用的那顆）：
 
 ```bash
-ollama pull qwen3-coder:30b
-ollama pull qwen3.6:35b-a3b-q4_K_M
-ollama pull devstral:24b
-ollama pull gpt-oss:20b
+ollama pull <CODE_MODEL>            # 自己選的主模型
+ollama pull qwen3-coder:30b         # 例:30B 候選
+ollama pull qwen3.6:35b-a3b-q4_K_M  # 例:35B 候選
+ollama pull devstral:24b            # 例:24B 候選
+ollama pull gpt-oss:20b             # 例:20B 候選
 ```
+
+### `aicode` 拒絕啟動,訊息說「主模型未設定」
+
+CodeTrail 不內建主聊天 / 程式推導模型，沒設好 `aicode` 會 fail-loud。任選一種設定方式（擇一即可）：
+
+```bash
+# 1) 環境變數 (最優先)
+export AICODE_MODEL=<CODE_MODEL>
+
+# 2) per-run CLI 旗標
+aicode -m ollama/<CODE_MODEL>
+
+# 3) ~/.config/opencode/opencode.json 設 "model": "ollama/<CODE_MODEL>"
+```
+
+`<CODE_MODEL>` 是佔位符，必須替換成實際模型名稱（例如 `qwen3-coder:30b`、`devstral:24b`、`qllama/some-model:tag`）。如果你看到「placeholder」相關錯誤，通常是值還停留在 `<CODE_MODEL>` 或 `<MODEL>` 沒換掉。
 
 ### 查 spec 沒結果
 

@@ -3,7 +3,9 @@
 """
 智能程式碼分析器 - 設定檔
 """
+import json as _json
 import os as _os
+from pathlib import Path as _Path
 
 # ============================================================
 # Ollama 設定
@@ -16,13 +18,111 @@ OLLAMA_CHAT_URL = f"{OLLAMA_BASE_URL}/api/chat"
 OLLAMA_EMBEDDINGS_URL = f"{OLLAMA_BASE_URL}/api/embeddings"
 OLLAMA_TAGS_URL = f"{OLLAMA_BASE_URL}/api/tags"
 OLLAMA_PS_URL = f"{OLLAMA_BASE_URL}/api/ps"
-# 主 LLM:可用 AICODE_MODEL 環境變數覆寫(切換模型用,不改 source code)
-# baseline: qwen3-coder:30b
-# 候選    : qwen3.6:35b-a3b-q4_K_M   (Linux + 5090 32GB 可跑)
-# 注意     : qwen3.6:35b-a3b-coding-nvfp4 是 macOS 專用 quant,Linux 無法 pull
-DEFAULT_MODEL = "qwen3-coder:30b"
-MODEL = _os.environ.get("AICODE_MODEL", DEFAULT_MODEL)
+
+# ============================================================
+# 主聊天 / 程式推導模型
+# ============================================================
+# 設計守則: CodeTrail 不內建、不推薦、不 fallback 任何固定主模型。
+# 使用者必須自己挑一顆 Ollama 模型,並透過下列任一方式告訴 CodeTrail:
+#
+#   1. AICODE_MODEL=<MODEL>                 (環境變數,最優先)
+#   2. aicode -m <MODEL> / --model <MODEL>  (CLI 旗標,只接受 ollama/<MODEL> 或 bare Ollama name)
+#   3. ~/.config/opencode/opencode.json     ("model": "ollama/<MODEL>")
+#
+# 三個都找不到、或值是 placeholder (含 '<' / '>') 時, MODEL 為空字串;
+# 要實際呼叫 LLM 的呼叫端必須先用 require_main_model() 取值,沒設好就 fail-loud。
+# 注意: <CODE_MODEL>、<MODEL>、<程式推導模型> 這類佔位符會被當成「未設」。
+
+# embedding / reranker / VL 是 RAG / media 內部用的固定附屬模型, 跟主模型分開,
+# 預設值保留, 必要時各自用環境變數覆寫。
 VL_MODEL = _os.environ.get("AICODE_VL_MODEL", "qwen3-vl:30b-a3b")
+
+
+def _is_placeholder_model(value: str) -> bool:
+    """`<CODE_MODEL>` / `<MODEL>` / `<...>` 形式視為未設定。"""
+    if not value:
+        return True
+    return "<" in value or ">" in value
+
+
+def _strip_ollama_prefix(value: str) -> str:
+    """只移除開頭的 `ollama/`;Ollama model name 本身可以含 namespace slash
+    (例如 `qllama/bge-reranker-v2-m3`),不能用 `*/*` 判斷 provider prefix。"""
+    if value.startswith("ollama/"):
+        return value[len("ollama/"):]
+    return value
+
+
+def _read_opencode_main_model() -> str:
+    """讀使用者 OpenCode global config 的 `model` 欄位 (第三優先 fallback)。
+
+    刻意只讀 `~/.config/opencode/opencode.json`,不掃描其他位置 (例如專案
+    local opencode.json) — 主模型是使用者帳號級別的偏好, 不是 per-project 設定。
+    讀不到、parse 失敗、值是 placeholder 都回空字串, 留給呼叫端 fail-loud。
+    """
+    candidates = []
+    home = _os.environ.get("HOME") or _os.environ.get("USERPROFILE")
+    if home:
+        candidates.append(_Path(home) / ".config" / "opencode" / "opencode.json")
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            data = _json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        raw = data.get("model")
+        if not isinstance(raw, str):
+            continue
+        raw = raw.strip()
+        if _is_placeholder_model(raw):
+            continue
+        return _strip_ollama_prefix(raw)
+    return ""
+
+
+def _resolve_main_model() -> str:
+    """主模型來源優先順序: AICODE_MODEL > opencode.json `model` 欄位。
+
+    回傳 bare model name (沒有 `ollama/` prefix), 找不到時回空字串。
+    `aicode` wrapper 會另外處理 `-m` / `--model` CLI 旗標 (在這裡看不到),
+    它應該在啟動子行程前把 AICODE_MODEL 設好。
+    """
+    raw = _os.environ.get("AICODE_MODEL", "").strip()
+    if raw and not _is_placeholder_model(raw):
+        return _strip_ollama_prefix(raw)
+    return _read_opencode_main_model()
+
+
+MODEL = _resolve_main_model()
+
+
+def require_main_model() -> str:
+    """取目前的主模型,沒設就 fail-loud。 LLM 呼叫端進入點都該先呼這個。"""
+    if not MODEL:
+        raise RuntimeError(
+            "CodeTrail 找不到主聊天 / 程式推導模型 (CODE_MODEL)。\n"
+            "請先選擇一顆 Ollama 模型 (例如 ollama pull <CODE_MODEL>),然後任選一種方式設定:\n"
+            "  1) export AICODE_MODEL=<CODE_MODEL>               (最優先,recommended)\n"
+            "  2) aicode -m ollama/<CODE_MODEL>                  (per-run CLI 旗標)\n"
+            "  3) 在 ~/.config/opencode/opencode.json 設 \"model\": \"ollama/<CODE_MODEL>\"\n"
+            "<CODE_MODEL> 是佔位符,必須替換成實際模型名稱 (例如 qwen3-coder:30b、\n"
+            "devstral:24b、qllama/some-model:tag 等)。CodeTrail 不會替你預設或推薦。"
+        )
+    return MODEL
+
+
+def to_opencode_model_id(bare_model: str) -> str:
+    """把 bare Ollama model name 轉成 OpenCode 認得的 `ollama/<MODEL>` 形式。
+    已經是 `ollama/...` 就不重複加 prefix。
+    """
+    if not bare_model:
+        return ""
+    if bare_model.startswith("ollama/"):
+        return bare_model
+    return f"ollama/{bare_model}"
 
 # Context 長度設定
 # - 5090 32GB + 192GB RAM: 可開 128K，VRAM 不足時自動 offload 到 RAM

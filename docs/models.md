@@ -1,30 +1,36 @@
 # 模型與硬體建議
 
-這份文件整理主模型、embedding、reranker、視覺模型、context，以及換顯卡或遠端 Ollama 時的建議。
+這份文件整理主模型候選、embedding、reranker、視覺模型、context，以及換顯卡或遠端 Ollama 時的建議。
 
 [回到 README](../README.md)。
 
 ---
 
-## 模型比較
+## 主模型來源（CodeTrail 不內建預設）
 
-下面比較的是這個 repo 的 OpenCode 設定檔已列出的模型，以及 CodeTrail 內部會用到的 RAG / 視覺模型。
+CodeTrail **不替你決定主聊天 / 程式推導模型**，也不會 fallback 任何固定 baseline。你必須自己 `ollama pull` 一顆 Ollama 模型，然後用下列任一方式告訴 CodeTrail（這幾個都沒設、或值是 `<CODE_MODEL>` 之類的 placeholder 時，`aicode` 會直接 fail-loud 拒絕啟動）：
 
-| 模型 | 建議用途 | 優點 | 注意事項 |
-|---|---|---|---|
-| `qwen3-coder:30b` | 預設主力；讀 repo、改 code、產 patch、跑驗證閉環 | coding 能力和工具使用穩定度最均衡；適合作為日常預設 | 比 20B 模型慢；長工具鏈任務建議拆成「先查證、再修改」 |
-| `qwen3.6:35b-a3b-q4_K_M` | 跨檔推理、規格 vs 實作比對、較複雜重構 | 推理上限較高；大 context 任務表現較好 | 顯卡 32GB 的話第一次跑先設 `AICODE_DYNAMIC_NUM_CTX_MAX=32768`，用一陣子沒問題再升到 `65536`。**不要**用 `qwen3.6:35b-a3b-coding-nvfp4`（macOS 限定的版本，Linux 拉會報錯 412） |
-| `devstral:24b` | 快速 code review、找 bug、簡單 patch | 速度和 coding 能力平衡；回答通常直接 | 工具呼叫格式不一定比 Qwen Coder 穩；大型修改前建議切回 Qwen |
-| `gpt-oss:20b` | 快速理解陌生 repo、摘要、初步定位 | 輕量、啟動快、硬體壓力低 | 複雜改檔與長工具鏈較弱；適合探索，不適合作為最終 patch 主力 |
-| `qwen3-vl:30b-a3b` | `analyze_file(...)` 處理截圖、UI error；`ingest_document(...)` 把圖片切 chunk 進 KB 也用它 | 讀圖中文字與畫面資訊較好 | 不是主要 coding model；不分析圖片、也不把圖片進 KB 就不用 pull |
-| `bge-m3` | `query_knowledge(...)` / `code_rag_search(...)` 的 embedding | 多語檢索穩定；中文 spec 與英文程式碼混用時有幫助 | 不是聊天模型，不要在 OpenCode model selector 裡選 |
-| `qllama/bge-reranker-v2-m3` | RAG rerank | 能改善 spec 查詢排序，降低抓到弱相關 chunk 的機率 | 會增加查詢延遲；模型未 pull 時 RAG 品質會下降或報錯 |
+1. `AICODE_MODEL` 環境變數（最優先，例如 `export AICODE_MODEL=<CODE_MODEL>`）。
+2. `aicode -m ollama/<CODE_MODEL>` / `--model ollama/<CODE_MODEL>` CLI 旗標（只接受 `ollama/<MODEL>` 或 bare Ollama model name；非 Ollama provider 會被拒）。
+3. `~/.config/opencode/opencode.json` 的 `"model"` 欄位（必須是 `ollama/<CODE_MODEL>`）。
 
-實務選法：
+下面的清單只是常見候選的比較，沒有「預設」或「推薦」一說 — 請依硬體與任務自己挑：
 
-- 要穩定完成「查證 -> patch -> test」：用 `qwen3-coder:30b`。
-- 任務跨很多檔、要比對規格或做設計判斷：用 `qwen3.6:35b-a3b-q4_K_M`（Linux 上能用的版本；`qwen3.6:35b-a3b-coding-nvfp4` 是 macOS 限定，不要用）。
-- 只想先看懂 repo 或做初步 review：用 `gpt-oss:20b` 或 `devstral:24b`。
+| 候選模型 | 適合任務 | 取捨 |
+|---|---|---|
+| `qwen3-coder:30b` | 讀 repo、改 code、產 patch、跑驗證閉環 | coding 與工具使用穩定度均衡；比 20B 慢；長工具鏈建議拆成「先查證、再修改」 |
+| `qwen3.6:35b-a3b-q4_K_M` | 跨檔推理、規格 vs 實作比對、較複雜重構 | 推理上限較高；32GB 顯卡先用 `AICODE_DYNAMIC_NUM_CTX_MAX=32768`，穩定再升 `65536`。**不要**用 `qwen3.6:35b-a3b-coding-nvfp4`（macOS 限定，Linux 拉會 412） |
+| `devstral:24b` | 快速 code review、找 bug、簡單 patch | 較快；工具呼叫格式不一定比 Qwen Coder 穩 |
+| `gpt-oss:20b` | 快速理解陌生 repo、摘要、初步定位 | 輕量、啟動快；複雜改檔與長工具鏈較弱 |
+| `qwen3-vl:30b-a3b` | `analyze_file(...)` 處理截圖、UI error；`ingest_document(...)` 把圖片切 chunk 進 KB 也用它 | 不是主要 coding model；不分析圖片、也不把圖片進 KB 就不用 pull |
+| `bge-m3` (CodeTrail 內部固定附屬模型) | `query_knowledge(...)` / `code_rag_search(...)` 的 embedding | 不是聊天模型，不要在 OpenCode model selector 裡選 |
+| `qllama/bge-reranker-v2-m3` (CodeTrail 內部固定附屬模型) | RAG rerank | 同上；模型未 pull 時 RAG 品質會下降或報錯 |
+
+挑選方向（自己判斷）：
+
+- 要穩定完成「查證 → patch → test」：候選 `qwen3-coder:30b` 或同級 coding 模型。
+- 任務跨很多檔、要比對規格或做設計判斷：候選 `qwen3.6:35b-a3b-q4_K_M`（Linux 版本；`qwen3.6:35b-a3b-coding-nvfp4` 是 macOS 限定，不要用）。
+- 只想先看懂 repo 或做初步 review：候選 `gpt-oss:20b` / `devstral:24b`。
 - 要讀截圖或把圖片進 KB：保留主聊天模型不變，讓 `analyze_file(...)` / `ingest_document(...)` 使用 `qwen3-vl:30b-a3b`。
 
 Context 建議：
@@ -120,10 +126,10 @@ ollama ps
 
 `scripts/doctor.py` 會檢查 context 設定是否打架，以及 `ollama ps` 上的模型是否 CPU/GPU split；它只報告，不會自動改設定。
 
-`scripts/ctx_safety_check.py` 是另一個更窄的入口：`aicode` 啟動時自動跑，只看「目前模型 + 目前 GPU + 要求的 ctx 上限」會不會 offload，不安全會直接 `exit 2` 擋下啟動。可以手動跑來測：
+`scripts/ctx_safety_check.py` 是另一個更窄的入口：`aicode` 啟動時自動跑，只看「目前模型 + 目前 GPU + 要求的 ctx 上限」會不會 offload，不安全會直接 `exit 2` 擋下啟動。它需要 `AICODE_MODEL` 已設定（CodeTrail 不假定任何預設主模型）；沒設也會直接 `exit 2`，不會 fallback。可以手動跑來測：
 
 ```bash
-AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M python scripts/ctx_safety_check.py
+AICODE_MODEL=<CODE_MODEL> python scripts/ctx_safety_check.py
 ```
 
 ---
@@ -134,25 +140,25 @@ AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M python scripts/ctx_safety_check.py
 CodeTrail 的模型選擇以環境變數為主，不需要改 source code。換到其他顯卡或其他機器時，先在那台 Ollama 主機下載模型，再用同一個 `AICODE_MODEL` 啟動 `aicode`，讓 OpenCode TUI 與 MCP server 內部呼叫保持一致：
 
 ```bash
-ollama pull <MODEL>
+ollama pull <CODE_MODEL>
 
-AICODE_MODEL=<MODEL> \
+AICODE_MODEL=<CODE_MODEL> \
 AICODE_DYNAMIC_NUM_CTX_MAX=32768 \
 aicode
 ```
 
 不要只在 OpenCode TUI 裡用 `/models` 換模型。那只會換前台對話模型，不會通知 CodeTrail MCP server；後台的 `query_knowledge_strict` 等內部流程仍會使用啟動時的 `AICODE_MODEL`。正確流程是退出 `aicode`，改環境變數，重新啟動。
 
-常見組合：
+常見組合（請把 `<CODE_MODEL>` 換成下表中你實際 pull 的那顆 tag）：
 
 ```bash
-# 5090 / 32GB VRAM：35B 先用 32K，穩定後再試 64K
+# 32GB VRAM：35B 先用 32K，穩定後再試 64K (示意 — 自己挑模型)
 AICODE_MODEL=qwen3.6:35b-a3b-q4_K_M AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
 
 # 24GB VRAM：優先用 30B / 24B，或把 35B context 降低
 AICODE_MODEL=qwen3-coder:30b AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
 
-# 16GB 以下：建議用 20B / 24B 或更小模型，不要硬開大 context
+# 16GB 以下：自己選 20B / 24B 或更小模型，不要硬開大 context
 AICODE_MODEL=gpt-oss:20b AICODE_DYNAMIC_NUM_CTX_MAX=16384 aicode
 ```
 
@@ -181,7 +187,7 @@ ollama ps
 
 ```bash
 AICODE_OLLAMA_BASE_URL=http://<GPU_HOST>:11434 \
-AICODE_MODEL=<MODEL> \
+AICODE_MODEL=<CODE_MODEL> \
 AICODE_DYNAMIC_NUM_CTX_MAX=32768 \
 aicode
 ```

@@ -817,10 +817,12 @@ def run_evaluation(
         print(f"  穩定性測試模式：{num_runs} 次重跑")
     print("=" * 60)
 
-    # 印出目前 MODEL,避免 silent fallback 後查不到實際跑哪個模型
+    # 印出目前 MODEL,避免 silent fallback 後查不到實際跑哪個模型。
+    # CodeTrail 不內建主模型, 沒設好直接 fail-loud (require_main_model raise)。
     import config as _eval_config
-    _override = " (AICODE_MODEL override)" if _eval_config.MODEL != _eval_config.DEFAULT_MODEL else " (default)"
-    print(f"Using model: {_eval_config.MODEL}{_override}")
+    _resolved = _eval_config.require_main_model()
+    _source = "AICODE_MODEL env" if os.environ.get("AICODE_MODEL", "").strip() else "opencode.json"
+    print(f"Using model: {_resolved} (from {_source})")
     print(f"NUM_CTX: {_eval_config.NUM_CTX}")
 
     # 健康檢查 - 確保 Ollama 正常運作

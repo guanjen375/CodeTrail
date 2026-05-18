@@ -24,7 +24,7 @@
     "metadata": {"mode": "agent", "kb_top_score": 0.5, ...},
     "reproducibility": {
         "repo_commit": "abc123",
-        "model_tag": "qwen3-coder:30b",
+        "model_tag": "<CODE_MODEL>",   // 使用者設定的 Ollama 主模型 (bare name)
         "strict_mode": true,
         "patch_enabled": false,
         "container_enabled": false,

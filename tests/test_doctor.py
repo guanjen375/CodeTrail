@@ -14,11 +14,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 from scripts import doctor as doc  # noqa: E402
 
 
-def test_doctor_no_network_exits_clean():
-    """沒帶 --project 時跑 --no-network 不該因為缺 KB / 網路而 FAIL。"""
+def test_doctor_no_network_exits_clean(monkeypatch):
+    """沒帶 --project 時跑 --no-network 不該因為缺 KB / 網路而 FAIL。
+
+    AICODE_MODEL 在這裡顯式設一個假值, 模擬使用者已經完成「選主模型」這一步;
+    我們在這個測試裡關心的是 doctor 不會因網路或 KB 缺席而 FAIL, 而不是
+    model resolution (那有自己的 test_check_models_fails_when_main_model_unset)。
+    """
+    import os
+    env = {**os.environ, "AICODE_MODEL": "qwen3-coder:30b"}
     r = subprocess.run(
         [sys.executable, str(REPO_ROOT / "scripts" / "doctor.py"), "--no-network"],
         capture_output=True, text=True, timeout=30, cwd=str(REPO_ROOT),
+        env=env,
     )
     assert r.returncode == 0, f"exit={r.returncode}\nstdout={r.stdout}\nstderr={r.stderr}"
     assert "FAIL=0" in r.stdout, r.stdout
@@ -182,10 +190,11 @@ def test_check_models_accepts_latest_tag_for_bare_config_name(monkeypatch):
     """模擬使用者只裝 bge-m3:latest 的情況。修補前會 FAIL,修補後應 PASS。"""
     import config as cfg
 
+    # MODEL 由 AICODE_MODEL env 決定 (CodeTrail 不內建預設); 測試裡直接 monkeypatch。
     monkeypatch.setattr(cfg, "MODEL", "qwen3-coder:30b")
-    monkeypatch.setattr(cfg, "DEFAULT_MODEL", "qwen3-coder:30b")
     monkeypatch.setattr(cfg, "EMBEDDING_MODEL", "bge-m3")
     monkeypatch.setattr(cfg, "RERANKER_MODEL", "qllama/bge-reranker-v2-m3")
+    monkeypatch.setenv("AICODE_MODEL", "qwen3-coder:30b")
     tags = {
         "qwen3-coder:30b",
         "bge-m3:latest",
@@ -194,6 +203,22 @@ def test_check_models_accepts_latest_tag_for_bare_config_name(monkeypatch):
     r = doc.Result()
     doc.check_models(r, tags)
     assert not r.fails, f"應該沒有 FAIL,實際: {r.fails}"
+
+
+def test_check_models_fails_when_main_model_unset(monkeypatch):
+    """config.MODEL 為空 (使用者沒設 AICODE_MODEL / opencode.json) 必須 FAIL。"""
+    import config as cfg
+
+    monkeypatch.setattr(cfg, "MODEL", "")
+    monkeypatch.setattr(cfg, "EMBEDDING_MODEL", "bge-m3")
+    monkeypatch.setattr(cfg, "RERANKER_MODEL", "qllama/bge-reranker-v2-m3")
+    tags = {"bge-m3:latest", "qllama/bge-reranker-v2-m3:latest"}
+    r = doc.Result()
+    doc.check_models(r, tags)
+    assert r.fails
+    assert any("MODEL" in f and "找不到" not in f for f in r.fails) or any(
+        "AICODE_MODEL" in f for f in r.fails
+    )
 
 
 # ============================================================

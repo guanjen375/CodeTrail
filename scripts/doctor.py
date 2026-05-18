@@ -162,8 +162,34 @@ def check_models(r: Result, tags: set[str] | None) -> None:
     cfg = _read_config()
     if isinstance(cfg, Exception):
         return
-    required = [
-        ("MODEL", "主 LLM"),
+
+    # 主模型 (MODEL) 不再有 baked-in 預設; 沒設就 FAIL, 不做 silent fallback。
+    main_model = getattr(cfg, "MODEL", "") or ""
+    if not main_model:
+        r.fail(
+            "config.MODEL 沒設 — CodeTrail 不內建主聊天 / 程式推導模型。\n"
+            "        請先 ollama pull 一顆 Ollama 模型, 然後任選一種方式設定:\n"
+            "          1) export AICODE_MODEL=<CODE_MODEL>            (最優先)\n"
+            "          2) aicode -m ollama/<CODE_MODEL>               (per-run CLI 旗標)\n"
+            "          3) ~/.config/opencode/opencode.json 設\n"
+            '                \"model\": \"ollama/<CODE_MODEL>\"\n'
+            "        <CODE_MODEL> 是佔位符, 必須替換成實際模型名稱。"
+        )
+    else:
+        env_model = os.environ.get("AICODE_MODEL", "").strip()
+        if env_model:
+            suffix = " [from AICODE_MODEL env]"
+        else:
+            suffix = " [resolved from ~/.config/opencode/opencode.json]"
+        if tags is None:
+            r.info(f"MODEL={main_model}{suffix} (主 LLM) — 未檢查 ollama 是否 pull")
+        elif _tag_present(main_model, tags):
+            r.ok(f"MODEL={main_model}{suffix} 已 pull")
+        else:
+            r.fail(f"MODEL={main_model}{suffix} 尚未 pull — 執行: ollama pull {main_model}")
+
+    # Embedding / reranker 是 RAG 內部固定附屬模型 (跟主模型分開), 預設值保留。
+    rag_required = [
         ("EMBEDDING_MODEL", "RAG embedding"),
         ("RERANKER_MODEL", "RAG reranker"),
     ]
@@ -171,24 +197,18 @@ def check_models(r: Result, tags: set[str] | None) -> None:
         ("VL_MODEL", "圖片 OCR — 不分析圖片就不需要"),
     ]
 
-    # 標示 MODEL 是否被 AICODE_MODEL 覆寫,避免使用者誤以為 silent fallback
-    default_model = getattr(cfg, "DEFAULT_MODEL", None)
-
-    for attr, desc in required:
+    for attr, desc in rag_required:
         name = getattr(cfg, attr, None)
         if not name:
             r.warn(f"config.py 沒有 {attr}")
             continue
-        suffix = ""
-        if attr == "MODEL" and default_model and name != default_model:
-            suffix = f" [AICODE_MODEL override, default={default_model}]"
         if tags is None:
-            r.info(f"{attr}={name}{suffix} ({desc}) — 未檢查 ollama 是否 pull")
+            r.info(f"{attr}={name} ({desc}) — 未檢查 ollama 是否 pull")
             continue
         if _tag_present(name, tags):
-            r.ok(f"{attr}={name}{suffix} 已 pull")
+            r.ok(f"{attr}={name} 已 pull")
         else:
-            r.fail(f"{attr}={name}{suffix} 尚未 pull — 執行: ollama pull {name}")
+            r.fail(f"{attr}={name} 尚未 pull — 執行: ollama pull {name}")
 
     for attr, desc in optional:
         name = getattr(cfg, attr, None)

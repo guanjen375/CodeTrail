@@ -118,13 +118,6 @@ if ! command -v opencode >/dev/null 2>&1; then
   exit 127
 fi
 
-# Predict VRAM offload BEFORE we exec opencode. ctx_safety_check.py exits 2
-# when the requested ctx cap (AICODE_DYNAMIC_NUM_CTX_MAX, default 65536) won't
-# fit alongside model weights on the visible GPU. It prints concrete remedies
-# (lower the cap, or AICODE_ACCEPT_CTX_RISK=1) so this is fail-loud — we don't
-# silently clamp anything. UNKNOWN cases (no nvidia-smi, remote Ollama,
-# unfamiliar model arch) exit 0 with a warning, so this won't block CI or
-# remote-GPU setups.
 if command -v python3 >/dev/null 2>&1; then
   PYBIN=python3
 elif command -v python >/dev/null 2>&1; then
@@ -132,7 +125,31 @@ elif command -v python >/dev/null 2>&1; then
 else
   PYBIN=""
 fi
-if [ -n "$PYBIN" ] && [ -f "$CODETRAIL_HOME/scripts/ctx_safety_check.py" ]; then
+
+if [ -z "$PYBIN" ]; then
+  echo "[aicode] python3/python not found in PATH — required for main-model resolution and ctx safety check." >&2
+  exit 2
+fi
+
+# 主模型解析:env > -m/--model arg > ~/.config/opencode/opencode.json。
+# 三個都找不到、是 placeholder、或被指到非 Ollama provider 時, resolve_main_model.py
+# 會印 fail-loud 訊息到 stderr 並 exit 2。CodeTrail 不內建 / 不 fallback 任何
+# 預設主模型 — 使用者必須先選一顆 Ollama 模型。
+if ! RESOLVED_MAIN_MODEL="$("$PYBIN" "$CODETRAIL_HOME/scripts/resolve_main_model.py" "$@")"; then
+  exit 2
+fi
+# resolve_main_model.py 已經剝掉 `ollama/` prefix, 這裡拿到的是 bare model name。
+# 把它寫回 AICODE_MODEL, 讓 ctx_safety_check / mcp_server / 子行程拿到同一顆。
+export AICODE_MODEL="$RESOLVED_MAIN_MODEL"
+
+# Predict VRAM offload BEFORE we exec opencode. ctx_safety_check.py exits 2
+# when the requested ctx cap (AICODE_DYNAMIC_NUM_CTX_MAX, default 65536) won't
+# fit alongside model weights on the visible GPU. It prints concrete remedies
+# (lower the cap, or AICODE_ACCEPT_CTX_RISK=1) so this is fail-loud — we don't
+# silently clamp anything. UNKNOWN cases (no nvidia-smi, remote Ollama,
+# unfamiliar model arch) exit 0 with a warning, so this won't block CI or
+# remote-GPU setups.
+if [ -f "$CODETRAIL_HOME/scripts/ctx_safety_check.py" ]; then
   if ! "$PYBIN" "$CODETRAIL_HOME/scripts/ctx_safety_check.py"; then
     echo "[aicode] ctx safety check refused to start (see [ctx-safety] above)." >&2
     exit 2
@@ -149,9 +166,7 @@ echo "[aicode] AICODE_ROOT=$AICODE_ROOT"
 # is determined by Ollama's OLLAMA_CONTEXT_LENGTH server setting + the
 # OpenCode model limit.context value — neither of which AICODE_NUM_CTX
 # can override.
-if [ -n "${AICODE_MODEL:-}" ]; then
-  echo "[aicode] AICODE_MODEL=${AICODE_MODEL}"
-fi
+echo "[aicode] AICODE_MODEL=${AICODE_MODEL}"
 if [ -n "${AICODE_NUM_CTX:-}" ]; then
   echo "[aicode] AICODE_NUM_CTX=${AICODE_NUM_CTX} (僅在 dynamic 關閉時當 fallback 上限;dynamic 開啟時不影響 per-call ctx)"
 fi
@@ -176,14 +191,14 @@ echo "         CodeTrail context overflow attempts are logged to .codetrail/cont
 # idea why. Surface this once at launch so non-experts don't fall into it.
 echo "[aicode] TIP: 換模型請退出後改 AICODE_MODEL 再重新啟動 aicode。"
 echo "         在 TUI 內按 /models 只會換對話那顆,背景 RAG / query_knowledge_strict"
-echo "         仍會用 AICODE_MODEL=${AICODE_MODEL:-<default>},兩邊不會自動同步。"
+echo "         仍會用 AICODE_MODEL=${AICODE_MODEL},兩邊不會自動同步。"
 
 # Point new users at the health check so they don't have to discover it via README.
 echo "[aicode] TIP: 設定有疑慮時可跑 \`python scripts/doctor.py\` 做健檢。"
 
-# If AICODE_MODEL is set, propagate it to OpenCode's --model flag so the
-# TUI conversation defaults to the same model the MCP server uses. Users
-# can still override with an explicit -m/--model in their own args.
+# 把解析後的 bare AICODE_MODEL 轉成 OpenCode 認得的 ollama/<MODEL> 形式,
+# 自動把 --model 加進 opencode args, 讓 TUI 對話模型跟 MCP server 後台用同一顆。
+# 若使用者命令列已經帶了 -m / --model, 不重複覆寫。
 EXTRA_OPENCODE_ARGS=()
 USER_PASSED_MODEL=0
 for arg in "$@"; do
@@ -192,14 +207,12 @@ for arg in "$@"; do
   esac
 done
 
-if [ -n "${AICODE_MODEL:-}" ] && [ "$USER_PASSED_MODEL" -eq 0 ]; then
-  # AICODE_MODEL may be bare ("qwen3.6:35b-a3b-q4_K_M") or already
-  # provider-qualified ("ollama/qwen3.6:..."). Only prepend "ollama/"
-  # when the value has no provider prefix.
-  case "$AICODE_MODEL" in
-    */*) OC_MODEL="$AICODE_MODEL" ;;
-    *)   OC_MODEL="ollama/$AICODE_MODEL" ;;
-  esac
+if [ "$USER_PASSED_MODEL" -eq 0 ]; then
+  # AICODE_MODEL 在 resolve_main_model.py 已經 strip 掉 `ollama/` prefix,
+  # 一定是 bare form (可能含 namespace slash, 例如 `some-org/foo:bar`)。
+  # 對 OpenCode 一律補回 `ollama/` 前綴 — 不要用 `*/*` 判斷, 因為 Ollama 自己
+  # 的 namespace 也含 slash 但仍需要 `ollama/` provider prefix。
+  OC_MODEL="ollama/$AICODE_MODEL"
   EXTRA_OPENCODE_ARGS+=(--model "$OC_MODEL")
   echo "[aicode] OpenCode --model=$OC_MODEL"
 fi

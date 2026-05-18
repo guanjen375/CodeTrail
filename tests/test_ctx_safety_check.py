@@ -1,7 +1,6 @@
 """scripts/ctx_safety_check.py 的 CLI 行為測試。"""
 from __future__ import annotations
 
-import config as cfg
 from gpu_safety import SafetyVerdict
 from scripts import ctx_safety_check as ctx
 
@@ -20,37 +19,58 @@ def _unknown_verdict(requested: int) -> SafetyVerdict:
     )
 
 
-def test_ctx_safety_default_model_matches_config():
-    assert ctx.DEFAULT_MODEL == cfg.DEFAULT_MODEL
-
-
-def test_ctx_safety_uses_default_model_when_env_missing(monkeypatch, capsys):
+def test_ctx_safety_fails_loud_when_env_missing(monkeypatch, capsys):
+    """CodeTrail 不內建主模型: AICODE_MODEL 未設時必須 fail-loud (exit 2),
+    不能 silent fallback 到某個預設模型。"""
     monkeypatch.delenv("AICODE_MODEL", raising=False)
     monkeypatch.delenv("AICODE_DYNAMIC_NUM_CTX_MAX", raising=False)
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
 
-    calls: dict[str, object] = {}
+    called = {"hit": False}
 
-    def fake_check_safety(model: str, requested: int, *, base_url: str):
-        calls["model"] = model
-        calls["requested"] = requested
-        calls["base_url"] = base_url
-        return _unknown_verdict(requested)
+    def fake_check_safety(*args, **kwargs):
+        called["hit"] = True
+        return _unknown_verdict(0)
 
     monkeypatch.setattr(ctx.gpu_safety, "check_safety", fake_check_safety)
 
-    assert ctx.main() == 0
-    assert calls == {
-        "model": ctx.DEFAULT_MODEL,
-        "requested": ctx.DEFAULT_CTX_MAX,
-        "base_url": "http://localhost:11434",
-    }
+    assert ctx.main() == 2
+    assert called["hit"] is False, "AICODE_MODEL 未設時不該呼叫 check_safety"
     out = capsys.readouterr().out
-    assert "AICODE_MODEL 未設,使用預設模型" in out
-    assert "跳過 ctx 安全檢查" not in out
+    assert "AICODE_MODEL 未設" in out
+    assert "refuse to start" in out
 
 
-def test_ctx_safety_env_model_still_overrides_default(monkeypatch):
+def test_ctx_safety_fails_loud_on_placeholder_model(monkeypatch, capsys):
+    """值是 `<CODE_MODEL>` 之類 placeholder 也要 fail-loud。"""
+    monkeypatch.setenv("AICODE_MODEL", "<CODE_MODEL>")
+    monkeypatch.delenv("AICODE_DYNAMIC_NUM_CTX_MAX", raising=False)
+    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
+
+    called = {"hit": False}
+
+    def fake_check_safety(*args, **kwargs):
+        called["hit"] = True
+        return _unknown_verdict(0)
+
+    monkeypatch.setattr(ctx.gpu_safety, "check_safety", fake_check_safety)
+
+    assert ctx.main() == 2
+    assert called["hit"] is False
+    out = capsys.readouterr().out
+    assert "placeholder" in out
+
+
+def test_ctx_safety_disable_short_circuits_even_without_model(monkeypatch, capsys):
+    """AICODE_CTX_SAFETY_DISABLE=1 時, 即使沒設 AICODE_MODEL 也 exit 0 (CI / 緊急逃生)。"""
+    monkeypatch.delenv("AICODE_MODEL", raising=False)
+    monkeypatch.setenv("AICODE_CTX_SAFETY_DISABLE", "1")
+    assert ctx.main() == 0
+    out = capsys.readouterr().out
+    assert "disabled via AICODE_CTX_SAFETY_DISABLE" in out
+
+
+def test_ctx_safety_uses_resolved_model_from_env(monkeypatch):
     monkeypatch.setenv("AICODE_MODEL", "custom:latest")
     monkeypatch.delenv("AICODE_DYNAMIC_NUM_CTX_MAX", raising=False)
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
@@ -66,3 +86,4 @@ def test_ctx_safety_env_model_still_overrides_default(monkeypatch):
 
     assert ctx.main() == 0
     assert calls["model"] == "custom:latest"
+    assert calls["requested"] == ctx.DEFAULT_CTX_MAX
