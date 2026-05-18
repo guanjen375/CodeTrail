@@ -128,11 +128,11 @@ def test_normalize_main_model_allows_namespaced_ollama_models():
 
 def test_normalize_main_model_rejects_known_cloud_provider_prefixes():
     assert normalize_main_model("openai/gpt-4.1", "test").error
-    assert normalize_main_model("anthropic/claude-sonnet-4", "test").error
+    assert normalize_main_model("anthropic/not-ollama-provider", "test").error
 
 
 def test_env_rejects_non_ollama_provider(monkeypatch, capsys):
-    monkeypatch.setenv("AICODE_MODEL", "anthropic/claude-sonnet-4")
+    monkeypatch.setenv("AICODE_MODEL", "anthropic/not-ollama-provider")
 
     rc = rmm.main([])
 
@@ -158,7 +158,7 @@ def test_opencode_config_env_path_is_used(monkeypatch, tmp_path, capsys):
 
 
 def test_opencode_json_rejects_non_ollama_provider(tmp_path, capsys):
-    _write_home_opencode(tmp_path, "anthropic/claude-sonnet-4")
+    _write_home_opencode(tmp_path, "anthropic/not-ollama-provider")
 
     rc = rmm.main([])
 

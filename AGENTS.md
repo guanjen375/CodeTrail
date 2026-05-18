@@ -3,7 +3,7 @@
 這個 repo 是一個 **本地 RAG / Code-RAG / MCP 工具集**。終端使用者透過 OpenCode TUI
 和 `aicode` wrapper 連到這個專案，用本地 Ollama 模型分析 NDA / 內部 firmware repo。
 
-如果你是 AI agent（Claude Code / Codex / OpenCode 等）正在改這個 repo，請先把這份檔讀完。
+如果你是 AI coding agent（Codex / OpenCode 等）正在改這個 repo，請先把這份檔讀完。
 維護命令、測試流程、eval 漂移檢查見 [README_DEV.md](README_DEV.md)。
 
 ---
@@ -15,7 +15,7 @@
 - 使用者 entry point 只保留一個：
   - `aicode` — wrapper，從目前目錄啟動 OpenCode 並設定 `AICODE_ROOT`
 - Runtime entry point：
-  - `mcp_server.py` — MCP server（OpenCode / Claude Code 用 stdio 接）
+  - `mcp_server.py` — MCP server（OpenCode / MCP client 用 stdio 接）
 
 ---
 

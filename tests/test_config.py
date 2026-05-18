@@ -33,7 +33,7 @@ def test_require_main_model_returns_value_when_set(monkeypatch):
 
 def test_require_main_model_rejects_non_ollama_provider(monkeypatch):
     import pytest
-    monkeypatch.setenv("AICODE_MODEL", "anthropic/claude-sonnet-4")
+    monkeypatch.setenv("AICODE_MODEL", "anthropic/not-ollama-provider")
     with pytest.raises(RuntimeError) as exc:
         config.require_main_model()
     assert "non-Ollama provider" in str(exc.value)

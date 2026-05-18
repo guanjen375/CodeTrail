@@ -324,7 +324,7 @@ def test_check_opencode_model_config_fails_non_ollama_provider(monkeypatch, tmp_
     oc_path = tmp_path / "opencode.json"
     _write_opencode_config(
         oc_path,
-        "anthropic/claude-sonnet-4",
+        "anthropic/not-ollama-provider",
         {"example-code-model:30b": {"name": "example-code-model:30b"}},
     )
     monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")

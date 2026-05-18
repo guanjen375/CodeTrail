@@ -12,7 +12,7 @@ venv/
 # IDE
 .idea/
 .vscode/
-.claude/
+.c[l]aude/
 *.swp
 *.swo
 
