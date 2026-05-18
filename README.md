@@ -20,18 +20,19 @@ pip install mcp pymupdf4llm ollama
 
 CodeTrail 不內建、也不替你預設任何「主聊天 / 程式推導模型」。你必須自己從 Ollama
 上挑一顆模型，下文用 `<CODE_MODEL>` 當佔位符代表它（**所有指令、JSON、env var 裡的
-`<CODE_MODEL>` 都要替換成實際 tag**）。比較見 [docs/models.md](docs/models.md)。
+`<CODE_MODEL>` 都要替換成實際 tag**）。選擇方式見 [docs/models.md](docs/models.md)。
 
 ```bash
 ollama pull <CODE_MODEL>
 ollama pull bge-m3
 ollama pull qllama/bge-reranker-v2-m3
 
-python3 scripts/doctor.py
+AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py
 ```
 
 `bge-m3` 與 `qllama/bge-reranker-v2-m3` 是 CodeTrail 內部 RAG embedding / reranker
 用的附屬模型，不是聊天模型，請不要在 OpenCode model selector 裡選它們。
+上面的 `<CODE_MODEL>` 是佔位符，必須替換成你實際 `ollama pull` 的 Ollama tag。
 
 接著做兩個一次性設定：
 
@@ -198,9 +199,9 @@ aicode
 
 ---
 
-## 常用模型
+## 模型設定與用途
 
-CodeTrail 不替你決定主聊天 / 程式推導模型 — 下表只是常見候選的比較，請依照硬體與任務自己挑一顆當 `<CODE_MODEL>`。要看更詳細的選擇邏輯與 context 建議，見 [docs/models.md](docs/models.md)。
+CodeTrail 不替你決定主聊天 / 程式推導模型。下表只把主模型佔位符與固定附屬模型分開說明，請依照硬體與任務自己挑一顆 Ollama tag 當 `<CODE_MODEL>`。要看更詳細的選擇邏輯與 context 取捨，見 [docs/models.md](docs/models.md)。
 
 | 模型 | 用途 | 取捨 |
 |---|---|---|
@@ -254,7 +255,7 @@ AICODE_DYNAMIC_NUM_CTX_MAX=32768 \
 aicode
 ```
 
-常見起點（請把 `<CODE_MODEL>` 換成下表中你實際 pull 的那顆 tag）：
+硬體起點（請把 `<CODE_MODEL>` 換成你實際 pull 的那顆 tag）：
 
 | 硬體 | 候選 |
 |---|---|
@@ -307,7 +308,7 @@ aicode
 |---|---|
 | [docs/setup.md](docs/setup.md) | 安裝、OpenCode config、`aicode`、啟動 |
 | [docs/basic-usage.md](docs/basic-usage.md) | 基本操作：正常對話、夾帶附件、RAG 注入、最小驗收流程 |
-| [docs/models.md](docs/models.md) | 模型比較、顯卡建議、遠端 Ollama、context / offload 後果 |
+| [docs/models.md](docs/models.md) | 模型設定、硬體取捨、遠端 Ollama、context / offload 後果 |
 | [docs/rag.md](docs/rag.md) | 讀檔、匯入附件、建立知識庫、Code-RAG、查 spec |
 | [docs/mcp-tools.md](docs/mcp-tools.md) | CodeTrail 暴露的 17 個 MCP 工具與使用原則 |
 | [docs/security.md](docs/security.md) | sandbox、patch、run command、NDA 資料、工作節奏 |

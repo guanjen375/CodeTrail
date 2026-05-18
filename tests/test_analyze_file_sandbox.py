@@ -24,6 +24,7 @@ def mcp_module(monkeypatch, tmp_path: Path):
     pytest.importorskip("mcp", reason="mcp 套件未安裝;OpenCode + MCP 路線才需要")
 
     monkeypatch.setenv("AICODE_ROOT", str(tmp_path))
+    monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")
     monkeypatch.setenv("AICODE_OLLAMA_BASE_URL", "http://127.0.0.1:1")
     # 避免無關設定干擾啟動 log
     monkeypatch.setenv("AI_CODE_PATCH", "")

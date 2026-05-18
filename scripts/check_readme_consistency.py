@@ -5,9 +5,9 @@
 和原始碼比對：
   1. mcp_server.py 內 @mcp.tool() 的工具數 == 文件提到的「N 個工具」
   2. 文件工具表內每個 backtick 工具名都在 mcp_server.py 裡定義
-  3. config.py 的 MODEL / EMBEDDING_MODEL / RERANKER_MODEL / VL_MODEL 在文件出現
+  3. config.py 的固定附屬模型 EMBEDDING_MODEL / RERANKER_MODEL / VL_MODEL 在文件出現
   4. README 必須包含「成熟私有部署版」/「不公開發布」之類產品狀態語句
-  5. 文件的 ollama pull 指令與內嵌 OpenCode JSON model tag 不打架
+  5. README / docs 的 <CODE_MODEL> placeholder、doctor 指令與 OpenCode JSON 範本一致
 
 退出碼：0=OK, 1=有 drift。
 """
@@ -69,16 +69,22 @@ def _readme_tool_names_in_table(readme_text: str) -> set[str]:
 
 
 def _config_model_values(config_text: str) -> dict[str, str]:
-    """從 config.py 用 regex 抓 MODEL = "..." 等欄位，避免 import config 帶副作用。"""
+    """從 config.py 抓固定附屬模型，避免 import config 帶副作用。"""
     out: dict[str, str] = {}
-    for attr in ("MODEL", "VL_MODEL", "EMBEDDING_MODEL", "RERANKER_MODEL"):
-        m = re.search(rf'^{attr}\s*=\s*[\'"]([^\'"]+)[\'"]', config_text, re.MULTILINE)
-        if m:
-            out[attr] = m.group(1)
+    for attr in ("VL_MODEL", "EMBEDDING_MODEL", "RERANKER_MODEL"):
+        patterns = [
+            rf'^{attr}\s*=\s*[\'"]([^\'"]+)[\'"]',
+            (
+                rf'^{attr}\s*=\s*(?:_?os)\.environ\.get\('
+                rf'\s*[\'"][^\'"]+[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]\s*\)'
+            ),
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, config_text, re.MULTILINE)
+            if m:
+                out[attr] = m.group(1)
+                break
     return out
-
-
-_OLLAMA_TAG_RE = re.compile(r"\b([a-zA-Z][a-zA-Z0-9._/-]*):([a-zA-Z0-9._-]+)\b")
 
 
 def _extract_pull_tags(readme_text: str) -> set[str]:
@@ -134,6 +140,50 @@ def _check_model_tag_consistency(readme_text: str, issues: list[str]) -> None:
             )
 
 
+def _check_code_model_placeholder_contract(readme_text: str, docs_text: str, issues: list[str]) -> None:
+    if "ollama pull <CODE_MODEL>" not in docs_text:
+        issues.append("README/docs 必須包含 `ollama pull <CODE_MODEL>`，且 <CODE_MODEL> 是 placeholder")
+
+    required_readme = [
+        '"model": "ollama/<CODE_MODEL>"',
+        '"small_model": "ollama/<CODE_MODEL>"',
+    ]
+    for needle in required_readme:
+        if needle not in readme_text:
+            issues.append(f"README OpenCode JSON 範本缺少 {needle}")
+
+    if not re.search(
+        r'"<CODE_MODEL>"\s*:\s*\{\s*"name"\s*:\s*"<CODE_MODEL>"',
+        readme_text,
+        re.DOTALL,
+    ):
+        issues.append('README OpenCode JSON 範本缺少 "<CODE_MODEL>": {"name": "<CODE_MODEL>"}')
+
+
+def _check_doctor_commands_have_explicit_model(docs_text: str, issues: list[str]) -> None:
+    for line in docs_text.splitlines():
+        stripped = line.strip()
+        if re.match(r"^(?:python3?|python)\s+scripts/doctor\.py(?:\s|$)", stripped):
+            issues.append(
+                "文件不可在未設定主模型時直接要求跑 doctor；請改成 "
+                "`AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py` 或移到 OpenCode JSON 設定後。"
+            )
+
+
+_FORBIDDEN_DOC_TOKENS = (
+    "DEFAULT" + "_MODEL",
+    "RECOMMENDED" + "_MODEL",
+    "<" + "default" + ">",
+    "qwen3" + "-coder:30b",
+)
+
+
+def _check_forbidden_main_model_tokens(docs_text: str, issues: list[str]) -> None:
+    for token in _FORBIDDEN_DOC_TOKENS:
+        if token in docs_text:
+            issues.append(f"README/docs 不得出現舊主模型預設 / 推薦標記: {token!r}")
+
+
 _PRODUCT_STATUS_PHRASES = [
     "成熟私有部署版",
     "不打算公開發布",
@@ -175,6 +225,9 @@ def check_all() -> list[str]:
 
     # 3. model name drift
     cfg_models = _config_model_values(config_text)
+    for attr in ("EMBEDDING_MODEL", "RERANKER_MODEL", "VL_MODEL"):
+        if attr not in cfg_models:
+            issues.append(f"check_readme_consistency.py 無法解析 config.py 的 {attr}")
     for attr, value in cfg_models.items():
         if value not in docs_text:
             issues.append(
@@ -189,6 +242,9 @@ def check_all() -> list[str]:
 
     # 5. model tag drift(ollama pull ↔ opencode JSON)
     _check_model_tag_consistency(docs_text, issues)
+    _check_code_model_placeholder_contract(readme_text, docs_text, issues)
+    _check_doctor_commands_have_explicit_model(docs_text, issues)
+    _check_forbidden_main_model_tokens(docs_text, issues)
 
     return issues
 

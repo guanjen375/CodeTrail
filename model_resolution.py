@@ -49,6 +49,20 @@ class ModelResolution:
         return bool(self.model) and not self.error
 
 
+@dataclass(frozen=True)
+class CliModelArg:
+    values: tuple[str, ...] = ()
+    error: str = ""
+
+    @property
+    def present(self) -> bool:
+        return bool(self.values) or bool(self.error)
+
+    @property
+    def raw(self) -> str:
+        return self.values[0] if self.values else ""
+
+
 def is_placeholder_model(value: str) -> bool:
     if not value:
         return True
@@ -120,20 +134,49 @@ def normalize_main_model(
     return ModelResolution(model=bare, source=source, raw=value, path=path, present=True)
 
 
-def parse_cli_model_arg(argv: Sequence[str]) -> str:
+def parse_cli_model_arg_detail(argv: Sequence[str]) -> CliModelArg:
+    values: list[str] = []
     i = 0
     while i < len(argv):
         arg = argv[i]
         if arg == "-m" or arg == "--model":
-            if i + 1 < len(argv):
-                return str(argv[i + 1]).strip()
-            return ""
+            if i + 1 >= len(argv):
+                return CliModelArg(
+                    values=tuple(values),
+                    error=f"{arg} requires a model value.",
+                )
+            value = str(argv[i + 1]).strip()
+            if not value or value.startswith("-"):
+                return CliModelArg(
+                    values=tuple(values),
+                    error=f"{arg} requires a model value.",
+                )
+            values.append(value)
+            i += 2
+            continue
         if arg.startswith("-m="):
-            return arg[3:].strip()
+            value = arg[3:].strip()
+            if not value:
+                return CliModelArg(values=tuple(values), error="-m requires a model value.")
+            values.append(value)
+            i += 1
+            continue
         if arg.startswith("--model="):
-            return arg[len("--model=") :].strip()
+            value = arg[len("--model=") :].strip()
+            if not value:
+                return CliModelArg(
+                    values=tuple(values),
+                    error="--model requires a model value.",
+                )
+            values.append(value)
+            i += 1
+            continue
         i += 1
-    return ""
+    return CliModelArg(values=tuple(values))
+
+
+def parse_cli_model_arg(argv: Sequence[str]) -> str:
+    return parse_cli_model_arg_detail(argv).raw
 
 
 def opencode_config_candidates(env: Mapping[str, str] | None = None) -> list[Path]:

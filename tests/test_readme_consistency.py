@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 from scripts.check_readme_consistency import (
+    _check_code_model_placeholder_contract,
+    _check_doctor_commands_have_explicit_model,
+    _check_forbidden_main_model_tokens,
+    _config_model_values,
     _mcp_tool_names,
     _readme_claimed_tool_count,
     _readme_tool_names_in_table,
@@ -38,3 +42,82 @@ def test_readme_tool_table_extracts_backtick_calls():
     names = _readme_tool_names_in_table(sample)
     assert "query_knowledge" in names
     assert "code_rag_search" in names
+
+
+def test_config_model_values_parse_literals_and_env_defaults():
+    sample = '''
+EMBEDDING_MODEL = "bge-m3"
+RERANKER_MODEL = "qllama/bge-reranker-v2-m3"
+VL_MODEL = _os.environ.get("AICODE_VL_MODEL", "qwen3-vl:30b-a3b")
+MODEL = _resolve_main_model()
+'''
+    assert _config_model_values(sample) == {
+        "EMBEDDING_MODEL": "bge-m3",
+        "RERANKER_MODEL": "qllama/bge-reranker-v2-m3",
+        "VL_MODEL": "qwen3-vl:30b-a3b",
+    }
+
+
+def test_code_model_placeholder_contract_requires_pull_and_readme_json():
+    readme = '''
+```json
+{
+  "model": "ollama/<CODE_MODEL>",
+  "small_model": "ollama/<CODE_MODEL>",
+  "provider": {
+    "ollama": {
+      "models": {
+        "<CODE_MODEL>": {
+          "name": "<CODE_MODEL>"
+        }
+      }
+    }
+  }
+}
+```
+'''
+    docs = "ollama pull <CODE_MODEL>\n" + readme
+    issues: list[str] = []
+
+    _check_code_model_placeholder_contract(readme, docs, issues)
+
+    assert issues == []
+
+
+def test_code_model_placeholder_contract_reports_missing_bits():
+    issues: list[str] = []
+
+    _check_code_model_placeholder_contract("", "", issues)
+
+    assert any("ollama pull <CODE_MODEL>" in issue for issue in issues)
+    assert any('"model": "ollama/<CODE_MODEL>"' in issue for issue in issues)
+    assert any('"small_model": "ollama/<CODE_MODEL>"' in issue for issue in issues)
+
+
+def test_doctor_commands_must_have_explicit_model_on_same_line():
+    issues: list[str] = []
+
+    _check_doctor_commands_have_explicit_model(
+        "python scripts/doctor.py\n"
+        "AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py\n",
+        issues,
+    )
+
+    assert len(issues) == 1
+    assert "AICODE_MODEL=<CODE_MODEL>" in issues[0]
+
+
+def test_forbidden_main_model_tokens_are_detected_without_flagging_placeholders():
+    bad_tokens = "\n".join(
+        [
+            "DEFAULT" + "_MODEL",
+            "RECOMMENDED" + "_MODEL",
+            "<" + "default" + ">",
+            "qwen3" + "-coder:30b",
+        ]
+    )
+    issues: list[str] = []
+
+    _check_forbidden_main_model_tokens("<CODE_MODEL>\n" + bad_tokens, issues)
+
+    assert len(issues) == 4

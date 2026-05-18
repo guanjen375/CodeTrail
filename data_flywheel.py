@@ -79,9 +79,14 @@ def get_reproducibility_info(folder: str = None) -> dict:
     import config  # 用模組存取，避免 import 快照問題
     import container_runner
 
+    try:
+        model_tag = config.require_main_model()
+    except RuntimeError:
+        model_tag = ""
+
     info = {
         'repo_commit': None,
-        'model_tag': config.MODEL,
+        'model_tag': model_tag,
         'strict_mode': config.STRICT_MODE,
         'patch_enabled': config.PATCH_ENABLED,
         'container_enabled': container_runner.CONTAINER_ENABLED,

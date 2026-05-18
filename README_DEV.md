@@ -13,7 +13,7 @@ python -m compileall -q .
 python scripts/run_tests.py
 python scripts/check_eval_consistency.py
 python scripts/check_readme_consistency.py
-python scripts/doctor.py
+AICODE_MODEL=test-model:latest python scripts/doctor.py --no-network
 
 # Lint（advisory，CI 不擋）
 ruff check tests scripts
@@ -182,13 +182,16 @@ OpenCode TUI 走 `/v1` OpenAI-compatible API,**不會** 經過這個模組,所�
 
 ```python
 import context_budget
+import config
+
+model = config.require_main_model()
 
 try:
     usage = context_budget.check_and_log(
         source="my_new_call_site",  # 用任意短字串標記,給 telemetry 看
         requested_num_ctx=num_ctx,
         prompt=prompt,            # 或 messages=messages, tools=tools
-        model=MODEL,
+        model=model,
     )
 except context_budget.ContextOverflowError as exc:
     return str(exc)               # 訊息已經包含 [CTX_OVERFLOW] + how-to-fix
@@ -206,6 +209,7 @@ context_budget.log_metrics(usage)
 ```
 
 如果你的 call site 也會累積 messages(像 agent loop),記得也接 `_pre_send_trim_if_needed`(或自己呼 `trim.trim_messages`)以便 soft warning 觸發時可以自動降載,而不是直接 hard refuse。低風險 / 一次性 prompt(如 RAG embedding query 之類)可以省略 trim,但**不能省略 gate**。
+新增 native Ollama 主模型 call site 時，必須在送出前用 call-time `config.require_main_model()` 取值；不要使用 import-time `config.MODEL` 或 `from config import MODEL` 當 runtime model source。
 
 ---
 

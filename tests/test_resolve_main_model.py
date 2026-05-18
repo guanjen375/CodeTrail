@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts import resolve_main_model as rmm  # noqa: E402
+from model_resolution import normalize_main_model  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -52,6 +53,13 @@ def test_env_and_argv_same_model_allowed(monkeypatch, capsys):
     assert capsys.readouterr().out.strip() == "same-model:tag"
 
 
+def test_env_and_argv_same_bare_model_allowed(monkeypatch, capsys):
+    monkeypatch.setenv("AICODE_MODEL", "foo:bar")
+
+    assert rmm.main(["--model", "foo:bar"]) == 0
+    assert capsys.readouterr().out.strip() == "foo:bar"
+
+
 def test_env_and_argv_conflict_fails(monkeypatch, capsys):
     monkeypatch.setenv("AICODE_MODEL", "env-model:tag")
 
@@ -64,6 +72,30 @@ def test_env_and_argv_conflict_fails(monkeypatch, capsys):
 def test_argv_equals_form(capsys):
     assert rmm.main(["--model=ollama/foo:bar"]) == 0
     assert capsys.readouterr().out.strip() == "foo:bar"
+
+
+def test_argv_missing_value_fails_loud(capsys):
+    rc = rmm.main(["--model"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "requires a model value" in err
+
+
+def test_short_argv_missing_value_fails_loud(capsys):
+    rc = rmm.main(["-m"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "requires a model value" in err
+
+
+def test_argv_missing_value_before_other_flag_fails_loud(capsys):
+    rc = rmm.main(["--model", "--foo"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "requires a model value" in err
 
 
 def test_argv_bare_ollama_name(capsys):
@@ -81,6 +113,22 @@ def test_argv_rejects_non_ollama_provider(capsys):
 
     assert rc == 2
     assert "non-Ollama provider" in capsys.readouterr().err
+
+
+def test_normalize_main_model_allows_namespaced_ollama_models():
+    assert (
+        normalize_main_model("some-org/model:tag", "test").model
+        == "some-org/model:tag"
+    )
+    assert (
+        normalize_main_model("hf.co/some-user/model:Q4_K_M", "test").model
+        == "hf.co/some-user/model:Q4_K_M"
+    )
+
+
+def test_normalize_main_model_rejects_known_cloud_provider_prefixes():
+    assert normalize_main_model("openai/gpt-4.1", "test").error
+    assert normalize_main_model("anthropic/claude-sonnet-4", "test").error
 
 
 def test_env_rejects_non_ollama_provider(monkeypatch, capsys):

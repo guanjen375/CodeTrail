@@ -5,9 +5,9 @@
 模型 pull 了沒、AICODE_ROOT 安不安全、OpenCode/MCP 入口都在不在、KB 有沒有資料。
 
 使用：
-    python scripts/doctor.py                       # 全檢
-    python scripts/doctor.py --project /path/proj  # 把 /path/proj 當 AICODE_ROOT 檢查
-    python scripts/doctor.py --no-network          # 跳過 Ollama 線上檢查（CI 用）
+    AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py                       # 全檢
+    AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py --project /path/proj  # 把 /path/proj 當 AICODE_ROOT 檢查
+    AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py --no-network          # 跳過 Ollama 線上檢查（CI 用）
 
 退出碼：
     0 = 全 PASS / 只有 WARN
@@ -501,9 +501,23 @@ def check_opencode_model_config(r: Result) -> None:
         r.fail(f"main model is missing or invalid: {exc}")
         return
 
+    env_model_set = bool(os.environ.get("AICODE_MODEL", "").strip())
+    explicit_config = bool(os.environ.get("OPENCODE_CONFIG", "").strip())
+    env_overrides_global_config = env_model_set and not explicit_config
+
+    def config_problem(msg: str) -> None:
+        if env_overrides_global_config:
+            r.warn(
+                msg
+                + f" — AICODE_MODEL={main_model} 已設定；aicode wrapper 會傳 "
+                + f"--model ollama/{main_model} 給 OpenCode。若要不帶 env 直接跑，仍需修正 OpenCode config。"
+            )
+        else:
+            r.fail(msg)
+
     path, oc, error = load_first_opencode_config(os.environ)
     if error:
-        r.fail(f"OpenCode config read failed: {path} -- {error}")
+        config_problem(f"OpenCode config read failed: {path} -- {error}")
         return
     if not oc:
         r.info("OpenCode config not found; skipping provider.ollama.models validation")
@@ -512,14 +526,14 @@ def check_opencode_model_config(r: Result) -> None:
     oc_res = resolve_opencode_main_model(os.environ)
     if oc_res.error:
         where = f" {oc_res.path}" if oc_res.path else ""
-        r.fail(f"OpenCode config model invalid{where}: {oc_res.error}")
+        config_problem(f"OpenCode config model invalid{where}: {oc_res.error}")
         return
     if not oc_res.model:
-        r.fail(f"OpenCode config {path} must set model=\"ollama/<CODE_MODEL>\"")
+        config_problem(f"OpenCode config {path} must set model=\"ollama/<CODE_MODEL>\"")
         return
 
     if oc_res.model != main_model:
-        r.fail(
+        config_problem(
             f"OpenCode config model={oc_res.model!r} does not match "
             f"CodeTrail main model={main_model!r}"
         )
@@ -527,11 +541,11 @@ def check_opencode_model_config(r: Result) -> None:
 
     models = _opencode_provider_ollama_models(oc)
     if not models:
-        r.fail(f"OpenCode config {path} must define provider.ollama.models")
+        config_problem(f"OpenCode config {path} must define provider.ollama.models")
         return
 
     if main_model not in models:
-        r.fail(
+        config_problem(
             f"OpenCode config {path} provider.ollama.models is missing "
             f"bare key {main_model!r}"
         )
@@ -622,7 +636,7 @@ def check_aicode_root(r: Result, project: str | None) -> None:
         r.fail(f"AICODE_ROOT 不是目錄: {resolved}")
         return
 
-    if str(resolved) == "/":
+    if resolved.parent == resolved:
         r.fail("AICODE_ROOT=/ 會把整個檔案系統暴露給 sandbox")
         return
 

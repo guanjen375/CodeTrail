@@ -277,6 +277,27 @@ def test_check_opencode_model_config_fails_when_provider_key_missing(monkeypatch
     assert any("missing bare key" in f for f in r.fails), r.fails
 
 
+def test_check_opencode_model_config_warns_for_global_config_when_env_model_set(
+    monkeypatch, tmp_path
+):
+    cfg_dir = tmp_path / ".config" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.json").write_text(
+        json.dumps({"provider": {"ollama": {"models": {}}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    r = doc.Result()
+    doc.check_opencode_model_config(r)
+
+    assert not r.fails
+    assert any("must set model" in w for w in r.warns), r.warns
+
+
 def test_check_opencode_model_config_requires_nested_provider_models(monkeypatch, tmp_path):
     oc_path = tmp_path / "opencode.json"
     oc_path.write_text(

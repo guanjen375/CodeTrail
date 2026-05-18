@@ -44,7 +44,7 @@ pip install mcp pymupdf4llm ollama
 
 ### 下載模型
 
-CodeTrail 不內建主聊天 / 程式推導模型 — 你必須自己挑一顆 Ollama 模型，下面用 `<CODE_MODEL>` 當佔位符代表它。**`<CODE_MODEL>` 不是真實 tag**，請替換成實際模型名稱（候選比較見 [模型與硬體建議](models.md)）：
+CodeTrail 不內建主聊天 / 程式推導模型 — 你必須自己挑一顆 Ollama 模型，下面用 `<CODE_MODEL>` 當佔位符代表它。**`<CODE_MODEL>` 不是真實 tag**，請替換成實際模型名稱（選擇方式見 [模型設定與硬體取捨](models.md)）：
 
 ```bash
 ollama pull <CODE_MODEL>            # 自己選的主模型
@@ -68,21 +68,21 @@ ollama pull <ANOTHER_CODE_MODEL>
 ollama pull qwen3-vl:30b-a3b
 ```
 
-模型怎麼選，見 [模型與硬體建議](models.md)。
+模型怎麼選，見 [模型設定與硬體取捨](models.md)。
 
 ### 自檢
 
 ```bash
-python scripts/doctor.py
+AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
 ```
 
 如果只想檢查本地檔案與設定，不連 Ollama：
 
 ```bash
-python scripts/doctor.py --no-network
+AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py --no-network
 ```
 
-`PASS` 可以先略過；`FAIL` 要處理。常見問題是 OpenCode 不在 PATH、Ollama 沒啟動、模型還沒 pull、`aicode` 沒有執行權。
+這裡的 `<CODE_MODEL>` 仍是佔位符，必須替換成實際 Ollama tag；如果你已經寫好 OpenCode JSON，也可以讓 doctor 從 `"model": "ollama/<CODE_MODEL>"` 解析同一顆。`PASS` 可以先略過；`FAIL` 要處理。常見問題是 OpenCode 不在 PATH、Ollama 沒啟動、模型還沒 pull、`aicode` 沒有執行權。
 
 ---
 
@@ -98,7 +98,7 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
 
 直接可貼的 `opencode.json` 放在 [README 的安裝與啟動](../README.md#安裝與啟動)。這裡只補充它的幾個關鍵點：
 
-- Ollama provider 指到 `http://localhost:11434/v1`；遠端 Ollama 要同步改這裡，見 [模型與硬體建議](models.md)。
+- Ollama provider 指到 `http://localhost:11434/v1`；遠端 Ollama 要同步改這裡，見 [模型設定與硬體取捨](models.md)。
 - MCP key 用 `codetrail`，所以 `/status` 會顯示 `codetrail Connected`。
 - MCP command 會從 OpenCode 啟動目錄找 git root，然後執行該 root 內的 `.opencode/run-codetrail-mcp`。
 - OpenCode 內建的 `bash` / `read` / `write` / `apply_patch` 預設 deny；日常讀檔、搜尋、patch 走 `codetrail_*` 工具。
@@ -141,7 +141,7 @@ command -v aicode
 - 在目前專案準備 `.opencode/run-codetrail-mcp`，讓 OpenCode config 裡的 MCP command 能啟動 CodeTrail server
 - 啟動前跑 `scripts/ctx_safety_check.py` 預估「目前模型 + 目前 GPU + 要求的 ctx 上限」會不會把模型推到 CPU offload；預估會 offload 就直接 `exit 2` 拒絕啟動並提示安全 cap 值（拿不到 GPU 或 Ollama 時 graceful 放行，只 warn）
 - 啟動 `opencode`，讓 OpenCode 子行程繼承同一個沙箱根目錄
-- 如果有 `AICODE_MODEL`，自動把它轉成 OpenCode 的 `--model` 參數，讓 TUI 對話模型也預設成這顆（命令列自己帶 `-m` / `--model` 時不覆蓋）
+- 把解析後的主模型轉成 OpenCode 的 `ollama/<MODEL>`，讓 TUI 對話模型與 CodeTrail MCP 後台使用同一顆；命令列自己帶 `-m` / `--model` 時也會 normalize，不會原樣傳 bare model
 
 ---
 
@@ -171,7 +171,7 @@ AICODE_MODEL=<CODE_MODEL> aicode
 
 主模型解析優先順序：`AICODE_MODEL` env > `aicode -m / --model` CLI 旗標 > `OPENCODE_CONFIG` / `~/.config/opencode/opencode.json` 的 `"model"` 欄位。三個都沒有、或值是 `<CODE_MODEL>` 之類的 placeholder 時，`aicode` 會 fail-loud，不會 fallback 任何內建主模型。
 
-換模型、context、offload、遠端 Ollama 的細節集中在 [模型與硬體建議](models.md)。不要只在 TUI 裡用 `/models` 切換；那只會換 OpenCode 前台對話模型，不會同步 CodeTrail MCP server 的內部呼叫。
+換模型、context、offload、遠端 Ollama 的細節集中在 [模型設定與硬體取捨](models.md)。不要只在 TUI 裡用 `/models` 切換；那只會換 OpenCode 前台對話模型，不會同步 CodeTrail MCP server 的內部呼叫。
 
 RAG 流程不在這裡重複；可先照 README 的 smoke test 跑一輪，完整說明見 [RAG、附件與知識庫操作](rag.md)。
 

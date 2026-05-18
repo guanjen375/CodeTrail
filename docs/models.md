@@ -1,22 +1,22 @@
-# 模型與硬體建議
+# 模型設定與硬體取捨
 
-這份文件整理主模型候選、embedding、reranker、視覺模型、context，以及換顯卡或遠端 Ollama 時的建議。
+這份文件整理如何挑 `<CODE_MODEL>`、固定附屬模型、context，以及換顯卡或遠端 Ollama 時的取捨。
 
 [回到 README](../README.md)。
 
 ---
 
-## 主模型來源（CodeTrail 不內建預設）
+## 如何挑 `<CODE_MODEL>`（CodeTrail 不內建預設）
 
 CodeTrail **不替你決定主聊天 / 程式推導模型**，也不會 fallback 任何固定 baseline。你必須自己 `ollama pull` 一顆 Ollama 模型，然後用下列任一方式告訴 CodeTrail（這幾個都沒設、或值是 `<CODE_MODEL>` 之類的 placeholder 時，`aicode` 會直接 fail-loud 拒絕啟動）：
 
 1. `AICODE_MODEL` 環境變數（最優先，例如 `export AICODE_MODEL=<CODE_MODEL>`）。
-2. `aicode -m ollama/<CODE_MODEL>` / `--model ollama/<CODE_MODEL>` CLI 旗標（只接受 `ollama/<MODEL>` 或 bare Ollama model name；非 Ollama provider 會被拒）。
+2. `aicode -m <CODE_MODEL>` / `--model ollama/<CODE_MODEL>` CLI 旗標（接受 `ollama/<MODEL>` 或 bare Ollama model name；非 Ollama provider 會被拒）。
 3. `~/.config/opencode/opencode.json` 的 `"model"` 欄位（必須是 `ollama/<CODE_MODEL>`）。
 
-下面的清單只是常見候選的比較，沒有「預設」或「推薦」一說 — 請依硬體與任務自己挑：
+下面只把用途分開，不是主模型推薦清單。請依硬體與任務自己挑：
 
-| 候選模型 | 適合任務 | 取捨 |
+| 模型 / 設定 | 用途 | 取捨 |
 |---|---|---|
 | `<CODE_MODEL>` | 主聊天 / 程式推導模型 | 由你自行選擇並 pull；CodeTrail 不內建、不推薦、不 fallback |
 | `qwen3-vl:30b-a3b` | `analyze_file(...)` 處理截圖、UI error；`ingest_document(...)` 把圖片切 chunk 進 KB 也用它 | 不是主要 coding model；不分析圖片、也不把圖片進 KB 就不用 pull |
@@ -132,7 +132,7 @@ AICODE_MODEL=<CODE_MODEL> python scripts/ctx_safety_check.py
 ---
 
 
-## 換顯卡 / 換模型建議
+## 換顯卡 / 換模型
 
 CodeTrail 的模型選擇以環境變數為主，不需要改 source code。換到其他顯卡或其他機器時，先在那台 Ollama 主機下載模型，再用同一個 `AICODE_MODEL` 啟動 `aicode`，讓 OpenCode TUI 與 MCP server 內部呼叫保持一致：
 
@@ -146,7 +146,7 @@ aicode
 
 不要只在 OpenCode TUI 裡用 `/models` 換模型。那只會換前台對話模型，不會通知 CodeTrail MCP server；後台的 `query_knowledge_strict` 等內部流程仍會使用啟動時的 `AICODE_MODEL`。正確流程是退出 `aicode`，改環境變數，重新啟動。
 
-常見組合（請把 `<CODE_MODEL>` 換成下表中你實際 pull 的那顆 tag）：
+硬體起點（請把 `<CODE_MODEL>` 換成你實際 pull 的那顆 tag）：
 
 ```bash
 # 32GB VRAM：35B 先用 32K，穩定後再試 64K (示意 — 自己挑模型)

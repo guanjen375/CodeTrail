@@ -11,10 +11,10 @@
 照 [安裝、設定與啟動](setup.md) 完成後，先在 CodeTrail repo 裡跑：
 
 ```bash
-python scripts/doctor.py
+AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
 ```
 
-`FAIL` 要先處理；`WARN` 可以依訊息判斷是否需要調整。接著切到要分析的專案根目錄：
+`<CODE_MODEL>` 是佔位符，必須替換成實際 Ollama tag；如果你已經在 OpenCode JSON 設好同一顆模型，doctor 也能從設定檔解析。`FAIL` 要先處理；`WARN` 可以依訊息判斷是否需要調整。接著切到要分析的專案根目錄：
 
 ```bash
 cd <PROJECT_TO_ANALYZE>

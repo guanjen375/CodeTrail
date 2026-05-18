@@ -45,14 +45,15 @@ def _validate_aicode_root(root_env: str | None, home: str | None,
             "        範例:  AICODE_ROOT=/path/to/project python mcp_server.py"
         )
     try:
-        resolved = str(Path(root_env).resolve())
+        resolved_path = Path(root_env).resolve()
+        resolved = str(resolved_path)
     except (OSError, ValueError) as e:
         return None, f"[FATAL] AICODE_ROOT 無法解析: {e}"
 
-    if not Path(resolved).is_dir():
+    if not resolved_path.is_dir():
         return None, f"[FATAL] AICODE_ROOT 不是目錄: {resolved}"
 
-    if resolved == "/":
+    if resolved_path.parent == resolved_path:
         return None, (
             "[FATAL] 拒絕 AICODE_ROOT=/ — 會把整個檔案系統暴露給 MCP sandbox。\n"
             "        cd 到具體 project 目錄再啟動 mcp_server.py。"

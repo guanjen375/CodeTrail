@@ -194,27 +194,54 @@ echo "         在 TUI 內按 /models 只會換對話那顆,背景 RAG / query_k
 echo "         仍會用 AICODE_MODEL=${AICODE_MODEL},兩邊不會自動同步。"
 
 # Point new users at the health check so they don't have to discover it via README.
-echo "[aicode] TIP: 設定有疑慮時可跑 \`python scripts/doctor.py\` 做健檢。"
+echo "[aicode] TIP: 設定有疑慮時可跑 \`AICODE_MODEL=${AICODE_MODEL} python scripts/doctor.py\` 做健檢。"
 
-# 把解析後的 bare AICODE_MODEL 轉成 OpenCode 認得的 ollama/<MODEL> 形式,
-# 自動把 --model 加進 opencode args, 讓 TUI 對話模型跟 MCP server 後台用同一顆。
-# 若使用者命令列已經帶了 -m / --model, 不重複覆寫。
-EXTRA_OPENCODE_ARGS=()
+# 把解析後的 bare AICODE_MODEL 轉成 OpenCode 認得的 ollama/<MODEL> 形式。
+# 使用者若已傳 -m / --model, 也要重寫成同一個 normalized provider id,
+# 避免 MCP server 用 AICODE_MODEL, 但 OpenCode TUI 收到 bare model 而不同步。
+OC_MODEL="ollama/$AICODE_MODEL"
+OPENCODE_ARGS=()
 USER_PASSED_MODEL=0
-for arg in "$@"; do
-  case "$arg" in
-    -m|--model|-m=*|--model=*) USER_PASSED_MODEL=1; break ;;
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -m|--model)
+      USER_PASSED_MODEL=1
+      flag="$1"
+      if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
+        echo "[aicode] $flag requires a model value." >&2
+        exit 2
+      fi
+      OPENCODE_ARGS+=("$flag" "$OC_MODEL")
+      shift 2
+      ;;
+    -m=*)
+      USER_PASSED_MODEL=1
+      if [ -z "${1#-m=}" ]; then
+        echo "[aicode] -m requires a model value." >&2
+        exit 2
+      fi
+      OPENCODE_ARGS+=("-m=$OC_MODEL")
+      shift
+      ;;
+    --model=*)
+      USER_PASSED_MODEL=1
+      if [ -z "${1#--model=}" ]; then
+        echo "[aicode] --model requires a model value." >&2
+        exit 2
+      fi
+      OPENCODE_ARGS+=("--model=$OC_MODEL")
+      shift
+      ;;
+    *)
+      OPENCODE_ARGS+=("$1")
+      shift
+      ;;
   esac
 done
 
 if [ "$USER_PASSED_MODEL" -eq 0 ]; then
-  # AICODE_MODEL 在 resolve_main_model.py 已經 strip 掉 `ollama/` prefix,
-  # 一定是 bare form (可能含 namespace slash, 例如 `some-org/foo:bar`)。
-  # 對 OpenCode 一律補回 `ollama/` 前綴 — 不要用 `*/*` 判斷, 因為 Ollama 自己
-  # 的 namespace 也含 slash 但仍需要 `ollama/` provider prefix。
-  OC_MODEL="ollama/$AICODE_MODEL"
-  EXTRA_OPENCODE_ARGS+=(--model "$OC_MODEL")
-  echo "[aicode] OpenCode --model=$OC_MODEL"
+  OPENCODE_ARGS=(--model "$OC_MODEL" "${OPENCODE_ARGS[@]}")
 fi
+echo "[aicode] OpenCode --model=$OC_MODEL"
 
-exec opencode ${EXTRA_OPENCODE_ARGS[@]+"${EXTRA_OPENCODE_ARGS[@]}"} "$@"
+exec opencode "${OPENCODE_ARGS[@]}"

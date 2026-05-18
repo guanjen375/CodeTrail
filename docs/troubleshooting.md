@@ -58,11 +58,17 @@ AICODE_ACCEPT_CTX_RISK=1 aicode
 export AICODE_CTX_SAFETY_DISABLE=1
 ```
 
-檢查跑不準的情況也會發生 —— 拿不到 `nvidia-smi`、跑遠端 Ollama、模型架構特殊 —— 這時會印 `[ctx-safety] UNKNOWN` 並放行，不會擋啟動。手動驗證可以單跑 `python scripts/ctx_safety_check.py`。
+檢查跑不準的情況也會發生 —— 拿不到 `nvidia-smi`、跑遠端 Ollama、模型架構特殊 —— 這時會印 `[ctx-safety] UNKNOWN` 並放行，不會擋啟動。手動驗證可以單跑：
+
+```bash
+AICODE_MODEL=<CODE_MODEL> python scripts/ctx_safety_check.py
+```
+
+`<CODE_MODEL>` 是佔位符，必須替換成實際 Ollama tag。
 
 ### 模型 404 或找不到模型
 
-代表 Ollama 沒有該 tag。先 `ollama list` 看裝了什麼，沒有的話再 pull（CodeTrail 不會替你預設任何主模型，下面只是常見候選舉例 — 自己挑要用的那顆）：
+代表 Ollama 沒有該 tag。先 `ollama list` 看裝了什麼，沒有的話再 pull（CodeTrail 不會替你預設任何主模型；自己挑要用的那顆）：
 
 ```bash
 ollama pull <CODE_MODEL>            # 自己選的主模型

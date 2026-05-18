@@ -23,7 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from model_resolution import (  # noqa: E402
     normalize_main_model,
-    parse_cli_model_arg,
+    parse_cli_model_arg_detail,
     resolve_opencode_main_model,
 )
 
@@ -50,15 +50,28 @@ def main(argv: list[str] | None = None) -> int:
     args = list(argv if argv is not None else sys.argv[1:])
 
     env_raw = os.environ.get("AICODE_MODEL", "").strip()
-    cli_raw = parse_cli_model_arg(args)
+    cli_arg = parse_cli_model_arg_detail(args)
+
+    if cli_arg.error:
+        return _fail(cli_arg.error)
 
     env_res = normalize_main_model(env_raw, "AICODE_MODEL") if env_raw else None
-    cli_res = normalize_main_model(cli_raw, "-m/--model") if cli_raw else None
+    cli_results = [
+        normalize_main_model(raw, "-m/--model") for raw in cli_arg.values
+    ]
+    cli_res = cli_results[0] if cli_results else None
 
     if env_res and env_res.error:
         return _fail(env_res.error)
-    if cli_res and cli_res.error:
-        return _fail(cli_res.error)
+    for res in cli_results:
+        if res.error:
+            return _fail(res.error)
+    cli_models = {res.model for res in cli_results if res.model}
+    if len(cli_models) > 1:
+        return _fail(
+            "multiple -m/--model flags point to different models: "
+            f"{sorted(cli_models)}. Use one model for both OpenCode TUI and CodeTrail MCP."
+        )
 
     if env_res and cli_res and env_res.model != cli_res.model:
         return _fail(
