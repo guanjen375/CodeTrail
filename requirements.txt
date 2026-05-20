@@ -9,3 +9,4 @@ numpy>=1.21.0       # RAG / MMR 向量運算
 # pip install pymupdf4llm ollama   # RAG.py 從 PDF/MD 建知識庫
 # pip install html2text            # RAG.py --url 抓網頁
 # pip install jieba                # 中文 BM25 切詞
+# pip install pyelftools           # media.py ELF 解析改用結構化 backend（含 DWARF/notes），不裝會回退到 readelf 文字解析

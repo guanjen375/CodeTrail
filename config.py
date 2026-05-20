@@ -510,10 +510,9 @@ GROUNDING_EXCLUDE_PATTERNS = [
 # ============================================================
 # BIN/ELF 報告限制（Hard Cap）
 # ============================================================
-# 保護重要資訊（Header、Entry point）不被截斷
-# 設定 hard cap，避免 context 超載時丟失關鍵資訊
+# 報告本身按重要度由前往後排（Header → Sections → Entry/反組譯 → Symbols → Strings），
+# 所以前綴切片就是「優先保留 header」。設定 hard cap 避免 context 超載。
 BIN_ELF_REPORT_MAX_CHARS = 25000      # 報告總長度上限（約 6K tokens）
-BIN_ELF_HEADER_RESERVED = 3000        # Header + Entry point 保留空間
 BIN_ELF_MAX_SECTIONS = 30             # Section 數量上限（縮減）
 BIN_ELF_MAX_FUNCS = 25                # Function 數量上限（縮減）
 BIN_ELF_MAX_OBJS = 12                 # Object 數量上限
