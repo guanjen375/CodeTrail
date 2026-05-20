@@ -28,11 +28,13 @@ try:
     from elftools.elf.elffile import ELFFile as _PyELFFile  # type: ignore
     from elftools.elf.sections import SymbolTableSection as _PySymTab  # type: ignore
     from elftools.elf.sections import NoteSection as _PyNoteSection  # type: ignore
+    from elftools.elf.dynamic import DynamicSection as _PyDynamic  # type: ignore
     _HAS_PYELFTOOLS = True
 except ImportError:
     _PyELFFile = None
     _PySymTab = None
     _PyNoteSection = None
+    _PyDynamic = None
     _HAS_PYELFTOOLS = False
 
 
@@ -567,6 +569,10 @@ def _build_elf_report(
     if not magic.startswith(b"\x7fELF"):
         return f"[ELF 錯誤] 不是有效的 ELF 檔案 (magic: 0x{magic.hex()})"
 
+    # 「fail loud」：pyelftools 失敗或未安裝時，把原因明文寫進 report，
+    # 不要只 print()——MCP 回傳裡 stdout 看不到，否則模型無法判斷自己看到的是
+    # 結構化解析還是 readelf 文字 fallback。
+    pyelf_failure: Optional[str] = None
     if _HAS_PYELFTOOLS:
         try:
             report = _build_elf_report_native(
@@ -574,11 +580,14 @@ def _build_elf_report(
             )
             return _truncate_elf_report(report)
         except Exception as e:
-            # 「fail loud」：顯示 pyelftools 失敗原因，再退回 readelf
-            print(f"[WARN] pyelftools 解析失敗 ({type(e).__name__}: {e})，回退到 readelf")
+            pyelf_failure = (
+                f"[WARN] pyelftools 解析失敗 ({type(e).__name__}: {e})，已退回 readelf 文字解析"
+            )
+            print(pyelf_failure)
 
     report = _build_elf_report_readelf(
-        filepath, max_sections, max_funcs, max_objs, max_strings
+        filepath, max_sections, max_funcs, max_objs, max_strings,
+        pyelf_failure=pyelf_failure,
     )
     return _truncate_elf_report(report)
 
@@ -641,6 +650,7 @@ def _build_elf_report_readelf(
     max_funcs: int,
     max_objs: int,
     max_strings: int,
+    pyelf_failure: Optional[str] = None,
 ) -> str:
     """ELF 報告：readelf / objdump 文字解析路徑（fallback）。"""
     file_size = filepath.stat().st_size
@@ -648,7 +658,10 @@ def _build_elf_report_readelf(
     report: List[str] = [
         f"檔案: {filepath.name}",
         f"大小: {file_size:,} bytes",
+        "(parser: readelf 文字解析)",
     ]
+    if pyelf_failure:
+        report.append(pyelf_failure)
 
     elf_fields: Dict[str, str] = {}
     sections: List[Dict] = []
@@ -824,6 +837,255 @@ def _py_strip_enum(value: object, prefix: str) -> str:
     return s[len(prefix):] if s.startswith(prefix) else s
 
 
+# Imported-symbol（.dynsym UND）按 API 家族分桶；對 stripped binary 而言，
+# 看不到自己定義的 function 名稱，但能從 imports 推斷做了什麼（網路？crypto？exec？）。
+# 順序就是顯示優先順序：威脅模型上更重要的（exec/dynamic_link/crypto/network）放前面。
+_IMPORT_API_CATEGORIES: List[Tuple[str, "re.Pattern[str]"]] = [
+    ("exec/process", re.compile(
+        r"^(fork|vfork|exec[lv][ep]?e?|system|popen|wait[a-z]*|kill|posix_spawn\w*|"
+        r"clone\d?|setuid|setgid|seteuid|setegid|setresuid|setresgid|chroot|"
+        r"daemon|setsid)$"
+    )),
+    ("dynamic_link", re.compile(r"^(dlopen|dlmopen|dlsym|dlvsym|dlclose|dlerror|dladdr|dlinfo)$")),
+    ("crypto", re.compile(
+        r"(^MD[245]|^SHA\d+|^AES_|^DES_|^RSA_|^EVP_|^HMAC_|^RAND_|^BN_|^EC_|^X509_|"
+        r"^PEM_|^SSL_|^TLS_|^ENGINE_|^BIO_|^crypto_|^gcry_|^nettle_|^openssl_|"
+        r"^mbedtls_|^wolfSSL_|PKCS[71]|PBKDF)"
+    )),
+    ("network", re.compile(
+        r"^(socket|bind|connect|listen|accept4?|send(to|msg)?|recv(from|msg)?|"
+        r"select|p?poll|epoll_\w+|getaddrinfo|freeaddrinfo|gethostby\w+|inet_\w+|"
+        r"htons|htonl|ntohs|ntohl|getsockopt|setsockopt|shutdown|getpeername|getsockname)$"
+    )),
+    ("io/fs", re.compile(
+        r"^(open(at)?|close|read[v]?|write[v]?|pread\d*|pwrite\d*|lseek\d*|"
+        r"f?stat\d*|lstat\d*|access|faccessat|mkdir(at)?|rmdir|unlink(at)?|"
+        r"rename(at)?|chmod|fchmod(at)?|chown|fchown(at)?|lchown|ioctl|fcntl\d*|"
+        r"dup[23]?|mmap\d*|munmap|msync|mprotect|sync|f?datasync|fsync|"
+        r"opendir|fdopendir|readdir\d*|closedir|truncate\d*|ftruncate\d*|"
+        r"symlink(at)?|readlink(at)?|getcwd|chdir|fchdir|umask|mknod(at)?|"
+        r"flock|fallocate)$"
+    )),
+    ("threading", re.compile(
+        r"^(pthread_|sem_(open|close|wait|post|init|destroy|trywait|timedwait|getvalue|unlink)|"
+        r"mtx_|thrd_|tss_|cnd_|atomic_|__atomic_|__sync_)"
+    )),
+    ("memory", re.compile(
+        r"^(malloc|free|calloc|realloc(array)?|mem(cpy|move|set|cmp|chr|rchr|mem)|"
+        r"brk|sbrk|mremap|posix_memalign|aligned_alloc|valloc|memalign|pvalloc)$"
+    )),
+    ("env/sig", re.compile(
+        r"^(getenv|setenv|unsetenv|putenv|clearenv|signal|sigaction|sigprocmask|"
+        r"sigpending|sigsuspend|sigwait\w*|raise|abort|atexit|on_exit|alarm|"
+        r"setitimer|getitimer)$"
+    )),
+    ("printf/str", re.compile(
+        r"^(printf|fprintf|sprintf|snprintf|vprintf|vsprintf|vsnprintf|asprintf|"
+        r"vasprintf|dprintf|vdprintf|__\w*printf\w*_chk|"
+        r"str(cpy|ncpy|cat|ncat|cmp|ncmp|len|nlen|chr|rchr|str|tok|dup|ndup|casecmp|ncasecmp)|"
+        r"__str\w+_chk)$"
+    )),
+]
+
+
+def _categorize_imports(imports: List[str]) -> Dict[str, List[str]]:
+    """把 imported symbol list 按 API 家族分桶。
+
+    分類順序固定（見 _IMPORT_API_CATEGORIES），第一個匹配的家族即歸屬，
+    所以 e.g. pthread_create 會落在 threading（而不是 exec/process 的 fork 同類）。
+    """
+    by_family: Dict[str, List[str]] = {}
+    for name in imports:
+        matched = False
+        for family, pat in _IMPORT_API_CATEGORIES:
+            if pat.search(name):
+                by_family.setdefault(family, []).append(name)
+                matched = True
+                break
+        if not matched:
+            by_family.setdefault("other", []).append(name)
+    return by_family
+
+
+def _format_imports(imports: List[str], max_per_cat: int = 8) -> List[str]:
+    """格式化 imports 為分類列表。
+
+    每類最多顯示 max_per_cat 個；超過就標 '+N more'。對 stripped binary，
+    這通常比看 .dynsym 已定義 symbols 更能告訴你「這檔案做什麼」。
+    """
+    if not imports:
+        return []
+    by_family = _categorize_imports(imports)
+
+    out: List[str] = ["", f"【Imports（.dynsym UND，按 API 家族分類）】共 {len(imports)} 個"]
+    family_order = [f for f, _ in _IMPORT_API_CATEGORIES] + ["other"]
+    for family in family_order:
+        items = by_family.get(family)
+        if not items:
+            continue
+        shown = items[:max_per_cat]
+        more = len(items) - len(shown)
+        sample = ", ".join(shown)
+        if more > 0:
+            sample += f", ... +{more}"
+        out.append(f"  [{family}] ({len(items)}) {sample}")
+    return out
+
+
+def _parse_modinfo(data: bytes) -> Dict[str, List[str]]:
+    """解析 .modinfo（Linux kernel module 元資料）。
+
+    格式：多個 null-terminated 的 key=value 字串串接。
+    同一個 key 可以重複（如 alias=、depends=），所以 value 是 list。
+    """
+    result: Dict[str, List[str]] = {}
+    for raw in data.split(b"\x00"):
+        if not raw:
+            continue
+        try:
+            s = raw.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        if "=" not in s:
+            continue
+        key, _, val = s.partition("=")
+        result.setdefault(key.strip(), []).append(val.strip())
+    return result
+
+
+def _format_modinfo(modinfo: Dict[str, List[str]]) -> List[str]:
+    """把 .modinfo 字典格式化成報告行。
+
+    parm/parmtype 很冗（大型 module 可能上百個），只給計數不展開。
+    """
+    out: List[str] = ["", "【.modinfo（kernel module 元資料）】"]
+    priority = [
+        "name", "license", "version", "vermagic", "srcversion", "author",
+        "description", "depends", "import_ns", "alias", "firmware",
+        "intree", "retpoline", "scmversion",
+    ]
+    shown: set = set()
+    for key in priority:
+        vals = modinfo.get(key)
+        if not vals:
+            continue
+        shown.add(key)
+        if len(vals) == 1:
+            out.append(f"  {key}: {vals[0]}")
+        else:
+            preview = ", ".join(vals[:5])
+            tail = f" ... +{len(vals)-5}" if len(vals) > 5 else ""
+            out.append(f"  {key} ({len(vals)}): {preview}{tail}")
+    other = [k for k in modinfo if k not in shown and k not in ("parm", "parmtype")]
+    if other:
+        out.append(f"  其他鍵: {', '.join(other[:10])}" +
+                   (f" ... +{len(other)-10}" if len(other) > 10 else ""))
+    if "parm" in modinfo or "parmtype" in modinfo:
+        out.append(
+            f"  module params: {len(modinfo.get('parm', []))} parm / "
+            f"{len(modinfo.get('parmtype', []))} parmtype"
+        )
+    return out
+
+
+def _format_dynamic_section(facts: Dict) -> List[str]:
+    """把 .dynamic 摘要格式化成報告行（NEEDED / SONAME / RPATH/RUNPATH 等）。"""
+    if not facts.get("has_dynamic"):
+        return []
+    out: List[str] = ["", "【.dynamic】"]
+    if facts.get("soname"):
+        out.append(f"  SONAME: {facts['soname']}")
+    needed = facts.get("needed", [])
+    if needed:
+        out.append(f"  NEEDED ({len(needed)}):")
+        for lib in needed[:12]:
+            out.append(f"    {lib}")
+        if len(needed) > 12:
+            out.append(f"    ... +{len(needed) - 12}")
+    # RPATH/RUNPATH 是 LD_LIBRARY_PATH 風險評估的關鍵資訊
+    if facts.get("rpath"):
+        out.append(f"  RPATH: {facts['rpath']}")
+    if facts.get("runpath"):
+        out.append(f"  RUNPATH: {facts['runpath']}")
+    flag_bits: List[str] = []
+    if facts.get("bind_now"):
+        flag_bits.append("BIND_NOW")
+    if facts.get("is_pie"):
+        flag_bits.append("PIE")
+    if flag_bits:
+        out.append(f"  Flags: {', '.join(flag_bits)}")
+    init_n = facts.get("init_array_count", 0)
+    fini_n = facts.get("fini_array_count", 0)
+    if init_n or fini_n:
+        out.append(f"  INIT_ARRAY: {init_n} entries, FINI_ARRAY: {fini_n} entries")
+    return out
+
+
+def _format_key_facts(facts: Dict) -> List[str]:
+    """TL;DR 摘要放在報告最前面。
+
+    設計意圖：就算 hard cap 截斷掉中間段（symbols/strings/DWARF），
+    模型還能從這段抓到 arch / type / stripped / linkage / imports 等高價值資訊。
+    每行控制在一個 key+value，便於模型快速 index。
+    """
+    out: List[str] = ["", "【Key Facts】"]
+    out.append(f"  Arch     : {facts['machine']} (ELF{facts['class']}, {facts['endian']}-endian)")
+
+    type_str = facts["type"]
+    type_extra: List[str] = []
+    if facts.get("is_pie"):
+        type_extra.append("PIE")
+    elif type_str == "DYN" and facts.get("soname"):
+        type_extra.append("shared library")
+    if facts.get("is_ko"):
+        type_extra.append("kernel module")
+    type_suffix = f" ({', '.join(type_extra)})" if type_extra else ""
+    out.append(f"  Type     : {type_str}{type_suffix}")
+
+    out.append(f"  Entry    : 0x{facts['entry']:08x}")
+
+    has_symtab = facts.get("has_symtab", False)
+    has_dynsym = facts.get("has_dynsym", False)
+    if has_symtab:
+        stripped = "no (.symtab present)"
+    elif has_dynsym:
+        stripped = "yes (.symtab absent, .dynsym only)"
+    else:
+        stripped = "fully stripped (no symbol tables)"
+    out.append(f"  Stripped : {stripped}")
+
+    if facts.get("has_dynamic"):
+        n_needed = len(facts.get("needed", []))
+        if n_needed:
+            preview = ", ".join(facts["needed"][:3])
+            if n_needed > 3:
+                preview += f" + {n_needed - 3} more"
+            linkage = f"dynamic, {n_needed} NEEDED ({preview})"
+        else:
+            linkage = "dynamic, no DT_NEEDED"
+    else:
+        linkage = "static (no .dynamic section)"
+    out.append(f"  Linkage  : {linkage}")
+
+    n_imports = facts.get("dynsym_imports_count", 0)
+    n_exports = facts.get("dynsym_exports_count", 0)
+    out.append(f"  Dynsym   : {n_imports} imports (UND) / {n_exports} exports (defined)")
+
+    out.append(f"  DWARF    : {'present' if facts.get('has_dwarf') else 'absent'}")
+
+    if facts.get("build_id"):
+        out.append(f"  Build-id : {facts['build_id']}")
+
+    return out
+
+
+# DT_FLAGS_1 中代表 PIE 的位元，DF_1_PIE = 0x08000000；BIND_NOW = 0x01。
+# 這些常數定義在 glibc / elf.h；pyelftools 不會直接給 enum。
+_DF_1_PIE = 0x08000000
+_DF_1_NOW = 0x00000001
+_DF_BIND_NOW = 0x00000008  # 舊版 DT_FLAGS 裡的 DF_BIND_NOW
+
+
 def _build_elf_report_native(
     filepath: Path,
     max_sections: int,
@@ -833,70 +1095,41 @@ def _build_elf_report_native(
 ) -> str:
     """ELF 報告：pyelftools 路徑（結構化、不依賴 readelf 文字格式）。
 
-    額外提供 readelf 路徑沒有的：DWARF compilation unit 來源檔案列表。
+    額外提供 readelf 路徑沒有的：Key Facts 摘要、.dynamic 表（NEEDED/SONAME/
+    RPATH/RUNPATH）、imports（.dynsym UND，按 API 家族分類）、.modinfo（kernel
+    module）、DWARF compilation unit 來源檔案列表。
     """
     file_size = filepath.stat().st_size
-
-    report: List[str] = [
+    header_lines: List[str] = [
         f"檔案: {filepath.name}",
         f"大小: {file_size:,} bytes",
         "(parser: pyelftools)",
     ]
+    body: List[str] = []  # 詳細資料區段（會在 facts 收集後 append 進來）
+    facts: Dict = {}     # Key Facts header 依賴的事實集合
 
     with open(filepath, "rb") as f:
         elf = _PyELFFile(f)
 
-        # ===== ELF Header =====
+        # ===== 基本 header 欄位（facts + ELF Header 區塊都用） =====
         machine_str = _py_strip_enum(elf["e_machine"], "EM_")
         type_str = _py_strip_enum(elf["e_type"], "ET_")
         entry_addr = int(elf["e_entry"])
         osabi_str = _py_strip_enum(elf["e_ident"]["EI_OSABI"], "ELFOSABI_")
-        report.append("")
-        report.append("【ELF Header】")
-        report.append(f"  Class: ELF{elf.elfclass}")
-        report.append(f"  Data: {'little endian' if elf.little_endian else 'big endian'}")
-        report.append(f"  OS/ABI: {osabi_str}")
-        report.append(f"  Type: {type_str}")
-        report.append(f"  Machine: {machine_str}")
-        report.append(f"  Entry point address: 0x{entry_addr:08x}")
-        report.append(f"  Flags: 0x{int(elf['e_flags']):x}")
-        report.append(f"  Number of program headers: {elf.num_segments()}")
-        report.append(f"  Number of section headers: {elf.num_sections()}")
+        facts.update({
+            "class": elf.elfclass,
+            "endian": "little" if elf.little_endian else "big",
+            "machine": machine_str,
+            "type": type_str,
+            "entry": entry_addr,
+            "osabi": osabi_str,
+            "has_dwarf": elf.has_dwarf_info(),
+        })
 
-        # ===== GNU build-id（從 .note.gnu.build-id 取） =====
-        build_id: Optional[str] = None
-        for sec in elf.iter_sections():
-            if not isinstance(sec, _PyNoteSection):
-                continue
-            for note in sec.iter_notes():
-                if note["n_type"] == "NT_GNU_BUILD_ID":
-                    # n_desc 可能是 hex string，也可能是 bytes（看版本）
-                    desc = note["n_desc"]
-                    build_id = desc if isinstance(desc, str) else desc.hex()
-                    break
-            if build_id:
-                break
-        if build_id:
-            report.append(f"  GNU build-id: {build_id}")
-
-        # ===== Program Headers =====
-        if elf.num_segments() > 0:
-            report.append("")
-            report.append("【Program Headers】")
-            for i, seg in enumerate(elf.iter_segments()):
-                if i >= 10:
-                    report.append(f"  ... (共 {elf.num_segments()} 個)")
-                    break
-                ptype = _py_strip_enum(seg["p_type"], "PT_")
-                report.append(
-                    f"  {ptype:<14} offset=0x{int(seg['p_offset']):06x} "
-                    f"vaddr=0x{int(seg['p_vaddr']):08x} "
-                    f"filesz=0x{int(seg['p_filesz']):x} memsz=0x{int(seg['p_memsz']):x} "
-                    f"flags=0x{int(seg['p_flags']):x}"
-                )
-
-        # ===== Sections =====
+        # ===== Sections（一次走訪 + 順便收集 build-id / 旗標 / .modinfo） =====
         sections: List[Dict] = []
+        build_id: Optional[str] = None
+        modinfo: Optional[Dict[str, List[str]]] = None
         for idx, sec in enumerate(elf.iter_sections()):
             sections.append({
                 "idx": idx,
@@ -906,66 +1139,80 @@ def _build_elf_report_native(
                 "offset": int(sec["sh_offset"]),
                 "size": int(sec["sh_size"]),
             })
+            if sec.name == ".symtab":
+                facts["has_symtab"] = True
+            elif sec.name == ".dynsym":
+                facts["has_dynsym"] = True
+            elif sec.name == ".dynamic":
+                facts["has_dynamic"] = True
+            elif sec.name == ".modinfo":
+                try:
+                    modinfo = _parse_modinfo(sec.data())
+                except Exception:
+                    modinfo = None
+            # GNU build-id 藏在 .note.gnu.build-id 裡，順手抓
+            if build_id is None and isinstance(sec, _PyNoteSection):
+                try:
+                    for note in sec.iter_notes():
+                        if note["n_type"] == "NT_GNU_BUILD_ID":
+                            desc = note["n_desc"]
+                            build_id = desc if isinstance(desc, str) else desc.hex()
+                            break
+                except Exception:
+                    pass
+        facts.setdefault("has_symtab", False)
+        facts.setdefault("has_dynsym", False)
+        facts.setdefault("has_dynamic", False)
+        facts["build_id"] = build_id
+        facts["is_ko"] = (modinfo is not None) or filepath.suffix.lower() == ".ko"
 
-        important_names = {
-            ".vectors", ".text", ".rodata", ".data", ".bss",
-            ".init", ".fini", ".comment", ".symtab", ".dynsym",
-            ".strtab", ".shstrtab", ".plt", ".got", ".got.plt",
-            ".eh_frame", ".dynamic", ".interp",
-        }
-        picked = [
-            sec for sec in sections
-            if sec["name"] in important_names
-            or sec["name"].startswith(".debug")
-            or sec["name"].startswith(".note")
-        ]
-        picked = sorted(picked, key=lambda s: s["idx"])[:max_sections]
-
-        if picked:
-            report.append("")
-            report.append(f"【Sections】({len(picked)}/{len(sections)} 個)")
-            report.append("  [idx] name              type       addr       offset   size")
-            for sec in picked:
-                report.append(
-                    f"  [{sec['idx']:2d}] {sec['name']:<17} {sec['type']:<10} "
-                    f"0x{sec['addr']:08x} 0x{sec['offset']:06x} 0x{sec['size']:06x}"
-                )
-
-        # ===== Entry point 對應的 section + 反組譯 =====
-        for sec in sections:
-            sec_end = sec["addr"] + max(1, sec["size"])
-            if sec["addr"] <= entry_addr < sec_end:
-                file_off = sec["offset"] + (entry_addr - sec["addr"])
-                report.append("")
-                report.append(
-                    f"Entry point 0x{entry_addr:08x} 位於 section {sec['name']} "
-                    f"(file offset ≈ 0x{file_off:x})"
-                )
-                break
-
-        disasm = _disasm_entry(filepath, entry_addr, machine=machine_str)
-        if disasm:
-            report.append("")
-            report.append("【Entry 反組譯（前幾條指令）】")
-            report.append(disasm)
-
-        # ===== .comment（編譯器資訊） =====
-        comment_sec = elf.get_section_by_name(".comment")
-        if comment_sec is not None:
+        # ===== .dynamic 表（NEEDED / SONAME / RPATH / RUNPATH / FLAGS） =====
+        # 沒 .dynamic（靜態連結）就略過；存在的話這段資訊對 stripped binary 特別關鍵。
+        dyn_sec = elf.get_section_by_name(".dynamic")
+        if dyn_sec is not None and isinstance(dyn_sec, _PyDynamic):
+            needed: List[str] = []
+            soname: Optional[str] = None
+            rpath: Optional[str] = None
+            runpath: Optional[str] = None
+            flags_val = 0
+            flags_1_val = 0
+            init_arr = 0
+            fini_arr = 0
             try:
-                raw = comment_sec.data()
-                # .comment 是多個 null-terminated 字串串接
-                parts = [p.decode("utf-8", errors="replace").strip()
-                         for p in raw.split(b"\x00") if p.strip()]
-                if parts:
-                    report.append("")
-                    report.append("【.comment（編譯器資訊）】")
-                    for line in parts[:10]:
-                        report.append(f"  {line}")
+                for tag in dyn_sec.iter_tags():
+                    tname = str(tag.entry.d_tag)
+                    if tname == "DT_NEEDED":
+                        needed.append(getattr(tag, "needed", str(tag.entry.d_val)))
+                    elif tname == "DT_SONAME":
+                        soname = getattr(tag, "soname", None)
+                    elif tname == "DT_RPATH":
+                        rpath = getattr(tag, "rpath", None)
+                    elif tname == "DT_RUNPATH":
+                        runpath = getattr(tag, "runpath", None)
+                    elif tname == "DT_FLAGS":
+                        flags_val = int(tag.entry.d_val)
+                    elif tname == "DT_FLAGS_1":
+                        flags_1_val = int(tag.entry.d_val)
+                    elif tname == "DT_INIT_ARRAYSZ":
+                        # pointer size = 4 (ELF32) or 8 (ELF64)
+                        init_arr = int(tag.entry.d_val) // (8 if elf.elfclass == 64 else 4)
+                    elif tname == "DT_FINI_ARRAYSZ":
+                        fini_arr = int(tag.entry.d_val) // (8 if elf.elfclass == 64 else 4)
             except Exception:
                 pass
+            facts.update({
+                "needed": needed,
+                "soname": soname,
+                "rpath": rpath,
+                "runpath": runpath,
+                "bind_now": bool(flags_val & _DF_BIND_NOW) or bool(flags_1_val & _DF_1_NOW),
+                # PIE 判斷：DT_FLAGS_1 的 DF_1_PIE 是最可靠來源（ET_DYN 也可能是 .so）
+                "is_pie": bool(flags_1_val & _DF_1_PIE),
+                "init_array_count": init_arr,
+                "fini_array_count": fini_arr,
+            })
 
-        # ===== Symbols（分 .symtab / .dynsym） =====
+        # ===== Symbols（分 .symtab / .dynsym） + 計算 imports/exports =====
         sym_tables: Dict[str, List[Dict]] = {}
         for sec in elf.iter_sections():
             if not isinstance(sec, _PySymTab):
@@ -973,6 +1220,7 @@ def _build_elf_report_native(
             syms: List[Dict] = []
             for sym in sec.iter_symbols():
                 shndx = sym["st_shndx"]
+                # pyelftools 對 shndx 有時回 str（'SHN_UNDEF'）有時回 int，要兩種都接
                 if isinstance(shndx, int):
                     if shndx == 0:
                         ndx_str = "UND"
@@ -982,6 +1230,12 @@ def _build_elf_report_native(
                         ndx_str = "COM"
                     else:
                         ndx_str = str(shndx)
+                elif shndx == "SHN_UNDEF":
+                    ndx_str = "UND"
+                elif shndx == "SHN_ABS":
+                    ndx_str = "ABS"
+                elif shndx == "SHN_COMMON":
+                    ndx_str = "COM"
                 else:
                     ndx_str = str(shndx)
                 syms.append({
@@ -994,18 +1248,142 @@ def _build_elf_report_native(
                 })
             sym_tables[sec.name] = syms
 
+        # imports = .dynsym 裡 UND 的 FUNC/OBJECT；exports = 已定義的 GLOBAL/WEAK
+        dynsym_syms = sym_tables.get(".dynsym", [])
+        imports = [s["name"] for s in dynsym_syms
+                   if s["ndx"] == "UND" and s["type"] in ("FUNC", "OBJECT", "NOTYPE")
+                   and s["name"]]
+        exports = [s for s in dynsym_syms
+                   if s["ndx"] not in ("UND", "ABS")
+                   and s["bind"] in ("GLOBAL", "WEAK")
+                   and s["type"] in ("FUNC", "OBJECT")]
+        facts["dynsym_imports_count"] = len(imports)
+        facts["dynsym_exports_count"] = len(exports)
+
+        # ===== Key Facts header（必須先 emit，hard cap 截斷時最先保留） =====
+        body.extend(_format_key_facts(facts))
+
+        # ===== ELF Header（完整版） =====
+        body.append("")
+        body.append("【ELF Header】")
+        body.append(f"  Class: ELF{elf.elfclass}")
+        body.append(f"  Data: {'little endian' if elf.little_endian else 'big endian'}")
+        body.append(f"  OS/ABI: {osabi_str}")
+        body.append(f"  Type: {type_str}")
+        body.append(f"  Machine: {machine_str}")
+        body.append(f"  Entry point address: 0x{entry_addr:08x}")
+        body.append(f"  Flags: 0x{int(elf['e_flags']):x}")
+        body.append(f"  Number of program headers: {elf.num_segments()}")
+        body.append(f"  Number of section headers: {elf.num_sections()}")
+        if build_id:
+            body.append(f"  GNU build-id: {build_id}")
+
+        # ===== Program Headers =====
+        if elf.num_segments() > 0:
+            body.append("")
+            body.append("【Program Headers】")
+            for i, seg in enumerate(elf.iter_segments()):
+                if i >= 10:
+                    body.append(f"  ... (共 {elf.num_segments()} 個)")
+                    break
+                ptype = _py_strip_enum(seg["p_type"], "PT_")
+                body.append(
+                    f"  {ptype:<14} offset=0x{int(seg['p_offset']):06x} "
+                    f"vaddr=0x{int(seg['p_vaddr']):08x} "
+                    f"filesz=0x{int(seg['p_filesz']):x} memsz=0x{int(seg['p_memsz']):x} "
+                    f"flags=0x{int(seg['p_flags']):x}"
+                )
+
+        # ===== .dynamic 詳細區塊（NEEDED / SONAME / RPATH / RUNPATH） =====
+        body.extend(_format_dynamic_section(facts))
+
+        # ===== Sections =====
+        important_names = {
+            ".vectors", ".text", ".rodata", ".data", ".bss",
+            ".init", ".fini", ".comment", ".symtab", ".dynsym",
+            ".strtab", ".shstrtab", ".plt", ".got", ".got.plt",
+            ".eh_frame", ".dynamic", ".interp", ".modinfo",
+        }
+        picked = [
+            sec for sec in sections
+            if sec["name"] in important_names
+            or sec["name"].startswith(".debug")
+            or sec["name"].startswith(".note")
+        ]
+        picked = sorted(picked, key=lambda s: s["idx"])[:max_sections]
+
+        if picked:
+            body.append("")
+            body.append(f"【Sections】({len(picked)}/{len(sections)} 個)")
+            body.append("  [idx] name              type       addr       offset   size")
+            for sec in picked:
+                body.append(
+                    f"  [{sec['idx']:2d}] {sec['name']:<17} {sec['type']:<10} "
+                    f"0x{sec['addr']:08x} 0x{sec['offset']:06x} 0x{sec['size']:06x}"
+                )
+
+        # ===== .modinfo（kernel module 才有） =====
+        if modinfo:
+            body.extend(_format_modinfo(modinfo))
+
+        # ===== Entry point 對應的 section + 反組譯 =====
+        # REL（.o/.ko）的 e_entry 通常是 0、由 kernel/linker 後續決定，不要硬報。
+        # 同時 sections[0] 是 SHN_UNDEF（addr=0 size=0 名字空），用 max(1,size) 會誤命中——
+        # 過濾空名 section 規避。
+        if type_str != "REL":
+            for sec in sections:
+                if not sec["name"]:
+                    continue
+                sec_end = sec["addr"] + max(1, sec["size"])
+                if sec["addr"] <= entry_addr < sec_end:
+                    file_off = sec["offset"] + (entry_addr - sec["addr"])
+                    body.append("")
+                    body.append(
+                        f"Entry point 0x{entry_addr:08x} 位於 section {sec['name']} "
+                        f"(file offset ≈ 0x{file_off:x})"
+                    )
+                    break
+
+            disasm = _disasm_entry(filepath, entry_addr, machine=machine_str)
+            if disasm:
+                body.append("")
+                body.append("【Entry 反組譯（前幾條指令）】")
+                body.append(disasm)
+
+        # ===== .comment（編譯器資訊） =====
+        comment_sec = elf.get_section_by_name(".comment")
+        if comment_sec is not None:
+            try:
+                raw = comment_sec.data()
+                # .comment 是多個 null-terminated 字串串接
+                parts = [p.decode("utf-8", errors="replace").strip()
+                         for p in raw.split(b"\x00") if p.strip()]
+                if parts:
+                    body.append("")
+                    body.append("【.comment（編譯器資訊）】")
+                    for line in parts[:10]:
+                        body.append(f"  {line}")
+            except Exception:
+                pass
+
+        # ===== Symbols（已定義 FUNC/OBJECT，分 .symtab / .dynsym） =====
         preferred_order = [".symtab", ".dynsym"]
         ordered_keys = (
             [k for k in preferred_order if k in sym_tables] +
             [k for k in sym_tables.keys() if k not in preferred_order]
         )
         for tname in ordered_keys:
-            report.extend(_format_symbol_table(
+            body.extend(_format_symbol_table(
                 sym_tables[tname], tname, max_funcs=max_funcs, max_objs=max_objs
             ))
 
+        # ===== Imports（.dynsym UND，按 API 家族分類） =====
+        # 對 stripped binary 而言：自己定義的函式名字看不到，imports 反而是
+        # 推斷「這檔在做什麼」的最佳線索（呼叫了 socket？exec？crypto？）。
+        body.extend(_format_imports(imports))
+
         # ===== DWARF compilation units（pyelftools 才有，readelf 路徑沒這個） =====
-        if elf.has_dwarf_info():
+        if facts["has_dwarf"]:
             try:
                 dwarf = elf.get_dwarf_info()
                 cu_files: List[Tuple[str, str]] = []  # (comp_dir, file_name)
@@ -1028,18 +1406,20 @@ def _build_elf_report_native(
                         cu_files.append((fdir, fname))
 
                 if cu_files:
-                    report.append("")
-                    report.append(f"【DWARF 編譯單元】({min(20, len(cu_files))}/{len(cu_files)} 個來源檔)")
+                    body.append("")
+                    body.append(f"【DWARF 編譯單元】({min(20, len(cu_files))}/{len(cu_files)} 個來源檔)")
                     for fdir, fname in cu_files[:20]:
                         # DWARF DW_AT_name 可能是絕對或相對；只有相對時才接 comp_dir
                         if fname.startswith("/") or not fdir:
-                            report.append(f"  {fname}")
+                            body.append(f"  {fname}")
                         else:
-                            report.append(f"  {fdir.rstrip('/')}/{fname}")
+                            body.append(f"  {fdir.rstrip('/')}/{fname}")
                     if len(cu_files) > 20:
-                        report.append(f"  ... (還有 {len(cu_files) - 20} 個)")
+                        body.append(f"  ... (還有 {len(cu_files) - 20} 個)")
             except Exception as e:
-                report.append(f"[WARN] DWARF 解析失敗: {type(e).__name__}: {e}")
+                body.append(f"[WARN] DWARF 解析失敗: {type(e).__name__}: {e}")
+
+        report = header_lines + body
 
     # ===== 字串掃描（ASCII + UTF-16LE，與 readelf 路徑共用 helper） =====
     seen_strings: set = set()
@@ -1120,16 +1500,20 @@ def ocr_image(path: str) -> str:
         return f"[OCR 錯誤] {type(e).__name__}: {e}"
 
 
-def read_elf(path: str, max_sections: int = 40, max_funcs: int = 30,
-              max_objs: int = 15, max_strings: int = 30) -> str:
+def read_elf(path: str, max_sections: Optional[int] = None,
+              max_funcs: Optional[int] = None, max_objs: Optional[int] = None,
+              max_strings: Optional[int] = None) -> str:
     """讀取 ELF 檔案並產生分析報告
 
     Args:
         path: ELF 檔案路徑
-        max_sections: 最多顯示的 section 數量
-        max_funcs: 最多顯示的 function 數量
-        max_objs: 最多顯示的 object 數量
-        max_strings: 最多顯示的高優先字串數量
+        max_sections: 最多顯示的 section 數量（None → BIN_ELF_MAX_SECTIONS）
+        max_funcs: 最多顯示的 function 數量（None → BIN_ELF_MAX_FUNCS）
+        max_objs: 最多顯示的 object 數量（None → BIN_ELF_MAX_OBJS）
+        max_strings: 最多顯示的高優先字串數量（None → BIN_ELF_MAX_STRINGS）
+
+    None 預設值會 fall through 到 config 設定，確保 `elf:` 與 `bin:` 走同一個 ELF
+    時報告大小一致（_build_elf_report 在 bin: 路徑會以 config 為預設）。
     """
     # 外部檔案不限制副檔名（process_file 已做 header sniffing）
     # sandbox 內檔案才檢查白名單（ELF + BIN，因為 .bin 可能是 ELF）
@@ -1148,6 +1532,13 @@ def read_elf(path: str, max_sections: int = 40, max_funcs: int = 30,
     file_size = p.stat().st_size
     if file_size > MAX_BINARY_SIZE:
         return f"[ELF 錯誤] 檔案過大: {file_size / 1024 / 1024:.1f}MB (上限 {MAX_BINARY_SIZE // 1024 // 1024}MB)"
+
+    # 先把 None 換成 config 預設，再算 cache key——這樣 read_elf(p) 跟
+    # _build_elf_report(p)（bin: 路徑用）會打到同一個 cache entry。
+    max_sections = max_sections or BIN_ELF_MAX_SECTIONS
+    max_funcs = max_funcs or BIN_ELF_MAX_FUNCS
+    max_objs = max_objs or BIN_ELF_MAX_OBJS
+    max_strings = max_strings or BIN_ELF_MAX_STRINGS
 
     cache_key = _cache_key(p, (max_sections, max_funcs, max_objs, max_strings))
     cached = _cache_get(_ELF_CACHE, cache_key)
