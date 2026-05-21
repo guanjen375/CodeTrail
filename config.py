@@ -160,7 +160,7 @@ CUSTOM_SYSTEM_RULES_MAX_CHARS = 4000 # 規則檔案最大字元數
 # ============================================================
 # Agent 設定
 # ============================================================
-MAX_TOOL_LOOPS = 10                  # Agent 最大工具回合數（調整: 12->10）
+MAX_TOOL_LOOPS = 16                  # Agent 最大工具回合數（調整: 10->16，鼓勵多查證再答）
 MAX_FILE_READ_CHARS = 50000
 MAX_GREP_RESULTS = 30
 MAX_LIST_DEPTH = 3
