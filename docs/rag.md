@@ -1,6 +1,6 @@
 # RAG、附件與知識庫操作
 
-這份文件整理附件匯入、知識庫建立、Code-RAG 搜尋與規格查詢方式。
+這份文件整理附件匯入、知識庫建立、Code-RAG 搜尋與規格查詢方式。需要 llama-server `:8081` (embedding) 啟動才能算 embedding;`:8082` (reranker) 與 `:8083` (VL) 是選用,只在做 rerank / 處理圖片時需要。
 
 [回到 README](../README.md)。
 
@@ -98,7 +98,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 #### 支援格式
 
 - **文字**：`.pdf` / `.md` / `.txt`（直接抽文字）
-- **圖片**：`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp`（用 VL 模型看圖、抽出文字描述後切 chunk，需要先 `ollama pull` 設定的 VL_MODEL，預設 `qwen3-vl:30b-a3b`）
+- **圖片**：`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp`（用 VL 模型看圖、抽出文字描述後切 chunk，需要先把 VL GGUF 掛在 llama-server :8083,設定見 [models.md](models.md)）
 - **binary**：`.bin` / `.dat` / `.raw` / `.fw` / `.img` / `.rom` / `.hex`（抽 hex dump、可讀字串、magic 偵測；遇到 ELF magic 自動切到 ELF 解析）
 - **ELF**：`.elf` / `.so` / `.o` / `.axf` / `.out` / `.ko`（抽 header / sections / symbols）
 
@@ -144,7 +144,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 最後回報目前載入幾個 chunks。
 ```
 
-`chunks` 是「切好的文件段落」。回報 0 代表沒匯入到任何內容 — 常見原因：純圖片掃描的 PDF（沒可選文字）、binary 太小或全是 0xff、VL 模型沒 pull 導致圖片分析失敗。
+`chunks` 是「切好的文件段落」。回報 0 代表沒匯入到任何內容 — 常見原因：純圖片掃描的 PDF（沒可選文字）、binary 太小或全是 0xff、VL llama-server (:8083) 沒啟動導致圖片分析失敗。
 
 **步驟 3：查**
 

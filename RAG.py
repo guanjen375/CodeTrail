@@ -28,19 +28,12 @@ from typing import List, Dict, Optional, Tuple
 # ============================================================
 # 條件式依賴檢查，按模式載入
 # - PDF 模式才需要 pymupdf4llm
-# - VL 模式（--chat/--image）需要 ollama
+# - VL 模式（--chat/--image）需要 llama-server VL 端點 (預設 8083)
 # - --url 模式需要 html2text
-# - 所有模式都需要 ollama（用於 embedding）
+# - 所有模式都需要 llama-server embedding 端點 (預設 8081)
 
-def check_ollama():
-    """檢查 ollama 套件（所有模式都需要）"""
-    try:
-        import ollama
-        return ollama
-    except ImportError:
-        print("[ERROR] 缺少套件: ollama")
-        print("請執行: pip install ollama")
-        sys.exit(1)
+import llama_client
+
 
 def check_pymupdf4llm():
     """檢查 pymupdf4llm 套件（只有 PDF 模式需要）"""
@@ -52,18 +45,21 @@ def check_pymupdf4llm():
         print("請執行: pip install pymupdf4llm")
         sys.exit(1)
 
-# 延遲載入：ollama 在需要時才 import
-ollama = None
 
 # ============================================================
 # 設定
 # ============================================================
 # 改進：從 config.py 統一匯入設定，避免兩處定義不一致
 try:
-    from config import EMBEDDING_MODEL, CHUNK_SETTINGS
+    from config import (
+        EMBEDDING_MODEL, CHUNK_SETTINGS,
+        LLAMA_EMBED_BASE_URL, LLAMA_VL_BASE_URL,
+    )
 except ImportError:
     EMBEDDING_MODEL = "bge-m3"  # Fallback：獨立執行時的預設值
     CHUNK_SETTINGS = {'default': {'size': 1200, 'overlap': 200}}
+    LLAMA_EMBED_BASE_URL = "http://localhost:8081"
+    LLAMA_VL_BASE_URL = "http://localhost:8083"
 
 # 預設 Chunk 設定（從 CHUNK_SETTINGS 取得）
 CHUNK_SIZE = CHUNK_SETTINGS.get('default', {}).get('size', 1200)
@@ -755,21 +751,16 @@ def extract_chat_from_screenshot(image_path: str) -> str:
 如果截圖內容不是聊天對話，請直接描述圖片中的技術資訊。
 若有任何不確定的內容，請明確標註「推測」或「不確定」。"""
 
-    # 延遲載入 ollama
-    global ollama
-    if ollama is None:
-        ollama = check_ollama()
-
     try:
-        response = ollama.chat(
-            model=VL_MODEL,
-            messages=[{
-                'role': 'user',
-                'content': prompt,
-                'images': [image_data]
-            }]
+        data = llama_client.native_completion(
+            base_url=LLAMA_VL_BASE_URL,
+            prompt=prompt,
+            temperature=0.2,
+            stream=False,
+            image_data=[{"id": 10, "data": image_data}],
+            timeout=300,
         )
-        return response['message']['content']
+        return data.get("content") or data.get("response") or ""
     except Exception as e:
         print(f"[ERROR] VL 模型處理失敗: {e}")
         return ""
@@ -892,21 +883,16 @@ def extract_info_from_image(image_path: str) -> str:
 盡可能完整描述圖中的所有資訊，包括文字標註、箭頭方向、顏色區分等。
 若有任何不確定的內容，請明確標註「推測」或「不確定」。"""
 
-    # 延遲載入 ollama
-    global ollama
-    if ollama is None:
-        ollama = check_ollama()
-
     try:
-        response = ollama.chat(
-            model=VL_MODEL,
-            messages=[{
-                'role': 'user',
-                'content': prompt,
-                'images': [image_data]
-            }]
+        data = llama_client.native_completion(
+            base_url=LLAMA_VL_BASE_URL,
+            prompt=prompt,
+            temperature=0.2,
+            stream=False,
+            image_data=[{"id": 10, "data": image_data}],
+            timeout=300,
         )
-        return response['message']['content']
+        return data.get("content") or data.get("response") or ""
     except Exception as e:
         print(f"[ERROR] VL 模型處理失敗: {e}")
         return ""
@@ -1049,10 +1035,6 @@ def generate_embeddings(chunks: List[Dict], cache_dir: Path = None) -> List[Dict
     - 相同內容直接從快取取得 embedding
     - 新內容計算後存入快取
     """
-    global ollama
-    if ollama is None:
-        ollama = check_ollama()
-
     total = len(chunks)
 
     # 載入快取
@@ -1078,10 +1060,14 @@ def generate_embeddings(chunks: List[Dict], cache_dir: Path = None) -> List[Dict
             cache_hits += 1
             continue
 
-        # 計算新的 embedding
+        # 計算新的 embedding(走 llama-server /embedding)
         try:
-            response = ollama.embeddings(model=EMBEDDING_MODEL, prompt=content)
-            embedding = response['embedding']
+            embedding = llama_client.embed_one(
+                base_url=LLAMA_EMBED_BASE_URL,
+                content=content,
+                model=EMBEDDING_MODEL,
+                timeout=120,
+            )
             chunk['embedding'] = embedding
             # 存入快取
             cache[content_key] = embedding
@@ -2050,7 +2036,7 @@ def print_usage():
 
 
 if __name__ == "__main__":
-    # --help / -h 短路:cheap path,不需要 Ollama / 不讀檔
+    # --help / -h 短路:cheap path,不需要 llama-server / 不讀檔
     if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help"):
         print_usage()
         sys.exit(0)

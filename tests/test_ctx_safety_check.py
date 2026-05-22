@@ -9,19 +9,16 @@ def _unknown_verdict(requested: int) -> SafetyVerdict:
     return SafetyVerdict(
         status="UNKNOWN",
         requested_ctx=requested,
-        computed_max_ctx=None,
-        weights_gb=None,
-        kv_per_token_kb=None,
-        vram_needed_gb=None,
+        server_n_ctx=None,
+        model_path=None,
         vram_total_gb=None,
-        headroom_gb=2.0,
+        vram_free_gb=None,
         reason="test unknown",
     )
 
 
 def test_ctx_safety_fails_loud_when_env_missing(monkeypatch, capsys):
-    """CodeTrail 不內建主模型: AICODE_MODEL 未設時必須 fail-loud (exit 2),
-    不能 silent fallback 到某個內建主模型。"""
+    """CodeTrail 不內建主模型: AICODE_MODEL 未設時必須 fail-loud (exit 2)。"""
     monkeypatch.delenv("AICODE_MODEL", raising=False)
     monkeypatch.delenv("AICODE_DYNAMIC_NUM_CTX_MAX", raising=False)
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
@@ -71,19 +68,24 @@ def test_ctx_safety_disable_short_circuits_even_without_model(monkeypatch, capsy
 
 
 def test_ctx_safety_uses_resolved_model_from_env(monkeypatch):
-    monkeypatch.setenv("AICODE_MODEL", "custom:latest")
+    """新版 check_safety(requested_ctx, base_url=...) 簽名 — 不再吃 model。
+    這個 test 確認 ctx_safety_check.main 走到 gpu_safety.check_safety 並帶入正確
+    requested ctx 與 base_url。
+    """
+    monkeypatch.setenv("AICODE_MODEL", "custom-model")
     monkeypatch.delenv("AICODE_DYNAMIC_NUM_CTX_MAX", raising=False)
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
+    monkeypatch.setenv("AICODE_LLAMA_BASE_URL", "http://example.test:8080")
 
     calls: dict[str, object] = {}
 
-    def fake_check_safety(model: str, requested: int, *, base_url: str):
-        calls["model"] = model
+    def fake_check_safety(requested, base_url="http://localhost:8080", **_kw):
         calls["requested"] = requested
+        calls["base_url"] = base_url
         return _unknown_verdict(requested)
 
     monkeypatch.setattr(ctx.gpu_safety, "check_safety", fake_check_safety)
 
     assert ctx.main() == 0
-    assert calls["model"] == "custom:latest"
     assert calls["requested"] == ctx.DEFAULT_CTX_MAX
+    assert calls["base_url"] == "http://example.test:8080"

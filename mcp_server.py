@@ -154,7 +154,7 @@ set_sandbox_root(AICODE_ROOT, allow_external=False)
 _log(f"[MCP] AICODE_ROOT = {AICODE_ROOT}")
 
 # fail-loud: CodeTrail 不內建主聊天模型, 沒設好就直接退出, 避免 silent 跑到底
-# 才在 Ollama 那邊 404。aicode wrapper 已經做過一次解析 + export, 走到這裡
+# 才在 llama-server 那邊 404。aicode wrapper 已經做過一次解析 + export, 走到這裡
 # 還是空表示使用者繞過了 wrapper (例如手動 spawn MCP 子行程)。
 try:
     _resolved_main_model = config.require_main_model()
@@ -313,7 +313,7 @@ def query_knowledge_strict(question: str) -> dict:
 
     跟一般 `query_knowledge` 的差別:
       - `query_knowledge` 只回傳 KB 上下文,要 OpenCode 的模型自己組答案;
-      - `query_knowledge_strict` 在 server-side 直接呼叫 Ollama
+      - `query_knowledge_strict` 在 server-side 直接呼叫主 llama-server
         (用 `AICODE_MODEL`,不是 OpenCode 選的那顆),套用嚴格模式 prompt
         並做自我檢查,然後回傳定稿答案。
 
@@ -333,9 +333,9 @@ def query_knowledge_strict(question: str) -> dict:
         }
 
     注意:
-      - 這個 tool 會占用 server 端的 Ollama 算力;OpenCode TUI 看不到中間
+      - 這個 tool 會占用主 llama-server 的算力;OpenCode TUI 看不到中間
         streaming(會被導向 stderr,只有最終定稿經 MCP 回來)。
-      - Ollama 不可用時 answer 會以 "[ERROR] ..." 開頭。
+      - llama-server 不可用時 answer 會以 "[ERROR] ..." 開頭。
     """
     if not KB.loaded:
         result = {
@@ -664,7 +664,7 @@ def analyze_file(path: str) -> str:
 
     依副檔名自動 dispatch:
       - 圖片(.png/.jpg/.jpeg/.gif/.webp) → 用 VL_MODEL 做 OCR,回傳圖中文字
-        (要先 ollama pull config.VL_MODEL,預設是 qwen3-vl:30b-a3b)
+        (要先在 llama-server VL port (8083) 掛載對應的 VL GGUF + mmproj)
       - ELF(.elf/.so/.o/.axf/.out/.ko) → 解析 header / sections / symbols
         (需要系統有 binutils 的 readelf / objdump)
       - 二進位(.bin/.dat/.raw/.fw/.img/.rom/.hex) → hex dump + 字串提取 + magic 偵測
@@ -725,7 +725,7 @@ def ingest_document(path: str, mode: str = "auto") -> str:
 
     支援副檔名:
       - 文字: .pdf / .md / .txt(直接抽文字)
-      - 圖片: .png / .jpg / .jpeg / .gif / .webp(經 VL 模型抽說明,需要 ollama VL_MODEL)
+      - 圖片: .png / .jpg / .jpeg / .gif / .webp(經 VL 模型抽說明,需要 llama-server VL port)
       - binary: .bin / .dat / .raw / .fw / .img / .rom / .hex
                 (hex dump + 可讀字串 + magic 偵測;偵測到 ELF magic 會自動切 ELF 解析)
       - ELF: .elf / .so / .o / .axf / .out / .ko(header / sections / symbols)

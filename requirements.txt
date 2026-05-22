@@ -1,12 +1,13 @@
 # pip install -r requirements.txt
 
 # 核心
-requests>=2.28.0    # Ollama HTTP
+requests>=2.28.0    # llama-server HTTP client
 mcp>=1.0.0          # MCP server（mcp_server.py 用）
 numpy>=1.21.0       # RAG / MMR 向量運算
 
 # 可選：缺了會由各功能 graceful skip，doctor 會提示
-# pip install pymupdf4llm ollama   # RAG.py 從 PDF/MD 建知識庫
-# pip install html2text            # RAG.py --url 抓網頁
-# pip install jieba                # 中文 BM25 切詞
-# pip install pyelftools           # media.py ELF 解析改用結構化 backend（含 DWARF/notes），不裝會回退到 readelf 文字解析
+# pip install pymupdf4llm                          # RAG.py 從 PDF/MD 建知識庫
+# pip install html2text                            # RAG.py --url 抓網頁
+# pip install jieba                                # 中文 BM25 切詞
+# pip install pyelftools                           # media.py ELF 結構化解析 (含 DWARF/notes)
+# llama.cpp llama-server 本身要自己 build,見 docs/setup.md

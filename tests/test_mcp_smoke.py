@@ -1,8 +1,8 @@
 """mcp_server.py 啟動 smoke test。
 
-驗證主產品路線(OpenCode + Ollama + MCP)的 server entry 至少能初始化:
+驗證主產品路線(OpenCode + llama-server + MCP)的 server entry 至少能初始化:
 import 成功 → root 檢查通過 → KnowledgeBase / CodeRAG / ToolExecutor 構造好 →
-FastMCP 實例就緒。**不**需要 Ollama、不下載模型、不跑 inference。
+FastMCP 實例就緒。**不**需要 llama-server、不下載模型、不跑 inference。
 
 實作方式:subprocess 啟動,看 stderr 印出我們已知的初始化里程碑 log,然後 terminate。
 
@@ -28,11 +28,11 @@ def _spawn_mcp(tmp_root: Path, env_overrides: dict[str, str] | None = None) -> s
     env = os.environ.copy()
     env["AICODE_ROOT"] = str(tmp_root)
     env["PYTHONIOENCODING"] = "utf-8"
-    # 確保子行程不會跑到 Ollama 卡住(雖然 smoke 階段不會 LLM call,但保險起見)
-    env["AICODE_OLLAMA_BASE_URL"] = "http://127.0.0.1:1"
+    # 確保子行程不會跑到 llama-server 卡住(雖然 smoke 階段不會 LLM call,但保險起見)
+    env["AICODE_LLAMA_BASE_URL"] = "http://127.0.0.1:65535"
     # mcp_server.py 啟動時會 require_main_model(); 沒設會 fail-loud exit 3。
     # smoke test 不在意主模型實際存不存在, 給個合理假值即可。
-    env.setdefault("AICODE_MODEL", "example-code-model:30b")
+    env["AICODE_MODEL"] = "example-code-model"
     # 即使 env_overrides 覆寫 HOME,也要讓子行程能找到 mcp 套件 — 把當前
     # Python 的 sys.path 顯式塞進 PYTHONPATH(包含 user site-packages)
     env["PYTHONPATH"] = os.pathsep.join(

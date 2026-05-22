@@ -9,7 +9,6 @@ import json
 from pathlib import Path
 from functools import lru_cache
 
-from http_client import get_session
 
 import config
 
@@ -29,8 +28,9 @@ except ImportError:
     print("[WARN] jieba 未安裝，中文 BM25 搜尋精準度可能較低", file=sys.stderr)
     print("       建議執行: pip install jieba", file=sys.stderr)
 
+import llama_client
 from config import (
-    OLLAMA_GENERATE_URL, OLLAMA_EMBEDDINGS_URL, OLLAMA_TAGS_URL,
+    LLAMA_BASE_URL, LLAMA_EMBED_BASE_URL, LLAMA_RERANK_BASE_URL,
     KNOWLEDGE_FILE, KNOWLEDGE_EMB_FILE,
     KNOWLEDGE_TOP_K, KNOWLEDGE_CANDIDATE_K, KNOWLEDGE_THRESHOLD,
     KNOWLEDGE_THRESHOLD_SHORT, KNOWLEDGE_SHORT_QUERY_TOKENS,
@@ -74,14 +74,12 @@ def _cached_get_embedding(text: str) -> tuple:
     注意：回傳 tuple 而非 list，因為 lru_cache 需要 hashable
     """
     try:
-        session = get_session()
-        resp = session.post(
-            OLLAMA_EMBEDDINGS_URL,
-            json={"model": EMBEDDING_MODEL, "prompt": text},
-            timeout=120
+        emb = llama_client.embed_one(
+            base_url=LLAMA_EMBED_BASE_URL,
+            content=text,
+            model=EMBEDDING_MODEL,
+            timeout=120,
         )
-        resp.raise_for_status()
-        emb = resp.json().get("embedding", [])
         return tuple(emb) if emb else ()
     except Exception:
         return ()
@@ -490,20 +488,7 @@ class KnowledgeBase:
             return self._reranker_available
 
         try:
-            session = get_session()
-            resp = session.get(OLLAMA_TAGS_URL, timeout=5)
-            if resp.status_code == 200:
-                models = [m.get("name", "") for m in resp.json().get("models", [])]
-                # 精確檢查 RERANKER_MODEL 是否已安裝
-                # Ollama model name 格式可能是 "model:tag" 或 "model"
-                reranker_base = RERANKER_MODEL.split(":")[0].lower()
-                self._reranker_available = any(
-                    m.lower() == RERANKER_MODEL.lower() or
-                    m.lower().startswith(reranker_base + ":")
-                    for m in models
-                )
-            else:
-                self._reranker_available = False
+            self._reranker_available = llama_client.is_ready(LLAMA_RERANK_BASE_URL)
         except Exception:
             self._reranker_available = False
 
@@ -604,20 +589,15 @@ class KnowledgeBase:
 
 關鍵字:"""
 
-            session = get_session()
             model = config.require_main_model()
-            resp = session.post(
-                OLLAMA_GENERATE_URL,
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"num_ctx": 2048, "temperature": 0}
-                },
-                timeout=30
+            data = llama_client.native_completion(
+                base_url=LLAMA_BASE_URL,
+                prompt=prompt,
+                temperature=0,
+                stream=False,
+                timeout=30,
             )
-            resp.raise_for_status()
-            result = resp.json().get("response", "").strip()
+            result = (data.get("content") or data.get("response") or "").strip()
 
             # 同時支援半形和全形逗號
             raw_keywords = re.split(r'[,，]', result)
@@ -677,7 +657,6 @@ class KnowledgeBase:
             preserved_symbols = re.findall(QUERY_SYMBOL_PATTERN, question)
 
         try:
-            session = get_session()
             model = config.require_main_model()
 
             # 根據啟用的類型生成變體
@@ -745,38 +724,37 @@ English:"""
                 else:
                     continue
 
-                resp = session.post(
-                    OLLAMA_GENERATE_URL,
-                    json={
-                        "model": model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"num_ctx": 2048, "temperature": 0.3}
-                    },
-                    timeout=20
-                )
+                try:
+                    data = llama_client.native_completion(
+                        base_url=LLAMA_BASE_URL,
+                        prompt=prompt,
+                        temperature=0.3,
+                        stream=False,
+                        timeout=20,
+                    )
+                except Exception:
+                    continue
 
-                if resp.status_code == 200:
-                    result = resp.json().get("response", "").strip()
-                    if result and len(result) < 200:  # 避免太長的回應
-                        if query_type == "translate":
-                            # P0-3: 翻譯結果直接加入，並附上原始符號
-                            translated = result
-                            for sym in preserved_symbols:
-                                if sym not in translated:
-                                    translated = f"{translated} {sym}"
-                            queries.append(translated)
-                        else:
-                            # 組合原始問題和術語
-                            terms = [t.strip() for t in re.split(r'[,，]', result)]
-                            # P0-3: 放寬過濾，允許中英文混合和符號
-                            terms = [t for t in terms if t and len(t) <= 40 and len(t.split()) <= 3]
-                            # 確保符號被保留
-                            for sym in preserved_symbols:
-                                if sym not in terms:
-                                    terms.append(sym)
-                            if terms:
-                                queries.append(f"{question} {' '.join(terms[:6])}")
+                result = (data.get("content") or data.get("response") or "").strip()
+                if result and len(result) < 200:
+                    if query_type == "translate":
+                        # P0-3: 翻譯結果直接加入，並附上原始符號
+                        translated = result
+                        for sym in preserved_symbols:
+                            if sym not in translated:
+                                translated = f"{translated} {sym}"
+                        queries.append(translated)
+                    else:
+                        # 組合原始問題和術語
+                        terms = [t.strip() for t in re.split(r'[,，]', result)]
+                        # P0-3: 放寬過濾，允許中英文混合和符號
+                        terms = [t for t in terms if t and len(t) <= 40 and len(t.split()) <= 3]
+                        # 確保符號被保留
+                        for sym in preserved_symbols:
+                            if sym not in terms:
+                                terms.append(sym)
+                        if terms:
+                            queries.append(f"{question} {' '.join(terms[:6])}")
 
         except Exception:
             pass
@@ -1295,41 +1273,16 @@ English:"""
 
         if self._check_reranker_available():
             try:
-                session = get_session()
-                scored = []
-                for score, _, _, chunk in candidates[:rerank_count]:
-                    content = chunk.get('content', '')[:800]
-
-                    # 改進：使用 stop 和 num_predict 強制 numeric output
-                    # - num_predict: 限制最多輸出 10 個 token（足夠 0.xxxxx 格式）
-                    # - stop: 遇到換行或空格就停止
-                    resp = session.post(
-                        OLLAMA_GENERATE_URL,
-                        json={
-                            "model": RERANKER_MODEL,
-                            "prompt": f"Query: {question}\n\nPassage: {content}",
-                            "stream": False,
-                            "options": {
-                                "num_ctx": 2048,
-                                "temperature": 0,
-                                "num_predict": 10,
-                                "stop": ["\n", " ", ",", "。", "，"]
-                            }
-                        },
-                        timeout=30
-                    )
-                    resp.raise_for_status()
-
-                    result = resp.json().get("response", "").strip()
-                    try:
-                        rerank_score = float(result)
-                    except ValueError:
-                        # Fallback: 嘗試從 result 中提取數字
-                        match = re.search(r'-?[\d.]+', result)
-                        rerank_score = float(match.group()) if match else score
-
-                    scored.append((rerank_score, chunk))
-
+                items = candidates[:rerank_count]
+                passages = [chunk.get('content', '')[:800] for _, _, _, chunk in items]
+                scores = llama_client.rerank(
+                    base_url=LLAMA_RERANK_BASE_URL,
+                    query=question,
+                    documents=passages,
+                    model=RERANKER_MODEL,
+                    timeout=60,
+                )
+                scored = [(scores[i], items[i][3]) for i in range(len(items))]
                 scored.sort(reverse=True, key=lambda x: x[0])
                 return [c[1] for c in scored[:top_k]]
 
@@ -1363,20 +1316,15 @@ English:"""
 排序結果:"""
 
         try:
-            session = get_session()
             model = config.require_main_model()
-            resp = session.post(
-                OLLAMA_GENERATE_URL,
-                json={
-                    "model": model,
-                    "prompt": rerank_prompt,
-                    "stream": False,
-                    "options": {"num_ctx": 8192, "temperature": 0}
-                },
-                timeout=60
+            data = llama_client.native_completion(
+                base_url=LLAMA_BASE_URL,
+                prompt=rerank_prompt,
+                temperature=0,
+                stream=False,
+                timeout=60,
             )
-            resp.raise_for_status()
-            result = resp.json().get("response", "")
+            result = data.get("content") or data.get("response") or ""
 
             doc_indices = []
             for match in re.finditer(r'DOC_(\d+)', result):

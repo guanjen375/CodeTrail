@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Resolve CodeTrail's explicit main Ollama model for the aicode wrapper.
+"""Resolve CodeTrail's explicit main llama.cpp model for the aicode wrapper.
 
 Priority:
   1. AICODE_MODEL
   2. CLI -m/--model
   3. OPENCODE_CONFIG, then ~/.config/opencode/opencode.json
 
-Env and CLI may both be present only when they resolve to the same bare Ollama
-model name. This prevents OpenCode TUI and CodeTrail MCP from silently using
-different models.
+Env and CLI may both be present only when they resolve to the same bare model
+name (or GGUF path). 這避免 OpenCode TUI 和 CodeTrail MCP 各自用不同模型。
 """
 from __future__ import annotations
 
@@ -32,13 +31,16 @@ def _fail(msg: str) -> int:
     print(f"[aicode] {msg}", file=sys.stderr, flush=True)
     print(
         "[aicode] CodeTrail 不內建、不推薦主聊天 / 程式推導模型。\n"
-        "         請先 ollama pull 一顆 Ollama 模型,然後任選一種方式設定:\n"
-        "           1) export AICODE_MODEL=<CODE_MODEL>\n"
-        "           2) aicode -m ollama/<CODE_MODEL>\n"
+        "         請先下載一顆 GGUF 並啟動 llama-server, 然後任選一種方式設定:\n"
+        "           1) export AICODE_MODEL=<MODEL>\n"
+        "           2) aicode -m <MODEL>\n"
         "           3) OPENCODE_CONFIG / ~/.config/opencode/opencode.json 設\n"
-        '                "model": "ollama/<CODE_MODEL>"\n'
-        "         <CODE_MODEL> 是佔位符,必須替換成實際模型名稱。\n"
-        "         CodeTrail MCP 只呼叫 Ollama native API,不可填 openai/、anthropic/ 等 provider。\n"
+        '                \"model\": \"<MODEL>\"\n'
+        "         <MODEL> 可以是:\n"
+        "           - registry 裡登記的 bare name (例如 \"qwen3-coder-30b\")\n"
+        "           - GGUF 絕對路徑 (例如 /models/foo.gguf)\n"
+        "         registry 維護在 ~/.config/codetrail/models.json 或 AICODE_MODEL_REGISTRY env。\n"
+        "         CodeTrail 不接受 ollama/、openai/、anthropic/ 等 provider prefix。\n"
         "         詳見 README.md。",
         file=sys.stderr,
         flush=True,

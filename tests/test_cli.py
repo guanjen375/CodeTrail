@@ -1,6 +1,6 @@
 """Maintenance script smoke tests: 確保基本 help / error path 不會 crash。
 
-不需要 Ollama 或任何外部服務即可通過。
+不需要 llama-server 或任何外部服務即可通過。
 """
 from __future__ import annotations
 
@@ -165,44 +165,48 @@ def test_aicode_prepares_opencode_mcp_wrapper(tmp_path):
     assert "exec python" in content and "mcp_server.py" in content
 
 
-def test_aicode_rewrites_bare_long_model_arg_for_opencode(tmp_path):
+def test_aicode_passes_through_bare_model_arg(tmp_path):
+    """新版 aicode 不再強加 provider prefix,使用者傳什麼就轉發什麼。"""
     result, args_file = _run_aicode_with_stub(
         tmp_path,
-        ["--model", "bare-model:tag"],
+        ["--model", "bare-model"],
     )
 
     assert result.returncode == 0, f"exit={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
-    assert _read_stub_args(args_file) == ["--model", "ollama/bare-model:tag"]
+    assert _read_stub_args(args_file) == ["--model", "bare-model"]
 
 
-def test_aicode_does_not_double_prefix_ollama_model_arg(tmp_path):
+def test_aicode_rejects_external_ollama_provider_in_model_arg(tmp_path):
+    """ollama/ openai/ 等已知外部 provider prefix 必須被 resolve_main_model 攔下。"""
     result, args_file = _run_aicode_with_stub(
         tmp_path,
-        ["--model", "ollama/bare-model:tag"],
+        ["--model", "ollama/bare-model"],
+    )
+
+    assert result.returncode != 0
+    assert ("外部 provider" in result.stderr) or ("provider prefix" in result.stderr)
+
+
+def test_aicode_passes_through_custom_provider_model_arg(tmp_path):
+    """自定 provider (例如 llamacpp/foo) 原樣轉發給 OpenCode;CodeTrail 自己會 strip 出 bare。"""
+    result, args_file = _run_aicode_with_stub(
+        tmp_path,
+        ["-m", "llamacpp/some-model"],
     )
 
     assert result.returncode == 0, f"exit={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
-    assert _read_stub_args(args_file) == ["--model", "ollama/bare-model:tag"]
+    assert _read_stub_args(args_file) == ["-m", "llamacpp/some-model"]
 
 
-def test_aicode_rewrites_namespaced_short_model_arg_for_opencode(tmp_path):
+def test_aicode_passes_through_equals_model_arg(tmp_path):
+    """--model=foo 形式也原樣轉發。"""
     result, args_file = _run_aicode_with_stub(
         tmp_path,
-        ["-m", "some-org/model:tag"],
+        ["--model=bare-model"],
     )
 
     assert result.returncode == 0, f"exit={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
-    assert _read_stub_args(args_file) == ["-m", "ollama/some-org/model:tag"]
-
-
-def test_aicode_rewrites_equals_model_arg_for_opencode(tmp_path):
-    result, args_file = _run_aicode_with_stub(
-        tmp_path,
-        ["--model=bare-model:tag"],
-    )
-
-    assert result.returncode == 0, f"exit={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
-    assert _read_stub_args(args_file) == ["--model=ollama/bare-model:tag"]
+    assert _read_stub_args(args_file) == ["--model=bare-model"]
 
 
 @pytest.mark.parametrize("args", [["--model"], ["-m"], ["--model", "--foo"]])
@@ -226,15 +230,16 @@ def test_aicode_env_and_cli_model_conflict_fails_loud(tmp_path):
     assert not args_file.exists()
 
 
-def test_aicode_env_and_cli_same_model_is_normalized_for_opencode(tmp_path):
+def test_aicode_env_and_cli_same_model_passes_through(tmp_path):
+    """env 和 CLI 解析到同一個 bare model 時不衝突,CLI 值原樣轉發給 OpenCode。"""
     result, args_file = _run_aicode_with_stub(
         tmp_path,
-        ["--model", "foo:bar"],
-        {"AICODE_MODEL": "foo:bar"},
+        ["--model", "foo-bar"],
+        {"AICODE_MODEL": "foo-bar"},
     )
 
     assert result.returncode == 0, f"exit={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
-    assert _read_stub_args(args_file) == ["--model", "ollama/foo:bar"]
+    assert _read_stub_args(args_file) == ["--model", "foo-bar"]
 
 
 def test_rag_help_exits_zero():
@@ -287,7 +292,7 @@ def test_rag_rejects_unknown_extension_with_supported_list(tmp_path):
 
 
 def test_run_eval_help_exits_zero():
-    """`python eval/run_eval.py --help` 必須能 cheap return 0,不需要 Ollama。"""
+    """`python eval/run_eval.py --help` 必須能 cheap return 0,不需要 llama-server。"""
     r = subprocess.run(
         [sys.executable, str(REPO_ROOT / "eval" / "run_eval.py"), "--help"],
         capture_output=True, text=True, timeout=15,

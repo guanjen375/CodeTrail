@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-trim — explainable, priority-aware trimming for messages sent to Ollama.
+trim — explainable, priority-aware trimming for messages sent to llama-server.
 
 Design goals:
 1. Every drop / shrink leaves an explicit marker in the content so neither

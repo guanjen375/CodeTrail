@@ -9,9 +9,49 @@ def test_model_strings_non_empty():
     # 沒設好時是 "" — 這是刻意的 fail-loud 狀態。型別仍應是 str。
     # 真實 LLM 呼叫端必須先呼 config.require_main_model() (沒設就 raise)。
     assert isinstance(config.MODEL, str)
-    # EMBEDDING / RERANKER 是 RAG 內部固定附屬模型, 預設值保留, 必須非空。
+    # EMBEDDING / RERANKER 是 RAG 內部固定附屬模型 ID (informational), 預設值保留。
     assert isinstance(config.EMBEDDING_MODEL, str) and config.EMBEDDING_MODEL.strip()
     assert isinstance(config.RERANKER_MODEL, str) and config.RERANKER_MODEL.strip()
+
+
+def test_llama_server_urls_are_strings():
+    """4 個 llama-server URL 都應該是 str + 有 scheme。"""
+    for attr in ("LLAMA_BASE_URL", "LLAMA_EMBED_BASE_URL",
+                 "LLAMA_RERANK_BASE_URL", "LLAMA_VL_BASE_URL"):
+        v = getattr(config, attr)
+        assert isinstance(v, str)
+        assert v.startswith("http://") or v.startswith("https://"), f"{attr}={v!r}"
+
+
+def test_model_registry_loads_from_env(monkeypatch):
+    """AICODE_MODEL_REGISTRY env (JSON 字串) 會被 _load_model_registry 吃進來。"""
+    import importlib
+    monkeypatch.setenv("AICODE_MODEL_REGISTRY", '{"foo": "/m/foo.gguf"}')
+    monkeypatch.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
+    importlib.reload(config)
+    assert config.MODEL_REGISTRY == {"foo": "/m/foo.gguf"}
+
+
+def test_resolve_model_path_uses_registry(monkeypatch, tmp_path):
+    """有 registry 命中時走 registry 路徑。"""
+    import importlib
+    gguf = tmp_path / "foo.gguf"
+    gguf.write_text("not-a-real-gguf")
+    monkeypatch.setenv("AICODE_MODEL_REGISTRY", f'{{"foo": "{gguf}"}}')
+    monkeypatch.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
+    importlib.reload(config)
+    assert config.resolve_model_path("foo") == str(gguf)
+
+
+def test_resolve_model_path_passthrough_for_existing_file(monkeypatch, tmp_path):
+    """registry 沒命中但路徑存在 → 直接用路徑。"""
+    import importlib
+    gguf = tmp_path / "bar.gguf"
+    gguf.write_text("not-a-real-gguf")
+    monkeypatch.delenv("AICODE_MODEL_REGISTRY", raising=False)
+    monkeypatch.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
+    importlib.reload(config)
+    assert config.resolve_model_path(str(gguf)) == str(gguf)
 
 
 def test_require_main_model_fails_when_unset(monkeypatch, tmp_path):
@@ -27,30 +67,42 @@ def test_require_main_model_fails_when_unset(monkeypatch, tmp_path):
 
 
 def test_require_main_model_returns_value_when_set(monkeypatch):
-    monkeypatch.setenv("AICODE_MODEL", "some-org/some-model:tag")
-    assert config.require_main_model() == "some-org/some-model:tag"
+    """bare name 形式直接回。"""
+    monkeypatch.setenv("AICODE_MODEL", "some-model-tag")
+    assert config.require_main_model() == "some-model-tag"
 
 
-def test_require_main_model_rejects_non_ollama_provider(monkeypatch):
+def test_require_main_model_rejects_external_provider(monkeypatch):
+    """openai/ ollama/ anthropic/ 等外部 provider prefix 一律拒絕。"""
     import pytest
-    monkeypatch.setenv("AICODE_MODEL", "anthropic/not-ollama-provider")
+    for value in ("anthropic/foo", "openai/gpt-4", "ollama/qwen3"):
+        monkeypatch.setenv("AICODE_MODEL", value)
+        with pytest.raises(RuntimeError) as exc:
+            config.require_main_model()
+        assert "外部 provider prefix" in str(exc.value) or "provider prefix" in str(exc.value)
+
+
+def test_require_main_model_strips_custom_provider(monkeypatch):
+    """custom-provider/bare 形式會 strip,只留下 bare model name。"""
+    monkeypatch.setenv("AICODE_MODEL", "myprovider/qwen3-coder-32b")
+    assert config.require_main_model() == "qwen3-coder-32b"
+
+
+def test_require_main_model_accepts_gguf_path(monkeypatch):
+    """GGUF 絕對路徑也是合法的主模型形式。"""
+    monkeypatch.setenv("AICODE_MODEL", "/models/foo.gguf")
+    assert config.require_main_model() == "/models/foo.gguf"
+
+
+def test_require_main_model_path_fails_when_file_missing(monkeypatch):
+    """resolve_model_path 解到的檔不存在時必須 raise。"""
+    import pytest
+    monkeypatch.setenv("AICODE_MODEL", "definitely-not-a-real-model")
+    monkeypatch.delenv("AICODE_MODEL_REGISTRY", raising=False)
+    monkeypatch.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
     with pytest.raises(RuntimeError) as exc:
-        config.require_main_model()
-    assert "non-Ollama provider" in str(exc.value)
-
-
-def test_to_opencode_model_id_normalization():
-    # bare name → 加 ollama/ prefix
-    assert config.to_opencode_model_id("example-code-model:30b") == "ollama/example-code-model:30b"
-    # 已含 ollama/ → 不重複加
-    assert config.to_opencode_model_id("ollama/example-code-model:30b") == "ollama/example-code-model:30b"
-    # 含 namespace slash 也視為 bare ollama name (qllama/, hf.co/ 等)
-    assert (
-        config.to_opencode_model_id("qllama/bge-reranker-v2-m3")
-        == "ollama/qllama/bge-reranker-v2-m3"
-    )
-    # 空字串 → 空字串 (呼叫端應該先用 require_main_model fail-loud)
-    assert config.to_opencode_model_id("") == ""
+        config.require_main_model_path()
+    assert "找不到對應的 GGUF" in str(exc.value)
 
 
 def test_numeric_thresholds_in_unit_range():

@@ -23,7 +23,7 @@ def _clean_env(monkeypatch, tmp_path):
     yield
 
 
-def _write_home_opencode(tmp_path: Path, model: str = "ollama/from-json:tag") -> Path:
+def _write_home_opencode(tmp_path: Path, model: str = "llamacpp/from-json") -> Path:
     cfg_dir = tmp_path / ".config" / "opencode"
     cfg_dir.mkdir(parents=True)
     path = cfg_dir / "opencode.json"
@@ -32,46 +32,47 @@ def _write_home_opencode(tmp_path: Path, model: str = "ollama/from-json:tag") ->
 
 
 def test_env_takes_priority_over_opencode_json(monkeypatch, tmp_path, capsys):
-    _write_home_opencode(tmp_path, "ollama/from-json:tag")
-    monkeypatch.setenv("AICODE_MODEL", "from-env:tag")
+    _write_home_opencode(tmp_path, "llamacpp/from-json")
+    monkeypatch.setenv("AICODE_MODEL", "from-env")
 
     assert rmm.main([]) == 0
-    assert capsys.readouterr().out.strip() == "from-env:tag"
+    assert capsys.readouterr().out.strip() == "from-env"
 
 
 def test_argv_overrides_opencode_json_when_env_missing(tmp_path, capsys):
-    _write_home_opencode(tmp_path, "ollama/from-json:tag")
+    _write_home_opencode(tmp_path, "llamacpp/from-json")
 
-    assert rmm.main(["-m", "ollama/from-arg:tag"]) == 0
-    assert capsys.readouterr().out.strip() == "from-arg:tag"
+    assert rmm.main(["-m", "from-arg"]) == 0
+    assert capsys.readouterr().out.strip() == "from-arg"
 
 
 def test_env_and_argv_same_model_allowed(monkeypatch, capsys):
-    monkeypatch.setenv("AICODE_MODEL", "same-model:tag")
+    monkeypatch.setenv("AICODE_MODEL", "same-model")
 
-    assert rmm.main(["--model", "ollama/same-model:tag"]) == 0
-    assert capsys.readouterr().out.strip() == "same-model:tag"
+    assert rmm.main(["--model", "same-model"]) == 0
+    assert capsys.readouterr().out.strip() == "same-model"
 
 
-def test_env_and_argv_same_bare_model_allowed(monkeypatch, capsys):
-    monkeypatch.setenv("AICODE_MODEL", "foo:bar")
+def test_argv_with_custom_provider_prefix_strips_to_bare(monkeypatch, capsys):
+    """OpenCode 風格的 myprovider/bare 形式應該 strip 成 bare。"""
+    monkeypatch.setenv("AICODE_MODEL", "foo-bar")
 
-    assert rmm.main(["--model", "foo:bar"]) == 0
-    assert capsys.readouterr().out.strip() == "foo:bar"
+    assert rmm.main(["--model", "llamacpp/foo-bar"]) == 0
+    assert capsys.readouterr().out.strip() == "foo-bar"
 
 
 def test_env_and_argv_conflict_fails(monkeypatch, capsys):
-    monkeypatch.setenv("AICODE_MODEL", "env-model:tag")
+    monkeypatch.setenv("AICODE_MODEL", "env-model")
 
-    rc = rmm.main(["--model", "ollama/cli-model:tag"])
+    rc = rmm.main(["--model", "cli-model"])
 
     assert rc == 2
     assert "different models" in capsys.readouterr().err
 
 
 def test_argv_equals_form(capsys):
-    assert rmm.main(["--model=ollama/foo:bar"]) == 0
-    assert capsys.readouterr().out.strip() == "foo:bar"
+    assert rmm.main(["--model=llamacpp/foo-bar"]) == 0
+    assert capsys.readouterr().out.strip() == "foo-bar"
 
 
 def test_argv_missing_value_fails_loud(capsys):
@@ -98,81 +99,90 @@ def test_argv_missing_value_before_other_flag_fails_loud(capsys):
     assert "requires a model value" in err
 
 
-def test_argv_bare_ollama_name(capsys):
-    assert rmm.main(["-m", "foo:bar"]) == 0
-    assert capsys.readouterr().out.strip() == "foo:bar"
+def test_argv_bare_model_name(capsys):
+    assert rmm.main(["-m", "foo-bar"]) == 0
+    assert capsys.readouterr().out.strip() == "foo-bar"
 
 
-def test_argv_namespaced_ollama_name_kept(capsys):
-    assert rmm.main(["-m", "some-org/model:tag"]) == 0
-    assert capsys.readouterr().out.strip() == "some-org/model:tag"
+def test_argv_gguf_path(capsys):
+    """GGUF 絕對路徑也是合法的主模型形式。"""
+    assert rmm.main(["-m", "/models/foo.gguf"]) == 0
+    assert capsys.readouterr().out.strip() == "/models/foo.gguf"
 
 
-def test_argv_rejects_non_ollama_provider(capsys):
-    rc = rmm.main(["-m", "openai/gpt-4"])
-
-    assert rc == 2
-    assert "non-Ollama provider" in capsys.readouterr().err
-
-
-def test_normalize_main_model_allows_namespaced_ollama_models():
-    assert (
-        normalize_main_model("some-org/model:tag", "test").model
-        == "some-org/model:tag"
-    )
-    assert (
-        normalize_main_model("hf.co/some-user/model:Q4_K_M", "test").model
-        == "hf.co/some-user/model:Q4_K_M"
-    )
+def test_argv_rejects_external_provider(capsys):
+    """openai/ ollama/ anthropic/ 等外部 provider prefix 必須拒絕。"""
+    for value, hint in [
+        ("openai/gpt-4", "openai/"),
+        ("ollama/qwen3", "ollama/"),
+        ("anthropic/claude", "anthropic/"),
+    ]:
+        rc = rmm.main(["-m", value])
+        assert rc == 2, f"應該拒絕 {value!r}"
+        err = capsys.readouterr().err
+        assert "外部 provider" in err or "provider prefix" in err
 
 
-def test_normalize_main_model_rejects_known_cloud_provider_prefixes():
+def test_normalize_main_model_strips_custom_provider():
+    """custom-provider/bare 形式被 strip 成 bare。"""
+    assert normalize_main_model("llamacpp/foo-bar", "test").model == "foo-bar"
+    assert normalize_main_model("myprovider/some-model", "test").model == "some-model"
+
+
+def test_normalize_main_model_accepts_gguf_path():
+    assert normalize_main_model("/models/foo.gguf", "test").model == "/models/foo.gguf"
+    assert normalize_main_model("~/models/foo.gguf", "test").model == "~/models/foo.gguf"
+
+
+def test_normalize_main_model_rejects_known_external_providers():
     assert normalize_main_model("openai/gpt-4.1", "test").error
-    assert normalize_main_model("anthropic/not-ollama-provider", "test").error
+    assert normalize_main_model("anthropic/something", "test").error
+    assert normalize_main_model("ollama/qwen3", "test").error
 
 
-def test_env_rejects_non_ollama_provider(monkeypatch, capsys):
-    monkeypatch.setenv("AICODE_MODEL", "anthropic/not-ollama-provider")
+def test_env_rejects_external_provider(monkeypatch, capsys):
+    monkeypatch.setenv("AICODE_MODEL", "anthropic/something")
 
     rc = rmm.main([])
 
     assert rc == 2
-    assert "non-Ollama provider" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "外部 provider" in err or "provider prefix" in err
 
 
 def test_opencode_json_fallback_when_neither_env_nor_argv(tmp_path, capsys):
-    _write_home_opencode(tmp_path, "ollama/from-json:tag")
+    _write_home_opencode(tmp_path, "llamacpp/from-json")
 
     assert rmm.main([]) == 0
-    assert capsys.readouterr().out.strip() == "from-json:tag"
+    assert capsys.readouterr().out.strip() == "from-json"
 
 
 def test_opencode_config_env_path_is_used(monkeypatch, tmp_path, capsys):
-    _write_home_opencode(tmp_path, "ollama/home-model:tag")
+    _write_home_opencode(tmp_path, "llamacpp/home-model")
     custom = tmp_path / "custom-opencode.json"
-    custom.write_text(json.dumps({"model": "ollama/custom-model:tag"}), encoding="utf-8")
+    custom.write_text(json.dumps({"model": "llamacpp/custom-model"}), encoding="utf-8")
     monkeypatch.setenv("OPENCODE_CONFIG", str(custom))
 
     assert rmm.main([]) == 0
-    assert capsys.readouterr().out.strip() == "custom-model:tag"
+    assert capsys.readouterr().out.strip() == "custom-model"
 
 
-def test_opencode_json_rejects_non_ollama_provider(tmp_path, capsys):
-    _write_home_opencode(tmp_path, "anthropic/not-ollama-provider")
-
-    rc = rmm.main([])
-
-    assert rc == 2
-    assert 'must be "ollama/<MODEL>"' in capsys.readouterr().err
-
-
-def test_opencode_json_requires_ollama_prefix_for_namespaced_model(tmp_path, capsys):
-    _write_home_opencode(tmp_path, "some-org/model:tag")
+def test_opencode_json_rejects_external_provider(tmp_path, capsys):
+    _write_home_opencode(tmp_path, "anthropic/something")
 
     rc = rmm.main([])
 
     assert rc == 2
-    assert 'must be "ollama/<MODEL>"' in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "外部 provider" in err or "provider prefix" in err
+
+
+def test_opencode_json_bare_model_also_accepted(tmp_path, capsys):
+    """opencode.json 不再強制 require ollama/ 前綴(或任何 prefix);bare 也接受。"""
+    _write_home_opencode(tmp_path, "just-bare-name")
+
+    assert rmm.main([]) == 0
+    assert capsys.readouterr().out.strip() == "just-bare-name"
 
 
 def test_placeholder_in_env_fails(monkeypatch, capsys):
@@ -185,7 +195,7 @@ def test_placeholder_in_env_fails(monkeypatch, capsys):
 
 
 def test_placeholder_in_opencode_json_fails(tmp_path, capsys):
-    _write_home_opencode(tmp_path, "ollama/<CODE_MODEL>")
+    _write_home_opencode(tmp_path, "llamacpp/<CODE_MODEL>")
 
     rc = rmm.main([])
 
@@ -200,20 +210,12 @@ def test_no_source_at_all_fails_loud(capsys):
     err = capsys.readouterr().err
     assert "AICODE_MODEL" in err
     assert "opencode.json" in err
-    assert "<CODE_MODEL>" in err
 
 
 def test_empty_string_treated_as_unset(monkeypatch, capsys):
     monkeypatch.setenv("AICODE_MODEL", "   ")
 
     assert rmm.main([]) == 2
-
-
-def test_strip_ollama_prefix_only_strips_leading(monkeypatch, capsys):
-    monkeypatch.setenv("AICODE_MODEL", "ollama/qllama/bge-reranker-v2-m3")
-
-    assert rmm.main([]) == 0
-    assert capsys.readouterr().out.strip() == "qllama/bge-reranker-v2-m3"
 
 
 def test_malformed_opencode_json_fails_loud(tmp_path, capsys):

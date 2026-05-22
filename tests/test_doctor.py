@@ -1,6 +1,7 @@
 """scripts/doctor.py 的核心邏輯測試。
 
-不依賴 Ollama / network。專注在 root safety 跟 KB warning 行為。
+不依賴 llama-server / network。專注在 root safety、KB warning、context settings、
+新版 server-based check 行為。
 """
 from __future__ import annotations
 
@@ -12,35 +13,33 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# scripts/ 是 package(有 __init__.py),可直接 import
 from scripts import doctor as doc  # noqa: E402
 
 
-def _write_opencode_config(path: Path, model: str, models: dict) -> Path:
+def _write_opencode_config(path: Path, model: str) -> Path:
     path.write_text(
-        json.dumps(
-            {
-                "model": model,
-                "provider": {
-                    "ollama": {
-                        "models": models,
-                    }
-                },
-            }
-        ),
+        json.dumps({
+            "model": model,
+            "provider": {
+                "llamacpp": {
+                    "options": {"baseURL": "http://localhost:8080/v1"},
+                    "models": {model.split("/")[-1]: {"name": model.split("/")[-1]}},
+                }
+            },
+        }),
         encoding="utf-8",
     )
     return path
 
 
 def test_doctor_no_network_exits_clean(monkeypatch, tmp_path):
-    """沒帶 --project 時跑 --no-network 不該因為缺 KB / 網路而 FAIL。
-
-    AICODE_MODEL 在這裡顯式設一個假值, 模擬使用者已經完成「選主模型」這一步;
-    我們在這個測試裡關心的是 doctor 不會因網路或 KB 缺席而 FAIL, 而不是
-    model resolution (那有自己的 test_check_models_fails_when_main_model_unset)。
+    """沒帶 --project 時跑 --no-network 不該因為缺 KB / 網路而 FAIL,
+    只要 AICODE_MODEL 有設並且能解析到既有 GGUF 路徑。
     """
-    env = {**os.environ, "AICODE_MODEL": "example-code-model:30b"}
+    # 造一個假 GGUF 並用 AICODE_MODEL 直接指它(避開 registry / require_main_model_path 失敗)
+    gguf = tmp_path / "fake.gguf"
+    gguf.write_text("not a real gguf")
+    env = {**os.environ, "AICODE_MODEL": str(gguf)}
     env.pop("OPENCODE_CONFIG", None)
     env["HOME"] = str(tmp_path)
     env["USERPROFILE"] = str(tmp_path)
@@ -54,7 +53,6 @@ def test_doctor_no_network_exits_clean(monkeypatch, tmp_path):
 
 
 def test_aicode_root_rejects_slash(tmp_path: Path):
-    """root='/' 必須被視為 fail。"""
     r = doc.Result()
     doc.check_aicode_root(r, "/")
     assert r.fails, r.fails
@@ -62,22 +60,17 @@ def test_aicode_root_rejects_slash(tmp_path: Path):
 
 
 def test_aicode_root_fails_on_home_by_default(monkeypatch, tmp_path: Path):
-    """root=$HOME 在沒有 AI_CODE_ALLOW_HOME_ROOT=1 時必須 FAIL。
-
-    與 mcp_server.py / aicode wrapper 行為對齊 — 三者都拒絕,doctor 不能光給 warn。
-    """
     fake_home = tmp_path / "fakehome"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.delenv("AI_CODE_ALLOW_HOME_ROOT", raising=False)
     r = doc.Result()
     doc.check_aicode_root(r, str(fake_home))
-    assert r.fails, "AICODE_ROOT=$HOME 沒有 override 時應該 FAIL"
+    assert r.fails
     assert any("$HOME" in m or str(fake_home) in m for m in r.fails)
 
 
 def test_aicode_root_passes_home_with_override(monkeypatch, tmp_path: Path):
-    """root=$HOME + AI_CODE_ALLOW_HOME_ROOT=1 時可通過 (但帶 warn)。"""
     fake_home = tmp_path / "fakehome"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
@@ -85,7 +78,7 @@ def test_aicode_root_passes_home_with_override(monkeypatch, tmp_path: Path):
     r = doc.Result()
     doc.check_aicode_root(r, str(fake_home))
     assert not r.fails
-    assert r.warns, "override 後仍應該印高風險 warning"
+    assert r.warns
 
 
 def test_aicode_root_passes_on_normal_dir(tmp_path: Path):
@@ -102,7 +95,6 @@ def test_aicode_root_fails_on_missing_dir(tmp_path: Path):
 
 
 def test_knowledge_base_missing_is_warn_not_fail(tmp_path: Path):
-    """KB 不存在不該 fail,只是 warn(新手剛裝完一定沒 KB)。"""
     r = doc.Result()
     doc.check_knowledge_base(r, str(tmp_path))
     assert not r.fails
@@ -112,28 +104,8 @@ def test_knowledge_base_missing_is_warn_not_fail(tmp_path: Path):
 def test_python_version_pass():
     r = doc.Result()
     doc.check_python(r)
-    # 跑 doctor 的這個 Python 一定 ≥ 3.10(pyproject.toml target-version=py310,
-    # 而我們在 CI 用 3.11)
     assert r.passes
     assert not r.fails
-
-
-def test_tag_present_matches_latest_for_bare_name():
-    # config 用裸名 'bge-m3',ollama 只列 'bge-m3:latest' — 應視為已安裝。
-    assert doc._tag_present("bge-m3", {"bge-m3:latest"})
-
-
-def test_tag_present_matches_explicit_tag():
-    assert doc._tag_present("example-code-model:30b", {"example-code-model:30b"})
-
-
-def test_tag_present_rejects_missing():
-    assert not doc._tag_present("does-not-exist", {"bge-m3:latest"})
-
-
-def test_tag_present_explicit_tag_not_in_latest():
-    # 帶 ':<tag>' 的名字不要做 latest fallback —— 否則會誤判 :30b 為 :latest。
-    assert not doc._tag_present("example-code-model:30b", {"example-code-model:latest"})
 
 
 def test_check_opencode_ai_entry_warns_when_cli_missing(monkeypatch):
@@ -207,74 +179,90 @@ def test_check_opencode_ai_entry_accepts_npm_package(monkeypatch):
     assert any("npm package opencode-ai 已安裝 (1.2.3)" in p for p in r.passes)
 
 
-def test_check_models_accepts_latest_tag_for_bare_config_name(monkeypatch):
-    """模擬使用者只裝 bge-m3:latest 的情況。修補前會 FAIL,修補後應 PASS。"""
-    import config as cfg
+def test_check_models_passes_when_gguf_exists(monkeypatch, tmp_path):
+    """MODEL 指到實際存在的 GGUF 檔時應該 PASS。"""
+    gguf = tmp_path / "foo.gguf"
+    gguf.write_text("not a real gguf")
+    monkeypatch.setenv("AICODE_MODEL", str(gguf))
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
 
-    # MODEL is resolved from AICODE_MODEL at call time.
-    monkeypatch.setattr(cfg, "EMBEDDING_MODEL", "bge-m3")
-    monkeypatch.setattr(cfg, "RERANKER_MODEL", "qllama/bge-reranker-v2-m3")
-    monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")
-    tags = {
-        "example-code-model:30b",
-        "bge-m3:latest",
-        "qllama/bge-reranker-v2-m3:latest",
-    }
     r = doc.Result()
-    doc.check_models(r, tags)
-    assert not r.fails, f"應該沒有 FAIL,實際: {r.fails}"
+    doc.check_models(r, server_status={})
+    assert not r.fails
+    assert any("exists" in p for p in r.passes), r.passes
+
+
+def test_check_models_fails_when_gguf_missing(monkeypatch, tmp_path):
+    """MODEL bare name 沒有對應的 GGUF 檔時必須 FAIL。"""
+    monkeypatch.setenv("AICODE_MODEL", "definitely-not-a-real-model")
+    monkeypatch.delenv("AICODE_MODEL_REGISTRY", raising=False)
+    monkeypatch.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    # registry 需要重新 load 才會清空
+    import importlib
+    import config
+    importlib.reload(config)
+
+    r = doc.Result()
+    doc.check_models(r, server_status={})
+    assert r.fails
+    assert any("檔案不存在" in f for f in r.fails)
 
 
 def test_check_models_fails_when_main_model_unset(monkeypatch, tmp_path):
     """config.MODEL 為空 (使用者沒設 AICODE_MODEL / opencode.json) 必須 FAIL。"""
-    import config as cfg
-
-    monkeypatch.setattr(cfg, "EMBEDDING_MODEL", "bge-m3")
-    monkeypatch.setattr(cfg, "RERANKER_MODEL", "qllama/bge-reranker-v2-m3")
     monkeypatch.delenv("AICODE_MODEL", raising=False)
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
-    tags = {"bge-m3:latest", "qllama/bge-reranker-v2-m3:latest"}
+
     r = doc.Result()
-    doc.check_models(r, tags)
+    doc.check_models(r, server_status={})
     assert r.fails
-    assert any("MODEL" in f and "找不到" not in f for f in r.fails) or any(
-        "AICODE_MODEL" in f for f in r.fails
-    )
+
+
+def test_check_models_warns_on_loaded_model_mismatch(monkeypatch, tmp_path):
+    """server 載入的 GGUF 跟 AICODE_MODEL 解析到的不同 → WARN。"""
+    gguf = tmp_path / "actual.gguf"
+    gguf.write_text("not a real gguf")
+    monkeypatch.setenv("AICODE_MODEL", str(gguf))
+
+    server_status = {
+        "main": {
+            "url": "http://localhost:8080",
+            "props": {"model_path": "/some/different/loaded.gguf"},
+        }
+    }
+    r = doc.Result()
+    doc.check_models(r, server_status=server_status)
+    assert any("AICODE_MODEL" in w and "不同" in w for w in r.warns), r.warns
 
 
 def test_check_opencode_model_config_accepts_valid_config(monkeypatch, tmp_path):
     oc_path = tmp_path / "opencode.json"
-    _write_opencode_config(
-        oc_path,
-        "ollama/example-code-model:30b",
-        {"example-code-model:30b": {"name": "example-code-model:30b"}},
-    )
-    monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")
+    _write_opencode_config(oc_path, "llamacpp/my-model")
+    monkeypatch.setenv("AICODE_MODEL", "my-model")
     monkeypatch.setenv("OPENCODE_CONFIG", str(oc_path))
 
     r = doc.Result()
     doc.check_opencode_model_config(r)
 
     assert not r.fails
-    assert any("provider.ollama.models" in p for p in r.passes)
+    assert any("對齊" in p for p in r.passes), r.passes
 
 
-def test_check_opencode_model_config_fails_when_provider_key_missing(monkeypatch, tmp_path):
+def test_check_opencode_model_config_fails_when_model_mismatches(monkeypatch, tmp_path):
     oc_path = tmp_path / "opencode.json"
-    _write_opencode_config(
-        oc_path,
-        "ollama/example-code-model:30b",
-        {"other-model:latest": {"name": "other-model:latest"}},
-    )
-    monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")
+    _write_opencode_config(oc_path, "llamacpp/different-model")
+    monkeypatch.setenv("AICODE_MODEL", "my-model")
     monkeypatch.setenv("OPENCODE_CONFIG", str(oc_path))
 
     r = doc.Result()
     doc.check_opencode_model_config(r)
 
-    assert any("missing bare key" in f for f in r.fails), r.fails
+    assert any("不一致" in f for f in r.fails), r.fails
 
 
 def test_check_opencode_model_config_warns_for_global_config_when_env_model_set(
@@ -283,10 +271,10 @@ def test_check_opencode_model_config_warns_for_global_config_when_env_model_set(
     cfg_dir = tmp_path / ".config" / "opencode"
     cfg_dir.mkdir(parents=True)
     (cfg_dir / "opencode.json").write_text(
-        json.dumps({"provider": {"ollama": {"models": {}}}}),
+        json.dumps({"model": "llamacpp/different-from-env"}),
         encoding="utf-8",
     )
-    monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")
+    monkeypatch.setenv("AICODE_MODEL", "my-env-model")
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
@@ -295,65 +283,34 @@ def test_check_opencode_model_config_warns_for_global_config_when_env_model_set(
     doc.check_opencode_model_config(r)
 
     assert not r.fails
-    assert any("must set model" in w for w in r.warns), r.warns
+    assert any("不一致" in w or "OpenCode" in w for w in r.warns), r.warns
 
 
-def test_check_opencode_model_config_requires_nested_provider_models(monkeypatch, tmp_path):
+def test_check_opencode_model_config_fails_external_provider(monkeypatch, tmp_path):
+    """opencode.json model 是 anthropic/openai/ollama/ 這類外部 provider 時必須 FAIL。"""
     oc_path = tmp_path / "opencode.json"
-    oc_path.write_text(
-        json.dumps(
-            {
-                "model": "ollama/example-code-model:30b",
-                "models": {
-                    "example-code-model:30b": {"name": "example-code-model:30b"},
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")
+    _write_opencode_config(oc_path, "anthropic/something")
+    monkeypatch.setenv("AICODE_MODEL", "my-model")
     monkeypatch.setenv("OPENCODE_CONFIG", str(oc_path))
 
     r = doc.Result()
     doc.check_opencode_model_config(r)
 
-    assert any("provider.ollama.models" in f for f in r.fails), r.fails
-
-
-def test_check_opencode_model_config_fails_non_ollama_provider(monkeypatch, tmp_path):
-    oc_path = tmp_path / "opencode.json"
-    _write_opencode_config(
-        oc_path,
-        "anthropic/not-ollama-provider",
-        {"example-code-model:30b": {"name": "example-code-model:30b"}},
-    )
-    monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")
-    monkeypatch.setenv("OPENCODE_CONFIG", str(oc_path))
-
-    r = doc.Result()
-    doc.check_opencode_model_config(r)
-
-    assert any('ollama/<MODEL>' in f for f in r.fails), r.fails
+    assert any("provider" in f.lower() for f in r.fails), r.fails
 
 
 # ============================================================
-# P2: context / offload checks
+# context settings
 # ============================================================
 
-def test_check_context_settings_prints_pipelines(monkeypatch):
-    """check_context_settings 不該 FAIL,但應該印出兩條 context 管線的設定。"""
-    monkeypatch.delenv("OLLAMA_CONTEXT_LENGTH", raising=False)
+def test_check_context_settings_does_not_fail(monkeypatch):
+    """check_context_settings 永遠是 info / warn,不會 fail。"""
     r = doc.Result()
     doc.check_context_settings(r)
     assert not r.fails
-    # 至少有幾個 INFO 行(passes/warns/fails 都不會記 info 到屬性裡,但有印到 stdout)
-    # 反之確認:不會誤判而 FAIL
-    assert isinstance(r.fails, list)
 
 
 def test_check_context_settings_warns_when_num_ctx_exceeds_dynamic_max(monkeypatch):
-    """使用者明確設 AICODE_NUM_CTX=131072,但 DYNAMIC_NUM_CTX_MAX=65536 + dynamic on
-    時應該 WARN 提醒使用者實際 internal call 會被 clamp。"""
     import config as cfg
     monkeypatch.setenv("AICODE_NUM_CTX", "131072")
     monkeypatch.setattr(cfg, "NUM_CTX", 131072)
@@ -361,33 +318,19 @@ def test_check_context_settings_warns_when_num_ctx_exceeds_dynamic_max(monkeypat
     monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_MAX", 65536)
     r = doc.Result()
     doc.check_context_settings(r)
-    assert r.warns, "應該有 WARN 提醒 dynamic max clamp"
+    assert r.warns
     assert any("DYNAMIC_NUM_CTX_MAX" in w for w in r.warns)
 
 
 def test_check_context_settings_does_not_warn_on_default_num_ctx_fallback(monkeypatch):
-    """config 預設 NUM_CTX 大於 dynamic max 是正常狀態;沒設 env 時不要誤報。"""
     import config as cfg
     monkeypatch.delenv("AICODE_NUM_CTX", raising=False)
-    monkeypatch.delenv("OLLAMA_CONTEXT_LENGTH", raising=False)
     monkeypatch.setattr(cfg, "NUM_CTX", 131072)
     monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", True)
     monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_MAX", 65536)
     r = doc.Result()
     doc.check_context_settings(r)
     assert not any("比 DYNAMIC_NUM_CTX_MAX" in w for w in r.warns)
-
-
-def test_check_context_settings_warns_on_server_ctx_smaller_than_aicode(monkeypatch):
-    """OLLAMA_CONTEXT_LENGTH=4096 < AICODE_NUM_CTX=32768 時提醒 OpenCode TUI 可能被截。"""
-    import config as cfg
-    monkeypatch.setattr(cfg, "NUM_CTX", 32768)
-    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", True)
-    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_MAX", 65536)
-    monkeypatch.setenv("OLLAMA_CONTEXT_LENGTH", "4096")
-    r = doc.Result()
-    doc.check_context_settings(r)
-    assert any("OLLAMA_CONTEXT_LENGTH" in w for w in r.warns)
 
 
 def test_check_context_settings_warns_when_hard_below_soft(monkeypatch):
@@ -399,91 +342,61 @@ def test_check_context_settings_warns_when_hard_below_soft(monkeypatch):
     assert any("HARD_THRESHOLD" in w for w in r.warns)
 
 
-def test_check_ollama_runtime_skipped_when_no_network():
-    """--no-network 模式下不該 raise,也不會去打 /api/ps。"""
+# ============================================================
+# llama-server runtime
+# ============================================================
+
+def test_check_llama_runtime_skipped_when_no_network():
     r = doc.Result()
-    doc.check_ollama_runtime(r, no_network=True)
-    # No-op: no passes/warns/fails added
+    doc.check_llama_runtime(r, no_network=True, server_status={})
     assert not r.fails
 
 
-def test_check_ollama_runtime_handles_unreachable_silently(monkeypatch):
-    """Ollama 不可連時 check_ollama_runtime 不該爆 — check_ollama 會先報。"""
-    import config as cfg
-    monkeypatch.setattr(cfg, "OLLAMA_BASE_URL", "http://127.0.0.1:1")
+def test_check_llama_runtime_reports_busy_slot():
+    """主 server 有 slot 在處理時應該 WARN。"""
+    server_status = {
+        "main": {
+            "url": "http://localhost:8080",
+            "slots": [{"id": 0, "state": 1, "n_ctx": 32768}],
+        }
+    }
     r = doc.Result()
-    doc.check_ollama_runtime(r, no_network=False)
-    # connection refused → silent skip
-    assert not r.fails
+    doc.check_llama_runtime(r, no_network=False, server_status=server_status)
+    assert any("slot 正在處理" in w for w in r.warns), r.warns
 
 
-def test_check_ollama_runtime_warns_on_cpu_gpu_split(monkeypatch):
-    """模擬 /api/ps 回 30% GPU 的 split 情境;應該觸發 WARN。"""
-    import config as cfg
-    import requests
-
-    class FakeResp:
-        status_code = 200
-        def raise_for_status(self):
-            return None
-        def json(self):
-            # 30B 模型 18GB,只放 5.4GB 進 VRAM (30% GPU)
-            return {
-                "models": [
-                    {
-                        "name": "example-large-model:35b",
-                        "size": 18 * 1024**3,
-                        "size_vram": int(0.3 * 18 * 1024**3),
-                        "context_length": 32768,
-                    }
-                ]
-            }
-
-    monkeypatch.setattr(cfg, "OLLAMA_BASE_URL", "http://localhost:11434")
-    monkeypatch.setenv("AICODE_MODEL", "example-large-model:35b")
-    monkeypatch.setattr(requests, "get", lambda *a, **kw: FakeResp())
+def test_check_llama_runtime_ok_when_idle():
+    server_status = {
+        "main": {
+            "url": "http://localhost:8080",
+            "slots": [{"id": 0, "state": 0, "n_ctx": 32768}],
+        }
+    }
     r = doc.Result()
-    doc.check_ollama_runtime(r, no_network=False)
-    assert any("CPU/GPU 混合" in w for w in r.warns), r.warns
-
-
-def test_check_ollama_runtime_ok_on_full_gpu(monkeypatch):
-    import config as cfg
-    import requests
-
-    class FakeResp:
-        status_code = 200
-        def raise_for_status(self):
-            return None
-        def json(self):
-            return {
-                "models": [
-                    {
-                        "name": "example-code-model:30b",
-                        "size": 17 * 1024**3,
-                        "size_vram": 17 * 1024**3,
-                        "context_length": 32768,
-                    }
-                ]
-            }
-
-    monkeypatch.setattr(cfg, "OLLAMA_BASE_URL", "http://localhost:11434")
-    monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")
-    monkeypatch.setattr(requests, "get", lambda *a, **kw: FakeResp())
-    r = doc.Result()
-    doc.check_ollama_runtime(r, no_network=False)
+    doc.check_llama_runtime(r, no_network=False, server_status=server_status)
     assert r.passes
-    assert not any("CPU/GPU 混合" in w for w in r.warns)
+    assert not r.warns
 
 
 def test_check_opencode_config_drift_warns_on_mismatch(monkeypatch, tmp_path):
     import config as cfg
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     monkeypatch.setattr(cfg, "NUM_CTX", 32768)
-    # opencode.json with limit.context = 4096 (huge gap)
+    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", True)
+    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_MAX", 32768)
+
+    # opencode.json with provider.llamacpp.models[xxx].limit.context = 4096 (huge gap)
     oc_path = tmp_path / "opencode.json"
     oc_path.write_text(
-        '{"models": {"example-code-model:30b": {"name": "X", "limit": {"context": 4096}}}}',
+        json.dumps({
+            "provider": {
+                "llamacpp": {
+                    "models": {
+                        "my-model": {"name": "X", "limit": {"context": 4096}}
+                    }
+                }
+            }
+        }),
         encoding="utf-8",
     )
     monkeypatch.setenv("AICODE_ROOT", str(tmp_path))
@@ -493,13 +406,9 @@ def test_check_opencode_config_drift_warns_on_mismatch(monkeypatch, tmp_path):
 
 
 def test_check_opencode_config_drift_silent_when_absent(monkeypatch, tmp_path):
-    """專案沒有 opencode.json 時應該只給 INFO,不 WARN/FAIL。"""
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     r = doc.Result()
-    # No opencode.json anywhere related to this project
     doc.check_opencode_config_drift(r, str(tmp_path))
-    # info doesn't go to passes/warns/fails; expect no warns/fails
-    # (we may still hit one if repo root or $HOME has one — skip if so)
     assert not r.fails

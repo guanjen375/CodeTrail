@@ -5,7 +5,7 @@
     "expected": {
       "file": "agent.py",
       "symbol": "run_agent",
-      "line": 556
+      "line": 602
     },
     "context": "."
   },
@@ -15,7 +15,7 @@
     "expected": {
       "file": "knowledge.py",
       "symbol": "query",
-      "line": 1624
+      "line": 1577
     },
     "context": "."
   },
@@ -41,7 +41,7 @@
   },
   {
     "id": "code_005",
-    "question": "call_llm 函式是怎麼呼叫 Ollama API 的？",
+    "question": "call_llm 函式是怎麼呼叫 llama-server 的？",
     "expected": {
       "file": "utils.py",
       "symbol": "call_llm",

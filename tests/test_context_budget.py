@@ -39,7 +39,7 @@ def test_estimate_tokens_from_messages_string_content():
 
 
 def test_estimate_tokens_from_messages_list_parts():
-    # OpenAI/Ollama multi-part content shape: list of {"type": "text", "text": ...}
+    # OpenAI multi-part content shape: list of {"type": "text", "text": ...}
     messages = [
         {
             "role": "user",
@@ -210,37 +210,52 @@ def test_overflow_message_includes_remediation():
 # Metrics parsing
 # ============================================================
 
-def test_parse_metrics_from_non_streaming_response():
+def test_parse_metrics_from_native_completion_response():
+    """llama-server native /completion 回 tokens_evaluated / tokens_predicted + timings。"""
     usage = context_budget.ContextUsage()
     resp = {
-        "response": "...",
-        "prompt_eval_count": 1024,
-        "prompt_eval_duration": 2_000_000_000,  # 2 sec in ns
-        "eval_count": 512,
-        "eval_duration": 4_000_000_000,
+        "content": "...",
+        "tokens_evaluated": 1024,
+        "tokens_predicted": 512,
+        "timings": {
+            "prompt_per_second": 512.0,
+            "predicted_per_second": 128.0,
+        },
     }
     context_budget.parse_usage_from_response(resp, usage)
     assert usage.actual_prompt_eval_count == 1024
     assert usage.actual_eval_count == 512
-    # 1024 / 2 sec = 512 tok/s
     assert usage.prompt_tokens_per_second == pytest.approx(512.0)
-    # 512 / 4 sec = 128 tok/s
     assert usage.output_tokens_per_second == pytest.approx(128.0)
 
 
-def test_parse_metrics_streaming_final_chunk_only():
+def test_parse_metrics_from_openai_v1_response():
+    """/v1/chat/completions 回 usage{prompt_tokens, completion_tokens}。"""
     usage = context_budget.ContextUsage()
-    # Mid-stream chunk shouldn't fill anything
-    mid = {"message": {"content": "tok"}, "done": False}
+    resp = {
+        "choices": [{"message": {"content": "..."}}],
+        "usage": {"prompt_tokens": 800, "completion_tokens": 200, "total_tokens": 1000},
+        "timings": {"prompt_per_second": 200.0, "predicted_per_second": 50.0},
+    }
+    context_budget.parse_usage_from_response(resp, usage)
+    assert usage.actual_prompt_eval_count == 800
+    assert usage.actual_eval_count == 200
+    assert usage.prompt_tokens_per_second == pytest.approx(200.0)
+    assert usage.output_tokens_per_second == pytest.approx(50.0)
+
+
+def test_parse_metrics_streaming_final_chunk_native():
+    """native /completion 串流結束信號是 stop: true。"""
+    usage = context_budget.ContextUsage()
+    mid = {"content": "tok", "stop": False}
     context_budget.parse_usage_from_stream_chunk(mid, usage)
     assert usage.actual_prompt_eval_count is None
-    # Final chunk does
+
     final = {
-        "done": True,
-        "prompt_eval_count": 100,
-        "prompt_eval_duration": 1_000_000_000,
-        "eval_count": 50,
-        "eval_duration": 500_000_000,
+        "stop": True,
+        "tokens_evaluated": 100,
+        "tokens_predicted": 50,
+        "timings": {"prompt_per_second": 100.0, "predicted_per_second": 100.0},
     }
     context_budget.parse_usage_from_stream_chunk(final, usage)
     assert usage.actual_prompt_eval_count == 100
@@ -249,23 +264,35 @@ def test_parse_metrics_streaming_final_chunk_only():
     assert usage.output_tokens_per_second == pytest.approx(100.0)
 
 
+def test_parse_metrics_streaming_final_chunk_openai():
+    """/v1 串流結束信號是 choices[0].finish_reason 非 null。"""
+    usage = context_budget.ContextUsage()
+    mid = {"choices": [{"delta": {"content": "tok"}, "finish_reason": None}]}
+    context_budget.parse_usage_from_stream_chunk(mid, usage)
+    assert usage.actual_prompt_eval_count is None
+
+    final = {
+        "choices": [{"delta": {}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+    }
+    context_budget.parse_usage_from_stream_chunk(final, usage)
+    assert usage.actual_prompt_eval_count == 100
+    assert usage.actual_eval_count == 50
+
+
 def test_parse_metrics_missing_fields_does_not_crash():
     usage = context_budget.ContextUsage()
-    context_budget.parse_usage_from_response({"response": "x"}, usage)
+    context_budget.parse_usage_from_response({"content": "x"}, usage)
     assert usage.actual_prompt_eval_count is None
     assert usage.actual_eval_count is None
     assert usage.prompt_tokens_per_second is None
     assert usage.output_tokens_per_second is None
 
 
-def test_parse_metrics_zero_duration_does_not_divide_by_zero():
+def test_parse_metrics_no_timings_skips_tps():
+    """llama-server 沒給 timings → tps 維持 None,但 token counts 仍要拿到。"""
     usage = context_budget.ContextUsage()
-    resp = {
-        "prompt_eval_count": 100,
-        "prompt_eval_duration": 0,
-        "eval_count": 50,
-        "eval_duration": 0,
-    }
+    resp = {"tokens_evaluated": 100, "tokens_predicted": 50}
     context_budget.parse_usage_from_response(resp, usage)
     assert usage.actual_prompt_eval_count == 100
     assert usage.actual_eval_count == 50

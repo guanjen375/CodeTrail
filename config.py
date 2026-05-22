@@ -3,6 +3,7 @@
 """
 智能程式碼分析器 - 設定檔
 """
+import json as _json
 import os as _os
 
 from model_resolution import (
@@ -11,35 +12,115 @@ from model_resolution import (
 )
 
 # ============================================================
-# Ollama 設定
+# llama.cpp llama-server 設定
 # ============================================================
-# 所有 Ollama API URL 都從這裡集中管理，方便切換遠端或改 port
-# 可用 AICODE_OLLAMA_BASE_URL 環境變數覆寫（測試 / 遠端 Ollama 用）
-OLLAMA_BASE_URL = _os.environ.get("AICODE_OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_GENERATE_URL = f"{OLLAMA_BASE_URL}/api/generate"
-OLLAMA_CHAT_URL = f"{OLLAMA_BASE_URL}/api/chat"
-OLLAMA_EMBEDDINGS_URL = f"{OLLAMA_BASE_URL}/api/embeddings"
-OLLAMA_TAGS_URL = f"{OLLAMA_BASE_URL}/api/tags"
-OLLAMA_PS_URL = f"{OLLAMA_BASE_URL}/api/ps"
+# 多 server 架構:每個角色一個 llama-server instance,各自綁不同 port。
+# 預設 port 排列:
+#     8080 主聊天 / 程式推導(--alias 對應 AICODE_MODEL)
+#     8081 embedding         (--embedding,通常掛 bge-m3)
+#     8082 reranker          (--reranking,通常掛 bge-reranker-v2-m3)
+#     8083 VL 多模態         (--mmproj,通常掛 qwen3-vl 或 llava 系列)
+# 任一 port 可用環境變數覆寫(testing / 遠端 server / port 衝突時用)。
+LLAMA_BASE_URL = _os.environ.get("AICODE_LLAMA_BASE_URL", "http://localhost:8080")
+LLAMA_EMBED_BASE_URL = _os.environ.get("AICODE_LLAMA_EMBED_BASE_URL", "http://localhost:8081")
+LLAMA_RERANK_BASE_URL = _os.environ.get("AICODE_LLAMA_RERANK_BASE_URL", "http://localhost:8082")
+LLAMA_VL_BASE_URL = _os.environ.get("AICODE_LLAMA_VL_BASE_URL", "http://localhost:8083")
+
+# Native + OpenAI-compat endpoints(集中管理,呼叫端不要硬寫路徑)。
+LLAMA_GENERATE_URL = f"{LLAMA_BASE_URL}/completion"
+LLAMA_CHAT_URL = f"{LLAMA_BASE_URL}/v1/chat/completions"
+LLAMA_PROPS_URL = f"{LLAMA_BASE_URL}/props"
+LLAMA_SLOTS_URL = f"{LLAMA_BASE_URL}/slots"
+LLAMA_HEALTH_URL = f"{LLAMA_BASE_URL}/health"
+LLAMA_EMBEDDINGS_URL = f"{LLAMA_EMBED_BASE_URL}/embedding"
+LLAMA_RERANK_URL = f"{LLAMA_RERANK_BASE_URL}/reranking"
+LLAMA_VL_URL = f"{LLAMA_VL_BASE_URL}/completion"
+
+
+# ============================================================
+# Model Registry:bare name → GGUF 絕對路徑
+# ============================================================
+# llama-server 啟動時要餵 GGUF 檔案路徑,使用者不會想在 env 裡塞絕對路徑。
+# 所以維護一份 bare-name → path 的映射,使用者只要 AICODE_MODEL=<name> 即可。
+# 來源(優先序):
+#   1. AICODE_MODEL_REGISTRY        — 直接放 JSON 字串
+#   2. AICODE_MODEL_REGISTRY_FILE   — 指向一個 JSON 檔
+#   3. ~/.config/codetrail/models.json
+# 三個都找不到 → 空 dict;此時 AICODE_MODEL 直接視為 GGUF 路徑。
+def _load_model_registry() -> dict[str, str]:
+    raw = (_os.environ.get("AICODE_MODEL_REGISTRY") or "").strip()
+    if raw:
+        try:
+            data = _json.loads(raw)
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+        except _json.JSONDecodeError:
+            pass
+
+    file_path = (_os.environ.get("AICODE_MODEL_REGISTRY_FILE") or "").strip()
+    if not file_path:
+        home = _os.environ.get("HOME") or _os.environ.get("USERPROFILE") or ""
+        if home:
+            candidate = _os.path.join(home, ".config", "codetrail", "models.json")
+            if _os.path.isfile(candidate):
+                file_path = candidate
+
+    if file_path:
+        try:
+            with open(_os.path.expanduser(file_path), "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+        except (OSError, _json.JSONDecodeError):
+            pass
+
+    return {}
+
+
+MODEL_REGISTRY: dict[str, str] = _load_model_registry()
+
+
+def resolve_model_path(name_or_path: str) -> str:
+    """把 bare model name 或 GGUF 路徑轉成可餵給 llama-server 的絕對路徑。
+
+    順序:
+      1. 完全空字串 → 回空
+      2. registry 有對應 → 回 registry 值(展開 ~)
+      3. 是現存檔案 → 直接回(展開 ~,轉絕對路徑)
+      4. 都不是 → 原樣回(讓呼叫端自己 fail-loud)
+    """
+    name = (name_or_path or "").strip()
+    if not name:
+        return ""
+    if name in MODEL_REGISTRY:
+        return _os.path.abspath(_os.path.expanduser(MODEL_REGISTRY[name]))
+    expanded = _os.path.expanduser(name)
+    if _os.path.isfile(expanded):
+        return _os.path.abspath(expanded)
+    return name
+
 
 # ============================================================
 # 主聊天 / 程式推導模型
 # ============================================================
 # 設計守則: CodeTrail 不內建、不推薦、不 fallback 任何固定主模型。
-# 使用者必須自己挑一顆 Ollama 模型,並透過下列任一方式告訴 CodeTrail:
+# 使用者必須自己挑一顆 GGUF 模型,並透過下列任一方式告訴 CodeTrail:
 #
 #   1. AICODE_MODEL=<MODEL>                 (環境變數,最優先)
-#   2. aicode -m <MODEL> / --model <MODEL>  (CLI 旗標,只接受 ollama/<MODEL> 或 bare Ollama name)
-#   3. OPENCODE_CONFIG or ~/.config/opencode/opencode.json
-#      ("model": "ollama/<MODEL>")
+#   2. aicode -m <MODEL> / --model <MODEL>  (CLI 旗標)
+#   3. OPENCODE_CONFIG or ~/.config/opencode/opencode.json ("model": "<MODEL>")
+#
+# <MODEL> 可以是:
+#   - registry 裡登記的 bare name(例如 "qwen3-coder-30b")
+#   - GGUF 絕對路徑(例如 "/models/qwen3-coder-30b-q4_k_m.gguf")
 #
 # 三個都找不到、或值是 placeholder (含 '<' / '>') 時, MODEL 為空字串;
 # 要實際呼叫 LLM 的呼叫端必須先用 require_main_model() 取值,沒設好就 fail-loud。
-# 注意: <CODE_MODEL>、<MODEL>、<程式推導模型> 這類佔位符會被當成「未設」。
 
-# embedding / reranker / VL 是 RAG / media 內部用的固定附屬模型, 跟主模型分開,
-# 預設值保留, 必要時各自用環境變數覆寫。
-VL_MODEL = _os.environ.get("AICODE_VL_MODEL", "qwen3-vl:30b-a3b")
+# embedding / reranker / VL 在 llama.cpp 架構下,model id 只是 informational
+# (server 啟動時就鎖死一顆 GGUF),這裡的常數主要用來寫 telemetry 與顯示。
+# 沿用舊名稱 EMBEDDING_MODEL / RERANKER_MODEL,因為下面 RAG 區段已經有 import。
+VL_MODEL = _os.environ.get("AICODE_VL_MODEL", "qwen3-vl")
 
 
 def _read_opencode_main_model() -> str:
@@ -57,7 +138,7 @@ def _read_opencode_main_model() -> str:
 def _resolve_main_model() -> str:
     """主模型來源優先順序: AICODE_MODEL > opencode.json `model` 欄位。
 
-    回傳 bare model name (沒有 `ollama/` prefix), 找不到時回空字串。
+    回傳 bare model name(可能是 registry key,可能是 GGUF 路徑),找不到時回空字串。
     `aicode` wrapper 會另外處理 `-m` / `--model` CLI 旗標 (在這裡看不到),
     它應該在啟動子行程前把 AICODE_MODEL 設好。
     """
@@ -77,25 +158,31 @@ def require_main_model() -> str:
         raise RuntimeError(
             "CodeTrail 找不到主聊天 / 程式推導模型 (CODE_MODEL)。"
             f"{detail}\n"
-            "請先選擇一顆 Ollama 模型 (例如 ollama pull <CODE_MODEL>),然後任選一種方式設定:\n"
-            "  1) export AICODE_MODEL=<CODE_MODEL>               (最優先)\n"
-            "  2) aicode -m ollama/<CODE_MODEL>                  (per-run CLI 旗標)\n"
-            "  3) 在 OPENCODE_CONFIG 或 ~/.config/opencode/opencode.json 設 \"model\": \"ollama/<CODE_MODEL>\"\n"
-            "<CODE_MODEL> 是佔位符,必須替換成實際模型名稱。\n"
+            "請先下載一顆 GGUF 模型(例如從 huggingface 抓 qwen3-coder-30b 的 q4_k_m),\n"
+            "啟動 llama-server 後,任選一種方式設定模型:\n"
+            "  1) export AICODE_MODEL=<MODEL>                    (最優先)\n"
+            "  2) aicode -m <MODEL>                              (per-run CLI 旗標)\n"
+            "  3) 在 ~/.config/opencode/opencode.json 設 \"model\": \"<MODEL>\"\n"
+            "<MODEL> 可以是 MODEL_REGISTRY 裡的 bare name 或 GGUF 絕對路徑。\n"
+            "Registry 維護在 ~/.config/codetrail/models.json,或用 AICODE_MODEL_REGISTRY env。\n"
             "CodeTrail 不會替你預設或推薦。"
         )
     return model
 
 
-def to_opencode_model_id(bare_model: str) -> str:
-    """把 bare Ollama model name 轉成 OpenCode 認得的 `ollama/<MODEL>` 形式。
-    已經是 `ollama/...` 就不重複加 prefix。
-    """
-    if not bare_model:
-        return ""
-    if bare_model.startswith("ollama/"):
-        return bare_model
-    return f"ollama/{bare_model}"
+def require_main_model_path() -> str:
+    """取主模型的 GGUF 絕對路徑(展開 registry / 檢查存在)。"""
+    name = require_main_model()
+    path = resolve_model_path(name)
+    if not _os.path.isfile(_os.path.expanduser(path)):
+        raise RuntimeError(
+            f"主模型 {name!r} 找不到對應的 GGUF 檔。\n"
+            f"  解析到: {path}\n"
+            f"  請確認:\n"
+            f"  1) GGUF 檔案存在於上述路徑,或\n"
+            f"  2) 在 ~/.config/codetrail/models.json 加入對應的 name→path 映射"
+        )
+    return path
 
 # Context 長度設定
 # - 5090 32GB + 192GB RAM: 可開 128K，VRAM 不足時自動 offload 到 RAM
@@ -130,9 +217,10 @@ CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
 # ============================================================
 # Context Budget / Hard Gate（P0：避免 silent truncation）
 # ============================================================
-# CodeTrail 自己呼叫 Ollama native /api/generate 與 /api/chat 時，
+# CodeTrail 自己呼叫 llama-server native /completion 與 /v1/chat/completions 時，
 # 必須在送出前估算 prompt token 數、保留輸出空間，並在超過硬上限時拒絕送出。
-# 這些設定只影響 CodeTrail internal LLM calls；OpenCode TUI 走 /v1，不在這裡管。
+# 這些設定只影響 CodeTrail internal LLM calls；OpenCode TUI 直接打 llama-server /v1
+# (透過 openai-compatible provider)，server 端的 -c (n_ctx) 才是它真正的上限。
 #
 # - AICODE_RESERVED_OUTPUT_TOKENS: 估算時保留給模型輸出的 token 數
 # - AICODE_CTX_SOFT_THRESHOLD: 使用率超過此值時輸出 WARN
@@ -286,8 +374,8 @@ KNOWLEDGE_INCLUDE_CONTENT = True
 KNOWLEDGE_CONTENT_MAX_CHARS = 2000
 KNOWLEDGE_MERGE_ADJACENT = True
 KNOWLEDGE_MERGE_MAX_CHARS = 2500
-EMBEDDING_MODEL = "bge-m3"
-RERANKER_MODEL = "qllama/bge-reranker-v2-m3"
+EMBEDDING_MODEL = _os.environ.get("AICODE_EMBED_MODEL", "bge-m3")
+RERANKER_MODEL = _os.environ.get("AICODE_RERANK_MODEL", "bge-reranker-v2-m3")
 USE_RERANKER = True
 USE_HYBRID_SEARCH = True
 USE_QUERY_EXPANSION = True

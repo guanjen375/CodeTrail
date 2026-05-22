@@ -132,23 +132,24 @@ if [ -z "$PYBIN" ]; then
 fi
 
 # 主模型解析:env > -m/--model arg > OPENCODE_CONFIG / ~/.config/opencode/opencode.json。
-# 三個都找不到、是 placeholder、或被指到非 Ollama provider 時, resolve_main_model.py
-# 會印 fail-loud 訊息到 stderr 並 exit 2。CodeTrail 不內建 / 不 fallback 任何
-# 預設主模型 — 使用者必須先選一顆 Ollama 模型。
+# 三個都找不到、是 placeholder、或被指到外部 provider (openai/、ollama/ 等) 時,
+# resolve_main_model.py 會印 fail-loud 訊息到 stderr 並 exit 2。CodeTrail 不內建 /
+# 不 fallback 任何預設主模型 — 使用者必須先下載一顆 GGUF 並啟動 llama-server。
 if ! RESOLVED_MAIN_MODEL="$("$PYBIN" "$CODETRAIL_HOME/scripts/resolve_main_model.py" "$@")"; then
   exit 2
 fi
-# resolve_main_model.py 已經剝掉 `ollama/` prefix, 這裡拿到的是 bare model name。
-# 把它寫回 AICODE_MODEL, 讓 ctx_safety_check / mcp_server / 子行程拿到同一顆。
+# resolve_main_model.py 已經 strip 掉 custom provider prefix, 這裡拿到的是 bare
+# model name (或 GGUF 路徑)。把它寫回 AICODE_MODEL, 讓 ctx_safety_check /
+# mcp_server / 子行程拿到同一顆。
 export AICODE_MODEL="$RESOLVED_MAIN_MODEL"
 
-# Predict VRAM offload BEFORE we exec opencode. ctx_safety_check.py exits 2
-# when the requested ctx cap (AICODE_DYNAMIC_NUM_CTX_MAX, default 65536) won't
-# fit alongside model weights on the visible GPU. It prints concrete remedies
-# (lower the cap, or AICODE_ACCEPT_CTX_RISK=1) so this is fail-loud — we don't
-# silently clamp anything. UNKNOWN cases (no nvidia-smi, remote Ollama,
-# unfamiliar model arch) exit 0 with a warning, so this won't block CI or
-# remote-GPU setups.
+# Verify main llama-server's actual n_ctx is big enough for our budget BEFORE
+# we exec opencode. ctx_safety_check.py reads /props from the server (8080 by
+# default) and exits 2 if requested ctx (AICODE_DYNAMIC_NUM_CTX_MAX, default
+# 65536) > server n_ctx. It prints concrete remedies (lower the cap, restart
+# server with bigger -c, AICODE_ACCEPT_CTX_RISK=1) so this is fail-loud — we
+# don't silently truncate. UNKNOWN cases (server not started, remote server
+# unreachable) exit 0 with a warning, so this won't block CI or remote setups.
 if [ -f "$CODETRAIL_HOME/scripts/ctx_safety_check.py" ]; then
   if ! "$PYBIN" "$CODETRAIL_HOME/scripts/ctx_safety_check.py"; then
     echo "[aicode] ctx safety check refused to start (see [ctx-safety] above)." >&2
@@ -160,11 +161,11 @@ export AICODE_ROOT="$ROOT"
 echo "[aicode] AICODE_ROOT=$AICODE_ROOT"
 
 # Surface the two-context-pipeline distinction so users know which knob
-# controls what. AICODE_NUM_CTX only affects CodeTrail-internal Ollama
-# native /api/chat | /api/generate calls (agent loop, RAG-related prompts).
-# OpenCode TUI uses Ollama /v1 (OpenAI-compatible), whose effective context
-# is determined by Ollama's OLLAMA_CONTEXT_LENGTH server setting + the
-# OpenCode model limit.context value — neither of which AICODE_NUM_CTX
+# controls what. AICODE_DYNAMIC_NUM_CTX_MAX only affects CodeTrail-internal
+# llama-server calls (agent loop, RAG-related prompts, embedding, reranker).
+# OpenCode TUI uses /v1/chat/completions against the same main llama-server,
+# whose effective context is determined by the server's `-c <N>` flag + the
+# OpenCode model limit.context value — neither of which AICODE_DYNAMIC_NUM_CTX_MAX
 # can override.
 echo "[aicode] AICODE_MODEL=${AICODE_MODEL}"
 if [ -n "${AICODE_NUM_CTX:-}" ]; then
@@ -176,32 +177,33 @@ fi
 if [ -n "${AICODE_RESERVED_OUTPUT_TOKENS:-}" ]; then
   echo "[aicode] AICODE_RESERVED_OUTPUT_TOKENS=${AICODE_RESERVED_OUTPUT_TOKENS}"
 fi
-if [ -n "${OLLAMA_CONTEXT_LENGTH:-}" ]; then
-  echo "[aicode] OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH} (server-side, affects OpenCode TUI /v1)"
+if [ -n "${AICODE_LLAMA_BASE_URL:-}" ]; then
+  echo "[aicode] AICODE_LLAMA_BASE_URL=${AICODE_LLAMA_BASE_URL} (主 LLM server)"
 fi
-echo "[aicode] NOTE: 要調 CodeTrail native Ollama call 的 per-call ctx 上限,改 AICODE_DYNAMIC_NUM_CTX_MAX。"
-echo "         OpenCode TUI 走 /v1,context 由 model limit.context + OLLAMA_CONTEXT_LENGTH 決定。"
-echo "         Check loaded model size/ctx with: ollama ps"
+echo "[aicode] NOTE: 要調 per-call ctx 上限,改 AICODE_DYNAMIC_NUM_CTX_MAX (受 server -c 限制)。"
+echo "         llama-server 啟動時 -c <N> 是真實 ctx 上限,改了要重啟 server。"
+echo "         Check loaded model with: curl -s \${AICODE_LLAMA_BASE_URL:-http://localhost:8080}/props"
 echo "         CodeTrail context overflow attempts are logged to .codetrail/context_metrics.jsonl"
 
-# Pitfall warning: /models in TUI silently desyncs from MCP server's background
-# model. There's no MCP hook to propagate the switch, so RAG/strict tools keep
-# using AICODE_MODEL while the conversation uses something else — Ollama ends
-# up swapping two models in/out of VRAM, latency spikes, and the user has no
-# idea why. Surface this once at launch so non-experts don't fall into it.
-echo "[aicode] TIP: 換模型請退出後改 AICODE_MODEL 再重新啟動 aicode。"
-echo "         在 TUI 內按 /models 只會換對話那顆,背景 RAG / query_knowledge_strict"
-echo "         仍會用 AICODE_MODEL=${AICODE_MODEL},兩邊不會自動同步。"
+# Pitfall warning: /models in TUI 跟 CodeTrail MCP 的 AICODE_MODEL 是兩條獨立
+# 設定。換模型靠重啟 server (load 新 GGUF) + 重啟 aicode wrapper。
+echo "[aicode] TIP: 換模型請先停掉 llama-server, 換 GGUF 重啟, 再改 AICODE_MODEL 重啟 aicode。"
+echo "         在 TUI 內按 /models 只會切 OpenCode 那邊的 model id,不會 reload server,"
+echo "         也不會通知 CodeTrail MCP — 兩邊不同步會錯亂。"
 
 # Point new users at the health check so they don't have to discover it via README.
 echo "[aicode] TIP: 設定有疑慮時可跑 \`AICODE_MODEL=${AICODE_MODEL} python scripts/doctor.py\` 做健檢。"
 
-# 把解析後的 bare AICODE_MODEL 轉成 OpenCode 認得的 ollama/<MODEL> 形式。
-# 使用者若已傳 -m / --model, 也要重寫成同一個 normalized provider id,
-# 避免 MCP server 用 AICODE_MODEL, 但 OpenCode TUI 收到 bare model 而不同步。
-OC_MODEL="ollama/$AICODE_MODEL"
+# OpenCode 那邊吃 <custom-provider>/<model> 形式的 model id (provider 名由使用者
+# 在 opencode.json 自己取)。CodeTrail wrapper 沒辦法 / 也不該替使用者決定 provider
+# 取名是什麼,所以這裡:
+#   - 若使用者傳了 -m / --model:原樣轉發給 opencode (使用者負責格式正確)
+#   - 若沒傳:不主動加 --model;讓 opencode 自己讀 opencode.json 的 "model" 欄位
+# AICODE_MODEL (bare name) 仍用於 CodeTrail MCP 本體, 跟 OpenCode TUI 顯示的
+# 可能形式不同但語意一致 (provider/ 後面那段)。
 OPENCODE_ARGS=()
 USER_PASSED_MODEL=0
+USER_MODEL_VALUE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -m|--model)
@@ -211,25 +213,30 @@ while [ "$#" -gt 0 ]; do
         echo "[aicode] $flag requires a model value." >&2
         exit 2
       fi
-      OPENCODE_ARGS+=("$flag" "$OC_MODEL")
+      USER_MODEL_VALUE="$2"
+      OPENCODE_ARGS+=("$flag" "$2")
       shift 2
       ;;
     -m=*)
       USER_PASSED_MODEL=1
-      if [ -z "${1#-m=}" ]; then
+      val="${1#-m=}"
+      if [ -z "$val" ]; then
         echo "[aicode] -m requires a model value." >&2
         exit 2
       fi
-      OPENCODE_ARGS+=("-m=$OC_MODEL")
+      USER_MODEL_VALUE="$val"
+      OPENCODE_ARGS+=("$1")
       shift
       ;;
     --model=*)
       USER_PASSED_MODEL=1
-      if [ -z "${1#--model=}" ]; then
+      val="${1#--model=}"
+      if [ -z "$val" ]; then
         echo "[aicode] --model requires a model value." >&2
         exit 2
       fi
-      OPENCODE_ARGS+=("--model=$OC_MODEL")
+      USER_MODEL_VALUE="$val"
+      OPENCODE_ARGS+=("$1")
       shift
       ;;
     *)
@@ -239,9 +246,11 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ "$USER_PASSED_MODEL" -eq 0 ]; then
-  OPENCODE_ARGS=(--model "$OC_MODEL" "${OPENCODE_ARGS[@]}")
+if [ "$USER_PASSED_MODEL" -eq 1 ]; then
+  echo "[aicode] OpenCode --model=$USER_MODEL_VALUE (使用者傳入,原樣轉發)"
+else
+  echo "[aicode] 沒有 -m;OpenCode 將自己讀 opencode.json 的 \"model\" 欄位。"
+  echo "         若你要明確指定 provider,請用 -m <provider>/<model> 或在 opencode.json 設好。"
 fi
-echo "[aicode] OpenCode --model=$OC_MODEL"
 
 exec opencode "${OPENCODE_ARGS[@]}"

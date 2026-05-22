@@ -14,7 +14,7 @@
 AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
 ```
 
-`<CODE_MODEL>` 是佔位符，必須替換成實際 Ollama tag；如果你已經在 OpenCode JSON 設好同一顆模型，doctor 也能從設定檔解析。`FAIL` 要先處理；`WARN` 可以依訊息判斷是否需要調整。接著切到要分析的專案根目錄：
+`<CODE_MODEL>` 是佔位符,必須替換成 MODEL_REGISTRY 裡登記的 bare name 或 GGUF 絕對路徑;如果你已經在 OpenCode JSON 設好同一顆模型,doctor 也能從設定檔解析。`FAIL` 要先處理;`WARN` 可以依訊息判斷是否需要調整。接著切到要分析的專案根目錄:
 
 ```bash
 cd <PROJECT_TO_ANALYZE>

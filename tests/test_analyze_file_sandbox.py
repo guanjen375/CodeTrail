@@ -18,14 +18,14 @@ import pytest
 def mcp_module(monkeypatch, tmp_path: Path):
     """以 tmp_path 當 AICODE_ROOT 重新 import mcp_server,避免污染全域狀態。
 
-    必要 env: AICODE_ROOT(指 tmp_path)、AICODE_OLLAMA_BASE_URL(指 closed port,
-    確保 KB / CodeRAG 初始化不會卡 Ollama)。
+    必要 env: AICODE_ROOT(指 tmp_path)、AICODE_LLAMA_BASE_URL(指 closed port,
+    確保 KB / CodeRAG 初始化不會卡 llama-server)。
     """
     pytest.importorskip("mcp", reason="mcp 套件未安裝;OpenCode + MCP 路線才需要")
 
     monkeypatch.setenv("AICODE_ROOT", str(tmp_path))
     monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")
-    monkeypatch.setenv("AICODE_OLLAMA_BASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("AICODE_LLAMA_BASE_URL", "http://127.0.0.1:65535")
     # 避免無關設定干擾啟動 log
     monkeypatch.setenv("AI_CODE_PATCH", "")
     monkeypatch.setenv("AI_CODE_RUN_TESTS", "")

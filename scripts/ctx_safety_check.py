@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""啟動前的 ctx 安全閘:預測「目前模型 + 目前 GPU + 要求的 ctx 上限」
-會不會逼 Ollama 把 model offload 到 CPU。
+"""啟動前的 ctx 安全閘:讀 llama-server 真實 n_ctx,跟使用者要求的 dynamic
+ctx 上限比對。requested > server n_ctx → UNSAFE。
 
 呼叫方式 (aicode wrapper 用):
     python3 scripts/ctx_safety_check.py
 
 讀取的環境變數:
-    AICODE_MODEL                  必填;aicode wrapper 會用 resolve_main_model.py 解析
-                                  好以後再 export。沒設 → 直接 fail-loud, CodeTrail
-                                  不假定任何預設主模型。
+    AICODE_MODEL                  必填;aicode wrapper 會用 resolve_main_model.py
+                                  解析好以後再 export。沒設 → 直接 fail-loud,
+                                  CodeTrail 不假定任何預設主模型。
     AICODE_DYNAMIC_NUM_CTX_MAX    要檢查的 ctx 上限;預設 65536 (跟 config.py 同)
-    AICODE_OLLAMA_BASE_URL        Ollama URL;預設 http://localhost:11434
-    AICODE_ACCEPT_CTX_RISK        =1 時即使預測 UNSAFE 也 exit 0 (使用者覆蓋)
+    AICODE_LLAMA_BASE_URL         主 llama-server URL;預設 http://localhost:8080
+    AICODE_ACCEPT_CTX_RISK        =1 時即使 UNSAFE 也 exit 0 (使用者覆蓋)
     AICODE_CTX_SAFETY_DISABLE     =1 時整個檢查跳過 (除錯 / 緊急逃生)
 
 退出碼:
@@ -21,8 +21,8 @@
 
 設計守則:
 - fail-loud:UNSAFE / 模型未設一定明確 print 出來,不偷偷 clamp / fallback。
-- UNKNOWN (拿不到 GPU / Ollama / metadata) 一律放行,只 warn — 不能因為
-  CI 環境或遠端 Ollama 沒辦法估算就 block 使用者。
+- UNKNOWN (server 未啟動 / 拿不到 /props) 一律放行,只 warn — 不能因為 CI 環境
+  或遠端 server 沒辦法觀測就 block 使用者。
 - 給可複製貼上的 export 指令,方便使用者一行修好。
 """
 from __future__ import annotations
@@ -39,9 +39,6 @@ import gpu_safety  # noqa: E402
 from model_resolution import normalize_main_model  # noqa: E402
 
 
-# 跟 config.py 的 DYNAMIC_NUM_CTX_MAX 預設保持一致。這個啟動前檢查刻意不
-# import config: config.py 會 parse 多個 env var, 任一使用者填錯都可能讓這個
-# safety gate 在印出可讀訊息前先爆掉。
 DEFAULT_CTX_MAX = 65536
 
 
@@ -62,17 +59,16 @@ def main() -> int:
     model_res = normalize_main_model(os.environ.get("AICODE_MODEL", ""), "AICODE_MODEL")
     model = model_res.model
     if not model:
-        _print("AICODE_MODEL 未設或無效 (例如 <CODE_MODEL> placeholder / 非 Ollama provider)。")
+        _print("AICODE_MODEL 未設或無效 (例如 <MODEL> placeholder / provider prefix)。")
         if model_res.error:
             _print(f"        {model_res.error}")
         _print("        CodeTrail 不內建預設主模型, 無法做 ctx 安全檢查。")
-        _print("        請先 ollama pull 一顆 Ollama 模型, 然後設定:")
-        _print("          export AICODE_MODEL=<CODE_MODEL>")
+        _print("        請啟動 llama-server (建議 port 8080) 並設定:")
+        _print("          export AICODE_MODEL=<MODEL>  # registry name 或 GGUF 路徑")
         _print("        或透過 aicode wrapper 自動解析 (aicode 會讀 opencode.json 主模型)。")
         _print("        若刻意要跳過檢查 (例如 CI), 設 AICODE_CTX_SAFETY_DISABLE=1。")
         _print("refuse to start.")
         return 2
-    # 已通過 placeholder 檢查, 後續邏輯不需要再判定 model 是否為空。
 
     try:
         requested = int(os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX", "") or DEFAULT_CTX_MAX)
@@ -83,46 +79,42 @@ def main() -> int:
         )
         return 0
 
-    base_url = os.environ.get("AICODE_OLLAMA_BASE_URL", "http://localhost:11434")
+    base_url = os.environ.get("AICODE_LLAMA_BASE_URL", "http://localhost:8080")
     accept_risk = os.environ.get("AICODE_ACCEPT_CTX_RISK", "").lower() in ("1", "true", "yes")
 
-    verdict = gpu_safety.check_safety(model, requested, base_url=base_url)
+    verdict = gpu_safety.check_safety(requested, base_url=base_url)
 
     if verdict.status == "SAFE":
         _print(
-            f"SAFE: model={model} ctx={requested}"
-            f" (safe cap≈{verdict.computed_max_ctx},"
-            f" est need={verdict.vram_needed_gb:.1f}GB"
-            f" / total={verdict.vram_total_gb:.1f}GB)"
+            f"SAFE: model={model} requested_ctx={requested}"
+            f" <= server n_ctx={verdict.server_n_ctx}"
         )
         return 0
 
     if verdict.status == "UNKNOWN":
         _print(f"UNKNOWN: {verdict.reason}")
-        _print("        無法判定 — 放行繼續。若真的 offload 請參考 ollama ps")
+        _print(f"        無法判定 — 放行繼續。先用 `curl -s {base_url}/health` 確認 server 可連。")
         return 0
 
     # UNSAFE
-    _print(f"UNSAFE: model={model} ctx={requested}")
+    _print(f"UNSAFE: model={model} requested_ctx={requested}")
     _print(f"        {verdict.reason}")
     _print_block("        ", verdict.detail_lines)
     _print("")
     _print("        建議任一處理:")
-    if verdict.computed_max_ctx and verdict.computed_max_ctx > 0:
-        # 給可貼上的指令;對齊到 1024,且不超過估算 safe cap
-        suggested = (verdict.computed_max_ctx // 1024) * 1024
-        _print(f"          (a) export AICODE_DYNAMIC_NUM_CTX_MAX={suggested}")
+    if verdict.server_n_ctx and verdict.server_n_ctx > 0:
+        suggested = (verdict.server_n_ctx // 1024) * 1024
+        _print(f"          (a) export AICODE_DYNAMIC_NUM_CTX_MAX={suggested}  (對齊 server n_ctx)")
+        _print(f"          (b) 重啟 llama-server 並提高 `-c {requested}` (確認 VRAM 夠)")
     else:
-        _print(
-            "          (a) 換成較小的 <CODE_MODEL>"
-            " — 這台 GPU 連此模型 weights 都裝不下"
-        )
-    _print("          (b) export AICODE_ACCEPT_CTX_RISK=1 (我知道會 offload,還是要跑)")
-    _print("          (c) export AICODE_CTX_SAFETY_DISABLE=1 (永久關閉此檢查)")
+        _print(f"          (a) export AICODE_DYNAMIC_NUM_CTX_MAX=<較小值>")
+        _print(f"          (b) 重啟 llama-server 並調整 `-c <N>` 對應期望 ctx")
+    _print("          (c) export AICODE_ACCEPT_CTX_RISK=1 (我知道會 truncate,還是要跑)")
+    _print("          (d) export AICODE_CTX_SAFETY_DISABLE=1 (永久關閉此檢查)")
     _print("")
 
     if accept_risk:
-        _print("AICODE_ACCEPT_CTX_RISK=1 已設 — 放行,但預期會 offload")
+        _print("AICODE_ACCEPT_CTX_RISK=1 已設 — 放行,但 prompt 超過 server ctx 會被 truncate")
         return 0
 
     _print("refuse to start.")

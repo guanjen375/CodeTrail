@@ -10,13 +10,12 @@ import re
 import fnmatch
 from pathlib import Path
 
-from http_client import get_session
-
 import config
 import context_budget
+import llama_client
 
 from config import (
-    OLLAMA_GENERATE_URL, OLLAMA_TAGS_URL, OLLAMA_PS_URL,
+    LLAMA_BASE_URL,
     NUM_CTX, NUM_CTX_FULL_MODE,
     CODE_EXTENSIONS, IGNORED_DIRS, IGNORED_FILES, IGNORED_PATTERNS,
     LOW_PRIORITY_PATTERNS, ALLOWED_DOT_DIRS,
@@ -80,44 +79,32 @@ def set_scan_cache(folder: str, files: list[dict]):
     }
 
 
-def check_ollama_gpu() -> tuple[bool, str]:
-    """檢查 Ollama GPU 狀態"""
+def check_llama_server() -> tuple[bool, str]:
+    """檢查主 llama-server 是否 ready,並回報 slot / ctx 狀態。"""
     try:
-        session = get_session()
-        resp = session.get(OLLAMA_TAGS_URL, timeout=5)
-        if resp.status_code != 200:
-            return False, "[ERROR] Ollama 服務異常"
+        if not llama_client.is_ready(LLAMA_BASE_URL):
+            return False, "[ERROR] llama-server 主端 (8080) 未 ready"
 
-        resp = session.get(OLLAMA_PS_URL, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            models = data.get("models", [])
+        props = llama_client.get_props(LLAMA_BASE_URL)
+        slots = llama_client.get_slots(LLAMA_BASE_URL)
 
-            if not models:
-                return True, "[GPU] 待載入模型"
+        name = ""
+        if isinstance(props, dict):
+            model_path = props.get("model_path") or ""
+            name = os.path.basename(str(model_path)) or "?"
 
-            for model in models:
-                size_vram = model.get("size_vram", 0)
-                size = model.get("size", 0)
-                name = model.get("name", "?")
+        if isinstance(slots, list) and slots:
+            n_ctx = slots[0].get("n_ctx") or 0
+            state = slots[0].get("state")
+            return True, f"[LLAMA] {name} n_ctx={n_ctx} slot_state={state}"
 
-                if size_vram > 0:
-                    vram_gb = size_vram / (1024**3)
-                    gpu_percent = (size_vram / size * 100) if size > 0 else 100
-                    if gpu_percent >= 99:
-                        return True, f"[GPU] {name} 使用 {vram_gb:.1f}GB VRAM"
-                    else:
-                        return True, f"[GPU] {name} 使用 {vram_gb:.1f}GB VRAM ({gpu_percent:.0f}% GPU)"
-
-            return True, "[GPU] OK"
-
-        return True, "[GPU] 狀態查詢失敗"
+        return True, f"[LLAMA] {name} ready"
 
     except Exception as e:
         err_type = type(e).__name__
         if "ConnectionError" in err_type:
-            return False, "[ERROR] 無法連接 Ollama"
-        return False, f"[WARN] GPU 檢測失敗: {err_type}"
+            return False, f"[ERROR] 無法連接 llama-server ({LLAMA_BASE_URL})"
+        return False, f"[WARN] llama-server 檢測失敗: {err_type}"
 
 
 def should_ignore_dir(path: Path) -> bool:
@@ -345,18 +332,17 @@ def print_ctx_usage(chars: int) -> bool:
 
 def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None,
              source: str = "generate") -> str:
-    """呼叫 LLM 生成回應
+    """呼叫主 LLM 生成回應(non-stream,走 llama-server /completion)。
 
     Args:
         prompt: 提示詞
         temperature: 溫度參數
-        num_ctx: Context 長度，預設使用 NUM_CTX
+        num_ctx: Context 預算(只用於 budget 計算;llama-server 真實 ctx 在啟動時固定)
         source: 標記呼叫來源（寫入 telemetry，純 metadata）
     """
     ctx = num_ctx if num_ctx is not None else NUM_CTX
     model = config.require_main_model()
 
-    # Context gate：先估算 token、做硬性 gate、紀錄 metadata
     try:
         usage = context_budget.check_and_log(
             source=source,
@@ -368,19 +354,17 @@ def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None,
         return str(exc)
 
     try:
-        session = get_session()
-        resp = session.post(OLLAMA_GENERATE_URL, json={
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"num_ctx": ctx, "temperature": temperature},
-        }, timeout=600)
-        resp.raise_for_status()
-        data = resp.json()
+        data = llama_client.native_completion(
+            base_url=LLAMA_BASE_URL,
+            prompt=prompt,
+            temperature=temperature,
+            stream=False,
+            timeout=600,
+        )
         context_budget.parse_usage_from_response(data, usage)
         context_budget.emit_post_call_line(usage)
         context_budget.log_metrics(usage)
-        return data.get("response", "")
+        return data.get("content", data.get("response", ""))
     except Exception as e:
         usage.error_type = type(e).__name__
         context_budget.log_metrics(usage)
@@ -392,50 +376,47 @@ def _llm_error_message(e: Exception, model: str) -> str:
 
     呼叫端拿到的字串都以 '[ERROR]' 開頭，方便上層 detect 與 propagate。
     """
-    from config import OLLAMA_BASE_URL
     err_type = type(e).__name__
     if "ConnectionError" in err_type or "ConnectionRefused" in err_type:
         return (
-            f"[ERROR] 無法連接 Ollama ({OLLAMA_BASE_URL})。\n"
-            "   1. ollama serve 是否正在執行？(Linux: systemctl --user status ollama)\n"
-            "   2. 防火牆 / port 是否被擋？\n"
-            "   3. config.py 的 OLLAMA_BASE_URL 或環境變數 AICODE_OLLAMA_BASE_URL 是否正確？\n"
-            f"   可先執行: curl -s {OLLAMA_BASE_URL}/api/tags"
+            f"[ERROR] 無法連接 llama-server ({LLAMA_BASE_URL})。\n"
+            f"   1. 主 llama-server 是否啟動?(預期 port 8080)\n"
+            f"   2. 防火牆 / port 是否被擋?\n"
+            f"   3. AICODE_LLAMA_BASE_URL 環境變數是否正確?\n"
+            f"   可先執行: curl -s {LLAMA_BASE_URL}/health"
         )
     if "Timeout" in err_type or "ReadTimeout" in err_type:
         return (
-            "[ERROR] Ollama 請求超時。\n"
-            "   首次載入 30B 模型可能要 10–30 秒；若仍持續，模型可能太大、VRAM 不夠或 server 卡住。\n"
-            "   檢查: ollama ps  /  nvidia-smi"
+            "[ERROR] llama-server 請求超時。\n"
+            "   首次冷載入大模型可能要數十秒;若仍持續,可能模型太大、VRAM 不夠或 server 卡住。\n"
+            f"   檢查: curl -s {LLAMA_BASE_URL}/health  /  nvidia-smi"
         )
     if "HTTPError" in err_type or "404" in str(e):
         return (
-            f"[ERROR] Ollama 回 HTTP 錯誤: {e}\n"
-            f"   常見原因：模型 {model!r} 沒有 pull。\n"
-            f"   檢查: ollama list  /  必要時 ollama pull {model}"
+            f"[ERROR] llama-server 回 HTTP 錯誤: {e}\n"
+            f"   常見原因:server 未掛載對應模型 {model!r}。\n"
+            f"   檢查: 啟動 server 時 -m / --model 是否指對 GGUF 檔。"
         )
     return f"[ERROR] LLM 呼叫失敗 ({err_type}): {e}"
 
 
 def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
                     source: str = "generate_stream") -> str:
-    """呼叫 LLM 生成回應（串流輸出，批次顯示）
+    """呼叫主 LLM(stream,走 llama-server /completion SSE)。
 
     改進：批次輸出減少 I/O 開銷，每累積一定字數或遇到換行時才 flush
 
     Args:
         prompt: 提示詞
         temperature: 溫度參數
-        num_ctx: Context 長度，預設使用 NUM_CTX
+        num_ctx: Context 預算(只用於 budget 計算)
         source: 標記呼叫來源（寫入 telemetry，純 metadata）
     """
-    import json as json_module
     import time
 
     ctx = num_ctx if num_ctx is not None else NUM_CTX
     model = config.require_main_model()
 
-    # Context gate：超過 hard threshold 直接拒絕，不送 prompt 給 Ollama
     try:
         usage = context_budget.check_and_log(
             source=source,
@@ -444,7 +425,6 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
             model=model,
         )
     except context_budget.ContextOverflowError as exc:
-        # 與其他 error 一樣，在 stderr 印出讓使用者看到
         msg = str(exc)
         try:
             print(msg, file=sys.stderr, flush=True)
@@ -453,57 +433,47 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
         return msg
 
     try:
-        session = get_session()
-        resp = session.post(OLLAMA_GENERATE_URL, json={
-            "model": model,
-            "prompt": prompt,
-            "stream": True,
-            "options": {"num_ctx": ctx, "temperature": temperature},
-        }, timeout=600, stream=True)
-        resp.raise_for_status()
+        stream = llama_client.native_completion(
+            base_url=LLAMA_BASE_URL,
+            prompt=prompt,
+            temperature=temperature,
+            stream=True,
+            timeout=600,
+        )
 
         full_response = []
         buffer = []
         buffer_chars = 0
         last_flush = time.time()
-        BATCH_SIZE = 20  # 累積 20 字元或 100ms 後 flush
-        FLUSH_INTERVAL = 0.1  # 100ms
+        BATCH_SIZE = 20
+        FLUSH_INTERVAL = 0.1
 
-        for line in resp.iter_lines():
-            if line:
-                try:
-                    chunk = json_module.loads(line)
-                    token = chunk.get("response", "")
-                    if token:
-                        full_response.append(token)
-                        buffer.append(token)
-                        buffer_chars += len(token)
+        for chunk in stream:
+            token = chunk.get("content", "")
+            if token:
+                full_response.append(token)
+                buffer.append(token)
+                buffer_chars += len(token)
 
-                        # 遇到換行、累積足夠字數、或超時則 flush
-                        now = time.time()
-                        should_flush = (
-                            '\n' in token or
-                            buffer_chars >= BATCH_SIZE or
-                            (now - last_flush) >= FLUSH_INTERVAL
-                        )
+                now = time.time()
+                should_flush = (
+                    '\n' in token or
+                    buffer_chars >= BATCH_SIZE or
+                    (now - last_flush) >= FLUSH_INTERVAL
+                )
 
-                        if should_flush and buffer:
-                            print(''.join(buffer), end="", flush=True)
-                            buffer = []
-                            buffer_chars = 0
-                            last_flush = now
+                if should_flush and buffer:
+                    print(''.join(buffer), end="", flush=True)
+                    buffer = []
+                    buffer_chars = 0
+                    last_flush = now
 
-                    # Final chunk usually carries prompt_eval_count/eval_count
-                    context_budget.parse_usage_from_stream_chunk(chunk, usage)
+            context_budget.parse_usage_from_stream_chunk(chunk, usage)
 
-                except json_module.JSONDecodeError:
-                    pass
-
-        # 輸出剩餘的 buffer
         if buffer:
             print(''.join(buffer), end="", flush=True)
 
-        print()  # 換行
+        print()
         context_budget.emit_post_call_line(usage)
         context_budget.log_metrics(usage)
         return "".join(full_response)
@@ -512,8 +482,6 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
         usage.error_type = type(e).__name__
         context_budget.log_metrics(usage)
         msg = _llm_error_message(e, model)
-        # 串流模式下要主動 print，否則使用者看不到：等於是「卡住」的觀感。
-        # 用 stderr 避免污染呼叫端可能要 capture 的 stdout 內容。
         try:
             print(msg, file=sys.stderr, flush=True)
         except Exception:

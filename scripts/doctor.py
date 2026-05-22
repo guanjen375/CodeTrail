@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""ai_code 安裝 / 啟動前自檢工具（preflight）。
+"""CodeTrail 安裝 / 啟動前自檢工具(preflight)。
 
-一次跑完就知道：Python 版本對不對、必要套件裝了沒、Ollama 通不通、
-模型 pull 了沒、AICODE_ROOT 安不安全、OpenCode/MCP 入口都在不在、KB 有沒有資料。
+一次跑完就知道：Python 版本對不對、必要套件裝了沒、llama-server 通不通、
+模型 GGUF 路徑對不對、AICODE_ROOT 安不安全、OpenCode / MCP 入口都在不在、KB 有沒有資料。
 
 使用：
-    AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py                       # 全檢
-    AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py --project /path/proj  # 把 /path/proj 當 AICODE_ROOT 檢查
-    AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py --no-network          # 跳過 Ollama 線上檢查（CI 用）
+    AICODE_MODEL=<MODEL> python scripts/doctor.py                       # 全檢
+    AICODE_MODEL=<MODEL> python scripts/doctor.py --project /path/proj  # 把 /path/proj 當 AICODE_ROOT 檢查
+    AICODE_MODEL=<MODEL> python scripts/doctor.py --no-network          # 跳過 llama-server 線上檢查（CI 用）
 
-退出碼：
+退出碼:
     0 = 全 PASS / 只有 WARN
     1 = 有 FAIL（無法正常使用）
 """
@@ -26,7 +26,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# 確保能 import config.py（doctor 不依賴 ai_code 其他重模組）
+# 確保能 import config.py（doctor 不依賴 CodeTrail 其他重模組）
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -115,116 +115,147 @@ def _read_config():
         return e
 
 
-def check_ollama(r: Result, no_network: bool) -> set[str] | None:
-    """回傳 ollama 上現有的模型 tag set；無法連線時回 None。"""
+# ============================================================
+# llama-server 健康檢查 (4 個 port 各自)
+# ============================================================
+_LLAMA_SERVERS = [
+    ("LLAMA_BASE_URL",       "main",      True),   # 主聊天/程式推導 — 必要
+    ("LLAMA_EMBED_BASE_URL", "embedding", True),   # embedding — 必要(RAG / KB 都吃)
+    ("LLAMA_RERANK_BASE_URL","reranker",  False),  # reranker — 選用
+    ("LLAMA_VL_BASE_URL",    "VL",        False),  # 視覺 — 選用
+]
+
+
+def check_llama_servers(r: Result, no_network: bool) -> dict[str, dict]:
+    """各 port 連線狀態,回傳 {role: {url, props, slots}} 給 check_models 用。"""
     cfg = _read_config()
     if isinstance(cfg, Exception):
         r.fail(f"無法 import config.py: {cfg}")
-        return None
+        return {}
 
-    base_url = getattr(cfg, "OLLAMA_BASE_URL", "http://localhost:11434")
+    status: dict[str, dict] = {}
     if no_network:
-        r.info(f"Ollama 線上檢查跳過 (--no-network)；目標 URL: {base_url}")
-        return None
+        for attr, role, _ in _LLAMA_SERVERS:
+            r.info(f"llama-server {role}={getattr(cfg, attr, '?')} (--no-network skip)")
+        return status
 
     try:
-        import requests  # noqa: F401
-    except ImportError:
-        r.warn("requests 未安裝，跳過 Ollama 連線檢查")
-        return None
+        import llama_client  # noqa: F401
+    except ImportError as exc:
+        r.fail(f"無法 import llama_client: {exc}")
+        return {}
 
-    import requests
-    try:
-        resp = requests.get(f"{base_url}/api/tags", timeout=3)
-        resp.raise_for_status()
-    except Exception as e:
-        r.fail(
-            f"Ollama 不可連 ({base_url}) — {type(e).__name__}: {e}\n"
-            "        請先執行: ollama serve"
-        )
-        return None
+    import llama_client
+    for attr, role, required in _LLAMA_SERVERS:
+        url = getattr(cfg, attr, None)
+        if not url:
+            r.warn(f"config.{attr} 沒值,跳過 {role} server 檢查")
+            continue
+        try:
+            health = llama_client.get_health(url)
+        except Exception as e:
+            health = None
+            err_repr = f"{type(e).__name__}: {e}"
+        else:
+            err_repr = ""
 
-    try:
-        data = resp.json()
-        tags = {m.get("name", "") for m in data.get("models", [])}
-    except (ValueError, AttributeError):
-        r.warn(f"Ollama 回應格式異常: {resp.text[:200]}")
-        return None
+        if not health:
+            msg = f"llama-server [{role}] {url} 不可連{(' — ' + err_repr) if err_repr else ''}"
+            if required:
+                r.fail(msg + "\n        請確認對應 llama-server 已啟動")
+            else:
+                r.warn(msg + " (選用 server,不影響核心功能)")
+            continue
 
-    r.ok(f"Ollama 可連 ({base_url}) — 已 pull {len(tags)} 個模型")
-    return tags
+        srv_status = str(health.get("status", "")).lower()
+        if srv_status != "ok":
+            r.warn(f"llama-server [{role}] {url} status={srv_status!r}")
+            status[role] = {"url": url, "health": health, "props": None}
+            continue
+
+        props = llama_client.get_props(url)
+        slots = llama_client.get_slots(url)
+        status[role] = {"url": url, "health": health, "props": props, "slots": slots}
+
+        model_path = ""
+        if isinstance(props, dict):
+            model_path = str(props.get("model_path") or "")
+        model_name = Path(model_path).name if model_path else "(unknown model)"
+
+        n_ctx = None
+        if isinstance(props, dict):
+            settings = props.get("default_generation_settings") or {}
+            n_ctx = settings.get("n_ctx") or props.get("n_ctx")
+
+        r.ok(f"llama-server [{role}] {url} model={model_name} n_ctx={n_ctx}")
+
+    return status
 
 
-def _tag_present(name: str, tags: set[str]) -> bool:
-    # ollama 對裸名 (`bge-m3`) 隱含 `:latest`；config 用裸名,registry 列的是
-    # 完整 tag,直接比對會誤判成「沒 pull」。
-    if name in tags:
-        return True
-    if ":" not in name and f"{name}:latest" in tags:
-        return True
-    return False
-
-
-def check_models(r: Result, tags: set[str] | None) -> None:
+def check_models(r: Result, server_status: dict[str, dict]) -> None:
+    """驗證主模型對應的 GGUF 檔案存在,並印 registry 摘要。"""
     cfg = _read_config()
     if isinstance(cfg, Exception):
         return
 
-    # 主模型 (MODEL) 不再有 baked-in 預設; 沒設就 FAIL, 不做 silent fallback。
     try:
         main_model = cfg.require_main_model()
     except RuntimeError as exc:
-        main_model = ""
         r.fail(
-            "main model is missing or invalid. CodeTrail does not ship a "
-            f"default main model.\n        {exc}"
+            "main model is missing or invalid. CodeTrail does not ship a default.\n"
+            f"        {exc}"
+        )
+        return
+
+    resolved = resolve_main_model_from_env(os.environ)
+    suffix = f" [from {resolved.source or 'runtime'}]"
+    if resolved.path:
+        suffix += f" {resolved.path}"
+
+    # 用 config.resolve_model_path 把 registry / 路徑都解開
+    gguf_path = cfg.resolve_model_path(main_model)
+    expanded = os.path.expanduser(gguf_path)
+    if os.path.isfile(expanded):
+        r.ok(f"MODEL={main_model}{suffix} → {expanded} (exists)")
+    else:
+        r.fail(
+            f"MODEL={main_model}{suffix} 解析到 {expanded} 但檔案不存在。\n"
+            "        在 ~/.config/codetrail/models.json 加入 name→path 映射,"
+            "或直接把 AICODE_MODEL 設成 GGUF 絕對路徑。"
         )
 
-    if main_model:
-        resolved = resolve_main_model_from_env(os.environ)
-        suffix = f" [from {resolved.source or 'runtime'}]"
-        if resolved.path:
-            suffix += f" {resolved.path}"
-        if tags is None:
-            r.info(f"MODEL={main_model}{suffix} (main LLM) -- ollama tags not checked")
-        elif _tag_present(main_model, tags):
-            r.ok(f"MODEL={main_model}{suffix} is pulled")
-        else:
-            r.fail(f"MODEL={main_model}{suffix} is not pulled -- run: ollama pull {main_model}")
+    registry = getattr(cfg, "MODEL_REGISTRY", {}) or {}
+    if registry:
+        r.info(f"MODEL_REGISTRY 有 {len(registry)} 個 mapping")
+    else:
+        r.info("MODEL_REGISTRY 空 (AICODE_MODEL 必須是 GGUF 絕對路徑)")
 
-    # Embedding / reranker 是 RAG 內部固定附屬模型 (跟主模型分開), 預設值保留。
-    rag_required = [
-        ("EMBEDDING_MODEL", "RAG embedding"),
-        ("RERANKER_MODEL", "RAG reranker"),
-    ]
-    optional = [
-        ("VL_MODEL", "圖片 OCR — 不分析圖片就不需要"),
-    ]
+    # 確認主 server 載入的 model_path 跟 AICODE_MODEL 對得起來
+    main_srv = server_status.get("main")
+    if main_srv and isinstance(main_srv.get("props"), dict):
+        loaded_path = str(main_srv["props"].get("model_path") or "")
+        if loaded_path:
+            expected_basename = Path(expanded).name.lower()
+            loaded_basename = Path(loaded_path).name.lower()
+            if expected_basename and expected_basename != loaded_basename:
+                r.warn(
+                    f"主 llama-server 載入的是 {loaded_basename},但 AICODE_MODEL"
+                    f"={main_model} 解析到 {expected_basename}。 兩邊不同 = 重啟 server"
+                    " 時要記得指對 GGUF。"
+                )
+            else:
+                r.ok(f"主 server 載入的 {loaded_basename} 與 AICODE_MODEL 一致")
 
-    for attr, desc in rag_required:
-        name = getattr(cfg, attr, None)
-        if not name:
-            r.warn(f"config.py 沒有 {attr}")
+    # 報附屬 server 載入的 model (informational)
+    for role in ("embedding", "reranker", "VL"):
+        srv = server_status.get(role)
+        if not srv:
             continue
-        if tags is None:
-            r.info(f"{attr}={name} ({desc}) — 未檢查 ollama 是否 pull")
+        props = srv.get("props")
+        if not isinstance(props, dict):
             continue
-        if _tag_present(name, tags):
-            r.ok(f"{attr}={name} 已 pull")
-        else:
-            r.fail(f"{attr}={name} 尚未 pull — 執行: ollama pull {name}")
-
-    for attr, desc in optional:
-        name = getattr(cfg, attr, None)
-        if not name:
-            continue
-        if tags is None:
-            r.info(f"{attr}={name} ({desc}) — 未檢查")
-            continue
-        if _tag_present(name, tags):
-            r.ok(f"{attr}={name} 已 pull (optional)")
-        else:
-            r.warn(f"{attr}={name} 沒 pull ({desc}) — 需要時: ollama pull {name}")
+        loaded = Path(str(props.get("model_path") or "")).name or "(unknown)"
+        r.info(f"{role} server loaded: {loaded}")
 
 
 def _npm_global_package_status(package: str) -> tuple[bool | None, str]:
@@ -307,13 +338,12 @@ def check_opencode_in_path(r: Result) -> None:
 
 
 # ============================================================
-# Context / offload checks（P2：避免 silent truncation / 速度退化）
+# Context settings
 # ============================================================
 def check_context_settings(r: Result) -> None:
-    """印出 CodeTrail-internal 與 Ollama-server 兩條 context 管線的設定,
-    並提示常見錯配。
+    """印出 CodeTrail-internal 的 context 設定,並提示常見錯配。
 
-    這個檢查只看 config + env,不需要連 Ollama,所以也適用 --no-network。
+    這個檢查只看 config + env,不需要連 llama-server,所以也適用 --no-network。
     """
     cfg = _read_config()
     if isinstance(cfg, Exception):
@@ -343,10 +373,11 @@ def check_context_settings(r: Result) -> None:
         f"AICODE_RESERVED_OUTPUT_TOKENS={reserved} "
         f"soft={int(soft*100)}% hard={int(hard*100)}% gate_on={gate_on}"
     )
+    r.info(
+        f"提醒: llama-server 啟動時 -c <N> 決定它真實 ctx;effective_internal_ctx={effective_internal_ctx} "
+        "只是 CodeTrail 自己的 budget,要對齊請確認 server 也夠大。"
+    )
 
-    # 常見錯配 1：使用者明確設定 AICODE_NUM_CTX,且它大於 dynamic max。
-    # config.py 的預設 NUM_CTX 本來就可能比 dynamic max 大;dynamic 開啟時
-    # 它只是 fallback,不要把這種預設狀態誤報成使用者設定錯誤。
     if num_ctx_env_set and dyn_on and num_ctx > 0 and dyn_max > 0 and num_ctx > dyn_max:
         r.warn(
             f"AICODE_NUM_CTX={num_ctx} 比 DYNAMIC_NUM_CTX_MAX={dyn_max} 大;"
@@ -355,142 +386,47 @@ def check_context_settings(r: Result) -> None:
             "或設 DYNAMIC_NUM_CTX_ENABLED=False 走 NUM_CTX 路徑。"
         )
 
-    # 常見錯配 1b：AICODE_NUM_CTX 有設、但 dynamic 開啟 → 多數情況下這個 env
-    # var 完全沒效果,使用者調了不會感覺到任何差別。明確告訴他要改的是哪顆。
     if dyn_on and num_ctx_env_set:
         r.warn(
             f"AICODE_NUM_CTX 環境變數有設 (={num_ctx}) 但 dynamic 啟用,"
             "在這種模式下它不影響 per-call 上限。\n"
-            "        要真的改 per-call 上限請改設 AICODE_DYNAMIC_NUM_CTX_MAX;"
-            "或如果只是想要個 banner 顯示值,留著沒關係但會誤導你自己。"
+            "        要真的改 per-call 上限請改設 AICODE_DYNAMIC_NUM_CTX_MAX。"
         )
 
-    # 常見錯配 2：hard < soft（人為設錯）
     if hard < soft:
         r.warn(
             f"CTX_HARD_THRESHOLD={hard:.2f} 低於 CTX_SOFT_THRESHOLD={soft:.2f}—"
             "代表 hard gate 永遠先於 soft warning 觸發,通常不是你要的。"
         )
 
-    # OLLAMA_CONTEXT_LENGTH（server 層）只有設環境變數時看得到,我們不能
-    # 隔著 process 邊界讀別人的 systemd Environment=;能看的時候給個 hint。
-    server_ctx_env = os.environ.get("OLLAMA_CONTEXT_LENGTH")
-    if server_ctx_env:
-        try:
-            sc = int(server_ctx_env)
-            r.info(f"OLLAMA_CONTEXT_LENGTH={sc}（server 層,影響 OpenCode TUI /v1 路徑）")
-            if effective_internal_ctx and sc < effective_internal_ctx:
-                r.warn(
-                    f"OLLAMA_CONTEXT_LENGTH={sc} 比 CodeTrail internal ctx cap="
-                    f"{effective_internal_ctx} 小;OpenCode TUI 主對話的 context "
-                    "會比 CodeTrail 工具/RAG 路徑小。若非刻意分開,建議調高 "
-                    "OLLAMA_CONTEXT_LENGTH 或降低 AICODE_DYNAMIC_NUM_CTX_MAX 對齊。"
-                )
-        except ValueError:
-            r.warn(f"OLLAMA_CONTEXT_LENGTH={server_ctx_env!r} 不是數字")
-    else:
-        r.info(
-            "OLLAMA_CONTEXT_LENGTH 環境變數未設;"
-            "OpenCode TUI 的 server context 由 Ollama 預設值決定(通常 4096-8192)。"
-            "若 TUI 對話被截,請設 OLLAMA_CONTEXT_LENGTH 並 restart ollama。"
-        )
 
-
-def check_ollama_runtime(r: Result, no_network: bool) -> None:
-    """讀 /api/ps,顯示目前載入的模型 + processor split + context。
-
-    處理三種情況:
-      - --no-network 直接 skip
-      - Ollama 不可連 → 已由 check_ollama 報過,這裡 silent skip
-      - Ollama OK 但沒載入任何模型 → INFO
-
-    處理器分裂(CPU/GPU 混合)只 WARN,不 FAIL — 這通常是速度問題,不是
-    正確性問題。但若使用者預設應該 100% GPU 還 split,值得提醒。
-    """
+def check_llama_runtime(r: Result, no_network: bool, server_status: dict[str, dict]) -> None:
+    """讀主 server /slots 看當前是否有 slot 在處理。"""
     if no_network:
         return
-    cfg = _read_config()
-    if isinstance(cfg, Exception):
+    main_srv = server_status.get("main")
+    if not main_srv:
         return
-    base_url = getattr(cfg, "OLLAMA_BASE_URL", "http://localhost:11434")
-    try:
-        import requests  # noqa: F401
-        import requests as _req
-        resp = _req.get(f"{base_url}/api/ps", timeout=3)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        return  # check_ollama 已經報過連線問題
-
-    models = data.get("models", []) if isinstance(data, dict) else []
-    if not models:
-        r.info("Ollama 目前沒有載入任何模型(首次呼叫會自動載入)")
+    slots = main_srv.get("slots")
+    if not isinstance(slots, list):
         return
-
-    try:
-        main_model = cfg.require_main_model()
-    except RuntimeError:
-        main_model = ""
-    for m in models:
-        name = m.get("name", "?")
-        size = m.get("size", 0) or 0
-        size_vram = m.get("size_vram", 0) or 0
-        ctx_size = m.get("context_length") or m.get("context") or "?"
-        gpu_pct = (size_vram / size * 100) if size > 0 else 0.0
-
-        # 把 byte 換成 GB 給人類看
-        size_gb = size / (1024**3) if size else 0.0
-        vram_gb = size_vram / (1024**3) if size_vram else 0.0
-
-        line = (
-            f"ollama ps: {name} size={size_gb:.1f}GB vram={vram_gb:.1f}GB "
-            f"({gpu_pct:.0f}% GPU) ctx={ctx_size}"
-        )
-        if size > 0 and gpu_pct < 99:
-            # CPU/GPU split — 速度警告,不是正確性問題
-            extra = (
-                "        CPU/GPU 混合;首 token 延遲會明顯增加。\n"
-                "        若這是日常 30B/35B 模型,建議:\n"
-                "          1) 確認 OLLAMA_FLASH_ATTENTION=1 + OLLAMA_KV_CACHE_TYPE=q8_0\n"
-                "          2) 降低 OLLAMA_CONTEXT_LENGTH / AICODE_NUM_CTX 讓 KV cache 進 VRAM\n"
-                "          3) 若是 70B Q4 reviewer,split 是正常的"
-            )
-            r.warn(line + "\n" + extra)
-        else:
-            r.ok(line)
-
-        if main_model and name and main_model not in name and name.split(":")[0] != main_model.split(":")[0]:
-            r.info(
-                f"注意:已載入 {name} 與 AICODE_MODEL={main_model} 不同;"
-                "下次 CodeTrail call 會觸發載入"
-            )
-
-
-def _opencode_provider_ollama_models(oc: dict) -> dict | None:
-    provider = oc.get("provider")
-    if isinstance(provider, dict):
-        ollama = provider.get("ollama")
-        if isinstance(ollama, dict):
-            models = ollama.get("models")
-            if isinstance(models, dict):
-                return models
-    return None
-
-
-def _opencode_ollama_models(oc: dict) -> dict | None:
-    provider_models = _opencode_provider_ollama_models(oc)
-    if provider_models is not None:
-        return provider_models
-
-    models = oc.get("models")
-    if isinstance(models, dict):
-        return models
-
-    return None
+    busy = sum(1 for s in slots if isinstance(s, dict) and s.get("state") not in (0, None))
+    total = len(slots)
+    n_ctx = ""
+    if slots and isinstance(slots[0], dict):
+        n_ctx = slots[0].get("n_ctx") or ""
+    if busy:
+        r.warn(f"主 llama-server 有 {busy}/{total} 個 slot 正在處理 (n_ctx={n_ctx})")
+    else:
+        r.ok(f"主 llama-server slot 全閒置 ({total} slots, n_ctx={n_ctx})")
 
 
 def check_opencode_model_config(r: Result) -> None:
-    """Validate the OpenCode config model binding without contacting Ollama."""
+    """驗證 opencode.json 的 model 欄位跟 AICODE_MODEL 對得起來。
+
+    我們不再要求特定 provider key (openai-compat / llamacpp / 等使用者自選),
+    只要 model 欄位 strip provider/ 後的 bare 跟 main_model 一致即可。
+    """
     cfg = _read_config()
     if isinstance(cfg, Exception):
         return
@@ -509,18 +445,18 @@ def check_opencode_model_config(r: Result) -> None:
         if env_overrides_global_config:
             r.warn(
                 msg
-                + f" — AICODE_MODEL={main_model} 已設定；aicode wrapper 會傳 "
-                + f"--model ollama/{main_model} 給 OpenCode。若要不帶 env 直接跑，仍需修正 OpenCode config。"
+                + f" — AICODE_MODEL={main_model} 已設定;aicode wrapper 會把 model 傳給 OpenCode,"
+                + " 但若要不帶 env 直接跑 opencode,仍需修正 OpenCode config。"
             )
         else:
             r.fail(msg)
 
     path, oc, error = load_first_opencode_config(os.environ)
     if error:
-        config_problem(f"OpenCode config read failed: {path} -- {error}")
+        config_problem(f"OpenCode config 讀取失敗: {path} -- {error}")
         return
     if not oc:
-        r.info("OpenCode config not found; skipping provider.ollama.models validation")
+        r.info("OpenCode config 不存在;若不走 OpenCode TUI 可忽略")
         return
 
     oc_res = resolve_opencode_main_model(os.environ)
@@ -529,29 +465,16 @@ def check_opencode_model_config(r: Result) -> None:
         config_problem(f"OpenCode config model invalid{where}: {oc_res.error}")
         return
     if not oc_res.model:
-        config_problem(f"OpenCode config {path} must set model=\"ollama/<CODE_MODEL>\"")
+        config_problem(f"OpenCode config {path} 必須設 \"model\" 欄位")
         return
 
     if oc_res.model != main_model:
         config_problem(
-            f"OpenCode config model={oc_res.model!r} does not match "
-            f"CodeTrail main model={main_model!r}"
+            f"OpenCode config model={oc_res.model!r} 跟 CodeTrail main model={main_model!r} 不一致"
         )
         return
 
-    models = _opencode_provider_ollama_models(oc)
-    if not models:
-        config_problem(f"OpenCode config {path} must define provider.ollama.models")
-        return
-
-    if main_model not in models:
-        config_problem(
-            f"OpenCode config {path} provider.ollama.models is missing "
-            f"bare key {main_model!r}"
-        )
-        return
-
-    r.ok(f"OpenCode config {path} binds ollama/{main_model} and provider.ollama.models")
+    r.ok(f"OpenCode config {path} model 跟 AICODE_MODEL 對齊 ({main_model})")
 
 
 def check_opencode_config_drift(r: Result, project: str | None) -> None:
@@ -569,7 +492,6 @@ def check_opencode_config_drift(r: Result, project: str | None) -> None:
             candidates.append(Path(os.environ["AICODE_ROOT"]) / "opencode.json")
         candidates.append(REPO_ROOT / "opencode.json")
         candidates.extend(opencode_config_candidates(os.environ))
-    # 全域設定
     found = next((p for p in candidates if p.is_file()), None)
     if not found:
         r.info("找不到 opencode.json(沒走 OpenCode TUI 路線可忽略)")
@@ -589,34 +511,41 @@ def check_opencode_config_drift(r: Result, project: str | None) -> None:
     dyn_max = int(getattr(cfg, "DYNAMIC_NUM_CTX_MAX", 0) or 0)
     internal_ctx_cap = dyn_max if dyn_on and dyn_max > 0 else num_ctx
 
-    models = _opencode_ollama_models(oc) or {}
-    if not isinstance(models, dict) or not models:
-        r.info(f"opencode.json={found} — 未設定 models.limit.context,OpenCode 會用內建預設")
-        return
-
+    # OpenCode 各 provider key 不固定 (openai-compat / llamacpp / 自選),
+    # 一律深掃所有 provider.*.models 找 limit.context。
+    providers = oc.get("provider") if isinstance(oc, dict) else None
     mismatches = []
-    for model_id, spec in models.items():
-        if not isinstance(spec, dict):
-            continue
-        limit = spec.get("limit") or {}
-        ctx = limit.get("context") if isinstance(limit, dict) else None
-        if (
-            isinstance(ctx, int)
-            and internal_ctx_cap
-            and abs(ctx - internal_ctx_cap) > internal_ctx_cap * 0.5
-        ):
-            mismatches.append(
-                f"        model={model_id} limit.context={ctx} 與 CodeTrail internal ctx cap={internal_ctx_cap} 差距 > 50%"
-            )
+    if isinstance(providers, dict):
+        for provider_key, provider_spec in providers.items():
+            if not isinstance(provider_spec, dict):
+                continue
+            models = provider_spec.get("models")
+            if not isinstance(models, dict):
+                continue
+            for model_id, spec in models.items():
+                if not isinstance(spec, dict):
+                    continue
+                limit = spec.get("limit") or {}
+                ctx = limit.get("context") if isinstance(limit, dict) else None
+                if (
+                    isinstance(ctx, int)
+                    and internal_ctx_cap
+                    and abs(ctx - internal_ctx_cap) > internal_ctx_cap * 0.5
+                ):
+                    mismatches.append(
+                        f"        provider={provider_key} model={model_id} limit.context={ctx}"
+                        f" 與 CodeTrail internal ctx cap={internal_ctx_cap} 差距 > 50%"
+                    )
+
     if mismatches:
         r.warn(
             f"opencode.json={found} 與 CodeTrail num_ctx 設定差距大:\n"
             + "\n".join(mismatches)
-            + "\n        提醒:兩條管線(OpenCode /v1 與 CodeTrail native)各自獨立,"
+            + "\n        提醒:兩條管線(OpenCode TUI 與 CodeTrail native)各自獨立,"
               "不會自動同步;手動對齊或接受兩邊的不同。"
         )
     else:
-        r.ok(f"opencode.json={found} model limit.context 與 AICODE_NUM_CTX 一致")
+        r.ok(f"opencode.json={found} model limit.context 與 internal ctx cap 一致(或未設)")
 
 
 def check_aicode_root(r: Result, project: str | None) -> None:
@@ -649,7 +578,6 @@ def check_aicode_root(r: Result, project: str | None) -> None:
                 "高風險，請確認你真的知道在做什麼"
             )
             return
-        # 預設行為：與 mcp_server.py / aicode wrapper 一致 → FAIL
         r.fail(
             f"AICODE_ROOT=$HOME ({resolved}) — 範圍太大、容易意外洩漏個人資料。\n"
             "        cd 到具體 project 目錄再啟動。\n"
@@ -660,7 +588,6 @@ def check_aicode_root(r: Result, project: str | None) -> None:
 
     r.ok(f"AICODE_ROOT 安全: {resolved}")
 
-    # 順便看一下這個 project 是否 git repo（方便 apply_patch 出錯時可 git checkout）
     if (resolved / ".git").exists():
         r.ok("AICODE_ROOT 在 git 控管下（apply_patch 出錯可 git checkout 還原）")
     else:
@@ -668,11 +595,12 @@ def check_aicode_root(r: Result, project: str | None) -> None:
 
 
 def check_repo_artifacts(r: Result) -> None:
-    """ai_code repo 自身應該存在的關鍵檔。"""
+    """CodeTrail repo 自身應該存在的關鍵檔。"""
     must_exist = [
         ("mcp_server.py", "MCP server 入口"),
         ("config.py", "設定檔"),
         ("RAG.py", "知識庫 ingestion"),
+        ("llama_client.py", "llama.cpp HTTP wrapper"),
     ]
     for rel, desc in must_exist:
         if (REPO_ROOT / rel).is_file():
@@ -741,14 +669,14 @@ def check_readme_consistency(r: Result) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="doctor",
-        description="ai_code preflight check — 安裝 / 啟動前自檢",
+        description="CodeTrail preflight check — 安裝 / 啟動前自檢",
     )
     parser.add_argument("--project", help="把這個目錄當作 AICODE_ROOT 來檢查")
     parser.add_argument("--no-network", action="store_true",
-                        help="跳過 Ollama / 模型線上檢查（CI 用）")
+                        help="跳過 llama-server / 模型線上檢查（CI 用）")
     args = parser.parse_args(argv)
 
-    print("=== ai_code doctor ===")
+    print("=== CodeTrail doctor ===")
     r = Result()
 
     print("\n-- runtime --")
@@ -758,17 +686,17 @@ def main(argv: list[str] | None = None) -> int:
     print("\n-- repo files --")
     check_repo_artifacts(r)
 
-    print("\n-- ollama / 模型 --")
-    tags = check_ollama(r, no_network=args.no_network)
-    check_models(r, tags)
+    print("\n-- llama-server / 模型 --")
+    server_status = check_llama_servers(r, no_network=args.no_network)
+    check_models(r, server_status)
 
     print("\n-- opencode-ai entry --")
     check_opencode_ai_entry(r)
     check_opencode_model_config(r)
 
-    print("\n-- context / offload --")
+    print("\n-- context settings --")
     check_context_settings(r)
-    check_ollama_runtime(r, no_network=args.no_network)
+    check_llama_runtime(r, no_network=args.no_network, server_status=server_status)
     check_opencode_config_drift(r, args.project)
 
     print("\n-- AICODE_ROOT / project --")
@@ -778,7 +706,6 @@ def main(argv: list[str] | None = None) -> int:
     print("\n-- README / docs 一致性 --")
     check_readme_consistency(r)
 
-    # Summary
     print("\n=== summary ===")
     print(f"PASS={len(r.passes)}  WARN={len(r.warns)}  FAIL={len(r.fails)}")
     if r.fails:

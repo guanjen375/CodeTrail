@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-context_budget — CodeTrail 內部對 Ollama native /api/generate / /api/chat
-呼叫的 context 觀測 + 預算 + 硬性 gate。
+context_budget — CodeTrail 內部對 llama.cpp llama-server 呼叫的 context 觀測
++ 預算 + 硬性 gate。
 
 設計重點:
 1. context overflow 是正確性問題,不是只是速度問題。所以這裡的硬性 gate 會
    直接拒絕送出超出 effective_num_ctx*hard_threshold 的 prompt。
-2. 只攔 CodeTrail 自己送的 native call。OpenCode TUI 走 /v1,不會經過這裡。
-3. token 估算先用 CHARS_PER_TOKEN heuristic;若 Ollama 回了 prompt_eval_count,
-   會用實測值校正下一次估算(下版),這次只先把 metric 蒐起來。
+2. 攔 CodeTrail 自己送出去的 /completion 與 /v1/chat/completions 兩條路。
+   OpenCode TUI 直接打 llama-server,不會經過這裡。
+3. token 估算先用 CHARS_PER_TOKEN heuristic;llama-server 回的
+   tokens_evaluated / usage.prompt_tokens 會被收下來給下一次校正(下版)。
 4. telemetry 只寫 metadata(count、模型名、context 設定、速度、是否 trim 等),
    絕不寫 prompt / tool output / 檔案內容,以防 NDA / private repo 外洩。
 """
@@ -56,7 +57,7 @@ class ContextUsage:
     char_per_token_estimate: float = 0.0
     did_trim: bool = False
     trim_summary: dict[str, Any] = field(default_factory=dict)
-    # Filled in after the response comes back (Ollama returns these in
+    # Filled in after the response comes back (llama-server returns these in
     # the response JSON for non-streaming, or in the final chunk for streaming).
     actual_prompt_eval_count: int | None = None
     actual_eval_count: int | None = None
@@ -89,7 +90,7 @@ def _chars_per_token() -> float:
 
 
 def _count_message_content_chars(content: Any) -> int:
-    """Count chars across Ollama / OpenAI-style message content shapes.
+    """Count chars across both native and OpenAI-style message content shapes.
 
     Supports:
         - plain str
@@ -159,8 +160,8 @@ def estimate_message_chars(messages: list[dict]) -> tuple[int, int, int]:
 def estimate_tools_chars(tools: list[dict] | None) -> int:
     """Estimate the JSON serialization length of the tools schema.
 
-    Ollama sends the tools schema to the model on every chat call, so it
-    eats real context. We use the JSON string length, divided later by
+    llama-server forwards the tools schema to the model on every chat call, so
+    it eats real context. We use the JSON string length, divided later by
     CHARS_PER_TOKEN, as a rough estimate.
     """
     if not tools:
@@ -212,10 +213,10 @@ def build_usage(
 ) -> ContextUsage:
     """Compute a ContextUsage snapshot for a pending request.
 
-    `requested_num_ctx` is what CodeTrail asked Ollama for (post dynamic
-    computation, post config-max clamping). We don't try to guess what the
-    Ollama server actually accepts — that depends on the model + server
-    OLLAMA_CONTEXT_LENGTH. The gate works on requested == effective.
+    `requested_num_ctx` 是 CodeTrail dynamic_ctx 計算後想用的上限。
+    llama-server 不接受 per-call num_ctx — 它的真實 ctx 在 server 啟動時
+    用 `-c N` 鎖死,這裡的 requested 只是 CodeTrail 自己 budget 用的相對值。
+    gate 仍照 requested == effective 算,跟模型實際 ctx 是否對齊由 doctor 報。
     """
     msg_chars = 0
     msg_count = 0
@@ -291,8 +292,8 @@ def overflow_message(usage: ContextUsage) -> str:
         "  - 縮小問題範圍 / 拆成多步\n"
         "  - 減少 tool output（read_file 指定行範圍、grep 縮小 pattern）\n"
         "  - 降低 AICODE_NUM_CTX 上限會讓 dynamic clamp 更早觸發,反而更明顯。\n"
-        "    要的是更大上限請調 DYNAMIC_NUM_CTX_MAX,並確認 Ollama server "
-        "OLLAMA_CONTEXT_LENGTH 也夠大。\n"
+        "    要的是更大上限請調 DYNAMIC_NUM_CTX_MAX,並確認 llama-server 啟動時\n"
+        "    的 -c <N> 也夠大(server 啟動後 ctx 即固定,改 env 沒用)。\n"
         "  - RAG 太多 REF：縮小 KNOWLEDGE_TOP_K 或讓 query 更具體\n"
         "  - 設定 AICODE_RESERVED_OUTPUT_TOKENS 較小（預設 4096）若你只需要短回答"
     )
@@ -312,47 +313,62 @@ def enforce_gate(usage: ContextUsage) -> None:
 
 
 # ============================================================
-# Ollama usage metrics capture
+# llama.cpp usage metrics capture
 # ============================================================
-
-def _safe_tps(count: Any, duration_ns: Any) -> float | None:
-    """Compute tokens/sec; return None on missing or zero-duration data."""
-    try:
-        c = float(count)
-        d = float(duration_ns)
-    except (TypeError, ValueError):
-        return None
-    if c <= 0 or d <= 0:
-        return None
-    # Ollama reports durations in nanoseconds.
-    return c / (d / 1e9)
+# 兩種 endpoint 兩種欄位,加上 OpenAI /v1 兩種,在這層統一吸收掉:
+#   - native /completion        → tokens_evaluated / tokens_predicted + timings{}
+#   - /v1/chat/completions      → usage.{prompt_tokens, completion_tokens} (+ timings)
 
 
 def parse_usage_from_response(data: dict, usage: ContextUsage) -> None:
-    """Pull prompt_eval_count / eval_count / *_duration off a non-streaming
-    Ollama response and attach them to `usage`. Missing fields → None.
+    """Pull prompt / output token counts off a non-streaming response.
+
+    支援 llama-server native /completion 與 OpenAI-compat /v1/chat/completions
+    兩種 shape;欄位缺就維持 None,不假裝有資料。
     """
     if not isinstance(data, dict):
         return
-    pec = data.get("prompt_eval_count")
-    ec = data.get("eval_count")
-    ped = data.get("prompt_eval_duration")
-    ed = data.get("eval_duration")
+
+    pec = data.get("tokens_evaluated")
+    ec = data.get("tokens_predicted")
+
+    if pec is None or ec is None:
+        u = data.get("usage")
+        if isinstance(u, dict):
+            if pec is None and isinstance(u.get("prompt_tokens"), (int, float)):
+                pec = u.get("prompt_tokens")
+            if ec is None and isinstance(u.get("completion_tokens"), (int, float)):
+                ec = u.get("completion_tokens")
+
     if isinstance(pec, (int, float)):
         usage.actual_prompt_eval_count = int(pec)
     if isinstance(ec, (int, float)):
         usage.actual_eval_count = int(ec)
-    usage.prompt_tokens_per_second = _safe_tps(pec, ped)
-    usage.output_tokens_per_second = _safe_tps(ec, ed)
+
+    timings = data.get("timings")
+    if isinstance(timings, dict):
+        if isinstance(timings.get("prompt_per_second"), (int, float)):
+            usage.prompt_tokens_per_second = float(timings["prompt_per_second"])
+        if isinstance(timings.get("predicted_per_second"), (int, float)):
+            usage.output_tokens_per_second = float(timings["predicted_per_second"])
 
 
 def parse_usage_from_stream_chunk(chunk: dict, usage: ContextUsage) -> None:
-    """Inspect a streaming chunk and pull usage metrics if it's the final
-    chunk (done=true). Safe to call on every chunk.
+    """Inspect a streaming chunk and pull usage metrics if it's the final chunk.
+
+    最後一個 chunk 在不同 endpoint 上的訊號不同:
+      - native /completion        → `stop: true`
+      - /v1/chat/completions      → `choices[0].finish_reason` 非 null
     """
     if not isinstance(chunk, dict):
         return
-    if not chunk.get("done"):
+    is_final = bool(chunk.get("stop"))
+    if not is_final:
+        choices = chunk.get("choices")
+        if isinstance(choices, list) and choices:
+            if choices[0].get("finish_reason"):
+                is_final = True
+    if not is_final:
         return
     parse_usage_from_response(chunk, usage)
 
@@ -387,12 +403,9 @@ _OFFLOAD_CHECK_FIRED = False
 
 
 def _emit_runtime_offload_check_once() -> None:
-    """Soft/hard threshold 觸發時順手查 /api/ps,看是不是真的 offload 了。
-    一個 process 只查一次,避免每個 call 都打 HTTP。
-
-    這是 ground-truth 驗證:啟動時的 gpu_safety 是「估算」,這裡是「實測」。
-    若實測 offload，把訊息跟 [CTX] WARN 黏在一起，使用者就知道兩件事相關
-    (ctx 大 → VRAM 滿 → CPU offload → 慢)。
+    """Soft/hard threshold 觸發時順手查 llama-server /slots + /props,看
+    server 自己的 n_ctx 和 slot 狀態。一個 process 只查一次,避免每個 call
+    都打 HTTP。
 
     任何 import / I/O 失敗都靜默吞掉:這層是輔助診斷,絕不能擋使用者。
     """
@@ -402,22 +415,13 @@ def _emit_runtime_offload_check_once() -> None:
     _OFFLOAD_CHECK_FIRED = True
     try:
         import gpu_safety
-        base_url = getattr(config, "OLLAMA_BASE_URL", "http://localhost:11434")
-        preferred = getattr(config, "MODEL", None)
-        status = gpu_safety.runtime_offload_check(base_url, preferred_model=preferred)
+        base_url = getattr(config, "LLAMA_BASE_URL", "http://localhost:8080")
+        status = gpu_safety.runtime_offload_check(base_url)
     except Exception:
         return
     if not status.available:
         return
-    if status.is_offloaded:
-        print(
-            f"[CTX] runtime: {status.short()} → 模型已 offload 到 CPU,"
-            " ctx 拉大就是這個原因。建議:export AICODE_DYNAMIC_NUM_CTX_MAX=<更小值>"
-            " 或退到較小的模型。",
-            flush=True,
-        )
-    else:
-        print(f"[CTX] runtime: {status.short()} (模型仍在 GPU,ctx 壓力不是 offload 造成)", flush=True)
+    print(f"[CTX] runtime: {status.short()}", flush=True)
 
 
 def emit_pre_call_lines(usage: ContextUsage) -> None:

@@ -17,7 +17,6 @@ import hashlib
 from pathlib import Path
 from functools import lru_cache
 
-from http_client import get_session
 
 try:
     import numpy as np
@@ -30,9 +29,10 @@ from config import (
     CODE_RAG_ENABLED, CODE_RAG_TOP_K, CODE_RAG_CACHE_FILE,
     CODE_RAG_THRESHOLD, CODE_RAG_THRESHOLD_BUG,
     CODE_RAG_LAZY_EMBED, CODE_RAG_LAZY_EMBED_MAX_SYMBOLS, CODE_RAG_LAZY_EMBED_QUERY_TOP_K,
-    OLLAMA_EMBEDDINGS_URL, OLLAMA_GENERATE_URL,
+    LLAMA_EMBED_BASE_URL, LLAMA_RERANK_BASE_URL,
     USE_RERANKER, RERANKER_MODEL
 )
+import llama_client
 from utils import should_ignore_file, should_ignore_dir, get_cached_scan_result, set_scan_cache
 
 # 導入 AST 解析器
@@ -46,16 +46,14 @@ def _normalize_text_for_cache(text: str) -> str:
 
 @lru_cache(maxsize=256)
 def _cached_get_embedding(text: str) -> tuple:
-    """帶 LRU cache 的 embedding 查詢（CodeRAG 用）"""
+    """帶 LRU cache 的 embedding 查詢(CodeRAG 用,走 llama-server /embedding)。"""
     try:
-        session = get_session()
-        resp = session.post(
-            OLLAMA_EMBEDDINGS_URL,
-            json={"model": EMBEDDING_MODEL, "prompt": text},
-            timeout=60
+        emb = llama_client.embed_one(
+            base_url=LLAMA_EMBED_BASE_URL,
+            content=text,
+            model=EMBEDDING_MODEL,
+            timeout=60,
         )
-        resp.raise_for_status()
-        emb = resp.json().get("embedding", [])
         return tuple(emb) if emb else ()
     except Exception:
         return ()
@@ -670,18 +668,10 @@ class CodeRAG:
         return []
 
     def _check_reranker_available(self) -> bool:
-        """檢查 reranker 模型是否可用"""
+        """檢查 reranker server 是否 ready(/health 200 + status=ok)。"""
         if not hasattr(self, '_reranker_available'):
             try:
-                from config import OLLAMA_TAGS_URL
-                session = get_session()
-                resp = session.get(OLLAMA_TAGS_URL, timeout=5)
-                if resp.status_code == 200:
-                    models = resp.json().get("models", [])
-                    model_names = [m.get("name", "") for m in models]
-                    self._reranker_available = any(RERANKER_MODEL in n for n in model_names)
-                else:
-                    self._reranker_available = False
+                self._reranker_available = llama_client.is_ready(LLAMA_RERANK_BASE_URL)
             except Exception:
                 self._reranker_available = False
         return self._reranker_available
@@ -735,46 +725,29 @@ class CodeRAG:
 
         if self._check_reranker_available():
             try:
-                session = get_session()
-                scored = []
-
-                for combined, emb_score, kw_score, item in candidates[:rerank_count]:
-                    # 建構 reranker 輸入：symbol + path + context
+                # 一次把 candidates 全部送進 /reranking 端點,llama-server 端
+                # 用 cross-encoder 一次 forward 完所有 (query, passage) pair,
+                # 不用 per-item HTTP round trip。
+                items = candidates[:rerank_count]
+                passages = []
+                for combined, emb_score, kw_score, item in items:
                     symbol = item.get('symbol', '')
                     path = item.get('path', '')
                     context = item.get('context', '')[:600]
                     parent_info = f" in {item.get('parent', '')}" if item.get('parent') else ""
                     sym_type = item.get('type', 'function')
-
-                    passage = f"{sym_type} {symbol}{parent_info}\nFile: {path}\n{context}"
-
-                    resp = session.post(
-                        OLLAMA_GENERATE_URL,
-                        json={
-                            "model": RERANKER_MODEL,
-                            "prompt": f"Query: {question}\n\nPassage: {passage}",
-                            "stream": False,
-                            "options": {
-                                "num_ctx": 2048,
-                                "temperature": 0,
-                                "num_predict": 10,
-                                "stop": ["\n", " ", ",", "。", "，"]
-                            }
-                        },
-                        timeout=30
+                    passages.append(
+                        f"{sym_type} {symbol}{parent_info}\nFile: {path}\n{context}"
                     )
-                    resp.raise_for_status()
 
-                    result = resp.json().get("response", "").strip()
-                    try:
-                        rerank_score = float(result)
-                    except ValueError:
-                        # Fallback: 嘗試提取數字
-                        match = re.search(r'-?[\d.]+', result)
-                        rerank_score = float(match.group()) if match else combined
-
-                    scored.append((rerank_score, item))
-
+                scores = llama_client.rerank(
+                    base_url=LLAMA_RERANK_BASE_URL,
+                    query=question,
+                    documents=passages,
+                    model=RERANKER_MODEL,
+                    timeout=60,
+                )
+                scored = [(score, items[i][3]) for i, score in enumerate(scores)]
                 scored.sort(reverse=True, key=lambda x: x[0])
                 return [c[1] for c in scored[:top_k]]
 

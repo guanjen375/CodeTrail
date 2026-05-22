@@ -8,13 +8,12 @@ import re
 import json
 from pathlib import Path
 
-from http_client import get_session
-
 import config
 import context_budget
+import llama_client
 import trim as trim_module
 from config import (
-    OLLAMA_CHAT_URL, NUM_CTX,
+    LLAMA_BASE_URL, NUM_CTX,
     DYNAMIC_NUM_CTX_ENABLED, DYNAMIC_NUM_CTX_MIN, DYNAMIC_NUM_CTX_MAX,
     DYNAMIC_NUM_CTX_BUFFER, CHARS_PER_TOKEN,
     MAX_TOOL_LOOPS,
@@ -136,16 +135,71 @@ def _pre_send_trim_if_needed(messages: list, num_ctx: int, tools: list,
     return usage, trim_summary
 
 
+def _llama_error_message(e: Exception, model: str) -> str:
+    """把底層 llama-server 例外轉成多行錯誤字串(以 '[ERROR]' 開頭)。"""
+    err_type = type(e).__name__
+    if "ConnectionError" in err_type or "ConnectionRefused" in err_type:
+        return (
+            f"[ERROR] 無法連接 llama-server ({LLAMA_BASE_URL})。\n"
+            f"   1. 主 llama-server 是否啟動?(預期 port 8080)\n"
+            f"   2. AICODE_LLAMA_BASE_URL 是否指對?\n"
+            f"   可先試: curl -s {LLAMA_BASE_URL}/health"
+        )
+    if "Timeout" in err_type or "ReadTimeout" in err_type:
+        return (
+            "[ERROR] llama-server 請求超時。\n"
+            "   首次冷載入可能要數十秒;若仍持續,可能是 prompt 過長或 GPU 卡住。\n"
+            f"   檢查: curl -s {LLAMA_BASE_URL}/slots  /  nvidia-smi"
+        )
+    if "HTTPError" in err_type or "404" in str(e):
+        return (
+            f"[ERROR] llama-server 回 HTTP 錯誤: {e}\n"
+            f"   常見原因:server 沒掛到對應模型 {model!r},或 server 是 --reranking / --embedding 模式 (不支援 chat)。"
+        )
+    return f"[ERROR] 錯誤: {e} (model={model})"
+
+
+def _openai_msg_to_local(message: dict) -> dict:
+    """OpenAI /v1/chat/completions 的 message → 我們內部統一格式
+    ({content, tool_calls})。OpenAI tool_calls 物件已經是 list[dict],
+    保持 shape 但補上 function name 與 parsed arguments,給 run_agent 使用。
+    """
+    content = message.get("content") or ""
+    tcs = message.get("tool_calls") or []
+    norm = []
+    for tc in tcs:
+        if not isinstance(tc, dict):
+            continue
+        func = tc.get("function") or {}
+        args_raw = func.get("arguments")
+        if isinstance(args_raw, str):
+            try:
+                args = json.loads(args_raw) if args_raw else {}
+            except json.JSONDecodeError:
+                args = {}
+        elif isinstance(args_raw, dict):
+            args = args_raw
+        else:
+            args = {}
+        norm.append({
+            "id": tc.get("id", ""),
+            "type": tc.get("type", "function"),
+            "function": {
+                "name": func.get("name", ""),
+                "arguments": args,
+            },
+        })
+    return {"content": content, "tool_calls": norm}
+
+
 def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
-    """呼叫 LLM（帶工具）"""
+    """呼叫主 LLM(帶 tool-calling,走 llama-server /v1/chat/completions)。"""
     model = config.require_main_model()
     num_ctx = _compute_dynamic_num_ctx(messages)
     tools = get_native_tools()
 
-    # Context gate：先估算,若觸發 soft 則先做一輪 aggressive trim;最後 hard 拒絕
     usage, trim_summary = _pre_send_trim_if_needed(messages, num_ctx, tools, "agent_tools", model)
     if not trim_summary:
-        # 沒有 pre-send trim,記入上一次 batch-trim 的 summary(若有)
         trim_summary = _last_trim_summary()
     if trim_summary:
         usage.did_trim = True
@@ -158,56 +212,58 @@ def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
         return {"content": str(exc), "tool_calls": [], "done_reason": "error"}
 
     try:
-        session = get_session()
-        resp = session.post(OLLAMA_CHAT_URL, json={
-            "model": model,
-            "messages": messages,
-            "tools": tools,
-            "stream": False,
-            "options": {"num_ctx": num_ctx, "temperature": temperature},
-        }, timeout=600)
-        resp.raise_for_status()
-        data = resp.json()
+        data = llama_client.chat_completions(
+            base_url=LLAMA_BASE_URL,
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            tools=tools,
+            tool_choice="auto",
+            stream=False,
+            timeout=600,
+        )
 
-        # 檢查 Ollama 錯誤（如模型不存在）
-        if "error" in data:
-            error_msg = data["error"]
-            usage.error_type = "ollama_error"
+        if isinstance(data, dict) and data.get("error"):
+            err = data["error"]
+            usage.error_type = "llama_error"
             context_budget.log_metrics(usage)
-            print(f"[ERROR] Ollama 錯誤: {error_msg}")
-            return {"content": f"[ERROR] Ollama 錯誤: {error_msg}", "tool_calls": [], "done_reason": "error"}
+            err_str = err.get("message") if isinstance(err, dict) else str(err)
+            print(f"[ERROR] llama-server 錯誤: {err_str}")
+            return {"content": f"[ERROR] llama-server 錯誤: {err_str}",
+                    "tool_calls": [], "done_reason": "error"}
 
-        message = data.get("message", {})
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not choices:
+            usage.error_type = "empty_response"
+            context_budget.log_metrics(usage)
+            return {"content": "[ERROR] llama-server 回應沒有 choices",
+                    "tool_calls": [], "done_reason": "error"}
+
+        choice0 = choices[0] or {}
+        message = choice0.get("message") or {}
+        finish_reason = choice0.get("finish_reason") or "stop"
         context_budget.parse_usage_from_response(data, usage)
         context_budget.emit_post_call_line(usage)
         context_budget.log_metrics(usage)
 
-        return {
-            "content": message.get("content", ""),
-            "tool_calls": message.get("tool_calls", []),
-            "done_reason": data.get("done_reason", "stop")
-        }
+        normalized = _openai_msg_to_local(message)
+        normalized["done_reason"] = finish_reason
+        return normalized
+
     except Exception as e:
         err_type = type(e).__name__
         usage.error_type = err_type
         context_budget.log_metrics(usage)
-        if "ConnectionError" in err_type:
-            return {"content": "[ERROR] 無法連接 Ollama", "tool_calls": [], "done_reason": "error"}
-        elif "Timeout" in err_type:
-            return {"content": "[ERROR] 請求超時", "tool_calls": [], "done_reason": "error"}
-        elif "HTTPError" in err_type or "404" in str(e):
-            msg = (
-                f"[ERROR] Ollama 回 HTTP 錯誤: {e}\n"
-                f"   常見原因：模型 {model!r} 沒有 pull。\n"
-                f"   檢查: ollama list  /  必要時 ollama pull {model}"
-            )
-            return {"content": msg, "tool_calls": [], "done_reason": "error"}
-        else:
-            return {"content": f"[ERROR] 錯誤: {e} (model={model})", "tool_calls": [], "done_reason": "error"}
+        return {"content": _llama_error_message(e, model),
+                "tool_calls": [], "done_reason": "error"}
 
 
 def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
-    """呼叫 LLM（帶工具，串流輸出，批次顯示）"""
+    """呼叫主 LLM(stream,走 /v1/chat/completions)。
+
+    這個函式只在 run_agent 的最終 summary 階段被呼叫,通常不會回 tool_calls
+    (因為 prompt 是「請總結」),所以這裡專注串流文字,不重組 tool_calls。
+    """
     import time
 
     model = config.require_main_model()
@@ -228,15 +284,16 @@ def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
         return str(exc)
 
     try:
-        session = get_session()
-        resp = session.post(OLLAMA_CHAT_URL, json={
-            "model": model,
-            "messages": messages,
-            "tools": tools,
-            "stream": True,
-            "options": {"num_ctx": num_ctx, "temperature": temperature},
-        }, timeout=600, stream=True)
-        resp.raise_for_status()
+        stream = llama_client.chat_completions(
+            base_url=LLAMA_BASE_URL,
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            tools=tools,
+            tool_choice="auto",
+            stream=True,
+            timeout=600,
+        )
 
         full_response = []
         buffer = []
@@ -245,34 +302,32 @@ def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
         BATCH_SIZE = 20
         FLUSH_INTERVAL = 0.1
 
-        for line in resp.iter_lines():
-            if line:
-                try:
-                    chunk = json.loads(line)
-                    message = chunk.get("message", {})
-                    token = message.get("content", "")
-                    if token:
-                        full_response.append(token)
-                        buffer.append(token)
-                        buffer_chars += len(token)
+        for chunk in stream:
+            choices = chunk.get("choices") if isinstance(chunk, dict) else None
+            if not choices:
+                context_budget.parse_usage_from_stream_chunk(chunk, usage)
+                continue
+            delta = choices[0].get("delta") or {}
+            token = delta.get("content") or ""
+            if token:
+                full_response.append(token)
+                buffer.append(token)
+                buffer_chars += len(token)
 
-                        now = time.time()
-                        should_flush = (
-                            '\n' in token or
-                            buffer_chars >= BATCH_SIZE or
-                            (now - last_flush) >= FLUSH_INTERVAL
-                        )
+                now = time.time()
+                should_flush = (
+                    '\n' in token or
+                    buffer_chars >= BATCH_SIZE or
+                    (now - last_flush) >= FLUSH_INTERVAL
+                )
 
-                        if should_flush and buffer:
-                            print(''.join(buffer), end="", flush=True)
-                            buffer = []
-                            buffer_chars = 0
-                            last_flush = now
+                if should_flush and buffer:
+                    print(''.join(buffer), end="", flush=True)
+                    buffer = []
+                    buffer_chars = 0
+                    last_flush = now
 
-                    context_budget.parse_usage_from_stream_chunk(chunk, usage)
-
-                except json.JSONDecodeError:
-                    pass
+            context_budget.parse_usage_from_stream_chunk(chunk, usage)
 
         if buffer:
             print(''.join(buffer), end="", flush=True)
@@ -286,18 +341,7 @@ def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
         err_type = type(e).__name__
         usage.error_type = err_type
         context_budget.log_metrics(usage)
-        if "ConnectionError" in err_type:
-            return "[ERROR] 無法連接 Ollama"
-        elif "Timeout" in err_type:
-            return "[ERROR] 請求超時"
-        elif "HTTPError" in err_type or "404" in str(e):
-            return (
-                f"[ERROR] Ollama 回 HTTP 錯誤: {e}\n"
-                f"   常見原因：模型 {model!r} 沒有 pull。\n"
-                f"   檢查: ollama list  /  必要時 ollama pull {model}"
-            )
-        else:
-            return f"[ERROR] 錯誤: {e} (model={model})"
+        return _llama_error_message(e, model)
 
 
 # ============================================================

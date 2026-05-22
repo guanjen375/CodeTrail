@@ -28,7 +28,7 @@
   },
   {
     "id": "bug_004",
-    "question": "呼叫 Ollama API 時經常 timeout，錯誤訊息是 ReadTimeout",
+    "question": "呼叫 llama-server API 時經常 timeout，錯誤訊息是 ReadTimeout",
     "expected": {
       "cause": "timeout",
       "fix_keywords": ["timeout", "重試", "retry", "增加"]

@@ -49,45 +49,33 @@ from agent import run_agent
 from utils import call_llm, answer_with_self_check, extract_evidence_mapping
 
 
-def check_ollama_health(max_retries: int = 3, timeout: int = 10) -> bool:
-    """檢查 Ollama 是否正常運作，必要時自動重啟
+def check_llama_health(max_retries: int = 3, timeout: int = 10) -> bool:
+    """檢查 llama-server 是否正常運作。
 
     Args:
         max_retries: 最大重試次數
         timeout: API 請求 timeout（秒）
 
     Returns:
-        True 如果 Ollama 正常，False 如果無法恢復
+        True 如果主 server 回 /health 200,否則 False
     """
-    ollama_url = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
+    base_url = os.environ.get('AICODE_LLAMA_BASE_URL', 'http://localhost:8080')
 
     for attempt in range(max_retries):
         try:
-            # 嘗試呼叫 Ollama API
-            resp = requests.get(f"{ollama_url}/api/tags", timeout=timeout)
+            resp = requests.get(f"{base_url}/health", timeout=timeout)
             if resp.status_code == 200:
-                print(f"[HEALTH] Ollama 正常運作中")
+                print(f"[HEALTH] llama-server 正常運作中 ({base_url})")
                 return True
         except requests.exceptions.RequestException as e:
-            print(f"[HEALTH] Ollama 無回應 (attempt {attempt + 1}/{max_retries}): {e}")
+            print(f"[HEALTH] llama-server 無回應 (attempt {attempt + 1}/{max_retries}): {e}")
 
-        # 嘗試重啟 Ollama
+        # llama-server 由使用者自己 systemd / shell 管理,這裡不嘗試自動重啟
         if attempt < max_retries - 1:
-            print(f"[HEALTH] 嘗試重啟 Ollama...")
-            try:
-                subprocess.run(
-                    ['sudo', 'systemctl', 'restart', 'ollama'],
-                    timeout=30,
-                    capture_output=True
-                )
-                # 等待 Ollama 啟動
-                time.sleep(5)
-            except subprocess.TimeoutExpired:
-                print(f"[HEALTH] 重啟 Ollama 超時")
-            except Exception as e:
-                print(f"[HEALTH] 重啟 Ollama 失敗: {e}")
+            print(f"[HEALTH] 等待 {timeout}s 再重試 (請手動確認 llama-server 已啟動)")
+            time.sleep(timeout)
 
-    print(f"[HEALTH] Ollama 無法恢復，請手動檢查")
+    print(f"[HEALTH] llama-server 無法連接,請手動檢查 ({base_url}/health)")
     return False
 
 
@@ -825,9 +813,9 @@ def run_evaluation(
     print(f"Using model: {_resolved} (from {_source})")
     print(f"NUM_CTX: {_eval_config.NUM_CTX}")
 
-    # 健康檢查 - 確保 Ollama 正常運作
-    if not check_ollama_health():
-        print("\n[ERROR] Ollama 無法啟動，評測中止")
+    # 健康檢查 - 確保 llama-server 正常運作
+    if not check_llama_health():
+        print("\n[ERROR] llama-server 無法連接,評測中止")
         return {}
 
     # P0-Eval: 決定要載入哪些 set_type

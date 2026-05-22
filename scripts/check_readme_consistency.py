@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """README / docs ↔ mcp_server.py / config.py 一致性檢查。
 
-不解析 markdown，只用 regex 抓出使用者文件上需要對齊的事實，
-和原始碼比對：
+不解析 markdown,只用 regex 抓出使用者文件上需要對齊的事實,
+和原始碼比對:
   1. mcp_server.py 內 @mcp.tool() 的工具數 == 文件提到的「N 個工具」
   2. 文件工具表內每個 backtick 工具名都在 mcp_server.py 裡定義
   3. config.py 的固定附屬模型 EMBEDDING_MODEL / RERANKER_MODEL / VL_MODEL 在文件出現
   4. README 必須包含「成熟私有部署版」/「不公開發布」之類產品狀態語句
-  5. README / docs 的 <CODE_MODEL> placeholder、doctor 指令與 OpenCode JSON 範本一致
+  5. README / docs 必須提到 llama-server / GGUF / <CODE_MODEL> placeholder / OpenCode JSON 範本
 
-退出碼：0=OK, 1=有 drift。
+退出碼:0=OK, 1=有 drift。
 """
 from __future__ import annotations
 
@@ -87,77 +87,22 @@ def _config_model_values(config_text: str) -> dict[str, str]:
     return out
 
 
-def _extract_pull_tags(readme_text: str) -> set[str]:
-    """從 README 抓 `ollama pull <model>:<tag>` 的所有 model 名(含 tag)。"""
-    tags = set()
-    for m in re.finditer(r"ollama\s+pull\s+([^\s`]+)", readme_text):
-        tags.add(m.group(1).strip())
-    return tags
-
-
-def _extract_opencode_model_keys_from_json(text: str) -> set[str]:
-    """從 opencode.json 風格的 JSON 文本抓 models 區塊裡的 key(model:tag)。
-
-    輕量正則,不真的 parse JSON,因為 README 的 fenced block 不是合法 JSON 子集。
-    """
-    keys = set()
-    # 比對 "models" 區塊內任何 "model:tag": { ... }
-    in_models = False
-    brace_depth = 0
-    for line in text.splitlines():
-        if '"models"' in line:
-            in_models = True
-            brace_depth = 0
-        if in_models:
-            brace_depth += line.count("{") - line.count("}")
-            m = re.match(r'\s*"([a-zA-Z0-9._/-]+:[a-zA-Z0-9._-]+)"\s*:\s*\{', line)
-            if m:
-                keys.add(m.group(1))
-            if brace_depth <= 0 and ('}' in line):
-                # 結束 models 區塊
-                in_models = False
-    return keys
-
-
-def _check_model_tag_consistency(readme_text: str, issues: list[str]) -> None:
-    """README pull 指令與 README 內嵌 opencode JSON 的 model tag 必須一致。"""
-    pulled = _extract_pull_tags(readme_text)
-    readme_json_keys = _extract_opencode_model_keys_from_json(readme_text)
-
-    # README 內 opencode 區塊提到的 model 必須有出現在 ollama pull 指令(否則新手不知該 pull 什麼)
-    # 這裡只檢查同名 model 的 tag 不要打架。
-    def _name(k: str) -> str:
-        return k.split(":")[0]
-
-    # README JSON ↔ pull
-    for key in readme_json_keys:
-        name = _name(key)
-        candidates = {p for p in pulled if _name(p) == name}
-        if candidates and key not in candidates:
-            issues.append(
-                f"README opencode 區塊寫 {key!r}, 但 README 的 `ollama pull` 是 "
-                f"{sorted(candidates)} — model tag 不一致,新手會 pull 錯。"
-            )
-
-
 def _check_code_model_placeholder_contract(readme_text: str, docs_text: str, issues: list[str]) -> None:
-    if "ollama pull <CODE_MODEL>" not in docs_text:
-        issues.append("README/docs 必須包含 `ollama pull <CODE_MODEL>`，且 <CODE_MODEL> 是 placeholder")
+    """確認 README/docs 仍把 <CODE_MODEL> 當 placeholder,且有提到 llama-server / GGUF / opencode model 範本。"""
+    if "<CODE_MODEL>" not in docs_text:
+        issues.append("README/docs 必須使用 <CODE_MODEL> placeholder 來代表主模型(不要 hardcode 真實 tag)")
 
-    required_readme = [
-        '"model": "ollama/<CODE_MODEL>"',
-        '"small_model": "ollama/<CODE_MODEL>"',
+    must_have = [
+        ("llama-server", "README/docs 必須提到 llama-server (llama.cpp HTTP server)"),
+        ("GGUF", "README/docs 必須提到 GGUF (模型檔格式)"),
     ]
-    for needle in required_readme:
-        if needle not in readme_text:
-            issues.append(f"README OpenCode JSON 範本缺少 {needle}")
+    for needle, msg in must_have:
+        if needle not in docs_text:
+            issues.append(msg)
 
-    if not re.search(
-        r'"<CODE_MODEL>"\s*:\s*\{\s*"name"\s*:\s*"<CODE_MODEL>"',
-        readme_text,
-        re.DOTALL,
-    ):
-        issues.append('README OpenCode JSON 範本缺少 "<CODE_MODEL>": {"name": "<CODE_MODEL>"}')
+    # opencode.json 範本必含 `"model": "<some-provider>/<CODE_MODEL>"`(provider 名稱使用者自選)
+    if not re.search(r'"model"\s*:\s*"[a-zA-Z][a-zA-Z0-9_-]*/<CODE_MODEL>"', readme_text):
+        issues.append('README OpenCode JSON 範本缺少 "model": "<provider>/<CODE_MODEL>" (provider 名使用者自選)')
 
 
 def _check_doctor_commands_have_explicit_model(docs_text: str, issues: list[str]) -> None:
@@ -240,8 +185,7 @@ def check_all() -> list[str]:
             "README 缺少產品狀態說明（任一：" + " / ".join(_PRODUCT_STATUS_PHRASES) + "）"
         )
 
-    # 5. model tag drift(ollama pull ↔ opencode JSON)
-    _check_model_tag_consistency(docs_text, issues)
+    # 5. placeholder contract + doctor command + forbidden tokens
     _check_code_model_placeholder_contract(readme_text, docs_text, issues)
     _check_doctor_commands_have_explicit_model(docs_text, issues)
     _check_forbidden_main_model_tokens(docs_text, issues)

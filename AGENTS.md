@@ -1,7 +1,8 @@
 # AGENTS.md — 給 AI coding agent 的工作規範
 
 這個 repo 是一個 **本地 RAG / Code-RAG / MCP 工具集**。終端使用者透過 OpenCode TUI
-和 `aicode` wrapper 連到這個專案，用本地 Ollama 模型分析 NDA / 內部 firmware repo。
+和 `aicode` wrapper 連到這個專案，用本地 llama.cpp `llama-server` 跑模型,
+分析 NDA / 內部 firmware repo。
 
 如果你是 AI coding agent（Codex / OpenCode 等）正在改這個 repo，請先把這份檔讀完。
 維護命令、測試流程、eval 漂移檢查見 [README_DEV.md](README_DEV.md)。
@@ -39,7 +40,7 @@
 - 不要 `git commit` 沒被使用者確認過的修改。
 
 ### 2.3 預設離線
-- CI 不可以依賴 ollama / GPU / 大型模型下載。
+- CI 不可以依賴 llama-server / GPU / 大型 GGUF 下載。
 - 任何測試用到 LLM 都要 mock 或 graceful skip（`pytest.importorskip` 或 `pytest.skip`）。
 
 ---

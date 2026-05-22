@@ -15,9 +15,9 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 
-from http_client import get_session
+import llama_client
 from config import (
-    OLLAMA_GENERATE_URL, VL_MODEL, IMAGE_EXTENSIONS,
+    LLAMA_VL_BASE_URL, VL_MODEL, IMAGE_EXTENSIONS,
     BIN_ELF_REPORT_MAX_CHARS,
     BIN_ELF_MAX_SECTIONS, BIN_ELF_MAX_FUNCS, BIN_ELF_MAX_OBJS, BIN_ELF_MAX_STRINGS
 )
@@ -1478,22 +1478,21 @@ def ocr_image(path: str) -> str:
         with open(p, "rb") as f:
             data = base64.b64encode(f.read()).decode()
 
-        session = get_session()
-        resp = session.post(OLLAMA_GENERATE_URL, json={
-            "model": VL_MODEL,
-            "prompt": (
+        resp_data = llama_client.native_completion(
+            base_url=LLAMA_VL_BASE_URL,
+            prompt=(
                 "請完整分析這張圖片，使用繁體中文輸出。\n"
                 "1. 先用 3-6 句描述主要畫面、物件、人物/角色、背景與風格。\n"
                 "2. 若圖片中有文字或數字，另列「可見文字」並保持原文。\n"
                 "3. 若是 UI、終端機、錯誤截圖、表格或圖表，請整理關鍵資訊與可能含義。\n"
                 "4. 若幾乎沒有文字，也不要只回答空白；仍要描述視覺內容。"
             ),
-            "images": [data],
-            "stream": False,
-            "options": {"num_ctx": 4096, "temperature": 0.1},
-        }, timeout=120)
-        resp.raise_for_status()
-        result = resp.json().get("response", "").strip()
+            temperature=0.1,
+            stream=False,
+            image_data=[{"id": 10, "data": data}],
+            timeout=120,
+        )
+        result = (resp_data.get("content") or resp_data.get("response") or "").strip()
         _cache_set(_OCR_CACHE, cache_key, result, _OCR_CACHE_MAX)
         return result
     except Exception as e:
