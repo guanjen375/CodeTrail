@@ -202,28 +202,23 @@ CodeTrail 預期 4 個角色各自一個 `llama-server` instance,**main / embedd
 | 8082 | reranker(RAG 結果重排) | `bge-reranker-v2-m3` | 是 |
 | 8083 | VL(看截圖 / 圖片) | `qwen3-vl` 等 | 否 |
 
-下面用 tmux 一個 session 開 3 個 pane,3 個 server 各跑一個,detach 之後 server 留在背景,terminal 關掉也不會死。
+下面**一個 server 開一個獨立的 tmux session**,3 個 server 共 3 個 session。流程都一樣:`tmux new -s <名字>` 進去 → 貼指令 → 等 `server is listening on ...` → 按 `Ctrl-b d` 退出來放背景。terminal 之後關掉也不會死。
 
-### 3.1 開 tmux session
+> **tmux 你會用到的 4 個指令**(其他都不用學):
+> - `Ctrl-b d` —— 把目前 session 放背景,回到原本 shell
+> - `tmux ls` —— 列出所有背景 session
+> - `tmux a -t <名字>` —— 接回去看某個 session 的即時 log
+> - `tmux kill-session -t <名字>` —— 關掉某個 session
+
+### 3.1 Session 1 — 主 server(:8080)
+
+從你的一般 shell 起 session:
 
 ```bash
-tmux new -s codetrail
+tmux new -s codetrail-main
 ```
 
-進去之後 tmux 最小操作:
-
-- `Ctrl-b "` 把目前 pane 水平切成兩半
-- `Ctrl-b %` 垂直切
-- `Ctrl-b ↑ / ↓ / ← / →` 在 pane 間移動
-- `Ctrl-b d` detach(server 繼續活著)
-- `tmux attach -t codetrail` 之後接回來
-- `tmux kill-session -t codetrail` 全部停掉
-
-按 `Ctrl-b "` 再 `Ctrl-b "` 切出 3 個 pane,接下來每個 pane 跑一個 server。
-
-### 3.2 Pane 0 — 主 server(:8080)
-
-5090 + Qwen3-235B-A22B-Instruct-2507 Q4_K_M(`--cpu-moe` MoE expert 卸到 CPU RAM):
+進去之後(prompt 下方會出現綠色 tmux 狀態列)貼下面這條,5090 + Qwen3-235B-A22B-Instruct-2507 Q4_K_M 範例:
 
 ```bash
 ~/llama.cpp/build/bin/llama-server \
@@ -247,17 +242,21 @@ tmux new -s codetrail
 
 非 MoE 模型(dense 30B / 14B / 7B)**不要加** `--cpu-moe` 與 `--no-mmap`,直接拿掉那兩行即可。
 
-啟動後等到看到這行才算成功:
+`--no-mmap` 模式下大約 1.5–2.5 分鐘(看 SSD 速度),期間會看到一堆 `load_tensors:` 滾過。**等到下面這行出現才算成功**:
 
 ```
 srv  llama_server: server is listening on http://0.0.0.0:8080
 ```
 
-`--no-mmap` 模式下大約 1.5–2.5 分鐘(看 SSD 速度),期間會看到一堆 `load_tensors:` 滾過。
+看到之後按 `Ctrl-b d` 退出來,回到一般 shell。server 留在背景跑。
 
-### 3.3 Pane 1 — embedding server(:8081)
+### 3.2 Session 2 — embedding server(:8081)
 
-`Ctrl-b ↓` 切到下一個 pane:
+```bash
+tmux new -s codetrail-embed
+```
+
+進去後貼:
 
 ```bash
 ~/llama.cpp/build/bin/llama-server \
@@ -266,11 +265,15 @@ srv  llama_server: server is listening on http://0.0.0.0:8080
   -c 8192 --embedding --pooling cls -ngl 99
 ```
 
-5–10 秒內 `server is listening on http://0.0.0.0:8081`。
+5–10 秒內看到 `server is listening on http://0.0.0.0:8081`,按 `Ctrl-b d` 退出。
 
-### 3.4 Pane 2 — reranker server(:8082)
+### 3.3 Session 3 — reranker server(:8082)
 
-再切到第三個 pane:
+```bash
+tmux new -s codetrail-rerank
+```
+
+進去後貼:
 
 ```bash
 ~/llama.cpp/build/bin/llama-server \
@@ -279,19 +282,37 @@ srv  llama_server: server is listening on http://0.0.0.0:8080
   -c 8192 --reranking -ngl 99
 ```
 
-同樣 5–10 秒就 listening。
+同樣 5–10 秒 listening,`Ctrl-b d` 退出。
 
-### 3.5 Detach 並驗活
+### 3.4 驗活與維運
 
-按 `Ctrl-b d` 把 tmux session detach,terminal 回到原本的 shell,3 個 server 留在背景。隨時 `tmux attach -t codetrail` 接回去看 log。
+確認 3 個 session 都在背景跑:
 
-驗 3 個 server 都通:
+```bash
+tmux ls
+# 應該看到:
+#   codetrail-main:   1 windows (created ...)
+#   codetrail-embed:  1 windows (created ...)
+#   codetrail-rerank: 1 windows (created ...)
+```
+
+驗 3 個 port 都通:
 
 ```bash
 for p in 8080 8081 8082; do
   echo ":$p → $(curl -s -o /dev/null -w '%{http_code}' http://localhost:$p/health)"
 done
 # 應該都印 200
+```
+
+要回去看某個 server 的 log:`tmux a -t codetrail-main`(看完 `Ctrl-b d` 再放背景)。
+
+之後要關掉全部:
+
+```bash
+tmux kill-session -t codetrail-main
+tmux kill-session -t codetrail-embed
+tmux kill-session -t codetrail-rerank
 ```
 
 VRAM 與 RAM 預期占用(5090 + 235B `--cpu-moe --no-mmap`):

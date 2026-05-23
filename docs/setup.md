@@ -163,7 +163,7 @@ pkill -INT -f "llama-server.*--port 8080"
 # 3. 等個 2-3 秒讓 KV cache / prompt cache flush
 sleep 3
 
-# 4. 用新參數重啟(在 tmux pane 內或 systemd 直接 restart)
+# 4. 用新參數重啟(在 tmux session 內貼新指令,或 systemd 直接 restart)
 ```
 
 systemd 版本:
