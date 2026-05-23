@@ -8,6 +8,73 @@
 
 ## 常見問題
 
+### Build llama.cpp 時 `nvcc fatal : Unsupported gpu architecture 'compute_120a'`
+
+你的 GPU 是 Blackwell(RTX 50 系列、RTX 6000 Ada Blackwell 等),但本機 CUDA Toolkit 太舊,不認識 `sm_120` / `compute_120a`。Ubuntu 24.04 的 `nvidia-cuda-toolkit` 套件停在 12.0,**Blackwell 需要 12.8+**。
+
+驗證:
+
+```bash
+nvidia-smi | grep "CUDA Version"   # 驅動上限,>= 12.8 才有救
+nvcc --version                      # 已安裝 toolkit
+```
+
+修法見 [README §1.4](../README.md#14-僅-blackwell-gpu-需要升級-cuda-toolkit-到-13)。重點順序:
+
+1. 從 NVIDIA apt repo 裝 `cuda-toolkit-13-0`(**不要**裝 `cuda` 或 `cuda-13-0`,那兩個會連驅動拉下來打架)
+2. `sudo apt remove --purge nvidia-cuda-toolkit ...` 移除 Ubuntu 內建舊的(避免 `/usr/bin/nvcc` 被當第一順位)
+3. `export PATH=/usr/local/cuda-13.0/bin:$PATH`
+4. `rm -rf build && cmake -B build ...` 重來(CMake 快取會記住舊 toolkit 路徑)
+
+驗證 CMake 確實切到新版:輸出要有 `Found CUDAToolkit: ... (found version "13.x")` 和 `Compiler: /usr/local/cuda-13.0/bin/nvcc`,不是 `/usr/bin/nvcc`。
+
+### CMake configure 時 `ptxas fatal : Value 'sm_52' is not defined for option 'gpu-name'`
+
+升級 CUDA 13 之後 CMake 還是抓到舊 nvcc 路徑,新舊 toolkit 二進位混用。代表 step 2 的 purge 沒跑、或 PATH 順序錯了。
+
+```bash
+which nvcc                          # 應該是 /usr/local/cuda-13.0/bin/nvcc
+echo $PATH | tr ':' '\n' | head     # /usr/local/cuda-13.0/bin 要在 /usr/bin 之前
+```
+
+不想移除舊 toolkit 的話,可以在 CMake 階段直接點名:
+
+```bash
+cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc
+```
+
+### MoE 模型第一次對話 TTFT(首字時間)1–2 分鐘
+
+例如 Qwen3-235B-A22B 用 `--cpu-moe` 但沒加 `--no-mmap`,llama-server 啟動會看到:
+
+```
+W llama_model_loader: tensor overrides to CPU are used with mmap enabled — consider using --no-mmap for better performance
+```
+
+mmap 模式下 expert weights 是懶載入,第一次推理時要從 SSD page-in 大量 expert 到 RAM,TTFT 容易破 60 秒。OpenCode TUI 會卡在「`...esc interrupt`」很久,**不要按 Esc** —— 它有在跑,只是慢。
+
+驗證是「慢」不是「卡」:
+
+```bash
+curl -s http://localhost:8080/slots | python3 -m json.tool   # 看主 server 是否 is_processing
+nvidia-smi -l 1                                              # GPU 是否在動
+```
+
+若 slot 都 idle、GPU 0% 連續超過 30 秒,代表請求**沒打到 server**(問題在 OpenCode / MCP 層,不是 llama-server)。看 OpenCode log:`ls -t ~/.local/share/opencode/log/*.log | head -1`。
+
+長期解法:重啟主 server 加 `--no-mmap`,前期載入慢 1.5–2.5 分鐘(把 ~135GB weights 全讀進 RAM),之後 TTFT 穩定在 5–15 秒。RAM 不夠 135GB 的就保持 mmap 接受偶爾卡頓,或換較小模型。
+
+### `pip install hf-transfer` 報 `error: externally-managed-environment`
+
+Ubuntu 24.04(PEP 668)的 Python 拒絕 system-wide pip install。加 `--user --break-system-packages`:
+
+```bash
+pip install --user --break-system-packages hf-transfer
+```
+
+`--user` 把套件裝進 `~/.local/lib/pythonX.Y/site-packages`,不會動到系統 Python。
+
 ### `/status` 沒看到 CodeTrail MCP Connected
 
 檢查:

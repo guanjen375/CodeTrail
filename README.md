@@ -6,11 +6,46 @@ CodeTrail 目前定位是**成熟私有部署版**:適合本機、離線、NDA /
 
 底層推理引擎使用 [llama.cpp](https://github.com/ggerganov/llama.cpp) `llama-server`(自己 build,需要 CUDA)。所有 LLM / embedding / reranker / VL 走它的 HTTP API。
 
+讀完這份 README 從零走到能進 OpenCode TUI 跟模型對話,大約需要:
+- 一次性安裝 + build:30–60 分鐘
+- 下載模型 GGUF:依網速與所選模型,5 分鐘到數小時不等
+
 ---
 
-## 安裝與啟動
+## 硬體與模型對照速查
 
-先安裝 OpenCode、llama.cpp、Python 依賴,完整步驟見 [docs/setup.md](docs/setup.md)。最小流程:
+`<CODE_MODEL>` 是 README / docs 全文使用的**佔位符**,代表你**自己選的主聊天 / 程式推導模型**。CodeTrail 不內建、不推薦、也不 fallback —— 你看完下表自己挑一顆 GGUF,後面所有步驟把 `<CODE_MODEL>` 換成你選的那顆。
+
+| 你的 VRAM | 可選 `<CODE_MODEL>` 量級 | 量化建議 | llama-server 額外旗標 |
+|---|---|---|---|
+| 48GB+(A6000 / RTX 6000 Ada) | Qwen3-235B-A22B-Instruct-2507 整顆塞 GPU,或 Qwen3-Coder-32B Q5/Q6 | Q4_K_M / Q5_K_M | `--jinja` |
+| 32GB(RTX 5090) | Qwen3-235B-A22B-Instruct-2507(MoE,135GB)+ CPU offload | Q4_K_M | `--jinja --cpu-moe --no-mmap` |
+| 24GB(RTX 4090 / 3090) | 30B 級 dense 模型,或 Qwen3-30B-A3B(MoE)+ 部分 offload | Q4_K_M | `--jinja`(若選 MoE 加 `--cpu-moe`) |
+| 16GB(RTX 4080 / 5070) | 14B / 20B 級 dense | Q4_K_M | `--jinja` |
+| 12GB 以下 | 7B / 8B / 14B 級,可能要 Q3 或部分 CPU offload | Q4 / Q3_K | `--jinja`(必要時 `-ngl <N>` 控制 GPU 層數) |
+
+下方步驟以 **RTX 5090 32GB + 170GB DDR5 RAM + Qwen3-235B-A22B-Instruct-2507 Q4_K_M(`--cpu-moe`)** 為走廊範例。其他硬體照同樣流程,把 `<CODE_MODEL>` 對應的 GGUF 名稱與 server 旗標換掉即可。額外的硬體取捨、context 大小、KV cache 量化、遠端 GPU 主機等深入內容見 [docs/models.md](docs/models.md)。
+
+---
+
+## 1. 安裝依賴
+
+### 1.1 系統工具
+
+- **Python 3.10+**(後續用 `python` 代表你的 Python 3,系統若只有 `python3` 把指令改掉即可)
+- **Node.js LTS + npm**(裝 OpenCode 需要)
+- **git**
+- **ripgrep** `rg`(建議但非必要,搜尋會快很多)
+- **tmux**(本文件用它在背景跑 3 個 llama-server;不熟可在這一步先 `sudo apt install tmux`,後面有 5 行教學)
+
+### 1.2 安裝 OpenCode
+
+```bash
+npm install -g opencode-ai
+command -v opencode    # 確認可被找到
+```
+
+### 1.3 安裝 CodeTrail Python 依賴
 
 ```bash
 cd <CODETRAIL_REPO>
@@ -18,75 +53,291 @@ pip install -r requirements.txt
 pip install mcp pymupdf4llm
 ```
 
-build llama.cpp(CUDA):
+`<CODETRAIL_REPO>` 是這個 CodeTrail 的 repo 路徑,不是你要分析的專案路徑。
+
+### 1.4 (僅 Blackwell GPU 需要)升級 CUDA Toolkit 到 13
+
+Ubuntu 24.04 的 `nvidia-cuda-toolkit` 套件停在 CUDA **12.0**,**不認識 Blackwell 的 `sm_120` / `compute_120a`**。如果你用 RTX 50 系列(5070 / 5080 / 5090 / 6000 Ada Blackwell),build llama.cpp 時會看到:
+
+```
+nvcc fatal : Unsupported gpu architecture 'compute_120a'
+```
+
+非 Blackwell(RTX 30/40、Ampere、Hopper)可直接跳到 1.5。
+
+驗證需不需要升級:
+
+```bash
+nvidia-smi | grep "CUDA Version"   # 驅動支援的最高 CUDA(只要 >= 12.8 就有救)
+nvcc --version                      # 目前已安裝的 toolkit 版本
+```
+
+升級流程(Ubuntu 24.04 / noble):
+
+```bash
+# (a) 加 NVIDIA 官方 apt repo
+cd /tmp
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt update
+
+# (b) 只裝 toolkit,不裝驅動(避免跟你現有 driver 打架)
+sudo apt install -y cuda-toolkit-13-0
+
+# (c) 移除 Ubuntu 內建舊 toolkit(避免 /usr/bin/nvcc 還是被當第一順位)
+sudo apt remove --purge nvidia-cuda-toolkit nvidia-cuda-toolkit-doc nvidia-cuda-dev
+sudo apt autoremove
+
+# (d) 把新 toolkit 加進 PATH 並寫進 ~/.bashrc
+echo 'export PATH=/usr/local/cuda-13.0/bin:$PATH' >> ~/.bashrc
+echo 'export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+
+# (e) 確認新版本生效
+hash -r
+which nvcc          # 應為 /usr/local/cuda-13.0/bin/nvcc
+nvcc --version      # 應顯示 release 13.x
+```
+
+若 `apt install cuda-toolkit-13-0` 想升級 / 移除你現有的 `nvidia-driver-*`,**停下來檢查**,通常不該發生;直接 `y` 可能會把 GPU 驅動換掉。
+
+### 1.5 Build llama.cpp(CUDA)
 
 ```bash
 git clone https://github.com/ggerganov/llama.cpp
 cd llama.cpp
 cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF
 cmake --build build --config Release -j
-# 拿到 build/bin/llama-server,丟到 PATH 或記住絕對路徑。
 ```
 
-### 下載 GGUF 與啟動 llama-server
+`cmake -B build ...` 跑完先看輸出有沒有:
 
-CodeTrail 不內建、也不替你預設任何「主聊天 / 程式推導模型」。你必須自己下載一顆 GGUF,下文用 `<CODE_MODEL>` 當佔位符代表它。選擇方式見 [docs/models.md](docs/models.md)。
+- `Found CUDAToolkit: ... (found version "13.x")` —— Blackwell 用戶要 13.x;其他卡 12.x 也行
+- `Compiler: /usr/local/cuda-13.0/bin/nvcc` —— 不是 `/usr/bin/nvcc`
+- 結尾 `Configuring done` / `Generating done`,沒有 `errors occurred`
 
-CodeTrail 預期 4 個角色各自一個 llama-server instance:
+第二條 `cmake --build` 編譯 20–40 分鐘。完成後 `~/llama.cpp/build/bin/llama-server` 就是後面要用的執行檔。
 
-| Port | 角色      | 必要 | 啟動旗標 |
-|------|-----------|------|----------|
-| 8080 | main      | 是   | `-c 65536 --jinja`(依模型) |
-| 8081 | embedding | 是   | `--embedding --pooling cls` |
-| 8082 | reranker  | 否   | `--reranking` |
-| 8083 | VL        | 否   | `--mmproj <mmproj.gguf>` |
+> 如果之前 build 失敗過(例如 CUDA 升級之前),**`rm -rf build` 再重來**,CMake 的快取會記住舊 toolkit 路徑。
 
-範例(假設你已下載好 GGUF 到 `~/models`):
+---
+
+## 2. 下載 GGUF
+
+### 2.1 安裝 hf-transfer 加速
+
+預設 `huggingface-cli download` 走單連線,實測 ~12 MB/s;裝 `hf-transfer` 後可以拉到 ~270 MB/s(視網路與 HF CDN 上限):
 
 ```bash
-# 主聊天 / 程式推導
-llama-server -m ~/models/<CODE_MODEL>.gguf \
-  --host 0.0.0.0 --port 8080 -c 65536 -ngl 99 --jinja \
-  --cache-type-k q8_0 --cache-type-v q8_0 &
-
-# embedding (bge-m3)
-llama-server -m ~/models/bge-m3-Q4_K_M.gguf \
-  --host 0.0.0.0 --port 8081 -c 8192 --embedding --pooling cls -ngl 99 &
-
-# reranker (bge-reranker-v2-m3)
-llama-server -m ~/models/bge-reranker-v2-m3-Q4_K_M.gguf \
-  --host 0.0.0.0 --port 8082 -c 8192 --reranking -ngl 99 &
+pip install --user --break-system-packages hf-transfer
+python -c "import hf_transfer; print('hf-transfer', hf_transfer.__version__)"
 ```
 
-### 維護 model registry
+`--break-system-packages` 是 Ubuntu 24.04 (PEP 668) 必要的旗標;不用害怕,只是用 `--user` 安裝到家目錄,不會動到系統 Python。
 
-讓 `AICODE_MODEL=qwen3-coder-32b` 這種 bare name 自動對應到 GGUF 路徑:
+啟用方式:下載指令前面加 `HF_HUB_ENABLE_HF_TRANSFER=1`。
+
+### 2.2 下載主聊天模型(`<CODE_MODEL>`)
+
+下面用 5090 走廊的 Qwen3-235B-A22B-Instruct-2507 Q4_K_M 當範例。它在 HuggingFace 上是 **3 個分片檔,共 ~134GB**:
+
+```bash
+mkdir -p ~/models
+
+HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
+  unsloth/Qwen3-235B-A22B-Instruct-2507-GGUF \
+  --include "Q4_K_M/*" \
+  --local-dir ~/models/Qwen3-235B-A22B-Instruct-2507-GGUF
+```
+
+下完之後會有:
+
+```
+~/models/Qwen3-235B-A22B-Instruct-2507-GGUF/Q4_K_M/
+  Qwen3-235B-A22B-Instruct-2507-Q4_K_M-00001-of-00003.gguf
+  Qwen3-235B-A22B-Instruct-2507-Q4_K_M-00002-of-00003.gguf
+  Qwen3-235B-A22B-Instruct-2507-Q4_K_M-00003-of-00003.gguf
+```
+
+> 啟動 server 時 `-m` **只指 shard 1**,llama.cpp 會自動讀第 2、3 片。
+
+如果你的硬體不是 5090、選了別的 `<CODE_MODEL>`,把上面的 repo 與 `--include` pattern 換成你要的那顆。常見社群 GGUF 來源:`unsloth/...-GGUF`、`bartowski/...-GGUF`、官方 `Qwen/...-GGUF`。
+
+### 2.3 下載 RAG 必要模型
+
+CodeTrail 的 RAG / Code-RAG 內建固定使用 `bge-m3`(embedding)和 `bge-reranker-v2-m3`(reranker),這兩個體積很小:
+
+```bash
+# embedding:bge-m3 (用 f16,不要量化 — embedding 對量化敏感,Q4 會明顯影響召回)
+HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
+  CompendiumLabs/bge-m3-gguf bge-m3-f16.gguf \
+  --local-dir ~/models/bge-m3
+
+# reranker:bge-reranker-v2-m3
+HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
+  gpustack/bge-reranker-v2-m3-GGUF bge-reranker-v2-m3-Q4_K_M.gguf \
+  --local-dir ~/models/bge-reranker-v2-m3
+```
+
+兩個合計約 1.5GB。
+
+### 2.4 (選用)VL 模型
+
+只在你會用 `analyze_file(...)` 處理截圖、UI 錯誤畫面、或把圖片 ingest 進 RAG 知識庫時才需要。CodeTrail 的內建 VL key 是 `qwen3-vl`,但任何相容的 VL GGUF 都可以(需要 mmproj 副檔)。沒打算分析圖片的話這一步直接跳過。
+
+---
+
+## 3. 啟動 3 個 llama-server(用 tmux 跑在背景)
+
+CodeTrail 預期 4 個角色各自一個 `llama-server` instance,**main / embedding / reranker 三個是 RAG + 程式對話必要的,VL 選用**。會分開是因為 `llama-server` 一次只能載一顆 GGUF,不同角色用不同模型 / 不同模式(`--embedding` / `--reranking` / `--jinja` / `--mmproj`),所以必須開不同 process。
+
+| Port | 角色 | 模型 | 必要 |
+|---|---|---|---|
+| 8080 | main(聊天、推理、工具呼叫) | `<CODE_MODEL>` | 是 |
+| 8081 | embedding(算向量,RAG 搜相似段落) | `bge-m3` | 是 |
+| 8082 | reranker(RAG 結果重排) | `bge-reranker-v2-m3` | 是 |
+| 8083 | VL(看截圖 / 圖片) | `qwen3-vl` 等 | 否 |
+
+下面用 tmux 一個 session 開 3 個 pane,3 個 server 各跑一個,detach 之後 server 留在背景,terminal 關掉也不會死。
+
+### 3.1 開 tmux session
+
+```bash
+tmux new -s codetrail
+```
+
+進去之後 tmux 最小操作:
+
+- `Ctrl-b "` 把目前 pane 水平切成兩半
+- `Ctrl-b %` 垂直切
+- `Ctrl-b ↑ / ↓ / ← / →` 在 pane 間移動
+- `Ctrl-b d` detach(server 繼續活著)
+- `tmux attach -t codetrail` 之後接回來
+- `tmux kill-session -t codetrail` 全部停掉
+
+按 `Ctrl-b "` 再 `Ctrl-b "` 切出 3 個 pane,接下來每個 pane 跑一個 server。
+
+### 3.2 Pane 0 — 主 server(:8080)
+
+5090 + Qwen3-235B-A22B-Instruct-2507 Q4_K_M(`--cpu-moe` MoE expert 卸到 CPU RAM):
+
+```bash
+~/llama.cpp/build/bin/llama-server \
+  -m ~/models/Qwen3-235B-A22B-Instruct-2507-GGUF/Q4_K_M/Qwen3-235B-A22B-Instruct-2507-Q4_K_M-00001-of-00003.gguf \
+  --host 0.0.0.0 --port 8080 \
+  -c 65536 -ngl 99 --jinja \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --cpu-moe \
+  --no-mmap
+```
+
+旗標說明:
+
+- `-m ...-00001-of-00003.gguf` —— 只指 shard 1,llama.cpp 自動接後續
+- `-c 65536` —— context 上限 64K token(模型原生 256K,KV cache 會吃 VRAM,先從 64K 起)
+- `-ngl 99` —— 嘗試把所有層放 GPU(MoE expert 之後會被 `--cpu-moe` 拉回 CPU)
+- `--jinja` —— 啟用模型內建 chat template,tool calling 才會走對格式
+- `--cache-type-k/v q8_0` —— KV cache 量化到 8-bit,64K ctx 約省一半 VRAM
+- `--cpu-moe` —— **MoE 模型才加**;把 expert tensors 卸到 CPU RAM(吃 ~130GB RAM)
+- `--no-mmap` —— **強烈建議搭 `--cpu-moe` 一起加**;不加的話用 mmap 懶載入,第一次推理 TTFT 可能 1–2 分鐘(每次觸到新 expert 都要從 SSD page-in);加了之後啟動時把 weights 全讀進 RAM,啟動慢 1–2 分鐘但之後對話穩定
+
+非 MoE 模型(dense 30B / 14B / 7B)**不要加** `--cpu-moe` 與 `--no-mmap`,直接拿掉那兩行即可。
+
+啟動後等到看到這行才算成功:
+
+```
+srv  llama_server: server is listening on http://0.0.0.0:8080
+```
+
+`--no-mmap` 模式下大約 1.5–2.5 分鐘(看 SSD 速度),期間會看到一堆 `load_tensors:` 滾過。
+
+### 3.3 Pane 1 — embedding server(:8081)
+
+`Ctrl-b ↓` 切到下一個 pane:
+
+```bash
+~/llama.cpp/build/bin/llama-server \
+  -m ~/models/bge-m3/bge-m3-f16.gguf \
+  --host 0.0.0.0 --port 8081 \
+  -c 8192 --embedding --pooling cls -ngl 99
+```
+
+5–10 秒內 `server is listening on http://0.0.0.0:8081`。
+
+### 3.4 Pane 2 — reranker server(:8082)
+
+再切到第三個 pane:
+
+```bash
+~/llama.cpp/build/bin/llama-server \
+  -m ~/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q4_K_M.gguf \
+  --host 0.0.0.0 --port 8082 \
+  -c 8192 --reranking -ngl 99
+```
+
+同樣 5–10 秒就 listening。
+
+### 3.5 Detach 並驗活
+
+按 `Ctrl-b d` 把 tmux session detach,terminal 回到原本的 shell,3 個 server 留在背景。隨時 `tmux attach -t codetrail` 接回去看 log。
+
+驗 3 個 server 都通:
+
+```bash
+for p in 8080 8081 8082; do
+  echo ":$p → $(curl -s -o /dev/null -w '%{http_code}' http://localhost:$p/health)"
+done
+# 應該都印 200
+```
+
+VRAM 與 RAM 預期占用(5090 + 235B `--cpu-moe --no-mmap`):
+
+```
+VRAM  ~14 GB / 32 GB    (主 ~12.5 + embed ~1 + rerank ~0.4)
+RAM   ~135 GB / 170 GB  (主要是 235B MoE expert 整個讀進 RAM)
+```
+
+---
+
+## 4. 設定 CodeTrail + OpenCode
+
+### 4.1 Model registry(短名稱 → GGUF 路徑)
+
+讓 `AICODE_MODEL=<CODE_MODEL>` 這種短名稱自動對應到實際 GGUF 路徑,不用每次打絕對路徑:
 
 ```bash
 mkdir -p ~/.config/codetrail
 cat > ~/.config/codetrail/models.json <<'EOF'
 {
-  "<CODE_MODEL>": "~/models/<CODE_MODEL>.gguf"
+  "<CODE_MODEL>": "~/models/<CODE_MODEL_GGUF_RELATIVE_PATH>.gguf",
+  "bge-m3": "~/models/bge-m3/bge-m3-f16.gguf",
+  "bge-reranker-v2-m3": "~/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q4_K_M.gguf"
 }
 EOF
 ```
 
-也可以跳過 registry,直接把 `AICODE_MODEL` 設成 GGUF 絕對路徑。
+用 5090 走廊的 235B 為例,實際內容會像:
 
-### 自檢
-
-```bash
-AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py
+```json
+{
+  "qwen3-235b-a22b-instruct": "~/models/Qwen3-235B-A22B-Instruct-2507-GGUF/Q4_K_M/Qwen3-235B-A22B-Instruct-2507-Q4_K_M-00001-of-00003.gguf",
+  "bge-m3": "~/models/bge-m3/bge-m3-f16.gguf",
+  "bge-reranker-v2-m3": "~/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q4_K_M.gguf"
+}
 ```
 
-接著做一個一次性 OpenCode 設定:
+也可以跳過 registry 直接把 `AICODE_MODEL` 設絕對路徑,但 registry 比較好維護。
+
+### 4.2 OpenCode config
+
+llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 即可:
 
 ```bash
 mkdir -p ~/.config/opencode
 ${EDITOR:-vi} ~/.config/opencode/opencode.json
 ```
 
-把下面內容貼進 `~/.config/opencode/opencode.json`;它會設定 openai-compatible provider 指到 llama-server `/v1`、CodeTrail MCP server 和 OpenCode 權限。**把所有 `<CODE_MODEL>` 都替換成你的模型名稱**:
+把下面整段貼進去,**把所有 `<CODE_MODEL>` 換成你 4.1 裡用的 registry key**(例如 `qwen3-235b-a22b-instruct`):
 
 ```json
 {
@@ -109,7 +360,7 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
       "models": {
         "<CODE_MODEL>": {
           "name": "<CODE_MODEL>",
-          "limit": { "context": 65536, "output": 8192 }
+          "limit": { "context": 32768, "output": 8192 }
         }
       }
     }
@@ -157,37 +408,77 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
 }
 ```
 
-`llamacpp` 是 provider key,你可以叫它別的名字(`local`、`llmcpp`、隨意),但要跟 `"model"` 那段的 prefix 對齊。`apiKey` llama-server 預設不檢查,填任意非空值即可。
+說明:
 
-貼完先確認 JSON 格式:
+- `llamacpp` 是 provider key,可改名(`local`、`llmcpp`、隨意),但要跟 `"model"` 那段的 prefix 對齊。
+- `apiKey` 任意非空值即可,llama-server 預設不檢查。
+- `limit.context: 32768` 是 OpenCode 主對話實際塞給 server 的上限。可以等於 server `-c`(64K),但留一半做 output / 不擠爆比較穩。
+- `permission` 區段:`*: deny` 是預設拒絕一切,只白名單 `codetrail_*`(經 CodeTrail 沙箱)。OpenCode 內建工具(`bash` / `read` / `write` 等)會繞過 CodeTrail 沙箱,所以這裡明確 `deny`。
+
+貼完先驗 JSON 格式:
 
 ```bash
-python3 -m json.tool ~/.config/opencode/opencode.json >/dev/null
+python -m json.tool ~/.config/opencode/opencode.json >/dev/null
 ```
 
-再把 `aicode` 放進 PATH:
+### 4.3 安裝 `aicode` 啟動指令
+
+從 CodeTrail repo 根目錄:
 
 ```bash
 chmod +x ./aicode
 mkdir -p "$HOME/.local/bin"
 ln -sfn "$PWD/aicode" "$HOME/.local/bin/aicode"
-command -v aicode
+command -v aicode    # 應顯示 ~/.local/bin/aicode
 ```
 
-完成後,從要分析的專案根目錄啟動:
+如果 `command -v aicode` 沒輸出,代表 `~/.local/bin` 不在你目前 shell 的 PATH:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+`aicode` 做的事:把目前目錄設成 `AICODE_ROOT`(沙箱根目錄)、拒絕從 `$HOME` 或 `/` 起、在當前 git root 準備 `.opencode/run-codetrail-mcp` 讓 OpenCode 的 MCP command 找得到、啟動前跑 ctx safety check 確認 `AICODE_DYNAMIC_NUM_CTX_MAX` 沒超過 server `-c`、最後啟 `opencode`。
+
+---
+
+## 5. 自檢與啟動 TUI
+
+### 5.1 跑 doctor 自檢
+
+```bash
+AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
+```
+
+(把 `<CODE_MODEL>` 換成你的 registry key,例如 `qwen3-235b-a22b-instruct`)
+
+預期結尾看到 `PASS=2x WARN=x FAIL=0`。常見可忽略的 WARN:
+
+- `html2text 沒裝` —— 只有 RAG 抓網頁要,可忽略
+- `VL server (8083) 不可連` —— 沒啟動 VL 就會這樣,可忽略
+- `knowledge.json 不存在` —— RAG 知識庫還沒建立,等用到再說
+
+**有 FAIL 不要跳過**,通常是 PATH、server 沒啟動、GGUF 路徑寫錯。對應修法見 [docs/troubleshooting.md](docs/troubleshooting.md)。
+
+### 5.2 啟動 TUI
+
+切到你要分析或修改的專案目錄(**不要從 `$HOME` 或 `/` 啟動**,沙箱會拒絕):
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-如果要讓模型讀專案外的附件,例如 `~/Downloads` 裡的 log、截圖、spec 或 firmware blob,啟動時先打開外部匯入:
+(`AICODE_MODEL` 已經寫進 `~/.bashrc` 或上一行的話就不用再 `AICODE_MODEL=... aicode`)
+
+如果要讓模型讀專案外的附件(`~/Downloads` 的 log、截圖、spec、firmware blob):
 
 ```bash
 AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 ```
 
-預設可匯入來源是 `~/Downloads` 和 `/tmp`。其他目錄要設白名單:
+預設允許 `~/Downloads` 和 `/tmp`。其他目錄要加白名單:
 
 ```bash
 AI_CODE_ALLOW_EXTERNAL_IMPORT=1 \
@@ -200,122 +491,43 @@ aicode
 | `AI_CODE_ALLOW_EXTERNAL_IMPORT=1` | 外部附件匯入總開關 |
 | `AI_CODE_IMPORT_ROOTS="..."` | 外部附件來源白名單(設了就取代預設) |
 
-進入 TUI 後就可以照下一節做基本操作。若工具看起來沒接上,再用 `/status` 檢查是否有 `codetrail Connected`;完整逐步版見 [docs/basic-usage.md](docs/basic-usage.md)。
+### 5.3 Smoke test
+
+進到 TUI 後輸入:
+
+```text
+請用工具 list_dir 看當前目錄結構,挑出 entry point、主要模組和測試目錄,簡單整理。
+```
+
+模型應該會呼叫 `codetrail_list_dir` 工具讀真實目錄,然後回給你整理結果。
+
+第一個請求**首字延遲(TTFT)**:
+
+- 用 `--no-mmap` 模式:約 5–15 秒
+- 用 mmap 模式(沒加 `--no-mmap`):**第一次可能要 1–2 分鐘**,因為要從 SSD page-in MoE expert weights。畫面上 OpenCode 會顯示「`...esc interrupt`」等待中,**不要按 Esc**,等就對了
+
+如果想驗證工具有沒有連上,在 TUI 裡輸入 `/status`,應看到 `codetrail Connected`。
+
+更多操作模式(夾帶附件、注入 RAG、查 spec)見 [docs/basic-usage.md](docs/basic-usage.md);完整 17 個工具清單見 [docs/mcp-tools.md](docs/mcp-tools.md)。
 
 ---
 
-## 基本操作
+## 必守安全界線
 
-進入 OpenCode 後,基本工作分成三類:正常對話、夾帶附件、注入 RAG。完整逐步說明見 [docs/basic-usage.md](docs/basic-usage.md);這裡只保留最小 smoke test。
+- `AICODE_ROOT` 是本次 OpenCode 可讀寫的 sandbox 根目錄;不要從 `$HOME` 或 `/` 啟動。
+- MCP server 啟動時會拒絕危險 root,並把工具限制在 `AICODE_ROOT` 內。
+- `knowledge.json`、`knowledge_emb.npz`、`data/`、`.codetrail/`、`*.jsonl` 和 `.code_rag_cache_*` 通常含 NDA 片段,**不要 commit**。
+- `apply_patch(...)` 有 context matching、max files、max lines 限制;不要放寬安全層。要完全關閉改檔,啟動時設 `AI_CODE_PATCH=0`。
+- `run_command(...)` 只允許白名單命令,不支援 shell metacharacter。預設白名單只含測試 / lint;`make` / `cmake` / `ninja` / `meson` / `bazel build` 等 build 命令需要顯式 `AI_CODE_ENABLE_BUILD_COMMANDS=1` 才會掛上。要完全關閉命令執行,設 `AI_CODE_RUN_TESTS=0`。
+- 遠端 llama-server 會收到 prompt、程式碼片段、spec 摘要與工具輸出,**只能指向可信內網 / VPN 主機**(llama-server 預設不檢查 API key)。
 
-### 1. 正常對話
-
-```text
-請用工具 list_dir 看專案結構,找出可能的 entry point、測試目錄和設定檔。
-```
-
-```text
-請用工具 read_file 讀 README.md 前 80 行,整理這個專案怎麼啟動。
-```
-
-### 2. 夾帶附件
-
-```text
-請先用工具 import_external_file 匯入 ~/Downloads/error.log,
-再用 read_file 讀回傳的新路徑,找出最重要的錯誤訊息。
-```
-
-如果檔案已經在專案內,直接要求 `read_file` 或 `analyze_file` 即可。
-
-### 3. 注入 RAG
-
-```text
-請用工具 ingest_document 匯入 docs/spec.pdf,
-完成後 reload_knowledge_base,回報目前載入幾個 chunks。
-```
-
-```text
-請用工具 query_knowledge_strict 查這份 spec 裡最重要的限制或預設值,
-證據不足就拒答,回答要附 REF。
-```
-
-完整 RAG 用法見 [docs/rag.md](docs/rag.md)。
+完整安全說明見 [docs/security.md](docs/security.md)。
 
 ---
 
-## 模型設定與用途
+## 換模型 / 換顯卡
 
-CodeTrail 不替你決定主聊天 / 程式推導模型。請依硬體與任務自己挑一顆 GGUF。完整選擇邏輯與 context 取捨見 [docs/models.md](docs/models.md)。
-
-| 模型 / 角色 | 用途 | 對應 server port |
-|---|---|---|
-| `<CODE_MODEL>` (主) | 主聊天 / 程式推導 | 8080 |
-| `bge-m3` (embedding) | RAG / Code-RAG 算 embedding | 8081 |
-| `bge-reranker-v2-m3` | RAG rerank cross-encoder | 8082 |
-| VL (qwen3-vl / llava / ...) | 截圖、UI error、圖片進 KB | 8083 |
-
-主模型解析優先順序(找不到、是 placeholder、或被指到外部 provider 時 `aicode` 會 fail-loud,**不會** fallback 任何內建預設):
-
-1. `AICODE_MODEL` 環境變數。
-2. `aicode -m <MODEL>` / `--model <MODEL>` CLI 旗標。
-3. `~/.config/opencode/opencode.json` 的 `"model"` 欄位(`<provider>/<MODEL>` 形式)。
-
-`<MODEL>` 可以是 MODEL_REGISTRY 裡登記的 bare name 或 GGUF 絕對路徑。**不接受** `ollama/...`、`openai/...`、`anthropic/...` 這類外部 provider prefix。
-
-換模型時不要只在 TUI 裡 `/models` 切換。正確方式是停掉舊的 llama-server、用新 GGUF 重啟、退出 `aicode`、用 `AICODE_MODEL=<新模型>` 重新啟動。
-
-啟動 `aicode` 時會自動讀主 llama-server `/props`,確認你要求的 `AICODE_DYNAMIC_NUM_CTX_MAX` 不超過 server `-c <N>` 的真實 ctx:
-
-```
-[ctx-safety] UNSAFE: model=<CODE_MODEL> requested_ctx=65536
-        requested ctx=65536 超過 llama-server 啟動時的 -c 8192 ...
-        建議任一處理:
-          (a) export AICODE_DYNAMIC_NUM_CTX_MAX=8192    ← 對齊 server n_ctx
-          (b) 重啟 llama-server 並提高 `-c 65536`        ← server 端拉大
-          (c) export AICODE_ACCEPT_CTX_RISK=1            ← 我知道會 truncate,照樣跑
-          (d) export AICODE_CTX_SAFETY_DISABLE=1         ← 永久關掉這個檢查
-```
-
-server 沒啟動 / 不可連時會印 `[ctx-safety] UNKNOWN` 並放行,不會擋啟動。
-
-如果你把模型固定寫進 `~/.bashrc`,也建議一起固定 dynamic cap:
-
-```bash
-export AICODE_MODEL=<CODE_MODEL>
-export AICODE_DYNAMIC_NUM_CTX_MAX=32768
-```
-
----
-
-## 換顯卡 / 換模型
-
-換到其他機器時:在那台主機 build llama.cpp、下載 GGUF、啟動 4 個 server、加進 registry、設 `AICODE_MODEL`,然後 `aicode`。
-
-```bash
-# 假設新機器已 build 好 llama.cpp 並下載完 GGUF
-llama-server -m ~/models/<CODE_MODEL>.gguf --host 0.0.0.0 --port 8080 -c 65536 -ngl 99 &
-# ... 啟動 8081 / 8082 / 8083 (見 docs/setup.md)
-
-AICODE_MODEL=<CODE_MODEL> \
-AICODE_DYNAMIC_NUM_CTX_MAX=32768 \
-aicode
-```
-
-硬體起點(請把 `<CODE_MODEL>` 換成實際下載的 GGUF 名稱):
-
-| 硬體 | 候選 |
-|---|---|
-| 5090 32GB | 30B-32B Q4_K_M @ `AICODE_DYNAMIC_NUM_CTX_MAX=65536`;穩定後可試 128K |
-| 24GB VRAM | 30B Q4 / 20B Q5;`AICODE_DYNAMIC_NUM_CTX_MAX=32768` |
-| 16GB 以下 | 14B Q4 / 20B Q4 或更小,不要硬開大 context |
-
-VRAM 不夠 / OOM 時的調整順序(由小痛到大痛):
-
-1. 降低 `AICODE_DYNAMIC_NUM_CTX_MAX`。
-2. 重啟 server 用更小的 `-c <N>`。
-3. server 啟動加 `--cache-type-k q8_0 --cache-type-v q8_0`(KV cache 量化)。
-4. 降到 Q4 量化 GGUF。
-5. 換更小的模型。
+把新 GGUF 加進 `~/.config/codetrail/models.json`,停掉舊的主 server,用新 GGUF 重啟 server(對應修改 `-c` 與 server 旗標),退出 `aicode`,用新的 `AICODE_MODEL` 重啟 `aicode`。**不要只在 TUI 裡用 `/models` 切換** —— 那只會換 OpenCode 前台 model id,不會 reload server,也不會同步 CodeTrail 內部呼叫。
 
 如果 llama-server 跑在另一台 GPU 主機上:
 
@@ -329,22 +541,7 @@ AICODE_DYNAMIC_NUM_CTX_MAX=32768 \
 aicode
 ```
 
-同時把 `~/.config/opencode/opencode.json` 的 provider `baseURL` 改成 `http://<GPU_HOST>:8080/v1`。遠端 server 會收到 prompt、程式碼片段和 spec 摘要,只能指向可信內網 / VPN 主機(llama-server 預設不檢查 API key)。
-
-完整模型、context 說明見 [docs/models.md](docs/models.md)。
-
----
-
-## 必守安全界線
-
-- `AICODE_ROOT` 是本次 OpenCode 可讀寫的 sandbox 根目錄;不要從 `$HOME` 或 `/` 啟動。
-- MCP server 啟動時會拒絕危險 root,並把工具限制在 `AICODE_ROOT` 內。
-- `knowledge.json`、`knowledge_emb.npz`、`data/`、`.codetrail/`、`*.jsonl` 和 `.code_rag_cache_*` 通常含 NDA 片段,不要 commit。
-- `apply_patch(...)` 有 context matching、max files、max lines 限制;不要放寬安全層。要完全關閉改檔,啟動時設 `AI_CODE_PATCH=0`。
-- `run_command(...)` 只允許白名單命令,不支援 shell metacharacter。預設白名單只含測試 / lint;`make` / `cmake` / `ninja` / `meson` / `bazel build` 等 build 命令需要顯式 `AI_CODE_ENABLE_BUILD_COMMANDS=1` 才會掛上。要完全關閉命令執行,設 `AI_CODE_RUN_TESTS=0`。
-- 遠端 llama-server 會收到 prompt、程式碼片段、spec 摘要與工具輸出,只能指向可信內網 / VPN 主機。
-
-完整安全說明見 [docs/security.md](docs/security.md)。
+同時把 `~/.config/opencode/opencode.json` 的 provider `baseURL` 改成 `http://<GPU_HOST>:8080/v1`。完整換機 / 多 GPU / context 調整見 [docs/models.md](docs/models.md)。
 
 ---
 
@@ -352,13 +549,13 @@ aicode
 
 | 文件 | 內容 |
 |---|---|
-| [docs/setup.md](docs/setup.md) | 安裝、build llama.cpp、啟動 4 個 server、OpenCode config、`aicode` |
-| [docs/basic-usage.md](docs/basic-usage.md) | 基本操作:正常對話、夾帶附件、RAG 注入、最小驗收流程 |
-| [docs/models.md](docs/models.md) | 模型設定、硬體取捨、遠端 server、ctx 對齊 |
+| [docs/setup.md](docs/setup.md) | 替代安裝方式、進階配置、換機部署 reference |
+| [docs/basic-usage.md](docs/basic-usage.md) | TUI 內常用操作:正常對話、夾帶附件、RAG 注入、最小驗收流程 |
+| [docs/models.md](docs/models.md) | 模型挑選邏輯、MoE / `--cpu-moe` / `--n-cpu-moe`、context、KV cache 量化、遠端 server |
 | [docs/rag.md](docs/rag.md) | 讀檔、匯入附件、建立知識庫、Code-RAG、查 spec |
 | [docs/mcp-tools.md](docs/mcp-tools.md) | CodeTrail 暴露的 17 個 MCP 工具與使用原則 |
 | [docs/security.md](docs/security.md) | sandbox、patch、run command、NDA 資料、工作節奏 |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | `/status`、ctx-safety、server 不可連、查 spec、patch / command 被拒絕 |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | `/status`、ctx-safety、server 不可連、Blackwell CUDA、MoE 首字慢 |
 | [README_DEV.md](README_DEV.md) | 開發者維護命令、測試、eval、context gate 設計 |
 | [AGENTS.md](AGENTS.md) | AI coding agent 修改本 repo 時必讀的安全規範 |
 

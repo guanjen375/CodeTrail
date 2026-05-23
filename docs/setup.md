@@ -1,265 +1,221 @@
-# 安裝、設定與啟動
+# 替代安裝、進階配置與維運
 
-這份文件保留完整的 OpenCode + llama.cpp + CodeTrail MCP 安裝與啟動細節。
+[README §1–§5](../README.md) 已涵蓋 RTX 5090 / Blackwell + Qwen3-235B 走廊的安裝、下載、啟動 server、設定、進 TUI 完整流程。**這份文件不重複那條走廊**,只補充:
 
-[回到 README](../README.md)。
+- README 沒涵蓋的安裝替代路徑(其他 distro、runfile installer、conda env)
+- tmux 以外的 process manager(systemd / screen / nohup + disown)
+- 多機部署(CodeTrail 跟 GPU server 分開)
+- `aicode` wrapper 詳細行為
+- 維運常用命令(重啟、reload、kill 所有 server)
 
 ---
 
-## 安裝
+## 安裝替代路徑
 
-以下用 `python` 表示 Python 3。如果你的系統只有 `python3`，把指令中的 `python` 改成 `python3`。
+### CUDA Toolkit 用 runfile 安裝(非 Ubuntu / 不能 apt)
 
-### 準備軟體
+[README §1.4](../README.md#14-僅-blackwell-gpu-需要升級-cuda-toolkit-到-13) 的 apt 流程只覆蓋 Ubuntu 24.04。其他情境:
 
-需要:
+- **其他 Ubuntu 版本(22.04 / 20.04)**:apt repo URL 把 `ubuntu2404` 換成 `ubuntu2204` / `ubuntu2004`,其餘相同
+- **不能 apt(離線、非 Ubuntu、container 內)**:從 [developer.nvidia.com/cuda-downloads](https://developer.nvidia.com/cuda-downloads) 下載 runfile installer,執行時**取消勾選 Driver**(避免覆蓋現有驅動),只裝 toolkit。安裝完手動 export `PATH` / `LD_LIBRARY_PATH` 指到對應路徑
 
-- Python 3.10+
-- Node.js LTS + npm
-- llama.cpp(自己 build,需要 CUDA toolchain 才能用 GPU;RTX 5090 走 CUDA 12.x)
-- git
-- ripgrep `rg`,建議安裝,搜尋會快很多
+### CodeTrail Python 依賴用 venv(隔離環境)
 
-安裝 OpenCode:
-
-```bash
-npm install -g opencode-ai
-```
-
-build llama.cpp(CUDA):
-
-```bash
-git clone https://github.com/ggerganov/llama.cpp
-cd llama.cpp
-cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF
-cmake --build build --config Release -j
-# 拿到 build/bin/llama-server,可以丟到 PATH 或記住絕對路徑。
-```
-
-### 安裝 CodeTrail Python 依賴
+如果不想用 `--user` 全域裝套件,可以用 venv:
 
 ```bash
 cd <CODETRAIL_REPO>
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 pip install mcp pymupdf4llm
 ```
 
-`<CODETRAIL_REPO>` 是這個 CodeTrail repo 的路徑,不是你要分析的 firmware repo。
+注意 `aicode` 啟動時會以 `python3` 跑 `scripts/doctor.py` 等,需要對應 venv 已啟用。建議在 `.venv/bin/activate` 內或 `~/.bashrc` 裡加上 `source <CODETRAIL_REPO>/.venv/bin/activate`,避免不同 shell 撞不到 venv。
 
-### 下載模型 (GGUF)
+### `llama.cpp` 不用 GPU(純 CPU)
 
-CodeTrail 不內建主聊天 / 程式推導模型 — 你必須自己挑一顆 GGUF,下面用 `<CODE_MODEL>` 當佔位符代表它。**`<CODE_MODEL>` 不是真實 tag**,請替換成實際模型名稱(選擇方式見 [模型設定與硬體取捨](models.md))。
-
-從 huggingface 下載 GGUF 範例:
+把 `-DGGML_CUDA=ON` 拿掉:
 
 ```bash
-mkdir -p ~/models
-
-# 主聊天 / 程式推導 (例如 qwen3-coder 30B Q4_K_M)
-huggingface-cli download Qwen/Qwen2.5-Coder-32B-Instruct-GGUF \
-  qwen2.5-coder-32b-instruct-q4_k_m.gguf --local-dir ~/models
-
-# embedding (bge-m3)
-huggingface-cli download CompendiumLabs/bge-m3-gguf \
-  bge-m3-Q4_K_M.gguf --local-dir ~/models
-
-# reranker (bge-reranker-v2-m3)
-huggingface-cli download gpustack/bge-reranker-v2-m3-GGUF \
-  bge-reranker-v2-m3-Q4_K_M.gguf --local-dir ~/models
-
-# (選用) VL 多模態
-huggingface-cli download <一個你選的 VL repo> ... --local-dir ~/models
-# 注意:VL 模型需要 `.gguf` 主檔 + `mmproj-*.gguf` projection 檔
+cmake -B build -DLLAMA_CURL=OFF
+cmake --build build --config Release -j
 ```
 
-### 建立 model registry
+啟動 server 時拿掉 `-ngl 99`。MoE 模型在純 CPU 上速度會很慢,適合純測試流程或極低成本部署。
 
-讓 `AICODE_MODEL=qwen3-coder-32b` 這種 bare name 自動對到 GGUF 路徑:
+---
 
-```bash
-mkdir -p ~/.config/codetrail
-cat > ~/.config/codetrail/models.json <<'EOF'
-{
-  "qwen3-coder-32b": "~/models/qwen2.5-coder-32b-instruct-q4_k_m.gguf",
-  "bge-m3": "~/models/bge-m3-Q4_K_M.gguf",
-  "bge-reranker-v2-m3": "~/models/bge-reranker-v2-m3-Q4_K_M.gguf"
-}
-EOF
-```
+## tmux 以外的 process manager
 
-也可以跳過 registry,直接用絕對路徑當 `AICODE_MODEL`,例如 `AICODE_MODEL=/home/you/models/foo.gguf`。
+README 用 tmux 是因為它**最直觀、最不依賴系統服務**。其他選擇:
 
-### 啟動 4 個 llama-server
+### systemd unit(永久部署)
 
-CodeTrail 預期 4 個角色各自一個 server(可省略選用的兩個):
+每個 server 一個 unit。範例 `~/.config/systemd/user/codetrail-main.service`:
 
-| Port | 角色      | 啟動旗標(關鍵)                          | 必要 |
-|------|-----------|----------------------------------------|------|
-| 8080 | main      | `-c 65536 --jinja` (依模型)            | 是   |
-| 8081 | embedding | `--embedding --pooling cls`            | 是   |
-| 8082 | reranker  | `--reranking`                          | 否(USE_RERANKER=False 時可省) |
-| 8083 | VL        | `--mmproj <mmproj.gguf>`               | 否(只在分析圖片時用) |
+```ini
+[Unit]
+Description=CodeTrail main llama-server
+After=network.target
 
-範例:
-
-```bash
-# 主聊天 (32B 模型在 5090 32GB 上 Q4_K_M + 64K ctx 還算 fits)
-llama-server -m ~/models/qwen2.5-coder-32b-instruct-q4_k_m.gguf \
+[Service]
+Type=simple
+ExecStart=/home/%u/llama.cpp/build/bin/llama-server \
+  -m /home/%u/models/.../shard-00001-of-00003.gguf \
   --host 0.0.0.0 --port 8080 \
-  -c 65536 \
-  -ngl 99 \
-  --jinja \
-  --cache-type-k q8_0 --cache-type-v q8_0
+  -c 65536 -ngl 99 --jinja \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --cpu-moe --no-mmap
+Restart=on-failure
+RestartSec=10
 
-# embedding
-llama-server -m ~/models/bge-m3-Q4_K_M.gguf \
-  --host 0.0.0.0 --port 8081 \
-  -c 8192 \
-  --embedding --pooling cls \
-  -ngl 99
-
-# reranker
-llama-server -m ~/models/bge-reranker-v2-m3-Q4_K_M.gguf \
-  --host 0.0.0.0 --port 8082 \
-  -c 8192 \
-  --reranking \
-  -ngl 99
+[Install]
+WantedBy=default.target
 ```
 
-建議用 systemd unit / tmux / supervisord 管理這 4 個 process。實測 5090 上 main(qwen 32B Q4_K_M @ 64K) + embedding(bge-m3) + reranker(bge-reranker) 三顆同時跑,VRAM 約佔 25-28GB,還有空間給 VL。
-
-### 自檢
+啟用 + 開機自啟:
 
 ```bash
-AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
+systemctl --user daemon-reload
+systemctl --user enable --now codetrail-main
+systemctl --user status codetrail-main
+journalctl --user -u codetrail-main -f    # 看 log
 ```
 
-如果只想檢查本地檔案與設定,不連 llama-server:
+embedding / reranker 各複製一份,改 ExecStart 即可。
+
+### screen(類 tmux)
 
 ```bash
-AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py --no-network
+screen -S codetrail
+# Ctrl-a c   新視窗
+# Ctrl-a n / p  下/上一個視窗
+# Ctrl-a d   detach
+screen -r codetrail   # reattach
 ```
 
-`PASS` 可以先略過;`FAIL` 要處理。常見問題是 OpenCode 不在 PATH、4 個 server 沒啟動、GGUF 路徑不對、`aicode` 沒有執行權。
+### nohup + disown(快速臨時方案)
+
+```bash
+nohup ~/llama.cpp/build/bin/llama-server -m ... --port 8080 ... > ~/main.log 2>&1 &
+disown
+```
+
+`disown` 把 process 從目前 shell job table 脫離,關 terminal 不會送 SIGHUP。優點簡單,缺點要自己 `kill <PID>` 收尾,沒有自動重啟。
 
 ---
 
-## 設定 OpenCode
+## 多機部署:CodeTrail 與 GPU 主機分開
 
-### 建立 OpenCode config
+CodeTrail repo 跑在你工作機(CPU 即可),llama-server 跑在另一台 GPU 主機。CodeTrail 透過 HTTP 呼叫對方的 8080 / 8081 / 8082 / 8083。
 
-```bash
-mkdir -p ~/.config/opencode
-${EDITOR:-vi} ~/.config/opencode/opencode.json
-```
+GPU 主機端:三個 server 照 [README §3](../README.md#3-啟動-3-個-llama-server用-tmux-跑在背景) 啟動,但 `--host 0.0.0.0` 必須保留(否則只 listen on `127.0.0.1`,外網連不到)。
 
-llama-server 提供 OpenAI 相容 `/v1`,所以 OpenCode 用 openai-compatible provider 即可。下面是最小範例:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "llamacpp": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "llama.cpp local",
-      "options": {
-        "baseURL": "http://localhost:8080/v1",
-        "apiKey": "dummy"
-      },
-      "models": {
-        "qwen3-coder-32b": {
-          "limit": { "context": 65536, "output": 8192 }
-        }
-      }
-    }
-  },
-  "model": "llamacpp/qwen3-coder-32b",
-  "mcp": {
-    "codetrail": {
-      "type": "local",
-      "command": [".opencode/run-codetrail-mcp"]
-    }
-  }
-}
-```
-
-說明:
-
-- `llamacpp` 是 provider key,你可以叫它別的名字(`local`、`llmcpp`、隨意),但要跟下面 `"model"` 那段的 prefix 對齊。
-- `baseURL` 指到主 llama-server 的 `/v1`。遠端的話改 IP 即可。
-- `apiKey` 可以填任意非空值(llama-server 預設不檢查 key)。
-- `limit.context` 對應啟動時的 `-c <N>`,兩邊建議對齊,不然 OpenCode 可能還沒撐到 server 上限就先 truncate。
-- `model` 欄位帶 provider prefix(`llamacpp/`),CodeTrail wrapper 會 strip 它取得 bare name。
-
-檢查 JSON 格式:
+CodeTrail 端:
 
 ```bash
-python -m json.tool ~/.config/opencode/opencode.json >/dev/null
-```
-
-### 安裝 `aicode` 啟動指令
-
-在 CodeTrail repo 根目錄執行。這段可以重跑;如果你剛換 repo,既有的舊 symlink 會被更新到目前這份 checkout:
-
-```bash
-chmod +x ./aicode
-mkdir -p "$HOME/.local/bin"
-ln -sfn "$PWD/aicode" "$HOME/.local/bin/aicode"
-```
-
-確認 shell 找得到它:
-
-```bash
-command -v aicode
-```
-
-如果沒有輸出,通常是 `$HOME/.local/bin` 還不在目前 shell 的 `PATH`。先讓這個 shell 生效:
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-command -v aicode
-```
-
-如果這樣有輸出,再把同一行 `export PATH="$HOME/.local/bin:$PATH"` 加到 `~/.bashrc` 或你的 shell 設定檔,之後新開終端機就會生效。
-
-`aicode` 會做六件事:
-
-- 將目前目錄設成 `AICODE_ROOT`
-- 拒絕 `AICODE_ROOT=/` 和 `AICODE_ROOT=$HOME`
-- 在目前專案準備 `.opencode/run-codetrail-mcp`,讓 OpenCode config 裡的 MCP command 能啟動 CodeTrail server
-- 啟動前跑 `scripts/ctx_safety_check.py` 讀 llama-server `/props` 拿真實 `n_ctx`,與 `AICODE_DYNAMIC_NUM_CTX_MAX` 比對;requested > server 就直接 `exit 2` 拒絕啟動並提示對齊辦法(server 沒啟動 / 不可連時 graceful 放行,只 warn)
-- 啟動 `opencode`,讓 OpenCode 子行程繼承同一個沙箱根目錄
-- 把使用者傳入的 `-m / --model` 原樣轉發給 OpenCode;沒傳就讓 OpenCode 自己讀 opencode.json `"model"` 欄位
-
----
-
-## 啟動專案
-
-日常建議優先使用 **OpenCode TUI + CodeTrail MCP**。這條路徑最完整:模型可以透過工具讀檔、搜尋程式碼、查 RAG、分析圖片/binary、必要時產生 patch,互動紀錄與工具結果也比較容易追蹤。
-
-切到要分析或修改的專案,再啟動 OpenCode:
-
-```bash
-cd <PROJECT_TO_ANALYZE>
+AICODE_LLAMA_BASE_URL=http://<GPU_HOST>:8080 \
+AICODE_LLAMA_EMBED_BASE_URL=http://<GPU_HOST>:8081 \
+AICODE_LLAMA_RERANK_BASE_URL=http://<GPU_HOST>:8082 \
+AICODE_LLAMA_VL_BASE_URL=http://<GPU_HOST>:8083 \
+AICODE_MODEL=<CODE_MODEL> \
+AICODE_DYNAMIC_NUM_CTX_MAX=32768 \
 aicode
 ```
 
-進入後可以直接問「請分析這個專案的整體架構」、「這個錯誤可能在哪裡」、「請查 RAG 裡某個規格限制」這類問題。涉及專案內容的問題,優先讓模型用工具讀實際檔案,不要只靠一般經驗回答。
+同時把 `~/.config/opencode/opencode.json` 的 provider `baseURL` 改成 `http://<GPU_HOST>:8080/v1`。
 
-如果要讀專案外的 log、截圖、spec 或 firmware blob,啟動參數見 [README 的安裝與啟動](../README.md#安裝與啟動);完整附件流程見 [RAG、附件與知識庫操作](rag.md)。
-
-若工具看起來沒接上,再用 `/status` 檢查是否有 `codetrail Connected`(或你在 `opencode.json` 裡設定的 MCP key)。若啟動 root 不如預期,再看啟動畫面的 `[aicode] AICODE_ROOT=...`。
-
-啟動時帶 `AICODE_MODEL`:
+**安全提醒**:llama-server 預設不檢查 API key,等於任何能連到 GPU 主機 8080 的人都能用你的模型。**只能指向可信內網 / VPN 主機**,不要把 8080 暴露公網。需要鎖住的話加反向代理(nginx / caddy)做 basic auth,或用 SSH tunnel:
 
 ```bash
-AICODE_MODEL=<CODE_MODEL> aicode
+ssh -L 8080:localhost:8080 -L 8081:localhost:8081 -L 8082:localhost:8082 \
+    user@<GPU_HOST>
+# 然後本機 AICODE_LLAMA_*_BASE_URL 全用 http://localhost:80xx
 ```
 
-主模型解析優先順序:`AICODE_MODEL` env > `aicode -m / --model` CLI 旗標 > `OPENCODE_CONFIG` / `~/.config/opencode/opencode.json` 的 `"model"` 欄位。三個都沒有、或值是 `<CODE_MODEL>` 之類的 placeholder 時,`aicode` 會 fail-loud,不會 fallback 任何內建主模型。
+---
 
-換模型、context、遠端 server 的細節集中在 [模型設定與硬體取捨](models.md)。不要只在 TUI 裡用 `/models` 切換;那只會換 OpenCode 前台對話模型,不會 reload server,也不會同步 CodeTrail MCP server 的內部呼叫。
+## `aicode` wrapper 詳細行為
 
-RAG 流程不在這裡重複;可先照 README 的 smoke test 跑一輪,完整說明見 [RAG、附件與知識庫操作](rag.md)。
+`aicode` 是一個 shell wrapper,啟動 `opencode` 之前做六件事:
+
+1. 把目前目錄設成 `AICODE_ROOT`(沙箱根)
+2. 拒絕 `AICODE_ROOT=/` 或 `AICODE_ROOT=$HOME`(可能誤刪 / 誤改大量檔案)
+3. 在目前 git root 準備 `.opencode/run-codetrail-mcp`,讓 OpenCode config 裡的 MCP command 能找到 CodeTrail server 入口
+4. 啟動前跑 `scripts/ctx_safety_check.py`,讀主 llama-server `/props` 拿真實 `n_ctx`,跟 `AICODE_DYNAMIC_NUM_CTX_MAX` 比對。requested > server 直接 `exit 2`,server 不可連時 graceful 放行只 warn
+5. 啟動 `opencode`,讓子行程繼承同一個沙箱根目錄
+6. 把使用者傳入的 `-m / --model` 原樣轉發給 OpenCode;沒傳就讓 OpenCode 自己讀 `opencode.json` 的 `"model"` 欄位
 
 ---
+
+## 維運常用命令
+
+### 重啟單一 server(換模型 / 換 ctx / 加旗標)
+
+```bash
+# 1. 找出 PID
+pgrep -fa "llama-server.*--port 8080"
+
+# 2. 終止(送 SIGINT,讓它優雅關掉)
+pkill -INT -f "llama-server.*--port 8080"
+
+# 3. 等個 2-3 秒讓 KV cache / prompt cache flush
+sleep 3
+
+# 4. 用新參數重啟(在 tmux pane 內或 systemd 直接 restart)
+```
+
+systemd 版本:
+
+```bash
+systemctl --user restart codetrail-main
+```
+
+### 全部停掉
+
+tmux:`tmux kill-session -t codetrail`
+
+systemd:`systemctl --user stop codetrail-{main,embed,rerank}`
+
+通用:
+
+```bash
+pkill -INT -f "llama-server"
+```
+
+### 看 server 狀態
+
+```bash
+# 三個 port 都通?
+for p in 8080 8081 8082; do
+  echo ":$p → $(curl -s -o /dev/null -w '%{http_code}' http://localhost:$p/health)"
+done
+
+# 主 server 載入的是哪顆 GGUF、ctx 多少?
+curl -s http://localhost:8080/props | python -m json.tool | head -20
+
+# slot 是否在處理請求?
+curl -s http://localhost:8080/slots | python -m json.tool
+
+# VRAM 占用
+nvidia-smi --query-gpu=memory.used,memory.free,memory.total --format=csv
+```
+
+### reload OpenCode / `aicode` 設定
+
+`aicode` 啟動時讀一次 `~/.config/opencode/opencode.json` 與 `~/.config/codetrail/models.json`,**之後改檔不會自動生效**。要套用新設定:
+
+```bash
+# 退出 TUI(Ctrl-D 或在 TUI 內輸入 /exit)
+# 改設定
+# 重新 aicode
+```
+
+llama-server 端的 `-c <N>` 也是啟動旗標,改完要重啟 server,不能熱 reload。
+
+---
+
+## 後續
+
+`aicode` 啟動之後的 TUI 操作流程見 [docs/basic-usage.md](basic-usage.md)。RAG / 知識庫 / 程式碼語意搜尋見 [docs/rag.md](rag.md)。

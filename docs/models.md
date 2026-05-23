@@ -112,6 +112,7 @@ llama-server \
   -c 32768 \
   -ngl 999 \
   --cpu-moe \
+  --no-mmap \
   --jinja \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   -fa on \
@@ -122,12 +123,33 @@ llama-server \
 
 - `-m ...-00001-of-00003.gguf` — 三檔切片只要指第一個,llama.cpp 自動接後續
 - `--cpu-moe` — 全 offload。要換 `--n-cpu-moe N`(留越多 expert 在 GPU 越快),5090 32GB 加掛 embedding+reranker 同顆 GPU 時 `N=84` 左右是常見起點
+- `--no-mmap` — **強烈建議搭 `--cpu-moe` 一起加**(見下方「mmap vs no-mmap 取捨」)
 - `--jinja` — 使用模型內建 chat_template,tool calling 才會正確
 - `-fa on` — flash attention(新版 llama.cpp 語法)
 - `--cache-type-k q8_0 --cache-type-v q8_0` — KV cache 量化,32K ctx 約 1.5GB
 - `--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0` — Qwen 官方對 Instruct-2507 的建議 sampling
 
 > `--cpu-moe` 與 `-fa on` 都是 2025 年中以後加入的 llama.cpp 旗標。如果 server 報 unknown option,先 `git pull && cmake --build build` 升級 llama.cpp。
+
+### mmap vs no-mmap 取捨(MoE 必看)
+
+預設 llama.cpp 用 `mmap` 把 GGUF 檔對應到 process 位址空間,**懶載入** —— 啟動很快(6 秒就 listening),但 weights 還沒實際讀進 RAM。
+
+對 dense 模型沒差;對 MoE 模型搭 `--cpu-moe` 後**會在第一次推理觸到新 expert 時從 SSD page-in**,造成首字延遲(TTFT)爆炸,Qwen3-235B-A22B 實測首次 TTFT 可達 120 秒以上。llama-server 啟動時也會自己警告:
+
+```
+W llama_model_loader: tensor overrides to CPU are used with mmap enabled —
+                      consider using --no-mmap for better performance
+```
+
+| | `mmap`(預設) | `--no-mmap` |
+|---|---|---|
+| 啟動時間 | ~6 秒(假載入) | 1.5–2.5 分鐘(真把 weights 全讀進 RAM) |
+| 首字 TTFT | 60–120 秒(第一次) | 5–15 秒 |
+| 後續對話 | 偶爾卡頓(冷 expert page-in) | 穩定 |
+| RAM 占用 | ~5GB + page cache | ~135GB(235B Q4_K_M 體積) |
+
+判斷:有 ≥ 150GB RAM 就加 `--no-mmap`,啟動慢一次換之後永久穩定。RAM 不到 150GB 就保持 mmap 接受偶爾卡頓,或換較小模型。
 
 ### 預期效能與資源(5090 32GB + DDR5 RAM 參考)
 
@@ -263,12 +285,12 @@ NDA 場景要特別注意:遠端 server 會收到 prompt、程式碼片段、spe
 RAG 相關模型也要在新機器上準備好 GGUF 並啟動對應 server:
 
 ```bash
-# embedding (必要)
-llama-server -m ~/models/bge-m3-Q4_K_M.gguf \
+# embedding (必要) — embedding 模型不要量化,Q4 會明顯影響召回,用 f16
+llama-server -m ~/models/bge-m3/bge-m3-f16.gguf \
   --host 0.0.0.0 --port 8081 -c 8192 --embedding --pooling cls -ngl 99 &
 
 # reranker (USE_RERANKER=True 時需要)
-llama-server -m ~/models/bge-reranker-v2-m3-Q4_K_M.gguf \
+llama-server -m ~/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q4_K_M.gguf \
   --host 0.0.0.0 --port 8082 -c 8192 --reranking -ngl 99 &
 ```
 
