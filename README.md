@@ -574,26 +574,6 @@ aicode
 
 ---
 
-## 換模型 / 換顯卡
-
-把新 GGUF 加進 `~/.config/codetrail/models.json`,停掉舊的主 server,用新 GGUF 重啟 server(對應修改 `-c` 與 server 旗標),退出 `aicode`,用新的 `AICODE_MODEL` 重啟 `aicode`。**不要只在 TUI 裡用 `/models` 切換** —— 那只會換 OpenCode 前台 model id,不會 reload server,也不會同步 CodeTrail 內部呼叫。
-
-如果 llama-server 跑在另一台 GPU 主機上:
-
-```bash
-AICODE_LLAMA_BASE_URL=http://<GPU_HOST>:8080 \
-AICODE_LLAMA_EMBED_BASE_URL=http://<GPU_HOST>:8081 \
-AICODE_LLAMA_RERANK_BASE_URL=http://<GPU_HOST>:8082 \
-AICODE_LLAMA_VL_BASE_URL=http://<GPU_HOST>:8083 \
-AICODE_MODEL=<CODE_MODEL> \
-AICODE_DYNAMIC_NUM_CTX_MAX=32768 \
-aicode
-```
-
-同時把 `~/.config/opencode/opencode.json` 的 provider `baseURL` 改成 `http://<GPU_HOST>:8080/v1`。完整換機 / 多 GPU / context 調整見 [docs/models.md](docs/models.md)。
-
----
-
 ## 文件地圖
 
 | 文件 | 內容 |
