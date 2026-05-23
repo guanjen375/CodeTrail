@@ -90,6 +90,66 @@ AICODE_MODEL=<CODE_MODEL> AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
 
 ---
 
+## MoE 模型 + CPU offload(Qwen3-235B-A22B-Instruct-2507)
+
+5090 32GB + 128GB+ RAM 可以跑 **Qwen3-235B-A22B-Instruct-2507 Q4_K_M(總 ~142GB)**,作法是把 MoE expert tensors offload 到 CPU,attention / KV cache / router 留在 GPU。`llama-server` 從 2025 中加入兩個關鍵旗標:
+
+| 旗標 | 行為 | 適用情境 |
+|---|---|---|
+| `--cpu-moe` | 把**所有** layer 的 MoE expert tensors 放 CPU | 預設,VRAM 最省、最不會 OOM |
+| `--n-cpu-moe N` | 把**前 N 層**的 expert 放 CPU(其餘留 GPU) | VRAM 還有空間時調小 N 換速度 |
+
+5090 32GB 在 `--cpu-moe`(全 offload) 下,實測 VRAM 約 15-18GB(主 server only),剩下空間可同時掛 bge-m3 + bge-reranker-v2-m3。若不跑 embedding/reranker,可改 `--n-cpu-moe 84` 之類把 ~10 層 expert 留在 GPU,生成速度通常多 1.5-2x。
+
+### 啟動範例
+
+CodeTrail 沒有附 launcher script — 怎麼啟動 server fleet(tmux / systemd / 自己寫 shell wrapper)留給你自己。下面是一個 5090 + 235B Q4_K_M 的 reference 命令:
+
+```bash
+llama-server \
+  -m ~/models/Qwen3-235B-A22B-Instruct-2507-GGUF/Q4_K_M/Qwen3-235B-A22B-Instruct-2507-Q4_K_M-00001-of-00003.gguf \
+  --host 0.0.0.0 --port 8080 \
+  -c 32768 \
+  -ngl 999 \
+  --cpu-moe \
+  --jinja \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  -fa on \
+  --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0
+```
+
+關鍵旗標:
+
+- `-m ...-00001-of-00003.gguf` — 三檔切片只要指第一個,llama.cpp 自動接後續
+- `--cpu-moe` — 全 offload。要換 `--n-cpu-moe N`(留越多 expert 在 GPU 越快),5090 32GB 加掛 embedding+reranker 同顆 GPU 時 `N=84` 左右是常見起點
+- `--jinja` — 使用模型內建 chat_template,tool calling 才會正確
+- `-fa on` — flash attention(新版 llama.cpp 語法)
+- `--cache-type-k q8_0 --cache-type-v q8_0` — KV cache 量化,32K ctx 約 1.5GB
+- `--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0` — Qwen 官方對 Instruct-2507 的建議 sampling
+
+> `--cpu-moe` 與 `-fa on` 都是 2025 年中以後加入的 llama.cpp 旗標。如果 server 報 unknown option,先 `git pull && cmake --build build` 升級 llama.cpp。
+
+### 預期效能與資源(5090 32GB + DDR5 RAM 參考)
+
+| 指標 | `--cpu-moe`(全 offload) | `--n-cpu-moe 84`(留 10 層 GPU) |
+|---|---|---|
+| 主 server VRAM | 15-18 GB | 28-30 GB |
+| 系統 RAM | 130-140 GB(mmap)| 115-125 GB |
+| Prompt ingest | 50-150 tok/s | 100-250 tok/s |
+| 生成速度 | 6-12 tok/s | 12-20 tok/s |
+
+實際數字會被 RAM 頻寬、PCIe gen、context 大小、batch size 拉動,以上是大致量級。第一次 prompt 會慢(冷 cache 載入 expert weights),之後 page cache 暖了就會快。
+
+### Context 上限
+
+- 模型原生支援 262K,但 KV cache 會吃 GPU。32K q8_0 KV cache 約 1.5GB,64K 約 3GB,128K 約 6GB。
+- CodeTrail 內部 ctx 預算(`AICODE_DYNAMIC_NUM_CTX_MAX`)要 ≤ server `-c`,否則 `aicode` 啟動時 ctx safety check 會 `exit 2` 拒絕。
+- 建議起點 32K,確認穩定後再升 64K(server `-c` 與 `AICODE_DYNAMIC_NUM_CTX_MAX` 必須一起改,後者不可超過前者,否則 `aicode` 的 ctx safety check 會 `exit 2`)。
+
+> `--cpu-moe` 偏慢主要在 expert 經 PCIe / RAM bus 取值。改用 `--n-cpu-moe N`(N < 94)留越多 expert 在 GPU 越快;94 是 Qwen3-235B-A22B 的層數,N=94 等價於 `--cpu-moe`,N=0 等價於不 offload。
+
+---
+
 ## Context overflow vs server truncation
 
 模型「看不到」想看的內容,通常是兩種不同問題:
@@ -152,6 +212,7 @@ aicode
 
 ```bash
 # 5090 32GB:32B Q4_K_M @ 64K + bge-m3 + bge-reranker 同時跑大概剛好
+#   要塞更大 MoE 模型(例如 235B-A22B)可看「MoE 模型 + CPU offload」段落把 expert offload 到 RAM
 AICODE_MODEL=<CODE_MODEL> AICODE_DYNAMIC_NUM_CTX_MAX=65536 aicode
 
 # 24GB VRAM:30B 或 20B,context 32K
