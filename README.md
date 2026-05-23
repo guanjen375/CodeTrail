@@ -281,13 +281,14 @@ CodeTrail 會把不同角色拆成不同 `llama-server` instance:main / embeddin
 | 8082 | reranker(RAG 結果重排) | `bge-reranker-v2-m3` | 建議(可選) |
 | 8083 | VL(看截圖 / 圖片) | `qwen3-vl` 等 | 否 |
 
-下面用推薦的 main / embedding / reranker 三個 server 示範,**一個 server 開一個獨立的 tmux session**。如果暫時不跑 reranker,可跳過 3.3;doctor 會把 8082 不可連列為 WARN,不會阻止啟動。流程都一樣:`tmux new -s <名字>` 進去 → 貼指令 → 等 `server is listening on ...` → 按 `Ctrl-b d` 退出來放背景。terminal 之後關掉也不會死。
+下面用推薦的 main / embedding / reranker 三個 server 示範,**一個 server 開一個獨立的 tmux session**。流程都一樣:`tmux new -s <名字>` 進去 → 貼指令 → 等 `server is listening on ...` → 按 `Ctrl-b d` 退出來放背景。terminal 之後關掉也不會死。主 server(§3.1)有硬體調整需要,embedding / reranker(§3.2)參數固定。
 
 > **tmux 你會用到的 4 個指令**(其他都不用學):
 > - `Ctrl-b d` —— 把目前 session 放背景,回到原本 shell
 > - `tmux ls` —— 列出所有背景 session
 > - `tmux a -t <名字>` —— 接回去看某個 session 的即時 log
 > - `tmux kill-session -t <名字>` —— 關掉某個 session
+> - bonus:`Ctrl-b n` —— 同 session 內切換 window(§3.2 的 RAG session 內含 embed / rerank 兩個 window)
 
 ### 3.1 Session 1 — 主 server(:8080)
 
@@ -361,50 +362,48 @@ srv  llama_server: server is listening on http://0.0.0.0:8080
 
 看到之後按 `Ctrl-b d` 退出來,回到一般 shell。server 留在背景跑。
 
-### 3.2 Session 2 — embedding server(:8081)
+### 3.2 RAG server — embedding + reranker(一鍵啟動 script)
+
+兩顆 RAG 副模型(embedding `bge-m3`、reranker `bge-reranker-v2-m3`)體積小、啟動秒開、**參數不需要依硬體調整**,所以包成一個 script 一次啟動,合在同一個 tmux session `codetrail-rag` 的兩個 window 內,使用者只需要管理一個 session。
 
 ```bash
-tmux new -s codetrail-embed
+chmod +x scripts/start-rag-servers.sh    # 第一次跑要加 exec bit
+./scripts/start-rag-servers.sh
 ```
 
-進去後貼:
+預期輸出:
+
+```
+[+] 啟動 embedding server (:8081) 於 tmux codetrail-rag:embed
+[+] 啟動 reranker server  (:8082) 於 tmux codetrail-rag:rerank
+
+兩顆 server 大約 5–10 秒後 listening。驗證:
+  curl -s -o /dev/null -w 'embed  :8081 -> %{http_code}\n' http://localhost:8081/health
+  curl -s -o /dev/null -w 'rerank :8082 -> %{http_code}\n' http://localhost:8082/health
+...
+```
+
+一次關掉兩顆 server:
 
 ```bash
-~/llama.cpp/build/bin/llama-server \
-  -m ~/models/bge-m3/bge-m3-f16.gguf \
-  --host 0.0.0.0 --port 8081 \
-  -c 8192 --embedding --pooling cls -ngl 99
+./scripts/stop-rag-servers.sh
 ```
 
-5–10 秒內看到 `server is listening on http://0.0.0.0:8081`,按 `Ctrl-b d` 退出。
+(平常不用看 log,真要偵錯才 `tmux a -t codetrail-rag`,session 內 `Ctrl-b n` 切 embed/rerank window,`Ctrl-b d` 退出。)
 
-### 3.3 Session 3 — reranker server(:8082)
+**不跑 reranker 的話**(例如還沒下載):script 偵測到 `bge-reranker-v2-m3-Q4_K_M.gguf` 不存在會自動跳過,只啟動 embedding。doctor 會把 8082 列為 WARN 但不擋啟動。
 
-```bash
-tmux new -s codetrail-rerank
-```
+**模型路徑非預設**:script 找的是 `~/models/bge-m3/...` 與 `~/models/bge-reranker-v2-m3/...`。若放別處,啟動前 `export MODELS_DIR=/your/path`。llama-server 不在 `~/llama.cpp/...` 也類似:`export LLAMA_BIN=/your/llama-server`。
 
-進去後貼:
+### 3.3 驗活與維運
 
-```bash
-~/llama.cpp/build/bin/llama-server \
-  -m ~/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q4_K_M.gguf \
-  --host 0.0.0.0 --port 8082 \
-  -c 8192 --embedding --pooling rank --reranking -ngl 99
-```
-
-同樣 5–10 秒 listening,`Ctrl-b d` 退出。
-
-### 3.4 驗活與維運
-
-如果照上面三個 server 都啟動,確認 3 個 session 都在背景跑:
+照上面流程跑下來會有 **2 個 tmux session**(main 自己一個、embed+rerank 合在一個):
 
 ```bash
 tmux ls
 # 應該看到:
-#   codetrail-main:   1 windows (created ...)
-#   codetrail-embed:  1 windows (created ...)
-#   codetrail-rerank: 1 windows (created ...)
+#   codetrail-main: 1 windows (created ...)
+#   codetrail-rag:  2 windows (created ...)    ← 內含 embed + rerank 兩個 window
 ```
 
 驗已啟動的 port 都通(若跳過 reranker,把 8082 拿掉):
@@ -416,15 +415,14 @@ done
 # 應該都印 200
 ```
 
-要回去看某個 server 的 log:`tmux a -t codetrail-main`(看完 `Ctrl-b d` 再放背景)。
-
 之後要關掉全部:
 
 ```bash
-tmux kill-session -t codetrail-main
-tmux kill-session -t codetrail-embed
-tmux kill-session -t codetrail-rerank
+tmux kill-session -t codetrail-main    # 砍主 server
+./scripts/stop-rag-servers.sh          # 砍 embed + rerank
 ```
+
+偵錯時要看 server log(平常不用):`tmux a -t codetrail-main` 或 `tmux a -t codetrail-rag`(rag 內按 `Ctrl-b n` 切 embed/rerank window,看完 `Ctrl-b d` 退出)。
 
 VRAM 與 RAM 預期占用(5090 + 235B `--n-cpu-moe 86 --no-mmap`):
 
