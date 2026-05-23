@@ -61,7 +61,7 @@ CodeTrail 目前定位是**成熟私有部署版**:適合本機、離線、NDA /
 | Qwen3-30B-A3B(小型 MoE) | ~18 GB | ≥ 32 GB | 16GB(`--n-cpu-moe N` 部分 offload 留多數 expert 在 GPU) |
 | Qwen3-32B(**dense**) | 19 GB | — | **不適用 offload**,直接選 24GB+ 卡 pure GPU |
 
-下方 §3 走廊範例用 5090 32GB + Qwen3-235B-A22B-Instruct-2507(`--cpu-moe --no-mmap`),屬於這裡的**例外路徑**(作者實測過所以拿來示範)。若你硬體 / 模型走的是上面正規 pure GPU 表的某一格,§3.1 server 指令把 `--cpu-moe` 與 `--no-mmap` 兩行拿掉即可。
+下方 §3 走廊範例用 5090 32GB + Qwen3-235B-A22B-Instruct-2507(`--n-cpu-moe N --no-mmap`,N 依 VRAM 調整見 §3.1),屬於這裡的**例外路徑**(作者實測過所以拿來示範)。若你硬體 / 模型走的是上面正規 pure GPU 表的某一格,§3.1 server 指令把 `--n-cpu-moe` 與 `--no-mmap` 兩行拿掉即可。
 
 完整 `--cpu-moe` vs `--n-cpu-moe`、mmap vs no-mmap、context / KV cache 量化、遠端 GPU 主機等深入內容見 [docs/models.md](docs/models.md)。
 
@@ -305,7 +305,10 @@ tmux new -s codetrail-main
   --host 0.0.0.0 --port 8080 \
   -c 65536 -ngl 99 --jinja \
   --cache-type-k q8_0 --cache-type-v q8_0 \
-  --cpu-moe \
+  --n-cpu-moe 86 \
+  -fa on \
+  -b 2048 -ub 512 \
+  -t 12 \
   --no-mmap
 ```
 
@@ -313,13 +316,42 @@ tmux new -s codetrail-main
 
 - `-m ...-00001-of-00003.gguf` —— 只指 shard 1,llama.cpp 自動接後續
 - `-c 65536` —— context 上限 64K token(模型原生 256K,KV cache 會吃 VRAM,先從 64K 起)
-- `-ngl 99` —— 嘗試把所有層放 GPU(MoE expert 之後會被 `--cpu-moe` 拉回 CPU)
+- `-ngl 99` —— 嘗試把所有層放 GPU(MoE expert 之後會被 `--n-cpu-moe` 拉回 CPU)
 - `--jinja` —— 啟用模型內建 chat template,tool calling 才會走對格式
 - `--cache-type-k/v q8_0` —— KV cache 量化到 8-bit,64K ctx 約省一半 VRAM
-- `--cpu-moe` —— **MoE 模型才加**;把 expert tensors 卸到 CPU RAM(吃 ~130GB RAM)
-- `--no-mmap` —— **強烈建議搭 `--cpu-moe` 一起加**;不加的話用 mmap 懶載入,第一次推理 TTFT 可能 1–2 分鐘(每次觸到新 expert 都要從 SSD page-in);加了之後啟動時把 weights 全讀進 RAM,啟動慢 1–2 分鐘但之後對話穩定
+- `--n-cpu-moe 86` —— **MoE 模型才加**;Qwen3-235B 共 94 層,**前 86 層 expert 卸到 CPU RAM、剩 8 層留在 GPU**。比 `--cpu-moe`(= 全 94 層都在 CPU)的純 offload 路徑快 ~50%(實測 5090 上 TG 從 ~5 升到 7.5 tok/s),代價是多吃 ~12 GB VRAM。**N 數字依你 VRAM 調整,見下方表格**
+- `-fa on` —— 啟用 flash attention,省 KV cache VRAM、加速 attention 計算。dense / MoE 都適用
+- `-b 2048 -ub 512` —— 加大 prompt processing 的 batch / micro-batch,PP 速度提升 ~30%(實測 5090 PP 從 ~50 升到 ~80 tok/s)。代價是啟動時略多 compute buffer
+- `-t 12` —— 用 12 條執行緒。9950X 是 16 核 2-CCD,跨 CCD 通訊延遲高,12 是甜蜜點(比 `-t 16` 快 ~10%)。**依你 CPU 調整,見下方說明**
+- `--no-mmap` —— **強烈建議搭 `--n-cpu-moe` 一起加**;不加的話用 mmap 懶載入,第一次推理 TTFT 可能 1–2 分鐘(每次觸到新 expert 都要從 SSD page-in);加了之後啟動時把 weights 全讀進 RAM,啟動慢 1–2 分鐘但之後對話穩定
 
-非 MoE 模型(dense 30B / 14B / 7B)**不要加** `--cpu-moe` 與 `--no-mmap`,直接拿掉那兩行即可。
+非 MoE 模型(dense 30B / 14B / 7B)**不要加** `--n-cpu-moe` 與 `--no-mmap`,直接拿掉那兩行即可。`-fa on` / `-b 2048 -ub 512` / `-t N` 對 dense 模型一樣有效,可以保留。
+
+#### `--n-cpu-moe N` 與 `-t N` 調整(其他硬體配置)
+
+**`--n-cpu-moe N`**:每多 1 層 expert 從 CPU 搬到 GPU,**多吃 ~1.4 GB VRAM、TG 提升 ~5~8%**。**留至少 3 GB VRAM 緩衝**給 KV cache 動態成長,否則長對話會 OOM 死掉。以 Qwen3-235B(94 層)為例,起手值:
+
+| VRAM | 建議 `--n-cpu-moe` | GPU expert 層數 | VRAM 用量(估) | TG(估) |
+|---|---|---|---|---|
+| 24GB | `90` | 4 | ~18 GB | ~6 tok/s |
+| **32GB** | **`86`** | **8** | **~26 GB**(5090 實測) | **~7.5 tok/s**(實測) |
+| 48GB | `74` | 20 | ~42 GB | ~10 tok/s |
+| 96GB | `42` | 52 | ~88 GB | ~15~18 tok/s |
+
+啟動完跑 `nvidia-smi` 看主 server VRAM,**留 3 GB 緩衝為目標**:用太少 → 浪費頻寬;用太滿 → 後續對話 KV cache 一脹就 OOM。從上表起手值開始,觀察一兩次對話的 VRAM 高點再 ±2 微調(N 越小越快越吃 VRAM)。
+
+**`-t N`** 規則:**P-core 物理核數 −2~−4**(避開 hyperthread、避開跨 CCD)。常見組合:
+
+| CPU | 物理結構 | 建議 `-t` |
+|---|---|---|
+| Ryzen 9 9950X / 9950X3D | 16 核 2-CCD | `12` |
+| Ryzen 9 9900X / 9900X3D | 12 核 2-CCD | `10` |
+| Ryzen 7 9700X / 9800X3D | 8 核單 CCD | `6~8` |
+| Core Ultra 9 285K | 8 P + 16 E(無 HT) | `8`(只用 P-core) |
+| Core Ultra 7 265K | 8 P + 12 E(無 HT) | `8` |
+| Core Ultra 5 245K | 6 P + 8 E(無 HT) | `6` |
+
+不確定甜蜜點可以用 `llama-bench -m <model.gguf> --n-cpu-moe N -t 8,12,16` 實測,挑 TG 數字最大那組。
 
 `--no-mmap` 模式下大約 1.5–2.5 分鐘(看 SSD 速度),期間會看到一堆 `load_tensors:` 滾過。**等到下面這行出現才算成功**:
 
@@ -394,12 +426,14 @@ tmux kill-session -t codetrail-embed
 tmux kill-session -t codetrail-rerank
 ```
 
-VRAM 與 RAM 預期占用(5090 + 235B `--cpu-moe --no-mmap`):
+VRAM 與 RAM 預期占用(5090 + 235B `--n-cpu-moe 86 --no-mmap`):
 
 ```
-VRAM  ~14 GB / 32 GB    (主 ~12.5 + embed ~1 + rerank ~0.4)
-RAM   ~135 GB / 170 GB  (主要是 235B MoE expert 整個讀進 RAM)
+VRAM  ~26 GB / 32 GB    (主 ~24 + embed ~1 + rerank ~0.4;8 層 expert 在 GPU)
+RAM   ~125 GB / 170 GB  (其餘 86 層 expert 在 RAM)
 ```
+
+對比純 `--cpu-moe`(94 層全在 CPU)為 VRAM ~14 GB / RAM ~135 GB,差異是把 8 層 expert(~12 GB)從 RAM 搬到 VRAM,換來 ~50% TG 速度提升。
 
 ---
 
