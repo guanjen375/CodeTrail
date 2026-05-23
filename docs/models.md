@@ -37,7 +37,7 @@ Registry 維護在 `~/.config/codetrail/models.json`,格式:
 | `<CODE_MODEL>` | 主聊天 / 程式推導,掛在 llama-server :8080 | 由你自行選擇並下載;CodeTrail 不內建、不推薦、不 fallback |
 | VL (例如 qwen3-vl, llava) | `analyze_file(...)` 處理截圖、UI error;`ingest_document(...)` 把圖片切 chunk 進 KB 也用它 | 掛在 :8083,需要 GGUF 主檔 + `mmproj-*.gguf`;不分析圖片就不用啟動 |
 | `bge-m3` (RAG embedding) | `query_knowledge(...)` / `code_rag_search(...)` 的 embedding | 掛在 :8081,server 啟動旗標 `--embedding --pooling cls` |
-| `bge-reranker-v2-m3` (RAG reranker) | RAG rerank cross-encoder | 掛在 :8082,server 啟動旗標 `--reranking`;沒掛時 RAG 會 fallback 到 LLM 排序 |
+| `bge-reranker-v2-m3` (RAG reranker) | RAG rerank cross-encoder | 掛在 :8082,server 啟動旗標 `--embedding --pooling rank --reranking`;沒掛時 RAG 會 fallback 到 LLM 排序 |
 
 挑選方向(自己判斷):
 
@@ -289,9 +289,9 @@ RAG 相關模型也要在新機器上準備好 GGUF 並啟動對應 server:
 llama-server -m ~/models/bge-m3/bge-m3-f16.gguf \
   --host 0.0.0.0 --port 8081 -c 8192 --embedding --pooling cls -ngl 99 &
 
-# reranker (USE_RERANKER=True 時需要)
+# reranker (建議啟動;沒掛時 RAG fallback 到 LLM 排序)
 llama-server -m ~/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q4_K_M.gguf \
-  --host 0.0.0.0 --port 8082 -c 8192 --reranking -ngl 99 &
+  --host 0.0.0.0 --port 8082 -c 8192 --embedding --pooling rank --reranking -ngl 99 &
 ```
 
 如果要分析截圖、UI error 或把圖片匯入 KB,再啟動 VL server:

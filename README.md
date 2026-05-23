@@ -152,12 +152,13 @@ cmake --build build --config Release -j
 
 ## 2. 下載 GGUF
 
-### 2.1 安裝 hf-transfer 加速
+### 2.1 安裝 Hugging Face CLI + hf-transfer 加速
 
-預設 `huggingface-cli download` 走單連線,實測 ~12 MB/s;裝 `hf-transfer` 後可以拉到 ~270 MB/s(視網路與 HF CDN 上限):
+下載指令使用 Hugging Face 新版 `hf` CLI;`hf-transfer` 只負責加速下載,不提供 `hf` 命令本身。預設下載走單連線,實測 ~12 MB/s;裝 `hf-transfer` 後可以拉到 ~270 MB/s(視網路與 HF CDN 上限):
 
 ```bash
-pip install --user --break-system-packages hf-transfer
+pip install --user --break-system-packages -U "huggingface_hub[cli]" hf-transfer
+command -v hf
 python -c "import hf_transfer; print('hf-transfer', hf_transfer.__version__)"
 ```
 
@@ -191,9 +192,9 @@ HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
 
 如果你的硬體不是 5090、選了別的 `<CODE_MODEL>`,把上面的 repo 與 `--include` pattern 換成你要的那顆。常見社群 GGUF 來源:`unsloth/...-GGUF`、`bartowski/...-GGUF`、官方 `Qwen/...-GGUF`。
 
-### 2.3 下載 RAG 必要模型
+### 2.3 下載 RAG 附屬模型
 
-CodeTrail 的 RAG / Code-RAG 內建固定使用 `bge-m3`(embedding)和 `bge-reranker-v2-m3`(reranker),這兩個體積很小:
+CodeTrail 的 RAG / Code-RAG 內建固定使用 `bge-m3`(embedding)。`bge-reranker-v2-m3`(reranker)建議一起下載與啟動;沒啟動時 RAG 仍可用,會 fallback 到主模型做排序。這兩個體積很小:
 
 ```bash
 # embedding:bge-m3 (用 f16,不要量化 — embedding 對量化敏感,Q4 會明顯影響召回)
@@ -215,18 +216,18 @@ HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
 
 ---
 
-## 3. 啟動 3 個 llama-server(用 tmux 跑在背景)
+## 3. 啟動 llama-server(用 tmux 跑在背景)
 
-CodeTrail 預期 4 個角色各自一個 `llama-server` instance,**main / embedding / reranker 三個是 RAG + 程式對話必要的,VL 選用**。會分開是因為 `llama-server` 一次只能載一顆 GGUF,不同角色用不同模型 / 不同模式(`--embedding` / `--reranking` / `--jinja` / `--mmproj`),所以必須開不同 process。
+CodeTrail 會把不同角色拆成不同 `llama-server` instance:main / embedding 是必要的;reranker 建議啟動,沒啟動時 RAG 會 fallback 到主模型排序;VL 選用。會分開是因為 `llama-server` 一次只能載一顆 GGUF,不同角色用不同模型 / 不同模式(`--jinja` / `--embedding --pooling cls` / `--embedding --pooling rank --reranking` / `--mmproj`),所以必須開不同 process。
 
 | Port | 角色 | 模型 | 必要 |
 |---|---|---|---|
 | 8080 | main(聊天、推理、工具呼叫) | `<CODE_MODEL>` | 是 |
 | 8081 | embedding(算向量,RAG 搜相似段落) | `bge-m3` | 是 |
-| 8082 | reranker(RAG 結果重排) | `bge-reranker-v2-m3` | 是 |
+| 8082 | reranker(RAG 結果重排) | `bge-reranker-v2-m3` | 建議(可選) |
 | 8083 | VL(看截圖 / 圖片) | `qwen3-vl` 等 | 否 |
 
-下面**一個 server 開一個獨立的 tmux session**,3 個 server 共 3 個 session。流程都一樣:`tmux new -s <名字>` 進去 → 貼指令 → 等 `server is listening on ...` → 按 `Ctrl-b d` 退出來放背景。terminal 之後關掉也不會死。
+下面用推薦的 main / embedding / reranker 三個 server 示範,**一個 server 開一個獨立的 tmux session**。如果暫時不跑 reranker,可跳過 3.3;doctor 會把 8082 不可連列為 WARN,不會阻止啟動。流程都一樣:`tmux new -s <名字>` 進去 → 貼指令 → 等 `server is listening on ...` → 按 `Ctrl-b d` 退出來放背景。terminal 之後關掉也不會死。
 
 > **tmux 你會用到的 4 個指令**(其他都不用學):
 > - `Ctrl-b d` —— 把目前 session 放背景,回到原本 shell
@@ -303,14 +304,14 @@ tmux new -s codetrail-rerank
 ~/llama.cpp/build/bin/llama-server \
   -m ~/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q4_K_M.gguf \
   --host 0.0.0.0 --port 8082 \
-  -c 8192 --reranking -ngl 99
+  -c 8192 --embedding --pooling rank --reranking -ngl 99
 ```
 
 同樣 5–10 秒 listening,`Ctrl-b d` 退出。
 
 ### 3.4 驗活與維運
 
-確認 3 個 session 都在背景跑:
+如果照上面三個 server 都啟動,確認 3 個 session 都在背景跑:
 
 ```bash
 tmux ls
@@ -320,7 +321,7 @@ tmux ls
 #   codetrail-rerank: 1 windows (created ...)
 ```
 
-驗 3 個 port 都通:
+驗已啟動的 port 都通(若跳過 reranker,把 8082 拿掉):
 
 ```bash
 for p in 8080 8081 8082; do
