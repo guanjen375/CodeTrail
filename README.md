@@ -16,15 +16,19 @@ CodeTrail 目前定位是**成熟私有部署版**:適合本機、離線、NDA /
 
 `<CODE_MODEL>` 是 README / docs 全文使用的**佔位符**,代表你**自己選的主聊天 / 程式推導模型**。CodeTrail 不內建、不推薦、也不 fallback —— 你看完下表自己挑一顆 GGUF,後面所有步驟把 `<CODE_MODEL>` 換成你選的那顆。
 
-| 你的 VRAM | 可選 `<CODE_MODEL>` 量級 | 量化建議 | llama-server 額外旗標 |
-|---|---|---|---|
-| 48GB+(A6000 / RTX 6000 Ada) | Qwen3-235B-A22B-Instruct-2507 整顆塞 GPU,或 Qwen3-Coder-32B Q5/Q6 | Q4_K_M / Q5_K_M | `--jinja` |
-| 32GB(RTX 5090) | Qwen3-235B-A22B-Instruct-2507(MoE,135GB)+ CPU offload | Q4_K_M | `--jinja --cpu-moe --no-mmap` |
-| 24GB(RTX 4090 / 3090) | 30B 級 dense 模型,或 Qwen3-30B-A3B(MoE)+ 部分 offload | Q4_K_M | `--jinja`(若選 MoE 加 `--cpu-moe`) |
-| 16GB(RTX 4080 / 5070) | 14B / 20B 級 dense | Q4_K_M | `--jinja` |
-| 12GB 以下 | 7B / 8B / 14B 級,可能要 Q3 或部分 CPU offload | Q4 / Q3_K | `--jinja`(必要時 `-ngl <N>` 控制 GPU 層數) |
+| 你的 VRAM | 2025–2026 代表卡 | 可選 `<CODE_MODEL>` 量級 | 量化建議 | llama-server 額外旗標 |
+|---|---|---|---|---|
+| 96GB | RTX PRO 6000 Blackwell | Qwen3-235B-A22B-Instruct-2507 整顆塞 GPU(135GB 略擠,可改 Q4_K_S 或先開 32K ctx) | Q4_K_M / Q4_K_S | `--jinja` |
+| 48GB | RTX PRO 5000 Blackwell | 235B Q4_K_M 配 `--cpu-moe` 留 KV cache 空間;或 30–32B dense Q5/Q6 整顆塞 GPU | Q4_K_M / Q5_K_M | `--jinja`(若選 MoE 加 `--cpu-moe`) |
+| 32GB | **RTX 5090** / RTX PRO 4500 Blackwell | Qwen3-235B-A22B-Instruct-2507(MoE,135GB)+ 全 CPU offload | Q4_K_M | `--jinja --cpu-moe --no-mmap` |
+| 24GB | RTX PRO 4000 Blackwell | 30B 級 dense,或 Qwen3-30B-A3B(MoE)+ 部分 offload | Q4_K_M | `--jinja`(若選 MoE 加 `--cpu-moe`) |
+| 16GB | RTX 5080 / 5070 Ti / 5060 Ti 16GB | 14B / 20B 級 dense | Q4_K_M | `--jinja` |
+| 12GB | RTX 5070 | 7B / 8B / 14B 級 | Q4_K_M / Q3_K_L | `--jinja`(必要時 `-ngl <N>` 控制 GPU 層數) |
+| 8GB | RTX 5060 / RTX 5060 Ti 8GB | 7B / 8B(可能要部分 CPU offload) | Q4_K_M / Q3_K_M | `--jinja -ngl <較少>` |
 
-下方步驟以 **RTX 5090 32GB + 170GB DDR5 RAM + Qwen3-235B-A22B-Instruct-2507 Q4_K_M(`--cpu-moe`)** 為走廊範例。其他硬體照同樣流程,把 `<CODE_MODEL>` 對應的 GGUF 名稱與 server 旗標換掉即可。額外的硬體取捨、context 大小、KV cache 量化、遠端 GPU 主機等深入內容見 [docs/models.md](docs/models.md)。
+> **資訊統計日期:2026-05-23**。本表以 NVIDIA Blackwell 世代為主(Consumer RTX 50 系列 2025 年 1–5 月陸續發布;RTX PRO Blackwell 工作站系列 2025 年 GTC 公布)。AMD RDNA 4(RX 9070 / 9070 XT 等)與 Intel Battlemage(Arc B 系列)也能跑,需走 llama.cpp 的 ROCm / Vulkan 後端,本文件不展開;CUDA 後端目前仍是穩定性與工具完整度首選。
+
+下方步驟以 **RTX 5090 32GB + 170GB DDR5 RAM + Qwen3-235B-A22B-Instruct-2507 Q4_K_M(`--cpu-moe --no-mmap`)** 為走廊範例。其他硬體照同樣流程,把 `<CODE_MODEL>` 對應的 GGUF 名稱與 server 旗標換掉即可。額外的硬體取捨、context 大小、KV cache 量化、遠端 GPU 主機等深入內容見 [docs/models.md](docs/models.md)。
 
 ---
 
