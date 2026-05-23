@@ -10,6 +10,17 @@ CodeTrail 目前定位是**成熟私有部署版**:適合本機、離線、NDA /
 - 一次性安裝 + build:30–60 分鐘
 - 下載模型 GGUF:依網速與所選模型,5 分鐘到數小時不等
 
+### 完成標準
+
+本 README 走完只要四件事都成立就算「完成」,任一步卡住就停在那一步排查,不要硬往下走:
+
+1. `AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py` 結尾印 `PASS=... WARN=... FAIL=0`
+2. `cd <PROJECT_TO_ANALYZE> && aicode` 進得了 OpenCode TUI(看到綠色輸入框、沒有 fatal 訊息)
+3. TUI 內輸入 `/status`,看到 `codetrail Connected`
+4. Smoke test:輸入 §5.3 的範例 prompt,模型成功呼叫 `codetrail_list_dir` 並回傳真實目錄結果
+
+任一步 FAIL 對應的修法見 [docs/troubleshooting.md](docs/troubleshooting.md)。
+
 ---
 
 ## 硬體與模型對照速查
@@ -60,11 +71,34 @@ CodeTrail 目前定位是**成熟私有部署版**:適合本機、離線、NDA /
 
 ### 1.1 系統工具
 
-- **Python 3.10+**(後續用 `python` 代表你的 Python 3,系統若只有 `python3` 把指令改掉即可)
-- **Node.js LTS + npm**(裝 OpenCode 需要)
-- **git**
-- **ripgrep** `rg`(建議但非必要,搜尋會快很多)
-- **tmux**(本文件用它在背景跑 3 個 llama-server;不熟可在這一步先 `sudo apt install tmux`,後面有 5 行教學)
+Ubuntu / Debian 乾淨機器一行裝齊基底工具:
+
+```bash
+sudo apt update
+sudo apt install -y \
+  git curl wget \
+  build-essential cmake pkg-config \
+  python3 python3-venv python3-pip \
+  ripgrep tmux
+```
+
+各套件對應後續哪一節用到:
+
+- `build-essential` + `cmake` + `pkg-config` —— §1.5 build llama.cpp 必備,缺一不可
+- `python3` (≥ 3.10) + `python3-venv` —— §1.3 建立 venv 安裝 CodeTrail Python deps;系統若 `python` 指令不存在,後續文件中的 `python` 自行改成 `python3`
+- `git` —— clone llama.cpp / 一般版本控管
+- `ripgrep` (`rg`) —— 加速程式碼搜尋(建議但非必要)
+- `tmux` —— §3 用來在背景跑三個 llama-server,§3 開頭有 4 行操作教學
+
+另外裝 **Node.js LTS + npm**(§1.2 裝 OpenCode 用)。Ubuntu 24.04 內建 nodejs 太舊,建議用 NodeSource 官方源裝 LTS:
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+sudo apt install -y nodejs
+node -v && npm -v    # 確認 node ≥ 18 / 20 LTS、npm 可執行
+```
+
+已經有 nvm / fnm / volta 的用熟悉的方式裝 Node LTS 即可(版本 ≥ 18)。
 
 ### 1.2 安裝 OpenCode
 
@@ -75,13 +109,26 @@ command -v opencode    # 確認可被找到
 
 ### 1.3 安裝 CodeTrail Python 依賴
 
+Ubuntu 24.04 啟用 PEP 668,system Python 不允許直接 `pip install`。**在 CodeTrail repo 內建一個 venv**,後續所有 Python 動作(`scripts/doctor.py`、`aicode` 啟動的 CodeTrail MCP server、§2.1 的 `hf` CLI)都跑在這個 venv 內:
+
 ```bash
 cd <CODETRAIL_REPO>
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
 pip install -r requirements.txt
-pip install mcp pymupdf4llm
+pip install pymupdf4llm    # 選用:RAG 從 PDF 建知識庫才用;不做 RAG 可省略
 ```
 
-`<CODETRAIL_REPO>` 是這個 CodeTrail 的 repo 路徑,不是你要分析的專案路徑。
+`<CODETRAIL_REPO>` 是這個 CodeTrail 的 repo 路徑,不是你要分析的專案路徑。`requirements.txt` 已含 `mcp` / `requests` / `numpy`,不必再單獨 `pip install mcp`。
+
+> **每次開新 shell 都要先 `source <CODETRAIL_REPO>/.venv/bin/activate`** 才能跑 `python scripts/doctor.py` 或 `aicode` —— `aicode` 內部用 PATH 上的 `python3` 拉起 MCP server,venv 沒啟用時會 `ModuleNotFoundError: No module named 'mcp'`。覺得每次手動 activate 太煩,把這行寫進 `~/.bashrc`(把 `<CODETRAIL_REPO>` 換成絕對路徑,例如 `$HOME/CodeTrail`):
+>
+> ```bash
+> echo 'source <CODETRAIL_REPO>/.venv/bin/activate' >> ~/.bashrc
+> ```
+>
+> §3 用 `tmux new -s ...` 開的新 session 是獨立的 shell —— 不過 §3 那三個 session 跑的是 `llama-server` 二進位、與 venv 無關,不必再 activate。`tmux` 主要影響的是 §5.1 / §5.2 那種需要 Python 的指令所在的 shell。
 
 ### 1.4 (僅 Blackwell GPU 需要)升級 CUDA Toolkit 到 13
 
@@ -156,13 +203,17 @@ cmake --build build --config Release -j
 
 下載指令使用 Hugging Face 新版 `hf` CLI;`hf-transfer` 只負責加速下載,不提供 `hf` 命令本身。預設下載走單連線,實測 ~12 MB/s;裝 `hf-transfer` 後可以拉到 ~270 MB/s(視網路與 HF CDN 上限):
 
+承 §1.3 venv 已啟用的狀態下,直接裝:
+
 ```bash
-pip install --user --break-system-packages -U "huggingface_hub[cli]" hf-transfer
+pip install -U "huggingface_hub[cli]" hf-transfer
 command -v hf
 python -c "import hf_transfer; print('hf-transfer', hf_transfer.__version__)"
 ```
 
-`--break-system-packages` 是 Ubuntu 24.04 (PEP 668) 必要的旗標;不用害怕,只是用 `--user` 安裝到家目錄,不會動到系統 Python。
+如果 `command -v hf` 沒輸出,通常代表 venv 沒啟用 —— 回去執行 `source <CODETRAIL_REPO>/.venv/bin/activate` 再重試。
+
+(若你刻意跳過 §1.3 venv,改成 `pip install --user --break-system-packages -U "huggingface_hub[cli]" hf-transfer`,會安裝到 `~/.local/bin`,需要 `~/.local/bin` 在 PATH 上。)
 
 啟用方式:下載指令前面加 `HF_HUB_ENABLE_HF_TRANSFER=1`。
 
