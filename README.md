@@ -16,19 +16,43 @@ CodeTrail 目前定位是**成熟私有部署版**:適合本機、離線、NDA /
 
 `<CODE_MODEL>` 是 README / docs 全文使用的**佔位符**,代表你**自己選的主聊天 / 程式推導模型**。CodeTrail 不內建、不推薦、也不 fallback —— 你看完下表自己挑一顆 GGUF,後面所有步驟把 `<CODE_MODEL>` 換成你選的那顆。
 
-| 你的 VRAM | 2025–2026 代表卡 | 可選 `<CODE_MODEL>` 量級 | 量化建議 | llama-server 額外旗標 |
-|---|---|---|---|---|
-| 96GB | RTX PRO 6000 Blackwell | Qwen3-235B-A22B-Instruct-2507 整顆塞 GPU(135GB 略擠,可改 Q4_K_S 或先開 32K ctx) | Q4_K_M / Q4_K_S | `--jinja` |
-| 48GB | RTX PRO 5000 Blackwell | 235B Q4_K_M 配 `--cpu-moe` 留 KV cache 空間;或 30–32B dense Q5/Q6 整顆塞 GPU | Q4_K_M / Q5_K_M | `--jinja`(若選 MoE 加 `--cpu-moe`) |
-| 32GB | **RTX 5090** / RTX PRO 4500 Blackwell | Qwen3-235B-A22B-Instruct-2507(MoE,135GB)+ 全 CPU offload | Q4_K_M | `--jinja --cpu-moe --no-mmap` |
-| 24GB | RTX PRO 4000 Blackwell | 30B 級 dense,或 Qwen3-30B-A3B(MoE)+ 部分 offload | Q4_K_M | `--jinja`(若選 MoE 加 `--cpu-moe`) |
-| 16GB | RTX 5080 / 5070 Ti / 5060 Ti 16GB | 14B / 20B 級 dense | Q4_K_M | `--jinja` |
-| 12GB | RTX 5070 | 7B / 8B / 14B 級 | Q4_K_M / Q3_K_L | `--jinja`(必要時 `-ngl <N>` 控制 GPU 層數) |
-| 8GB | RTX 5060 / RTX 5060 Ti 8GB | 7B / 8B(可能要部分 CPU offload) | Q4_K_M / Q3_K_M | `--jinja -ngl <較少>` |
+下表以「**模型 weights 完整塞 VRAM,無 CPU offload**」為預設推薦。Pure GPU 路徑速度最快、最穩定,是絕大多數情境的正確選擇。要跑超過 VRAM 容量的模型(例如 235B / Llama 4 Scout 等),走下方「CPU offload 例外情形」。
 
-> **資訊統計日期:2026-05-23**。本表以 NVIDIA Blackwell 世代為主(Consumer RTX 50 系列 2025 年 1–5 月陸續發布;RTX PRO Blackwell 工作站系列 2025 年 GTC 公布)。AMD RDNA 4(RX 9070 / 9070 XT 等)與 Intel Battlemage(Arc B 系列)也能跑,需走 llama.cpp 的 ROCm / Vulkan 後端,本文件不展開;CUDA 後端目前仍是穩定性與工具完整度首選。
+| 你的 VRAM | 2025–2026 代表卡 | 純 GPU 模型範例(完整塞 VRAM) |
+|---|---|---|
+| 96GB | RTX PRO 6000 Blackwell | Llama-3.3-70B Q8;Mistral Medium 3.5;Qwen3-Coder-Next(80B-A3B MoE)Q8;或多模型同卡並跑 |
+| 48GB | RTX PRO 5000 Blackwell | 70B 級 dense Q4–Q5;**Qwen3-Coder-Next(80B-A3B MoE)Q4 整顆塞**(~44GB) |
+| 32GB | **RTX 5090** / RTX PRO 4500 Blackwell | **Qwen3-32B Q5_K_M / Q6_K**;Gemma 4 26B-A4B Q8;Mistral Small 3 14B Q8(寬裕) |
+| 24GB | RTX PRO 4000 Blackwell | Qwen3-32B Q4_K_M;Qwen3-14B Q8;Gemma 4 26B-A4B Q4 |
+| 16GB | RTX 5080 / 5070 Ti / 5060 Ti 16GB | **Gemma 4 26B-A4B Q4**(MoE,~14GB);Qwen3-14B Q5;Mistral Small 3 14B Q5;Phi-4 14B Q4 |
+| 12GB | RTX 5070 | Qwen3-8B Q5/Q6;Llama 3.x 8B Q5;Phi-4-mini Q8 |
+| 8GB | RTX 5060 / RTX 5060 Ti 8GB | Qwen3-4B Q5/Q8;Phi-4-mini Q5;Gemma 3 4B Q5 |
 
-下方步驟以 **RTX 5090 32GB + 170GB DDR5 RAM + Qwen3-235B-A22B-Instruct-2507 Q4_K_M(`--cpu-moe --no-mmap`)** 為走廊範例。其他硬體照同樣流程,把 `<CODE_MODEL>` 對應的 GGUF 名稱與 server 旗標換掉即可。額外的硬體取捨、context 大小、KV cache 量化、遠端 GPU 主機等深入內容見 [docs/models.md](docs/models.md)。
+> 全部模型啟動 server 時都加 `--jinja`(啟用模型內建 chat template,tool calling 才會走對格式);其餘 `--cpu-moe` / `--no-mmap` 等旗標僅在下方例外情形才用。
+
+> **資訊統計日期:2026-05-23**。主流家族快照:Qwen3(2507 Instruct/Thinking 變體、Coder、Coder-Next 80B-A3B 走 sparse-MoE)、Qwen3.5(397B-A17B 旗艦 MoE)、Llama 4 Scout(17B 活躍 / 109B 總、10M ctx)/Maverick(17B / 400B、1M ctx)/Behemoth(~2T,訓練中尚未釋出 weights)、Gemma 4(26B-A4B MoE,~14GB GGUF)、Mistral Small 3(14B dense)/ Medium 3.5、DeepSeek V3.2(671B-MoE,Q4 ≈ 370GB)/ V4 Pro(1.6T-MoE)/ V4 Flash(284B-MoE)、GLM-4.6、Phi-4 / Phi-4-mini。本表只列以**單卡 pure GPU** 能跑的範例;超過 VRAM 容量者見下方例外段落,或考慮多卡 NVLink / 遠端 GPU 主機([docs/models.md](docs/models.md))。
+
+### CPU offload(`--cpu-moe` / `--n-cpu-moe`)—— 例外情形,不是預設
+
+只在以下三條件**同時**成立才考慮:
+
+1. **模型必須是 MoE 架構**(每 token 只啟用部分 expert,例如 Qwen3-235B-A22B 每 token 只跑 22B / 235B = 9% 參數)。Dense 模型不要嘗試 offload —— 每 token 都要用全部參數,跨 PCIe / RAM bus 取值會嚴重吞速度。
+2. **MoE 模型 Q4_K_M 體積 ≤ 你的 RAM 容量 − 15GB**(留給 OS / page cache)。否則 swap 一發、速度直接歸零。Q4_K_M 體積估算公式:`總參數(B) × 0.55 GB`。
+3. **你接受生成速度從 pure GPU 的 ~40 tok/s 降到 6–15 tok/s**。Offload 路徑跑出來的東西可用,但延遲明顯高。
+
+換言之,「VRAM 不夠就 offload 大模型」**只在 MoE 模型成立**,而且要看 RAM 多大。常見例子:
+
+| MoE 模型 | Q4_K_M 體積 | 需要 RAM | 適合 VRAM 段 |
+|---|---|---|---|
+| Qwen3-235B-A22B-Instruct-2507 | ~135 GB | ≥ 150 GB | 32GB+(`--cpu-moe` 全 offload) |
+| Llama 4 Scout(109B-MoE / 10M ctx) | ~60 GB | ≥ 80 GB | 32GB+ |
+| Qwen3-Coder 480B-A35B-Instruct | ~265 GB | ≥ 280 GB | 48GB+(實質要 workstation 級 RAM) |
+| Qwen3-30B-A3B(小型 MoE) | ~18 GB | ≥ 32 GB | 16GB(`--n-cpu-moe N` 部分 offload 留多數 expert 在 GPU) |
+| Qwen3-32B(**dense**) | 19 GB | — | **不適用 offload**,直接選 24GB+ 卡 pure GPU |
+
+下方 §3 走廊範例用 5090 32GB + Qwen3-235B-A22B-Instruct-2507(`--cpu-moe --no-mmap`),屬於這裡的**例外路徑**(作者實測過所以拿來示範)。若你硬體 / 模型走的是上面正規 pure GPU 表的某一格,§3.1 server 指令把 `--cpu-moe` 與 `--no-mmap` 兩行拿掉即可。
+
+完整 `--cpu-moe` vs `--n-cpu-moe`、mmap vs no-mmap、context / KV cache 量化、遠端 GPU 主機等深入內容見 [docs/models.md](docs/models.md)。
 
 ---
 
