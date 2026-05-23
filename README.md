@@ -178,9 +178,12 @@ nvcc --version      # 應顯示 release 13.x
 
 ### 1.5 Build llama.cpp(CUDA)
 
+固定 clone 到 `~/llama.cpp` —— §3 啟動 server 直接寫死這個路徑,放別處後面要逐行改:
+
 ```bash
-git clone https://github.com/ggerganov/llama.cpp
-cd llama.cpp
+cd ~
+git clone https://github.com/ggerganov/llama.cpp ~/llama.cpp
+cd ~/llama.cpp
 cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF
 cmake --build build --config Release -j
 ```
