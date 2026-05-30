@@ -27,6 +27,10 @@ venv/
 # OpenCode session 紀錄（可能含問題/回答的快取，勿提交）
 .opencode/
 
+# CodeTrail aicodex 產生的 Codex MCP wrapper；不要忽略整個 .codex/
+.codex/run-codetrail-mcp
+.codex/run-codetrail-mcp.tmp.*
+
 # 外部檔案匯入暫存（可能含 NDA 截圖、log、PDF、firmware）
 .aicode_uploads/
 

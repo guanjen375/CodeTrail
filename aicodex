@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+# aicodex — launch Codex CLI with CodeTrail MCP wired in for the current project.
+#
+# Usage:
+#   cd <project-to-analyze>
+#   aicodex
+#   aicodex --codetrail-model <LOCAL_MODEL>
+#   aicodex --codetrail-model <LOCAL_MODEL> -m gpt-5.5
+#
+# `--codetrail-model` selects CodeTrail MCP's internal local llama.cpp model.
+# Codex CLI's own `-m/--model` is a separate frontend model setting and is
+# forwarded to `codex` unchanged.
+
+set -euo pipefail
+
+fail() {
+  echo "[aicodex] $*" >&2
+  exit 2
+}
+
+resolve_aicodex_home() {
+  local source="${BASH_SOURCE[0]}"
+  local dir
+
+  while [ -h "$source" ]; do
+    dir="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd -P)"
+    source="$(readlink "$source")"
+    case "$source" in
+      /*) ;;
+      *) source="$dir/$source" ;;
+    esac
+  done
+
+  cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd -P
+}
+
+expand_tilde() {
+  local value="$1"
+  case "$value" in
+    "~")
+      if [ -z "${HOME:-}" ]; then
+        fail "cannot expand ~ because HOME is not set"
+      fi
+      printf '%s\n' "$HOME"
+      ;;
+    "~/"*)
+      if [ -z "${HOME:-}" ]; then
+        fail "cannot expand ~/ because HOME is not set"
+      fi
+      printf '%s/%s\n' "$HOME" "${value#~/}"
+      ;;
+    *)
+      printf '%s\n' "$value"
+      ;;
+  esac
+}
+
+canonical_dir() {
+  local label="$1"
+  local raw="$2"
+  local expanded
+  expanded="$(expand_tilde "$raw")"
+  cd "$expanded" 2>/dev/null && pwd -P || {
+    echo "[aicodex] $label is not a readable directory: $raw" >&2
+    exit 2
+  }
+}
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
+toml_string() {
+  "$PYBIN" -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$1"
+}
+
+toml_string_array() {
+  "$PYBIN" -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@"
+}
+
+print_model_resolution_hint() {
+  echo "[aicodex] Codex frontend model and CodeTrail MCP internal model are separate settings." >&2
+  echo "[aicodex] \`aicodex -m gpt-5.5\` only selects the Codex frontend model." >&2
+  echo "[aicodex] To set the CodeTrail MCP internal local model, use:" >&2
+  echo "[aicodex]   aicodex --codetrail-model <LOCAL_MODEL>" >&2
+  echo "[aicodex] or:" >&2
+  echo "[aicodex]   AICODE_MODEL=<LOCAL_MODEL> aicodex" >&2
+}
+
+reject_unsafe_codex_arg() {
+  local arg="$1"
+  echo "[aicodex] refusing unsafe Codex CLI argument: $arg" >&2
+  echo "[aicodex] aicodex starts Codex with approval on-request and sandbox workspace-write." >&2
+  exit 2
+}
+
+CODETRAIL_HOME="$(resolve_aicodex_home)" || {
+  echo "[aicodex] cannot resolve CodeTrail checkout path" >&2
+  exit 2
+}
+
+CODEX_ARGS=()
+CODETRAIL_MODEL_ARG=""
+ENV_AICODE_MODEL="${AICODE_MODEL:-}"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --)
+      CODEX_ARGS+=("$1")
+      shift
+      while [ "$#" -gt 0 ]; do
+        CODEX_ARGS+=("$1")
+        shift
+      done
+      ;;
+    --codetrail-model)
+      if [ "$#" -lt 2 ] || [ -z "${2:-}" ] || [[ "$2" == -* ]]; then
+        fail "--codetrail-model requires a model value."
+      fi
+      CODETRAIL_MODEL_ARG="$2"
+      shift 2
+      ;;
+    --codetrail-model=*)
+      CODETRAIL_MODEL_ARG="${1#--codetrail-model=}"
+      if [ -z "$CODETRAIL_MODEL_ARG" ]; then
+        fail "--codetrail-model requires a model value."
+      fi
+      shift
+      ;;
+    --dangerously-bypass-approvals-and-sandbox|--yolo)
+      reject_unsafe_codex_arg "$1"
+      ;;
+    --sandbox=danger-full-access|-s=danger-full-access)
+      reject_unsafe_codex_arg "$1"
+      ;;
+    --sandbox|-s)
+      if [ "$#" -ge 2 ] && [ "$2" = "danger-full-access" ]; then
+        reject_unsafe_codex_arg "$1 $2"
+      fi
+      CODEX_ARGS+=("$1")
+      if [ "$#" -ge 2 ]; then
+        CODEX_ARGS+=("$2")
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    *)
+      CODEX_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [ -n "$ENV_AICODE_MODEL" ] && [ -n "$CODETRAIL_MODEL_ARG" ] && [ "$ENV_AICODE_MODEL" != "$CODETRAIL_MODEL_ARG" ]; then
+  echo "[aicodex] AICODE_MODEL and --codetrail-model point to different CodeTrail MCP internal models:" >&2
+  echo "[aicodex]   AICODE_MODEL=$ENV_AICODE_MODEL" >&2
+  echo "[aicodex]   --codetrail-model=$CODETRAIL_MODEL_ARG" >&2
+  print_model_resolution_hint
+  exit 2
+fi
+
+if [ -n "$CODETRAIL_MODEL_ARG" ]; then
+  export AICODE_MODEL="$CODETRAIL_MODEL_ARG"
+fi
+
+if [ -n "${AICODE_ROOT:-}" ]; then
+  ROOT_RAW="$AICODE_ROOT"
+else
+  ROOT_RAW="$(pwd -P)"
+fi
+ROOT="$(canonical_dir "AICODE_ROOT" "$ROOT_RAW")"
+
+case "$ROOT" in
+  /)
+    echo "[aicodex] refusing AICODE_ROOT=/ (would expose entire filesystem)" >&2
+    exit 2
+    ;;
+esac
+
+if [ -n "${HOME:-}" ]; then
+  HOME_RESOLVED="$(canonical_dir "HOME" "$HOME")"
+  if [ "$ROOT" = "$HOME_RESOLVED" ]; then
+    echo "[aicodex] refusing AICODE_ROOT=\$HOME ($HOME_RESOLVED)" >&2
+    echo "[aicodex] cd into a specific project directory first." >&2
+    exit 2
+  fi
+fi
+
+resolve_codex_launch_root() {
+  local git_root
+  if command -v git >/dev/null 2>&1; then
+    if git_root="$(git rev-parse --show-toplevel 2>/dev/null)" && [ -n "$git_root" ]; then
+      cd "$git_root" >/dev/null 2>&1 && pwd -P && return
+    fi
+  fi
+  pwd -P
+}
+
+CODEX_ROOT="$(resolve_codex_launch_root)" || {
+  echo "[aicodex] cannot resolve Codex launch root" >&2
+  exit 2
+}
+
+if ! command -v codex >/dev/null 2>&1; then
+  echo "[aicodex] 'codex' not found in PATH." >&2
+  echo "[aicodex] Install Codex CLI with: npm install -g @openai/codex" >&2
+  exit 127
+fi
+
+if command -v python3 >/dev/null 2>&1; then
+  PYBIN=python3
+elif command -v python >/dev/null 2>&1; then
+  PYBIN=python
+else
+  echo "[aicodex] python3/python not found in PATH — required for model resolution and ctx safety check." >&2
+  exit 2
+fi
+
+resolve_err="$(mktemp "${TMPDIR:-/tmp}/aicodex-resolve-main-model.XXXXXX")" || {
+  echo "[aicodex] cannot create temporary file for model resolution diagnostics" >&2
+  exit 2
+}
+trap 'rm -f "$resolve_err"' EXIT
+
+if ! RESOLVED_MAIN_MODEL="$("$PYBIN" "$CODETRAIL_HOME/scripts/resolve_main_model.py" 2>"$resolve_err")"; then
+  echo "[aicodex] failed to resolve CodeTrail MCP internal local model." >&2
+  print_model_resolution_hint
+  if [ -s "$resolve_err" ]; then
+    while IFS= read -r line; do
+      echo "[aicodex] resolver: $line" >&2
+    done < "$resolve_err"
+  fi
+  exit 2
+fi
+RESOLVED_MAIN_MODEL="${RESOLVED_MAIN_MODEL//$'\n'/}"
+if [ -z "$RESOLVED_MAIN_MODEL" ]; then
+  echo "[aicodex] model resolver returned an empty CodeTrail MCP internal local model." >&2
+  print_model_resolution_hint
+  exit 2
+fi
+export AICODE_MODEL="$RESOLVED_MAIN_MODEL"
+rm -f "$resolve_err"
+trap - EXIT
+
+if [ -f "$CODETRAIL_HOME/scripts/ctx_safety_check.py" ]; then
+  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/ctx_safety_check.py"; then
+    echo "[aicodex] ctx safety check refused to start (see [ctx-safety] above)." >&2
+    exit 2
+  fi
+fi
+
+prepare_codex_mcp_wrapper() {
+  local codex_dir="$CODEX_ROOT/.codex"
+  local wrapper="$codex_dir/run-codetrail-mcp"
+  local tmp
+  local quoted_root quoted_home quoted_model
+
+  mkdir -p "$codex_dir" || {
+    echo "[aicodex] cannot create $codex_dir for the Codex MCP wrapper" >&2
+    exit 2
+  }
+
+  if [ -e "$wrapper" ] && ! grep -q "generated by CodeTrail aicodex" "$wrapper" 2>/dev/null; then
+    echo "[aicodex] refusing to overwrite existing non-CodeTrail Codex MCP wrapper: $wrapper" >&2
+    echo "[aicodex] move or inspect that file first; aicodex only overwrites wrappers it generated." >&2
+    exit 2
+  fi
+
+  tmp="$(mktemp "$codex_dir/run-codetrail-mcp.tmp.XXXXXX")" || {
+    echo "[aicodex] cannot create temporary Codex MCP wrapper in $codex_dir" >&2
+    exit 2
+  }
+
+  quoted_root="$(shell_quote "$ROOT")"
+  quoted_home="$(shell_quote "$CODETRAIL_HOME")"
+  quoted_model="$(shell_quote "$AICODE_MODEL")"
+
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' '# generated by CodeTrail aicodex; safe to regenerate'
+    printf '%s\n' 'set -euo pipefail'
+    printf '\n'
+    printf 'export AICODE_ROOT=%s\n' "$quoted_root"
+    printf 'export CODETRAIL_HOME=%s\n' "$quoted_home"
+    printf 'export AICODE_MODEL=%s\n' "$quoted_model"
+    printf '\n'
+    printf '%s\n' 'if command -v python3 >/dev/null 2>&1; then'
+    printf '%s\n' '  exec python3 "$CODETRAIL_HOME/mcp_server.py"'
+    printf '%s\n' 'fi'
+    printf '\n'
+    printf '%s\n' 'exec python "$CODETRAIL_HOME/mcp_server.py"'
+  } > "$tmp"
+
+  chmod 700 "$tmp"
+  mv "$tmp" "$wrapper"
+}
+
+prepare_codex_mcp_wrapper
+CODEX_MCP_WRAPPER="$CODEX_ROOT/.codex/run-codetrail-mcp"
+
+READ_APPROVE_TOOLS=(
+  query_knowledge
+  query_knowledge_strict
+  code_rag_search
+  read_file
+  grep_code
+  list_dir
+  file_info
+  git_status
+  git_diff
+  analyze_file
+)
+WRITE_PROMPT_TOOLS=(
+  apply_patch
+  run_lint
+  import_external_file
+  ingest_document
+  remove_document
+  reload_knowledge_base
+  run_command
+)
+ENABLED_TOOLS=("${READ_APPROVE_TOOLS[@]}" "${WRITE_PROMPT_TOOLS[@]}")
+
+CODEX_RUNTIME_ARGS=(
+  -C "$CODEX_ROOT"
+  -a on-request
+  -s workspace-write
+  -c "mcp_servers.codetrail.command=$(toml_string "$CODEX_MCP_WRAPPER")"
+  -c "mcp_servers.codetrail.enabled=true"
+  -c "mcp_servers.codetrail.required=true"
+  -c "mcp_servers.codetrail.startup_timeout_sec=10"
+  -c "mcp_servers.codetrail.tool_timeout_sec=120"
+  -c "mcp_servers.codetrail.default_tools_approval_mode=\"prompt\""
+  -c "mcp_servers.codetrail.enabled_tools=$(toml_string_array "${ENABLED_TOOLS[@]}")"
+)
+
+for tool in "${READ_APPROVE_TOOLS[@]}"; do
+  CODEX_RUNTIME_ARGS+=(
+    -c "mcp_servers.codetrail.tools.$tool.approval_mode=\"approve\""
+  )
+done
+
+for tool in "${WRITE_PROMPT_TOOLS[@]}"; do
+  CODEX_RUNTIME_ARGS+=(
+    -c "mcp_servers.codetrail.tools.$tool.approval_mode=\"prompt\""
+  )
+done
+
+export AICODE_ROOT="$ROOT"
+export CODETRAIL_HOME
+export AICODE_MODEL
+
+echo "[aicodex] AICODE_ROOT=$AICODE_ROOT"
+echo "[aicodex] CODETRAIL_HOME=$CODETRAIL_HOME"
+echo "[aicodex] AICODE_MODEL=$AICODE_MODEL (CodeTrail MCP internal local model)"
+echo "[aicodex] Codex frontend model is controlled separately by Codex CLI args such as -m/--model."
+echo "[aicodex] Codex MCP wrapper: $CODEX_MCP_WRAPPER"
+echo "[aicodex] TIP: in Codex TUI, /mcp should show codetrail connected."
+
+cd "$CODEX_ROOT" || fail "cannot cd to Codex launch root: $CODEX_ROOT"
+exec codex "${CODEX_RUNTIME_ARGS[@]}" "${CODEX_ARGS[@]}"
