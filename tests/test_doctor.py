@@ -412,3 +412,15 @@ def test_check_opencode_config_drift_silent_when_absent(monkeypatch, tmp_path):
     r = doc.Result()
     doc.check_opencode_config_drift(r, str(tmp_path))
     assert not r.fails
+
+
+def test_check_rerank_policy_prints_current_policy(monkeypatch, capsys):
+    import config as cfg
+
+    monkeypatch.setattr(cfg, "RERANK_FALLBACK_POLICY", "embedding")
+    r = doc.Result()
+    doc.check_rerank_policy(r, no_network=False, server_status={})
+
+    out = capsys.readouterr().out
+    assert "RAG reranker: not reachable -> RAG rerank fallback = embedding" in out
+    assert "does not call the main model" in out

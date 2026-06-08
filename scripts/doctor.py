@@ -192,6 +192,39 @@ def check_llama_servers(r: Result, no_network: bool) -> dict[str, dict]:
     return status
 
 
+def check_rerank_policy(r: Result, no_network: bool, server_status: dict[str, dict]) -> None:
+    """Print dedicated reranker reachability and the configured fallback policy."""
+    cfg = _read_config()
+    if isinstance(cfg, Exception):
+        r.fail(f"無法 import config.py: {cfg}")
+        return
+
+    policy = getattr(cfg, "RERANK_FALLBACK_POLICY", "embedding")
+    if no_network:
+        reachability = "not checked (--no-network)"
+    else:
+        srv = server_status.get("reranker")
+        health = srv.get("health") if isinstance(srv, dict) else None
+        srv_status = str(health.get("status", "")).lower() if isinstance(health, dict) else ""
+        if srv_status == "ok":
+            reachability = "reachable"
+        elif srv_status:
+            reachability = f"not ready (status={srv_status})"
+        else:
+            reachability = "not reachable"
+
+    r.info(f"RAG reranker: {reachability} -> RAG rerank fallback = {policy}")
+    if policy == "main_model":
+        r.info(
+            "AICODE_RERANK_FALLBACK_POLICY=main_model restores the old behavior: "
+            "strict RAG queries may call the main model for reranking."
+        )
+    elif policy == "embedding":
+        r.info("AICODE_RERANK_FALLBACK_POLICY=embedding keeps embedding order and does not call the main model.")
+    elif policy == "error":
+        r.info("AICODE_RERANK_FALLBACK_POLICY=error fails loudly when the dedicated reranker is unavailable.")
+
+
 def check_models(r: Result, server_status: dict[str, dict]) -> None:
     """驗證主模型對應的 GGUF 檔案存在,並印 registry 摘要。"""
     cfg = _read_config()
@@ -689,6 +722,9 @@ def main(argv: list[str] | None = None) -> int:
     print("\n-- llama-server / 模型 --")
     server_status = check_llama_servers(r, no_network=args.no_network)
     check_models(r, server_status)
+
+    print("\n-- RAG rerank policy --")
+    check_rerank_policy(r, no_network=args.no_network, server_status=server_status)
 
     print("\n-- opencode-ai entry --")
     check_opencode_ai_entry(r)

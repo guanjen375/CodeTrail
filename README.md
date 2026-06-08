@@ -276,7 +276,7 @@ HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
 
 ### 2.3 下載 RAG 附屬模型
 
-CodeTrail 的 RAG / Code-RAG 內建固定使用 `bge-m3`(embedding)。`bge-reranker-v2-m3`(reranker)建議一起下載與啟動;沒啟動時 RAG 仍可用,會 fallback 到主模型做排序。這兩個體積很小:
+CodeTrail 的 RAG / Code-RAG 內建固定使用 `bge-m3`(embedding)。`bge-reranker-v2-m3`(reranker)建議一起下載與啟動;沒啟動時 RAG 仍可用,預設用既有 embedding 排序直接回傳,**不會靜默呼叫主模型**。這兩個體積很小:
 
 ```bash
 # embedding:bge-m3 (用 f16,不要量化 — embedding 對量化敏感,Q4 會明顯影響召回)
@@ -300,7 +300,7 @@ HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
 
 ## 3. 啟動 llama-server(用 tmux 跑在背景)
 
-CodeTrail 會把不同角色拆成不同 `llama-server` instance:main / embedding 是必要的;reranker 建議啟動,沒啟動時 RAG 會 fallback 到主模型排序;VL 選用。會分開是因為 `llama-server` 一次只能載一顆 GGUF,不同角色用不同模型 / 不同模式(`--jinja` / `--embedding --pooling cls` / `--embedding --pooling rank --reranking` / `--mmproj`),所以必須開不同 process。
+CodeTrail 會把不同角色拆成不同 `llama-server` instance:main / embedding 是必要的;reranker 建議啟動,沒啟動時 RAG 依 `AICODE_RERANK_FALLBACK_POLICY` 處理(預設 `embedding`,不打主模型);VL 選用。會分開是因為 `llama-server` 一次只能載一顆 GGUF,不同角色用不同模型 / 不同模式(`--jinja` / `--embedding --pooling cls` / `--embedding --pooling rank --reranking` / `--mmproj`),所以必須開不同 process。
 
 | Port | 角色 | 模型 | 必要 |
 |---|---|---|---|
@@ -392,22 +392,48 @@ srv  llama_server: server is listening on http://0.0.0.0:8080
 
 ### 3.2 RAG server — embedding + reranker(一鍵啟動 script)
 
-兩顆 RAG 副模型(embedding `bge-m3`、reranker `bge-reranker-v2-m3`)體積小、啟動秒開、**參數不需要依硬體調整**,所以包成一個 script 一次啟動,合在同一個 tmux session `codetrail-rag` 的兩個 window 內,使用者只需要管理一個 session。
+兩顆 RAG 副模型(embedding `bge-m3`、reranker `bge-reranker-v2-m3`)體積小、啟動參數固定,所以包成一個 script 一次啟動,合在同一個 tmux session `codetrail-rag` 的兩個 window 內,使用者只需要管理一個 session。script 會從 `AICODE_LLAMA_EMBED_BASE_URL` / `AICODE_LLAMA_RERANK_BASE_URL` 解析 host:port(預設 `http://localhost:8081` / `http://localhost:8082`),啟動後輪詢 `/health` JSON,直到 `status == "ok"` 才算成功;`status="loading model"` 不算 ready。
 
 ```bash
 chmod +x scripts/start-rag-servers.sh    # 第一次跑要加 exec bit
 ./scripts/start-rag-servers.sh
 ```
 
+常用覆寫:
+
+```bash
+# port / host 與 client 端 config 共用同一組 env
+AICODE_LLAMA_EMBED_BASE_URL=http://localhost:18081 \
+AICODE_LLAMA_RERANK_BASE_URL=http://localhost:18082 \
+RAG_HEALTH_TIMEOUT=120 \
+./scripts/start-rag-servers.sh
+
+# GPU placement:未設定時沿用 CUDA_VISIBLE_DEVICES;單顆可用 EMBED_GPU / RERANK_GPU 覆寫
+CUDA_VISIBLE_DEVICES=0 ./scripts/start-rag-servers.sh
+EMBED_GPU=0 RERANK_GPU=1 ./scripts/start-rag-servers.sh
+```
+
+`AICODE_RERANK_FALLBACK_POLICY` 控制 reranker 不可用時的行為:
+
+| policy | RAG 知識庫 fallback | Code RAG fallback |
+|---|---|---|
+| `embedding`(預設) | 保留 embedding / hybrid 既有排序,不呼叫主模型 | 同左 |
+| `main_model` | 還原舊行為,用主聊天模型做 LLM rerank | 等同 `embedding`(Code RAG 沒有主模型 rerank 路徑) |
+| `error` | 直接報錯,不靜默降級 | 直接報錯 |
+
+`main_model` 可能很貴:嚴格模式下每條符合條件的 RAG query 都可能觸發主模型 rerank。只有你明確接受這個成本時才設定 `AICODE_RERANK_FALLBACK_POLICY=main_model`。
+
 預期輸出:
 
 ```
-[+] 啟動 embedding server (:8081) 於 tmux codetrail-rag:embed
-[+] 啟動 reranker server  (:8082) 於 tmux codetrail-rag:rerank
+[+] 啟動 embedding server (http://localhost:8081) 於 tmux codetrail-rag:embed
+[+] embedding health OK: http://localhost:8081/health status=ok
+[+] 啟動 reranker server  (http://localhost:8082) 於 tmux codetrail-rag:rerank
+[+] reranker health OK: http://localhost:8082/health status=ok
 
-兩顆 server 大約 5–10 秒後 listening。驗證:
-  curl -s -o /dev/null -w 'embed  :8081 -> %{http_code}\n' http://localhost:8081/health
-  curl -s -o /dev/null -w 'rerank :8082 -> %{http_code}\n' http://localhost:8082/health
+RAG servers ready。驗證:
+  curl -s http://localhost:8081/health
+  curl -s http://localhost:8082/health
 ...
 ```
 
@@ -419,9 +445,9 @@ chmod +x scripts/start-rag-servers.sh    # 第一次跑要加 exec bit
 
 (平常不用看 log,真要偵錯才 `tmux a -t codetrail-rag`,session 內 `Ctrl-b n` 切 embed/rerank window,`Ctrl-b d` 退出。)
 
-**不跑 reranker 的話**(例如還沒下載):script 偵測到 `bge-reranker-v2-m3-Q4_K_M.gguf` 不存在會自動跳過,只啟動 embedding。doctor 會把 8082 列為 WARN 但不擋啟動。
+**不跑 reranker 的話**(例如還沒下載):script 偵測到 `bge-reranker-v2-m3-Q4_K_M.gguf` 或 `bge-reranker-v2-m3*.gguf` 不存在會自動跳過,只啟動 embedding,並印出目前 `AICODE_RERANK_FALLBACK_POLICY`。doctor 會把 8082 列為 WARN 但不擋啟動。
 
-**模型路徑非預設**:script 找的是 `~/models/bge-m3/...` 與 `~/models/bge-reranker-v2-m3/...`。若放別處,啟動前 `export MODELS_DIR=/your/path`。llama-server 不在 `~/llama.cpp/...` 也類似:`export LLAMA_BIN=/your/llama-server`。
+**模型路徑非預設**:script 先找 `~/models/bge-m3/bge-m3-f16.gguf` 與 `~/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q4_K_M.gguf`;找不到時會在對應目錄 glob `bge-m3*.gguf` / `bge-reranker-v2-m3*.gguf`,方便不同 quant 檔名。若放別處,啟動前 `export MODELS_DIR=/your/path`;若要指定完整檔案,用 `EMBED_MODEL=/path/to/bge-m3*.gguf` 或 `RERANK_MODEL=/path/to/bge-reranker-v2-m3*.gguf`。llama-server 不在 `~/llama.cpp/...` 也類似:`export LLAMA_BIN=/your/llama-server`。
 
 ### 3.3 驗活與維運
 
@@ -434,13 +460,13 @@ tmux ls
 #   codetrail-rag:  2 windows (created ...)    ← 內含 embed + rerank 兩個 window
 ```
 
-驗已啟動的 port 都通(若跳過 reranker,把 8082 拿掉):
+驗已啟動的 port 都 ready(若跳過 reranker,把 8082 拿掉):
 
 ```bash
 for p in 8080 8081 8082; do
-  echo ":$p → $(curl -s -o /dev/null -w '%{http_code}' http://localhost:$p/health)"
+  echo ":$p → $(curl -s http://localhost:$p/health)"
 done
-# 應該都印 200
+# 應該都含 {"status":"ok"};只有 HTTP 200 不夠,loading model 時也可能是 200
 ```
 
 之後要關掉全部:

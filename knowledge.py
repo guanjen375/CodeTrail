@@ -1249,6 +1249,20 @@ English:"""
         # 其他情況：top_emb_score 較低時，需要 rerank
         return top_emb_score < 0.5
 
+    def _rerank_fallback(self, question: str, candidates: list, top_k: int, reason: str) -> list:
+        """Apply the configured fallback after the dedicated reranker cannot be used."""
+        policy = config.RERANK_FALLBACK_POLICY
+        if policy == "embedding":
+            return [c[3] for c in candidates[:top_k]]
+        if policy == "main_model":
+            return self._rerank_with_llm(question, candidates, top_k)
+        if policy == "error":
+            raise RuntimeError(
+                "RAG reranker unavailable and AICODE_RERANK_FALLBACK_POLICY=error. "
+                f"Reason: {reason}"
+            )
+        raise RuntimeError(f"Unknown RERANK_FALLBACK_POLICY: {policy!r}")
+
     def _rerank_with_model(self, question: str, candidates: list, top_k: int,
                            is_strict_mode: bool = False) -> list:
         """使用專用 reranker 模型重排
@@ -1286,10 +1300,12 @@ English:"""
                 scored.sort(reverse=True, key=lambda x: x[0])
                 return [c[1] for c in scored[:top_k]]
 
-            except Exception:
-                pass
+            except Exception as exc:
+                return self._rerank_fallback(
+                    question, candidates, top_k, f"dedicated reranker call failed: {exc}"
+                )
 
-        return self._rerank_with_llm(question, candidates, top_k)
+        return self._rerank_fallback(question, candidates, top_k, "dedicated reranker is not reachable")
 
     def _rerank_with_llm(self, question: str, candidates: list, top_k: int) -> list:
         """LLM Reranking (fallback)"""

@@ -37,7 +37,7 @@ Registry 維護在 `~/.config/codetrail/models.json`,格式:
 | `<CODE_MODEL>` | 主聊天 / 程式推導,掛在 llama-server :8080 | 由你自行選擇並下載;CodeTrail 不內建、不推薦、不 fallback |
 | VL (例如 qwen3-vl, llava) | `analyze_file(...)` 處理截圖、UI error;`ingest_document(...)` 把圖片切 chunk 進 KB 也用它 | 掛在 :8083,需要 GGUF 主檔 + `mmproj-*.gguf`;不分析圖片就不用啟動 |
 | `bge-m3` (RAG embedding) | `query_knowledge(...)` / `code_rag_search(...)` 的 embedding | 掛在 :8081,server 啟動旗標 `--embedding --pooling cls` |
-| `bge-reranker-v2-m3` (RAG reranker) | RAG rerank cross-encoder | 掛在 :8082,server 啟動旗標 `--embedding --pooling rank --reranking`;沒掛時 RAG 會 fallback 到 LLM 排序 |
+| `bge-reranker-v2-m3` (RAG reranker) | RAG rerank cross-encoder | 掛在 :8082,server 啟動旗標 `--embedding --pooling rank --reranking`;沒掛時依 `AICODE_RERANK_FALLBACK_POLICY` 處理,預設 `embedding` 不打主模型 |
 
 挑選方向(自己判斷):
 
@@ -262,7 +262,7 @@ VRAM 不夠時的調整順序(由小痛到大痛):
 | context 開太大 | server 啟動 OOM 或 KV cache 太占 VRAM,sampling 變慢 |
 | context 開太小 | 是正確性問題,長 spec / 大 repo 可能塞不進 prompt;CodeTrail 會用 `[CTX_OVERFLOW]` 阻止 silent truncation |
 
-如果 llama-server 跑在另一台 GPU 主機上,CodeTrail 這台可以把 URL 指過去:
+如果 llama-server 跑在另一台 GPU 主機上,CodeTrail 這台可以把 URL 指過去。`scripts/start-rag-servers.sh` 也讀同一組 `AICODE_LLAMA_EMBED_BASE_URL` / `AICODE_LLAMA_RERANK_BASE_URL`,所以 client 和 launcher 不需要兩套 port 設定:
 
 ```bash
 AICODE_LLAMA_BASE_URL=http://<GPU_HOST>:8080 \
@@ -280,16 +280,26 @@ aicode
 "baseURL": "http://<GPU_HOST>:8080/v1"
 ```
 
+Reranker 不可用時的行為由 `AICODE_RERANK_FALLBACK_POLICY` 控制:
+
+| policy | 行為 |
+|---|---|
+| `embedding`(預設) | 保留 embedding / hybrid 既有排序,不呼叫主模型 |
+| `main_model` | RAG 知識庫還原舊行為,用主聊天模型 rerank;Code RAG 沒有這條路徑,等同 `embedding` |
+| `error` | 專用 reranker 不可用或呼叫失敗時直接報錯 |
+
+`main_model` 有成本風險:嚴格模式下每條符合條件的 query 都可能打主模型做 rerank。公開 / 多硬體部署建議維持預設 `embedding`,除非使用者明確選擇舊行為。
+
 NDA 場景要特別注意:遠端 server 會收到 prompt、程式碼片段、spec 摘要與工具輸出。只把它指向你信任的內網 / VPN 主機,不要把 llama-server 暴露到公開網路(llama-server 預設不檢查 API key)。
 
-RAG 相關模型也要在新機器上準備好 GGUF 並啟動對應 server:
+RAG 相關模型也要在新機器上準備好 GGUF 並啟動對應 server。若用 repo 內建 launcher,可用 `MODELS_DIR` 指模型根目錄,或用 `EMBED_MODEL` / `RERANK_MODEL` 指完整 GGUF 路徑;找不到預設檔名時,launcher 會 glob `bge-m3*.gguf` / `bge-reranker-v2-m3*.gguf`。`RAG_HEALTH_TIMEOUT` 控制 `/health` 等待秒數(預設 60)。GPU placement 可用既有 `CUDA_VISIBLE_DEVICES`,或每顆 server 分別用 `EMBED_GPU` / `RERANK_GPU`。
 
 ```bash
 # embedding (必要) — embedding 模型不要量化,Q4 會明顯影響召回,用 f16
 llama-server -m ~/models/bge-m3/bge-m3-f16.gguf \
   --host 0.0.0.0 --port 8081 -c 8192 --embedding --pooling cls -ngl 99 &
 
-# reranker (建議啟動;沒掛時 RAG fallback 到 LLM 排序)
+# reranker (建議啟動;沒掛時預設保留 embedding 排序,不呼叫主模型)
 llama-server -m ~/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q4_K_M.gguf \
   --host 0.0.0.0 --port 8082 -c 8192 --embedding --pooling rank --reranking -ngl 99 &
 ```

@@ -376,6 +376,13 @@ KNOWLEDGE_MERGE_ADJACENT = True
 KNOWLEDGE_MERGE_MAX_CHARS = 2500
 EMBEDDING_MODEL = _os.environ.get("AICODE_EMBED_MODEL", "bge-m3")
 RERANKER_MODEL = _os.environ.get("AICODE_RERANK_MODEL", "bge-reranker-v2-m3")
+RERANK_FALLBACK_POLICY = _os.environ.get("AICODE_RERANK_FALLBACK_POLICY", "embedding").strip().lower()
+_RERANK_FALLBACK_POLICIES = {"embedding", "main_model", "error"}
+if RERANK_FALLBACK_POLICY not in _RERANK_FALLBACK_POLICIES:
+    raise ValueError(
+        "AICODE_RERANK_FALLBACK_POLICY must be one of "
+        f"{sorted(_RERANK_FALLBACK_POLICIES)}; got {RERANK_FALLBACK_POLICY!r}"
+    )
 USE_RERANKER = True
 USE_HYBRID_SEARCH = True
 USE_QUERY_EXPANSION = True

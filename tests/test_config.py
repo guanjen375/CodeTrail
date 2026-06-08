@@ -157,3 +157,31 @@ def test_get_answer_rules_returns_string():
     s2 = config.get_answer_rules(has_binary=True)
     assert isinstance(s1, str) and "REF" in s1
     assert isinstance(s2, str) and "BIN" in s2 and "ELF" in s2
+
+
+def test_rerank_fallback_policy_defaults_to_embedding(monkeypatch):
+    import importlib
+    monkeypatch.delenv("AICODE_RERANK_FALLBACK_POLICY", raising=False)
+    importlib.reload(config)
+    assert config.RERANK_FALLBACK_POLICY == "embedding"
+
+
+def test_rerank_fallback_policy_rejects_unknown_value():
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+    env = {**os.environ, "AICODE_RERANK_FALLBACK_POLICY": "not-a-policy"}
+    proc = subprocess.run(
+        [sys.executable, "-c", "import config"],
+        cwd=str(repo_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "AICODE_RERANK_FALLBACK_POLICY" in proc.stderr

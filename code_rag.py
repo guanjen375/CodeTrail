@@ -24,6 +24,7 @@ try:
 except ImportError:
     HAS_NUMPY = False
 
+import config
 from config import (
     CODE_EXTENSIONS, EMBEDDING_MODEL,
     CODE_RAG_ENABLED, CODE_RAG_TOP_K, CODE_RAG_CACHE_FILE,
@@ -699,6 +700,15 @@ class CodeRAG:
 
         return top_score < 0.6
 
+    def _rerank_code_fallback(self, candidates: list, top_k: int, reason: str) -> list:
+        """Fallback for Code RAG rerank. main_model is intentionally embedding here."""
+        if config.RERANK_FALLBACK_POLICY == "error":
+            raise RuntimeError(
+                "Code RAG reranker unavailable and AICODE_RERANK_FALLBACK_POLICY=error. "
+                f"Reason: {reason}"
+            )
+        return [c[3] for c in candidates[:top_k]]
+
     def _rerank_code_candidates(self, question: str, candidates: list, top_k: int) -> list:
         """使用 reranker 模型對程式碼候選進行二次排序
 
@@ -751,11 +761,13 @@ class CodeRAG:
                 scored.sort(reverse=True, key=lambda x: x[0])
                 return [c[1] for c in scored[:top_k]]
 
-            except Exception:
-                pass
+            except Exception as exc:
+                return self._rerank_code_fallback(
+                    candidates, top_k, f"dedicated reranker call failed: {exc}"
+                )
 
-        # Fallback: 不用 reranker，直接返回原始排序
-        return [c[3] for c in candidates[:top_k]]
+        # Code RAG 沒有主模型 rerank 路徑;main_model policy 在這裡等同 embedding。
+        return self._rerank_code_fallback(candidates, top_k, "dedicated reranker is not reachable")
 
     def query(self, question: str, top_k: int = CODE_RAG_TOP_K, is_bug_fix: bool = False) -> list[dict]:
         """查詢相關程式碼位置（動態門檻 + reranker 二次排序）
