@@ -376,7 +376,7 @@ KNOWLEDGE_MERGE_ADJACENT = True
 KNOWLEDGE_MERGE_MAX_CHARS = 2500
 EMBEDDING_MODEL = _os.environ.get("AICODE_EMBED_MODEL", "bge-m3")
 RERANKER_MODEL = _os.environ.get("AICODE_RERANK_MODEL", "bge-reranker-v2-m3")
-RERANK_FALLBACK_POLICY = _os.environ.get("AICODE_RERANK_FALLBACK_POLICY", "embedding").strip().lower()
+RERANK_FALLBACK_POLICY = _os.environ.get("AICODE_RERANK_FALLBACK_POLICY", "error").strip().lower()
 _RERANK_FALLBACK_POLICIES = {"embedding", "main_model", "error"}
 if RERANK_FALLBACK_POLICY not in _RERANK_FALLBACK_POLICIES:
     raise ValueError(
@@ -431,9 +431,9 @@ BM25_ENABLED = True                  # 啟用真正的 BM25（取代簡單 keywo
 RRF_K = 60                           # RRF 常數，控制排名衰減速度
 RRF_ENABLED = True                   # 啟用 RRF 融合（取代線性加權）
 
-# Reranker 條件式觸發（平衡精準度與速度）
-# 改進：高信心時跳過 rerank，減少不必要的延遲
-RERANKER_ALWAYS_ON = False           # False = 條件式觸發，高信心時跳過
+# Reranker 強制觸發：聊天模型啟用時 preflight 會要求 reranker server ready，
+# query 時也預設不因高信心跳過 rerank。
+RERANKER_ALWAYS_ON = True            # True = 有足夠候選就一律走專用 reranker
 RERANKER_TOP_N = 6                   # P0 改進：Rerank 後取 top N（速度優先：8->6）
 RERANKER_SKIP_THRESHOLD = 0.55       # top_emb_score > 此值時跳過 rerank（放寬：0.65->0.55）
 

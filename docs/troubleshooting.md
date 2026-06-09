@@ -212,6 +212,7 @@ AICODE_MODEL=<CODE_MODEL> python scripts/ctx_safety_check.py
 curl -s http://localhost:8080/health
 curl -s http://localhost:8081/health   # embedding
 curl -s http://localhost:8082/health   # reranker
+curl -s http://localhost:8083/health   # VL
 ```
 
 回 `{"status": "ok"}` 才算 ready。沒回應就重啟對應 server(見 [docs/setup.md](setup.md))。

@@ -88,6 +88,7 @@ def _run_aicode_with_stub(
             "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
             "PYTHONIOENCODING": "utf-8",
             "AICODE_CTX_SAFETY_DISABLE": "1",
+            "AICODE_REQUIRED_MODELS_CHECK_SKIP": "1",
         }
     )
     if env_extra:
@@ -141,6 +142,7 @@ def test_aicode_prepares_opencode_mcp_wrapper(tmp_path):
         # 的環境下會 refuse to start。這個 smoke test 只關心 MCP wrapper
         # 生成,不該被安全閘擋下。
         "AICODE_CTX_SAFETY_DISABLE": "1",
+        "AICODE_REQUIRED_MODELS_CHECK_SKIP": "1",
         # CodeTrail 不再內建預設主模型, 啟動時要先解析。給個假值讓 resolve_main_model
         # 通過; 真正的主模型解析邏輯有自己的單元測試覆蓋。
         "AICODE_MODEL": "example-code-model:30b",
@@ -318,6 +320,7 @@ def _run_aicodex_with_stub(
             "AICODE_CTX_SAFETY_DISABLE": "1",
             "AICODEX_FAKE_CODEX_ARGS": str(args_file),
             "AICODEX_FAKE_CODEX_ENV": str(env_file),
+            "AICODE_REQUIRED_MODELS_CHECK_SKIP": "1",
         }
     )
     if env_model is not None:

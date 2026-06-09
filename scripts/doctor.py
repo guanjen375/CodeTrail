@@ -121,8 +121,8 @@ def _read_config():
 _LLAMA_SERVERS = [
     ("LLAMA_BASE_URL",       "main",      True),   # 主聊天/程式推導 — 必要
     ("LLAMA_EMBED_BASE_URL", "embedding", True),   # embedding — 必要(RAG / KB 都吃)
-    ("LLAMA_RERANK_BASE_URL","reranker",  False),  # reranker — 選用
-    ("LLAMA_VL_BASE_URL",    "VL",        False),  # 視覺 — 選用
+    ("LLAMA_RERANK_BASE_URL","reranker",  True),   # reranker — 必要(RAG / Code RAG hard gate)
+    ("LLAMA_VL_BASE_URL",    "VL",        True),   # 視覺 — 必要(圖片 / RAG ingestion hard gate)
 ]
 
 
@@ -164,7 +164,7 @@ def check_llama_servers(r: Result, no_network: bool) -> dict[str, dict]:
             if required:
                 r.fail(msg + "\n        請確認對應 llama-server 已啟動")
             else:
-                r.warn(msg + " (選用 server,不影響核心功能)")
+                r.warn(msg + " (required server)")
             continue
 
         srv_status = str(health.get("status", "")).lower()
@@ -199,7 +199,7 @@ def check_rerank_policy(r: Result, no_network: bool, server_status: dict[str, di
         r.fail(f"無法 import config.py: {cfg}")
         return
 
-    policy = getattr(cfg, "RERANK_FALLBACK_POLICY", "embedding")
+    policy = getattr(cfg, "RERANK_FALLBACK_POLICY", "error")
     if no_network:
         reachability = "not checked (--no-network)"
     else:

@@ -157,6 +157,13 @@ if [ -f "$CODETRAIL_HOME/scripts/ctx_safety_check.py" ]; then
   fi
 fi
 
+if [ -f "$CODETRAIL_HOME/scripts/required_model_servers_check.py" ]; then
+  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/required_model_servers_check.py"; then
+    echo "[aicode] required model server preflight refused to start (see [model-preflight] above)." >&2
+    exit 2
+  fi
+fi
+
 export AICODE_ROOT="$ROOT"
 echo "[aicode] AICODE_ROOT=$AICODE_ROOT"
 

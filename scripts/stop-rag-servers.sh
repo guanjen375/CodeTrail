@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 關掉 CodeTrail RAG 兩顆 server(embedding + reranker)。
+# 關掉 CodeTrail 附屬 server(embedding + reranker + VL)。
 #
-# 配套 `start-rag-servers.sh` 使用:那邊把 embed + rerank 包進同一個 tmux
-# session(`codetrail-rag`)的兩個 window,這邊一次砍掉整個 session 就同時停掉兩顆。
+# 配套 `start-rag-servers.sh` 使用:那邊把 embed + rerank + vl 包進同一個 tmux
+# session(`codetrail-rag`)的三個 window,這邊一次砍掉整個 session 就同時停掉三顆。
 #
 # 用法:
 #   ./scripts/stop-rag-servers.sh
@@ -12,6 +12,7 @@
 #   SESSION                       tmux session 名稱,預設 codetrail-rag
 #   AICODE_LLAMA_EMBED_BASE_URL   embedding server base URL,預設 http://localhost:8081
 #   AICODE_LLAMA_RERANK_BASE_URL  reranker server base URL,預設 http://localhost:8082
+#   AICODE_LLAMA_VL_BASE_URL      VL server base URL,預設 http://localhost:8083
 
 set -euo pipefail
 
@@ -22,6 +23,7 @@ source "$SCRIPT_DIR/rag-server-lib.sh"
 SESSION="${SESSION:-codetrail-rag}"
 AICODE_LLAMA_EMBED_BASE_URL="${AICODE_LLAMA_EMBED_BASE_URL:-http://localhost:8081}"
 AICODE_LLAMA_RERANK_BASE_URL="${AICODE_LLAMA_RERANK_BASE_URL:-http://localhost:8082}"
+AICODE_LLAMA_VL_BASE_URL="${AICODE_LLAMA_VL_BASE_URL:-http://localhost:8083}"
 FORCE=0
 
 while [[ $# -gt 0 ]]; do
@@ -43,11 +45,12 @@ done
 
 read -r EMBED_HOST EMBED_PORT EMBED_BASE_URL < <(rag_parse_base_url "$AICODE_LLAMA_EMBED_BASE_URL" 8081)
 read -r RERANK_HOST RERANK_PORT RERANK_BASE_URL < <(rag_parse_base_url "$AICODE_LLAMA_RERANK_BASE_URL" 8082)
+read -r VL_HOST VL_PORT VL_BASE_URL < <(rag_parse_base_url "$AICODE_LLAMA_VL_BASE_URL" 8083)
 
 if command -v tmux >/dev/null 2>&1; then
     if tmux has-session -t "$SESSION" 2>/dev/null; then
         tmux kill-session -t "$SESSION"
-        echo "[+] 已關閉 tmux session '$SESSION'(embedding + reranker 都停止)"
+        echo "[+] 已關閉 tmux session '$SESSION'(embedding + reranker + VL 都停止)"
     else
         echo "[!] tmux session '$SESSION' 不存在,沒有 tmux session 要關"
     fi
@@ -94,3 +97,4 @@ check_orphan_port() {
 
 check_orphan_port "embedding" "$EMBED_PORT" "$EMBED_BASE_URL"
 check_orphan_port "reranker" "$RERANK_PORT" "$RERANK_BASE_URL"
+check_orphan_port "VL" "$VL_PORT" "$VL_BASE_URL"

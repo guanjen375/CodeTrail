@@ -98,6 +98,11 @@ from utils import (
     should_refuse_answer,
     should_use_strict_mode,
 )
+from scripts.required_model_servers_check import (
+    SKIP_ENV as REQUIRED_MODELS_SKIP_ENV,
+    render_report as _render_required_model_report,
+    run_checks as _run_required_model_checks,
+)
 import data_flywheel
 
 try:
@@ -169,6 +174,18 @@ else:
         f"[MCP] Using model: {_resolved_main_model} "
         "(resolved from ~/.config/opencode/opencode.json)"
     )
+
+if os.environ.get(REQUIRED_MODELS_SKIP_ENV, "").lower() in ("1", "true", "yes"):
+    _log(
+        f"[MCP] WARN: required model server preflight skipped via {REQUIRED_MODELS_SKIP_ENV}=1 "
+        "(test/CI only; normal runtime should keep this hard gate enabled)"
+    )
+else:
+    _required_model_checks = _run_required_model_checks()
+    for _line in _render_required_model_report(_required_model_checks, prefix="[MCP][model-preflight]"):
+        _log(_line)
+    if not all(_check.ok for _check in _required_model_checks):
+        sys.exit(3)
 
 # Warn if user set AICODE_NUM_CTX expecting it to cap per-call context, but
 # dynamic mode (the default) ignores it and uses DYNAMIC_NUM_CTX_MAX instead.

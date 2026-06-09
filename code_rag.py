@@ -31,7 +31,7 @@ from config import (
     CODE_RAG_THRESHOLD, CODE_RAG_THRESHOLD_BUG,
     CODE_RAG_LAZY_EMBED, CODE_RAG_LAZY_EMBED_MAX_SYMBOLS, CODE_RAG_LAZY_EMBED_QUERY_TOP_K,
     LLAMA_EMBED_BASE_URL, LLAMA_RERANK_BASE_URL,
-    USE_RERANKER, RERANKER_MODEL
+    USE_RERANKER, RERANKER_MODEL, RERANKER_ALWAYS_ON
 )
 import llama_client
 from utils import should_ignore_file, should_ignore_dir, get_cached_scan_result, set_scan_cache
@@ -686,6 +686,9 @@ class CodeRAG:
         """
         if len(candidates) <= top_k:
             return False
+
+        if RERANKER_ALWAYS_ON:
+            return True
 
         top_score = candidates[0][0] if candidates else 0
         if top_score >= 0.85:

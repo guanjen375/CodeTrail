@@ -159,11 +159,11 @@ def test_get_answer_rules_returns_string():
     assert isinstance(s2, str) and "BIN" in s2 and "ELF" in s2
 
 
-def test_rerank_fallback_policy_defaults_to_embedding(monkeypatch):
+def test_rerank_fallback_policy_defaults_to_error(monkeypatch):
     import importlib
     monkeypatch.delenv("AICODE_RERANK_FALLBACK_POLICY", raising=False)
     importlib.reload(config)
-    assert config.RERANK_FALLBACK_POLICY == "embedding"
+    assert config.RERANK_FALLBACK_POLICY == "error"
 
 
 def test_rerank_fallback_policy_rejects_unknown_value():

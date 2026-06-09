@@ -33,6 +33,7 @@ def _spawn_mcp(tmp_root: Path, env_overrides: dict[str, str] | None = None) -> s
     # mcp_server.py 啟動時會 require_main_model(); 沒設會 fail-loud exit 3。
     # smoke test 不在意主模型實際存不存在, 給個合理假值即可。
     env["AICODE_MODEL"] = "example-code-model"
+    env["AICODE_REQUIRED_MODELS_CHECK_SKIP"] = "1"
     # 即使 env_overrides 覆寫 HOME,也要讓子行程能找到 mcp 套件 — 把當前
     # Python 的 sys.path 顯式塞進 PYTHONPATH(包含 user site-packages)
     env["PYTHONPATH"] = os.pathsep.join(

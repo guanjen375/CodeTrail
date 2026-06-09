@@ -33,6 +33,7 @@ def _spawn_mcp(tmp_root: Path, env_overrides: dict[str, str] | None = None) -> s
     # 所以給一個合理的假值讓 server 起得來。AICODE_MODEL resolution 邏輯有
     # tests/test_resolve_main_model.py + tests/test_config.py 各自覆蓋。
     env["AICODE_MODEL"] = "example-code-model"
+    env["AICODE_REQUIRED_MODELS_CHECK_SKIP"] = "1"
     env["PYTHONPATH"] = os.pathsep.join(
         [p for p in sys.path if p]
         + [env.get("PYTHONPATH", "")]

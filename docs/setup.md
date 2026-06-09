@@ -83,7 +83,7 @@ systemctl --user status codetrail-main
 journalctl --user -u codetrail-main -f    # 看 log
 ```
 
-embedding / reranker 各複製一份,改 ExecStart 即可。
+embedding / reranker / VL 各複製一份,改 ExecStart 即可。
 
 ### screen(類 tmux)
 
@@ -129,7 +129,7 @@ aicode
 **安全提醒**:llama-server 預設不檢查 API key,等於任何能連到 GPU 主機 8080 的人都能用你的模型。**只能指向可信內網 / VPN 主機**,不要把 8080 暴露公網。需要鎖住的話加反向代理(nginx / caddy)做 basic auth,或用 SSH tunnel:
 
 ```bash
-ssh -L 8080:localhost:8080 -L 8081:localhost:8081 -L 8082:localhost:8082 \
+ssh -L 8080:localhost:8080 -L 8081:localhost:8081 -L 8082:localhost:8082 -L 8083:localhost:8083 \
     user@<GPU_HOST>
 # 然後本機 AICODE_LLAMA_*_BASE_URL 全用 http://localhost:80xx
 ```
@@ -188,7 +188,7 @@ pkill -INT -f "llama-server"
 
 ```bash
 # 三個 port 都通?
-for p in 8080 8081 8082; do
+for p in 8080 8081 8082 8083; do
   echo ":$p → $(curl -s -o /dev/null -w '%{http_code}' http://localhost:$p/health)"
 done
 

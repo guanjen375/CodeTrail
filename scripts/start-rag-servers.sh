@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 啟動 CodeTrail RAG 兩顆固定參數 server(embedding + reranker)。
+# 啟動 CodeTrail 必要附屬 server(embedding + reranker + VL)。
 #
-# 兩顆模型體積小、啟動秒開、參數不需要依硬體調整,合併在一個 tmux session
-# (`codetrail-rag`)的兩個 window 內,使用者只需要管理一個 session。
+# 三顆附屬模型合併在一個 tmux session (`codetrail-rag`) 的三個 window 內,
+# 使用者只需要管理一個 session。
 #
 # 用法:
 #   ./scripts/start-rag-servers.sh
@@ -11,21 +11,24 @@
 # 環境變數(可選):
 #   MODELS_DIR                         GGUF 模型根目錄,預設 ~/models
 #   EMBED_MODEL                        embedding GGUF 完整路徑
-#   RERANK_MODEL                       reranker GGUF 完整路徑(可選)
+#   RERANK_MODEL                       reranker GGUF 完整路徑
+#   VL_GGUF                            VL GGUF 完整路徑
+#   VL_MMPROJ                          VL mmproj GGUF 完整路徑
 #   LLAMA_BIN                          llama-server 執行檔路徑
 #   SESSION                            tmux session 名稱,預設 codetrail-rag
 #   AICODE_LLAMA_EMBED_BASE_URL        embedding server base URL,預設 http://localhost:8081
 #   AICODE_LLAMA_RERANK_BASE_URL       reranker server base URL,預設 http://localhost:8082
-#   CUDA_VISIBLE_DEVICES               兩顆 server 共用的 CUDA device filter
-#   EMBED_GPU / RERANK_GPU             單顆 server 的 CUDA_VISIBLE_DEVICES 覆寫
+#   AICODE_LLAMA_VL_BASE_URL           VL server base URL,預設 http://localhost:8083
+#   CUDA_VISIBLE_DEVICES               三顆 server 共用的 CUDA device filter
+#   EMBED_GPU / RERANK_GPU / VL_GPU    單顆 server 的 CUDA_VISIBLE_DEVICES 覆寫
 #   RAG_HEALTH_TIMEOUT                 /health status=ok 等待秒數,預設 60
-#   AICODE_RERANK_FALLBACK_POLICY      embedding | main_model | error,預設 embedding
+#   AICODE_RERANK_FALLBACK_POLICY      embedding | main_model | error,預設 error
 #
 # 啟動後操作:
 #   tmux a -t codetrail-rag        接回去看 log
-#   Ctrl-b n                       切換 embed / rerank window
+#   Ctrl-b n                       切換 embed / rerank / vl window
 #   Ctrl-b d                       退出 tmux,server 留在背景
-#   ./scripts/stop-rag-servers.sh  一次關掉兩顆 server
+#   ./scripts/stop-rag-servers.sh  一次關掉三顆 server
 
 set -euo pipefail
 
@@ -38,8 +41,9 @@ LLAMA_BIN="${LLAMA_BIN:-$HOME/llama.cpp/build/bin/llama-server}"
 SESSION="${SESSION:-codetrail-rag}"
 AICODE_LLAMA_EMBED_BASE_URL="${AICODE_LLAMA_EMBED_BASE_URL:-http://localhost:8081}"
 AICODE_LLAMA_RERANK_BASE_URL="${AICODE_LLAMA_RERANK_BASE_URL:-http://localhost:8082}"
+AICODE_LLAMA_VL_BASE_URL="${AICODE_LLAMA_VL_BASE_URL:-http://localhost:8083}"
 RAG_HEALTH_TIMEOUT="${RAG_HEALTH_TIMEOUT:-60}"
-AICODE_RERANK_FALLBACK_POLICY="${AICODE_RERANK_FALLBACK_POLICY:-embedding}"
+AICODE_RERANK_FALLBACK_POLICY="${AICODE_RERANK_FALLBACK_POLICY:-error}"
 
 DRY_RUN=0
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -47,7 +51,7 @@ if [[ "${1:-}" == "--dry-run" ]]; then
     shift
 fi
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    sed -n '1,36p' "$0"
+    sed -n '1,39p' "$0"
     exit 0
 fi
 if [[ $# -gt 0 ]]; then
@@ -63,8 +67,10 @@ rag_validate_rerank_policy "$AICODE_RERANK_FALLBACK_POLICY"
 
 read -r EMBED_HOST EMBED_PORT EMBED_BASE_URL < <(rag_parse_base_url "$AICODE_LLAMA_EMBED_BASE_URL" 8081)
 read -r RERANK_HOST RERANK_PORT RERANK_BASE_URL < <(rag_parse_base_url "$AICODE_LLAMA_RERANK_BASE_URL" 8082)
+read -r VL_HOST VL_PORT VL_BASE_URL < <(rag_parse_base_url "$AICODE_LLAMA_VL_BASE_URL" 8083)
 EMBED_BIND_HOST="$(rag_bind_host_for "$EMBED_HOST")"
 RERANK_BIND_HOST="$(rag_bind_host_for "$RERANK_HOST")"
+VL_BIND_HOST="$(rag_bind_host_for "$VL_HOST")"
 
 find_model_path() {
     local default_path="$1"
@@ -100,14 +106,24 @@ find_model_path() {
 
 DEFAULT_EMBED_MODEL="$MODELS_DIR/bge-m3/bge-m3-f16.gguf"
 DEFAULT_RERANK_MODEL="$MODELS_DIR/bge-reranker-v2-m3/bge-reranker-v2-m3-Q4_K_M.gguf"
+DEFAULT_VL_GGUF="$MODELS_DIR/qwen3-vl/Qwen3VL-8B-Instruct-Q4_K_M.gguf"
+DEFAULT_VL_MMPROJ="$MODELS_DIR/qwen3-vl/mmproj-Qwen3VL-8B-Instruct-F16.gguf"
 
 EMBED_MODEL="${EMBED_MODEL:-}"
 RERANK_MODEL="${RERANK_MODEL:-}"
+VL_GGUF="${VL_GGUF:-}"
+VL_MMPROJ="${VL_MMPROJ:-}"
 if [[ -z "$EMBED_MODEL" ]]; then
     EMBED_MODEL="$(find_model_path "$DEFAULT_EMBED_MODEL" "$MODELS_DIR/bge-m3" 'bge-m3*.gguf' "$DRY_RUN" || true)"
 fi
 if [[ -z "$RERANK_MODEL" ]]; then
     RERANK_MODEL="$(find_model_path "$DEFAULT_RERANK_MODEL" "$MODELS_DIR/bge-reranker-v2-m3" 'bge-reranker-v2-m3*.gguf' "$DRY_RUN" || true)"
+fi
+if [[ -z "$VL_GGUF" ]]; then
+    VL_GGUF="$(find_model_path "$DEFAULT_VL_GGUF" "$MODELS_DIR/qwen3-vl" 'Qwen3VL-8B-Instruct*.gguf' "$DRY_RUN" || true)"
+fi
+if [[ -z "$VL_MMPROJ" ]]; then
+    VL_MMPROJ="$(find_model_path "$DEFAULT_VL_MMPROJ" "$MODELS_DIR/qwen3-vl" 'mmproj-Qwen3VL-8B-Instruct*.gguf' "$DRY_RUN" || true)"
 fi
 
 embed_cmd_string() {
@@ -128,10 +144,14 @@ rerank_cmd_string() {
         -c 8192 --embedding --pooling rank --reranking -ngl 99)"
 }
 
-RERANK_WILL_START=0
-if [[ -n "$RERANK_MODEL" && ( -f "$RERANK_MODEL" || "$DRY_RUN" == "1" ) ]]; then
-    RERANK_WILL_START=1
-fi
+vl_cmd_string() {
+    local prefix
+    prefix="$(rag_gpu_prefix "${VL_GPU:-}")"
+    printf '%s%s\n' "$prefix" "$(rag_quote_command \
+        "$LLAMA_BIN" -m "$VL_GGUF" --mmproj "$VL_MMPROJ" \
+        --host "$VL_BIND_HOST" --port "$VL_PORT" \
+        -c 8192 -ngl 99)"
+}
 
 if (( DRY_RUN )); then
     cat <<EOF
@@ -147,6 +167,13 @@ rerank_bind_host=$RERANK_BIND_HOST
 rerank_port=$RERANK_PORT
 rerank_model=$RERANK_MODEL
 rerank_command=$(rerank_cmd_string)
+vl_base_url=$VL_BASE_URL
+vl_host=$VL_HOST
+vl_bind_host=$VL_BIND_HOST
+vl_port=$VL_PORT
+vl_gguf=$VL_GGUF
+vl_mmproj=$VL_MMPROJ
+vl_command=$(vl_cmd_string)
 rerank_fallback_policy=$AICODE_RERANK_FALLBACK_POLICY
 health_timeout=$RAG_HEALTH_TIMEOUT
 EOF
@@ -173,14 +200,22 @@ check_model_files() {
         exit 1
     fi
 
-    if [[ -n "$RERANK_MODEL" && ! -f "$RERANK_MODEL" ]]; then
-        echo "[!] 找不到 reranker 模型 ($RERANK_MODEL),跳過。" >&2
-        echo "    AICODE_RERANK_FALLBACK_POLICY=$AICODE_RERANK_FALLBACK_POLICY ($(rag_policy_description "$AICODE_RERANK_FALLBACK_POLICY"))" >&2
-        RERANK_WILL_START=0
-    elif [[ -z "$RERANK_MODEL" ]]; then
-        echo "[!] 找不到 reranker 模型 ($DEFAULT_RERANK_MODEL 或 bge-reranker-v2-m3*.gguf),跳過。" >&2
-        echo "    AICODE_RERANK_FALLBACK_POLICY=$AICODE_RERANK_FALLBACK_POLICY ($(rag_policy_description "$AICODE_RERANK_FALLBACK_POLICY"))" >&2
-        RERANK_WILL_START=0
+    if [[ -z "$RERANK_MODEL" || ! -f "$RERANK_MODEL" ]]; then
+        echo "ERROR: 找不到 reranker 模型: ${RERANK_MODEL:-$DEFAULT_RERANK_MODEL}" >&2
+        echo "       依 README §2.3 下載 bge-reranker-v2-m3,或設定 RERANK_MODEL=/path/to/bge-reranker*.gguf" >&2
+        exit 1
+    fi
+
+    if [[ -z "$VL_GGUF" || ! -f "$VL_GGUF" ]]; then
+        echo "ERROR: 找不到 VL 模型: ${VL_GGUF:-$DEFAULT_VL_GGUF}" >&2
+        echo "       依 README §2.4 下載 qwen3-vl GGUF,或設定 VL_GGUF=/path/to/Qwen3VL*.gguf" >&2
+        exit 1
+    fi
+
+    if [[ -z "$VL_MMPROJ" || ! -f "$VL_MMPROJ" ]]; then
+        echo "ERROR: 找不到 VL mmproj: ${VL_MMPROJ:-$DEFAULT_VL_MMPROJ}" >&2
+        echo "       依 README §2.4 下載 mmproj,或設定 VL_MMPROJ=/path/to/mmproj*.gguf" >&2
+        exit 1
     fi
 }
 
@@ -219,14 +254,23 @@ check_port_free() {
 
 check_ports_free() {
     check_port_free "EMBED" "$EMBED_PORT" "$EMBED_BASE_URL"
-    if (( RERANK_WILL_START )); then
-        if [[ "$EMBED_PORT" == "$RERANK_PORT" && "$EMBED_HOST" == "$RERANK_HOST" ]]; then
-            echo "ERROR: embedding 與 reranker 指到同一個 host:port ($EMBED_HOST:$EMBED_PORT)" >&2
-            echo "       請調整 AICODE_LLAMA_EMBED_BASE_URL 或 AICODE_LLAMA_RERANK_BASE_URL。" >&2
-            exit 1
-        fi
-        check_port_free "RERANK" "$RERANK_PORT" "$RERANK_BASE_URL"
+    if [[ "$EMBED_PORT" == "$RERANK_PORT" && "$EMBED_HOST" == "$RERANK_HOST" ]]; then
+        echo "ERROR: embedding 與 reranker 指到同一個 host:port ($EMBED_HOST:$EMBED_PORT)" >&2
+        echo "       請調整 AICODE_LLAMA_EMBED_BASE_URL 或 AICODE_LLAMA_RERANK_BASE_URL。" >&2
+        exit 1
     fi
+    if [[ "$EMBED_PORT" == "$VL_PORT" && "$EMBED_HOST" == "$VL_HOST" ]]; then
+        echo "ERROR: embedding 與 VL 指到同一個 host:port ($EMBED_HOST:$EMBED_PORT)" >&2
+        echo "       請調整 AICODE_LLAMA_EMBED_BASE_URL 或 AICODE_LLAMA_VL_BASE_URL。" >&2
+        exit 1
+    fi
+    if [[ "$RERANK_PORT" == "$VL_PORT" && "$RERANK_HOST" == "$VL_HOST" ]]; then
+        echo "ERROR: reranker 與 VL 指到同一個 host:port ($RERANK_HOST:$RERANK_PORT)" >&2
+        echo "       請調整 AICODE_LLAMA_RERANK_BASE_URL 或 AICODE_LLAMA_VL_BASE_URL。" >&2
+        exit 1
+    fi
+    check_port_free "RERANK" "$RERANK_PORT" "$RERANK_BASE_URL"
+    check_port_free "VL" "$VL_PORT" "$VL_BASE_URL"
 }
 
 wait_for_health() {
@@ -283,27 +327,30 @@ echo "[+] 啟動 embedding server ($EMBED_BASE_URL) 於 tmux $SESSION:embed"
 wait_for_health "embedding" "$EMBED_BASE_URL" "$RAG_HEALTH_TIMEOUT"
 
 # --- 啟動 reranker (window 1) ----------------------------------------------
-# 沒下載 reranker 模型也不擋,RAG 會依 AICODE_RERANK_FALLBACK_POLICY fallback。
 
-if (( RERANK_WILL_START )); then
-    tmux new-window -t "$SESSION" -n rerank
-    tmux send-keys -t "$SESSION:rerank" "$(rerank_cmd_string)" Enter
-    echo "[+] 啟動 reranker server  ($RERANK_BASE_URL) 於 tmux $SESSION:rerank"
-    wait_for_health "reranker" "$RERANK_BASE_URL" "$RAG_HEALTH_TIMEOUT"
-else
-    echo "[!] reranker 未啟動。AICODE_RERANK_FALLBACK_POLICY=$AICODE_RERANK_FALLBACK_POLICY ($(rag_policy_description "$AICODE_RERANK_FALLBACK_POLICY"))"
-fi
+tmux new-window -t "$SESSION" -n rerank
+tmux send-keys -t "$SESSION:rerank" "$(rerank_cmd_string)" Enter
+echo "[+] 啟動 reranker server  ($RERANK_BASE_URL) 於 tmux $SESSION:rerank"
+wait_for_health "reranker" "$RERANK_BASE_URL" "$RAG_HEALTH_TIMEOUT"
+
+# --- 啟動 VL (window 2) ------------------------------------------------------
+
+tmux new-window -t "$SESSION" -n vl
+tmux send-keys -t "$SESSION:vl" "$(vl_cmd_string)" Enter
+echo "[+] 啟動 VL server        ($VL_BASE_URL) 於 tmux $SESSION:vl"
+wait_for_health "VL" "$VL_BASE_URL" "$RAG_HEALTH_TIMEOUT"
 
 # --- 收尾提示 ---------------------------------------------------------------
 
 cat <<EOF
 
-RAG servers ready。驗證:
+Aux model servers ready。驗證:
   curl -s $(rag_health_url "$EMBED_BASE_URL")
-$(if (( RERANK_WILL_START )); then printf '  curl -s %s\n' "$(rag_health_url "$RERANK_BASE_URL")"; fi)
-一次關掉兩顆:
+  curl -s $(rag_health_url "$RERANK_BASE_URL")
+  curl -s $(rag_health_url "$VL_BASE_URL")
+一次關掉三顆:
   ./scripts/stop-rag-servers.sh
 
 偵錯時看 log(平常不用):
-  tmux a -t $SESSION         (Ctrl-b n 切 window,Ctrl-b d 退出)
+  tmux a -t $SESSION         (Ctrl-b n 切 embed/rerank/vl window,Ctrl-b d 退出)
 EOF

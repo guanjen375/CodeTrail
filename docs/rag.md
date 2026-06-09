@@ -1,6 +1,6 @@
 # RAG、附件與知識庫操作
 
-這份文件整理附件匯入、知識庫建立、Code-RAG 搜尋與規格查詢方式。需要 llama-server `:8081` (embedding) 啟動才能算 embedding;`:8082` (reranker) 與 `:8083` (VL) 是選用,只在做 rerank / 處理圖片時需要。
+這份文件整理附件匯入、知識庫建立、Code-RAG 搜尋與規格查詢方式。CodeTrail 啟動聊天 frontend 前會硬性檢查 llama-server `:8081` (embedding)、`:8082` (reranker) 與 `:8083` (VL) 都 ready。
 
 [回到 README](../README.md)。
 
@@ -102,7 +102,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 - **binary**：`.bin` / `.dat` / `.raw` / `.fw` / `.img` / `.rom` / `.hex`（抽 hex dump、可讀字串、magic 偵測；遇到 ELF magic 自動切到 ELF 解析）
 - **ELF**：`.elf` / `.so` / `.o` / `.axf` / `.out` / `.ko`（抽 header / sections / symbols）
 
-純圖片掃描的 PDF（沒有可選文字）切不出內容，先把每頁存成 `.png` 再用 `ingest_document` 走圖片路徑，或先用 OCR 工具轉成文字檔再匯入。
+純圖片掃描的 PDF（沒有可選文字）切不出內容，先把每頁存成 `.png` 再用 `ingest_document` 走圖片路徑，或先用 OCR 工具轉成文字檔再匯入。VL server 是啟動必要條件，若圖片分析仍失敗，先跑 `python scripts/required_model_servers_check.py` 看 image_data probe。
 
 #### 三個步驟
 

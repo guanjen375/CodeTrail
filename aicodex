@@ -250,6 +250,13 @@ if [ -f "$CODETRAIL_HOME/scripts/ctx_safety_check.py" ]; then
   fi
 fi
 
+if [ -f "$CODETRAIL_HOME/scripts/required_model_servers_check.py" ]; then
+  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/required_model_servers_check.py"; then
+    echo "[aicodex] required model server preflight refused to start (see [model-preflight] above)." >&2
+    exit 2
+  fi
+fi
+
 prepare_codex_mcp_wrapper() {
   local codex_dir="$CODEX_ROOT/.codex"
   local wrapper="$codex_dir/run-codetrail-mcp"
