@@ -90,52 +90,51 @@ AICODE_MODEL=<CODE_MODEL> AICODE_DYNAMIC_NUM_CTX_MAX=32768 aicode
 
 ---
 
-## MoE 模型 + CPU offload(Qwen3-235B-A22B-Instruct-2507)
+## MoE 模型 + CPU offload(Qwen3-235B-A22B-Thinking-2507)
 
-5090 32GB + 128GB+ RAM 可以跑 **Qwen3-235B-A22B-Instruct-2507 Q4_K_M(總 ~142GB)**,作法是把 MoE expert tensors offload 到 CPU,attention / KV cache / router 留在 GPU。`llama-server` 從 2025 中加入兩個關鍵旗標:
+5090 32GB + 170GB RAM 可以跑 **Qwen3-235B-A22B-Thinking-2507 UD-Q4_K_XL(3 shard,約 140GB 級)**,作法是把大多數 MoE expert tensors offload 到 CPU,attention / KV cache / router 與少數 expert 留在 GPU。`llama-server` 從 2025 中加入兩個關鍵旗標:
 
 | 旗標 | 行為 | 適用情境 |
 |---|---|---|
-| `--cpu-moe` | 把**所有** layer 的 MoE expert tensors 放 CPU | 預設,VRAM 最省、最不會 OOM |
+| `--cpu-moe` | 把**所有** layer 的 MoE expert tensors 放 CPU | VRAM 最省、最不會 OOM,但較慢 |
 | `--n-cpu-moe N` | 把**前 N 層**的 expert 放 CPU(其餘留 GPU) | VRAM 還有空間時調小 N 換速度 |
 
-5090 32GB 在 `--cpu-moe`(全 offload) 下,實測 VRAM 約 15-18GB(主 server only),剩下空間可同時掛 bge-m3 + bge-reranker-v2-m3。若不跑 embedding/reranker,可改 `--n-cpu-moe 84` 之類把 ~10 層 expert 留在 GPU,生成速度通常多 1.5-2x。
+目前 README 走廊採用 `--n-cpu-moe 90`:Qwen3-235B 共 94 層,前 90 層 expert 在 CPU RAM,剩 4 層留 GPU。這組是 5090 同卡同時掛 main + embedding + reranker + VL 的保守實測值。
 
 ### 啟動範例
 
-CodeTrail 沒有附 launcher script — 怎麼啟動 server fleet(tmux / systemd / 自己寫 shell wrapper)留給你自己。下面是一個 5090 + 235B Q4_K_M 的 reference 命令:
+下面是一個 code tmux session 實際跑過的 5090 + 235B Thinking UD-Q4_K_XL reference 命令:
 
 ```bash
-llama-server \
-  -m ~/models/Qwen3-235B-A22B-Instruct-2507-GGUF/Q4_K_M/Qwen3-235B-A22B-Instruct-2507-Q4_K_M-00001-of-00003.gguf \
+~/llama.cpp/build/bin/llama-server \
+  -m ~/models/Qwen3-235B-A22B-Thinking-2507-GGUF/UD-Q4_K_XL/Qwen3-235B-A22B-Thinking-2507-UD-Q4_K_XL-00001-of-00003.gguf \
   --host 0.0.0.0 --port 8080 \
-  -c 32768 \
-  -ngl 999 \
-  --cpu-moe \
-  --no-mmap \
-  --jinja \
+  -c 65536 -ngl 99 --jinja \
   --cache-type-k q8_0 --cache-type-v q8_0 \
+  --n-cpu-moe 90 \
   -fa on \
-  --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0
+  -b 2048 -ub 512 \
+  -t 12 \
+  --no-mmap
 ```
 
 關鍵旗標:
 
 - `-m ...-00001-of-00003.gguf` — 三檔切片只要指第一個,llama.cpp 自動接後續
-- `--cpu-moe` — 全 offload。要換 `--n-cpu-moe N`(留越多 expert 在 GPU 越快),5090 32GB 加掛 embedding+reranker 同顆 GPU 時 `N=84` 左右是常見起點
-- `--no-mmap` — **強烈建議搭 `--cpu-moe` 一起加**(見下方「mmap vs no-mmap 取捨」)
+- `--n-cpu-moe 90` — 5090 同卡掛 main + RAG + VL 的實測值;只跑 main 時可把 N 調小,留更多 expert 在 GPU 換速度
+- `--no-mmap` — **強烈建議搭 MoE CPU offload 一起加**(見下方「mmap vs no-mmap 取捨」)
 - `--jinja` — 使用模型內建 chat_template,tool calling 才會正確
 - `-fa on` — flash attention(新版 llama.cpp 語法)
-- `--cache-type-k q8_0 --cache-type-v q8_0` — KV cache 量化,32K ctx 約 1.5GB
-- `--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0` — Qwen 官方對 Instruct-2507 的建議 sampling
+- `--cache-type-k q8_0 --cache-type-v q8_0` — KV cache 量化,64K ctx 約 3GB 級
+- `-b 2048 -ub 512 -t 12` — code session 在 9950X 上 prompt eval / ingest 約 74-80 tok/s;這不是 output decode 速度
 
-> `--cpu-moe` 與 `-fa on` 都是 2025 年中以後加入的 llama.cpp 旗標。如果 server 報 unknown option,先 `git pull && cmake --build build` 升級 llama.cpp。
+> 這次 code session 未顯式加 `--parallel`;llama-server log 顯示 auto `n_parallel=4`。如果改成 `--parallel 1`,速度與 VRAM 數字要重新量。
 
 ### mmap vs no-mmap 取捨(MoE 必看)
 
-預設 llama.cpp 用 `mmap` 把 GGUF 檔對應到 process 位址空間,**懶載入** —— 啟動很快(6 秒就 listening),但 weights 還沒實際讀進 RAM。
+預設 llama.cpp 用 `mmap` 把 GGUF 檔對應到 process 位址空間,**懶載入** —— 啟動很快,但 weights 還沒實際讀進 RAM。
 
-對 dense 模型沒差;對 MoE 模型搭 `--cpu-moe` 後**會在第一次推理觸到新 expert 時從 SSD page-in**,造成首字延遲(TTFT)爆炸,Qwen3-235B-A22B 實測首次 TTFT 可達 120 秒以上。llama-server 啟動時也會自己警告:
+對 dense 模型沒差;對 MoE 模型搭 CPU offload 後**會在第一次推理觸到新 expert 時從 SSD page-in**,造成首字延遲(TTFT)爆炸。llama-server 啟動時也會自己警告:
 
 ```
 W llama_model_loader: tensor overrides to CPU are used with mmap enabled —
@@ -144,29 +143,32 @@ W llama_model_loader: tensor overrides to CPU are used with mmap enabled —
 
 | | `mmap`(預設) | `--no-mmap` |
 |---|---|---|
-| 啟動時間 | ~6 秒(假載入) | 1.5–2.5 分鐘(真把 weights 全讀進 RAM) |
-| 首字 TTFT | 60–120 秒(第一次) | 5–15 秒 |
+| 啟動時間 | 快,但只是假載入 | 較慢,會把 weights 讀進 RAM |
+| 首字 TTFT | 第一次可能 60–120 秒 | 通常穩定很多 |
 | 後續對話 | 偶爾卡頓(冷 expert page-in) | 穩定 |
-| RAM 占用 | ~5GB + page cache | ~135GB(235B Q4_K_M 體積) |
+| RAM 占用 | 低 RSS + page cache | 約模型檔大小等級 |
 
-判斷:有 ≥ 150GB RAM 就加 `--no-mmap`,啟動慢一次換之後永久穩定。RAM 不到 150GB 就保持 mmap 接受偶爾卡頓,或換較小模型。
+判斷:有 ≥ 160GB RAM 就加 `--no-mmap`,啟動慢一次換之後永久穩定。RAM 不到模型檔大小 + 系統緩衝就保持 mmap 接受偶爾卡頓,或換較小模型。
 
-### 預期效能與資源(5090 32GB + DDR5 RAM 參考)
+### 實測效能與資源(2026-06-11,5090 32GB + 170GB RAM)
 
-| 指標 | `--cpu-moe`(全 offload) | `--n-cpu-moe 84`(留 10 層 GPU) |
-|---|---|---|
-| 主 server VRAM | 15-18 GB | 28-30 GB |
-| 系統 RAM | 130-140 GB(mmap)| 115-125 GB |
-| Prompt ingest | 50-150 tok/s | 100-250 tok/s |
-| 生成速度 | 6-12 tok/s | 12-20 tok/s |
+| 指標 | code session 實測 |
+|---|---|
+| main server command | `-c 65536 --n-cpu-moe 90 -b 2048 -ub 512 -t 12 --no-mmap` |
+| 四個 server VRAM | 28083 MiB / 32607 MiB |
+| VRAM 分布 | main 17830 MiB;VL 7952 MiB;embed 1148 MiB;rerank 896 MiB |
+| 系統 RAM | 122 GiB used / 170 GiB total;48 GiB available;swap 幾乎未用 |
+| prompt eval / ingest(吃輸入) | 約 74-80 tok/s |
+| output decode / generation(吐字) | 約 7.37 tok/s |
+| 重疊主模型請求 | 長任務約 4.95 tok/s;小任務約 2.20 tok/s |
 
-實際數字會被 RAM 頻寬、PCIe gen、context 大小、batch size 拉動,以上是大致量級。第一次 prompt 會慢(冷 cache 載入 expert weights),之後 page cache 暖了就會快。
+實際數字會被 RAM 頻寬、PCIe gen、context 大小、batch size、`--parallel`、同時是否跑 VL/RAG server 拉動。若只跑 main,或把 VL / RAG 附屬 server 放另一張卡,可以從 `--n-cpu-moe 86` 開始往下試。
 
 ### Context 上限
 
 - 模型原生支援 262K,但 KV cache 會吃 GPU。32K q8_0 KV cache 約 1.5GB,64K 約 3GB,128K 約 6GB。
 - CodeTrail 內部 ctx 預算(`AICODE_DYNAMIC_NUM_CTX_MAX`)要 ≤ server `-c`,否則 `aicode` 啟動時 ctx safety check 會 `exit 2` 拒絕。
-- 建議起點 32K,確認穩定後再升 64K(server `-c` 與 `AICODE_DYNAMIC_NUM_CTX_MAX` 必須一起改,後者不可超過前者,否則 `aicode` 的 ctx safety check 會 `exit 2`)。
+- 目前實測主 server 是 `-c 65536`;OpenCode `limit.context` 可先保守設 32768,要吃滿 64K 再把 `AICODE_DYNAMIC_NUM_CTX_MAX` 與 frontend context 一起調上去。
 
 > `--cpu-moe` 偏慢主要在 expert 經 PCIe / RAM bus 取值。改用 `--n-cpu-moe N`(N < 94)留越多 expert 在 GPU 越快;94 是 Qwen3-235B-A22B 的層數,N=94 等價於 `--cpu-moe`,N=0 等價於不 offload。
 
@@ -300,7 +302,7 @@ llama-server -m ~/models/bge-m3/bge-m3-f16.gguf \
   --host 0.0.0.0 --port 8081 -c 8192 --embedding --pooling cls -ngl 99 &
 
 # reranker (必要;啟動前 hard preflight 會檢查)
-llama-server -m ~/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q4_K_M.gguf \
+llama-server -m ~/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q8_0.gguf \
   --host 0.0.0.0 --port 8082 -c 8192 --embedding --pooling rank --reranking -ngl 99 &
 ```
 

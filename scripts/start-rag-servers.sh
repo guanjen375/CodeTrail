@@ -105,7 +105,7 @@ find_model_path() {
 }
 
 DEFAULT_EMBED_MODEL="$MODELS_DIR/bge-m3/bge-m3-f16.gguf"
-DEFAULT_RERANK_MODEL="$MODELS_DIR/bge-reranker-v2-m3/bge-reranker-v2-m3-Q4_K_M.gguf"
+DEFAULT_RERANK_MODEL="$MODELS_DIR/bge-reranker-v2-m3/bge-reranker-v2-m3-Q8_0.gguf"
 DEFAULT_VL_GGUF="$MODELS_DIR/qwen3-vl/Qwen3VL-8B-Instruct-Q4_K_M.gguf"
 DEFAULT_VL_MMPROJ="$MODELS_DIR/qwen3-vl/mmproj-Qwen3VL-8B-Instruct-F16.gguf"
 

@@ -66,7 +66,7 @@ ExecStart=/home/%u/llama.cpp/build/bin/llama-server \
   --host 0.0.0.0 --port 8080 \
   -c 65536 -ngl 99 --jinja \
   --cache-type-k q8_0 --cache-type-v q8_0 \
-  --cpu-moe --no-mmap
+  --n-cpu-moe 90 --no-mmap
 Restart=on-failure
 RestartSec=10
 
@@ -110,7 +110,7 @@ disown
 
 CodeTrail repo 跑在你工作機(CPU 即可),llama-server 跑在另一台 GPU 主機。CodeTrail 透過 HTTP 呼叫對方的 8080 / 8081 / 8082 / 8083。
 
-GPU 主機端:三個 server 照 [README §3](../README.md#3-啟動-3-個-llama-server用-tmux-跑在背景) 啟動,但 `--host 0.0.0.0` 必須保留(否則只 listen on `127.0.0.1`,外網連不到)。
+GPU 主機端:四個 server 照 [README §3](../README.md#3-啟動-llama-server用-tmux-跑在背景) 啟動,但 `--host 0.0.0.0` 必須保留(否則只 listen on `127.0.0.1`,外網連不到)。
 
 CodeTrail 端:
 
@@ -187,7 +187,7 @@ pkill -INT -f "llama-server"
 ### 看 server 狀態
 
 ```bash
-# 三個 port 都通?
+# 四個 port 都通?
 for p in 8080 8081 8082 8083; do
   echo ":$p → $(curl -s -o /dev/null -w '%{http_code}' http://localhost:$p/health)"
 done
