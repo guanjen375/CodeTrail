@@ -137,6 +137,30 @@ AICODE_WEB_PORT=4097 aicode web
 AICODE_WEB_PORT=4097 aicode attach      # 或 aicode attach http://127.0.0.1:4097
 ```
 
+### web UI 切了資料夾,CodeTrail 還是讀啟動時那個目錄
+
+CodeTrail 的沙箱根(`AICODE_ROOT`)是**啟動 `aicode web` / `start-web.sh` 當下那個目錄**,backend 起來時就釘死。OpenCode web UI 的「切換 WORK DIR / 開其他資料夾」只換 OpenCode 自己的 view,**不會 re-scope CodeTrail 的 MCP 沙箱** —— 所以你在 UI 切到別的資料夾後,`list_dir` / `read_file` 還是讀**啟動那個目錄**。
+
+這不是 escape(CodeTrail 讀不到沙箱外的資料夾,只是還停在原本那個),但會誤導。**CodeTrail web 是一個 backend 一個專案**:要分析另一個專案,在那個專案目錄**另起一個 backend**(換 port):
+
+```bash
+cd ~/other-project
+AICODE_WEB_PORT=4097 <CODETRAIL_REPO>/scripts/start-web.sh
+```
+
+OpenCode 目前沒有關掉那個切換器的設定,所以請直接**無視 UI 的資料夾切換**。
+
+### 分析不信任的 repo:擋 `opencode.json` 覆蓋你的鎖定
+
+被分析的 repo 如果自帶 `opencode.json`(根目錄或往上到 git root),它會**覆蓋你的全域鎖定設定** —— 可能把 `permission` 的 `bash` / `read` / `write` 從 `deny` 翻成 `allow`,讓 OpenCode 內建工具繞過 CodeTrail 沙箱;整個過程靜默無提示。分析**不信任 repo** 時前面加一個 env,讓 OpenCode 忽略專案層級 config:
+
+```bash
+OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode
+# web 也一樣:OPENCODE_DISABLE_PROJECT_CONFIG=1 <CODETRAIL_REPO>/scripts/start-web.sh
+```
+
+細節與實測見 [docs/security.md](security.md)。
+
 ### Codex CLI: `codex not found`
 
 `aicodex` 啟動前會先檢查 `codex` 是否在 PATH。沒有的話安裝 Codex CLI:

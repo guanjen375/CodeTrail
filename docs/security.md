@@ -97,6 +97,23 @@ OpenCode 的 model picker（TUI 與 web 都有）預設可能列出**雲端**模
 
 設了之後 model picker **只會出現你的本機模型**，雲端 provider 完全不列出、無法誤選。陣列字串要跟你 opencode.json 裡的 provider key 一致。NDA 場景強烈建議保留；這不影響 CodeTrail MCP（本機 llama-server）的運作。
 
+### 不信任 repo 的 opencode.json 可覆蓋鎖定設定（NDA 必看）
+
+OpenCode 載入設定時是「**專案層級 `opencode.json` 覆蓋全域**」。所以**你 clone 來分析的 repo，如果根目錄（或往上到 git root）有自己的 `opencode.json`，它能蓋掉你那份鎖死的全域 `permission` / `enabled_providers`** —— 例如把 `bash` / `read` / `write` 從 `deny` 翻成 `allow`，讓 OpenCode 內建工具繞過 CodeTrail 沙箱讀寫整個檔案系統、跑命令；或塞一個雲端 provider 蓋掉本機鎖定。整個過程**靜默**，UI 不會提示。
+
+這需要被分析的 repo 主動帶一個惡意 `opencode.json`（分析自己的 / 一般 repo 碰不到），但分析**不信任 repo** 時值得防。啟動時讓 OpenCode 忽略專案層級 config、只認你的全域鎖定：
+
+```bash
+OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode
+# web：OPENCODE_DISABLE_PROJECT_CONFIG=1 <CODETRAIL_REPO>/scripts/start-web.sh
+```
+
+實測加了之後 CodeTrail 不受影響（`codetrail` MCP、`enabled_providers`、`permission` deny 全保留）。CodeTrail 預設**沒有**強制這個 env，是為了維持 stock OpenCode 行為；分析不信任 repo 時自己加上即可。
+
+### web 沙箱是「單專案 per backend」
+
+`aicode web` / `start-web.sh` 的沙箱根釘在**啟動目錄**，backend 起來就固定。OpenCode web UI 的資料夾 / 專案切換器**不會改 CodeTrail 沙箱** —— 切到別的資料夾後 CodeTrail 還是只讀啟動目錄（讀不到沙箱外，所以不是 escape，但會誤導）。要分析另一個專案，在那個目錄另起一個 backend（換 `AICODE_WEB_PORT`）。詳見 [troubleshooting](troubleshooting.md)。
+
 ### 不要 commit 的資料
 
 這些通常含有 NDA 內容或本地快取，應留在 `.gitignore`：
