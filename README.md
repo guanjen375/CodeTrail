@@ -768,27 +768,41 @@ aicode web
 
 #### 情況 B:這台是沒有桌面的遠端 server(常見:GPU 主機)
 
-server 上沒瀏覽器,把它的 4096 透過 SSH 轉到你自己電腦,用本機瀏覽器開。**訣竅:用你平常 SSH 進 server 的那條指令,後面加 `-L 4096:127.0.0.1:4096` 就好,不用另外開第二條 tunnel。** 全程維持 loopback、不必設密碼、不開對外 port。
+server 上沒瀏覽器,從你自己的裝置連進去。**推薦走 Tailscale**:給 server 一個固定網址,加到瀏覽器最愛點一下就進,不用每次手動開 SSH tunnel(tunnel 偶爾會斷、或忘了開)。全程維持 loopback、tailnet 內 WireGuard 加密、免設密碼。
 
-1. **從你自己的電腦** SSH 進 server,順手帶 port-forward:
+**一次性設定:**
+
+1. server 和你要瀏覽的裝置都裝 [Tailscale](https://tailscale.com/) 並登入**同一個 tailnet**。
+2. 在 server 把 loopback 的 web port 掛上 tailnet(常駐、跨重開機):
 
    ```bash
-   ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>
+   tailscale serve --bg --https=4096 4096
+   tailscale serve status     # 看到 https://<你的-server>.<tailnet>.ts.net:4096 → 127.0.0.1:4096 就對了
    ```
 
-2. **就在這條 SSH 連線裡**(你已經在 server 上了)啟動 backend。建議用背景啟動腳本,起完就回到提示字元、不占住終端:
+   把印出來的 `https://<你的-server>.<tailnet>.ts.net:4096/` 加到瀏覽器最愛。
+
+   > ⚠️ **一定用 `tailscale serve`(只限 tailnet 內)。絕不可用 `tailscale funnel`** —— funnel 會把 backend 暴露到**整個公網**,NDA 直接外洩。
+   > (server 的 443 沒被占用的話,也可用 `tailscale serve --bg 4096` 拿到沒 port 的短網址 `https://<你的-server>.<tailnet>.ts.net/`。)
+
+**每次使用:**
+
+3. 在 server 啟動 backend(背景,起完就回到提示字元):
 
    ```bash
    cd <PROJECT_TO_ANALYZE>
-   <CODETRAIL_REPO>/scripts/start-web.sh     # 背景啟動(tmux),並印出連線 / 停止方式
+   <CODETRAIL_REPO>/scripts/start-web.sh     # 背景啟動(tmux);停止用 stop-web.sh
    ```
 
-   停止:`<CODETRAIL_REPO>/scripts/stop-web.sh`。看 backend log:`tmux a -t codetrail-web`(`Ctrl-b d` 退出)。
-   (想前景跑、`Ctrl-C` 停也行:`aicode web`。)
+   `start-web.sh` 起來後若偵測到 tailscale serve,會直接把那個 ts.net 網址印給你。
 
-3. **回你自己電腦的瀏覽器**開 `http://127.0.0.1:4096` —— 就是 server 上的 session 清單,點一筆續問。
+4. 在你自己的裝置開那個 Tailscale 最愛網址 → 就是 server 上的 session 清單,點一筆續問。
 
-(如果你已經用沒帶 `-L` 的 SSH 開著 `aicode web` 了,不用重來:另開一條 `ssh -N -L 4096:127.0.0.1:4096 <你的帳號>@<server>` 補上 tunnel 即可。)
+**沒裝 / 不想裝 Tailscale 的 fallback** —— SSH port-forward(每次都要開、斷了要重來):用你平常 SSH 進 server 的指令後面加 `-L`,再開本機 `http://127.0.0.1:4096`:
+
+```bash
+ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>
+```
 
 #### (選用)用 TUI 接上同一個 backend
 
@@ -803,8 +817,8 @@ web 發問 TUI 看得到,TUI 發問 web 也看得到。CodeTrail MCP 只在 back
 
 #### 換 port / 要對外開放
 
-- **換 port**:`AICODE_WEB_PORT=4097 aicode web`。記得 attach 和 SSH tunnel 的 `4096` 也要一起改成 `4097`。
-- **一般情況用情況 B 的 SSH tunnel 就好,不要綁 `0.0.0.0`。** 只有你真的要讓別台機器不透過 SSH 直接連時才需要,而且 `aicode web` 會強制先設密碼,否則拒絕啟動:
+- **換 port**:`AICODE_WEB_PORT=4097 scripts/start-web.sh`(或 `aicode web`)。記得 attach、Tailscale serve、SSH tunnel 的 `4096` 也要一起改成 `4097`(serve 重設:`tailscale serve --bg --https=4097 4097`)。
+- **一般情況用情況 B 的 Tailscale(或 SSH tunnel)就好,不要綁 `0.0.0.0`。** 只有你真的要讓別台機器不透過 tailnet / SSH 直接連時才需要,而且 `aicode web` 會強制先設密碼,否則拒絕啟動:
 
   ```bash
   export OPENCODE_SERVER_PASSWORD=<強密碼>   # username 預設 opencode,可用 OPENCODE_SERVER_USERNAME 覆寫

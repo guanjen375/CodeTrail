@@ -135,12 +135,15 @@ if tmux has-session -t "$WEB_SESSION" 2>/dev/null; then
     exit 1
 fi
 
-# port 占用檢查(擋孤兒 process / 別的服務)。ss 不在 PATH 時 rag_port_listener 回非 0,跳過。
-if listener="$(rag_port_listener "$PORT")"; then
-    if [[ -n "$listener" ]]; then
-        echo "ERROR: port $PORT 已被占用:" >&2
-        echo "$listener" >&2
-        echo "       先停掉它,或設 AICODE_WEB_PORT 換 port(attach / ssh tunnel 也要一致)。" >&2
+# port 占用檢查:只算「會跟 backend 的 127.0.0.1 bind 衝突」的 listener。
+# tailscale serve 會在 tailscale IP:PORT listen(這正是建議設定),不衝突,別誤判成占用。
+# ss 不在 PATH 時 rag_port_listener 回非 0,跳過檢查。
+if raw_listener="$(rag_port_listener "$PORT")"; then
+    loopback_listener="$(printf '%s\n' "$raw_listener" | grep -E "(^|[[:space:]])(127\.[0-9.]+|0\.0\.0\.0|\*|\[::1?\]):${PORT}([[:space:]]|\$)" || true)"
+    if [[ -n "$loopback_listener" ]]; then
+        echo "ERROR: port $PORT(loopback)已被占用:" >&2
+        echo "$loopback_listener" >&2
+        echo "       先停掉它,或設 AICODE_WEB_PORT 換 port(attach / ssh tunnel / tailscale serve 也要一致)。" >&2
         exit 1
     fi
 fi
@@ -163,16 +166,26 @@ http_up() {
 deadline=$((SECONDS + WEB_HEALTH_TIMEOUT))
 while (( SECONDS < deadline )); do
     if http_up; then
-        cat <<EOF
-
-[+] web backend ready → $HEALTH_URL
-    本機有桌面:直接用瀏覽器開上面網址。
-    headless server:在你自己的電腦跑
-      ssh -L $PORT:127.0.0.1:$PORT <你的帳號>@<此 server>
-    再用本機瀏覽器開 http://127.0.0.1:$PORT
-    停止:$CODETRAIL_HOME/scripts/stop-web.sh
-    看 log:tmux a -t $WEB_SESSION   (Ctrl-b d 退出)
-EOF
+        # 偵測這個 port 是否已掛在 tailscale serve(tailnet),有的話直接給固定網址。
+        ts_url=""
+        if command -v tailscale >/dev/null 2>&1; then
+            ts_url="$(tailscale serve status 2>/dev/null | awk -v port="$PORT" '
+                /^https:\/\// { url=$1 }
+                $0 ~ ("127\\.0\\.0\\.1:" port "$") { print url; exit }
+            ')"
+        fi
+        echo ""
+        echo "[+] web backend ready → $HEALTH_URL"
+        if [ -n "$ts_url" ]; then
+            echo "    遠端(推薦):Tailscale → ${ts_url}/   ← 加到瀏覽器最愛,免 SSH tunnel"
+        else
+            echo "    本機有桌面:直接用瀏覽器開上面網址。"
+            echo "    headless server 遠端連法(擇一):"
+            echo "      a) Tailscale(推薦,固定網址):在 server 跑 \`tailscale serve --bg --https=$PORT $PORT\`,再開它印出的 ts.net 網址"
+            echo "         ⚠️ 用 serve(tailnet 內),絕不可 funnel(公網)。"
+            echo "      b) SSH tunnel:你的電腦跑 \`ssh -L $PORT:127.0.0.1:$PORT <你的帳號>@<此 server>\`,再開 http://127.0.0.1:$PORT"
+        fi
+        echo "    停止:$CODETRAIL_HOME/scripts/stop-web.sh    看 log:tmux a -t $WEB_SESSION (Ctrl-b d 退出)"
         exit 0
     fi
     if backend_session_gone; then

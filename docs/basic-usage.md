@@ -199,15 +199,7 @@ aicode web
 接著怎麼開首頁，看機器有沒有桌面:
 
 - **有桌面瀏覽器**:啟動時會自動開,或手動把印出來的 `http://127.0.0.1:4096` 貼進瀏覽器。
-- **沒有桌面的遠端 server(常見:GPU 主機)**:server 上開不了瀏覽器是正常的,backend 照跑。從**你自己的電腦**用 SSH port-forward 連進去,再用本機瀏覽器開:
-
-  ```bash
-  # 在你自己的電腦另開終端,開著別關
-  ssh -N -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>
-  # 然後本機瀏覽器開 http://127.0.0.1:4096
-  ```
-
-  完整步驟見 [README §5.4](../README.md#54-web-模式選用)。
+- **沒有桌面的遠端 server(常見:GPU 主機)**:server 上開不了瀏覽器是正常的,backend 照跑。**推薦用 Tailscale** 給 server 一個固定網址(加最愛點一下就進,不用每次開 SSH tunnel):一次性在 server 跑 `tailscale serve --bg --https=4096 4096`,之後在你的裝置開 `https://<你的-server>.<tailnet>.ts.net:4096/`。⚠️ 用 `serve`(tailnet 內),**絕不可 `funnel`**(公網)。沒裝 Tailscale 的話走 SSH:`ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server>` 後開本機 `http://127.0.0.1:4096`。完整步驟見 [README §5.4](../README.md#54-web-模式選用)。
 
 首頁就是 session 清單,點任一筆即可載入該 session 繼續對話。
 
@@ -227,4 +219,4 @@ attach 端與 web 端**共用同一份 session 與狀態**:web 發問後 TUI 看
 
 ### 安全注意(重要)
 
-未設 `OPENCODE_SERVER_PASSWORD` 時 OpenCode server 無認證。預設綁 loopback 最安全;跨機器最推薦走 SSH port-forward(見上面情況 B),維持 loopback 又不必設密碼;真要不透過 SSH 直接對外才考慮 Tailscale / VPN，別把 port 綁到實體網卡。`aicode web` 對非 loopback(如 `0.0.0.0`)或 `--mdns` 會強制要求先設密碼，否則拒絕啟動。詳見 [安全邊界與工作節奏](security.md)。
+未設 `OPENCODE_SERVER_PASSWORD` 時 OpenCode server 無認證。預設綁 loopback 最安全;跨機器最推薦用 **Tailscale `serve`**(維持 loopback、tailnet 內加密、免設密碼),或 SSH port-forward。**絕不可用 `tailscale funnel`** —— 那會把 backend 暴露到公網。真要綁非 loopback(`0.0.0.0`)或 `--mdns`，`aicode web` 會強制先設密碼,否則拒絕啟動。詳見 [安全邊界與工作節奏](security.md)。

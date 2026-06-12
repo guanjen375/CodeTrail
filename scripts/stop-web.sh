@@ -60,7 +60,8 @@ else
     listener=""
     deadline=$((SECONDS + 5))
     while (( SECONDS < deadline )); do
-        listener="$(rag_port_listener "$PORT" 2>/dev/null || true)"
+        # 只看 backend 的 loopback listener;tailscale serve 的 tailscale IP:PORT 不算占用。
+        listener="$(rag_port_listener "$PORT" 2>/dev/null | grep -E "(^|[[:space:]])(127\.[0-9.]+|0\.0\.0\.0|\*|\[::1?\]):${PORT}([[:space:]]|\$)" || true)"
         [[ -z "$listener" ]] && break
         sleep 1
     done
