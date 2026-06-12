@@ -35,6 +35,39 @@ CODETRAIL_HOME="$(resolve_aicode_home)" || {
   exit 2
 }
 
+# --- 子指令路由:web / attach -----------------------------------------------
+# 子指令必須是「第一個位置參數且精確等於 web / attach」才觸發新路徑。
+# 其他情況(無參數、-m、專案路徑等)完全維持現行 standalone TUI 行為。
+# 注意:想對名為 web/attach 的子目錄開 TUI,請用 `aicode ./web`(不會精確匹配)。
+SUBCMD=""
+case "${1:-}" in
+  attach)
+    # attach 是純 client:不需要 venv / 沙箱 root 檢查 / MCP launcher。
+    # 保持薄,只做「預設 URL + 參數原樣轉發 opencode attach」。
+    shift
+    if [ "$#" -ge 1 ] && [ "${1:0:1}" != "-" ]; then
+      ATTACH_URL="$1"
+      shift
+    else
+      ATTACH_URL="http://127.0.0.1:${AICODE_WEB_PORT:-4096}"
+    fi
+    if ! command -v opencode >/dev/null 2>&1; then
+      echo "[aicode] 'opencode' not found in PATH — install with: npm install -g opencode-ai" >&2
+      exit 127
+    fi
+    echo "[aicode] attach → $ATTACH_URL" >&2
+    exec opencode attach "$ATTACH_URL" "$@"
+    ;;
+  web)
+    # web backend 沿用 aicode 全部既有前置(沙箱 root 檢查、MCP launcher、
+    # ctx safety、AICODE_MODEL 解析、AI_CODE_* 透傳)。web 專屬處理(能力偵測、
+    # port/hostname、安全硬規則、exec opencode web)在腳本結尾、現有 -m 解析
+    # 之前分支。這裡只標記子指令並 shift 掉,讓後續前置看到的是 web 參數。
+    SUBCMD="web"
+    shift
+    ;;
+esac
+
 # Allow explicit override via env, else use cwd (canonicalised).
 if [ -n "${AICODE_ROOT:-}" ]; then
   ROOT="$AICODE_ROOT"
@@ -208,6 +241,115 @@ echo "[aicode] TIP: 設定有疑慮時可跑 \`AICODE_MODEL=${AICODE_MODEL} pyth
 #   - 若沒傳:不主動加 --model;讓 opencode 自己讀 opencode.json 的 "model" 欄位
 # AICODE_MODEL (bare name) 仍用於 CodeTrail MCP 本體, 跟 OpenCode TUI 顯示的
 # 可能形式不同但語意一致 (provider/ 後面那段)。
+
+if [ "${SUBCMD:-}" = "web" ]; then
+  # ---- aicode web: 帶 CodeTrail MCP 的 OpenCode web backend ----------------
+  # 能力偵測:確認這個 opencode 真的支援 web 子指令。
+  # 不能只看 exit code —— yargs 對 `--help` 短路,`opencode <任何字> --help`
+  # 一律 exit 0(舊版會把 web 當成專案 positional)。因此額外要求輸出含 web
+  # 指令自己的 synopsis 行(`opencode web`),代表 yargs 真的路由到 web。
+  web_help_ok=1
+  if ! web_help_out="$(opencode web --help 2>&1)"; then
+    web_help_ok=0
+  elif ! printf '%s\n' "$web_help_out" | grep -qE '^opencode web([[:space:]]|$)'; then
+    web_help_ok=0
+  fi
+  if [ "$web_help_ok" -ne 1 ]; then
+    echo "[aicode] 這個 opencode 不支援 'web' 子指令(版本太舊)。" >&2
+    echo "[aicode] 升級後再試:npm install -g opencode-ai@latest" >&2
+    echo "[aicode] web backend 需要 opencode 內建的 headless server + 網頁介面。" >&2
+    exit 2
+  fi
+
+  # port:讀 AICODE_WEB_PORT,否則固定 4096(刻意固定,方便 attach;不沿用上游
+  # 隨機 port)。hostname:預設 127.0.0.1。使用者可在轉發 args 覆寫 --port /
+  # --hostname;這裡解析出來以套預設、做安全檢查,其餘 args 原樣轉發。
+  WEB_PORT="${AICODE_WEB_PORT:-4096}"
+  WEB_HOSTNAME="127.0.0.1"
+  WEB_MDNS=0
+  WEB_PASSTHROUGH=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --port)
+        if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
+          echo "[aicode] --port 需要一個值。" >&2
+          exit 2
+        fi
+        WEB_PORT="$2"
+        shift 2
+        ;;
+      --port=*)
+        WEB_PORT="${1#--port=}"
+        if [ -z "$WEB_PORT" ]; then
+          echo "[aicode] --port 需要一個值。" >&2
+          exit 2
+        fi
+        shift
+        ;;
+      --hostname)
+        if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
+          echo "[aicode] --hostname 需要一個值。" >&2
+          exit 2
+        fi
+        WEB_HOSTNAME="$2"
+        shift 2
+        ;;
+      --hostname=*)
+        WEB_HOSTNAME="${1#--hostname=}"
+        if [ -z "$WEB_HOSTNAME" ]; then
+          echo "[aicode] --hostname 需要一個值。" >&2
+          exit 2
+        fi
+        shift
+        ;;
+      --mdns)
+        # mDNS 會把 hostname 預設翻成 0.0.0.0 並對區網廣播服務;視為非 loopback 暴露。
+        WEB_MDNS=1
+        WEB_PASSTHROUGH+=("$1")
+        shift
+        ;;
+      *)
+        WEB_PASSTHROUGH+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  # 安全硬規則(比上游嚴):hostname 非 loopback,或開了 --mdns 廣播時,
+  # 必須已設 OPENCODE_SERVER_PASSWORD —— 未設密碼時 OpenCode server 完全無認證。
+  WEB_LOCAL=0
+  case "$WEB_HOSTNAME" in
+    127.0.0.1|localhost|::1)
+      WEB_LOCAL=1
+      ;;
+  esac
+  if [ "$WEB_LOCAL" -ne 1 ] || [ "$WEB_MDNS" -eq 1 ]; then
+    if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
+      WEB_WHY="hostname=$WEB_HOSTNAME"
+      if [ "$WEB_MDNS" -eq 1 ]; then
+        WEB_WHY="$WEB_WHY 且開啟 --mdns 廣播"
+      fi
+      echo "[aicode] 拒絕啟動:$WEB_WHY 會把 web backend 暴露到 loopback 以外," >&2
+      echo "[aicode] 但未設定 OPENCODE_SERVER_PASSWORD —— 未設密碼時 OpenCode server 完全無認證。" >&2
+      echo "[aicode] 擇一處理:" >&2
+      echo "[aicode]   1) 只在本機用:aicode web(預設 127.0.0.1、不要 --mdns)" >&2
+      echo "[aicode]   2) 要對可信內網/VPN 暴露:先 export OPENCODE_SERVER_PASSWORD=<強密碼> 再啟動" >&2
+      echo "[aicode] 切勿把 0.0.0.0 綁到可信內網以外的網卡。" >&2
+      exit 2
+    fi
+  fi
+
+  echo "[aicode] web backend → http://$WEB_HOSTNAME:$WEB_PORT"
+  if [ "$WEB_LOCAL" -eq 1 ] && [ "$WEB_MDNS" -ne 1 ]; then
+    echo "[aicode] 綁 loopback;另開終端用 \`aicode attach\`(預設 http://127.0.0.1:$WEB_PORT)接 TUI。"
+  else
+    echo "[aicode] 已設 OPENCODE_SERVER_PASSWORD;非 loopback 暴露請確認只在可信內網/VPN。"
+  fi
+  echo "[aicode] 瀏覽器會自動開首頁(session 清單),點任一 session 即可續問;Ctrl-C 停止 backend。"
+
+  exec opencode web --port "$WEB_PORT" --hostname "$WEB_HOSTNAME" "${WEB_PASSTHROUGH[@]}"
+fi
+
 OPENCODE_ARGS=()
 USER_PASSED_MODEL=0
 USER_MODEL_VALUE=""

@@ -180,3 +180,40 @@ aicode
 ```
 
 `apply_patch(...)` 會真的寫檔，`run_command(...)` 會執行白名單命令。只想分析時要明講「不要改檔」。安全邊界與副作用工具說明見 [安全邊界與工作節奏](security.md)。
+
+---
+
+## 6. Web 模式(瀏覽 / 續問歷史 session)
+
+§0 的 `aicode` 是 standalone TUI。如果你想用瀏覽器瀏覽歷史 session、點任一筆續問，或讓 web 與 TUI 同時看同一份對話，改用 web 模式。web backend 會 spawn CodeTrail MCP，所以**啟動的 shell 要先 activate venv**(同 [安裝、設定與啟動](setup.md));attach 端是純 client，不受此限。
+
+### 啟動 web backend
+
+```bash
+cd <PROJECT_TO_ANALYZE>
+aicode web
+```
+
+預設綁 `127.0.0.1:4096`(port 可用 `AICODE_WEB_PORT` 覆寫),瀏覽器自動開首頁。首頁就是 session 清單，點任一筆即可載入該 session 繼續對話。沙箱 root 檢查、模型解析、ctx safety 與 `AI_CODE_*` 透傳全部跟 standalone TUI 一致 —— 例如要讀專案外附件一樣加 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1`:
+
+```bash
+AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode web
+```
+
+驗證 MCP 連通:在 web 介面挑一個 session 問「請用工具 list_dir 看當前目錄結構」，模型應該透過 CodeTrail 呼叫 `list_dir(...)` 回真實結果(OpenCode log 裡可能顯示成 `codetrail_list_dir`)。
+
+### Attach TUI 到同一個 backend
+
+另開一個終端:
+
+```bash
+aicode attach                              # 預設接 http://127.0.0.1:4096
+aicode attach http://127.0.0.1:4096 -c     # 指定 url，並用 -c 續接上一個 session
+aicode attach -s <SESSION_ID>              # 接上指定 session
+```
+
+attach 端與 web 端**共用同一份 session 與狀態**:web 發問後 TUI 看得到新訊息，TUI 切 session 也會反映在 web。CodeTrail MCP 只在 backend 冷啟一次，attach 端不會再起第二個。TUI 內 `/status` 應看到 `codetrail Connected`。
+
+### 安全注意(重要)
+
+未設 `OPENCODE_SERVER_PASSWORD` 時 OpenCode server 無認證。預設綁 loopback 最安全;要跨機器用請走 Tailscale / VPN，不要把 port 直接綁到實體網卡。`aicode web` 對非 loopback(如 `0.0.0.0`)或 `--mdns` 會強制要求先設密碼，否則拒絕啟動。詳見 [安全邊界與工作節奏](security.md)。

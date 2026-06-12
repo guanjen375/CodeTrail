@@ -70,6 +70,21 @@ AI_CODE_PATCH=0 AI_CODE_RUN_TESTS=0 aicode
 
 兩個分開設，可以做出「只看 / 只跑測試不改檔 / 改檔但不跑命令」等不同信任邊界。
 
+### 網路邊界
+
+CodeTrail 的網路對外點都只能暴露於可信內網 / VPN，不要綁到對公網開放的網卡：
+
+- **遠端 llama-server**：main / embedding / reranker / VL server 會收到 prompt、程式碼片段、spec 摘要與工具輸出。llama-server 預設不檢查 API key，所以 `AICODE_LLAMA_*_BASE_URL` 只能指向可信主機。
+- **`aicode web` backend**：`aicode web` 啟動的 OpenCode headless server 與 llama-server **同級** —— 未設 `OPENCODE_SERVER_PASSWORD` 時完全無認證，任何能連到該 port 的人都能用你的模型、讀你的專案。
+
+`aicode web` 的硬規則比上游嚴：
+
+- 預設綁 `127.0.0.1`、固定 port `4096`（`AICODE_WEB_PORT` 可覆寫）。
+- hostname 非 loopback（`127.0.0.1` / `localhost` / `::1` 以外，例如 `0.0.0.0`)或帶 `--mdns` 時，**必須先設 `OPENCODE_SERVER_PASSWORD`**，否則 `aicode web` 拒絕啟動。
+- 即使設了密碼，`0.0.0.0` 也只應綁在可信內網 / VPN 介面。跨機器使用走 Tailscale / VPN / SSH tunnel，不要直接對外開 port。
+
+`aicode attach` 是純 client，本身不開 port、不 spawn MCP，沙箱邊界由它連上的 backend 決定。
+
 ### 不要 commit 的資料
 
 這些通常含有 NDA 內容或本地快取，應留在 `.gitignore`：

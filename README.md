@@ -762,6 +762,48 @@ aicode
 
 更多操作模式(夾帶附件、注入 RAG、查 spec)見 [docs/basic-usage.md](docs/basic-usage.md);完整 17 個工具清單見 [docs/mcp-tools.md](docs/mcp-tools.md)。
 
+### 5.4 Web 模式(選用)
+
+除了 §5.2 的 standalone TUI,`aicode` 還能啟動 OpenCode 內建的 **web backend**(headless server + 網頁介面):用瀏覽器瀏覽歷史 session、點任一筆直接續問;同一個 backend 也能用 TUI attach 上去,web 與 TUI **共用同一份 session 與狀態**,CodeTrail MCP 只在 backend 冷啟一次。
+
+啟動(跟 §5.2 一樣切到要分析的專案目錄,不要從 `$HOME` 或 `/` 起):
+
+```bash
+cd <PROJECT_TO_ANALYZE>
+aicode web
+```
+
+- 預設綁 `127.0.0.1`、固定 port `4096`(可用 `AICODE_WEB_PORT` 覆寫;刻意固定方便 attach,不沿用上游隨機 port)。
+- 啟動後瀏覽器自動開首頁,首頁即 session 清單,點任一筆續問。
+- 沿用 §5.2 全部前置:沙箱 root 檢查、CodeTrail MCP、ctx safety、`AICODE_MODEL` 解析、`AI_CODE_*` 透傳。
+- backend process 會 spawn CodeTrail MCP,所以**啟動 `aicode web` 的 shell 必須已 activate venv**(同 §1.3),否則 MCP 會 `ModuleNotFoundError`。
+
+另開一個終端,把 TUI 接上同一個 backend:
+
+```bash
+aicode attach                              # 預設接 http://127.0.0.1:4096
+aicode attach http://127.0.0.1:4096 -c     # 也可指定 url / 用 -c 續接上一個 session
+```
+
+`aicode attach` 是純 client:不 spawn 第二個 MCP、不做沙箱檢查、不需要 venv。web 端發問後,TUI 端看得到同一個 session 的新訊息,反之亦然。
+
+#### 安全注意
+
+web backend 跟遠端 llama-server 同級:**未設密碼時 OpenCode server 完全無認證**,任何能連到該 port 的人都能用你的模型、讀你的專案。因此:
+
+- **預設只綁 loopback**(`127.0.0.1`),只有本機能連,最安全。
+- 要在多台機器間用,**走 Tailscale / VPN / SSH tunnel**,不要把 port 直接暴露到實體網卡。
+- `aicode web` 比上游嚴:hostname 非 loopback(例如 `0.0.0.0`)或開 `--mdns` 時,**必須先設 `OPENCODE_SERVER_PASSWORD`**,否則拒絕啟動:
+
+  ```bash
+  export OPENCODE_SERVER_PASSWORD=<強密碼>    # username 預設 opencode,可用 OPENCODE_SERVER_USERNAME 覆寫
+  aicode web --hostname 0.0.0.0
+  ```
+
+- 即使設了密碼,`0.0.0.0` 也只應綁在可信內網 / VPN 介面,**不要綁到對公網開放的網卡**。
+
+web 子指令不存在(版本太舊)、attach 連不上、port 被占用的排查見 [docs/troubleshooting.md](docs/troubleshooting.md);日常操作見 [docs/basic-usage.md](docs/basic-usage.md)。
+
 ---
 
 ## 必守安全界線
@@ -772,6 +814,7 @@ aicode
 - `apply_patch(...)` 有 context matching、max files、max lines 限制;不要放寬安全層。要完全關閉改檔,啟動時設 `AI_CODE_PATCH=0`。
 - `run_command(...)` 只允許白名單命令,不支援 shell metacharacter。預設白名單只含測試 / lint;`make` / `cmake` / `ninja` / `meson` / `bazel build` 等 build 命令需要顯式 `AI_CODE_ENABLE_BUILD_COMMANDS=1` 才會掛上。要完全關閉命令執行,設 `AI_CODE_RUN_TESTS=0`。
 - 遠端 llama-server 會收到 prompt、程式碼片段、spec 摘要與工具輸出,**只能指向可信內網 / VPN 主機**(llama-server 預設不檢查 API key)。
+- `aicode web` backend 與 llama-server 同級:未設 `OPENCODE_SERVER_PASSWORD` 時 server 無認證,**只能暴露於可信內網 / VPN**。預設綁 `127.0.0.1`;非 loopback 或 `--mdns` 未設密碼時 `aicode web` 會拒絕啟動。
 
 完整安全說明見 [docs/security.md](docs/security.md)。
 
