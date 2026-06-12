@@ -547,6 +547,8 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
   "share": "disabled",
   "autoupdate": false,
 
+  "enabled_providers": ["llamacpp"],
+
   "model": "llamacpp/<CODE_MODEL>",
   "small_model": "llamacpp/<CODE_MODEL>",
 
@@ -612,6 +614,7 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
 說明:
 
 - `llamacpp` 是 provider key,可改名(`local`、`llmcpp`、隨意),但要跟 `"model"` 那段的 prefix 對齊。
+- `enabled_providers` 鎖定只啟用本機 provider:設了之後 OpenCode 的 model picker(TUI 與 web)**只會出現你的本機模型**,雲端 provider(OpenCode Zen、Anthropic、OpenAI 等)完全不列出、無法誤選 —— **NDA 場景強烈建議保留**,避免把程式碼送到雲端模型。陣列內字串要跟你的 provider key 一致(這裡是 `llamacpp`)。
 - `apiKey` 任意非空值即可,llama-server 預設不檢查。
 - `limit.context: 32768` 是 OpenCode 主對話實際塞給 server 的上限。可以等於 server `-c`(64K),但留一半做 output / 不擠爆比較穩。
 - `permission` 區段:`*: deny` 是預設拒絕一切,只白名單 `codetrail_*`(經 CodeTrail 沙箱)。OpenCode 內建工具(`bash` / `read` / `write` 等)會繞過 CodeTrail 沙箱,所以這裡明確 `deny`。
@@ -765,32 +768,27 @@ aicode web
 
 #### 情況 B:這台是沒有桌面的遠端 server(常見:GPU 主機)
 
-server 上沒有瀏覽器,所以從**你自己的筆電 / 桌機**用 SSH port-forward 連進去。全程維持 loopback + 走 SSH 加密通道,最安全:不必設密碼、不開任何對外 port。
+server 上沒瀏覽器,把它的 4096 透過 SSH 轉到你自己電腦,用本機瀏覽器開。**訣竅:用你平常 SSH 進 server 的那條指令,後面加 `-L 4096:127.0.0.1:4096` 就好,不用另外開第二條 tunnel。** 全程維持 loopback、不必設密碼、不開對外 port。
 
-1. **在 server 上**(你 SSH 進去的那個 shell)啟動 backend:
+1. **從你自己的電腦** SSH 進 server,順手帶 port-forward:
+
+   ```bash
+   ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>
+   ```
+
+2. **就在這條 SSH 連線裡**(你已經在 server 上了)啟動 backend。建議用背景啟動腳本,起完就回到提示字元、不占住終端:
 
    ```bash
    cd <PROJECT_TO_ANALYZE>
-   aicode web
+   <CODETRAIL_REPO>/scripts/start-web.sh     # 背景啟動(tmux),並印出連線 / 停止方式
    ```
 
-   它會印 `http://127.0.0.1:4096`。server 上開不了瀏覽器是正常的,backend 會一直跑;這個 shell 開著別關。
+   停止:`<CODETRAIL_REPO>/scripts/stop-web.sh`。看 backend log:`tmux a -t codetrail-web`(`Ctrl-b d` 退出)。
+   (想前景跑、`Ctrl-C` 停也行:`aicode web`。)
 
-2. **在你自己的電腦**另開一個終端,把 server 的 4096 轉到本地 4096:
+3. **回你自己電腦的瀏覽器**開 `http://127.0.0.1:4096` —— 就是 server 上的 session 清單,點一筆續問。
 
-   ```bash
-   ssh -N -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>
-   ```
-
-   `-N` 表示只做轉發、不開遠端 shell。這個視窗也開著別關。
-
-3. **在你自己電腦的瀏覽器**開:
-
-   ```
-   http://127.0.0.1:4096
-   ```
-
-   看到的就是 server 上那個 backend 的 session 清單,點一筆即可續問。
+(如果你已經用沒帶 `-L` 的 SSH 開著 `aicode web` 了,不用重來:另開一條 `ssh -N -L 4096:127.0.0.1:4096 <你的帳號>@<server>` 補上 tunnel 即可。)
 
 #### (選用)用 TUI 接上同一個 backend
 
