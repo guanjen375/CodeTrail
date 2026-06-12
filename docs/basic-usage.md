@@ -1,6 +1,6 @@
 # 基本操作
 
-這份文件整理 CodeTrail 的基本操作：環境驗收、正常對話、夾帶附件、注入 RAG。完整安裝步驟仍放在 [安裝、設定與啟動](setup.md)；工具細節放在 [MCP 工具清單](mcp-tools.md)。
+這份文件整理 CodeTrail 的基本操作：環境驗收、正常對話、夾帶附件、注入 RAG。完整 OpenCode TUI 安裝主線放在 [README](../README.md)；進階/替代安裝補充放在 [setup.md](setup.md)；工具細節放在 [MCP 工具清單](mcp-tools.md)。
 
 [回到 README](../README.md)。
 
@@ -8,7 +8,7 @@
 
 ## 0. 環境驗收
 
-照 [安裝、設定與啟動](setup.md) 完成後，先在 CodeTrail repo 裡跑：
+照 [README](../README.md) 的 OpenCode TUI 流程完成後，先在 CodeTrail repo 裡跑：
 
 ```bash
 AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py

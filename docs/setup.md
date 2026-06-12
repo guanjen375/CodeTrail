@@ -27,8 +27,9 @@
 cd <CODETRAIL_REPO>
 python -m venv .venv
 source .venv/bin/activate
+pip install -U pip
 pip install -r requirements.txt
-pip install mcp pymupdf4llm
+pip install pymupdf4llm    # 選用:RAG 從 PDF 建知識庫才用
 ```
 
 注意 `aicode` 啟動時會以 `python3` 跑 `scripts/doctor.py` 等,需要對應 venv 已啟用。建議在 `.venv/bin/activate` 內或 `~/.bashrc` 裡加上 `source <CODETRAIL_REPO>/.venv/bin/activate`,避免不同 shell 撞不到 venv。
@@ -174,9 +175,14 @@ systemctl --user restart codetrail-main
 
 ### 全部停掉
 
-tmux:`tmux kill-session -t codetrail`
+tmux:
 
-systemd:`systemctl --user stop codetrail-{main,embed,rerank}`
+```bash
+tmux kill-session -t codetrail-main
+./scripts/stop-rag-servers.sh
+```
+
+systemd:`systemctl --user stop codetrail-{main,embed,rerank,vl}`
 
 通用:
 
