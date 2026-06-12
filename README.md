@@ -749,6 +749,8 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 
 standalone TUI 之外,`aicode` 還能開一個 **web backend**:用瀏覽器看歷史 session、點一筆直接續問;TUI 也能接上同一個 backend,兩邊共用同一份對話。**web backend 預設只綁 `127.0.0.1`(本機 loopback)、固定 port `4096`。**
 
+> ⚠️ **CodeTrail web 是「單專案」**:沙箱鎖在你**啟動 backend 的那個專案目錄**。OpenCode web UI 那個「切換資料夾 / 開其他專案」的按鈕**對 CodeTrail 無效** —— 切過去後 CodeTrail 工具還是只讀啟動目錄(不會洩漏到別處,但會讓你誤以為切了)。**請無視那個切換器**;要分析別的專案,就在那個目錄另起一個 backend(換 port,例:`AICODE_WEB_PORT=4097 <CODETRAIL_REPO>/scripts/start-web.sh`)。
+
 兩種情況都一樣的先決條件:這個 shell 先 `source <CODETRAIL_REPO>/.venv/bin/activate`(同 §1.3),且 §3 的 llama-server 都起好了。然後看你的機器有沒有桌面瀏覽器,挑下面一種。
 
 #### 情況 A:這台機器自己有桌面瀏覽器

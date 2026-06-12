@@ -185,6 +185,7 @@ while (( SECONDS < deadline )); do
             echo "         ⚠️ 用 serve(tailnet 內),絕不可 funnel(公網)。"
             echo "      b) SSH tunnel:你的電腦跑 \`ssh -L $PORT:127.0.0.1:$PORT <你的帳號>@<此 server>\`,再開 http://127.0.0.1:$PORT"
         fi
+        echo "    ⚠️ 沙箱鎖在這個專案;web UI『切換資料夾』對 CodeTrail 無效,請無視(換專案=另起 backend)。"
         echo "    停止:$CODETRAIL_HOME/scripts/stop-web.sh    看 log:tmux a -t $WEB_SESSION (Ctrl-b d 退出)"
         exit 0
     fi

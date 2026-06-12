@@ -348,6 +348,7 @@ if [ "${SUBCMD:-}" = "web" ]; then
     echo "[aicode] 已設 OPENCODE_SERVER_PASSWORD;非 loopback 暴露請確認只在可信內網/VPN。"
   fi
   echo "[aicode] 首頁即 session 清單,點任一 session 續問;Ctrl-C 停止 backend。"
+  echo "[aicode] ⚠️ 沙箱鎖在這個專案;web UI『切換資料夾』對 CodeTrail 無效,請無視(換專案=另起 backend)。"
 
   exec opencode web --port "$WEB_PORT" --hostname "$WEB_HOSTNAME" "${WEB_PASSTHROUGH[@]}"
 fi
