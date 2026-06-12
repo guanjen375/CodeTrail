@@ -713,35 +713,15 @@ cd <PROJECT_TO_ANALYZE>
 aicodex --codetrail-model <LOCAL_MODEL>
 ```
 
-也可以同時指定 Codex frontend model:
+`<LOCAL_MODEL>` 用 §4.1 registry 裡的 `<CODE_MODEL>` bare name 或 GGUF 路徑。已經 `export AICODE_MODEL=<CODE_MODEL>`(或寫進 `~/.bashrc`)的話,`aicode` 直接打就好、`aicodex` 也不必再帶 `--codetrail-model`;Codex 自己的 frontend model 用 `-m`(跟 CodeTrail 本地模型分開,細節見 §4.3)。
 
-```bash
-cd <PROJECT_TO_ANALYZE>
-aicodex --codetrail-model <LOCAL_MODEL> -m gpt-5.5
-```
-
-`<LOCAL_MODEL>` 是 CodeTrail MCP internal local model,通常就是前面 registry 裡的 `<CODE_MODEL>` 或 GGUF 路徑。`--codetrail-model` 控制 `mcp_server.py` / CodeTrail server-side tools 使用的本地模型;`-m` / `--model` 控制 Codex frontend model。兩者刻意分開,不能混用。`aicodex -m gpt-5.5` 只是在選 Codex frontend model,不會設定 CodeTrail local model;要設定 CodeTrail MCP internal model,請用 `aicodex --codetrail-model <LOCAL_MODEL>` 或 `AICODE_MODEL=<LOCAL_MODEL> aicodex`。
-
-(`AICODE_MODEL` 已經寫進 `~/.bashrc` 或上一行的話就不用再 `AICODE_MODEL=... aicode` / `aicodex --codetrail-model ...`)
-
-如果要讓模型讀專案外的附件(`~/Downloads` 的 log、截圖、spec、firmware blob),兩個 frontend 都吃同一組 env;下面用 `aicode` 示範,改成 `aicodex --codetrail-model <LOCAL_MODEL>` 也一樣:
+要讓模型讀專案外的附件(`~/Downloads` 的 log / 截圖 / spec)就多加一個開關:
 
 ```bash
 AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 ```
 
-預設允許 `~/Downloads` 和 `/tmp`。其他目錄要加白名單:
-
-```bash
-AI_CODE_ALLOW_EXTERNAL_IMPORT=1 \
-AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/specs" \
-aicode
-```
-
-| 變數 | 用途 |
-|---|---|
-| `AI_CODE_ALLOW_EXTERNAL_IMPORT=1` | 外部附件匯入總開關 |
-| `AI_CODE_IMPORT_ROOTS="..."` | 外部附件來源白名單(設了就取代預設) |
+來源白名單(`AI_CODE_IMPORT_ROOTS`)等細節見 [docs/basic-usage.md](docs/basic-usage.md)。第一次先照上面最短的指令跑起來就好。
 
 ### 5.3 Smoke test
 
@@ -764,45 +744,78 @@ aicode
 
 ### 5.4 Web 模式(選用)
 
-除了 §5.2 的 standalone TUI,`aicode` 還能啟動 OpenCode 內建的 **web backend**(headless server + 網頁介面):用瀏覽器瀏覽歷史 session、點任一筆直接續問;同一個 backend 也能用 TUI attach 上去,web 與 TUI **共用同一份 session 與狀態**,CodeTrail MCP 只在 backend 冷啟一次。
+standalone TUI 之外,`aicode` 還能開一個 **web backend**:用瀏覽器看歷史 session、點一筆直接續問;TUI 也能接上同一個 backend,兩邊共用同一份對話。**web backend 預設只綁 `127.0.0.1`(本機 loopback)、固定 port `4096`。**
 
-啟動(跟 §5.2 一樣切到要分析的專案目錄,不要從 `$HOME` 或 `/` 起):
+兩種情況都一樣的先決條件:這個 shell 先 `source <CODETRAIL_REPO>/.venv/bin/activate`(同 §1.3),且 §3 的 llama-server 都起好了。然後看你的機器有沒有桌面瀏覽器,挑下面一種。
+
+#### 情況 A:這台機器自己有桌面瀏覽器
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
 aicode web
 ```
 
-- 預設綁 `127.0.0.1`、固定 port `4096`(可用 `AICODE_WEB_PORT` 覆寫;刻意固定方便 attach,不沿用上游隨機 port)。
-- 啟動後瀏覽器自動開首頁,首頁即 session 清單,點任一筆續問。
-- 沿用 §5.2 全部前置:沙箱 root 檢查、CodeTrail MCP、ctx safety、`AICODE_MODEL` 解析、`AI_CODE_*` 透傳。
-- backend process 會 spawn CodeTrail MCP,所以**啟動 `aicode web` 的 shell 必須已 activate venv**(同 §1.3),否則 MCP 會 `ModuleNotFoundError`。
+啟動後會印出網址並自動開瀏覽器:
 
-另開一個終端,把 TUI 接上同一個 backend:
-
-```bash
-aicode attach                              # 預設接 http://127.0.0.1:4096
-aicode attach http://127.0.0.1:4096 -c     # 也可指定 url / 用 -c 續接上一個 session
+```
+[aicode] web backend → http://127.0.0.1:4096
 ```
 
-`aicode attach` 是純 client:不 spawn 第二個 MCP、不做沙箱檢查、不需要 venv。web 端發問後,TUI 端看得到同一個 session 的新訊息,反之亦然。
+瀏覽器首頁就是 session 清單,點任一筆續問。沒自動開就手動把那行網址貼到瀏覽器。
 
-#### 安全注意
+#### 情況 B:這台是沒有桌面的遠端 server(常見:GPU 主機)
 
-web backend 跟遠端 llama-server 同級:**未設密碼時 OpenCode server 完全無認證**,任何能連到該 port 的人都能用你的模型、讀你的專案。因此:
+server 上沒有瀏覽器,所以從**你自己的筆電 / 桌機**用 SSH port-forward 連進去。全程維持 loopback + 走 SSH 加密通道,最安全:不必設密碼、不開任何對外 port。
 
-- **預設只綁 loopback**(`127.0.0.1`),只有本機能連,最安全。
-- 要在多台機器間用,**走 Tailscale / VPN / SSH tunnel**,不要把 port 直接暴露到實體網卡。
-- `aicode web` 比上游嚴:hostname 非 loopback(例如 `0.0.0.0`)或開 `--mdns` 時,**必須先設 `OPENCODE_SERVER_PASSWORD`**,否則拒絕啟動:
+1. **在 server 上**(你 SSH 進去的那個 shell)啟動 backend:
+
+   ```bash
+   cd <PROJECT_TO_ANALYZE>
+   aicode web
+   ```
+
+   它會印 `http://127.0.0.1:4096`。server 上開不了瀏覽器是正常的,backend 會一直跑;這個 shell 開著別關。
+
+2. **在你自己的電腦**另開一個終端,把 server 的 4096 轉到本地 4096:
+
+   ```bash
+   ssh -N -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>
+   ```
+
+   `-N` 表示只做轉發、不開遠端 shell。這個視窗也開著別關。
+
+3. **在你自己電腦的瀏覽器**開:
+
+   ```
+   http://127.0.0.1:4096
+   ```
+
+   看到的就是 server 上那個 backend 的 session 清單,點一筆即可續問。
+
+#### (選用)用 TUI 接上同一個 backend
+
+backend 沒關掉的狀態下,**在 server 上**另開一個終端:
+
+```bash
+aicode attach        # 預設接 http://127.0.0.1:4096
+aicode attach -c     # 接上去並續接上一個 session
+```
+
+web 發問 TUI 看得到,TUI 發問 web 也看得到。CodeTrail MCP 只在 backend 起一次,attach 端不會再起第二個;TUI 內 `/status` 應看到 `codetrail Connected`。
+
+#### 換 port / 要對外開放
+
+- **換 port**:`AICODE_WEB_PORT=4097 aicode web`。記得 attach 和 SSH tunnel 的 `4096` 也要一起改成 `4097`。
+- **一般情況用情況 B 的 SSH tunnel 就好,不要綁 `0.0.0.0`。** 只有你真的要讓別台機器不透過 SSH 直接連時才需要,而且 `aicode web` 會強制先設密碼,否則拒絕啟動:
 
   ```bash
-  export OPENCODE_SERVER_PASSWORD=<強密碼>    # username 預設 opencode,可用 OPENCODE_SERVER_USERNAME 覆寫
+  export OPENCODE_SERVER_PASSWORD=<強密碼>   # username 預設 opencode,可用 OPENCODE_SERVER_USERNAME 覆寫
   aicode web --hostname 0.0.0.0
   ```
 
-- 即使設了密碼,`0.0.0.0` 也只應綁在可信內網 / VPN 介面,**不要綁到對公網開放的網卡**。
+  即使設了密碼,`0.0.0.0` 也只能綁在可信內網 / VPN 介面,不要對公網開放。
 
-web 子指令不存在(版本太舊)、attach 連不上、port 被占用的排查見 [docs/troubleshooting.md](docs/troubleshooting.md);日常操作見 [docs/basic-usage.md](docs/basic-usage.md)。
+排查(版本太舊 / attach 連不上 / port 被占用)見 [docs/troubleshooting.md](docs/troubleshooting.md)。
 
 ---
 

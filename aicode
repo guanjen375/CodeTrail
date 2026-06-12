@@ -341,11 +341,13 @@ if [ "${SUBCMD:-}" = "web" ]; then
 
   echo "[aicode] web backend → http://$WEB_HOSTNAME:$WEB_PORT"
   if [ "$WEB_LOCAL" -eq 1 ] && [ "$WEB_MDNS" -ne 1 ]; then
-    echo "[aicode] 綁 loopback;另開終端用 \`aicode attach\`(預設 http://127.0.0.1:$WEB_PORT)接 TUI。"
+    echo "[aicode] 綁 loopback。有桌面的話瀏覽器會自動開;若這台是沒有桌面的 server,從你自己的電腦:"
+    echo "[aicode]   ssh -N -L $WEB_PORT:127.0.0.1:$WEB_PORT <你的帳號>@<此 server>"
+    echo "[aicode]   再用本機瀏覽器開 http://127.0.0.1:$WEB_PORT。另開終端 \`aicode attach\` 可接 TUI。"
   else
     echo "[aicode] 已設 OPENCODE_SERVER_PASSWORD;非 loopback 暴露請確認只在可信內網/VPN。"
   fi
-  echo "[aicode] 瀏覽器會自動開首頁(session 清單),點任一 session 即可續問;Ctrl-C 停止 backend。"
+  echo "[aicode] 首頁即 session 清單,點任一 session 續問;Ctrl-C 停止 backend。"
 
   exec opencode web --port "$WEB_PORT" --hostname "$WEB_HOSTNAME" "${WEB_PASSTHROUGH[@]}"
 fi
