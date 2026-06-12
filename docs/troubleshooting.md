@@ -87,6 +87,56 @@ command -v opencode
 
 再確認 `opencode.json` 裡的 MCP command 能找到目前 git root 內的 `.opencode/run-codetrail-mcp`,且 `/status` 裡的名字會跟 `mcp` key 一致;如果 key 是 `codetrail`,應該看到 `codetrail Connected`。
 
+### `aicode web`: 「這個 opencode 不支援 'web' 子指令(版本太舊)」
+
+`aicode web` 啟動前會偵測 opencode 是否真的支援 web 子指令。看到這個訊息代表你的 opencode 太舊、還沒內建 web backend。升級:
+
+```bash
+npm install -g opencode-ai@latest
+opencode web --help    # 應印出 opencode web 的說明(含 --port / --hostname)
+```
+
+偵測刻意不只看 exit code —— `opencode <任何字> --help` 在 yargs 下一律 exit 0,舊版會把 `web` 當成專案 positional,所以 `aicode web` 會額外檢查 `opencode web --help` 輸出裡有沒有 web 指令本身的 synopsis。升級後再跑一次 `aicode web` 即可。
+
+### `aicode attach`: 連不上 backend
+
+`aicode attach` 是純 client,連不上通常代表 backend 沒在跑、或 url / port 不對。逐項確認:
+
+```bash
+# 1) backend 有在跑嗎?(另一個終端應該有 aicode web 沒被關掉)
+curl -sS http://127.0.0.1:4096/ -o /dev/null -w '%{http_code}\n'   # 有回 HTTP 碼(200/401 等)代表 backend 活著
+
+# 2) port 對嗎?attach 預設接 4096;web 端若用 AICODE_WEB_PORT 換過 port,attach 也要對齊
+aicode attach http://127.0.0.1:<PORT>
+```
+
+如果 web backend 啟動時設了 `OPENCODE_SERVER_PASSWORD`,attach 端要帶同一組認證:
+
+```bash
+aicode attach http://127.0.0.1:4096 -p <密碼>     # username 預設 opencode,可用 -u 覆寫
+```
+
+curl 回 401 代表 backend 活著但需要密碼;完全沒回應才是 backend 沒起來、或 port / host 寫錯。
+
+### `aicode web`: port 被占用
+
+`aicode web` 刻意固定 port(預設 4096),被占用時不會自動換 port,讓 opencode 直接報錯。先看誰占用:
+
+```bash
+ss -ltnp 'sport = :4096' 2>/dev/null || lsof -i :4096
+```
+
+兩種處理:
+
+```bash
+# A) 占用的是上一個沒關掉的 aicode web —— 直接 attach 上去就好,不必另開
+aicode attach http://127.0.0.1:4096
+
+# B) 真的要換 port(web 與 attach 都要對齊同一個)
+AICODE_WEB_PORT=4097 aicode web
+AICODE_WEB_PORT=4097 aicode attach      # 或 aicode attach http://127.0.0.1:4097
+```
+
 ### Codex CLI: `codex not found`
 
 `aicodex` 啟動前會先檢查 `codex` 是否在 PATH。沒有的話安裝 Codex CLI:

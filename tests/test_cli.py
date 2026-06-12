@@ -624,3 +624,304 @@ def test_run_eval_help_exits_zero():
     assert r.returncode == 0, f"exit={r.returncode}\n{r.stderr}"
     assert "usage" in r.stdout.lower() or "用法" in r.stdout
     assert "Traceback" not in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# aicode web / aicode attach 子指令
+# ---------------------------------------------------------------------------
+
+# web-capable opencode:`web --help` 印出 web 指令自己的 synopsis 行並 exit 0;
+# 其他呼叫(含真正的 exec)記錄 args 到 cwd 的 opencode_args.txt。
+_OPENCODE_WEB_CAPABLE_STUB = (
+    "#!/usr/bin/env bash\n"
+    "set -euo pipefail\n"
+    'if [ "${1:-}" = "web" ] && [ "${2:-}" = "--help" ]; then\n'
+    "  printf 'opencode web\\n\\nstart opencode server and open web interface\\n'\n"
+    "  exit 0\n"
+    "fi\n"
+    ": > opencode_args.txt\n"
+    'for arg in "$@"; do\n'
+    "  printf '%s\\n' \"$arg\" >> opencode_args.txt\n"
+    "done\n"
+)
+
+# 舊版 opencode:沒有 web 子指令,yargs 把 web 當專案 positional,`--help` 短路
+# 印預設說明(**沒有** `opencode web` synopsis)且一樣 exit 0 —— 真實模擬舊版,
+# 用來證明能力偵測不靠 exit code。
+_OPENCODE_WEB_OLD_STUB = (
+    "#!/usr/bin/env bash\n"
+    "set -euo pipefail\n"
+    'if [ "${1:-}" = "web" ] && [ "${2:-}" = "--help" ]; then\n'
+    "  printf 'opencode [project]\\n\\nstart opencode tui\\n'\n"
+    "  exit 0\n"
+    "fi\n"
+    ": > opencode_args.txt\n"
+    'for arg in "$@"; do\n'
+    "  printf '%s\\n' \"$arg\" >> opencode_args.txt\n"
+    "done\n"
+)
+
+
+def _run_aicode_subcmd_with_stub(
+    tmp_path: Path,
+    args: list[str],
+    *,
+    opencode_stub: str = _OPENCODE_WEB_CAPABLE_STUB,
+    env_extra: dict[str, str] | None = None,
+    set_model: bool = True,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """跑 `aicode <args>`,用可注入的 opencode stub。回傳 (result, args_file)。
+
+    跟 `_run_aicode_with_stub` 不同處:預設會設好 AICODE_MODEL(web 路徑沿用模型
+    解析,沒設會 fail),並允許注入 opencode stub 與 OPENCODE_SERVER_PASSWORD /
+    AICODE_WEB_PORT / AICODE_ROOT 等環境變數。
+    """
+    if not shutil.which("git"):
+        pytest.skip("git is required for the aicode wrapper tests")
+    bash = _require_working_bash()
+    aicode_script = _bash_compatible_path(bash, REPO_ROOT / "aicode")
+
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    subdir = project / "src"
+    subdir.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    stub_opencode = bin_dir / "opencode"
+    stub_opencode.write_text(opencode_stub, encoding="utf-8")
+    stub_opencode.chmod(0o700)
+
+    env = os.environ.copy()
+    for key in (
+        "AICODE_MODEL",
+        "AICODE_ROOT",
+        "OPENCODE_CONFIG",
+        "AICODE_WEB_PORT",
+        "OPENCODE_SERVER_PASSWORD",
+        "OPENCODE_SERVER_USERNAME",
+    ):
+        env.pop(key, None)
+    env.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "PYTHONIOENCODING": "utf-8",
+            "AICODE_CTX_SAFETY_DISABLE": "1",
+            "AICODE_REQUIRED_MODELS_CHECK_SKIP": "1",
+        }
+    )
+    if set_model:
+        env["AICODE_MODEL"] = "example-code-model:30b"
+    if env_extra:
+        for key, value in env_extra.items():
+            env[key] = str(home) if value == "__HOME__" else value
+
+    result = subprocess.run(
+        [bash, aicode_script, *args],
+        cwd=subdir,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        stdin=subprocess.DEVNULL,
+        env=env,
+    )
+    return result, subdir / "opencode_args.txt"
+
+
+# ---- aicode web ----------------------------------------------------------
+
+
+def test_aicode_web_default_port_and_hostname(tmp_path):
+    """`aicode web` 注入固定 port 4096 + loopback hostname,並沿用既有前置(備好 MCP launcher)。"""
+    result, args_file = _run_aicode_subcmd_with_stub(tmp_path, ["web"])
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
+    assert _read_stub_args(args_file) == ["web", "--port", "4096", "--hostname", "127.0.0.1"]
+    # web 沿用既有前置:CodeTrail MCP launcher 要被備好(對照 attach 的純 client)
+    assert (tmp_path / "project" / ".opencode" / "run-codetrail-mcp").is_file()
+
+
+def test_aicode_web_respects_aicode_web_port_env(tmp_path):
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path, ["web"], env_extra={"AICODE_WEB_PORT": "5000"}
+    )
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstderr={result.stderr}"
+    assert _read_stub_args(args_file) == ["web", "--port", "5000", "--hostname", "127.0.0.1"]
+
+
+def test_aicode_web_forwards_extra_args_and_user_port(tmp_path):
+    """使用者自帶 --port 覆寫預設;其餘參數原樣轉發 opencode web。"""
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path, ["web", "--port", "7000", "--cors", "https://example.test"]
+    )
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstderr={result.stderr}"
+    args = _read_stub_args(args_file)
+    assert args[0] == "web"
+    assert _contains_subsequence(args, ["--port", "7000"])
+    assert _contains_subsequence(args, ["--hostname", "127.0.0.1"])
+    assert _contains_subsequence(args, ["--cors", "https://example.test"])
+    # 不應重複注入 --port(使用者已給)
+    assert args.count("--port") == 1
+
+
+def test_aicode_web_missing_port_value_fails(tmp_path):
+    result, args_file = _run_aicode_subcmd_with_stub(tmp_path, ["web", "--port"])
+
+    assert result.returncode != 0
+    assert "--port" in result.stderr
+    assert not args_file.exists()
+
+
+def test_aicode_web_rejects_root_slash(tmp_path):
+    """spec E.1:aicode web 從 / 啟動被拒(沿用既有沙箱 root 檢查)。"""
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path, ["web"], env_extra={"AICODE_ROOT": "/"}
+    )
+
+    assert result.returncode != 0
+    assert "refusing AICODE_ROOT=/" in result.stderr
+    assert not args_file.exists()
+
+
+def test_aicode_web_rejects_home_root(tmp_path):
+    """spec E.1:aicode web 從 $HOME 啟動被拒。"""
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path, ["web"], env_extra={"AICODE_ROOT": "__HOME__"}
+    )
+
+    assert result.returncode != 0
+    assert "refusing AICODE_ROOT=$HOME" in result.stderr
+    assert not args_file.exists()
+
+
+def test_aicode_web_non_local_hostname_without_password_refused(tmp_path):
+    """spec E.2:hostname 非 local 且未設密碼 → 拒絕啟動。"""
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path, ["web", "--hostname", "0.0.0.0"]
+    )
+
+    assert result.returncode != 0
+    assert "OPENCODE_SERVER_PASSWORD" in result.stderr
+    assert not args_file.exists()
+
+
+def test_aicode_web_non_local_hostname_with_password_allowed(tmp_path):
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path,
+        ["web", "--hostname", "0.0.0.0"],
+        env_extra={"OPENCODE_SERVER_PASSWORD": "s3cret"},
+    )
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstderr={result.stderr}"
+    args = _read_stub_args(args_file)
+    assert args[0] == "web"
+    assert _contains_subsequence(args, ["--hostname", "0.0.0.0"])
+
+
+def test_aicode_web_mdns_without_password_refused(tmp_path):
+    """--mdns 會翻成 0.0.0.0 廣播,視為非 loopback 暴露,未設密碼也要拒絕。"""
+    result, args_file = _run_aicode_subcmd_with_stub(tmp_path, ["web", "--mdns"])
+
+    assert result.returncode != 0
+    assert "OPENCODE_SERVER_PASSWORD" in result.stderr
+    assert "mdns" in result.stderr.lower()
+    assert not args_file.exists()
+
+
+def test_aicode_web_localhost_hostname_allowed_without_password(tmp_path):
+    """明確 --hostname localhost 仍屬 loopback,不需要密碼。"""
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path, ["web", "--hostname", "localhost"]
+    )
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstderr={result.stderr}"
+    assert _contains_subsequence(_read_stub_args(args_file), ["--hostname", "localhost"])
+
+
+def test_aicode_web_old_opencode_prints_upgrade_and_exits(tmp_path):
+    """spec E.3:舊版 opencode(web --help 無 synopsis)→ 印升級指引後退出,不 exec。"""
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path, ["web"], opencode_stub=_OPENCODE_WEB_OLD_STUB
+    )
+
+    assert result.returncode != 0
+    assert "opencode-ai@latest" in result.stderr
+    assert not args_file.exists()
+
+
+# ---- aicode attach -------------------------------------------------------
+
+
+def test_aicode_attach_default_url(tmp_path):
+    result, args_file = _run_aicode_subcmd_with_stub(tmp_path, ["attach"], set_model=False)
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstderr={result.stderr}"
+    assert _read_stub_args(args_file) == ["attach", "http://127.0.0.1:4096"]
+
+
+def test_aicode_attach_respects_aicode_web_port_env(tmp_path):
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path, ["attach"], env_extra={"AICODE_WEB_PORT": "5000"}, set_model=False
+    )
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstderr={result.stderr}"
+    assert _read_stub_args(args_file) == ["attach", "http://127.0.0.1:5000"]
+
+
+def test_aicode_attach_explicit_url_and_flags_forwarded(tmp_path):
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path, ["attach", "http://host:9000", "-s", "SID", "-c"], set_model=False
+    )
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstderr={result.stderr}"
+    assert _read_stub_args(args_file) == ["attach", "http://host:9000", "-s", "SID", "-c"]
+
+
+def test_aicode_attach_flag_only_uses_default_url(tmp_path):
+    """第一個參數是 flag(非 url)時,用預設 url 並把 flag 轉發。"""
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path, ["attach", "-c"], set_model=False
+    )
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstderr={result.stderr}"
+    assert _read_stub_args(args_file) == ["attach", "http://127.0.0.1:4096", "-c"]
+
+
+def test_aicode_attach_is_thin_no_wrapper_no_sandbox(tmp_path):
+    """attach 是純 client:不做沙箱 root 檢查(AICODE_ROOT=/ 也不擋)、不準備 MCP wrapper。"""
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path, ["attach"], env_extra={"AICODE_ROOT": "/"}, set_model=False
+    )
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstderr={result.stderr}"
+    assert _read_stub_args(args_file) == ["attach", "http://127.0.0.1:4096"]
+    # 純 client 不應建立 .opencode/run-codetrail-mcp launcher
+    assert not (tmp_path / "project" / ".opencode" / "run-codetrail-mcp").exists()
+
+
+# ---- regression: 既有 standalone TUI 路徑不受影響 -------------------------
+
+
+def test_aicode_no_subcommand_does_not_trigger_web_or_attach(tmp_path):
+    """spec E.4:無參數 → exec 純 opencode,不含 web/attach 子指令。"""
+    result, args_file = _run_aicode_subcmd_with_stub(tmp_path, [])
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstderr={result.stderr}"
+    args = _read_stub_args(args_file)
+    assert args == []
+    assert "web" not in args and "attach" not in args
+
+
+def test_aicode_non_subcommand_first_arg_forwarded_verbatim(tmp_path):
+    """第一個位置參數不是 web/attach(例如專案路徑)→ 完全走現行語義,原樣轉發。"""
+    result, args_file = _run_aicode_subcmd_with_stub(tmp_path, ["somedir"])
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstderr={result.stderr}"
+    assert _read_stub_args(args_file) == ["somedir"]
