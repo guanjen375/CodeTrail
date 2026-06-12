@@ -340,6 +340,7 @@ if [ "${SUBCMD:-}" = "web" ]; then
   fi
 
   echo "[aicode] web backend → http://$WEB_HOSTNAME:$WEB_PORT"
+  echo "[aicode] 🧪 web 模式為實驗功能(開發中);要穩定請用 standalone TUI(直接 aicode)。"
   if [ "$WEB_LOCAL" -eq 1 ] && [ "$WEB_MDNS" -ne 1 ]; then
     echo "[aicode] 綁 loopback。有桌面的話瀏覽器會自動開;若這台是沒有桌面的 server,從你自己的電腦:"
     echo "[aicode]   ssh -N -L $WEB_PORT:127.0.0.1:$WEB_PORT <你的帳號>@<此 server>"

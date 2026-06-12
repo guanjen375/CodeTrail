@@ -176,6 +176,7 @@ while (( SECONDS < deadline )); do
         fi
         echo ""
         echo "[+] web backend ready → $HEALTH_URL"
+        echo "    🧪 web 模式為實驗功能(開發中);穩定路徑是 standalone TUI(aicode)。"
         if [ -n "$ts_url" ]; then
             echo "    遠端(推薦):Tailscale → ${ts_url}/   ← 加到瀏覽器最愛,免 SSH tunnel"
         else
