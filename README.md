@@ -11,7 +11,7 @@ CodeTrail 目前定位是**成熟私有部署版**:適合本機、離線、NDA /
 
 底層推理引擎使用 [llama.cpp](https://github.com/ggerganov/llama.cpp) `llama-server`(自己 build,需要 CUDA)。所有 CodeTrail internal LLM / embedding / reranker / VL 走它的 HTTP API。Codex CLI frontend model 可以另外使用你自己的 Codex / OpenAI / ChatGPT / local provider 設定。
 
-## 0. OpenCode TUI 新手路線圖
+## 0. OpenCode TUI 部署路線圖
 
 如果你的目標只是把 **OpenCode TUI** 布置起來,先照這條走。Codex CLI 與 web 模式都可以先跳過,等 TUI 穩了再看。
 
@@ -33,7 +33,7 @@ OpenCode TUI 的完成條件是:
 
 README 的命令範例以 Ubuntu / Debian shell 為主。`aicode` 是 bash wrapper;Windows 使用者建議在 WSL2 或遠端 Linux GPU 主機上跑這條流程。
 
-## 特別注意(剛上手最容易踩的)
+## 特別注意(首次部署最容易踩的)
 
 > [!WARNING]
 > 動手前掃一遍 —— 這幾點踩了通常會卡很久,或踩到 NDA / 安全:
