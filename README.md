@@ -300,6 +300,7 @@ tmux new -s codetrail-main
   -m ~/models/Qwen3-235B-A22B-Thinking-2507-GGUF/UD-Q4_K_XL/Qwen3-235B-A22B-Thinking-2507-UD-Q4_K_XL-00001-of-00003.gguf \
   --host 0.0.0.0 --port 8080 \
   -c 65536 -ngl 99 --jinja \
+  --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.0 \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --n-cpu-moe 90 \
   -fa on \
@@ -314,6 +315,8 @@ tmux new -s codetrail-main
 - `-c 65536` —— context 上限 64K token(模型原生 256K,KV cache 會吃 VRAM,先從 64K 起)
 - `-ngl 99` —— 嘗試把所有層放 GPU(MoE expert 之後會被 `--n-cpu-moe` 拉回 CPU)
 - `--jinja` —— 啟用模型內建 chat template,tool calling 才會走對格式
+- `--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0` —— **Qwen3-235B-A22B-Thinking-2507 官方建議取樣值**。llama-server 不帶這些旗標時的內建預設是 `temp 0.8 / top_k 40 / min_p 0.05`,溫度偏高會讓模型更容易「自由發揮」杜撰不存在的具體事實(條號 / 日期 / 數字)。**這條同時也是 OpenCode TUI 純聊天路徑的取樣來源** —— OpenCode 的 openai-compatible provider 無法可靠地逐次帶取樣參數(`temperature` 有已知 bug 會被丟掉,`top_k` / `min_p` 不在它的 schema 裡),所以唯一可靠的釘法就是這裡的 server 啟動旗標。**改了要重啟 server 才生效**。詳見 [docs/troubleshooting.md](docs/troubleshooting.md)
+- `--presence-penalty 1.0` —— Unsloth 對此模型的建議值,壓重複輸出;若看到中英文混雜可調回 `0`
 - `--cache-type-k/v q8_0` —— KV cache 量化到 8-bit,64K ctx 約省一半 VRAM
 - `--n-cpu-moe 90` —— **MoE 模型才加**;Qwen3-235B 共 94 層,**前 90 層 expert 卸到 CPU RAM、剩 4 層留在 GPU**。這是 5090 同卡掛 main + embedding + reranker + VL 的實測值;若只跑 main 或把附屬模型放另一張卡,可再把 N 調小換速度。**N 數字依你 VRAM 調整,見下方表格**
 - `-fa on` —— 啟用 flash attention,省 KV cache VRAM、加速 attention 計算。dense / MoE 都適用
@@ -552,6 +555,8 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
 - `llamacpp` 是 provider key,可改名(`local`、`llmcpp`、隨意),但要跟 `"model"` 那段的 prefix 對齊。
 - `enabled_providers` 鎖定只啟用本機 provider:設了之後 OpenCode 的 model picker(TUI 與 web)**只會出現你的本機模型**,雲端 provider(OpenCode Zen、Anthropic、OpenAI 等)完全不列出、無法誤選 —— **NDA 場景強烈建議保留**,避免把程式碼送到雲端模型。陣列內字串要跟你的 provider key 一致(這裡是 `llamacpp`)。
 - `apiKey` 任意非空值即可,llama-server 預設不檢查。
+- **取樣參數(temperature / top_p / top_k / min_p)不要寫在這裡指望它生效**。OpenCode 的 openai-compatible provider 對自訂 provider 有已知問題:`temperature` 會被丟掉、不送進 request body([opencode#25755](https://github.com/anomalyco/opencode/issues/25755)),而 `top_k` / `min_p` 根本不在 OpenCode 的 schema 裡。**取樣一律在 §3.1 的 llama-server 啟動旗標釘**(`--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0`);OpenCode 純聊天不帶取樣時就會吃到 server 的正確預設。
+- **要壓「模型杜撰不存在的具體事實」(條號 / 日期 / 數字),在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則**(OpenCode 會自動把它載入每一段對話,含純聊天)。範例與原理見 [docs/troubleshooting.md](docs/troubleshooting.md)。注意這個 `~/.config/opencode/AGENTS.md` 是 OpenCode runtime 的全域規則檔,跟本 repo 根目錄那份「給修改 CodeTrail 原始碼的 agent 看的」`AGENTS.md` 是兩回事。
 - `limit.context: 32768` 是 OpenCode 主對話實際塞給 server 的上限。可以等於 server `-c`(64K),但留一半做 output / 不擠爆比較穩。
 - `permission` 區段:`*: deny` 是預設拒絕一切,只白名單 `codetrail_*`(經 CodeTrail 沙箱)。OpenCode 內建工具(`bash` / `read` / `write` 等)會繞過 CodeTrail 沙箱,所以這裡明確 `deny`。
 

@@ -545,6 +545,22 @@ STRICT_MODE_KEYWORDS = [
     'spec', 'manual', 'specification', 'according to'
 ]
 STRICT_MODE_TEMPERATURE = 0.0        # 嚴格模式下溫度壓到最低
+
+# ------------------------------------------------------------
+# CodeTrail 內部呼叫的取樣參數(top_p / top_k / min_p)
+# ------------------------------------------------------------
+# llama-server 啟動若沒帶 sampling 旗標,內建預設是 temp 0.8 / top_k 40 / min_p 0.05,
+# 偏離 Qwen3-235B-A22B-Thinking-2507 官方建議(temp 0.6 / top_p 0.95 / top_k 20 /
+# min_p 0),容易讓模型「自由發揮」杜撰不存在的具體事實(條號 / 日期 / 數字)。
+# CodeTrail 自己的呼叫除了把 temperature 壓到 0.0/0.2,這裡再把 top_p / top_k /
+# min_p 也釘在 Qwen 建議值,不再依賴 server 端預設(server 沒設旗標也安全)。
+#
+# 注意:這只影響 CodeTrail internal calls。OpenCode TUI 直接打 llama-server /v1,
+# 不經過這裡 —— OpenCode 聊天路徑的取樣必須在 llama-server 啟動旗標釘
+# (見 README §3.1 與 docs/troubleshooting.md「模型編造不存在的具體事實」)。
+CHAT_TOP_P = float(_os.environ.get("AICODE_CHAT_TOP_P", "0.95"))
+CHAT_TOP_K = int(_os.environ.get("AICODE_CHAT_TOP_K", "20"))
+CHAT_MIN_P = float(_os.environ.get("AICODE_CHAT_MIN_P", "0.0"))
 WEAK_REF_THRESHOLD = 0.35            # REF 分數低於此值視為「太弱」（調整: 0.30->0.35）
 SKIP_LOW_CONFIDENCE_KB = True        # 是否跳過低信心度的 KB 上下文注入
 LOW_CONFIDENCE_KB_THRESHOLD = 0.30   # 低於此分數則不注入 KB context（調整: 0.25->0.30）

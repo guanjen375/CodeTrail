@@ -65,6 +65,42 @@ nvidia-smi -l 1                                              # GPU 是否在動
 
 長期解法:重啟主 server 加 `--no-mmap`,前期載入慢 1.5–2.5 分鐘(把 ~135GB weights 全讀進 RAM),之後 TTFT 穩定在 5–15 秒。RAM 不夠 135GB 的就保持 mmap 接受偶爾卡頓,或換較小模型。
 
+### 模型編造不存在的具體事實(條號 / 日期 / ticket 號 / 金額)—— 幻覺 / confabulation
+
+**症狀**:問一個你沒提供來源的問題(例如「對某廠商發 ticket 施壓」),模型回了看似可執行的細節 —— 引用「合約第 7.2 條」、「每日延遲成本 \$25K」、「3 日內回應」 —— 但這些數字 / 條號**從來沒出現在你給它的任何資料裡**,是模型自己補的。
+
+**先講結論:這不是模型壞掉,也不是 Q4 量化的鍋,換模型解決不了。** 模型甚至能正確診斷自己的這個現象,代表它很健康。根因有兩個:
+
+1. **沒有 grounding(來源)**。你要它引合約條款,卻沒把合約貼給它。沒有來源時,任何模型、任何精度都**不可能**猜中真實條號 —— 它只能依「訓練語料裡最常見的 `第 X.Y 條` 模式」補一個最像的數字。這是機率預測的副作用,不是故意騙人。
+2. **取樣太放飛 + 走錯路徑**。純聊天走的是 **OpenCode TUI → llama-server**,**完全繞過 CodeTrail** 的 temp 0.0 + RAG + strict mode(見 [context_budget.py](../context_budget.py) 註解、`config.py` 的 `STRICT_MODE_TEMPERATURE`)。而 llama-server 啟動若沒帶 sampling 旗標,內建預設 `temp 0.8 / top_k 40 / min_p 0.05` —— 對 `Qwen3-235B-A22B-Thinking-2507`(官方建議 `temp 0.6 / top_p 0.95 / top_k 20 / min_p 0`)偏高,更容易自由發揮。
+
+**三個修法(按效果排序)**:
+
+**① 要它講具體事實 → 先給它來源。** 想引合約就把合約貼進 prompt;程式碼問題走 CodeTrail 工具(`codetrail_*` / `aicode`)讓 RAG 把真實程式碼接進 context。沒來源的「具體數字 / 條號 / ticket 號」一律是擲骰子。
+
+**② 在 llama-server 啟動旗標釘住取樣(這條同時修好 OpenCode 純聊天路徑)。** 主 server 啟動指令(README §3.1)加上:
+
+```bash
+  --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.0 \
+```
+
+為什麼一定要在 server 旗標釘、而不是寫在 `opencode.json`:OpenCode 的 openai-compatible provider 對自訂 provider 有已知問題,`temperature` 會被丟掉不送進 request body([opencode#25755](https://github.com/anomalyco/opencode/issues/25755)),`top_k` / `min_p` 又不在它的 schema 裡。所以 server 旗標是唯一可靠的釘法。**改完要重啟 server 才生效。**
+
+**③ 在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則。** OpenCode 會把全域 `~/.config/opencode/AGENTS.md` 自動載入每一段對話(含純聊天)。加入類似:
+
+```markdown
+## 事實準確性
+- 不要杜撰未提供的具體事實:合約條號、日期、ticket 編號、金額、API 名稱、檔案路徑、引用出處。
+- 沒有來源可佐證時,直接說「我手上沒有這項資訊」或輸出佔位符(如 `{待填}`),不要補一個看似合理的數字。
+- 區分「推測」與「事實」:要推測就明講這是推測,不要當成已知條件輸出。
+```
+
+(注意:這份 `~/.config/opencode/AGENTS.md` 是 OpenCode runtime 的全域規則,跟本 repo 根目錄那份「給修改 CodeTrail 原始碼的 AI agent 看的」`AGENTS.md` 不是同一個東西。)
+
+**換不換模型?** 不用。換更大 / 更高精度的模型幻覺會少一點但不會消失 —— 它一樣會編沒給它的東西。真正要調的是「來源 + 取樣 + 規則」,不是模型。
+
+> CodeTrail 自己的內部呼叫(agent loop / 全文分析 / strict 自我複查)除了 temp 0.0/0.2,也已經把 `top_p / top_k / min_p` 釘在 Qwen 建議值(`config.py` 的 `CHAT_TOP_P` / `CHAT_TOP_K` / `CHAT_MIN_P`,可用 `AICODE_CHAT_TOP_P` / `AICODE_CHAT_TOP_K` / `AICODE_CHAT_MIN_P` env 覆寫),所以即使 server 忘了帶旗標,**CodeTrail 路徑仍然是穩的**。會吃到 server 預設、需要靠上面 ② 修的,只有 OpenCode 純聊天路徑。
+
 ### `pip install hf-transfer` 報 `error: externally-managed-environment`
 
 Ubuntu 24.04(PEP 668)的 Python 拒絕 system-wide pip install。加 `--user --break-system-packages`:

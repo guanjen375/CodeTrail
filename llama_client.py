@@ -34,6 +34,7 @@ def native_completion(
     temperature: float = 0.2,
     top_p: float = 0.95,
     top_k: int = 40,
+    min_p: float | None = None,
     stream: bool = False,
     stop: list[str] | None = None,
     image_data: list[dict] | None = None,
@@ -59,6 +60,8 @@ def native_completion(
         "stream": stream,
         "cache_prompt": True,
     }
+    if min_p is not None:
+        payload["min_p"] = min_p
     if stop:
         payload["stop"] = stop
     if image_data:
@@ -104,6 +107,9 @@ def chat_completions(
     messages: list[dict],
     model: str = "",
     temperature: float = 0.2,
+    top_p: float | None = None,
+    top_k: int | None = None,
+    min_p: float | None = None,
     tools: list[dict] | None = None,
     tool_choice: str | dict = "auto",
     stream: bool = False,
@@ -117,6 +123,9 @@ def chat_completions(
         stream=True  → 迭代器,yield 每個 delta chunk
 
     model 在 llama.cpp 是 informational(server 一啟動就鎖死一顆),仍要帶,寫進 telemetry。
+
+    top_p / top_k / min_p 預設 None = 不送,沿用 server 啟動旗標的取樣預設;
+    呼叫端(agent.py)會帶入 config.CHAT_* 把 Qwen 建議值釘住。
     """
     payload: dict[str, Any] = {
         "model": model or "local",
@@ -125,6 +134,13 @@ def chat_completions(
         "stream": stream,
         "cache_prompt": True,
     }
+    # top_p / top_k / min_p:None 表示「不送,沿用 server 啟動旗標的取樣預設值」。
+    if top_p is not None:
+        payload["top_p"] = top_p
+    if top_k is not None:
+        payload["top_k"] = top_k
+    if min_p is not None:
+        payload["min_p"] = min_p
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice
