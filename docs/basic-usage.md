@@ -105,6 +105,8 @@ aicode
 
 匯入後的檔案會複製到專案底下 `.aicode_uploads/`，原始檔不會被修改。更多副檔名、白名單與圖片/binary 細節見 [RAG、附件與知識庫操作](rag.md)。
 
+如果外部 PDF / spec 也要注入 RAG，先 `import_external_file`，再把回傳的 `.aicode_uploads/...` 路徑交給 `ingest_document`；完整串接範例見 [RAG、附件與知識庫操作](rag.md#同時處理外部附件並注入-rag)。
+
 ---
 
 ## 3. 注入 RAG

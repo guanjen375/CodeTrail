@@ -89,6 +89,26 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 最後用 grep_code 在當前專案找這串錯誤可能來自哪個 .c 檔。
 ```
 
+#### 同時處理外部附件並注入 RAG
+
+如果檔案在專案外，又想讓它同時進入目前對話和長期知識庫，流程是：
+
+1. 先用 `import_external_file` 把外部檔案複製進專案。
+2. 對回傳的新路徑做 `read_file` 或 `analyze_file`，讓模型這一輪先看內容。
+3. 對同一個新路徑做 `ingest_document`，再 `reload_knowledge_base`，讓之後的對話也查得到。
+
+範例：
+
+```text
+請用工具 import_external_file 匯入 ~/Downloads/npu_spec.pdf，
+用回傳的新路徑先做 file_info 確認檔名與大小，
+再用同一個新路徑執行 ingest_document，
+完成後 reload_knowledge_base，
+最後用 query_knowledge 查這份 spec 的版本號並附 REF。
+```
+
+若是外部 log 或純文字檔，可以在 `ingest_document` 前先 `read_file` 摘要；若是圖片、ELF 或 firmware binary，可以先 `analyze_file`。重點是 **`import_external_file` 只負責把檔案帶進沙箱，不會自動寫入 KB**；要長期查詢一定還要呼叫 `ingest_document` 和 `reload_knowledge_base`。
+
 ### 把附件做成知識庫讓模型隨時能查
 
 「知識庫」是這個專案放規格書、手冊、設計文件的地方。一旦把文件匯進去，之後對話遇到相關問題時，系統會自動找出最相關的幾段內容當作回答依據，並用 `REF1` `REF2` 標出每段是引用自哪份文件的哪個位置。
