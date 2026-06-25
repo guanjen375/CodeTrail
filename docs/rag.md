@@ -193,6 +193,8 @@ batch size 上限是 32 (REF1)。
 | 只看這張圖一次，看完就丟 | `analyze_file('diagram.png')` | ✗ 只在這一輪對話 |
 | 看完還要之後反覆查 | `ingest_document('diagram.png')` → `reload_knowledge_base()` | ✓ VL 抽完寫進 knowledge.json |
 
+> **不用先 `analyze_file`。** `ingest_document` 餵圖片時內部會自己呼叫 VL 看圖（`RAG.py --image` → `process_technical_image` → VL server :8083），抽出文字後才切 chunk、算 embedding 寫進 `knowledge.json`。`analyze_file` 是另一條獨立的入口（走 `media.py`），只在你想「這一輪先看一眼畫面」時用，它的輸出不會被 ingest 吃進去，**不是 ingest 的前置步驟**。
+
 圖片在專案目錄內（建議放 `docs/`）直接 ingest，之後就查得到：
 
 ```text
@@ -208,8 +210,8 @@ batch size 上限是 32 (REF1)。
 
 ```text
 請用工具 import_external_file 匯入 ~/Downloads/error_screen.png，
-對回傳的新路徑做 analyze_file 讓我這一輪先看到畫面，
-再對同一個新路徑做 ingest_document，最後 reload_knowledge_base。
+對回傳的新路徑做 ingest_document，最後 reload_knowledge_base。
+（想在這一輪先看一眼畫面，可以在 ingest 前選用 analyze_file，但它不是 ingest 的前置步驟。）
 ```
 
 兩個常踩的點：

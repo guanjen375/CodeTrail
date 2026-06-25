@@ -133,7 +133,7 @@ aicode
 證據不足就拒答，不要用常識補。
 ```
 
-圖片附件（截圖、架構圖、被拍成圖的規格頁）也能進 RAG，跟 PDF 走同一套 —— `ingest_document` 看到圖片副檔名會自動用 VL 看圖、抽成文字再切 chunk，之後一樣用 `query_knowledge` 查：
+圖片附件（截圖、架構圖、被拍成圖的規格頁）也能進 RAG，跟 PDF 走同一套 —— `ingest_document` 看到圖片副檔名會自動用 VL 看圖、抽成文字再切 chunk（**不必先 `analyze_file`**），之後一樣用 `query_knowledge` 查：
 
 ```text
 請用工具 ingest_document 匯入 docs/block_diagram.png，
