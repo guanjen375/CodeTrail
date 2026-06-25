@@ -93,9 +93,9 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 
 如果檔案在專案外，又想讓它同時進入目前對話和長期知識庫，流程是：
 
-1. 先用 `import_external_file` 把外部檔案複製進專案。
-2. 對回傳的新路徑做 `read_file` 或 `analyze_file`，讓模型這一輪先看內容。
-3. 對同一個新路徑做 `ingest_document`，再 `reload_knowledge_base`，讓之後的對話也查得到。
+1. 先用 `import_external_file` 把外部檔案複製進專案，拿到 `.aicode_uploads/...` 新路徑。
+2. （選用）對新路徑做 `read_file` 或 `analyze_file`，**只是讓模型這一輪先看一次**，不會寫入 `knowledge.json`。
+3. 對**同一個路徑**做 `ingest_document`（它會重新讀那個原始檔案、自己切 chunk 算 embedding），再 `reload_knowledge_base`，之後的對話才查得到。
 
 範例：
 
@@ -107,7 +107,13 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 最後用 query_knowledge 查這份 spec 的版本號並附 REF。
 ```
 
-若是外部 log 或純文字檔，可以在 `ingest_document` 前先 `read_file` 摘要；若是圖片、ELF 或 firmware binary，可以先 `analyze_file`。重點是 **`import_external_file` 只負責把檔案帶進沙箱，不會自動寫入 KB**；要長期查詢一定還要呼叫 `ingest_document` 和 `reload_knowledge_base`。
+這個「先看一次、再把同一路徑入庫」的流程對**圖片 / ELF / firmware binary 都適用**（純文字 / log 第 2 步改用 `read_file`）。但三件事一定要分清楚，否則容易誤會：
+
+- `analyze_file(path)` / `read_file(path)` **只讓目前這一輪對話先看附件**，不會寫入 `knowledge.json`。
+- `ingest_document(path)` 會**重新讀同一個原始檔案**、切 chunk、算 embedding、寫入 `knowledge.json` —— 它**不會接收 `analyze_file` 的文字輸出**，所以第 2 步看一次只是給你參考，省略也不影響入庫結果。
+- `ingest_document` 之後**一定要 `reload_knowledge_base()`**，否則 `query_knowledge` 查不到剛注入的內容。
+
+（另外 `import_external_file` 只負責把外部檔案帶進沙箱，本身不寫 KB。）
 
 ### 把附件做成知識庫讓模型隨時能查
 
@@ -193,7 +199,7 @@ batch size 上限是 32 (REF1)。
 | 只看這張圖一次，看完就丟 | `analyze_file('diagram.png')` | ✗ 只在這一輪對話 |
 | 看完還要之後反覆查 | `ingest_document('diagram.png')` → `reload_knowledge_base()` | ✓ VL 抽完寫進 knowledge.json |
 
-> **不用先 `analyze_file`。** `ingest_document` 餵圖片時內部會自己呼叫 VL 看圖（`RAG.py --image` → `process_technical_image` → VL server :8083），抽出文字後才切 chunk、算 embedding 寫進 `knowledge.json`。`analyze_file` 是另一條獨立的入口（走 `media.py`），只在你想「這一輪先看一眼畫面」時用，它的輸出不會被 ingest 吃進去，**不是 ingest 的前置步驟**。
+> **不用先 `analyze_file`。** `ingest_document` 餵圖片時會**重新讀那個原始圖檔**、內部自己呼叫 VL 看圖（`RAG.py --image` → `process_technical_image` → VL server :8083），抽出文字後才切 chunk、算 embedding 寫進 `knowledge.json`。`analyze_file` 是另一條獨立的入口（走 `media.py`），只在你想「這一輪先看一眼畫面」時用，它的輸出不會被 ingest 吃進去，**不是 ingest 的前置步驟**。
 
 圖片在專案目錄內（建議放 `docs/`）直接 ingest，之後就查得到：
 
