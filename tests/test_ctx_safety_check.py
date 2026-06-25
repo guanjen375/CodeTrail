@@ -17,6 +17,98 @@ def _unknown_verdict(requested: int) -> SafetyVerdict:
     )
 
 
+def _server_verdict_factory(status: str, server_n_ctx: int):
+    """回一個假 check_safety:固定 server_n_ctx,status 由呼叫端指定。
+
+    gate 是拿 env 推出的 requested 跟 verdict.server_n_ctx 比,所以這裡只要把
+    server_n_ctx 釘住,測試端用 AICODE_DYNAMIC_NUM_CTX_MAX 控制 requested 即可。
+    """
+
+    def fake_check_safety(requested, base_url="http://localhost:8080", **_kw):
+        return SafetyVerdict(
+            status=status,
+            requested_ctx=requested,
+            server_n_ctx=server_n_ctx,
+            model_path="/models/x.gguf",
+            vram_total_gb=None,
+            vram_free_gb=None,
+            reason="test reason",
+            detail_lines=[f"Server n_ctx (啟動時 -c): {server_n_ctx}"],
+        )
+
+    return fake_check_safety
+
+
+def test_ctx_safety_passes_when_requested_equals_server(monkeypatch, capsys):
+    """requested == server n_ctx → SAFE,放行 (exit 0)。"""
+    monkeypatch.setenv("AICODE_MODEL", "custom-model")
+    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65532")
+    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
+    monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
+    monkeypatch.setattr(
+        ctx.gpu_safety, "check_safety", _server_verdict_factory("SAFE", 65532)
+    )
+
+    assert ctx.main() == 0
+    out = capsys.readouterr().out
+    assert "SAFE" in out
+    assert "== server n_ctx=65532" in out
+
+
+def test_ctx_safety_mismatch_when_requested_below_server(monkeypatch, capsys):
+    """requested < server n_ctx → MISMATCH (對齊漂移),擋住 (exit 2)。"""
+    monkeypatch.setenv("AICODE_MODEL", "custom-model")
+    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "32768")
+    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
+    monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
+    monkeypatch.setattr(
+        ctx.gpu_safety, "check_safety", _server_verdict_factory("SAFE", 65532)
+    )
+
+    assert ctx.main() == 2
+    out = capsys.readouterr().out
+    assert "MISMATCH" in out
+    assert "32768" in out
+    assert "65532" in out
+    # 修法 (a) 應該建議對齊到 server 的真實 n_ctx
+    assert "AICODE_DYNAMIC_NUM_CTX_MAX=65532" in out
+    assert "refuse to start" in out
+
+
+def test_ctx_safety_mismatch_allows_with_accept_risk(monkeypatch, capsys):
+    """requested < server n_ctx 但設了 AICODE_ACCEPT_CTX_RISK=1 → 放行 (exit 0)。"""
+    monkeypatch.setenv("AICODE_MODEL", "custom-model")
+    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "32768")
+    monkeypatch.setenv("AICODE_ACCEPT_CTX_RISK", "1")
+    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
+    monkeypatch.setattr(
+        ctx.gpu_safety, "check_safety", _server_verdict_factory("SAFE", 65532)
+    )
+
+    assert ctx.main() == 0
+    out = capsys.readouterr().out
+    assert "MISMATCH" in out
+    assert "AICODE_ACCEPT_CTX_RISK=1 已設" in out
+
+
+def test_ctx_safety_unsafe_when_requested_above_server(monkeypatch, capsys):
+    """requested > server n_ctx → UNSAFE (截斷風險),擋住 (exit 2)。"""
+    monkeypatch.setenv("AICODE_MODEL", "custom-model")
+    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65532")
+    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
+    monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
+    monkeypatch.setattr(
+        ctx.gpu_safety, "check_safety", _server_verdict_factory("UNSAFE", 8192)
+    )
+
+    assert ctx.main() == 2
+    out = capsys.readouterr().out
+    assert "UNSAFE" in out
+    # 修法 (a) 對齊到 server 的真實 n_ctx (8192),不再 round down
+    assert "AICODE_DYNAMIC_NUM_CTX_MAX=8192" in out
+    assert "refuse to start" in out
+
+
 def test_ctx_safety_fails_loud_when_env_missing(monkeypatch, capsys):
     """CodeTrail 不內建主模型: AICODE_MODEL 未設時必須 fail-loud (exit 2)。"""
     monkeypatch.delenv("AICODE_MODEL", raising=False)

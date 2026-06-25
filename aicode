@@ -227,9 +227,9 @@ fi
 if [ -n "${AICODE_LLAMA_BASE_URL:-}" ]; then
   echo "[aicode] AICODE_LLAMA_BASE_URL=${AICODE_LLAMA_BASE_URL} (主 LLM server)"
 fi
-echo "[aicode] NOTE: 要調 per-call ctx 上限,改 AICODE_DYNAMIC_NUM_CTX_MAX (受 server -c 限制)。"
+echo "[aicode] NOTE: 要調 per-call ctx 上限,改 AICODE_DYNAMIC_NUM_CTX_MAX (必須等於 server 啟動的 -c)。"
 echo "         llama-server 啟動時 -c <N> 是真實 ctx 上限,改了要重啟 server。"
-echo "         OpenCode active model 的 limit.context 也必須對齊 AICODE_DYNAMIC_NUM_CTX_MAX。"
+echo "         OpenCode active model 的 limit.context 必須等於 AICODE_DYNAMIC_NUM_CTX_MAX (三個數字要一樣)。"
 echo "         Check loaded model with: curl -s \${AICODE_LLAMA_BASE_URL:-http://localhost:8080}/props"
 echo "         CodeTrail context overflow attempts are logged to .codetrail/context_metrics.jsonl"
 

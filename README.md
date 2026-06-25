@@ -559,7 +559,7 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
 - `apiKey` 任意非空值即可,llama-server 預設不檢查。
 - **取樣參數(temperature / top_p / top_k / min_p)不要寫在這裡指望它生效**。OpenCode 的 openai-compatible provider 對自訂 provider 有已知問題:`temperature` 會被丟掉、不送進 request body([opencode#25755](https://github.com/anomalyco/opencode/issues/25755)),而 `top_k` / `min_p` 根本不在 OpenCode 的 schema 裡。**取樣一律在 §3.1 的 llama-server 啟動旗標釘**(`--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0`);OpenCode 純聊天不帶取樣時就會吃到 server 的正確預設。
 - **要壓「模型杜撰不存在的具體事實」(條號 / 日期 / 數字),在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則**(OpenCode 會自動把它載入每一段對話,含純聊天)。範例與原理見 [docs/troubleshooting.md](docs/troubleshooting.md)。注意這個 `~/.config/opencode/AGENTS.md` 是 OpenCode runtime 的全域規則檔,跟本 repo 根目錄那份「給修改 CodeTrail 原始碼的 agent 看的」`AGENTS.md` 是兩回事。
-- `limit.context: 65532` 是 OpenCode 主對話實際塞給 server 的上限。它應該跟 `AICODE_DYNAMIC_NUM_CTX_MAX` 對齊,且不得超過 llama-server 啟動時的 `-c <N>`;`aicode` 會在啟動時檢查這件事。
+- `limit.context: 65532` 是 OpenCode 主對話實際塞給 server 的上限。它必須跟 `AICODE_DYNAMIC_NUM_CTX_MAX` 以及 llama-server 啟動時的 `-c <N>` **完全相等**(三者同一個數字);`aicode` 會在啟動時檢查,任一不相等就拒絕啟動。
 - `permission` 區段:`*: deny` 是預設拒絕一切,只白名單 `codetrail_*`(經 CodeTrail 沙箱)。OpenCode 內建工具(`bash` / `read` / `write` 等)會繞過 CodeTrail 沙箱,所以這裡明確 `deny`。
 
 貼完先驗 JSON 格式:
@@ -605,7 +605,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
-`aicode` 做的事:把目前目錄設成 `AICODE_ROOT`(沙箱根目錄)、拒絕從 `$HOME` 或 `/` 起、在當前 git root 準備 `.opencode/run-codetrail-mcp` 讓 OpenCode 的 MCP command 找得到、啟動前確認 `AICODE_DYNAMIC_NUM_CTX_MAX` 沒超過 server `-c` 且 OpenCode active model `limit.context` 已對齊、最後啟 `opencode`。
+`aicode` 做的事:把目前目錄設成 `AICODE_ROOT`(沙箱根目錄)、拒絕從 `$HOME` 或 `/` 起、在當前 git root 準備 `.opencode/run-codetrail-mcp` 讓 OpenCode 的 MCP command 找得到、啟動前確認 `AICODE_DYNAMIC_NUM_CTX_MAX`、server `-c`、OpenCode active model `limit.context` **三者完全相等**(不相等就拒絕啟動)、最後啟 `opencode`。
 
 ### 4.5 安裝 `aicodex` 啟動指令
 

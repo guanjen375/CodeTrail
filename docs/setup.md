@@ -111,7 +111,7 @@ disown
 
 CodeTrail repo 跑在你工作機(CPU 即可),llama-server 跑在另一台 GPU 主機。CodeTrail 透過 HTTP 呼叫對方的 8080 / 8081 / 8082 / 8083。
 
-GPU 主機端:四個 server 照 [README §3](../README.md#3-啟動-llama-server用-tmux-跑在背景) 啟動,但 `--host 0.0.0.0` 必須保留(否則只 listen on `127.0.0.1`,外網連不到)。
+GPU 主機端:四個 server 照 [README §3](../README.md#3-啟動-llama-server用-tmux-跑在背景) 啟動,但有兩點要改:① `--host 0.0.0.0` 必須保留(否則只 listen on `127.0.0.1`,外網連不到);② 主 server 的 `-c` 要設成跟下面的 `AICODE_DYNAMIC_NUM_CTX_MAX` 同一個值(本例是 `-c 32768`,不是 §3 的 65532)。`server -c`、`AICODE_DYNAMIC_NUM_CTX_MAX`、opencode `limit.context` 三者必須相同,否則 `aicode` 會拒絕啟動。
 
 CodeTrail 端:
 
@@ -145,7 +145,7 @@ ssh -L 8080:localhost:8080 -L 8081:localhost:8081 -L 8082:localhost:8082 -L 8083
 2. 拒絕 `AICODE_ROOT=/` 或 `AICODE_ROOT=$HOME`(可能誤刪 / 誤改大量檔案)
 3. 在目前 git root 準備 `.opencode/run-codetrail-mcp`,讓 OpenCode config 裡的 MCP command 能找到 CodeTrail server 入口
 4. 用 `scripts/resolve_main_model.py` 解析主模型；若 `AICODE_MODEL` 和 opencode.json 同時存在且沒傳 CLI `-m/--model`,兩者必須指向同一顆
-5. 啟動前跑 `scripts/ctx_safety_check.py`,讀主 llama-server `/props` 拿真實 `n_ctx`,跟 `AICODE_DYNAMIC_NUM_CTX_MAX` 比對。requested > server 直接 `exit 2`,server 不可連時 graceful 放行只 warn
+5. 啟動前跑 `scripts/ctx_safety_check.py`,讀主 llama-server `/props` 拿真實 `n_ctx`,要求它跟 `AICODE_DYNAMIC_NUM_CTX_MAX` **完全相等**;不等就 `exit 2`(大於 = prompt 會被截斷,小於 = server 容量用不滿、且 TUI/MCP 兩邊預算不同步)。server 不可連時 graceful 放行只 warn
 6. 跑 `scripts/opencode_ctx_check.py`,確認 OpenCode active model 的 `limit.context` 等於 `AICODE_DYNAMIC_NUM_CTX_MAX`,避免 TUI 32K compact 但 CodeTrail MCP 以為自己有 64K
 7. 啟動 `opencode`,讓子行程繼承同一個沙箱根目錄
 8. 把使用者傳入的 `-m / --model` 原樣轉發給 OpenCode;沒傳就讓 OpenCode 自己讀 `opencode.json` 的 `"model"` 欄位

@@ -409,7 +409,8 @@ def check_context_settings(r: Result) -> None:
     )
     r.info(
         f"提醒: llama-server 啟動時 -c <N> 決定它真實 ctx;effective_internal_ctx={effective_internal_ctx} "
-        "只是 CodeTrail 自己的 budget,要對齊請確認 server 也夠大。"
+        "只是 CodeTrail 自己的 budget。aicode 啟動時要求兩者完全相等 "
+        "(server -c == AICODE_DYNAMIC_NUM_CTX_MAX),不只是 server 夠大。"
     )
 
     if num_ctx_env_set and dyn_on and num_ctx > 0 and dyn_max > 0 and num_ctx > dyn_max:
@@ -558,6 +559,46 @@ def check_opencode_config_drift(r: Result, project: str | None) -> None:
         )
     else:
         r.ok(f"opencode.json={found} active model limit.context 與 internal ctx cap 一致")
+
+
+def check_main_server_ctx_alignment(r: Result, server_status: dict[str, dict]) -> None:
+    """主 llama-server 真實 n_ctx 必須等於 CodeTrail internal ctx cap。
+
+    aicode 啟動時 (scripts/ctx_safety_check.py) 對這件事是 hard gate(requested
+    必須 == server n_ctx);doctor 只 warn,讓使用者先看到漂移。server 沒連上
+    (--no-network / 未啟動 / 沒給 n_ctx) 一律跳過,不擋健檢。
+    """
+    main_srv = server_status.get("main")
+    if not main_srv or not isinstance(main_srv.get("props"), dict):
+        return
+    props = main_srv["props"]
+    settings = props.get("default_generation_settings") or {}
+    raw_n_ctx = settings.get("n_ctx") or props.get("n_ctx")
+    try:
+        n_ctx = int(raw_n_ctx)
+    except (TypeError, ValueError):
+        return
+    if n_ctx <= 0:
+        return
+
+    cfg = _read_config()
+    if isinstance(cfg, Exception):
+        return
+    num_ctx = int(getattr(cfg, "NUM_CTX", 0) or 0)
+    dyn_on = bool(getattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", False))
+    dyn_max = int(getattr(cfg, "DYNAMIC_NUM_CTX_MAX", 0) or 0)
+    internal_ctx_cap = dyn_max if dyn_on and dyn_max > 0 else num_ctx
+    if not internal_ctx_cap:
+        return
+
+    if n_ctx != internal_ctx_cap:
+        r.warn(
+            f"主 llama-server n_ctx={n_ctx} 與 CodeTrail ctx cap={internal_ctx_cap} 不一致。\n"
+            "        aicode 啟動時會拒絕這種不一致(要求兩者完全相等);請把 server 的 "
+            "`-c <N>` 或 AICODE_DYNAMIC_NUM_CTX_MAX 調成相同值。"
+        )
+    else:
+        r.ok(f"主 llama-server n_ctx={n_ctx} 與 CodeTrail ctx cap 一致")
 
 
 def check_aicode_root(r: Result, project: str | None) -> None:
@@ -712,6 +753,7 @@ def main(argv: list[str] | None = None) -> int:
     print("\n-- context settings --")
     check_context_settings(r)
     check_llama_runtime(r, no_network=args.no_network, server_status=server_status)
+    check_main_server_ctx_alignment(r, server_status)
     check_opencode_config_drift(r, args.project)
 
     print("\n-- AICODE_ROOT / project --")

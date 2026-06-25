@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""啟動前的 ctx 安全閘:讀 llama-server 真實 n_ctx,跟使用者要求的 dynamic
-ctx 上限比對。requested > server n_ctx → UNSAFE。
+"""啟動前的 ctx 安全閘:讀 llama-server 真實 n_ctx,要求它跟使用者要求的
+dynamic ctx 上限「完全相等」。requested > server n_ctx → UNSAFE (prompt 會被
+截斷);requested < server n_ctx → MISMATCH (對齊漂移,server 多出來的 ctx 用
+不到、且 TUI/MCP 兩邊預算易不同步)。兩種情況都 refuse to start。
 
 呼叫方式 (aicode wrapper 用):
     python3 scripts/ctx_safety_check.py
@@ -84,37 +86,49 @@ def main() -> int:
 
     verdict = gpu_safety.check_safety(requested, base_url=base_url)
 
-    if verdict.status == "SAFE":
-        _print(
-            f"SAFE: model={model} requested_ctx={requested}"
-            f" <= server n_ctx={verdict.server_n_ctx}"
-        )
-        return 0
-
     if verdict.status == "UNKNOWN":
         _print(f"UNKNOWN: {verdict.reason}")
         _print(f"        無法判定 — 放行繼續。先用 `curl -s {base_url}/health` 確認 server 可連。")
         return 0
 
-    # UNSAFE
-    _print(f"UNSAFE: model={model} requested_ctx={requested}")
-    _print(f"        {verdict.reason}")
+    # check_safety 的 SAFE 只保證 requested <= server n_ctx。CodeTrail 再嚴一階:
+    # 要求 requested == server n_ctx,讓三條 ctx 預算 (AICODE_DYNAMIC_NUM_CTX_MAX /
+    # OpenCode limit.context / server -c) 完全一致。只有相等才放行。
+    if verdict.status == "SAFE" and verdict.server_n_ctx == requested:
+        _print(
+            f"SAFE: model={model} requested_ctx={requested}"
+            f" == server n_ctx={verdict.server_n_ctx}"
+        )
+        return 0
+
+    if verdict.status == "UNSAFE":
+        # requested > server n_ctx — 超過 server 真實上限,prompt 會被截斷。
+        _print(f"UNSAFE: model={model} requested_ctx={requested}")
+        _print(f"        {verdict.reason}")
+    else:
+        # SAFE 但 requested < server n_ctx — 不截斷,純粹是對齊漂移。
+        _print(
+            f"MISMATCH: model={model} requested_ctx={requested}"
+            f" < server n_ctx={verdict.server_n_ctx}"
+        )
+        _print("        AICODE_DYNAMIC_NUM_CTX_MAX 必須等於 llama-server 啟動時的 -c;")
+        _print("        目前 server 開得比 CodeTrail 大,多出來的 ctx 用不到,")
+        _print("        且 OpenCode TUI / CodeTrail MCP 兩邊 ctx 預算容易各走各的。")
     _print_block("        ", verdict.detail_lines)
     _print("")
-    _print("        建議任一處理:")
+    _print("        建議任一處理 (目標是讓兩邊數字完全相等):")
     if verdict.server_n_ctx and verdict.server_n_ctx > 0:
-        suggested = (verdict.server_n_ctx // 1024) * 1024
-        _print(f"          (a) export AICODE_DYNAMIC_NUM_CTX_MAX={suggested}  (對齊 server n_ctx)")
-        _print(f"          (b) 重啟 llama-server 並提高 `-c {requested}` (確認 VRAM 夠)")
+        _print(f"          (a) export AICODE_DYNAMIC_NUM_CTX_MAX={verdict.server_n_ctx}  (對齊 server n_ctx)")
+        _print(f"          (b) 重啟 llama-server 用 `-c {requested}` (把 server 對齊到 CodeTrail;確認 VRAM 夠)")
     else:
-        _print(f"          (a) export AICODE_DYNAMIC_NUM_CTX_MAX=<較小值>")
-        _print(f"          (b) 重啟 llama-server 並調整 `-c <N>` 對應期望 ctx")
-    _print("          (c) export AICODE_ACCEPT_CTX_RISK=1 (我知道會 truncate,還是要跑)")
+        _print(f"          (a) export AICODE_DYNAMIC_NUM_CTX_MAX=<server 真實 n_ctx>")
+        _print(f"          (b) 重啟 llama-server 把 `-c <N>` 設成跟 AICODE_DYNAMIC_NUM_CTX_MAX 相同")
+    _print("          (c) export AICODE_ACCEPT_CTX_RISK=1 (本次接受不一致)")
     _print("          (d) export AICODE_CTX_SAFETY_DISABLE=1 (永久關閉此檢查)")
     _print("")
 
     if accept_risk:
-        _print("AICODE_ACCEPT_CTX_RISK=1 已設 — 放行,但 prompt 超過 server ctx 會被 truncate")
+        _print("AICODE_ACCEPT_CTX_RISK=1 已設 — 放行,但 CodeTrail 與 server ctx 不一致")
         return 0
 
     _print("refuse to start.")

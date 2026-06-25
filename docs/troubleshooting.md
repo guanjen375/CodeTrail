@@ -268,7 +268,16 @@ aicode
 
 ### `[ctx-safety] refuse to start.` 啟動被擋
 
-代表 frontend wrapper 讀了主 llama-server 的 `/props`,發現你要求的 `AICODE_DYNAMIC_NUM_CTX_MAX` 大於 server 啟動時的 `-c <N>`。輸出長這樣:
+> **一條規則就夠**:`AICODE_DYNAMIC_NUM_CTX_MAX`、llama-server 的 `-c <N>`、OpenCode active model 的 `limit.context` **三個數字必須完全相同**。aicode 啟動時的兩道檢查——`[ctx-safety]` 比 `AICODE_DYNAMIC_NUM_CTX_MAX` 跟 server `-c`、`[ctx-align]` 比 `AICODE_DYNAMIC_NUM_CTX_MAX` 跟 `limit.context`——任一不等就拒絕。**修法永遠一樣:挑一個數字,三處都改成它。**
+>
+> 為什麼非得一致:OpenCode TUI 的主對話**不經過 CodeTrail**、直接打 llama-server,它的真實 ctx 只由 server `-c` 和 `limit.context` 決定;`AICODE_DYNAMIC_NUM_CTX_MAX` 只管 CodeTrail 自己的 MCP / RAG 呼叫。三個不一致,TUI 和 MCP 就在不同 ctx 預算下各做各的。
+
+這道 `[ctx-safety]` 比的是 `AICODE_DYNAMIC_NUM_CTX_MAX` 跟 server 真實 `-c`,兩個方向都擋:
+
+- `AICODE_DYNAMIC_NUM_CTX_MAX` **大於** server `-c` → 標 `UNSAFE`:超過 server 真實上限,prompt 會被截斷(真正危險)。
+- `AICODE_DYNAMIC_NUM_CTX_MAX` **小於** server `-c` → 標 `MISMATCH`:不會截斷,但 server 多出來的 ctx 用不到,且 OpenCode TUI / CodeTrail MCP 兩邊預算容易各走各的。
+
+`UNSAFE` 輸出長這樣:
 
 ```
 [ctx-safety] UNSAFE: model=<CODE_MODEL> requested_ctx=65532
@@ -293,6 +302,8 @@ llama-server -m ~/models/<MODEL>.gguf --host 0.0.0.0 --port 8080 -c 65532 -ngl 9
 aicode
 ```
 
+`MISMATCH`(小於 server `-c`)反方向修即可:把 `AICODE_DYNAMIC_NUM_CTX_MAX` 提高到 server `-c`,或用較小的 `-c` 重啟 server。工具印出的 `(a)/(b)` 已帶好數字。
+
 如果你確認要硬跑(例如想實測 truncation 的影響),用一次性放行:
 
 ```bash
@@ -316,11 +327,9 @@ AICODE_MODEL=<CODE_MODEL> python scripts/ctx_safety_check.py
 
 ### `[ctx-align] MISMATCH` 啟動被擋
 
-代表 OpenCode active model 的 `limit.context` 跟 CodeTrail 的
-`AICODE_DYNAMIC_NUM_CTX_MAX` 不一致。典型情況是 llama-server / CodeTrail 已經是
-64K,但 opencode.json 還留在 32K,所以 TUI 會提早 compact。
+同一條規則的另一道檢查:OpenCode active model 的 `limit.context` 跟 `AICODE_DYNAMIC_NUM_CTX_MAX` 不一致。典型情況是 server / CodeTrail 已經是 64K,但 opencode.json 還留在 32K,TUI 會提早 compact。
 
-處理方式是把三個值對齊:
+一樣把三個數字對齊:
 
 ```bash
 # server 真實上限

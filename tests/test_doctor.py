@@ -425,3 +425,42 @@ def test_check_rerank_policy_prints_current_policy(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "RAG reranker: not reachable -> RAG rerank fallback = embedding" in out
     assert "does not call the main model" in out
+
+
+class _FakeCfg:
+    """最小 config 替身,讓 doctor 的 internal_ctx_cap 計算可控。"""
+
+    def __init__(self, dyn_max: int) -> None:
+        self.NUM_CTX = dyn_max
+        self.DYNAMIC_NUM_CTX_ENABLED = True
+        self.DYNAMIC_NUM_CTX_MAX = dyn_max
+
+
+def _server_status(n_ctx: int) -> dict:
+    return {"main": {"props": {"default_generation_settings": {"n_ctx": n_ctx}}}}
+
+
+def test_main_server_ctx_alignment_warns_on_mismatch(monkeypatch):
+    """server n_ctx != internal ctx cap → WARN(aicode 啟動時會 hard-refuse)。"""
+    monkeypatch.setattr(doc, "_read_config", lambda: _FakeCfg(32768))
+    r = doc.Result()
+    doc.check_main_server_ctx_alignment(r, _server_status(65536))
+    assert not r.fails
+    assert any("65536" in w and "32768" in w for w in r.warns), r.warns
+
+
+def test_main_server_ctx_alignment_ok_when_equal(monkeypatch):
+    """server n_ctx == internal ctx cap → PASS,不 warn。"""
+    monkeypatch.setattr(doc, "_read_config", lambda: _FakeCfg(65536))
+    r = doc.Result()
+    doc.check_main_server_ctx_alignment(r, _server_status(65536))
+    assert not r.fails
+    assert not r.warns
+    assert any("一致" in p for p in r.passes), r.passes
+
+
+def test_main_server_ctx_alignment_skips_without_server():
+    """沒有 main server(--no-network / 未啟動)→ 完全跳過,不擾健檢。"""
+    r = doc.Result()
+    doc.check_main_server_ctx_alignment(r, {})
+    assert not r.fails and not r.warns and not r.passes
