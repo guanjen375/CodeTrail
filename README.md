@@ -255,6 +255,8 @@ HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
 
 CodeTrail 的內建 VL key 是 `qwen3-vl`。目前不需要替換:Qwen3-VL 有官方 GGUF 與 mmproj,適合本專案的截圖、UI 錯誤畫面與圖片 ingestion。預設 launcher 會找 Qwen3-VL 8B Instruct Q4_K_M + F16 mmproj;若你要用別的相容 VL GGUF,啟動前設定 `VL_GGUF` / `VL_MMPROJ`。
 
+> 「圖片 ingestion」就是 **VL + RAG 一起用**:`ingest_document(...)` 餵圖片時會自動呼叫 VL 把圖看成文字、再切 chunk 進知識庫,所以截圖/架構圖/規格頁能變成之後 `query_knowledge(...)` 查得到的內容。一次性看圖用 `analyze_file(...)`,要長期反覆查改用 `ingest_document(...)`;完整串接見 [docs/rag.md](docs/rag.md)。
+
 ```bash
 HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
   Qwen/Qwen3-VL-8B-Instruct-GGUF \
@@ -684,6 +686,16 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 
 如果想驗證工具有沒有連上:OpenCode TUI 輸入 `/status`,應看到 `codetrail Connected`;Codex TUI 輸入 `/mcp`,應看到 `codetrail` connected。
 
+想把**圖片**(截圖、架構圖、規格頁掃描)變成之後查得到的知識,就是「VL + RAG 一起用」—— `ingest_document` 餵圖片時會自動走 VL 把圖抽成文字再進 RAG,跟 PDF 走同一套:
+
+```text
+請用工具 ingest_document 匯入 docs/diagram.png,
+完成後 reload_knowledge_base,
+再用 query_knowledge 查這張圖的重點,回答附 REF。
+```
+
+(圖片附件需要 VL server :8083 已啟動。聊天截圖模式、外部圖片匯入、binary/ELF 等完整串接見 [docs/rag.md](docs/rag.md)。)
+
 更多操作模式(夾帶附件、注入 RAG、查 spec)見 [docs/basic-usage.md](docs/basic-usage.md);完整 17 個工具清單見 [docs/mcp-tools.md](docs/mcp-tools.md)。
 
 ### 5.4 Web 模式(目前測試中)
@@ -727,7 +739,7 @@ ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>
 |---|---|
 | [docs/setup.md](docs/setup.md) | 替代安裝方式、進階配置、換機部署 reference |
 | [docs/basic-usage.md](docs/basic-usage.md) | TUI 內常用操作:正常對話、夾帶附件、RAG 注入、最小驗收流程 |
-| [docs/rag.md](docs/rag.md) | 讀檔、匯入附件、建立知識庫、Code-RAG、查 spec |
+| [docs/rag.md](docs/rag.md) | 讀檔、匯入附件(PDF / 圖片經 VL)、建立知識庫、圖片+RAG 一起用、Code-RAG、查 spec |
 | [docs/mcp-tools.md](docs/mcp-tools.md) | CodeTrail 暴露的 17 個 MCP 工具與使用原則 |
 | [docs/security.md](docs/security.md) | 沙箱邊界、OpenCode permission、外部匯入與 NDA 資料注意事項 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | `/status` / `/mcp`、ctx-safety、server 不可連、Blackwell CUDA、MoE 首字慢 |

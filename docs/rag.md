@@ -182,6 +182,41 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 batch size 上限是 32 (REF1)。
 ```
 
+#### 圖片附件：讓 VL 看圖，再進 RAG
+
+前面三步示範的是 PDF／文字。**圖片附件（截圖、架構圖、被拍成圖的 datasheet 頁）走的是同一個 `ingest_document`，只是中間多一段 VL**：`auto` 模式看到 `.png` / `.jpg` 這類副檔名，會自動呼叫 VL server（:8083）把圖看成文字說明，再切 chunk、算 embedding 寫進 `knowledge.json`。所以「VL 看圖」和「RAG 查得到」不是兩個要分開操作的功能，而是同一條管線的前後段。
+
+兩個工具都會用到 VL，差別只在會不會進知識庫：
+
+| 你要的 | 用哪個 | 進 RAG？ |
+|---|---|---|
+| 只看這張圖一次，看完就丟 | `analyze_file('diagram.png')` | ✗ 只在這一輪對話 |
+| 看完還要之後反覆查 | `ingest_document('diagram.png')` → `reload_knowledge_base()` | ✓ VL 抽完寫進 knowledge.json |
+
+圖片在專案目錄內（建議放 `docs/`）直接 ingest，之後就查得到：
+
+```text
+請用工具 ingest_document 匯入 docs/npu_block_diagram.png，
+完成後 reload_knowledge_base，回報載入幾個 chunks。
+```
+
+```text
+請用 query_knowledge 查這張方塊圖裡 DMA 跟 SRAM 怎麼連，結論附 REF。
+```
+
+圖片在專案外（例如 `~/Downloads` 的截圖），跟上面「同時處理外部附件並注入 RAG」一樣，只是把 PDF 換成圖片 —— 先 `import_external_file` 帶進沙箱再 ingest：
+
+```text
+請用工具 import_external_file 匯入 ~/Downloads/error_screen.png，
+對回傳的新路徑做 analyze_file 讓我這一輪先看到畫面，
+再對同一個新路徑做 ingest_document，最後 reload_knowledge_base。
+```
+
+兩個常踩的點：
+
+- **預設走「技術圖片」路徑**（架構圖／流程圖／記憶體圖），抽的是畫面說明。若這張是**聊天截圖**、想抽的是對話內容，要顯式 `ingest_document('teams.png', mode='chat')`。
+- chunks 回報 0，圖片來源最常見的原因是 **VL server（:8083）沒起來** —— 圖片分析失敗就切不出內容。先跑 `python scripts/required_model_servers_check.py` 看 image_data probe。
+
 #### 規格題、數字題用嚴格模式
 
 「最大值是多少」「預設值是什麼」「reset 訊號最少要拉幾毫秒」這種**答錯比不答更糟**的題目，改用 `query_knowledge_strict`：
