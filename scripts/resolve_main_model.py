@@ -8,7 +8,9 @@ Priority:
   3. OPENCODE_CONFIG, then ~/.config/opencode/opencode.json
 
 Env and CLI may both be present only when they resolve to the same bare model
-name (or GGUF path). 這避免 OpenCode TUI 和 CodeTrail MCP 各自用不同模型。
+name (or GGUF path). If env is used without CLI, opencode.json must also match
+when present, because OpenCode will still read opencode.json for the TUI model.
+這避免 OpenCode TUI 和 CodeTrail MCP 各自用不同模型。
 """
 from __future__ import annotations
 
@@ -81,6 +83,20 @@ def main(argv: list[str] | None = None) -> int:
             f"{env_res.model!r} != {cli_res.model!r}. "
             "Use one model for both OpenCode TUI and CodeTrail MCP."
         )
+
+    if env_res and env_res.model and not cli_res:
+        oc_res = resolve_opencode_main_model(os.environ)
+        if oc_res.error:
+            where = f" ({oc_res.path})" if oc_res.path else ""
+            return _fail(f"{oc_res.source}{where}: {oc_res.error}")
+        if oc_res.model and oc_res.model != env_res.model:
+            where = f" ({oc_res.path})" if oc_res.path else ""
+            return _fail(
+                "AICODE_MODEL and opencode.json model point to different models"
+                f"{where}: {env_res.model!r} != {oc_res.model!r}. "
+                "Either update opencode.json, unset AICODE_MODEL, or launch with "
+                "-m/--model so OpenCode and CodeTrail receive the same model."
+            )
 
     if env_res and env_res.model:
         print(env_res.model, flush=True)

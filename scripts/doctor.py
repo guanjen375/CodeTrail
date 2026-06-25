@@ -36,6 +36,7 @@ from model_resolution import (  # noqa: E402
     resolve_main_model_from_env,
     resolve_opencode_main_model,
 )
+import opencode_context  # noqa: E402
 
 OK = "[PASS]"
 WARN = "[WARN]"
@@ -478,8 +479,9 @@ def check_opencode_model_config(r: Result) -> None:
         if env_overrides_global_config:
             r.warn(
                 msg
-                + f" — AICODE_MODEL={main_model} 已設定;aicode wrapper 會把 model 傳給 OpenCode,"
-                + " 但若要不帶 env 直接跑 opencode,仍需修正 OpenCode config。"
+                + f" — AICODE_MODEL={main_model} 已設定;新版 aicode 會在啟動時拒絕"
+                + " env/opencode 不一致。請修正 OpenCode config,或啟動時明確傳"
+                + " -m/--model 給 OpenCode。"
             )
         else:
             r.fail(msg)
@@ -511,7 +513,7 @@ def check_opencode_model_config(r: Result) -> None:
 
 
 def check_opencode_config_drift(r: Result, project: str | None) -> None:
-    """看 opencode.json 內 model.limit.context 跟 CodeTrail internal ctx cap 是否大致對齊。
+    """看 opencode.json active model 的 limit.context 跟 CodeTrail ctx cap 是否對齊。
 
     僅 warn,絕不自動改使用者設定。
     """
@@ -530,12 +532,6 @@ def check_opencode_config_drift(r: Result, project: str | None) -> None:
         r.info("找不到 opencode.json(沒走 OpenCode TUI 路線可忽略)")
         return
 
-    try:
-        oc = json.loads(found.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        r.warn(f"opencode.json 讀取失敗: {found} — {e}")
-        return
-
     cfg = _read_config()
     if isinstance(cfg, Exception):
         return
@@ -544,41 +540,24 @@ def check_opencode_config_drift(r: Result, project: str | None) -> None:
     dyn_max = int(getattr(cfg, "DYNAMIC_NUM_CTX_MAX", 0) or 0)
     internal_ctx_cap = dyn_max if dyn_on and dyn_max > 0 else num_ctx
 
-    # OpenCode 各 provider key 不固定 (openai-compat / llamacpp / 自選),
-    # 一律深掃所有 provider.*.models 找 limit.context。
-    providers = oc.get("provider") if isinstance(oc, dict) else None
-    mismatches = []
-    if isinstance(providers, dict):
-        for provider_key, provider_spec in providers.items():
-            if not isinstance(provider_spec, dict):
-                continue
-            models = provider_spec.get("models")
-            if not isinstance(models, dict):
-                continue
-            for model_id, spec in models.items():
-                if not isinstance(spec, dict):
-                    continue
-                limit = spec.get("limit") or {}
-                ctx = limit.get("context") if isinstance(limit, dict) else None
-                if (
-                    isinstance(ctx, int)
-                    and internal_ctx_cap
-                    and abs(ctx - internal_ctx_cap) > internal_ctx_cap * 0.5
-                ):
-                    mismatches.append(
-                        f"        provider={provider_key} model={model_id} limit.context={ctx}"
-                        f" 與 CodeTrail internal ctx cap={internal_ctx_cap} 差距 > 50%"
-                    )
+    env = {**os.environ, "OPENCODE_CONFIG": str(found)}
+    limit = opencode_context.resolve_active_opencode_context_limit(env, [])
+    if limit.error:
+        r.warn(f"opencode.json active model limit.context 讀取失敗: {found} — {limit.error}")
+        return
+    if limit.context is None:
+        r.info(f"opencode.json={found} active model 未設定 limit.context")
+        return
 
-    if mismatches:
+    if internal_ctx_cap and limit.context != internal_ctx_cap:
         r.warn(
-            f"opencode.json={found} 與 CodeTrail num_ctx 設定差距大:\n"
-            + "\n".join(mismatches)
-            + "\n        提醒:兩條管線(OpenCode TUI 與 CodeTrail native)各自獨立,"
-              "不會自動同步;手動對齊或接受兩邊的不同。"
+            f"opencode.json={found} active model={limit.raw_model or limit.model} "
+            f"limit.context={limit.context} 與 CodeTrail ctx cap={internal_ctx_cap} 不一致。\n"
+            "        aicode 啟動時會拒絕這種不一致;請對齊 opencode.json limit.context "
+            "或 AICODE_DYNAMIC_NUM_CTX_MAX。"
         )
     else:
-        r.ok(f"opencode.json={found} model limit.context 與 internal ctx cap 一致(或未設)")
+        r.ok(f"opencode.json={found} active model limit.context 與 internal ctx cap 一致")
 
 
 def check_aicode_root(r: Result, project: str | None) -> None:

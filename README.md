@@ -41,7 +41,7 @@ README 的命令範例以 Ubuntu / Debian shell 為主。`aicode` 是 bash wrapp
 > 1. **每個新 shell 都要先 `source <CODETRAIL_REPO>/.venv/bin/activate`** —— 沒 activate venv,`aicode` / `aicodex` / web 起的 CodeTrail MCP 會 `ModuleNotFoundError: No module named 'mcp'`。嫌煩就寫進 `~/.bashrc`(§1.3)。
 > 2. **四個 llama-server 都要起**:main `8080` + embedding `8081` + reranker `8082` + VL `8083`。三顆副模型是硬性需求,缺一個啟動前 preflight 就擋下;reranker 預設不降級。見 §3。
 > 3. **不要從 `$HOME` 或 `/` 啟動** —— 沙箱會直接拒絕。先 `cd` 進你要分析的**具體專案目錄**再跑。
-> 4. **換模型是三件獨立的事**:TUI 按 `/models` 只切 OpenCode 的 model id,**不會 reload llama-server、也不會通知 CodeTrail MCP**。真要換 → 停 server、載新 GGUF、重啟 server、改 `AICODE_MODEL`、重啟 `aicode`。
+> 4. **換模型是三件獨立的事**:TUI 按 `/models` 只切 OpenCode 的 model id,**不會 reload llama-server、也不會通知 CodeTrail MCP**。真要換 → 停 server、載新 GGUF、重啟 server、對齊 opencode.json 的 `model` / `limit.context`、`AICODE_MODEL` / `AICODE_DYNAMIC_NUM_CTX_MAX`,再重啟 `aicode`。
 > 5. **CodeTrail 沙箱鎖在「你啟動的那個資料夾」(`AICODE_ROOT`)** —— 綁在 process 上,**不會跟著你在 UI 切資料夾或切對話而移動**。web UI 那顆「切換資料夾」按鈕對 CodeTrail 無效(切過去還是只讀啟動目錄)。換專案 = 到那個目錄重新啟動一個(TUI 重開 `aicode`;web 另起一個 backend)。
 > 6. **web 模式目前是實驗性的(開發中)** —— 穩定、proven 的主力是 standalone TUI(`aicode` / `aicodex`);web 用來瀏覽器續問歷史 session,行為可能還會變。要可靠就用 TUI。
 > 7. **CodeTrail 沙箱只蓋它那 17 個 MCP 工具** —— OpenCode 內建的 `bash` / `read` / `write` 不走這層,所以範本把它們全 `deny`,**別放寬那份 permission**。分析不信任 repo 時,連被分析 repo 自帶的 `opencode.json` 都可能翻掉你的鎖定(防法:`OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode`,見 [docs/security.md](docs/security.md))。
@@ -301,7 +301,7 @@ tmux new -s codetrail-main
 ~/llama.cpp/build/bin/llama-server \
   -m ~/models/Qwen3-235B-A22B-Thinking-2507-GGUF/UD-Q4_K_XL/Qwen3-235B-A22B-Thinking-2507-UD-Q4_K_XL-00001-of-00003.gguf \
   --host 0.0.0.0 --port 8080 \
-  -c 65536 -ngl 99 --jinja \
+  -c 65532 -ngl 99 --jinja \
   --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.0 \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --n-cpu-moe 90 \
@@ -314,7 +314,7 @@ tmux new -s codetrail-main
 旗標說明:
 
 - `-m ...-00001-of-00003.gguf` —— 只指 shard 1,llama.cpp 自動接後續
-- `-c 65536` —— context 上限 64K token(模型原生 256K,KV cache 會吃 VRAM,先從 64K 起)
+- `-c 65532` —— context 上限約 64K token(模型原生 256K,KV cache 會吃 VRAM,先從 64K 起)
 - `-ngl 99` —— 嘗試把所有層放 GPU(MoE expert 之後會被 `--n-cpu-moe` 拉回 CPU)
 - `--jinja` —— 啟用模型內建 chat template,tool calling 才會走對格式
 - `--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0` —— **Qwen3-235B-A22B-Thinking-2507 官方建議取樣值**。llama-server 不帶這些旗標時的內建預設是 `temp 0.8 / top_k 40 / min_p 0.05`,溫度偏高會讓模型更容易「自由發揮」杜撰不存在的具體事實(條號 / 日期 / 數字)。**這條同時也是 OpenCode TUI 純聊天路徑的取樣來源** —— OpenCode 的 openai-compatible provider 無法可靠地逐次帶取樣參數(`temperature` 有已知 bug 會被丟掉,`top_k` / `min_p` 不在它的 schema 裡),所以唯一可靠的釘法就是這裡的 server 啟動旗標。**改了要重啟 server 才生效**。詳見 [docs/troubleshooting.md](docs/troubleshooting.md)
@@ -504,7 +504,7 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
       "models": {
         "<CODE_MODEL>": {
           "name": "<CODE_MODEL>",
-          "limit": { "context": 32768, "output": 8192 }
+          "limit": { "context": 65532, "output": 8192 }
         }
       }
     }
@@ -559,7 +559,7 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
 - `apiKey` 任意非空值即可,llama-server 預設不檢查。
 - **取樣參數(temperature / top_p / top_k / min_p)不要寫在這裡指望它生效**。OpenCode 的 openai-compatible provider 對自訂 provider 有已知問題:`temperature` 會被丟掉、不送進 request body([opencode#25755](https://github.com/anomalyco/opencode/issues/25755)),而 `top_k` / `min_p` 根本不在 OpenCode 的 schema 裡。**取樣一律在 §3.1 的 llama-server 啟動旗標釘**(`--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0`);OpenCode 純聊天不帶取樣時就會吃到 server 的正確預設。
 - **要壓「模型杜撰不存在的具體事實」(條號 / 日期 / 數字),在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則**(OpenCode 會自動把它載入每一段對話,含純聊天)。範例與原理見 [docs/troubleshooting.md](docs/troubleshooting.md)。注意這個 `~/.config/opencode/AGENTS.md` 是 OpenCode runtime 的全域規則檔,跟本 repo 根目錄那份「給修改 CodeTrail 原始碼的 agent 看的」`AGENTS.md` 是兩回事。
-- `limit.context: 32768` 是 OpenCode 主對話實際塞給 server 的上限。可以等於 server `-c`(64K),但留一半做 output / 不擠爆比較穩。
+- `limit.context: 65532` 是 OpenCode 主對話實際塞給 server 的上限。它應該跟 `AICODE_DYNAMIC_NUM_CTX_MAX` 對齊,且不得超過 llama-server 啟動時的 `-c <N>`;`aicode` 會在啟動時檢查這件事。
 - `permission` 區段:`*: deny` 是預設拒絕一切,只白名單 `codetrail_*`(經 CodeTrail 沙箱)。OpenCode 內建工具(`bash` / `read` / `write` 等)會繞過 CodeTrail 沙箱,所以這裡明確 `deny`。
 
 貼完先驗 JSON 格式:
@@ -605,7 +605,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
-`aicode` 做的事:把目前目錄設成 `AICODE_ROOT`(沙箱根目錄)、拒絕從 `$HOME` 或 `/` 起、在當前 git root 準備 `.opencode/run-codetrail-mcp` 讓 OpenCode 的 MCP command 找得到、啟動前跑 ctx safety check 確認 `AICODE_DYNAMIC_NUM_CTX_MAX` 沒超過 server `-c`、最後啟 `opencode`。
+`aicode` 做的事:把目前目錄設成 `AICODE_ROOT`(沙箱根目錄)、拒絕從 `$HOME` 或 `/` 起、在當前 git root 準備 `.opencode/run-codetrail-mcp` 讓 OpenCode 的 MCP command 找得到、啟動前確認 `AICODE_DYNAMIC_NUM_CTX_MAX` 沒超過 server `-c` 且 OpenCode active model `limit.context` 已對齊、最後啟 `opencode`。
 
 ### 4.5 安裝 `aicodex` 啟動指令
 

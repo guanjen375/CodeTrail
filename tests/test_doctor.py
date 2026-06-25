@@ -385,10 +385,11 @@ def test_check_opencode_config_drift_warns_on_mismatch(monkeypatch, tmp_path):
     monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", True)
     monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_MAX", 32768)
 
-    # opencode.json with provider.llamacpp.models[xxx].limit.context = 4096 (huge gap)
+    # opencode.json active model limit.context differs from CodeTrail cap.
     oc_path = tmp_path / "opencode.json"
     oc_path.write_text(
         json.dumps({
+            "model": "llamacpp/my-model",
             "provider": {
                 "llamacpp": {
                     "models": {

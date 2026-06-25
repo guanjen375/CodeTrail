@@ -233,7 +233,8 @@ llama-server 啟動時 `-c <N>` 已經把 ctx + KV cache 鎖死,所以 doctor / 
 | 模組 / 入口 | 責任 |
 |---|---|
 | `gpu_safety.py` | 純 library:`query_gpu_info()` 跑 nvidia-smi 拿 GPU info(純診斷)、`query_server_info()` 打 llama-server `/props` 抓 `default_generation_settings.n_ctx` + `model_path`、`check_safety(requested_ctx, base_url)` 比對後包成 `SafetyVerdict`。所有 I/O 都用 hook 參數注入,測試可完全離線 mock。 |
-| `scripts/ctx_safety_check.py` | CLI 入口。讀 env (`AICODE_MODEL` 必填; 沒設 / placeholder 直接 exit 2 — CodeTrail 不假定預設主模型 / `AICODE_DYNAMIC_NUM_CTX_MAX` / `AICODE_LLAMA_BASE_URL`),呼 `gpu_safety.check_safety()`,根據 verdict 與 `AICODE_ACCEPT_CTX_RISK` / `AICODE_CTX_SAFETY_DISABLE` 決定 exit code。`aicode` wrapper 在 exec opencode 前跑這個,exit 2 = refuse to start。aicode wrapper 啟動時會先用 `scripts/resolve_main_model.py` 把 env / CLI 旗標 / opencode.json 三條優先序解析成 bare model name 並 export AICODE_MODEL,所以這支 script 拿到的一定是已解析好的值。 |
+| `scripts/ctx_safety_check.py` | CLI 入口。讀 env (`AICODE_MODEL` 必填; 沒設 / placeholder 直接 exit 2 — CodeTrail 不假定預設主模型 / `AICODE_DYNAMIC_NUM_CTX_MAX` / `AICODE_LLAMA_BASE_URL`),呼 `gpu_safety.check_safety()`,根據 verdict 與 `AICODE_ACCEPT_CTX_RISK` / `AICODE_CTX_SAFETY_DISABLE` 決定 exit code。`aicode` wrapper 在 exec opencode 前跑這個,exit 2 = refuse to start。aicode wrapper 啟動時會先用 `scripts/resolve_main_model.py` 把 env / CLI 旗標 / opencode.json 解析成 bare model name 並 export AICODE_MODEL；若 `AICODE_MODEL` 和 opencode.json 同時存在且沒有 CLI `-m/--model` override,兩者必須指向同一顆,避免 TUI 與 MCP 用不同模型。 |
+| `opencode_context.py` / `scripts/opencode_ctx_check.py` | 解析 OpenCode active model 的 `provider.*.models.*.limit.context`,並在 `aicode` 啟動前確認它等於 `AICODE_DYNAMIC_NUM_CTX_MAX`。這守的是「OpenCode TUI 會不會提早 compact / 和 CodeTrail MCP 使用不同 ctx 預算」。`AICODE_ACCEPT_CTX_RISK=1` 可一次性放行,`AICODE_CTX_SAFETY_DISABLE=1` 可跳過。 |
 | `context_budget.py::_emit_runtime_offload_check_once` | runtime 觀測 hook:`[CTX] WARNING` 或 `[CTX_OVERFLOW]` 觸發時順手查一次 `/slots` + `/props`,把 server 真實 n_ctx / 忙碌 slot 數 黏在 log 後面。每個 process 只跑一次,任何錯誤靜默吞掉。 |
 
 ### 設計守則

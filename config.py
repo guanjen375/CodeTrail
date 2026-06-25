@@ -210,7 +210,7 @@ NUM_CTX_FULL_MODE = NUM_CTX
 #   「調 env var = 真的改上限」這件事語意一致。
 DYNAMIC_NUM_CTX_ENABLED = True
 DYNAMIC_NUM_CTX_MIN = 16384      # 最小 16K
-DYNAMIC_NUM_CTX_MAX = int(_os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX", "65536"))
+DYNAMIC_NUM_CTX_MAX = int(_os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX", "65532"))
 DYNAMIC_NUM_CTX_BUFFER = 1.3     # 預留空間給回答（調整: 1.5->1.3）
 CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
 

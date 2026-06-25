@@ -271,12 +271,12 @@ aicode
 代表 frontend wrapper 讀了主 llama-server 的 `/props`,發現你要求的 `AICODE_DYNAMIC_NUM_CTX_MAX` 大於 server 啟動時的 `-c <N>`。輸出長這樣:
 
 ```
-[ctx-safety] UNSAFE: model=<CODE_MODEL> requested_ctx=65536
-        requested ctx=65536 超過 llama-server 啟動時的 -c 8192 (http://localhost:8080) — 多出來的 prompt 會被截斷
+[ctx-safety] UNSAFE: model=<CODE_MODEL> requested_ctx=65532
+        requested ctx=65532 超過 llama-server 啟動時的 -c 8192 (http://localhost:8080) — 多出來的 prompt 會被截斷
         ...
         建議任一處理:
           (a) export AICODE_DYNAMIC_NUM_CTX_MAX=8192  (對齊 server n_ctx)
-          (b) 重啟 llama-server 並提高 `-c 65536` (確認 VRAM 夠)
+          (b) 重啟 llama-server 並提高 `-c 65532` (確認 VRAM 夠)
 ```
 
 兩條路:
@@ -289,7 +289,7 @@ aicode
 
 # 路徑 B: 停掉舊 server,用新 -c 重啟,把 server 上限拉大
 pkill -f "llama-server.*--port 8080"
-llama-server -m ~/models/<MODEL>.gguf --host 0.0.0.0 --port 8080 -c 65536 -ngl 99 &
+llama-server -m ~/models/<MODEL>.gguf --host 0.0.0.0 --port 8080 -c 65532 -ngl 99 &
 aicode
 ```
 
@@ -314,6 +314,28 @@ AICODE_MODEL=<CODE_MODEL> python scripts/ctx_safety_check.py
 
 `<CODE_MODEL>` 是佔位符,必須替換成實際模型名稱或 GGUF 路徑。
 
+### `[ctx-align] MISMATCH` 啟動被擋
+
+代表 OpenCode active model 的 `limit.context` 跟 CodeTrail 的
+`AICODE_DYNAMIC_NUM_CTX_MAX` 不一致。典型情況是 llama-server / CodeTrail 已經是
+64K,但 opencode.json 還留在 32K,所以 TUI 會提早 compact。
+
+處理方式是把三個值對齊:
+
+```bash
+# server 真實上限
+curl -s http://localhost:8080/props | jq '.default_generation_settings.n_ctx'
+
+# CodeTrail MCP / RAG 上限
+export AICODE_DYNAMIC_NUM_CTX_MAX=65532
+
+# OpenCode TUI 上限
+# ~/.config/opencode/opencode.json:
+#   provider.<你的 provider>.models.<active model>.limit.context = 65532
+```
+
+若只是一次性實驗,可以用 `AICODE_ACCEPT_CTX_RISK=1 aicode` 放行,但不建議長期這樣跑。
+
 ### llama-server 不可連 / 404
 
 代表對應 server 沒啟動,或 port 設錯。先 curl 試:
@@ -335,7 +357,7 @@ curl -s http://localhost:8080/props | jq '.model_path, .default_generation_setti
 
 ### `aicode` 拒絕啟動,訊息說「主模型未設定」
 
-CodeTrail 不內建主聊天 / 程式推導模型,沒設好 `aicode` 會 fail-loud。任選一種設定方式(擇一即可):
+CodeTrail 不內建主聊天 / 程式推導模型,沒設好 `aicode` 會 fail-loud。任選一種設定方式:
 
 ```bash
 # 1) 環境變數 (最優先)
@@ -348,6 +370,8 @@ aicode -m <CODE_MODEL>
 ```
 
 `<CODE_MODEL>` 是 MODEL_REGISTRY 裡的 bare name 或 GGUF 絕對路徑。如果你看到「placeholder」相關錯誤,通常是值還停留在 `<CODE_MODEL>` 或 `<MODEL>` 沒換掉;看到「外部 provider prefix」錯誤代表你還在用 `ollama/foo` 那種舊寫法,改成 bare name 或你 opencode.json 裡 custom provider 的 prefix。
+
+若 `AICODE_MODEL` 和 opencode.json 同時存在,且啟動時沒有傳 `-m/--model`,兩者必須指向同一顆 bare model。這是刻意 fail-loud,避免 OpenCode TUI 用 A 模型、CodeTrail MCP tools 用 B 模型。
 
 ### MODEL 解析到 GGUF 路徑但檔案不存在
 

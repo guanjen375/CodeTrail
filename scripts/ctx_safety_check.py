@@ -10,7 +10,7 @@ ctx 上限比對。requested > server n_ctx → UNSAFE。
     AICODE_MODEL                  必填;aicode wrapper 會用 resolve_main_model.py
                                   解析好以後再 export。沒設 → 直接 fail-loud,
                                   CodeTrail 不假定任何預設主模型。
-    AICODE_DYNAMIC_NUM_CTX_MAX    要檢查的 ctx 上限;預設 65536 (跟 config.py 同)
+    AICODE_DYNAMIC_NUM_CTX_MAX    要檢查的 ctx 上限;預設 65532 (跟 config.py 同)
     AICODE_LLAMA_BASE_URL         主 llama-server URL;預設 http://localhost:8080
     AICODE_ACCEPT_CTX_RISK        =1 時即使 UNSAFE 也 exit 0 (使用者覆蓋)
     AICODE_CTX_SAFETY_DISABLE     =1 時整個檢查跳過 (除錯 / 緊急逃生)
@@ -39,7 +39,7 @@ import gpu_safety  # noqa: E402
 from model_resolution import normalize_main_model  # noqa: E402
 
 
-DEFAULT_CTX_MAX = 65536
+DEFAULT_CTX_MAX = 65532
 
 
 def _print(line: str) -> None:

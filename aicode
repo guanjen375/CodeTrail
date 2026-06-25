@@ -190,6 +190,13 @@ if [ -f "$CODETRAIL_HOME/scripts/ctx_safety_check.py" ]; then
   fi
 fi
 
+if [ -f "$CODETRAIL_HOME/scripts/opencode_ctx_check.py" ]; then
+  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/opencode_ctx_check.py" "$@"; then
+    echo "[aicode] OpenCode ctx alignment check refused to start (see [ctx-align] above)." >&2
+    exit 2
+  fi
+fi
+
 if [ -f "$CODETRAIL_HOME/scripts/required_model_servers_check.py" ]; then
   if ! "$PYBIN" "$CODETRAIL_HOME/scripts/required_model_servers_check.py"; then
     echo "[aicode] required model server preflight refused to start (see [model-preflight] above)." >&2
@@ -222,6 +229,7 @@ if [ -n "${AICODE_LLAMA_BASE_URL:-}" ]; then
 fi
 echo "[aicode] NOTE: 要調 per-call ctx 上限,改 AICODE_DYNAMIC_NUM_CTX_MAX (受 server -c 限制)。"
 echo "         llama-server 啟動時 -c <N> 是真實 ctx 上限,改了要重啟 server。"
+echo "         OpenCode active model 的 limit.context 也必須對齊 AICODE_DYNAMIC_NUM_CTX_MAX。"
 echo "         Check loaded model with: curl -s \${AICODE_LLAMA_BASE_URL:-http://localhost:8080}/props"
 echo "         CodeTrail context overflow attempts are logged to .codetrail/context_metrics.jsonl"
 

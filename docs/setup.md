@@ -65,7 +65,7 @@ Type=simple
 ExecStart=/home/%u/llama.cpp/build/bin/llama-server \
   -m /home/%u/models/.../shard-00001-of-00003.gguf \
   --host 0.0.0.0 --port 8080 \
-  -c 65536 -ngl 99 --jinja \
+  -c 65532 -ngl 99 --jinja \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --n-cpu-moe 90 --no-mmap
 Restart=on-failure
@@ -125,7 +125,7 @@ AICODE_DYNAMIC_NUM_CTX_MAX=32768 \
 aicode
 ```
 
-同時把 `~/.config/opencode/opencode.json` 的 provider `baseURL` 改成 `http://<GPU_HOST>:8080/v1`。
+同時把 `~/.config/opencode/opencode.json` 的 provider `baseURL` 改成 `http://<GPU_HOST>:8080/v1`,並把 active model 的 `limit.context` 設成同一個值(上例是 32768)。
 
 **安全提醒**:llama-server 預設不檢查 API key,等於任何能連到 GPU 主機 8080 的人都能用你的模型。**只能指向可信內網 / VPN 主機**,不要把 8080 暴露公網。需要鎖住的話加反向代理(nginx / caddy)做 basic auth,或用 SSH tunnel:
 
@@ -139,14 +139,16 @@ ssh -L 8080:localhost:8080 -L 8081:localhost:8081 -L 8082:localhost:8082 -L 8083
 
 ## `aicode` wrapper 詳細行為
 
-`aicode` 是一個 shell wrapper,啟動 `opencode` 之前做六件事:
+`aicode` 是一個 shell wrapper,啟動 `opencode` 之前做八件事:
 
 1. 把目前目錄設成 `AICODE_ROOT`(沙箱根)
 2. 拒絕 `AICODE_ROOT=/` 或 `AICODE_ROOT=$HOME`(可能誤刪 / 誤改大量檔案)
 3. 在目前 git root 準備 `.opencode/run-codetrail-mcp`,讓 OpenCode config 裡的 MCP command 能找到 CodeTrail server 入口
-4. 啟動前跑 `scripts/ctx_safety_check.py`,讀主 llama-server `/props` 拿真實 `n_ctx`,跟 `AICODE_DYNAMIC_NUM_CTX_MAX` 比對。requested > server 直接 `exit 2`,server 不可連時 graceful 放行只 warn
-5. 啟動 `opencode`,讓子行程繼承同一個沙箱根目錄
-6. 把使用者傳入的 `-m / --model` 原樣轉發給 OpenCode;沒傳就讓 OpenCode 自己讀 `opencode.json` 的 `"model"` 欄位
+4. 用 `scripts/resolve_main_model.py` 解析主模型；若 `AICODE_MODEL` 和 opencode.json 同時存在且沒傳 CLI `-m/--model`,兩者必須指向同一顆
+5. 啟動前跑 `scripts/ctx_safety_check.py`,讀主 llama-server `/props` 拿真實 `n_ctx`,跟 `AICODE_DYNAMIC_NUM_CTX_MAX` 比對。requested > server 直接 `exit 2`,server 不可連時 graceful 放行只 warn
+6. 跑 `scripts/opencode_ctx_check.py`,確認 OpenCode active model 的 `limit.context` 等於 `AICODE_DYNAMIC_NUM_CTX_MAX`,避免 TUI 32K compact 但 CodeTrail MCP 以為自己有 64K
+7. 啟動 `opencode`,讓子行程繼承同一個沙箱根目錄
+8. 把使用者傳入的 `-m / --model` 原樣轉發給 OpenCode;沒傳就讓 OpenCode 自己讀 `opencode.json` 的 `"model"` 欄位
 
 ---
 

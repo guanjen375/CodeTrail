@@ -422,7 +422,7 @@ def test_effective_ctx_uses_requested_value():
 
 
 def test_dynamic_max_respected_when_caller_clamps():
-    # Simulate caller clamping to DYNAMIC_NUM_CTX_MAX=65536 even though
+    # Simulate caller requesting a large ctx even though
     # AICODE_NUM_CTX = 131072. We should reflect the clamped value.
     usage = context_budget.build_usage(
         source="agent_tools",

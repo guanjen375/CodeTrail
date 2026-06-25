@@ -31,12 +31,32 @@ def _write_home_opencode(tmp_path: Path, model: str = "llamacpp/from-json") -> P
     return path
 
 
-def test_env_takes_priority_over_opencode_json(monkeypatch, tmp_path, capsys):
-    _write_home_opencode(tmp_path, "llamacpp/from-json")
+def test_env_and_opencode_json_same_model_allowed(monkeypatch, tmp_path, capsys):
+    _write_home_opencode(tmp_path, "llamacpp/from-env")
     monkeypatch.setenv("AICODE_MODEL", "from-env")
 
     assert rmm.main([]) == 0
     assert capsys.readouterr().out.strip() == "from-env"
+
+
+def test_env_and_opencode_json_conflict_fails(monkeypatch, tmp_path, capsys):
+    _write_home_opencode(tmp_path, "llamacpp/from-json")
+    monkeypatch.setenv("AICODE_MODEL", "from-env")
+
+    rc = rmm.main([])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "opencode.json" in err
+    assert "different models" in err
+
+
+def test_cli_model_may_override_opencode_json(monkeypatch, tmp_path, capsys):
+    _write_home_opencode(tmp_path, "llamacpp/from-json")
+    monkeypatch.setenv("AICODE_MODEL", "from-cli")
+
+    assert rmm.main(["--model", "llamacpp/from-cli"]) == 0
+    assert capsys.readouterr().out.strip() == "from-cli"
 
 
 def test_argv_overrides_opencode_json_when_env_missing(tmp_path, capsys):
