@@ -198,7 +198,7 @@ def check_safety(
         f"Server: {base_url}",
         f"Model:  {model_name or '(unknown)'}",
         f"Server n_ctx (啟動時 -c): {server.n_ctx}",
-        f"Requested ctx (AICODE_DYNAMIC_NUM_CTX_MAX): {requested_ctx}",
+        f"Requested ctx (CodeTrail budget, 自動跟隨 server n_ctx): {requested_ctx}",
         f"GPU: {gpu.name if gpu else '(no nvidia-smi)'}"
         + (f" total={vram_total_gb:.1f}GB free={vram_free_gb:.1f}GB" if gpu else ""),
     ]

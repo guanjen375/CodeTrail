@@ -268,41 +268,41 @@ aicode
 
 ### `[ctx-safety] refuse to start.` 啟動被擋
 
-> **一條規則就夠**:`AICODE_DYNAMIC_NUM_CTX_MAX`、llama-server 的 `-c <N>`、OpenCode active model 的 `limit.context` **三個數字必須完全相同**。aicode 啟動時的兩道檢查——`[ctx-safety]` 比 `AICODE_DYNAMIC_NUM_CTX_MAX` 跟 server `-c`、`[ctx-align]` 比 `AICODE_DYNAMIC_NUM_CTX_MAX` 跟 `limit.context`——任一不等就拒絕。**修法永遠一樣:挑一個數字,三處都改成它。**
+> **唯一真值是 server `-c`**:ctx 上限由 llama-server 啟動時的 `-c <N>` 決定。CodeTrail 端(`AICODE_DYNAMIC_NUM_CTX_MAX`)會在 `aicode` 啟動時**自動跟隨** server 的真實 `n_ctx`,你不用手動設它。**唯一要你手動對齊的是 OpenCode active model 的 `limit.context` 也要 == server `-c`**;`aicode` 啟動時的 `[ctx-align]` 會檢查這一個,不等就拒絕。
 >
-> 為什麼非得一致:OpenCode TUI 的主對話**不經過 CodeTrail**、直接打 llama-server,它的真實 ctx 只由 server `-c` 和 `limit.context` 決定;`AICODE_DYNAMIC_NUM_CTX_MAX` 只管 CodeTrail 自己的 MCP / RAG 呼叫。三個不一致,TUI 和 MCP 就在不同 ctx 預算下各做各的。
+> 為什麼這一個要手動顧:OpenCode TUI 的主對話**不經過 CodeTrail**、直接打 llama-server,CodeTrail 設不了它的 `limit.context`。設太小 TUI 會提早 compact、設太大會被 server 截斷。所以正常流程就兩步:設好 server `-c`、把 opencode.json 的 `limit.context` 設成同一個數字。
 
-這道 `[ctx-safety]` 比的是 `AICODE_DYNAMIC_NUM_CTX_MAX` 跟 server 真實 `-c`,兩個方向都擋:
+`[ctx-safety]` 是一道**容量閘**:確認 CodeTrail 端的 ctx 上限不會「超過」server 真實 `-c`(超過會截斷 prompt)。因為 CodeTrail 已自動跟隨 server,這道閘正常都是 `SAFE` 直接過;會被它擋下,通常代表你**自己手動**設了一個比 server `-c` 還大的 `AICODE_DYNAMIC_NUM_CTX_MAX`:
 
-- `AICODE_DYNAMIC_NUM_CTX_MAX` **大於** server `-c` → 標 `UNSAFE`:超過 server 真實上限,prompt 會被截斷(真正危險)。
-- `AICODE_DYNAMIC_NUM_CTX_MAX` **小於** server `-c` → 標 `MISMATCH`:不會截斷,但 server 多出來的 ctx 用不到,且 OpenCode TUI / CodeTrail MCP 兩邊預算容易各走各的。
+- `AICODE_DYNAMIC_NUM_CTX_MAX` **大於** server `-c` → 標 `UNSAFE`:超過 server 真實上限,prompt 會被截斷(真正危險)→ 拒絕啟動。
+- `AICODE_DYNAMIC_NUM_CTX_MAX` **小於等於** server `-c` → `SAFE` 放行(「小於」不是安全問題,不會截斷,只是沒用滿 server 容量)。
 
 `UNSAFE` 輸出長這樣:
 
 ```
-[ctx-safety] UNSAFE: model=<CODE_MODEL> requested_ctx=65532
-        requested ctx=65532 超過 llama-server 啟動時的 -c 8192 (http://localhost:8080) — 多出來的 prompt 會被截斷
+[ctx-safety] UNSAFE: model=<CODE_MODEL> requested_ctx=65536
+        requested ctx=65536 超過 llama-server 啟動時的 -c 8192 (http://localhost:8080) — 多出來的 prompt 會被截斷
         ...
         建議任一處理:
-          (a) export AICODE_DYNAMIC_NUM_CTX_MAX=8192  (對齊 server n_ctx)
-          (b) 重啟 llama-server 並提高 `-c 65532` (確認 VRAM 夠)
+          (a) 不要手動設 AICODE_DYNAMIC_NUM_CTX_MAX —— 拿掉它,
+              CodeTrail 會自動跟隨 server 真實 n_ctx (最省事)
+          (b) 或把 AICODE_DYNAMIC_NUM_CTX_MAX 設成 <= 8192
+          (c) 或重啟 llama-server 用更大的 `-c 65536` (確認 VRAM 夠)
 ```
 
-兩條路:
+最省事的修法就是 `(a)`:拿掉你手動設的覆寫,讓 CodeTrail 自動對齊 server。
 
 ```bash
-# 路徑 A: 把 CodeTrail 端的上限降到跟 server 一致
-export AICODE_DYNAMIC_NUM_CTX_MAX=8192
+# 路徑 A(推薦):拿掉手動覆寫,CodeTrail 自動跟隨 server n_ctx
+unset AICODE_DYNAMIC_NUM_CTX_MAX
 aicode
 # 或 aicodex --codetrail-model <LOCAL_MODEL>
 
-# 路徑 B: 停掉舊 server,用新 -c 重啟,把 server 上限拉大
+# 路徑 B: 真的想用更大的 ctx —— 那是 server 端的事,用更大的 -c 重啟,CodeTrail 會自動跟上
 pkill -f "llama-server.*--port 8080"
-llama-server -m ~/models/<MODEL>.gguf --host 0.0.0.0 --port 8080 -c 65532 -ngl 99 &
+llama-server -m ~/models/<MODEL>.gguf --host 0.0.0.0 --port 8080 -c 65536 -ngl 99 &
 aicode
 ```
-
-`MISMATCH`(小於 server `-c`)反方向修即可:把 `AICODE_DYNAMIC_NUM_CTX_MAX` 提高到 server `-c`,或用較小的 `-c` 重啟 server。工具印出的 `(a)/(b)` 已帶好數字。
 
 如果你確認要硬跑(例如想實測 truncation 的影響),用一次性放行:
 
@@ -327,20 +327,17 @@ AICODE_MODEL=<CODE_MODEL> python scripts/ctx_safety_check.py
 
 ### `[ctx-align] MISMATCH` 啟動被擋
 
-同一條規則的另一道檢查:OpenCode active model 的 `limit.context` 跟 `AICODE_DYNAMIC_NUM_CTX_MAX` 不一致。典型情況是 server / CodeTrail 已經是 64K,但 opencode.json 還留在 32K,TUI 會提早 compact。
+這就是上面說的「唯一要你手動對齊的數字」沒對齊:OpenCode active model 的 `limit.context` 跟 server 真實 `-c`(= CodeTrail 已自動跟隨的上限)不一致。典型情況是 server / CodeTrail 已經是 64K,但 opencode.json 還留在 32K,TUI 會提早 compact。
 
-一樣把三個數字對齊:
+修法很單純 —— 把 opencode.json 的 `limit.context` 改成 server `-c` 的值:
 
 ```bash
-# server 真實上限
-curl -s http://localhost:8080/props | jq '.default_generation_settings.n_ctx'
+# 先看 server 真實上限
+curl -s http://localhost:8080/props | jq '.default_generation_settings.n_ctx'   # 例:65536
 
-# CodeTrail MCP / RAG 上限
-export AICODE_DYNAMIC_NUM_CTX_MAX=65532
-
-# OpenCode TUI 上限
+# 再把 OpenCode active model 的 limit.context 設成同一個數字
 # ~/.config/opencode/opencode.json:
-#   provider.<你的 provider>.models.<active model>.limit.context = 65532
+#   provider.<你的 provider>.models.<active model>.limit.context = 65536
 ```
 
 若只是一次性實驗,可以用 `AICODE_ACCEPT_CTX_RISK=1 aicode` 放行,但不建議長期這樣跑。

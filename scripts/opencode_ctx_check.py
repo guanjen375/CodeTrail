@@ -57,17 +57,23 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     label = limit.raw_model or limit.model
+    # requested 正常 == server 真實 n_ctx (aicode 已用 resolve_server_ctx.py 自動帶入)。
+    # 所以這道閘等於在問:「OpenCode TUI 的 limit.context 有沒有跟 server -c 對齊?」
+    # 這是使用者唯一還要手動顧的數字 —— 因為 TUI 直接打 llama-server、繞過 CodeTrail,
+    # CodeTrail 沒辦法替它設。
     if limit.context == requested:
-        _print(f"SAFE: OpenCode model={label} limit.context={limit.context} == AICODE_DYNAMIC_NUM_CTX_MAX={requested}")
+        _print(f"SAFE: OpenCode model={label} limit.context={limit.context} == server ctx={requested}")
         return 0
 
     _print(f"MISMATCH: OpenCode model={label} limit.context={limit.context}")
-    _print(f"          AICODE_DYNAMIC_NUM_CTX_MAX={requested}")
-    _print("          這會讓 OpenCode TUI 和 CodeTrail MCP 在不同 ctx 預算下工作。")
+    _print(f"          CodeTrail ctx 上限 (= server 真實 n_ctx) = {requested}")
+    _print("          OpenCode TUI 直接打 llama-server、不經過 CodeTrail;limit.context 跟")
+    _print("          server -c 不一致時,TUI 會在跟 CodeTrail 不同的 ctx 預算下工作")
+    _print("          (太小會提早 compact、太大會被 server 截斷)。")
     _print("")
-    _print("          建議任一處理:")
+    _print("          建議任一處理 (把這兩個數字對齊):")
     _print(f"            (a) 把 opencode.json active model 的 limit.context 改成 {requested}")
-    _print(f"            (b) export AICODE_DYNAMIC_NUM_CTX_MAX={limit.context}")
+    _print("            (b) 或用 `-c <N>` 重啟 llama-server 改 ctx 大小,opencode.json 跟著一致")
     _print("            (c) 啟動時傳 -m/--model 指到另一個已對齊的 OpenCode model entry")
     _print("            (d) export AICODE_ACCEPT_CTX_RISK=1 (本次接受不一致)")
     _print("            (e) export AICODE_CTX_SAFETY_DISABLE=1 (跳過 ctx safety/alignment 檢查)")

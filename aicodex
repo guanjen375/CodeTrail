@@ -243,6 +243,16 @@ export AICODE_MODEL="$RESOLVED_MAIN_MODEL"
 rm -f "$resolve_err"
 trap - EXIT
 
+# CodeTrail 的 per-call ctx 上限自動跟隨主 llama-server 的真實 n_ctx(server -c 是唯一
+# 真值)。使用者沒手動設 AICODE_DYNAMIC_NUM_CTX_MAX 時,讀 server /props 的 n_ctx 並
+# export 進環境,讓 CodeTrail MCP 子行程自動拿到正確上限;server 讀不到時退回 config 預設。
+if [ -z "${AICODE_DYNAMIC_NUM_CTX_MAX:-}" ]; then
+  if RESOLVED_CTX="$("$PYBIN" "$CODETRAIL_HOME/scripts/resolve_server_ctx.py")" && [ -n "$RESOLVED_CTX" ]; then
+    export AICODE_DYNAMIC_NUM_CTX_MAX="$RESOLVED_CTX"
+    echo "[aicodex] CodeTrail ctx 上限自動跟隨 server n_ctx=$RESOLVED_CTX (無需手動設 AICODE_DYNAMIC_NUM_CTX_MAX)" >&2
+  fi
+fi
+
 if [ -f "$CODETRAIL_HOME/scripts/ctx_safety_check.py" ]; then
   if ! "$PYBIN" "$CODETRAIL_HOME/scripts/ctx_safety_check.py"; then
     echo "[aicodex] ctx safety check refused to start (see [ctx-safety] above)." >&2

@@ -33,10 +33,10 @@ def _write_opencode(tmp_path: Path, ctx: int, model: str = "llamacpp/main-model"
 
 
 def test_opencode_ctx_check_passes_when_context_matches(monkeypatch, tmp_path, capsys):
-    _write_opencode(tmp_path, 65532)
+    _write_opencode(tmp_path, 65536)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
-    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65532")
+    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65536")
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
     monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
 
@@ -48,7 +48,7 @@ def test_opencode_ctx_check_fails_when_context_mismatches(monkeypatch, tmp_path,
     _write_opencode(tmp_path, 32768)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
-    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65532")
+    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65536")
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
     monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
 
@@ -56,14 +56,14 @@ def test_opencode_ctx_check_fails_when_context_mismatches(monkeypatch, tmp_path,
     out = capsys.readouterr().out
     assert "MISMATCH" in out
     assert "32768" in out
-    assert "65532" in out
+    assert "65536" in out
 
 
 def test_opencode_ctx_check_accept_risk_allows_mismatch(monkeypatch, tmp_path):
     _write_opencode(tmp_path, 32768)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
-    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65532")
+    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65536")
     monkeypatch.setenv("AICODE_ACCEPT_CTX_RISK", "1")
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
 
@@ -71,10 +71,10 @@ def test_opencode_ctx_check_accept_risk_allows_mismatch(monkeypatch, tmp_path):
 
 
 def test_opencode_ctx_check_uses_cli_model_entry(monkeypatch, tmp_path, capsys):
-    _write_opencode(tmp_path, 65532, model="llamacpp/other-model")
+    _write_opencode(tmp_path, 65536, model="llamacpp/other-model")
     cfg = tmp_path / ".config" / "opencode" / "opencode.json"
     data = json.loads(cfg.read_text(encoding="utf-8"))
-    data["provider"]["llamacpp"]["models"]["main-model"]["limit"]["context"] = 65532
+    data["provider"]["llamacpp"]["models"]["main-model"]["limit"]["context"] = 65536
     data["provider"]["llamacpp"]["models"]["other-model"] = {
         "name": "other-model",
         "limit": {"context": 32768, "output": 8192},
@@ -82,7 +82,7 @@ def test_opencode_ctx_check_uses_cli_model_entry(monkeypatch, tmp_path, capsys):
     cfg.write_text(json.dumps(data), encoding="utf-8")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
-    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65532")
+    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65536")
     monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
 

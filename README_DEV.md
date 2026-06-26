@@ -233,13 +233,14 @@ llama-server 啟動時 `-c <N>` 已經把 ctx + KV cache 鎖死,所以 doctor / 
 | 模組 / 入口 | 責任 |
 |---|---|
 | `gpu_safety.py` | 純 library:`query_gpu_info()` 跑 nvidia-smi 拿 GPU info(純診斷)、`query_server_info()` 打 llama-server `/props` 抓 `default_generation_settings.n_ctx` + `model_path`、`check_safety(requested_ctx, base_url)` 比對後包成 `SafetyVerdict`。所有 I/O 都用 hook 參數注入,測試可完全離線 mock。 |
-| `scripts/ctx_safety_check.py` | CLI 入口。讀 env (`AICODE_MODEL` 必填; 沒設 / placeholder 直接 exit 2 — CodeTrail 不假定預設主模型 / `AICODE_DYNAMIC_NUM_CTX_MAX` / `AICODE_LLAMA_BASE_URL`),呼 `gpu_safety.check_safety()` 後**再收緊成 requested 必須等於 server n_ctx**(大於 = `UNSAFE` 截斷風險、小於 = `MISMATCH` 對齊漂移,兩者都 refuse),並依 verdict 與 `AICODE_ACCEPT_CTX_RISK` / `AICODE_CTX_SAFETY_DISABLE` 決定 exit code。`aicode` wrapper 在 exec opencode 前跑這個,exit 2 = refuse to start。aicode wrapper 啟動時會先用 `scripts/resolve_main_model.py` 把 env / CLI 旗標 / opencode.json 解析成 bare model name 並 export AICODE_MODEL；若 `AICODE_MODEL` 和 opencode.json 同時存在且沒有 CLI `-m/--model` override,兩者必須指向同一顆,避免 TUI 與 MCP 用不同模型。 |
-| `opencode_context.py` / `scripts/opencode_ctx_check.py` | 解析 OpenCode active model 的 `provider.*.models.*.limit.context`,並在 `aicode` 啟動前確認它等於 `AICODE_DYNAMIC_NUM_CTX_MAX`。這守的是「OpenCode TUI 會不會提早 compact / 和 CodeTrail MCP 使用不同 ctx 預算」。`AICODE_ACCEPT_CTX_RISK=1` 可一次性放行,`AICODE_CTX_SAFETY_DISABLE=1` 可跳過。 |
+| `scripts/resolve_server_ctx.py` | CLI 取值器。讀主 llama-server `/props` 拿真實 `n_ctx`,只把這個整數印到 stdout(讀不到就印空字串、永遠 exit 0,不擋啟動)。`aicode` wrapper 在使用者「沒手動設」`AICODE_DYNAMIC_NUM_CTX_MAX` 時跑它,把結果 export 進環境 —— 這就是「CodeTrail ctx 上限自動跟隨 server」的實作。server `-c <N>` 是唯一真值,使用者通常不用碰這個 env var。 |
+| `scripts/ctx_safety_check.py` | CLI 入口(容量閘)。讀 env (`AICODE_MODEL` 必填; 沒設 / placeholder 直接 exit 2 — CodeTrail 不假定預設主模型 / `AICODE_DYNAMIC_NUM_CTX_MAX` / `AICODE_LLAMA_BASE_URL`),呼 `gpu_safety.check_safety()`:**requested 只要 `<=` server n_ctx 就 `SAFE` 放行;只有 `>`(`UNSAFE`,prompt 會被截斷)才 refuse**。因為上面 resolve_server_ctx 已把 requested 自動帶成 == server,這道閘正常都過,真正會擋的是「使用者手動把 `AICODE_DYNAMIC_NUM_CTX_MAX` 設得比 server `-c` 還大」。依 verdict 與 `AICODE_ACCEPT_CTX_RISK` / `AICODE_CTX_SAFETY_DISABLE` 決定 exit code。aicode wrapper 啟動時會先用 `scripts/resolve_main_model.py` 把 env / CLI 旗標 / opencode.json 解析成 bare model name 並 export AICODE_MODEL；若 `AICODE_MODEL` 和 opencode.json 同時存在且沒有 CLI `-m/--model` override,兩者必須指向同一顆,避免 TUI 與 MCP 用不同模型。 |
+| `opencode_context.py` / `scripts/opencode_ctx_check.py` | 解析 OpenCode active model 的 `provider.*.models.*.limit.context`,並在 `aicode` 啟動前確認它等於 CodeTrail 的 ctx 上限(= 已自動跟隨的 server `-c`)。這是使用者**唯一還要手動對齊**的數字,守的是「OpenCode TUI 會不會提早 compact / 和 CodeTrail MCP 使用不同 ctx 預算」—— 因為 TUI 直接打 llama-server、繞過 CodeTrail,CodeTrail 設不了它。`AICODE_ACCEPT_CTX_RISK=1` 可一次性放行,`AICODE_CTX_SAFETY_DISABLE=1` 可跳過。 |
 | `context_budget.py::_emit_runtime_offload_check_once` | runtime 觀測 hook:`[CTX] WARNING` 或 `[CTX_OVERFLOW]` 觸發時順手查一次 `/slots` + `/props`,把 server 真實 n_ctx / 忙碌 slot 數 黏在 log 後面。每個 process 只跑一次,任何錯誤靜默吞掉。 |
 
 ### 設計守則
 
-- **fail-loud,不偷偷 clamp**:`UNSAFE` 一定 print verdict + 對齊方案,然後 `exit 2`。不會自動把 `DYNAMIC_NUM_CTX_MAX` 改掉 — 這違背「prefer visible failure over defensive defaults」原則。
+- **fail-loud,不偷偷 clamp**:`ctx_safety_check` 遇到 `UNSAFE`(requested > server)一定 print verdict + 對齊方案然後 `exit 2`,**不會為了避開 UNSAFE 自動把 requested 改小**。(這跟 aicode 啟動時「從 server 讀 n_ctx 自動設成 budget」是兩回事:後者是拿 source of truth 當預設值,不是為了掩蓋失敗而 clamp。)
 - **UNKNOWN 一律放行**:server 不可連 / `/props` 沒給 n_ctx → 只 warn 不擋。否則 CI、遠端 server、新版 server 改 schema 時會被卡住。
 - **server 是 source of truth**:不再做 KV cache 公式預測;server `-c` 就是答案。
 
@@ -247,7 +248,7 @@ llama-server 啟動時 `-c <N>` 已經把 ctx + KV cache 鎖死,所以 doctor / 
 
 | Env | 行為 | 何時用 |
 |---|---|---|
-| `AICODE_DYNAMIC_NUM_CTX_MAX=<N>` | 顯式指定 CodeTrail 端 ctx 上限 | 對齊 server n_ctx 的預期解法 |
+| `AICODE_DYNAMIC_NUM_CTX_MAX=<N>` | 進階覆寫 CodeTrail 端 ctx 上限(預設自動跟隨 server n_ctx,通常不用設) | 想讓 CodeTrail 用比 server 小的 ctx 時 |
 | 重啟 server 改 `-c <N>` | 物理上限 | 想拉大 ctx 時的根本解法 |
 | `AICODE_ACCEPT_CTX_RISK=1` | UNSAFE 也 exit 0,但仍印完整 verdict | 一次性實測 truncation 影響 |
 | `AICODE_CTX_SAFETY_DISABLE=1` | 整個 check 跳過,連 verdict 都不算 | CI / 自動化、緊急逃生 |

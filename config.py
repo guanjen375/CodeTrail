@@ -203,14 +203,15 @@ NUM_CTX_FULL_MODE = NUM_CTX
 # 根據 prompt 長度動態調整 context 大小，減少不必要的記憶體佔用和延遲
 # 1 token ≈ 3-4 chars（粗估）
 #
-# 為什麼有 AICODE_DYNAMIC_NUM_CTX_MAX 而不是直接用 AICODE_NUM_CTX:
-#   dynamic 開啟時(預設),每次 call 的真實上限由 DYNAMIC_NUM_CTX_MAX 決定,
-#   NUM_CTX 只在 dynamic 關閉時當 fallback 用。早期的 AICODE_NUM_CTX 看起來
-#   像是「主上限」其實大多時候沒效,造成使用者調了卻沒感覺。新名稱讓
-#   「調 env var = 真的改上限」這件事語意一致。
+# DYNAMIC_NUM_CTX_MAX 是 CodeTrail internal LLM call 的 per-call ctx 上限。
+#   預設「自動跟隨」主 llama-server 的真實 n_ctx —— aicode wrapper 啟動時會讀
+#   server /props 的 n_ctx,export 成 AICODE_DYNAMIC_NUM_CTX_MAX 帶進這個行程。
+#   也就是說 server 啟動時的 `-c <N>` 才是唯一真值,使用者通常不需要手動設這個
+#   env var。沒經過 aicode(或 server 讀不到)時退回下面的預設常數。
+#   手動設 AICODE_DYNAMIC_NUM_CTX_MAX 視為進階覆寫,使用者要自行確保它 == server -c。
 DYNAMIC_NUM_CTX_ENABLED = True
 DYNAMIC_NUM_CTX_MIN = 16384      # 最小 16K
-DYNAMIC_NUM_CTX_MAX = int(_os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX", "65532"))
+DYNAMIC_NUM_CTX_MAX = int(_os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX", "65536"))
 DYNAMIC_NUM_CTX_BUFFER = 1.3     # 預留空間給回答（調整: 1.5->1.3）
 CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
 

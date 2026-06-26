@@ -194,7 +194,7 @@ if os.environ.get("AICODE_NUM_CTX") and config.DYNAMIC_NUM_CTX_ENABLED:
     _log(
         f"[MCP] WARN: AICODE_NUM_CTX={config.NUM_CTX} 在 dynamic mode 下不影響"
         f"per-call 上限;實際上限由 DYNAMIC_NUM_CTX_MAX={config.DYNAMIC_NUM_CTX_MAX} "
-        "決定。要真的改上限請設 AICODE_DYNAMIC_NUM_CTX_MAX。"
+        "決定 (預設自動跟隨 server 真實 n_ctx)。要改上限請調 llama-server 的 -c <N>。"
     )
 # knowledge.json 綁 AICODE_ROOT,不依賴 cwd
 _kb_path = str(Path(AICODE_ROOT) / KNOWLEDGE_FILE)

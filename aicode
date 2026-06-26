@@ -176,13 +176,25 @@ fi
 # mcp_server / 子行程拿到同一顆。
 export AICODE_MODEL="$RESOLVED_MAIN_MODEL"
 
-# Verify main llama-server's actual n_ctx is big enough for our budget BEFORE
-# we exec opencode. ctx_safety_check.py reads /props from the server (8080 by
-# default) and exits 2 if requested ctx (AICODE_DYNAMIC_NUM_CTX_MAX, default
-# 65536) > server n_ctx. It prints concrete remedies (lower the cap, restart
-# server with bigger -c, AICODE_ACCEPT_CTX_RISK=1) so this is fail-loud — we
-# don't silently truncate. UNKNOWN cases (server not started, remote server
-# unreachable) exit 0 with a warning, so this won't block CI or remote setups.
+# CodeTrail 的 per-call ctx 上限「自動跟隨」主 llama-server 的真實 n_ctx —— server
+# 啟動時的 `-c <N>` 是唯一真值。使用者通常不需要、也不該手動設
+# AICODE_DYNAMIC_NUM_CTX_MAX。這裡讀 server /props 的 n_ctx 並 export 進環境,讓
+# CodeTrail MCP 子行程自動拿到正確上限;只有「使用者自己明確設過」時才尊重他的值
+# (進階覆寫),不覆寫。server 讀不到時靜默退回 config.DYNAMIC_NUM_CTX_MAX 預設。
+if [ -z "${AICODE_DYNAMIC_NUM_CTX_MAX:-}" ]; then
+  if RESOLVED_CTX="$("$PYBIN" "$CODETRAIL_HOME/scripts/resolve_server_ctx.py")" && [ -n "$RESOLVED_CTX" ]; then
+    export AICODE_DYNAMIC_NUM_CTX_MAX="$RESOLVED_CTX"
+    echo "[aicode] CodeTrail ctx 上限自動跟隨 server n_ctx=$RESOLVED_CTX (無需手動設 AICODE_DYNAMIC_NUM_CTX_MAX)"
+  fi
+else
+  echo "[aicode] 偵測到你手動設了 AICODE_DYNAMIC_NUM_CTX_MAX=${AICODE_DYNAMIC_NUM_CTX_MAX} (進階覆寫;需自行確保 == server -c 與 opencode limit.context)"
+fi
+
+# 容量閘:確認上面決定的 CodeTrail ctx budget 不會「超過」server 真實 n_ctx
+# (超過會截斷 prompt)。正常自動跟隨時 requested == server、直接放行;會擋下的只有
+# 使用者手動把 AICODE_DYNAMIC_NUM_CTX_MAX 設得比 server -c 還大的情況。
+# ctx_safety_check.py 讀 server /props (預設 8080);server 沒啟動 / 不可連的 UNKNOWN
+# 情況 exit 0 只 warn,不擋 CI / 遠端。
 if [ -f "$CODETRAIL_HOME/scripts/ctx_safety_check.py" ]; then
   if ! "$PYBIN" "$CODETRAIL_HOME/scripts/ctx_safety_check.py"; then
     echo "[aicode] ctx safety check refused to start (see [ctx-safety] above)." >&2
@@ -207,19 +219,17 @@ fi
 export AICODE_ROOT="$ROOT"
 echo "[aicode] AICODE_ROOT=$AICODE_ROOT"
 
-# Surface the two-context-pipeline distinction so users know which knob
-# controls what. AICODE_DYNAMIC_NUM_CTX_MAX only affects CodeTrail-internal
-# llama-server calls (agent loop, RAG-related prompts, embedding, reranker).
-# OpenCode TUI uses /v1/chat/completions against the same main llama-server,
-# whose effective context is determined by the server's `-c <N>` flag + the
-# OpenCode model limit.context value — neither of which AICODE_DYNAMIC_NUM_CTX_MAX
-# can override.
+# 兩條 context pipeline 的分工:CodeTrail-internal 呼叫 (agent loop / RAG / embedding /
+# reranker) 的 per-call ctx 上限 = AICODE_DYNAMIC_NUM_CTX_MAX,上面已自動設成 server
+# 真實 n_ctx。OpenCode TUI 則是直接打同一台 llama-server 的 /v1/chat/completions,它的
+# 真實 ctx 由 server `-c <N>` + OpenCode model limit.context 決定 —— 所以只要大家都等於
+# server -c 就一致。
 echo "[aicode] AICODE_MODEL=${AICODE_MODEL}"
 if [ -n "${AICODE_NUM_CTX:-}" ]; then
   echo "[aicode] AICODE_NUM_CTX=${AICODE_NUM_CTX} (僅在 dynamic 關閉時當 fallback 上限;dynamic 開啟時不影響 per-call ctx)"
 fi
 if [ -n "${AICODE_DYNAMIC_NUM_CTX_MAX:-}" ]; then
-  echo "[aicode] AICODE_DYNAMIC_NUM_CTX_MAX=${AICODE_DYNAMIC_NUM_CTX_MAX} (dynamic 模式真正生效的 per-call ctx 上限)"
+  echo "[aicode] AICODE_DYNAMIC_NUM_CTX_MAX=${AICODE_DYNAMIC_NUM_CTX_MAX} (CodeTrail per-call ctx 上限;自動跟隨 server n_ctx)"
 fi
 if [ -n "${AICODE_RESERVED_OUTPUT_TOKENS:-}" ]; then
   echo "[aicode] AICODE_RESERVED_OUTPUT_TOKENS=${AICODE_RESERVED_OUTPUT_TOKENS}"
@@ -227,9 +237,10 @@ fi
 if [ -n "${AICODE_LLAMA_BASE_URL:-}" ]; then
   echo "[aicode] AICODE_LLAMA_BASE_URL=${AICODE_LLAMA_BASE_URL} (主 LLM server)"
 fi
-echo "[aicode] NOTE: 要調 per-call ctx 上限,改 AICODE_DYNAMIC_NUM_CTX_MAX (必須等於 server 啟動的 -c)。"
-echo "         llama-server 啟動時 -c <N> 是真實 ctx 上限,改了要重啟 server。"
-echo "         OpenCode active model 的 limit.context 必須等於 AICODE_DYNAMIC_NUM_CTX_MAX (三個數字要一樣)。"
+echo "[aicode] NOTE: ctx 上限的唯一真值是 llama-server 啟動的 -c <N> (改了要重啟 server)。"
+echo "         CodeTrail 端會自動跟隨,你不用手動設 AICODE_DYNAMIC_NUM_CTX_MAX。"
+echo "         唯一要你手動對齊的:OpenCode active model 的 limit.context 也要 == server -c"
+echo "         (TUI 直接打 server、繞過 CodeTrail,CodeTrail 設不了它)。"
 echo "         Check loaded model with: curl -s \${AICODE_LLAMA_BASE_URL:-http://localhost:8080}/props"
 echo "         CodeTrail context overflow attempts are logged to .codetrail/context_metrics.jsonl"
 

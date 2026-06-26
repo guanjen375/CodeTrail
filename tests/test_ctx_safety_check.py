@@ -42,59 +42,61 @@ def _server_verdict_factory(status: str, server_n_ctx: int):
 def test_ctx_safety_passes_when_requested_equals_server(monkeypatch, capsys):
     """requested == server n_ctx → SAFE,放行 (exit 0)。"""
     monkeypatch.setenv("AICODE_MODEL", "custom-model")
-    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65532")
+    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65536")
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
     monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
     monkeypatch.setattr(
-        ctx.gpu_safety, "check_safety", _server_verdict_factory("SAFE", 65532)
+        ctx.gpu_safety, "check_safety", _server_verdict_factory("SAFE", 65536)
     )
 
     assert ctx.main() == 0
     out = capsys.readouterr().out
     assert "SAFE" in out
-    assert "== server n_ctx=65532" in out
+    assert "<= server n_ctx=65536" in out
 
 
-def test_ctx_safety_mismatch_when_requested_below_server(monkeypatch, capsys):
-    """requested < server n_ctx → MISMATCH (對齊漂移),擋住 (exit 2)。"""
+def test_ctx_safety_passes_when_requested_below_server(monkeypatch, capsys):
+    """requested < server n_ctx → SAFE,放行 (exit 0)。
+
+    「小於」不是安全問題(不截斷,只是沒用滿 server 容量),不該擋。正常情況下
+    aicode 會自動把 requested 帶成 == server,這條主要保障使用者手動設小一點時
+    不會被無謂擋住,也是把舊版 e129d48「小於就 refuse」死鎖拿掉的回歸測試。
+    """
     monkeypatch.setenv("AICODE_MODEL", "custom-model")
     monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "32768")
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
     monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
     monkeypatch.setattr(
-        ctx.gpu_safety, "check_safety", _server_verdict_factory("SAFE", 65532)
-    )
-
-    assert ctx.main() == 2
-    out = capsys.readouterr().out
-    assert "MISMATCH" in out
-    assert "32768" in out
-    assert "65532" in out
-    # 修法 (a) 應該建議對齊到 server 的真實 n_ctx
-    assert "AICODE_DYNAMIC_NUM_CTX_MAX=65532" in out
-    assert "refuse to start" in out
-
-
-def test_ctx_safety_mismatch_allows_with_accept_risk(monkeypatch, capsys):
-    """requested < server n_ctx 但設了 AICODE_ACCEPT_CTX_RISK=1 → 放行 (exit 0)。"""
-    monkeypatch.setenv("AICODE_MODEL", "custom-model")
-    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "32768")
-    monkeypatch.setenv("AICODE_ACCEPT_CTX_RISK", "1")
-    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
-    monkeypatch.setattr(
-        ctx.gpu_safety, "check_safety", _server_verdict_factory("SAFE", 65532)
+        ctx.gpu_safety, "check_safety", _server_verdict_factory("SAFE", 65536)
     )
 
     assert ctx.main() == 0
     out = capsys.readouterr().out
-    assert "MISMATCH" in out
+    assert "SAFE" in out
+    assert "<= server n_ctx=65536" in out
+    assert "refuse to start" not in out
+
+
+def test_ctx_safety_unsafe_allows_with_accept_risk(monkeypatch, capsys):
+    """requested > server n_ctx 但設了 AICODE_ACCEPT_CTX_RISK=1 → 放行 (exit 0)。"""
+    monkeypatch.setenv("AICODE_MODEL", "custom-model")
+    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65536")
+    monkeypatch.setenv("AICODE_ACCEPT_CTX_RISK", "1")
+    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
+    monkeypatch.setattr(
+        ctx.gpu_safety, "check_safety", _server_verdict_factory("UNSAFE", 8192)
+    )
+
+    assert ctx.main() == 0
+    out = capsys.readouterr().out
+    assert "UNSAFE" in out
     assert "AICODE_ACCEPT_CTX_RISK=1 已設" in out
 
 
 def test_ctx_safety_unsafe_when_requested_above_server(monkeypatch, capsys):
     """requested > server n_ctx → UNSAFE (截斷風險),擋住 (exit 2)。"""
     monkeypatch.setenv("AICODE_MODEL", "custom-model")
-    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65532")
+    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65536")
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
     monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
     monkeypatch.setattr(
@@ -104,8 +106,9 @@ def test_ctx_safety_unsafe_when_requested_above_server(monkeypatch, capsys):
     assert ctx.main() == 2
     out = capsys.readouterr().out
     assert "UNSAFE" in out
-    # 修法 (a) 對齊到 server 的真實 n_ctx (8192),不再 round down
-    assert "AICODE_DYNAMIC_NUM_CTX_MAX=8192" in out
+    assert "8192" in out
+    # 主要修法:拿掉手動的 AICODE_DYNAMIC_NUM_CTX_MAX 讓 CodeTrail 自動跟隨 server
+    assert "自動跟隨 server" in out
     assert "refuse to start" in out
 
 

@@ -3,9 +3,12 @@
 """Helpers for comparing OpenCode TUI context with CodeTrail context.
 
 OpenCode keeps the frontend chat budget in opencode.json as
-provider.<key>.models.<model>.limit.context. CodeTrail keeps its MCP/native LLM
-budget in AICODE_DYNAMIC_NUM_CTX_MAX. These are separate knobs, but for the
-single-local-llama-server setup they should usually be equal.
+provider.<key>.models.<model>.limit.context. CodeTrail's own MCP/native LLM
+budget follows the main llama-server's real n_ctx (aicode auto-derives it; see
+config.DYNAMIC_NUM_CTX_MAX). The server's `-c <N>` is the single source of truth,
+so opencode.json limit.context must equal it — that is the one alignment a user
+still has to make by hand, because the OpenCode TUI talks to llama-server
+directly and bypasses CodeTrail.
 """
 from __future__ import annotations
 
@@ -22,7 +25,7 @@ from model_resolution import (
 )
 
 
-DEFAULT_DYNAMIC_CTX_MAX = 65532
+DEFAULT_DYNAMIC_CTX_MAX = 65536
 
 
 @dataclass(frozen=True)
