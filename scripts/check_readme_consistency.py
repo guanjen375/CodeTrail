@@ -38,9 +38,15 @@ def _documentation_text() -> str:
 
 
 def _mcp_tool_names(mcp_text: str) -> list[str]:
-    """抓 @mcp.tool() 之後緊接的 def <name>。"""
+    """抓工具 decorator 之後緊接的 def <name>。
+
+    工具現在透過 @_tool() 註冊（在 @mcp.tool() 外包一層 redirect_stdout，避免
+    stdout 污染 JSON-RPC，見 mcp_server.py）。兩種寫法都要認得，才不會誤判工具數。
+    """
     names = []
-    pattern = re.compile(r"@mcp\.tool\(\)\s*\n\s*def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(")
+    pattern = re.compile(
+        r"@(?:mcp\.tool|_tool)\(\)\s*\n\s*def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\("
+    )
     for m in pattern.finditer(mcp_text):
         names.append(m.group(1))
     return names

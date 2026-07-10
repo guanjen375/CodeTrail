@@ -15,7 +15,7 @@
     "expected": {
       "file": "knowledge.py",
       "symbol": "query",
-      "line": 1577
+      "line": 1606
     },
     "context": "."
   },
@@ -25,7 +25,7 @@
     "expected": {
       "file": "agent_tools.py",
       "symbol": "_parse_unified_diff",
-      "line": 981
+      "line": 1074
     },
     "context": "."
   },

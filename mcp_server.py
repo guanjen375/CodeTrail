@@ -12,6 +12,7 @@ ai_code MCP server — 把 KnowledgeBase / CodeRAG / agent_tools 包成 MCP tool
 """
 
 import contextlib
+import functools
 import os
 import sys
 import io
@@ -25,6 +26,17 @@ if sys.stdout.encoding != 'utf-8':
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
     except Exception:
         pass
+
+
+# ---- stdio 協定安全 (P0) ----------------------------------------------------
+# MCP 走 stdio：stdout 是 JSON-RPC 專用通道。但 import / 模組載入 / KnowledgeBase
+# / CodeRAG 初始化都可能 print() 到 stdout（knowledge.py、RAG.py 有大量 print），
+# 只要一行落在 stdout，就會和最前面的 JSON-RPC handshake 黏在一起，client 直接
+# `Failed to parse JSONRPC message`。@_tool 只能保護「工具執行期」，蓋不到「啟動
+# 期」。因此這裡把整個載入/初始化期間的 stdout 導到 stderr，真正的 stdout 保存在
+# _REAL_STDOUT，等到要交給 JSON-RPC transport（mcp.run()）前才還回去。
+_REAL_STDOUT = sys.stdout
+sys.stdout = sys.stderr
 
 
 def _log(msg: str) -> None:
@@ -270,8 +282,33 @@ def _record_kb_interaction(
 
 mcp = FastMCP("ai_code")
 
+_real_mcp_tool = mcp.tool
 
-@mcp.tool()
+
+def _tool(*d_args, **d_kwargs):
+    """@_tool() 的包裝：工具執行期間把 stdout 導到 stderr。
+
+    P0：MCP 走 stdio，stdout 是 JSON-RPC 專用通道。但 run_command / run_lint /
+    code_rag 建索引 / media 等程式碼會 print() 到 stdout（RAG.py 就有上百個
+    print），只要有一行落到 stdout，就會和 JSON-RPC 回應黏在一起，client 報
+    `Failed to parse JSONRPC message` 然後 tool call timeout。
+
+    與其逐一改上百個 print 呼叫（易漏、易回歸），這裡在「工具邊界」統一把
+    stdout 重導到 stderr：redirect 只在工具 body 執行期間生效，FastMCP 在工具
+    return 之後才把結果序列化寫到「真正的」stdout，因此 JSON-RPC 通道乾淨。
+    functools.wraps 保留原簽名/型別註記/docstring，FastMCP 的 schema 產生
+    （走 inspect.signature，會 follow __wrapped__）不受影響。
+    """
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with contextlib.redirect_stdout(sys.stderr):
+                return fn(*args, **kwargs)
+        return _real_mcp_tool(*d_args, **d_kwargs)(wrapper)
+    return decorator
+
+
+@_tool()
 def query_knowledge(question: str) -> dict:
     """Query the project knowledge base (PDF/spec/manual RAG).
 
@@ -319,7 +356,7 @@ def query_knowledge(question: str) -> dict:
     }
 
 
-@mcp.tool()
+@_tool()
 def query_knowledge_strict(question: str) -> dict:
     """Strict-mode KB query: server-side LLM with refuse + 2-stage self-check.
 
@@ -449,7 +486,7 @@ def query_knowledge_strict(question: str) -> dict:
     return result
 
 
-@mcp.tool()
+@_tool()
 def code_rag_search(query: str, top_k: int = 5) -> list[dict]:
     """Find relevant code locations (file:line + symbol) inside AICODE_ROOT.
 
@@ -487,7 +524,7 @@ def code_rag_search(query: str, top_k: int = 5) -> list[dict]:
     return results
 
 
-@mcp.tool()
+@_tool()
 def read_file(
     path: str,
     start_line: int = 1,
@@ -520,7 +557,7 @@ def read_file(
     return out
 
 
-@mcp.tool()
+@_tool()
 def grep_code(
     pattern: str,
     path: Optional[str] = ".",
@@ -543,7 +580,7 @@ def grep_code(
     return EXEC.grep(pattern, path=path or ".", include=include, context=context)
 
 
-@mcp.tool()
+@_tool()
 def list_dir(path: str = ".", depth: int = 2, max_chars: int = 20000) -> str:
     """List the directory tree under AICODE_ROOT/<path> (sandbox-protected).
 
@@ -568,7 +605,7 @@ def list_dir(path: str = ".", depth: int = 2, max_chars: int = 20000) -> str:
     return out
 
 
-@mcp.tool()
+@_tool()
 def apply_patch(diff: str, dry_run: bool = False) -> str:
     """Apply a unified-diff patch to files inside AICODE_ROOT (writes to disk).
 
@@ -588,7 +625,7 @@ def apply_patch(diff: str, dry_run: bool = False) -> str:
     return EXEC.apply_patch(patch=diff, dry_run=dry_run)
 
 
-@mcp.tool()
+@_tool()
 def file_info(path: str) -> str:
     """Get quick metadata about a file or directory inside AICODE_ROOT.
 
@@ -605,7 +642,7 @@ def file_info(path: str) -> str:
     return EXEC.file_info(path)
 
 
-@mcp.tool()
+@_tool()
 def git_status() -> str:
     """git status --porcelain for AICODE_ROOT, with human-readable status labels.
 
@@ -618,7 +655,7 @@ def git_status() -> str:
     return EXEC.git_status()
 
 
-@mcp.tool()
+@_tool()
 def git_diff(path: Optional[str] = None, staged: bool = False) -> str:
     """git diff inside AICODE_ROOT, optionally scoped to a path or to the index.
 
@@ -633,7 +670,7 @@ def git_diff(path: Optional[str] = None, staged: bool = False) -> str:
     return EXEC.git_diff(path=path, staged=staged)
 
 
-@mcp.tool()
+@_tool()
 def run_lint(path: str, fix: bool = True) -> str:
     """Run lint/format on a file using the toolchain configured in LINT_COMMANDS.
 
@@ -653,7 +690,7 @@ def run_lint(path: str, fix: bool = True) -> str:
     return EXEC.run_lint(path=path, fix=fix)
 
 
-@mcp.tool()
+@_tool()
 def import_external_file(path: str, dest_name: Optional[str] = None) -> str:
     """Copy an allowed external file into AICODE_ROOT/.aicode_uploads/.
 
@@ -675,7 +712,7 @@ def import_external_file(path: str, dest_name: Optional[str] = None) -> str:
     return _import_external_file(path, AICODE_ROOT, dest_name=dest_name)
 
 
-@mcp.tool()
+@_tool()
 def analyze_file(path: str) -> str:
     """Analyze a non-text file (image / ELF / binary firmware) inside AICODE_ROOT.
 
@@ -729,7 +766,7 @@ def analyze_file(path: str) -> str:
     )
 
 
-@mcp.tool()
+@_tool()
 def ingest_document(path: str, mode: str = "auto") -> str:
     """Ingest a file into the project knowledge base.
 
@@ -855,7 +892,7 @@ def ingest_document(path: str, mode: str = "auto") -> str:
     return f"=== ingest_document {status} ===\n{out}{hint}"
 
 
-@mcp.tool()
+@_tool()
 def remove_document(source: str) -> str:
     """Remove all chunks of a given source file from the knowledge base.
 
@@ -948,7 +985,7 @@ def remove_document(source: str) -> str:
     )
 
 
-@mcp.tool()
+@_tool()
 def reload_knowledge_base() -> str:
     """Reload the in-memory KnowledgeBase from AICODE_ROOT/knowledge.json.
 
@@ -963,7 +1000,7 @@ def reload_knowledge_base() -> str:
     return f"[KB reloaded] {KB.get_status()}"
 
 
-@mcp.tool()
+@_tool()
 def run_command(cmd: str) -> str:
     """Run a whitelisted command inside AICODE_ROOT.
 
@@ -984,6 +1021,9 @@ def run_command(cmd: str) -> str:
 
 if __name__ == "__main__":
     _log("[MCP] server ready, listening on stdio.")
+    # 交還真正的 stdout 給 JSON-RPC transport。此後只有 FastMCP transport 寫
+    # stdout；工具內的 incidental print() 由 @_tool 的 redirect_stdout 擋回 stderr。
+    sys.stdout = _REAL_STDOUT
     try:
         mcp.run()
     finally:

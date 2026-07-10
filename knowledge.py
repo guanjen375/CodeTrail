@@ -233,6 +233,19 @@ class KnowledgeBase:
             self._embeddings = embeddings
             self._embeddings_normalized = True  # .npz 已預先正規化
             self._embedding_indices = list(range(len(self.chunks)))
+
+            # P0：把 .npz 的向量掛回每個 chunk。
+            # RAG 存 knowledge.json 時為了體積「不再 inline embedding」（只留 .npz，
+            # 見 RAG.py:_restore_embeddings_from_npz）。若這裡只設 self._embeddings 而
+            # 不回填 chunk["embedding"]，下游的 MMR / 污染控制 / 最終信心分數（全都讀
+            # chunk.get("embedding")）會一律拿到空向量、把相似度算成 0，最後只回一個
+            # 空的 [REF]…[/REF] 殼。chunk_count 已在上面驗證 == len(self.chunks)。
+            # 向量已 L2 正規化，且下游 _cosine_similarity / _mmr_select_numpy 都會再
+            # 自行正規化；用 .tolist() 是因為那些消費者對 numpy array 做 `if not a` /
+            # `if emb:` 會丟 ambiguous-truth 例外，必須是 Python list。
+            for i, chunk in enumerate(self.chunks):
+                chunk["embedding"] = embeddings[i].tolist()
+
             return True
         except Exception as e:
             print(f"[WARN] 載入 .npz 失敗: {e}")

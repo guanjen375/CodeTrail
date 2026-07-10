@@ -443,17 +443,22 @@ def split_by_semantic_with_sections(
     chunks = [c for c in chunks if c["content"].strip()]
 
     # Add overlap for better recall.
+    # 重要（P0 無損性）：overlap 是「附加在前面的前段脈絡」，必須是純前綴，
+    # 絕不能為了壓在 max_chars 內而截斷「當前 chunk 的正文」——舊版
+    #   curr = curr[:max_chars - len(tail)]
+    # 會永久刪掉本段尾端（linker map 位址、表格末欄、限制條件），屬資料毀損。
+    # chunk 允許因 overlap 而略超 max_chars（overlap+heading 合計 < embedding 上限）。
+    # tail 一律取「原始」前段內容，避免 overlap 逐段累積污染。
     if overlap_chars and len(chunks) > 1:
+        original_contents = [c["content"] for c in chunks]
         for i in range(1, len(chunks)):
-            prev = chunks[i - 1]["content"]
+            prev = original_contents[i - 1]
             tail = prev[-overlap_chars:] if prev else ""
             if tail:
-                curr = chunks[i]["content"]
-                if len(tail) + len(curr) > max_chars:
-                    curr = curr[:max(0, max_chars - len(tail))]
-                chunks[i]["content"] = tail + "\n" + curr
+                chunks[i]["content"] = tail + "\n" + chunks[i]["content"]
 
     # Inject heading hierarchy into content to improve retrieval.
+    # 同為純前綴，不截斷正文（舊版 content[:max_chars]+"..." 同樣會遺失原文）。
     if include_heading:
         for chunk in chunks:
             header_lines = []
@@ -462,10 +467,7 @@ def split_by_semantic_with_sections(
             if chunk.get("section"):
                 header_lines.append(f"[SECTION] {chunk['section']}")
             if header_lines:
-                content = "\n".join(header_lines) + "\n" + chunk["content"]
-                if len(content) > max_chars:
-                    content = content[:max_chars] + "..."
-                chunk["content"] = content
+                chunk["content"] = "\n".join(header_lines) + "\n" + chunk["content"]
 
     return chunks
 

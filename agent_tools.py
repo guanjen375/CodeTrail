@@ -6,11 +6,13 @@
 
 import os
 import re
+import sys
 import json
 import fnmatch
 import shlex
 import subprocess
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -767,7 +769,7 @@ class ToolExecutor:
             return self._run_command_in_container(command, timeout)
 
         try:
-            print(f"   [RUN] 執行: {command}")
+            print(f"   [RUN] 執行: {command}", file=sys.stderr)
             result = subprocess.run(
                 cmd_parts,
                 shell=False,
@@ -809,7 +811,7 @@ class ToolExecutor:
 
         needs_network = any(kw in command for kw in ['npm install', 'pip install', 'go get', 'cargo fetch'])
 
-        print(f"   [CONTAINER] 執行: {command}")
+        print(f"   [CONTAINER] 執行: {command}", file=sys.stderr)
 
         result = container_runner.run_in_container(
             command=command,
@@ -854,36 +856,131 @@ class ToolExecutor:
         if len(changes) > PATCH_MAX_FILES:
             return f"錯誤: 修改檔案數量超過限制（{len(changes)} > {PATCH_MAX_FILES}）"
 
-        results = []
-        successfully_patched = []
-
+        # ============================================================
+        # Phase 1: preflight 全部檔案（不寫入任何東西）
+        #   - 路徑必須在 sandbox 內
+        #   - 行數限制
+        #   - 既有檔案的 context 必須對得上（dry_run 也要驗，與工具說明一致）
+        # ============================================================
+        plans = []      # [(filepath, target, hunks, original_or_None)]
+        errors = []
         for filepath, hunks in changes.items():
             target = self._safe_path(filepath)
             if not target:
-                results.append(f"✗ {filepath}: 路徑不在專案內或無效")
+                errors.append(f"✗ {filepath}: 路徑不在專案內或無效")
                 continue
 
             total_lines = sum(len(h['add']) + len(h['remove']) for h in hunks)
             if total_lines > PATCH_MAX_LINES_PER_FILE:
-                results.append(f"✗ {filepath}: 修改行數超過限制（{total_lines} > {PATCH_MAX_LINES_PER_FILE}）")
+                errors.append(f"✗ {filepath}: 修改行數超過限制（{total_lines} > {PATCH_MAX_LINES_PER_FILE}）")
                 continue
 
-            if dry_run:
-                results.append(f"[DRY RUN] {filepath}: 將修改 {len(hunks)} 個區塊, {total_lines} 行")
+            if target.exists():
+                try:
+                    original = target.read_text(encoding='utf-8', errors='replace')
+                except Exception as e:
+                    errors.append(f"✗ {filepath}: 讀取失敗 - {e}")
+                    continue
+                file_lines = original.split('\n')
+                hunk_err = None
+                for i, hunk in enumerate(hunks):
+                    ok, msg = self._verify_hunk_context(file_lines, hunk)
+                    if not ok:
+                        hunk_err = f"✗ {filepath}: 區塊 {i+1} {msg}"
+                        break
+                if hunk_err:
+                    errors.append(hunk_err)
+                    continue
+                plans.append((filepath, target, hunks, original))
+            else:
+                plans.append((filepath, target, hunks, None))
+
+        # ---- dry_run: 只報告 preflight 結果，不寫入 ----
+        if dry_run:
+            results = []
+            for filepath, target, hunks, original in plans:
+                total_lines = sum(len(h['add']) + len(h['remove']) for h in hunks)
+                kind = "新建檔案" if original is None else "修改"
+                results.append(
+                    f"[DRY RUN] {filepath}: 將{kind} {len(hunks)} 個區塊, {total_lines} 行"
+                    f"（context 驗證通過）"
+                )
                 for i, hunk in enumerate(hunks):
                     results.append(f"  區塊 {i+1}: 行 {hunk['old_start']}-{hunk['old_start']+hunk['old_count']-1}")
-                continue
+            results.extend(errors)
+            if errors:
+                results.append(
+                    "⚠ [DRY RUN] 上述 ✗ 檔案未通過 preflight；實際套用時整個 patch 會被拒絕，"
+                    "不會寫入任何檔案（atomic）。"
+                )
+            return "\n".join(results) if results else "沒有修改"
 
-            try:
-                result = self._apply_hunks_to_file(target, hunks)
-                results.append(result)
-                if result.startswith("✓"):
-                    successfully_patched.append(filepath)
-            except Exception as e:
-                results.append(f"✗ {filepath}: 套用失敗 - {e}")
+        # ---- 原子性：任一檔 preflight 失敗 → 全部不套用 ----
+        if errors:
+            results = list(errors)
+            results.append("⚠ 因有檔案未通過 preflight，整個 patch 已被拒絕，未寫入任何檔案（atomic）。")
+            return "\n".join(results)
+
+        # ============================================================
+        # Phase 2: 實際套用（含失敗回滾）
+        #   每個既有檔案先寫一份唯一命名的備份（不覆蓋使用者既有 .orig）；
+        #   任一檔寫入拋錯 → 用備份把已寫入的檔案全部回滾。
+        # ============================================================
+        written = []    # [(target, backup_path_or_None)]  None = 本次新建的檔案
+        results = []
+        try:
+            for filepath, target, hunks, original in plans:
+                if original is None:
+                    # 先登記（backup=None 代表新建）再寫，確保寫到一半失敗時
+                    # rollback 也涵蓋這一檔（把它刪掉還原成「不存在」）。
+                    written.append((target, None))
+                    content = self._compute_new_file_content(hunks)
+                    target.write_text(content, encoding='utf-8')
+                    results.append(f"✓ {filepath}: 新建檔案")
+                else:
+                    fd, backup_name = tempfile.mkstemp(
+                        dir=str(target.parent), prefix=target.name + '.', suffix='.orig'
+                    )
+                    os.close(fd)
+                    backup_path = Path(backup_name)
+                    backup_path.write_text(original, encoding='utf-8')
+                    # backup 就緒後、寫入前先登記 → 若 write_text 中途失敗，
+                    # 這一檔也能從備份還原（否則會留下半寫入的檔案 + 孤兒備份）。
+                    written.append((target, backup_path))
+                    content = self._compute_patched_content(original, hunks)
+                    target.write_text(content, encoding='utf-8')
+                    results.append(f"✓ {filepath}: 已修改 {len(hunks)} 個區塊")
+        except Exception as e:
+            rollback_notes = []
+            for tgt, backup_path in reversed(written):
+                try:
+                    if backup_path is None:
+                        tgt.unlink(missing_ok=True)  # 移除本次新建的檔案
+                    else:
+                        tgt.write_text(backup_path.read_text(encoding='utf-8'), encoding='utf-8')
+                except Exception as rexc:
+                    rollback_notes.append(f"⚠ 回滾 {tgt} 失敗: {rexc}")
+            for _, backup_path in written:
+                if backup_path is not None:
+                    try:
+                        backup_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            msg = [f"✗ 套用失敗，已回滾所有變更（atomic）: {e}"]
+            msg.extend(rollback_notes)
+            return "\n".join(msg)
+
+        # ---- 成功：只刪除本次自己建立的備份（絕不動使用者既有 .orig）----
+        for _, backup_path in written:
+            if backup_path is not None:
+                try:
+                    backup_path.unlink()
+                except Exception:
+                    pass
 
         # P2 改進：自動驗證流程
-        if successfully_patched and not dry_run:
+        successfully_patched = [p[0] for p in plans]
+        if successfully_patched:
             verify_results = self._verify_patched_files(successfully_patched)
             results.extend(verify_results)
 
@@ -1061,6 +1158,27 @@ class ToolExecutor:
                         else:
                             break
 
+                    # P0 資料安全：核對 hunk header 宣稱的行數與 body 實際行數。
+                    # 不核對的話，「header 說替換 N 行、body 只給 M 行 (M<N)」會讓
+                    # 後 (N-M) 行被 splice 靜默刪除。任一不符 → 拒絕整個 patch(fail loud)。
+                    ctx_n = sum(1 for t, _ in hunk['lines'] if t == ' ')
+                    rem_n = len(hunk['remove'])
+                    add_n = len(hunk['add'])
+                    if ctx_n + rem_n != old_count:
+                        raise ValueError(
+                            f"{current_file}: hunk '@@ -{old_start},{old_count} ...' "
+                            f"宣稱移除+context 共 {old_count} 行，但 body 實際只有 "
+                            f"{ctx_n + rem_n} 行(context {ctx_n} + 移除 {rem_n})。"
+                            f"為避免靜默刪除未列在 patch 內的行，已拒絕整個 patch。"
+                        )
+                    if ctx_n + add_n != new_count:
+                        raise ValueError(
+                            f"{current_file}: hunk '@@ ... +{new_start},{new_count} @@' "
+                            f"宣稱新增+context 共 {new_count} 行，但 body 實際只有 "
+                            f"{ctx_n + add_n} 行(context {ctx_n} + 新增 {add_n})。"
+                            f"已拒絕整個 patch。"
+                        )
+
                     changes[current_file].append(hunk)
                     continue
 
@@ -1090,50 +1208,30 @@ class ToolExecutor:
 
         return True, ""
 
-    def _apply_hunks_to_file(self, filepath: Path, hunks: list) -> str:
-        """將 hunks 套用到檔案"""
-        if not filepath.exists():
-            new_lines = []
-            for hunk in hunks:
-                for line_type, content in hunk['lines']:
-                    if line_type in (' ', '+'):
-                        new_lines.append(content)
-            filepath.write_text('\n'.join(new_lines) + '\n', encoding='utf-8')
-            return f"✓ {filepath.relative_to(self.root)}: 新建檔案"
-
-        original = filepath.read_text(encoding='utf-8', errors='replace')
-        lines = original.split('\n')
-
-        for i, hunk in enumerate(hunks):
-            is_valid, error_msg = self._verify_hunk_context(lines, hunk)
-            if not is_valid:
-                return f"✗ {filepath.relative_to(self.root)}: 區塊 {i+1} {error_msg}"
-
-        backup_path = filepath.with_suffix(filepath.suffix + '.orig')
-        backup_path.write_text(original, encoding='utf-8')
-
-        sorted_hunks = sorted(hunks, key=lambda h: h['old_start'], reverse=True)
-
-        for hunk in sorted_hunks:
-            start_idx = hunk['old_start'] - 1
-            old_count = hunk['old_count']
-
-            new_lines = []
+    def _compute_new_file_content(self, hunks: list) -> str:
+        """從 hunks 組出新建檔案的完整內容（context + 新增行）。"""
+        new_lines = []
+        for hunk in hunks:
             for line_type, content in hunk['lines']:
                 if line_type in (' ', '+'):
                     new_lines.append(content)
+        return '\n'.join(new_lines) + '\n'
 
-            lines[start_idx:start_idx + old_count] = new_lines
+    def _compute_patched_content(self, original: str, hunks: list) -> str:
+        """把 hunks 套到既有內容，回傳新內容字串（不寫檔）。
 
-        filepath.write_text('\n'.join(lines), encoding='utf-8')
-
-        try:
-            backup_path.unlink()
-        except Exception:
-            pass
-
-        rel_path = filepath.relative_to(self.root)
-        return f"✓ {rel_path}: 已修改 {len(hunks)} 個區塊"
+        splice 長度改用「body 實際的 context+移除 行數」而非 header 宣稱的
+        old_count —— parse 階段已驗證兩者一致，這裡是雙保險，確保永遠不會
+        刪到沒列在 patch body 裡的行。
+        """
+        lines = original.split('\n')
+        sorted_hunks = sorted(hunks, key=lambda h: h['old_start'], reverse=True)
+        for hunk in sorted_hunks:
+            start_idx = hunk['old_start'] - 1
+            replaced_len = sum(1 for t, _ in hunk['lines'] if t in (' ', '-'))
+            new_lines = [c for t, c in hunk['lines'] if t in (' ', '+')]
+            lines[start_idx:start_idx + replaced_len] = new_lines
+        return '\n'.join(lines)
 
     def git_status(self) -> str:
         """顯示 git 工作目錄狀態"""
@@ -1273,7 +1371,7 @@ class ToolExecutor:
             cmd_parts.append(rel_path)
 
             try:
-                print(f"   [LINT] 執行: {' '.join(cmd_parts)}")
+                print(f"   [LINT] 執行: {' '.join(cmd_parts)}", file=sys.stderr)
                 result = subprocess.run(
                     cmd_parts,
                     cwd=str(self.root),

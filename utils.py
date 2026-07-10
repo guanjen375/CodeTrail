@@ -16,7 +16,7 @@ import llama_client
 
 from config import (
     LLAMA_BASE_URL,
-    NUM_CTX, NUM_CTX_FULL_MODE,
+    NUM_CTX, NUM_CTX_FULL_MODE, DYNAMIC_NUM_CTX_MAX,
     CODE_EXTENSIONS, IGNORED_DIRS, IGNORED_FILES, IGNORED_PATTERNS,
     LOW_PRIORITY_PATTERNS, ALLOWED_DOT_DIRS,
     STRICT_MODE, STRICT_MODE_KEYWORDS, SPEC_QUESTION_KEYWORDS,
@@ -330,6 +330,20 @@ def print_ctx_usage(chars: int) -> bool:
     return False
 
 
+def _default_ctx_budget() -> int:
+    """internal LLM call 的預設 ctx 預算 = 主 llama-server 的真實 n_ctx。
+
+    DYNAMIC_NUM_CTX_MAX 由 aicode wrapper 讀 server /props 的 n_ctx export 進來
+    （沒經 wrapper 時退回 65536）。NUM_CTX(131072) 是舊的 aspirational 值；若拿它
+    當 budget 上限，會在 `llama-server -c 65536` 下高估可用空間，讓 context gate
+    放行「實際會被 server 靜默截斷」的 prompt。取兩者較小值最安全。
+
+    這條路徑對 query_knowledge_strict → answer_with_self_check → call_llm_stream()
+    特別重要：那兩處呼叫沒有帶 num_ctx，過去會落到 131072 的預設。
+    """
+    return min(NUM_CTX, DYNAMIC_NUM_CTX_MAX)
+
+
 def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None,
              source: str = "generate") -> str:
     """呼叫主 LLM 生成回應(non-stream,走 llama-server /completion)。
@@ -340,7 +354,7 @@ def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None,
         num_ctx: Context 預算(只用於 budget 計算;llama-server 真實 ctx 在啟動時固定)
         source: 標記呼叫來源（寫入 telemetry，純 metadata）
     """
-    ctx = num_ctx if num_ctx is not None else NUM_CTX
+    ctx = num_ctx if num_ctx is not None else _default_ctx_budget()
     model = config.require_main_model()
 
     try:
@@ -417,7 +431,7 @@ def call_llm_stream(prompt: str, temperature: float = 0.2, num_ctx: int = None,
     """
     import time
 
-    ctx = num_ctx if num_ctx is not None else NUM_CTX
+    ctx = num_ctx if num_ctx is not None else _default_ctx_budget()
     model = config.require_main_model()
 
     try:
