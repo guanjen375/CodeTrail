@@ -423,14 +423,21 @@ tmux ls
 #   codetrail-rag:  3 windows (created ...)    ← 內含 embed + rerank + vl 三個 window
 ```
 
-驗已啟動的 port 都 ready:
+查看所有 GPU 上是否有 main + embedding + reranker + VL 共四個 `llama-server`
+process：
 
 ```bash
-for p in 8080 8081 8082 8083; do
-  echo ":$p → $(curl -s http://localhost:$p/health)"
-done
-# 應該都含 {"status":"ok"};只有 HTTP 200 不夠,loading model 時也可能是 200
+./scripts/check-status.sh
+
+# CI / 自動化需要用 exit code 擋下時：
+./scripts/check-status.sh --strict
 ```
+
+`check-status.sh` 透過 `nvidia-smi` 列出所有 GPU 上的 PID、GPU UUID 與 VRAM，
+並計算不同的 `llama-server` PID；同一個 PID 使用多張 GPU 時只算一個。預設是
+人工查看模式，即使不足四個仍 exit 0，避免啟用 `set -e` 的 SSH shell 被一起退出；
+`--strict` 才會在數量不足時 exit 1。`nvidia-smi` 無法判斷各 PID 對應哪個角色或
+port，因此這項檢查確認的是「至少四個 GPU process」，不是 API health。
 
 之後要關掉全部:
 
