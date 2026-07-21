@@ -362,7 +362,18 @@ RAG_HEALTH_TIMEOUT=120 \
 # GPU placement:未設定時沿用 CUDA_VISIBLE_DEVICES;單顆可用 EMBED_GPU / RERANK_GPU / VL_GPU 覆寫
 CUDA_VISIBLE_DEVICES=0 ./scripts/start-rag-servers.sh
 EMBED_GPU=0 RERANK_GPU=1 VL_GPU=1 ./scripts/start-rag-servers.sh
+
+# 多 GPU 主機可先掃描 GPU 並互動選一顆，三個附屬 server 都會綁到該卡
+./scripts/start-rag-servers-mgpu.sh
+
+# 無互動環境可直接指定 nvidia-smi 顯示的 GPU index
+./scripts/start-rag-servers-mgpu.sh --gpu 1
 ```
+
+`start-rag-servers-mgpu.sh` 會用 `nvidia-smi` 顯示每張卡的 index、型號、總 VRAM、
+可用 VRAM 與 UUID，再詢問要使用哪一張。選定後會以 GPU UUID 綁定 embedding、
+reranker、VL，接著沿用原 launcher 的模型檢查、port 檢查、tmux 與 health check。
+先預覽而不啟動可加 `--dry-run`。
 
 `AICODE_RERANK_FALLBACK_POLICY` 只控制啟動後 reranker 呼叫失敗時的行為;啟動前 preflight 仍要求 reranker server ready。
 
