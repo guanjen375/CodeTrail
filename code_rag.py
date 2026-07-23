@@ -55,9 +55,18 @@ def _cached_get_embedding(text: str) -> tuple:
             model=EMBEDDING_MODEL,
             timeout=60,
         )
-        return tuple(emb) if emb else ()
-    except Exception:
-        return ()
+    except Exception as exc:
+        raise RuntimeError(
+            f"embedding server unreachable at {LLAMA_EMBED_BASE_URL}: {exc}. "
+            "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+        ) from exc
+
+    if not emb:
+        raise RuntimeError(
+            f"embedding server returned an empty vector at {LLAMA_EMBED_BASE_URL}. "
+            "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+        )
+    return tuple(emb)
 
 
 class CodeRAG:
@@ -356,7 +365,7 @@ class CodeRAG:
         """取得 embedding（使用 LRU cache 加速重複查詢）"""
         normalized = _normalize_text_for_cache(text)
         result = _cached_get_embedding(normalized)
-        return list(result) if result else []
+        return list(result)
 
     def _build_embed_text(self, item: dict) -> str:
         """Build embed text from a symbol/item dict.
@@ -429,7 +438,7 @@ class CodeRAG:
                 index_entry['type_hints'] = sym['type_hints']
 
             file_symbols.append(index_entry)
-            file_embeddings.append(emb if emb else [])
+            file_embeddings.append(emb)
 
         return file_symbols, file_embeddings
 
@@ -521,6 +530,12 @@ class CodeRAG:
 
                 if verbose and is_incremental:
                     print(f"   [REINDEX] {rel_path} ({len(symbols)} 個符號)")
+            except RuntimeError:
+                # Embedding failures must not leave a partial index that makes
+                # the next query skip build_index after the server recovers.
+                self.index = []
+                self.embeddings = None
+                raise
             except Exception as e:
                 print(f"[CODE_RAG] 索引 {rel_path} 時發生錯誤: {e}", file=sys.stderr)
                 continue
@@ -785,8 +800,6 @@ class CodeRAG:
                 return []
 
         q_emb = self._get_embedding(question)
-        if not q_emb:
-            return []
 
         code_tokens = self._extract_code_tokens(question)
         code_tokens_lower = {t.lower() for t in code_tokens}
@@ -819,8 +832,7 @@ class CodeRAG:
                 item = self.index[idx]
                 if not item.get("embedding"):
                     emb = self._get_embedding(self._build_embed_text(item))
-                    if emb:
-                        item["embedding"] = emb
+                    item["embedding"] = emb
 
         # 動態門檻：Bug 類問題稍微放寬
         threshold = CODE_RAG_THRESHOLD_BUG if is_bug_fix else CODE_RAG_THRESHOLD

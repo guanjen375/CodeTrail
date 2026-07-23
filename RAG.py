@@ -1056,9 +1056,10 @@ def generate_embeddings(chunks: List[Dict], cache_dir: Path = None) -> List[Dict
         content = chunk['content']
         content_key = _content_hash(content)
 
-        # 檢查快取
-        if content_key in cache:
-            chunk['embedding'] = cache[content_key]
+        # 檢查快取；舊版可能留下空向量，空值視為 miss 並重新請求。
+        cached_embedding = cache.get(content_key)
+        if cached_embedding:
+            chunk['embedding'] = cached_embedding
             cache_hits += 1
             continue
 
@@ -1070,13 +1071,22 @@ def generate_embeddings(chunks: List[Dict], cache_dir: Path = None) -> List[Dict
                 model=EMBEDDING_MODEL,
                 timeout=120,
             )
-            chunk['embedding'] = embedding
-            # 存入快取
-            cache[content_key] = embedding
-            cache_updated = True
-        except Exception as e:
-            print(f"\n  [ERROR] Embedding 失敗: {e}")
-            chunk['embedding'] = []
+        except Exception as exc:
+            raise RuntimeError(
+                f"embedding server unreachable at {LLAMA_EMBED_BASE_URL}: {exc}. "
+                "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+            ) from exc
+
+        if not embedding:
+            raise RuntimeError(
+                f"embedding server returned an empty vector at {LLAMA_EMBED_BASE_URL}. "
+                "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+            )
+
+        chunk['embedding'] = embedding
+        # 存入快取
+        cache[content_key] = embedding
+        cache_updated = True
 
     # 儲存更新後的快取
     if cache_updated:

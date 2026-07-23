@@ -80,9 +80,18 @@ def _cached_get_embedding(text: str) -> tuple:
             model=EMBEDDING_MODEL,
             timeout=120,
         )
-        return tuple(emb) if emb else ()
-    except Exception:
-        return ()
+    except Exception as exc:
+        raise RuntimeError(
+            f"embedding server unreachable at {LLAMA_EMBED_BASE_URL}: {exc}. "
+            "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+        ) from exc
+
+    if not emb:
+        raise RuntimeError(
+            f"embedding server returned an empty vector at {LLAMA_EMBED_BASE_URL}. "
+            "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+        )
+    return tuple(emb)
 
 
 class KnowledgeBase:
@@ -523,7 +532,7 @@ class KnowledgeBase:
         normalized = _normalize_text_for_cache(text)
         # 使用 cached function（回傳 tuple，需轉 list）
         result = _cached_get_embedding(normalized)
-        return list(result) if result else []
+        return list(result)
 
     def _extract_keywords(self, text: str) -> set:
         text = re.sub(r'[^\w\s\-_]', ' ', text.lower())
@@ -1001,8 +1010,6 @@ English:"""
 
         # 取得 query embedding
         q_emb = self._get_embedding(question)
-        if not q_emb:
-            return []
 
         # ===== Embedding 召回 =====
         if HAS_NUMPY and self._embeddings is not None and self._embeddings_normalized:
@@ -1044,8 +1051,7 @@ English:"""
                 # 用額外的 queries 增強 embedding 召回
                 for mq in multi_queries[1:]:
                     mq_emb = self._get_embedding(mq)
-                    if mq_emb:
-                        self._update_scores_with_expansion(scores, mq_emb)
+                    self._update_scores_with_expansion(scores, mq_emb)
 
                 # 重新排序
                 scores.sort(reverse=True, key=lambda x: x[0])

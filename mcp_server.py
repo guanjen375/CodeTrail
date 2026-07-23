@@ -884,6 +884,19 @@ def ingest_document(path: str, mode: str = "auto") -> str:
     out = result.stdout or ""
     if result.stderr:
         out += "\n--- stderr ---\n" + result.stderr
+
+    # RAG.py runs in a subprocess, so convert its fail-loud embedding error
+    # back into an exception at the MCP tool boundary. Keep other ingestion
+    # failures (including the existing VL behavior) as the current text result.
+    if result.returncode != 0:
+        for line in reversed(out.splitlines()):
+            if (
+                "embedding server unreachable at " in line
+                or "embedding server returned an empty vector at " in line
+            ):
+                detail = line.partition("RuntimeError: ")[2] or line.strip()
+                raise RuntimeError(detail)
+
     if len(out) > 8000:
         out = out[:4000] + "\n\n...[截斷中段]...\n\n" + out[-4000:]
 

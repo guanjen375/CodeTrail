@@ -35,7 +35,7 @@
     "expected": {
       "file": "code_rag.py",
       "symbol": "build_index",
-      "line": 424
+      "line": 445
     },
     "context": "."
   },

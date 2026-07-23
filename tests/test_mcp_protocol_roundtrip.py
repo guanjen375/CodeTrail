@@ -36,6 +36,7 @@ def _server_env(project: Path) -> dict[str, str]:
     env["PYTHONIOENCODING"] = "utf-8"
     # 指向一個關著的 port，確保子行程不會真的打 llama-server。
     env["AICODE_LLAMA_BASE_URL"] = "http://127.0.0.1:65535"
+    env["AICODE_LLAMA_EMBED_BASE_URL"] = "http://127.0.0.1:65535"
     env["AICODE_MODEL"] = "example-code-model"
     env["AICODE_REQUIRED_MODELS_CHECK_SKIP"] = "1"
     # 讓子行程找得到 mcp / numpy（可能裝在 user site）。
@@ -72,6 +73,27 @@ async def _roundtrip(project: Path):
             return names, listed, grepped
 
 
+async def _embedding_failure_roundtrip(project: Path):
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[str(REPO_ROOT / "mcp_server.py")],
+        env=_server_env(project),
+    )
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            code_result = await session.call_tool(
+                "code_rag_search", {"query": "hello function"}
+            )
+            knowledge_result = await session.call_tool(
+                "query_knowledge", {"question": "hello behavior"}
+            )
+            ingest_result = await session.call_tool(
+                "ingest_document", {"path": "ingest.md"}
+            )
+            return code_result, knowledge_result, ingest_result
+
+
 def _content_text(result) -> str:
     return "".join(getattr(c, "text", "") or "" for c in result.content)
 
@@ -91,6 +113,38 @@ def test_mcp_protocol_roundtrip(tmp_path: Path):
 
     assert grepped.isError is False, _content_text(grepped)
     assert "hello" in _content_text(grepped)
+
+
+def test_embedding_failure_is_a_tool_error_with_actionable_url(tmp_path: Path):
+    project = _make_project(tmp_path)
+    (project / "ingest.md").write_text("# Hello\n\nDocument chunk.\n", encoding="utf-8")
+    (project / "knowledge.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"documents": ["manual.md"]},
+                "chunks": [
+                    {
+                        "id": "manual-1",
+                        "source": "manual.md",
+                        "content": "hello behavior",
+                        "embedding": [1.0, 0.0],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code_result, knowledge_result, ingest_result = asyncio.run(
+        asyncio.wait_for(_embedding_failure_roundtrip(project), timeout=60)
+    )
+
+    for result in (code_result, knowledge_result, ingest_result):
+        error_text = _content_text(result)
+        assert result.isError is True, error_text
+        assert "http://127.0.0.1:65535" in error_text
+        assert "8081 llama-server" in error_text
+        assert "AICODE_LLAMA_EMBED_BASE_URL" in error_text
 
 
 # ---------------------------------------------------------------------------
