@@ -16,6 +16,9 @@ venv/
 *.swp
 *.swo
 
+# 本地 AI 協作工作流程指引(個人設定,勿提交)
+CLAUDE.md
+
 # 快取
 .code_rag_cache.json
 .code_rag_cache_meta.json
