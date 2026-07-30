@@ -132,7 +132,8 @@ embed_cmd_string() {
     printf '%s%s\n' "$prefix" "$(rag_quote_command \
         "$LLAMA_BIN" -m "$EMBED_MODEL" \
         --host "$EMBED_BIND_HOST" --port "$EMBED_PORT" \
-        -c 8192 --embedding --pooling cls -ngl 99)"
+        -c 8192 -b 8192 -ub 8192 \
+        --embedding --pooling cls -ngl 99)"
 }
 
 rerank_cmd_string() {
@@ -141,7 +142,8 @@ rerank_cmd_string() {
     printf '%s%s\n' "$prefix" "$(rag_quote_command \
         "$LLAMA_BIN" -m "$RERANK_MODEL" \
         --host "$RERANK_BIND_HOST" --port "$RERANK_PORT" \
-        -c 8192 --embedding --pooling rank --reranking -ngl 99)"
+        -c 8192 -b 8192 -ub 8192 \
+        --embedding --pooling rank --reranking -ngl 99)"
 }
 
 vl_cmd_string() {

@@ -48,3 +48,33 @@ def test_start_rag_servers_dry_run_uses_base_url_ports(tmp_path):
     assert "CUDA_VISIBLE_DEVICES=0" in proc.stdout
     assert "CUDA_VISIBLE_DEVICES=1" in proc.stdout
     assert "CUDA_VISIBLE_DEVICES=2" in proc.stdout
+
+
+def test_start_rag_servers_noncausal_models_use_full_physical_batch(tmp_path):
+    proc = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "start-rag-servers.sh"), "--dry-run"],
+        cwd=str(REPO_ROOT),
+        env={
+            **os.environ,
+            "LLAMA_BIN": str(tmp_path / "llama-server"),
+            "MODELS_DIR": str(tmp_path / "models"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    settings = dict(
+        line.split("=", 1)
+        for line in proc.stdout.splitlines()
+        if "=" in line
+    )
+
+    # llama.cpp non-causal embedding/reranking inputs must fit in one physical
+    # batch. Its default -ub 512 makes otherwise healthy servers return HTTP
+    # 500 as soon as a RAG chunk is longer than 512 tokens.
+    assert "-c 8192 -b 8192 -ub 8192" in settings["embed_command"]
+    assert "-c 8192 -b 8192 -ub 8192" in settings["rerank_command"]
+    assert "-ub 8192" not in settings["vl_command"]

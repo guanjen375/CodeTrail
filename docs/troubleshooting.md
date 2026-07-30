@@ -361,6 +361,30 @@ curl -s http://localhost:8083/health   # VL
 curl -s http://localhost:8080/props | jq '.model_path, .default_generation_settings.n_ctx'
 ```
 
+### embedding `/health` 正常、短 `curl` 成功,但 `ingest_document` 回 500
+
+先看 embedding server log:
+
+```bash
+tmux capture-pane -p -t codetrail-rag:embed -S -100
+```
+
+若看到 `input (...) is too large to process` 和
+`increase the physical batch size (current batch size: 512)`,代表 server 雖然
+ready,但 llama.cpp 的預設 physical batch `-ub 512` 放不下真實 RAG chunk。
+短字串 curl 會成功,不能排除這個設定錯誤。
+
+CodeTrail launcher 會把 embedding 與 reranker 都設成
+`-c 8192 -b 8192 -ub 8192`;重啟三顆附屬 server 套用:
+
+```bash
+./scripts/stop-rag-servers.sh
+./scripts/start-rag-servers.sh
+```
+
+若是手動啟動 embedding / reranker,也要讓 `-b`、`-ub` 至少容納最長輸入;
+non-causal pooling 不能把單一序列拆成較小的 physical batches。
+
 ### `aicode` 拒絕啟動,訊息說「主模型未設定」
 
 CodeTrail 不內建主聊天 / 程式推導模型,沒設好 `aicode` 會 fail-loud。任選一種設定方式:
