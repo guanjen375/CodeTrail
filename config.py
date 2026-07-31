@@ -134,7 +134,8 @@ VL_ANALYZE_TIMEOUT = int(_os.environ.get("AICODE_VL_ANALYZE_TIMEOUT", "180"))
 VL_INGEST_TIMEOUT = int(_os.environ.get("AICODE_VL_INGEST_TIMEOUT", "300"))
 
 # OpenCode 的 MCP timeout 是 client 端全域上限，必須略高於 ingest_document 的
-# 600 秒內部上限。aicode 啟動前會檢查，避免 10 秒 timeout 造成圖片與後續工具連鎖失敗。
+# 600 秒內部上限。aicode 啟動前會把既有 codetrail entry 自動同步到這個最小值，
+# 避免 10 秒 timeout 造成圖片與後續工具連鎖失敗。
 OPENCODE_MCP_TIMEOUT_MIN_MS = 660_000
 
 

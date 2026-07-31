@@ -355,7 +355,15 @@ jq '.mcp.codetrail.timeout' ~/.config/opencode/opencode.json
 此時可能還在 MCP server 內收尾，接下來送出的 `file_info` / `list_dir` 也會排隊，
 所以表面上會像所有工具同時壞掉。
 
-把它改成 660000（11 分鐘，略高於 `ingest_document` 的 10 分鐘內部上限）：
+正常入口直接重新執行 `aicode`：新版 wrapper 會在 OpenCode 啟動前把既有
+`mcp.codetrail.timeout` 自動同步為 660000（11 分鐘，略高於
+`ingest_document` 的 10 分鐘內部上限），並備份原設定。也可單獨執行：
+
+```bash
+python3 <CODETRAIL_REPO>/scripts/opencode_mcp_timeout_check.py --fix
+```
+
+同步後的欄位會是：
 
 ```json
 {
@@ -367,10 +375,10 @@ jq '.mcp.codetrail.timeout' ~/.config/opencode/opencode.json
 }
 ```
 
-改完要完全退出並重開 `aicode`，已啟動的 OpenCode 不會重新讀設定。CodeTrail 自己
-仍會用較短的單次 VL HTTP timeout，且圖片生成有有限 token 預算；660000 只是讓
-OpenCode 不要比工具本身更早切斷。新版 `aicode` 也會在啟動時做
-`[mcp-timeout]` 檢查；只有緊急測試才用
+若你是直接啟動 `opencode`、不是使用 `aicode`，同步後要完全退出並重開，已啟動的
+OpenCode 不會重新讀設定。CodeTrail 自己仍會用較短的單次 VL HTTP timeout，且圖片
+生成有有限 token 預算；660000 只是讓 OpenCode 不要比工具本身更早切斷。設定檔
+無法解析或寫入時，`aicode` 會 fail-loud；只有緊急測試才用
 `AICODE_MCP_TIMEOUT_CHECK_SKIP=1 aicode` 跳過。
 
 若 timeout 已正確，但圖片回答像是在描述一張不存在的通用終端畫面，跑：

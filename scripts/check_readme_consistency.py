@@ -8,6 +8,7 @@
   3. config.py 的固定附屬模型 EMBEDDING_MODEL / RERANKER_MODEL / VL_MODEL 在文件出現
   4. README 必須包含「成熟私有部署版」/「不公開發布」之類產品狀態語句
   5. README / docs 必須提到 llama-server / GGUF / <CODE_MODEL> placeholder / OpenCode JSON 範本
+  6. README OpenCode 範本的 MCP timeout == config.py 的 runtime 最小值
 
 退出碼:0=OK, 1=有 drift。
 """
@@ -91,6 +92,31 @@ def _config_model_values(config_text: str) -> dict[str, str]:
                 out[attr] = m.group(1)
                 break
     return out
+
+
+def _config_int_constant(config_text: str, name: str) -> int | None:
+    match = re.search(
+        rf"^{re.escape(name)}\s*=\s*([0-9][0-9_]*)\s*$",
+        config_text,
+        re.MULTILINE,
+    )
+    return int(match.group(1).replace("_", "")) if match else None
+
+
+def _check_opencode_timeout_contract(
+    readme_text: str,
+    config_text: str,
+    issues: list[str],
+) -> None:
+    minimum = _config_int_constant(config_text, "OPENCODE_MCP_TIMEOUT_MIN_MS")
+    if minimum is None:
+        issues.append("check_readme_consistency.py 無法解析 OPENCODE_MCP_TIMEOUT_MIN_MS")
+        return
+    if f'"timeout": {minimum}' not in readme_text:
+        issues.append(
+            "README OpenCode JSON 範本的 mcp.codetrail.timeout 必須等於 "
+            f"config.py OPENCODE_MCP_TIMEOUT_MIN_MS={minimum}"
+        )
 
 
 def _check_code_model_placeholder_contract(readme_text: str, docs_text: str, issues: list[str]) -> None:
@@ -195,6 +221,9 @@ def check_all() -> list[str]:
     _check_code_model_placeholder_contract(readme_text, docs_text, issues)
     _check_doctor_commands_have_explicit_model(docs_text, issues)
     _check_forbidden_main_model_tokens(docs_text, issues)
+
+    # 6. OpenCode client timeout contract
+    _check_opencode_timeout_contract(readme_text, config_text, issues)
 
     return issues
 

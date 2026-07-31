@@ -210,8 +210,11 @@ if [ -f "$CODETRAIL_HOME/scripts/opencode_ctx_check.py" ]; then
 fi
 
 if [ -f "$CODETRAIL_HOME/scripts/opencode_mcp_timeout_check.py" ]; then
-  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/opencode_mcp_timeout_check.py"; then
-    echo "[aicode] OpenCode MCP timeout check refused to start (see [mcp-timeout] above)." >&2
+  # 這是可安全自動對齊的單一 client 欄位：只改既有
+  # mcp.codetrail.timeout，保留其他 OpenCode 設定並留下備份。這讓舊使用者
+  # git pull 後第一次執行 aicode 就修好，不必逐台手動改全域設定。
+  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/opencode_mcp_timeout_check.py" --fix; then
+    echo "[aicode] OpenCode MCP timeout sync refused to start (see [mcp-timeout] above)." >&2
     exit 2
   fi
 fi

@@ -140,7 +140,7 @@ ssh -L 8080:localhost:8080 -L 8081:localhost:8081 -L 8082:localhost:8082 -L 8083
 
 ## `aicode` wrapper 詳細行為
 
-`aicode` 是一個 shell wrapper,啟動 `opencode` 之前做八件事:
+`aicode` 是一個 shell wrapper,啟動 `opencode` 之前做九件事:
 
 1. 把目前目錄設成 `AICODE_ROOT`(沙箱根)
 2. 拒絕 `AICODE_ROOT=/` 或 `AICODE_ROOT=$HOME`(可能誤刪 / 誤改大量檔案)
@@ -148,8 +148,9 @@ ssh -L 8080:localhost:8080 -L 8081:localhost:8081 -L 8082:localhost:8082 -L 8083
 4. 用 `scripts/resolve_main_model.py` 解析主模型；若 `AICODE_MODEL` 和 opencode.json 同時存在且沒傳 CLI `-m/--model`,兩者必須指向同一顆
 5. 讀主 llama-server `/props` 拿真實 `n_ctx`,在使用者沒手動設時自動 export 成 `AICODE_DYNAMIC_NUM_CTX_MAX`(`scripts/resolve_server_ctx.py`)—— CodeTrail 的 ctx 上限就此自動跟隨 server。接著 `scripts/ctx_safety_check.py` 當容量閘:requested 只要不超過 server `n_ctx` 就放行,只有「使用者手動把它設得比 server 大」才 `exit 2`(prompt 會被截斷)。server 不可連時 graceful 放行只 warn
 6. 跑 `scripts/opencode_ctx_check.py`,確認 OpenCode active model 的 `limit.context` 等於 server `-c`(= CodeTrail 已自動跟隨的上限)—— 這是唯一要你手動對齊的數字,避免 TUI 32K compact 但 CodeTrail MCP 以為自己有 64K
-7. 啟動 `opencode`,讓子行程繼承同一個沙箱根目錄
-8. 把使用者傳入的 `-m / --model` 原樣轉發給 OpenCode;沒傳就讓 OpenCode 自己讀 `opencode.json` 的 `"model"` 欄位
+7. 跑 `scripts/opencode_mcp_timeout_check.py --fix`,把既有 `mcp.codetrail.timeout` 自動同步到專案要求的最小值；只改這個欄位、原子寫入並備份原設定，失敗就拒絕啟動
+8. 啟動 `opencode`,讓子行程繼承同一個沙箱根目錄
+9. 把使用者傳入的 `-m / --model` 原樣轉發給 OpenCode;沒傳就讓 OpenCode 自己讀 `opencode.json` 的 `"model"` 欄位
 
 ---
 

@@ -5,6 +5,8 @@ from scripts.check_readme_consistency import (
     _check_code_model_placeholder_contract,
     _check_doctor_commands_have_explicit_model,
     _check_forbidden_main_model_tokens,
+    _check_opencode_timeout_contract,
+    _config_int_constant,
     _config_model_values,
     _mcp_tool_names,
     _readme_claimed_tool_count,
@@ -56,6 +58,28 @@ MODEL = _resolve_main_model()
         "RERANKER_MODEL": "bge-reranker-v2-m3",
         "VL_MODEL": "qwen3-vl",
     }
+
+
+def test_opencode_timeout_contract_matches_runtime_constant():
+    config_text = "OPENCODE_MCP_TIMEOUT_MIN_MS = 660_000\n"
+    assert (
+        _config_int_constant(config_text, "OPENCODE_MCP_TIMEOUT_MIN_MS") == 660_000
+    )
+
+    issues: list[str] = []
+    _check_opencode_timeout_contract(
+        '{"mcp":{"codetrail":{"timeout": 660000}}}',
+        config_text,
+        issues,
+    )
+    assert issues == []
+
+    _check_opencode_timeout_contract(
+        '{"mcp":{"codetrail":{"timeout": 10000}}}',
+        config_text,
+        issues,
+    )
+    assert any("660000" in issue for issue in issues)
 
 
 def test_code_model_placeholder_contract_passes_with_llamacpp_setup():

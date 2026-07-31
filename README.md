@@ -574,8 +574,14 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
 分析通常超過 10 秒，`ingest_document` 的內部上限則是 10 分鐘，因此範本使用
 660000 ms（11 分鐘）。若沿用 OpenCode 常見的 `10000`，第一個圖片呼叫會在剛好
 10 秒被 client 切斷，後續 `file_info` / `list_dir` 也可能排在尚未結束的圖片請求
-後面，看起來像整個 MCP server 一起超時。`aicode` 啟動時會檢查這個值，太短就
-fail-loud 並顯示要修改的欄位；只有緊急測試才用
+後面，看起來像整個 MCP server 一起超時。
+
+`aicode` 啟動時會把**既有** `mcp.codetrail` entry 中缺漏、型別錯誤或小於
+660000 的 `timeout` 自動同步為專案常數，保留其餘 OpenCode JSON 設定，並在同目錄
+留下 `opencode.json.codetrail.bak`（若已存在則加數字後綴）。寫入採原子替換；
+設定檔格式錯誤或無法寫入時會 fail-loud，不會帶著已知錯誤啟動 OpenCode。這表示
+舊使用者 `git pull` 後直接重新執行 `aicode` 即可，不需要逐台手改。若整個
+`mcp.codetrail` entry 尚未建立，仍須先依上方完整範本完成首次設定。只有緊急測試才用
 `AICODE_MCP_TIMEOUT_CHECK_SKIP=1 aicode` 跳過。
 
 說明:
@@ -631,7 +637,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
-`aicode` 做的事:把目前目錄設成 `AICODE_ROOT`(沙箱根目錄)、拒絕從 `$HOME` 或 `/` 起、在當前 git root 準備 `.opencode/run-codetrail-mcp` 讓 OpenCode 的 MCP command 找得到、啟動前讀主 llama-server 真實 `n_ctx` 自動設成 CodeTrail 的 ctx 上限、並確認 OpenCode active model 的 `limit.context` 也等於 server `-c`(不一致就拒絕啟動)、最後啟 `opencode`。
+`aicode` 做的事:把目前目錄設成 `AICODE_ROOT`(沙箱根目錄)、拒絕從 `$HOME` 或 `/` 起、在當前 git root 準備 `.opencode/run-codetrail-mcp` 讓 OpenCode 的 MCP command 找得到、自動同步既有 `mcp.codetrail.timeout` 並備份原設定、啟動前讀主 llama-server 真實 `n_ctx` 自動設成 CodeTrail 的 ctx 上限、確認 OpenCode active model 的 `limit.context` 也等於 server `-c`(不一致就拒絕啟動)、最後啟 `opencode`。
 
 ### 4.5 安裝 `aicodex` 啟動指令
 
