@@ -235,7 +235,7 @@ HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
 
 ### 2.3 下載 RAG 附屬模型
 
-CodeTrail 的 RAG / Code-RAG 內建固定使用 `bge-m3`(embedding) 與 `bge-reranker-v2-m3`(reranker)。兩者都是必要副模型:聊天 frontend 啟動前會硬性檢查 embedding / reranker / VL 都 ready,reranker 缺失不再降級成 embedding 排序。這兩個體積很小:
+CodeTrail 的 RAG / Code-RAG 內建固定使用 `bge-m3`(embedding) 與 `qwen3-reranker-0.6b`(reranker)。兩者都是必要副模型:聊天 frontend 啟動前會硬性檢查 embedding / reranker / VL 都 ready,reranker 缺失不再降級成 embedding 排序。這兩個體積很小:
 
 ```bash
 # embedding:bge-m3 (用 f16,不要量化 — embedding 對量化敏感,Q4 會明顯影響召回)
@@ -243,26 +243,26 @@ HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
   CompendiumLabs/bge-m3-gguf bge-m3-f16.gguf \
   --local-dir ~/models/bge-m3
 
-# reranker:bge-reranker-v2-m3
-HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
-  gpustack/bge-reranker-v2-m3-GGUF bge-reranker-v2-m3-Q8_0.gguf \
-  --local-dir ~/models/bge-reranker-v2-m3
+# reranker:Qwen3-Reranker 0.6B Q8_0
+HF_XET_HIGH_PERFORMANCE=1 hf download \
+  ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF qwen3-reranker-0.6b-q8_0.gguf \
+  --local-dir ~/models/qwen3-reranker-0.6b
 ```
 
 兩個合計約 2GB 級。
 
 ### 2.4 VL 模型
 
-CodeTrail 的內建 VL key 是 `qwen3-vl`。目前不需要替換:Qwen3-VL 有官方 GGUF 與 mmproj,適合本專案的截圖、UI 錯誤畫面與圖片 ingestion。預設 launcher 會找 Qwen3-VL 8B Instruct Q4_K_M + F16 mmproj;若你要用別的相容 VL GGUF,啟動前設定 `VL_GGUF` / `VL_MMPROJ`。
+CodeTrail 的內建 VL key 是 `qwen3.5-9b`。Qwen3.5-9B 是原生多模態模型,適合本專案的截圖、UI 錯誤畫面與圖片 ingestion。預設 launcher 會找 Qwen3.5-9B Q6_K + F16 mmproj;若你要用別的相容 VL GGUF,啟動前設定 `VL_GGUF` / `VL_MMPROJ`。
 
 > 「圖片 ingestion」就是 **VL + RAG 一起用**:`ingest_document(...)` 餵圖片時會自動呼叫 VL 把圖看成文字、再切 chunk 進知識庫,所以截圖/架構圖/規格頁能變成之後 `query_knowledge(...)` 查得到的內容。一次性看圖用 `analyze_file(...)`,要長期反覆查改用 `ingest_document(...)`;完整串接見 [docs/rag.md](docs/rag.md)。
 
 ```bash
-HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
-  Qwen/Qwen3-VL-8B-Instruct-GGUF \
-  Qwen3VL-8B-Instruct-Q4_K_M.gguf \
-  mmproj-Qwen3VL-8B-Instruct-F16.gguf \
-  --local-dir ~/models/qwen3-vl
+HF_XET_HIGH_PERFORMANCE=1 hf download \
+  unsloth/Qwen3.5-9B-GGUF \
+  Qwen3.5-9B-Q6_K.gguf \
+  mmproj-F16.gguf \
+  --local-dir ~/models/qwen3.5-9b
 ```
 
 ---
@@ -275,8 +275,8 @@ CodeTrail 會把不同角色拆成不同 `llama-server` instance:main / embeddin
 |---|---|---|---|
 | 8080 | main(聊天、推理、工具呼叫) | `<CODE_MODEL>` | 是 |
 | 8081 | embedding(算向量,RAG 搜相似段落) | `bge-m3` | 是 |
-| 8082 | reranker(RAG 結果重排) | `bge-reranker-v2-m3` | 是 |
-| 8083 | VL(看截圖 / 圖片) | `qwen3-vl` 等 | 是 |
+| 8082 | reranker(RAG 結果重排) | `qwen3-reranker-0.6b` | 是 |
+| 8083 | VL(看截圖 / 圖片) | `qwen3.5-9b` 等 | 是 |
 
 下面用 main + 三顆附屬 server 示範。主 server 自己一個 tmux session;embedding / reranker / VL 由 §3.2 script 合在同一個 tmux session 內。流程都一樣:啟動 → 等 `server is listening on ...` / `/health status=ok` → 按 `Ctrl-b d` 退出來放背景。terminal 之後關掉也不會死。
 
@@ -342,7 +342,7 @@ srv  llama_server: server is listening on http://0.0.0.0:8080
 
 ### 3.2 附屬 server — embedding + reranker + VL(一鍵啟動 script)
 
-三顆必要副模型(embedding `bge-m3`、reranker `bge-reranker-v2-m3`、VL `qwen3-vl`)由 script 一次啟動,合在同一個 tmux session `codetrail-rag` 的三個 window 內,使用者只需要管理一個 session。script 會從 `AICODE_LLAMA_EMBED_BASE_URL` / `AICODE_LLAMA_RERANK_BASE_URL` / `AICODE_LLAMA_VL_BASE_URL` 解析 host:port(預設 `http://localhost:8081` / `http://localhost:8082` / `http://localhost:8083`),啟動後輪詢 `/health` JSON,直到 `status == "ok"` 才算成功;`status="loading model"` 不算 ready。
+三顆必要副模型(embedding `bge-m3`、reranker `qwen3-reranker-0.6b`、VL `qwen3.5-9b`)由 script 一次啟動,合在同一個 tmux session `codetrail-rag` 的三個 window 內,使用者只需要管理一個 session。script 會從 `AICODE_LLAMA_EMBED_BASE_URL` / `AICODE_LLAMA_RERANK_BASE_URL` / `AICODE_LLAMA_VL_BASE_URL` 解析 host:port(預設 `http://localhost:8081` / `http://localhost:8082` / `http://localhost:8083`),啟動後輪詢 `/health` JSON,直到 `status == "ok"` 才算成功;`status="loading model"` 不算 ready。
 
 ```bash
 chmod +x scripts/start-rag-servers.sh    # 第一次跑要加 exec bit
@@ -410,7 +410,7 @@ Aux model servers ready。驗證:
 
 (平常不用看 log,真要偵錯才 `tmux a -t codetrail-rag`,session 內 `Ctrl-b n` 切 embed/rerank/vl window,`Ctrl-b d` 退出。)
 
-**模型路徑非預設**:script 先找 `~/models/bge-m3/bge-m3-f16.gguf`、`~/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q8_0.gguf`、`~/models/qwen3-vl/Qwen3VL-8B-Instruct-Q4_K_M.gguf` 與 `~/models/qwen3-vl/mmproj-Qwen3VL-8B-Instruct-F16.gguf`;找不到時會在對應目錄 glob。若放別處,啟動前 `export MODELS_DIR=/your/path`;若要指定完整檔案,用 `EMBED_MODEL=/path/to/bge-m3*.gguf`、`RERANK_MODEL=/path/to/bge-reranker-v2-m3*.gguf`、`VL_GGUF=/path/to/Qwen3VL*.gguf`、`VL_MMPROJ=/path/to/mmproj*.gguf`。llama-server 不在 `~/llama.cpp/...` 也類似:`export LLAMA_BIN=/your/llama-server`。
+**模型路徑非預設**:script 先找 `~/models/bge-m3/bge-m3-f16.gguf`、`~/models/qwen3-reranker-0.6b/qwen3-reranker-0.6b-q8_0.gguf`、`~/models/qwen3.5-9b/Qwen3.5-9B-Q6_K.gguf` 與 `~/models/qwen3.5-9b/mmproj-F16.gguf`;找不到時會在對應目錄 glob。若放別處,啟動前 `export MODELS_DIR=/your/path`;若要指定完整檔案,用 `EMBED_MODEL=/path/to/bge-m3*.gguf`、`RERANK_MODEL=/path/to/qwen3-reranker*.gguf`、`VL_GGUF=/path/to/Qwen3.5*.gguf`、`VL_MMPROJ=/path/to/mmproj*.gguf`。llama-server 不在 `~/llama.cpp/...` 也類似:`export LLAMA_BIN=/your/llama-server`。
 
 ### 3.3 驗活與維運
 
@@ -471,7 +471,7 @@ cat > ~/.config/codetrail/models.json <<'EOF'
 {
   "<CODE_MODEL>": "~/models/<CODE_MODEL_GGUF_RELATIVE_PATH>.gguf",
   "bge-m3": "~/models/bge-m3/bge-m3-f16.gguf",
-  "bge-reranker-v2-m3": "~/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q8_0.gguf"
+  "qwen3-reranker-0.6b": "~/models/qwen3-reranker-0.6b/qwen3-reranker-0.6b-q8_0.gguf"
 }
 EOF
 ```
@@ -482,7 +482,7 @@ EOF
 {
   "qwen3-235b-a22b-thinking": "~/models/Qwen3-235B-A22B-Thinking-2507-GGUF/UD-Q4_K_XL/Qwen3-235B-A22B-Thinking-2507-UD-Q4_K_XL-00001-of-00003.gguf",
   "bge-m3": "~/models/bge-m3/bge-m3-f16.gguf",
-  "bge-reranker-v2-m3": "~/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q8_0.gguf"
+  "qwen3-reranker-0.6b": "~/models/qwen3-reranker-0.6b/qwen3-reranker-0.6b-q8_0.gguf"
 }
 ```
 

@@ -5,8 +5,8 @@ When a CodeTrail chat/frontend session starts, the local main model is only
 useful if the three auxiliary model servers are also available:
 
   - embedding: bge-m3 on /embedding
-  - reranker: bge-reranker-v2-m3 on /reranking
-  - VL: qwen3-vl-compatible server accepting OpenAI image_url content
+  - reranker: qwen3-reranker-0.6b on /reranking
+  - VL: qwen3.5-9b-compatible server accepting OpenAI image_url content
 
 This script is intentionally stricter than doctor.py: missing auxiliary
 servers are FAIL, not WARN.

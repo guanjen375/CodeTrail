@@ -18,8 +18,8 @@ from model_resolution import (
 # 預設 port 排列:
 #     8080 主聊天 / 程式推導(--alias 對應 AICODE_MODEL)
 #     8081 embedding         (--embedding,通常掛 bge-m3)
-#     8082 reranker          (--reranking,通常掛 bge-reranker-v2-m3)
-#     8083 VL 多模態         (--mmproj,通常掛 qwen3-vl 或 llava 系列)
+#     8082 reranker          (--reranking,通常掛 qwen3-reranker-0.6b)
+#     8083 VL 多模態         (--mmproj,通常掛 qwen3.5-9b 或其他相容 VL)
 # 任一 port 可用環境變數覆寫(testing / 遠端 server / port 衝突時用)。
 LLAMA_BASE_URL = _os.environ.get("AICODE_LLAMA_BASE_URL", "http://localhost:8080")
 LLAMA_EMBED_BASE_URL = _os.environ.get("AICODE_LLAMA_EMBED_BASE_URL", "http://localhost:8081")
@@ -120,7 +120,7 @@ def resolve_model_path(name_or_path: str) -> str:
 # embedding / reranker / VL 在 llama.cpp 架構下,model id 只是 informational
 # (server 啟動時就鎖死一顆 GGUF),這裡的常數主要用來寫 telemetry 與顯示。
 # 沿用舊名稱 EMBEDDING_MODEL / RERANKER_MODEL,因為下面 RAG 區段已經有 import。
-VL_MODEL = _os.environ.get("AICODE_VL_MODEL", "qwen3-vl")
+VL_MODEL = _os.environ.get("AICODE_VL_MODEL", "qwen3.5-9b")
 
 # VL 圖片分析預算。
 #
@@ -392,7 +392,7 @@ KNOWLEDGE_CONTENT_MAX_CHARS = 2000
 KNOWLEDGE_MERGE_ADJACENT = True
 KNOWLEDGE_MERGE_MAX_CHARS = 2500
 EMBEDDING_MODEL = _os.environ.get("AICODE_EMBED_MODEL", "bge-m3")
-RERANKER_MODEL = _os.environ.get("AICODE_RERANK_MODEL", "bge-reranker-v2-m3")
+RERANKER_MODEL = _os.environ.get("AICODE_RERANK_MODEL", "qwen3-reranker-0.6b")
 RERANK_FALLBACK_POLICY = _os.environ.get("AICODE_RERANK_FALLBACK_POLICY", "error").strip().lower()
 _RERANK_FALLBACK_POLICIES = {"embedding", "main_model", "error"}
 if RERANK_FALLBACK_POLICY not in _RERANK_FALLBACK_POLICIES:

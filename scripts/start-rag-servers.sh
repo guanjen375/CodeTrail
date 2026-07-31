@@ -105,9 +105,9 @@ find_model_path() {
 }
 
 DEFAULT_EMBED_MODEL="$MODELS_DIR/bge-m3/bge-m3-f16.gguf"
-DEFAULT_RERANK_MODEL="$MODELS_DIR/bge-reranker-v2-m3/bge-reranker-v2-m3-Q8_0.gguf"
-DEFAULT_VL_GGUF="$MODELS_DIR/qwen3-vl/Qwen3VL-8B-Instruct-Q4_K_M.gguf"
-DEFAULT_VL_MMPROJ="$MODELS_DIR/qwen3-vl/mmproj-Qwen3VL-8B-Instruct-F16.gguf"
+DEFAULT_RERANK_MODEL="$MODELS_DIR/qwen3-reranker-0.6b/qwen3-reranker-0.6b-q8_0.gguf"
+DEFAULT_VL_GGUF="$MODELS_DIR/qwen3.5-9b/Qwen3.5-9B-Q6_K.gguf"
+DEFAULT_VL_MMPROJ="$MODELS_DIR/qwen3.5-9b/mmproj-F16.gguf"
 
 EMBED_MODEL="${EMBED_MODEL:-}"
 RERANK_MODEL="${RERANK_MODEL:-}"
@@ -117,13 +117,13 @@ if [[ -z "$EMBED_MODEL" ]]; then
     EMBED_MODEL="$(find_model_path "$DEFAULT_EMBED_MODEL" "$MODELS_DIR/bge-m3" 'bge-m3*.gguf' "$DRY_RUN" || true)"
 fi
 if [[ -z "$RERANK_MODEL" ]]; then
-    RERANK_MODEL="$(find_model_path "$DEFAULT_RERANK_MODEL" "$MODELS_DIR/bge-reranker-v2-m3" 'bge-reranker-v2-m3*.gguf' "$DRY_RUN" || true)"
+    RERANK_MODEL="$(find_model_path "$DEFAULT_RERANK_MODEL" "$MODELS_DIR/qwen3-reranker-0.6b" 'qwen3-reranker-0.6b*.gguf' "$DRY_RUN" || true)"
 fi
 if [[ -z "$VL_GGUF" ]]; then
-    VL_GGUF="$(find_model_path "$DEFAULT_VL_GGUF" "$MODELS_DIR/qwen3-vl" 'Qwen3VL-8B-Instruct*.gguf' "$DRY_RUN" || true)"
+    VL_GGUF="$(find_model_path "$DEFAULT_VL_GGUF" "$MODELS_DIR/qwen3.5-9b" 'Qwen3.5-9B*.gguf' "$DRY_RUN" || true)"
 fi
 if [[ -z "$VL_MMPROJ" ]]; then
-    VL_MMPROJ="$(find_model_path "$DEFAULT_VL_MMPROJ" "$MODELS_DIR/qwen3-vl" 'mmproj-Qwen3VL-8B-Instruct*.gguf' "$DRY_RUN" || true)"
+    VL_MMPROJ="$(find_model_path "$DEFAULT_VL_MMPROJ" "$MODELS_DIR/qwen3.5-9b" 'mmproj*.gguf' "$DRY_RUN" || true)"
 fi
 
 embed_cmd_string() {
@@ -204,13 +204,13 @@ check_model_files() {
 
     if [[ -z "$RERANK_MODEL" || ! -f "$RERANK_MODEL" ]]; then
         echo "ERROR: 找不到 reranker 模型: ${RERANK_MODEL:-$DEFAULT_RERANK_MODEL}" >&2
-        echo "       依 README §2.3 下載 bge-reranker-v2-m3,或設定 RERANK_MODEL=/path/to/bge-reranker*.gguf" >&2
+        echo "       依 README §2.3 下載 qwen3-reranker-0.6b,或設定 RERANK_MODEL=/path/to/qwen3-reranker*.gguf" >&2
         exit 1
     fi
 
     if [[ -z "$VL_GGUF" || ! -f "$VL_GGUF" ]]; then
         echo "ERROR: 找不到 VL 模型: ${VL_GGUF:-$DEFAULT_VL_GGUF}" >&2
-        echo "       依 README §2.4 下載 qwen3-vl GGUF,或設定 VL_GGUF=/path/to/Qwen3VL*.gguf" >&2
+        echo "       依 README §2.4 下載 qwen3.5-9b GGUF,或設定 VL_GGUF=/path/to/Qwen3.5*.gguf" >&2
         exit 1
     fi
 

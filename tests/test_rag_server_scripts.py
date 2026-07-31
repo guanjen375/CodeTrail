@@ -45,6 +45,9 @@ def test_start_rag_servers_dry_run_uses_base_url_ports(tmp_path):
     assert "--port 18082" in proc.stdout
     assert "--port 18083" in proc.stdout
     assert "--mmproj" in proc.stdout
+    assert "qwen3-reranker-0.6b/qwen3-reranker-0.6b-q8_0.gguf" in proc.stdout
+    assert "qwen3.5-9b/Qwen3.5-9B-Q6_K.gguf" in proc.stdout
+    assert "qwen3.5-9b/mmproj-F16.gguf" in proc.stdout
     assert "CUDA_VISIBLE_DEVICES=0" in proc.stdout
     assert "CUDA_VISIBLE_DEVICES=1" in proc.stdout
     assert "CUDA_VISIBLE_DEVICES=2" in proc.stdout

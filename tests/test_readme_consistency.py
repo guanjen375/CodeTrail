@@ -49,14 +49,14 @@ def test_readme_tool_table_extracts_backtick_calls():
 def test_config_model_values_parse_literals_and_env_defaults():
     sample = '''
 EMBEDDING_MODEL = _os.environ.get("AICODE_EMBED_MODEL", "bge-m3")
-RERANKER_MODEL = _os.environ.get("AICODE_RERANK_MODEL", "bge-reranker-v2-m3")
-VL_MODEL = _os.environ.get("AICODE_VL_MODEL", "qwen3-vl")
+RERANKER_MODEL = _os.environ.get("AICODE_RERANK_MODEL", "qwen3-reranker-0.6b")
+VL_MODEL = _os.environ.get("AICODE_VL_MODEL", "qwen3.5-9b")
 MODEL = _resolve_main_model()
 '''
     assert _config_model_values(sample) == {
         "EMBEDDING_MODEL": "bge-m3",
-        "RERANKER_MODEL": "bge-reranker-v2-m3",
-        "VL_MODEL": "qwen3-vl",
+        "RERANKER_MODEL": "qwen3-reranker-0.6b",
+        "VL_MODEL": "qwen3.5-9b",
     }
 
 

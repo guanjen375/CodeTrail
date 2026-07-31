@@ -61,7 +61,7 @@ except ImportError:
     CHUNK_SETTINGS = {'default': {'size': 1200, 'overlap': 200}}
     LLAMA_EMBED_BASE_URL = "http://localhost:8081"
     LLAMA_VL_BASE_URL = "http://localhost:8083"
-    VL_MODEL = "qwen3-vl"
+    VL_MODEL = "qwen3.5-9b"
     VL_INGEST_MAX_TOKENS = 2048
     VL_INGEST_TIMEOUT = 300
 
