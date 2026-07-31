@@ -34,7 +34,7 @@ LLAMA_SLOTS_URL = f"{LLAMA_BASE_URL}/slots"
 LLAMA_HEALTH_URL = f"{LLAMA_BASE_URL}/health"
 LLAMA_EMBEDDINGS_URL = f"{LLAMA_EMBED_BASE_URL}/embedding"
 LLAMA_RERANK_URL = f"{LLAMA_RERANK_BASE_URL}/reranking"
-LLAMA_VL_URL = f"{LLAMA_VL_BASE_URL}/completion"
+LLAMA_VL_URL = f"{LLAMA_VL_BASE_URL}/v1/chat/completions"
 
 
 # ============================================================
@@ -121,6 +121,21 @@ def resolve_model_path(name_or_path: str) -> str:
 # (server 啟動時就鎖死一顆 GGUF),這裡的常數主要用來寫 telemetry 與顯示。
 # 沿用舊名稱 EMBEDDING_MODEL / RERANKER_MODEL,因為下面 RAG 區段已經有 import。
 VL_MODEL = _os.environ.get("AICODE_VL_MODEL", "qwen3-vl")
+
+# VL 圖片分析預算。
+#
+# analyze_file 是互動式「先看一眼」：輸出要完整但不能讓 MCP call 無上限生成。
+# ingest_document 需要較完整的結構化文字供 RAG 切 chunk，因此給較大的預算。
+# timeout 是單次 HTTP read timeout；http_client 對 read timeout 不重試，避免一張圖
+# 卡住後把同一個昂貴的生成請求重送數次。
+VL_ANALYZE_MAX_TOKENS = int(_os.environ.get("AICODE_VL_ANALYZE_MAX_TOKENS", "1024"))
+VL_INGEST_MAX_TOKENS = int(_os.environ.get("AICODE_VL_INGEST_MAX_TOKENS", "2048"))
+VL_ANALYZE_TIMEOUT = int(_os.environ.get("AICODE_VL_ANALYZE_TIMEOUT", "180"))
+VL_INGEST_TIMEOUT = int(_os.environ.get("AICODE_VL_INGEST_TIMEOUT", "300"))
+
+# OpenCode 的 MCP timeout 是 client 端全域上限，必須略高於 ingest_document 的
+# 600 秒內部上限。aicode 啟動前會檢查，避免 10 秒 timeout 造成圖片與後續工具連鎖失敗。
+OPENCODE_MCP_TIMEOUT_MIN_MS = 660_000
 
 
 def _read_opencode_main_model() -> str:

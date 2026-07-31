@@ -537,7 +537,7 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
         "root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P); exec \"$root/.opencode/run-codetrail-mcp\""
       ],
       "enabled": true,
-      "timeout": 10000
+      "timeout": 660000
     }
   },
 
@@ -569,6 +569,14 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
   }
 }
 ```
+
+`mcp.codetrail.timeout` 的單位是毫秒，而且套用到每一次 MCP tool call。圖片 VL
+分析通常超過 10 秒，`ingest_document` 的內部上限則是 10 分鐘，因此範本使用
+660000 ms（11 分鐘）。若沿用 OpenCode 常見的 `10000`，第一個圖片呼叫會在剛好
+10 秒被 client 切斷，後續 `file_info` / `list_dir` 也可能排在尚未結束的圖片請求
+後面，看起來像整個 MCP server 一起超時。`aicode` 啟動時會檢查這個值，太短就
+fail-loud 並顯示要修改的欄位；只有緊急測試才用
+`AICODE_MCP_TIMEOUT_CHECK_SKIP=1 aicode` 跳過。
 
 說明:
 

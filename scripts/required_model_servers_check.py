@@ -6,7 +6,7 @@ useful if the three auxiliary model servers are also available:
 
   - embedding: bge-m3 on /embedding
   - reranker: bge-reranker-v2-m3 on /reranking
-  - VL: qwen3-vl-compatible server accepting image_data
+  - VL: qwen3-vl-compatible server accepting OpenAI image_url content
 
 This script is intentionally stricter than doctor.py: missing auxiliary
 servers are FAIL, not WARN.
@@ -54,7 +54,12 @@ def required_servers() -> tuple[RequiredServer, ...]:
     return (
         RequiredServer("embedding", config.LLAMA_EMBED_BASE_URL, config.EMBEDDING_MODEL, "/embedding"),
         RequiredServer("reranker", config.LLAMA_RERANK_BASE_URL, config.RERANKER_MODEL, "/reranking"),
-        RequiredServer("VL", config.LLAMA_VL_BASE_URL, config.VL_MODEL, "/completion image_data"),
+        RequiredServer(
+            "VL",
+            config.LLAMA_VL_BASE_URL,
+            config.VL_MODEL,
+            "/v1/chat/completions image_url",
+        ),
     )
 
 
@@ -97,20 +102,21 @@ def _check_reranker(server: RequiredServer) -> str:
 
 
 def _check_vl(server: RequiredServer) -> str:
-    data = llama_client.native_completion(
+    content = llama_client.vision_completion(
         base_url=server.url,
         prompt="請用三個字以內描述這張圖片。",
-        n_predict=8,
+        image_base64=_TINY_PNG_BASE64,
+        mime_type="image/png",
+        model=server.model,
+        max_tokens=8,
         temperature=0.0,
         top_p=1.0,
         top_k=1,
-        stream=False,
-        image_data=[{"id": 10, "data": _TINY_PNG_BASE64}],
         timeout=60,
     )
-    if not isinstance(data, dict):
-        raise RuntimeError("/completion returned a non-JSON response")
-    return "/completion image_data ok"
+    if not content:
+        raise RuntimeError("/v1/chat/completions returned empty image content")
+    return "/v1/chat/completions image_url ok"
 
 
 def check_server(server: RequiredServer) -> ServerCheck:

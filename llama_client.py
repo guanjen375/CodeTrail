@@ -15,9 +15,7 @@
 """
 from __future__ import annotations
 
-import base64
 import json
-from pathlib import Path
 from typing import Any, Iterator
 
 from http_client import get_session
@@ -48,7 +46,8 @@ def native_completion(
         stream=True  → 迭代器,yield 每個 chunk dict
 
     n_predict=-1 表示「直到 EOS / 上下文滿」。
-    image_data 用於多模態:[{"data": "<base64>", "id": 10}, ...]
+    image_data 是舊 llama.cpp 格式，只保留參數讓舊呼叫 fail-loud；圖片請改用
+    vision_completion()，它會走目前支援的 image_url content part。
     extra 是直接合併進 payload 的 raw dict,供高階參數覆寫(seed / mirostat / grammar 等)。
     """
     payload: dict[str, Any] = {
@@ -65,7 +64,10 @@ def native_completion(
     if stop:
         payload["stop"] = stop
     if image_data:
-        payload["image_data"] = image_data
+        raise ValueError(
+            "native_completion(image_data=...) is obsolete and may be silently ignored "
+            "by current llama.cpp; use vision_completion()"
+        )
     if extra:
         payload.update(extra)
 
@@ -158,6 +160,81 @@ def chat_completions(
     resp = session.post(url, json=payload, timeout=timeout, stream=True)
     resp.raise_for_status()
     return _iter_openai_stream(resp)
+
+
+def vision_completion(
+    *,
+    base_url: str,
+    prompt: str,
+    image_base64: str,
+    mime_type: str = "image/png",
+    model: str = "",
+    max_tokens: int = 1024,
+    temperature: float = 0.1,
+    top_p: float = 0.95,
+    top_k: int = 40,
+    timeout: int = 180,
+) -> str:
+    """Call a multimodal llama-server through the current OpenAI-compatible API.
+
+    Current llama.cpp accepts images as ``image_url`` content parts on
+    ``/v1/chat/completions``.  The former top-level ``image_data`` field on
+    ``/completion`` is silently ignored by newer servers, which makes a VL
+    model answer from the text prompt alone and hallucinate image contents.
+
+    ``max_tokens`` is deliberately required to be finite.  A VL model that
+    misses EOS must not occupy the MCP server indefinitely.
+    """
+    if not image_base64:
+        raise ValueError("image_base64 must not be empty")
+    if not mime_type.startswith("image/"):
+        raise ValueError(f"unsupported image MIME type: {mime_type!r}")
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
+
+    data_url = image_base64
+    if not data_url.startswith("data:"):
+        data_url = f"data:{mime_type};base64,{data_url}"
+
+    response = chat_completions(
+        base_url=base_url,
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        stream=False,
+        timeout=timeout,
+        extra={
+            "max_tokens": max_tokens,
+            # Qwen VL 的 thinking 對忠實轉錄沒有幫助，反而會消耗輸出預算。
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+
+    choices = response.get("choices") if isinstance(response, dict) else None
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError("VL server returned no choices")
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        return "\n".join(part for part in parts if part).strip()
+    raise RuntimeError("VL server returned no text content")
 
 
 def _iter_openai_stream(resp) -> Iterator[dict]:
@@ -287,15 +364,6 @@ def rerank(
                 scores[idx] = score
         return scores
     return [0.0] * len(documents)
-
-
-# ============================================================
-# 多模態:把圖片轉成 image_data
-# ============================================================
-def file_to_image_data(path: str | Path, image_id: int = 10) -> dict:
-    """讀圖片檔轉成 native /completion image_data 一筆。"""
-    raw = Path(path).read_bytes()
-    return {"id": image_id, "data": base64.b64encode(raw).decode("ascii")}
 
 
 # ============================================================

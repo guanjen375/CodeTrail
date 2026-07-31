@@ -209,6 +209,13 @@ if [ -f "$CODETRAIL_HOME/scripts/opencode_ctx_check.py" ]; then
   fi
 fi
 
+if [ -f "$CODETRAIL_HOME/scripts/opencode_mcp_timeout_check.py" ]; then
+  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/opencode_mcp_timeout_check.py"; then
+    echo "[aicode] OpenCode MCP timeout check refused to start (see [mcp-timeout] above)." >&2
+    exit 2
+  fi
+fi
+
 if [ -f "$CODETRAIL_HOME/scripts/required_model_servers_check.py" ]; then
   if ! "$PYBIN" "$CODETRAIL_HOME/scripts/required_model_servers_check.py"; then
     echo "[aicode] required model server preflight refused to start (see [model-preflight] above)." >&2

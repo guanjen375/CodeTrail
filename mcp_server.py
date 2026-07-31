@@ -717,7 +717,8 @@ def analyze_file(path: str) -> str:
     """Analyze a non-text file (image / ELF / binary firmware) inside AICODE_ROOT.
 
     依副檔名自動 dispatch:
-      - 圖片(.png/.jpg/.jpeg/.gif/.webp) → 用 VL_MODEL 做 OCR,回傳圖中文字
+      - 圖片(.png/.jpg/.jpeg/.gif/.webp) → 用 VL_MODEL 做通用視覺分析,
+        包含文字轉錄、UI / 終端機、表格、圖表、架構圖、流程圖與一般照片
         (要先在 llama-server VL port (8083) 掛載對應的 VL GGUF + mmproj)
       - ELF(.elf/.so/.o/.axf/.out/.ko) → 解析 header / sections / symbols
         (需要系統有 binutils 的 readelf / objdump)
@@ -733,7 +734,7 @@ def analyze_file(path: str) -> str:
         path: 檔案路徑(絕對或相對 AICODE_ROOT)。
 
     Returns:
-        對應類型的分析報告(OCR 文字 / ELF symbol 表 / binary 字串列)。
+        對應類型的分析報告(VL 圖片分析 / ELF symbol 表 / binary 字串列)。
     """
     # Sandbox: 路徑必須在 AICODE_ROOT 內,且必須是檔案。
     # 兩種失敗合併回同一句訊息,避免透過錯誤訊息的差異 probe 外部路徑是否存在

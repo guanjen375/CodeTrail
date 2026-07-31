@@ -54,12 +54,16 @@ try:
     from config import (
         EMBEDDING_MODEL, CHUNK_SETTINGS,
         LLAMA_EMBED_BASE_URL, LLAMA_VL_BASE_URL,
+        VL_MODEL, VL_INGEST_MAX_TOKENS, VL_INGEST_TIMEOUT,
     )
 except ImportError:
     EMBEDDING_MODEL = "bge-m3"  # Fallback：獨立執行時的預設值
     CHUNK_SETTINGS = {'default': {'size': 1200, 'overlap': 200}}
     LLAMA_EMBED_BASE_URL = "http://localhost:8081"
     LLAMA_VL_BASE_URL = "http://localhost:8083"
+    VL_MODEL = "qwen3-vl"
+    VL_INGEST_MAX_TOKENS = 2048
+    VL_INGEST_TIMEOUT = 300
 
 # 預設 Chunk 設定（從 CHUNK_SETTINGS 取得）
 CHUNK_SIZE = CHUNK_SETTINGS.get('default', {}).get('size', 1200)
@@ -74,6 +78,13 @@ SUPPORTED_EXTENSIONS = {".pdf", ".md", ".txt"}
 
 # 支援的圖片類型（聊天截圖模式）
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+IMAGE_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
 
 # 支援的二進位/ELF 副檔名（與 media.py 對齊；走 media.read_binary 抽報告）
 BINARY_EXTENSIONS = {".bin", ".dat", ".raw", ".fw", ".img", ".rom", ".hex"}
@@ -696,12 +707,6 @@ def extract_chat_from_screenshot(image_path: str) -> str:
     """
     import base64
 
-    # 載入 VL 模型設定
-    try:
-        from config import VL_MODEL
-    except ImportError:
-        VL_MODEL = "llava"  # Fallback
-
     # 讀取圖片並轉 base64
     with open(image_path, 'rb') as f:
         image_data = base64.b64encode(f.read()).decode('utf-8')
@@ -754,15 +759,16 @@ def extract_chat_from_screenshot(image_path: str) -> str:
 若有任何不確定的內容，請明確標註「推測」或「不確定」。"""
 
     try:
-        data = llama_client.native_completion(
+        return llama_client.vision_completion(
             base_url=LLAMA_VL_BASE_URL,
             prompt=prompt,
+            image_base64=image_data,
+            mime_type=IMAGE_MIME_TYPES[ext],
+            model=VL_MODEL,
+            max_tokens=VL_INGEST_MAX_TOKENS,
             temperature=0.2,
-            stream=False,
-            image_data=[{"id": 10, "data": image_data}],
-            timeout=300,
+            timeout=VL_INGEST_TIMEOUT,
         )
-        return data.get("content") or data.get("response") or ""
     except Exception as e:
         print(f"[ERROR] VL 模型處理失敗: {e}")
         return ""
@@ -814,12 +820,6 @@ def extract_info_from_image(image_path: str) -> str:
     適用於：架構圖、流程圖、記憶體映射圖、硬體方塊圖等
     """
     import base64
-
-    # 載入 VL 模型設定
-    try:
-        from config import VL_MODEL
-    except ImportError:
-        VL_MODEL = "llava"  # Fallback
 
     # 讀取圖片並轉 base64
     with open(image_path, 'rb') as f:
@@ -886,15 +886,16 @@ def extract_info_from_image(image_path: str) -> str:
 若有任何不確定的內容，請明確標註「推測」或「不確定」。"""
 
     try:
-        data = llama_client.native_completion(
+        return llama_client.vision_completion(
             base_url=LLAMA_VL_BASE_URL,
             prompt=prompt,
+            image_base64=image_data,
+            mime_type=IMAGE_MIME_TYPES[Path(image_path).suffix.lower()],
+            model=VL_MODEL,
+            max_tokens=VL_INGEST_MAX_TOKENS,
             temperature=0.2,
-            stream=False,
-            image_data=[{"id": 10, "data": image_data}],
-            timeout=300,
+            timeout=VL_INGEST_TIMEOUT,
         )
-        return data.get("content") or data.get("response") or ""
     except Exception as e:
         print(f"[ERROR] VL 模型處理失敗: {e}")
         return ""

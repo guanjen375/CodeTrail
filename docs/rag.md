@@ -30,7 +30,7 @@
 兩個工具差別：
 
 - `read_file` 直接把純文字內容讀進對話。
-- `analyze_file` 會先做處理 — 圖片做文字辨識、二進位檔抓出檔頭格式和可讀字串 — 再把整理後的結果丟給模型。
+- `analyze_file` 會先做處理 — 圖片由 VL 做通用視覺分析（文字辨識、UI／終端機、表格、圖表、架構／流程關係與一般照片都包含），二進位檔則抓出檔頭格式和可讀字串 — 再把整理後的結果丟給模型。
 
 `analyze_file` 是「這一輪看一次就丟」，看完不會留在 KB 裡，未來其他對話查不到。如果想把這張截圖／這份 firmware 永久保存供之後查詢，改用 `ingest_document`（見「把附件做成知識庫讓模型隨時能查」），它接受相同的圖片／binary／ELF 副檔名，並會切 chunk、算 embedding 寫進 `knowledge.json`。
 
@@ -128,7 +128,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 - **binary**：`.bin` / `.dat` / `.raw` / `.fw` / `.img` / `.rom` / `.hex`（抽 hex dump、可讀字串、magic 偵測；遇到 ELF magic 自動切到 ELF 解析）
 - **ELF**：`.elf` / `.so` / `.o` / `.axf` / `.out` / `.ko`（抽 header / sections / symbols）
 
-純圖片掃描的 PDF（沒有可選文字）切不出內容，先把每頁存成 `.png` 再用 `ingest_document` 走圖片路徑，或先用 OCR 工具轉成文字檔再匯入。VL server 是啟動必要條件，若圖片分析仍失敗，先跑 `python scripts/required_model_servers_check.py` 看 image_data probe。
+純圖片掃描的 PDF（沒有可選文字）切不出內容，先把每頁存成 `.png` 再用 `ingest_document` 走圖片路徑，或先用 OCR 工具轉成文字檔再匯入。VL server 是啟動必要條件，若圖片分析仍失敗，先跑 `python scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
 
 #### 三個步驟
 
@@ -223,7 +223,7 @@ batch size 上限是 32 (REF1)。
 兩個常踩的點：
 
 - **預設走「技術圖片」路徑**（架構圖／流程圖／記憶體圖），抽的是畫面說明。若這張是**聊天截圖**、想抽的是對話內容，要顯式 `ingest_document('teams.png', mode='chat')`。
-- chunks 回報 0，圖片來源最常見的原因是 **VL server（:8083）沒起來** —— 圖片分析失敗就切不出內容。先跑 `python scripts/required_model_servers_check.py` 看 image_data probe。
+- chunks 回報 0，圖片來源最常見的原因是 **VL server（:8083）沒起來** —— 圖片分析失敗就切不出內容。先跑 `python scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
 
 #### 規格題、數字題用嚴格模式
 

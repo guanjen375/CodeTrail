@@ -150,7 +150,7 @@ aicode
 - 每次新增或移除文件後都要 `reload_knowledge_base(...)`。
 - `knowledge.json` 會保存切碎後的文件內容，NDA 場景不要 commit。
 
-完整流程、支援格式、圖片 OCR、binary/ELF 匯入和舊文件移除見 [RAG、附件與知識庫操作](rag.md)。
+完整流程、支援格式、圖片 VL 分析、binary/ELF 匯入和舊文件移除見 [RAG、附件與知識庫操作](rag.md)。
 
 ---
 

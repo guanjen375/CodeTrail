@@ -7,7 +7,7 @@ def test_required_model_servers_all_pass(monkeypatch):
     monkeypatch.setattr(preflight.llama_client, "get_health", lambda url, timeout=3: {"status": "ok"})
     monkeypatch.setattr(preflight.llama_client, "embed_one", lambda **kwargs: [0.1, 0.2])
     monkeypatch.setattr(preflight.llama_client, "rerank", lambda **kwargs: [0.9, 0.1])
-    monkeypatch.setattr(preflight.llama_client, "native_completion", lambda **kwargs: {"content": "ok"})
+    monkeypatch.setattr(preflight.llama_client, "vision_completion", lambda **kwargs: "ok")
 
     checks = preflight.run_checks()
 
@@ -30,7 +30,7 @@ def test_required_model_servers_fails_role_probe(monkeypatch):
     monkeypatch.setattr(preflight.llama_client, "get_health", lambda url, timeout=3: {"status": "ok"})
     monkeypatch.setattr(preflight.llama_client, "embed_one", lambda **kwargs: [0.1, 0.2])
     monkeypatch.setattr(preflight.llama_client, "rerank", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
-    monkeypatch.setattr(preflight.llama_client, "native_completion", lambda **kwargs: {"content": "ok"})
+    monkeypatch.setattr(preflight.llama_client, "vision_completion", lambda **kwargs: "ok")
 
     checks = preflight.run_checks()
 

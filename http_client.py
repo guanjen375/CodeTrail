@@ -33,6 +33,12 @@ def create_session() -> requests.Session:
 
     retry_strategy = Retry(
         total=RETRY_TOTAL,
+        connect=RETRY_TOTAL,
+        # 生成式 POST 已經送到 server 後，read timeout 不能重試。否則一個
+        # timeout=120 的 VL call 最壞會被透明重送數次，讓 MCP 看似卡住數分鐘。
+        read=0,
+        status=RETRY_TOTAL,
+        other=0,
         backoff_factor=RETRY_BACKOFF,
         status_forcelist=RETRY_STATUS_CODES,
         allowed_methods=["GET", "POST"],  # GET 和 POST 都允許重試

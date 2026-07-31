@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 智能程式碼分析器 - 媒體檔案處理
-- 圖片 OCR（使用 VL 模型）
+- 圖片通用視覺分析（使用 VL 模型，包含但不限於 OCR）
 - 二進位檔案分析（Hex dump + strings 提取，含 offset）
 - ELF 檔案解析（header/sections/symbols）
 """
@@ -18,6 +18,7 @@ from typing import Optional, List, Tuple, Dict
 import llama_client
 from config import (
     LLAMA_VL_BASE_URL, VL_MODEL, IMAGE_EXTENSIONS,
+    VL_ANALYZE_MAX_TOKENS, VL_ANALYZE_TIMEOUT,
     BIN_ELF_REPORT_MAX_CHARS,
     BIN_ELF_MAX_SECTIONS, BIN_ELF_MAX_FUNCS, BIN_ELF_MAX_OBJS, BIN_ELF_MAX_STRINGS
 )
@@ -74,13 +75,21 @@ _PRINTABLE_CHARS = set(
 _SANDBOX_ROOT: Optional[Path] = None
 _ALLOW_EXTERNAL: bool = True  # 預設允許外部檔案（大部分使用場景都是外部路徑）
 
-# Small LRU caches to avoid repeated OCR/BIN/ELF work in a session.
+# Small LRU caches to avoid repeated VL/BIN/ELF work in a session.
 _OCR_CACHE = OrderedDict()
 _BIN_CACHE = OrderedDict()
 _ELF_CACHE = OrderedDict()
 _OCR_CACHE_MAX = 8
 _BIN_CACHE_MAX = 6
 _ELF_CACHE_MAX = 6
+
+_IMAGE_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
 
 
 def set_sandbox_root(root: str, allow_external: bool = True) -> None:
@@ -1450,26 +1459,29 @@ def _build_elf_report_native(
 # ============================================================================
 
 def ocr_image(path: str) -> str:
-    """對圖片進行視覺分析與 OCR。"""
+    """對圖片進行通用視覺分析；有文字時同時忠實轉錄。"""
     p = _safe_path(path, allow_external=True, allowed_extensions=IMAGE_EXTENSIONS)
 
     if p is None:
         if _ALLOW_EXTERNAL:
-            return f"[OCR 錯誤] 檔案不存在或不是支援的圖片格式: {path}"
+            return f"[圖片分析錯誤] 檔案不存在或不是支援的圖片格式: {path}"
         else:
-            return f"[OCR 錯誤] 路徑不在允許範圍內或檔案不存在: {path}"
+            return f"[圖片分析錯誤] 路徑不在允許範圍內或檔案不存在: {path}"
 
     if not p.exists():
-        return f"[OCR 錯誤] 檔案不存在: {path}"
+        return f"[圖片分析錯誤] 檔案不存在: {path}"
 
     if p.suffix.lower() not in IMAGE_EXTENSIONS:
-        return f"[OCR 錯誤] 不支援的格式: {p.suffix}"
+        return f"[圖片分析錯誤] 不支援的格式: {p.suffix}"
 
     file_size = p.stat().st_size
     if file_size > 20 * 1024 * 1024:
-        return f"[OCR 錯誤] 圖片過大: {file_size / 1024 / 1024:.1f}MB"
+        return f"[圖片分析錯誤] 圖片過大: {file_size / 1024 / 1024:.1f}MB"
 
-    cache_key = _cache_key(p, extra=("vision-v2",))
+    cache_key = _cache_key(
+        p,
+        extra=("vision-chat-v1", VL_ANALYZE_MAX_TOKENS),
+    )
     cached = _cache_get(_OCR_CACHE, cache_key)
     if cached is not None:
         return cached
@@ -1478,25 +1490,29 @@ def ocr_image(path: str) -> str:
         with open(p, "rb") as f:
             data = base64.b64encode(f.read()).decode()
 
-        resp_data = llama_client.native_completion(
+        result = llama_client.vision_completion(
             base_url=LLAMA_VL_BASE_URL,
             prompt=(
-                "請完整分析這張圖片，使用繁體中文輸出。\n"
-                "1. 先用 3-6 句描述主要畫面、物件、人物/角色、背景與風格。\n"
-                "2. 若圖片中有文字或數字，另列「可見文字」並保持原文。\n"
-                "3. 若是 UI、終端機、錯誤截圖、表格或圖表，請整理關鍵資訊與可能含義。\n"
-                "4. 若幾乎沒有文字，也不要只回答空白；仍要描述視覺內容。"
+                "請忠實分析這張圖片，使用繁體中文，內容完整但避免重複。\n"
+                "1. 先判斷圖片類型，例如終端機、UI、聊天、表格、圖表、"
+                "架構圖、流程圖、文件頁、照片或其他類型。\n"
+                "2. 若有文字、數字、指令、路徑、錯誤碼或標籤，另列「可見文字」，"
+                "盡量保持原文與相對位置。\n"
+                "3. 整理畫面中的物件、區塊、連接關係、資料流、狀態與關鍵含義；"
+                "若是一般照片，也描述人物、物件、背景與重要細節。\n"
+                "4. 看不清楚的內容請標註 [模糊] 或 [看不清楚]，不要猜測或補完。"
             ),
+            image_base64=data,
+            mime_type=_IMAGE_MIME_TYPES[p.suffix.lower()],
+            model=VL_MODEL,
+            max_tokens=VL_ANALYZE_MAX_TOKENS,
             temperature=0.1,
-            stream=False,
-            image_data=[{"id": 10, "data": data}],
-            timeout=120,
+            timeout=VL_ANALYZE_TIMEOUT,
         )
-        result = (resp_data.get("content") or resp_data.get("response") or "").strip()
         _cache_set(_OCR_CACHE, cache_key, result, _OCR_CACHE_MAX)
         return result
     except Exception as e:
-        return f"[OCR 錯誤] {type(e).__name__}: {e}"
+        return f"[圖片分析錯誤] {type(e).__name__}: {e}"
 
 
 def read_elf(path: str, max_sections: Optional[int] = None,
@@ -1826,7 +1842,7 @@ def process_images(text: str, max_images: int = 3) -> tuple[str, str]:
     ctx = "\n附加圖片:\n"
     for m in matches[:max_images]:
         path = extract_path(m)
-        print(f"[IMG] OCR: {path}")
+        print(f"[IMG] VL 分析: {path}")
         ctx += f"\n[{path}]:\n{ocr_image(path)}\n"
 
     return clean, ctx
@@ -1836,14 +1852,14 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str, dict]:
     """統一處理文字中的 file: 檔案引用（自動偵測檔案類型）
 
     支援：
-    - file:/path/to/image.png - 圖片 OCR（png/jpg/jpeg/gif/webp）
+    - file:/path/to/image.png - 通用 VL 圖片分析（png/jpg/jpeg/gif/webp）
     - file:/path/to/firmware.bin - 二進位分析（bin/dat/raw/fw/img/rom/hex）
     - file:/path/to/app.elf - ELF 解析（elf/so/o/axf/out/ko）
     - file:"/path with spaces/file.bin" - 帶引號的路徑（支援空白）
     - file:'path with spaces/file.png' - 單引號也支援
 
     自動偵測規則（優先級）：
-    1. 副檔名符合圖片格式 → OCR
+    1. 副檔名符合圖片格式 → 通用 VL 分析（含文字辨識）
     2. 副檔名符合 ELF 格式 或 檔案開頭是 ELF magic → ELF 解析
     3. 其他 → 二進位分析
 
@@ -1857,7 +1873,7 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str, dict]:
         - has_binary: bool - 是否有處理 BIN/ELF 檔案
         - has_image: bool - 是否有處理圖片
         - binary_type: str|None - 'bin' 或 'elf' 或 None
-        - image_ctx: str - 圖片 OCR 上下文（獨立，供 strict mode 使用）
+        - image_ctx: str - 圖片 VL 分析上下文（獨立，供 strict mode 使用）
         - binary_ctx: str - BIN/ELF 上下文（獨立，供 strict mode 使用）
     """
     # 匹配 file: 後面跟著：
@@ -1921,7 +1937,7 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str, dict]:
 
     ctx_parts: List[str] = []
     processed_binary_type: Optional[str] = None  # 記錄處理的 binary 類型
-    file_image_ctx = ""  # 獨立的圖片 OCR 上下文
+    file_image_ctx = ""  # 獨立的圖片 VL 分析上下文
     file_binary_ctx = ""  # 獨立的 BIN/ELF 上下文
 
     # 處理圖片
@@ -1933,7 +1949,7 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str, dict]:
 
         file_image_ctx = "\n附加圖片:\n"
         for path in image_files[:max_images]:
-            print(f"[IMG] OCR: {path}")
+            print(f"[IMG] VL 分析: {path}")
             file_image_ctx += f"\n[{path}]:\n{ocr_image(path)}\n"
         ctx_parts.append(file_image_ctx)
 
@@ -1968,7 +1984,7 @@ def process_file(text: str, max_images: int = 3) -> tuple[str, str, dict]:
         "has_binary": processed_binary_type is not None,
         "has_image": len(image_files) > 0,
         "binary_type": processed_binary_type,
-        "image_ctx": file_image_ctx,    # 獨立的圖片 OCR（供 strict mode 的 base_ctx）
+        "image_ctx": file_image_ctx,    # 獨立的圖片 VL 分析（供 strict mode 的 base_ctx）
         "binary_ctx": file_binary_ctx   # 獨立的 BIN/ELF（供 strict mode 的 binary_ctx）
     }
 

@@ -342,6 +342,46 @@ curl -s http://localhost:8080/props | jq '.default_generation_settings.n_ctx'   
 
 若只是一次性實驗,可以用 `AICODE_ACCEPT_CTX_RISK=1 aicode` 放行,但不建議長期這樣跑。
 
+### 圖片工具剛好 10 秒超時，接著連小工具也超時
+
+先看 `~/.config/opencode/opencode.json`：
+
+```bash
+jq '.mcp.codetrail.timeout' ~/.config/opencode/opencode.json
+```
+
+這個值的單位是毫秒，而且是每次 MCP tool call 的 client timeout。若仍是
+`10000`，VL 圖片分析一超過 10 秒，OpenCode 就會先放棄等待；原本的同步圖片請求
+此時可能還在 MCP server 內收尾，接下來送出的 `file_info` / `list_dir` 也會排隊，
+所以表面上會像所有工具同時壞掉。
+
+把它改成 660000（11 分鐘，略高於 `ingest_document` 的 10 分鐘內部上限）：
+
+```json
+{
+  "mcp": {
+    "codetrail": {
+      "timeout": 660000
+    }
+  }
+}
+```
+
+改完要完全退出並重開 `aicode`，已啟動的 OpenCode 不會重新讀設定。CodeTrail 自己
+仍會用較短的單次 VL HTTP timeout，且圖片生成有有限 token 預算；660000 只是讓
+OpenCode 不要比工具本身更早切斷。新版 `aicode` 也會在啟動時做
+`[mcp-timeout]` 檢查；只有緊急測試才用
+`AICODE_MCP_TIMEOUT_CHECK_SKIP=1 aicode` 跳過。
+
+若 timeout 已正確，但圖片回答像是在描述一張不存在的通用終端畫面，跑：
+
+```bash
+python3 scripts/required_model_servers_check.py
+```
+
+新版 CodeTrail 走 llama.cpp 的 `/v1/chat/completions` `image_url` 多模態格式；舊版
+top-level `image_data` 可能被新版 llama.cpp 靜默忽略，造成模型只看提示詞猜圖。
+
 ### llama-server 不可連 / 404
 
 代表對應 server 沒啟動,或 port 設錯。先 curl 試:
