@@ -31,12 +31,36 @@ def _write_home_opencode(tmp_path: Path, model: str = "llamacpp/from-json") -> P
     return path
 
 
+def _write_alias_registry(tmp_path: Path, aliases: tuple[str, ...]) -> Path:
+    model = tmp_path / "models" / "same-model.gguf"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"GGUF fixture")
+    cfg_dir = tmp_path / ".config" / "codetrail"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "models.json").write_text(
+        json.dumps({alias: str(model) for alias in aliases}),
+        encoding="utf-8",
+    )
+    return model
+
+
 def test_env_and_opencode_json_same_model_allowed(monkeypatch, tmp_path, capsys):
     _write_home_opencode(tmp_path, "llamacpp/from-env")
     monkeypatch.setenv("AICODE_MODEL", "from-env")
 
     assert rmm.main([]) == 0
     assert capsys.readouterr().out.strip() == "from-env"
+
+
+def test_env_and_opencode_registry_aliases_for_same_gguf_allowed(
+    monkeypatch, tmp_path, capsys
+):
+    _write_alias_registry(tmp_path, ("old-alias", "new-alias"))
+    _write_home_opencode(tmp_path, "llamacpp/new-alias")
+    monkeypatch.setenv("AICODE_MODEL", "old-alias")
+
+    assert rmm.main([]) == 0
+    assert capsys.readouterr().out.strip() == "old-alias"
 
 
 def test_env_and_opencode_json_conflict_fails(monkeypatch, tmp_path, capsys):
@@ -71,6 +95,16 @@ def test_env_and_argv_same_model_allowed(monkeypatch, capsys):
 
     assert rmm.main(["--model", "same-model"]) == 0
     assert capsys.readouterr().out.strip() == "same-model"
+
+
+def test_env_and_argv_registry_aliases_for_same_gguf_allowed(
+    monkeypatch, tmp_path, capsys
+):
+    _write_alias_registry(tmp_path, ("old-alias", "new-alias"))
+    monkeypatch.setenv("AICODE_MODEL", "old-alias")
+
+    assert rmm.main(["--model", "new-alias"]) == 0
+    assert capsys.readouterr().out.strip() == "old-alias"
 
 
 def test_argv_with_custom_provider_prefix_strips_to_bare(monkeypatch, capsys):

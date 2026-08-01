@@ -8,9 +8,10 @@ Priority:
   4. OPENCODE_CONFIG, then ~/.config/opencode/opencode.json
 
 Env and CLI may both be present only when they resolve to the same bare model
-name (or GGUF path). If env is used without CLI, opencode.json must also match
-when present, because OpenCode will still read opencode.json for the TUI model.
-這避免 OpenCode TUI 和 CodeTrail MCP 各自用不同模型。
+name, GGUF path, or registry aliases backed by the same canonical GGUF. If env
+is used without CLI, opencode.json must also resolve to that model when present,
+because OpenCode will still read opencode.json for the TUI model. 這避免
+OpenCode TUI 和 CodeTrail MCP 各自用不同模型。
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from model_resolution import (  # noqa: E402
+    main_model_references_equivalent,
     normalize_main_model,
     parse_cli_model_arg_detail,
     resolve_main_model_from_env,
@@ -72,14 +74,21 @@ def main(argv: list[str] | None = None) -> int:
     for res in cli_results:
         if res.error:
             return _fail(res.error)
-    cli_models = {res.model for res in cli_results if res.model}
-    if len(cli_models) > 1:
+    cli_models = [res.model for res in cli_results if res.model]
+    if cli_models and any(
+        not main_model_references_equivalent(cli_models[0], model, os.environ)
+        for model in cli_models[1:]
+    ):
         return _fail(
             "multiple -m/--model flags point to different models: "
-            f"{sorted(cli_models)}. Use one model for both OpenCode TUI and CodeTrail MCP."
+            f"{sorted(set(cli_models))}. Use one model for both OpenCode TUI and CodeTrail MCP."
         )
 
-    if env_res and cli_res and env_res.model != cli_res.model:
+    if (
+        env_res
+        and cli_res
+        and not main_model_references_equivalent(env_res.model, cli_res.model, os.environ)
+    ):
         return _fail(
             "AICODE_MODEL and --model point to different models: "
             f"{env_res.model!r} != {cli_res.model!r}. "
@@ -91,7 +100,9 @@ def main(argv: list[str] | None = None) -> int:
         if oc_res.error:
             where = f" ({oc_res.path})" if oc_res.path else ""
             return _fail(f"{oc_res.source}{where}: {oc_res.error}")
-        if oc_res.model and oc_res.model != env_res.model:
+        if oc_res.model and not main_model_references_equivalent(
+            env_res.model, oc_res.model, os.environ
+        ):
             where = f" ({oc_res.path})" if oc_res.path else ""
             return _fail(
                 "AICODE_MODEL and opencode.json model point to different models"
@@ -118,7 +129,9 @@ def main(argv: list[str] | None = None) -> int:
             if oc_res.error:
                 where = f" ({oc_res.path})" if oc_res.path else ""
                 return _fail(f"{oc_res.source}{where}: {oc_res.error}")
-            if oc_res.model and oc_res.model != fallback.model:
+            if oc_res.model and not main_model_references_equivalent(
+                fallback.model, oc_res.model, os.environ
+            ):
                 return _fail(
                     "deployment profile and opencode.json point to different models: "
                     f"{fallback.model!r} != {oc_res.model!r}. Update opencode.json or pass "

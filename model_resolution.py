@@ -258,6 +258,36 @@ def resolve_opencode_main_model(
     )
 
 
+def main_model_references_equivalent(
+    first: str,
+    second: str,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether two accepted model references resolve to the same GGUF.
+
+    Bare registry aliases are allowed to differ when both entries resolve to
+    the same canonical file path.  Unknown aliases and invalid registries stay
+    non-equivalent so the caller's existing fail-loud behavior is preserved.
+    """
+    left = (first or "").strip()
+    right = (second or "").strip()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+
+    environ = env if env is not None else os.environ
+    try:
+        # Lazy import keeps deployment_profile.py independent from this parser.
+        from deployment_profile import ProfileError, resolve_model_reference
+
+        left_path = resolve_model_reference(left, environ)
+        right_path = resolve_model_reference(right, environ)
+    except ProfileError:
+        return False
+    return left_path == right_path
+
+
 def resolve_main_model_from_env(
     env: Mapping[str, str] | None = None,
 ) -> ModelResolution:

@@ -44,6 +44,7 @@ from deployment_status import (  # noqa: E402
 )
 from model_resolution import (  # noqa: E402
     load_first_opencode_config,
+    main_model_references_equivalent,
     opencode_config_candidates,
     resolve_main_model_from_env,
     resolve_opencode_main_model,
@@ -598,7 +599,7 @@ def check_opencode_model_config(r: Result) -> None:
         config_problem(f"OpenCode config {path} 必須設 \"model\" 欄位")
         return
 
-    if oc_res.model != main_model:
+    if not main_model_references_equivalent(oc_res.model, main_model, os.environ):
         config_problem(
             f"OpenCode config model={oc_res.model!r} 跟 CodeTrail main model={main_model!r} 不一致"
         )

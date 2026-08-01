@@ -254,6 +254,27 @@ def test_check_opencode_model_config_accepts_valid_config(monkeypatch, tmp_path)
     assert any("對齊" in p for p in r.passes), r.passes
 
 
+def test_check_opencode_model_config_accepts_aliases_for_same_gguf(
+    monkeypatch, tmp_path
+):
+    model = tmp_path / "same-model.gguf"
+    model.write_bytes(b"GGUF fixture")
+    oc_path = tmp_path / "opencode.json"
+    _write_opencode_config(oc_path, "llamacpp/new-alias")
+    monkeypatch.setenv("AICODE_MODEL", "old-alias")
+    monkeypatch.setenv("OPENCODE_CONFIG", str(oc_path))
+    monkeypatch.setenv(
+        "AICODE_MODEL_REGISTRY",
+        json.dumps({"old-alias": str(model), "new-alias": str(model)}),
+    )
+
+    r = doc.Result()
+    doc.check_opencode_model_config(r)
+
+    assert not r.fails
+    assert any("對齊" in passed for passed in r.passes), r.passes
+
+
 def test_check_opencode_model_config_fails_when_model_mismatches(monkeypatch, tmp_path):
     oc_path = tmp_path / "opencode.json"
     _write_opencode_config(oc_path, "llamacpp/different-model")

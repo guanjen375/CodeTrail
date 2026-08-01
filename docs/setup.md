@@ -149,7 +149,7 @@ ssh -L 8080:localhost:8080 -L 8081:localhost:8081 -L 8082:localhost:8082 -L 8083
 2. 拒絕 `AICODE_ROOT=/` 或 `AICODE_ROOT=$HOME`(可能誤刪 / 誤改大量檔案)
 3. 在目前 git root 準備 `.opencode/run-codetrail-mcp`,讓 OpenCode config 裡的 MCP command 能找到 CodeTrail server 入口
 4. 驗證 deployment profile，安全匯入四個 base URL 與 aux model ID；不 `source` / `eval` JSON
-5. 用 `scripts/resolve_main_model.py` 解析主模型；若 `AICODE_MODEL` 和 opencode.json 同時存在且沒傳 CLI `-m/--model`,兩者必須一致
+5. 用 `scripts/resolve_main_model.py` 解析主模型；若 `AICODE_MODEL` 和 opencode.json 同時存在且沒傳 CLI `-m/--model`,兩者必須一致（不同 registry alias 解析到同一個 GGUF 也視為一致）
 6. 讀主 llama-server `/props` 取得真實 `n_ctx`，再跑 ctx capacity gate
 7. 確認 OpenCode active model 的 `limit.context` 等於 server `-c`
 8. 安全同步既有 `mcp.codetrail.timeout`

@@ -457,7 +457,7 @@ aicode -m <CODE_MODEL>
 
 `<CODE_MODEL>` 是 MODEL_REGISTRY 裡的 bare name 或 GGUF 絕對路徑。如果你看到「placeholder」相關錯誤,通常是值還停留在 `<CODE_MODEL>` 或 `<MODEL>` 沒換掉;看到「外部 provider prefix」錯誤代表你還在用 `ollama/foo` 那種舊寫法,改成 bare name 或你 opencode.json 裡 custom provider 的 prefix。
 
-若 `AICODE_MODEL` 和 opencode.json 同時存在,且啟動時沒有傳 `-m/--model`,兩者必須指向同一顆 bare model。這是刻意 fail-loud,避免 OpenCode TUI 用 A 模型、CodeTrail MCP tools 用 B 模型。
+若 `AICODE_MODEL` 和 opencode.json 同時存在,且啟動時沒有傳 `-m/--model`,兩者必須指向同一顆模型。名稱不同但 registry 解析到同一個 canonical GGUF 路徑時視為一致；其餘情況仍會 fail-loud，避免 OpenCode TUI 用 A 模型、CodeTrail MCP tools 用 B 模型。
 
 ### MODEL 解析到 GGUF 路徑但檔案不存在
 
