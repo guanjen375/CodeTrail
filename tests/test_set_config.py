@@ -11,6 +11,7 @@ import os
 import shlex
 import shutil
 import stat
+import struct
 import subprocess
 from pathlib import Path
 
@@ -31,12 +32,52 @@ _PROFILE_ENV_KEYS = set(RUNTIME_OVERRIDE_ENV_KEYS) | {
     "MODELS_DIR", "LLAMA_BIN",
     "MAIN_SESSION", "AUX_SESSION", "SESSION",
     "MAIN_HEALTH_TIMEOUT", "RAG_HEALTH_TIMEOUT",
+    "AICODE_SET_CONFIG_MEMINFO",
 }
 
 
 def _sparse(path: Path, size: int) -> None:
     """建立指定 st_size 的稀疏檔:容量規劃只看大小,不需要真的占磁碟。"""
     with open(path, "wb") as handle:
+        handle.truncate(size)
+
+
+def _sparse_dense_gguf(path: Path, size: int) -> None:
+    """建立有合法 tensor table 的 sparse dense GGUF，供 offload 分流測試。"""
+    name = b"blk.0.attn_q.weight"
+    header = struct.pack("<4sIQQ", b"GGUF", 3, 1, 0)
+    tensor = (
+        struct.pack("<Q", len(name)) + name
+        + struct.pack("<I", 1) + struct.pack("<Q", 1)
+        + struct.pack("<I", 0) + struct.pack("<Q", 0)
+    )
+    metadata_end = len(header) + len(tensor)
+    data_start = (metadata_end + 31) // 32 * 32
+    with open(path, "wb") as handle:
+        handle.write(header)
+        handle.write(tensor)
+        handle.write(b"\0" * (data_start - metadata_end))
+        handle.truncate(size)
+
+
+def _sparse_moe_gguf(path: Path, size: int, expert_bytes: int) -> None:
+    """建立 expert + dense tensor 的 sparse MoE GGUF。"""
+    tensors = (
+        (b"blk.0.ffn_up_exps.weight", 0),
+        (b"blk.0.attn_q.weight", expert_bytes),
+    )
+    header = struct.pack("<4sIQQ", b"GGUF", 3, len(tensors), 0)
+    table = bytearray()
+    for name, offset in tensors:
+        table.extend(struct.pack("<Q", len(name)) + name)
+        table.extend(struct.pack("<I", 1) + struct.pack("<Q", 1))
+        table.extend(struct.pack("<I", 0) + struct.pack("<Q", offset))
+    metadata_end = len(header) + len(table)
+    data_start = (metadata_end + 31) // 32 * 32
+    with open(path, "wb") as handle:
+        handle.write(header)
+        handle.write(table)
+        handle.write(b"\0" * (data_start - metadata_end))
         handle.truncate(size)
 
 
@@ -52,7 +93,9 @@ def _write_fake_nvidia_smi(bin_dir: Path, output: str, exit_code: int = 0) -> No
     executable.chmod(0o755)
 
 
-def _write_fake_llama(tmp_path: Path, help_flags: str = "--fit --reranking --mmproj") -> Path:
+def _write_fake_llama(
+    tmp_path: Path, help_flags: str = "--fit --cpu-moe --reranking --mmproj"
+) -> Path:
     executable = tmp_path / "llama-server"
     executable.write_text(
         "#!/usr/bin/env bash\n"
@@ -84,6 +127,11 @@ def _env(tmp_path: Path, *, with_llama: bool = True) -> dict[str, str]:
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     env = {key: value for key, value in os.environ.items() if key not in _PROFILE_ENV_KEYS}
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(
+        "MemTotal:       536870912 kB\nMemAvailable:   524288000 kB\n",
+        encoding="utf-8",
+    )
     env.update(
         {
             "HOME": str(home),
@@ -93,6 +141,7 @@ def _env(tmp_path: Path, *, with_llama: bool = True) -> dict[str, str]:
             # 不存在的 session 名稱:避免「偵測到 server 運行中」誤觸開發機上真的 tmux。
             "MAIN_SESSION": "codetrail-test-none-main",
             "SESSION": "codetrail-test-none-rag",
+            "AICODE_SET_CONFIG_MEMINFO": str(meminfo),
         }
     )
     if with_llama and not (tmp_path / "llama-server").exists():
@@ -101,11 +150,15 @@ def _env(tmp_path: Path, *, with_llama: bool = True) -> dict[str, str]:
 
 
 def _run(tmp_path: Path, *args: str, stdin: str | None = None,
-         with_llama: bool = True) -> subprocess.CompletedProcess:
+         with_llama: bool = True,
+         env_overrides: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    env = _env(tmp_path, with_llama=with_llama)
+    if env_overrides:
+        env.update(env_overrides)
     return subprocess.run(
         ["bash", str(SCRIPT), "--skip-deps-check", *args],
         cwd=REPO_ROOT,
-        env=_env(tmp_path, with_llama=with_llama),
+        env=env,
         input=stdin,
         capture_output=True,
         text=True,
@@ -119,6 +172,7 @@ def test_help_is_offline_and_exits_zero(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "--models-dir" in proc.stdout
     assert "--advanced" in proc.stdout
+    assert "--cpu-moe" in proc.stdout
     assert "--allow-remote" in proc.stdout
 
 
@@ -145,6 +199,14 @@ def test_yes_run_generates_all_artifacts(tmp_path):
     assert services["reranker"]["model"].endswith("qwen3-reranker-0.6b-q8_0.gguf")
     assert services["vl"]["model"] == str(models / "vl" / "vl-model-q6.gguf")
     assert services["vl"]["mmproj"] == str(models / "vl" / "mmproj-F16.gguf")
+    assert services["embedding"]["parameters"] == {"parallel": 1}
+    assert services["reranker"]["parameters"] == {"parallel": 1}
+    assert services["vl"]["parameters"] == {
+        "gpu_layers": "auto",
+        "parallel": 1,
+        "fit": "on",
+        "fit_target": 3072,
+    }
     # 預設不開放遠端 → 不寫 bind(profile 預設 local)
     assert "bind" not in services["main"]
 
@@ -246,8 +308,11 @@ def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
 
-    accepted = _run(tmp_path, "--no-preview", "--models-dir", str(models), stdin="\n")
+    # main 選擇、CPU-MoE 模式、摘要確認各按一次 Enter。
+    accepted = _run(tmp_path, "--no-preview", "--models-dir", str(models), stdin="\n\n\n")
     assert accepted.returncode == 0, accepted.stderr + accepted.stdout
+    assert "【主聊天模型】 — 偵測到的候選" in accepted.stdout
+    assert "目前主模型: big-chat-ud-q4_k_xl-00001-of-00002.gguf" in accepted.stdout
     assert "建議配置" in accepted.stdout
     assert (tmp_path / "home" / "start.sh").exists()
 
@@ -256,7 +321,7 @@ def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
         ["bash", str(SCRIPT), "--skip-deps-check", "--no-preview", "--models-dir", str(models)],
         cwd=REPO_ROOT,
         env={**_env(tmp_path), "HOME": str(home2), "USERPROFILE": str(home2)},
-        input="q\n",
+        input="\n\nq\n",
         capture_output=True,
         text=True,
         timeout=60,
@@ -318,6 +383,34 @@ def test_llama_without_reranking_support_fails(tmp_path):
     assert proc.returncode == 2
     assert "--reranking" in proc.stderr
     assert "更新並重新 build" in proc.stderr
+
+
+def test_cpu_moe_mode_requires_llama_cpu_moe_flag(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    _write_fake_llama(tmp_path, help_flags="--fit --reranking --mmproj")
+
+    proc = _run(
+        tmp_path, "--yes", "--cpu-moe", "--no-preview", "--models-dir", str(models)
+    )
+
+    assert proc.returncode == 2
+    assert "需要 llama-server 的 --cpu-moe" in proc.stderr
+    assert "重新 build" in proc.stderr
+
+
+def test_generated_vl_safety_requires_llama_fit_flag(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    _write_fake_llama(tmp_path, help_flags="--cpu-moe --reranking --mmproj")
+
+    proc = _run(
+        tmp_path, "--yes", "--no-cpu-moe", "--no-preview", "--models-dir", str(models)
+    )
+
+    assert proc.returncode == 2
+    assert "安全的 VL placement 需要 llama-server --fit" in proc.stderr
+    assert "重新 build" in proc.stderr
 
 
 def test_incomplete_shards_are_reported_with_missing_names(tmp_path):
@@ -510,8 +603,12 @@ def test_only_vl_main_candidate_proceeds_with_warning(tmp_path):
 def test_capacity_main_too_big_without_fit_hard_stops(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", "0, Small GPU, 24576, 20000, GPU-small")
     models = _make_models(tmp_path)
-    _sparse(models / "big-chat" / "big-chat-ud-q4_k_xl-00001-of-00002.gguf", 13 * GIB)
-    _sparse(models / "big-chat" / "big-chat-ud-q4_k_xl-00002-of-00002.gguf", 12 * GIB)
+    _sparse_dense_gguf(
+        models / "big-chat" / "big-chat-ud-q4_k_xl-00001-of-00002.gguf", 13 * GIB
+    )
+    _sparse_dense_gguf(
+        models / "big-chat" / "big-chat-ud-q4_k_xl-00002-of-00002.gguf", 12 * GIB
+    )
     _write_fake_llama(tmp_path, help_flags="--reranking --mmproj")  # 沒有 --fit
 
     proc = _run(tmp_path, "--yes", "--models-dir", str(models))
@@ -520,17 +617,32 @@ def test_capacity_main_too_big_without_fit_hard_stops(tmp_path):
     assert "--fit" in proc.stderr
     assert "--ignore-capacity" in proc.stderr
 
-    # 明知風險仍可用 --ignore-capacity 產生(警告後 -ngl 99)
-    forced = _run(tmp_path, "--yes", "--no-preview", "--ignore-capacity", "--models-dir", str(models))
+    # --ignore-capacity 只略過容量風險，不得產生含不支援旗標的配置；先模擬
+    # 使用者已升級到支援 --fit 的 build，再用不足的 RAM 確認 escape hatch。
+    _write_fake_llama(tmp_path, help_flags="--fit --reranking --mmproj")
+    low_meminfo = tmp_path / "low-meminfo"
+    low_meminfo.write_text(
+        "MemTotal:       16777216 kB\nMemAvailable:   8388608 kB\n",
+        encoding="utf-8",
+    )
+    forced = _run(
+        tmp_path,
+        "--yes", "--no-preview", "--ignore-capacity", "--models-dir", str(models),
+        env_overrides={"AICODE_SET_CONFIG_MEMINFO": str(low_meminfo)},
+    )
     assert forced.returncode == 0, forced.stderr
-    assert "風險自負" in forced.stdout
+    assert "--ignore-capacity" in forced.stdout
 
 
 def test_capacity_shared_gpu_raises_fit_target(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", "0, Small GPU, 24576, 20000, GPU-small")
     models = _make_models(tmp_path)
-    _sparse(models / "big-chat" / "big-chat-ud-q4_k_xl-00001-of-00002.gguf", 13 * GIB)
-    _sparse(models / "big-chat" / "big-chat-ud-q4_k_xl-00002-of-00002.gguf", 12 * GIB)
+    _sparse_dense_gguf(
+        models / "big-chat" / "big-chat-ud-q4_k_xl-00001-of-00002.gguf", 13 * GIB
+    )
+    _sparse_dense_gguf(
+        models / "big-chat" / "big-chat-ud-q4_k_xl-00002-of-00002.gguf", 12 * GIB
+    )
     _sparse(models / "vl" / "vl-model-q6.gguf", 4 * GIB)  # 共卡的附屬模型夠大才看得出抬高
 
     proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
@@ -543,6 +655,35 @@ def test_capacity_shared_gpu_raises_fit_target(tmp_path):
     assert parameters["gpu_layers"] == "auto"
     # 預設 5120 → 抬高到「同卡附屬 + 保留」量級
     assert 9000 < parameters["fit_target"] < 11000
+
+
+def test_yes_auto_selects_cpu_moe_for_oversized_moe_main_only(tmp_path):
+    _write_fake_nvidia_smi(
+        tmp_path / "bin", "0, NVIDIA GeForce RTX 5090, 32607, 30000, GPU-solo"
+    )
+    models = _make_models(tmp_path)
+    _sparse_moe_gguf(
+        models / "big-chat" / "big-chat-ud-q4_k_xl-00001-of-00002.gguf",
+        14 * GIB,
+        21 * GIB // 2,
+    )
+    _sparse_moe_gguf(
+        models / "big-chat" / "big-chat-ud-q4_k_xl-00002-of-00002.gguf",
+        12 * GIB,
+        9 * GIB,
+    )
+
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "自動選擇主模型模式:CPU-MoE" in proc.stdout
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    assert deployment["services"]["main"]["parameters"]["cpu_moe"] is True
+    assert deployment["services"]["main"]["parameters"]["fit"] == "off"
+    for role in ("embedding", "reranker", "vl"):
+        assert "cpu_moe" not in deployment["services"][role].get("parameters", {})
 
 
 def test_capacity_aux_alone_exceeding_budget_fails(tmp_path):

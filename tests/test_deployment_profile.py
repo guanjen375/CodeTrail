@@ -258,6 +258,48 @@ def test_main_auto_fit_parameters_build_expected_command(tmp_path):
     assert command[command.index("-np") + 1] == "1"
 
 
+def test_aux_parallel_and_vl_fit_parameters_build_expected_commands(tmp_path):
+    model = tmp_path / "model.gguf"
+    mmproj = tmp_path / "mmproj.gguf"
+    model.write_bytes(b"fixture")
+    mmproj.write_bytes(b"fixture")
+    _write_local(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "services": {
+                "embedding": {"model": str(model), "parameters": {"parallel": 1}},
+                "reranker": {"model": str(model), "parameters": {"parallel": 1}},
+                "vl": {
+                    "model": str(model),
+                    "mmproj": str(mmproj),
+                    "parameters": {
+                        "gpu_layers": "auto",
+                        "parallel": 1,
+                        "fit": "on",
+                        "fit_target": 3072,
+                    },
+                },
+            },
+        },
+    )
+    env = _env(tmp_path)
+    profile = load_effective_profile(env)
+
+    for role in ("embedding", "reranker"):
+        command = build_server_command(
+            profile.service(role), "/opt/llama-server", env, must_exist=True
+        )
+        assert command[command.index("-np") + 1] == "1"
+    vl_command = build_server_command(
+        profile.service("vl"), "/opt/llama-server", env, must_exist=True
+    )
+    assert vl_command[vl_command.index("-ngl") + 1] == "auto"
+    assert vl_command[vl_command.index("-np") + 1] == "1"
+    assert vl_command[vl_command.index("--fit") + 1] == "on"
+    assert vl_command[vl_command.index("--fit-target") + 1] == "3072"
+
+
 @pytest.mark.parametrize(
     ("role", "parameters", "needle"),
     [

@@ -44,10 +44,15 @@ launcher CLI / environment
   套用四個 role。非 loopback 的 base_url host 不受影響、照原樣綁定。
 - `gpu_role`：只能是 `main` 或 `aux`。
 - `ctx`、`batch`、`ubatch`：正整數或明確 `null`；`null` 代表不傳該 llama.cpp flag。
-- `parameters`：role-specific allowlist；未知 key 直接拒絕。main 另支援新版
+- `parameters`：role-specific allowlist；未知 key 直接拒絕。四個 role 都支援
+  `parallel`(→ `-np`)；main 另支援新版
   llama.cpp 的自動 VRAM 配置:`gpu_layers` 可為整數或 `"auto"`(`-ngl auto`)、
   `fit`(`"on"`/`"off"` → `--fit`)、`fit_target`(MiB → `--fit-target`)、
-  `parallel`(→ `-np`)。主模型大於 VRAM 時 `set_config.sh` 會自動採用這組。
+  以及 `cpu_moe: true`(→ `--cpu-moe`)；VL 也支援 `fit` / `fit_target`，讓最後
+  啟動的 VL 依其他 aux 實際占用保留 VRAM。`cpu_moe` 只允許 main，且不可與
+  部分 offload 的 `n_cpu_moe` 同時設定。`set_config.sh` 會先分流 CPU-MoE /
+  一般模式，再依 GGUF expert/dense tensor 容量產生配置；三個 aux 固定 `-np 1`，
+  VL 使用 `-ngl auto --fit on --fit-target 3072`。
 - VL 的 `mmproj`：同樣只接受 registry key 或 GGUF 絕對路徑。
 
 禁止 `extra_args`、shell 字串、相對 artifact path、帶控制字元的值。launcher 由驗證後

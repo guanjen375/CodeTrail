@@ -8,15 +8,17 @@
   2. 偵測:GPU 種類/VRAM、~/models 的 GGUF 自動分類(main / embedding /
      reranker / VL+mmproj);多 shard 聚合並驗證齊全性(缺片直接列出)。
   3. 背景初步判定:GPU 數與四類模型是否齊全,缺什麼通知什麼。
-  4. 預設模式只需確認一頁「建議配置」(Enter 採用 / a 進階 / q 離開);
+  4. 主模型先分流 CPU-MoE / 一般模式；前者從 GGUF tensor table 分別 gate
+     expert RAM 與 dense/KV VRAM，且只對 main 產生 --cpu-moe。
+  5. 預設模式再確認一頁「建議配置」(Enter 採用 / a 進階 / q 離開);
      `--advanced` 才逐項詢問四個角色與 ctx/threads。
-  5. 產物(先寫 staging、全部就緒才原子替換;既有檔備份 *.bak-setconfig-*):
+  6. 產物(先寫 staging、全部就緒才原子替換;既有檔備份 *.bak-setconfig-*):
      - ~/.config/codetrail/models.json     主模型 registry(合併既有)
      - ~/.config/codetrail/deployment.json deployment local override
      - ~/.config/opencode/opencode.json    只合併 CodeTrail 管的欄位,
                                            保留使用者既有 provider / mcp / 其他設定
      - ~/start.sh                          啟動腳本(支援 status / stop / logs 子命令)
-  6. 安全預設:llama-server 只綁 127.0.0.1;要讓其他機器連線必須明確
+  7. 安全預設:llama-server 只綁 127.0.0.1;要讓其他機器連線必須明確
      `--allow-remote`(或 deployment.json 的 bind: "all-interfaces")。
 
 `--restore-last-backup` 可把四個產物還原到最近一次備份。
@@ -30,6 +32,7 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -65,13 +68,15 @@ _EMBED_TOKENS = (
     "jina-embed",
     "snowflake-arctic-embed",
 )
-# 排序提示:符合 deployment profile 預設 key 的檔案排最前面當預設選項;
-# 同時用來標記「維護者驗證過的附屬模型」(選了其他檔會提示未驗證)。
+# 排序提示:符合已驗證 reference / deployment profile 預設 key 的檔案排最前面;
+# 附屬模型的提示也用來標記「維護者驗證過」(選了其他檔會提示未驗證)。
 _DEFAULT_HINTS = {
     "embedding": ("bge-m3",),
     "reranker": ("qwen3-reranker",),
     "vl": ("qwen3.5-9b", "qwen3-vl"),
-    "main": (),
+    # docs/verified-reference-5090.md 的實測主模型。這只決定 Enter / --yes
+    # 的候選優先序；互動模式仍會先列出所有 main 讓使用者明確選擇。
+    "main": ("qwen3-235b-a22b-thinking-2507",),
 }
 
 # 這些 env 會蓋過設定檔;驗證/預覽時剔除,產生的 ~/start.sh 也會先 unset,
@@ -90,6 +95,28 @@ GPU_RESERVE_MIB = 1536                 # 驅動 / 顯示 / 碎片保留
 AUX_OVERHEAD_MIB = {"embedding": 1024, "reranker": 1024, "vl": 1536}  # ctx/compute buffer 概估
 MAIN_BASE_OVERHEAD_MIB = 2048          # 主模型 compute buffer 概估
 MAIN_KV_PER_32K_MIB = 1024             # 主模型每 32k ctx 的 KV cache 概估(q8_0)
+SYSTEM_RAM_RESERVE_MIB = 32 * 1024      # OS / page cache / launcher 與其他服務保留
+AUX_PARALLEL = 1                        # 本地單使用者服務不預留四個同時 request slot
+VL_FIT_TARGET_MIB = 3 * 1024            # VL 最後啟動後仍保留給 mmproj / inference transient
+
+# llama.cpp --cpu-moe 使用的 expert tensor 命名規則。這裡刻意對齊
+# common/arg.cpp::llm_ffn_exps_cpu_override(),不靠模型檔名猜是不是 MoE。
+_CPU_MOE_TENSOR_RE = re.compile(
+    r"(?:^|\.)ffn_(?:up|down|gate_up|gate)_(?:ch)?exps(?:\.|$)"
+)
+_GGUF_FIXED_TYPES: dict[int, tuple[str, int]] = {
+    0: ("<B", 1),   # UINT8
+    1: ("<b", 1),   # INT8
+    2: ("<H", 2),   # UINT16
+    3: ("<h", 2),   # INT16
+    4: ("<I", 4),   # UINT32
+    5: ("<i", 4),   # INT32
+    6: ("<f", 4),   # FLOAT32
+    7: ("<?", 1),   # BOOL
+    10: ("<Q", 8),  # UINT64
+    11: ("<q", 8),  # INT64
+    12: ("<d", 8),  # FLOAT64
+}
 
 
 class SetupError(RuntimeError):
@@ -132,6 +159,18 @@ class ModelCandidate:
         return f"{self.path.name}({size}{extra}){mm}{vl}"
 
 
+@dataclass(frozen=True)
+class ModelLayout:
+    """從 GGUF tensor table 取得的 placement 資訊(不讀 tensor 內容)。"""
+
+    tensor_bytes: int
+    expert_bytes: int
+
+    @property
+    def is_moe(self) -> bool:
+        return self.expert_bytes > 0
+
+
 @dataclass
 class Selection:
     role: str
@@ -152,6 +191,8 @@ class Plan:
     threads: int
     batch: int
     ubatch: int
+    cpu_moe: bool = False
+    main_layout: ModelLayout | None = None
     allow_remote: bool = False
     parameters: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
@@ -208,7 +249,7 @@ def _llama_bin() -> Path:
 
 
 def check_llama_binary(skip: bool, notes: list[str]) -> dict[str, bool]:
-    """llama-server 存在性 + 必要旗標探測;回傳 capability dict(至少含 fit)。"""
+    """llama-server 存在性 + 必要旗標探測;回傳 fit / cpu_moe capabilities。"""
     binary = _llama_bin()
     if not binary.is_file() or not os.access(binary, os.X_OK):
         message = (
@@ -221,7 +262,7 @@ def check_llama_binary(skip: bool, notes: list[str]) -> dict[str, bool]:
         )
         if skip:
             notes.append("⚠ 已用 --skip-binary-check 跳過 llama-server 檢查(假設為支援 --fit 的新版)。")
-            return {"fit": True}
+            return {"fit": True, "cpu_moe": True}
         raise SetupError(message)
     try:
         proc = subprocess.run(
@@ -230,7 +271,7 @@ def check_llama_binary(skip: bool, notes: list[str]) -> dict[str, bool]:
         help_text = proc.stdout + proc.stderr
     except (OSError, subprocess.TimeoutExpired):
         notes.append(f"⚠ llama-server --help 執行失敗({binary});略過旗標探測。")
-        return {"fit": True}
+        return {"fit": True, "cpu_moe": True}
 
     missing = [flag for flag in ("--reranking", "--mmproj") if flag not in help_text]
     if missing:
@@ -245,7 +286,11 @@ def check_llama_binary(skip: bool, notes: list[str]) -> dict[str, bool]:
             notes.append("⚠ 已跳過 llama-server 旗標檢查:" + " / ".join(missing) + " 不支援。")
         else:
             raise SetupError(message)
-    caps = {"fit": "--fit" in help_text}
+    caps = {
+        "fit": bool(re.search(r"(?<![\w-])--fit(?![\w-])", help_text)),
+        # 不把 --cpu-moe-draft 誤認成主模型用的 --cpu-moe。
+        "cpu_moe": bool(re.search(r"(?<![\w-])--cpu-moe(?![\w-])", help_text)),
+    }
     if not caps["fit"]:
         notes.append(
             "⚠ 這個 llama-server 沒有 --fit(自動 VRAM 配置);"
@@ -352,6 +397,154 @@ def _shard_issues(path: Path) -> list[str]:
     if leftovers:
         issues.append("殘留未完成下載檔:" + "、".join(leftovers))
     return issues
+
+
+def _candidate_files(candidate: ModelCandidate) -> list[Path]:
+    """回傳單檔或依編號排序的完整 shard 路徑。"""
+    match = _SHARD_RE.match(candidate.path.name)
+    if not match:
+        return [candidate.path]
+    stem = match.group("stem")
+    total_text = match.group("total")
+    return [
+        candidate.path.parent / f"{stem}-{index:05d}-of-{total_text}.gguf"
+        for index in range(1, int(total_text) + 1)
+    ]
+
+
+def _gguf_exact(handle, size: int, path: Path) -> bytes:
+    data = handle.read(size)
+    if len(data) != size:
+        raise SetupError(f"GGUF metadata 截斷:{path.name}")
+    return data
+
+
+def _gguf_u32(handle, path: Path) -> int:
+    return struct.unpack("<I", _gguf_exact(handle, 4, path))[0]
+
+
+def _gguf_u64(handle, path: Path) -> int:
+    return struct.unpack("<Q", _gguf_exact(handle, 8, path))[0]
+
+
+def _gguf_string(handle, path: Path, *, capture: bool) -> str | None:
+    length = _gguf_u64(handle, path)
+    if length > GIB:
+        raise SetupError(f"GGUF string 長度異常:{path.name} ({length} bytes)")
+    if capture:
+        raw = _gguf_exact(handle, length, path)
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SetupError(f"GGUF string 不是 UTF-8:{path.name}") from exc
+    handle.seek(length, os.SEEK_CUR)
+    return None
+
+
+def _consume_gguf_value(handle, value_type: int, path: Path, *, capture: bool = False,
+                        depth: int = 0) -> object | None:
+    """讀/略過一個 GGUF metadata value；只在 capture 時回傳 scalar/string。"""
+    if depth > 2:
+        raise SetupError(f"GGUF metadata array 巢狀過深:{path.name}")
+    fixed = _GGUF_FIXED_TYPES.get(value_type)
+    if fixed:
+        fmt, size = fixed
+        raw = _gguf_exact(handle, size, path)
+        return struct.unpack(fmt, raw)[0] if capture else None
+    if value_type == 8:  # STRING
+        return _gguf_string(handle, path, capture=capture)
+    if value_type == 9:  # ARRAY
+        element_type = _gguf_u32(handle, path)
+        count = _gguf_u64(handle, path)
+        if count > 100_000_000:
+            raise SetupError(f"GGUF metadata array 長度異常:{path.name} ({count})")
+        element_fixed = _GGUF_FIXED_TYPES.get(element_type)
+        if element_fixed:
+            handle.seek(element_fixed[1] * count, os.SEEK_CUR)
+        else:
+            for _ in range(count):
+                _consume_gguf_value(handle, element_type, path, depth=depth + 1)
+        return None
+    raise SetupError(f"GGUF metadata type 不支援:{path.name} (type={value_type})")
+
+
+def _inspect_gguf_file(path: Path) -> ModelLayout:
+    """只走 GGUF header/tensor table，以 offset 差計算 expert storage bytes。"""
+    try:
+        file_size = path.stat().st_size
+        with path.open("rb") as handle:
+            if _gguf_exact(handle, 4, path) != b"GGUF":
+                raise SetupError(f"不是有效 GGUF(magic 不符):{path.name}")
+            version = _gguf_u32(handle, path)
+            if version not in {2, 3}:
+                raise SetupError(f"GGUF version 不支援:{path.name} (v{version})")
+            tensor_count = _gguf_u64(handle, path)
+            metadata_count = _gguf_u64(handle, path)
+            # split GGUF 允許某一片只帶 metadata、tensor_count=0。
+            if tensor_count > 10_000_000:
+                raise SetupError(f"GGUF tensor 數量異常:{path.name} ({tensor_count})")
+            if metadata_count > 10_000_000:
+                raise SetupError(f"GGUF metadata 數量異常:{path.name} ({metadata_count})")
+
+            alignment = 32
+            for _ in range(metadata_count):
+                key = _gguf_string(handle, path, capture=True)
+                value_type = _gguf_u32(handle, path)
+                value = _consume_gguf_value(
+                    handle, value_type, path, capture=key == "general.alignment"
+                )
+                if key == "general.alignment" and isinstance(value, int):
+                    alignment = value
+            if alignment < 1 or alignment > MIB or alignment & (alignment - 1):
+                raise SetupError(f"GGUF alignment 異常:{path.name} ({alignment})")
+
+            tensors: list[tuple[int, str]] = []
+            for _ in range(tensor_count):
+                name = _gguf_string(handle, path, capture=True)
+                n_dims = _gguf_u32(handle, path)
+                if n_dims > 16:
+                    raise SetupError(f"GGUF tensor 維度異常:{path.name} ({n_dims})")
+                _gguf_exact(handle, n_dims * 8, path)  # dimensions
+                _gguf_u32(handle, path)                # ggml tensor type
+                offset = _gguf_u64(handle, path)
+                tensors.append((offset, name or ""))
+
+            data_start = (handle.tell() + alignment - 1) // alignment * alignment
+    except OSError as exc:
+        raise SetupError(f"無法讀取 GGUF metadata:{path} ({exc})") from exc
+
+    if not tensors:
+        return ModelLayout(tensor_bytes=0, expert_bytes=0)
+    tensors.sort()
+    data_bytes = file_size - data_start
+    if data_bytes <= 0:
+        raise SetupError(f"GGUF 沒有 tensor data:{path.name}")
+    total = 0
+    expert = 0
+    for index, (offset, name) in enumerate(tensors):
+        end = tensors[index + 1][0] if index + 1 < len(tensors) else data_bytes
+        if offset < 0 or end <= offset or end > data_bytes:
+            raise SetupError(f"GGUF tensor offset 異常:{path.name} ({name})")
+        storage = end - offset
+        total += storage
+        if _CPU_MOE_TENSOR_RE.search(name):
+            expert += storage
+    return ModelLayout(tensor_bytes=total, expert_bytes=expert)
+
+
+def inspect_model_layout(candidate: ModelCandidate) -> ModelLayout:
+    """聚合所有 GGUF shards 的 tensor/expert bytes。"""
+    total = 0
+    expert = 0
+    for path in _candidate_files(candidate):
+        layout = _inspect_gguf_file(path)
+        total += layout.tensor_bytes
+        expert += layout.expert_bytes
+    if total <= 0:
+        raise SetupError(f"GGUF 沒有可分析的 tensor table:{candidate.path.name}")
+    if expert > candidate.total_bytes:
+        raise SetupError(f"GGUF expert tensor 容量異常:{candidate.path.name}")
+    return ModelLayout(tensor_bytes=total, expert_bytes=expert)
 
 
 def scan_models(models_dir: Path) -> tuple[dict[str, list[ModelCandidate]], list[str]]:
@@ -574,6 +767,43 @@ def choose_int(label: str, default: int, override: int | None, assume_yes: bool)
         print("  請輸入正整數。")
 
 
+def choose_cpu_moe_mode(
+    override: bool | None,
+    assume_yes: bool,
+    recommended: bool,
+    candidate: ModelCandidate,
+    layout: ModelLayout | None,
+) -> bool:
+    """主模型唯一一次的模式分流；附屬三模型永遠不套 CPU-MoE。"""
+    if override is not None:
+        return override
+    if assume_yes:
+        return recommended
+
+    print("\n【主聊天模型運行模式】CPU-MoE 只套用 main，不影響 embedding/reranker/VL。")
+    print(f"  目前主模型: {candidate.describe()}")
+    if layout is None:
+        print(f"  ⚠ 無法讀取 {candidate.path.name} 的 GGUF tensor 配置，預設一般模式。")
+    elif layout.is_moe:
+        expert_gib = layout.expert_bytes / GIB
+        print(f"  已偵測到 MoE expert tensors 約 {expert_gib:.1f} GiB。")
+    else:
+        print("  未偵測到 MoE expert tensors；dense 模型通常選一般模式。")
+    if recommended:
+        print("  主模型整顆放不進所選 GPU，建議 CPU-MoE（experts 放 RAM、dense/KV 留 GPU）。")
+
+    suffix = "Y/n" if recommended else "y/N"
+    while True:
+        raw = _input(f"主聊天模型啟用 CPU-MoE (--cpu-moe)? [{suffix}]: ").strip().lower()
+        if not raw:
+            return recommended
+        if raw in {"y", "yes"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        print("  請輸入 y 或 n。")
+
+
 def resolve_vl_mmproj(
     vl_cand: ModelCandidate,
     override: str | None,
@@ -618,15 +848,23 @@ def resolve_vl_mmproj(
 # 推薦參數
 # ---------------------------------------------------------------------------
 
-def _mem_total_bytes() -> int:
+def _mem_info_mib() -> tuple[int, int]:
+    """回傳 (MemTotal, MemAvailable) MiB；env path 僅供離線 fixture 注入。"""
+    values: dict[str, int] = {}
+    meminfo_path = os.environ.get("AICODE_SET_CONFIG_MEMINFO") or "/proc/meminfo"
     try:
-        with open("/proc/meminfo", encoding="utf-8") as handle:
+        with open(meminfo_path, encoding="utf-8") as handle:
             for line in handle:
-                if line.startswith("MemTotal:"):
-                    return int(line.split()[1]) * 1024
+                key = line.partition(":")[0]
+                if key in {"MemTotal", "MemAvailable", "MemFree"}:
+                    values[key] = int(line.split()[1]) // 1024
     except (OSError, ValueError, IndexError):
-        pass
-    return 0
+        return 0, 0
+    return values.get("MemTotal", 0), values.get("MemAvailable", values.get("MemFree", 0))
+
+
+def _mem_total_bytes() -> int:
+    return _mem_info_mib()[0] * MIB
 
 
 def _aux_need_mib(selection: Selection) -> int:
@@ -640,9 +878,56 @@ def _aux_need_mib(selection: Selection) -> int:
     return int(size * 1.1 / MIB) + AUX_OVERHEAD_MIB[selection.role]
 
 
-def _main_need_mib(candidate: ModelCandidate, ctx: int) -> int:
+def _main_need_for_weights_mib(weight_bytes: int, ctx: int) -> int:
     overhead = MAIN_BASE_OVERHEAD_MIB + int(ctx / 32768 * MAIN_KV_PER_32K_MIB)
-    return int(candidate.total_bytes * 1.05 / MIB) + overhead
+    return int(weight_bytes * 1.05 / MIB) + overhead
+
+
+def _main_need_mib(candidate: ModelCandidate, ctx: int) -> int:
+    return _main_need_for_weights_mib(candidate.total_bytes, ctx)
+
+
+def _capacity_problem(message: str, ignore: bool, notes: list[str]) -> None:
+    if ignore:
+        notes.append("⚠(--ignore-capacity)" + message)
+        return
+    raise SetupError(message + "\n(明知風險仍要產生設定:--ignore-capacity)")
+
+
+def _check_system_ram(
+    resident_bytes: int,
+    label: str,
+    ignore: bool,
+    notes: list[str],
+) -> None:
+    """CPU placement 的總 RAM hard gate；當下 available 另做啟動前提醒。"""
+    total_mib, available_mib = _mem_info_mib()
+    resident_mib = int(resident_bytes * 1.10 / MIB)
+    if total_mib <= 0:
+        _capacity_problem(
+            f"容量判定不通過:讀不到系統 MemTotal，無法確認 {label} 是否會造成 RAM OOM。",
+            ignore,
+            notes,
+        )
+        return
+    budget_mib = max(total_mib - SYSTEM_RAM_RESERVE_MIB, 0)
+    notes.append(
+        f"RAM 容量預估:總量 {total_mib} MiB − 保留 {SYSTEM_RAM_RESERVE_MIB} MiB"
+        f" = 預算 {budget_mib} MiB；{label} 約需 {resident_mib} MiB。"
+    )
+    if resident_mib > budget_mib:
+        _capacity_problem(
+            f"容量判定不通過:{label} 約需 {resident_mib} MiB RAM，但系統預算只有"
+            f" {budget_mib} MiB(總 RAM − 保留 {SYSTEM_RAM_RESERVE_MIB})。"
+            "請換較小量化/模型，或增加 RAM。",
+            ignore,
+            notes,
+        )
+    if available_mib and available_mib < resident_mib:
+        notes.append(
+            f"⚠ 系統目前只有 {available_mib} MiB MemAvailable，但 {label} 規劃需"
+            f" ~{resident_mib} MiB；啟動前先停掉舊 server/其他大型程序。"
+        )
 
 
 def plan_capacity(
@@ -652,13 +937,14 @@ def plan_capacity(
     ignore: bool,
     notes: list[str],
 ) -> tuple[bool, int]:
-    """整機容量可行性判定(GPT 評估的最後一個 P0)。
+    """整機容量可行性判定。
 
     1. 每張 GPU 預算 = 總 VRAM − 保留;先扣 aux(embedding/reranker/vl+mmproj)。
     2. aux 自己就塞不下 → 硬性失敗(不產生必定 OOM 的設定)。
     3. main 與 aux 同卡時,從 main 預算扣掉同卡 aux。
-    4. main 塞不下且 llama-server 沒有 --fit → 硬性失敗,不再退回 -ngl 99。
-    5. main 塞不下但有 --fit → 允許,共卡時把 fit-target 抬高到「同卡 aux + 保留」。
+    4. CPU-MoE 模式:從 GGUF tensor table 拆出 experts(RAM)與 dense+KV(GPU),兩邊都 gate。
+    5. 一般模式:MoE 放不下時拒絕隱性 CPU-MoE；dense 才可退到 --fit layer offload,
+       並另外檢查 RAM。共卡時把 fit-target 抬高到「同卡 aux + 保留」。
     `--ignore-capacity` 可把硬性失敗降為警告(進階者自負)。
     回傳 (main 是否整顆塞得下, 建議 fit_target)。
     """
@@ -675,10 +961,7 @@ def plan_capacity(
                 f"但該卡預算只有 {budget.get(index, 0)} MiB(總 VRAM − 保留 {GPU_RESERVE_MIB})。"
                 "請把附屬模型分到別的 GPU(--advanced / --embed-gpu 等),或換較小的附屬模型。"
             )
-            if ignore:
-                notes.append("⚠(--ignore-capacity)" + message)
-            else:
-                raise SetupError(message + "\n(明知風險仍要產生設定:--ignore-capacity)")
+            _capacity_problem(message, ignore, notes)
 
     main_index = plan.main.gpu.index
     main_aux = aux_by_gpu.get(main_index, 0)
@@ -691,20 +974,74 @@ def plan_capacity(
         f"同卡附屬約 {main_aux} MiB,主模型含 KV/buffer 約需 {main_need} MiB → "
         + ("整顆塞得下" if fits else "塞不下(需要 CPU offload)")
     )
-    if not fits and not fit_supported:
-        message = (
-            "容量判定不通過:主模型放不下所選 GPU,而你的 llama-server 不支援 --fit"
-            "(自動 GPU/CPU 配置)—— 直接 -ngl 99 啟動幾乎必定 OOM,拒絕產生這種設定。\n"
-            "  修法(擇一):更新並重新 build llama.cpp(README §1.5)/ 選較小量化的主模型 /"
-            " --advanced 手動調 n_cpu_moe。"
-        )
-        if ignore:
-            notes.append("⚠(--ignore-capacity)" + message)
+    planned_main_gpu = main_need if fits else max(remaining, 0)
+
+    if plan.cpu_moe:
+        layout = plan.main_layout
+        if layout is None:
+            _capacity_problem(
+                "容量判定不通過:CPU-MoE 模式無法解析主模型 GGUF tensor table，"
+                "因此無法估算 experts 的 RAM 與 dense/KV 的 VRAM。",
+                ignore,
+                notes,
+            )
+        elif not layout.is_moe:
+            _capacity_problem(
+                "容量判定不通過:CPU-MoE 模式未在主模型偵測到 expert tensors；"
+                "--cpu-moe 對 dense 模型無效，請改用一般模式。",
+                ignore,
+                notes,
+            )
         else:
-            raise SetupError(message + "\n(明知風險仍要產生設定:--ignore-capacity)")
+            dense_bytes = max(plan.main.candidate.total_bytes - layout.expert_bytes, 0)
+            cpu_moe_gpu_need = _main_need_for_weights_mib(dense_bytes, plan.ctx)
+            planned_main_gpu = cpu_moe_gpu_need
+            notes.append(
+                f"CPU-MoE 容量預估:experts 約 {layout.expert_bytes / GIB:.1f} GiB 放 RAM；"
+                f"dense/其他權重 + KV/buffer 在 GPU {main_index} 約需 {cpu_moe_gpu_need} MiB，"
+                f"該卡扣除同卡附屬後剩 {remaining} MiB。"
+            )
+            if cpu_moe_gpu_need > remaining:
+                _capacity_problem(
+                    "容量判定不通過:即使把全部 MoE experts 放 CPU，主模型的 dense/其他權重"
+                    f" + KV/buffer 仍約需 {cpu_moe_gpu_need} MiB VRAM，但 GPU {main_index}"
+                    f" 只剩 {remaining} MiB。請降低 --ctx、移走同卡附屬模型，或換更大 GPU。",
+                    ignore,
+                    notes,
+                )
+            _check_system_ram(layout.expert_bytes, "CPU-MoE expert resident", ignore, notes)
+    elif not fits:
+        layout = plan.main_layout
+        if layout is None:
+            _capacity_problem(
+                "容量判定不通過:主模型放不進 GPU，且無法解析 GGUF tensor table 判斷"
+                " dense/MoE；拒絕猜測 CPU placement。請確認模型檔完整。",
+                ignore,
+                notes,
+            )
+        elif layout.is_moe:
+            _capacity_problem(
+                "容量判定不通過:這是 MoE 主模型且整顆放不進所選 GPU；一般模式不允許"
+                " --fit 隱性決定 expert placement。請重跑並選 CPU-MoE，或加 --cpu-moe。",
+                ignore,
+                notes,
+            )
+        if not fit_supported:
+            _capacity_problem(
+                "容量判定不通過:主模型放不下所選 GPU，而 llama-server 不支援 --fit"
+                "(dense layer 自動 GPU/CPU 配置)。請更新 llama.cpp 或換較小主模型。",
+                ignore,
+                notes,
+            )
+        _check_system_ram(
+            plan.main.candidate.total_bytes,
+            "一般模式 dense CPU offload(保守以上限整顆 GGUF 計)",
+            ignore,
+            notes,
+        )
 
     fit_target = fit_target_arg
-    if not fits and main_aux:
+    if not fits and not plan.cpu_moe and main_aux:
         # 共卡時 --fit 要多留出同卡附屬模型的空間,否則 main 自動吃滿後 aux 起不來。
         raised = main_aux + GPU_RESERVE_MIB
         if raised > fit_target:
@@ -718,7 +1055,7 @@ def plan_capacity(
     for gpu in plan.gpus:
         planned = aux_by_gpu.get(gpu.index, 0)
         if gpu.index == main_index:
-            planned += min(main_need, max(remaining, 0)) if fits else max(remaining, 0)
+            planned += min(planned_main_gpu, max(remaining, 0))
         if planned and gpu.free_mib < planned:
             notes.append(
                 f"⚠ GPU {gpu.index} 目前只剩 {gpu.free_mib} MiB free(規劃需 ~{planned} MiB):"
@@ -729,7 +1066,7 @@ def plan_capacity(
 
 def recommend_main(plan_gpu: Gpu, candidate: ModelCandidate, ctx: int, threads: int,
                    fit_target: int, fit_supported: bool, fits_in_budget: bool,
-                   notes: list[str]) -> tuple[dict, int, int]:
+                   cpu_moe: bool, notes: list[str]) -> tuple[dict, int, int]:
     """依容量規劃結果(fits_in_budget 來自 plan_capacity)決定 offload 策略與 batch。"""
     parameters: dict = {
         "jinja": True,
@@ -738,8 +1075,22 @@ def recommend_main(plan_gpu: Gpu, candidate: ModelCandidate, ctx: int, threads: 
         "cache_type_v": "q8_0",
         "threads": threads,
     }
-    if fits_in_budget:
+    if cpu_moe:
+        # --fit 會嘗試改寫 tensor placement，不能和顯式 --cpu-moe override 混用。
+        parameters.update({"gpu_layers": 99, "cpu_moe": True})
+        if fit_supported:
+            parameters["fit"] = "off"
+        batch, ubatch = 1024, 256
+        notes.append(
+            f"主模型 {candidate.total_bytes / GIB:.0f} GB 採 CPU-MoE 模式 → "
+            "全部 expert tensors 固定在 RAM(--cpu-moe)，dense/其他層全 GPU offload(-ngl 99)；"
+            "只影響 main。"
+        )
+    elif fits_in_budget:
         parameters["gpu_layers"] = 99
+        if fit_supported:
+            # 新版 llama.cpp 的 --fit 預設可能是 on；明確關閉才不會重寫已規劃的 -ngl 99。
+            parameters["fit"] = "off"
         batch, ubatch = 2048, 512
         notes.append(
             f"主模型 {candidate.total_bytes / GIB:.0f} GB 可整顆放進 "
@@ -824,11 +1175,26 @@ def build_deployment_config(plan: Plan) -> dict:
             "ubatch": plan.ubatch,
             "parameters": plan.parameters,
         },
-        "embedding": {"model": str(plan.embedding.candidate.path)},
-        "reranker": {"model": str(plan.reranker.candidate.path)},
+        "embedding": {
+            "model": str(plan.embedding.candidate.path),
+            "parameters": {"parallel": AUX_PARALLEL},
+        },
+        "reranker": {
+            "model": str(plan.reranker.candidate.path),
+            "parameters": {"parallel": AUX_PARALLEL},
+        },
         "vl": {
             "model": str(plan.vl.candidate.path),
             "mmproj": str(plan.vl.mmproj),
+            # VL 固定最後啟動。讓 llama.cpp 依 embedding/reranker 的實際占用
+            # 自動決定 GPU layers；server 也會把 mmproj worst-case memory 加進
+            # fit target，避免 health OK 後第一張圖片才 CUDA OOM。
+            "parameters": {
+                "gpu_layers": "auto",
+                "parallel": AUX_PARALLEL,
+                "fit": "on",
+                "fit_target": VL_FIT_TARGET_MIB,
+            },
         },
     }
     if plan.allow_remote:
@@ -1015,13 +1381,22 @@ def _gpu_exports(plan: Plan) -> list[str]:
     return lines
 
 
+def _offload_description(plan: Plan) -> str:
+    if plan.parameters.get("cpu_moe"):
+        suffix = " --fit off" if plan.parameters.get("fit") == "off" else ""
+        return f"CPU-MoE: -ngl 99 --cpu-moe{suffix}(只套 main)"
+    if plan.parameters.get("fit") == "on":
+        return (
+            "一般 dense offload: -ngl auto --fit on --fit-target "
+            f"{plan.parameters.get('fit_target')}"
+        )
+    suffix = " --fit off" if plan.parameters.get("fit") == "off" else ""
+    return f"一般模式: -ngl 99{suffix}(全 GPU offload)"
+
+
 def build_start_sh(plan: Plan) -> str:
     gpu_lines = "\n".join(f"#   {gpu.describe()}" for gpu in plan.gpus)
-    offload = (
-        "-ngl auto --fit on(自動 VRAM 配置)"
-        if plan.parameters.get("fit") == "on"
-        else "-ngl 99(全 GPU offload)"
-    )
+    offload = _offload_description(plan)
     bind_note = (
         "0.0.0.0(--allow-remote:區網其他機器可連線,llama-server 無認證,務必只在可信網段)"
         if plan.allow_remote
@@ -1045,6 +1420,7 @@ def build_start_sh(plan: Plan) -> str:
 #   vl        = {plan.vl.candidate.path.name} @ GPU {plan.vl.gpu.index}
 #
 # 推薦啟動參數:ctx={plan.ctx}, threads={plan.parameters.get("threads")}, {offload}
+#   附屬服務:-np {AUX_PARALLEL};VL -ngl auto --fit on --fit-target {VL_FIT_TARGET_MIB}
 #   綁定:{bind_note}
 #   完整參數在 ~/.config/codetrail/deployment.json;實際指令預覽:~/start.sh --dry-run
 #
@@ -1305,6 +1681,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--yes", action="store_true", help="全部採用建議配置,不互動")
     parser.add_argument("--advanced", action="store_true",
                         help="進階模式:逐項詢問四個角色的模型/GPU 與 ctx/threads")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--cpu-moe", dest="cpu_moe", action="store_true",
+        help="主聊天模型啟用 CPU-MoE(--cpu-moe；experts 放 RAM；不影響三個附屬模型)",
+    )
+    mode.add_argument(
+        "--no-cpu-moe", dest="cpu_moe", action="store_false",
+        help="主聊天模型使用一般模式(互動提示不再詢問)",
+    )
+    parser.set_defaults(cpu_moe=None)
     parser.add_argument("--dry-run", action="store_true", help="只顯示會寫入的內容,不動任何檔案")
     parser.add_argument("--allow-remote", action="store_true",
                         help="讓區網其他機器可連線模型 API(預設只綁 127.0.0.1;llama-server 無認證,慎用)")
@@ -1329,11 +1715,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def _print_summary_page(plan: Plan, python_bin: str, opencode_changes: list[str],
                         codetrail_dir: Path, opencode_path: Path, start_path: Path) -> None:
-    offload = (
-        f"-ngl auto --fit on --fit-target {plan.parameters.get('fit_target')}"
-        if plan.parameters.get("fit") == "on"
-        else "-ngl 99(全 GPU offload)"
-    )
+    offload = _offload_description(plan)
     print("\n=== 建議配置(確認一次即可)===")
     print(f"  主聊天    : {plan.main.candidate.describe()}")
     print(f"              → GPU {plan.main.gpu.index}({plan.main.gpu.name};VRAM 最大)")
@@ -1393,13 +1775,49 @@ def run(args: argparse.Namespace) -> int:
     others = [gpu for gpu in gpus if gpu.index != main_gpu_default.index]
     aux_gpu_default = max(others, key=lambda gpu: gpu.total_mib) if others else main_gpu_default
 
-    # 非互動(--yes / 全旗標)與摘要確認模式都先按預設+旗標組出配置;
-    # --advanced 才逐項詢問。
+    # 普通互動也必須先明確列出 main 候選，不能靜默拿排序第一顆；否則多顆
+    # 大模型並存時，使用者會在不知道模型名稱的情況下替錯誤的模型選模式。
+    # --yes 才直接採用已驗證 reference 優先的預設；--advanced 再詢問其餘項目。
     ask = args.advanced and not args.yes
     main_cand = choose_candidate("【主聊天模型】", candidates["main"], args.main_model,
-                                 assume_yes=not ask)
+                                 assume_yes=args.yes)
     main_gpu = choose_gpu("【主聊天模型】", gpus, main_gpu_default, args.main_gpu,
                           assume_yes=not ask)
+
+    # 先決定 main 的 CPU-MoE / 一般模式，再詢問任何附屬模型選項。
+    # GGUF 只讀 header/tensor table，不讀權重內容，也不執行模型。
+    main_layout: ModelLayout | None
+    try:
+        main_layout = inspect_model_layout(main_cand)
+    except SetupError as exc:
+        main_layout = None
+        notes.append(f"⚠ 主模型 placement metadata 無法分析:{exc}")
+    cpu_moe_recommended = bool(
+        main_layout
+        and main_layout.is_moe
+        and _main_need_mib(main_cand, args.ctx or DEFAULT_MAIN_CTX)
+        > main_gpu.total_mib - GPU_RESERVE_MIB
+    )
+    mode_was_unspecified = args.cpu_moe is None
+    cpu_moe = choose_cpu_moe_mode(
+        args.cpu_moe,
+        assume_yes=args.yes,
+        recommended=cpu_moe_recommended,
+        candidate=main_cand,
+        layout=main_layout,
+    )
+    if cpu_moe and not llama_caps.get("cpu_moe", False):
+        raise SetupError(
+            "CPU-MoE 模式需要 llama-server 的 --cpu-moe，但目前 build 不支援。\n"
+            "  修復:更新並重新 build llama.cpp(README §1.5)，或改用 --no-cpu-moe。"
+        )
+    if mode_was_unspecified and args.yes:
+        notes.append(
+            "--yes 已依 GGUF/GPU 容量自動選擇主模型模式:"
+            + ("CPU-MoE" if cpu_moe else "一般模式")
+            + "(可用 --cpu-moe / --no-cpu-moe 明確覆寫)。"
+        )
+
     embed_cand = choose_candidate("【embedding 模型】", candidates["embedding"], args.embed_model,
                                   assume_yes=not ask)
     embed_gpu = choose_gpu("【embedding 模型】", gpus, aux_gpu_default, args.embed_gpu,
@@ -1452,6 +1870,8 @@ def run(args: argparse.Namespace) -> int:
         threads=threads,
         batch=0,
         ubatch=0,
+        cpu_moe=cpu_moe,
+        main_layout=main_layout,
         allow_remote=allow_remote,
         parameters={},
         notes=notes,
@@ -1463,13 +1883,23 @@ def run(args: argparse.Namespace) -> int:
     fits_in_budget, fit_target = plan_capacity(
         plan, llama_caps.get("fit", True), args.fit_target, args.ignore_capacity, notes
     )
+    if not llama_caps.get("fit", False):
+        raise SetupError(
+            "安全的 VL placement 需要 llama-server --fit，才能在 embedding/reranker"
+            " 啟動後保留推論用 VRAM。請更新並重新 build llama.cpp(README §1.5)。"
+        )
     parameters, batch, ubatch = recommend_main(
         main_gpu, main_cand, ctx, threads, fit_target,
-        llama_caps.get("fit", True), fits_in_budget, notes,
+        llama_caps.get("fit", True), fits_in_budget, cpu_moe, notes,
     )
     plan.parameters = parameters
     plan.batch = batch
     plan.ubatch = ubatch
+    notes.append(
+        f"附屬服務安全配置:三個服務固定 -np {AUX_PARALLEL}；VL 最後啟動並用"
+        f" -ngl auto --fit on --fit-target {VL_FIT_TARGET_MIB}，依當下剩餘 VRAM"
+        " 自動 offload（llama.cpp 會另計 mmproj worst-case memory）。"
+    )
     if allow_remote:
         notes.append("⚠ --allow-remote:四個 llama-server 會綁 0.0.0.0,同網段任何人都能呼叫模型 API"
                      "(llama-server 無認證)。只在可信內網使用,必要時加防火牆規則。")

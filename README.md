@@ -202,7 +202,7 @@ cmake --build build --config Release -j
 
 > 如果之前 build 失敗過(例如 CUDA 升級之前),**`rm -rf build` 再重來**,CMake 的快取會記住舊 toolkit 路徑。
 >
-> 建議用**新版** llama.cpp:主模型比 VRAM 大時,`set_config.sh` 產生的推薦參數會用新版的 `-ngl auto --fit on` 自動 VRAM 配置;太舊的 build 沒有 `--fit`,set_config 會提醒你升級。
+> 建議用**新版** llama.cpp:`set_config.sh` 會把超出 VRAM 的主模型分成兩條安全路徑——MoE 明確用 `--cpu-moe`，dense 才用 `-ngl auto --fit on` 做一般 layer offload；缺少必要旗標時會直接提醒升級。
 
 ---
 
@@ -266,9 +266,9 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 設計給**剛接觸專案者**:預設不需要懂 embedding / reranker / mmproj 的差別,只要確認一頁建議配置。在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`,它會依序:
 
-1. **前置檢查**:Python 依賴(mcp/numpy/requests)、`tmux`、`nvidia-smi`、`llama-server` 是否存在且支援必要旗標(`--reranking` / `--mmproj`;`--fit` 沒有只警告)。缺什麼直接給**可複製的修復指令**(裝哪個套件、跑哪行 build),修完重跑即可。
-2. **偵測與判定**:GPU 種類/VRAM、`~/models` 的 GGUF 自動分類成主聊天 / embedding / reranker / VL+mmproj 四類;多 shard 自動聚合並**驗證齊全性**(缺片、零大小、殘留 `.incomplete` 都會列出檔名與補救指令)。缺任何一類直接列出並指到 §2;單 GPU 可以跑(全部共用一顆卡)但會提示建議雙卡分工。
-3. **容量可行性規劃 + 建議配置一頁確認**:主模型放 VRAM 最大的 GPU、三顆附屬模型共用另一顆,並做**整機容量預估**(每張 GPU 預算 = 總 VRAM − 保留;先扣附屬模型與 KV/buffer 概估,再判主模型):附屬模型自己就塞不下 → 直接失敗;主模型塞不下且 llama-server 沒有 `--fit` → **拒絕產生必定 OOM 的設定**(`--ignore-capacity` 可強制);與附屬模型共卡時 `--fit-target` 自動抬高。有 mmproj 的 VL 模型**不會被自動選成主模型**(只剩 VL 可選時會明確警告/確認)。`ctx`(預設 65536)、`threads`、`--no-mmap`(RAM 夠才開)、OpenCode `limit.context` 對齊、MCP timeout、MCP 用的 Python 路徑全部自動補好。看完按 **Enter 採用**;要逐項自選按 **a**(或直接 `./set_config.sh --advanced`);**q** 離開不寫任何檔案。
+1. **前置檢查**:Python 依賴(mcp/numpy/requests)、`tmux`、`nvidia-smi`、`llama-server` 是否存在且支援必要旗標(`--reranking` / `--mmproj`;CPU-MoE 模式另需 `--cpu-moe`)。缺什麼直接給**可複製的修復指令**(裝哪個套件、跑哪行 build),修完重跑即可。
+2. **偵測與主模型模式分流**:GPU 種類/VRAM、`~/models` 的 GGUF 自動分類成主聊天 / embedding / reranker / VL+mmproj 四類;多 shard 自動聚合並**驗證齊全性**。普通互動模式會先列出並選定主模型（不會靜默挑最大顆），接著顯示該模型完整檔名，再於詢問任何附屬模型前直接問是否啟用 **CPU-MoE**；它只影響 main。`--yes` 優先採用 5090 reference 已驗證的 Qwen3-235B（若存在），並讀 GGUF tensor table 判斷是否為 MoE，且整顆放不進 GPU 時自動選 CPU-MoE；`--cpu-moe` / `--no-cpu-moe` 可明確覆寫。
+3. **CPU/RAM/VRAM 容量規劃 + 建議配置一頁確認**:主模型放 VRAM 最大的 GPU、三顆附屬模型共用另一顆。一般模式的 MoE 若放不進 GPU會直接停止，不讓 `--fit` 隱性決定 expert placement；CPU-MoE 模式會依 tensor offset 分別估算 experts 的 RAM 與 dense/其他權重＋KV/buffer 的 VRAM，任一邊不足都拒絕寫設定。dense 模型超出 VRAM 時才走 `--fit`，並以整顆 GGUF 當保守 RAM 上限；附屬模型容量也維持硬 gate。三個附屬服務固定單 slot，最後啟動的 VL 另用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用保留 3 GiB，避免只通過 health、第一張圖片才 OOM。`--ignore-capacity` 是明知風險的 escape hatch。有 mmproj 的 VL 模型不會被自動選成 main。`ctx`(預設 65536)、`threads`、`--no-mmap`、OpenCode context、MCP timeout/Python 路徑一併對齊。看完按 **Enter 採用**；要逐項自選按 **a**；**q** 離開不寫檔。
 4. **產生四個檔案**(transaction 寫入:要嘛全套完成、要嘛完全不動;既有檔自動備份 `*.bak-setconfig-<時間戳>`,`--restore-last-backup` 可整批還原):
 
 | 產物 | 內容 |
@@ -280,7 +280,7 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 結尾會自動印出**推薦啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
 
-非互動用法(自動化 / 重跑):`./set_config.sh --yes` 全用建議值;`--allow-remote` 開放區網連線(預設只綁 127.0.0.1);`./set_config.sh --help` 看完整旗標(可直接指定各模型與 GPU)。
+非互動用法(自動化 / 重跑):`./set_config.sh --yes` 全用建議值；想固定主模型模式就加 `--cpu-moe` 或 `--no-cpu-moe`。`--allow-remote` 開放區網連線(預設只綁 127.0.0.1)；`./set_config.sh --help` 看完整旗標。
 
 ### 3.2 啟動與停止
 
@@ -395,7 +395,7 @@ AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
 }
 ```
 
-所有 service 都有同級 `model`、`port`、`base_url`、`bind`(`local` 預設只綁 127.0.0.1 / `all-interfaces` 綁 0.0.0.0)、`gpu_role`、`ctx`、`batch`、`ubatch`、`parameters`;VL 另外有 `mmproj`。模型欄只接受 registry key 或 GGUF 絕對路徑,參數只接受 schema allowlist(含新版 llama.cpp 的 `gpu_layers: "auto"`、`fit`、`fit_target`、`parallel`),沒有 raw shell `extra_args`;JSON 不會被 `source` / `eval`。schema 與 GPU precedence 詳見 [docs/deployment-profiles.md](docs/deployment-profiles.md)。可離線查看合併結果:
+所有 service 都有同級 `model`、`port`、`base_url`、`bind`(`local` 預設只綁 127.0.0.1 / `all-interfaces` 綁 0.0.0.0)、`gpu_role`、`ctx`、`batch`、`ubatch`、`parameters`;VL 另外有 `mmproj`。模型欄只接受 registry key 或 GGUF 絕對路徑,參數只接受 schema allowlist(含 main-only `cpu_moe` → `--cpu-moe`，以及 `gpu_layers: "auto"`、`fit`、`fit_target`、`parallel`),沒有 raw shell `extra_args`;JSON 不會被 `source` / `eval`。schema 與 GPU precedence 詳見 [docs/deployment-profiles.md](docs/deployment-profiles.md)。可離線查看合併結果:
 
 ```bash
 AICODE_MODEL=<CODE_MODEL> python deployment_profile.py show

@@ -45,7 +45,7 @@ _SERVICE_KEYS = {
     "parameters",
 }
 _BIND_VALUES = {"local", "all-interfaces"}
-_COMMON_PARAMETERS = {"gpu_layers", "flash_attention", "no_mmap"}
+_COMMON_PARAMETERS = {"gpu_layers", "flash_attention", "no_mmap", "parallel"}
 _ROLE_PARAMETERS = {
     "main": _COMMON_PARAMETERS
     | {
@@ -57,15 +57,16 @@ _ROLE_PARAMETERS = {
         "presence_penalty",
         "cache_type_k",
         "cache_type_v",
+        "cpu_moe",
         "n_cpu_moe",
         "threads",
         "fit",
         "fit_target",
-        "parallel",
     },
     "embedding": _COMMON_PARAMETERS | {"embedding", "pooling"},
     "reranker": _COMMON_PARAMETERS | {"embedding", "pooling", "reranking"},
-    "vl": _COMMON_PARAMETERS,
+    # VL 最後啟動，可用 llama.cpp --fit 依前兩個 aux 的實際占用保留 VRAM。
+    "vl": _COMMON_PARAMETERS | {"fit", "fit_target"},
 }
 _BARE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,191}$")
 _GPU_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:,\-]{0,255}$")
@@ -251,7 +252,7 @@ def _url_with_port(value: str, port: int) -> str:
 def _validate_parameter(role: str, key: str, value: Any, where: str) -> None:
     if key not in _ROLE_PARAMETERS[role]:
         raise ProfileError(f"{where} parameter {key!r} is not allowed for role {role}")
-    if key in {"jinja", "embedding", "reranking", "no_mmap"}:
+    if key in {"jinja", "embedding", "reranking", "no_mmap", "cpu_moe"}:
         if not isinstance(value, bool):
             raise ProfileError(f"{where}.{key} must be boolean")
         if role == "embedding" and key == "embedding" and value is not True:
@@ -364,6 +365,10 @@ def _validate_document(data: dict[str, Any], where: str, *, local: bool = False)
                 raise ProfileError(f"{service_where}.parameters must be an object")
             for key, value in params.items():
                 _validate_parameter(role, key, value, f"{service_where}.parameters")
+            if params.get("cpu_moe") and "n_cpu_moe" in params:
+                raise ProfileError(
+                    f"{service_where}.parameters.cpu_moe and n_cpu_moe are mutually exclusive"
+                )
 
 
 def _merge(base: dict[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
@@ -769,6 +774,8 @@ def build_server_command(
         command.extend(["-ngl", str(p["gpu_layers"])])
     if p.get("jinja"):
         command.append("--jinja")
+    if p.get("cpu_moe"):
+        command.append("--cpu-moe")
     parameter_flags = (
         ("temperature", "--temp"),
         ("top_p", "--top-p"),
