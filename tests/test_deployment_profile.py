@@ -277,3 +277,59 @@ def test_auto_fit_parameter_validation_rejects_bad_values(tmp_path, role, parame
 
     with pytest.raises(ProfileError, match=needle):
         load_effective_profile(env)
+
+
+def test_bind_defaults_to_loopback_only(tmp_path):
+    model = tmp_path / "main.gguf"
+    model.write_bytes(b"fixture")
+    env = _env(tmp_path, AICODE_MODEL=str(model))
+    profile = load_effective_profile(env)
+
+    for role in ("main", "embedding", "reranker", "vl"):
+        assert profile.service(role).bind == "local"
+    command = build_server_command(profile.service("main"), "/opt/llama-server", env, must_exist=True)
+    assert command[command.index("--host") + 1] == "127.0.0.1"
+
+
+def test_bind_all_interfaces_via_override_and_env(tmp_path):
+    model = tmp_path / "main.gguf"
+    model.write_bytes(b"fixture")
+    _write_local(
+        tmp_path,
+        {"schema_version": 1, "services": {"main": {"bind": "all-interfaces"}}},
+    )
+    env = _env(tmp_path, AICODE_MODEL=str(model))
+    profile = load_effective_profile(env)
+    command = build_server_command(profile.service("main"), "/opt/llama-server", env, must_exist=True)
+    assert command[command.index("--host") + 1] == "0.0.0.0"
+    # local override 只設了 main;其他 role 仍是安全預設
+    assert profile.service("embedding").bind == "local"
+
+    env_all = _env(tmp_path, AICODE_MODEL=str(model), AICODE_BIND="all-interfaces")
+    profile_all = load_effective_profile(env_all)
+    for role in ("main", "embedding", "reranker", "vl"):
+        assert profile_all.service(role).bind == "all-interfaces"
+
+
+def test_bind_rejects_unknown_value_and_preserves_remote_host(tmp_path):
+    _write_local(
+        tmp_path,
+        {"schema_version": 1, "services": {"main": {"bind": "everywhere"}}},
+    )
+    with pytest.raises(ProfileError, match="bind must be local or all-interfaces"):
+        load_effective_profile(_env(tmp_path, AICODE_MODEL="some-model"))
+
+    # 清掉壞 override,驗證非 loopback base_url(多機部署)不受 bind 預設影響
+    (tmp_path / ".config" / "codetrail" / "deployment.json").write_text(
+        json.dumps({"schema_version": 1, "services": {}}), encoding="utf-8"
+    )
+    model = tmp_path / "main.gguf"
+    model.write_bytes(b"fixture")
+    env = _env(
+        tmp_path,
+        AICODE_MODEL=str(model),
+        AICODE_LLAMA_BASE_URL="http://gpu-host:8080",
+    )
+    service = load_effective_profile(env).service("main")
+    command = build_server_command(service, "/opt/llama-server", env, must_exist=True)
+    assert command[command.index("--host") + 1] == "gpu-host"

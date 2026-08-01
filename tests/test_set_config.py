@@ -1,13 +1,15 @@
 """set_config.sh / scripts/set_config.py 的離線測試。
 
-nvidia-smi 用 PATH 上的 stub、模型目錄用 tmp fixture、HOME 指到 tmp,
-完全不需要 GPU / llama-server / 真模型。
+nvidia-smi、llama-server 都用 PATH / LLAMA_BIN 上的 stub、模型目錄用 tmp
+fixture、HOME 指到 tmp,完全不需要 GPU / 真 llama-server / 真模型。
+tmux session 名稱指到不存在的名字,避免碰到開發機上真的 CodeTrail session。
 """
 from __future__ import annotations
 
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -27,6 +29,8 @@ _PROFILE_ENV_KEYS = {
     "AICODE_EMBED_MODEL", "AICODE_RERANK_MODEL", "AICODE_VL_MODEL", "AICODE_VL_MMPROJ",
     "MAIN_GPU", "AUX_GPU", "EMBED_GPU", "RERANK_GPU", "VL_GPU", "CUDA_VISIBLE_DEVICES",
     "MAIN_CTX", "MAIN_BATCH", "MAIN_UBATCH", "MODELS_DIR", "LLAMA_BIN",
+    "MAIN_BIND", "EMBED_BIND", "RERANK_BIND", "VL_BIND", "AICODE_BIND",
+    "MAIN_SESSION", "AUX_SESSION", "SESSION",
 }
 
 
@@ -40,6 +44,18 @@ def _write_fake_nvidia_smi(bin_dir: Path, output: str, exit_code: int = 0) -> No
         encoding="utf-8",
     )
     executable.chmod(0o755)
+
+
+def _write_fake_llama(tmp_path: Path, help_flags: str = "--fit --reranking --mmproj") -> Path:
+    executable = tmp_path / "llama-server"
+    executable.write_text(
+        "#!/usr/bin/env bash\n"
+        f"if [[ \"${{1:-}}\" == \"--help\" ]]; then printf '%s\\n' {shlex.quote(help_flags)}; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return executable
 
 
 def _make_models(root: Path, *, with_reranker: bool = True) -> Path:
@@ -58,7 +74,7 @@ def _make_models(root: Path, *, with_reranker: bool = True) -> Path:
     return models
 
 
-def _env(tmp_path: Path) -> dict[str, str]:
+def _env(tmp_path: Path, *, with_llama: bool = True) -> dict[str, str]:
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     env = {key: value for key, value in os.environ.items() if key not in _PROFILE_ENV_KEYS}
@@ -68,16 +84,22 @@ def _env(tmp_path: Path) -> dict[str, str]:
             "USERPROFILE": str(home),
             "PATH": f"{tmp_path / 'bin'}:{env.get('PATH', '')}",
             "LLAMA_BIN": str(tmp_path / "llama-server"),
+            # 不存在的 session 名稱:避免「偵測到 server 運行中」誤觸開發機上真的 tmux。
+            "MAIN_SESSION": "codetrail-test-none-main",
+            "SESSION": "codetrail-test-none-rag",
         }
     )
+    if with_llama and not (tmp_path / "llama-server").exists():
+        _write_fake_llama(tmp_path)
     return env
 
 
-def _run(tmp_path: Path, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+def _run(tmp_path: Path, *args: str, stdin: str | None = None,
+         with_llama: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["bash", str(SCRIPT), "--skip-deps-check", *args],
         cwd=REPO_ROOT,
-        env=_env(tmp_path),
+        env=_env(tmp_path, with_llama=with_llama),
         input=stdin,
         capture_output=True,
         text=True,
@@ -90,6 +112,8 @@ def test_help_is_offline_and_exits_zero(tmp_path):
     proc = _run(tmp_path, "--help")
     assert proc.returncode == 0, proc.stderr
     assert "--models-dir" in proc.stdout
+    assert "--advanced" in proc.stdout
+    assert "--allow-remote" in proc.stdout
 
 
 def test_yes_run_generates_all_artifacts(tmp_path):
@@ -115,6 +139,8 @@ def test_yes_run_generates_all_artifacts(tmp_path):
     assert services["reranker"]["model"].endswith("qwen3-reranker-0.6b-q8_0.gguf")
     assert services["vl"]["model"] == str(models / "vl" / "vl-model-q6.gguf")
     assert services["vl"]["mmproj"] == str(models / "vl" / "mmproj-F16.gguf")
+    # 預設不開放遠端 → 不寫 bind(profile 預設 local)
+    assert "bind" not in services["main"]
 
     opencode = json.loads((home / ".config/opencode/opencode.json").read_text(encoding="utf-8"))
     assert opencode["model"] == "llamacpp/big-chat-ud-q4-k-xl"
@@ -136,9 +162,12 @@ def test_yes_run_generates_all_artifacts(tmp_path):
     # 結尾預覽 = start-all --dry-run 的完整指令(推薦啟動參數)
     assert "main_command=" in proc.stdout
     assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-bbbb-2000") == 3
+    # 三層狀態:設定完成 ≠ 已可使用
+    assert "第 1 層" in proc.stdout
+    assert "待執行" in proc.stdout
 
 
-def test_generated_start_sh_dry_run_pins_gpus(tmp_path):
+def test_generated_start_sh_dry_run_pins_gpus_and_binds_loopback(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
     assert _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models)).returncode == 0
@@ -156,6 +185,81 @@ def test_generated_start_sh_dry_run_pins_gpus(tmp_path):
         assert f"_port={port}" in proc.stdout
     assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-aaaa-5090") == 1
     assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-bbbb-2000") == 3
+    # 安全預設:只綁 127.0.0.1,不暴露 0.0.0.0
+    assert "main_bind_host=127.0.0.1" in proc.stdout
+    assert "0.0.0.0" not in proc.stdout
+
+
+def test_allow_remote_binds_all_interfaces_with_warning(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    proc = _run(tmp_path, "--yes", "--no-preview", "--allow-remote", "--models-dir", str(models))
+    assert proc.returncode == 0, proc.stderr
+    assert "0.0.0.0" in proc.stdout  # 警告文字
+
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    for role in ("main", "embedding", "reranker", "vl"):
+        assert deployment["services"][role]["bind"] == "all-interfaces"
+
+    dry = subprocess.run(
+        ["bash", str(tmp_path / "home" / "start.sh"), "--dry-run"],
+        env=_env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert dry.returncode == 0, dry.stderr
+    assert "main_bind_host=0.0.0.0" in dry.stdout
+
+
+def test_generated_start_sh_clears_legacy_env_overrides(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    assert _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models)).returncode == 0
+
+    env = _env(tmp_path)
+    env["EMBED_MODEL"] = "/bogus/does-not-exist.gguf"   # 模擬 .bashrc 殘留的舊 override
+    env["MAIN_CTX"] = "1234"
+    proc = subprocess.run(
+        ["bash", str(tmp_path / "home" / "start.sh"), "--dry-run"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "/bogus/does-not-exist.gguf" not in proc.stdout
+    assert "-c 65536" in proc.stdout  # 不被 MAIN_CTX=1234 蓋掉
+
+
+def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+
+    accepted = _run(tmp_path, "--no-preview", "--models-dir", str(models), stdin="\n")
+    assert accepted.returncode == 0, accepted.stderr + accepted.stdout
+    assert "建議配置" in accepted.stdout
+    assert (tmp_path / "home" / "start.sh").exists()
+
+    home2 = tmp_path / "home2"
+    proc = subprocess.run(
+        ["bash", str(SCRIPT), "--skip-deps-check", "--no-preview", "--models-dir", str(models)],
+        cwd=REPO_ROOT,
+        env={**_env(tmp_path), "HOME": str(home2), "USERPROFILE": str(home2)},
+        input="q\n",
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "未寫入任何檔案" in proc.stdout
+    assert not (home2 / ".config").exists()
+    assert not (home2 / "start.sh").exists()
 
 
 def test_flags_override_model_and_gpu(tmp_path):
@@ -188,6 +292,70 @@ def test_missing_model_category_fails_precheck(tmp_path):
     assert proc.returncode == 2
     assert "reranker" in proc.stderr
     assert "初步判定不通過" in proc.stderr
+
+
+def test_missing_llama_binary_fails_with_build_hint(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    proc = _run(tmp_path, "--yes", "--models-dir", str(models), with_llama=False)
+    assert proc.returncode == 2
+    assert "llama-server" in proc.stderr
+    assert "README §1.5" in proc.stderr
+    assert "LLAMA_BIN" in proc.stderr
+
+
+def test_llama_without_reranking_support_fails(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    _write_fake_llama(tmp_path, help_flags="--fit --mmproj")  # 沒有 --reranking
+    proc = _run(tmp_path, "--yes", "--models-dir", str(models))
+    assert proc.returncode == 2
+    assert "--reranking" in proc.stderr
+    assert "更新並重新 build" in proc.stderr
+
+
+def test_incomplete_shards_are_reported_with_missing_names(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    (models / "big-chat" / "big-chat-ud-q4_k_xl-00002-of-00002.gguf").unlink()
+
+    # 還有別的 main 候選(VL 模型也可當 main)→ 軟剔除:警告列出缺哪片,改用替代模型
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert proc.returncode == 0, proc.stderr
+    assert "模型不完整已剔除" in proc.stdout
+    assert "big-chat-ud-q4_k_xl-00002-of-00002.gguf" in proc.stdout
+    registry = json.loads(
+        (tmp_path / "home" / ".config/codetrail/models.json").read_text(encoding="utf-8")
+    )
+    assert "big-chat-ud-q4-k-xl" not in registry  # 壞模型不會被選成 main
+
+    # 唯一的 main 候選也不見了 → 硬失敗,錯誤訊息直接寫缺哪個 shard 檔
+    shutil.rmtree(models / "vl")
+    proc2 = _run(tmp_path, "--yes", "--models-dir", str(models))
+    assert proc2.returncode == 2
+    assert "初步判定不通過" in proc2.stderr
+    assert "缺少 shard" in proc2.stderr
+    assert "big-chat-ud-q4_k_xl-00002-of-00002.gguf" in proc2.stderr
+
+
+def test_multiple_mmproj_requires_explicit_choice(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    (models / "vl" / "mmproj-other-F16.gguf").write_bytes(b"x" * 256)
+
+    ambiguous = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert ambiguous.returncode == 2
+    assert "--vl-mmproj" in ambiguous.stderr
+
+    explicit = _run(
+        tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
+        "--vl-mmproj", str(models / "vl" / "mmproj-F16.gguf"),
+    )
+    assert explicit.returncode == 0, explicit.stderr
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    assert deployment["services"]["vl"]["mmproj"] == str(models / "vl" / "mmproj-F16.gguf")
 
 
 def test_single_gpu_warns_and_shares_one_card(tmp_path):
@@ -233,9 +401,66 @@ def test_existing_configs_are_backed_up_and_registry_merged(tmp_path):
     assert list((home / ".config/opencode").glob("opencode.json.bak-setconfig-*"))
 
 
+def test_opencode_merge_preserves_user_config_and_respects_permission(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    home = tmp_path / "home"
+    (home / ".config/opencode").mkdir(parents=True)
+    existing = {
+        "theme": "dark",
+        "model": "openrouter/some-cloud-model",
+        "enabled_providers": ["openrouter"],
+        "provider": {
+            "openrouter": {"npm": "@ai-sdk/openai", "options": {"apiKey": "sk-keep"}},
+            "llamacpp": {
+                "npm": "@ai-sdk/openai-compatible",
+                "options": {"baseURL": "http://localhost:8080/v1", "apiKey": "dummy"},
+                "models": {"my-old-local": {"name": "my-old-local"}},
+            },
+        },
+        "mcp": {"other-server": {"type": "local", "command": ["echo"], "enabled": True}},
+        "permission": {"*": "deny", "bash": "allow"},
+    }
+    (home / ".config/opencode/opencode.json").write_text(json.dumps(existing), encoding="utf-8")
+
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert proc.returncode == 0, proc.stderr
+
+    merged = json.loads((home / ".config/opencode/opencode.json").read_text(encoding="utf-8"))
+    assert merged["theme"] == "dark"                                   # 使用者設定保留
+    assert merged["model"] == "llamacpp/big-chat-ud-q4-k-xl"           # CodeTrail 欄位覆蓋
+    assert "openrouter" in merged["provider"]                          # 其他 provider 保留
+    assert merged["provider"]["openrouter"]["options"]["apiKey"] == "sk-keep"
+    assert "my-old-local" in merged["provider"]["llamacpp"]["models"]  # 舊本機模型項保留
+    assert "big-chat-ud-q4-k-xl" in merged["provider"]["llamacpp"]["models"]
+    assert "other-server" in merged["mcp"]                             # 其他 MCP 保留
+    assert "codetrail" in merged["mcp"]
+    assert merged["permission"]["bash"] == "allow"                     # 尊重使用者顯式設定…
+    assert "已尊重你的設定" in proc.stdout                              # …但要警告
+    assert "llamacpp" in merged["enabled_providers"]
+    assert "openrouter" in merged["enabled_providers"]
+
+
 def test_noninteractive_without_flags_fails_with_hint(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
     proc = _run(tmp_path, "--models-dir", str(models), stdin="")
     assert proc.returncode == 2
     assert "無互動輸入環境" in proc.stderr
+
+
+def test_restore_last_backup_round_trips(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    home = tmp_path / "home"
+    (home / ".config/codetrail").mkdir(parents=True)
+    (home / ".config/codetrail/models.json").write_text('{"marker": "/old.gguf"}', encoding="utf-8")
+
+    assert _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models)).returncode == 0
+    registry = json.loads((home / ".config/codetrail/models.json").read_text(encoding="utf-8"))
+    assert "big-chat-ud-q4-k-xl" in registry
+
+    proc = _run(tmp_path, "--restore-last-backup")
+    assert proc.returncode == 0, proc.stderr
+    restored = json.loads((home / ".config/codetrail/models.json").read_text(encoding="utf-8"))
+    assert restored == {"marker": "/old.gguf"}

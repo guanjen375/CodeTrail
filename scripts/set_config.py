@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """CodeTrail 一鍵設定精靈(`./set_config.sh` 的實作)。
 
-流程(對應 README「Quick Start」step 6):
-  1. 偵測 NVIDIA GPU(nvidia-smi)與 ~/models 內的 GGUF 模型並分類
-     (主聊天 / embedding / reranker / VL+mmproj);偵測失敗會明確通知。
-  2. 背景初步判定:GPU 數量與四類模型是否齊全,缺什麼直接列出。
-  3.-6. 逐一詢問「主聊天模型、embedding、reranker、VL(+mmproj)」各用哪個檔案、
-     放哪顆 GPU;並補上容易遺漏的重要參數(ctx、threads、offload 策略、
-     OpenCode limit.context / MCP timeout / Python 直譯器路徑)。
-  7. 產生:
-     - ~/.config/codetrail/models.json     (主模型 registry key → GGUF 路徑,合併既有)
-     - ~/.config/codetrail/deployment.json (deployment profile local override)
-     - ~/.config/opencode/opencode.json    (OpenCode provider + MCP + 權限範本)
-     - ~/start.sh                          (帶著推薦啟動參數呼叫 scripts/start-all.sh)
-     既有檔案一律先備份成 *.bak-setconfig-<時間戳>,不會靜默覆蓋。
+以「剛接觸專案者」為預設對象:
 
-安全性:純 stdlib、不 eval / source 任何內容;所有寫入都是結構化 JSON 或
-固定模板;GPU / 模型選擇沿用 deployment_profile.py 的封閉 allowlist 驗證。
+  1. 前置檢查:Python 依賴、tmux、nvidia-smi、llama-server 與必要旗標
+     (--reranking / --mmproj / --fit),缺什麼就給可直接複製的修復指令。
+  2. 偵測:GPU 種類/VRAM、~/models 的 GGUF 自動分類(main / embedding /
+     reranker / VL+mmproj);多 shard 聚合並驗證齊全性(缺片直接列出)。
+  3. 背景初步判定:GPU 數與四類模型是否齊全,缺什麼通知什麼。
+  4. 預設模式只需確認一頁「建議配置」(Enter 採用 / a 進階 / q 離開);
+     `--advanced` 才逐項詢問四個角色與 ctx/threads。
+  5. 產物(先寫 staging、全部就緒才原子替換;既有檔備份 *.bak-setconfig-*):
+     - ~/.config/codetrail/models.json     主模型 registry(合併既有)
+     - ~/.config/codetrail/deployment.json deployment local override
+     - ~/.config/opencode/opencode.json    只合併 CodeTrail 管的欄位,
+                                           保留使用者既有 provider / mcp / 其他設定
+     - ~/start.sh                          啟動腳本(支援 status / stop / logs 子命令)
+  6. 安全預設:llama-server 只綁 127.0.0.1;要讓其他機器連線必須明確
+     `--allow-remote`(或 deployment.json 的 bind: "all-interfaces")。
+
+`--restore-last-backup` 可把四個產物還原到最近一次備份。
+純 stdlib;不 eval / source 任何內容;產物經 deployment_profile 的封閉 schema 驗證。
 """
 from __future__ import annotations
 
@@ -28,6 +32,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,7 +61,8 @@ _EMBED_TOKENS = (
     "jina-embed",
     "snowflake-arctic-embed",
 )
-# 排序提示:偵測清單把符合 deployment profile 預設 key 的檔案排最前面當預設選項。
+# 排序提示:符合 deployment profile 預設 key 的檔案排最前面當預設選項;
+# 同時用來標記「維護者驗證過的附屬模型」(選了其他檔會提示未驗證)。
 _DEFAULT_HINTS = {
     "embedding": ("bge-m3",),
     "reranker": ("qwen3-reranker",),
@@ -64,9 +70,22 @@ _DEFAULT_HINTS = {
     "main": (),
 }
 
+# 這些 env 會蓋過設定檔;驗證/預覽時剔除,產生的 ~/start.sh 也會先 unset,
+# 模擬「全新 shell」行為,避免 .bashrc 裡的舊 override 讓新設定看似無效。
+_OVERRIDE_ENV_KEYS = (
+    "AICODE_PROFILE", "AICODE_DEPLOYMENT_CONFIG", "AICODE_MODEL",
+    "AICODE_MODEL_REGISTRY", "AICODE_MODEL_REGISTRY_FILE",
+    "EMBED_MODEL", "RERANK_MODEL", "VL_GGUF", "VL_MMPROJ",
+    "AICODE_EMBED_MODEL", "AICODE_RERANK_MODEL", "AICODE_VL_MODEL", "AICODE_VL_MMPROJ",
+    "MAIN_GPU", "AUX_GPU", "EMBED_GPU", "RERANK_GPU", "VL_GPU", "CUDA_VISIBLE_DEVICES",
+    "MAIN_CTX", "MAIN_BATCH", "MAIN_UBATCH",
+    "MAIN_BIND", "EMBED_BIND", "RERANK_BIND", "VL_BIND", "AICODE_BIND",
+    "MAIN_PORT", "EMBED_PORT", "RERANK_PORT", "VL_PORT",
+)
+
 
 class SetupError(RuntimeError):
-    """偵測或驗證失敗;訊息會原樣通知使用者。"""
+    """偵測或驗證失敗;訊息會原樣通知使用者(含修復指令)。"""
 
 
 @dataclass(frozen=True)
@@ -91,12 +110,15 @@ class ModelCandidate:
     path: Path            # 多 shard 模型固定指向第 1 片
     total_bytes: int      # 含所有 shard
     shards: int
-    mmproj: Path | None = None
+    mmproj: Path | None = None            # 目錄內唯一 mmproj 時的自動配對
+    mmproj_choices: tuple[Path, ...] = () # 目錄內有多個 mmproj 時的候選(需使用者選)
 
     def describe(self) -> str:
         size = f"{self.total_bytes / GIB:.1f} GB"
         extra = f",{self.shards} shards" if self.shards > 1 else ""
         mm = f" + mmproj: {self.mmproj.name}" if self.mmproj else ""
+        if not self.mmproj and self.mmproj_choices:
+            mm = f"(同目錄有 {len(self.mmproj_choices)} 個 mmproj,需選擇)"
         return f"{self.path.name}({size}{extra}){mm}"
 
 
@@ -120,13 +142,112 @@ class Plan:
     threads: int
     batch: int
     ubatch: int
+    allow_remote: bool = False
     parameters: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
-# 偵測
+# 前置檢查(缺什麼 → 可複製的修復指令)
 # ---------------------------------------------------------------------------
+
+def _detect_python(skip_deps_check: bool, notes: list[str]) -> str:
+    """MCP server 要跑在哪個 Python:用執行 set_config 的這一顆,並驗證依賴齊全。
+
+    把絕對路徑寫死進 opencode.json 的 MCP command,新 shell 不 activate venv
+    也能啟動 MCP server(舊安裝流程最常踩的坑)。
+    """
+    python_bin = sys.executable or "python3"
+    proc = subprocess.run(
+        [python_bin, "-c", "import mcp, numpy, requests"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        message = (
+            f"這顆 Python({python_bin})缺少 CodeTrail 依賴(mcp/numpy/requests)。\n"
+            f"  修復:{python_bin} -m pip install --user --break-system-packages -r "
+            f"{REPO_ROOT / 'requirements.txt'}\n"
+            "  (或先 activate 你的 venv 再重跑 ./set_config.sh)"
+        )
+        if skip_deps_check:
+            notes.append("⚠ 已用 --skip-deps-check 跳過依賴檢查:" + message)
+        else:
+            raise SetupError("[FAIL] Python 依賴檢查未通過:\n" + message)
+    return python_bin
+
+
+def _check_tmux(skip: bool, notes: list[str]) -> None:
+    if shutil.which("tmux"):
+        return
+    message = (
+        "[FAIL] 找不到 tmux(啟動器用它把四個 server 放到背景)。\n"
+        "  Ubuntu / Debian 修復:sudo apt install -y tmux\n"
+        "  修復後重新執行:./set_config.sh"
+    )
+    if skip:
+        notes.append("⚠ 已用 --skip-binary-check 跳過 tmux 檢查。")
+        return
+    raise SetupError(message)
+
+
+def _llama_bin() -> Path:
+    return Path(os.environ.get("LLAMA_BIN") or (Path.home() / "llama.cpp" / "build" / "bin" / "llama-server"))
+
+
+def check_llama_binary(skip: bool, notes: list[str]) -> dict[str, bool]:
+    """llama-server 存在性 + 必要旗標探測;回傳 capability dict(至少含 fit)。"""
+    binary = _llama_bin()
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        message = (
+            f"[FAIL] 找不到可執行的 llama-server:{binary}\n"
+            "  尚未 build 的話照 README §1.5:\n"
+            "    git clone https://github.com/ggerganov/llama.cpp ~/llama.cpp\n"
+            "    cd ~/llama.cpp && cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF && "
+            "cmake --build build --config Release -j\n"
+            "  放在別處的話:export LLAMA_BIN=/path/to/llama-server 後重跑 ./set_config.sh"
+        )
+        if skip:
+            notes.append("⚠ 已用 --skip-binary-check 跳過 llama-server 檢查(假設為支援 --fit 的新版)。")
+            return {"fit": True}
+        raise SetupError(message)
+    try:
+        proc = subprocess.run(
+            [str(binary), "--help"], capture_output=True, text=True, timeout=30, check=False
+        )
+        help_text = proc.stdout + proc.stderr
+    except (OSError, subprocess.TimeoutExpired):
+        notes.append(f"⚠ llama-server --help 執行失敗({binary});略過旗標探測。")
+        return {"fit": True}
+
+    missing = [flag for flag in ("--reranking", "--mmproj") if flag not in help_text]
+    if missing:
+        message = (
+            f"[FAIL] 這個 llama-server 不支援 {' / '.join(missing)}"
+            "(reranker / VL 角色必要)。\n"
+            "  修復:更新並重新 build llama.cpp(README §1.5):\n"
+            "    cd ~/llama.cpp && git pull && rm -rf build && "
+            "cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF && cmake --build build --config Release -j"
+        )
+        if skip:
+            notes.append("⚠ 已跳過 llama-server 旗標檢查:" + " / ".join(missing) + " 不支援。")
+        else:
+            raise SetupError(message)
+    caps = {"fit": "--fit" in help_text}
+    if not caps["fit"]:
+        notes.append(
+            "⚠ 這個 llama-server 沒有 --fit(自動 VRAM 配置);"
+            "主模型大於 VRAM 時建議更新 llama.cpp(README §1.5)。"
+        )
+    ldd = shutil.which("ldd")
+    if ldd:
+        link = subprocess.run([ldd, str(binary)], capture_output=True, text=True, check=False)
+        if link.returncode == 0 and "cuda" not in link.stdout.lower():
+            notes.append("⚠ llama-server 看起來是純 CPU build(未連結 CUDA);能跑但會非常慢。")
+    return caps
+
 
 def detect_gpus() -> list[Gpu]:
     smi = shutil.which("nvidia-smi")
@@ -163,6 +284,10 @@ def detect_gpus() -> list[Gpu]:
     return gpus
 
 
+# ---------------------------------------------------------------------------
+# 模型掃描與齊全性驗證
+# ---------------------------------------------------------------------------
+
 def _shard_info(path: Path) -> tuple[Path, int, int] | None:
     """多 shard GGUF:回傳 (第 1 片路徑, 總大小, shard 數);非 shard 回 None。"""
     match = _SHARD_RE.match(path.name)
@@ -180,18 +305,61 @@ def _shard_info(path: Path) -> tuple[Path, int, int] | None:
     return first, sum(sib.stat().st_size for sib in siblings), len(siblings)
 
 
-def scan_models(models_dir: Path) -> dict[str, list[ModelCandidate]]:
+def _shard_issues(path: Path) -> list[str]:
+    """檢查多 shard 模型是否齊全:缺片、零大小、殘留 incomplete/lock 檔。"""
+    match = _SHARD_RE.match(path.name)
+    issues: list[str] = []
+    if not match:
+        try:
+            if path.stat().st_size == 0:
+                issues.append(f"{path.name} 是零大小檔案(下載未完成?)")
+        except OSError as exc:
+            issues.append(f"{path.name} 無法讀取:{exc}")
+        return issues
+
+    stem, total_str = match.group("stem"), match.group("total")
+    expected = int(total_str)
+    present: dict[int, Path] = {}
+    for sib in path.parent.glob("*.gguf"):
+        m = _SHARD_RE.match(sib.name)
+        if m and m.group("stem") == stem and m.group("total") == total_str:
+            present[int(m.group("idx"))] = sib
+    missing = [f"{stem}-{idx:05d}-of-{total_str}.gguf" for idx in range(1, expected + 1)
+               if idx not in present]
+    if missing:
+        issues.append("缺少 shard:" + "、".join(missing))
+    for idx, sib in sorted(present.items()):
+        try:
+            if sib.stat().st_size == 0:
+                issues.append(f"{sib.name} 是零大小檔案(下載未完成?)")
+        except OSError as exc:
+            issues.append(f"{sib.name} 無法讀取:{exc}")
+    leftovers = sorted(
+        leftover.name
+        for pattern in (f"{stem}*.incomplete", f"{stem}*.lock", f"{stem}*.part")
+        for leftover in path.parent.glob(pattern)
+    )
+    if leftovers:
+        issues.append("殘留未完成下載檔:" + "、".join(leftovers))
+    return issues
+
+
+def scan_models(models_dir: Path) -> tuple[dict[str, list[ModelCandidate]], list[str]]:
     if not models_dir.is_dir():
         raise SetupError(
             f"偵測失敗:找不到模型目錄 {models_dir}。"
             "請先依 README §2 下載 GGUF,或用 --models-dir 指定位置。"
         )
-    ggufs = sorted(p for p in models_dir.rglob("*.gguf") if p.is_file())
+    try:
+        ggufs = sorted(p for p in models_dir.rglob("*.gguf") if p.is_file())
+    except PermissionError as exc:
+        raise SetupError(f"偵測失敗:模型目錄無法讀取(權限不足):{exc}") from exc
     if not ggufs:
         raise SetupError(f"偵測失敗:{models_dir} 內沒有任何 .gguf 模型檔(README §2)。")
 
     mmprojs = [p for p in ggufs if "mmproj" in p.name.lower()]
     seen: set[Path] = set()
+    broken: list[str] = []
     candidates: dict[str, list[ModelCandidate]] = {
         "main": [], "embedding": [], "reranker": [], "vl": []
     }
@@ -211,6 +379,11 @@ def scan_models(models_dir: Path) -> dict[str, list[ModelCandidate]]:
             seen.add(path)
             candidate = ModelCandidate(path=path, total_bytes=path.stat().st_size, shards=1)
 
+        issues = _shard_issues(candidate.path)
+        if issues:
+            broken.append(f"{candidate.path.parent.name}/{candidate.path.name}:" + ";".join(issues))
+            continue
+
         haystack = f"{path.parent.name}/{path.name}".lower()
         sibling_mmproj = sorted(
             (mp for mp in mmprojs if mp.parent == path.parent),
@@ -228,7 +401,8 @@ def scan_models(models_dir: Path) -> dict[str, list[ModelCandidate]]:
                         path=candidate.path,
                         total_bytes=candidate.total_bytes,
                         shards=candidate.shards,
-                        mmproj=sibling_mmproj[0],
+                        mmproj=sibling_mmproj[0] if len(sibling_mmproj) == 1 else None,
+                        mmproj_choices=tuple(sibling_mmproj),
                     )
                 )
             candidates["main"].append(candidate)
@@ -242,10 +416,11 @@ def scan_models(models_dir: Path) -> dict[str, list[ModelCandidate]]:
             return (hinted, size, str(cand.path))
 
         entries.sort(key=sort_key)
-    return candidates
+    return candidates, broken
 
 
-def precheck(gpus: list[Gpu], candidates: dict[str, list[ModelCandidate]]) -> list[str]:
+def precheck(gpus: list[Gpu], candidates: dict[str, list[ModelCandidate]],
+             broken: list[str]) -> list[str]:
     """背景初步判定;不 OK 直接 SetupError 通知,可過但要注意的回傳 warning 清單。"""
     warnings: list[str] = []
     missing = {
@@ -256,10 +431,15 @@ def precheck(gpus: list[Gpu], candidates: dict[str, list[ModelCandidate]]) -> li
     }
     lacking = [label for role, label in missing.items() if not candidates[role]]
     if lacking:
+        detail = ""
+        if broken:
+            detail = "\n以下模型因不完整被剔除(修復後重跑):\n  - " + "\n  - ".join(broken)
         raise SetupError(
             "初步判定不通過:~/models 缺少必要模型類別 → " + "、".join(lacking)
-            + "。下載方式見 README §2;四類模型都是硬性需求。"
+            + "。下載方式見 README §2;四類模型都是硬性需求。" + detail
         )
+    for report in broken:
+        warnings.append(f"模型不完整已剔除:{report}(重新執行原本的 hf download 即可補齊)")
     if len(gpus) < 2:
         warnings.append(
             "只偵測到 1 顆 GPU:主模型與三顆附屬模型將共用同一顆卡(可以跑,"
@@ -273,7 +453,10 @@ def precheck(gpus: list[Gpu], candidates: dict[str, list[ModelCandidate]]) -> li
 # ---------------------------------------------------------------------------
 
 def _candidate_from_path(path: Path) -> ModelCandidate:
-    """使用者直接給路徑時也要正確聚合多 shard 的總大小。"""
+    """使用者直接給路徑時也要正確聚合多 shard 的總大小,並驗證齊全性。"""
+    issues = _shard_issues(path)
+    if issues:
+        raise SetupError(f"{path.name} 不完整:" + ";".join(issues))
     shard = _shard_info(path)
     if shard:
         first, total_bytes, shards = shard
@@ -286,8 +469,8 @@ def _input(prompt: str) -> str:
         return input(prompt)
     except EOFError as exc:
         raise SetupError(
-            "無互動輸入環境。請改用旗標(--main-model/--main-gpu/... 或 --yes 全用預設),"
-            "見 ./set_config.sh --help。"
+            "無互動輸入環境。請改用旗標(--yes 全用預設,或 --main-model/--main-gpu/... "
+            "個別指定),見 ./set_config.sh --help。"
         ) from exc
 
 
@@ -373,6 +556,46 @@ def choose_int(label: str, default: int, override: int | None, assume_yes: bool)
         print("  請輸入正整數。")
 
 
+def resolve_vl_mmproj(
+    vl_cand: ModelCandidate,
+    override: str | None,
+    interactive: bool,
+) -> Path:
+    """mmproj 配對:唯一 → 自動;多個 → 必須選(不猜);沒有 → 停下並指路。"""
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_file() or path.suffix.lower() != ".gguf":
+            raise SetupError(f"VL mmproj:{override} 不是存在的 .gguf 檔。")
+        return path
+    choices = list(vl_cand.mmproj_choices)
+    if not choices:
+        sibling = sorted(vl_cand.path.parent.glob("*mmproj*.gguf"))
+        choices = sibling
+    if not choices:
+        raise SetupError(
+            f"VL 模型 {vl_cand.path.name} 同目錄找不到 mmproj *.gguf;"
+            "VL 模型與它的 mmproj 必須放在同一目錄(README §2.4),"
+            "或用 --vl-mmproj 明確指定。"
+        )
+    if len(choices) == 1:
+        return choices[0]
+    if not interactive:
+        listing = "、".join(p.name for p in choices)
+        raise SetupError(
+            f"VL 模型 {vl_cand.path.name} 同目錄有多個 mmproj({listing}),"
+            "無法自動判斷相容配對(配錯會讓圖片分析輸出錯亂):"
+            "請用 --vl-mmproj <絕對路徑> 明確指定,或改跑 ./set_config.sh --advanced 互動選擇。"
+        )
+    print(f"\n【VL mmproj】{vl_cand.path.name} 同目錄有多個 mmproj,請選擇相容的那個:")
+    for pos, choice in enumerate(choices, start=1):
+        print(f"  [{pos}] {choice.name}")
+    while True:
+        raw = _input(f"請輸入編號 1..{len(choices)}: ").strip()
+        if raw.isdecimal() and 1 <= int(raw) <= len(choices):
+            return choices[int(raw) - 1]
+        print("  無效輸入。")
+
+
 # ---------------------------------------------------------------------------
 # 推薦參數
 # ---------------------------------------------------------------------------
@@ -388,30 +611,9 @@ def _mem_total_bytes() -> int:
     return 0
 
 
-def _llama_bin() -> Path:
-    return Path(os.environ.get("LLAMA_BIN") or (Path.home() / "llama.cpp" / "build" / "bin" / "llama-server"))
-
-
-def _llama_supports_fit(notes: list[str]) -> bool:
-    """探測 llama-server 是否支援 `--fit`(新版自動 VRAM 配置)。"""
-    binary = _llama_bin()
-    if not binary.is_file():
-        notes.append(
-            f"找不到 llama-server({binary});先假設是支援 --fit 的新版。"
-            "若尚未 build,見 README §1.5。"
-        )
-        return True
-    try:
-        proc = subprocess.run(
-            [str(binary), "--help"], capture_output=True, text=True, timeout=30, check=False
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return True
-    return "--fit" in (proc.stdout + proc.stderr)
-
-
 def recommend_main(plan_gpu: Gpu, candidate: ModelCandidate, ctx: int, threads: int,
-                   fit_target: int, notes: list[str]) -> tuple[dict, int, int]:
+                   fit_target: int, fit_supported: bool,
+                   notes: list[str]) -> tuple[dict, int, int]:
     """依主模型大小 vs 所選 GPU VRAM 推薦 offload 策略與 batch。"""
     parameters: dict = {
         "jinja": True,
@@ -430,7 +632,7 @@ def recommend_main(plan_gpu: Gpu, candidate: ModelCandidate, ctx: int, threads: 
         )
     else:
         batch, ubatch = 1024, 256
-        if _llama_supports_fit(notes):
+        if fit_supported:
             parameters.update(
                 {"gpu_layers": "auto", "fit": "on", "fit_target": fit_target, "parallel": 1}
             )
@@ -468,29 +670,20 @@ def sanitize_registry_key(path: Path) -> str:
     return key[:64]
 
 
+def _warn_unverified_aux(plan: Plan) -> None:
+    for selection in (plan.embedding, plan.reranker, plan.vl):
+        hints = _DEFAULT_HINTS[selection.role]
+        if hints and not any(h in str(selection.candidate.path).lower() for h in hints):
+            plan.notes.append(
+                f"⚠ {selection.role} 選了未經維護者驗證的模型 {selection.candidate.path.name}:"
+                "server 可能正常啟動,但 pooling / reranking / 圖片分析行為不保證正確"
+                "(維護者驗證組合見 deployment_profiles/defaults.json 與 README §2.3–§2.4)。"
+            )
+
+
 # ---------------------------------------------------------------------------
-# 產生設定檔
+# 產物內容
 # ---------------------------------------------------------------------------
-
-def _backup(path: Path, notes: list[str]) -> None:
-    if path.exists():
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        backup = path.with_name(f"{path.name}.bak-setconfig-{stamp}")
-        shutil.copy2(path, backup)
-        notes.append(f"已備份原有 {path} → {backup.name}")
-
-
-def _write_json(path: Path, data: dict, notes: list[str], dry_run: bool) -> None:
-    payload = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
-    if dry_run:
-        print(f"\n--- [dry-run] 將寫入 {path} ---\n{payload}", end="")
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _backup(path, notes)
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(path)
-
 
 def build_models_registry(plan: Plan, registry_path: Path, notes: list[str]) -> dict:
     existing: dict = {}
@@ -508,25 +701,25 @@ def build_models_registry(plan: Plan, registry_path: Path, notes: list[str]) -> 
 
 
 def build_deployment_config(plan: Plan) -> dict:
-    return {
-        "schema_version": 1,
-        "profile": "defaults",
-        "services": {
-            "main": {
-                "model": plan.main_key,
-                "ctx": plan.ctx,
-                "batch": plan.batch,
-                "ubatch": plan.ubatch,
-                "parameters": plan.parameters,
-            },
-            "embedding": {"model": str(plan.embedding.candidate.path)},
-            "reranker": {"model": str(plan.reranker.candidate.path)},
-            "vl": {
-                "model": str(plan.vl.candidate.path),
-                "mmproj": str(plan.vl.mmproj),
-            },
+    services: dict = {
+        "main": {
+            "model": plan.main_key,
+            "ctx": plan.ctx,
+            "batch": plan.batch,
+            "ubatch": plan.ubatch,
+            "parameters": plan.parameters,
+        },
+        "embedding": {"model": str(plan.embedding.candidate.path)},
+        "reranker": {"model": str(plan.reranker.candidate.path)},
+        "vl": {
+            "model": str(plan.vl.candidate.path),
+            "mmproj": str(plan.vl.mmproj),
         },
     }
+    if plan.allow_remote:
+        for role in services:
+            services[role]["bind"] = "all-interfaces"
+    return {"schema_version": 1, "profile": "defaults", "services": services}
 
 
 def _opencode_timeout_ms() -> int:
@@ -535,7 +728,32 @@ def _opencode_timeout_ms() -> int:
     return int(match.group(1).replace("_", "")) if match else OPENCODE_TIMEOUT_FALLBACK_MS
 
 
-def build_opencode_config(plan: Plan, python_bin: str) -> dict:
+_OPENCODE_PERMISSION_TEMPLATE = {
+    "*": "deny",
+    "question": "allow",
+    "todowrite": "allow",
+    "codetrail_*": "allow",
+    "codetrail_apply_patch": "ask",
+    "codetrail_run_lint": "ask",
+    "codetrail_run_command": "ask",
+    "codetrail_import_external_file": "allow",
+    "webfetch": "deny",
+    "websearch": "deny",
+    "bash": "deny",
+    "read": "deny",
+    "grep": "deny",
+    "glob": "deny",
+    "edit": "deny",
+    "write": "deny",
+    "apply_patch": "deny",
+    "external_directory": "deny",
+    "task": "deny",
+    "skill": "deny",
+    "lsp": "deny",
+}
+
+
+def _opencode_template(plan: Plan, python_bin: str) -> dict:
     mcp_command = (
         'root="${AICODE_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)}"; '
         f'AICODE_ROOT="$root" exec {shlex.quote(python_bin)} '
@@ -569,30 +787,105 @@ def build_opencode_config(plan: Plan, python_bin: str) -> dict:
                 "timeout": _opencode_timeout_ms(),
             }
         },
-        "permission": {
-            "*": "deny",
-            "question": "allow",
-            "todowrite": "allow",
-            "codetrail_*": "allow",
-            "codetrail_apply_patch": "ask",
-            "codetrail_run_lint": "ask",
-            "codetrail_run_command": "ask",
-            "codetrail_import_external_file": "allow",
-            "webfetch": "deny",
-            "websearch": "deny",
-            "bash": "deny",
-            "read": "deny",
-            "grep": "deny",
-            "glob": "deny",
-            "edit": "deny",
-            "write": "deny",
-            "apply_patch": "deny",
-            "external_directory": "deny",
-            "task": "deny",
-            "skill": "deny",
-            "lsp": "deny",
-        },
+        "permission": dict(_OPENCODE_PERMISSION_TEMPLATE),
     }
+
+
+def build_opencode_config(
+    plan: Plan, python_bin: str, existing_path: Path
+) -> tuple[dict, list[str]]:
+    """只合併 CodeTrail 管的欄位;保留使用者既有 provider / mcp / 主題等設定。
+
+    回傳 (config, 變更清單)。既有檔不存在或無法解析 → 用完整範本。
+    """
+    template = _opencode_template(plan, python_bin)
+    changes: list[str] = []
+    existing: dict | None = None
+    if existing_path.is_file():
+        try:
+            loaded = json.loads(existing_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+            else:
+                changes.append("既有 opencode.json 不是 JSON object → 以完整範本重建(原檔已備份)")
+        except (OSError, json.JSONDecodeError):
+            changes.append("既有 opencode.json 無法解析 → 以完整範本重建(原檔已備份)")
+    if existing is None:
+        if not changes:
+            changes.append("建立新的 opencode.json(完整範本)")
+        return template, changes
+
+    merged = json.loads(json.dumps(existing))  # 深拷貝
+
+    providers = merged.get("enabled_providers")
+    if isinstance(providers, list):
+        if "llamacpp" not in providers:
+            providers.append("llamacpp")
+            changes.append("enabled_providers 加入 'llamacpp'(保留你原本啟用的 provider)")
+        extra = [p for p in providers if p != "llamacpp"]
+        if extra:
+            changes.append(
+                f"⚠ enabled_providers 仍包含其他 provider({', '.join(map(str, extra))});"
+                "NDA 場景建議只留 llamacpp"
+            )
+    else:
+        merged["enabled_providers"] = ["llamacpp"]
+        changes.append("設定 enabled_providers = ['llamacpp']")
+
+    for key in ("model", "small_model"):
+        new_value = template[key]
+        if merged.get(key) != new_value:
+            old = merged.get(key)
+            merged[key] = new_value
+            changes.append(f"{key}: {old!r} → {new_value!r}")
+
+    provider = merged.setdefault("provider", {})
+    llamacpp = provider.get("llamacpp")
+    if not isinstance(llamacpp, dict):
+        provider["llamacpp"] = template["provider"]["llamacpp"]
+        changes.append("新增 provider.llamacpp(其他 provider 設定保留)")
+    else:
+        llamacpp["npm"] = template["provider"]["llamacpp"]["npm"]
+        llamacpp["name"] = template["provider"]["llamacpp"]["name"]
+        llamacpp["options"] = template["provider"]["llamacpp"]["options"]
+        models = llamacpp.setdefault("models", {})
+        models[plan.main_key] = template["provider"]["llamacpp"]["models"][plan.main_key]
+        changes.append(
+            f"provider.llamacpp.models 加入/更新 '{plan.main_key}'"
+            f"(limit.context={plan.ctx};你其他的本機模型項目保留)"
+        )
+
+    mcp = merged.setdefault("mcp", {})
+    mcp["codetrail"] = template["mcp"]["codetrail"]
+    changes.append("mcp.codetrail 更新為偵測到的 Python 與 mcp_server.py 路徑(其他 MCP server 保留)")
+
+    permission = merged.get("permission")
+    if not isinstance(permission, dict):
+        merged["permission"] = dict(_OPENCODE_PERMISSION_TEMPLATE)
+        changes.append("加入 CodeTrail 建議的 deny-all permission 範本")
+    else:
+        added, conflicts = [], []
+        for key, value in _OPENCODE_PERMISSION_TEMPLATE.items():
+            if key not in permission:
+                permission[key] = value
+                added.append(key)
+            elif permission[key] != value:
+                conflicts.append(f"{key}(你設 {permission[key]!r},建議 {value!r})")
+        if added:
+            changes.append(f"permission 補上缺少的 {len(added)} 個鍵(依 CodeTrail 範本)")
+        if conflicts:
+            changes.append(
+                "⚠ permission 與 CodeTrail 建議不同、已尊重你的設定:" + "、".join(conflicts)
+                + " —— 放寬這些會讓 OpenCode 內建工具繞過 CodeTrail 沙箱(docs/security.md)"
+            )
+
+    for key in ("share", "autoupdate"):
+        if key not in merged:
+            merged[key] = template[key]
+        elif merged[key] != template[key]:
+            changes.append(f"⚠ {key}={merged[key]!r} 與建議值 {template[key]!r} 不同,已保留你的設定")
+    merged.setdefault("$schema", template["$schema"])
+    return merged, changes
 
 
 def _gpu_exports(plan: Plan) -> list[str]:
@@ -614,7 +907,15 @@ def build_start_sh(plan: Plan) -> str:
         if plan.parameters.get("fit") == "on"
         else "-ngl 99(全 GPU offload)"
     )
+    bind_note = (
+        "0.0.0.0(--allow-remote:區網其他機器可連線,llama-server 無認證,務必只在可信網段)"
+        if plan.allow_remote
+        else "127.0.0.1(僅本機;要開放其他機器 → 重跑 ./set_config.sh --allow-remote)"
+    )
     exports = "\n".join(_gpu_exports(plan))
+    unset_line = " ".join(_OVERRIDE_ENV_KEYS)
+    quit_sh = shlex.quote(str(REPO_ROOT / "scripts" / "quit.sh"))
+    status_sh = shlex.quote(str(REPO_ROOT / "scripts" / "check-status.sh"))
     return f"""#!/usr/bin/env bash
 # {GENERATED_MARKER} — {time.strftime("%Y-%m-%d %H:%M:%S")}
 # 重新設定:cd {REPO_ROOT} && ./set_config.sh
@@ -629,9 +930,34 @@ def build_start_sh(plan: Plan) -> str:
 #   vl        = {plan.vl.candidate.path.name} @ GPU {plan.vl.gpu.index}
 #
 # 推薦啟動參數:ctx={plan.ctx}, threads={plan.parameters.get("threads")}, {offload}
+#   綁定:{bind_note}
 #   完整參數在 ~/.config/codetrail/deployment.json;實際指令預覽:~/start.sh --dry-run
-# 停止全部 server:{REPO_ROOT}/scripts/quit.sh
+#
+# 子命令:
+#   ~/start.sh            啟動四個 llama-server(tmux 背景)
+#   ~/start.sh status     檢查四個 server 狀態(= scripts/check-status.sh)
+#   ~/start.sh stop       全部停止(= scripts/quit.sh)
+#   ~/start.sh logs [role] 看啟動失敗時保存的 server log(main/embedding/reranker/vl)
 set -euo pipefail
+
+case "${{1:-}}" in
+  status)
+    shift
+    exec {status_sh} "$@"
+    ;;
+  stop|quit)
+    shift
+    exec {quit_sh} "$@"
+    ;;
+  logs)
+    role="${{2:-main}}"
+    exec tail -n "${{3:-120}}" "${{XDG_STATE_HOME:-$HOME/.local/state}}/codetrail/logs/$role.log"
+    ;;
+esac
+
+# 清掉會遮蔽 ~/.config/codetrail 設定檔的舊環境變數(例如寫在 ~/.bashrc 的
+# EMBED_MODEL / MAIN_CTX / CUDA_VISIBLE_DEVICES)。進階覆寫請改 deployment.json。
+unset {unset_line} 2>/dev/null || true
 
 export AICODE_MODEL={shlex.quote(plan.main_key)}
 {exports}
@@ -640,64 +966,89 @@ exec {shlex.quote(str(REPO_ROOT / "scripts" / "start-all.sh"))} "$@"
 """
 
 
-def write_start_sh(plan: Plan, start_path: Path, notes: list[str], dry_run: bool) -> None:
-    content = build_start_sh(plan)
+# ---------------------------------------------------------------------------
+# transaction 寫入 / 備份還原
+# ---------------------------------------------------------------------------
+
+def _backup(path: Path, notes: list[str]) -> Path | None:
+    if path.exists():
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = path.with_name(f"{path.name}.bak-setconfig-{stamp}")
+        shutil.copy2(path, backup)
+        notes.append(f"已備份原有 {path} → {backup.name}")
+        return backup
+    return None
+
+
+def commit_files(targets: list[tuple[Path, str, int]], notes: list[str], dry_run: bool) -> None:
+    """四個產物的 transaction:全部先寫 staging,備份既有檔,再逐一原子替換;
+    任一步失敗 → 還原備份、清掉 staging,不留半套狀態。"""
     if dry_run:
-        print(f"\n--- [dry-run] 將寫入 {start_path} ---\n{content}", end="")
+        for path, content, _mode in targets:
+            print(f"\n--- [dry-run] 將寫入 {path} ---\n{content}", end="")
         return
-    if start_path.exists() and GENERATED_MARKER not in start_path.read_text(
-        encoding="utf-8", errors="replace"
-    ):
-        notes.append(f"{start_path} 已存在且不是 set_config 產生的;原檔已備份後才覆寫。")
-    _backup(start_path, notes)
-    tmp = start_path.with_name(f"{start_path.name}.tmp.{os.getpid()}")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.chmod(0o755)
-    tmp.replace(start_path)
+
+    staged: list[tuple[Path, Path, int]] = []
+    try:
+        for path, content, mode in targets:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.setconfig-staging-{os.getpid()}")
+            tmp.write_text(content, encoding="utf-8")
+            tmp.chmod(mode)
+            staged.append((tmp, path, mode))
+    except BaseException:
+        for tmp, _path, _mode in staged:
+            tmp.unlink(missing_ok=True)
+        raise
+
+    backups: dict[Path, Path | None] = {}
+    replaced: list[Path] = []
+    try:
+        for _tmp, path, _mode in staged:
+            backups[path] = _backup(path, notes)
+        for tmp, path, _mode in staged:
+            os.replace(tmp, path)
+            replaced.append(path)
+    except BaseException:
+        for path in replaced:
+            backup = backups.get(path)
+            if backup is not None:
+                shutil.copy2(backup, path)
+            else:
+                path.unlink(missing_ok=True)
+        for tmp, _path, _mode in staged:
+            Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def restore_last_backup(home: Path) -> int:
+    """把四個產物還原到最近一次 *.bak-setconfig-* 備份。"""
+    targets = [
+        home / ".config" / "codetrail" / "models.json",
+        home / ".config" / "codetrail" / "deployment.json",
+        home / ".config" / "opencode" / "opencode.json",
+        home / "start.sh",
+    ]
+    restored = 0
+    for target in targets:
+        backups = sorted(target.parent.glob(f"{target.name}.bak-setconfig-*"))
+        if not backups:
+            print(f"  (略過)沒有 {target.name} 的備份")
+            continue
+        latest = backups[-1]
+        shutil.copy2(latest, target)
+        print(f"  已還原 {target} ← {latest.name}")
+        restored += 1
+    if restored == 0:
+        print("[set_config] 找不到任何 *.bak-setconfig-* 備份,未做任何變更。")
+        return 2
+    print(f"[set_config] 已還原 {restored} 個檔案。")
+    return 0
 
 
 # ---------------------------------------------------------------------------
-# 驗證與預覽
+# 驗證、預覽、運行中偵測
 # ---------------------------------------------------------------------------
-
-def _detect_python(skip_deps_check: bool, notes: list[str]) -> str:
-    """MCP server 要跑在哪個 Python:用執行 set_config 的這一顆,並驗證依賴齊全。
-
-    把絕對路徑寫死進 opencode.json 的 MCP command,新 shell 不 activate venv
-    也能啟動 MCP server(舊安裝流程最常踩的坑)。
-    """
-    python_bin = sys.executable or "python3"
-    proc = subprocess.run(
-        [python_bin, "-c", "import mcp, numpy, requests"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
-    if proc.returncode != 0:
-        message = (
-            f"這顆 Python({python_bin})缺少 CodeTrail 依賴(mcp/numpy/requests)。\n"
-            f"  安裝:{python_bin} -m pip install --user --break-system-packages -r "
-            f"{REPO_ROOT / 'requirements.txt'}\n"
-            "  (或先 activate 你的 venv 再重跑 ./set_config.sh)"
-        )
-        if skip_deps_check:
-            notes.append("⚠ 已用 --skip-deps-check 跳過依賴檢查:" + message)
-        else:
-            raise SetupError("偵測失敗:" + message)
-    return python_bin
-
-
-# 這些 env 會蓋過剛寫好的設定檔;驗證/預覽時剔除,模擬「全新 shell 跑 ~/start.sh」。
-_OVERRIDE_ENV_KEYS = (
-    "AICODE_PROFILE", "AICODE_DEPLOYMENT_CONFIG", "AICODE_MODEL",
-    "AICODE_MODEL_REGISTRY", "AICODE_MODEL_REGISTRY_FILE",
-    "EMBED_MODEL", "RERANK_MODEL", "VL_GGUF", "VL_MMPROJ",
-    "AICODE_EMBED_MODEL", "AICODE_RERANK_MODEL", "AICODE_VL_MODEL", "AICODE_VL_MMPROJ",
-    "MAIN_GPU", "AUX_GPU", "EMBED_GPU", "RERANK_GPU", "VL_GPU", "CUDA_VISIBLE_DEVICES",
-    "MAIN_CTX", "MAIN_BATCH", "MAIN_UBATCH",
-)
-
 
 def _fresh_env(plan: Plan) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if key not in _OVERRIDE_ENV_KEYS}
@@ -705,14 +1056,22 @@ def _fresh_env(plan: Plan) -> dict[str, str]:
     return env
 
 
-def validate_effective_profile(plan: Plan, dry_run: bool) -> None:
-    """寫檔後用 deployment_profile 真正載入一次,確保產物自洽。"""
-    if dry_run:
-        return
+def validate_payloads(plan: Plan, deployment_json: str, registry_json: str) -> None:
+    """寫入正式檔之前,用 staging 內容跑一次 deployment_profile 完整驗證。"""
+    env = _fresh_env(plan)
+    env["AICODE_MODEL_REGISTRY"] = registry_json
+    tmp = tempfile.NamedTemporaryFile(
+        "w", suffix=".json", prefix="codetrail-setconfig-", delete=False, encoding="utf-8"
+    )
     try:
-        load_effective_profile(_fresh_env(plan))
+        tmp.write(deployment_json)
+        tmp.close()
+        env["AICODE_DEPLOYMENT_CONFIG"] = tmp.name
+        load_effective_profile(env)
     except ProfileError as exc:
-        raise SetupError(f"產生的設定未通過 deployment profile 驗證:{exc}") from exc
+        raise SetupError(f"產生的設定未通過 deployment profile 驗證(未寫入任何檔案):{exc}") from exc
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
 
 
 def preview_start_commands(plan: Plan) -> int:
@@ -740,22 +1099,50 @@ def preview_start_commands(plan: Plan) -> int:
     return proc.returncode
 
 
+def running_codetrail_sessions() -> list[str]:
+    if not shutil.which("tmux"):
+        return []
+    names = [
+        os.environ.get("MAIN_SESSION") or "codetrail-main",
+        os.environ.get("SESSION") or os.environ.get("AUX_SESSION") or "codetrail-rag",
+    ]
+    running = []
+    for name in names:
+        probe = subprocess.run(
+            ["tmux", "has-session", "-t", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if probe.returncode == 0:
+            running.append(name)
+    return running
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="CodeTrail 一鍵設定:偵測 GPU/模型 → 互動選擇 → 產生設定檔與 ~/start.sh",
+        description="CodeTrail 一鍵設定:偵測 GPU/模型 → 確認建議配置 → 產生設定檔與 ~/start.sh",
     )
     parser.add_argument("--models-dir", help="模型目錄(預設 $MODELS_DIR 或 ~/models)")
-    parser.add_argument("--yes", action="store_true", help="全部採用偵測到的預設值,不互動")
+    parser.add_argument("--yes", action="store_true", help="全部採用建議配置,不互動")
+    parser.add_argument("--advanced", action="store_true",
+                        help="進階模式:逐項詢問四個角色的模型/GPU 與 ctx/threads")
     parser.add_argument("--dry-run", action="store_true", help="只顯示會寫入的內容,不動任何檔案")
+    parser.add_argument("--allow-remote", action="store_true",
+                        help="讓區網其他機器可連線模型 API(預設只綁 127.0.0.1;llama-server 無認證,慎用)")
+    parser.add_argument("--restore-last-backup", action="store_true",
+                        help="把四個產物還原到最近一次 *.bak-setconfig-* 備份後離開")
     parser.add_argument("--skip-deps-check", action="store_true", help="跳過 Python 依賴檢查")
+    parser.add_argument("--skip-binary-check", action="store_true",
+                        help="跳過 llama-server / tmux 檢查(自動化測試用)")
     for role in ("main", "embed", "rerank", "vl"):
         parser.add_argument(f"--{role}-model", help=f"{role} 模型:候選編號(從 1 起)或 .gguf 絕對路徑")
         parser.add_argument(f"--{role}-gpu", help=f"{role} 要綁的 GPU index")
-    parser.add_argument("--vl-mmproj", help="VL mmproj .gguf 絕對路徑(預設自動配對同目錄 mmproj)")
+    parser.add_argument("--vl-mmproj", help="VL mmproj .gguf 絕對路徑(預設自動配對同目錄唯一 mmproj)")
     parser.add_argument("--ctx", type=int, help=f"主模型 context(-c),預設 {DEFAULT_MAIN_CTX}")
     parser.add_argument("--threads", type=int, help="主模型 CPU threads(-t),預設 nproc/2")
     parser.add_argument("--fit-target", type=int, default=DEFAULT_FIT_TARGET_MIB,
@@ -764,27 +1151,64 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _print_summary_page(plan: Plan, python_bin: str, opencode_changes: list[str],
+                        codetrail_dir: Path, opencode_path: Path, start_path: Path) -> None:
+    offload = (
+        f"-ngl auto --fit on --fit-target {plan.parameters.get('fit_target')}"
+        if plan.parameters.get("fit") == "on"
+        else "-ngl 99(全 GPU offload)"
+    )
+    print("\n=== 建議配置(確認一次即可)===")
+    print(f"  主聊天    : {plan.main.candidate.describe()}")
+    print(f"              → GPU {plan.main.gpu.index}({plan.main.gpu.name};VRAM 最大)")
+    print(f"  embedding : {plan.embedding.candidate.path.name} → GPU {plan.embedding.gpu.index}")
+    print(f"  reranker  : {plan.reranker.candidate.path.name} → GPU {plan.reranker.gpu.index}")
+    print(f"  VL        : {plan.vl.candidate.path.name} + {plan.vl.mmproj.name}"
+          f" → GPU {plan.vl.gpu.index}")
+    print(f"  參數      : ctx={plan.ctx}、threads={plan.threads}、{offload}")
+    bind = "0.0.0.0(區網可連,無認證!)" if plan.allow_remote else "127.0.0.1(僅本機)"
+    print(f"  綁定      : {bind}")
+    print(f"  MCP Python: {python_bin}")
+    print("  產物      :")
+    print(f"    {codetrail_dir / 'models.json'} / {codetrail_dir / 'deployment.json'}")
+    print(f"    {opencode_path}")
+    print(f"    {start_path}")
+    if opencode_changes:
+        print("  opencode.json 變更:")
+        for change in opencode_changes:
+            print(f"    - {change}")
+    for note in plan.notes:
+        print(f"  {note if note.startswith('⚠') else '- ' + note}")
+
+
 def run(args: argparse.Namespace) -> int:
     notes: list[str] = []
     home = Path(os.path.expanduser("~"))
+    if args.restore_last_backup:
+        return restore_last_backup(home)
+
     models_dir = Path(args.models_dir or os.environ.get("MODELS_DIR") or (home / "models")).expanduser()
 
     print("=== CodeTrail set_config ===")
     python_bin = _detect_python(args.skip_deps_check, notes)
-    print(f"[1/4] Python(MCP server 用):{python_bin}")
+    print(f"[1/5] [PASS] Python(MCP server 用):{python_bin}")
+    _check_tmux(args.skip_binary_check, notes)
+    llama_caps = check_llama_binary(args.skip_binary_check, notes)
+    print(f"[2/5] [PASS] tmux 與 llama-server({_llama_bin()};--fit "
+          f"{'支援' if llama_caps.get('fit') else '不支援'})")
 
     gpus = detect_gpus()
-    print(f"[2/4] 偵測到 {len(gpus)} 顆 NVIDIA GPU:")
+    print(f"[3/5] [PASS] 偵測到 {len(gpus)} 顆 NVIDIA GPU:")
     for gpu in gpus:
         print(f"      {gpu.describe()}")
 
-    candidates = scan_models(models_dir)
-    print(f"[3/4] 掃描 {models_dir}:main={len(candidates['main'])}、"
+    candidates, broken = scan_models(models_dir)
+    print(f"[4/5] [PASS] 掃描 {models_dir}:main={len(candidates['main'])}、"
           f"embedding={len(candidates['embedding'])}、reranker={len(candidates['reranker'])}、"
           f"vl={len(candidates['vl'])} 個候選")
 
-    warnings = precheck(gpus, candidates)
-    print("[4/4] 初步判定 OK:GPU 與四類模型(main / embedding / reranker / vl+mmproj)齊全")
+    warnings = precheck(gpus, candidates, broken)
+    print("[5/5] [PASS] 初步判定 OK:GPU 與四類模型(main / embedding / reranker / vl+mmproj)齊全")
     for warning in warnings:
         print(f"      ⚠ {warning}")
 
@@ -793,37 +1217,37 @@ def run(args: argparse.Namespace) -> int:
     others = [gpu for gpu in gpus if gpu.index != main_gpu_default.index]
     aux_gpu_default = max(others, key=lambda gpu: gpu.total_mib) if others else main_gpu_default
 
-    main_cand = choose_candidate("【主聊天模型】", candidates["main"], args.main_model, args.yes)
-    main_gpu = choose_gpu("【主聊天模型】", gpus, main_gpu_default, args.main_gpu, args.yes)
-    embed_cand = choose_candidate("【embedding 模型】", candidates["embedding"], args.embed_model, args.yes)
-    embed_gpu = choose_gpu("【embedding 模型】", gpus, aux_gpu_default, args.embed_gpu, args.yes)
-    rerank_cand = choose_candidate("【reranker 模型】", candidates["reranker"], args.rerank_model, args.yes)
-    rerank_gpu = choose_gpu("【reranker 模型】", gpus, aux_gpu_default, args.rerank_gpu, args.yes)
-    vl_cand = choose_candidate("【VL 模型】", candidates["vl"], args.vl_model, args.yes)
-    vl_gpu = choose_gpu("【VL 模型】", gpus, aux_gpu_default, args.vl_gpu, args.yes)
+    # 非互動(--yes / 全旗標)與摘要確認模式都先按預設+旗標組出配置;
+    # --advanced 才逐項詢問。
+    ask = args.advanced and not args.yes
+    main_cand = choose_candidate("【主聊天模型】", candidates["main"], args.main_model,
+                                 assume_yes=not ask)
+    main_gpu = choose_gpu("【主聊天模型】", gpus, main_gpu_default, args.main_gpu,
+                          assume_yes=not ask)
+    embed_cand = choose_candidate("【embedding 模型】", candidates["embedding"], args.embed_model,
+                                  assume_yes=not ask)
+    embed_gpu = choose_gpu("【embedding 模型】", gpus, aux_gpu_default, args.embed_gpu,
+                           assume_yes=not ask)
+    rerank_cand = choose_candidate("【reranker 模型】", candidates["reranker"], args.rerank_model,
+                                   assume_yes=not ask)
+    rerank_gpu = choose_gpu("【reranker 模型】", gpus, aux_gpu_default, args.rerank_gpu,
+                            assume_yes=not ask)
+    vl_cand = choose_candidate("【VL 模型】", candidates["vl"], args.vl_model, assume_yes=not ask)
+    vl_gpu = choose_gpu("【VL 模型】", gpus, aux_gpu_default, args.vl_gpu, assume_yes=not ask)
+    vl_mmproj = resolve_vl_mmproj(vl_cand, args.vl_mmproj, interactive=ask)
 
-    if args.vl_mmproj:
-        vl_mmproj = Path(args.vl_mmproj).expanduser()
-        if not vl_mmproj.is_file() or vl_mmproj.suffix.lower() != ".gguf":
-            raise SetupError(f"VL mmproj:{args.vl_mmproj} 不是存在的 .gguf 檔。")
-    else:
-        vl_mmproj = vl_cand.mmproj
-        if vl_mmproj is None:
-            sibling = sorted(vl_cand.path.parent.glob("*mmproj*.gguf"))
-            if not sibling:
-                raise SetupError(
-                    f"VL 模型 {vl_cand.path.name} 同目錄找不到 mmproj *.gguf;"
-                    "請用 --vl-mmproj 指定(README §2.4)。"
-                )
-            vl_mmproj = sibling[0]
-    print(f"      VL mmproj:{vl_mmproj}")
+    allow_remote = bool(args.allow_remote)
+    if ask and not allow_remote:
+        raw = _input("允許區網其他機器連線到模型 API?(llama-server 無認證;y/N): ").strip().lower()
+        allow_remote = raw in {"y", "yes"}
 
     default_threads = max(4, (os.cpu_count() or 8) // 2)
-    ctx = choose_int("主模型 context(-c)", DEFAULT_MAIN_CTX, args.ctx, args.yes)
-    threads = choose_int("主模型 CPU threads(-t)", default_threads, args.threads, args.yes)
+    ctx = choose_int("主模型 context(-c)", DEFAULT_MAIN_CTX, args.ctx, assume_yes=not ask)
+    threads = choose_int("主模型 CPU threads(-t)", default_threads, args.threads,
+                         assume_yes=not ask)
 
     parameters, batch, ubatch = recommend_main(
-        main_gpu, main_cand, ctx, threads, args.fit_target, notes
+        main_gpu, main_cand, ctx, threads, args.fit_target, llama_caps.get("fit", True), notes
     )
     plan = Plan(
         gpus=gpus,
@@ -836,44 +1260,93 @@ def run(args: argparse.Namespace) -> int:
         threads=threads,
         batch=batch,
         ubatch=ubatch,
+        allow_remote=allow_remote,
         parameters=parameters,
+        notes=notes,
     )
+    _warn_unverified_aux(plan)
+    if allow_remote:
+        notes.append("⚠ --allow-remote:四個 llama-server 會綁 0.0.0.0,同網段任何人都能呼叫模型 API"
+                     "(llama-server 無認證)。只在可信內網使用,必要時加防火牆規則。")
 
     codetrail_dir = home / ".config" / "codetrail"
     opencode_path = home / ".config" / "opencode" / "opencode.json"
     start_path = home / "start.sh"
 
     registry = build_models_registry(plan, codetrail_dir / "models.json", notes)
-    _write_json(codetrail_dir / "models.json", registry, notes, args.dry_run)
-    _write_json(codetrail_dir / "deployment.json", build_deployment_config(plan), notes, args.dry_run)
-    _write_json(opencode_path, build_opencode_config(plan, python_bin), notes, args.dry_run)
-    write_start_sh(plan, start_path, notes, args.dry_run)
-    validate_effective_profile(plan, args.dry_run)
+    registry_json = json.dumps(registry, ensure_ascii=False, indent=2) + "\n"
+    deployment_json = json.dumps(build_deployment_config(plan), ensure_ascii=False, indent=2) + "\n"
+    opencode_config, opencode_changes = build_opencode_config(plan, python_bin, opencode_path)
+    opencode_json = json.dumps(opencode_config, ensure_ascii=False, indent=2) + "\n"
+    start_content = build_start_sh(plan)
+    if start_path.exists():
+        try:
+            if GENERATED_MARKER not in start_path.read_text(encoding="utf-8", errors="replace"):
+                notes.append(f"{start_path} 已存在且不是 set_config 產生的;原檔會備份後才覆寫。")
+        except OSError:
+            pass
 
-    print("\n=== 設定摘要 ===")
-    print(f"  main      : {plan.main.candidate.path}(key={plan.main_key})@ GPU {main_gpu.index}")
-    print(f"  embedding : {embed_cand.path} @ GPU {embed_gpu.index}")
-    print(f"  reranker  : {rerank_cand.path} @ GPU {rerank_gpu.index}")
-    print(f"  vl        : {vl_cand.path} + {vl_mmproj.name} @ GPU {vl_gpu.index}")
-    print(f"  ctx={ctx}、threads={threads}、batch={batch}、ubatch={ubatch}")
-    for note in notes:
-        print(f"  - {note}")
-    if not args.dry_run:
-        print("\n已產生:")
-        print(f"  {codetrail_dir / 'models.json'}")
-        print(f"  {codetrail_dir / 'deployment.json'}")
-        print(f"  {opencode_path}(OpenCode limit.context 已對齊 -c {ctx};MCP timeout 已設)")
-        print(f"  {start_path}")
+    # 寫入前先驗證 staging 內容;摘要頁 → 確認 → transaction 寫入。
+    validate_payloads(plan, deployment_json, registry_json)
+    _print_summary_page(plan, python_bin, opencode_changes, codetrail_dir, opencode_path, start_path)
+
+    if not args.yes and not args.dry_run:
+        answer = _input("\n[Enter] 採用並寫入 / [a] 進階逐項設定 / [q] 離開: ").strip().lower()
+        if answer == "q":
+            print("[set_config] 已離開,未寫入任何檔案。")
+            return 0
+        if answer == "a" and not args.advanced:
+            args.advanced = True
+            return run(args)
+        if answer not in {"", "y", "yes"}:
+            print(f"[set_config] 無效輸入 {answer!r},未寫入任何檔案。", file=sys.stderr)
+            return 2
+
+    commit_files(
+        [
+            (codetrail_dir / "models.json", registry_json, 0o644),
+            (codetrail_dir / "deployment.json", deployment_json, 0o644),
+            (opencode_path, opencode_json, 0o644),
+            (start_path, start_content, 0o755),
+        ],
+        notes,
+        args.dry_run,
+    )
+
+    print("\n=== 結果 ===")
+    if args.dry_run:
+        print("[dry-run] 未寫入任何檔案;以上為將寫入的完整內容。")
+    else:
+        print("[PASS] 第 1 層:設定檔已寫入並通過 schema 驗證(備份:*.bak-setconfig-*)")
+        print("[待執行] 第 2 層:實際啟動與模型載入 → ~/start.sh(成功與否以此為準)")
+        print("[待執行] 第 3 層:啟動後健檢 → ~/start.sh status(或 ./scripts/check-status.sh --strict)")
+        print(f"          與 AICODE_MODEL={plan.main_key} python scripts/doctor.py")
 
     preview_rc = 0
     if not args.dry_run and not args.no_preview:
         preview_rc = preview_start_commands(plan)
 
+    if not args.dry_run:
+        running = running_codetrail_sessions()
+        if running:
+            print(f"\n⚠ 偵測到 CodeTrail server 正在執行(tmux:{', '.join(running)});"
+                  "新設定要重啟才會生效。")
+            if args.yes:
+                print("  之後執行:~/start.sh stop && ~/start.sh")
+            else:
+                answer = _input("  [R] 現在自動重啟 / [S] 稍後自行重啟(Enter=S): ").strip().lower()
+                if answer == "r":
+                    subprocess.run(["bash", str(REPO_ROOT / "scripts" / "quit.sh")], check=False)
+                    print("  已停止舊 server;開始啟動新設定(載入大模型需要幾分鐘)…")
+                    rc = subprocess.run(["bash", str(start_path)], check=False).returncode
+                    if rc != 0:
+                        return rc
+
     print("\n下一步:")
     print("  ~/start.sh                        # 啟動四個 llama-server(tmux)")
-    print(f"  {REPO_ROOT}/scripts/check-status.sh --strict")
+    print("  ~/start.sh status                 # 確認四個 server 都 ready")
     print("  cd <你要分析的專案> && aicode      # 進 TUI;/status 應顯示 codetrail Connected")
-    print(f"  {REPO_ROOT}/scripts/quit.sh       # 收工:關掉全部 tmux server 視窗")
+    print("  ~/start.sh stop                   # 收工:關掉全部 tmux server 視窗")
     return 1 if preview_rc != 0 else 0
 
 
@@ -885,7 +1358,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n[set_config] {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print("\n[set_config] 已取消。(已寫入的檔案都有 .bak-setconfig-* 備份可還原)", file=sys.stderr)
+        print("\n[set_config] 已取消。(寫入採 transaction:要嘛全套完成、要嘛完全未動;"
+              "已寫入過的舊檔都有 .bak-setconfig-* 備份)", file=sys.stderr)
         return 130
 
 

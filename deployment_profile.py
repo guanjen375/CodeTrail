@@ -37,12 +37,14 @@ _SERVICE_KEYS = {
     "mmproj",
     "port",
     "base_url",
+    "bind",
     "gpu_role",
     "ctx",
     "batch",
     "ubatch",
     "parameters",
 }
+_BIND_VALUES = {"local", "all-interfaces"}
 _COMMON_PARAMETERS = {"gpu_layers", "flash_attention", "no_mmap"}
 _ROLE_PARAMETERS = {
     "main": _COMMON_PARAMETERS
@@ -120,6 +122,9 @@ class ServiceProfile:
     ubatch: int | None
     parameters: dict[str, Any]
     mmproj: str | None = None
+    # 安全預設:loopback base_url 只綁 127.0.0.1;要對其他機器開放必須
+    # 明確設 "all-interfaces"(舊版一律轉 0.0.0.0,對剛接觸專案者是暗坑)。
+    bind: str = "local"
 
 
 @dataclass(frozen=True)
@@ -348,6 +353,8 @@ def _validate_document(data: dict[str, Any], where: str, *, local: bool = False)
             _url_port(raw["base_url"], f"{service_where}.base_url")
         if "gpu_role" in raw and raw["gpu_role"] not in {"main", "aux"}:
             raise ProfileError(f"{service_where}.gpu_role must be main or aux")
+        if "bind" in raw and raw["bind"] not in _BIND_VALUES:
+            raise ProfileError(f"{service_where}.bind must be local or all-interfaces")
         for field, maximum in (("ctx", 1_048_576), ("batch", 1_048_576), ("ubatch", 1_048_576)):
             if field in raw:
                 _validate_nullable_int(raw[field], f"{service_where}.{field}", maximum=maximum)
@@ -458,6 +465,7 @@ def _environment_overlay(env: Mapping[str, str], current: dict[str, Any]) -> dic
             "model": ("AICODE_MODEL",),
             "base_url": ("AICODE_LLAMA_BASE_URL",),
             "port": ("MAIN_PORT", "AICODE_MAIN_PORT"),
+            "bind": ("MAIN_BIND", "AICODE_BIND"),
             "ctx": ("MAIN_CTX", "AICODE_MAIN_CTX"),
             "batch": ("MAIN_BATCH", "AICODE_MAIN_BATCH"),
             "ubatch": ("MAIN_UBATCH", "AICODE_MAIN_UBATCH"),
@@ -466,6 +474,7 @@ def _environment_overlay(env: Mapping[str, str], current: dict[str, Any]) -> dic
             "model": ("EMBED_MODEL", "AICODE_EMBED_MODEL"),
             "base_url": ("AICODE_LLAMA_EMBED_BASE_URL",),
             "port": ("EMBED_PORT", "AICODE_EMBED_PORT"),
+            "bind": ("EMBED_BIND", "AICODE_BIND"),
             "ctx": ("EMBED_CTX", "AICODE_EMBED_CTX"),
             "batch": ("EMBED_BATCH", "AICODE_EMBED_BATCH"),
             "ubatch": ("EMBED_UBATCH", "AICODE_EMBED_UBATCH"),
@@ -474,6 +483,7 @@ def _environment_overlay(env: Mapping[str, str], current: dict[str, Any]) -> dic
             "model": ("RERANK_MODEL", "AICODE_RERANK_MODEL"),
             "base_url": ("AICODE_LLAMA_RERANK_BASE_URL",),
             "port": ("RERANK_PORT", "AICODE_RERANK_PORT"),
+            "bind": ("RERANK_BIND", "AICODE_BIND"),
             "ctx": ("RERANK_CTX", "AICODE_RERANK_CTX"),
             "batch": ("RERANK_BATCH", "AICODE_RERANK_BATCH"),
             "ubatch": ("RERANK_UBATCH", "AICODE_RERANK_UBATCH"),
@@ -483,6 +493,7 @@ def _environment_overlay(env: Mapping[str, str], current: dict[str, Any]) -> dic
             "mmproj": ("VL_MMPROJ", "AICODE_VL_MMPROJ"),
             "base_url": ("AICODE_LLAMA_VL_BASE_URL",),
             "port": ("VL_PORT", "AICODE_VL_PORT"),
+            "bind": ("VL_BIND", "AICODE_BIND"),
             "ctx": ("VL_CTX", "AICODE_VL_CTX"),
             "batch": ("VL_BATCH", "AICODE_VL_BATCH"),
             "ubatch": ("VL_UBATCH", "AICODE_VL_UBATCH"),
@@ -599,6 +610,7 @@ def load_effective_profile(
             mmproj=raw.get("mmproj"),
             port=raw["port"],
             base_url=raw["base_url"].rstrip("/"),
+            bind=raw.get("bind") or "local",
             gpu_role=raw["gpu_role"],
             gpu=_gpu_for(role, raw["gpu_role"], env),
             ctx=raw["ctx"],
@@ -691,8 +703,16 @@ def resolve_model_reference(
 
 
 def bind_host(service: ServiceProfile) -> str:
+    """loopback base_url 預設只綁 127.0.0.1;`bind: "all-interfaces"` 才綁 0.0.0.0。
+
+    llama-server 沒有內建認證,綁 0.0.0.0 等於把模型 API 開放給整個網段;
+    這必須是使用者的明確選擇(deployment.json 的 bind 欄位、AICODE_BIND=all-interfaces
+    或 set_config 的 --allow-remote),不能是 localhost 的靜默轉譯。
+    """
     host = urlsplit(service.base_url).hostname or ""
-    return "0.0.0.0" if host == "localhost" or host.startswith("127.") or host == "::1" else host
+    if host == "localhost" or host.startswith("127.") or host == "::1":
+        return "0.0.0.0" if service.bind == "all-interfaces" else "127.0.0.1"
+    return host
 
 
 def build_server_command(
@@ -758,6 +778,7 @@ def profile_as_dict(profile: DeploymentProfile, environ: Mapping[str, str] | Non
             "model": service.model,
             "port": service.port,
             "base_url": service.base_url,
+            "bind": service.bind,
             "gpu_role": service.gpu_role,
             "gpu": service.gpu,
             "ctx": service.ctx,
@@ -819,7 +840,7 @@ def _build_parser() -> argparse.ArgumentParser:
     env_parser.add_argument("--include-main-model", action="store_true")
     get_parser = sub.add_parser("get", help="print one effective service field")
     get_parser.add_argument("role", choices=ROLES)
-    get_parser.add_argument("field", choices=("model", "mmproj", "port", "base_url", "gpu_role", "gpu", "ctx", "batch", "ubatch"))
+    get_parser.add_argument("field", choices=("model", "mmproj", "port", "base_url", "bind", "gpu_role", "gpu", "ctx", "batch", "ubatch"))
     exec_parser = sub.add_parser("exec", help="exec one role directly (for systemd or another supervisor)")
     exec_parser.add_argument("role", choices=ROLES)
     exec_parser.add_argument("--llama-bin", default=os.environ.get("LLAMA_BIN") or str(Path.home() / "llama.cpp" / "build" / "bin" / "llama-server"))

@@ -33,9 +33,10 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 ```
 
 - 第 5 步沒輸出,代表 `~/.local/bin` 不在 PATH:`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc` 後再試。
-- `./set_config.sh` 做的事與產物見 §3;要改配置(換模型 / 換 GPU / 換 ctx)隨時重跑它即可,舊設定會自動備份。
-- 收工關掉全部 server:`<CODETRAIL_REPO>/scripts/quit.sh`(關閉主模型 + 三顆附屬模型的所有 tmux 視窗)。
-- 重新啟動前要先 `scripts/quit.sh`,tmux session 還在時 `~/start.sh` 會拒絕重複啟動。
+- `./set_config.sh` 預設只要**確認一頁建議配置**(Enter 採用);做的事與產物見 §3。要改配置(換模型 / 換 GPU / 換 ctx)隨時重跑它,舊設定自動備份、可用 `--restore-last-backup` 還原。
+- 安全預設:四個模型 server **只綁 `127.0.0.1`**(僅本機可連);要讓區網其他機器使用要明確 `./set_config.sh --allow-remote`(見 [docs/security.md](docs/security.md))。
+- 管理指令都掛在 `~/start.sh` 上:`~/start.sh status`(檢查四個 server)、`~/start.sh stop`(全部關閉,= `scripts/quit.sh`,關掉主模型 + 三顆附屬模型的所有 tmux 視窗)、`~/start.sh logs [role]`(看啟動失敗保存的 log)。
+- 重新啟動前要先 `~/start.sh stop`,tmux session 還在時 `~/start.sh` 會拒絕重複啟動;若是啟動中途失敗,launcher 會自動清理本次啟動的服務,修正後直接重跑即可。
 
 ## 0. OpenCode TUI 部署路線圖
 
@@ -263,33 +264,39 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 ### 3.1 `./set_config.sh` 做什麼
 
-在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`,它會依序:
+設計給**剛接觸專案者**:預設不需要懂 embedding / reranker / mmproj 的差別,只要確認一頁建議配置。在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`,它會依序:
 
-1. **偵測**:GPU 的種類與 VRAM(`nvidia-smi`)、`~/models` 內的 GGUF 並自動分類成主聊天 / embedding / reranker / VL+mmproj 四類(多 shard 自動聚合、mmproj 自動配對)。偵測失敗會直接告訴你缺什麼。
-2. **初步判定**:GPU 數量與四類模型是否齊全 —— 缺任何一類直接列出並指到 §2 的下載指令;單 GPU 可以跑(全部共用一顆卡)但會提示建議雙卡分工。
-3.–6. **逐一詢問**:主聊天模型 + GPU、embedding + GPU、reranker + GPU、VL(+mmproj)+ GPU。每題都有偵測出的預設值(Enter 直接接受),也可以貼自己的 `.gguf` 絕對路徑。多 GPU 時預設把主模型放 VRAM 最大那顆、三顆附屬模型共用另一顆。
-   另外會補上容易遺漏的重要參數:主模型 `ctx`(預設 65536)、CPU `threads`、offload 策略(主模型塞得進 VRAM → `-ngl 99`;塞不進 → 新版 llama.cpp 的 `-ngl auto --fit on` 自動配置)、`--no-mmap`(RAM 夠才開)、OpenCode `limit.context` 對齊、MCP timeout、MCP 用的 Python 路徑。
-7. **產生四個檔案**(既有檔案自動備份成 `*.bak-setconfig-<時間戳>`):
+1. **前置檢查**:Python 依賴(mcp/numpy/requests)、`tmux`、`nvidia-smi`、`llama-server` 是否存在且支援必要旗標(`--reranking` / `--mmproj`;`--fit` 沒有只警告)。缺什麼直接給**可複製的修復指令**(裝哪個套件、跑哪行 build),修完重跑即可。
+2. **偵測與判定**:GPU 種類/VRAM、`~/models` 的 GGUF 自動分類成主聊天 / embedding / reranker / VL+mmproj 四類;多 shard 自動聚合並**驗證齊全性**(缺片、零大小、殘留 `.incomplete` 都會列出檔名與補救指令)。缺任何一類直接列出並指到 §2;單 GPU 可以跑(全部共用一顆卡)但會提示建議雙卡分工。
+3. **建議配置一頁確認**:主模型放 VRAM 最大的 GPU、三顆附屬模型共用另一顆;`ctx`(預設 65536)、`threads`、offload 策略(塞得進 VRAM → `-ngl 99`;塞不進 → 新版 llama.cpp 的 `-ngl auto --fit on` 自動配置)、`--no-mmap`(RAM 夠才開)、OpenCode `limit.context` 對齊、MCP timeout、MCP 用的 Python 路徑全部自動補好。看完按 **Enter 採用**;要逐項自選按 **a**(或直接 `./set_config.sh --advanced`);**q** 離開不寫任何檔案。
+4. **產生四個檔案**(transaction 寫入:要嘛全套完成、要嘛完全不動;既有檔自動備份 `*.bak-setconfig-<時間戳>`,`--restore-last-backup` 可整批還原):
 
 | 產物 | 內容 |
 |---|---|
 | `~/.config/codetrail/models.json` | 主模型 registry key → GGUF 路徑(合併既有內容) |
 | `~/.config/codetrail/deployment.json` | deployment profile local override:四個 role 的模型與主模型推薦參數 |
-| `~/.config/opencode/opencode.json` | OpenCode 本機 provider + `limit.context` 對齊 + CodeTrail MCP + deny-all 權限範本 |
-| `~/start.sh` | 啟動腳本:寫死你的 GPU 配置與主模型,呼叫 `scripts/start-all.sh` |
+| `~/.config/opencode/opencode.json` | **合併**而非重建:只更新 CodeTrail 管的欄位(model / provider.llamacpp / mcp.codetrail / 缺少的 permission 鍵),你原本的 provider、主題、其他 MCP server 都保留;與安全範本衝突的 permission 會尊重你的值但明確警告 |
+| `~/start.sh` | 啟動腳本:寫死你的 GPU 配置與主模型,呼叫 `scripts/start-all.sh`;支援 `status` / `stop` / `logs` 子命令 |
 
-結尾會自動印出**推薦啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),讓你在真正啟動前看得到、也改得動(改 `~/.config/codetrail/deployment.json` 即可)。
+結尾會自動印出**推薦啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
 
-非互動用法(自動化 / 重跑):`./set_config.sh --yes` 全用預設;`./set_config.sh --help` 看完整旗標(可直接指定各模型與 GPU)。
+非互動用法(自動化 / 重跑):`./set_config.sh --yes` 全用建議值;`--allow-remote` 開放區網連線(預設只綁 127.0.0.1);`./set_config.sh --help` 看完整旗標(可直接指定各模型與 GPU)。
 
 ### 3.2 啟動與停止
 
 ```bash
 ~/start.sh              # 啟動 main + embedding + reranker + VL(各自 tmux 視窗,驗 /health 才算 ready)
 ~/start.sh --dry-run    # 只印出將執行的四條 llama-server 指令,不啟動
-
-<CODETRAIL_REPO>/scripts/quit.sh    # 關閉全部 tmux 視窗(主模型 + 三附屬模型)
+~/start.sh status       # 檢查四個 server 狀態(= scripts/check-status.sh)
+~/start.sh stop         # 關閉全部 tmux 視窗(主模型 + 三附屬模型;= scripts/quit.sh)
+~/start.sh logs vl      # 看啟動失敗時自動保存的該 role server log
 ```
+
+啟動時的行為(對剛接觸專案者友善):
+
+- **載入進度**:大模型載入要幾分鐘,等待期間每 15 秒回報「載入中,已等待 N 秒(process 存活)」,不會看起來像當機;health 等待上限依主模型大小自動放大。llama-server process 一死就立即失敗,不會空等 timeout。
+- **失敗自動清理**:某個 role 啟動失敗時,launcher 會先把各 role 的 server log 存到 `~/.local/state/codetrail/logs/`,自動關閉本次啟動的其他服務並釋放 port,然後告訴你「修正後直接重跑 `~/start.sh`」—— 不會留下半套 tmux 讓下次啟動卡 `session already exist`(要保留現場除錯:`AICODE_NO_ROLLBACK=1`)。
+- **綁定**:預設四個 server 只綁 `127.0.0.1`;`--allow-remote` 設定過的才綁 `0.0.0.0`。
 
 | 預設 port | 角色 | 必要 |
 |---|---|---|
@@ -387,7 +394,7 @@ AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
 }
 ```
 
-所有 service 都有同級 `model`、`port`、`base_url`、`gpu_role`、`ctx`、`batch`、`ubatch`、`parameters`;VL 另外有 `mmproj`。模型欄只接受 registry key 或 GGUF 絕對路徑,參數只接受 schema allowlist(含新版 llama.cpp 的 `gpu_layers: "auto"`、`fit`、`fit_target`、`parallel`),沒有 raw shell `extra_args`;JSON 不會被 `source` / `eval`。schema 與 GPU precedence 詳見 [docs/deployment-profiles.md](docs/deployment-profiles.md)。可離線查看合併結果:
+所有 service 都有同級 `model`、`port`、`base_url`、`bind`(`local` 預設只綁 127.0.0.1 / `all-interfaces` 綁 0.0.0.0)、`gpu_role`、`ctx`、`batch`、`ubatch`、`parameters`;VL 另外有 `mmproj`。模型欄只接受 registry key 或 GGUF 絕對路徑,參數只接受 schema allowlist(含新版 llama.cpp 的 `gpu_layers: "auto"`、`fit`、`fit_target`、`parallel`),沒有 raw shell `extra_args`;JSON 不會被 `source` / `eval`。schema 與 GPU precedence 詳見 [docs/deployment-profiles.md](docs/deployment-profiles.md)。可離線查看合併結果:
 
 ```bash
 AICODE_MODEL=<CODE_MODEL> python deployment_profile.py show

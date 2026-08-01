@@ -38,6 +38,10 @@ launcher CLI / environment
 - `model`：`models.json` key 或 GGUF 絕對路徑；main 可在基底中為 `null`，但啟動
   main 時一定 fail-loud，直到 `AICODE_MODEL` 或 local profile 明確指定。
 - `port` 與 `base_url`：必須一致；URL 只接受無 credentials/path/query 的 HTTP(S)。
+- `bind`：`local`(預設,loopback base_url 只綁 `127.0.0.1`)或 `all-interfaces`
+  (綁 `0.0.0.0`,對其他機器開放 —— llama-server 無認證,慎用)。env 覆寫:
+  `MAIN_BIND` / `EMBED_BIND` / `RERANK_BIND` / `VL_BIND`,或 `AICODE_BIND` 一次
+  套用四個 role。非 loopback 的 base_url host 不受影響、照原樣綁定。
 - `gpu_role`：只能是 `main` 或 `aux`。
 - `ctx`、`batch`、`ubatch`：正整數或明確 `null`；`null` 代表不傳該 llama.cpp flag。
 - `parameters`：role-specific allowlist；未知 key 直接拒絕。main 另支援新版

@@ -188,7 +188,7 @@ def check_all() -> list[str]:
     mcp_tools = _mcp_tool_names(mcp_text)
     claimed = _readme_claimed_tool_count(docs_text)
     if claimed is None:
-        issues.append("文件沒寫「N 個 MCP 工具」/「暴露的 N 個工具」字樣 — 新手會不知道要連幾個")
+        issues.append("文件沒寫「N 個 MCP 工具」/「暴露的 N 個工具」字樣 — 剛接觸專案者會不知道要連幾個")
     elif claimed != len(mcp_tools):
         issues.append(
             f"README 說「{claimed} 個工具」但 mcp_server.py 實際有 {len(mcp_tools)} 個："

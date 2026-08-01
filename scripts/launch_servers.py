@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -82,9 +83,36 @@ def _session_for(role: str, sessions: Mapping[str, str]) -> str:
     return sessions["main" if role == "main" else "aux"]
 
 
-def _health_timeout(role: str, environ: Mapping[str, str]) -> int:
+_SHARD_RE = re.compile(r"^(?P<stem>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$", re.IGNORECASE)
+
+
+def _artifact_bytes(path: Path) -> int:
+    """模型總大小;多 shard GGUF 會把同組 shard 全部加總。"""
+    try:
+        match = _SHARD_RE.match(path.name)
+        if not match:
+            return path.stat().st_size
+        stem, total = match.group("stem"), match.group("total")
+        return sum(
+            sib.stat().st_size
+            for sib in path.parent.glob("*.gguf")
+            if (m := _SHARD_RE.match(sib.name)) and m.group("stem") == stem and m.group("total") == total
+        )
+    except OSError:
+        return 0
+
+
+def _health_timeout(role: str, environ: Mapping[str, str], artifact_bytes: int = 0) -> int:
+    """health 等待上限。main 依模型大小放大:大模型冷載入(尤其 --no-mmap)
+    正常就要好幾分鐘,固定 120s 會把「還在載入」誤判成失敗。"""
     name = "MAIN_HEALTH_TIMEOUT" if role == "main" else "RAG_HEALTH_TIMEOUT"
-    return _positive_int((environ.get(name) or "120" if role == "main" else environ.get(name) or "60"), name)
+    explicit = (environ.get(name) or "").strip()
+    if explicit:
+        return _positive_int(explicit, name)
+    if role != "main":
+        return 60
+    size_gib = artifact_bytes / (1024**3)
+    return max(300, min(1800, int(size_gib * 5)))
 
 
 def _health_status(service: ServiceProfile) -> str:
@@ -98,14 +126,43 @@ def _health_status(service: ServiceProfile) -> str:
     return str(data.get("status") or "unknown").lower()
 
 
+def _window_alive(session: str, window: str) -> bool:
+    proc = subprocess.run(
+        ["tmux", "list-windows", "-t", session, "-F", "#{window_name}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0 and window in proc.stdout.split()
+
+
 def _wait_for_health(service: ServiceProfile, timeout: int, session: str) -> None:
-    deadline = time.monotonic() + timeout
+    """等 /health=ok。等待期間定時回報進度(載入中 ≠ 當機);
+    llama-server process 一結束(tmux window 消失)立即失敗,不空等 timeout。"""
+    window = WINDOWS[service.role]
+    start = time.monotonic()
+    deadline = start + timeout
+    next_report = start + 15
     last_status = "unreachable"
     while time.monotonic() < deadline:
         last_status = _health_status(service)
         if last_status == "ok":
             print(f"[+] {service.role} health OK: {service.base_url}/health status=ok")
             return
+        if not _window_alive(session, window):
+            raise ProfileError(
+                f"{service.role} 的 llama-server process 已結束(模型載入失敗或參數錯誤);"
+                f"tmux window {session}:{window} 已關閉"
+            )
+        now = time.monotonic()
+        if now >= next_report:
+            elapsed = int(now - start)
+            print(
+                f"[…] {service.role} 載入中,已等待 {elapsed}s(health={last_status},"
+                f"上限 {timeout}s)— process 存活,大模型載入需要幾分鐘是正常的",
+                flush=True,
+            )
+            next_report = now + 15
         time.sleep(1)
     raise ProfileError(
         f"{service.role} server was not ready within {timeout}s: "
@@ -203,6 +260,71 @@ def _start_role(
     print(f"[+] started {service.role} server ({service.base_url}) in tmux {session}:{window}")
 
 
+def _state_log_dir(environ: Mapping[str, str]) -> Path:
+    base = (environ.get("XDG_STATE_HOME") or "").strip() or str(
+        Path(environ.get("HOME") or Path.home()) / ".local" / "state"
+    )
+    return Path(base) / "codetrail" / "logs"
+
+
+def _capture_window_log(session: str, window: str, dest: Path) -> bool:
+    proc = subprocess.run(
+        ["tmux", "capture-pane", "-p", "-t", f"{session}:{window}", "-S", "-300"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return False
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(proc.stdout, encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _rollback_started(
+    exc: Exception,
+    started_roles: Sequence[ServiceProfile],
+    created_sessions: Sequence[str],
+    sessions: Mapping[str, str],
+    environ: Mapping[str, str],
+) -> None:
+    """某個 role 啟動失敗:先保存各 role 的 server log,再關掉本次建立的
+    tmux sessions,讓使用者修正後可以直接重跑,不會卡在 session already exist。"""
+    if not created_sessions:
+        return
+    if (environ.get("AICODE_NO_ROLLBACK") or "").strip():
+        print(
+            f"[!] AICODE_NO_ROLLBACK=1:保留現場不清理(tmux:{', '.join(created_sessions)})",
+            file=sys.stderr,
+        )
+        return
+    log_dir = _state_log_dir(environ)
+    saved: list[str] = []
+    for service in started_roles:
+        session = _session_for(service.role, sessions)
+        if _capture_window_log(session, WINDOWS[service.role], log_dir / f"{service.role}.log"):
+            saved.append(service.role)
+    for session in created_sessions:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    print(f"[rollback] 啟動失敗:{exc}", file=sys.stderr)
+    if saved:
+        print(f"[rollback] server log 已保存:{log_dir}/({', '.join(saved)}).log", file=sys.stderr)
+    print(
+        f"[rollback] 已自動停止本次啟動的服務並清理 tmux({', '.join(created_sessions)});"
+        "修正後直接重新執行 ~/start.sh 即可。",
+        file=sys.stderr,
+    )
+    print("[rollback] 要保留現場除錯:AICODE_NO_ROLLBACK=1 ~/start.sh", file=sys.stderr)
+
+
 def launch(
     profile: DeploymentProfile,
     roles: Sequence[str],
@@ -227,7 +349,10 @@ def launch(
     used_sessions = {_session_for(role, sessions) for role in roles}
     existing = sorted(session for session in used_sessions if _tmux_has_session(session))
     if existing:
-        raise ProfileError(f"tmux session(s) already exist: {', '.join(existing)}; stop them first")
+        raise ProfileError(
+            f"tmux session(s) already exist: {', '.join(existing)}; "
+            "先執行 ./scripts/quit.sh(或 ~/start.sh stop)再重新啟動"
+        )
     for service in services:
         resolve_model_reference(service.model, environ, must_exist=True)
         if service.mmproj:
@@ -236,12 +361,26 @@ def launch(
             raise ProfileError(f"{service.role} port {service.port} is already in use ({service.base_url})")
 
     started_sessions: set[str] = set()
-    for service in services:
-        session = _session_for(service.role, sessions)
-        command = _command_for(service, str(binary), environ, must_exist=True)
-        _start_role(service, command, session, first_in_session=session not in started_sessions)
-        started_sessions.add(session)
-        _wait_for_health(service, _health_timeout(service.role, environ), session)
+    created_sessions: list[str] = []
+    started_roles: list[ServiceProfile] = []
+    try:
+        for service in services:
+            session = _session_for(service.role, sessions)
+            command = _command_for(service, str(binary), environ, must_exist=True)
+            _start_role(service, command, session, first_in_session=session not in started_sessions)
+            if session not in started_sessions:
+                created_sessions.append(session)
+            started_sessions.add(session)
+            started_roles.append(service)
+            artifact = (
+                _artifact_bytes(Path(resolve_model_reference(service.model, environ)))
+                if service.role == "main"
+                else 0
+            )
+            _wait_for_health(service, _health_timeout(service.role, environ, artifact), session)
+    except (ProfileError, subprocess.CalledProcessError) as exc:
+        _rollback_started(exc, started_roles, created_sessions, sessions, environ)
+        raise
 
     print("\nCodeTrail model servers ready.")
     print("  ./scripts/check-status.sh --strict")

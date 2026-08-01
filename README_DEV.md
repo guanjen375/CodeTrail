@@ -59,7 +59,8 @@ aicode
 - `tests/test_deployment_profile.py` — profile schema/precedence、惡意值拒絕、registry/mmproj、main/aux GPU precedence、`-ngl auto --fit` 參數驗證
 - `tests/test_deployment_status.py` — port/cmdline role 辨識、錯卡/錯模型;process 與 HTTP 都用 hook
 - `tests/test_profile_server_launchers.py` — start-all/main、quit.sh 與所有舊 launcher 的離線 dry-run 相容性
-- `tests/test_set_config.py` — `set_config.sh` 的 GPU/模型偵測分類、初步判定失敗通知、產物(registry/deployment/opencode/start.sh)內容與 end-to-end dry-run;nvidia-smi 與 models 目錄全用 fixture
+- `tests/test_set_config.py` — `set_config.sh` 的前置檢查(llama-server/依賴缺失通知)、GPU/模型偵測分類、shard 齊全性、mmproj 多重配對、摘要確認模式、opencode.json 合併(保留使用者設定)、bind 安全預設、legacy env 清除、備份/還原與 end-to-end dry-run;nvidia-smi/llama-server/models 全用 fixture
+- `tests/test_launch_rollback.py` — launcher 啟動失敗的 rollback(保存 log、清理本次 tmux session、`AICODE_NO_ROLLBACK`)與依模型大小放大的 health timeout;tmux 用 monkeypatch
 
 ---
 

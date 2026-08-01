@@ -339,7 +339,7 @@ def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None,
 
 
 def _llm_error_message(e: Exception, model: str) -> str:
-    """把底層例外轉成新手看得懂的多行錯誤字串。
+    """把底層例外轉成剛接觸專案者看得懂的多行錯誤字串。
 
     呼叫端拿到的字串都以 '[ERROR]' 開頭，方便上層 detect 與 propagate。
     """

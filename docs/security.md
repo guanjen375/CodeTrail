@@ -100,6 +100,10 @@ aicode
 
 ---
 
+## 模型 API(llama-server)曝光面
+
+四個 llama-server(8080–8083)**預設只綁 `127.0.0.1`**:llama-server 沒有內建認證,綁 `0.0.0.0` 等於讓同網段任何機器都能呼叫你的模型 API。要讓其他機器連線必須明確選擇:`./set_config.sh --allow-remote`、`AICODE_BIND=all-interfaces`,或 deployment.json 各 service 的 `"bind": "all-interfaces"` —— 且只該在可信內網 / VPN 使用,必要時加防火牆規則。(2026-08 之前的舊版會把 localhost 靜默轉成 `0.0.0.0`,升級後預設收緊。)
+
 ## Web 模式曝光面
 
 `aicode web` 預設只綁 `127.0.0.1`。跨機器使用時推薦 Tailscale `serve` 或 SSH port-forward。
