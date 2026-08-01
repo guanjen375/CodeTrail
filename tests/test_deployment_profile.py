@@ -1,0 +1,227 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from deployment_profile import (
+    ProfileError,
+    build_server_command,
+    load_effective_profile,
+    resolve_model_reference,
+)
+from model_resolution import resolve_main_model_from_env
+
+PROFILE_ENV_KEYS = {
+    "AICODE_PROFILE",
+    "AICODE_DEPLOYMENT_CONFIG",
+    "AICODE_MODEL",
+    "AICODE_MODEL_REGISTRY",
+    "AICODE_MODEL_REGISTRY_FILE",
+    "AICODE_LLAMA_BASE_URL",
+    "AICODE_LLAMA_EMBED_BASE_URL",
+    "AICODE_LLAMA_RERANK_BASE_URL",
+    "AICODE_LLAMA_VL_BASE_URL",
+    "AICODE_EMBED_MODEL",
+    "AICODE_RERANK_MODEL",
+    "AICODE_VL_MODEL",
+    "AICODE_VL_MMPROJ",
+    "EMBED_MODEL",
+    "RERANK_MODEL",
+    "VL_GGUF",
+    "VL_MMPROJ",
+    "MAIN_GPU",
+    "AUX_GPU",
+    "EMBED_GPU",
+    "RERANK_GPU",
+    "VL_GPU",
+    "CUDA_VISIBLE_DEVICES",
+    "MAIN_CTX",
+    "MAIN_BATCH",
+    "MAIN_UBATCH",
+}
+
+
+def _env(tmp_path: Path, **values: str) -> dict[str, str]:
+    import os
+
+    env = {key: value for key, value in os.environ.items() if key not in PROFILE_ENV_KEYS}
+    env.update({"HOME": str(tmp_path), "USERPROFILE": str(tmp_path), **values})
+    return env
+
+
+def _write_local(tmp_path: Path, data: dict) -> Path:
+    path = tmp_path / ".config" / "codetrail" / "deployment.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def test_maintainer_target_is_explicit_and_unverified(tmp_path):
+    profile = load_effective_profile(_env(tmp_path, AICODE_PROFILE="maintainer-target"))
+
+    assert profile.selected_profile == "maintainer-target"
+    assert profile.verification == "unverified"
+    assert profile.service("main").model is None
+    assert profile.service("embedding").parameters["pooling"] == "cls"
+    assert profile.service("reranker").parameters["pooling"] == "rank"
+    assert profile.service("vl").mmproj == "qwen3.5-9b-mmproj-f16"
+
+
+def test_main_model_resolution_uses_selected_profile(tmp_path):
+    resolved = resolve_main_model_from_env(
+        _env(tmp_path, AICODE_PROFILE="verified-reference")
+    )
+
+    assert resolved.ok
+    assert resolved.model == "qwen3-235b-a22b-thinking-2507-ud-q4-k-xl"
+    assert resolved.source.startswith("deployment profile verified-reference")
+
+
+def test_precedence_cli_env_over_local_over_profile_over_defaults(tmp_path):
+    _write_local(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "profile": "maintainer-target",
+            "services": {"main": {"model": "local-main", "ctx": 32768}},
+        },
+    )
+    env = _env(tmp_path, AICODE_MODEL="env-main", MAIN_CTX="49152")
+
+    effective = load_effective_profile(
+        env,
+        cli_env={"AICODE_MODEL": "cli-main", "MAIN_CTX": "98304"},
+    )
+
+    assert effective.selected_profile == "maintainer-target"
+    assert effective.service("main").model == "cli-main"
+    assert effective.service("main").ctx == 98304
+    assert effective.service("embedding").ctx == 8192  # inherited safe default
+
+
+def test_profile_selector_precedence_cli_then_env_then_local(tmp_path):
+    _write_local(tmp_path, {"schema_version": 1, "profile": "maintainer-target"})
+    env = _env(tmp_path, AICODE_PROFILE="verified-reference")
+
+    assert load_effective_profile(env).selected_profile == "verified-reference"
+    assert (
+        load_effective_profile(env, profile="maintainer-target").selected_profile
+        == "maintainer-target"
+    )
+
+
+@pytest.mark.parametrize(
+    "service_patch,needle",
+    [
+        ({"extra_args": "--host 0.0.0.0; touch /tmp/pwned"}, "unsupported"),
+        ({"model": "x; touch /tmp/pwned"}, "safe registry key"),
+        ({"model": "~codetrail-user-that-does-not-exist/model.gguf"}, "unresolvable"),
+        ({"base_url": "http://user:pass@localhost:8080"}, "credentials"),
+        ({"gpu_role": "aux"}, "must remain"),
+        ({"parameters": {"shell": "$(id)"}}, "not allowed"),
+    ],
+)
+def test_malicious_or_raw_shell_profile_values_are_rejected(tmp_path, service_patch, needle):
+    profile_path = tmp_path / "bad.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "name": "bad",
+                "extends": "defaults",
+                "description": "bad test",
+                "verification": "unverified",
+                "hardware": "test",
+                "services": {"main": service_patch},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProfileError, match=needle):
+        load_effective_profile(_env(tmp_path), profile=str(profile_path))
+
+
+@pytest.mark.parametrize(
+    ("raw", "needle"),
+    [
+        ('{"schema_version": 1, "schema_version": 1}', "duplicate JSON key"),
+        ('{"schema_version": 1, "services": {"main": {"ctx": NaN}}}', "non-finite"),
+    ],
+)
+def test_noncanonical_json_is_rejected(tmp_path, raw, needle):
+    profile_path = tmp_path / "noncanonical.json"
+    profile_path.write_text(raw, encoding="utf-8")
+
+    with pytest.raises(ProfileError, match=needle):
+        load_effective_profile(_env(tmp_path), profile=str(profile_path))
+
+
+def test_model_and_mmproj_resolve_from_registry_or_absolute_path(tmp_path):
+    main = tmp_path / "main.gguf"
+    vl = tmp_path / "vl.gguf"
+    mmproj = tmp_path / "mmproj.gguf"
+    for path in (main, vl, mmproj):
+        path.write_bytes(b"fixture")
+    registry = {"main-key": str(main), "vl-key": str(vl), "mm-key": str(mmproj)}
+    env = _env(
+        tmp_path,
+        AICODE_MODEL="main-key",
+        AICODE_VL_MODEL="vl-key",
+        AICODE_VL_MMPROJ="mm-key",
+        AICODE_MODEL_REGISTRY=json.dumps(registry),
+    )
+    profile = load_effective_profile(env)
+
+    assert resolve_model_reference(profile.service("main").model, env, must_exist=True) == str(main)
+    assert resolve_model_reference(profile.service("vl").model, env, must_exist=True) == str(vl)
+    assert resolve_model_reference(profile.service("vl").mmproj, env, must_exist=True) == str(mmproj)
+    assert resolve_model_reference(str(main), env, must_exist=True) == str(main)
+
+
+def test_main_and_aux_gpu_split_and_three_aux_share_one_gpu(tmp_path):
+    env = _env(tmp_path, MAIN_GPU="GPU-H200", AUX_GPU="GPU-RTX2000ADA")
+    profile = load_effective_profile(env)
+
+    assert profile.service("main").gpu == "GPU-H200"
+    assert {profile.service(role).gpu for role in ("embedding", "reranker", "vl")} == {
+        "GPU-RTX2000ADA"
+    }
+
+
+def test_per_role_gpu_override_wins_over_aux_gpu(tmp_path):
+    env = _env(
+        tmp_path,
+        AUX_GPU="GPU-AUX",
+        EMBED_GPU="GPU-EMBED",
+        RERANK_GPU="GPU-RERANK",
+        VL_GPU="GPU-VL",
+    )
+    profile = load_effective_profile(env)
+
+    assert profile.service("embedding").gpu == "GPU-EMBED"
+    assert profile.service("reranker").gpu == "GPU-RERANK"
+    assert profile.service("vl").gpu == "GPU-VL"
+
+
+def test_command_builder_uses_only_structured_allowlisted_arguments(tmp_path):
+    model = tmp_path / "main model.gguf"
+    model.write_bytes(b"fixture")
+    env = _env(tmp_path, AICODE_MODEL=str(model), MAIN_GPU="GPU-safe")
+    service = load_effective_profile(env).service("main")
+
+    command = build_server_command(service, "/opt/llama-server", env, must_exist=True)
+
+    assert command[:3] == ["env", "CUDA_VISIBLE_DEVICES=GPU-safe", "/opt/llama-server"]
+    assert command[command.index("-m") + 1] == str(model)
+    assert "extra_args" not in command
+
+
+def test_main_launcher_resolution_fails_loud_without_main_model(tmp_path):
+    env = _env(tmp_path, AICODE_PROFILE="maintainer-target")
+    service = load_effective_profile(env).service("main")
+
+    with pytest.raises(ProfileError, match="main model is unset"):
+        build_server_command(service, "/opt/llama-server", env)

@@ -16,13 +16,14 @@ RAG_LAUNCHER="$SCRIPT_DIR/start-rag-servers.sh"
 
 usage() {
     cat <<'EOF'
-Usage: ./scripts/start-rag-servers-mgpu.sh [--gpu INDEX] [--dry-run]
+Usage: ./scripts/start-rag-servers-mgpu.sh [--gpu INDEX] [--profile NAME] [--dry-run]
 
 掃描 nvidia-smi 列出的所有 NVIDIA GPU，選定一顆後在該 GPU 啟動
 embedding、reranker、VL 三個 RAG server（預設 ports 8081-8083）。
 
 Options:
   --gpu INDEX  直接選擇 nvidia-smi 顯示的 GPU index，不進入互動提示
+  --profile NAME  選用 deployment profile（也可設 AICODE_PROFILE）
   --dry-run    只印出三個 server 的設定與命令，不啟動 tmux
   -h, --help   顯示這份說明
 EOF
@@ -53,6 +54,18 @@ while (( $# > 0 )); do
             ;;
         --dry-run)
             LAUNCHER_ARGS+=("--dry-run")
+            shift
+            ;;
+        --profile)
+            if (( $# < 2 )); then
+                echo "ERROR: --profile 需要一個名稱或絕對 JSON 路徑" >&2
+                exit 1
+            fi
+            LAUNCHER_ARGS+=("--profile" "$2")
+            shift 2
+            ;;
+        --profile=*)
+            LAUNCHER_ARGS+=("--profile" "${1#*=}")
             shift
             ;;
         -h|--help)
@@ -170,6 +183,7 @@ fi
 # 用 UUID 綁定可避免 PCI enumeration 順序改變後選到不同實體卡。三個 role
 # override 也一併覆寫，避免呼叫端殘留的 EMBED_GPU 等變數繞過本次選擇。
 export CUDA_VISIBLE_DEVICES="$SELECTED_CUDA_DEVICE"
+export AUX_GPU="$SELECTED_CUDA_DEVICE"
 export EMBED_GPU="$SELECTED_CUDA_DEVICE"
 export RERANK_GPU="$SELECTED_CUDA_DEVICE"
 export VL_GPU="$SELECTED_CUDA_DEVICE"

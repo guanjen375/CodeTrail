@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Resolve CodeTrail's explicit main llama.cpp model for the aicode wrapper.
 
 Priority:
   1. AICODE_MODEL
   2. CLI -m/--model
-  3. OPENCODE_CONFIG, then ~/.config/opencode/opencode.json
+  3. deployment profile / local override main.model
+  4. OPENCODE_CONFIG, then ~/.config/opencode/opencode.json
 
 Env and CLI may both be present only when they resolve to the same bare model
 name (or GGUF path). If env is used without CLI, opencode.json must also match
@@ -15,8 +15,8 @@ when present, because OpenCode will still read opencode.json for the TUI model.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 from model_resolution import (  # noqa: E402
     normalize_main_model,
     parse_cli_model_arg_detail,
+    resolve_main_model_from_env,
     resolve_opencode_main_model,
 )
 
@@ -36,7 +37,8 @@ def _fail(msg: str) -> int:
         "         請先下載一顆 GGUF 並啟動 llama-server, 然後任選一種方式設定:\n"
         "           1) export AICODE_MODEL=<MODEL>\n"
         "           2) aicode -m <MODEL>\n"
-        "           3) OPENCODE_CONFIG / ~/.config/opencode/opencode.json 設\n"
+        "           3) deployment profile / ~/.config/codetrail/deployment.json 設 main.model\n"
+        "           4) OPENCODE_CONFIG / ~/.config/opencode/opencode.json 設\n"
         '                \"model\": \"<MODEL>\"\n'
         "         <MODEL> 可以是:\n"
         "           - registry 裡登記的 bare name (例如 \"qwen3-coder-30b\")\n"
@@ -106,17 +108,28 @@ def main(argv: list[str] | None = None) -> int:
         print(cli_res.model, flush=True)
         return 0
 
-    oc_res = resolve_opencode_main_model(os.environ)
-    if oc_res.error:
-        where = f" ({oc_res.path})" if oc_res.path else ""
-        return _fail(f"{oc_res.source}{where}: {oc_res.error}")
-    if oc_res.model:
-        print(oc_res.model, flush=True)
+    fallback = resolve_main_model_from_env(os.environ)
+    if fallback.error:
+        where = f" ({fallback.path})" if fallback.path else ""
+        return _fail(f"{fallback.source}{where}: {fallback.error}")
+    if fallback.model:
+        if fallback.source.startswith("deployment profile"):
+            oc_res = resolve_opencode_main_model(os.environ)
+            if oc_res.error:
+                where = f" ({oc_res.path})" if oc_res.path else ""
+                return _fail(f"{oc_res.source}{where}: {oc_res.error}")
+            if oc_res.model and oc_res.model != fallback.model:
+                return _fail(
+                    "deployment profile and opencode.json point to different models: "
+                    f"{fallback.model!r} != {oc_res.model!r}. Update opencode.json or pass "
+                    "-m/--model explicitly."
+                )
+        print(fallback.model, flush=True)
         return 0
 
     return _fail(
-        "主模型未設定: AICODE_MODEL 未設、CLI 未帶 -m、"
-        "OPENCODE_CONFIG / opencode.json 也沒有有效 model。"
+        "主模型未設定: AICODE_MODEL 未設、CLI 未帶 -m、deployment profile/local override "
+        "沒有 main.model，OPENCODE_CONFIG / opencode.json 也沒有有效 model。"
     )
 
 

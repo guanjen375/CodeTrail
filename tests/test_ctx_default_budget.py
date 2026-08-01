@@ -8,8 +8,6 @@
 """
 from __future__ import annotations
 
-import pytest
-
 import config
 import context_budget
 import utils

@@ -164,8 +164,36 @@ if [ -z "$PYBIN" ]; then
   exit 2
 fi
 
-# 主模型解析:env > -m/--model arg > OPENCODE_CONFIG / ~/.config/opencode/opencode.json。
-# 三個都找不到、是 placeholder、或被指到外部 provider (openai/、ollama/ 等) 時,
+# Resolve the same deployment profile used by launchers, doctor, status, and
+# preflight.  NUL-delimited KEY=VALUE records are imported one-by-one; profile
+# JSON is never sourced or eval'd as shell code.  Main model stays excluded
+# here because the existing -m/--model resolver below owns CLI precedence.
+if [ -f "$CODETRAIL_HOME/deployment_profile.py" ]; then
+  if ! "$PYBIN" "$CODETRAIL_HOME/deployment_profile.py" validate >/dev/null; then
+    echo "[aicode] deployment profile validation refused to start." >&2
+    exit 2
+  fi
+  PROFILE_ENV=()
+  mapfile -d '' -t PROFILE_ENV < <(
+    "$PYBIN" "$CODETRAIL_HOME/deployment_profile.py" env --null
+  )
+  for assignment in "${PROFILE_ENV[@]}"; do
+    case "${assignment%%=*}" in
+      AICODE_LLAMA_BASE_URL|AICODE_LLAMA_EMBED_BASE_URL|AICODE_LLAMA_RERANK_BASE_URL|AICODE_LLAMA_VL_BASE_URL|AICODE_EMBED_MODEL|AICODE_RERANK_MODEL|AICODE_VL_MODEL|AICODE_VL_MMPROJ|AICODE_EFFECTIVE_PROFILE)
+        export "$assignment"
+        ;;
+      *)
+        echo "[aicode] deployment profile emitted an unsupported environment key." >&2
+        exit 2
+        ;;
+    esac
+  done
+  echo "[aicode] deployment profile=${AICODE_EFFECTIVE_PROFILE:-defaults}"
+fi
+
+# 主模型解析:env > -m/--model arg > deployment profile/local override >
+# OPENCODE_CONFIG / ~/.config/opencode/opencode.json。全部找不到、是 placeholder、
+# 或被指到外部 provider (openai/、ollama/ 等) 時,
 # resolve_main_model.py 會印 fail-loud 訊息到 stderr 並 exit 2。CodeTrail 不內建 /
 # 不 fallback 任何預設主模型 — 使用者必須先下載一顆 GGUF 並啟動 llama-server。
 if ! RESOLVED_MAIN_MODEL="$("$PYBIN" "$CODETRAIL_HOME/scripts/resolve_main_model.py" "$@")"; then

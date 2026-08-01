@@ -103,6 +103,7 @@ def test_native_completion_min_p_is_opt_in(monkeypatch):
 # ------------------------------------------------------------
 def test_config_chat_sampling_defaults(monkeypatch):
     import importlib
+
     import config
 
     for key in ("AICODE_CHAT_TOP_P", "AICODE_CHAT_TOP_K", "AICODE_CHAT_MIN_P"):
@@ -119,6 +120,7 @@ def test_config_chat_sampling_defaults(monkeypatch):
 
 def test_config_chat_sampling_env_override(monkeypatch):
     import importlib
+
     import config
 
     monkeypatch.setenv("AICODE_CHAT_TOP_K", "40")

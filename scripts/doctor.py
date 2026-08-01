@@ -6,6 +6,7 @@
 
 使用：
     AICODE_MODEL=<MODEL> python scripts/doctor.py                       # 全檢
+    AICODE_MODEL=<MODEL> python scripts/doctor.py --profile maintainer-target
     AICODE_MODEL=<MODEL> python scripts/doctor.py --project /path/proj  # 把 /path/proj 當 AICODE_ROOT 檢查
     AICODE_MODEL=<MODEL> python scripts/doctor.py --no-network          # 跳過 llama-server 線上檢查（CI 用）
 
@@ -30,13 +31,23 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import opencode_context  # noqa: E402
+from deployment_profile import (  # noqa: E402
+    ProfileError,
+    load_effective_profile,
+    resolve_model_reference,
+)
+from deployment_status import (  # noqa: E402
+    inspect_deployment,
+    query_gpu_inventory,
+    query_gpu_processes,
+)
 from model_resolution import (  # noqa: E402
     load_first_opencode_config,
     opencode_config_candidates,
     resolve_main_model_from_env,
     resolve_opencode_main_model,
 )
-import opencode_context  # noqa: E402
 
 OK = "[PASS]"
 WARN = "[WARN]"
@@ -290,6 +301,89 @@ def check_models(r: Result, server_status: dict[str, dict]) -> None:
             continue
         loaded = Path(str(props.get("model_path") or "")).name or "(unknown)"
         r.info(f"{role} server loaded: {loaded}")
+
+
+def check_deployment_profile(
+    r: Result,
+    *,
+    no_network: bool,
+    server_status: dict[str, dict],
+) -> None:
+    """Validate the effective profile and, online, its model/GPU placement."""
+    try:
+        profile = load_effective_profile(os.environ)
+    except ProfileError as exc:
+        r.fail(f"deployment profile invalid: {exc}")
+        return
+
+    r.ok(
+        f"deployment profile={profile.selected_profile} "
+        f"verification={profile.verification} hardware={profile.hardware}"
+    )
+    if profile.verification != "verified":
+        r.warn(f"deployment profile {profile.selected_profile} 尚未標記為 verified")
+    for role in ("main", "embedding", "reranker", "vl"):
+        service = profile.service(role)
+        r.info(
+            f"profile [{role}] port={service.port} gpu_role={service.gpu_role} "
+            f"gpu={service.gpu or '(unset)'} model={service.model or '(unset)'} "
+            f"ctx={service.ctx} batch={service.batch} ubatch={service.ubatch}"
+        )
+    if no_network:
+        r.info("deployment PID/GPU/model runtime validation skipped (--no-network)")
+        return
+
+    # Compare loaded artifacts even if nvidia-smi is unavailable.
+    for role in ("main", "embedding", "reranker", "vl"):
+        service = profile.service(role)
+        srv = server_status.get(role) or (server_status.get("VL") if role == "vl" else None)
+        props = srv.get("props") if isinstance(srv, dict) else None
+        loaded = str(props.get("model_path") or "") if isinstance(props, dict) else ""
+        if not loaded:
+            continue
+        try:
+            expected = resolve_model_reference(service.model, os.environ)
+        except ProfileError as exc:
+            r.fail(f"profile [{role}] expected model cannot be resolved: {exc}")
+            continue
+        if Path(expected).name.lower() != Path(loaded).name.lower():
+            r.fail(
+                f"profile [{role}] wrong model: expected={Path(expected).name} "
+                f"loaded={Path(loaded).name}"
+            )
+
+    gpu_processes, gpu_error = query_gpu_processes()
+    if gpu_error:
+        r.warn(f"deployment GPU placement unavailable: nvidia-smi: {gpu_error}")
+        return
+
+    def server_reader(service):
+        srv = server_status.get(service.role) or (
+            server_status.get("VL") if service.role == "vl" else None
+        )
+        if not isinstance(srv, dict):
+            return None, None
+        return srv.get("health"), srv.get("props")
+
+    inspection = inspect_deployment(
+        profile,
+        gpu_processes,
+        environ=os.environ,
+        server_reader=server_reader,
+        gpu_inventory=query_gpu_inventory(),
+    )
+    for role in ("main", "embedding", "reranker", "vl"):
+        observation = inspection.observations[role]
+        r.info(
+            f"runtime [{role}] PID={observation.pid or '-'} "
+            f"GPU={','.join(observation.gpu_uuids) or 'unknown'} "
+            f"model={Path(observation.model).name if observation.model else 'unknown'} "
+            f"n_ctx={observation.n_ctx or 'unknown'} health={observation.health}"
+        )
+    for warning in inspection.warnings:
+        r.warn(f"deployment: {warning}")
+    for issue in inspection.issues:
+        r.fail(f"deployment: {issue}")
 
 
 def _npm_global_package_status(package: str) -> tuple[bool | None, str]:
@@ -728,9 +822,13 @@ def main(argv: list[str] | None = None) -> int:
         description="CodeTrail preflight check — 安裝 / 啟動前自檢",
     )
     parser.add_argument("--project", help="把這個目錄當作 AICODE_ROOT 來檢查")
+    parser.add_argument("--profile", help="選用 deployment profile 名稱或絕對 JSON 路徑")
     parser.add_argument("--no-network", action="store_true",
                         help="跳過 llama-server / 模型線上檢查（CI 用）")
     args = parser.parse_args(argv)
+
+    if args.profile:
+        os.environ["AICODE_PROFILE"] = args.profile
 
     print("=== CodeTrail doctor ===")
     r = Result()
@@ -745,6 +843,9 @@ def main(argv: list[str] | None = None) -> int:
     print("\n-- llama-server / 模型 --")
     server_status = check_llama_servers(r, no_network=args.no_network)
     check_models(r, server_status)
+
+    print("\n-- deployment profile / placement --")
+    check_deployment_profile(r, no_network=args.no_network, server_status=server_status)
 
     print("\n-- RAG rerank policy --")
     check_rerank_policy(r, no_network=args.no_network, server_status=server_status)

@@ -7,7 +7,6 @@ overlap 應為純前綴，不得截斷當前 chunk 的正文。
 """
 from __future__ import annotations
 
-import RAG
 from RAG import split_by_semantic_with_sections
 
 

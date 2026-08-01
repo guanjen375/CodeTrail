@@ -4,9 +4,9 @@
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from types import SimpleNamespace
-import sys
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -35,8 +35,8 @@ class CapturingChatCompletions:
 
 
 def test_utils_call_llm_uses_require_main_model(monkeypatch):
-    import utils
     import llama_client
+    import utils
 
     fake = CapturingNativeCompletion({"content": "ok"})
     usage = SimpleNamespace(error_type=None)

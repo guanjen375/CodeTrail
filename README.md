@@ -11,6 +11,55 @@ CodeTrail 目前定位是**成熟私有部署版**:適合本機、離線、NDA /
 
 底層推理引擎使用 [llama.cpp](https://github.com/ggerganov/llama.cpp) `llama-server`(自己 build,需要 CUDA)。所有 CodeTrail internal LLM / embedding / reranker / VL 走它的 HTTP API。Codex CLI frontend model 可以另外使用你自己的 Codex / OpenAI / ChatGPT / local provider 設定。
 
+## Quick Start：deployment profile
+
+四個 server 現在共用同一份嚴格 deployment profile。維護者目標機是 H200＋448GB
+RAM 只跑 main，專用 RTX 2000 Ada 跑 embedding、reranker、VL；這條配置目前是
+`maintainer-target`，**尚未實機驗證，不是 verified profile**。profile 不含 GPU UUID、
+私人路徑，也不替 H200 猜主模型、threads 或 `n-cpu-moe`。
+
+先在 `~/.config/codetrail/models.json` 登記 profile 顯示的 model/mmproj key，或把
+對應 env 設為 GGUF 絕對路徑。主模型一定要明確給 `AICODE_MODEL`：
+
+```bash
+cd <CODETRAIL_REPO>
+export AICODE_PROFILE=maintainer-target
+export AICODE_MODEL=<CODE_MODEL>
+export MAIN_GPU=<H200_GPU_UUID_OR_INDEX>
+export AUX_GPU=<RTX_2000_ADA_GPU_UUID_OR_INDEX>
+
+# 先看最終參數；不啟動、不連網
+./scripts/start-all.sh --dry-run
+
+# 啟動四個 tmux server，並嚴格驗證 role / GPU / model / ctx / health
+./scripts/start-all.sh
+./scripts/check-status.sh --strict
+AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
+```
+
+再到要分析的 repo 執行 `aicode`。`aicode`、doctor、啟動前 preflight、status 與所有
+launcher 都會重新讀同一個有效 profile；設定不只存在於 `start-all.sh` 的暫時 env。
+
+`~/.config/codetrail/deployment.json` 可持久選 profile 並做局部覆寫：
+
+```json
+{
+  "schema_version": 1,
+  "profile": "maintainer-target",
+  "services": {
+    "main": { "model": "<CODE_MODEL>" }
+  }
+}
+```
+
+優先序固定為 launcher CLI / env > local override > 選用 profile > 安全相容預設。
+JSON schema 是封閉 allowlist；不接受 `extra_args`，也不會 `source` / `eval` JSON。
+既有 `start-rag-servers.sh`、`start-rag-servers-mgpu.sh` 與舊 env 名稱仍可使用。
+
+另一個明確選用的 `verified-reference` 保存 RTX 5090＋170GB RAM＋Qwen3-235B 的
+既有實測參數與 benchmark；完整內容移至
+[docs/verified-reference-5090.md](docs/verified-reference-5090.md)。它不是全域預設。
+
 ## 0. OpenCode TUI 部署路線圖
 
 如果你的目標只是把 **OpenCode TUI** 布置起來,先照這條走。Codex CLI 與 web 模式都可以先跳過,等 TUI 穩了再看。
@@ -48,10 +97,6 @@ README 的命令範例以 Ubuntu / Debian shell 為主。`aicode` 是 bash wrapp
 > 8. **首次 MoE 對話首字會慢(可能 1–2 分鐘),別按 Esc** —— 它在 page-in expert weights,不是當掉;slot / GPU 在動就是正常。
 > 9. **NDA / 衍生資料不要 commit**:`knowledge.json`、`*.jsonl`、`.codetrail/`、`data/`、`.aicode_uploads/` 等已在 `.gitignore`,commit 前自己 `git diff` 看一眼。
 > 10. **任一步 FAIL 對應的修法見 [docs/troubleshooting.md](docs/troubleshooting.md)。**
-
----
-
-以下範例用 5090 32GB + 170GB RAM + Qwen3-235B-A22B-Thinking-2507 UD-Q4_K_XL(`--n-cpu-moe N --no-mmap`,N 依 VRAM 調整見 §3.1)。若你硬體 / 模型是正規 pure GPU,將 `--n-cpu-moe` 與 `--no-mmap` 兩行拿掉即可。
 
 ---
 
@@ -121,7 +166,7 @@ pip install pymupdf4llm    # 選用:RAG 從 PDF 建知識庫才用;不做 RAG �
 
 ### 1.4 僅 Blackwell GPU 需要升級 CUDA Toolkit 到 13
 
-Ubuntu 24.04 的 `nvidia-cuda-toolkit` 套件停在 CUDA **12.0**,**不認識 Blackwell 的 `sm_120` / `compute_120a`**。如果你用 RTX 50 系列(5070 / 5080 / 5090 / 6000 Ada Blackwell),build llama.cpp 時會看到:
+Ubuntu 24.04 的 `nvidia-cuda-toolkit` 套件停在 CUDA **12.0**,**不認識 Blackwell 的 `sm_120` / `compute_120a`**。如果你用 RTX 50 系列(5070 / 5080 / 5090)或 RTX PRO 6000 Blackwell,build llama.cpp 時會看到:
 
 ```
 nvcc fatal : Unsupported gpu architecture 'compute_120a'
@@ -211,27 +256,10 @@ python -c "import hf_transfer; print('hf-transfer', hf_transfer.__version__)"
 
 ### 2.2 下載主聊天模型(`<CODE_MODEL>`)
 
-下面用 5090 + 170GB RAM 走廊的 Qwen3-235B-A22B-Thinking-2507 UD-Q4_K_XL 當範例。它在 HuggingFace 上是 **3 個分片檔,約 140GB 級**:
-
-```bash
-mkdir -p ~/models
-
-HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
-  unsloth/Qwen3-235B-A22B-Thinking-2507-GGUF \
-  --include "UD-Q4_K_XL/*" \
-  --local-dir ~/models/Qwen3-235B-A22B-Thinking-2507-GGUF
-```
-
-下完之後會有:
-
-```
-~/models/Qwen3-235B-A22B-Thinking-2507-GGUF/UD-Q4_K_XL/
-  Qwen3-235B-A22B-Thinking-2507-UD-Q4_K_XL-00001-of-00003.gguf
-  Qwen3-235B-A22B-Thinking-2507-UD-Q4_K_XL-00002-of-00003.gguf
-  Qwen3-235B-A22B-Thinking-2507-UD-Q4_K_XL-00003-of-00003.gguf
-```
-
-> 啟動 server 時 `-m` **只指 shard 1**,llama.cpp 會自動讀第 2、3 片。
+H200 目標 profile 刻意不指定 main model。請依工作負載選 GGUF，下載後把 shard 1
+的絕對路徑登記為 `<CODE_MODEL>`；多 shard 模型只需把 registry 指向第一片，llama.cpp
+會接續讀取。RTX 5090 reference 的特定模型、量化與下載資訊見
+[docs/verified-reference-5090.md](docs/verified-reference-5090.md)。
 
 ### 2.3 下載 RAG 附屬模型
 
@@ -271,12 +299,12 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 CodeTrail 會把不同角色拆成不同 `llama-server` instance:main / embedding / reranker / VL 都是必要的。會分開是因為 `llama-server` 一次只能載一顆 GGUF,不同角色用不同模型 / 不同模式(`--jinja` / `--embedding --pooling cls` / `--embedding --pooling rank --reranking` / `--mmproj`),所以必須開不同 process。`aicode` / `aicodex` / `mcp_server.py` 都會硬性檢查三顆副模型已 ready。
 
-| Port | 角色 | 模型 | 必要 |
+| 預設 port | 角色 | 模型來源 | 必要 |
 |---|---|---|---|
-| 8080 | main(聊天、推理、工具呼叫) | `<CODE_MODEL>` | 是 |
-| 8081 | embedding(算向量,RAG 搜相似段落) | `bge-m3` | 是 |
-| 8082 | reranker(RAG 結果重排) | `qwen3-reranker-0.6b` | 是 |
-| 8083 | VL(看截圖 / 圖片) | `qwen3.5-9b` 等 | 是 |
+| 8080 | main(聊天、推理、工具呼叫) | `AICODE_MODEL` / registry | 是 |
+| 8081 | embedding(算向量,RAG 搜相似段落) | profile `embedding.model` | 是 |
+| 8082 | reranker(RAG 結果重排) | profile `reranker.model` | 是 |
+| 8083 | VL(看截圖 / 圖片) | profile `vl.model` + `mmproj` | 是 |
 
 下面用 main + 三顆附屬 server 示範。主 server 自己一個 tmux session;embedding / reranker / VL 由 §3.2 script 合在同一個 tmux session 內。流程都一樣:啟動 → 等 `server is listening on ...` / `/health status=ok` → 按 `Ctrl-b d` 退出來放背景。terminal 之後關掉也不會死。
 
@@ -287,93 +315,66 @@ CodeTrail 會把不同角色拆成不同 `llama-server` instance:main / embeddin
 > - `tmux kill-session -t <名字>` —— 關掉某個 session
 > - bonus:`Ctrl-b n` —— 同 session 內切換 window(§3.2 的 RAG session 內含 embed / rerank / vl 三個 window)
 
-### 3.1 Session 1 — 主 server(:8080)
+### 3.1 四個 role 共用的 profile
 
-從你的一般 shell 起 session:
+`deployment_profiles/defaults.json` 是向下相容的安全基底；硬體 profile 必須明確
+選用，不會自動套上：
 
-```bash
-tmux new -s codetrail-main
-```
+- `maintainer-target`：H200＋448GB RAM 跑 main，RTX 2000 Ada 跑三個 aux；
+  `verification=unverified`。main model 必須由 `AICODE_MODEL` 或 registry 指定，
+  目前不設定 H200 專屬 threads / `n-cpu-moe`，也不宣稱效能。
+- `verified-reference`：RTX 5090＋170GB RAM 的既有實測設定；完整 tuning 與 benchmark
+  在 [docs/verified-reference-5090.md](docs/verified-reference-5090.md)。
 
-進去之後(prompt 下方會出現綠色 tmux 狀態列)貼下面這條,5090 + 170GB RAM + Qwen3-235B-A22B-Thinking-2507 UD-Q4_K_XL 實測範例:
-
-```bash
-~/llama.cpp/build/bin/llama-server \
-  -m ~/models/Qwen3-235B-A22B-Thinking-2507-GGUF/UD-Q4_K_XL/Qwen3-235B-A22B-Thinking-2507-UD-Q4_K_XL-00001-of-00003.gguf \
-  --host 0.0.0.0 --port 8080 \
-  -c 65536 -ngl 99 --jinja \
-  --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.0 \
-  --cache-type-k q8_0 --cache-type-v q8_0 \
-  --n-cpu-moe 90 \
-  -fa on \
-  -b 2048 -ub 512 \
-  -t 12 \
-  --no-mmap
-```
-
-旗標說明:
-
-- `-m ...-00001-of-00003.gguf` —— 只指 shard 1,llama.cpp 自動接後續
-- `-c 65536` —— context 上限 64K token(模型原生 256K,KV cache 會吃 VRAM,先從 64K 起)。這個 `-c` 是 ctx 上限的唯一真值:CodeTrail 端會自動跟隨它,opencode.json 的 `limit.context` 也要設成同一個數字
-- `-ngl 99` —— 嘗試把所有層放 GPU(MoE expert 之後會被 `--n-cpu-moe` 拉回 CPU)
-- `--jinja` —— 啟用模型內建 chat template,tool calling 才會走對格式
-- `--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0` —— **Qwen3-235B-A22B-Thinking-2507 官方建議取樣值**。llama-server 不帶這些旗標時的內建預設是 `temp 0.8 / top_k 40 / min_p 0.05`,溫度偏高會讓模型更容易「自由發揮」杜撰不存在的具體事實(條號 / 日期 / 數字)。**這條同時也是 OpenCode TUI 純聊天路徑的取樣來源** —— OpenCode 的 openai-compatible provider 無法可靠地逐次帶取樣參數(`temperature` 有已知 bug 會被丟掉,`top_k` / `min_p` 不在它的 schema 裡),所以唯一可靠的釘法就是這裡的 server 啟動旗標。**改了要重啟 server 才生效**。詳見 [docs/troubleshooting.md](docs/troubleshooting.md)
-- `--presence-penalty 1.0` —— Unsloth 對此模型的建議值,壓重複輸出;若看到中英文混雜可調回 `0`
-- `--cache-type-k/v q8_0` —— KV cache 量化到 8-bit,64K ctx 約省一半 VRAM
-- `--n-cpu-moe 90` —— **MoE 模型才加**;Qwen3-235B 共 94 層,**前 90 層 expert 卸到 CPU RAM、剩 4 層留在 GPU**。這是 5090 同卡掛 main + embedding + reranker + VL 的實測值;若只跑 main 或把附屬模型放另一張卡,可再把 N 調小換速度。**N 數字依你 VRAM 調整,見下方表格**
-- `-fa on` —— 啟用 flash attention,省 KV cache VRAM、加速 attention 計算。dense / MoE 都適用
-- `-b 2048 -ub 512` —— 加大 prompt processing 的 batch / micro-batch,PP 速度提升 ~30%(code session 實測 prompt eval / ingest 約 74-80 tok/s;這不是輸出生成速度)。代價是啟動時略多 compute buffer
-- `-t 12` —— 用 12 條執行緒。9950X 是 16 核 2-CCD,跨 CCD 通訊延遲高,12 是甜蜜點(比 `-t 16` 快 ~10%)。**依你 CPU 調整,見下方說明**
-- `--no-mmap` —— **強烈建議搭 `--n-cpu-moe` 一起加**;不加的話用 mmap 懶載入,第一次推理 TTFT 可能 1–2 分鐘(每次觸到新 expert 都要從 SSD page-in);加了之後啟動時把 weights 全讀進 RAM,啟動慢 1–2 分鐘但之後對話穩定
-
-非 MoE 模型(dense 30B / 14B / 7B)**不要加** `--n-cpu-moe` 與 `--no-mmap`,直接拿掉那兩行即可。`-fa on` / `-b 2048 -ub 512` / `-t N` 對 dense 模型一樣有效,可以保留。
-
-#### `--n-cpu-moe N` 與 `-t N` 調整(其他硬體配置)
-
-**`--n-cpu-moe N`**:每多 1 層 expert 從 CPU 搬到 GPU,**多吃 ~1.4 GB VRAM、TG 提升 ~5~8%**。**留至少 3 GB VRAM 緩衝**給 KV cache 動態成長,否則長對話會 OOM 死掉。
-**啟動完跑 `nvidia-smi` 看主 server VRAM,**留 3 GB 緩衝為目標**:用太少 → 浪費頻寬;用太滿 → 後續對話 KV cache 一脹就 OOM。從上表起手值開始,觀察一兩次對話的 VRAM 高點再 ±2 微調(N 越小越快越吃 VRAM)。
-**`-t N`** 規則:**P-core 物理核數 −2~−4**(避開 hyperthread、避開跨 CCD)。常見組合:
-**不確定甜蜜點可以用 `llama-bench -m <model.gguf> --n-cpu-moe N -t 8,12,16` 實測,挑 TG 數字最大那組。
-**等到下面這行出現才算成功**:
-
-```
-srv  llama_server: server is listening on http://0.0.0.0:8080
-```
-
-### 3.2 附屬 server — embedding + reranker + VL(一鍵啟動 script)
-
-三顆必要副模型(embedding `bge-m3`、reranker `qwen3-reranker-0.6b`、VL `qwen3.5-9b`)由 script 一次啟動,合在同一個 tmux session `codetrail-rag` 的三個 window 內,使用者只需要管理一個 session。script 會從 `AICODE_LLAMA_EMBED_BASE_URL` / `AICODE_LLAMA_RERANK_BASE_URL` / `AICODE_LLAMA_VL_BASE_URL` 解析 host:port(預設 `http://localhost:8081` / `http://localhost:8082` / `http://localhost:8083`),啟動後輪詢 `/health` JSON,直到 `status == "ok"` 才算成功;`status="loading model"` 不算 ready。
+有效設定的合併順序是 CLI/env > `~/.config/codetrail/deployment.json` > profile >
+安全預設。可離線查看合併結果與解析後路徑：
 
 ```bash
-chmod +x scripts/start-rag-servers.sh    # 第一次跑要加 exec bit
+AICODE_PROFILE=maintainer-target \
+AICODE_MODEL=<CODE_MODEL> \
+MAIN_GPU=<H200_GPU> AUX_GPU=<RTX_2000_ADA_GPU> \
+python deployment_profile.py show
+```
+
+所有 service 都有同級 `model`、`port`、`base_url`、`gpu_role`、`ctx`、`batch`、
+`ubatch`、`parameters`；VL 另外有 `mmproj`。模型欄只接受 registry key 或 GGUF
+絕對路徑，參數只接受 schema allowlist，沒有 raw shell `extra_args`。
+
+### 3.2 啟動／停止
+
+目標雙 GPU 配置只需設定一次 shared placement：`MAIN_GPU` 綁 main，`AUX_GPU` 同時
+綁三個附屬 role；`EMBED_GPU` / `RERANK_GPU` / `VL_GPU` 若有設定，會以更高優先級
+覆寫個別 aux。
+
+```bash
+export AICODE_PROFILE=maintainer-target
+export AICODE_MODEL=<CODE_MODEL>
+export MAIN_GPU=<H200_GPU_UUID_OR_INDEX>
+export AUX_GPU=<RTX_2000_ADA_GPU_UUID_OR_INDEX>
+
+./scripts/start-all.sh --dry-run
+./scripts/start-all.sh
+```
+
+也可分開啟動 main 與 aux：
+
+```bash
+./scripts/start-main-server.sh
 ./scripts/start-rag-servers.sh
 ```
 
-常用覆寫:
+舊 launcher 與 env 完整保留。`start-rag-servers-mgpu.sh --gpu 1` 仍會掃 GPU 後讓三個
+aux 共用選定卡；`EMBED_MODEL` / `RERANK_MODEL` / `VL_GGUF` / `VL_MMPROJ`、
+`MODELS_DIR`、`LLAMA_BIN`、三個 `AICODE_LLAMA_*_BASE_URL` 也仍是高優先級覆寫。
+新的通用 env 則可用 `MAIN_CTX` / `MAIN_BATCH` / `MAIN_UBATCH` 與各 role 對應名稱。
+
+要停止：
 
 ```bash
-# port / host 與 client 端 config 共用同一組 env
-AICODE_LLAMA_EMBED_BASE_URL=http://localhost:18081 \
-AICODE_LLAMA_RERANK_BASE_URL=http://localhost:18082 \
-AICODE_LLAMA_VL_BASE_URL=http://localhost:18083 \
-RAG_HEALTH_TIMEOUT=120 \
-./scripts/start-rag-servers.sh
-
-# GPU placement:未設定時沿用 CUDA_VISIBLE_DEVICES;單顆可用 EMBED_GPU / RERANK_GPU / VL_GPU 覆寫
-CUDA_VISIBLE_DEVICES=0 ./scripts/start-rag-servers.sh
-EMBED_GPU=0 RERANK_GPU=1 VL_GPU=1 ./scripts/start-rag-servers.sh
-
-# 多 GPU 主機可先掃描 GPU 並互動選一顆，三個附屬 server 都會綁到該卡
-./scripts/start-rag-servers-mgpu.sh
-
-# 無互動環境可直接指定 nvidia-smi 顯示的 GPU index
-./scripts/start-rag-servers-mgpu.sh --gpu 1
+./scripts/stop-all.sh
+# 或只停三個 aux，保留舊命令
+./scripts/stop-rag-servers.sh
 ```
-
-`start-rag-servers-mgpu.sh` 會用 `nvidia-smi` 顯示每張卡的 index、型號、總 VRAM、
-可用 VRAM 與 UUID，再詢問要使用哪一張。選定後會以 GPU UUID 綁定 embedding、
-reranker、VL，接著沿用原 launcher 的模型檢查、port 檢查、tmux 與 health check。
-先預覽而不啟動可加 `--dry-run`。
 
 `AICODE_RERANK_FALLBACK_POLICY` 只控制啟動後 reranker 呼叫失敗時的行為;啟動前 preflight 仍要求 reranker server ready。
 
@@ -385,32 +386,9 @@ reranker、VL，接著沿用原 launcher 的模型檢查、port 檢查、tmux �
 
 預設是 `error`:專用 reranker 不可用或呼叫失敗就直接報錯。`main_model` 可能很貴:嚴格模式下每條符合條件的 RAG query 都可能觸發主模型 rerank。只有你明確接受這個成本時才設定 `AICODE_RERANK_FALLBACK_POLICY=main_model`。
 
-預期輸出:
-
-```
-[+] 啟動 embedding server (http://localhost:8081) 於 tmux codetrail-rag:embed
-[+] embedding health OK: http://localhost:8081/health status=ok
-[+] 啟動 reranker server  (http://localhost:8082) 於 tmux codetrail-rag:rerank
-[+] reranker health OK: http://localhost:8082/health status=ok
-[+] 啟動 VL server        (http://localhost:8083) 於 tmux codetrail-rag:vl
-[+] VL health OK: http://localhost:8083/health status=ok
-
-Aux model servers ready。驗證:
-  curl -s http://localhost:8081/health
-  curl -s http://localhost:8082/health
-  curl -s http://localhost:8083/health
-...
-```
-
-一次關掉三顆 server:
-
-```bash
-./scripts/stop-rag-servers.sh
-```
-
-(平常不用看 log,真要偵錯才 `tmux a -t codetrail-rag`,session 內 `Ctrl-b n` 切 embed/rerank/vl window,`Ctrl-b d` 退出。)
-
-**模型路徑非預設**:script 先找 `~/models/bge-m3/bge-m3-f16.gguf`、`~/models/qwen3-reranker-0.6b/qwen3-reranker-0.6b-q8_0.gguf`、`~/models/qwen3.5-9b/Qwen3.5-9B-Q6_K.gguf` 與 `~/models/qwen3.5-9b/mmproj-F16.gguf`;找不到時會在對應目錄 glob。若放別處,啟動前 `export MODELS_DIR=/your/path`;若要指定完整檔案,用 `EMBED_MODEL=/path/to/bge-m3*.gguf`、`RERANK_MODEL=/path/to/qwen3-reranker*.gguf`、`VL_GGUF=/path/to/Qwen3.5*.gguf`、`VL_MMPROJ=/path/to/mmproj*.gguf`。llama-server 不在 `~/llama.cpp/...` 也類似:`export LLAMA_BIN=/your/llama-server`。
+launcher 在建立 tmux 前會驗證 profile、模型/mmproj 檔案、session 與 port；每個 server
+只有 `/health` 回 `status=ok` 才算 ready。log 仍在 `codetrail-main` 與
+`codetrail-rag` tmux sessions。
 
 ### 3.3 驗活與維運
 
@@ -433,29 +411,23 @@ process：
 ./scripts/check-status.sh --strict
 ```
 
-`check-status.sh` 透過 `nvidia-smi` 列出所有 GPU 上的 PID、GPU UUID 與 VRAM，
-並計算不同的 `llama-server` PID；同一個 PID 使用多張 GPU 時只算一個。預設是
-人工查看模式，即使不足四個仍 exit 0，避免啟用 `set -e` 的 SSH shell 被一起退出；
-`--strict` 才會在數量不足時 exit 1。`nvidia-smi` 無法判斷各 PID 對應哪個角色或
-port，因此這項檢查確認的是「至少四個 GPU process」，不是 API health。
+`check-status.sh` 會把 `nvidia-smi` PID 與 `/proc/<PID>/cmdline` 的 `--port` 對上有效
+profile，逐 role 顯示 PID、GPU UUID、model、`n_ctx`、health。預設 report-only，即使
+異常仍 exit 0；`--strict` 遇到缺 service、錯 GPU、錯 model、錯 ctx 或 unhealthy
+就失敗。舊環境讀不到 cmdline 時仍保留 PID-count 報告，但 strict 不會把未知 PID
+誤當成四個正確 role。
 
 之後要關掉全部:
 
 ```bash
-tmux kill-session -t codetrail-main    # 砍主 server
-./scripts/stop-rag-servers.sh          # 砍 embed + rerank + vl
+./scripts/stop-all.sh
 ```
 
 偵錯時要看 server log(平常不用):`tmux a -t codetrail-main` 或 `tmux a -t codetrail-rag`(rag 內按 `Ctrl-b n` 切 embed/rerank/vl window,看完 `Ctrl-b d` 退出)。
 
-VRAM 與 RAM 實測占用(2026-06-11,5090 + 170GB RAM + 235B Thinking `--n-cpu-moe 90 --no-mmap`,同卡跑 main + embedding + reranker + VL):
-
-```
-VRAM  28083 MiB / 32607 MiB (main 17830 + VL 7952 + embed 1148 + rerank 896)
-RAM   122 GiB used / 170 GiB total,48 GiB available,swap 幾乎未用
-```
-
-速度以 code tmux session 的 llama-server log 為準:prompt eval / ingest(吃輸入 prompt,不是輸出)約 74-80 tok/s;output decode / generation(實際吐字)單請求約 7.37 tok/s;兩個主模型請求重疊時,其中一個長任務落在約 4.95 tok/s,另一個小任務約 2.20 tok/s。這次主 server 未顯式加 `--parallel`;llama-server log 顯示 auto `n_parallel=4`。
+RTX 5090 reference 的 VRAM/RAM、prompt processing、decode 與 concurrency 實測數字
+統一放在 [docs/verified-reference-5090.md](docs/verified-reference-5090.md)，避免被誤套到
+尚未量測的 H200＋RTX 2000 Ada 目標機。
 
 ---
 
@@ -469,22 +441,19 @@ RAM   122 GiB used / 170 GiB total,48 GiB available,swap 幾乎未用
 mkdir -p ~/.config/codetrail
 cat > ~/.config/codetrail/models.json <<'EOF'
 {
-  "<CODE_MODEL>": "~/models/<CODE_MODEL_GGUF_RELATIVE_PATH>.gguf",
-  "bge-m3": "~/models/bge-m3/bge-m3-f16.gguf",
-  "qwen3-reranker-0.6b": "~/models/qwen3-reranker-0.6b/qwen3-reranker-0.6b-q8_0.gguf"
+  "<CODE_MODEL>": "/absolute/path/to/main.gguf",
+  "<PROFILE_EMBED_MODEL_KEY>": "/absolute/path/to/embedding.gguf",
+  "<PROFILE_RERANK_MODEL_KEY>": "/absolute/path/to/reranker.gguf",
+  "<PROFILE_VL_MODEL_KEY>": "/absolute/path/to/vl.gguf",
+  "<PROFILE_VL_MMPROJ_KEY>": "/absolute/path/to/mmproj.gguf"
 }
 EOF
 ```
 
-用 5090 走廊的 235B 為例,實際內容會像:
-
-```json
-{
-  "qwen3-235b-a22b-thinking": "~/models/Qwen3-235B-A22B-Thinking-2507-GGUF/UD-Q4_K_XL/Qwen3-235B-A22B-Thinking-2507-UD-Q4_K_XL-00001-of-00003.gguf",
-  "bge-m3": "~/models/bge-m3/bge-m3-f16.gguf",
-  "qwen3-reranker-0.6b": "~/models/qwen3-reranker-0.6b/qwen3-reranker-0.6b-q8_0.gguf"
-}
-```
+先用 `AICODE_PROFILE=maintainer-target python deployment_profile.py show` 看有效 model/mmproj
+key；artifact 名稱的 source of truth 是 `deployment_profiles/defaults.json` 與選用 profile，
+不再由 config、launcher、README 各維護一份。registry value 也可寫 `~`，loader 會展開
+並要求它解析成絕對 `.gguf` 路徑。
 
 也可以跳過 registry 直接把 `AICODE_MODEL` 設絕對路徑,但 registry 比較好維護。
 
@@ -497,7 +466,7 @@ mkdir -p ~/.config/opencode
 ${EDITOR:-vi} ~/.config/opencode/opencode.json
 ```
 
-把下面整段貼進去,**把所有 `<CODE_MODEL>` 換成你 4.1 裡用的 registry key**(例如 `qwen3-235b-a22b-thinking`):
+把下面整段貼進去,**把所有 `<CODE_MODEL>` 換成你 4.1 裡用的 registry key**:
 
 ```json
 {
@@ -589,7 +558,7 @@ ${EDITOR:-vi} ~/.config/opencode/opencode.json
 - `llamacpp` 是 provider key,可改名(`local`、`llmcpp`、隨意),但要跟 `"model"` 那段的 prefix 對齊。
 - `enabled_providers` 鎖定只啟用本機 provider:設了之後 OpenCode 的 model picker(TUI 與 web)**只會出現你的本機模型**,雲端 provider(OpenCode Zen、Anthropic、OpenAI 等)完全不列出、無法誤選 —— **NDA 場景強烈建議保留**,避免把程式碼送到雲端模型。陣列內字串要跟你的 provider key 一致(這裡是 `llamacpp`)。
 - `apiKey` 任意非空值即可,llama-server 預設不檢查。
-- **取樣參數(temperature / top_p / top_k / min_p)不要寫在這裡指望它生效**。OpenCode 的 openai-compatible provider 對自訂 provider 有已知問題:`temperature` 會被丟掉、不送進 request body([opencode#25755](https://github.com/anomalyco/opencode/issues/25755)),而 `top_k` / `min_p` 根本不在 OpenCode 的 schema 裡。**取樣一律在 §3.1 的 llama-server 啟動旗標釘**(`--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0`);OpenCode 純聊天不帶取樣時就會吃到 server 的正確預設。
+- **取樣參數(temperature / top_p / top_k / min_p)不要寫在這裡指望它生效**。OpenCode 的 openai-compatible provider 對自訂 provider 有已知問題；應在 deployment profile 的 allowlisted `parameters` 內設定，由 server launcher 釘住。特定 5090/Qwen reference 值見 [docs/verified-reference-5090.md](docs/verified-reference-5090.md)，不要套到未知模型。
 - **要壓「模型杜撰不存在的具體事實」(條號 / 日期 / 數字),在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則**(OpenCode 會自動把它載入每一段對話,含純聊天)。範例與原理見 [docs/troubleshooting.md](docs/troubleshooting.md)。注意這個 `~/.config/opencode/AGENTS.md` 是 OpenCode runtime 的全域規則檔,跟本 repo 根目錄那份「給修改 CodeTrail 原始碼的 agent 看的」`AGENTS.md` 是兩回事。
 - `limit.context: 65536` 是 OpenCode 主對話實際塞給 server 的上限。它必須等於 llama-server 啟動時的 `-c <N>`(server 是 ctx 上限的唯一真值);CodeTrail 端的 ctx 上限會自動跟隨 server,所以你只要顧好「`limit.context` == server `-c`」這一個對齊就好。`aicode` 啟動時會檢查,不一致就拒絕啟動。
 - `permission` 區段:`*: deny` 是預設拒絕一切,只白名單 `codetrail_*`(經 CodeTrail 沙箱)。OpenCode 內建工具(`bash` / `read` / `write` 等)會繞過 CodeTrail 沙箱,所以這裡明確 `deny`。
@@ -770,6 +739,8 @@ ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>
 | 文件 | 內容 |
 |---|---|
 | [docs/setup.md](docs/setup.md) | 替代安裝方式、進階配置、換機部署 reference |
+| [docs/deployment-profiles.md](docs/deployment-profiles.md) | profile schema、precedence、GPU override 與 local override |
+| [docs/verified-reference-5090.md](docs/verified-reference-5090.md) | RTX 5090＋170GB RAM 已驗證 tuning / benchmark |
 | [docs/basic-usage.md](docs/basic-usage.md) | TUI 內常用操作:正常對話、夾帶附件、RAG 注入、最小驗收流程 |
 | [docs/rag.md](docs/rag.md) | 讀檔、匯入附件(PDF / 圖片經 VL)、建立知識庫、圖片+RAG 一起用、Code-RAG、查 spec |
 | [docs/mcp-tools.md](docs/mcp-tools.md) | CodeTrail 暴露的 17 個 MCP 工具與使用原則 |

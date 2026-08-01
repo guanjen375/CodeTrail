@@ -1,6 +1,8 @@
 # 替代安裝、進階配置與維運
 
-[README §1–§5](../README.md) 已涵蓋 RTX 5090 / Blackwell + Qwen3-235B 走廊的安裝、下載、啟動 server、設定、進 TUI 完整流程。**這份文件不重複那條走廊**,只補充:
+[README Quick Start](../README.md#quick-startdeployment-profile) 已涵蓋 profile-based
+主流程；RTX 5090 實測另見 [verified-reference-5090.md](verified-reference-5090.md)。
+這份文件只補充:
 
 - README 沒涵蓋的安裝替代路徑(其他 distro、runfile installer、conda env)
 - tmux 以外的 process manager(systemd / screen / nohup + disown)
@@ -53,7 +55,8 @@ README 用 tmux 是因為它**最直觀、最不依賴系統服務**。其他選
 
 ### systemd unit(永久部署)
 
-每個 server 一個 unit。範例 `~/.config/systemd/user/codetrail-main.service`:
+每個 server 一個 unit。不要在 unit 重抄模型與 tuning 旗標；直接讓 profile loader
+`exec` 該 role。範例 `~/.config/systemd/user/codetrail-main.service`:
 
 ```ini
 [Unit]
@@ -62,12 +65,11 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/home/%u/llama.cpp/build/bin/llama-server \
-  -m /home/%u/models/.../shard-00001-of-00003.gguf \
-  --host 0.0.0.0 --port 8080 \
-  -c 65536 -ngl 99 --jinja \
-  --cache-type-k q8_0 --cache-type-v q8_0 \
-  --n-cpu-moe 90 --no-mmap
+Environment=AICODE_PROFILE=maintainer-target
+Environment=AICODE_MODEL=<CODE_MODEL>
+Environment=MAIN_GPU=<MAIN_GPU_UUID_OR_INDEX>
+Environment=AUX_GPU=<AUX_GPU_UUID_OR_INDEX>
+ExecStart=/usr/bin/python3 /absolute/path/to/CodeTrail/deployment_profile.py exec main --llama-bin /absolute/path/to/llama-server
 Restart=on-failure
 RestartSec=10
 
@@ -84,7 +86,8 @@ systemctl --user status codetrail-main
 journalctl --user -u codetrail-main -f    # 看 log
 ```
 
-embedding / reranker / VL 各複製一份,改 ExecStart 即可。
+embedding / reranker / VL 各複製一份，只把 `exec main` 改成對應 role；所有 unit 要用
+同一組 profile/env。systemd 不會展開 `<...>` placeholder，啟用前必須換成實值。
 
 ### screen(類 tmux)
 
@@ -140,17 +143,18 @@ ssh -L 8080:localhost:8080 -L 8081:localhost:8081 -L 8082:localhost:8082 -L 8083
 
 ## `aicode` wrapper 詳細行為
 
-`aicode` 是一個 shell wrapper,啟動 `opencode` 之前做九件事:
+`aicode` 是一個 shell wrapper,啟動 `opencode` 之前做十件事:
 
 1. 把目前目錄設成 `AICODE_ROOT`(沙箱根)
 2. 拒絕 `AICODE_ROOT=/` 或 `AICODE_ROOT=$HOME`(可能誤刪 / 誤改大量檔案)
 3. 在目前 git root 準備 `.opencode/run-codetrail-mcp`,讓 OpenCode config 裡的 MCP command 能找到 CodeTrail server 入口
-4. 用 `scripts/resolve_main_model.py` 解析主模型；若 `AICODE_MODEL` 和 opencode.json 同時存在且沒傳 CLI `-m/--model`,兩者必須指向同一顆
-5. 讀主 llama-server `/props` 拿真實 `n_ctx`,在使用者沒手動設時自動 export 成 `AICODE_DYNAMIC_NUM_CTX_MAX`(`scripts/resolve_server_ctx.py`)—— CodeTrail 的 ctx 上限就此自動跟隨 server。接著 `scripts/ctx_safety_check.py` 當容量閘:requested 只要不超過 server `n_ctx` 就放行,只有「使用者手動把它設得比 server 大」才 `exit 2`(prompt 會被截斷)。server 不可連時 graceful 放行只 warn
-6. 跑 `scripts/opencode_ctx_check.py`,確認 OpenCode active model 的 `limit.context` 等於 server `-c`(= CodeTrail 已自動跟隨的上限)—— 這是唯一要你手動對齊的數字,避免 TUI 32K compact 但 CodeTrail MCP 以為自己有 64K
-7. 跑 `scripts/opencode_mcp_timeout_check.py --fix`,把既有 `mcp.codetrail.timeout` 自動同步到專案要求的最小值；只改這個欄位、原子寫入並備份原設定，失敗就拒絕啟動
-8. 啟動 `opencode`,讓子行程繼承同一個沙箱根目錄
-9. 把使用者傳入的 `-m / --model` 原樣轉發給 OpenCode;沒傳就讓 OpenCode 自己讀 `opencode.json` 的 `"model"` 欄位
+4. 驗證 deployment profile，安全匯入四個 base URL 與 aux model ID；不 `source` / `eval` JSON
+5. 用 `scripts/resolve_main_model.py` 解析主模型；若 `AICODE_MODEL` 和 opencode.json 同時存在且沒傳 CLI `-m/--model`,兩者必須一致
+6. 讀主 llama-server `/props` 取得真實 `n_ctx`，再跑 ctx capacity gate
+7. 確認 OpenCode active model 的 `limit.context` 等於 server `-c`
+8. 安全同步既有 `mcp.codetrail.timeout`
+9. 對三個 aux server 跑 hard preflight
+10. 啟動 `opencode` 並原樣轉發使用者的 `-m / --model`
 
 ---
 
@@ -182,25 +186,15 @@ systemctl --user restart codetrail-main
 tmux:
 
 ```bash
-tmux kill-session -t codetrail-main
-./scripts/stop-rag-servers.sh
+./scripts/stop-all.sh
 ```
 
 systemd:`systemctl --user stop codetrail-{main,embed,rerank,vl}`
 
-通用:
-
-```bash
-pkill -INT -f "llama-server"
-```
-
 ### 看 server 狀態
 
 ```bash
-# 四個 port 都通?
-for p in 8080 8081 8082 8083; do
-  echo ":$p → $(curl -s -o /dev/null -w '%{http_code}' http://localhost:$p/health)"
-done
+./scripts/check-status.sh --strict
 
 # 主 server 載入的是哪顆 GGUF、ctx 多少?
 curl -s http://localhost:8080/props | python -m json.tool | head -20

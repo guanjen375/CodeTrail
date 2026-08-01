@@ -10,8 +10,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from scripts import resolve_main_model as rmm  # noqa: E402
 from model_resolution import normalize_main_model  # noqa: E402
+from scripts import resolve_main_model as rmm  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

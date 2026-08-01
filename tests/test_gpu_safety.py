@@ -5,8 +5,6 @@ CI 跑 --no-network 沒問題。
 """
 from __future__ import annotations
 
-import pytest
-
 import gpu_safety
 from gpu_safety import (
     GPUInfo,

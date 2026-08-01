@@ -4,9 +4,9 @@
 When a CodeTrail chat/frontend session starts, the local main model is only
 useful if the three auxiliary model servers are also available:
 
-  - embedding: bge-m3 on /embedding
-  - reranker: qwen3-reranker-0.6b on /reranking
-  - VL: qwen3.5-9b-compatible server accepting OpenAI image_url content
+  - embedding on /embedding
+  - reranker on /reranking
+  - VL server accepting OpenAI image_url content
 
 This script is intentionally stricter than doctor.py: missing auxiliary
 servers are FAIL, not WARN.
@@ -22,8 +22,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import config  # noqa: E402
 import llama_client  # noqa: E402
+from deployment_profile import load_effective_profile  # noqa: E402
 
 SKIP_ENV = "AICODE_REQUIRED_MODELS_CHECK_SKIP"
 
@@ -51,13 +51,17 @@ def _truthy(value: str | None) -> bool:
 
 
 def required_servers() -> tuple[RequiredServer, ...]:
+    profile = load_effective_profile(os.environ)
+    embedding = profile.service("embedding")
+    reranker = profile.service("reranker")
+    vl = profile.service("vl")
     return (
-        RequiredServer("embedding", config.LLAMA_EMBED_BASE_URL, config.EMBEDDING_MODEL, "/embedding"),
-        RequiredServer("reranker", config.LLAMA_RERANK_BASE_URL, config.RERANKER_MODEL, "/reranking"),
+        RequiredServer("embedding", embedding.base_url, embedding.model or "", "/embedding"),
+        RequiredServer("reranker", reranker.base_url, reranker.model or "", "/reranking"),
         RequiredServer(
             "VL",
-            config.LLAMA_VL_BASE_URL,
-            config.VL_MODEL,
+            vl.base_url,
+            vl.model or "",
             "/v1/chat/completions image_url",
         ),
     )

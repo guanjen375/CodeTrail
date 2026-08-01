@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Shared main-model resolution helpers.
 
 This module intentionally has no dependency on config.py. It is used by
 config.py, scripts/resolve_main_model.py, and scripts/doctor.py, including
-before the aicode wrapper has exported AICODE_MODEL.
+before the aicode wrapper has exported AICODE_MODEL. The deployment profile
+is consulted lazily between AICODE_MODEL and the OpenCode-config fallback.
 
 CodeTrail 只跑 llama.cpp llama-server。AICODE_MODEL 可以是:
   - registry 裡登記的 bare name(例如 "qwen3-coder-30b")
@@ -14,12 +14,11 @@ opencode.json `model` 欄位若是 "<provider>/<name>" 形式 (例如 OpenAI 留
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
-
 
 # 留下的這份「非本機 provider」清單是給 opencode.json 設定錯誤時用的:
 # 使用者可能還沿用以前 ollama/* 或 openai/* 那種寫法,讓 resolution 報得明確一點。
@@ -266,4 +265,22 @@ def resolve_main_model_from_env(
     raw = (environ.get("AICODE_MODEL") or "").strip()
     if raw:
         return normalize_main_model(raw, "AICODE_MODEL")
+    # Keep this import lazy so deployment_profile.py stays independent of the
+    # OpenCode model parser and config.py can import both without a cycle.
+    try:
+        from deployment_profile import ProfileError, load_effective_profile
+
+        deployment = load_effective_profile(environ)
+    except ProfileError as exc:
+        return ModelResolution(
+            source="deployment profile",
+            present=True,
+            error=str(exc),
+        )
+    profile_model = deployment.service("main").model
+    if profile_model:
+        return normalize_main_model(
+            profile_model,
+            f"deployment profile {deployment.selected_profile} main.model",
+        )
     return resolve_opencode_main_model(environ)

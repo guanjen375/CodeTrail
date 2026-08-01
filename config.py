@@ -1,30 +1,22 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 智能程式碼分析器 - 設定檔
 """
-import json as _json
 import os as _os
 
-from model_resolution import (
-    resolve_main_model_from_env as _resolve_main_model_from_env,
-    resolve_opencode_main_model as _resolve_opencode_main_model,
-)
+import deployment_profile as _deployment_profile
+import model_resolution as _model_resolution
 
 # ============================================================
 # llama.cpp llama-server 設定
 # ============================================================
-# 多 server 架構:每個角色一個 llama-server instance,各自綁不同 port。
-# 預設 port 排列:
-#     8080 主聊天 / 程式推導(--alias 對應 AICODE_MODEL)
-#     8081 embedding         (--embedding,通常掛 bge-m3)
-#     8082 reranker          (--reranking,通常掛 qwen3-reranker-0.6b)
-#     8083 VL 多模態         (--mmproj,通常掛 qwen3.5-9b 或其他相容 VL)
-# 任一 port 可用環境變數覆寫(testing / 遠端 server / port 衝突時用)。
-LLAMA_BASE_URL = _os.environ.get("AICODE_LLAMA_BASE_URL", "http://localhost:8080")
-LLAMA_EMBED_BASE_URL = _os.environ.get("AICODE_LLAMA_EMBED_BASE_URL", "http://localhost:8081")
-LLAMA_RERANK_BASE_URL = _os.environ.get("AICODE_LLAMA_RERANK_BASE_URL", "http://localhost:8082")
-LLAMA_VL_BASE_URL = _os.environ.get("AICODE_LLAMA_VL_BASE_URL", "http://localhost:8083")
+# 多 server 架構:每個角色一個 llama-server instance。URL、模型 ID 與啟動參數
+# 一律由 deployment_profile.py 解析；env/local profile 的 precedence 也只在那裡維護。
+_DEPLOYMENT_PROFILE = _deployment_profile.load_effective_profile(_os.environ)
+LLAMA_BASE_URL = _DEPLOYMENT_PROFILE.service("main").base_url
+LLAMA_EMBED_BASE_URL = _DEPLOYMENT_PROFILE.service("embedding").base_url
+LLAMA_RERANK_BASE_URL = _DEPLOYMENT_PROFILE.service("reranker").base_url
+LLAMA_VL_BASE_URL = _DEPLOYMENT_PROFILE.service("vl").base_url
 
 # Native + OpenAI-compat endpoints(集中管理,呼叫端不要硬寫路徑)。
 LLAMA_GENERATE_URL = f"{LLAMA_BASE_URL}/completion"
@@ -48,33 +40,7 @@ LLAMA_VL_URL = f"{LLAMA_VL_BASE_URL}/v1/chat/completions"
 #   3. ~/.config/codetrail/models.json
 # 三個都找不到 → 空 dict;此時 AICODE_MODEL 直接視為 GGUF 路徑。
 def _load_model_registry() -> dict[str, str]:
-    raw = (_os.environ.get("AICODE_MODEL_REGISTRY") or "").strip()
-    if raw:
-        try:
-            data = _json.loads(raw)
-            if isinstance(data, dict):
-                return {str(k): str(v) for k, v in data.items()}
-        except _json.JSONDecodeError:
-            pass
-
-    file_path = (_os.environ.get("AICODE_MODEL_REGISTRY_FILE") or "").strip()
-    if not file_path:
-        home = _os.environ.get("HOME") or _os.environ.get("USERPROFILE") or ""
-        if home:
-            candidate = _os.path.join(home, ".config", "codetrail", "models.json")
-            if _os.path.isfile(candidate):
-                file_path = candidate
-
-    if file_path:
-        try:
-            with open(_os.path.expanduser(file_path), "r", encoding="utf-8") as f:
-                data = _json.load(f)
-            if isinstance(data, dict):
-                return {str(k): str(v) for k, v in data.items()}
-        except (OSError, _json.JSONDecodeError):
-            pass
-
-    return {}
+    return _deployment_profile.load_model_registry(_os.environ)
 
 
 MODEL_REGISTRY: dict[str, str] = _load_model_registry()
@@ -108,7 +74,8 @@ def resolve_model_path(name_or_path: str) -> str:
 #
 #   1. AICODE_MODEL=<MODEL>                 (環境變數,最優先)
 #   2. aicode -m <MODEL> / --model <MODEL>  (CLI 旗標)
-#   3. OPENCODE_CONFIG or ~/.config/opencode/opencode.json ("model": "<MODEL>")
+#   3. deployment profile / local override 的 main.model
+#   4. OPENCODE_CONFIG or ~/.config/opencode/opencode.json ("model": "<MODEL>")
 #
 # <MODEL> 可以是:
 #   - registry 裡登記的 bare name(例如 "qwen3-coder-30b")
@@ -120,7 +87,7 @@ def resolve_model_path(name_or_path: str) -> str:
 # embedding / reranker / VL 在 llama.cpp 架構下,model id 只是 informational
 # (server 啟動時就鎖死一顆 GGUF),這裡的常數主要用來寫 telemetry 與顯示。
 # 沿用舊名稱 EMBEDDING_MODEL / RERANKER_MODEL,因為下面 RAG 區段已經有 import。
-VL_MODEL = _os.environ.get("AICODE_VL_MODEL", "qwen3.5-9b")
+VL_MODEL = _DEPLOYMENT_PROFILE.service("vl").model or ""
 
 # VL 圖片分析預算。
 #
@@ -140,25 +107,25 @@ OPENCODE_MCP_TIMEOUT_MIN_MS = 660_000
 
 
 def _read_opencode_main_model() -> str:
-    """讀使用者 OpenCode global config 的 `model` 欄位 (第三優先 fallback)。
+    """讀使用者 OpenCode global config 的 `model` 欄位 (最後 fallback)。
 
     刻意只讀 OPENCODE_CONFIG 或 `~/.config/opencode/opencode.json`,不掃描其他
     位置 (例如專案 local opencode.json) — 主模型是使用者帳號級別的偏好, 不是
     per-project 設定。
     讀不到、parse 失敗、值是 placeholder 都回空字串, 留給呼叫端 fail-loud。
     """
-    resolved = _resolve_opencode_main_model(_os.environ)
+    resolved = _model_resolution.resolve_opencode_main_model(_os.environ)
     return resolved.model if resolved.ok else ""
 
 
 def _resolve_main_model() -> str:
-    """主模型來源優先順序: AICODE_MODEL > opencode.json `model` 欄位。
+    """主模型來源: AICODE_MODEL > profile/local override > opencode.json。
 
     回傳 bare model name(可能是 registry key,可能是 GGUF 路徑),找不到時回空字串。
     `aicode` wrapper 會另外處理 `-m` / `--model` CLI 旗標 (在這裡看不到),
     它應該在啟動子行程前把 AICODE_MODEL 設好。
     """
-    resolved = _resolve_main_model_from_env(_os.environ)
+    resolved = _model_resolution.resolve_main_model_from_env(_os.environ)
     return resolved.model if resolved.ok else ""
 
 
@@ -167,7 +134,7 @@ MODEL = _resolve_main_model()
 
 def require_main_model() -> str:
     """取目前的主模型,沒設就 fail-loud。 LLM 呼叫端進入點都該先呼這個。"""
-    resolved = _resolve_main_model_from_env(_os.environ)
+    resolved = _model_resolution.resolve_main_model_from_env(_os.environ)
     model = resolved.model if resolved.ok else ""
     if not model:
         detail = f"\n解析錯誤: {resolved.error}" if resolved.error else ""
@@ -178,7 +145,8 @@ def require_main_model() -> str:
             "啟動 llama-server 後,任選一種方式設定模型:\n"
             "  1) export AICODE_MODEL=<MODEL>                    (最優先)\n"
             "  2) aicode -m <MODEL>                              (per-run CLI 旗標)\n"
-            "  3) 在 ~/.config/opencode/opencode.json 設 \"model\": \"<MODEL>\"\n"
+            "  3) deployment profile / local override 設 main.model\n"
+            "  4) 在 ~/.config/opencode/opencode.json 設 \"model\": \"<MODEL>\"\n"
             "<MODEL> 可以是 MODEL_REGISTRY 裡的 bare name 或 GGUF 絕對路徑。\n"
             "Registry 維護在 ~/.config/codetrail/models.json,或用 AICODE_MODEL_REGISTRY env。\n"
             "CodeTrail 不會替你預設或推薦。"
@@ -200,12 +168,8 @@ def require_main_model_path() -> str:
         )
     return path
 
-# Context 長度設定
-# - 5090 32GB + 192GB RAM: 可開 128K，VRAM 不足時自動 offload 到 RAM
-# - 純 GPU 模式: 建議 64K 以內避免 OOM
-# - 注意：Offload 到 RAM 會降低推理速度（主要是首 token 延遲/prompt ingest）
-#         但輸出階段（decode）影響較小
-# 可用環境變數 AICODE_NUM_CTX 覆寫（測試新模型 / 不同顯卡時用）。
+# Context 長度 fallback。server profile 的 -c 與 runtime /props 才是實際上限；
+# AICODE_NUM_CTX 只在 dynamic 路徑停用時使用。
 NUM_CTX = int(_os.environ.get("AICODE_NUM_CTX", "131072"))
 
 # Full 模式 context：設成與 NUM_CTX 相同
@@ -391,8 +355,8 @@ KNOWLEDGE_INCLUDE_CONTENT = True
 KNOWLEDGE_CONTENT_MAX_CHARS = 2000
 KNOWLEDGE_MERGE_ADJACENT = True
 KNOWLEDGE_MERGE_MAX_CHARS = 2500
-EMBEDDING_MODEL = _os.environ.get("AICODE_EMBED_MODEL", "bge-m3")
-RERANKER_MODEL = _os.environ.get("AICODE_RERANK_MODEL", "qwen3-reranker-0.6b")
+EMBEDDING_MODEL = _DEPLOYMENT_PROFILE.service("embedding").model or ""
+RERANKER_MODEL = _DEPLOYMENT_PROFILE.service("reranker").model or ""
 RERANK_FALLBACK_POLICY = _os.environ.get("AICODE_RERANK_FALLBACK_POLICY", "error").strip().lower()
 _RERANK_FALLBACK_POLICIES = {"embedding", "main_model", "error"}
 if RERANK_FALLBACK_POLICY not in _RERANK_FALLBACK_POLICIES:
@@ -566,11 +530,10 @@ STRICT_MODE_TEMPERATURE = 0.0        # 嚴格模式下溫度壓到最低
 # ------------------------------------------------------------
 # CodeTrail 內部呼叫的取樣參數(top_p / top_k / min_p)
 # ------------------------------------------------------------
-# llama-server 啟動若沒帶 sampling 旗標,內建預設是 temp 0.8 / top_k 40 / min_p 0.05,
-# 偏離 Qwen3-235B-A22B-Thinking-2507 官方建議(temp 0.6 / top_p 0.95 / top_k 20 /
-# min_p 0),容易讓模型「自由發揮」杜撰不存在的具體事實(條號 / 日期 / 數字)。
+# llama-server 啟動若沒帶適合該模型的 sampling 旗標，可能更容易在沒有 grounding
+# 時自由發揮。下列值只控制 CodeTrail internal calls，不是硬體 deployment tuning。
 # CodeTrail 自己的呼叫除了把 temperature 壓到 0.0/0.2,這裡再把 top_p / top_k /
-# min_p 也釘在 Qwen 建議值,不再依賴 server 端預設(server 沒設旗標也安全)。
+# min_p 也明確送出，不依賴 server 端預設。
 #
 # 注意:這只影響 CodeTrail internal calls。OpenCode TUI 直接打 llama-server /v1,
 # 不經過這裡 —— OpenCode 聊天路徑的取樣必須在 llama-server 啟動旗標釘

@@ -5,7 +5,6 @@ agent_tools.run_lint 收了 `fix` 參數卻完全沒用,所以 fix=False 仍會�
 """
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 from typing import Any
 

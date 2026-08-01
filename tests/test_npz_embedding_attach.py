@@ -15,8 +15,8 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-import config
-from knowledge import KnowledgeBase
+import config  # noqa: E402 - keep dependency-heavy imports behind importorskip
+from knowledge import KnowledgeBase  # noqa: E402 - keep optional numpy skip offline-safe
 
 
 def _content_hash(chunks) -> str:

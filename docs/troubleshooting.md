@@ -10,7 +10,7 @@
 
 ### Build llama.cpp 時 `nvcc fatal : Unsupported gpu architecture 'compute_120a'`
 
-你的 GPU 是 Blackwell(RTX 50 系列、RTX 6000 Ada Blackwell 等),但本機 CUDA Toolkit 太舊,不認識 `sm_120` / `compute_120a`。Ubuntu 24.04 的 `nvidia-cuda-toolkit` 套件停在 12.0,**Blackwell 需要 12.8+**。
+你的 GPU 是 Blackwell(RTX 50 系列或 RTX PRO 6000 Blackwell),但本機 CUDA Toolkit 太舊,不認識 `sm_120` / `compute_120a`。Ubuntu 24.04 的 `nvidia-cuda-toolkit` 套件停在 12.0,**Blackwell 需要 12.8+**。
 
 驗證:
 
@@ -444,7 +444,9 @@ export AICODE_MODEL=<CODE_MODEL>
 # 2) per-run CLI 旗標
 aicode -m <CODE_MODEL>
 
-# 3) ~/.config/opencode/opencode.json 設 "model": "<provider>/<CODE_MODEL>"
+# 3) ~/.config/codetrail/deployment.json 設 profile + services.main.model
+
+# 4) ~/.config/opencode/opencode.json 設 "model": "<provider>/<CODE_MODEL>"
 ```
 
 `<CODE_MODEL>` 是 MODEL_REGISTRY 裡的 bare name 或 GGUF 絕對路徑。如果你看到「placeholder」相關錯誤,通常是值還停留在 `<CODE_MODEL>` 或 `<MODEL>` 沒換掉;看到「外部 provider prefix」錯誤代表你還在用 `ollama/foo` 那種舊寫法,改成 bare name 或你 opencode.json 裡 custom provider 的 prefix。

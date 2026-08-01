@@ -5,7 +5,7 @@
 和原始碼比對:
   1. mcp_server.py 內 @mcp.tool() 的工具數 == 文件提到的「N 個工具」
   2. 文件工具表內每個 backtick 工具名都在 mcp_server.py 裡定義
-  3. config.py 的固定附屬模型 EMBEDDING_MODEL / RERANKER_MODEL / VL_MODEL 在文件出現
+  3. config.py 的附屬模型由 deployment profile 取得，避免三處 hardcode 漂移
   4. README 必須包含「成熟私有部署版」/「不公開發布」之類產品狀態語句
   5. README / docs 必須提到 llama-server / GGUF / <CODE_MODEL> placeholder / OpenCode JSON 範本
   6. README OpenCode 範本的 MCP timeout == config.py 的 runtime 最小值
@@ -23,6 +23,7 @@ README = REPO_ROOT / "README.md"
 DOCS_DIR = REPO_ROOT / "docs"
 MCP = REPO_ROOT / "mcp_server.py"
 CONFIG = REPO_ROOT / "config.py"
+DEFAULT_DEPLOYMENT = REPO_ROOT / "deployment_profiles" / "defaults.json"
 
 
 def _read(path: Path) -> str:
@@ -200,16 +201,20 @@ def check_all() -> list[str]:
     if missing:
         issues.append(f"文件沒提到的 MCP 工具: {missing}")
 
-    # 3. model name drift
-    cfg_models = _config_model_values(config_text)
-    for attr in ("EMBEDDING_MODEL", "RERANKER_MODEL", "VL_MODEL"):
-        if attr not in cfg_models:
-            issues.append(f"check_readme_consistency.py 無法解析 config.py 的 {attr}")
-    for attr, value in cfg_models.items():
-        if value not in docs_text:
-            issues.append(
-                f"config.py 的 {attr}={value!r} 沒出現在文件 — 改了模型？"
-            )
+    # 3. model defaults have one source of truth: deployment_profiles/defaults.json.
+    if not DEFAULT_DEPLOYMENT.is_file():
+        issues.append("deployment_profiles/defaults.json 不存在")
+    required_profile_reads = (
+        'VL_MODEL = _DEPLOYMENT_PROFILE.service("vl").model',
+        'EMBEDDING_MODEL = _DEPLOYMENT_PROFILE.service("embedding").model',
+        'RERANKER_MODEL = _DEPLOYMENT_PROFILE.service("reranker").model',
+    )
+    for needle in required_profile_reads:
+        if needle not in config_text:
+            issues.append(f"config.py 未由 deployment profile 取得模型: {needle}")
+    for profile_name in ("verified-reference", "maintainer-target"):
+        if profile_name not in docs_text:
+            issues.append(f"README/docs 必須說明選用 profile {profile_name!r}")
 
     # 4. 產品狀態段落
     if not any(p in readme_text for p in _PRODUCT_STATUS_PHRASES):

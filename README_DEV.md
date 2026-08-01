@@ -14,6 +14,7 @@ python scripts/run_tests.py
 python scripts/check_eval_consistency.py
 python scripts/check_readme_consistency.py
 AICODE_MODEL=test-model:latest python scripts/doctor.py --no-network
+python deployment_profile.py --profile maintainer-target validate
 
 # Lint（advisory，CI 不擋）
 ruff check tests scripts
@@ -55,6 +56,9 @@ aicode
 - `tests/test_mcp_smoke.py` — MCP server stdio 啟動與基本 tool 呼叫
 - `tests/test_gpu_safety.py` — `gpu_safety.py` 的 server /props 觀測、SafetyVerdict 分支;完全離線(nvidia-smi 與 llama-server HTTP 都用 hook 注入 fixture)
 - `tests/test_check_status_script.py` — `check-status.sh` 的 nvidia-smi process 計數、跨 GPU PID 去重、report-only / strict exit code;nvidia-smi 完全用 stub
+- `tests/test_deployment_profile.py` — profile schema/precedence、惡意值拒絕、registry/mmproj、main/aux GPU precedence
+- `tests/test_deployment_status.py` — port/cmdline role 辨識、錯卡/錯模型；process 與 HTTP 都用 hook
+- `tests/test_profile_server_launchers.py` — start-all/main 與所有舊 launcher 的離線 dry-run 相容性
 
 ---
 

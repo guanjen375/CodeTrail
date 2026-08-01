@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """把主 llama-server 的真實 n_ctx 解析出來,印到 stdout 給 aicode wrapper 用。
 
 設計重點:server 啟動時的 `-c <N>` (= /props 的 n_ctx) 是 ctx 上限的「唯一真值」。

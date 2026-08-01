@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """啟動前的 ctx 容量閘:讀 llama-server 真實 n_ctx,確認 CodeTrail 端的 ctx 上限
 不會「超過」它。正常情況下 aicode 已經用 scripts/resolve_server_ctx.py 把 server
 n_ctx 自動帶進 AICODE_DYNAMIC_NUM_CTX_MAX,所以這裡幾乎都是 requested == server、
@@ -42,7 +41,6 @@ if str(REPO_ROOT) not in sys.path:
 
 import gpu_safety  # noqa: E402
 from model_resolution import normalize_main_model  # noqa: E402
-
 
 DEFAULT_CTX_MAX = 65536
 

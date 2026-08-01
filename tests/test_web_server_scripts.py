@@ -64,7 +64,7 @@ def test_start_web_dry_run_respects_custom_port_and_session(tmp_path):
 def test_start_web_dry_run_forwards_extra_args(tmp_path):
     proc = _run(START, ["--dry-run", "--hostname", "0.0.0.0"], cwd=tmp_path)
     assert proc.returncode == 0, proc.stderr
-    launch = next(l for l in proc.stdout.splitlines() if l.startswith("launch="))
+    launch = next(line for line in proc.stdout.splitlines() if line.startswith("launch="))
     assert launch.rstrip().endswith("aicode web --hostname 0.0.0.0")
 
 

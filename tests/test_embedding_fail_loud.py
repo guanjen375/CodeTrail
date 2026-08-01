@@ -4,10 +4,9 @@ import json
 
 import pytest
 
-import RAG
 import code_rag
 import knowledge
-
+import RAG
 
 EMBEDDING_MODULES = (code_rag, knowledge)
 

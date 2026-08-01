@@ -202,6 +202,7 @@ def test_check_models_fails_when_gguf_missing(monkeypatch, tmp_path):
 
     # registry 需要重新 load 才會清空
     import importlib
+
     import config
     importlib.reload(config)
 
