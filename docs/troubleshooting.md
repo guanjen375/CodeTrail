@@ -78,11 +78,13 @@ nvidia-smi -l 1                                              # GPU 是否在動
 
 **① 要它講具體事實 → 先給它來源。** 想引合約就把合約貼進 prompt;程式碼問題走 CodeTrail 工具(`codetrail_*` / `aicode`)讓 RAG 把真實程式碼接進 context。沒來源的「具體數字 / 條號 / ticket 號」一律是擲骰子。
 
-**② 在 llama-server 啟動旗標釘住取樣(這條同時修好 OpenCode 純聊天路徑)。** 主 server 啟動指令(README §3.1)加上:
+**② 在 llama-server 啟動旗標釘住取樣(這條同時修好 OpenCode 純聊天路徑)。** 在 `~/.config/codetrail/deployment.json` 的 `services.main.parameters` 加上取樣參數(README §4.1),launcher 會轉成對應旗標:
 
-```bash
-  --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.0 \
+```json
+{ "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.0 }
 ```
+
+(等價於 server 旗標 `--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.0`;改完 `scripts/quit.sh` → `~/start.sh` 重啟生效。)
 
 為什麼一定要在 server 旗標釘、而不是寫在 `opencode.json`:OpenCode 的 openai-compatible provider 對自訂 provider 有已知問題,`temperature` 會被丟掉不送進 request body([opencode#25755](https://github.com/anomalyco/opencode/issues/25755)),`top_k` / `min_p` 又不在它的 schema 裡。所以 server 旗標是唯一可靠的釘法。**改完要重啟 server 才生效。**
 
@@ -298,9 +300,10 @@ unset AICODE_DYNAMIC_NUM_CTX_MAX
 aicode
 # 或 aicodex --codetrail-model <LOCAL_MODEL>
 
-# 路徑 B: 真的想用更大的 ctx —— 那是 server 端的事,用更大的 -c 重啟,CodeTrail 會自動跟上
-pkill -f "llama-server.*--port 8080"
-llama-server -m ~/models/<MODEL>.gguf --host 0.0.0.0 --port 8080 -c 65536 -ngl 99 &
+# 路徑 B: 真的想用更大的 ctx —— 那是 server 端的事:改 ~/.config/codetrail/deployment.json
+# 的 services.main.ctx(或重跑 ./set_config.sh 換 ctx),再重啟 server,CodeTrail 會自動跟上
+<CODETRAIL_REPO>/scripts/quit.sh
+~/start.sh
 aicode
 ```
 
@@ -438,6 +441,9 @@ non-causal pooling 不能把單一序列拆成較小的 physical batches。
 CodeTrail 不內建主聊天 / 程式推導模型,沒設好 `aicode` 會 fail-loud。任選一種設定方式:
 
 ```bash
+# 0) 最省事:重跑一鍵設定,registry / deployment / opencode.json 一次寫齊
+cd <CODETRAIL_REPO> && ./set_config.sh
+
 # 1) 環境變數 (最優先)
 export AICODE_MODEL=<CODE_MODEL>
 

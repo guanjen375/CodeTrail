@@ -56,9 +56,10 @@ aicode
 - `tests/test_mcp_smoke.py` — MCP server stdio 啟動與基本 tool 呼叫
 - `tests/test_gpu_safety.py` — `gpu_safety.py` 的 server /props 觀測、SafetyVerdict 分支;完全離線(nvidia-smi 與 llama-server HTTP 都用 hook 注入 fixture)
 - `tests/test_check_status_script.py` — `check-status.sh` 的 nvidia-smi process 計數、跨 GPU PID 去重、report-only / strict exit code;nvidia-smi 完全用 stub
-- `tests/test_deployment_profile.py` — profile schema/precedence、惡意值拒絕、registry/mmproj、main/aux GPU precedence
-- `tests/test_deployment_status.py` — port/cmdline role 辨識、錯卡/錯模型；process 與 HTTP 都用 hook
-- `tests/test_profile_server_launchers.py` — start-all/main 與所有舊 launcher 的離線 dry-run 相容性
+- `tests/test_deployment_profile.py` — profile schema/precedence、惡意值拒絕、registry/mmproj、main/aux GPU precedence、`-ngl auto --fit` 參數驗證
+- `tests/test_deployment_status.py` — port/cmdline role 辨識、錯卡/錯模型;process 與 HTTP 都用 hook
+- `tests/test_profile_server_launchers.py` — start-all/main、quit.sh 與所有舊 launcher 的離線 dry-run 相容性
+- `tests/test_set_config.py` — `set_config.sh` 的 GPU/模型偵測分類、初步判定失敗通知、產物(registry/deployment/opencode/start.sh)內容與 end-to-end dry-run;nvidia-smi 與 models 目錄全用 fixture
 
 ---
 

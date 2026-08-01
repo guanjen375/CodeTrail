@@ -57,6 +57,9 @@ _ROLE_PARAMETERS = {
         "cache_type_v",
         "n_cpu_moe",
         "threads",
+        "fit",
+        "fit_target",
+        "parallel",
     },
     "embedding": _COMMON_PARAMETERS | {"embedding", "pooling"},
     "reranker": _COMMON_PARAMETERS | {"embedding", "pooling", "reranking"},
@@ -252,12 +255,24 @@ def _validate_parameter(role: str, key: str, value: Any, where: str) -> None:
             raise ProfileError(f"{where}.{key} must remain true")
         return
     if key in {"gpu_layers", "n_cpu_moe", "threads", "top_k"}:
+        # llama.cpp 新版支援 `-ngl auto`(配合 --fit 自動決定 offload 層數)。
+        if key == "gpu_layers" and value == "auto":
+            return
         if isinstance(value, bool) or not isinstance(value, int):
             raise ProfileError(f"{where}.{key} must be an integer")
         lower = -1 if key == "gpu_layers" else 0
         upper = 4096 if key == "gpu_layers" else 1024
         if not lower <= value <= upper or (key == "threads" and value == 0):
             raise ProfileError(f"{where}.{key} is outside the allowed range")
+        return
+    if key == "fit":
+        if value not in {"on", "off"}:
+            raise ProfileError(f"{where}.fit must be on or off")
+        return
+    if key in {"fit_target", "parallel"}:
+        upper = 1_048_576 if key == "fit_target" else 64
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= upper:
+            raise ProfileError(f"{where}.{key} must be an integer in 1..{upper}")
         return
     if key in {"temperature", "top_p", "min_p", "presence_penalty"}:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -720,6 +735,9 @@ def build_server_command(
         ("cache_type_k", "--cache-type-k"),
         ("cache_type_v", "--cache-type-v"),
         ("n_cpu_moe", "--n-cpu-moe"),
+        ("fit", "--fit"),
+        ("fit_target", "--fit-target"),
+        ("parallel", "-np"),
         ("flash_attention", "-fa"),
         ("threads", "-t"),
     )

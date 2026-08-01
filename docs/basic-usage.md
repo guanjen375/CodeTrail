@@ -197,7 +197,7 @@ aicode
 
 ## 6. Web 模式(瀏覽 / 續問歷史 session)
 
-§0 的 `aicode` 是 standalone TUI。如果你想用瀏覽器瀏覽歷史 session、點任一筆續問，或讓 web 與 TUI 同時看同一份對話，改用 web 模式。web backend 會 spawn CodeTrail MCP，所以**啟動的 shell 要先 activate venv**(同 [安裝、設定與啟動](setup.md));attach 端是純 client，不受此限。
+§0 的 `aicode` 是 standalone TUI。如果你想用瀏覽器瀏覽歷史 session、點任一筆續問，或讓 web 與 TUI 同時看同一份對話，改用 web 模式。web backend 會 spawn CodeTrail MCP —— `set_config.sh` 已把偵測到的 Python 路徑寫進 OpenCode 設定,一般不需 activate 任何環境;若你是手動設定且用 venv,啟動的 shell 要先 activate(見 [安裝、設定與啟動](setup.md))。attach 端是純 client,不受此限。
 
 ### 啟動 web backend
 
@@ -211,7 +211,7 @@ aicode web
 接著怎麼開首頁，看機器有沒有桌面:
 
 - **有桌面瀏覽器**:啟動時會自動開,或手動把印出來的 `http://127.0.0.1:4096` 貼進瀏覽器。
-- **沒有桌面的遠端 server(常見:GPU 主機)**:server 上開不了瀏覽器是正常的,backend 照跑。**推薦用 Tailscale** 給 server 一個固定網址(加最愛點一下就進,不用每次開 SSH tunnel):一次性在 server 跑 `tailscale serve --bg --https=4096 4096`,之後在你的裝置開 `https://<你的-server>.<tailnet>.ts.net:4096/`。⚠️ 用 `serve`(tailnet 內),**絕不可 `funnel`**(公網)。沒裝 Tailscale 的話走 SSH:`ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server>` 後開本機 `http://127.0.0.1:4096`。完整步驟見 [README §5.4](../README.md#54-web-模式選用)。
+- **沒有桌面的遠端 server(常見:GPU 主機)**:server 上開不了瀏覽器是正常的,backend 照跑。**推薦用 Tailscale** 給 server 一個固定網址(加最愛點一下就進,不用每次開 SSH tunnel):一次性在 server 跑 `tailscale serve --bg --https=4096 4096`,之後在你的裝置開 `https://<你的-server>.<tailnet>.ts.net:4096/`。⚠️ 用 `serve`(tailnet 內),**絕不可 `funnel`**(公網)。沒裝 Tailscale 的話走 SSH:`ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server>` 後開本機 `http://127.0.0.1:4096`。完整步驟見 [README §5.4](../README.md#54-web-模式目前測試中)。
 
 首頁就是 session 清單,點任一筆即可載入該 session 繼續對話。
 

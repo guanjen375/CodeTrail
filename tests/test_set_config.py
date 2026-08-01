@@ -1,0 +1,241 @@
+"""set_config.sh / scripts/set_config.py 的離線測試。
+
+nvidia-smi 用 PATH 上的 stub、模型目錄用 tmp fixture、HOME 指到 tmp,
+完全不需要 GPU / llama-server / 真模型。
+"""
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import stat
+import subprocess
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = REPO_ROOT / "set_config.sh"
+
+TWO_GPUS = (
+    "0, NVIDIA GeForce RTX 5090, 32607, 30000, GPU-aaaa-5090\n"
+    "1, NVIDIA RTX 2000 Ada Generation, 16380, 15000, GPU-bbbb-2000"
+)
+
+_PROFILE_ENV_KEYS = {
+    "AICODE_PROFILE", "AICODE_DEPLOYMENT_CONFIG", "AICODE_MODEL",
+    "AICODE_MODEL_REGISTRY", "AICODE_MODEL_REGISTRY_FILE",
+    "EMBED_MODEL", "RERANK_MODEL", "VL_GGUF", "VL_MMPROJ",
+    "AICODE_EMBED_MODEL", "AICODE_RERANK_MODEL", "AICODE_VL_MODEL", "AICODE_VL_MMPROJ",
+    "MAIN_GPU", "AUX_GPU", "EMBED_GPU", "RERANK_GPU", "VL_GPU", "CUDA_VISIBLE_DEVICES",
+    "MAIN_CTX", "MAIN_BATCH", "MAIN_UBATCH", "MODELS_DIR", "LLAMA_BIN",
+}
+
+
+def _write_fake_nvidia_smi(bin_dir: Path, output: str, exit_code: int = 0) -> None:
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    executable = bin_dir / "nvidia-smi"
+    executable.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' {shlex.quote(output)}\n"
+        f"exit {exit_code}\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+
+def _make_models(root: Path, *, with_reranker: bool = True) -> Path:
+    models = root / "models"
+    (models / "big-chat").mkdir(parents=True)
+    (models / "big-chat" / "big-chat-ud-q4_k_xl-00001-of-00002.gguf").write_bytes(b"x" * 2048)
+    (models / "big-chat" / "big-chat-ud-q4_k_xl-00002-of-00002.gguf").write_bytes(b"x" * 2048)
+    (models / "bge-m3").mkdir()
+    (models / "bge-m3" / "bge-m3-f16.gguf").write_bytes(b"x" * 512)
+    if with_reranker:
+        (models / "qwen3-reranker-0.6b").mkdir()
+        (models / "qwen3-reranker-0.6b" / "qwen3-reranker-0.6b-q8_0.gguf").write_bytes(b"x" * 512)
+    (models / "vl").mkdir()
+    (models / "vl" / "vl-model-q6.gguf").write_bytes(b"x" * 512)
+    (models / "vl" / "mmproj-F16.gguf").write_bytes(b"x" * 256)
+    return models
+
+
+def _env(tmp_path: Path) -> dict[str, str]:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    env = {key: value for key, value in os.environ.items() if key not in _PROFILE_ENV_KEYS}
+    env.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "PATH": f"{tmp_path / 'bin'}:{env.get('PATH', '')}",
+            "LLAMA_BIN": str(tmp_path / "llama-server"),
+        }
+    )
+    return env
+
+
+def _run(tmp_path: Path, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(SCRIPT), "--skip-deps-check", *args],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path),
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def test_help_is_offline_and_exits_zero(tmp_path):
+    proc = _run(tmp_path, "--help")
+    assert proc.returncode == 0, proc.stderr
+    assert "--models-dir" in proc.stdout
+
+
+def test_yes_run_generates_all_artifacts(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    proc = _run(tmp_path, "--yes", "--models-dir", str(models))
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "初步判定 OK" in proc.stdout
+    home = tmp_path / "home"
+
+    registry = json.loads((home / ".config/codetrail/models.json").read_text(encoding="utf-8"))
+    main_path = str(models / "big-chat" / "big-chat-ud-q4_k_xl-00001-of-00002.gguf")
+    assert registry["big-chat-ud-q4-k-xl"] == main_path
+
+    deployment = json.loads((home / ".config/codetrail/deployment.json").read_text(encoding="utf-8"))
+    services = deployment["services"]
+    assert services["main"]["model"] == "big-chat-ud-q4-k-xl"
+    assert services["main"]["ctx"] == 65536
+    assert services["main"]["parameters"]["jinja"] is True
+    assert "threads" in services["main"]["parameters"]
+    assert services["embedding"]["model"] == str(models / "bge-m3" / "bge-m3-f16.gguf")
+    assert services["reranker"]["model"].endswith("qwen3-reranker-0.6b-q8_0.gguf")
+    assert services["vl"]["model"] == str(models / "vl" / "vl-model-q6.gguf")
+    assert services["vl"]["mmproj"] == str(models / "vl" / "mmproj-F16.gguf")
+
+    opencode = json.loads((home / ".config/opencode/opencode.json").read_text(encoding="utf-8"))
+    assert opencode["model"] == "llamacpp/big-chat-ud-q4-k-xl"
+    limit = opencode["provider"]["llamacpp"]["models"]["big-chat-ud-q4-k-xl"]["limit"]
+    assert limit["context"] == 65536
+    mcp = opencode["mcp"]["codetrail"]
+    assert mcp["timeout"] == 660000
+    assert "mcp_server.py" in mcp["command"][2]
+    assert opencode["permission"]["bash"] == "deny"
+
+    start = home / "start.sh"
+    content = start.read_text(encoding="utf-8")
+    assert "generated by CodeTrail set_config.sh" in content
+    assert "export MAIN_GPU=GPU-aaaa-5090" in content
+    assert "export AUX_GPU=GPU-bbbb-2000" in content
+    assert content.rstrip().endswith('start-all.sh "$@"')
+    assert start.stat().st_mode & stat.S_IXUSR
+
+    # 結尾預覽 = start-all --dry-run 的完整指令(推薦啟動參數)
+    assert "main_command=" in proc.stdout
+    assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-bbbb-2000") == 3
+
+
+def test_generated_start_sh_dry_run_pins_gpus(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    assert _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models)).returncode == 0
+
+    proc = subprocess.run(
+        ["bash", str(tmp_path / "home" / "start.sh"), "--dry-run"],
+        env=_env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    for port in ("8080", "8081", "8082", "8083"):
+        assert f"_port={port}" in proc.stdout
+    assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-aaaa-5090") == 1
+    assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-bbbb-2000") == 3
+
+
+def test_flags_override_model_and_gpu(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    proc = _run(
+        tmp_path,
+        "--yes", "--no-preview", "--models-dir", str(models),
+        "--main-gpu", "1", "--embed-gpu", "0",
+    )
+    assert proc.returncode == 0, proc.stderr
+    content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
+    assert "export MAIN_GPU=GPU-bbbb-2000" in content
+    # aux 三顆不同卡(embed=0、rerank/vl=預設)→ 逐 role export
+    assert "export EMBED_GPU=GPU-aaaa-5090" in content
+
+
+def test_no_gpu_notifies_and_fails(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", "", exit_code=1)
+    models = _make_models(tmp_path)
+    proc = _run(tmp_path, "--yes", "--models-dir", str(models))
+    assert proc.returncode == 2
+    assert "偵測失敗" in proc.stderr
+
+
+def test_missing_model_category_fails_precheck(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path, with_reranker=False)
+    proc = _run(tmp_path, "--yes", "--models-dir", str(models))
+    assert proc.returncode == 2
+    assert "reranker" in proc.stderr
+    assert "初步判定不通過" in proc.stderr
+
+
+def test_single_gpu_warns_and_shares_one_card(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", "0, NVIDIA GeForce RTX 5090, 32607, 30000, GPU-solo")
+    models = _make_models(tmp_path)
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert proc.returncode == 0, proc.stderr
+    assert "只偵測到 1 顆 GPU" in proc.stdout
+    content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
+    assert "export MAIN_GPU=GPU-solo" in content
+    assert "export AUX_GPU=GPU-solo" in content
+
+
+def test_dry_run_writes_nothing(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    proc = _run(tmp_path, "--yes", "--dry-run", "--models-dir", str(models))
+    assert proc.returncode == 0, proc.stderr
+    assert "[dry-run]" in proc.stdout
+    home = tmp_path / "home"
+    assert not (home / ".config").exists()
+    assert not (home / "start.sh").exists()
+
+
+def test_existing_configs_are_backed_up_and_registry_merged(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    home = tmp_path / "home"
+    (home / ".config/codetrail").mkdir(parents=True)
+    (home / ".config/codetrail/models.json").write_text(
+        json.dumps({"old-key": "/somewhere/old.gguf"}), encoding="utf-8"
+    )
+    (home / ".config/opencode").mkdir(parents=True)
+    (home / ".config/opencode/opencode.json").write_text("{}", encoding="utf-8")
+
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert proc.returncode == 0, proc.stderr
+
+    registry = json.loads((home / ".config/codetrail/models.json").read_text(encoding="utf-8"))
+    assert registry["old-key"] == "/somewhere/old.gguf"
+    assert "big-chat-ud-q4-k-xl" in registry
+    assert list((home / ".config/codetrail").glob("models.json.bak-setconfig-*"))
+    assert list((home / ".config/opencode").glob("opencode.json.bak-setconfig-*"))
+
+
+def test_noninteractive_without_flags_fails_with_hint(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    proc = _run(tmp_path, "--models-dir", str(models), stdin="")
+    assert proc.returncode == 2
+    assert "無互動輸入環境" in proc.stderr

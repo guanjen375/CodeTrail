@@ -40,7 +40,10 @@ launcher CLI / environment
 - `port` 與 `base_url`：必須一致；URL 只接受無 credentials/path/query 的 HTTP(S)。
 - `gpu_role`：只能是 `main` 或 `aux`。
 - `ctx`、`batch`、`ubatch`：正整數或明確 `null`；`null` 代表不傳該 llama.cpp flag。
-- `parameters`：role-specific allowlist；未知 key 直接拒絕。
+- `parameters`：role-specific allowlist；未知 key 直接拒絕。main 另支援新版
+  llama.cpp 的自動 VRAM 配置:`gpu_layers` 可為整數或 `"auto"`(`-ngl auto`)、
+  `fit`(`"on"`/`"off"` → `--fit`)、`fit_target`(MiB → `--fit-target`)、
+  `parallel`(→ `-np`)。主模型大於 VRAM 時 `set_config.sh` 會自動採用這組。
 - VL 的 `mmproj`：同樣只接受 registry key 或 GGUF 絕對路徑。
 
 禁止 `extra_args`、shell 字串、相對 artifact path、帶控制字元的值。launcher 由驗證後

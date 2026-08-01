@@ -45,7 +45,7 @@
     "expected": {
       "file": "utils.py",
       "symbol": "call_llm",
-      "line": 343
+      "line": 297
     },
     "context": "."
   }

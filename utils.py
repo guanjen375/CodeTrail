@@ -18,7 +18,7 @@ from config import (
     LLAMA_BASE_URL,
     NUM_CTX, NUM_CTX_FULL_MODE, DYNAMIC_NUM_CTX_MAX,
     CODE_EXTENSIONS, IGNORED_DIRS, IGNORED_FILES, IGNORED_PATTERNS,
-    LOW_PRIORITY_PATTERNS, ALLOWED_DOT_DIRS,
+    ALLOWED_DOT_DIRS,
     STRICT_MODE, STRICT_MODE_KEYWORDS, SPEC_QUESTION_KEYWORDS,
     STRICT_MODE_TEMPERATURE, WEAK_REF_THRESHOLD,
     PRIORITY_RULE_WITH_BINARY, PRIORITY_RULE_WITHOUT_BINARY,
@@ -122,15 +122,6 @@ def should_ignore_dir(path: Path) -> bool:
     return False
 
 
-def is_low_priority_file(filepath: str) -> bool:
-    """判斷檔案是否為低優先級（測試檔案等）
-
-    低優先級檔案仍會被索引和搜尋，但在排序時優先級較低
-    """
-    name = Path(filepath).name.lower()
-    return any(fnmatch.fnmatch(name, pattern) for pattern in LOW_PRIORITY_PATTERNS)
-
-
 def should_ignore_file(filepath: str) -> bool:
     """判斷是否應忽略檔案
 
@@ -154,47 +145,6 @@ def should_ignore_file(filepath: str) -> bool:
             return True
 
     return False
-
-
-def get_priority(filepath: str) -> int:
-    """取得檔案優先級（用於完整模式排序）
-
-    改進：測試檔案不再被忽略，而是給予較低優先級（6）
-    """
-    name = Path(filepath).name.lower()
-    path_lower = filepath.lower()
-
-    # 測試檔案：低優先級但不忽略（測試定義了規格/行為）
-    if is_low_priority_file(filepath):
-        return 6
-
-    if name in ("main.cpp", "main.c", "main.py", "app.py", "index.py", "index.js"):
-        return -10
-    if name in ("__init__.py", "__main__.py"):
-        return -5
-    if "main" in name and any(name.endswith(ext) for ext in [".cpp", ".c", ".py"]):
-        return -3
-    if name in ("cmakelists.txt", "makefile", "setup.py", "pyproject.toml", "cargo.toml"):
-        return -2
-
-    if name.endswith((".h", ".hpp")):
-        return 0 if any(x in path_lower for x in ["/include/", "/api/"]) else 1
-
-    if name.endswith((".cpp", ".c", ".cc", ".py", ".rs", ".go")):
-        return 1 if any(x in path_lower for x in ["/src/", "/lib/", "/core/"]) else 2
-
-    if name.endswith((".json", ".yaml", ".yml", ".toml")):
-        return 2 if "config" in name else 4
-
-    if name.endswith((".mk", ".cmake", ".sh", ".tcl")):
-        return 3
-
-    if "readme" in name or name.endswith(".md"):
-        return 8
-    if name.endswith(".txt"):
-        return 9
-
-    return 5
 
 
 def scan_project_metadata(folder: str) -> list[dict]:

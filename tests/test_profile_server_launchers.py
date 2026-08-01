@@ -118,7 +118,7 @@ def test_new_and_legacy_launcher_help_paths_are_offline(tmp_path):
         "start-main-server.sh",
         "start-all.sh",
         "start-rag-servers.sh",
-        "stop-all.sh",
+        "quit.sh",
         "stop-rag-servers.sh",
     ):
         proc = _run(script, tmp_path, {}, "--help")

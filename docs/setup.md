@@ -1,8 +1,8 @@
 # 替代安裝、進階配置與維運
 
-[README Quick Start](../README.md#quick-startdeployment-profile) 已涵蓋 profile-based
-主流程；RTX 5090 實測另見 [verified-reference-5090.md](verified-reference-5090.md)。
-這份文件只補充:
+[README Quick Start](../README.md) 的 `./set_config.sh` + `~/start.sh` 已涵蓋主流程
+(手動 profile 流程見 README §4);RTX 5090 實測另見
+[verified-reference-5090.md](verified-reference-5090.md)。這份文件只補充:
 
 - README 沒涵蓋的安裝替代路徑(其他 distro、runfile installer、conda env)
 - tmux 以外的 process manager(systemd / screen / nohup + disown)
@@ -114,7 +114,7 @@ disown
 
 CodeTrail repo 跑在你工作機(CPU 即可),llama-server 跑在另一台 GPU 主機。CodeTrail 透過 HTTP 呼叫對方的 8080 / 8081 / 8082 / 8083。
 
-GPU 主機端:四個 server 照 [README §3](../README.md#3-啟動-llama-server用-tmux-跑在背景) 啟動,但有兩點要改:① `--host 0.0.0.0` 必須保留(否則只 listen on `127.0.0.1`,外網連不到);② 主 server 的 `-c` 決定 ctx 上限(本例用 `-c 32768`,不是 §3 的 65536)。CodeTrail 端會自動跟隨遠端 server 的真實 `n_ctx`,你只要再把 opencode `limit.context` 也設成同一個值即可;不一致時 `aicode` 會拒絕啟動。
+GPU 主機端:四個 server 照 [README §3](../README.md)(`./set_config.sh` + `~/start.sh`)啟動,但有兩點要改:① `--host 0.0.0.0` 必須保留(否則只 listen on `127.0.0.1`,外網連不到);② 主 server 的 `-c` 決定 ctx 上限(本例用 `-c 32768`,不是預設的 65536)。CodeTrail 端會自動跟隨遠端 server 的真實 `n_ctx`,你只要再把 opencode `limit.context` 也設成同一個值即可;不一致時 `aicode` 會拒絕啟動。
 
 CodeTrail 端:
 
@@ -186,7 +186,7 @@ systemctl --user restart codetrail-main
 tmux:
 
 ```bash
-./scripts/stop-all.sh
+./scripts/quit.sh
 ```
 
 systemd:`systemctl --user stop codetrail-{main,embed,rerank,vl}`
@@ -208,7 +208,7 @@ nvidia-smi --query-gpu=memory.used,memory.free,memory.total --format=csv
 
 ### reload OpenCode / `aicode` 設定
 
-`aicode` 啟動時讀一次 `~/.config/opencode/opencode.json` 與 `~/.config/codetrail/models.json`,**之後改檔不會自動生效**。要套用新設定:
+`aicode` 啟動時讀一次 `~/.config/opencode/opencode.json` 與 `~/.config/codetrail/models.json`,**之後改檔不會自動生效**。要大改配置(換模型 / 換 GPU / 換 ctx)最省事的是重跑 `<CODETRAIL_REPO>/set_config.sh`(會重生成全部設定並備份舊檔)。手動改的話,要套用新設定:
 
 ```bash
 # 退出 TUI(Ctrl-D 或在 TUI 內輸入 /exit)

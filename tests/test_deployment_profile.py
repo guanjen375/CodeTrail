@@ -225,3 +225,55 @@ def test_main_launcher_resolution_fails_loud_without_main_model(tmp_path):
 
     with pytest.raises(ProfileError, match="main model is unset"):
         build_server_command(service, "/opt/llama-server", env)
+
+
+def test_main_auto_fit_parameters_build_expected_command(tmp_path):
+    model = tmp_path / "main.gguf"
+    model.write_bytes(b"fixture")
+    _write_local(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "services": {
+                "main": {
+                    "parameters": {
+                        "gpu_layers": "auto",
+                        "fit": "on",
+                        "fit_target": 5120,
+                        "parallel": 1,
+                        "jinja": True,
+                    }
+                }
+            },
+        },
+    )
+    env = _env(tmp_path, AICODE_MODEL=str(model))
+    service = load_effective_profile(env).service("main")
+
+    command = build_server_command(service, "/opt/llama-server", env, must_exist=True)
+
+    assert command[command.index("-ngl") + 1] == "auto"
+    assert command[command.index("--fit") + 1] == "on"
+    assert command[command.index("--fit-target") + 1] == "5120"
+    assert command[command.index("-np") + 1] == "1"
+
+
+@pytest.mark.parametrize(
+    ("role", "parameters", "needle"),
+    [
+        ("main", {"fit": "maybe"}, "fit must be on or off"),
+        ("main", {"fit_target": 0}, "fit_target"),
+        ("main", {"parallel": 0}, "parallel"),
+        ("main", {"gpu_layers": "autox"}, "gpu_layers"),
+        ("embedding", {"fit": "on"}, "not allowed"),
+    ],
+)
+def test_auto_fit_parameter_validation_rejects_bad_values(tmp_path, role, parameters, needle):
+    _write_local(
+        tmp_path,
+        {"schema_version": 1, "services": {role: {"parameters": parameters}}},
+    )
+    env = _env(tmp_path, AICODE_MODEL="some-model")
+
+    with pytest.raises(ProfileError, match=needle):
+        load_effective_profile(env)
