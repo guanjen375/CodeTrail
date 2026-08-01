@@ -59,8 +59,8 @@ aicode
 - `tests/test_deployment_profile.py` — profile schema/precedence、惡意值拒絕、registry/mmproj、main/aux GPU precedence、`-ngl auto --fit` 參數驗證
 - `tests/test_deployment_status.py` — port/cmdline role 辨識、錯卡/錯模型;process 與 HTTP 都用 hook
 - `tests/test_profile_server_launchers.py` — start-all/main、quit.sh 與所有舊 launcher 的離線 dry-run 相容性
-- `tests/test_set_config.py` — `set_config.sh` 的前置檢查(llama-server/依賴缺失通知)、GPU/模型偵測分類、shard 齊全性、mmproj 多重配對、摘要確認模式、opencode.json 合併(保留使用者設定)、bind 安全預設、legacy env 清除、備份/還原與 end-to-end dry-run;nvidia-smi/llama-server/models 全用 fixture
-- `tests/test_launch_rollback.py` — launcher 啟動失敗的 rollback(保存 log、清理本次 tmux session、`AICODE_NO_ROLLBACK`)與依模型大小放大的 health timeout;tmux 用 monkeypatch
+- `tests/test_set_config.py` — `set_config.sh` 的前置檢查(llama-server/依賴缺失通知)、GPU/模型偵測分類、shard 齊全性、mmproj 多重配對、**整機容量可行性(無 --fit 時硬停、共卡 fit-target 抬高、附屬超額失敗)**、VL 不自動當 main、摘要確認模式、opencode.json 合併(保留使用者設定)、bind 安全預設、legacy env 清除(單一來源 `RUNTIME_OVERRIDE_ENV_KEYS`)、transaction manifest 整批還原與 end-to-end dry-run;nvidia-smi/llama-server/models 全用 fixture(容量用稀疏檔)
+- `tests/test_launch_rollback.py` — launcher 啟動失敗的 rollback(pipe-pane 持久 log、清理本次 tmux session、`AICODE_NO_ROLLBACK`)與依模型大小放大的 health timeout;tmux 用 monkeypatch
 
 ---
 

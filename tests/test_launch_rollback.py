@@ -106,6 +106,34 @@ def test_rollback_respects_no_rollback_env(tmp_path, monkeypatch):
     assert calls == []  # 保留現場:不 capture、不 kill
 
 
+def test_start_role_pipes_server_output_to_persistent_log(tmp_path, monkeypatch):
+    calls: list[list[str]] = []
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        return _Result()
+
+    monkeypatch.setattr(launch_servers.subprocess, "run", fake_run)
+    log_dir = tmp_path / "logs"
+    launch_servers._start_role(
+        _service("main"), ["llama-server", "-m", "x"], "s-main",
+        first_in_session=True, log_dir=log_dir,
+    )
+
+    # 從啟動第一刻就 pipe-pane 持續寫 log(llama-server 秒退時 capture-pane 抓不到)
+    assert (log_dir / "main.log").exists()
+    pipes = [cmd for cmd in calls if cmd[:2] == ["tmux", "pipe-pane"]]
+    assert pipes, calls
+    assert "-o" in pipes[0]
+    assert "s-main:main" in pipes[0]
+    assert "main.log" in pipes[0][-1]
+
+
 def test_rollback_noop_when_nothing_created(tmp_path, monkeypatch):
     def fake_run(cmd, **_kwargs):
         raise AssertionError(f"不應呼叫 tmux:{cmd}")

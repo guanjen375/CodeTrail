@@ -268,7 +268,7 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 1. **前置檢查**:Python 依賴(mcp/numpy/requests)、`tmux`、`nvidia-smi`、`llama-server` 是否存在且支援必要旗標(`--reranking` / `--mmproj`;`--fit` 沒有只警告)。缺什麼直接給**可複製的修復指令**(裝哪個套件、跑哪行 build),修完重跑即可。
 2. **偵測與判定**:GPU 種類/VRAM、`~/models` 的 GGUF 自動分類成主聊天 / embedding / reranker / VL+mmproj 四類;多 shard 自動聚合並**驗證齊全性**(缺片、零大小、殘留 `.incomplete` 都會列出檔名與補救指令)。缺任何一類直接列出並指到 §2;單 GPU 可以跑(全部共用一顆卡)但會提示建議雙卡分工。
-3. **建議配置一頁確認**:主模型放 VRAM 最大的 GPU、三顆附屬模型共用另一顆;`ctx`(預設 65536)、`threads`、offload 策略(塞得進 VRAM → `-ngl 99`;塞不進 → 新版 llama.cpp 的 `-ngl auto --fit on` 自動配置)、`--no-mmap`(RAM 夠才開)、OpenCode `limit.context` 對齊、MCP timeout、MCP 用的 Python 路徑全部自動補好。看完按 **Enter 採用**;要逐項自選按 **a**(或直接 `./set_config.sh --advanced`);**q** 離開不寫任何檔案。
+3. **容量可行性規劃 + 建議配置一頁確認**:主模型放 VRAM 最大的 GPU、三顆附屬模型共用另一顆,並做**整機容量預估**(每張 GPU 預算 = 總 VRAM − 保留;先扣附屬模型與 KV/buffer 概估,再判主模型):附屬模型自己就塞不下 → 直接失敗;主模型塞不下且 llama-server 沒有 `--fit` → **拒絕產生必定 OOM 的設定**(`--ignore-capacity` 可強制);與附屬模型共卡時 `--fit-target` 自動抬高。有 mmproj 的 VL 模型**不會被自動選成主模型**(只剩 VL 可選時會明確警告/確認)。`ctx`(預設 65536)、`threads`、`--no-mmap`(RAM 夠才開)、OpenCode `limit.context` 對齊、MCP timeout、MCP 用的 Python 路徑全部自動補好。看完按 **Enter 採用**;要逐項自選按 **a**(或直接 `./set_config.sh --advanced`);**q** 離開不寫任何檔案。
 4. **產生四個檔案**(transaction 寫入:要嘛全套完成、要嘛完全不動;既有檔自動備份 `*.bak-setconfig-<時間戳>`,`--restore-last-backup` 可整批還原):
 
 | 產物 | 內容 |
@@ -294,8 +294,9 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 啟動時的行為(對剛接觸專案者友善):
 
+- **server log 從啟動第一刻就持續寫入** `~/.local/state/codetrail/logs/<role>.log`(tmux pipe-pane)—— 即使 llama-server 因參數或模型錯誤秒退、tmux 視窗消失,完整錯誤訊息也已經在檔案裡,`~/start.sh logs <role>` 直接看。
 - **載入進度**:大模型載入要幾分鐘,等待期間每 15 秒回報「載入中,已等待 N 秒(process 存活)」,不會看起來像當機;health 等待上限依主模型大小自動放大。llama-server process 一死就立即失敗,不會空等 timeout。
-- **失敗自動清理**:某個 role 啟動失敗時,launcher 會先把各 role 的 server log 存到 `~/.local/state/codetrail/logs/`,自動關閉本次啟動的其他服務並釋放 port,然後告訴你「修正後直接重跑 `~/start.sh`」—— 不會留下半套 tmux 讓下次啟動卡 `session already exist`(要保留現場除錯:`AICODE_NO_ROLLBACK=1`)。
+- **失敗自動清理**:某個 role 啟動失敗時,launcher 自動關閉本次啟動的其他服務並釋放 port,然後告訴你「修正後直接重跑 `~/start.sh`」—— 不會留下半套 tmux 讓下次啟動卡 `session already exist`(要保留現場除錯:`AICODE_NO_ROLLBACK=1`)。
 - **綁定**:預設四個 server 只綁 `127.0.0.1`;`--allow-remote` 設定過的才綁 `0.0.0.0`。
 
 | 預設 port | 角色 | 必要 |

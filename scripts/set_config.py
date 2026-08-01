@@ -41,7 +41,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from deployment_profile import ProfileError, load_effective_profile  # noqa: E402
+from deployment_profile import (  # noqa: E402
+    RUNTIME_OVERRIDE_ENV_KEYS,
+    ProfileError,
+    load_effective_profile,
+)
 
 GIB = 1024**3
 MIB = 1024**2
@@ -72,16 +76,20 @@ _DEFAULT_HINTS = {
 
 # 這些 env 會蓋過設定檔;驗證/預覽時剔除,產生的 ~/start.sh 也會先 unset,
 # 模擬「全新 shell」行為,避免 .bashrc 裡的舊 override 讓新設定看似無效。
-_OVERRIDE_ENV_KEYS = (
-    "AICODE_PROFILE", "AICODE_DEPLOYMENT_CONFIG", "AICODE_MODEL",
-    "AICODE_MODEL_REGISTRY", "AICODE_MODEL_REGISTRY_FILE",
-    "EMBED_MODEL", "RERANK_MODEL", "VL_GGUF", "VL_MMPROJ",
-    "AICODE_EMBED_MODEL", "AICODE_RERANK_MODEL", "AICODE_VL_MODEL", "AICODE_VL_MMPROJ",
-    "MAIN_GPU", "AUX_GPU", "EMBED_GPU", "RERANK_GPU", "VL_GPU", "CUDA_VISIBLE_DEVICES",
-    "MAIN_CTX", "MAIN_BATCH", "MAIN_UBATCH",
-    "MAIN_BIND", "EMBED_BIND", "RERANK_BIND", "VL_BIND", "AICODE_BIND",
-    "MAIN_PORT", "EMBED_PORT", "RERANK_PORT", "VL_PORT",
-)
+# 唯一來源是 deployment_profile.RUNTIME_OVERRIDE_ENV_KEYS(loader 讀哪些就清哪些)。
+_OVERRIDE_ENV_KEYS = RUNTIME_OVERRIDE_ENV_KEYS
+# tmux session 名稱不屬於 deployment 設定,但 start.sh 內也要一併清掉,
+# 確保 launch / stop 兩條路看到同一組 session 名。
+_SESSION_ENV_KEYS = ("MAIN_SESSION", "AUX_SESSION", "SESSION")
+
+# --- 容量規劃(保守可行性判定,不是精確 VRAM 模擬)--------------------------
+# 目標:不產生「明顯不可能成功」的配置。預算刻意用「GPU 總 VRAM − 保留」而非
+# nvidia-smi 當下 free:free 會被『還在跑的舊 CodeTrail server』吃掉,重跑
+# set_config 時會誤判全部塞不下;當下 free 另外做建議性提醒。
+GPU_RESERVE_MIB = 1536                 # 驅動 / 顯示 / 碎片保留
+AUX_OVERHEAD_MIB = {"embedding": 1024, "reranker": 1024, "vl": 1536}  # ctx/compute buffer 概估
+MAIN_BASE_OVERHEAD_MIB = 2048          # 主模型 compute buffer 概估
+MAIN_KV_PER_32K_MIB = 1024             # 主模型每 32k ctx 的 KV cache 概估(q8_0)
 
 
 class SetupError(RuntimeError):
@@ -112,6 +120,7 @@ class ModelCandidate:
     shards: int
     mmproj: Path | None = None            # 目錄內唯一 mmproj 時的自動配對
     mmproj_choices: tuple[Path, ...] = () # 目錄內有多個 mmproj 時的候選(需使用者選)
+    vl_paired: bool = False               # 有 mmproj 配對的 VL 模型(不自動當 main)
 
     def describe(self) -> str:
         size = f"{self.total_bytes / GIB:.1f} GB"
@@ -119,7 +128,8 @@ class ModelCandidate:
         mm = f" + mmproj: {self.mmproj.name}" if self.mmproj else ""
         if not self.mmproj and self.mmproj_choices:
             mm = f"(同目錄有 {len(self.mmproj_choices)} 個 mmproj,需選擇)"
-        return f"{self.path.name}({size}{extra}){mm}"
+        vl = "(VL 模型)" if self.vl_paired and not mm else ""
+        return f"{self.path.name}({size}{extra}){mm}{vl}"
 
 
 @dataclass
@@ -405,6 +415,14 @@ def scan_models(models_dir: Path) -> tuple[dict[str, list[ModelCandidate]], list
                         mmproj_choices=tuple(sibling_mmproj),
                     )
                 )
+                # VL 模型仍可手動選成 main(進階模式 / 明確旗標),
+                # 但標記 vl_paired:排序永遠在非 VL 之後,不會被自動選中。
+                candidate = ModelCandidate(
+                    path=candidate.path,
+                    total_bytes=candidate.total_bytes,
+                    shards=candidate.shards,
+                    vl_paired=True,
+                )
             candidates["main"].append(candidate)
 
     for role, entries in candidates.items():
@@ -413,7 +431,7 @@ def scan_models(models_dir: Path) -> tuple[dict[str, list[ModelCandidate]], list
         def sort_key(cand: ModelCandidate) -> tuple:
             hinted = 0 if any(h in str(cand.path).lower() for h in hints) else 1
             size = -cand.total_bytes if role == "main" else cand.total_bytes
-            return (hinted, size, str(cand.path))
+            return (cand.vl_paired, hinted, size, str(cand.path))
 
         entries.sort(key=sort_key)
     return candidates, broken
@@ -611,10 +629,108 @@ def _mem_total_bytes() -> int:
     return 0
 
 
+def _aux_need_mib(selection: Selection) -> int:
+    """附屬服務的保守 VRAM 需求:GGUF(+mmproj)×1.1 + 各 role 的 buffer 概估。"""
+    size = selection.candidate.total_bytes
+    if selection.role == "vl" and selection.mmproj is not None:
+        try:
+            size += selection.mmproj.stat().st_size
+        except OSError:
+            pass
+    return int(size * 1.1 / MIB) + AUX_OVERHEAD_MIB[selection.role]
+
+
+def _main_need_mib(candidate: ModelCandidate, ctx: int) -> int:
+    overhead = MAIN_BASE_OVERHEAD_MIB + int(ctx / 32768 * MAIN_KV_PER_32K_MIB)
+    return int(candidate.total_bytes * 1.05 / MIB) + overhead
+
+
+def plan_capacity(
+    plan: Plan,
+    fit_supported: bool,
+    fit_target_arg: int,
+    ignore: bool,
+    notes: list[str],
+) -> tuple[bool, int]:
+    """整機容量可行性判定(GPT 評估的最後一個 P0)。
+
+    1. 每張 GPU 預算 = 總 VRAM − 保留;先扣 aux(embedding/reranker/vl+mmproj)。
+    2. aux 自己就塞不下 → 硬性失敗(不產生必定 OOM 的設定)。
+    3. main 與 aux 同卡時,從 main 預算扣掉同卡 aux。
+    4. main 塞不下且 llama-server 沒有 --fit → 硬性失敗,不再退回 -ngl 99。
+    5. main 塞不下但有 --fit → 允許,共卡時把 fit-target 抬高到「同卡 aux + 保留」。
+    `--ignore-capacity` 可把硬性失敗降為警告(進階者自負)。
+    回傳 (main 是否整顆塞得下, 建議 fit_target)。
+    """
+    budget = {gpu.index: gpu.total_mib - GPU_RESERVE_MIB for gpu in plan.gpus}
+    aux_by_gpu: dict[int, int] = {}
+    for selection in (plan.embedding, plan.reranker, plan.vl):
+        need = _aux_need_mib(selection)
+        aux_by_gpu[selection.gpu.index] = aux_by_gpu.get(selection.gpu.index, 0) + need
+
+    for index, need in sorted(aux_by_gpu.items()):
+        if need > budget.get(index, 0):
+            message = (
+                f"容量判定不通過:三顆附屬模型在 GPU {index} 需要約 {need} MiB,"
+                f"但該卡預算只有 {budget.get(index, 0)} MiB(總 VRAM − 保留 {GPU_RESERVE_MIB})。"
+                "請把附屬模型分到別的 GPU(--advanced / --embed-gpu 等),或換較小的附屬模型。"
+            )
+            if ignore:
+                notes.append("⚠(--ignore-capacity)" + message)
+            else:
+                raise SetupError(message + "\n(明知風險仍要產生設定:--ignore-capacity)")
+
+    main_index = plan.main.gpu.index
+    main_aux = aux_by_gpu.get(main_index, 0)
+    remaining = budget.get(main_index, 0) - main_aux
+    main_need = _main_need_mib(plan.main.candidate, plan.ctx)
+    fits = main_need <= remaining
+    shared = "(與附屬模型共卡)" if main_aux else ""
+    notes.append(
+        f"容量預估:GPU {main_index} 預算 {budget.get(main_index, 0)} MiB{shared},"
+        f"同卡附屬約 {main_aux} MiB,主模型含 KV/buffer 約需 {main_need} MiB → "
+        + ("整顆塞得下" if fits else "塞不下(需要 CPU offload)")
+    )
+    if not fits and not fit_supported:
+        message = (
+            "容量判定不通過:主模型放不下所選 GPU,而你的 llama-server 不支援 --fit"
+            "(自動 GPU/CPU 配置)—— 直接 -ngl 99 啟動幾乎必定 OOM,拒絕產生這種設定。\n"
+            "  修法(擇一):更新並重新 build llama.cpp(README §1.5)/ 選較小量化的主模型 /"
+            " --advanced 手動調 n_cpu_moe。"
+        )
+        if ignore:
+            notes.append("⚠(--ignore-capacity)" + message)
+        else:
+            raise SetupError(message + "\n(明知風險仍要產生設定:--ignore-capacity)")
+
+    fit_target = fit_target_arg
+    if not fits and main_aux:
+        # 共卡時 --fit 要多留出同卡附屬模型的空間,否則 main 自動吃滿後 aux 起不來。
+        raised = main_aux + GPU_RESERVE_MIB
+        if raised > fit_target:
+            fit_target = raised
+            notes.append(
+                f"主模型與附屬模型共用 GPU {main_index} → --fit-target 自動抬高到 "
+                f"{fit_target} MiB(同卡附屬 {main_aux} + 保留 {GPU_RESERVE_MIB})。"
+            )
+
+    # 建議性提醒:規劃用「總 VRAM」;當下 free 不足通常是舊 server / 其他程式還占著。
+    for gpu in plan.gpus:
+        planned = aux_by_gpu.get(gpu.index, 0)
+        if gpu.index == main_index:
+            planned += min(main_need, max(remaining, 0)) if fits else max(remaining, 0)
+        if planned and gpu.free_mib < planned:
+            notes.append(
+                f"⚠ GPU {gpu.index} 目前只剩 {gpu.free_mib} MiB free(規劃需 ~{planned} MiB):"
+                "有其他程式或舊 CodeTrail server 佔用,啟動前先釋放(~/start.sh stop)。"
+            )
+    return fits, fit_target
+
+
 def recommend_main(plan_gpu: Gpu, candidate: ModelCandidate, ctx: int, threads: int,
-                   fit_target: int, fit_supported: bool,
+                   fit_target: int, fit_supported: bool, fits_in_budget: bool,
                    notes: list[str]) -> tuple[dict, int, int]:
-    """依主模型大小 vs 所選 GPU VRAM 推薦 offload 策略與 batch。"""
+    """依容量規劃結果(fits_in_budget 來自 plan_capacity)決定 offload 策略與 batch。"""
     parameters: dict = {
         "jinja": True,
         "flash_attention": "on",
@@ -622,13 +738,12 @@ def recommend_main(plan_gpu: Gpu, candidate: ModelCandidate, ctx: int, threads: 
         "cache_type_v": "q8_0",
         "threads": threads,
     }
-    fits_in_vram = candidate.total_bytes <= plan_gpu.total_mib * MIB * 0.85
-    if fits_in_vram:
+    if fits_in_budget:
         parameters["gpu_layers"] = 99
         batch, ubatch = 2048, 512
         notes.append(
             f"主模型 {candidate.total_bytes / GIB:.0f} GB 可整顆放進 "
-            f"{plan_gpu.name}({plan_gpu.total_mib} MiB)→ 全 GPU offload(-ngl 99)。"
+            f"{plan_gpu.name}(含同卡附屬與 KV/buffer 預估)→ 全 GPU offload(-ngl 99)。"
         )
     else:
         batch, ubatch = 1024, 256
@@ -637,16 +752,16 @@ def recommend_main(plan_gpu: Gpu, candidate: ModelCandidate, ctx: int, threads: 
                 {"gpu_layers": "auto", "fit": "on", "fit_target": fit_target, "parallel": 1}
             )
             notes.append(
-                f"主模型 {candidate.total_bytes / GIB:.0f} GB 超過 {plan_gpu.name} 的 VRAM → "
+                f"主模型 {candidate.total_bytes / GIB:.0f} GB 放不下 {plan_gpu.name} 的可用預算 → "
                 f"用 llama.cpp 自動配置(-ngl auto --fit on --fit-target {fit_target}),"
                 "由 server 自行決定 GPU/CPU 層分配。"
             )
         else:
+            # 只有 --ignore-capacity 才會走到這裡(plan_capacity 已警告過)。
             parameters["gpu_layers"] = 99
             notes.append(
-                "⚠ 你的 llama-server 不支援 --fit,且主模型大於 VRAM —— 這樣啟動很可能 OOM。"
-                "建議更新並重新 build llama.cpp(README §1.5),"
-                "或自行在 ~/.config/codetrail/deployment.json 調 n_cpu_moe。"
+                "⚠ 主模型大於可用 VRAM 且無 --fit,仍依 --ignore-capacity 產生 -ngl 99 設定"
+                "(預期會 OOM,風險自負)。"
             )
     mem_total = _mem_total_bytes()
     if mem_total and mem_total > candidate.total_bytes + 32 * GIB:
@@ -913,7 +1028,7 @@ def build_start_sh(plan: Plan) -> str:
         else "127.0.0.1(僅本機;要開放其他機器 → 重跑 ./set_config.sh --allow-remote)"
     )
     exports = "\n".join(_gpu_exports(plan))
-    unset_line = " ".join(_OVERRIDE_ENV_KEYS)
+    unset_line = " ".join((*_OVERRIDE_ENV_KEYS, *_SESSION_ENV_KEYS))
     quit_sh = shlex.quote(str(REPO_ROOT / "scripts" / "quit.sh"))
     status_sh = shlex.quote(str(REPO_ROOT / "scripts" / "check-status.sh"))
     return f"""#!/usr/bin/env bash
@@ -937,8 +1052,14 @@ def build_start_sh(plan: Plan) -> str:
 #   ~/start.sh            啟動四個 llama-server(tmux 背景)
 #   ~/start.sh status     檢查四個 server 狀態(= scripts/check-status.sh)
 #   ~/start.sh stop       全部停止(= scripts/quit.sh)
-#   ~/start.sh logs [role] 看啟動失敗時保存的 server log(main/embedding/reranker/vl)
+#   ~/start.sh logs [role] 看 server log(啟動起即時寫入;main/embedding/reranker/vl)
 set -euo pipefail
+
+# 先清掉會遮蔽 ~/.config/codetrail 設定檔的舊環境變數(例如寫在 ~/.bashrc 的
+# EMBED_MODEL / MAIN_CTX / CUDA_VISIBLE_DEVICES / SESSION 名稱)。清單來自
+# deployment_profile.RUNTIME_OVERRIDE_ENV_KEYS;進階覆寫請改 deployment.json。
+# 放在子命令之前:launch / stop / status 三條路看到的 session 名與設定才一致。
+unset {unset_line} 2>/dev/null || true
 
 case "${{1:-}}" in
   status)
@@ -954,10 +1075,6 @@ case "${{1:-}}" in
     exec tail -n "${{3:-120}}" "${{XDG_STATE_HOME:-$HOME/.local/state}}/codetrail/logs/$role.log"
     ;;
 esac
-
-# 清掉會遮蔽 ~/.config/codetrail 設定檔的舊環境變數(例如寫在 ~/.bashrc 的
-# EMBED_MODEL / MAIN_CTX / CUDA_VISIBLE_DEVICES)。進階覆寫請改 deployment.json。
-unset {unset_line} 2>/dev/null || true
 
 export AICODE_MODEL={shlex.quote(plan.main_key)}
 {exports}
@@ -980,9 +1097,15 @@ def _backup(path: Path, notes: list[str]) -> Path | None:
     return None
 
 
-def commit_files(targets: list[tuple[Path, str, int]], notes: list[str], dry_run: bool) -> None:
+def _manifest_path(home: Path) -> Path:
+    return home / ".config" / "codetrail" / "setconfig-last-transaction.json"
+
+
+def commit_files(targets: list[tuple[Path, str, int]], notes: list[str], dry_run: bool,
+                 home: Path | None = None) -> None:
     """四個產物的 transaction:全部先寫 staging,備份既有檔,再逐一原子替換;
-    任一步失敗 → 還原備份、清掉 staging,不留半套狀態。"""
+    任一步失敗 → 還原備份、清掉 staging,不留半套狀態。成功後寫入 transaction
+    manifest(同一次設定的備份對應表),讓 --restore-last-backup 能整批一致還原。"""
     if dry_run:
         for path, content, _mode in targets:
             print(f"\n--- [dry-run] 將寫入 {path} ---\n{content}", end="")
@@ -1002,9 +1125,11 @@ def commit_files(targets: list[tuple[Path, str, int]], notes: list[str], dry_run
         raise
 
     backups: dict[Path, Path | None] = {}
+    existed: dict[Path, bool] = {}
     replaced: list[Path] = []
     try:
         for _tmp, path, _mode in staged:
+            existed[path] = path.exists()
             backups[path] = _backup(path, notes)
         for tmp, path, _mode in staged:
             os.replace(tmp, path)
@@ -1020,9 +1145,58 @@ def commit_files(targets: list[tuple[Path, str, int]], notes: list[str], dry_run
             Path(tmp).unlink(missing_ok=True)
         raise
 
+    if home is not None:
+        manifest = {
+            "transaction": time.strftime("%Y%m%d-%H%M%S"),
+            "targets": {
+                str(path): {
+                    "existed": existed.get(path, False),
+                    "backup": str(backups[path]) if backups.get(path) else None,
+                }
+                for _tmp, path, _mode in staged
+            },
+        }
+        try:
+            _manifest_path(home).write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            notes.append(f"⚠ transaction manifest 寫入失敗({exc});--restore-last-backup 會退回逐檔模式。")
+
 
 def restore_last_backup(home: Path) -> int:
-    """把四個產物還原到最近一次 *.bak-setconfig-* 備份。"""
+    """依最近一次 transaction manifest 整批還原:當時存在的檔案還原備份、
+    當時不存在的檔案刪除。沒有 manifest 才退回「逐檔最新備份」的舊行為。"""
+    manifest_file = _manifest_path(home)
+    if manifest_file.is_file():
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            targets = manifest.get("targets", {})
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[set_config] manifest 無法解析({exc}),退回逐檔模式。", file=sys.stderr)
+            targets = {}
+        if targets:
+            print(f"[set_config] 依 transaction {manifest.get('transaction')} 整批還原:")
+            restored = 0
+            for target_str, info in targets.items():
+                target = Path(target_str)
+                if info.get("existed") and info.get("backup"):
+                    backup = Path(info["backup"])
+                    if backup.is_file():
+                        shutil.copy2(backup, target)
+                        print(f"  已還原 {target} ← {backup.name}")
+                        restored += 1
+                    else:
+                        print(f"  ⚠ 備份不見了:{backup}(略過 {target.name})")
+                else:
+                    target.unlink(missing_ok=True)
+                    print(f"  已移除 {target}(該次設定前不存在)")
+                    restored += 1
+            print(f"[set_config] 完成:{restored}/{len(targets)} 個檔案回到該次設定前狀態。")
+            return 0 if restored else 2
+
+    # 舊備份(無 manifest)的退路:逐檔取最新備份,可能混合不同次設定。
+    print("[set_config] 找不到 transaction manifest,退回逐檔最新備份(可能混合不同次設定):")
     targets = [
         home / ".config" / "codetrail" / "models.json",
         home / ".config" / "codetrail" / "deployment.json",
@@ -1146,7 +1320,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--ctx", type=int, help=f"主模型 context(-c),預設 {DEFAULT_MAIN_CTX}")
     parser.add_argument("--threads", type=int, help="主模型 CPU threads(-t),預設 nproc/2")
     parser.add_argument("--fit-target", type=int, default=DEFAULT_FIT_TARGET_MIB,
-                        help=f"--fit-target MiB(預設 {DEFAULT_FIT_TARGET_MIB})")
+                        help=f"--fit-target MiB(預設 {DEFAULT_FIT_TARGET_MIB};與附屬模型共卡時會自動抬高)")
+    parser.add_argument("--ignore-capacity", action="store_true",
+                        help="容量判定不通過仍產生設定(預期 OOM,風險自負)")
     parser.add_argument("--no-preview", action="store_true", help="結尾不跑 start-all.sh --dry-run 預覽")
     return parser
 
@@ -1246,9 +1422,25 @@ def run(args: argparse.Namespace) -> int:
     threads = choose_int("主模型 CPU threads(-t)", default_threads, args.threads,
                          assume_yes=not ask)
 
-    parameters, batch, ubatch = recommend_main(
-        main_gpu, main_cand, ctx, threads, args.fit_target, llama_caps.get("fit", True), notes
-    )
+    # 只剩 VL 模型可當 main 時要明確確認(自動排序已保證:有非 VL 候選就不會選到 VL)。
+    if main_cand.vl_paired and args.main_model is None and all(
+        cand.vl_paired for cand in candidates["main"]
+    ):
+        if ask:
+            raw = _input(
+                f"沒有非 VL 的主聊天模型;要把 VL 模型 {main_cand.path.name} 同時當 main 嗎?"
+                "(工具呼叫行為視模型而定;Y/n): "
+            ).strip().lower()
+            if raw in {"n", "no"}:
+                raise SetupError(
+                    "已取消:請先下載一顆主聊天模型(README §2.2)再重跑 ./set_config.sh。"
+                )
+        notes.append(
+            f"⚠ 沒有非 VL 的主聊天模型候選,已把 VL 模型 {main_cand.path.name} 同時當 main"
+            "(VL service 會再載一份)。工具呼叫品質視該模型而定;"
+            "建議另外下載一顆主聊天模型(README §2.2)。"
+        )
+
     plan = Plan(
         gpus=gpus,
         main=Selection("main", main_cand, main_gpu),
@@ -1258,13 +1450,26 @@ def run(args: argparse.Namespace) -> int:
         main_key=sanitize_registry_key(main_cand.path),
         ctx=ctx,
         threads=threads,
-        batch=batch,
-        ubatch=ubatch,
+        batch=0,
+        ubatch=0,
         allow_remote=allow_remote,
-        parameters=parameters,
+        parameters={},
         notes=notes,
     )
     _warn_unverified_aux(plan)
+
+    # 整機容量可行性(P0):aux 先配、main 扣同卡預算;不可行就 fail-loud,
+    # 不產生「結構正確但必定 OOM」的設定。
+    fits_in_budget, fit_target = plan_capacity(
+        plan, llama_caps.get("fit", True), args.fit_target, args.ignore_capacity, notes
+    )
+    parameters, batch, ubatch = recommend_main(
+        main_gpu, main_cand, ctx, threads, fit_target,
+        llama_caps.get("fit", True), fits_in_budget, notes,
+    )
+    plan.parameters = parameters
+    plan.batch = batch
+    plan.ubatch = ubatch
     if allow_remote:
         notes.append("⚠ --allow-remote:四個 llama-server 會綁 0.0.0.0,同網段任何人都能呼叫模型 API"
                      "(llama-server 無認證)。只在可信內網使用,必要時加防火牆規則。")
@@ -1311,6 +1516,7 @@ def run(args: argparse.Namespace) -> int:
         ],
         notes,
         args.dry_run,
+        home=home,
     )
 
     print("\n=== 結果 ===")

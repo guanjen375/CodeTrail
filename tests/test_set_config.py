@@ -14,6 +14,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+from deployment_profile import RUNTIME_OVERRIDE_ENV_KEYS
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "set_config.sh"
 
@@ -22,16 +24,20 @@ TWO_GPUS = (
     "1, NVIDIA RTX 2000 Ada Generation, 16380, 15000, GPU-bbbb-2000"
 )
 
-_PROFILE_ENV_KEYS = {
-    "AICODE_PROFILE", "AICODE_DEPLOYMENT_CONFIG", "AICODE_MODEL",
-    "AICODE_MODEL_REGISTRY", "AICODE_MODEL_REGISTRY_FILE",
-    "EMBED_MODEL", "RERANK_MODEL", "VL_GGUF", "VL_MMPROJ",
-    "AICODE_EMBED_MODEL", "AICODE_RERANK_MODEL", "AICODE_VL_MODEL", "AICODE_VL_MMPROJ",
-    "MAIN_GPU", "AUX_GPU", "EMBED_GPU", "RERANK_GPU", "VL_GPU", "CUDA_VISIBLE_DEVICES",
-    "MAIN_CTX", "MAIN_BATCH", "MAIN_UBATCH", "MODELS_DIR", "LLAMA_BIN",
-    "MAIN_BIND", "EMBED_BIND", "RERANK_BIND", "VL_BIND", "AICODE_BIND",
+GIB = 1024**3
+
+# 會影響有效設定的 env 一律引用 deployment_profile 的單一來源,只補測試自身用的鍵。
+_PROFILE_ENV_KEYS = set(RUNTIME_OVERRIDE_ENV_KEYS) | {
+    "MODELS_DIR", "LLAMA_BIN",
     "MAIN_SESSION", "AUX_SESSION", "SESSION",
+    "MAIN_HEALTH_TIMEOUT", "RAG_HEALTH_TIMEOUT",
 }
+
+
+def _sparse(path: Path, size: int) -> None:
+    """建立指定 st_size 的稀疏檔:容量規劃只看大小,不需要真的占磁碟。"""
+    with open(path, "wb") as handle:
+        handle.truncate(size)
 
 
 def _write_fake_nvidia_smi(bin_dir: Path, output: str, exit_code: int = 0) -> None:
@@ -449,7 +455,7 @@ def test_noninteractive_without_flags_fails_with_hint(tmp_path):
     assert "無互動輸入環境" in proc.stderr
 
 
-def test_restore_last_backup_round_trips(tmp_path):
+def test_restore_last_backup_round_trips_whole_transaction(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
     home = tmp_path / "home"
@@ -459,8 +465,92 @@ def test_restore_last_backup_round_trips(tmp_path):
     assert _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models)).returncode == 0
     registry = json.loads((home / ".config/codetrail/models.json").read_text(encoding="utf-8"))
     assert "big-chat-ud-q4-k-xl" in registry
+    assert (home / ".config/codetrail/setconfig-last-transaction.json").is_file()
 
     proc = _run(tmp_path, "--restore-last-backup")
     assert proc.returncode == 0, proc.stderr
+    # manifest 整批還原:當時存在的檔案回到備份內容…
     restored = json.loads((home / ".config/codetrail/models.json").read_text(encoding="utf-8"))
     assert restored == {"marker": "/old.gguf"}
+    # …當時不存在的檔案被移除,不會殘留半套設定
+    assert not (home / ".config/codetrail/deployment.json").exists()
+    assert not (home / ".config/opencode/opencode.json").exists()
+    assert not (home / "start.sh").exists()
+
+
+def test_vl_model_is_not_auto_selected_as_main(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    # VL 模型比一般聊天模型大很多:舊排序(越大越優先)會誤選它當 main
+    _sparse(models / "vl" / "vl-model-q6.gguf", 8 * GIB)
+
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert proc.returncode == 0, proc.stderr
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    assert deployment["services"]["main"]["model"] == "big-chat-ud-q4-k-xl"
+    assert deployment["services"]["vl"]["model"].endswith("vl-model-q6.gguf")
+
+
+def test_only_vl_main_candidate_proceeds_with_warning(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    shutil.rmtree(models / "big-chat")
+
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert proc.returncode == 0, proc.stderr
+    assert "同時當 main" in proc.stdout
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    assert deployment["services"]["main"]["model"] == "vl-model-q6"
+
+
+def test_capacity_main_too_big_without_fit_hard_stops(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", "0, Small GPU, 24576, 20000, GPU-small")
+    models = _make_models(tmp_path)
+    _sparse(models / "big-chat" / "big-chat-ud-q4_k_xl-00001-of-00002.gguf", 13 * GIB)
+    _sparse(models / "big-chat" / "big-chat-ud-q4_k_xl-00002-of-00002.gguf", 12 * GIB)
+    _write_fake_llama(tmp_path, help_flags="--reranking --mmproj")  # 沒有 --fit
+
+    proc = _run(tmp_path, "--yes", "--models-dir", str(models))
+    assert proc.returncode == 2
+    assert "容量判定不通過" in proc.stderr
+    assert "--fit" in proc.stderr
+    assert "--ignore-capacity" in proc.stderr
+
+    # 明知風險仍可用 --ignore-capacity 產生(警告後 -ngl 99)
+    forced = _run(tmp_path, "--yes", "--no-preview", "--ignore-capacity", "--models-dir", str(models))
+    assert forced.returncode == 0, forced.stderr
+    assert "風險自負" in forced.stdout
+
+
+def test_capacity_shared_gpu_raises_fit_target(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", "0, Small GPU, 24576, 20000, GPU-small")
+    models = _make_models(tmp_path)
+    _sparse(models / "big-chat" / "big-chat-ud-q4_k_xl-00001-of-00002.gguf", 13 * GIB)
+    _sparse(models / "big-chat" / "big-chat-ud-q4_k_xl-00002-of-00002.gguf", 12 * GIB)
+    _sparse(models / "vl" / "vl-model-q6.gguf", 4 * GIB)  # 共卡的附屬模型夠大才看得出抬高
+
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert proc.returncode == 0, proc.stderr
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    parameters = deployment["services"]["main"]["parameters"]
+    assert parameters["fit"] == "on"
+    assert parameters["gpu_layers"] == "auto"
+    # 預設 5120 → 抬高到「同卡附屬 + 保留」量級
+    assert 9000 < parameters["fit_target"] < 11000
+
+
+def test_capacity_aux_alone_exceeding_budget_fails(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", "0, Tiny GPU, 4096, 3500, GPU-tiny")
+    models = _make_models(tmp_path)
+    _sparse(models / "vl" / "vl-model-q6.gguf", 8 * GIB)
+
+    proc = _run(tmp_path, "--yes", "--models-dir", str(models))
+    assert proc.returncode == 2
+    assert "容量判定不通過" in proc.stderr
+    assert "附屬模型" in proc.stderr

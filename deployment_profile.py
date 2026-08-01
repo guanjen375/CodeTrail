@@ -458,10 +458,11 @@ def _environment_model(value: str, role: str, where: str) -> str:
     return bare
 
 
-def _environment_overlay(env: Mapping[str, str], current: dict[str, Any]) -> dict[str, Any]:
-    services: dict[str, Any] = {}
-    env_fields = {
-        "main": {
+# role → 欄位 → 可覆寫該欄位的 env 名稱。這是 runtime override 的唯一定義處;
+# RUNTIME_OVERRIDE_ENV_KEYS 由此推導,set_config / start.sh 產生器 / 測試一律引用它,
+# 不再各自維護清單(GPT 評估 #13:清單分叉會讓 .bashrc 舊變數蓋過新設定)。
+_ENV_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
+    "main": {
             "model": ("AICODE_MODEL",),
             "base_url": ("AICODE_LLAMA_BASE_URL",),
             "port": ("MAIN_PORT", "AICODE_MAIN_PORT"),
@@ -498,8 +499,30 @@ def _environment_overlay(env: Mapping[str, str], current: dict[str, Any]) -> dic
             "batch": ("VL_BATCH", "AICODE_VL_BATCH"),
             "ubatch": ("VL_UBATCH", "AICODE_VL_UBATCH"),
         },
+}
+
+# 會影響有效 deployment 設定的全部環境變數(供 set_config / start.sh / 測試清理用):
+# _ENV_FIELDS 推導的 per-role 覆寫 + profile/registry 選擇 + GPU selector。
+RUNTIME_OVERRIDE_ENV_KEYS: tuple[str, ...] = tuple(sorted(
+    {name for fields in _ENV_FIELDS.values() for names in fields.values() for name in names}
+    | {
+        "AICODE_PROFILE",
+        "AICODE_DEPLOYMENT_CONFIG",
+        "AICODE_MODEL_REGISTRY",
+        "AICODE_MODEL_REGISTRY_FILE",
+        "MAIN_GPU",
+        "AUX_GPU",
+        "EMBED_GPU",
+        "RERANK_GPU",
+        "VL_GPU",
+        "CUDA_VISIBLE_DEVICES",
     }
-    for role, fields in env_fields.items():
+))
+
+
+def _environment_overlay(env: Mapping[str, str], current: dict[str, Any]) -> dict[str, Any]:
+    services: dict[str, Any] = {}
+    for role, fields in _ENV_FIELDS.items():
         role_overlay: dict[str, Any] = {}
         base_was_set = False
         port_was_set = False

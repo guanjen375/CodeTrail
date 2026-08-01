@@ -249,6 +249,7 @@ def _start_role(
     session: str,
     *,
     first_in_session: bool,
+    log_dir: Path | None = None,
 ) -> None:
     window = WINDOWS[service.role]
     command_line = shlex.join(command)
@@ -257,6 +258,21 @@ def _start_role(
     else:
         tmux_args = ["tmux", "new-window", "-t", session, "-n", window, command_line]
     subprocess.run(tmux_args, check=True)
+    if log_dir is not None:
+        # 從啟動第一刻就把 server 輸出持續寫進一般檔案:llama-server 若因參數/模型
+        # 錯誤立即退出,tmux window 會消失、事後 capture-pane 抓不到 —— pipe-pane
+        # 保證失敗當下的 log 已經在磁碟上。
+        log_path = log_dir / f"{service.role}.log"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("", encoding="utf-8")  # 每次啟動重寫該 role 的 log
+            subprocess.run(
+                ["tmux", "pipe-pane", "-o", "-t", f"{session}:{window}",
+                 f"cat >> {shlex.quote(str(log_path))}"],
+                check=False,
+            )
+        except OSError:
+            pass
     print(f"[+] started {service.role} server ({service.base_url}) in tmux {session}:{window}")
 
 
@@ -304,8 +320,14 @@ def _rollback_started(
     log_dir = _state_log_dir(environ)
     saved: list[str] = []
     for service in started_roles:
+        dest = log_dir / f"{service.role}.log"
+        try:
+            piped = dest.is_file() and dest.stat().st_size > 0
+        except OSError:
+            piped = False
+        # pipe-pane 已持續寫入的 log 不覆蓋(capture-pane 只是 window 還活著時的補充)。
         session = _session_for(service.role, sessions)
-        if _capture_window_log(session, WINDOWS[service.role], log_dir / f"{service.role}.log"):
+        if piped or _capture_window_log(session, WINDOWS[service.role], dest):
             saved.append(service.role)
     for session in created_sessions:
         subprocess.run(
@@ -360,6 +382,8 @@ def launch(
         if _port_responds(service):
             raise ProfileError(f"{service.role} port {service.port} is already in use ({service.base_url})")
 
+    log_dir = _state_log_dir(environ)
+    print(f"[i] server log 即時寫入:{log_dir}/<role>.log(~/start.sh logs <role> 可查看)")
     started_sessions: set[str] = set()
     created_sessions: list[str] = []
     started_roles: list[ServiceProfile] = []
@@ -367,7 +391,11 @@ def launch(
         for service in services:
             session = _session_for(service.role, sessions)
             command = _command_for(service, str(binary), environ, must_exist=True)
-            _start_role(service, command, session, first_in_session=session not in started_sessions)
+            _start_role(
+                service, command, session,
+                first_in_session=session not in started_sessions,
+                log_dir=log_dir,
+            )
             if session not in started_sessions:
                 created_sessions.append(session)
             started_sessions.add(session)
