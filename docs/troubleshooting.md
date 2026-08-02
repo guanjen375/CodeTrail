@@ -103,15 +103,15 @@ nvidia-smi -l 1                                              # GPU 是否在動
 
 > CodeTrail 自己的內部呼叫(agent loop / 全文分析 / strict 自我複查)除了 temp 0.0/0.2,也已經把 `top_p / top_k / min_p` 釘在 Qwen 建議值(`config.py` 的 `CHAT_TOP_P` / `CHAT_TOP_K` / `CHAT_MIN_P`,可用 `AICODE_CHAT_TOP_P` / `AICODE_CHAT_TOP_K` / `AICODE_CHAT_MIN_P` env 覆寫),所以即使 server 忘了帶旗標,**CodeTrail 路徑仍然是穩的**。會吃到 server 預設、需要靠上面 ② 修的,只有 OpenCode 純聊天路徑。
 
-### `pip install hf-transfer` 報 `error: externally-managed-environment`
+### `pip install huggingface_hub` 報 `error: externally-managed-environment`
 
 Ubuntu 24.04(PEP 668)的 Python 拒絕 system-wide pip install。加 `--user --break-system-packages`:
 
 ```bash
-pip install --user --break-system-packages hf-transfer
+python3 -m pip install --user --break-system-packages -U huggingface_hub
 ```
 
-`--user` 把套件裝進 `~/.local/lib/pythonX.Y/site-packages`,不會動到系統 Python。
+`--user` 把套件裝進 `~/.local/lib/pythonX.Y/site-packages`,不會動到系統 Python。新版 `huggingface_hub` 會同時提供 `hf` CLI 與 `hf_xet`;不要再另外安裝已移除的 `hf-transfer`。
 
 ### `/status` 沒看到 CodeTrail MCP Connected
 

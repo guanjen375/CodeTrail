@@ -210,17 +210,17 @@ cmake --build build --config Release -j
 
 模型統一放 `~/models`(`set_config.sh` 預設掃這裡;放別處用 `MODELS_DIR` 或 `--models-dir` 指定)。
 
-### 2.1 安裝 Hugging Face CLI + hf-transfer 加速
+### 2.1 安裝 Hugging Face CLI + Xet 加速
 
-下載指令使用 Hugging Face 新版 `hf` CLI;`hf-transfer` 只負責加速下載,不提供 `hf` 命令本身。預設下載走單連線,實測 ~12 MB/s;裝 `hf-transfer` 後可以拉到 ~270 MB/s(視網路與 HF CDN 上限):
+下載指令使用 Hugging Face 新版 `hf` CLI。新版 `huggingface_hub` 會一併安裝 `hf_xet`,下載時預設自動使用 Xet 與 adaptive concurrency;舊的 `hf-transfer` 已移除,`HF_HUB_ENABLE_HF_TRANSFER` 也不再生效:
 
 ```bash
-python3 -m pip install --user --break-system-packages -U "huggingface_hub[cli]" hf-transfer
+python3 -m pip install --user --break-system-packages -U huggingface_hub
 command -v hf    # 沒輸出代表 ~/.local/bin 不在 PATH(見 Quick Start 第 5 步的修法)
-python3 -c "import hf_transfer; print('hf-transfer', hf_transfer.__version__)"
+python3 -c "from importlib.metadata import version; print('hf-xet', version('hf-xet'))"
 ```
 
-啟用方式:下載指令前面加 `HF_HUB_ENABLE_HF_TRANSFER=1`。
+下面的大型 GGUF 範例以 `HF_XET_HIGH_PERFORMANCE=1` 啟用 Xet 高效能模式。它會積極使用網路、CPU 與較大的記憶體 buffer;若機器 RAM 少於 64GB,拿掉這段前綴即可使用預設的 adaptive concurrency。
 
 ### 2.2 下載主聊天模型(`<CODE_MODEL>`)
 
@@ -232,7 +232,7 @@ CodeTrail 的 RAG / Code-RAG 預設使用 `bge-m3`(embedding)與 `qwen3-reranker
 
 ```bash
 # embedding:bge-m3 (用 f16,不要量化 — embedding 對量化敏感,Q4 會明顯影響召回)
-HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
+HF_XET_HIGH_PERFORMANCE=1 hf download \
   CompendiumLabs/bge-m3-gguf bge-m3-f16.gguf \
   --local-dir ~/models/bge-m3
 

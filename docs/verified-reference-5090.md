@@ -17,7 +17,7 @@ reference，不是 CodeTrail 全域預設，也不是 H200＋RTX 2000 Ada 的推
 Reference main 可用 Hugging Face CLI 下載；它是三個 GGUF shard，registry 指向第一片：
 
 ```bash
-HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
+HF_XET_HIGH_PERFORMANCE=1 hf download \
   unsloth/Qwen3-235B-A22B-Thinking-2507-GGUF \
   --include "UD-Q4_K_XL/*" \
   --local-dir ~/models/Qwen3-235B-A22B-Thinking-2507-GGUF
