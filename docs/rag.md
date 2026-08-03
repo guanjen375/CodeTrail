@@ -239,6 +239,10 @@ batch size 上限是 32 (REF1)。
 - `query_knowledge`：把找到的文件段落丟給對話模型，模型自己組答案。
 - `query_knowledge_strict`：在背後跑兩階段檢查 — 先看找到的內容是不是真的足以回答；確認後再驗證最終答案每一句話都有對應的 `REF` 出處；任何一句沒對到的會被刪掉，證據真的太弱就直接回「拒答」而不是亂編。
 
+多份相似 spec 同時存在時可限定文件，例如
+`query_knowledge("reset value", source="npu_core_rev_b.md")`；`source` 用 basename 精確比對，
+而且在 dense/BM25 各自取 top-k 前就套用，不是事後把別份文件濾掉。嚴格版也接受同一參數。
+
 代價是後者比較慢，而且因為是後台跑，TUI 不會顯示中間過程，只看得到定稿後的答案。
 
 #### 維護
@@ -273,7 +277,7 @@ batch size 上限是 32 (REF1)。
 操作流程的主體寫在上面的「把附件做成知識庫讓模型隨時能查」，這節只列幾個補充細節：
 
 - `knowledge.json` 存在當前專案根目錄下，預設會被 `.gitignore` 忽略。它保存切碎後的文件內容，NDA 場景下幾乎一定有敏感片段，**不要 commit**。
-- `remove_document(...)` 用檔名 basename 比對，所以傳完整路徑（`docs/old_spec.pdf`）或單純檔名（`old_spec.pdf`）都可以。
+- `remove_document(...)` 用檔名 basename 比對，所以傳完整路徑（`docs/old_spec.pdf`）或單純檔名（`old_spec.pdf`）都可以。刪除會在同一把 store lock 內同步重寫 JSON 與剩餘 NPZ 向量；不會刪掉整份向量檔再期待 reload 偷偷重算。
 - 文件切段的大小、不同來源類型的搜尋權重，這些可調參數放在 `config.py` 的 `CHUNK_SETTINGS` 和 `SOURCE_TYPE_WEIGHTS`，預設值在大多數情境下已經夠用，要微調再去動。
 
 ---

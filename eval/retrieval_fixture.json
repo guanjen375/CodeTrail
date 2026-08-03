@@ -1,0 +1,275 @@
+{
+  "schema_version": 1,
+  "description": "Synthetic, NDA-safe firmware register retrieval suite. Three generated questions per fact plus five unanswerable cases = 95 cases.",
+  "facts": [
+    {
+      "id": "dma_ctrl",
+      "source": "dma_engine_rev_a.md",
+      "register": "DMA_CTRL",
+      "offset": "0x1000",
+      "reset": "0",
+      "purpose": "enabling the DMA scheduler and selecting burst mode",
+      "filter_by_source": true
+    },
+    {
+      "id": "dma_status",
+      "source": "dma_engine_rev_a.md",
+      "register": "DMA_STATUS",
+      "offset": "0x1004",
+      "reset": "1",
+      "purpose": "reporting channel busy and completion state"
+    },
+    {
+      "id": "dma_desc_base",
+      "source": "dma_engine_rev_a.md",
+      "register": "DMA_DESC_BASE",
+      "offset": "0x1010",
+      "reset": "0x80000000",
+      "purpose": "holding the descriptor ring base address"
+    },
+    {
+      "id": "dma_ring_size",
+      "source": "dma_engine_rev_a.md",
+      "register": "DMA_RING_SIZE",
+      "offset": "0x1018",
+      "reset": "64",
+      "purpose": "configuring the descriptor ring entry count"
+    },
+    {
+      "id": "dma_irq_mask",
+      "source": "dma_engine_rev_a.md",
+      "register": "DMA_IRQ_MASK",
+      "offset": "0x1020",
+      "reset": "0x0000000F",
+      "purpose": "masking DMA completion and error interrupts"
+    },
+    {
+      "id": "dma_timeout",
+      "source": "dma_engine_rev_a.md",
+      "register": "DMA_TIMEOUT",
+      "offset": "0x1024",
+      "reset": "4096",
+      "purpose": "setting the DMA watchdog threshold in cycles"
+    },
+    {
+      "id": "npu_cfg",
+      "source": "npu_core_rev_b.md",
+      "register": "NPU_CFG",
+      "offset": "0x4000",
+      "reset": "1",
+      "purpose": "selecting tensor precision and enabling the NPU core",
+      "filter_by_source": true
+    },
+    {
+      "id": "npu_status",
+      "source": "npu_core_rev_b.md",
+      "register": "NPU_STATUS",
+      "offset": "0x4004",
+      "reset": "0",
+      "purpose": "reporting NPU idle fault and saturation state"
+    },
+    {
+      "id": "npu_tile_count",
+      "source": "npu_core_rev_b.md",
+      "register": "NPU_TILE_COUNT",
+      "offset": "0x4010",
+      "reset": "32",
+      "purpose": "limiting the number of tensor tiles per dispatch"
+    },
+    {
+      "id": "npu_acc_threshold",
+      "source": "npu_core_rev_b.md",
+      "register": "NPU_ACC_THRESHOLD",
+      "offset": "0x4014",
+      "reset": "7",
+      "purpose": "setting the accumulator saturation warning threshold"
+    },
+    {
+      "id": "npu_sram_base",
+      "source": "npu_core_rev_b.md",
+      "register": "NPU_SRAM_BASE",
+      "offset": "0x4020",
+      "reset": "0x90000000",
+      "purpose": "holding the local tensor SRAM aperture base"
+    },
+    {
+      "id": "npu_fw_version",
+      "source": "npu_core_rev_b.md",
+      "register": "NPU_FW_VERSION",
+      "offset": "0x4024",
+      "reset": "0x00020301",
+      "version": "2.3.1",
+      "purpose": "exposing the loaded NPU firmware version"
+    },
+    {
+      "id": "pcie_command",
+      "source": "pcie_bridge_v3.md",
+      "register": "PCIE_COMMAND",
+      "offset": "0x0010",
+      "reset": "0x00000006",
+      "purpose": "enabling PCIe memory space and bus mastering",
+      "filter_by_source": true
+    },
+    {
+      "id": "pcie_status",
+      "source": "pcie_bridge_v3.md",
+      "register": "PCIE_STATUS",
+      "offset": "0x0014",
+      "reset": "0x00000010",
+      "purpose": "reporting PCIe capability and parity status"
+    },
+    {
+      "id": "pcie_bar0",
+      "source": "pcie_bridge_v3.md",
+      "register": "PCIE_BAR0",
+      "offset": "0x0020",
+      "reset": "0xA0000000",
+      "purpose": "mapping the device control aperture"
+    },
+    {
+      "id": "pcie_msi_addr",
+      "source": "pcie_bridge_v3.md",
+      "register": "PCIE_MSI_ADDR",
+      "offset": "0x0050",
+      "reset": "0",
+      "purpose": "holding the message signaled interrupt target address"
+    },
+    {
+      "id": "pcie_link_ctrl",
+      "source": "pcie_bridge_v3.md",
+      "register": "PCIE_LINK_CTRL",
+      "offset": "0x0080",
+      "reset": "0x00000020",
+      "purpose": "controlling PCIe link retraining and power state"
+    },
+    {
+      "id": "pcie_aer_mask",
+      "source": "pcie_bridge_v3.md",
+      "register": "PCIE_AER_MASK",
+      "offset": "0x0108",
+      "reset": "0x0000FFFF",
+      "purpose": "masking advanced error reporting events"
+    },
+    {
+      "id": "sec_boot_cfg",
+      "source": "security_block_r2.md",
+      "register": "SEC_BOOT_CFG",
+      "offset": "0x7000",
+      "reset": "1",
+      "purpose": "enforcing authenticated boot policy",
+      "filter_by_source": true
+    },
+    {
+      "id": "sec_key_slot",
+      "source": "security_block_r2.md",
+      "register": "SEC_KEY_SLOT",
+      "offset": "0x7004",
+      "reset": "3",
+      "purpose": "selecting the hardware root key slot"
+    },
+    {
+      "id": "sec_rollback",
+      "source": "security_block_r2.md",
+      "register": "SEC_ROLLBACK",
+      "offset": "0x7010",
+      "reset": "12",
+      "purpose": "holding the minimum accepted firmware rollback counter"
+    },
+    {
+      "id": "sec_hash_base",
+      "source": "security_block_r2.md",
+      "register": "SEC_HASH_BASE",
+      "offset": "0x7020",
+      "reset": "0xB0000000",
+      "purpose": "pointing to the authenticated image hash table"
+    },
+    {
+      "id": "sec_fault_status",
+      "source": "security_block_r2.md",
+      "register": "SEC_FAULT_STATUS",
+      "offset": "0x7030",
+      "reset": "0",
+      "purpose": "reporting tamper signature and rollback faults"
+    },
+    {
+      "id": "sec_version",
+      "source": "security_block_r2.md",
+      "register": "SEC_VERSION",
+      "offset": "0x7034",
+      "reset": "0x00010005",
+      "version": "1.0.5",
+      "purpose": "exposing the security ROM interface version"
+    },
+    {
+      "id": "pmu_ctrl",
+      "source": "power_manager_rev_c.md",
+      "register": "PMU_CTRL",
+      "offset": "0x9000",
+      "reset": "0x00000001",
+      "purpose": "enabling automatic power domain sequencing",
+      "filter_by_source": true
+    },
+    {
+      "id": "pmu_status",
+      "source": "power_manager_rev_c.md",
+      "register": "PMU_STATUS",
+      "offset": "0x9004",
+      "reset": "0x00000007",
+      "purpose": "reporting rail stability and clock readiness"
+    },
+    {
+      "id": "pmu_voltage_limit",
+      "source": "power_manager_rev_c.md",
+      "register": "PMU_VOLTAGE_LIMIT",
+      "offset": "0x9010",
+      "reset": "950",
+      "purpose": "setting the maximum core rail millivolts"
+    },
+    {
+      "id": "pmu_temp_threshold",
+      "source": "power_manager_rev_c.md",
+      "register": "PMU_TEMP_THRESHOLD",
+      "offset": "0x9014",
+      "reset": "105",
+      "purpose": "setting the thermal shutdown threshold in Celsius"
+    },
+    {
+      "id": "pmu_wake_mask",
+      "source": "power_manager_rev_c.md",
+      "register": "PMU_WAKE_MASK",
+      "offset": "0x9020",
+      "reset": "0x0000003F",
+      "purpose": "selecting wakeup sources for deep sleep"
+    },
+    {
+      "id": "pmu_sleep_timer",
+      "source": "power_manager_rev_c.md",
+      "register": "PMU_SLEEP_TIMER",
+      "offset": "0x9024",
+      "reset": "2048",
+      "purpose": "setting the idle cycles before automatic sleep"
+    }
+  ],
+  "unanswerable": [
+    {
+      "id": "unknown_gpu_clock",
+      "question": "What exact GPU shader clock is guaranteed by these documents?"
+    },
+    {
+      "id": "unknown_voltage_typical",
+      "question": "What is the undocumented typical analog rail voltage?"
+    },
+    {
+      "id": "unknown_secret_key",
+      "question": "What plaintext secure boot key is programmed at manufacture?"
+    },
+    {
+      "id": "unknown_future_version",
+      "question": "Which firmware version will ship in the next unreleased product?"
+    },
+    {
+      "id": "unknown_hidden_register",
+      "question": "What is the offset of the undocumented DEBUG_BACKDOOR register?"
+    }
+  ]
+}

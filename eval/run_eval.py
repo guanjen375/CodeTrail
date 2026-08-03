@@ -301,7 +301,9 @@ def eval_spec_question(case: EvalCase, kb: KnowledgeBase, use_strict_mode: bool 
     start_time = time.time()
 
     # 查詢知識庫
-    knowledge_ctx, _, kb_metadata = kb.query(case.question)
+    knowledge_ctx, _, kb_metadata = kb.query(
+        case.question, is_strict_mode=use_strict_mode
+    )
 
     # 取得檢索到的 chunk 內容（用於 Layer 1）
     retrieved_chunks = kb_metadata.get('retrieved_chunks', [])

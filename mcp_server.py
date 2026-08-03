@@ -309,7 +309,7 @@ def _tool(*d_args, **d_kwargs):
 
 
 @_tool()
-def query_knowledge(question: str) -> dict:
+def query_knowledge(question: str, source: Optional[str] = None) -> dict:
     """Query the project knowledge base (PDF/spec/manual RAG).
 
     Use this when the user asks about specs, datasheets, manuals, or any
@@ -318,6 +318,7 @@ def query_knowledge(question: str) -> dict:
 
     Args:
         question: 自然語言問題,中英文皆可。
+        source: 可選的文件 basename；設定後只在該文件內召回。
 
     Returns:
         {
@@ -337,7 +338,7 @@ def query_knowledge(question: str) -> dict:
             "has_ref": False,
             "error": "knowledge base not loaded",
         }
-    text, display, meta = KB.query(question)
+    text, display, meta = KB.query(question, source=source)
     refs = meta.get("refs", [])
     top_score = meta.get("top_score", 0.0)
     _record_kb_interaction(
@@ -357,7 +358,7 @@ def query_knowledge(question: str) -> dict:
 
 
 @_tool()
-def query_knowledge_strict(question: str) -> dict:
+def query_knowledge_strict(question: str, source: Optional[str] = None) -> dict:
     """Strict-mode KB query: server-side LLM with refuse + 2-stage self-check.
 
     這是 server-side 嚴格模式(answer_with_self_check) — 把
@@ -411,7 +412,9 @@ def query_knowledge_strict(question: str) -> dict:
         )
         return result
 
-    knowledge_ctx, _display, meta = KB.query(question)
+    knowledge_ctx, _display, meta = KB.query(
+        question, is_strict_mode=True, source=source
+    )
     refs = meta.get("refs", [])
     top_score = meta.get("top_score", 0.0)
     top_emb_score = meta.get("top_emb_score", 0.0)
@@ -914,9 +917,8 @@ def remove_document(source: str) -> str:
     spec/PDF from the KB. Match is by basename of the `source` field stored
     in each chunk (the same string ingest_document recorded).
 
-    操作對象是 AICODE_ROOT/knowledge.json,順便刪 knowledge_emb.npz 強迫下次
-    reload 重算 embeddings(否則 hash 不一致 KB 會 warn 自動重建,效果一樣
-    只是少一次 warn)。
+    操作對象是 AICODE_ROOT/knowledge.json。刪除會在同一個 store lock 內同步
+    篩掉 NPZ 對應列並原子替換 JSON/NPZ；不會留下無向量的剩餘 chunks。
 
     **完成後必須再呼叫 reload_knowledge_base() 才會被 query_knowledge 看到**
     (KB 是啟動時載入的 singleton,跟 ingest_document 一樣)。
@@ -928,73 +930,28 @@ def remove_document(source: str) -> str:
     Returns:
         刪了幾個 chunk + 剩餘的 source 清單 + 提醒呼叫 reload。
     """
-    import json
-
     target = Path(source).name  # basename only, ignore any directory part
     kb_path = Path(AICODE_ROOT) / KNOWLEDGE_FILE
     if not kb_path.is_file():
         return f"錯誤: knowledge.json 不存在於 {kb_path}"
 
-    try:
-        kb_data = json.loads(kb_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
-        return f"錯誤: 讀 knowledge.json 失敗: {type(e).__name__}: {e}"
+    from RAG import remove_document_from_knowledge_base
 
-    chunks = kb_data.get("chunks", [])
-    md = kb_data.setdefault("metadata", {})
-    md_docs = list(md.get("documents", []))
-
-    before_chunks = len(chunks)
-    kept_chunks = [c for c in chunks if Path(str(c.get("source", ""))).name != target]
-    removed_chunks = before_chunks - len(kept_chunks)
-
-    before_docs = len(md_docs)
-    kept_docs = [d for d in md_docs if Path(str(d)).name != target]
-    removed_docs = before_docs - len(kept_docs)
-
-    if removed_chunks == 0 and removed_docs == 0:
-        sources = sorted(
-            {Path(str(c.get("source", ""))).name for c in chunks if c.get("source")}
-            | {Path(str(d)).name for d in md_docs if d}
-        )
+    result = remove_document_from_knowledge_base(kb_path, target)
+    if result["removed_chunks"] == 0 and result["removed_documents"] == 0:
         return (
-            f"找不到 source = '{target}'(chunks {before_chunks} 個、metadata.documents "
-            f"{before_docs} 筆都沒命中)。\n"
-            f"目前 KB 內的 sources:\n  - " + "\n  - ".join(sources or ["(無)"])
+            f"找不到 source = '{target}'。\n"
+            f"目前 KB 內的 sources:\n  - "
+            + "\n  - ".join(result["sources"] or ["(無)"])
         )
 
-    kb_data["chunks"] = kept_chunks
-    md["documents"] = kept_docs
-    md["total_documents"] = len(kept_docs)
-    md["total_chunks"] = len(kept_chunks)
-    from datetime import datetime, timezone
-    md["updated_at"] = datetime.now(timezone.utc).isoformat()
-
-    try:
-        kb_path.write_text(json.dumps(kb_data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError as e:
-        return f"錯誤: 寫回 knowledge.json 失敗: {e}"
-
-    # 清掉 .npz cache(內容雜湊已不一致,留著也是要 rebuild)
-    npz_path = Path(AICODE_ROOT) / KNOWLEDGE_EMB_FILE
-    npz_note = ""
-    if npz_path.is_file():
-        try:
-            npz_path.unlink()
-            npz_note = f" + 已刪 {KNOWLEDGE_EMB_FILE} 快取"
-        except OSError as e:
-            npz_note = f" (注意: 刪 {KNOWLEDGE_EMB_FILE} 失敗: {e},下次 reload 會 warn 並自動 rebuild)"
-
-    remain_sources = sorted(
-        {Path(str(c.get("source", ""))).name for c in kept_chunks if c.get("source")}
-        | {Path(str(d)).name for d in kept_docs if d}
-    )
     return (
         f"=== remove_document ✓ ===\n"
-        f"刪了 {removed_chunks} 個 chunk + {removed_docs} 筆 metadata.documents 紀錄"
-        f"(source = '{target}'),剩 {len(kept_chunks)} 個 chunk / "
-        f"{len(kept_docs)} 個文件{npz_note}。\n"
-        f"剩餘 sources: {remain_sources or '(無)'}\n\n"
+        f"刪了 {result['removed_chunks']} 個 chunk + "
+        f"{result['removed_documents']} 筆 metadata.documents 紀錄"
+        f"(source = '{target}'),剩 {result['remaining_chunks']} 個 chunk / "
+        f"{result['remaining_documents']} 個文件；NPZ 向量列已同步提交。\n"
+        f"剩餘 sources: {result['sources'] or '(無)'}\n\n"
         f"提醒: 呼叫 reload_knowledge_base() 讓變更立即生效。"
     )
 

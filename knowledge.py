@@ -29,6 +29,7 @@ except ImportError:
     print("       建議執行: pip install jieba", file=sys.stderr)
 
 import llama_client
+from knowledge_store import KnowledgeStoreError, knowledge_store_lock
 from config import (
     LLAMA_BASE_URL, LLAMA_EMBED_BASE_URL, LLAMA_RERANK_BASE_URL,
     KNOWLEDGE_FILE, KNOWLEDGE_EMB_FILE,
@@ -44,9 +45,10 @@ from config import (
     # P0 改進：Source Type Weighting（來源權重）
     SOURCE_TYPE_WEIGHTS, POLLUTION_RISK_TOP_K, POLLUTION_RISK_MIN_SCORE,
     # P0 改進：BM25 + RRF + Reranker 條件式觸發
-    BM25_K1, BM25_B, BM25_ENABLED,
+    BM25_K1, BM25_B, BM25_ENABLED, BM25_MIN_RELATIVE_SCORE,
     RRF_K, RRF_ENABLED,
-    RERANKER_ALWAYS_ON, RERANKER_TOP_N, RERANKER_SKIP_THRESHOLD,
+    RERANKER_ALWAYS_ON, RERANKER_TOP_N, RERANKER_PASSAGE_MAX_CHARS,
+    RERANKER_SKIP_THRESHOLD,
     MARGIN_ENABLED, MARGIN_MIN_GAP, MARGIN_LOW_SCORE,
     STRICT_MODE_THRESHOLD, STRICT_MODE_RERANK_REQUIRED,
     # P1 改進：Multi-Query（條件式啟用）
@@ -128,71 +130,77 @@ class KnowledgeBase:
 
     def _load(self, path: str):
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            with knowledge_store_lock(Path(path), exclusive=False):
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
 
-            self.chunks = data.get("chunks", [])
-            metadata = data.get("metadata", {})
-            self.documents = metadata.get("documents", [])
+                self.chunks = data.get("chunks", [])
+                metadata = data.get("metadata", {})
+                self._loaded_metadata = metadata
+                self.documents = metadata.get("documents", [])
 
-            # 驗證 embedding model 一致性
-            saved_model = metadata.get("embedding_model", "")
-            if saved_model and saved_model != EMBEDDING_MODEL:
-                print(f"[WARN] 知識庫 embedding model 不一致！")
-                print(f"       知識庫使用: {saved_model}")
-                print(f"       目前設定: {EMBEDDING_MODEL}")
-                print(f"       請執行 RAG.py 重建知識庫，否則搜尋結果可能不準確")
-                # 仍然載入，但發出警告
-                self._embedding_mismatch = True
-            else:
+                # 驗證 embedding model 一致性
+                saved_model = metadata.get("embedding_model", "")
+                if saved_model and saved_model != EMBEDDING_MODEL:
+                    raise KnowledgeStoreError(
+                        "knowledge JSON embedding model mismatch: "
+                        f"saved={saved_model}, configured={EMBEDDING_MODEL}. "
+                        "Rebuild the knowledge base before querying."
+                    )
                 self._embedding_mismatch = False
 
-            # 驗證 embedding 維度一致性（抽樣檢查前幾個 chunk）
-            if self.chunks:
-                sample_dims = set()
-                for chunk in self.chunks[:5]:
-                    emb = chunk.get("embedding", [])
-                    if emb:
-                        sample_dims.add(len(emb))
+                # 驗證 embedding 維度一致性（抽樣檢查前幾個 chunk）
+                if self.chunks:
+                    sample_dims = set()
+                    for chunk in self.chunks[:5]:
+                        emb = chunk.get("embedding", [])
+                        if emb:
+                            sample_dims.add(len(emb))
 
-                if len(sample_dims) > 1:
-                    print(f"[WARN] 知識庫 embedding 維度不一致: {sample_dims}")
-                    print(f"       請執行 RAG.py 重建知識庫")
-                    self._embedding_dim_mismatch = True
-                else:
+                    if len(sample_dims) > 1:
+                        raise KnowledgeStoreError(
+                            f"knowledge JSON embedding dimension mismatch: {sorted(sample_dims)}"
+                        )
                     self._embedding_dim_mismatch = False
                     self._embedding_dim = sample_dims.pop() if sample_dims else None
-            else:
-                self._embedding_dim_mismatch = False
-                self._embedding_dim = None
+                else:
+                    self._embedding_dim_mismatch = False
+                    self._embedding_dim = None
 
-            self.loaded = True
+                self.loaded = True
 
-            # 優先從 .npz 載入 embeddings（加速載入）
-            npz_loaded = self._load_embeddings_from_npz()
+                # 優先從 .npz 載入 embeddings（加速載入）
+                npz_loaded = self._load_embeddings_from_npz()
 
-            if not npz_loaded:
-                # Fallback：從 JSON 重建 numpy embeddings
-                self._precompute_embeddings()
-                # 儲存為 .npz 供下次使用
-                self._save_embeddings_to_npz()
+                if not npz_loaded:
+                    # Legacy JSON may still contain inline embeddings.  Missing
+                    # vectors are not a lexical-only fallback: fail loudly.
+                    self._precompute_embeddings()
+                    if self.chunks and self._embeddings is None:
+                        raise KnowledgeStoreError(
+                            f"knowledge chunks have no usable embeddings and {self._emb_path} "
+                            "could not be loaded; rebuild the knowledge base"
+                        )
 
-            # P0 改進：預計算 BM25 索引
-            if BM25_ENABLED:
-                self._precompute_bm25_index()
+                # P0 改進：預計算 BM25 索引
+                if BM25_ENABLED:
+                    self._precompute_bm25_index()
 
-            # 速度優化：記錄載入的 metadata 供快取驗證
-            self._cache_metadata = {
-                "embedding_model": EMBEDDING_MODEL,
-                "chunk_count": len(self.chunks),
-                "bm25_enabled": BM25_ENABLED,
-            }
+                # 速度優化：記錄載入的 metadata 供快取驗證
+                self._cache_metadata = {
+                    "embedding_model": EMBEDDING_MODEL,
+                    "chunk_count": len(self.chunks),
+                    "bm25_enabled": BM25_ENABLED,
+                }
 
+        except KnowledgeStoreError:
+            self.loaded = False
+            raise
         except Exception as e:
             print(f"[WARN] 知識庫載入失敗: {e}")
             self.loaded = False
 
-    def _compute_content_hash(self) -> str:
+    def _compute_content_hash(self, schema: str = "content-v1") -> str:
         """計算所有 chunk 內容的雜湊（用於 .npz 快取驗證）
 
         改進：使用內容雜湊確保 .npz 與 JSON 內容一致，
@@ -201,8 +209,21 @@ class KnowledgeBase:
         import hashlib
         hasher = hashlib.md5()
         for chunk in self.chunks:
-            content = chunk.get('content', '')
-            hasher.update(content.encode('utf-8'))
+            if schema == "source-section-content-v2":
+                source = Path(str(chunk.get("source", ""))).name
+                section = str(chunk.get("section", "")).strip()
+                parts = []
+                if source:
+                    parts.append(f"[SOURCE] {source}")
+                if section:
+                    parts.append(f"[SECTION_METADATA] {section}")
+                parts.append(str(chunk.get("content", "")))
+                encoded = "\n".join(parts).encode("utf-8")
+                hasher.update(len(encoded).to_bytes(8, "big"))
+                hasher.update(encoded)
+            else:
+                content = chunk.get('content', '')
+                hasher.update(content.encode('utf-8'))
         return hasher.hexdigest()
 
     def _load_embeddings_from_npz(self) -> bool:
@@ -217,11 +238,14 @@ class KnowledgeBase:
             return False
 
         try:
-            data = np.load(self._emb_path, allow_pickle=True)
-            embeddings = data['embeddings']
-            emb_model = str(data.get('embedding_model', ''))
-            chunk_count = int(data.get('chunk_count', 0))
-            content_hash = str(data.get('content_hash', ''))
+            with np.load(self._emb_path, allow_pickle=False) as data:
+                embeddings = data['embeddings'].copy()
+                emb_model = str(data.get('embedding_model', ''))
+                chunk_count = int(data.get('chunk_count', 0))
+                content_hash = str(data.get('content_hash', ''))
+                hash_schema = str(data.get('content_hash_schema', 'content-v1'))
+                npz_generation = str(data.get('store_generation', ''))
+                stored_dimension = int(data.get('embedding_dimension', 0))
 
             # 驗證 embedding model 一致
             if emb_model and emb_model != EMBEDDING_MODEL:
@@ -233,8 +257,20 @@ class KnowledgeBase:
                 print(f"[WARN] .npz chunk 數量不一致，將重建")
                 return False
 
+            if embeddings.ndim != 2 or embeddings.shape[0] != len(self.chunks):
+                print(f"[WARN] .npz embedding matrix shape 不一致，將重建")
+                return False
+            if stored_dimension and embeddings.shape[1] != stored_dimension:
+                print(f"[WARN] .npz embedding dimension metadata 不一致，將重建")
+                return False
+
+            json_generation = str(getattr(self, "_loaded_metadata", {}).get("store_generation", ""))
+            if json_generation and npz_generation != json_generation:
+                print(f"[WARN] .npz store generation 不一致，拒絕載入")
+                return False
+
             # 驗證內容雜湊一致（避免內容變更但數量相同的情況）
-            current_hash = self._compute_content_hash()
+            current_hash = self._compute_content_hash(schema=hash_schema)
             if content_hash and content_hash != current_hash:
                 print(f"[WARN] .npz 內容雜湊不一致，將重建")
                 return False
@@ -300,16 +336,12 @@ class KnowledgeBase:
             self._embeddings = None
             return
 
-        # 確保維度一致
-        dim = len(embeddings_list[0])
-        filtered = [(i, emb) for i, emb in zip(valid_indices, embeddings_list) if len(emb) == dim]
-
-        if not filtered:
-            self._embeddings = None
-            return
-
-        valid_indices = [x[0] for x in filtered]
-        embeddings_list = [x[1] for x in filtered]
+        # 維度不一致是模型/快取混用，不能靜默丟掉異常列。
+        dimensions = {len(embedding) for embedding in embeddings_list}
+        if len(dimensions) != 1:
+            raise KnowledgeStoreError(
+                f"knowledge embedding dimension mismatch: {sorted(dimensions)}"
+            )
 
         self._embeddings = np.array(embeddings_list, dtype=np.float32)
         self._embedding_indices = valid_indices  # 映射回 self.chunks 的索引
@@ -346,7 +378,7 @@ class KnowledgeBase:
         doc_freqs = defaultdict(int)  # 每個 term 出現在多少文件中
 
         for idx, chunk in enumerate(self.chunks):
-            content = chunk.get("content", "")
+            content = self._content_for_bm25(chunk)
             # 加入 title、section、source 提升 lexical 命中率
             title = chunk.get("section", "")
             source = chunk.get("source", "")
@@ -378,6 +410,24 @@ class KnowledgeBase:
         self._bm25_avg_doc_len = sum(doc_lens) / len(doc_lens) if doc_lens else 1.0
         self._bm25_idf = idf
 
+    def _content_for_bm25(self, chunk: dict) -> str:
+        """Return unique chunk body, excluding synthetic heading/overlap prefixes.
+
+        New chunks record prefix lengths during ingestion.  Older stores do not
+        have the metadata and retain their legacy indexing behavior until they
+        are rebuilt; guessing prefix boundaries would risk dropping real text.
+        """
+        content = str(chunk.get("content", ""))
+        try:
+            heading_chars = int(chunk.get("heading_prefix_chars", 0) or 0)
+            overlap_chars = int(chunk.get("overlap_prefix_chars", 0) or 0)
+        except (TypeError, ValueError):
+            return content
+        total_prefix = heading_chars + overlap_chars
+        if total_prefix < 0 or total_prefix > len(content):
+            return content
+        return content[total_prefix:]
+
     def _tokenize_for_bm25(self, text: str) -> list:
         """BM25 專用的 tokenizer
 
@@ -389,9 +439,12 @@ class KnowledgeBase:
         # 先轉小寫
         text = text.lower()
 
-        # 抽取所有 word-like tokens（英文、中文、數字底線）
-        # 英文 token
-        en_tokens = re.findall(r'\b[a-z_][a-z0-9_]*\b', text)
+        # 技術 token：identifier、十六進位與純數字都必須保留。數字/hex
+        # 是 register map、offset、threshold、版本題的主要 lexical evidence。
+        en_tokens = re.findall(
+            r'(?<![a-z0-9_])(?:0x[0-9a-f]+|v?\d+(?:\.\d+)+(?:[a-z]+)?|\d+(?:[a-z]+)?|[a-z_][a-z0-9_]*)(?![a-z0-9_])',
+            text,
+        )
         # 中文 token（單字或雙字詞）
         if HAS_JIEBA:
             zh_tokens = [t for t in jieba.cut(text, cut_all=False)
@@ -417,9 +470,12 @@ class KnowledgeBase:
                      '我', '你', '他', '她', '它', '們', '這', '那', '要', '會',
                      '能', '可以', '一個', '什麼', '怎麼', '如何'}
 
-        return [t for t in all_tokens if len(t) > 1 and t not in stopwords]
+        return [
+            t for t in all_tokens
+            if (len(t) > 1 or t.isdigit()) and t not in stopwords
+        ]
 
-    def _bm25_score(self, query_tokens: list) -> list:
+    def _bm25_score(self, query_tokens: list, allowed_indices: set[int] | None = None) -> list:
         """計算所有 chunks 的 BM25 分數
 
         返回: [(score, chunk_idx), ...] 按分數降序排列
@@ -440,6 +496,8 @@ class KnowledgeBase:
             term_docs = self._bm25_index[token]
 
             for chunk_idx, tf in term_docs.items():
+                if allowed_indices is not None and chunk_idx not in allowed_indices:
+                    continue
                 dl = self._bm25_doc_lens[chunk_idx]
                 # BM25 公式
                 numerator = tf * (k1 + 1)
@@ -452,7 +510,11 @@ class KnowledgeBase:
             scores = [s / max_score for s in scores]
 
         # 返回 (score, chunk_idx) 列表，按分數降序
-        scored = [(scores[i], i) for i in range(len(scores)) if scores[i] > 0]
+        scored = [
+            (scores[i], i) for i in range(len(scores))
+            if scores[i] >= BM25_MIN_RELATIVE_SCORE
+            and (allowed_indices is None or i in allowed_indices)
+        ]
         scored.sort(reverse=True, key=lambda x: x[0])
         return scored
 
@@ -802,6 +864,35 @@ English:"""
                 return True
         return False
 
+    def _exact_literals(self, text: str) -> set[str]:
+        """Extract values whose exact spelling is evidence (hex, decimal, version-like)."""
+        return {
+            match.group(0).lower()
+            for match in re.finditer(
+                r'(?<![A-Za-z0-9_])(?:0x[0-9A-Fa-f]+|v?\d+(?:\.\d+)+|\d+)(?![A-Za-z0-9_])',
+                text,
+                re.IGNORECASE,
+            )
+        }
+
+    def _has_lexical_numeric_evidence(
+        self, question: str, bm25_score: float, chunk: dict
+    ) -> bool:
+        if bm25_score <= 0 or not self._is_numeric_query(question):
+            return False
+        literals = self._exact_literals(question)
+        if not literals:
+            # Questions such as "最大值是多少" still need a lexical route.  A
+            # normalized BM25 leader is admitted to the reranker, not trusted
+            # as the final answer by itself.
+            return bm25_score >= 0.75
+        haystack = " ".join([
+            str(chunk.get("source", "")),
+            str(chunk.get("section", "")),
+            self._content_for_bm25(chunk),
+        ]).lower()
+        return bool(literals & self._exact_literals(haystack))
+
     def _get_source_weight(self, chunk: dict) -> float:
         """取得 chunk 的來源權重
 
@@ -994,7 +1085,101 @@ English:"""
         # 高信心時跳過 expansion
         return top_emb_score < threshold
 
-    def _hybrid_search(self, question: str, candidate_k: int = KNOWLEDGE_CANDIDATE_K) -> list:
+    def _matching_chunk_indices(self, metadata_filter: dict | None) -> set[int] | None:
+        """Resolve exact metadata filters before either retrieval branch applies top-k."""
+        if not metadata_filter:
+            return None
+
+        allowed = set(range(len(self.chunks)))
+        for key in ("source", "type", "section"):
+            if key not in metadata_filter or metadata_filter[key] in (None, ""):
+                continue
+            raw = metadata_filter[key]
+            values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+            expected = {str(value).casefold() for value in values}
+            matched = set()
+            for index, chunk in enumerate(self.chunks):
+                actual = str(chunk.get(key, ""))
+                candidates = {actual.casefold()}
+                if key == "source":
+                    candidates.add(Path(actual).name.casefold())
+                if candidates & expected:
+                    matched.add(index)
+            allowed &= matched
+        return allowed
+
+    def _search_once(
+        self,
+        question: str,
+        q_emb: list,
+        candidate_k: int,
+        allowed_indices: set[int] | None,
+    ) -> list:
+        """Run one dense+lexical recall pass and keep scores in RRF units."""
+        recall_k = max(1, candidate_k * 2)
+        if HAS_NUMPY and self._embeddings is not None and self._embeddings_normalized:
+            embedding_ranks = self._embedding_search_numpy(
+                q_emb, recall_k, allowed_indices=allowed_indices
+            )
+        else:
+            embedding_ranks = self._embedding_search_fallback(
+                q_emb, recall_k, allowed_indices=allowed_indices
+            )
+
+        if BM25_ENABLED and self._bm25_index:
+            query_tokens = self._tokenize_for_bm25(question)
+            bm25_ranks = self._bm25_score(
+                query_tokens, allowed_indices=allowed_indices
+            )[:recall_k]
+        else:
+            query_keywords = self._extract_keywords(question) if USE_HYBRID_SEARCH else set()
+            bm25_ranks = self._keyword_search_fallback(
+                query_keywords, recall_k, allowed_indices=allowed_indices
+            )
+
+        if RRF_ENABLED and (embedding_ranks or bm25_ranks):
+            return self._rrf_fusion(embedding_ranks, bm25_ranks)
+        if embedding_ranks:
+            return [
+                (emb_score, emb_score, 0.0, self.chunks[idx])
+                for emb_score, idx in embedding_ranks
+            ]
+        return [
+            (bm25_score, 0.0, bm25_score, self.chunks[idx])
+            for bm25_score, idx in bm25_ranks
+        ]
+
+    def _merge_expansion_scores(
+        self, base_scores: list, expansion_scores: list, weight: float = 0.9
+    ) -> list:
+        """Union a variant's recall with the base list without mixing score scales."""
+        merged: dict[int, list] = {}
+        for rrf_score, emb_score, bm25_score, chunk in base_scores:
+            merged[id(chunk)] = [rrf_score, emb_score, bm25_score, chunk]
+        for rrf_score, emb_score, bm25_score, chunk in expansion_scores:
+            key = id(chunk)
+            if key in merged:
+                row = merged[key]
+                row[0] += rrf_score * weight
+                row[1] = max(row[1], emb_score * weight)
+                row[2] = max(row[2], bm25_score)
+            else:
+                merged[key] = [
+                    rrf_score * weight,
+                    emb_score * weight,
+                    bm25_score,
+                    chunk,
+                ]
+        result = [tuple(row) for row in merged.values()]
+        result.sort(reverse=True, key=lambda row: row[0])
+        return result
+
+    def _hybrid_search(
+        self,
+        question: str,
+        candidate_k: int = KNOWLEDGE_CANDIDATE_K,
+        metadata_filter: dict | None = None,
+    ) -> list:
         """混合搜尋：Embedding + BM25 + RRF 融合
 
         P0 改進：
@@ -1008,31 +1193,13 @@ English:"""
         if not self.loaded or not self.chunks:
             return []
 
+        allowed_indices = self._matching_chunk_indices(metadata_filter)
+        if allowed_indices is not None and not allowed_indices:
+            return []
+
         # 取得 query embedding
         q_emb = self._get_embedding(question)
-
-        # ===== Embedding 召回 =====
-        if HAS_NUMPY and self._embeddings is not None and self._embeddings_normalized:
-            embedding_ranks = self._embedding_search_numpy(q_emb, candidate_k * 2)
-        else:
-            embedding_ranks = self._embedding_search_fallback(q_emb, candidate_k * 2)
-
-        # ===== BM25 召回（P0 改進）=====
-        if BM25_ENABLED and self._bm25_index:
-            query_tokens = self._tokenize_for_bm25(question)
-            bm25_ranks = self._bm25_score(query_tokens)[:candidate_k * 2]
-        else:
-            # Fallback: 使用舊的 keyword matching
-            query_keywords = self._extract_keywords(question) if USE_HYBRID_SEARCH else set()
-            bm25_ranks = self._keyword_search_fallback(query_keywords, candidate_k * 2)
-
-        # ===== RRF 融合（P0 改進）=====
-        if RRF_ENABLED and embedding_ranks and bm25_ranks:
-            scores = self._rrf_fusion(embedding_ranks, bm25_ranks)
-        else:
-            # Fallback: 只用 embedding
-            scores = [(emb_score, emb_score, 0.0, self.chunks[idx])
-                      for emb_score, idx in embedding_ranks]
+        scores = self._search_once(question, q_emb, candidate_k, allowed_indices)
 
         first_round = scores[:candidate_k]
 
@@ -1051,14 +1218,19 @@ English:"""
                 # 用額外的 queries 增強 embedding 召回
                 for mq in multi_queries[1:]:
                     mq_emb = self._get_embedding(mq)
-                    self._update_scores_with_expansion(scores, mq_emb)
-
-                # 重新排序
-                scores.sort(reverse=True, key=lambda x: x[0])
+                    scores = self._update_scores_with_expansion(
+                        scores,
+                        mq_emb,
+                        expanded_query=mq,
+                        candidate_k=candidate_k,
+                        allowed_indices=allowed_indices,
+                    )
 
         return scores[:candidate_k]
 
-    def _embedding_search_numpy(self, q_emb: list, top_k: int) -> list:
+    def _embedding_search_numpy(
+        self, q_emb: list, top_k: int, allowed_indices: set[int] | None = None
+    ) -> list:
         """使用 numpy 向量化的 embedding 搜尋
 
         返回: [(emb_score, chunk_idx), ...] 按分數降序
@@ -1067,24 +1239,36 @@ English:"""
             return []
         # 正規化 query embedding
         q_vec = np.array(q_emb, dtype=np.float32)
+        if self._embeddings.shape[1] != q_vec.shape[0]:
+            raise RuntimeError(
+                "query embedding dimension mismatch: "
+                f"query={q_vec.shape[0]}, knowledge={self._embeddings.shape[1]}"
+            )
         q_norm = np.linalg.norm(q_vec)
         if q_norm > 0:
             q_vec = q_vec / q_norm
 
         # 批次計算所有 cosine similarity
         emb_scores = np.dot(self._embeddings, q_vec)
-        total = emb_scores.shape[0]
+        eligible = np.array([
+            arr_idx for arr_idx, chunk_idx in enumerate(self._embedding_indices)
+            if allowed_indices is None or chunk_idx in allowed_indices
+        ], dtype=int)
+        total = eligible.shape[0]
         if total == 0:
             return []
         k = min(top_k, total)
         if total <= k:
-            idxs = np.arange(total)
+            idxs = eligible
         else:
-            idxs = np.argpartition(-emb_scores, k - 1)[:k]
+            local = np.argpartition(-emb_scores[eligible], k - 1)[:k]
+            idxs = eligible[local]
         idxs = idxs[np.argsort(-emb_scores[idxs])]
         return [(float(emb_scores[i]), self._embedding_indices[i]) for i in idxs]
 
-    def _embedding_search_fallback(self, q_emb: list, top_k: int) -> list:
+    def _embedding_search_fallback(
+        self, q_emb: list, top_k: int, allowed_indices: set[int] | None = None
+    ) -> list:
         """Fallback：Python 迴圈版 embedding 搜尋
 
         返回: [(emb_score, chunk_idx), ...] 按分數降序
@@ -1094,6 +1278,8 @@ English:"""
         import heapq
         results = []
         for idx, chunk in enumerate(self.chunks):
+            if allowed_indices is not None and idx not in allowed_indices:
+                continue
             emb = chunk.get("embedding", [])
             if emb:
                 score = self._cosine_similarity(q_emb, emb)
@@ -1101,13 +1287,17 @@ English:"""
 
         return heapq.nlargest(top_k, results, key=lambda x: x[0])
 
-    def _keyword_search_fallback(self, query_keywords: set, top_k: int) -> list:
+    def _keyword_search_fallback(
+        self, query_keywords: set, top_k: int, allowed_indices: set[int] | None = None
+    ) -> list:
         """Fallback：舊的 keyword matching（當 BM25 未啟用時）
 
         返回: [(kw_score, chunk_idx), ...] 按分數降序
         """
         results = []
         for idx, chunk in enumerate(self.chunks):
+            if allowed_indices is not None and idx not in allowed_indices:
+                continue
             content = chunk.get("content", "")
             score = self._keyword_score(query_keywords, content)
             if score > 0:
@@ -1176,41 +1366,20 @@ English:"""
 
         return scores
 
-    def _update_scores_with_expansion(self, scores: list, eq_emb: list):
-        """使用擴展 query 更新分數"""
-        if HAS_NUMPY and self._embeddings is not None and self._embeddings_normalized:
-            # Numpy 向量化版本
-            eq_vec = np.array(eq_emb, dtype=np.float32)
-            eq_norm = np.linalg.norm(eq_vec)
-            if eq_norm > 0:
-                eq_vec = eq_vec / eq_norm
-            exp_scores = np.dot(self._embeddings, eq_vec)
-
-            # 建立 chunk -> arr_idx 的映射
-            chunk_to_arr = {id(self.chunks[ci]): ai for ai, ci in enumerate(self._embedding_indices)}
-
-            for i, (combined, emb_score, kw_score, chunk) in enumerate(scores):
-                arr_idx = chunk_to_arr.get(id(chunk))
-                if arr_idx is not None:
-                    exp_score = float(exp_scores[arr_idx]) * 0.9  # 擴展分數打 9 折
-                    new_emb = max(emb_score, exp_score)
-                    if USE_HYBRID_SEARCH:
-                        new_combined = new_emb * (1 - KEYWORD_WEIGHT) + kw_score * KEYWORD_WEIGHT
-                    else:
-                        new_combined = new_emb
-                    scores[i] = (new_combined, new_emb, kw_score, chunk)
-        else:
-            # Fallback：逐一計算
-            for i, (combined, emb_score, kw_score, chunk) in enumerate(scores):
-                chunk_emb = chunk.get("embedding", [])
-                if chunk_emb:
-                    exp_score = self._cosine_similarity(eq_emb, chunk_emb) * 0.9
-                    new_emb = max(emb_score, exp_score)
-                    if USE_HYBRID_SEARCH:
-                        new_combined = new_emb * (1 - KEYWORD_WEIGHT) + kw_score * KEYWORD_WEIGHT
-                    else:
-                        new_combined = new_emb
-                    scores[i] = (new_combined, new_emb, kw_score, chunk)
+    def _update_scores_with_expansion(
+        self,
+        scores: list,
+        eq_emb: list,
+        *,
+        expanded_query: str,
+        candidate_k: int,
+        allowed_indices: set[int] | None = None,
+    ) -> list:
+        """Return an RRF-scale union including chunks recalled only by a variant."""
+        expansion_scores = self._search_once(
+            expanded_query, eq_emb, candidate_k, allowed_indices
+        )
+        return self._merge_expansion_scores(scores, expansion_scores)
 
     def _should_rerank(self, candidates: list, top_k: int, is_strict_mode: bool = False) -> bool:
         """判斷是否需要 rerank
@@ -1221,7 +1390,10 @@ English:"""
         - 高信心時跳過 rerank（top_emb_score > RERANKER_SKIP_THRESHOLD）
         - 否則使用條件觸發
         """
-        if len(candidates) <= top_k:
+        # One item cannot be reordered.  Candidate count relative to requested
+        # output is not a reason to skip: strict/low-confidence queries often
+        # have <= output_k candidates and are exactly where reranking matters.
+        if len(candidates) <= 1:
             return False
 
         # P0-4 修正：使用 embedding score (candidates[i][1]) 而非 RRF score (candidates[i][0])
@@ -1294,20 +1466,29 @@ English:"""
         if not candidates:
             return []
 
-        if not USE_RERANKER or len(candidates) <= top_k:
+        if not USE_RERANKER or len(candidates) <= 1:
             return [c[3] for c in candidates[:top_k]]
 
         # 條件觸發：判斷是否真的需要 rerank
         if not self._should_rerank(candidates, top_k, is_strict_mode):
             return [c[3] for c in candidates[:top_k]]
 
-        # P0 改進：使用 RERANKER_TOP_N 控制候選數量
-        rerank_count = min(RERANKER_TOP_N, len(candidates))
+        # Input pool and output count are separate.  RERANKER_TOP_N is the
+        # final query cap; the cross-encoder must see a much wider pool so a
+        # rank-7..30 item can be rescued and MMR still has choices.
+        rerank_count = min(len(candidates), max(15, top_k * 3))
 
         if self._check_reranker_available():
             try:
                 items = candidates[:rerank_count]
-                passages = [chunk.get('content', '')[:800] for _, _, _, chunk in items]
+                passages = []
+                for _, _, _, chunk in items:
+                    source = chunk.get("source", "")
+                    section = chunk.get("section", "")
+                    content = chunk.get("content", "")[:RERANKER_PASSAGE_MAX_CHARS]
+                    passages.append(
+                        f"Source: {source}\nSection: {section}\n{content}"
+                    )
                 scores = llama_client.rerank(
                     base_url=LLAMA_RERANK_BASE_URL,
                     query=question,
@@ -1315,6 +1496,10 @@ English:"""
                     model=RERANKER_MODEL,
                     timeout=60,
                 )
+                if len(scores) != len(items):
+                    raise RuntimeError(
+                        f"reranker returned {len(scores)} scores for {len(items)} passages"
+                    )
                 scored = [(scores[i], items[i][3]) for i in range(len(items))]
                 scored.sort(reverse=True, key=lambda x: x[0])
                 return [c[1] for c in scored[:top_k]]
@@ -1609,8 +1794,14 @@ English:"""
         other_chars = len(text) - chinese_chars
         return int(chinese_chars / 1.5 + other_chars / 4)
 
-    def query(self, question: str, top_k: int = KNOWLEDGE_TOP_K,
-              is_strict_mode: bool = False) -> tuple[str, str, dict]:
+    def query(
+        self,
+        question: str,
+        top_k: int = KNOWLEDGE_TOP_K,
+        is_strict_mode: bool = False,
+        metadata_filter: dict | None = None,
+        source: str | None = None,
+    ) -> tuple[str, str, dict]:
         """
         查詢相關知識 - 結構化輸出版本（P0 改進：Margin-based 動態門檻）
 
@@ -1622,7 +1813,12 @@ English:"""
         if not self.loaded or not self.chunks:
             return "", "", empty_metadata
 
-        candidates = self._hybrid_search(question, KNOWLEDGE_CANDIDATE_K)
+        if source:
+            metadata_filter = dict(metadata_filter or {})
+            metadata_filter["source"] = source
+        candidates = self._hybrid_search(
+            question, KNOWLEDGE_CANDIDATE_K, metadata_filter=metadata_filter
+        )
         if not candidates:
             return "", "", empty_metadata
 
@@ -1652,8 +1848,12 @@ English:"""
             if top_emb_score < MARGIN_LOW_SCORE:
                 is_high_risk = True  # top1 分數太低
 
-        # 過濾：只看 embedding score，避免 keyword 誤打誤撞拉高分數
-        filtered = [(s, e, k, c) for s, e, k, c in candidates if e >= min_emb_score]
+        # Dense 是一般語意 gate；數字/hex 題另保留有精確 lexical evidence
+        # 的候選交給 reranker。否則 dense 對數字偏弱時會把 BM25 的正解先丟掉。
+        filtered = [
+            (s, e, k, c) for s, e, k, c in candidates
+            if e >= min_emb_score or self._has_lexical_numeric_evidence(question, k, c)
+        ]
         if not filtered:
             return "", "", empty_metadata
 
@@ -1667,9 +1867,19 @@ English:"""
         else:
             effective_top_k = min(top_k, DYNAMIC_TOP_K_MAX)
 
-        # P0 改進：傳入 is_strict_mode 給 reranker
-        reranked_chunks = self._rerank_with_model(question, filtered, effective_top_k * 2,
-                                                   is_strict_mode=is_strict_mode)
+        # RERANKER_TOP_N 是最終上限；reranker output 先保留較寬的 MMR pool。
+        effective_top_k = min(effective_top_k, RERANKER_TOP_N)
+        rerank_output_k = effective_top_k
+        if USE_MMR:
+            rerank_output_k = min(
+                len(filtered), max(effective_top_k * 3, RERANKER_TOP_N * 2)
+            )
+        reranked_chunks = self._rerank_with_model(
+            question,
+            filtered,
+            rerank_output_k,
+            is_strict_mode=is_strict_mode,
+        )
         if not reranked_chunks:
             return "", "", empty_metadata
 

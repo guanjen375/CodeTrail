@@ -95,6 +95,7 @@ class CodeRAG:
         self._file_cache = {}
         self._lazy_embed = False
         self._lazy_embed_top_k = CODE_RAG_LAZY_EMBED_QUERY_TOP_K
+        self._indexed_file_hashes = None
 
     # 小檔走 content hash 的門檻 — 256 KiB 以下直接 hash 內容,
     # 大於這個值 fallback 到 size + mtime_ns 的快路徑。
@@ -148,7 +149,7 @@ class CodeRAG:
         files.sort()
         return hashlib.md5("\n".join(files).encode()).hexdigest()
 
-    def _scan_code_files(self) -> dict:
+    def _scan_code_files(self, *, force_refresh: bool = False) -> dict:
         """掃描所有程式碼檔案，返回 {rel_path: {"filepath": Path, "hash": str}}
 
         P0 改進：使用共用快取減少重複掃描
@@ -161,7 +162,7 @@ class CodeRAG:
         }
 
         # P0 改進：檢查共用快取
-        cached = get_cached_scan_result(str(self.folder))
+        cached = None if force_refresh else get_cached_scan_result(str(self.folder))
         if cached is not None:
             # 快取格式是 [{"path": str, "size": int}, ...]
             # 轉換為我們需要的格式並計算 hash
@@ -210,6 +211,13 @@ class CodeRAG:
             set_scan_cache(str(self.folder), files_for_cache)
 
         return result
+
+    def _scan_code_files_fresh(self) -> dict:
+        """Fresh scan helper that keeps simple no-arg test/integration hooks compatible."""
+        scanner = self._scan_code_files
+        if getattr(scanner, "__func__", None) is CodeRAG._scan_code_files:
+            return scanner(force_refresh=True)
+        return scanner()
 
     def _load_file_cache(self) -> dict:
         """載入增量快取（每檔案粒度）
@@ -442,19 +450,23 @@ class CodeRAG:
 
         return file_symbols, file_embeddings
 
-    def build_index(self, verbose: bool = True):
+    def build_index(self, verbose: bool = True, _current_files: dict | None = None):
         """建立程式碼索引（支援增量更新）"""
         if not CODE_RAG_ENABLED:
             return
 
         # 嘗試載入快取
         if self._load_cache():
+            current_files = _current_files or self._scan_code_files_fresh()
+            self._indexed_file_hashes = {
+                rel_path: info["hash"] for rel_path, info in current_files.items()
+            }
             if verbose:
                 print(f"[CODE_RAG] 載入快取: {len(self.index)} 個符號")
             return
 
         # 掃描所有程式碼檔案
-        current_files = self._scan_code_files()
+        current_files = _current_files or self._scan_code_files_fresh()
 
         # 計算需要更新的檔案
         files_to_index = []
@@ -544,15 +556,21 @@ class CodeRAG:
 
         # 將 embedding 轉換為 numpy array 並預先 L2 normalize
         if HAS_NUMPY and embeddings_list and not self._lazy_embed:
-            emb_dim = max((len(e) for e in embeddings_list if e), default=1024)
-            normalized = []
-            for emb in embeddings_list:
-                if len(emb) == emb_dim:
-                    normalized.append(emb)
-                elif len(emb) == 0:
-                    normalized.append([0.0] * emb_dim)
-                else:
-                    normalized.append((emb + [0.0] * emb_dim)[:emb_dim])
+            dimensions = {len(embedding) for embedding in embeddings_list if embedding}
+            if not dimensions or any(not embedding for embedding in embeddings_list):
+                self.index = []
+                self.embeddings = None
+                raise RuntimeError(
+                    "Code RAG full index contains missing embeddings; refusing zero padding"
+                )
+            if len(dimensions) != 1:
+                self.index = []
+                self.embeddings = None
+                raise RuntimeError(
+                    f"Code RAG embedding dimension mismatch: {sorted(dimensions)}; "
+                    "zero-padding/truncation is forbidden"
+                )
+            normalized = embeddings_list
             self.embeddings = np.array(normalized, dtype=np.float32)
 
             norms = np.linalg.norm(self.embeddings, axis=1, keepdims=True)
@@ -565,6 +583,10 @@ class CodeRAG:
                 if i < len(self.index) and emb:
                     self.index[i]['embedding'] = emb
 
+        self._indexed_file_hashes = {
+            rel_path: info["hash"] for rel_path, info in current_files.items()
+        }
+
         if verbose:
             if is_incremental:
                 print(f"[CODE_RAG] 增量更新完成: 共 {len(self.index)} 個符號")
@@ -573,6 +595,67 @@ class CodeRAG:
             if self._lazy_embed:
                 print(f"[CODE_RAG] lazy embed on: >{CODE_RAG_LAZY_EMBED_MAX_SYMBOLS} symbols")
 
+        self._save_cache()
+
+    def _refresh_if_stale(self) -> None:
+        """Incrementally rebuild when files change during the current MCP session."""
+        if self._indexed_file_hashes is None:
+            return
+        current_files = self._scan_code_files_fresh()
+        current_hashes = {
+            rel_path: info["hash"] for rel_path, info in current_files.items()
+        }
+        if current_hashes != self._indexed_file_hashes:
+            self.build_index(verbose=False, _current_files=current_files)
+
+    def _sync_embeddings_to_file_cache(self, rows: list[list[float]]) -> None:
+        by_symbol = {
+            (item.get("path"), item.get("symbol"), item.get("line")): row
+            for item, row in zip(self.index, rows)
+        }
+        for cached in self._file_cache.values():
+            cached["embeddings"] = [
+                by_symbol.get(
+                    (symbol.get("path"), symbol.get("symbol"), symbol.get("line")),
+                    [],
+                )
+                for symbol in cached.get("symbols", [])
+            ]
+
+    def _materialize_dense_index(self) -> None:
+        """Embed every lazy symbol when lexical routing has no meaningful signal."""
+        rows = []
+        dimensions = set()
+        for index, item in enumerate(self.index):
+            embedding = item.get("embedding") or self._get_embedding(
+                self._build_embed_text(item)
+            )
+            if not embedding:
+                raise RuntimeError(f"Code RAG symbol {index} returned an empty embedding")
+            row = [float(value) for value in embedding]
+            dimensions.add(len(row))
+            rows.append(row)
+        if len(dimensions) != 1:
+            raise RuntimeError(
+                f"Code RAG embedding dimension mismatch: {sorted(dimensions)}; "
+                "refusing a mixed dense index"
+            )
+
+        self._sync_embeddings_to_file_cache(rows)
+        if HAS_NUMPY and rows:
+            matrix = np.asarray(rows, dtype=np.float32)
+            norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+            if np.any(norms <= 0):
+                raise RuntimeError("Code RAG dense index contains a zero-norm embedding")
+            self.embeddings = matrix / norms
+            self._embeddings_normalized = True
+            for item in self.index:
+                item.pop("embedding", None)
+        else:
+            self.embeddings = None
+            for item, row in zip(self.index, rows):
+                item["embedding"] = row
+        self._lazy_embed = False
         self._save_cache()
 
     def _extract_code_tokens(self, text: str) -> set:
@@ -798,6 +881,10 @@ class CodeRAG:
             # build 後若仍無索引（空專案），返回空
             if not self.index:
                 return []
+        else:
+            self._refresh_if_stale()
+            if not self.index:
+                return []
 
         q_emb = self._get_embedding(question)
 
@@ -815,24 +902,27 @@ class CodeRAG:
                 if symbol_lower and symbol_lower in code_tokens_lower:
                     explicit_indices.append(i)
 
-            if self._lazy_embed_top_k > 0 and self.index:
-                import heapq
-                lazy_top_k = min(self._lazy_embed_top_k, len(self.index))
-                cand_indices = heapq.nlargest(
-                    lazy_top_k, range(len(self.index)), key=lambda idx: kw_scores[idx]
-                )
+            if not any(score > 0 for score in kw_scores):
+                # All lexical scores tied at zero: slicing the first N symbols
+                # is arbitrary and makes dense recall effectively random.
+                self._materialize_dense_index()
             else:
-                cand_indices = []
+                if self._lazy_embed_top_k > 0 and self.index:
+                    import heapq
+                    lazy_top_k = min(self._lazy_embed_top_k, len(self.index))
+                    cand_indices = heapq.nlargest(
+                        lazy_top_k, range(len(self.index)), key=lambda idx: kw_scores[idx]
+                    )
+                else:
+                    cand_indices = []
 
-            cand_set = {i for i in cand_indices if kw_scores[i] > 0}
-            if not cand_set:
-                cand_set = set(cand_indices)
-            cand_set.update(explicit_indices)
-            for idx in cand_set:
-                item = self.index[idx]
-                if not item.get("embedding"):
-                    emb = self._get_embedding(self._build_embed_text(item))
-                    item["embedding"] = emb
+                cand_set = {i for i in cand_indices if kw_scores[i] > 0}
+                cand_set.update(explicit_indices)
+                for idx in cand_set:
+                    item = self.index[idx]
+                    if not item.get("embedding"):
+                        emb = self._get_embedding(self._build_embed_text(item))
+                        item["embedding"] = emb
 
         # 動態門檻：Bug 類問題稍微放寬
         threshold = CODE_RAG_THRESHOLD_BUG if is_bug_fix else CODE_RAG_THRESHOLD

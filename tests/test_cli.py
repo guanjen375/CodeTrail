@@ -667,6 +667,19 @@ def test_run_eval_help_exits_zero():
     assert "Traceback" not in r.stderr
 
 
+def test_run_retrieval_eval_help_exits_zero():
+    """離線 retrieval harness 的 help 不得載入模型或連 server。"""
+    r = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "eval" / "run_retrieval_eval.py"), "--help"],
+        capture_output=True, text=True, timeout=15,
+        stdin=subprocess.DEVNULL,
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+    )
+    assert r.returncode == 0, f"exit={r.returncode}\n{r.stderr}"
+    assert "usage" in r.stdout.lower() or "用法" in r.stdout
+    assert "Traceback" not in r.stderr
+
+
 # ---------------------------------------------------------------------------
 # aicode web / aicode attach 子指令
 # ---------------------------------------------------------------------------

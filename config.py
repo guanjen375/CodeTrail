@@ -407,6 +407,7 @@ POLLUTION_RISK_MIN_SCORE = 0.40
 BM25_K1 = 1.5                        # 詞頻飽和度參數
 BM25_B = 0.75                        # 文件長度正規化參數
 BM25_ENABLED = True                  # 啟用真正的 BM25（取代簡單 keyword matching）
+BM25_MIN_RELATIVE_SCORE = 0.05       # 丟掉只命中 generic 詞的 lexical 長尾，避免 RRF rank 放大
 
 # RRF (Reciprocal Rank Fusion) 參數
 RRF_K = 60                           # RRF 常數，控制排名衰減速度
@@ -416,6 +417,7 @@ RRF_ENABLED = True                   # 啟用 RRF 融合（取代線性加權）
 # query 時也預設不因高信心跳過 rerank。
 RERANKER_ALWAYS_ON = True            # True = 有足夠候選就一律走專用 reranker
 RERANKER_TOP_N = 6                   # P0 改進：Rerank 後取 top N（速度優先：8->6）
+RERANKER_PASSAGE_MAX_CHARS = 8000    # BGE reranker passage 上限；不可只看 overlap/開頭
 RERANKER_SKIP_THRESHOLD = 0.55       # top_emb_score > 此值時跳過 rerank（放寬：0.65->0.55）
 
 # 動態門檻：Margin-based 判斷

@@ -93,6 +93,10 @@ python scripts/run_tests.py tests/test_eval_consistency.py tests/test_readme_con
 主要檔案：
 
 - `eval/run_eval.py`：手動評測 runner，會呼叫模型，適合調 RAG / agent / prompt 後做回歸。
+- `eval/run_retrieval_eval.py`：完全離線的 retrieval-only gate；只跑 `_hybrid_search`，
+  query/chunk embedding 從 checked-in fixture cache 讀取，cache miss 直接失敗，不呼叫四台 server。
+- `eval/retrieval_fixture.json`、`eval/retrieval_embedding_cache.json`：30 個 NDA-safe 合成
+  register facts，展開成 92 個可回答題（62 個數值/hex/version）+ 5 個拒答題。
 - `eval/spec_questions.json`、`eval/spec_holdout.json`、`eval/spec_adversarial.json`：規格/RAG 題庫。
 - `eval/code_questions.json`：程式碼定位題庫。
 - `eval/bug_questions.json`：bug 類問題題庫。
@@ -104,10 +108,13 @@ python scripts/run_tests.py tests/test_eval_consistency.py tests/test_readme_con
 ```bash
 python scripts/check_eval_consistency.py
 python scripts/run_tests.py tests/test_eval_consistency.py
+python eval/run_retrieval_eval.py
 python eval/run_eval.py --test-set all --verbose
 ```
 
-前兩個命令不需要 llama-server;`eval/run_eval.py` 需要本機 4 個 llama-server 與對應 GGUF。
+前三個命令不需要 llama-server；retrieval runner 固定回報 Recall@5、MRR、nDCG@5 與
+數值證據精確率。加 `--predictions <json>` 時才另外計算 citation entailment、數值答案
+精確率、拒答率/拒答正確率。`eval/run_eval.py` 才需要本機 4 個 llama-server 與對應 GGUF。
 
 ---
 

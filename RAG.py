@@ -23,6 +23,13 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
+from knowledge_store import (
+    KnowledgeStoreError,
+    knowledge_store_lock,
+    save_knowledge_store_atomic,
+    validate_embeddings,
+)
+
 # ============================================================
 # 依賴檢查
 # ============================================================
@@ -53,11 +60,13 @@ def check_pymupdf4llm():
 try:
     from config import (
         EMBEDDING_MODEL, CHUNK_SETTINGS,
+        KNOWLEDGE_EMB_FILE,
         LLAMA_EMBED_BASE_URL, LLAMA_VL_BASE_URL,
         VL_MODEL, VL_INGEST_MAX_TOKENS, VL_INGEST_TIMEOUT,
     )
 except ImportError:
     EMBEDDING_MODEL = "bge-m3"  # Fallback：獨立執行時的預設值
+    KNOWLEDGE_EMB_FILE = "knowledge_emb.npz"
     CHUNK_SETTINGS = {'default': {'size': 1200, 'overlap': 200}}
     LLAMA_EMBED_BASE_URL = "http://localhost:8081"
     LLAMA_VL_BASE_URL = "http://localhost:8083"
@@ -72,6 +81,8 @@ INCLUDE_HEADING_IN_CONTENT = True
 
 # Embedding 增量快取檔案
 EMBEDDING_CACHE_FILE = ".rag_embedding_cache.json"
+EMBEDDING_INPUT_SCHEMA = "source-section-content-v2"
+LEGACY_CONTENT_HASH_SCHEMA = "content-v1"
 
 # 支援的檔案類型（文字類，process_file 走純文字抽取）
 SUPPORTED_EXTENSIONS = {".pdf", ".md", ".txt"}
@@ -280,12 +291,13 @@ def normalize_table_content(text: str) -> str:
         # Markdown 表格行 (| col1 | col2 | col3 |)
         if '|' in line and line.count('|') >= 2:
             cells = [c.strip() for c in line.split('|') if c.strip()]
-            if len(cells) >= 2 and not all(c == '-' or c.startswith('-') for c in cells):
+            if len(cells) >= 3:
+                # Register maps need their original header + separator so the
+                # splitter can repeat both when the table spans chunks.
+                normalized.append(line)
+            elif len(cells) >= 2 and not all(c == '-' or c.startswith('-') for c in cells):
                 # 嘗試識別 key-value 對
-                if len(cells) == 2:
-                    normalized.append(f"{cells[0]}: {cells[1]}")
-                else:
-                    normalized.append(line)  # 保留原始格式
+                normalized.append(f"{cells[0]}: {cells[1]}")
             continue
 
         # 條列格式 (- key: value 或 * key: value)
@@ -357,6 +369,35 @@ def split_by_semantic_with_sections(
         return [{"content": text, "section": "", "heading_hierarchy": ""}]
 
     lines = text.split('\n')
+    table_context: Dict[int, Tuple[str, str]] = {}
+
+    def _table_cells(line: str) -> List[str]:
+        if '|' not in line or line.count('|') < 2:
+            return []
+        return [cell.strip() for cell in line.strip().strip('|').split('|')]
+
+    def _is_table_separator(line: str) -> bool:
+        cells = _table_cells(line)
+        return len(cells) >= 3 and all(
+            re.fullmatch(r':?-{3,}:?', cell or '') for cell in cells
+        )
+
+    # Map each data row to its table header.  This is computed before splitting
+    # so a continuation chunk can restore column semantics deterministically.
+    line_idx = 0
+    while line_idx + 1 < len(lines):
+        header_cells = _table_cells(lines[line_idx])
+        if len(header_cells) >= 3 and _is_table_separator(lines[line_idx + 1]):
+            header = lines[line_idx]
+            separator = lines[line_idx + 1]
+            data_idx = line_idx + 2
+            while data_idx < len(lines) and len(_table_cells(lines[data_idx])) >= 3:
+                table_context[data_idx] = (header, separator)
+                data_idx += 1
+            line_idx = data_idx
+        else:
+            line_idx += 1
+
     chunks = []
     current_chunk = []
     current_len = 0
@@ -433,8 +474,13 @@ def split_by_semantic_with_sections(
                 current_chunk = [sub_chunks[-1]] if sub_chunks else []
                 current_len = len(current_chunk[0]) if current_chunk else 0
             else:
-                current_chunk = [line]
-                current_len = line_len
+                table_header = table_context.get(idx)
+                if table_header:
+                    current_chunk = [table_header[0], table_header[1], line]
+                    current_len = sum(len(value) + 1 for value in current_chunk)
+                else:
+                    current_chunk = [line]
+                    current_len = line_len
             chunk_start_idx = idx
         else:
             current_chunk.append(line)
@@ -452,6 +498,9 @@ def split_by_semantic_with_sections(
             })
 
     chunks = [c for c in chunks if c["content"].strip()]
+    for chunk in chunks:
+        chunk["overlap_prefix_chars"] = 0
+        chunk["heading_prefix_chars"] = 0
 
     # Add overlap for better recall.
     # 重要（P0 無損性）：overlap 是「附加在前面的前段脈絡」，必須是純前綴，
@@ -466,7 +515,9 @@ def split_by_semantic_with_sections(
             prev = original_contents[i - 1]
             tail = prev[-overlap_chars:] if prev else ""
             if tail:
-                chunks[i]["content"] = tail + "\n" + chunks[i]["content"]
+                prefix = tail + "\n"
+                chunks[i]["content"] = prefix + chunks[i]["content"]
+                chunks[i]["overlap_prefix_chars"] = len(prefix)
 
     # Inject heading hierarchy into content to improve retrieval.
     # 同為純前綴，不截斷正文（舊版 content[:max_chars]+"..." 同樣會遺失原文）。
@@ -478,7 +529,9 @@ def split_by_semantic_with_sections(
             if chunk.get("section"):
                 header_lines.append(f"[SECTION] {chunk['section']}")
             if header_lines:
-                chunk["content"] = "\n".join(header_lines) + "\n" + chunk["content"]
+                prefix = "\n".join(header_lines) + "\n"
+                chunk["content"] = prefix + chunk["content"]
+                chunk["heading_prefix_chars"] = len(prefix)
 
     return chunks
 
@@ -490,6 +543,14 @@ def split_by_semantic(text: str, max_chars: int = CHUNK_SIZE) -> List[str]:
     """
     results = split_by_semantic_with_sections(text, max_chars)
     return [r["content"] for r in results]
+
+
+def _retrieval_prefix_metadata(chunk_data: Dict) -> Dict[str, int]:
+    """Carry synthetic-prefix boundaries from the splitter into stored chunks."""
+    return {
+        "overlap_prefix_chars": int(chunk_data.get("overlap_prefix_chars", 0) or 0),
+        "heading_prefix_chars": int(chunk_data.get("heading_prefix_chars", 0) or 0),
+    }
 
 def split_long_paragraph(text: str, max_chars: int) -> List[str]:
     """切分超長段落（按句子）"""
@@ -581,7 +642,8 @@ def extract_pdf(file_path: str) -> List[Dict]:
                 "content": chunk_data["content"],
                 "type": chunk_type,
                 "section": section,
-                "heading_hierarchy": chunk_data.get("heading_hierarchy", "")
+                "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
+                **_retrieval_prefix_metadata(chunk_data),
             })
 
     return results
@@ -622,7 +684,8 @@ def extract_text_file(file_path: str) -> List[Dict]:
             "content": chunk_data["content"],
             "type": chunk_type,
             "section": chunk_data["section"],
-            "heading_hierarchy": chunk_data.get("heading_hierarchy", "")
+            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
+            **_retrieval_prefix_metadata(chunk_data),
         })
 
     return results
@@ -679,6 +742,7 @@ def extract_binary(file_path: str) -> List[Dict]:
             "type": chunk_type,
             "section": section,
             "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
+            **_retrieval_prefix_metadata(chunk_data),
             "origin": "binary",
         })
 
@@ -805,6 +869,7 @@ def process_chat_screenshot(image_path: str) -> List[Dict]:
             "type": chunk_type,
             "section": chunk_data["section"],
             "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
+            **_retrieval_prefix_metadata(chunk_data),
             "origin": "screenshot"  # 標記來源是截圖
         })
 
@@ -932,6 +997,7 @@ def process_technical_image(image_path: str) -> List[Dict]:
             "type": chunk_type,
             "section": chunk_data["section"],
             "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
+            **_retrieval_prefix_metadata(chunk_data),
             "origin": "image"  # 標記來源是技術圖片
         })
 
@@ -1030,6 +1096,19 @@ def _content_hash(content: str) -> str:
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
 
+def _embedding_input(chunk: Dict) -> str:
+    """Build the model input; source identity is retrieval evidence, not post-hoc metadata."""
+    source = Path(str(chunk.get("source", ""))).name
+    section = str(chunk.get("section", "")).strip()
+    prefixes = []
+    if source:
+        prefixes.append(f"[SOURCE] {source}")
+    if section:
+        prefixes.append(f"[SECTION_METADATA] {section}")
+    prefixes.append(str(chunk.get("content", "")))
+    return "\n".join(prefixes)
+
+
 def generate_embeddings(chunks: List[Dict], cache_dir: Path = None) -> List[Dict]:
     """為所有 chunks 生成 embeddings
 
@@ -1054,7 +1133,7 @@ def generate_embeddings(chunks: List[Dict], cache_dir: Path = None) -> List[Dict
             status = f"(快取命中: {cache_hits})" if cache_hits > 0 else ""
             print(f"  Embedding: {i + 1}/{total} {status}", end='\r')
 
-        content = chunk['content']
+        content = _embedding_input(chunk)
         content_key = _content_hash(content)
 
         # 檢查快取；舊版可能留下空向量，空值視為 miss 並重新請求。
@@ -1106,14 +1185,12 @@ def generate_embeddings(chunks: List[Dict], cache_dir: Path = None) -> List[Dict
 def load_knowledge_base(output_path: Path) -> Dict:
     """載入現有知識庫，不存在則建立空的"""
     if output_path.exists():
-        try:
+        with knowledge_store_lock(output_path, exclusive=False):
             with open(output_path, 'r', encoding='utf-8') as f:
                 kb = json.load(f)
             _restore_embeddings_from_npz(kb, output_path)
             print(f"[INFO] 載入現有知識庫: {len(kb.get('chunks', []))} 個區塊")
             return kb
-        except Exception as e:
-            print(f"[WARN] 無法讀取現有知識庫，將建立新的: {e}")
     
     # 建立空的知識庫
     return {
@@ -1128,11 +1205,20 @@ def load_knowledge_base(output_path: Path) -> Dict:
         "chunks": []
     }
 
-def _chunks_content_hash(chunks: List[Dict]) -> str:
-    """計算 chunks 內容 hash，需與 save_knowledge_base 的 .npz metadata 一致。"""
+def _chunks_content_hash(
+    chunks: List[Dict], schema: str = LEGACY_CONTENT_HASH_SCHEMA
+) -> str:
+    """計算 chunks hash；新版同時涵蓋會影響 embedding input 的 metadata。"""
     hasher = hashlib.md5()
     for chunk in chunks:
-        hasher.update(chunk.get('content', '').encode('utf-8'))
+        if schema == EMBEDDING_INPUT_SCHEMA:
+            value = _embedding_input(chunk)
+            # 長度前綴避免欄位/相鄰 chunk 邊界碰撞。
+            encoded = value.encode('utf-8')
+            hasher.update(len(encoded).to_bytes(8, "big"))
+            hasher.update(encoded)
+        else:
+            hasher.update(chunk.get('content', '').encode('utf-8'))
     return hasher.hexdigest()
 
 
@@ -1145,7 +1231,23 @@ def _restore_embeddings_from_npz(kb: Dict, output_path: Path) -> bool:
     chunks = kb.get("chunks", [])
     if not chunks:
         return False
+    saved_metadata = kb.get("metadata", {})
+    saved_model = str(saved_metadata.get("embedding_model", ""))
+    if saved_model and saved_model != EMBEDDING_MODEL:
+        raise KnowledgeStoreError(
+            "embedding model mismatch: "
+            f"JSON={saved_model}, configured={EMBEDDING_MODEL}. "
+            "Rebuild the whole knowledge base; mixing vectors from different "
+            "models is forbidden."
+        )
     if all(chunk.get("embedding") for chunk in chunks):
+        _, dimension = validate_embeddings(chunks)
+        stored_dimension = saved_metadata.get("embedding_dimension")
+        if stored_dimension and int(stored_dimension) != dimension:
+            raise KnowledgeStoreError(
+                "embedding dimension metadata mismatch: "
+                f"JSON={stored_dimension}, vectors={dimension}"
+            )
         return True
 
     try:
@@ -1156,25 +1258,59 @@ def _restore_embeddings_from_npz(kb: Dict, output_path: Path) -> bool:
 
     emb_path = output_path.parent / KNOWLEDGE_EMB_FILE
     if not emb_path.exists():
-        return False
+        raise KnowledgeStoreError(
+            f"knowledge embedding file is missing: {emb_path}. "
+            "Rebuild the knowledge base; refusing to continue with vectorless chunks."
+        )
 
     try:
-        data = np.load(emb_path, allow_pickle=True)
-        embeddings = data["embeddings"]
-        chunk_count = int(data.get("chunk_count", 0))
-        content_hash = str(data.get("content_hash", ""))
+        with np.load(emb_path, allow_pickle=False) as data:
+            embeddings = data["embeddings"].copy()
+            emb_model = str(data.get("embedding_model", ""))
+            chunk_count = int(data.get("chunk_count", 0))
+            content_hash = str(data.get("content_hash", ""))
+            hash_schema = str(data.get("content_hash_schema", LEGACY_CONTENT_HASH_SCHEMA))
+            npz_generation = str(data.get("store_generation", ""))
+            stored_dimension = int(data.get("embedding_dimension", 0))
     except Exception as e:
-        print(f"[WARN] 載入既有 .npz embeddings 失敗，將在儲存時重算缺失向量: {e}")
-        return False
+        raise KnowledgeStoreError(f"failed to load knowledge embeddings from {emb_path}: {e}") from e
+
+    if emb_model != EMBEDDING_MODEL or (saved_model and saved_model != EMBEDDING_MODEL):
+        raise KnowledgeStoreError(
+            "embedding model mismatch: "
+            f"JSON={saved_model or '(missing)'}, NPZ={emb_model or '(missing)'}, "
+            f"configured={EMBEDDING_MODEL}. Rebuild the whole knowledge base; "
+            "mixing vectors from different models is forbidden."
+        )
 
     if chunk_count != len(chunks):
-        print("[WARN] 既有 .npz chunk 數量不一致，將在儲存時重算缺失向量")
-        return False
+        raise KnowledgeStoreError(
+            f"embedding chunk_count mismatch: NPZ={chunk_count}, JSON={len(chunks)}"
+        )
 
-    current_hash = _chunks_content_hash(chunks)
+    if getattr(embeddings, "ndim", 0) != 2 or embeddings.shape[0] != len(chunks):
+        raise KnowledgeStoreError(
+            f"embedding matrix shape mismatch: got {getattr(embeddings, 'shape', None)}, "
+            f"expected ({len(chunks)}, dimension)"
+        )
+    if stored_dimension and embeddings.shape[1] != stored_dimension:
+        raise KnowledgeStoreError(
+            f"embedding dimension metadata mismatch: NPZ matrix={embeddings.shape[1]}, "
+            f"metadata={stored_dimension}"
+        )
+
+    json_generation = str(kb.get("metadata", {}).get("store_generation", ""))
+    if json_generation and npz_generation != json_generation:
+        raise KnowledgeStoreError(
+            f"knowledge store generation mismatch: JSON={json_generation}, "
+            f"NPZ={npz_generation or '(missing)'}"
+        )
+
+    current_hash = _chunks_content_hash(chunks, schema=hash_schema)
     if content_hash and content_hash != current_hash:
-        print("[WARN] 既有 .npz 內容 hash 不一致，將在儲存時重算缺失向量")
-        return False
+        raise KnowledgeStoreError(
+            f"knowledge embedding content hash mismatch: NPZ={content_hash}, JSON={current_hash}"
+        )
 
     for chunk, emb in zip(chunks, embeddings):
         if not chunk.get("embedding"):
@@ -1182,7 +1318,7 @@ def _restore_embeddings_from_npz(kb: Dict, output_path: Path) -> bool:
     return True
 
 
-def save_knowledge_base(kb: Dict, output_path: Path):
+def save_knowledge_base(kb: Dict, output_path: Path, *, _already_locked: bool = False):
     """儲存知識庫
 
     改進：將 embeddings 完全移到 .npz，JSON 只存文字與 metadata
@@ -1192,79 +1328,29 @@ def save_knowledge_base(kb: Dict, output_path: Path):
     """
     missing_embeddings = [chunk for chunk in kb.get("chunks", []) if not chunk.get("embedding")]
     if missing_embeddings:
-        print(f"[WARN] {len(missing_embeddings)} 個舊 chunks 缺少 embedding，將重算以避免寫入零向量")
-        generate_embeddings(missing_embeddings)
+        print(f"[INFO] {len(missing_embeddings)} 個 chunks 缺少 embedding，明確重算後再提交")
+        generate_embeddings(missing_embeddings, cache_dir=output_path.parent)
 
     # 更新 metadata
     kb["metadata"]["updated_at"] = datetime.now().isoformat()
     kb["metadata"]["total_documents"] = len(kb["metadata"]["documents"])
     kb["metadata"]["total_chunks"] = len(kb["chunks"])
 
-    # 分離 embeddings（從 chunks 移除，存到 .npz）
-    embeddings = []
-    chunks_without_emb = []
-    for chunk in kb["chunks"]:
-        emb = chunk.pop("embedding", [])
-        embeddings.append(emb)
-        chunks_without_emb.append(chunk)
-
-    # 儲存 JSON（不含 embedding）
-    kb_to_save = {
-        "metadata": kb["metadata"],
-        "chunks": chunks_without_emb
-    }
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(kb_to_save, f, ensure_ascii=False, indent=2)
-
-    # 儲存 embeddings 到 .npz
-    try:
-        import numpy as np
-        from config import KNOWLEDGE_EMB_FILE
-        emb_path = output_path.parent / KNOWLEDGE_EMB_FILE
-
-        # 計算 content hash（用於載入時驗證）
-        content_hash = _chunks_content_hash(chunks_without_emb)
-
-        # 確保 embeddings 維度一致
-        non_empty_embeddings = [e for e in embeddings if e]
-        if non_empty_embeddings:
-            emb_dim = max(len(e) for e in non_empty_embeddings)
-            normalized = []
-            for emb in embeddings:
-                if len(emb) == emb_dim:
-                    normalized.append(emb)
-                elif len(emb) == 0:
-                    normalized.append([0.0] * emb_dim)
-                else:
-                    normalized.append((emb + [0.0] * emb_dim)[:emb_dim])
-
-            emb_array = np.array(normalized, dtype=np.float32)
-            # L2 正規化
-            norms = np.linalg.norm(emb_array, axis=1, keepdims=True)
-            norms = np.where(norms > 0, norms, 1.0)
-            emb_array = emb_array / norms
-
-            np.savez_compressed(
-                emb_path,
-                embeddings=emb_array,
-                embedding_model=EMBEDDING_MODEL,
-                chunk_count=len(chunks_without_emb),
-                content_hash=content_hash
-            )
-            emb_size = emb_path.stat().st_size / 1024 / 1024
-            print(f"     Embeddings: {emb_path.name} ({emb_size:.2f} MB)")
-        elif emb_path.exists():
-            emb_path.unlink()
-            print(f"     Embeddings: 已移除空知識庫的 {emb_path.name}")
-    except ImportError:
-        # numpy 不可用，將 embedding 放回 JSON（向後相容）
-        for i, emb in enumerate(embeddings):
-            if i < len(kb["chunks"]):
-                kb["chunks"][i]["embedding"] = emb
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(kb, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"     [WARN] 儲存 .npz 失敗: {e}")
+    content_hash = _chunks_content_hash(kb["chunks"], schema=EMBEDDING_INPUT_SCHEMA)
+    _, saved_emb_path = save_knowledge_store_atomic(
+        kb,
+        output_path,
+        embedding_file=KNOWLEDGE_EMB_FILE,
+        embedding_model=EMBEDDING_MODEL,
+        content_hash=content_hash,
+        content_hash_schema=EMBEDDING_INPUT_SCHEMA,
+        already_locked=_already_locked,
+    )
+    if saved_emb_path:
+        emb_size = saved_emb_path.stat().st_size / 1024 / 1024
+        print(f"     Embeddings: {saved_emb_path.name} ({emb_size:.2f} MB)")
+    else:
+        print(f"     Embeddings: 已移除空知識庫的 {KNOWLEDGE_EMB_FILE}")
 
     file_size = output_path.stat().st_size / 1024 / 1024  # MB
     print(f"\n[OK] 知識庫已更新!")
@@ -1272,6 +1358,60 @@ def save_knowledge_base(kb: Dict, output_path: Path):
     print(f"     大小: {file_size:.2f} MB")
     print(f"     文件數: {kb['metadata']['total_documents']}")
     print(f"     區塊數: {kb['metadata']['total_chunks']}")
+
+
+def remove_document_from_knowledge_base(output_path: Path, source: str) -> Dict:
+    """Transactionally remove one source while preserving aligned remaining vectors."""
+    output_path = Path(output_path)
+    target = Path(source).name
+    if not output_path.is_file():
+        raise KnowledgeStoreError(f"knowledge JSON does not exist: {output_path}")
+
+    with knowledge_store_lock(output_path, exclusive=True):
+        try:
+            with open(output_path, "r", encoding="utf-8") as handle:
+                kb = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise KnowledgeStoreError(f"failed to read {output_path}: {exc}") from exc
+        _restore_embeddings_from_npz(kb, output_path)
+
+        chunks = list(kb.get("chunks", []))
+        documents = list(kb.setdefault("metadata", {}).get("documents", []))
+        kept_chunks = [
+            chunk for chunk in chunks
+            if Path(str(chunk.get("source", ""))).name != target
+        ]
+        kept_documents = [
+            document for document in documents
+            if Path(str(document)).name != target
+        ]
+        removed_chunks = len(chunks) - len(kept_chunks)
+        removed_documents = len(documents) - len(kept_documents)
+        if removed_chunks == 0 and removed_documents == 0:
+            return {
+                "target": target,
+                "removed_chunks": 0,
+                "removed_documents": 0,
+                "remaining_chunks": len(chunks),
+                "remaining_documents": len(documents),
+                "sources": sorted({Path(str(c.get("source", ""))).name for c in chunks}),
+            }
+
+        kb["chunks"] = kept_chunks
+        kb["metadata"]["documents"] = kept_documents
+        save_knowledge_base(kb, output_path, _already_locked=True)
+
+        return {
+            "target": target,
+            "removed_chunks": removed_chunks,
+            "removed_documents": removed_documents,
+            "remaining_chunks": len(kept_chunks),
+            "remaining_documents": len(kept_documents),
+            "sources": sorted({
+                Path(str(c.get("source", ""))).name
+                for c in kept_chunks if c.get("source")
+            }),
+        }
 
 def add_document(input_file: str, output_file: str):
     """將文件加入知識庫"""
@@ -1419,6 +1559,7 @@ def _add_chat_content_to_kb(image_path: Path, content: str, output_file: str):
             "type": chunk_type,
             "section": chunk_data["section"],
             "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
+            **_retrieval_prefix_metadata(chunk_data),
             "origin": "screenshot"
         })
 
@@ -1690,6 +1831,7 @@ def process_url(url: str) -> Optional[Tuple[List[Dict], str]]:
             "type": chunk_type,
             "section": chunk_data["section"],
             "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
+            **_retrieval_prefix_metadata(chunk_data),
             "origin": "url",
             "url": url,              # 保留原始 URL
             "title": title,          # 補存標題
@@ -1762,6 +1904,7 @@ def _add_url_content_to_kb(url: str, content: str, title: str, output_file: str)
             "type": chunk_type,
             "section": chunk_data["section"],
             "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
+            **_retrieval_prefix_metadata(chunk_data),
             "origin": "url",
             "url": url,
             "title": title,
@@ -1919,6 +2062,7 @@ def _add_image_content_to_kb(image_path: Path, content: str, output_file: str):
             "type": chunk_type,
             "section": chunk_data["section"],
             "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
+            **_retrieval_prefix_metadata(chunk_data),
             "origin": "image"
         })
 

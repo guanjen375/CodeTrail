@@ -42,6 +42,7 @@ knowledge.json
 knowledge*.json
 *.knowledge.json
 knowledge_emb.npz
+.knowledge.json.lock
 
 # 資料飛輪（可能含使用者提問與回答，勿提交）
 data/

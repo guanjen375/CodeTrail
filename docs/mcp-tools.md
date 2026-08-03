@@ -42,8 +42,8 @@
 | 文件/外部檔案 | `ingest_document(path, mode="auto")` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document` |
 | 文件/外部檔案 | `remove_document(source)` | 從 KB 移除過期文件 |
 | 文件/外部檔案 | `reload_knowledge_base()` | 讓剛匯入或刪除的 KB 內容立即生效 |
-| 文件/外部檔案 | `query_knowledge(question)` | 查 KB，適合 spec / manual / datasheet |
-| 文件/外部檔案 | `query_knowledge_strict(question)` | 查高風險規格題，弱證據會拒答 |
+| 文件/外部檔案 | `query_knowledge(question, source=None)` | 查 KB；`source` 可用 basename 限定單一 spec/manual |
+| 文件/外部檔案 | `query_knowledge_strict(question, source=None)` | 查高風險規格題，弱證據會拒答；可限定文件 |
 | 修改/驗證 | `git_status()` | 看工作樹目前有沒有改動 |
 | 修改/驗證 | `git_diff(path=None, staged=False)` | 看修改內容，不需要用 `run_command` 跑 git |
 | 修改/驗證 | `apply_patch(diff, dry_run=False)` | 套 unified diff，會真的寫檔 |
@@ -54,7 +54,7 @@
 
 - 找程式碼時，先請模型用工具 `code_rag_search` 或 `grep_code`，再用工具 `read_file`。
 - 長檔先用工具 `file_info` 看大小，再要求工具 `read_file` 分段讀。
-- 查 spec 先用工具 `query_knowledge`；數字、限制、預設值這類答錯很糟的題目，用工具 `query_knowledge_strict`。
+- 查 spec 先用工具 `query_knowledge`；數字、限制、預設值這類答錯很糟的題目，用工具 `query_knowledge_strict`。多份相似版本並存時傳 `source="檔名"`，filter 會在 top-k 前套用。
 - 外部檔案先用工具 `import_external_file`，再用工具 `analyze_file`、`ingest_document` 或 `read_file` 處理匯入後路徑。
 - 新增或刪除文件後一定要用工具 `reload_knowledge_base`。
 - 改檔前先看工具 `git_status` / `git_diff`；改檔用工具 `apply_patch`。
