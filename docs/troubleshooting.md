@@ -113,17 +113,83 @@ python3 -m pip install --user --break-system-packages -U huggingface_hub
 
 `--user` 把套件裝進 `~/.local/lib/pythonX.Y/site-packages`,不會動到系統 Python。新版 `huggingface_hub` 會同時提供 `hf` CLI 與 `hf_xet`;不要再另外安裝已移除的 `hf-transfer`。
 
-### `/status` 沒看到 CodeTrail MCP Connected
+### `/status` 顯示 `codetrail MCP error -32000: Connection closed`
 
-檢查:
+`-32000` 不是根因,只表示 OpenCode 啟動的 MCP 子行程在完成 initialize 前退出。先完全
+退出 OpenCode,在 target project 目錄檢查 client 設定與狀態:
 
 ```bash
-python -m json.tool ~/.config/opencode/opencode.json >/dev/null
+python3 -m json.tool ~/.config/opencode/opencode.json >/dev/null
+jq '.mcp.codetrail | {type, command, enabled, timeout}' ~/.config/opencode/opencode.json
 command -v aicode
 command -v opencode
+opencode mcp list
 ```
 
-再確認 `opencode.json` 裡的 MCP command 能找到目前 git root 內的 `.opencode/run-codetrail-mcp`,且 `/status` 裡的名字會跟 `mcp` key 一致;如果 key 是 `codetrail`,應該看到 `codetrail Connected`。
+`mcp` key 若是 `codetrail`,`/status` 正常應顯示 `codetrail Connected`。MCP command 有
+兩種正常形式:`set_config.sh` 產生的設定會用偵測到的 Python 絕對路徑直接執行
+`mcp_server.py`;手動設定則可指向目前 project git root 內由 `aicode` 產生的
+`.opencode/run-codetrail-mcp`。不要因為沒看到其中某一種形式就判定設定壞掉。
+
+OpenCode log 往往只記 `server unavailable`,不會保留子行程的完整 traceback。要看到真正
+原因,在同一個 target project 目錄直接跑一次 MCP command(以下兩個絕對路徑取自上面的
+`jq` 輸出；`<CODE_MODEL>` 用 `aicode` 啟動時印出的 bare model name):
+
+```bash
+cd <PROJECT_TO_ANALYZE>
+AICODE_ROOT="$PWD" AICODE_MODEL=<CODE_MODEL> \
+  /ABS/PYTHON /ABS/CODETRAIL/mcp_server.py
+```
+
+若看到 `[MCP] server ready, listening on stdio.`,server 本身正常,按 Ctrl-C 結束後再查
+OpenCode command / wrapper。若它退出,最後一段 stderr 才是根因。常見分流:
+
+- `[MCP][model-preflight] FAIL` → 對應的 embedding / reranker / VL server 沒 ready;
+  先跑 `python3 <CODETRAIL_REPO>/scripts/required_model_servers_check.py`。
+- `ModuleNotFoundError` → `mcp.codetrail.command` 指到的那顆 Python 缺依賴;用**同一顆
+  Python** 安裝 `requirements.txt`,或重跑 `set_config.sh`。
+- `[FATAL] AICODE_ROOT ...` → 必須從具體 project 目錄走 `aicode`,不可把 `/` 或 `$HOME`
+  當 sandbox root。
+- `KnowledgeStoreError` → 既有 `knowledge.json` / `knowledge_emb.npz` 不相容或不完整;
+  依下一段處理。
+
+#### `KnowledgeStoreError: ... embedding model mismatch`
+
+這表示知識庫向量是由另一個 embedding model id 建立,例如錯誤會列出
+`saved=<OLD_EMBED_MODEL>, configured=<CURRENT_EMBED_MODEL>`。CodeTrail 會 fail-loud,
+避免拿不同模型的向量混算;因為失敗發生在 MCP initialize 前,OpenCode 表面只看得到
+`-32000`。
+
+不要只手改 `knowledge.json` 的 `metadata.embedding_model`:伴隨的 `knowledge_emb.npz`
+也綁定 model、維度、content hash 與 generation,硬改標籤不能證明向量相容。先退出
+OpenCode,把舊 store 與 embedding cache **一起保留到不會被 commit 的備份目錄**:
+
+```bash
+cd <PROJECT_TO_ANALYZE>
+mkdir -p .codetrail/kb-backup-<TIMESTAMP>
+mv knowledge.json .codetrail/kb-backup-<TIMESTAMP>/
+mv knowledge_emb.npz .codetrail/kb-backup-<TIMESTAMP>/        # 若存在
+mv .rag_embedding_cache.json .codetrail/kb-backup-<TIMESTAMP>/ # 若存在
+```
+
+如果暫時不需要文件 RAG,此時重跑 `aicode` 即可;沒有 `knowledge.json` 只代表空知識庫,
+不會阻止 MCP 連線。如果仍要查原本文件,先從備份列出來源,再用**目前設定的同一顆
+embedding model** 全量重建:
+
+```bash
+jq -r '.metadata.documents[]?' \
+  .codetrail/kb-backup-<TIMESTAMP>/knowledge.json
+
+# PDF / Markdown / text / binary / ELF
+python3 <CODETRAIL_REPO>/RAG.py <SOURCE_FILE> knowledge.json
+
+# 技術圖片；聊天截圖則改用 --chat
+python3 <CODETRAIL_REPO>/RAG.py <SOURCE_IMAGE> knowledge.json --image -y
+```
+
+每個舊來源都重建完成後再啟動 `aicode`,用 `/status` 確認 `codetrail Connected`。
+`knowledge.json`、`knowledge_emb.npz`、embedding cache 與備份都可能含 NDA 衍生資料,
+不可 commit。
 
 ### `aicode web`: 「這個 opencode 不支援 'web' 子指令(版本太舊)」
 
