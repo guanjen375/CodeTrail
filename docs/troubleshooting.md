@@ -548,16 +548,19 @@ tmux capture-pane -p -t codetrail-rag:embed -S -100
 ready,但 llama.cpp 的預設 physical batch `-ub 512` 放不下真實 RAG chunk。
 短字串 curl 會成功,不能排除這個設定錯誤。
 
-CodeTrail launcher 會把 embedding 與 reranker 都設成
-`-c 8192 -b 8192 -ub 8192`;重啟三顆附屬 server 套用:
+safe-defaults / 舊的 `start-rag-servers.sh` 會把 embedding 與 BGE reranker 都設成
+`-c 8192 -b 8192 -ub 8192`。`set_config.sh` 產生的設定則維持 embedding 8192，
+並把你選的 reranker ctx 同步套到它的 `-c/-b/-ub`。重啟三顆附屬 server 套用:
 
 ```bash
 ./scripts/stop-rag-servers.sh
 ./scripts/start-rag-servers.sh
 ```
 
-若是手動啟動 embedding / reranker,也要讓 `-b`、`-ub` 至少容納最長輸入;
-non-causal pooling 不能把單一序列拆成較小的 physical batches。
+若是手動啟動 embedding / reranker，也要讓 `-b`、`-ub` 至少容納最長輸入；
+llama.cpp 的 embedding/reranking server 會要求單一輸入序列放得進 physical batch。
+Qwen3-Reranker 若在 8192 OOM，可重跑 `./set_config.sh` 選 ctx 2048，或非互動加
+`--rerank-ctx 2048`；輸入原本就小於 2048 時不會因縮小上限而降低排序精準度。
 
 ### `aicode` 拒絕啟動,訊息說「主模型未設定」
 

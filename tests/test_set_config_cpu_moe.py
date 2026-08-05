@@ -71,6 +71,7 @@ def _build_plan(tmp_path: Path, *, cpu_moe: bool) -> sc.Plan:
         threads=12,
         batch=0,
         ubatch=0,
+        reranker_ctx=sc.DEFAULT_RERANKER_CTX,
         cpu_moe=cpu_moe,
         main_layout=layout,
     )

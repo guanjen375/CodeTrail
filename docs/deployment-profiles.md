@@ -55,11 +55,17 @@ launcher CLI / environment
   VL 使用 `-ngl auto --fit on --fit-target 3072`。
 - VL 的 `mmproj`：同樣只接受 registry key 或 GGUF 絕對路徑。
 
-預設 reranker 是 `bge-reranker-v2-m3` Q8_0，並保留 non-causal 模型所需的
-`-b 8192 -ub 8192`，讓最長 8192-token passage 不會在 `/reranking` 回 HTTP 500。
-舊的 Qwen3-Reranker 仍可明確選用，但它在同一 physical batch 下有遠高於 GGUF
-檔案大小的 activation buffer；`set_config.sh` 會用模型感知的保守估值做 aux GPU
-容量 gate。容量不夠時應換預設 BGE、換較小 VL 或分卡，不應關閉 VL `--fit`。
+safe-defaults 的 reranker 是 `bge-reranker-v2-m3` Q8_0，保留
+`-c 8192 -b 8192 -ub 8192`。`set_config.sh` 一般互動會另讓使用者選 reranker ctx，
+並把所選值同步寫入這三個欄位；否則只改 `ctx`、仍留著 8192 physical batch，並不能
+解決 Qwen3 的 buffer 壓力。
+
+Qwen3-Reranker 是支援的 accuracy-first 選項，建議先用 ctx 2048；BGE 預設 8192。
+只要每筆 `query + passage` 沒超過上限，單純增大 ctx 不會提高排序精準度；超過時請求
+可能失敗或上游必須截斷，才可能漏證據。較大 ctx 可容納較長輸入，但配置更多顯存，
+實際處理更多 token 時延遲也會增加。Qwen3 是 causal 架構，除 compute buffer 外還有
+KV cache，所以增幅遠高於 GGUF 權重大小；容量 gate 會依所選 ctx 縮放保守估值。
+容量不夠時應降低 reranker ctx、換 BGE、換較小 VL 或分卡，不應關閉 VL `--fit`。
 
 禁止 `extra_args`、shell 字串、相對 artifact path、帶控制字元的值。launcher 由驗證後
 欄位建立 argv，再逐參數 quote 給 tmux。

@@ -179,6 +179,7 @@ def test_help_is_offline_and_exits_zero(tmp_path):
     assert "--advanced" in proc.stdout
     assert "--cpu-moe" in proc.stdout
     assert "--allow-remote" in proc.stdout
+    assert "--rerank-ctx" in proc.stdout
 
 
 def test_yes_run_generates_all_artifacts(tmp_path):
@@ -205,6 +206,9 @@ def test_yes_run_generates_all_artifacts(tmp_path):
     assert services["vl"]["model"] == str(models / "vl" / "vl-model-q6.gguf")
     assert services["vl"]["mmproj"] == str(models / "vl" / "mmproj-F16.gguf")
     assert services["embedding"]["parameters"] == {"parallel": 1}
+    assert services["reranker"]["ctx"] == 8192
+    assert services["reranker"]["batch"] == 8192
+    assert services["reranker"]["ubatch"] == 8192
     assert services["reranker"]["parameters"] == {"parallel": 1}
     assert services["vl"]["parameters"] == {
         "gpu_layers": "auto",
@@ -334,11 +338,17 @@ def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
 
-    # main 選擇、CPU-MoE 模式、摘要確認各按一次 Enter。
-    accepted = _run(tmp_path, "--no-preview", "--models-dir", str(models), stdin="\n\n\n")
+    # main、CPU-MoE、reranker、reranker ctx、摘要確認各按一次 Enter。
+    accepted = _run(
+        tmp_path, "--no-preview", "--models-dir", str(models), stdin="\n\n\n\n\n"
+    )
     assert accepted.returncode == 0, accepted.stderr + accepted.stdout
     assert "【主聊天模型】 — 偵測到的候選" in accepted.stdout
     assert "目前主模型: big-chat-ud-q4_k_xl-00001-of-00002.gguf" in accepted.stdout
+    assert "Qwen3 = 上游 benchmark 較強的 accuracy-first 候選" in accepted.stdout
+    assert "【reranker 模型】 — 偵測到的候選" in accepted.stdout
+    assert "【reranker ctx】" in accepted.stdout
+    assert "ctx 設更大不會讓排序更準" in accepted.stdout
     assert "建議配置" in accepted.stdout
     assert (tmp_path / "home" / "start.sh").exists()
 
@@ -347,7 +357,7 @@ def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
         ["bash", str(SCRIPT), "--skip-deps-check", "--no-preview", "--models-dir", str(models)],
         cwd=REPO_ROOT,
         env={**_env(tmp_path), "HOME": str(home2), "USERPROFILE": str(home2)},
-        input="\n\nq\n",
+        input="\n\n\n\nq\n",
         capture_output=True,
         text=True,
         timeout=60,
@@ -746,7 +756,7 @@ def test_rtx2000_aux_capacity_prefers_bge_and_accepts_measured_model_sizes(tmp_p
     )
 
 
-def test_rtx2000_aux_capacity_rejects_qwen3_reranker_buffer_pressure(tmp_path):
+def test_rtx2000_aux_capacity_uses_selected_qwen3_reranker_ctx(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
     shutil.rmtree(models / "bge-reranker-v2-m3")
@@ -755,9 +765,36 @@ def test_rtx2000_aux_capacity_rejects_qwen3_reranker_buffer_pressure(tmp_path):
     _sparse(models / "vl" / "vl-model-q6.gguf", 7 * GIB)
     _sparse(models / "vl" / "mmproj-F16.gguf", 876 * 1024**2)
 
-    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    recommended = _run(
+        tmp_path,
+        "--yes",
+        "--no-preview",
+        "--models-dir",
+        str(models),
+    )
 
-    assert proc.returncode == 2
-    assert "Qwen3-Reranker" in proc.stderr
-    assert "額外 6 GiB buffer" in proc.stderr
-    assert "bge-reranker-v2-m3" in proc.stderr
+    assert recommended.returncode == 0, recommended.stderr + recommended.stdout
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert deployment["services"]["reranker"]["ctx"] == 2048
+    assert deployment["services"]["reranker"]["batch"] == 2048
+    assert deployment["services"]["reranker"]["ubatch"] == 2048
+
+    forced_long = _run(
+        tmp_path,
+        "--yes",
+        "--no-preview",
+        "--rerank-ctx",
+        "8192",
+        "--models-dir",
+        str(models),
+    )
+
+    assert forced_long.returncode == 2
+    assert "Qwen3-Reranker" in forced_long.stderr
+    assert "ctx=8192" in forced_long.stderr
+    assert "6144 MiB" in forced_long.stderr
+    assert "bge-reranker-v2-m3" in forced_long.stderr
