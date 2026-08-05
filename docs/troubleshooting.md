@@ -44,6 +44,51 @@ cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc
 ```
 
+### 新 GGUF 啟動後立即 rollback,log 顯示 `unknown model architecture`
+
+**症狀**:`~/start.sh` 建立 main 的 tmux window 後立刻回報啟動失敗並自動
+rollback;接著執行 `tmux ls` 可能又顯示沒有 server。這不是前後矛盾 ——
+`llama-server` 已經退出,launcher 為了避免殘留 session 阻擋下一次啟動,會清掉
+本次建立的 tmux session。
+
+先看持久化 log,不要只看 tmux window:
+
+```bash
+~/start.sh logs main
+```
+
+若其中有類似下面這行:
+
+```text
+llama_model_load: error loading model: unknown model architecture: '<architecture>'
+```
+
+通常代表 GGUF 使用的架構比本機 `llama-server` build 新;模型檔不一定損壞,
+CodeTrail 的 tmux 啟動與 rollback 也仍在正常運作。先確認目前實際執行的 binary
+與版本:
+
+```bash
+~/start.sh --dry-run | grep 'llama-server'
+~/llama.cpp/build/bin/llama-server --version
+git -C ~/llama.cpp log -1 --oneline
+```
+
+若 launcher 使用預設的 `~/llama.cpp/build/bin/llama-server`,更新原始碼並重新 build:
+
+```bash
+cd ~/llama.cpp
+git status --short                 # 有自己的修改時先處理,不要直接覆蓋
+git pull --ff-only
+cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF
+cmake --build build --config Release -j
+~/llama.cpp/build/bin/llama-server --version
+~/start.sh
+```
+
+更新後若仍是同一個 `unknown model architecture`,先查該架構是否已進 llama.cpp
+上游;尚未支援時只能暫時換回已支援的 GGUF,或等待支援合併後再 build。不要為了
+繞過錯誤修改 GGUF metadata:loader 還是缺少真正的模型實作。
+
 ### MoE 模型第一次對話 TTFT(首字時間)1–2 分鐘
 
 例如 Qwen3-235B-A22B 用 `--cpu-moe` 但沒加 `--no-mmap`,llama-server 啟動會看到:
