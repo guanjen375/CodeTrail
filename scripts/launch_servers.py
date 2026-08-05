@@ -283,13 +283,27 @@ def _start_role(
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
             log_path.write_text("", encoding="utf-8")  # 每次啟動重寫該 role 的 log
-            subprocess.run(
+            pipe = subprocess.run(
                 ["tmux", "pipe-pane", "-o", "-t", target,
                  f"cat >> {shlex.quote(str(log_path))}"],
                 check=False,
+                capture_output=True,
+                text=True,
             )
-        except OSError:
-            pass
+            if pipe.returncode != 0:
+                detail = (pipe.stderr or pipe.stdout).strip() or f"exit {pipe.returncode}"
+                print(
+                    f"[!] ⚠ 無法為 {service.role} 接上 tmux pipe-pane({detail});"
+                    f"啟動照常進行,但 ~/start.sh logs {service.role} 將看不到輸出",
+                    file=sys.stderr,
+                )
+        except OSError as exc:
+            # log 寫不進去不該擋啟動,但也不能無聲吞掉,否則使用者以為 logs 可用。
+            print(
+                f"[!] ⚠ 無法建立 {service.role} 的 log 檔({exc});"
+                f"啟動照常進行,但 ~/start.sh logs {service.role} 將看不到輸出",
+                file=sys.stderr,
+            )
     subprocess.run(["tmux", "respawn-window", "-k", "-t", target, command_line], check=True)
     print(f"[+] started {service.role} server ({service.base_url}) in tmux {session}:{window}")
 

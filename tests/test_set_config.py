@@ -1275,6 +1275,13 @@ def test_rerun_keeps_hand_edited_port_and_base_url(tmp_path):
     merged = json.loads(deployment_path.read_text(encoding="utf-8"))
     assert merged["services"]["main"]["port"] == 18080
     assert merged["services"]["main"]["base_url"] == "http://127.0.0.1:18080"
+    # OpenCode 的 baseURL 必須跟著保留下來的 main endpoint,不能仍寫死 8080
+    opencode = json.loads(
+        (tmp_path / "home" / ".config/opencode/opencode.json").read_text(encoding="utf-8")
+    )
+    options = opencode["provider"]["llamacpp"]["options"]
+    assert options["baseURL"] == "http://127.0.0.1:18080/v1"
+    assert "對齊 deployment 的 main endpoint" in rerun.stdout
 
 
 def test_rerun_keeps_out_of_tree_main_model(tmp_path):
@@ -1443,3 +1450,173 @@ def test_pip_fix_hint_matches_python_environment(monkeypatch):
     monkeypatch.setattr(sc.sys, "base_prefix", "/usr")
     hint = sc._pip_fix_hint("/usr/bin/python3")
     assert "--user --break-system-packages" in hint
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-05 第六輪 review 修復的行為契約
+# ---------------------------------------------------------------------------
+
+def _make_flat_vl_models(root: Path) -> Path:
+    """混放目錄 fixture:flat/ 內兩顆聊天模型 + 一顆 mmproj(歸屬不明)。"""
+    models = root / "models"
+    (models / "big-chat").mkdir(parents=True)
+    _sparse_dense_gguf(models / "big-chat" / "big-chat-q4.gguf", 4096)
+    (models / "bge-m3").mkdir()
+    (models / "bge-m3" / "bge-m3-f16.gguf").write_bytes(b"x" * 512)
+    (models / "bge-reranker-v2-m3").mkdir()
+    (models / "bge-reranker-v2-m3" / "bge-reranker-v2-m3-Q8_0.gguf").write_bytes(b"x" * 512)
+    flat = models / "flat"
+    flat.mkdir()
+    (flat / "chat-small-q4.gguf").write_bytes(b"x" * 512)
+    (flat / "media-large-q4.gguf").write_bytes(b"x" * 1024)
+    (flat / "mmproj-F16.gguf").write_bytes(b"x" * 256)
+    return models
+
+
+def test_flat_dir_vl_pairing_fails_loud_on_yes(tmp_path):
+    """混放目錄無法判斷 mmproj 歸屬:--yes 不得自動抓一顆配對,要 fail-loud 指路。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_flat_vl_models(tmp_path)
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "混放" in proc.stderr
+    assert "--vl-model" in proc.stderr
+    assert not (tmp_path / "home" / "start.sh").exists()  # 未寫入任何設定
+
+    # 明確 --vl-model 之後可過:唯一 mmproj 與明確指定的模型配對
+    explicit = _run(
+        tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
+        "--vl-model", str(models / "flat" / "media-large-q4.gguf"),
+    )
+    assert explicit.returncode == 0, explicit.stderr + explicit.stdout
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    assert deployment["services"]["vl"]["model"].endswith("media-large-q4.gguf")
+    assert deployment["services"]["vl"]["mmproj"].endswith("mmproj-F16.gguf")
+
+    # 之後的重跑沿用既有 VL+mmproj,不再被混放目錄卡住
+    rerun = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert rerun.returncode == 0, rerun.stderr + rerun.stdout
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    assert deployment["services"]["vl"]["model"].endswith("media-large-q4.gguf")
+
+
+def test_flat_dir_vl_pairing_asks_explicitly_in_interactive(tmp_path):
+    """互動模式遇到混放目錄:就地要求明確選 VL 模型,不悄悄用排序第一名。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_flat_vl_models(tmp_path)
+    # main、CPU-MoE、reranker、reranker ctx 各 Enter;VL 明確選 [2] media-large;摘要 Enter。
+    proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
+                stdin="\n\n\n\n2\n\n")
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "無法自動判斷哪顆是 VL 模型" in proc.stdout
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    assert deployment["services"]["vl"]["model"].endswith("media-large-q4.gguf")
+    assert deployment["services"]["vl"]["mmproj"].endswith("mmproj-F16.gguf")
+
+
+def test_rerun_rescues_external_model_before_precheck(tmp_path):
+    """現用外部模型必須在 precheck 之前 rescue:models-dir 缺該類別時,
+    重跑 --yes 不得因「初步判定不通過」直接失敗。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = tmp_path / "models"
+    (models / "big-chat").mkdir(parents=True)
+    _sparse_dense_gguf(models / "big-chat" / "big-chat-q4.gguf", 4096)
+    (models / "bge-reranker-v2-m3").mkdir()
+    (models / "bge-reranker-v2-m3" / "bge-reranker-v2-m3-Q8_0.gguf").write_bytes(b"x" * 512)
+    (models / "vl").mkdir()
+    (models / "vl" / "vl-model-q6.gguf").write_bytes(b"x" * 512)
+    (models / "vl" / "mmproj-F16.gguf").write_bytes(b"x" * 256)
+    outside = tmp_path / "external-embed"
+    outside.mkdir()
+    (outside / "bge-m3-f16.gguf").write_bytes(b"x" * 512)
+
+    first = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
+                 "--embed-model", str(outside / "bge-m3-f16.gguf"))
+    assert first.returncode == 0, first.stderr + first.stdout
+
+    rerun = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert rerun.returncode == 0, rerun.stderr + rerun.stdout
+    assert "初步判定 OK" in rerun.stdout
+    assert "之外" in rerun.stdout
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    assert deployment["services"]["embedding"]["model"] == str(outside / "bge-m3-f16.gguf")
+
+
+def test_llama_help_exec_failure_hard_stops_without_skip(tmp_path):
+    """llama-server --help 連跑都跑不動(OSError):非 --skip-binary-check 必須硬停,
+    不得假定支援全部旗標然後顯示 PASS。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    broken = tmp_path / "llama-server"
+    broken.write_text("#!/nonexistent-interpreter\n", encoding="utf-8")
+    broken.chmod(0o755)
+
+    proc = _run(tmp_path, "--yes", "--models-dir", str(models))
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "--help 無法執行" in proc.stderr
+
+    skipped = _run(tmp_path, "--yes", "--no-preview", "--skip-binary-check",
+                   "--models-dir", str(models))
+    assert skipped.returncode == 0, skipped.stderr + skipped.stdout
+    assert "跳過 llama-server 執行檢查" in skipped.stdout
+
+
+def test_deployment_env_override_split_brain_warns(tmp_path):
+    """AICODE_DEPLOYMENT_CONFIG 等 override 有設時要警告:aicode 會讀自訂檔、
+    ~/start.sh 卻刻意 unset,兩邊將各用一份設定。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    proc = _run(
+        tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
+        env_overrides={"AICODE_DEPLOYMENT_CONFIG": str(tmp_path / "custom-deploy.json")},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "偵測到環境變數 AICODE_DEPLOYMENT_CONFIG" in proc.stdout
+    assert "各用一份設定" in proc.stdout
+
+
+def test_logs_accepts_count_and_follow_shorthand(tmp_path):
+    """logs 依說明允許省略 role:logs 3 / logs -f 都要能用;多餘參數不得靜默忽略。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    assert _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models)).returncode == 0
+    home = tmp_path / "home"
+    start = home / "start.sh"
+    state = home / ".local" / "state"
+    log_dir = state / "codetrail" / "logs"
+    log_dir.mkdir(parents=True)
+    (log_dir / "main.log").write_text("line1\nline2\n", encoding="utf-8")
+    env = _env(tmp_path)
+    env["XDG_STATE_HOME"] = str(state)
+
+    def run_start(*args: str, timeout: float = 30):
+        return subprocess.run(
+            ["bash", str(start), *args],
+            env=env, capture_output=True, text=True, timeout=timeout, check=False,
+        )
+
+    shorthand = run_start("logs", "3")   # 省略 role,數字當行數
+    assert shorthand.returncode == 0, shorthand.stderr
+    assert "line2" in shorthand.stdout
+
+    extra = run_start("logs", "main", "5", "x")
+    assert extra.returncode == 2
+    assert "參數過多" in extra.stderr
+
+    still_bad = run_start("logs", "gpu")  # 未知 role 仍要拒絕
+    assert still_bad.returncode == 2
+    assert "未知 role" in still_bad.stderr
+
+    try:
+        run_start("logs", "-f", timeout=2)
+        raise AssertionError("logs -f 應進入 tail -f 追蹤模式,不得被當成未知 role")
+    except subprocess.TimeoutExpired:
+        pass  # tail -f 持續追蹤 → timeout = 解析成功

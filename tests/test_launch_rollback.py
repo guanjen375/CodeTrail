@@ -259,3 +259,46 @@ def test_ready_message_uses_absolute_status_path(monkeypatch, tmp_path, capsys):
     expected = Path(launch_servers.__file__).resolve().parent / "check-status.sh"
     assert f"{expected} --strict" in out
     assert "  ./scripts/check-status.sh" not in out
+
+
+def test_start_role_warns_when_pipe_pane_fails(tmp_path, monkeypatch, capsys):
+    """pipe-pane 接不上不该無聲吞掉:啟動照常,但要警告 logs 會沒內容。"""
+
+    def fake_run(cmd, **_kwargs):
+        class _Result:
+            returncode = 1 if cmd[:2] == ["tmux", "pipe-pane"] else 0
+            stdout = ""
+            stderr = "pipe boom" if cmd[:2] == ["tmux", "pipe-pane"] else ""
+
+        return _Result()
+
+    monkeypatch.setattr(launch_servers.subprocess, "run", fake_run)
+    launch_servers._start_role(
+        _service("main"), ["llama-server", "-m", "x"], "s-main",
+        first_in_session=True, log_dir=tmp_path / "logs",
+    )
+    err = capsys.readouterr().err
+    assert "pipe-pane" in err
+    assert "logs main 將看不到輸出" in err
+
+
+def test_start_role_warns_when_log_dir_unwritable(tmp_path, monkeypatch, capsys):
+    """log 檔建不出來也一樣:不擋啟動,但必須告知 logs 不可用,不能佯稱 log 就緒。"""
+
+    def fake_run(cmd, **_kwargs):
+        class _Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _Result()
+
+    monkeypatch.setattr(launch_servers.subprocess, "run", fake_run)
+    blocker = tmp_path / "blocked"
+    blocker.write_text("file, not dir", encoding="utf-8")
+    launch_servers._start_role(
+        _service("main"), ["llama-server", "-m", "x"], "s-main",
+        first_in_session=True, log_dir=blocker / "logs",
+    )
+    err = capsys.readouterr().err
+    assert "無法建立 main 的 log 檔" in err

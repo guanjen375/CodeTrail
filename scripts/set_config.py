@@ -172,12 +172,15 @@ class ModelCandidate:
     mmproj: Path | None = None            # 目錄內唯一 mmproj 時的自動配對
     mmproj_choices: tuple[Path, ...] = () # 目錄內有多個 mmproj 時的候選(需使用者選)
     vl_paired: bool = False               # 有 mmproj 配對的 VL 模型(不自動當 main)
+    mmproj_ambiguous: bool = False        # 混放目錄:多顆模型共用 mmproj,歸屬需明確確認
 
     def describe(self) -> str:
         size = f"{self.total_bytes / GIB:.1f} GB"
         extra = f",{self.shards} shards" if self.shards > 1 else ""
         mm = f" + mmproj: {self.mmproj.name}" if self.mmproj else ""
-        if not self.mmproj and self.mmproj_choices:
+        if not self.mmproj and self.mmproj_ambiguous:
+            mm = "(混放目錄:mmproj 歸屬需明確確認)"
+        elif not self.mmproj and self.mmproj_choices:
             mm = f"(同目錄有 {len(self.mmproj_choices)} 個 mmproj,需選擇)"
         vl = "(VL 模型)" if self.vl_paired and not mm else ""
         return f"{self.path.name}({size}{extra}){mm}{vl}"
@@ -322,9 +325,22 @@ def check_llama_binary(skip: bool, notes: list[str]) -> dict[str, bool]:
             [str(binary), "--help"], capture_output=True, text=True, timeout=30, check=False
         )
         help_text = proc.stdout + proc.stderr
-    except (OSError, subprocess.TimeoutExpired):
-        notes.append(f"⚠ llama-server --help 執行失敗({binary});略過旗標探測。")
-        return {"fit": True, "cpu_moe": True}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # 連 --help 都跑不動的 binary 不能假定支援任何旗標:非明確 skip 一律硬停,
+        # 否則會在 [2/5] 顯示 PASS、到 ~/start.sh 才發現整組啟動不了。
+        message = (
+            f"[FAIL] llama-server --help 無法執行:{binary}\n"
+            f"    {exc}\n"
+            "  可能是 binary 損壞、架構不符或執行環境問題(動態庫/權限)。\n"
+            f"  先在終端執行 {binary} --help 確認,再重跑 ./set_config.sh"
+        )
+        if skip:
+            notes.append(
+                "⚠ 已用 --skip-binary-check 跳過 llama-server 執行檢查"
+                f"(--help 無法執行:{exc};假設支援全部旗標)。"
+            )
+            return {"fit": True, "cpu_moe": True}
+        raise SetupError(message) from exc
 
     # --help 跑不起來(常見:動態庫找不到)時,help_text 是 loader 錯誤而不是旗標清單。
     # 這種情況不能誤診成「build 不支援 --reranking」,要指向真正的執行環境問題。
@@ -710,16 +726,21 @@ def scan_models(
             candidates["embedding"].append(candidate)
         else:
             if sibling_mmproj:
+                ambiguous = mainlike_per_dir.get(candidate.path.parent, 0) > 1
                 candidates["vl"].append(
                     ModelCandidate(
                         path=candidate.path,
                         total_bytes=candidate.total_bytes,
                         shards=candidate.shards,
-                        mmproj=sibling_mmproj[0] if len(sibling_mmproj) == 1 else None,
+                        # 混放目錄不得自動配對:mmproj 可能屬於同目錄的另一顆模型,
+                        # 自動吞下去會讓錯的模型配 mmproj 當 VL(圖片分析輸出錯亂)。
+                        mmproj=None if ambiguous
+                        else (sibling_mmproj[0] if len(sibling_mmproj) == 1 else None),
                         mmproj_choices=tuple(sibling_mmproj),
+                        mmproj_ambiguous=ambiguous,
                     )
                 )
-                if mainlike_per_dir.get(candidate.path.parent, 0) <= 1:
+                if not ambiguous:
                     # 一目錄一模型(README §2 慣例)→ mmproj 配對明確:
                     # 標記 vl_paired,排序永遠在非 VL 之後,不會被自動選成 main。
                     candidate = ModelCandidate(
@@ -1748,12 +1769,19 @@ _OPENCODE_PERMISSION_TEMPLATE = {
 }
 
 
-def _opencode_template(plan: Plan, python_bin: str) -> dict:
+DEFAULT_MAIN_BASE_URL = "http://localhost:8080"
+
+
+def _opencode_template(plan: Plan, python_bin: str,
+                       main_base_url: str | None = None) -> dict:
     mcp_command = (
         'root="${AICODE_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)}"; '
         f'AICODE_ROOT="$root" exec {shlex.quote(python_bin)} '
         f'{shlex.quote(str(REPO_ROOT / "mcp_server.py"))}'
     )
+    # OpenCode 連的必須是 deployment 實際的 main endpoint:使用者手改過 port/base_url
+    # 時(merge_existing_deployment 會保留),baseURL 不能仍寫死 8080。
+    base_url = (main_base_url or DEFAULT_MAIN_BASE_URL).rstrip("/")
     return {
         "$schema": "https://opencode.ai/config.json",
         "share": "disabled",
@@ -1765,7 +1793,7 @@ def _opencode_template(plan: Plan, python_bin: str) -> dict:
             "llamacpp": {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "llama.cpp local",
-                "options": {"baseURL": "http://localhost:8080/v1", "apiKey": "dummy"},
+                "options": {"baseURL": f"{base_url}/v1", "apiKey": "dummy"},
                 "models": {
                     plan.main_key: {
                         "name": plan.main_key,
@@ -1787,13 +1815,16 @@ def _opencode_template(plan: Plan, python_bin: str) -> dict:
 
 
 def build_opencode_config(
-    plan: Plan, python_bin: str, existing_path: Path
+    plan: Plan, python_bin: str, existing_path: Path,
+    main_base_url: str | None = None,
 ) -> tuple[dict, list[str]]:
     """只合併 CodeTrail 管的欄位;保留使用者既有 provider / mcp / 主題等設定。
 
     回傳 (config, 變更清單)。既有檔不存在或無法解析 → 用完整範本。
+    main_base_url 是合併後 deployment 的 main endpoint(手改 port 時非預設),
+    baseURL 跟著它走,deployment 與 OpenCode 才不會各連各的 port。
     """
-    template = _opencode_template(plan, python_bin)
+    template = _opencode_template(plan, python_bin, main_base_url)
     changes: list[str] = []
     existing: dict | None = None
     if existing_path.is_file():
@@ -1849,7 +1880,14 @@ def build_opencode_config(
     else:
         llamacpp["npm"] = template["provider"]["llamacpp"]["npm"]
         llamacpp["name"] = template["provider"]["llamacpp"]["name"]
+        old_options = llamacpp.get("options")
         llamacpp["options"] = template["provider"]["llamacpp"]["options"]
+        if isinstance(old_options, dict) and \
+                old_options.get("baseURL") != llamacpp["options"]["baseURL"]:
+            changes.append(
+                f"provider.llamacpp.options.baseURL: {old_options.get('baseURL')!r} → "
+                f"{llamacpp['options']['baseURL']!r}(對齊 deployment 的 main endpoint)"
+            )
         models = llamacpp.get("models")
         if not isinstance(models, dict):
             if models is not None:
@@ -1962,7 +2000,7 @@ def build_start_sh(plan: Plan) -> str:
 #   ~/start.sh                     啟動四個 llama-server(tmux 背景)
 #   ~/start.sh status [--strict]   檢查四個 server 狀態(= scripts/check-status.sh)
 #   ~/start.sh stop [--force]      全部停止(= scripts/quit.sh)
-#   ~/start.sh logs [role] [行數|-f] 看 server log(啟動起即時寫入;main/embedding/reranker/vl)
+#   ~/start.sh logs [role] [行數|-f] 看 server log(role 可省略,預設 main;啟動起即時寫入)
 #   ~/start.sh help                顯示子命令說明
 set -euo pipefail
 
@@ -1991,12 +2029,28 @@ case "${{1:-}}" in
     exec {quit_sh} "$@"
     ;;
   logs)
+    if [ "$#" -gt 3 ]; then
+      echo "logs 參數過多(用法:~/start.sh logs [role] [行數|-f];role 可省略,預設 main)" >&2
+      exit 2
+    fi
     role="${{2:-main}}"
+    tail_spec="${{3:-}}"
     case "$role" in
       main|embedding|reranker|vl) ;;
       *)
-        echo "未知 role:$role(可用:main / embedding / reranker / vl)" >&2
-        exit 2
+        # 允許省略 role:logs -f / logs 200 → role 用預設 main。
+        if [ -n "$tail_spec" ]; then
+          echo "未知 role:$role(可用:main / embedding / reranker / vl)" >&2
+          exit 2
+        fi
+        case "$role" in
+          -f|f) tail_spec="$role"; role=main ;;
+          *[!0-9]*)
+            echo "未知 role:$role(可用:main / embedding / reranker / vl)" >&2
+            exit 2
+            ;;
+          *) tail_spec="$role"; role=main ;;
+        esac
         ;;
     esac
     log_file="${{XDG_STATE_HOME:-$HOME/.local/state}}/codetrail/logs/$role.log"
@@ -2004,10 +2058,10 @@ case "${{1:-}}" in
       echo "找不到 $log_file — 該 role 尚未啟動過(先執行 ~/start.sh)" >&2
       exit 1
     fi
-    if [ "${{3:-}}" = "-f" ] || [ "${{3:-}}" = "f" ]; then
+    if [ "$tail_spec" = "-f" ] || [ "$tail_spec" = "f" ]; then
       exec tail -f "$log_file"
     fi
-    exec tail -n "${{3:-120}}" "$log_file"
+    exec tail -n "${{tail_spec:-120}}" "$log_file"
     ;;
   help|-h|--help)
     cat <<'CODETRAIL_USAGE'
@@ -2016,7 +2070,7 @@ case "${{1:-}}" in
   --dry-run                只印出將執行的四條 llama-server 指令(其餘旗標見 scripts/start-all.sh --help)
   status [--strict]        檢查四個 server 狀態
   stop [--force]           全部停止(--force 連孤兒 llama-server 一併 SIGTERM)
-  logs [role] [行數|-f]     看 server log(role:main / embedding / reranker / vl;-f 持續追蹤)
+  logs [role] [行數|-f]     看 server log(role 可省略,預設 main;-f 持續追蹤)
   help                     顯示本說明
 CODETRAIL_USAGE
     echo "重新設定:cd {REPO_ROOT} && ./set_config.sh"
@@ -2475,14 +2529,11 @@ def run(args: argparse.Namespace) -> int:
 
     overrides = {"main": args.main_model, "embedding": args.embed_model,
                  "reranker": args.rerank_model, "vl": args.vl_model}
-    warnings = precheck(gpus, candidates, broken, overrides)
-    print("[5/5] [PASS] 初步判定 OK:GPU 與四類模型(main / embedding / reranker / vl+mmproj)齊全")
-    for warning in warnings:
-        print(f"      ⚠ {warning}")
 
     # 沿用既有設定:重跑(README 建議的維護操作)不得靜默改變使用者現用的模型。
     # 促升到候選清單最前 → 互動 Enter 與 --yes 都會沿用;要換模型仍可明確選/給旗標。
     # 現用模型不在掃描目錄(models-dir 之外)時 rescue 成候選,同樣促升,不得靜默換掉。
+    # 必須在 precheck 之前:現用外部模型也能滿足類別需求,重跑不得因掃描缺類別而失敗。
     current, current_missing, current_values = _existing_selection_paths(home)
     promoted: list[str] = []
     outside_dir: list[str] = []
@@ -2525,6 +2576,27 @@ def run(args: argparse.Namespace) -> int:
         )
     for role in current_missing:
         base_notes.append(f"⚠ 目前設定的 {role} 模型檔已不存在 → 改用偵測到的建議預設。")
+
+    warnings = precheck(gpus, candidates, broken, overrides)
+    print("[5/5] [PASS] 初步判定 OK:GPU 與四類模型(main / embedding / reranker / vl+mmproj)齊全")
+    for warning in warnings:
+        print(f"      ⚠ {warning}")
+
+    # deployment/registry 的 env override(文件允許的自訂路徑)只影響 aicode/doctor
+    # 等 runtime 讀取;本工具固定寫預設路徑,產生的 ~/start.sh 也刻意 unset 這些變數
+    # (防 .bashrc 殘留)。設了卻不提醒,使用者會拿到「aicode 與 start.sh 各讀一份」。
+    split_env = [
+        key for key in ("AICODE_DEPLOYMENT_CONFIG", "AICODE_PROFILE",
+                        "AICODE_MODEL_REGISTRY", "AICODE_MODEL_REGISTRY_FILE")
+        if (os.environ.get(key) or "").strip()
+    ]
+    if split_env:
+        base_notes.append(
+            "⚠ 偵測到環境變數 " + "、".join(split_env)
+            + ":本工具只寫入預設路徑(~/.config/codetrail/*),而 ~/start.sh 啟動時會刻意"
+            " unset 這些 override——aicode/doctor 會讀你的自訂檔,~/start.sh 卻讀預設檔,"
+            "兩邊將各用一份設定。建議 unset 後重跑;要用自訂檔請自行維護其內容。"
+        )
 
     # GPU 預設:main 給 VRAM 最大那顆;三顆附屬模型共用「另一顆」VRAM 最大者(單卡則同顆)。
     main_gpu_default = max(gpus, key=lambda gpu: gpu.total_mib)
@@ -2763,8 +2835,24 @@ def run(args: argparse.Namespace) -> int:
                     if vl_cand.mmproj is None or _resolved(vl_cand.mmproj) != current_mm:
                         notes.append(f"沿用目前設定的 VL mmproj:{current_mm.name}")
                     vl_mmproj = current_mm
+        if vl_mmproj is None and vl_cand.mmproj_ambiguous and args.vl_model is None:
+            # 混放目錄的自動選擇不可信:多顆模型共用 mmproj 時,自動吞排序第一名
+            # 可能讓錯的模型配 mmproj 當 VL(圖片分析輸出錯亂)。
+            if args.yes:
+                raise SetupError(
+                    f"VL 配對不明確:{vl_cand.path.parent} 內有多顆模型與 mmproj 混放,"
+                    "無法自動判斷哪顆是 VL 模型。請用 --vl-model(必要時加 --vl-mmproj)"
+                    "明確指定,或改成每顆模型一個目錄(README §2.4)後重跑。"
+                )
+            print(f"\n⚠ {vl_cand.path.parent} 內有多顆模型與 mmproj 混放,"
+                  "無法自動判斷哪顆是 VL 模型,請明確選擇:")
+            vl_cand = choose_candidate("【VL 模型】", candidates["vl"], None,
+                                       assume_yes=False, default_marker=vl_marker)
         if vl_mmproj is None:
-            vl_mmproj = resolve_vl_mmproj(vl_cand, args.vl_mmproj, interactive=ask)
+            vl_mmproj = resolve_vl_mmproj(
+                vl_cand, args.vl_mmproj,
+                interactive=ask or (vl_cand.mmproj_ambiguous and not args.yes),
+            )
 
         allow_remote = bool(args.allow_remote)
         if ask and not allow_remote:
@@ -2888,7 +2976,15 @@ def run(args: argparse.Namespace) -> int:
         deployment_config = build_deployment_config(plan)
         merge_existing_deployment(deployment_config, codetrail_dir / "deployment.json", notes)
         deployment_json = json.dumps(deployment_config, ensure_ascii=False, indent=2) + "\n"
-        opencode_config, opencode_changes = build_opencode_config(plan, python_bin, opencode_path)
+        # OpenCode 的 baseURL 必須對齊合併後 deployment 的 main endpoint
+        # (使用者手改 port/base_url 時才會出現在 config;否則用預設 8080)。
+        main_service = deployment_config["services"]["main"]
+        main_base_url = main_service.get("base_url")
+        if main_base_url is None and isinstance(main_service.get("port"), int):
+            main_base_url = f"http://localhost:{main_service['port']}"
+        opencode_config, opencode_changes = build_opencode_config(
+            plan, python_bin, opencode_path, main_base_url
+        )
         opencode_json = json.dumps(opencode_config, ensure_ascii=False, indent=2) + "\n"
 
         # 寫入正式檔之前,用 staging 內容跑一次 deployment_profile 完整驗證。
