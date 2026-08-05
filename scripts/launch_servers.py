@@ -126,19 +126,31 @@ def _health_status(service: ServiceProfile) -> str:
     return str(data.get("status") or "unknown").lower()
 
 
-def _window_alive(session: str, window: str) -> bool:
+def _pane_state(session: str, window: str) -> tuple[bool, str]:
+    """回傳 (llama-server process 是否已結束, 原因說明)。
+
+    window 開著 remain-on-exit:process 結束時 pane 標記 dead 並保留 exit code
+    (畫面上也留著最後輸出可檢視);window 整個不見(被外部 kill)也視為結束。"""
     proc = subprocess.run(
-        ["tmux", "list-windows", "-t", session, "-F", "#{window_name}"],
+        ["tmux", "list-panes", "-t", f"{session}:{window}",
+         "-F", "#{pane_dead} #{pane_dead_status}"],
         capture_output=True,
         text=True,
         check=False,
     )
-    return proc.returncode == 0 and window in proc.stdout.split()
+    if proc.returncode != 0:
+        return True, "tmux window 已關閉"
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if parts and parts[0] == "1":
+            status = parts[1] if len(parts) > 1 else ""
+            return True, f"process 已結束(exit {status or '?'})"
+    return False, ""
 
 
 def _wait_for_health(service: ServiceProfile, timeout: int, session: str) -> None:
     """等 /health=ok。等待期間定時回報進度(載入中 ≠ 當機);
-    llama-server process 一結束(tmux window 消失)立即失敗,不空等 timeout。"""
+    llama-server process 一結束(pane dead / window 消失)立即失敗,不空等 timeout。"""
     window = WINDOWS[service.role]
     start = time.monotonic()
     deadline = start + timeout
@@ -149,10 +161,11 @@ def _wait_for_health(service: ServiceProfile, timeout: int, session: str) -> Non
         if last_status == "ok":
             print(f"[+] {service.role} health OK: {service.base_url}/health status=ok")
             return
-        if not _window_alive(session, window):
+        dead, reason = _pane_state(session, window)
+        if dead:
             raise ProfileError(
-                f"{service.role} 的 llama-server process 已結束(模型載入失敗或參數錯誤);"
-                f"tmux window {session}:{window} 已關閉"
+                f"{service.role} 的 llama-server {reason};模型載入失敗或參數錯誤。"
+                f"完整錯誤:~/start.sh logs {service.role}"
             )
         now = time.monotonic()
         if now >= next_report:
@@ -252,27 +265,32 @@ def _start_role(
     log_dir: Path | None = None,
 ) -> None:
     window = WINDOWS[service.role]
+    target = f"{session}:{window}"
     command_line = shlex.join(command)
+    # 先開「空」window(預設 shell),掛好 remain-on-exit 與 pipe-pane 之後,
+    # 才 respawn 成真正的 llama-server。這樣即使 llama-server 秒退:
+    #   1. 輸出從第一個 byte 就進 log(pipe-pane 已先接上,沒有 attach race);
+    #   2. pane 帶著 exit code 留在原地(remain-on-exit),不會 window 消失後什麼都抓不到。
     if first_in_session:
-        tmux_args = ["tmux", "new-session", "-d", "-s", session, "-n", window, command_line]
+        subprocess.run(["tmux", "new-session", "-d", "-s", session, "-n", window], check=True)
     else:
-        tmux_args = ["tmux", "new-window", "-t", session, "-n", window, command_line]
-    subprocess.run(tmux_args, check=True)
+        subprocess.run(["tmux", "new-window", "-t", session, "-n", window], check=True)
+    subprocess.run(
+        ["tmux", "set-option", "-w", "-t", target, "remain-on-exit", "on"], check=False
+    )
     if log_dir is not None:
-        # 從啟動第一刻就把 server 輸出持續寫進一般檔案:llama-server 若因參數/模型
-        # 錯誤立即退出,tmux window 會消失、事後 capture-pane 抓不到 —— pipe-pane
-        # 保證失敗當下的 log 已經在磁碟上。
         log_path = log_dir / f"{service.role}.log"
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
             log_path.write_text("", encoding="utf-8")  # 每次啟動重寫該 role 的 log
             subprocess.run(
-                ["tmux", "pipe-pane", "-o", "-t", f"{session}:{window}",
+                ["tmux", "pipe-pane", "-o", "-t", target,
                  f"cat >> {shlex.quote(str(log_path))}"],
                 check=False,
             )
         except OSError:
             pass
+    subprocess.run(["tmux", "respawn-window", "-k", "-t", target, command_line], check=True)
     print(f"[+] started {service.role} server ({service.base_url}) in tmux {session}:{window}")
 
 

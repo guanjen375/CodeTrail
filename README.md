@@ -35,7 +35,7 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 - 第 5 步沒輸出,代表 `~/.local/bin` 不在 PATH:`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc` 後再試。
 - `./set_config.sh` 預設只要**確認一頁建議配置**(Enter 採用);做的事與產物見 §3。要改配置(換模型 / 換 GPU / 換 ctx)隨時重跑它,舊設定自動備份、可用 `--restore-last-backup` 還原。
 - 安全預設:四個模型 server **只綁 `127.0.0.1`**(僅本機可連);要讓區網其他機器使用要明確 `./set_config.sh --allow-remote`(見 [docs/security.md](docs/security.md))。
-- 管理指令都掛在 `~/start.sh` 上:`~/start.sh status`(檢查四個 server)、`~/start.sh stop`(全部關閉,= `scripts/quit.sh`,關掉主模型 + 三顆附屬模型的所有 tmux 視窗)、`~/start.sh logs [role]`(看啟動失敗保存的 log)。
+- 管理指令都掛在 `~/start.sh` 上:`~/start.sh status`(檢查四個 server)、`~/start.sh stop`(全部關閉,= `scripts/quit.sh`,關掉主模型 + 三顆附屬模型的所有 tmux 視窗)、`~/start.sh logs [role] [-f]`(看 server log)、`~/start.sh help`(子命令說明)。
 - 重新啟動前要先 `~/start.sh stop`,tmux session 還在時 `~/start.sh` 會拒絕重複啟動;若是啟動中途失敗,launcher 會自動清理本次啟動的服務,修正後直接重跑即可。
 
 ## 0. OpenCode TUI 部署路線圖
@@ -269,7 +269,8 @@ llama.cpp 的 embedding/reranking server 又會讓 batch 與 micro-batch 相同�
 輸入失敗或必須截斷時，才可能漏掉後段關鍵證據。ctx 越大可接更長 passage，但更吃顯存；
 真的送入更多 token 時也更慢。CodeTrail 預設 chunk 約 600–1200 字元，Qwen3 的 2048
 通常足夠；若你調大 ingestion chunk，再選 4096/8192 並讓容量 gate 檢查。非互動可用
-`--rerank-model <GGUF絕對路徑> --rerank-ctx 2048`；`--yes` 仍採 BGE 8192 的穩健預設。
+`--rerank-model <GGUF絕對路徑> --rerank-ctx 2048`；全新安裝的 `--yes` 採 BGE 8192 的
+穩健預設，已設定過的機器重跑 `--yes` 則沿用你目前的 reranker 與 ctx。
 
 ### 2.4 VL 模型
 
@@ -293,21 +294,21 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 設計給**剛接觸專案者**:預設不需要懂 embedding / reranker / mmproj 的差別,只要確認一頁建議配置。在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`,它會依序:
 
-1. **前置檢查**:Python 依賴(mcp/numpy/requests)、`tmux`、`nvidia-smi`、`llama-server` 是否存在且支援必要旗標(`--reranking` / `--mmproj`;CPU-MoE 模式另需 `--cpu-moe`)。缺什麼直接給**可複製的修復指令**(裝哪個套件、跑哪行 build),修完重跑即可。
-2. **偵測與主模型模式分流**:GPU 種類/VRAM、`~/models` 的 GGUF 自動分類成主聊天 / embedding / reranker / VL+mmproj 四類;多 shard 自動聚合並**驗證齊全性**。普通互動模式會先列出並選定主模型（不會靜默挑最大顆），接著顯示該模型完整檔名，再於詢問任何附屬模型前直接問是否啟用 **CPU-MoE**；它只影響 main。之後會明確選 reranker 與它的 ctx；要選其他 embedding/VL/GPU 才需進階模式。`--yes` 優先採用 5090 reference 已驗證的 Qwen3-235B（若存在），並讀 GGUF tensor table 判斷是否為 MoE，且整顆放不進 GPU 時自動選 CPU-MoE；`--cpu-moe` / `--no-cpu-moe` 可明確覆寫。
+1. **前置檢查**:Python 依賴(mcp/numpy/requests)、`tmux`、`nvidia-smi`、`llama-server` 是否存在且支援必要旗標(`--reranking` / `--mmproj` / `--fit`;CPU-MoE 模式另需 `--cpu-moe`)。缺什麼直接在這一步就擋下並給**可複製的修復指令**(裝哪個套件、跑哪行 build),不會讓你答完所有問題才發現要重來;`llama-server` 因動態庫(如 CUDA lib)跑不起來時,會轉述原始錯誤並指向 `LD_LIBRARY_PATH`,不會誤報成「不支援旗標」。
+2. **偵測與主模型模式分流**:GPU 種類/VRAM、`~/models` 的 GGUF 自動分類成主聊天 / embedding / reranker / VL+mmproj 四類;多 shard 自動聚合並**驗證齊全性**。普通互動模式會先列出並選定主模型（不會靜默挑最大顆），接著顯示該模型完整檔名，再於詢問任何附屬模型前直接問是否啟用 **CPU-MoE**；它只影響 main。之後會明確選 reranker 與它的 ctx；要選其他 embedding/VL/GPU 才需進階模式。**重跑時沿用你目前的設定**:已設定過的四顆模型(檔案還在的話)會被促升為預設,互動按 Enter 或 `--yes` 都不會把你現用的模型換掉;要換就明確選、或給 `--main-model` 等旗標。全新安裝的 `--yes` 才優先採用 5090 reference 已驗證的 Qwen3-235B（若存在），並讀 GGUF tensor table 判斷是否為 MoE，且整顆放不進 GPU 時自動選 CPU-MoE；互動模式若在容量判定才發現一般模式塞不下 MoE，會**就地詢問改用 CPU-MoE**,不必整段重來;`--cpu-moe` / `--no-cpu-moe` 可明確覆寫。
 3. **CPU/RAM/VRAM 容量規劃 + 建議配置一頁確認**:主模型放 VRAM 最大的 GPU、三顆附屬模型共用另一顆。一般模式的 MoE 若放不進 GPU會直接停止，不讓 `--fit` 隱性決定 expert placement；CPU-MoE 模式會依 tensor offset 分別估算 experts 的 RAM 與 dense/其他權重＋KV/buffer 的 VRAM，任一邊都會 gate。dense 模型超出 VRAM 時才走 `--fit`，並以整顆 GGUF 當保守 RAM 上限；附屬模型容量也維持硬 gate，且會按所選 reranker ctx 計入已知模型的 runtime buffer，不能只用 GGUF 大小判斷。三個附屬服務固定單 slot，最後啟動的 VL 另用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用保留 3 GiB，避免只通過 health、第一張圖片才 OOM 或大量 CPU offload。`--ignore-capacity` 是明知風險的 escape hatch。有 mmproj 的 VL 模型不會被自動選成 main。主模型 `ctx`(預設 65536)、reranker `ctx`(模型感知建議)、`threads`、`--no-mmap`、OpenCode context、MCP timeout/Python 路徑一併對齊。看完按 **Enter 採用**；要逐項自選按 **a**；**q** 離開不寫檔。
 4. **產生四個檔案**(transaction 寫入:要嘛全套完成、要嘛完全不動;既有檔自動備份 `*.bak-setconfig-<時間戳>`,`--restore-last-backup` 可整批還原):
 
 | 產物 | 內容 |
 |---|---|
 | `~/.config/codetrail/models.json` | 主模型 registry key → GGUF 路徑(合併既有內容) |
-| `~/.config/codetrail/deployment.json` | deployment profile local override:四個 role 的模型與主模型推薦參數 |
+| `~/.config/codetrail/deployment.json` | deployment profile local override:四個 role 的模型與主模型推薦參數;重跑時**保留你手動加的取樣參數**(temperature/top-p/…),其他未涵蓋鍵會警告已捨棄 |
 | `~/.config/opencode/opencode.json` | **合併**而非重建:只更新 CodeTrail 管的欄位(model / provider.llamacpp / mcp.codetrail / 缺少的 permission 鍵),你原本的 provider、主題、其他 MCP server 都保留;與安全範本衝突的 permission 會尊重你的值但明確警告 |
-| `~/start.sh` | 啟動腳本:寫死你的 GPU 配置與主模型,呼叫 `scripts/start-all.sh`;支援 `status` / `stop` / `logs` 子命令 |
+| `~/start.sh` | 啟動腳本:寫死你的 GPU 配置、主模型與驗證過的 `LLAMA_BIN`,呼叫 `scripts/start-all.sh`;支援 `status` / `stop` / `logs` / `help` 子命令,打錯子命令會提示而不是誤啟動 |
 
 結尾會自動印出**推薦啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
 
-非互動用法(自動化 / 重跑):`./set_config.sh --yes` 全用建議值；想固定主模型模式就加 `--cpu-moe` 或 `--no-cpu-moe`，reranker 可加 `--rerank-model ... --rerank-ctx ...`。`--allow-remote` 開放區網連線(預設只綁 127.0.0.1)；`./set_config.sh --help` 看完整旗標。
+非互動用法(自動化 / 重跑):`./set_config.sh --yes` 全用建議值(**已設定過的機器上=沿用你現用的模型**,全新安裝才是 reference 預設);想固定主模型模式就加 `--cpu-moe` 或 `--no-cpu-moe`，reranker 可加 `--rerank-model ... --rerank-ctx ...`(模型不在 `~/models` 也可以:各 `--*-model` 給 .gguf 絕對路徑即可)。`--allow-remote` 開放區網連線(預設只綁 127.0.0.1)；`./set_config.sh --help` 看完整旗標。
 
 ### 3.2 啟動與停止
 
@@ -316,12 +317,13 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 ~/start.sh --dry-run    # 只印出將執行的四條 llama-server 指令,不啟動
 ~/start.sh status       # 檢查四個 server 狀態(= scripts/check-status.sh)
 ~/start.sh stop         # 關閉全部 tmux 視窗(主模型 + 三附屬模型;= scripts/quit.sh)
-~/start.sh logs vl      # 看啟動失敗時自動保存的該 role server log
+~/start.sh logs vl      # 看該 role 的 server log(加 -f 持續追蹤,如 logs main -f)
+~/start.sh help         # 子命令說明(打錯子命令會提示,不會誤觸啟動)
 ```
 
 啟動時的行為(對剛接觸專案者友善):
 
-- **server log 從啟動第一刻就持續寫入** `~/.local/state/codetrail/logs/<role>.log`(tmux pipe-pane)—— 即使 llama-server 因參數或模型錯誤秒退、tmux 視窗消失,完整錯誤訊息也已經在檔案裡,`~/start.sh logs <role>` 直接看。
+- **server log 從第一個 byte 就持續寫入** `~/.local/state/codetrail/logs/<role>.log`:launcher 先開好 tmux 視窗、接上 log 管線,才把 llama-server 放進去跑,所以即使因參數或模型錯誤**秒退**,完整錯誤也已在檔案裡;視窗本身也會帶著 exit code 留在原地(remain-on-exit)供檢視,`~/start.sh logs <role>` 直接看。
 - **載入進度**:大模型載入要幾分鐘,等待期間每 15 秒回報「載入中,已等待 N 秒(process 存活)」,不會看起來像當機;health 等待上限依主模型大小自動放大。llama-server process 一死就立即失敗,不會空等 timeout。
 - **失敗自動清理**:某個 role 啟動失敗時,launcher 自動關閉本次啟動的其他服務並釋放 port,然後告訴你「修正後直接重跑 `~/start.sh`」—— 不會留下半套 tmux 讓下次啟動卡 `session already exist`(要保留現場除錯:`AICODE_NO_ROLLBACK=1`)。
 - **綁定**:預設四個 server 只綁 `127.0.0.1`;`--allow-remote` 設定過的才綁 `0.0.0.0`。

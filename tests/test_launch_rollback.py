@@ -133,6 +133,17 @@ def test_start_role_pipes_server_output_to_persistent_log(tmp_path, monkeypatch)
     assert "s-main:main" in pipes[0]
     assert "main.log" in pipes[0][-1]
 
+    # 零 race 的關鍵順序:先開空 window → remain-on-exit → pipe-pane 接上
+    # → 最後才 respawn 成真正的 llama-server(輸出從第一個 byte 就進 log)。
+    kinds = [cmd[1] for cmd in calls if cmd[0] == "tmux"]
+    assert kinds.index("pipe-pane") < kinds.index("respawn-window")
+    assert kinds.index("set-option") < kinds.index("respawn-window")
+    respawn = next(cmd for cmd in calls if cmd[:2] == ["tmux", "respawn-window"])
+    assert "-k" in respawn
+    assert respawn[-1] == "llama-server -m x"
+    session_cmd = next(cmd for cmd in calls if cmd[:2] == ["tmux", "new-session"])
+    assert session_cmd[-1] == "main"  # 先開空 window,不直接帶 llama-server 指令
+
 
 def test_rollback_noop_when_nothing_created(tmp_path, monkeypatch):
     def fake_run(cmd, **_kwargs):

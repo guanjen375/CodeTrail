@@ -161,6 +161,41 @@ def test_mode_prompt_defaults_to_recommendation_and_only_asks_once(tmp_path, mon
     assert "--cpu-moe" in prompts[0]
 
 
+def test_flat_dir_with_mmproj_does_not_mark_every_main_as_vl(tmp_path):
+    """所有 GGUF 平鋪同一目錄時,mmproj 歸屬不明:不得把每顆主模型都標成 VL
+    (否則會出現「沒有非 VL 的主聊天模型」這種誤導警告)。"""
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / "big-chat-q4.gguf").write_bytes(b"x" * 4096)
+    (models / "qwen3-vl-8b-q4.gguf").write_bytes(b"x" * 1024)
+    (models / "mmproj-F16.gguf").write_bytes(b"x" * 256)
+    (models / "bge-m3-f16.gguf").write_bytes(b"x" * 512)
+    (models / "bge-reranker-v2-m3-Q8_0.gguf").write_bytes(b"x" * 512)
+
+    notes: list[str] = []
+    candidates, broken = sc.scan_models(models, notes=notes)
+
+    assert not broken
+    # 兩顆 main 類模型都不能被標 vl_paired(歸屬不明)
+    assert [cand.vl_paired for cand in candidates["main"]] == [False, False]
+    # VL 候選仍在(使用者可明確選),qwen3-vl hint 排最前
+    assert candidates["vl"][0].path.name == "qwen3-vl-8b-q4.gguf"
+    assert any("混放" in note for note in notes)
+
+    # 對照組:一目錄一模型(README 慣例)→ 照舊自動配對 + vl_paired
+    tidy = tmp_path / "tidy"
+    (tidy / "vl").mkdir(parents=True)
+    (tidy / "vl" / "vl-model-q6.gguf").write_bytes(b"x" * 1024)
+    (tidy / "vl" / "mmproj-F16.gguf").write_bytes(b"x" * 256)
+    (tidy / "chat").mkdir()
+    (tidy / "chat" / "chat-q4.gguf").write_bytes(b"x" * 4096)
+    tidy_candidates, _ = sc.scan_models(tidy)
+    vl_mains = [cand for cand in tidy_candidates["main"] if cand.vl_paired]
+    assert len(vl_mains) == 1
+    assert vl_mains[0].path.name == "vl-model-q6.gguf"
+    assert tidy_candidates["vl"][0].mmproj is not None
+
+
 def test_scan_prefers_verified_235b_over_larger_main_candidate(tmp_path):
     models = tmp_path / "models"
     verified_dir = models / "Qwen3-235B-A22B-Thinking-2507-GGUF"

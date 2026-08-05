@@ -636,7 +636,43 @@ def test_only_vl_main_candidate_proceeds_with_warning(tmp_path):
     assert deployment["services"]["main"]["model"] == "vl-model-q6"
 
 
-def test_capacity_main_too_big_without_fit_hard_stops(tmp_path):
+def test_missing_fit_stops_at_preflight_before_any_questions(tmp_path):
+    """--fit 是硬需求(VL placement):缺少時要在前置檢查就擋下,
+    不能讓使用者答完所有互動題才發現白忙一場。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", "0, Small GPU, 24576, 20000, GPU-small")
+    models = _make_models(tmp_path)
+    _write_fake_llama(tmp_path, help_flags="--reranking --mmproj")  # 沒有 --fit
+
+    proc = _run(tmp_path, "--yes", "--models-dir", str(models))
+    assert proc.returncode == 2
+    assert "安全的 VL placement 需要 llama-server --fit" in proc.stderr
+    assert "重新 build" in proc.stderr
+    # 前置(preflight)就失敗:還沒開始掃描模型/互動
+    assert "[3/5]" not in proc.stdout
+
+
+def test_llama_help_loader_failure_is_not_misdiagnosed_as_missing_flags(tmp_path):
+    """--help 因動態庫問題跑不起來時,要指向執行環境,不能誤診成缺 --reranking。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", "0, Small GPU, 24576, 20000, GPU-small")
+    models = _make_models(tmp_path)
+    executable = tmp_path / "llama-server"
+    executable.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'error while loading shared libraries: libcudart.so.13: cannot open' >&2\n"
+        "exit 127\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    proc = _run(tmp_path, "--yes", "--models-dir", str(models))
+    assert proc.returncode == 2
+    assert "無法執行" in proc.stderr
+    assert "LD_LIBRARY_PATH" in proc.stderr
+    assert "libcudart.so.13" in proc.stderr          # 原始錯誤要轉述給使用者
+    assert "不支援 --reranking" not in proc.stderr    # 不得誤診成旗標問題
+
+
+def test_capacity_main_too_big_for_ram_hard_stops(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", "0, Small GPU, 24576, 20000, GPU-small")
     models = _make_models(tmp_path)
     _sparse_dense_gguf(
@@ -645,22 +681,22 @@ def test_capacity_main_too_big_without_fit_hard_stops(tmp_path):
     _sparse_dense_gguf(
         models / "big-chat" / "big-chat-ud-q4_k_xl-00002-of-00002.gguf", 12 * GIB
     )
-    _write_fake_llama(tmp_path, help_flags="--reranking --mmproj")  # 沒有 --fit
-
-    proc = _run(tmp_path, "--yes", "--models-dir", str(models))
-    assert proc.returncode == 2
-    assert "容量判定不通過" in proc.stderr
-    assert "--fit" in proc.stderr
-    assert "--ignore-capacity" in proc.stderr
-
-    # --ignore-capacity 只略過容量風險，不得產生含不支援旗標的配置；先模擬
-    # 使用者已升級到支援 --fit 的 build，再用不足的 RAM 確認 escape hatch。
-    _write_fake_llama(tmp_path, help_flags="--fit --reranking --mmproj")
+    # dense 25GiB > 24GiB VRAM → 走 --fit CPU offload;RAM 只有 16GiB → 容量硬停。
     low_meminfo = tmp_path / "low-meminfo"
     low_meminfo.write_text(
         "MemTotal:       16777216 kB\nMemAvailable:   8388608 kB\n",
         encoding="utf-8",
     )
+    proc = _run(
+        tmp_path, "--yes", "--models-dir", str(models),
+        env_overrides={"AICODE_SET_CONFIG_MEMINFO": str(low_meminfo)},
+    )
+    assert proc.returncode == 2
+    assert "容量判定不通過" in proc.stderr
+    assert "RAM" in proc.stderr
+    assert "--ignore-capacity" in proc.stderr
+
+    # --ignore-capacity escape hatch:同樣條件降為警告並完成設定。
     forced = _run(
         tmp_path,
         "--yes", "--no-preview", "--ignore-capacity", "--models-dir", str(models),
@@ -731,6 +767,257 @@ def test_capacity_aux_alone_exceeding_budget_fails(tmp_path):
     assert proc.returncode == 2
     assert "容量判定不通過" in proc.stderr
     assert "附屬模型" in proc.stderr
+
+
+def test_start_sh_pins_validated_llama_bin(tmp_path):
+    """set_config 用 LLAMA_BIN 驗證旗標 → 產生的 start.sh 必須寫死同一顆 binary,
+    否則新 shell 啟動的是另一顆(可能沒 --fit 的)llama-server。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    assert _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models)).returncode == 0
+    content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
+    assert f"export LLAMA_BIN={tmp_path / 'llama-server'}" in content
+
+
+def test_rerun_keeps_current_main_model_instead_of_reference_hint(tmp_path):
+    """重跑 --yes 不得把使用者現用的主模型靜默換成 hint 排序第一的 reference 模型。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    assert _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models)).returncode == 0
+    deployment_path = tmp_path / "home" / ".config/codetrail/deployment.json"
+    first = json.loads(deployment_path.read_text(encoding="utf-8"))
+    assert first["services"]["main"]["model"] == "big-chat-ud-q4-k-xl"
+
+    # 之後才下載了 hint 首選的 reference 模型(排序會排最前)…
+    hinted = models / "Qwen3-235B-A22B-Thinking-2507-GGUF"
+    hinted.mkdir()
+    (hinted / "Qwen3-235B-A22B-Thinking-2507-UD-Q4_K_XL.gguf").write_bytes(b"x" * 4096)
+
+    rerun = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert rerun.returncode == 0, rerun.stderr
+    assert "沿用目前設定" in rerun.stdout
+    second = json.loads(deployment_path.read_text(encoding="utf-8"))
+    # 主模型仍是使用者現用的 big-chat,不被 hint 蓋掉
+    assert second["services"]["main"]["model"] == "big-chat-ud-q4-k-xl"
+
+    # 明確給旗標仍可換模型(旗標優先於沿用)
+    switched = _run(
+        tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
+        "--main-model", str(hinted / "Qwen3-235B-A22B-Thinking-2507-UD-Q4_K_XL.gguf"),
+    )
+    assert switched.returncode == 0, switched.stderr
+    third = json.loads(deployment_path.read_text(encoding="utf-8"))
+    assert third["services"]["main"]["model"].startswith("qwen3-235b")
+
+
+def test_rerun_keeps_ctx_threads_and_reranker_ctx_values(tmp_path):
+    """重跑 --yes 也要沿用數值(ctx/threads/reranker ctx),不悄悄重設回預設。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    first = _run(
+        tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
+        "--ctx", "32768", "--threads", "12", "--rerank-ctx", "4096",
+    )
+    assert first.returncode == 0, first.stderr
+
+    rerun = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert rerun.returncode == 0, rerun.stderr
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    assert deployment["services"]["main"]["ctx"] == 32768
+    assert deployment["services"]["main"]["parameters"]["threads"] == 12
+    assert deployment["services"]["reranker"]["ctx"] == 4096
+
+    opencode = json.loads(
+        (tmp_path / "home" / ".config/opencode/opencode.json").read_text(encoding="utf-8")
+    )
+    limit = opencode["provider"]["llamacpp"]["models"]["big-chat-ud-q4-k-xl"]["limit"]
+    assert limit["context"] == 32768  # OpenCode limit.context 跟著沿用的 ctx
+
+
+def test_symlinked_config_files_are_written_through(tmp_path):
+    """dotfiles 使用者的 opencode.json 是 symlink → 寫穿到目標,保留連結。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    home = tmp_path / "home"
+    dotfiles = tmp_path / "dotfiles"
+    dotfiles.mkdir()
+    real = dotfiles / "opencode.json"
+    real.write_text("{}", encoding="utf-8")
+    (home / ".config/opencode").mkdir(parents=True)
+    (home / ".config/opencode/opencode.json").symlink_to(real)
+
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert proc.returncode == 0, proc.stderr
+    link = home / ".config/opencode/opencode.json"
+    assert link.is_symlink()  # 連結還在,沒被換成一般檔
+    merged = json.loads(real.read_text(encoding="utf-8"))
+    assert merged["model"] == "llamacpp/big-chat-ud-q4-k-xl"  # 內容寫到目標
+    assert "symlink" in proc.stdout
+
+
+def test_invalid_registry_entries_are_dropped_with_warning(tmp_path):
+    """models.json 有格式非法的手寫項目時要剔除並警告,
+    否則啟動時整份 registry 會被 loader 拒絕。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    home = tmp_path / "home"
+    (home / ".config/codetrail").mkdir(parents=True)
+    (home / ".config/codetrail/models.json").write_text(
+        json.dumps({
+            "good-key": "/somewhere/model.gguf",
+            "bad key with spaces": "/somewhere/other.gguf",
+            "relative-path": "not/absolute.gguf",
+        }),
+        encoding="utf-8",
+    )
+
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert proc.returncode == 0, proc.stderr
+    assert "格式不合法的項目已剔除" in proc.stdout
+    registry = json.loads((home / ".config/codetrail/models.json").read_text(encoding="utf-8"))
+    assert "good-key" in registry
+    assert "bad key with spaces" not in registry
+    assert "relative-path" not in registry
+
+
+def test_rerun_preserves_hand_added_sampling_params_and_warns_on_dropped(tmp_path):
+    """工具自己教使用者把取樣參數加進 deployment.json → 重跑必須保留;
+    其他未涵蓋鍵(如 n_cpu_moe)要警告已捨棄,不能靜默消失。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    assert _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models)).returncode == 0
+    deployment_path = tmp_path / "home" / ".config/codetrail/deployment.json"
+    config = json.loads(deployment_path.read_text(encoding="utf-8"))
+    config["services"]["main"]["parameters"]["temperature"] = 0.6
+    config["services"]["main"]["parameters"]["top_p"] = 0.95
+    config["services"]["main"]["parameters"]["n_cpu_moe"] = 90
+    deployment_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    rerun = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert rerun.returncode == 0, rerun.stderr + rerun.stdout
+    assert "保留你手動加在 deployment.json 的 main 取樣參數" in rerun.stdout
+    assert "temperature=0.6" in rerun.stdout
+    assert "已捨棄:n_cpu_moe=90" in rerun.stdout
+
+    merged = json.loads(deployment_path.read_text(encoding="utf-8"))
+    parameters = merged["services"]["main"]["parameters"]
+    assert parameters["temperature"] == 0.6
+    assert parameters["top_p"] == 0.95
+    assert "n_cpu_moe" not in parameters
+
+
+def test_summary_advanced_reentry_carries_prior_answers(tmp_path):
+    """摘要頁按 a:進階逐項重問,但要帶上一輪選擇當預設;再次確認後正常寫入。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    stdin = "\n\n\n\n" + "a\n" + "\n" * 20
+    proc = _run(tmp_path, "--no-preview", "--models-dir", str(models), stdin=stdin)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "進階逐項設定:以上一輪選擇為預設" in proc.stdout
+    assert "上輪選擇,預設" in proc.stdout
+    assert (tmp_path / "home" / "start.sh").exists()
+
+
+def test_summary_invalid_input_reprompts_instead_of_aborting(tmp_path):
+    """摘要頁打錯字要重新詢問,不能直接 exit 2 丟掉使用者剛答完的所有選擇。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    proc = _run(
+        tmp_path, "--no-preview", "--models-dir", str(models), stdin="\n\n\n\nzz\nq\n"
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "無效輸入 'zz'" in proc.stdout
+    assert "未寫入任何檔案" in proc.stdout
+    assert not (tmp_path / "home" / "start.sh").exists()
+
+
+def test_capacity_moe_offers_inplace_cpu_moe_switch(tmp_path):
+    """互動時 MoE 在一般模式塞不下 → 就地詢問改用 CPU-MoE,不逼使用者整段重來。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", "0, Small GPU, 24576, 20000, GPU-small")
+    models = _make_models(tmp_path)
+    _sparse_moe_gguf(
+        models / "big-chat" / "big-chat-ud-q4_k_xl-00001-of-00002.gguf",
+        14 * GIB, 11 * GIB,
+    )
+    _sparse_moe_gguf(
+        models / "big-chat" / "big-chat-ud-q4_k_xl-00002-of-00002.gguf",
+        12 * GIB, 10 * GIB,
+    )
+
+    # main=Enter、CPU-MoE 強制答 n(一般模式)、reranker、rerank ctx、
+    # 容量判定的就地切換提問=Enter(Y)、摘要確認=Enter。
+    proc = _run(
+        tmp_path, "--no-preview", "--models-dir", str(models), stdin="\nn\n\n\n\n\n"
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "直接改用 CPU-MoE 模式重新規劃?" in proc.stdout
+    assert "已就地改用 CPU-MoE" in proc.stdout
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    assert deployment["services"]["main"]["parameters"]["cpu_moe"] is True
+
+
+def test_model_path_flag_rescues_missing_category(tmp_path):
+    """模型不在 models-dir 時,--rerank-model <路徑> 必須能救援「缺類別」硬停。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path, with_reranker=False)
+    external = tmp_path / "elsewhere"
+    external.mkdir()
+    (external / "my-reranker.gguf").write_bytes(b"x" * 512)
+
+    proc = _run(
+        tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
+        "--rerank-model", str(external / "my-reranker.gguf"),
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    assert deployment["services"]["reranker"]["model"] == str(external / "my-reranker.gguf")
+
+    # 數字編號沒有候選可對應 → 仍要硬停,且訊息指向用路徑
+    numbered = _run(
+        tmp_path, "--yes", "--models-dir", str(models), "--rerank-model", "1",
+    )
+    assert numbered.returncode == 2
+    assert "初步判定不通過" in numbered.stderr
+
+
+def test_generated_start_sh_subcommand_guard_and_logs_validation(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    assert _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models)).returncode == 0
+    start = tmp_path / "home" / "start.sh"
+
+    def run_start(*args: str):
+        return subprocess.run(
+            ["bash", str(start), *args],
+            env=_env(tmp_path),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    helped = run_start("help")
+    assert helped.returncode == 0, helped.stderr
+    assert "用法" in helped.stdout
+    assert "logs [role]" in helped.stdout
+
+    typo = run_start("stauts")  # 拼錯不得直接進入啟動流程
+    assert typo.returncode == 2
+    assert "未知子命令" in typo.stderr
+
+    bad_role = run_start("logs", "gpu")
+    assert bad_role.returncode == 2
+    assert "未知 role" in bad_role.stderr
+
+    never_started = run_start("logs", "main")
+    assert never_started.returncode == 1
+    assert "尚未啟動過" in never_started.stderr
 
 
 def test_rtx2000_aux_capacity_prefers_bge_and_accepts_measured_model_sizes(tmp_path):

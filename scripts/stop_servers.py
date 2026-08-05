@@ -65,11 +65,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--profile", help="profile name or absolute JSON profile path")
     parser.add_argument("--force", action="store_true", help="SIGTERM verified orphan llama-server listeners")
     args = parser.parse_args(argv)
+    # 設定檔壞掉時(手改壞 JSON、registry 失效)不能連「停止」都做不到:
+    # 關 tmux session 不需要 profile,先關;之後的 port 檢查才需要 profile。
+    profile = None
+    profile_error: ProfileError | None = None
     try:
         profile = load_effective_profile(profile=args.profile)
     except ProfileError as exc:
+        profile_error = exc
         print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+        print(
+            "[!] deployment 設定載入失敗 → 退路模式:仍會關閉 tmux session,"
+            "但略過 port 檢查。設定可用 ./set_config.sh(或 --restore-last-backup)修復。",
+            file=sys.stderr,
+        )
 
     if shutil.which("tmux"):
         for session in _sessions(args.scope):
@@ -80,12 +89,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 check=False,
             ).returncode == 0
             if exists:
-                subprocess.run(["tmux", "kill-session", "-t", session], check=True)
-                print(f"[+] stopped tmux session {session!r}")
+                kill = subprocess.run(
+                    ["tmux", "kill-session", "-t", session],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if kill.returncode == 0:
+                    print(f"[+] stopped tmux session {session!r}")
+                else:
+                    print(
+                        f"[!] could not kill tmux session {session!r}: "
+                        f"{(kill.stderr or kill.stdout).strip()}",
+                        file=sys.stderr,
+                    )
             else:
                 print(f"[!] tmux session {session!r} does not exist")
     else:
         print("[!] tmux not found; checking profile ports only", file=sys.stderr)
+
+    if profile is None:
+        return 1 if profile_error else 0
 
     for role in _roles(args.scope):
         service = profile.service(role)

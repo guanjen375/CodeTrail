@@ -125,6 +125,28 @@ def test_new_and_legacy_launcher_help_paths_are_offline(tmp_path):
         assert proc.returncode == 0, f"{script}: {proc.stderr}"
 
 
+def test_quit_still_kills_sessions_when_deployment_config_is_broken(tmp_path):
+    """設定檔壞掉時 quit.sh 不能連 tmux session 都拒絕關(復原路徑不能死)。"""
+    config_dir = tmp_path / ".config" / "codetrail"
+    config_dir.mkdir(parents=True)
+    (config_dir / "deployment.json").write_text("{not json", encoding="utf-8")
+
+    proc = _run(
+        "quit.sh",
+        tmp_path,
+        {
+            # 不存在的 session 名:只驗證退路流程,不動開發機上真的 codetrail session
+            "MAIN_SESSION": "codetrail-test-none-main",
+            "SESSION": "codetrail-test-none-rag",
+        },
+        "--scope", "all",
+    )
+
+    assert proc.returncode == 1  # 設定仍是壞的 → 非零提醒
+    assert "退路模式" in proc.stderr
+    assert "does not exist" in proc.stdout  # tmux session 檢查有跑(而非提前 return)
+
+
 def test_launcher_rejects_duplicate_service_ports(tmp_path):
     deployment = tmp_path / "deployment.json"
     deployment.write_text(
