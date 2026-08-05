@@ -44,28 +44,40 @@ cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc
 ```
 
-### 新 GGUF 啟動後立即 rollback,log 顯示 `unknown model architecture`
+### `~/start.sh` 只顯示 process 已結束並 rollback
 
-**症狀**:`~/start.sh` 建立 main 的 tmux window 後立刻回報啟動失敗並自動
-rollback;接著執行 `tmux ls` 可能又顯示沒有 server。這不是前後矛盾 ——
-`llama-server` 已經退出,launcher 為了避免殘留 session 阻擋下一次啟動,會清掉
-本次建立的 tmux session。
+**使用者前台通常只會看到摘要**:
 
-先看持久化 log,不要只看 tmux window:
+```text
+[+] started main server (...) in tmux codetrail-main:main
+[rollback] 啟動失敗:main 的 llama-server process 已結束(模型載入失敗或參數錯誤)
+[rollback] server log 已保存:.../logs/(main).log
+ERROR: main 的 llama-server process 已結束(模型載入失敗或參數錯誤)
+```
+
+這段訊息**不是 server 回報的真正根因**。launcher 只觀察到 tmux window 已消失,
+因此只能統一回報「process 已結束」;真正的模型 loader、參數、CUDA 或記憶體錯誤
+是 `llama-server` 寫在後台 log 裡的。launcher 隨後會自動清掉本次建立的 session,
+避免下一次啟動卡在 `session already exists`;所以 rollback 後 `tmux ls` 顯示沒有
+server 是預期行為,不代表錯誤紀錄也消失了。
+
+畫面中的 `/(main).log` 是「已保存 main role」的摘要顯示,實際檔名是
+`~/.local/state/codetrail/logs/main.log`。最簡單的讀法是:
 
 ```bash
 ~/start.sh logs main
 ```
 
-若其中有類似下面這行:
+不要只憑前台的 generic rollback 訊息就重裝 CUDA、重抓模型或刪 tmux session;
+先依後台 log 的第一個明確 error 判斷。若後台出現類似下面這行:
 
 ```text
 llama_model_load: error loading model: unknown model architecture: '<architecture>'
 ```
 
-通常代表 GGUF 使用的架構比本機 `llama-server` build 新;模型檔不一定損壞,
-CodeTrail 的 tmux 啟動與 rollback 也仍在正常運作。先確認目前實際執行的 binary
-與版本:
+才表示這次的具體原因通常是 GGUF 使用的架構比本機 `llama-server` build 新;
+模型檔不一定損壞,CodeTrail 的 tmux 啟動與 rollback 也仍在正常運作。先確認目前
+實際執行的 binary 與版本:
 
 ```bash
 ~/start.sh --dry-run | grep 'llama-server'
