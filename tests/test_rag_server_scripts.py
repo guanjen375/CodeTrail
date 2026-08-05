@@ -4,12 +4,28 @@ import os
 import subprocess
 from pathlib import Path
 
+from deployment_profile import RUNTIME_OVERRIDE_ENV_KEYS
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _isolated_env(tmp_path: Path) -> dict[str, str]:
+    """乾淨環境:不吃開發機真實的 ~/.config/codetrail 與 shell 覆寫變數。
+
+    這兩個 dry-run 測試斷言的是 profile 預設值;繼承真實 HOME 會讓
+    「本機重跑過 set_config」直接改掉測試結果(環境相依假失敗)。"""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in set(RUNTIME_OVERRIDE_ENV_KEYS)
+    }
+    env.update({"HOME": str(tmp_path), "USERPROFILE": str(tmp_path)})
+    return env
 
 
 def test_start_rag_servers_dry_run_uses_base_url_ports(tmp_path):
     env = {
-        **os.environ,
+        **_isolated_env(tmp_path),
         "LLAMA_BIN": str(tmp_path / "llama-server"),
         "MODELS_DIR": str(tmp_path / "models"),
         "AICODE_LLAMA_EMBED_BASE_URL": "http://127.0.0.1:18081",
@@ -58,7 +74,7 @@ def test_start_rag_servers_noncausal_models_use_full_physical_batch(tmp_path):
         ["bash", str(REPO_ROOT / "scripts" / "start-rag-servers.sh"), "--dry-run"],
         cwd=str(REPO_ROOT),
         env={
-            **os.environ,
+            **_isolated_env(tmp_path),
             "LLAMA_BIN": str(tmp_path / "llama-server"),
             "MODELS_DIR": str(tmp_path / "models"),
         },

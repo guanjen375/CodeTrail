@@ -30,6 +30,7 @@ from deployment_profile import (  # noqa: E402
     load_effective_profile,
     resolve_model_reference,
 )
+from scripts import stop_servers  # noqa: E402
 
 WINDOWS = {
     "main": "main",
@@ -361,6 +362,11 @@ def _rollback_started(
         session = _session_for(service.role, sessions)
         if piped or _capture_window_log(session, WINDOWS[service.role], dest):
             saved.append(service.role)
+    # kill 之前先記 pane PID:半載入的主模型退出時要釋放幾十 GB buffer,
+    # VRAM 會多掛數十秒;不等它結束就返回,立刻重跑會撞 port/容量誤判。
+    pane_pids: dict[int, str] = {}
+    for session in created_sessions:
+        pane_pids.update(stop_servers._pane_pids(session))
     for session in created_sessions:
         subprocess.run(
             ["tmux", "kill-session", "-t", session],
@@ -368,6 +374,20 @@ def _rollback_started(
             stderr=subprocess.DEVNULL,
             check=False,
         )
+    if pane_pids:
+        try:
+            leftover = stop_servers._wait_released(
+                pane_pids, timeout=stop_servers._stop_timeout(environ)
+            )
+        except KeyboardInterrupt:
+            leftover = []
+            print("[rollback] 略過等待 VRAM 釋放(Ctrl-C)", file=sys.stderr)
+        if leftover:
+            print(
+                f"[rollback] ⚠ 部分 process 尚未釋放 VRAM(PID:"
+                f"{', '.join(map(str, sorted(leftover)))});重新啟動前先用 nvidia-smi 確認",
+                file=sys.stderr,
+            )
     print(f"[rollback] 啟動失敗:{reason}", file=sys.stderr)
     if saved:
         print(f"[rollback] server log 已保存:{log_dir}/({', '.join(saved)}).log", file=sys.stderr)

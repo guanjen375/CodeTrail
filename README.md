@@ -35,7 +35,7 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 - 第 5 步沒輸出,代表 `~/.local/bin` 不在 PATH:`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc` 後再試。
 - `./set_config.sh` 預設互動只需回答幾個帶預設值的問題(主模型 / 運行模式 / reranker 與其 ctx,一路 Enter 即可),最後**確認一頁建議配置**(Enter 採用);做的事與產物見 §3。要改配置(換模型 / 換 GPU / 換 ctx)隨時重跑它,舊設定自動備份、可用 `--restore-last-backup` 還原(搭配 `--dry-run` 可先預覽會還原什麼)。
 - 安全預設:四個模型 server **只綁 `127.0.0.1`**(僅本機可連);要讓區網其他機器使用要明確 `./set_config.sh --allow-remote`(見 [docs/security.md](docs/security.md))。
-- 管理指令都掛在 `~/start.sh` 上:`~/start.sh status`(檢查四個 server)、`~/start.sh stop`(全部關閉,= `scripts/quit.sh`,關掉主模型 + 三顆附屬模型的所有 tmux 視窗)、`~/start.sh logs [role] [-f]`(看 server log)、`~/start.sh help`(子命令說明)。
+- 管理指令都掛在 `~/start.sh` 上:`~/start.sh status`(檢查四個 server)、`~/start.sh stop`(全部關閉,= `scripts/quit.sh`,關掉主模型 + 三顆附屬模型的所有 tmux 視窗,並**等到 process 退出、VRAM 從 nvidia-smi 消失才返回** — 大模型釋放記憶體需要數十秒是正常的,期間會印進度)、`~/start.sh logs [role] [-f]`(看 server log)、`~/start.sh help`(子命令說明)。
 - 重新啟動前要先 `~/start.sh stop`,tmux session 還在時 `~/start.sh` 會拒絕重複啟動;若是啟動中途失敗,launcher 會自動清理本次啟動的服務,修正後直接重跑即可。
 
 ## 0. OpenCode TUI 部署路線圖
@@ -316,7 +316,7 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 ~/start.sh              # 啟動 main + embedding + reranker + VL(各自 tmux 視窗,驗 /health 才算 ready)
 ~/start.sh --dry-run    # 只印出將執行的四條 llama-server 指令,不啟動
 ~/start.sh status       # 檢查四個 server 狀態(= scripts/check-status.sh)
-~/start.sh stop         # 關閉全部 tmux 視窗(主模型 + 三附屬模型;= scripts/quit.sh)
+~/start.sh stop         # 關閉全部並等到 VRAM 釋放完畢(主模型 + 三附屬模型;= scripts/quit.sh)
 ~/start.sh logs vl      # 看該 role 的 server log(加 -f 持續追蹤,如 logs main -f)
 ~/start.sh help         # 子命令說明(打錯子命令會提示,不會誤觸啟動)
 ```

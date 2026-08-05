@@ -1999,7 +1999,7 @@ def build_start_sh(plan: Plan) -> str:
 # 子命令:
 #   ~/start.sh                     啟動四個 llama-server(tmux 背景)
 #   ~/start.sh status [--strict]   檢查四個 server 狀態(= scripts/check-status.sh)
-#   ~/start.sh stop [--force]      全部停止(= scripts/quit.sh)
+#   ~/start.sh stop [--force]      全部停止,等到 process 退出、VRAM 釋放完畢才返回(= scripts/quit.sh)
 #   ~/start.sh logs [role] [行數|-f] 看 server log(role 可省略,預設 main;啟動起即時寫入)
 #   ~/start.sh help                顯示子命令說明
 set -euo pipefail
@@ -2069,7 +2069,7 @@ case "${{1:-}}" in
   (無參數)                 啟動四個 llama-server(tmux 背景)
   --dry-run                只印出將執行的四條 llama-server 指令(其餘旗標見 scripts/start-all.sh --help)
   status [--strict]        檢查四個 server 狀態
-  stop [--force]           全部停止(--force 連孤兒 llama-server 一併 SIGTERM)
+  stop [--force]           全部停止並等到 VRAM 釋放完畢(--force 連孤兒 llama-server 一併處理)
   logs [role] [行數|-f]     看 server log(role 可省略,預設 main;-f 持續追蹤)
   help                     顯示本說明
 CODETRAIL_USAGE
