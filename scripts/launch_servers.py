@@ -319,7 +319,7 @@ def _capture_window_log(session: str, window: str, dest: Path) -> bool:
 
 
 def _rollback_started(
-    exc: Exception,
+    reason: BaseException | str,
     started_roles: Sequence[ServiceProfile],
     created_sessions: Sequence[str],
     sessions: Mapping[str, str],
@@ -354,7 +354,7 @@ def _rollback_started(
             stderr=subprocess.DEVNULL,
             check=False,
         )
-    print(f"[rollback] 啟動失敗:{exc}", file=sys.stderr)
+    print(f"[rollback] 啟動失敗:{reason}", file=sys.stderr)
     if saved:
         print(f"[rollback] server log 已保存:{log_dir}/({', '.join(saved)}).log", file=sys.stderr)
     print(
@@ -409,15 +409,18 @@ def launch(
         for service in services:
             session = _session_for(service.role, sessions)
             command = _command_for(service, str(binary), environ, must_exist=True)
-            _start_role(
-                service, command, session,
-                first_in_session=session not in started_sessions,
-                log_dir=log_dir,
-            )
-            if session not in started_sessions:
+            first_in_session = session not in started_sessions
+            if first_in_session:
+                # 建 session 之前先登記:new-session 成功、respawn-window 才失敗的
+                # 半套狀態也要能 rollback,否則殘留 session 會卡住下一次啟動。
                 created_sessions.append(session)
             started_sessions.add(session)
             started_roles.append(service)
+            _start_role(
+                service, command, session,
+                first_in_session=first_in_session,
+                log_dir=log_dir,
+            )
             artifact = (
                 _artifact_bytes(Path(resolve_model_reference(service.model, environ)))
                 if service.role == "main"
@@ -427,9 +430,16 @@ def launch(
     except (ProfileError, subprocess.CalledProcessError) as exc:
         _rollback_started(exc, started_roles, created_sessions, sessions, environ)
         raise
+    except KeyboardInterrupt:
+        # Ctrl-C 最常發生在等待大模型 health 的幾分鐘;同樣要清理,
+        # 不留下會卡住下一次啟動的殘存 session(保留現場:AICODE_NO_ROLLBACK=1)。
+        _rollback_started("使用者中斷(Ctrl-C)", started_roles, created_sessions, sessions, environ)
+        raise
 
     print("\nCodeTrail model servers ready.")
-    print("  ./scripts/check-status.sh --strict")
+    # 絕對路徑:這行常被從 $HOME 執行的 ~/start.sh 帶出來,相對路徑會找不到。
+    status_sh = Path(__file__).resolve().parent / "check-status.sh"
+    print(f"  {shlex.quote(str(status_sh))} --strict")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -461,6 +471,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (ProfileError, subprocess.CalledProcessError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        # launch() 已先做過 rollback(或還沒建任何 session);這裡只收尾訊息。
+        print("\n[!] 已中斷(Ctrl-C)。", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

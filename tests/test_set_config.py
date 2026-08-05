@@ -33,6 +33,7 @@ _PROFILE_ENV_KEYS = set(RUNTIME_OVERRIDE_ENV_KEYS) | {
     "MAIN_SESSION", "AUX_SESSION", "SESSION",
     "MAIN_HEALTH_TIMEOUT", "RAG_HEALTH_TIMEOUT",
     "AICODE_SET_CONFIG_MEMINFO",
+    "OPENCODE_CONFIG",  # set_config 會尊重它;開發機殼層若有設定不得洩漏進測試
 }
 
 
@@ -1085,3 +1086,360 @@ def test_rtx2000_aux_capacity_uses_selected_qwen3_reranker_ctx(tmp_path):
     assert "ctx=8192" in forced_long.stderr
     assert "6144 MiB" in forced_long.stderr
     assert "bge-reranker-v2-m3" in forced_long.stderr
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-05 入口第三方 review 修復的行為契約
+# ---------------------------------------------------------------------------
+
+def test_generated_start_sh_exports_before_subcommand_dispatch(tmp_path):
+    """GPU/模型 exports 必須在 case dispatch 之前:status --strict 的 wrong-GPU
+    檢查唯一來源是這些環境變數,放在 case 之後 status 路徑會拿不到期望值。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    assert _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models)).returncode == 0
+    content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
+    dispatch = content.index('case "${1:-}"')
+    assert content.index("unset ") < content.index("export AICODE_MODEL=") < dispatch
+    assert content.index("export MAIN_GPU=") < dispatch
+    assert content.index("export LLAMA_BIN=") < dispatch
+
+
+def test_opencode_json_written_owner_only_and_dry_run_redacts_api_keys(tmp_path):
+    """opencode.json 合併後帶著使用者 provider 的 apiKey:檔案必須 0600
+    (不得把原本的 0600 重跑成 0644),--dry-run 印出的內容也不得出現金鑰原文。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    home = tmp_path / "home"
+    (home / ".config/opencode").mkdir(parents=True)
+    secret = "sk-live-super-secret-123"
+    opencode_path = home / ".config/opencode/opencode.json"
+    opencode_path.write_text(
+        json.dumps({"provider": {"openrouter": {"options": {"apiKey": secret}}}}),
+        encoding="utf-8",
+    )
+    opencode_path.chmod(0o600)
+
+    dry = _run(tmp_path, "--yes", "--dry-run", "--models-dir", str(models))
+    assert dry.returncode == 0, dry.stderr + dry.stdout
+    assert secret not in dry.stdout
+    assert "***redacted***" in dry.stdout
+    assert "憑證類欄位值已遮罩" in dry.stdout
+    assert stat.S_IMODE(opencode_path.stat().st_mode) == 0o600  # dry-run 不動檔案
+
+    real = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert real.returncode == 0, real.stderr + real.stdout
+    assert stat.S_IMODE(opencode_path.stat().st_mode) == 0o600
+    merged = json.loads(opencode_path.read_text(encoding="utf-8"))
+    # 遮罩只影響顯示,實際寫入的金鑰原樣保留
+    assert merged["provider"]["openrouter"]["options"]["apiKey"] == secret
+
+
+def test_restart_subprocess_env_is_sanitized(monkeypatch):
+    """[R] 自動重啟的 quit/start 子程序不得繼承泛用 SESSION/override env:
+    桌面環境的 SESSION 會讓 stop 殺錯無關 session、漏掉真正的 codetrail-rag。"""
+    from scripts import set_config as sc
+
+    monkeypatch.setenv("SESSION", "unrelated-desktop-session")
+    monkeypatch.setenv("MAIN_SESSION", "custom-main")
+    monkeypatch.setenv("AUX_SESSION", "custom-aux")
+    monkeypatch.setenv("MAIN_GPU", "GPU-x")
+    monkeypatch.setenv("KEEP_ME", "1")
+    env = sc._sanitized_subprocess_env()
+    assert "SESSION" not in env
+    assert "MAIN_SESSION" not in env
+    assert "AUX_SESSION" not in env
+    assert "MAIN_GPU" not in env
+    assert env.get("KEEP_ME") == "1"
+
+    calls = []
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(cmd, check=False, env=None, **_kwargs):
+        calls.append((list(cmd), env))
+        return _Result()
+
+    monkeypatch.setattr(sc.subprocess, "run", fake_run)
+    rc = sc._restart_servers(Path("/fake/home/start.sh"))
+    assert rc == 0
+    assert len(calls) == 2
+    assert calls[0][0][1].endswith("quit.sh")
+    assert calls[1][0][1] == "/fake/home/start.sh"
+    for _cmd, env in calls:
+        assert env is not None
+        assert "SESSION" not in env and "MAIN_GPU" not in env
+
+
+def test_existing_gpu_selectors_parse_generated_start_sh(tmp_path):
+    """GPU 分卡的唯一持久紀錄是產生的 start.sh export;重跑沿用要能讀回。"""
+    from scripts import set_config as sc
+
+    start = tmp_path / "start.sh"
+    start.write_text(
+        "#!/usr/bin/env bash\n"
+        f"# {sc.GENERATED_MARKER} — test\n"
+        "export MAIN_GPU=GPU-aaaa\n"
+        "export AUX_GPU='GPU-bbbb'\n",
+        encoding="utf-8",
+    )
+    assert sc._existing_gpu_selectors(start) == {
+        "main": "GPU-aaaa",
+        "embedding": "GPU-bbbb",
+        "reranker": "GPU-bbbb",
+        "vl": "GPU-bbbb",
+    }
+    # 逐 role export 的形式
+    start.write_text(
+        f"# {sc.GENERATED_MARKER}\n"
+        "export MAIN_GPU=GPU-1\nexport EMBED_GPU=GPU-2\n"
+        "export RERANK_GPU=GPU-3\nexport VL_GPU=GPU-4\n",
+        encoding="utf-8",
+    )
+    assert sc._existing_gpu_selectors(start)["reranker"] == "GPU-3"
+    # 非本工具產生 → 不解析;檔案不存在 → 空
+    start.write_text("#!/usr/bin/env bash\nexport MAIN_GPU=GPU-x\n", encoding="utf-8")
+    assert sc._existing_gpu_selectors(start) == {}
+    assert sc._existing_gpu_selectors(tmp_path / "missing.sh") == {}
+
+
+def test_rerun_keeps_custom_gpu_split(tmp_path):
+    """重跑 --yes 不得把使用者自訂的 GPU 分卡靜默重設回 VRAM 建議預設。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    first = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
+                 "--main-gpu", "1", "--embed-gpu", "0")
+    assert first.returncode == 0, first.stderr
+    content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
+    assert "export MAIN_GPU=GPU-bbbb-2000" in content
+    assert "export EMBED_GPU=GPU-aaaa-5090" in content
+
+    rerun = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert rerun.returncode == 0, rerun.stderr + rerun.stdout
+    assert "沿用目前 GPU 分卡" in rerun.stdout
+    content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
+    assert "export MAIN_GPU=GPU-bbbb-2000" in content   # 自訂 main GPU 保留
+    assert "export EMBED_GPU=GPU-aaaa-5090" in content  # 自訂 embed GPU 保留
+
+    # 旗標仍優先於沿用
+    switched = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
+                    "--main-gpu", "0")
+    assert switched.returncode == 0, switched.stderr
+    content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
+    assert "export MAIN_GPU=GPU-aaaa-5090" in content
+
+
+def test_rerun_keeps_forced_cpu_moe_mode(tmp_path):
+    """--cpu-moe 覆寫過容量建議之後,重跑 --yes 要沿用該模式,不悄悄退回推薦值。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    moe_dir = models / "moe-chat"
+    moe_dir.mkdir()
+    # 小 MoE:容量上一般模式塞得下(推薦=一般),使用者仍強制 CPU-MoE。
+    _sparse_moe_gguf(moe_dir / "moe-chat-q4.gguf", 4096, 2048)
+    first = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
+                 "--main-model", str(moe_dir / "moe-chat-q4.gguf"), "--cpu-moe")
+    assert first.returncode == 0, first.stderr + first.stdout
+    deployment_path = tmp_path / "home" / ".config/codetrail/deployment.json"
+    deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+    assert deployment["services"]["main"]["parameters"]["cpu_moe"] is True
+
+    rerun = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert rerun.returncode == 0, rerun.stderr + rerun.stdout
+    assert "沿用既有主模型模式" in rerun.stdout
+    deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+    assert deployment["services"]["main"]["parameters"]["cpu_moe"] is True
+    # 明確旗標仍可改回一般模式
+    switched = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
+                    "--no-cpu-moe")
+    assert switched.returncode == 0, switched.stderr
+    deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+    assert "cpu_moe" not in deployment["services"]["main"]["parameters"]
+
+
+def test_rerun_keeps_hand_edited_port_and_base_url(tmp_path):
+    """port/base_url 屬使用者領域(本工具從不寫)→ 手改過的值重跑要原樣保留。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    assert _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models)).returncode == 0
+    deployment_path = tmp_path / "home" / ".config/codetrail/deployment.json"
+    config = json.loads(deployment_path.read_text(encoding="utf-8"))
+    config["services"]["main"]["port"] = 18080
+    config["services"]["main"]["base_url"] = "http://127.0.0.1:18080"
+    deployment_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    rerun = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert rerun.returncode == 0, rerun.stderr + rerun.stdout
+    assert "保留你手動設定的 services.main.port=18080" in rerun.stdout
+    merged = json.loads(deployment_path.read_text(encoding="utf-8"))
+    assert merged["services"]["main"]["port"] == 18080
+    assert merged["services"]["main"]["base_url"] == "http://127.0.0.1:18080"
+
+
+def test_rerun_keeps_out_of_tree_main_model(tmp_path):
+    """現用主模型在 models-dir 之外:重跑 --yes 不得靜默換成掃描到的模型。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    _sparse_dense_gguf(outside / "external-chat-q4.gguf", 4096)
+    first = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
+                 "--main-model", str(outside / "external-chat-q4.gguf"))
+    assert first.returncode == 0, first.stderr + first.stdout
+    deployment_path = tmp_path / "home" / ".config/codetrail/deployment.json"
+    deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+    assert deployment["services"]["main"]["model"] == "external-chat-q4"
+
+    rerun = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert rerun.returncode == 0, rerun.stderr + rerun.stdout
+    assert "之外" in rerun.stdout
+    deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+    assert deployment["services"]["main"]["model"] == "external-chat-q4"
+
+
+def test_opencode_config_env_var_is_honored(tmp_path):
+    """OpenCode 與 config.py/aicode 都先讀 OPENCODE_CONFIG;set_config 寫死預設
+    路徑會做出「顯示 PASS 但完全沒生效」的設定。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    custom = tmp_path / "custom" / "oc.json"
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
+                env_overrides={"OPENCODE_CONFIG": str(custom)})
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OPENCODE_CONFIG 已設定" in proc.stdout
+    written = json.loads(custom.read_text(encoding="utf-8"))
+    assert written["model"] == "llamacpp/big-chat-ud-q4-k-xl"
+    assert not (tmp_path / "home" / ".config/opencode/opencode.json").exists()
+
+
+def test_relative_models_dir_and_llama_bin_are_stored_absolute(tmp_path):
+    """相對路徑立刻轉絕對:--models-dir ./models 不得走到最後 schema 驗證才爆;
+    相對 LLAMA_BIN 不得原樣寫進 ~/start.sh(換目錄執行就找不到)。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    env = _env(tmp_path)
+    env["LLAMA_BIN"] = "./llama-server"
+    proc = subprocess.run(
+        ["bash", str(SCRIPT), "--skip-deps-check", "--yes", "--no-preview",
+         "--models-dir", "./models"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    registry = json.loads(
+        (tmp_path / "home" / ".config/codetrail/models.json").read_text(encoding="utf-8")
+    )
+    expected = str(models / "big-chat" / "big-chat-ud-q4_k_xl-00001-of-00002.gguf")
+    assert registry["big-chat-ud-q4-k-xl"] == expected
+    content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
+    assert f"export LLAMA_BIN={tmp_path / 'llama-server'}" in content
+    assert "export LLAMA_BIN=./llama-server" not in content
+
+
+def test_interactive_reranker_ctx_rejects_below_minimum(tmp_path):
+    """互動輸入與 CLI 用同一個下限:reranker ctx=1 不得被接受寫入。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    # main、CPU-MoE、reranker 各 Enter;ctx 先給 1(拒絕)再給 256;摘要 Enter。
+    proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
+                stdin="\n\n\n1\n256\n\n")
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "請輸入 ≥ 128 的整數" in proc.stdout
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    assert deployment["services"]["reranker"]["ctx"] == 256
+
+    cli = _run(tmp_path, "--yes", "--rerank-ctx", "1", "--models-dir", str(models))
+    assert cli.returncode == 2
+    assert "128" in cli.stderr
+
+
+def test_small_main_ctx_clamps_batch_instead_of_failing_validation(tmp_path):
+    """--ctx 1024(CLI 允許的最小值)+ 全 GPU 模式:batch 要夾到 ctx,
+    不得產生 batch>ctx 再被自己的 schema 驗證打死。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
+                "--ctx", "1024")
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    main = deployment["services"]["main"]
+    assert main["ctx"] == 1024
+    assert main["batch"] <= 1024
+    assert main["ubatch"] <= main["batch"]
+
+
+def test_opencode_merge_rebuilds_wrong_typed_sections_without_traceback(tmp_path):
+    """合法 JSON 但 provider/mcp/models 型別錯誤:降級重建+變更說明,不得 traceback。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    home = tmp_path / "home"
+    (home / ".config/opencode").mkdir(parents=True)
+    opencode_path = home / ".config/opencode/opencode.json"
+    opencode_path.write_text(
+        json.dumps({"provider": [], "mcp": "not-an-object", "theme": "dark"}),
+        encoding="utf-8",
+    )
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "Traceback" not in proc.stderr
+    assert "不是 JSON object" in proc.stdout
+    merged = json.loads(opencode_path.read_text(encoding="utf-8"))
+    assert merged["theme"] == "dark"
+    assert isinstance(merged["provider"], dict) and "llamacpp" in merged["provider"]
+    assert isinstance(merged["mcp"], dict) and "codetrail" in merged["mcp"]
+
+    # provider.llamacpp.models 是 list 的變體同樣不得當機
+    opencode_path.write_text(
+        json.dumps({"provider": {"llamacpp": {"models": []}}}), encoding="utf-8"
+    )
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    merged = json.loads(opencode_path.read_text(encoding="utf-8"))
+    assert "big-chat-ud-q4-k-xl" in merged["provider"]["llamacpp"]["models"]
+
+
+def test_restore_last_backup_dry_run_previews_without_touching_files(tmp_path):
+    """--restore-last-backup --dry-run 只預覽會做什麼,絕不動檔案。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    home = tmp_path / "home"
+    (home / ".config/codetrail").mkdir(parents=True)
+    (home / ".config/codetrail/models.json").write_text('{"marker": "/old.gguf"}', encoding="utf-8")
+    assert _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models)).returncode == 0
+
+    after_setup = (home / ".config/codetrail/models.json").read_text(encoding="utf-8")
+    proc = _run(tmp_path, "--restore-last-backup", "--dry-run")
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "[dry-run]" in proc.stdout
+    assert "會還原" in proc.stdout
+    assert "會移除" in proc.stdout
+    # 檔案完全沒動:還原目標仍是設定後內容,產物一個都沒消失
+    assert (home / ".config/codetrail/models.json").read_text(encoding="utf-8") == after_setup
+    assert (home / ".config/codetrail/deployment.json").exists()
+    assert (home / ".config/opencode/opencode.json").exists()
+    assert (home / "start.sh").exists()
+
+
+def test_pip_fix_hint_matches_python_environment(monkeypatch):
+    """venv 的 pip 會拒絕 --user:建議指令必須分環境給。"""
+    from scripts import set_config as sc
+
+    monkeypatch.setattr(sc.sys, "prefix", "/venv")
+    monkeypatch.setattr(sc.sys, "base_prefix", "/usr")
+    hint = sc._pip_fix_hint("/venv/bin/python")
+    assert "pip install --user" not in hint  # venv 內的建議指令不得帶 --user
+    assert "-m pip install -r" in hint
+
+    monkeypatch.setattr(sc.sys, "prefix", "/usr")
+    monkeypatch.setattr(sc.sys, "base_prefix", "/usr")
+    hint = sc._pip_fix_hint("/usr/bin/python3")
+    assert "--user --break-system-packages" in hint

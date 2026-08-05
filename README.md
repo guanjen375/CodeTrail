@@ -33,7 +33,7 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 ```
 
 - 第 5 步沒輸出,代表 `~/.local/bin` 不在 PATH:`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc` 後再試。
-- `./set_config.sh` 預設只要**確認一頁建議配置**(Enter 採用);做的事與產物見 §3。要改配置(換模型 / 換 GPU / 換 ctx)隨時重跑它,舊設定自動備份、可用 `--restore-last-backup` 還原。
+- `./set_config.sh` 預設互動只需回答幾個帶預設值的問題(主模型 / 運行模式 / reranker 與其 ctx,一路 Enter 即可),最後**確認一頁建議配置**(Enter 採用);做的事與產物見 §3。要改配置(換模型 / 換 GPU / 換 ctx)隨時重跑它,舊設定自動備份、可用 `--restore-last-backup` 還原(搭配 `--dry-run` 可先預覽會還原什麼)。
 - 安全預設:四個模型 server **只綁 `127.0.0.1`**(僅本機可連);要讓區網其他機器使用要明確 `./set_config.sh --allow-remote`(見 [docs/security.md](docs/security.md))。
 - 管理指令都掛在 `~/start.sh` 上:`~/start.sh status`(檢查四個 server)、`~/start.sh stop`(全部關閉,= `scripts/quit.sh`,關掉主模型 + 三顆附屬模型的所有 tmux 視窗)、`~/start.sh logs [role] [-f]`(看 server log)、`~/start.sh help`(子命令說明)。
 - 重新啟動前要先 `~/start.sh stop`,tmux session 還在時 `~/start.sh` 會拒絕重複啟動;若是啟動中途失敗,launcher 會自動清理本次啟動的服務,修正後直接重跑即可。
@@ -292,7 +292,7 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 ### 3.1 `./set_config.sh` 做什麼
 
-設計給**剛接觸專案者**:預設不需要懂 embedding / reranker / mmproj 的差別,只要確認一頁建議配置。在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`,它會依序:
+設計給**剛接觸專案者**:預設不需要懂 embedding / reranker / mmproj 的差別——幾個問題都有建議預設(一路 Enter),最後確認一頁建議配置。在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`,它會依序:
 
 1. **前置檢查**:Python 依賴(mcp/numpy/requests)、`tmux`、`nvidia-smi`、`llama-server` 是否存在且支援必要旗標(`--reranking` / `--mmproj` / `--fit`;CPU-MoE 模式另需 `--cpu-moe`)。缺什麼直接在這一步就擋下並給**可複製的修復指令**(裝哪個套件、跑哪行 build),不會讓你答完所有問題才發現要重來;`llama-server` 因動態庫(如 CUDA lib)跑不起來時,會轉述原始錯誤並指向 `LD_LIBRARY_PATH`,不會誤報成「不支援旗標」。
 2. **偵測與主模型模式分流**:GPU 種類/VRAM、`~/models` 的 GGUF 自動分類成主聊天 / embedding / reranker / VL+mmproj 四類;多 shard 自動聚合並**驗證齊全性**。普通互動模式會先列出並選定主模型（不會靜默挑最大顆），接著顯示該模型完整檔名，再於詢問任何附屬模型前直接問是否啟用 **CPU-MoE**；它只影響 main。之後會明確選 reranker 與它的 ctx；要選其他 embedding/VL/GPU 才需進階模式。**重跑時沿用你目前的設定**:已設定過的四顆模型(檔案還在的話)會被促升為預設,互動按 Enter 或 `--yes` 都不會把你現用的模型換掉;要換就明確選、或給 `--main-model` 等旗標。全新安裝的 `--yes` 才優先採用 5090 reference 已驗證的 Qwen3-235B（若存在），並讀 GGUF tensor table 判斷是否為 MoE，且整顆放不進 GPU 時自動選 CPU-MoE；互動模式若在容量判定才發現一般模式塞不下 MoE，會**就地詢問改用 CPU-MoE**,不必整段重來;`--cpu-moe` / `--no-cpu-moe` 可明確覆寫。

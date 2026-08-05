@@ -154,3 +154,108 @@ def test_rollback_noop_when_nothing_created(tmp_path, monkeypatch):
         RuntimeError("boom"), [], [], {"main": "s-main", "aux": "s-aux"},
         {"HOME": str(tmp_path)},
     )
+
+
+def _fake_profile():
+    class _Profile:
+        def service(self, role):
+            return _service(role)
+
+    return _Profile()
+
+
+def _patch_launch_scaffolding(monkeypatch, tmp_path):
+    """launch() 的離線鷹架:tmux/port/模型解析全部 stub,聚焦 session 記帳。"""
+    binary = tmp_path / "llama-server"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    monkeypatch.setattr(launch_servers.shutil, "which", lambda _name: "/usr/bin/tmux")
+    monkeypatch.setattr(launch_servers, "_check_port_collisions", lambda _services: None)
+    monkeypatch.setattr(launch_servers, "_tmux_has_session", lambda _session: False)
+    monkeypatch.setattr(
+        launch_servers, "resolve_model_reference",
+        lambda value, _env, must_exist=True: value,
+    )
+    monkeypatch.setattr(launch_servers, "_port_responds", lambda _service: False)
+    monkeypatch.setattr(
+        launch_servers, "_command_for",
+        lambda service, binary_path, env, must_exist=True: ["llama-server"],
+    )
+    return {"LLAMA_BIN": str(binary), "HOME": str(tmp_path)}
+
+
+def test_launch_registers_session_before_start_role_failure(monkeypatch, tmp_path):
+    """new-session 成功、respawn-window 才失敗的半套狀態:session 必須「先登記
+    再建立」,rollback 才會清掉它;否則殘留 session 會卡住下一次啟動。"""
+    import subprocess as sp
+
+    environ = _patch_launch_scaffolding(monkeypatch, tmp_path)
+
+    def boom(*_args, **_kwargs):
+        raise sp.CalledProcessError(1, ["tmux", "respawn-window"])
+
+    monkeypatch.setattr(launch_servers, "_start_role", boom)
+    rollbacks: list[list[str]] = []
+    monkeypatch.setattr(
+        launch_servers, "_rollback_started",
+        lambda reason, roles, created, sessions, env: rollbacks.append(list(created)),
+    )
+
+    try:
+        launch_servers.launch(_fake_profile(), ["main"], environ, dry_run=False)
+    except sp.CalledProcessError:
+        pass
+    else:
+        raise AssertionError("expected CalledProcessError to propagate")
+    assert rollbacks == [["codetrail-main"]]  # 剛建立(或建立中)的 session 已在清單
+
+
+def test_launch_rolls_back_on_keyboard_interrupt(monkeypatch, tmp_path):
+    """Ctrl-C(最常發生在等 health 的幾分鐘)也要走 rollback,不留殘存 session。"""
+    environ = _patch_launch_scaffolding(monkeypatch, tmp_path)
+    monkeypatch.setattr(launch_servers, "_start_role", lambda *args, **kwargs: None)
+
+    def interrupted(*_args, **_kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(launch_servers, "_wait_for_health", interrupted)
+    rollbacks: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(
+        launch_servers, "_rollback_started",
+        lambda reason, roles, created, sessions, env: rollbacks.append((str(reason), list(created))),
+    )
+
+    try:
+        launch_servers.launch(_fake_profile(), ["main"], environ, dry_run=False)
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("expected KeyboardInterrupt to propagate")
+    assert rollbacks and rollbacks[0][1] == ["codetrail-main"]
+    assert "Ctrl-C" in rollbacks[0][0]
+
+
+def test_main_returns_130_on_keyboard_interrupt(monkeypatch, capsys):
+    """CLI 收 Ctrl-C:乾淨訊息 + exit 130,不噴 traceback。"""
+
+    def interrupted(_env, profile=None):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(launch_servers, "load_effective_profile", interrupted)
+    rc = launch_servers.main(["--scope", "all"])
+    assert rc == 130
+    assert "已中斷" in capsys.readouterr().err
+
+
+def test_ready_message_uses_absolute_status_path(monkeypatch, tmp_path, capsys):
+    """啟動成功訊息的 check-status 提示必須是絕對路徑(常從 $HOME 執行)。"""
+    environ = _patch_launch_scaffolding(monkeypatch, tmp_path)
+    monkeypatch.setattr(launch_servers, "_start_role", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launch_servers, "_wait_for_health", lambda *args, **kwargs: None)
+
+    launch_servers.launch(_fake_profile(), ["main"], environ, dry_run=False)
+    out = capsys.readouterr().out
+    assert "CodeTrail model servers ready." in out
+    expected = Path(launch_servers.__file__).resolve().parent / "check-status.sh"
+    assert f"{expected} --strict" in out
+    assert "  ./scripts/check-status.sh" not in out
