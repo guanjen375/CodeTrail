@@ -4,6 +4,7 @@ from __future__ import annotations
 from scripts.check_readme_consistency import (
     _check_code_model_placeholder_contract,
     _check_doctor_commands_have_explicit_model,
+    _check_default_aux_models_documented,
     _check_forbidden_main_model_tokens,
     _check_opencode_timeout_contract,
     _config_int_constant,
@@ -127,6 +128,25 @@ def test_doctor_commands_must_have_explicit_model_on_same_line():
 
     assert len(issues) == 1
     assert "AICODE_MODEL=<CODE_MODEL>" in issues[0]
+
+
+def test_default_aux_models_must_be_documented():
+    profile = '''
+{"services": {
+  "embedding": {"model": "embed-model"},
+  "reranker": {"model": "rerank-model"},
+  "vl": {"model": "vl-model"}
+}}
+'''
+    issues: list[str] = []
+
+    _check_default_aux_models_documented(
+        profile,
+        "下載 embed-model 與 vl-model。",
+        issues,
+    )
+
+    assert issues == ["README/docs 未提到預設 reranker 模型 'rerank-model'"]
 
 
 def test_forbidden_main_model_tokens_are_detected_without_flagging_placeholders():

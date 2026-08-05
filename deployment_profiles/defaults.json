@@ -33,7 +33,7 @@
       }
     },
     "reranker": {
-      "model": "qwen3-reranker-0.6b",
+      "model": "bge-reranker-v2-m3",
       "port": 8082,
       "base_url": "http://localhost:8082",
       "gpu_role": "aux",

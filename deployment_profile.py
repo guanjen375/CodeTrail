@@ -96,6 +96,11 @@ _EXTERNAL_PROVIDER_PREFIXES = {
 # They live here (not in config, launchers, or README), so one resolver owns them.
 _LEGACY_MODEL_PATHS = {
     "bge-m3": ("bge-m3", "bge-m3-f16.gguf", "bge-m3*.gguf"),
+    "bge-reranker-v2-m3": (
+        "bge-reranker-v2-m3",
+        "bge-reranker-v2-m3-Q8_0.gguf",
+        "bge-reranker-v2-m3*.gguf",
+    ),
     "qwen3-reranker-0.6b": (
         "qwen3-reranker-0.6b",
         "qwen3-reranker-0.6b-q8_0.gguf",

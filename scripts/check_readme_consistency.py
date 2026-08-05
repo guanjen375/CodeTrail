@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -148,6 +149,30 @@ def _check_doctor_commands_have_explicit_model(docs_text: str, issues: list[str]
             )
 
 
+def _check_default_aux_models_documented(
+    default_profile_text: str,
+    docs_text: str,
+    issues: list[str],
+) -> None:
+    """預設附屬模型換掉時，下載文件也必須同步更新。"""
+    try:
+        profile = json.loads(default_profile_text)
+    except (TypeError, json.JSONDecodeError):
+        issues.append("deployment_profiles/defaults.json 無法解析")
+        return
+    services = profile.get("services") if isinstance(profile, dict) else None
+    if not isinstance(services, dict):
+        issues.append("deployment_profiles/defaults.json 缺少 services")
+        return
+    for role in ("embedding", "reranker", "vl"):
+        service = services.get(role)
+        model = service.get("model") if isinstance(service, dict) else None
+        if not isinstance(model, str) or not model:
+            issues.append(f"deployment_profiles/defaults.json 缺少 {role} model")
+        elif model not in docs_text:
+            issues.append(f"README/docs 未提到預設 {role} 模型 {model!r}")
+
+
 _FORBIDDEN_DOC_TOKENS = (
     "DEFAULT" + "_MODEL",
     "RECOMMENDED" + "_MODEL",
@@ -204,6 +229,8 @@ def check_all() -> list[str]:
     # 3. model defaults have one source of truth: deployment_profiles/defaults.json.
     if not DEFAULT_DEPLOYMENT.is_file():
         issues.append("deployment_profiles/defaults.json 不存在")
+    else:
+        _check_default_aux_models_documented(_read(DEFAULT_DEPLOYMENT), docs_text, issues)
     required_profile_reads = (
         'VL_MODEL = _DEPLOYMENT_PROFILE.service("vl").model',
         'EMBEDDING_MODEL = _DEPLOYMENT_PROFILE.service("embedding").model',

@@ -229,7 +229,7 @@ CodeTrail 刻意不指定主模型。請依工作負載與硬體選 GGUF;多 sha
 
 ### 2.3 下載 RAG 附屬模型
 
-CodeTrail 的 RAG / Code-RAG 預設使用 `bge-m3`(embedding)與 `qwen3-reranker-0.6b`(reranker)。兩者都是必要副模型:聊天 frontend 啟動前會硬性檢查 embedding / reranker / VL 都 ready,reranker 缺失不再降級成 embedding 排序。這兩個體積很小:
+CodeTrail 的 RAG / Code-RAG 預設使用 `bge-m3`(embedding)與 `bge-reranker-v2-m3` Q8_0(reranker)。兩者都是必要副模型:聊天 frontend 啟動前會硬性檢查 embedding / reranker / VL 都 ready,reranker 缺失不再降級成 embedding 排序。這兩個體積很小:
 
 ```bash
 # embedding:bge-m3 (用 f16,不要量化 — embedding 對量化敏感,Q4 會明顯影響召回)
@@ -237,13 +237,20 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
   CompendiumLabs/bge-m3-gguf bge-m3-f16.gguf \
   --local-dir ~/models/bge-m3
 
-# reranker:Qwen3-Reranker 0.6B Q8_0
+# reranker:bge-reranker-v2-m3 Q8_0
 HF_XET_HIGH_PERFORMANCE=1 hf download \
-  ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF qwen3-reranker-0.6b-q8_0.gguf \
-  --local-dir ~/models/qwen3-reranker-0.6b
+  gpustack/bge-reranker-v2-m3-GGUF bge-reranker-v2-m3-Q8_0.gguf \
+  --local-dir ~/models/bge-reranker-v2-m3
 ```
 
 兩個合計約 2GB 級。
+
+選 BGE reranker 不只是看 GGUF 大小。在 RTX 2000 Ada 16GB，使用 `-c 8192`、
+`-b 8192`、`-ub 8192` 的實機配置中，BGE reranker 常駐約 0.7 GiB；舊預設 Qwen3-Reranker
+0.6B 雖然權重同樣約 0.6 GiB，non-causal physical batch 卻會把常駐顯存推到約
+6.5 GiB，足以迫使同卡 9B VL 大量 CPU offload。數值會隨 llama.cpp 版本浮動，
+`set_config.sh` 因此對 Qwen3-Reranker 採保守 buffer 估值；容量不足時會在寫設定前
+fail-loud，提示改用上述 BGE 模型或分卡，不再產生「health 正常但看圖極慢」的配置。
 
 ### 2.4 VL 模型
 
@@ -269,7 +276,7 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 1. **前置檢查**:Python 依賴(mcp/numpy/requests)、`tmux`、`nvidia-smi`、`llama-server` 是否存在且支援必要旗標(`--reranking` / `--mmproj`;CPU-MoE 模式另需 `--cpu-moe`)。缺什麼直接給**可複製的修復指令**(裝哪個套件、跑哪行 build),修完重跑即可。
 2. **偵測與主模型模式分流**:GPU 種類/VRAM、`~/models` 的 GGUF 自動分類成主聊天 / embedding / reranker / VL+mmproj 四類;多 shard 自動聚合並**驗證齊全性**。普通互動模式會先列出並選定主模型（不會靜默挑最大顆），接著顯示該模型完整檔名，再於詢問任何附屬模型前直接問是否啟用 **CPU-MoE**；它只影響 main。`--yes` 優先採用 5090 reference 已驗證的 Qwen3-235B（若存在），並讀 GGUF tensor table 判斷是否為 MoE，且整顆放不進 GPU 時自動選 CPU-MoE；`--cpu-moe` / `--no-cpu-moe` 可明確覆寫。
-3. **CPU/RAM/VRAM 容量規劃 + 建議配置一頁確認**:主模型放 VRAM 最大的 GPU、三顆附屬模型共用另一顆。一般模式的 MoE 若放不進 GPU會直接停止，不讓 `--fit` 隱性決定 expert placement；CPU-MoE 模式會依 tensor offset 分別估算 experts 的 RAM 與 dense/其他權重＋KV/buffer 的 VRAM，任一邊不足都拒絕寫設定。dense 模型超出 VRAM 時才走 `--fit`，並以整顆 GGUF 當保守 RAM 上限；附屬模型容量也維持硬 gate。三個附屬服務固定單 slot，最後啟動的 VL 另用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用保留 3 GiB，避免只通過 health、第一張圖片才 OOM。`--ignore-capacity` 是明知風險的 escape hatch。有 mmproj 的 VL 模型不會被自動選成 main。`ctx`(預設 65536)、`threads`、`--no-mmap`、OpenCode context、MCP timeout/Python 路徑一併對齊。看完按 **Enter 採用**；要逐項自選按 **a**；**q** 離開不寫檔。
+3. **CPU/RAM/VRAM 容量規劃 + 建議配置一頁確認**:主模型放 VRAM 最大的 GPU、三顆附屬模型共用另一顆。一般模式的 MoE 若放不進 GPU會直接停止，不讓 `--fit` 隱性決定 expert placement；CPU-MoE 模式會依 tensor offset 分別估算 experts 的 RAM 與 dense/其他權重＋KV/buffer 的 VRAM，任一邊都會 gate。dense 模型超出 VRAM 時才走 `--fit`，並以整顆 GGUF 當保守 RAM 上限；附屬模型容量也維持硬 gate，且會計入已知模型的 runtime buffer（例如 Qwen3 reranker 的 8192 physical batch），不能只用 GGUF 大小判斷。三個附屬服務固定單 slot，最後啟動的 VL 另用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用保留 3 GiB，避免只通過 health、第一張圖片才 OOM 或大量 CPU offload。`--ignore-capacity` 是明知風險的 escape hatch。有 mmproj 的 VL 模型不會被自動選成 main。`ctx`(預設 65536)、`threads`、`--no-mmap`、OpenCode context、MCP timeout/Python 路徑一併對齊。看完按 **Enter 採用**；要逐項自選按 **a**；**q** 離開不寫檔。
 4. **產生四個檔案**(transaction 寫入:要嘛全套完成、要嘛完全不動;既有檔自動備份 `*.bak-setconfig-<時間戳>`,`--restore-last-backup` 可整批還原):
 
 | 產物 | 內容 |

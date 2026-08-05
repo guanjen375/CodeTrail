@@ -72,7 +72,7 @@ _EMBED_TOKENS = (
 # 附屬模型的提示也用來標記「維護者驗證過」(選了其他檔會提示未驗證)。
 _DEFAULT_HINTS = {
     "embedding": ("bge-m3",),
-    "reranker": ("qwen3-reranker",),
+    "reranker": ("bge-reranker-v2-m3",),
     "vl": ("qwen3.5-9b", "qwen3-vl"),
     # docs/verified-reference-5090.md 的實測主模型。這只決定 Enter / --yes
     # 的候選優先序；互動模式仍會先列出所有 main 讓使用者明確選擇。
@@ -93,6 +93,12 @@ _SESSION_ENV_KEYS = ("MAIN_SESSION", "AUX_SESSION", "SESSION")
 # set_config 時會誤判全部塞不下;當下 free 另外做建議性提醒。
 GPU_RESERVE_MIB = 1536                 # 驅動 / 顯示 / 碎片保留
 AUX_OVERHEAD_MIB = {"embedding": 1024, "reranker": 1024, "vl": 1536}  # ctx/compute buffer 概估
+# Qwen3-Reranker 0.6B 的權重雖然只有約 610 MiB，但 llama.cpp 的 non-causal
+# reranking 路徑要求整段輸入放進 physical batch；defaults 的 -ub 8192 在
+# RTX 2000 Ada 實測會另外配置約 6 GiB activation/compute buffer。若仍用通用
+# 1 GiB 估值，16 GiB aux 卡會錯判「三顆都放得下」，最後讓 VL 靜默 CPU offload。
+QWEN3_RERANKER_BUFFER_MIB = 6 * 1024
+_QWEN3_RERANKER_HINTS = ("qwen3-reranker",)
 MAIN_BASE_OVERHEAD_MIB = 2048          # 主模型 compute buffer 概估
 MAIN_KV_PER_32K_MIB = 1024             # 主模型每 32k ctx 的 KV cache 概估(q8_0)
 SYSTEM_RAM_RESERVE_MIB = 32 * 1024      # OS / page cache / launcher 與其他服務保留
@@ -622,9 +628,15 @@ def scan_models(models_dir: Path) -> tuple[dict[str, list[ModelCandidate]], list
         hints = _DEFAULT_HINTS[role]
 
         def sort_key(cand: ModelCandidate) -> tuple:
-            hinted = 0 if any(h in str(cand.path).lower() for h in hints) else 1
+            path_text = str(cand.path).lower()
+            # tuple 的先後就是維護者 preference；不能只做 bool 命中後再按大小，
+            # 否則同時裝有 qwen3.5-9b / qwen3-vl 時會讓較小的舊模型蓋過首選。
+            hint_rank = next(
+                (rank for rank, hint in enumerate(hints) if hint in path_text),
+                len(hints),
+            )
             size = -cand.total_bytes if role == "main" else cand.total_bytes
-            return (cand.vl_paired, hinted, size, str(cand.path))
+            return (cand.vl_paired, hint_rank, size, str(cand.path))
 
         entries.sort(key=sort_key)
     return candidates, broken
@@ -637,7 +649,7 @@ def precheck(gpus: list[Gpu], candidates: dict[str, list[ModelCandidate]],
     missing = {
         "main": "主聊天模型",
         "embedding": "embedding 模型(如 bge-m3)",
-        "reranker": "reranker 模型(如 qwen3-reranker-0.6b)",
+        "reranker": "reranker 模型(如 bge-reranker-v2-m3)",
         "vl": "VL 模型 + mmproj(如 qwen3.5-9b)",
     }
     lacking = [label for role, label in missing.items() if not candidates[role]]
@@ -867,6 +879,19 @@ def _mem_total_bytes() -> int:
     return _mem_info_mib()[0] * MIB
 
 
+def _is_qwen3_reranker(selection: Selection) -> bool:
+    haystack = str(selection.candidate.path).lower()
+    return selection.role == "reranker" and any(
+        hint in haystack for hint in _QWEN3_RERANKER_HINTS
+    )
+
+
+def _aux_overhead_mib(selection: Selection) -> int:
+    if _is_qwen3_reranker(selection):
+        return QWEN3_RERANKER_BUFFER_MIB
+    return AUX_OVERHEAD_MIB[selection.role]
+
+
 def _aux_need_mib(selection: Selection) -> int:
     """附屬服務的保守 VRAM 需求:GGUF(+mmproj)×1.1 + 各 role 的 buffer 概估。"""
     size = selection.candidate.total_bytes
@@ -875,7 +900,7 @@ def _aux_need_mib(selection: Selection) -> int:
             size += selection.mmproj.stat().st_size
         except OSError:
             pass
-    return int(size * 1.1 / MIB) + AUX_OVERHEAD_MIB[selection.role]
+    return int(size * 1.1 / MIB) + _aux_overhead_mib(selection)
 
 
 def _main_need_for_weights_mib(weight_bytes: int, ctx: int) -> int:
@@ -950,16 +975,32 @@ def plan_capacity(
     """
     budget = {gpu.index: gpu.total_mib - GPU_RESERVE_MIB for gpu in plan.gpus}
     aux_by_gpu: dict[int, int] = {}
+    aux_details_by_gpu: dict[int, list[tuple[Selection, int]]] = {}
     for selection in (plan.embedding, plan.reranker, plan.vl):
         need = _aux_need_mib(selection)
         aux_by_gpu[selection.gpu.index] = aux_by_gpu.get(selection.gpu.index, 0) + need
+        aux_details_by_gpu.setdefault(selection.gpu.index, []).append((selection, need))
 
     for index, need in sorted(aux_by_gpu.items()):
+        details = aux_details_by_gpu[index]
+        notes.append(
+            f"附屬容量預估:GPU {index} "
+            + " + ".join(f"{selection.role}~{role_need} MiB" for selection, role_need in details)
+            + f" = {need} MiB。"
+        )
         if need > budget.get(index, 0):
+            qwen_hint = ""
+            if any(_is_qwen3_reranker(selection) for selection, _ in details):
+                qwen_hint = (
+                    "偵測到 Qwen3-Reranker:它在 -ub 8192 下約需額外 6 GiB buffer；"
+                    "共用 16 GiB 級 aux GPU 時請改用 README 預設的 "
+                    "bge-reranker-v2-m3 Q8_0，或把 reranker/VL 分到其他 GPU。"
+                )
             message = (
                 f"容量判定不通過:三顆附屬模型在 GPU {index} 需要約 {need} MiB,"
                 f"但該卡預算只有 {budget.get(index, 0)} MiB(總 VRAM − 保留 {GPU_RESERVE_MIB})。"
                 "請把附屬模型分到別的 GPU(--advanced / --embed-gpu 等),或換較小的附屬模型。"
+                + qwen_hint
             )
             _capacity_problem(message, ignore, notes)
 

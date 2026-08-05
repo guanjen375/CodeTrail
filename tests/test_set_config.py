@@ -115,6 +115,11 @@ def _make_models(root: Path, *, with_reranker: bool = True) -> Path:
     (models / "bge-m3").mkdir()
     (models / "bge-m3" / "bge-m3-f16.gguf").write_bytes(b"x" * 512)
     if with_reranker:
+        (models / "bge-reranker-v2-m3").mkdir()
+        (models / "bge-reranker-v2-m3" / "bge-reranker-v2-m3-Q8_0.gguf").write_bytes(
+            b"x" * 512
+        )
+        # 舊模型同時存在時，--yes 仍必須優先選已驗證的 BGE 預設。
         (models / "qwen3-reranker-0.6b").mkdir()
         (models / "qwen3-reranker-0.6b" / "qwen3-reranker-0.6b-q8_0.gguf").write_bytes(b"x" * 512)
     (models / "vl").mkdir()
@@ -196,7 +201,7 @@ def test_yes_run_generates_all_artifacts(tmp_path):
     assert services["main"]["parameters"]["jinja"] is True
     assert "threads" in services["main"]["parameters"]
     assert services["embedding"]["model"] == str(models / "bge-m3" / "bge-m3-f16.gguf")
-    assert services["reranker"]["model"].endswith("qwen3-reranker-0.6b-q8_0.gguf")
+    assert services["reranker"]["model"].endswith("bge-reranker-v2-m3-Q8_0.gguf")
     assert services["vl"]["model"] == str(models / "vl" / "vl-model-q6.gguf")
     assert services["vl"]["mmproj"] == str(models / "vl" / "mmproj-F16.gguf")
     assert services["embedding"]["parameters"] == {"parallel": 1}
@@ -233,6 +238,27 @@ def test_yes_run_generates_all_artifacts(tmp_path):
     # 三層狀態:設定完成 ≠ 已可使用
     assert "第 1 層" in proc.stdout
     assert "待執行" in proc.stdout
+
+
+def test_yes_honors_vl_hint_order_before_model_size(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    preferred = models / "qwen3.5-9b"
+    preferred.mkdir()
+    (preferred / "Qwen3.5-9B-Q6_K.gguf").write_bytes(b"x" * 2048)
+    (preferred / "mmproj-F16.gguf").write_bytes(b"x" * 256)
+    older = models / "qwen3-vl"
+    older.mkdir()
+    (older / "Qwen3VL-8B-Instruct-Q4_K_M.gguf").write_bytes(b"x" * 1024)
+    (older / "mmproj-Qwen3VL-8B-Instruct-F16.gguf").write_bytes(b"x" * 256)
+
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    assert deployment["services"]["vl"]["model"].endswith("Qwen3.5-9B-Q6_K.gguf")
 
 
 def test_generated_start_sh_dry_run_pins_gpus_and_binds_loopback(tmp_path):
@@ -695,3 +721,43 @@ def test_capacity_aux_alone_exceeding_budget_fails(tmp_path):
     assert proc.returncode == 2
     assert "容量判定不通過" in proc.stderr
     assert "附屬模型" in proc.stderr
+
+
+def test_rtx2000_aux_capacity_prefers_bge_and_accepts_measured_model_sizes(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    _sparse(models / "bge-m3" / "bge-m3-f16.gguf", 1100 * 1024**2)
+    _sparse(
+        models / "bge-reranker-v2-m3" / "bge-reranker-v2-m3-Q8_0.gguf",
+        610 * 1024**2,
+    )
+    _sparse(models / "qwen3-reranker-0.6b" / "qwen3-reranker-0.6b-q8_0.gguf", 610 * 1024**2)
+    _sparse(models / "vl" / "vl-model-q6.gguf", 7 * GIB)
+    _sparse(models / "vl" / "mmproj-F16.gguf", 876 * 1024**2)
+
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    deployment = json.loads(
+        (tmp_path / "home" / ".config/codetrail/deployment.json").read_text(encoding="utf-8")
+    )
+    assert deployment["services"]["reranker"]["model"].endswith(
+        "bge-reranker-v2-m3-Q8_0.gguf"
+    )
+
+
+def test_rtx2000_aux_capacity_rejects_qwen3_reranker_buffer_pressure(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    shutil.rmtree(models / "bge-reranker-v2-m3")
+    _sparse(models / "bge-m3" / "bge-m3-f16.gguf", 1100 * 1024**2)
+    _sparse(models / "qwen3-reranker-0.6b" / "qwen3-reranker-0.6b-q8_0.gguf", 610 * 1024**2)
+    _sparse(models / "vl" / "vl-model-q6.gguf", 7 * GIB)
+    _sparse(models / "vl" / "mmproj-F16.gguf", 876 * 1024**2)
+
+    proc = _run(tmp_path, "--yes", "--no-preview", "--models-dir", str(models))
+
+    assert proc.returncode == 2
+    assert "Qwen3-Reranker" in proc.stderr
+    assert "額外 6 GiB buffer" in proc.stderr
+    assert "bge-reranker-v2-m3" in proc.stderr
