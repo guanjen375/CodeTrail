@@ -59,8 +59,8 @@ aicode
 - `tests/test_deployment_profile.py` — profile schema/precedence、惡意值拒絕、registry/mmproj、main/aux GPU precedence、`-ngl auto --fit` 參數驗證
 - `tests/test_deployment_status.py` — port/cmdline role 辨識、錯卡/錯模型;process 與 HTTP 都用 hook
 - `tests/test_profile_server_launchers.py` — start-all/main、quit.sh 與所有舊 launcher 的離線 dry-run 相容性
-- `tests/test_set_config.py` — `set_config.sh` 的前置檢查(llama-server/依賴缺失通知)、GPU/模型偵測分類、shard 齊全性、mmproj 多重配對、dense `--fit`/共卡 fit-target/附屬超額容量 gate、VL 不自動當 main、摘要確認模式、opencode.json 合併、bind 安全預設、legacy env 清除、transaction restore 與 end-to-end dry-run；I/O 全用 fixture
-- `tests/test_set_config_cpu_moe.py` — 主模型 CPU-MoE/一般模式分流、GGUF expert tensor 容量解析、experts RAM + dense/KV VRAM hard gate、一般模式拒絕 oversized MoE、`--cpu-moe` main-only schema/argv；完全離線且大檔用 sparse fixture
+- `tests/test_set_config.py` — `set_config.sh` 的前置檢查(llama-server/依賴缺失通知)、GPU/模型偵測分類、shard 齊全性、mmproj 多重配對、純問答契約(互動題無預設值、選項外輸入重問、`--yes` 缺旗標指名報錯、超大配置不被容量擋下)、start.sh 結尾 nvidia-smi 提醒、VL 不自動當 main、摘要確認/離開、opencode.json 合併、bind 安全預設、legacy env 清除、transaction restore 與 end-to-end dry-run;I/O 全用 fixture
+- `tests/test_set_config_cpu_moe.py` — 主模型 CPU-MoE 分流(MoE 才詢問、y/n 必答、dense 給 `--cpu-moe` 旗標要報錯)、GGUF expert tensor 解析(含 per-layer 編號與 split shard)、choose_n_cpu_moe 純輸入驗證(0..1024、超過最大 blk 編號=全放 RAM)、build_main_parameters 參數組裝、`cpu_moe`/`n_cpu_moe` main-only schema/argv;完全離線且大檔用 sparse fixture
 - `tests/test_launch_rollback.py` — launcher 啟動失敗的 rollback(pipe-pane 持久 log、清理本次 tmux session、`AICODE_NO_ROLLBACK`)與依模型大小放大的 health timeout;tmux 用 monkeypatch
 
 ---

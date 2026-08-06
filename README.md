@@ -21,7 +21,7 @@ chmod +x ./aicode                            # 2. 讓啟動指令可執行
 mkdir -p "$HOME/.local/bin"                  # 3. 準備使用者 bin 目錄
 ln -sfn "$PWD/aicode" "$HOME/.local/bin/aicode"   # 4. 建立 aicode symlink
 command -v aicode                            # 5. 應顯示 ~/.local/bin/aicode
-./set_config.sh                              # 6. 一鍵設定(偵測 GPU/模型 → 互動選擇 → 產生所有設定檔)
+./set_config.sh                              # 6. 一鍵設定(偵測 GPU/模型 → 互動問答 → 產生所有設定檔)
 ~/start.sh                                   # 7. 啟動四個 llama-server(tmux 背景)
 ```
 
@@ -33,7 +33,7 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 ```
 
 - 第 5 步沒輸出,代表 `~/.local/bin` 不在 PATH:`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc` 後再試。
-- `./set_config.sh` 預設互動只需回答幾個帶預設值的問題(主模型 / 運行模式 / reranker 與其 ctx,一路 Enter 即可),最後**確認一頁建議配置**(Enter 採用);做的事與產物見 §3。要改配置(換模型 / 換 GPU / 換 ctx)隨時重跑它,舊設定自動備份、可用 `--restore-last-backup` 還原(搭配 `--dry-run` 可先預覽會還原什麼)。
+- `./set_config.sh` 是**純問答**:逐題回答各角色模型、GPU、主模型運行模式(MoE 才問)、reranker ctx、主模型 ctx / threads,答完看一頁摘要(Enter 寫入 / q 離開)。沒有預設值、不推薦數值、也**不做容量估算**——工具只驗證輸入在合理範圍(選項 1/2 打 3 會重問);VRAM 塞不塞得下以啟動後 `nvidia-smi` 實測為準(`~/start.sh` 啟動完會提醒)。只有一個候選(或一顆 GPU)的題目自動選用。做的事與產物見 §3。要改配置(換模型 / 換 GPU / 換 ctx)隨時重跑它,舊設定自動備份、可用 `--restore-last-backup` 還原(搭配 `--dry-run` 可先預覽會還原什麼)。
 - 安全預設:四個模型 server **只綁 `127.0.0.1`**(僅本機可連);要讓區網其他機器使用要明確 `./set_config.sh --allow-remote`(見 [docs/security.md](docs/security.md))。
 - 管理指令都掛在 `~/start.sh` 上:`~/start.sh status`(檢查四個 server)、`~/start.sh stop`(全部關閉,= `scripts/quit.sh`,關掉主模型 + 三顆附屬模型的所有 tmux 視窗,並**等到 process 退出、VRAM 從 nvidia-smi 消失才返回** — 大模型釋放記憶體需要數十秒是正常的,期間會印進度)、`~/start.sh logs [role] [-f]`(看 server log)、`~/start.sh help`(子命令說明)。
 - 重新啟動前要先 `~/start.sh stop`,tmux session 還在時 `~/start.sh` 會拒絕重複啟動;若是啟動中途失敗,launcher 會自動清理本次啟動的服務,修正後直接重跑即可。
@@ -203,7 +203,7 @@ cmake --build build --config Release -j
 
 > 如果之前 build 失敗過(例如 CUDA 升級之前),**`rm -rf build` 再重來**,CMake 的快取會記住舊 toolkit 路徑。
 >
-> 建議用**新版** llama.cpp:`set_config.sh` 會把超出 VRAM 的主模型分成兩條安全路徑——MoE 明確用 `--cpu-moe`，dense 才用 `-ngl auto --fit on` 做一般 layer offload；缺少必要旗標時會直接提醒升級。
+> 建議用**新版** llama.cpp:`set_config.sh` 會探測 `--reranking` / `--mmproj` / `--fit`(VL 啟動必要)與 `--cpu-moe` / `--n-cpu-moe`(MoE 主模型的可選運行模式);缺少必要旗標時會直接提醒升級。
 
 ---
 
@@ -258,19 +258,20 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 0.6B 指的是**權重參數量**，不等於啟動後總顯存。Qwen3-Reranker 是 causal 架構；
 llama.cpp 的 embedding/reranking server 又會讓 batch 與 micro-batch 相同，因此除了約
-0.6 GiB 權重，還會配置隨 ctx 增長的 KV/compute buffer。在目前量測中，Qwen3 的
+0.6 GiB 權重，還會配置隨 ctx 增長的 KV/compute buffer。在過往量測中，Qwen3 的
 `-c/-b/-ub 8192` 合計約 6.25 GiB，改成 2048 約 2 GiB；BGE 在 8192 則約
-0.7 GiB。數值會隨 llama.cpp、量化與 GPU 變動，所以這些只用來做保守容量 gate，
-實際值仍以啟動 log / `nvidia-smi` 為準。
+0.7 GiB。數值會隨 llama.cpp、量化與 GPU 變動；`set_config.sh` 不做容量估算，
+實際值以啟動 log / `nvidia-smi` 為準。
 
-`set_config.sh` 的一般互動模式會明確選 reranker，再選它的 ctx；選 Qwen3 時建議值是
-2048，選 BGE 時是 8192，並把同一數字同步寫到 `-c/-b/-ub`。影響很直接：
+`set_config.sh` 會列出偵測到的 reranker 讓你選(多顆時必選,不自動挑),再問它的
+ctx(128..1048576,無預設值),並把同一數字同步寫到 `-c/-b/-ub`。影響很直接：
 每筆 `query + passage` 放得進 ctx 時，單純把上限加大**不會讓排序更準**；ctx 太小而使
 輸入失敗或必須截斷時，才可能漏掉後段關鍵證據。ctx 越大可接更長 passage，但更吃顯存；
-真的送入更多 token 時也更慢。CodeTrail 預設 chunk 約 600–1200 字元，Qwen3 的 2048
-通常足夠；若你調大 ingestion chunk，再選 4096/8192 並讓容量 gate 檢查。非互動可用
-`--rerank-model <GGUF絕對路徑> --rerank-ctx 2048`；全新安裝的 `--yes` 採 BGE 8192 的
-穩健預設，已設定過的機器重跑 `--yes` 則沿用你目前的 reranker 與 ctx。
+真的送入更多 token 時也更慢。CodeTrail 預設 chunk 約 600–1200 字元,可參考上面的
+量測自行取值(例如 Qwen3 配 2048、BGE 配 8192);若你調大 ingestion chunk,
+再取 4096/8192 並在啟動後用 `nvidia-smi` 確認。非互動可用
+`--rerank-model <GGUF絕對路徑> --rerank-ctx 2048`(`--yes` 之下這兩個旗標是必填,
+沒有任何自動預設)。
 
 ### 2.4 VL 模型
 
@@ -292,23 +293,23 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 ### 3.1 `./set_config.sh` 做什麼
 
-設計給**剛接觸專案者**:預設不需要懂 embedding / reranker / mmproj 的差別——幾個問題都有建議預設(一路 Enter),最後確認一頁建議配置。在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`,它會依序:
+**純問答式設定**:每一題由你作答,工具不推薦數值、不提供預設、也不做容量估算——它只驗證輸入在合理範圍(例如選項只有 1/2 卻輸入 3 會重問),以及做結構性檢查(binary 旗標、模型齊全性、schema)。VRAM 塞不塞得下以啟動後 `nvidia-smi` 實測為準。在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`,它會依序:
 
 1. **前置檢查**:Python 依賴(mcp/numpy/requests)、`tmux`、`nvidia-smi`、`llama-server` 是否存在且支援必要旗標(`--reranking` / `--mmproj` / `--fit`;CPU-MoE 模式另需 `--cpu-moe`)。缺什麼直接在這一步就擋下並給**可複製的修復指令**(裝哪個套件、跑哪行 build),不會讓你答完所有問題才發現要重來;`llama-server` 因動態庫(如 CUDA lib)跑不起來時,會轉述原始錯誤並指向 `LD_LIBRARY_PATH`,不會誤報成「不支援旗標」。
-2. **偵測與主模型模式分流**:GPU 種類/VRAM、`~/models` 的 GGUF 自動分類成主聊天 / embedding / reranker / VL+mmproj 四類;多 shard 自動聚合並**驗證齊全性**。普通互動模式會先列出並選定主模型（不會靜默挑最大顆），接著顯示該模型完整檔名，再於詢問任何附屬模型前直接問是否啟用 **CPU-MoE**；它只影響 main。之後會明確選 reranker 與它的 ctx；要選其他 embedding/VL/GPU 才需進階模式。**重跑時沿用你目前的設定**:已設定過的四顆模型(檔案還在的話)會被促升為預設,互動按 Enter 或 `--yes` 都不會把你現用的模型換掉;要換就明確選、或給 `--main-model` 等旗標。全新安裝的 `--yes` 才優先採用 5090 reference 已驗證的 Qwen3-235B（若存在），並讀 GGUF tensor table 判斷是否為 MoE，且整顆放不進 GPU 時自動選 CPU-MoE；互動模式若在容量判定才發現一般模式塞不下 MoE，會**就地詢問改用 CPU-MoE**,不必整段重來;`--cpu-moe` / `--no-cpu-moe` 可明確覆寫。
-3. **CPU/RAM/VRAM 容量規劃 + 建議配置一頁確認**:主模型放 VRAM 最大的 GPU、三顆附屬模型共用另一顆。一般模式的 MoE 若放不進 GPU會直接停止，不讓 `--fit` 隱性決定 expert placement；CPU-MoE 模式會依 tensor offset 分別估算 experts 的 RAM 與 dense/其他權重＋KV/buffer 的 VRAM，任一邊都會 gate。dense 模型超出 VRAM 時才走 `--fit`，並以整顆 GGUF 當保守 RAM 上限；附屬模型容量也維持硬 gate，且會按所選 reranker ctx 計入已知模型的 runtime buffer，不能只用 GGUF 大小判斷。三個附屬服務固定單 slot，最後啟動的 VL 另用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用保留 3 GiB，避免只通過 health、第一張圖片才 OOM 或大量 CPU offload。`--ignore-capacity` 是明知風險的 escape hatch。有 mmproj 的 VL 模型不會被自動選成 main。主模型 `ctx`(預設 65536)、reranker `ctx`(模型感知建議)、`threads`、`--no-mmap`、OpenCode context、MCP timeout/Python 路徑一併對齊。看完按 **Enter 採用**；要逐項自選按 **a**；**q** 離開不寫檔。
+2. **偵測**:GPU 種類/VRAM、`~/models` 的 GGUF 自動分類成主聊天 / embedding / reranker / VL+mmproj 四類;多 shard 自動聚合並**驗證齊全性**(缺片直接列出檔名)。有 mmproj 的 VL 模型不會被排進 main 清單前面;四類缺一即在初步判定硬停。
+3. **互動問答(全部必答,無預設值)**:依序問各角色模型(列出候選,輸入編號或直接貼 .gguf 路徑;**只有一個候選時自動選用**)、各角色要綁哪顆 GPU(單卡自動)、主模型運行模式——讀 GGUF tensor table,**偵測到 MoE expert tensors 才問**是否啟用 CPU-MoE(y/n 必答;只影響 main),答 y 後再問 **`n-cpu-moe`(部分 offload)**:前 N 層 experts 留 RAM、其餘進 GPU,輸入超過最大 blk 編號 = 全部留 RAM(等同 `--cpu-moe`);接著問 reranker `ctx`(同步寫到 `-c/-b/-ub`)、主模型 `ctx` 與 `threads`。工具對每一題**只驗證輸入範圍**,不算容量、不給建議;三個附屬服務固定單 slot,最後啟動的 VL 用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用自動配置(這是 VL 的啟動機制,不是容量估算)。答完顯示**設定摘要一頁**:按 **Enter 寫入**;**q** 離開不寫檔。OpenCode context、MCP timeout/Python 路徑一併對齊。
 4. **產生四個檔案**(transaction 寫入:要嘛全套完成、要嘛完全不動;既有檔自動備份 `*.bak-setconfig-<時間戳>`,`--restore-last-backup` 可整批還原):
 
 | 產物 | 內容 |
 |---|---|
 | `~/.config/codetrail/models.json` | 主模型 registry key → GGUF 路徑(合併既有內容) |
-| `~/.config/codetrail/deployment.json` | deployment profile local override:四個 role 的模型與主模型推薦參數;重跑時**保留你手動加的取樣參數**(temperature/top-p/…),其他未涵蓋鍵會警告已捨棄 |
+| `~/.config/codetrail/deployment.json` | deployment profile local override:四個 role 的模型與主模型參數(全部來自你的作答);重跑時**保留你手動加的取樣參數**(temperature/top-p/…與 no_mmap),其他未涵蓋鍵會警告已捨棄 |
 | `~/.config/opencode/opencode.json` | **合併**而非重建:只更新 CodeTrail 管的欄位(model / provider.llamacpp / mcp.codetrail / 缺少的 permission 鍵),你原本的 provider、主題、其他 MCP server 都保留;與安全範本衝突的 permission 會尊重你的值但明確警告 |
 | `~/start.sh` | 啟動腳本:寫死你的 GPU 配置、主模型與驗證過的 `LLAMA_BIN`,呼叫 `scripts/start-all.sh`;支援 `status` / `stop` / `logs` / `help` 子命令,打錯子命令會提示而不是誤啟動 |
 
-結尾會自動印出**推薦啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
+結尾會自動印出**啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準;`~/start.sh` 啟動完成的最後一行也會提醒你用 `nvidia-smi` 稍微監控 GPU/VRAM(例如 `watch -n 1 nvidia-smi`),因為 set_config 不做任何容量估算。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
 
-非互動用法(自動化 / 重跑):`./set_config.sh --yes` 全用建議值(**已設定過的機器上=沿用你現用的模型**,全新安裝才是 reference 預設);想固定主模型模式就加 `--cpu-moe` 或 `--no-cpu-moe`，reranker 可加 `--rerank-model ... --rerank-ctx ...`(模型不在 `~/models` 也可以:各 `--*-model` 給 .gguf 絕對路徑即可)。`--allow-remote` 開放區網連線(預設只綁 127.0.0.1)；`./set_config.sh --help` 看完整旗標。
+非互動用法(自動化 / 重跑):`./set_config.sh --yes` 跳過提問與確認頁,但**所有互動題的值必須由旗標提供,缺哪個就報錯**(沒有任何自動預設):模型與 GPU 用 `--main-model` / `--main-gpu` / `--embed-gpu` / `--rerank-model` / `--rerank-gpu` / `--vl-gpu`(單一候選/單卡的題目自動選用,可省略),數值用 `--ctx` / `--threads` / `--rerank-ctx`,MoE 主模型另需 `--cpu-moe` / `--no-cpu-moe` / `--n-cpu-moe N` 三選一(模型不在 `~/models` 也可以:各 `--*-model` 給 .gguf 絕對路徑即可)。重跑**不沿用舊值**——每次設定完全來自本次作答/旗標(只有你手動加進 deployment.json 的取樣參數與 port/base_url 會保留)。`--allow-remote` 開放區網連線(未指定只綁 127.0.0.1)；`./set_config.sh --help` 看完整旗標。
 
 ### 3.2 啟動與停止
 
@@ -424,7 +425,7 @@ AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
 }
 ```
 
-所有 service 都有同級 `model`、`port`、`base_url`、`bind`(`local` 預設只綁 127.0.0.1 / `all-interfaces` 綁 0.0.0.0)、`gpu_role`、`ctx`、`batch`、`ubatch`、`parameters`;VL 另外有 `mmproj`。模型欄只接受 registry key 或 GGUF 絕對路徑,參數只接受 schema allowlist(含 main-only `cpu_moe` → `--cpu-moe`，以及 `gpu_layers: "auto"`、`fit`、`fit_target`、`parallel`),沒有 raw shell `extra_args`;JSON 不會被 `source` / `eval`。schema 與 GPU precedence 詳見 [docs/deployment-profiles.md](docs/deployment-profiles.md)。可離線查看合併結果:
+所有 service 都有同級 `model`、`port`、`base_url`、`bind`(`local` 預設只綁 127.0.0.1 / `all-interfaces` 綁 0.0.0.0)、`gpu_role`、`ctx`、`batch`、`ubatch`、`parameters`;VL 另外有 `mmproj`。模型欄只接受 registry key 或 GGUF 絕對路徑,參數只接受 schema allowlist(含 main-only `cpu_moe` → `--cpu-moe` 與部分 offload 的 `n_cpu_moe` → `--n-cpu-moe`(兩鍵互斥),以及 `gpu_layers: "auto"`、`fit`、`fit_target`、`parallel`),沒有 raw shell `extra_args`;JSON 不會被 `source` / `eval`。schema 與 GPU precedence 詳見 [docs/deployment-profiles.md](docs/deployment-profiles.md)。可離線查看合併結果:
 
 ```bash
 AICODE_MODEL=<CODE_MODEL> python deployment_profile.py show

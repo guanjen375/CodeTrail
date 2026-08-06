@@ -114,7 +114,7 @@ disown
 
 CodeTrail repo 跑在你工作機(CPU 即可),llama-server 跑在另一台 GPU 主機。CodeTrail 透過 HTTP 呼叫對方的 8080 / 8081 / 8082 / 8083。
 
-GPU 主機端:四個 server 照 [README §3](../README.md)(`./set_config.sh` + `~/start.sh`)啟動,但有兩點要改:① 預設只綁 `127.0.0.1`,遠端連線要明確開放 —— `./set_config.sh --allow-remote`(或 `AICODE_BIND=all-interfaces`,詳見 [deployment-profiles.md](deployment-profiles.md));② 主 server 的 `-c` 決定 ctx 上限(本例用 `-c 32768`,不是預設的 65536)。CodeTrail 端會自動跟隨遠端 server 的真實 `n_ctx`,你只要再把 opencode `limit.context` 也設成同一個值即可;不一致時 `aicode` 會拒絕啟動。
+GPU 主機端:四個 server 照 [README §3](../README.md)(`./set_config.sh` + `~/start.sh`)啟動,但有兩點要改:① 預設只綁 `127.0.0.1`,遠端連線要明確開放 —— `./set_config.sh --allow-remote`(或 `AICODE_BIND=all-interfaces`,詳見 [deployment-profiles.md](deployment-profiles.md));② 主 server 的 `-c` 決定 ctx 上限(本例用 `-c 32768`;`set_config.sh` 的 ctx 沒有預設值,由你自行輸入)。CodeTrail 端會自動跟隨遠端 server 的真實 `n_ctx`,你只要再把 opencode `limit.context` 也設成同一個值即可;不一致時 `aicode` 會拒絕啟動。
 
 CodeTrail 端:
 

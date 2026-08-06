@@ -1,4 +1,9 @@
-"""set_config 主模型 CPU-MoE 分流與容量 gate 的離線回歸測試。"""
+"""set_config 主模型 CPU-MoE 分流的離線回歸測試(新契約:無容量估算、無預設值)。
+
+涵蓋:GGUF expert tensor 解析(含 per-layer 編號與 split shard)、
+choose_cpu_moe_mode / choose_n_cpu_moe 的純問答行為、build_main_parameters
+的參數組裝,以及 deployment profile 對 cpu_moe / n_cpu_moe 的 main-only 約束。
+"""
 from __future__ import annotations
 
 import json
@@ -12,7 +17,7 @@ from scripts import set_config as sc
 
 
 def _write_moe_gguf(path: Path, *, expert_bytes: int, dense_bytes: int) -> None:
-    """建立只含 tensor table 的 sparse GGUF；不配置 GiB 級實體磁碟內容。"""
+    """建立只含 tensor table 的 sparse GGUF;不配置 GiB 級實體磁碟內容。"""
     tensors = (
         ("blk.0.ffn_up_exps.weight", 0),
         ("blk.0.attn_q.weight", expert_bytes),
@@ -39,9 +44,50 @@ def _write_metadata_only_gguf(path: Path) -> None:
     path.write_bytes(struct.pack("<4sIQQ", b"GGUF", 3, 0, 0))
 
 
-def _build_plan(tmp_path: Path, *, cpu_moe: bool) -> sc.Plan:
+def _write_layered_moe_gguf(
+    path: Path, *, layer_expert_bytes: dict[int, int], dense_bytes: int
+) -> None:
+    """多層 expert tensor 的 sparse GGUF:n_cpu_moe 提問需要 per-layer 編號。"""
+    names: list[tuple[str, int]] = []
+    offset = 0
+    for layer, size in sorted(layer_expert_bytes.items()):
+        names.append((f"blk.{layer}.ffn_up_exps.weight", offset))
+        offset += size
+    if dense_bytes:
+        names.append(("blk.0.attn_q.weight", offset))
+        offset += dense_bytes
+    header = struct.pack("<4sIQQ", b"GGUF", 3, len(names), 0)
+    table = bytearray()
+    for name, tensor_offset in names:
+        encoded = name.encode("utf-8")
+        table.extend(struct.pack("<Q", len(encoded)))
+        table.extend(encoded)
+        table.extend(struct.pack("<I", 1))
+        table.extend(struct.pack("<Q", 1))
+        table.extend(struct.pack("<I", 0))
+        table.extend(struct.pack("<Q", tensor_offset))
+    data_start = (len(header) + len(table) + 31) // 32 * 32
+    with path.open("wb") as handle:
+        handle.write(header)
+        handle.write(table)
+        handle.write(b"\0" * (data_start - len(header) - len(table)))
+        handle.truncate(data_start + offset)
+
+
+def _build_plan(
+    tmp_path: Path,
+    *,
+    cpu_moe: bool,
+    layer_expert_bytes: dict[int, int] | None = None,
+    n_cpu_moe: int | None = None,
+) -> sc.Plan:
     main_path = tmp_path / "main-moe.gguf"
-    _write_moe_gguf(main_path, expert_bytes=8 * sc.GIB, dense_bytes=1 * sc.GIB)
+    if layer_expert_bytes is None:
+        _write_moe_gguf(main_path, expert_bytes=8 * sc.GIB, dense_bytes=1 * sc.GIB)
+    else:
+        _write_layered_moe_gguf(
+            main_path, layer_expert_bytes=layer_expert_bytes, dense_bytes=1 * sc.GIB
+        )
     candidate = sc.ModelCandidate(main_path, main_path.stat().st_size, 1)
     layout = sc.inspect_model_layout(candidate)
 
@@ -71,8 +117,9 @@ def _build_plan(tmp_path: Path, *, cpu_moe: bool) -> sc.Plan:
         threads=12,
         batch=0,
         ubatch=0,
-        reranker_ctx=sc.DEFAULT_RERANKER_CTX,
+        reranker_ctx=8192,
         cpu_moe=cpu_moe,
+        n_cpu_moe=n_cpu_moe,
         main_layout=layout,
     )
 
@@ -101,64 +148,189 @@ def test_split_gguf_allows_metadata_only_shard(tmp_path):
     assert layout.expert_bytes == 2 * sc.GIB
 
 
-def test_cpu_moe_mode_splits_gpu_and_ram_budget_and_generates_flag(tmp_path, monkeypatch):
-    plan = _build_plan(tmp_path, cpu_moe=True)
-    monkeypatch.setattr(sc, "_mem_info_mib", lambda: (64 * 1024, 60 * 1024))
+def test_gguf_parser_collects_per_layer_expert_bytes(tmp_path):
+    path = tmp_path / "layered.gguf"
+    _write_layered_moe_gguf(
+        path,
+        layer_expert_bytes={0: 1 * sc.GIB, 1: 2 * sc.GIB, 2: 3 * sc.GIB},
+        dense_bytes=1 * sc.GIB,
+    )
+    candidate = sc.ModelCandidate(path, path.stat().st_size, 1)
 
-    fits_whole, fit_target = sc.plan_capacity(plan, True, 5120, False, plan.notes)
-    parameters, batch, ubatch = sc.recommend_main(
-        plan.main.gpu,
-        plan.main.candidate,
-        plan.ctx,
-        plan.threads,
-        fit_target,
-        True,
-        fits_whole,
-        True,
-        plan.notes,
+    layout = sc.inspect_model_layout(candidate)
+
+    assert layout.expert_bytes == 6 * sc.GIB
+    assert layout.expert_layer_bytes == (
+        (0, 1 * sc.GIB), (1, 2 * sc.GIB), (2, 3 * sc.GIB)
     )
 
-    assert fits_whole is False
+
+def test_split_gguf_sums_same_layer_across_shards(tmp_path):
+    first = tmp_path / "layered-00001-of-00002.gguf"
+    second = tmp_path / "layered-00002-of-00002.gguf"
+    _write_layered_moe_gguf(
+        first, layer_expert_bytes={3: 1 * sc.GIB}, dense_bytes=1 * sc.GIB
+    )
+    _write_layered_moe_gguf(
+        second, layer_expert_bytes={3: 2 * sc.GIB, 4: 1 * sc.GIB}, dense_bytes=0
+    )
+    candidate = sc.ModelCandidate(
+        first, first.stat().st_size + second.stat().st_size, 2
+    )
+
+    layout = sc.inspect_model_layout(candidate)
+
+    assert layout.expert_layer_bytes == ((3, 3 * sc.GIB), (4, 1 * sc.GIB))
+
+
+def test_build_main_parameters_full_cpu_moe(tmp_path):
+    plan = _build_plan(tmp_path, cpu_moe=True)
+
+    parameters, batch, ubatch = sc.build_main_parameters(
+        plan.main.candidate, plan.ctx, plan.threads, True, True, plan.notes,
+    )
+
     assert parameters["cpu_moe"] is True
     assert parameters["gpu_layers"] == 99
     assert parameters["fit"] == "off"
-    assert (batch, ubatch) == (1024, 256)
-    assert any("experts" in note and "dense" in note for note in plan.notes)
+    assert "n_cpu_moe" not in parameters
+    assert (batch, ubatch) == (2048, 512)
+    assert any("expert tensors 固定在 RAM" in note for note in plan.notes)
 
 
-def test_general_mode_refuses_oversized_moe_even_when_fit_exists(tmp_path, monkeypatch):
-    plan = _build_plan(tmp_path, cpu_moe=False)
-    monkeypatch.setattr(sc, "_mem_info_mib", lambda: (416 * 1024, 400 * 1024))
-
-    with pytest.raises(sc.SetupError, match="一般模式.*CPU-MoE"):
-        sc.plan_capacity(plan, True, 5120, False, plan.notes)
-
-
-def test_cpu_moe_mode_refuses_insufficient_system_ram(tmp_path, monkeypatch):
-    plan = _build_plan(tmp_path, cpu_moe=True)
-    # 保留 32 GiB 後只剩 4 GiB，不足以容納約 8.8 GiB expert resident。
-    monkeypatch.setattr(sc, "_mem_info_mib", lambda: (36 * 1024, 36 * 1024))
-
-    with pytest.raises(sc.SetupError, match="CPU-MoE expert resident.*RAM"):
-        sc.plan_capacity(plan, True, 5120, False, plan.notes)
-
-
-def test_mode_prompt_defaults_to_recommendation_and_only_asks_once(tmp_path, monkeypatch):
-    plan = _build_plan(tmp_path, cpu_moe=False)
-    prompts: list[str] = []
-
-    def accept_default(prompt: str) -> str:
-        prompts.append(prompt)
-        return ""
-
-    monkeypatch.setattr(sc, "_input", accept_default)
-    selected = sc.choose_cpu_moe_mode(
-        None, False, True, plan.main.candidate, plan.main_layout
+def test_build_main_parameters_partial_n_cpu_moe(tmp_path):
+    plan = _build_plan(
+        tmp_path, cpu_moe=True, n_cpu_moe=7,
+        layer_expert_bytes={index: 1 * sc.GIB for index in range(8)},
     )
 
+    parameters, batch, ubatch = sc.build_main_parameters(
+        plan.main.candidate, plan.ctx, plan.threads, True, True, plan.notes,
+        n_cpu_moe=plan.n_cpu_moe,
+    )
+
+    assert parameters["n_cpu_moe"] == 7
+    assert "cpu_moe" not in parameters
+    assert parameters["gpu_layers"] == 99
+    assert parameters["fit"] == "off"
+    assert (batch, ubatch) == (2048, 512)
+    assert any("前 7 層" in note for note in plan.notes)
+
+
+def test_build_main_parameters_normal_mode_points_to_nvidia_smi(tmp_path):
+    """一般模式固定 -ngl 99:不做容量分支,note 指向 nvidia-smi 實測。"""
+    plan = _build_plan(tmp_path, cpu_moe=False)
+
+    parameters, batch, ubatch = sc.build_main_parameters(
+        plan.main.candidate, plan.ctx, plan.threads, True, False, plan.notes,
+    )
+
+    assert parameters["gpu_layers"] == 99
+    assert parameters["fit"] == "off"
+    assert "cpu_moe" not in parameters
+    assert "fit_target" not in parameters
+    assert (batch, ubatch) == (2048, 512)
+    assert any("nvidia-smi" in note for note in plan.notes)
+
+    # 小 ctx 時 batch 夾到 ctx(schema 要求 ubatch ≤ batch ≤ ctx)
+    small_notes: list[str] = []
+    _, small_batch, small_ubatch = sc.build_main_parameters(
+        plan.main.candidate, 1024, plan.threads, True, False, small_notes,
+    )
+    assert small_batch == 1024
+    assert small_ubatch <= small_batch
+
+    # build 不支援 --fit 時不寫 fit 鍵
+    no_fit_notes: list[str] = []
+    no_fit, _, _ = sc.build_main_parameters(
+        plan.main.candidate, plan.ctx, plan.threads, False, False, no_fit_notes,
+    )
+    assert "fit" not in no_fit
+
+
+def test_choose_cpu_moe_mode_is_pure_question(tmp_path, monkeypatch):
+    """模式問題沒有預設答案:必須明確 y/n,亂打會重問;dense/解析失敗不詢問。"""
+    plan = _build_plan(tmp_path, cpu_moe=False)
+    layout = plan.main_layout
+    candidate = plan.main.candidate
+
+    prompts: list[str] = []
+    answers = iter(["", "x", "y"])
+
+    def scripted(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr(sc, "_input", scripted)
+    notes: list[str] = []
+    selected = sc.choose_cpu_moe_mode(None, False, candidate, layout, True, notes)
     assert selected is True
-    assert len(prompts) == 1
-    assert "--cpu-moe" in prompts[0]
+    assert len(prompts) == 3          # Enter 與亂打都不被接受
+    assert "[y/n]" in prompts[0]
+    assert not notes
+
+    # 旗標 override 直接生效,不提問
+    monkeypatch.setattr(sc, "_input", lambda prompt: pytest.fail("不應詢問"))
+    assert sc.choose_cpu_moe_mode(True, False, candidate, layout, True, []) is True
+    assert sc.choose_cpu_moe_mode(False, False, candidate, layout, True, []) is False
+
+    # dense 模型:不詢問,直接一般模式
+    dense = sc.ModelLayout(tensor_bytes=1 * sc.GIB, expert_bytes=0)
+    assert sc.choose_cpu_moe_mode(None, False, candidate, dense, True, []) is False
+
+    # layout 解析失敗:不詢問,一般模式 + 提示
+    none_notes: list[str] = []
+    assert sc.choose_cpu_moe_mode(None, False, candidate, None, True, none_notes) is False
+    assert any("無法讀取" in note for note in none_notes)
+
+    # build 不支援 --cpu-moe:不詢問,一般模式 + 提示
+    unsupported_notes: list[str] = []
+    assert sc.choose_cpu_moe_mode(
+        None, False, candidate, layout, False, unsupported_notes
+    ) is False
+    assert any("不支援 --cpu-moe" in note for note in unsupported_notes)
+
+    # --yes 且是 MoE:必須用旗標指定模式
+    with pytest.raises(sc.SetupError, match="--cpu-moe / --no-cpu-moe / --n-cpu-moe"):
+        sc.choose_cpu_moe_mode(None, True, candidate, layout, True, [])
+
+
+def test_choose_n_cpu_moe_validates_range_without_recommendation(monkeypatch):
+    layout = sc.ModelLayout(
+        tensor_bytes=9 * sc.GIB,
+        expert_bytes=8 * sc.GIB,
+        expert_layer_bytes=tuple((index, 1 * sc.GIB) for index in range(8)),
+    )
+
+    # 旗標覆寫:照用;超過最大 block 編號 → None(等同 --cpu-moe)。
+    assert sc.choose_n_cpu_moe(3, True, layout) == 3
+    assert sc.choose_n_cpu_moe(99, True, layout) is None
+
+    # 互動:沒有預設值(Enter 無效)、只驗證 0..1024 範圍;
+    # 輸入超過最大 blk 編號(7)→ None。
+    answers = iter(["", "4", "8", "2000", "0"])
+    prompts: list[str] = []
+
+    def scripted(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr(sc, "_input", scripted)
+    assert sc.choose_n_cpu_moe(None, False, layout) == 4     # "" 重問後輸入 4
+    assert sc.choose_n_cpu_moe(None, False, layout) is None  # 8 > blk 上限 7
+    assert sc.choose_n_cpu_moe(None, False, layout) == 0     # 2000 超出 0..1024 重問
+    assert all(f"(0..{sc.MAX_N_CPU_MOE})" in prompt for prompt in prompts)
+
+
+def test_offload_description_shows_manual_n_cpu_moe(tmp_path):
+    plan = _build_plan(
+        tmp_path, cpu_moe=True, n_cpu_moe=7,
+        layer_expert_bytes={index: 1 * sc.GIB for index in range(8)},
+    )
+    plan.parameters = {"gpu_layers": 99, "n_cpu_moe": 7, "fit": "off"}
+
+    assert "--n-cpu-moe 7" in sc._offload_description(plan)
+    assert "--cpu-moe" not in sc._offload_description(plan)
 
 
 def test_flat_dir_with_mmproj_does_not_mark_every_main_as_vl(tmp_path):
@@ -197,6 +369,7 @@ def test_flat_dir_with_mmproj_does_not_mark_every_main_as_vl(tmp_path):
 
 
 def test_scan_prefers_verified_235b_over_larger_main_candidate(tmp_path):
+    """hint 只決定清單排序(維護者驗證的排前面);選哪顆仍由使用者輸入。"""
     models = tmp_path / "models"
     verified_dir = models / "Qwen3-235B-A22B-Thinking-2507-GGUF"
     larger_dir = models / "GLM-5.2-GGUF"
