@@ -231,15 +231,7 @@ curl -s http://localhost:8080/props | jq -r '.chat_template' \
 
 例如模型只寫出自創的 `<codetrail_list_dir .../>`,不會因為看起來像 XML 就被 frontend 當成結構化呼叫。不要靠 prompt 手寫 / 猜測底層 tool-call markup;應讓 OpenCode、provider adapter 與 llama.cpp chat template 處理。
 
-若 server 已降溫但模型仍會否認工具,在 `~/.config/opencode/AGENTS.md` 合併下面規則。完整列名是刻意的:只寫一句「優先用 `codetrail_*`」仍可能被較弱的本機模型忽略;新增或移除 MCP tool 時要同步 [工具清單](mcp-tools.md)與這份個人規則。
-
-```markdown
-## CodeTrail 工具存在性與真實呼叫(最高優先)
-- 這個 OpenCode 環境已配置 CodeTrail MCP。工具 schema 是唯一真值;CodeTrail 工具恰好 17 個:`codetrail_analyze_file`、`codetrail_apply_patch`、`codetrail_code_rag_search`、`codetrail_file_info`、`codetrail_git_diff`、`codetrail_git_status`、`codetrail_grep_code`、`codetrail_import_external_file`、`codetrail_ingest_document`、`codetrail_list_dir`、`codetrail_query_knowledge`、`codetrail_query_knowledge_strict`、`codetrail_read_file`、`codetrail_reload_knowledge_base`、`codetrail_remove_document`、`codetrail_run_command`、`codetrail_run_lint`。`todowrite` / `question` 是 frontend 工具,不能算成 CodeTrail 工具。
-- 除非 frontend / MCP 明確回傳連線或工具不存在的錯誤,禁止回答「沒有外部工具」、「沒有 CodeTrail」、「MCP 未配置」,也禁止虛構未出現在 tool schema 的工具。
-- 使用者詢問工具清單時,直接依本輪 tool schema 列出;若仍不確定 CodeTrail 是否可用,先結構化呼叫 `codetrail_list_dir(path=".", depth=1)` 驗證,不要靠自我描述猜測。
-- `<codetrail_list_dir .../>` 之類純文字 / XML 不是工具呼叫。必須使用 frontend 提供的結構化 tool-call channel;沒有收到工具結果前,不得宣稱已呼叫或執行成功。
-```
+若 server 已降溫但模型仍會否認工具,把 [OpenCode 全域 AGENTS.md 範本](opencode-agents-template.md) 合併進 `~/.config/opencode/AGENTS.md`,至少要「CodeTrail 工具存在性與真實呼叫」一段。完整列名是刻意的:只寫一句「優先用 `codetrail_*`」仍可能被較弱的本機模型忽略;新增或移除 MCP tool 時要同步 [工具清單](mcp-tools.md)與該範本(consistency check 會抓)。
 
 改全域規則後完全退出並重開 OpenCode,用新 session 分別測「列出所有 CodeTrail 工具」與強制 `codetrail_list_dir`。前者只列清單、不出現工具卡是正常的;後者必須出現結構化 `tool_use`。降溫與規則都完成後仍反覆失敗,才表示這顆模型 / template 組合的工具呼叫能力不穩,應換成已驗證支援 tool calling 的模型或版本。
 
@@ -266,7 +258,7 @@ curl -s http://localhost:8080/props | jq -r '.chat_template' \
 
 為什麼這裡仍建議在 server 旗標釘:OpenCode 官方支援 `agent.<name>.temperature`,但 custom openai-compatible provider 有版本相關的已知問題,可能解析了設定卻沒有把 `temperature` 送進 request body([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));`top_k` / `min_p` 又不一定在 provider schema 裡。agent override 適合針對 Build agent 降溫,server 參數則是所有未明示取樣值之 request 的共同 fallback。**改完 server 設定要重啟才生效。**
 
-**③ 在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則。** OpenCode 會把全域 `~/.config/opencode/AGENTS.md` 自動載入每一段對話(含純聊天)。加入類似:
+**③ 在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則([全域範本](opencode-agents-template.md)已內建「事實準確性」段,裝過範本就不用再加)。** OpenCode 會把全域 `~/.config/opencode/AGENTS.md` 自動載入每一段對話(含純聊天)。加入類似:
 
 ```markdown
 ## 事實準確性
