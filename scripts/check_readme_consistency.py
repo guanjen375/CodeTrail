@@ -9,6 +9,10 @@
   4. README 必須包含「成熟私有部署版」/「不公開發布」之類產品狀態語句
   5. README / docs 必須提到 llama-server / GGUF / <CODE_MODEL> placeholder / OpenCode JSON 範本
   6. README OpenCode 範本的 MCP timeout == config.py 的 runtime 最小值
+  7. README OpenCode 範本的 permission 區塊 == scripts/set_config.py 的
+     _OPENCODE_PERMISSION_TEMPLATE(鍵、值、順序;codetrail_* 必須排在覆寫前)
+  8. docs/opencode-agents-template.md(全域 AGENTS.md 範本)的工具清單與
+     「工具共 N 個」數量 == mcp_server.py 實際工具
 
 退出碼:0=OK, 1=有 drift。
 """
@@ -25,6 +29,8 @@ DOCS_DIR = REPO_ROOT / "docs"
 MCP = REPO_ROOT / "mcp_server.py"
 CONFIG = REPO_ROOT / "config.py"
 DEFAULT_DEPLOYMENT = REPO_ROOT / "deployment_profiles" / "defaults.json"
+SET_CONFIG = REPO_ROOT / "scripts" / "set_config.py"
+AGENTS_TEMPLATE_DOC = DOCS_DIR / "opencode-agents-template.md"
 
 
 def _read(path: Path) -> str:
@@ -119,6 +125,95 @@ def _check_opencode_timeout_contract(
             "README OpenCode JSON 範本的 mcp.codetrail.timeout 必須等於 "
             f"config.py OPENCODE_MCP_TIMEOUT_MIN_MS={minimum}"
         )
+
+
+def _check_agents_template_tools(
+    template_text: str,
+    mcp_tools: list[str],
+    issues: list[str],
+) -> None:
+    """docs/opencode-agents-template.md 的工具清單必須和 mcp_server.py 完全一致。
+
+    全域 AGENTS.md 範本靠「完整列名 + 明確數量」壓小模型的工具幻覺;
+    清單漂移會直接把錯的工具名教給模型。
+    """
+    if not template_text:
+        issues.append("docs/opencode-agents-template.md 不存在(OpenCode 全域 AGENTS.md 範本)")
+        return
+    listed = set(re.findall(r"`codetrail_([a-z0-9_]+)`", template_text))
+    actual = set(mcp_tools)
+    missing = sorted(actual - listed)
+    extra = sorted(listed - actual)
+    if missing:
+        issues.append(f"opencode-agents-template.md 工具清單缺少 mcp_server.py 的工具: {missing}")
+    if extra:
+        issues.append(f"opencode-agents-template.md 列了 mcp_server.py 沒有的工具: {extra}")
+    m = re.search(r"工具共\s*(\d+)\s*個", template_text)
+    if m is None:
+        issues.append("opencode-agents-template.md 範本必須寫「CodeTrail 工具共 N 個」")
+    elif int(m.group(1)) != len(mcp_tools):
+        issues.append(
+            f"opencode-agents-template.md 說「工具共 {m.group(1)} 個」"
+            f"但 mcp_server.py 實際有 {len(mcp_tools)} 個"
+        )
+
+
+_PERMISSION_PAIR_RE = re.compile(r'"([*a-zA-Z0-9_]+)"\s*:\s*"(allow|ask|deny)"')
+
+
+def _permission_pairs(block: str) -> list[tuple[str, str]]:
+    """依出現順序抓 "key": "allow|ask|deny" 配對(順序即 OpenCode 的規則順序)。"""
+    return [(m.group(1), m.group(2)) for m in _PERMISSION_PAIR_RE.finditer(block)]
+
+
+def _readme_permission_block(readme_text: str) -> str | None:
+    m = re.search(r'"permission"\s*:\s*\{([^{}]*)\}', readme_text)
+    return m.group(1) if m else None
+
+
+def _set_config_permission_block(set_config_text: str) -> str | None:
+    m = re.search(r"_OPENCODE_PERMISSION_TEMPLATE\s*=\s*\{([^{}]*)\}", set_config_text)
+    return m.group(1) if m else None
+
+
+def _check_permission_template_contract(
+    readme_text: str,
+    set_config_text: str,
+    issues: list[str],
+) -> None:
+    """README permission 範本必須和 set_config.py 範本完全一致(含順序)。
+
+    OpenCode permission 是 last-matching-rule-wins:`codetrail_*` 若排在
+    `codetrail_<tool>` 的 ask/deny 覆寫之後,覆寫會被 wildcard 蓋掉而失效,
+    所以順序也是契約的一部分。
+    """
+    readme_block = _readme_permission_block(readme_text)
+    template_block = _set_config_permission_block(set_config_text)
+    if readme_block is None:
+        issues.append('README 找不到 "permission": {...} JSON 範本區塊')
+        return
+    if template_block is None:
+        issues.append("scripts/set_config.py 找不到 _OPENCODE_PERMISSION_TEMPLATE")
+        return
+    readme_pairs = _permission_pairs(readme_block)
+    template_pairs = _permission_pairs(template_block)
+    if readme_pairs != template_pairs:
+        issues.append(
+            "README permission 範本和 set_config.py _OPENCODE_PERMISSION_TEMPLATE "
+            f"不一致(鍵/值/順序):README={readme_pairs} vs set_config={template_pairs}"
+        )
+    for pairs, where in ((readme_pairs, "README"), (template_pairs, "set_config.py")):
+        keys = [k for k, _ in pairs]
+        if "codetrail_*" not in keys:
+            issues.append(f"{where} permission 範本缺少 codetrail_* 規則")
+            continue
+        wild = keys.index("codetrail_*")
+        early = [k for k in keys[:wild] if k.startswith("codetrail_") and k != "codetrail_*"]
+        if early:
+            issues.append(
+                f"{where} permission 範本順序錯誤:{early} 排在 codetrail_* 之前,"
+                "OpenCode 是 last-matching-rule-wins,這些覆寫會被 wildcard 蓋掉"
+            )
 
 
 def _check_code_model_placeholder_contract(readme_text: str, docs_text: str, issues: list[str]) -> None:
@@ -256,6 +351,12 @@ def check_all() -> list[str]:
 
     # 6. OpenCode client timeout contract
     _check_opencode_timeout_contract(readme_text, config_text, issues)
+
+    # 7. OpenCode permission template contract (README ↔ set_config.py)
+    _check_permission_template_contract(readme_text, _read(SET_CONFIG), issues)
+
+    # 8. Global AGENTS.md template tool-list contract
+    _check_agents_template_tools(_read(AGENTS_TEMPLATE_DOC), mcp_tools, issues)
 
     return issues
 

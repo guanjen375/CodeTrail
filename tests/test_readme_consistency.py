@@ -6,7 +6,9 @@ from scripts.check_readme_consistency import (
     _check_doctor_commands_have_explicit_model,
     _check_default_aux_models_documented,
     _check_forbidden_main_model_tokens,
+    _check_agents_template_tools,
     _check_opencode_timeout_contract,
+    _check_permission_template_contract,
     _config_int_constant,
     _config_model_values,
     _mcp_tool_names,
@@ -163,3 +165,68 @@ def test_forbidden_main_model_tokens_are_detected_without_flagging_placeholders(
     _check_forbidden_main_model_tokens("<CODE_MODEL>\n" + bad_tokens, issues)
 
     assert len(issues) == 4
+
+
+def test_permission_template_contract_passes_when_identical():
+    readme = """
+```json
+{
+  "permission": {
+    "*": "deny",
+    "plan_enter": "allow",
+    "codetrail_*": "allow",
+    "codetrail_apply_patch": "ask"
+  }
+}
+```
+"""
+    set_config = (
+        '_OPENCODE_PERMISSION_TEMPLATE = {\n'
+        '    "*": "deny",\n'
+        '    "plan_enter": "allow",\n'
+        '    "codetrail_*": "allow",\n'
+        '    "codetrail_apply_patch": "ask",\n'
+        '}\n'
+    )
+    issues: list[str] = []
+    _check_permission_template_contract(readme, set_config, issues)
+    assert issues == []
+
+
+def test_permission_template_contract_reports_drift_and_bad_order():
+    # README 少了一鍵、且 ask 覆寫排在 wildcard 之前(last-match-wins 下會失效)
+    readme = '"permission": { "*": "deny", "codetrail_apply_patch": "ask", "codetrail_*": "allow" }'
+    set_config = (
+        '_OPENCODE_PERMISSION_TEMPLATE = {"*": "deny", "codetrail_*": "allow", '
+        '"codetrail_apply_patch": "ask", "codetrail_remove_document": "ask"}'
+    )
+    issues: list[str] = []
+    _check_permission_template_contract(readme, set_config, issues)
+    assert any("不一致" in i for i in issues)
+    assert any("排在 codetrail_* 之前" in i for i in issues)
+
+
+def test_agents_template_tool_list_contract():
+    issues: list[str] = []
+    _check_agents_template_tools(
+        "CodeTrail 工具共 2 個:`codetrail_read_file`、`codetrail_git_diff`。",
+        ["read_file", "git_diff"],
+        issues,
+    )
+    assert issues == []
+
+    # 缺一個真工具、多一個假工具、數量寫錯,三種都要抓到
+    issues = []
+    _check_agents_template_tools(
+        "CodeTrail 工具共 3 個:`codetrail_read_file`、`codetrail_ghost_tool`。",
+        ["read_file", "git_diff"],
+        issues,
+    )
+    assert any("缺少" in i for i in issues)
+    assert any("沒有的工具" in i for i in issues)
+    assert any("實際有 2 個" in i for i in issues)
+
+    # 範本檔不存在也要報
+    issues = []
+    _check_agents_template_tools("", ["read_file"], issues)
+    assert any("不存在" in i for i in issues)
