@@ -122,6 +122,82 @@ nvidia-smi -l 1                                              # GPU 是否在動
 
 長期解法:重啟主 server 加 `--no-mmap`,前期載入慢 1.5–2.5 分鐘(把 ~135GB weights 全讀進 RAM),之後 TTFT 穩定在 5–15 秒。RAM 不夠 135GB 的就保持 mmap 接受偶爾卡頓,或換較小模型。
 
+<a id="mcp-connected-but-no-tool-call"></a>
+
+### `/status` 是 Connected,但模型說沒有 CodeTrail 或只印出假工具 XML
+
+**典型症狀**:
+
+- `/status` 或 `opencode mcp list` 明明顯示 `codetrail Connected`,模型卻回答「沒有 CodeTrail 工具」,甚至改口說只有 `todos`、`web_search` 等別的工具。
+- 明確要求 `list_dir(path=".", depth=1)` 後,模型只輸出 `<codetrail_list_dir path="." depth="1"/>`,接著用自然語言宣稱「已成功取得目錄」,畫面上沒有工具卡、也沒有真實目錄內容。
+
+**先講結論:模型對「自己有哪些工具」的文字回答不是診斷資料,XML 長得像 tool call 也不代表執行過。** 要把三層狀態分開看:
+
+| 層次 | 能證明什麼 | 怎麼驗證 |
+|---|---|---|
+| MCP 連線 | OpenCode 已啟動 CodeTrail 子行程並完成 initialize | `/status`、`opencode mcp list` |
+| 工具註冊 | client 收到 CodeTrail 的工具 schema | OpenCode 的 tools / MCP 檢視;完整名稱見 [MCP 工具清單](mcp-tools.md) |
+| 本輪實際執行 | 模型真的發出結構化 tool call,client 執行後把結果送回模型 | TUI 工具卡,或 JSON event 的 `type: "tool_use"`、`state.status: "completed"` |
+
+用一個全新 session 做最小重現,不要沿用已經多次回答「工具不存在」的舊對話(舊上下文本身可能讓模型繼續模仿錯誤答案):
+
+```bash
+opencode mcp list
+opencode run --dir <PROJECT_TO_ANALYZE> --agent build --format json \
+  '請立即呼叫 codetrail_list_dir，path="."、depth=1。必須實際呼叫工具。'
+```
+
+真的呼叫時,JSON stream 會出現 `type: "tool_use"`、`tool: "codetrail_list_dir"` 和完成狀態,step 結束原因通常是 `tool-calls`;只看到 assistant 的 XML / 純文字且以 `stop` 結束,就是模型模擬了呼叫。也可從 OpenCode log 交叉檢查:
+
+```bash
+rg -n 'codetrail_list_dir|evaluated permission|tool_use' \
+  ~/.local/share/opencode/log/*.log | tail -50
+```
+
+真呼叫通常會留下 tool / permission evaluation 紀錄;假 XML 只有普通 assistant text。不要以「模型說 retrieved successfully」當成功證據。
+
+這種情況常見於本機模型的 tool-call 格式不穩。先在既有 `~/.config/opencode/opencode.json` **合併**下面區塊(不要整份覆蓋):
+
+```json
+{
+  "agent": {
+    "build": {
+      "temperature": 0
+    }
+  }
+}
+```
+
+驗證 JSON 與 OpenCode 實際解析到的 agent 設定,然後完全退出 OpenCode、重開並建立新 session:
+
+```bash
+python3 -m json.tool ~/.config/opencode/opencode.json >/dev/null
+opencode debug agent build | rg '"temperature": 0'
+```
+
+`temperature: 0` 是降低隨機格式漂移的建議,不是保證任何模型都能正確 tool call。[OpenCode agent 設定](https://opencode.ai/docs/agents/)雖正式支援 agent-level `temperature`,custom `@ai-sdk/openai-compatible` provider 仍有版本相關的傳遞問題([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));所以 `opencode debug agent build` 只能證明設定已解析,不能單獨證明 request body 一定帶了它。要釘住所有未明示取樣值的請求,再把下面的鍵**合併進既有** `~/.config/codetrail/deployment.json`(保留其他 service / model / port):
+
+```json
+{
+  "services": {
+    "main": {
+      "parameters": {
+        "temperature": 0
+      }
+    }
+  }
+}
+```
+
+改 server 設定後執行 `scripts/quit.sh` → `~/start.sh` 重啟才會生效。`set_config.sh` 重跑時會保留手動加入的 allowlisted 取樣參數。若模型輸出的格式名稱跟目前 chat template 完全不同,可再確認 llama-server 載入的 template:
+
+```bash
+curl -s http://localhost:8080/props | jq -r '.chat_template' \
+  | rg 'tool_calls|invoke|DSML'
+```
+
+例如模型只寫出自創的 `<codetrail_list_dir .../>`,不會因為看起來像 XML 就被 frontend 當成結構化呼叫。不要靠 prompt 手寫 / 猜測底層 tool-call markup;應讓 OpenCode、provider adapter 與 llama.cpp chat template 處理。降溫後仍反覆失敗,表示這顆模型 / template 組合的工具呼叫能力不穩,應換成已驗證支援 tool calling 的模型或版本。
+
 ### 模型編造不存在的具體事實(條號 / 日期 / ticket 號 / 金額)—— 幻覺 / confabulation
 
 **症狀**:問一個你沒提供來源的問題(例如「對某廠商發 ticket 施壓」),模型回了看似可執行的細節 —— 引用「合約第 7.2 條」、「每日延遲成本 \$25K」、「3 日內回應」 —— 但這些數字 / 條號**從來沒出現在你給它的任何資料裡**,是模型自己補的。
@@ -143,7 +219,7 @@ nvidia-smi -l 1                                              # GPU 是否在動
 
 (等價於 server 旗標 `--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.0`;改完 `scripts/quit.sh` → `~/start.sh` 重啟生效。)
 
-為什麼一定要在 server 旗標釘、而不是寫在 `opencode.json`:OpenCode 的 openai-compatible provider 對自訂 provider 有已知問題,`temperature` 會被丟掉不送進 request body([opencode#25755](https://github.com/anomalyco/opencode/issues/25755)),`top_k` / `min_p` 又不在它的 schema 裡。所以 server 旗標是唯一可靠的釘法。**改完要重啟 server 才生效。**
+為什麼這裡仍建議在 server 旗標釘:OpenCode 官方支援 `agent.<name>.temperature`,但 custom openai-compatible provider 有版本相關的已知問題,可能解析了設定卻沒有把 `temperature` 送進 request body([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));`top_k` / `min_p` 又不一定在 provider schema 裡。agent override 適合針對 Build agent 降溫,server 參數則是所有未明示取樣值之 request 的共同 fallback。**改完 server 設定要重啟才生效。**
 
 **③ 在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則。** OpenCode 會把全域 `~/.config/opencode/AGENTS.md` 自動載入每一段對話(含純聊天)。加入類似:
 

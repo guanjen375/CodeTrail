@@ -21,7 +21,7 @@ cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-進入 TUI 後就可以開始下一節操作。需要讀專案外附件時看「夾帶附件」；若工具看起來沒接上，再用 `/status` 檢查是否有 `codetrail Connected`；如果 `/status` 沒連上，先看 [常見問題](troubleshooting.md)。
+進入 TUI 後就可以開始下一節操作。需要讀專案外附件時看「夾帶附件」；若工具看起來沒接上，再用 `/status` 檢查是否有 `codetrail Connected`。注意 Connected 只證明 MCP transport 已初始化,不證明模型這一輪真的呼叫工具;如果 `/status` 沒連上,或模型只印出假 XML 卻宣稱工具成功,照 [常見問題的分層診斷](troubleshooting.md#mcp-connected-but-no-tool-call)處理。
 
 ---
 
@@ -38,7 +38,7 @@ CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透�
 最後用 file:line 列出「證據」和「推測」。
 ```
 
-正常情況下，你會看到模型呼叫 `list_dir(...)`、`grep_code(...)`、`code_rag_search(...)`、`read_file(...)` 這類工具，再用檔名與行號回答。如果它沒有讀檔就直接回答，可以要求：
+正常情況下，你會看到 frontend 顯示 `list_dir(...)`、`grep_code(...)`、`code_rag_search(...)`、`read_file(...)` 這類工具的呼叫卡與真實結果,模型再用檔名與行號回答。單純輸出 `<codetrail_list_dir .../>` 文字不算呼叫。如果它沒有讀檔就直接回答，可以要求：
 
 ```text
 請先用工具查證，不要只根據一般經驗回答。

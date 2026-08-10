@@ -458,7 +458,7 @@ registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf`
 
 ### 4.3 OpenCode config
 
-llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 即可。`set_config.sh` 產生的 `~/.config/opencode/opencode.json` 就是下面這份範本(把所有 `<CODE_MODEL>` 換成你 4.2 裡用的 registry key):
+llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 即可。下面是手動設定範本(把所有 `<CODE_MODEL>` 換成你 4.2 裡用的 registry key);`set_config.sh` 會產生 / 合併其中由 CodeTrail 管理的欄位,而 `agent.build.temperature` 是工具呼叫型本機模型建議另外加上的覆寫。重跑 `set_config.sh` 時,這類非 CodeTrail 管理欄位會保留:
 
 ```json
 {
@@ -471,6 +471,12 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 
   "model": "llamacpp/<CODE_MODEL>",
   "small_model": "llamacpp/<CODE_MODEL>",
+
+  "agent": {
+    "build": {
+      "temperature": 0
+    }
+  },
 
   "provider": {
     "llamacpp": {
@@ -542,7 +548,8 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 - `llamacpp` 是 provider key,可改名(`local`、`llmcpp`、隨意),但要跟 `"model"` 那段的 prefix 對齊。
 - `enabled_providers` 鎖定只啟用本機 provider:設了之後 OpenCode 的 model picker(TUI 與 web)**只會出現你的本機模型**,雲端 provider(OpenCode Zen、Anthropic、OpenAI 等)完全不列出、無法誤選 —— **NDA 場景強烈建議保留**,避免把程式碼送到雲端模型。陣列內字串要跟你的 provider key 一致(這裡是 `llamacpp`)。
 - `apiKey` 任意非空值即可,llama-server 預設不檢查。
-- **取樣參數(temperature / top_p / top_k / min_p)不要寫在這裡指望它生效**。OpenCode 的 openai-compatible provider 對自訂 provider 有已知問題;應在 deployment profile 的 allowlisted `parameters` 內設定,由 server launcher 釘住。特定 5090/Qwen reference 值見 [docs/verified-reference-5090.md](docs/verified-reference-5090.md),不要套到未知模型。
+- **工具呼叫很多的 Build agent 建議設 `agent.build.temperature: 0`**。這是 [OpenCode 官方 agent 設定](https://opencode.ai/docs/agents/)支援的 override,可降低本機模型把工具呼叫格式「說成文字」或隨機改寫格式的機率;它不會替你連上 MCP,也只影響 Build agent。改完先用 `opencode debug agent build` 確認解析結果含 `"temperature": 0`,再完全退出並重開 OpenCode、開新 session 測試。
+- **解析到設定不等於每個版本都一定把它送進 request body**。OpenCode 的 custom `@ai-sdk/openai-compatible` provider 有已知的 `temperature` 傳遞問題([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));因此需要所有 client 都有一致的 server 預設時,仍應在 deployment profile 的 `services.main.parameters` 設 `temperature`。`top_p` / `top_k` / `min_p` 等 provider schema 不一定支援的參數也放 server 端。完整判讀與假工具呼叫排查見 [docs/troubleshooting.md](docs/troubleshooting.md#mcp-connected-but-no-tool-call);特定 5090/Qwen reference 值見 [docs/verified-reference-5090.md](docs/verified-reference-5090.md),不要套到未知模型。
 - **要壓「模型杜撰不存在的具體事實」(條號 / 日期 / 數字),在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則**(OpenCode 會自動把它載入每一段對話,含純聊天)。範例與原理見 [docs/troubleshooting.md](docs/troubleshooting.md)。注意這個 `~/.config/opencode/AGENTS.md` 是 OpenCode runtime 的全域規則檔,跟本 repo 根目錄那份「給修改 CodeTrail 原始碼的 agent 看的」`AGENTS.md` 是兩回事。
 - `limit.context: 65536` 是 OpenCode 主對話實際塞給 server 的上限。它必須等於 llama-server 啟動時的 `-c <N>`(server 是 ctx 上限的唯一真值);CodeTrail 端的 ctx 上限會自動跟隨 server,所以你只要顧好「`limit.context` == server `-c`」這一個對齊就好(`set_config.sh` 產生時已對齊)。`aicode` 啟動時會檢查,不一致就拒絕啟動。
 - `permission` 區段:`*: deny` 是預設拒絕一切,只白名單 `codetrail_*`(經 CodeTrail 沙箱)。OpenCode 內建工具(`bash` / `read` / `write` 等)會繞過 CodeTrail 沙箱,所以這裡明確 `deny`。
@@ -639,7 +646,7 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 - 用 `--no-mmap` 模式:約 5–15 秒
 - 用 mmap 模式(沒加 `--no-mmap`):**第一次可能要 1–2 分鐘**,因為要從 SSD page-in MoE expert weights。畫面上 frontend 可能顯示「`...esc interrupt`」或類似等待狀態,**不要按 Esc**,等就對了
 
-如果想驗證工具有沒有連上:OpenCode TUI 輸入 `/status`,應看到 `codetrail Connected`;Codex TUI 輸入 `/mcp`,應看到 `codetrail` connected。
+如果想驗證 MCP transport 有沒有連上:OpenCode TUI 輸入 `/status`,應看到 `codetrail Connected`;Codex TUI 輸入 `/mcp`,應看到 `codetrail` connected。**Connected 只代表 MCP 子行程完成連線,不代表模型在這一輪真的發出 tool call。** 真正執行時應看到 frontend 的工具卡 / 結果;若模型只印出 `<codetrail_list_dir .../>` 再用文字宣稱成功,那是假工具呼叫,照 [troubleshooting 的分層檢查](docs/troubleshooting.md#mcp-connected-but-no-tool-call)處理。
 
 想把**圖片**(截圖、架構圖、規格頁掃描)變成之後查得到的知識,就是「VL + RAG 一起用」—— `ingest_document` 餵圖片時會自動走 VL 把圖抽成文字再進 RAG,跟 PDF 走同一套:
 

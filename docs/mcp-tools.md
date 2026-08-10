@@ -10,6 +10,8 @@
 
 你不用手動寫 JSON 或自己呼 API。這些工具會出現在 frontend 的 MCP 工具列表裡；日常用法是在對話中直接要求模型「用工具 `<工具名>` 做某件事」。多數情況只講工具名就夠了，模型會自己補預設參數；需要指定檔案、行號、搜尋範圍時，再把那些條件寫進自然語言。
 
+判斷有沒有真的執行,要看 frontend 的工具卡 / 回傳結果或結構化 `tool_use` event,不要看模型如何描述自己的工具清單。`/status` 的 Connected 只證明 MCP transport 已連線;模型輸出 `<codetrail_list_dir .../>` 之類純文字後自行宣稱成功,仍是假呼叫。完整診斷見 [Connected 但沒有實際 tool call](troubleshooting.md#mcp-connected-but-no-tool-call)。
+
 ### 最常用講法
 
 | 你想做什麼 | 在 frontend 裡可以這樣說 | 主要工具 |
