@@ -157,6 +157,8 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 
 `ingest_document` 會把整份文件切成多段、算出每段的向量、存進專案根目錄的 `knowledge.json`。`reload_knowledge_base` 把剛存進去的內容立刻吃進記憶體 — **每次匯入或刪除文件後都要呼叫**，不然查不到。
 
+這裡的「吃進記憶體」是 **MCP server 的 KB singleton / 向量索引**,不是把整份文件塞進 OpenCode 聊天 context。`ingest_document` 回到當前對話的只有執行摘要,`reload_knowledge_base` 只有狀態;等你呼叫 `query_knowledge` 時,才會把命中的少量 chunks 當 tool result 帶進那個 session。因此 KB 文件數變多會增加索引與 retrieval 工作,但不會讓每個新 session 自動帶著全文。若模型在 ingest 後看似「失憶」,先依 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)檢查實際 token、compaction 與真 / 假 tool call,不要直接歸因於 RAG context overflow。
+
 預設依副檔名自動分派到對應的處理路徑（見上方「支援格式」清單）。圖片預設走「技術圖片」路徑（架構圖／流程圖／記憶體圖），抽出的是畫面說明；若這張是聊天截圖、想抽出對話內容，要顯式傳 `mode="chat"`：`ingest_document("teams.png", mode="chat")`。
 
 一次匯入多份：

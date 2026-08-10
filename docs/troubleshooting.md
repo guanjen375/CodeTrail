@@ -139,6 +139,10 @@ nvidia-smi -l 1                                              # GPU 是否在動
 | 工具註冊 | client 收到 CodeTrail 的工具 schema | OpenCode 的 tools / MCP 檢視;完整名稱見 [MCP 工具清單](mcp-tools.md) |
 | 本輪實際執行 | 模型真的發出結構化 tool call,client 執行後把結果送回模型 | TUI 工具卡,或 JSON event 的 `type: "tool_use"`、`state.status: "completed"` |
 
+**「剛 ingest 文件就失憶」不等於整份 RAG 塞爆 context。** `ingest_document` 把全文切 chunk 後寫進 `knowledge.json`,它送回目前對話的只有有長度上限的執行摘要;`reload_knowledge_base` 只更新 MCP process 內的 KB singleton。只有之後呼叫 `query_knowledge` 時,召回的少量 REF 才會以 tool result 進入那個 session。新 session 不會因為 KB 裡文件變多就自動攜帶全文。同一個舊 session 累積很多 tool result 時仍可能變長,但要看實際 token / compaction,不能只看 ingest 發生過就下結論。
+
+這次實際失敗案例是全新 session:`step_finish.tokens.total=9001`、模型上限 131072,且沒有 compaction;其中 `input=522`、`cache.read=8355`,因此 RAG overflow 可直接排除。`--format json` 的 `step_finish` event 可用來看重現請求的 tokens;本例的 cache read 是可重用的 system / tool schema prefix,而 `cache.read` 數值本身也不能當成「整份 KB 已注入」的證據。
+
 用一個全新 session 做最小重現,不要沿用已經多次回答「工具不存在」的舊對話(舊上下文本身可能讓模型繼續模仿錯誤答案):
 
 ```bash
@@ -189,14 +193,33 @@ opencode debug agent build | rg '"temperature": 0'
 }
 ```
 
-改 server 設定後執行 `scripts/quit.sh` → `~/start.sh` 重啟才會生效。`set_config.sh` 重跑時會保留手動加入的 allowlisted 取樣參數。若模型輸出的格式名稱跟目前 chat template 完全不同,可再確認 llama-server 載入的 template:
+改 server 設定後執行 `scripts/quit.sh` → `~/start.sh` 重啟才會生效。`set_config.sh` 重跑時會保留手動加入的 allowlisted 取樣參數。重啟後不要只看 JSON,直接確認 server 實際預設已變成 `0.0`:
+
+```bash
+curl -s http://localhost:8080/props \
+  | jq '.default_generation_settings.params.temperature'
+```
+
+若模型輸出的格式名稱跟目前 chat template 完全不同,可再確認 llama-server 載入的 template:
 
 ```bash
 curl -s http://localhost:8080/props | jq -r '.chat_template' \
   | rg 'tool_calls|invoke|DSML'
 ```
 
-例如模型只寫出自創的 `<codetrail_list_dir .../>`,不會因為看起來像 XML 就被 frontend 當成結構化呼叫。不要靠 prompt 手寫 / 猜測底層 tool-call markup;應讓 OpenCode、provider adapter 與 llama.cpp chat template 處理。降溫後仍反覆失敗,表示這顆模型 / template 組合的工具呼叫能力不穩,應換成已驗證支援 tool calling 的模型或版本。
+例如模型只寫出自創的 `<codetrail_list_dir .../>`,不會因為看起來像 XML 就被 frontend 當成結構化呼叫。不要靠 prompt 手寫 / 猜測底層 tool-call markup;應讓 OpenCode、provider adapter 與 llama.cpp chat template 處理。
+
+若 server 已降溫但模型仍會否認工具,在 `~/.config/opencode/AGENTS.md` 合併下面規則。完整列名是刻意的:只寫一句「優先用 `codetrail_*`」仍可能被較弱的本機模型忽略;新增或移除 MCP tool 時要同步 [工具清單](mcp-tools.md)與這份個人規則。
+
+```markdown
+## CodeTrail 工具存在性與真實呼叫(最高優先)
+- 這個 OpenCode 環境已配置 CodeTrail MCP。工具 schema 是唯一真值;CodeTrail 工具恰好 17 個:`codetrail_analyze_file`、`codetrail_apply_patch`、`codetrail_code_rag_search`、`codetrail_file_info`、`codetrail_git_diff`、`codetrail_git_status`、`codetrail_grep_code`、`codetrail_import_external_file`、`codetrail_ingest_document`、`codetrail_list_dir`、`codetrail_query_knowledge`、`codetrail_query_knowledge_strict`、`codetrail_read_file`、`codetrail_reload_knowledge_base`、`codetrail_remove_document`、`codetrail_run_command`、`codetrail_run_lint`。`todowrite` / `question` 是 frontend 工具,不能算成 CodeTrail 工具。
+- 除非 frontend / MCP 明確回傳連線或工具不存在的錯誤,禁止回答「沒有外部工具」、「沒有 CodeTrail」、「MCP 未配置」,也禁止虛構未出現在 tool schema 的工具。
+- 使用者詢問工具清單時,直接依本輪 tool schema 列出;若仍不確定 CodeTrail 是否可用,先結構化呼叫 `codetrail_list_dir(path=".", depth=1)` 驗證,不要靠自我描述猜測。
+- `<codetrail_list_dir .../>` 之類純文字 / XML 不是工具呼叫。必須使用 frontend 提供的結構化 tool-call channel;沒有收到工具結果前,不得宣稱已呼叫或執行成功。
+```
+
+改全域規則後完全退出並重開 OpenCode,用新 session 分別測「列出所有 CodeTrail 工具」與強制 `codetrail_list_dir`。前者只列清單、不出現工具卡是正常的;後者必須出現結構化 `tool_use`。降溫與規則都完成後仍反覆失敗,才表示這顆模型 / template 組合的工具呼叫能力不穩,應換成已驗證支援 tool calling 的模型或版本。
 
 ### 模型編造不存在的具體事實(條號 / 日期 / ticket 號 / 金額)—— 幻覺 / confabulation
 
@@ -205,7 +228,7 @@ curl -s http://localhost:8080/props | jq -r '.chat_template' \
 **先講結論:這不是模型壞掉,也不是 Q4 量化的鍋,換模型解決不了。** 模型甚至能正確診斷自己的這個現象,代表它很健康。根因有兩個:
 
 1. **沒有 grounding(來源)**。你要它引合約條款,卻沒把合約貼給它。沒有來源時,任何模型、任何精度都**不可能**猜中真實條號 —— 它只能依「訓練語料裡最常見的 `第 X.Y 條` 模式」補一個最像的數字。這是機率預測的副作用,不是故意騙人。
-2. **取樣太放飛 + 走錯路徑**。純聊天走的是 **OpenCode TUI → llama-server**,**完全繞過 CodeTrail** 的 temp 0.0 + RAG + strict mode(見 [context_budget.py](../context_budget.py) 註解、`config.py` 的 `STRICT_MODE_TEMPERATURE`)。而 llama-server 啟動若沒帶 sampling 旗標,內建預設 `temp 0.8 / top_k 40 / min_p 0.05` —— 對 `Qwen3-235B-A22B-Thinking-2507`(官方建議 `temp 0.6 / top_p 0.95 / top_k 20 / min_p 0`)偏高,更容易自由發揮。
+2. **取樣太放飛 + 走錯路徑**。純聊天走的是 **OpenCode TUI → llama-server**,**完全繞過 CodeTrail** 的 temp 0.0 + RAG + strict mode(見 [context_budget.py](../context_budget.py) 註解、`config.py` 的 `STRICT_MODE_TEMPERATURE`)。llama-server 沒帶 sampling 旗標時會使用該 build 的預設,不同版本不可硬猜;本次實測 `/props` 是 `temp 1.0 / top_k 40 / top_p 1.0 / min_p 0.05`。對 `Qwen3-235B-A22B-Thinking-2507`(官方建議 `temp 0.6 / top_p 0.95 / top_k 20 / min_p 0`)會偏高,更容易自由發揮。先用上面的 `/props` 指令看自己正在跑的真值。
 
 **三個修法(按效果排序)**:
 
