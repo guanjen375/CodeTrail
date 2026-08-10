@@ -143,7 +143,7 @@ ssh -L 8080:localhost:8080 -L 8081:localhost:8081 -L 8082:localhost:8082 -L 8083
 
 ## `aicode` wrapper 詳細行為
 
-`aicode` 是一個 shell wrapper,啟動 `opencode` 之前做十件事:
+`aicode` 是一個 shell wrapper,啟動 `opencode` 之前做十二件事:
 
 1. 把目前目錄設成 `AICODE_ROOT`(沙箱根)
 2. 拒絕 `AICODE_ROOT=/` 或 `AICODE_ROOT=$HOME`(可能誤刪 / 誤改大量檔案)
@@ -154,7 +154,11 @@ ssh -L 8080:localhost:8080 -L 8081:localhost:8081 -L 8082:localhost:8082 -L 8083
 7. 確認 OpenCode active model 的 `limit.context` 等於 server `-c`
 8. 安全同步既有 `mcp.codetrail.timeout`
 9. 對三個 aux server 跑 hard preflight
-10. 啟動 `opencode` 並原樣轉發使用者的 `-m / --model`
+10. 直接對實際 `mcp.codetrail.command` 做 `initialize → tools/list → list_dir`,確認完整 17-tool contract 與只讀工具派發都正常
+11. 用 fresh `opencode run --format json` 驗 active model 真的產生 completed 的結構化 `codetrail_list_dir` event；依 model/config/chat-template/project 指紋快取成功結果 24 小時
+12. 啟動 `opencode` 並原樣轉發使用者的 `-m / --model`
+
+第 10 項每次啟動都實跑，不靠模型自述；第 11 項首次、快取過期或指紋變動才實跑，所以不必每次手動問「列出 17 個工具」。`aicode web` 也會跑兩層檢查；`aicode attach` 是接既有 backend 的薄 client，不重跑。完整 PASS / FAIL、快取與緊急 override 說明見 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)。
 
 ---
 

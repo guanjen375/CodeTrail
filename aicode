@@ -257,6 +257,25 @@ fi
 export AICODE_ROOT="$ROOT"
 echo "[aicode] AICODE_ROOT=$AICODE_ROOT"
 
+# MCP / tool-call health gate:
+#   1) 每次都直接走 initialize → tools/list → list_dir，確認 server 真正暴露
+#      完整 17-tool contract，而不是相信模型對自身工具的文字描述。
+#   2) 用 fresh `opencode run --format json` 驗 active model 能產生 completed 的
+#      結構化 codetrail_list_dir event；成功結果依 model/config/template/root 指紋
+#      快取，避免每次啟動都花一次完整推理時間。
+# attach 是薄 client，前面已直接 exec，不會重跑 backend canary；standalone TUI 與
+# web backend 都會走這道 gate。`--` 後原樣交給 Python，只掃描 -m/--model，
+# 不會消耗或改寫稍後要轉發給 OpenCode 的參數。
+TOOL_CANARY="$CODETRAIL_HOME/scripts/tool_call_canary.py"
+if [ ! -f "$TOOL_CANARY" ]; then
+  echo "[aicode] missing required tool-call canary: $TOOL_CANARY" >&2
+  exit 2
+fi
+if ! "$PYBIN" "$TOOL_CANARY" --root "$AICODE_ROOT" -- "$@"; then
+  echo "[aicode] CodeTrail tool health check refused to start (see [tool-health] above)." >&2
+  exit 2
+fi
+
 # 兩條 context pipeline 的分工:CodeTrail-internal 呼叫 (agent loop / RAG / embedding /
 # reranker) 的 per-call ctx 上限 = AICODE_DYNAMIC_NUM_CTX_MAX,上面已自動設成 server
 # 真實 n_ctx。OpenCode TUI 則是直接打同一台 llama-server 的 /v1/chat/completions,它的

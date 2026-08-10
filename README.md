@@ -543,6 +543,8 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 
 `aicode` 啟動時會把**既有** `mcp.codetrail` entry 中缺漏、型別錯誤或小於 660000 的 `timeout` 自動同步為專案常數,保留其餘 OpenCode JSON 設定,並在同目錄留下 `opencode.json.codetrail.bak`(若已存在則加數字後綴)。寫入採原子替換;設定檔格式錯誤或無法寫入時會 fail-loud,不會帶著已知錯誤啟動 OpenCode。只有緊急測試才用 `AICODE_MCP_TIMEOUT_CHECK_SKIP=1 aicode` 跳過。
 
+`aicode`（含 `aicode web`，不含只連既有 backend 的 `attach`）還會自動跑兩層工具健檢。第一層每次都直接對實際 MCP command 做 `initialize → tools/list → list_dir`，並要求工具集合精確等於文件列出的 17 個；第二層用 fresh `opencode run --format json` 要 active model 真正呼叫 `codetrail_list_dir`，只有 `tool_use.state.status=completed` 的結構化 event 才算 PASS，模型輸出的 XML／成功宣稱一律不算。模型層 PASS 依 OpenCode config、模型、server `/props`（含 chat template／取樣預設）、專案規則與版本指紋快取 24 小時；設定變更會自動失效。快取只有 hash／時間，不含 prompt、檔名或 tool output，臨時 canary session 也會在檢查後刪除。完整輸出與 override 見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。
+
 說明:
 
 - `llamacpp` 是 provider key,可改名(`local`、`llmcpp`、隨意),但要跟 `"model"` 那段的 prefix 對齊。
@@ -550,7 +552,7 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 - `apiKey` 任意非空值即可,llama-server 預設不檢查。
 - **工具呼叫很多的 Build agent 建議設 `agent.build.temperature: 0`**。這是 [OpenCode 官方 agent 設定](https://opencode.ai/docs/agents/)支援的 override,可降低本機模型把工具呼叫格式「說成文字」或隨機改寫格式的機率;它不會替你連上 MCP,也只影響 Build agent。改完先用 `opencode debug agent build` 確認解析結果含 `"temperature": 0`,再完全退出並重開 OpenCode、開新 session 測試。
 - **解析到設定不等於每個版本都一定把它送進 request body**。OpenCode 的 custom `@ai-sdk/openai-compatible` provider 有已知的 `temperature` 傳遞問題([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));因此需要所有 client 都有一致的 server 預設時,仍應在 deployment profile 的 `services.main.parameters` 設 `temperature`。`top_p` / `top_k` / `min_p` 等 provider schema 不一定支援的參數也放 server 端。完整判讀與假工具呼叫排查見 [docs/troubleshooting.md](docs/troubleshooting.md#mcp-connected-but-no-tool-call);特定 5090/Qwen reference 值見 [docs/verified-reference-5090.md](docs/verified-reference-5090.md),不要套到未知模型。
-- **Connected 卻回答「沒有 CodeTrail」時,再加全域工具存在性規則**。`~/.config/opencode/AGENTS.md` 可明訂 17 個 `codetrail_*`、禁止假 XML / 假成功,並要求不確定時先做無副作用的 `codetrail_list_dir` 驗證;可複製範本見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。`ingest_document` 只寫 KB,不會把整份文件永久塞進每個新 session,所以不要把「匯入後剛好亂答」直接判成 RAG context overflow。
+- **Connected 卻回答「沒有 CodeTrail」時,保留全域工具存在性規則作為模型約束**。新版 `aicode` 的自動 canary 會在進 TUI 前抓出 MCP 斷線、工具清單漂移與假 XML，但模型仍可能在後續某一輪隨機失手；`~/.config/opencode/AGENTS.md` 可明訂 17 個 `codetrail_*`、禁止假 XML / 假成功,並要求不確定時先做無副作用的 `codetrail_list_dir` 驗證。可複製範本與強制重測方式見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。`ingest_document` 只寫 KB,不會把整份文件永久塞進每個新 session,所以不要把「匯入後剛好亂答」直接判成 RAG context overflow。
 - **要壓「模型杜撰不存在的具體事實」(條號 / 日期 / 數字),在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則**(OpenCode 會自動把它載入每一段對話,含純聊天)。範例與原理見 [docs/troubleshooting.md](docs/troubleshooting.md)。注意這個 `~/.config/opencode/AGENTS.md` 是 OpenCode runtime 的全域規則檔,跟本 repo 根目錄那份「給修改 CodeTrail 原始碼的 agent 看的」`AGENTS.md` 是兩回事。
 - `limit.context: 65536` 是 OpenCode 主對話實際塞給 server 的上限。它必須等於 llama-server 啟動時的 `-c <N>`(server 是 ctx 上限的唯一真值);CodeTrail 端的 ctx 上限會自動跟隨 server,所以你只要顧好「`limit.context` == server `-c`」這一個對齊就好(`set_config.sh` 產生時已對齊)。`aicode` 啟動時會檢查,不一致就拒絕啟動。
 - `permission` 區段:`*: deny` 是預設拒絕一切,只白名單 `codetrail_*`(經 CodeTrail 沙箱)。OpenCode 內建工具(`bash` / `read` / `write` 等)會繞過 CodeTrail 沙箱,所以這裡明確 `deny`。

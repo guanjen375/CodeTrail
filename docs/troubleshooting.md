@@ -139,11 +139,33 @@ nvidia-smi -l 1                                              # GPU 是否在動
 | 工具註冊 | client 收到 CodeTrail 的工具 schema | OpenCode 的 tools / MCP 檢視;完整名稱見 [MCP 工具清單](mcp-tools.md) |
 | 本輪實際執行 | 模型真的發出結構化 tool call,client 執行後把結果送回模型 | TUI 工具卡,或 JSON event 的 `type: "tool_use"`、`state.status: "completed"` |
 
+新版 `aicode` 已把這兩個容易漏做的檢查接到啟動流程，不需要每次先叫模型背 17 個名字：
+
+- `MCP PASS — 17 tools + list_dir round-trip`：每次啟動都另起實際設定的 MCP command，完成 `initialize`、精確比對 17 個 schema，再真的執行無副作用的 `list_dir(path=".", depth=1)`。這一層完全不問 LLM。
+- `MODEL PASS — structured codetrail_list_dir completed`：用 fresh headless session 跑 active model，只接受 JSON stream 裡 completed 的結構化 `tool_use`。純文字／XML 和模型自行宣稱成功都不會通過。
+- `MODEL PASS — cached ...`：相同專案、模型、OpenCode 設定、全域／專案 AGENTS、server `/props`（含 chat template 與取樣預設）曾在 24 小時內通過；MCP 第一層仍是本次 live 檢查。指紋任一部分改變會自動重測。
+- `MODEL FLAKY`：第一次失敗、retry 才成功。本次可進入，但不寫 PASS cache，所以下次 `aicode` 仍會再驗。連續兩次失敗預設拒絕進 TUI。
+
+模型 canary 會刪除自己建立的臨時 OpenCode session；本身的 cache 只存 hash、PASS 時間與版本，不存 prompt、模型輸出、目錄內容或專案路徑。這是啟動抽查，不是「往後每個生成 token 都保證正確」；如果 TUI 裡稍後又碰到偶發失手，可直接退出後強制重測：
+
+```bash
+AICODE_TOOL_CANARY_FORCE=1 aicode
+```
+
+只在排查／救援時才用 override。`WARN_ONLY` 仍執行檢查並顯示失敗，但允許進 TUI；`SKIP` 連兩層都不執行：
+
+```bash
+AICODE_TOOL_CANARY_WARN_ONLY=1 aicode
+AICODE_TOOL_CANARY_SKIP=1 aicode
+```
+
+預設 cache TTL 是 86400 秒；需要更頻繁抽查可設 `AICODE_TOOL_CANARY_TTL_SECONDS=<SECONDS>`（設 `0` 等同每次 live model canary）。第一層或第二層 FAIL 時，訊息會刻意區分「MCP/config/17-tool contract」和「MCP 已通但 model/provider/chat-template 沒產生 tool call」，避免再把兩者混為一談。
+
 **「剛 ingest 文件就失憶」不等於整份 RAG 塞爆 context。** `ingest_document` 把全文切 chunk 後寫進 `knowledge.json`,它送回目前對話的只有有長度上限的執行摘要;`reload_knowledge_base` 只更新 MCP process 內的 KB singleton。只有之後呼叫 `query_knowledge` 時,召回的少量 REF 才會以 tool result 進入那個 session。新 session 不會因為 KB 裡文件變多就自動攜帶全文。同一個舊 session 累積很多 tool result 時仍可能變長,但要看實際 token / compaction,不能只看 ingest 發生過就下結論。
 
 這次實際失敗案例是全新 session:`step_finish.tokens.total=9001`、模型上限 131072,且沒有 compaction;其中 `input=522`、`cache.read=8355`,因此 RAG overflow 可直接排除。`--format json` 的 `step_finish` event 可用來看重現請求的 tokens;本例的 cache read 是可重用的 system / tool schema prefix,而 `cache.read` 數值本身也不能當成「整份 KB 已注入」的證據。
 
-用一個全新 session 做最小重現,不要沿用已經多次回答「工具不存在」的舊對話(舊上下文本身可能讓模型繼續模仿錯誤答案):
+若要繞過 wrapper 做更底層的手動重現,用一個全新 session,不要沿用已經多次回答「工具不存在」的舊對話(舊上下文本身可能讓模型繼續模仿錯誤答案):
 
 ```bash
 opencode mcp list

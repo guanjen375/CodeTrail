@@ -90,6 +90,9 @@ def _run_aicode_with_stub(
             "PYTHONIOENCODING": "utf-8",
             "AICODE_CTX_SAFETY_DISABLE": "1",
             "AICODE_REQUIRED_MODELS_CHECK_SKIP": "1",
+            # CLI forwarding tests are offline.  The canary has dedicated
+            # mocked tests and must never contact a real model from pytest.
+            "AICODE_TOOL_CANARY_SKIP": "1",
         }
     )
     if env_extra:
@@ -144,6 +147,7 @@ def test_aicode_prepares_opencode_mcp_wrapper(tmp_path):
         # 生成,不該被安全閘擋下。
         "AICODE_CTX_SAFETY_DISABLE": "1",
         "AICODE_REQUIRED_MODELS_CHECK_SKIP": "1",
+        "AICODE_TOOL_CANARY_SKIP": "1",
         # CodeTrail 不再內建預設主模型, 啟動時要先解析。給個假值讓 resolve_main_model
         # 通過; 真正的主模型解析邏輯有自己的單元測試覆蓋。
         "AICODE_MODEL": "example-code-model:30b",
@@ -159,6 +163,7 @@ def test_aicode_prepares_opencode_mcp_wrapper(tmp_path):
     )
 
     assert r.returncode == 0, f"exit={r.returncode}\nstdout={r.stdout}\nstderr={r.stderr}"
+    assert "[tool-health] SKIP" in r.stdout
     wrapper = project / ".opencode" / "run-codetrail-mcp"
     assert wrapper.is_file()
     assert os.access(wrapper, os.X_OK)
@@ -767,6 +772,7 @@ def _run_aicode_subcmd_with_stub(
             "PYTHONIOENCODING": "utf-8",
             "AICODE_CTX_SAFETY_DISABLE": "1",
             "AICODE_REQUIRED_MODELS_CHECK_SKIP": "1",
+            "AICODE_TOOL_CANARY_SKIP": "1",
         }
     )
     if set_model:

@@ -21,7 +21,7 @@ cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-進入 TUI 後就可以開始下一節操作。需要讀專案外附件時看「夾帶附件」；若工具看起來沒接上，再用 `/status` 檢查是否有 `codetrail Connected`。注意 Connected 只證明 MCP transport 已初始化,不證明模型這一輪真的呼叫工具;如果 `/status` 沒連上,或模型只印出假 XML 卻宣稱工具成功,照 [常見問題的分層診斷](troubleshooting.md#mcp-connected-but-no-tool-call)處理。
+進入 TUI 前應先看到兩行健康狀態：`MCP PASS — 17 tools + list_dir round-trip`，以及 live 或 cached 的 `MODEL PASS`。前者每次都實跑；後者只有首次、24 小時到期或模型／設定／chat template／專案規則改變時才重新要求模型做一次真實結構化工具呼叫，所以平常不用先手動問 17 個工具。需要讀專案外附件時看「夾帶附件」；若 TUI 內後續某一輪仍異常，再用 `/status` 與 [常見問題的分層診斷](troubleshooting.md#mcp-connected-but-no-tool-call)交叉檢查。Connected 只證明 MCP transport 已初始化，模型在單一對話輪次仍可能失手。
 
 ---
 
