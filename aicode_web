@@ -26,6 +26,8 @@
 #
 # 安全前置(拒 $HOME / /、能力偵測、hostname / 密碼硬規則)仍由 aicode web 本身
 # 執行;這裡只負責背景 tmux 包裝、Tailscale bind 鎖定與 health 等待。
+# 啟動前會先在「前景」跑一次 aicode 同款 preflight(AICODE_PREFLIGHT_ONLY=1),
+# 設定/模型/server 有問題時立即 fail-loud,不會進背景才發現。
 
 set -euo pipefail
 
@@ -462,6 +464,24 @@ if (( ! REUSE_SESSION )); then
             echo "$conflicting_listener" >&2
             echo "       先停掉它,或用 AICODE_WEB_PORT 換 port。" >&2
             exit 1
+        fi
+    fi
+
+    # 前景先跑一次 aicode 同款 preflight(profile、主模型、n_ctx 安全閘、OpenCode
+    # 設定同步、附屬 server、tool canary、web 能力偵測與 bind 安全規則)。失敗就地
+    # 擋下、不建 tmux —— 不必再等背景 pane 死掉才從 capture 撈原因;通過後背景
+    # pane 重跑同組檢查只是冪等快速通過(canary 命中指紋快取)。
+    # AICODE_WEB_SKIP_PREFLIGHT=1 可跳過前景這輪(背景 pane 的完整檢查照舊)。
+    if [[ "${AICODE_WEB_SKIP_PREFLIGHT:-0}" != "1" ]]; then
+        if [[ -f "$VENV_ACTIVATE" ]]; then
+            # 與背景 pane 相同的 python 環境
+            # shellcheck source=/dev/null
+            source "$VENV_ACTIVATE"
+        fi
+        echo "[aicode_web] 前景 preflight(與 aicode 相同檢查;首次 tool canary 可能需數分鐘)…"
+        if ! AICODE_PREFLIGHT_ONLY=1 AICODE_ROOT="$PROJECT" "$AICODE" web "${WEB_FORWARD[@]}"; then
+            echo "[aicode_web] preflight 未通過(見上方訊息);不啟動背景 backend。" >&2
+            exit 2
         fi
     fi
 

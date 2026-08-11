@@ -93,6 +93,9 @@ def _headless_runtime_env(tmp_path: Path):
             "FAKE_TMUX_STATE": str(state),
             "FAKE_TMUX_CALLS": str(calls),
             "FAKE_TMUX_PROJECT": str(tmp_path),
+            # 這組測試只驗 tmux 包裝行為;前景 preflight 需要完整 aicode 環境,
+            # 由 test_cli.py 的 AICODE_PREFLIGHT_ONLY 測試與下方 blocks 測試涵蓋。
+            "AICODE_WEB_SKIP_PREFLIGHT": "1",
         }
     )
     return env, state, calls
@@ -262,6 +265,34 @@ def test_aicode_web_headless_start_is_idempotent_and_stop_uses_session_metadata(
     assert stopped.returncode == 0, stopped.stderr
     assert not state.exists()
     assert "100.100.10.20:4096 已釋放" in stopped.stdout
+
+
+def test_foreground_preflight_failure_blocks_backend_start(tmp_path):
+    """前景 preflight 失敗必須就地擋下:不建 tmux session、印出指引。"""
+    env, state, calls = _headless_runtime_env(tmp_path)
+    env.pop("AICODE_WEB_SKIP_PREFLIGHT")
+    bin_dir = tmp_path / "bin"
+    opencode = bin_dir / "opencode"
+    opencode.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    opencode.chmod(0o700)
+    home = tmp_path / "home"
+    home.mkdir()
+    env.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            # 指到外部 provider → resolve_main_model 必定 fail-loud(不吃宿主機設定)
+            "AICODE_MODEL": "openai/gpt-4",
+        }
+    )
+
+    proc = _run(WEB_ENTRY, [], cwd=tmp_path, env_extra=env, timeout=60)
+
+    assert proc.returncode != 0
+    assert "preflight 未通過" in proc.stderr
+    assert not state.exists()
+    if calls.exists():
+        assert "new-session" not in calls.read_text(encoding="utf-8")
 
 
 def test_rejects_invalid_port(tmp_path):

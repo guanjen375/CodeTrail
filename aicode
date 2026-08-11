@@ -445,6 +445,15 @@ if [ "${SUBCMD:-}" = "web" ]; then
     fi
   fi
 
+  if [ "${AICODE_PREFLIGHT_ONLY:-0}" = "1" ]; then
+    # aicode_web 的前景預檢模式:全部前置(profile、主模型、n_ctx 閘、OpenCode
+    # 同步、附屬 server、tool canary、web 能力偵測與 bind 安全規則)已通過,
+    # 到此為止、不啟動 OpenCode;背景 pane 會用同一組檢查再走一次(冪等,
+    # canary 命中指紋快取)。
+    echo "[aicode] preflight-only:檢查全部通過(未啟動 OpenCode)。"
+    exit 0
+  fi
+
   echo "[aicode] web backend → http://$WEB_HOSTNAME:$WEB_PORT"
   echo "[aicode] 🧪 web 模式為實驗功能(開發中);要穩定請用 standalone TUI(直接 aicode)。"
   if [ "$WEB_TAILSCALE_VERIFIED" -eq 1 ]; then
@@ -514,6 +523,11 @@ if [ "$USER_PASSED_MODEL" -eq 1 ]; then
 else
   echo "[aicode] 沒有 -m;OpenCode 將自己讀 opencode.json 的 \"model\" 欄位。"
   echo "         若你要明確指定 provider,請用 -m <provider>/<model> 或在 opencode.json 設好。"
+fi
+
+if [ "${AICODE_PREFLIGHT_ONLY:-0}" = "1" ]; then
+  echo "[aicode] preflight-only:檢查全部通過(未啟動 OpenCode)。"
+  exit 0
 fi
 
 exec opencode "${OPENCODE_ARGS[@]}"

@@ -610,6 +610,28 @@ def test_aicode_web_verified_tailscale_ip_without_password_allowed(tmp_path):
     assert "已驗證並只綁本機 Tailscale IPv4" in result.stdout
 
 
+def test_aicode_web_preflight_only_passes_checks_without_exec(tmp_path):
+    """AICODE_PREFLIGHT_ONLY=1(aicode_web 前景預檢用):跑完全部前置後退出,不 exec OpenCode。"""
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path, ["web"], env_extra={"AICODE_PREFLIGHT_ONLY": "1"}
+    )
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstderr={result.stderr}"
+    assert "preflight-only" in result.stdout
+    # 只有 web 能力偵測(web --help)會碰 stub;真正的 exec 不能發生
+    assert not args_file.exists()
+
+
+def test_aicode_preflight_only_tui_path_also_exits_before_exec(tmp_path):
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path, [], env_extra={"AICODE_PREFLIGHT_ONLY": "1"}
+    )
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstderr={result.stderr}"
+    assert "preflight-only" in result.stdout
+    assert not args_file.exists()
+
+
 def test_aicode_web_tailscale_env_cannot_spoof_current_ip(tmp_path):
     result, args_file = _run_aicode_subcmd_with_stub(
         tmp_path,

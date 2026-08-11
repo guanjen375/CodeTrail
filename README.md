@@ -638,7 +638,7 @@ cd <PROJECT_TO_ANALYZE>
 aicode_web
 ```
 
-`aicode_web` 會自動讀取 A 機當下的 Tailscale IPv4、只把 backend 綁到該位址,在背景 tmux 完成 preflight，最後印出例如 `http://100.x.y.z:4096/`。A 機沒有瀏覽器完全沒關係；B 機只要把這個網址貼進瀏覽器。重跑同一個命令會沿用同專案的 backend；停止用:
+`aicode_web` 會自動讀取 A 機當下的 Tailscale IPv4、只把 backend 綁到該位址,先在**前景**跑一輪與 `aicode` 完全相同的 preflight(設定、主模型、server、工具健檢;有問題當場擋下,不用等背景),通過後在背景 tmux 啟動 backend,最後印出例如 `http://100.x.y.z:4096/`。A 機沒有瀏覽器完全沒關係；B 機只要把這個網址貼進瀏覽器。重跑同一個命令會沿用同專案的 backend；停止用:
 
 ```bash
 aicode_web stop
