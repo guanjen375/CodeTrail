@@ -1,8 +1,7 @@
 # 替代安裝、進階配置與維運
 
 [README Quick Start](../README.md) 的 `./set_config.sh` + `~/start.sh` 已涵蓋主流程
-(手動 profile 流程見 README §4);RTX 5090 實測另見
-[verified-reference-5090.md](verified-reference-5090.md)。這份文件只補充:
+(手動 profile 流程見 README §4)。這份文件只補充:
 
 - README 沒涵蓋的安裝替代路徑(其他 distro、runfile installer、conda env)
 - tmux 以外的 process manager(systemd / screen / nohup + disown)

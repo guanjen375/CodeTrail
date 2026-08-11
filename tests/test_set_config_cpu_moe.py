@@ -368,23 +368,23 @@ def test_flat_dir_with_mmproj_does_not_mark_every_main_as_vl(tmp_path):
     assert tidy_candidates["vl"][0].mmproj is not None
 
 
-def test_scan_prefers_verified_235b_over_larger_main_candidate(tmp_path):
-    """hint 只決定清單排序(維護者驗證的排前面);選哪顆仍由使用者輸入。"""
+def test_scan_orders_main_candidates_by_size_without_model_specific_hint(tmp_path):
+    """主模型沒有維護者偏好;候選維持通用的容量降冪排序。"""
     models = tmp_path / "models"
-    verified_dir = models / "Qwen3-235B-A22B-Thinking-2507-GGUF"
-    larger_dir = models / "GLM-5.2-GGUF"
-    verified_dir.mkdir(parents=True)
+    smaller_dir = models / "smaller-chat"
+    larger_dir = models / "larger-chat"
+    smaller_dir.mkdir(parents=True)
     larger_dir.mkdir(parents=True)
-    verified = verified_dir / "Qwen3-235B-A22B-Thinking-2507-UD-Q4_K_XL.gguf"
-    larger = larger_dir / "GLM-5.2-UD-Q4_K_XL.gguf"
-    verified.write_bytes(b"verified")
+    smaller = smaller_dir / "smaller-chat-q4.gguf"
+    larger = larger_dir / "larger-chat-q4.gguf"
+    smaller.write_bytes(b"small")
     larger.write_bytes(b"larger candidate")
 
     candidates, broken = sc.scan_models(models)
 
     assert not broken
-    assert candidates["main"][0].path == verified
-    assert candidates["main"][1].path == larger
+    assert candidates["main"][0].path == larger
+    assert candidates["main"][1].path == smaller
 
 
 def test_profile_emits_cpu_moe_only_for_main_and_rejects_partial_mix(tmp_path):

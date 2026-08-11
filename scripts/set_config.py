@@ -82,15 +82,13 @@ _EMBED_TOKENS = (
     "jina-embed",
     "snowflake-arctic-embed",
 )
-# 排序提示:維護者驗證過的檔案排在候選清單前面(只影響列出順序;
-# 沒有預設值,選哪個仍由使用者輸入編號決定)。附屬模型的提示也用來標記
-# 「維護者驗證過」(選了其他檔會提示未驗證)。
-_VERIFIED_HINTS = {
+# 附屬模型排序提示:維護者驗證過的檔案排在候選清單前面(只影響列出順序;
+# 沒有預設值,選哪個仍由使用者輸入編號決定),也用來標記「維護者驗證過」
+# (選了其他檔會提示未驗證)。主模型刻意沒有特定模型偏好,只按大小排序。
+_AUX_MODEL_HINTS = {
     "embedding": ("bge-m3",),
     "reranker": ("bge-reranker-v2-m3", "qwen3-reranker"),
     "vl": ("qwen3.5-9b", "qwen3-vl"),
-    # docs/verified-reference-5090.md 的實測主模型。
-    "main": ("qwen3-235b-a22b-thinking-2507",),
 }
 
 # 這些 env 會蓋過設定檔;驗證/預覽時剔除,產生的 ~/start.sh 也會先 unset,
@@ -775,7 +773,7 @@ def scan_models(
             )
 
     for role, entries in candidates.items():
-        hints = _VERIFIED_HINTS[role]
+        hints = _AUX_MODEL_HINTS.get(role, ())
 
         def sort_key(cand: ModelCandidate) -> tuple:
             path_text = str(cand.path).lower()
@@ -830,7 +828,7 @@ def precheck(gpus: list[Gpu], candidates: dict[str, list[ModelCandidate]],
     if len(gpus) < 2:
         warnings.append(
             "只偵測到 1 顆 GPU:主模型與三顆附屬模型將共用同一顆卡(可以跑,"
-            "但雙卡分工更穩;RTX 5090 單卡實測見 docs/verified-reference-5090.md)。"
+            "但雙卡分工更穩;啟動後請用 nvidia-smi 監控 VRAM 餘量)。"
         )
     return warnings
 
@@ -1188,7 +1186,7 @@ def sanitize_registry_key(path: Path) -> str:
 
 def _warn_unverified_aux(plan: Plan) -> None:
     for selection in (plan.embedding, plan.reranker, plan.vl):
-        hints = _VERIFIED_HINTS[selection.role]
+        hints = _AUX_MODEL_HINTS[selection.role]
         if hints and not any(h in str(selection.candidate.path).lower() for h in hints):
             plan.notes.append(
                 f"⚠ {selection.role} 選了未經維護者驗證的模型 {selection.candidate.path.name}:"

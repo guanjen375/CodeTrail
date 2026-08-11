@@ -215,7 +215,8 @@ python3 -c "from importlib.metadata import version; print('hf-xet', version('hf-
 
 ### 2.2 下載主聊天模型(`<CODE_MODEL>`)
 
-CodeTrail 刻意不指定主模型。請依工作負載與硬體選 GGUF;多 shard 模型下載完整目錄即可,`set_config.sh` 會自動抓 shard 1 當入口、llama.cpp 會接續讀取其餘分片。RTX 5090 reference 的特定模型、量化與下載資訊見 [docs/verified-reference-5090.md](docs/verified-reference-5090.md)。
+CodeTrail 刻意不指定主模型。請依工作負載與硬體選 GGUF;多 shard 模型下載完整目錄即可,
+`set_config.sh` 會自動抓 shard 1 當入口、llama.cpp 會接續讀取其餘分片。
 
 ### 2.3 下載 RAG 附屬模型
 
@@ -363,8 +364,6 @@ tmux ls
 ```
 
 偵錯時要看 server log(平常不用):`tmux a -t codetrail-main` 或 `tmux a -t codetrail-rag`(rag 內按 `Ctrl-b n` 切 embed/rerank/vl window,看完 `Ctrl-b d` 退出)。
-
-RTX 5090 reference 的 VRAM/RAM、prompt processing、decode 與 concurrency 實測數字統一放在 [docs/verified-reference-5090.md](docs/verified-reference-5090.md)。
 
 ---
 
@@ -539,7 +538,7 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 - `enabled_providers` 鎖定只啟用本機 provider:設了之後 OpenCode 的 model picker(TUI 與 web)**只會出現你的本機模型**,雲端 provider(OpenCode Zen、Anthropic、OpenAI 等)完全不列出、無法誤選 —— **NDA 場景強烈建議保留**,避免把程式碼送到雲端模型。陣列內字串要跟你的 provider key 一致(這裡是 `llamacpp`)。
 - `apiKey` 任意非空值即可,llama-server 預設不檢查。
 - **工具呼叫很多的 Build agent 建議設 `agent.build.temperature: 0`**。這是 [OpenCode 官方 agent 設定](https://opencode.ai/docs/agents/)支援的 override,可降低本機模型把工具呼叫格式「說成文字」或隨機改寫格式的機率;它不會替你連上 MCP,也只影響 Build agent。改完先用 `opencode debug agent build` 確認解析結果含 `"temperature": 0`,再完全退出並重開 OpenCode、開新 session 測試。
-- **解析到設定不等於每個版本都一定把它送進 request body**。OpenCode 的 custom `@ai-sdk/openai-compatible` provider 有已知的 `temperature` 傳遞問題([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));因此需要所有 client 都有一致的 server 預設時,仍應在 deployment profile 的 `services.main.parameters` 設 `temperature`。`top_p` / `top_k` / `min_p` 等 provider schema 不一定支援的參數也放 server 端。完整判讀與假工具呼叫排查見 [docs/troubleshooting.md](docs/troubleshooting.md#mcp-connected-but-no-tool-call);特定 5090/Qwen reference 值見 [docs/verified-reference-5090.md](docs/verified-reference-5090.md),不要套到未知模型。
+- **解析到設定不等於每個版本都一定把它送進 request body**。OpenCode 的 custom `@ai-sdk/openai-compatible` provider 有已知的 `temperature` 傳遞問題([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));因此需要所有 client 都有一致的 server 預設時,仍應在 deployment profile 的 `services.main.parameters` 設 `temperature`。`top_p` / `top_k` / `min_p` 等 provider schema 不一定支援的參數也放 server 端。完整判讀與假工具呼叫排查見 [docs/troubleshooting.md](docs/troubleshooting.md#mcp-connected-but-no-tool-call);取樣值必須依目前主模型的文件設定,不要沿用其他模型的數值。
 - **Connected 卻回答「沒有 CodeTrail」時,保留全域工具存在性規則作為模型約束**。新版 `aicode` 的自動 canary 會在進 TUI 前抓出 MCP 斷線、工具清單漂移與假 XML，但模型仍可能在後續某一輪隨機失手；`~/.config/opencode/AGENTS.md` 可明訂 17 個 `codetrail_*`、禁止假 XML / 假成功,並要求不確定時先做無副作用的 `codetrail_list_dir` 驗證。完整可複製範本(含 RAG 自發查詢、防杜撰與驗證紀律)見 [docs/opencode-agents-template.md](docs/opencode-agents-template.md);強制重測方式見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。`ingest_document` 只寫 KB,不會把整份文件永久塞進每個新 session,所以不要把「匯入後剛好亂答」直接判成 RAG context overflow。
 - **要壓「模型杜撰不存在的具體事實」(條號 / 日期 / 數字),在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則**(OpenCode 會自動把它載入每一段對話,含純聊天)。範例與原理見 [docs/troubleshooting.md](docs/troubleshooting.md);[全域範本](docs/opencode-agents-template.md)已內建「事實準確性」段。注意這個 `~/.config/opencode/AGENTS.md` 是 OpenCode runtime 的全域規則檔,跟本 repo 根目錄那份「給修改 CodeTrail 原始碼的 agent 看的」`AGENTS.md` 是兩回事。
 - `limit.context: 65536` 是 OpenCode 對主 n_ctx 的 client-side 鏡像。正常不要分開調：用 `set_config.sh` 設一次主 n_ctx 並重啟 server；`aicode` 會觀測 server `-c` 的實值並自動同步此欄。
@@ -659,7 +658,6 @@ ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>
 |---|---|
 | [docs/setup.md](docs/setup.md) | 替代安裝方式、進階配置、換機部署 reference |
 | [docs/deployment-profiles.md](docs/deployment-profiles.md) | profile schema、precedence、GPU override 與 local override |
-| [docs/verified-reference-5090.md](docs/verified-reference-5090.md) | RTX 5090＋170GB RAM 已驗證 tuning / benchmark |
 | [docs/basic-usage.md](docs/basic-usage.md) | TUI 內常用操作:正常對話、夾帶附件、RAG 注入、最小驗收流程 |
 | [docs/rag.md](docs/rag.md) | 讀檔、匯入附件(PDF / 圖片經 VL)、建立知識庫、圖片+RAG 一起用、Code-RAG、查 spec |
 | [docs/mcp-tools.md](docs/mcp-tools.md) | CodeTrail 暴露的 17 個 MCP 工具與使用原則 |
