@@ -139,9 +139,9 @@ nvidia-smi -l 1                                              # GPU 是否在動
 | 工具註冊 | client 收到 CodeTrail 的工具 schema | OpenCode 的 tools / MCP 檢視;完整名稱見 [MCP 工具清單](mcp-tools.md) |
 | 本輪實際執行 | 模型真的發出結構化 tool call,client 執行後把結果送回模型 | TUI 工具卡,或 JSON event 的 `type: "tool_use"`、`state.status: "completed"` |
 
-新版 `aicode` 已把這兩個容易漏做的檢查接到啟動流程，不需要每次先叫模型背 17 個名字：
+新版 `aicode` 已把這兩個容易漏做的檢查接到啟動流程，不需要每次先叫模型背 18 個名字：
 
-- `MCP PASS — 17 tools + list_dir round-trip`：每次啟動都另起實際設定的 MCP command，完成 `initialize`、精確比對 17 個 schema，再真的執行無副作用的 `list_dir(path=".", depth=1)`。這一層完全不問 LLM。
+- `MCP PASS — 18 tools + list_dir round-trip`：每次啟動都另起實際設定的 MCP command，完成 `initialize`、精確比對 18 個 schema，再真的執行無副作用的 `list_dir(path=".", depth=1)`。這一層完全不問 LLM。
 - `MODEL PASS — structured codetrail_list_dir completed`：用 fresh headless session 跑 active model，只接受 JSON stream 裡 completed 的結構化 `tool_use`。純文字／XML 和模型自行宣稱成功都不會通過。
 - `MODEL live canary — <原因>`：第二層 cache 未命中（新專案、設定變動、快取過期或 `--force`）時，實跑前會先印出原因與單次上限秒數，執行中每 15 秒回報一次「仍在執行」。本地推理通常需要數十秒到數分鐘——看得到心跳就不是當機，完全靜默才是異常。
 - `MODEL PASS — cached ...`：相同專案、模型、OpenCode 設定、全域／專案 AGENTS、server `/props`（含 chat template 與取樣預設）曾在 24 小時內通過；MCP 第一層仍是本次 live 檢查。指紋任一部分改變會自動重測。
@@ -160,7 +160,7 @@ AICODE_TOOL_CANARY_WARN_ONLY=1 aicode
 AICODE_TOOL_CANARY_SKIP=1 aicode
 ```
 
-預設 cache TTL 是 86400 秒；需要更頻繁抽查可設 `AICODE_TOOL_CANARY_TTL_SECONDS=<SECONDS>`（設 `0` 等同每次 live model canary）。第一層或第二層 FAIL 時，訊息會刻意區分「MCP/config/17-tool contract」和「MCP 已通但 model/provider/chat-template 沒產生 tool call」，避免再把兩者混為一談。
+預設 cache TTL 是 86400 秒；需要更頻繁抽查可設 `AICODE_TOOL_CANARY_TTL_SECONDS=<SECONDS>`（設 `0` 等同每次 live model canary）。第一層或第二層 FAIL 時，訊息會刻意區分「MCP/config/18-tool contract」和「MCP 已通但 model/provider/chat-template 沒產生 tool call」，避免再把兩者混為一談。
 
 **「剛 ingest 文件就失憶」不等於整份 RAG 塞爆 context。** `ingest_document` 把全文切 chunk 後寫進 `knowledge.json`,它送回目前對話的只有有長度上限的執行摘要;`reload_knowledge_base` 只更新 MCP process 內的 KB singleton。只有之後呼叫 `query_knowledge` 時,召回的少量 REF 才會以 tool result 進入那個 session。新 session 不會因為 KB 裡文件變多就自動攜帶全文。同一個舊 session 累積很多 tool result 時仍可能變長,但要看實際 token / compaction,不能只看 ingest 發生過就下結論。
 

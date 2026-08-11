@@ -63,6 +63,7 @@ EXPECTED_MCP_TOOLS = frozenset(
         "query_knowledge",
         "query_knowledge_strict",
         "read_file",
+        "record_lesson",
         "reload_knowledge_base",
         "remove_document",
         "run_command",
@@ -441,6 +442,9 @@ def build_fingerprint(
         "canary": _file_digest(Path(__file__)),
         "mcp_server": _file_digest(REPO_ROOT / "mcp_server.py"),
         "project_agents": _file_digest(root / "AGENTS.md"),
+        # lessons 注入檔也是模型看到的「專案規則」:內容變了要讓 model canary
+        # 快取失效(aicode 會在 canary 之前先 render 好這個檔)。
+        "project_lessons": _file_digest(root / ".codetrail" / "lessons.md"),
         "project_opencode_json": _file_digest(root / ".opencode" / "opencode.json"),
         "project_opencode_jsonc": _file_digest(root / ".opencode" / "opencode.jsonc"),
     }

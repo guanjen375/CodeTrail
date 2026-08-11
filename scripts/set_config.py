@@ -1382,6 +1382,7 @@ _OPENCODE_PERMISSION_TEMPLATE = {
     "codetrail_run_lint": "ask",
     "codetrail_run_command": "ask",
     "codetrail_remove_document": "ask",
+    "codetrail_record_lesson": "ask",
     "codetrail_import_external_file": "allow",
     "webfetch": "deny",
     "websearch": "deny",
@@ -1400,6 +1401,11 @@ _OPENCODE_PERMISSION_TEMPLATE = {
 
 
 DEFAULT_MAIN_BASE_URL = "http://localhost:8080"
+
+# lessons(行為教訓)注入:aicode 每次啟動把 active lessons render 成專案內的
+# 這個檔案,OpenCode 以 instructions 相對路徑(相對專案 root)載入。檔案不存在
+# 時 OpenCode 視同 glob 無匹配、直接略過,所以對沒跑過 aicode 的目錄無害。
+_OPENCODE_LESSONS_INSTRUCTION = ".codetrail/lessons.md"
 
 
 def _opencode_template(plan: Plan, python_bin: str,
@@ -1440,6 +1446,7 @@ def _opencode_template(plan: Plan, python_bin: str,
                 "timeout": _opencode_timeout_ms(),
             }
         },
+        "instructions": [_OPENCODE_LESSONS_INSTRUCTION],
         "permission": dict(_OPENCODE_PERMISSION_TEMPLATE),
     }
 
@@ -1540,6 +1547,18 @@ def build_opencode_config(
         merged["mcp"] = mcp
     mcp["codetrail"] = template["mcp"]["codetrail"]
     changes.append("mcp.codetrail 更新為偵測到的 Python 與 mcp_server.py 路徑(其他 MCP server 保留)")
+
+    instructions = merged.get("instructions")
+    if not isinstance(instructions, list):
+        if instructions is not None:
+            changes.append("⚠ 既有 instructions 不是 JSON array → 以範本重建該欄位(原值在備份)")
+        merged["instructions"] = list(template["instructions"])
+        changes.append(f"instructions 加入 '{_OPENCODE_LESSONS_INSTRUCTION}'(lessons 注入)")
+    elif _OPENCODE_LESSONS_INSTRUCTION not in instructions:
+        instructions.append(_OPENCODE_LESSONS_INSTRUCTION)
+        changes.append(
+            f"instructions 補上 '{_OPENCODE_LESSONS_INSTRUCTION}'(lessons 注入;你其他的項目保留)"
+        )
 
     permission = merged.get("permission")
     if not isinstance(permission, dict):

@@ -21,7 +21,7 @@ cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-進入 TUI 前應先看到兩行健康狀態：`MCP PASS — 17 tools + list_dir round-trip`，以及 live 或 cached 的 `MODEL PASS`。前者每次都實跑；後者只有首次、24 小時到期或模型／設定／chat template／專案規則改變時才重新要求模型做一次真實結構化工具呼叫，所以平常不用先手動問 17 個工具。需要讀專案外附件時看「夾帶附件」；若 TUI 內後續某一輪仍異常，再用 `/status` 與 [常見問題的分層診斷](troubleshooting.md#mcp-connected-but-no-tool-call)交叉檢查。Connected 只證明 MCP transport 已初始化，模型在單一對話輪次仍可能失手。
+進入 TUI 前應先看到兩行健康狀態：`MCP PASS — 18 tools + list_dir round-trip`，以及 live 或 cached 的 `MODEL PASS`。前者每次都實跑；後者只有首次、24 小時到期或模型／設定／chat template／專案規則改變時才重新要求模型做一次真實結構化工具呼叫，所以平常不用先手動問 18 個工具。需要讀專案外附件時看「夾帶附件」；若 TUI 內後續某一輪仍異常，再用 `/status` 與 [常見問題的分層診斷](troubleshooting.md#mcp-connected-but-no-tool-call)交叉檢查。Connected 只證明 MCP transport 已初始化，模型在單一對話輪次仍可能失手。
 
 ---
 
@@ -192,6 +192,18 @@ aicode
 ```
 
 `apply_patch(...)` 會真的寫檔，`run_command(...)` 會執行白名單命令。只想分析時要明講「不要改檔」。安全邊界與副作用工具說明見 [安全邊界與工作節奏](security.md)。
+
+---
+
+## 5.5 糾正模型的做事方式(lessons)
+
+同一種糾正不想每個 session 重講一次時,糾正完接一句:
+
+```text
+把這條記成 lesson,之後的 session 都要遵守。
+```
+
+模型會用 `record_lesson(...)` 提案一條祈使句行為規則,**你在核准框看到內容、同意才寫入**;下個 session 起由 `aicode` 自動注入(啟動輸出有 `[lessons] N 條 active lessons 已注入 ...`)。規則 90 天到期會停止注入並在啟動時提示複審。生命週期、上限與 `python lessons.py list / renew / delete` 管理指令見 [docs/lessons.md](lessons.md)。
 
 ---
 

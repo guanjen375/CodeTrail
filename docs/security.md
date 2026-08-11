@@ -21,7 +21,7 @@ OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode
 
 ## 沙箱真正保護什麼
 
-`aicode` 啟動時會把當前目錄設成 `AICODE_ROOT`。CodeTrail 的 17 個 MCP 工具只能在這個根目錄裡讀寫;從 `$HOME` 或 `/` 啟動會直接被拒絕。
+`aicode` 啟動時會把當前目錄設成 `AICODE_ROOT`。CodeTrail 的 18 個 MCP 工具只能在這個根目錄裡讀寫;從 `$HOME` 或 `/` 啟動會直接被拒絕。
 
 受 CodeTrail 沙箱保護的典型工具包含:
 
@@ -81,6 +81,8 @@ aicode
 4. 修改後只跑最小相關測試或 lint。
 
 `run_command(...)` 本身還有命令白名單與 dangerous-pattern 過濾。不要把 `rm` / `sudo` / `curl` / `bash` 加進白名單;真的需要人工操作時,讓模型列出建議命令,由人自己判斷後在 shell 執行。
+
+`record_lesson(...)` 是唯一會寫到 `AICODE_ROOT` 之外的工具,而且只寫一個固定路徑:`~/.config/codetrail/lessons.json`(per-deployment 的行為教訓 store,與 `deployment.json` 同層;不能被模型指到別的路徑)。它被 permission 設成 `ask`:模型只能「提案」,你會在核准框看到完整 rule 內容,核准後才落地。沒有無審核的自動寫入路徑;細節見 [docs/lessons.md](lessons.md)。
 
 ---
 

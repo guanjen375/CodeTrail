@@ -256,6 +256,16 @@ if [ -f "$CODETRAIL_HOME/scripts/opencode_mcp_timeout_check.py" ]; then
   fi
 fi
 
+if [ -f "$CODETRAIL_HOME/scripts/lessons_check.py" ]; then
+  # session start 注入 lessons(行為教訓):把 active lessons render 成
+  # $ROOT/.codetrail/lessons.md(OpenCode 經 opencode.json instructions 載入),
+  # 並提示已過 review_by 的待複審清單。store 損壞 / 超過上限會 fail-loud。
+  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/lessons_check.py" --root "$ROOT"; then
+    echo "[aicode] lessons check refused to start (see [lessons] above)." >&2
+    exit 2
+  fi
+fi
+
 if [ -f "$CODETRAIL_HOME/scripts/required_model_servers_check.py" ]; then
   if ! "$PYBIN" "$CODETRAIL_HOME/scripts/required_model_servers_check.py"; then
     echo "[aicode] required model server preflight refused to start (see [model-preflight] above)." >&2

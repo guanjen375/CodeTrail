@@ -1017,6 +1017,44 @@ def reload_knowledge_base() -> str:
 
 
 @_tool()
+def record_lesson(rule: str, scope: str = "project") -> str:
+    """Propose a durable behavior rule after the USER corrected the agent's behavior.
+
+    觸發條件(唯一):使用者糾正「你做事的方式」——例如「以後 migration 前要先
+    確認 backward compatibility」「不要每次都重跑整套測試」。以下都**不是**
+    觸發條件,不要呼叫:
+      - 工具執行失敗 / exception / lint 錯(那是環境或程式問題)
+      - 答案內容錯誤被指正(客觀知識修正請走 ingest_document 進 KB)
+      - 你自己覺得「這樣做比較好」(沒有使用者糾正就不記)
+    knowledge.json 是客觀知識(RAG),lessons 是主觀行為教訓,兩者嚴格分離。
+
+    這是「提案」:permission 設為 ask,使用者在核准對話框看到 rule 內容、
+    同意後才寫入 per-deployment 的 ~/.config/codetrail/lessons.json。被拒絕
+    就放下,不要換句話重試。寫入後於下一個 session 起注入 context
+    (aicode 啟動時 render 進 .codetrail/lessons.md);本 session 請直接遵守。
+    每條 lesson 有 90 天 review_by,到期停止注入、待使用者複審;active 上限
+    20 條,滿了會拒絕並要求人工整併。
+
+    Args:
+        rule: 可執行的祈使句行為規則(單行、≤200 字元),例如
+              「migration 前先確認 backward compatibility」。
+              禁止事件敘述(「上次 migration 壞了」)或 error log。
+        scope: "project" = 只在本專案注入(預設);
+               "global" = 此部署的所有專案都注入。跨專案皆適用的工作習慣
+               才用 global,專案特定的約定用 project。
+
+    Returns:
+        寫入結果(id / review_by / 生效時點),或「錯誤: ...」說明
+        (rule 格式不合法時;可修正後重試一次)。
+    """
+    import lessons
+
+    # store 損壞 / 超過上限會 raise LessonsError(fail-loud,需人工處理);
+    # rule/scope 格式問題回「錯誤: ...」讓模型修正。
+    return lessons.propose_lesson(AICODE_ROOT, rule, scope=scope)
+
+
+@_tool()
 def run_command(cmd: str) -> str:
     """Run a whitelisted command inside AICODE_ROOT.
 

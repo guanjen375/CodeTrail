@@ -101,7 +101,7 @@ def test_expected_tool_contract_matches_mcp_server():
     source = (canary.REPO_ROOT / "mcp_server.py").read_text(encoding="utf-8")
     registered = set(check_readme_consistency._mcp_tool_names(source))
     assert registered == canary.EXPECTED_MCP_TOOLS
-    assert len(registered) == 17
+    assert len(registered) == 18
 
 
 def test_extract_codetrail_command_uses_effective_local_entry(tmp_path):

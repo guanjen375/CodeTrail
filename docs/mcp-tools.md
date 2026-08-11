@@ -6,7 +6,7 @@
 
 ---
 
-## CodeTrail 暴露的 17 個 MCP 工具
+## CodeTrail 暴露的 18 個 MCP 工具
 
 你不用手動寫 JSON 或自己呼 API。這些工具會出現在 frontend 的 MCP 工具列表裡；日常用法是在對話中直接要求模型「用工具 `<工具名>` 做某件事」。多數情況只講工具名就夠了，模型會自己補預設參數；需要指定檔案、行號、搜尋範圍時，再把那些條件寫進自然語言。
 
@@ -29,6 +29,7 @@
 | 準備改檔 | 請先用工具 `git_status` 和 `git_diff` 確認目前變更，再說明要改哪些檔案。 | `git_status(...)`、`git_diff(...)` |
 | 套修改 | 請產生最小 unified diff，先用工具 `apply_patch` 預覽，再正式套用。 | `apply_patch(...)` |
 | 修改後檢查 | 請用工具 `run_lint` 檢查剛改的檔案，再用工具 `run_command` 跑最小相關測試。 | `run_lint(...)`、`run_command(...)` |
+| 糾正模型的做事方式 | (糾正它之後)請用工具 `record_lesson` 把這條記成行為規則,之後的 session 都要遵守。 | `record_lesson(...)` |
 
 ### 依任務分類
 
@@ -51,6 +52,7 @@
 | 修改/驗證 | `apply_patch(diff, dry_run=False)` | 套 unified diff，會真的寫檔 |
 | 修改/驗證 | `run_lint(path, fix=True)` | 對單一檔案跑格式化/lint；`fix=False` 走 check-only(不改檔) |
 | 修改/驗證 | `run_command(cmd)` | 跑白名單內的測試 / lint;build 命令(make/cmake/ninja/meson/bazel)需設 `AI_CODE_ENABLE_BUILD_COMMANDS=1` |
+| 行為教訓 | `record_lesson(rule, scope="project")` | 你糾正模型行為後,把糾正「提案」成一條行為規則;經你核准(permission ask)寫入 lessons store,之後 session 注入 context([docs/lessons.md](lessons.md)) |
 
 ### 使用原則
 
@@ -61,5 +63,6 @@
 - 新增或刪除文件後一定要用工具 `reload_knowledge_base`。
 - 改檔前先看工具 `git_status` / `git_diff`；改檔用工具 `apply_patch`。
 - 工具 `apply_patch` 和 `run_command` 有副作用；需要改檔或執行專案腳本時才允許。
+- 工具 `record_lesson` 只在「你糾正了模型的做事方式」之後用;工具報錯或答案錯誤不是觸發條件。寫入需要你核准,細節與管理指令見 [docs/lessons.md](lessons.md)。
 
 ---
