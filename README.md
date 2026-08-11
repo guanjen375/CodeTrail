@@ -4,7 +4,7 @@ CodeTrail 是一個給 OpenCode 使用的本地 MCP 後端。你在 TUI 裡提�
 
 主線使用方式:
 - OpenCode TUI: `aicode`(README 的主流程以這條為準)
-- 選用/測試:跨機瀏覽器模式 `aicode_web`(A 機跑 backend、B 機開網址)
+- 選用/測試:跨機瀏覽器模式 `aicode_web`(A 機跑 backend、B 機開網址;用法見 §5.4)
 
 CodeTrail 目前定位是**成熟私有部署版**:適合本機、離線、NDA / firmware / private repo 分析;**不打算公開發布**成 PyPI package、Docker image 或 SaaS。安全邊界有自動測試保護,但未做公開產品級安全審計。
 
@@ -32,6 +32,8 @@ cd <PROJECT_TO_ANALYZE>
 aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 ```
 
+想改在**另一台電腦的瀏覽器**操作(實驗性 web 模式):A/B 機加入同一個 [Tailscale](https://tailscale.com/download) tailnet 後,同樣先 `cd <PROJECT_TO_ANALYZE>`,改跑 `aicode_web`,把印出的網址貼到 B 機瀏覽器;停止用 `aicode_web stop`。沒有 Tailscale 的 SSH fallback 與細節見 §5.4。
+
 - 第 5 步沒輸出,代表 `~/.local/bin` 不在 PATH:`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc` 後再試。
 - `./set_config.sh` 是**純問答**:逐題回答各角色模型、GPU、主模型運行模式(MoE 才問)、主模型 n_ctx / threads,答完看一頁摘要(Enter 寫入 / q 離開)。主 n_ctx 沒有猜測預設，也**不做容量估算**；reranker/embedding/VL 的 ctx 是獨立 server 內部值，不再混成使用者題目。VRAM 塞不塞得下以啟動後 `nvidia-smi` 實測為準。只有一個候選(或一顆 GPU)的題目自動選用。做的事與產物見 §3。要改配置隨時重跑,舊設定自動備份、可用 `--restore-last-backup` 還原。
 - 安全預設:四個模型 server **只綁 `127.0.0.1`**(僅本機可連);要讓區網其他機器使用要明確 `./set_config.sh --allow-remote`(見 [docs/security.md](docs/security.md))。
@@ -41,7 +43,7 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 
 ## 0. OpenCode TUI 部署路線圖
 
-如果你的目標只是把 **OpenCode TUI** 布置起來,先照這條走。web 模式可以先跳過,等 TUI 穩了再看。
+如果你的目標只是把 **OpenCode TUI** 布置起來,先照這條走。web 模式可以先跳過,等 TUI 穩了再看 §5.4(入口指令 `aicode_web` 在 Quick Start 步驟 2–5 已一併裝好)。
 
 先分清楚兩個路徑:
 
@@ -625,7 +627,7 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 >
 > (TUI 沒有這顆切換器,你 `cd 專案 && aicode` 在裡面開幾個對話都是鎖在同一個專案,自然不會錯亂;換專案就重開一個 `aicode`。)
 
-前提只有兩個:
+`aicode_web` 指令本身在 Quick Start 步驟 2–5 已隨 `aicode` 一併安裝(`command -v aicode_web` 應有輸出)。前提只有兩個:
 
 - A 機(跑模型、可只有文字終端)和 B 機(有 GUI / 瀏覽器)已安裝 [Tailscale](https://tailscale.com/download)、登入同一個 tailnet。
 - A 機已先執行 `set_config.sh` 產生的模型啟動檔:標準位置跑 `~/start.sh`；若你把它放在桌面,就在桌面目錄跑 `./start.sh`。四個 llama-server 要先 ready。
