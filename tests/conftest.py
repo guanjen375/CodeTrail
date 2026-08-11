@@ -4,9 +4,16 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+# 測試不能被開發者 shell 裡的資料收集設定污染。部分 integration tests 會把
+# os.environ 原樣傳給 MCP 子行程；若外面設了 AI_CODE_COLLECT_DATA=1，原本會把
+# synthetic fixture 寫進真實 data flywheel，既拖慢測試也污染本機資料。
+os.environ["AI_CODE_COLLECT_DATA"] = "0"
+os.environ.pop("AI_CODE_DATA_FILE", None)

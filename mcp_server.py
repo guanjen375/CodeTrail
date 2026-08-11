@@ -13,6 +13,7 @@ ai_code MCP server — 把 KnowledgeBase / CodeRAG / agent_tools 包成 MCP tool
 
 import contextlib
 import functools
+import importlib.metadata
 import os
 import sys
 import io
@@ -42,6 +43,48 @@ sys.stdout = sys.stderr
 def _log(msg: str) -> None:
     sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
     sys.stderr.flush()
+
+
+def _needs_py314_stdio_pulse() -> bool:
+    """Stable AnyIO releases before 4.15 can miss worker-thread wakeups on 3.14.
+
+    MCP 1.x implements stdio reads through AnyIO worker threads. On affected
+    Python 3.14 runtimes the read completes, but the event loop does not resume
+    until another timer fires; initialize then appears to hang until the client
+    timeout. A tiny event-loop pulse keeps stdio responsive. Keep this narrowly
+    version-gated so fixed AnyIO releases and older Python versions use the
+    normal FastMCP path with no periodic wakeup.
+    """
+    if sys.version_info < (3, 14):
+        return False
+    try:
+        raw = importlib.metadata.version("anyio")
+        major, minor = (int(part) for part in raw.split(".", 2)[:2])
+    except (importlib.metadata.PackageNotFoundError, ValueError):
+        return True
+    return (major, minor) < (4, 15)
+
+
+def _run_mcp_stdio() -> None:
+    if not _needs_py314_stdio_pulse():
+        mcp.run()
+        return
+
+    import anyio
+
+    async def pulse() -> None:
+        while True:
+            await anyio.sleep(0.05)
+
+    async def serve() -> None:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(pulse)
+            try:
+                await mcp.run_stdio_async()
+            finally:
+                task_group.cancel_scope.cancel()
+
+    anyio.run(serve)
 
 
 def _validate_aicode_root(root_env: str | None, home: str | None,
@@ -996,6 +1039,6 @@ if __name__ == "__main__":
     # stdout；工具內的 incidental print() 由 @_tool 的 redirect_stdout 擋回 stderr。
     sys.stdout = _REAL_STDOUT
     try:
-        mcp.run()
+        _run_mcp_stdio()
     finally:
         close_session()

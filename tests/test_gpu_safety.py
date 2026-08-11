@@ -131,12 +131,13 @@ class TestCheckSafety:
         assert "8192" in v.reason
         assert "truncate" in v.reason or "截斷" in v.reason
 
-    def test_unknown_when_server_unreachable(self):
-        # base_url 指向死 port,hermetic:不論本機是否真的跑著 llama-server 都不可達。
-        # (_server=None 會觸發真實查詢,舊版預設 8080 在有 server 的開發機上會誤判 SAFE。)
+    def test_unknown_when_server_unreachable(self, monkeypatch):
+        # query_server_info 的 HTTP/None 分支已有上面的 hook 測試；這裡只驗
+        # check_safety 對「查不到 server」的 verdict，不必真的等 socket timeout。
+        monkeypatch.setattr(gpu_safety, "query_server_info", lambda _url: None)
         v = check_safety(
             32768,
-            base_url="http://127.0.0.1:1",
+            base_url="http://127.0.0.1:65535",
             _gpu=self._gpu(32),
             _server=None,
         )

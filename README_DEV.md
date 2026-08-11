@@ -56,6 +56,7 @@ aicode
 - `tests/test_mcp_smoke.py` — MCP server stdio 啟動與基本 tool 呼叫
 - `tests/test_tool_call_canary.py` — `aicode` 的兩層工具健檢：17-tool contract、假 XML 拒絕、completed event、設定指紋／24h cache、retry/FLAKY/fail-loud；所有 OpenCode／MCP／HTTP／LLM 路徑都 mock，pytest 絕不呼叫真模型
 - `tests/test_gpu_safety.py` — `gpu_safety.py` 的 server /props 觀測、SafetyVerdict 分支;完全離線(nvidia-smi 與 llama-server HTTP 都用 hook 注入 fixture)
+- `tests/test_resolve_server_ctx.py` — `/props` n_ctx 自動跟隨；server 缺席／例外時 non-blocking fallback
 - `tests/test_check_status_script.py` — `check-status.sh` 的 nvidia-smi process 計數、跨 GPU PID 去重、report-only / strict exit code;nvidia-smi 完全用 stub
 - `tests/test_deployment_profile.py` — profile schema/precedence、惡意值拒絕、registry/mmproj、main/aux GPU precedence、`-ngl auto --fit` 參數驗證
 - `tests/test_deployment_status.py` — port/cmdline role 辨識、錯卡/錯模型;process 與 HTTP 都用 hook

@@ -34,9 +34,10 @@ def _server_env(project: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["AICODE_ROOT"] = str(project)
     env["PYTHONIOENCODING"] = "utf-8"
-    # 指向一個關著的 port，確保子行程不會真的打 llama-server。
-    env["AICODE_LLAMA_BASE_URL"] = "http://127.0.0.1:65535"
-    env["AICODE_LLAMA_EMBED_BASE_URL"] = "http://127.0.0.1:65535"
+    # 使用 requests 會立即拒絕的 malformed host，確保不會碰到真 server；也不必
+    # 為三條 error path 各等一次 production retry/backoff。
+    env["AICODE_LLAMA_BASE_URL"] = "http://%zz:8081"
+    env["AICODE_LLAMA_EMBED_BASE_URL"] = "http://%zz:8081"
     env["AICODE_MODEL"] = "example-code-model"
     env["AICODE_REQUIRED_MODELS_CHECK_SKIP"] = "1"
     # 讓子行程找得到 mcp / numpy（可能裝在 user site）。
@@ -142,7 +143,7 @@ def test_embedding_failure_is_a_tool_error_with_actionable_url(tmp_path: Path):
     for result in (code_result, knowledge_result, ingest_result):
         error_text = _content_text(result)
         assert result.isError is True, error_text
-        assert "http://127.0.0.1:65535" in error_text
+        assert "http://%zz:8081" in error_text
         assert "8081 llama-server" in error_text
         assert "AICODE_LLAMA_EMBED_BASE_URL" in error_text
 

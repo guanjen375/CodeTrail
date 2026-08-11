@@ -1619,8 +1619,15 @@ def test_logs_accepts_count_and_follow_shorthand(tmp_path):
     assert still_bad.returncode == 2
     assert "未知 role" in still_bad.stderr
 
-    try:
-        run_start("logs", "-f", timeout=2)
-        raise AssertionError("logs -f 應進入 tail -f 追蹤模式,不得被當成未知 role")
-    except subprocess.TimeoutExpired:
-        pass  # tail -f 持續追蹤 → timeout = 解析成功
+    tail_args = tmp_path / "tail_args.txt"
+    fake_tail = tmp_path / "bin" / "tail"
+    fake_tail.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$@\" > \"$AICODE_TEST_TAIL_ARGS\"\n",
+        encoding="utf-8",
+    )
+    fake_tail.chmod(0o700)
+    env["AICODE_TEST_TAIL_ARGS"] = str(tail_args)
+    follow = run_start("logs", "-f")
+    assert follow.returncode == 0, follow.stderr
+    assert tail_args.read_text(encoding="utf-8").splitlines()[0] == "-f"
