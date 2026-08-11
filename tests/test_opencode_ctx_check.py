@@ -188,3 +188,46 @@ def test_fix_refuses_ambiguous_model_entries_without_writing(monkeypatch, tmp_pa
     assert path.read_bytes() == before
     assert "multiple matching" in capsys.readouterr().out
     assert not path.with_name(path.name + occ.BACKUP_SUFFIX).exists()
+
+
+def _write_profile(tmp_path: Path, ctx: int) -> Path:
+    path = tmp_path / "deployment.json"
+    path.write_text(
+        json.dumps({"schema_version": 1, "services": {"main": {"ctx": ctx}}}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _clear_ctx_env(monkeypatch) -> None:
+    for var in (
+        "AICODE_N_CTX", "AICODE_DYNAMIC_NUM_CTX_MAX", "MAIN_CTX", "AICODE_MAIN_CTX",
+        "AICODE_ACCEPT_CTX_RISK", "AICODE_CTX_SAFETY_DISABLE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_check_follows_deployment_profile_when_env_unset(monkeypatch, tmp_path, capsys):
+    """Standalone(無 AICODE_N_CTX)時 requested 必須來自 deployment profile 的
+    main.ctx,不能落回寫死預設而對 set_config 寫入的值誤報 MISMATCH。"""
+    _write_opencode(tmp_path, 131072)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("AICODE_DEPLOYMENT_CONFIG", str(_write_profile(tmp_path, 131072)))
+    _clear_ctx_env(monkeypatch)
+
+    assert occ.main([]) == 0
+    assert "SAFE" in capsys.readouterr().out
+
+
+def test_fix_syncs_to_deployment_profile_when_env_unset(monkeypatch, tmp_path):
+    """--fix 無 AICODE_N_CTX 時同步成 profile main.ctx,而非寫死預設。"""
+    path = _write_opencode(tmp_path, 65536)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("AICODE_DEPLOYMENT_CONFIG", str(_write_profile(tmp_path, 131072)))
+    _clear_ctx_env(monkeypatch)
+
+    assert occ.main(["--fix"]) == 0
+    updated = json.loads(path.read_text(encoding="utf-8"))
+    assert updated["provider"]["llamacpp"]["models"]["main-model"]["limit"]["context"] == 131072

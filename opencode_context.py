@@ -14,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import deployment_profile
 import n_ctx
 from model_resolution import (
     has_external_provider_prefix,
@@ -44,8 +45,21 @@ class OpenCodeContextLimit:
 
 
 def n_ctx_from_env(env: Mapping[str, str] | None = None) -> int:
+    """Resolve the main n_ctx the same way config.py does.
+
+    Without AICODE_N_CTX (standalone diagnostics, aicode's server-unreachable
+    path) the answer must come from the deployment profile's main.ctx — not a
+    hardcoded default — or the check would contradict what set_config wrote.
+    Raises ValueError (incl. ProfileError) on invalid settings; callers stay
+    fail-loud.
+    """
     environ = env if env is not None else os.environ
-    return n_ctx.resolve_n_ctx(environ).value
+    profile_ctx = deployment_profile.load_effective_profile(environ).service("main").ctx
+    return n_ctx.resolve_n_ctx(
+        environ,
+        default=profile_ctx or n_ctx.DEFAULT_N_CTX,
+        default_source="deployment profile main.ctx",
+    ).value
 
 
 def dynamic_ctx_max_from_env(env: Mapping[str, str] | None = None) -> int:
