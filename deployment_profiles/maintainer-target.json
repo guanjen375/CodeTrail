@@ -1,9 +1,0 @@
-{
-  "schema_version": 1,
-  "name": "maintainer-target",
-  "extends": "defaults",
-  "description": "Maintainer target: H200 plus 448GB RAM for main and a dedicated RTX 2000 Ada for all auxiliary services. Main tuning is not yet measured.",
-  "verification": "unverified",
-  "hardware": "H200 + 448GB RAM + RTX 2000 Ada",
-  "services": {}
-}

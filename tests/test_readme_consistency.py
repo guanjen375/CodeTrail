@@ -133,17 +133,15 @@ def test_doctor_commands_must_have_explicit_model_on_same_line():
 
 
 def test_default_aux_models_must_be_documented():
-    profile = '''
-{"services": {
-  "embedding": {"model": "embed-model"},
-  "reranker": {"model": "rerank-model"},
-  "vl": {"model": "vl-model"}
-}}
-'''
+    services = {
+        "embedding": {"model": "embed-model"},
+        "reranker": {"model": "rerank-model"},
+        "vl": {"model": "vl-model"},
+    }
     issues: list[str] = []
 
     _check_default_aux_models_documented(
-        profile,
+        services,
         "下載 embed-model 與 vl-model。",
         issues,
     )

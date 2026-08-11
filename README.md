@@ -380,10 +380,7 @@ RTX 5090 reference 的 VRAM/RAM、prompt processing、decode 與 concurrency 實
 launcher CLI / env > ~/.config/codetrail/deployment.json local override > 選用 profile > 安全相容預設
 ```
 
-`deployment_profiles/defaults.json` 是向下相容的安全基底;硬體 profile 必須明確選用,不會自動套上:
-
-- `maintainer-target`:H200＋448GB RAM 跑 main,RTX 2000 Ada 跑三個 aux;`verification=unverified`。
-- `verified-reference`:RTX 5090＋170GB RAM 的既有實測設定;完整 tuning 與 benchmark 在 [docs/verified-reference-5090.md](docs/verified-reference-5090.md)。
+安全基底 `safe-defaults` 直接內建在 `deployment_profile.py`(不宣稱硬體的向下相容預設,含 port、base_url 與附屬模型預設);`set_config.sh` 產生的 `~/.config/codetrail/deployment.json` 疊在上面。要做一次性實驗設定,`AICODE_PROFILE` 可指向絕對路徑 `.json` profile(用 `"extends": "defaults"` 繼承基底),不設定時就是基底加上你的 local override。
 
 手動啟動範例(等價於 `~/start.sh` 做的事):
 
@@ -399,12 +396,12 @@ export AUX_GPU=<附屬模型_GPU_UUID_或_INDEX>   # EMBED_GPU / RERANK_GPU / VL
 AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
 ```
 
-`~/.config/codetrail/deployment.json` 可持久選 profile 並做局部覆寫:
+`~/.config/codetrail/deployment.json` 可持久做局部覆寫(`profile` 欄位維持 `set_config.sh` 寫入的 `defaults` 即可):
 
 ```json
 {
   "schema_version": 1,
-  "profile": "maintainer-target",
+  "profile": "defaults",
   "services": {
     "main": { "model": "<CODE_MODEL>" }
   }

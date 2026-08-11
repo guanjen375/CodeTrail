@@ -65,7 +65,6 @@ After=network.target
 
 [Service]
 Type=simple
-Environment=AICODE_PROFILE=maintainer-target
 Environment=AICODE_MODEL=<CODE_MODEL>
 Environment=MAIN_GPU=<MAIN_GPU_UUID_OR_INDEX>
 Environment=AUX_GPU=<AUX_GPU_UUID_OR_INDEX>

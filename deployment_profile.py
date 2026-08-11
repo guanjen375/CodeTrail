@@ -17,9 +17,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-REPO_ROOT = Path(__file__).resolve().parent
-PROFILE_DIR = REPO_ROOT / "deployment_profiles"
-DEFAULT_PROFILE_PATH = PROFILE_DIR / "defaults.json"
 ROLES = ("main", "embedding", "reranker", "vl")
 
 _TOP_LEVEL_KEYS = {
@@ -108,6 +105,66 @@ _LEGACY_MODEL_PATHS = {
     ),
     "qwen3.5-9b": ("qwen3.5-9b", "Qwen3.5-9B-Q6_K.gguf", "Qwen3.5-9B*.gguf"),
     "qwen3.5-9b-mmproj-f16": ("qwen3.5-9b", "mmproj-F16.gguf", "mmproj*.gguf"),
+}
+
+# 內建 safe-defaults 基底:不宣稱硬體的向下相容預設。所有有效設定都以它墊底,
+# set_config 產生的 ~/.config/codetrail/deployment.json 與 env/CLI 覆寫疊在上面。
+# 附屬模型預設(bge-m3 / bge-reranker-v2-m3 / qwen3.5-9b)的單一事實來源在這裡;
+# check_readme_consistency 會驗證使用者文件與這份預設同步。
+_BUILTIN_DEFAULTS: dict[str, Any] = {
+    "schema_version": 1,
+    "name": "safe-defaults",
+    "description": "Backward-compatible CodeTrail llama-server defaults without a hardware claim.",
+    "verification": "unverified",
+    "hardware": "unspecified",
+    "services": {
+        "main": {
+            "model": None,
+            "port": 8080,
+            "base_url": "http://localhost:8080",
+            "gpu_role": "main",
+            "ctx": 65536,
+            "batch": None,
+            "ubatch": None,
+            "parameters": {"gpu_layers": 99, "jinja": True},
+        },
+        "embedding": {
+            "model": "bge-m3",
+            "port": 8081,
+            "base_url": "http://localhost:8081",
+            "gpu_role": "aux",
+            "ctx": 8192,
+            "batch": 8192,
+            "ubatch": 8192,
+            "parameters": {"gpu_layers": 99, "embedding": True, "pooling": "cls"},
+        },
+        "reranker": {
+            "model": "bge-reranker-v2-m3",
+            "port": 8082,
+            "base_url": "http://localhost:8082",
+            "gpu_role": "aux",
+            "ctx": 8192,
+            "batch": 8192,
+            "ubatch": 8192,
+            "parameters": {
+                "gpu_layers": 99,
+                "embedding": True,
+                "pooling": "rank",
+                "reranking": True,
+            },
+        },
+        "vl": {
+            "model": "qwen3.5-9b",
+            "mmproj": "qwen3.5-9b-mmproj-f16",
+            "port": 8083,
+            "base_url": "http://localhost:8083",
+            "gpu_role": "aux",
+            "ctx": 8192,
+            "batch": None,
+            "ubatch": None,
+            "parameters": {"gpu_layers": 99},
+        },
+    },
 }
 
 
@@ -389,21 +446,23 @@ def _merge(base: dict[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
 def _profile_path(reference: str) -> Path:
     ref = _reject_control(reference.strip(), "profile reference")
     candidate = _expanduser(ref, "profile reference")
-    if candidate.is_absolute():
-        if candidate.suffix.lower() != ".json":
-            raise ProfileError("absolute deployment profile path must end in .json")
-        return candidate
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", ref):
-        raise ProfileError("AICODE_PROFILE must be a built-in name or absolute JSON path")
-    path = PROFILE_DIR / (ref if ref.endswith(".json") else f"{ref}.json")
-    if not path.is_file():
-        available = ", ".join(sorted(p.stem for p in PROFILE_DIR.glob("*.json") if p.stem != "defaults"))
-        raise ProfileError(f"unknown deployment profile {ref!r}; available: {available}")
-    return path
+    if not candidate.is_absolute():
+        raise ProfileError(
+            'AICODE_PROFILE must be "defaults" or an absolute JSON profile path'
+        )
+    if candidate.suffix.lower() != ".json":
+        raise ProfileError("absolute deployment profile path must end in .json")
+    return candidate
 
 
-def _load_profile_chain(reference: str, seen: set[Path] | None = None) -> tuple[dict[str, Any], Path]:
-    raw_path = _profile_path(reference)
+def _load_profile_chain(reference: str, seen: set[Path] | None = None) -> tuple[dict[str, Any], str]:
+    """回傳 (合併後資料, 選用名稱)。名稱是 "defaults" 或絕對路徑檔的 stem。"""
+    ref = _reject_control(reference.strip(), "profile reference")
+    if ref == "defaults":
+        data = json.loads(json.dumps(_BUILTIN_DEFAULTS))
+        _validate_document(data, "built-in safe-defaults")
+        return data, "defaults"
+    raw_path = _profile_path(ref)
     try:
         path = raw_path.resolve()
     except (OSError, RuntimeError) as exc:
@@ -417,8 +476,8 @@ def _load_profile_chain(reference: str, seen: set[Path] | None = None) -> tuple[
     parent = data.get("extends")
     if parent:
         parent_data, _ = _load_profile_chain(parent, visited)
-        return _merge(parent_data, {k: v for k, v in data.items() if k != "extends"}), path
-    return data, path
+        return _merge(parent_data, {k: v for k, v in data.items() if k != "extends"}), path.stem
+    return data, path.stem
 
 
 def local_override_path(environ: Mapping[str, str] | None = None) -> Path | None:
@@ -635,7 +694,7 @@ def load_effective_profile(
         selected = str(local_data.get("profile") or "").strip()
     selected = selected or "defaults"
 
-    data, selected_path = _load_profile_chain(selected)
+    data, selected_name = _load_profile_chain(selected)
     if local_data:
         data = _merge(data, {"services": local_data.get("services", {})})
     data = _merge(data, _environment_overlay(env, data))
@@ -664,7 +723,7 @@ def load_effective_profile(
         verification=str(data["verification"]),
         hardware=str(data["hardware"]),
         services=services,
-        selected_profile=selected_path.stem,
+        selected_profile=selected_name,
         local_override=override_path if local_data else None,
     )
 
@@ -872,7 +931,7 @@ def runtime_environment(profile: DeploymentProfile, *, include_main_model: bool 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Resolve and validate CodeTrail deployment profiles")
-    parser.add_argument("--profile", help="built-in profile name or absolute JSON profile path")
+    parser.add_argument("--profile", help='"defaults" or absolute JSON profile path')
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("show", help="print the effective profile as JSON")
     validate = sub.add_parser("validate", help="validate profile and optionally require model files")

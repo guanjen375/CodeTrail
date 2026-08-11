@@ -59,10 +59,31 @@ def _write_local(tmp_path: Path, data: dict) -> Path:
     return path
 
 
-def test_maintainer_target_is_explicit_and_unverified(tmp_path):
-    profile = load_effective_profile(_env(tmp_path, AICODE_PROFILE="maintainer-target"))
+def _write_profile(tmp_path: Path, name: str, services: dict) -> Path:
+    """寫一個繼承內建 safe-defaults 的絕對路徑 profile fixture。"""
+    path = tmp_path / f"{name}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "name": name,
+                "extends": "defaults",
+                "description": "test profile fixture",
+                "verification": "unverified",
+                "hardware": "test",
+                "services": services,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
 
-    assert profile.selected_profile == "maintainer-target"
+
+def test_absolute_path_profile_inherits_builtin_safe_defaults(tmp_path):
+    profile_path = _write_profile(tmp_path, "empty-target", {})
+    profile = load_effective_profile(_env(tmp_path, AICODE_PROFILE=str(profile_path)))
+
+    assert profile.selected_profile == "empty-target"
     assert profile.verification == "unverified"
     assert profile.service("main").model is None
     assert profile.service("embedding").parameters["pooling"] == "cls"
@@ -70,22 +91,31 @@ def test_maintainer_target_is_explicit_and_unverified(tmp_path):
     assert profile.service("vl").mmproj == "qwen3.5-9b-mmproj-f16"
 
 
+def test_named_profile_references_are_rejected(tmp_path):
+    with pytest.raises(ProfileError, match="absolute JSON profile path"):
+        load_effective_profile(_env(tmp_path, AICODE_PROFILE="some-named-profile"))
+
+
 def test_main_model_resolution_uses_selected_profile(tmp_path):
+    profile_path = _write_profile(
+        tmp_path, "pinned-main", {"main": {"model": "profile-main-model"}}
+    )
     resolved = resolve_main_model_from_env(
-        _env(tmp_path, AICODE_PROFILE="verified-reference")
+        _env(tmp_path, AICODE_PROFILE=str(profile_path))
     )
 
     assert resolved.ok
-    assert resolved.model == "qwen3-235b-a22b-thinking-2507-ud-q4-k-xl"
-    assert resolved.source.startswith("deployment profile verified-reference")
+    assert resolved.model == "profile-main-model"
+    assert resolved.source.startswith("deployment profile pinned-main")
 
 
 def test_precedence_cli_env_over_local_over_profile_over_defaults(tmp_path):
+    profile_path = _write_profile(tmp_path, "local-selected", {})
     _write_local(
         tmp_path,
         {
             "schema_version": 1,
-            "profile": "maintainer-target",
+            "profile": str(profile_path),
             "services": {"main": {"model": "local-main", "ctx": 32768}},
         },
     )
@@ -96,7 +126,7 @@ def test_precedence_cli_env_over_local_over_profile_over_defaults(tmp_path):
         cli_env={"AICODE_MODEL": "cli-main", "MAIN_CTX": "98304"},
     )
 
-    assert effective.selected_profile == "maintainer-target"
+    assert effective.selected_profile == "local-selected"
     assert effective.service("main").model == "cli-main"
     assert effective.service("main").ctx == 98304
     assert effective.service("embedding").ctx == 8192  # inherited safe default
@@ -126,13 +156,16 @@ def test_absent_default_local_override_still_uses_defaults(tmp_path):
 
 
 def test_profile_selector_precedence_cli_then_env_then_local(tmp_path):
-    _write_local(tmp_path, {"schema_version": 1, "profile": "maintainer-target"})
-    env = _env(tmp_path, AICODE_PROFILE="verified-reference")
+    local_choice = _write_profile(tmp_path, "local-choice", {})
+    env_choice = _write_profile(tmp_path, "env-choice", {})
+    cli_choice = _write_profile(tmp_path, "cli-choice", {})
+    _write_local(tmp_path, {"schema_version": 1, "profile": str(local_choice)})
+    env = _env(tmp_path, AICODE_PROFILE=str(env_choice))
 
-    assert load_effective_profile(env).selected_profile == "verified-reference"
+    assert load_effective_profile(env).selected_profile == "env-choice"
     assert (
-        load_effective_profile(env, profile="maintainer-target").selected_profile
-        == "maintainer-target"
+        load_effective_profile(env, profile=str(cli_choice)).selected_profile
+        == "cli-choice"
     )
 
 
@@ -244,7 +277,7 @@ def test_command_builder_uses_only_structured_allowlisted_arguments(tmp_path):
 
 
 def test_main_launcher_resolution_fails_loud_without_main_model(tmp_path):
-    env = _env(tmp_path, AICODE_PROFILE="maintainer-target")
+    env = _env(tmp_path)
     service = load_effective_profile(env).service("main")
 
     with pytest.raises(ProfileError, match="main model is unset"):

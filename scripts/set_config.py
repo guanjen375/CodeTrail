@@ -1193,7 +1193,7 @@ def _warn_unverified_aux(plan: Plan) -> None:
             plan.notes.append(
                 f"⚠ {selection.role} 選了未經維護者驗證的模型 {selection.candidate.path.name}:"
                 "server 可能正常啟動,但 pooling / reranking / 圖片分析行為不保證正確"
-                "(維護者驗證組合見 deployment_profiles/defaults.json 與 README §2.3–§2.4)。"
+                "(維護者驗證組合見 README §2.3–§2.4)。"
             )
 
 

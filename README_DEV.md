@@ -14,7 +14,7 @@ python scripts/run_tests.py
 python scripts/check_eval_consistency.py
 python scripts/check_readme_consistency.py
 AICODE_MODEL=test-model:latest python scripts/doctor.py --no-network
-python deployment_profile.py --profile maintainer-target validate
+python deployment_profile.py validate
 
 # Lint（advisory，CI 不擋）
 ruff check tests scripts

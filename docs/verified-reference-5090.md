@@ -10,7 +10,7 @@ reference，不是 CodeTrail 全域預設，也不是 H200＋RTX 2000 Ada 的推
 - GPU：RTX 5090 32GB
 - System RAM：170GB
 - Main：Qwen3-235B-A22B-Thinking-2507 UD-Q4_K_XL
-- Aux：與 `deployment_profiles/defaults.json` 相同
+- Aux：與內建 safe-defaults 相同(見 [deployment-profiles.md](deployment-profiles.md))
 - 量測日期：2026-06-11
 - placement：main 與三個 aux 同卡，因此 `MAIN_GPU` 與 `AUX_GPU` 指向同一張 5090
 

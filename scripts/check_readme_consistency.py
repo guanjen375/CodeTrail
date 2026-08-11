@@ -18,7 +18,6 @@
 """
 from __future__ import annotations
 
-import json
 import re
 import sys
 from pathlib import Path
@@ -28,9 +27,13 @@ README = REPO_ROOT / "README.md"
 DOCS_DIR = REPO_ROOT / "docs"
 MCP = REPO_ROOT / "mcp_server.py"
 CONFIG = REPO_ROOT / "config.py"
-DEFAULT_DEPLOYMENT = REPO_ROOT / "deployment_profiles" / "defaults.json"
 SET_CONFIG = REPO_ROOT / "scripts" / "set_config.py"
 AGENTS_TEMPLATE_DOC = DOCS_DIR / "opencode-agents-template.md"
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from deployment_profile import _BUILTIN_DEFAULTS  # noqa: E402
 
 
 def _read(path: Path) -> str:
@@ -245,25 +248,19 @@ def _check_doctor_commands_have_explicit_model(docs_text: str, issues: list[str]
 
 
 def _check_default_aux_models_documented(
-    default_profile_text: str,
+    default_services: object,
     docs_text: str,
     issues: list[str],
 ) -> None:
     """預設附屬模型換掉時，下載文件也必須同步更新。"""
-    try:
-        profile = json.loads(default_profile_text)
-    except (TypeError, json.JSONDecodeError):
-        issues.append("deployment_profiles/defaults.json 無法解析")
-        return
-    services = profile.get("services") if isinstance(profile, dict) else None
-    if not isinstance(services, dict):
-        issues.append("deployment_profiles/defaults.json 缺少 services")
+    if not isinstance(default_services, dict):
+        issues.append("deployment_profile 內建 safe-defaults 缺少 services")
         return
     for role in ("embedding", "reranker", "vl"):
-        service = services.get(role)
+        service = default_services.get(role)
         model = service.get("model") if isinstance(service, dict) else None
         if not isinstance(model, str) or not model:
-            issues.append(f"deployment_profiles/defaults.json 缺少 {role} model")
+            issues.append(f"內建 safe-defaults 缺少 {role} model")
         elif model not in docs_text:
             issues.append(f"README/docs 未提到預設 {role} 模型 {model!r}")
 
@@ -321,11 +318,8 @@ def check_all() -> list[str]:
     if missing:
         issues.append(f"文件沒提到的 MCP 工具: {missing}")
 
-    # 3. model defaults have one source of truth: deployment_profiles/defaults.json.
-    if not DEFAULT_DEPLOYMENT.is_file():
-        issues.append("deployment_profiles/defaults.json 不存在")
-    else:
-        _check_default_aux_models_documented(_read(DEFAULT_DEPLOYMENT), docs_text, issues)
+    # 3. model defaults have one source of truth: deployment_profile._BUILTIN_DEFAULTS.
+    _check_default_aux_models_documented(_BUILTIN_DEFAULTS.get("services"), docs_text, issues)
     required_profile_reads = (
         'VL_MODEL = _DEPLOYMENT_PROFILE.service("vl").model',
         'EMBEDDING_MODEL = _DEPLOYMENT_PROFILE.service("embedding").model',
@@ -334,9 +328,6 @@ def check_all() -> list[str]:
     for needle in required_profile_reads:
         if needle not in config_text:
             issues.append(f"config.py 未由 deployment profile 取得模型: {needle}")
-    for profile_name in ("verified-reference", "maintainer-target"):
-        if profile_name not in docs_text:
-            issues.append(f"README/docs 必須說明選用 profile {profile_name!r}")
 
     # 4. 產品狀態段落
     if not any(p in readme_text for p in _PRODUCT_STATUS_PHRASES):

@@ -6,7 +6,7 @@
 
 使用：
     AICODE_MODEL=<MODEL> python scripts/doctor.py                       # 全檢
-    AICODE_MODEL=<MODEL> python scripts/doctor.py --profile maintainer-target
+    AICODE_MODEL=<MODEL> python scripts/doctor.py --profile /abs/path/profile.json
     AICODE_MODEL=<MODEL> python scripts/doctor.py --project /path/proj  # 把 /path/proj 當 AICODE_ROOT 檢查
     AICODE_MODEL=<MODEL> python scripts/doctor.py --no-network          # 跳過 llama-server 線上檢查（CI 用）
 
@@ -805,7 +805,7 @@ def main(argv: list[str] | None = None) -> int:
         description="CodeTrail preflight check — 安裝 / 啟動前自檢",
     )
     parser.add_argument("--project", help="把這個目錄當作 AICODE_ROOT 來檢查")
-    parser.add_argument("--profile", help="選用 deployment profile 名稱或絕對 JSON 路徑")
+    parser.add_argument("--profile", help='選用 deployment profile("defaults" 或絕對 JSON 路徑)')
     parser.add_argument("--no-network", action="store_true",
                         help="跳過 llama-server / 模型線上檢查（CI 用）")
     args = parser.parse_args(argv)

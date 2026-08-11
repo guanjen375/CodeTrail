@@ -7,25 +7,23 @@ Python 3.10 stdlib 讀 JSON，採封閉 schema/參數 allowlist，不執行 JSON
 
 ## 選擇與優先序
 
+安全基底 `safe-defaults` 直接內建在 `deployment_profile.py`,不宣稱硬體;正常使用不必選
+profile,`set_config.sh` 產生的 local override 疊在基底上就是有效設定。要做一次性實驗
+設定,`AICODE_PROFILE`(或 CLI `--profile`)可指向**絕對路徑** `.json` profile,檔內可用
+`"extends": "defaults"` 繼承基底:
+
 ```bash
-export AICODE_PROFILE=maintainer-target
 python deployment_profile.py show
-python deployment_profile.py validate
+python deployment_profile.py --profile /absolute/path/to/experiment.json validate
 ```
 
-可選 profile：
-
-- `maintainer-target`：H200＋448GB RAM main、RTX 2000 Ada aux；尚未 verified。
-- `verified-reference`：RTX 5090＋170GB RAM reference；量測見
-  [verified-reference-5090.md](verified-reference-5090.md)。
-
-兩者都必須明確選用。沒選時只載入不宣稱硬體的 `safe-defaults`。合併順序：
+合併順序：
 
 ```text
 launcher CLI / environment
   > ~/.config/codetrail/deployment.json local override
-  > AICODE_PROFILE 選用 profile
-  > safe-defaults
+  > AICODE_PROFILE 選用 profile(絕對路徑 .json,選用)
+  > safe-defaults(內建)
 ```
 
 `AICODE_DEPLOYMENT_CONFIG=/absolute/path.json` 可在測試或多帳號環境改 local override
@@ -94,7 +92,7 @@ GPU UUID 比 index 穩定，因為 PCI enumeration 次序可能在重開機或�
 ```json
 {
   "schema_version": 1,
-  "profile": "maintainer-target",
+  "profile": "defaults",
   "services": {
     "main": {
       "model": "<CODE_MODEL>",
@@ -104,4 +102,4 @@ GPU UUID 比 index 穩定，因為 PCI enumeration 次序可能在重開機或�
 }
 ```
 
-不要把真實 UUID、私有模型路徑或 NDA 名稱放進 repo profile；留在使用者 home config。
+不要把真實 UUID、私有模型路徑或 NDA 名稱 commit 進 repo；這類值留在使用者 home config。

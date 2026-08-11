@@ -52,14 +52,35 @@ def _run(script: str, tmp_path: Path, env_extra: dict[str, str], *args: str):
     )
 
 
+def _write_profile_fixture(tmp_path: Path, name: str) -> Path:
+    """絕對路徑 profile fixture:繼承內建 safe-defaults,不覆寫任何 service。"""
+    path = tmp_path / f"{name}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "name": name,
+                "extends": "defaults",
+                "description": "launcher test profile fixture",
+                "verification": "unverified",
+                "hardware": "test",
+                "services": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_start_all_routes_main_and_all_aux_to_their_shared_gpus(tmp_path):
     main = tmp_path / "main.gguf"
     main.write_bytes(b"fixture")
+    profile_path = _write_profile_fixture(tmp_path, "gpu-split")
     proc = _run(
         "start-all.sh",
         tmp_path,
         {
-            "AICODE_PROFILE": "maintainer-target",
+            "AICODE_PROFILE": str(profile_path),
             "AICODE_MODEL": str(main),
             "MAIN_GPU": "GPU-H200",
             "AUX_GPU": "GPU-RTX2000ADA",
@@ -68,16 +89,16 @@ def test_start_all_routes_main_and_all_aux_to_their_shared_gpus(tmp_path):
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "profile=maintainer-target" in proc.stdout
+    assert "profile=gpu-split" in proc.stdout
     assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-H200") == 1
     assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-RTX2000ADA") == 3
 
 
-def test_start_main_fails_loud_when_maintainer_profile_has_no_model(tmp_path):
+def test_start_main_fails_loud_when_no_main_model_is_set(tmp_path):
     proc = _run(
         "start-main-server.sh",
         tmp_path,
-        {"AICODE_PROFILE": "maintainer-target"},
+        {},
         "--dry-run",
     )
 
