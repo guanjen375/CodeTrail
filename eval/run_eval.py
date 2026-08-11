@@ -813,7 +813,7 @@ def run_evaluation(
     _resolved = _eval_config.require_main_model()
     _source = "AICODE_MODEL env" if os.environ.get("AICODE_MODEL", "").strip() else "opencode.json"
     print(f"Using model: {_resolved} (from {_source})")
-    print(f"NUM_CTX: {_eval_config.NUM_CTX}")
+    print(f"N_CTX: {_eval_config.N_CTX}")
 
     # 健康檢查 - 確保 llama-server 正常運作
     if not check_llama_health():

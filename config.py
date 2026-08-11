@@ -6,6 +6,7 @@ import os as _os
 
 import deployment_profile as _deployment_profile
 import model_resolution as _model_resolution
+import n_ctx as _n_ctx
 
 # ============================================================
 # llama.cpp llama-server 設定
@@ -168,14 +169,21 @@ def require_main_model_path() -> str:
         )
     return path
 
-# Context 長度 fallback。server profile 的 -c 與 runtime /props 才是實際上限；
-# AICODE_NUM_CTX 只在 dynamic 路徑停用時使用。
-NUM_CTX = int(_os.environ.get("AICODE_NUM_CTX", "131072"))
+# 主模型只保留一個 n_ctx 概念：正常由 set_config 的 --ctx 寫入 deployment
+# profile / server -c；aicode 啟動時再從 server /props 觀測實值並以
+# AICODE_N_CTX 傳給 runtime。沒經 wrapper 時，回到 effective profile 的 main.ctx。
+_PROFILE_MAIN_CTX = _DEPLOYMENT_PROFILE.service("main").ctx or _n_ctx.DEFAULT_N_CTX
+N_CTX_RESOLUTION = _n_ctx.resolve_n_ctx(
+    _os.environ,
+    default=_PROFILE_MAIN_CTX,
+    default_source="deployment profile main.ctx",
+)
+N_CTX = N_CTX_RESOLUTION.value
 
-# Full 模式 context：設成與 NUM_CTX 相同
-# Full 模式會把完整程式碼 + 知識庫 + 圖片/bin 上下文全部塞入 prompt
-# 需要足夠大的 context 才能避免截斷
-NUM_CTX_FULL_MODE = NUM_CTX
+# 舊 production call sites / external scripts 的相容 alias。三者現在永遠是同一個
+# 主 n_ctx，不再讓 NUM_CTX 與 DYNAMIC_NUM_CTX_MAX 形成兩個可漂移的使用者設定。
+NUM_CTX = N_CTX
+NUM_CTX_FULL_MODE = N_CTX
 
 # ============================================================
 # 動態 num_ctx 設定
@@ -183,15 +191,11 @@ NUM_CTX_FULL_MODE = NUM_CTX
 # 根據 prompt 長度動態調整 context 大小，減少不必要的記憶體佔用和延遲
 # 1 token ≈ 3-4 chars（粗估）
 #
-# DYNAMIC_NUM_CTX_MAX 是 CodeTrail internal LLM call 的 per-call ctx 上限。
-#   預設「自動跟隨」主 llama-server 的真實 n_ctx —— aicode wrapper 啟動時會讀
-#   server /props 的 n_ctx,export 成 AICODE_DYNAMIC_NUM_CTX_MAX 帶進這個行程。
-#   也就是說 server 啟動時的 `-c <N>` 才是唯一真值,使用者通常不需要手動設這個
-#   env var。沒經過 aicode(或 server 讀不到)時退回下面的預設常數。
-#   手動設 AICODE_DYNAMIC_NUM_CTX_MAX 視為進階覆寫,使用者要自行確保它 == server -c。
+# 動態 sizing 只是在 16K..N_CTX 內依 prompt 大小選每次呼叫值；它沒有另一個
+# 使用者要設定的 max。DYNAMIC_NUM_CTX_MAX 僅保留為程式碼相容 alias。
 DYNAMIC_NUM_CTX_ENABLED = True
 DYNAMIC_NUM_CTX_MIN = 16384      # 最小 16K
-DYNAMIC_NUM_CTX_MAX = int(_os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX", "65536"))
+DYNAMIC_NUM_CTX_MAX = N_CTX
 DYNAMIC_NUM_CTX_BUFFER = 1.3     # 預留空間給回答（調整: 1.5->1.3）
 CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
 

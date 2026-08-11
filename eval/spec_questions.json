@@ -11,11 +11,11 @@
   },
   {
     "id": "spec_002",
-    "question": "NUM_CTX 應該設多大才不會 OOM？",
+    "question": "主模型 n_ctx 應該設多大才不會 OOM？",
     "expected": {
       "refs": ["spec", "context"],
       "keywords": ["64K", "OOM", "offload"],
-      "gold_chunks": ["NUM_CTX", "context"],
+      "gold_chunks": ["N_CTX", "context"],
       "gold_evidence": ["65536", "64K"]
     }
   },

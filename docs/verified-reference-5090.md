@@ -57,8 +57,8 @@ profile 會產生下列等價參數；實際 model path、host、port 與 GPU se
 --n-cpu-moe 90 -fa on -t 12 --no-mmap
 ```
 
-- `-c 65536` 是這次 server context 上限；OpenCode active model 的 `limit.context`
-  必須對齊。
+- `-c 65536` 是這次主 n_ctx；`aicode` 會讓 CodeTrail budget 與 OpenCode active
+  model 的 `limit.context` 自動跟隨。
 - `--n-cpu-moe 90` 是這個 235B MoE＋同卡四服務的實測 placement，不適用於 dense
   模型，也不能當成 H200 數字。
 - `-b 2048 -ub 512` 是本 reference 的 prompt-processing 設定。

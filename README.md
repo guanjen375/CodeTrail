@@ -33,7 +33,7 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 ```
 
 - 第 5 步沒輸出,代表 `~/.local/bin` 不在 PATH:`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc` 後再試。
-- `./set_config.sh` 是**純問答**:逐題回答各角色模型、GPU、主模型運行模式(MoE 才問)、reranker ctx、主模型 ctx / threads,答完看一頁摘要(Enter 寫入 / q 離開)。沒有預設值、不推薦數值、也**不做容量估算**——工具只驗證輸入在合理範圍(選項 1/2 打 3 會重問);VRAM 塞不塞得下以啟動後 `nvidia-smi` 實測為準(`~/start.sh` 啟動完會提醒)。只有一個候選(或一顆 GPU)的題目自動選用。做的事與產物見 §3。要改配置(換模型 / 換 GPU / 換 ctx)隨時重跑它,舊設定自動備份、可用 `--restore-last-backup` 還原(搭配 `--dry-run` 可先預覽會還原什麼)。
+- `./set_config.sh` 是**純問答**:逐題回答各角色模型、GPU、主模型運行模式(MoE 才問)、主模型 n_ctx / threads,答完看一頁摘要(Enter 寫入 / q 離開)。主 n_ctx 沒有猜測預設，也**不做容量估算**；reranker/embedding/VL 的 ctx 是獨立 server 內部值，不再混成使用者題目。VRAM 塞不塞得下以啟動後 `nvidia-smi` 實測為準。只有一個候選(或一顆 GPU)的題目自動選用。做的事與產物見 §3。要改配置隨時重跑,舊設定自動備份、可用 `--restore-last-backup` 還原。
 - 安全預設:四個模型 server **只綁 `127.0.0.1`**(僅本機可連);要讓區網其他機器使用要明確 `./set_config.sh --allow-remote`(見 [docs/security.md](docs/security.md))。
 - 管理指令都掛在 `~/start.sh` 上:`~/start.sh status`(檢查四個 server)、`~/start.sh stop`(全部關閉,= `scripts/quit.sh`,關掉主模型 + 三顆附屬模型的所有 tmux 視窗,並**等到 process 退出、VRAM 從 nvidia-smi 消失才返回** — 大模型釋放記憶體需要數十秒是正常的,期間會印進度)、`~/start.sh logs [role] [-f]`(看 server log)、`~/start.sh help`(子命令說明)。
 - 重新啟動前要先 `~/start.sh stop`,tmux session 還在時 `~/start.sh` 會拒絕重複啟動;若是啟動中途失敗,launcher 會自動清理本次啟動的服務,修正後直接重跑即可。
@@ -68,7 +68,7 @@ README 的命令範例以 Ubuntu / Debian shell 為主。`aicode` 是 bash wrapp
 > 1. **CodeTrail MCP server 跑在 `set_config.sh` 當下偵測到的那顆 Python 上**(路徑會寫死進 `~/.config/opencode/opencode.json`),所以新開 shell 不必 activate 任何環境。如果你之後換了 Python 環境(重建 venv、升級系統 Python),**重跑一次 `./set_config.sh`** 讓它重新偵測。
 > 2. **四個 llama-server 都要起**:main `8080` + embedding `8081` + reranker `8082` + VL `8083`。三顆副模型是硬性需求,缺一個啟動前 preflight 就擋下;reranker 預設不降級。見 §3。
 > 3. **不要從 `$HOME` 或 `/` 啟動** —— 沙箱會直接拒絕。先 `cd` 進你要分析的**具體專案目錄**再跑。
-> 4. **換模型就重跑 `./set_config.sh` + 重啟 server**:TUI 按 `/models` 只切 OpenCode 的 model id,**不會 reload llama-server、也不會通知 CodeTrail MCP**。`set_config.sh` 會一次對齊 registry、deployment、opencode.json 的 `model` / `limit.context` 與啟動參數,之後 `scripts/quit.sh` → `~/start.sh` 重啟即可(ctx 上限 CodeTrail 會自動跟隨 server,不用手動調)。
+> 4. **換模型或主 n_ctx 就重跑 `./set_config.sh` + 重啟 server**:TUI 按 `/models` 只切 OpenCode 的 model id,**不會 reload llama-server、也不會通知 CodeTrail MCP**。主 n_ctx 只填一次；`set_config.sh` 會寫入 deployment / server `-c`，`aicode` 啟動時再讓 CodeTrail budget 與 OpenCode active model 的 `limit.context` 自動跟隨，不用另設 max。
 > 5. **啟動後立即 rollback,先看 server log**:`~/start.sh` 前台只會回報 process 已結束,真正根因用 `~/start.sh logs main` 查看;新 GGUF 也可能需要更新並重新 build llama.cpp。詳細判讀與修復見 [docs/troubleshooting.md](docs/troubleshooting.md)。
 > 6. **CodeTrail 沙箱鎖在「你啟動的那個資料夾」(`AICODE_ROOT`)** —— 綁在 process 上,**不會跟著你在 UI 切資料夾或切對話而移動**。web UI 那顆「切換資料夾」按鈕對 CodeTrail 無效(切過去還是只讀啟動目錄)。換專案 = 到那個目錄重新啟動一個(TUI 重開 `aicode`;web 另起一個 backend)。
 > 7. **web 模式目前是實驗性的(開發中)** —— 穩定、proven 的主力是 standalone TUI(`aicode` / `aicodex`);web 用來瀏覽器續問歷史 session,行為可能還會變。要可靠就用 TUI。
@@ -263,15 +263,11 @@ llama.cpp 的 embedding/reranking server 又會讓 batch 與 micro-batch 相同�
 0.7 GiB。數值會隨 llama.cpp、量化與 GPU 變動；`set_config.sh` 不做容量估算，
 實際值以啟動 log / `nvidia-smi` 為準。
 
-`set_config.sh` 會列出偵測到的 reranker 讓你選(多顆時必選,不自動挑),再問它的
-ctx(128..1048576,無預設值),並把同一數字同步寫到 `-c/-b/-ub`。影響很直接：
-每筆 `query + passage` 放得進 ctx 時，單純把上限加大**不會讓排序更準**；ctx 太小而使
-輸入失敗或必須截斷時，才可能漏掉後段關鍵證據。ctx 越大可接更長 passage，但更吃顯存；
-真的送入更多 token 時也更慢。CodeTrail 預設 chunk 約 600–1200 字元,可參考上面的
-量測自行取值(例如 Qwen3 配 2048、BGE 配 8192);若你調大 ingestion chunk,
-再取 4096/8192 並在啟動後用 `nvidia-smi` 確認。非互動可用
-`--rerank-model <GGUF絕對路徑> --rerank-ctx 2048`(`--yes` 之下這兩個旗標是必填,
-沒有任何自動預設)。
+`set_config.sh` 會列出偵測到的 reranker 讓你選(多顆時必選,不自動挑)。它是獨立
+aux server，`-c/-b/-ub` 屬於內部 buffer，不是主模型 n_ctx，也不再當成一般使用者題目；
+未指定時固定使用 8192。只有遇到 reranker OOM 或自行放大 passage 時，才用進階旗標
+`--rerank-ctx <128..1048576>` 覆寫(三個參數會同步)。每筆 `query + passage` 原本就放得下
+時，單純放大 buffer 不會讓排序更準。
 
 ### 2.4 VL 模型
 
@@ -297,7 +293,7 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 1. **前置檢查**:Python 依賴(mcp/numpy/requests)、`tmux`、`nvidia-smi`、`llama-server` 是否存在且支援必要旗標(`--reranking` / `--mmproj` / `--fit`;CPU-MoE 模式另需 `--cpu-moe`)。缺什麼直接在這一步就擋下並給**可複製的修復指令**(裝哪個套件、跑哪行 build),不會讓你答完所有問題才發現要重來;`llama-server` 因動態庫(如 CUDA lib)跑不起來時,會轉述原始錯誤並指向 `LD_LIBRARY_PATH`,不會誤報成「不支援旗標」。
 2. **偵測**:GPU 種類/VRAM、`~/models` 的 GGUF 自動分類成主聊天 / embedding / reranker / VL+mmproj 四類;多 shard 自動聚合並**驗證齊全性**(缺片直接列出檔名)。有 mmproj 的 VL 模型不會被排進 main 清單前面;四類缺一即在初步判定硬停。
-3. **互動問答(全部必答,無預設值)**:依序問各角色模型(列出候選,輸入編號或直接貼 .gguf 路徑;**只有一個候選時自動選用**)、各角色要綁哪顆 GPU(單卡自動)、主模型運行模式——讀 GGUF tensor table,**偵測到 MoE expert tensors 才問**是否啟用 CPU-MoE(y/n 必答;只影響 main),答 y 後再問 **`n-cpu-moe`(部分 offload)**:前 N 層 experts 留 RAM、其餘進 GPU,輸入超過最大 blk 編號 = 全部留 RAM(等同 `--cpu-moe`);接著問 reranker `ctx`(同步寫到 `-c/-b/-ub`)、主模型 `ctx` 與 `threads`。工具對每一題**只驗證輸入範圍**,不算容量、不給建議;三個附屬服務固定單 slot,最後啟動的 VL 用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用自動配置(這是 VL 的啟動機制,不是容量估算)。答完顯示**設定摘要一頁**:按 **Enter 寫入**;**q** 離開不寫檔。OpenCode context、MCP timeout/Python 路徑一併對齊。
+3. **互動問答(使用者選擇必答)**:依序問各角色模型(列出候選,輸入編號或直接貼 .gguf 路徑;**只有一個候選時自動選用**)、各角色要綁哪顆 GPU(單卡自動)、主模型運行模式——讀 GGUF tensor table,**偵測到 MoE expert tensors 才問**是否啟用 CPU-MoE(y/n 必答;只影響 main),答 y 後再問 **`n-cpu-moe`(部分 offload)**:前 N 層 experts 留 RAM、其餘進 GPU,輸入超過最大 blk 編號 = 全部留 RAM(等同 `--cpu-moe`);最後只問主模型 `ctx` 與 `threads`。reranker/embedding/VL 的 ctx 是各自 server 的內部值，不混成另一個主 n_ctx 題目；reranker 預設 internal buffer 8192，特殊情況才用 `--rerank-ctx`。工具只驗證輸入範圍,不算容量;三個附屬服務固定單 slot,最後啟動的 VL 用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用自動配置。答完顯示**設定摘要一頁**:按 **Enter 寫入**;**q** 離開不寫檔。OpenCode context、MCP timeout/Python 路徑一併對齊。
 4. **產生四個檔案**(transaction 寫入:要嘛全套完成、要嘛完全不動;既有檔自動備份 `*.bak-setconfig-<時間戳>`,`--restore-last-backup` 可整批還原):
 
 | 產物 | 內容 |
@@ -309,7 +305,7 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 結尾會自動印出**啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準;`~/start.sh` 啟動完成的最後一行也會提醒你用 `nvidia-smi` 稍微監控 GPU/VRAM(例如 `watch -n 1 nvidia-smi`),因為 set_config 不做任何容量估算。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
 
-非互動用法(自動化 / 重跑):`./set_config.sh --yes` 跳過提問與確認頁,但**所有互動題的值必須由旗標提供,缺哪個就報錯**(沒有任何自動預設):模型與 GPU 用 `--main-model` / `--main-gpu` / `--embed-gpu` / `--rerank-model` / `--rerank-gpu` / `--vl-gpu`(單一候選/單卡的題目自動選用,可省略),數值用 `--ctx` / `--threads` / `--rerank-ctx`,MoE 主模型另需 `--cpu-moe` / `--no-cpu-moe` / `--n-cpu-moe N` 三選一(模型不在 `~/models` 也可以:各 `--*-model` 給 .gguf 絕對路徑即可)。重跑**不沿用舊值**——每次設定完全來自本次作答/旗標(只有你手動加進 deployment.json 的取樣參數與 port/base_url 會保留)。`--allow-remote` 開放區網連線(未指定只綁 127.0.0.1)；`./set_config.sh --help` 看完整旗標。
+非互動用法(自動化 / 重跑):`./set_config.sh --yes` 跳過提問與確認頁,但**所有使用者選擇題的值必須由旗標提供,缺哪個就報錯**:模型與 GPU 用 `--main-model` / `--main-gpu` / `--embed-gpu` / `--rerank-model` / `--rerank-gpu` / `--vl-gpu`(單一候選/單卡的題目自動選用,可省略),數值只需 `--ctx` / `--threads`;`--rerank-ctx` 是非必要的進階 buffer override。MoE 主模型另需 `--cpu-moe` / `--no-cpu-moe` / `--n-cpu-moe N` 三選一。重跑**不沿用舊值**——每次設定完全來自本次作答/旗標(只有你手動加進 deployment.json 的取樣參數與 port/base_url 會保留)。`--allow-remote` 開放區網連線(未指定只綁 127.0.0.1)；`./set_config.sh --help` 看完整旗標。
 
 ### 3.2 啟動與停止
 
@@ -546,6 +542,8 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 
 `aicode` 啟動時會把**既有** `mcp.codetrail` entry 中缺漏、型別錯誤或小於 660000 的 `timeout` 自動同步為專案常數,保留其餘 OpenCode JSON 設定,並在同目錄留下 `opencode.json.codetrail.bak`(若已存在則加數字後綴)。寫入採原子替換;設定檔格式錯誤或無法寫入時會 fail-loud,不會帶著已知錯誤啟動 OpenCode。只有緊急測試才用 `AICODE_MCP_TIMEOUT_CHECK_SKIP=1 aicode` 跳過。
 
+主模型 context 也採同一原則：使用者只在 `set_config.sh` 設 `n_ctx`。`aicode` 會讀主 server `/props` 的實值，供 CodeTrail internal calls 使用，並把 OpenCode active model 的 `limit.context` 安全同步成同一值。同步只改該 model 的這一欄、原子寫入並留備份；無法唯一定位 model、JSON 損壞或寫入失敗時才 fail-loud。
+
 `aicode`（含 `aicode web`，不含只連既有 backend 的 `attach`）還會自動跑兩層工具健檢。第一層每次都直接對實際 MCP command 做 `initialize → tools/list → list_dir`，並要求工具集合精確等於文件列出的 17 個；第二層用 fresh `opencode run --format json` 要 active model 真正呼叫 `codetrail_list_dir`，只有 `tool_use.state.status=completed` 的結構化 event 才算 PASS，模型輸出的 XML／成功宣稱一律不算。模型層 PASS 依 OpenCode config、模型、server `/props`（含 chat template／取樣預設）、專案規則與版本指紋快取 24 小時；設定變更會自動失效。快取只有 hash／時間，不含 prompt、檔名或 tool output，臨時 canary session 也會在檢查後刪除。完整輸出與 override 見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。
 
 說明:
@@ -557,7 +555,7 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 - **解析到設定不等於每個版本都一定把它送進 request body**。OpenCode 的 custom `@ai-sdk/openai-compatible` provider 有已知的 `temperature` 傳遞問題([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));因此需要所有 client 都有一致的 server 預設時,仍應在 deployment profile 的 `services.main.parameters` 設 `temperature`。`top_p` / `top_k` / `min_p` 等 provider schema 不一定支援的參數也放 server 端。完整判讀與假工具呼叫排查見 [docs/troubleshooting.md](docs/troubleshooting.md#mcp-connected-but-no-tool-call);特定 5090/Qwen reference 值見 [docs/verified-reference-5090.md](docs/verified-reference-5090.md),不要套到未知模型。
 - **Connected 卻回答「沒有 CodeTrail」時,保留全域工具存在性規則作為模型約束**。新版 `aicode` 的自動 canary 會在進 TUI 前抓出 MCP 斷線、工具清單漂移與假 XML，但模型仍可能在後續某一輪隨機失手；`~/.config/opencode/AGENTS.md` 可明訂 17 個 `codetrail_*`、禁止假 XML / 假成功,並要求不確定時先做無副作用的 `codetrail_list_dir` 驗證。完整可複製範本(含 RAG 自發查詢、防杜撰與驗證紀律)見 [docs/opencode-agents-template.md](docs/opencode-agents-template.md);強制重測方式見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。`ingest_document` 只寫 KB,不會把整份文件永久塞進每個新 session,所以不要把「匯入後剛好亂答」直接判成 RAG context overflow。
 - **要壓「模型杜撰不存在的具體事實」(條號 / 日期 / 數字),在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則**(OpenCode 會自動把它載入每一段對話,含純聊天)。範例與原理見 [docs/troubleshooting.md](docs/troubleshooting.md);[全域範本](docs/opencode-agents-template.md)已內建「事實準確性」段。注意這個 `~/.config/opencode/AGENTS.md` 是 OpenCode runtime 的全域規則檔,跟本 repo 根目錄那份「給修改 CodeTrail 原始碼的 agent 看的」`AGENTS.md` 是兩回事。
-- `limit.context: 65536` 是 OpenCode 主對話實際塞給 server 的上限。它必須等於 llama-server 啟動時的 `-c <N>`(server 是 ctx 上限的唯一真值);CodeTrail 端的 ctx 上限會自動跟隨 server,所以你只要顧好「`limit.context` == server `-c`」這一個對齊就好(`set_config.sh` 產生時已對齊)。`aicode` 啟動時會檢查,不一致就拒絕啟動。
+- `limit.context: 65536` 是 OpenCode 對主 n_ctx 的 client-side 鏡像。正常不要分開調：用 `set_config.sh` 設一次主 n_ctx 並重啟 server；`aicode` 會觀測 server `-c` 的實值並自動同步此欄。
 - `permission` 區段:`*: deny` 是預設拒絕一切,只白名單 `codetrail_*`(經 CodeTrail 沙箱)。OpenCode 內建工具(`bash` / `read` / `write` 等)會繞過 CodeTrail 沙箱,所以這裡明確 `deny`。
 
 手動貼完先驗 JSON 格式:

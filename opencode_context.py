@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""Helpers for comparing OpenCode TUI context with CodeTrail context.
+"""Helpers for resolving OpenCode TUI context against the main n_ctx.
 
 OpenCode keeps the frontend chat budget in opencode.json as
 provider.<key>.models.<model>.limit.context. CodeTrail's own MCP/native LLM
-budget follows the main llama-server's real n_ctx (aicode auto-derives it; see
-config.DYNAMIC_NUM_CTX_MAX). The server's `-c <N>` is the single source of truth,
-so opencode.json limit.context must equal it — that is the one alignment a user
-still has to make by hand, because the OpenCode TUI talks to llama-server
-directly and bypasses CodeTrail.
+budget follows the main llama-server's real n_ctx. ``aicode`` transports that
+single value as AICODE_N_CTX and safely synchronizes this mirror before opening
+the TUI.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
 
+import n_ctx
 from model_resolution import (
     has_external_provider_prefix,
     load_first_opencode_config,
@@ -24,8 +22,9 @@ from model_resolution import (
     parse_cli_model_arg_detail,
 )
 
-
-DEFAULT_DYNAMIC_CTX_MAX = 65536
+DEFAULT_N_CTX = n_ctx.DEFAULT_N_CTX
+# External compatibility; new code should use DEFAULT_N_CTX.
+DEFAULT_DYNAMIC_CTX_MAX = DEFAULT_N_CTX
 
 
 @dataclass(frozen=True)
@@ -44,12 +43,14 @@ class OpenCodeContextLimit:
         return self.context is not None and not self.error
 
 
-def dynamic_ctx_max_from_env(env: Mapping[str, str] | None = None) -> int:
+def n_ctx_from_env(env: Mapping[str, str] | None = None) -> int:
     environ = env if env is not None else os.environ
-    raw = (environ.get("AICODE_DYNAMIC_NUM_CTX_MAX") or "").strip()
-    if not raw:
-        return DEFAULT_DYNAMIC_CTX_MAX
-    return int(raw)
+    return n_ctx.resolve_n_ctx(environ).value
+
+
+def dynamic_ctx_max_from_env(env: Mapping[str, str] | None = None) -> int:
+    """Deprecated compatibility alias for callers outside this repository."""
+    return n_ctx_from_env(env)
 
 
 def _provider_model_from_raw(raw: str) -> tuple[str, str] | None:
@@ -190,14 +191,14 @@ def resolve_active_opencode_context_limit(
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
-        contexts = {m.context for m in matches}
-        if len(contexts) == 1:
-            return matches[0]
         return OpenCodeContextLimit(
             path=path,
             raw_model=raw_model,
             model=model,
-            error="multiple matching OpenCode model entries have different limit.context values",
+            error=(
+                "multiple matching OpenCode model entries; use an explicit "
+                "provider/model id so an automatic update is unambiguous"
+            ),
             present=True,
         )
 

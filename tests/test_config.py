@@ -126,7 +126,9 @@ def test_numeric_thresholds_in_unit_range():
 
 
 def test_context_sizes_positive():
-    assert config.NUM_CTX > 0
+    assert config.N_CTX > 0
+    assert config.NUM_CTX == config.N_CTX
+    assert config.DYNAMIC_NUM_CTX_MAX == config.N_CTX
     assert config.MAX_TOTAL_CHARS > 0
     assert config.MAX_FILE_READ_CHARS > 0
     assert config.MAX_TOOL_LOOPS > 0

@@ -420,8 +420,7 @@ def test_effective_ctx_uses_requested_value():
 
 
 def test_dynamic_max_respected_when_caller_clamps():
-    # Simulate caller requesting a large ctx even though
-    # AICODE_NUM_CTX = 131072. We should reflect the clamped value.
+    # Telemetry keeps the legacy field name, but its value is the one N_CTX.
     usage = context_budget.build_usage(
         source="agent_tools",
         requested_num_ctx=65536,

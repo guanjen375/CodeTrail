@@ -63,8 +63,8 @@ aicode/doctor 與 `~/start.sh` 各讀一份設定(set_config 偵測到會警告)
 - VL 的 `mmproj`：同樣只接受 registry key 或 GGUF 絕對路徑。
 
 safe-defaults 的 reranker 是 `bge-reranker-v2-m3` Q8_0,保留
-`-c 8192 -b 8192 -ub 8192`。`set_config.sh` 會讓使用者輸入 reranker ctx
-(128..1048576,無預設值),並把所選值同步寫入這三個欄位;手動只改 `ctx`、
+`-c 8192 -b 8192 -ub 8192`。`set_config.sh` 正常沿用這個 internal buffer，不另外提問；
+特殊情況可用 `--rerank-ctx`(128..1048576)覆寫並同步三個欄位。手動只改 `ctx`、
 仍留著 8192 physical batch 的話,並不能解決 Qwen3 的 buffer 壓力。
 
 Qwen3-Reranker 是支援的 accuracy-first 選項(過往量測可參考 ctx 2048 約 2 GiB、
@@ -73,7 +73,7 @@ Qwen3-Reranker 是支援的 accuracy-first 選項(過往量測可參考 ctx 2048
 較大 ctx 可容納較長輸入,但配置更多顯存,實際處理更多 token 時延遲也會增加。
 Qwen3 是 causal 架構,除 compute buffer 外還有 KV cache,所以增幅遠高於 GGUF
 權重大小。`set_config.sh` 不做容量估算:啟動後用 `nvidia-smi` 實測,不夠時
-降低 reranker ctx、換 BGE、換較小 VL 或分卡,不應關閉 VL `--fit`。
+用 `--rerank-ctx` 降低 buffer、換 BGE、換較小 VL 或分卡,不應關閉 VL `--fit`。
 
 禁止 `extra_args`、shell 字串、相對 artifact path、帶控制字元的值。launcher 由驗證後
 欄位建立 argv，再逐參數 quote 給 tmux。

@@ -477,7 +477,9 @@ _ENV_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
             "base_url": ("AICODE_LLAMA_BASE_URL",),
             "port": ("MAIN_PORT", "AICODE_MAIN_PORT"),
             "bind": ("MAIN_BIND", "AICODE_BIND"),
-            "ctx": ("MAIN_CTX", "AICODE_MAIN_CTX"),
+            # AICODE_N_CTX is the one canonical main-context override.  Keep
+            # the older role-specific names after it for launcher compatibility.
+            "ctx": ("AICODE_N_CTX", "MAIN_CTX", "AICODE_MAIN_CTX"),
             "batch": ("MAIN_BATCH", "AICODE_MAIN_BATCH"),
             "ubatch": ("MAIN_UBATCH", "AICODE_MAIN_UBATCH"),
         },

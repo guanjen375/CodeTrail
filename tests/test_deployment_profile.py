@@ -27,6 +27,7 @@ PROFILE_ENV_KEYS = {
     "AICODE_RERANK_MODEL",
     "AICODE_VL_MODEL",
     "AICODE_VL_MMPROJ",
+    "AICODE_N_CTX",
     "EMBED_MODEL",
     "RERANK_MODEL",
     "VL_GGUF",
@@ -99,6 +100,14 @@ def test_precedence_cli_env_over_local_over_profile_over_defaults(tmp_path):
     assert effective.service("main").model == "cli-main"
     assert effective.service("main").ctx == 98304
     assert effective.service("embedding").ctx == 8192  # inherited safe default
+
+
+def test_canonical_n_ctx_override_wins_over_legacy_main_ctx(tmp_path):
+    effective = load_effective_profile(
+        _env(tmp_path, AICODE_N_CTX="57344", MAIN_CTX="32768")
+    )
+
+    assert effective.service("main").ctx == 57344
 
 
 def test_profile_selector_precedence_cli_then_env_then_local(tmp_path):

@@ -1,4 +1,4 @@
-"""set_config reranker ctx 問答與寫入的離線回歸測試(無預設值、只驗證範圍)。"""
+"""Reranker internal buffer defaults quietly and keeps an advanced override."""
 from pathlib import Path
 
 from scripts import set_config as sc
@@ -11,38 +11,22 @@ def _candidate(tmp_path: Path, name: str, size_mib: int = 610) -> sc.ModelCandid
     return sc.ModelCandidate(path=path, total_bytes=path.stat().st_size, shards=1)
 
 
-def test_reranker_ctx_question_has_no_default_and_validates_range(
-    tmp_path, monkeypatch, capsys
-):
+def test_reranker_buffer_uses_internal_default_without_prompt(tmp_path, monkeypatch, capsys):
     candidate = _candidate(tmp_path, "qwen3-reranker-0.6b-q8_0.gguf")
     prompts: list[str] = []
-    answers = iter(["", "1", "2048"])  # Enter 與低於下限都不被接受
 
     def fake_input(prompt: str) -> str:
         prompts.append(prompt)
-        return next(answers)
+        raise AssertionError("reranker internal buffer 不應成為互動題")
 
     monkeypatch.setattr(sc, "_input", fake_input)
 
     ctx = sc.choose_reranker_ctx(candidate, override=None, assume_yes=False)
     output = capsys.readouterr().out
 
-    assert ctx == 2048
-    assert len(prompts) == 3
-    assert all(
-        prompt == (
-            f"reranker context(-c/-b/-ub)({sc.MIN_RERANKER_CTX}.."
-            f"{sc.MAX_RERANKER_CTX}): "
-        )
-        for prompt in prompts
-    )
-    # 中性的機制說明仍在;不再有模型別建議值
-    assert "ctx 設更大不會讓排序更準" in output
-    assert "太小導致失敗/截斷時才會漏證據" in output
-    assert "更吃顯存" in output
-    assert "實際送入更多 token 時也會更慢" in output
-    assert "建議" not in output
-    assert f"請輸入 {sc.MIN_RERANKER_CTX}..{sc.MAX_RERANKER_CTX} 的整數" in output
+    assert ctx == sc.DEFAULT_RERANKER_CTX
+    assert prompts == []
+    assert output == ""
 
 
 def test_reranker_ctx_flag_and_yes_share_the_same_bounds(tmp_path):
@@ -58,13 +42,10 @@ def test_reranker_ctx_flag_and_yes_share_the_same_bounds(tmp_path):
     else:
         raise AssertionError("低於下限的旗標值必須報錯")
 
-    # --yes 沒給旗標 → 指名 --rerank-ctx 報錯,不用任何預設值
-    try:
+    assert (
         sc.choose_reranker_ctx(candidate, override=None, assume_yes=True)
-    except sc.SetupError as exc:
-        assert "--rerank-ctx" in str(exc)
-    else:
-        raise AssertionError("--yes 缺 --rerank-ctx 必須報錯")
+        == sc.DEFAULT_RERANKER_CTX
+    )
 
 
 def test_selected_reranker_ctx_sets_context_and_physical_batch(tmp_path):

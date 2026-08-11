@@ -61,7 +61,7 @@ aicode
 - `tests/test_deployment_profile.py` — profile schema/precedence、惡意值拒絕、registry/mmproj、main/aux GPU precedence、`-ngl auto --fit` 參數驗證
 - `tests/test_deployment_status.py` — port/cmdline role 辨識、錯卡/錯模型;process 與 HTTP 都用 hook
 - `tests/test_profile_server_launchers.py` — start-all/main、quit.sh 與所有舊 launcher 的離線 dry-run 相容性
-- `tests/test_set_config.py` — `set_config.sh` 的前置檢查(llama-server/依賴缺失通知)、GPU/模型偵測分類、shard 齊全性、mmproj 多重配對、純問答契約(互動題無預設值、選項外輸入重問、`--yes` 缺旗標指名報錯、超大配置不被容量擋下)、start.sh 結尾 nvidia-smi 提醒、VL 不自動當 main、摘要確認/離開、opencode.json 合併、bind 安全預設、legacy env 清除、transaction restore 與 end-to-end dry-run;I/O 全用 fixture
+- `tests/test_set_config.py` — `set_config.sh` 的前置檢查(llama-server/依賴缺失通知)、GPU/模型偵測分類、shard 齊全性、mmproj 多重配對、純問答契約(使用者選擇題無預設值、reranker internal buffer 不提問、選項外輸入重問、`--yes` 缺旗標指名報錯、超大配置不被容量擋下)、start.sh 結尾 nvidia-smi 提醒、VL 不自動當 main、摘要確認/離開、opencode.json 合併、bind 安全預設、legacy env 清除、transaction restore 與 end-to-end dry-run;I/O 全用 fixture
 - `tests/test_set_config_cpu_moe.py` — 主模型 CPU-MoE 分流(MoE 才詢問、y/n 必答、dense 給 `--cpu-moe` 旗標要報錯)、GGUF expert tensor 解析(含 per-layer 編號與 split shard)、choose_n_cpu_moe 純輸入驗證(0..1024、超過最大 blk 編號=全放 RAM)、build_main_parameters 參數組裝、`cpu_moe`/`n_cpu_moe` main-only schema/argv;完全離線且大檔用 sparse fixture
 - `tests/test_launch_rollback.py` — launcher 啟動失敗的 rollback(pipe-pane 持久 log、清理本次 tmux session、`AICODE_NO_ROLLBACK`)與依模型大小放大的 health timeout;tmux 用 monkeypatch
 
@@ -172,7 +172,7 @@ CodeTrail 自己對 llama-server `/completion` 與 `/v1/chat/completions` 發送
 telemetry」流程。OpenCode TUI 也走 `/v1/chat/completions` 但走的是它自己的 client
 (`@ai-sdk/openai-compatible`),**不會** 經過這個模組,所以它的 context 仍然要靠
 llama-server 啟動時 `-c <N>` 與 OpenCode `model.limit.context` 對齊。`scripts/doctor.py`
-會掃這兩條管線是否打架,但不會自動改 OpenCode 的設定。
+只掃描、絕不寫檔；正常 `aicode` preflight 則會針對 active model 原子同步這個鏡像欄位並留備份。
 
 ### 模組分工
 
@@ -239,7 +239,7 @@ context_budget.log_metrics(usage)
 
 `context_budget.py` 守的是「prompt 會不會超出 ctx 上限」(正確性);
 `gpu_safety.py` 守的是「使用者要求的 ctx 上限會不會超過 llama-server 啟動時的 `-c <N>`」
-(會被 server 端 truncation)。兩者不重疊。注意 `gpu_safety.py` 本身只判 `>`(容量);把它收緊成「requested 必須等於 server n_ctx」的是下表的 gate `scripts/ctx_safety_check.py`。
+(會被 server 端 truncation)。兩者不重疊；容量閘只拒絕 `requested > server n_ctx`，較小值雖未用滿容量但不會截斷。
 
 llama-server 啟動時 `-c <N>` 已經把 ctx + KV cache 鎖死,所以 doctor / safety check
 **不再做 VRAM / weights / KV cache 預測計算** — 改成「server 自己說 n_ctx 是多少」
@@ -250,9 +250,10 @@ llama-server 啟動時 `-c <N>` 已經把 ctx + KV cache 鎖死,所以 doctor / 
 | 模組 / 入口 | 責任 |
 |---|---|
 | `gpu_safety.py` | 純 library:`query_gpu_info()` 跑 nvidia-smi 拿 GPU info(純診斷)、`query_server_info()` 打 llama-server `/props` 抓 `default_generation_settings.n_ctx` + `model_path`、`check_safety(requested_ctx, base_url)` 比對後包成 `SafetyVerdict`。所有 I/O 都用 hook 參數注入,測試可完全離線 mock。 |
-| `scripts/resolve_server_ctx.py` | CLI 取值器。讀主 llama-server `/props` 拿真實 `n_ctx`,只把這個整數印到 stdout(讀不到就印空字串、永遠 exit 0,不擋啟動)。`aicode` wrapper 在使用者「沒手動設」`AICODE_DYNAMIC_NUM_CTX_MAX` 時跑它,把結果 export 進環境 —— 這就是「CodeTrail ctx 上限自動跟隨 server」的實作。server `-c <N>` 是唯一真值,使用者通常不用碰這個 env var。 |
-| `scripts/ctx_safety_check.py` | CLI 入口(容量閘)。讀 env (`AICODE_MODEL` 必填; 沒設 / placeholder 直接 exit 2 — CodeTrail 不假定預設主模型 / `AICODE_DYNAMIC_NUM_CTX_MAX` / `AICODE_LLAMA_BASE_URL`),呼 `gpu_safety.check_safety()`:**requested 只要 `<=` server n_ctx 就 `SAFE` 放行;只有 `>`(`UNSAFE`,prompt 會被截斷)才 refuse**。因為上面 resolve_server_ctx 已把 requested 自動帶成 == server,這道閘正常都過,真正會擋的是「使用者手動把 `AICODE_DYNAMIC_NUM_CTX_MAX` 設得比 server `-c` 還大」。依 verdict 與 `AICODE_ACCEPT_CTX_RISK` / `AICODE_CTX_SAFETY_DISABLE` 決定 exit code。aicode wrapper 啟動時會先用 `scripts/resolve_main_model.py` 把 env / CLI 旗標 / opencode.json 解析成 bare model name 並 export AICODE_MODEL；若 `AICODE_MODEL` 和 opencode.json 同時存在且沒有 CLI `-m/--model` override,兩者必須解析到同一顆 GGUF（同一路徑的不同 registry alias 可接受）,避免 TUI 與 MCP 用不同模型。 |
-| `opencode_context.py` / `scripts/opencode_ctx_check.py` | 解析 OpenCode active model 的 `provider.*.models.*.limit.context`,並在 `aicode` 啟動前確認它等於 CodeTrail 的 ctx 上限(= 已自動跟隨的 server `-c`)。這是使用者**唯一還要手動對齊**的數字,守的是「OpenCode TUI 會不會提早 compact / 和 CodeTrail MCP 使用不同 ctx 預算」—— 因為 TUI 直接打 llama-server、繞過 CodeTrail,CodeTrail 設不了它。`AICODE_ACCEPT_CTX_RISK=1` 可一次性放行,`AICODE_CTX_SAFETY_DISABLE=1` 可跳過。 |
+| `n_ctx.py` / `config.py::N_CTX` | 主模型 n_ctx 的集中解析。正常設定入口是 `set_config.sh --ctx`；runtime 以 `AICODE_N_CTX` 傳遞 server 實值。`NUM_CTX` / `DYNAMIC_NUM_CTX_MAX` 只保留程式碼相容 alias，永遠等於 `N_CTX`。舊 `AICODE_DYNAMIC_NUM_CTX_MAX` 只暫時相容讀取並警告 deprecated。 |
+| `scripts/resolve_server_ctx.py` | CLI 取值器。讀主 llama-server `/props` 拿真實 `n_ctx`，只把整數印到 stdout(讀不到就印空字串、永遠 exit 0)。`aicode` 將實值 export 成 `AICODE_N_CTX`；讀不到時回到 deployment profile 的 `services.main.ctx`。 |
+| `scripts/ctx_safety_check.py` | CLI 入口(容量閘)。讀 `AICODE_MODEL` / 主 n_ctx / `AICODE_LLAMA_BASE_URL`，呼 `gpu_safety.check_safety()`；requested `<=` server n_ctx 放行，只有 `>` 才 refuse。安全 gate、`AICODE_ACCEPT_CTX_RISK` 與 `AICODE_CTX_SAFETY_DISABLE` 仍保留。 |
+| `opencode_context.py` / `scripts/opencode_ctx_check.py` | 解析 OpenCode active model 的 `provider.*.models.*.limit.context`。純檢查模式不寫檔；`aicode` 使用 `--fix`，只同步 active model 的該欄、保留其他 JSON、原子替換並建立 `.codetrail.bak`。無法唯一定位、解析或寫入時 fail-loud；`AICODE_ACCEPT_CTX_RISK=1` 可維持不一致而不寫入。 |
 | `scripts/opencode_mcp_timeout_check.py` | OpenCode MCP client timeout 契約。純檢查模式供診斷；`aicode` 使用 `--fix`，只在既有 `mcp.codetrail` entry 內將缺漏、無效或過短的 `timeout` 提升到 `config.OPENCODE_MCP_TIMEOUT_MIN_MS`。修復會保留其他 JSON 欄位、原子替換並建立 `.codetrail.bak`；設定無法解析/寫入則 fail-loud。 |
 | `context_budget.py::_emit_runtime_offload_check_once` | runtime 觀測 hook:`[CTX] WARNING` 或 `[CTX_OVERFLOW]` 觸發時順手查一次 `/slots` + `/props`,把 server 真實 n_ctx / 忙碌 slot 數 黏在 log 後面。每個 process 只跑一次,任何錯誤靜默吞掉。 |
 
@@ -262,14 +263,16 @@ llama-server 啟動時 `-c <N>` 已經把 ctx + KV cache 鎖死,所以 doctor / 
 - **UNKNOWN 一律放行**:server 不可連 / `/props` 沒給 n_ctx → 只 warn 不擋。否則 CI、遠端 server、新版 server 改 schema 時會被卡住。
 - **server 是 source of truth**:不再做 KV cache 公式預測;server `-c` 就是答案。
 
-### 四個 escape env var
+### 進階 / escape 設定
 
 | Env | 行為 | 何時用 |
 |---|---|---|
-| `AICODE_DYNAMIC_NUM_CTX_MAX=<N>` | 進階覆寫 CodeTrail 端 ctx 上限(預設自動跟隨 server n_ctx,通常不用設) | 想讓 CodeTrail 用比 server 小的 ctx 時 |
-| 重啟 server 改 `-c <N>` | 物理上限 | 想拉大 ctx 時的根本解法 |
+| `AICODE_N_CTX=<N>` | 單次覆寫主 n_ctx；仍須通過 server capacity gate | 測試 / 特殊 launcher；正常使用改跑 `set_config.sh` |
+| 重跑 `set_config.sh` 並重啟 server | 更新主 n_ctx | 一般使用者唯一需要的設定方式 |
 | `AICODE_ACCEPT_CTX_RISK=1` | UNSAFE 也 exit 0,但仍印完整 verdict | 一次性實測 truncation 影響 |
 | `AICODE_CTX_SAFETY_DISABLE=1` | 整個 check 跳過,連 verdict 都不算 | CI / 自動化、緊急逃生 |
+
+`AICODE_DYNAMIC_NUM_CTX_MAX` 與 `AICODE_NUM_CTX` 已 deprecated；不要再寫進 shell profile。
 
 ### 沒有解的事(刻意留)
 

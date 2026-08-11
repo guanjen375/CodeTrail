@@ -21,7 +21,7 @@ def _server_verdict_factory(status: str, server_n_ctx: int):
     """回一個假 check_safety:固定 server_n_ctx,status 由呼叫端指定。
 
     gate 是拿 env 推出的 requested 跟 verdict.server_n_ctx 比,所以這裡只要把
-    server_n_ctx 釘住,測試端用 AICODE_DYNAMIC_NUM_CTX_MAX 控制 requested 即可。
+    server_n_ctx 釘住,測試端用 AICODE_N_CTX 控制 requested 即可。
     """
 
     def fake_check_safety(requested, base_url="http://localhost:8080", **_kw):
@@ -42,7 +42,7 @@ def _server_verdict_factory(status: str, server_n_ctx: int):
 def test_ctx_safety_passes_when_requested_equals_server(monkeypatch, capsys):
     """requested == server n_ctx → SAFE,放行 (exit 0)。"""
     monkeypatch.setenv("AICODE_MODEL", "custom-model")
-    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65536")
+    monkeypatch.setenv("AICODE_N_CTX", "65536")
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
     monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
     monkeypatch.setattr(
@@ -63,7 +63,7 @@ def test_ctx_safety_passes_when_requested_below_server(monkeypatch, capsys):
     不會被無謂擋住,也是把舊版 e129d48「小於就 refuse」死鎖拿掉的回歸測試。
     """
     monkeypatch.setenv("AICODE_MODEL", "custom-model")
-    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "32768")
+    monkeypatch.setenv("AICODE_N_CTX", "32768")
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
     monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
     monkeypatch.setattr(
@@ -80,7 +80,7 @@ def test_ctx_safety_passes_when_requested_below_server(monkeypatch, capsys):
 def test_ctx_safety_unsafe_allows_with_accept_risk(monkeypatch, capsys):
     """requested > server n_ctx 但設了 AICODE_ACCEPT_CTX_RISK=1 → 放行 (exit 0)。"""
     monkeypatch.setenv("AICODE_MODEL", "custom-model")
-    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65536")
+    monkeypatch.setenv("AICODE_N_CTX", "65536")
     monkeypatch.setenv("AICODE_ACCEPT_CTX_RISK", "1")
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
     monkeypatch.setattr(
@@ -96,7 +96,7 @@ def test_ctx_safety_unsafe_allows_with_accept_risk(monkeypatch, capsys):
 def test_ctx_safety_unsafe_when_requested_above_server(monkeypatch, capsys):
     """requested > server n_ctx → UNSAFE (截斷風險),擋住 (exit 2)。"""
     monkeypatch.setenv("AICODE_MODEL", "custom-model")
-    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65536")
+    monkeypatch.setenv("AICODE_N_CTX", "65536")
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
     monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
     monkeypatch.setattr(
@@ -107,15 +107,14 @@ def test_ctx_safety_unsafe_when_requested_above_server(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "UNSAFE" in out
     assert "8192" in out
-    # 主要修法:拿掉手動的 AICODE_DYNAMIC_NUM_CTX_MAX 讓 CodeTrail 自動跟隨 server
-    assert "自動跟隨 server" in out
+    assert "set_config.sh" in out
     assert "refuse to start" in out
 
 
 def test_ctx_safety_fails_loud_when_env_missing(monkeypatch, capsys):
     """CodeTrail 不內建主模型: AICODE_MODEL 未設時必須 fail-loud (exit 2)。"""
     monkeypatch.delenv("AICODE_MODEL", raising=False)
-    monkeypatch.delenv("AICODE_DYNAMIC_NUM_CTX_MAX", raising=False)
+    monkeypatch.delenv("AICODE_N_CTX", raising=False)
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
 
     called = {"hit": False}
@@ -136,7 +135,7 @@ def test_ctx_safety_fails_loud_when_env_missing(monkeypatch, capsys):
 def test_ctx_safety_fails_loud_on_placeholder_model(monkeypatch, capsys):
     """值是 `<CODE_MODEL>` 之類 placeholder 也要 fail-loud。"""
     monkeypatch.setenv("AICODE_MODEL", "<CODE_MODEL>")
-    monkeypatch.delenv("AICODE_DYNAMIC_NUM_CTX_MAX", raising=False)
+    monkeypatch.delenv("AICODE_N_CTX", raising=False)
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
 
     called = {"hit": False}
@@ -162,13 +161,24 @@ def test_ctx_safety_disable_short_circuits_even_without_model(monkeypatch, capsy
     assert "disabled via AICODE_CTX_SAFETY_DISABLE" in out
 
 
+def test_ctx_safety_rejects_invalid_canonical_n_ctx(monkeypatch, capsys):
+    monkeypatch.setenv("AICODE_MODEL", "custom-model")
+    monkeypatch.setenv("AICODE_N_CTX", "not-a-number")
+    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
+
+    assert ctx.main() == 2
+    out = capsys.readouterr().out
+    assert "AICODE_N_CTX" in out
+    assert "refuse to start" in out
+
+
 def test_ctx_safety_uses_resolved_model_from_env(monkeypatch):
     """新版 check_safety(requested_ctx, base_url=...) 簽名 — 不再吃 model。
     這個 test 確認 ctx_safety_check.main 走到 gpu_safety.check_safety 並帶入正確
     requested ctx 與 base_url。
     """
     monkeypatch.setenv("AICODE_MODEL", "custom-model")
-    monkeypatch.delenv("AICODE_DYNAMIC_NUM_CTX_MAX", raising=False)
+    monkeypatch.setenv("AICODE_N_CTX", "65536")
     monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
     monkeypatch.setenv("AICODE_LLAMA_BASE_URL", "http://example.test:8080")
 
@@ -182,5 +192,5 @@ def test_ctx_safety_uses_resolved_model_from_env(monkeypatch):
     monkeypatch.setattr(ctx.gpu_safety, "check_safety", fake_check_safety)
 
     assert ctx.main() == 0
-    assert calls["requested"] == ctx.DEFAULT_CTX_MAX
+    assert calls["requested"] == ctx.n_ctx.DEFAULT_N_CTX
     assert calls["base_url"] == "http://example.test:8080"

@@ -4,7 +4,7 @@ nvidia-smi、llama-server 都用 PATH / LLAMA_BIN 上的 stub、模型目錄用 
 fixture、HOME 指到 tmp,完全不需要 GPU / 真 llama-server / 真模型。
 tmux session 名稱指到不存在的名字,避免碰到開發機上真的 CodeTrail session。
 
-新契約(2026-08-06):set_config 不做容量估算、不推薦數值、互動題沒有預設值;
+新契約(2026-08-06):set_config 不做容量估算、不推薦主模型數值、使用者選擇題沒有預設值;
 只驗證輸入在合理範圍。--yes = 純旗標非互動,缺哪個值就報錯。
 VRAM 塞不塞得下由使用者以啟動後 nvidia-smi 實測(start.sh 結尾提醒)。
 """
@@ -39,8 +39,8 @@ _PROFILE_ENV_KEYS = set(RUNTIME_OVERRIDE_ENV_KEYS) | {
     "OPENCODE_CONFIG",  # set_config 會尊重它;開發機殼層若有設定不得洩漏進測試
 }
 
-# --yes 的數值旗標(互動題沒有預設值 → 非互動一律得給)。
-NUM_FLAGS = ("--ctx", "65536", "--threads", "8", "--rerank-ctx", "8192")
+# --yes 的主模型數值旗標(使用者題沒有預設值 → 非互動一律得給)。
+NUM_FLAGS = ("--ctx", "65536", "--threads", "8")
 # 標準 fixture(TWO_GPUS + _make_models):main 有 2 個候選(big-chat + VL)、
 # reranker 有 2 個(bge + qwen3)、兩顆 GPU → 這些都要旗標;
 # embedding / VL 只有一個候選會自動選用。
@@ -53,11 +53,11 @@ YES_TWO_GPU = (
 YES_ONE_GPU = ("--yes", "--main-model", "1", "--rerank-model", "1", *NUM_FLAGS)
 
 # 標準 fixture 的互動作答順序:
-# main 編號、main GPU、embed GPU、reranker 編號、reranker GPU、reranker ctx、
-# VL GPU、主模型 ctx、threads、摘要確認。
+# main 編號、main GPU、embed GPU、reranker 編號、reranker GPU、VL GPU、
+# 主模型 ctx、threads、摘要確認。reranker internal buffer 自動使用 8192。
 # (big-chat 是非 GGUF 假檔 → 無法解析 layout → 不會問 CPU-MoE;
 #  embedding / VL 單一候選自動選用。)
-STDIN_STANDARD = "1\n0\n1\n1\n1\n8192\n1\n65536\n8\n\n"
+STDIN_STANDARD = "1\n0\n1\n1\n1\n1\n65536\n8\n\n"
 
 
 def _sparse(path: Path, size: int) -> None:
@@ -230,6 +230,7 @@ def test_help_is_offline_and_exits_zero(tmp_path):
     assert "--n-cpu-moe" in proc.stdout
     assert "--allow-remote" in proc.stdout
     assert "--rerank-ctx" in proc.stdout
+    assert "--n-ctx" in proc.stdout
     # 容量/建議機制已移除:相關旗標不得再出現
     assert "--advanced" not in proc.stdout
     assert "--ignore-capacity" not in proc.stdout
@@ -431,6 +432,7 @@ def test_generated_start_sh_clears_legacy_env_overrides(tmp_path):
     env = _env(tmp_path)
     env["EMBED_MODEL"] = "/bogus/does-not-exist.gguf"   # 模擬 .bashrc 殘留的舊 override
     env["MAIN_CTX"] = "1234"
+    env["AICODE_N_CTX"] = "2048"
     proc = subprocess.run(
         ["bash", str(tmp_path / "home" / "start.sh"), "--dry-run"],
         env=env,
@@ -445,13 +447,13 @@ def test_generated_start_sh_clears_legacy_env_overrides(tmp_path):
 
 
 def test_interactive_flow_answers_everything_and_validates_ranges(tmp_path):
-    """互動 = 純問答:沒有預設值(Enter 不可過關)、選項外的輸入會重問。"""
+    """使用者選擇題沒有預設值(Enter 不可過關)、選項外輸入會重問。"""
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
 
     # main 先按 Enter(無效)再輸入 3(超出 1..2,無效)才輸入 1;
     # main GPU 先輸入 5(不存在)再輸入 0;其餘照標準作答。
-    stdin = "\n3\n1\n5\n0\n1\n1\n1\n8192\n1\n65536\n8\n\n"
+    stdin = "\n3\n1\n5\n0\n1\n1\n1\n1\n65536\n8\n\n"
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models), stdin=stdin)
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "【主聊天模型】 — 偵測到的候選" in proc.stdout
@@ -484,7 +486,7 @@ def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
         cwd=REPO_ROOT,
         env={**_env(tmp_path), "HOME": str(home2), "USERPROFILE": str(home2)},
         # 全部答完,摘要頁按 q → 不寫入
-        input="1\n0\n1\n1\n1\n8192\n1\n65536\n8\nq\n",
+        input="1\n0\n1\n1\n1\n1\n65536\n8\nq\n",
         capture_output=True,
         text=True,
         timeout=60,
@@ -502,7 +504,7 @@ def test_summary_invalid_input_reprompts_instead_of_aborting(tmp_path):
     models = _make_models(tmp_path)
     proc = _run(
         tmp_path, "--no-preview", "--models-dir", str(models),
-        stdin="1\n0\n1\n1\n1\n8192\n1\n65536\n8\nzz\nq\n",
+        stdin="1\n0\n1\n1\n1\n1\n65536\n8\nzz\nq\n",
     )
     assert proc.returncode == 0, proc.stderr
     assert "無效輸入 'zz'" in proc.stdout
@@ -1073,9 +1075,9 @@ def test_interactive_prompt_accepts_typed_n_cpu_moe(tmp_path):
     models = _moe_models_needing_cpu_moe(tmp_path)
 
     # main、main GPU、CPU-MoE=y、n-cpu-moe 先 abc(無效)再 3、embed GPU、
-    # reranker、reranker GPU、reranker ctx、VL GPU、ctx、threads、摘要確認。
+    # reranker、reranker GPU、VL GPU、ctx、threads、摘要確認。
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\ny\nabc\n3\n1\n1\n1\n8192\n1\n65536\n8\n\n")
+                stdin="1\n0\ny\nabc\n3\n1\n1\n1\n1\n65536\n8\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "【主模型 n-cpu-moe(部分 CPU-MoE)】" in proc.stdout
@@ -1092,7 +1094,7 @@ def test_interactive_n_cpu_moe_over_max_index_means_full_cpu_moe(tmp_path):
     models = _moe_models_needing_cpu_moe(tmp_path)
 
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\ny\n42\n1\n1\n1\n8192\n1\n65536\n8\n\n")
+                stdin="1\n0\ny\n42\n1\n1\n1\n1\n65536\n8\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "輸入 ≥ 10 = 全部 experts 留 RAM" in proc.stdout
@@ -1107,7 +1109,7 @@ def test_interactive_mode_question_requires_explicit_y_or_n(tmp_path):
     models = _moe_models_needing_cpu_moe(tmp_path)
 
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n\nx\nn\n1\n1\n1\n8192\n1\n65536\n8\n\n")
+                stdin="1\n0\n\nx\nn\n1\n1\n1\n1\n65536\n8\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "請輸入 y 或 n" in proc.stdout
@@ -1139,7 +1141,7 @@ def test_build_without_n_cpu_moe_support_degrades_to_full_cpu_moe(tmp_path):
     models = _moe_models_needing_cpu_moe(tmp_path)
 
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\ny\n1\n1\n1\n8192\n1\n65536\n8\n\n")
+                stdin="1\n0\ny\n1\n1\n1\n1\n65536\n8\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "不支援 --n-cpu-moe" in proc.stdout
@@ -1371,17 +1373,16 @@ def test_relative_models_dir_and_llama_bin_are_stored_absolute(tmp_path):
     assert "export LLAMA_BIN=./llama-server" not in content
 
 
-def test_interactive_reranker_ctx_validates_range(tmp_path):
-    """互動輸入與 CLI 用同一組上下限:reranker ctx=1 不得被接受寫入。"""
+def test_reranker_buffer_defaults_and_advanced_override_validates_range(tmp_path):
+    """Reranker buffer 不再提問，預設 8192；進階 CLI override 仍嚴格驗證。"""
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
-    # 標準作答,但 reranker ctx 先給 1(拒絕)再給 256。
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n1\n1\n1\n1\n256\n1\n65536\n8\n\n")
+                stdin=STDIN_STANDARD)
     assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "無效輸入:請輸入 128..1048576 的整數" in proc.stdout
+    assert "【reranker ctx】" not in proc.stdout
     deployment = _read_deployment(tmp_path)
-    assert deployment["services"]["reranker"]["ctx"] == 256
+    assert deployment["services"]["reranker"]["ctx"] == 8192
 
     cli = _run(tmp_path, "--yes", "--rerank-ctx", "1", "--models-dir", str(models))
     assert cli.returncode == 2
@@ -1393,7 +1394,7 @@ def test_interactive_main_ctx_rejects_above_maximum(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n1\n1\n1\n8192\n1\n9999999\n65536\n8\n\n")
+                stdin="1\n0\n1\n1\n1\n1\n9999999\n65536\n8\n\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "無效輸入:請輸入 1024..1048576 的整數" in proc.stdout
     assert _read_deployment(tmp_path)["services"]["main"]["ctx"] == 65536
@@ -1543,9 +1544,9 @@ def test_flat_dir_vl_pairing_asks_explicitly_in_interactive(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_flat_vl_models(tmp_path)
     # main(3 候選選 1)、main GPU、embed GPU、reranker 唯一自動、reranker GPU、
-    # reranker ctx、VL 明確選 [2] media-large、VL GPU、ctx、threads、摘要確認。
+    # VL 明確選 [2] media-large、VL GPU、ctx、threads、摘要確認。
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n1\n1\n8192\n2\n1\n65536\n8\n\n")
+                stdin="1\n0\n1\n1\n2\n1\n65536\n8\n\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "【VL 模型】 — 偵測到的候選" in proc.stdout
     deployment = _read_deployment(tmp_path)

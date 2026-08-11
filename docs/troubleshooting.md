@@ -507,14 +507,9 @@ aicode
 
 ### `[ctx-safety] refuse to start.` 啟動被擋
 
-> **唯一真值是 server `-c`**:ctx 上限由 llama-server 啟動時的 `-c <N>` 決定。CodeTrail 端(`AICODE_DYNAMIC_NUM_CTX_MAX`)會在 `aicode` 啟動時**自動跟隨** server 的真實 `n_ctx`,你不用手動設它。**唯一要你手動對齊的是 OpenCode active model 的 `limit.context` 也要 == server `-c`**;`aicode` 啟動時的 `[ctx-align]` 會檢查這一個,不等就拒絕。
->
-> 為什麼這一個要手動顧:OpenCode TUI 的主對話**不經過 CodeTrail**、直接打 llama-server,CodeTrail 設不了它的 `limit.context`。設太小 TUI 會提早 compact、設太大會被 server 截斷。所以正常流程就兩步:設好 server `-c`、把 opencode.json 的 `limit.context` 設成同一個數字。
+主模型現在只有一個 `n_ctx`：正常在 `./set_config.sh` 輸入一次，產生 deployment 的 `services.main.ctx` 與 server `-c`。`aicode` 啟動時會讀 server `/props` 的實值，供 CodeTrail 使用並同步 OpenCode active model 的 `limit.context`；不需要另設 max。
 
-`[ctx-safety]` 是一道**容量閘**:確認 CodeTrail 端的 ctx 上限不會「超過」server 真實 `-c`(超過會截斷 prompt)。因為 CodeTrail 已自動跟隨 server,這道閘正常都是 `SAFE` 直接過;會被它擋下,通常代表你**自己手動**設了一個比 server `-c` 還大的 `AICODE_DYNAMIC_NUM_CTX_MAX`:
-
-- `AICODE_DYNAMIC_NUM_CTX_MAX` **大於** server `-c` → 標 `UNSAFE`:超過 server 真實上限,prompt 會被截斷(真正危險)→ 拒絕啟動。
-- `AICODE_DYNAMIC_NUM_CTX_MAX` **小於等於** server `-c` → `SAFE` 放行(「小於」不是安全問題,不會截斷,只是沒用滿 server 容量)。
+`[ctx-safety]` 仍是必要的容量閘：如果本次 `AICODE_N_CTX`／profile 值大於 server 真正啟動的 `-c`，prompt 可能被截斷，因此會標 `UNSAFE` 並拒絕啟動。較小值不會截斷，仍可放行。
 
 `UNSAFE` 輸出長這樣:
 
@@ -523,24 +518,20 @@ aicode
         requested ctx=65536 超過 llama-server 啟動時的 -c 8192 (http://localhost:8080) — 多出來的 prompt 會被截斷
         ...
         建議任一處理:
-          (a) 不要手動設 AICODE_DYNAMIC_NUM_CTX_MAX —— 拿掉它,
-              CodeTrail 會自動跟隨 server 真實 n_ctx (最省事)
-          (b) 或把 AICODE_DYNAMIC_NUM_CTX_MAX 設成 <= 8192
-          (c) 或重啟 llama-server 用更大的 `-c 65536` (確認 VRAM 夠)
+          (a) 重跑 ./set_config.sh 設定主模型 n_ctx，然後重啟 server
+          (b) 或把本次 AICODE_N_CTX 設成 <= 8192
+          (c) 或重啟 llama-server 用 `-c 65536` (確認 VRAM 夠)
 ```
 
-最省事的修法就是 `(a)`:拿掉你手動設的覆寫,讓 CodeTrail 自動對齊 server。
+一般修法就是重跑設定並重啟，讓同一個主 n_ctx 重新展開到所有 consumer：
 
 ```bash
-# 路徑 A(推薦):拿掉手動覆寫,CodeTrail 自動跟隨 server n_ctx
-unset AICODE_DYNAMIC_NUM_CTX_MAX
-aicode
-# 或 aicodex --codetrail-model <LOCAL_MODEL>
-
-# 路徑 B: 真的想用更大的 ctx —— 那是 server 端的事:改 ~/.config/codetrail/deployment.json
-# 的 services.main.ctx(或重跑 ./set_config.sh 換 ctx),再重啟 server,CodeTrail 會自動跟上
+unset AICODE_DYNAMIC_NUM_CTX_MAX AICODE_NUM_CTX  # 清掉舊版 shell 設定(若有)
+cd <CODETRAIL_REPO>
+./set_config.sh                                  # 主 n_ctx 只填這一次
 <CODETRAIL_REPO>/scripts/quit.sh
 ~/start.sh
+cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
@@ -567,20 +558,16 @@ AICODE_MODEL=<CODE_MODEL> python scripts/ctx_safety_check.py
 
 ### `[ctx-align] MISMATCH` 啟動被擋
 
-這就是上面說的「唯一要你手動對齊的數字」沒對齊:OpenCode active model 的 `limit.context` 跟 server 真實 `-c`(= CodeTrail 已自動跟隨的上限)不一致。典型情況是 server / CodeTrail 已經是 64K,但 opencode.json 還留在 32K,TUI 會提早 compact。
+新版 `aicode` 遇到單純數值漂移會直接印 `[ctx-align] FIXED`，只更新 active model 的 `limit.context`、保留其他 JSON，並建立 `opencode.json.codetrail.bak`；不再要求手動對齊。
 
-修法很單純 —— 把 opencode.json 的 `limit.context` 改成 server `-c` 的值:
+仍看到 `FIX_FAILED`／refuse，代表設定檔損壞、無法寫入，或 active model 無法唯一定位。先確認 JSON 與 model entry：
 
 ```bash
-# 先看 server 真實上限
-curl -s http://localhost:8080/props | jq '.default_generation_settings.n_ctx'   # 例:65536
-
-# 再把 OpenCode active model 的 limit.context 設成同一個數字
-# ~/.config/opencode/opencode.json:
-#   provider.<你的 provider>.models.<active model>.limit.context = 65536
+python3 -m json.tool ~/.config/opencode/opencode.json >/dev/null
+jq '{model, provider}' ~/.config/opencode/opencode.json
 ```
 
-若只是一次性實驗,可以用 `AICODE_ACCEPT_CTX_RISK=1 aicode` 放行,但不建議長期這樣跑。
+修好 JSON／model id 後重跑 `aicode` 即會再次同步。若只是一次性實驗，可以用 `AICODE_ACCEPT_CTX_RISK=1 aicode` 保留不一致且不寫檔，但不建議長期使用。
 
 ### 圖片工具剛好 10 秒超時，接著連小工具也超時
 
@@ -664,7 +651,8 @@ ready,但 llama.cpp 的預設 physical batch `-ub 512` 放不下真實 RAG chunk
 
 safe-defaults / 舊的 `start-rag-servers.sh` 會把 embedding 與 BGE reranker 都設成
 `-c 8192 -b 8192 -ub 8192`。`set_config.sh` 產生的設定則維持 embedding 8192，
-並把你選的 reranker ctx 同步套到它的 `-c/-b/-ub`。重啟三顆附屬 server 套用:
+reranker 預設也自動 8192；若傳 `--rerank-ctx`，會同步套到它的 `-c/-b/-ub`。
+重啟三顆附屬 server 套用:
 
 ```bash
 ./scripts/stop-rag-servers.sh
@@ -673,8 +661,8 @@ safe-defaults / 舊的 `start-rag-servers.sh` 會把 embedding 與 BGE reranker 
 
 若是手動啟動 embedding / reranker，也要讓 `-b`、`-ub` 至少容納最長輸入；
 llama.cpp 的 embedding/reranking server 會要求單一輸入序列放得進 physical batch。
-Qwen3-Reranker 若在 8192 OOM，可重跑 `./set_config.sh` 選 ctx 2048，或非互動加
-`--rerank-ctx 2048`；輸入原本就小於 2048 時不會因縮小上限而降低排序精準度。
+Qwen3-Reranker 若在自動的 8192 buffer OOM，可重跑
+`./set_config.sh --rerank-ctx 2048`；輸入原本就小於 2048 時不會因縮小上限而降低排序精準度。
 
 ### `aicode` 拒絕啟動,訊息說「主模型未設定」
 

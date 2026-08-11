@@ -332,27 +332,28 @@ def test_check_context_settings_does_not_fail(monkeypatch):
     assert not r.fails
 
 
-def test_check_context_settings_warns_when_num_ctx_exceeds_dynamic_max(monkeypatch):
-    import config as cfg
+def test_check_context_settings_warns_for_deprecated_num_ctx(monkeypatch):
     monkeypatch.setenv("AICODE_NUM_CTX", "131072")
-    monkeypatch.setattr(cfg, "NUM_CTX", 131072)
-    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", True)
-    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_MAX", 65536)
+    monkeypatch.delenv("AICODE_DYNAMIC_NUM_CTX_MAX", raising=False)
     r = doc.Result()
     doc.check_context_settings(r)
-    assert r.warns
-    assert any("DYNAMIC_NUM_CTX_MAX" in w for w in r.warns)
+    assert any("AICODE_NUM_CTX" in w and "deprecated" in w for w in r.warns)
 
 
-def test_check_context_settings_does_not_warn_on_default_num_ctx_fallback(monkeypatch):
-    import config as cfg
+def test_check_context_settings_warns_for_deprecated_dynamic_max(monkeypatch):
     monkeypatch.delenv("AICODE_NUM_CTX", raising=False)
-    monkeypatch.setattr(cfg, "NUM_CTX", 131072)
-    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", True)
-    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_MAX", 65536)
+    monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65536")
     r = doc.Result()
     doc.check_context_settings(r)
-    assert not any("比 DYNAMIC_NUM_CTX_MAX" in w for w in r.warns)
+    assert any("AICODE_DYNAMIC_NUM_CTX_MAX" in w and "deprecated" in w for w in r.warns)
+
+
+def test_check_context_settings_has_no_legacy_warning_by_default(monkeypatch):
+    monkeypatch.delenv("AICODE_NUM_CTX", raising=False)
+    monkeypatch.delenv("AICODE_DYNAMIC_NUM_CTX_MAX", raising=False)
+    r = doc.Result()
+    doc.check_context_settings(r)
+    assert not any("deprecated" in w for w in r.warns)
 
 
 def test_check_context_settings_warns_when_hard_below_soft(monkeypatch):
@@ -403,9 +404,7 @@ def test_check_llama_runtime_ok_when_idle():
 def test_check_opencode_config_drift_warns_on_mismatch(monkeypatch, tmp_path):
     import config as cfg
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
-    monkeypatch.setattr(cfg, "NUM_CTX", 32768)
-    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", True)
-    monkeypatch.setattr(cfg, "DYNAMIC_NUM_CTX_MAX", 32768)
+    monkeypatch.setattr(cfg, "N_CTX", 32768)
 
     # opencode.json active model limit.context differs from CodeTrail cap.
     oc_path = tmp_path / "opencode.json"
@@ -452,10 +451,8 @@ def test_check_rerank_policy_prints_current_policy(monkeypatch, capsys):
 class _FakeCfg:
     """最小 config 替身,讓 doctor 的 internal_ctx_cap 計算可控。"""
 
-    def __init__(self, dyn_max: int) -> None:
-        self.NUM_CTX = dyn_max
-        self.DYNAMIC_NUM_CTX_ENABLED = True
-        self.DYNAMIC_NUM_CTX_MAX = dyn_max
+    def __init__(self, n_ctx: int) -> None:
+        self.N_CTX = n_ctx
 
 
 def _server_status(n_ctx: int) -> dict:

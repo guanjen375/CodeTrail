@@ -242,14 +242,16 @@ else:
     if not all(_check.ok for _check in _required_model_checks):
         sys.exit(3)
 
-# Warn if user set AICODE_NUM_CTX expecting it to cap per-call context, but
-# dynamic mode (the default) ignores it and uses DYNAMIC_NUM_CTX_MAX instead.
-# This is a common bashrc-level misconfiguration that silently does nothing.
-if os.environ.get("AICODE_NUM_CTX") and config.DYNAMIC_NUM_CTX_ENABLED:
+# 舊 ctx env 只留遷移相容；正常使用只需在 set_config 設一次主 n_ctx。
+if os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX") and not os.environ.get("AICODE_N_CTX"):
     _log(
-        f"[MCP] WARN: AICODE_NUM_CTX={config.NUM_CTX} 在 dynamic mode 下不影響"
-        f"per-call 上限;實際上限由 DYNAMIC_NUM_CTX_MAX={config.DYNAMIC_NUM_CTX_MAX} "
-        "決定 (預設自動跟隨 server 真實 n_ctx)。要改上限請調 llama-server 的 -c <N>。"
+        "[MCP] WARN: AICODE_DYNAMIC_NUM_CTX_MAX 已 deprecated；本次仍相容讀取。"
+        "請改用 ./set_config.sh 設定主模型 n_ctx，之後不需要另設 max。"
+    )
+if os.environ.get("AICODE_NUM_CTX"):
+    _log(
+        "[MCP] WARN: AICODE_NUM_CTX 已 deprecated 且不再是獨立上限；"
+        "請移除它並用 ./set_config.sh 設定主模型 n_ctx。"
     )
 # knowledge.json 綁 AICODE_ROOT,不依賴 cwd
 _kb_path = str(Path(AICODE_ROOT) / KNOWLEDGE_FILE)

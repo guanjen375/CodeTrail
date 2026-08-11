@@ -13,8 +13,8 @@ import context_budget
 import llama_client
 import trim as trim_module
 from config import (
-    LLAMA_BASE_URL, NUM_CTX,
-    DYNAMIC_NUM_CTX_ENABLED, DYNAMIC_NUM_CTX_MIN, DYNAMIC_NUM_CTX_MAX,
+    LLAMA_BASE_URL, N_CTX,
+    DYNAMIC_NUM_CTX_ENABLED, DYNAMIC_NUM_CTX_MIN,
     DYNAMIC_NUM_CTX_BUFFER, CHARS_PER_TOKEN,
     MAX_TOOL_LOOPS,
     MAX_MESSAGES_BUDGET, MIN_RECENT_TOOL_OUTPUTS,
@@ -39,7 +39,7 @@ _BASENAME_MAP_CACHE = {}
 def _compute_dynamic_num_ctx(messages: list) -> int:
     """根據 messages 長度動態計算 num_ctx"""
     if not DYNAMIC_NUM_CTX_ENABLED:
-        return NUM_CTX
+        return N_CTX
 
     total_chars = 0
     for msg in messages:
@@ -54,7 +54,9 @@ def _compute_dynamic_num_ctx(messages: list) -> int:
     estimated_tokens = int(total_chars / CHARS_PER_TOKEN)
     target_ctx = int(estimated_tokens * DYNAMIC_NUM_CTX_BUFFER)
     target_ctx = ((target_ctx + 2047) // 2048) * 2048
-    target_ctx = max(DYNAMIC_NUM_CTX_MIN, min(DYNAMIC_NUM_CTX_MAX, target_ctx))
+    # The configured main n_ctx always wins, even for intentionally small test
+    # deployments below the usual dynamic floor.
+    target_ctx = min(N_CTX, max(DYNAMIC_NUM_CTX_MIN, target_ctx))
 
     return target_ctx
 

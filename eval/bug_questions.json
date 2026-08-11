@@ -19,10 +19,10 @@
   },
   {
     "id": "bug_003",
-    "question": "在 5090 32GB 上使用一顆 30B coding 模型，並把 config.py 裡的 NUM_CTX 設成 131072 之後，多次執行程式時 VRAM 會一路漲到 OOM，應該調整哪些參數？",
+    "question": "在 5090 32GB 上使用一顆 30B coding 模型，並把主 n_ctx 設成 131072 之後，多次執行程式時 VRAM 會一路漲到 OOM，應該怎麼重新設定？",
     "expected": {
-      "cause": "NUM_CTX",
-      "fix_keywords": ["NUM_CTX", "64K", "32K", "offload", "降低"]
+      "cause": "n_ctx",
+      "fix_keywords": ["n_ctx", "set_config", "64K", "32K", "offload", "降低"]
     },
     "context": "."
   },

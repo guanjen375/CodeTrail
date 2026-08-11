@@ -114,7 +114,7 @@ disown
 
 CodeTrail repo 跑在你工作機(CPU 即可),llama-server 跑在另一台 GPU 主機。CodeTrail 透過 HTTP 呼叫對方的 8080 / 8081 / 8082 / 8083。
 
-GPU 主機端:四個 server 照 [README §3](../README.md)(`./set_config.sh` + `~/start.sh`)啟動,但有兩點要改:① 預設只綁 `127.0.0.1`,遠端連線要明確開放 —— `./set_config.sh --allow-remote`(或 `AICODE_BIND=all-interfaces`,詳見 [deployment-profiles.md](deployment-profiles.md));② 主 server 的 `-c` 決定 ctx 上限(本例用 `-c 32768`;`set_config.sh` 的 ctx 沒有預設值,由你自行輸入)。CodeTrail 端會自動跟隨遠端 server 的真實 `n_ctx`,你只要再把 opencode `limit.context` 也設成同一個值即可;不一致時 `aicode` 會拒絕啟動。
+GPU 主機端:四個 server 照 [README §3](../README.md)(`./set_config.sh` + `~/start.sh`)啟動,但有兩點要改:① 預設只綁 `127.0.0.1`,遠端連線要明確開放 —— `./set_config.sh --allow-remote`(或 `AICODE_BIND=all-interfaces`,詳見 [deployment-profiles.md](deployment-profiles.md));② 主 server 的 `-c` 決定主 n_ctx(本例用 `-c 32768`;`set_config.sh` 的 ctx 沒有預設值,由你自行輸入)。CodeTrail 端會讀遠端 server 的實值，`aicode` 也會把 OpenCode active model 的 `limit.context` 自動同步成同一值。
 
 CodeTrail 端:
 
@@ -127,9 +127,9 @@ AICODE_MODEL=<CODE_MODEL> \
 aicode
 ```
 
-(不用設 `AICODE_DYNAMIC_NUM_CTX_MAX` —— `aicode` 會讀 `AICODE_LLAMA_BASE_URL` 指到的遠端 server `/props`,自動把 CodeTrail 的 ctx 上限對齊成它的 `n_ctx`。)
+(不用另設 ctx max —— `aicode` 會讀 `AICODE_LLAMA_BASE_URL` 指到的遠端 server `/props`，把主 `n_ctx` 傳給 CodeTrail 與 OpenCode。)
 
-同時把 `~/.config/opencode/opencode.json` 的 provider `baseURL` 改成 `http://<GPU_HOST>:8080/v1`,並把 active model 的 `limit.context` 設成同一個值(上例是 32768)。
+把 `~/.config/opencode/opencode.json` 的 provider `baseURL` 改成 `http://<GPU_HOST>:8080/v1`；active model 的 `limit.context` 會在第一次 `aicode` 啟動時同步(上例是 32768，原檔會備份)。
 
 **安全提醒**:llama-server 預設不檢查 API key,等於任何能連到 GPU 主機 8080 的人都能用你的模型。**只能指向可信內網 / VPN 主機**,不要把 8080 暴露公網。需要鎖住的話加反向代理(nginx / caddy)做 basic auth,或用 SSH tunnel:
 
@@ -151,7 +151,7 @@ ssh -L 8080:localhost:8080 -L 8081:localhost:8081 -L 8082:localhost:8082 -L 8083
 4. 驗證 deployment profile，安全匯入四個 base URL 與 aux model ID；不 `source` / `eval` JSON
 5. 用 `scripts/resolve_main_model.py` 解析主模型；若 `AICODE_MODEL` 和 opencode.json 同時存在且沒傳 CLI `-m/--model`,兩者必須一致（不同 registry alias 解析到同一個 GGUF 也視為一致）
 6. 讀主 llama-server `/props` 取得真實 `n_ctx`，再跑 ctx capacity gate
-7. 確認 OpenCode active model 的 `limit.context` 等於 server `-c`
+7. 安全同步 OpenCode active model 的 `limit.context` 為主 n_ctx(原子寫入 + 備份)
 8. 安全同步既有 `mcp.codetrail.timeout`
 9. 對三個 aux server 跑 hard preflight
 10. 直接對實際 `mcp.codetrail.command` 做 `initialize → tools/list → list_dir`,確認完整 17-tool contract 與只讀工具派發都正常

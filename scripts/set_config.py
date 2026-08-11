@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CodeTrail 一鍵設定精靈(`./set_config.sh` 的實作)。
 
-純問答式設定:不做容量估算、不推薦數值、互動題沒有預設值——每一題由
+純問答式設定:不做容量估算、不推薦主模型數值；使用者選擇題由
 使用者作答,工具只驗證輸入在合理範圍(例如選項只有 1..2 卻輸入 3 會重問)。
 VRAM 塞不塞得下以啟動後實測為準(產生的 ~/start.sh 啟動完會提醒用
 nvidia-smi 稍微監控)。
@@ -12,10 +12,11 @@ nvidia-smi 稍微監控)。
      reranker / VL+mmproj);多 shard 聚合並驗證齊全性(缺片直接列出)。
   3. 背景初步判定:GPU 數與四類模型是否齊全,缺什麼通知什麼。
   4. 互動問答:各角色模型與 GPU、主模型 CPU-MoE / 一般模式(MoE 主模型
-     才詢問;CPU-MoE 之下可再輸入 --n-cpu-moe 檔位)、reranker ctx、
-     主模型 ctx / threads。只有一個候選(或一顆 GPU)時自動選用;
+     才詢問;CPU-MoE 之下可再輸入 --n-cpu-moe 檔位)、主模型 ctx / threads。
+     reranker internal buffer 自動 8192(進階才用 --rerank-ctx 覆寫)。
+     只有一個候選(或一顆 GPU)時自動選用;
      其餘必答。最後顯示摘要一頁(Enter 寫入 / q 離開)。
-  5. 非互動:`--yes` 跳過提問與確認,但所有互動題的值必須由旗標提供
+  5. 非互動:`--yes` 跳過提問與確認,但所有使用者選擇題的值必須由旗標提供
      (--main-model / --ctx / ...),缺哪個就明確報錯。
   6. 產物(先寫 staging、全部就緒才原子替換;既有檔備份 *.bak-setconfig-*):
      - ~/.config/codetrail/models.json     主模型 registry(合併既有)
@@ -65,6 +66,7 @@ MIN_MAIN_CTX = 1024
 MAX_MAIN_CTX = 1_048_576
 MIN_RERANKER_CTX = 128
 MAX_RERANKER_CTX = 1_048_576
+DEFAULT_RERANKER_CTX = 8192
 MAX_THREADS = 1024
 MAX_N_CPU_MOE = 1024
 OPENCODE_TIMEOUT_FALLBACK_MS = 660_000
@@ -983,14 +985,17 @@ def choose_reranker_ctx(
     override: int | None,
     assume_yes: bool,
 ) -> int:
-    if override is None and not assume_yes:
-        print("\n【reranker ctx】")
-        print(f"  目前模型: {candidate.path.name}")
-        print("  ctx 是每筆 query+passage 可完整送入排序的 token 上限。")
-        print("  輸入放得下時,ctx 設更大不會讓排序更準;太小導致失敗/截斷時才會漏證據。")
-        print("  設大可處理更長 passage,但更吃顯存;實際送入更多 token 時也會更慢。")
+    """Return the reranker service's internal buffer size.
+
+    This is not the main-model n_ctx and should not be another normal setup
+    question.  Keep the CLI override for unusual long-passage/OOM tuning, but
+    otherwise use the deployment default silently.
+    """
+    del candidate, assume_yes
+    if override is None:
+        return DEFAULT_RERANKER_CTX
     return choose_int(
-        "reranker context(-c/-b/-ub)", override, assume_yes,
+        "reranker internal buffer(-c/-b/-ub)", override, True,
         minimum=MIN_RERANKER_CTX, maximum=MAX_RERANKER_CTX, flag_name="--rerank-ctx",
     )
 
@@ -1613,7 +1618,7 @@ def build_start_sh(plan: Plan) -> str:
 # 配置(模型 @ GPU index):
 #   main      = {plan.main_key} @ GPU {plan.main.gpu.index}
 #   embedding = {plan.embedding.candidate.path.name} @ GPU {plan.embedding.gpu.index}
-#   reranker  = {plan.reranker.candidate.path.name} @ GPU {plan.reranker.gpu.index} (ctx={plan.reranker_ctx})
+#   reranker  = {plan.reranker.candidate.path.name} @ GPU {plan.reranker.gpu.index} (internal buffer={plan.reranker_ctx})
 #   vl        = {plan.vl.candidate.path.name} @ GPU {plan.vl.gpu.index}
 #
 # 啟動參數(全部來自你在 set_config 的作答):ctx={plan.ctx}, threads={plan.parameters.get("threads")}, {offload}
@@ -2088,16 +2093,16 @@ def _parser() -> argparse.ArgumentParser:
         parser.add_argument(f"--{role}-model", help=f"{role} 模型:候選編號(從 1 起)或 .gguf 絕對路徑")
         parser.add_argument(f"--{role}-gpu", help=f"{role} 要綁的 GPU index")
     parser.add_argument("--vl-mmproj", help="VL mmproj .gguf 絕對路徑(同目錄唯一 mmproj 時自動配對)")
-    parser.add_argument("--ctx", type=int,
-                        help=f"主模型 context(-c),{MIN_MAIN_CTX}..{MAX_MAIN_CTX}")
+    parser.add_argument("--ctx", "--n-ctx", dest="ctx", type=int,
+                        help=f"主模型 n_ctx(-c),{MIN_MAIN_CTX}..{MAX_MAIN_CTX}")
     parser.add_argument(
         "--rerank-ctx",
         "--reranker-ctx",
         dest="reranker_ctx",
         type=int,
         help=(
-            "reranker 每筆 query+passage token 上限;同步設定 -c/-b/-ub"
-            f"({MIN_RERANKER_CTX}..{MAX_RERANKER_CTX})"
+            "進階:覆寫 reranker internal -c/-b/-ub buffer;"
+            f"未指定自動 {DEFAULT_RERANKER_CTX}({MIN_RERANKER_CTX}..{MAX_RERANKER_CTX})"
         ),
     )
     parser.add_argument("--threads", type=int, help=f"主模型 CPU threads(-t),1..{MAX_THREADS}")
@@ -2114,7 +2119,7 @@ def _print_summary_page(plan: Plan, python_bin: str, opencode_changes: list[str]
     print(f"  embedding : {plan.embedding.candidate.path.name} → GPU {plan.embedding.gpu.index}")
     print(
         f"  reranker  : {plan.reranker.candidate.path.name} → GPU {plan.reranker.gpu.index}"
-        f"（ctx={plan.reranker_ctx}；-c/-b/-ub 同步）"
+        f"（internal buffer={plan.reranker_ctx}）"
     )
     print(f"  VL        : {plan.vl.candidate.path.name} + {plan.vl.mmproj.name}"
           f" → GPU {plan.vl.gpu.index}")
@@ -2223,7 +2228,7 @@ def run(args: argparse.Namespace) -> int:
             pass
 
     def _gather(notes: list[str]) -> dict:
-        """一趟完整的互動問答 + 產物組裝(沒有預設值,只驗證輸入範圍)。"""
+        """一趟互動問答 + 產物組裝(使用者題無預設值,只驗證輸入範圍)。"""
         # 互動也必須明確列出 main 候選,不能靜默拿排序第一顆;否則多顆
         # 大模型並存時,使用者會在不知道模型名稱的情況下替錯誤的模型選模式。
         main_cand = choose_candidate("【主聊天模型】", candidates["main"], args.main_model,
@@ -2312,7 +2317,7 @@ def run(args: argparse.Namespace) -> int:
         # 綁定是安全 opt-in,不是互動題:未給 --allow-remote 一律只綁 127.0.0.1。
         allow_remote = bool(args.allow_remote)
 
-        ctx = choose_int("主模型 context(-c)", args.ctx, assume_yes=args.yes,
+        ctx = choose_int("主模型 n_ctx(-c)", args.ctx, assume_yes=args.yes,
                          minimum=MIN_MAIN_CTX, maximum=MAX_MAIN_CTX, flag_name="--ctx")
         threads = choose_int("主模型 CPU threads(-t)", args.threads, assume_yes=args.yes,
                              minimum=1, maximum=MAX_THREADS, flag_name="--threads")
@@ -2368,7 +2373,8 @@ def run(args: argparse.Namespace) -> int:
             parameters={},
             notes=notes,
         )
-        notes.append(reranker_ctx_effect(reranker_ctx))
+        if args.reranker_ctx is not None:
+            notes.append(reranker_ctx_effect(reranker_ctx))
         _warn_unverified_aux(plan)
 
         parameters, batch, ubatch = build_main_parameters(

@@ -470,7 +470,7 @@ def check_opencode_in_path(r: Result) -> None:
 # Context settings
 # ============================================================
 def check_context_settings(r: Result) -> None:
-    """印出 CodeTrail-internal 的 context 設定,並提示常見錯配。
+    """印出單一主 n_ctx 與 internal dynamic sizing 狀態。
 
     這個檢查只看 config + env,不需要連 llama-server,所以也適用 --no-network。
     """
@@ -478,49 +478,40 @@ def check_context_settings(r: Result) -> None:
     if isinstance(cfg, Exception):
         return
 
-    num_ctx = int(getattr(cfg, "NUM_CTX", 0) or 0)
+    main_n_ctx = int(getattr(cfg, "N_CTX", getattr(cfg, "NUM_CTX", 0)) or 0)
     dyn_on = bool(getattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", False))
     dyn_min = int(getattr(cfg, "DYNAMIC_NUM_CTX_MIN", 0) or 0)
-    dyn_max = int(getattr(cfg, "DYNAMIC_NUM_CTX_MAX", 0) or 0)
     reserved = int(getattr(cfg, "RESERVED_OUTPUT_TOKENS", 0) or 0)
     soft = float(getattr(cfg, "CTX_SOFT_THRESHOLD", 0.80) or 0.80)
     hard = float(getattr(cfg, "CTX_HARD_THRESHOLD", 0.90) or 0.90)
     gate_on = bool(getattr(cfg, "CTX_GATE_ENABLED", True))
-    num_ctx_env_set = bool(os.environ.get("AICODE_NUM_CTX"))
-    effective_internal_ctx = dyn_max if dyn_on and dyn_max > 0 else num_ctx
+    resolution = getattr(cfg, "N_CTX_RESOLUTION", None)
+    source = getattr(resolution, "source", "config")
 
+    r.info(f"主模型 n_ctx={main_n_ctx}（source={source}）")
     r.info(
-        f"AICODE_NUM_CTX={num_ctx}（dynamic 關閉時的 fallback 上限;"
-        "dynamic 開啟時不影響 per-call 上限,由 DYNAMIC_NUM_CTX_MAX 決定）"
-    )
-    r.info(
-        f"DYNAMIC_NUM_CTX: enabled={dyn_on} min={dyn_min} max={dyn_max} "
-        "（agent loop 會根據 messages 大小動態壓低 num_ctx,避免占用 VRAM。"
-        "max 預設自動跟隨 server 真實 n_ctx;進階可用 AICODE_DYNAMIC_NUM_CTX_MAX 覆寫）"
+        f"internal dynamic sizing: enabled={dyn_on} usual_min={dyn_min}，"
+        f"每次呼叫永遠不超過主 n_ctx({main_n_ctx})，沒有另一個 max 設定"
     )
     r.info(
         f"AICODE_RESERVED_OUTPUT_TOKENS={reserved} "
         f"soft={int(soft*100)}% hard={int(hard*100)}% gate_on={gate_on}"
     )
     r.info(
-        f"提醒: llama-server 啟動時 -c <N> 是 ctx 上限的唯一真值;effective_internal_ctx={effective_internal_ctx} "
-        "是 CodeTrail 自己的 budget,aicode 啟動時會自動把它設成 == server -c。"
-        "你唯一要手動對齊的是 OpenCode active model 的 limit.context 也 == server -c。"
+        "設定方式: ./set_config.sh 只填一次主 n_ctx；server -c、CodeTrail budget 與 "
+        "OpenCode active model limit.context 會使用同一值。"
     )
 
-    if num_ctx_env_set and dyn_on and num_ctx > 0 and dyn_max > 0 and num_ctx > dyn_max:
+    if os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX"):
         r.warn(
-            f"AICODE_NUM_CTX={num_ctx} 比 DYNAMIC_NUM_CTX_MAX={dyn_max} 大;"
-            "dynamic 啟用時實際 internal call 會被 clamp 到 dynamic max。\n"
-            "        要真的用更大的 ctx,請把 llama-server 的 -c <N> 開大 (CodeTrail 自動跟隨),"
-            "或設 DYNAMIC_NUM_CTX_ENABLED=False 走 NUM_CTX 路徑。"
+            "AICODE_DYNAMIC_NUM_CTX_MAX 已 deprecated；本次僅為相容而讀取。\n"
+            "        請移除它並用 ./set_config.sh 設定主 n_ctx。"
         )
 
-    if dyn_on and num_ctx_env_set:
+    if os.environ.get("AICODE_NUM_CTX"):
         r.warn(
-            f"AICODE_NUM_CTX 環境變數有設 (={num_ctx}) 但 dynamic 啟用,"
-            "在這種模式下它不影響 per-call 上限。\n"
-            "        per-call 上限自動跟隨 server n_ctx;要改請調 llama-server 的 -c <N>。"
+            "AICODE_NUM_CTX 已 deprecated 且不是獨立上限。\n"
+            "        請移除它並用 ./set_config.sh 設定主 n_ctx。"
         )
 
     if hard < soft:
@@ -631,10 +622,7 @@ def check_opencode_config_drift(r: Result, project: str | None) -> None:
     cfg = _read_config()
     if isinstance(cfg, Exception):
         return
-    num_ctx = int(getattr(cfg, "NUM_CTX", 0) or 0)
-    dyn_on = bool(getattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", False))
-    dyn_max = int(getattr(cfg, "DYNAMIC_NUM_CTX_MAX", 0) or 0)
-    internal_ctx_cap = dyn_max if dyn_on and dyn_max > 0 else num_ctx
+    internal_ctx_cap = int(getattr(cfg, "N_CTX", getattr(cfg, "NUM_CTX", 0)) or 0)
 
     env = {**os.environ, "OPENCODE_CONFIG": str(found)}
     limit = opencode_context.resolve_active_opencode_context_limit(env, [])
@@ -648,9 +636,8 @@ def check_opencode_config_drift(r: Result, project: str | None) -> None:
     if internal_ctx_cap and limit.context != internal_ctx_cap:
         r.warn(
             f"opencode.json={found} active model={limit.raw_model or limit.model} "
-            f"limit.context={limit.context} 與 CodeTrail ctx cap={internal_ctx_cap} 不一致。\n"
-            "        aicode 啟動時會拒絕這種不一致;CodeTrail 端已自動跟隨 server,"
-            "請把 opencode.json 的 limit.context 對齊到 server -c。"
+            f"limit.context={limit.context} 與主 n_ctx={internal_ctx_cap} 不一致。\n"
+            "        aicode 啟動時會安全自動同步；doctor 本身只診斷、不修改設定。"
         )
     else:
         r.ok(f"opencode.json={found} active model limit.context 與 internal ctx cap 一致")
@@ -661,8 +648,8 @@ def check_main_server_ctx_alignment(r: Result, server_status: dict[str, dict]) -
 
     正常情況下 aicode 啟動時會用 scripts/resolve_server_ctx.py 自動把 CodeTrail ctx
     cap 設成 == server n_ctx,所以不會漂移。doctor 是獨立跑、不經過 aicode 的自動
-    export,所以若使用者手動設了 AICODE_DYNAMIC_NUM_CTX_MAX、或 server 的 -c 跟 config
-    預設不同,這裡就會 warn 讓使用者先看到。server 沒連上 (--no-network / 未啟動 /
+    觀測；若 deployment profile 的 main.ctx 與 server -c 不同，這裡會先 warn。
+    server 沒連上 (--no-network / 未啟動 /
     沒給 n_ctx) 一律跳過,不擋健檢。
     """
     main_srv = server_status.get("main")
@@ -681,19 +668,14 @@ def check_main_server_ctx_alignment(r: Result, server_status: dict[str, dict]) -
     cfg = _read_config()
     if isinstance(cfg, Exception):
         return
-    num_ctx = int(getattr(cfg, "NUM_CTX", 0) or 0)
-    dyn_on = bool(getattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", False))
-    dyn_max = int(getattr(cfg, "DYNAMIC_NUM_CTX_MAX", 0) or 0)
-    internal_ctx_cap = dyn_max if dyn_on and dyn_max > 0 else num_ctx
+    internal_ctx_cap = int(getattr(cfg, "N_CTX", getattr(cfg, "NUM_CTX", 0)) or 0)
     if not internal_ctx_cap:
         return
 
     if n_ctx != internal_ctx_cap:
         r.warn(
             f"主 llama-server n_ctx={n_ctx} 與 CodeTrail ctx cap={internal_ctx_cap} 不一致。\n"
-            "        正常經過 aicode 時 CodeTrail 會自動跟隨 server n_ctx;會看到這個多半是你"
-            "手動設了 AICODE_DYNAMIC_NUM_CTX_MAX,或 doctor 沒經過 aicode。\n"
-            "        對策:拿掉手動的 AICODE_DYNAMIC_NUM_CTX_MAX,或把 server `-c <N>` 調成你要的值。"
+            "        對策:重跑 ./set_config.sh 設定主 n_ctx，並重啟 server。"
         )
     else:
         r.ok(f"主 llama-server n_ctx={n_ctx} 與 CodeTrail ctx cap 一致")

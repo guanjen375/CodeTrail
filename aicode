@@ -204,23 +204,30 @@ fi
 # mcp_server / 子行程拿到同一顆。
 export AICODE_MODEL="$RESOLVED_MAIN_MODEL"
 
-# CodeTrail 的 per-call ctx 上限「自動跟隨」主 llama-server 的真實 n_ctx —— server
-# 啟動時的 `-c <N>` 是唯一真值。使用者通常不需要、也不該手動設
-# AICODE_DYNAMIC_NUM_CTX_MAX。這裡讀 server /props 的 n_ctx 並 export 進環境,讓
-# CodeTrail MCP 子行程自動拿到正確上限;只有「使用者自己明確設過」時才尊重他的值
-# (進階覆寫),不覆寫。server 讀不到時靜默退回 config.DYNAMIC_NUM_CTX_MAX 預設。
-if [ -z "${AICODE_DYNAMIC_NUM_CTX_MAX:-}" ]; then
+# 主模型只傳遞一個 n_ctx。正常情況從 server /props 觀測實值；server 暫時不可讀時
+# 使用 deployment profile 的 main.ctx。AICODE_N_CTX 可作單次明確 override，後面的
+# safety gate 仍會確認它不超過實際 server。
+if [ -z "${AICODE_N_CTX:-}" ]; then
   if RESOLVED_CTX="$("$PYBIN" "$CODETRAIL_HOME/scripts/resolve_server_ctx.py")" && [ -n "$RESOLVED_CTX" ]; then
-    export AICODE_DYNAMIC_NUM_CTX_MAX="$RESOLVED_CTX"
-    echo "[aicode] CodeTrail ctx 上限自動跟隨 server n_ctx=$RESOLVED_CTX (無需手動設 AICODE_DYNAMIC_NUM_CTX_MAX)"
+    export AICODE_N_CTX="$RESOLVED_CTX"
+    echo "[aicode] n_ctx=$RESOLVED_CTX (from main server)"
+  elif CONFIGURED_CTX="$("$PYBIN" "$CODETRAIL_HOME/deployment_profile.py" get main ctx)" && [ -n "$CONFIGURED_CTX" ]; then
+    export AICODE_N_CTX="$CONFIGURED_CTX"
+    echo "[aicode] n_ctx=$CONFIGURED_CTX (from deployment profile; server 尚無法觀測)"
   fi
 else
-  echo "[aicode] 偵測到你手動設了 AICODE_DYNAMIC_NUM_CTX_MAX=${AICODE_DYNAMIC_NUM_CTX_MAX} (進階覆寫;需自行確保 == server -c 與 opencode limit.context)"
+  echo "[aicode] n_ctx=${AICODE_N_CTX} (from AICODE_N_CTX)"
+fi
+if [ -n "${AICODE_DYNAMIC_NUM_CTX_MAX:-}" ]; then
+  echo "[aicode] WARNING: AICODE_DYNAMIC_NUM_CTX_MAX 已 deprecated 且不再是另一個 max；請移除。" >&2
+fi
+if [ -n "${AICODE_NUM_CTX:-}" ]; then
+  echo "[aicode] WARNING: AICODE_NUM_CTX 已 deprecated；請移除並只設定主 n_ctx。" >&2
 fi
 
 # 容量閘:確認上面決定的 CodeTrail ctx budget 不會「超過」server 真實 n_ctx
 # (超過會截斷 prompt)。正常自動跟隨時 requested == server、直接放行;會擋下的只有
-# 使用者手動把 AICODE_DYNAMIC_NUM_CTX_MAX 設得比 server -c 還大的情況。
+# 設定值與 server 實值不相容的情況。
 # ctx_safety_check.py 讀 server /props (預設 8080);server 沒啟動 / 不可連的 UNKNOWN
 # 情況 exit 0 只 warn,不擋 CI / 遠端。
 if [ -f "$CODETRAIL_HOME/scripts/ctx_safety_check.py" ]; then
@@ -231,8 +238,10 @@ if [ -f "$CODETRAIL_HOME/scripts/ctx_safety_check.py" ]; then
 fi
 
 if [ -f "$CODETRAIL_HOME/scripts/opencode_ctx_check.py" ]; then
-  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/opencode_ctx_check.py" "$@"; then
-    echo "[aicode] OpenCode ctx alignment check refused to start (see [ctx-align] above)." >&2
+  # limit.context 是主 n_ctx 的 client-side 鏡像；只改 active model 的這一欄，
+  # 原子寫入並保留備份，讓使用者不必維護第二個數字。
+  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/opencode_ctx_check.py" --fix "$@"; then
+    echo "[aicode] OpenCode n_ctx sync refused to start (see [ctx-align] above)." >&2
     exit 2
   fi
 fi
@@ -276,17 +285,11 @@ if ! "$PYBIN" "$TOOL_CANARY" --root "$AICODE_ROOT" -- "$@"; then
   exit 2
 fi
 
-# 兩條 context pipeline 的分工:CodeTrail-internal 呼叫 (agent loop / RAG / embedding /
-# reranker) 的 per-call ctx 上限 = AICODE_DYNAMIC_NUM_CTX_MAX,上面已自動設成 server
-# 真實 n_ctx。OpenCode TUI 則是直接打同一台 llama-server 的 /v1/chat/completions,它的
-# 真實 ctx 由 server `-c <N>` + OpenCode model limit.context 決定 —— 所以只要大家都等於
-# server -c 就一致。
+# 主模型的 server、CodeTrail budget 與 OpenCode client 現在共用同一個 n_ctx；
+# embedding/reranker/VL 是獨立 server 的內部 ctx，不混入這個使用者設定。
 echo "[aicode] AICODE_MODEL=${AICODE_MODEL}"
-if [ -n "${AICODE_NUM_CTX:-}" ]; then
-  echo "[aicode] AICODE_NUM_CTX=${AICODE_NUM_CTX} (僅在 dynamic 關閉時當 fallback 上限;dynamic 開啟時不影響 per-call ctx)"
-fi
-if [ -n "${AICODE_DYNAMIC_NUM_CTX_MAX:-}" ]; then
-  echo "[aicode] AICODE_DYNAMIC_NUM_CTX_MAX=${AICODE_DYNAMIC_NUM_CTX_MAX} (CodeTrail per-call ctx 上限;自動跟隨 server n_ctx)"
+if [ -n "${AICODE_N_CTX:-}" ]; then
+  echo "[aicode] n_ctx=${AICODE_N_CTX}"
 fi
 if [ -n "${AICODE_RESERVED_OUTPUT_TOKENS:-}" ]; then
   echo "[aicode] AICODE_RESERVED_OUTPUT_TOKENS=${AICODE_RESERVED_OUTPUT_TOKENS}"
@@ -294,10 +297,8 @@ fi
 if [ -n "${AICODE_LLAMA_BASE_URL:-}" ]; then
   echo "[aicode] AICODE_LLAMA_BASE_URL=${AICODE_LLAMA_BASE_URL} (主 LLM server)"
 fi
-echo "[aicode] NOTE: ctx 上限的唯一真值是 llama-server 啟動的 -c <N> (改了要重啟 server)。"
-echo "         CodeTrail 端會自動跟隨,你不用手動設 AICODE_DYNAMIC_NUM_CTX_MAX。"
-echo "         唯一要你手動對齊的:OpenCode active model 的 limit.context 也要 == server -c"
-echo "         (TUI 直接打 server、繞過 CodeTrail,CodeTrail 設不了它)。"
+echo "[aicode] NOTE: 主 n_ctx 只需用 ./set_config.sh 設一次；改完重啟 server。"
+echo "         CodeTrail budget 與 OpenCode active model limit.context 會自動跟隨。"
 echo "         Check loaded model with: curl -s \${AICODE_LLAMA_BASE_URL:-http://localhost:8080}/props"
 echo "         CodeTrail context overflow attempts are logged to .codetrail/context_metrics.jsonl"
 

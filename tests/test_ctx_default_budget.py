@@ -1,5 +1,4 @@
-"""P0-3：internal LLM 呼叫在未帶 num_ctx 時，預設 ctx 預算必須是 server 真值
-（DYNAMIC_NUM_CTX_MAX），而非舊的 aspirational NUM_CTX=131072。
+"""Internal LLM calls without num_ctx use the one resolved main N_CTX.
 
 漏掉的 production 路徑：
     query_knowledge_strict → answer_with_self_check → call_llm_stream()
@@ -30,21 +29,21 @@ def _stub_gate(monkeypatch):
 
 
 def test_default_ctx_budget_is_server_truth():
-    assert utils._default_ctx_budget() == min(config.NUM_CTX, config.DYNAMIC_NUM_CTX_MAX)
-    # 在典型 `-c 65536` 部署下，絕不能是舊的 131072
-    assert utils._default_ctx_budget() <= config.DYNAMIC_NUM_CTX_MAX
+    assert utils._default_ctx_budget() == config.N_CTX
+    assert config.NUM_CTX == config.N_CTX
+    assert config.DYNAMIC_NUM_CTX_MAX == config.N_CTX
 
 
 def test_call_llm_defaults_to_server_truth(monkeypatch):
     captured = _stub_gate(monkeypatch)
     utils.call_llm("hi")  # 未帶 num_ctx
-    assert captured["ctx"] == min(config.NUM_CTX, config.DYNAMIC_NUM_CTX_MAX)
+    assert captured["ctx"] == config.N_CTX
 
 
 def test_call_llm_stream_defaults_to_server_truth(monkeypatch):
     captured = _stub_gate(monkeypatch)
     utils.call_llm_stream("hi")  # 未帶 num_ctx（strict 路徑就是走這條）
-    assert captured["ctx"] == min(config.NUM_CTX, config.DYNAMIC_NUM_CTX_MAX)
+    assert captured["ctx"] == config.N_CTX
 
 
 def test_explicit_num_ctx_still_respected(monkeypatch):

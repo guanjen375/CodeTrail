@@ -93,7 +93,7 @@ def _run_aicode_with_stub(
             "USERPROFILE": str(home),
             "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
             "PYTHONIOENCODING": "utf-8",
-            "AICODE_DYNAMIC_NUM_CTX_MAX": OFFLINE_CTX,
+            "AICODE_N_CTX": OFFLINE_CTX,
             "AICODE_CTX_SAFETY_DISABLE": "1",
             "AICODE_REQUIRED_MODELS_CHECK_SKIP": "1",
             # CLI forwarding tests are offline.  The canary has dedicated
@@ -148,7 +148,7 @@ def test_aicode_prepares_opencode_mcp_wrapper(tmp_path):
         "HOME": str(home),
         "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
         "PYTHONIOENCODING": "utf-8",
-        "AICODE_DYNAMIC_NUM_CTX_MAX": OFFLINE_CTX,
+        "AICODE_N_CTX": OFFLINE_CTX,
         # aicode 啟動會跑 ctx 安全閘,在 CI / 沒 GPU / inherited AICODE_MODEL
         # 的環境下會 refuse to start。這個 smoke test 只關心 MCP wrapper
         # 生成,不該被安全閘擋下。
@@ -370,7 +370,7 @@ def _run_aicodex_with_stub(
             "USERPROFILE": str(home),
             "PATH": f"{bin_dir}{os.pathsep}{base_path}",
             "PYTHONIOENCODING": "utf-8",
-            "AICODE_DYNAMIC_NUM_CTX_MAX": OFFLINE_CTX,
+            "AICODE_N_CTX": OFFLINE_CTX,
             "AICODE_CTX_SAFETY_DISABLE": "1",
             "AICODEX_FAKE_CODEX_ARGS": str(args_file),
             "AICODEX_FAKE_CODEX_ENV": str(env_file),
@@ -443,6 +443,7 @@ def test_aicodex_prepares_codex_mcp_wrapper(tmp_path):
     assert f"export AICODE_ROOT={paths['subdir']}" in content
     assert f"export CODETRAIL_HOME={REPO_ROOT}" in content
     assert "export AICODE_MODEL=env-local-model" in content
+    assert f"export AICODE_N_CTX={OFFLINE_CTX}" in content
     assert 'exec python3 "$CODETRAIL_HOME/mcp_server.py"' in content
     assert 'exec python "$CODETRAIL_HOME/mcp_server.py"' in content
 
@@ -778,7 +779,7 @@ def _run_aicode_subcmd_with_stub(
             "USERPROFILE": str(home),
             "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
             "PYTHONIOENCODING": "utf-8",
-            "AICODE_DYNAMIC_NUM_CTX_MAX": OFFLINE_CTX,
+            "AICODE_N_CTX": OFFLINE_CTX,
             "AICODE_CTX_SAFETY_DISABLE": "1",
             "AICODE_REQUIRED_MODELS_CHECK_SKIP": "1",
             "AICODE_TOOL_CANARY_SKIP": "1",

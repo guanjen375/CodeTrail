@@ -246,7 +246,9 @@ def build_usage(
         effective_num_ctx=effective_ctx,
         dynamic_ctx_enabled=bool(getattr(config, "DYNAMIC_NUM_CTX_ENABLED", False)),
         dynamic_ctx_min=int(getattr(config, "DYNAMIC_NUM_CTX_MIN", 0) or 0),
-        dynamic_ctx_max=int(getattr(config, "DYNAMIC_NUM_CTX_MAX", 0) or 0),
+        # Field name is retained for telemetry-schema compatibility; the value
+        # now comes from the one resolved main N_CTX.
+        dynamic_ctx_max=int(getattr(config, "N_CTX", 0) or 0),
         estimated_input_tokens=est_in,
         reserved_output_tokens=reserved,
         estimated_total_tokens=est_total,
@@ -291,9 +293,8 @@ def overflow_message(usage: ContextUsage) -> str:
         "  How to fix:\n"
         "  - 縮小問題範圍 / 拆成多步\n"
         "  - 減少 tool output（read_file 指定行範圍、grep 縮小 pattern）\n"
-        "  - 降低 AICODE_NUM_CTX 上限會讓 dynamic clamp 更早觸發,反而更明顯。\n"
-        "    要的是更大上限請調 DYNAMIC_NUM_CTX_MAX,並確認 llama-server 啟動時\n"
-        "    的 -c <N> 也夠大(server 啟動後 ctx 即固定,改 env 沒用)。\n"
+        "  - 若確實需要更大 context，請重跑 ./set_config.sh 設定主模型 n_ctx，\n"
+        "    再重啟 llama-server；CodeTrail 與 OpenCode 會跟著同一個值。\n"
         "  - RAG 太多 REF：縮小 KNOWLEDGE_TOP_K 或讓 query 更具體\n"
         "  - 設定 AICODE_RESERVED_OUTPUT_TOKENS 較小（預設 4096）若你只需要短回答"
     )

@@ -1,6 +1,6 @@
 """resolve_server_ctx 的 deterministic 單元測試。
 
-Wrapper integration tests 會直接給定 AICODE_DYNAMIC_NUM_CTX_MAX，避免每一案都對
+Wrapper integration tests 會直接給定 AICODE_N_CTX，避免每一案都對
 離線 port 重複等待；server /props → ctx 的契約集中在這裡完整驗證。
 """
 from __future__ import annotations
