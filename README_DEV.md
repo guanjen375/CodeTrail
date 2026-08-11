@@ -20,11 +20,12 @@ python deployment_profile.py validate
 ruff check tests scripts
 ```
 
-日常使用者入口只保留 OpenCode TUI：
+核心日常入口是 OpenCode TUI；跨機 web 另有薄 launcher（兩者共用 `aicode` 安全前置）：
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
 aicode
+aicode_web  # A/B 機已加入同一 tailnet 時
 ```
 
 ---
@@ -55,6 +56,7 @@ aicode
 - `tests/test_mcp_root_safety.py` — MCP 啟動拒絕 `/` 或 `$HOME` 當 root
 - `tests/test_mcp_smoke.py` — MCP server stdio 啟動與基本 tool 呼叫
 - `tests/test_tool_call_canary.py` — `aicode` 的兩層工具健檢：17-tool contract、假 XML 拒絕、completed event、設定指紋／24h cache、retry/FLAKY/fail-loud；所有 OpenCode／MCP／HTTP／LLM 路徑都 mock，pytest 絕不呼叫真模型
+- `tests/test_web_server_scripts.py` — `aicode_web` 的 Tailscale IPv4 鎖定、headless tmux launcher、參數防繞過與 stop/help smoke；Tailscale / OpenCode 不連真服務
 - `tests/test_gpu_safety.py` — `gpu_safety.py` 的 server /props 觀測、SafetyVerdict 分支;完全離線(nvidia-smi 與 llama-server HTTP 都用 hook 注入 fixture)
 - `tests/test_resolve_server_ctx.py` — `/props` n_ctx 自動跟隨；server 缺席／例外時 non-blocking fallback
 - `tests/test_check_status_script.py` — `check-status.sh` 的 nvidia-smi process 計數、跨 GPU PID 去重、report-only / strict exit code;nvidia-smi 完全用 stub

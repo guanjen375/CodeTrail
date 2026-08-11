@@ -4,7 +4,7 @@ CodeTrail 是一個給 OpenCode 使用的本地 MCP 後端。你在 TUI 裡提�
 
 主線使用方式:
 - OpenCode TUI: `aicode`(README 的主流程以這條為準)
-- 選用/測試: OpenCode web via `aicode web`
+- 選用/測試:跨機瀏覽器模式 `aicode_web`(A 機跑 backend、B 機開網址)
 
 CodeTrail 目前定位是**成熟私有部署版**:適合本機、離線、NDA / firmware / private repo 分析;**不打算公開發布**成 PyPI package、Docker image 或 SaaS。安全邊界有自動測試保護,但未做公開產品級安全審計。
 
@@ -16,10 +16,11 @@ CodeTrail 目前定位是**成熟私有部署版**:適合本機、離線、NDA /
 
 ```bash
 cd <CODETRAIL_REPO>                          # 1. 進 CodeTrail repo
-chmod +x ./aicode                            # 2. 讓啟動指令可執行
+chmod +x ./aicode ./aicode_web               # 2. 讓啟動指令可執行
 mkdir -p "$HOME/.local/bin"                  # 3. 準備使用者 bin 目錄
-ln -sfn "$PWD/aicode" "$HOME/.local/bin/aicode"   # 4. 建立 aicode symlink
-command -v aicode                            # 5. 應顯示 ~/.local/bin/aicode
+ln -sfn "$PWD/aicode" "$HOME/.local/bin/aicode"       # 4. 安裝 TUI 指令
+ln -sfn "$PWD/aicode_web" "$HOME/.local/bin/aicode_web" #    安裝 web 指令
+command -v aicode aicode_web                 # 5. 兩者都應顯示 ~/.local/bin/...
 ./set_config.sh                              # 6. 一鍵設定(偵測 GPU/模型 → 互動問答 → 產生所有設定檔)
 ~/start.sh                                   # 7. 啟動四個 llama-server(tmux 背景)
 ```
@@ -35,6 +36,7 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 - `./set_config.sh` 是**純問答**:逐題回答各角色模型、GPU、主模型運行模式(MoE 才問)、主模型 n_ctx / threads,答完看一頁摘要(Enter 寫入 / q 離開)。主 n_ctx 沒有猜測預設，也**不做容量估算**；reranker/embedding/VL 的 ctx 是獨立 server 內部值，不再混成使用者題目。VRAM 塞不塞得下以啟動後 `nvidia-smi` 實測為準。只有一個候選(或一顆 GPU)的題目自動選用。做的事與產物見 §3。要改配置隨時重跑,舊設定自動備份、可用 `--restore-last-backup` 還原。
 - 安全預設:四個模型 server **只綁 `127.0.0.1`**(僅本機可連);要讓區網其他機器使用要明確 `./set_config.sh --allow-remote`(見 [docs/security.md](docs/security.md))。
 - 管理指令都掛在 `~/start.sh` 上:`~/start.sh status`(檢查四個 server)、`~/start.sh stop`(全部關閉,= `scripts/quit.sh`,關掉主模型 + 三顆附屬模型的所有 tmux 視窗,並**等到 process 退出、VRAM 從 nvidia-smi 消失才返回** — 大模型釋放記憶體需要數十秒是正常的,期間會印進度)、`~/start.sh logs [role] [-f]`(看 server log)、`~/start.sh help`(子命令說明)。
+- **TUI 或 web 之前都要先啟動四個模型 server。**標準產物是 `~/start.sh`,所以 A 機每次開機後先跑 `~/start.sh`。如果你把這支檔案放在桌面,等價做法是先在桌面終端 `cd ~/Desktop && ./start.sh`；下文假設這一步已完成。
 - 重新啟動前要先 `~/start.sh stop`,tmux session 還在時 `~/start.sh` 會拒絕重複啟動;若是啟動中途失敗,launcher 會自動清理本次啟動的服務,修正後直接重跑即可。
 
 ## 0. OpenCode TUI 部署路線圖
@@ -70,7 +72,7 @@ README 的命令範例以 Ubuntu / Debian shell 為主。`aicode` 是 bash wrapp
 > 4. **換模型或主 n_ctx 就重跑 `./set_config.sh` + 重啟 server**:TUI 按 `/models` 只切 OpenCode 的 model id,**不會 reload llama-server、也不會通知 CodeTrail MCP**。主 n_ctx 只填一次；`set_config.sh` 會寫入 deployment / server `-c`，`aicode` 啟動時再讓 CodeTrail budget 與 OpenCode active model 的 `limit.context` 自動跟隨，不用另設 max。
 > 5. **啟動後立即 rollback,先看 server log**:`~/start.sh` 前台只會回報 process 已結束,真正根因用 `~/start.sh logs main` 查看;新 GGUF 也可能需要更新並重新 build llama.cpp。詳細判讀與修復見 [docs/troubleshooting.md](docs/troubleshooting.md)。
 > 6. **CodeTrail 沙箱鎖在「你啟動的那個資料夾」(`AICODE_ROOT`)** —— 綁在 process 上,**不會跟著你在 UI 切資料夾或切對話而移動**。web UI 那顆「切換資料夾」按鈕對 CodeTrail 無效(切過去還是只讀啟動目錄)。換專案 = 到那個目錄重新啟動一個(TUI 重開 `aicode`;web 另起一個 backend)。
-> 7. **web 模式目前是實驗性的(開發中)** —— 穩定、proven 的主力是 standalone TUI(`aicode`);web 用來瀏覽器續問歷史 session,行為可能還會變。要可靠就用 TUI。
+> 7. **web 模式目前是實驗性的(開發中)** —— 穩定、proven 的主力是 standalone TUI(`aicode`);跨機器 web 的簡化入口是 `aicode_web`,低階前景入口才是 `aicode web`。
 > 8. **CodeTrail 沙箱只蓋它那 17 個 MCP 工具** —— OpenCode 內建的 `bash` / `read` / `write` 不走這層,所以範本把它們全 `deny`,**別放寬那份 permission**。分析不信任 repo 時,連被分析 repo 自帶的 `opencode.json` 都可能翻掉你的鎖定(防法:`OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode`,見 [docs/security.md](docs/security.md))。
 > 9. **首次 MoE 對話首字會慢(可能 1–2 分鐘),別按 Esc** —— 它在 page-in expert weights,不是當掉;slot / GPU 在動就是正常。
 > 10. **NDA / 衍生資料不要 commit**:`knowledge.json`、`*.jsonl`、`.codetrail/`、`data/`、`.aicode_uploads/` 等已在 `.gitignore`,commit 前自己 `git diff` 看一眼。
@@ -530,7 +532,7 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 
 主模型 context 也採同一原則：使用者只在 `set_config.sh` 設 `n_ctx`。`aicode` 會讀主 server `/props` 的實值，供 CodeTrail internal calls 使用，並把 OpenCode active model 的 `limit.context` 安全同步成同一值。同步只改該 model 的這一欄、原子寫入並留備份；無法唯一定位 model、JSON 損壞或寫入失敗時才 fail-loud。
 
-`aicode`（含 `aicode web`，不含只連既有 backend 的 `attach`）還會自動跑兩層工具健檢。第一層每次都直接對實際 MCP command 做 `initialize → tools/list → list_dir`，並要求工具集合精確等於文件列出的 17 個；第二層用 fresh `opencode run --format json` 要 active model 真正呼叫 `codetrail_list_dir`，只有 `tool_use.state.status=completed` 的結構化 event 才算 PASS，模型輸出的 XML／成功宣稱一律不算。模型層 PASS 依 OpenCode config、模型、server `/props`（含 chat template／取樣預設）、專案規則與版本指紋快取 24 小時；設定變更會自動失效。快取只有 hash／時間，不含 prompt、檔名或 tool output，臨時 canary session 也會在檢查後刪除。完整輸出與 override 見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。
+`aicode`（含 `aicode web` 與最終委派它的 `aicode_web`，不含只連既有 backend 的 `attach`）還會自動跑兩層工具健檢。第一層每次都直接對實際 MCP command 做 `initialize → tools/list → list_dir`，並要求工具集合精確等於文件列出的 17 個；第二層用 fresh `opencode run --format json` 要 active model 真正呼叫 `codetrail_list_dir`，只有 `tool_use.state.status=completed` 的結構化 event 才算 PASS，模型輸出的 XML／成功宣稱一律不算。模型層 PASS 依 OpenCode config、模型、server `/props`（含 chat template／取樣預設）、專案規則與版本指紋快取 24 小時；設定變更會自動失效。快取只有 hash／時間，不含 prompt、檔名或 tool output，臨時 canary session 也會在檢查後刪除。完整輸出與 override 見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。
 
 說明:
 
@@ -619,34 +621,32 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 
 ### 5.4 Web 模式(目前測試中)
 
-> ⚠️ **CodeTrail 的沙箱綁在「你啟動 backend 的那個資料夾」(`AICODE_ROOT`)—— 綁在 process 上,不會跟著你在 UI 切資料夾、或切對話而移動。** 所以 OpenCode web UI 那顆「切換資料夾 / 開其他專案」按鈕**對 CodeTrail 完全無效**:切過去後 CodeTrail 工具還是只讀**啟動目錄**(讀不到沙箱外,所以不是 escape,但會讓你誤以為切了)。**請無視那顆切換器。** 要分析別的專案,就在那個目錄**另起一個 backend**(換 port,例:`AICODE_WEB_PORT=4097 <CODETRAIL_REPO>/scripts/start-web.sh`)。
+> ⚠️ **CodeTrail 的沙箱綁在「你啟動 backend 的那個資料夾」(`AICODE_ROOT`)—— 綁在 process 上,不會跟著你在 UI 切資料夾、或切對話而移動。** 所以 OpenCode web UI 那顆「切換資料夾 / 開其他專案」按鈕**對 CodeTrail 完全無效**:切過去後 CodeTrail 工具還是只讀**啟動目錄**(讀不到沙箱外,所以不是 escape,但會讓你誤以為切了)。**請無視那顆切換器。** 換專案時先 `aicode_web stop`,再到新專案目錄重開。
 >
 > (TUI 沒有這顆切換器,你 `cd 專案 && aicode` 在裡面開幾個對話都是鎖在同一個專案,自然不會錯亂;換專案就重開一個 `aicode`。)
 
-1. server 和你要瀏覽的裝置都裝 [Tailscale](https://tailscale.com/) 並登入**同一個 tailnet**。
-2. 在 server 把 loopback 的 web port 掛上 tailnet(常駐、跨重開機):
+前提只有兩個:
 
-   ```bash
-   tailscale serve --bg --https=4096 4096
-   tailscale serve status     # 看到 https://<你的-server>.<tailnet>.ts.net:4096 → 127.0.0.1:4096 就對了
-   ```
+- A 機(跑模型、可只有文字終端)和 B 機(有 GUI / 瀏覽器)已安裝 [Tailscale](https://tailscale.com/download)、登入同一個 tailnet。
+- A 機已先執行 `set_config.sh` 產生的模型啟動檔:標準位置跑 `~/start.sh`；若你把它放在桌面,就在桌面目錄跑 `./start.sh`。四個 llama-server 要先 ready。
 
-   把印出來的 `https://<你的-server>.<tailnet>.ts.net:4096/` 加到瀏覽器最愛。
+之後每次只做:
 
-   > ⚠️ **一定用 `tailscale serve`(只限 tailnet 內)。絕不可用 `tailscale funnel`** —— funnel 會把 backend 暴露到**整個公網**,NDA 直接外洩。
-   > (server 的 443 沒被占用的話,也可用 `tailscale serve --bg 4096` 拿到沒 port 的短網址 `https://<你的-server>.<tailnet>.ts.net/`。)
+```bash
+# A 機
+cd <PROJECT_TO_ANALYZE>
+aicode_web
+```
 
-**每次使用:**
+`aicode_web` 會自動讀取 A 機當下的 Tailscale IPv4、只把 backend 綁到該位址,在背景 tmux 完成 preflight，最後印出例如 `http://100.x.y.z:4096/`。A 機沒有瀏覽器完全沒關係；B 機只要把這個網址貼進瀏覽器。重跑同一個命令會沿用同專案的 backend；停止用:
 
-3. 在 server 啟動 backend(背景,起完就回到提示字元):
+```bash
+aicode_web stop
+```
 
-   ```bash
-   cd <PROJECT_TO_ANALYZE>
-   <CODETRAIL_REPO>/scripts/start-web.sh     # 背景啟動(tmux);停止用 stop-web.sh
-   ```
-   `start-web.sh` 起來後若偵測到 tailscale serve,會直接把那個 ts.net 網址印給你。
+這條路徑不綁 `0.0.0.0`、不開 LAN / 公網介面，也不需要設定 Tailscale Serve / Funnel / HTTPS 憑證。網址雖是 `http://`,封包仍在 Tailscale 的加密隧道內；存取權由 tailnet ACL 決定。共享或多人 tailnet 請確認 ACL 只允許預期的 B 機。**絕不可改用 `tailscale funnel`**，它會公開到 Internet。
 
-**沒裝 / 不想裝 Tailscale 的 fallback** —— SSH port-forward(每次都要開、斷了要重來):用你平常 SSH 進 server 的指令後面加 `-L`,再開本機 `http://127.0.0.1:4096`:
+**沒裝 / 不想裝 Tailscale 的 fallback** —— 在 A 機從專案目錄跑 `<CODETRAIL_REPO>/scripts/start-web.sh`(只綁 loopback)，B 機建立 SSH port-forward 後開 `http://127.0.0.1:4096`:
 
 ```bash
 ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>

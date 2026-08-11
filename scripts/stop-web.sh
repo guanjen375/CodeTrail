@@ -17,6 +17,7 @@ source "$SCRIPT_DIR/rag-server-lib.sh"
 
 PORT="${AICODE_WEB_PORT:-4096}"
 WEB_SESSION="${WEB_SESSION:-codetrail-web}"
+BIND_HOST="${AICODE_WEB_BIND_HOST:-}"
 FORCE=0
 
 while [[ $# -gt 0 ]]; do
@@ -43,6 +44,14 @@ fi
 
 if command -v tmux >/dev/null 2>&1; then
     if tmux has-session -t "$WEB_SESSION" 2>/dev/null; then
+        session_host="$(tmux show-options -qv -t "$WEB_SESSION" @codetrail_host 2>/dev/null || true)"
+        session_port="$(tmux show-options -qv -t "$WEB_SESSION" @codetrail_port 2>/dev/null || true)"
+        if [[ -n "$session_host" ]]; then
+            BIND_HOST="$session_host"
+        fi
+        if [[ "$session_port" =~ ^[0-9]+$ ]] && (( session_port >= 1 && session_port <= 65535 )); then
+            PORT="$session_port"
+        fi
         tmux kill-session -t "$WEB_SESSION"
         echo "[+] 已關閉 tmux session '$WEB_SESSION'(web backend 已停止)"
     else
@@ -50,6 +59,10 @@ if command -v tmux >/dev/null 2>&1; then
     fi
 else
     echo "[!] 找不到 tmux,跳過 session 關閉;仍會檢查目標 port" >&2
+fi
+
+if [[ -z "$BIND_HOST" ]]; then
+    BIND_HOST="127.0.0.1"
 fi
 
 # 確認 port 釋放。backend 收到 kill 到真正關閉 socket 之間有 race,所以先輪詢幾秒;
@@ -60,14 +73,16 @@ else
     listener=""
     deadline=$((SECONDS + 5))
     while (( SECONDS < deadline )); do
-        # 只看 backend 的 loopback listener;tailscale serve 的 tailscale IP:PORT 不算占用。
-        listener="$(rag_port_listener "$PORT" 2>/dev/null | grep -E "(^|[[:space:]])(127\.[0-9.]+|0\.0\.0\.0|\*|\[::1?\]):${PORT}([[:space:]]|\$)" || true)"
+        # 只看本次 backend 的 bind address 與 wildcard listener。loopback 模式不會把
+        # 另一個 Tailscale listener 誤算進來;direct-Tailscale 模式則檢查該 CGNAT IP。
+        bind_host_re="${BIND_HOST//./\\.}"
+        listener="$(rag_port_listener "$PORT" 2>/dev/null | grep -E "(^|[[:space:]])(${bind_host_re}|0\.0\.0\.0|\*|\[(::|::1)\]):${PORT}([[:space:]]|\$)" || true)"
         [[ -z "$listener" ]] && break
         sleep 1
     done
 
     if [[ -z "$listener" ]]; then
-        echo "[+] port $PORT 已釋放"
+        echo "[+] $BIND_HOST:$PORT 已釋放"
     else
         pids="$(printf '%s\n' "$listener" | rag_listener_pids | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
         if [[ -z "$pids" ]]; then

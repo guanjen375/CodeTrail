@@ -2487,6 +2487,7 @@ def run(args: argparse.Namespace) -> int:
     print("  ~/start.sh                        # 啟動四個 llama-server(tmux)")
     print("  ~/start.sh status                 # 確認四個 server 都 ready")
     print("  cd <你要分析的專案> && aicode      # 進 TUI;/status 應顯示 codetrail Connected")
+    print("  cd <你要分析的專案> && aicode_web  # A 機背景 web;B 機開它印出的 Tailscale URL")
     print("  ~/start.sh stop                   # 收工:關掉全部 tmux server 視窗")
     return 1 if preview_rc != 0 else 0
 

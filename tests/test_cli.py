@@ -422,6 +422,7 @@ def _run_aicode_subcmd_with_stub(
     opencode_stub: str = _OPENCODE_WEB_CAPABLE_STUB,
     env_extra: dict[str, str] | None = None,
     set_model: bool = True,
+    tailscale_ip: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     """跑 `aicode <args>`,用可注入的 opencode stub。回傳 (result, args_file)。
 
@@ -447,6 +448,18 @@ def _run_aicode_subcmd_with_stub(
     stub_opencode = bin_dir / "opencode"
     stub_opencode.write_text(opencode_stub, encoding="utf-8")
     stub_opencode.chmod(0o700)
+    if tailscale_ip is not None:
+        stub_tailscale = bin_dir / "tailscale"
+        stub_tailscale.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [ \"${1:-}\" = ip ] && [ \"${2:-}\" = -4 ]; then\n"
+            f"  printf '%s\\n' {tailscale_ip!r}\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 2\n",
+            encoding="utf-8",
+        )
+        stub_tailscale.chmod(0o700)
 
     env = os.environ.copy()
     for key in (
@@ -454,6 +467,7 @@ def _run_aicode_subcmd_with_stub(
         "AICODE_ROOT",
         "OPENCODE_CONFIG",
         "AICODE_WEB_PORT",
+        "AICODE_WEB_TAILSCALE_IP",
         "OPENCODE_SERVER_PASSWORD",
         "OPENCODE_SERVER_USERNAME",
     ):
@@ -580,9 +594,61 @@ def test_aicode_web_non_local_hostname_with_password_allowed(tmp_path):
     assert _contains_subsequence(args, ["--hostname", "0.0.0.0"])
 
 
+def test_aicode_web_verified_tailscale_ip_without_password_allowed(tmp_path):
+    """aicode_web 的窄例外:env、hostname、tailscale CLI 三者完全一致才放行。"""
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path,
+        ["web", "--hostname", "100.100.10.20"],
+        env_extra={"AICODE_WEB_TAILSCALE_IP": "100.100.10.20"},
+        tailscale_ip="100.100.10.20",
+    )
+
+    assert result.returncode == 0, f"exit={result.returncode}\nstderr={result.stderr}"
+    assert _contains_subsequence(
+        _read_stub_args(args_file), ["--hostname", "100.100.10.20"]
+    )
+    assert "已驗證並只綁本機 Tailscale IPv4" in result.stdout
+
+
+def test_aicode_web_tailscale_env_cannot_spoof_current_ip(tmp_path):
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path,
+        ["web", "--hostname", "100.100.10.20"],
+        env_extra={"AICODE_WEB_TAILSCALE_IP": "100.100.10.20"},
+        tailscale_ip="100.100.10.21",
+    )
+
+    assert result.returncode != 0
+    assert "OPENCODE_SERVER_PASSWORD" in result.stderr
+    assert not args_file.exists()
+
+
+def test_aicode_web_non_cgnat_ip_cannot_use_tailscale_exception(tmp_path):
+    result, args_file = _run_aicode_subcmd_with_stub(
+        tmp_path,
+        ["web", "--hostname", "192.168.1.50"],
+        env_extra={"AICODE_WEB_TAILSCALE_IP": "192.168.1.50"},
+        tailscale_ip="192.168.1.50",
+    )
+
+    assert result.returncode != 0
+    assert "OPENCODE_SERVER_PASSWORD" in result.stderr
+    assert not args_file.exists()
+
+
 def test_aicode_web_mdns_without_password_refused(tmp_path):
     """--mdns 會翻成 0.0.0.0 廣播,視為非 loopback 暴露,未設密碼也要拒絕。"""
     result, args_file = _run_aicode_subcmd_with_stub(tmp_path, ["web", "--mdns"])
+
+    assert result.returncode != 0
+    assert "OPENCODE_SERVER_PASSWORD" in result.stderr
+    assert "mdns" in result.stderr.lower()
+    assert not args_file.exists()
+
+
+def test_aicode_web_mdns_equals_form_without_password_refused(tmp_path):
+    """yargs 也接受 --mdns=true；不能靠 spelling 繞過非 loopback 密碼硬規則。"""
+    result, args_file = _run_aicode_subcmd_with_stub(tmp_path, ["web", "--mdns=true"])
 
     assert result.returncode != 0
     assert "OPENCODE_SERVER_PASSWORD" in result.stderr

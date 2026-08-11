@@ -106,15 +106,17 @@ aicode
 
 ## Web 模式曝光面
 
-`aicode web` 預設只綁 `127.0.0.1`。跨機器使用時推薦 Tailscale `serve` 或 SSH port-forward。
+`aicode web` 預設只綁 `127.0.0.1`。A/B 機跨機器使用時推薦 `aicode_web`:它每次向本機 `tailscale ip -4` 取值,只綁該 `100.64.0.0/10` virtual interface，絕不綁 `0.0.0.0`。A 機可完全沒有 GUI，B 機開 launcher 印出的 `http://100.x.y.z:4096/` 即可；HTTP 封包仍包在 Tailscale 的加密 tunnel 內。
 
-不要用 `tailscale funnel`,因為它會把 OpenCode web backend 暴露到公網。若你刻意綁 `0.0.0.0` 或開 `--mdns`,必須先設定 `OPENCODE_SERVER_PASSWORD`,否則 `aicode web` 會拒絕啟動。
+`aicode_web` 沒有應用層密碼,因此 **tailnet ACL 是存取邊界**；共享 / 多人 tailnet 應限制哪些裝置或使用者能連 A 機的 4096 port。wrapper 傳入值、hostname、Tailscale CLI 當下 IP 只要有一項不一致就拒絕。普通 `aicode web` 若刻意綁 LAN IP / `0.0.0.0` 或開 `--mdns`,仍必須先設定 `OPENCODE_SERVER_PASSWORD`。
+
+不要用 `tailscale funnel`,因為它會把 OpenCode web backend 暴露到公網。想維持純 loopback 也可使用 SSH port-forward；這兩條都不會放寬 CodeTrail MCP sandbox。
 
 ---
 
 ## 快速檢查表
 
-- 從具體專案目錄跑 `aicode`,不要從 `$HOME` 或 `/`。
+- 從具體專案目錄跑 `aicode` / `aicode_web`,不要從 `$HOME` 或 `/`。
 - `/status` 看到 `codetrail Connected` 後再開始工作。
 - 不信任 repo 時加 `OPENCODE_DISABLE_PROJECT_CONFIG=1`。
 - 保留 README §4.2 的 `permission` 鎖定。

@@ -379,8 +379,10 @@ if [ "${SUBCMD:-}" = "web" ]; then
         fi
         shift
         ;;
-      --mdns)
+      --mdns|--mdns=*)
         # mDNS 會把 hostname 預設翻成 0.0.0.0 並對區網廣播服務;視為非 loopback 暴露。
+        # `--mdns=true` 也是 yargs 接受的形式；保守地把任何 --mdns=<value>
+        # 都視為啟用，避免 boolean spelling 繞過密碼硬規則。
         WEB_MDNS=1
         WEB_PASSTHROUGH+=("$1")
         shift
@@ -394,14 +396,40 @@ if [ "${SUBCMD:-}" = "web" ]; then
 
   # 安全硬規則(比上游嚴):hostname 非 loopback,或開了 --mdns 廣播時,
   # 必須已設 OPENCODE_SERVER_PASSWORD —— 未設密碼時 OpenCode server 完全無認證。
+  # 唯一例外是 aicode_web 的受限 Tailscale 路徑:hostname 必須同時等於 wrapper
+  # 傳入的 AICODE_WEB_TAILSCALE_IP、以及 tailscale CLI 當下回報的本機 IPv4，且
+  # 必須落在 Tailscale 的 100.64.0.0/10。這不允許 0.0.0.0、LAN IP 或任意 env
+  # 值繞過密碼硬規則；backend 只 listen 在 Tailscale virtual interface。
   WEB_LOCAL=0
   case "$WEB_HOSTNAME" in
     127.0.0.1|localhost|::1)
       WEB_LOCAL=1
       ;;
   esac
+
+  is_tailscale_ipv4() {
+    local ip="$1" a b c d
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r a b c d <<<"$ip"
+    (( 10#$a == 100 && 10#$b >= 64 && 10#$b <= 127 && \
+       10#$c >= 0 && 10#$c <= 255 && 10#$d >= 0 && 10#$d <= 255 ))
+  }
+
+  WEB_TAILSCALE_VERIFIED=0
+  if [ "$WEB_LOCAL" -ne 1 ] && [ "$WEB_MDNS" -ne 1 ] && \
+     [ -n "${AICODE_WEB_TAILSCALE_IP:-}" ] && \
+     [ "$WEB_HOSTNAME" = "$AICODE_WEB_TAILSCALE_IP" ] && \
+     is_tailscale_ipv4 "$WEB_HOSTNAME" && command -v tailscale >/dev/null 2>&1; then
+    while IFS= read -r current_ts_ip; do
+      if [ "$current_ts_ip" = "$WEB_HOSTNAME" ]; then
+        WEB_TAILSCALE_VERIFIED=1
+        break
+      fi
+    done < <(tailscale ip -4 2>/dev/null || true)
+  fi
+
   if [ "$WEB_LOCAL" -ne 1 ] || [ "$WEB_MDNS" -eq 1 ]; then
-    if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
+    if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ] && [ "$WEB_TAILSCALE_VERIFIED" -ne 1 ]; then
       WEB_WHY="hostname=$WEB_HOSTNAME"
       if [ "$WEB_MDNS" -eq 1 ]; then
         WEB_WHY="$WEB_WHY 且開啟 --mdns 廣播"
@@ -410,7 +438,8 @@ if [ "${SUBCMD:-}" = "web" ]; then
       echo "[aicode] 但未設定 OPENCODE_SERVER_PASSWORD —— 未設密碼時 OpenCode server 完全無認證。" >&2
       echo "[aicode] 擇一處理:" >&2
       echo "[aicode]   1) 只在本機用:aicode web(預設 127.0.0.1、不要 --mdns)" >&2
-      echo "[aicode]   2) 要對可信內網/VPN 暴露:先 export OPENCODE_SERVER_PASSWORD=<強密碼> 再啟動" >&2
+      echo "[aicode]   2) A/B 機已加入同一 tailnet:改用 aicode_web(只綁 Tailscale IP)" >&2
+      echo "[aicode]   3) 要對其他可信內網暴露:先 export OPENCODE_SERVER_PASSWORD=<強密碼> 再啟動" >&2
       echo "[aicode] 切勿把 0.0.0.0 綁到可信內網以外的網卡。" >&2
       exit 2
     fi
@@ -418,8 +447,12 @@ if [ "${SUBCMD:-}" = "web" ]; then
 
   echo "[aicode] web backend → http://$WEB_HOSTNAME:$WEB_PORT"
   echo "[aicode] 🧪 web 模式為實驗功能(開發中);要穩定請用 standalone TUI(直接 aicode)。"
-  if [ "$WEB_LOCAL" -eq 1 ] && [ "$WEB_MDNS" -ne 1 ]; then
+  if [ "$WEB_TAILSCALE_VERIFIED" -eq 1 ]; then
+    echo "[aicode] 已驗證並只綁本機 Tailscale IPv4；不會 listen 在 LAN / 公網介面。"
+    echo "[aicode] 存取邊界是 tailnet ACL：只有 ACL 允許連到這台 A 機的裝置可開啟。"
+  elif [ "$WEB_LOCAL" -eq 1 ] && [ "$WEB_MDNS" -ne 1 ]; then
     echo "[aicode] 綁 loopback。有桌面的話瀏覽器會自動開;若這台是沒有桌面的 server,從你自己的電腦:"
+    echo "[aicode]   A/B 機有 Tailscale:Ctrl-C 後改跑 aicode_web(自動印 B 機網址)"
     echo "[aicode]   ssh -N -L $WEB_PORT:127.0.0.1:$WEB_PORT <你的帳號>@<此 server>"
     echo "[aicode]   再用本機瀏覽器開 http://127.0.0.1:$WEB_PORT。另開終端 \`aicode attach\` 可接 TUI。"
   else

@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# aicode_web — 在目前專案背景啟動 web backend，僅綁 A 機的 Tailscale IPv4。
+#
+# 正常用法:
+#   cd <PROJECT_TO_ANALYZE>
+#   aicode_web
+#
+# 停止:
+#   aicode_web stop
+
+set -euo pipefail
+
+resolve_codetrail_home() {
+  local source="${BASH_SOURCE[0]}"
+  local dir
+
+  while [ -h "$source" ]; do
+    dir="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd -P)"
+    source="$(readlink "$source")"
+    case "$source" in
+      /*) ;;
+      *) source="$dir/$source" ;;
+    esac
+  done
+
+  cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd -P
+}
+
+CODETRAIL_HOME="$(resolve_codetrail_home)" || {
+  echo "[aicode_web] cannot resolve CodeTrail checkout path" >&2
+  exit 2
+}
+
+case "${1:-}" in
+  stop)
+    shift
+    # session metadata 是主要來源；這個 env 讓 session 已意外消失時仍能檢查
+    # Tailscale bind 上是否殘留 listener。只接受 tailscale CLI 的 CGNAT IPv4。
+    if command -v tailscale >/dev/null 2>&1; then
+      current_ts_ip="$(tailscale ip -4 2>/dev/null | awk 'NF { print; exit }' || true)"
+      if [[ "$current_ts_ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        export AICODE_WEB_BIND_HOST="$current_ts_ip"
+      fi
+    fi
+    exec "$CODETRAIL_HOME/scripts/stop-web.sh" "$@"
+    ;;
+  -h|--help|help)
+    exec "$CODETRAIL_HOME/scripts/start-web.sh" --help
+    ;;
+  ""|-*)
+    exec "$CODETRAIL_HOME/scripts/start-web.sh" --tailscale "$@"
+    ;;
+  *)
+    echo "[aicode_web] unknown subcommand: $1 (可用:stop / --help)" >&2
+    exit 2
+    ;;
+esac

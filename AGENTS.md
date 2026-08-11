@@ -1,7 +1,7 @@
 # AGENTS.md — 給 AI coding agent 的工作規範
 
 這個 repo 是一個 **本地 RAG / Code-RAG / MCP 工具集**。終端使用者透過 OpenCode TUI
-和 `aicode` wrapper 連到這個專案，用本地 llama.cpp `llama-server` 跑模型,
+和 `aicode` wrapper（或薄的 `aicode_web` 背景 launcher）連到這個專案，用本地 llama.cpp `llama-server` 跑模型,
 分析 NDA / 內部 firmware repo。
 
 如果你是 AI coding agent（Codex / OpenCode 等）正在改這個 repo，請先把這份檔讀完。
@@ -13,8 +13,9 @@
 
 - **不是** library，不是要 publish 到 PyPI。
 - **是** 個人工程工具，重視可修改性、可測試性，但**安全層的東西不要砍**。
-- 使用者 entry point 只保留一個：
-  - `aicode` — wrapper，從目前目錄啟動 OpenCode 並設定 `AICODE_ROOT`
+- 核心 wrapper 只保留一個：
+  - `aicode` — 從目前目錄啟動 OpenCode 並設定 `AICODE_ROOT`
+  - `aicode_web` 只是跨機瀏覽器便利入口；它委派 `scripts/start-web.sh`，backend 最終仍走 `aicode web` 的完整安全前置
 - Runtime entry point：
   - `mcp_server.py` — MCP server（OpenCode / MCP client 用 stdio 接）
 

@@ -362,6 +362,17 @@ python3 <CODETRAIL_REPO>/RAG.py <SOURCE_IMAGE> knowledge.json --image -y
 `knowledge.json`、`knowledge_emb.npz`、embedding cache 與備份都可能含 NDA 衍生資料,
 不可 commit。
 
+### `aicode_web`: Tailscale 尚未連線 / IP 無效
+
+`aicode_web` 不猜 LAN 位址，也不 fallback 到 `0.0.0.0`。A 機必須先登入 Tailscale，且 `tailscale ip -4` 要回報一個 `100.64.0.0/10` 位址:
+
+```bash
+tailscale status
+tailscale ip -4
+```
+
+看到 `NeedsLogin` / `Stopped` 時先完成 Tailscale 登入。A、B 機都 online 後，回到**要分析的專案目錄**重跑 `aicode_web`。若使用自訂 tailnet ACL，還要允許 B 機連 A 機的 web port(預設 4096)。launcher 不會操作 Tailscale Serve / Funnel，也不需要 A 機有 GUI。
+
 ### `aicode web`: 「這個 opencode 不支援 'web' 子指令(版本太舊)」
 
 `aicode web` 啟動前會偵測 opencode 是否真的支援 web 子指令。看到這個訊息代表你的 opencode 太舊、還沒內建 web backend。升級:
@@ -378,7 +389,7 @@ opencode web --help    # 應印出 opencode web 的說明(含 --port / --hostnam
 `aicode attach` 是純 client,連不上通常代表 backend 沒在跑、或 url / port 不對。逐項確認:
 
 ```bash
-# 1) backend 有在跑嗎?(另一個終端應該有 aicode web 沒被關掉)
+# 1) loopback backend 有在跑嗎?(aicode_web 模式請改用它印出的 100.x URL)
 curl -sS http://127.0.0.1:4096/ -o /dev/null -w '%{http_code}\n'   # 有回 HTTP 碼(200/401 等)代表 backend 活著
 
 # 2) port 對嗎?attach 預設接 4096;web 端若用 AICODE_WEB_PORT 換過 port,attach 也要對齊
@@ -393,7 +404,7 @@ aicode attach http://127.0.0.1:4096 -p <密碼>     # username 預設 opencode,�
 
 curl 回 401 代表 backend 活著但需要密碼;完全沒回應才是 backend 沒起來、或 port / host 寫錯。
 
-### `aicode web`: port 被占用
+### `aicode web` / `aicode_web`: port 被占用
 
 `aicode web` 刻意固定 port(預設 4096),被占用時不會自動換 port,讓 opencode 直接報錯。先看誰占用:
 
@@ -410,17 +421,21 @@ aicode attach http://127.0.0.1:4096
 # B) 真的要換 port(web 與 attach 都要對齊同一個)
 AICODE_WEB_PORT=4097 aicode web
 AICODE_WEB_PORT=4097 aicode attach      # 或 aicode attach http://127.0.0.1:4097
+
+# Tailscale 背景模式(會印出新 port 的 B 機 URL)
+AICODE_WEB_PORT=4097 aicode_web
 ```
 
 ### web UI 切了資料夾,CodeTrail 還是讀啟動時那個目錄
 
-CodeTrail 的沙箱根(`AICODE_ROOT`)是**啟動 `aicode web` / `start-web.sh` 當下那個目錄**,backend 起來時就釘死。OpenCode web UI 的「切換 WORK DIR / 開其他資料夾」只換 OpenCode 自己的 view,**不會 re-scope CodeTrail 的 MCP 沙箱** —— 所以你在 UI 切到別的資料夾後,`list_dir` / `read_file` 還是讀**啟動那個目錄**。
+CodeTrail 的沙箱根(`AICODE_ROOT`)是**啟動 `aicode_web` / `aicode web` / `start-web.sh` 當下那個目錄**,backend 起來時就釘死。OpenCode web UI 的「切換 WORK DIR / 開其他資料夾」只換 OpenCode 自己的 view,**不會 re-scope CodeTrail 的 MCP 沙箱** —— 所以你在 UI 切到別的資料夾後,`list_dir` / `read_file` 還是讀**啟動那個目錄**。
 
 這不是 escape(CodeTrail 讀不到沙箱外的資料夾,只是還停在原本那個),但會誤導。**CodeTrail web 是一個 backend 一個專案**:要分析另一個專案,在那個專案目錄**另起一個 backend**(換 port):
 
 ```bash
 cd ~/other-project
-AICODE_WEB_PORT=4097 <CODETRAIL_REPO>/scripts/start-web.sh
+aicode_web stop
+aicode_web
 ```
 
 OpenCode 目前沒有關掉那個切換器的設定,所以請直接**無視 UI 的資料夾切換**。
