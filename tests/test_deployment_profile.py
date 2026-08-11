@@ -110,6 +110,21 @@ def test_canonical_n_ctx_override_wins_over_legacy_main_ctx(tmp_path):
     assert effective.service("main").ctx == 57344
 
 
+def test_explicit_local_override_must_exist(tmp_path):
+    missing = tmp_path / "missing-deployment.json"
+
+    with pytest.raises(ProfileError, match="AICODE_DEPLOYMENT_CONFIG.*existing file"):
+        load_effective_profile(_env(tmp_path, AICODE_DEPLOYMENT_CONFIG=str(missing)))
+
+
+def test_absent_default_local_override_still_uses_defaults(tmp_path):
+    effective = load_effective_profile(_env(tmp_path))
+
+    assert effective.selected_profile == "defaults"
+    assert effective.local_override is None
+    assert effective.service("main").ctx == 65536
+
+
 def test_profile_selector_precedence_cli_then_env_then_local(tmp_path):
     _write_local(tmp_path, {"schema_version": 1, "profile": "maintainer-target"})
     env = _env(tmp_path, AICODE_PROFILE="verified-reference")

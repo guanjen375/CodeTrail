@@ -620,10 +620,15 @@ def load_effective_profile(
         env.update({key: str(value) for key, value in cli_env.items()})
 
     override_path = local_override_path(env)
+    explicit_override = bool((env.get("AICODE_DEPLOYMENT_CONFIG") or "").strip())
     local_data: dict[str, Any] | None = None
     if override_path and override_path.is_file():
         local_data = _read_json_object(override_path, "local deployment override")
         _validate_document(local_data, f"local deployment override {override_path}", local=True)
+    elif override_path and explicit_override:
+        raise ProfileError(
+            f"AICODE_DEPLOYMENT_CONFIG must point to an existing file: {override_path}"
+        )
 
     selected = (profile or env.get("AICODE_PROFILE") or "").strip()
     if not selected and local_data:

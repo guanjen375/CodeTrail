@@ -231,3 +231,23 @@ def test_fix_syncs_to_deployment_profile_when_env_unset(monkeypatch, tmp_path):
     assert occ.main(["--fix"]) == 0
     updated = json.loads(path.read_text(encoding="utf-8"))
     assert updated["provider"]["llamacpp"]["models"]["main-model"]["limit"]["context"] == 131072
+
+
+def test_fix_refuses_missing_explicit_profile_without_writing(
+    monkeypatch, tmp_path, capsys
+):
+    path = _write_opencode(tmp_path, 131072)
+    before = path.read_bytes()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv(
+        "AICODE_DEPLOYMENT_CONFIG", str(tmp_path / "missing-deployment.json")
+    )
+    _clear_ctx_env(monkeypatch)
+
+    assert occ.main(["--fix"]) == 2
+    assert path.read_bytes() == before
+    assert not path.with_name(path.name + occ.BACKUP_SUFFIX).exists()
+    out = capsys.readouterr().out
+    assert "INVALID" in out
+    assert "AICODE_DEPLOYMENT_CONFIG" in out
