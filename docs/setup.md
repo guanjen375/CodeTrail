@@ -158,7 +158,7 @@ ssh -L 8080:localhost:8080 -L 8081:localhost:8081 -L 8082:localhost:8082 -L 8083
 11. 用 fresh `opencode run --format json` 驗 active model 真的產生 completed 的結構化 `codetrail_list_dir` event；依 model/config/chat-template/project 指紋快取成功結果 24 小時
 12. 啟動 `opencode` 並原樣轉發使用者的 `-m / --model`
 
-第 10 項每次啟動都實跑，不靠模型自述；第 11 項首次、快取過期或指紋變動才實跑，所以不必每次手動問「列出 17 個工具」。`aicode web` 也會跑兩層檢查；`aicode attach` 是接既有 backend 的薄 client，不重跑。完整 PASS / FAIL、快取與緊急 override 說明見 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)。
+第 10 項每次啟動都實跑，不靠模型自述；第 11 項首次、快取過期或指紋變動才實跑，所以不必每次手動問「列出 17 個工具」。第 11 項實跑（本地推理，通常數十秒起）前會先印出原因與單次上限，執行中每 15 秒回報進度——不是當機。`aicode web` 也會跑兩層檢查；`aicode attach` 是接既有 backend 的薄 client，不重跑。完整 PASS / FAIL、快取與緊急 override 說明見 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)。
 
 ---
 

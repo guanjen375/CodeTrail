@@ -143,6 +143,7 @@ nvidia-smi -l 1                                              # GPU 是否在動
 
 - `MCP PASS — 17 tools + list_dir round-trip`：每次啟動都另起實際設定的 MCP command，完成 `initialize`、精確比對 17 個 schema，再真的執行無副作用的 `list_dir(path=".", depth=1)`。這一層完全不問 LLM。
 - `MODEL PASS — structured codetrail_list_dir completed`：用 fresh headless session 跑 active model，只接受 JSON stream 裡 completed 的結構化 `tool_use`。純文字／XML 和模型自行宣稱成功都不會通過。
+- `MODEL live canary — <原因>`：第二層 cache 未命中（新專案、設定變動、快取過期或 `--force`）時，實跑前會先印出原因與單次上限秒數，執行中每 15 秒回報一次「仍在執行」。本地推理通常需要數十秒到數分鐘——看得到心跳就不是當機，完全靜默才是異常。
 - `MODEL PASS — cached ...`：相同專案、模型、OpenCode 設定、全域／專案 AGENTS、server `/props`（含 chat template 與取樣預設）曾在 24 小時內通過；MCP 第一層仍是本次 live 檢查。指紋任一部分改變會自動重測。
 - `MODEL FLAKY`：第一次失敗、retry 才成功。本次可進入，但不寫 PASS cache，所以下次 `aicode` 仍會再驗。連續兩次失敗預設拒絕進 TUI。
 

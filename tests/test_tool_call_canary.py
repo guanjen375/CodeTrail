@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 from scripts import check_readme_consistency
@@ -303,7 +305,7 @@ def test_run_model_attempt_passes_explicit_model_and_ignores_private_output(
         recorded.extend(argv)
         return subprocess.CompletedProcess(argv, 0, _completed_event(), "secret stderr")
 
-    monkeypatch.setattr(canary, "_run_process", fake_run)
+    monkeypatch.setattr(canary, "_run_process_with_heartbeat", fake_run)
     evidence = canary.run_model_attempt(
         root=tmp_path,
         env={},
@@ -334,6 +336,106 @@ def test_frontend_model_argument_is_forwarded_to_canary_run(monkeypatch, tmp_pat
         force=True,
     ) == 0
     assert observed == ["llamacpp/from-cli"]
+
+
+def test_heartbeat_runner_reports_progress_and_captures_output(tmp_path, capsys):
+    child = (
+        "import time; print('canary-stdout', flush=True); "
+        "time.sleep(1.2); print('done', flush=True)"
+    )
+    result = canary._run_process_with_heartbeat(
+        [sys.executable, "-c", child],
+        root=tmp_path,
+        env=dict(os.environ),
+        timeout=30,
+        heartbeat=0.4,
+    )
+    assert result.returncode == 0
+    assert "canary-stdout" in result.stdout
+    assert "done" in result.stdout
+    assert "仍在執行" in capsys.readouterr().out
+
+
+def test_heartbeat_runner_timeout_preserves_partial_output(tmp_path):
+    child = "import time; print('early', flush=True); time.sleep(30)"
+    try:
+        canary._run_process_with_heartbeat(
+            [sys.executable, "-c", child],
+            root=tmp_path,
+            env=dict(os.environ),
+            timeout=1,
+            heartbeat=0.3,
+        )
+    except subprocess.TimeoutExpired as exc:
+        assert "early" in canary._coerce_text(exc.stdout)
+    else:  # pragma: no cover - assertion aid
+        raise AssertionError("timeout must raise TimeoutExpired")
+
+
+def test_live_canary_announces_reason_for_fresh_fingerprint(
+    monkeypatch, tmp_path, capsys
+):
+    success = canary.ModelEvidence(
+        True, "ok", ("ses_live",), saw_tool_calls_finish=True
+    )
+    root, env = _patch_runtime(monkeypatch, tmp_path, [success])
+    assert canary.run_all(
+        root=root,
+        env=env,
+        explicit_model="",
+        frontend_args=[],
+        force=False,
+    ) == 0
+    out = capsys.readouterr().out
+    assert "MODEL live canary — 這個專案＋模型＋設定組合尚無通過紀錄" in out
+    assert "不是當機" in out
+
+
+def test_live_canary_announces_reason_for_expired_cache(monkeypatch, tmp_path, capsys):
+    attempts = [
+        canary.ModelEvidence(True, "ok", ("ses_a",)),
+        canary.ModelEvidence(True, "ok", ("ses_b",)),
+    ]
+    root, env = _patch_runtime(monkeypatch, tmp_path, attempts)
+    assert canary.run_all(
+        root=root,
+        env=env,
+        explicit_model="",
+        frontend_args=[],
+        force=False,
+    ) == 0
+    capsys.readouterr()
+
+    cache_path = Path(env["AICODE_TOOL_CANARY_CACHE"])
+    data = json.loads(cache_path.read_text(encoding="utf-8"))
+    for entry in data["passes"].values():
+        entry["checked_at"] -= 7200.0
+    cache_path.write_text(json.dumps(data), encoding="utf-8")
+
+    env["AICODE_TOOL_CANARY_TTL_SECONDS"] = "3600"
+    assert canary.run_all(
+        root=root,
+        env=env,
+        explicit_model="",
+        frontend_args=[],
+        force=False,
+    ) == 0
+    out = capsys.readouterr().out
+    assert "上次通過已是約 2 小時前" in out
+    assert "超過快取期 1 小時" in out
+
+
+def test_live_canary_announces_forced_cache_bypass(monkeypatch, tmp_path, capsys):
+    success = canary.ModelEvidence(True, "ok", ("ses_force",))
+    root, env = _patch_runtime(monkeypatch, tmp_path, [success])
+    assert canary.run_all(
+        root=root,
+        env=env,
+        explicit_model="",
+        frontend_args=[],
+        force=True,
+    ) == 0
+    assert "略過快取" in capsys.readouterr().out
 
 
 def test_skip_mode_never_loads_opencode_or_model(monkeypatch, tmp_path, capsys):

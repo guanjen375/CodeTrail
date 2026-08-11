@@ -44,6 +44,7 @@ DEFAULT_CACHE_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_MCP_TIMEOUT_SECONDS = 90
 DEFAULT_MODEL_TIMEOUT_SECONDS = 240
 DEFAULT_CONFIG_TIMEOUT_SECONDS = 30
+MODEL_CANARY_HEARTBEAT_SECONDS = 15
 MAX_CACHE_ENTRIES = 32
 MAX_PROPS_BYTES = 4 * 1024 * 1024
 
@@ -141,6 +142,59 @@ def _run_process(
         timeout=timeout,
         check=False,
     )
+
+
+def _run_process_with_heartbeat(
+    argv: Sequence[str],
+    *,
+    root: Path,
+    env: Mapping[str, str],
+    timeout: int,
+    heartbeat: float = MODEL_CANARY_HEARTBEAT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    """``_run_process`` with periodic progress lines while the child runs.
+
+    The live model canary regularly takes tens of seconds on local hardware;
+    with zero output users assume ``aicode`` is hung.  Timeout behaviour
+    matches ``_run_process``: raise ``subprocess.TimeoutExpired`` carrying any
+    partial output collected so far.
+    """
+    with subprocess.Popen(
+        list(argv),
+        cwd=str(root),
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as process:
+        started = time.monotonic()
+        try:
+            while True:
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    raise subprocess.TimeoutExpired(
+                        list(argv), timeout, output=stdout, stderr=stderr
+                    )
+                try:
+                    stdout, stderr = process.communicate(
+                        timeout=min(heartbeat, remaining)
+                    )
+                except subprocess.TimeoutExpired:
+                    elapsed = int(time.monotonic() - started)
+                    _print(
+                        f"opencode run 仍在執行… 已 {elapsed} 秒"
+                        f"（單次上限 {timeout} 秒）"
+                    )
+                    continue
+                return subprocess.CompletedProcess(
+                    list(argv), process.returncode, stdout, stderr
+                )
+        except BaseException:
+            process.kill()
+            raise
 
 
 def load_effective_opencode_config(
@@ -473,6 +527,38 @@ def cached_pass_age(
     return max(0, int(age))
 
 
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    if total >= 3600:
+        return f"{total // 3600} 小時"
+    if total >= 60:
+        return f"{total // 60} 分鐘"
+    return f"{total} 秒"
+
+
+def _live_canary_reason(
+    path: Path,
+    fingerprint: str,
+    *,
+    now: float,
+    ttl_seconds: int,
+) -> str:
+    """Explain why a live model canary is about to run (new combo vs expiry)."""
+    if ttl_seconds <= 0:
+        return "AICODE_TOOL_CANARY_TTL_SECONDS=0，快取已停用"
+    entry = _read_cache(path).get("passes", {}).get(fingerprint)
+    if isinstance(entry, dict) and entry.get("status") == "pass":
+        checked_at = entry.get("checked_at")
+        if isinstance(checked_at, (int, float)):
+            age = now - float(checked_at)
+            if age > ttl_seconds:
+                return (
+                    f"上次通過已是約 {_format_duration(age)}前，"
+                    f"超過快取期 {_format_duration(ttl_seconds)}"
+                )
+    return "這個專案＋模型＋設定組合尚無通過紀錄（新專案或設定變動）"
+
+
 def save_cached_pass(path: Path, fingerprint: str, *, now: float) -> None:
     data = _read_cache(path)
     passes = data.setdefault("passes", {})
@@ -620,7 +706,7 @@ def run_model_attempt(
         command.extend(("--model", model_override))
     command.append(CANARY_PROMPT)
     try:
-        result = _run_process(command, root=root, env=env, timeout=timeout)
+        result = _run_process_with_heartbeat(command, root=root, env=env, timeout=timeout)
     except FileNotFoundError:
         return ModelEvidence(False, "找不到 opencode")
     except subprocess.TimeoutExpired as exc:
@@ -759,7 +845,9 @@ def run_all(
             opencode_version=opencode_version,
             env=env,
         )
-        if not (force or _truthy(env.get("AICODE_TOOL_CANARY_FORCE"))):
+        if force or _truthy(env.get("AICODE_TOOL_CANARY_FORCE")):
+            live_reason = "--force／AICODE_TOOL_CANARY_FORCE 略過快取"
+        else:
             age = cached_pass_age(
                 cache_path,
                 fingerprint,
@@ -769,8 +857,23 @@ def run_all(
             if age is not None:
                 _print(f"MODEL PASS — cached structured tool_use（{age // 60} 分鐘前）")
                 return 0
+            live_reason = _live_canary_reason(
+                cache_path,
+                fingerprint,
+                now=time.time(),
+                ttl_seconds=ttl_seconds,
+            )
     else:
-        _print("MODEL cache unavailable — 將執行 live canary，且不快取本次結果")
+        live_reason = "server /props、opencode 版本或快取路徑不可用；本次結果不會快取"
+
+    # 這一步是整個 aicode 啟動流程唯一會安靜跑數十秒以上的地方；先講清楚
+    # 原因與預期時長，執行中再配合 heartbeat，避免被誤判成當機。
+    _print(f"MODEL live canary — {live_reason}")
+    _print(
+        "現在實跑一次 opencode run，驗證模型會真的呼叫 codetrail_list_dir；"
+        f"本地推理通常需要數十秒到數分鐘（單次上限 {model_timeout} 秒），"
+        f"執行中每 {MODEL_CANARY_HEARTBEAT_SECONDS} 秒回報進度，不是當機。"
+    )
 
     last_reason = "未知錯誤"
     for attempt in (1, 2):
