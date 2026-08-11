@@ -1,15 +1,14 @@
-# CodeTrail - OpenCode / Codex CLI + llama.cpp 本地 MCP 工作台
+# CodeTrail - OpenCode + llama.cpp 本地 MCP 工作台
 
-CodeTrail 是一個給 OpenCode 與 Codex CLI 使用的本地 MCP 後端。你在任一 frontend TUI 裡提問,模型可以透過 CodeTrail 讀專案、找程式碼、查已匯入的 spec、分析截圖或 binary、產生 patch,並在允許的白名單內跑驗證命令。
+CodeTrail 是一個給 OpenCode 使用的本地 MCP 後端。你在 TUI 裡提問,模型可以透過 CodeTrail 讀專案、找程式碼、查已匯入的 spec、分析截圖或 binary、產生 patch,並在允許的白名單內跑驗證命令。
 
 主線使用方式:
 - OpenCode TUI: `aicode`(README 的主流程以這條為準)
-- 選用/測試: Codex CLI `aicodex`
 - 選用/測試: OpenCode web via `aicode web`
 
 CodeTrail 目前定位是**成熟私有部署版**:適合本機、離線、NDA / firmware / private repo 分析;**不打算公開發布**成 PyPI package、Docker image 或 SaaS。安全邊界有自動測試保護,但未做公開產品級安全審計。
 
-底層推理引擎使用 [llama.cpp](https://github.com/ggerganov/llama.cpp) `llama-server`(自己 build,需要 CUDA)。所有 CodeTrail internal LLM / embedding / reranker / VL 走它的 HTTP API。Codex CLI frontend model 可以另外使用你自己的 Codex / OpenAI / ChatGPT / local provider 設定。
+底層推理引擎使用 [llama.cpp](https://github.com/ggerganov/llama.cpp) `llama-server`(自己 build,需要 CUDA)。所有 CodeTrail internal LLM / embedding / reranker / VL 走它的 HTTP API。
 
 ## 🚀 Quick Start(7 步設定完成)
 
@@ -40,7 +39,7 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 
 ## 0. OpenCode TUI 部署路線圖
 
-如果你的目標只是把 **OpenCode TUI** 布置起來,先照這條走。Codex CLI 與 web 模式都可以先跳過,等 TUI 穩了再看。
+如果你的目標只是把 **OpenCode TUI** 布置起來,先照這條走。web 模式可以先跳過,等 TUI 穩了再看。
 
 先分清楚兩個路徑:
 
@@ -49,7 +48,7 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 
 OpenCode TUI 的完成條件是:
 
-1. `opencode` 在 PATH 上:§1.2.1。
+1. `opencode` 在 PATH 上:§1.2。
 2. `python3` 能 import CodeTrail 依賴(`mcp` / `numpy` / `requests`):§1.3;`set_config.sh` 會偵測並把正確的 Python 路徑寫進設定。
 3. `llama-server` 已 build 完:§1.5。
 4. 主模型、embedding、reranker、VL GGUF 都已下載:§2.2–§2.4。
@@ -71,7 +70,7 @@ README 的命令範例以 Ubuntu / Debian shell 為主。`aicode` 是 bash wrapp
 > 4. **換模型或主 n_ctx 就重跑 `./set_config.sh` + 重啟 server**:TUI 按 `/models` 只切 OpenCode 的 model id,**不會 reload llama-server、也不會通知 CodeTrail MCP**。主 n_ctx 只填一次；`set_config.sh` 會寫入 deployment / server `-c`，`aicode` 啟動時再讓 CodeTrail budget 與 OpenCode active model 的 `limit.context` 自動跟隨，不用另設 max。
 > 5. **啟動後立即 rollback,先看 server log**:`~/start.sh` 前台只會回報 process 已結束,真正根因用 `~/start.sh logs main` 查看;新 GGUF 也可能需要更新並重新 build llama.cpp。詳細判讀與修復見 [docs/troubleshooting.md](docs/troubleshooting.md)。
 > 6. **CodeTrail 沙箱鎖在「你啟動的那個資料夾」(`AICODE_ROOT`)** —— 綁在 process 上,**不會跟著你在 UI 切資料夾或切對話而移動**。web UI 那顆「切換資料夾」按鈕對 CodeTrail 無效(切過去還是只讀啟動目錄)。換專案 = 到那個目錄重新啟動一個(TUI 重開 `aicode`;web 另起一個 backend)。
-> 7. **web 模式目前是實驗性的(開發中)** —— 穩定、proven 的主力是 standalone TUI(`aicode` / `aicodex`);web 用來瀏覽器續問歷史 session,行為可能還會變。要可靠就用 TUI。
+> 7. **web 模式目前是實驗性的(開發中)** —— 穩定、proven 的主力是 standalone TUI(`aicode`);web 用來瀏覽器續問歷史 session,行為可能還會變。要可靠就用 TUI。
 > 8. **CodeTrail 沙箱只蓋它那 17 個 MCP 工具** —— OpenCode 內建的 `bash` / `read` / `write` 不走這層,所以範本把它們全 `deny`,**別放寬那份 permission**。分析不信任 repo 時,連被分析 repo 自帶的 `opencode.json` 都可能翻掉你的鎖定(防法:`OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode`,見 [docs/security.md](docs/security.md))。
 > 9. **首次 MoE 對話首字會慢(可能 1–2 分鐘),別按 Esc** —— 它在 page-in expert weights,不是當掉;slot / GPU 在動就是正常。
 > 10. **NDA / 衍生資料不要 commit**:`knowledge.json`、`*.jsonl`、`.codetrail/`、`data/`、`.aicode_uploads/` 等已在 `.gitignore`,commit 前自己 `git diff` 看一眼。
@@ -94,7 +93,7 @@ sudo apt install -y \
   ripgrep tmux
 ```
 
-另外裝 **Node.js LTS + npm**(§1.2 裝 OpenCode / Codex CLI 用)。Ubuntu 24.04 內建 nodejs 太舊,建議用 NodeSource 官方源裝 LTS:
+另外裝 **Node.js LTS + npm**(§1.2 裝 OpenCode 用)。Ubuntu 24.04 內建 nodejs 太舊,建議用 NodeSource 官方源裝 LTS:
 
 ```bash
 curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
@@ -104,20 +103,11 @@ node -v && npm -v    # 確認 node ≥ 18 / 20 LTS、npm 可執行
 
 已經有 nvm / fnm / volta 的用熟悉的方式裝 Node LTS 即可(版本 ≥ 18)。
 
-### 1.2 安裝 frontend CLI
-
-#### 1.2.1 OpenCode
+### 1.2 安裝 OpenCode
 
 ```bash
 npm install -g opencode-ai
 command -v opencode    # 確認可被找到
-```
-
-#### 1.2.2 Codex CLI(選用)
-
-```bash
-npm install -g @openai/codex
-command -v codex       # 確認可被找到
 ```
 
 ### 1.3 安裝 CodeTrail Python 依賴
@@ -332,7 +322,7 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 | 8082 | reranker(RAG 結果重排) | 是 |
 | 8083 | VL(看截圖 / 圖片) | 是 |
 
-會分四個 `llama-server` 是因為它一次只能載一顆 GGUF,不同角色用不同模式(`--jinja` / `--embedding --pooling cls` / `--embedding --pooling rank --reranking` / `--mmproj`)。`aicode` / `aicodex` / `mcp_server.py` 都會硬性檢查三顆副模型已 ready。
+會分四個 `llama-server` 是因為它一次只能載一顆 GGUF,不同角色用不同模式(`--jinja` / `--embedding --pooling cls` / `--embedding --pooling rank --reranking` / `--mmproj`)。`aicode` / `mcp_server.py` 都會硬性檢查三顆副模型已 ready。
 
 只重啟部分角色:`scripts/stop-rag-servers.sh` + `scripts/start-rag-servers.sh`(只動三顆附屬),或 `scripts/start-main-server.sh`(只起主模型)。
 
@@ -564,30 +554,6 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 python -m json.tool ~/.config/opencode/opencode.json >/dev/null
 ```
 
-### 4.4 Codex CLI frontend(選用)
-
-`aicodex` 的安裝同 `aicode`(Quick Start 步驟 2–4,把 `aicode` 換成 `aicodex`)。它不會自動修改 `~/.codex/config.toml`,啟動時用 Codex CLI 的 runtime `-c` override 注入 CodeTrail MCP server:
-
-```bash
-cd <PROJECT_TO_ANALYZE>
-aicodex --codetrail-model <LOCAL_MODEL>
-```
-
-如果你想讓 **Codex frontend** 也走本機 llama.cpp provider,可以自行在 `~/.codex/config.toml` 加類似設定(選用):
-
-```toml
-# ~/.codex/config.toml
-model = "<LOCAL_MODEL>"
-model_provider = "llamacpp"
-
-[model_providers.llamacpp]
-name = "llama.cpp local"
-base_url = "http://localhost:8080/v1"
-wire_api = "responses"
-```
-
-這只是 Codex frontend provider 設定,和 CodeTrail MCP internal model 設定分開。`--codetrail-model` / `AICODE_MODEL` 控制的是 `mcp_server.py` 與 CodeTrail server-side tools 使用的本地模型;Codex 的 `-m` / `--model` 控制的是 Codex frontend model。`aicodex` 不會把 `--codetrail-model` 轉發給 Codex CLI;Codex frontend 的 `-m` / `--model` 會原樣轉發。
-
 ---
 
 ## 5. 自檢與啟動 TUI
@@ -609,23 +575,14 @@ AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
 
 ### 5.2 啟動 TUI
 
-切到你要分析或修改的專案目錄(**不要從 `$HOME` 或 `/` 啟動**,沙箱會拒絕)。兩個 frontend 是並列入口,選一個用即可。
-
-OpenCode frontend:
+切到你要分析或修改的專案目錄(**不要從 `$HOME` 或 `/` 啟動**,沙箱會拒絕):
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-Codex CLI frontend:
-
-```bash
-cd <PROJECT_TO_ANALYZE>
-aicodex --codetrail-model <LOCAL_MODEL>
-```
-
-`<LOCAL_MODEL>` 用 §4.2 registry 裡的 `<CODE_MODEL>` bare name 或 GGUF 路徑。`aicode` 不用帶參數:主模型會依「env `AICODE_MODEL` > `-m` 旗標 > deployment.json > opencode.json」解析,`set_config.sh` 已把後兩者設好。
+`aicode` 不用帶參數:主模型會依「env `AICODE_MODEL` > `-m` 旗標 > deployment.json > opencode.json」解析,`set_config.sh` 已把後兩者設好。
 
 要讓模型讀專案外的附件(`~/Downloads` 的 log / 截圖 / spec)就多加一個開關:
 
@@ -650,7 +607,7 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 - 用 `--no-mmap` 模式:約 5–15 秒
 - 用 mmap 模式(沒加 `--no-mmap`):**第一次可能要 1–2 分鐘**,因為要從 SSD page-in MoE expert weights。畫面上 frontend 可能顯示「`...esc interrupt`」或類似等待狀態,**不要按 Esc**,等就對了
 
-如果想驗證 MCP transport 有沒有連上:OpenCode TUI 輸入 `/status`,應看到 `codetrail Connected`;Codex TUI 輸入 `/mcp`,應看到 `codetrail` connected。**Connected 只代表 MCP 子行程完成連線,不代表模型在這一輪真的發出 tool call。** 真正執行時應看到 frontend 的工具卡 / 結果;若模型只印出 `<codetrail_list_dir .../>` 再用文字宣稱成功,那是假工具呼叫,照 [troubleshooting 的分層檢查](docs/troubleshooting.md#mcp-connected-but-no-tool-call)處理。
+如果想驗證 MCP transport 有沒有連上:OpenCode TUI 輸入 `/status`,應看到 `codetrail Connected`。**Connected 只代表 MCP 子行程完成連線,不代表模型在這一輪真的發出 tool call。** 真正執行時應看到 frontend 的工具卡 / 結果;若模型只印出 `<codetrail_list_dir .../>` 再用文字宣稱成功,那是假工具呼叫,照 [troubleshooting 的分層檢查](docs/troubleshooting.md#mcp-connected-but-no-tool-call)處理。
 
 想把**圖片**(截圖、架構圖、規格頁掃描)變成之後查得到的知識,就是「VL + RAG 一起用」—— `ingest_document` 餵圖片時會自動走 VL 把圖抽成文字再進 RAG,跟 PDF 走同一套:
 

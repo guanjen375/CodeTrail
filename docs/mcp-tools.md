@@ -1,6 +1,6 @@
 # MCP 工具清單
 
-這份文件列出 CodeTrail MCP server 暴露給 OpenCode / Codex CLI 的工具，以及工具使用原則。
+這份文件列出 CodeTrail MCP server 暴露給 OpenCode 的工具，以及工具使用原則。
 
 [回到 README](../README.md)。
 
