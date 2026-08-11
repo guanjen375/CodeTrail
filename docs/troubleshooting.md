@@ -216,7 +216,7 @@ opencode debug agent build | rg '"temperature": 0'
 }
 ```
 
-改 server 設定後執行 `scripts/quit.sh` → `~/start.sh` 重啟才會生效。`set_config.sh` 重跑時會保留手動加入的 allowlisted 取樣參數。重啟後不要只看 JSON,直接確認 server 實際預設已變成 `0.0`:
+改 server 設定後執行 `~/start.sh stop` → `~/start.sh` 重啟才會生效。`set_config.sh` 重跑時會保留手動加入的 allowlisted 取樣參數。重啟後不要只看 JSON,直接確認 server 實際預設已變成 `0.0`:
 
 ```bash
 curl -s http://localhost:8080/props \
@@ -255,7 +255,7 @@ curl -s http://localhost:8080/props | jq -r '.chat_template' \
 { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.0 }
 ```
 
-(等價於 server 旗標 `--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.0`;改完 `scripts/quit.sh` → `~/start.sh` 重啟生效。)
+(等價於 server 旗標 `--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.0`;改完 `~/start.sh stop` → `~/start.sh` 重啟生效。)
 
 為什麼這裡仍建議在 server 旗標釘:OpenCode 官方支援 `agent.<name>.temperature`,但 custom openai-compatible provider 有版本相關的已知問題,可能解析了設定卻沒有把 `temperature` 送進 request body([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));`top_k` / `min_p` 又不一定在 provider schema 裡。agent override 適合針對 Build agent 降溫,server 參數則是所有未明示取樣值之 request 的共同 fallback。**改完 server 設定要重啟才生效。**
 
@@ -428,7 +428,7 @@ AICODE_WEB_PORT=4097 aicode_web
 
 ### web UI 切了資料夾,CodeTrail 還是讀啟動時那個目錄
 
-CodeTrail 的沙箱根(`AICODE_ROOT`)是**啟動 `aicode_web` / `aicode web` / `start-web.sh` 當下那個目錄**,backend 起來時就釘死。OpenCode web UI 的「切換 WORK DIR / 開其他資料夾」只換 OpenCode 自己的 view,**不會 re-scope CodeTrail 的 MCP 沙箱** —— 所以你在 UI 切到別的資料夾後,`list_dir` / `read_file` 還是讀**啟動那個目錄**。
+CodeTrail 的沙箱根(`AICODE_ROOT`)是**啟動 `aicode_web` / `aicode web` 當下那個目錄**,backend 起來時就釘死。OpenCode web UI 的「切換 WORK DIR / 開其他資料夾」只換 OpenCode 自己的 view,**不會 re-scope CodeTrail 的 MCP 沙箱** —— 所以你在 UI 切到別的資料夾後,`list_dir` / `read_file` 還是讀**啟動那個目錄**。
 
 這不是 escape(CodeTrail 讀不到沙箱外的資料夾,只是還停在原本那個),但會誤導。**CodeTrail web 是一個 backend 一個專案**:要分析另一個專案,在那個專案目錄**另起一個 backend**(換 port):
 
@@ -446,7 +446,7 @@ OpenCode 目前沒有關掉那個切換器的設定,所以請直接**無視 UI �
 
 ```bash
 OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode
-# web 也一樣:OPENCODE_DISABLE_PROJECT_CONFIG=1 <CODETRAIL_REPO>/scripts/start-web.sh
+# web 也一樣:OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode_web
 ```
 
 細節與實測見 [docs/security.md](security.md)。
@@ -484,7 +484,7 @@ aicode
 unset AICODE_DYNAMIC_NUM_CTX_MAX AICODE_NUM_CTX  # 清掉舊版 shell 設定(若有)
 cd <CODETRAIL_REPO>
 ./set_config.sh                                  # 主 n_ctx 只填這一次
-<CODETRAIL_REPO>/scripts/quit.sh
+~/start.sh stop
 ~/start.sh
 cd <PROJECT_TO_ANALYZE>
 aicode
@@ -603,14 +603,14 @@ tmux capture-pane -p -t codetrail-rag:embed -S -100
 ready,但 llama.cpp 的預設 physical batch `-ub 512` 放不下真實 RAG chunk。
 短字串 curl 會成功,不能排除這個設定錯誤。
 
-safe-defaults / 舊的 `start-rag-servers.sh` 會把 embedding 與 BGE reranker 都設成
+內建 safe-defaults 會把 embedding 與 BGE reranker 都設成
 `-c 8192 -b 8192 -ub 8192`。`set_config.sh` 產生的設定則維持 embedding 8192，
 reranker 預設也自動 8192；若傳 `--rerank-ctx`，會同步套到它的 `-c/-b/-ub`。
 重啟三顆附屬 server 套用:
 
 ```bash
-./scripts/stop-rag-servers.sh
-./scripts/start-rag-servers.sh
+~/start.sh stop --scope aux
+~/start.sh --scope aux
 ```
 
 若是手動啟動 embedding / reranker，也要讓 `-b`、`-ub` 至少容納最長輸入；

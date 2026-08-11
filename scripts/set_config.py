@@ -1604,8 +1604,9 @@ def build_start_sh(plan: Plan) -> str:
     )
     exports = "\n".join(_gpu_exports(plan))
     unset_line = " ".join((*_OVERRIDE_ENV_KEYS, *_SESSION_ENV_KEYS))
-    quit_sh = shlex.quote(str(REPO_ROOT / "scripts" / "quit.sh"))
-    status_sh = shlex.quote(str(REPO_ROOT / "scripts" / "check-status.sh"))
+    stop_py = shlex.quote(str(REPO_ROOT / "scripts" / "stop_servers.py"))
+    status_py = shlex.quote(str(REPO_ROOT / "scripts" / "check_status.py"))
+    launch_py = shlex.quote(str(REPO_ROOT / "scripts" / "launch_servers.py"))
     return f"""#!/usr/bin/env bash
 # {GENERATED_MARKER} — {time.strftime("%Y-%m-%d %H:%M:%S")}
 # 重新設定:cd {REPO_ROOT} && ./set_config.sh
@@ -1627,8 +1628,8 @@ def build_start_sh(plan: Plan) -> str:
 #
 # 子命令:
 #   ~/start.sh                     啟動四個 llama-server(tmux 背景)
-#   ~/start.sh status [--strict]   檢查四個 server 狀態(= scripts/check-status.sh)
-#   ~/start.sh stop [--force]      全部停止,等到 process 退出、VRAM 釋放完畢才返回(= scripts/quit.sh)
+#   ~/start.sh status [--strict]   檢查四個 server 狀態(= scripts/check_status.py)
+#   ~/start.sh stop [--force]      全部停止,等到 process 退出、VRAM 釋放完畢才返回(= scripts/stop_servers.py)
 #   ~/start.sh logs [role] [行數|-f] 看 server log(role 可省略,預設 main;啟動起即時寫入)
 #   ~/start.sh help                顯示子命令說明
 set -euo pipefail
@@ -1651,11 +1652,13 @@ export LLAMA_BIN={shlex.quote(str(_llama_bin()))}
 case "${{1:-}}" in
   status)
     shift
-    exec {status_sh} "$@"
+    exec python3 {status_py} "$@"
     ;;
   stop|quit)
+    # --scope 預設 all;後面使用者旗標可覆寫(argparse last-wins),
+    # 例:~/start.sh stop --scope aux 只停三顆附屬、不動主模型。
     shift
-    exec {quit_sh} "$@"
+    exec python3 {stop_py} --scope all "$@"
     ;;
   logs)
     if [ "$#" -gt 3 ]; then
@@ -1696,7 +1699,8 @@ case "${{1:-}}" in
     cat <<'CODETRAIL_USAGE'
 用法:~/start.sh [子命令|啟動器旗標]
   (無參數)                 啟動四個 llama-server(tmux 背景)
-  --dry-run                只印出將執行的四條 llama-server 指令(其餘旗標見 scripts/start-all.sh --help)
+  --dry-run                只印出將執行的四條 llama-server 指令(其餘旗標見 python3 scripts/launch_servers.py --help)
+  --scope aux|main         只啟動部分角色(aux=三顆附屬、main=主模型;stop --scope aux 同理只停附屬)
   status [--strict]        檢查四個 server 狀態
   stop [--force]           全部停止並等到 VRAM 釋放完畢(--force 連孤兒 llama-server 一併處理)
   logs [role] [行數|-f]     看 server log(role 可省略,預設 main;-f 持續追蹤)
@@ -1706,15 +1710,15 @@ CODETRAIL_USAGE
     exit 0
     ;;
   ""|-*)
-    ;;  # 無參數 → 啟動;旗標(如 --dry-run)→ 轉交 start-all.sh
+    ;;  # 無參數 → 啟動;旗標(如 --dry-run / --scope)→ 轉交 launch_servers.py
   *)
-    echo "未知子命令:$1(可用:status / stop / logs / help;啟動器旗標如 --dry-run 會轉交 start-all.sh)" >&2
+    echo "未知子命令:$1(可用:status / stop / logs / help;啟動器旗標如 --dry-run / --scope 會轉交 launch_servers.py)" >&2
     exit 2
     ;;
 esac
 
 rc=0
-{shlex.quote(str(REPO_ROOT / "scripts" / "start-all.sh"))} "$@" || rc=$?
+python3 {launch_py} --scope all "$@" || rc=$?
 if [ "$rc" -eq 0 ]; then
   case " $* " in
     *" --dry-run "*) ;;  # 純預覽沒有真的啟動,不需要監控提醒
@@ -1945,7 +1949,7 @@ def _fresh_env(plan: Plan) -> dict[str, str]:
 def _sanitized_subprocess_env() -> dict[str, str]:
     """啟停子程序用的乾淨環境:同 ~/start.sh 開頭的 unset(override + session 名)。
 
-    quit.sh / start.sh 必須看到同一組「預設」session 名;桌面環境常見的泛用
+    stop_servers / start.sh 必須看到同一組「預設」session 名;桌面環境常見的泛用
     SESSION 變數若流進 stop_servers,會殺錯無關的 tmux session、漏掉真正的
     codetrail-rag,接著重啟就撞 session already exist。
     """
@@ -1958,7 +1962,11 @@ def _sanitized_subprocess_env() -> dict[str, str]:
 def _restart_servers(start_path: Path) -> int:
     """[R] 自動重啟:先 quit 再 start,兩者都用 sanitized env。"""
     env = _sanitized_subprocess_env()
-    subprocess.run(["bash", str(REPO_ROOT / "scripts" / "quit.sh")], check=False, env=env)
+    subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "stop_servers.py"), "--scope", "all"],
+        check=False,
+        env=env,
+    )
     print("  已停止舊 server;開始啟動新設定(載入大模型需要幾分鐘)…")
     return subprocess.run(["bash", str(start_path)], check=False, env=env).returncode
 
@@ -1982,7 +1990,7 @@ def validate_payloads(plan: Plan, deployment_json: str, registry_json: str) -> N
 
 
 def preview_start_commands(plan: Plan) -> int:
-    """跑 start-all.sh --dry-run,把最終 llama-server 指令(推薦參數)印給使用者。"""
+    """跑 launch_servers.py --scope all --dry-run,把最終 llama-server 指令(推薦參數)印給使用者。"""
     env = _fresh_env(plan)
     env["MAIN_GPU"] = plan.main.gpu.selector
     env["EMBED_GPU"] = plan.embedding.gpu.selector
@@ -1990,7 +1998,8 @@ def preview_start_commands(plan: Plan) -> int:
     env["VL_GPU"] = plan.vl.gpu.selector
     try:
         proc = subprocess.run(
-            ["bash", str(REPO_ROOT / "scripts" / "start-all.sh"), "--dry-run"],
+            [sys.executable, str(REPO_ROOT / "scripts" / "launch_servers.py"),
+             "--scope", "all", "--dry-run"],
             env=env,
             capture_output=True,
             text=True,
@@ -2104,7 +2113,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--threads", type=int, help=f"主模型 CPU threads(-t),1..{MAX_THREADS}")
-    parser.add_argument("--no-preview", action="store_true", help="結尾不跑 start-all.sh --dry-run 預覽")
+    parser.add_argument("--no-preview", action="store_true", help="結尾不跑啟動參數預覽(launch_servers.py --dry-run)")
     return parser
 
 
@@ -2460,7 +2469,7 @@ def run(args: argparse.Namespace) -> int:
     else:
         print("[PASS] 第 1 層:設定檔已寫入並通過 schema 驗證(備份:*.bak-setconfig-*)")
         print("[待執行] 第 2 層:實際啟動與模型載入 → ~/start.sh(成功與否以此為準)")
-        print("[待執行] 第 3 層:啟動後健檢 → ~/start.sh status(或 ./scripts/check-status.sh --strict)")
+        print("[待執行] 第 3 層:啟動後健檢 → ~/start.sh status(嚴格模式加 --strict)")
         print(f"          與 AICODE_MODEL={plan.main_key} python scripts/doctor.py")
 
     preview_rc = 0

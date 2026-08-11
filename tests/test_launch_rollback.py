@@ -256,9 +256,9 @@ def test_ready_message_uses_absolute_status_path(monkeypatch, tmp_path, capsys):
     launch_servers.launch(_fake_profile(), ["main"], environ, dry_run=False)
     out = capsys.readouterr().out
     assert "CodeTrail model servers ready." in out
-    expected = Path(launch_servers.__file__).resolve().parent / "check-status.sh"
-    assert f"{expected} --strict" in out
-    assert "  ./scripts/check-status.sh" not in out
+    expected = Path(launch_servers.__file__).resolve().parent / "check_status.py"
+    assert f"python3 {expected} --strict" in out
+    assert "  ./scripts/" not in out
 
 
 def test_start_role_warns_when_pipe_pane_fails(tmp_path, monkeypatch, capsys):

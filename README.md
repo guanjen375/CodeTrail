@@ -35,7 +35,7 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 - 第 5 步沒輸出,代表 `~/.local/bin` 不在 PATH:`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc` 後再試。
 - `./set_config.sh` 是**純問答**:逐題回答各角色模型、GPU、主模型運行模式(MoE 才問)、主模型 n_ctx / threads,答完看一頁摘要(Enter 寫入 / q 離開)。主 n_ctx 沒有猜測預設，也**不做容量估算**；reranker/embedding/VL 的 ctx 是獨立 server 內部值，不再混成使用者題目。VRAM 塞不塞得下以啟動後 `nvidia-smi` 實測為準。只有一個候選(或一顆 GPU)的題目自動選用。做的事與產物見 §3。要改配置隨時重跑,舊設定自動備份、可用 `--restore-last-backup` 還原。
 - 安全預設:四個模型 server **只綁 `127.0.0.1`**(僅本機可連);要讓區網其他機器使用要明確 `./set_config.sh --allow-remote`(見 [docs/security.md](docs/security.md))。
-- 管理指令都掛在 `~/start.sh` 上:`~/start.sh status`(檢查四個 server)、`~/start.sh stop`(全部關閉,= `scripts/quit.sh`,關掉主模型 + 三顆附屬模型的所有 tmux 視窗,並**等到 process 退出、VRAM 從 nvidia-smi 消失才返回** — 大模型釋放記憶體需要數十秒是正常的,期間會印進度)、`~/start.sh logs [role] [-f]`(看 server log)、`~/start.sh help`(子命令說明)。
+- 管理指令都掛在 `~/start.sh` 上:`~/start.sh status`(檢查四個 server)、`~/start.sh stop`(全部關閉,= `scripts/stop_servers.py`,關掉主模型 + 三顆附屬模型的所有 tmux 視窗,並**等到 process 退出、VRAM 從 nvidia-smi 消失才返回** — 大模型釋放記憶體需要數十秒是正常的,期間會印進度)、`~/start.sh logs [role] [-f]`(看 server log)、`~/start.sh help`(子命令說明)。
 - **TUI 或 web 之前都要先啟動四個模型 server。**標準產物是 `~/start.sh`,所以 A 機每次開機後先跑 `~/start.sh`。如果你把這支檔案放在桌面,等價做法是先在桌面終端 `cd ~/Desktop && ./start.sh`；下文假設這一步已完成。
 - 重新啟動前要先 `~/start.sh stop`,tmux session 還在時 `~/start.sh` 會拒絕重複啟動;若是啟動中途失敗,launcher 會自動清理本次啟動的服務,修正後直接重跑即可。
 
@@ -294,7 +294,7 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 | `~/.config/codetrail/models.json` | 主模型 registry key → GGUF 路徑(合併既有內容) |
 | `~/.config/codetrail/deployment.json` | deployment profile local override:四個 role 的模型與主模型參數(全部來自你的作答);重跑時**保留你手動加的取樣參數**(temperature/top-p/…與 no_mmap),其他未涵蓋鍵會警告已捨棄 |
 | `~/.config/opencode/opencode.json` | **合併**而非重建:只更新 CodeTrail 管的欄位(model / provider.llamacpp / mcp.codetrail / 缺少的 permission 鍵),你原本的 provider、主題、其他 MCP server 都保留;與安全範本衝突的 permission 會尊重你的值但明確警告 |
-| `~/start.sh` | 啟動腳本:寫死你的 GPU 配置、主模型與驗證過的 `LLAMA_BIN`,呼叫 `scripts/start-all.sh`;支援 `status` / `stop` / `logs` / `help` 子命令,打錯子命令會提示而不是誤啟動 |
+| `~/start.sh` | 啟動腳本:寫死你的 GPU 配置、主模型與驗證過的 `LLAMA_BIN`,呼叫 `scripts/launch_servers.py`;支援 `status` / `stop` / `logs` / `help` 子命令,打錯子命令會提示而不是誤啟動 |
 
 結尾會自動印出**啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準;`~/start.sh` 啟動完成的最後一行也會提醒你用 `nvidia-smi` 稍微監控 GPU/VRAM(例如 `watch -n 1 nvidia-smi`),因為 set_config 不做任何容量估算。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
 
@@ -305,8 +305,8 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 ```bash
 ~/start.sh              # 啟動 main + embedding + reranker + VL(各自 tmux 視窗,驗 /health 才算 ready)
 ~/start.sh --dry-run    # 只印出將執行的四條 llama-server 指令,不啟動
-~/start.sh status       # 檢查四個 server 狀態(= scripts/check-status.sh)
-~/start.sh stop         # 關閉全部並等到 VRAM 釋放完畢(主模型 + 三附屬模型;= scripts/quit.sh)
+~/start.sh status       # 檢查四個 server 狀態(= scripts/check_status.py)
+~/start.sh stop         # 關閉全部並等到 VRAM 釋放完畢(主模型 + 三附屬模型;= scripts/stop_servers.py)
 ~/start.sh logs vl      # 看該 role 的 server log(加 -f 持續追蹤,如 logs main -f)
 ~/start.sh help         # 子命令說明(打錯子命令會提示,不會誤觸啟動)
 ```
@@ -327,7 +327,7 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 會分四個 `llama-server` 是因為它一次只能載一顆 GGUF,不同角色用不同模式(`--jinja` / `--embedding --pooling cls` / `--embedding --pooling rank --reranking` / `--mmproj`)。`aicode` / `mcp_server.py` 都會硬性檢查三顆副模型已 ready。
 
-只重啟部分角色:`scripts/stop-rag-servers.sh` + `scripts/start-rag-servers.sh`(只動三顆附屬),或 `scripts/start-main-server.sh`(只起主模型)。
+只重啟部分角色:`~/start.sh stop --scope aux` + `~/start.sh --scope aux`(只動三顆附屬、不重載主模型),或 `~/start.sh --scope main`(只起主模型)。
 
 > **tmux 你會用到的 4 個指令**(其他都不用學):
 > - `Ctrl-b d` —— 把目前 session 放背景,回到原本 shell
@@ -335,7 +335,7 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 > - `tmux a -t <名字>` —— 接回去看某個 session 的即時 log
 > - `Ctrl-b n` —— 同 session 內切換 window(RAG session 內含 embed / rerank / vl 三個 window)
 >
-> (關 server 不用學 tmux 指令,直接 `scripts/quit.sh`。)
+> (關 server 不用學 tmux 指令,直接 `~/start.sh stop`。)
 
 ### 3.3 驗活與維運
 
@@ -351,18 +351,18 @@ tmux ls
 查看四個 role 是否都正確跑在指定 GPU 上:
 
 ```bash
-./scripts/check-status.sh
+~/start.sh status
 
 # CI / 自動化需要用 exit code 擋下時:
-./scripts/check-status.sh --strict
+~/start.sh status --strict
 ```
 
-`check-status.sh` 會把 `nvidia-smi` PID 與 `/proc/<PID>/cmdline` 的 `--port` 對上有效 profile,逐 role 顯示 PID、GPU UUID、model、`n_ctx`、health。預設 report-only,即使異常仍 exit 0;`--strict` 遇到缺 service、錯 GPU、錯 model、錯 ctx 或 unhealthy 就失敗。
+`~/start.sh status` 會把 `nvidia-smi` PID 與 `/proc/<PID>/cmdline` 的 `--port` 對上有效 profile,逐 role 顯示 PID、GPU UUID、model、`n_ctx`、health。預設 report-only,即使異常仍 exit 0;`--strict` 遇到缺 service、錯 GPU、錯 model、錯 ctx 或 unhealthy 就失敗。
 
 之後要關掉全部:
 
 ```bash
-./scripts/quit.sh
+~/start.sh stop
 ```
 
 偵錯時要看 server log(平常不用):`tmux a -t codetrail-main` 或 `tmux a -t codetrail-rag`(rag 內按 `Ctrl-b n` 切 embed/rerank/vl window,看完 `Ctrl-b d` 退出)。
@@ -391,9 +391,9 @@ export AICODE_MODEL=<CODE_MODEL>
 export MAIN_GPU=<主模型_GPU_UUID_或_INDEX>
 export AUX_GPU=<附屬模型_GPU_UUID_或_INDEX>   # EMBED_GPU / RERANK_GPU / VL_GPU 可個別覆寫
 
-./scripts/start-all.sh --dry-run    # 先看最終參數;不啟動、不連網
-./scripts/start-all.sh              # 啟動四個 tmux server,嚴格驗證 role / GPU / model / ctx / health
-./scripts/check-status.sh --strict
+python3 scripts/launch_servers.py --scope all --dry-run   # 先看最終參數;不啟動、不連網
+python3 scripts/launch_servers.py --scope all             # 啟動四個 tmux server,嚴格驗證 role / GPU / model / ctx / health
+python3 scripts/check_status.py --strict
 AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
 ```
 
@@ -646,7 +646,7 @@ aicode_web stop
 
 這條路徑不綁 `0.0.0.0`、不開 LAN / 公網介面，也不需要設定 Tailscale Serve / Funnel / HTTPS 憑證。網址雖是 `http://`,封包仍在 Tailscale 的加密隧道內；存取權由 tailnet ACL 決定。共享或多人 tailnet 請確認 ACL 只允許預期的 B 機。**絕不可改用 `tailscale funnel`**，它會公開到 Internet。
 
-**沒裝 / 不想裝 Tailscale 的 fallback** —— 在 A 機從專案目錄跑 `<CODETRAIL_REPO>/scripts/start-web.sh`(只綁 loopback)，B 機建立 SSH port-forward 後開 `http://127.0.0.1:4096`:
+**沒裝 / 不想裝 Tailscale 的 fallback** —— 在 A 機從專案目錄跑 `aicode_web --local`(只綁 loopback)，B 機建立 SSH port-forward 後開 `http://127.0.0.1:4096`:
 
 ```bash
 ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>

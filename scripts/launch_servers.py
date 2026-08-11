@@ -425,7 +425,7 @@ def launch(
     if existing:
         raise ProfileError(
             f"tmux session(s) already exist: {', '.join(existing)}; "
-            "先執行 ./scripts/quit.sh(或 ~/start.sh stop)再重新啟動"
+            "先執行 ~/start.sh stop 再重新啟動"
         )
     for service in services:
         resolve_model_reference(service.model, environ, must_exist=True)
@@ -472,8 +472,8 @@ def launch(
 
     print("\nCodeTrail model servers ready.")
     # 絕對路徑:這行常被從 $HOME 執行的 ~/start.sh 帶出來,相對路徑會找不到。
-    status_sh = Path(__file__).resolve().parent / "check-status.sh"
-    print(f"  {shlex.quote(str(status_sh))} --strict")
+    status_py = Path(__file__).resolve().parent / "check_status.py"
+    print(f"  python3 {shlex.quote(str(status_py))} --strict")
 
 
 def _parser() -> argparse.ArgumentParser:

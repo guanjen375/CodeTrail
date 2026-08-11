@@ -44,7 +44,7 @@ OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode
 web 模式也一樣:
 
 ```bash
-OPENCODE_DISABLE_PROJECT_CONFIG=1 <CODETRAIL_REPO>/scripts/start-web.sh
+OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode_web
 ```
 
 這會讓 OpenCode 忽略專案層級設定,避免 repo 自帶 config 把 `bash` / `read` / `write` 等內建工具重新放開。

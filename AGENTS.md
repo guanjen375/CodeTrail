@@ -15,7 +15,7 @@
 - **是** 個人工程工具，重視可修改性、可測試性，但**安全層的東西不要砍**。
 - 核心 wrapper 只保留一個：
   - `aicode` — 從目前目錄啟動 OpenCode 並設定 `AICODE_ROOT`
-  - `aicode_web` 只是跨機瀏覽器便利入口；它委派 `scripts/start-web.sh`，backend 最終仍走 `aicode web` 的完整安全前置
+  - `aicode_web` 只是跨機瀏覽器便利入口（背景 tmux 包裝內建於同一支腳本），backend 最終仍走 `aicode web` 的完整安全前置
 - Runtime entry point：
   - `mcp_server.py` — MCP server（OpenCode / MCP client 用 stdio 接）
 

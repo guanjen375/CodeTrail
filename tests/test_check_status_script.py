@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRIPT = REPO_ROOT / "scripts" / "check-status.sh"
+SCRIPT = REPO_ROOT / "scripts" / "check_status.py"
 
 
 def _write_fake_nvidia_smi(tmp_path: Path, output: str, exit_code: int = 0) -> None:
@@ -26,7 +27,7 @@ def _run(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
     }
     return subprocess.run(
-        ["bash", str(SCRIPT), *args],
+        [sys.executable, str(SCRIPT), *args],
         cwd=str(REPO_ROOT),
         env=env,
         capture_output=True,

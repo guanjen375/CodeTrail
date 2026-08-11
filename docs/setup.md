@@ -188,7 +188,7 @@ systemctl --user restart codetrail-main
 tmux:
 
 ```bash
-./scripts/quit.sh
+~/start.sh stop
 ```
 
 systemd:`systemctl --user stop codetrail-{main,embed,rerank,vl}`
@@ -196,7 +196,7 @@ systemd:`systemctl --user stop codetrail-{main,embed,rerank,vl}`
 ### 看 server 狀態
 
 ```bash
-./scripts/check-status.sh --strict
+~/start.sh status --strict
 
 # 主 server 載入的是哪顆 GGUF、ctx 多少?
 curl -s http://localhost:8080/props | python -m json.tool | head -20

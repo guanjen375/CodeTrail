@@ -3,9 +3,17 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# scripts/*.sh 入口已移除;啟停一律直呼共用引擎 + --scope。
+START_ALL = ("launch_servers.py", "--scope", "all")
+START_MAIN = ("launch_servers.py", "--scope", "main")
+START_AUX = ("launch_servers.py", "--scope", "aux")
+STOP_ALL = ("stop_servers.py", "--scope", "all")
+STOP_AUX = ("stop_servers.py", "--scope", "aux")
 
 
 def _clean_env(tmp_path: Path) -> dict[str, str]:
@@ -38,11 +46,12 @@ def _clean_env(tmp_path: Path) -> dict[str, str]:
     return env
 
 
-def _run(script: str, tmp_path: Path, env_extra: dict[str, str], *args: str):
+def _run(entry: tuple[str, ...], tmp_path: Path, env_extra: dict[str, str], *args: str):
     env = _clean_env(tmp_path)
     env.update(env_extra)
+    script, *base_args = entry
     return subprocess.run(
-        ["bash", str(REPO_ROOT / "scripts" / script), *args],
+        [sys.executable, str(REPO_ROOT / "scripts" / script), *base_args, *args],
         cwd=REPO_ROOT,
         env=env,
         capture_output=True,
@@ -77,7 +86,7 @@ def test_start_all_routes_main_and_all_aux_to_their_shared_gpus(tmp_path):
     main.write_bytes(b"fixture")
     profile_path = _write_profile_fixture(tmp_path, "gpu-split")
     proc = _run(
-        "start-all.sh",
+        START_ALL,
         tmp_path,
         {
             "AICODE_PROFILE": str(profile_path),
@@ -96,7 +105,7 @@ def test_start_all_routes_main_and_all_aux_to_their_shared_gpus(tmp_path):
 
 def test_start_main_fails_loud_when_no_main_model_is_set(tmp_path):
     proc = _run(
-        "start-main-server.sh",
+        START_MAIN,
         tmp_path,
         {},
         "--dry-run",
@@ -112,7 +121,7 @@ def test_legacy_aux_launcher_env_names_still_override_profile(tmp_path):
     vl = tmp_path / "legacy-vl.gguf"
     mmproj = tmp_path / "legacy-mmproj.gguf"
     proc = _run(
-        "start-rag-servers.sh",
+        START_AUX,
         tmp_path,
         {
             "EMBED_MODEL": str(embed),
@@ -134,33 +143,26 @@ def test_legacy_aux_launcher_env_names_still_override_profile(tmp_path):
     assert "CUDA_VISIBLE_DEVICES=2" in proc.stdout
 
 
-def test_new_and_legacy_launcher_help_paths_are_offline(tmp_path):
-    for script in (
-        "start-main-server.sh",
-        "start-all.sh",
-        "start-rag-servers.sh",
-        "quit.sh",
-        "stop-rag-servers.sh",
-    ):
-        proc = _run(script, tmp_path, {}, "--help")
-        assert proc.returncode == 0, f"{script}: {proc.stderr}"
+def test_launcher_help_paths_are_offline(tmp_path):
+    for entry in (START_MAIN, START_ALL, START_AUX, STOP_ALL, STOP_AUX):
+        proc = _run(entry, tmp_path, {}, "--help")
+        assert proc.returncode == 0, f"{entry}: {proc.stderr}"
 
 
 def test_quit_still_kills_sessions_when_deployment_config_is_broken(tmp_path):
-    """設定檔壞掉時 quit.sh 不能連 tmux session 都拒絕關(復原路徑不能死)。"""
+    """設定檔壞掉時 stop_servers 不能連 tmux session 都拒絕關(復原路徑不能死)。"""
     config_dir = tmp_path / ".config" / "codetrail"
     config_dir.mkdir(parents=True)
     (config_dir / "deployment.json").write_text("{not json", encoding="utf-8")
 
     proc = _run(
-        "quit.sh",
+        STOP_ALL,
         tmp_path,
         {
             # 不存在的 session 名:只驗證退路流程,不動開發機上真的 codetrail session
             "MAIN_SESSION": "codetrail-test-none-main",
             "SESSION": "codetrail-test-none-rag",
         },
-        "--scope", "all",
     )
 
     assert proc.returncode == 1  # 設定仍是壞的 → 非零提醒
@@ -188,7 +190,7 @@ def test_launcher_rejects_duplicate_service_ports(tmp_path):
     main.write_bytes(b"fixture")
 
     proc = _run(
-        "start-all.sh",
+        START_ALL,
         tmp_path,
         {
             "AICODE_DEPLOYMENT_CONFIG": str(deployment),

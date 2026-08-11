@@ -157,7 +157,7 @@ def render_report(checks: list[ServerCheck], *, prefix: str = "[model-preflight]
             f"{prefix} refuse to start: embedding, reranker, and VL servers must all be ready."
         )
         lines.append(
-            f"{prefix} start them with ./scripts/start-rag-servers.sh or point "
+            f"{prefix} start them with '~/start.sh --scope aux' (main 也沒起就直接 ~/start.sh) or point "
             "AICODE_LLAMA_EMBED_BASE_URL / AICODE_LLAMA_RERANK_BASE_URL / "
             "AICODE_LLAMA_VL_BASE_URL at ready servers."
         )

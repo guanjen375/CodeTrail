@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from deployment_profile import RUNTIME_OVERRIDE_ENV_KEYS
@@ -38,7 +39,8 @@ def test_start_rag_servers_dry_run_uses_base_url_ports(tmp_path):
     }
 
     proc = subprocess.run(
-        ["bash", str(REPO_ROOT / "scripts" / "start-rag-servers.sh"), "--dry-run"],
+        [sys.executable, str(REPO_ROOT / "scripts" / "launch_servers.py"),
+         "--scope", "aux", "--dry-run"],
         cwd=str(REPO_ROOT),
         env=env,
         capture_output=True,
@@ -71,7 +73,8 @@ def test_start_rag_servers_dry_run_uses_base_url_ports(tmp_path):
 
 def test_start_rag_servers_noncausal_models_use_full_physical_batch(tmp_path):
     proc = subprocess.run(
-        ["bash", str(REPO_ROOT / "scripts" / "start-rag-servers.sh"), "--dry-run"],
+        [sys.executable, str(REPO_ROOT / "scripts" / "launch_servers.py"),
+         "--scope", "aux", "--dry-run"],
         cwd=str(REPO_ROOT),
         env={
             **_isolated_env(tmp_path),

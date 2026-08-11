@@ -216,7 +216,7 @@ aicode_web
 
 沙箱 root 檢查、模型解析、ctx safety 與 `AI_CODE_*` 透傳全部跟 standalone TUI 一致 —— 例如要讀專案外附件一樣加 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode_web`。停止 backend 用 `aicode_web stop`。
 
-沒用 Tailscale時,低階入口仍可用 `aicode web`(前景、預設 `127.0.0.1:4096`)或 `<CODETRAIL_REPO>/scripts/start-web.sh`(背景),再從 B 機做 SSH tunnel:`ssh -L 4096:127.0.0.1:4096 <帳號>@<A機>`。完整步驟見 [README §5.4](../README.md#54-web-模式目前測試中)。
+沒用 Tailscale時,低階入口仍可用 `aicode web`(前景、預設 `127.0.0.1:4096`)或 `aicode_web --local`(背景),再從 B 機做 SSH tunnel:`ssh -L 4096:127.0.0.1:4096 <帳號>@<A機>`。完整步驟見 [README §5.4](../README.md#54-web-模式目前測試中)。
 
 首頁就是 session 清單,點任一筆即可載入該 session 繼續對話。
 
