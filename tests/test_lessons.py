@@ -1,10 +1,11 @@
 """lessons(行為教訓)機制的離線測試。
 
 涵蓋:store 驗證 fail-loud、20 條上限拒絕、scope/review_by 過濾、
-render 注入、session start 檢查(注入 / 過期複審提示 / 壞檔拒啟動)、
-管理 CLI、opencode.json 注入欄位與 permission 契約,以及驗收要求的
-完整生命週期:提案(核准後寫入)→ 下個 session 注入 → 過期 →
-停注入 + 複審提示 → renew 後恢復。
+render 注入、session start 檢查(注入 / 過期複審提示 / 壞檔拒啟動 /
+SKIP 與安全模式清除殘留 / .codetrail symlink 拒寫)、id 不重用、
+mutate 交易、propose 冪等與 render 失敗降級、管理 CLI、opencode.json
+注入欄位與 permission 契約,以及驗收要求的完整生命週期:提案(核准後
+寫入)→ 下個 session 注入 → 過期 → 停注入 + 複審提示 → renew 後恢復。
 
 純檔案系統操作,不需要 llama-server / OpenCode。
 """
@@ -73,6 +74,7 @@ def test_load_rejects_invalid_json(tmp_path):
         ({"hit_count": -1}, "非負整數"),
         ({"hit_count": True}, "非負整數"),
         ({"last_triggered": 5}, "last_triggered"),
+        ({"last_triggered": "昨天下午"}, "ISO 8601"),
         ({"note": "x"}, "未知欄位"),
     ],
 )
@@ -88,6 +90,12 @@ def test_validate_store_rejects_duplicate_ids_and_bad_top_level():
         lessons.validate_store({"version": 2, "lessons": []})
     with pytest.raises(LessonsError, match="未知頂層"):
         lessons.validate_store({"version": 1, "lessons": [], "extra": 1})
+    # next_id 是合法的頂層欄位(id 計數器),但必須是正整數
+    lessons.validate_store({"version": 1, "lessons": [], "next_id": 7})
+    with pytest.raises(LessonsError, match="next_id"):
+        lessons.validate_store({"version": 1, "lessons": [], "next_id": 0})
+    with pytest.raises(LessonsError, match="next_id"):
+        lessons.validate_store({"version": 1, "lessons": [], "next_id": True})
 
 
 @pytest.mark.parametrize(
@@ -130,9 +138,24 @@ def test_add_lesson_fills_schema_and_allocates_ids(tmp_path):
     third = lessons.add_lesson(data, "先跑最小相關測試再宣稱完成", "project", ROOT, today=TODAY)
     assert third["id"] == "L-003"
 
+    # 刪掉「最高編號」那條也不重用:next_id 計數器持久化在 store 裡,
+    # 否則舊對話引用的 [L-003] 會指到之後的另一條規則。
+    lessons.delete_lesson(data, "L-003")
+    fourth = lessons.add_lesson(data, "commit 訊息用英文", "project", ROOT, today=TODAY)
+    assert fourth["id"] == "L-004"
+
     path = tmp_path / "lessons.json"
     lessons.save_lessons(path, data)
     assert lessons.load_lessons(path) == data
+
+
+def test_next_id_counter_backfills_legacy_store():
+    """沒有 next_id 的舊 store(round 11 寫的)照常載入,首次新增即補計數器。"""
+    data = _store_with(_lesson(id="L-005"))
+    lessons.validate_store(data)
+    added = lessons.add_lesson(data, "舊 store 也要單調遞增", "project", ROOT, today=TODAY)
+    assert added["id"] == "L-006"
+    assert data["next_id"] == 7
 
 
 def test_add_lesson_rejects_bad_inputs():
@@ -201,6 +224,20 @@ def test_delete_and_unknown_id():
     assert data["lessons"] == []
     with pytest.raises(LessonsError, match="找不到"):
         lessons.delete_lesson(data, "L-999")
+
+
+def test_mutate_lessons_commits_on_success_and_aborts_on_error(tmp_path):
+    """交易語意:body 正常結束才寫檔;body raise 則 store 完全不動。"""
+    path = tmp_path / "lessons.json"
+    with lessons.mutate_lessons(path) as data:
+        lessons.add_lesson(data, "規則一", "global", None, today=TODAY)
+    assert [x["id"] for x in lessons.load_lessons(path)["lessons"]] == ["L-001"]
+
+    with pytest.raises(LessonsError, match="boom"):
+        with lessons.mutate_lessons(path) as data:
+            lessons.add_lesson(data, "規則二", "global", None, today=TODAY)
+            raise LessonsError("boom")
+    assert [x["id"] for x in lessons.load_lessons(path)["lessons"]] == ["L-001"]
 
 
 # ---------------------------------------------------------------------------
@@ -290,10 +327,51 @@ def test_propose_lesson_cap_is_loud(tmp_path):
     root.mkdir()
     data = lessons.empty_store()
     for i in range(lessons.LESSONS_MAX_ACTIVE):
-        lessons.add_lesson(data, f"規則 {i} 保持一致", "project", str(root), today=lessons.today_utc())
+        lessons.add_lesson(data, f"規則 {i} 保持一致", "project", str(root), today=lessons.today_local())
     lessons.save_lessons(store, data)
     with pytest.raises(LessonsError, match="上限"):
         lessons.propose_lesson(str(root), "第 21 條", path=store)
+
+
+def test_propose_lesson_duplicate_is_idempotent(tmp_path):
+    """內容完全相同的重複提案不再寫一條(重試安全);不同 scope 算不同條。"""
+    store = tmp_path / "lessons.json"
+    root = tmp_path / "proj"
+    root.mkdir()
+    first = lessons.propose_lesson(str(root), "改 schema 前先問過使用者", "project",
+                                   path=store, today=TODAY)
+    assert "L-001" in first
+    again = lessons.propose_lesson(str(root), "改 schema 前先問過使用者", "project",
+                                   path=store, today=TODAY)
+    assert "未重複寫入" in again and "L-001" in again
+    assert len(lessons.load_lessons(store)["lessons"]) == 1
+
+    # 同文字但 global scope 是另一條 lesson(注入範圍不同)
+    other = lessons.propose_lesson(str(root), "改 schema 前先問過使用者", "global",
+                                   path=store, today=TODAY)
+    assert "L-002" in other
+    assert len(lessons.load_lessons(store)["lessons"]) == 2
+
+
+def test_propose_lesson_render_failure_persists_store_with_warning(tmp_path):
+    """render 失敗 ≠ 提案失敗:store 已落地就回成功 + 警告;重試不產生重複。"""
+    store = tmp_path / "lessons.json"
+    root = tmp_path / "proj"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (root / ".codetrail").symlink_to(outside)  # render 會被 symlink 防線擋下
+
+    msg = lessons.propose_lesson(str(root), "先跑最小相關測試再宣稱完成", "project",
+                                 path=store, today=TODAY)
+    assert "L-001" in msg and "render 注入檔失敗" in msg and "不要為此重新提案" in msg
+    assert len(lessons.load_lessons(store)["lessons"]) == 1
+    assert not (outside / "lessons.md").exists()  # 一個 byte 都沒寫出沙箱
+
+    retry = lessons.propose_lesson(str(root), "先跑最小相關測試再宣稱完成", "project",
+                                   path=store, today=TODAY)
+    assert "未重複寫入" in retry
+    assert len(lessons.load_lessons(store)["lessons"]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -311,12 +389,13 @@ def _run_check(tmp_path, monkeypatch, store_data=None, raw=None):
         store.write_text(raw, encoding="utf-8")
     monkeypatch.setenv(lessons.LESSONS_FILE_ENV, str(store))
     monkeypatch.delenv("AICODE_LESSONS_SKIP", raising=False)
+    monkeypatch.delenv("OPENCODE_DISABLE_PROJECT_CONFIG", raising=False)
     return root, lessons_check.main(["--root", str(root)])
 
 
 def test_check_renders_active_and_prompts_expired(tmp_path, monkeypatch, capsys):
     data = lessons.empty_store()
-    lessons.add_lesson(data, "還有效的規則", "global", None, today=lessons.today_utc())
+    lessons.add_lesson(data, "還有效的規則", "global", None, today=lessons.today_local())
     stale = lessons.add_lesson(data, "早該複審的規則", "global", None, today="2020-01-01")
     root, code = _run_check(tmp_path, monkeypatch, store_data=data)
     out = capsys.readouterr().out
@@ -368,9 +447,80 @@ def test_check_skip_env_bypasses_everything(tmp_path, monkeypatch, capsys):
     assert "跳過" in capsys.readouterr().out
 
 
+def test_check_skip_removes_stale_render(tmp_path, monkeypatch, capsys):
+    """SKIP 不只是不 render:上個 session 的 lessons.md 也要清掉,
+    否則 OpenCode instructions 仍會把舊規則載入,「已跳過」就是謊話。"""
+    data = lessons.empty_store()
+    lessons.add_lesson(data, "上個 session 的規則", "global", None, today=lessons.today_local())
+    root, code = _run_check(tmp_path, monkeypatch, store_data=data)
+    assert code == 0
+    context = root / lessons.LESSONS_CONTEXT_RELPATH
+    assert "上個 session 的規則" in context.read_text(encoding="utf-8")
+    capsys.readouterr()
+
+    monkeypatch.setenv("AICODE_LESSONS_SKIP", "1")
+    assert lessons_check.main(["--root", str(root)]) == 0
+    out = capsys.readouterr().out
+    assert not context.exists()
+    assert "已移除" in out
+
+
+def test_check_safe_mode_is_honest_and_removes_stale(tmp_path, monkeypatch, capsys):
+    """OPENCODE_DISABLE_PROJECT_CONFIG 模式:OpenCode 從全域設定目錄解析相對
+    instructions,專案內的 lessons.md 根本不會被載入 —— 這裡必須明講不注入、
+    不動不信任的 repo(清殘留除外)、也不讀 store(壞 store 不擋安全模式)。"""
+    data = lessons.empty_store()
+    lessons.add_lesson(data, "殘留的規則", "global", None, today=lessons.today_local())
+    root, code = _run_check(tmp_path, monkeypatch, store_data=data)
+    assert code == 0
+    context = root / lessons.LESSONS_CONTEXT_RELPATH
+    assert context.exists()
+    capsys.readouterr()
+
+    # 換成壞 store 證明安全模式不讀它;env 給 "0" 證明比照 OpenCode 的
+    # JS truthiness(非空即真,"0" 也算開啟)。
+    store = tmp_path / "store" / "lessons.json"
+    store.write_text("{bad", encoding="utf-8")
+    monkeypatch.setenv("OPENCODE_DISABLE_PROJECT_CONFIG", "0")
+    assert lessons_check.main(["--root", str(root)]) == 0
+    out = capsys.readouterr().out
+    assert "不注入" in out and "已移除" in out
+    assert not context.exists()
+
+
+def test_check_refuses_symlinked_codetrail(tmp_path, monkeypatch, capsys):
+    """.codetrail 被 symlink 指到專案外 → 拒寫 + 拒啟動,外部目錄一個檔都不多。"""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / ".codetrail").symlink_to(outside)
+    monkeypatch.setenv(lessons.LESSONS_FILE_ENV, str(tmp_path / "store" / "lessons.json"))
+    monkeypatch.delenv("AICODE_LESSONS_SKIP", raising=False)
+    monkeypatch.delenv("OPENCODE_DISABLE_PROJECT_CONFIG", raising=False)
+
+    assert lessons_check.main(["--root", str(root)]) == 2
+    out = capsys.readouterr().out
+    assert "symlink" in out
+    assert list(outside.iterdir()) == []
+
+
+def test_write_context_refuses_symlinked_lessons_md(tmp_path):
+    """lessons.md 本身是 symlink 也拒絕(自動產生檔不應是連結)。"""
+    root = tmp_path / "root"
+    (root / ".codetrail").mkdir(parents=True)
+    outside_file = tmp_path / "target.md"
+    outside_file.write_text("外部檔", encoding="utf-8")
+    (root / ".codetrail" / "lessons.md").symlink_to(outside_file)
+    with pytest.raises(LessonsError, match="symlink"):
+        lessons.write_context_file(root, [])
+    assert outside_file.read_text(encoding="utf-8") == "外部檔"
+
+
 def test_check_rejects_missing_root(tmp_path, monkeypatch):
     monkeypatch.setenv(lessons.LESSONS_FILE_ENV, str(tmp_path / "lessons.json"))
     monkeypatch.delenv("AICODE_LESSONS_SKIP", raising=False)
+    monkeypatch.delenv("OPENCODE_DISABLE_PROJECT_CONFIG", raising=False)
     assert lessons_check.main(["--root", str(tmp_path / "nope")]) == 2
 
 
@@ -381,7 +531,7 @@ def test_check_rejects_missing_root(tmp_path, monkeypatch):
 def test_cli_list_renew_delete_hit(tmp_path, capsys):
     store = tmp_path / "lessons.json"
     data = lessons.empty_store()
-    lessons.add_lesson(data, "有效規則", "global", None, today=lessons.today_utc())
+    lessons.add_lesson(data, "有效規則", "global", None, today=lessons.today_local())
     lessons.add_lesson(data, "過期規則", "project", ROOT, today="2020-01-01")
     lessons.save_lessons(store, data)
 
@@ -466,6 +616,7 @@ def test_full_lifecycle_correction_to_review(tmp_path, monkeypatch, capsys):
     root.mkdir()
     monkeypatch.setenv(lessons.LESSONS_FILE_ENV, str(store))
     monkeypatch.delenv("AICODE_LESSONS_SKIP", raising=False)
+    monkeypatch.delenv("OPENCODE_DISABLE_PROJECT_CONFIG", raising=False)
     context = root / lessons.LESSONS_CONTEXT_RELPATH
 
     # 1. 使用者糾正 → 模型提案 → ask 核准 → 寫入
@@ -479,7 +630,7 @@ def test_full_lifecycle_correction_to_review(tmp_path, monkeypatch, capsys):
     class _FrozenDate:
         value = "2026-11-09"  # review_by 當天,仍 active
 
-    monkeypatch.setattr(lessons, "today_utc", lambda: _FrozenDate.value)
+    monkeypatch.setattr(lessons, "today_local", lambda: _FrozenDate.value)
     assert lessons_check.main(["--root", str(root)]) == 0
     assert "migration 前先確認" in context.read_text(encoding="utf-8")
     assert "待人工複審" not in capsys.readouterr().out

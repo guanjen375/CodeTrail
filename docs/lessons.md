@@ -44,7 +44,8 @@
 ```
 
 - `scope: "project"`(預設)只注入到記錄它的那個專案;`"global"` 注入到此部署的所有專案。跨專案皆適用的工作習慣才用 global。
-- `rule` 必須是可執行的祈使句行為規則,單行、≤200 字元;事件敘述(「上次 migration 壞了」)與 error log 會被拒絕。真正的品質把關是你的核准框 —— 內容不對就拒絕,讓模型改寫再提。
+- `rule` 必須是可執行的祈使句行為規則,單行、≤200 字元。機械檢查只擋得住明顯的 log 形式(Traceback、timestamp、`[ERROR]`、`exit code N`);「上次 migration 壞了」這類事件敘述句它擋不住 —— 真正的品質把關是你的核准框,內容不對就拒絕,讓模型改寫再提。
+- 日期(`created` / `review_by`)取本機時區的「今天」;id 單調遞增,刪掉最高編號的條目後新 lesson 也不會重用該編號(舊對話裡的 `[L-xxx]` 引用不會指到別條)。
 
 ## 什麼會觸發、什麼不會
 
@@ -54,7 +55,9 @@
 - 答案內容錯誤被指正 —— 客觀知識修正請 `ingest_document` 進 KB;
 - 模型自己覺得「這樣做比較好」—— 沒有人的糾正就不記。
 
-被你拒絕的提案就結束,模型不該換句話重試。**沒有任何無審核的自動寫入路徑。**
+被你拒絕的提案就結束,模型不該換句話重試;內容完全相同的重複提案也不會寫入第二條(回報既有編號,重試因此安全)。**沒有任何無審核的自動寫入路徑。**
+
+升級注意:舊安裝 `git pull` 後,全域 opencode.json 可能還沒有 `codetrail_record_lesson: "ask"` 這個核准閘(新工具會被舊的 `codetrail_*: allow` wildcard 直接放行)、也沒有 lessons 的 `instructions` 項(render 了也不載入)。`aicode` 每次啟動會用 `scripts/opencode_contract_check.py --fix` 自動補齊缺少的鍵(原檔備份、你明確設過的值一律尊重);不經 `aicode` 直接開 `opencode` 的話,請先重跑 `./set_config.sh`。
 
 ## 上限與 fail-loud
 
@@ -64,7 +67,13 @@ session start(`aicode`)時:
 
 - lessons store 損壞 → **拒絕啟動**(fail-loud),修復或 `AICODE_LESSONS_SKIP=1 aicode` 緊急跳過(該 session 不注入);
 - active 超過 20(只可能手改 JSON 造成)→ 拒絕啟動,要求整併;
-- 有條目過 review_by → 照常啟動,但該條停止注入,並醒目列出待複審清單與 renew / delete 指令。
+- 有條目過 review_by → 照常啟動,但該條停止注入,並醒目列出待複審清單與 renew / delete 指令;
+- `.codetrail` 被 symlink/junction 指到專案外 → 拒絕啟動(沙箱寫入防線,render 一個 byte 都不寫;不信任的 repo 可能用這招把檔案導出沙箱)。
+
+跳過與安全模式(兩者都會**移除**先前 render 的 `.codetrail/lessons.md`,避免上個 session 的規則殘留被 OpenCode 載入):
+
+- `AICODE_LESSONS_SKIP=1`:本 session 不注入(緊急逃生口);
+- `OPENCODE_DISABLE_PROJECT_CONFIG=1`(分析不信任 repo 的安全模式,見 [docs/security.md](security.md)):OpenCode 這個模式從全域設定目錄解析相對 instructions、不讀專案內檔案,lessons **不會注入** —— `aicode` 會明講,不會謊報「已注入」。注意 OpenCode 對這個 env 是「非空即真」,`=0` 也算開啟。
 
 ## 管理指令
 

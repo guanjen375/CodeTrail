@@ -95,6 +95,15 @@ case "$ROOT" in
     ;;
 esac
 
+# AICODE_ROOT override 時,先 cd 到該 root 再做其餘所有事:MCP wrapper 的
+# 放置位置、preflight、canary 與最後 exec 的 OpenCode 才會看到同一個專案。
+# 不 cd 的話 OpenCode 仍以原 cwd 當專案,載入另一個目錄的設定與
+# instructions,前面驗過的保證全部對不上。ROOT == cwd(未 override)時是 no-op。
+cd "$ROOT" || {
+  echo "[aicode] cannot cd into AICODE_ROOT: $ROOT" >&2
+  exit 2
+}
+
 resolve_opencode_mcp_root() {
   if command -v git >/dev/null 2>&1; then
     git rev-parse --show-toplevel 2>/dev/null && return
@@ -252,6 +261,17 @@ if [ -f "$CODETRAIL_HOME/scripts/opencode_mcp_timeout_check.py" ]; then
   # git pull 後第一次執行 aicode 就修好，不必逐台手動改全域設定。
   if ! "$PYBIN" "$CODETRAIL_HOME/scripts/opencode_mcp_timeout_check.py" --fix; then
     echo "[aicode] OpenCode MCP timeout sync refused to start (see [mcp-timeout] above)." >&2
+    exit 2
+  fi
+fi
+
+if [ -f "$CODETRAIL_HOME/scripts/opencode_contract_check.py" ]; then
+  # 舊安裝 git pull 後的自動遷移:record_lesson 等寫入工具的 ask 核准閘與
+  # lessons 的 instructions 項都在全域 opencode.json。沒補上的話,新工具會被
+  # 舊的 codetrail_* allow wildcard 直接放行(繞過人工核准),lessons.md
+  # render 了也不會被載入。只補缺少的鍵、使用者設過的值一律尊重、有備份。
+  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/opencode_contract_check.py" --fix; then
+    echo "[aicode] OpenCode contract sync refused to start (see [oc-contract] above)." >&2
     exit 2
   fi
 fi

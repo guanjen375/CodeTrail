@@ -181,7 +181,9 @@ def test_aicode_prepares_opencode_mcp_wrapper(tmp_path):
 
 
 def test_aicode_repairs_short_codetrail_timeout_before_starting_opencode(tmp_path):
-    """更新 repo 後直接跑 aicode，舊的 10 秒設定應在 client 啟動前被修好。"""
+    """更新 repo 後直接跑 aicode:舊的 10 秒 timeout 要在 client 啟動前修好,
+    契約遷移(opencode_contract_check)也要接著補上寫入工具的 ask 核准閘與
+    lessons instructions —— 這是舊安裝 git pull 後的無感升級路徑。"""
     config_path = tmp_path / "opencode.json"
     original = {
         "model": "llamacpp/local-model",
@@ -213,7 +215,11 @@ def test_aicode_repairs_short_codetrail_timeout_before_starting_opencode(tmp_pat
     )
     updated = json.loads(config_path.read_text(encoding="utf-8"))
     assert updated["mcp"]["codetrail"]["timeout"] == 660_000
-    assert updated["permission"] == original["permission"]
+    # 原有 permission 保留;缺少的 ask 核准閘與 lessons instructions 被補上
+    assert updated["permission"]["*"] == "deny"
+    assert updated["permission"]["codetrail_record_lesson"] == "ask"
+    assert updated["instructions"] == [".codetrail/lessons.md"]
+    # 第一份備份是 timeout 修復前的原檔(契約遷移的備份接續編號)
     backup = config_path.with_name(config_path.name + ".codetrail.bak")
     assert json.loads(backup.read_text(encoding="utf-8")) == original
     assert "FIXED" in result.stdout

@@ -49,6 +49,11 @@ OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode_web
 
 這會讓 OpenCode 忽略專案層級設定,避免 repo 自帶 config 把 `bash` / `read` / `write` 等內建工具重新放開。
 
+兩個此模式的副作用/防線要知道:
+
+- OpenCode 此模式改從全域設定目錄解析相對 instructions,不讀專案內檔案,所以 [lessons](lessons.md) 該 session **不會注入** —— `aicode` 啟動輸出會明講,並清掉先前 render 殘留的 `.codetrail/lessons.md`,不會謊報「已注入」。(OpenCode 對這個 env 是「非空即真」,`=0` 也算開啟。)
+- 不信任 repo 可能把 `.codetrail` 換成指向專案外的 symlink/junction,誘導 lessons render 把檔案寫出沙箱;`aicode` 啟動時偵測到會直接拒絕啟動,一個 byte 都不寫。
+
 ---
 
 ## 外部檔案匯入
@@ -83,6 +88,8 @@ aicode
 `run_command(...)` 本身還有命令白名單與 dangerous-pattern 過濾。不要把 `rm` / `sudo` / `curl` / `bash` 加進白名單;真的需要人工操作時,讓模型列出建議命令,由人自己判斷後在 shell 執行。
 
 `record_lesson(...)` 是唯一會寫到 `AICODE_ROOT` 之外的工具,而且只寫一個固定路徑:`~/.config/codetrail/lessons.json`(per-deployment 的行為教訓 store,與 `deployment.json` 同層;不能被模型指到別的路徑)。它被 permission 設成 `ask`:模型只能「提案」,你會在核准框看到完整 rule 內容,核准後才落地。沒有無審核的自動寫入路徑;細節見 [docs/lessons.md](lessons.md)。
+
+升級防護:舊安裝 `git pull` 後,舊 opencode.json 的 `codetrail_*: allow` wildcard 會放行還沒有 ask 覆寫的新工具。`aicode` 每次啟動會自動把缺少的 ask 核准閘(與 lessons 的 instructions 項)補進全域 opencode.json(`scripts/opencode_contract_check.py --fix`,原檔備份、你明確設過的值一律尊重);不經 `aicode` 直接開 `opencode` 的話請先重跑 `./set_config.sh`。
 
 ---
 
