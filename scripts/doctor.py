@@ -101,7 +101,7 @@ _OPTIONAL_PACKAGES = [
     ("mcp", "MCP server 需要 — pip install mcp"),
     ("numpy", "提升 RAG/MMR 速度，非必要 — pip install numpy"),
     ("jieba", "中文 BM25 精準度，非必要 — pip install jieba"),
-    ("pymupdf4llm", "PDF ingestion 才需要 — pip install pymupdf4llm"),
+    ("pymupdf4llm", "PDF ingestion 才需要 — pip install \"pymupdf4llm==1.28.0\"(釘驗證版)"),
     ("html2text", "RAG.py --url 抓網頁才需要 — pip install html2text"),
 ]
 

@@ -30,7 +30,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 pip install -r requirements.txt
-pip install pymupdf4llm    # 選用:RAG 從 PDF 建知識庫才用
+pip install "pymupdf4llm==1.28.0"    # 選用:RAG 從 PDF 建知識庫才用;釘本 repo 驗證版
 ```
 
 注意 `aicode` 啟動時會以 `python3` 跑 `scripts/doctor.py` 等,需要對應 venv 已啟用。建議在 `.venv/bin/activate` 內或 `~/.bashrc` 裡加上 `source <CODETRAIL_REPO>/.venv/bin/activate`,避免不同 shell 撞不到 venv。

@@ -121,7 +121,7 @@ Ubuntu 24.04 啟用 PEP 668,system Python 不允許直接 `pip install`。最省
 ```bash
 cd <CODETRAIL_REPO>
 python3 -m pip install --user --break-system-packages -r requirements.txt
-python3 -m pip install --user --break-system-packages pymupdf4llm    # 選用:RAG 從 PDF 建知識庫才用
+python3 -m pip install --user --break-system-packages "pymupdf4llm==1.28.0"    # 選用:RAG 從 PDF 建知識庫才用;釘本 repo 驗證版(上游 page schema 常變動)
 python3 -c "import mcp, numpy, requests; print('deps OK')"
 ```
 

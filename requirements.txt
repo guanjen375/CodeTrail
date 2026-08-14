@@ -7,7 +7,7 @@ numpy>=1.21.0       # RAG / MMR 向量運算
 jieba>=0.42.1       # 中文 BM25 切詞（缺少時可降級，但預設安裝確保檢索品質）
 
 # 可選：缺了會由各功能 graceful skip，doctor 會提示
-# pip install pymupdf4llm                          # RAG.py 從 PDF/MD 建知識庫
+# pip install "pymupdf4llm==1.28.0"               # RAG.py 從 PDF/MD 建知識庫(釘驗證版,上游 schema 常變動)
 # pip install html2text                            # RAG.py --url 抓網頁
 # pip install pyelftools                           # media.py ELF 結構化解析 (含 DWARF/notes)
 # llama.cpp llama-server 本身要自己 build,見 docs/setup.md
