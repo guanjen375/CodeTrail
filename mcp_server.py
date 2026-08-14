@@ -144,7 +144,7 @@ from config import KNOWLEDGE_FILE, KNOWLEDGE_EMB_FILE, RUN_COMMAND_TIMEOUT
 from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from agent_tools import ToolExecutor
-from media import set_sandbox_root, ocr_image, read_elf, read_binary, IMAGE_EXTENSIONS, ELF_EXTENSIONS, BINARY_EXTENSIONS
+from media import set_sandbox_root, ocr_image, read_elf, read_binary, read_pdf, IMAGE_EXTENSIONS, ELF_EXTENSIONS, BINARY_EXTENSIONS
 from external_import import import_external_file as _import_external_file
 from http_client import close_session
 from utils import (
@@ -258,6 +258,22 @@ _kb_path = str(Path(AICODE_ROOT) / KNOWLEDGE_FILE)
 _log(f"[MCP] 載入 KnowledgeBase ({_kb_path}) ...")
 KB = KnowledgeBase(_kb_path)
 _log(f"[MCP] {KB.get_status()}")
+
+
+def _ensure_kb_fresh() -> None:
+    """查詢前檢查 knowledge.json 是否在載入後又被改過,是就自動重載。
+
+    這是「ingest/remove 後必須 reload」的 code 層保證:呼叫端忘了
+    reload_knowledge_base 也不會查到過期 singleton。ingest_document 走
+    subprocess 寫檔,CLI 手動跑 RAG.py 也一樣會被偵測到。
+    載入失敗會 fail-loud(KnowledgeStoreError 直接拋出);此時舊 KB 物件
+    保持原樣,下一次查詢會再重試。
+    """
+    global KB
+    if KB.source_changed():
+        _log(f"[MCP] knowledge.json 已變更,自動重新載入 ({_kb_path}) ...")
+        KB = KnowledgeBase(_kb_path)
+        _log(f"[MCP] {KB.get_status()}")
 
 _log("[MCP] 初始化 CodeRAG (lazy index — 第一次 code_rag_search 才建索引) ...")
 CODE_RAG = CodeRAG(AICODE_ROOT)
@@ -374,6 +390,7 @@ def query_knowledge(question: str, source: Optional[str] = None) -> dict:
             "has_ref": bool
         }
     """
+    _ensure_kb_fresh()
     if not KB.loaded:
         return {
             "text": "",
@@ -437,6 +454,7 @@ def query_knowledge_strict(question: str, source: Optional[str] = None) -> dict:
         streaming(會被導向 stderr,只有最終定稿經 MCP 回來)。
       - llama-server 不可用時 answer 會以 "[ERROR] ..." 開頭。
     """
+    _ensure_kb_fresh()
     if not KB.loaded:
         result = {
             "answer": None,
@@ -580,6 +598,9 @@ def read_file(
     max_chars: int = 50000,
 ) -> str:
     """Read a file inside AICODE_ROOT (sandbox-protected, returns numbered lines).
+
+    只處理純文字:.pdf 與二進位檔會回導引訊息(請改用 analyze_file 一次性
+    檢視,或 ingest_document 入庫)。
 
     Args:
         path: 相對於 AICODE_ROOT 的檔案路徑。
@@ -762,18 +783,21 @@ def import_external_file(path: str, dest_name: Optional[str] = None) -> str:
 
 @_tool()
 def analyze_file(path: str) -> str:
-    """Analyze a non-text file (image / ELF / binary firmware) inside AICODE_ROOT.
+    """Analyze a non-text file (image / PDF / ELF / binary firmware) inside AICODE_ROOT.
 
     依副檔名自動 dispatch:
       - 圖片(.png/.jpg/.jpeg/.gif/.webp) → 用 VL_MODEL 做通用視覺分析,
         包含文字轉錄、UI / 終端機、表格、圖表、架構圖、流程圖與一般照片
         (要先在 llama-server VL port (8083) 掛載對應的 VL GGUF + mmproj)
+      - PDF(.pdf) → 一次性抽各頁文字(不寫入 knowledge.json);
+        內嵌圖會標註頁碼與張數但不做 VL 分析
       - ELF(.elf/.so/.o/.axf/.out/.ko) → 解析 header / sections / symbols
         (需要系統有 binutils 的 readelf / objdump)
       - 二進位(.bin/.dat/.raw/.fw/.img/.rom/.hex) → hex dump + 字串提取 + magic 偵測
         (若內容是 ELF magic 會自動切到 ELF 解析)
 
-    用途:OpenCode 對話中想分析錯誤截圖、firmware blob、ELF binary 時呼叫。
+    用途:OpenCode 對話中想分析錯誤截圖、firmware blob、ELF binary,
+    或「只看一眼」一份 PDF(不想汙染 KB)時呼叫。
     對純文字檔(.py/.c/.md...)請改用 read_file。
 
     沙箱:檔案必須在 AICODE_ROOT 內。要分析 root 外的檔案請先複製進來。
@@ -802,6 +826,8 @@ def analyze_file(path: str) -> str:
 
     if ext in IMAGE_EXTENSIONS:
         return ocr_image(path_str)
+    if ext == ".pdf":
+        return read_pdf(path_str)
     if ext in ELF_EXTENSIONS:
         return read_elf(path_str)
     if ext in BINARY_EXTENSIONS:
@@ -809,8 +835,8 @@ def analyze_file(path: str) -> str:
 
     return (
         f"錯誤: 不支援的副檔名 {ext}\n"
-        f"支援:image {sorted(IMAGE_EXTENSIONS)}, ELF {sorted(ELF_EXTENSIONS)}, "
-        f"binary {sorted(BINARY_EXTENSIONS)}\n"
+        f"支援:image {sorted(IMAGE_EXTENSIONS)}, PDF ['.pdf'], "
+        f"ELF {sorted(ELF_EXTENSIONS)}, binary {sorted(BINARY_EXTENSIONS)}\n"
         f"純文字檔請用 read_file。"
     )
 
@@ -820,8 +846,12 @@ def ingest_document(path: str, mode: str = "auto") -> str:
     """Ingest a file into the project knowledge base.
 
     呼叫 AICODE_ROOT/RAG.py 把指定檔案切 chunk + 算 embedding,append 到
-    AICODE_ROOT/knowledge.json。**完成後必須再呼叫 reload_knowledge_base()
-    才會被 query_knowledge 看到**(KB 是啟動時載入的 singleton)。
+    AICODE_ROOT/knowledge.json。查詢端會自動偵測檔案變更:下一次
+    query_knowledge / query_knowledge_strict 會先重載 KB 再查,不依賴人工
+    記得 reload。想「立即」載入並確認 chunk 數,可呼叫 reload_knowledge_base()。
+
+    注意:.pdf 只抽文字。內嵌圖片不會經 VL、不會入庫;有內嵌圖時執行輸出
+    會出現 [WARN](掃描頁/圖表頁請另存 .png 用 mode="image" 補灌)。
 
     依 RAG.py 的檔名類型偵測:檔名含 `_spec` / `datasheet` 會被當成 spec(權重最高),
     `manual` 當 manual,`_api` / `reference` 當 api,以此類推。所以檔名取貼切一點。
@@ -844,7 +874,7 @@ def ingest_document(path: str, mode: str = "auto") -> str:
               "binary"   – 強制 binary/ELF 路徑
 
     Returns:
-        RAG.py 的執行輸出+ 提醒呼叫 reload_knowledge_base。
+        RAG.py 的執行輸出(PDF 內嵌圖 [WARN] 也在這裡)+ 後續建議。
     """
     import subprocess
 
@@ -949,8 +979,13 @@ def ingest_document(path: str, mode: str = "auto") -> str:
     if len(out) > 8000:
         out = out[:4000] + "\n\n...[截斷中段]...\n\n" + out[-4000:]
 
-    status = "✓ 完成" if result.returncode == 0 else f"✗ 失敗 (exit {result.returncode})"
-    hint = "\n\n提醒: 呼叫 reload_knowledge_base() 讓新內容立即生效。"
+    if result.returncode == 0:
+        status = "✓ 完成"
+        hint = ("\n\n下一次 query_knowledge 會自動偵測並載入新內容;"
+                "要立即載入+確認 chunk 數可呼叫 reload_knowledge_base()。")
+    else:
+        status = f"✗ 失敗 (exit {result.returncode})"
+        hint = "\n\n入庫失敗;請依上方輸出排除錯誤後重試。"
     return f"=== ingest_document {status} ===\n{out}{hint}"
 
 
@@ -965,15 +1000,15 @@ def remove_document(source: str) -> str:
     操作對象是 AICODE_ROOT/knowledge.json。刪除會在同一個 store lock 內同步
     篩掉 NPZ 對應列並原子替換 JSON/NPZ；不會留下無向量的剩餘 chunks。
 
-    **完成後必須再呼叫 reload_knowledge_base() 才會被 query_knowledge 看到**
-    (KB 是啟動時載入的 singleton,跟 ingest_document 一樣)。
+    查詢端會自動偵測檔案變更:下一次 query_knowledge 會先重載再查。
+    想立即生效+看狀態可呼叫 reload_knowledge_base()。
 
     Args:
         source: 要刪的檔案名(basename),例如 "spec.pdf"。傳絕對路徑也行,
                 會自動取 basename 比對。
 
     Returns:
-        刪了幾個 chunk + 剩餘的 source 清單 + 提醒呼叫 reload。
+        刪了幾個 chunk + 剩餘的 source 清單。
     """
     target = Path(source).name  # basename only, ignore any directory part
     kb_path = Path(AICODE_ROOT) / KNOWLEDGE_FILE
@@ -997,7 +1032,7 @@ def remove_document(source: str) -> str:
         f"(source = '{target}'),剩 {result['remaining_chunks']} 個 chunk / "
         f"{result['remaining_documents']} 個文件；NPZ 向量列已同步提交。\n"
         f"剩餘 sources: {result['sources'] or '(無)'}\n\n"
-        f"提醒: 呼叫 reload_knowledge_base() 讓變更立即生效。"
+        f"變更會在下一次查詢時自動載入;要立即生效可呼叫 reload_knowledge_base()。"
     )
 
 
@@ -1005,8 +1040,10 @@ def remove_document(source: str) -> str:
 def reload_knowledge_base() -> str:
     """Reload the in-memory KnowledgeBase from AICODE_ROOT/knowledge.json.
 
-    KB 是 module-level singleton,只在 server 啟動時載入。剛跑完 ingest_document
-    或外面手動編輯過 knowledge.json,要呼叫這個才看得到變更。
+    KB 是 module-level singleton。query_knowledge / query_knowledge_strict
+    每次查詢前會自動偵測 knowledge.json 變更並重載,平常不必手動呼叫;
+    這個工具用於「立即」載入並回報 chunk 數(例如 ingest 後想馬上確認狀態),
+    或在自動偵測疑似失效時強制重載。
 
     Returns:
         重新載入後的狀態訊息(chunk 數量等)。

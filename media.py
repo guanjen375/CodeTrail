@@ -45,6 +45,11 @@ BINARY_EXTENSIONS = {".bin", ".dat", ".raw", ".fw", ".img", ".rom", ".hex"}
 # 支援的 ELF 檔案副檔名
 ELF_EXTENSIONS = {".elf", ".so", ".o", ".axf", ".out", ".ko"}
 
+# 一次性 PDF 檢視（read_pdf）
+PDF_EXTENSIONS = {".pdf"}
+MAX_PDF_SIZE = 50 * 1024 * 1024  # 50MB
+PDF_ONESHOT_MAX_CHARS = 30000    # read_pdf 輸出上限（避免炸 OpenCode context）
+
 # 檔案大小限制
 MAX_BINARY_SIZE = 50 * 1024 * 1024  # 50MB
 
@@ -79,9 +84,11 @@ _ALLOW_EXTERNAL: bool = True  # 預設允許外部檔案（大部分使用場景
 _OCR_CACHE = OrderedDict()
 _BIN_CACHE = OrderedDict()
 _ELF_CACHE = OrderedDict()
+_PDF_CACHE = OrderedDict()
 _OCR_CACHE_MAX = 8
 _BIN_CACHE_MAX = 6
 _ELF_CACHE_MAX = 6
+_PDF_CACHE_MAX = 6
 
 _IMAGE_MIME_TYPES = {
     ".png": "image/png",
@@ -1513,6 +1520,102 @@ def ocr_image(path: str) -> str:
         return result
     except Exception as e:
         return f"[圖片分析錯誤] {type(e).__name__}: {e}"
+
+
+def read_pdf(path: str, max_chars: int = PDF_ONESHOT_MAX_CHARS) -> str:
+    """一次性抽 PDF 各頁文字（不寫入 knowledge.json）。
+
+    補上「只看一眼 PDF」的通道：以前一次性入口只有 read_file（純文字）與
+    analyze_file（圖片/binary），想看 PDF 只能 ingest → remove → reload。
+    內嵌圖只標註頁碼與張數、不做 VL 分析——要圖片內容請另存 .png 後用
+    ocr_image/analyze_file 或 ingest_document(mode="image")。
+    """
+    p = _safe_path(path, allow_external=True, allowed_extensions=PDF_EXTENSIONS)
+
+    if p is None:
+        if _ALLOW_EXTERNAL:
+            return f"[PDF 錯誤] 檔案不存在或不是 .pdf: {path}"
+        else:
+            return f"[PDF 錯誤] 路徑不在允許範圍內或檔案不存在: {path}"
+
+    if not p.exists():
+        return f"[PDF 錯誤] 檔案不存在: {path}"
+
+    # sandbox 內路徑 _safe_path 不查副檔名（同 ocr_image 的處理），這裡補查
+    if p.suffix.lower() not in PDF_EXTENSIONS:
+        return f"[PDF 錯誤] 不是 .pdf: {p.suffix}"
+
+    file_size = p.stat().st_size
+    if file_size > MAX_PDF_SIZE:
+        return f"[PDF 錯誤] 檔案過大: {file_size / 1024 / 1024:.1f}MB (上限 {MAX_PDF_SIZE // 1024 // 1024}MB)"
+
+    try:
+        import pymupdf4llm
+    except ImportError:
+        return "[PDF 錯誤] 需要 pymupdf4llm 套件（pip install pymupdf4llm）"
+
+    cache_key = _cache_key(p, ("pdf-oneshot-v1", max_chars))
+    cached = _cache_get(_PDF_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        pages = pymupdf4llm.to_markdown(str(p), page_chunks=True, write_images=False)
+    except Exception as e:
+        return f"[PDF 錯誤] 無法解析: {type(e).__name__}: {e}"
+
+    parts: List[str] = [
+        f"[PDF] {p.name} 共 {len(pages)} 頁（一次性檢視，未寫入 knowledge.json）"
+    ]
+    image_pages: dict = {}   # 頁碼 → 內嵌圖數
+    used = 0
+    truncated_at: Optional[int] = None
+
+    for page_info in pages:
+        meta = page_info.get("metadata", {}) or {}
+        # pymupdf4llm 新版 key 是 page_number（1-based），舊版是 page（0-based）
+        page_num = meta.get("page_number")
+        if page_num is None:
+            page_num = meta.get("page", 0) + 1
+
+        pics = [b for b in page_info.get("page_boxes") or []
+                if b.get("class") == "picture"]
+        n_pics = len(pics) or len(page_info.get("images") or [])
+        if n_pics:
+            image_pages[page_num] = n_pics
+
+        if truncated_at is not None:
+            continue
+
+        text = (page_info.get("text") or "").strip()
+        body = text if text else "（本頁無可抽取文字）"
+        if n_pics:
+            body += f"\n［本頁含 {n_pics} 張內嵌圖，未做 VL 分析］"
+        block = f"\n--- 第 {page_num} 頁 ---\n{body}"
+
+        if used + len(block) > max_chars:
+            truncated_at = page_num
+            continue
+        parts.append(block)
+        used += len(block)
+
+    if truncated_at is not None:
+        parts.append(
+            f"\n[已截斷] 第 {truncated_at} 頁起省略（輸出上限 {max_chars} 字元）。"
+            "要完整內容請用 ingest_document 入庫後查詢，"
+            "或用 read_pdf 的 max_chars 參數放寬。"
+        )
+    if image_pages:
+        pages_str = ", ".join(str(pg) for pg in sorted(image_pages))
+        parts.append(
+            f"\n[注意] 內嵌圖共 {sum(image_pages.values())} 張（頁 {pages_str}）"
+            "未包含在上面文字裡。需要圖片內容時，把該頁另存 .png 後用 "
+            "analyze_file 或 ingest_document(mode=\"image\") 處理。"
+        )
+
+    result = "\n".join(parts)
+    _cache_set(_PDF_CACHE, cache_key, result, _PDF_CACHE_MAX)
+    return result
 
 
 def read_elf(path: str, max_sections: Optional[int] = None,

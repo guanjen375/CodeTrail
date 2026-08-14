@@ -234,7 +234,13 @@ def detect_content_type(content: str, base_type: str) -> str:
     """
     根據內容判斷是否為警告類型
     如果內容包含警告關鍵字，覆蓋為 'warning' 類型
+
+    例外：VL 產物（diagram/chat）不升級。「注意/必須/限制」在 VL 描述裡
+    幾乎必然出現，一升級就把降權中的 VL chunk 拉到 warning 權重（1.15 >
+    diagram 0.8），同時抹掉 type 層的出身標記。
     """
+    if base_type in ('diagram', 'chat'):
+        return base_type
     content_upper = content.upper()
     for kw in WARNING_KEYWORDS:
         if kw.upper() in content_upper:
@@ -616,9 +622,26 @@ def extract_pdf(file_path: str) -> List[Dict]:
     # 根據文件類型取得 chunk 設定
     chunk_size, chunk_overlap = get_chunk_settings(doc_type)
 
+    image_pages: Dict[int, int] = {}   # 頁碼 → 內嵌圖數
+    image_only_pages: List[int] = []   # 只有圖、抽不到文字而整頁跳過的頁
+
     for page_info in pages:
-        page_num = page_info.get('metadata', {}).get('page', 0) + 1
+        meta = page_info.get('metadata', {}) or {}
+        # pymupdf4llm >= 1.x 的 key 是 page_number（1-based）；
+        # 舊版是 page（0-based）。舊 key 硬讀會讓所有 chunk 都變第 1 頁。
+        page_num = meta.get('page_number')
+        if page_num is None:
+            page_num = meta.get('page', 0) + 1
         content = page_info.get('text', '').strip()
+
+        # 內嵌圖偵測：新版在 page_boxes（class=picture），舊版在 images
+        pics = [b for b in page_info.get('page_boxes') or []
+                if b.get('class') == 'picture']
+        n_pics = len(pics) or len(page_info.get('images') or [])
+        if n_pics:
+            image_pages[page_num] = n_pics
+            if not content:
+                image_only_pages.append(page_num)
 
         if not content:
             continue
@@ -645,6 +668,19 @@ def extract_pdf(file_path: str) -> List[Dict]:
                 "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
                 **_retrieval_prefix_metadata(chunk_data),
             })
+
+    # fail-loud：PDF 路徑只抽文字，內嵌圖不經 VL、不入庫。
+    # 混合 PDF（datasheet 類）以前會「chunks>0 → 回報成功」而圖無聲消失。
+    if image_pages:
+        total_pics = sum(image_pages.values())
+        pages_str = ", ".join(str(p) for p in sorted(image_pages))
+        print(f"  [WARN] PDF 內嵌圖片未入庫: 共 {total_pics} 張（頁 {pages_str}）。"
+              f"PDF 路徑只抽文字，圖片內容不會經 VL、不會進知識庫。")
+        if image_only_pages:
+            only_str = ", ".join(str(p) for p in sorted(image_only_pages))
+            print(f"  [WARN] 第 {only_str} 頁只有圖片、沒有可抽取文字，整頁已跳過。")
+        print("  [HINT] 需要圖片內容時：把該頁圖片另存成 .png，"
+              "用 ingest_document(mode=\"image\") 入庫或 analyze_file 看一次。")
 
     return results
 

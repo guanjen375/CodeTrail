@@ -78,7 +78,7 @@ CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透�
 請用工具 analyze_file 分析 firmware/boot.bin，整理檔頭、magic 和可讀字串。
 ```
 
-`read_file(...)` 適合文字；`analyze_file(...)` 適合圖片、ELF、firmware binary。這些操作只把附件帶進目前對話，不會建立可長期查詢的知識庫。想讓圖片或附件之後反覆查，改用 §3 的 `ingest_document(...)`（圖片會自動走 VL 看圖再進 RAG）。
+`read_file(...)` 適合文字；`analyze_file(...)` 適合圖片、PDF（一次性抽文字）、ELF、firmware binary。這些操作只把附件帶進目前對話，不會建立可長期查詢的知識庫。想讓圖片或附件之後反覆查，改用 §3 的 `ingest_document(...)`（圖片會自動走 VL 看圖再進 RAG）。
 
 ### 檔案在專案目錄外
 
@@ -147,7 +147,7 @@ aicode
 
 - `query_knowledge(...)` 適合一般查文件，速度較快。
 - `query_knowledge_strict(...)` 適合規格數字與限制，較慢但會做證據檢查。
-- 每次新增或移除文件後都要 `reload_knowledge_base(...)`。
+- 新增或移除文件後查詢會自動載入變更；`reload_knowledge_base(...)` 用來立即確認 chunk 數。
 - `knowledge.json` 會保存切碎後的文件內容，NDA 場景不要 commit。
 
 完整流程、支援格式、圖片 VL 分析、binary/ELF 匯入和舊文件移除見 [RAG、附件與知識庫操作](rag.md)。

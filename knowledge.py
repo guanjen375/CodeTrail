@@ -125,8 +125,29 @@ class KnowledgeBase:
         json_dir = Path(json_path).parent
         self._emb_path = json_dir / KNOWLEDGE_EMB_FILE
 
+        # staleness 偵測：記下載入當下的檔案簽章，之後用 source_changed() 比對。
+        # 刻意在 _load 之前取——若載入期間檔案又被改，下次比對會看到差異再重載一次。
+        self._source_stat = self._stat_signature(json_path)
+
         if Path(json_path).exists():
             self._load(json_path)
+
+    @staticmethod
+    def _stat_signature(path: str):
+        """檔案簽章 (mtime_ns, size)；檔案不存在時回 None。"""
+        try:
+            st = Path(path).stat()
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def source_changed(self) -> bool:
+        """knowledge.json 在本 instance 載入後是否又被改過。
+
+        查詢端（MCP query_knowledge*）靠這個做自動重載，取代
+        「ingest 後必須人工記得呼叫 reload」的文件層約定。
+        """
+        return self._stat_signature(self.path) != self._source_stat
 
     def _load(self, path: str):
         try:
@@ -1738,6 +1759,8 @@ English:"""
                     "content": c.get("content", ""),
                     "type": chunk_type,
                     "section": chunk_section,
+                    # 同一 source 的 origin 一致，直接沿用（丟掉會讓 VL 出身標記在 REF 消失）
+                    "origin": c.get("origin", ""),
                     "last_idx": chunk_idx,
                     "embedding": c_emb,
                     "_emb_sum": emb_sum,
@@ -1771,6 +1794,7 @@ English:"""
                     "content": c.get("content", ""),
                     "type": chunk_type,
                     "section": chunk_section,
+                    "origin": c.get("origin", ""),
                     "last_idx": chunk_idx,
                     "embedding": c.get("embedding", []),
                     "_emb_sum": emb_sum,
@@ -1929,6 +1953,10 @@ English:"""
 
         has_spec = any(chunk.get('type') == 'spec' for chunk in merged_chunks)
         has_warning = any(chunk.get('type') == 'warning' for chunk in merged_chunks)
+        # VL 產物（圖片/截圖經視覺模型抽述）要在 REF 層揭露出身：
+        # 它的內容是機率性描述，不能與原文抽取的 chunk 當同級證據
+        vl_origins = {'image', 'screenshot'}
+        has_vl_ref = any(chunk.get('origin') in vl_origins for chunk in merged_chunks)
 
         # 修正：用「最終被選中的 chunks」重新計算 top_emb_score
         # 避免 candidates[0] 被過濾/rerank 後，仍用它的低分來決定信心度
@@ -1959,6 +1987,7 @@ English:"""
             page = chunk.get('page', '?')
             doc_type = chunk.get('type', 'doc')
             section = chunk.get('section', '')
+            origin = chunk.get('origin', '')
 
             if KNOWLEDGE_INCLUDE_CONTENT:
                 content = chunk.get('content', '')
@@ -1969,6 +1998,10 @@ English:"""
 
                 model_lines.append(f"\n[REF{i}]")
                 model_lines.append(f"  type: {doc_type}")
+                if origin:
+                    origin_label = (f"VL（{origin} 經視覺模型辨識，非原文）"
+                                    if origin in vl_origins else origin)
+                    model_lines.append(f"  origin: {origin_label}")
                 model_lines.append(f"  source: {source}")
                 model_lines.append(f"  page: {page}")
                 if section:
@@ -1976,7 +2009,8 @@ English:"""
                 model_lines.append(f"  content: {content}")
             else:
                 section_hint = f" ({section})" if section else ""
-                model_lines.append(f"  - REF{i}: {source} 第 {page} 頁 [{doc_type}]{section_hint}")
+                vl_hint = "（VL 辨識）" if origin in vl_origins else ""
+                model_lines.append(f"  - REF{i}: {source} 第 {page} 頁 [{doc_type}]{vl_hint}{section_hint}")
 
         model_lines.append("\n[/REF]")
 
@@ -1987,11 +2021,18 @@ English:"""
             model_lines.append("※ spec 類型的 REF 優先級較高")
         if has_warning:
             model_lines.append("※ warning 類型的 REF 請特別注意其限制條件")
+        if has_vl_ref:
+            model_lines.append(
+                "※ origin 標註 VL 的 REF 是視覺模型對圖片/截圖的辨識結果"
+                "（機率性描述，非原始文件）：引用其數值/規格時請註明「(VL 辨識)」，"
+                "與文字抽取的 REF 衝突時以文字抽取為準"
+            )
 
         model_output = "\n".join(model_lines)
 
         doc_pages = {}
         doc_types = {}
+        vl_sources = set()
         for chunk in merged_chunks:
             src = chunk.get('source', '?')
             chunk_type = chunk.get('type', 'doc')
@@ -2001,6 +2042,8 @@ English:"""
             else:
                 # 改進：同 source 只要出現 warning/spec 就升級 type
                 doc_types[src] = self._upgrade_type(doc_types[src], chunk_type)
+            if chunk.get('origin') in vl_origins:
+                vl_sources.add(src)
             page = chunk.get('page')
             if page and page not in doc_pages[src]:
                 doc_pages[src].append(page)
@@ -2011,7 +2054,8 @@ English:"""
             if len(pages) > 5:
                 pages_str += "..."
             dtype = doc_types.get(src, 'doc')
-            display_parts.append(f"{src} [{dtype}] p.{pages_str}")
+            vl_tag = "·VL" if src in vl_sources else ""
+            display_parts.append(f"{src} [{dtype}{vl_tag}] p.{pages_str}")
 
         # display 也顯示信心度，讓用戶知道參考資料的可靠度
         # P0 改進：高風險時加上警告
@@ -2039,7 +2083,9 @@ English:"""
                 "source": c.get("source", ""),
                 "page": c.get("page", 0),
                 "type": c.get("type", "doc"),
-                "section": c.get("section", "")
+                "section": c.get("section", ""),
+                # 出身揭露：VL 產物（image/screenshot）在下游要能與原文區分
+                "origin": c.get("origin", ""),
             }
             for c in merged_chunks
         ]

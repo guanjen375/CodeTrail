@@ -381,6 +381,22 @@ class ToolExecutor:
         if not target.is_file():
             return f"錯誤: '{path}' 不是檔案"
 
+        # 純文字通道分流：PDF/二進位硬讀只會吐 U+FFFD 亂碼——燒 context 又
+        # 容易誘發模型腦補。回導引訊息比「成功地讀出垃圾」誠實。
+        if target.suffix.lower() == ".pdf":
+            return (f"錯誤: '{path}' 是 PDF，read_file 只處理純文字。"
+                    "想這一輪看一眼用 analyze_file(path)；"
+                    "要之後隨時可查用 ingest_document(path)。")
+        try:
+            with open(target, 'rb') as fb:
+                head = fb.read(4096)
+        except Exception as e:
+            return f"錯誤: {e}"
+        if b"\x00" in head:
+            return (f"錯誤: '{path}' 是二進位檔（開頭含 NUL byte），"
+                    "read_file 只處理純文字。請改用 analyze_file"
+                    "（圖片/ELF/binary/PDF）或 ingest_document 入庫。")
+
         target_str = str(target)
         start_line = max(1, start_line)
         truncated_by_limit = False

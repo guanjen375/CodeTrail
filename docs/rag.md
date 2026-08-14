@@ -27,12 +27,13 @@
 |---|---|
 | 程式碼 / log / 純文字 | 「請用工具 `read_file` 讀 `logs/build_fail.txt`」 |
 | 截圖 / 圖片 | 「請用工具 `analyze_file` 分析 `screenshots/error.png`」 |
+| PDF（只看一眼、不入庫） | 「請用工具 `analyze_file` 分析 `docs/npu_spec.pdf`」 |
 | 韌體 / 執行檔 / 二進位（.bin / .elf / .img） | 「請用工具 `analyze_file` 分析 `firmware/boot.bin`」 |
 
 兩個工具差別：
 
-- `read_file` 直接把純文字內容讀進對話。
-- `analyze_file` 會先做處理 — 圖片由 VL 做通用視覺分析（文字辨識、UI／終端機、表格、圖表、架構／流程關係與一般照片都包含），二進位檔則抓出檔頭格式和可讀字串 — 再把整理後的結果丟給模型。
+- `read_file` 直接把純文字內容讀進對話（拿到 PDF／二進位會回導引訊息，不會吐亂碼）。
+- `analyze_file` 會先做處理 — 圖片由 VL 做通用視覺分析（文字辨識、UI／終端機、表格、圖表、架構／流程關係與一般照片都包含），PDF 抽各頁文字（內嵌圖會標註頁碼張數但不做 VL），二進位檔則抓出檔頭格式和可讀字串 — 再把整理後的結果丟給模型。
 
 `analyze_file` 是「這一輪看一次就丟」，看完不會留在 KB 裡，未來其他對話查不到。如果想把這張截圖／這份 firmware 永久保存供之後查詢，改用 `ingest_document`（見「把附件做成知識庫讓模型隨時能查」），它接受相同的圖片／binary／ELF 副檔名，並會切 chunk、算 embedding 寫進 `knowledge.json`。
 
@@ -97,7 +98,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 
 1. 先用 `import_external_file` 把外部檔案複製進專案，拿到 `.aicode_uploads/...` 新路徑。
 2. （選用）對新路徑做 `read_file` 或 `analyze_file`，**只是讓模型這一輪先看一次**，不會寫入 `knowledge.json`。
-3. 對**同一個路徑**做 `ingest_document`（它會重新讀那個原始檔案、自己切 chunk 算 embedding），再 `reload_knowledge_base`，之後的對話才查得到。
+3. 對**同一個路徑**做 `ingest_document`（它會重新讀那個原始檔案、自己切 chunk 算 embedding）。之後的查詢會**自動偵測** `knowledge.json` 變更並載入；想立即載入並確認 chunk 數，可補一句 `reload_knowledge_base`。
 
 範例：
 
@@ -113,7 +114,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 
 - `analyze_file(path)` / `read_file(path)` **只讓目前這一輪對話先看附件**，不會寫入 `knowledge.json`。
 - `ingest_document(path)` 會**重新讀同一個原始檔案**、切 chunk、算 embedding、寫入 `knowledge.json` —— 它**不會接收 `analyze_file` 的文字輸出**，所以第 2 步看一次只是給你參考，省略也不影響入庫結果。
-- `ingest_document` 之後**一定要 `reload_knowledge_base()`**，否則 `query_knowledge` 查不到剛注入的內容。
+- ingest／remove 之後**查詢會自動偵測檔案變更並重載**（code 層保證，不再依賴人工記得）。`reload_knowledge_base()` 仍可用來「立即」載入並回報 chunk 數。
 
 （另外 `import_external_file` 只負責把外部檔案帶進沙箱，本身不寫 KB。）
 
@@ -125,12 +126,12 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 
 #### 支援格式
 
-- **文字**：`.pdf` / `.md` / `.txt`（直接抽文字）
+- **文字**：`.pdf` / `.md` / `.txt`（直接抽文字。**PDF 只抽文字**：內嵌圖不經 VL、不入庫，有內嵌圖時 ingest 輸出會列出 `[WARN]` 張數與頁碼——需要圖的內容就把該頁另存 `.png` 走圖片路徑補灌）
 - **圖片**：`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp`（用 VL 模型看圖、抽出文字描述後切 chunk，需要先把 VL GGUF 掛在 llama-server :8083,設定見 [README §2.4](../README.md#24-vl-模型) 與 §3.2）
 - **binary**：`.bin` / `.dat` / `.raw` / `.fw` / `.img` / `.rom` / `.hex`（抽 hex dump、可讀字串、magic 偵測；遇到 ELF magic 自動切到 ELF 解析）
 - **ELF**：`.elf` / `.so` / `.o` / `.axf` / `.out` / `.ko`（抽 header / sections / symbols）
 
-純圖片掃描的 PDF（沒有可選文字）切不出內容，先把每頁存成 `.png` 再用 `ingest_document` 走圖片路徑，或先用 OCR 工具轉成文字檔再匯入。VL server 是啟動必要條件，若圖片分析仍失敗，先跑 `python scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
+純圖片掃描的 PDF（沒有可選文字）切不出內容（chunks=0 直接失敗），先把每頁存成 `.png` 再用 `ingest_document` 走圖片路徑，或先用 OCR 工具轉成文字檔再匯入。文字＋圖混合的 PDF（datasheet 類）會成功入庫**但只有文字部分**——看 ingest 輸出的 `[WARN]` 就知道哪幾頁的圖被略過。VL server 是啟動必要條件，若圖片分析仍失敗，先跑 `python scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
 
 #### 三個步驟
 
@@ -157,7 +158,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 完成後用工具 reload_knowledge_base 重新載入。
 ```
 
-`ingest_document` 會把整份文件切成多段、算出每段的向量、存進專案根目錄的 `knowledge.json`。`reload_knowledge_base` 把剛存進去的內容立刻吃進記憶體 — **每次匯入或刪除文件後都要呼叫**，不然查不到。
+`ingest_document` 會把整份文件切成多段、算出每段的向量、存進專案根目錄的 `knowledge.json`。之後的 `query_knowledge` 會**自動偵測檔案變更並重載**，忘了 reload 也查得到；`reload_knowledge_base` 的用途是「立即」載入並回報 chunk 數（像上面範例那樣馬上確認匯入結果），或在自動偵測疑似失效時強制重載。
 
 這裡的「吃進記憶體」是 **MCP server 的 KB singleton / 向量索引**,不是把整份文件塞進 OpenCode 聊天 context。`ingest_document` 回到當前對話的只有執行摘要,`reload_knowledge_base` 只有狀態;等你呼叫 `query_knowledge` 時,才會把命中的少量 chunks 當 tool result 帶進那個 session。因此 KB 文件數變多會增加索引與 retrieval 工作,但不會讓每個新 session 自動帶著全文。若模型在 ingest 後看似「失憶」,先依 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)檢查實際 token、compaction 與真 / 假 tool call,不要直接歸因於 RAG context overflow。
 
@@ -201,9 +202,11 @@ batch size 上限是 32 (REF1)。
 | 你要的 | 用哪個 | 進 RAG？ |
 |---|---|---|
 | 只看這張圖一次，看完就丟 | `analyze_file('diagram.png')` | ✗ 只在這一輪對話 |
-| 看完還要之後反覆查 | `ingest_document('diagram.png')` → `reload_knowledge_base()` | ✓ VL 抽完寫進 knowledge.json |
+| 看完還要之後反覆查 | `ingest_document('diagram.png')`（之後查詢自動載入） | ✓ VL 抽完寫進 knowledge.json |
 
 > **不用先 `analyze_file`。** `ingest_document` 餵圖片時會**重新讀那個原始圖檔**、內部自己呼叫 VL 看圖（`RAG.py --image` → `process_technical_image` → VL server :8083），抽出文字後才切 chunk、算 embedding 寫進 `knowledge.json`。`analyze_file` 是另一條獨立的入口（走 `media.py`），只在你想「這一輪先看一眼畫面」時用，它的輸出不會被 ingest 吃進去，**不是 ingest 的前置步驟**。
+
+入庫後查詢時，圖片／截圖來源的 REF 會標 `origin: VL`（給人看的摘要則標 `·VL`），提醒模型這是視覺辨識的**機率性描述**、與原文抽取不同級——與文字 REF 衝突時以文字為準。規格數字題的拒答判斷也把 diagram/chat 排除在權威類型（spec/manual/api）之外。
 
 圖片在專案目錄內（建議放 `docs/`）直接 ingest，之後就查得到：
 

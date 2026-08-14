@@ -101,3 +101,62 @@ def test_analyze_file_allows_inside_unsupported_ext(mcp_module, tmp_path: Path):
     # 該回「不支援的副檔名」,而不是 sandbox 訊息
     assert "不支援" in out or "支援" in out, out
     assert "AICODE_ROOT" not in out, out
+
+
+# ------------------------------------------------------------------
+# 2026-08-14 review 追加:PDF dispatch 與 KB 自動 refresh
+# (借用本檔的 mcp_module fixture — 都是 mcp_server 的 tool 層行為)
+# ------------------------------------------------------------------
+
+def test_analyze_file_dispatches_pdf_to_read_pdf(mcp_module, tmp_path: Path, monkeypatch):
+    """.pdf 應走 read_pdf(一次性檢視),不再回「不支援的副檔名」。"""
+    (tmp_path / "doc.pdf").write_bytes(b"%PDF-1.4 fake")
+    monkeypatch.setattr(
+        mcp_module, "read_pdf", lambda p: f"PDF_OK:{Path(p).name}"
+    )
+
+    out = _call_analyze_file(mcp_module, "doc.pdf")
+
+    assert out == "PDF_OK:doc.pdf", out
+
+
+def test_ensure_kb_fresh_reloads_only_on_change(mcp_module):
+    """KB.source_changed() True → 換新 KnowledgeBase;False → 原物件不動。"""
+
+    class _Stub:
+        def __init__(self, changed: bool):
+            self._changed = changed
+
+        def source_changed(self) -> bool:
+            return self._changed
+
+    stale = _Stub(True)
+    mcp_module.KB = stale
+    mcp_module._ensure_kb_fresh()
+    assert mcp_module.KB is not stale, "檔案變更後應重建 KB singleton"
+
+    fresh = _Stub(False)
+    mcp_module.KB = fresh
+    mcp_module._ensure_kb_fresh()
+    assert mcp_module.KB is fresh, "沒變更就不該動 KB"
+
+
+def test_query_knowledge_autoloads_kb_created_after_startup(mcp_module, tmp_path: Path):
+    """啟動時沒有 knowledge.json,之後被 ingest 建出來 → 查詢要自動載入。
+
+    這是 P3「reload 依賴人工記得」的 code 層保證:不呼叫
+    reload_knowledge_base 也不能查到過期(或不存在)的 singleton。
+    """
+    import json as _json
+
+    fn = getattr(mcp_module.query_knowledge, "fn", mcp_module.query_knowledge)
+
+    out_before = fn("任何問題")
+    assert out_before.get("error") == "knowledge base not loaded"
+
+    (tmp_path / "knowledge.json").write_text(
+        _json.dumps({"chunks": [], "metadata": {}}), encoding="utf-8"
+    )
+
+    out_after = fn("任何問題")
+    assert "error" not in out_after, out_after
