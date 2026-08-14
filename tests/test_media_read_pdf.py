@@ -70,3 +70,73 @@ def test_read_pdf_truncates_by_max_chars(pdf_sandbox: Path):
     out = media.read_pdf("mixed2.pdf", max_chars=10)
 
     assert "[已截斷]" in out, out
+
+
+def _build_image_pages_pdf(path: Path, n_pages: int) -> None:
+    fitz = pytest.importorskip("fitz", reason="需要 PyMuPDF（pymupdf4llm 相依）")
+    doc = fitz.open()
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 32, 32))
+    pix.clear_with(120)
+    for _ in range(n_pages):
+        pg = doc.new_page()
+        pg.insert_image(fitz.Rect(72, 72, 200, 200), pixmap=pix)
+    doc.save(str(path))
+    doc.close()
+
+
+def _build_text_pages_pdf(path: Path, n_pages: int) -> None:
+    fitz = pytest.importorskip("fitz", reason="需要 PyMuPDF（pymupdf4llm 相依）")
+    doc = fitz.open()
+    for i in range(n_pages):
+        pg = doc.new_page()
+        # 多行寫入（insert_text 不會自動換行，單一長行會被版面裁掉導致抽出文字過短）
+        for j in range(12):
+            pg.insert_text((72, 80 + j * 14), f"page {i + 1} line {j} lorem ipsum dolor sit amet")
+    doc.save(str(path))
+    doc.close()
+
+
+# ============================================================
+# 2026-08-14 GPT review #2：max_chars 不是 hard cap——
+# header/截斷訊息/逐頁圖片列表都不計入 budget（10,000 圖片頁 +
+# max_chars=100 實測輸出 59,230 字），且解析工作不受 cap 限制。
+# ============================================================
+def test_read_pdf_image_pages_are_range_summarized(pdf_sandbox: Path):
+    pytest.importorskip("pymupdf4llm", reason="PDF 檢視需要 pymupdf4llm")
+    _build_image_pages_pdf(pdf_sandbox / "imgs.pdf", 40)
+
+    out = media.read_pdf("imgs.pdf")
+
+    assert "頁 1-40" in out, out          # 範圍摘要
+    assert "頁 1, 2, 3" not in out, out   # 不逐頁列舉
+
+
+def test_read_pdf_output_is_hard_capped(pdf_sandbox: Path):
+    _build_image_pages_pdf(pdf_sandbox / "imgs2.pdf", 40)
+    pytest.importorskip("pymupdf4llm", reason="PDF 檢視需要 pymupdf4llm")
+
+    out = media.read_pdf("imgs2.pdf", max_chars=700)
+
+    assert len(out) <= 700, (len(out), out)
+    assert "[已截斷]" in out, out
+
+
+def test_read_pdf_stops_parsing_after_budget(pdf_sandbox: Path, monkeypatch):
+    """達 budget 後的批次不再解析：高頁數 PDF 不會為被丟棄的內容卡住 MCP。"""
+    pymupdf4llm = pytest.importorskip("pymupdf4llm", reason="PDF 檢視需要 pymupdf4llm")
+    _build_text_pages_pdf(pdf_sandbox / "long.pdf", 60)
+
+    calls = {"n": 0}
+    real = pymupdf4llm.to_markdown
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pymupdf4llm, "to_markdown", counting)
+
+    out = media.read_pdf("long.pdf", max_chars=800)
+
+    assert calls["n"] == 1, calls  # 60 頁 / 批 16 → 只解析第一批
+    assert "[已截斷]" in out, out
+    assert "未解析" in out, out

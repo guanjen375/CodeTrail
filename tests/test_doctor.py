@@ -483,3 +483,39 @@ def test_main_server_ctx_alignment_skips_without_server():
     r = doc.Result()
     doc.check_main_server_ctx_alignment(r, {})
     assert not r.fails and not r.warns and not r.passes
+
+
+# ============================================================
+# pymupdf4llm 釘版驗證（2026-08-14 GPT review #4）
+# 背景：doctor 之前只驗 import，任何版本都 PASS，釘版只活在文件裡；
+# 上游 page schema 變動會讓 PDF 頁碼靜默全錯。
+# ============================================================
+def test_require_pymupdf4llm_pin_mismatch_raises(monkeypatch):
+    import pytest as _pytest
+    _pytest.importorskip("pymupdf4llm", reason="沒裝 pymupdf4llm 時走 WARN 路徑，不在本測試範圍")
+    import config
+
+    assert config.require_pymupdf4llm() is not None  # 本機裝的就是釘版，happy path
+
+    monkeypatch.setattr(config, "PYMUPDF4LLM_PIN", "0.0.0")
+    try:
+        config.require_pymupdf4llm()
+    except RuntimeError as e:
+        assert "版本不符" in str(e) and "0.0.0" in str(e)
+    else:
+        raise AssertionError("釘版不符時 require_pymupdf4llm 必須 raise")
+
+
+def test_check_packages_fails_on_pymupdf4llm_pin_mismatch(monkeypatch):
+    import pytest as _pytest
+    _pytest.importorskip("pymupdf4llm", reason="沒裝 pymupdf4llm 時走 WARN 路徑，不在本測試範圍")
+    import config
+
+    r = doc.Result()
+    doc.check_packages(r)
+    assert not any("pymupdf4llm" in f for f in r.fails), r.fails
+
+    monkeypatch.setattr(config, "PYMUPDF4LLM_PIN", "0.0.0")
+    r2 = doc.Result()
+    doc.check_packages(r2)
+    assert any("pymupdf4llm" in f and "版本不符" in f for f in r2.fails), (r2.fails, r2.warns)

@@ -30,6 +30,12 @@ except ImportError:
 
 import llama_client
 from knowledge_store import KnowledgeStoreError, knowledge_store_lock
+
+# _load 失敗時塞進 _source_stat 的哨兵:它不等於任何真實 stat 簽章(也不等於
+# 「檔案不存在」的 None),因此 source_changed() 恆為 True——失敗的載入永遠算
+# stale,查詢端會持續重試,直到檔案修好(或被移除)為止。沒有這個哨兵,失敗
+# 的 instance 會記住壞檔的簽章,source_changed() 回 False,自動重載就此卡死。
+_LOAD_FAILED_STAT = object()
 from config import (
     LLAMA_BASE_URL, LLAMA_EMBED_BASE_URL, LLAMA_RERANK_BASE_URL,
     KNOWLEDGE_FILE, KNOWLEDGE_EMB_FILE,
@@ -111,6 +117,9 @@ class KnowledgeBase:
         self.chunks = []
         self.documents = []
         self.loaded = False
+        # 載入失敗原因(str);None 表示「沒失敗」——檔案不存在的合法空庫也是 None。
+        # 呼叫端用它區分「空庫」與「壞庫」:壞庫不可拿來取代還在服務的舊 KB。
+        self.load_error = None
         self.path = json_path
         self._reranker_available = None
         # Numpy 加速用的預計算陣列
@@ -214,12 +223,16 @@ class KnowledgeBase:
                     "bm25_enabled": BM25_ENABLED,
                 }
 
-        except KnowledgeStoreError:
+        except KnowledgeStoreError as e:
             self.loaded = False
+            self.load_error = str(e)
+            self._source_stat = _LOAD_FAILED_STAT
             raise
         except Exception as e:
             print(f"[WARN] 知識庫載入失敗: {e}")
             self.loaded = False
+            self.load_error = f"{type(e).__name__}: {e}"
+            self._source_stat = _LOAD_FAILED_STAT
 
     def _compute_content_hash(self, schema: str = "content-v1") -> str:
         """計算所有 chunk 內容的雜湊（用於 .npz 快取驗證）
@@ -2133,6 +2146,8 @@ English:"""
 
     def get_status(self) -> str:
         if not self.loaded:
+            if self.load_error:
+                return f"[KB] 知識庫: 載入失敗({self.load_error})"
             return "[KB] 知識庫: (空)"
 
         chunk_count = len(self.chunks)
@@ -2161,3 +2176,18 @@ English:"""
 
         feature_str = f" [{'+'.join(features)}]" if features else ""
         return f"[KB] 知識庫: {self.path} ({doc_count} 文件, {chunk_count} 區塊){feature_str}"
+
+
+def load_knowledge_base_strict(json_path: str) -> KnowledgeBase:
+    """建立新 KnowledgeBase;任何載入失敗都拋 KnowledgeStoreError,不回傳半殘物件。
+
+    給「自動重載 / 手動 reload」的呼叫端用:呼叫端把回傳值當 candidate,
+    例外時保留手上還能用的舊 KB(不要先覆蓋再發現壞掉)。
+    「檔案不存在」是合法空庫,正常回傳(loaded=False、load_error=None)。
+    """
+    kb = KnowledgeBase(json_path)   # KnowledgeStoreError 由 _load 直接傳播
+    if kb.load_error is not None:
+        raise KnowledgeStoreError(
+            f"knowledge.json 載入失敗: {kb.load_error}(path={json_path})"
+        )
+    return kb

@@ -43,13 +43,26 @@ import llama_client
 
 
 def check_pymupdf4llm():
-    """檢查 pymupdf4llm 套件（只有 PDF 模式需要）"""
+    """檢查 pymupdf4llm 套件與釘版（只有 PDF 模式需要）
+
+    釘版驗證走 config.require_pymupdf4llm()：版本不符會直接擋下，
+    避免照著未釘版提示裝到最新版、頁碼靜默全錯（page→page_number schema 變動）。
+    """
     try:
-        import pymupdf4llm
-        return pymupdf4llm
+        from config import require_pymupdf4llm
     except ImportError:
-        print("[ERROR] 處理 PDF 需要 pymupdf4llm 套件")
-        print("請執行: pip install pymupdf4llm")
+        # 獨立執行且 config 不可用：退回 import-only 檢查（與其他 config fallback 同策略）
+        try:
+            import pymupdf4llm
+            return pymupdf4llm
+        except ImportError:
+            print("[ERROR] 處理 PDF 需要 pymupdf4llm 套件")
+            print('請執行: pip install "pymupdf4llm==1.28.0"')
+            sys.exit(1)
+    try:
+        return require_pymupdf4llm()
+    except RuntimeError as e:
+        print(f"[ERROR] {e}")
         sys.exit(1)
 
 
@@ -562,15 +575,15 @@ def split_long_paragraph(text: str, max_chars: int) -> List[str]:
     """切分超長段落（按句子）"""
     # 句子分隔符
     sentences = re.split(r'(?<=[.。!?！？])\s+', text)
-    
+
     chunks = []
     current = ""
-    
+
     for sent in sentences:
         sent = sent.strip()
         if not sent:
             continue
-        
+
         if len(current) + len(sent) + 1 <= max_chars:
             current = current + " " + sent if current else sent
         else:
@@ -583,10 +596,10 @@ def split_long_paragraph(text: str, max_chars: int) -> List[str]:
                 current = ""
             else:
                 current = sent
-    
+
     if current:
         chunks.append(current)
-    
+
     return chunks
 
 # 兼容舊 API
@@ -1227,7 +1240,7 @@ def load_knowledge_base(output_path: Path) -> Dict:
             _restore_embeddings_from_npz(kb, output_path)
             print(f"[INFO] 載入現有知識庫: {len(kb.get('chunks', []))} 個區塊")
             return kb
-    
+
     # 建立空的知識庫
     return {
         "metadata": {
@@ -1453,12 +1466,12 @@ def add_document(input_file: str, output_file: str):
     """將文件加入知識庫"""
     input_path = Path(input_file)
     output_path = Path(output_file)
-    
+
     # 檢查輸入檔案
     if not input_path.exists():
         print(f"[ERROR] 檔案不存在: {input_file}")
         sys.exit(1)
-    
+
     allowed = SUPPORTED_EXTENSIONS | BINARY_EXTENSIONS | ELF_EXTENSIONS
     if input_path.suffix.lower() not in allowed:
         print(f"[ERROR] 不支援的檔案類型: {input_path.suffix}")
@@ -1479,30 +1492,30 @@ def add_document(input_file: str, output_file: str):
         kb["metadata"]["documents"].remove(doc_name)
     else:
         print(f"[INFO] 新增文件: {doc_name}")
-    
+
     # 處理新文件
     print(f"[INFO] 處理: {input_path.name}")
     new_chunks = process_file(str(input_path))
-    
+
     if not new_chunks:
         print("[WARN] 沒有提取到任何內容")
         sys.exit(1)
-    
+
     print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
-    
+
     # 生成 embeddings
     print(f"[INFO] 使用 {EMBEDDING_MODEL} 生成 embeddings...")
     new_chunks = generate_embeddings(new_chunks)
-    
+
     # 為每個 chunk 生成唯一 ID
     for chunk in new_chunks:
         content_hash = hashlib.md5(chunk['content'].encode()).hexdigest()[:8]
         chunk['id'] = f"{chunk['source']}::p{chunk['page']}::c{chunk['chunk_index']}::{content_hash}"
-    
+
     # Append 到知識庫
     kb["chunks"].extend(new_chunks)
     kb["metadata"]["documents"].append(doc_name)
-    
+
     # 儲存
     save_knowledge_base(kb, output_path)
 

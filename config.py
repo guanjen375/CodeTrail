@@ -169,6 +169,43 @@ def require_main_model_path() -> str:
         )
     return path
 
+
+# pymupdf4llm 釘版:上游 page schema 常變動(1.x 把 metadata.page 改成
+# page_number,舊 key 硬讀會讓所有 chunk 都變第 1 頁——已實際踩過)。
+# 只釘在文件擋不住「照 runtime 提示裝到最新版」;所有 PDF 入口與 doctor
+# 都必須經 require_pymupdf4llm() 驗證安裝版本 == 釘版。
+PYMUPDF4LLM_PIN = "1.28.0"
+PYMUPDF4LLM_INSTALL_HINT = f'pip install "pymupdf4llm=={PYMUPDF4LLM_PIN}"'
+
+
+def require_pymupdf4llm():
+    """Import pymupdf4llm 並驗證釘版;沒裝或版本不符都 raise RuntimeError。
+
+    PDF 入口(RAG.py extract_pdf / media.read_pdf)與 doctor 都走這裡,
+    確保「文件釘版」有 code 層強制力。升級釘版 = 改 PYMUPDF4LLM_PIN 一處。
+    """
+    try:
+        import pymupdf4llm
+    except ImportError as exc:
+        raise RuntimeError(
+            "處理 PDF 需要 pymupdf4llm 套件(未安裝)。"
+            f"請執行: {PYMUPDF4LLM_INSTALL_HINT}"
+        ) from exc
+
+    import importlib.metadata as _importlib_metadata
+    try:
+        installed = _importlib_metadata.version("pymupdf4llm")
+    except _importlib_metadata.PackageNotFoundError:
+        installed = getattr(pymupdf4llm, "__version__", "unknown")
+
+    if installed != PYMUPDF4LLM_PIN:
+        raise RuntimeError(
+            f"pymupdf4llm 版本不符:裝的是 {installed},本 repo 釘 {PYMUPDF4LLM_PIN}"
+            "(上游 page schema 常變動,錯版會讓 PDF 頁碼靜默全錯)。"
+            f"請執行: {PYMUPDF4LLM_INSTALL_HINT}"
+        )
+    return pymupdf4llm
+
 # 主模型只保留一個 n_ctx 概念：正常由 set_config 的 --ctx 寫入 deployment
 # profile / server -c；aicode 啟動時再從 server /props 觀測實值並以
 # AICODE_N_CTX 傳給 runtime。沒經 wrapper 時，回到 effective profile 的 main.ctx。

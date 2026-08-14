@@ -141,7 +141,8 @@ assert AICODE_ROOT is not None  # for type checkers
 
 import config
 from config import KNOWLEDGE_FILE, KNOWLEDGE_EMB_FILE, RUN_COMMAND_TIMEOUT
-from knowledge import KnowledgeBase
+from knowledge import KnowledgeBase, load_knowledge_base_strict
+from knowledge_store import KnowledgeStoreError
 from code_rag import CodeRAG
 from agent_tools import ToolExecutor
 from media import set_sandbox_root, ocr_image, read_elf, read_binary, read_pdf, IMAGE_EXTENSIONS, ELF_EXTENSIONS, BINARY_EXTENSIONS
@@ -266,14 +267,20 @@ def _ensure_kb_fresh() -> None:
     這是「ingest/remove 後必須 reload」的 code 層保證:呼叫端忘了
     reload_knowledge_base 也不會查到過期 singleton。ingest_document 走
     subprocess 寫檔,CLI 手動跑 RAG.py 也一樣會被偵測到。
-    載入失敗會 fail-loud(KnowledgeStoreError 直接拋出);此時舊 KB 物件
-    保持原樣,下一次查詢會再重試。
+    載入失敗會 fail-loud(KnowledgeStoreError 直接拋出),此時全域 KB 保持
+    原樣(candidate 模式:新物件確認載入成功才替換,壞檔不會把還能用的舊 KB
+    換成空殼);失敗的載入不記檔案簽章,下一次查詢一定會再重試。
     """
     global KB
-    if KB.source_changed():
-        _log(f"[MCP] knowledge.json 已變更,自動重新載入 ({_kb_path}) ...")
-        KB = KnowledgeBase(_kb_path)
-        _log(f"[MCP] {KB.get_status()}")
+    if not KB.source_changed():
+        return
+    _log(f"[MCP] knowledge.json 已變更,自動重新載入 ({_kb_path}) ...")
+    try:
+        KB = load_knowledge_base_strict(_kb_path)
+    except KnowledgeStoreError as e:
+        _log(f"[MCP] KB 自動重載失敗,保留原記憶體 KB: {e}")
+        raise
+    _log(f"[MCP] {KB.get_status()}")
 
 _log("[MCP] 初始化 CodeRAG (lazy index — 第一次 code_rag_search 才建索引) ...")
 CODE_RAG = CodeRAG(AICODE_ROOT)
@@ -1046,10 +1053,18 @@ def reload_knowledge_base() -> str:
     或在自動偵測疑似失效時強制重載。
 
     Returns:
-        重新載入後的狀態訊息(chunk 數量等)。
+        重新載入後的狀態訊息(chunk 數量等)。載入失敗時保留原記憶體 KB
+        並回報原因(不會把還能用的 KB 換成空殼)。
     """
     global KB
-    KB = KnowledgeBase(_kb_path)
+    try:
+        KB = load_knowledge_base_strict(_kb_path)
+    except KnowledgeStoreError as e:
+        return (
+            f"[KB reload 失敗] {e}\n"
+            f"原記憶體 KB 保留:{KB.get_status()}\n"
+            "修好 knowledge.json 後,下一次查詢會自動重試(或再呼叫本工具)。"
+        )
     return f"[KB reloaded] {KB.get_status()}"
 
 

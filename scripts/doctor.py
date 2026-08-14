@@ -116,9 +116,25 @@ def check_packages(r: Result) -> None:
     for name, hint in _OPTIONAL_PACKAGES:
         try:
             importlib.import_module(name)
-            r.ok(f"package {name} (optional)")
         except ImportError:
             r.warn(f"package {name} 沒裝 — {hint}")
+            continue
+        if name == "pymupdf4llm":
+            # 釘版驗證：裝錯版比沒裝更糟（PDF 頁碼靜默全錯），所以是 FAIL 不是 WARN。
+            # 只驗 import 的話任何版本都會 PASS，釘版就只活在文件裡。
+            try:
+                cfg = importlib.import_module("config")
+            except Exception as e:
+                r.warn(f"package {name} 已裝但無法驗證釘版（config 載入失敗: {e}）")
+                continue
+            try:
+                cfg.require_pymupdf4llm()
+            except RuntimeError as e:
+                r.fail(str(e))
+                continue
+            r.ok(f"package {name}=={cfg.PYMUPDF4LLM_PIN} (optional, 釘版驗證通過)")
+            continue
+        r.ok(f"package {name} (optional)")
 
 
 def _read_config():

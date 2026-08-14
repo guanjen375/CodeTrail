@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import json
+import codecs
 import fnmatch
 import shlex
 import subprocess
@@ -301,6 +302,76 @@ def get_native_tools() -> list:
 # ============================================================
 # Tool Executor
 # ============================================================
+# read_file 的「已知非文字」副檔名黑名單:這些格式硬讀只會吐亂碼或空白,
+# 不必開檔就直接導向 analyze_file / ingest_document。刻意不含 .dat/.raw/.hex/
+# .out 等可能是文字的模糊副檔名——那些交給 _sniff_text_encoding 的內容判斷。
+_NONTEXT_EXTENSIONS = {
+    # 圖片
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff",
+    # 壓縮 / 封裝
+    ".zip", ".gz", ".tgz", ".bz2", ".xz", ".zst", ".7z", ".rar", ".tar", ".whl",
+    # 編譯產物 / 可執行
+    ".so", ".o", ".a", ".elf", ".ko", ".axf", ".pyc", ".pyo", ".wasm",
+    ".class", ".jar", ".dex", ".dll", ".exe", ".dylib", ".bin",
+    # 資料庫 / 序列化 / 模型
+    ".sqlite", ".sqlite3", ".db", ".npz", ".npy", ".pkl", ".pickle",
+    ".pt", ".pth", ".onnx", ".gguf", ".safetensors",
+    # 文件容器
+    ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".doc", ".xls", ".ppt", ".epub",
+    # 影音 / 字型
+    ".mp3", ".mp4", ".m4a", ".avi", ".mkv", ".mov", ".flac", ".ogg", ".wav", ".webm",
+    ".ttf", ".otf", ".woff", ".woff2",
+}
+
+
+def _sniff_text_encoding(head: bytes):
+    """判斷檔案開頭 bytes 是否為文字,回 (encoding, None) 或 (None, 拒絕原因)。
+
+    取代單看 NUL 的 heuristic——那會放行不含 NUL 的 binary(例如全 0xFF 的
+    firmware,讀出來全是亂碼或空白),又誤殺含 NUL 的 UTF-16 純文字 log。
+    判斷順序:
+      1. BOM(UTF-8/16/32):確定性,直接採信
+      2. 無 BOM 但含 NUL:ASCII 主體的 UTF-16 有「一半 byte 幾乎全 NUL、
+         另一半幾乎全可印字元」的交錯 pattern;不符就視為二進位
+      3. 無 BOM 無 NUL:strict UTF-8 decode;失敗時只有「幾乎全 ASCII、
+         零星壞 byte」(log 夾到 binary 噴濺)才放行,其餘拒絕
+    """
+    if not head:
+        return "utf-8", None  # 空檔案當文字
+    if head.startswith(codecs.BOM_UTF8):
+        return "utf-8-sig", None
+    # UTF-32-LE BOM(FF FE 00 00)是 UTF-16-LE BOM(FF FE)的前綴,必須先查 32
+    if head.startswith(codecs.BOM_UTF32_LE) or head.startswith(codecs.BOM_UTF32_BE):
+        return "utf-32", None
+    if head.startswith(codecs.BOM_UTF16_LE) or head.startswith(codecs.BOM_UTF16_BE):
+        return "utf-16", None
+
+    def _text_ratio(bs: bytes) -> float:
+        if not bs:
+            return 0.0
+        ok = sum(1 for b in bs if 0x20 <= b < 0x7F or b in (0x09, 0x0A, 0x0D))
+        return ok / len(bs)
+
+    if b"\x00" in head:
+        even, odd = head[0::2], head[1::2]
+        if odd and odd.count(0) / len(odd) > 0.7 and _text_ratio(even) > 0.7:
+            return "utf-16-le", None
+        if even and even.count(0) / len(even) > 0.7 and _text_ratio(odd) > 0.7:
+            return "utf-16-be", None
+        return None, "二進位檔(內含 NUL byte)"
+
+    try:
+        head.decode("utf-8")
+        return "utf-8", None
+    except UnicodeDecodeError as e:
+        # head 可能剛好切在多位元組字元中間:只容忍發生在結尾的截斷錯誤
+        if e.start >= len(head) - 3:
+            return "utf-8", None
+        if _text_ratio(head) >= 0.90:
+            return "utf-8", None  # 壞 byte 以 U+FFFD 呈現,不整檔拒絕
+        return None, "非 UTF-8 文字或二進位內容"
+
+
 class ToolExecutor:
     def __init__(self, root: str):
         self.root = Path(root).resolve()
@@ -371,9 +442,7 @@ class ToolExecutor:
                 continue
 
     def read_file(self, path: str, start_line: int = 1, end_line: Optional[int] = None) -> str:
-        """P0 改進：使用 line-based streaming 避免載入整個檔案"""
-        import linecache
-
+        """P0 改進：line-based streaming 單趟讀取，避免載入整個檔案"""
         target = self._safe_path(path)
 
         if not target or not target.exists():
@@ -387,52 +456,56 @@ class ToolExecutor:
             return (f"錯誤: '{path}' 是 PDF，read_file 只處理純文字。"
                     "想這一輪看一眼用 analyze_file(path)；"
                     "要之後隨時可查用 ingest_document(path)。")
-        try:
-            with open(target, 'rb') as fb:
-                head = fb.read(4096)
-        except Exception as e:
-            return f"錯誤: {e}"
-        if b"\x00" in head:
-            return (f"錯誤: '{path}' 是二進位檔（開頭含 NUL byte），"
+        if target.suffix.lower() in _NONTEXT_EXTENSIONS:
+            return (f"錯誤: '{path}' 是二進位/非文字格式（{target.suffix.lower()}），"
                     "read_file 只處理純文字。請改用 analyze_file"
                     "（圖片/ELF/binary/PDF）或 ingest_document 入庫。")
 
-        target_str = str(target)
+        try:
+            with open(target, 'rb') as fb:
+                head = fb.read(8192)
+        except Exception as e:
+            return f"錯誤: {e}"
+        encoding, reject_reason = _sniff_text_encoding(head)
+        if encoding is None:
+            return (f"錯誤: '{path}' 判定為{reject_reason}，"
+                    "read_file 只處理純文字。請改用 analyze_file"
+                    "（圖片/ELF/binary/PDF）或 ingest_document 入庫；"
+                    "若確定是其他編碼的純文字，請先轉成 UTF-8。")
+
         start_line = max(1, start_line)
         truncated_by_limit = False
 
-        # P0 改進：使用 linecache 進行 line-based 讀取
-        # linecache 會快取檔案，對重複讀取同一檔案更有效率
-        # 先清除舊的快取（避免檔案變更後讀到舊內容）
-        linecache.checkcache(target_str)
-
-        # 計算總行數（使用 generator 避免一次載入整個檔案）
+        # 單趟 streaming：邊數總行數邊收集目標範圍。用 sniff 出的編碼 +
+        # errors='replace' 讀——以前 linecache 走 strict decode，檔案中段
+        # 一個壞 byte 會讓「整個檔案」的每一行都靜默變成空字串。
+        selected: list = []
+        total = 0
+        char_count = 0
         try:
-            with open(target, 'r', encoding='utf-8', errors='replace') as f:
-                total = sum(1 for _ in f)
+            with open(target, 'r', encoding=encoding, errors='replace') as f:
+                for i, line in enumerate(f, 1):
+                    total = i
+                    if i < start_line:
+                        continue
+                    if end_line is not None:
+                        if i <= end_line:
+                            selected.append(line.rstrip('\n\r'))
+                        continue  # 之後只數總行數
+                    if truncated_by_limit:
+                        continue
+                    char_count += len(line)
+                    if char_count > MAX_FILE_READ_CHARS and selected:
+                        truncated_by_limit = True
+                        continue
+                    selected.append(line.rstrip('\n\r'))
         except Exception as e:
             return f"錯誤: {e}"
 
-        # 計算 end_line
-        if end_line is None:
-            char_count = 0
-            end_line = start_line
-            for i in range(start_line, total + 1):
-                line = linecache.getline(target_str, i)
-                char_count += len(line)
-                if char_count > MAX_FILE_READ_CHARS:
-                    truncated_by_limit = True
-                    break
-                end_line = i
+        if selected:
+            end_line = start_line + len(selected) - 1
         else:
-            end_line = min(end_line, total)
-
-        # 讀取指定範圍的行
-        selected = []
-        for i in range(start_line, end_line + 1):
-            line = linecache.getline(target_str, i)
-            # getline 返回含 \n 的行，需要 rstrip
-            selected.append(line.rstrip('\n\r'))
+            end_line = min(end_line, total) if end_line is not None else start_line
 
         numbered = [f"{i:4d} | {line}" for i, line in enumerate(selected, start_line)]
 

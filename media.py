@@ -20,7 +20,8 @@ from config import (
     LLAMA_VL_BASE_URL, VL_MODEL, IMAGE_EXTENSIONS,
     VL_ANALYZE_MAX_TOKENS, VL_ANALYZE_TIMEOUT,
     BIN_ELF_REPORT_MAX_CHARS,
-    BIN_ELF_MAX_SECTIONS, BIN_ELF_MAX_FUNCS, BIN_ELF_MAX_OBJS, BIN_ELF_MAX_STRINGS
+    BIN_ELF_MAX_SECTIONS, BIN_ELF_MAX_FUNCS, BIN_ELF_MAX_OBJS, BIN_ELF_MAX_STRINGS,
+    require_pymupdf4llm,
 )
 
 # pyelftools 為可選依賴：若安裝則優先用結構化解析（避開 readelf 文字 regex 的脆弱性），
@@ -1522,6 +1523,34 @@ def ocr_image(path: str) -> str:
         return f"[圖片分析錯誤] {type(e).__name__}: {e}"
 
 
+_PDF_BATCH_PAGES = 16          # 分批解析大小：達輸出上限即停，晚批不付解析成本
+_PDF_ONESHOT_MIN_RESULT = 600  # 最終輸出的絕對下限空間：極小 max_chars 仍能容納導引訊息
+
+
+def _format_page_ranges(nums: List[int], max_ranges: int = 30) -> str:
+    """把頁碼列表壓成範圍摘要：[1,2,3,7,9,10] → "1-3, 7, 9-10"。
+
+    上限 max_ranges 段，超過以「…(共 N 頁)」收尾——逐頁列舉在萬頁 PDF 上
+    光頁碼清單就會炸掉輸出上限。
+    """
+    nums = sorted(nums)
+    ranges: List[Tuple[int, int]] = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        ranges.append((start, prev))
+        start = prev = n
+    ranges.append((start, prev))
+
+    shown = [str(a) if a == b else f"{a}-{b}" for a, b in ranges[:max_ranges]]
+    text = ", ".join(shown)
+    if len(ranges) > max_ranges:
+        text += f", …(共 {len(nums)} 頁)"
+    return text
+
+
 def read_pdf(path: str, max_chars: int = PDF_ONESHOT_MAX_CHARS) -> str:
     """一次性抽 PDF 各頁文字（不寫入 knowledge.json）。
 
@@ -1529,6 +1558,11 @@ def read_pdf(path: str, max_chars: int = PDF_ONESHOT_MAX_CHARS) -> str:
     analyze_file（圖片/binary），想看 PDF 只能 ingest → remove → reload。
     內嵌圖只標註頁碼與張數、不做 VL 分析——要圖片內容請另存 .png 後用
     ocr_image/analyze_file 或 ingest_document(mode="image")。
+
+    max_chars 是真 hard cap：最終字串（含 header、截斷訊息、內嵌圖摘要）
+    保證 ≤ max(max_chars, 600)；600 是導引訊息的最低可讀空間。解析分批
+    進行，達上限即停止——高頁數 PDF 不會為被丟棄的內容卡住 MCP，代價是
+    截斷時內嵌圖統計只涵蓋已解析的頁（輸出會註明）。
     """
     p = _safe_path(path, allow_external=True, allowed_extensions=PDF_EXTENSIONS)
 
@@ -1550,70 +1584,108 @@ def read_pdf(path: str, max_chars: int = PDF_ONESHOT_MAX_CHARS) -> str:
         return f"[PDF 錯誤] 檔案過大: {file_size / 1024 / 1024:.1f}MB (上限 {MAX_PDF_SIZE // 1024 // 1024}MB)"
 
     try:
-        import pymupdf4llm
-    except ImportError:
-        return "[PDF 錯誤] 需要 pymupdf4llm 套件（pip install pymupdf4llm）"
+        pymupdf4llm = require_pymupdf4llm()
+        import pymupdf
+    except (RuntimeError, ImportError) as e:
+        return f"[PDF 錯誤] {e}"
 
-    cache_key = _cache_key(p, ("pdf-oneshot-v1", max_chars))
+    max_chars = max(1, int(max_chars))
+    cache_key = _cache_key(p, ("pdf-oneshot-v2", max_chars))
     cached = _cache_get(_PDF_CACHE, cache_key)
     if cached is not None:
         return cached
 
+    # 只為了 page_count / 密碼檢查開一次，批次解析用 pages= 走檔案路徑
     try:
-        pages = pymupdf4llm.to_markdown(str(p), page_chunks=True, write_images=False)
+        src = pymupdf.open(str(p))
+        try:
+            if src.needs_pass:
+                return f"[PDF 錯誤] 檔案有密碼保護，無法解析: {p.name}"
+            n_total = src.page_count
+        finally:
+            src.close()
     except Exception as e:
         return f"[PDF 錯誤] 無法解析: {type(e).__name__}: {e}"
 
-    parts: List[str] = [
-        f"[PDF] {p.name} 共 {len(pages)} 頁（一次性檢視，未寫入 knowledge.json）"
-    ]
-    image_pages: dict = {}   # 頁碼 → 內嵌圖數
-    used = 0
+    header = f"[PDF] {p.name} 共 {n_total} 頁（一次性檢視，未寫入 knowledge.json）"
+    # 正文預算保留一段給尾端訊息（[已截斷]/內嵌圖摘要），避免最終 clamp 削到它們
+    budget = max_chars - min(400, max_chars // 4)
+
+    body: List[str] = []
+    image_pages: dict = {}      # 頁碼 → 內嵌圖數（只涵蓋已解析的頁）
+    used = len(header)
     truncated_at: Optional[int] = None
+    parsed_through = 0          # 已解析（含內嵌圖統計）的最後一頁
 
-    for page_info in pages:
-        meta = page_info.get("metadata", {}) or {}
-        # pymupdf4llm 新版 key 是 page_number（1-based），舊版是 page（0-based）
-        page_num = meta.get("page_number")
-        if page_num is None:
-            page_num = meta.get("page", 0) + 1
+    for batch_start in range(0, n_total, _PDF_BATCH_PAGES):
+        batch_end = min(batch_start + _PDF_BATCH_PAGES, n_total)
+        try:
+            pages = pymupdf4llm.to_markdown(
+                str(p), page_chunks=True, write_images=False,
+                pages=list(range(batch_start, batch_end)),  # 0-based；輸出 page_number 是絕對 1-based
+            )
+        except Exception as e:
+            return f"[PDF 錯誤] 無法解析: {type(e).__name__}: {e}"
 
-        pics = [b for b in page_info.get("page_boxes") or []
-                if b.get("class") == "picture"]
-        n_pics = len(pics) or len(page_info.get("images") or [])
-        if n_pics:
-            image_pages[page_num] = n_pics
+        for page_info in pages:
+            meta = page_info.get("metadata", {}) or {}
+            # pymupdf4llm 新版 key 是 page_number（1-based），舊版是 page（0-based）
+            page_num = meta.get("page_number")
+            if page_num is None:
+                page_num = meta.get("page", 0) + 1
 
+            pics = [b for b in page_info.get("page_boxes") or []
+                    if b.get("class") == "picture"]
+            n_pics = len(pics) or len(page_info.get("images") or [])
+            if n_pics:
+                image_pages[page_num] = n_pics
+
+            if truncated_at is not None:
+                continue  # 本批剩餘頁只補內嵌圖統計
+
+            text = (page_info.get("text") or "").strip()
+            page_body = text if text else "（本頁無可抽取文字）"
+            if n_pics:
+                page_body += f"\n［本頁含 {n_pics} 張內嵌圖，未做 VL 分析］"
+            block = f"\n--- 第 {page_num} 頁 ---\n{page_body}"
+
+            if used + len(block) > budget:
+                truncated_at = page_num
+                continue
+            body.append(block)
+            used += len(block)
+
+        parsed_through = batch_end
         if truncated_at is not None:
-            continue
+            break  # 之後的批次不再解析：被丟棄的內容不付解析成本
 
-        text = (page_info.get("text") or "").strip()
-        body = text if text else "（本頁無可抽取文字）"
-        if n_pics:
-            body += f"\n［本頁含 {n_pics} 張內嵌圖，未做 VL 分析］"
-        block = f"\n--- 第 {page_num} 頁 ---\n{body}"
-
-        if used + len(block) > max_chars:
-            truncated_at = page_num
-            continue
-        parts.append(block)
-        used += len(block)
-
+    tails: List[str] = []
     if truncated_at is not None:
-        parts.append(
+        tails.append(
             f"\n[已截斷] 第 {truncated_at} 頁起省略（輸出上限 {max_chars} 字元）。"
-            "要完整內容請用 ingest_document 入庫後查詢，"
-            "或用 read_pdf 的 max_chars 參數放寬。"
+            "要完整內容請用 ingest_document 入庫後查詢。"
         )
     if image_pages:
-        pages_str = ", ".join(str(pg) for pg in sorted(image_pages))
-        parts.append(
+        pages_str = _format_page_ranges(list(image_pages))
+        tails.append(
             f"\n[注意] 內嵌圖共 {sum(image_pages.values())} 張（頁 {pages_str}）"
             "未包含在上面文字裡。需要圖片內容時，把該頁另存 .png 後用 "
             "analyze_file 或 ingest_document(mode=\"image\") 處理。"
         )
+    if parsed_through < n_total:
+        tails.append(
+            f"\n[注意] 第 {parsed_through + 1}-{n_total} 頁未解析（達輸出上限即停止），"
+            "內嵌圖統計只涵蓋前面已解析的頁。"
+        )
 
-    result = "\n".join(parts)
+    result = "\n".join([header] + body + tails)
+
+    # 真 hard cap：上面 budget 只管正文，這裡對最終字串做絕對保證
+    limit = max(max_chars, _PDF_ONESHOT_MIN_RESULT)
+    if len(result) > limit:
+        tail_note = "\n[硬截斷] 已達輸出絕對上限。完整內容請用 ingest_document 入庫後查詢。"
+        result = result[: limit - len(tail_note)] + tail_note
+
     _cache_set(_PDF_CACHE, cache_key, result, _PDF_CACHE_MAX)
     return result
 
