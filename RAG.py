@@ -50,15 +50,12 @@ def check_pymupdf4llm():
     """
     try:
         from config import require_pymupdf4llm
-    except ImportError:
-        # 獨立執行且 config 不可用：退回 import-only 檢查（與其他 config fallback 同策略）
-        try:
-            import pymupdf4llm
-            return pymupdf4llm
-        except ImportError:
-            print("[ERROR] 處理 PDF 需要 pymupdf4llm 套件")
-            print('請執行: pip install "pymupdf4llm==1.28.0"')
-            sys.exit(1)
+    except ImportError as exc:
+        # 釘版驗證是安全機制：config 缺失時 fail closed，不退回「只驗 import」
+        # （那會讓任何版本被放行，與「所有 PDF 入口強制釘版」矛盾）。
+        print(f"[ERROR] 無法載入 config.require_pymupdf4llm（釘版驗證必要）: {exc}")
+        print("請在 CodeTrail repo 內執行（config.py 必須可 import）")
+        sys.exit(1)
     try:
         return require_pymupdf4llm()
     except RuntimeError as e:

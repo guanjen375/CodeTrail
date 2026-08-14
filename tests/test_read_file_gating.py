@@ -110,3 +110,63 @@ def test_read_file_survives_stray_binary_byte(tmp_path: Path):
     out = ex.read_file("s.log")
 
     assert "line one ok" in out and "line three ok" in out, out
+
+
+# ============================================================
+# 2026-08-14 GPT review 第二輪：
+# (a) strict UTF-8 decode 成功 ≠ 文字——C0 控制字元 binary 會過關；
+#     尾端容錯只看位置會把 b"\xff" 這種短 binary 放行。
+# (b) MAX_FILE_READ_CHARS 對「單一超長首行」與「指定 end_line 大範圍」失效。
+# ============================================================
+def test_sniff_rejects_single_invalid_byte():
+    from agent_tools import _sniff_text_encoding
+
+    enc, reason = _sniff_text_encoding(b"\xff")
+    assert enc is None, (enc, reason)
+
+
+def test_sniff_still_tolerates_truncated_multibyte_tail():
+    from agent_tools import _sniff_text_encoding
+
+    head = "前面都是正常中文內容。".encode("utf-8")[:-1]  # 尾字被讀取邊界切斷
+    enc, reason = _sniff_text_encoding(head)
+    assert enc == "utf-8", (enc, reason)
+
+
+def test_read_file_rejects_control_byte_binary(tmp_path: Path):
+    """全 \\x01 是合法 UTF-8，但不是文字——要用字元層 printable 比例擋。"""
+    (tmp_path / "ctl.dump").write_bytes(b"\x01" * 8192)
+    ex = ToolExecutor(str(tmp_path))
+
+    out = ex.read_file("ctl.dump")
+
+    assert out.startswith("錯誤"), out
+    assert "控制字元" in out or "二進位" in out, out
+
+
+def test_read_file_clips_single_oversized_line(tmp_path: Path):
+    """單行 150,000 字：以前整行放進輸出（首行豁免），上限形同虛設。"""
+    from config import MAX_FILE_READ_CHARS
+
+    (tmp_path / "one.txt").write_text("x" * 150_000, encoding="utf-8")
+    ex = ToolExecutor(str(tmp_path))
+
+    out = ex.read_file("one.txt")
+
+    assert len(out) <= MAX_FILE_READ_CHARS + 500, len(out)  # 500 = header/footer 餘裕
+    assert "[CTX]" in out and "過長" in out, out[-200:]
+
+
+def test_read_file_explicit_end_line_still_budgeted(tmp_path: Path):
+    """指定 end_line 的大範圍也要受 MAX_FILE_READ_CHARS 保險。"""
+    from config import MAX_FILE_READ_CHARS
+
+    (tmp_path / "many.txt").write_text("0123456789\n" * 30_000, encoding="utf-8")
+    ex = ToolExecutor(str(tmp_path))
+
+    out = ex.read_file("many.txt", 1, 30_000)
+
+    # 原文預算 MAX；行號裝飾每行另計 ~7 字，給 2 倍上限已足以抓「完全沒截」回歸
+    assert len(out) < MAX_FILE_READ_CHARS * 2, len(out)
+    assert "[CTX]" in out, out[-200:]
+    assert "繼續讀取" in out, out[-200:]

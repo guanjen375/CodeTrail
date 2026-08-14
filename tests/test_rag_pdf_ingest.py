@@ -138,3 +138,45 @@ def test_real_pymupdf4llm_contract(tmp_path: Path, capsys):
     assert "內嵌圖" in out, (
         "偵測不到內嵌圖 → pymupdf4llm 的 page_boxes/images schema 又變了"
     )
+
+
+# ============================================================
+# 2026-08-14 GPT review 第二輪：check_pymupdf4llm 的 config fallback
+# 曾退回「只驗 import」——假 999.0.0 module 也會被放行。修正後
+# fail closed：config 缺失直接退出；版本不符也退出。
+# 這兩個測試不依賴真的 pymupdf4llm 套件（乾淨環境也會執行）。
+# ============================================================
+def _fake_pymupdf4llm(monkeypatch, version: str):
+    import sys as _sys
+    import types
+    import importlib.metadata as _md
+
+    fake = types.ModuleType("pymupdf4llm")
+    fake.__version__ = version
+    monkeypatch.setitem(_sys.modules, "pymupdf4llm", fake)
+
+    def _no_dist(_name):
+        raise _md.PackageNotFoundError(_name)
+
+    # 逼 require_pymupdf4llm 走 __version__ fallback，脫離本機真實安裝狀態
+    monkeypatch.setattr(_md, "version", _no_dist)
+    return fake
+
+
+def test_check_pymupdf4llm_rejects_wrong_version(monkeypatch, capsys):
+    _fake_pymupdf4llm(monkeypatch, "999.0.0")
+
+    with pytest.raises(SystemExit) as exc:
+        RAG.check_pymupdf4llm()
+
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "版本不符" in out and "999.0.0" in out, out
+
+
+def test_check_pymupdf4llm_accepts_pinned_version(monkeypatch):
+    import config
+
+    fake = _fake_pymupdf4llm(monkeypatch, config.PYMUPDF4LLM_PIN)
+
+    assert RAG.check_pymupdf4llm() is fake

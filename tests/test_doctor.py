@@ -519,3 +519,31 @@ def test_check_packages_fails_on_pymupdf4llm_pin_mismatch(monkeypatch):
     r2 = doc.Result()
     doc.check_packages(r2)
     assert any("pymupdf4llm" in f and "版本不符" in f for f in r2.fails), (r2.fails, r2.warns)
+
+
+def test_require_pymupdf4llm_verifies_without_real_package(monkeypatch):
+    """釘版驗證不能只在「本機有裝真套件」時才被測到（importorskip 缺口）：
+    用假 module + PackageNotFoundError 走 __version__ fallback 路徑。"""
+    import sys as _sys
+    import types
+    import importlib.metadata as _md
+    import config
+
+    fake = types.ModuleType("pymupdf4llm")
+    fake.__version__ = "999.0.0"
+    monkeypatch.setitem(_sys.modules, "pymupdf4llm", fake)
+
+    def _no_dist(_name):
+        raise _md.PackageNotFoundError(_name)
+
+    monkeypatch.setattr(_md, "version", _no_dist)
+
+    try:
+        config.require_pymupdf4llm()
+    except RuntimeError as e:
+        assert "版本不符" in str(e) and "999.0.0" in str(e)
+    else:
+        raise AssertionError("假 999.0.0 module 必須被釘版驗證擋下")
+
+    fake.__version__ = config.PYMUPDF4LLM_PIN
+    assert config.require_pymupdf4llm() is fake

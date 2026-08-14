@@ -19,7 +19,9 @@ from typing import Optional
 
 import config
 import container_runner
+from media import BINARY_EXTENSIONS, ELF_EXTENSIONS
 from config import (
+    IMAGE_EXTENSIONS,
     MAX_FILE_READ_CHARS, MAX_GREP_RESULTS, MAX_LIST_DEPTH,
     IGNORED_PATTERNS, GREP_DEFAULT_EXTENSIONS, ALLOWED_DOT_DIRS,
     RUN_COMMAND_TIMEOUT, RUN_COMMAND_MAX_OUTPUT,
@@ -323,6 +325,11 @@ _NONTEXT_EXTENSIONS = {
     ".ttf", ".otf", ".woff", ".woff2",
 }
 
+# analyze_file 實際吃得下的格式(media dispatch 四類)。黑名單提示分流用:
+# 在這集合內才導向 analyze_file,其餘(.docx/.zip/.mp4/.sqlite...)老實說
+# 沒有工具能解析,要先轉檔——導向不支援的工具只會讓模型空轉。
+_ANALYZABLE_EXTENSIONS = IMAGE_EXTENSIONS | ELF_EXTENSIONS | BINARY_EXTENSIONS | {".pdf"}
+
 
 def _sniff_text_encoding(head: bytes):
     """判斷檔案開頭 bytes 是否為文字,回 (encoding, None) 或 (None, 拒絕原因)。
@@ -361,15 +368,24 @@ def _sniff_text_encoding(head: bytes):
         return None, "二進位檔(內含 NUL byte)"
 
     try:
-        head.decode("utf-8")
-        return "utf-8", None
+        decoded = head.decode("utf-8")
     except UnicodeDecodeError as e:
-        # head 可能剛好切在多位元組字元中間:只容忍發生在結尾的截斷錯誤
-        if e.start >= len(head) - 3:
-            return "utf-8", None
-        if _text_ratio(head) >= 0.90:
-            return "utf-8", None  # 壞 byte 以 U+FFFD 呈現,不整檔拒絕
-        return None, "非 UTF-8 文字或二進位內容"
+        # 尾端容錯只認「多位元組字元被讀取邊界切斷」:位置在結尾**且** reason
+        # 是 unexpected end of data。單看位置會把 b"\xff" 這種單 byte binary
+        # 放行(檔案夠短時任何錯誤位置都算「在結尾」)。
+        if e.start >= len(head) - 3 and "unexpected end of data" in (e.reason or ""):
+            decoded = head[:e.start].decode("utf-8")
+        elif _text_ratio(head) >= 0.90:
+            decoded = head.decode("utf-8", errors="replace")  # 零星壞 byte 以 U+FFFD 呈現
+        else:
+            return None, "非 UTF-8 文字或二進位內容"
+    # decode 成功不代表是文字:C0 控制字元(\x01...)是合法 UTF-8,
+    # 全控制字元的 binary 會 strict decode 過關。再用字元層 printable 比例擋。
+    if decoded:
+        printable = sum(1 for ch in decoded if ch.isprintable() or ch in "\t\n\r")
+        if printable / len(decoded) < 0.90:
+            return None, "二進位內容(控制字元比例過高)"
+    return "utf-8", None
 
 
 class ToolExecutor:
@@ -456,10 +472,15 @@ class ToolExecutor:
             return (f"錯誤: '{path}' 是 PDF，read_file 只處理純文字。"
                     "想這一輪看一眼用 analyze_file(path)；"
                     "要之後隨時可查用 ingest_document(path)。")
-        if target.suffix.lower() in _NONTEXT_EXTENSIONS:
-            return (f"錯誤: '{path}' 是二進位/非文字格式（{target.suffix.lower()}），"
-                    "read_file 只處理純文字。請改用 analyze_file"
-                    "（圖片/ELF/binary/PDF）或 ingest_document 入庫。")
+        ext = target.suffix.lower()
+        if ext in _NONTEXT_EXTENSIONS:
+            if ext in _ANALYZABLE_EXTENSIONS:
+                return (f"錯誤: '{path}' 是二進位/非文字格式（{ext}），"
+                        "read_file 只處理純文字。請改用 analyze_file"
+                        "（圖片/ELF/binary/PDF）解析。")
+            return (f"錯誤: '{path}' 是二進位/非文字格式（{ext}），read_file 只處理"
+                    "純文字，且 analyze_file/ingest_document 也不支援此格式；"
+                    "請先轉成純文字、PDF 或圖片再處理。")
 
         try:
             with open(target, 'rb') as fb:
@@ -475,10 +496,13 @@ class ToolExecutor:
 
         start_line = max(1, start_line)
         truncated_by_limit = False
+        line_clipped = False
 
         # 單趟 streaming：邊數總行數邊收集目標範圍。用 sniff 出的編碼 +
         # errors='replace' 讀——以前 linecache 走 strict decode，檔案中段
         # 一個壞 byte 會讓「整個檔案」的每一行都靜默變成空字串。
+        # MAX_FILE_READ_CHARS 是硬預算：指定 end_line 的大範圍照樣受限，
+        # 首行本身超限也只放行預算內的前段（不然單行巨檔會整行進 context）。
         selected: list = []
         total = 0
         char_count = 0
@@ -488,16 +512,17 @@ class ToolExecutor:
                     total = i
                     if i < start_line:
                         continue
-                    if end_line is not None:
-                        if i <= end_line:
-                            selected.append(line.rstrip('\n\r'))
+                    if end_line is not None and i > end_line:
                         continue  # 之後只數總行數
                     if truncated_by_limit:
                         continue
-                    char_count += len(line)
-                    if char_count > MAX_FILE_READ_CHARS and selected:
+                    if char_count + len(line) > MAX_FILE_READ_CHARS:
+                        if not selected:
+                            selected.append(line[:MAX_FILE_READ_CHARS].rstrip('\n\r'))
+                            line_clipped = True
                         truncated_by_limit = True
                         continue
+                    char_count += len(line)
                     selected.append(line.rstrip('\n\r'))
         except Exception as e:
             return f"錯誤: {e}"
@@ -511,11 +536,14 @@ class ToolExecutor:
 
         header = f"=== {path} (行 {start_line}-{end_line} / 共 {total} 行) ===\n"
 
-        if end_line < total:
-            if truncated_by_limit:
-                footer = f"\n\n⚠️ [CTX] 因 MAX_FILE_READ_CHARS 限制只讀到第 {end_line} 行。用 read_file('{path}', {end_line + 1}) 繼續讀取。"
-            else:
-                footer = f"\n... 用 read_file('{path}', {end_line + 1}) 繼續"
+        if truncated_by_limit:
+            clip_note = (f"(第 {end_line} 行過長,僅顯示前 {MAX_FILE_READ_CHARS} 字元)"
+                         if line_clipped else "")
+            cont = (f"用 read_file('{path}', {end_line + 1}) 繼續讀取。"
+                    if end_line < total else "")
+            footer = f"\n\n⚠️ [CTX] 因 MAX_FILE_READ_CHARS 限制只讀到第 {end_line} 行{clip_note}。{cont}"
+        elif end_line < total:
+            footer = f"\n... 用 read_file('{path}', {end_line + 1}) 繼續"
         else:
             footer = ""
 
