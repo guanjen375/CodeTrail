@@ -201,3 +201,49 @@ def test_launcher_rejects_duplicate_service_ports(tmp_path):
 
     assert proc.returncode != 0
     assert "share localhost:8081" in proc.stderr
+
+
+def test_legacy_vl_cpu_moe_config_gets_fit_off_and_a_warning(tmp_path):
+    """既有 deployment(CPU-MoE + fit on + gpu_layers auto)不必重跑 set_config:
+
+    llama.cpp 的 --fit 會因為 tensor override 而 abort,而它的預設值是 on ——
+    launcher 必須明寫 --fit off(否則等同 on)、丟掉不會生效的 --fit-target,
+    並且不能靜靜矯正:設定檔與實際行為不一致要講出來。
+    """
+    config = tmp_path / ".config" / "codetrail" / "deployment.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "profile": "defaults",
+                "services": {
+                    "vl": {
+                        "parameters": {
+                            "gpu_layers": "auto",
+                            "parallel": 1,
+                            "fit": "on",
+                            "fit_target": 3072,
+                            "n_cpu_moe": 35,
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    proc = _run(START_AUX, tmp_path, {}, "--dry-run")
+
+    assert proc.returncode == 0, proc.stderr
+    vl_command = next(
+        line for line in proc.stdout.splitlines() if line.startswith("vl_command=")
+    ).split(" ")
+    assert vl_command[vl_command.index("--fit") + 1] == "off"
+    assert vl_command.count("--fit") == 1
+    assert "--fit-target" not in vl_command
+    assert vl_command[vl_command.index("--n-cpu-moe") + 1] == "35"
+    assert "放棄 --fit" in proc.stderr
+
+    # embedding 沒有 CPU-MoE → 完全不受影響,也不該被警告
+    assert "services.embedding" not in proc.stderr

@@ -434,8 +434,6 @@ def _validate_document(data: dict[str, Any], where: str, *, local: bool = False)
                 raise ProfileError(
                     f"{service_where}.parameters.cpu_moe and n_cpu_moe are mutually exclusive"
                 )
-
-
 def _merge(base: dict[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
     merged = dict(base)
     for key, value in overlay.items():
@@ -817,6 +815,42 @@ def bind_host(service: ServiceProfile) -> str:
     return host
 
 
+def cpu_moe_disables_fit(parameters: Mapping[str, Any]) -> bool:
+    """CPU-MoE 是否讓這個 role 的 --fit 失去作用。
+
+    llama.cpp 的 common_params_fit_impl 一看到 model_params::tensor_buft_overrides
+    已被使用者設定就 abort(只印一行 WARN 就繼續載入),而 --cpu-moe / --n-cpu-moe
+    正是往那裡塞 override。n_cpu_moe: 0 不產生任何 override(common/arg.cpp),
+    所以不算。
+    """
+    return bool(parameters.get("cpu_moe") or parameters.get("n_cpu_moe"))
+
+
+def cpu_moe_fit_conflict(service: ServiceProfile) -> str | None:
+    """回傳「設定寫了但不會生效」的說明;沒有衝突回 None。
+
+    刻意不在 schema 層拒絕:config.py 在 import 期就載入 effective profile,
+    硬拒會讓整個 CodeTrail(含 MCP server)無法啟動,而這個組合 llama.cpp 自己
+    是容忍的。改成在 build_server_command 剔除不會生效的旗標 + 由 launcher 提醒。
+    """
+    p = service.parameters
+    if not cpu_moe_disables_fit(p):
+        return None
+    claims = []
+    if p.get("fit") == "on":
+        claims.append('fit "on"' + (f" / fit_target {p['fit_target']}" if "fit_target" in p else ""))
+    if p.get("gpu_layers") == "auto":
+        claims.append('gpu_layers "auto"(fit 不跑時等同「全部層上 GPU」)')
+    if not claims:
+        return None
+    return (
+        f"services.{service.role} 同時設了 CPU-MoE 與 " + "、".join(claims)
+        + ":llama.cpp 會因為 tensor override 而放棄 --fit,這些值不會生效。"
+        "啟動指令已自動剔除不生效的 --fit/--fit-target;"
+        "要讓設定檔與實際行為一致請重跑 ./set_config.sh。"
+    )
+
+
 def build_server_command(
     service: ServiceProfile,
     llama_bin: str,
@@ -850,6 +884,14 @@ def build_server_command(
         command.append("--jinja")
     if p.get("cpu_moe"):
         command.append("--cpu-moe")
+    # CPU-MoE 之下強制 --fit off。--fit 的預設值是 "on",不輸出等同 on,一樣會
+    # 走進 common_params_fit_impl 然後因 tensor override 而 abort(多一次無用嘗試
+    # 加一行嚇人的 WARN);明寫 off 才會真的跳過。fit_target 在 fit off 之下無意義,
+    # 一併不輸出 —— 既有設定檔不必重跑 set_config 也立刻拿到正確的啟動指令。
+    skip: set[str] = set()
+    if cpu_moe_disables_fit(p):
+        skip = {"fit", "fit_target"}
+        command.extend(["--fit", "off"])
     parameter_flags = (
         ("temperature", "--temp"),
         ("top_p", "--top-p"),
@@ -866,7 +908,7 @@ def build_server_command(
         ("threads", "-t"),
     )
     for key, flag in parameter_flags:
-        if key in p:
+        if key in p and key not in skip:
             command.extend([flag, str(p[key]).lower() if isinstance(p[key], bool) else str(p[key])])
     if p.get("no_mmap"):
         command.append("--no-mmap")

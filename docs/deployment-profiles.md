@@ -57,6 +57,11 @@ aicode/doctor 與 `~/start.sh` 各讀一份設定(set_config 偵測到會警告)
   (只印一行 WARN 就繼續載入,而 `-ngl auto` 的語意是「全部層上 GPU」)。因此
   `set_config.sh` 在 VL 套用 CPU-MoE 時會改寫 `gpu_layers: 99` + `fit: "off"`,
   不寫不會生效的 `fit_target`——沒有自動退讓的安全網,層數要自己抓。
+  **既有設定檔不必重跑也會被矯正**:`build_server_command` 在偵測到 CPU-MoE 時一律
+  輸出 `--fit off`(`--fit` 的預設值是 `on`,不輸出等同 on 一樣會 abort)並丟掉
+  `--fit-target`;launcher 另外印出警告,指出設定檔與實際行為不一致。
+  刻意不在 schema 層拒絕:`config.py` 在 import 期就載入 effective profile,
+  硬拒會讓整個 CodeTrail(含 MCP server)無法啟動。
   `set_config.sh` 只在偵測到 MoE expert tensors 時詢問 CPU-MoE(main 與 VL 各一題,
   沒有 y/n 分流,直接問「幾層 experts 留 RAM」;無預設答案,只給一個推薦區間
   (下界 = 權重剛好放得進該 role 所選 GPU 目前 free VRAM 的層數,上界 = 全部移到

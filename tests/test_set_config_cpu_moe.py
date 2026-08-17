@@ -14,7 +14,12 @@ from pathlib import Path
 
 import pytest
 
-from deployment_profile import ProfileError, build_server_command, load_effective_profile
+from deployment_profile import (
+    ProfileError,
+    build_server_command,
+    cpu_moe_fit_conflict,
+    load_effective_profile,
+)
 from scripts import set_config as sc
 
 
@@ -619,6 +624,22 @@ def test_profile_emits_cpu_moe_for_main_and_vl_and_rejects_partial_mix(tmp_path)
     assert vl_command[vl_command.index("--fit") + 1] == "off"
     assert vl_command[vl_command.index("-ngl") + 1] == "99"
     assert "--fit-target" not in vl_command
+    assert vl_command.count("--fit") == 1
+
+    # 既有設定檔(CPU-MoE + fit on + gpu_layers auto)不必重跑 set_config:
+    # build_server_command 直接輸出 --fit off 並丟掉不會生效的 --fit-target。
+    legacy = sc.build_deployment_config(plan)
+    legacy["services"]["vl"]["parameters"].update(
+        {"n_cpu_moe": 4, "fit": "on", "fit_target": 3072, "gpu_layers": "auto"}
+    )
+    local_path.write_text(json.dumps(legacy), encoding="utf-8")
+    legacy_service = load_effective_profile(env).service("vl")
+    legacy_command = build_server_command(legacy_service, "/opt/llama-server", env)
+    assert legacy_command[legacy_command.index("--fit") + 1] == "off"
+    assert "--fit-target" not in legacy_command
+    assert legacy_command.count("--fit") == 1
+    assert cpu_moe_fit_conflict(legacy_service) is not None      # 但仍要提醒使用者
+    assert cpu_moe_fit_conflict(vl_profile.service("vl")) is None
     plan.vl_n_cpu_moe = None
 
     for role in ("embedding", "reranker"):
