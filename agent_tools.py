@@ -22,7 +22,9 @@ import container_runner
 from media import BINARY_EXTENSIONS, ELF_EXTENSIONS
 from config import (
     IMAGE_EXTENSIONS,
-    MAX_FILE_READ_CHARS, MAX_GREP_RESULTS, MAX_LIST_DEPTH,
+    MAX_FILE_READ_CHARS, MAX_GREP_RESULTS,
+    MAX_GREP_LINE_CHARS,
+    MAX_GREP_OUTPUT_CHARS, MAX_LIST_DEPTH,
     IGNORED_PATTERNS, GREP_DEFAULT_EXTENSIONS, ALLOWED_DOT_DIRS,
     RUN_COMMAND_TIMEOUT, RUN_COMMAND_MAX_OUTPUT,
     RUN_COMMAND_TAIL_RATIO, RUN_COMMAND_ERROR_PATTERNS,
@@ -388,6 +390,26 @@ def _sniff_text_encoding(head: bytes):
     return "utf-8", None
 
 
+
+def _clip_grep_line(line: str) -> str:
+    """單行硬上限。grep 的爆量幾乎都來自生成檔的超長行,不是 match 太多。"""
+    if len(line) <= MAX_GREP_LINE_CHARS:
+        return line
+    return line[:MAX_GREP_LINE_CHARS] + f"…[行過長,已截斷 {len(line) - MAX_GREP_LINE_CHARS} 字元]"
+
+
+def _collect_within_budget(lines) -> tuple[list, bool]:
+    """逐行套用行上限並累計總長度,超過整體預算就停手。"""
+    out, total = [], 0
+    for line in lines:
+        clipped = _clip_grep_line(line)
+        if total + len(clipped) + 1 > MAX_GREP_OUTPUT_CHARS:
+            return out, True
+        out.append(clipped)
+        total += len(clipped) + 1
+    return out, False
+
+
 class ToolExecutor:
     def __init__(self, root: str):
         self.root = Path(root).resolve()
@@ -570,7 +592,10 @@ class ToolExecutor:
     def _grep_with_rg(self, pattern: str, target: Path, include_patterns: list,
                       context: int, use_literal: bool) -> tuple[list, int, bool] | str:
         def _run(case_insensitive: bool):
-            cmd = ["rg", "--no-heading", "--color", "never", "--line-number"]
+            # --max-columns 讓 rg 自己就不吐超長行:否則 capture_output 會先把
+            # 整份 stdout(實測可達 1.3 GB)讀進記憶體,之後再截斷已經來不及。
+            cmd = ["rg", "--no-heading", "--color", "never", "--line-number",
+                   "--max-columns", str(MAX_GREP_LINE_CHARS)]
             if context > 0:
                 cmd += ["-C", str(context)]
             for p in include_patterns:
@@ -609,6 +634,7 @@ class ToolExecutor:
         results = []
         match_count = 0
         truncated = False
+        total = 0
         match_line_re = re.compile(r'^.+?:\d+:')
 
         for line in lines:
@@ -617,7 +643,14 @@ class ToolExecutor:
             if match_count > MAX_GREP_RESULTS:
                 truncated = True
                 break
-            results.append(line)
+            # 位元組預算與筆數預算是兩回事:超長行(生成檔/壓縮 JSON)能讓
+            # 25 個 match 撐出 GB 級字串,經 MCP 送出去會把前端打死。
+            clipped = _clip_grep_line(line)
+            if total + len(clipped) + 1 > MAX_GREP_OUTPUT_CHARS:
+                truncated = True
+                break
+            results.append(clipped)
+            total += len(clipped) + 1
 
         return results, match_count, truncated
 
@@ -660,7 +693,9 @@ class ToolExecutor:
             body = "\n".join(results)
             if truncated or match_count >= MAX_GREP_RESULTS:
                 body += (
-                    f"\n\n[CTX] rg 已達 MAX_GREP_RESULTS={MAX_GREP_RESULTS}，結果可能不完整，"
+                    f"\n\n[CTX] rg 結果不完整(上限 MAX_GREP_RESULTS={MAX_GREP_RESULTS}、"
+                    f"MAX_GREP_OUTPUT_CHARS={MAX_GREP_OUTPUT_CHARS}、"
+                    f"單行 MAX_GREP_LINE_CHARS={MAX_GREP_LINE_CHARS})，"
                     f"建議縮小 path/include 或用更精準的 pattern。"
                 )
             return header + body
@@ -691,7 +726,13 @@ class ToolExecutor:
             return f"沒有找到 '{pattern}'"
 
         header = f"=== grep '{pattern}' ({len(results)} 結果) ===\n"
-        body = "\n".join(results)
+        kept, over_budget = _collect_within_budget(results)
+        body = "\n".join(kept)
+        if over_budget:
+            body += (
+                f"\n\n⚠️ [CTX] grep 輸出已達 MAX_GREP_OUTPUT_CHARS={MAX_GREP_OUTPUT_CHARS}，"
+                "結果已截斷。請縮小 path/include 或用更精準的 pattern。"
+            )
 
         if len(results) >= MAX_GREP_RESULTS:
             body += f"\n\n⚠️ [CTX] grep 已達 MAX_GREP_RESULTS={MAX_GREP_RESULTS}，結果可能不完整。建議縮小 path/include 或用更精準的 pattern。"

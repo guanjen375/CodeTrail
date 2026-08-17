@@ -273,6 +273,12 @@ CUSTOM_SYSTEM_RULES_MAX_CHARS = 4000 # 規則檔案最大字元數
 MAX_TOOL_LOOPS = 16                  # Agent 最大工具回合數（調整: 10->16，鼓勵多查證再答）
 MAX_FILE_READ_CHARS = 50000
 MAX_GREP_RESULTS = 30
+# grep 輸出的硬預算。MAX_GREP_RESULTS 只限制「match 筆數」,不限制位元組:
+# 生成檔/壓縮 JSON 這類超長行的專案,25 個 match 就能撐出 1.3 GB 字串,
+# 經 MCP stdio 送出去會把前端打死(實測 OpenCode 的 worker thread 99% 空轉)。
+# 與 read_file 的 MAX_FILE_READ_CHARS 同一個概念:單行先截斷,整體再設上限。
+MAX_GREP_LINE_CHARS = 500        # 單行超過就截斷(context 行與 match 行同樣適用)
+MAX_GREP_OUTPUT_CHARS = 200_000  # 整體輸出上限;超過即停止收集並標明已截斷
 MAX_LIST_DEPTH = 3
 
 # Messages 總預算（字元數，粗估 1 token ≈ 3-4 chars）
