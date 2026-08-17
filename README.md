@@ -40,8 +40,8 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 - 管理指令都掛在 `~/start.sh` 上:`~/start.sh status`(檢查四個 server)、`~/start.sh stop`(全部關閉,= `scripts/stop_servers.py`,關掉主模型 + 三顆附屬模型的所有 tmux 視窗,並**等到 process 退出、VRAM 從 nvidia-smi 消失才返回** — 大模型釋放記憶體需要數十秒是正常的,期間會印進度)、`~/start.sh logs [role] [-f]`(看 server log)、`~/start.sh help`(子命令說明)。
 - **TUI 或 web 之前都要先啟動四個模型 server。**標準產物是 `~/start.sh`,所以 A 機每次開機後先跑 `~/start.sh`。如果你把這支檔案放在桌面,等價做法是先在桌面終端 `cd ~/Desktop && ./start.sh`；下文假設這一步已完成。
 - 重新啟動前要先 `~/start.sh stop`,tmux session 還在時 `~/start.sh` 會拒絕重複啟動;若是啟動中途失敗,launcher 會自動清理本次啟動的服務,修正後直接重跑即可。
-- **同一個專案目錄不要同時開 `aicode` 與 `aicode_web`。** 兩者是各自獨立的 OpenCode 行程,卻共用同一份 session 資料庫(`~/.local/share/opencode/opencode.db`),而且裡面沒有持有者/鎖欄位(`event_sequence.owner_id` 全為 NULL)——同時操作同一個 session 沒有任何隔離。收工用 `aicode_web stop --force`(`--force` 會一併清掉 backend 底下殘留的 `mcp_server.py` 子行程;長時間不關會累積)。
-- **兩邊看到的 session 清單本來就不一樣,不是壞掉**:web 依 **project** 列出,TUI 依**目錄**列出。而 OpenCode 只為 git repo 建立獨立 project,**非 git 的目錄會全部擠進同一個 catch-all project**,所以在 web 會看到其他非 git 目錄的 session 混進來。要讓兩邊一致就把該目錄 `git init`。
+- **同一個目錄不要同時開 `aicode` 與 `aicode_web`**:兩者共用同一份 session 資料庫且沒有鎖,同開會互相干擾。收工用 `aicode_web stop --force`(順便清掉殘留的 MCP 子行程)。
+- 兩邊看到的 **session 清單不一樣是正常的**(web 依 project 列、TUI 依目錄列);非 git 目錄會共用同一個 project,`git init` 後才會一致。
 
 ## 0. OpenCode TUI 部署路線圖
 
