@@ -247,3 +247,70 @@ def test_legacy_vl_cpu_moe_config_gets_fit_off_and_a_warning(tmp_path):
 
     # embedding 沒有 CPU-MoE → 完全不受影響,也不該被警告
     assert "services.embedding" not in proc.stderr
+
+
+def _write_vl_cpu_moe_config(tmp_path: Path, parameters: dict) -> None:
+    config = tmp_path / ".config" / "codetrail" / "deployment.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "profile": "defaults",
+                "services": {"vl": {"parameters": parameters}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_cpu_moe_without_explicit_fit_still_warns(tmp_path):
+    """省略 fit 不代表沒事:llama.cpp 的預設就是 on,一樣會 abort。
+    只留 fit_target 也會被丟掉,兩者都不能靜默矯正。"""
+    _write_vl_cpu_moe_config(
+        tmp_path, {"gpu_layers": 99, "parallel": 1, "fit_target": 3072, "n_cpu_moe": 4}
+    )
+
+    proc = _run(START_AUX, tmp_path, {}, "--dry-run")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "fit 未設定(llama.cpp 預設即 on)" in proc.stderr
+    assert "fit_target 3072(不會被保留)" in proc.stderr
+    vl_command = next(
+        line for line in proc.stdout.splitlines() if line.startswith("vl_command=")
+    ).split(" ")
+    assert vl_command[vl_command.index("--fit") + 1] == "off"
+    assert "--fit-target" not in vl_command
+
+
+def test_set_config_shaped_cpu_moe_config_is_not_warned(tmp_path):
+    """set_config 產生的形狀(fit off / 明確 gpu_layers / 無 fit_target)沒有衝突,
+    不該每次啟動都噴警告。"""
+    _write_vl_cpu_moe_config(
+        tmp_path, {"gpu_layers": 99, "parallel": 1, "fit": "off", "n_cpu_moe": 4}
+    )
+
+    proc = _run(START_AUX, tmp_path, {}, "--dry-run")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "放棄 --fit" not in proc.stderr
+
+
+def test_systemd_exec_path_also_warns_before_launching(tmp_path):
+    """文件支援的 systemd 路徑(deployment_profile.py exec)只呼叫 build_server_command,
+    少了警告就等於靜默矯正 —— 這裡釘住它會先印警告再 exec。"""
+    _write_vl_cpu_moe_config(
+        tmp_path,
+        {"gpu_layers": "auto", "parallel": 1, "fit": "on", "fit_target": 3072, "n_cpu_moe": 4},
+    )
+    env = _clean_env(tmp_path)
+    # exec 會 os.execvpe;指到一個一定不存在的 binary,警告仍必須先印出來。
+    proc = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "deployment_profile.py"), "exec", "vl",
+         "--llama-bin", str(tmp_path / "no-such-llama-server")],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=15, check=False,
+    )
+
+    assert "[deployment-profile] ⚠" in proc.stderr
+    assert 'gpu_layers "auto"' in proc.stderr
+    assert "重跑 ./set_config.sh" in proc.stderr

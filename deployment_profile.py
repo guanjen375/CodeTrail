@@ -837,8 +837,14 @@ def cpu_moe_fit_conflict(service: ServiceProfile) -> str | None:
     if not cpu_moe_disables_fit(p):
         return None
     claims = []
-    if p.get("fit") == "on":
-        claims.append('fit "on"' + (f" / fit_target {p['fit_target']}" if "fit_target" in p else ""))
+    # --fit 的預設值是 "on":省略 fit 與明寫 fit "on" 一樣會走進 fit 然後 abort,
+    # 兩者都會被 build_server_command 改寫成 --fit off,所以都要說。
+    if p.get("fit", "on") != "off":
+        claims.append(
+            'fit "on"(明寫)' if "fit" in p else "fit 未設定(llama.cpp 預設即 on)"
+        )
+    if "fit_target" in p:
+        claims.append(f"fit_target {p['fit_target']}(不會被保留)")
     if p.get("gpu_layers") == "auto":
         claims.append('gpu_layers "auto"(fit 不跑時等同「全部層上 GPU」)')
     if not claims:
@@ -846,9 +852,23 @@ def cpu_moe_fit_conflict(service: ServiceProfile) -> str | None:
     return (
         f"services.{service.role} 同時設了 CPU-MoE 與 " + "、".join(claims)
         + ":llama.cpp 會因為 tensor override 而放棄 --fit,這些值不會生效。"
-        "啟動指令已自動剔除不生效的 --fit/--fit-target;"
+        "啟動指令已自動改寫成 --fit off 並剔除 --fit-target;"
         "要讓設定檔與實際行為一致請重跑 ./set_config.sh。"
     )
+
+
+def warn_cpu_moe_fit_conflicts(
+    services: Sequence[ServiceProfile], *, prefix: str = "[!]"
+) -> None:
+    """把「設定檔寫了但不會生效」印到 stderr。
+
+    每一條真的會啟動 server 的路徑都要呼叫(launch_servers 與
+    `deployment_profile.py exec` 的 systemd 路徑),否則就變成靜默矯正。
+    """
+    for service in services:
+        conflict = cpu_moe_fit_conflict(service)
+        if conflict:
+            print(f"{prefix} ⚠ {conflict}", file=sys.stderr)
 
 
 def build_server_command(
@@ -1019,8 +1039,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             value = getattr(profile.service(args.role), args.field)
             print("" if value is None else value)
         elif args.command == "exec":
+            service = profile.service(args.role)
+            # systemd 之類的 supervisor 只會走這裡:少了這行就等於靜默矯正。
+            warn_cpu_moe_fit_conflicts([service], prefix="[deployment-profile]")
             command = build_server_command(
-                profile.service(args.role),
+                service,
                 args.llama_bin,
                 os.environ,
                 must_exist=True,

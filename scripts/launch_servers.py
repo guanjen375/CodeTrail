@@ -27,9 +27,9 @@ from deployment_profile import (  # noqa: E402
     ProfileError,
     ServiceProfile,
     build_server_command,
-    cpu_moe_fit_conflict,
     load_effective_profile,
     resolve_model_reference,
+    warn_cpu_moe_fit_conflicts,
 )
 from scripts import stop_servers  # noqa: E402
 
@@ -204,14 +204,6 @@ def _check_port_collisions(services: Sequence[ServiceProfile]) -> None:
                 f"services {seen[key]} and {service.role} share {host}:{service.port}"
             )
         seen[key] = service.role
-
-
-def _warn_cpu_moe_fit_conflicts(services: Sequence[ServiceProfile]) -> None:
-    """設定檔寫了 --fit/auto 但 CPU-MoE 讓它不會生效:啟動指令已矯正,但不能不說。"""
-    for service in services:
-        conflict = cpu_moe_fit_conflict(service)
-        if conflict:
-            print(f"[!] ⚠ {conflict}", file=sys.stderr)
 
 
 def _command_for(
@@ -418,7 +410,7 @@ def launch(
     llama_bin = environ.get("LLAMA_BIN") or str(Path.home() / "llama.cpp" / "build" / "bin" / "llama-server")
     services = [profile.service(role) for role in roles]
     _check_port_collisions(services)
-    _warn_cpu_moe_fit_conflicts(services)
+    warn_cpu_moe_fit_conflicts(services)
     if dry_run:
         _print_dry_run(profile, roles, llama_bin, environ)
         return

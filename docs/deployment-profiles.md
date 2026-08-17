@@ -59,7 +59,12 @@ aicode/doctor 與 `~/start.sh` 各讀一份設定(set_config 偵測到會警告)
   不寫不會生效的 `fit_target`——沒有自動退讓的安全網,層數要自己抓。
   **既有設定檔不必重跑也會被矯正**:`build_server_command` 在偵測到 CPU-MoE 時一律
   輸出 `--fit off`(`--fit` 的預設值是 `on`,不輸出等同 on 一樣會 abort)並丟掉
-  `--fit-target`;launcher 另外印出警告,指出設定檔與實際行為不一致。
+  `--fit-target`;**每一條會真的啟動 server 的路徑**都會先印警告
+  (`launch_servers.py` 與文件支援的 systemd `deployment_profile.py exec`),
+  不做靜默矯正。警告條件涵蓋「明寫 `fit: "on"`」「**省略 fit**(llama.cpp 預設即
+  `on`)」「只留 `fit_target`」「`gpu_layers: "auto"`」;
+  `set_config.sh` 產生的形狀(`fit: "off"` + 明確 `gpu_layers` + 無 `fit_target`)
+  沒有衝突,不會每次啟動噴警告。
   刻意不在 schema 層拒絕:`config.py` 在 import 期就載入 effective profile,
   硬拒會讓整個 CodeTrail(含 MCP server)無法啟動。
   `set_config.sh` 只在偵測到 MoE expert tensors 時詢問 CPU-MoE(main 與 VL 各一題,
