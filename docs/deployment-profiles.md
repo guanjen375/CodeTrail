@@ -46,6 +46,7 @@ aicode/doctor 與 `~/start.sh` 各讀一份設定(set_config 偵測到會警告)
 - `gpu_role`：只能是 `main` 或 `aux`。
 - `ctx`、`batch`、`ubatch`：正整數或明確 `null`；`null` 代表不傳該 llama.cpp flag。
 - `parameters`：role-specific allowlist；未知 key 直接拒絕。四個 role 都支援
+  `gpu_layers`(→ `-ngl`)、`flash_attention`(→ `-fa`)、`no_mmap`(→ `--no-mmap`)、
   `parallel`(→ `-np`)；main 另支援新版
   llama.cpp 的自動 VRAM 配置:`gpu_layers` 可為整數或 `"auto"`(`-ngl auto`)、
   `fit`(`"on"`/`"off"` → `--fit`)、`fit_target`(MiB → `--fit-target`)、
@@ -78,6 +79,11 @@ aicode/doctor 與 `~/start.sh` 各讀一份設定(set_config 偵測到會警告)
   `0` = 不 offload(不寫任何 CPU-MoE 鍵)、`N` = `n_cpu_moe: N`、
   輸入超過最大 blk 編號(或 build 不支援 `--n-cpu-moe`)→ `cpu_moe: true`。
   放不放得下 VRAM 以啟動後 `nvidia-smi` 實測為準。
+- `no_mmap`(→ `--no-mmap`)屬**使用者領域**,`set_config.sh` 從不自動決定:代價是啟動時要把整份
+  權重讀進 RAM,換來 MoE 首次推論不必從 SSD 逐頁 page-in(TTFT 1–2 分鐘 → 5–15 秒)。
+  套了 CPU-MoE 卻沒設時 `set_config.sh` 會警告(llama.cpp 自己也會印
+  `tensor overrides to CPU are used with mmap enabled`);**手動加在 main 或 vl 的設定,重跑
+  `set_config.sh` 會保留**(`_PRESERVED_KEYS_BY_ROLE`),不會被當成「未涵蓋鍵」丟掉。
 - main 的 `threads`(→ `-t`)**從來不是設定時的問題**,只有 `set_config.sh --threads N`
   明確指定時才會寫入。未指定 = auto:不傳 `-t`,llama.cpp 的預設 `-1` 會自己偵測
   (x86_64 Linux 上 hybrid CPU 只算 P-core,否則用實體核心數、排除 HT siblings),

@@ -120,7 +120,26 @@ nvidia-smi -l 1                                              # GPU 是否在動
 
 若 slot 都 idle、GPU 0% 連續超過 30 秒,代表請求**沒打到 server**(問題在 OpenCode / MCP 層,不是 llama-server)。看 OpenCode log:`ls -t ~/.local/share/opencode/log/*.log | head -1`。
 
-長期解法:重啟主 server 加 `--no-mmap`,前期載入慢 1.5–2.5 分鐘(把 ~135GB weights 全讀進 RAM),之後 TTFT 穩定在 5–15 秒。RAM 不夠 135GB 的就保持 mmap 接受偶爾卡頓,或換較小模型。
+長期解法:把 `no_mmap` 加進該 role 的 deployment 參數。**不要手動改 llama-server 指令** ——
+`~/start.sh` 的 argv 每次都由 `~/.config/codetrail/deployment.json` 重新產生,手改會被下次啟動蓋掉。
+
+```bash
+# 編輯 ~/.config/codetrail/deployment.json,在該 role 的 parameters 加一行:
+#   "services": { "main": { "parameters": { ..., "no_mmap": true } } }
+python3 deployment_profile.py validate     # 確認 schema 過
+
+# 改 main 的:整組重啟
+~/start.sh stop && ~/start.sh
+# 只改 vl 的:不必動主模型,重啟三顆附屬即可
+~/start.sh stop --scope aux && ~/start.sh --scope aux
+```
+
+**main 與 vl 都適用** —— VL 一旦套用 CPU-MoE(`--vl-n-cpu-moe` / `--vl-cpu-moe`)就會踩到同一個坑。
+`set_config.sh` 偵測到「開了 CPU-MoE 卻沒設 no_mmap」時會直接警告並附上這個做法;它**不會替你決定**
+(代價是啟動時要把整份權重讀進 RAM),但重跑 `set_config.sh` 會**保留**你手動加的 `no_mmap`。
+
+代價:前期載入慢 1.5–2.5 分鐘(把整份 weights 讀進 RAM),之後 TTFT 穩定在 5–15 秒。
+RAM 不夠的就保持 mmap 接受偶爾卡頓,或換較小模型 / 調高 CPU-MoE 層數。
 
 <a id="mcp-connected-but-no-tool-call"></a>
 

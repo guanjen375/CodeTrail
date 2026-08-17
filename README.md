@@ -622,7 +622,9 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 第一個請求**首字延遲(TTFT)**:
 
 - 用 `--no-mmap` 模式:約 5–15 秒
-- 用 mmap 模式(沒加 `--no-mmap`):**第一次可能要 1–2 分鐘**,因為要從 SSD page-in MoE expert weights。畫面上 frontend 可能顯示「`...esc interrupt`」或類似等待狀態,**不要按 Esc**,等就對了
+- 用 mmap 模式(沒加 `--no-mmap`,**這是預設**):**第一次可能要 1–2 分鐘**,因為要從 SSD page-in MoE expert weights。畫面上 frontend 可能顯示「`...esc interrupt`」或類似等待狀態,**不要按 Esc**,等就對了
+
+要改成 `--no-mmap`,是在 `~/.config/codetrail/deployment.json` 的 `services.<main|vl>.parameters` 加 `"no_mmap": true`(不是手動改 llama-server 指令 —— argv 每次由 deployment 重新產生)。CodeTrail **不替你決定**這一項,但套了 CPU-MoE 卻沒設時 `set_config.sh` 會警告,而且重跑會保留你的設定。詳見 [docs/troubleshooting.md](docs/troubleshooting.md)。
 
 如果想驗證 MCP transport 有沒有連上:OpenCode TUI 輸入 `/status`,應看到 `codetrail Connected`。**Connected 只代表 MCP 子行程完成連線,不代表模型在這一輪真的發出 tool call。** 真正執行時應看到 frontend 的工具卡 / 結果;若模型只印出 `<codetrail_list_dir .../>` 再用文字宣稱成功,那是假工具呼叫,照 [troubleshooting 的分層檢查](docs/troubleshooting.md#mcp-connected-but-no-tool-call)處理。
 
