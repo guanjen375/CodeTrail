@@ -63,7 +63,9 @@ _ROLE_PARAMETERS = {
     "embedding": _COMMON_PARAMETERS | {"embedding", "pooling"},
     "reranker": _COMMON_PARAMETERS | {"embedding", "pooling", "reranking"},
     # VL 最後啟動，可用 llama.cpp --fit 依前兩個 aux 的實際占用保留 VRAM。
-    "vl": _COMMON_PARAMETERS | {"fit", "fit_target"},
+    # MoE VL 模型同樣可以把 experts 釘進 RAM：--fit 會把 expert 的 buffer
+    # override 一併算進 fit 計算，兩者可以並存。
+    "vl": _COMMON_PARAMETERS | {"fit", "fit_target", "cpu_moe", "n_cpu_moe"},
 }
 _BARE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,191}$")
 _GPU_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:,\-]{0,255}$")

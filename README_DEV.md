@@ -65,7 +65,7 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 - `tests/test_deployment_status.py` — port/cmdline role 辨識、錯卡/錯模型;process 與 HTTP 都用 hook
 - `tests/test_profile_server_launchers.py` — launch_servers / stop_servers 各 `--scope` 的離線 dry-run 相容性(含壞設定檔時 stop 退路)
 - `tests/test_set_config.py` — `set_config.sh` 的前置檢查(llama-server/依賴缺失通知)、GPU/模型偵測分類、shard 齊全性、mmproj 多重配對、純問答契約(使用者選擇題無預設值、reranker internal buffer 不提問、選項外輸入重問、`--yes` 缺旗標指名報錯、超大配置不被容量擋下)、start.sh 結尾 nvidia-smi 提醒、VL 不自動當 main、摘要確認/離開、opencode.json 合併、bind 安全預設、legacy env 清除、transaction restore 與 end-to-end dry-run;I/O 全用 fixture
-- `tests/test_set_config_cpu_moe.py` — 主模型 CPU-MoE 分流(MoE 才詢問、y/n 必答、dense 給 `--cpu-moe` 旗標要報錯)、GGUF expert tensor 解析(含 per-layer 編號與 split shard)、choose_n_cpu_moe 純輸入驗證(0..1024、超過最大 blk 編號=全放 RAM)、build_main_parameters 參數組裝、`cpu_moe`/`n_cpu_moe` main-only schema/argv;完全離線且大檔用 sparse fixture
+- `tests/test_set_config_cpu_moe.py` — CPU-MoE 只問層數(MoE 才詢問、dense 印原因略過、dense 給非 0 旗標要報錯)、GGUF expert tensor 解析(含 per-layer 編號與 split shard)、choose_cpu_moe_layers 純輸入驗證(0-1024;0=不 offload、≥ 層數上限=全放 RAM、build 缺旗標時的降級)、build_main_parameters 參數組裝、`cpu_moe`/`n_cpu_moe` 的 main+vl schema/argv(embedding/reranker 拒絕);完全離線且大檔用 sparse fixture
 - `tests/test_launch_rollback.py` — launcher 啟動失敗的 rollback(pipe-pane 持久 log、清理本次 tmux session、`AICODE_NO_ROLLBACK`)與依模型大小放大的 health timeout;tmux 用 monkeypatch
 
 ---

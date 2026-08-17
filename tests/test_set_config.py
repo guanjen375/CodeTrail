@@ -39,8 +39,9 @@ _PROFILE_ENV_KEYS = set(RUNTIME_OVERRIDE_ENV_KEYS) | {
     "OPENCODE_CONFIG",  # set_config 會尊重它;開發機殼層若有設定不得洩漏進測試
 }
 
-# --yes 的主模型數值旗標(使用者題沒有預設值 → 非互動一律得給)。
-NUM_FLAGS = ("--ctx", "65536", "--threads", "8")
+# --yes 的數值旗標(使用者題沒有預設值 → 非互動一律得給)。
+# threads 已不是使用者題(未給 --threads 就不寫 -t)。
+NUM_FLAGS = ("--ctx", "65536", "--rerank-ctx", "8192")
 # 標準 fixture(TWO_GPUS + _make_models):main 有 2 個候選(big-chat + VL)、
 # reranker 有 2 個(bge + qwen3)、兩顆 GPU → 這些都要旗標;
 # embedding / VL 只有一個候選會自動選用。
@@ -52,12 +53,14 @@ YES_TWO_GPU = (
 # 單 GPU fixture:GPU 自動選用,只剩模型與數值。
 YES_ONE_GPU = ("--yes", "--main-model", "1", "--rerank-model", "1", *NUM_FLAGS)
 
-# 標準 fixture 的互動作答順序:
-# main 編號、main GPU、embed GPU、reranker 編號、reranker GPU、VL GPU、
-# 主模型 ctx、threads、摘要確認。reranker internal buffer 自動使用 8192。
-# (big-chat 是非 GGUF 假檔 → 無法解析 layout → 不會問 CPU-MoE;
-#  embedding / VL 單一候選自動選用。)
-STDIN_STANDARD = "1\n0\n1\n1\n1\n1\n65536\n8\n\n"
+# 標準 fixture 的互動作答順序(一個角色問完才換下一個):
+#   [1/4] main 編號、main GPU、主模型 ctx
+#   [2/4] embed GPU(唯一候選自動選用)
+#   [3/4] reranker 編號、reranker GPU、reranker internal buffer
+#   [4/4] VL GPU(唯一候選/唯一 mmproj 自動選用)
+#   摘要確認
+# (big-chat / vl-model 都是非 GGUF 假檔 → 無法解析 layout → 不會問 CPU-MoE。)
+STDIN_STANDARD = "1\n0\n65536\n1\n1\n1\n8192\n1\n\n"
 
 
 def _sparse(path: Path, size: int) -> None:
@@ -228,9 +231,14 @@ def test_help_is_offline_and_exits_zero(tmp_path):
     assert "--models-dir" in proc.stdout
     assert "--cpu-moe" in proc.stdout
     assert "--n-cpu-moe" in proc.stdout
+    assert "--vl-cpu-moe" in proc.stdout
+    assert "--vl-n-cpu-moe" in proc.stdout
     assert "--allow-remote" in proc.stdout
     assert "--rerank-ctx" in proc.stdout
     assert "--n-ctx" in proc.stdout
+    # 範圍顯示統一用 "-" 連接上下限,不再用 ".."
+    assert "1024-1048576" in proc.stdout
+    assert "1024..1048576" not in proc.stdout
     # 容量/建議機制已移除:相關旗標不得再出現
     assert "--advanced" not in proc.stdout
     assert "--ignore-capacity" not in proc.stdout
@@ -262,7 +270,8 @@ def test_yes_run_generates_all_artifacts(tmp_path):
     assert services["main"]["model"] == "big-chat-ud-q4-k-xl"
     assert services["main"]["ctx"] == 65536
     assert services["main"]["parameters"]["jinja"] is True
-    assert services["main"]["parameters"]["threads"] == 8
+    # 沒給 --threads → 不寫 -t,交給 llama.cpp 自己的預設
+    assert "threads" not in services["main"]["parameters"]
     assert services["main"]["parameters"]["gpu_layers"] == 99
     assert services["embedding"]["model"] == str(models / "bge-m3" / "bge-m3-f16.gguf")
     assert services["reranker"]["model"].endswith("bge-reranker-v2-m3-Q8_0.gguf")
@@ -333,10 +342,19 @@ def test_yes_missing_value_errors_name_the_flag(tmp_path):
     no_ctx = _run(
         tmp_path, "--yes", "--main-model", "1", "--rerank-model", "1",
         "--main-gpu", "0", "--embed-gpu", "1", "--rerank-gpu", "1", "--vl-gpu", "1",
-        "--threads", "8", "--rerank-ctx", "8192", "--models-dir", str(models),
+        "--rerank-ctx", "8192", "--models-dir", str(models),
     )
     assert no_ctx.returncode == 2
     assert "--ctx" in no_ctx.stderr
+
+    # reranker internal buffer 現在也是使用者題 → 缺 --rerank-ctx 一樣報錯
+    no_rerank_ctx = _run(
+        tmp_path, "--yes", "--main-model", "1", "--rerank-model", "1",
+        "--main-gpu", "0", "--embed-gpu", "1", "--rerank-gpu", "1", "--vl-gpu", "1",
+        "--ctx", "65536", "--models-dir", str(models),
+    )
+    assert no_rerank_ctx.returncode == 2
+    assert "--rerank-ctx" in no_rerank_ctx.stderr
 
 
 def test_vl_hint_order_sorts_candidates_first(tmp_path):
@@ -451,22 +469,31 @@ def test_interactive_flow_answers_everything_and_validates_ranges(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
 
-    # main 先按 Enter(無效)再輸入 3(超出 1..2,無效)才輸入 1;
+    # main 先按 Enter(無效)再輸入 3(超出 1-2,無效)才輸入 1;
     # main GPU 先輸入 5(不存在)再輸入 0;其餘照標準作答。
-    stdin = "\n3\n1\n5\n0\n1\n1\n1\n1\n65536\n8\n\n"
+    stdin = "\n3\n1\n5\n0\n65536\n1\n1\n1\n8192\n1\n\n"
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models), stdin=stdin)
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "【主聊天模型】 — 偵測到的候選" in proc.stdout
-    assert "編號只有 1..2" in proc.stdout          # 選項 1/2 輸入 3 → 重問
+    assert "編號只有 1-2" in proc.stdout           # 選項 1/2 輸入 3 → 重問
     assert "無效的 GPU index" in proc.stdout       # GPU 0/1 輸入 5 → 重問
     assert "只有一個候選,自動選用" in proc.stdout  # embedding / VL 唯一候選
     assert "設定摘要" in proc.stdout
     assert "(預設)" not in proc.stdout             # 不再有任何預設標記
     assert "建議配置" not in proc.stdout           # 不再有建議配置頁
+    # 一個角色問完才換下一個(四段標題依序出現)
+    for step, title in ((1, "主聊天模型"), (2, "embedding 模型"),
+                        (3, "reranker 模型"), (4, "VL 模型")):
+        assert f"=== [{step}/4] {title} ===" in proc.stdout
+    assert (
+        proc.stdout.index("=== [1/4]") < proc.stdout.index("=== [2/4]")
+        < proc.stdout.index("=== [3/4]") < proc.stdout.index("=== [4/4]")
+    )
     assert (tmp_path / "home" / "start.sh").exists()
     deployment = _read_deployment(tmp_path)
     assert deployment["services"]["main"]["ctx"] == 65536
-    assert deployment["services"]["main"]["parameters"]["threads"] == 8
+    assert "threads" not in deployment["services"]["main"]["parameters"]
+    assert deployment["services"]["reranker"]["ctx"] == 8192
 
 
 def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
@@ -486,7 +513,7 @@ def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
         cwd=REPO_ROOT,
         env={**_env(tmp_path), "HOME": str(home2), "USERPROFILE": str(home2)},
         # 全部答完,摘要頁按 q → 不寫入
-        input="1\n0\n1\n1\n1\n1\n65536\n8\nq\n",
+        input="1\n0\n65536\n1\n1\n1\n8192\n1\nq\n",
         capture_output=True,
         text=True,
         timeout=60,
@@ -504,7 +531,7 @@ def test_summary_invalid_input_reprompts_instead_of_aborting(tmp_path):
     models = _make_models(tmp_path)
     proc = _run(
         tmp_path, "--no-preview", "--models-dir", str(models),
-        stdin="1\n0\n1\n1\n1\n1\n65536\n8\nzz\nq\n",
+        stdin="1\n0\n65536\n1\n1\n1\n8192\n1\nzz\nq\n",
     )
     assert proc.returncode == 0, proc.stderr
     assert "無效輸入 'zz'" in proc.stdout
@@ -575,7 +602,7 @@ def test_cpu_moe_mode_requires_llama_cpu_moe_flag(tmp_path):
     # 但 build 不支援就要硬停。
     proc = _run(
         tmp_path, "--yes", "--cpu-moe", "--no-preview", "--models-dir", str(models),
-        "--main-model", "1", "--main-gpu", "0",
+        "--main-model", "1", "--main-gpu", "0", "--ctx", "65536",
     )
 
     assert proc.returncode == 2
@@ -675,7 +702,9 @@ def test_no_capacity_estimation_oversized_configs_pass_through(tmp_path):
     combined = proc.stdout + proc.stderr
     assert "容量判定" not in combined
     assert "容量預估" not in combined
-    assert "不做容量估算" in proc.stdout
+    # 估算只當參考,不當判定:數字仍以啟動後 nvidia-smi 實測為準
+    assert "找起點用的粗估" in proc.stdout
+    assert "nvidia-smi 實測為準" in proc.stdout
     parameters = _read_deployment(tmp_path)["services"]["main"]["parameters"]
     assert parameters["gpu_layers"] == 99      # 不再退 --fit 自動配置
     assert "fit_target" not in parameters
@@ -683,7 +712,7 @@ def test_no_capacity_estimation_oversized_configs_pass_through(tmp_path):
 
 
 def test_yes_moe_main_requires_explicit_mode_flag(tmp_path):
-    """MoE 主模型的運行模式沒有預設:--yes 必須用旗標指定,不再自動選。"""
+    """MoE 主模型的 CPU-MoE 層數沒有預設:--yes 必須用旗標指定,不再自動選。"""
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
     _sparse_moe_gguf(
@@ -697,7 +726,8 @@ def test_yes_moe_main_requires_explicit_mode_flag(tmp_path):
 
     proc = _run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models))
     assert proc.returncode == 2
-    assert "--cpu-moe / --no-cpu-moe / --n-cpu-moe" in proc.stderr
+    assert "--n-cpu-moe" in proc.stderr
+    assert "--cpu-moe / --no-cpu-moe" in proc.stderr
 
     forced = _run(tmp_path, *YES_TWO_GPU, "--cpu-moe", "--no-preview",
                   "--models-dir", str(models))
@@ -707,6 +737,14 @@ def test_yes_moe_main_requires_explicit_mode_flag(tmp_path):
     assert deployment["services"]["main"]["parameters"]["fit"] == "off"
     for role in ("embedding", "reranker", "vl"):
         assert "cpu_moe" not in deployment["services"][role].get("parameters", {})
+
+    # 0 = 不 offload:與 --no-cpu-moe 同義,不寫任何 CPU-MoE 鍵。
+    zero = _run(tmp_path, *YES_TWO_GPU, "--n-cpu-moe", "0", "--no-preview",
+                "--models-dir", str(models))
+    assert zero.returncode == 0, zero.stderr + zero.stdout
+    main_params = _read_deployment(tmp_path)["services"]["main"]["parameters"]
+    assert "cpu_moe" not in main_params
+    assert "n_cpu_moe" not in main_params
 
 
 def test_cpu_moe_flag_on_dense_main_is_rejected(tmp_path):
@@ -723,12 +761,115 @@ def test_cpu_moe_flag_on_dense_main_is_rejected(tmp_path):
     cpu_moe = _run(tmp_path, *YES_TWO_GPU, "--cpu-moe", "--no-preview",
                    "--models-dir", str(models))
     assert cpu_moe.returncode == 2
-    assert "只對 MoE 主模型有意義" in cpu_moe.stderr
+    assert "只對 MoE 模型有意義" in cpu_moe.stderr
 
     n_cpu_moe = _run(tmp_path, *YES_TWO_GPU, "--n-cpu-moe", "3", "--no-preview",
                      "--models-dir", str(models))
     assert n_cpu_moe.returncode == 2
-    assert "只對 MoE 主模型有意義" in n_cpu_moe.stderr
+    assert "只對 MoE 模型有意義" in n_cpu_moe.stderr
+
+    # 0 = 關閉:dense 模型也接受(等同沒開 CPU-MoE),不該報錯
+    zero = _run(tmp_path, *YES_TWO_GPU, "--n-cpu-moe", "0", "--no-preview",
+                "--models-dir", str(models))
+    assert zero.returncode == 0, zero.stderr + zero.stdout
+
+
+def test_vl_cpu_moe_warns_about_mmap_and_preserves_manual_no_mmap(tmp_path):
+    """VL 開了 CPU-MoE 卻沒 no_mmap:llama-server 會警告首次推論從 SSD 逐頁載入,
+    set_config 要講清楚;使用者手動加的 services.vl.no_mmap 重跑不得被丟掉。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    _sparse_layered_moe_gguf(
+        models / "vl" / "vl-model-q6.gguf",
+        layer_expert_bytes={index: GIB for index in range(6)},
+        dense_bytes=GIB,
+    )
+
+    first = _run(tmp_path, *YES_TWO_GPU, "--vl-n-cpu-moe", "3", "--no-preview",
+                 "--models-dir", str(models))
+    assert first.returncode == 0, first.stderr + first.stdout
+    assert "VL 模型 開了 CPU-MoE 但未設 no_mmap" in first.stdout
+    assert "tensor overrides to CPU are used with mmap enabled" in first.stdout
+
+    # 使用者照建議手動加上 → 重跑保留,警告消失
+    path = tmp_path / "home" / ".config/codetrail/deployment.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["services"]["vl"]["parameters"]["no_mmap"] = True
+    path.write_text(json.dumps(config), encoding="utf-8")
+
+    rerun = _run(tmp_path, *YES_TWO_GPU, "--vl-n-cpu-moe", "3", "--no-preview",
+                 "--models-dir", str(models))
+    assert rerun.returncode == 0, rerun.stderr + rerun.stdout
+    vl_params = _read_deployment(tmp_path)["services"]["vl"]["parameters"]
+    assert vl_params["no_mmap"] is True          # 沒被當成「未涵蓋鍵」丟掉
+    assert vl_params["n_cpu_moe"] == 3
+    assert "已捨棄:no_mmap" not in rerun.stdout
+    assert "VL 模型 開了 CPU-MoE 但未設 no_mmap" not in rerun.stdout
+
+    # 沒開 CPU-MoE 就不該有這個警告
+    off = _run(tmp_path, *YES_TWO_GPU, "--vl-n-cpu-moe", "0", "--no-preview",
+               "--models-dir", str(models))
+    assert off.returncode == 0, off.stderr + off.stdout
+    assert "VL 模型 開了 CPU-MoE 但未設 no_mmap" not in off.stdout
+
+
+def test_vl_cpu_moe_is_asked_and_written_for_moe_vl(tmp_path):
+    """VL 也有 CPU-MoE 題:MoE VL --yes 必須給旗標,寫入後與 --fit on 並存。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    _sparse_layered_moe_gguf(
+        models / "vl" / "vl-model-q6.gguf",
+        layer_expert_bytes={index: GIB for index in range(6)},
+        dense_bytes=GIB,
+    )
+
+    missing = _run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models))
+    assert missing.returncode == 2
+    assert "--vl-n-cpu-moe" in missing.stderr
+
+    partial = _run(tmp_path, *YES_TWO_GPU, "--vl-n-cpu-moe", "3", "--no-preview",
+                   "--models-dir", str(models))
+    assert partial.returncode == 0, partial.stderr + partial.stdout
+    vl_params = _read_deployment(tmp_path)["services"]["vl"]["parameters"]
+    assert vl_params["n_cpu_moe"] == 3
+    # VL 的 --fit 機制不變:llama.cpp 會把 expert override 一起算進 fit
+    assert vl_params["fit"] == "on"
+    assert vl_params["gpu_layers"] == "auto"
+    assert "cpu_moe" not in vl_params
+
+    full = _run(tmp_path, *YES_TWO_GPU, "--vl-cpu-moe", "--no-preview",
+                "--models-dir", str(models))
+    assert full.returncode == 0, full.stderr + full.stdout
+    vl_params = _read_deployment(tmp_path)["services"]["vl"]["parameters"]
+    assert vl_params["cpu_moe"] is True
+    assert "n_cpu_moe" not in vl_params
+
+    off = _run(tmp_path, *YES_TWO_GPU, "--vl-n-cpu-moe", "0", "--no-preview",
+               "--models-dir", str(models))
+    assert off.returncode == 0, off.stderr + off.stdout
+    vl_params = _read_deployment(tmp_path)["services"]["vl"]["parameters"]
+    assert "cpu_moe" not in vl_params and "n_cpu_moe" not in vl_params
+
+
+def test_dense_vl_skips_cpu_moe_question_with_reason(tmp_path):
+    """dense VL(本專案預設的 Qwen3.5-9B 就是)不問 CPU-MoE,但要說明為什麼。"""
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    _sparse_dense_gguf(models / "vl" / "vl-model-q6.gguf", 4096)
+    _sparse_dense_gguf(
+        models / "big-chat" / "big-chat-ud-q4_k_xl-00001-of-00002.gguf", 4096
+    )
+    _sparse_dense_gguf(
+        models / "big-chat" / "big-chat-ud-q4_k_xl-00002-of-00002.gguf", 4096
+    )
+
+    proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
+                stdin=STDIN_STANDARD)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert proc.stdout.count("略過 CPU-MoE 提問") == 2   # main 與 VL 各一次
+    assert "dense 模型" in proc.stdout
+    vl_params = _read_deployment(tmp_path)["services"]["vl"]["parameters"]
+    assert "cpu_moe" not in vl_params and "n_cpu_moe" not in vl_params
 
 
 def test_dry_run_writes_nothing(tmp_path):
@@ -925,13 +1066,15 @@ def test_rerun_has_no_carryover_current_answers_win(tmp_path):
     )
     assert first.returncode == 0, first.stderr
     assert _read_deployment(tmp_path)["services"]["main"]["ctx"] == 32768
+    assert _read_deployment(tmp_path)["services"]["main"]["parameters"]["threads"] == 12
 
     rerun = _run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models))
     assert rerun.returncode == 0, rerun.stderr + rerun.stdout
     assert "沿用" not in rerun.stdout
     deployment = _read_deployment(tmp_path)
     assert deployment["services"]["main"]["ctx"] == 65536      # 本次旗標值,不是舊值
-    assert deployment["services"]["main"]["parameters"]["threads"] == 8
+    # 這次沒給 --threads → 舊值不沿用,直接不寫 -t
+    assert "threads" not in deployment["services"]["main"]["parameters"]
     assert deployment["services"]["reranker"]["ctx"] == 8192
 
     opencode = json.loads(
@@ -1006,7 +1149,7 @@ def test_rerun_preserves_hand_added_sampling_params_and_warns_on_dropped(tmp_pat
 
     rerun = _run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models))
     assert rerun.returncode == 0, rerun.stderr + rerun.stdout
-    assert "保留你手動加在 deployment.json 的 main 取樣參數" in rerun.stdout
+    assert "保留你手動加在 deployment.json 的 main 參數" in rerun.stdout
     assert "temperature=0.6" in rerun.stdout
     assert "已捨棄:custom_flag=123" in rerun.stdout
     assert "n_cpu_moe=90" not in rerun.stdout  # 工具管理鍵:安靜淘汰,不當成使用者鍵警告
@@ -1070,20 +1213,25 @@ def test_n_cpu_moe_flag_over_max_index_means_full_cpu_moe(tmp_path):
 
 
 def test_interactive_prompt_accepts_typed_n_cpu_moe(tmp_path):
-    """互動流程:CPU-MoE 答 y 後,n-cpu-moe 由使用者輸入(無建議值,驗證範圍)。"""
+    """互動流程:CPU-MoE 只有「幾層」一題(沒有 y/n),由使用者輸入、只驗證範圍。"""
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _moe_models_needing_cpu_moe(tmp_path)
 
-    # main、main GPU、CPU-MoE=y、n-cpu-moe 先 abc(無效)再 3、embed GPU、
-    # reranker、reranker GPU、VL GPU、ctx、threads、摘要確認。
+    # main、main GPU(選 1 = 15000 MiB free)、ctx、CPU-MoE 層數先 abc(無效)再 3、
+    # embed GPU、reranker、reranker GPU、reranker ctx、VL GPU、摘要確認。
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\ny\nabc\n3\n1\n1\n1\n1\n65536\n8\n\n")
+                stdin="1\n1\n65536\nabc\n3\n1\n1\n1\n8192\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "【主模型 n-cpu-moe(部分 CPU-MoE)】" in proc.stdout
-    assert "共 10 層 experts(blk.0..blk.9)" in proc.stdout
-    assert "建議值" not in proc.stdout
-    assert "無效輸入:請輸入 0..1024 的整數" in proc.stdout
+    assert "主聊天模型 CPU-MoE 留在 RAM 的層數(0-1024)" in proc.stdout
+    # 提示只留兩件事:(1) 方向 (2) 依 GGUF 權重 + nvidia-smi free VRAM 算的推薦區間。
+    # 權重 26 GiB(10 層 × 2 GiB experts + 6 GiB dense)、GPU 1 free 15000 MiB
+    # → 要移走 6 層才放得進,上界是全部移到 RAM 的 10。
+    assert "數值越大 → GPU 負載越低(0 = 不 offload)。" in proc.stdout
+    assert "推薦數值:6-10" in proc.stdout
+    assert "GiB" not in proc.stdout               # 不再對使用者丟權重容量細節
+    assert "[y/n]" not in proc.stdout             # 不再有模式分流題
+    assert "無效輸入:請輸入 0-1024 的整數" in proc.stdout
     parameters = _read_deployment(tmp_path)["services"]["main"]["parameters"]
     assert parameters["n_cpu_moe"] == 3
     assert "cpu_moe" not in parameters
@@ -1094,25 +1242,25 @@ def test_interactive_n_cpu_moe_over_max_index_means_full_cpu_moe(tmp_path):
     models = _moe_models_needing_cpu_moe(tmp_path)
 
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\ny\n42\n1\n1\n1\n1\n65536\n8\n\n")
+                stdin="1\n0\n65536\n42\n1\n1\n1\n8192\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "輸入 ≥ 10 = 全部 experts 留 RAM" in proc.stdout
+    assert "推薦數值:" in proc.stdout
     parameters = _read_deployment(tmp_path)["services"]["main"]["parameters"]
     assert parameters["cpu_moe"] is True
     assert "n_cpu_moe" not in parameters
 
 
-def test_interactive_mode_question_requires_explicit_y_or_n(tmp_path):
-    """CPU-MoE 模式問題沒有預設答案:Enter / 亂打都要重問,必須明確 y 或 n。"""
+def test_interactive_cpu_moe_zero_means_no_offload(tmp_path):
+    """CPU-MoE 預設就是開著問層數:不想 offload 的人輸入 0,不寫任何 CPU-MoE 鍵。"""
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _moe_models_needing_cpu_moe(tmp_path)
 
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n\nx\nn\n1\n1\n1\n1\n65536\n8\n\n")
+                stdin="1\n0\n65536\n0\n1\n1\n1\n8192\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "請輸入 y 或 n" in proc.stdout
+    assert "0 = 不 offload" in proc.stdout
     parameters = _read_deployment(tmp_path)["services"]["main"]["parameters"]
     assert "cpu_moe" not in parameters
     assert "n_cpu_moe" not in parameters
@@ -1134,14 +1282,14 @@ def test_explicit_cpu_moe_flag_means_full_ram_without_question(tmp_path):
 
 
 def test_build_without_n_cpu_moe_support_degrades_to_full_cpu_moe(tmp_path):
-    """llama-server 沒有 --n-cpu-moe(舊 build):互動答 y 直接用全 --cpu-moe 並提示;
-    --n-cpu-moe 旗標則直接報錯。"""
+    """llama-server 沒有 --n-cpu-moe(舊 build):互動輸入的層數改用全 --cpu-moe
+    並提示;--n-cpu-moe 旗標則直接報錯。"""
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     _write_fake_llama(tmp_path, help_flags="--fit --cpu-moe --reranking --mmproj")
     models = _moe_models_needing_cpu_moe(tmp_path)
 
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\ny\n1\n1\n1\n1\n65536\n8\n\n")
+                stdin="1\n0\n65536\n3\n1\n1\n1\n8192\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "不支援 --n-cpu-moe" in proc.stdout
@@ -1395,9 +1543,9 @@ def test_interactive_main_ctx_rejects_above_maximum(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n1\n1\n1\n1\n9999999\n65536\n8\n\n")
+                stdin="1\n0\n9999999\n65536\n1\n1\n1\n8192\n1\n\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "無效輸入:請輸入 1024..1048576 的整數" in proc.stdout
+    assert "無效輸入:請輸入 1024-1048576 的整數" in proc.stdout
     assert _read_deployment(tmp_path)["services"]["main"]["ctx"] == 65536
 
     cli = _run(tmp_path, "--yes", "--ctx", "9999999", "--models-dir", str(models))
@@ -1544,10 +1692,10 @@ def test_flat_dir_vl_pairing_asks_explicitly_in_interactive(tmp_path):
     """互動模式遇到混放目錄:VL 是多候選 → 必答題,選定後唯一 mmproj 自動配對。"""
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_flat_vl_models(tmp_path)
-    # main(3 候選選 1)、main GPU、embed GPU、reranker 唯一自動、reranker GPU、
-    # VL 明確選 [2] media-large、VL GPU、ctx、threads、摘要確認。
+    # main(3 候選選 1)、main GPU、ctx、embed GPU、reranker 唯一自動、reranker GPU、
+    # reranker ctx、VL 明確選 [2] media-large、VL GPU、摘要確認。
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n1\n1\n2\n1\n65536\n8\n\n")
+                stdin="1\n0\n65536\n1\n1\n8192\n2\n1\n\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "【VL 模型】 — 偵測到的候選" in proc.stdout
     deployment = _read_deployment(tmp_path)

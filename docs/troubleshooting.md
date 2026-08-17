@@ -604,9 +604,9 @@ ready,但 llama.cpp 的預設 physical batch `-ub 512` 放不下真實 RAG chunk
 短字串 curl 會成功,不能排除這個設定錯誤。
 
 內建 safe-defaults 會把 embedding 與 BGE reranker 都設成
-`-c 8192 -b 8192 -ub 8192`。`set_config.sh` 產生的設定則維持 embedding 8192，
-reranker 預設也自動 8192；若傳 `--rerank-ctx`，會同步套到它的 `-c/-b/-ub`。
-重啟三顆附屬 server 套用:
+`-c 8192 -b 8192 -ub 8192`。`set_config.sh` 產生的設定維持 embedding 8192，
+reranker 的 buffer 則是設定時的必答題(互動輸入或 `--rerank-ctx`),你填的值會同步
+套到它的 `-c/-b/-ub`。重啟三顆附屬 server 套用:
 
 ```bash
 ~/start.sh stop --scope aux
@@ -615,8 +615,9 @@ reranker 預設也自動 8192；若傳 `--rerank-ctx`，會同步套到它的 `-
 
 若是手動啟動 embedding / reranker，也要讓 `-b`、`-ub` 至少容納最長輸入；
 llama.cpp 的 embedding/reranking server 會要求單一輸入序列放得進 physical batch。
-Qwen3-Reranker 若在自動的 8192 buffer OOM，可重跑
-`./set_config.sh --rerank-ctx 2048`；輸入原本就小於 2048 時不會因縮小上限而降低排序精準度。
+Qwen3-Reranker 若在 8192 buffer OOM，可重跑
+`./set_config.sh --rerank-ctx 2048`(互動時在 reranker 那一組直接輸入 2048);
+輸入原本就小於 2048 時不會因縮小上限而降低排序精準度。
 
 ### `aicode` 拒絕啟動,訊息說「主模型未設定」
 

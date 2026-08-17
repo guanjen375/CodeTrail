@@ -1,8 +1,10 @@
-"""set_config 主模型 CPU-MoE 分流的離線回歸測試(新契約:無容量估算、無預設值)。
+"""set_config CPU-MoE 的離線回歸測試(契約:無容量估算、無預設值、只問層數)。
 
 涵蓋:GGUF expert tensor 解析(含 per-layer 編號與 split shard)、
-choose_cpu_moe_mode / choose_n_cpu_moe 的純問答行為、build_main_parameters
-的參數組裝,以及 deployment profile 對 cpu_moe / n_cpu_moe 的 main-only 約束。
+choose_cpu_moe_layers 的純問答行為(0 = 不 offload、N = 前 N 層、
+≥ 層數上限 = 全部)、build_main_parameters 的參數組裝,以及 deployment
+profile 對 cpu_moe / n_cpu_moe 的 role 約束(main 與 vl 可用,embedding/
+reranker 不可)。
 """
 from __future__ import annotations
 
@@ -42,6 +44,49 @@ def _write_moe_gguf(path: Path, *, expert_bytes: int, dense_bytes: int) -> None:
 
 def _write_metadata_only_gguf(path: Path) -> None:
     path.write_bytes(struct.pack("<4sIQQ", b"GGUF", 3, 0, 0))
+
+
+def _gguf_kv_string(key: str, value: str) -> bytes:
+    k, v = key.encode(), value.encode()
+    return (struct.pack("<Q", len(k)) + k + struct.pack("<I", 8)
+            + struct.pack("<Q", len(v)) + v)
+
+
+def _gguf_kv_u32(key: str, value: int) -> bytes:
+    k = key.encode()
+    return struct.pack("<Q", len(k)) + k + struct.pack("<I", 4) + struct.pack("<I", value)
+
+
+def _write_gguf_with_metadata(
+    path: Path, *, architecture: str, expert_count: int | None, tensor_names: tuple[str, ...]
+) -> None:
+    """帶 general.architecture / <arch>.expert_count 的 sparse GGUF。
+
+    用來釘住「metadata 有讀到」以及 metadata 與 tensor 名稱不一致時的警告。
+    """
+    metadata = _gguf_kv_string("general.architecture", architecture)
+    count = 1
+    if expert_count is not None:
+        metadata += _gguf_kv_u32(f"{architecture}.expert_count", expert_count)
+        count += 1
+    header = struct.pack("<4sIQQ", b"GGUF", 3, len(tensor_names), count)
+    table = bytearray()
+    for index, name in enumerate(tensor_names):
+        encoded = name.encode()
+        table.extend(struct.pack("<Q", len(encoded)))
+        table.extend(encoded)
+        table.extend(struct.pack("<I", 1))
+        table.extend(struct.pack("<Q", 1))
+        table.extend(struct.pack("<I", 0))
+        table.extend(struct.pack("<Q", index * sc.GIB))
+    metadata_end = len(header) + len(metadata) + len(table)
+    data_start = (metadata_end + 31) // 32 * 32
+    with path.open("wb") as handle:
+        handle.write(header)
+        handle.write(metadata)
+        handle.write(table)
+        handle.write(b"\0" * (data_start - metadata_end))
+        handle.truncate(data_start + len(tensor_names) * sc.GIB)
 
 
 def _write_layered_moe_gguf(
@@ -248,78 +293,225 @@ def test_build_main_parameters_normal_mode_points_to_nvidia_smi(tmp_path):
     assert "fit" not in no_fit
 
 
-def test_choose_cpu_moe_mode_is_pure_question(tmp_path, monkeypatch):
-    """模式問題沒有預設答案:必須明確 y/n,亂打會重問;dense/解析失敗不詢問。"""
-    plan = _build_plan(tmp_path, cpu_moe=False)
-    layout = plan.main_layout
-    candidate = plan.main.candidate
-
-    prompts: list[str] = []
-    answers = iter(["", "x", "y"])
-
-    def scripted(prompt: str) -> str:
-        prompts.append(prompt)
-        return next(answers)
-
-    monkeypatch.setattr(sc, "_input", scripted)
-    notes: list[str] = []
-    selected = sc.choose_cpu_moe_mode(None, False, candidate, layout, True, notes)
-    assert selected is True
-    assert len(prompts) == 3          # Enter 與亂打都不被接受
-    assert "[y/n]" in prompts[0]
-    assert not notes
-
-    # 旗標 override 直接生效,不提問
-    monkeypatch.setattr(sc, "_input", lambda prompt: pytest.fail("不應詢問"))
-    assert sc.choose_cpu_moe_mode(True, False, candidate, layout, True, []) is True
-    assert sc.choose_cpu_moe_mode(False, False, candidate, layout, True, []) is False
-
-    # dense 模型:不詢問,直接一般模式
-    dense = sc.ModelLayout(tensor_bytes=1 * sc.GIB, expert_bytes=0)
-    assert sc.choose_cpu_moe_mode(None, False, candidate, dense, True, []) is False
-
-    # layout 解析失敗:不詢問,一般模式 + 提示
-    none_notes: list[str] = []
-    assert sc.choose_cpu_moe_mode(None, False, candidate, None, True, none_notes) is False
-    assert any("無法讀取" in note for note in none_notes)
-
-    # build 不支援 --cpu-moe:不詢問,一般模式 + 提示
-    unsupported_notes: list[str] = []
-    assert sc.choose_cpu_moe_mode(
-        None, False, candidate, layout, False, unsupported_notes
-    ) is False
-    assert any("不支援 --cpu-moe" in note for note in unsupported_notes)
-
-    # --yes 且是 MoE:必須用旗標指定模式
-    with pytest.raises(sc.SetupError, match="--cpu-moe / --no-cpu-moe / --n-cpu-moe"):
-        sc.choose_cpu_moe_mode(None, True, candidate, layout, True, [])
+_FULL_CAPS = {"fit": True, "cpu_moe": True, "n_cpu_moe": True}
+_MAIN_FLAGS = ("--cpu-moe", "--no-cpu-moe", "--n-cpu-moe")
 
 
-def test_choose_n_cpu_moe_validates_range_without_recommendation(monkeypatch):
+def _ask(layout, *, caps=None, notes=None, assume_yes=False,
+         cpu_moe_override=None, n_cpu_moe_override=None, label="主聊天模型"):
+    return sc.choose_cpu_moe_layers(
+        label,
+        layout,
+        cpu_moe_override=cpu_moe_override,
+        n_cpu_moe_override=n_cpu_moe_override,
+        assume_yes=assume_yes,
+        caps=_FULL_CAPS if caps is None else caps,
+        flag_names=_MAIN_FLAGS,
+        notes=[] if notes is None else notes,
+    )
+
+
+def test_cpu_moe_question_is_only_the_layer_count(tmp_path, monkeypatch):
+    """沒有 y/n 分流:CPU-MoE 直接問層數,0 = 不 offload、≥ 上限 = 全部。"""
     layout = sc.ModelLayout(
         tensor_bytes=9 * sc.GIB,
         expert_bytes=8 * sc.GIB,
         expert_layer_bytes=tuple((index, 1 * sc.GIB) for index in range(8)),
     )
+    assert sc.cpu_moe_layer_ceiling(layout) == 8
 
-    # 旗標覆寫:照用;超過最大 block 編號 → None(等同 --cpu-moe)。
-    assert sc.choose_n_cpu_moe(3, True, layout) == 3
-    assert sc.choose_n_cpu_moe(99, True, layout) is None
-
-    # 互動:沒有預設值(Enter 無效)、只驗證 0..1024 範圍;
-    # 輸入超過最大 blk 編號(7)→ None。
-    answers = iter(["", "4", "8", "2000", "0"])
     prompts: list[str] = []
+    answers = iter(["", "4", "8", "2000", "0"])
 
     def scripted(prompt: str) -> str:
         prompts.append(prompt)
         return next(answers)
 
     monkeypatch.setattr(sc, "_input", scripted)
-    assert sc.choose_n_cpu_moe(None, False, layout) == 4     # "" 重問後輸入 4
-    assert sc.choose_n_cpu_moe(None, False, layout) is None  # 8 > blk 上限 7
-    assert sc.choose_n_cpu_moe(None, False, layout) == 0     # 2000 超出 0..1024 重問
-    assert all(f"(0..{sc.MAX_N_CPU_MOE})" in prompt for prompt in prompts)
+    assert _ask(layout) == (True, 4)        # "" 重問後輸入 4 → 前 4 層
+    assert _ask(layout) == (True, None)     # 8 ≥ 上限 8 → 全部留 RAM
+    assert _ask(layout) == (False, None)    # 2000 超出 0-1024 重問 → 0 = 不 offload
+    assert all(f"(0-{sc.MAX_N_CPU_MOE})" in prompt for prompt in prompts)
+    assert all("[y/n]" not in prompt for prompt in prompts)
+
+
+def test_gguf_metadata_architecture_and_expert_count_are_read(tmp_path):
+    """「這顆是 dense」要能被使用者驗證 → architecture / expert_count 必須真的讀進來。"""
+    dense = tmp_path / "dense.gguf"
+    _write_gguf_with_metadata(
+        dense, architecture="qwen3vl", expert_count=None,
+        tensor_names=("blk.0.ffn_up.weight", "blk.0.ffn_down.weight"),
+    )
+    layout = sc.inspect_model_layout(sc.ModelCandidate(dense, dense.stat().st_size, 1))
+    assert layout.architecture == "qwen3vl"
+    assert layout.expert_count == 0
+    assert not layout.is_moe
+    assert not layout.metadata_claims_moe
+
+    moe = tmp_path / "moe.gguf"
+    _write_gguf_with_metadata(
+        moe, architecture="qwen35moe", expert_count=512,
+        tensor_names=("blk.0.ffn_up_exps.weight", "blk.1.ffn_up_exps.weight"),
+    )
+    layout = sc.inspect_model_layout(sc.ModelCandidate(moe, moe.stat().st_size, 1))
+    assert (layout.architecture, layout.expert_count) == ("qwen35moe", 512)
+    assert layout.is_moe
+    assert not layout.metadata_claims_moe
+
+
+def test_metadata_moe_without_matching_tensors_warns_instead_of_claiming_dense(
+    tmp_path, monkeypatch, capsys
+):
+    """metadata 說有 experts、tensor 名稱卻對不上 llama.cpp 的 offload 規則:
+    不能含糊說成「dense 模型」——那會讓使用者以為工具漏判。"""
+    odd = tmp_path / "odd-moe.gguf"
+    _write_gguf_with_metadata(
+        odd, architecture="futurearch", expert_count=64,
+        tensor_names=("blk.0.ffn_experts_v2.weight", "blk.1.ffn_experts_v2.weight"),
+    )
+    layout = sc.inspect_model_layout(sc.ModelCandidate(odd, odd.stat().st_size, 1))
+    assert layout.expert_count == 64
+    assert not layout.is_moe            # llama.cpp 的 --cpu-moe 抓不到這些名字
+    assert layout.metadata_claims_moe
+
+    monkeypatch.setattr(sc, "_input", lambda prompt: pytest.fail("不應詢問"))
+    notes: list[str] = []
+    assert _ask(layout, notes=notes) == (False, None)
+    assert "dense 模型" not in capsys.readouterr().out
+    assert any("64 個 experts" in note and "不會有作用" in note for note in notes)
+
+
+def test_cpu_moe_recommendation_spans_fit_to_full_offload():
+    """推薦區間 = [權重剛好放得進 free VRAM 的最小層數, 全部移到 RAM]。
+
+    只算 GGUF 權重 storage,所以三種 GPU 各自落在不同分支。
+    """
+    layout = sc.ModelLayout(                       # 10 層 × 2 GiB experts + 6 GiB dense
+        tensor_bytes=26 * sc.GIB,
+        expert_bytes=20 * sc.GIB,
+        expert_layer_bytes=tuple((index, 2 * sc.GIB) for index in range(10)),
+    )
+    roomy = sc.Gpu(0, "roomy", 40960, 40960, "GPU-roomy")   # 40 GiB free → 0 就放得下
+    tight = sc.Gpu(1, "tight", 16384, 15000, "GPU-tight")   # 14.6 GiB free → 要移走 6 層
+    tiny = sc.Gpu(2, "tiny", 4096, 4096, "GPU-tiny")        # 4 GiB free → dense 都放不下
+
+    assert sc.cpu_moe_recommendation(layout, tight) == "6-10"
+    assert sc.cpu_moe_recommendation(layout, roomy).startswith("0(")
+    assert sc.cpu_moe_recommendation(layout, tiny).startswith("10(")
+
+    # expert tensors 沒有 blk 編號 / 沒有 GPU 資訊 → 只能推薦「全部移到 RAM」
+    flat = sc.ModelLayout(tensor_bytes=26 * sc.GIB, expert_bytes=20 * sc.GIB)
+    assert sc.cpu_moe_recommendation(flat, tight) == "1"
+    assert sc.cpu_moe_recommendation(layout, None) == "10"
+
+    # 推薦不是限制:區間外的輸入照樣接受(這題只驗證 0-MAX 範圍)
+    assert sc.cpu_moe_gpu_bytes(layout, 6) == 14 * sc.GIB
+    assert sc.cpu_moe_fit_layers(layout, 14 * sc.GIB) == 6
+
+
+def test_vl_recommendation_subtracts_the_fit_target_it_reserves():
+    """VL 一定帶 --fit-target,那塊 VRAM 是既定保留量,不扣掉會推薦放不下的值。
+
+    這是實機踩到的:35.8 GiB 的 MoE VL 放進 free 15.57 GiB 的卡,
+    未扣 fit_target 時下界算出 25(權重就要 15.18 GiB,已超過扣除後的 12.57 GiB)。
+    """
+    layout = sc.ModelLayout(                       # 10 層 × 2 GiB experts + 6 GiB dense
+        tensor_bytes=26 * sc.GIB,
+        expert_bytes=20 * sc.GIB,
+        expert_layer_bytes=tuple((index, 2 * sc.GIB) for index in range(10)),
+    )
+    gpu = sc.Gpu(1, "aux", 16384, 15000, "GPU-aux")     # free 14.65 GiB
+
+    assert sc.cpu_moe_recommendation(layout, gpu) == "6-10"                 # main:fit off
+    assert sc.cpu_moe_recommendation(layout, gpu, sc.VL_FIT_TARGET_MIB) == "8-10"
+    # 保留量大到連 dense 都放不下 → 退回「全部移到 RAM」並註明可能仍放不下
+    assert sc.cpu_moe_recommendation(layout, gpu, 15000).startswith("10(")
+
+
+def test_cpu_moe_question_is_skipped_for_dense_and_unparsable(tmp_path, monkeypatch, capsys):
+    """dense / GGUF 解析不出來 → 不問;dense 印出原因,解析失敗留 note。"""
+    monkeypatch.setattr(sc, "_input", lambda prompt: pytest.fail("不應詢問"))
+
+    dense = sc.ModelLayout(tensor_bytes=1 * sc.GIB, expert_bytes=0)
+    assert _ask(dense) == (False, None)
+    assert "略過 CPU-MoE 提問" in capsys.readouterr().out
+
+    none_notes: list[str] = []
+    assert _ask(None, notes=none_notes) == (False, None)
+    assert any("無法讀取" in note for note in none_notes)
+
+
+def test_cpu_moe_question_is_skipped_when_build_lacks_the_flags(tmp_path, monkeypatch):
+    layout = sc.ModelLayout(
+        tensor_bytes=9 * sc.GIB, expert_bytes=8 * sc.GIB,
+        expert_layer_bytes=((0, 8 * sc.GIB),),
+    )
+    monkeypatch.setattr(sc, "_input", lambda prompt: pytest.fail("不應詢問"))
+    notes: list[str] = []
+    caps = {"fit": True, "cpu_moe": False, "n_cpu_moe": False}
+    assert _ask(layout, caps=caps, notes=notes) == (False, None)
+    assert any("不支援 --cpu-moe" in note for note in notes)
+
+
+def test_cpu_moe_flag_overrides_skip_the_question(tmp_path, monkeypatch):
+    layout = sc.ModelLayout(
+        tensor_bytes=9 * sc.GIB,
+        expert_bytes=8 * sc.GIB,
+        expert_layer_bytes=tuple((index, 1 * sc.GIB) for index in range(8)),
+    )
+    monkeypatch.setattr(sc, "_input", lambda prompt: pytest.fail("不應詢問"))
+
+    assert _ask(layout, cpu_moe_override=True) == (True, None)
+    assert _ask(layout, cpu_moe_override=False) == (False, None)
+    assert _ask(layout, n_cpu_moe_override=3) == (True, 3)
+    assert _ask(layout, n_cpu_moe_override=0) == (False, None)
+    assert _ask(layout, n_cpu_moe_override=99) == (True, None)   # ≥ 上限 = 全部
+
+    # dense 模型給非 0 的旗標 → 報錯(0 仍然合法,代表「不開」)
+    dense = sc.ModelLayout(tensor_bytes=1 * sc.GIB, expert_bytes=0)
+    with pytest.raises(sc.SetupError, match="只對 MoE 模型有意義"):
+        _ask(dense, cpu_moe_override=True)
+    with pytest.raises(sc.SetupError, match="只對 MoE 模型有意義"):
+        _ask(dense, n_cpu_moe_override=3)
+    assert _ask(dense, n_cpu_moe_override=0) == (False, None)
+
+    # GGUF 解析不出來:--cpu-moe 是逃生門(允許),--n-cpu-moe 不猜層數上限
+    assert _ask(None, cpu_moe_override=True) == (True, None)
+    with pytest.raises(sc.SetupError, match="只對 MoE 模型有意義"):
+        _ask(None, n_cpu_moe_override=3)
+
+
+def test_yes_mode_requires_a_cpu_moe_flag_for_moe_models(tmp_path):
+    layout = sc.ModelLayout(
+        tensor_bytes=9 * sc.GIB, expert_bytes=8 * sc.GIB,
+        expert_layer_bytes=((0, 8 * sc.GIB),),
+    )
+    with pytest.raises(sc.SetupError, match="--n-cpu-moe"):
+        _ask(layout, assume_yes=True)
+    # 非 MoE 不需要旗標(--yes 也不該卡住)
+    dense = sc.ModelLayout(tensor_bytes=1 * sc.GIB, expert_bytes=0)
+    assert _ask(dense, assume_yes=True) == (False, None)
+
+
+def test_partial_offload_degrades_when_build_lacks_n_cpu_moe(tmp_path, monkeypatch):
+    """舊 build 只有 --cpu-moe:互動輸入的部分層數退成全 CPU-MoE 並留 note。"""
+    layout = sc.ModelLayout(
+        tensor_bytes=9 * sc.GIB,
+        expert_bytes=8 * sc.GIB,
+        expert_layer_bytes=tuple((index, 1 * sc.GIB) for index in range(8)),
+    )
+    monkeypatch.setattr(sc, "_input", lambda prompt: "3")
+    notes: list[str] = []
+    caps = {"fit": True, "cpu_moe": True, "n_cpu_moe": False}
+    assert _ask(layout, caps=caps, notes=notes) == (True, None)
+    assert any("不支援 --n-cpu-moe" in note for note in notes)
+
+    # 反過來:只有 --n-cpu-moe 的 build answering「全部」→ 用 --n-cpu-moe <上限>
+    monkeypatch.setattr(sc, "_input", lambda prompt: "99")
+    only_partial: list[str] = []
+    caps = {"fit": True, "cpu_moe": False, "n_cpu_moe": True}
+    assert _ask(layout, caps=caps, notes=only_partial) == (True, 8)
+    assert any("不支援 --cpu-moe" in note for note in only_partial)
 
 
 def test_offload_description_shows_manual_n_cpu_moe(tmp_path):
@@ -387,7 +579,7 @@ def test_scan_orders_main_candidates_by_size_without_model_specific_hint(tmp_pat
     assert candidates["main"][1].path == smaller
 
 
-def test_profile_emits_cpu_moe_only_for_main_and_rejects_partial_mix(tmp_path):
+def test_profile_emits_cpu_moe_for_main_and_vl_and_rejects_partial_mix(tmp_path):
     plan = _build_plan(tmp_path, cpu_moe=True)
     plan.batch = 1024
     plan.ubatch = 256
@@ -416,8 +608,27 @@ def test_profile_emits_cpu_moe_only_for_main_and_rejects_partial_mix(tmp_path):
     assert vl_command[vl_command.index("--fit") + 1] == "on"
     assert vl_command[vl_command.index("--fit-target") + 1] == "3072"
 
-    bad = sc.build_deployment_config(plan)
-    bad["services"]["main"]["parameters"]["n_cpu_moe"] = 90
-    local_path.write_text(json.dumps(bad), encoding="utf-8")
-    with pytest.raises(ProfileError, match="mutually exclusive"):
-        load_effective_profile(env)
+    # VL 也可以有 CPU-MoE:--fit on 與 --n-cpu-moe 並存(llama.cpp 會把
+    # expert override 算進 fit),embedding/reranker 則仍被 schema 拒絕。
+    plan.vl_n_cpu_moe = 4
+    local_path.write_text(json.dumps(sc.build_deployment_config(plan)), encoding="utf-8")
+    vl_profile = load_effective_profile(env)
+    vl_command = build_server_command(vl_profile.service("vl"), "/opt/llama-server", env)
+    assert vl_command[vl_command.index("--n-cpu-moe") + 1] == "4"
+    assert vl_command[vl_command.index("--fit") + 1] == "on"
+    plan.vl_n_cpu_moe = None
+
+    for role in ("embedding", "reranker"):
+        rejected = sc.build_deployment_config(plan)
+        rejected["services"][role]["parameters"]["cpu_moe"] = True
+        local_path.write_text(json.dumps(rejected), encoding="utf-8")
+        with pytest.raises(ProfileError, match="not allowed for role"):
+            load_effective_profile(env)
+
+    for role in ("main", "vl"):
+        bad = sc.build_deployment_config(plan)
+        bad["services"][role]["parameters"]["cpu_moe"] = True
+        bad["services"][role]["parameters"]["n_cpu_moe"] = 90
+        local_path.write_text(json.dumps(bad), encoding="utf-8")
+        with pytest.raises(ProfileError, match="mutually exclusive"):
+            load_effective_profile(env)

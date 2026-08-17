@@ -50,19 +50,32 @@ aicode/doctor 與 `~/start.sh` 各讀一份設定(set_config 偵測到會警告)
   llama.cpp 的自動 VRAM 配置:`gpu_layers` 可為整數或 `"auto"`(`-ngl auto`)、
   `fit`(`"on"`/`"off"` → `--fit`)、`fit_target`(MiB → `--fit-target`)、
   以及 `cpu_moe: true`(→ `--cpu-moe`)；VL 也支援 `fit` / `fit_target`，讓最後
-  啟動的 VL 依其他 aux 實際占用保留 VRAM。`cpu_moe` 只允許 main，且不可與
-  部分 offload 的 `n_cpu_moe`(→ `--n-cpu-moe`,同樣 main-only)同時設定。
-  `set_config.sh` 只在偵測到 MoE expert tensors 時詢問 CPU-MoE / 一般模式
-  (無預設答案,不做容量估算);三個 aux 固定 `-np 1`,VL 使用 `-ngl auto --fit on
-  --fit-target 3072`(VL 的啟動機制)。`n_cpu_moe` 由 `set_config.sh` 在 CPU-MoE
-  模式詢問並寫入:值完全由使用者輸入(互動題或 `--n-cpu-moe N` 旗標),工具只驗證
-  0..1024 範圍;輸入超過最大 blk 編號、或 build 不支援 `--n-cpu-moe` 時退回
-  `cpu_moe: true`。放不放得下 VRAM 以啟動後 `nvidia-smi` 實測為準。
+  啟動的 VL 依其他 aux 實際占用保留 VRAM。`cpu_moe` 與部分 offload 的
+  `n_cpu_moe`(→ `--n-cpu-moe`)**只允許 main 與 vl**(embedding / reranker
+  拒絕),且同一個 role 不可同時設定這兩鍵。VL 的 `--fit on` 與 CPU-MoE 可以並存:
+  llama.cpp 的 `--fit` 只調整「未指定」的參數,並會把 expert 的 buffer override
+  一併算進 fit 計算。
+  `set_config.sh` 只在偵測到 MoE expert tensors 時詢問 CPU-MoE(main 與 VL 各一題,
+  沒有 y/n 分流,直接問「幾層 experts 留 RAM」;無預設答案,只給一個推薦區間
+  (下界 = 權重剛好放得進該 role 所選 GPU 目前 free VRAM 的層數,上界 = 全部移到
+  RAM),例如 `推薦數值:38-43`。估算只含 GGUF 權重 storage(未計 KV cache /
+  compute buffer / 共卡的附屬服務),是起點而非保證,也不限制輸入);
+  三個 aux 固定 `-np 1`,VL 使用 `-ngl auto --fit on --fit-target 3072`
+  (VL 的啟動機制)。層數的值完全由使用者輸入(互動題或
+  `--n-cpu-moe N` / `--vl-n-cpu-moe N` 旗標),工具只驗證 0-1024 範圍:
+  `0` = 不 offload(不寫任何 CPU-MoE 鍵)、`N` = `n_cpu_moe: N`、
+  輸入超過最大 blk 編號(或 build 不支援 `--n-cpu-moe`)→ `cpu_moe: true`。
+  放不放得下 VRAM 以啟動後 `nvidia-smi` 實測為準。
+- main 的 `threads`(→ `-t`)**從來不是設定時的問題**,只有 `set_config.sh --threads N`
+  明確指定時才會寫入。未指定 = auto:不傳 `-t`,llama.cpp 的預設 `-1` 會自己偵測
+  (x86_64 Linux 上 hybrid CPU 只算 P-core,否則用實體核心數、排除 HT siblings),
+  比工具自己數邏輯 CPU 準。
 - VL 的 `mmproj`：同樣只接受 registry key 或 GGUF 絕對路徑。
 
 safe-defaults 的 reranker 是 `bge-reranker-v2-m3` Q8_0,保留
-`-c 8192 -b 8192 -ub 8192`。`set_config.sh` 正常沿用這個 internal buffer，不另外提問；
-特殊情況可用 `--rerank-ctx`(128..1048576)覆寫並同步三個欄位。手動只改 `ctx`、
+`-c 8192 -b 8192 -ub 8192`。`set_config.sh` 會把這個 internal buffer 當成一般問題問
+(必答、沒有預設值,只把 8192 當「維護者驗證過的組合」提示);非互動用
+`--rerank-ctx`(128-1048576)提供,三個欄位同步。手動只改 `ctx`、
 仍留著 8192 physical batch 的話,並不能解決 Qwen3 的 buffer 壓力。
 
 Qwen3-Reranker 是支援的 accuracy-first 選項(過往量測可參考 ctx 2048 約 2 GiB、
@@ -70,7 +83,7 @@ Qwen3-Reranker 是支援的 accuracy-first 選項(過往量測可參考 ctx 2048
 單純增大 ctx 不會提高排序精準度;超過時請求可能失敗或上游必須截斷,才可能漏證據。
 較大 ctx 可容納較長輸入,但配置更多顯存,實際處理更多 token 時延遲也會增加。
 Qwen3 是 causal 架構,除 compute buffer 外還有 KV cache,所以增幅遠高於 GGUF
-權重大小。`set_config.sh` 不做容量估算:啟動後用 `nvidia-smi` 實測,不夠時
+權重大小。`set_config.sh` 不替 reranker 估容量:啟動後用 `nvidia-smi` 實測,不夠時
 用 `--rerank-ctx` 降低 buffer、換 BGE、換較小 VL 或分卡,不應關閉 VL `--fit`。
 
 禁止 `extra_args`、shell 字串、相對 artifact path、帶控制字元的值。launcher 由驗證後

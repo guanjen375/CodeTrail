@@ -1,5 +1,7 @@
-"""Reranker internal buffer defaults quietly and keeps an advanced override."""
+"""Reranker internal buffer is a normal (mandatory) question with no default."""
 from pathlib import Path
+
+import pytest
 
 from scripts import set_config as sc
 
@@ -11,22 +13,25 @@ def _candidate(tmp_path: Path, name: str, size_mib: int = 610) -> sc.ModelCandid
     return sc.ModelCandidate(path=path, total_bytes=path.stat().st_size, shards=1)
 
 
-def test_reranker_buffer_uses_internal_default_without_prompt(tmp_path, monkeypatch, capsys):
+def test_reranker_buffer_is_asked_without_default(tmp_path, monkeypatch, capsys):
+    """必答、沒有預設值:Enter 不可過關,維護者驗證值只當提示顯示。"""
     candidate = _candidate(tmp_path, "qwen3-reranker-0.6b-q8_0.gguf")
     prompts: list[str] = []
+    answers = iter(["", "4096"])
 
     def fake_input(prompt: str) -> str:
         prompts.append(prompt)
-        raise AssertionError("reranker internal buffer 不應成為互動題")
+        return next(answers)
 
     monkeypatch.setattr(sc, "_input", fake_input)
 
     ctx = sc.choose_reranker_ctx(candidate, override=None, assume_yes=False)
     output = capsys.readouterr().out
 
-    assert ctx == sc.DEFAULT_RERANKER_CTX
-    assert prompts == []
-    assert output == ""
+    assert ctx == 4096
+    assert len(prompts) == 2                      # Enter 被拒絕後重問
+    assert f"({sc.MIN_RERANKER_CTX}-{sc.MAX_RERANKER_CTX})" in prompts[0]
+    assert f"推薦數值:{sc.VERIFIED_RERANKER_CTX}" in output   # 只是推薦,仍要自己打
 
 
 def test_reranker_ctx_flag_and_yes_share_the_same_bounds(tmp_path):
@@ -42,10 +47,9 @@ def test_reranker_ctx_flag_and_yes_share_the_same_bounds(tmp_path):
     else:
         raise AssertionError("低於下限的旗標值必須報錯")
 
-    assert (
+    # --yes 沒給旗標 → 報錯並指名旗標(不再靜默採用內建值)
+    with pytest.raises(sc.SetupError, match="--rerank-ctx"):
         sc.choose_reranker_ctx(candidate, override=None, assume_yes=True)
-        == sc.DEFAULT_RERANKER_CTX
-    )
 
 
 def test_selected_reranker_ctx_sets_context_and_physical_batch(tmp_path):
