@@ -608,14 +608,17 @@ def test_profile_emits_cpu_moe_for_main_and_vl_and_rejects_partial_mix(tmp_path)
     assert vl_command[vl_command.index("--fit") + 1] == "on"
     assert vl_command[vl_command.index("--fit-target") + 1] == "3072"
 
-    # VL 也可以有 CPU-MoE:--fit on 與 --n-cpu-moe 並存(llama.cpp 會把
-    # expert override 算進 fit),embedding/reranker 則仍被 schema 拒絕。
+    # VL 也可以有 CPU-MoE,但 llama.cpp 的 --fit 會因為 tensor override 而 abort,
+    # 所以此時必須輸出 --fit off / -ngl 99(不是 --fit on),且不寫 --fit-target;
+    # embedding/reranker 則仍被 schema 拒絕。
     plan.vl_n_cpu_moe = 4
     local_path.write_text(json.dumps(sc.build_deployment_config(plan)), encoding="utf-8")
     vl_profile = load_effective_profile(env)
     vl_command = build_server_command(vl_profile.service("vl"), "/opt/llama-server", env)
     assert vl_command[vl_command.index("--n-cpu-moe") + 1] == "4"
-    assert vl_command[vl_command.index("--fit") + 1] == "on"
+    assert vl_command[vl_command.index("--fit") + 1] == "off"
+    assert vl_command[vl_command.index("-ngl") + 1] == "99"
+    assert "--fit-target" not in vl_command
     plan.vl_n_cpu_moe = None
 
     for role in ("embedding", "reranker"):

@@ -1088,11 +1088,11 @@ def cpu_moe_recommendation(layout: ModelLayout, gpu: Gpu | None,
     下界 = 權重剛好放得進(free VRAM - reserve_mib)的最小層數;
     上界 = 全部 experts 移到 RAM(GPU 負載最低)。
 
-    reserve_mib 是「我們自己寫進 config、llama.cpp 保證會留下」的餘量
-    (VL 的 --fit-target)。那不是估算而是既定參數,不扣掉會讓下界系統性偏低,
-    推薦一個權重根本放不下的值。KV cache、compute buffer、共用同一顆卡的附屬
-    服務仍然沒進這個算式,所以這是「從這裡開始試」的推薦,不是保證,也不拿來
-    限制輸入(這題仍只驗證 0-MAX 範圍)。
+    reserve_mib 是留給 KV cache / compute buffer / mmproj 的手動餘量。VL 特別需要
+    它:一旦套用 CPU-MoE,llama.cpp 的 --fit 會直接放棄(見 build_vl_parameters),
+    -ngl 退化成「全部層上 GPU」而沒有任何自動退讓,下界貼著權重上限就等於必 OOM。
+    KV cache、compute buffer、共用同一顆卡的附屬服務仍然沒被精算,所以這是
+    「從這裡開始試」的推薦,不是保證,也不拿來限制輸入(仍只驗證 0-MAX 範圍)。
     """
     ceiling = cpu_moe_layer_ceiling(layout)
     if gpu is None or not layout.expert_layer_bytes:
@@ -1423,19 +1423,33 @@ def warn_cpu_moe_without_no_mmap(role_label: str, service_key: str, cpu_moe: boo
     )
 
 
-def build_vl_parameters(plan: Plan) -> dict:
-    """VL 服務參數:固定最後啟動、-ngl auto + --fit,再疊上使用者選的 CPU-MoE。
+def vl_uses_cpu_moe(plan: Plan) -> bool:
+    return plan.vl_cpu_moe or plan.vl_n_cpu_moe is not None
 
-    --fit 只調整「未指定」的參數,而且 llama.cpp 會把 expert 的 buffer override
-    一併算進 fit 計算,所以 --fit on 與 --n-cpu-moe 可以並存:
-    使用者釘住幾層 experts 進 RAM,剩下的 offload 層數仍由 --fit 依實際剩餘 VRAM 決定。
+
+def build_vl_parameters(plan: Plan) -> dict:
+    """VL 服務參數。VL 固定最後啟動,所以預設讓 llama.cpp 依剩餘 VRAM 自動配置。
+
+    沒有 CPU-MoE:-ngl auto + --fit on --fit-target,依 embedding/reranker 的實際
+    占用自動決定 offload 層數(server 也會把 mmproj worst-case memory 算進去)。
+
+    有 CPU-MoE:**--fit 不能用**。llama.cpp 的 common_params_fit_impl 一看到
+    model_params::tensor_buft_overrides 已被使用者設過就直接
+    「abort」(common/fit.cpp),而 --cpu-moe / --n-cpu-moe 正是往那裡塞 override。
+    放棄後只印一行 WARN 就繼續載入,且 -ngl auto(-1)在 llama.h 的語意是
+    「negative value means all layers」→ 退化成全部層上 GPU、完全沒有安全網。
+    與其寫一組不會生效的 --fit on --fit-target 讓人誤以為有保護,不如照 main 的
+    做法明寫 -ngl 99 --fit off:實際行為相同,但設定檔與啟動指令不說謊。
     """
-    parameters: dict = {
-        "gpu_layers": "auto",
-        "parallel": AUX_PARALLEL,
-        "fit": "on",
-        "fit_target": VL_FIT_TARGET_MIB,
-    }
+    parameters: dict = {"parallel": AUX_PARALLEL}
+    if vl_uses_cpu_moe(plan):
+        parameters.update({"gpu_layers": 99, "fit": "off"})
+    else:
+        parameters.update({
+            "gpu_layers": "auto",
+            "fit": "on",
+            "fit_target": VL_FIT_TARGET_MIB,
+        })
     if plan.vl_n_cpu_moe is not None:
         parameters["n_cpu_moe"] = plan.vl_n_cpu_moe
     elif plan.vl_cpu_moe:
@@ -1812,12 +1826,12 @@ def _offload_description(plan: Plan) -> str:
 
 
 def _vl_offload_description(plan: Plan) -> str:
-    base = f"-ngl auto --fit on --fit-target {VL_FIT_TARGET_MIB}"
     if plan.vl_n_cpu_moe is not None:
-        return f"{base} --n-cpu-moe {plan.vl_n_cpu_moe}(前 {plan.vl_n_cpu_moe} 層 experts 留 RAM)"
+        return (f"-ngl 99 --fit off --n-cpu-moe {plan.vl_n_cpu_moe}"
+                f"(前 {plan.vl_n_cpu_moe} 層 experts 留 RAM;CPU-MoE 下 --fit 無效)")
     if plan.vl_cpu_moe:
-        return f"{base} --cpu-moe(全部 experts 留 RAM)"
-    return base
+        return "-ngl 99 --fit off --cpu-moe(全部 experts 留 RAM;CPU-MoE 下 --fit 無效)"
+    return f"-ngl auto --fit on --fit-target {VL_FIT_TARGET_MIB}"
 
 
 def _threads_description(plan: Plan) -> str:
@@ -2664,10 +2678,20 @@ def run(args: argparse.Namespace) -> int:
         plan.ubatch = ubatch
         notes.append(
             f"附屬服務固定配置:三個服務 -np {AUX_PARALLEL};VL 最後啟動並用"
-            f" {_vl_offload_description(plan)},依當下剩餘 VRAM"
-            " 自動 offload(llama.cpp 會另計 mmproj worst-case memory,"
-            "並把 CPU-MoE 的 expert override 一起算進 fit)。"
+            f" {_vl_offload_description(plan)}。"
         )
+        if vl_uses_cpu_moe(plan):
+            notes.append(
+                "⚠ VL 開了 CPU-MoE → llama.cpp 的 --fit 會因為 tensor override 已被設定而"
+                "直接放棄(fit.cpp:「tensor_buft_overrides already set by user, abort」),"
+                f"所以本工具改寫 -ngl 99 --fit off,不再假裝有 --fit-target {VL_FIT_TARGET_MIB} 的保護。"
+                "沒有自動退讓的安全網:層數填太低會在載入或第一張圖片時 OOM,"
+                "請用 nvidia-smi 確認,不夠就把層數調高。"
+            )
+        else:
+            notes.append(
+                "VL 依當下剩餘 VRAM 自動 offload(llama.cpp 會另計 mmproj worst-case memory)。"
+            )
         notes.append(
             "CPU-MoE 那題顯示的 GPU 用量只算 GGUF 權重(未計 KV cache / compute buffer /"
             " 共卡的附屬服務),是找起點用的粗估;VRAM/RAM 真的放不放得下,"

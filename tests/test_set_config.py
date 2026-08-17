@@ -832,10 +832,13 @@ def test_vl_cpu_moe_is_asked_and_written_for_moe_vl(tmp_path):
     assert partial.returncode == 0, partial.stderr + partial.stdout
     vl_params = _read_deployment(tmp_path)["services"]["vl"]["parameters"]
     assert vl_params["n_cpu_moe"] == 3
-    # VL 的 --fit 機制不變:llama.cpp 會把 expert override 一起算進 fit
-    assert vl_params["fit"] == "on"
-    assert vl_params["gpu_layers"] == "auto"
+    # CPU-MoE 之下 llama.cpp 的 --fit 一定會 abort(tensor override 已被設定),
+    # 所以不能再寫一組不會生效的 --fit on/--fit-target,改成明寫 -ngl 99 --fit off。
+    assert vl_params["fit"] == "off"
+    assert vl_params["gpu_layers"] == 99
+    assert "fit_target" not in vl_params
     assert "cpu_moe" not in vl_params
+    assert "--fit 會因為 tensor override" in partial.stdout   # 安全網消失要講明
 
     full = _run(tmp_path, *YES_TWO_GPU, "--vl-cpu-moe", "--no-preview",
                 "--models-dir", str(models))
@@ -849,6 +852,9 @@ def test_vl_cpu_moe_is_asked_and_written_for_moe_vl(tmp_path):
     assert off.returncode == 0, off.stderr + off.stdout
     vl_params = _read_deployment(tmp_path)["services"]["vl"]["parameters"]
     assert "cpu_moe" not in vl_params and "n_cpu_moe" not in vl_params
+    # 沒有 CPU-MoE → fit 真的能用,維持原本的自動配置
+    assert (vl_params["fit"], vl_params["gpu_layers"]) == ("on", "auto")
+    assert vl_params["fit_target"] == 3072
 
 
 def test_dense_vl_skips_cpu_moe_question_with_reason(tmp_path):

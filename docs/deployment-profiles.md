@@ -52,9 +52,11 @@ aicode/doctor 與 `~/start.sh` 各讀一份設定(set_config 偵測到會警告)
   以及 `cpu_moe: true`(→ `--cpu-moe`)；VL 也支援 `fit` / `fit_target`，讓最後
   啟動的 VL 依其他 aux 實際占用保留 VRAM。`cpu_moe` 與部分 offload 的
   `n_cpu_moe`(→ `--n-cpu-moe`)**只允許 main 與 vl**(embedding / reranker
-  拒絕),且同一個 role 不可同時設定這兩鍵。VL 的 `--fit on` 與 CPU-MoE 可以並存:
-  llama.cpp 的 `--fit` 只調整「未指定」的參數,並會把 expert 的 buffer override
-  一併算進 fit 計算。
+  拒絕),且同一個 role 不可同時設定這兩鍵。**`--fit` 與 CPU-MoE 互斥**:llama.cpp 的
+  `common_params_fit_impl` 一看到 `tensor_buft_overrides` 已被使用者設定就直接 abort
+  (只印一行 WARN 就繼續載入,而 `-ngl auto` 的語意是「全部層上 GPU」)。因此
+  `set_config.sh` 在 VL 套用 CPU-MoE 時會改寫 `gpu_layers: 99` + `fit: "off"`,
+  不寫不會生效的 `fit_target`——沒有自動退讓的安全網,層數要自己抓。
   `set_config.sh` 只在偵測到 MoE expert tensors 時詢問 CPU-MoE(main 與 VL 各一題,
   沒有 y/n 分流,直接問「幾層 experts 留 RAM」;無預設答案,只給一個推薦區間
   (下界 = 權重剛好放得進該 role 所選 GPU 目前 free VRAM 的層數,上界 = 全部移到

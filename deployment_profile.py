@@ -63,8 +63,9 @@ _ROLE_PARAMETERS = {
     "embedding": _COMMON_PARAMETERS | {"embedding", "pooling"},
     "reranker": _COMMON_PARAMETERS | {"embedding", "pooling", "reranking"},
     # VL 最後啟動，可用 llama.cpp --fit 依前兩個 aux 的實際占用保留 VRAM。
-    # MoE VL 模型同樣可以把 experts 釘進 RAM：--fit 會把 expert 的 buffer
-    # override 一併算進 fit 計算，兩者可以並存。
+    # MoE VL 模型同樣可以把 experts 釘進 RAM。注意 llama.cpp 的 --fit 與 tensor
+    # override 互斥（common_params_fit_impl 見到 tensor_buft_overrides 已被設定就
+    # abort），所以 set_config 在 VL 套 CPU-MoE 時會改寫 -ngl 99 --fit off。
     "vl": _COMMON_PARAMETERS | {"fit", "fit_target", "cpu_moe", "n_cpu_moe"},
 }
 _BARE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,191}$")
