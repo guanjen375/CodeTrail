@@ -103,6 +103,14 @@ INDEX_ARTIFACT_FILES = frozenset({
     f"{_CACHE_BASE}_emb.npz",
 })
 
+# 壞 pattern 的訊息刻意不含 pattern 內容。這個檔的契約是「永不進 repo、永不出現在
+# 任何輸出」,而 pattern 就是樹狀結構本身(`nda_customer_x/...`);fatal 訊息會被貼進
+# issue。改用「第幾個 root 的第幾條」定位,使用者自己回去看檔案就找得到。
+_UNCOMPILABLE_HINT = (
+    "無法編譯成 regex。訊息刻意不列出 pattern 內容 —— pattern 會洩漏樹狀結構,"
+    "請用位置回去對照設定檔。常見原因是壞掉的字元類(例如 [z-a] 這種反向範圍)。"
+)
+
 _windows_perm_notice_shown = False
 
 
@@ -177,6 +185,7 @@ def compile_pattern(pattern: str) -> re.Pattern[str]:
 
     壞的字元類(例如 ``[z-a]``)一律轉成 IndexScopeError:呼叫端只 catch
     IndexScopeError,漏出裸的 re.error 會變成 traceback 而不是乾淨的 fatal。
+    訊息**不含 pattern 內容**,理由見 _UNCOMPILABLE_HINT。
     """
     segs, dir_only, anchored = _split_pattern(pattern)
     body: list[str] = []
@@ -199,8 +208,10 @@ def compile_pattern(pattern: str) -> re.Pattern[str]:
     prefix = "" if anchored else "(?:.*/)?"
     try:
         return re.compile("^" + prefix + core_re + suffix + r"\Z")
-    except re.error as exc:
-        raise IndexScopeError(f"pattern {pattern!r} 無法編譯: {exc}") from exc
+    except re.error:
+        # from None 是必要的:re.error 的訊息本身會嵌入出錯的字元
+        # (例如 "bad character range z-a"),掛在 exception chain 上照樣被印出來。
+        raise IndexScopeError(f"pattern {_UNCOMPILABLE_HINT}") from None
 
 
 def literal_prefix(pattern: str) -> str | None:
@@ -331,7 +342,12 @@ def _validate_patterns(kind: str, values: object, root_label: str) -> tuple[str,
             raise IndexScopeError(
                 f"{root_label} 的 {kind}[{i}] 含 '..' 段 —— pattern 只能相對 root 往下"
             )
-        compile_pattern(item)          # 壞 regex 在 loader 就 fail-loud
+        try:
+            compile_pattern(item)      # 壞 regex 在 loader 就 fail-loud
+        except IndexScopeError:
+            raise IndexScopeError(
+                f"{root_label} 的 {kind}[{i}] {_UNCOMPILABLE_HINT}"
+            ) from None
         out.append(item)
     return tuple(out)
 

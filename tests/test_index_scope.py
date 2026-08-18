@@ -1016,3 +1016,66 @@ def test_index_stats_exits_two_on_bad_scope_file(tree, tmp_path):
     assert proc.returncode == 2, proc.stdout
     assert "[FATAL]" in proc.stderr
     assert "Traceback" not in proc.stderr
+
+
+def test_backfill_failure_leaves_no_partial_index(tree, monkeypatch, clean_scan_cache):
+    """backfill 途中 embedding server 掛掉:不能留下半成品索引。
+
+    回歸:原本 backfill 在清理 partial index 的 try/except 之外,失敗後 self.index
+    仍非空 → query() 不重建、_refresh_if_stale 也因為 _indexed_file_hashes is None
+    直接 return,整個 MCP process 一路用缺 embedding 的索引降級下去。
+    """
+    code_rag = clean_scan_cache
+    rag = code_rag.CodeRAG(str(tree))
+    kept = sorted(_indexed(rag.scope))
+    _seed_cache_with_lazy_holes(rag, kept, holes=set(kept))
+
+    outage = {"on": True}
+
+    def flaky(_text):
+        if outage["on"]:
+            raise RuntimeError("embedding server unreachable at test URL")
+        return [1.0, 0.0]
+
+    monkeypatch.setattr(rag, "_get_embedding", flaky)
+    with pytest.raises(RuntimeError, match="embedding server unreachable"):
+        rag.build_index(verbose=False)
+
+    assert rag.index == [], "半成品索引沒清掉 → query() 不會重建"
+    assert rag.embeddings is None
+    assert rag._indexed_file_hashes is None, "_refresh_if_stale 會被舊 hash 卡住"
+
+    # server 恢復:同一個物件必須能重建,而且快取的洞要補好
+    outage["on"] = False
+    code_rag._INDEX_SCAN_CACHE.clear()
+    rag.build_index(verbose=False)
+    assert rag.index and rag.embeddings is not None
+    meta = json.loads(rag.cache_meta_file.read_text(encoding="utf-8"))
+    assert not [
+        rel for rel, entry in meta["file_cache"].items()
+        for emb in entry["embeddings"] if not emb
+    ]
+
+
+def test_uncompilable_pattern_error_never_leaks_pattern_content(tree, tmp_path, monkeypatch):
+    """壞 pattern 的 fatal 訊息不得帶 pattern 內容 —— pattern 就是樹狀結構本身。"""
+    secret = "customer_tree_delta"
+    _write_scope(tmp_path, monkeypatch, tree, exclude=[f"{secret}/[z-a]/**"])
+
+    with pytest.raises(IndexScopeError) as exc:
+        load_scope_config(tree)
+
+    message = str(exc.value)
+    assert secret not in message
+    assert "bad character range" not in message, "底層 re.error 的訊息也帶片段"
+    assert "roots[0]" in message and "exclude[0]" in message, "要能靠位置定位"
+    # from None:exception chain 上掛著 re.error 一樣會被 traceback 印出來
+    assert exc.value.__cause__ is None
+    assert exc.value.__suppress_context__ is True
+
+    scope_file = tmp_path / "index-scope.json"
+    proc = _run_stats(["--root", str(tree)],
+                      env_extra={"AICODE_INDEX_SCOPE_FILE": str(scope_file)})
+    assert proc.returncode == 2
+    assert secret not in proc.stdout + proc.stderr
+    assert "Traceback" not in proc.stderr

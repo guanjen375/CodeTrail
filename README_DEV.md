@@ -349,6 +349,11 @@ root 內)→ 不是實際載入的 index-scope.json → 是 regular file。
 ```
 
 - **檔案不存在 = 正常預設**,不 fail-loud:絕大多數部署者一輩子不需要這個檔。
+- **錯誤訊息永遠不含 pattern 內容。** pattern 就是樹狀結構本身
+  (`nda_customer_x/...`),而 fatal 訊息會被貼進 issue。一律用
+  `roots[i] 的 exclude[j]` 定位;壞 regex 連底層 `re.error` 的訊息都不能轉述
+  (它會嵌入出錯的字元),`raise ... from None` 也是必要的,否則 exception chain
+  照樣把它印出來。
 - **檔案存在但壞掉 = fail-loud**:未知鍵、schema_version 不符、重複 selector、
   非絕對路徑 `root`、pattern 衛生違規(`!` / `..` 段 / 空 / NUL / 每 root >200 條 /
   單條 >512 字元)、POSIX 權限不是 owner-only(訊息附 `chmod 600`)。
@@ -381,6 +386,11 @@ schema 版本)寫進 `.code_rag_cache_meta.json`。
   起來**。索引縮小正是 index scope 的主要場景,所以這條是必修,不是防禦性程式碼。
   回歸鎖:`test_dense_rebuild_backfills_lazy_embedding_holes` /
   `test_lazy_index_shrunk_by_scope_still_builds`。
+- **backfill 失敗要走 `_reset_partial_index()`**:embedding server 中途掛掉時,
+  index / embeddings / `_indexed_file_hashes` 三個都得清掉。留任何一個,`query()`
+  就會因為 index 非空而不重建(`_refresh_if_stale` 也因為 hashes is None 直接
+  return),整個 MCP process 會一路用缺 embedding 的索引降級下去。回歸鎖:
+  `test_backfill_failure_leaves_no_partial_index`。
 - scope 熱重載是另案;改了設定要重啟 MCP server。
 
 ### scripts/index_stats.py

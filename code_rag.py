@@ -556,8 +556,7 @@ class CodeRAG:
             except RuntimeError:
                 # Embedding failures must not leave a partial index that makes
                 # the next query skip build_index after the server recovers.
-                self.index = []
-                self.embeddings = None
+                self._reset_partial_index()
                 raise
             except Exception as e:
                 print(f"[CODE_RAG] 索引 {rel_path} 時發生錯誤: {e}", file=sys.stderr)
@@ -567,17 +566,23 @@ class CodeRAG:
 
         # 將 embedding 轉換為 numpy array 並預先 L2 normalize
         if HAS_NUMPY and embeddings_list and not self._lazy_embed:
-            self._backfill_cached_embedding_gaps(embeddings_list, verbose=verbose)
+            try:
+                self._backfill_cached_embedding_gaps(embeddings_list, verbose=verbose)
+            except Exception:
+                # 和上面 files_to_index 那個 except 同一個契約:embedding 失敗不能
+                # 留下半成品索引。留著的話 query() 會因為 self.index 非空而不再
+                # 重建(_refresh_if_stale 也因為 _indexed_file_hashes is None 直接
+                # return),整個 MCP process 就一路用缺 embedding 的索引降級下去。
+                self._reset_partial_index()
+                raise
             dimensions = {len(embedding) for embedding in embeddings_list if embedding}
             if not dimensions or any(not embedding for embedding in embeddings_list):
-                self.index = []
-                self.embeddings = None
+                self._reset_partial_index()
                 raise RuntimeError(
                     "Code RAG full index contains missing embeddings; refusing zero padding"
                 )
             if len(dimensions) != 1:
-                self.index = []
-                self.embeddings = None
+                self._reset_partial_index()
                 raise RuntimeError(
                     f"Code RAG embedding dimension mismatch: {sorted(dimensions)}; "
                     "zero-padding/truncation is forbidden"
@@ -630,6 +635,17 @@ class CodeRAG:
         }
         if current_hashes != self._indexed_file_hashes:
             self.build_index(verbose=False, _current_files=current_files)
+
+    def _reset_partial_index(self) -> None:
+        """把半成品索引清乾淨,保證下一次 query 一定會重建。
+
+        三個欄位缺一不可:index 非空 → query() 不重建;_indexed_file_hashes 非 None
+        → _refresh_if_stale 會拿舊 hash 比對。留任何一個都會讓 server 恢復之後,
+        同一個 process 繼續用壞掉的索引。
+        """
+        self.index = []
+        self.embeddings = None
+        self._indexed_file_hashes = None
 
     def _backfill_cached_embedding_gaps(self, embeddings_list: list, *, verbose: bool) -> None:
         """dense 模式復用 per-file 快取時,把 lazy 模式留下的空 embedding 補回來。
