@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -506,3 +507,119 @@ def test_sanitize_falls_back_to_hard_cut_without_a_boundary():
     out = cg.sanitize_ctx("一" * 50, max_chars=10)
 
     assert len(out) == 10
+
+
+# ============================================================
+# GPT review 回歸（2026-08-18）
+# ============================================================
+def test_live_writer_is_not_stolen_after_an_hour(tmp_path: Path, monkeypatch):
+    """跑超過一小時的活 writer 不得被誤判成 stale。
+
+    大型 rebuild 本來就可能超過一小時（237 chunk ≈ 80 分鐘）。存活判定要看心跳，
+    不是看總時長。
+    """
+    root = tmp_path / "cache"
+    holder = cg.SingleWriterLock(root)
+    holder.acquire()
+    # 假裝這把鎖是兩小時前建立的，但持有者（本行程）還活著且剛續過期
+    two_hours_ago = time.time() - 7200
+    os.utime(holder.path, (two_hours_ago, two_hours_ago))
+    holder.heartbeat()   # 活著 → 心跳把 mtime 拉回現在
+
+    with pytest.raises(cg.ContextLockError, match="心跳"):
+        cg.SingleWriterLock(root).acquire()
+
+
+def test_a_taken_over_lock_is_not_deleted_by_the_old_holder(tmp_path: Path):
+    """被接管過的鎖，原持有者收工時不得刪掉它。"""
+    root = tmp_path / "cache"
+    first = cg.SingleWriterLock(root)
+    first.acquire()
+    # 模擬「原持有者被判定為 stale 而被接手」
+    first.path.unlink()
+    second = cg.SingleWriterLock(root)
+    second.acquire()
+
+    first.release()   # 舊持有者收工
+
+    assert second.path.exists(), "現任 writer 的鎖被上一任刪掉了"
+    second.release()
+    assert not second.path.exists()
+
+
+def test_dead_holder_is_still_taken_over(tmp_path: Path):
+    root = tmp_path / "cache"
+    root.mkdir(parents=True)
+    (root / ".writer.lock").write_text(
+        json.dumps({"pid": 2 ** 22, "started_at": 0, "token": "old"}), encoding="utf-8"
+    )
+
+    cg.SingleWriterLock(root).acquire()  # 持有者已死 → 接手，不得卡住
+
+
+def test_summary_fingerprint_tracks_the_real_request_budget(
+    tmp_path: Path, monkeypatch, model_file
+):
+    """摘要指紋要記實際送出的 max_tokens，不是窗預算。
+
+    請求端另外加了 reasoning 額度；指紋若只記 budget_tokens，調大 reasoning
+    budget 之後仍會命中舊摘要，等於改了生成參數卻沒失效。
+    """
+    monkeypatch.setattr(config, "RESERVED_OUTPUT_TOKENS", 0)
+    monkeypatch.setattr(config, "KB_CONTEXT_REASONING_TOKENS", 512)
+    state = _install_fake_transport(
+        monkeypatch, model_file, [_completion("摘要"), _completion("脈絡")], n_ctx=2048
+    )
+    document = _document(60, body="內容片段" * 30)
+    kb_path = tmp_path / "knowledge.json"
+    cache_dir = str(tmp_path / "c")
+
+    def _summary_entries() -> int:
+        root = cg.cache_root_for(kb_path, cache_dir)
+        return sum(
+            1 for path in root.iterdir()
+            if path.suffix == ".json"
+            and json.loads(path.read_text(encoding="utf-8")).get("meta", {}).get("kind")
+            == "summary"
+        )
+
+    cg.generate_document_context(document, kb_path=kb_path, cache_dir=cache_dir)
+    before = _summary_entries()
+    assert before, "第一次 rebuild 應該留下摘要快取"
+
+    # 只改 reasoning 額度：實際送出的 max_tokens 變了，摘要指紋必須跟著失效
+    monkeypatch.setattr(config, "KB_CONTEXT_REASONING_TOKENS", 2048)
+    cg.generate_document_context(_document(60, body="內容片段" * 30),
+                                 kb_path=kb_path, cache_dir=cache_dir)
+
+    assert _summary_entries() > before, (
+        "調整生成參數之後摘要仍命中舊快取（指紋沒涵蓋實際送出的 max_tokens）"
+    )
+    assert state["chat_calls"] > 0
+
+
+def test_empty_summary_is_retried_and_not_cached(tmp_path: Path, monkeypatch, model_file):
+    """空摘要不進快取：記下來等於毒化之後每一次 rebuild。"""
+    monkeypatch.setattr(config, "RESERVED_OUTPUT_TOKENS", 0)
+    state = _install_fake_transport(
+        monkeypatch, model_file, [_completion(""), _completion(""), _completion("脈絡")],
+        n_ctx=2048,
+    )
+    document = _document(60, body="內容片段" * 30)
+
+    cg.generate_document_context(
+        document, kb_path=tmp_path / "knowledge.json", cache_dir=str(tmp_path / "c")
+    )
+
+    root = cg.cache_root_for(tmp_path / "knowledge.json", str(tmp_path / "c"))
+    cached = [
+        json.loads(p.read_text(encoding="utf-8"))
+        for p in root.iterdir() if p.suffix == ".json"
+    ]
+    assert cached, "chunk 的 ctx 還是要落盤"
+    empty_summaries = [
+        entry for entry in cached
+        if entry.get("meta", {}).get("kind") == "summary" and not entry.get("value")
+    ]
+    assert not empty_summaries, "空摘要被寫進快取了（會毒化之後每一次 rebuild）"
+    assert state["chat_calls"] >= 2, "空摘要至少要重試一次"

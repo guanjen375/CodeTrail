@@ -15,7 +15,7 @@
     "expected": {
       "file": "knowledge.py",
       "symbol": "query",
-      "line": 2104
+      "line": 2126
     },
     "context": "."
   },

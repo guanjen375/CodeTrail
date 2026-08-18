@@ -33,6 +33,7 @@ import os
 import re
 import time
 import unicodedata
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -373,13 +374,24 @@ class ContextCache:
 
 
 class SingleWriterLock:
-    """per-KB 的 single-writer 鎖：搶不到就明確報錯，不排隊。"""
+    """per-KB 的 single-writer 鎖：搶不到就明確報錯，不排隊。
 
-    STALE_SECONDS = 3600
+    存活判定靠**心跳**，不靠總時長。只看「pid 活著且鎖建立不到一小時」是錯的：
+    大型 rebuild 本來就可能跑超過一小時（實測 237 chunk ≈ 80 分鐘），到點之後
+    活著的 writer 會被後來者奪走鎖，而原 writer 收工時還會把後來者的鎖刪掉。
+    改成持有者每處理完一個 chunk 就續期；「活著但心跳停了很久」才算 stale
+    （那代表 pid 被回收給不相干的行程用了）。逾時因此可以取短，真正的死鎖也
+    清得更快。
+
+    釋放時比對 token：鎖若已被接管，這個檔就不屬於自己，不能刪。
+    """
+
+    STALE_SECONDS = 900
 
     def __init__(self, root: Path):
         self.path = Path(root) / ".writer.lock"
         self._held = False
+        self._token = ""
 
     def _read(self) -> Optional[Dict]:
         try:
@@ -407,29 +419,46 @@ class SingleWriterLock:
             holder = self._read() or {}
             pid = int(holder.get("pid") or 0)
             try:
-                age = time.time() - self.path.stat().st_mtime
+                silence = time.time() - self.path.stat().st_mtime
             except OSError:
-                age = 0.0
-            if self._alive(pid) and age < self.STALE_SECONDS:
+                silence = 0.0
+            if self._alive(pid) and silence < self.STALE_SECONDS:
                 raise ContextLockError(
                     f"另一個 rebuild 正在寫這個 KB 的 chunk 脈絡（pid {pid}，"
-                    f"{int(age)} 秒前）。等它結束，或確認那個行程已經死了之後刪掉 "
-                    f"{self.path}。"
+                    f"{int(silence)} 秒前還有心跳）。等它結束，或確認那個行程真的"
+                    f"死了之後刪掉 {self.path}。"
                 )
-            # stale：持有者已死或超時，接手。
+            # stale：持有者已死，或活著但心跳停了很久（pid 被回收）。接手。
             self.path.unlink(missing_ok=True)
         try:
             fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError as exc:
             raise ContextLockError(f"context lock race on {self.path}") from exc
+        token = uuid.uuid4().hex
         with open(fd, "w", encoding="utf-8") as handle:
-            json.dump({"pid": os.getpid(), "started_at": time.time()}, handle)
+            json.dump({"pid": os.getpid(), "started_at": time.time(), "token": token}, handle)
         self._held = True
+        self._token = token
+
+    def heartbeat(self) -> None:
+        """續期。持有者每做完一個單位工作就叫一次，證明自己還活著。"""
+        if not self._held:
+            return
+        try:
+            os.utime(self.path, None)
+        except OSError:
+            pass
 
     def release(self) -> None:
-        if self._held:
+        if not self._held:
+            return
+        # 只刪自己的鎖：被接管過的話這個檔已經屬於別人，刪掉等於毀掉現任 writer
+        # 的互斥保護。
+        holder = self._read() or {}
+        if holder.get("token") == self._token:
             self.path.unlink(missing_ok=True)
-            self._held = False
+        self._held = False
+        self._token = ""
 
     def __enter__(self):
         self.acquire()
@@ -646,6 +675,7 @@ class ContextGenerator:
         cache_dir: Optional[str] = None,
         model: Optional[str] = None,
         n_ctx: Optional[int] = None,
+        lock: Optional["SingleWriterLock"] = None,
     ):
         self.base_url = (base_url or config.LLAMA_BASE_URL).rstrip("/")
         ensure_endpoint_allowed(self.base_url)
@@ -662,12 +692,19 @@ class ContextGenerator:
         self.n_ctx = int(resolved_ctx)
         self.cache = ContextCache(cache_root_for(kb_path, cache_dir))
         self.report = GenerationReport()
+        # 每做完一個單位工作就替鎖續期：rebuild 動輒跑一小時以上，沒有心跳的話
+        # 活著的 writer 會被誤判成 stale 而被奪走鎖。
+        self._lock = lock
         self.max_ctx_tokens = int(getattr(config, "KB_CONTEXT_TARGET_TOKENS", 100))
         # 請求端的上限要蓋住 reasoning，回應端才有東西可截。
         self.request_max_tokens = self.max_ctx_tokens + int(
             getattr(config, "KB_CONTEXT_REASONING_TOKENS", 512)
         )
         self.timeout = int(getattr(config, "KB_CONTEXT_TIMEOUT", 180))
+
+    def _beat(self) -> None:
+        if self._lock is not None:
+            self._lock.heartbeat()
 
     # -------------------------------------------------- LLM
     def _params(self) -> Dict:
@@ -729,7 +766,13 @@ class ContextGenerator:
         max_words = max(80, min(400, budget_tokens // 3))
         prompt = SUMMARY_PROMPT_V1.format(segment=segment, max_words=max_words)
         messages = [{"role": "user", "content": prompt}]
-        params = {"temperature": 0, "max_tokens": budget_tokens}
+        # 指紋要記**實際送出的**參數。之前記的是 budget_tokens，但請求端另外加了
+        # reasoning 額度——調大 reasoning budget 之後仍會命中舊摘要，等於改了生成
+        # 參數卻沒有失效。
+        request_tokens = budget_tokens + int(
+            getattr(config, "KB_CONTEXT_REASONING_TOKENS", 512)
+        )
+        params = {"temperature": 0, "max_tokens": request_tokens, "budget_tokens": budget_tokens}
         fingerprint = generation_fingerprint(
             messages=messages, params=params, identity=self.identity,
             kind="summary", extra=extra,
@@ -739,13 +782,17 @@ class ContextGenerator:
             self.report.cache_hits += 1
             return str(cached.get("value", ""))
 
-        text, _ = self._call(
-            messages,
-            max_tokens=budget_tokens + int(getattr(config, "KB_CONTEXT_REASONING_TOKENS", 512)),
-        )
+        text, _ = self._call(messages, max_tokens=request_tokens)
         summary = sanitize_ctx(text, max_chars=tokens_to_chars(budget_tokens))
-        # write-through：每一層摘要成功就落盤，中斷重跑只補缺。
-        self.cache.put(fingerprint, summary, {"kind": "summary"})
+        if not summary:
+            # 空摘要會讓底下每個 chunk 的窗都少掉文件級脈絡。重試一次；還是空就
+            # 不進快取——把它記下來等於毒化之後每一次 rebuild。
+            text, _ = self._call(messages, max_tokens=request_tokens)
+            summary = sanitize_ctx(text, max_chars=tokens_to_chars(budget_tokens))
+        if summary:
+            # write-through：每一層摘要成功就落盤，中斷重跑只補缺。
+            self.cache.put(fingerprint, summary, {"kind": "summary"})
+        self._beat()
         return summary
 
     def document_summary(self, document: ExtractedDocument, budget_tokens: int) -> str:
@@ -858,6 +905,7 @@ class ContextGenerator:
             ctx, absent_reason = self._generate_one(messages)
             self.cache.put(fingerprint, ctx, {"absent_reason": absent_reason})
             self._apply(chunk, ctx, fingerprint, absent_reason=absent_reason)
+            self._beat()
 
         self.report.elapsed_seconds = time.time() - started
         self._enforce_coverage()
@@ -926,11 +974,27 @@ def generate_document_context(
 ) -> GenerationReport:
     """替一份文件的所有 chunk 生成脈絡。single-writer 鎖在這一層取得。"""
     root = cache_root_for(kb_path, cache_dir)
-    with SingleWriterLock(root):
-        generator = ContextGenerator(
-            kb_path=kb_path, base_url=base_url, cache_dir=cache_dir, n_ctx=n_ctx
+    with SingleWriterLock(root) as lock:
+        return generate_with_lock(
+            document, kb_path=kb_path, base_url=base_url, cache_dir=cache_dir,
+            n_ctx=n_ctx, lock=lock,
         )
-        try:
-            return generator.generate_for_document(document)
-        finally:
-            generator.close()
+
+
+def generate_with_lock(
+    document: ExtractedDocument,
+    *,
+    kb_path: Path,
+    base_url: Optional[str] = None,
+    cache_dir: Optional[str] = None,
+    n_ctx: Optional[int] = None,
+    lock: Optional[SingleWriterLock] = None,
+) -> GenerationReport:
+    """鎖已經在外層持有時用這個（rebuild 一次多份文件共用一把鎖）。"""
+    generator = ContextGenerator(
+        kb_path=kb_path, base_url=base_url, cache_dir=cache_dir, n_ctx=n_ctx, lock=lock
+    )
+    try:
+        return generator.generate_for_document(document)
+    finally:
+        generator.close()

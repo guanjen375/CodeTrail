@@ -250,6 +250,17 @@ class KnowledgeBase:
                 npz_loaded = self._load_embeddings_from_npz()
 
                 if not npz_loaded:
+                    # 有 ctx 的 KB 一律不准走 legacy inline 回退。那條路徑會把
+                    # retrieval 矩陣直接別名成 gate，於是 KB_CONTEXT_USE=0、拒答
+                    # 門檻、信心判斷全都吃到含生成脈絡的向量——正是雙訊號要擋的
+                    # 循環 grounding。gate 向量只能來自驗過的 NPZ 第二組矩陣。
+                    if self._has_ctx:
+                        raise KnowledgeStoreError(
+                            "this knowledge base carries generated chunk context but its "
+                            f"embeddings could not be loaded from {self._emb_path}; refusing "
+                            "to fall back to inline vectors (that would alias the retrieval "
+                            "matrix as the decision gate). Rebuild the knowledge base."
+                        )
                     # Legacy JSON may still contain inline embeddings.  Missing
                     # vectors are not a lexical-only fallback: fail loudly.
                     self._precompute_embeddings()
@@ -321,6 +332,7 @@ class KnowledgeBase:
                 )
             return False
         if not self._emb_path.exists():
+            # 有 ctx 的情況由 _load 統一拒載（訊息在那邊，涵蓋所有 return False）
             return False
 
         try:
@@ -567,8 +579,18 @@ class KnowledgeBase:
             print(f"[WARN] 儲存 .npz 失敗: {e}")
 
     def _precompute_embeddings(self):
-        """預計算並正規化 embeddings 到 numpy array（legacy：JSON inline 向量）"""
+        """預計算並正規化 embeddings 到 numpy array（legacy：JSON inline 向量）
+
+        這條路徑會把 retrieval 矩陣別名成 gate，所以只准用在確定沒有 ctx 的 KB。
+        呼叫端（_load）已經擋過一次；這裡是第二道，避免以後有人繞過去。
+        """
         self._index_chunks()
+        if context_signals.has_any_ctx(self.chunks):
+            raise KnowledgeStoreError(
+                "refusing to build a gate matrix from inline vectors for a knowledge base "
+                "that carries generated chunk context; rebuild it so the NPZ has both "
+                "matrices"
+            )
         if not HAS_NUMPY or not self.chunks:
             self._embeddings = None
             return

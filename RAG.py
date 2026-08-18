@@ -19,6 +19,7 @@ import sys
 import re
 import json
 import hashlib
+import contextlib
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
@@ -1286,14 +1287,30 @@ def generate_gate_embeddings(chunks: List[Dict], cache_dir: Path = None) -> List
 # ============================================================
 # 主程式
 # ============================================================
-def load_knowledge_base(output_path: Path) -> Dict:
-    """載入現有知識庫，不存在則建立空的"""
+def load_knowledge_base(
+    output_path: Path, *, _already_locked: bool = False, _quiet: bool = False
+) -> Dict:
+    """載入現有知識庫，不存在則建立空的
+
+    `_already_locked` 給「load→改→save 要在同一把鎖裡完成」的呼叫端用。flock 是
+    綁在 open file description 上的：同一個行程另開一個 fd 再上鎖會**擋住自己**，
+    所以不能靠重入。
+    """
     if output_path.exists():
-        with knowledge_store_lock(output_path, exclusive=False):
+        @contextlib.contextmanager
+        def _maybe_lock():
+            if _already_locked:
+                yield
+            else:
+                with knowledge_store_lock(output_path, exclusive=False):
+                    yield
+
+        with _maybe_lock():
             with open(output_path, 'r', encoding='utf-8') as f:
                 kb = json.load(f)
             _restore_embeddings_from_npz(kb, output_path)
-            print(f"[INFO] 載入現有知識庫: {len(kb.get('chunks', []))} 個區塊")
+            if not _quiet:
+                print(f"[INFO] 載入現有知識庫: {len(kb.get('chunks', []))} 個區塊")
             return kb
 
     # 建立空的知識庫
@@ -1593,7 +1610,6 @@ def _commit_document_to_kb(
     output_file: str,
     *,
     label: str = "文件",
-    kb: Optional[Dict] = None,
     generate_context: bool = False,
 ) -> bool:
     """把一份 ExtractedDocument 併進知識庫（同名文件先移除舊 chunks）。
@@ -1602,27 +1618,18 @@ def _commit_document_to_kb(
     save）。共用之後「一份文件怎麼進 KB」只有一條路；要在入庫前多做一步
     （例如生成 chunk 脈絡）也只有一個掛點，不會漏掉某個入口。
 
-    kb 已載入時直接沿用：add_document 會先載入，好讓壞掉的 KB 在付出抽取成本
-    前就 fail。回傳 False 代表沒有內容可入庫（呼叫端決定 exit 還是 return）。
+    **順序是刻意的**：脈絡生成與 embedding 都不需要現有 KB，所以全部在鎖外做完；
+    只有「載入 → 併入 → 寫回」進同一把 exclusive store lock。以前是先載入、再花
+    幾十分鐘生成、最後拿那份過期快照覆寫——中間有人入庫的文件會整份消失
+    （lost update）。原子的 JSON/NPZ 提交只能防半套檔案，防不了這個。
+
+    回傳 False 代表沒有內容可入庫（呼叫端決定 exit 還是 return）。
     """
     output_path = Path(output_file)
     new_chunks = document.chunks
     if not new_chunks:
         print("[WARN] 沒有提取到任何內容")
         return False
-
-    # 載入現有知識庫
-    if kb is None:
-        kb = load_knowledge_base(output_path)
-
-    # 檢查是否已存在同名文件（若有則先移除舊的）
-    doc_name = document.source
-    if doc_name in kb["metadata"]["documents"]:
-        print(f"[INFO] 更新現有{label}: {doc_name}")
-        kb["chunks"] = [c for c in kb["chunks"] if c["source"] != doc_name]
-        kb["metadata"]["documents"].remove(doc_name)
-    else:
-        print(f"[INFO] 新增{label}: {doc_name}")
 
     print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
 
@@ -1646,12 +1653,25 @@ def _commit_document_to_kb(
         content_hash = hashlib.md5(chunk['content'].encode()).hexdigest()[:8]
         chunk['id'] = f"{chunk['source']}::p{chunk['page']}::c{chunk['chunk_index']}::{content_hash}"
 
-    # Append 到知識庫
-    kb["chunks"].extend(new_chunks)
-    kb["metadata"]["documents"].append(doc_name)
+    # 這裡開始才碰共用狀態：整段 read-modify-write 在同一把鎖內。
+    with knowledge_store_lock(output_path, exclusive=True):
+        kb = load_knowledge_base(output_path, _already_locked=True)
 
-    # 儲存
-    save_knowledge_base(kb, output_path)
+        # 檢查是否已存在同名文件（若有則先移除舊的）
+        doc_name = document.source
+        if doc_name in kb["metadata"]["documents"]:
+            print(f"[INFO] 更新現有{label}: {doc_name}")
+            kb["chunks"] = [c for c in kb["chunks"] if c["source"] != doc_name]
+            kb["metadata"]["documents"].remove(doc_name)
+        else:
+            print(f"[INFO] 新增{label}: {doc_name}")
+
+        # Append 到知識庫
+        kb["chunks"].extend(new_chunks)
+        kb["metadata"]["documents"].append(doc_name)
+
+        # 儲存
+        save_knowledge_base(kb, output_path, _already_locked=True)
     return True
 
 
@@ -1677,15 +1697,16 @@ def add_document(input_file: str, output_file: str, *, generate_context: bool = 
         print(f"        ELF: {', '.join(sorted(ELF_EXTENSIONS))}")
         sys.exit(1)
 
-    # 先載入現有知識庫：壞掉的 KB 要在付出抽取成本前就 fail
-    kb = load_knowledge_base(output_path)
+    # 先驗一次：壞掉的 KB 要在付出抽取／生成成本前就 fail。真正併入用的快照
+    # 是 _commit_document_to_kb 在鎖裡重新載的那一份。
+    load_knowledge_base(output_path, _quiet=True)
 
     # 處理新文件
     print(f"[INFO] 處理: {input_path.name}")
     document = process_file_document(str(input_path))
 
     if not _commit_document_to_kb(
-        document, output_file, label="文件", kb=kb, generate_context=generate_context
+        document, output_file, label="文件", generate_context=generate_context
     ):
         sys.exit(1)
 
@@ -1782,14 +1803,14 @@ def add_chat_screenshot(image_file: str, output_file: str):
         print(f"        支援: {', '.join(IMAGE_EXTENSIONS)}")
         sys.exit(1)
 
-    # 載入現有知識庫
-    kb = load_knowledge_base(output_path)
+    # 先驗一次：壞掉的 KB 要在付出 VL 成本前就 fail
+    load_knowledge_base(output_path, _quiet=True)
 
     # 處理截圖
     print(f"[INFO] 處理: {image_path.name}")
     document = process_chat_screenshot_document(str(image_path))
 
-    if not _commit_document_to_kb(document, output_file, label="截圖知識", kb=kb):
+    if not _commit_document_to_kb(document, output_file, label="截圖知識"):
         sys.exit(1)
 
 
@@ -2047,8 +2068,8 @@ def add_url(url: str, output_file: str):
         print("        URL 必須以 http:// 或 https:// 開頭")
         sys.exit(1)
 
-    # 載入現有知識庫
-    kb = load_knowledge_base(output_path)
+    # 先驗一次：壞掉的 KB 要在抓網頁前就 fail
+    load_knowledge_base(output_path, _quiet=True)
 
     # 處理網頁
     document = process_url_document(url)
@@ -2057,7 +2078,7 @@ def add_url(url: str, output_file: str):
         print("[ERROR] 無法從網頁提取內容，新增失敗")
         sys.exit(1)
 
-    _commit_document_to_kb(document, output_file, label="網頁知識", kb=kb)
+    _commit_document_to_kb(document, output_file, label="網頁知識")
 
 
 # ============================================================
@@ -2130,14 +2151,14 @@ def add_technical_image(image_file: str, output_file: str):
         print(f"        支援: {', '.join(IMAGE_EXTENSIONS)}")
         sys.exit(1)
 
-    # 載入現有知識庫
-    kb = load_knowledge_base(output_path)
+    # 先驗一次：壞掉的 KB 要在付出 VL 成本前就 fail
+    load_knowledge_base(output_path, _quiet=True)
 
     # 處理圖片
     print(f"[INFO] 處理: {image_path.name}")
     document = process_technical_image_document(str(image_path))
 
-    if not _commit_document_to_kb(document, output_file, label="圖片知識", kb=kb):
+    if not _commit_document_to_kb(document, output_file, label="圖片知識"):
         sys.exit(1)
 
 

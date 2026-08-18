@@ -62,7 +62,8 @@ def _load_npz_meta(json_path: Path) -> dict:
         return {"error": f"NPZ 不存在: {emb_path}"}
     try:
         with np.load(emb_path, allow_pickle=False) as data:
-            return {
+            available = set(getattr(data, "files", []))
+            meta = {
                 "path": str(emb_path),
                 "content_hash_schema": str(data.get("content_hash_schema", "")),
                 "content_hash": str(data.get("content_hash", "")),
@@ -70,7 +71,17 @@ def _load_npz_meta(json_path: Path) -> dict:
                 "embedding_dimension": int(data.get("embedding_dimension", 0)),
                 "rows": int(data["embeddings"].shape[0]),
                 "store_generation": str(data.get("store_generation", "")),
+                "has_gate": "embeddings_gate" in available,
             }
+            if meta["has_gate"]:
+                gate = data["embeddings_gate"]
+                meta.update(
+                    gate_rows=int(gate.shape[0]),
+                    gate_dimension=int(gate.shape[1]) if gate.ndim == 2 else 0,
+                    gate_content_hash=str(data.get("gate_content_hash", "")),
+                    gate_content_hash_schema=str(data.get("gate_content_hash_schema", "")),
+                )
+            return meta
     except Exception as exc:  # NPZ 壞掉不該讓體檢整個死掉
         return {"error": f"NPZ 載入失敗: {exc}"}
 
@@ -94,6 +105,13 @@ def audit(label: str, json_path: Path, show_content: bool) -> dict:
         print(f"  npz dim/rows   : {npz['embedding_dimension']} / {npz['rows']}")
         generation_ok = npz["store_generation"] == str(metadata.get("store_generation", ""))
         print(f"  npz generation : {'一致' if generation_ok else '不一致 ← 拒載條件'}")
+        if npz.get("has_gate"):
+            print(f"  gate 矩陣      : {npz['gate_dimension']} / {npz['gate_rows']}"
+                  f"  schema={npz['gate_content_hash_schema']}")
+            if npz["gate_rows"] != npz["rows"]:
+                print("                   ← 列數與 retrieval 不一致，拒載條件")
+        else:
+            print("  gate 矩陣      : 無")
 
     with_heading = sum(1 for c in chunks if c.get("heading_prefix_chars"))
     with_locator = sum(1 for c in chunks if "char_start" in c and "section_index" in c)
@@ -103,6 +121,19 @@ def audit(label: str, json_path: Path, show_content: bool) -> dict:
           f"{'  ← 舊版 KB，重建後才有' if with_locator == 0 and chunks else ''}")
     print(f"  section 為空      : {empty_section}/{len(chunks)}"
           f"{'  ← 這些 chunk 沒有章節檢索訊號' if empty_section else ''}")
+
+    has_ctx = any(str(c.get("ctx", "") or "").strip() for c in chunks)
+    ctx_count = sum(1 for c in chunks if str(c.get("ctx", "") or "").strip())
+    if has_ctx:
+        print(f"  帶 ctx 的 chunk  : {ctx_count}/{len(chunks)}")
+        if "error" not in npz and not npz.get("has_gate"):
+            print("  [FATAL] 有 ctx 但 NPZ 沒有 gate（content-only）矩陣 —— "
+                  "查詢端會拒載。重建這個 KB。")
+        elif "error" not in npz and npz.get("gate_content_hash_schema") not in (
+            "source-section-content-v2",
+        ):
+            print(f"  [FATAL] gate schema 不對: "
+                  f"{npz.get('gate_content_hash_schema')!r} —— 查詢端會拒載。")
 
     titles = Counter(c.get("section", "") for c in chunks if c.get("section"))
     duplicated = {t: n for t, n in titles.items() if n > 1}
@@ -137,12 +168,25 @@ def structural_diff(a: dict, b: dict) -> None:
               "逐筆比對沒有意義，先確認是不是同一批來源文件")
         return
 
+    import context_signals
+
     content_diff = 0
+    retrieval_input_diff = 0
+    gate_input_diff = 0
     section_diff = []
     other_fields: Counter = Counter()
     for index, (x, y) in enumerate(zip(chunks_a, chunks_b)):
         if x.get("content") != y.get("content"):
             content_diff += 1
+        # 「向量還能不能用」不能只看 content：embedding 輸入還含 source 與
+        # section，contextual schema 另含 ctx。只比 content 會在「同 content、
+        # 不同 section」時錯報「既有向量仍可用」。
+        if context_signals.retrieval_embedding_input(
+            x, use_ctx=True
+        ) != context_signals.retrieval_embedding_input(y, use_ctx=True):
+            retrieval_input_diff += 1
+        if context_signals.gate_embedding_input(x) != context_signals.gate_embedding_input(y):
+            gate_input_diff += 1
         if x.get("section") != y.get("section"):
             section_diff.append((index, x, y))
         for key in set(x) | set(y):
@@ -151,8 +195,14 @@ def structural_diff(a: dict, b: dict) -> None:
             if x.get(key) != y.get(key):
                 other_fields[key] += 1
 
-    print(f"  content 位元組差異: {content_diff}"
-          f"{'  ← 需要重算 embedding' if content_diff else '  ← 既有向量仍可用'}")
+    print(f"  content 位元組差異: {content_diff}")
+    print(f"  retrieval 組字差異: {retrieval_input_diff}")
+    print(f"  gate 組字差異     : {gate_input_diff}")
+    if retrieval_input_diff or gate_input_diff:
+        print("                      ← 這些 chunk 的 embedding 要重算"
+              "（組字含 source / section / ctx，不只 content）")
+    else:
+        print("                      ← 既有向量仍可用")
     print(f"  section 差異      : {len(section_diff)}")
     if other_fields:
         print("  其他欄位差異      : " + ", ".join(

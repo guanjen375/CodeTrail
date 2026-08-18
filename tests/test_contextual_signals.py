@@ -692,3 +692,127 @@ def test_is_high_risk_is_computed_from_gate_scores(tmp_path: Path, monkeypatch):
     # 兩個 chunk 的 gate 向量完全相同 → gate margin = 0 → 必須示警，
     # 而它們的 retrieval 向量是正交的（差距最大）。
     assert meta["is_high_risk"] is True
+
+
+# ============================================================
+# GPT review 回歸（2026-08-18）
+# ============================================================
+def test_ctx_kb_refuses_inline_vector_fallback(tmp_path: Path):
+    """有 ctx 卻沒有 NPZ 時，不准回退到 JSON inline 向量。
+
+    那條路徑會把 retrieval 矩陣直接別名成 gate，於是 KB_CONTEXT_USE=0、拒答門檻、
+    信心判斷全都吃到含生成脈絡的向量——正是雙訊號要擋的東西。
+    """
+    chunks = [
+        _chunk("a", "原文一" * 30, ctx=CTX_TEXT, embedding=[1.0, 0.0]),
+        _chunk("b", "原文二" * 30, ctx=CTX_TEXT, embedding=[0.0, 1.0]),
+    ]
+    json_path = tmp_path / config.KNOWLEDGE_FILE
+    json_path.write_text(
+        json.dumps(
+            {"metadata": {"documents": ["spec_a.md"],
+                          "embedding_model": config.EMBEDDING_MODEL},
+             "chunks": chunks},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    assert not (tmp_path / config.KNOWLEDGE_EMB_FILE).exists()
+
+    with pytest.raises(KnowledgeStoreError, match="inline"):
+        KnowledgeBase(str(json_path))
+
+
+def test_precompute_embeddings_refuses_to_alias_gate_for_a_ctx_kb(tmp_path: Path):
+    """第二道防線：直接呼叫 legacy 路徑也不准替 ctx KB 別名 gate。"""
+    kb = KnowledgeBase(str(tmp_path / "missing.json"))
+    kb.chunks = [_chunk("a", "原文", ctx=CTX_TEXT, embedding=[1.0, 0.0])]
+
+    with pytest.raises(KnowledgeStoreError, match="inline"):
+        kb._precompute_embeddings()
+
+
+def test_concurrent_ingest_is_not_lost(tmp_path: Path, monkeypatch):
+    """入庫途中別人寫進來的文件不得被過期快照覆蓋（lost update）。
+
+    脈絡生成與 embedding 可能跑幾十分鐘；以前是「先載入 → 慢慢算 → 拿那份過期
+    快照覆寫」，中間任何一次入庫都會整份消失。現在昂貴步驟在鎖外做完，
+    載入→併入→寫回收在同一把 exclusive store lock 裡。
+    """
+    monkeypatch.chdir(tmp_path)   # embedding 快取不要落到 repo
+    monkeypatch.setattr(RAG.llama_client, "embed_one", lambda **_kw: [1.0, 0.0])
+    kb_path = tmp_path / config.KNOWLEDGE_FILE
+
+    def _doc(name: str, body: str) -> Path:
+        path = tmp_path / name
+        path.write_text(f"# {name} 章節\n" + body * 200, encoding="utf-8")
+        return path
+
+    first = _doc("spec_a.md", "第一份內容")
+    second = _doc("toolchain_x.md", "第二份內容")
+    third = _doc("other_spec.md", "第三份內容")
+
+    RAG.add_document(str(first), str(kb_path))
+
+    original = RAG.generate_embeddings
+    interleaved = {"done": False}
+
+    def interleave(chunks, cache_dir=None, **kwargs):
+        # 第二份還在算 embedding 時，另一個「行程」把第三份灌進同一個 KB
+        if not interleaved["done"]:
+            interleaved["done"] = True
+            RAG.add_document(str(third), str(kb_path))
+        return original(chunks, cache_dir, **kwargs)
+
+    monkeypatch.setattr(RAG, "generate_embeddings", interleave)
+    RAG.add_document(str(second), str(kb_path))
+
+    documents = json.loads(kb_path.read_text(encoding="utf-8"))["metadata"]["documents"]
+    assert sorted(documents) == ["other_spec.md", "spec_a.md", "toolchain_x.md"], (
+        f"併發寫入的文件被覆蓋掉了: {documents}"
+    )
+
+
+def _run_ab_tool(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "kb_ab_compare.py"), *args],
+        capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL, check=False,
+    )
+
+
+def test_audit_flags_a_ctx_kb_without_a_gate_matrix(tmp_path: Path):
+    """離線體檢就要抓到「有 ctx 但沒有 gate 矩陣」，不要拖到查詢才拒載。"""
+    chunks = [
+        _chunk("a", "原文一", ctx=CTX_TEXT, embedding=[1.0, 0.0]),
+        _chunk("b", "原文二", ctx=CTX_TEXT, embedding=[0.0, 1.0]),
+    ]
+    path = _write_kb(tmp_path, chunks, with_gate=False)
+
+    proc = _run_ab_tool(str(path))
+
+    assert proc.returncode == 0, proc.stderr
+    assert "[FATAL]" in proc.stdout and "gate" in proc.stdout
+    assert "gate 矩陣      : 無" in proc.stdout
+
+
+def test_diff_does_not_claim_vectors_are_reusable_when_section_changed(tmp_path: Path):
+    """embedding 輸入含 source / section / ctx，不是只有 content。
+
+    只比 content 的話，「同 content、不同 section」會被錯報成「既有向量仍可用」。
+    """
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    body = "同樣的原文內容" * 10
+    _write_kb(left, [_chunk("a", body, section="1.2 Core control", embedding=[1.0, 0.0])],
+              with_gate=False)
+    _write_kb(right, [_chunk("a", body, section="9.9 別的章節", embedding=[1.0, 0.0])],
+              with_gate=False)
+
+    proc = _run_ab_tool(str(left / config.KNOWLEDGE_FILE), str(right / config.KNOWLEDGE_FILE))
+
+    assert proc.returncode == 0, proc.stderr
+    assert "content 位元組差異: 0" in proc.stdout
+    assert "既有向量仍可用" not in proc.stdout, "section 變了卻說向量還能用"
+    assert "embedding 要重算" in proc.stdout
