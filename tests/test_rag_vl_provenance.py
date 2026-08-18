@@ -58,10 +58,16 @@ def _kb_with(monkeypatch, tmp_path: Path, chunk: dict) -> knowledge.KnowledgeBas
     kb.loaded = True
     kb.chunks = [chunk]
     kb.documents = [chunk["source"]]
-    monkeypatch.setattr(kb, "_hybrid_search", lambda *_a, **_k: [(0.5, 0.9, 0.0, chunk)])
+    monkeypatch.setattr(
+        kb, "_hybrid_search",
+        lambda *_a, **_k: [knowledge.Candidate(
+            chunk_idx=0, chunk=chunk, rrf_score=0.5,
+            retrieval_score=0.9, gate_score=0.9,
+        )],
+    )
     monkeypatch.setattr(
         kb, "_rerank_with_model",
-        lambda _q, candidates, _top_k, **_kw: [c[3] for c in candidates],
+        lambda _q, candidates, _top_k, **_kw: [c.chunk for c in candidates],
     )
     monkeypatch.setattr(kb, "_get_embedding", lambda _t: [0.0, 1.0])
     monkeypatch.setattr(knowledge, "USE_MMR", False)

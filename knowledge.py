@@ -6,6 +6,7 @@
 
 import re
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from functools import lru_cache
 
@@ -28,6 +29,7 @@ except ImportError:
     print("[WARN] jieba 未安裝，中文 BM25 搜尋精準度可能較低", file=sys.stderr)
     print("       建議執行: pip install jieba", file=sys.stderr)
 
+import context_signals
 import llama_client
 from knowledge_store import KnowledgeStoreError, knowledge_store_lock
 
@@ -47,7 +49,7 @@ from config import (
     KNOWLEDGE_MERGE_ADJACENT, KNOWLEDGE_MERGE_MAX_CHARS,
     EMBEDDING_MODEL, RERANKER_MODEL,
     USE_RERANKER, USE_HYBRID_SEARCH, USE_QUERY_EXPANSION,
-    USE_MMR, MMR_LAMBDA, KEYWORD_WEIGHT,
+    USE_MMR, MMR_LAMBDA,
     # P0 改進：Source Type Weighting（來源權重）
     SOURCE_TYPE_WEIGHTS, POLLUTION_RISK_TOP_K, POLLUTION_RISK_MIN_SCORE,
     # P0 改進：BM25 + RRF + Reranker 條件式觸發
@@ -102,6 +104,46 @@ def _cached_get_embedding(text: str) -> tuple:
     return tuple(emb)
 
 
+def use_generated_context() -> bool:
+    """查詢端要不要吃 chunk 的生成脈絡。
+
+    每次呼叫都重讀 config：這同時是緊急 kill switch，關掉之後不必重建 KB、不必
+    重啟就退回 content-only 檢索。
+    """
+    return bool(getattr(config, "KB_CONTEXT_USE", False))
+
+
+@dataclass
+class Candidate:
+    """一個候選 chunk 與它的各種分數。
+
+    刻意不是多元素 tuple：這裡有兩套訊號，`retrieval_*` 含 LLM 生成的脈絡、
+    `gate_*` 只看原文。哪個分數餵哪個決策必須在型別層看得出來、grep 得到、
+    測得到——tuple 的 `c[1]` 做不到這件事，而搞混的後果是生成脈絡抬高的分數
+    通過了拒答閘（分數面的循環 grounding）。
+
+    規則：排序 / 召回看 retrieval_*，門檻 / 決策看 gate_*。
+    """
+
+    chunk_idx: int
+    chunk: dict
+    rrf_score: float = 0.0
+    retrieval_score: float = 0.0
+    gate_score: float = 0.0
+    retrieval_bm25: float = 0.0
+    gate_bm25: float = 0.0
+
+
+@dataclass
+class Bm25Index:
+    """一套 BM25 索引（inverted index + doc len + idf）。"""
+
+    index: dict = field(default_factory=dict)
+    doc_lens: list = field(default_factory=list)
+    avg_doc_len: float = 1.0
+    idf: dict = field(default_factory=dict)
+
+
 class KnowledgeBase:
     """
     優化版知識庫（P0 改進版）：
@@ -125,11 +167,15 @@ class KnowledgeBase:
         # Numpy 加速用的預計算陣列
         self._embeddings = None  # shape: (n_chunks, dim)
         self._embeddings_normalized = False
-        # BM25 索引（預計算）
-        self._bm25_index = None  # {term: {chunk_idx: tf}}
-        self._bm25_doc_lens = None  # [doc_len, ...]
-        self._bm25_avg_doc_len = 0.0
-        self._bm25_idf = None  # {term: idf}
+        # 決策訊號：content-only 的向量矩陣。沒有任何 ctx 的 KB 直接別名到
+        # retrieval 矩陣（兩者組字本來就相同），不多佔一份記憶體。
+        self._gate_embeddings = None
+        self._has_ctx = False
+        # BM25 索引（預計算）：retrieval 一套、gate（content-only）一套。
+        # 本專案規模下多一套 idf/doc-len 的記憶體與載入成本可忽略，換到的是
+        # 「lexical 決策永遠看不到生成文字」這條硬保證。
+        self._bm25 = None
+        self._bm25_gate = None
         # .npz embeddings 路徑（與 json 同目錄）
         json_dir = Path(json_path).parent
         self._emb_path = json_dir / KNOWLEDGE_EMB_FILE
@@ -165,6 +211,7 @@ class KnowledgeBase:
                     data = json.load(f)
 
                 self.chunks = data.get("chunks", [])
+                self._index_chunks()
                 metadata = data.get("metadata", {})
                 self._loaded_metadata = metadata
                 self.documents = metadata.get("documents", [])
@@ -234,53 +281,72 @@ class KnowledgeBase:
             self.load_error = f"{type(e).__name__}: {e}"
             self._source_stat = _LOAD_FAILED_STAT
 
-    def _compute_content_hash(self, schema: str = "content-v1") -> str:
-        """計算所有 chunk 內容的雜湊（用於 .npz 快取驗證）
+    def _index_chunks(self) -> None:
+        """標上 KB 內的列索引（≠ chunk 自己的 `chunk_index`，那是文件內序號）。
 
-        改進：使用內容雜湊確保 .npz 與 JSON 內容一致，
-        避免 chunk 數量相同但內容變更時讀到舊 embedding
+        決策點靠這個索引回去 gate 矩陣讀對應的列，而不是把 gate 向量掛回 chunk
+        （n×dim 的 Python float list 記憶體會爆）。冪等，重複呼叫無害。
         """
-        import hashlib
-        hasher = hashlib.md5()
-        for chunk in self.chunks:
-            if schema == "source-section-content-v2":
-                source = Path(str(chunk.get("source", ""))).name
-                section = str(chunk.get("section", "")).strip()
-                parts = []
-                if source:
-                    parts.append(f"[SOURCE] {source}")
-                if section:
-                    parts.append(f"[SECTION_METADATA] {section}")
-                parts.append(str(chunk.get("content", "")))
-                encoded = "\n".join(parts).encode("utf-8")
-                hasher.update(len(encoded).to_bytes(8, "big"))
-                hasher.update(encoded)
-            else:
-                content = chunk.get('content', '')
-                hasher.update(content.encode('utf-8'))
-        return hasher.hexdigest()
+        for row, chunk in enumerate(self.chunks):
+            chunk["chunk_idx"] = row
+
+    def _compute_content_hash(self, schema: str = context_signals.LEGACY_CONTENT_HASH_SCHEMA) -> str:
+        """chunks 內容雜湊（用於 .npz 快取驗證）。
+
+        組字與雜湊的唯一定義在 context_signals，寫入端（RAG.py）用的是同一份。
+        以前兩邊各寫一套同樣的字串，差一個字就會變成「內容雜湊不一致」這種看起來
+        像資料壞掉的訊息。
+        """
+        return context_signals.chunks_content_hash(self.chunks, schema=schema)
 
     def _load_embeddings_from_npz(self) -> bool:
-        """從 .npz 檔案載入 embeddings（加速載入）
+        """從 .npz 載入 embeddings（retrieval + gate 兩套）。
 
-        改進：加入內容雜湊驗證，確保 .npz 與 JSON 內容一致
+        schema 走 required 對照，不是只拿 NPZ 自報的 schema 重算一次自己：那樣
+        legacy NPZ 永遠自驗通過，程式換了組字規則也察覺不到。
+
+        KB 只要有任何 chunk 帶 ctx，gate 矩陣就必須同時存在，缺了直接拒載——
+        絕不 fallback 到 contextual 向量當 gate 用。
 
         Returns:
             True 如果成功載入，False 如果需要從 JSON 重建
         """
-        if not HAS_NUMPY or not self._emb_path.exists():
+        self._has_ctx = context_signals.has_any_ctx(self.chunks)
+
+        if not HAS_NUMPY:
+            if self._has_ctx:
+                raise KnowledgeStoreError(
+                    "this knowledge base carries generated chunk context, which needs "
+                    "numpy to load its two embedding matrices; install numpy"
+                )
+            return False
+        if not self._emb_path.exists():
             return False
 
         try:
             with np.load(self._emb_path, allow_pickle=False) as data:
+                available = set(getattr(data, "files", []))
                 embeddings = data['embeddings'].copy()
                 emb_model = str(data.get('embedding_model', ''))
                 chunk_count = int(data.get('chunk_count', 0))
                 content_hash = str(data.get('content_hash', ''))
-                hash_schema = str(data.get('content_hash_schema', 'content-v1'))
+                hash_schema = str(data.get(
+                    'content_hash_schema', context_signals.LEGACY_CONTENT_HASH_SCHEMA
+                ))
                 npz_generation = str(data.get('store_generation', ''))
                 stored_dimension = int(data.get('embedding_dimension', 0))
+                gate_embeddings = (
+                    data['embeddings_gate'].copy() if 'embeddings_gate' in available else None
+                )
+                gate_hash = str(data.get('gate_content_hash', ''))
+                gate_schema = str(data.get('gate_content_hash_schema', ''))
+        except KnowledgeStoreError:
+            raise
+        except Exception as e:
+            print(f"[WARN] 載入 .npz 失敗: {e}")
+            return False
 
+        try:
             # 驗證 embedding model 一致
             if emb_model and emb_model != EMBEDDING_MODEL:
                 print(f"[WARN] .npz embedding model 不一致，將重建")
@@ -303,32 +369,146 @@ class KnowledgeBase:
                 print(f"[WARN] .npz store generation 不一致，拒絕載入")
                 return False
 
+            # required-schema 對照：這是 fail-loud，不是「重建就好」——schema 不對
+            # 代表向量是用另一套組字算的，拿來查會靜默地錯。
+            allowed = context_signals.required_retrieval_schemas(has_ctx=self._has_ctx)
+            if hash_schema not in allowed:
+                raise KnowledgeStoreError(
+                    f"knowledge embedding schema mismatch: NPZ={hash_schema!r}, "
+                    f"required one of {sorted(allowed)}. Rebuild the knowledge base "
+                    f"(python RAG.py rebuild --kb {self.path} <docs>)."
+                )
+
             # 驗證內容雜湊一致（避免內容變更但數量相同的情況）
             current_hash = self._compute_content_hash(schema=hash_schema)
             if content_hash and content_hash != current_hash:
                 print(f"[WARN] .npz 內容雜湊不一致，將重建")
                 return False
 
-            self._embeddings = embeddings
-            self._embeddings_normalized = True  # .npz 已預先正規化
-            self._embedding_indices = list(range(len(self.chunks)))
+            if self._has_ctx:
+                if gate_embeddings is None:
+                    raise KnowledgeStoreError(
+                        "this knowledge base carries generated chunk context but "
+                        f"{self._emb_path} has no gate (content-only) matrix; refusing to "
+                        "use contextual vectors for decisions. Rebuild the knowledge base."
+                    )
+                if gate_schema != context_signals.GATE_SCHEMA:
+                    raise KnowledgeStoreError(
+                        f"gate embedding schema mismatch: NPZ={gate_schema!r}, "
+                        f"required {context_signals.GATE_SCHEMA!r}. Rebuild the knowledge base."
+                    )
+                if gate_embeddings.ndim != 2 or gate_embeddings.shape != embeddings.shape:
+                    raise KnowledgeStoreError(
+                        "gate embedding matrix shape mismatch: "
+                        f"{getattr(gate_embeddings, 'shape', None)} vs {embeddings.shape}"
+                    )
+                current_gate_hash = self._compute_content_hash(
+                    schema=context_signals.GATE_SCHEMA
+                )
+                if gate_hash and gate_hash != current_gate_hash:
+                    raise KnowledgeStoreError(
+                        f"gate embedding content hash mismatch: NPZ={gate_hash}, "
+                        f"JSON={current_gate_hash}. Rebuild the knowledge base."
+                    )
+        except KnowledgeStoreError:
+            raise
 
-            # P0：把 .npz 的向量掛回每個 chunk。
-            # RAG 存 knowledge.json 時為了體積「不再 inline embedding」（只留 .npz，
-            # 見 RAG.py:_restore_embeddings_from_npz）。若這裡只設 self._embeddings 而
-            # 不回填 chunk["embedding"]，下游的 MMR / 污染控制 / 最終信心分數（全都讀
-            # chunk.get("embedding")）會一律拿到空向量、把相似度算成 0，最後只回一個
-            # 空的 [REF]…[/REF] 殼。chunk_count 已在上面驗證 == len(self.chunks)。
-            # 向量已 L2 正規化，且下游 _cosine_similarity / _mmr_select_numpy 都會再
-            # 自行正規化；用 .tolist() 是因為那些消費者對 numpy array 做 `if not a` /
-            # `if emb:` 會丟 ambiguous-truth 例外，必須是 Python list。
-            for i, chunk in enumerate(self.chunks):
-                chunk["embedding"] = embeddings[i].tolist()
+        self._embeddings = embeddings
+        self._embeddings_normalized = True  # .npz 已預先正規化
+        self._embedding_indices = list(range(len(self.chunks)))
+        # 沒有 ctx 的 KB：retrieval 與 gate 是同一組字算出來的，直接別名。
+        self._gate_embeddings = gate_embeddings if gate_embeddings is not None else embeddings
 
-            return True
-        except Exception as e:
-            print(f"[WARN] 載入 .npz 失敗: {e}")
-            return False
+        # P0：把 .npz 的 retrieval 向量掛回每個 chunk。
+        # RAG 存 knowledge.json 時為了體積「不再 inline embedding」（只留 .npz），
+        # 若這裡只設 self._embeddings 而不回填 chunk["embedding"]，下游的 MMR /
+        # 污染控制（都讀 chunk.get("embedding")）會一律拿到空向量、把相似度算成 0。
+        # gate 向量刻意**不**掛回 chunk：那是 Python float list，n×dim 一份就夠痛，
+        # 決策點一律用 chunk_idx 讀矩陣列。
+        for i, chunk in enumerate(self.chunks):
+            chunk["embedding"] = embeddings[i].tolist()
+
+        return True
+
+    def _retrieval_matrix(self):
+        """排序用的矩陣。
+
+        `KB_CONTEXT_USE` 關掉時退回 gate 矩陣——旗標的契約是「關掉之後檢索與
+        content-only 完全等價」,只換分數來源、不必重建 KB。
+        """
+        if self._has_ctx and not use_generated_context():
+            return self._gate_matrix()
+        return self._embeddings
+
+    def _selection_vector(self, chunk: dict) -> list:
+        """MMR/多樣性用的向量；USE 關掉時同樣退回 gate 列。"""
+        if self._has_ctx and not use_generated_context() and HAS_NUMPY:
+            matrix = self._gate_matrix()
+            index = chunk.get("chunk_idx")
+            if matrix is not None and isinstance(index, int) and 0 <= index < matrix.shape[0]:
+                return matrix[index].tolist()
+        return chunk.get("embedding", [])
+
+    def _gate_matrix(self):
+        """決策用的 content-only 矩陣；沒有就退回 retrieval（代表 KB 無 ctx）。"""
+        if self._gate_embeddings is not None:
+            return self._gate_embeddings
+        return self._embeddings
+
+    def _gate_score_for(self, chunk_idx: int, q_emb: list) -> float:
+        """單一 chunk 的 gate 相似度（以列索引讀矩陣，不掛回 chunk）。"""
+        matrix = self._gate_matrix()
+        if matrix is None or not q_emb:
+            return 0.0
+        if not (0 <= chunk_idx < matrix.shape[0]):
+            return 0.0
+        q_vec = np.asarray(q_emb, dtype=np.float32)
+        norm = np.linalg.norm(q_vec)
+        if norm <= 0:
+            return 0.0
+        return float(np.dot(matrix[chunk_idx], q_vec / norm))
+
+    def _chunk_gate_score(self, chunk: dict, q_emb: list) -> float:
+        """一個 chunk（可能是合併過的）的 gate 相似度。
+
+        合併 chunk 保留成員的 KB 列索引，聚合取 max——**不**拿合併後的平均
+        contextual 向量重算，那等於讓生成脈絡回到決策路徑上。
+        """
+        members = chunk.get("member_chunk_idx")
+        if not members:
+            index = chunk.get("chunk_idx")
+            members = [index] if index is not None else []
+        indices = []
+        for value in members:
+            try:
+                indices.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        if indices and HAS_NUMPY and self._gate_matrix() is not None:
+            scores = self._gate_scores_for(indices, q_emb)
+            return max(scores.values()) if scores else 0.0
+        # 沒有 numpy 的 legacy 路徑：那種 KB 一定沒有 ctx，inline 向量就是
+        # content-only 的訊號本身。
+        embedding = chunk.get("embedding", [])
+        if embedding and q_emb:
+            return self._cosine_similarity(q_emb, embedding)
+        return 0.0
+
+    def _gate_scores_for(self, chunk_indices: list, q_emb: list) -> dict:
+        """一次算好一批 chunk 的 gate 相似度。"""
+        matrix = self._gate_matrix()
+        if matrix is None or not q_emb or not chunk_indices:
+            return {}
+        q_vec = np.asarray(q_emb, dtype=np.float32)
+        norm = np.linalg.norm(q_vec)
+        if norm <= 0:
+            return {}
+        q_vec = q_vec / norm
+        valid = [i for i in chunk_indices if 0 <= i < matrix.shape[0]]
+        if not valid:
+            return {}
+        scores = np.dot(matrix[valid], q_vec)
+        return {index: float(score) for index, score in zip(valid, scores)}
 
     def _save_embeddings_to_npz(self):
         """將 embeddings 儲存為 .npz（加速下次載入）
@@ -351,7 +531,8 @@ class KnowledgeBase:
             print(f"[WARN] 儲存 .npz 失敗: {e}")
 
     def _precompute_embeddings(self):
-        """預計算並正規化 embeddings 到 numpy array"""
+        """預計算並正規化 embeddings 到 numpy array（legacy：JSON inline 向量）"""
+        self._index_chunks()
         if not HAS_NUMPY or not self.chunks:
             self._embeddings = None
             return
@@ -385,82 +566,80 @@ class KnowledgeBase:
         norms = np.where(norms > 0, norms, 1.0)  # 避免除零
         self._embeddings = self._embeddings / norms
         self._embeddings_normalized = True
+        # JSON inline 向量的 KB 一定沒有 ctx（ctx 是新格式），別名即可。
+        self._gate_embeddings = self._embeddings
 
-    def _precompute_bm25_index(self):
-        """預計算 BM25 索引（inverted index + IDF）
+    @property
+    def _bm25_index(self):
+        """retrieval BM25 的 inverted index（相容舊呼叫端）。"""
+        return self._bm25.index if self._bm25 else None
+
+    @property
+    def _bm25_doc_lens(self):
+        return self._bm25.doc_lens if self._bm25 else None
+
+    @property
+    def _bm25_avg_doc_len(self):
+        return self._bm25.avg_doc_len if self._bm25 else 0.0
+
+    @property
+    def _bm25_idf(self):
+        return self._bm25.idf if self._bm25 else None
+
+    def _build_bm25_index(self, *, use_ctx: bool) -> Bm25Index:
+        """建一套 BM25 索引。
 
         BM25 公式：
         score = sum( IDF(t) * (tf * (k1+1)) / (tf + k1 * (1 - b + b * dl/avgdl)) )
-
-        其中：
-        - tf: 詞在文件中出現的次數
-        - dl: 文件長度（token 數）
-        - avgdl: 平均文件長度
-        - IDF(t) = log((N - n(t) + 0.5) / (n(t) + 0.5) + 1)
-        - N: 文件總數
-        - n(t): 包含詞 t 的文件數
         """
-        if not self.chunks:
-            return
-
         import math
         from collections import defaultdict
 
-        # 建立 inverted index: {term: {chunk_idx: tf}}
         inverted_index = defaultdict(lambda: defaultdict(int))
         doc_lens = []
-        doc_freqs = defaultdict(int)  # 每個 term 出現在多少文件中
+        doc_freqs = defaultdict(int)
 
         for idx, chunk in enumerate(self.chunks):
-            content = self._content_for_bm25(chunk)
-            # 加入 title、section、source 提升 lexical 命中率
-            title = chunk.get("section", "")
-            source = chunk.get("source", "")
-            full_text = f"{title} {source} {content}"
-
-            # Tokenize（同時支援中英文）
+            # 章節 + 來源 +（ctx）+ 去合成前綴的本文；組法的唯一定義在 context_signals
+            full_text = context_signals.bm25_document_text(chunk, use_ctx=use_ctx)
             tokens = self._tokenize_for_bm25(full_text)
             doc_lens.append(len(tokens))
 
-            # 統計 term frequency
             term_set = set()
             for token in tokens:
                 inverted_index[token][idx] += 1
                 term_set.add(token)
-
-            # 統計 document frequency
             for term in term_set:
                 doc_freqs[term] += 1
 
-        # 計算 IDF
-        N = len(self.chunks)
+        n_docs = len(self.chunks)
         idf = {}
         for term, df in doc_freqs.items():
             # BM25 IDF 公式（加上 +1 避免負值）
-            idf[term] = math.log((N - df + 0.5) / (df + 0.5) + 1)
+            idf[term] = math.log((n_docs - df + 0.5) / (df + 0.5) + 1)
 
-        self._bm25_index = dict(inverted_index)
-        self._bm25_doc_lens = doc_lens
-        self._bm25_avg_doc_len = sum(doc_lens) / len(doc_lens) if doc_lens else 1.0
-        self._bm25_idf = idf
+        return Bm25Index(
+            index=dict(inverted_index),
+            doc_lens=doc_lens,
+            avg_doc_len=sum(doc_lens) / len(doc_lens) if doc_lens else 1.0,
+            idf=idf,
+        )
+
+    def _precompute_bm25_index(self):
+        """預計算 BM25 索引：retrieval 一套，gate（content-only）一套。
+
+        沒有任何 ctx 時兩套的來源文本逐位元組相同，直接別名，不重算也不多佔記憶體。
+        """
+        if not self.chunks:
+            return
+        self._bm25 = self._build_bm25_index(use_ctx=True)
+        self._bm25_gate = (
+            self._build_bm25_index(use_ctx=False) if self._has_ctx else self._bm25
+        )
 
     def _content_for_bm25(self, chunk: dict) -> str:
-        """Return unique chunk body, excluding synthetic heading/overlap prefixes.
-
-        New chunks record prefix lengths during ingestion.  Older stores do not
-        have the metadata and retain their legacy indexing behavior until they
-        are rebuilt; guessing prefix boundaries would risk dropping real text.
-        """
-        content = str(chunk.get("content", ""))
-        try:
-            heading_chars = int(chunk.get("heading_prefix_chars", 0) or 0)
-            overlap_chars = int(chunk.get("overlap_prefix_chars", 0) or 0)
-        except (TypeError, ValueError):
-            return content
-        total_prefix = heading_chars + overlap_chars
-        if total_prefix < 0 or total_prefix > len(content):
-            return content
-        return content[total_prefix:]
+        """去掉合成前綴（overlap + heading）的本文；定義在 context_signals。"""
+        return context_signals.chunk_body(chunk)
 
     def _tokenize_for_bm25(self, text: str) -> list:
         """BM25 專用的 tokenizer
@@ -509,30 +688,40 @@ class KnowledgeBase:
             if (len(t) > 1 or t.isdigit()) and t not in stopwords
         ]
 
-    def _bm25_score(self, query_tokens: list, allowed_indices: set[int] | None = None) -> list:
+    def _bm25_score(
+        self,
+        query_tokens: list,
+        allowed_indices: set[int] | None = None,
+        *,
+        index: Bm25Index | None = None,
+    ) -> list:
         """計算所有 chunks 的 BM25 分數
+
+        `index` 不給就用 retrieval 那一套（含 ctx）。決策路徑要傳
+        `self._bm25_gate`——lexical 決策不能看見生成文字。
 
         返回: [(score, chunk_idx), ...] 按分數降序排列
         """
-        if not self._bm25_index or not query_tokens:
+        bm25 = index or self._bm25
+        if not bm25 or not bm25.index or not query_tokens:
             return []
 
         scores = [0.0] * len(self.chunks)
         k1 = BM25_K1
         b = BM25_B
-        avgdl = self._bm25_avg_doc_len
+        avgdl = bm25.avg_doc_len or 1.0
 
         for token in query_tokens:
-            if token not in self._bm25_index:
+            if token not in bm25.index:
                 continue
 
-            idf = self._bm25_idf.get(token, 0.0)
-            term_docs = self._bm25_index[token]
+            idf = bm25.idf.get(token, 0.0)
+            term_docs = bm25.index[token]
 
             for chunk_idx, tf in term_docs.items():
                 if allowed_indices is not None and chunk_idx not in allowed_indices:
                     continue
-                dl = self._bm25_doc_lens[chunk_idx]
+                dl = bm25.doc_lens[chunk_idx]
                 # BM25 公式
                 numerator = tf * (k1 + 1)
                 denominator = tf + k1 * (1 - b + b * dl / avgdl)
@@ -552,6 +741,24 @@ class KnowledgeBase:
         scored.sort(reverse=True, key=lambda x: x[0])
         return scored
 
+    def _gate_bm25_map(
+        self, query_tokens: list, chunk_indices: list, allowed_indices: set[int] | None = None
+    ) -> dict:
+        """候選 chunk 的 content-only BM25 分數（決策訊號）。
+
+        沒有 ctx 時 gate 索引就是 retrieval 索引的別名，這一趟等於免費。
+        """
+        if self._bm25_gate is None or not query_tokens:
+            return {}
+        wanted = set(chunk_indices)
+        return {
+            chunk_idx: score
+            for score, chunk_idx in self._bm25_score(
+                query_tokens, allowed_indices=allowed_indices, index=self._bm25_gate
+            )
+            if chunk_idx in wanted
+        }
+
     def _rrf_fusion(self, embedding_ranks: list, bm25_ranks: list, k: int = RRF_K) -> list:
         """RRF (Reciprocal Rank Fusion) 融合兩個排名列表
 
@@ -563,7 +770,7 @@ class KnowledgeBase:
             k: RRF 常數（預設 60）
 
         Returns:
-            [(rrf_score, emb_score, bm25_score, chunk), ...] 按 RRF 分數降序
+            [Candidate, ...] 按 RRF 分數降序（gate 分數由呼叫端補）
         """
         # 建立 chunk_idx -> rank 的映射
         emb_rank_map = {chunk_idx: rank for rank, (_, chunk_idx) in enumerate(embedding_ranks)}
@@ -576,25 +783,24 @@ class KnowledgeBase:
         # 取所有候選的 union
         all_chunks = set(emb_rank_map.keys()) | set(bm25_rank_map.keys())
 
-        # 計算 RRF 分數
-        rrf_scores = []
+        candidates = []
         for chunk_idx in all_chunks:
             rrf = 0.0
-            # Embedding rank
             if chunk_idx in emb_rank_map:
                 rrf += 1.0 / (k + emb_rank_map[chunk_idx])
-            # BM25 rank
             if chunk_idx in bm25_rank_map:
                 rrf += 1.0 / (k + bm25_rank_map[chunk_idx])
 
-            emb_score = emb_score_map.get(chunk_idx, 0.0)
-            bm25_score = bm25_score_map.get(chunk_idx, 0.0)
-            chunk = self.chunks[chunk_idx]
-            rrf_scores.append((rrf, emb_score, bm25_score, chunk))
+            candidates.append(Candidate(
+                chunk_idx=chunk_idx,
+                chunk=self.chunks[chunk_idx],
+                rrf_score=rrf,
+                retrieval_score=emb_score_map.get(chunk_idx, 0.0),
+                retrieval_bm25=bm25_score_map.get(chunk_idx, 0.0),
+            ))
 
-        # 按 RRF 分數降序排列
-        rrf_scores.sort(reverse=True, key=lambda x: x[0])
-        return rrf_scores
+        candidates.sort(reverse=True, key=lambda c: c.rrf_score)
+        return candidates
 
     def _check_reranker_available(self) -> bool:
         """檢查 reranker 模型是否可用
@@ -912,6 +1118,13 @@ English:"""
     def _has_lexical_numeric_evidence(
         self, question: str, bm25_score: float, chunk: dict
     ) -> bool:
+        """數值題的 lexical 放行判定。**只吃 gate BM25**。
+
+        呼叫端必須傳 content-only 的 BM25 分數：「最大值是多少」這種沒有明示
+        數字的問題走的是 `bm25_score >= 0.75` 這條 BM25-only 的路，如果分數裡
+        含 LLM 生成的脈絡，生成文字就能冒充數值證據。haystack 這邊同理，只看
+        source / section / 去前綴本文，不看 ctx。
+        """
         if bm25_score <= 0 or not self._is_numeric_query(question):
             return False
         literals = self._exact_literals(question)
@@ -937,25 +1150,19 @@ English:"""
         return SOURCE_TYPE_WEIGHTS.get(chunk_type, SOURCE_TYPE_WEIGHTS['default'])
 
     def _apply_source_weighting(self, candidates: list) -> list:
-        """對候選結果應用來源權重
+        """對候選結果應用來源權重（retrieval 與 gate 一視同仁）。
 
-        Args:
-            candidates: [(rrf_score, emb_score, bm25_score, chunk), ...]
-
-        Returns:
-            [(weighted_score, emb_score, bm25_score, chunk), ...] 按加權分數排序
+        兩套 dense 分數都乘同一個權重：來源權重是確定性的 metadata，不是生成物，
+        對 gate 訊號同樣適用；只加權其中一邊會讓兩套分數不可比。
         """
-        weighted = []
-        for rrf_score, emb_score, bm25_score, chunk in candidates:
-            weight = self._get_source_weight(chunk)
-            # 加權分數 = 原始分數 * 來源權重
-            weighted_emb = emb_score * weight
-            weighted_rrf = rrf_score * weight
-            weighted.append((weighted_rrf, weighted_emb, bm25_score, chunk))
+        for candidate in candidates:
+            weight = self._get_source_weight(candidate.chunk)
+            candidate.rrf_score *= weight
+            candidate.retrieval_score *= weight
+            candidate.gate_score *= weight
 
-        # 按加權 RRF 分數重新排序
-        weighted.sort(reverse=True, key=lambda x: x[0])
-        return weighted
+        candidates.sort(reverse=True, key=lambda c: c.rrf_score)
+        return candidates
 
     def _select_with_pollution_control(self, chunks: list, pollution_risk: str,
                                         emb_scores: list) -> list:
@@ -969,7 +1176,8 @@ English:"""
         Args:
             chunks: 候選 chunk 列表
             pollution_risk: "low" / "medium" / "high"
-            emb_scores: 對應的 embedding scores
+            emb_scores: 對應的 **gate** embedding scores（這裡有 min_score 門檻，
+                是決策；用含生成脈絡的分數會讓弱原文被放行）
 
         Returns:
             篩選後的 chunk 列表
@@ -1113,11 +1321,12 @@ English:"""
         if len(candidates) < 3:
             return True
 
-        # P0-4: 改用 embedding score，格式是 (rrf, emb, bm25, chunk)
-        top_emb_score = candidates[0][1] if candidates else 0
+        # 「信心夠高就不擴寫」是決策，看 gate 分數：content-only 的信心低才擴寫，
+        # 不能讓生成脈絡把信心撐高而少召回。
+        top_gate_score = candidates[0].gate_score if candidates else 0
 
         # 高信心時跳過 expansion
-        return top_emb_score < threshold
+        return top_gate_score < threshold
 
     def _matching_chunk_indices(self, metadata_filter: dict | None) -> set[int] | None:
         """Resolve exact metadata filters before either retrieval branch applies top-k."""
@@ -1151,7 +1360,7 @@ English:"""
     ) -> list:
         """Run one dense+lexical recall pass and keep scores in RRF units."""
         recall_k = max(1, candidate_k * 2)
-        if HAS_NUMPY and self._embeddings is not None and self._embeddings_normalized:
+        if HAS_NUMPY and self._retrieval_matrix() is not None and self._embeddings_normalized:
             embedding_ranks = self._embedding_search_numpy(
                 q_emb, recall_k, allowed_indices=allowed_indices
             )
@@ -1160,10 +1369,13 @@ English:"""
                 q_emb, recall_k, allowed_indices=allowed_indices
             )
 
+        query_tokens = []
         if BM25_ENABLED and self._bm25_index:
             query_tokens = self._tokenize_for_bm25(question)
+            # USE 關掉時連 lexical 排序都走 content-only 索引
+            ranking_index = self._bm25 if use_generated_context() else self._bm25_gate
             bm25_ranks = self._bm25_score(
-                query_tokens, allowed_indices=allowed_indices
+                query_tokens, allowed_indices=allowed_indices, index=ranking_index
             )[:recall_k]
         else:
             query_keywords = self._extract_keywords(question) if USE_HYBRID_SEARCH else set()
@@ -1172,40 +1384,81 @@ English:"""
             )
 
         if RRF_ENABLED and (embedding_ranks or bm25_ranks):
-            return self._rrf_fusion(embedding_ranks, bm25_ranks)
-        if embedding_ranks:
-            return [
-                (emb_score, emb_score, 0.0, self.chunks[idx])
+            candidates = self._rrf_fusion(embedding_ranks, bm25_ranks)
+        elif embedding_ranks:
+            candidates = [
+                Candidate(chunk_idx=idx, chunk=self.chunks[idx], rrf_score=emb_score,
+                          retrieval_score=emb_score)
                 for emb_score, idx in embedding_ranks
             ]
-        return [
-            (bm25_score, 0.0, bm25_score, self.chunks[idx])
-            for bm25_score, idx in bm25_ranks
-        ]
+        else:
+            candidates = [
+                Candidate(chunk_idx=idx, chunk=self.chunks[idx], rrf_score=bm25_score,
+                          retrieval_bm25=bm25_score)
+                for bm25_score, idx in bm25_ranks
+            ]
+
+        self._fill_gate_scores(candidates, q_emb, query_tokens, allowed_indices)
+        return candidates
+
+    def _fill_gate_scores(
+        self,
+        candidates: list,
+        q_emb: list,
+        query_tokens: list,
+        allowed_indices: set[int] | None,
+    ) -> None:
+        """替候選補上 content-only 的 dense / lexical 分數（決策訊號）。
+
+        沒有 ctx 的 KB 兩套訊號同源，gate 分數會等於 retrieval 分數；有 ctx 時
+        才真的分開。決策點一律只讀 gate_*。
+        """
+        if not candidates:
+            return
+        indices = [c.chunk_idx for c in candidates]
+        dense = self._gate_scores_for(indices, q_emb) if HAS_NUMPY else {}
+        lexical = self._gate_bm25_map(query_tokens, indices, allowed_indices)
+        for candidate in candidates:
+            if dense:
+                candidate.gate_score = dense.get(candidate.chunk_idx, 0.0)
+            else:
+                # 沒有 numpy 的 legacy 路徑：chunk 上有 inline 向量，且這種 KB
+                # 一定沒有 ctx（ctx 是新格式），retrieval 分數就是 content-only。
+                candidate.gate_score = candidate.retrieval_score
+            candidate.gate_bm25 = lexical.get(candidate.chunk_idx, 0.0)
 
     def _merge_expansion_scores(
         self, base_scores: list, expansion_scores: list, weight: float = 0.9
     ) -> list:
-        """Union a variant's recall with the base list without mixing score scales."""
-        merged: dict[int, list] = {}
-        for rrf_score, emb_score, bm25_score, chunk in base_scores:
-            merged[id(chunk)] = [rrf_score, emb_score, bm25_score, chunk]
-        for rrf_score, emb_score, bm25_score, chunk in expansion_scores:
-            key = id(chunk)
-            if key in merged:
-                row = merged[key]
-                row[0] += rrf_score * weight
-                row[1] = max(row[1], emb_score * weight)
-                row[2] = max(row[2], bm25_score)
-            else:
-                merged[key] = [
-                    rrf_score * weight,
-                    emb_score * weight,
-                    bm25_score,
-                    chunk,
-                ]
-        result = [tuple(row) for row in merged.values()]
-        result.sort(reverse=True, key=lambda row: row[0])
+        """Union a variant's recall with the base list without mixing score scales.
+
+        兩套分數各自合併：gate 分數同樣取 max，才不會因為只有變體召回到某個
+        chunk 就讓它的決策分數變成 0。
+        """
+        merged: dict[int, Candidate] = {c.chunk_idx: c for c in base_scores}
+        for candidate in expansion_scores:
+            existing = merged.get(candidate.chunk_idx)
+            if existing is None:
+                merged[candidate.chunk_idx] = Candidate(
+                    chunk_idx=candidate.chunk_idx,
+                    chunk=candidate.chunk,
+                    rrf_score=candidate.rrf_score * weight,
+                    retrieval_score=candidate.retrieval_score * weight,
+                    gate_score=candidate.gate_score * weight,
+                    retrieval_bm25=candidate.retrieval_bm25,
+                    gate_bm25=candidate.gate_bm25,
+                )
+                continue
+            existing.rrf_score += candidate.rrf_score * weight
+            existing.retrieval_score = max(
+                existing.retrieval_score, candidate.retrieval_score * weight
+            )
+            existing.gate_score = max(existing.gate_score, candidate.gate_score * weight)
+            existing.retrieval_bm25 = max(existing.retrieval_bm25, candidate.retrieval_bm25)
+            existing.gate_bm25 = max(existing.gate_bm25, candidate.gate_bm25)
+
+        result = list(merged.values())
+        result.sort(reverse=True, key=lambda c: c.rrf_score)
         return result
 
     def _hybrid_search(
@@ -1283,7 +1536,7 @@ English:"""
             q_vec = q_vec / q_norm
 
         # 批次計算所有 cosine similarity
-        emb_scores = np.dot(self._embeddings, q_vec)
+        emb_scores = np.dot(self._retrieval_matrix(), q_vec)
         eligible = np.array([
             arr_idx for arr_idx, chunk_idx in enumerate(self._embedding_indices)
             if allowed_indices is None or chunk_idx in allowed_indices
@@ -1340,66 +1593,6 @@ English:"""
         results.sort(reverse=True, key=lambda x: x[0])
         return results[:top_k]
 
-    def _hybrid_search_numpy(self, q_emb: list, query_keywords: set, candidate_k: int) -> list:
-        """使用 numpy 向量化的混合搜尋"""
-        # 正規化 query embedding
-        q_vec = np.array(q_emb, dtype=np.float32)
-        q_norm = np.linalg.norm(q_vec)
-        if q_norm > 0:
-            q_vec = q_vec / q_norm
-
-        # 批次計算所有 cosine similarity（因為已預正規化，dot product = cosine similarity）
-        emb_scores = np.dot(self._embeddings, q_vec)
-
-        # 建立結果列表
-        scores = []
-        for arr_idx, chunk_idx in enumerate(self._embedding_indices):
-            chunk = self.chunks[chunk_idx]
-            emb_score = float(emb_scores[arr_idx])
-            content = chunk.get("content", "")
-
-            kw_score = self._keyword_score(query_keywords, content) if USE_HYBRID_SEARCH else 0.0
-
-            if USE_HYBRID_SEARCH:
-                combined = emb_score * (1 - KEYWORD_WEIGHT) + kw_score * KEYWORD_WEIGHT
-            else:
-                combined = emb_score
-
-            scores.append((combined, emb_score, kw_score, chunk))
-
-        # 處理沒有 embedding 的 chunks（給予 0 分）
-        indexed_set = set(self._embedding_indices)
-        for i, chunk in enumerate(self.chunks):
-            if i not in indexed_set:
-                content = chunk.get("content", "")
-                kw_score = self._keyword_score(query_keywords, content) if USE_HYBRID_SEARCH else 0.0
-                combined = kw_score * KEYWORD_WEIGHT if USE_HYBRID_SEARCH else 0.0
-                scores.append((combined, 0.0, kw_score, chunk))
-
-        return scores
-
-    def _hybrid_search_fallback(self, q_emb: list, query_keywords: set) -> list:
-        """Fallback：Python 迴圈版混合搜尋（無 numpy 時使用）"""
-        scores = []
-        for chunk in self.chunks:
-            emb = chunk.get("embedding", [])
-            content = chunk.get("content", "")
-
-            emb_score = 0.0
-            if emb:
-                emb_score = self._cosine_similarity(q_emb, emb)
-
-            kw_score = self._keyword_score(query_keywords, content) if USE_HYBRID_SEARCH else 0.0
-
-            if USE_HYBRID_SEARCH:
-                combined = emb_score * (1 - KEYWORD_WEIGHT) + kw_score * KEYWORD_WEIGHT
-            else:
-                combined = emb_score
-
-            scores.append((combined, emb_score, kw_score, chunk))
-
-        return scores
-
     def _update_scores_with_expansion(
         self,
         scores: list,
@@ -1430,15 +1623,14 @@ English:"""
         if len(candidates) <= 1:
             return False
 
-        # P0-4 修正：使用 embedding score (candidates[i][1]) 而非 RRF score (candidates[i][0])
-        # RRF score 範圍約 0.01-0.03，和固定門檻完全不在同一量級
-        # 格式是 (rrf_score, emb_score, bm25_score, chunk)
-        top_emb_score = candidates[0][1] if candidates else 0
+        # 分數用 gate（content-only）而不是 RRF：RRF 範圍約 0.01-0.03，和固定門檻
+        # 不在同一量級；而「跳過 rerank」是決策，不能讓生成脈絡抬高的分數觸發跳過。
+        top_gate_score = candidates[0].gate_score if candidates else 0
 
         # 改進：高信心時跳過 rerank（減少不必要的延遲）
         # 但嚴格模式和 ALWAYS_ON 除外
         if not RERANKER_ALWAYS_ON and not is_strict_mode:
-            if top_emb_score >= RERANKER_SKIP_THRESHOLD:
+            if top_gate_score >= RERANKER_SKIP_THRESHOLD:
                 return False
 
         # P0 改進：強制啟用 reranker
@@ -1449,36 +1641,39 @@ English:"""
         if is_strict_mode and STRICT_MODE_RERANK_REQUIRED:
             return True
 
-        # Margin-based 判斷（P0 改進）- 改用 embedding score
+        # Margin-based 判斷（P0 改進）- 全部走 gate 分數
         if MARGIN_ENABLED and len(candidates) >= 2:
-            gap = candidates[0][1] - candidates[1][1]  # P0-4: 用 emb score 差距
+            gap = candidates[0].gate_score - candidates[1].gate_score
             # top1-top2 差距太小 → 不確定，需要 rerank
             if gap < MARGIN_MIN_GAP:
                 return True
             # top1 分數太低 → 需要更精確判斷
-            if top_emb_score < MARGIN_LOW_SCORE:
+            if top_gate_score < MARGIN_LOW_SCORE:
                 return True
 
         # 如果最高分很高（>0.6），且與第5名差距明顯（>0.1），不需要 rerank
-        if top_emb_score > 0.6:
-            fifth_emb_score = candidates[min(4, len(candidates)-1)][1] if len(candidates) > 4 else 0
-            if top_emb_score - fifth_emb_score > 0.1:
+        if top_gate_score > 0.6:
+            fifth_gate_score = (
+                candidates[min(4, len(candidates) - 1)].gate_score
+                if len(candidates) > 4 else 0
+            )
+            if top_gate_score - fifth_gate_score > 0.1:
                 return False
 
         # 如果前幾名分數太接近（差距 < 0.05），需要 rerank 來區分
         if len(candidates) >= 3:
-            score_diff = candidates[0][1] - candidates[2][1]  # P0-4: 用 emb score
+            score_diff = candidates[0].gate_score - candidates[2].gate_score
             if score_diff < 0.05:
                 return True
 
-        # 其他情況：top_emb_score 較低時，需要 rerank
-        return top_emb_score < 0.5
+        # 其他情況：gate 分數較低時，需要 rerank
+        return top_gate_score < 0.5
 
     def _rerank_fallback(self, question: str, candidates: list, top_k: int, reason: str) -> list:
         """Apply the configured fallback after the dedicated reranker cannot be used."""
         policy = config.RERANK_FALLBACK_POLICY
         if policy == "embedding":
-            return [c[3] for c in candidates[:top_k]]
+            return [c.chunk for c in candidates[:top_k]]
         if policy == "main_model":
             return self._rerank_with_llm(question, candidates, top_k)
         if policy == "error":
@@ -1501,11 +1696,11 @@ English:"""
             return []
 
         if not USE_RERANKER or len(candidates) <= 1:
-            return [c[3] for c in candidates[:top_k]]
+            return [c.chunk for c in candidates[:top_k]]
 
         # 條件觸發：判斷是否真的需要 rerank
         if not self._should_rerank(candidates, top_k, is_strict_mode):
-            return [c[3] for c in candidates[:top_k]]
+            return [c.chunk for c in candidates[:top_k]]
 
         # Input pool and output count are separate.  RERANKER_TOP_N is the
         # final query cap; the cross-encoder must see a much wider pool so a
@@ -1515,14 +1710,15 @@ English:"""
         if self._check_reranker_available():
             try:
                 items = candidates[:rerank_count]
-                passages = []
-                for _, _, _, chunk in items:
-                    source = chunk.get("source", "")
-                    section = chunk.get("section", "")
-                    content = chunk.get("content", "")[:RERANKER_PASSAGE_MAX_CHARS]
-                    passages.append(
-                        f"Source: {source}\nSection: {section}\n{content}"
+                # reranker 的 document 側是檢索訊號（排序），可以帶 ctx；
+                # 組法的唯一定義在 context_signals，USE 關掉時逐位元組等同舊版。
+                use_ctx = use_generated_context()
+                passages = [
+                    context_signals.reranker_passage(
+                        item.chunk, use_ctx=use_ctx, max_chars=RERANKER_PASSAGE_MAX_CHARS
                     )
+                    for item in items
+                ]
                 scores = llama_client.rerank(
                     base_url=LLAMA_RERANK_BASE_URL,
                     query=question,
@@ -1534,7 +1730,7 @@ English:"""
                     raise RuntimeError(
                         f"reranker returned {len(scores)} scores for {len(items)} passages"
                     )
-                scored = [(scores[i], items[i][3]) for i in range(len(items))]
+                scored = [(scores[i], items[i].chunk) for i in range(len(items))]
                 scored.sort(reverse=True, key=lambda x: x[0])
                 return [c[1] for c in scored[:top_k]]
 
@@ -1551,7 +1747,8 @@ English:"""
             return []
 
         docs_text = ""
-        for i, (score, _, _, chunk) in enumerate(candidates[:15]):
+        for i, candidate in enumerate(candidates[:15]):
+            chunk = candidate.chunk
             content = chunk.get('content', '')[:500]
             source = chunk.get('source', '?')
             page = chunk.get('page', '?')
@@ -1589,12 +1786,12 @@ English:"""
                     break
 
             if doc_indices:
-                return [candidates[i][3] for i in doc_indices]
+                return [candidates[i].chunk for i in doc_indices]
 
         except Exception:
             pass
 
-        return [c[3] for c in candidates[:top_k]]
+        return [c.chunk for c in candidates[:top_k]]
 
     def _mmr_select(self, chunks: list, question_emb: list, k: int, lambda_: float = MMR_LAMBDA) -> list:
         """Max Marginal Relevance 選擇：平衡相關性與多樣性
@@ -1619,7 +1816,7 @@ English:"""
                 if c in selected:
                     continue
 
-                c_emb = c.get("embedding", [])
+                c_emb = self._selection_vector(c)
                 if not c_emb:
                     mmr_score = -1
                 else:
@@ -1636,7 +1833,7 @@ English:"""
                 break
 
             selected.append(best)
-            best_emb = best.get("embedding", [])
+            best_emb = self._selection_vector(best)
             if best_emb:
                 selected_embs.append(best_emb)
 
@@ -1649,7 +1846,7 @@ English:"""
         embeddings = []
 
         for c in chunks:
-            emb = c.get("embedding", [])
+            emb = self._selection_vector(c)
             if emb:
                 valid_chunks.append(c)
                 embeddings.append(emb)
@@ -1740,6 +1937,13 @@ English:"""
         merged = []
         buffer = None
 
+        def _member_indices(chunk: dict) -> list:
+            members = chunk.get("member_chunk_idx")
+            if members:
+                return list(members)
+            index = chunk.get("chunk_idx")
+            return [index] if index is not None else []
+
         def _init_emb(emb):
             if not emb:
                 return [], 0
@@ -1776,6 +1980,9 @@ English:"""
                     "origin": c.get("origin", ""),
                     "last_idx": chunk_idx,
                     "embedding": c_emb,
+                    # 成員的 KB 列索引：決策要靠它回去 gate 矩陣聚合，
+                    # 不能用合併後的平均向量重算。
+                    "member_chunk_idx": _member_indices(c),
                     "_emb_sum": emb_sum,
                     "_emb_count": emb_count,
                 }
@@ -1785,6 +1992,7 @@ English:"""
                   len(buffer["content"]) + len(c.get("content", "")) < KNOWLEDGE_MERGE_MAX_CHARS):
                 buffer["content"] += "\n" + c.get("content", "")
                 buffer["last_idx"] = chunk_idx
+                buffer["member_chunk_idx"] = buffer.get("member_chunk_idx", []) + _member_indices(c)
                 # 升級 type（warning > spec > doc）
                 buffer["type"] = self._upgrade_type(buffer["type"], chunk_type)
                 emb_sum, emb_count = _add_emb(buffer.get("_emb_sum", []),
@@ -1810,6 +2018,7 @@ English:"""
                     "origin": c.get("origin", ""),
                     "last_idx": chunk_idx,
                     "embedding": c.get("embedding", []),
+                    "member_chunk_idx": _member_indices(c),
                     "_emb_sum": emb_sum,
                     "_emb_count": emb_count,
                 }
@@ -1871,35 +2080,38 @@ English:"""
         else:
             base_threshold = KNOWLEDGE_THRESHOLD
 
-        # 改用 embedding score (candidates[i][1]) 作為過濾依據，而非 combined score
-        # P0 改進：格式是 (rrf_score, emb_score, bm25_score, chunk)
-        top_emb_score = candidates[0][1]  # (rrf, emb, bm25, chunk)
-        min_emb_score = max(base_threshold, top_emb_score * DYNAMIC_THRESHOLD_RATIO)
+        # 門檻一律吃 gate（content-only）分數。排序可以被生成脈絡影響，
+        # 「夠不夠格當證據」不行——那正是規格 §2 說的分數面循環 grounding：
+        # 錯誤脈絡把弱原文推過 strict 門檻。
+        top_gate_score = candidates[0].gate_score
+        top_retrieval_score = candidates[0].retrieval_score
+        min_gate_score = max(base_threshold, top_gate_score * DYNAMIC_THRESHOLD_RATIO)
 
-        # P0 改進：Margin-based 風險判斷
+        # P0 改進：Margin-based 風險判斷（決策 → gate）
         is_high_risk = False
         if MARGIN_ENABLED and len(candidates) >= 2:
-            gap = candidates[0][1] - candidates[1][1]  # 用 embedding score 算 gap
+            gap = candidates[0].gate_score - candidates[1].gate_score
             if gap < MARGIN_MIN_GAP:
                 is_high_risk = True  # top1-top2 差距太小，不確定
-            if top_emb_score < MARGIN_LOW_SCORE:
+            if top_gate_score < MARGIN_LOW_SCORE:
                 is_high_risk = True  # top1 分數太低
 
         # Dense 是一般語意 gate；數字/hex 題另保留有精確 lexical evidence
         # 的候選交給 reranker。否則 dense 對數字偏弱時會把 BM25 的正解先丟掉。
+        # lexical 判定吃 gate BM25：生成文字不得冒充數值證據。
         filtered = [
-            (s, e, k, c) for s, e, k, c in candidates
-            if e >= min_emb_score or self._has_lexical_numeric_evidence(question, k, c)
+            candidate for candidate in candidates
+            if candidate.gate_score >= min_gate_score
+            or self._has_lexical_numeric_evidence(
+                question, candidate.gate_bm25, candidate.chunk
+            )
         ]
         if not filtered:
             return "", "", empty_metadata
 
-        # 動態 top_k：高相關度時少給，低相關度時多給
-        # P0-4 修正：使用 embedding score 來決定 top_k，避免 RRF score 量級問題
-        # top_emb_score 在上面已經取得
-        # P0-4: 保留 RRF score 供 metadata 向後相容
-        top_score = candidates[0][0]  # RRF score，僅供 metadata 記錄
-        if top_emb_score >= DYNAMIC_TOP_K_HIGH_SCORE:
+        # 動態 top_k：高相關度時少給，低相關度時多給（同樣看 gate）
+        top_score = candidates[0].rrf_score  # RRF score，僅供 metadata 記錄
+        if top_gate_score >= DYNAMIC_TOP_K_HIGH_SCORE:
             effective_top_k = DYNAMIC_TOP_K_MIN
         else:
             effective_top_k = min(top_k, DYNAMIC_TOP_K_MAX)
@@ -1929,15 +2141,12 @@ English:"""
         if not top_chunks:
             return "", "", empty_metadata
 
-        # P0 改進：計算 embedding scores 供污染風險控制使用
+        # 污染風險控制有 min_score 門檻 → 決策 → 讀 gate 矩陣。
+        # 以 chunk_idx 讀矩陣列，不把 gate 向量掛回 chunk（那是 n×dim 的 float list）。
         q_emb_prelim = q_emb if USE_MMR else self._get_embedding(question)
-        prelim_emb_scores = []
-        for c in top_chunks:
-            c_emb = c.get("embedding", [])
-            if c_emb and q_emb_prelim:
-                prelim_emb_scores.append(self._cosine_similarity(q_emb_prelim, c_emb))
-            else:
-                prelim_emb_scores.append(0.0)
+        prelim_emb_scores = [
+            self._chunk_gate_score(c, q_emb_prelim) for c in top_chunks
+        ]
 
         # P0 改進：預估污染風險
         prelim_unique_sources = set(c.get("source", "") for c in top_chunks)
@@ -1971,16 +2180,17 @@ English:"""
         vl_origins = {'image', 'screenshot'}
         has_vl_ref = any(chunk.get('origin') in vl_origins for chunk in merged_chunks)
 
-        # 修正：用「最終被選中的 chunks」重新計算 top_emb_score
+        # 修正：用「最終被選中的 chunks」重新計算信心分數
         # 避免 candidates[0] 被過濾/rerank 後，仍用它的低分來決定信心度
         # 這會導致「有好 REF 卻被誤判為低信心而跳過」
+        # 信心是決策（拒答閘讀的就是這個數字）→ gate 矩陣；合併過的 chunk 取
+        # 成員的最大 gate 分數，絕不回退到 contextual 向量重算。
         q_emb_for_score = self._get_embedding(question) if not USE_MMR else q_emb
-        used_emb_scores = []
-        for c in merged_chunks:
-            c_emb = c.get("embedding", [])
-            if c_emb and q_emb_for_score:
-                used_emb_scores.append(self._cosine_similarity(q_emb_for_score, c_emb))
-        top_emb_score_used = max(used_emb_scores) if used_emb_scores else top_emb_score
+        used_emb_scores = [
+            self._chunk_gate_score(c, q_emb_for_score) for c in merged_chunks
+        ]
+        used_emb_scores = [s for s in used_emb_scores if s]
+        top_emb_score_used = max(used_emb_scores) if used_emb_scores else top_gate_score
 
         # 在 REF header 加入信心分數提示，讓 LLM 了解參考資料的可靠度
         # 使用修正後的 top_emb_score_used
@@ -2079,7 +2289,7 @@ English:"""
         # 改進：分別回傳 embedding score 和 keyword score，讓 spec 題拒答只看 embedding
         # 修正：top_emb_score 改用「最終被選中的 chunks」的最高分，而非 candidates[0]
         # 這避免了「candidates[0] 被過濾掉，但 top_emb_score 仍用它的低分」的問題
-        top_kw_score = candidates[0][2] if candidates else 0.0
+        top_kw_score = candidates[0].gate_bm25 if candidates else 0.0
         # 將 has_spec_chunk 改為 has_authoritative_chunk
         # 權威類型：spec、manual、api（chat/diagram 不算權威）
         authoritative_types = {'spec', 'manual', 'api'}
@@ -2124,9 +2334,14 @@ English:"""
 
         metadata = {
             "has_ref": len(merged_chunks) > 0,
-            "top_score": top_score,               # combined score（向後相容）
-            "top_emb_score": top_emb_score_used,  # 修正：用最終選中 chunks 的最高 emb score
-            "top_kw_score": top_kw_score,         # 純 keyword/BM25 score
+            "top_score": top_score,               # RRF score（向後相容）
+            # 決策訊號：content-only（gate）的最高分。拒答閘、信心標記讀的都是
+            # 這個數字，所以它**必須**不含 LLM 生成的脈絡。
+            "top_emb_score": top_emb_score_used,
+            "top_kw_score": top_kw_score,         # gate BM25 score
+            # 觀測用：含生成脈絡的檢索分數。只給 telemetry / A-B 看，不做決策。
+            "top_retrieval_score": top_retrieval_score,
+            "context_in_use": use_generated_context() and self._has_ctx,
             "has_spec_chunk": has_spec_chunk,     # 向後相容（等同 has_authoritative_chunk）
             "has_authoritative_chunk": has_authoritative_chunk,  # 是否命中權威類型（spec/manual/api）
             "ref_count": len(merged_chunks),
@@ -2174,8 +2389,43 @@ English:"""
         if USE_MMR:
             features.append("MMR")
 
+        if self._has_ctx:
+            features.append("Ctx(on)" if use_generated_context() else "Ctx(off)")
+
         feature_str = f" [{'+'.join(features)}]" if features else ""
-        return f"[KB] 知識庫: {self.path} ({doc_count} 文件, {chunk_count} 區塊){feature_str}"
+        line = f"[KB] 知識庫: {self.path} ({doc_count} 文件, {chunk_count} 區塊){feature_str}"
+        ctx_line = self.context_status()
+        return f"{line}\n{ctx_line}" if ctx_line else line
+
+    def context_status(self) -> str:
+        """chunk 脈絡的世代分布。
+
+        沒有單一 KB-level fingerprint 能代表混存狀態（同一個 KB 可能混著不同
+        prompt 版本、不同模型生成的 ctx），所以聚合每個 chunk 的 ctx_meta 就是
+        真相。只出計數，**不出 ctx 文本**——ctx 內容視同 KB 內容（NDA）。
+        """
+        if not self._has_ctx:
+            return ""
+        generations: dict[str, int] = {}
+        absent = 0
+        absent_reasons: dict[str, int] = {}
+        for chunk in self.chunks:
+            meta = chunk.get("ctx_meta") or {}
+            if context_signals.chunk_ctx(chunk):
+                key = f"prompt-v{meta.get('prompt_version', '?')}"
+                generations[key] = generations.get(key, 0) + 1
+            else:
+                absent += 1
+                reason = str(meta.get("absent_reason") or "unknown")
+                absent_reasons[reason] = absent_reasons.get(reason, 0) + 1
+        total = len(self.chunks) or 1
+        covered = total - absent
+        parts = ", ".join(f"{k}: {v}" for k, v in sorted(generations.items()))
+        line = f"[KB] ctx coverage {covered * 100 // total}% ({parts or 'none'}, absent: {absent})"
+        if absent_reasons:
+            detail = ", ".join(f"{k}×{v}" for k, v in sorted(absent_reasons.items()))
+            line += f" [{detail}]"
+        return line
 
 
 def load_knowledge_base_strict(json_path: str) -> KnowledgeBase:

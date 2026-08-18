@@ -432,6 +432,52 @@ KNOWLEDGE_CONTENT_MAX_CHARS = 2000
 KNOWLEDGE_MERGE_ADJACENT = True
 KNOWLEDGE_MERGE_MAX_CHARS = 2500
 EMBEDDING_MODEL = _DEPLOYMENT_PROFILE.service("embedding").model or ""
+
+# ------------------------------------------------------------
+# Contextual Retrieval（chunk 級生成脈絡）
+# ------------------------------------------------------------
+# 兩個旗標都預設關閉，理由有兩條，都不是保守而已：
+#   1. standalone 的 RAG.py 目前只依賴 embedding server。預設開啟等於替所有
+#      既有部署新增一條 main-server 硬依賴，升級即破壞。
+#   2. 部署允許 main URL 指到非 loopback。預設開啟等於在沒有明確同意的情況下
+#      把「整份文件的窗」送去遠端（NDA）。
+# KB_CONTEXT_USE 同時是緊急 kill switch：關掉之後查詢端立刻退回 content-only
+# 訊號，不需要重建 KB。
+KB_CONTEXT_GENERATE = _os.environ.get(
+    "AICODE_KB_CONTEXT_GENERATE", ""
+).lower() in ("1", "true", "yes")
+KB_CONTEXT_USE = _os.environ.get(
+    "AICODE_KB_CONTEXT_USE", ""
+).lower() in ("1", "true", "yes")
+# main URL 非 loopback 時，必須顯式同意才會把文件內容送出去。
+KB_CONTEXT_REMOTE_OK = _os.environ.get(
+    "AICODE_KB_CONTEXT_REMOTE_OK", ""
+).lower() in ("1", "true", "yes")
+
+# 生成一段 ctx 的 token 上限（送出時就明設 max_tokens，回應後截斷只是第二道）。
+KB_CONTEXT_TARGET_TOKENS = int(_os.environ.get("AICODE_KB_CONTEXT_TARGET_TOKENS", "100"))
+# 推理模型（DeepSeek / Qwen thinking 等）會把 reasoning token 一起算進
+# max_tokens。只送 TARGET_TOKENS 的話，思考就把額度用完、content 直接是空字串
+# ——實測 21 個 chunk 有 4 個因此變成 absent。所以請求端的上限是
+# TARGET + REASONING，「50–100 token」那個契約改由回應後截斷來保證。
+KB_CONTEXT_REASONING_TOKENS = int(
+    _os.environ.get("AICODE_KB_CONTEXT_REASONING_TOKENS", "512")
+)
+# 單次 context 呼叫的逾時（秒）。
+KB_CONTEXT_TIMEOUT = int(_os.environ.get("AICODE_KB_CONTEXT_TIMEOUT", "180"))
+# 窗預算的安全係數：n_ctx 乘上它之後才扣模板 / chunk / 保留輸出。
+KB_CONTEXT_WINDOW_SAFETY = float(_os.environ.get("AICODE_KB_CONTEXT_WINDOW_SAFETY", "0.8"))
+# 一批做完之後 absent 率超過這個比例就中止發布，不把低覆蓋的 KB 當成功寫出去。
+KB_CONTEXT_MAX_ABSENT_RATIO = float(
+    _os.environ.get("AICODE_KB_CONTEXT_MAX_ABSENT_RATIO", "0.20")
+)
+# ctx 快取放 repo 外的 per-root user cache：改 CodeTrail 自己的 .gitignore
+# 保護不了任意 AICODE_ROOT 底下的 firmware repo。
+KB_CONTEXT_CACHE_DIR = _os.environ.get(
+    "AICODE_KB_CONTEXT_CACHE_DIR",
+    _os.path.join(_os.path.expanduser("~"), ".cache", "codetrail", "ctx"),
+)
+
 RERANKER_MODEL = _DEPLOYMENT_PROFILE.service("reranker").model or ""
 RERANK_FALLBACK_POLICY = _os.environ.get("AICODE_RERANK_FALLBACK_POLICY", "error").strip().lower()
 _RERANK_FALLBACK_POLICIES = {"embedding", "main_model", "error"}

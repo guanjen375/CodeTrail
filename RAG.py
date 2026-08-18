@@ -39,7 +39,15 @@ from knowledge_store import (
 # - --url 模式需要 html2text
 # - 所有模式都需要 llama-server embedding 端點 (預設 8081)
 
+import context_signals
 import llama_client
+
+# 執行期才讀的設定（旗標之類）走這個 module handle，不要 import-time 綁值；
+# 獨立執行（沒有 config.py）時是 None，getattr 的預設值會接住。
+try:
+    import config as config_module
+except ImportError:  # pragma: no cover - standalone 模式
+    config_module = None
 
 
 def check_pymupdf4llm():
@@ -91,8 +99,11 @@ INCLUDE_HEADING_IN_CONTENT = True
 
 # Embedding 增量快取檔案
 EMBEDDING_CACHE_FILE = ".rag_embedding_cache.json"
-EMBEDDING_INPUT_SCHEMA = "source-section-content-v2"
-LEGACY_CONTENT_HASH_SCHEMA = "content-v1"
+# 組字與 schema 名稱的唯一定義在 context_signals；這裡只 re-export 舊名字。
+EMBEDDING_INPUT_SCHEMA = context_signals.CONTENT_INPUT_SCHEMA
+CONTEXTUAL_INPUT_SCHEMA = context_signals.CONTEXTUAL_INPUT_SCHEMA
+GATE_INPUT_SCHEMA = context_signals.GATE_SCHEMA
+LEGACY_CONTENT_HASH_SCHEMA = context_signals.LEGACY_CONTENT_HASH_SCHEMA
 
 # 支援的檔案類型（文字類，process_file 走純文字抽取）
 SUPPORTED_EXTENSIONS = {".pdf", ".md", ".txt"}
@@ -1161,87 +1172,116 @@ def _content_hash(content: str) -> str:
 
 
 def _embedding_input(chunk: Dict) -> str:
-    """Build the model input; source identity is retrieval evidence, not post-hoc metadata."""
-    source = Path(str(chunk.get("source", ""))).name
-    section = str(chunk.get("section", "")).strip()
-    prefixes = []
-    if source:
-        prefixes.append(f"[SOURCE] {source}")
-    if section:
-        prefixes.append(f"[SECTION_METADATA] {section}")
-    prefixes.append(str(chunk.get("content", "")))
-    return "\n".join(prefixes)
+    """content-only 組字（gate 訊號）。組字規則的唯一定義在 context_signals。"""
+    return context_signals.gate_embedding_input(chunk)
 
 
-def generate_embeddings(chunks: List[Dict], cache_dir: Path = None) -> List[Dict]:
-    """為所有 chunks 生成 embeddings
+def _embed_text_cached(text: str, cache: Dict, state: Dict) -> List[float]:
+    """算一段文字的 embedding，先查內容雜湊快取。
 
-    改進：使用內容雜湊快取，避免重複計算相同內容的 embedding
-    - 快取 key = content 的 MD5 雜湊
-    - 相同內容直接從快取取得 embedding
-    - 新內容計算後存入快取
+    快取 key 是「實際送出的字串」的雜湊，所以 retrieval（含 ctx）與 gate
+    （純內容）兩種組字自然分屬不同 key，不會互相污染。
+    """
+    key = _content_hash(text)
+    # 舊版可能留下空向量，空值視為 miss 並重新請求。
+    cached = cache.get(key)
+    if cached:
+        state["hits"] += 1
+        return cached
+
+    try:
+        embedding = llama_client.embed_one(
+            base_url=LLAMA_EMBED_BASE_URL,
+            content=text,
+            model=EMBEDDING_MODEL,
+            timeout=120,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"embedding server unreachable at {LLAMA_EMBED_BASE_URL}: {exc}. "
+            "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+        ) from exc
+
+    if not embedding:
+        raise RuntimeError(
+            f"embedding server returned an empty vector at {LLAMA_EMBED_BASE_URL}. "
+            "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+        )
+
+    cache[key] = embedding
+    state["updated"] = True
+    return embedding
+
+
+def _generate_embedding_fields(
+    chunks: List[Dict],
+    cache_dir: Path = None,
+    *,
+    retrieval: bool,
+    gate: bool,
+) -> List[Dict]:
+    """替 chunks 產生 retrieval / gate 兩套向量（各自可選）。
+
+    chunk 沒有 ctx 時兩套組字完全相同，直接共用同一個向量，不會多打一次
+    embedding server——「沒開 contextual」的部署因此不會多付任何成本。
     """
     total = len(chunks)
+    if not total:
+        return chunks
 
-    # 載入快取
     if cache_dir is None:
         cache_dir = Path.cwd()
     cache_path = cache_dir / EMBEDDING_CACHE_FILE
     cache = _load_embedding_cache(cache_path)
-    cache_hits = 0
-    cache_updated = False
+    state = {"hits": 0, "updated": False}
 
     for i, chunk in enumerate(chunks):
         # 進度顯示
         if (i + 1) % 10 == 0 or i == 0 or i == total - 1:
-            status = f"(快取命中: {cache_hits})" if cache_hits > 0 else ""
+            status = f"(快取命中: {state['hits']})" if state["hits"] > 0 else ""
             print(f"  Embedding: {i + 1}/{total} {status}", end='\r')
 
-        content = _embedding_input(chunk)
-        content_key = _content_hash(content)
+        retrieval_text = context_signals.retrieval_embedding_input(chunk, use_ctx=True)
+        gate_text = context_signals.gate_embedding_input(chunk)
 
-        # 檢查快取；舊版可能留下空向量，空值視為 miss 並重新請求。
-        cached_embedding = cache.get(content_key)
-        if cached_embedding:
-            chunk['embedding'] = cached_embedding
-            cache_hits += 1
-            continue
-
-        # 計算新的 embedding(走 llama-server /embedding)
-        try:
-            embedding = llama_client.embed_one(
-                base_url=LLAMA_EMBED_BASE_URL,
-                content=content,
-                model=EMBEDDING_MODEL,
-                timeout=120,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"embedding server unreachable at {LLAMA_EMBED_BASE_URL}: {exc}. "
-                "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
-            ) from exc
-
-        if not embedding:
-            raise RuntimeError(
-                f"embedding server returned an empty vector at {LLAMA_EMBED_BASE_URL}. "
-                "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
-            )
-
-        chunk['embedding'] = embedding
-        # 存入快取
-        cache[content_key] = embedding
-        cache_updated = True
+        if retrieval:
+            chunk['embedding'] = _embed_text_cached(retrieval_text, cache, state)
+        if gate:
+            if gate_text == retrieval_text and chunk.get('embedding'):
+                chunk['embedding_gate'] = list(chunk['embedding'])
+            else:
+                chunk['embedding_gate'] = _embed_text_cached(gate_text, cache, state)
 
     # 儲存更新後的快取
-    if cache_updated:
+    if state["updated"]:
         _save_embedding_cache(cache_path, cache)
         print(f"\n  [INFO] Embedding 快取已更新 ({len(cache)} 項)")
-    elif cache_hits > 0:
-        print(f"\n  [INFO] 快取命中 {cache_hits}/{total} ({cache_hits*100//total}%)")
+    elif state["hits"] > 0:
+        print(f"\n  [INFO] 快取命中 {state['hits']}/{total} ({state['hits']*100//total}%)")
     else:
         print()  # 換行
 
     return chunks
+
+
+def generate_embeddings(
+    chunks: List[Dict], cache_dir: Path = None, *, with_gate: bool = False
+) -> List[Dict]:
+    """為所有 chunks 生成 embeddings
+
+    - 快取 key = 實際送出字串的 MD5 雜湊
+    - with_gate=True 時同時補上 content-only 的 gate 向量（決策訊號）
+    """
+    return _generate_embedding_fields(
+        chunks, cache_dir, retrieval=True, gate=with_gate
+    )
+
+
+def generate_gate_embeddings(chunks: List[Dict], cache_dir: Path = None) -> List[Dict]:
+    """只補 content-only 的 gate 向量（retrieval 向量已經有了的情況）。"""
+    return _generate_embedding_fields(
+        chunks, cache_dir, retrieval=False, gate=True
+    )
 
 # ============================================================
 # 主程式
@@ -1272,18 +1312,8 @@ def load_knowledge_base(output_path: Path) -> Dict:
 def _chunks_content_hash(
     chunks: List[Dict], schema: str = LEGACY_CONTENT_HASH_SCHEMA
 ) -> str:
-    """計算 chunks hash；新版同時涵蓋會影響 embedding input 的 metadata。"""
-    hasher = hashlib.md5()
-    for chunk in chunks:
-        if schema == EMBEDDING_INPUT_SCHEMA:
-            value = _embedding_input(chunk)
-            # 長度前綴避免欄位/相鄰 chunk 邊界碰撞。
-            encoded = value.encode('utf-8')
-            hasher.update(len(encoded).to_bytes(8, "big"))
-            hasher.update(encoded)
-        else:
-            hasher.update(chunk.get('content', '').encode('utf-8'))
-    return hasher.hexdigest()
+    """計算 chunks hash；實作在 context_signals，載入端用的是同一份。"""
+    return context_signals.chunks_content_hash(chunks, schema=schema)
 
 
 def _restore_embeddings_from_npz(kb: Dict, output_path: Path) -> bool:
@@ -1291,6 +1321,10 @@ def _restore_embeddings_from_npz(kb: Dict, output_path: Path) -> bool:
 
     RAG JSON 為了減少體積不再保存 embedding；增量新增文件前必須先把舊
     embeddings 還原，否則下一次 save 會把舊 chunks 寫成零向量。
+
+    KB 有任何 ctx 時，gate 矩陣（content-only 決策訊號）必須同時存在——缺了就
+    fail-loud，絕不退回「拿 contextual 向量當 gate 用」：那等於讓生成脈絡抬高
+    的分數去通過拒答閘，是分數面的循環 grounding。
     """
     chunks = kb.get("chunks", [])
     if not chunks:
@@ -1304,7 +1338,11 @@ def _restore_embeddings_from_npz(kb: Dict, output_path: Path) -> bool:
             "Rebuild the whole knowledge base; mixing vectors from different "
             "models is forbidden."
         )
-    if all(chunk.get("embedding") for chunk in chunks):
+
+    needs_gate = context_signals.has_any_ctx(chunks)
+    have_retrieval = all(chunk.get("embedding") for chunk in chunks)
+    have_gate = all(chunk.get("embedding_gate") for chunk in chunks)
+    if have_retrieval and (have_gate or not needs_gate):
         _, dimension = validate_embeddings(chunks)
         stored_dimension = saved_metadata.get("embedding_dimension")
         if stored_dimension and int(stored_dimension) != dimension:
@@ -1336,6 +1374,12 @@ def _restore_embeddings_from_npz(kb: Dict, output_path: Path) -> bool:
             hash_schema = str(data.get("content_hash_schema", LEGACY_CONTENT_HASH_SCHEMA))
             npz_generation = str(data.get("store_generation", ""))
             stored_dimension = int(data.get("embedding_dimension", 0))
+            has_gate_matrix = "embeddings_gate" in getattr(data, "files", [])
+            gate_embeddings = data["embeddings_gate"].copy() if has_gate_matrix else None
+            gate_hash = str(data.get("gate_content_hash", ""))
+            gate_schema = str(data.get("gate_content_hash_schema", ""))
+    except KeyError as e:
+        raise KnowledgeStoreError(f"knowledge embeddings are incomplete in {emb_path}: {e}") from e
     except Exception as e:
         raise KnowledgeStoreError(f"failed to load knowledge embeddings from {emb_path}: {e}") from e
 
@@ -1370,15 +1414,51 @@ def _restore_embeddings_from_npz(kb: Dict, output_path: Path) -> bool:
             f"NPZ={npz_generation or '(missing)'}"
         )
 
+    # Required-schema 對照：不能只信 NPZ 自報的 schema 再拿它重算 hash——
+    # 那樣 legacy NPZ 永遠自驗通過，程式換了組字規則也察覺不到。
+    allowed_schemas = context_signals.required_retrieval_schemas(has_ctx=needs_gate)
+    if hash_schema not in allowed_schemas:
+        raise KnowledgeStoreError(
+            f"knowledge embedding schema mismatch: NPZ={hash_schema!r}, "
+            f"required one of {sorted(allowed_schemas)}. Rebuild the knowledge base."
+        )
+
     current_hash = _chunks_content_hash(chunks, schema=hash_schema)
     if content_hash and content_hash != current_hash:
         raise KnowledgeStoreError(
             f"knowledge embedding content hash mismatch: NPZ={content_hash}, JSON={current_hash}"
         )
 
-    for chunk, emb in zip(chunks, embeddings):
+    if needs_gate:
+        if gate_embeddings is None:
+            raise KnowledgeStoreError(
+                f"knowledge store has generated chunk context but {emb_path} carries no "
+                "gate (content-only) matrix; refusing to fall back to contextual vectors "
+                "for decisions. Rebuild the knowledge base."
+            )
+        if gate_schema != context_signals.GATE_SCHEMA:
+            raise KnowledgeStoreError(
+                f"gate embedding schema mismatch: NPZ={gate_schema!r}, "
+                f"required {context_signals.GATE_SCHEMA!r}. Rebuild the knowledge base."
+            )
+        if getattr(gate_embeddings, "ndim", 0) != 2 or gate_embeddings.shape[0] != len(chunks):
+            raise KnowledgeStoreError(
+                "gate embedding matrix shape mismatch: got "
+                f"{getattr(gate_embeddings, 'shape', None)}, expected ({len(chunks)}, dimension)"
+            )
+        current_gate_hash = _chunks_content_hash(chunks, schema=context_signals.GATE_SCHEMA)
+        if gate_hash and gate_hash != current_gate_hash:
+            raise KnowledgeStoreError(
+                f"gate embedding content hash mismatch: NPZ={gate_hash}, JSON={current_gate_hash}"
+            )
+
+    for index, chunk in enumerate(chunks):
         if not chunk.get("embedding"):
-            chunk["embedding"] = emb.tolist() if hasattr(emb, "tolist") else list(emb)
+            row = embeddings[index]
+            chunk["embedding"] = row.tolist() if hasattr(row, "tolist") else list(row)
+        if gate_embeddings is not None and not chunk.get("embedding_gate"):
+            row = gate_embeddings[index]
+            chunk["embedding_gate"] = row.tolist() if hasattr(row, "tolist") else list(row)
     return True
 
 
@@ -1389,30 +1469,54 @@ def save_knowledge_base(kb: Dict, output_path: Path, *, _already_locked: bool = 
     - 大幅減少 JSON 檔案大小
     - 加速 JSON 解析
     - .npz 使用壓縮格式，整體儲存更有效率
+
+    KB 裡只要有任何一個 chunk 帶 ctx，就同時寫出 content-only 的 gate 矩陣，
+    retrieval schema 也跟著換成 contextual 版本。完全沒有 ctx 的 KB 走的還是
+    單一矩陣 + 舊 schema，輸出與加入 contextual retrieval 之前逐位元組相同。
     """
-    missing_embeddings = [chunk for chunk in kb.get("chunks", []) if not chunk.get("embedding")]
+    chunks = kb.get("chunks", [])
+    needs_gate = context_signals.has_any_ctx(chunks)
+
+    missing_embeddings = [chunk for chunk in chunks if not chunk.get("embedding")]
     if missing_embeddings:
         print(f"[INFO] {len(missing_embeddings)} 個 chunks 缺少 embedding，明確重算後再提交")
-        generate_embeddings(missing_embeddings, cache_dir=output_path.parent)
+        generate_embeddings(
+            missing_embeddings, cache_dir=output_path.parent, with_gate=needs_gate
+        )
+    if needs_gate:
+        missing_gate = [chunk for chunk in chunks if not chunk.get("embedding_gate")]
+        if missing_gate:
+            print(f"[INFO] {len(missing_gate)} 個 chunks 缺少 gate embedding，明確重算後再提交")
+            generate_gate_embeddings(missing_gate, cache_dir=output_path.parent)
 
     # 更新 metadata
     kb["metadata"]["updated_at"] = datetime.now().isoformat()
     kb["metadata"]["total_documents"] = len(kb["metadata"]["documents"])
     kb["metadata"]["total_chunks"] = len(kb["chunks"])
 
-    content_hash = _chunks_content_hash(kb["chunks"], schema=EMBEDDING_INPUT_SCHEMA)
+    retrieval_schema = (
+        context_signals.CONTEXTUAL_INPUT_SCHEMA if needs_gate else EMBEDDING_INPUT_SCHEMA
+    )
+    content_hash = _chunks_content_hash(kb["chunks"], schema=retrieval_schema)
+    gate_hash = (
+        _chunks_content_hash(kb["chunks"], schema=context_signals.GATE_SCHEMA)
+        if needs_gate else None
+    )
     _, saved_emb_path = save_knowledge_store_atomic(
         kb,
         output_path,
         embedding_file=KNOWLEDGE_EMB_FILE,
         embedding_model=EMBEDDING_MODEL,
         content_hash=content_hash,
-        content_hash_schema=EMBEDDING_INPUT_SCHEMA,
+        content_hash_schema=retrieval_schema,
+        gate_content_hash=gate_hash,
+        gate_content_hash_schema=context_signals.GATE_SCHEMA if needs_gate else None,
         already_locked=_already_locked,
     )
     if saved_emb_path:
         emb_size = saved_emb_path.stat().st_size / 1024 / 1024
-        print(f"     Embeddings: {saved_emb_path.name} ({emb_size:.2f} MB)")
+        gate_note = "（含 gate 矩陣）" if needs_gate else ""
+        print(f"     Embeddings: {saved_emb_path.name} ({emb_size:.2f} MB){gate_note}")
     else:
         print(f"     Embeddings: 已移除空知識庫的 {KNOWLEDGE_EMB_FILE}")
 
@@ -1477,12 +1581,20 @@ def remove_document_from_knowledge_base(output_path: Path, source: str) -> Dict:
             }),
         }
 
+def resolve_context_flag(cli_flag: Optional[bool]) -> bool:
+    """CLI 旗標 > config（規格 §12 的 precedence）。"""
+    if cli_flag is None:
+        return bool(getattr(config_module, "KB_CONTEXT_GENERATE", False))
+    return bool(cli_flag)
+
+
 def _commit_document_to_kb(
     document: ExtractedDocument,
     output_file: str,
     *,
     label: str = "文件",
     kb: Optional[Dict] = None,
+    generate_context: bool = False,
 ) -> bool:
     """把一份 ExtractedDocument 併進知識庫（同名文件先移除舊 chunks）。
 
@@ -1514,9 +1626,20 @@ def _commit_document_to_kb(
 
     print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
 
+    # chunk 級生成脈絡（預設關閉）。失敗一律往上丟：這一步失敗就不該發布，
+    # 覆蓋率不足也一樣——寧可整批不進 KB，也不要寫出半套脈絡的知識庫。
+    if generate_context:
+        import context_generation
+
+        report = context_generation.generate_document_context(
+            document, kb_path=output_path
+        )
+        print(report.format_summary())
+
     # 生成 embeddings
+    needs_gate = context_signals.has_any_ctx(new_chunks)
     print(f"[INFO] 使用 {EMBEDDING_MODEL} 生成 embeddings...")
-    new_chunks = generate_embeddings(new_chunks)
+    new_chunks = generate_embeddings(new_chunks, with_gate=needs_gate)
 
     # 為每個 chunk 生成唯一 ID
     for chunk in new_chunks:
@@ -1532,8 +1655,12 @@ def _commit_document_to_kb(
     return True
 
 
-def add_document(input_file: str, output_file: str):
-    """將文件加入知識庫"""
+def add_document(input_file: str, output_file: str, *, generate_context: bool = False):
+    """將文件加入知識庫
+
+    `generate_context` 只有 `rebuild` 子命令會給 True——chunk 脈絡的唯一執行路徑
+    是同步 CLI rebuild（MCP 那條有 600 秒 timeout，數十個大窗串行必然超時）。
+    """
     input_path = Path(input_file)
     output_path = Path(output_file)
 
@@ -1557,7 +1684,9 @@ def add_document(input_file: str, output_file: str):
     print(f"[INFO] 處理: {input_path.name}")
     document = process_file_document(str(input_path))
 
-    if not _commit_document_to_kb(document, output_file, label="文件", kb=kb):
+    if not _commit_document_to_kb(
+        document, output_file, label="文件", kb=kb, generate_context=generate_context
+    ):
         sys.exit(1)
 
 # ============================================================
@@ -2015,10 +2144,52 @@ def add_technical_image(image_file: str, output_file: str):
 # ============================================================
 # 入口
 # ============================================================
+def rebuild_cli(argv: List[str]) -> int:
+    """`python RAG.py rebuild ...`：chunk 脈絡的唯一執行路徑。
+
+    刻意用 argparse 另開一個子命令，不去擴充下面那個手工 argv parser——旗標語意
+    （互斥、precedence、同給即錯）交給 argparse，不要再手寫一套。
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="RAG.py rebuild",
+        description=(
+            "把文件灌進知識庫。這是唯一會生成 chunk 脈絡（contextual retrieval）"
+            "的路徑；MCP 的 ingest_document 永遠不生成。"
+        ),
+    )
+    parser.add_argument("--kb", required=True, help="knowledge.json 路徑（不存在會建立）")
+    parser.add_argument(
+        "documents", nargs="+", help="要灌的文件（pdf/md/txt/bin/elf）"
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--context", dest="context", action="store_const", const=True,
+        help="這次強制生成 chunk 脈絡（需要主 llama-server）",
+    )
+    group.add_argument(
+        "--no-context", dest="context", action="store_const", const=False,
+        help="這次強制不生成",
+    )
+    parser.set_defaults(context=None)
+    args = parser.parse_args(argv)
+
+    generate_context = resolve_context_flag(args.context)
+    source = "CLI 旗標" if args.context is not None else "config"
+    print(f"[INFO] chunk 脈絡生成: {'開' if generate_context else '關'}（來源: {source}）")
+
+    for document_path in args.documents:
+        print(f"\n=== {document_path} ===")
+        add_document(document_path, args.kb, generate_context=generate_context)
+    return 0
+
+
 def print_usage():
     """印出使用說明"""
     print("用法:")
     print("  python RAG.py <input_file> <output_json>             # 一般文件（直接入庫）")
+    print("  python RAG.py rebuild --kb <output_json> <input>...  # 批次入庫（唯一會生成 chunk 脈絡的路徑）")
     print("  python RAG.py <screenshot> <output_json> --chat      # 聊天截圖（互動式）")
     print("  python RAG.py <image> <output_json> --image          # 技術圖片（互動式）")
     print("  python RAG.py <url> <output_json> --url              # 網頁（互動式）")
@@ -2054,6 +2225,16 @@ if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help"):
         print_usage()
         sys.exit(0)
+
+    # rebuild 子命令走自己的 argparse，不進下面的手工 parser
+    if len(sys.argv) >= 2 and sys.argv[1] == "rebuild":
+        sys.exit(rebuild_cli(sys.argv[2:]))
+
+    if getattr(config_module, "KB_CONTEXT_GENERATE", False):
+        print(
+            "[INFO] KB_CONTEXT_GENERATE 是開的，但 chunk 脈絡只在 "
+            "`python RAG.py rebuild --kb <kb> <doc>` 這條路徑生成；這次不生成。"
+        )
 
     # 抽出 -y / --yes 旗標（位置不限），剩下的當作正常參數
     args = [a for a in sys.argv[1:] if a not in ("-y", "--yes")]

@@ -117,7 +117,7 @@ def test_remove_document_rewrites_remaining_npz_and_reload_keeps_dense_search(mo
 
     monkeypatch.setattr(loaded, "_get_embedding", lambda _text: [1.0, 0.0])
     rows = loaded._hybrid_search("KEEP 0x1000", candidate_k=5)
-    assert rows and rows[0][3]["source"] == "keep.md"
+    assert rows and rows[0].chunk["source"] == "keep.md"
 
 
 def test_remove_aborts_if_vectors_are_missing_and_leaves_json_unchanged(tmp_path: Path):

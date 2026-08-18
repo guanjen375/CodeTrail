@@ -953,6 +953,14 @@ def ingest_document(path: str, mode: str = "auto") -> str:
         status = "✓ 完成"
         hint = ("\n\n下一次 query_knowledge 會自動偵測並載入新內容;"
                 "要立即載入+確認 chunk 數可呼叫 reload_knowledge_base()。")
+        if getattr(config, "KB_CONTEXT_GENERATE", False):
+            # MCP 這條路徑永遠不生成 chunk 脈絡:工具鏈有 600 秒 timeout,
+            # 數十個大窗串行必然超時。功能開著就要講明白該去哪裡做。
+            hint += (
+                "\n\n注意: KB_CONTEXT_GENERATE 是開的,但這次入庫**沒有**生成 chunk 脈絡"
+                "(MCP 有 600 秒 timeout,大窗串行會超時)。要生成請在終端機跑:\n"
+                f"  python RAG.py rebuild --kb {kb_path} {doc_path} --context"
+            )
     else:
         status = f"✗ 失敗 (exit {result.returncode})"
         hint = "\n\n入庫失敗;請依上方輸出排除錯誤後重試。"

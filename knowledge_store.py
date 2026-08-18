@@ -70,32 +70,39 @@ def knowledge_store_lock(json_path: Path, *, exclusive: bool) -> Iterator[None]:
             handle.close()
 
 
-def validate_embeddings(chunks: list[dict]) -> tuple[list[list[float]], int | None]:
-    """Return a plain, dimension-consistent matrix without changing ``chunks``."""
+def validate_embeddings(
+    chunks: list[dict], *, key: str = "embedding"
+) -> tuple[list[list[float]], int | None]:
+    """Return a plain, dimension-consistent matrix without changing ``chunks``.
+
+    ``key`` 選要驗哪一套向量:``embedding`` 是 retrieval(可能含生成脈絡),
+    ``embedding_gate`` 是 content-only 的決策訊號。兩套各自驗維度一致性——
+    混維度代表模型/快取混用,補零或截斷都是靜默毀損。
+    """
     if not chunks:
         return [], None
 
     rows: list[list[float]] = []
     dimensions: set[int] = set()
     for index, chunk in enumerate(chunks):
-        raw = chunk.get("embedding")
+        raw = chunk.get(key)
         if raw is None or len(raw) == 0:
             raise KnowledgeStoreError(
-                f"chunk {index} ({chunk.get('source', '?')}) is missing its embedding; "
+                f"chunk {index} ({chunk.get('source', '?')}) is missing its {key}; "
                 "refusing to write a partial knowledge store"
             )
         try:
             row = [float(value) for value in raw]
         except (TypeError, ValueError) as exc:
-            raise KnowledgeStoreError(f"chunk {index} has a non-numeric embedding") from exc
+            raise KnowledgeStoreError(f"chunk {index} has a non-numeric {key}") from exc
         if not row or not all(math.isfinite(value) for value in row):
-            raise KnowledgeStoreError(f"chunk {index} has an empty or non-finite embedding")
+            raise KnowledgeStoreError(f"chunk {index} has an empty or non-finite {key}")
         dimensions.add(len(row))
         rows.append(row)
 
     if len(dimensions) != 1:
         raise KnowledgeStoreError(
-            f"embedding dimension mismatch: found {sorted(dimensions)}; "
+            f"{key} dimension mismatch: found {sorted(dimensions)}; "
             "zero-padding/truncation is forbidden, rebuild with one embedding model"
         )
     return rows, dimensions.pop()
@@ -115,6 +122,16 @@ def _write_json_temp(directory: Path, basename: str, payload: dict) -> Path:
         raise
 
 
+def _normalized_matrix(rows: list[list[float]], label: str):
+    import numpy as np
+
+    matrix = np.asarray(rows, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    if np.any(norms <= 0):
+        raise KnowledgeStoreError(f"zero-norm {label} detected; refusing to persist it")
+    return matrix / norms
+
+
 def _write_npz_temp(
     directory: Path,
     basename: str,
@@ -124,7 +141,16 @@ def _write_npz_temp(
     content_hash: str,
     content_hash_schema: str,
     generation: str,
+    gate_rows: list[list[float]] | None = None,
+    gate_content_hash: str = "",
+    gate_content_hash_schema: str = "",
 ) -> Path:
+    """Stage the NPZ.  Both matrices live in one file, so publishing is one rename.
+
+    `embeddings` 是 retrieval 訊號(可能含生成脈絡),`embeddings_gate` 是
+    content-only 的決策訊號。兩組各帶自己的 schema / hash / 維度 / 列數,
+    同一個 store_generation 下一次提交——分兩個檔就會有「只換到一半」的視窗。
+    """
     try:
         import numpy as np
     except ImportError as exc:  # pragma: no cover - numpy is an optional runtime dependency
@@ -132,26 +158,37 @@ def _write_npz_temp(
             "numpy is required to persist external knowledge embeddings"
         ) from exc
 
-    matrix = np.asarray(rows, dtype=np.float32)
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    if np.any(norms <= 0):
-        raise KnowledgeStoreError("zero-norm embedding detected; refusing to persist it")
-    matrix = matrix / norms
+    matrix = _normalized_matrix(rows, "embedding")
+    payload = {
+        "embeddings": matrix,
+        "embedding_model": embedding_model,
+        "embedding_dimension": matrix.shape[1],
+        "chunk_count": matrix.shape[0],
+        "content_hash": content_hash,
+        "content_hash_schema": content_hash_schema,
+        "store_generation": generation,
+    }
+
+    if gate_rows is not None:
+        gate_matrix = _normalized_matrix(gate_rows, "gate embedding")
+        if gate_matrix.shape[0] != matrix.shape[0]:
+            raise KnowledgeStoreError(
+                "gate matrix row count does not match the retrieval matrix: "
+                f"{gate_matrix.shape[0]} vs {matrix.shape[0]}"
+            )
+        payload.update(
+            embeddings_gate=gate_matrix,
+            gate_embedding_dimension=gate_matrix.shape[1],
+            gate_chunk_count=gate_matrix.shape[0],
+            gate_content_hash=gate_content_hash,
+            gate_content_hash_schema=gate_content_hash_schema,
+        )
 
     fd, raw_path = tempfile.mkstemp(prefix=f".{basename}.tmp.", dir=directory)
     path = Path(raw_path)
     try:
         with os.fdopen(fd, "wb") as handle:
-            np.savez_compressed(
-                handle,
-                embeddings=matrix,
-                embedding_model=embedding_model,
-                embedding_dimension=matrix.shape[1],
-                chunk_count=matrix.shape[0],
-                content_hash=content_hash,
-                content_hash_schema=content_hash_schema,
-                store_generation=generation,
-            )
+            np.savez_compressed(handle, **payload)
             handle.flush()
             os.fsync(handle.fileno())
         return path
@@ -189,17 +226,33 @@ def save_knowledge_store_atomic(
     embedding_model: str,
     content_hash: str,
     content_hash_schema: str,
+    gate_content_hash: str | None = None,
+    gate_content_hash_schema: str | None = None,
     already_locked: bool = False,
 ) -> tuple[Path, Path | None]:
     """Atomically publish a validated JSON/NPZ pair.
 
     The caller's dict and chunk embeddings are never mutated.  Readers holding
     ``knowledge_store_lock`` cannot observe the pair between replacements.
+
+    給了 ``gate_content_hash_schema`` 就同時寫出 content-only 的 gate 矩陣
+    (取自每個 chunk 的 ``embedding_gate``)。沒給就只有單一矩陣——沒有任何
+    ctx 的 KB 用不到第二套向量,retrieval 與 gate 本來就是同一組字。
     """
     json_path = Path(json_path)
     emb_path = json_path.parent / embedding_file
     chunks = list(kb.get("chunks", []))
     rows, dimension = validate_embeddings(chunks)
+    with_gate = gate_content_hash_schema is not None
+    gate_rows: list[list[float]] | None = None
+    gate_dimension: int | None = None
+    if with_gate:
+        gate_rows, gate_dimension = validate_embeddings(chunks, key="embedding_gate")
+        if gate_dimension is not None and dimension is not None and gate_dimension != dimension:
+            raise KnowledgeStoreError(
+                "gate embedding dimension does not match the retrieval matrix: "
+                f"{gate_dimension} vs {dimension}"
+            )
     generation = uuid.uuid4().hex
 
     metadata = copy.deepcopy(kb.get("metadata", {}))
@@ -210,10 +263,25 @@ def save_knowledge_store_atomic(
     metadata["store_generation"] = generation
     metadata["total_chunks"] = len(chunks)
     metadata["total_documents"] = len(metadata.get("documents", []))
+    if with_gate:
+        metadata["gate_embedding_dimension"] = gate_dimension
+        metadata["gate_embedding_content_hash"] = gate_content_hash or ""
+        metadata["gate_embedding_content_hash_schema"] = gate_content_hash_schema
+    else:
+        # 上一代 KB 有 gate 而這次沒有時，殘留的 metadata 會讓載入端誤以為
+        # NPZ 裡還有第二套矩陣。
+        for stale in (
+            "gate_embedding_dimension",
+            "gate_embedding_content_hash",
+            "gate_embedding_content_hash_schema",
+        ):
+            metadata.pop(stale, None)
     json_chunks = []
     for chunk in chunks:
         clean = copy.deepcopy(chunk)
+        # 任何向量都不 inline 進 JSON：體積之外，兩份會各自漂移。
         clean.pop("embedding", None)
+        clean.pop("embedding_gate", None)
         json_chunks.append(clean)
     payload = {"metadata": metadata, "chunks": json_chunks}
 
@@ -244,6 +312,9 @@ def save_knowledge_store_atomic(
                         content_hash=content_hash,
                         content_hash_schema=content_hash_schema,
                         generation=generation,
+                        gate_rows=gate_rows,
+                        gate_content_hash=gate_content_hash or "",
+                        gate_content_hash_schema=gate_content_hash_schema or "",
                     )
 
                 json_backup = _backup_link(json_path, generation)

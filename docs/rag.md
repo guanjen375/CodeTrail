@@ -288,3 +288,25 @@ batch size 上限是 32 (REF1)。
 - 文件切段的大小、不同來源類型的搜尋權重，這些可調參數放在 `config.py` 的 `CHUNK_SETTINGS` 和 `SOURCE_TYPE_WEIGHTS`，預設值在大多數情境下已經夠用，要微調再去動。
 
 ---
+
+## Chunk 脈絡（contextual retrieval）— 預設關閉
+
+切碎之後每個 chunk 會失去父文件的脈絡：同一份規格書有十個「測試結果」節，任何一段脫離父章節後幾乎沒有鑑別度。這個功能會在入庫時替每個 chunk 生成一段 50–100 token 的定位文字（「本節出自 <文件> 的 <章節路徑>，說明 <主題>」），只拿去餵檢索訊號。
+
+**兩個旗標都預設關閉**，因為開啟會改變兩件事：入庫從此需要主模型（不只 embedding server），而且如果你的主模型 URL 指到別台機器，整份文件的內容就會離開這台電腦（非 loopback 需要額外設 `AICODE_KB_CONTEXT_REMOTE_OK=1` 才放行）。
+
+```bash
+# 生成：只有這條路徑會生成，MCP 的 ingest_document 永遠不會
+python RAG.py rebuild --kb knowledge.json spec_a.pdf --context
+
+# 查詢時使用（也是緊急關閉開關，關掉不需要重建知識庫）
+AICODE_KB_CONTEXT_USE=1 aicode
+```
+
+要知道的三件事：
+
+1. **生成的文字不是證據。** 它只會影響「哪些 chunk 被撈上來、排第幾」，不會出現在 `[REF]` 的內容裡，也不會影響拒答判斷、信心度或數值證據判定——那些一律看原文算出來的分數。所以就算脈絡寫錯了，也不會讓一段不相關的原文被當成答案。
+2. **成本是每個 chunk 一次主模型呼叫。** 實測約 10–20 秒一個 chunk，幾百個 chunk 的規格書要跑十幾分鐘到一小時。文件沒改的話重跑會全部命中快取、零呼叫。
+3. **知識庫格式會變。** 開了之後 `knowledge_emb.npz` 會存兩組向量，舊版程式讀不了；要換回去就重新入庫一次（`--no-context`）。
+
+---

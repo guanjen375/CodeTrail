@@ -56,6 +56,8 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 - `tests/test_mcp_root_safety.py` — `root_safety.validate_aicode_root` 拒絕 `/` / `$HOME` /不存在的 root,並守住 mcp_server 真的有接上去
 - `tests/test_index_scope.py` — 索引範圍:三態走訪 ≡ `should_index_file` 的不變式、rescue 四測、Layer C loader fail-loud(schema/權限/pattern 衛生)、matcher 方言向量、symlink containment、快取 fingerprint 遷移、`index_stats` root 驗證;全部離線且用合成樹名
 - `tests/test_mcp_smoke.py` — MCP server stdio 啟動與基本 tool 呼叫
+- `tests/test_contextual_signals.py` — 雙訊號不變式:ctx 不進 evidence/REF/strict 來源、六個決策點逐一讀 gate、`_should_rerank` 三分支、merge 聚合 gate、lexical bypass 走 gate BM25、雙矩陣儲存與 required-schema 對照、旗標四象限;離線
+- `tests/test_context_generation.py` — 生成端:loopback 雙棧判定、非 loopback 需顯式同意、3xx/HTTP 錯當傳輸失敗、環境 proxy 隔離、快取檔名/權限/symlink 逃逸、write-through 與零呼叫冪等、指紋涵蓋模型檔 size+mtime、single-writer 鎖、窗公式含 `RESERVED_OUTPUT_TOKENS`、map/reduce 路徑、空回應重試一次、覆蓋率閘;HTTP 全 mock,離線
 - `tests/test_extracted_document.py` — `ExtractedDocument` 單一真相:章節 span 連續性、重複標題各自成節、chunk 的 char span 定位、PDF 頁 span/跨頁 page_range、「短頁被歸到上一頁章節」回歸、五個入口的 chunk 形狀一致;離線且用合成語料
 - `tests/test_tool_call_canary.py` — `aicode` 的兩層工具健檢：18-tool contract、假 XML 拒絕、completed event、設定指紋／24h cache、retry/FLAKY/fail-loud；所有 OpenCode／MCP／HTTP／LLM 路徑都 mock，pytest 絕不呼叫真模型
 - `tests/test_lessons.py` — lessons(行為教訓)store 驗證 fail-loud、20 條上限、scope/review_by 過濾、render 注入、過期停注入+複審提示、管理 CLI 與完整生命週期;純檔案系統,離線
@@ -185,6 +187,8 @@ llama-server 啟動時 `-c <N>` 與 OpenCode `model.limit.context` 對齊。`scr
 |---|---|
 | `context_budget.py` | token 估算(prompt / messages parts / tools schema)、`ContextUsage` dataclass、hard gate (`enforce_gate` → `ContextOverflowError`)、llama-server usage metrics 解析(支援 native `tokens_evaluated/tokens_predicted` 與 OpenAI `usage{}`,streaming + non-streaming)、JSONL telemetry。**不寫 prompt / 檔案內容** 進 log,只寫 count + metadata。 |
 | `trim.py` | 對 `role=tool` 訊息做 priority-aware trim,加入明確 `[CTX_TRIMMED]` / `[TOOL_SUMMARY]` 標記。`role=system` / `role=user` 訊息**完全不動**(REF metadata 因此被保留)。run_command 保留 tail + error line;read_file 保留 header + window;舊輪 tool output 摘要成 deterministic facts(file:line 錨點、error 行)。 |
+| `context_signals.py` | **檢索訊號的唯一定義**:embedding 組字(retrieval 含 ctx / gate 只看原文)、schema 名稱與 required 對照、內容雜湊、BM25 來源文本、reranker passage。寫入端(`RAG.py`)與載入端(`knowledge.py`)一律 import 這裡——以前兩邊各寫一份同樣的字串,差一個字就變成「內容雜湊不一致」。 |
+| `context_generation.py` | chunk 級生成脈絡的產生器:窗策略(整份 / 階層式摘要 + target-centered section window)、prompt 版本、輸出衛生、write-through 快取與指紋、per-KB single-writer 鎖、覆蓋率閘、**專用的受限 HTTP client**(`trust_env=False`、拒絕 3xx、host 必須是 loopback)。 |
 | `extracted_document.py` | 文件結構原語與 `ExtractedDocument`(raw_text / sections / chunks)。章節偵測、表格正規化、章節層級、行 offset 都在這裡;RAG.py 只 re-export。**章節與頁碼的單一真相**:chunk 的 `section` / `section_index` / `char_span` 一律由文件級走訪決定,不再由 splitter 的 page-local 追蹤加呼叫端 `last_section` 繼承拼湊。 |
 | `llama_client.py` | 對 llama-server 4 個端點的薄 HTTP wrapper:`/completion` / `/v1/chat/completions` / `/embedding` / `/reranking` / `/props` / `/slots` / `/health`。stream / non-stream 雙模式,native / OpenAI usage 萃取統一接口。 |
 | `utils.py` / `agent.py` 內呼叫點 | 在送 server 前 `context_budget.build_usage(...)` → 觸發 soft 時 `_pre_send_trim_if_needed(...)` → `enforce_gate(...)` → 走 `llama_client.native_completion(...)` 或 `chat_completions(...)` → `parse_usage_from_response(...)` → `log_metrics(...)`。 |
@@ -394,6 +398,57 @@ schema 版本)寫進 `.code_rag_cache_meta.json`。
   return),整個 MCP process 會一路用缺 embedding 的索引降級下去。回歸鎖:
   `test_backfill_failure_leaves_no_partial_index`。
 - scope 熱重載是另案;改了設定要重啟 MCP server。
+
+### Contextual Retrieval(chunk 級生成脈絡)
+
+入庫時替每個 chunk 生成一段 50–100 token 的定位文字(「本節出自 <文件> 的 <章節路徑>,
+說明 <主題>」),存進 chunk 的 `ctx` 欄位,只餵檢索訊號。**兩個旗標都預設關閉。**
+
+```bash
+# 生成(唯一會生成的路徑;MCP 的 ingest_document 永遠不生成)
+AICODE_KB_CONTEXT_GENERATE=1 python RAG.py rebuild --kb knowledge.json spec_a.pdf
+python RAG.py rebuild --kb knowledge.json spec_a.pdf --context      # 旗標 > config
+python RAG.py rebuild --kb knowledge.json spec_a.pdf --no-context   # 這次不生成
+
+# 查詢端使用(同時是緊急 kill switch:關掉不必重建 KB)
+AICODE_KB_CONTEXT_USE=1 aicode
+```
+
+| 環境變數 | 預設 | 作用 |
+|---|---|---|
+| `AICODE_KB_CONTEXT_GENERATE` | off | 入庫時是否生成 ctx |
+| `AICODE_KB_CONTEXT_USE` | off | 查詢時是否使用 ctx(kill switch) |
+| `AICODE_KB_CONTEXT_REMOTE_OK` | off | main URL 非 loopback 時的顯式同意 |
+| `AICODE_KB_CONTEXT_TARGET_TOKENS` | 100 | ctx 長度上限(回應後截斷) |
+| `AICODE_KB_CONTEXT_REASONING_TOKENS` | 512 | 請求端額外留給 reasoning 的額度 |
+| `AICODE_KB_CONTEXT_WINDOW_SAFETY` | 0.8 | 窗預算的 n_ctx 安全係數 |
+| `AICODE_KB_CONTEXT_MAX_ABSENT_RATIO` | 0.20 | 絕跡率超過就中止發布 |
+| `AICODE_KB_CONTEXT_CACHE_DIR` | `~/.cache/codetrail/ctx` | ctx 快取(repo 外、per-root、0700) |
+
+**為什麼預設關閉**:(a) standalone 的 `RAG.py` 目前只依賴 embedding server,預設開啟等於
+替既有部署新增一條 main-server 硬依賴;(b) 部署允許 main URL 指到非 loopback,預設開啟
+等於在沒有明確同意下把整份文件的窗送去遠端(NDA)。
+
+**雙訊號是這個功能的正確性核心**。`ctx` 是 LLM 生成物,只准影響「哪些 chunk 被撈上來、
+排第幾」。所有**決策**——拒答閘、信心標記、rerank/expansion 的 skip、數值證據判定、
+污染控制的分數門檻——一律讀 content-only 的 gate 訊號:
+
+- NPZ 存兩組矩陣:`embeddings`(retrieval,含 ctx)與 `embeddings_gate`(content-only),
+  各帶自己的 schema/hash/維度/列數,同一個 `store_generation` 一次提交。
+- BM25 也是兩套索引。gate 那套的來源文本與加入本功能之前逐位元組相同。
+- `Candidate` 這個 dataclass 把 `retrieval_*` 與 `gate_*` 分開:哪個分數餵哪個決策在型別層
+  看得出來、grep 得到。**看到 `candidates[i][1]` 這種寫法就是退化。**
+- KB 有 ctx 卻缺 gate 矩陣 → 拒載,不 fallback 到 contextual 向量。
+- gate 向量只留在矩陣裡,不 `.tolist()` 掛回 chunk;決策點用 `chunk_idx` 讀列。
+
+`AICODE_KB_CONTEXT_USE=0` 時查詢端完全退回 content-only:dense 讀 gate 矩陣、BM25 用
+content-only 索引、reranker passage 不加 ctx。**同一份 KB 上就能做乾淨的 A/B**,不需要
+第二套 KB。
+
+**成本**:每個 chunk 一次主模型呼叫。實測(21 chunk 合成語料、DeepSeek-V4-Flash)約
+10 秒/chunk,prompt-cache 重用約 89%。文件沒變 → 全部命中快取 → 零 LLM 呼叫。
+
+---
 
 ### scripts/kb_ab_compare.py
 

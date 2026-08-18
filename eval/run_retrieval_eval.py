@@ -349,7 +349,7 @@ def run_retrieval_evaluation(
             candidate_k=max(top_k, 30),
             metadata_filter=metadata_filter,
         )
-        ranked_ids = [str(row[3].get("id", "")) for row in rows]
+        ranked_ids = [str(row.chunk.get("id", "")) for row in rows]
         recall = recall_at_k(ranked_ids, case.relevant, top_k)
         rr = reciprocal_rank(ranked_ids, case.relevant) if case.relevant else math.nan
         ndcg = ndcg_at_k(ranked_ids, case.relevant, top_k)
@@ -363,7 +363,7 @@ def run_retrieval_evaluation(
 
         numeric_ok = None
         if case.expected_values:
-            top_text = "\n".join(str(row[3].get("content", "")) for row in rows[:top_k])
+            top_text = "\n".join(str(row.chunk.get("content", "")) for row in rows[:top_k])
             expected = {value.lower() for value in case.expected_values}
             numeric_ok = expected <= _normalized_values(top_text)
             numeric_retrieval.append(float(numeric_ok))

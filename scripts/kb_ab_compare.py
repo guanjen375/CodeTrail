@@ -168,7 +168,10 @@ def structural_diff(a: dict, b: dict) -> None:
         print(f"    ...（另有 {len(section_diff) - 20} 筆未列出）")
 
 
-def run_questions(paths: list[Path], labels: list[str], questions: list[str]) -> None:
+def run_questions(
+    paths: list[Path], labels: list[str], questions: list[str], ctx_modes: list[bool] | None = None
+) -> None:
+    import config as config_module
     from knowledge import KnowledgeBase
 
     bases = []
@@ -178,19 +181,29 @@ def run_questions(paths: list[Path], labels: list[str], questions: list[str]) ->
             raise SystemExit(f"[ERROR] {label} 載入失敗: {kb.load_error}")
         bases.append((label, kb))
 
-    for question in questions:
-        print(f"\n{'=' * 72}\nQ: {question}")
-        for label, kb in bases:
-            _, _, meta = kb.query(question)
-            print(f"  --- {label}")
-            print(f"      top_emb={meta.get('top_emb_score', 0.0):.3f} "
-                  f"refs={meta.get('ref_count')} "
-                  f"risk={meta.get('is_high_risk')} "
-                  f"conf={meta.get('confidence_label')} "
-                  f"pollution={meta.get('context_pollution_risk')}")
-            for i, ref in enumerate(meta.get("refs", []), 1):
-                print(f"      REF{i}: {ref['source']} p.{ref['page']} "
-                      f"[{ref['type']}] section={str(ref['section'])[:70]!r}")
+    modes = ctx_modes if ctx_modes is not None else [bool(config_module.KB_CONTEXT_USE)]
+    original = config_module.KB_CONTEXT_USE
+    try:
+        for question in questions:
+            print(f"\n{'=' * 72}\nQ: {question}")
+            for label, kb in bases:
+                for use_ctx in modes:
+                    # 旗標在查詢端是 call-time 讀取，同一份 KB 直接翻旗標即可做 A/B
+                    config_module.KB_CONTEXT_USE = use_ctx
+                    _, _, meta = kb.query(question)
+                    suffix = f" ctx={'on' if use_ctx else 'off'}" if len(modes) > 1 else ""
+                    print(f"  --- {label}{suffix}")
+                    print(f"      gate={meta.get('top_emb_score', 0.0):.3f} "
+                          f"retrieval={meta.get('top_retrieval_score', 0.0):.3f} "
+                          f"refs={meta.get('ref_count')} "
+                          f"risk={meta.get('is_high_risk')} "
+                          f"conf={meta.get('confidence_label')} "
+                          f"ctx_used={meta.get('context_in_use')}")
+                    for i, ref in enumerate(meta.get("refs", []), 1):
+                        print(f"      REF{i}: {ref['source']} p.{ref['page']} "
+                              f"[{ref['type']}] section={str(ref['section'])[:70]!r}")
+    finally:
+        config_module.KB_CONTEXT_USE = original
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -206,6 +219,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="問題檔（一行一題，# 開頭略過）；給了才跑檢索，需要 server")
     parser.add_argument("--show-content", action="store_true",
                         help="印出抽樣 chunk 的前綴（預設只印計數，NDA）")
+    parser.add_argument("--use-context", choices=("off", "on", "both"),
+                        help=("查詢時要不要吃 chunk 的生成脈絡。both = 同一份 KB 兩種旗標"
+                              "各跑一次（單 KB A/B，不需要第二套 KB）"))
     args = parser.parse_args(argv)
 
     for path in filter(None, (args.kb, args.other_kb)):
@@ -234,7 +250,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"問題檔沒有可用問題: {args.questions}")
         paths = [args.kb] + ([args.other_kb] if args.other_kb else [])
         labels = ["A"] + (["B"] if args.other_kb else [])
-        run_questions(paths, labels, questions)
+        ctx_modes = {"off": [False], "on": [True], "both": [False, True]}.get(args.use_context)
+        run_questions(paths, labels, questions, ctx_modes)
 
     return 0
 

@@ -52,8 +52,8 @@ def test_hybrid_search_keeps_bm25_only_results(monkeypatch, tmp_path: Path):
     results = kb._hybrid_search("0x4000", candidate_k=5)
 
     assert results
-    assert results[0][3]["id"] == "target"
-    assert results[0][2] > 0
+    assert results[0].chunk["id"] == "target"
+    assert results[0].retrieval_bm25 > 0
 
 
 def test_exact_literal_bm25_candidate_survives_dense_threshold(monkeypatch, tmp_path: Path):
@@ -63,11 +63,20 @@ def test_exact_literal_bm25_candidate_survives_dense_threshold(monkeypatch, tmp_
         embedding=[0.0, 1.0],
     )
     kb = _loaded_kb(tmp_path, [target])
-    monkeypatch.setattr(kb, "_hybrid_search", lambda *_args, **_kwargs: [(0.02, 0.0, 1.0, target)])
+    monkeypatch.setattr(
+        kb,
+        "_hybrid_search",
+        lambda *_args, **_kwargs: [
+            knowledge.Candidate(
+                chunk_idx=0, chunk=target, rrf_score=0.02,
+                retrieval_bm25=1.0, gate_bm25=1.0,
+            )
+        ],
+    )
     monkeypatch.setattr(
         kb,
         "_rerank_with_model",
-        lambda _q, candidates, _top_k, **_kw: [c[3] for c in candidates],
+        lambda _q, candidates, _top_k, **_kw: [c.chunk for c in candidates],
     )
     monkeypatch.setattr(kb, "_get_embedding", lambda _text: [1.0, 0.0])
     monkeypatch.setattr(knowledge, "USE_MMR", False)
@@ -87,10 +96,10 @@ def test_multi_query_adds_new_candidates_without_overwriting_rrf_scale(monkeypat
     monkeypatch.setattr(kb, "_should_expand_query", lambda *_args, **_kwargs: True)
 
     results = kb._hybrid_search("original", candidate_k=2)
-    ids = [row[3]["id"] for row in results]
+    ids = [row.chunk["id"] for row in results]
 
     assert "rescued" in ids
-    assert max(row[0] for row in results) < 0.2, "RRF score must not be replaced by cosine/linear score"
+    assert max(row.rrf_score for row in results) < 0.2, "RRF score must not be replaced by cosine/linear score"
 
 
 def test_reranker_sees_full_pool_and_late_passage_text(monkeypatch, tmp_path: Path):
@@ -99,7 +108,10 @@ def test_reranker_sees_full_pool_and_late_passage_text(monkeypatch, tmp_path: Pa
     for i in range(30):
         marker = "LATE_NUMERIC_FACT_0xBEEF" if i == 20 else f"item-{i}"
         content = ("prefix " * 160) + marker
-        candidates.append((0.03, 0.4, 0.0, _chunk(str(i), content)))
+        candidates.append(knowledge.Candidate(
+            chunk_idx=i, chunk=_chunk(str(i), content),
+            rrf_score=0.03, retrieval_score=0.4, gate_score=0.4,
+        ))
 
     captured: list[str] = []
     monkeypatch.setattr(kb, "_check_reranker_available", lambda: True)
@@ -120,7 +132,11 @@ def test_reranker_sees_full_pool_and_late_passage_text(monkeypatch, tmp_path: Pa
 def test_strict_rerank_is_not_skipped_when_candidates_fit_output_pool(monkeypatch, tmp_path: Path):
     kb = knowledge.KnowledgeBase(str(tmp_path / "missing.json"))
     candidates = [
-        (0.03, 0.3, 0.0, _chunk(str(i), f"candidate {i} with enough specification context"))
+        knowledge.Candidate(
+            chunk_idx=i,
+            chunk=_chunk(str(i), f"candidate {i} with enough specification context"),
+            rrf_score=0.03, retrieval_score=0.3, gate_score=0.3,
+        )
         for i in range(5)
     ]
     calls = 0
@@ -148,7 +164,7 @@ def test_source_filter_limits_recall_before_top_k(monkeypatch, tmp_path: Path):
 
     results = kb._hybrid_search("reset threshold", candidate_k=1, metadata_filter={"source": "rev_b.md"})
 
-    assert [row[3]["source"] for row in results] == ["rev_b.md"]
+    assert [row.chunk["source"] for row in results] == ["rev_b.md"]
 
 
 def test_bm25_does_not_count_overlap_prefix_twice(tmp_path: Path):

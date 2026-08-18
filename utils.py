@@ -563,6 +563,12 @@ def should_refuse_answer(question: str, kb_metadata: dict) -> bool:
     - spec 問題只看 embedding score（或 rerank score），不看 hybrid
       因為 keyword 很容易把分數灌高，造成假陽性
     - 額外檢查是否命中 type=spec 的 chunk
+
+    `kb_metadata["top_emb_score"]` 依定義是 **gate（content-only）** 分數：
+    KnowledgeBase 保證它不含 LLM 生成的 chunk 脈絡。這一點是拒答閘的正確性
+    前提——讓生成脈絡抬高的分數通過這裡，等於用可能是錯的脈絡替弱原文背書
+    （分數面的循環 grounding）。要改這裡的分數來源，先回去看 knowledge.py 的
+    Candidate.gate_score。
     """
     if not kb_metadata:
         return False

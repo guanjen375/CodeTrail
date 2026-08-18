@@ -8,10 +8,16 @@ import knowledge
 
 
 def _kb_candidates():
+    rows = [(0.30, "a", "alpha"), (0.29, "b", "beta"), (0.28, "c", "gamma")]
     return [
-        (0.30, 0.30, 0.0, {"id": "a", "content": "alpha"}),
-        (0.29, 0.29, 0.0, {"id": "b", "content": "beta"}),
-        (0.28, 0.28, 0.0, {"id": "c", "content": "gamma"}),
+        knowledge.Candidate(
+            chunk_idx=i,
+            chunk={"id": chunk_id, "content": content, "chunk_idx": i},
+            rrf_score=score,
+            retrieval_score=score,
+            gate_score=score,
+        )
+        for i, (score, chunk_id, content) in enumerate(rows)
     ]
 
 
@@ -28,7 +34,7 @@ def test_knowledge_rerank_policy_embedding_does_not_call_main_model(monkeypatch,
 
     out = kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True)
 
-    assert out == [candidates[0][3], candidates[1][3]]
+    assert out == [candidates[0].chunk, candidates[1].chunk]
 
 
 def test_knowledge_rerank_policy_main_model_calls_llm(monkeypatch, tmp_path):
@@ -74,7 +80,7 @@ def test_knowledge_rerank_policy_embedding_handles_rerank_exception(monkeypatch,
 
     out = kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True)
 
-    assert out == [candidates[0][3], candidates[1][3]]
+    assert out == [candidates[0].chunk, candidates[1].chunk]
 
 
 def _code_candidates():
