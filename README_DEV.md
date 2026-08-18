@@ -395,6 +395,38 @@ schema 版本)寫進 `.code_rag_cache_meta.json`。
   `test_backfill_failure_leaves_no_partial_index`。
 - scope 熱重載是另案;改了設定要重啟 MCP server。
 
+### scripts/kb_ab_compare.py
+
+知識庫體檢與 A-B 對照。單一 KB 時做離線體檢（NPZ schema 是否現行版本、多少 chunk 帶
+`[HEADING]` 前綴 / char span、多少 chunk 的 section 是空的、哪些章節標題重複到連
+heading hierarchy 都分不開）；給兩份 KB 再加結構差異（**content 位元組有沒有變** →
+決定既有向量還能不能用、section 差在哪幾筆）；加 `--questions` 才會跑檢索，需要
+8081 / 8082。
+
+```bash
+python scripts/kb_ab_compare.py ~/proj/knowledge.json                       # 體檢
+python scripts/kb_ab_compare.py old/knowledge.json new/knowledge.json       # 重建前後對照
+python scripts/kb_ab_compare.py old/knowledge.json new/knowledge.json \
+    --questions ~/questions.txt                                             # 加跑真題
+```
+
+**兩份 KB 一定要放不同目錄**：`knowledge_emb.npz` 是固定檔名，同目錄兩份 JSON 會互相
+覆蓋向量檔；工具會直接擋下同目錄的組合，不會靜默比錯。預設只印 metadata 與計數，
+不印 chunk 內容（NDA）；要看抽樣前綴得自己加 `--show-content`。問題檔與真實文件都
+不進 repo。
+
+重建一份對照 KB 就是把來源文件逐一灌進獨立目錄：
+
+```bash
+mkdir -p /tmp/kb-baseline && cd /tmp/kb-baseline
+for f in <doc1> <doc2>; do python /path/to/CodeTrail/RAG.py "$f" ./knowledge.json; done
+```
+
+（embedding 快取是 CWD 下的 `.rag_embedding_cache.json`；把舊的複製進來可大幅減少
+重算，內容沒變的 chunk 會直接命中。）
+
+---
+
 ### scripts/index_stats.py
 
 完全唯讀、完全離線的計數工具。**預設輸出只有計數,不含任何路徑** —— 這種輸出會被貼進

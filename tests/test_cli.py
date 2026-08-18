@@ -373,6 +373,46 @@ def test_index_stats_help_exits_zero():
     assert "--show-paths" in proc.stdout
 
 
+def test_kb_ab_compare_help_exits_zero():
+    """`python scripts/kb_ab_compare.py --help` 必須 cheap return 0(離線、不載模型)。"""
+    proc = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "kb_ab_compare.py"), "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--questions" in proc.stdout
+    assert "Traceback" not in proc.stderr
+
+
+def test_kb_ab_compare_rejects_two_kbs_in_one_directory(tmp_path: Path):
+    """同目錄兩份 KB 會互相覆蓋 knowledge_emb.npz，必須擋下（不是靜默比錯）。"""
+    first = tmp_path / "a.json"
+    second = tmp_path / "b.json"
+    for path in (first, second):
+        path.write_text(json.dumps({"metadata": {}, "chunks": []}), encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "kb_ab_compare.py"),
+            str(first),
+            str(second),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "同一個目錄" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
 def test_run_eval_help_exits_zero():
     """`python eval/run_eval.py --help` 必須能 cheap return 0,不需要 llama-server。"""
     r = subprocess.run(
