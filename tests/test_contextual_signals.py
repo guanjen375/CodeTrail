@@ -665,3 +665,30 @@ def test_ctx_cannot_move_the_threshold_through_candidate_order(tmp_path: Path, m
     # 旗標關掉時必須原樣（RRF 順序），不得偷偷改變既有行為
     monkeypatch.setattr(config, "KB_CONTEXT_USE", False)
     assert kb._decision_order(low_gate_first) is low_gate_first
+
+
+def test_is_high_risk_is_computed_from_gate_scores(tmp_path: Path, monkeypatch):
+    """UI 的風險警告是 margin 決策：兩個候選的 gate 分數貼很近就要示警，
+
+    即使含生成脈絡的檢索分數把它們拉得很開。
+    """
+    monkeypatch.setattr(config, "KB_CONTEXT_USE", True)
+    monkeypatch.setattr(knowledge, "MARGIN_ENABLED", True)
+    chunks = [
+        _chunk("a", "原文一夠長可以通過噪音過濾。" * 4, ctx=CTX_TEXT,
+               embedding=[1.0, 0.0], gate=[0.70, 0.71414284]),
+        _chunk("b", "原文二夠長可以通過噪音過濾。" * 4, ctx=CTX_TEXT,
+               embedding=[0.0, 1.0], gate=[0.70, 0.71414284]),
+    ]
+    path = _write_kb(tmp_path, chunks, with_gate=True)
+    kb = KnowledgeBase(str(path))
+    _go_offline(kb, monkeypatch)
+    monkeypatch.setattr(
+        kb, "_rerank_with_model", lambda _q, candidates, _k, **_kw: [c.chunk for c in candidates]
+    )
+
+    _model, _display, meta = kb.query("CTRL 重置值是什麼")
+
+    # 兩個 chunk 的 gate 向量完全相同 → gate margin = 0 → 必須示警，
+    # 而它們的 retrieval 向量是正交的（差距最大）。
+    assert meta["is_high_risk"] is True
