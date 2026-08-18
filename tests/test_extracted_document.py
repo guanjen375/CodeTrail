@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import extracted_document
 import RAG
 from extracted_document import (
     ExtractedDocument,
@@ -347,3 +348,93 @@ def test_raw_text_is_the_text_the_splitter_actually_saw(tmp_path):
 
     assert document.raw_text == normalize_document_text(text)
     assert "Field: Value" in document.raw_text
+
+
+# ============================================================
+# 標題偵測（G2）：條列項不是標題
+# ============================================================
+@pytest.mark.parametrize(
+    "line",
+    [
+        "2. Power on the HAPS system.",
+        "1. L2 CPU selftest: DM, CSM, XM",
+        "3. STU copy test: XM => VCCM, CSM => VCCM",
+        "1. For the fastest response, enter a case through SolvNetPlus: https://example.invalid",
+        "2. Insert the adapter into the J22 socket on the GPIO card.",
+        "1. Go to https://example.invalid.",
+        "2. Set the environment variables for enabling the bus with the debugger:",
+    ],
+)
+def test_numbered_list_items_are_not_headings(line):
+    """實測三份真實 spec：舊規則命中 73 次，沒有一次是真標題，全是這種條列項。
+
+    它們變成 section 之後會污染 [SECTION_METADATA] 與 [HEADING]，還多切一堆
+    chunk 邊界。
+    """
+    assert extracted_document.is_heading(line) is False
+    assert extracted_document.extract_section_title(line) == ""
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "2.3 Methods",
+        "1.1.4 Results",
+        "5.8 MEM access path",
+        "1. Introduction",          # 純文字文件的單層章節：夠短、無冒號、無句尾標點
+        "3. Configuration",
+    ],
+)
+def test_real_numbered_headings_still_detected(line):
+    """規則不能刪：沒有 markdown 結構的純文字文件要靠它。"""
+    assert extracted_document.is_heading(line) is True
+    assert extracted_document.extract_section_title(line) == line
+
+
+@pytest.mark.parametrize(
+    "line,expected",
+    [
+        ("SYSTEM CONTROL REGISTER", True),
+        ("MEMORY MAP", True),
+        ("PASS", False),                              # 單一個詞是結論，不是標題
+        ("PASS 畫面截圖如下：", False),                 # CJK 沒有大小寫，不該算 ALL CAPS
+        ("以下針對 NPX/VPX 測試項目逐一說明：", False),
+        ("OK", False),                                # 太短
+    ],
+)
+def test_allcaps_rule_is_not_fooled_by_mixed_scripts(line, expected):
+    """`str.isupper()` 對中英混排太寬：拉丁部分大寫就整行算 ALL CAPS。"""
+    assert extracted_document.is_heading(line) is expected
+
+
+def test_heading_detection_and_title_extraction_never_disagree():
+    """is_heading 為真卻抽不出標題名 = 靜默的空 section。兩者共用同一組 helper。"""
+    lines = [
+        "# Chapter 1", "## 1.2 Core control", "#### 流程：",
+        "SYSTEM CONTROL REGISTER", "PASS", "2.3 Methods", "1. Introduction",
+        "2. Power on the HAPS system.", "1. L2 CPU selftest: DM, CSM, XM",
+        "plain body text", "", "   ",
+    ]
+    for line in lines:
+        detected = extracted_document.is_heading(line)
+        title = extracted_document.extract_section_title(line)
+        assert detected == bool(title), f"{line!r}: is_heading={detected} title={title!r}"
+
+
+def test_list_items_no_longer_fragment_a_section(tmp_path):
+    """條列項不再切斷章節：整個步驟清單留在它所屬的節裡。"""
+    text = "\n".join([
+        "## 5.2 Running a Test Application",
+        _filler("intro", 60),
+        "",
+        "1. Set up the environment by launching the setup script.",
+        "2. Compile the example or model.",
+        "3. Invoke the build system command to run the test application.",
+        "",
+        _filler("tail", 60),
+    ])
+    document = _chunked_doc(tmp_path, text)
+
+    titles = [s.title for s in document.sections if s.title]
+    assert titles == ["5.2 Running a Test Application"]
+    assert all(c["section"] == "5.2 Running a Test Application" for c in document.chunks)

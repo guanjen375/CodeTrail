@@ -400,6 +400,32 @@ schema 版本)寫進 `.code_rag_cache_meta.json`。
   `test_backfill_failure_leaves_no_partial_index`。
 - scope 熱重載是另案;改了設定要重啟 MCP server。
 
+### 標題偵測為什麼收緊過
+
+`is_heading` 原本有三條規則。實測三份真實 spec:
+
+| 規則 | 命中 | 真標題 |
+|---|---|---|
+| markdown `#{1,6}` | 144 | 大部分（`流程：` 這種是來源文件自己的 `####`，不是誤判） |
+| 數字章節 `^\d+\.[\d\.]*\s+[A-Z]` | 73 | **0** |
+| 全大寫 `line.isupper()` | 3 | **0** |
+
+數字那條全部命中的是「2. Power on the HAPS system.」「1. L2 CPU selftest: DM, CSM, XM」
+這種編號條列項——真的章節標題在這些文件裡全部走 markdown。全大寫那條被中英混排騙了:
+CJK 沒有大小寫,所以「PASS 畫面截圖如下：」的拉丁部分是大寫就整行算 ALL CAPS。
+
+規則不能刪(沒有 markdown 結構的純文字文件要靠它們),所以改成:
+- 數字:多層編號(`2.3` / `1.1.4`)照舊放行;單層編號要夠短(≤40)、句中無冒號、
+  句尾無標點,才算標題。
+- 全大寫:不含 CJK、至少兩個詞、至少兩個字母。
+
+效果(同一批文件):雜訊 section 58 → 9,而且**找回 33 個真章節**(`1.1.4. 測試結果`
+這種原本被前面的條列項擠掉的),chunk 237 → 180。
+
+**改這條規則會改變切點與 content,既有 KB 必須重灌。**
+
+---
+
 ### Reranker 與 MMR 的分工
 
 `USE_MMR` 預設開著。以前的順序是「rerank 排好 → MMR 用 `cosine(query, chunk)` 重算

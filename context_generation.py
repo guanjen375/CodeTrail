@@ -31,6 +31,7 @@ import ipaddress
 import json
 import os
 import re
+import stat
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -432,7 +433,24 @@ class SingleWriterLock:
 
     def acquire(self) -> None:
         _ensure_private_dir(self.path.parent)
-        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        # O_NOFOLLOW：鎖檔若是 symlink,open 會失敗而不是跟過去。沒有這一道的話,
+        # 把 .writer.lock 指向任何可寫檔案,取得鎖之後的 ftruncate + 寫 PID JSON
+        # 就會把那個檔案內容洗掉。
+        flags = os.O_CREAT | os.O_RDWR
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self.path, flags, 0o600)
+        except OSError as exc:
+            raise ContextLockError(
+                f"鎖檔 {self.path} 打不開(可能是 symlink 或型別不對): {exc}。"
+                "確認那個路徑是普通檔案再重跑。"
+            ) from exc
+        # 第二道:確認拿到的真的是普通檔案(FIFO / device 之類同樣不能寫)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise ContextLockError(
+                f"鎖檔 {self.path} 不是普通檔案,拒絕使用。"
+            )
         if os.name == "nt" and os.fstat(fd).st_size == 0:
             # msvcrt.locking 需要那個 byte 真的存在
             os.write(fd, b"\0")

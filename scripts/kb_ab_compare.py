@@ -97,7 +97,9 @@ def loader_verdict(json_path: Path) -> tuple[bool, str]:
         from knowledge import KnowledgeBase
         from knowledge_store import KnowledgeStoreError
     except ImportError as exc:  # pragma: no cover - 依賴缺失
-        return True, f"(無法載入 knowledge 模組，略過: {exc})"
+        # 判準跑不起來時不能宣告健康。「略過」等於 fail-open：使用者會拿到一份
+        # 看起來沒問題、實際上根本沒驗過的報告。
+        return False, f"無法載入 knowledge 模組，這份 KB 沒有被驗證: {exc}"
 
     try:
         kb = KnowledgeBase(json_path=str(json_path))
@@ -150,6 +152,8 @@ def audit(label: str, json_path: Path, show_content: bool) -> dict:
     if ctx_count:
         print(f"  帶 ctx 的 chunk  : {ctx_count}/{len(chunks)}")
 
+    _print_prefix_classification(chunks)
+
     # 收不收由正式 loader 說了算，不是由這支工具自己重打一套檢查。
     accepted, reason = loader_verdict(json_path)
     if accepted:
@@ -180,6 +184,53 @@ def audit(label: str, json_path: Path, show_content: bool) -> dict:
         print(f"  抽樣 chunk 前綴   : {sample.get('content', '')[:prefix]!r}")
 
     return {"chunks": chunks, "metadata": metadata, "npz": npz, "fatal": not accepted}
+
+
+def _print_prefix_classification(chunks: list) -> None:
+    """把「章節標記」的狀態分類清楚，而不是只報一個總數。
+
+    `[HEADING]`/`[SECTION]` 前綴是**烘進 content** 的檢索訊號；`section` 是**另存
+    的 metadata**，embedding 輸入與 BM25 都會用到。兩者可以合法地不同步：整份文字
+    塞得進一個 chunk 時 splitter 走 early-return，不注入前綴，但文件級走訪之後
+    仍會補上 section metadata。那種 chunk 不是「沒有章節訊號」，只是少了父章節
+    階層那一段。分開數才知道要不要為它改 content（改 content = 整庫重灌）。
+    """
+    if not chunks:
+        return
+    with_prefix = 0
+    section_only = 0
+    no_section = 0
+    inconsistent = []
+    for index, chunk in enumerate(chunks):
+        section = str(chunk.get("section", "") or "")
+        content = str(chunk.get("content", ""))
+        try:
+            heading_chars = int(chunk.get("heading_prefix_chars", 0) or 0)
+        except (TypeError, ValueError):
+            heading_chars = 0
+
+        if heading_chars:
+            with_prefix += 1
+            # 前綴的順序是 heading 在最外層、overlap 在它之後（splitter 先加
+            # overlap、再把 heading 加到最前面），所以 heading 前綴永遠從 0 起算。
+            prefix = content[:heading_chars]
+            if section and f"[SECTION] {section}" not in prefix:
+                inconsistent.append((index, section, prefix.splitlines()[:2]))
+        elif section:
+            section_only += 1
+        else:
+            no_section += 1
+
+    total = len(chunks)
+    print("  章節標記分類     :")
+    print(f"      content 有 [HEADING] 前綴      : {with_prefix}/{total}")
+    print(f"      只有 section metadata、無前綴  : {section_only}/{total}"
+          f"{'  ← 少的是父章節階層，不是章節本身' if section_only else ''}")
+    print(f"      完全沒有章節                   : {no_section}/{total}")
+    if inconsistent:
+        print(f"      [WARN] metadata 與 content 前綴不一致: {len(inconsistent)}")
+        for index, section, prefix in inconsistent[:5]:
+            print(f"          #{index} section={section[:40]!r} prefix={prefix}")
 
 
 def structural_diff(a: dict, b: dict) -> None:

@@ -653,3 +653,32 @@ def test_empty_summary_is_retried_and_not_cached(tmp_path: Path, monkeypatch, mo
     ]
     assert not empty_summaries, "空摘要被寫進快取了（會毒化之後每一次 rebuild）"
     assert state["chat_calls"] >= 2, "空摘要至少要重試一次"
+
+
+def test_lock_refuses_a_symlinked_lock_file(tmp_path: Path):
+    """鎖檔是 symlink 時不得跟過去。
+
+    沒有 O_NOFOLLOW 的話，把 .writer.lock 指向任何可寫檔案，取得鎖之後的
+    ftruncate + 寫 PID JSON 就會把那個檔案洗掉。
+    """
+    root = tmp_path / "cache"
+    root.mkdir()
+    victim = tmp_path / "victim.txt"
+    original = "不該被動到的內容\n第二行"
+    victim.write_text(original, encoding="utf-8")
+    (root / ".writer.lock").symlink_to(victim)
+
+    with pytest.raises(cg.ContextLockError):
+        cg.SingleWriterLock(root).acquire()
+
+    assert victim.read_text(encoding="utf-8") == original, "symlink 目標被改寫了"
+
+
+def test_lock_refuses_a_non_regular_lock_file(tmp_path: Path):
+    """FIFO / device 之類同樣不能當鎖檔。"""
+    root = tmp_path / "cache"
+    root.mkdir()
+    os.mkfifo(root / ".writer.lock")
+
+    with pytest.raises(cg.ContextLockError):
+        cg.SingleWriterLock(root).acquire()

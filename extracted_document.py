@@ -42,23 +42,79 @@ HEADING_PATTERN = re.compile(r'^(#{1,6})\s+(.+)$', re.MULTILINE)
 # ============================================================
 # 標題 / 章節原語
 # ============================================================
+# 句尾標點：標題不會這樣結束，條列項與句子會。
+_SENTENCE_TAIL = ("。", ".", "：", ":", "；", ";", "!", "?", "！", "？", ",", "，")
+_MARKDOWN_HEADING = re.compile(r'^#{1,6}\s+')
+_NUMBERED_HEADING = re.compile(r'^\d+\.[\d\.]*\s+[A-Z]')
+
+
+def _has_cjk(text: str) -> bool:
+    return any('\u4e00' <= ch <= '\u9fff' for ch in text)
+
+
+def _looks_like_allcaps_heading(line: str) -> bool:
+    """全大寫章節標題（常見於 PDF）。
+
+    `str.isupper()` 對中英混排太寬:CJK 沒有大小寫,所以只要拉丁字母部分是大寫,
+    整行就算 ALL CAPS。實測(三份真實 spec)這條規則命中 3 個標題,全是誤判——
+    「PASS 畫面截圖如下：」「以下針對 NPX/VPX 測試項目逐一說明：」都中招。單獨
+    一個詞（PASS）也不是標題,是測試結論。
+    """
+    if not (3 < len(line) < 100):
+        return False
+    if _has_cjk(line):
+        return False
+    if not line.isupper():
+        return False
+    if sum(1 for ch in line if ch.isalpha()) < 2:
+        return False
+    return len(line.split()) >= 2
+
+
+def _looks_like_numbered_heading(line: str) -> bool:
+    r"""數字章節標題 vs 編號條列項。
+
+    實測(三份真實 spec):舊規則 `^\d+\.[\d\.]*\s+[A-Z]` 命中 73 次,**沒有一次**
+    是真正的章節標題——真標題全部走 markdown 那條(`##` / `###`),這 73 個全是
+    「2. Power on the HAPS system.」「1. L2 CPU selftest: DM, CSM, XM」這種條列項。
+    它們變成 section 之後會污染 `[SECTION_METADATA]` 與 `[HEADING]` 兩個檢索訊號,
+    而且會多切出一堆 chunk 邊界。
+
+    規則本身不能刪:沒有 markdown 結構的純文字文件(「1. Introduction」)要靠它。
+    所以改成兩段——多層編號(2.3 / 1.1.4)照舊放行;單層編號要「看起來像標題」:
+    夠短、句中沒有冒號、句尾沒有標點。
+    """
+    if re.match(r'^\d+\.\d', line):
+        return True
+    if len(line) > 40:
+        return False
+    if line.endswith(_SENTENCE_TAIL):
+        return False
+    _, _, remainder = line.partition(".")
+    return ":" not in remainder and "：" not in remainder
+
+
 def is_heading(line: str) -> bool:
     """判斷是否為標題行"""
     line = line.strip()
     # Markdown 標題
-    if re.match(r'^#{1,6}\s+', line):
+    if _MARKDOWN_HEADING.match(line):
         return True
     # 全大寫行（常見於 PDF 章節標題）
-    if line.isupper() and len(line) > 3 and len(line) < 100:
+    if _looks_like_allcaps_heading(line):
         return True
     # 數字開頭的章節（如 "1. Introduction", "2.3 Methods"）
-    if re.match(r'^\d+\.[\d\.]*\s+[A-Z]', line):
+    if _NUMBERED_HEADING.match(line) and _looks_like_numbered_heading(line):
         return True
     return False
 
 
 def extract_section_title(line: str) -> str:
-    """從標題行提取章節名稱"""
+    """從標題行提取章節名稱
+
+    判定條件與 `is_heading` 共用同一組 helper——兩邊各寫一套就會漂移，而漂移的
+    症狀是「這行被當成標題、卻抽不出標題名」這種靜默的空 section。
+    """
     line = line.strip()
     # Markdown 標題
     md_match = re.match(r'^#{1,6}\s+(.+)$', line)
@@ -66,10 +122,10 @@ def extract_section_title(line: str) -> str:
         return md_match.group(1).strip()
     # 數字章節
     num_match = re.match(r'^(\d+\.[\d\.]*\s+.+)$', line)
-    if num_match:
+    if num_match and _looks_like_numbered_heading(line):
         return num_match.group(1).strip()
     # 全大寫標題
-    if line.isupper() and len(line) > 3 and len(line) < 100:
+    if _looks_like_allcaps_heading(line):
         return line
     return ""
 

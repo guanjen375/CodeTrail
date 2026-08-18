@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import builtins
 import json
 import subprocess
 import sys
@@ -864,3 +865,30 @@ def test_diff_does_not_claim_vectors_are_reusable_when_section_changed(tmp_path:
     assert "content 位元組差異: 0" in proc.stdout
     assert "既有向量仍可用" not in proc.stdout, "section 變了卻說向量還能用"
     assert "embedding 要重算" in proc.stdout
+
+
+def test_audit_is_fatal_when_the_loader_cannot_be_imported(monkeypatch, tmp_path: Path):
+    """判準跑不起來時不能宣告健康——那等於給一份沒驗過卻看起來沒問題的報告。"""
+    import importlib.util
+    import sys as _sys
+
+    spec = importlib.util.spec_from_file_location(
+        "kb_ab_compare", REPO_ROOT / "scripts" / "kb_ab_compare.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    real_import = builtins.__import__
+
+    def broken_import(name, *args, **kwargs):
+        if name == "knowledge":
+            raise ImportError("simulated missing dependency")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", broken_import)
+    monkeypatch.delitem(_sys.modules, "knowledge", raising=False)
+
+    accepted, reason = module.loader_verdict(tmp_path / "knowledge.json")
+
+    assert accepted is False
+    assert "沒有被驗證" in reason

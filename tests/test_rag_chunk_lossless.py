@@ -44,10 +44,15 @@ def test_every_original_line_survives_chunking():
 
 
 def test_overlap_does_not_truncate_current_chunk_tail():
-    """當 overlap+正文超過 max_chars 時，正文尾端不能被截掉。"""
-    # 兩段，每段剛好 = max_chars，overlap 會讓第二段超過 max_chars
+    """當 overlap+正文超過 max_chars 時，正文尾端不能被截掉。
+
+    兩段都要**在** max_chars 之內，超出是 overlap 造成的——這才是要測的那條路。
+    （舊 fixture 的 seg2 本身就超過 max_chars，會先被「單行超長 → 按句切」硬切；
+    它之所以沒被切，是因為當時 `"A"*40` 這種整行大寫被誤判成標題而跳過長度檢查。
+    標題偵測收緊之後那個巧合消失，fixture 才露出來。）
+    """
     seg1 = "A" * 40
-    seg2 = "B" * 40 + "TAIL_MUST_SURVIVE"
+    seg2 = "B" * 23 + "TAIL_MUST_SURVIVE"   # 40 字元，未超過 max_chars
     text = seg1 + "\n" + seg2
     chunks = split_by_semantic_with_sections(
         text, max_chars=45, overlap_chars=10, include_heading=False
