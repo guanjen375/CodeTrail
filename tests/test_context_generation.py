@@ -292,15 +292,33 @@ def test_second_writer_fails_loudly(tmp_path: Path):
     cg.SingleWriterLock(root).acquire()  # 釋放後可以取得
 
 
-def test_stale_lock_from_a_dead_process_is_taken_over(tmp_path: Path):
+def test_lock_left_behind_by_a_dead_process_is_reusable(tmp_path: Path):
+    """行程死掉之後 kernel 就把 flock 釋放了，殘留的鎖檔不該卡住任何人。"""
     root = tmp_path / "cache"
     root.mkdir(parents=True)
     lock_path = root / ".writer.lock"
     lock_path.write_text(json.dumps({"pid": 2 ** 22, "started_at": 0}), encoding="utf-8")
 
-    cg.SingleWriterLock(root).acquire()  # 持有者已死 → 接手，不得卡住
+    lock = cg.SingleWriterLock(root)
+    lock.acquire()
 
     assert json.loads(lock_path.read_text(encoding="utf-8"))["pid"] == os.getpid()
+    lock.release()
+
+
+def test_empty_or_garbage_lock_file_does_not_confuse_acquire(tmp_path: Path):
+    """鎖檔內容壞掉／空的只影響診斷訊息，不影響互斥。"""
+    root = tmp_path / "cache"
+    root.mkdir(parents=True)
+    (root / ".writer.lock").write_text("", encoding="utf-8")
+
+    first = cg.SingleWriterLock(root)
+    first.acquire()
+    try:
+        with pytest.raises(cg.ContextLockError):
+            cg.SingleWriterLock(root).acquire()
+    finally:
+        first.release()
 
 
 # ============================================================
@@ -512,39 +530,51 @@ def test_sanitize_falls_back_to_hard_cut_without_a_boundary():
 # ============================================================
 # GPT review 回歸（2026-08-18）
 # ============================================================
-def test_live_writer_is_not_stolen_after_an_hour(tmp_path: Path, monkeypatch):
-    """跑超過一小時的活 writer 不得被誤判成 stale。
+def test_live_writer_is_never_stolen_no_matter_how_long_it_runs(tmp_path: Path):
+    """活著的 writer 不得被奪鎖——不管它跑多久、多久沒有動靜。
 
-    大型 rebuild 本來就可能超過一小時（237 chunk ≈ 80 分鐘）。存活判定要看心跳，
-    不是看總時長。
+    rebuild 本來就會有長停頓（單次大窗呼叫、機器負載、SIGSTOP），停頓不等於死亡。
+    這裡刻意**不**做任何續期，只把鎖檔的 mtime 推到兩小時前：互斥由 flock 認定，
+    跟時間無關。
     """
     root = tmp_path / "cache"
     holder = cg.SingleWriterLock(root)
     holder.acquire()
-    # 假裝這把鎖是兩小時前建立的，但持有者（本行程）還活著且剛續過期
     two_hours_ago = time.time() - 7200
     os.utime(holder.path, (two_hours_ago, two_hours_ago))
-    holder.heartbeat()   # 活著 → 心跳把 mtime 拉回現在
 
-    with pytest.raises(cg.ContextLockError, match="心跳"):
-        cg.SingleWriterLock(root).acquire()
+    try:
+        with pytest.raises(cg.ContextLockError):
+            cg.SingleWriterLock(root).acquire()
+        assert holder.held
+    finally:
+        holder.release()
 
 
-def test_a_taken_over_lock_is_not_deleted_by_the_old_holder(tmp_path: Path):
-    """被接管過的鎖，原持有者收工時不得刪掉它。"""
+def test_release_does_not_unlink_the_lock_file(tmp_path: Path):
+    """釋放不刪檔：刪掉會讓正在 open 但還沒 flock 的人抓到孤兒 inode。"""
     root = tmp_path / "cache"
     first = cg.SingleWriterLock(root)
     first.acquire()
-    # 模擬「原持有者被判定為 stale 而被接手」
-    first.path.unlink()
+    first.release()
+
+    assert first.path.exists()
     second = cg.SingleWriterLock(root)
-    second.acquire()
-
-    first.release()   # 舊持有者收工
-
-    assert second.path.exists(), "現任 writer 的鎖被上一任刪掉了"
+    second.acquire()   # 釋放之後別人拿得到
     second.release()
-    assert not second.path.exists()
+
+
+def test_two_locks_are_never_held_at_the_same_time(tmp_path: Path):
+    root = tmp_path / "cache"
+    first = cg.SingleWriterLock(root)
+    second = cg.SingleWriterLock(root)
+    first.acquire()
+    try:
+        with pytest.raises(cg.ContextLockError):
+            second.acquire()
+        assert first.held and not second.held
+    finally:
+        first.release()
 
 
 def test_dead_holder_is_still_taken_over(tmp_path: Path):

@@ -33,7 +33,6 @@ import os
 import re
 import time
 import unicodedata
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -374,91 +373,106 @@ class ContextCache:
 
 
 class SingleWriterLock:
-    """per-KB 的 single-writer 鎖：搶不到就明確報錯，不排隊。
+    """per-KB 的 single-writer 鎖：non-blocking flock，鎖的存活由 kernel 認定。
 
-    存活判定靠**心跳**，不靠總時長。只看「pid 活著且鎖建立不到一小時」是錯的：
-    大型 rebuild 本來就可能跑超過一小時（實測 237 chunk ≈ 80 分鐘），到點之後
-    活著的 writer 會被後來者奪走鎖，而原 writer 收工時還會把後來者的鎖刪掉。
-    改成持有者每處理完一個 chunk 就續期；「活著但心跳停了很久」才算 stale
-    （那代表 pid 被回收給不相干的行程用了）。逾時因此可以取短，真正的死鎖也
-    清得更快。
+    以前是自己算 staleness（pid 活著 + mtime 心跳）。那條路擋不住三件事：
+      1. 活著但停頓超過逾時的 writer 會被奪鎖——而 rebuild 本來就會有長停頓
+         （單次大窗 LLM 呼叫、機器負載、SIGSTOP），停頓不等於死亡。
+      2. 鎖檔剛建立、內容還沒寫完的那一瞬間，第二個 writer 會把它當成 stale 刪掉。
+      3. 續期不驗身分，舊 writer 會去更新別人的鎖檔。
+    這些全部是「自己重新發明 kernel 已經做對的事」的後果。flock 沒有這些問題：
+    行程死了 kernel 直接釋放，不需要任何啟發式，也不需要心跳。
 
-    釋放時比對 token：鎖若已被接管，這個檔就不屬於自己，不能刪。
+    釋放時**不刪檔**：刪掉會讓正在 open 但還沒 flock 的人抓到孤兒 inode，
+    兩個 writer 各自鎖在不同 inode 上。
     """
-
-    STALE_SECONDS = 900
 
     def __init__(self, root: Path):
         self.path = Path(root) / ".writer.lock"
-        self._held = False
-        self._token = ""
-
-    def _read(self) -> Optional[Dict]:
-        try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
+        self._fd: Optional[int] = None
 
     @staticmethod
-    def _alive(pid: int) -> bool:
-        if pid <= 0:
-            return False
+    def _try_lock(fd: int) -> None:
+        """取得排他鎖；拿不到就丟 OSError（絕不等待）。"""
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @staticmethod
+    def _unlock(fd: int) -> None:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+    def _holder_note(self) -> str:
+        """讀鎖檔裡的診斷資訊（純參考，互斥不靠它）。"""
         try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        return True
+            holder = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return ""
+        pid = holder.get("pid")
+        started = holder.get("started_at")
+        if not pid:
+            return ""
+        if isinstance(started, (int, float)):
+            return f"（pid {pid}，已跑 {int(time.time() - started)} 秒）"
+        return f"（pid {pid}）"
 
     def acquire(self) -> None:
         _ensure_private_dir(self.path.parent)
-        if self.path.exists():
-            holder = self._read() or {}
-            pid = int(holder.get("pid") or 0)
-            try:
-                silence = time.time() - self.path.stat().st_mtime
-            except OSError:
-                silence = 0.0
-            if self._alive(pid) and silence < self.STALE_SECONDS:
-                raise ContextLockError(
-                    f"另一個 rebuild 正在寫這個 KB 的 chunk 脈絡（pid {pid}，"
-                    f"{int(silence)} 秒前還有心跳）。等它結束，或確認那個行程真的"
-                    f"死了之後刪掉 {self.path}。"
-                )
-            # stale：持有者已死，或活著但心跳停了很久（pid 被回收）。接手。
-            self.path.unlink(missing_ok=True)
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        if os.name == "nt" and os.fstat(fd).st_size == 0:
+            # msvcrt.locking 需要那個 byte 真的存在
+            os.write(fd, b"\0")
         try:
-            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError as exc:
-            raise ContextLockError(f"context lock race on {self.path}") from exc
-        token = uuid.uuid4().hex
-        with open(fd, "w", encoding="utf-8") as handle:
-            json.dump({"pid": os.getpid(), "started_at": time.time(), "token": token}, handle)
-        self._held = True
-        self._token = token
+            self._try_lock(fd)
+        except OSError as exc:
+            note = self._holder_note()
+            os.close(fd)
+            raise ContextLockError(
+                f"另一個 rebuild 正在寫這個 KB 的 chunk 脈絡{note}。"
+                f"等它結束再重跑；鎖檔是 {self.path}，由 kernel 管理，"
+                "行程結束就會自動釋放（不要手動刪）。"
+            ) from exc
 
-    def heartbeat(self) -> None:
-        """續期。持有者每做完一個單位工作就叫一次，證明自己還活著。"""
-        if not self._held:
-            return
-        try:
-            os.utime(self.path, None)
-        except OSError:
-            pass
+        # 診斷資訊在鎖拿到之後才寫，所以永遠不會有「半寫的鎖檔」被誤判。
+        if os.name != "nt":
+            try:
+                os.ftruncate(fd, 0)
+                os.write(
+                    fd,
+                    json.dumps({"pid": os.getpid(), "started_at": time.time()}).encode("utf-8"),
+                )
+            except OSError:
+                pass
+        self._fd = fd
 
     def release(self) -> None:
-        if not self._held:
+        if self._fd is None:
             return
-        # 只刪自己的鎖：被接管過的話這個檔已經屬於別人，刪掉等於毀掉現任 writer
-        # 的互斥保護。
-        holder = self._read() or {}
-        if holder.get("token") == self._token:
-            self.path.unlink(missing_ok=True)
-        self._held = False
-        self._token = ""
+        try:
+            self._unlock(self._fd)
+        except OSError:
+            pass
+        finally:
+            os.close(self._fd)
+            self._fd = None
+
+    @property
+    def held(self) -> bool:
+        return self._fd is not None
 
     def __enter__(self):
         self.acquire()
@@ -692,8 +706,7 @@ class ContextGenerator:
         self.n_ctx = int(resolved_ctx)
         self.cache = ContextCache(cache_root_for(kb_path, cache_dir))
         self.report = GenerationReport()
-        # 每做完一個單位工作就替鎖續期：rebuild 動輒跑一小時以上，沒有心跳的話
-        # 活著的 writer 會被誤判成 stale 而被奪走鎖。
+        # 鎖只是傳進來讓生命週期看得出來；互斥由 flock 保證，不需要心跳。
         self._lock = lock
         self.max_ctx_tokens = int(getattr(config, "KB_CONTEXT_TARGET_TOKENS", 100))
         # 請求端的上限要蓋住 reasoning，回應端才有東西可截。
@@ -701,10 +714,6 @@ class ContextGenerator:
             getattr(config, "KB_CONTEXT_REASONING_TOKENS", 512)
         )
         self.timeout = int(getattr(config, "KB_CONTEXT_TIMEOUT", 180))
-
-    def _beat(self) -> None:
-        if self._lock is not None:
-            self._lock.heartbeat()
 
     # -------------------------------------------------- LLM
     def _params(self) -> Dict:
@@ -792,7 +801,6 @@ class ContextGenerator:
         if summary:
             # write-through：每一層摘要成功就落盤，中斷重跑只補缺。
             self.cache.put(fingerprint, summary, {"kind": "summary"})
-        self._beat()
         return summary
 
     def document_summary(self, document: ExtractedDocument, budget_tokens: int) -> str:
@@ -905,7 +913,6 @@ class ContextGenerator:
             ctx, absent_reason = self._generate_one(messages)
             self.cache.put(fingerprint, ctx, {"absent_reason": absent_reason})
             self._apply(chunk, ctx, fingerprint, absent_reason=absent_reason)
-            self._beat()
 
         self.report.elapsed_seconds = time.time() - started
         self._enforce_coverage()

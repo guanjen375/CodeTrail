@@ -86,6 +86,30 @@ def _load_npz_meta(json_path: Path) -> dict:
         return {"error": f"NPZ 載入失敗: {exc}"}
 
 
+def loader_verdict(json_path: Path) -> tuple[bool, str]:
+    """用**正式的** loader 判斷這份 KB 查詢端收不收。
+
+    以前 audit 自己重打一套結構檢查，於是永遠會跟真的 loader 漂移——GPT review
+    重現過：gate 矩陣列數對、維度不對，工具毫無警告 exit 0，正式 loader 卻拒載。
+    判準只能有一份，就是 loader 自己。
+    """
+    try:
+        from knowledge import KnowledgeBase
+        from knowledge_store import KnowledgeStoreError
+    except ImportError as exc:  # pragma: no cover - 依賴缺失
+        return True, f"(無法載入 knowledge 模組，略過: {exc})"
+
+    try:
+        kb = KnowledgeBase(json_path=str(json_path))
+    except KnowledgeStoreError as exc:
+        return False, str(exc)
+    except Exception as exc:  # noqa: BLE001 - loader 任何例外都算拒載
+        return False, f"{type(exc).__name__}: {exc}"
+    if not kb.loaded:
+        return False, kb.load_error or "(載入失敗，無錯誤訊息)"
+    return True, ""
+
+
 def audit(label: str, json_path: Path, show_content: bool) -> dict:
     kb = _load_kb(json_path)
     metadata = kb.get("metadata", {})
@@ -122,18 +146,16 @@ def audit(label: str, json_path: Path, show_content: bool) -> dict:
     print(f"  section 為空      : {empty_section}/{len(chunks)}"
           f"{'  ← 這些 chunk 沒有章節檢索訊號' if empty_section else ''}")
 
-    has_ctx = any(str(c.get("ctx", "") or "").strip() for c in chunks)
     ctx_count = sum(1 for c in chunks if str(c.get("ctx", "") or "").strip())
-    if has_ctx:
+    if ctx_count:
         print(f"  帶 ctx 的 chunk  : {ctx_count}/{len(chunks)}")
-        if "error" not in npz and not npz.get("has_gate"):
-            print("  [FATAL] 有 ctx 但 NPZ 沒有 gate（content-only）矩陣 —— "
-                  "查詢端會拒載。重建這個 KB。")
-        elif "error" not in npz and npz.get("gate_content_hash_schema") not in (
-            "source-section-content-v2",
-        ):
-            print(f"  [FATAL] gate schema 不對: "
-                  f"{npz.get('gate_content_hash_schema')!r} —— 查詢端會拒載。")
+
+    # 收不收由正式 loader 說了算，不是由這支工具自己重打一套檢查。
+    accepted, reason = loader_verdict(json_path)
+    if accepted:
+        print("  查詢端載入      : OK")
+    else:
+        print(f"  查詢端載入      : [FATAL] 會被拒載 —— {reason}")
 
     titles = Counter(c.get("section", "") for c in chunks if c.get("section"))
     duplicated = {t: n for t, n in titles.items() if n > 1}
@@ -157,7 +179,7 @@ def audit(label: str, json_path: Path, show_content: bool) -> dict:
         prefix = sample.get("heading_prefix_chars", 0)
         print(f"  抽樣 chunk 前綴   : {sample.get('content', '')[:prefix]!r}")
 
-    return {"chunks": chunks, "metadata": metadata, "npz": npz}
+    return {"chunks": chunks, "metadata": metadata, "npz": npz, "fatal": not accepted}
 
 
 def structural_diff(a: dict, b: dict) -> None:
@@ -284,8 +306,10 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     audit_a = audit("A", args.kb, args.show_content)
+    fatal = bool(audit_a.get("fatal"))
     if args.other_kb:
         audit_b = audit("B", args.other_kb, args.show_content)
+        fatal = fatal or bool(audit_b.get("fatal"))
         structural_diff(audit_a, audit_b)
 
     if args.questions:
@@ -303,6 +327,9 @@ def main(argv: list[str] | None = None) -> int:
         ctx_modes = {"off": [False], "on": [True], "both": [False, True]}.get(args.use_context)
         run_questions(paths, labels, questions, ctx_modes)
 
+    if fatal:
+        print("\n[FATAL] 至少一份 KB 會被查詢端拒載（見上方）。重建它。")
+        return 1
     return 0
 
 

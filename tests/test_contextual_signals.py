@@ -781,7 +781,7 @@ def _run_ab_tool(*args: str) -> subprocess.CompletedProcess:
 
 
 def test_audit_flags_a_ctx_kb_without_a_gate_matrix(tmp_path: Path):
-    """離線體檢就要抓到「有 ctx 但沒有 gate 矩陣」，不要拖到查詢才拒載。"""
+    """離線體檢就要抓到「有 ctx 但沒有 gate 矩陣」，而且要回非零。"""
     chunks = [
         _chunk("a", "原文一", ctx=CTX_TEXT, embedding=[1.0, 0.0]),
         _chunk("b", "原文二", ctx=CTX_TEXT, embedding=[0.0, 1.0]),
@@ -790,9 +790,54 @@ def test_audit_flags_a_ctx_kb_without_a_gate_matrix(tmp_path: Path):
 
     proc = _run_ab_tool(str(path))
 
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode == 1, proc.stdout
     assert "[FATAL]" in proc.stdout and "gate" in proc.stdout
     assert "gate 矩陣      : 無" in proc.stdout
+
+
+def test_audit_matches_the_real_loader_on_gate_dimension_mismatch(tmp_path: Path):
+    """列數對、維度不對：以前工具毫無警告 exit 0，正式 loader 卻拒載。
+
+    判準只能有一份 —— 體檢直接跑正式 loader，不再自己重打一套結構檢查。
+    """
+    chunks = [_chunk("a", "原文", ctx=CTX_TEXT, embedding=[1.0, 0.0], gate=[1.0, 0.0])]
+    path = _write_kb(tmp_path, chunks, with_gate=True)
+    # 事後把 gate 換成不同維度（列數仍相同）
+    with np.load(tmp_path / config.KNOWLEDGE_EMB_FILE, allow_pickle=False) as data:
+        payload = {key: data[key] for key in data.files}
+    payload["embeddings_gate"] = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
+    payload["gate_embedding_dimension"] = np.array(3)
+    np.savez_compressed(tmp_path / config.KNOWLEDGE_EMB_FILE, **payload)
+
+    proc = _run_ab_tool(str(path))
+
+    assert proc.returncode == 1, proc.stdout
+    assert "會被拒載" in proc.stdout
+
+
+def test_audit_reports_a_missing_npz_as_fatal(tmp_path: Path):
+    """壞掉／缺失的 NPZ 不能只印 [WARN] 然後 exit 0。"""
+    chunks = [_chunk("a", "原文一", embedding=[1.0, 0.0])]
+    path = _write_kb(tmp_path, chunks, with_gate=False)
+    (tmp_path / config.KNOWLEDGE_EMB_FILE).unlink()
+
+    proc = _run_ab_tool(str(path))
+
+    assert proc.returncode == 1, proc.stdout
+    assert "[FATAL]" in proc.stdout
+
+
+def test_audit_accepts_a_healthy_kb(tmp_path: Path):
+    chunks = [
+        _chunk("a", "原文一", ctx=CTX_TEXT, embedding=[1.0, 0.0], gate=[0.0, 1.0]),
+        _chunk("b", "原文二", ctx=CTX_TEXT, embedding=[0.0, 1.0], gate=[1.0, 0.0]),
+    ]
+    path = _write_kb(tmp_path, chunks, with_gate=True)
+
+    proc = _run_ab_tool(str(path))
+
+    assert proc.returncode == 0, proc.stdout
+    assert "查詢端載入      : OK" in proc.stdout
 
 
 def test_diff_does_not_claim_vectors_are_reusable_when_section_changed(tmp_path: Path):
