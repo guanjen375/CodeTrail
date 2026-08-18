@@ -359,6 +359,20 @@ def test_rag_rejects_unknown_extension_with_supported_list(tmp_path):
     assert "Traceback" not in r.stderr
 
 
+def test_index_stats_help_exits_zero():
+    """`python scripts/index_stats.py --help` 必須 cheap return 0(唯讀、離線)。"""
+    proc = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "index_stats.py"), "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--show-paths" in proc.stdout
+
+
 def test_run_eval_help_exits_zero():
     """`python eval/run_eval.py --help` 必須能 cheap return 0,不需要 llama-server。"""
     r = subprocess.run(

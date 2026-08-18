@@ -87,47 +87,10 @@ def _run_mcp_stdio() -> None:
     anyio.run(serve)
 
 
-def _validate_aicode_root(root_env: str | None, home: str | None,
-                          allow_home_override: bool) -> tuple[str | None, str | None]:
-    """純函式：判斷 AICODE_ROOT 是否安全。回傳 (resolved_root, error_msg)。
-
-    抽出來方便 tests 不啟動 FastMCP / mcp 套件就能驗證。
-    """
-    if not root_env:
-        return None, (
-            "[FATAL] 未設定 AICODE_ROOT 環境變數。\n"
-            "        為避免誤掃 cwd 或洩漏 NDA 內容, server 拒絕啟動。\n"
-            "        範例:  AICODE_ROOT=/path/to/project python mcp_server.py"
-        )
-    try:
-        resolved_path = Path(root_env).resolve()
-        resolved = str(resolved_path)
-    except (OSError, ValueError) as e:
-        return None, f"[FATAL] AICODE_ROOT 無法解析: {e}"
-
-    if not resolved_path.is_dir():
-        return None, f"[FATAL] AICODE_ROOT 不是目錄: {resolved}"
-
-    if resolved_path.parent == resolved_path:
-        return None, (
-            "[FATAL] 拒絕 AICODE_ROOT=/ — 會把整個檔案系統暴露給 MCP sandbox。\n"
-            "        cd 到具體 project 目錄再啟動 mcp_server.py。"
-        )
-    if home:
-        try:
-            home_resolved = str(Path(home).resolve())
-        except (OSError, ValueError):
-            home_resolved = home
-        if resolved == home_resolved and not allow_home_override:
-            return None, (
-                f"[FATAL] 拒絕 AICODE_ROOT=$HOME ({home_resolved})。\n"
-                "        $HOME 範圍太大且很容易意外洩漏個人資料。\n"
-                "        cd 到具體 project 目錄再啟動。\n"
-                "        若真的有需要 (高風險，自行承擔), 設定:\n"
-                "        AI_CODE_ALLOW_HOME_ROOT=1"
-            )
-    return resolved, None
-
+# AICODE_ROOT 安全檢查放在 root_safety.py:scripts/index_stats.py 這種完全離線的
+# 唯讀 CLI 也要用同一套語意驗證 root,但不能 import 這個 module(會拉起 FastMCP /
+# KnowledgeBase / CodeRAG)。純函式的實作與測試都在 root_safety.py。
+from root_safety import validate_aicode_root as _validate_aicode_root
 
 AICODE_ROOT, _err = _validate_aicode_root(
     os.environ.get("AICODE_ROOT"),

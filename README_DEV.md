@@ -53,7 +53,8 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 - `tests/test_context_budget.py` — token 估算、hard gate、metrics 解析、telemetry 隱私
 - `tests/test_trim.py` — per-tool trim 策略、`[CTX_TRIMMED]`/`[TOOL_SUMMARY]` 標記、優先級
 - `tests/test_external_import.py` — `import_external_file` 白名單、副檔名、大小限制
-- `tests/test_mcp_root_safety.py` — MCP 啟動拒絕 `/` 或 `$HOME` 當 root
+- `tests/test_mcp_root_safety.py` — `root_safety.validate_aicode_root` 拒絕 `/` / `$HOME` /不存在的 root,並守住 mcp_server 真的有接上去
+- `tests/test_index_scope.py` — 索引範圍:三態走訪 ≡ `should_index_file` 的不變式、rescue 四測、Layer C loader fail-loud(schema/權限/pattern 衛生)、matcher 方言向量、symlink containment、快取 fingerprint 遷移、`index_stats` root 驗證;全部離線且用合成樹名
 - `tests/test_mcp_smoke.py` — MCP server stdio 啟動與基本 tool 呼叫
 - `tests/test_tool_call_canary.py` — `aicode` 的兩層工具健檢：18-tool contract、假 XML 拒絕、completed event、設定指紋／24h cache、retry/FLAKY/fail-loud；所有 OpenCode／MCP／HTTP／LLM 路徑都 mock，pytest 絕不呼叫真模型
 - `tests/test_lessons.py` — lessons(行為教訓)store 驗證 fail-loud、20 條上限、scope/review_by 過濾、render 注入、過期停注入+複審提示、管理 CLI 與完整生命週期;純檔案系統,離線
@@ -282,6 +283,107 @@ llama-server 啟動時 `-c <N>` 已經把 ctx + KV cache 鎖死,所以 doctor / 
 - 估算還是 `CHARS_PER_TOKEN` heuristic。`actual_prompt_eval_count` 已蒐集,之後可以做 per-model 校正,但這次不引入 tokenizer 依賴。
 - `code_rag.py` / `knowledge.py` / `media.py` 內的 LLM call site 還沒接 gate;它們各自有 chunk 大小限制,通常不會吃滿 ctx,但若哪一天出 silent truncation 就要補。
 - OpenCode TUI 主對話完全在 CodeTrail 視線外,doctor 只能驗 config 對齊,不能驗實際 prompt 是否爆。
+
+---
+
+## 索引範圍 (index scope)
+
+**只影響 Code RAG 索引。`grep_code` / `list_dir` 完全不受影響** —— 檔案還是找得到、還是
+grep 得到,只是不再吃掉語意檢索的名額。這條界線是刻意的:使用者以為檔案不見了比雜訊更糟。
+
+### 不變式
+
+> 檔案是否進索引,**由且僅由** `index_scope.IndexScope.should_index_file(rel)` 決定。
+> `decide_dir()` 的三態(`PRUNE` / `TRAVERSE_ONLY` / `INDEX`)只是剪枝優化,必須保守:
+> `PRUNE` 僅在「其下不可能存在任何能通過 `should_index_file` 的檔案」時才允許。
+
+`tests/test_index_scope.py::test_tri_state_walk_matches_should_index_file` 對合成樹全量
+枚舉逐檔求值當基準,再跑三態走訪比對 —— 任何 `PRUNE` 吃掉應索引檔案就立刻紅。改剪枝
+邏輯時先看那條測試。
+
+### 分層
+
+| 層 | 內容 | 誰吃 |
+|---|---|---|
+| A | `config.IGNORED_DIRS`(19 名,**凍結**)+ dot 目錄規則 | 索引 / grep / list_dir |
+| A′ | `config.INDEX_ONLY_IGNORED_DIRS` = `site-packages` / `dist-packages`;段精確、case-insensitive | 只有索引 |
+| B | 結構偵測器,**永遠不收專案名**。B1 標記:目錄含 `pyvenv.cfg`、含 `conda-meta/`;B2 段規則:段 `^python\d+(\.\d+)*$` 且父段 ∈ {`lib`,`lib64`}、段以 `.egg-info` 結尾 | 只有索引 |
+| C | 部署層 `~/.config/codetrail/index-scope.json`(見下) | 只有索引 |
+
+規則鏈(對檔案路徑求值):hard gates(containment → `should_ignore_file` / dotfile →
+`CODE_EXTENSIONS` → 祖先段命中 A)全過之後,才是
+`C.include` > `C.exclude` > `B` > `A′` > 預設索引。
+
+刻意的限制,不要「好心修掉」:
+
+- **A 命中不可用 `C.include` 救回。** 救回等於擴大 committed 行為的索引範圍,違反
+  「只做減法」,而且會逼 `list_dir` / grep 連動。
+- **root 自身不套 A′ / B。** 使用者的專案根剛好叫 `site-packages`、或根目錄放了
+  `pyvenv.cfg`,整棵樹被剪掉是最糟的誤殺(設計原則:寧可漏排,不可誤殺)。
+
+### index-scope.json (Layer C)
+
+`~/.config/codetrail/index-scope.json`,**永不進 repo、永不出現在任何輸出**
+(`index_stats` 連 pattern 內容都不印)。`AICODE_INDEX_SCOPE_FILE` 可覆寫路徑(測試用)。
+
+```json
+{
+  "schema_version": 1,
+  "roots": [
+    {
+      "root": "/abs/path/to/tree",
+      "mode": "denylist",
+      "detectors": true,
+      "exclude": ["vendor_env/**"],
+      "include": ["vendor_env/keep.c"]
+    }
+  ]
+}
+```
+
+- **檔案不存在 = 正常預設**,不 fail-loud:絕大多數部署者一輩子不需要這個檔。
+- **檔案存在但壞掉 = fail-loud**:未知鍵、schema_version 不符、重複 selector、
+  非絕對路徑 `root`、pattern 衛生違規(`!` / `..` 段 / 空 / NUL / 每 root >200 條 /
+  單條 >512 字元)、POSIX 權限不是 owner-only(訊息附 `chmod 600`)。
+- `root` 是**選擇器,不是掃描根**:canonicalize(realpath + normcase)後與當下的
+  `AICODE_ROOT` 精確比對。沒匹配到不是錯誤,但 `index_stats` 會印 `C: no matching selector`。
+- `mode`:`denylist`(預設)/ `allowlist`(只有 include 列的進索引)。
+  **allowlist 下給非空 `exclude` 直接 fail-loud** —— `C.include` 優先於 `C.exclude`,
+  在 allowlist 恆為死碼,靜默接受會養出錯誤心智模型。
+- `detectors: false` 停用該 root 的 B1+B2(A′ 仍生效)。這是整樹級的鈍器;
+  A′/B 的個別誤殺本來就能用 `include` 救。
+- Glob 方言:gitwildmatch 子集,in-repo 實作(不引入 `pathspec` 依賴),比對「相對 root
+  的 POSIX 路徑」、case-sensitive、`**` globstar、前導 `/` 錨定 root。**目錄比對補尾斜線
+  再比** —— 所以 `vendor_env/**` 不匹配 `"vendor_env"` 但匹配 `"vendor_env/"`。
+  向量鎖在 `tests/test_index_scope.py::test_matcher_vectors`。
+
+### 快取遷移
+
+`scope_fingerprint`(canonical JSON hash:C 展開後的 include/exclude 含順序、`mode`、
+`detectors`、A′/B 的實際規則值、`CODE_EXTENSIONS`、檔案 ignore policy、matcher 版本、
+schema 版本)寫進 `.code_rag_cache_meta.json`。
+
+- fingerprint 缺失或不符 → **禁止**整包 fast load 與掃描快取 fast path,強制重算 membership。
+- `embedding_model` 相同 → **保留** per-file symbol/embedding cache:scope 改了只重算
+  membership delta,**不重 embed**。
+- 任何來源的 cached path 一律**重過** `should_index_file`,不得直接信任。
+- scope 熱重載是另案;改了設定要重啟 MCP server。
+
+### scripts/index_stats.py
+
+完全唯讀、完全離線的計數工具。**預設輸出只有計數,不含任何路徑** —— 這種輸出會被貼進
+issue,路徑本身就是 NDA 內容。
+
+```bash
+AICODE_ROOT=/path/to/tree python scripts/index_stats.py
+python scripts/index_stats.py --root /path/to/tree --deep        # 真的跑 AST 算符號數
+python scripts/index_stats.py --root /path/to/tree --show-paths  # 顯式 opt-in 才印路徑樣本
+```
+
+root 只能來自 `--root` 或 `AICODE_ROOT`,都沒有就報錯不猜 cwd;驗證復用
+`root_safety.validate_aicode_root`(和 MCP server 同一份,拒絕 `/`、`$HOME`、
+不存在 / 非目錄)。符號數預設讀既有 cache,涵蓋不全就印 `unknown`;`--deep` 有檔數與
+時間預算,超過會標 `truncated`。
 
 ---
 

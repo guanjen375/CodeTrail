@@ -1,7 +1,8 @@
-"""mcp_server.py 的 AICODE_ROOT 安全檢查。
+"""AICODE_ROOT 安全檢查(root_safety.validate_aicode_root)。
 
-直接從 mcp_server import 純函式 _validate_aicode_root,避免啟動 FastMCP
-(FastMCP 會綁 stdio,測試環境不適合)。
+實作放在 root_safety.py:mcp_server.py 匯入它,scripts/index_stats.py 也匯入
+同一份 —— 維護 CLI 不能 import mcp_server(會拉起 FastMCP / KnowledgeBase /
+CodeRAG),又不准另寫一套 root 驗證。這裡順便守住「mcp_server 真的有接上去」。
 """
 from __future__ import annotations
 
@@ -9,29 +10,16 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+from root_safety import validate_aicode_root as _validate  # noqa: E402
 
-def _import_validator():
-    """從 mcp_server.py 抓 _validate_aicode_root,但不執行 module 主體。
 
-    mcp_server 啟動時會做 sys.exit / 連 KB / load FastMCP,跑單純的 import
-    會炸。這裡用 ast 切出函式,exec 在隔離 namespace 裡。
-    """
+def test_mcp_server_still_wires_up_root_validation():
+    """mcp_server.py 必須匯入並實際呼叫 root 檢查 —— 別讓它被靜悄悄拿掉。"""
     src = (REPO_ROOT / "mcp_server.py").read_text(encoding="utf-8")
-    import ast
-    tree = ast.parse(src)
-    func = next(
-        (n for n in tree.body
-         if isinstance(n, ast.FunctionDef) and n.name == "_validate_aicode_root"),
-        None,
+    assert "from root_safety import validate_aicode_root" in src, (
+        "mcp_server.py 沒有匯入 root_safety.validate_aicode_root — root safety 檢查被砍了?"
     )
-    assert func is not None, "_validate_aicode_root 不在 mcp_server.py — root safety 檢查被砍了？"
-    module = ast.Module(body=[func], type_ignores=[])
-    ns: dict = {"Path": Path}
-    exec(compile(module, "mcp_server.py", "exec"), ns)
-    return ns["_validate_aicode_root"]
-
-
-_validate = _import_validator()
+    assert "_validate_aicode_root(" in src, "mcp_server.py 沒有呼叫 root 檢查"
 
 
 def test_rejects_empty_root():

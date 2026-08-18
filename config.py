@@ -374,6 +374,35 @@ ALLOWED_DOT_DIRS = {
 }
 
 # ============================================================
+# 索引範圍 (index scope) — 只影響 Code RAG 索引，不影響 grep / list_dir
+# ============================================================
+# 規則分層（完整語意見 index_scope.py 的 module docstring）：
+#   A  = 上面的 IGNORED_DIRS + dot 目錄規則。共用、凍結，索引/grep/list_dir 都吃。
+#   A' = 索引專用通名（下面這組）。段精確比對、case-insensitive。
+#   B  = 索引專用結構偵測器（B1 標記 + B2 段規則），永遠不收專案名。
+#   C  = 部署層 index-scope.json（永不進 repo）。
+# A′ 與 B 只在建索引時生效；把第三方 runtime 從語意檢索裡拿掉，
+# 但 grep_code / list_dir 仍看得到，避免使用者以為檔案不見了。
+
+# A′：索引專用通名（段精確比對、case-insensitive）
+INDEX_ONLY_IGNORED_DIRS = {"site-packages", "dist-packages"}
+
+# B1：結構標記（目錄自身含這些東西就整棵剪掉）
+INDEX_VENV_MARKER_FILE = "pyvenv.cfg"      # 目錄含此檔 → 是 venv
+INDEX_CONDA_MARKER_DIR = "conda-meta"      # 目錄含此子目錄 → 是 conda env
+
+# B2：段規則（case-insensitive）
+INDEX_PYTHON_VERSION_DIR_RE = r"^python\d+(\.\d+)*$"   # 需搭配父段
+INDEX_PYTHON_VERSION_PARENTS = {"lib", "lib64"}
+INDEX_EGG_INFO_SUFFIX = ".egg-info"
+
+# C：部署層設定檔。永不進 repo、永不出現在任何輸出（連路徑都不印）。
+INDEX_SCOPE_SCHEMA_VERSION = 1
+INDEX_SCOPE_FILE_ENV = "AICODE_INDEX_SCOPE_FILE"
+INDEX_SCOPE_MAX_PATTERNS = 200      # 每個 root（include + exclude 合計）
+INDEX_SCOPE_MAX_PATTERN_CHARS = 512
+
+# ============================================================
 # 知識庫 (RAG) 設定
 # ============================================================
 KNOWLEDGE_FILE = "knowledge.json"

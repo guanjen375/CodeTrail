@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import json
+import time as _time
 import hashlib
 from pathlib import Path
 from functools import lru_cache
@@ -34,10 +35,17 @@ from config import (
     USE_RERANKER, RERANKER_MODEL, RERANKER_ALWAYS_ON
 )
 import llama_client
-from utils import should_ignore_file, should_ignore_dir, get_cached_scan_result, set_scan_cache
+from index_scope import load_index_scope, walk_index_files
 
 # 導入 AST 解析器
 from ast_parser import parse_file, get_parser_status
+
+# 索引專用的掃描快取。刻意**不**共用 utils 的 _SCAN_CACHE:那份是 agent.py 的
+# scan_project_metadata 在用,成員資格規則和索引不同,而且沒有 scope
+# fingerprint —— §7 要求 fingerprint 缺失或不一致時禁止 fast path,所以那份
+# 快取一律不可信。key 帶 fingerprint,scope 一改就自然失效。
+_INDEX_SCAN_CACHE: dict[tuple[str, str], dict] = {}
+_INDEX_SCAN_CACHE_TTL = 30  # 秒
 
 
 def _normalize_text_for_cache(text: str) -> str:
@@ -83,6 +91,8 @@ class CodeRAG:
 
     def __init__(self, folder: str):
         self.folder = Path(folder).resolve()
+        # 索引範圍引擎(Layer C 設定不存在時就是預設行為,不會 fail)
+        self.scope = load_index_scope(self.folder)
         # 快取檔案
         cache_base = CODE_RAG_CACHE_FILE.replace('.json', '')
         self.cache_meta_file = self.folder / f"{cache_base}_meta.json"
@@ -96,6 +106,8 @@ class CodeRAG:
         self._lazy_embed = False
         self._lazy_embed_top_k = CODE_RAG_LAZY_EMBED_QUERY_TOP_K
         self._indexed_file_hashes = None
+        # 快取裡的 scope_fingerprint 是否與現在的規則一致(見 _load_file_cache)
+        self._scope_fingerprint_ok = False
 
     # 小檔走 content hash 的門檻 — 256 KiB 以下直接 hash 內容,
     # 大於這個值 fallback 到 size + mtime_ns 的快路徑。
@@ -120,96 +132,53 @@ class CodeRAG:
             return ""
 
     def _compute_folder_hash(self) -> str:
-        """計算資料夾的 hash（用於快取驗證，向後相容）"""
-        # 排除快取檔案本身，避免快取寫入後導致 hash 變化
-        cache_base = CODE_RAG_CACHE_FILE.replace('.json', '')
-        skip_files = {
-            CODE_RAG_CACHE_FILE,
-            f"{cache_base}_meta.json",
-            f"{cache_base}_emb.npz",
-        }
+        """計算資料夾的 hash（用於舊格式快取驗證，向後相容）
 
+        成員資格與索引本身共用同一個判定（should_index_file），否則「有沒有變」
+        和「有沒有進索引」會各講各話。
+        """
         files = []
-        folder_path = Path(self.folder)
-        for dirpath, dirnames, filenames in os.walk(self.folder):
-            # 使用統一的目錄過濾邏輯
-            rel_dir = Path(dirpath).relative_to(folder_path)
-            dirnames[:] = [d for d in dirnames if not should_ignore_dir(rel_dir / d)]
-            for f in filenames:
-                # 跳過 dotfile 和快取檔案
-                if f.startswith('.') or f in skip_files:
-                    continue
-                if Path(f).suffix.lower() in CODE_EXTENSIONS:
-                    fp = Path(dirpath) / f
-                    try:
-                        stat = fp.stat()
-                        files.append(f"{fp.relative_to(self.folder)}:{stat.st_size}:{stat.st_mtime}")
-                    except OSError:
-                        pass
+        for filepath, rel_path in walk_index_files(self.scope):
+            try:
+                stat = filepath.stat()
+                files.append(f"{rel_path}:{stat.st_size}:{stat.st_mtime}")
+            except OSError:
+                pass
         files.sort()
         return hashlib.md5("\n".join(files).encode()).hexdigest()
 
     def _scan_code_files(self, *, force_refresh: bool = False) -> dict:
-        """掃描所有程式碼檔案，返回 {rel_path: {"filepath": Path, "hash": str}}
+        """掃描進索引的程式碼檔案，返回 {rel_path: {"filepath": Path, "hash": str}}
 
-        P0 改進：使用共用快取減少重複掃描
+        成員資格由且僅由 self.scope.should_index_file 決定;_filter_dirnames 的
+        三態只是剪枝。fast path 的 key 綁 scope fingerprint,而且拿回來的每一條
+        cached path 仍然要重過 should_index_file（§7.3:任何來源的 cached path
+        都不得直接信任）。
         """
-        cache_base = CODE_RAG_CACHE_FILE.replace('.json', '')
-        skip_files = {
-            CODE_RAG_CACHE_FILE,
-            f"{cache_base}_meta.json",
-            f"{cache_base}_emb.npz",
-        }
-
-        # P0 改進：檢查共用快取
-        cached = None if force_refresh else get_cached_scan_result(str(self.folder))
-        if cached is not None:
-            # 快取格式是 [{"path": str, "size": int}, ...]
-            # 轉換為我們需要的格式並計算 hash
-            result = {}
-            for item in cached:
-                rel_path = item["path"]
-                if Path(rel_path).name in skip_files:
-                    continue
-                filepath = self.folder / rel_path
-                file_hash = self._compute_file_hash(filepath)
-                if file_hash:
-                    result[rel_path] = {"filepath": filepath, "hash": file_hash}
-            return result
+        cache_key = (str(self.folder), self.scope.fingerprint)
+        if not force_refresh:
+            cached = _INDEX_SCAN_CACHE.get(cache_key)
+            if cached is not None and _time.time() - cached["timestamp"] < _INDEX_SCAN_CACHE_TTL:
+                result = {}
+                for rel_path in cached["paths"]:
+                    if not self.scope.should_index_file(rel_path):
+                        continue
+                    filepath = self.folder / rel_path
+                    file_hash = self._compute_file_hash(filepath)
+                    if file_hash:
+                        result[rel_path] = {"filepath": filepath, "hash": file_hash}
+                return result
 
         result = {}
-        folder_path = Path(self.folder)
-        files_for_cache = []
+        for filepath, rel_path in walk_index_files(self.scope):
+            file_hash = self._compute_file_hash(filepath)
+            if file_hash:
+                result[rel_path] = {"filepath": filepath, "hash": file_hash}
 
-        for dirpath, dirnames, filenames in os.walk(self.folder):
-            rel_dir = Path(dirpath).relative_to(folder_path)
-            dirnames[:] = [d for d in dirnames if not should_ignore_dir(rel_dir / d)]
-
-            for filename in filenames:
-                if filename.startswith('.') or filename in skip_files:
-                    continue
-                if Path(filename).suffix.lower() not in CODE_EXTENSIONS:
-                    continue
-
-                filepath = Path(dirpath) / filename
-                rel_path = str(filepath.relative_to(self.folder))
-                if should_ignore_file(rel_path):
-                    continue
-
-                file_hash = self._compute_file_hash(filepath)
-                if file_hash:
-                    result[rel_path] = {"filepath": filepath, "hash": file_hash}
-                    # 加入快取格式
-                    try:
-                        stat = filepath.stat()
-                        files_for_cache.append({"path": rel_path, "size": stat.st_size})
-                    except OSError:
-                        pass
-
-        # P0 改進：設定共用快取
-        if files_for_cache:
-            set_scan_cache(str(self.folder), files_for_cache)
-
+        _INDEX_SCAN_CACHE[cache_key] = {
+            "paths": list(result.keys()),
+            "timestamp": _time.time(),
+        }
         return result
 
     def _scan_code_files_fresh(self) -> dict:
@@ -225,6 +194,7 @@ class CodeRAG:
         Returns:
             {rel_path: {"hash": str, "symbols": list, "embeddings": list}}
         """
+        self._scope_fingerprint_ok = False
         if not self.cache_meta_file.exists():
             return {}
 
@@ -236,6 +206,13 @@ class CodeRAG:
             if meta.get("embedding_model") != EMBEDDING_MODEL:
                 return {}
 
+            # scope 規則變了不代表要重 embed:embedding_model 相同就保留 per-file
+            # symbol/embedding cache,只重算 membership delta。這裡只記錄
+            # fingerprint 是否相符,由 _load_cache / _scan_code_files 決定要不要
+            # 拒絕「整包 fast load」。
+            self._scope_fingerprint_ok = (
+                meta.get("scope_fingerprint") == self.scope.fingerprint
+            )
             return meta.get("file_cache", {})
         except Exception:
             return {}
@@ -257,19 +234,29 @@ class CodeRAG:
                 with open(self.cache_meta_file, 'r', encoding='utf-8') as f:
                     meta = json.load(f)
 
-                # 舊格式用 folder_hash 驗證
-                if meta.get("folder_hash") == folder_hash and meta.get("embedding_model") == EMBEDDING_MODEL:
+                # 舊格式用 folder_hash 驗證。scope_fingerprint 缺失或不符時一律
+                # 拒絕整包 fast load —— 否則會直接沿用「用別套範圍規則建的索引」。
+                if (
+                    self._scope_fingerprint_ok
+                    and meta.get("folder_hash") == folder_hash
+                    and meta.get("embedding_model") == EMBEDDING_MODEL
+                ):
                     self.index = meta.get("index", [])
                     emb_data = np.load(self.cache_emb_file)
                     self.embeddings = emb_data['embeddings']
+
+                    # §7.3:cached path 一律重過 should_index_file,index 與
+                    # embeddings 必須同步裁切,不然 row 會對錯符號。
+                    self._filter_loaded_index()
 
                     if len(self.index) > 0 and self.embeddings is not None:
                         return True
             except Exception:
                 pass
 
-        # 向後相容：舊版 JSON 格式
-        if self.legacy_cache_file.exists():
+        # 向後相容：舊版 JSON 格式。同樣要 scope_fingerprint 相符才准整包載入;
+        # 舊版 JSON 從來沒寫過 fingerprint,所以實務上一定走重建那條路。
+        if self.legacy_cache_file.exists() and self._scope_fingerprint_ok:
             try:
                 with open(self.legacy_cache_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
@@ -305,12 +292,27 @@ class CodeRAG:
 
         return False
 
+    def _filter_loaded_index(self) -> None:
+        """把整包載入的 index 重過一次 should_index_file（embeddings 同步裁切）。"""
+        if not self.index:
+            return
+        keep = [
+            i for i, item in enumerate(self.index)
+            if self.scope.should_index_file(item.get("path", ""))
+        ]
+        if len(keep) == len(self.index):
+            return
+        self.index = [self.index[i] for i in keep]
+        if HAS_NUMPY and self.embeddings is not None:
+            self.embeddings = self.embeddings[keep]
+
     def _save_cache(self):
         """儲存快取（增量模式：每檔案粒度）"""
         try:
             emb_dim = self.embeddings.shape[1] if HAS_NUMPY and self.embeddings is not None else None
             meta = {
                 "embedding_model": EMBEDDING_MODEL,
+                "scope_fingerprint": self.scope.fingerprint,
                 "embedding_dim": emb_dim,
                 "index": self.index,
                 "file_cache": self._file_cache  # 增量快取
@@ -594,8 +596,19 @@ class CodeRAG:
                 print(f"[CODE_RAG] 索引完成: {len(self.index)} 個符號")
             if self._lazy_embed:
                 print(f"[CODE_RAG] lazy embed on: >{CODE_RAG_LAZY_EMBED_MAX_SYMBOLS} symbols")
+            self._print_scope_summary()
 
         self._save_cache()
+
+    def _print_scope_summary(self) -> None:
+        """索引範圍摘要 —— **只有計數,永遠不印路徑或 pattern 內容**。
+
+        這行會進 MCP log,而 log 會被貼進 issue;路徑本身就是 NDA 內容。
+        預設部署(沒有任何規則命中)完全不印,避免噪音。
+        """
+        lines = self.scope.stats_lines(include_zero=False)
+        if lines:
+            print("[CODE_RAG] index scope — " + "; ".join(lines))
 
     def _refresh_if_stale(self) -> None:
         """Incrementally rebuild when files change during the current MCP session."""
