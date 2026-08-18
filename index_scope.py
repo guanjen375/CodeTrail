@@ -173,7 +173,11 @@ def _split_pattern(pattern: str) -> tuple[list[str], bool, bool]:
 
 
 def compile_pattern(pattern: str) -> re.Pattern[str]:
-    """把一條 pattern 編成 regex(語意見上面的方言說明)。"""
+    """把一條 pattern 編成 regex(語意見上面的方言說明)。
+
+    壞的字元類(例如 ``[z-a]``)一律轉成 IndexScopeError:呼叫端只 catch
+    IndexScopeError,漏出裸的 re.error 會變成 traceback 而不是乾淨的 fatal。
+    """
     segs, dir_only, anchored = _split_pattern(pattern)
     body: list[str] = []
     last_index = len(segs) - 1
@@ -193,7 +197,10 @@ def compile_pattern(pattern: str) -> re.Pattern[str]:
     else:
         suffix = "(?:/.*)?"    # 'foo' → 檔案 foo,或目錄 foo 連同其下全部
     prefix = "" if anchored else "(?:.*/)?"
-    return re.compile("^" + prefix + core_re + suffix + r"\Z")
+    try:
+        return re.compile("^" + prefix + core_re + suffix + r"\Z")
+    except re.error as exc:
+        raise IndexScopeError(f"pattern {pattern!r} 無法編譯: {exc}") from exc
 
 
 def literal_prefix(pattern: str) -> str | None:
@@ -241,6 +248,9 @@ class ScopeConfig:
     include: tuple[str, ...] = ()
     selector_matched: bool = False
     scope_file_present: bool = False
+    # 實際載入的 index-scope.json 的 realpath。它若落在 root 內必須擋在索引外
+    # ——「永不進 repo、永不出現在任何輸出」是這個檔的契約。
+    scope_file_real: str | None = None
     warnings: tuple[str, ...] = field(default=())
 
 
@@ -321,6 +331,7 @@ def _validate_patterns(kind: str, values: object, root_label: str) -> tuple[str,
             raise IndexScopeError(
                 f"{root_label} 的 {kind}[{i}] 含 '..' 段 —— pattern 只能相對 root 往下"
             )
+        compile_pattern(item)          # 壞 regex 在 loader 就 fail-loud
         out.append(item)
     return tuple(out)
 
@@ -399,7 +410,7 @@ def load_scope_config(root: str | Path, env: dict | None = None) -> ScopeConfig:
     _check_scope_permissions(path)
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:      # ValueError 涵蓋 UnicodeDecodeError
         raise IndexScopeError(f"index-scope.json 讀取失敗: {exc}") from exc
     try:
         data = json.loads(raw)
@@ -433,8 +444,13 @@ def load_scope_config(root: str | Path, env: dict | None = None) -> ScopeConfig:
         if selector == wanted:
             matched = cfg
 
+    try:
+        scope_file_real = str(path.resolve())
+    except (OSError, ValueError):
+        scope_file_real = str(path)
+
     if matched is None:
-        return ScopeConfig(scope_file_present=True)
+        return ScopeConfig(scope_file_present=True, scope_file_real=scope_file_real)
 
     for warning in matched.warnings:
         print(f"[INDEX_SCOPE] {warning}", file=sys.stderr)
@@ -445,6 +461,7 @@ def load_scope_config(root: str | Path, env: dict | None = None) -> ScopeConfig:
         include=matched.include,
         selector_matched=True,
         scope_file_present=True,
+        scope_file_real=scope_file_real,
         warnings=matched.warnings,
     )
 
@@ -468,6 +485,9 @@ class IndexScope:
         self.detectors = self.config.detectors
         self._exclude_res = [compile_pattern(p) for p in self.config.exclude]
         self._include_res = [compile_pattern(p) for p in self.config.include]
+        self._scope_file_real = (
+            Path(self.config.scope_file_real) if self.config.scope_file_real else None
+        )
         prefixes = [literal_prefix(p) for p in self.config.include]
         self._include_open = bool(self.config.include) and any(p is None for p in prefixes)
         self._include_prefixes = tuple(p for p in prefixes if p is not None)
@@ -551,16 +571,22 @@ class IndexScope:
                 return ""
         return "/".join(p for p in text.split("/") if p and p != ".")
 
-    def contained(self, path: str | Path) -> bool:
-        """realpath containment —— symlink / junction 逃逸一律擋掉。"""
+    def _resolve_inside(self, path: str | Path) -> Path | None:
+        """realpath 後仍在 root 內就回 resolved path,逃逸回 None。"""
         try:
             target = Path(path)
             if not target.is_absolute():
                 target = self.root / target
             resolved = target.resolve()
         except (OSError, ValueError):
-            return False
-        return resolved == self.root or resolved.is_relative_to(self.root)
+            return None
+        if resolved == self.root or resolved.is_relative_to(self.root):
+            return resolved
+        return None
+
+    def contained(self, path: str | Path) -> bool:
+        """realpath containment —— symlink / junction 逃逸一律擋掉。"""
+        return self._resolve_inside(path) is not None
 
     # -------- 目錄判定 --------
 
@@ -692,8 +718,7 @@ class IndexScope:
             return False
 
         # --- hard gates ---
-        if not self.contained(normalized):
-            return False
+        # 純字串規則先跑、碰檔案系統的後跑:語意上全是 AND,順序只影響 syscall 成本。
         name = normalized.rpartition("/")[2]
         if name.startswith(".") or name in INDEX_ARTIFACT_FILES:
             return False                                   # committed code_rag 行為
@@ -704,6 +729,14 @@ class IndexScope:
         parent = normalized.rpartition("/")[0]
         if parent and should_ignore_dir(Path(parent)):
             return False                                   # Layer A,不可救回
+
+        resolved = self._resolve_inside(normalized)
+        if resolved is None:
+            return False                                   # containment 逃逸
+        if self._scope_file_real is not None and resolved == self._scope_file_real:
+            return False        # index-scope.json 自己:永不進索引、永不進輸出
+        if not resolved.is_file():
+            return False        # 只認 regular file:FIFO/socket/device 讀下去會永久阻塞
 
         # --- scope 鏈 ---
         for regex in self._include_res:

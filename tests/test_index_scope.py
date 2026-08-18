@@ -823,3 +823,196 @@ def test_index_stats_reports_rule_hits(tree, tmp_path):
     assert "B2 dirs: 2" in proc.stdout
     assert "C#1 dirs: 1" in proc.stdout
     assert "vendor_env" not in proc.stdout
+
+
+# ============================================================
+# Review 修復的回歸鎖
+# ============================================================
+
+
+def _seed_cache_with_lazy_holes(rag, rel_paths, *, holes):
+    """手動寫一份 per-file 快取,holes 裡的檔案 embedding 全是 []（lazy 模式的產物）。
+
+    直接構造狀態,不依賴「第幾個檔案剛好跨過 lazy 門檻」——那個順序由 os.walk 決定,
+    當回歸測試不可靠。
+    """
+    import code_rag
+
+    file_cache = {}
+    for rel in rel_paths:
+        path = rag.folder / rel
+        symbols = [
+            {"path": rel, "symbol": f"sym_{rel}_{i}", "type": "function",
+             "line": i + 1, "context": "ctx"}
+            for i in range(2)
+        ]
+        file_cache[rel] = {
+            "hash": code_rag.compute_file_hash(path),
+            "symbols": symbols,
+            "embeddings": [[] for _ in symbols] if rel in holes else [[1.0, 0.0]] * len(symbols),
+        }
+    rag.cache_meta_file.write_text(json.dumps({
+        "embedding_model": code_rag.EMBEDDING_MODEL,
+        "scope_fingerprint": rag.scope.fingerprint,
+        "index": [],
+        "file_cache": file_cache,
+    }), encoding="utf-8")
+
+
+def test_dense_rebuild_backfills_lazy_embedding_holes(tree, monkeypatch, clean_scan_cache):
+    """scope 縮小 → dense 模式復用 lazy 快取,空 embedding 必須被補算而不是 fail-loud。
+
+    回歸:原本會拋 "refusing zero padding",而且失敗不寫快取 → 重啟照樣失敗,
+    索引永久建不起來。索引縮小正是 index scope 的主要場景。
+    """
+    code_rag = clean_scan_cache
+    monkeypatch.setattr(code_rag, "CODE_RAG_LAZY_EMBED", True)
+    rag = code_rag.CodeRAG(str(tree))
+    kept = sorted(_indexed(rag.scope))
+    _seed_cache_with_lazy_holes(rag, kept, holes=set(kept))
+
+    calls: list[str] = []
+    monkeypatch.setattr(rag, "_get_embedding", lambda text: (calls.append(text), [1.0, 0.0])[1])
+    rag.build_index(verbose=False)
+
+    assert rag._lazy_embed is False
+    assert rag.embeddings is not None and rag.embeddings.shape[0] == len(rag.index)
+    assert calls, "空洞應該被補算"
+
+    # 快取要被修好,否則重啟又炸一次
+    meta = json.loads(rag.cache_meta_file.read_text(encoding="utf-8"))
+    holes_left = [
+        rel for rel, entry in meta["file_cache"].items()
+        for emb in entry["embeddings"] if not emb
+    ]
+    assert not holes_left, f"快取仍留著空 embedding: {sorted(set(holes_left))}"
+
+    code_rag._INDEX_SCAN_CACHE.clear()
+    restart = code_rag.CodeRAG(str(tree))
+    monkeypatch.setattr(restart, "_get_embedding", lambda _text: [1.0, 0.0])
+    restart.build_index(verbose=False)          # 不得再拋
+
+
+def test_lazy_index_shrunk_by_scope_still_builds(tmp_path, monkeypatch, clean_scan_cache):
+    """端到端:大索引跑 lazy → 用 Layer C 縮小 → dense 重建必須成功(含重啟)。"""
+    code_rag = clean_scan_cache
+    monkeypatch.setattr(code_rag, "CODE_RAG_LAZY_EMBED", True)
+    monkeypatch.setattr(code_rag, "CODE_RAG_LAZY_EMBED_MAX_SYMBOLS", 20)
+
+    root = tmp_path / "big_tree"
+    (root / "keep").mkdir(parents=True)
+    (root / "vendor_env").mkdir(parents=True)
+    (root / "keep" / "a.py").write_text(
+        "".join(f"def keep_{i}(): pass\n" for i in range(5)), encoding="utf-8")
+    for i in range(10):
+        (root / "vendor_env" / f"v{i}.py").write_text(
+            "".join(f"def vend_{i}_{j}(): pass\n" for j in range(10)), encoding="utf-8")
+
+    monkeypatch.setenv("AICODE_INDEX_SCOPE_FILE", str(tmp_path / "absent.json"))
+    first = code_rag.CodeRAG(str(root))
+    monkeypatch.setattr(first, "_get_embedding", lambda _text: [1.0, 0.0])
+    first.build_index(verbose=False)
+    assert first._lazy_embed is True, "fixture 沒有真的觸發 lazy 模式,這條就沒在測東西"
+
+    _write_scope(tmp_path, monkeypatch, root, exclude=["vendor_env/**"])
+    code_rag._INDEX_SCAN_CACHE.clear()
+    second = code_rag.CodeRAG(str(root))
+    monkeypatch.setattr(second, "_get_embedding", lambda _text: [1.0, 0.0])
+    second.build_index(verbose=False)           # 回歸點:這裡原本會拋
+    assert second._lazy_embed is False
+    assert {item["path"] for item in second.index} == {"keep/a.py"}
+
+    code_rag._INDEX_SCAN_CACHE.clear()
+    third = code_rag.CodeRAG(str(root))
+    monkeypatch.setattr(third, "_get_embedding", lambda _text: [1.0, 0.0])
+    third.build_index(verbose=False)            # 重啟也不能炸
+
+
+def test_scope_file_inside_root_never_enters_index(tree, monkeypatch):
+    """index-scope.json 放進 root 也不准進索引 ——「永不進 repo/輸出」是它的契約。"""
+    path = tree / "index-scope.json"
+    path.write_text(json.dumps(
+        {"schema_version": 1, "roots": [{"root": str(tree), "exclude": ["nothing/**"]}]}
+    ), encoding="utf-8")
+    os.chmod(path, 0o600)
+    monkeypatch.setenv("AICODE_INDEX_SCOPE_FILE", str(path))
+
+    scope = load_index_scope(tree)
+    assert scope.should_index_file("index-scope.json") is False
+    assert "index-scope.json" not in _indexed(scope)
+
+    proc = _run_stats(["--root", str(tree), "--show-paths"],
+                      env_extra={"AICODE_INDEX_SCOPE_FILE": str(path)})
+    assert proc.returncode == 0, proc.stderr
+    assert "index-scope.json" not in proc.stdout
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="需要 POSIX FIFO")
+def test_non_regular_files_are_never_read(tmp_path):
+    """FIFO / socket 讀下去會永久阻塞 —— 掃描與 --deep 都不准碰。"""
+    root = tmp_path / "fifo_tree"
+    root.mkdir()
+    (root / "real.py").write_text("def real(): pass\n", encoding="utf-8")
+    os.mkfifo(root / "blocked.py")
+
+    scope = load_index_scope(root)
+    assert scope.should_index_file("blocked.py") is False
+    assert _indexed(scope) == {"real.py"}
+
+    import subprocess
+
+    proc = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "index_stats.py"),
+         "--root", str(root), "--deep"],
+        capture_output=True, text=True, timeout=30, check=False,
+        env={**os.environ, "AICODE_INDEX_SCOPE_FILE": str(tmp_path / "absent.json")},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "indexed: 1 files" in proc.stdout
+
+
+def test_index_stats_refuses_stale_cached_symbol_count(tmp_path, clean_scan_cache):
+    """快取過期時要印 unknown,不能報舊符號數。"""
+    import code_rag
+
+    root = tmp_path / "stale_tree"
+    root.mkdir()
+    target = root / "m.py"
+    target.write_text("def one(): pass\ndef two(): pass\n", encoding="utf-8")
+    rag = code_rag.CodeRAG(str(root))
+    _seed_cache_with_lazy_holes(rag, ["m.py"], holes=set())
+
+    fresh = _run_stats(["--root", str(root)])
+    assert "2 (cached) symbols" in fresh.stdout, fresh.stdout
+
+    target.write_text("def one(): pass\ndef two(): pass\ndef three(): pass\n", encoding="utf-8")
+    stale = _run_stats(["--root", str(root)])
+    assert "unknown symbols" in stale.stdout, stale.stdout
+
+
+@pytest.mark.parametrize("pattern", ["[z-a]/**", "docs/[9-0]*.md"])
+def test_uncompilable_patterns_fail_as_index_scope_error(tree, tmp_path, monkeypatch, pattern):
+    _write_scope(tmp_path, monkeypatch, tree, exclude=[pattern])
+    with pytest.raises(IndexScopeError):
+        load_scope_config(tree)
+
+
+def test_non_utf8_scope_file_fails_as_index_scope_error(tree, tmp_path, monkeypatch):
+    path = tmp_path / "index-scope.json"
+    path.write_bytes('{"schema_version":1,"roots":[]}'.encode("utf-16"))
+    os.chmod(path, 0o600)
+    monkeypatch.setenv("AICODE_INDEX_SCOPE_FILE", str(path))
+    with pytest.raises(IndexScopeError):
+        load_scope_config(tree)
+
+
+def test_index_stats_exits_two_on_bad_scope_file(tree, tmp_path):
+    bad = tmp_path / "bad-scope.json"
+    bad.write_text(json.dumps(
+        {"schema_version": 1, "roots": [{"root": str(tree), "exclude": ["[z-a]/**"]}]}
+    ), encoding="utf-8")
+    os.chmod(bad, 0o600)
+    proc = _run_stats(["--root", str(tree)], env_extra={"AICODE_INDEX_SCOPE_FILE": str(bad)})
+    assert proc.returncode == 2, proc.stdout
+    assert "[FATAL]" in proc.stderr
+    assert "Traceback" not in proc.stderr

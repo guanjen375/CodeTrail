@@ -310,9 +310,16 @@ grep 得到,只是不再吃掉語意檢索的名額。這條界線是刻意的:�
 | B | 結構偵測器,**永遠不收專案名**。B1 標記:目錄含 `pyvenv.cfg`、含 `conda-meta/`;B2 段規則:段 `^python\d+(\.\d+)*$` 且父段 ∈ {`lib`,`lib64`}、段以 `.egg-info` 結尾 | 只有索引 |
 | C | 部署層 `~/.config/codetrail/index-scope.json`(見下) | 只有索引 |
 
-規則鏈(對檔案路徑求值):hard gates(containment → `should_ignore_file` / dotfile →
-`CODE_EXTENSIONS` → 祖先段命中 A)全過之後,才是
-`C.include` > `C.exclude` > `B` > `A′` > 預設索引。
+規則鏈(對檔案路徑求值):hard gates 全過之後,才是
+`C.include` > `C.exclude` > `B` > `A′` > 預設索引。hard gates 有七條,語意上全是 AND
+(所以評估順序只影響 syscall 成本,不影響結果):dotfile / 索引產物檔名 →
+`CODE_EXTENSIONS` → `should_ignore_file` → 祖先段命中 A → containment(realpath 仍在
+root 內)→ 不是實際載入的 index-scope.json → 是 regular file。
+
+最後兩條是 review 補的:設定檔要是被放進 root 就會自己進索引(`.json` 在
+`CODE_EXTENSIONS` 裡),違反它「永不進 repo/輸出」的契約;而 FIFO / socket / device
+一路讀下去會**永久阻塞**建索引(`read_bytes` 在 FIFO 上不會回來),`os.walk` 的
+`filenames` 是會列出它們的。
 
 刻意的限制,不要「好心修掉」:
 
@@ -367,6 +374,13 @@ schema 版本)寫進 `.code_rag_cache_meta.json`。
 - `embedding_model` 相同 → **保留** per-file symbol/embedding cache:scope 改了只重算
   membership delta,**不重 embed**。
 - 任何來源的 cached path 一律**重過** `should_index_file`,不得直接信任。
+- **dense 模式復用快取時要補算 lazy 留下的空 embedding**(`_backfill_cached_embedding_gaps`)。
+  lazy 模式(符號數 > `CODE_RAG_LAZY_EMBED_MAX_SYMBOLS`)把 embedding 存成 `[]`,延後到
+  查詢時才算;之後索引縮小到門檻以下就會走 dense,那些空洞會直接觸發
+  「refusing zero padding」fail-loud,而且失敗不寫快取 → **重啟照樣失敗,索引永久建不
+  起來**。索引縮小正是 index scope 的主要場景,所以這條是必修,不是防禦性程式碼。
+  回歸鎖:`test_dense_rebuild_backfills_lazy_embedding_holes` /
+  `test_lazy_index_shrunk_by_scope_still_builds`。
 - scope 熱重載是另案;改了設定要重啟 MCP server。
 
 ### scripts/index_stats.py
@@ -382,8 +396,13 @@ python scripts/index_stats.py --root /path/to/tree --show-paths  # 顯式 opt-in
 
 root 只能來自 `--root` 或 `AICODE_ROOT`,都沒有就報錯不猜 cwd;驗證復用
 `root_safety.validate_aicode_root`(和 MCP server 同一份,拒絕 `/`、`$HOME`、
-不存在 / 非目錄)。符號數預設讀既有 cache,涵蓋不全就印 `unknown`;`--deep` 有檔數與
-時間預算,超過會標 `truncated`。
+不存在 / 非目錄)。root 不合法或 index-scope.json 壞掉都是乾淨的 `[FATAL]` + exit 2,
+不吐 traceback。
+
+符號數預設讀既有 cache,標成 `N (cached)`;**只有每個檔案都在快取裡而且 hash 對得上**
+才給數字,少一個或過期就印 `unknown` —— 這個數字的用途就是判斷索引範圍對不對,
+報一個過期的數字比報 unknown 更糟。hash 用 `code_rag.compute_file_hash` 同一份實作,
+不另寫。`--deep` 才真的跑 AST,有檔數與時間預算,超過會標 `truncated`。
 
 ---
 

@@ -48,6 +48,30 @@ _INDEX_SCAN_CACHE: dict[tuple[str, str], dict] = {}
 _INDEX_SCAN_CACHE_TTL = 30  # 秒
 
 
+# 小檔走 content hash 的門檻 — 256 KiB 以下直接 hash 內容,
+# 大於這個值 fallback 到 size + mtime_ns 的快路徑。
+CONTENT_HASH_MAX_BYTES = 256 * 1024
+
+
+def compute_file_hash(filepath: Path, max_bytes: int = CONTENT_HASH_MAX_BYTES) -> str:
+    """單一檔案的快取 hash。空字串 = 讀不到(呼叫端一律當作「不進索引」)。
+
+    小檔(≤256 KiB)直接 hash content,避開「同秒多次寫入 / preserve-timestamp
+    同步工具」造成的 mis-hit;大檔走 size + mtime_ns 快路徑,平衡 I/O 與正確性。
+    mtime_ns 比 mtime(秒解析度)更穩,在快速 edit-save 場景下不會誤判 cache hit。
+
+    module-level 是為了讓 scripts/index_stats.py 能用同一套判定驗證快取新鮮度,
+    不必複製一份會漂移的實作。
+    """
+    try:
+        stat = filepath.stat()
+        if stat.st_size <= max_bytes:
+            return hashlib.md5(filepath.read_bytes()).hexdigest()
+        return hashlib.md5(f"{stat.st_size}:{stat.st_mtime_ns}".encode()).hexdigest()
+    except OSError:
+        return ""
+
+
 def _normalize_text_for_cache(text: str) -> str:
     """正規化文字以提高 cache 命中率"""
     return ' '.join(text.split())
@@ -109,27 +133,12 @@ class CodeRAG:
         # 快取裡的 scope_fingerprint 是否與現在的規則一致(見 _load_file_cache)
         self._scope_fingerprint_ok = False
 
-    # 小檔走 content hash 的門檻 — 256 KiB 以下直接 hash 內容,
-    # 大於這個值 fallback 到 size + mtime_ns 的快路徑。
-    _CONTENT_HASH_MAX_BYTES = 256 * 1024
+    # 保留成 class attribute:既有測試與呼叫端都靠它。
+    _CONTENT_HASH_MAX_BYTES = CONTENT_HASH_MAX_BYTES
 
     def _compute_file_hash(self, filepath: Path) -> str:
-        """計算單一檔案的 hash（用於增量快取驗證）。
-
-        小檔(≤256 KiB)直接 hash content,避開「同秒多次寫入 / preserve-timestamp
-        同步工具」造成的 mis-hit;大檔走 size + mtime_ns 快路徑,平衡 I/O 與
-        正確性。mtime_ns 比 mtime(秒解析度)更穩,在快速 edit-save 場景下不會
-        誤判 cache hit。
-        """
-        try:
-            stat = filepath.stat()
-            if stat.st_size <= self._CONTENT_HASH_MAX_BYTES:
-                return hashlib.md5(filepath.read_bytes()).hexdigest()
-            return hashlib.md5(
-                f"{stat.st_size}:{stat.st_mtime_ns}".encode()
-            ).hexdigest()
-        except OSError:
-            return ""
+        """計算單一檔案的 hash（用於增量快取驗證）。見 compute_file_hash。"""
+        return compute_file_hash(filepath, self._CONTENT_HASH_MAX_BYTES)
 
     def _compute_folder_hash(self) -> str:
         """計算資料夾的 hash（用於舊格式快取驗證，向後相容）
@@ -558,6 +567,7 @@ class CodeRAG:
 
         # 將 embedding 轉換為 numpy array 並預先 L2 normalize
         if HAS_NUMPY and embeddings_list and not self._lazy_embed:
+            self._backfill_cached_embedding_gaps(embeddings_list, verbose=verbose)
             dimensions = {len(embedding) for embedding in embeddings_list if embedding}
             if not dimensions or any(not embedding for embedding in embeddings_list):
                 self.index = []
@@ -620,6 +630,31 @@ class CodeRAG:
         }
         if current_hashes != self._indexed_file_hashes:
             self.build_index(verbose=False, _current_files=current_files)
+
+    def _backfill_cached_embedding_gaps(self, embeddings_list: list, *, verbose: bool) -> None:
+        """dense 模式復用 per-file 快取時,把 lazy 模式留下的空 embedding 補回來。
+
+        lazy 模式(符號數 > CODE_RAG_LAZY_EMBED_MAX_SYMBOLS)會把 embedding 存成
+        [],延後到查詢時才算。之後索引縮小 —— index scope 變窄、大量檔案被刪 ——
+        使符號數掉回門檻以下時,build_index 會走 dense 路徑,那些空洞直接觸發
+        「refusing zero padding」fail-loud;而且失敗時不會寫回快取,所以**重啟
+        還是失敗**,索引就永久建不起來。索引縮小正是 index scope 的主要場景,
+        所以這裡把洞補起來,結果與「刪掉快取重建」一致。
+
+        補算量上限就是新索引的符號數(dense 模式必然 ≤ lazy 門檻),不會比冷啟
+        重建更貴。
+        """
+        missing = [i for i, embedding in enumerate(embeddings_list) if not embedding]
+        if not missing:
+            return
+        if verbose:
+            print(f"[CODE_RAG] 補算 {len(missing)} 個 lazy 快取留下的空 embedding")
+        for i in missing:
+            embeddings_list[i] = self._get_embedding(
+                self._build_embed_text(self.index[i])
+            )
+        # 寫回 per-file 快取,否則 _save_cache 會把洞原樣存回去,下次照樣爆。
+        self._sync_embeddings_to_file_cache(embeddings_list)
 
     def _sync_embeddings_to_file_cache(self, rows: list[list[float]]) -> None:
         by_symbol = {

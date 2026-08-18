@@ -63,8 +63,13 @@ def _resolve_root(cli_root: str | None, env: dict) -> str:
     return resolved
 
 
-def _cached_symbol_count(root: Path, rel_paths: list[str]) -> int | None:
-    """從既有快取算符號數。涵蓋不全就回 None(印 unknown,不瞎猜)。"""
+def _cached_symbol_count(root: Path, files: list[tuple[Path, str]]) -> int | None:
+    """從既有快取算符號數。涵蓋不全或過期就回 None(印 unknown,不瞎猜)。
+
+    只確認「每個檔案都在快取裡」是不夠的:檔案改過之後快取仍會回報舊的符號數。
+    這個數字的用途就是判斷索引範圍對不對,報一個過期的數字比報 unknown 更糟,
+    所以 hash 也要對得上 —— 用 code_rag 自己那份 hash 實作,避免兩邊漂移。
+    """
     cache_base = CODE_RAG_CACHE_FILE.replace(".json", "")
     meta_file = root / f"{cache_base}_meta.json"
     if not meta_file.is_file():
@@ -76,11 +81,16 @@ def _cached_symbol_count(root: Path, rel_paths: list[str]) -> int | None:
     file_cache = meta.get("file_cache")
     if not isinstance(file_cache, dict):
         return None
+
+    from code_rag import compute_file_hash  # 只有真的有快取檔才付這個 import 成本
+
     total = 0
-    for rel in rel_paths:
+    for filepath, rel in files:
         entry = file_cache.get(rel)
         if not isinstance(entry, dict):
             return None                      # 有檔案沒進快取 → 數字不可信
+        if entry.get("hash") != compute_file_hash(filepath):
+            return None                      # 快取過期 → 數字不可信
         total += len(entry.get("symbols") or ())
     return total
 
@@ -102,6 +112,9 @@ def _deep_symbol_count(scope, files: list[tuple[Path, str]], max_files: int,
             scope.note_symlink_escape()
             continue
         try:
+            if not filepath.is_file():         # FIFO/socket 讀下去會永久阻塞
+                truncated = True
+                continue
             if filepath.stat().st_size > DEEP_MAX_BYTES:
                 truncated = True
                 continue
@@ -152,8 +165,8 @@ def main(argv: list[str] | None = None) -> int:
         suffix = f" (deep scan truncated: {parsed}/{len(files)} files)" if truncated else ""
         symbol_text = f"{symbols}{suffix}"
     else:
-        cached = _cached_symbol_count(root, rel_paths)
-        symbol_text = "unknown" if cached is None else str(cached)
+        cached = _cached_symbol_count(root, files)
+        symbol_text = "unknown" if cached is None else f"{cached} (cached)"
 
     print(f"indexed: {len(files)} files / {symbol_text} symbols")
     for line in scope.stats_lines():
