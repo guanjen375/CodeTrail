@@ -430,6 +430,10 @@ class KnowledgeBase:
 
         return True
 
+    def _ranking_bm25_index(self):
+        """排序用的 BM25 索引；USE 關掉時就是 gate（content-only）那一套。"""
+        return self._bm25 if use_generated_context() else self._bm25_gate
+
     def _retrieval_matrix(self):
         """排序用的矩陣。
 
@@ -468,12 +472,9 @@ class KnowledgeBase:
             return 0.0
         return float(np.dot(matrix[chunk_idx], q_vec / norm))
 
-    def _chunk_gate_score(self, chunk: dict, q_emb: list) -> float:
-        """一個 chunk（可能是合併過的）的 gate 相似度。
-
-        合併 chunk 保留成員的 KB 列索引，聚合取 max——**不**拿合併後的平均
-        contextual 向量重算，那等於讓生成脈絡回到決策路徑上。
-        """
+    @staticmethod
+    def _member_indices(chunk: dict) -> list:
+        """chunk（可能是合併過的）對應的 KB 列索引。"""
         members = chunk.get("member_chunk_idx")
         if not members:
             index = chunk.get("chunk_idx")
@@ -484,8 +485,17 @@ class KnowledgeBase:
                 indices.append(int(value))
             except (TypeError, ValueError):
                 continue
-        if indices and HAS_NUMPY and self._gate_matrix() is not None:
-            scores = self._gate_scores_for(indices, q_emb)
+        return indices
+
+    def _chunk_matrix_score(self, chunk: dict, q_emb: list, matrix) -> float:
+        """chunk 對某個矩陣的相似度；合併 chunk 取成員的 max。
+
+        聚合刻意用成員的 max，**不**拿合併後的平均向量重算——決策面那樣做等於
+        讓生成脈絡回到路徑上。
+        """
+        indices = self._member_indices(chunk)
+        if indices and HAS_NUMPY and matrix is not None:
+            scores = self._matrix_scores_for(indices, q_emb, matrix)
             return max(scores.values()) if scores else 0.0
         # 沒有 numpy 的 legacy 路徑：那種 KB 一定沒有 ctx，inline 向量就是
         # content-only 的訊號本身。
@@ -494,9 +504,20 @@ class KnowledgeBase:
             return self._cosine_similarity(q_emb, embedding)
         return 0.0
 
+    def _chunk_gate_score(self, chunk: dict, q_emb: list) -> float:
+        """決策用的 content-only 相似度。"""
+        return self._chunk_matrix_score(chunk, q_emb, self._gate_matrix())
+
+    def _chunk_retrieval_score(self, chunk: dict, q_emb: list) -> float:
+        """觀測用的檢索相似度（USE 開著時含生成脈絡）。"""
+        return self._chunk_matrix_score(chunk, q_emb, self._retrieval_matrix())
+
     def _gate_scores_for(self, chunk_indices: list, q_emb: list) -> dict:
         """一次算好一批 chunk 的 gate 相似度。"""
-        matrix = self._gate_matrix()
+        return self._matrix_scores_for(chunk_indices, q_emb, self._gate_matrix())
+
+    def _matrix_scores_for(self, chunk_indices: list, q_emb: list, matrix) -> dict:
+        """一次算好一批 chunk 對某個矩陣的相似度。"""
         if matrix is None or not q_emb or not chunk_indices:
             return {}
         q_vec = np.asarray(q_emb, dtype=np.float32)
@@ -1373,9 +1394,10 @@ English:"""
         if BM25_ENABLED and self._bm25_index:
             query_tokens = self._tokenize_for_bm25(question)
             # USE 關掉時連 lexical 排序都走 content-only 索引
-            ranking_index = self._bm25 if use_generated_context() else self._bm25_gate
             bm25_ranks = self._bm25_score(
-                query_tokens, allowed_indices=allowed_indices, index=ranking_index
+                query_tokens,
+                allowed_indices=allowed_indices,
+                index=self._ranking_bm25_index(),
             )[:recall_k]
         else:
             query_keywords = self._extract_keywords(question) if USE_HYBRID_SEARCH else set()
@@ -1415,17 +1437,39 @@ English:"""
         """
         if not candidates:
             return
+
+        # 兩套訊號同源時直接沿用，不重跑一次 dense/BM25。沒有 ctx 的 KB（也就是
+        # 功能關掉的所有既有部署）會走這條，查詢成本與加入本功能前完全相同。
+        same_dense = self._gate_matrix() is self._retrieval_matrix()
+        same_lexical = self._ranking_bm25_index() is self._bm25_gate
+        if same_dense and same_lexical:
+            for candidate in candidates:
+                candidate.gate_score = candidate.retrieval_score
+                candidate.gate_bm25 = candidate.retrieval_bm25
+            return
+
         indices = [c.chunk_idx for c in candidates]
-        dense = self._gate_scores_for(indices, q_emb) if HAS_NUMPY else {}
-        lexical = self._gate_bm25_map(query_tokens, indices, allowed_indices)
+        dense = (
+            {} if same_dense
+            else (self._gate_scores_for(indices, q_emb) if HAS_NUMPY else {})
+        )
+        lexical = (
+            {} if same_lexical
+            else self._gate_bm25_map(query_tokens, indices, allowed_indices)
+        )
         for candidate in candidates:
-            if dense:
+            if same_dense:
+                candidate.gate_score = candidate.retrieval_score
+            elif dense:
                 candidate.gate_score = dense.get(candidate.chunk_idx, 0.0)
             else:
                 # 沒有 numpy 的 legacy 路徑：chunk 上有 inline 向量，且這種 KB
                 # 一定沒有 ctx（ctx 是新格式），retrieval 分數就是 content-only。
                 candidate.gate_score = candidate.retrieval_score
-            candidate.gate_bm25 = lexical.get(candidate.chunk_idx, 0.0)
+            candidate.gate_bm25 = (
+                candidate.retrieval_bm25 if same_lexical
+                else lexical.get(candidate.chunk_idx, 0.0)
+            )
 
     def _merge_expansion_scores(
         self, base_scores: list, expansion_scores: list, weight: float = 0.9
@@ -2084,7 +2128,6 @@ English:"""
         # 「夠不夠格當證據」不行——那正是規格 §2 說的分數面循環 grounding：
         # 錯誤脈絡把弱原文推過 strict 門檻。
         top_gate_score = candidates[0].gate_score
-        top_retrieval_score = candidates[0].retrieval_score
         min_gate_score = max(base_threshold, top_gate_score * DYNAMIC_THRESHOLD_RATIO)
 
         # P0 改進：Margin-based 風險判斷（決策 → gate）
@@ -2191,6 +2234,15 @@ English:"""
         ]
         used_emb_scores = [s for s in used_emb_scores if s]
         top_emb_score_used = max(used_emb_scores) if used_emb_scores else top_gate_score
+        # 觀測用的檢索分數必須算在**同一組 chunk** 上，否則兩個數字不可比
+        # （一個是最終選中的、一個是過濾前的候選首位）。
+        used_retrieval_scores = [
+            self._chunk_retrieval_score(c, q_emb_for_score) for c in merged_chunks
+        ]
+        used_retrieval_scores = [s for s in used_retrieval_scores if s]
+        top_retrieval_score = (
+            max(used_retrieval_scores) if used_retrieval_scores else top_emb_score_used
+        )
 
         # 在 REF header 加入信心分數提示，讓 LLM 了解參考資料的可靠度
         # 使用修正後的 top_emb_score_used

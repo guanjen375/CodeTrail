@@ -474,9 +474,15 @@ def test_metadata_top_emb_score_is_the_gate_score(tmp_path: Path, monkeypatch):
     _model, _display, meta = kb.query("CTRL 規格是什麼")
 
     assert meta["has_ref"] is True
+    # 兩個數字算在同一組最終 chunk 上，所以可以直接比：gate 必須低於含 ctx 的分數
     assert meta["top_emb_score"] < meta["top_retrieval_score"], (
         "top_emb_score 必須是 content-only 的分數，不能被生成脈絡撐高"
     )
+
+    # 旗標關掉時兩者必須相等（USE=off ≡ content-only）
+    monkeypatch.setattr(config, "KB_CONTEXT_USE", False)
+    _model, _display, meta_off = kb.query("CTRL 規格是什麼")
+    assert meta_off["top_emb_score"] == pytest.approx(meta_off["top_retrieval_score"])
 
 
 def test_refuse_answer_reads_top_emb_score_not_retrieval_score():
