@@ -430,6 +430,21 @@ class KnowledgeBase:
 
         return True
 
+    def _decision_order(self, candidates: list) -> list:
+        """決策用的候選排序。
+
+        決策讀的是「top1 / top2 / top5 的分數」這種位置性的東西，而候選本身是照
+        RRF 排的——生成脈絡可以改動那個順序，於是即使每個位置讀的都是 gate 分數，
+        ctx 仍然能透過「誰站在第一位」間接推動門檻與 margin。真的在用 ctx 時，
+        決策改看 gate 分數自己的排序。
+
+        沒有 ctx（或旗標關著）時原樣回傳：那條路徑必須與加入本功能前逐位元組
+        相同，而 RRF 順序本來就不等於 dense 分數順序。
+        """
+        if not (self._has_ctx and use_generated_context()):
+            return candidates
+        return sorted(candidates, key=lambda c: c.gate_score, reverse=True)
+
     def _ranking_bm25_index(self):
         """排序用的 BM25 索引；USE 關掉時就是 gate（content-only）那一套。"""
         return self._bm25 if use_generated_context() else self._bm25_gate
@@ -1344,7 +1359,8 @@ English:"""
 
         # 「信心夠高就不擴寫」是決策，看 gate 分數：content-only 的信心低才擴寫，
         # 不能讓生成脈絡把信心撐高而少召回。
-        top_gate_score = candidates[0].gate_score if candidates else 0
+        ranked = self._decision_order(candidates)
+        top_gate_score = ranked[0].gate_score if ranked else 0
 
         # 高信心時跳過 expansion
         return top_gate_score < threshold
@@ -1669,6 +1685,7 @@ English:"""
 
         # 分數用 gate（content-only）而不是 RRF：RRF 範圍約 0.01-0.03，和固定門檻
         # 不在同一量級；而「跳過 rerank」是決策，不能讓生成脈絡抬高的分數觸發跳過。
+        candidates = self._decision_order(candidates)
         top_gate_score = candidates[0].gate_score if candidates else 0
 
         # 改進：高信心時跳過 rerank（減少不必要的延遲）
@@ -2127,13 +2144,14 @@ English:"""
         # 門檻一律吃 gate（content-only）分數。排序可以被生成脈絡影響，
         # 「夠不夠格當證據」不行——那正是規格 §2 說的分數面循環 grounding：
         # 錯誤脈絡把弱原文推過 strict 門檻。
-        top_gate_score = candidates[0].gate_score
+        decision_ranked = self._decision_order(candidates)
+        top_gate_score = decision_ranked[0].gate_score
         min_gate_score = max(base_threshold, top_gate_score * DYNAMIC_THRESHOLD_RATIO)
 
         # P0 改進：Margin-based 風險判斷（決策 → gate）
         is_high_risk = False
-        if MARGIN_ENABLED and len(candidates) >= 2:
-            gap = candidates[0].gate_score - candidates[1].gate_score
+        if MARGIN_ENABLED and len(decision_ranked) >= 2:
+            gap = decision_ranked[0].gate_score - decision_ranked[1].gate_score
             if gap < MARGIN_MIN_GAP:
                 is_high_risk = True  # top1-top2 差距太小，不確定
             if top_gate_score < MARGIN_LOW_SCORE:
@@ -2341,7 +2359,7 @@ English:"""
         # 改進：分別回傳 embedding score 和 keyword score，讓 spec 題拒答只看 embedding
         # 修正：top_emb_score 改用「最終被選中的 chunks」的最高分，而非 candidates[0]
         # 這避免了「candidates[0] 被過濾掉，但 top_emb_score 仍用它的低分」的問題
-        top_kw_score = candidates[0].gate_bm25 if candidates else 0.0
+        top_kw_score = decision_ranked[0].gate_bm25 if decision_ranked else 0.0
         # 將 has_spec_chunk 改為 has_authoritative_chunk
         # 權威類型：spec、manual、api（chat/diagram 不算權威）
         authoritative_types = {'spec', 'manual', 'api'}

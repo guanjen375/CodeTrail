@@ -640,3 +640,28 @@ def test_context_flag_precedence(monkeypatch, cli_flag, config_value, expected):
     monkeypatch.setattr(config, "KB_CONTEXT_GENERATE", config_value)
 
     assert RAG.resolve_context_flag(cli_flag) is expected
+
+
+def test_ctx_cannot_move_the_threshold_through_candidate_order(tmp_path: Path, monkeypatch):
+    """決策讀的是位置性的分數（top1 / top2），排序不能被生成脈絡推動。
+
+    候選本身照 RRF 排，而 RRF 受 ctx 影響。即使每個位置讀的都是 gate 分數，
+    「誰站在第一位」被 ctx 換掉時，門檻與 margin 還是會跟著動。開著 ctx 時
+    決策改看 gate 分數自己的排序。
+    """
+    kb = _kb_with_split_signals(tmp_path)
+    monkeypatch.setattr(config, "KB_CONTEXT_USE", True)
+    low_gate_first = [
+        Candidate(chunk_idx=0, chunk=kb.chunks[0], rrf_score=0.9,
+                  retrieval_score=0.99, gate_score=0.10),
+        Candidate(chunk_idx=1, chunk=kb.chunks[1], rrf_score=0.1,
+                  retrieval_score=0.20, gate_score=0.90),
+    ]
+
+    ranked = kb._decision_order(low_gate_first)
+
+    assert [c.gate_score for c in ranked] == [0.90, 0.10]
+
+    # 旗標關掉時必須原樣（RRF 順序），不得偷偷改變既有行為
+    monkeypatch.setattr(config, "KB_CONTEXT_USE", False)
+    assert kb._decision_order(low_gate_first) is low_gate_first
