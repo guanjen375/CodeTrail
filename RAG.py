@@ -261,109 +261,31 @@ def detect_content_type(content: str, base_type: str) -> str:
 # ============================================================
 # 文字處理 - 語意切分
 # ============================================================
-# Markdown 標題 pattern（# 開頭的行）
-HEADING_PATTERN = re.compile(r'^(#{1,6})\s+(.+)$', re.MULTILINE)
-
-def is_heading(line: str) -> bool:
-    """判斷是否為標題行"""
-    line = line.strip()
-    # Markdown 標題
-    if re.match(r'^#{1,6}\s+', line):
-        return True
-    # 全大寫行（常見於 PDF 章節標題）
-    if line.isupper() and len(line) > 3 and len(line) < 100:
-        return True
-    # 數字開頭的章節（如 "1. Introduction", "2.3 Methods"）
-    if re.match(r'^\d+\.[\d\.]*\s+[A-Z]', line):
-        return True
-    return False
-
-def extract_section_title(line: str) -> str:
-    """從標題行提取章節名稱"""
-    line = line.strip()
-    # Markdown 標題
-    md_match = re.match(r'^#{1,6}\s+(.+)$', line)
-    if md_match:
-        return md_match.group(1).strip()
-    # 數字章節
-    num_match = re.match(r'^(\d+\.[\d\.]*\s+.+)$', line)
-    if num_match:
-        return num_match.group(1).strip()
-    # 全大寫標題
-    if line.isupper() and len(line) > 3 and len(line) < 100:
-        return line
-    return ""
-
-
-def normalize_table_content(text: str) -> str:
-    """P1 改進：將表格/條列轉成 Key: Value 格式
-
-    提升「最大值/預設值/限制」等問題的命中率
-    """
-    lines = text.split('\n')
-    normalized = []
-
-    for line in lines:
-        # Markdown 表格行 (| col1 | col2 | col3 |)
-        if '|' in line and line.count('|') >= 2:
-            cells = [c.strip() for c in line.split('|') if c.strip()]
-            if len(cells) >= 3:
-                # Register maps need their original header + separator so the
-                # splitter can repeat both when the table spans chunks.
-                normalized.append(line)
-            elif len(cells) >= 2 and not all(c == '-' or c.startswith('-') for c in cells):
-                # 嘗試識別 key-value 對
-                normalized.append(f"{cells[0]}: {cells[1]}")
-            continue
-
-        # 條列格式 (- key: value 或 * key: value)
-        list_match = re.match(r'^[\-\*\•]\s*(.+?):\s*(.+)$', line.strip())
-        if list_match:
-            normalized.append(f"{list_match.group(1)}: {list_match.group(2)}")
-            continue
-
-        normalized.append(line)
-
-    return '\n'.join(normalized)
-
-
-def extract_heading_hierarchy(lines: list, current_idx: int) -> str:
-    """P1 改進：提取章節標題層級
-
-    返回格式：H1 > H2 > H3
-    """
-    hierarchy = []
-
-    for i in range(current_idx, -1, -1):
-        line = lines[i].strip()
-        if is_heading(line):
-            title = extract_section_title(line)
-            if title:
-                # 判斷層級
-                if line.startswith('### '):
-                    level = 3
-                elif line.startswith('## '):
-                    level = 2
-                elif line.startswith('# '):
-                    level = 1
-                elif line.isupper():
-                    level = 1
-                else:
-                    level = 2
-
-                # 插入到正確位置
-                while hierarchy and hierarchy[0][0] >= level:
-                    hierarchy.pop(0)
-                hierarchy.insert(0, (level, title))
-
-    return ' > '.join(h[1] for h in hierarchy)
+# 標題偵測 / 表格正規化 / 章節層級都搬到 extracted_document.py（見該檔檔頭：
+# 切完 chunk 後「完整文件 + 章節 span」必須能無損還原）。這裡 re-export 名字，
+# 既有呼叫端（RAG.is_heading / RAG.normalize_table_content …）與測試不受影響。
+from extracted_document import (  # noqa: E402  (在設定區塊之後才 import)
+    HEADING_PATTERN,  # noqa: F401  (re-export，舊呼叫端仍讀 RAG.HEADING_PATTERN)
+    PAGE_SEPARATOR,
+    ExtractedDocument,
+    Section,  # noqa: F401  (re-export)
+    build_line_offsets,
+    extract_heading_hierarchy,
+    extract_section_title,
+    extract_sections,
+    heading_level,  # noqa: F401  (re-export)
+    is_heading,
+    normalize_document_text,
+    normalize_table_content,  # noqa: F401  (re-export)
+)
 
 
 def split_by_semantic_with_sections(
     text: str,
     max_chars: int = CHUNK_SIZE,
     overlap_chars: int = CHUNK_OVERLAP,
-    include_heading: bool = INCLUDE_HEADING_IN_CONTENT
+    include_heading: bool = INCLUDE_HEADING_IN_CONTENT,
+    pre_normalized: bool = False
 ) -> List[Dict]:
     """
     語意切分：按標題/段落切，保持語意完整性，同時追蹤章節標題
@@ -372,19 +294,34 @@ def split_by_semantic_with_sections(
     - 表格/條列轉成 Key: Value 格式
     - 追蹤完整的標題層級
 
-    Returns: List[{content: str, section: str, heading_hierarchy: str}]
+    char_start / char_end 是這個 chunk 取材的「來源行」範圍（相對切分時看到的
+    正規化文字），給 ExtractedDocument 拿來定位章節與鄰近脈絡用；它**不是**
+    content 的還原座標——content 另外會有 overlap / [HEADING] 合成前綴，表格
+    續行還會補回表頭。
+
+    pre_normalized=True 表示呼叫端已自己跑過 normalize_document_text()：多頁
+    文件要先算出整份 raw_text 才能給出跨頁一致的 offset，這裡再正規化一次會
+    讓座標對不上實際切出的文字。
+
+    Returns: List[{content, section, heading_hierarchy, char_start, char_end}]
     """
-    text = text.strip()
+    if not pre_normalized:
+        # P1 改進：正規化表格內容（含前後空白修剪）
+        text = normalize_document_text(text)
     if not text:
         return []
 
-    # P1 改進：正規化表格內容
-    text = normalize_table_content(text)
-
     if len(text) <= max_chars:
-        return [{"content": text, "section": "", "heading_hierarchy": ""}]
+        return [{
+            "content": text,
+            "section": "",
+            "heading_hierarchy": "",
+            "char_start": 0,
+            "char_end": len(text),
+        }]
 
     lines = text.split('\n')
+    line_offsets = build_line_offsets(text)
     table_context: Dict[int, Tuple[str, str]] = {}
 
     def _table_cells(line: str) -> List[str]:
@@ -420,6 +357,27 @@ def split_by_semantic_with_sections(
     current_section = ""  # 追蹤當前章節
     chunk_start_idx = 0  # 用於計算 heading hierarchy
 
+    def _span(start_idx: int, end_idx: int) -> Tuple[int, int]:
+        """來源行 [start_idx, end_idx]（含）的字元範圍；前後空行不計入。"""
+        start_idx = max(0, min(start_idx, len(lines) - 1))
+        end_idx = max(start_idx, min(end_idx, len(lines) - 1))
+        while start_idx < end_idx and not lines[start_idx].strip():
+            start_idx += 1
+        while end_idx > start_idx and not lines[end_idx].strip():
+            end_idx -= 1
+        return line_offsets[start_idx], line_offsets[end_idx] + len(lines[end_idx])
+
+    def _emit(chunk_text: str, hierarchy_idx: int, start_idx: int, end_idx: int):
+        """收下一個 chunk：內容與 section 照舊，另記來源行 span。"""
+        char_start, char_end = _span(start_idx, end_idx)
+        chunks.append({
+            "content": chunk_text,
+            "section": current_section,
+            "heading_hierarchy": extract_heading_hierarchy(lines, hierarchy_idx),
+            "char_start": char_start,
+            "char_end": char_end,
+        })
+
     for idx, line in enumerate(lines):
         line_len = len(line) + 1  # +1 for newline
 
@@ -429,12 +387,7 @@ def split_by_semantic_with_sections(
             if current_chunk:
                 chunk_text = '\n'.join(current_chunk).strip()
                 if chunk_text:
-                    hierarchy = extract_heading_hierarchy(lines, chunk_start_idx)
-                    chunks.append({
-                        "content": chunk_text,
-                        "section": current_section,
-                        "heading_hierarchy": hierarchy
-                    })
+                    _emit(chunk_text, chunk_start_idx, chunk_start_idx, idx - 1)
 
             # 再更新 section
             section_title = extract_section_title(line)
@@ -451,12 +404,7 @@ def split_by_semantic_with_sections(
             if current_len > max_chars * 0.7:  # 超過 70% 就切
                 chunk_text = '\n'.join(current_chunk).strip()
                 if chunk_text:
-                    hierarchy = extract_heading_hierarchy(lines, chunk_start_idx)
-                    chunks.append({
-                        "content": chunk_text,
-                        "section": current_section,
-                        "heading_hierarchy": hierarchy
-                    })
+                    _emit(chunk_text, chunk_start_idx, chunk_start_idx, idx - 1)
                 current_chunk = []
                 current_len = 0
                 chunk_start_idx = idx + 1
@@ -470,23 +418,13 @@ def split_by_semantic_with_sections(
             if current_chunk:
                 chunk_text = '\n'.join(current_chunk).strip()
                 if chunk_text:
-                    hierarchy = extract_heading_hierarchy(lines, chunk_start_idx)
-                    chunks.append({
-                        "content": chunk_text,
-                        "section": current_section,
-                        "heading_hierarchy": hierarchy
-                    })
+                    _emit(chunk_text, chunk_start_idx, chunk_start_idx, idx - 1)
 
             # 單行超長 → 按句子切
             if line_len > max_chars:
                 sub_chunks = split_long_paragraph(line, max_chars)
                 for i, sc in enumerate(sub_chunks[:-1]):
-                    hierarchy = extract_heading_hierarchy(lines, idx)
-                    chunks.append({
-                        "content": sc,
-                        "section": current_section,
-                        "heading_hierarchy": hierarchy
-                    })
+                    _emit(sc, idx, idx, idx)
                 current_chunk = [sub_chunks[-1]] if sub_chunks else []
                 current_len = len(current_chunk[0]) if current_chunk else 0
             else:
@@ -506,12 +444,7 @@ def split_by_semantic_with_sections(
     if current_chunk:
         chunk_text = '\n'.join(current_chunk).strip()
         if chunk_text:
-            hierarchy = extract_heading_hierarchy(lines, chunk_start_idx)
-            chunks.append({
-                "content": chunk_text,
-                "section": current_section,
-                "heading_hierarchy": hierarchy
-            })
+            _emit(chunk_text, chunk_start_idx, chunk_start_idx, len(lines) - 1)
 
     chunks = [c for c in chunks if c["content"].strip()]
     for chunk in chunks:
@@ -568,6 +501,17 @@ def _retrieval_prefix_metadata(chunk_data: Dict) -> Dict[str, int]:
         "heading_prefix_chars": int(chunk_data.get("heading_prefix_chars", 0) or 0),
     }
 
+def _chunk_locator_metadata(chunk_data: Dict, offset: int = 0) -> Dict[str, int]:
+    """Carry the splitter's source-line span into stored chunks.
+
+    `offset` 是這一頁在文件 raw_text 裡的起點——PDF 逐頁切，chunk 的 span 要
+    加上頁位移才會落在文件座標系上。
+    """
+    return {
+        "char_start": int(chunk_data.get("char_start", 0) or 0) + offset,
+        "char_end": int(chunk_data.get("char_end", 0) or 0) + offset,
+    }
+
 def split_long_paragraph(text: str, max_chars: int) -> List[str]:
     """切分超長段落（按句子）"""
     # 句子分隔符
@@ -607,21 +551,83 @@ def split_text(text: str, max_chars: int = CHUNK_SIZE) -> List[str]:
 # ============================================================
 # 檔案處理
 # ============================================================
-def extract_pdf(file_path: str) -> List[Dict]:
-    """提取 PDF 內容，保留頁碼、文件類型、章節"""
+def build_text_document(
+    content: str,
+    *,
+    source: str,
+    base_type: str,
+    doc_type: str = "doc",
+    chunk_size: int = CHUNK_SIZE,
+    chunk_overlap: int = CHUNK_OVERLAP,
+    page: int = 1,
+    extra: Optional[Dict] = None,
+) -> ExtractedDocument:
+    """單一文字來源（md/txt、VL 抽述、網頁、binary 報告）→ ExtractedDocument。
+
+    四個入庫入口以前各自複製這段組 chunk dict 的程式碼，欄位一有出入就是靜默
+    的 retrieval 差異（少一個 *_prefix_chars 就會讓 BM25 重複計算前綴）。共用
+    之後 chunk 的形狀只有一處定義。
+
+    `base_type` 餵 detect_content_type（可升級成 warning）；`doc_type` 只是
+    文件層標記，不影響 chunk。
+    """
+    raw_text = normalize_document_text(content)
+    chunk_results = split_by_semantic_with_sections(
+        raw_text,
+        max_chars=chunk_size,
+        overlap_chars=chunk_overlap,
+        pre_normalized=True,
+    )
+
+    chunks: List[Dict] = []
+    for i, chunk_data in enumerate(chunk_results):
+        chunk = {
+            "source": source,
+            "page": page,
+            "chunk_index": i,
+            "content": chunk_data["content"],
+            "type": detect_content_type(chunk_data["content"], base_type),
+            "section": chunk_data["section"],
+            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
+            **_retrieval_prefix_metadata(chunk_data),
+            **_chunk_locator_metadata(chunk_data),
+        }
+        if extra:
+            chunk.update(extra)
+        chunks.append(chunk)
+
+    document = ExtractedDocument(
+        raw_text=raw_text,
+        sections=extract_sections(raw_text),
+        chunks=chunks,
+        source=source,
+        doc_type=doc_type,
+        page_spans=[(page, 0, len(raw_text))] if raw_text else [],
+    )
+    document.assign_section_indices()
+    document.apply_section_titles()
+    return document
+
+
+def extract_pdf_document(file_path: str) -> ExtractedDocument:
+    """提取 PDF 內容，保留頁碼、文件類型、章節。
+
+    逐頁切 chunk（維持既有切點），但同時把每頁正規化後的文字串成整份
+    raw_text 並記下頁 span——章節範圍因此是文件級的，不再受制於「這一頁看得
+    到哪些標題」。
+    """
     # 延遲載入 pymupdf4llm（只有 PDF 模式需要）
     pymupdf4llm = check_pymupdf4llm()
+
+    filename = Path(file_path).name
 
     try:
         pages = pymupdf4llm.to_markdown(file_path, page_chunks=True, write_images=False)
     except Exception as e:
         print(f"  [WARN] 無法處理 PDF: {e}")
-        return []
+        return ExtractedDocument(raw_text="", source=filename)
 
-    results = []
-    filename = Path(file_path).name
     doc_type = detect_doc_type(filename)
-    last_section = ""  # 跨頁追蹤章節
 
     # 改進：若檔名無法識別類型，使用內容特徵輔助判斷
     if doc_type == 'doc' and pages:
@@ -634,6 +640,11 @@ def extract_pdf(file_path: str) -> List[Dict]:
 
     image_pages: Dict[int, int] = {}   # 頁碼 → 內嵌圖數
     image_only_pages: List[int] = []   # 只有圖、抽不到文字而整頁跳過的頁
+
+    chunks: List[Dict] = []
+    page_texts: List[str] = []
+    page_spans: List[Tuple[int, int, int]] = []
+    offset = 0  # 下一頁在 raw_text 中的起點
 
     for page_info in pages:
         meta = page_info.get('metadata', {}) or {}
@@ -656,28 +667,39 @@ def extract_pdf(file_path: str) -> List[Dict]:
         if not content:
             continue
 
+        # 先正規化再切：raw_text 必須就是 splitter 看到的那份文字，offset 才對得上
+        page_text = normalize_document_text(content)
+        if not page_text:
+            continue
+
         # 使用帶章節的切分（根據文件類型調整 chunk 大小）
         chunk_results = split_by_semantic_with_sections(
-            content, max_chars=chunk_size, overlap_chars=chunk_overlap
+            page_text,
+            max_chars=chunk_size,
+            overlap_chars=chunk_overlap,
+            pre_normalized=True,
         )
         for i, chunk_data in enumerate(chunk_results):
-            section = chunk_data["section"] or last_section
-            if chunk_data["section"]:
-                last_section = chunk_data["section"]
-
             # 根據內容判斷是否為警告類型
             chunk_type = detect_content_type(chunk_data["content"], doc_type)
 
-            results.append({
+            # section 先放 splitter 的 page-local 值，最後由 apply_section_titles()
+            # 統一改成文件級真相（舊碼在這裡用 last_section 補，會補到過期章節）
+            chunks.append({
                 "source": filename,
                 "page": page_num,
                 "chunk_index": i,
                 "content": chunk_data["content"],
                 "type": chunk_type,
-                "section": section,
+                "section": chunk_data["section"],
                 "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
                 **_retrieval_prefix_metadata(chunk_data),
+                **_chunk_locator_metadata(chunk_data, offset),
             })
+
+        page_spans.append((page_num, offset, offset + len(page_text)))
+        page_texts.append(page_text)
+        offset += len(page_text) + len(PAGE_SEPARATOR)
 
     # fail-loud：PDF 路徑只抽文字，內嵌圖不經 VL、不入庫。
     # 混合 PDF（datasheet 類）以前會「chunks>0 → 回報成功」而圖無聲消失。
@@ -692,20 +714,35 @@ def extract_pdf(file_path: str) -> List[Dict]:
         print("  [HINT] 需要圖片內容時：把該頁圖片另存成 .png，"
               "用 ingest_document(mode=\"image\") 入庫或 analyze_file 看一次。")
 
-    return results
+    raw_text = PAGE_SEPARATOR.join(page_texts)
+    document = ExtractedDocument(
+        raw_text=raw_text,
+        sections=extract_sections(raw_text, page_spans),
+        chunks=chunks,
+        source=filename,
+        doc_type=doc_type,
+        page_spans=page_spans,
+    )
+    document.assign_section_indices()
+    document.apply_section_titles()
+    return document
 
 
-def extract_text_file(file_path: str) -> List[Dict]:
+def extract_pdf(file_path: str) -> List[Dict]:
+    """提取 PDF 內容（只要 chunks 的相容入口）"""
+    return extract_pdf_document(file_path).chunks
+
+
+def extract_text_file_document(file_path: str) -> ExtractedDocument:
     """提取純文字檔案（md, txt），包含文件類型和章節"""
+    filename = Path(file_path).name
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
     except Exception as e:
         print(f"  [WARN] 無法讀取檔案: {e}")
-        return []
+        return ExtractedDocument(raw_text="", source=filename)
 
-    results = []
-    filename = Path(file_path).name
     doc_type = detect_doc_type(filename)
 
     # 改進：若檔名無法識別類型，使用內容特徵輔助判斷
@@ -715,44 +752,40 @@ def extract_text_file(file_path: str) -> List[Dict]:
     # 根據文件類型取得 chunk 設定
     chunk_size, chunk_overlap = get_chunk_settings(doc_type)
 
-    # 使用帶章節的切分（根據文件類型調整 chunk 大小）
-    chunk_results = split_by_semantic_with_sections(
-        content, max_chars=chunk_size, overlap_chars=chunk_overlap
+    return build_text_document(
+        content,
+        source=filename,
+        base_type=doc_type,
+        doc_type=doc_type,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        page=1,  # 純文字檔案視為單頁
     )
-    for i, chunk_data in enumerate(chunk_results):
-        # 根據內容判斷是否為警告類型
-        chunk_type = detect_content_type(chunk_data["content"], doc_type)
 
-        results.append({
-            "source": filename,
-            "page": 1,  # 純文字檔案視為單頁
-            "chunk_index": i,
-            "content": chunk_data["content"],
-            "type": chunk_type,
-            "section": chunk_data["section"],
-            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
-            **_retrieval_prefix_metadata(chunk_data),
-        })
 
-    return results
+def extract_text_file(file_path: str) -> List[Dict]:
+    """提取純文字檔案（只要 chunks 的相容入口）"""
+    return extract_text_file_document(file_path).chunks
 
-def extract_binary(file_path: str) -> List[Dict]:
+
+def extract_binary_document(file_path: str) -> ExtractedDocument:
     """提取 binary/ELF 內容（hex dump、magic、可讀字串、ELF symbol 等）。
 
     用 media.read_binary 抽出可分析的 Markdown 報告（遇到 ELF magic 會自動切到
     ELF 解析）。報告裡 【...】 章節標記會被轉成 ## 標題，方便語意切分。
     """
+    filename = Path(file_path).name
     # 延遲載入 media（其他模式不需要）
     try:
         from media import read_binary, set_sandbox_root
     except ImportError as e:
         print(f"[ERROR] binary/ELF 模式需要 media 模組: {e}")
-        return []
+        return ExtractedDocument(raw_text="", source=filename)
 
     p = Path(file_path).resolve()
     if not p.is_file():
         print(f"  [WARN] 檔案不存在: {file_path}")
-        return []
+        return ExtractedDocument(raw_text="", source=filename)
 
     # read_binary 內建沙箱（_SANDBOX_ROOT），這裡設成檔案所在目錄即可
     set_sandbox_root(str(p.parent), allow_external=False)
@@ -762,51 +795,44 @@ def extract_binary(file_path: str) -> List[Dict]:
             or content.startswith("[BIN 錯誤]")
             or content.startswith("[ELF 錯誤]")):
         print(f"  [WARN] binary 分析失敗: {content[:200] if content else '空結果'}")
-        return []
+        return ExtractedDocument(raw_text="", source=p.name)
 
     # 把 【標題】(尾巴) 轉成 ## 標題 尾巴，讓 split_by_semantic_with_sections 抓得到章節
     # （media.py 的報告會出現「【可讀字串（含 offset）】共 3 個」這種尾巴帶文字的行）
     content = re.sub(r'^【(.+?)】(.*)$', r'## \1\2', content, flags=re.MULTILINE)
 
-    filename = p.name
-    chunk_results = split_by_semantic_with_sections(content)
-
-    results: List[Dict] = []
-    last_section = ""
-    for i, chunk_data in enumerate(chunk_results):
-        section = chunk_data["section"] or last_section
-        if chunk_data["section"]:
-            last_section = chunk_data["section"]
-
-        chunk_type = detect_content_type(chunk_data["content"], "binary")
-
-        results.append({
-            "source": filename,
-            "page": 1,
-            "chunk_index": i,
-            "content": chunk_data["content"],
-            "type": chunk_type,
-            "section": section,
-            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
-            **_retrieval_prefix_metadata(chunk_data),
-            "origin": "binary",
-        })
-
-    return results
+    return build_text_document(
+        content,
+        source=p.name,
+        base_type="binary",
+        doc_type="binary",
+        page=1,
+        extra={"origin": "binary"},
+    )
 
 
-def process_file(file_path: str) -> List[Dict]:
-    """根據檔案類型選擇處理方式"""
+def extract_binary(file_path: str) -> List[Dict]:
+    """提取 binary/ELF 內容（只要 chunks 的相容入口）"""
+    return extract_binary_document(file_path).chunks
+
+
+def process_file_document(file_path: str) -> ExtractedDocument:
+    """根據檔案類型選擇處理方式，回傳文件級單一真相"""
     ext = Path(file_path).suffix.lower()
 
     if ext == ".pdf":
-        return extract_pdf(file_path)
+        return extract_pdf_document(file_path)
     elif ext in {".md", ".txt"}:
-        return extract_text_file(file_path)
+        return extract_text_file_document(file_path)
     elif ext in BINARY_EXTENSIONS or ext in ELF_EXTENSIONS:
-        return extract_binary(file_path)
+        return extract_binary_document(file_path)
     else:
-        return []
+        return ExtractedDocument(raw_text="", source=Path(file_path).name)
+
+
+def process_file(file_path: str) -> List[Dict]:
+    """根據檔案類型選擇處理方式（只要 chunks 的相容入口）"""
+    return process_file_document(file_path).chunks
 
 # ============================================================
 # 聊天截圖處理
@@ -884,7 +910,18 @@ def extract_chat_from_screenshot(image_path: str) -> str:
         return ""
 
 
-def process_chat_screenshot(image_path: str) -> List[Dict]:
+def build_chat_document(image_name: str, content: str) -> ExtractedDocument:
+    """VL 抽出的聊天文字 → ExtractedDocument（互動式與自動入庫共用同一份切法）"""
+    return build_text_document(
+        content,
+        source=f"chat_{image_name}",
+        base_type='chat',
+        doc_type='chat',
+        extra={"origin": "screenshot"},  # 標記來源是截圖
+    )
+
+
+def process_chat_screenshot_document(image_path: str) -> ExtractedDocument:
     """處理聊天截圖，提取並整理成知識區塊"""
     print(f"[INFO] 使用 VL 模型分析截圖...")
 
@@ -892,34 +929,19 @@ def process_chat_screenshot(image_path: str) -> List[Dict]:
     content = extract_chat_from_screenshot(image_path)
 
     if not content:
-        return []
+        return ExtractedDocument(raw_text="", source=f"chat_{Path(image_path).name}")
 
     print(f"[INFO] 提取完成，內容長度: {len(content)} 字元")
     print("-" * 40)
     print(content[:500] + "..." if len(content) > 500 else content)
     print("-" * 40)
 
-    # 切分成 chunks
-    results = []
-    filename = Path(image_path).name
+    return build_chat_document(Path(image_path).name, content)
 
-    chunk_results = split_by_semantic_with_sections(content)
-    for i, chunk_data in enumerate(chunk_results):
-        chunk_type = detect_content_type(chunk_data["content"], 'chat')
 
-        results.append({
-            "source": f"chat_{filename}",
-            "page": 1,
-            "chunk_index": i,
-            "content": chunk_data["content"],
-            "type": chunk_type,
-            "section": chunk_data["section"],
-            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
-            **_retrieval_prefix_metadata(chunk_data),
-            "origin": "screenshot"  # 標記來源是截圖
-        })
-
-    return results
+def process_chat_screenshot(image_path: str) -> List[Dict]:
+    """處理聊天截圖（只要 chunks 的相容入口）"""
+    return process_chat_screenshot_document(image_path).chunks
 
 
 # ============================================================
@@ -1012,7 +1034,18 @@ def extract_info_from_image(image_path: str) -> str:
         return ""
 
 
-def process_technical_image(image_path: str) -> List[Dict]:
+def build_image_document(image_name: str, content: str) -> ExtractedDocument:
+    """VL 抽出的圖片說明 → ExtractedDocument（互動式與自動入庫共用同一份切法）"""
+    return build_text_document(
+        content,
+        source=f"image_{image_name}",
+        base_type='diagram',
+        doc_type='diagram',
+        extra={"origin": "image"},  # 標記來源是技術圖片
+    )
+
+
+def process_technical_image_document(image_path: str) -> ExtractedDocument:
     """處理技術圖片，提取並整理成知識區塊"""
     print(f"[INFO] 使用 VL 模型分析技術圖片...")
 
@@ -1020,34 +1053,19 @@ def process_technical_image(image_path: str) -> List[Dict]:
     content = extract_info_from_image(image_path)
 
     if not content:
-        return []
+        return ExtractedDocument(raw_text="", source=f"image_{Path(image_path).name}")
 
     print(f"[INFO] 提取完成，內容長度: {len(content)} 字元")
     print("-" * 40)
     print(content[:500] + "..." if len(content) > 500 else content)
     print("-" * 40)
 
-    # 切分成 chunks
-    results = []
-    filename = Path(image_path).name
+    return build_image_document(Path(image_path).name, content)
 
-    chunk_results = split_by_semantic_with_sections(content)
-    for i, chunk_data in enumerate(chunk_results):
-        chunk_type = detect_content_type(chunk_data["content"], 'diagram')
 
-        results.append({
-            "source": f"image_{filename}",
-            "page": 1,
-            "chunk_index": i,
-            "content": chunk_data["content"],
-            "type": chunk_type,
-            "section": chunk_data["section"],
-            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
-            **_retrieval_prefix_metadata(chunk_data),
-            "origin": "image"  # 標記來源是技術圖片
-        })
-
-    return results
+def process_technical_image(image_path: str) -> List[Dict]:
+    """處理技術圖片（只要 chunks 的相容入口）"""
+    return process_technical_image_document(image_path).chunks
 
 
 # ============================================================
@@ -1459,44 +1477,40 @@ def remove_document_from_knowledge_base(output_path: Path, source: str) -> Dict:
             }),
         }
 
-def add_document(input_file: str, output_file: str):
-    """將文件加入知識庫"""
-    input_path = Path(input_file)
+def _commit_document_to_kb(
+    document: ExtractedDocument,
+    output_file: str,
+    *,
+    label: str = "文件",
+    kb: Optional[Dict] = None,
+) -> bool:
+    """把一份 ExtractedDocument 併進知識庫（同名文件先移除舊 chunks）。
+
+    七個入口以前各自複製這段（載入 → 去重同名 → embedding → 配 id → append →
+    save）。共用之後「一份文件怎麼進 KB」只有一條路；要在入庫前多做一步
+    （例如生成 chunk 脈絡）也只有一個掛點，不會漏掉某個入口。
+
+    kb 已載入時直接沿用：add_document 會先載入，好讓壞掉的 KB 在付出抽取成本
+    前就 fail。回傳 False 代表沒有內容可入庫（呼叫端決定 exit 還是 return）。
+    """
     output_path = Path(output_file)
-
-    # 檢查輸入檔案
-    if not input_path.exists():
-        print(f"[ERROR] 檔案不存在: {input_file}")
-        sys.exit(1)
-
-    allowed = SUPPORTED_EXTENSIONS | BINARY_EXTENSIONS | ELF_EXTENSIONS
-    if input_path.suffix.lower() not in allowed:
-        print(f"[ERROR] 不支援的檔案類型: {input_path.suffix}")
-        print(f"        文字: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
-        print(f"        二進位: {', '.join(sorted(BINARY_EXTENSIONS))}")
-        print(f"        ELF: {', '.join(sorted(ELF_EXTENSIONS))}")
-        sys.exit(1)
+    new_chunks = document.chunks
+    if not new_chunks:
+        print("[WARN] 沒有提取到任何內容")
+        return False
 
     # 載入現有知識庫
-    kb = load_knowledge_base(output_path)
+    if kb is None:
+        kb = load_knowledge_base(output_path)
 
     # 檢查是否已存在同名文件（若有則先移除舊的）
-    doc_name = input_path.name
+    doc_name = document.source
     if doc_name in kb["metadata"]["documents"]:
-        print(f"[INFO] 更新現有文件: {doc_name}")
-        # 移除舊的 chunks
+        print(f"[INFO] 更新現有{label}: {doc_name}")
         kb["chunks"] = [c for c in kb["chunks"] if c["source"] != doc_name]
         kb["metadata"]["documents"].remove(doc_name)
     else:
-        print(f"[INFO] 新增文件: {doc_name}")
-
-    # 處理新文件
-    print(f"[INFO] 處理: {input_path.name}")
-    new_chunks = process_file(str(input_path))
-
-    if not new_chunks:
-        print("[WARN] 沒有提取到任何內容")
-        sys.exit(1)
+        print(f"[INFO] 新增{label}: {doc_name}")
 
     print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
 
@@ -1515,6 +1529,36 @@ def add_document(input_file: str, output_file: str):
 
     # 儲存
     save_knowledge_base(kb, output_path)
+    return True
+
+
+def add_document(input_file: str, output_file: str):
+    """將文件加入知識庫"""
+    input_path = Path(input_file)
+    output_path = Path(output_file)
+
+    # 檢查輸入檔案
+    if not input_path.exists():
+        print(f"[ERROR] 檔案不存在: {input_file}")
+        sys.exit(1)
+
+    allowed = SUPPORTED_EXTENSIONS | BINARY_EXTENSIONS | ELF_EXTENSIONS
+    if input_path.suffix.lower() not in allowed:
+        print(f"[ERROR] 不支援的檔案類型: {input_path.suffix}")
+        print(f"        文字: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
+        print(f"        二進位: {', '.join(sorted(BINARY_EXTENSIONS))}")
+        print(f"        ELF: {', '.join(sorted(ELF_EXTENSIONS))}")
+        sys.exit(1)
+
+    # 先載入現有知識庫：壞掉的 KB 要在付出抽取成本前就 fail
+    kb = load_knowledge_base(output_path)
+
+    # 處理新文件
+    print(f"[INFO] 處理: {input_path.name}")
+    document = process_file_document(str(input_path))
+
+    if not _commit_document_to_kb(document, output_file, label="文件", kb=kb):
+        sys.exit(1)
 
 # ============================================================
 # 互動式確認函式
@@ -1585,63 +1629,13 @@ def interactive_chat_screenshot(image_file: str, output_file: str):
 
 def _add_chat_content_to_kb(image_path: Path, content: str, output_file: str):
     """將已分析的聊天內容加入知識庫（內部函式）"""
-    output_path = Path(output_file)
-
     # 自動快取分析結果
     cache_file = _save_to_cache(image_path.name, content, "chat")
     if cache_file:
         print(f"[INFO] 快取已存: {cache_file}")
 
-    # 切分成 chunks
-    chunk_results = split_by_semantic_with_sections(content)
-    new_chunks = []
-    for i, chunk_data in enumerate(chunk_results):
-        chunk_type = detect_content_type(chunk_data["content"], 'chat')
-        new_chunks.append({
-            "source": f"chat_{image_path.name}",
-            "page": 1,
-            "chunk_index": i,
-            "content": chunk_data["content"],
-            "type": chunk_type,
-            "section": chunk_data["section"],
-            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
-            **_retrieval_prefix_metadata(chunk_data),
-            "origin": "screenshot"
-        })
-
-    if not new_chunks:
-        print("[WARN] 沒有提取到任何內容")
-        return
-
-    # 載入現有知識庫
-    kb = load_knowledge_base(output_path)
-    doc_name = f"chat_{image_path.name}"
-
-    # 檢查是否已存在同名文件
-    if doc_name in kb["metadata"]["documents"]:
-        print(f"[INFO] 更新現有截圖知識: {doc_name}")
-        kb["chunks"] = [c for c in kb["chunks"] if c["source"] != doc_name]
-        kb["metadata"]["documents"].remove(doc_name)
-    else:
-        print(f"[INFO] 新增截圖知識: {doc_name}")
-
-    print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
-
-    # 生成 embeddings
-    print(f"[INFO] 使用 {EMBEDDING_MODEL} 生成 embeddings...")
-    new_chunks = generate_embeddings(new_chunks)
-
-    # 為每個 chunk 生成唯一 ID
-    for chunk in new_chunks:
-        content_hash = hashlib.md5(chunk['content'].encode()).hexdigest()[:8]
-        chunk['id'] = f"{chunk['source']}::p{chunk['page']}::c{chunk['chunk_index']}::{content_hash}"
-
-    # Append 到知識庫
-    kb["chunks"].extend(new_chunks)
-    kb["metadata"]["documents"].append(doc_name)
-
-    # 儲存
-    save_knowledge_base(kb, output_path)
+    document = build_chat_document(image_path.name, content)
+    _commit_document_to_kb(document, output_file, label="截圖知識")
 
 
 def add_chat_screenshot(image_file: str, output_file: str):
@@ -1662,40 +1656,12 @@ def add_chat_screenshot(image_file: str, output_file: str):
     # 載入現有知識庫
     kb = load_knowledge_base(output_path)
 
-    # 檢查是否已存在同名文件（若有則先移除舊的）
-    doc_name = f"chat_{image_path.name}"
-    if doc_name in kb["metadata"]["documents"]:
-        print(f"[INFO] 更新現有截圖知識: {doc_name}")
-        kb["chunks"] = [c for c in kb["chunks"] if c["source"] != doc_name]
-        kb["metadata"]["documents"].remove(doc_name)
-    else:
-        print(f"[INFO] 新增截圖知識: {doc_name}")
-
     # 處理截圖
     print(f"[INFO] 處理: {image_path.name}")
-    new_chunks = process_chat_screenshot(str(image_path))
+    document = process_chat_screenshot_document(str(image_path))
 
-    if not new_chunks:
-        print("[WARN] 沒有提取到任何內容")
+    if not _commit_document_to_kb(document, output_file, label="截圖知識", kb=kb):
         sys.exit(1)
-
-    print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
-
-    # 生成 embeddings
-    print(f"[INFO] 使用 {EMBEDDING_MODEL} 生成 embeddings...")
-    new_chunks = generate_embeddings(new_chunks)
-
-    # 為每個 chunk 生成唯一 ID
-    for chunk in new_chunks:
-        content_hash = hashlib.md5(chunk['content'].encode()).hexdigest()[:8]
-        chunk['id'] = f"{chunk['source']}::p{chunk['page']}::c{chunk['chunk_index']}::{content_hash}"
-
-    # Append 到知識庫
-    kb["chunks"].extend(new_chunks)
-    kb["metadata"]["documents"].append(doc_name)
-
-    # 儲存
-    save_knowledge_base(kb, output_path)
 
 
 # ============================================================
@@ -1840,11 +1806,30 @@ def generate_url_name(url: str) -> str:
         return netloc
 
 
-def process_url(url: str) -> Optional[Tuple[List[Dict], str]]:
+def build_url_document(
+    url: str, content: str, title: str, fetched_at: str
+) -> ExtractedDocument:
+    """抓回來的網頁 Markdown → ExtractedDocument（互動式與自動入庫共用）"""
+    url_name = generate_url_name(url)
+    return build_text_document(
+        content,
+        source=f"url_{url_name}",
+        base_type='web',
+        doc_type='web',
+        extra={
+            "origin": "url",
+            "url": url,              # 保留原始 URL
+            "title": title,          # 補存標題
+            "fetched_at": fetched_at,  # 補存抓取時間
+        },
+    )
+
+
+def process_url_document(url: str) -> Optional[ExtractedDocument]:
     """處理網頁 URL，提取內容並整理成知識區塊
 
     Returns:
-        成功: (chunks, url_name) tuple
+        成功: ExtractedDocument
         失敗: None
     """
     content, title = fetch_url_content(url)
@@ -1859,32 +1844,16 @@ def process_url(url: str) -> Optional[Tuple[List[Dict], str]]:
     print(content[:500] + "..." if len(content) > 500 else content)
     print("-" * 40)
 
-    # 使用更穩定的命名避免撞名
-    url_name = generate_url_name(url)
+    return build_url_document(url, content, title, fetched_at)
 
-    # 切分成 chunks
-    results = []
-    chunk_results = split_by_semantic_with_sections(content)
 
-    for i, chunk_data in enumerate(chunk_results):
-        chunk_type = detect_content_type(chunk_data["content"], 'web')
-
-        results.append({
-            "source": f"url_{url_name}",
-            "page": 1,
-            "chunk_index": i,
-            "content": chunk_data["content"],
-            "type": chunk_type,
-            "section": chunk_data["section"],
-            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
-            **_retrieval_prefix_metadata(chunk_data),
-            "origin": "url",
-            "url": url,              # 保留原始 URL
-            "title": title,          # 補存標題
-            "fetched_at": fetched_at # 補存抓取時間
-        })
-
-    return results, url_name  # 回傳 url_name 供 add_url 使用
+def process_url(url: str) -> Optional[Tuple[List[Dict], str]]:
+    """處理網頁 URL（只要 (chunks, url_name) 的相容入口）"""
+    document = process_url_document(url)
+    if document is None:
+        return None
+    # source 是 "url_<name>"，去掉前綴還原 url_name
+    return document.chunks, document.source[len("url_"):]
 
 
 # ============================================================
@@ -1928,8 +1897,6 @@ def interactive_url(url: str, output_file: str):
 
 def _add_url_content_to_kb(url: str, content: str, title: str, output_file: str):
     """將已抓取的網頁內容加入知識庫（內部函式）"""
-    output_path = Path(output_file)
-    url_name = generate_url_name(url)
     fetched_at = datetime.now().isoformat()
 
     # 自動快取抓取結果
@@ -1937,59 +1904,8 @@ def _add_url_content_to_kb(url: str, content: str, title: str, output_file: str)
     if cache_file:
         print(f"[INFO] 快取已存: {cache_file}")
 
-    # 切分成 chunks
-    chunk_results = split_by_semantic_with_sections(content)
-    new_chunks = []
-    for i, chunk_data in enumerate(chunk_results):
-        chunk_type = detect_content_type(chunk_data["content"], 'web')
-        new_chunks.append({
-            "source": f"url_{url_name}",
-            "page": 1,
-            "chunk_index": i,
-            "content": chunk_data["content"],
-            "type": chunk_type,
-            "section": chunk_data["section"],
-            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
-            **_retrieval_prefix_metadata(chunk_data),
-            "origin": "url",
-            "url": url,
-            "title": title,
-            "fetched_at": fetched_at
-        })
-
-    if not new_chunks:
-        print("[WARN] 沒有提取到任何內容")
-        return
-
-    # 載入現有知識庫
-    kb = load_knowledge_base(output_path)
-    doc_name = f"url_{url_name}"
-
-    # 檢查是否已存在同名文件
-    if doc_name in kb["metadata"]["documents"]:
-        print(f"[INFO] 更新現有網頁知識: {doc_name}")
-        kb["chunks"] = [c for c in kb["chunks"] if c["source"] != doc_name]
-        kb["metadata"]["documents"].remove(doc_name)
-    else:
-        print(f"[INFO] 新增網頁知識: {doc_name}")
-
-    print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
-
-    # 生成 embeddings
-    print(f"[INFO] 使用 {EMBEDDING_MODEL} 生成 embeddings...")
-    new_chunks = generate_embeddings(new_chunks)
-
-    # 為每個 chunk 生成唯一 ID
-    for chunk in new_chunks:
-        content_hash = hashlib.md5(chunk['content'].encode()).hexdigest()[:8]
-        chunk['id'] = f"{chunk['source']}::p{chunk['page']}::c{chunk['chunk_index']}::{content_hash}"
-
-    # Append 到知識庫
-    kb["chunks"].extend(new_chunks)
-    kb["metadata"]["documents"].append(doc_name)
-
-    # 儲存
-    save_knowledge_base(kb, output_path)
+    document = build_url_document(url, content, title, fetched_at)
+    _commit_document_to_kb(document, output_file, label="網頁知識")
 
 
 def add_url(url: str, output_file: str):
@@ -2005,41 +1921,14 @@ def add_url(url: str, output_file: str):
     # 載入現有知識庫
     kb = load_knowledge_base(output_path)
 
-    # 處理網頁（會回傳 (chunks, url_name) 或 None）
-    result = process_url(url)
+    # 處理網頁
+    document = process_url_document(url)
 
-    if result is None:
+    if document is None:
         print("[ERROR] 無法從網頁提取內容，新增失敗")
         sys.exit(1)
 
-    new_chunks, url_name = result
-    doc_name = f"url_{url_name}"
-
-    # 檢查是否已存在同名文件
-    if doc_name in kb["metadata"]["documents"]:
-        print(f"[INFO] 更新現有網頁知識: {doc_name}")
-        kb["chunks"] = [c for c in kb["chunks"] if c["source"] != doc_name]
-        kb["metadata"]["documents"].remove(doc_name)
-    else:
-        print(f"[INFO] 新增網頁知識: {doc_name}")
-
-    print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
-
-    # 生成 embeddings
-    print(f"[INFO] 使用 {EMBEDDING_MODEL} 生成 embeddings...")
-    new_chunks = generate_embeddings(new_chunks)
-
-    # 為每個 chunk 生成唯一 ID
-    for chunk in new_chunks:
-        content_hash = hashlib.md5(chunk['content'].encode()).hexdigest()[:8]
-        chunk['id'] = f"{chunk['source']}::p{chunk['page']}::c{chunk['chunk_index']}::{content_hash}"
-
-    # Append 到知識庫
-    kb["chunks"].extend(new_chunks)
-    kb["metadata"]["documents"].append(doc_name)
-
-    # 儲存
-    save_knowledge_base(kb, output_path)
+    _commit_document_to_kb(document, output_file, label="網頁知識", kb=kb)
 
 
 # ============================================================
@@ -2088,63 +1977,13 @@ def interactive_technical_image(image_file: str, output_file: str):
 
 def _add_image_content_to_kb(image_path: Path, content: str, output_file: str):
     """將已分析的技術圖片內容加入知識庫（內部函式）"""
-    output_path = Path(output_file)
-
     # 自動快取分析結果
     cache_file = _save_to_cache(image_path.name, content, "image")
     if cache_file:
         print(f"[INFO] 快取已存: {cache_file}")
 
-    # 切分成 chunks
-    chunk_results = split_by_semantic_with_sections(content)
-    new_chunks = []
-    for i, chunk_data in enumerate(chunk_results):
-        chunk_type = detect_content_type(chunk_data["content"], 'diagram')
-        new_chunks.append({
-            "source": f"image_{image_path.name}",
-            "page": 1,
-            "chunk_index": i,
-            "content": chunk_data["content"],
-            "type": chunk_type,
-            "section": chunk_data["section"],
-            "heading_hierarchy": chunk_data.get("heading_hierarchy", ""),
-            **_retrieval_prefix_metadata(chunk_data),
-            "origin": "image"
-        })
-
-    if not new_chunks:
-        print("[WARN] 沒有提取到任何內容")
-        return
-
-    # 載入現有知識庫
-    kb = load_knowledge_base(output_path)
-    doc_name = f"image_{image_path.name}"
-
-    # 檢查是否已存在同名文件
-    if doc_name in kb["metadata"]["documents"]:
-        print(f"[INFO] 更新現有圖片知識: {doc_name}")
-        kb["chunks"] = [c for c in kb["chunks"] if c["source"] != doc_name]
-        kb["metadata"]["documents"].remove(doc_name)
-    else:
-        print(f"[INFO] 新增圖片知識: {doc_name}")
-
-    print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
-
-    # 生成 embeddings
-    print(f"[INFO] 使用 {EMBEDDING_MODEL} 生成 embeddings...")
-    new_chunks = generate_embeddings(new_chunks)
-
-    # 為每個 chunk 生成唯一 ID
-    for chunk in new_chunks:
-        content_hash = hashlib.md5(chunk['content'].encode()).hexdigest()[:8]
-        chunk['id'] = f"{chunk['source']}::p{chunk['page']}::c{chunk['chunk_index']}::{content_hash}"
-
-    # Append 到知識庫
-    kb["chunks"].extend(new_chunks)
-    kb["metadata"]["documents"].append(doc_name)
-
-    # 儲存
-    save_knowledge_base(kb, output_path)
+    document = build_image_document(image_path.name, content)
+    _commit_document_to_kb(document, output_file, label="圖片知識")
 
 
 def add_technical_image(image_file: str, output_file: str):
@@ -2165,40 +2004,12 @@ def add_technical_image(image_file: str, output_file: str):
     # 載入現有知識庫
     kb = load_knowledge_base(output_path)
 
-    # 檢查是否已存在同名文件（若有則先移除舊的）
-    doc_name = f"image_{image_path.name}"
-    if doc_name in kb["metadata"]["documents"]:
-        print(f"[INFO] 更新現有圖片知識: {doc_name}")
-        kb["chunks"] = [c for c in kb["chunks"] if c["source"] != doc_name]
-        kb["metadata"]["documents"].remove(doc_name)
-    else:
-        print(f"[INFO] 新增圖片知識: {doc_name}")
-
     # 處理圖片
     print(f"[INFO] 處理: {image_path.name}")
-    new_chunks = process_technical_image(str(image_path))
+    document = process_technical_image_document(str(image_path))
 
-    if not new_chunks:
-        print("[WARN] 沒有提取到任何內容")
+    if not _commit_document_to_kb(document, output_file, label="圖片知識", kb=kb):
         sys.exit(1)
-
-    print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
-
-    # 生成 embeddings
-    print(f"[INFO] 使用 {EMBEDDING_MODEL} 生成 embeddings...")
-    new_chunks = generate_embeddings(new_chunks)
-
-    # 為每個 chunk 生成唯一 ID
-    for chunk in new_chunks:
-        content_hash = hashlib.md5(chunk['content'].encode()).hexdigest()[:8]
-        chunk['id'] = f"{chunk['source']}::p{chunk['page']}::c{chunk['chunk_index']}::{content_hash}"
-
-    # Append 到知識庫
-    kb["chunks"].extend(new_chunks)
-    kb["metadata"]["documents"].append(doc_name)
-
-    # 儲存
-    save_knowledge_base(kb, output_path)
 
 
 # ============================================================
