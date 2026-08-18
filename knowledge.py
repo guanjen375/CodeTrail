@@ -1768,22 +1768,25 @@ English:"""
 
     def _rerank_with_model(self, question: str, candidates: list, top_k: int,
                            is_strict_mode: bool = False) -> list:
-        """使用專用 reranker 模型重排
+        """重排並保留 cross-encoder 分數，回 [(score, chunk), ...]。
 
-        P0 改進：
-        1. RERANKER_ALWAYS_ON = True 時預設啟用
-        2. 使用 RERANKER_TOP_N 控制 rerank 後取幾個
-        3. 嚴格模式下強制 rerank
+        分數會一路傳到 MMR 當 relevance。以前 rerank 完就把分數丟掉，MMR 再拿
+        `cosine(query, chunk_embedding)` 重算相關度——等於把 cross-encoder 的排序
+        整份蓋掉，reranker 實際上只剩「篩候選」的作用。實測（真實 spec）：
+        reranker 排第一的 chunk 被 MMR 直接降到第二、甚至剔除。
+
+        沒有走到 cross-encoder 的路徑（跳過 rerank、fallback）score 是 None，
+        MMR 會退回原本的 embedding 相關度。
         """
         if not candidates:
             return []
 
         if not USE_RERANKER or len(candidates) <= 1:
-            return [c.chunk for c in candidates[:top_k]]
+            return [(None, c.chunk) for c in candidates[:top_k]]
 
         # 條件觸發：判斷是否真的需要 rerank
         if not self._should_rerank(candidates, top_k, is_strict_mode):
-            return [c.chunk for c in candidates[:top_k]]
+            return [(None, c.chunk) for c in candidates[:top_k]]
 
         # Input pool and output count are separate.  RERANKER_TOP_N is the
         # final query cap; the cross-encoder must see a much wider pool so a
@@ -1813,16 +1816,18 @@ English:"""
                     raise RuntimeError(
                         f"reranker returned {len(scores)} scores for {len(items)} passages"
                     )
-                scored = [(scores[i], items[i].chunk) for i in range(len(items))]
+                scored = [(float(scores[i]), items[i].chunk) for i in range(len(items))]
                 scored.sort(reverse=True, key=lambda x: x[0])
-                return [c[1] for c in scored[:top_k]]
+                return scored[:top_k]
 
             except Exception as exc:
-                return self._rerank_fallback(
+                return [(None, chunk) for chunk in self._rerank_fallback(
                     question, candidates, top_k, f"dedicated reranker call failed: {exc}"
-                )
+                )]
 
-        return self._rerank_fallback(question, candidates, top_k, "dedicated reranker is not reachable")
+        return [(None, chunk) for chunk in self._rerank_fallback(
+            question, candidates, top_k, "dedicated reranker is not reachable"
+        )]
 
     def _rerank_with_llm(self, question: str, candidates: list, top_k: int) -> list:
         """LLM Reranking (fallback)"""
@@ -1876,21 +1881,49 @@ English:"""
 
         return [c.chunk for c in candidates[:top_k]]
 
-    def _mmr_select(self, chunks: list, question_emb: list, k: int, lambda_: float = MMR_LAMBDA) -> list:
+    @staticmethod
+    def _normalized_relevance(relevance: list | None) -> list | None:
+        """把 cross-encoder 分數壓到 [0, 1]，好跟餘弦的多樣性懲罰同量級。
+
+        reranker 回的是 logit，範圍不固定（可能是負的），直接跟 [0,1] 的餘弦
+        相減會讓 λ 失去意義。用候選池自己的 min-max：全部同分時一律給 1.0
+        （此時 MMR 退化成純多樣性，正是我們要的）。任何一項缺分數就整批放棄，
+        退回 embedding 相關度——半套的 relevance 比沒有更糟。
+        """
+        if not relevance or any(score is None for score in relevance):
+            return None
+        values = [float(score) for score in relevance]
+        low, high = min(values), max(values)
+        if high - low <= 1e-9:
+            return [1.0] * len(values)
+        span = high - low
+        return [(value - low) / span for value in values]
+
+    def _mmr_select(self, chunks: list, question_emb: list, k: int,
+                    lambda_: float = MMR_LAMBDA, relevance: list | None = None) -> list:
         """Max Marginal Relevance 選擇：平衡相關性與多樣性
 
-        改進：使用 numpy 加速向量運算（若可用）
+        `relevance` 是 cross-encoder 分數（跟 chunks 等長）。給了就用它當相關度，
+        embedding 只負責算多樣性懲罰——否則 rerank 的結果會被這一步整份蓋掉。
+        沒給就退回原本的 `cosine(query, chunk)`。
         """
-        if not chunks or not question_emb:
+        if not chunks:
+            return chunks[:k]
+
+        rel = self._normalized_relevance(relevance)
+        if rel is not None and len(rel) != len(chunks):
+            rel = None
+        if rel is None and not question_emb:
             return chunks[:k]
 
         # 嘗試使用 numpy 加速
         if HAS_NUMPY and len(chunks) > 3:
-            return self._mmr_select_numpy(chunks, question_emb, k, lambda_)
+            return self._mmr_select_numpy(chunks, question_emb, k, lambda_, rel)
 
         # Fallback：原始 Python 實作
         selected = []
         selected_embs = []
+        relevance_by_id = {id(c): rel[i] for i, c in enumerate(chunks)} if rel else {}
 
         for _ in range(min(k, len(chunks))):
             best, best_score = None, -float('inf')
@@ -1900,12 +1933,18 @@ English:"""
                     continue
 
                 c_emb = self._selection_vector(c)
-                if not c_emb:
+                if rel:
+                    sim_q = relevance_by_id.get(id(c), 0.0)
+                elif c_emb:
+                    sim_q = self._cosine_similarity(question_emb, c_emb)
+                else:
+                    sim_q = None
+
+                if sim_q is None:
                     mmr_score = -1
                 else:
-                    sim_q = self._cosine_similarity(question_emb, c_emb)
                     sim_rep = 0.0
-                    if selected_embs:
+                    if selected_embs and c_emb:
                         sim_rep = max(self._cosine_similarity(c_emb, e) for e in selected_embs)
                     mmr_score = lambda_ * sim_q - (1 - lambda_) * sim_rep
 
@@ -1922,17 +1961,21 @@ English:"""
 
         return selected
 
-    def _mmr_select_numpy(self, chunks: list, question_emb: list, k: int, lambda_: float) -> list:
+    def _mmr_select_numpy(self, chunks: list, question_emb: list, k: int, lambda_: float,
+                          relevance: list | None = None) -> list:
         """使用 numpy 加速的 MMR 選擇"""
         # 收集有效的 embeddings
         valid_chunks = []
         embeddings = []
+        valid_relevance = []
 
-        for c in chunks:
+        for index, c in enumerate(chunks):
             emb = self._selection_vector(c)
             if emb:
                 valid_chunks.append(c)
                 embeddings.append(emb)
+                if relevance is not None:
+                    valid_relevance.append(relevance[index])
 
         if not valid_chunks:
             return chunks[:k]
@@ -1948,8 +1991,11 @@ English:"""
         if q_norm > 0:
             q_vec = q_vec / q_norm
 
-        # 預計算與 query 的相似度
-        sim_to_query = np.dot(emb_matrix, q_vec)
+        # 相關度：有 cross-encoder 分數就用它，否則退回與 query 的餘弦。
+        if relevance is not None and len(valid_relevance) == len(valid_chunks):
+            sim_to_query = np.asarray(valid_relevance, dtype=np.float32)
+        else:
+            sim_to_query = np.dot(emb_matrix, q_vec)
 
         n = len(valid_chunks)
         selected_indices = []
@@ -2206,18 +2252,23 @@ English:"""
             rerank_output_k = min(
                 len(filtered), max(effective_top_k * 3, RERANKER_TOP_N * 2)
             )
-        reranked_chunks = self._rerank_with_model(
+        reranked = self._rerank_with_model(
             question,
             filtered,
             rerank_output_k,
             is_strict_mode=is_strict_mode,
         )
+        reranked_chunks = [chunk for _score, chunk in reranked]
         if not reranked_chunks:
             return "", "", empty_metadata
 
         if USE_MMR:
             q_emb = self._get_embedding(question)
-            top_chunks = self._mmr_select(reranked_chunks, q_emb, effective_top_k)
+            # cross-encoder 的分數一路帶到這裡當相關度；MMR 只負責多樣性懲罰。
+            top_chunks = self._mmr_select(
+                reranked_chunks, q_emb, effective_top_k,
+                relevance=[score for score, _chunk in reranked],
+            )
         else:
             top_chunks = reranked_chunks[:effective_top_k]
 

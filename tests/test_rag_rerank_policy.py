@@ -34,7 +34,7 @@ def test_knowledge_rerank_policy_embedding_does_not_call_main_model(monkeypatch,
 
     out = kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True)
 
-    assert out == [candidates[0].chunk, candidates[1].chunk]
+    assert [chunk for _score, chunk in out] == [candidates[0].chunk, candidates[1].chunk]
 
 
 def test_knowledge_rerank_policy_main_model_calls_llm(monkeypatch, tmp_path):
@@ -53,7 +53,9 @@ def test_knowledge_rerank_policy_main_model_calls_llm(monkeypatch, tmp_path):
 
     monkeypatch.setattr(kb, "_rerank_with_llm", fake_llm)
 
-    assert kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True) is sentinel
+    out = kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True)
+    assert [chunk for _score, chunk in out] == sentinel
+    assert called["value"] is True
     assert called["value"] is True
 
 
@@ -80,7 +82,7 @@ def test_knowledge_rerank_policy_embedding_handles_rerank_exception(monkeypatch,
 
     out = kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True)
 
-    assert out == [candidates[0].chunk, candidates[1].chunk]
+    assert [chunk for _score, chunk in out] == [candidates[0].chunk, candidates[1].chunk]
 
 
 def _code_candidates():

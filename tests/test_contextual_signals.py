@@ -468,7 +468,8 @@ def test_metadata_top_emb_score_is_the_gate_score(tmp_path: Path, monkeypatch):
     kb = KnowledgeBase(str(path))
     _go_offline(kb, monkeypatch)
     monkeypatch.setattr(
-        kb, "_rerank_with_model", lambda _q, candidates, _k, **_kw: [c.chunk for c in candidates]
+        kb, "_rerank_with_model",
+        lambda _q, candidates, _k, **_kw: [(None, c.chunk) for c in candidates],
     )
 
     _model, _display, meta = kb.query("CTRL 規格是什麼")
@@ -512,7 +513,8 @@ def test_ctx_never_reaches_ref_text_or_retrieved_chunks(tmp_path: Path, monkeypa
     kb = KnowledgeBase(str(path))
     _go_offline(kb, monkeypatch)
     monkeypatch.setattr(
-        kb, "_rerank_with_model", lambda _q, candidates, _k, **_kw: [c.chunk for c in candidates]
+        kb, "_rerank_with_model",
+        lambda _q, candidates, _k, **_kw: [(None, c.chunk) for c in candidates],
     )
 
     model_output, display_output, meta = kb.query("CTRL 重置值")
@@ -684,7 +686,8 @@ def test_is_high_risk_is_computed_from_gate_scores(tmp_path: Path, monkeypatch):
     kb = KnowledgeBase(str(path))
     _go_offline(kb, monkeypatch)
     monkeypatch.setattr(
-        kb, "_rerank_with_model", lambda _q, candidates, _k, **_kw: [c.chunk for c in candidates]
+        kb, "_rerank_with_model",
+        lambda _q, candidates, _k, **_kw: [(None, c.chunk) for c in candidates],
     )
 
     _model, _display, meta = kb.query("CTRL 重置值是什麼")

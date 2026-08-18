@@ -67,7 +67,7 @@ def _kb_with(monkeypatch, tmp_path: Path, chunk: dict) -> knowledge.KnowledgeBas
     )
     monkeypatch.setattr(
         kb, "_rerank_with_model",
-        lambda _q, candidates, _top_k, **_kw: [c.chunk for c in candidates],
+        lambda _q, candidates, _top_k, **_kw: [(None, c.chunk) for c in candidates],
     )
     monkeypatch.setattr(kb, "_get_embedding", lambda _t: [0.0, 1.0])
     monkeypatch.setattr(knowledge, "USE_MMR", False)

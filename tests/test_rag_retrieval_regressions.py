@@ -76,7 +76,7 @@ def test_exact_literal_bm25_candidate_survives_dense_threshold(monkeypatch, tmp_
     monkeypatch.setattr(
         kb,
         "_rerank_with_model",
-        lambda _q, candidates, _top_k, **_kw: [c.chunk for c in candidates],
+        lambda _q, candidates, _top_k, **_kw: [(None, c.chunk) for c in candidates],
     )
     monkeypatch.setattr(kb, "_get_embedding", lambda _text: [1.0, 0.0])
     monkeypatch.setattr(knowledge, "USE_MMR", False)
@@ -126,7 +126,7 @@ def test_reranker_sees_full_pool_and_late_passage_text(monkeypatch, tmp_path: Pa
 
     assert len(captured) == 30
     assert any("LATE_NUMERIC_FACT_0xBEEF" in doc for doc in captured)
-    assert results[0]["id"] == "20"
+    assert results[0][1]["id"] == "20"
 
 
 def test_strict_rerank_is_not_skipped_when_candidates_fit_output_pool(monkeypatch, tmp_path: Path):

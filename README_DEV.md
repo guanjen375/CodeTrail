@@ -56,6 +56,7 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 - `tests/test_mcp_root_safety.py` — `root_safety.validate_aicode_root` 拒絕 `/` / `$HOME` /不存在的 root,並守住 mcp_server 真的有接上去
 - `tests/test_index_scope.py` — 索引範圍:三態走訪 ≡ `should_index_file` 的不變式、rescue 四測、Layer C loader fail-loud(schema/權限/pattern 衛生)、matcher 方言向量、symlink containment、快取 fingerprint 遷移、`index_stats` root 驗證;全部離線且用合成樹名
 - `tests/test_mcp_smoke.py` — MCP server stdio 啟動與基本 tool 呼叫
+- `tests/test_rerank_mmr_relevance.py` — MMR 不得蓋掉 cross-encoder 排序:rerank 分數當相關度、embedding 只算多樣性懲罰、min-max 正規化、半套 relevance 退回舊行為、跳過 rerank 時無分數;離線
 - `tests/test_contextual_signals.py` — 雙訊號不變式:ctx 不進 evidence/REF/strict 來源、六個決策點逐一讀 gate、`_should_rerank` 三分支、merge 聚合 gate、lexical bypass 走 gate BM25、雙矩陣儲存與 required-schema 對照、旗標四象限;離線
 - `tests/test_context_generation.py` — 生成端:loopback 雙棧判定、非 loopback 需顯式同意、3xx/HTTP 錯當傳輸失敗、環境 proxy 隔離、快取檔名/權限/symlink 逃逸、write-through 與零呼叫冪等、指紋涵蓋模型檔 size+mtime、single-writer 鎖、窗公式含 `RESERVED_OUTPUT_TOKENS`、map/reduce 路徑、空回應重試一次、覆蓋率閘;HTTP 全 mock,離線
 - `tests/test_extracted_document.py` — `ExtractedDocument` 單一真相:章節 span 連續性、重複標題各自成節、chunk 的 char span 定位、PDF 頁 span/跨頁 page_range、「短頁被歸到上一頁章節」回歸、五個入口的 chunk 形狀一致;離線且用合成語料
@@ -398,6 +399,22 @@ schema 版本)寫進 `.code_rag_cache_meta.json`。
   return),整個 MCP process 會一路用缺 embedding 的索引降級下去。回歸鎖:
   `test_backfill_failure_leaves_no_partial_index`。
 - scope 熱重載是另案;改了設定要重啟 MCP server。
+
+### Reranker 與 MMR 的分工
+
+`USE_MMR` 預設開著。以前的順序是「rerank 排好 → MMR 用 `cosine(query, chunk)` 重算
+相關度」,等於把 cross-encoder 的結果整份丟掉——reranker 實際上只剩「篩候選」的作用。
+真實 spec 上重現過:reranker 排第一的 chunk 被 MMR 直接剔除,換上一段雜訊。
+
+現在 `_rerank_with_model` 回 `[(score, chunk), ...]`,分數一路帶到 `_mmr_select` 當
+相關度(min-max 正規化到 [0,1],才跟餘弦的多樣性懲罰同量級),embedding 只負責算
+多樣性懲罰。**沒有走到 cross-encoder 的路徑**(跳過 rerank、reranker 不可用而
+fallback)分數是 None,MMR 退回原本的 embedding 相關度,那條路徑行為不變。
+
+實務效果(8 題真題):`PASS 畫面截圖如下：`、章首導言這類雜訊 chunk 被換成真正的
+章節;`1.6.4 測試結果是什麼` 這種指名章節的查詢終於撈得到 1.6.4。
+
+---
 
 ### Contextual Retrieval(chunk 級生成脈絡)
 
