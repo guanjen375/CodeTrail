@@ -34,9 +34,10 @@ staleness(§7.5):每次 graph query 先比對 §5-3 的掃描快照(與 code_rag
 共用同一 TTL 快照)與 files.content_hash,不符就同步跑增量 transaction
 (stderr 一行)再回答。graph 不是「只建一次」。
 
-已知限制(capability):增量只重抽「變更檔 + includes/imports 直接指向它的
-1-hop 反向依賴檔」;未變檔案裡的 unresolved call 不會因為別的檔新增了同名
-函式而自動 resolve(整體 rebuild 會)。
+增量範圍:「變更檔 + includes/imports 直接指向它的 1-hop 反向依賴檔 +
+callable catalog delta 的同名 caller 檔」。第三類讓同名函式的增刪(unique↔
+ambiguous、unresolved↔resolved)也會把呼叫端一併重 resolve,增量結果與
+整體 rebuild 對 call edges 的判定一致。
 """
 from __future__ import annotations
 
@@ -367,21 +368,27 @@ class CodeGraph:
     def _parser_versions(self) -> str:
         """抽取能力指紋:進 index_metadata,ensure_fresh 比對不符 → full rebuild。
 
-        涵蓋 tree-sitter 版本、c/cpp grammar 是否實際可載入、`.h` 語言模式
-        (審核 #6):安裝 grammar / 升級 parser / 改 AICODE_H_LANG 之後,舊的
-        degraded graph 不得永久沿用。
+        涵蓋 tree-sitter core 與 c/cpp grammar 三個 distribution 的**實際版本**
+        (importlib.metadata;grammar 是獨立釘版套件,「可載入」布林分不出
+        版本升級,審核二輪 #5)、grammar 可載入性(裝了但 ABI 不相容也要能
+        區分)、`.h` 語言模式:任一變動,舊 graph 都不得沿用。
         """
-        try:
-            import tree_sitter
+        import importlib.metadata as _im
 
-            ts = getattr(tree_sitter, "__version__", "?")
-        except ImportError:
-            ts = "absent"
+        def _dist(name: str) -> str:
+            try:
+                return _im.version(name)
+            except _im.PackageNotFoundError:
+                return "absent"
+
         c_ok = bool(HAS_TREE_SITTER and _try_load_tree_sitter_language("c"))
         cpp_ok = bool(HAS_TREE_SITTER and _try_load_tree_sitter_language("cpp"))
         return (
             f"python-ast:{sys.version_info.major}.{sys.version_info.minor};"
-            f"tree-sitter:{ts};c:{int(c_ok)};cpp:{int(cpp_ok)};h:{_h_ext_lang()}"
+            f"tree-sitter:{_dist('tree-sitter')};"
+            f"c:{_dist('tree-sitter-c')}:{int(c_ok)};"
+            f"cpp:{_dist('tree-sitter-cpp')}:{int(cpp_ok)};"
+            f"h:{_h_ext_lang()}"
         )
 
     # -------- 抽取單檔 --------
@@ -681,13 +688,16 @@ class CodeGraph:
         return True
 
     def ensure_fresh(self) -> None:
-        """graph query 前置(明確的 lazy-build 契約,與文件/測試統一;審核 #8):
+        """graph query 前置(§2 失效矩陣:缺 / 損壞 / schema 不符 → 明確錯誤):
 
-        - 檔不存在 → **當場自動建置**(首次 graph 查詢會付一次 build 成本);
-        - 檔存在但損壞 / schema 不符 → CodeGraphError(不砍不蓋,semantic 不受影響);
-        - scope fingerprint 或 parser 能力指紋(tree-sitter/grammar/AICODE_H_LANG)
-          變了 → full rebuild;
-        - 檔案 hash 落後 → 同步增量後回答。
+        - 檔不存在 → CodeGraphError,訊息載明建立命令(semantic 不受影響)。
+          graph **不做隱式 lazy build**:首次建置是顯式維運動作
+          (`python code_graph.py --root <AICODE_ROOT>`),查詢不得靜默付
+          全量建置成本 —— 這是施工單 §2 的契約,不是實作偏好。
+        - 檔存在但損壞 / schema 不符 → CodeGraphError(不砍不蓋)。
+        - scope fingerprint 或 parser 能力指紋(tree-sitter/grammar 版本/
+          AICODE_H_LANG)變了 → full rebuild;
+        - 檔案 hash 落後 → 同步增量後回答(§7.5;前提是 graph 已存在)。
         """
         if not self._db_ready():
             if self.db_file.exists():
@@ -695,9 +705,11 @@ class CodeGraph:
                     "code graph 存在但 schema 不符或損壞;砍掉 "
                     f"{self.db_file.name} 後重建(mode='semantic' 不受影響)"
                 )
-            # 首次:直接建
-            self.build(verbose=False)
-            return
+            raise CodeGraphError(
+                "code graph 尚未建立(mode='semantic' 不受影響)。"
+                f"建立方式:在終端跑 `python {Path(__file__).name} --root <AICODE_ROOT>`"
+                "(建好之後查詢會自動偵測變更做增量,不必重跑)"
+            )
 
         files = self._scan_files()
         conn = self._connect()
@@ -734,7 +746,14 @@ class CodeGraph:
         self._incremental_update(files, changed, deleted)
 
     def _incremental_update(self, files: dict, changed: list[str], deleted: list[str]) -> None:
-        """單一 transaction 涵蓋「變更檔 + 1-hop 反向依賴檔」的 delete+insert。"""
+        """單一 transaction 涵蓋「變更檔 + 1-hop 反向依賴檔 + 同名 caller 檔」
+        的 delete+insert。
+
+        「同名 caller 檔」(審核二輪 #1):受影響檔的 callable 名稱集合有增刪
+        時,呼叫這些名稱的檔案即使自身沒變,其 call edges 的解析結果也可能
+        改變(unique→ambiguous、ambiguous→unique、unresolved→resolved),
+        必須一併重抽重 resolve,否則會留下錯誤的「確定呼叫」。
+        """
         lock_fd = fs_safety.acquire_file_lock(self.lock_file, self.root)
         try:
             conn = self._connect()
@@ -749,21 +768,67 @@ class CodeGraph:
                         sorted(dirty),
                     )
                 }
-                affected = sorted((dirty | reverse) & (set(files) | set(deleted)))
-                re_extract = [rel for rel in affected if rel in files]
+                affected = set((dirty | reverse) & (set(files) | set(deleted)))
 
-                file_rows, node_rows, relations = [], [], {}
-                for rel in re_extract:
-                    extracted = self._extract_file(
-                        rel, files[rel]["filepath"], files[rel]["hash"])
-                    if extracted is None:
-                        continue
-                    row, nodes, rel_relations = extracted
-                    file_rows.append(row)
-                    node_rows.extend(nodes)
-                    relations[rel] = rel_relations
+                def _extract_batch(rels: list[str]):
+                    rows, nodes_acc, rels_acc = [], [], {}
+                    for rel in rels:
+                        extracted = self._extract_file(
+                            rel, files[rel]["filepath"], files[rel]["hash"])
+                        if extracted is None:
+                            continue
+                        row, nodes, rel_relations = extracted
+                        rows.append(row)
+                        nodes_acc.extend(nodes)
+                        rels_acc[rel] = rel_relations
+                    return rows, nodes_acc, rels_acc
 
-                all_dirty = sorted(set(affected))
+                re_extract = sorted(rel for rel in affected if rel in files)
+                file_rows, node_rows, relations = _extract_batch(re_extract)
+
+                # callable catalog delta:受影響檔的 callable 名稱(DB 舊的 ∪
+                # 重抽出的新的)。這些名稱的可解析目標集合可能改變 → 找出
+                # 全 DB 呼叫這些名稱的 caller 檔,一併重抽。
+                aff_ph = ",".join("?" * len(affected)) or "''"
+                delta_names: set[str] = set()
+                for row in conn.execute(
+                    f"SELECT name, qualified_name FROM nodes"
+                    f" WHERE kind IN ('function','method') AND path IN ({aff_ph})",
+                    sorted(affected),
+                ):
+                    delta_names.update(row)
+                for nrow in node_rows:
+                    if nrow[2] in _CALLABLE_KINDS:
+                        delta_names.update((nrow[3], nrow[4]))
+                delta_names.discard(None)
+
+                if delta_names:
+                    name_ph = ",".join("?" * len(delta_names))
+                    sorted_delta = sorted(delta_names)
+                    caller_files = {
+                        row[0] for row in conn.execute(
+                            f"""
+                            SELECT DISTINCT evidence_path FROM edges
+                            WHERE type='calls' AND (
+                                unresolved_target IN ({name_ph})
+                                OR dst_id IN (SELECT id FROM nodes
+                                              WHERE name IN ({name_ph})
+                                                 OR qualified_name IN ({name_ph}))
+                            )
+                            """,
+                            sorted_delta * 3,
+                        )
+                    }
+                    extra_callers = sorted(
+                        (caller_files & set(files)) - affected)
+                    if extra_callers:
+                        affected.update(extra_callers)
+                        more_rows, more_nodes, more_relations = _extract_batch(extra_callers)
+                        file_rows.extend(more_rows)
+                        node_rows.extend(more_nodes)
+                        relations.update(more_relations)
+
+                all_dirty = sorted(affected)
                 ph = ",".join("?" * len(all_dirty))
 
                 # 重抽檔的 call resolve 必須看得到「未受影響檔案」的既有
@@ -1152,3 +1217,31 @@ class CodeGraph:
 
     def close(self) -> None:
         """目前連線都是 per-query 開關;保留此 API 供呼叫端對稱使用。"""
+
+
+def _cli(argv: list[str]) -> int:
+    """顯式建圖入口(§2:graph 缺席時查詢 fail-loud,首次建置走這裡)。
+
+    用法:python code_graph.py --root <AICODE_ROOT>
+    冪等:已存在就 in-place rebuild(§7.5)。
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Build the CodeTrail code graph")
+    parser.add_argument("--root", required=True, help="專案根目錄(AICODE_ROOT)")
+    args = parser.parse_args(argv)
+    root = Path(args.root).resolve()
+    if not root.is_dir():
+        print(f"[CODE_GRAPH] root 不是目錄: {root}", file=sys.stderr)
+        return 2
+    graph = CodeGraph(str(root))
+    graph.build(verbose=True)
+    with graph._read_snapshot() as conn:
+        nodes = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        edges = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+    print(f"[CODE_GRAPH] done: {nodes} nodes, {edges} edges -> {graph.db_file}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_cli(sys.argv[1:]))

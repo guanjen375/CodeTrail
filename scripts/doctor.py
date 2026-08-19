@@ -209,7 +209,7 @@ def check_endpoint_policy(r: Result) -> None:
         url = getattr(cfg, attr, "") or ""
         host = urlparse(url).hostname or ""
         if url and not endpoint_policy.is_loopback_host(host):
-            remote.append((role, url))
+            remote.append((role, endpoint_policy.redact_url(url)))
 
     if remote:
         opted_in = os.environ.get(
@@ -242,8 +242,8 @@ def check_endpoint_policy(r: Result) -> None:
             and not bool(getattr(cfg, "KB_CONTEXT_REMOTE_OK", False))
         ):
             r.fail(
-                f"KB_CONTEXT_GENERATE 開啟且 main={main_url} 非 loopback,"
-                f"但未設 {endpoint_policy.KB_CONTEXT_REMOTE_OK_ENV}=1;"
+                f"KB_CONTEXT_GENERATE 開啟且 main={endpoint_policy.redact_url(main_url)} "
+                f"非 loopback,但未設 {endpoint_policy.KB_CONTEXT_REMOTE_OK_ENV}=1;"
                 "chunk 脈絡生成會 fail-loud"
             )
 

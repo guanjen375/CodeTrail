@@ -570,3 +570,96 @@ def test_relative_from_import_alias_resolves(tmp_path):
     g = CodeGraph(str(tmp_path))
     g.build()
     assert g.file_includes("pkg/app.py") == ["pkg/util.py"]
+
+
+# ============================================================
+# GPT 審核二輪修正的回歸測試(2026-08-19)
+# ============================================================
+def test_incremental_unique_to_ambiguous_updates_existing_caller(tmp_path):
+    """審核二輪 #1:新增同名函式後,未變的 caller 檔必須重 resolve 成歧義。"""
+    (tmp_path / "lib_a.py").write_text(
+        "def foo():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "caller.py").write_text(
+        "def run():\n    return foo()\n", encoding="utf-8")
+    g = CodeGraph(str(tmp_path))
+    g.build()
+    edges = g.callees("run")
+    assert len(edges) == 1 and edges[0]["resolved"], "起點:唯一定義 → resolved"
+
+    # 新增另一個同名定義;caller.py 本身完全沒變
+    (tmp_path / "lib_b.py").write_text(
+        "def foo():\n    return 2\n", encoding="utf-8")
+    code_rag.invalidate_scan_cache(tmp_path)
+    g.ensure_fresh()
+
+    edges = g.callees("run")
+    assert len(edges) == 2, "同一 call site 應變成兩列歧義候選"
+    assert all(e["resolved"] is False for e in edges), (
+        "unique→ambiguous:舊的『確定呼叫』必須被重判成歧義")
+    groups = {e["ambiguity_group"] for e in edges}
+    assert len(groups) == 1 and None not in groups
+
+    paths = g.shortest_evidence_paths({"run"}, {"foo"})
+    assert paths == [], "歧義後不得再出現確定呼叫鏈"
+
+
+def test_incremental_ambiguous_to_unique_updates_existing_caller(tmp_path):
+    """審核二輪 #1 反向:刪掉一個同名定義後,歧義要收斂回 resolved。"""
+    (tmp_path / "lib_a.py").write_text(
+        "def foo():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "lib_b.py").write_text(
+        "def foo():\n    return 2\n", encoding="utf-8")
+    (tmp_path / "caller.py").write_text(
+        "def run():\n    return foo()\n", encoding="utf-8")
+    g = CodeGraph(str(tmp_path))
+    g.build()
+    assert all(not e["resolved"] for e in g.callees("run")), "起點:歧義"
+
+    (tmp_path / "lib_b.py").unlink()
+    code_rag.invalidate_scan_cache(tmp_path)
+    g.ensure_fresh()
+
+    edges = g.callees("run")
+    assert len(edges) == 1, "歧義收斂後同一 call site 只剩一列"
+    assert edges[0]["resolved"] is True
+    assert edges[0]["dst_name"] == "foo"
+    assert g.shortest_evidence_paths({"run"}, {"foo"}), "收斂後呼叫鏈恢復可用"
+
+
+def test_missing_graph_raises_with_build_command(tmp_path):
+    """審核二輪 #3:graph 未建立 → CodeGraphError(訊息含 CLI 建立命令),
+    不做隱式 build、不留任何 graph 檔。"""
+    _write_py_repo(tmp_path)
+    g = CodeGraph(str(tmp_path))
+    with pytest.raises(CodeGraphError, match=r"code_graph\.py --root"):
+        g.ensure_fresh()
+    assert not g.db_file.exists(), "fail-loud 路徑不得偷偷建檔"
+
+
+def test_cli_builds_graph_and_is_idempotent(tmp_path):
+    """顯式建圖入口:python code_graph.py --root <root>;重跑=in-place rebuild。"""
+    _write_py_repo(tmp_path)
+    script = REPO_ROOT / "code_graph.py"
+    for _ in range(2):
+        proc = subprocess.run(
+            [sys.executable, str(script), "--root", str(tmp_path)],
+            capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr
+        assert "done:" in proc.stdout
+    g = CodeGraph(str(tmp_path))
+    g.ensure_fresh()  # 建好之後不得再拋
+    assert g.find_nodes("entry")
+
+
+def test_parser_fingerprint_includes_grammar_distribution_versions():
+    """審核二輪 #5:指紋要含三個 distribution 的實際版本,不是可載入布林。"""
+    import importlib.metadata as _im
+
+    g = CodeGraph.__new__(CodeGraph)
+    fp = CodeGraph._parser_versions(g)
+    for dist in ("tree-sitter", "tree-sitter-c", "tree-sitter-cpp"):
+        try:
+            version = _im.version(dist)
+        except _im.PackageNotFoundError:
+            version = "absent"
+        assert version in fp, f"指紋缺 {dist} 版本({version}): {fp}"

@@ -305,3 +305,47 @@ def test_probe_log_redacts_credentials(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "topsecret" not in err
     assert "127.0.0.1" in err
+
+
+def test_policy_error_redacts_credentials_without_opt_in(monkeypatch):
+    """審核二輪 #2:真正的洩漏路徑 —— 未 opt-in 時 policy 例外不得帶密碼。"""
+    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+    with pytest.raises(endpoint_policy.EndpointPolicyError) as exc:
+        endpoint_policy.ensure_allowed("http://user:secret@10.0.0.5:8080/v1", "model")
+    message = str(exc.value)
+    assert "secret" not in message and "user:" not in message
+    assert "10.0.0.5:8080" in message, "host:port 要保留供診斷"
+
+    monkeypatch.setattr(config, "KB_CONTEXT_REMOTE_OK", False)
+    with pytest.raises(endpoint_policy.EndpointPolicyError) as exc:
+        endpoint_policy.ensure_allowed("http://user:secret@10.0.0.5:8080", "kb_context")
+    assert "secret" not in str(exc.value)
+
+
+def test_prompt_call_policy_rejection_has_no_credentials(monkeypatch):
+    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+
+    class _Bomb:
+        def __getattr__(self, name):
+            raise AssertionError("policy 必須在任何 HTTP 動作之前 raise")
+
+    monkeypatch.setattr(llama_client, "get_session", lambda: _Bomb())
+    with pytest.raises(endpoint_policy.EndpointPolicyError) as exc:
+        llama_client.embed_one(
+            base_url="http://user:secret@10.0.0.5:8081", content="x")
+    assert "secret" not in str(exc.value)
+
+
+def test_probe_stderr_has_no_credentials_without_opt_in(monkeypatch, capsys):
+    """probe 吞 policy 例外回 None 的 stderr 也不得帶密碼(exc 本身已 redact)。"""
+    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+    assert llama_client.get_health("http://user:secret@10.0.0.5:8080") is None
+    err = capsys.readouterr().err
+    assert "secret" not in err and "user:" not in err
+    assert "10.0.0.5" in err
+
+
+def test_redact_url_helper():
+    assert endpoint_policy.redact_url("http://u:p@h:1/x?q=1") == "http://h:1/x?q=1"
+    assert endpoint_policy.redact_url("http://h:1/x") == "http://h:1/x"
+    assert endpoint_policy.redact_url("not a url") == "not a url"

@@ -637,7 +637,7 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 把呼叫鏈每一步的檔案與行號列出來。
 ```
 
-graph 對 C/C++(tree-sitter)與 Python 抽 definitions / includes / calls,查詢時自動偵測檔案變更做增量更新;function pointer 與 macro 間接呼叫會誠實回報 unresolved。細節見 [docs/mcp-tools.md](docs/mcp-tools.md)。
+graph 對 C/C++(tree-sitter)與 Python 抽 definitions / includes / calls。首次建置要在專案目錄跑一次 `python <CODETRAIL_REPO>/code_graph.py --root <AICODE_ROOT>`(沒建就用 graph 模式會明確報錯;語意搜尋不受影響);建好之後查詢自動偵測檔案變更做增量更新。function pointer 與 macro 間接呼叫會誠實回報 unresolved。細節見 [docs/mcp-tools.md](docs/mcp-tools.md)。
 
 想把**圖片**(截圖、架構圖、規格頁掃描)變成之後查得到的知識,就是「VL + RAG 一起用」—— `ingest_document` 餵圖片時會自動走 VL 把圖抽成文字再進 RAG,跟 PDF 走同一套:
 

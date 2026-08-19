@@ -54,6 +54,13 @@ def mcp_module(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(mcp_server.CODE_RAG, "_get_embedding", lambda _t: [1.0, 0.0])
     monkeypatch.setattr(mcp_server.CODE_RAG, "_embed_texts_batched",
                         lambda texts: [[1.0, 0.0]] * len(texts))
+
+    # graph 首次建置是顯式動作(§2:未建置時 graph 模式 fail-loud);
+    # 測試模擬使用者已跑過 `python code_graph.py --root <root>`。
+    import code_graph as _code_graph
+
+    _code_graph.CodeGraph(str(tmp_path)).build()
+
     yield mcp_server
     sys.modules.pop("mcp_server", None)
     code_rag._INDEX_SCAN_CACHE.clear()
@@ -240,3 +247,61 @@ def test_cap_holds_for_neighbors_lists(mcp_module):
     }
     capped = mcp_module._cap_graph_response(resp)
     assert len(json.dumps(capped, ensure_ascii=False)) <= mcp_module._GRAPH_RESPONSE_MAX_CHARS
+
+
+def test_missing_graph_fails_loud_with_build_command(mcp_module, tmp_path):
+    """審核二輪 #3:graph 缺席時 neighbors/path 依施工單 §2 明確報錯
+    (不做隱式 lazy build),錯誤訊息含建立命令;semantic 不受影響。"""
+    import code_graph
+
+    for suffix in ("", "-wal", "-shm"):
+        p = tmp_path / f".code_rag_graph.sqlite3{suffix}"
+        if p.exists():
+            p.unlink()
+    mcp_module._CODE_GRAPH = None
+
+    with pytest.raises(code_graph.CodeGraphError, match="code_graph.py --root"):
+        mcp_module.code_rag_search("entry", mode="neighbors")
+    with pytest.raises(code_graph.CodeGraphError, match="尚未建立"):
+        mcp_module.code_rag_search("entry -> helper", mode="path")
+
+    # 缺席期間不得偷偷建出 graph 檔
+    assert not (tmp_path / ".code_rag_graph.sqlite3").exists()
+
+    # semantic 完全不受影響(預設 shape)
+    results = mcp_module.code_rag_search("entry")
+    assert results and all(not (set(r) & EVIDENCE_KEYS) for r in results)
+
+    # evidence 模式:graph_status 揭露 unavailable,不 raise
+    results = mcp_module.code_rag_search("entry", include_evidence=True)
+    assert all(r["graph_status"].startswith("unavailable") for r in results)
+
+
+def test_cap_is_hard_even_with_huge_echo_fields(mcp_module):
+    """審核二輪 #4:超長 query(echo 欄位)也不能撐爆 8000 cap。"""
+    import json
+
+    huge = "q" * 100_000
+    resp = {
+        "mode": "path", "src": mcp_module._echo(huge), "dst": mcp_module._echo(huge),
+        "paths": [], "graph_status": "ok",
+    }
+    capped = mcp_module._cap_graph_response(resp)
+    assert len(json.dumps(capped, ensure_ascii=False)) <= mcp_module._GRAPH_RESPONSE_MAX_CHARS
+    # echo 欄位在組 resp 時就截斷
+    assert len(capped.get("src", "")) <= mcp_module._GRAPH_ECHO_MAX_CHARS + 1
+
+
+def test_cap_falls_back_to_minimal_when_lists_exhausted(mcp_module):
+    """裁光清單仍超限(病態固定欄位)→ 回 minimal 物件,絕不回傳超限內容。"""
+    import json
+
+    resp = {
+        "mode": "neighbors",
+        "pathological_fixed_field": "x" * 20_000,  # 不在可裁清單內
+        "edges": [{"e": 1}],
+        "graph_status": "ok",
+    }
+    capped = mcp_module._cap_graph_response(resp)
+    assert len(json.dumps(capped, ensure_ascii=False)) <= mcp_module._GRAPH_RESPONSE_MAX_CHARS
+    assert "error" in capped and capped["truncated"] is True

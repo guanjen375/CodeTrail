@@ -37,8 +37,9 @@
 - 只有「規格數值答錯比不答更糟」的問題才升級用 `codetrail_query_knowledge_strict`(它占用主模型算力,慢,平常不要用)。
 
 ## 程式碼關係(call / include)查詢
-- 問「誰呼叫 X」「X 到 Y 的呼叫鏈」「這個檔 include 了誰」時,用 `codetrail_code_rag_search` 的 graph 模式:`mode="neighbors"`(query 放 symbol 名)看 1–2 hop 關係;`mode="path"`(query 寫 `"SRC -> DST"`)拿呼叫鏈。回傳每一步都附 `檔:行` 證據,引用時照著標,不要憑記憶補呼叫關係。
-- 回傳標 unresolved 的邊(function pointer / macro 間接呼叫)就回答「靜態解析不到目標」,不要自己腦補它會呼叫誰。
+- 問「誰呼叫 X」「X 到 Y 的呼叫鏈」時,用 `codetrail_code_rag_search` 的 graph 模式:`mode="neighbors"`(query 放 symbol 名)看 1–2 hop 呼叫關係;`mode="path"`(query 寫 `"SRC -> DST"`)拿呼叫鏈。問「這個檔 include / import 了誰」時,`mode="neighbors"` 的 query 改放 **repo 相對檔案路徑**(例如 `src/uart.c`)。回傳每一步都附 `檔:行` 證據,引用時照著標,不要憑記憶補呼叫關係。
+- 回傳標 unresolved 的邊(function pointer / macro 間接呼叫)就回答「靜態解析不到目標」;標 ambiguity(同名多定義的候選)就列出候選並明講無法確定,不要自己腦補或挑一個當定論。
+- graph 模式報「code graph 尚未建立」時,把錯誤訊息裡的建立命令轉告使用者(要在終端跑一次),不要改用猜的;語意搜尋(預設 mode)不受影響照常可用。
 
 ## 不要鬼打牆(最重要)
 - 同一個問題最多問一次。使用者已經回答過、或回答後你仍無法判定時,**不要再用同樣或換句話的方式重問**。

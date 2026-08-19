@@ -24,17 +24,8 @@ import endpoint_policy
 from http_client import get_session
 
 
-def _redact_url(url: str) -> str:
-    """去掉 URL 內嵌的 credentials(user:pass@)再進錯誤訊息 / log。"""
-    from urllib.parse import urlsplit, urlunsplit
-
-    parts = urlsplit(url)
-    if not (parts.username or parts.password):
-        return url
-    netloc = parts.hostname or ""
-    if parts.port:
-        netloc += f":{parts.port}"
-    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+# credentials 遮蔽集中在 endpoint_policy(policy 錯誤本身也要乾淨,見該處)
+_redact_url = endpoint_policy.redact_url
 
 
 def _ensure_allowed(url: str) -> None:

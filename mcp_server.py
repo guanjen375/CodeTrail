@@ -537,7 +537,8 @@ def _get_code_graph():
 
 
 def _graph_for_query():
-    """graph query 前置:staleness 同步(§7.5);缺/壞 → 明確錯誤往上拋。"""
+    """graph query 前置:staleness 同步(§7.5);尚未建立/損壞 → 明確錯誤
+    往上拋(§2;首次建置走 `python code_graph.py --root <AICODE_ROOT>`)。"""
     graph = _get_code_graph()
     graph.ensure_fresh()
     return graph
@@ -546,11 +547,22 @@ def _graph_for_query():
 _GRAPH_RESPONSE_MAX_CHARS = 8000
 
 
-def _cap_graph_response(resp: dict) -> dict:
-    """全回應 ≤8000 chars,對所有可裁清單(paths / edges / nodes / files)成立。
+_GRAPH_ECHO_MAX_CHARS = 300
 
-    truncation metadata **先**加入再裁(審核 #9:metadata 加入後才量測會
-    再次超限),裁序 paths → edges → nodes → files,每輪重量測到符合為止。
+
+def _echo(text: str) -> str:
+    """回應內 echo 使用者輸入的欄位(query/src/dst)先截斷:cap 是對整體
+    回應的硬上限,不能被一個超長 query 撐爆(審核二輪 #4)。"""
+    text = str(text)
+    return text if len(text) <= _GRAPH_ECHO_MAX_CHARS else text[:_GRAPH_ECHO_MAX_CHARS] + "…"
+
+
+def _cap_graph_response(resp: dict) -> dict:
+    """全回應 ≤8000 chars 的**硬上限**。
+
+    truncation metadata 先加入再量測;裁序 paths → edges → nodes → files →
+    anchors,每輪重量測。全部清單裁空後仍超限(理論上只剩截斷過的固定欄位,
+    不應發生)→ 回 minimal 錯誤物件,絕不回傳超限內容。
     """
     import json as _json
 
@@ -560,8 +572,8 @@ def _cap_graph_response(resp: dict) -> dict:
     if _size() <= _GRAPH_RESPONSE_MAX_CHARS:
         return resp
 
-    lists = [k for k in ("paths", "edges", "nodes", "files") if resp.get(k)]
-    totals = {k: len(resp[k]) for k in lists}
+    trim_keys = ("paths", "edges", "nodes", "files", "anchors")
+    totals = {k: len(resp[k]) for k in trim_keys if resp.get(k)}
     resp["truncated"] = True
     resp["truncation"] = {
         "reason": f"response cap {_GRAPH_RESPONSE_MAX_CHARS} chars",
@@ -569,12 +581,20 @@ def _cap_graph_response(resp: dict) -> dict:
         "total": totals,
     }
     while _size() > _GRAPH_RESPONSE_MAX_CHARS:
-        for key in ("paths", "edges", "nodes", "files"):
+        for key in trim_keys:
             if resp.get(key):
                 resp[key].pop()
                 break
         else:
-            break  # 沒東西可裁:固定欄位不會超過 cap
+            # 沒東西可裁還超限:不回傳超限內容,給 minimal 替代物
+            return {
+                "mode": resp.get("mode"),
+                "truncated": True,
+                "error": (
+                    f"response exceeded {_GRAPH_RESPONSE_MAX_CHARS} chars even "
+                    "after truncation; narrow the query"
+                ),
+            }
         resp["truncation"]["kept"] = {k: len(resp.get(k, [])) for k in totals}
     return resp
 
@@ -631,9 +651,10 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
             或 anchors/files/edges(file anchor);每步 evidence 是
             "file:line",超限附 truncation metadata。
         mode="path":單元素 list,含 paths(每條是 edge list,逐步證據)。
-        graph 生命週期:首次 graph 查詢會**自動建置**(付一次 build 成本)、
-        之後每次查詢自動偵測變更做增量;graph 檔損壞或 schema 不符時
-        neighbors/path 直接報錯,semantic 不受影響。
+        graph 生命週期:首次建置是顯式維運動作(終端跑
+        `python code_graph.py --root <AICODE_ROOT>`),graph 尚未建立、
+        損壞或 schema 不符時 neighbors/path 直接報錯(訊息含建立命令),
+        semantic 不受影響;建好之後每次查詢自動偵測變更做增量。
     """
     if mode not in ("semantic", "neighbors", "path"):
         raise ValueError(f"mode 必須是 semantic|neighbors|path,收到 {mode!r}")
@@ -650,7 +671,7 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
                     file_anchor, hops=min(max(int(hops), 1), 2), limit=50)
                 resp = {
                     "mode": "neighbors",
-                    "query": query,
+                    "query": _echo(query),
                     "anchors": [{"file": file_anchor}],
                     "files": result["files"],
                     "edges": [_slim_edge(e) for e in result["edges"]],
@@ -682,7 +703,7 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
             edges.extend(_slim_edge(e) for e in result["edges"])
         resp = {
             "mode": "neighbors",
-            "query": query,
+            "query": _echo(query),
             "anchors": [
                 {"id": a["id"], "name": a["name"], "qualified_name": a["qualified_name"],
                  "path": a["path"], "line": a["start_line"], "backend": a["backend"]}
@@ -712,8 +733,8 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
         paths = graph.shortest_evidence_paths({src}, {dst}, max_hops=4, limit=3)
         resp = {
             "mode": "path",
-            "src": src,
-            "dst": dst,
+            "src": _echo(src),
+            "dst": _echo(dst),
             "paths": [[_slim_edge(e) for e in path] for path in paths],
             "graph_status": "ok",
         }

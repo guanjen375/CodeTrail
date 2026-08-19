@@ -20,9 +20,29 @@ from __future__ import annotations
 
 import ipaddress
 import os
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 _LOOPBACK_NAMES = frozenset({"localhost", "ip6-localhost", "ip6-loopback"})
+
+
+def redact_url(url: str) -> str:
+    """去掉 URL 內嵌的 credentials(user:pass@)。
+
+    所有會進錯誤訊息 / stderr / doctor 輸出的 URL 都必須先過這裡:
+    policy 拒絕的錯誤本身就會被印出與往上拋,錯誤裡帶密碼等於把
+    credentials 洩進 log(GPT 審核二輪 #2)。parse 失敗原樣回傳
+    (parse 不了的字串也組不出 userinfo)。
+    """
+    try:
+        parts = urlsplit(url)
+        if not (parts.username or parts.password):
+            return url
+        netloc = parts.hostname or ""
+        if parts.port:
+            netloc += f":{parts.port}"
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    except ValueError:
+        return url
 
 MODEL_REMOTE_OK_ENV = "AICODE_MODEL_REMOTE_OK"
 KB_CONTEXT_REMOTE_OK_ENV = "AICODE_KB_CONTEXT_REMOTE_OK"
@@ -87,7 +107,11 @@ _ROLES = {
 
 
 def ensure_allowed(url: str, role: str) -> None:
-    """url 的 host 非 loopback 且該 role 未 opt-in 時 raise EndpointPolicyError。"""
+    """url 的 host 非 loopback 且該 role 未 opt-in 時 raise EndpointPolicyError。
+
+    錯誤訊息內的 URL 一律先 redact_url:policy 錯誤會被印出與往上拋,
+    不得帶出 URL 內嵌的 credentials。
+    """
     try:
         allowed_fn, error_fn = _ROLES[role]
     except KeyError:
@@ -97,4 +121,4 @@ def ensure_allowed(url: str, role: str) -> None:
         return
     if allowed_fn():
         return
-    raise EndpointPolicyError(error_fn(url))
+    raise EndpointPolicyError(error_fn(redact_url(url)))
