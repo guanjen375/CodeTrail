@@ -62,10 +62,6 @@ def test_discovery_covers_nested_dirs_and_both_default_namings(tmp_path: Path):
     """並行分片必須跟序列 pytest 收到同一組檔案。"""
     nested = tmp_path / "integration"
     nested.mkdir()
-    cache = tmp_path / "__pycache__"
-    cache.mkdir()
-    hidden = tmp_path / ".hidden"
-    hidden.mkdir()
 
     expected = {
         _test_file(tmp_path, "test_top.py", "def test_top(): pass\n"),
@@ -77,12 +73,35 @@ def test_discovery_covers_nested_dirs_and_both_default_namings(tmp_path: Path):
     }
     _test_file(tmp_path, "conftest.py", "")
     _test_file(tmp_path, "helper.py", "def helper(): pass\n")
-    _test_file(cache, "test_cached.py", "def test_cached(): pass\n")
-    _test_file(hidden, "test_hidden.py", "def test_hidden(): pass\n")
 
     found = run_tests._discover_test_files(tmp_path)
     assert found == sorted(expected)
     assert len(found) == len(set(found))
+
+
+@pytest.mark.parametrize(
+    "directory",
+    [".hidden", "build", "dist", "CVS", "_darcs", "node_modules", "venv",
+     "{arch}", "sample.egg"],
+)
+def test_discovery_applies_pytest_norecursedirs_defaults(tmp_path: Path, directory: str):
+    """排除規則必須等同 pytest 預設 norecursedirs,否則並行會多收。"""
+    excluded = tmp_path / directory
+    excluded.mkdir()
+    _test_file(excluded, "test_excluded.py", "def test_excluded(): pass\n")
+    kept = _test_file(tmp_path, "test_kept.py", "def test_kept(): pass\n")
+
+    assert run_tests._discover_test_files(tmp_path) == [kept]
+
+
+def test_discovery_does_not_invent_extra_exclusions(tmp_path: Path):
+    """pytest 不排除的目錄(例如 __pycache__)也不能被我們自己排掉。"""
+    cache = tmp_path / "__pycache__"
+    cache.mkdir()
+    stale = _test_file(cache, "test_stale.py", "def test_stale(): pass\n")
+    kept = _test_file(tmp_path, "test_kept.py", "def test_kept(): pass\n")
+
+    assert run_tests._discover_test_files(tmp_path) == sorted([stale, kept])
 
 
 def test_discovery_of_missing_root_is_empty(tmp_path: Path):

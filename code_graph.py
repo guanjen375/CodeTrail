@@ -66,6 +66,11 @@ from ast_parser import (
 
 GRAPH_SCHEMA_VERSION = 3
 
+# 確定解析的 edge confidence。heuristic(Python attribute call 靠 repo 內同名
+# 唯一猜出來的)不算確定,不得進 path 呼叫鏈,也不該當成 confirmed evidence
+# (消費端對應 code_context._CONFIRMED_EDGE_CONFIDENCE)。
+CONFIRMED_EDGE_CONFIDENCE = ("exact", "resolved")
+
 # 只有這些語言有 includes/calls 抽取器;其他語言仍有 defines(symbols)。
 _LANG_BY_EXT = {
     ".py": "python", ".pyx": "python", ".pyi": "python",
@@ -873,8 +878,11 @@ class CodeGraph:
             add_callable(row)
 
         edges = []
-        # path -> {included_path: condition}(None = 無條件 include)。
-        unique_includes: dict[str, dict[str, str | None]] = {
+        # path -> {included_path: [condition, ...]}(None = 無條件 include)。
+        # 同一個 header 可能在多個 branch 各 include 一次(`#ifdef` 與 `#else`
+        # 各一),只留第一個條件會讓另一邊的呼叫被誤判成互斥而消失,所以全存,
+        # 用 OR 語意合併。
+        unique_includes: dict[str, dict[str, list]] = {
             path: {} for path in all_files
         }
 
@@ -929,9 +937,9 @@ class CodeGraph:
                     candidates = self._resolve_include(raw, all_files)
                 if len(candidates) == 1:
                     known = unique_includes.setdefault(rel_path, {})
-                    # 同一個 header 被多次 include 時，無條件的那次最寬鬆。
-                    if candidates[0] not in known or include_condition is None:
-                        known[candidates[0]] = include_condition
+                    conditions = known.setdefault(candidates[0], [])
+                    if include_condition not in conditions:
+                        conditions.append(include_condition)
                     edges.append((
                         "file", rel_path, "file", candidates[0], None, None,
                         "includes", rel_path, lineno, edge_backend, "resolved",
@@ -976,11 +984,19 @@ class CodeGraph:
             frontier: list[tuple[str, str]] = [(start, "active")]
             while frontier:
                 current, current_state = frontier.pop(0)
-                for dst, condition in sorted(unique_includes.get(current, {}).items()):
-                    relation = condition_relation(
-                        effective_condition(current, condition), call_condition
-                    )
-                    if relation == "exclusive":
+                for dst, conditions in sorted(unique_includes.get(current, {}).items()):
+                    # OR:任一 include 點相容就算相容;全部互斥才剪掉。
+                    relations = {
+                        condition_relation(
+                            effective_condition(current, condition), call_condition
+                        )
+                        for condition in conditions
+                    }
+                    if "active" in relations:
+                        relation = "active"
+                    elif "possible" in relations:
+                        relation = "possible"
+                    else:
                         continue
                     next_state = "active" if (
                         current_state == "active" and relation == "active"
@@ -1059,13 +1075,28 @@ class CodeGraph:
             longer = left_parts if len(left_parts) > common else right_parts
             return longer[common].startswith(("#else", "#elif"))
 
+        def condition_implies(outer: str, inner: str) -> bool:
+            """inner 是 outer 的內層 branch(同一條 chain 前綴)⇒ inner 成立時
+            outer 必成立。`#ifdef FEATURE` 的 include 對 `#ifdef FEATURE >
+            #ifdef MODE` 的呼叫是確定可見,不是條件候選。
+
+            互斥的 `#else` 分支在 tree-sitter 模型裡也是前綴關係
+            (`A` vs `A > #else`),所以這條一定要排在互斥判定之後。
+            """
+            outer_parts = outer.split(" > ")
+            inner_parts = inner.split(" > ")
+            return (len(outer_parts) < len(inner_parts)
+                    and inner_parts[:len(outer_parts)] == outer_parts)
+
         def condition_relation(condition: str | None,
                                call_condition: str | None) -> str:
             if condition is None or condition == call_condition:
                 return "active"
-            if call_condition is not None \
-                    and conditions_mutually_exclusive(condition, call_condition):
-                return "exclusive"
+            if call_condition is not None:
+                if conditions_mutually_exclusive(condition, call_condition):
+                    return "exclusive"
+                if condition_implies(condition, call_condition):
+                    return "active"
             return "possible"
 
         def condition_groups(targets: list[str], call_condition: str | None):
@@ -1992,7 +2023,10 @@ class CodeGraph:
         """確定解析的 calls 邊上的最短路徑(≤max_hops、≤limit 條、cycle-safe)。
 
         歧義邊(ambiguity_group)不入路徑(審核 #3):候選之一不是確定呼叫,
-        呈現成呼叫鏈會誤導。整趟搜尋在單一 read snapshot 內(審核 #4)。
+        呈現成呼叫鏈會誤導。confidence 不在 CONFIRMED_EDGE_CONFIDENCE 的邊
+        (Python attribute call 的 heuristic 同名猜測)同樣不入路徑——
+        「只走確定解析的邊」是這個 mode 對外的契約。
+        整趟搜尋在單一 read snapshot 內(審核 #4)。
         """
         self._require_ready()
         max_hops = min(int(max_hops), 4)
@@ -2010,6 +2044,7 @@ class CodeGraph:
                     f"path 端點 resolve 失敗({missing});用 find_nodes 檢查名稱")
 
             # BFS(paths as edge lists);deterministic:鄰接按 evidence 排序
+            confirmed_ph = ",".join("?" * len(CONFIRMED_EDGE_CONFIDENCE))
             queue: list[tuple[str, list]] = [(sid, []) for sid in sorted(src_ids)]
             best_depth: dict[str, int] = {sid: 0 for sid in src_ids}
             while queue and len(results) < limit:
@@ -2020,8 +2055,9 @@ class CodeGraph:
                     f"SELECT {self._EDGE_COLS} FROM edges WHERE src_id = ?"
                     " AND type='calls' AND dst_id IS NOT NULL"
                     " AND ambiguity_group IS NULL"
+                    f" AND confidence IN ({confirmed_ph})"
                     " ORDER BY evidence_path, evidence_line",
-                    (nid,), conn=conn,
+                    (nid, *CONFIRMED_EDGE_CONFIDENCE), conn=conn,
                 )
                 for r in rows:
                     dst = r[3]

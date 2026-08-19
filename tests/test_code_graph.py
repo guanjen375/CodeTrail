@@ -889,3 +889,34 @@ def test_missing_graph_error_command_is_directly_executable(tmp_path):
     assert proc.returncode == 0, proc.stderr
     g.ensure_fresh()  # 建好後不得再拋
     assert g.find_nodes("entry")
+
+
+def test_heuristic_attribute_call_never_enters_evidence_path(tmp_path):
+    """`obj.target()` 只是「repo 內同名唯一」的猜測(confidence=heuristic)。
+
+    它可以當線索,但 path mode 對外宣稱「只走確定解析的邊」,不能收它。
+    """
+    (tmp_path / "lib.py").write_text(
+        "def target():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "caller.py").write_text(
+        "def run(obj):\n"
+        "    return obj.target()\n"
+        "\n"
+        "\n"
+        "def run_direct():\n"
+        "    return target()\n",
+        encoding="utf-8",
+    )
+    g = CodeGraph(str(tmp_path))
+    g.build()
+
+    [attr_edge] = g.callees("run")
+    assert attr_edge["resolved"] is True, "同名唯一仍給線索邊"
+    assert attr_edge["confidence"] == "heuristic"
+    assert g.shortest_evidence_paths({"run"}, {"target"}) == [], (
+        "heuristic 邊不得出現在確定呼叫鏈")
+
+    [name_edge] = g.callees("run_direct")
+    assert name_edge["confidence"] in code_graph.CONFIRMED_EDGE_CONFIDENCE
+    assert g.shortest_evidence_paths({"run_direct"}, {"target"}), (
+        "確定解析的邊仍必須可走")

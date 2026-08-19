@@ -492,3 +492,27 @@ def test_already_applied_still_idempotent_with_garbage_hint(runner: ToolExecutor
     assert "✓" in out and "✗" not in out, out
     assert "已套用" in out and "行 1" in out, out
     assert target.read_text(encoding="utf-8") == "a\nB\nc\n"
+
+
+def test_already_applied_rejected_when_hint_still_holds_pre_image(
+    runner: ToolExecutor, tmp_path: Path,
+):
+    """目標區塊漂移(hint 那裡還像修改前)+ 別處唯一相同 post-image → fail loud。
+
+    唯一性與 100 行窗都擋不住這種:必須用「hint 附近仍是 pre-image」當反證。
+    """
+    target = tmp_path / "drift.py"
+    original = "x = 0\ntail\n\ndef other():\n    pass\n\nx = 2\ntail\n"
+    target.write_text(original, encoding="utf-8")
+    patch = (
+        "--- a/drift.py\n"
+        "+++ b/drift.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-x = 1\n"
+        "+x = 2\n"
+        " tail\n"
+    )
+    out = runner.apply_patch(patch)
+    assert "✗" in out and "修改前" in out, out
+    assert "已套用" not in out.split("✗")[0], out
+    assert target.read_text(encoding="utf-8") == original

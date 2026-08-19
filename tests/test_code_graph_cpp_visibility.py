@@ -789,3 +789,54 @@ def test_conditional_static_inline_header_is_not_visible(tmp_path):
     [edge] = _source_edges(graph, "src/poll.c", "poll")
     assert edge["resolved"] is False
     assert edge["resolution_basis"] == "conditional_candidate"
+
+
+def test_call_in_nested_branch_sees_outer_conditional_include(tmp_path):
+    """include 在 `#ifdef FEATURE`、呼叫在其內層 `#ifdef MODE` → 外層條件已成立。"""
+    _conditional_repo(tmp_path)
+    _write(
+        tmp_path,
+        "src/nested.c",
+        "#ifdef FEATURE\n"
+        '#include "service.h"\n'
+        "#ifdef MODE\n"
+        "int run_nested(void) { return service(); }\n"
+        "#endif\n"
+        "#endif\n",
+    )
+
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "src/nested.c", "run_nested")
+    assert edge["resolved"] is True
+    assert edge["dst_name"] == "service"
+    assert edge["resolution_basis"] == "visible_declaration"
+
+
+def test_header_included_in_both_branches_stays_visible_in_each(tmp_path):
+    """同一 header 在 `#ifdef` 與 `#else` 各 include 一次 → 兩邊的呼叫都看得到。
+
+    只保留第一個 condition 會讓 `#else` 那邊被誤判成互斥而消失。
+    """
+    _conditional_repo(tmp_path)
+    _write(
+        tmp_path,
+        "src/branches.c",
+        "#ifdef USE_A\n"
+        '#include "service.h"\n'
+        "int run_a(void) { return service(); }\n"
+        "#else\n"
+        '#include "service.h"\n'
+        "int run_b(void) { return service(); }\n"
+        "#endif\n",
+    )
+
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    for symbol in ("run_a", "run_b"):
+        [edge] = _source_edges(graph, "src/branches.c", symbol)
+        assert edge["resolved"] is True, symbol
+        assert edge["dst_name"] == "service", symbol
+        assert edge["resolution_basis"] == "visible_declaration", symbol

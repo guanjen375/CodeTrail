@@ -27,6 +27,8 @@ MCP runtime 目前刻意維持 SDK 1.x：`requirements.txt` 使用官方建議�
 
 `python scripts/run_tests.py` 無參數時會以標準庫把 test file 分成最多 4 個
 隔離 shard 並行執行，不需要 `pytest-xdist`，而且不會拆開同一個 test module。
+分片的檔案清單用 pytest 的預設收集規則遞迴掃 `tests/`（`test_*.py` 與 `*_test.py`，
+排除 norecursedirs 預設目錄），確保並行與序列收到完全相同的一組測試。
 資源較小或要重現序列順序時用 `AICODE_TEST_JOBS=1 python scripts/run_tests.py`。
 只要有傳 `-k`、`-x`、檔名或其他 pytest 參數，就維持原本的單一 pytest 行程與
 逐字轉發語意。
@@ -152,9 +154,10 @@ python eval/run_eval.py --test-set all --verbose
 
 ### Code graph 的 C/C++ 保守解析
 
-`GRAPH_SCHEMA_VERSION=2` 保存 definition linkage/condition、function declarations，
-以及 edge 的 `resolution_basis`/condition。既有 v1 DB 由同一條顯式 build command 在
-單一 SQLite transaction 中原地升級；升級失敗會 rollback。真正損壞、無法由 SQLite
+`GRAPH_SCHEMA_VERSION=3` 保存 definition linkage/condition、function declarations、
+include edge 的 preprocessor condition，以及 edge 的 `resolution_basis`/condition。
+既有舊版 DB（v1/v2）由同一條顯式 build command 在單一 SQLite transaction 中原地
+升級；升級失敗會 rollback。真正損壞、無法由 SQLite
 開啟的 DB 不宣稱能原地重建：錯誤會要求先移出/刪除 graph DB，再執行 build command。
 C/C++ call 只按下列證據順序解析：同檔定義、C++ exact qualified name、實際 included
 header 的 static-inline 定義、direct/transitive repo-header 可見且 qualified identity 相符的

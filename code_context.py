@@ -32,6 +32,7 @@ _PATH_DIVERSITY_PENALTY = 12.0
 # resolved(有 dst、無 ambiguity group)不等於 confirmed。Python 的
 # attribute call 只靠「repo 內同名 callable 唯一」猜,graph 會標
 # confidence="heuristic";當成確定證據會把 obj.target() 綁到不相干的同名函式。
+# 與 code_graph.CONFIRMED_EDGE_CONFIDENCE 同一組值(path mode 用同一條線)。
 _CONFIRMED_EDGE_CONFIDENCE = frozenset({"exact", "resolved"})
 
 _STOP_WORDS = frozenset({

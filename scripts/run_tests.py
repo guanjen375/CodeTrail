@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import fnmatch
 import os
 import subprocess
 import sys
@@ -33,10 +34,12 @@ MAX_PARALLEL_JOBS = 4
 # 遞迴掃,否則 tests/integration/test_x.py 或 foo_test.py 會被並行模式靜默
 # 漏掉——序列 pytest 收得到、並行綠燈卻是假的。
 TEST_FILE_PATTERNS = ("test_*.py", "*_test.py")
-# pytest norecursedirs 的預設集合(加上 __pycache__ / .* 這類永不 collect 的)。
-SKIP_DIR_NAMES = frozenset({
-    "__pycache__", "node_modules", "build", "dist", "venv", ".venv", "CVS",
-})
+# pytest 的 norecursedirs 預設值(pyproject 沒有覆寫)。分片必須套用一模一樣的
+# 排除規則:多收或少收都是「並行與序列結果漂移」,而漂移的那一邊是靜默的。
+NORECURSE_DIR_PATTERNS = (
+    "*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv",
+    "{arch}",
+)
 
 
 def _relax_windows_pytest_tmp_acl() -> None:
@@ -83,6 +86,13 @@ def _resolve_parallel_jobs(
     return max(1, min(MAX_PARALLEL_JOBS, available or 1))
 
 
+def _is_norecurse_dir(name: str) -> bool:
+    """目錄名是否命中 pytest norecursedirs 預設樣式(fnmatch 語意)。"""
+    return any(
+        fnmatch.fnmatchcase(name, pattern) for pattern in NORECURSE_DIR_PATTERNS
+    )
+
+
 def _discover_test_files(root: Path | None = None) -> list[Path]:
     """遞迴收集 pytest 會 collect 的測試檔(兩種預設命名),結果去重且排序。"""
     base = TEST_ROOT if root is None else root
@@ -94,8 +104,7 @@ def _discover_test_files(root: Path | None = None) -> list[Path]:
             if not path.is_file():
                 continue
             directories = path.relative_to(base).parts[:-1]
-            if any(part in SKIP_DIR_NAMES or part.startswith(".")
-                   for part in directories):
+            if any(_is_norecurse_dir(part) for part in directories):
                 continue
             found[path] = None
     return sorted(found)
