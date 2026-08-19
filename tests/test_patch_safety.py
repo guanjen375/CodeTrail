@@ -27,9 +27,15 @@ def runner(tmp_path: Path, monkeypatch):
 
 # ---------------------------------------------------------------------------
 # 缺陷 1：header count 造假不能靜默刪行
+#
+# 2026-08-19 契約更新:header 行數不再參與任何計算(splice 位置靠 context
+# 內容定位、splice 長度 = body 實際行數),所以「宣稱 N 行、body 給 M 行」
+# 結構上就刪不到未列出的行 — 不再需要拒絕,行數錯誤直接忽略。
+# 這裡守的 invariant 從「必須拒絕」改成「未列在 body 的行絕不消失」。
+# (背景:小模型行數幾乎必錯,舊 strict 核對讓它陷入改 header 重試迴圈。)
 # ---------------------------------------------------------------------------
-def test_header_count_larger_than_body_is_rejected(runner: ToolExecutor, tmp_path: Path):
-    """header 宣稱替換 4 行、body 只給第 1 行 → 必須拒絕，後 3 行不能被刪。"""
+def test_header_count_larger_than_body_cannot_delete_lines(runner: ToolExecutor, tmp_path: Path):
+    """header 宣稱替換 4 行、body 只給第 1 行 → 只有 body 列出的 l1 被換,l2/l3/l4 必須留存。"""
     target = tmp_path / "four.txt"
     target.write_text("l1\nl2\nl3\nl4\n", encoding="utf-8")
 
@@ -43,14 +49,14 @@ def test_header_count_larger_than_body_is_rejected(runner: ToolExecutor, tmp_pat
         "+X1\n"
     )
     out = runner.apply_patch(evil)
-    # 必須被拒絕
-    assert "✗" in out or "拒絕" in out or "失敗" in out, out
-    # 檔案原封不動，l2/l3/l4 不能消失
-    assert target.read_text(encoding="utf-8") == "l1\nl2\nl3\nl4\n"
+    # 行數宣稱被忽略,body 列出的修改正常套用
+    assert "✓" in out, out
+    # 未列在 body 的 l2/l3/l4 絕不能消失(splice 長度由 body 決定)
+    assert target.read_text(encoding="utf-8") == "X1\nl2\nl3\nl4\n"
 
 
-def test_new_count_mismatch_is_rejected(runner: ToolExecutor, tmp_path: Path):
-    """new_count 與 body 的 context+add 不符 → 拒絕。"""
+def test_new_count_mismatch_is_ignored(runner: ToolExecutor, tmp_path: Path):
+    """new_count 與 body 的 context+add 不符 → 行數宣稱忽略,依 body 套用。"""
     target = tmp_path / "n.txt"
     target.write_text("a\nb\n", encoding="utf-8")
     bad = (
@@ -62,8 +68,8 @@ def test_new_count_mismatch_is_rejected(runner: ToolExecutor, tmp_path: Path):
         "+B\n"
     )
     out = runner.apply_patch(bad)
-    assert "✗" in out or "拒絕" in out or "失敗" in out, out
-    assert target.read_text(encoding="utf-8") == "a\nb\n"
+    assert "✓" in out, out
+    assert target.read_text(encoding="utf-8") == "a\nB\n"
 
 
 def test_valid_multi_line_hunk_still_applies(runner: ToolExecutor, tmp_path: Path):

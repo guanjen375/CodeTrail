@@ -316,6 +316,25 @@ mcp = FastMCP("ai_code")
 
 _real_mcp_tool = mcp.tool
 
+# ---- 重複呼叫偵測(鬼打牆打斷)-------------------------------------------
+# 小模型會對同一組參數連續呼叫同一個查詢工具(觀察到 grep_code 連打六次,
+# 每次 thinking 40–70 秒)。同工具+同參數+同結果連續出現時,在結果前面加
+# 打斷文字。結果每次都重新計算、重新比對:檔案真的變了 → 計數歸零、不加
+# 文字,所以不會遮蔽新資訊。只掛唯讀查詢工具;寫入/執行類(apply_patch /
+# run_command / run_lint / ingest...)的重複呼叫是合法工作流,不打斷。
+import repeat_guard as _repeat_guard_mod
+
+_REPEAT_GUARD = _repeat_guard_mod.RepeatGuard()
+_REPEAT_GUARDED_TOOLS = frozenset({
+    "grep_code",
+    "read_file",
+    "list_dir",
+    "file_info",
+    "git_status",
+    "git_diff",
+    "analyze_file",
+})
+
 
 def _tool(*d_args, **d_kwargs):
     """@_tool() 的包裝：工具執行期間把 stdout 導到 stderr。
@@ -330,12 +349,22 @@ def _tool(*d_args, **d_kwargs):
     return 之後才把結果序列化寫到「真正的」stdout，因此 JSON-RPC 通道乾淨。
     functools.wraps 保留原簽名/型別註記/docstring，FastMCP 的 schema 產生
     （走 inspect.signature，會 follow __wrapped__）不受影響。
+
+    另外對唯讀查詢工具掛 RepeatGuard:同參數且同結果的連續重複呼叫,
+    會在結果前面加打斷文字(見 repeat_guard.py 的動機說明)。
     """
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             with contextlib.redirect_stdout(sys.stderr):
-                return fn(*args, **kwargs)
+                result = fn(*args, **kwargs)
+            if fn.__name__ in _REPEAT_GUARDED_TOOLS and isinstance(result, str):
+                count = _REPEAT_GUARD.observe(
+                    fn.__name__, _repeat_guard_mod.args_key(args, kwargs), result
+                )
+                if count >= _repeat_guard_mod.BANNER_THRESHOLD:
+                    result = _repeat_guard_mod.banner(fn.__name__, count) + result
+            return result
         return _real_mcp_tool(*d_args, **d_kwargs)(wrapper)
     return decorator
 
@@ -899,12 +928,20 @@ def list_dir(path: str = ".", depth: int = 2, max_chars: int = 20000) -> str:
 def apply_patch(diff: str, dry_run: bool = False) -> str:
     """Apply a unified-diff patch to files inside AICODE_ROOT (writes to disk).
 
-    ⚠ 預設會直接寫入檔案。每次最多改 PATCH_MAX_FILES 個檔案、單檔最多
-    PATCH_MAX_LINES_PER_FILE 行。Patch 的 context 行必須與檔案實際內容相符,
-    否則整個 hunk 會被拒絕。套用後會自動跑 lint / typecheck / 相關測試。
+    ⚠ 預設會直接寫入檔案。定位靠 context 內容,**不靠行號**:
+      - hunk header 寫 `@@` 就好,**不必計算行數**;寫了 `@@ -N,M +N,M @@`
+        也只當提示用(context 在檔案中多處出現時用來挑最近的一處),
+        行號/行數錯了不會導致失敗。
+      - 每個 hunk 的修改行前後各帶 2–3 行 context 即可;context 行必須與
+        檔案現況一致(這是唯一的定位依據)。
+      - context 在檔案中多處出現且無行號提示 → 拒絕並列出候選行號
+        (fail loud,不猜位置)。
+      - 已套用過的 hunk 會自動偵測並跳過(重試安全,不會重複插入)。
+    每次最多改 PATCH_MAX_FILES 個檔案、單檔最多 PATCH_MAX_LINES_PER_FILE 行。
+    套用後會自動跑 lint / typecheck / 相關測試。
 
     Args:
-        diff: unified diff 內容(--- a/file / +++ b/file / @@ ... @@)。
+        diff: unified diff 內容(--- a/file / +++ b/file / @@)。
         dry_run: True 時只解析 diff、檢查 context、列出將改的檔案/行數,
                  但不寫檔、不跑驗證。先 dry_run 一次再正式 apply 是好習慣,
                  尤其當前面的 read_file 跟 patch 之間隔了多個工具呼叫時。

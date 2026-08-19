@@ -222,13 +222,13 @@ _APPLY_PATCH_TOOL = {
     "type": "function",
     "function": {
         "name": "apply_patch",
-        "description": "套用 unified diff 格式的程式碼修改。修改會直接寫入檔案。",
+        "description": "套用 unified diff 格式的程式碼修改。修改會直接寫入檔案。定位靠 context 行內容,@@ 行號可省略、不必計算行數。",
         "parameters": {
             "type": "object",
             "properties": {
                 "patch": {
                     "type": "string",
-                    "description": "unified diff 格式的修改內容，例如：\n--- a/file.py\n+++ b/file.py\n@@ -10,3 +10,4 @@\n context line\n-old line\n+new line\n+added line"
+                    "description": "unified diff 格式的修改內容。hunk header 寫 @@ 即可(行號選填,只當多處匹配時的提示);修改行前後帶 2-3 行 context,context 必須與檔案現況一致。例如：\n--- a/file.py\n+++ b/file.py\n@@\n context line\n-old line\n+new line\n+added line"
                 },
                 "dry_run": {
                     "type": "boolean",
@@ -1018,9 +1018,10 @@ class ToolExecutor:
         # Phase 1: preflight 全部檔案（不寫入任何東西）
         #   - 路徑必須在 sandbox 內
         #   - 行數限制
-        #   - 既有檔案的 context 必須對得上（dry_run 也要驗，與工具說明一致）
+        #   - 既有檔案的每個 hunk 必須能靠 context 內容定位
+        #     （dry_run 也要驗，與工具說明一致）
         # ============================================================
-        plans = []      # [(filepath, target, hunks, original_or_None)]
+        plans = []      # [(filepath, target, hunks, plan_or_None, original_or_None)]
         errors = []
         for filepath, hunks in changes.items():
             target = self._safe_path(filepath)
@@ -1039,32 +1040,39 @@ class ToolExecutor:
                 except Exception as e:
                     errors.append(f"✗ {filepath}: 讀取失敗 - {e}")
                     continue
-                file_lines = original.split('\n')
-                hunk_err = None
-                for i, hunk in enumerate(hunks):
-                    ok, msg = self._verify_hunk_context(file_lines, hunk)
-                    if not ok:
-                        hunk_err = f"✗ {filepath}: 區塊 {i+1} {msg}"
-                        break
+                plan, hunk_err = self._locate_hunks(original.split('\n'), hunks)
                 if hunk_err:
-                    errors.append(hunk_err)
+                    errors.append(f"✗ {filepath}: {hunk_err}")
                     continue
-                plans.append((filepath, target, hunks, original))
+                plans.append((filepath, target, hunks, plan, original))
             else:
-                plans.append((filepath, target, hunks, None))
+                plans.append((filepath, target, hunks, None, None))
 
         # ---- dry_run: 只報告 preflight 結果，不寫入 ----
         if dry_run:
             results = []
-            for filepath, target, hunks, original in plans:
+            for filepath, target, hunks, plan, original in plans:
                 total_lines = sum(len(h['add']) + len(h['remove']) for h in hunks)
-                kind = "新建檔案" if original is None else "修改"
+                if original is None:
+                    results.append(
+                        f"[DRY RUN] {filepath}: 將新建檔案 {len(hunks)} 個區塊, "
+                        f"{total_lines} 行"
+                    )
+                    continue
+                pending = [e for e in plan if e['status'] == 'apply']
                 results.append(
-                    f"[DRY RUN] {filepath}: 將{kind} {len(hunks)} 個區塊, {total_lines} 行"
-                    f"（context 驗證通過）"
+                    f"[DRY RUN] {filepath}: 將修改 {len(pending)} 個區塊, "
+                    f"{total_lines} 行（context 已依內容定位）"
                 )
-                for i, hunk in enumerate(hunks):
-                    results.append(f"  區塊 {i+1}: 行 {hunk['old_start']}-{hunk['old_start']+hunk['old_count']-1}")
+                for e in plan:
+                    if e['status'] == 'already':
+                        results.append(f"  區塊 {e['index'] + 1}: 已套用過,將跳過")
+                    else:
+                        end = e['pos'] + max(e['replace_len'], 1)
+                        results.append(
+                            f"  區塊 {e['index'] + 1}: 行 {e['pos'] + 1}-{end}"
+                            + ("（依 context 定位）" if e['relocated'] else "")
+                        )
             results.extend(errors)
             if errors:
                 results.append(
@@ -1087,7 +1095,7 @@ class ToolExecutor:
         written = []    # [(target, backup_path_or_None)]  None = 本次新建的檔案
         results = []
         try:
-            for filepath, target, hunks, original in plans:
+            for filepath, target, hunks, plan, original in plans:
                 if original is None:
                     # 先登記（backup=None 代表新建）再寫，確保寫到一半失敗時
                     # rollback 也涵蓋這一檔（把它刪掉還原成「不存在」）。
@@ -1096,6 +1104,15 @@ class ToolExecutor:
                     target.write_text(content, encoding='utf-8')
                     results.append(f"✓ {filepath}: 新建檔案")
                 else:
+                    pending = [e for e in plan if e['status'] == 'apply']
+                    already = [e for e in plan if e['status'] == 'already']
+                    if not pending:
+                        # 冪等:所有區塊都已套用過 → 不碰檔案、不留備份。
+                        results.append(
+                            f"✓ {filepath}: 所有區塊({len(already)})都已套用過,"
+                            "檔案未變更"
+                        )
+                        continue
                     fd, backup_name = tempfile.mkstemp(
                         dir=str(target.parent), prefix=target.name + '.', suffix='.orig'
                     )
@@ -1105,9 +1122,22 @@ class ToolExecutor:
                     # backup 就緒後、寫入前先登記 → 若 write_text 中途失敗，
                     # 這一檔也能從備份還原（否則會留下半寫入的檔案 + 孤兒備份）。
                     written.append((target, backup_path))
-                    content = self._compute_patched_content(original, hunks)
+                    content = self._compute_patched_content(original, plan)
                     target.write_text(content, encoding='utf-8')
-                    results.append(f"✓ {filepath}: 已修改 {len(hunks)} 個區塊")
+                    msg = f"✓ {filepath}: 已修改 {len(pending)} 個區塊"
+                    relocated = [e for e in pending if e['relocated']]
+                    if relocated:
+                        msg += (
+                            "（"
+                            + ", ".join(
+                                f"區塊{e['index'] + 1}依 context 定位於行 {e['pos'] + 1}"
+                                for e in relocated
+                            )
+                            + "）"
+                        )
+                    if already:
+                        msg += f"（另 {len(already)} 個區塊已套用過,跳過）"
+                    results.append(msg)
         except Exception as e:
             rollback_notes = []
             for tgt, backup_path in reversed(written):
@@ -1234,8 +1264,29 @@ class ToolExecutor:
 
         return results
 
+    # hunk header:行號/行數全部**選填**。`@@` / `@@ -26 +26 @@` /
+    # `@@ -26,6 +26,13 @@ void f()` 都合法。實測(2026-08-19)本機小模型
+    # 幾乎每次都把行數算錯,舊版 strict 核對讓它陷入「改 header → 再拒絕」
+    # 的重試迴圈;現在定位靠 context 內容(_locate_hunks),行號只當多處
+    # 匹配時的提示,行數完全不使用 — 資料安全由「splice 長度 = body 實際
+    # 行數 + 內容必須匹配」結構性保證,不再需要 header 自我一致。
+    _HUNK_HEADER_RE = re.compile(
+        r'^@@(?:\s+-(\d+)(?:,(\d+))?(?:\s+\+(\d+)(?:,(\d+))?)?)?\s*(?:@@.*)?$'
+    )
+
+    @staticmethod
+    def _is_hunk_body_line(line: str) -> bool:
+        """這行是否屬於 hunk body(context / 新增 / 移除)。"""
+        if line.startswith(' '):
+            return True
+        if line.startswith('+') and not line.startswith('+++'):
+            return True
+        if line.startswith('-') and not line.startswith('---'):
+            return True
+        return line.startswith('\\')  # "\ No newline at end of file"
+
     def _parse_unified_diff(self, patch: str) -> dict:
-        """解析 unified diff 格式"""
+        """解析 unified diff 格式(容錯版:行號選填、空白 context 行容錯)"""
         changes = {}
         lines = patch.split('\n')
         i = 0
@@ -1265,12 +1316,13 @@ class ToolExecutor:
                 continue
 
             if line.startswith('@@') and current_file:
-                match = re.match(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', line)
+                match = self._HUNK_HEADER_RE.match(line)
                 if match:
-                    old_start = int(match.group(1))
-                    old_count = int(match.group(2)) if match.group(2) else 1
-                    new_start = int(match.group(3))
-                    new_count = int(match.group(4)) if match.group(4) else 1
+                    # 行號/行數是選填 hint:缺省為 None,絕不參與行數核對。
+                    old_start = int(match.group(1)) if match.group(1) else None
+                    old_count = int(match.group(2)) if match.group(2) else None
+                    new_start = int(match.group(3)) if match.group(3) else None
+                    new_count = int(match.group(4)) if match.group(4) else None
 
                     hunk = {
                         'old_start': old_start,
@@ -1286,12 +1338,23 @@ class ToolExecutor:
                     while i < len(lines):
                         hunk_line = lines[i]
 
-                        # 合法 unified-diff context blank line 是 " "(單一空格)。
-                        # `""` 是 split('\n') 對結尾 newline 產生的 sentinel,或
-                        # hunk 結束後的空白分隔 — 都不該被當成 context blank line
-                        # (舊版會在 context verify 階段算成 file 行,造成 EOF 附近
-                        # 的合法 patch 誤判為 context mismatch)。
+                        # 合法 unified-diff context blank line 是 " "(單一空格),
+                        # 但模型常把行尾空白 strip 掉、送出 `""`。`""` 也可能是
+                        # split('\n') 對結尾 newline 產生的 sentinel,或 hunk 結束
+                        # 後的空白分隔。用 lookahead 區分:跳過連續空行後,若下一
+                        # 個非空行仍是 hunk body(' '/'+'/'-'),這些空行就是被
+                        # strip 的 context blank line;否則是分隔/EOF sentinel,
+                        # 結束 hunk(EOF sentinel 誤算的舊 bug 見
+                        # tests/test_patch_parser_edge.py)。
                         if hunk_line == "":
+                            j = i
+                            while j < len(lines) and lines[j] == "":
+                                j += 1
+                            if j < len(lines) and self._is_hunk_body_line(lines[j]):
+                                for _ in range(i, j):
+                                    hunk['lines'].append((' ', ''))
+                                i = j
+                                continue
                             break
 
                         # `\ No newline at end of file` — git / unified diff 對沒尾
@@ -1316,27 +1379,6 @@ class ToolExecutor:
                         else:
                             break
 
-                    # P0 資料安全：核對 hunk header 宣稱的行數與 body 實際行數。
-                    # 不核對的話，「header 說替換 N 行、body 只給 M 行 (M<N)」會讓
-                    # 後 (N-M) 行被 splice 靜默刪除。任一不符 → 拒絕整個 patch(fail loud)。
-                    ctx_n = sum(1 for t, _ in hunk['lines'] if t == ' ')
-                    rem_n = len(hunk['remove'])
-                    add_n = len(hunk['add'])
-                    if ctx_n + rem_n != old_count:
-                        raise ValueError(
-                            f"{current_file}: hunk '@@ -{old_start},{old_count} ...' "
-                            f"宣稱移除+context 共 {old_count} 行，但 body 實際只有 "
-                            f"{ctx_n + rem_n} 行(context {ctx_n} + 移除 {rem_n})。"
-                            f"為避免靜默刪除未列在 patch 內的行，已拒絕整個 patch。"
-                        )
-                    if ctx_n + add_n != new_count:
-                        raise ValueError(
-                            f"{current_file}: hunk '@@ ... +{new_start},{new_count} @@' "
-                            f"宣稱新增+context 共 {new_count} 行，但 body 實際只有 "
-                            f"{ctx_n + add_n} 行(context {ctx_n} + 新增 {add_n})。"
-                            f"已拒絕整個 patch。"
-                        )
-
                     changes[current_file].append(hunk)
                     continue
 
@@ -1344,27 +1386,172 @@ class ToolExecutor:
 
         return changes
 
-    def _verify_hunk_context(self, lines: list, hunk: dict) -> tuple:
-        """驗證 hunk 的 context 行是否與檔案內容匹配"""
-        start_idx = hunk['old_start'] - 1
-        file_line_idx = start_idx
+    # ------------------------------------------------------------------
+    # hunk 定位:靠 context 內容,不靠行號
+    # ------------------------------------------------------------------
+    # 舊版拿 old_start 直接當套用位置、context 對不上就拒絕 — 小模型行號
+    # 幾乎必錯,導致反覆重試。新版把 hunk 的 (context+移除) 行當搜尋樣板,
+    # 在檔案裡找匹配位置:
+    #   - 唯一匹配 → 套用(行號錯誤/缺省都無所謂)。
+    #   - 多處匹配 → 有行號 hint 挑最近的一處;沒有 hint 或距離打平 →
+    #     拒絕並列出候選行號(fail loud,絕不猜位置)。
+    #   - 零匹配 → 若 hunk 的「修改後內容」已存在,視為已套用過(no-op,
+    #     重試安全);否則拒絕,附最接近位置的期望/實際對照。
+    # 逐行比對容忍度沿用舊版:行尾空白差異(rstrip)一律容忍;整檔 strict
+    # 掃不到時退一步做縮排不敏感(strip)掃描。
 
-        for line_type, content in hunk['lines']:
-            if line_type in (' ', '-'):
-                if file_line_idx >= len(lines):
-                    return False, f"行 {file_line_idx + 1}: 超出檔案範圍"
+    @staticmethod
+    def _lines_match(actual: str, expect: str, *, loose: bool) -> bool:
+        if actual.rstrip() == expect.rstrip():
+            return True
+        return loose and actual.strip() == expect.strip()
 
-                file_line = lines[file_line_idx]
-                if file_line.rstrip() != content.rstrip():
-                    if file_line.strip() != content.strip():
-                        return False, (
-                            f"行 {file_line_idx + 1} context 不匹配:\n"
-                            f"  期望: '{content[:60]}...'\n"
-                            f"  實際: '{file_line[:60]}...'"
+    def _find_pattern_positions(self, file_lines: list, pattern: list,
+                                *, loose: bool) -> list:
+        """回傳 pattern(逐行)在 file_lines 中所有匹配起點(0-based)。"""
+        n = len(file_lines) - len(pattern) + 1
+        positions = []
+        for i in range(max(0, n)):
+            if all(
+                self._lines_match(file_lines[i + k], expect, loose=loose)
+                for k, expect in enumerate(pattern)
+            ):
+                positions.append(i)
+        return positions
+
+    def _best_mismatch_report(self, file_lines: list, pattern: list) -> str:
+        """零匹配時的診斷:找匹配行數最多的位置,回報第一個不符的行。"""
+        # 掃描成本上限:超大檔 × 長 pattern 就不做逐位置評分(訊息仍完整)。
+        if not pattern or len(file_lines) * len(pattern) > 2_000_000:
+            return ""
+        best_pos, best_score = 0, -1
+        for i in range(len(file_lines)):
+            score = 0
+            for k, expect in enumerate(pattern):
+                if i + k >= len(file_lines):
+                    break
+                if self._lines_match(file_lines[i + k], expect, loose=True):
+                    score += 1
+            if score > best_score:
+                best_pos, best_score = i, score
+        for k, expect in enumerate(pattern):
+            actual = (
+                file_lines[best_pos + k]
+                if best_pos + k < len(file_lines) else "<檔案結尾>"
+            )
+            if not self._lines_match(actual, expect, loose=True):
+                return (
+                    f"最接近的位置是行 {best_pos + 1}(匹配 {best_score}/"
+                    f"{len(pattern)} 行),第一個不符在行 {best_pos + k + 1}:\n"
+                    f"  期望: {expect[:80]!r}\n"
+                    f"  實際: {actual[:80]!r}"
+                )
+        return ""
+
+    def _locate_hunks(self, file_lines: list, hunks: list) -> tuple:
+        """把每個 hunk 定位到檔案位置。
+
+        Returns:
+            (plan, err):err 非 None 時 plan 無效。plan 是 per-hunk dict:
+            {'index', 'status'('apply'|'already'), 'pos'(0-based),
+             'replace_len', 'new_lines', 'relocated'(header 行號缺省或不準)}
+        """
+        plan = []
+        for idx, hunk in enumerate(hunks):
+            pattern = [c for t, c in hunk['lines'] if t in (' ', '-')]
+            new_lines = [c for t, c in hunk['lines'] if t in (' ', '+')]
+            hint = hunk.get('old_start')  # 1-based 或 None
+
+            if not pattern:
+                # 純新增且完全沒 context:只能靠行號提示。
+                if hint is None:
+                    return None, (
+                        f"區塊 {idx + 1} 是純新增且沒有 context 行,無法定位。"
+                        "請在修改行前後帶 2-3 行 context(建議),"
+                        "或在 @@ 提供行號提示。"
+                    )
+                # unified diff 慣例:old_count == 0 表示插在第 old_start 行之後。
+                insert_at = hint if hunk.get('old_count') == 0 else hint - 1
+                pos = min(max(insert_at, 0), len(file_lines))
+                plan.append({
+                    'index': idx, 'status': 'apply', 'pos': pos,
+                    'replace_len': 0, 'new_lines': new_lines, 'relocated': False,
+                })
+                continue
+
+            positions = self._find_pattern_positions(file_lines, pattern, loose=False)
+            if not positions:
+                positions = self._find_pattern_positions(file_lines, pattern, loose=True)
+
+            if len(positions) == 1:
+                pos = positions[0]
+            elif len(positions) > 1:
+                if hint is not None:
+                    best = min(positions, key=lambda p: abs(p - (hint - 1)))
+                    ties = [
+                        p for p in positions
+                        if abs(p - (hint - 1)) == abs(best - (hint - 1))
+                    ]
+                    if len(ties) > 1:
+                        return None, (
+                            f"區塊 {idx + 1} 的 context 在檔案中出現 "
+                            f"{len(positions)} 處(行 "
+                            f"{', '.join(str(p + 1) for p in positions[:5])}),"
+                            f"行號提示 {hint} 距離打平無法消歧。"
+                            "請增加 context 行數。"
                         )
-                file_line_idx += 1
+                    pos = best
+                else:
+                    return None, (
+                        f"區塊 {idx + 1} 的 context 在檔案中出現 "
+                        f"{len(positions)} 處(行 "
+                        f"{', '.join(str(p + 1) for p in positions[:5])})。"
+                        "請增加 context 行數,或在 @@ 標大約行號以消歧。"
+                    )
+            else:
+                # 零匹配:先檢查是否已套用過(修改後內容已在檔案裡)。
+                # 只對「有新增行」的 hunk 做,純刪除的 context-only 樣板太弱,
+                # 誤判成已套用會靜默漏刪 — 那種情況走 fail-loud。
+                if hunk['add'] and new_lines:
+                    done = self._find_pattern_positions(
+                        file_lines, new_lines, loose=False
+                    ) or self._find_pattern_positions(
+                        file_lines, new_lines, loose=True
+                    )
+                    if done:
+                        plan.append({
+                            'index': idx, 'status': 'already',
+                            'pos': done[0], 'replace_len': 0,
+                            'new_lines': [], 'relocated': False,
+                        })
+                        continue
+                detail = self._best_mismatch_report(file_lines, pattern)
+                return None, (
+                    f"區塊 {idx + 1} context 不匹配(在檔案中找不到對應內容)。"
+                    + (f"\n{detail}" if detail else "")
+                    + "\n提示: context 行必須與檔案現況一致;"
+                    "先 read_file 確認現況再重送。行號不需要準確,定位靠 context。"
+                )
 
-        return True, ""
+            plan.append({
+                'index': idx, 'status': 'apply', 'pos': pos,
+                'replace_len': len(pattern), 'new_lines': new_lines,
+                'relocated': hint is None or (hint - 1) != pos,
+            })
+
+        # 重疊檢查:兩個 hunk 套到同一段行 → 順序/語意不明,拒絕。
+        applied = sorted(
+            (e for e in plan if e['status'] == 'apply'),
+            key=lambda e: (e['pos'], e['index']),
+        )
+        for prev, nxt in zip(applied, applied[1:]):
+            if prev['pos'] + prev['replace_len'] > nxt['pos']:
+                return None, (
+                    f"區塊 {prev['index'] + 1} 與區塊 {nxt['index'] + 1} "
+                    f"定位後重疊(行 {nxt['pos'] + 1} 附近)。"
+                    "請合併成一個 hunk,或增加 context 讓兩者分開。"
+                )
+        return plan, None
 
     def _compute_new_file_content(self, hunks: list) -> str:
         """從 hunks 組出新建檔案的完整內容（context + 新增行）。"""
@@ -1375,20 +1562,22 @@ class ToolExecutor:
                     new_lines.append(content)
         return '\n'.join(new_lines) + '\n'
 
-    def _compute_patched_content(self, original: str, hunks: list) -> str:
-        """把 hunks 套到既有內容，回傳新內容字串（不寫檔）。
+    def _compute_patched_content(self, original: str, plan: list) -> str:
+        """把 _locate_hunks 產出的 plan 套到既有內容，回傳新內容字串（不寫檔）。
 
-        splice 長度改用「body 實際的 context+移除 行數」而非 header 宣稱的
-        old_count —— parse 階段已驗證兩者一致，這裡是雙保險，確保永遠不會
-        刪到沒列在 patch body 裡的行。
+        splice 位置來自 content 定位(不是 header 行號),splice 長度 =
+        pattern 實際行數 —— 結構上保證永遠不會刪到沒列在 patch body 裡的行,
+        也因此 header 行數宣稱錯誤完全無害(直接忽略)。
+        由後往前套,前面的 splice 不會位移後面的定位。
         """
         lines = original.split('\n')
-        sorted_hunks = sorted(hunks, key=lambda h: h['old_start'], reverse=True)
-        for hunk in sorted_hunks:
-            start_idx = hunk['old_start'] - 1
-            replaced_len = sum(1 for t, _ in hunk['lines'] if t in (' ', '-'))
-            new_lines = [c for t, c in hunk['lines'] if t in (' ', '+')]
-            lines[start_idx:start_idx + replaced_len] = new_lines
+        pending = sorted(
+            (e for e in plan if e['status'] == 'apply'),
+            key=lambda e: (e['pos'], e['index']),
+            reverse=True,
+        )
+        for entry in pending:
+            lines[entry['pos']:entry['pos'] + entry['replace_len']] = entry['new_lines']
         return '\n'.join(lines)
 
     def git_status(self) -> str:

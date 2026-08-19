@@ -53,6 +53,8 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 - `tests/test_config.py` — config 數值的範圍與型別 sanity
 - `tests/test_sandbox.py` — `_safe_path` 不會被 `..` / 絕對路徑 / symlink 騙過
 - `tests/test_patch.py` — apply_patch 的 happy path、逃逸、context 不符、max 限制
+- `tests/test_patch_context_locate.py` — apply_patch content 定位契約:行號選填/錯誤無害、空白 context 行容錯、多處匹配 fail-loud 與行號消歧、已套用冪等、重疊拒絕
+- `tests/test_repeat_guard.py` — 唯讀查詢工具的重複呼叫偵測(同參數同結果 → 打斷文字;結果變了 → 歸零)
 - `tests/test_run_command.py` — 白名單 + shell 元字元 + 注入防護
 - `tests/test_eval_consistency.py` — eval ↔ config / source 不漂移
 - `tests/test_readme_consistency.py` — README / docs ↔ mcp_server.py / config.py 不漂移
