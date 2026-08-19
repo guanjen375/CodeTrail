@@ -220,6 +220,9 @@ async def _raw_protocol_roundtrip(project: Path, msgs: list[dict]) -> tuple[byte
         raise
 
 
+# smoke:stdout 被污染 → JSON-RPC 直接壞掉,而且是無聲的(client 只會看到亂碼)。
+# 整份 roundtrip 太貴(約 2.6s),只把這條契約放進 smoke。
+@pytest.mark.smoke
 def test_mcp_stdout_is_pure_jsonrpc(tmp_path: Path):
     project = _make_project(tmp_path)
 

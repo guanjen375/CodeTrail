@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """C/C++ tree-sitter parser golden tests(§6.3)。
 
 需要 tree-sitter + tree-sitter-c + tree-sitter-cpp(requirements.txt 已釘版);
@@ -18,7 +17,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import ast_parser  # noqa: E402
-from ast_parser import parse_file, get_parser_status  # noqa: E402
+from ast_parser import get_parser_status, parse_file  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not ast_parser.HAS_TREE_SITTER

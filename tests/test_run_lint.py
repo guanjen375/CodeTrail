@@ -13,6 +13,10 @@ import pytest
 import config
 from agent_tools import ToolExecutor
 
+# smoke:AGENTS.md §2.1 第 1 款「真實發生過的 bug 的 regression」
+# 真實 bug regression:fix=False 仍跑會改檔的命令。
+pytestmark = pytest.mark.smoke
+
 
 class TestLintCommandsStructure:
     """LINT_COMMANDS 必須是 {ext: {'fix': [...], 'check': [...]}} 結構。"""

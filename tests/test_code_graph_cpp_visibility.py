@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """C/C++ conservative graph resolution and rebuild-equivalence tests."""
 from __future__ import annotations
 

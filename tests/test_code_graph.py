@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """code_graph 專屬測試(§7.7)+ stable ID(§7.2)。
 
 雙 process 情境用 subprocess 跑真另一個 Python;WAL/flock 行為不能用

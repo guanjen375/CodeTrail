@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Bounded code evidence selection, merge, safety, and char-budget tests."""
 from __future__ import annotations
 

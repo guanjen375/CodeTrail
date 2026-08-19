@@ -8,6 +8,10 @@ import pytest
 import config
 from agent_tools import ToolExecutor
 
+# smoke:安全層(AGENTS.md §2.1 第 2 款「無聲失敗風險的契約」)
+# AGENTS.md §3 安全檢查點:agent_tools._validate_command(白名單 + dangerous pattern)。
+pytestmark = pytest.mark.smoke
+
 
 @pytest.fixture
 def runner(tmp_path: Path, monkeypatch):

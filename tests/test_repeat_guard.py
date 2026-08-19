@@ -8,12 +8,16 @@ codetrail_grep_code 參數連續呼叫六次,每次 thinking 40–70 秒,結果�
 """
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pytest
 
-from repeat_guard import RepeatGuard, args_key, banner, BANNER_THRESHOLD
+from repeat_guard import BANNER_THRESHOLD, RepeatGuard, args_key, banner
+from tests._harness import import_mcp_module
+
+# smoke:AGENTS.md §2.1 第 1 款「真實發生過的 bug 的 regression」
+# 真實 bug regression(repeat.png 2026-08-19):鬼打牆打斷。
+pytestmark = pytest.mark.smoke
 
 
 # ---------------------------------------------------------------------------
@@ -69,24 +73,8 @@ def test_banner_mentions_tool_and_count():
 # ---------------------------------------------------------------------------
 @pytest.fixture
 def mcp_module(monkeypatch, tmp_path: Path):
-    pytest.importorskip("mcp", reason="mcp 套件未安裝;OpenCode + MCP 路線才需要")
-
-    monkeypatch.setenv("AICODE_ROOT", str(tmp_path))
-    monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")
-    monkeypatch.setenv("AICODE_LLAMA_BASE_URL", "http://127.0.0.1:65535")
-    monkeypatch.setenv("AICODE_REQUIRED_MODELS_CHECK_SKIP", "1")
-    monkeypatch.setenv("AI_CODE_PATCH", "")
-    monkeypatch.setenv("AI_CODE_RUN_TESTS", "")
-    monkeypatch.setenv("AI_CODE_ENABLE_BUILD_COMMANDS", "")
-
-    import config as _config
-    monkeypatch.setattr(_config, "PATCH_ENABLED", _config.PATCH_ENABLED)
-    monkeypatch.setattr(_config, "RUN_COMMAND_ENABLED", _config.RUN_COMMAND_ENABLED)
-    monkeypatch.setattr(_config, "ALLOWED_COMMANDS", list(_config.ALLOWED_COMMANDS))
-
-    sys.modules.pop("mcp_server", None)
-    import mcp_server  # type: ignore
-    return mcp_server
+    """以 tmp_path 當 AICODE_ROOT 重新 import mcp_server(細節見 _harness)。"""
+    return import_mcp_module(monkeypatch, tmp_path)
 
 
 def _tool_fn(mcp_module, name: str):

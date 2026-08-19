@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """code_rag_search 的回傳契約(§8):預設 shape 完全不變(key-set 鎖死)、
 evidence 模式欄位、neighbors/path 模式、graph 缺席行為。全部離線。"""
 from __future__ import annotations
@@ -8,6 +7,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from tests._harness import import_mcp_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -28,7 +29,7 @@ CONTEXT_KEYS = {
 
 @pytest.fixture
 def mcp_module(monkeypatch, tmp_path: Path):
-    pytest.importorskip("mcp", reason="mcp 套件未安裝")
+    """先在 root 放一組有明確 import 邊的來源,再以它當 AICODE_ROOT import mcp_server。"""
     (tmp_path / "util.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
     # 直接 name call:path mode 只走確定解析的邊,`util.helper()` 這種
     # attribute call 只有 heuristic confidence,本來就不該進呼叫鏈
@@ -37,22 +38,8 @@ def mcp_module(monkeypatch, tmp_path: Path):
         "from util import helper\n\n\ndef entry():\n    return helper()\n",
         encoding="utf-8")
 
-    monkeypatch.setenv("AICODE_ROOT", str(tmp_path))
-    monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")
-    monkeypatch.setenv("AICODE_LLAMA_BASE_URL", "http://127.0.0.1:65535")
-    monkeypatch.setenv("AICODE_REQUIRED_MODELS_CHECK_SKIP", "1")
-    monkeypatch.setenv("AI_CODE_PATCH", "")
-    monkeypatch.setenv("AI_CODE_RUN_TESTS", "")
-    monkeypatch.setenv("AI_CODE_ENABLE_BUILD_COMMANDS", "")
-
-    import config as _config
-    monkeypatch.setattr(_config, "PATCH_ENABLED", _config.PATCH_ENABLED)
-    monkeypatch.setattr(_config, "RUN_COMMAND_ENABLED", _config.RUN_COMMAND_ENABLED)
-    monkeypatch.setattr(_config, "ALLOWED_COMMANDS", list(_config.ALLOWED_COMMANDS))
-
     code_rag._INDEX_SCAN_CACHE.clear()
-    sys.modules.pop("mcp_server", None)
-    import mcp_server  # type: ignore
+    mcp_server = import_mcp_module(monkeypatch, tmp_path)
 
     # 離線 stub:embedding 與 reranker 都不打 server
     monkeypatch.setattr(code_rag, "USE_RERANKER", False)

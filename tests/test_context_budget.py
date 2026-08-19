@@ -1,8 +1,6 @@
-"""Tests for context_budget.py — token estimation, hard gate, metrics parsing,
-JSONL logging privacy.
+"""context budget:預算計算、soft/hard 閘、以及未設定時的預設預算。
 
-These tests intentionally do not touch the network. They exercise the gating
-logic that runs *before* any LLM request.
+併入 tests/test_ctx_default_budget.py(2026-08-20)。
 """
 from __future__ import annotations
 
@@ -12,10 +10,8 @@ import pytest
 
 import config
 import context_budget
+import utils
 
-# ============================================================
-# Token estimation
-# ============================================================
 
 def test_estimate_tokens_from_plain_string():
     tokens, chars = context_budget.estimate_tokens(prompt="hello world" * 100)
@@ -428,3 +424,46 @@ def test_dynamic_max_respected_when_caller_clamps():
     )
     assert usage.effective_num_ctx == 65536
     assert usage.dynamic_ctx_max == config.DYNAMIC_NUM_CTX_MAX
+
+
+# --------------------------------------------------------------------------
+# 併自 tests/test_ctx_default_budget.py:沒有明確設定時的預設預算。
+# --------------------------------------------------------------------------
+def _stub_gate(monkeypatch):
+    """讓 check_and_log 記下 requested_num_ctx 後立即以 overflow 中斷，
+    避免真的打到 llama-server。"""
+    captured = {}
+
+    def fake_check_and_log(*, source, requested_num_ctx, prompt=None,
+                           messages=None, model=None, **kw):
+        captured["ctx"] = requested_num_ctx
+        usage = context_budget.ContextUsage(hard_overflow=True, source=source)
+        raise context_budget.ContextOverflowError(usage)
+
+    monkeypatch.setattr(utils.context_budget, "check_and_log", fake_check_and_log)
+    monkeypatch.setattr(utils.config, "require_main_model", lambda: "dummy-model")
+    return captured
+
+
+def test_default_ctx_budget_is_server_truth():
+    assert utils._default_ctx_budget() == config.N_CTX
+    assert config.NUM_CTX == config.N_CTX
+    assert config.DYNAMIC_NUM_CTX_MAX == config.N_CTX
+
+
+def test_call_llm_defaults_to_server_truth(monkeypatch):
+    captured = _stub_gate(monkeypatch)
+    utils.call_llm("hi")  # 未帶 num_ctx
+    assert captured["ctx"] == config.N_CTX
+
+
+def test_call_llm_stream_defaults_to_server_truth(monkeypatch):
+    captured = _stub_gate(monkeypatch)
+    utils.call_llm_stream("hi")  # 未帶 num_ctx（strict 路徑就是走這條）
+    assert captured["ctx"] == config.N_CTX
+
+
+def test_explicit_num_ctx_still_respected(monkeypatch):
+    captured = _stub_gate(monkeypatch)
+    utils.call_llm("hi", num_ctx=8192)
+    assert captured["ctx"] == 8192

@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import pytest
 
+# smoke:AGENTS.md §2.1 第 1 款「真實發生過的 bug 的 regression」
+# 真實 bug regression:VL 流程。
+pytestmark = pytest.mark.smoke
+
 
 class _FakeResp:
     status_code = 200

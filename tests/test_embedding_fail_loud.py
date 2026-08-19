@@ -8,6 +8,10 @@ import code_rag
 import knowledge
 import RAG
 
+# smoke:AGENTS.md §2.1 第 1 款「真實發生過的 bug 的 regression」
+# 無聲失敗契約:embedding 失敗必須 fail loud,不得回空向量。
+pytestmark = pytest.mark.smoke
+
 EMBEDDING_MODULES = (code_rag, knowledge)
 
 

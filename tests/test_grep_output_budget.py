@@ -21,6 +21,10 @@ import pytest
 import config
 from agent_tools import ToolExecutor, _clip_grep_line, _collect_within_budget
 
+# smoke:AGENTS.md §2.1 第 1 款「真實發生過的 bug 的 regression」
+# 真實 bug regression:grep 輸出預算。
+pytestmark = pytest.mark.smoke
+
 
 def _write_tree(root, *, long_line_chars: int) -> None:
     """一個有超長行的專案:真實世界的生成檔 / 壓縮 JSON 就長這樣。"""

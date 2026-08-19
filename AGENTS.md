@@ -26,9 +26,10 @@
 
 ### 2.1 兩包制
 
-- **smoke** ＝ 標 `@pytest.mark.smoke` 的測試：真實發生過的 bug 的 regression ＋ 無聲失敗風險的契約檢查。整包目標 30 秒內。
+- **smoke** ＝ 標 `@pytest.mark.smoke` 的測試：真實發生過的 bug 的 regression ＋ 無聲失敗風險的契約檢查。
+  §3 的每個安全檢查點都必須在裡面（由 `tests/test_smoke_gate.py` 靜態守住）。整包目標 10 秒內。
 - **full** ＝ 整個 `tests/`。
-- 統一入口 `python scripts/run_tests.py`（無參數＝full，4-shard 並行；帶任何 pytest 參數＝單行程逐字轉發）：
+- 統一入口 `python scripts/run_tests.py`（無參數＝full，最多 8-shard 並行；帶任何 pytest 參數＝單行程逐字轉發）：
   - smoke：`python scripts/run_tests.py -m smoke`
   - full：`python scripts/run_tests.py`
 
@@ -80,6 +81,9 @@
 
 任何重構碰到上面這些東西，**新加測試**（開發者寫測試檔，執行依 §2.2 權責），
 不要直接刪 / weaken / 移除檢查點。
+
+新增安全檢查點時，守它的測試檔要標 smoke 並登記進 `tests/test_smoke_gate.py`
+的 `SAFETY_MODULES`；漏標是無聲的（smoke 綠燈但那個檢查點根本沒跑）。
 
 ---
 

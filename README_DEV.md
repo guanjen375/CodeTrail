@@ -25,13 +25,19 @@ MCP runtime 目前刻意維持 SDK 1.x：`requirements.txt` 使用官方建議�
 1.x；SDK 2.x migration 必須另案同步處理 import、transport、schema 與 OpenCode
 相容性，不能只移除 `<2`。`doctor` 會把缺少 MCP、低於 1.28 或 2.x 都列為 FAIL。
 
-`python scripts/run_tests.py` 無參數時會以標準庫把 test file 分成最多 4 個
+`python scripts/run_tests.py` 無參數時會以標準庫把 test file 分成最多 8 個
 隔離 shard 並行執行，不需要 `pytest-xdist`，而且不會拆開同一個 test module。
 分片的檔案清單用 pytest 的預設收集規則遞迴掃 `tests/`（`test_*.py` 與 `*_test.py`，
 排除 norecursedirs 預設目錄），確保並行與序列收到完全相同的一組測試。
 資源較小或要重現序列順序時用 `AICODE_TEST_JOBS=1 python scripts/run_tests.py`。
 只要有傳 `-k`、`-x`、檔名或其他 pytest 參數，就維持原本的單一 pytest 行程與
 逐字轉發語意。
+
+分片權重用「上一輪實測」而不是檔案大小：每個 shard 產一份 junit XML，全綠時
+把每檔耗時彙總寫進 `.pytest_cache/shard_weights.json`（已在 `.gitignore`），
+下一輪直接照它 largest-first 分。沒有這份檔（第一次跑／剛新增的測試檔）才退回
+「檔案大小 + `subprocess.` 密度」的啟發式。檔案大小是很差的耗時預測——同樣 30KB，
+一個可能是 40 條純函式斷言（0.03s），另一個是 17 條各 fork 一次 `aicode`（5.6s）。
 
 核心日常入口是 OpenCode TUI；跨機 web 另有薄 launcher（兩者共用 `aicode` 安全前置）：
 
@@ -55,27 +61,30 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 
 ## 測試指南
 
-- `tests/test_cli.py` — 維護用腳本 help / error path smoke test
+- `tests/test_aicode_wrapper.py` — `aicode` wrapper:MCP wrapper 生成、舊 opencode.json 自動修復、`--model` 轉發與衝突
+- `tests/test_aicode_web_forwarding.py` — `aicode web` 的 port/hostname 注入、額外參數直通、preflight-only 早退
+- `tests/test_aicode_web_access.py` — `aicode web` 的存取控制:root safety、非本機 hostname 密碼閘、Tailscale 例外
+- `tests/test_aicode_attach.py` — `aicode attach` 與「無子指令時不得誤觸 web/attach」的回歸
+- `tests/test_script_help.py` — 維護腳本的 `--help` / 錯誤路徑 smoke(cheap return、不吐 Traceback)
 - `tests/test_test_runner.py` — 完整測試分片的完整性、決定性與 worker 上限
 - `tests/test_config.py` — config 數值的範圍與型別 sanity
-- `tests/test_sandbox.py` — `_safe_path` 不會被 `..` / 絕對路徑 / symlink 騙過
-- `tests/test_patch.py` — apply_patch 的 happy path、逃逸、context 不符、max 限制
-- `tests/test_patch_context_locate.py` — apply_patch content 定位契約:行號選填/錯誤無害、空白 context 行容錯、多處匹配 fail-loud 與行號消歧、已套用冪等、重疊拒絕
+- `tests/test_fs_sandbox.py` — §3 第一道閘:`_safe_path` 擋 `..`/絕對路徑/symlink、`read_file` 的內容型別分流(BOM/UTF-16/二進位/預算)、`analyze_file` 入口不洩漏外部路徑存不存在;整份 smoke
+- `tests/test_patch_parser.py` — apply_patch 的 unified-diff parser:多檔 hunk、header 變體、格式異常拒絕;整份 smoke
+- `tests/test_patch_apply.py` — apply_patch 套用階段:context 必須匹配、max files/lines、行號選填、多處匹配 fail-loud、已套用冪等;整份 smoke
 - `tests/test_repeat_guard.py` — 唯讀查詢工具的重複呼叫偵測(同參數同結果 → 打斷文字;結果變了 → 歸零)
 - `tests/test_run_command.py` — 白名單 + shell 元字元 + 注入防護
-- `tests/test_eval_consistency.py` — eval ↔ config / source 不漂移
-- `tests/test_readme_consistency.py` — README / docs ↔ mcp_server.py / config.py 不漂移
+- `tests/test_repo_consistency.py` — README/docs ↔ `mcp_server.py`/`config.py` 不漂移,以及 eval ↔ config/source 不漂移
 - `tests/test_doctor.py` — doctor 各 check 的 happy / fail / skip 路徑(含 context/offload)
 - `tests/test_context_budget.py` — token 估算、hard gate、metrics 解析、telemetry 隱私
 - `tests/test_code_context.py` — bounded code evidence 的 range merge、content dedupe、
   `2000..30000` 字元 budget，以及 symlink/binary/ignored-path 安全回歸
 - `tests/test_trim.py` — per-tool trim 策略、`[CTX_TRIMMED]`/`[TOOL_SUMMARY]` 標記、優先級
 - `tests/test_external_import.py` — `import_external_file` 白名單、副檔名、大小限制
-- `tests/test_mcp_root_safety.py` — `root_safety.validate_aicode_root` 拒絕 `/` / `$HOME` /不存在的 root,並守住 mcp_server 真的有接上去
+- `tests/test_mcp_startup.py` — 啟動閘三層:`validate_aicode_root` 純函式、mcp_server 真的有接上去(靜態)、真 spawn 一次驗 listening 與 `/` 被拒;整份 smoke
+- `tests/test_mcp_runtime_policy.py` — `runtime_policy` 的 patch/run_command/build 決策 + 兩條 startup banner 端對端錨點;整份 smoke
 - `tests/test_index_scope.py` — 索引範圍:三態走訪 ≡ `should_index_file` 的不變式、rescue 四測、Layer C loader fail-loud(schema/權限/pattern 衛生)、matcher 方言向量、symlink containment、快取 fingerprint 遷移、`index_stats` root 驗證;全部離線且用合成樹名
 - `tests/test_code_smoke_eval.py` — code inference fixture schema(舊 16 題 + 五類各 4 題 blocking core + bounded stretch)、deterministic plumbing stub、HTTP poison、chars-only context metrics 與 fixture cache 隔離
-- `tests/test_mcp_smoke.py` — MCP server stdio 啟動與基本 tool 呼叫
-- `tests/test_rerank_mmr_relevance.py` — MMR 不得蓋掉 cross-encoder 排序:rerank 分數當相關度、embedding 只算多樣性懲罰、min-max 正規化、半套 relevance 退回舊行為、跳過 rerank 時無分數;離線
+- `tests/test_rag_rerank.py` — rerank policy(何時呼叫、失敗如何降級)+ MMR 不得蓋掉 cross-encoder 排序(rerank 分數當相關度、embedding 只算多樣性懲罰、min-max 正規化);離線
 - `tests/test_contextual_signals.py` — 雙訊號不變式:ctx 不進 evidence/REF/strict 來源、六個決策點逐一讀 gate、`_should_rerank` 三分支、merge 聚合 gate、lexical bypass 走 gate BM25、雙矩陣儲存與 required-schema 對照、旗標四象限;離線
 - `tests/test_context_generation.py` — 生成端:loopback 雙棧判定、非 loopback 需顯式同意、3xx/HTTP 錯當傳輸失敗、環境 proxy 隔離、快取檔名/權限/symlink 逃逸、write-through 與零呼叫冪等、指紋涵蓋模型檔 size+mtime、single-writer 鎖、窗公式含 `RESERVED_OUTPUT_TOKENS`、map/reduce 路徑、空回應重試一次、覆蓋率閘;HTTP 全 mock,離線
 - `tests/test_extracted_document.py` — `ExtractedDocument` 單一真相:章節 span 連續性、重複標題各自成節、chunk 的 char span 定位、PDF 頁 span/跨頁 page_range、「短頁被歸到上一頁章節」回歸、五個入口的 chunk 形狀一致;離線且用合成語料
@@ -83,14 +92,17 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 - `tests/test_lessons.py` — lessons(行為教訓)store 驗證 fail-loud、20 條上限、scope/review_by 過濾、render 注入、過期停注入+複審提示、管理 CLI 與完整生命週期;純檔案系統,離線
 - `tests/test_web_server_scripts.py` — `aicode_web` 的 Tailscale IPv4 鎖定、headless tmux launcher、前景 preflight 擋下、參數防繞過與 stop/help smoke；Tailscale / OpenCode 不連真服務
 - `tests/test_gpu_safety.py` — `gpu_safety.py` 的 server /props 觀測、SafetyVerdict 分支;完全離線(nvidia-smi 與 llama-server HTTP 都用 hook 注入 fixture)
-- `tests/test_resolve_server_ctx.py` — `/props` n_ctx 自動跟隨；server 缺席／例外時 non-blocking fallback
-- `tests/test_check_status_script.py` — `check_status.py` 的 nvidia-smi process 計數、跨 GPU PID 去重、report-only / strict exit code;nvidia-smi 完全用 stub
+- `tests/test_ctx_resolution.py` — n_ctx 多來源優先序,以及 `/props` 自動跟隨與 server 缺席時的 non-blocking fallback
+- `tests/test_server_lifecycle.py` — `check_status.py` 的 nvidia-smi process 計數/跨 GPU PID 去重/exit code,與 `stop_servers` 的等待與強制終止;nvidia-smi 完全用 stub
 - `tests/test_deployment_profile.py` — profile schema/precedence、惡意值拒絕、registry/mmproj、main/aux GPU precedence、`-ngl auto --fit` 參數驗證
 - `tests/test_deployment_status.py` — port/cmdline role 辨識、錯卡/錯模型;process 與 HTTP 都用 hook
-- `tests/test_profile_server_launchers.py` — launch_servers / stop_servers 各 `--scope` 的離線 dry-run 相容性(含壞設定檔時 stop 退路)
-- `tests/test_set_config.py` — `set_config.sh` 的前置檢查(llama-server/依賴缺失通知)、GPU/模型偵測分類、shard 齊全性、mmproj 多重配對、純問答契約(使用者選擇題無預設值、四段式一角色一組、reranker internal buffer 必答且 `--yes` 需 `--rerank-ctx`、threads 不提問改 auto、範圍顯示用 `-`、選項外輸入重問、`--yes` 缺旗標指名報錯、超大配置不被容量擋下)、start.sh 結尾 nvidia-smi 提醒、VL 不自動當 main、摘要確認/離開、opencode.json 合併、bind 安全預設、legacy env 清除、transaction restore 與 end-to-end dry-run;I/O 全用 fixture
-- `tests/test_set_config_cpu_moe.py` — CPU-MoE 只問層數(MoE 才詢問、dense 印原因略過、dense 給非 0 旗標要報錯)、GGUF expert tensor 解析(含 per-layer 編號與 split shard)、choose_cpu_moe_layers 純輸入驗證(0-1024;0=不 offload、≥ 層數上限=全放 RAM、build 缺旗標時的降級)、build_main_parameters 參數組裝、`cpu_moe`/`n_cpu_moe` 的 main+vl schema/argv(embedding/reranker 拒絕);完全離線且大檔用 sparse fixture
-- `tests/test_launch_rollback.py` — launcher 啟動失敗的 rollback(pipe-pane 持久 log、清理本次 tmux session、`AICODE_NO_ROLLBACK`)與依模型大小放大的 health timeout;tmux 用 monkeypatch
+- `tests/test_server_launch.py` — launch_servers / stop_servers 各 `--scope` 的離線 dry-run(含壞設定檔退路)、啟動失敗 rollback(pipe-pane log、清 tmux session、`AICODE_NO_ROLLBACK`)、依模型大小放大的 health timeout、RAG server 腳本契約;tmux 用 monkeypatch
+- `tests/test_set_config_flow.py` — 問答流程與旗標契約:前置檢查(llama-server/依賴缺失通知)、純問答(使用者選擇題無預設值、四段式一角色一組、reranker internal buffer 必答且 `--yes` 需 `--rerank-ctx`、threads 不提問改 auto、範圍顯示用 `-`、選項外輸入重問、`--yes` 缺旗標指名報錯)、範圍驗證、超大配置不被容量擋下
+- `tests/test_set_config_artifacts.py` — 產出物:`~/start.sh`(nvidia-smi 提醒、GPU pin、bind 安全預設、legacy env 清除)、deployment.json、opencode.json 合併、備份/restore transaction、end-to-end dry-run
+- `tests/test_set_config_models.py` — 模型探索與 CPU-MoE:GPU/模型偵測分類、shard 齊全性、mmproj 多重配對、VL 不自動當 main、GGUF expert tensor 解析(含 per-layer 編號與 split shard)、`choose_cpu_moe_layers`(0=不 offload、≥ 上限=全放 RAM、build 缺旗標降級)、`cpu_moe`/`n_cpu_moe` 的 main+vl schema/argv(embedding/reranker 拒絕);大檔用 sparse fixture
+- `tests/_set_config_harness.py` — 上面三份共用的 fixture 產生器與兩種呼叫入口(`run()` in-process、`run_subprocess()` 走 `bash set_config.sh`);不是 test module
+- `tests/test_smoke_gate.py` — smoke 包的組成契約:AGENTS.md §3 的每個安全檢查點都必須帶 smoke 標記
+- `tests/_harness.py` — 跨 module 共用的重型 harness(aicode wrapper 子行程、mcp_server spawn/等待/收屍);不是 test module
 
 ---
 
@@ -102,7 +114,7 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 ```bash
 python scripts/check_eval_consistency.py
 python scripts/check_readme_consistency.py
-python scripts/run_tests.py tests/test_eval_consistency.py tests/test_readme_consistency.py
+python scripts/run_tests.py tests/test_repo_consistency.py
 ```
 
 漂移範例（已修，避免再犯）：
@@ -137,13 +149,13 @@ python scripts/run_tests.py tests/test_eval_consistency.py tests/test_readme_con
   pseudo embedding 只叫 deterministic plumbing stub，不代表真 semantic 品質；
   `--with-servers` 才是手動 real-model lane，永不成為 CI 必要條件。
 - `scripts/check_eval_consistency.py`：不跑 LLM，只檢查 eval expected 是否和 `config.py` / source code 漂移。
-- `tests/test_eval_consistency.py`：把 consistency check 接進 pytest。
+- `tests/test_repo_consistency.py`：把 consistency check 接進 pytest。
 
 常用命令：
 
 ```bash
 python scripts/check_eval_consistency.py
-python scripts/run_tests.py tests/test_eval_consistency.py
+python scripts/run_tests.py tests/test_repo_consistency.py
 python eval/run_retrieval_eval.py
 python eval/run_eval.py --test-set all --verbose
 ```
@@ -613,8 +625,8 @@ root 只能來自 `--root` 或 `AICODE_ROOT`,都沒有就報錯不猜 cwd;驗證
 
 - `eval/`
 - `scripts/check_eval_consistency.py`
-- `tests/test_eval_consistency.py`
-- `tests/test_cli.py` 裡 `eval/run_eval.py --help` 的 smoke test
+- `tests/test_repo_consistency.py`
+- `tests/test_script_help.py` 裡 `eval/run_eval.py --help` 的 smoke test
 - `README.md`、`README_DEV.md` 裡的 eval 說明
 
 若刪 data flywheel，至少同步處理：

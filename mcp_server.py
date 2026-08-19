@@ -115,6 +115,7 @@ from agent_tools import ToolExecutor
 from media import set_sandbox_root, ocr_image, read_elf, read_binary, read_pdf, IMAGE_EXTENSIONS, ELF_EXTENSIONS, BINARY_EXTENSIONS
 from external_import import import_external_file as _import_external_file
 from http_client import close_session
+from runtime_policy import EXTRA_BUILD_COMMANDS, resolve_runtime_policy
 from utils import (
     answer_with_self_check,
     needs_grounding,
@@ -141,37 +142,16 @@ except ImportError:
 # OpenCode runtime defaults: patch/run_tests 預設開,但尊重 env 顯式關閉。
 # 早期版本是無條件 force-on,使用者設 AI_CODE_PATCH=0 也會被吞掉 — 那違反
 # CodeTrail 「fail loud over silent fallback」 的原則。改成 env-aware default。
-_TRUTHY = ("1", "true", "yes")
-_FALSY = ("0", "false", "no")
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name, "").lower()
-    if raw in _TRUTHY:
-        return True
-    if raw in _FALSY:
-        return False
-    return default
-
-
-config.PATCH_ENABLED = _env_bool("AI_CODE_PATCH", default=True)
-config.RUN_COMMAND_ENABLED = _env_bool("AI_CODE_RUN_TESTS", default=True)
+_POLICY = resolve_runtime_policy()
+config.PATCH_ENABLED = _POLICY.patch_enabled
+config.RUN_COMMAND_ENABLED = _POLICY.run_command_enabled
 
 # Build 命令(make/cmake/ninja/meson/bazel)會跑專案內的 build script,
 # 風險面比 pytest/cargo test 大。預設不掛白名單,要分析自己的專案再
 # 顯式打開 AI_CODE_ENABLE_BUILD_COMMANDS=1。
 # 直接 mutate config.ALLOWED_COMMANDS,agent_tools 透過 from-import 共用同一個 list 物件
-_BUILD_COMMANDS_ENABLED = _env_bool("AI_CODE_ENABLE_BUILD_COMMANDS", default=False)
-_EXTRA_BUILD_COMMANDS = [
-    "make",
-    "cmake",
-    "cmake --build",
-    "ninja",
-    "meson",
-    "meson setup",
-    "meson compile",
-    "bazel build",
-]
+_BUILD_COMMANDS_ENABLED = _POLICY.build_commands_enabled
+_EXTRA_BUILD_COMMANDS = list(EXTRA_BUILD_COMMANDS)
 if _BUILD_COMMANDS_ENABLED:
     for _c in _EXTRA_BUILD_COMMANDS:
         if _c not in config.ALLOWED_COMMANDS:

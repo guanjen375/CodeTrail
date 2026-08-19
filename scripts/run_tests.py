@@ -2,7 +2,7 @@
 """統一測試入口 — 隔離外部 pytest plugin，並加速完整測試。
 
 用途:
-    python scripts/run_tests.py            # 依 test file 分片並行跑全部 pytest
+    python scripts/run_tests.py            # 依 test file 分片並行跑全部 pytest(最多 8 shard)
     AICODE_TEST_JOBS=1 python scripts/run_tests.py  # 序列完整測試
     python scripts/run_tests.py -k cli     # 有 args 時等於 pytest -k cli（序列）
     python scripts/run_tests.py -x -v ...  # args 原樣 forward
@@ -20,16 +20,18 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ElementTree
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEST_ROOT = REPO_ROOT / "tests"
-MAX_PARALLEL_JOBS = 4
+MAX_PARALLEL_JOBS = 8
 # pytest 預設的 python_files(pyproject 沒有覆寫)。分片必須用同一組樣式並
 # 遞迴掃,否則 tests/integration/test_x.py 或 foo_test.py 會被並行模式靜默
 # 漏掉——序列 pytest 收得到、並行綠燈卻是假的。
@@ -42,6 +44,15 @@ NORECURSE_DIR_PATTERNS = (
     "*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv",
     "{arch}", "__pycache__",
 )
+# 上一輪完整測試量到的每檔耗時(秒)。檔案大小是很差的耗時預測:同樣 30KB,
+# 一個是 40 條純函式斷言(0.03s),另一個是 17 條各 fork 一次 aicode(5.6s)。
+# 所以跑完一次就把實測寫下來,下一次直接拿來分片;沒有這份檔(第一次跑 / 新增
+# 的測試檔)才退回大小啟發式。這份檔在 .pytest_cache 底下,已在 .gitignore。
+WEIGHTS_FILE = REPO_ROOT / ".pytest_cache" / "shard_weights.json"
+# 大小啟發式 → 秒的換算,由實測校準(拆檔前 test_cli.py 權重 277k ↔ 14.07s)。
+HEURISTIC_BYTES_PER_SECOND = 20_000
+# junit 只記 setup/call/teardown,不含 module import 與 collection;補一個固定量。
+FILE_OVERHEAD_SECONDS = 0.08
 
 
 def _relax_windows_pytest_tmp_acl() -> None:
@@ -79,9 +90,11 @@ def _resolve_parallel_jobs(
         try:
             jobs = int(raw)
         except ValueError as exc:
-            raise ValueError("AICODE_TEST_JOBS 必須是 1..4 的整數") from exc
+            raise ValueError(
+                f"AICODE_TEST_JOBS 必須是 1..{MAX_PARALLEL_JOBS} 的整數"
+            ) from exc
         if not 1 <= jobs <= MAX_PARALLEL_JOBS:
-            raise ValueError("AICODE_TEST_JOBS 必須是 1..4 的整數")
+            raise ValueError(f"AICODE_TEST_JOBS 必須是 1..{MAX_PARALLEL_JOBS} 的整數")
         return jobs
 
     available = os.cpu_count() if cpu_count is None else cpu_count
@@ -112,22 +125,93 @@ def _discover_test_files(root: Path | None = None) -> list[Path]:
     return sorted(found)
 
 
-def _test_file_weight(path: Path) -> int:
-    """用檔案大小 + process-bound 測試密度做穩定、免歷史資料的粗估。"""
+def _weight_key(path: Path) -> str:
+    """分片權重的檔案鍵:相對 tests/ 的 posix 路徑;不在 tests/ 底下就用檔名。"""
+    try:
+        return path.resolve().relative_to(TEST_ROOT).as_posix()
+    except ValueError:
+        return path.name
+
+
+def _load_measured_weights(weights_file: Path | None = None) -> dict[str, float]:
+    """讀上一輪的實測秒數;檔案不存在 / 壞掉一律當成「沒有資料」。"""
+    target = WEIGHTS_FILE if weights_file is None else weights_file
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    measured: dict[str, float] = {}
+    for key, value in raw.items():
+        if isinstance(key, str) and isinstance(value, (int, float)) and value > 0:
+            measured[key] = float(value)
+    return measured
+
+
+def _collect_measured_weights(junit_paths: Sequence[Path]) -> dict[str, float]:
+    """把各 shard 的 junit XML 併成 {tests/ 相對路徑: 秒}。"""
+    totals: dict[str, float] = {}
+    for junit_path in junit_paths:
+        try:
+            root = ElementTree.parse(junit_path).getroot()
+        except (OSError, ElementTree.ParseError):
+            continue
+        for case in root.iter("testcase"):
+            classname = case.get("classname") or ""
+            if not classname.startswith("tests."):
+                continue
+            module = classname.split(".")[1] if "." in classname else ""
+            if not module:
+                continue
+            try:
+                elapsed = float(case.get("time") or 0.0)
+            except ValueError:
+                continue
+            key = f"{module}.py"
+            totals[key] = totals.get(key, 0.0) + elapsed
+    return {key: value + FILE_OVERHEAD_SECONDS for key, value in totals.items()}
+
+
+def _write_measured_weights(weights: Mapping[str, float],
+                            weights_file: Path | None = None) -> None:
+    if not weights:
+        return
+    target = WEIGHTS_FILE if weights_file is None else weights_file
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps({k: round(v, 3) for k, v in sorted(weights.items())}, indent=1),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass  # 權重只是最佳化;寫不進去不該讓測試失敗
+
+
+def _test_file_weight(path: Path, measured: Mapping[str, float] | None = None) -> float:
+    """這個 test module 的預估耗時(秒)。有上一輪實測就用實測,否則用大小啟發式。"""
+    if measured:
+        hit = measured.get(_weight_key(path))
+        if hit is not None:
+            return hit
     source = path.read_text(encoding="utf-8")
-    return len(source.encode("utf-8")) + 8_000 * source.count("subprocess.")
+    raw = len(source.encode("utf-8")) + 8_000 * source.count("subprocess.")
+    return raw / HEURISTIC_BYTES_PER_SECOND
 
 
-def _partition_test_files(paths: Sequence[Path], jobs: int) -> list[list[Path]]:
+def _partition_test_files(paths: Sequence[Path], jobs: int,
+                          measured: Mapping[str, float] | None = None) -> list[list[Path]]:
     """Largest-first greedy 分片；同一 test module 不拆，避免重複重型 import。"""
     if jobs < 1:
         raise ValueError("jobs must be positive")
     if not paths:
         return []
+    if measured is None:
+        measured = _load_measured_weights()
     buckets: list[list[Path]] = [[] for _ in range(min(jobs, len(paths)))]
-    loads = [0] * len(buckets)
+    loads = [0.0] * len(buckets)
     weighted = sorted(
-        ((_test_file_weight(path), path) for path in paths),
+        ((_test_file_weight(path, measured), path) for path in paths),
         key=lambda item: (-item[0], item[1].as_posix()),
     )
     for weight, path in weighted:
@@ -158,6 +242,7 @@ def _run_parallel(env: Mapping[str, str], jobs: int) -> int:
         temp_root = Path(temp_name)
         processes: list[subprocess.Popen] = []
         log_paths: list[Path] = []
+        junit_paths: list[Path] = []
         log_files = []
         try:
             for index, shard in enumerate(shards, start=1):
@@ -165,6 +250,7 @@ def _run_parallel(env: Mapping[str, str], jobs: int) -> int:
                 shard_root.mkdir()
                 log_path = temp_root / f"shard-{index}.log"
                 log_file = open(log_path, "wb")
+                junit_path = shard_root / "junit.xml"
                 cmd = [
                     sys.executable,
                     "-m",
@@ -173,6 +259,7 @@ def _run_parallel(env: Mapping[str, str], jobs: int) -> int:
                     "-o",
                     f"cache_dir={shard_root / 'cache'}",
                     f"--basetemp={shard_root / 'tmp'}",
+                    f"--junit-xml={junit_path}",
                 ]
                 print(
                     f"[run_tests] shard {index}/{len(shards)}: {len(shard)} files",
@@ -188,6 +275,7 @@ def _run_parallel(env: Mapping[str, str], jobs: int) -> int:
                     )
                 )
                 log_paths.append(log_path)
+                junit_paths.append(junit_path)
                 log_files.append(log_file)
 
             return_codes = [process.wait() for process in processes]
@@ -207,6 +295,11 @@ def _run_parallel(env: Mapping[str, str], jobs: int) -> int:
         ):
             print(f"\n[run_tests] ===== shard {index} (exit={return_code}) =====")
             print(log_path.read_text(encoding="utf-8", errors="replace"), end="")
+
+        # 這一輪的實測耗時 → 下一輪的分片權重。只在全綠時更新:某個 shard 中途
+        # 崩掉的話它的 junit 是殘缺的,拿去當權重會讓下一輪分得更差。
+        if all(code == 0 for code in return_codes):
+            _write_measured_weights(_collect_measured_weights(junit_paths))
 
     failed = [index for index, code in enumerate(return_codes, start=1) if code != 0]
     if failed:

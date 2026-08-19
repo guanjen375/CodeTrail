@@ -1,9 +1,14 @@
 """scripts/ctx_safety_check.py 的 CLI 行為測試。"""
 from __future__ import annotations
 
+import pytest
+
 from gpu_safety import SafetyVerdict
 from scripts import ctx_safety_check as ctx
 
+# smoke:AGENTS.md §2.1 第 1 款「真實發生過的 bug 的 regression」
+# 真實 bug regression:ctx 安全閘。
+pytestmark = pytest.mark.smoke
 
 def _unknown_verdict(requested: int) -> SafetyVerdict:
     return SafetyVerdict(

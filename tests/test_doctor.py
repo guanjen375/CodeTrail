@@ -565,9 +565,10 @@ def test_check_packages_fails_on_pymupdf4llm_pin_mismatch(monkeypatch):
 def test_require_pymupdf4llm_verifies_without_real_package(monkeypatch):
     """釘版驗證不能只在「本機有裝真套件」時才被測到（importorskip 缺口）：
     用假 module + PackageNotFoundError 走 __version__ fallback 路徑。"""
+    import importlib.metadata as _md
     import sys as _sys
     import types
-    import importlib.metadata as _md
+
     import config
 
     fake = types.ModuleType("pymupdf4llm")

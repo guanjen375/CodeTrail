@@ -17,8 +17,8 @@ import pytest
 import extracted_document
 import RAG
 from extracted_document import (
-    ExtractedDocument,
     PAGE_SEPARATOR,
+    ExtractedDocument,
     extract_sections,
     normalize_document_text,
 )

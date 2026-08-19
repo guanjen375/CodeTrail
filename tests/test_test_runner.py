@@ -55,7 +55,10 @@ def test_parallel_job_resolution(env, cpu_count, expected):
     assert run_tests._resolve_parallel_jobs(env, cpu_count=cpu_count) == expected
 
 
-@pytest.mark.parametrize("value", ["0", "5", "many", "1.5"])
+@pytest.mark.parametrize(
+    "value",
+    ["0", str(run_tests.MAX_PARALLEL_JOBS + 1), "many", "1.5"],
+)
 def test_parallel_job_resolution_rejects_invalid_values(value):
     with pytest.raises(ValueError, match="AICODE_TEST_JOBS"):
         run_tests._resolve_parallel_jobs({"AICODE_TEST_JOBS": value}, cpu_count=64)
