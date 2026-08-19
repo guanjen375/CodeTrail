@@ -24,6 +24,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 mcp = pytest.importorskip("mcp", reason="mcp 套件未安裝;OpenCode + MCP 路線才需要")
 
 
+def test_fastmcp_v1_import_contract():
+    """requirements 不得解出已移除現行 import path 的 MCP SDK 2.x。"""
+    from mcp.server.fastmcp import FastMCP
+
+    assert FastMCP is not None
+
+
 def _spawn_mcp(tmp_root: Path, env_overrides: dict[str, str] | None = None) -> subprocess.Popen:
     env = os.environ.copy()
     env["AICODE_ROOT"] = str(tmp_root)

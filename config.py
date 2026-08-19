@@ -631,6 +631,11 @@ CODE_RAG_CACHE_FILE = ".code_rag_cache.json"
 # 這個名字為前綴;index_scope 的 artifact 前綴防線靠這點涵蓋它們。
 CODE_RAG_GRAPH_FILE = ".code_rag_graph.sqlite3"
 CODE_RAG_GRAPH_LOCK_FILE = ".code_rag_graph.lock"
+# ``code_rag_search(mode="context")`` 的 evidence text 裝箱限制。這是純字元
+# budget，不是 tokenizer token 數，也不是 context_budget.py 的 LLM hard gate。
+CODE_CONTEXT_DEFAULT_MAX_CHARS = 12_000
+CODE_CONTEXT_MIN_MAX_CHARS = 2_000
+CODE_CONTEXT_MAX_MAX_CHARS = 30_000
 CODE_RAG_AUTO_PREREAD = True
 CODE_RAG_PREREAD_TOP_K = 3           # 減少預讀數量，降低 I/O（優化：5->3）
 CODE_RAG_PREREAD_TOP_K_BUG = 3       # Bug 模式預讀更少，靠 stack trace 補

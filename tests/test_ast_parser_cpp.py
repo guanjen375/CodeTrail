@@ -155,6 +155,45 @@ def test_declaration_is_not_a_definition():
     assert computes[0].start_line == 3
 
 
+def test_c_definition_linkage_and_preprocessor_condition_are_preserved():
+    content = (
+        "static int local_helper(void) { return 1; }\n"
+        "#if defined(BOARD_ALPHA)\n"
+        "int variant_init(void) { return 2; }\n"
+        "#else\n"
+        "int variant_init(void) { return 3; }\n"
+        "#endif\n"
+    )
+    symbols = _parse("variant.c", content)
+    local = next(sym for sym in symbols if sym.name == "local_helper")
+    variants = [sym for sym in symbols if sym.name == "variant_init"]
+
+    assert local.linkage == "internal"
+    assert local.condition is None
+    assert len(variants) == 2
+    assert all(sym.linkage == "external" for sym in variants)
+    assert variants[0].condition == "#if defined(BOARD_ALPHA)"
+    assert variants[1].condition == "#if defined(BOARD_ALPHA) > #else"
+
+
+def test_cpp_static_member_is_not_translation_unit_internal():
+    symbols = _parse(
+        "member.cpp",
+        "class Device { public: static int ready(void) { return 1; } };\n",
+    )
+    ready = next(sym for sym in symbols if sym.name == "ready")
+    assert ready.linkage == "external"
+
+
+def test_cpp_anonymous_namespace_function_is_internal():
+    symbols = _parse(
+        "anonymous.cpp",
+        "namespace { int hidden(void) { return 1; } }\n",
+    )
+    hidden = next(sym for sym in symbols if sym.name == "hidden")
+    assert hidden.linkage == "internal"
+
+
 def test_malformed_source_does_not_crash_and_extracts_best_effort():
     content = (
         "int ok_before(void) {\n"

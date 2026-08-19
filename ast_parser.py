@@ -102,6 +102,10 @@ class Symbol:
     # graph 的 stable node ID 依賴 qualified_name;backend 進 evidence 揭露。
     qualified_name: Optional[str] = None
     backend: Optional[str] = None
+    # C/C++ graph metadata。其他語言維持 None；definition 至少區分
+    # internal(`static`)與 external，condition 保存外層 preprocessor branch。
+    linkage: Optional[str] = None
+    condition: Optional[str] = None
 
 
 class PythonASTParser:
@@ -525,6 +529,8 @@ class TreeSitterParser:
                     symbols.append(self._make_symbol(
                         node, lines, name, sym_type, parent_name,
                         qualified_name=f"{qualified_prefix}{name}",
+                        linkage=self._cpp_function_linkage(node),
+                        condition=self._preprocessor_condition(node),
                     ))
 
         elif node_type == 'namespace_definition':
@@ -572,6 +578,48 @@ class TreeSitterParser:
         elif declarator.type == 'identifier':
             return declarator.text.decode('utf-8')
         return None
+
+    @staticmethod
+    def _cpp_function_linkage(node) -> str:
+        """C/C++ function_definition 的最低限度 linkage。"""
+        current = node.parent
+        inside_class = False
+        while current is not None:
+            if current.type in {"class_specifier", "struct_specifier"}:
+                inside_class = True
+            if (current.type == "namespace_definition"
+                    and current.child_by_field_name("name") is None):
+                return "internal"
+            current = current.parent
+        for child in node.children:
+            if child.type != "storage_class_specifier":
+                continue
+            value = child.text.decode("utf-8", errors="replace").strip()
+            # C++ static member function 仍有 class/namespace linkage；只有
+            # namespace/file scope static function 是 translation-unit local。
+            if value == "static" and not inside_class:
+                return "internal"
+        return "external"
+
+    @staticmethod
+    def _preprocessor_condition(node) -> Optional[str]:
+        """保存 function 所在的 preprocessor branch，不猜實際 build variant。"""
+        parts = []
+        current = node.parent
+        condition_nodes = {
+            "preproc_if",
+            "preproc_ifdef",
+            "preproc_elif",
+            "preproc_else",
+        }
+        while current is not None:
+            if current.type in condition_nodes:
+                first_line = current.text.decode("utf-8", errors="replace").splitlines()[0]
+                normalized = " ".join(first_line.split())[:300]
+                if normalized:
+                    parts.append(normalized)
+            current = current.parent
+        return " > ".join(reversed(parts)) or None
 
     def _extract_go_symbols(self, node, lines: list, symbols: list, parent_name: str = None):
         """提取 Go 符號"""
@@ -684,7 +732,8 @@ class TreeSitterParser:
                 self._extract_python_symbols(child, lines, symbols, parent_name)
 
     def _make_symbol(self, node, lines: list, name: str, sym_type: str, parent: str = None,
-                     qualified_name: str = None) -> Symbol:
+                     qualified_name: str = None, linkage: str = None,
+                     condition: str = None) -> Symbol:
         """建立 Symbol 物件"""
         start_line = node.start_point[0] + 1  # 轉為 1-based
         end_line = node.end_point[0] + 1
@@ -714,6 +763,8 @@ class TreeSitterParser:
             parent=parent,
             signature=signature,
             qualified_name=qualified_name,
+            linkage=linkage,
+            condition=condition,
         )
 
 

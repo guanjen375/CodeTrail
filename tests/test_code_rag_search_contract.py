@@ -20,6 +20,10 @@ import code_rag  # noqa: E402
 REQUIRED_KEYS = {"path", "symbol", "type", "line", "score"}
 OPTIONAL_KEYS = {"end_line", "parent"}
 EVIDENCE_KEYS = {"score_components", "backend", "confidence", "relations", "graph_status"}
+CONTEXT_KEYS = {
+    "query", "evidence", "uncertainties", "seeds", "graph_status", "truncated",
+    "budget_chars", "used_chars",
+}
 
 
 @pytest.fixture
@@ -150,8 +154,64 @@ def test_path_mode_rejects_bad_format_and_unknown_symbols(mcp_module):
         mcp_module.code_rag_search("entry -> no_such_symbol", mode="path")
 
 
+def test_context_mode_has_exact_top_level_contract_and_char_accounting(mcp_module):
+    [bundle] = mcp_module.code_rag_search(
+        "entry calls helper", mode="context", top_k=2, max_chars=12000
+    )
+    assert set(bundle) == CONTEXT_KEYS
+    assert bundle["graph_status"] == "ok"
+    assert bundle["budget_chars"] == 12000
+    assert bundle["evidence"]
+    assert bundle["seeds"]
+    actual = sum(len(item["text"]) for item in bundle["evidence"])
+    assert bundle["used_chars"] == actual <= bundle["budget_chars"]
+    for item in bundle["evidence"]:
+        assert item["path"] in {"app.py", "util.py"}
+        assert 1 <= item["start_line"] <= item["end_line"]
+        assert item["text"].startswith(f"=== {item['path']} (行 ")
+
+
+@pytest.mark.parametrize("bad", [1999, 30001, True, "12000"])
+def test_context_mode_rejects_invalid_max_chars(mcp_module, bad):
+    with pytest.raises(ValueError, match="2000..30000"):
+        mcp_module.code_rag_search("entry", mode="context", max_chars=bad)
+
+
+def test_context_mode_is_not_silently_capped_at_graph_8000(mcp_module, tmp_path):
+    import json
+
+    body = ["def big_context():", "    value = 0"]
+    body.extend(f"    # evidence-{i:02d}-" + "x" * 120 for i in range(68))
+    body.append("    return value")
+    (tmp_path / "big.py").write_text("\n".join(body) + "\n", encoding="utf-8")
+    code_rag.invalidate_scan_cache(tmp_path)
+
+    [bundle] = mcp_module.code_rag_search(
+        "big_context", mode="context", top_k=1, max_chars=12000
+    )
+    assert bundle["used_chars"] <= 12000
+    assert len(json.dumps(bundle, ensure_ascii=False)) > 8000
+    assert "truncation" not in bundle, "context must not pass through graph response cap"
+
+
+def test_context_telemetry_records_metadata_but_not_evidence_text(mcp_module, monkeypatch):
+    recorded = []
+    monkeypatch.setattr(mcp_module.data_flywheel, "DATA_COLLECT_ENABLED", True)
+    monkeypatch.setattr(
+        mcp_module, "_record_kb_interaction", lambda **kwargs: recorded.append(kwargs)
+    )
+
+    [bundle] = mcp_module.code_rag_search("entry helper", mode="context")
+    assert recorded and recorded[0]["extra_meta"]["mode"] == "context"
+    payload = recorded[0]
+    assert all(set(item) == {"path", "line", "symbol"}
+               for item in payload["code_snippets"])
+    evidence_text = bundle["evidence"][0]["text"]
+    assert evidence_text not in repr(payload)
+
+
 def test_unknown_mode_is_rejected(mcp_module):
-    with pytest.raises(ValueError, match="semantic|neighbors|path"):
+    with pytest.raises(ValueError, match="context"):
         mcp_module.code_rag_search("x", mode="bogus")
 
 
@@ -179,6 +239,13 @@ def test_corrupt_graph_fails_graph_modes_but_not_semantic(mcp_module, tmp_path):
     assert all(r["graph_status"].startswith("unavailable") for r in results)
     assert all(r["relations"] == [] for r in results)
 
+    # context 降級成 semantic-only evidence，不因 graph 壞掉整體失敗。
+    [bundle] = mcp_module.code_rag_search("entry", mode="context", max_chars=2000)
+    assert set(bundle) == CONTEXT_KEYS
+    assert bundle["graph_status"].startswith("unavailable")
+    assert bundle["evidence"]
+    assert all(item["reason"] == "semantic" for item in bundle["evidence"])
+
 
 # ============================================================
 # GPT 審核修正的回歸測試(2026-08-19 二輪)
@@ -202,10 +269,14 @@ def test_slim_edge_preserves_ambiguity_group(mcp_module):
         "src_name": "a", "dst_name": "b", "unresolved_target": "b",
         "ambiguity_group": "grp123", "type": "calls",
         "evidence_path": "x.c", "evidence_line": 3,
-        "backend": "tree-sitter", "confidence": "syntactic", "resolved": False,
+        "backend": "tree-sitter", "confidence": "syntactic",
+        "resolution_basis": "ambiguous_condition", "condition": "#if BOARD_A",
+        "resolved": False,
     })
     assert edge["ambiguity_group"] == "grp123"
     assert edge["resolved"] is False
+    assert edge["resolution_basis"] == "ambiguous_condition"
+    assert edge["condition"] == "#if BOARD_A"
 
 
 def test_cap_holds_for_path_mode_and_after_metadata(mcp_module):

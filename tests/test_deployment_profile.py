@@ -87,7 +87,9 @@ def test_absolute_path_profile_inherits_builtin_safe_defaults(tmp_path):
     assert profile.verification == "unverified"
     assert profile.service("main").model is None
     assert profile.service("embedding").parameters["pooling"] == "cls"
+    assert profile.service("embedding").parameters["cache_ram"] == 0
     assert profile.service("reranker").parameters["pooling"] == "rank"
+    assert profile.service("reranker").parameters["cache_ram"] == 0
     assert profile.service("vl").mmproj == "qwen3.5-9b-mmproj-f16"
 
 
@@ -348,6 +350,7 @@ def test_aux_parallel_and_vl_fit_parameters_build_expected_commands(tmp_path):
             profile.service(role), "/opt/llama-server", env, must_exist=True
         )
         assert command[command.index("-np") + 1] == "1"
+        assert command[command.index("--cache-ram") + 1] == "0"
     vl_command = build_server_command(
         profile.service("vl"), "/opt/llama-server", env, must_exist=True
     )
@@ -376,6 +379,47 @@ def test_auto_fit_parameter_validation_rejects_bad_values(tmp_path, role, parame
 
     with pytest.raises(ProfileError, match=needle):
         load_effective_profile(env)
+
+
+@pytest.mark.parametrize("role", ["embedding", "reranker"])
+@pytest.mark.parametrize("cache_ram", [0, 262_144])
+def test_aux_cache_ram_boundaries_build_expected_command(tmp_path, role, cache_ram):
+    model = tmp_path / "aux.gguf"
+    model.write_bytes(b"fixture")
+    _write_local(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "services": {role: {"model": str(model), "parameters": {"cache_ram": cache_ram}}},
+        },
+    )
+    env = _env(tmp_path)
+    service = load_effective_profile(env).service(role)
+    command = build_server_command(service, "/opt/llama-server", env, must_exist=True)
+    assert command[command.index("--cache-ram") + 1] == str(cache_ram)
+
+
+@pytest.mark.parametrize("role", ["main", "vl"])
+def test_cache_ram_is_rejected_for_generating_roles(tmp_path, role):
+    _write_local(
+        tmp_path,
+        {"schema_version": 1, "services": {role: {"parameters": {"cache_ram": 0}}}},
+    )
+    with pytest.raises(ProfileError, match="not allowed"):
+        load_effective_profile(_env(tmp_path, AICODE_MODEL="some-model"))
+
+
+@pytest.mark.parametrize("value", [-1, 262_145, True, 0.0, "0"])
+def test_cache_ram_rejects_out_of_range_bool_and_wrong_types(tmp_path, value):
+    _write_local(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "services": {"embedding": {"parameters": {"cache_ram": value}}},
+        },
+    )
+    with pytest.raises(ProfileError, match="cache_ram must be an integer in 0..262144"):
+        load_effective_profile(_env(tmp_path))
 
 
 def test_bind_defaults_to_loopback_only(tmp_path):

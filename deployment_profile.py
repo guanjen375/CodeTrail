@@ -60,8 +60,8 @@ _ROLE_PARAMETERS = {
         "fit",
         "fit_target",
     },
-    "embedding": _COMMON_PARAMETERS | {"embedding", "pooling"},
-    "reranker": _COMMON_PARAMETERS | {"embedding", "pooling", "reranking"},
+    "embedding": _COMMON_PARAMETERS | {"embedding", "pooling", "cache_ram"},
+    "reranker": _COMMON_PARAMETERS | {"embedding", "pooling", "reranking", "cache_ram"},
     # VL 最後啟動，可用 llama.cpp --fit 依前兩個 aux 的實際占用保留 VRAM。
     # MoE VL 模型同樣可以把 experts 釘進 RAM。注意 llama.cpp 的 --fit 與 tensor
     # override 互斥（common_params_fit_impl 見到 tensor_buft_overrides 已被設定就
@@ -139,7 +139,12 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
             "ctx": 8192,
             "batch": 8192,
             "ubatch": 8192,
-            "parameters": {"gpu_layers": 99, "embedding": True, "pooling": "cls"},
+            "parameters": {
+                "gpu_layers": 99,
+                "embedding": True,
+                "pooling": "cls",
+                "cache_ram": 0,
+            },
         },
         "reranker": {
             "model": "bge-reranker-v2-m3",
@@ -154,6 +159,7 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
                 "embedding": True,
                 "pooling": "rank",
                 "reranking": True,
+                "cache_ram": 0,
             },
         },
         "vl": {
@@ -335,6 +341,10 @@ def _validate_parameter(role: str, key: str, value: Any, where: str) -> None:
         upper = 4096 if key == "gpu_layers" else 1024
         if not lower <= value <= upper or (key == "threads" and value == 0):
             raise ProfileError(f"{where}.{key} is outside the allowed range")
+        return
+    if key == "cache_ram":
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 262_144:
+            raise ProfileError(f"{where}.cache_ram must be an integer in 0..262144 MiB")
         return
     if key == "fit":
         if value not in {"on", "off"}:
@@ -920,6 +930,7 @@ def build_server_command(
         ("presence_penalty", "--presence-penalty"),
         ("cache_type_k", "--cache-type-k"),
         ("cache_type_v", "--cache-type-v"),
+        ("cache_ram", "--cache-ram"),
         ("n_cpu_moe", "--n-cpu-moe"),
         ("fit", "--fit"),
         ("fit_target", "--fit-target"),

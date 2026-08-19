@@ -68,9 +68,12 @@ async def _roundtrip(project: Path):
             await session.initialize()
             tools = await session.list_tools()
             names = {t.name for t in tools.tools}
+            code_search_schema = next(
+                t.inputSchema for t in tools.tools if t.name == "code_rag_search"
+            )
             listed = await session.call_tool("list_dir", {"path": "."})
             grepped = await session.call_tool("grep_code", {"pattern": "def "})
-            return names, listed, grepped
+            return names, code_search_schema, listed, grepped
 
 
 async def _embedding_failure_roundtrip(project: Path):
@@ -100,12 +103,18 @@ def _content_text(result) -> str:
 
 def test_mcp_protocol_roundtrip(tmp_path: Path):
     project = _make_project(tmp_path)
-    names, listed, grepped = asyncio.run(
+    names, code_search_schema, listed, grepped = asyncio.run(
         asyncio.wait_for(_roundtrip(project), timeout=60)
     )
 
+    assert len(names) == 18
     for expected in ("query_knowledge", "list_dir", "read_file", "grep_code"):
         assert expected in names, f"工具 {expected} 沒註冊成功；實得 {sorted(names)}"
+    max_chars_schema = code_search_schema["properties"]["max_chars"]
+    assert max_chars_schema["type"] == "integer"
+    assert max_chars_schema["default"] == 12000
+    assert max_chars_schema["minimum"] == 2000
+    assert max_chars_schema["maximum"] == 30000
 
     assert listed.isError is False, _content_text(listed)
     listed_text = _content_text(listed)

@@ -609,6 +609,28 @@ curl -s http://localhost:8083/health   # VL
 curl -s http://localhost:8080/props | jq '.model_path, .default_generation_settings.n_ctx'
 ```
 
+### embedding / reranker 長時間服務後 host RAM 持續成長
+
+CodeTrail 的 safe-defaults 與 `set_config.sh` 產物都會對 embedding、reranker 傳
+`--cache-ram 0`。這兩個角色不會生成可重用的 prompt prefix；開著 llama.cpp 預設的
+host prompt cache，反而可能讓每筆不同輸入持續佔用 RAM。`cache_ram: 0` 只作用在
+embedding / reranker；main 仍保留生成用 prompt cache，VL 不在這個 workaround 範圍。
+
+這是針對 llama.cpp [#26293](https://github.com/ggml-org/llama.cpp/issues/26293) 的
+隔離措施；規劃時修復 [#26893](https://github.com/ggml-org/llama.cpp/pull/26893)
+仍未合併，另有跨 slot cache 還原正確性的 [#27148](https://github.com/ggml-org/llama.cpp/issues/27148)
+需獨立追蹤。因此單純升級 build 不能取代這個非生成服務預設，也不代表應順手關掉
+main cache。若 `set_config.sh` 報 build 缺 `--cache-ram`，請更新並重 build llama.cpp；
+不要在 generated launcher 手動刪旗標，否則下次重產設定會漂移。
+
+2026-08-19 曾用 build 10276 在隔離 port、CPU、單 slot 各送 40 筆全合成輸入做
+A/B。embedding 在第 10→40 筆的 RSS 是 `2699356→2707396 KiB`(`8192`)與
+`2699320→2707360 KiB`(`0`)；reranker 是 `2101252→2109412 KiB` 與
+`2101212→2109372 KiB`，兩組各自約 `268` / `272 KiB/request` 且輸出逐組一致。
+第一筆另有約 0.9 GiB 的一次性 compute allocation。因為無 GPU 且兩條軌跡幾乎
+相同，這次本機量測結論是 **inconclusive**，不可拿來宣稱已重現或修復線性 cache
+成長；安全預設仍依上游 issue/PR 與 schema/argv 離線測試保留。
+
 ### embedding `/health` 正常、短 `curl` 成功,但 `ingest_document` 回 500
 
 先看 embedding server log:

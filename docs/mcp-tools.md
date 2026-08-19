@@ -18,6 +18,7 @@
 |---|---|---|
 | 先看 repo 長什麼樣 | 請用工具 `list_dir` 看專案結構，找 entry point、測試和設定檔。 | `list_dir(...)` |
 | 不知道程式在哪 | 請先用工具 `code_rag_search` 搜尋「初始化流程」，再用工具 `read_file` 讀最相關檔案。 | `code_rag_search(...)`、`read_file(...)` |
+| 想一次取得有限推導證據 | 請用工具 `code_rag_search`,mode 設 "context",query 寫要分析的問題,max_chars 設 12000；依 path:line 區分已證實和 uncertainty。 | `code_rag_search(query="...", mode="context", max_chars=12000)` |
 | 想看呼叫鏈 | 請用工具 `code_rag_search`,mode 設 "path",query 寫 "main -> uart_send",把每一步的檔案與行號列出來。 | `code_rag_search(query="main -> uart_send", mode="path")` |
 | 找某個字串或錯誤訊息 | 請用工具 `grep_code` 搜尋錯誤訊息「panic: xxx」，範圍限 C/C++ 檔，並顯示上下文。 | `grep_code(...)` |
 | 讀一個已知檔案 | 請用工具 `file_info` 看 `src/main.py` 大小，再用工具 `read_file` 讀前 120 行。 | `file_info(...)`、`read_file(...)` |
@@ -37,7 +38,7 @@
 | 類型 | 工具 | 白話用途 |
 |---|---|---|
 | 專案探索 | `list_dir(path=".", depth=2)` | 看目錄樹，不要叫模型跑 `ls` |
-| 專案探索 | `code_rag_search(query, top_k=5, mode="semantic", hops=1, include_evidence=False)` | 用「這段程式在做什麼」去找可能的函式/class。`mode="neighbors"`(query 放 symbol 名看 1–2 hop 呼叫關係;放 repo 相對檔案路徑如 `src/uart.c` 看該檔的 include/import 關係);`mode="path"`(query 寫 `"SRC -> DST"`)拿跨檔案呼叫鏈,每一步都附 `檔:行` 證據且只走確定解析的邊(同名多候選的歧義邊不入鏈);`include_evidence=True` 讓 semantic 結果多帶分數組成 / parser backend / graph 1-hop 關係。graph 對 C/C++(tree-sitter)與 Python 抽 definitions / includes / calls;**首次建置是顯式動作**:graph 尚未建立時 graph 模式會報錯,**錯誤訊息內含一條可直接複製到終端執行的建立命令**(實際的 MCP python interpreter + CodeTrail repo 內 `code_graph.py` 的絕對路徑 + 實際專案 root——手動形式是 `<MCP_PYTHON> <CODETRAIL_REPO>/code_graph.py --root <AICODE_ROOT>`);建好後查詢自動增量;function pointer 與 macro 間接呼叫會誠實標 unresolved,不亂猜目標 |
+| 專案探索 | `code_rag_search(query, top_k=5, mode="semantic", hops=1, include_evidence=False, max_chars=12000)` | 用「這段程式在做什麼」去找可能的函式/class。`mode="context"` 把 semantic seeds、確定 1-hop caller/callee/include 與相關 test/header/config/trace lexical evidence 合併去重後裝箱；`max_chars` 只在此模式使用，合法 `2000..30000`，`used_chars` 只計 evidence text，歧義/unresolved 只列在 `uncertainties`。它不走 graph mode 的 8000-char cap；graph 缺席時回 semantic-only evidence 並標 `graph_status`。`mode="neighbors"`(query 放 symbol 名看 1–2 hop 呼叫關係;放 repo 相對檔案路徑如 `src/uart.c` 看該檔的 include/import 關係);`mode="path"`(query 寫 `"SRC -> DST"`)拿跨檔案呼叫鏈,每一步都附 `檔:行` 證據且只走確定解析的邊(同名多候選的歧義邊不入鏈);`include_evidence=True` 讓 semantic 結果多帶分數組成 / parser backend / graph 1-hop 關係。graph 對 C/C++(tree-sitter)與 Python 抽 definitions / includes / calls；C/C++ 只信 same-file、可見 prototype 對應的唯一 external definition、或 C++ exact qualified name，edge 會標 `resolution_basis` / `confidence` / condition。`static` 不跨 translation unit，repo-owned quote/angle header 可形成 transitive visibility，條件分支無 build variant 時維持 ambiguous，function pointer/macro 維持 unresolved。**首次建置是顯式動作**:graph 尚未建立時 graph 模式會報錯,**錯誤訊息內含一條可直接複製到終端執行的建立命令**(實際的 MCP python interpreter + CodeTrail repo 內 `code_graph.py` 的絕對路徑 + 實際專案 root——手動形式是 `<MCP_PYTHON> <CODETRAIL_REPO>/code_graph.py --root <AICODE_ROOT>`);建好後自動偵測變更，C/C++ visibility 變更會 full rebuild 以維持與 fresh build 等價 |
 | 專案探索 | `grep_code(pattern, path=".", include=None, context=0)` | 搜錯誤訊息、函式名、設定名 |
 | 專案探索 | `file_info(path)` | 讀檔前先看大小，避免一次塞爆 context |
 | 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=50000)` | 讀檔案內容，長檔要分段 |
@@ -57,7 +58,8 @@
 
 ### 使用原則
 
-- 找程式碼時，先請模型用工具 `code_rag_search` 或 `grep_code`，再用工具 `read_file`。
+- 分析、解釋、推導或找原因時，先用 `code_rag_search(mode="context")` 一次取得 bounded evidence；不足才做精準 `grep_code` / `read_file`，同一 query 不重複。
+- 只想定位程式碼時，用工具 `code_rag_search` 或 `grep_code`，再用工具 `read_file`。
 - 問「誰呼叫了 X」「X 怎麼一路呼叫到 Y」時,用 `code_rag_search` 的 `mode="neighbors"`(query 放 symbol 名)/ `mode="path"`;問「這個檔直接 include 了誰」時,`mode="neighbors"` 的 query 放 repo 相對檔案路徑。回傳的關係每一步都有 `檔:行` 證據,unresolved(function pointer / macro 間接呼叫)與歧義候選(同名多定義)會明講。graph 首次建置要在終端跑一次建立命令——沒建就查 graph 模式會明確報錯,**錯誤訊息就含完整可執行的那條命令**(實際 interpreter 與絕對路徑,直接複製貼上;semantic 不受影響);建好之後查詢自動偵測檔案變更做增量更新,安裝 tree-sitter grammar 或改 `AICODE_H_LANG` 後會自動整體重建。
 - 檔案變更偵測有一個 30 秒的快照窗(`AICODE_CODE_RAG_REFRESH_TTL`,設 0 關閉):透過 CodeTrail 工具(`apply_patch` / `run_command` / `run_lint`)寫檔會立即失效重掃;**在外部編輯器改檔**則最長 30 秒內的查詢可能還看到舊索引,屬既知取捨。
 - 長檔先用工具 `file_info` 看大小，再要求工具 `read_file` 分段讀。

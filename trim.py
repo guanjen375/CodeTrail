@@ -53,7 +53,9 @@ PRI_GENERIC = 3
 
 # Heuristics: pattern → priority. Used when we don't know the originating
 # tool (e.g. message["content"] was prefixed by agent code).
-_HIGH_PRIORITY_TOOLS = {"read_file", "grep", "find", "list_files"}
+_HIGH_PRIORITY_TOOLS = {
+    "read_file", "grep", "find", "list_files", "code_rag_search",
+}
 _COMMAND_TOOLS = {"run_command", "run_tests"}
 
 

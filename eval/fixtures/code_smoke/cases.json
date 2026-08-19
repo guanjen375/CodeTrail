@@ -22,6 +22,35 @@
       "root": "variants_mini",
       "true_call_edges": [],
       "true_unresolved_calls": []
+    },
+    "workflow_mini": {
+      "root": "workflow_mini",
+      "true_call_edges": [
+        "recovery_cycle->watchdog_note_heartbeat",
+        "recovery_cycle->retry_execute",
+        "dispatch_alarm->alarm_queue_push",
+        "install_hook->hook_register",
+        "sensor_irq->alarm_queue_push",
+        "private_driver_reset->private_reset",
+        "service_user_flush->service_commit",
+        "boot_driver_a->init",
+        "boot_driver_b->init",
+        "verify_retry_budget_case->retry_execute",
+        "verify_missed_heartbeat_case->watchdog_tick",
+        "verify_oldest_alarm_case->alarm_queue_push",
+        "verify_blank_calibration_case->calibration_load",
+        "verify_retry_layout_case->retry_execute",
+        "verify_watchdog_layout_case->watchdog_tick",
+        "verify_alarm_layout_case->alarm_queue_push",
+        "verify_hook_signature_case->hook_register",
+        "verify_hook_signature_case->hook_dispatch",
+        "verify_config_generation_case->config_guard_validate"
+      ],
+      "true_unresolved_calls": [
+        "rogue_entry->private_reset",
+        "hook_dispatch->RUN_HOOK",
+        "f17->x9"
+      ]
     }
   },
   "cases": [
@@ -258,6 +287,254 @@
       "requires": [],
       "expected_unresolved": false,
       "must_abstain": true
+    },
+    {
+      "id": "core_001",
+      "repo": "workflow_mini",
+      "family": "code2test",
+      "blocking": true,
+      "task_type": "workflow_retrieval",
+      "question": "verify retry budget after a transient sensor outage",
+      "seed_files": ["src/retry.c", "tests/test_workflows.c"],
+      "gold_files": ["src/retry.c", "tests/test_workflows.c"],
+      "gold_symbols": ["retry_execute", "verify_retry_budget_case"]
+    },
+    {
+      "id": "core_002",
+      "repo": "workflow_mini",
+      "family": "code2test",
+      "blocking": true,
+      "task_type": "workflow_retrieval",
+      "question": "test safe-mode entry after three missed heartbeats",
+      "seed_files": ["src/watchdog.c", "tests/test_workflows.c"],
+      "gold_files": ["src/watchdog.c", "tests/test_workflows.c"],
+      "gold_symbols": ["watchdog_tick", "verify_missed_heartbeat_case"]
+    },
+    {
+      "id": "core_003",
+      "repo": "workflow_mini",
+      "family": "code2test",
+      "blocking": true,
+      "task_type": "workflow_retrieval",
+      "question": "validate queue overflow keeps the oldest alarm",
+      "seed_files": ["src/alarm_queue.c", "tests/test_workflows.c"],
+      "gold_files": ["src/alarm_queue.c", "tests/test_workflows.c"],
+      "gold_symbols": ["alarm_queue_push", "verify_oldest_alarm_case"]
+    },
+    {
+      "id": "core_004",
+      "repo": "workflow_mini",
+      "family": "code2test",
+      "blocking": true,
+      "task_type": "workflow_retrieval",
+      "question": "exercise calibration fallback when coefficients are blank",
+      "seed_files": ["src/calibration.c", "tests/test_workflows.c"],
+      "gold_files": ["src/calibration.c", "tests/test_workflows.c"],
+      "gold_symbols": ["calibration_load", "verify_blank_calibration_case"]
+    },
+    {
+      "id": "core_005",
+      "repo": "workflow_mini",
+      "family": "trace2code",
+      "blocking": true,
+      "task_type": "workflow_retrieval",
+      "question": "assertion trace pending_count <= capacity after ISR burst",
+      "seed_files": ["src/alarm_queue.c", "src/isr.c"],
+      "gold_files": ["src/alarm_queue.c", "src/isr.c"],
+      "gold_symbols": ["alarm_queue_push", "sensor_irq"]
+    },
+    {
+      "id": "core_006",
+      "repo": "workflow_mini",
+      "family": "trace2code",
+      "blocking": true,
+      "task_type": "workflow_retrieval",
+      "question": "FAULT_WDOG_EXPIRED appears after the third missed heartbeat",
+      "seed_files": ["src/watchdog.c"],
+      "gold_files": ["src/watchdog.c", "tests/test_workflows.c"],
+      "gold_symbols": ["watchdog_tick"]
+    },
+    {
+      "id": "core_007",
+      "repo": "workflow_mini",
+      "family": "trace2code",
+      "blocking": true,
+      "task_type": "workflow_retrieval",
+      "question": "boot log reports configuration generation mismatch",
+      "seed_files": ["src/config_guard.c", "tests/test_workflows.c"],
+      "gold_files": ["src/config_guard.c", "config/runtime_limits.h", "tests/test_workflows.c"],
+      "gold_symbols": ["config_guard_validate", "verify_config_generation_case"]
+    },
+    {
+      "id": "core_008",
+      "repo": "workflow_mini",
+      "family": "trace2code",
+      "blocking": true,
+      "task_type": "workflow_retrieval",
+      "question": "boot dispatch fails because the callback registry is empty",
+      "seed_files": ["src/hook_dispatch.c"],
+      "gold_files": ["src/hook_dispatch.c", "include/fw/hook_api.h"],
+      "gold_symbols": ["hook_dispatch"]
+    },
+    {
+      "id": "core_009",
+      "repo": "workflow_mini",
+      "family": "edit2ripple",
+      "blocking": true,
+      "task_type": "workflow_retrieval",
+      "question": "changing the public retry policy layout which callers tests and generated config need review",
+      "seed_files": ["src/app.c", "tests/test_workflows.c"],
+      "gold_files": ["include/fw/retry_policy.h", "src/retry.c", "src/app.c", "tests/test_workflows.c", "config/runtime_limits.h"],
+      "gold_symbols": ["recovery_cycle", "verify_retry_layout_case"]
+    },
+    {
+      "id": "core_010",
+      "repo": "workflow_mini",
+      "family": "edit2ripple",
+      "blocking": true,
+      "task_type": "workflow_retrieval",
+      "question": "rename the heartbeat timeout field and find dispatch behavior compatibility tests and config",
+      "seed_files": ["src/watchdog.c", "tests/test_workflows.c"],
+      "gold_files": ["include/fw/watchdog.h", "src/watchdog.c", "src/app.c", "tests/test_workflows.c", "config/runtime_limits.h"],
+      "gold_symbols": ["watchdog_tick", "verify_watchdog_layout_case"]
+    },
+    {
+      "id": "core_011",
+      "repo": "workflow_mini",
+      "family": "edit2ripple",
+      "blocking": true,
+      "task_type": "workflow_retrieval",
+      "question": "add a severity field to the alarm record and locate ISR producers consumers and tests",
+      "seed_files": ["src/isr.c", "src/app.c", "tests/test_workflows.c"],
+      "gold_files": ["include/fw/alarm_queue.h", "src/alarm_queue.c", "src/isr.c", "src/app.c", "tests/test_workflows.c"],
+      "gold_symbols": ["sensor_irq", "dispatch_alarm", "verify_alarm_layout_case"]
+    },
+    {
+      "id": "core_012",
+      "repo": "workflow_mini",
+      "family": "edit2ripple",
+      "blocking": true,
+      "task_type": "workflow_retrieval",
+      "question": "change the hook callback signature and find registration callers callback table and tests",
+      "seed_files": ["src/hook_dispatch.c", "src/app.c", "tests/test_workflows.c"],
+      "gold_files": ["include/fw/hook_api.h", "src/hook_dispatch.c", "src/app.c", "tests/test_workflows.c"],
+      "gold_symbols": ["hook_dispatch", "install_hook", "verify_hook_signature_case"]
+    },
+    {
+      "id": "core_013",
+      "repo": "workflow_mini",
+      "family": "firmware_semantics",
+      "blocking": true,
+      "task_type": "graph_invariant",
+      "question": "translation-unit static linkage must not cross files",
+      "graph_checks": [
+        {"kind": "resolved", "source_path": "src/driver_a.c", "source_symbol": "boot_driver_a", "target_path": "src/driver_a.c", "target_symbol": "init"},
+        {"kind": "resolved", "source_path": "src/driver_b.c", "source_symbol": "boot_driver_b", "target_path": "src/driver_b.c", "target_symbol": "init"},
+        {"kind": "resolved", "source_path": "src/private_driver.c", "source_symbol": "private_driver_reset", "target_path": "src/private_driver.c", "target_symbol": "private_reset"},
+        {"kind": "unresolved", "source_path": "src/rogue.c", "source_symbol": "rogue_entry", "target_symbol": "private_reset"}
+      ]
+    },
+    {
+      "id": "core_014",
+      "repo": "workflow_mini",
+      "family": "firmware_semantics",
+      "blocking": true,
+      "task_type": "graph_invariant",
+      "question": "repo angle header declaration makes one external definition visible",
+      "graph_checks": [
+        {"kind": "include", "source_path": "src/service_user.c", "target_path": "include/fw/service.h"},
+        {"kind": "resolved", "source_path": "src/service_user.c", "source_symbol": "service_user_flush", "target_path": "src/service.c", "target_symbol": "service_commit"}
+      ]
+    },
+    {
+      "id": "core_015",
+      "repo": "workflow_mini",
+      "family": "firmware_semantics",
+      "blocking": true,
+      "task_type": "graph_invariant",
+      "question": "conditional duplicate definitions stay ambiguous without a build variant",
+      "graph_checks": [
+        {"kind": "ambiguous", "source_path": "src/variant.c", "source_symbol": "variant_boot", "target_symbol": "variant_init"},
+        {"kind": "no_path", "source_symbol": "variant_boot", "target_symbol": "variant_init"}
+      ]
+    },
+    {
+      "id": "core_016",
+      "repo": "workflow_mini",
+      "family": "firmware_semantics",
+      "blocking": true,
+      "task_type": "graph_invariant",
+      "question": "macro wrapper and callback table remain syntactic evidence",
+      "graph_checks": [
+        {"kind": "unresolved", "source_path": "src/hook_dispatch.c", "source_symbol": "hook_dispatch", "target_symbol": "RUN_HOOK"},
+        {"kind": "no_resolved_calls", "source_path": "src/hook_dispatch.c", "source_symbol": "hook_dispatch"}
+      ]
+    },
+    {
+      "id": "core_017",
+      "repo": "workflow_mini",
+      "family": "selective_retrieval",
+      "blocking": true,
+      "task_type": "abstain",
+      "question": "where is the firmware image CRC64 polynomial verified",
+      "gold_files": [],
+      "gold_symbols": [],
+      "must_abstain": true
+    },
+    {
+      "id": "core_018",
+      "repo": "workflow_mini",
+      "family": "selective_retrieval",
+      "blocking": true,
+      "task_type": "abstain",
+      "question": "which routine decrypts the satellite boot manifest",
+      "gold_files": [],
+      "gold_symbols": [],
+      "must_abstain": true
+    },
+    {
+      "id": "core_019",
+      "repo": "workflow_mini",
+      "family": "selective_retrieval",
+      "blocking": true,
+      "task_type": "abstain",
+      "question": "where does sm_transition enter the idle state in this repository",
+      "gold_files": [],
+      "gold_symbols": [],
+      "must_abstain": true
+    },
+    {
+      "id": "core_020",
+      "repo": "workflow_mini",
+      "family": "selective_retrieval",
+      "blocking": true,
+      "task_type": "abstain",
+      "question": "show the ethernet packet checksum offload implementation",
+      "gold_files": [],
+      "gold_symbols": [],
+      "must_abstain": true
+    },
+    {
+      "id": "stretch_001",
+      "repo": "workflow_mini",
+      "family": "low_lexical_overlap",
+      "blocking": false,
+      "task_type": "workflow_retrieval",
+      "question": "opaque boot handoff reaches the retained fast vector table",
+      "seed_files": ["startup/bridge.c"],
+      "gold_files": ["startup/bridge.c", "config/linker_layout.cfg"],
+      "gold_symbols": ["f17"]
+    },
+    {
+      "id": "stretch_002",
+      "repo": "workflow_mini",
+      "family": "low_lexical_overlap",
+      "blocking": false,
+      "task_type": "workflow_retrieval",
+      "question": "locate the anonymous startup transfer into the latency-critical interrupt region",
+      "seed_files": ["startup/bridge.c"],
+      "gold_files": ["startup/bridge.c", "config/linker_layout.cfg"],
+      "gold_symbols": ["f17"]
     }
   ]
 }

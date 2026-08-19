@@ -147,7 +147,8 @@ def _write_fake_nvidia_smi(bin_dir: Path, output: str, exit_code: int = 0) -> No
 
 
 def _write_fake_llama(
-    tmp_path: Path, help_flags: str = "--fit --cpu-moe --n-cpu-moe --reranking --mmproj"
+    tmp_path: Path,
+    help_flags: str = "--fit --cpu-moe --n-cpu-moe --reranking --mmproj --cache-ram",
 ) -> Path:
     executable = tmp_path / "llama-server"
     executable.write_text(
@@ -277,11 +278,11 @@ def test_yes_run_generates_all_artifacts(tmp_path):
     assert services["reranker"]["model"].endswith("bge-reranker-v2-m3-Q8_0.gguf")
     assert services["vl"]["model"] == str(models / "vl" / "vl-model-q6.gguf")
     assert services["vl"]["mmproj"] == str(models / "vl" / "mmproj-F16.gguf")
-    assert services["embedding"]["parameters"] == {"parallel": 1}
+    assert services["embedding"]["parameters"] == {"parallel": 1, "cache_ram": 0}
     assert services["reranker"]["ctx"] == 8192
     assert services["reranker"]["batch"] == 8192
     assert services["reranker"]["ubatch"] == 8192
-    assert services["reranker"]["parameters"] == {"parallel": 1}
+    assert services["reranker"]["parameters"] == {"parallel": 1, "cache_ram": 0}
     assert services["vl"]["parameters"] == {
         "gpu_layers": "auto",
         "parallel": 1,
@@ -586,7 +587,7 @@ def test_missing_llama_binary_fails_with_build_hint(tmp_path):
 def test_llama_without_reranking_support_fails(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
-    _write_fake_llama(tmp_path, help_flags="--fit --mmproj")  # 沒有 --reranking
+    _write_fake_llama(tmp_path, help_flags="--fit --mmproj --cache-ram")  # 沒有 --reranking
     proc = _run(tmp_path, "--yes", "--models-dir", str(models))
     assert proc.returncode == 2
     assert "--reranking" in proc.stderr
@@ -596,7 +597,7 @@ def test_llama_without_reranking_support_fails(tmp_path):
 def test_cpu_moe_mode_requires_llama_cpu_moe_flag(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
-    _write_fake_llama(tmp_path, help_flags="--fit --reranking --mmproj")
+    _write_fake_llama(tmp_path, help_flags="--fit --reranking --mmproj --cache-ram")
 
     # big-chat 假檔不是 GGUF → layout 無法解析;--cpu-moe 仍尊重旗標,
     # 但 build 不支援就要硬停。
@@ -613,7 +614,7 @@ def test_cpu_moe_mode_requires_llama_cpu_moe_flag(tmp_path):
 def test_generated_vl_safety_requires_llama_fit_flag(tmp_path):
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = _make_models(tmp_path)
-    _write_fake_llama(tmp_path, help_flags="--cpu-moe --reranking --mmproj")
+    _write_fake_llama(tmp_path, help_flags="--cpu-moe --reranking --mmproj --cache-ram")
 
     proc = _run(
         tmp_path, "--yes", "--no-cpu-moe", "--no-preview", "--models-dir", str(models)
@@ -622,6 +623,22 @@ def test_generated_vl_safety_requires_llama_fit_flag(tmp_path):
     assert proc.returncode == 2
     assert "安全的 VL placement 需要 llama-server --fit" in proc.stderr
     assert "重新 build" in proc.stderr
+
+
+def test_llama_without_cache_ram_support_fails_before_questions(tmp_path):
+    _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = _make_models(tmp_path)
+    _write_fake_llama(
+        tmp_path,
+        help_flags="--fit --cpu-moe --n-cpu-moe --reranking --mmproj",
+    )
+
+    proc = _run(tmp_path, "--yes", "--models-dir", str(models))
+
+    assert proc.returncode == 2
+    assert "--cache-ram" in proc.stderr
+    assert "更新並重新 build" in proc.stderr
+    assert "[3/5]" not in proc.stdout
 
 
 def test_incomplete_shards_are_reported_with_missing_names(tmp_path):
@@ -1018,7 +1035,7 @@ def test_missing_fit_stops_at_preflight_before_any_questions(tmp_path):
     不能讓使用者答完所有互動題才發現白忙一場。"""
     _write_fake_nvidia_smi(tmp_path / "bin", "0, Small GPU, 24576, 20000, GPU-small")
     models = _make_models(tmp_path)
-    _write_fake_llama(tmp_path, help_flags="--reranking --mmproj")  # 沒有 --fit
+    _write_fake_llama(tmp_path, help_flags="--reranking --mmproj --cache-ram")  # 沒有 --fit
 
     proc = _run(tmp_path, "--yes", "--models-dir", str(models))
     assert proc.returncode == 2
@@ -1291,7 +1308,7 @@ def test_build_without_n_cpu_moe_support_degrades_to_full_cpu_moe(tmp_path):
     """llama-server 沒有 --n-cpu-moe(舊 build):互動輸入的層數改用全 --cpu-moe
     並提示;--n-cpu-moe 旗標則直接報錯。"""
     _write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
-    _write_fake_llama(tmp_path, help_flags="--fit --cpu-moe --reranking --mmproj")
+    _write_fake_llama(tmp_path, help_flags="--fit --cpu-moe --reranking --mmproj --cache-ram")
     models = _moe_models_needing_cpu_moe(tmp_path)
 
     proc = _run(tmp_path, "--no-preview", "--models-dir", str(models),

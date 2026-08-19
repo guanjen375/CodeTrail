@@ -2,7 +2,7 @@
 
 # 核心
 requests>=2.28.0    # llama-server HTTP client
-mcp>=1.0.0          # MCP server（mcp_server.py 用）
+mcp>=1.28,<2         # MCP server（現行 FastMCP import 只相容 SDK 1.x）
 numpy>=1.21.0       # RAG / MMR 向量運算
 jieba>=0.42.1       # 中文 BM25 切詞（缺少時可降級，但預設安裝確保檢索品質）
 # C/C++ AST 解析（Code RAG symbol / graph 抽取;缺席時 c/cpp 降級 regex,

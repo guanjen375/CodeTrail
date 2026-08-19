@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import argparse
 import importlib
+from importlib import metadata as importlib_metadata
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -96,19 +98,74 @@ def check_python(r: Result) -> None:
 
 
 _REQUIRED_PACKAGES = [
+    ("mcp", "MCP server 必要 — python3 -m pip install \"mcp>=1.28,<2\""),
     ("requests", "必要 — HTTP 請求"),
 ]
 _OPTIONAL_PACKAGES = [
-    ("mcp", "MCP server 需要 — pip install mcp"),
     ("numpy", "提升 RAG/MMR 速度，非必要 — pip install numpy"),
     ("jieba", "中文 BM25 精準度，非必要 — pip install jieba"),
     ("pymupdf4llm", "PDF ingestion 才需要 — pip install \"pymupdf4llm==1.28.0\"(釘驗證版)"),
     ("html2text", "RAG.py --url 抓網頁才需要 — pip install html2text"),
 ]
 
+_MCP_REQUIREMENT = "mcp>=1.28,<2"
+_MCP_RELEASE_RE = re.compile(r"^(\d+)\.(\d+)(?:\.|[-+]|$)")
+
+
+def check_mcp_runtime(r: Result) -> None:
+    """驗證現行 FastMCP runtime 所需的 MCP Python SDK 1.x 契約。"""
+    try:
+        importlib.import_module("mcp")
+    except ImportError:
+        r.fail(
+            "package mcp 沒裝（MCP runtime 必要）— "
+            f'python3 -m pip install "{_MCP_REQUIREMENT}"'
+        )
+        return
+
+    try:
+        version = importlib_metadata.version("mcp")
+    except importlib_metadata.PackageNotFoundError:
+        r.fail(
+            "package mcp 可 import，但讀不到 distribution version；"
+            f'請重裝：python3 -m pip install --upgrade "{_MCP_REQUIREMENT}"'
+        )
+        return
+    except Exception as exc:
+        r.fail(f"package mcp 無法讀取版本 ({exc})")
+        return
+
+    match = _MCP_RELEASE_RE.match(version)
+    if match is None:
+        r.fail(
+            f"package mcp 版本格式無法辨識 ({version!r})；"
+            f'請重裝：python3 -m pip install --upgrade "{_MCP_REQUIREMENT}"'
+        )
+        return
+
+    major, minor = (int(part) for part in match.groups())
+    if major >= 2:
+        r.fail(
+            f"package mcp=={version} 不相容：目前仍使用 SDK 1.x 的 "
+            "mcp.server.fastmcp.FastMCP；MCP 2.x migration 必須獨立進行。\n"
+            f'        修復：python3 -m pip install --upgrade "{_MCP_REQUIREMENT}"'
+        )
+        return
+    if major != 1 or minor < 28:
+        r.fail(
+            f"package mcp=={version} 太舊，目前需要 {_MCP_REQUIREMENT}。\n"
+            f'        修復：python3 -m pip install --upgrade "{_MCP_REQUIREMENT}"'
+        )
+        return
+
+    r.ok(f"package mcp=={version} (runtime required, FastMCP SDK 1.x)")
+
 
 def check_packages(r: Result) -> None:
     for name, hint in _REQUIRED_PACKAGES:
+        if name == "mcp":
+            check_mcp_runtime(r)
+            continue
         try:
             importlib.import_module(name)
             r.ok(f"package {name}")

@@ -9,7 +9,10 @@ import json
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -43,6 +46,12 @@ def test_doctor_no_network_exits_clean(monkeypatch, tmp_path):
     env.pop("OPENCODE_CONFIG", None)
     env["HOME"] = str(tmp_path)
     env["USERPROFILE"] = str(tmp_path)
+    # HOME 隔離會關掉真實 user-site；MCP 已是 runtime required，因此把目前
+    # 測試 interpreter 已驗證可用的 site-packages 明確傳給 doctor 子行程。
+    env["PYTHONPATH"] = os.pathsep.join(
+        [path for path in sys.path if path]
+        + [env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
     r = subprocess.run(
         [sys.executable, str(REPO_ROOT / "scripts" / "doctor.py"), "--no-network"],
         capture_output=True, text=True, timeout=30, cwd=str(REPO_ROOT),
@@ -106,6 +115,39 @@ def test_python_version_pass():
     doc.check_python(r)
     assert r.passes
     assert not r.fails
+
+
+def test_check_mcp_runtime_fails_when_package_is_absent(monkeypatch):
+    def _missing(name: str):
+        assert name == "mcp"
+        raise ImportError(name)
+
+    monkeypatch.setattr(doc.importlib, "import_module", _missing)
+    r = doc.Result()
+    doc.check_mcp_runtime(r)
+    assert any("mcp 沒裝" in message for message in r.fails)
+    assert not r.passes
+
+
+@pytest.mark.parametrize("version", ["1.28.0", "1.29.0"])
+def test_check_mcp_runtime_accepts_supported_v1_versions(monkeypatch, version):
+    monkeypatch.setattr(doc.importlib, "import_module", lambda name: types.ModuleType(name))
+    monkeypatch.setattr(doc.importlib_metadata, "version", lambda name: version)
+    r = doc.Result()
+    doc.check_mcp_runtime(r)
+    assert not r.fails
+    assert any(f"mcp=={version}" in message for message in r.passes)
+
+
+@pytest.mark.parametrize("version", ["1.27.9", "2.0.0"])
+def test_check_mcp_runtime_rejects_incompatible_versions(monkeypatch, version):
+    monkeypatch.setattr(doc.importlib, "import_module", lambda name: types.ModuleType(name))
+    monkeypatch.setattr(doc.importlib_metadata, "version", lambda name: version)
+    r = doc.Result()
+    doc.check_mcp_runtime(r)
+    assert r.fails
+    assert any('mcp>=1.28,<2' in message for message in r.fails)
+    assert not r.passes
 
 
 def test_check_opencode_ai_entry_warns_when_cli_missing(monkeypatch):

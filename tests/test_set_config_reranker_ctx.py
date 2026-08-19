@@ -79,4 +79,4 @@ def test_selected_reranker_ctx_sets_context_and_physical_batch(tmp_path):
     assert service["ctx"] == 2048
     assert service["batch"] == 2048
     assert service["ubatch"] == 2048
-    assert service["parameters"] == {"parallel": 1}
+    assert service["parameters"] == {"parallel": 1, "cache_ram": 0}

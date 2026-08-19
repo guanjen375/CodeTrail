@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Code smoke eval — 16 題,離線、零 server 接觸的 Code-RAG/graph 回歸 harness。
+"""Code inference smoke eval — 舊 16 題 + 20 core + 2 stretch 的離線 harness。
 
 離線保證(三道,缺一不可):
   1. embedding 取得路徑被 monkeypatch 成 SHA-256(normalized text) 展開的
@@ -15,8 +15,8 @@
   --record-baseline   把現況數字寫進 eval/fixtures/code_smoke/baseline.json
                       (不 gate;Step 0 用)
   (預設)             依 §3.5 判準 gate,任一組不過 exit 1
-  --with-servers      手動 warm-latency 冒煙(真 dense+rerank;server 不在
-                      graceful skip;永不入 gate)
+  --with-servers      manual real-model lane(真 dense+rerank;server 不在
+                      graceful skip;永不入 CI gate)
 
 fixture 不攜帶 validation_command;評分全部在本檔內建決定性計算。
 """
@@ -41,6 +41,17 @@ CASES_FILE = FIXTURE_DIR / "cases.json"
 BASELINE_FILE = FIXTURE_DIR / "baseline.json"
 
 PSEUDO_EMBED_DIM = 64
+LEGACY_CASE_COUNT = 16
+BLOCKING_CORE_COUNT = 20
+MAX_STRETCH_CASES = 4
+CONTEXT_BUDGETS = (12_000, 28_000)
+CORE_FAMILIES = (
+    "code2test",
+    "trace2code",
+    "edit2ripple",
+    "firmware_semantics",
+    "selective_retrieval",
+)
 
 # --with-servers 手動模式的固定問題(字面值常數,不從 fixture 讀)。
 WARM_LATENCY_QUERIES = [
@@ -113,8 +124,31 @@ def install_offline_stubs() -> None:
 def load_cases() -> dict:
     data = json.loads(CASES_FILE.read_text(encoding="utf-8"))
     cases = data["cases"]
-    if len(cases) != 16:
-        raise RuntimeError(f"expected 16 smoke cases, got {len(cases)}")
+    ids = [case.get("id") for case in cases]
+    if len(ids) != len(set(ids)):
+        raise RuntimeError("code smoke case ids must be unique")
+    if any("validation_command" in case for case in cases):
+        raise RuntimeError("fixtures must not contain executable validation_command fields")
+    legacy = [case for case in cases if str(case.get("id", "")).startswith("smoke_")]
+    core = [case for case in cases if case.get("blocking") is True]
+    stretch = [case for case in cases if str(case.get("id", "")).startswith("stretch_")]
+    if len(legacy) != LEGACY_CASE_COUNT:
+        raise RuntimeError(f"expected {LEGACY_CASE_COUNT} legacy cases, got {len(legacy)}")
+    if len(core) != BLOCKING_CORE_COUNT:
+        raise RuntimeError(f"expected {BLOCKING_CORE_COUNT} blocking core cases, got {len(core)}")
+    family_counts = {
+        family: sum(case.get("family") == family and case.get("blocking") is True for case in core)
+        for family in CORE_FAMILIES
+    }
+    if any(count != 4 for count in family_counts.values()):
+        raise RuntimeError(f"blocking core must contain four cases per family: {family_counts}")
+    if not 1 <= len(stretch) <= MAX_STRETCH_CASES:
+        raise RuntimeError(f"expected 1..{MAX_STRETCH_CASES} stretch cases, got {len(stretch)}")
+    for case in cases:
+        if case.get("repo") not in data.get("repos", {}):
+            raise RuntimeError(f"case {case.get('id')} references unknown repo")
+        if not isinstance(case.get("question"), str) or not case["question"].strip():
+            raise RuntimeError(f"case {case.get('id')} has no question")
     return data
 
 
@@ -161,6 +195,75 @@ def eval_retrieval_case(case: dict, rags: dict) -> dict:
         "symbol_hit": bool(gold_symbols) and any(s in gold_symbols for s in symbols),
         "empty": len(results) == 0,
     }
+
+
+def retrieval_metrics(results: list[dict], gold_files: list[str]) -> dict:
+    """純計算的 file Recall@5 / MRR；供 runner 與單元測試共用。"""
+    normalized_gold = {path.replace("\\", "/") for path in gold_files}
+    ranked_paths = [item.get("path", "").replace("\\", "/") for item in results[:5]]
+    hits = normalized_gold.intersection(ranked_paths)
+    reciprocal_rank = 0.0
+    for rank, path in enumerate(ranked_paths, start=1):
+        if path in normalized_gold:
+            reciprocal_rank = 1.0 / rank
+            break
+    return {
+        "file_recall_at_5": len(hits) / len(normalized_gold) if normalized_gold else 0.0,
+        "mrr": reciprocal_rank,
+        "hit_files": sorted(hits),
+    }
+
+
+def _workflow_ranked_items(case: dict, rag) -> list[dict]:
+    # CI structural lane:用 CodeRAG 自己的 lexical view 排序 parser 產出的 symbols。
+    # pseudo embedding 只在舊 smoke/hybrid plumbing 路徑使用，不能拿隨機向量的
+    # threshold hit/miss 冒充真實 semantic 品質。
+    tokens = rag._extract_code_tokens(case["question"])
+    ranked = sorted(
+        (
+            (rag._token_match_score(tokens, item), item)
+            for item in rag.index
+        ),
+        key=lambda pair: (-pair[0], pair[1].get("path", ""), pair[1].get("line", 0)),
+    )
+    return [dict(item, score=float(score)) for score, item in ranked if score > 0][:5]
+
+
+def eval_workflow_retrieval_case(case: dict, rags: dict) -> dict:
+    rag = rags[case["repo"]]
+    raw_results = _workflow_ranked_items(case, rag)
+    compact = [
+        {
+            "path": item.get("path", "").replace("\\", "/"),
+            "symbol": item.get("symbol", ""),
+        }
+        for item in raw_results
+    ]
+    metrics = retrieval_metrics(compact, case.get("seed_files", case.get("gold_files", [])))
+    return {
+        "id": case["id"],
+        "family": case["family"],
+        "blocking": bool(case.get("blocking")),
+        "lane": "ci_structural_lexical",
+        "results": compact,
+        **metrics,
+        "seed_hit": bool(metrics["hit_files"]),
+    }
+
+
+def summarize_retrieval_families(results: list[dict]) -> dict[str, dict]:
+    summary: dict[str, dict] = {}
+    for family in sorted({item["family"] for item in results}):
+        members = [item for item in results if item["family"] == family]
+        summary[family] = {
+            "cases": len(members),
+            "file_recall_at_5": round(
+                sum(item["file_recall_at_5"] for item in members) / len(members), 4
+            ),
+            "mrr": round(sum(item["mrr"] for item in members) / len(members), 4),
+            "seed_hits": sum(item["seed_hit"] for item in members),
+        }
+    return summary
 
 
 # ============================================================
@@ -245,6 +348,78 @@ def eval_fp_case(case: dict, graphs: dict) -> dict:
     }
 
 
+def _source_edges(graph, path: str, symbol: str) -> tuple[list[dict], str | None]:
+    nodes = [node for node in graph.find_nodes(symbol) if node["path"] == path]
+    if len(nodes) != 1:
+        return [], f"source {path}:{symbol} resolved to {len(nodes)} nodes"
+    node_id = nodes[0]["id"]
+    neighborhood = graph.neighbors(
+        node_id, edge_types=("calls",), direction="out", hops=1, limit=100
+    )
+    return [edge for edge in neighborhood["edges"] if edge["src_id"] == node_id], None
+
+
+def eval_graph_check(check: dict, graph) -> dict:
+    kind = check["kind"]
+    if kind == "include":
+        got = graph.file_includes(check["source_path"])
+        ok = check["target_path"] in got
+        return {"kind": kind, "pass": ok, "got": got, "expected": check["target_path"]}
+    if kind == "no_path":
+        paths = graph.shortest_evidence_paths(
+            {check["source_symbol"]}, {check["target_symbol"]}, max_hops=4, limit=3
+        )
+        return {"kind": kind, "pass": not paths, "paths": paths}
+
+    edges, error = _source_edges(graph, check["source_path"], check["source_symbol"])
+    if error:
+        return {"kind": kind, "pass": False, "error": error}
+    if kind == "no_resolved_calls":
+        resolved = [edge for edge in edges if edge["resolved"]]
+        return {"kind": kind, "pass": not resolved, "resolved": resolved}
+    target = check["target_symbol"]
+    if kind == "unresolved":
+        matching = [
+            edge for edge in edges
+            if not edge["resolved"] and edge.get("unresolved_target") == target
+        ]
+        return {"kind": kind, "pass": bool(matching), "matching": matching}
+    if kind == "ambiguous":
+        matching = [
+            edge for edge in edges
+            if not edge["resolved"] and edge.get("ambiguity_group")
+            and (edge.get("unresolved_target") == target or edge.get("dst_name") == target)
+        ]
+        groups = {edge["ambiguity_group"] for edge in matching}
+        return {
+            "kind": kind,
+            "pass": len(matching) >= 2 and len(groups) == 1,
+            "matching": matching,
+        }
+    if kind == "resolved":
+        target_nodes = [
+            node for node in graph.find_nodes(target)
+            if node["path"] == check["target_path"]
+        ]
+        target_ids = {node["id"] for node in target_nodes}
+        matching = [
+            edge for edge in edges if edge["resolved"] and edge.get("dst_id") in target_ids
+        ]
+        return {"kind": kind, "pass": bool(matching), "matching": matching}
+    return {"kind": kind, "pass": False, "error": "unknown graph check kind"}
+
+
+def eval_graph_invariant_case(case: dict, graphs: dict) -> dict:
+    graph = graphs[case["repo"]]
+    checks = [eval_graph_check(check, graph) for check in case["graph_checks"]]
+    return {
+        "id": case["id"],
+        "family": case["family"],
+        "checks": checks,
+        "pass": all(check["pass"] for check in checks),
+    }
+
+
 def eval_graph_precision(graphs: dict, repos_info: dict) -> dict:
     extracted = []
     for name, g in graphs.items():
@@ -256,14 +431,156 @@ def eval_graph_precision(graphs: dict, repos_info: dict) -> dict:
     correct = sum(
         1 for name, edge in extracted if edge in set(repos_info[name]["true_call_edges"])
     )
+    expected = {
+        (name, edge)
+        for name, info in repos_info.items()
+        for edge in info["true_call_edges"]
+    }
+    extracted_set = set(extracted)
     return {
         "precision": correct / len(extracted),
+        "representable_recall": len(extracted_set & expected) / len(expected) if expected else 1.0,
         "extracted": len(extracted),
         "correct": correct,
+        "representable": len(expected),
+        "false_resolved": sorted(f"{name}:{edge}" for name, edge in extracted_set - expected),
+        "missing_representable": sorted(f"{name}:{edge}" for name, edge in expected - extracted_set),
     }
 
 
 _TRUE_EDGES_BY_REPO: dict[str, set[str]] = {}
+
+
+def budgeted_context_metrics(bundle: dict, gold_files: list[str]) -> dict:
+    """以純字元計算 context coverage/precision；不聲稱 tokenizer token 數。"""
+    evidence = bundle.get("evidence", []) if isinstance(bundle, dict) else []
+    budget_chars = int(bundle.get("budget_chars", 0)) if isinstance(bundle, dict) else 0
+    actual_used = sum(len(str(item.get("text", ""))) for item in evidence)
+    declared_used = int(bundle.get("used_chars", actual_used)) if isinstance(bundle, dict) else 0
+    evidence_files = {str(item.get("path", "")).replace("\\", "/") for item in evidence}
+    gold = {path.replace("\\", "/") for path in gold_files}
+    hits = evidence_files & gold
+    return {
+        "budget_chars": budget_chars,
+        "used_chars": actual_used,
+        "declared_used_chars": declared_used,
+        "within_budget": actual_used <= budget_chars and declared_used == actual_used,
+        "gold_file_coverage": len(hits) / len(gold) if gold else 1.0,
+        "evidence_precision": len(hits) / len(evidence_files) if evidence_files else 0.0,
+        "hit_files": sorted(hits),
+        "truncated": bool(bundle.get("truncated")) if isinstance(bundle, dict) else False,
+    }
+
+
+def unavailable_context_report(cases: list[dict]) -> dict:
+    return {
+        "available": False,
+        "reason": "code_context bounded bundle is not implemented yet",
+        "budgets": {
+            str(budget): {
+                "budget_chars": budget,
+                "used_chars": 0,
+                "gold_file_coverage": 0.0,
+                "evidence_precision": 0.0,
+                "truncation_cases": 0,
+                "cases": len(cases),
+            }
+            for budget in CONTEXT_BUDGETS
+        },
+    }
+
+
+class _CountingExecutor:
+    """Eval-only wrapper:count the grep text a multi-round agent would receive."""
+
+    def __init__(self, executor):
+        self._executor = executor
+        self.root = executor.root
+        self.grep_chars = 0
+
+    def _safe_path(self, path):
+        return self._executor._safe_path(path)
+
+    def grep(self, *args, **kwargs):
+        output = self._executor.grep(*args, **kwargs)
+        self.grep_chars += len(output) if isinstance(output, str) else 0
+        return output
+
+
+def evaluate_context_report(cases: list[dict], rags: dict, graphs: dict,
+                            roots: dict[str, Path]) -> dict:
+    """Run bounded context locally; all source text still goes through ToolExecutor."""
+    try:
+        import code_context
+        from agent_tools import ToolExecutor
+    except ImportError as exc:
+        report = unavailable_context_report(cases)
+        report["reason"] = f"{type(exc).__name__}: {exc}"
+        return report
+
+    budgets = {}
+    for budget in CONTEXT_BUDGETS:
+        case_results = []
+        total_gold = total_hits = total_evidence_files = 0
+        total_context_chars = total_multi_round_chars = 0
+        truncation_cases = 0
+        all_within_budget = True
+        for case in cases:
+            rag = rags[case["repo"]]
+            graph = graphs.get(case["repo"])
+            allowed_paths = set(rag._scan_code_files())
+            executor = ToolExecutor(str(roots[case["repo"]]))
+            counting = _CountingExecutor(executor)
+            lexical_hits = (
+                code_context.collect_safe_lexical_hits(
+                    counting, case["question"], allowed_paths
+                )
+                if graph is not None else []
+            )
+            bundle = code_context.build_code_context(
+                query=case["question"],
+                semantic_items=_workflow_ranked_items(case, rag),
+                index_items=rag.index,
+                allowed_paths=allowed_paths,
+                read_window=lambda path, start, end, _executor=executor: _executor.read_file(
+                    path, start_line=start, end_line=end
+                ),
+                max_chars=budget,
+                graph=graph,
+                graph_status="ok" if graph is not None else "unavailable",
+                lexical_hits=lexical_hits,
+            )
+            metrics = budgeted_context_metrics(bundle, case.get("gold_files", []))
+            metrics["id"] = case["id"]
+            metrics["multi_round_chars"] = metrics["used_chars"] + counting.grep_chars
+            case_results.append(metrics)
+
+            gold = {path.replace("\\", "/") for path in case.get("gold_files", [])}
+            total_gold += len(gold)
+            total_hits += len(set(metrics["hit_files"]) & gold)
+            total_evidence_files += len({
+                item.get("path", "") for item in bundle.get("evidence", [])
+            })
+            total_context_chars += metrics["used_chars"]
+            total_multi_round_chars += metrics["multi_round_chars"]
+            truncation_cases += int(metrics["truncated"])
+            all_within_budget = all_within_budget and metrics["within_budget"]
+
+        budgets[str(budget)] = {
+            "budget_chars": budget,
+            "used_chars": total_context_chars,
+            "max_case_used_chars": max((row["used_chars"] for row in case_results), default=0),
+            "within_budget": all_within_budget,
+            "gold_file_coverage": total_hits / total_gold if total_gold else 1.0,
+            "evidence_precision": total_hits / total_evidence_files
+            if total_evidence_files else 0.0,
+            "multi_round_chars": total_multi_round_chars,
+            "saved_chars": total_multi_round_chars - total_context_chars,
+            "truncation_cases": truncation_cases,
+            "cases": len(cases),
+            "case_results": case_results,
+        }
+    return {"available": True, "reason": "", "unit": "chars", "budgets": budgets}
 
 
 # ============================================================
@@ -297,8 +614,11 @@ def run_offline(record_baseline: bool) -> int:
                 graph_available = False
                 graph_error = f"{type(exc).__name__}: {exc}"
 
-        loc_cases = [c for c in data["cases"] if c["task_type"] == "localization" and not c["requires"]]
-        ts_cases = [c for c in data["cases"] if c["requires"] == ["tree_sitter"]]
+        loc_cases = [
+            c for c in data["cases"]
+            if c["task_type"] == "localization" and not c.get("requires", [])
+        ]
+        ts_cases = [c for c in data["cases"] if c.get("requires") == ["tree_sitter"]]
         inc_cases = [c for c in data["cases"] if c["task_type"] == "includes"]
         path_cases = [
             c for c in data["cases"]
@@ -306,6 +626,10 @@ def run_offline(record_baseline: bool) -> int:
         ]
         fp_cases = [c for c in data["cases"] if c.get("expected_unresolved")]
         abstain_cases = [c for c in data["cases"] if c.get("must_abstain")]
+        workflow_cases = [c for c in data["cases"] if c["task_type"] == "workflow_retrieval"]
+        graph_invariant_cases = [
+            c for c in data["cases"] if c["task_type"] == "graph_invariant"
+        ]
 
         # --- localization ---
         loc_results = [eval_retrieval_case(c, rags) for c in loc_cases]
@@ -320,6 +644,11 @@ def run_offline(record_baseline: bool) -> int:
         abstain_results = [eval_retrieval_case(c, rags) for c in abstain_cases]
         abstain_ok = all(r["empty"] for r in abstain_results)
 
+        # --- task-family retrieval(pseudo embedding 只驗 plumbing,不是語意品質宣稱) ---
+        workflow_results = [eval_workflow_retrieval_case(c, rags) for c in workflow_cases]
+        family_summary = summarize_retrieval_families(workflow_results)
+        context_report = evaluate_context_report(workflow_cases, rags, graphs, roots)
+
         # --- graph 題 ---
         if graph_available:
             inc_results = [eval_includes_case(c, graphs) for c in inc_cases]
@@ -328,6 +657,9 @@ def run_offline(record_baseline: bool) -> int:
                 for c in path_cases
             ]
             fp_results = [eval_fp_case(c, graphs) for c in fp_cases]
+            graph_invariant_results = [
+                eval_graph_invariant_case(c, graphs) for c in graph_invariant_cases
+            ]
             precision = eval_graph_precision(graphs, data["repos"])
             for g in graphs.values():
                 g.close()
@@ -335,7 +667,22 @@ def run_offline(record_baseline: bool) -> int:
             inc_results = [{"id": c["id"], "pass": False, "unavailable": True} for c in inc_cases]
             path_results = [{"id": c["id"], "pass": False, "unavailable": True} for c in path_cases]
             fp_results = [{"id": c["id"], "pass": False, "unavailable": True} for c in fp_cases]
-            precision = {"precision": 0.0, "extracted": 0, "correct": 0, "unavailable": True}
+            graph_invariant_results = [
+                {"id": c["id"], "pass": False, "unavailable": True}
+                for c in graph_invariant_cases
+            ]
+            precision = {
+                "precision": 0.0,
+                "representable_recall": 0.0,
+                "extracted": 0,
+                "correct": 0,
+                "representable": sum(
+                    len(info["true_call_edges"]) for info in data["repos"].values()
+                ),
+                "false_resolved": [],
+                "missing_representable": [],
+                "unavailable": True,
+            }
 
     summary.update(
         {
@@ -352,6 +699,10 @@ def run_offline(record_baseline: bool) -> int:
             "call_path": {"cases": path_results, "precision": precision},
             "function_pointer": {"cases": fp_results},
             "abstain": {"ok": abstain_ok, "cases": abstain_results},
+            "retrieval_backend": "deterministic_pseudo_embedding_plumbing_stub",
+            "task_families": {"summary": family_summary, "cases": workflow_results},
+            "graph_invariants": {"cases": graph_invariant_results},
+            "context": context_report,
         }
     )
 
@@ -373,6 +724,32 @@ def run_offline(record_baseline: bool) -> int:
     for r in fp_results:
         print(f"function_pointer {r['id']}: {'PASS' if r['pass'] else 'FAIL'}")
     print(f"abstain: {'PASS' if abstain_ok else 'FAIL'}")
+    print("retrieval backend: deterministic pseudo-embedding (plumbing stub; not semantic quality)")
+    for family, metrics in family_summary.items():
+        print(
+            f"family {family}: file_recall@5={metrics['file_recall_at_5']:.3f} "
+            f"MRR={metrics['mrr']:.3f} seeds={metrics['seed_hits']}/{metrics['cases']}"
+        )
+    for result in graph_invariant_results:
+        suffix = " (graph unavailable)" if result.get("unavailable") else ""
+        print(f"graph invariant {result['id']}: {'PASS' if result['pass'] else 'FAIL'}{suffix}")
+    print(
+        "graph metrics: resolved_precision="
+        f"{precision['precision']:.3f} representable_recall="
+        f"{precision.get('representable_recall', 0.0):.3f} "
+        f"false_resolved={len(precision.get('false_resolved', []))}"
+    )
+    print(
+        "bounded context: "
+        + ("available" if context_report["available"] else f"UNAVAILABLE ({context_report['reason']})")
+    )
+    if context_report["available"]:
+        for budget, metrics in context_report["budgets"].items():
+            print(
+                f"  budget {budget} chars: coverage={metrics['gold_file_coverage']:.3f} "
+                f"used={metrics['used_chars']} multi_round={metrics['multi_round_chars']} "
+                f"saved={metrics['saved_chars']} truncated_cases={metrics['truncation_cases']}"
+            )
 
     if record_baseline:
         baseline = {
@@ -424,6 +801,36 @@ def run_offline(record_baseline: bool) -> int:
             failures.append(f"function_pointer {r['id']} 未回報 unresolved 或誤 resolve")
     if not abstain_ok:
         failures.append("abstain 題誤答")
+    for result in workflow_results:
+        if result["blocking"] and not result["seed_hit"]:
+            failures.append(f"{result['family']} {result['id']} semantic seed miss")
+    for result in graph_invariant_results:
+        if not result["pass"]:
+            failures.append(f"firmware graph invariant {result['id']} failed")
+    if precision.get("unavailable") or precision["precision"] != 1.0:
+        failures.append(
+            f"resolved-edge precision {precision['precision']:.3f} != 1.0"
+            + (f" false={precision.get('false_resolved', [])}" if precision.get("false_resolved") else "")
+        )
+    if precision.get("representable_recall", 0.0) != 1.0:
+        failures.append(
+            f"representable-edge recall {precision.get('representable_recall', 0.0):.3f} != 1.0"
+        )
+    if not context_report["available"]:
+        failures.append("bounded context unavailable")
+    else:
+        for budget, metrics in context_report["budgets"].items():
+            if not metrics["within_budget"]:
+                failures.append(f"bounded context {budget} exceeded or misreported char budget")
+            if metrics["gold_file_coverage"] < 1.0:
+                failures.append(
+                    f"bounded context {budget} gold coverage "
+                    f"{metrics['gold_file_coverage']:.3f} < 1.0"
+                )
+            if metrics["saved_chars"] <= 0:
+                failures.append(
+                    f"bounded context {budget} did not reduce equivalent grep/read chars"
+                )
 
     if failures:
         print("\n=== GATE FAIL ===")

@@ -79,6 +79,12 @@ aicode/doctor 與 `~/start.sh` 各讀一份設定(set_config 偵測到會警告)
   `0` = 不 offload(不寫任何 CPU-MoE 鍵)、`N` = `n_cpu_moe: N`、
   輸入超過最大 blk 編號(或 build 不支援 `--n-cpu-moe`)→ `cpu_moe: true`。
   放不放得下 VRAM 以啟動後 `nvidia-smi` 實測為準。
+- embedding 與 reranker 另支援 `cache_ram`(整數 `0..262144` MiB，映射為
+  `--cache-ram N`)；內建與 `set_config.sh` 預設都固定為 `0`。這兩種非生成服務的
+  prompt cache 無法重用，保留預設 8192 MiB 上限只會讓不同輸入逐步累積 host RAM。
+  main 與 VL 不接受這個 profile key，main 的生成 prompt cache 保持原行為。
+  `set_config.sh` 會先探測 build 是否支援 `--cache-ram`，舊 build 直接 fail-loud，
+  不會靜默省略安全預設；也不另暴露可能互相矛盾的 `cache_idle_slots`。
 - `no_mmap`(→ `--no-mmap`)屬**使用者領域**,`set_config.sh` 從不自動決定:代價是啟動時要把整份
   權重讀進 RAM,換來 MoE 首次推論不必從 SSD 逐頁 page-in(TTFT 1–2 分鐘 → 5–15 秒)。
   套了 CPU-MoE 卻沒設時 `set_config.sh` 會警告(llama.cpp 自己也會印

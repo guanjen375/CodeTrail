@@ -223,6 +223,20 @@ def test_trim_messages_priority_drops_generic_before_evidence(monkeypatch):
     assert any("x.py:42" in c or "a.py" in c for c in contents)
 
 
+def test_bounded_code_context_is_treated_as_file_line_evidence():
+    assert trim._priority_for_tool("code_rag_search") == trim.PRI_EVIDENCE
+    payload = (
+        '{"evidence":[{"path":"src/dispatcher.c","start_line":21,'
+        '"end_line":44,"text":"' + "x" * 5000 + '"}]}'
+    )
+    result, meta = trim.trim_tool_message(
+        payload, "code_rag_search", max_chars=500, mode="auto"
+    )
+    assert "src/dispatcher.c" in result
+    assert trim.CTX_TRIMMED_MARKER in result
+    assert meta["trimmed"] is True
+
+
 def test_trim_messages_emits_telemetry_metadata_only():
     """Trim summary returned to the caller must be JSON-safe metadata,
     never the original prompt text."""

@@ -18,7 +18,9 @@ import os
 import sys
 import io
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
+
+from pydantic import Field
 
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 if sys.stdout.encoding != 'utf-8':
@@ -103,6 +105,7 @@ if _err:
 assert AICODE_ROOT is not None  # for type checkers
 
 import config
+import code_context
 from config import KNOWLEDGE_FILE, KNOWLEDGE_EMB_FILE, RUN_COMMAND_TIMEOUT
 from knowledge import KnowledgeBase, load_knowledge_base_strict
 from knowledge_store import KnowledgeStoreError
@@ -643,19 +646,24 @@ def _slim_edge(edge: dict) -> dict:
         "evidence": f"{edge.get('evidence_path')}:{edge.get('evidence_line')}",
         "backend": edge.get("backend"),
         "confidence": edge.get("confidence"),
+        "resolution_basis": edge.get("resolution_basis"),
+        "condition": edge.get("condition"),
         "resolved": edge.get("resolved", edge.get("dst_id") is not None),
     }
 
 
 @_tool()
 def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
-                    hops: int = 1, include_evidence: bool = False) -> list[dict]:
+                    hops: int = 1, include_evidence: bool = False,
+                    max_chars: Annotated[int, Field(ge=2000, le=30000)] = 12000
+                    ) -> list[dict]:
     """Find code locations, or traverse the code graph (calls/includes), inside AICODE_ROOT.
 
     Use this BEFORE read_file when you need to locate a function/class
     by intent rather than exact name. CodeRAG indexes symbols (functions,
     classes, methods) with embeddings + keyword matching. mode="neighbors" /
-    "path" 走 code graph(definitions/includes/calls,含逐步 file:line 證據)。
+    "path" 走 code graph(definitions/includes/calls,含逐步 file:line 證據)；
+    mode="context" 一次回傳固定字元 budget 的 source evidence bundle。
 
     Args:
         query: mode="semantic" → 想找的程式碼行為,例如 "conv2d 的 padding 計算"。
@@ -663,14 +671,18 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
                個 anchor)或 repo 相對檔案路徑(如 "src/dispatcher.c",看該檔
                的 includes/imports 關係)。
                mode="path" → "SRC -> DST"(兩端都是 symbol 名;容忍空白)。
+               mode="context" → 要分析/推導的問題；先取 semantic seeds，再加入
+               確定的 1-hop 關係與 lexical/test/config/header 候選。
         top_k: 回傳前幾名(預設 5;semantic 模式)。
-        mode: "semantic"(預設)| "neighbors"(1–2 hop 鄰居)| "path"
-              (呼叫鏈最短路徑,≤4 hop、最多 3 條;只走確定解析的邊,
-              歧義候選不入鏈)。
+        mode: "semantic"(預設)| "neighbors"(1–2 hop 鄰居)|
+              "path"(呼叫鏈最短路徑,≤4 hop、最多 3 條;只走確定解析的邊,
+              歧義候選不入鏈)| "context"(bounded read-only evidence bundle)。
         hops: neighbors 模式的跳數(1–2,預設 1)。
         include_evidence: semantic 模式加開 score_components / backend /
                confidence / relations(graph 1-hop,≤5 條/筆)/ graph_status。
                預設 False = 回傳 shape 與既往完全一致。
+        max_chars: context 模式 evidence text 的字元 budget，固定合法範圍
+               2000..30000，預設 12000；不代表 tokenizer token 數。
 
     Returns:
         mode="semantic":[{"path": str, "line": int, "symbol": str,
@@ -680,14 +692,90 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
             或 anchors/files/edges(file anchor);每步 evidence 是
             "file:line",超限附 truncation metadata。
         mode="path":單元素 list,含 paths(每條是 edge list,逐步證據)。
+        mode="context":單元素 list,top-level keys 固定為 query/evidence/
+            uncertainties/seeds/graph_status/truncated/budget_chars/used_chars。
+            graph 缺席或損壞時仍回 semantic-only evidence 並標 graph_status。
         graph 生命週期:首次建置是顯式維運動作;graph 尚未建立、損壞或
         schema 不符時 neighbors/path 直接報錯,錯誤訊息內含**可直接複製
         執行**的建立命令(實際 python interpreter + code_graph.py 絕對
         路徑 + 實際專案 root),semantic 不受影響;建好之後每次查詢自動
-        偵測變更做增量。
+        偵測變更做增量。context 不走 neighbors/path 的 8000-char response cap，
+        只由自己的 max_chars 約束 evidence text。
     """
-    if mode not in ("semantic", "neighbors", "path"):
-        raise ValueError(f"mode 必須是 semantic|neighbors|path,收到 {mode!r}")
+    if mode not in ("semantic", "neighbors", "path", "context"):
+        raise ValueError(
+            f"mode 必須是 semantic|neighbors|path|context,收到 {mode!r}"
+        )
+
+    if mode == "context":
+        budget = code_context.validate_max_chars(max_chars)
+        context_top_k = min(max(int(top_k), 1), 10)
+        ranked = CODE_RAG.query_ranked(query, top_k=context_top_k)
+        semantic_items = []
+        for rc in ranked:
+            item = dict(rc.item)
+            item["score"] = float(rc.final_score)
+            semantic_items.append(item)
+
+        graph = None
+        graph_status = "ok"
+        try:
+            graph = _graph_for_query()
+        except Exception as exc:
+            graph_status = f"unavailable: {type(exc).__name__}: {exc}"[:200]
+
+        allowed_paths = set(CODE_RAG._scan_code_files())
+        lexical_hits = (
+            code_context.collect_safe_lexical_hits(EXEC, query, allowed_paths)
+            if graph is not None else []
+        )
+        bundle = code_context.build_code_context(
+            query=query,
+            semantic_items=semantic_items,
+            index_items=CODE_RAG.index,
+            allowed_paths=allowed_paths,
+            read_window=lambda path, start, end: EXEC.read_file(
+                path, start_line=start, end_line=end
+            ),
+            max_chars=budget,
+            graph=graph,
+            graph_status=graph_status,
+            lexical_hits=lexical_hits,
+        )
+        bundle["query"] = _echo(query)
+
+        if data_flywheel.DATA_COLLECT_ENABLED:
+            snippets = [
+                {
+                    "path": item["path"],
+                    "line": item["start_line"],
+                    "symbol": item.get("symbol", ""),
+                }
+                for item in bundle["evidence"]
+            ]
+            top_score = float(ranked[0].final_score) if ranked else 0.0
+            _record_kb_interaction(
+                mode="mcp_code_rag_search",
+                question=query,
+                answer=(
+                    f"[code_context evidence={len(bundle['evidence'])} "
+                    f"used_chars={bundle['used_chars']}]"
+                ),
+                refs=[],
+                top_score=top_score,
+                code_snippets=snippets,
+                extra_meta={
+                    "top_k": context_top_k,
+                    "mode": "context",
+                    "evidence_count": len(bundle["evidence"]),
+                    "seed_count": len(bundle["seeds"]),
+                    "uncertainty_count": len(bundle["uncertainties"]),
+                    "budget_chars": bundle["budget_chars"],
+                    "used_chars": bundle["used_chars"],
+                    "graph_status": bundle["graph_status"],
+                },
+            )
+        return [bundle]
 
     if mode == "neighbors":
         graph = _graph_for_query()
@@ -736,13 +824,15 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
             "query": _echo(query),
             "anchors": [
                 {"id": a["id"], "name": a["name"], "qualified_name": a["qualified_name"],
-                 "path": a["path"], "line": a["start_line"], "backend": a["backend"]}
+                 "path": a["path"], "line": a["start_line"], "backend": a["backend"],
+                 "linkage": a["linkage"], "condition": a["condition"]}
                 for a in anchors
             ],
             "nodes": [
                 {"name": n["name"], "qualified_name": n["qualified_name"],
                  "kind": n["kind"], "path": n["path"], "line": n["start_line"],
-                 "backend": n["backend"]}
+                 "backend": n["backend"], "linkage": n["linkage"],
+                 "condition": n["condition"]}
                 for n in nodes
             ],
             "edges": edges,

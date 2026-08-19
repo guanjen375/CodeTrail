@@ -8,7 +8,7 @@ VRAM 塞不塞得下以啟動後實測為準(產生的 ~/start.sh 啟動完會�
 nvidia-smi 稍微監控)。
 
   1. 前置檢查:Python 依賴、tmux、nvidia-smi、llama-server 與必要旗標
-     (--reranking / --mmproj / --fit),缺什麼就給可直接複製的修復指令。
+     (--reranking / --mmproj / --fit / --cache-ram),缺什麼就給可直接複製的修復指令。
   2. 偵測:GPU 種類/VRAM、~/models 的 GGUF 自動分類(main / embedding /
      reranker / VL+mmproj);多 shard 聚合並驗證齊全性(缺片直接列出)。
   3. 背景初步判定:GPU 數與四類模型是否齊全,缺什麼通知什麼。
@@ -330,7 +330,7 @@ def _llama_bin() -> Path:
 
 
 def check_llama_binary(skip: bool, notes: list[str]) -> dict[str, bool]:
-    """llama-server 存在性 + 必要旗標探測;回傳 fit / cpu_moe capabilities。"""
+    """llama-server 存在性 + 必要旗標探測;回傳已驗證 capabilities。"""
     binary = _llama_bin()
     if not binary.is_file() or not os.access(binary, os.X_OK):
         message = (
@@ -343,7 +343,7 @@ def check_llama_binary(skip: bool, notes: list[str]) -> dict[str, bool]:
         )
         if skip:
             notes.append("⚠ 已用 --skip-binary-check 跳過 llama-server 檢查(假設為支援 --fit 的新版)。")
-            return {"fit": True, "cpu_moe": True, "n_cpu_moe": True}
+            return {"fit": True, "cpu_moe": True, "n_cpu_moe": True, "cache_ram": True}
         raise SetupError(message)
     try:
         proc = subprocess.run(
@@ -364,7 +364,7 @@ def check_llama_binary(skip: bool, notes: list[str]) -> dict[str, bool]:
                 "⚠ 已用 --skip-binary-check 跳過 llama-server 執行檢查"
                 f"(--help 無法執行:{exc};假設支援全部旗標)。"
             )
-            return {"fit": True, "cpu_moe": True, "n_cpu_moe": True}
+            return {"fit": True, "cpu_moe": True, "n_cpu_moe": True, "cache_ram": True}
         raise SetupError(message) from exc
 
     # --help 跑不起來(常見:動態庫找不到)時,help_text 是 loader 錯誤而不是旗標清單。
@@ -386,7 +386,7 @@ def check_llama_binary(skip: bool, notes: list[str]) -> dict[str, bool]:
         )
         if skip:
             notes.append("⚠ 已用 --skip-binary-check 跳過 llama-server 執行檢查(--help 失敗)。")
-            return {"fit": True, "cpu_moe": True, "n_cpu_moe": True}
+            return {"fit": True, "cpu_moe": True, "n_cpu_moe": True, "cache_ram": True}
         raise SetupError(message)
 
     missing = [flag for flag in ("--reranking", "--mmproj") if flag not in help_text]
@@ -408,7 +408,21 @@ def check_llama_binary(skip: bool, notes: list[str]) -> dict[str, bool]:
         "cpu_moe": bool(re.search(r"(?<![\w-])--cpu-moe(?![\w-])", help_text)),
         # 手動 n_cpu_moe(部分 experts 留 GPU)寫入前先確認 build 支援。
         "n_cpu_moe": bool(re.search(r"(?<![\w-])--n-cpu-moe(?![\w-])", help_text)),
+        # 非生成服務的 prompt cache 不可重用，兩角色固定傳 0 防止 RAM 線性成長。
+        "cache_ram": bool(re.search(r"(?<![\w-])--cache-ram(?![\w-])", help_text)),
     }
+    if not caps["cache_ram"]:
+        message = (
+            "[FAIL] embedding / reranker 的安全預設需要 llama-server --cache-ram，"
+            "才能以 --cache-ram 0 停用不可重用、會累積 RAM 的 prompt cache；"
+            "這個 build 不支援該旗標。\n"
+            "  修復:更新並重新 build llama.cpp(README §1.5)，再重跑 ./set_config.sh"
+        )
+        if skip:
+            notes.append("⚠ 已跳過 --cache-ram 檢查(假設為支援該旗標的新版)。")
+            caps["cache_ram"] = True
+        else:
+            raise SetupError(message)
     if not caps["fit"]:
         # VL 固定用 --fit 在 embedding/reranker 啟動後保留推論 VRAM,這是硬需求。
         # 在前置檢查就擋下,不讓使用者答完所有互動題才發現白忙一場。
@@ -1468,7 +1482,7 @@ def build_deployment_config(plan: Plan) -> dict:
         },
         "embedding": {
             "model": str(plan.embedding.candidate.path),
-            "parameters": {"parallel": AUX_PARALLEL},
+            "parameters": {"parallel": AUX_PARALLEL, "cache_ram": 0},
         },
         "reranker": {
             "model": str(plan.reranker.candidate.path),
@@ -1477,7 +1491,7 @@ def build_deployment_config(plan: Plan) -> dict:
             "ctx": plan.reranker_ctx,
             "batch": plan.reranker_ctx,
             "ubatch": plan.reranker_ctx,
-            "parameters": {"parallel": AUX_PARALLEL},
+            "parameters": {"parallel": AUX_PARALLEL, "cache_ram": 0},
         },
         "vl": {
             "model": str(plan.vl.candidate.path),
@@ -1499,7 +1513,7 @@ def build_deployment_config(plan: Plan) -> dict:
 _MANAGED_PARAMETER_KEYS = {
     "jinja", "flash_attention", "cache_type_k", "cache_type_v", "threads",
     "gpu_layers", "cpu_moe", "n_cpu_moe", "fit", "fit_target", "parallel",
-    "embedding", "pooling", "reranking",
+    "embedding", "pooling", "reranking", "cache_ram",
 }
 # 明確屬於使用者領域的主模型參數(本工具刻意不寫死)→ 重跑時原樣保留。
 # no_mmap 已不由本工具自動判定,使用者(或舊版工具)設過就尊重。
@@ -2450,7 +2464,7 @@ def run(args: argparse.Namespace) -> int:
     _check_tmux(args.skip_binary_check, base_notes)
     llama_caps = check_llama_binary(args.skip_binary_check, base_notes)
     print(f"[2/5] [PASS] tmux 與 llama-server({_llama_bin()};--fit "
-          f"{'支援' if llama_caps.get('fit') else '不支援'})")
+          f"{'支援' if llama_caps.get('fit') else '不支援'};--cache-ram 支援)")
 
     gpus = detect_gpus()
     print(f"[3/5] [PASS] 偵測到 {len(gpus)} 顆 NVIDIA GPU:")

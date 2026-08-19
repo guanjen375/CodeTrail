@@ -20,6 +20,11 @@ python deployment_profile.py validate
 ruff check tests scripts
 ```
 
+MCP runtime 目前刻意維持 SDK 1.x：`requirements.txt` 使用官方建議的
+`mcp>=1.28,<2`，因為程式仍 import `mcp.server.fastmcp.FastMCP`。乾淨安裝會取最新
+1.x；SDK 2.x migration 必須另案同步處理 import、transport、schema 與 OpenCode
+相容性，不能只移除 `<2`。`doctor` 會把缺少 MCP、低於 1.28 或 2.x 都列為 FAIL。
+
 `python scripts/run_tests.py` 無參數時會以標準庫把 test file 分成最多 4 個
 隔離 shard 並行執行，不需要 `pytest-xdist`，而且不會拆開同一個 test module。
 資源較小或要重現序列順序時用 `AICODE_TEST_JOBS=1 python scripts/run_tests.py`。
@@ -60,10 +65,13 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 - `tests/test_readme_consistency.py` — README / docs ↔ mcp_server.py / config.py 不漂移
 - `tests/test_doctor.py` — doctor 各 check 的 happy / fail / skip 路徑(含 context/offload)
 - `tests/test_context_budget.py` — token 估算、hard gate、metrics 解析、telemetry 隱私
+- `tests/test_code_context.py` — bounded code evidence 的 range merge、content dedupe、
+  `2000..30000` 字元 budget，以及 symlink/binary/ignored-path 安全回歸
 - `tests/test_trim.py` — per-tool trim 策略、`[CTX_TRIMMED]`/`[TOOL_SUMMARY]` 標記、優先級
 - `tests/test_external_import.py` — `import_external_file` 白名單、副檔名、大小限制
 - `tests/test_mcp_root_safety.py` — `root_safety.validate_aicode_root` 拒絕 `/` / `$HOME` /不存在的 root,並守住 mcp_server 真的有接上去
 - `tests/test_index_scope.py` — 索引範圍:三態走訪 ≡ `should_index_file` 的不變式、rescue 四測、Layer C loader fail-loud(schema/權限/pattern 衛生)、matcher 方言向量、symlink containment、快取 fingerprint 遷移、`index_stats` root 驗證;全部離線且用合成樹名
+- `tests/test_code_smoke_eval.py` — code inference fixture schema(舊 16 題 + 五類各 4 題 blocking core + bounded stretch)、deterministic plumbing stub、HTTP poison、chars-only context metrics 與 fixture cache 隔離
 - `tests/test_mcp_smoke.py` — MCP server stdio 啟動與基本 tool 呼叫
 - `tests/test_rerank_mmr_relevance.py` — MMR 不得蓋掉 cross-encoder 排序:rerank 分數當相關度、embedding 只算多樣性懲罰、min-max 正規化、半套 relevance 退回舊行為、跳過 rerank 時無分數;離線
 - `tests/test_contextual_signals.py` — 雙訊號不變式:ctx 不進 evidence/REF/strict 來源、六個決策點逐一讀 gate、`_should_rerank` 三分支、merge 聚合 gate、lexical bypass 走 gate BM25、雙矩陣儲存與 required-schema 對照、旗標四象限;離線
@@ -119,6 +127,13 @@ python scripts/run_tests.py tests/test_eval_consistency.py tests/test_readme_con
 - `eval/spec_questions.json`、`eval/spec_holdout.json`、`eval/spec_adversarial.json`：規格/RAG 題庫。
 - `eval/code_questions.json`：程式碼定位題庫。
 - `eval/bug_questions.json`：bug 類問題題庫。
+- `eval/run_code_smoke_eval.py`：全離線 code inference gate。保留歷史 16 題
+  regression floor，另跑 20 題 blocking core(code2test / trace2code / edit2ripple /
+  firmware semantics / selective retrieval，各 4 題)與最多 4 題 stretch；目前 fixture
+  是 20 + 2。CI structural lane 使用 parser/lexical/graph 與 HTTP poison，固定檢查
+  `12000` / `28000` 的純 `budget_chars`，不輸出 tokenizer token 單位。SHA-256
+  pseudo embedding 只叫 deterministic plumbing stub，不代表真 semantic 品質；
+  `--with-servers` 才是手動 real-model lane，永不成為 CI 必要條件。
 - `scripts/check_eval_consistency.py`：不跑 LLM，只檢查 eval expected 是否和 `config.py` / source code 漂移。
 - `tests/test_eval_consistency.py`：把 consistency check 接進 pytest。
 
@@ -134,6 +149,25 @@ python eval/run_eval.py --test-set all --verbose
 前三個命令不需要 llama-server；retrieval runner 固定回報 Recall@5、MRR、nDCG@5 與
 數值證據精確率。加 `--predictions <json>` 時才另外計算 citation entailment、數值答案
 精確率、拒答率/拒答正確率。`eval/run_eval.py` 才需要本機 4 個 llama-server 與對應 GGUF。
+
+### Code graph 的 C/C++ 保守解析
+
+`GRAPH_SCHEMA_VERSION=2` 保存 definition linkage/condition、function declarations，
+以及 edge 的 `resolution_basis`/condition。C/C++ call 只按下列證據順序解析：同檔定義、
+direct/transitive repo-header 可見 prototype 對應的唯一 external 定義、C++ exact
+qualified name；其餘維持 ambiguous 或 unresolved。`static` 與 anonymous namespace
+definition 不跨 translation unit，function pointer/macro 不猜。唯一對到 repo header 的
+quote/angle include 都進 visibility closure，零命中的 angle include 視為外部系統 header。
+
+C/C++ 任一檔案 add/change/delete 都把檔案 hash 當作完整 visibility fingerprint 並走
+full rebuild；這是刻意的保守 invalidation，避免 linkage/declaration/include closure 的
+partial cone 與 fresh build 漂移。Python 仍走既有增量路徑。相關 gate：
+
+```bash
+python scripts/run_tests.py tests/test_ast_parser_cpp.py tests/test_code_graph.py \
+  tests/test_code_graph_cpp_visibility.py
+python eval/run_code_smoke_eval.py
+```
 
 ---
 
@@ -196,6 +230,7 @@ llama-server 啟動時 `-c <N>` 與 OpenCode `model.limit.context` 對齊。`scr
 | 模組 | 責任 |
 |---|---|
 | `context_budget.py` | token 估算(prompt / messages parts / tools schema)、`ContextUsage` dataclass、hard gate (`enforce_gate` → `ContextOverflowError`)、llama-server usage metrics 解析(支援 native `tokens_evaluated/tokens_predicted` 與 OpenAI `usage{}`,streaming + non-streaming)、JSONL telemetry。**不寫 prompt / 檔案內容** 進 log,只寫 count + metadata。 |
+| `code_context.py` | `code_rag_search(mode="context")` 的 deterministic 程式證據選取/overlap merge/content dedupe/字元裝箱。它不是 LLM context hard gate；source I/O 由呼叫端注入既有 `ToolExecutor.grep/read_file`，本模組不裸讀檔。固定 `max_chars=2000..30000`，`used_chars` 只加總 `evidence[].text`。 |
 | `trim.py` | 對 `role=tool` 訊息做 priority-aware trim,加入明確 `[CTX_TRIMMED]` / `[TOOL_SUMMARY]` 標記。`role=system` / `role=user` 訊息**完全不動**(REF metadata 因此被保留)。run_command 保留 tail + error line;read_file 保留 header + window;舊輪 tool output 摘要成 deterministic facts(file:line 錨點、error 行)。 |
 | `context_signals.py` | **檢索訊號的唯一定義**:embedding 組字(retrieval 含 ctx / gate 只看原文)、schema 名稱與 required 對照、內容雜湊、BM25 來源文本、reranker passage。寫入端(`RAG.py`)與載入端(`knowledge.py`)一律 import 這裡——以前兩邊各寫一份同樣的字串,差一個字就變成「內容雜湊不一致」。 |
 | `context_generation.py` | chunk 級生成脈絡的產生器:窗策略(整份 / 階層式摘要 + target-centered section window)、prompt 版本、輸出衛生、write-through 快取與指紋、per-KB single-writer 鎖、覆蓋率閘、**專用的受限 HTTP client**(`trust_env=False`、拒絕 3xx、host 必須是 loopback)。 |

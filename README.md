@@ -129,6 +129,8 @@ python3 -c "import mcp, numpy, requests; print('deps OK')"
 
 `<CODETRAIL_REPO>` 是這個 CodeTrail 的 repo 路徑,不是你要分析的專案路徑。`requirements.txt` 已含 `mcp` / `requests` / `numpy`,不必再單獨 `pip install mcp`。
 
+目前 runtime 使用 MCP Python SDK 1.x 的 `mcp.server.fastmcp.FastMCP`,因此 dependency 固定為 `mcp>=1.28,<2`；乾淨安裝會取可用的最新 1.x，而不會誤升到不相容的 2.x。MCP 2.x 是另一次 breaking migration，不應只移除上限後邊跑邊修。這個版本範圍也符合 [MCP Python SDK 官方給既有 v1 專案的安裝建議](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/get-started/installation.md)。若 `doctor` 報版本不符，執行 `python3 -m pip install --upgrade "mcp>=1.28,<2"`。
+
 > 想隔離環境的話也可以用 venv(`python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`,見 [docs/setup.md](docs/setup.md))。**用 venv 的話,跑 `./set_config.sh` 前要先 activate** —— set_config 會把「當下這顆 Python」的絕對路徑寫進 OpenCode 的 MCP 設定,之後新 shell 不 activate 也能啟動;但也因此換環境後要重跑一次 `./set_config.sh`。
 
 ### 1.4 僅 Blackwell GPU 需要升級 CUDA Toolkit 到 13
@@ -199,7 +201,7 @@ cmake --build build --config Release -j
 
 > 如果之前 build 失敗過(例如 CUDA 升級之前),**`rm -rf build` 再重來**,CMake 的快取會記住舊 toolkit 路徑。
 >
-> 建議用**新版** llama.cpp:`set_config.sh` 會探測 `--reranking` / `--mmproj` / `--fit`(VL 啟動必要)與 `--cpu-moe` / `--n-cpu-moe`(MoE 主模型 / MoE VL 模型的可選 offload);缺少必要旗標時會直接提醒升級。
+> 建議用**新版** llama.cpp:`set_config.sh` 會探測 `--reranking` / `--mmproj` / `--fit`(VL 啟動必要)、`--cache-ram`(embedding / reranker 必要)與 `--cpu-moe` / `--n-cpu-moe`(MoE 主模型 / MoE VL 模型的可選 offload);缺少必要旗標時會直接提醒升級。
 
 ---
 
@@ -288,7 +290,7 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 **純問答式設定**:每一題由你作答,工具不提供預設值,也**不用估算擋你的輸入**——它只驗證輸入在合理範圍(例如選項只有 1/2 卻輸入 3 會重問),以及做結構性檢查(binary 旗標、模型齊全性、schema)。數值題會附一句方向(越大越吃什麼)與一個**推薦值**,但推薦不是限制,填區間外的值照樣接受。VRAM 塞不塞得下仍以啟動後 `nvidia-smi` 實測為準。在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`,它會依序:
 
-1. **前置檢查**:Python 依賴(mcp/numpy/requests)、`tmux`、`nvidia-smi`、`llama-server` 是否存在且支援必要旗標(`--reranking` / `--mmproj` / `--fit`;CPU-MoE 另需 `--cpu-moe` / `--n-cpu-moe`)。缺什麼直接在這一步就擋下並給**可複製的修復指令**(裝哪個套件、跑哪行 build),不會讓你答完所有問題才發現要重來;`llama-server` 因動態庫(如 CUDA lib)跑不起來時,會轉述原始錯誤並指向 `LD_LIBRARY_PATH`,不會誤報成「不支援旗標」。
+1. **前置檢查**:Python 依賴(mcp/numpy/requests)、`tmux`、`nvidia-smi`、`llama-server` 是否存在且支援必要旗標(`--reranking` / `--mmproj` / `--fit` / `--cache-ram`;CPU-MoE 另需 `--cpu-moe` / `--n-cpu-moe`)。缺什麼直接在這一步就擋下並給**可複製的修復指令**(裝哪個套件、跑哪行 build),不會讓你答完所有問題才發現要重來;`llama-server` 因動態庫(如 CUDA lib)跑不起來時,會轉述原始錯誤並指向 `LD_LIBRARY_PATH`,不會誤報成「不支援旗標」。
 2. **偵測**:GPU 種類/VRAM、`~/models` 的 GGUF 自動分類成主聊天 / embedding / reranker / VL+mmproj 四類;多 shard 自動聚合並**驗證齊全性**(缺片直接列出檔名)。有 mmproj 的 VL 模型不會被排進 main 清單前面;四類缺一即在初步判定硬停。
 3. **互動問答(使用者選擇必答)**:**一個角色問完才換下一個**,每組先列出偵測結果再提問(列出候選,輸入編號或直接貼 .gguf 路徑;**只有一個候選時自動選用**,單卡時 GPU 也自動):
 
@@ -424,7 +426,7 @@ AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
 }
 ```
 
-所有 service 都有同級 `model`、`port`、`base_url`、`bind`(`local` 預設只綁 127.0.0.1 / `all-interfaces` 綁 0.0.0.0)、`gpu_role`、`ctx`、`batch`、`ubatch`、`parameters`;VL 另外有 `mmproj`。模型欄只接受 registry key 或 GGUF 絕對路徑,參數只接受 schema allowlist(含 main / vl 專用的 `cpu_moe` → `--cpu-moe` 與部分 offload 的 `n_cpu_moe` → `--n-cpu-moe`(同一 role 兩鍵互斥;embedding / reranker 一律拒絕),以及 `gpu_layers: "auto"`、`fit`、`fit_target`、`parallel`),沒有 raw shell `extra_args`;JSON 不會被 `source` / `eval`。schema 與 GPU precedence 詳見 [docs/deployment-profiles.md](docs/deployment-profiles.md)。可離線查看合併結果:
+所有 service 都有同級 `model`、`port`、`base_url`、`bind`(`local` 預設只綁 127.0.0.1 / `all-interfaces` 綁 0.0.0.0)、`gpu_role`、`ctx`、`batch`、`ubatch`、`parameters`;VL 另外有 `mmproj`。模型欄只接受 registry key 或 GGUF 絕對路徑,參數只接受 schema allowlist(含 embedding / reranker 專用的 `cache_ram` → `--cache-ram`，預設 `0`;main / vl 專用的 `cpu_moe` → `--cpu-moe` 與部分 offload 的 `n_cpu_moe` → `--n-cpu-moe`(同一 role 兩鍵互斥;embedding / reranker 一律拒絕),以及 `gpu_layers: "auto"`、`fit`、`fit_target`、`parallel`),沒有 raw shell `extra_args`;JSON 不會被 `source` / `eval`。schema 與 GPU precedence 詳見 [docs/deployment-profiles.md](docs/deployment-profiles.md)。可離線查看合併結果:
 
 ```bash
 AICODE_MODEL=<CODE_MODEL> python deployment_profile.py show
@@ -630,6 +632,15 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 
 如果想驗證 MCP transport 有沒有連上:OpenCode TUI 輸入 `/status`,應看到 `codetrail Connected`。**Connected 只代表 MCP 子行程完成連線,不代表模型在這一輪真的發出 tool call。** 真正執行時應看到 frontend 的工具卡 / 結果;若模型只印出 `<codetrail_list_dir .../>` 再用文字宣稱成功,那是假工具呼叫,照 [troubleshooting 的分層檢查](docs/troubleshooting.md#mcp-connected-but-no-tool-call)處理。
 
+要做「分析、解釋、推導、找原因」時，優先用同一個既有工具的 bounded context 模式：
+
+```text
+請用工具 code_rag_search,mode 設 "context",query 寫「為什麼 ISR event 沒進 idle state」,
+max_chars 設 12000，依 evidence 的 path:line 分成已證實與仍不確定兩部分回答。
+```
+
+`mode="context"` 會把 semantic seeds、確定的 1-hop caller/callee/include，以及相關 test/header/config/trace lexical evidence 合併去重後裝進固定字元 budget。`max_chars` 合法範圍是 `2000..30000`、預設 `12000`，`used_chars` 只計 `evidence[].text` 的實際字元，不宣稱 tokenizer token 數；歧義與 unresolved 只進 `uncertainties`，不偽裝成確定證據。所有 source window 仍由既有 sandboxed `read_file` 路徑讀取。graph 尚未建立或損壞時會降級回 semantic-only evidence 並標示 `graph_status`，不影響整次呼叫。
+
 想看**跨檔案的呼叫關係**(誰呼叫誰、include 鏈),`code_rag_search` 除了語意搜尋還有 graph 模式:
 
 ```text
@@ -637,7 +648,7 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 把呼叫鏈每一步的檔案與行號列出來。
 ```
 
-graph 對 C/C++(tree-sitter)與 Python 抽 definitions / includes / calls。首次建置要在終端跑一次(手動形式是 `<MCP_PYTHON> <CODETRAIL_REPO>/code_graph.py --root <AICODE_ROOT>`);沒建就用 graph 模式會明確報錯,**錯誤訊息內就是一條含實際 interpreter 與絕對路徑、可直接複製執行的命令**(語意搜尋不受影響)。建好之後查詢自動偵測檔案變更做增量更新。function pointer 與 macro 間接呼叫會誠實回報 unresolved。細節見 [docs/mcp-tools.md](docs/mcp-tools.md)。
+graph 對 C/C++(tree-sitter)與 Python 抽 definitions / includes / calls。C/C++ 只把同 translation unit 定義、caller 可見 prototype 對應的唯一 external 定義、或 C++ exact qualified name 當成確定呼叫；`static` 不跨 translation unit，repo 內唯一同名但不可見也不會硬連。repo-owned quote/angle header 都可形成 transitive visibility closure，條件編譯候選在沒有 build variant 時維持 ambiguous；回傳會標 `resolution_basis`、`confidence` 與 condition。首次建置要在終端跑一次(手動形式是 `<MCP_PYTHON> <CODETRAIL_REPO>/code_graph.py --root <AICODE_ROOT>`);沒建就用 graph 模式會明確報錯,**錯誤訊息內就是一條含實際 interpreter 與絕對路徑、可直接複製執行的命令**(語意搜尋不受影響)。建好之後查詢自動偵測檔案變更；C/C++ 的 declaration/linkage/include visibility 變更會保守地整體重建，確保與 fresh build 相同。function pointer 與 macro 間接呼叫會誠實回報 unresolved。細節見 [docs/mcp-tools.md](docs/mcp-tools.md)。
 
 想把**圖片**(截圖、架構圖、規格頁掃描)變成之後查得到的知識,就是「VL + RAG 一起用」—— `ingest_document` 餵圖片時會自動走 VL 把圖抽成文字再進 RAG,跟 PDF 走同一套:
 

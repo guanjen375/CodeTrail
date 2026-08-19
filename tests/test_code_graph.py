@@ -277,7 +277,8 @@ def test_crash_mid_transaction_leaves_old_graph_intact(tmp_path):
         conn.execute("DELETE FROM edges")
         conn.execute("DELETE FROM nodes")
         conn.execute(
-            "INSERT INTO nodes VALUES ('x','p.py','function','half','half',1,1,'t','exact')")
+            "INSERT INTO nodes VALUES "
+            "('x','p.py','function','half','half',1,1,'t','exact','not_applicable',NULL)")
         os._exit(1)
     """)
     proc = subprocess.run([sys.executable, "-c", script],
@@ -317,7 +318,8 @@ def test_traversal_filters_out_of_scope_evidence(tmp_path):
     with conn:
         conn.execute(
             "INSERT INTO edges VALUES ('symbol',?, 'symbol',?,NULL,NULL,"
-            "'calls','../../outside/secret.py',1,'python-ast','resolved')",
+            "'calls','../../outside/secret.py',1,'python-ast','resolved',"
+            "'global_unique',NULL)",
             (entry_id, helper_id),
         )
     conn.close()
