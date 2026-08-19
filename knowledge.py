@@ -2462,8 +2462,12 @@ English:"""
                 "page": c.get("page", 0),
                 "type": c.get("type", "doc"),
                 "section": c.get("section", ""),
-                # 出身揭露：VL 產物（image/screenshot）在下游要能與原文區分
+                # 出身揭露：VL 產物（image/screenshot/diagram）在下游要能與原文區分
                 "origin": c.get("origin", ""),
+                # PDF 內嵌圖的頁內序號：同頁多張圖若 VL 標題相同，少了它
+                # 下游（MCP / strict / flywheel / eval）就分不出是哪一張。
+                # 非圖 chunk 是 None。
+                "figure_index": c.get("figure_index"),
             }
             for c in merged_chunks
         ]

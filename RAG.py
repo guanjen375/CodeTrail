@@ -877,6 +877,10 @@ def _render_pdf_figure_png(pdf_doc, job: Dict) -> bytes:
     超過 PDF_FIGURE_MAX_SIDE_PX 時等比例降。crop 框先外擴到整數 pt 再與頁面
     相交——量化讓同一張圖（頁首 logo）每頁 render 出逐位元組相同的 PNG，
     內容 hash 去重才會生效。
+
+    失敗一律拋**原因**（ValueError），不自己拼檔案／頁碼／圖索引：那些由
+    `_pdf_figure_chunks` 統一包成 PdfFigureError。這裡自作主張拼一半，錯誤
+    訊息就會依失敗種類時有時無地缺欄位。
     """
     import math
 
@@ -884,10 +888,7 @@ def _render_pdf_figure_png(pdf_doc, job: Dict) -> bytes:
 
     page_index = job["page"] - 1
     if page_index < 0 or page_index >= pdf_doc.page_count:
-        raise PdfFigureError(
-            f"figure job 頁碼超出範圍: 第 {job['page']} 頁"
-            f"（PDF 共 {pdf_doc.page_count} 頁）"
-        )
+        raise ValueError(f"頁碼超出範圍（PDF 共 {pdf_doc.page_count} 頁）")
     page = pdf_doc[page_index]
 
     if job["mode"] == "page":
@@ -899,10 +900,7 @@ def _render_pdf_figure_png(pdf_doc, job: Dict) -> bytes:
                             math.ceil(x1), math.ceil(y1))
         rect.intersect(page.rect)
         if rect.is_empty or rect.width < 2 or rect.height < 2:
-            raise PdfFigureError(
-                f"picture 框與頁面沒有有效交集: 第 {job['page']} 頁 "
-                f"圖 {job['figure_index']}（bbox={job['bbox']}）"
-            )
+            raise ValueError(f"picture 框與頁面沒有有效交集（bbox={job['bbox']}）")
         clip = rect
 
     zoom = PDF_FIGURE_RENDER_DPI / 72.0
@@ -911,10 +909,7 @@ def _render_pdf_figure_png(pdf_doc, job: Dict) -> bytes:
         zoom = PDF_FIGURE_MAX_SIDE_PX / long_side
     pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=clip, alpha=False)
     if pix.width < 2 or pix.height < 2:
-        raise PdfFigureError(
-            f"render 結果過小（{pix.width}x{pix.height}px）: "
-            f"第 {job['page']} 頁 圖 {job['figure_index']}"
-        )
+        raise ValueError(f"render 結果過小（{pix.width}x{pix.height}px）")
     return pix.tobytes("png")
 
 
@@ -955,9 +950,9 @@ def _pdf_figure_chunks(
             where = f"第 {job['page']} 頁 圖 {job['figure_index']}"
             try:
                 png = _render_pdf_figure_png(pdf_doc, job)
-            except PdfFigureError:
-                raise
             except Exception as exc:
+                # 所有 render 失敗（含 helper 自己的前置檢查）都經這一條包裝，
+                # 定位資訊才不會依失敗種類而時有時無
                 raise PdfFigureError(
                     f"內嵌圖 render 失敗: {filename} {where}"
                     f"（第 {n}/{total} 張）: {exc}"

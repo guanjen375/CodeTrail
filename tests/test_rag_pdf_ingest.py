@@ -366,6 +366,46 @@ def test_render_failure_hard_fails(monkeypatch):
     assert spy.calls == []
 
 
+def test_render_precondition_failure_keeps_full_location(monkeypatch, tmp_path: Path):
+    """render helper 自己的前置檢查（頁碼超界）也必須帶檔案/頁/圖/第 N 張。
+
+    舊版讓 helper 自拋 PdfFigureError 再被裸 re-raise，訊息只剩「第 2 頁」，
+    缺檔名與 figure 索引——與 fail-loud「可直接定位」的承諾不符。
+
+    用真 pymupdf render：PDF 實際只有 1 頁，但 metadata 報 2 頁（模擬 schema
+    漂移／畸形檔），第 1 張正常 render、第 2 張撞前置檢查。
+    """
+    fitz = pytest.importorskip("fitz", reason="需要 PyMuPDF（pymupdf4llm 相依）")
+
+    pdf = tmp_path / "spec.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), LONG_TEXT_A)
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 64, 64))
+    pix.clear_with(120)
+    page.insert_image(fitz.Rect(*BIG_BBOX), pixmap=pix)
+    doc.save(str(pdf))
+    doc.close()
+
+    _fake_pdf(monkeypatch, [
+        {"metadata": {"page_number": 1}, "text": LONG_TEXT_A,
+         "page_boxes": [{"class": "picture", "bbox": BIG_BBOX}]},
+        {"metadata": {"page_number": 2}, "text": LONG_TEXT_B,
+         "page_boxes": [{"class": "picture", "bbox": BIG_BBOX_2}]},
+    ])
+    monkeypatch.setattr(RAG, "_describe_technical_image_base64",
+                        lambda *_a, **_k: VL_DESCRIPTION)
+
+    with pytest.raises(RAG.PdfFigureError) as exc:
+        RAG.extract_pdf(str(pdf))
+
+    msg = str(exc.value)
+    assert "spec.pdf" in msg, msg
+    assert "第 2 頁" in msg and "圖 1" in msg, msg
+    assert "第 2/2 張" in msg, msg
+    assert "頁碼超出範圍" in msg and "PDF 共 1 頁" in msg, msg
+
+
 def test_empty_vl_description_is_hard_fail(monkeypatch):
     """VL 回空/純空白：嚴格核心要 raise，不得產生空 chunk。"""
     monkeypatch.setattr(

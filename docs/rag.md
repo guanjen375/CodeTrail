@@ -175,7 +175,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 最後回報目前載入幾個 chunks。
 ```
 
-`chunks` 是「切好的文件段落」。回報 0 代表沒匯入到任何內容 — 常見原因：純圖片掃描的 PDF（沒可選文字）、binary 太小或全是 0xff、VL llama-server (:8083) 沒啟動導致圖片分析失敗。
+`chunks` 是「切好的文件段落」。回報 0 代表沒匯入到任何內容 — 常見原因：binary 太小或全是 0xff、圖片走 VL 卻抽不出可用描述。（純圖片掃描的 PDF 不再是原因：每頁會整頁 render 交給 VL；但 VL llama-server (:8083) 沒啟動時，PDF 會**整份 ingest 失敗**而不是回報 0。）
 
 **步驟 3：查**
 
