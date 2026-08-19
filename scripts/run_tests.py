@@ -29,6 +29,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEST_ROOT = REPO_ROOT / "tests"
 MAX_PARALLEL_JOBS = 4
+# pytest 預設的 python_files(pyproject 沒有覆寫)。分片必須用同一組樣式並
+# 遞迴掃,否則 tests/integration/test_x.py 或 foo_test.py 會被並行模式靜默
+# 漏掉——序列 pytest 收得到、並行綠燈卻是假的。
+TEST_FILE_PATTERNS = ("test_*.py", "*_test.py")
+# pytest norecursedirs 的預設集合(加上 __pycache__ / .* 這類永不 collect 的)。
+SKIP_DIR_NAMES = frozenset({
+    "__pycache__", "node_modules", "build", "dist", "venv", ".venv", "CVS",
+})
 
 
 def _relax_windows_pytest_tmp_acl() -> None:
@@ -75,6 +83,24 @@ def _resolve_parallel_jobs(
     return max(1, min(MAX_PARALLEL_JOBS, available or 1))
 
 
+def _discover_test_files(root: Path | None = None) -> list[Path]:
+    """遞迴收集 pytest 會 collect 的測試檔(兩種預設命名),結果去重且排序。"""
+    base = TEST_ROOT if root is None else root
+    if not base.is_dir():
+        return []
+    found: dict[Path, None] = {}
+    for pattern in TEST_FILE_PATTERNS:
+        for path in base.rglob(pattern):
+            if not path.is_file():
+                continue
+            directories = path.relative_to(base).parts[:-1]
+            if any(part in SKIP_DIR_NAMES or part.startswith(".")
+                   for part in directories):
+                continue
+            found[path] = None
+    return sorted(found)
+
+
 def _test_file_weight(path: Path) -> int:
     """用檔案大小 + process-bound 測試密度做穩定、免歷史資料的粗估。"""
     source = path.read_text(encoding="utf-8")
@@ -103,9 +129,12 @@ def _partition_test_files(paths: Sequence[Path], jobs: int) -> list[list[Path]]:
 
 
 def _run_parallel(env: Mapping[str, str], jobs: int) -> int:
-    test_files = sorted(TEST_ROOT.glob("test_*.py"))
+    test_files = _discover_test_files()
     if not test_files:
-        print("[run_tests] 找不到 tests/test_*.py", file=sys.stderr)
+        print(
+            "[run_tests] 找不到 tests/ 下的測試檔(test_*.py / *_test.py)",
+            file=sys.stderr,
+        )
         return 2
     shards = _partition_test_files(test_files, jobs)
 

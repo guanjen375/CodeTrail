@@ -343,3 +343,152 @@ def test_multi_hunk_bottom_up_no_drift(runner: ToolExecutor, tmp_path: Path):
     out = runner.apply_patch(patch)
     assert "✓" in out and "✗" not in out, out
     assert target.read_text(encoding="utf-8") == "h1\nB1\nB1x\nm\nh2\nB2\n"
+
+
+# ---------------------------------------------------------------------------
+# 純新增:越界行號 fail loud(舊版靜默 clamp 到 EOF)
+# ---------------------------------------------------------------------------
+def test_pure_insertion_out_of_range_hint_is_rejected(runner: ToolExecutor, tmp_path: Path):
+    """`@@ -999,0 +1000,1 @@` 對兩行檔 → 必須拒絕,不能夾到檔尾當成功。"""
+    target = tmp_path / "oob.py"
+    target.write_text("a\nb\n", encoding="utf-8")
+    patch = (
+        "--- a/oob.py\n"
+        "+++ b/oob.py\n"
+        "@@ -999,0 +1000,1 @@\n"
+        "+INSERTED\n"
+    )
+    out = runner.apply_patch(patch)
+    assert "✗" in out and "超出檔案範圍" in out, out
+    assert "共 2 行" in out, out
+    assert target.read_text(encoding="utf-8") == "a\nb\n"
+
+
+def test_pure_insertion_out_of_range_hint_rejected_in_dry_run(runner: ToolExecutor, tmp_path: Path):
+    target = tmp_path / "oob2.py"
+    target.write_text("a\nb\n", encoding="utf-8")
+    patch = (
+        "--- a/oob2.py\n"
+        "+++ b/oob2.py\n"
+        "@@ -50,0 +51,1 @@\n"
+        "+INSERTED\n"
+    )
+    out = runner.apply_patch(patch, dry_run=True)
+    assert "✗" in out and "超出檔案範圍" in out, out
+    assert target.read_text(encoding="utf-8") == "a\nb\n"
+
+
+def test_pure_insertion_at_eof_keeps_trailing_newline(runner: ToolExecutor, tmp_path: Path):
+    """插在最後一行之後(hint == 實際行數)是合法邊界,且不新增空行。"""
+    target = tmp_path / "eof.py"
+    target.write_text("a\nb\n", encoding="utf-8")
+    patch = (
+        "--- a/eof.py\n"
+        "+++ b/eof.py\n"
+        "@@ -2,0 +3,1 @@\n"
+        "+APPENDED\n"
+    )
+    out = runner.apply_patch(patch)
+    assert "✓" in out and "✗" not in out, out
+    assert target.read_text(encoding="utf-8") == "a\nb\nAPPENDED\n"
+
+
+def test_pure_insertion_into_file_without_trailing_newline(runner: ToolExecutor, tmp_path: Path):
+    """檔尾沒有換行:行數不含 sentinel,插到最後一行之後仍不加尾端換行。"""
+    target = tmp_path / "nonl.py"
+    target.write_text("a\nb", encoding="utf-8")
+    patch = (
+        "--- a/nonl.py\n"
+        "+++ b/nonl.py\n"
+        "@@ -2,0 +3,1 @@\n"
+        "+APPENDED\n"
+    )
+    out = runner.apply_patch(patch)
+    assert "✓" in out and "✗" not in out, out
+    assert target.read_text(encoding="utf-8") == "a\nb\nAPPENDED"
+
+
+def test_pure_insertion_into_empty_file(runner: ToolExecutor, tmp_path: Path):
+    """空檔只有 0 這個合法插入點;`@@ -0,0 +1,1 @@` 可用,越界的要拒。"""
+    target = tmp_path / "empty.py"
+    target.write_text("", encoding="utf-8")
+    patch = (
+        "--- a/empty.py\n"
+        "+++ b/empty.py\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+FIRST\n"
+    )
+    out = runner.apply_patch(patch)
+    assert "✓" in out and "✗" not in out, out
+    assert target.read_text(encoding="utf-8") == "FIRST\n"
+
+    target.write_text("", encoding="utf-8")
+    bad = (
+        "--- a/empty.py\n"
+        "+++ b/empty.py\n"
+        "@@ -3,0 +4,1 @@\n"
+        "+FIRST\n"
+    )
+    out = runner.apply_patch(bad)
+    assert "✗" in out and "超出檔案範圍" in out, out
+    assert target.read_text(encoding="utf-8") == ""
+
+
+# ---------------------------------------------------------------------------
+# 「已套用過」判定:post-image 也要唯一 / 與 hint 相符
+# ---------------------------------------------------------------------------
+def test_already_applied_needs_unique_post_image(runner: ToolExecutor, tmp_path: Path):
+    """目標區塊漂移、但檔案裡有兩處相同的修改後內容 → 不能當 no-op。"""
+    target = tmp_path / "dup.py"
+    original = "def a():\n    x = 2\n    return x\n\ndef b():\n    x = 2\n    return x\n"
+    target.write_text(original, encoding="utf-8")
+    patch = (
+        "--- a/dup.py\n"
+        "+++ b/dup.py\n"
+        "@@\n"
+        "-    x = 1\n"
+        "+    x = 2\n"
+        "     return x\n"
+    )
+    out = runner.apply_patch(patch)
+    assert "✗" in out and "修改後內容" in out, out
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_already_applied_conflicting_hint_is_rejected(runner: ToolExecutor, tmp_path: Path):
+    """唯一的修改後內容在檔案另一端(離 hint 很遠)→ fail loud,不報 no-op。"""
+    target = tmp_path / "far.py"
+    body = "".join(f"line{i}\n" for i in range(300))
+    original = "PATCHED\ntail\n" + body
+    target.write_text(original, encoding="utf-8")
+    patch = (
+        "--- a/far.py\n"
+        "+++ b/far.py\n"
+        "@@ -290,2 +290,2 @@\n"
+        "-ORIGINAL\n"
+        "+PATCHED\n"
+        " tail\n"
+    )
+    out = runner.apply_patch(patch)
+    assert "✗" in out and "行號提示" in out, out
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_already_applied_still_idempotent_with_garbage_hint(runner: ToolExecutor, tmp_path: Path):
+    """行號整組亂寫(超出檔案)時,重送同一份 patch 仍必須是成功的 no-op。"""
+    target = tmp_path / "idem2.py"
+    target.write_text("a\nb\nc\n", encoding="utf-8")
+    patch = (
+        "--- a/idem2.py\n"
+        "+++ b/idem2.py\n"
+        "@@ -999,3 +999,3 @@\n"
+        " a\n"
+        "-b\n"
+        "+B\n"
+        " c\n"
+    )
+    assert "✓" in runner.apply_patch(patch)
+    out = runner.apply_patch(patch)
+    assert "✓" in out and "✗" not in out, out
+    assert "已套用" in out and "行 1" in out, out
+    assert target.read_text(encoding="utf-8") == "a\nB\nc\n"

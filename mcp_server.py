@@ -1026,7 +1026,11 @@ def apply_patch(diff: str, dry_run: bool = False) -> str:
         檔案現況一致(這是唯一的定位依據)。
       - context 在檔案中多處出現且無行號提示 → 拒絕並列出候選行號
         (fail loud,不猜位置)。
-      - 已套用過的 hunk 會自動偵測並跳過(重試安全,不會重複插入)。
+      - 已套用過的 hunk 會自動偵測並跳過(重試安全,不會重複插入);
+        但「修改後內容」在檔案中出現多處、或與行號提示明顯衝突時會拒絕,
+        不會假設是同一處。
+      - 完全沒有 context 的純新增只能靠行號,且行號必須落在檔案實際行數內
+        (0 = 插在檔首),越界直接拒絕。
     每次最多改 PATCH_MAX_FILES 個檔案、單檔最多 PATCH_MAX_LINES_PER_FILE 行。
     套用後會自動跑 lint / typecheck / 相關測試。
 

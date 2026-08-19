@@ -56,3 +56,40 @@ def test_parallel_job_resolution(env, cpu_count, expected):
 def test_parallel_job_resolution_rejects_invalid_values(value):
     with pytest.raises(ValueError, match="AICODE_TEST_JOBS"):
         run_tests._resolve_parallel_jobs({"AICODE_TEST_JOBS": value}, cpu_count=64)
+
+
+def test_discovery_covers_nested_dirs_and_both_default_namings(tmp_path: Path):
+    """並行分片必須跟序列 pytest 收到同一組檔案。"""
+    nested = tmp_path / "integration"
+    nested.mkdir()
+    cache = tmp_path / "__pycache__"
+    cache.mkdir()
+    hidden = tmp_path / ".hidden"
+    hidden.mkdir()
+
+    expected = {
+        _test_file(tmp_path, "test_top.py", "def test_top(): pass\n"),
+        _test_file(tmp_path, "legacy_test.py", "def test_legacy(): pass\n"),
+        _test_file(nested, "test_nested.py", "def test_nested(): pass\n"),
+        _test_file(nested, "nested_test.py", "def test_nested2(): pass\n"),
+        # 同時符合兩種樣式 → 只能出現一次
+        _test_file(tmp_path, "test_both_test.py", "def test_both(): pass\n"),
+    }
+    _test_file(tmp_path, "conftest.py", "")
+    _test_file(tmp_path, "helper.py", "def helper(): pass\n")
+    _test_file(cache, "test_cached.py", "def test_cached(): pass\n")
+    _test_file(hidden, "test_hidden.py", "def test_hidden(): pass\n")
+
+    found = run_tests._discover_test_files(tmp_path)
+    assert found == sorted(expected)
+    assert len(found) == len(set(found))
+
+
+def test_discovery_of_missing_root_is_empty(tmp_path: Path):
+    assert run_tests._discover_test_files(tmp_path / "nope") == []
+
+
+def test_repo_discovery_is_a_superset_of_top_level_glob():
+    top_level = set(run_tests.TEST_ROOT.glob("test_*.py"))
+    assert top_level, "repo 的 tests/ 應該有頂層測試檔"
+    assert top_level <= set(run_tests._discover_test_files())

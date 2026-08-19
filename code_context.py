@@ -29,6 +29,10 @@ _SYMBOL_WINDOW_LINES = 80
 _INCLUDE_WINDOW_LINES = 60
 _LEXICAL_RADIUS = 8
 _PATH_DIVERSITY_PENALTY = 12.0
+# resolved(有 dst、無 ambiguity group)不等於 confirmed。Python 的
+# attribute call 只靠「repo 內同名 callable 唯一」猜,graph 會標
+# confidence="heuristic";當成確定證據會把 obj.target() 綁到不相干的同名函式。
+_CONFIRMED_EDGE_CONFIDENCE = frozenset({"exact", "resolved"})
 
 _STOP_WORDS = frozenset({
     "about", "after", "also", "and", "because", "before", "change", "changing",
@@ -310,14 +314,32 @@ def _graph_candidates(graph, seeds: list[dict], allowed: set[str],
                     )
                     uncertainties.append({"target": target, "reason": reason})
                     continue
+                confidence = str(edge.get("confidence") or "")
+                heuristic = confidence not in _CONFIRMED_EDGE_CONFIDENCE
                 if edge.get("src_id") == anchor["id"]:
                     related = nodes.get(edge.get("dst_id"))
-                    reason, priority = "confirmed callee", 88.0
+                    reason, priority = (
+                        ("heuristic callee candidate", 64.0) if heuristic
+                        else ("confirmed callee", 88.0)
+                    )
                 elif edge.get("dst_id") == anchor["id"]:
                     related = nodes.get(edge.get("src_id"))
-                    reason, priority = "confirmed caller", 86.0
+                    reason, priority = (
+                        ("heuristic caller candidate", 62.0) if heuristic
+                        else ("confirmed caller", 86.0)
+                    )
                 else:
                     related = None
+                if related is not None and heuristic:
+                    uncertainties.append({
+                        "target": str(
+                            related.get("name") or related.get("id") or "?"
+                        ),
+                        "reason": (
+                            f"call edge confidence={confidence or 'unknown'}; "
+                            "name-based match, not confirmed evidence"
+                        ),
+                    })
                 if related is not None and related.get("path") in allowed:
                     candidates.append(_candidate_for_related_node(related, reason, priority))
 

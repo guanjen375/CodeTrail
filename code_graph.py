@@ -64,7 +64,7 @@ from ast_parser import (
     parse_file,
 )
 
-GRAPH_SCHEMA_VERSION = 2
+GRAPH_SCHEMA_VERSION = 3
 
 # 只有這些語言有 includes/calls 抽取器;其他語言仍有 defines(symbols)。
 _LANG_BY_EXT = {
@@ -422,7 +422,7 @@ def _extract_c_relations(rel_path: str, content: str, lang: str,
     """C/C++:tree-sitter 抽 includes、prototypes 與 call_expression。
 
     回傳 (includes, calls, declarations, include_guard):
-      includes: [(raw_target, lineno, is_angle)]
+      includes: [(raw_target, lineno, is_angle, condition)]
       calls:    [(caller_node_id, callee_name, lineno, condition)]
       declarations: [(name, qualified_name, lineno, linkage, condition)]
     """
@@ -436,7 +436,7 @@ def _extract_c_relations(rel_path: str, content: str, lang: str,
     except Exception:
         return [], [], [], _include_guard_condition(rel_path, content)
 
-    includes: list[tuple[str, int, bool]] = []
+    includes: list[tuple[str, int, bool, str | None]] = []
     calls: list[tuple[str, str, int, str | None]] = []
     declarations: list[tuple[str, str, int, str, str | None]] = []
 
@@ -461,7 +461,11 @@ def _extract_c_relations(rel_path: str, content: str, lang: str,
                 raw_text = path_node.text.decode("utf-8", errors="replace")
                 is_angle = path_node.type == "system_lib_string"
                 raw = raw_text.strip("<>") if is_angle else raw_text.strip('"')
-                includes.append((raw, node.start_point[0] + 1, is_angle))
+                # condition 一定要留:`#ifdef FEATURE` 內的 include 只在該
+                # branch 成立時形成可見性,當成無條件會憑空造出 resolved 邊。
+                includes.append(
+                    (raw, node.start_point[0] + 1, is_angle, _ts_condition(node))
+                )
         elif node.type == "declaration":
             linkage = "external"
             current = node.parent
@@ -869,7 +873,10 @@ class CodeGraph:
             add_callable(row)
 
         edges = []
-        unique_includes: dict[str, set[str]] = {path: set() for path in all_files}
+        # path -> {included_path: condition}(None = 無條件 include)。
+        unique_includes: dict[str, dict[str, str | None]] = {
+            path: {} for path in all_files
+        }
 
         def ambiguity_id(kind: str, rel_path: str, lineno: int, target: str,
                          candidates: list[str]) -> str:
@@ -890,7 +897,7 @@ class CodeGraph:
                     ))
             lang = _lang_for(rel_path)
             edge_backend = "python-ast" if lang == "python" else "tree-sitter"
-            for raw, lineno, is_angle in relations["includes"]:
+            for raw, lineno, is_angle, include_condition in relations["includes"]:
                 if is_angle:
                     # A bare <stdint.h> does not identify the repo's
                     # include-search path.  A unique vendored shim with that
@@ -921,19 +928,22 @@ class CodeGraph:
                 else:
                     candidates = self._resolve_include(raw, all_files)
                 if len(candidates) == 1:
-                    unique_includes.setdefault(rel_path, set()).add(candidates[0])
+                    known = unique_includes.setdefault(rel_path, {})
+                    # 同一個 header 被多次 include 時，無條件的那次最寬鬆。
+                    if candidates[0] not in known or include_condition is None:
+                        known[candidates[0]] = include_condition
                     edges.append((
                         "file", rel_path, "file", candidates[0], None, None,
                         "includes", rel_path, lineno, edge_backend, "resolved",
                         "unique_repo_angle_include" if is_angle else "unique_quote_include",
-                        None,
+                        include_condition,
                     ))
                 elif not candidates:
                     if not is_angle:  # angle zero-match = system/external，不製造噪音邊
                         edges.append((
                             "file", rel_path, None, None, raw, None,
                             "includes", rel_path, lineno, edge_backend, "syntactic",
-                            "unresolved_quote_include", None,
+                            "unresolved_quote_include", include_condition,
                         ))
                 else:
                     group = ambiguity_id("include", rel_path, lineno, raw, candidates)
@@ -941,7 +951,7 @@ class CodeGraph:
                         edges.append((
                             "file", rel_path, "file", candidate, raw, group,
                             "includes", rel_path, lineno, edge_backend, "syntactic",
-                            "ambiguous_include", None,
+                            "ambiguous_include", include_condition,
                         ))
 
             for parts, level, lineno in relations["imports"]:
@@ -953,16 +963,35 @@ class CodeGraph:
                         "module_import", None,
                     ))
 
-        def include_closure(start: str) -> set[str]:
-            seen: set[str] = set()
-            frontier = list(sorted(unique_includes.get(start, set())))
+        def include_closure(start: str, call_condition: str | None) -> tuple:
+            """依 call 的 preprocessor condition 走 include closure。
+
+            回傳 (active, possible):
+              active   路徑上每個 #include 都與 call condition 相容 → 可見。
+              possible 至少有一段 include 的條件無法證明相容 → 只能當
+                       conditional 候選(ambiguous),不得算成可見。
+            可證明互斥的 branch 直接剪掉。
+            """
+            state: dict[str, str] = {}
+            frontier: list[tuple[str, str]] = [(start, "active")]
             while frontier:
-                current = frontier.pop(0)
-                if current in seen:
-                    continue
-                seen.add(current)
-                frontier.extend(sorted(unique_includes.get(current, set()) - seen))
-            return seen
+                current, current_state = frontier.pop(0)
+                for dst, condition in sorted(unique_includes.get(current, {}).items()):
+                    relation = condition_relation(
+                        effective_condition(current, condition), call_condition
+                    )
+                    if relation == "exclusive":
+                        continue
+                    next_state = "active" if (
+                        current_state == "active" and relation == "active"
+                    ) else "possible"
+                    if state.get(dst) == next_state or state.get(dst) == "active":
+                        continue
+                    state[dst] = next_state
+                    frontier.append((dst, next_state))
+            active = {path for path, value in state.items() if value == "active"}
+            possible = {path for path, value in state.items() if value == "possible"}
+            return active, possible - active
 
         declarations_by_file = {
             path: relations.get("declarations", [])
@@ -1220,12 +1249,24 @@ class CodeGraph:
                 # 3. Definitions in an actually included static-inline header are
                 # part of this translation unit.  They have internal linkage, but
                 # unlike a static function in another .c file they are visible here.
-                visible_files = {rel_path} | include_closure(rel_path)
+                active_includes, conditional_includes = include_closure(
+                    rel_path, effective_call_condition
+                )
+                active_includes = active_includes - {rel_path}
+                conditional_files = conditional_includes - {rel_path}
+                visible_files = {rel_path} | active_includes
                 header_inline_all = [
                     target for target in targets
-                    if node_by_id[target][1] in visible_files - {rel_path}
+                    if node_by_id[target][1] in active_includes
                     and node_by_id[target][9] == "header_inline"
                 ]
+                # 只在條件式 include 底下才看得到的定義不是可見性,
+                # 是 conditional 候選(合併進 deferred → ambiguous)。
+                deferred = list(dict.fromkeys(deferred + [
+                    target for target in targets
+                    if node_by_id[target][1] in conditional_files
+                    and node_by_id[target][9] == "header_inline"
+                ]))
                 decision, deferred = merge_stage(
                     header_inline_all, effective_call_condition, deferred,
                     "ambiguous_header_inline",
@@ -1246,6 +1287,16 @@ class CodeGraph:
                         path, decl, name, caller_id, effective_call_condition
                     )) is not None
                 }
+                # 條件式 include 進來的 prototype 同理:不算可見宣告,
+                # 只能讓對應 definition 成為 conditional 候選。
+                conditional_declarations = {
+                    identity
+                    for path in conditional_files
+                    for decl in declarations_by_file.get(path, [])
+                    if (identity := visible_declaration_identity(
+                        path, decl, name, caller_id, effective_call_condition
+                    )) is not None
+                } - visible_declarations
                 external_all = [
                     target for target in targets
                     if node_by_id[target][1] != rel_path
@@ -1253,6 +1304,13 @@ class CodeGraph:
                     and _normalize_cpp_qualified(node_by_id[target][4])
                     in visible_declarations
                 ]
+                deferred = list(dict.fromkeys(deferred + [
+                    target for target in targets
+                    if node_by_id[target][1] != rel_path
+                    and node_by_id[target][9] == "external"
+                    and _normalize_cpp_qualified(node_by_id[target][4])
+                    in conditional_declarations
+                ]))
                 if visible_declarations:
                     decision, deferred = merge_stage(
                         external_all, effective_call_condition, deferred,

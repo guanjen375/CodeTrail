@@ -1066,7 +1066,10 @@ class ToolExecutor:
                 )
                 for e in plan:
                     if e['status'] == 'already':
-                        results.append(f"  區塊 {e['index'] + 1}: 已套用過,將跳過")
+                        results.append(
+                            f"  區塊 {e['index'] + 1}: 已套用過(修改後內容見行 "
+                            f"{e['pos'] + 1}),將跳過"
+                        )
                     else:
                         end = e['pos'] + max(e['replace_len'], 1)
                         results.append(
@@ -1108,9 +1111,13 @@ class ToolExecutor:
                     already = [e for e in plan if e['status'] == 'already']
                     if not pending:
                         # 冪等:所有區塊都已套用過 → 不碰檔案、不留備份。
+                        # 位置一定要報出來:no-op 若判錯,這是唯一的破綻。
+                        where = ", ".join(
+                            f"區塊{e['index'] + 1}→行 {e['pos'] + 1}" for e in already
+                        )
                         results.append(
                             f"✓ {filepath}: 所有區塊({len(already)})都已套用過,"
-                            "檔案未變更"
+                            f"檔案未變更（{where}）"
                         )
                         continue
                     fd, backup_name = tempfile.mkstemp(
@@ -1136,7 +1143,14 @@ class ToolExecutor:
                             + "）"
                         )
                     if already:
-                        msg += f"（另 {len(already)} 個區塊已套用過,跳過）"
+                        msg += (
+                            "（另 "
+                            + ", ".join(
+                                f"區塊{e['index'] + 1}已套用過於行 {e['pos'] + 1}"
+                                for e in already
+                            )
+                            + ",跳過）"
+                        )
                     results.append(msg)
         except Exception as e:
             rollback_notes = []
@@ -1395,8 +1409,10 @@ class ToolExecutor:
     #   - 唯一匹配 → 套用(行號錯誤/缺省都無所謂)。
     #   - 多處匹配 → 有行號 hint 挑最近的一處;沒有 hint 或距離打平 →
     #     拒絕並列出候選行號(fail loud,絕不猜位置)。
-    #   - 零匹配 → 若 hunk 的「修改後內容」已存在,視為已套用過(no-op,
-    #     重試安全);否則拒絕,附最接近位置的期望/實際對照。
+    #   - 零匹配 → 若 hunk 的「修改後內容」在檔案中唯一存在(有行號 hint 時
+    #     還要與 hint 相符),視為已套用過(no-op,重試安全);多處相同或與
+    #     hint 明顯衝突一律拒絕,否則會靜默跳過真正該改的地方。
+    #     其餘情況拒絕,附最接近位置的期望/實際對照。
     # 逐行比對容忍度沿用舊版:行尾空白差異(rstrip)一律容忍;整檔 strict
     # 掃不到時退一步做縮排不敏感(strip)掃描。
 
@@ -1448,6 +1464,53 @@ class ToolExecutor:
                 )
         return ""
 
+    # 「已套用過」的判定窗:hint 落在檔案範圍內(不是模型隨手亂寫)時,
+    # post-image 必須就在提示附近才算同一處。純內容比對會把「檔案別處剛好
+    # 有一段相同的修改後內容」誤判成已套用,靜默跳過真正該改的地方。
+    ALREADY_APPLIED_HINT_WINDOW = 100
+
+    def _resolve_already_applied(self, idx: int, positions: list,
+                                 hint: int | None, line_count: int) -> tuple:
+        """零匹配時判斷「修改後內容」是否真的就是這個 hunk 的目標位置。
+
+        Returns:
+            (pos, err):err 非 None 時視為定位失敗(fail loud,不當成 no-op)。
+        """
+        listed = ', '.join(str(p + 1) for p in positions[:5])
+        if len(positions) > 1:
+            if hint is None:
+                return None, (
+                    f"區塊 {idx + 1} 的 context 對不上,而「修改後內容」在檔案中"
+                    f"出現 {len(positions)} 處(行 {listed}),"
+                    "無法判斷是已套用過還是該改別處。"
+                    "請增加 context 行數,或在 @@ 標大約行號以消歧。"
+                )
+            best = min(positions, key=lambda p: abs(p - (hint - 1)))
+            ties = [
+                p for p in positions
+                if abs(p - (hint - 1)) == abs(best - (hint - 1))
+            ]
+            if len(ties) > 1:
+                return None, (
+                    f"區塊 {idx + 1} 的 context 對不上,而「修改後內容」在檔案中"
+                    f"出現 {len(positions)} 處(行 {listed}),"
+                    f"行號提示 {hint} 距離打平無法消歧。請增加 context 行數。"
+                )
+            chosen = best
+        else:
+            chosen = positions[0]
+
+        distance = abs(chosen - (hint - 1)) if hint is not None else 0
+        if hint is not None and 1 <= hint <= line_count \
+                and distance > self.ALREADY_APPLIED_HINT_WINDOW:
+            return None, (
+                f"區塊 {idx + 1} 的 context 對不上;行 {chosen + 1} 雖有相同的"
+                f"「修改後內容」,但距行號提示 {hint} 有 {distance} 行,"
+                "不能認定是同一處(很可能是別處剛好內容相同)。"
+                "請先 read_file 確認現況,再用該處的實際 context 重送。"
+            )
+        return chosen, None
+
     def _locate_hunks(self, file_lines: list, hunks: list) -> tuple:
         """把每個 hunk 定位到檔案位置。
 
@@ -1456,6 +1519,12 @@ class ToolExecutor:
             {'index', 'status'('apply'|'already'), 'pos'(0-based),
              'replace_len', 'new_lines', 'relocated'(header 行號缺省或不準)}
         """
+        # split('\n') 在「檔尾有換行」時會多出一個空字串 sentinel,它不是一行。
+        # 真實行數是純新增定位與 hint 合理性判斷的唯一基準。
+        line_count = (
+            len(file_lines) - 1
+            if file_lines and file_lines[-1] == '' else len(file_lines)
+        )
         plan = []
         for idx, hunk in enumerate(hunks):
             pattern = [c for t, c in hunk['lines'] if t in (' ', '-')]
@@ -1472,7 +1541,18 @@ class ToolExecutor:
                     )
                 # unified diff 慣例:old_count == 0 表示插在第 old_start 行之後。
                 insert_at = hint if hunk.get('old_count') == 0 else hint - 1
-                pos = min(max(insert_at, 0), len(file_lines))
+                # 越界行號一律 fail loud。舊版把它 clamp 到檔尾,
+                # `@@ -999,0 +1000,1 @@` 會「成功」寫到 EOF 之後(還會多一個
+                # 空行、吃掉尾端換行),模型完全看不出定位錯了。
+                if not 0 <= insert_at <= line_count:
+                    return None, (
+                        f"區塊 {idx + 1} 是純新增且沒有 context 行,只能靠行號定位,"
+                        f"但 @@ 的行號提示 {hint} 超出檔案範圍"
+                        f"(檔案共 {line_count} 行)。"
+                        "請改帶 2-3 行 context(定位就不必依賴行號),"
+                        f"或把行號改成 0..{line_count} 之間。"
+                    )
+                pos = insert_at
                 plan.append({
                     'index': idx, 'status': 'apply', 'pos': pos,
                     'replace_len': 0, 'new_lines': new_lines, 'relocated': False,
@@ -1519,9 +1599,14 @@ class ToolExecutor:
                         file_lines, new_lines, loose=True
                     )
                     if done:
+                        done_pos, done_err = self._resolve_already_applied(
+                            idx, done, hint, line_count
+                        )
+                        if done_err:
+                            return None, done_err
                         plan.append({
                             'index': idx, 'status': 'already',
-                            'pos': done[0], 'replace_len': 0,
+                            'pos': done_pos, 'replace_len': 0,
                             'new_lines': [], 'relocated': False,
                         })
                         continue

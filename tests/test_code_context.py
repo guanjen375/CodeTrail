@@ -347,3 +347,68 @@ def test_unscoped_index_items_never_reach_read_callback():
     assert bundle["seeds"] == []
     assert bundle["evidence"] == []
     assert calls == []
+
+
+def _stub_graph(edge: dict, related: dict):
+    class StubGraph:
+        def find_nodes(self, name, limit=20):
+            return [{"id": "seed", "path": "src/a.py", "start_line": 1,
+                     "end_line": 3, "name": "seed"}]
+
+        def neighbors(self, *args, **kwargs):
+            return {
+                "nodes": [
+                    {"id": "seed", "path": "src/a.py", "start_line": 1,
+                     "end_line": 3, "name": "seed"},
+                    related,
+                ],
+                "edges": [edge],
+                "truncated": False,
+            }
+
+        def file_neighbors(self, *args, **kwargs):
+            return {"files": ["src/a.py"], "edges": [], "truncated": False}
+
+    return StubGraph()
+
+
+def _context_with_edge(edge: dict):
+    related = {"id": "callee", "path": "src/b.py", "start_line": 1,
+               "end_line": 3, "name": "target"}
+    return code_context.build_code_context(
+        query="seed",
+        semantic_items=[{"path": "src/a.py", "symbol": "seed", "line": 1}],
+        index_items=[],
+        allowed_paths={"src/a.py", "src/b.py"},
+        read_window=lambda path, start, end: (
+            f"=== {path} (行 1-1 / 共 1 行) ===\n   1 | def {Path(path).stem}(): ...\n"
+        ),
+        max_chars=4000,
+        graph=_stub_graph(edge, related),
+    )
+
+
+def test_heuristic_call_edge_is_not_confirmed_evidence():
+    """resolved 但 confidence=heuristic(Python attribute call 猜同名)。"""
+    bundle = _context_with_edge({
+        "src_id": "seed", "dst_id": "callee", "dst_name": "target",
+        "resolved": True, "confidence": "heuristic",
+        "ambiguity_group": None, "type": "calls",
+    })
+    reasons = [row["reason"] for row in bundle["evidence"]]
+    assert any("heuristic callee candidate" in reason for reason in reasons), reasons
+    assert not any("confirmed callee" in reason for reason in reasons), reasons
+    assert any("not confirmed evidence" in row["reason"]
+               for row in bundle["uncertainties"]), bundle["uncertainties"]
+
+
+def test_exact_call_edge_stays_confirmed_evidence():
+    bundle = _context_with_edge({
+        "src_id": "seed", "dst_id": "callee", "dst_name": "target",
+        "resolved": True, "confidence": "exact",
+        "ambiguity_group": None, "type": "calls",
+    })
+    reasons = [row["reason"] for row in bundle["evidence"]]
+    assert any("confirmed callee" in reason for reason in reasons), reasons
+    assert not any("not confirmed evidence" in row["reason"]
+                   for row in bundle["uncertainties"]), bundle["uncertainties"]

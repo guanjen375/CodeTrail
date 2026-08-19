@@ -669,3 +669,123 @@ def test_c_add_change_delete_matches_full_rebuild(tmp_path, capsys):
     for root in (incremental_root, full_root):
         (root / "src/second.c").unlink()
     refresh_and_compare()
+
+
+# ---------------------------------------------------------------------------
+# 條件式 include:不得當成無條件可見性
+# ---------------------------------------------------------------------------
+def _conditional_repo(tmp_path):
+    _write(
+        tmp_path,
+        "include/service.h",
+        "#ifndef SERVICE_H\n#define SERVICE_H\n"
+        "int service(void);\n#endif\n",
+    )
+    _write(
+        tmp_path,
+        "src/service.c",
+        '#include "service.h"\nint service(void) { return 1; }\n',
+    )
+
+
+def test_conditional_include_is_only_a_conditional_candidate(tmp_path):
+    """`#ifdef FEATURE` 內的 include + branch 外的呼叫 → 不可 resolved。"""
+    _conditional_repo(tmp_path)
+    _write(
+        tmp_path,
+        "src/user.c",
+        "#ifdef FEATURE\n"
+        '#include "service.h"\n'
+        "#endif\n"
+        "int run(void) { return service(); }\n",
+    )
+
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "src/user.c", "run")
+    assert edge["resolved"] is False
+    assert edge["resolution_basis"] == "conditional_candidate"
+    assert edge["ambiguity_group"] is not None
+
+    conn = sqlite3.connect(graph.db_file)
+    include_condition = conn.execute(
+        "SELECT condition FROM edges"
+        " WHERE src_id='src/user.c' AND type='includes'"
+    ).fetchone()
+    conn.close()
+    # include edge 必須保存自己的 condition,否則 closure 無從判斷相容性。
+    assert include_condition == ("#ifdef FEATURE",)
+
+
+def test_call_inside_the_same_branch_still_resolves(tmp_path):
+    """同一個 `#ifdef FEATURE` 內的呼叫仍然看得到該 include → 正常解析。"""
+    _conditional_repo(tmp_path)
+    _write(
+        tmp_path,
+        "src/user_same_branch.c",
+        "#ifdef FEATURE\n"
+        '#include "service.h"\n'
+        "int run_same(void) { return service(); }\n"
+        "#endif\n",
+    )
+
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "src/user_same_branch.c", "run_same")
+    assert edge["resolved"] is True
+    assert edge["dst_name"] == "service"
+    assert edge["resolution_basis"] == "visible_declaration"
+
+
+def test_transitive_conditional_include_does_not_grant_visibility(tmp_path):
+    """無條件 include 的 header 裡再條件式 include → 整條路徑降為候選。"""
+    _conditional_repo(tmp_path)
+    _write(
+        tmp_path,
+        "include/facade.h",
+        "#ifndef FACADE_H\n#define FACADE_H\n"
+        "#ifdef FEATURE\n"
+        '#include "service.h"\n'
+        "#endif\n"
+        "#endif\n",
+    )
+    _write(
+        tmp_path,
+        "src/transitive.c",
+        '#include "facade.h"\n'
+        "int run_transitive(void) { return service(); }\n",
+    )
+
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "src/transitive.c", "run_transitive")
+    assert edge["resolved"] is False
+    assert edge["resolution_basis"] == "conditional_candidate"
+
+
+def test_conditional_static_inline_header_is_not_visible(tmp_path):
+    """條件式 include 的 static-inline header 定義同樣不算 translation unit 的一部分。"""
+    _write(
+        tmp_path,
+        "include/regs.h",
+        "#ifndef REGS_H\n#define REGS_H\n"
+        "static inline int read_status(void) { return 7; }\n#endif\n",
+    )
+    _write(
+        tmp_path,
+        "src/poll.c",
+        "#ifdef FEATURE\n"
+        '#include "regs.h"\n'
+        "#endif\n"
+        "int poll(void) { return read_status(); }\n",
+    )
+
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "src/poll.c", "poll")
+    assert edge["resolved"] is False
+    assert edge["resolution_basis"] == "conditional_candidate"
