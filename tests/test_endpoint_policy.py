@@ -268,3 +268,40 @@ def test_rag_fetch_url_does_not_go_through_model_policy(monkeypatch):
         "--url 是使用者顯式要抓的外部網頁,不得被 model endpoint policy 擋下"
     )
     assert content == "hello markdown"
+
+
+# ============================================================
+# GPT 審核修正的回歸測試(2026-08-19 二輪)
+# ============================================================
+def test_redirect_message_uses_hostname_and_redacts_credentials(monkeypatch):
+    """審核 #10:Location 用 .hostname(netloc 會帶 user:pass);request URL
+    內嵌 credentials 也要遮蔽。"""
+    fake = _FakeSession(_FakeResponse(
+        302, headers={"Location": "http://leak-user:leak-pass@evil.invalid:9999/x"}))
+    monkeypatch.setattr(llama_client, "get_session", lambda: fake)
+    monkeypatch.setenv(endpoint_policy.MODEL_REMOTE_OK_ENV, "1")
+
+    with pytest.raises(RuntimeError) as exc:
+        llama_client.native_completion(
+            base_url="http://api-user:api-secret@127.0.0.1:8080", prompt="x")
+    message = str(exc.value)
+    assert "evil.invalid" in message
+    assert "leak-pass" not in message and "leak-user" not in message, (
+        "Location 的 credentials 不得進錯誤訊息")
+    assert "api-secret" not in message and "api-user" not in message, (
+        "request URL 內嵌的 credentials 必須遮蔽")
+    assert "127.0.0.1:8080" in message
+
+
+def test_probe_log_redacts_credentials(monkeypatch, capsys):
+    monkeypatch.setenv(endpoint_policy.MODEL_REMOTE_OK_ENV, "1")
+
+    class _Boom:
+        def get(self, *a, **k):
+            raise ConnectionError("down")
+
+    monkeypatch.setattr(llama_client, "get_session", lambda: _Boom())
+    assert llama_client.get_health("http://u:topsecret@127.0.0.1:8080") is None
+    err = capsys.readouterr().err
+    assert "topsecret" not in err
+    assert "127.0.0.1" in err

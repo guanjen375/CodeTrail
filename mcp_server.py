@@ -547,37 +547,49 @@ _GRAPH_RESPONSE_MAX_CHARS = 8000
 
 
 def _cap_graph_response(resp: dict) -> dict:
-    """全回應 ≤8000 chars;超限從 edges/nodes 尾端截,附 truncation metadata。"""
+    """全回應 ≤8000 chars,對所有可裁清單(paths / edges / nodes / files)成立。
+
+    truncation metadata **先**加入再裁(審核 #9:metadata 加入後才量測會
+    再次超限),裁序 paths → edges → nodes → files,每輪重量測到符合為止。
+    """
     import json as _json
 
-    def _size(d):
-        return len(_json.dumps(d, ensure_ascii=False))
+    def _size():
+        return len(_json.dumps(resp, ensure_ascii=False))
 
-    if _size(resp) <= _GRAPH_RESPONSE_MAX_CHARS:
+    if _size() <= _GRAPH_RESPONSE_MAX_CHARS:
         return resp
-    original_edges = len(resp.get("edges", []))
-    original_nodes = len(resp.get("nodes", []))
-    while resp.get("edges") and _size(resp) > _GRAPH_RESPONSE_MAX_CHARS:
-        resp["edges"].pop()
-    while resp.get("nodes") and _size(resp) > _GRAPH_RESPONSE_MAX_CHARS:
-        resp["nodes"].pop()
+
+    lists = [k for k in ("paths", "edges", "nodes", "files") if resp.get(k)]
+    totals = {k: len(resp[k]) for k in lists}
     resp["truncated"] = True
     resp["truncation"] = {
         "reason": f"response cap {_GRAPH_RESPONSE_MAX_CHARS} chars",
-        "edges_kept": len(resp.get("edges", [])),
-        "edges_total": original_edges,
-        "nodes_kept": len(resp.get("nodes", [])),
-        "nodes_total": original_nodes,
+        "kept": dict(totals),   # 先佔位,裁完更新;含 metadata 一起量測
+        "total": totals,
     }
+    while _size() > _GRAPH_RESPONSE_MAX_CHARS:
+        for key in ("paths", "edges", "nodes", "files"):
+            if resp.get(key):
+                resp[key].pop()
+                break
+        else:
+            break  # 沒東西可裁:固定欄位不會超過 cap
+        resp["truncation"]["kept"] = {k: len(resp.get(k, [])) for k in totals}
     return resp
 
 
 def _slim_edge(edge: dict) -> dict:
-    """graph edge 的精簡輸出(逐步 file:line 證據)。"""
+    """graph edge 的精簡輸出(逐步 file:line 證據)。
+
+    ambiguity_group 必須保留(審核 #3):同一 call site 的多候選共用一組 id,
+    丟掉它會把候選之一呈現成確定呼叫;resolved 對歧義候選是 False。
+    """
     return {
         "src": edge.get("src_name") or edge.get("src_id"),
         "dst": edge.get("dst_name") or edge.get("dst_id"),
         "unresolved_target": edge.get("unresolved_target"),
+        "ambiguity_group": edge.get("ambiguity_group"),
         "type": edge.get("type"),
         "evidence": f"{edge.get('evidence_path')}:{edge.get('evidence_line')}",
         "backend": edge.get("backend"),
@@ -599,11 +611,13 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
     Args:
         query: mode="semantic" → 想找的程式碼行為,例如 "conv2d 的 padding 計算"。
                mode="neighbors" → symbol 名(exact / qualified name 比對,取前 3
-               個 anchor)。
+               個 anchor)或 repo 相對檔案路徑(如 "src/dispatcher.c",看該檔
+               的 includes/imports 關係)。
                mode="path" → "SRC -> DST"(兩端都是 symbol 名;容忍空白)。
         top_k: 回傳前幾名(預設 5;semantic 模式)。
         mode: "semantic"(預設)| "neighbors"(1–2 hop 鄰居)| "path"
-              (呼叫鏈最短路徑,≤4 hop、最多 3 條)。
+              (呼叫鏈最短路徑,≤4 hop、最多 3 條;只走確定解析的邊,
+              歧義候選不入鏈)。
         hops: neighbors 模式的跳數(1–2,預設 1)。
         include_evidence: semantic 模式加開 score_components / backend /
                confidence / relations(graph 1-hop,≤5 條/筆)/ graph_status。
@@ -613,10 +627,13 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
         mode="semantic":[{"path": str, "line": int, "symbol": str,
             "score": float, ...}, ...](include_evidence=True 時每筆多
             score_components/backend/confidence/relations/graph_status)。
-        mode="neighbors":單元素 list,含 anchors/nodes/edges(每步
-            evidence 是 "file:line")與 truncation metadata。
+        mode="neighbors":單元素 list,含 anchors/nodes/edges(symbol anchor)
+            或 anchors/files/edges(file anchor);每步 evidence 是
+            "file:line",超限附 truncation metadata。
         mode="path":單元素 list,含 paths(每條是 edge list,逐步證據)。
-        graph 檔缺席或損壞時 neighbors/path 直接報錯;semantic 不受影響。
+        graph 生命週期:首次 graph 查詢會**自動建置**(付一次 build 成本)、
+        之後每次查詢自動偵測變更做增量;graph 檔損壞或 schema 不符時
+        neighbors/path 直接報錯,semantic 不受影響。
     """
     if mode not in ("semantic", "neighbors", "path"):
         raise ValueError(f"mode 必須是 semantic|neighbors|path,收到 {mode!r}")
@@ -625,9 +642,26 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
         graph = _graph_for_query()
         anchors = graph.find_nodes(query.strip())[:3]
         if not anchors:
+            # file anchor(審核 #5):「這個檔 include 誰」走 files 表,
+            # 不會因為 query 不是 symbol 而報找不到。
+            file_anchor = graph.find_file(query.strip())
+            if file_anchor is not None:
+                result = graph.file_neighbors(
+                    file_anchor, hops=min(max(int(hops), 1), 2), limit=50)
+                resp = {
+                    "mode": "neighbors",
+                    "query": query,
+                    "anchors": [{"file": file_anchor}],
+                    "files": result["files"],
+                    "edges": [_slim_edge(e) for e in result["edges"]],
+                    "graph_status": "ok",
+                    "truncated": result["truncated"],
+                }
+                return [_cap_graph_response(resp)]
             hints = graph.suggest_names(query.strip())
             raise RuntimeError(
-                f"neighbors: 找不到 symbol {query.strip()!r}(exact/qualified 比對)。"
+                f"neighbors: 找不到 symbol 或檔案 {query.strip()!r}"
+                "(symbol 走 exact/qualified 比對,檔案走 repo 相對路徑)。"
                 + (f"近似候選: {', '.join(hints)}" if hints else "graph 內無近似名稱。")
             )
         hops = min(max(int(hops), 1), 2)

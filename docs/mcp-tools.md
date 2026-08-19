@@ -37,7 +37,7 @@
 | 類型 | 工具 | 白話用途 |
 |---|---|---|
 | 專案探索 | `list_dir(path=".", depth=2)` | 看目錄樹，不要叫模型跑 `ls` |
-| 專案探索 | `code_rag_search(query, top_k=5, mode="semantic", hops=1, include_evidence=False)` | 用「這段程式在做什麼」去找可能的函式/class。`mode="neighbors"`(query 放 symbol 名)看某符號的 1–2 hop 呼叫關係;`mode="path"`(query 寫 `"SRC -> DST"`)拿跨檔案呼叫鏈,每一步都附 `檔:行` 證據;`include_evidence=True` 讓 semantic 結果多帶分數組成 / parser backend / graph 1-hop 關係。graph 對 C/C++(tree-sitter)與 Python 抽 definitions / includes / calls;function pointer 與 macro 間接呼叫會誠實標 unresolved,不亂猜目標 |
+| 專案探索 | `code_rag_search(query, top_k=5, mode="semantic", hops=1, include_evidence=False)` | 用「這段程式在做什麼」去找可能的函式/class。`mode="neighbors"`(query 放 symbol 名看 1–2 hop 呼叫關係;放 repo 相對檔案路徑如 `src/uart.c` 看該檔的 include/import 關係);`mode="path"`(query 寫 `"SRC -> DST"`)拿跨檔案呼叫鏈,每一步都附 `檔:行` 證據且只走確定解析的邊(同名多候選的歧義邊不入鏈);`include_evidence=True` 讓 semantic 結果多帶分數組成 / parser backend / graph 1-hop 關係。graph 對 C/C++(tree-sitter)與 Python 抽 definitions / includes / calls;**首次 graph 查詢會自動建置**(付一次 build 成本),之後查詢自動增量;graph 檔損壞時 graph 模式報錯、semantic 不受影響;function pointer 與 macro 間接呼叫會誠實標 unresolved,不亂猜目標 |
 | 專案探索 | `grep_code(pattern, path=".", include=None, context=0)` | 搜錯誤訊息、函式名、設定名 |
 | 專案探索 | `file_info(path)` | 讀檔前先看大小，避免一次塞爆 context |
 | 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=50000)` | 讀檔案內容，長檔要分段 |
@@ -58,7 +58,7 @@
 ### 使用原則
 
 - 找程式碼時，先請模型用工具 `code_rag_search` 或 `grep_code`，再用工具 `read_file`。
-- 問「誰呼叫了 X」「X 怎麼一路呼叫到 Y」「這個檔直接 include 了誰」時,用 `code_rag_search` 的 `mode="neighbors"` / `mode="path"`;回傳的關係每一步都有 `檔:行` 證據,unresolved(function pointer / macro 間接呼叫)會明講。graph 在查詢時自動偵測檔案變更並增量更新。
+- 問「誰呼叫了 X」「X 怎麼一路呼叫到 Y」時,用 `code_rag_search` 的 `mode="neighbors"`(query 放 symbol 名)/ `mode="path"`;問「這個檔直接 include 了誰」時,`mode="neighbors"` 的 query 放 repo 相對檔案路徑。回傳的關係每一步都有 `檔:行` 證據,unresolved(function pointer / macro 間接呼叫)與歧義候選(同名多定義)會明講。graph 首次查詢自動建置,之後查詢自動偵測檔案變更做增量更新;安裝 tree-sitter grammar 或改 `AICODE_H_LANG` 後會自動整體重建。
 - 檔案變更偵測有一個 30 秒的快照窗(`AICODE_CODE_RAG_REFRESH_TTL`,設 0 關閉):透過 CodeTrail 工具(`apply_patch` / `run_command` / `run_lint`)寫檔會立即失效重掃;**在外部編輯器改檔**則最長 30 秒內的查詢可能還看到舊索引,屬既知取捨。
 - 長檔先用工具 `file_info` 看大小，再要求工具 `read_file` 分段讀。
 - 查 spec 先用工具 `query_knowledge`；數字、限制、預設值這類答錯很糟的題目，用工具 `query_knowledge_strict`。多份相似版本並存時傳 `source="檔名"`，filter 會在 top-k 前套用。

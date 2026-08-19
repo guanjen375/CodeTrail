@@ -24,6 +24,19 @@ import endpoint_policy
 from http_client import get_session
 
 
+def _redact_url(url: str) -> str:
+    """去掉 URL 內嵌的 credentials(user:pass@)再進錯誤訊息 / log。"""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    if not (parts.username or parts.password):
+        return url
+    netloc = parts.hostname or ""
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
 def _ensure_allowed(url: str) -> None:
     """所有 llama-server 呼叫送出前的端點 policy(role="model")。
 
@@ -35,11 +48,13 @@ def _ensure_allowed(url: str) -> None:
 
 
 def _reject_redirect(resp, url: str) -> None:
-    """3xx 一律 fail-loud。訊息含 status 與 Location host,絕不含 request body。"""
+    """3xx 一律 fail-loud。訊息含 status 與 Location 的 **host**(用 .hostname,
+    不用 netloc —— netloc 可能帶 user:password@),request URL 內嵌的
+    credentials 也遮蔽;絕不含 request body。"""
     if 300 <= resp.status_code < 400:
-        location_host = urlparse(resp.headers.get("Location", "")).netloc or "?"
+        location_host = urlparse(resp.headers.get("Location", "")).hostname or "?"
         raise RuntimeError(
-            f"llama-server request to {url} was redirected "
+            f"llama-server request to {_redact_url(url)} was redirected "
             f"(HTTP {resp.status_code} -> host {location_host!r}); "
             "refusing to follow redirects (request body was not resent)"
         )
@@ -514,7 +529,7 @@ def _log_probe_failure(endpoint: str, url: str, exc: Exception) -> None:
     不含 body,直接印。
     """
     print(
-        f"[llama_client] {endpoint} probe failed for {url}: "
+        f"[llama_client] {endpoint} probe failed for {_redact_url(url)}: "
         f"{type(exc).__name__}: {exc}",
         file=sys.stderr,
     )

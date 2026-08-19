@@ -47,6 +47,7 @@ import sqlite3
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import config
@@ -171,8 +172,17 @@ def _extract_python_relations(rel_path: str, content: str,
             for alias in node.names:
                 imports.append((tuple(alias.name.split(".")), 0, node.lineno))
         elif isinstance(node, _ast.ImportFrom):
-            parts = tuple(node.module.split(".")) if node.module else ()
-            imports.append((parts, node.level, node.lineno))
+            base = tuple(node.module.split(".")) if node.module else ()
+            # alias 要接到 module path 尾端(審核 #7):
+            # `from pkg import util` 得先試 pkg/util.py,不是只看 pkg;
+            # alias 是符號(非子模組)時 _resolve_import 的逐段縮短會退回
+            # pkg.py / pkg/__init__.py。`import *` 沒有 alias 可接,原樣。
+            for alias in node.names:
+                if alias.name == "*":
+                    imports.append((base, node.level, node.lineno))
+                else:
+                    imports.append((base + tuple(alias.name.split(".")),
+                                    node.level, node.lineno))
 
     # caller 定位:call 行號落在哪個 function/method 的範圍內(取最內層)
     callable_nodes = [
@@ -293,6 +303,12 @@ class CodeGraph:
             os.close(fd)
 
     def _connect(self, path: Path | None = None) -> sqlite3.Connection:
+        """開連線。正式 DB 每次 connect 前都過 symlink 防線(審核 #2):
+        sqlite3.connect 會 follow symlink,graph 路徑被換成指向別的專案
+        graph 的 symlink 時,查詢/增量會跨 root 讀寫。staging tmp(顯式傳
+        path)由呼叫端以 O_NOFOLLOW 預建立,不重驗。"""
+        if path is None:
+            self._assert_db_path_safe()
         conn = sqlite3.connect(str(path or self.db_file))
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
@@ -349,13 +365,24 @@ class CodeGraph:
         )
 
     def _parser_versions(self) -> str:
+        """抽取能力指紋:進 index_metadata,ensure_fresh 比對不符 → full rebuild。
+
+        涵蓋 tree-sitter 版本、c/cpp grammar 是否實際可載入、`.h` 語言模式
+        (審核 #6):安裝 grammar / 升級 parser / 改 AICODE_H_LANG 之後,舊的
+        degraded graph 不得永久沿用。
+        """
         try:
             import tree_sitter
 
             ts = getattr(tree_sitter, "__version__", "?")
         except ImportError:
             ts = "absent"
-        return f"python-ast:{sys.version_info.major}.{sys.version_info.minor};tree-sitter:{ts}"
+        c_ok = bool(HAS_TREE_SITTER and _try_load_tree_sitter_language("c"))
+        cpp_ok = bool(HAS_TREE_SITTER and _try_load_tree_sitter_language("cpp"))
+        return (
+            f"python-ast:{sys.version_info.major}.{sys.version_info.minor};"
+            f"tree-sitter:{ts};c:{int(c_ok)};cpp:{int(cpp_ok)};h:{_h_ext_lang()}"
+        )
 
     # -------- 抽取單檔 --------
     def _extract_file(self, rel_path: str, filepath: Path, file_hash: str):
@@ -464,8 +491,14 @@ class CodeGraph:
             per_file_relations[rel_path] = relations
         return file_rows, node_rows, per_file_relations
 
-    def _edge_rows(self, file_rows, node_rows, per_file_relations):
-        """把 raw relations resolve 成 edges rows(跨檔一致視角)。"""
+    def _edge_rows(self, file_rows, node_rows, per_file_relations,
+                   extra_callables: list[tuple[str, str, str]] | None = None):
+        """把 raw relations resolve 成 edges rows(跨檔一致視角)。
+
+        extra_callables:增量更新時,DB 內「未受影響檔案」的既有 callable
+        nodes [(id, name, qualified_name)]。少了它,重抽 caller 檔時指向
+        未變檔案的 call 全部誤判 unresolved(GPT 審核 #1)。
+        """
         all_files = {row[0] for row in file_rows}
         node_by_id = {row[0]: row for row in node_rows}
         # name → node ids(callable 才是 call 的合法 dst)
@@ -476,6 +509,9 @@ class CodeGraph:
             if kind in _CALLABLE_KINDS:
                 callable_by_name.setdefault(name, []).append(nid)
                 callable_by_qualified.setdefault(qualified, []).append(nid)
+        for nid, name, qualified in (extra_callables or []):
+            callable_by_name.setdefault(name, []).append(nid)
+            callable_by_qualified.setdefault(qualified, []).append(nid)
 
         edges = []
         for rel_path, relations in per_file_relations.items():
@@ -645,7 +681,14 @@ class CodeGraph:
         return True
 
     def ensure_fresh(self) -> None:
-        """query 前置:graph 缺 → CodeGraphError;落後 → 同步增量後回答。"""
+        """graph query 前置(明確的 lazy-build 契約,與文件/測試統一;審核 #8):
+
+        - 檔不存在 → **當場自動建置**(首次 graph 查詢會付一次 build 成本);
+        - 檔存在但損壞 / schema 不符 → CodeGraphError(不砍不蓋,semantic 不受影響);
+        - scope fingerprint 或 parser 能力指紋(tree-sitter/grammar/AICODE_H_LANG)
+          變了 → full rebuild;
+        - 檔案 hash 落後 → 同步增量後回答。
+        """
         if not self._db_ready():
             if self.db_file.exists():
                 raise CodeGraphError(
@@ -660,13 +703,20 @@ class CodeGraph:
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT scope_fingerprint FROM index_metadata LIMIT 1").fetchone()
+                "SELECT scope_fingerprint, parser_versions FROM index_metadata LIMIT 1"
+            ).fetchone()
             db_hashes = dict(conn.execute("SELECT path, content_hash FROM files"))
         finally:
             conn.close()
 
         if row and row[0] != self._scanner.scope.fingerprint:
             print("[CODE_GRAPH] scope fingerprint changed; full rebuild", file=sys.stderr)
+            self.build(verbose=False)
+            return
+        if row and row[1] != self._parser_versions():
+            # grammar 裝上 / parser 升級 / .h 語言模式改變:degraded graph
+            # 不得永久沿用(審核 #6)
+            print("[CODE_GRAPH] parser capabilities changed; full rebuild", file=sys.stderr)
             self.build(verbose=False)
             return
 
@@ -713,16 +763,36 @@ class CodeGraph:
                     node_rows.extend(nodes)
                     relations[rel] = rel_relations
 
+                all_dirty = sorted(set(affected))
+                ph = ",".join("?" * len(all_dirty))
+
+                # 重抽檔的 call resolve 必須看得到「未受影響檔案」的既有
+                # callable nodes,否則跨檔呼叫全變 unresolved(審核 #1)。
+                extra_callables = [
+                    (row[0], row[1], row[2])
+                    for row in conn.execute(
+                        f"SELECT id, name, qualified_name FROM nodes"
+                        f" WHERE kind IN ('function','method')"
+                        f" AND path NOT IN ({ph})",
+                        all_dirty,
+                    )
+                ]
                 # resolve 對照的檔案全集 = 現存所有檔(含未重抽的)
                 all_files_rows = [(rel, files[rel]["hash"], _lang_for(rel), "") for rel in files]
-                edges = self._edge_rows(all_files_rows, node_rows, relations)
+                edges = self._edge_rows(all_files_rows, node_rows, relations,
+                                        extra_callables=extra_callables)
                 # _edge_rows 的 defines 只涵蓋重抽檔(relations keys),但它掃
                 # node_rows 全集;這裡 node_rows 本來就只含重抽檔,一致。
 
+                # dangling 的名稱要在 DELETE 之前蒐集:node 刪掉後就查不到
+                # 名字,unresolved_target 會退化成 '?'(審核 #1)。
+                doomed_names = dict(
+                    conn.execute(
+                        f"SELECT id, name FROM nodes WHERE path IN ({ph})", all_dirty)
+                )
+
                 conn.execute("BEGIN IMMEDIATE")
                 try:
-                    all_dirty = sorted(set(affected))
-                    ph = ",".join("?" * len(all_dirty))
                     conn.execute(
                         f"DELETE FROM edges WHERE evidence_path IN ({ph})", all_dirty)
                     conn.execute(
@@ -733,17 +803,22 @@ class CodeGraph:
                     conn.executemany(self._INSERT_FILE, file_rows)
                     conn.executemany(self._INSERT_NODE, node_rows)
                     conn.executemany(self._INSERT_EDGE, edges)
-                    # 指向已消失 node 的 calls → 標 unresolved(檔案刪除語意)
-                    conn.execute(
-                        """
-                        UPDATE edges SET unresolved_target = COALESCE(
-                            unresolved_target,
-                            (SELECT name FROM nodes WHERE id = edges.dst_id), '?'),
-                            dst_kind = NULL, dst_id = NULL, confidence='syntactic'
-                        WHERE type='calls' AND dst_id IS NOT NULL
-                          AND dst_id NOT IN (SELECT id FROM nodes)
-                        """
-                    )
+                    # 指向已消失 node 的 calls → 標 unresolved(檔案刪除語意);
+                    # 名稱用 DELETE 前蒐集的 doomed_names,不留 '?'。
+                    dangling = conn.execute(
+                        "SELECT rowid, dst_id, unresolved_target FROM edges"
+                        " WHERE type='calls' AND dst_id IS NOT NULL"
+                        " AND dst_id NOT IN (SELECT id FROM nodes)"
+                    ).fetchall()
+                    for rowid, dst_id, existing_target in dangling:
+                        target = existing_target or doomed_names.get(dst_id, "?")
+                        conn.execute(
+                            "UPDATE edges SET unresolved_target = ?, dst_kind = NULL,"
+                            " dst_id = NULL, confidence = 'syntactic' WHERE rowid = ?",
+                            (target, rowid),
+                        )
+                    # parser_versions 刻意不動:它是 full-rebuild 的訊號
+                    # (ensure_fresh 比對),增量只重抽部分檔案,不得洗白。
                     conn.execute(
                         "UPDATE index_metadata SET updated = ?",
                         (time.strftime("%Y-%m-%dT%H:%M:%S"),),
@@ -767,22 +842,53 @@ class CodeGraph:
                 "neighbors/path 需要先成功 build"
             )
 
-    def _query(self, sql: str, params=()):
+    @contextmanager
+    def _read_snapshot(self):
+        """單一讀連線 + 讀 transaction:traversal 的所有查詢共用同一個 WAL
+        snapshot(審核 #4)。每個查詢各開連線的話,BFS 途中撞上另一 process
+        的 COMMIT 會混到兩個 graph 世代,甚至組出從未同時存在過的路徑。
+        BEGIN(deferred)後的第一個 SELECT 固定 snapshot,直到 rollback。
+        """
         conn = self._connect()
+        conn.execute("BEGIN")
         try:
-            return conn.execute(sql, params).fetchall()
+            yield conn
         finally:
-            conn.close()
+            try:
+                conn.rollback()
+            finally:
+                conn.close()
 
-    def find_nodes(self, name: str, limit: int = 20) -> list[dict]:
-        self._require_ready()
-        rows = self._query(
-            "SELECT id, path, kind, name, qualified_name, start_line, end_line,"
-            " backend, confidence FROM nodes WHERE name = ? OR qualified_name = ?"
-            " ORDER BY path, start_line LIMIT ?",
-            (name, name, limit),
-        )
+    def _query(self, sql: str, params=(), conn: sqlite3.Connection | None = None):
+        if conn is not None:
+            return conn.execute(sql, params).fetchall()
+        with self._read_snapshot() as snap:
+            return snap.execute(sql, params).fetchall()
+
+    _FIND_NODES_SQL = (
+        "SELECT id, path, kind, name, qualified_name, start_line, end_line,"
+        " backend, confidence FROM nodes WHERE name = ? OR qualified_name = ?"
+        " ORDER BY path, start_line LIMIT ?"
+    )
+
+    def find_nodes(self, name: str, limit: int = 20, *,
+                   conn: sqlite3.Connection | None = None) -> list[dict]:
+        # conn 給定 = 已在驗證過的 snapshot 內,跳過 _require_ready
+        # (它會另開連線,破壞「單連線 traversal」的常數連線數契約)。
+        if conn is None:
+            self._require_ready()
+        rows = self._query(self._FIND_NODES_SQL, (name, name, limit), conn=conn)
         return [self._node_dict(r) for r in rows]
+
+    def find_file(self, rel_path: str, *,
+                  conn: sqlite3.Connection | None = None) -> str | None:
+        """files 表 exact match(正規化反斜線);找不到回 None。"""
+        if conn is None:
+            self._require_ready()
+        normalized = rel_path.strip().replace("\\", "/")
+        rows = self._query("SELECT path FROM files WHERE path = ?", (normalized,),
+                           conn=conn)
+        return rows[0][0] if rows else None
 
     @staticmethod
     def _node_dict(r) -> dict:
@@ -792,10 +898,11 @@ class CodeGraph:
             "backend": r[7], "confidence": r[8],
         }
 
-    def _edge_dict(self, r, name_cache: dict) -> dict:
-        src_name = self._id_name(r[1], name_cache) if r[0] == "symbol" else r[1]
+    def _edge_dict(self, r, name_cache: dict,
+                   conn: sqlite3.Connection | None = None) -> dict:
+        src_name = self._id_name(r[1], name_cache, conn) if r[0] == "symbol" else r[1]
         dst_name = (
-            self._id_name(r[3], name_cache) if (r[2] == "symbol" and r[3]) else r[3]
+            self._id_name(r[3], name_cache, conn) if (r[2] == "symbol" and r[3]) else r[3]
         )
         return {
             "src_kind": r[0], "src_id": r[1], "src_name": src_name,
@@ -803,16 +910,20 @@ class CodeGraph:
             "unresolved_target": r[4], "ambiguity_group": r[5],
             "type": r[6], "evidence_path": r[7], "evidence_line": r[8],
             "backend": r[9], "confidence": r[10],
-            "resolved": r[3] is not None,
+            # resolved = 確定解析:歧義候選(ambiguity_group)有 dst_id 但
+            # 只是候選之一,不得呈現成確定關係(審核 #3)。
+            "resolved": r[3] is not None and r[5] is None,
         }
 
     _EDGE_COLS = ("src_kind, src_id, dst_kind, dst_id, unresolved_target,"
                   " ambiguity_group, type, evidence_path, evidence_line,"
                   " backend, confidence")
 
-    def _id_name(self, node_id: str, cache: dict) -> str:
+    def _id_name(self, node_id: str, cache: dict,
+                 conn: sqlite3.Connection | None = None) -> str:
         if node_id not in cache:
-            rows = self._query("SELECT name FROM nodes WHERE id = ?", (node_id,))
+            rows = self._query("SELECT name FROM nodes WHERE id = ?", (node_id,),
+                               conn=conn)
             cache[node_id] = rows[0][0] if rows else node_id
         return cache[node_id]
 
@@ -826,7 +937,10 @@ class CodeGraph:
 
     def neighbors(self, node_id: str, edge_types: tuple = ("calls",),
                   direction: str = "both", hops: int = 1, limit: int = 50) -> dict:
-        """BFS ≤2 hops。回傳 {nodes, edges, truncated}。deterministic ordering。"""
+        """BFS ≤2 hops。回傳 {nodes, edges, truncated}。deterministic ordering。
+
+        整趟 BFS 在單一 read snapshot 內(審核 #4)。
+        """
         self._require_ready()
         hops = min(max(int(hops), 1), 2)
         type_ph = ",".join("?" * len(edge_types))
@@ -835,117 +949,168 @@ class CodeGraph:
         edges_out = []
         truncated = False
         name_cache: dict = {}
-        for _ in range(hops):
-            next_frontier = []
-            for nid in frontier:
-                clauses = []
-                if direction in ("out", "both"):
-                    clauses.append(("src_id", "dst_id"))
-                if direction in ("in", "both"):
-                    clauses.append(("dst_id", "src_id"))
-                for anchor_col, other_col in clauses:
-                    rows = self._query(
-                        f"SELECT {self._EDGE_COLS} FROM edges WHERE {anchor_col} = ?"
-                        f" AND type IN ({type_ph})"
-                        " ORDER BY evidence_path, evidence_line",
-                        (nid, *edge_types),
-                    )
-                    for r in rows:
-                        if len(edges_out) >= limit * 2:
-                            truncated = True
-                            break
-                        edge = self._edge_dict(r, name_cache)
-                        if not self._evidence_in_scope(edge):
-                            continue
-                        edges_out.append(edge)
-                        other = r[3] if other_col == "dst_id" else r[1]
-                        if other and other not in seen_nodes:
-                            if len(seen_nodes) >= limit:
+        with self._read_snapshot() as conn:
+            for _ in range(hops):
+                next_frontier = []
+                for nid in frontier:
+                    clauses = []
+                    if direction in ("out", "both"):
+                        clauses.append(("src_id", "dst_id"))
+                    if direction in ("in", "both"):
+                        clauses.append(("dst_id", "src_id"))
+                    for anchor_col, other_col in clauses:
+                        rows = self._query(
+                            f"SELECT {self._EDGE_COLS} FROM edges WHERE {anchor_col} = ?"
+                            f" AND type IN ({type_ph})"
+                            " ORDER BY evidence_path, evidence_line",
+                            (nid, *edge_types), conn=conn,
+                        )
+                        for r in rows:
+                            if len(edges_out) >= limit * 2:
                                 truncated = True
+                                break
+                            edge = self._edge_dict(r, name_cache, conn)
+                            if not self._evidence_in_scope(edge):
                                 continue
-                            seen_nodes.add(other)
-                            next_frontier.append(other)
-            frontier = next_frontier
-        node_rows = []
-        for nid in sorted(seen_nodes):
-            rows = self._query(
-                "SELECT id, path, kind, name, qualified_name, start_line, end_line,"
-                " backend, confidence FROM nodes WHERE id = ?", (nid,))
-            node_rows.extend(self._node_dict(r) for r in rows)
+                            edges_out.append(edge)
+                            other = r[3] if other_col == "dst_id" else r[1]
+                            if other and other not in seen_nodes:
+                                if len(seen_nodes) >= limit:
+                                    truncated = True
+                                    continue
+                                seen_nodes.add(other)
+                                next_frontier.append(other)
+                frontier = next_frontier
+            node_rows = []
+            for nid in sorted(seen_nodes):
+                rows = self._query(
+                    "SELECT id, path, kind, name, qualified_name, start_line, end_line,"
+                    " backend, confidence FROM nodes WHERE id = ?", (nid,), conn=conn)
+                node_rows.extend(self._node_dict(r) for r in rows)
         return {"nodes": node_rows, "edges": edges_out, "truncated": truncated}
+
+    def file_neighbors(self, rel_path: str, hops: int = 1, limit: int = 50) -> dict:
+        """file anchor 的 includes/imports 關係(審核 #5:MCP 的「這個檔
+        include 誰」入口)。回傳 {files, edges, truncated};edges 含雙向
+        (includes 與 included_by 都在,方向看 src/dst)。單一 snapshot。
+        """
+        self._require_ready()
+        hops = min(max(int(hops), 1), 2)
+        seen_files = {rel_path}
+        frontier = [rel_path]
+        edges_out: list[dict] = []
+        truncated = False
+        name_cache: dict = {}
+        with self._read_snapshot() as conn:
+            for _ in range(hops):
+                next_frontier = []
+                for current in frontier:
+                    for anchor_col, other_col in (("src_id", "dst_id"), ("dst_id", "src_id")):
+                        rows = self._query(
+                            f"SELECT {self._EDGE_COLS} FROM edges WHERE {anchor_col} = ?"
+                            " AND type IN ('includes','imports')"
+                            " ORDER BY evidence_path, evidence_line",
+                            (current,), conn=conn,
+                        )
+                        for r in rows:
+                            if len(edges_out) >= limit * 2:
+                                truncated = True
+                                break
+                            edge = self._edge_dict(r, name_cache, conn)
+                            if not self._evidence_in_scope(edge):
+                                continue
+                            edges_out.append(edge)
+                            other = r[3] if other_col == "dst_id" else r[1]
+                            if other and other not in seen_files:
+                                if len(seen_files) >= limit:
+                                    truncated = True
+                                    continue
+                                seen_files.add(other)
+                                next_frontier.append(other)
+                frontier = next_frontier
+        return {"files": sorted(seen_files), "edges": edges_out, "truncated": truncated}
 
     def shortest_evidence_paths(self, src_names: set, dst_names: set,
                                 max_hops: int = 4, limit: int = 3) -> list[list[dict]]:
-        """resolved calls 邊上的最短路徑(≤max_hops、≤limit 條、cycle-safe)。"""
+        """確定解析的 calls 邊上的最短路徑(≤max_hops、≤limit 條、cycle-safe)。
+
+        歧義邊(ambiguity_group)不入路徑(審核 #3):候選之一不是確定呼叫,
+        呈現成呼叫鏈會誤導。整趟搜尋在單一 read snapshot 內(審核 #4)。
+        """
         self._require_ready()
         max_hops = min(int(max_hops), 4)
         limit = min(int(limit), 3)
-        src_ids = {n["id"] for name in sorted(src_names) for n in self.find_nodes(name)}
-        dst_ids = {n["id"] for name in sorted(dst_names) for n in self.find_nodes(name)}
-        if not src_ids or not dst_ids:
-            missing = "src" if not src_ids else "dst"
-            raise CodeGraphError(f"path 端點 resolve 失敗({missing});用 find_nodes 檢查名稱")
-
         name_cache: dict = {}
         results: list[list[dict]] = []
-        # BFS(paths as edge lists);deterministic:鄰接按 (dst 名, evidence) 排序
-        queue: list[tuple[str, list]] = [(sid, []) for sid in sorted(src_ids)]
-        best_depth: dict[str, int] = {sid: 0 for sid in src_ids}
-        while queue and len(results) < limit:
-            nid, path = queue.pop(0)
-            if len(path) >= max_hops:
-                continue
-            rows = self._query(
-                f"SELECT {self._EDGE_COLS} FROM edges WHERE src_id = ?"
-                " AND type='calls' AND dst_id IS NOT NULL"
-                " ORDER BY evidence_path, evidence_line",
-                (nid,),
-            )
-            for r in rows:
-                dst = r[3]
-                on_path = {e["src_id"] for e in path} | {nid}
-                if dst in on_path:
-                    continue  # cycle
-                step = self._edge_dict(r, name_cache)
-                if not self._evidence_in_scope(step):
+        with self._read_snapshot() as conn:
+            src_ids = {n["id"] for name in sorted(src_names)
+                       for n in self.find_nodes(name, conn=conn)}
+            dst_ids = {n["id"] for name in sorted(dst_names)
+                       for n in self.find_nodes(name, conn=conn)}
+            if not src_ids or not dst_ids:
+                missing = "src" if not src_ids else "dst"
+                raise CodeGraphError(
+                    f"path 端點 resolve 失敗({missing});用 find_nodes 檢查名稱")
+
+            # BFS(paths as edge lists);deterministic:鄰接按 evidence 排序
+            queue: list[tuple[str, list]] = [(sid, []) for sid in sorted(src_ids)]
+            best_depth: dict[str, int] = {sid: 0 for sid in src_ids}
+            while queue and len(results) < limit:
+                nid, path = queue.pop(0)
+                if len(path) >= max_hops:
                     continue
-                new_path = path + [step]
-                if dst in dst_ids:
-                    results.append(new_path)
-                    if len(results) >= limit:
-                        break
-                    continue
-                depth = len(new_path)
-                if best_depth.get(dst, max_hops + 1) > depth:
-                    best_depth[dst] = depth
-                    queue.append((dst, new_path))
+                rows = self._query(
+                    f"SELECT {self._EDGE_COLS} FROM edges WHERE src_id = ?"
+                    " AND type='calls' AND dst_id IS NOT NULL"
+                    " AND ambiguity_group IS NULL"
+                    " ORDER BY evidence_path, evidence_line",
+                    (nid,), conn=conn,
+                )
+                for r in rows:
+                    dst = r[3]
+                    on_path = {e["src_id"] for e in path} | {nid}
+                    if dst in on_path:
+                        continue  # cycle
+                    step = self._edge_dict(r, name_cache, conn)
+                    if not self._evidence_in_scope(step):
+                        continue
+                    new_path = path + [step]
+                    if dst in dst_ids:
+                        results.append(new_path)
+                        if len(results) >= limit:
+                            break
+                        continue
+                    depth = len(new_path)
+                    if best_depth.get(dst, max_hops + 1) > depth:
+                        best_depth[dst] = depth
+                        queue.append((dst, new_path))
         return results
+
+    def _edges_for_ids(self, ids, anchor_col: str, name_cache: dict,
+                       conn: sqlite3.Connection) -> list[dict]:
+        out = []
+        for nid in ids:
+            rows = self._query(
+                f"SELECT {self._EDGE_COLS} FROM edges WHERE {anchor_col} = ?"
+                " AND type='calls' ORDER BY evidence_path, evidence_line",
+                (nid,), conn=conn)
+            out.extend(e for e in (self._edge_dict(r, name_cache, conn) for r in rows)
+                       if self._evidence_in_scope(e))
+        return out
 
     def callers(self, symbol_name: str) -> list[dict]:
         self._require_ready()
-        ids = [n["id"] for n in self.find_nodes(symbol_name)]
-        out = []
         name_cache: dict = {}
-        for nid in ids:
-            rows = self._query(
-                f"SELECT {self._EDGE_COLS} FROM edges WHERE dst_id = ? AND type='calls'"
-                " ORDER BY evidence_path, evidence_line", (nid,))
-            out.extend(e for e in (self._edge_dict(r, name_cache) for r in rows)
-                       if self._evidence_in_scope(e))
-        return out
+        with self._read_snapshot() as conn:
+            ids = [n["id"] for n in self.find_nodes(symbol_name, conn=conn)]
+            return self._edges_for_ids(ids, "dst_id", name_cache, conn)
 
     def callees(self, symbol_name: str) -> list[dict]:
         self._require_ready()
-        ids = [n["id"] for n in self.find_nodes(symbol_name)]
-        out = []
         name_cache: dict = {}
-        for nid in ids:
-            rows = self._query(
-                f"SELECT {self._EDGE_COLS} FROM edges WHERE src_id = ? AND type='calls'"
-                " ORDER BY evidence_path, evidence_line", (nid,))
-            out.extend(e for e in (self._edge_dict(r, name_cache) for r in rows)
-                       if self._evidence_in_scope(e))
-        return out
+        with self._read_snapshot() as conn:
+            ids = [n["id"] for n in self.find_nodes(symbol_name, conn=conn)]
+            return self._edges_for_ids(ids, "src_id", name_cache, conn)
 
     def file_includes(self, rel_path: str) -> list[str]:
         """某檔的 direct includes/imports(resolved dst rel paths,排序)。"""
@@ -959,16 +1124,22 @@ class CodeGraph:
     def iter_call_edges(self) -> list[dict]:
         self._require_ready()
         name_cache: dict = {}
-        rows = self._query(
-            f"SELECT {self._EDGE_COLS} FROM edges WHERE type='calls'"
-            " ORDER BY evidence_path, evidence_line")
-        return [e for e in (self._edge_dict(r, name_cache) for r in rows)
-                if self._evidence_in_scope(e)]
+        with self._read_snapshot() as conn:
+            rows = self._query(
+                f"SELECT {self._EDGE_COLS} FROM edges WHERE type='calls'"
+                " ORDER BY evidence_path, evidence_line", conn=conn)
+            return [e for e in (self._edge_dict(r, name_cache, conn) for r in rows)
+                    if self._evidence_in_scope(e)]
 
     def relations_for_symbol(self, name: str, limit: int = 5) -> list[dict]:
-        """include_evidence 用的 1-hop 摘要(≤limit 條)。graph 缺席由呼叫端處理。"""
-        edges = (self.callees(name) + self.callers(name))[:limit]
-        return edges
+        """include_evidence 用的 1-hop 摘要(≤limit 條)。單一 snapshot。"""
+        self._require_ready()
+        name_cache: dict = {}
+        with self._read_snapshot() as conn:
+            ids = [n["id"] for n in self.find_nodes(name, conn=conn)]
+            outs = self._edges_for_ids(ids, "src_id", name_cache, conn)
+            ins = self._edges_for_ids(ids, "dst_id", name_cache, conn)
+        return (outs + ins)[:limit]
 
     def suggest_names(self, text: str, limit: int = 5) -> list[str]:
         """neighbors 無 anchor 時的近似候選(substring match,§8.2)。"""

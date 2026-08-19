@@ -174,3 +174,69 @@ def test_corrupt_graph_fails_graph_modes_but_not_semantic(mcp_module, tmp_path):
     assert results
     assert all(r["graph_status"].startswith("unavailable") for r in results)
     assert all(r["relations"] == [] for r in results)
+
+
+# ============================================================
+# GPT 審核修正的回歸測試(2026-08-19 二輪)
+# ============================================================
+def test_neighbors_accepts_file_path_anchor(mcp_module):
+    """審核 #5:「這個檔 include 誰」—— query 放 repo 相對路徑要能走 includes。"""
+    [resp] = mcp_module.code_rag_search("app.py", mode="neighbors")
+    assert resp["mode"] == "neighbors"
+    assert resp["anchors"] == [{"file": "app.py"}]
+    assert "util.py" in resp["files"]
+    import_edges = [e for e in resp["edges"] if e["type"] == "imports"]
+    assert any(e["src"] == "app.py" and e["dst"] == "util.py" for e in import_edges)
+    for e in resp["edges"]:
+        path, _, line = e["evidence"].rpartition(":")
+        assert path and line.isdigit()
+
+
+def test_slim_edge_preserves_ambiguity_group(mcp_module):
+    """審核 #3(MCP 端):歧義資訊不得在精簡輸出被丟掉。"""
+    edge = mcp_module._slim_edge({
+        "src_name": "a", "dst_name": "b", "unresolved_target": "b",
+        "ambiguity_group": "grp123", "type": "calls",
+        "evidence_path": "x.c", "evidence_line": 3,
+        "backend": "tree-sitter", "confidence": "syntactic", "resolved": False,
+    })
+    assert edge["ambiguity_group"] == "grp123"
+    assert edge["resolved"] is False
+
+
+def test_cap_holds_for_path_mode_and_after_metadata(mcp_module):
+    """審核 #9:8000 上限對 paths 也成立,且 metadata 加入後仍 ≤ 上限。"""
+    import json
+
+    big_edge = {
+        "src": "a" * 50, "dst": "b" * 50, "unresolved_target": None,
+        "ambiguity_group": None, "type": "calls",
+        "evidence": "some/deep/path/file.c:123", "backend": "tree-sitter",
+        "confidence": "resolved", "resolved": True,
+    }
+    resp = {
+        "mode": "path", "src": "a", "dst": "b",
+        "paths": [[dict(big_edge) for _ in range(30)] for _ in range(20)],
+        "graph_status": "ok",
+    }
+    capped = mcp_module._cap_graph_response(resp)
+    size = len(json.dumps(capped, ensure_ascii=False))
+    assert size <= mcp_module._GRAPH_RESPONSE_MAX_CHARS, (
+        f"含 truncation metadata 的最終回應 {size} chars 仍超上限")
+    assert capped["truncated"] is True
+    assert capped["truncation"]["kept"]["paths"] < capped["truncation"]["total"]["paths"]
+
+
+def test_cap_holds_for_neighbors_lists(mcp_module):
+    import json
+
+    resp = {
+        "mode": "neighbors", "query": "x",
+        "anchors": [{"id": "i", "name": "x"}],
+        "nodes": [{"name": f"n{i}", "path": "p.py" * 30, "line": i} for i in range(400)],
+        "edges": [{"src": "a" * 40, "dst": "b" * 40, "evidence": "p.py:1"}
+                  for _ in range(400)],
+        "graph_status": "ok", "truncated": False,
+    }
+    capped = mcp_module._cap_graph_response(resp)
+    assert len(json.dumps(capped, ensure_ascii=False)) <= mcp_module._GRAPH_RESPONSE_MAX_CHARS
