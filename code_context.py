@@ -101,10 +101,11 @@ def collect_safe_lexical_hits(executor, query: str,
         if not isinstance(output, str) or output.startswith("錯誤:"):
             continue
         for line in output.splitlines():
-            # rg emits path:line:text.  Both a legal path and the match text can
-            # contain `:123:`.  Try delimiters left-to-right and accept the first
-            # one whose path passes the existing sandbox and scoped-file checks.
-            parsed: tuple[str, int] | None = None
+            # rg emits path:line:text. Both a legal path and the match text can
+            # contain `:123:`. Collect every sandbox-safe scoped interpretation,
+            # then prefer the longest path; accepting the first delimiter can
+            # misattribute `prefix:123:name.c:1:...` to a real file named prefix.
+            parsed_candidates: list[tuple[int, str, int]] = []
             for delimiter in re.finditer(r":([1-9]\d*):", line):
                 raw_path = line[:delimiter.start()]
                 try:
@@ -115,11 +116,12 @@ def collect_safe_lexical_hits(executor, query: str,
                 except (OSError, ValueError):
                     continue
                 if rel_path in allowed:
-                    parsed = (rel_path, int(delimiter.group(1)))
-                    break
-            if parsed is None:
+                    parsed_candidates.append(
+                        (len(raw_path), rel_path, int(delimiter.group(1)))
+                    )
+            if not parsed_candidates:
                 continue
-            rel_path, raw_line = parsed
+            _length, rel_path, raw_line = max(parsed_candidates, key=lambda row: row[0])
             key = (rel_path, max(1, raw_line))
             aggregated.setdefault(key, set()).add(term)
             if len(aggregated) >= _MAX_LEXICAL_HITS:
@@ -548,7 +550,13 @@ def build_code_context(
                 selected = _shrink_candidate(candidate, target_lines)
                 text = read_window(selected.path, selected.start_line, selected.end_line)
                 truncated = True
-        if not isinstance(text, str) or text.startswith("錯誤:") or len(text) > remaining:
+        if not isinstance(text, str) or text.startswith("錯誤:"):
+            uncertainties.append({
+                "target": f"{selected.path}:{selected.start_line}",
+                "reason": "safe source read unavailable after budget shrink; evidence excluded",
+            })
+            continue
+        if len(text) > remaining:
             truncated = True
             for reason in candidate.reasons:
                 budget_omitted_reasons[reason] = budget_omitted_reasons.get(reason, 0) + 1

@@ -300,7 +300,7 @@ SKELETON_MAX_LINES = 200
 # 檔案過濾設定
 # ============================================================
 CODE_EXTENSIONS = {
-    ".cpp", ".c", ".h", ".hpp", ".cc", ".cxx",
+    ".cpp", ".c", ".h", ".hpp", ".hh", ".hxx", ".cc", ".cxx",
     ".py", ".pyx", ".pyi",
     ".json", ".yaml", ".yml", ".toml",
     ".sh", ".bash", ".mk", ".cmake",
@@ -311,7 +311,7 @@ CODE_EXTENSIONS = {
 }
 
 # grep 預設搜尋的檔案類型（避免掃到圖片/大型二進位檔，提升效能）
-GREP_DEFAULT_EXTENSIONS = "*.py,*.c,*.cpp,*.h,*.hpp,*.js,*.ts,*.jsx,*.tsx,*.go,*.rs,*.java,*.kt,*.sh,*.md,*.json,*.yaml,*.yml,*.toml"
+GREP_DEFAULT_EXTENSIONS = "*.py,*.c,*.cpp,*.h,*.hpp,*.hh,*.hxx,*.js,*.ts,*.jsx,*.tsx,*.go,*.rs,*.java,*.kt,*.sh,*.md,*.json,*.yaml,*.yml,*.toml"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 # ============================================================

@@ -161,6 +161,24 @@ def test_lexical_hit_parser_accepts_safe_path_containing_colon_digits(tmp_path):
     ) == [{"path": "src/part:123:value.c", "line": 1, "terms": ["target"]}]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows filenames cannot contain colon")
+def test_lexical_hit_parser_prefers_longest_scoped_colon_digit_path(tmp_path):
+    root = tmp_path / "repo"
+    prefix = root / "src/prefix"
+    source = root / "src/prefix:123:value.c"
+    source.parent.mkdir(parents=True)
+    prefix.write_text("prefix decoy\n", encoding="utf-8")
+    source.write_text("int target = 1;\n", encoding="utf-8")
+    executor = ToolExecutor(str(root))
+    executor.grep = lambda *args, **kwargs: f"{source}:1:int target = 1;"
+
+    assert code_context.collect_safe_lexical_hits(
+        executor,
+        "target",
+        {"src/prefix", "src/prefix:123:value.c"},
+    ) == [{"path": "src/prefix:123:value.c", "line": 1, "terms": ["target"]}]
+
+
 def test_candidate_limit_is_not_reported_as_character_budget_exhaustion():
     semantic = [
         {"path": f"src/f{i}.c", "symbol": f"f{i}", "line": 1, "end_line": 1}
@@ -276,6 +294,37 @@ def test_binary_disguised_as_source_is_rejected_by_safe_reader(tmp_path):
     assert bundle["evidence"] == []
     assert bundle["used_chars"] == 0
     assert bundle["uncertainties"]
+
+
+def test_failed_budget_shrink_read_is_not_reported_as_budget_omission():
+    calls = 0
+
+    def read_window(path, start, end):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return (
+                f"=== {path} (行 1-100 / 共 100 行) ===\n"
+                + "".join(f"{line:4d} | int value_{line};\n" for line in range(1, 101))
+            )
+        return "錯誤:縮小後讀取失敗"
+
+    bundle = code_context.build_code_context(
+        query="value",
+        semantic_items=[{
+            "path": "src/large.c", "symbol": "value", "line": 1, "end_line": 100,
+        }],
+        index_items=[],
+        allowed_paths={"src/large.c"},
+        read_window=read_window,
+        max_chars=2000,
+        graph=None,
+        graph_status="unavailable",
+    )
+
+    reasons = [row["reason"] for row in bundle["uncertainties"]]
+    assert any("safe source read unavailable" in reason for reason in reasons)
+    assert not any("character budget omitted" in reason for reason in reasons)
 
 
 def test_unscoped_index_items_never_reach_read_callback():

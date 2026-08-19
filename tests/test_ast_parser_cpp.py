@@ -239,6 +239,17 @@ def test_overloads_are_both_extracted_with_same_qualified_name():
     assert len(sigs) == 2, "兩個 overload 的 signature 必須不同(ID tie-break 依賴它)"
 
 
+@pytest.mark.parametrize("extension", [".hh", ".hxx"])
+def test_cpp_header_extensions_use_cpp_tree_sitter(extension):
+    symbols = _parse(
+        f"registers{extension}",
+        "namespace device { inline int read_status(void) { return 7; } }\n",
+    )
+    [symbol] = [row for row in symbols if row.name == "read_status"]
+    assert symbol.backend == "tree-sitter"
+    assert symbol.qualified_name == "device::read_status"
+
+
 def test_every_node_range_is_within_file_bounds():
     content = (
         "namespace n {\n"

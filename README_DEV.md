@@ -154,19 +154,24 @@ python eval/run_eval.py --test-set all --verbose
 
 `GRAPH_SCHEMA_VERSION=2` 保存 definition linkage/condition、function declarations，
 以及 edge 的 `resolution_basis`/condition。既有 v1 DB 由同一條顯式 build command 在
-單一 SQLite transaction 中原地升級；升級失敗會 rollback，不要求手刪 DB。C/C++ call
-只按下列證據順序解析：同檔定義、實際 included header 的 static-inline 定義、C++ exact
-qualified name、direct/transitive repo-header 可見 prototype 對應的唯一 external 定義；
-其餘維持 ambiguous 或 unresolved。bare call 不會配到別的 C++ scope/method，條件不明的
-singleton 會保留為 unresolved candidate，不會消失或冒充確定邊。`static` 與 anonymous
-namespace definition 不跨 translation unit，function pointer/macro 不猜。quote include
-沿用 repo resolution；angle include 只有帶 namespace path 且唯一 suffix 命中才進
-visibility closure，bare `<stdint.h>` 不會因 repo 裡有 vendored shim 就誤配。
+單一 SQLite transaction 中原地升級；升級失敗會 rollback。真正損壞、無法由 SQLite
+開啟的 DB 不宣稱能原地重建：錯誤會要求先移出/刪除 graph DB，再執行 build command。
+C/C++ call 只按下列證據順序解析：同檔定義、C++ exact qualified name、實際 included
+header 的 static-inline 定義、direct/transitive repo-header 可見且 qualified identity 相符的
+prototype 對應唯一 external 定義；其餘維持 ambiguous 或 unresolved。候選不再由第一個
+condition-incompatible stage 截斷：可證明是同一 preprocessor chain 的互斥 branch 才排除，
+其餘跨 stage 合併成明示 ambiguity。bare call 不會配到別的 C++ scope/method；`static` 與
+anonymous namespace definition 不跨 translation unit，function pointer/macro 不猜。quote
+include 沿用 repo resolution；angle include 只有帶 namespace path、非絕對且唯一 suffix
+命中才進 visibility closure。bare `<stdint.h>` 的單一 repo basename 不會誤配，多個同名
+repo candidate 會留下 ambiguity edge；絕對 angle path 不做 suffix 配對。`.hh` / `.hxx`
+已在 `CODE_EXTENSIONS`、index scope 與 tree-sitter parser 三層按 C++ header 接通。
 
 C/C++ 任一檔案 add/change/delete 都把檔案 hash 當作完整 visibility fingerprint 並走
 full rebuild；這是刻意的保守 invalidation，避免 linkage/declaration/include closure 的
-partial cone 與 fresh build 漂移。Python 仍走既有增量路徑，但 callable catalog delta
-若牽動 C/C++ caller，會在寫 DB 前切換成 full rebuild。相關 gate：
+partial cone 與 fresh build 漂移。Python 仍走既有增量路徑；body-only edit 因 callable
+node-id catalog 沒變，不會只因同名 C call 就 fan-out。只有名稱、qualified identity 或
+overload identity 改變且牽動 C/C++ caller，才會在寫 DB 前切換成 full rebuild。相關 gate：
 
 ```bash
 python scripts/run_tests.py tests/test_ast_parser_cpp.py tests/test_code_graph.py \

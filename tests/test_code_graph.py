@@ -300,10 +300,20 @@ def test_corrupt_db_gives_explicit_error(tmp_path):
     g.db_file.write_bytes(b"garbage not a sqlite file")
 
     fresh = CodeGraph(str(tmp_path))
-    with pytest.raises(CodeGraphError):
+    with pytest.raises(CodeGraphError) as exc_info:
         fresh.ensure_fresh()
+    message = str(exc_info.value)
+    assert "損壞" in message
+    assert "移出" in message or "刪除" in message
+    assert str(fresh.db_file) in message
+    assert fresh.build_command() in message
     with pytest.raises(CodeGraphError):
         fresh.find_nodes("entry")
+
+    backup = fresh.db_file.with_suffix(".sqlite3.corrupt")
+    fresh.db_file.replace(backup)
+    fresh.build()
+    assert fresh.find_nodes("entry")
 
 
 def test_explicit_build_migrates_v1_graph_in_place(tmp_path):
@@ -684,6 +694,60 @@ def test_incremental_ambiguous_to_unique_updates_existing_caller(tmp_path):
     assert edges[0]["resolved"] is True
     assert edges[0]["dst_name"] == "foo"
     assert g.shortest_evidence_paths({"run"}, {"foo"}), "收斂後呼叫鏈恢復可用"
+
+
+@pytest.mark.skipif(not HAS_TS_C, reason="tree-sitter-c 未安裝")
+def test_python_body_only_edit_does_not_rebuild_for_c_name_collision(
+    tmp_path, monkeypatch,
+):
+    """An unchanged callable catalog must not fan out to colliding C callers."""
+    (tmp_path / "helpers.py").write_text(
+        "def reset():\n    return 1\n", encoding="utf-8"
+    )
+    (tmp_path / "caller.c").write_text(
+        "int boot(void) { return reset(); }\n", encoding="utf-8"
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    (tmp_path / "helpers.py").write_text(
+        "def reset():\n    return 2\n", encoding="utf-8"
+    )
+    code_rag.invalidate_scan_cache(tmp_path)
+
+    def unexpected_full_rebuild(*args, **kwargs):
+        raise AssertionError("body-only Python edit must remain incremental")
+
+    monkeypatch.setattr(graph, "build", unexpected_full_rebuild)
+    graph.ensure_fresh()
+
+    [reset] = graph.find_nodes("reset")
+    assert reset["path"] == "helpers.py"
+
+
+def test_callable_multiplicity_change_still_reresolves_unchanged_callers(tmp_path):
+    """Per-name node-id sets must detect a same-name overload addition."""
+    (tmp_path / "library.py").write_text(
+        "def dispatch():\n    return 1\n", encoding="utf-8"
+    )
+    (tmp_path / "caller.py").write_text(
+        "def run():\n    return dispatch()\n", encoding="utf-8"
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+    assert [edge["resolved"] for edge in graph.callees("run")] == [True]
+
+    (tmp_path / "library.py").write_text(
+        "def dispatch():\n    return 1\n\n"
+        "def dispatch(value):\n    return value\n",
+        encoding="utf-8",
+    )
+    code_rag.invalidate_scan_cache(tmp_path)
+    graph.ensure_fresh()
+
+    edges = graph.callees("run")
+    assert len(edges) == 2
+    assert all(edge["resolved"] is False for edge in edges)
 
 
 def test_missing_graph_raises_with_build_command(tmp_path):

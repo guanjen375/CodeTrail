@@ -223,79 +223,29 @@ def test_trim_messages_priority_drops_generic_before_evidence(monkeypatch):
     assert any("x.py:42" in c or "a.py" in c for c in contents)
 
 
-def test_bounded_code_context_is_treated_as_file_line_evidence():
-    assert trim._priority_for_tool("code_rag_search") == trim.PRI_EVIDENCE
-    payload = (
-        '{"evidence":[{"path":"src/dispatcher.c","start_line":21,'
-        '"end_line":44,"text":"' + "x" * 5000 + '"}]}'
-    )
+def test_unwired_code_rag_tool_name_uses_bounded_generic_trim():
+    """The native-agent trim layer must not pretend to understand MCP output."""
+    assert trim._priority_for_tool("code_rag_search") == trim.PRI_GENERIC
+    payload = json.dumps({
+        "evidence": [{"text": "x" * 5000}],
+        "uncertainties": [],
+        "seeds": None,
+    })
     result, meta = trim.trim_tool_message(
         payload, "code_rag_search", max_chars=500, mode="auto"
     )
-    assert "src/dispatcher.c" in result
+    assert len(result) <= 500
     assert trim.CTX_TRIMMED_MARKER in result
     assert meta["trimmed"] is True
 
-
-def test_bounded_code_context_trim_preserves_uncertainties_and_valid_json():
-    payload = {
-        "query": "dispatch",
-        "evidence": [{
-            "path": "src/dispatcher.c",
-            "start_line": 1,
-            "end_line": 100,
-            "symbol": "dispatch",
-            "reason": "semantic",
-            "text": "x" * 5000,
-        }],
-        "uncertainties": [{
-            "target": "callback",
-            "reason": "call target unresolved",
-        }],
-        "seeds": [{"path": "src/dispatcher.c", "line": 1, "symbol": "dispatch"}],
-        "graph_status": "ok",
-        "truncated": False,
-        "budget_chars": 12000,
-        "used_chars": 5000,
-    }
-    result, meta = trim.trim_tool_message(
-        json.dumps(payload, ensure_ascii=False),
-        "code_rag_search",
-        max_chars=700,
-        mode="auto",
-    )
-    decoded = json.loads(result)
-    assert decoded["uncertainties"][0]["target"] == "callback"
-    assert decoded["truncated"] is True
-    assert trim.CTX_TRIMMED_MARKER in result
-    assert len(result) <= 700
-    assert meta["trimmed"] is True
-
-
-def test_final_message_pressure_pass_still_preserves_code_context_uncertainty():
-    payload = {
-        "query": "dispatch",
-        "evidence": [{
-            "path": "src/dispatcher.c", "start_line": 1, "end_line": 100,
-            "symbol": "dispatch", "reason": "semantic", "text": "x" * 8000,
-        }],
-        "uncertainties": [{"target": "callback", "reason": "unresolved"}],
-        "seeds": [],
-        "graph_status": "ok",
-        "truncated": False,
-        "budget_chars": 12000,
-        "used_chars": 8000,
-    }
     messages = [_msg("system", "s"), _msg("user", "q")]
-    messages.extend(_build_tool_message_pair(
-        "code_rag_search", json.dumps(payload, ensure_ascii=False)
-    ))
-
-    out, _ = trim.trim_messages(messages, budget=700)
-    [tool_message] = [row for row in out if row.get("role") == "tool"]
-    decoded = json.loads(tool_message["content"])
-    assert decoded["uncertainties"][0]["target"] == "callback"
-    assert decoded["truncated"] is True
+    messages.extend(_build_tool_message_pair("code_rag_search", payload))
+    output, summary = trim.trim_messages(messages, budget=500)
+    assert summary.chars_after <= 500
+    assert any(
+        trim.CTX_TRIMMED_MARKER in row.get("content", "")
+        for row in output if row.get("role") == "tool"
+    )
 
 
 def test_trim_messages_emits_telemetry_metadata_only():

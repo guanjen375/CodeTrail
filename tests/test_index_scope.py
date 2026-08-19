@@ -103,6 +103,18 @@ def _brute_force(scope: IndexScope, root: Path) -> set[str]:
     return out
 
 
+def test_cpp_header_extensions_are_in_default_index_scope(tmp_path):
+    root = tmp_path / "headers"
+    root.mkdir()
+    (root / "device.hh").write_text("int read_device(void);\n", encoding="utf-8")
+    (root / "registers.hxx").write_text("int read_register(void);\n", encoding="utf-8")
+    scope = IndexScope(root)
+
+    assert scope.should_index_file("device.hh") is True
+    assert scope.should_index_file("registers.hxx") is True
+    assert _indexed(scope) == {"device.hh", "registers.hxx"}
+
+
 # ============================================================
 # 不變式(整份設計的防呆核心)
 # ============================================================

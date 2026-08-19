@@ -25,6 +25,11 @@ from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
 
+
+_CPP_EXTENSIONS = frozenset({
+    '.c', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.hh', '.hxx',
+})
+
 # 嘗試導入 tree-sitter
 try:
     import tree_sitter
@@ -782,7 +787,7 @@ class RegexFallbackParser:
 
         if ext in ('.py', '.pyx', '.pyi'):
             symbols = self._parse_python(lines)
-        elif ext in ('.c', '.cpp', '.cc', '.cxx', '.h', '.hpp'):
+        elif ext in _CPP_EXTENSIONS:
             symbols = self._parse_cpp(lines)
         elif ext in ('.js', '.ts', '.jsx', '.tsx'):
             symbols = self._parse_js(lines)
@@ -791,7 +796,7 @@ class RegexFallbackParser:
         elif ext == '.go':
             symbols = self._parse_go(lines)
 
-        sep = "::" if ext in ('.c', '.cpp', '.cc', '.cxx', '.h', '.hpp') else "."
+        sep = "::" if ext in _CPP_EXTENSIONS else "."
         for sym in symbols:
             sym.backend = "regex"
             if sym.qualified_name is None:
@@ -1285,6 +1290,8 @@ def get_parser(filepath: Path):
             '.cc': 'cpp',
             '.cxx': 'cpp',
             '.hpp': 'cpp',
+            '.hh': 'cpp',
+            '.hxx': 'cpp',
             '.go': 'go',
             '.rs': 'rust',
         }

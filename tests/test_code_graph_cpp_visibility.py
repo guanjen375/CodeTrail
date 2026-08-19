@@ -210,6 +210,52 @@ def test_cpp_exact_qualified_name_is_a_conservative_fallback(tmp_path):
     assert edge["resolution_basis"] == "qualified"
 
 
+def test_cpp_global_qualified_call_resolves_only_the_global_definition(tmp_path):
+    _write(tmp_path, "impl.cpp", "int helper(void) { return 1; }\n")
+    _write(
+        tmp_path,
+        "user.cpp",
+        "namespace decoy { int helper(void) { return 2; } }\n"
+        "int run(void) { return ::helper(); }\n",
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "user.cpp", "run")
+    assert edge["resolved"] is True
+    assert edge["dst_id"] in {
+        node["id"] for node in graph.find_nodes("helper")
+        if node["path"] == "impl.cpp"
+    }
+    assert edge["resolution_basis"] == "qualified"
+
+
+def test_cpp_unconditional_qualified_overloads_are_qualified_ambiguity(tmp_path):
+    _write(
+        tmp_path,
+        "impl.cpp",
+        "namespace service {\n"
+        "int helper(int value) { return value; }\n"
+        "int helper(double value) { return (int)value; }\n"
+        "}\n",
+    )
+    _write(
+        tmp_path,
+        "user.cpp",
+        "int run(void) { return service::helper(1); }\n",
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    edges = _source_edges(graph, "user.cpp", "run")
+    assert len(edges) == 2
+    assert all(edge["resolved"] is False for edge in edges)
+    assert {edge["resolution_basis"] for edge in edges} == {
+        "ambiguous_qualified"
+    }
+    assert len({edge["ambiguity_group"] for edge in edges}) == 1
+
+
 def test_cpp_bare_call_does_not_resolve_to_unrelated_method(tmp_path):
     _write(
         tmp_path,
@@ -288,6 +334,45 @@ def test_bare_angle_include_does_not_resolve_to_vendored_shim(tmp_path):
     assert not any(edge["resolved"] for edge in rows)
 
 
+def test_bare_angle_include_with_multiple_repo_candidates_stays_explicit(tmp_path):
+    _write(tmp_path, "board_a/platform.h", "int board_a(void);\n")
+    _write(tmp_path, "board_b/platform.h", "int board_b(void);\n")
+    _write(tmp_path, "src/user.c", "#include <platform.h>\nint run(void) { return 0; }\n")
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    include_edges = [
+        edge for edge in graph.file_neighbors("src/user.c", limit=20)["edges"]
+        if edge["type"] == "includes"
+    ]
+    assert len(include_edges) == 2
+    assert {edge["dst_id"] for edge in include_edges} == {
+        "board_a/platform.h", "board_b/platform.h"
+    }
+    assert {edge["resolution_basis"] for edge in include_edges} == {
+        "ambiguous_include"
+    }
+    assert all(edge["resolved"] is False for edge in include_edges)
+    assert len({edge["ambiguity_group"] for edge in include_edges}) == 1
+
+
+def test_absolute_angle_include_cannot_suffix_match_a_vendored_header(tmp_path):
+    _write(tmp_path, "repo_headers/usr/include/platform.h", "int fake_platform(void);\n")
+    _write(
+        tmp_path,
+        "src/user.c",
+        "#include </usr/include/platform.h>\nint run(void) { return 0; }\n",
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    assert graph.file_includes("src/user.c") == []
+    assert not [
+        edge for edge in graph.file_neighbors("src/user.c", limit=20)["edges"]
+        if edge["type"] == "includes"
+    ]
+
+
 def test_single_conditional_definition_remains_an_explicit_candidate(tmp_path):
     _write(
         tmp_path,
@@ -307,6 +392,33 @@ def test_single_conditional_definition_remains_an_explicit_candidate(tmp_path):
     assert edge["resolution_basis"] == "conditional_candidate"
 
 
+def test_mutually_exclusive_same_file_definition_does_not_hide_external_target(
+    tmp_path,
+):
+    _write(tmp_path, "include/api.h", "int helper(void);\n")
+    _write(tmp_path, "src/impl.c", "int helper(void) { return 7; }\n")
+    _write(
+        tmp_path,
+        "src/user.c",
+        "#ifdef USE_LOCAL_HELPER\n"
+        "static int helper(void) { return 1; }\n"
+        "#else\n"
+        '#include "api.h"\n'
+        "int run(void) { return helper(); }\n"
+        "#endif\n",
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "src/user.c", "run")
+    assert edge["resolved"] is True
+    assert edge["dst_id"] in {
+        node["id"] for node in graph.find_nodes("helper")
+        if node["path"] == "src/impl.c"
+    }
+    assert edge["resolution_basis"] == "visible_declaration"
+
+
 def test_weak_default_block_is_not_treated_as_include_guard(tmp_path):
     _write(
         tmp_path,
@@ -323,6 +435,142 @@ def test_weak_default_block_is_not_treated_as_include_guard(tmp_path):
     [edge] = _source_edges(graph, "src/defaults.c", "run")
     assert edge["resolved"] is False
     assert edge["resolution_basis"] == "conditional_candidate"
+
+
+def test_header_weak_default_block_is_not_treated_as_include_guard(tmp_path):
+    _write(
+        tmp_path,
+        "include/defaults.h",
+        "#ifndef HAVE_PLATFORM_IMPL\n"
+        "#define HAVE_PLATFORM_IMPL\n"
+        "int platform_impl(void);\n"
+        "#endif\n",
+    )
+    _write(
+        tmp_path,
+        "src/platform.c",
+        "int platform_impl(void) { return 1; }\n",
+    )
+    _write(
+        tmp_path,
+        "src/user.c",
+        '#include "defaults.h"\n'
+        "int run(void) { return platform_impl(); }\n",
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "src/user.c", "run")
+    assert edge["resolved"] is False
+    assert edge["unresolved_target"] == "platform_impl"
+
+
+def test_out_of_class_declaration_identity_matches_ast_definition(tmp_path):
+    _write(
+        tmp_path,
+        "api.hpp",
+        "namespace service {\n"
+        "class Device { public: static int helper(); };\n"
+        "int Device::helper();\n"
+        "}\n",
+    )
+    _write(
+        tmp_path,
+        "impl.cpp",
+        "namespace service {\n"
+        "class Device;\n"
+        "int Device::helper() { return 1; }\n"
+        "}\n",
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    conn = sqlite3.connect(graph.db_file)
+    try:
+        declaration = conn.execute(
+            "SELECT qualified_name FROM declarations"
+            " WHERE path='api.hpp' AND name='helper'"
+        ).fetchone()
+        definition = conn.execute(
+            "SELECT qualified_name FROM nodes"
+            " WHERE path='impl.cpp' AND name='Device::helper'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert declaration == definition == ("service::Device::helper",)
+
+
+@pytest.mark.parametrize(
+    ("header", "symbol", "body"),
+    [
+        (
+            "include/pragma_api.h",
+            "pragma_api",
+            "#pragma once\n"
+            "#ifndef PRAGMA_API_H\n#define PRAGMA_API_H\n"
+            "int pragma_api(void);\n#endif\n",
+        ),
+        (
+            "include/wrapped_api.h",
+            "wrapped_api",
+            "extern int header_prefix;\n"
+            "#ifndef WRAPPED_API_H\n#define WRAPPED_API_H\n"
+            "int wrapped_api(void);\n#endif\n"
+            "extern int header_suffix;\n",
+        ),
+        (
+            "include/string_api.h",
+            "string_api",
+            'static const char *comment_token = "/*";\n'
+            "#ifndef STRING_API_H\n#define STRING_API_H\n"
+            "int string_api(void);\n#endif\n"
+            "/* a real trailing comment */\n",
+        ),
+    ],
+)
+def test_common_include_guard_wrappers_remain_visibility_neutral(
+    tmp_path, header, symbol, body,
+):
+    _write(tmp_path, header, body)
+    _write(tmp_path, f"src/{symbol}.c", f"int {symbol}(void) {{ return 1; }}\n")
+    _write(
+        tmp_path,
+        f"src/use_{symbol}.c",
+        f'#include "{Path(header).name}"\n'
+        f"int use_{symbol}(void) {{ return {symbol}(); }}\n",
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, f"src/use_{symbol}.c", f"use_{symbol}")
+    assert edge["resolved"] is True
+    assert edge["dst_id"] in {
+        node["id"] for node in graph.find_nodes(symbol)
+        if node["path"] == f"src/{symbol}.c"
+    }
+    assert edge["resolution_basis"] == "visible_declaration"
+
+
+def test_visible_declaration_must_match_definition_namespace(tmp_path):
+    _write(
+        tmp_path,
+        "include/api.hpp",
+        "namespace service { int helper(void); }\n",
+    )
+    _write(tmp_path, "src/global.cpp", "int helper(void) { return 1; }\n")
+    _write(
+        tmp_path,
+        "src/user.cpp",
+        '#include "api.hpp"\n'
+        "namespace service { int run(void) { return helper(); } }\n",
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "src/user.cpp", "run")
+    assert edge["resolved"] is False
+    assert edge["unresolved_target"] == "helper"
+    assert edge["resolution_basis"] == "syntactic_only"
 
 
 def test_visible_header_static_inline_resolves_for_including_translation_unit(tmp_path):
