@@ -35,7 +35,7 @@ from knowledge_store import (
 # 依賴檢查
 # ============================================================
 # 條件式依賴檢查，按模式載入
-# - PDF 模式才需要 pymupdf4llm
+# - PDF 模式才需要 pymupdf4llm；PDF 有內嵌圖時另需 VL 端點（自動逐張入庫）
 # - VL 模式（--chat/--image）需要 llama-server VL 端點 (預設 8083)
 # - --url 模式需要 html2text
 # - 所有模式都需要 llama-server embedding 端點 (預設 8081)
@@ -122,6 +122,13 @@ IMAGE_MIME_TYPES = {
 # 支援的二進位/ELF 副檔名（與 media.py 對齊；走 media.read_binary 抽報告）
 BINARY_EXTENSIONS = {".bin", ".dat", ".raw", ".fw", ".img", ".rom", ".hex"}
 ELF_EXTENSIONS = {".elf", ".so", ".o", ".axf", ".out", ".ko"}
+
+# PDF 內嵌圖 → VL 自動入庫（常駐啟用，無設定開關；純文字 PDF 產生零 job、零 VL 成本）
+PDF_FIGURE_RENDER_DPI = 200        # render 解析度：VL 要能讀出圖中文字
+PDF_FIGURE_MAX_SIDE_PX = 2200      # render 最長邊上限（整頁 A4 約等效 190 DPI）
+PDF_FIGURE_MIN_SIDE_PT = 30        # picture 框最短邊門檻（pt）：圖示/分隔線不送 VL
+PDF_FIGURE_MIN_AREA_PT2 = 4000     # picture 框面積門檻（pt²）：約 0.77 平方英吋
+PDF_PAGE_TEXT_NEAR_ZERO_CHARS = 20 # 頁文字（strip 後）低於此 → 「近乎 0」，整頁 render
 
 # ============================================================
 # 文件類型識別
@@ -627,6 +634,12 @@ def extract_pdf_document(file_path: str) -> ExtractedDocument:
     逐頁切 chunk（維持既有切點），但同時把每頁正規化後的文字串成整份
     raw_text 並記下頁 span——章節範圍因此是文件級的，不再受制於「這一頁看得
     到哪些標題」。
+
+    內嵌圖不再只印 [WARN]：偵測到就自動 render 成 PNG、逐張經 VL 抽述、產
+    origin="diagram" 的 chunk（見 `_plan_pdf_figure_jobs` 的分流規則）。VL /
+    render 任何一張失敗都 raise `PdfFigureError`——整份文件不入庫、零寫入；
+    這與「PDF 本身打不開 → 回空 document」的既有語意刻意不同：前者是圖會
+    無聲消失的部分成功，後者是整份明顯失敗。
     """
     # 延遲載入 pymupdf4llm（只有 PDF 模式需要）
     pymupdf4llm = check_pymupdf4llm()
@@ -650,31 +663,20 @@ def extract_pdf_document(file_path: str) -> ExtractedDocument:
     # 根據文件類型取得 chunk 設定
     chunk_size, chunk_overlap = get_chunk_settings(doc_type)
 
-    image_pages: Dict[int, int] = {}   # 頁碼 → 內嵌圖數
-    image_only_pages: List[int] = []   # 只有圖、抽不到文字而整頁跳過的頁
+    # 內嵌圖逐頁分流：哪些頁整頁 render、哪些 picture 框逐一 crop
+    figure_jobs, figure_stats = _plan_pdf_figure_jobs(pages)
 
     chunks: List[Dict] = []
     page_texts: List[str] = []
     page_spans: List[Tuple[int, int, int]] = []
+    # 頁碼 → 該頁文字 chunk 數；figure chunk 的 chunk_index 接在同頁文字 chunk
+    # 之後，chunk id（source::pN::cM::hash）才不會與文字 chunk 共用索引空間
+    text_chunk_counts: Dict[int, int] = {}
     offset = 0  # 下一頁在 raw_text 中的起點
 
     for page_info in pages:
-        meta = page_info.get('metadata', {}) or {}
-        # pymupdf4llm >= 1.x 的 key 是 page_number（1-based）；
-        # 舊版是 page（0-based）。舊 key 硬讀會讓所有 chunk 都變第 1 頁。
-        page_num = meta.get('page_number')
-        if page_num is None:
-            page_num = meta.get('page', 0) + 1
+        page_num = _pdf_page_number(page_info.get('metadata'))
         content = page_info.get('text', '').strip()
-
-        # 內嵌圖偵測：新版在 page_boxes（class=picture），舊版在 images
-        pics = [b for b in page_info.get('page_boxes') or []
-                if b.get('class') == 'picture']
-        n_pics = len(pics) or len(page_info.get('images') or [])
-        if n_pics:
-            image_pages[page_num] = n_pics
-            if not content:
-                image_only_pages.append(page_num)
 
         if not content:
             continue
@@ -708,23 +710,15 @@ def extract_pdf_document(file_path: str) -> ExtractedDocument:
                 **_retrieval_prefix_metadata(chunk_data),
                 **_chunk_locator_metadata(chunk_data, offset),
             })
+        # 累加而非覆寫：畸形 metadata 讓兩個 page dict 撞同一頁碼時，
+        # figure chunk 的起始 index 也不能與前一批文字 chunk 相撞
+        text_chunk_counts[page_num] = (
+            text_chunk_counts.get(page_num, 0) + len(chunk_results)
+        )
 
         page_spans.append((page_num, offset, offset + len(page_text)))
         page_texts.append(page_text)
         offset += len(page_text) + len(PAGE_SEPARATOR)
-
-    # fail-loud：PDF 路徑只抽文字，內嵌圖不經 VL、不入庫。
-    # 混合 PDF（datasheet 類）以前會「chunks>0 → 回報成功」而圖無聲消失。
-    if image_pages:
-        total_pics = sum(image_pages.values())
-        pages_str = ", ".join(str(p) for p in sorted(image_pages))
-        print(f"  [WARN] PDF 內嵌圖片未入庫: 共 {total_pics} 張（頁 {pages_str}）。"
-              f"PDF 路徑只抽文字，圖片內容不會經 VL、不會進知識庫。")
-        if image_only_pages:
-            only_str = ", ".join(str(p) for p in sorted(image_only_pages))
-            print(f"  [WARN] 第 {only_str} 頁只有圖片、沒有可抽取文字，整頁已跳過。")
-        print("  [HINT] 需要圖片內容時：把該頁圖片另存成 .png，"
-              "用 ingest_document(mode=\"image\") 入庫或 analyze_file 看一次。")
 
     raw_text = PAGE_SEPARATOR.join(page_texts)
     document = ExtractedDocument(
@@ -735,14 +729,287 @@ def extract_pdf_document(file_path: str) -> ExtractedDocument:
         doc_type=doc_type,
         page_spans=page_spans,
     )
+    # 章節對齊只作用在文字 chunk：figure chunk 的 section 來自 VL 描述自己的
+    # markdown 標題（與獨立圖片入庫一致），拿 PDF 文件級章節去蓋會蓋錯座標系。
     document.assign_section_indices()
     document.apply_section_titles()
+
+    # 內嵌圖 → VL → diagram chunks（hard fail：任何一張失敗，整份文件不入庫）
+    if figure_stats["skipped_small"]:
+        print(f"  [INFO] {figure_stats['skipped_small']} 個過小 picture 框"
+              f"（圖示/項目符號/分隔線類，短邊 <{PDF_FIGURE_MIN_SIDE_PT}pt 或"
+              f"面積 <{PDF_FIGURE_MIN_AREA_PT2}pt²）不送 VL")
+    if figure_stats["degraded_pages"]:
+        pages_str = ", ".join(str(p) for p in figure_stats["degraded_pages"])
+        print(f"  [INFO] 第 {pages_str} 頁偵測到內嵌圖但缺 bbox（舊 schema），"
+              "降級為整頁 render——寧可多看，不無聲丟圖")
+    if figure_stats["dropped_tiny_only_pages"]:
+        pages_str = ", ".join(str(p) for p in figure_stats["dropped_tiny_only_pages"])
+        print(f"  [INFO] 第 {pages_str} 頁只有過小影像、幾乎沒有文字，未送 VL")
+    if figure_jobs:
+        document.chunks.extend(
+            _pdf_figure_chunks(file_path, filename, figure_jobs, text_chunk_counts)
+        )
     return document
 
 
 def extract_pdf(file_path: str) -> List[Dict]:
     """提取 PDF 內容（只要 chunks 的相容入口）"""
     return extract_pdf_document(file_path).chunks
+
+
+# ============================================================
+# PDF 內嵌圖 → VL 自動入庫
+# ============================================================
+class PdfFigureError(RuntimeError):
+    """PDF 內嵌圖 render / VL 失敗（hard fail：整份文件不入庫、零寫入）。
+
+    訊息一律帶檔案、頁碼、figure 索引與底層原始錯誤——失敗要能直接定位到
+    是哪一張圖、哪一端出的問題。
+    """
+
+
+def _pdf_page_number(meta: Optional[Dict]) -> int:
+    """pymupdf4llm 頁碼相容 helper（唯一定義）。
+
+    >= 1.x 的 key 是 page_number（1-based）；舊版是 page（0-based）。舊 key
+    硬讀會讓所有 chunk 都變第 1 頁。
+    """
+    meta = meta or {}
+    page_num = meta.get('page_number')
+    if page_num is None:
+        page_num = meta.get('page', 0) + 1
+    return int(page_num)
+
+
+def _pdf_picture_bboxes(page_info: Dict) -> List[Optional[Tuple[float, float, float, float]]]:
+    """一頁裡所有內嵌圖的 bbox（pt 座標）。
+
+    新版 schema 在 page_boxes（class=picture、帶 bbox）；舊版在 images。
+    解析不出 bbox 的偵測結果回 None——呼叫端會降級整頁 render，絕不因為
+    讀不到框就讓那張圖無聲消失。
+    """
+    def _bbox_of(entry) -> Optional[Tuple[float, float, float, float]]:
+        if not isinstance(entry, dict):
+            return None
+        raw = entry.get('bbox')
+        if raw is None:
+            return None
+        try:
+            x0, y0, x1, y1 = (float(v) for v in tuple(raw))
+        except (TypeError, ValueError):
+            return None
+        # 退化框（零寬/負向）保留原值：交給尺寸門檻過濾，不當成「缺 bbox」
+        return (x0, y0, x1, y1)
+
+    pics = [b for b in page_info.get('page_boxes') or []
+            if isinstance(b, dict) and b.get('class') == 'picture']
+    if pics:
+        return [_bbox_of(b) for b in pics]
+    return [_bbox_of(e) for e in page_info.get('images') or []]
+
+
+def _pdf_bbox_big_enough(bbox: Tuple[float, float, float, float]) -> bool:
+    """尺寸門檻：過小的 picture 框（圖示、項目符號、分隔線）不送 VL。"""
+    x0, y0, x1, y1 = bbox
+    width = x1 - x0
+    height = y1 - y0
+    return (min(width, height) >= PDF_FIGURE_MIN_SIDE_PT
+            and width * height >= PDF_FIGURE_MIN_AREA_PT2)
+
+
+def _plan_pdf_figure_jobs(pages: List[Dict]) -> Tuple[List[Dict], Dict]:
+    """逐頁分流：決定每頁怎麼 render 內嵌圖。
+
+    規則（依該頁文字長度與 picture 框）：
+      - 文字近乎 0（< PDF_PAGE_TEXT_NEAR_ZERO_CHARS）且有夠大的圖 → 整頁 render 一張
+      - 有文字 + 有 picture 框 → 每個夠大的框各 crop 一張
+      - 有文字 + 無 picture 框 → 純文字路徑，零 VL 成本
+    偵測到圖但 bbox 解析不出（舊 schema）→ 該頁降級整頁 render。
+
+    job：{"page", "figure_index"(頁內 1-based), "mode": "page"|"crop", "bbox"}。
+    figure_index 只對「會送 VL 的圖」編號，同頁多張以它區分。
+    """
+    jobs: List[Dict] = []
+    stats: Dict = {
+        "skipped_small": 0,          # 過小、不送 VL 的框數
+        "degraded_pages": [],        # 缺 bbox、降級整頁 render 的頁
+        "dropped_tiny_only_pages": [],  # 幾乎沒文字、圖又全過小而整頁未送 VL 的頁
+    }
+    for page_info in pages:
+        page_num = _pdf_page_number(page_info.get('metadata'))
+        text_len = len((page_info.get('text') or '').strip())
+        bboxes = _pdf_picture_bboxes(page_info)
+        if not bboxes:
+            continue
+        known = [b for b in bboxes if b is not None]
+        missing_bbox = len(bboxes) - len(known)
+        passing = [b for b in known if _pdf_bbox_big_enough(b)]
+        stats["skipped_small"] += len(known) - len(passing)
+
+        if text_len < PDF_PAGE_TEXT_NEAR_ZERO_CHARS:
+            if passing or missing_bbox:
+                jobs.append({"page": page_num, "figure_index": 1,
+                             "mode": "page", "bbox": None})
+            else:
+                stats["dropped_tiny_only_pages"].append(page_num)
+        elif missing_bbox:
+            stats["degraded_pages"].append(page_num)
+            jobs.append({"page": page_num, "figure_index": 1,
+                         "mode": "page", "bbox": None})
+        else:
+            for k, bbox in enumerate(passing, 1):
+                jobs.append({"page": page_num, "figure_index": k,
+                             "mode": "crop", "bbox": bbox})
+    return jobs, stats
+
+
+def _open_pdf_document(file_path: str):
+    """render 用的 pymupdf 開檔（獨立函式：測試以假 renderer 取代）。"""
+    import pymupdf  # pymupdf4llm 的相依，PDF 模式必然裝了
+    return pymupdf.open(file_path)
+
+
+def _render_pdf_figure_png(pdf_doc, job: Dict) -> bytes:
+    """把一個 figure job render 成 PNG bytes。
+
+    解析度以 PDF_FIGURE_RENDER_DPI 為目標（VL 要能讀出圖中文字），最長邊
+    超過 PDF_FIGURE_MAX_SIDE_PX 時等比例降。crop 框先外擴到整數 pt 再與頁面
+    相交——量化讓同一張圖（頁首 logo）每頁 render 出逐位元組相同的 PNG，
+    內容 hash 去重才會生效。
+    """
+    import math
+
+    import pymupdf
+
+    page_index = job["page"] - 1
+    if page_index < 0 or page_index >= pdf_doc.page_count:
+        raise PdfFigureError(
+            f"figure job 頁碼超出範圍: 第 {job['page']} 頁"
+            f"（PDF 共 {pdf_doc.page_count} 頁）"
+        )
+    page = pdf_doc[page_index]
+
+    if job["mode"] == "page":
+        rect = page.rect
+        clip = None
+    else:
+        x0, y0, x1, y1 = job["bbox"]
+        rect = pymupdf.Rect(math.floor(x0), math.floor(y0),
+                            math.ceil(x1), math.ceil(y1))
+        rect.intersect(page.rect)
+        if rect.is_empty or rect.width < 2 or rect.height < 2:
+            raise PdfFigureError(
+                f"picture 框與頁面沒有有效交集: 第 {job['page']} 頁 "
+                f"圖 {job['figure_index']}（bbox={job['bbox']}）"
+            )
+        clip = rect
+
+    zoom = PDF_FIGURE_RENDER_DPI / 72.0
+    long_side = max(rect.width, rect.height)
+    if long_side * zoom > PDF_FIGURE_MAX_SIDE_PX:
+        zoom = PDF_FIGURE_MAX_SIDE_PX / long_side
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=clip, alpha=False)
+    if pix.width < 2 or pix.height < 2:
+        raise PdfFigureError(
+            f"render 結果過小（{pix.width}x{pix.height}px）: "
+            f"第 {job['page']} 頁 圖 {job['figure_index']}"
+        )
+    return pix.tobytes("png")
+
+
+def _pdf_figure_chunks(
+    file_path: str,
+    filename: str,
+    jobs: List[Dict],
+    next_chunk_index: Dict[int, int],
+) -> List[Dict]:
+    """把 figure jobs 逐張 render → VL 抽述 → 切成 diagram chunks。
+
+    - 去重：以 render 出的 PNG 內容 hash 判定，同一張圖（頁首 logo、浮水印）
+      只送一次 VL，chunk 記錄首次出現的頁碼與 figure 索引。
+    - 進度：影像多的文件會明顯變慢，逐張印「第 N/M 張」與頁碼。
+    - 失敗（render / VL 連不上 / 逾時 / 回空）一律 raise PdfFigureError：
+      呼叫端在任何 KB 寫入之前，整份文件因此零寫入。
+    """
+    import base64
+
+    total = len(jobs)
+    n_page_renders = sum(1 for j in jobs if j["mode"] == "page")
+    n_crops = total - n_page_renders
+    print(f"[INFO] PDF 內嵌圖自動經 VL 入庫: 共 {total} 張"
+          f"（整頁 render {n_page_renders} 張、區塊 crop {n_crops} 張）", flush=True)
+
+    try:
+        pdf_doc = _open_pdf_document(file_path)
+    except Exception as exc:
+        raise PdfFigureError(
+            f"無法開啟 PDF 進行圖面 render: {filename}: {exc}"
+        ) from exc
+
+    figure_chunks: List[Dict] = []
+    seen: Dict[str, Tuple[int, int]] = {}  # PNG hash → (首見頁碼, figure_index)
+    dup_count = 0
+    try:
+        for n, job in enumerate(jobs, 1):
+            where = f"第 {job['page']} 頁 圖 {job['figure_index']}"
+            try:
+                png = _render_pdf_figure_png(pdf_doc, job)
+            except PdfFigureError:
+                raise
+            except Exception as exc:
+                raise PdfFigureError(
+                    f"內嵌圖 render 失敗: {filename} {where}"
+                    f"（第 {n}/{total} 張）: {exc}"
+                ) from exc
+
+            digest = hashlib.sha256(png).hexdigest()
+            if digest in seen:
+                first_page, first_fig = seen[digest]
+                dup_count += 1
+                print(f"  [{n}/{total}] {where}: 與第 {first_page} 頁 "
+                      f"圖 {first_fig} 內容相同，去重跳過", flush=True)
+                continue
+
+            label = "整頁" if job["mode"] == "page" else "區塊"
+            print(f"  [{n}/{total}] {where}（{label}）→ VL 分析中...", flush=True)
+            try:
+                description = _describe_technical_image_base64(
+                    base64.b64encode(png).decode("ascii"), "image/png"
+                )
+            except Exception as exc:
+                raise PdfFigureError(
+                    f"內嵌圖 VL 分析失敗: {filename} {where}（第 {n}/{total} 張）。"
+                    f"VL 端錯誤: {exc}。整份文件不入庫（零寫入）。"
+                ) from exc
+            seen[digest] = (job["page"], job["figure_index"])
+
+            # 與獨立圖片入庫同一份切法/型別（type=diagram → 檢索降權 0.8），
+            # 但 source 是 PDF 檔名：重灌/移除這份 PDF 時 figure chunk 一起走。
+            fig_doc = build_text_document(
+                description,
+                source=filename,
+                base_type='diagram',
+                doc_type='diagram',
+                page=job["page"],
+                extra={"origin": "diagram", "figure_index": job["figure_index"]},
+            )
+            if not fig_doc.chunks:
+                raise PdfFigureError(
+                    f"VL 描述切不出任何 chunk: {filename} {where}"
+                )
+            base = next_chunk_index.get(job["page"], 0)
+            for j, chunk in enumerate(fig_doc.chunks):
+                chunk["chunk_index"] = base + j
+            next_chunk_index[job["page"]] = base + len(fig_doc.chunks)
+            figure_chunks.extend(fig_doc.chunks)
+    finally:
+        with contextlib.suppress(Exception):
+            pdf_doc.close()
+
+    print(f"[INFO] 內嵌圖入庫完成: {total} 張 → {len(seen)} 張獨特"
+          f"（去重 {dup_count} 張）、{len(figure_chunks)} 個 diagram chunk", flush=True)
+    return figure_chunks
 
 
 def extract_text_file_document(file_path: str) -> ExtractedDocument:
@@ -959,20 +1226,9 @@ def process_chat_screenshot(image_path: str) -> List[Dict]:
 # ============================================================
 # 技術圖片處理
 # ============================================================
-def extract_info_from_image(image_path: str) -> str:
-    """
-    使用 VL 模型從技術圖片中提取資訊並整理成結構化文件
-    適用於：架構圖、流程圖、記憶體映射圖、硬體方塊圖等
-    """
-    import base64
-
-    # 讀取圖片並轉 base64
-    with open(image_path, 'rb') as f:
-        image_data = base64.b64encode(f.read()).decode('utf-8')
-
-    # 提示詞：針對技術圖片的分析
-    # 增加「原始文字摘錄」層，降低幻覺風險
-    prompt = """請詳細分析這張技術圖片，並整理成結構化的技術文件。
+# 提示詞：針對技術圖片的分析（獨立 --image 入庫與 PDF 內嵌圖共用同一份）
+# 增加「原始文字摘錄」層，降低幻覺風險
+_TECHNICAL_IMAGE_PROMPT = """請詳細分析這張技術圖片，並整理成結構化的技術文件。
 
 **重要**：請盡量忠實呈現圖中文字，不要推測或補完看不清楚的內容。
 
@@ -1030,16 +1286,42 @@ def extract_info_from_image(image_path: str) -> str:
 盡可能完整描述圖中的所有資訊，包括文字標註、箭頭方向、顏色區分等。
 若有任何不確定的內容，請明確標註「推測」或「不確定」。"""
 
+
+def _describe_technical_image_base64(image_base64: str, mime_type: str) -> str:
+    """技術圖片 VL 抽述的嚴格核心：連不上/逾時/回空一律 raise。
+
+    PDF 內嵌圖路徑（hard fail，整份文件零寫入）直接用這個核心；
+    `extract_info_from_image`（--image 路徑）維持既有的吃例外回空字串行為。
+    """
+    content = llama_client.vision_completion(
+        base_url=LLAMA_VL_BASE_URL,
+        prompt=_TECHNICAL_IMAGE_PROMPT,
+        image_base64=image_base64,
+        mime_type=mime_type,
+        model=VL_MODEL,
+        max_tokens=VL_INGEST_MAX_TOKENS,
+        temperature=0.2,
+        timeout=VL_INGEST_TIMEOUT,
+    )
+    if not content or not content.strip():
+        raise RuntimeError(f"VL 回傳空內容（{LLAMA_VL_BASE_URL}）")
+    return content
+
+
+def extract_info_from_image(image_path: str) -> str:
+    """
+    使用 VL 模型從技術圖片中提取資訊並整理成結構化文件
+    適用於：架構圖、流程圖、記憶體映射圖、硬體方塊圖等
+    """
+    import base64
+
+    # 讀取圖片並轉 base64
+    with open(image_path, 'rb') as f:
+        image_data = base64.b64encode(f.read()).decode('utf-8')
+
     try:
-        return llama_client.vision_completion(
-            base_url=LLAMA_VL_BASE_URL,
-            prompt=prompt,
-            image_base64=image_data,
-            mime_type=IMAGE_MIME_TYPES[Path(image_path).suffix.lower()],
-            model=VL_MODEL,
-            max_tokens=VL_INGEST_MAX_TOKENS,
-            temperature=0.2,
-            timeout=VL_INGEST_TIMEOUT,
+        return _describe_technical_image_base64(
+            image_data, IMAGE_MIME_TYPES[Path(image_path).suffix.lower()]
         )
     except Exception as e:
         print(f"[ERROR] VL 模型處理失敗: {e}")

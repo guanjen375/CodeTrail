@@ -87,7 +87,8 @@ SUMMARY_PROMPT_V1 = """你是文件摘要助理。
 """
 
 # VL 產物本身就是生成文本，再 contextualize 是生成疊生成。
-_GENERATIVE_ORIGINS = frozenset({"image", "screenshot"})
+# diagram = PDF 內嵌圖經 VL 抽述（RAG.extract_pdf_document 的自動路徑）。
+_GENERATIVE_ORIGINS = frozenset({"image", "screenshot", "diagram"})
 
 _LOOPBACK_NAMES = frozenset({"localhost", "ip6-localhost", "ip6-loopback"})
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -985,7 +986,7 @@ class ContextGenerator:
 
 
 def is_generative_origin(chunk: Dict) -> bool:
-    """VL 產物（圖片 / 截圖）不 contextualize：生成疊生成。"""
+    """VL 產物（圖片 / 截圖 / PDF 內嵌圖）不 contextualize：生成疊生成。"""
     return str(chunk.get("origin", "")) in _GENERATIVE_ORIGINS
 
 

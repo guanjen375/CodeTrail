@@ -126,12 +126,12 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 
 #### 支援格式
 
-- **文字**：`.pdf` / `.md` / `.txt`（直接抽文字。**PDF 只抽文字**：內嵌圖不經 VL、不入庫，有內嵌圖時 ingest 輸出會列出 `[WARN]` 張數與頁碼——需要圖的內容就把該頁另存 `.png` 走圖片路徑補灌）
+- **文字**：`.pdf` / `.md` / `.txt`（抽文字。**PDF 內嵌圖會自動經 VL 入庫**：幾乎沒有文字的頁（掃描頁）整頁 render 成圖，文字頁裡的圖逐張裁切送 VL；過小的圖示/分隔線略過，重複影像（頁首 logo）只入庫一次。這些 chunk 帶 `origin="diagram"`，檢索時降權、REF 會標示「VL 辨識」。**任何一張圖 VL 失敗整份文件就不入庫**（零寫入），所以混合 PDF 需要 VL server（:8083）在線）
 - **圖片**：`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp`（用 VL 模型看圖、抽出文字描述後切 chunk，需要先把 VL GGUF 掛在 llama-server :8083,設定見 [README §2.4](../README.md#24-vl-模型) 與 §3.2）
 - **binary**：`.bin` / `.dat` / `.raw` / `.fw` / `.img` / `.rom` / `.hex`（抽 hex dump、可讀字串、magic 偵測；遇到 ELF magic 自動切到 ELF 解析）
 - **ELF**：`.elf` / `.so` / `.o` / `.axf` / `.out` / `.ko`（抽 header / sections / symbols）
 
-純圖片掃描的 PDF（沒有可選文字）切不出內容（chunks=0 直接失敗），先把每頁存成 `.png` 再用 `ingest_document` 走圖片路徑，或先用 OCR 工具轉成文字檔再匯入。文字＋圖混合的 PDF（datasheet 類）會成功入庫**但只有文字部分**——看 ingest 輸出的 `[WARN]` 就知道哪幾頁的圖被略過。VL server 是啟動必要條件，若圖片分析仍失敗，先跑 `python scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
+純圖片掃描的 PDF（沒有可選文字）不再切不出內容：每頁會整頁 render 後經 VL 抽述入庫。文字＋圖混合的 PDF（datasheet 類）文字照舊切 chunk，圖另外產生 `origin="diagram"` 的 chunk，ingest 輸出會逐張列出「第 N/M 張、頁碼」進度。VL server 是啟動必要條件，若圖片分析失敗（ingest 會整份中止、知識庫不變），先跑 `python scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
 
 #### 三個步驟
 

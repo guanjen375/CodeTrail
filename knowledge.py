@@ -2090,7 +2090,12 @@ English:"""
             return emb_sum, emb_count + 1
 
         for c in sorted_chunks:
-            key = (c.get("source", ""), c.get("page", 0))
+            # origin / figure_index 也進 key：同一份 PDF 現在同時有文字 chunk 與
+            # VL diagram chunk（內嵌圖），chunk_index 相鄰也絕不能把 VL 描述併進
+            # 原文（origin 會被首個成員蓋掉，VL 揭露就消失）；不同 figure 之間
+            # 同理不併，避免兩張圖的描述混成一段。
+            key = (c.get("source", ""), c.get("page", 0),
+                   c.get("origin", ""), c.get("figure_index"))
             chunk_idx = c.get("chunk_index", 0)
             chunk_type = c.get("type", "doc")
             chunk_section = c.get("section", "")
@@ -2105,8 +2110,10 @@ English:"""
                     "content": c.get("content", ""),
                     "type": chunk_type,
                     "section": chunk_section,
-                    # 同一 source 的 origin 一致，直接沿用（丟掉會讓 VL 出身標記在 REF 消失）
+                    # origin/figure_index 在 key 裡，buffer 內必然一致，直接沿用
+                    # （丟掉會讓 VL 出身標記與 figure 序號在 REF 消失）
                     "origin": c.get("origin", ""),
+                    "figure_index": c.get("figure_index"),
                     "last_idx": chunk_idx,
                     "embedding": c_emb,
                     # 成員的 KB 列索引：決策要靠它回去 gate 矩陣聚合，
@@ -2145,6 +2152,7 @@ English:"""
                     "type": chunk_type,
                     "section": chunk_section,
                     "origin": c.get("origin", ""),
+                    "figure_index": c.get("figure_index"),
                     "last_idx": chunk_idx,
                     "embedding": c.get("embedding", []),
                     "member_chunk_idx": _member_indices(c),
@@ -2309,9 +2317,9 @@ English:"""
 
         has_spec = any(chunk.get('type') == 'spec' for chunk in merged_chunks)
         has_warning = any(chunk.get('type') == 'warning' for chunk in merged_chunks)
-        # VL 產物（圖片/截圖經視覺模型抽述）要在 REF 層揭露出身：
+        # VL 產物（圖片/截圖/PDF 內嵌圖經視覺模型抽述）要在 REF 層揭露出身：
         # 它的內容是機率性描述，不能與原文抽取的 chunk 當同級證據
-        vl_origins = {'image', 'screenshot'}
+        vl_origins = {'image', 'screenshot', 'diagram'}
         has_vl_ref = any(chunk.get('origin') in vl_origins for chunk in merged_chunks)
 
         # 修正：用「最終被選中的 chunks」重新計算信心分數
@@ -2370,6 +2378,10 @@ English:"""
                     model_lines.append(f"  origin: {origin_label}")
                 model_lines.append(f"  source: {source}")
                 model_lines.append(f"  page: {page}")
+                figure_index = chunk.get('figure_index')
+                if figure_index:
+                    # PDF 內嵌圖：同頁多張時以頁內序號區分是哪一張
+                    model_lines.append(f"  figure: {figure_index}")
                 if section:
                     model_lines.append(f"  section: {section}")
                 model_lines.append(f"  content: {content}")
@@ -2389,7 +2401,7 @@ English:"""
             model_lines.append("※ warning 類型的 REF 請特別注意其限制條件")
         if has_vl_ref:
             model_lines.append(
-                "※ origin 標註 VL 的 REF 是視覺模型對圖片/截圖的辨識結果"
+                "※ origin 標註 VL 的 REF 是視覺模型對圖片/截圖/PDF 內嵌圖的辨識結果"
                 "（機率性描述，非原始文件）：引用其數值/規格時請註明「(VL 辨識)」，"
                 "與文字抽取的 REF 衝突時以文字抽取為準"
             )

@@ -820,14 +820,18 @@ def ingest_document(path: str, mode: str = "auto") -> str:
     query_knowledge / query_knowledge_strict 會先重載 KB 再查,不依賴人工
     記得 reload。想「立即」載入並確認 chunk 數,可呼叫 reload_knowledge_base()。
 
-    注意:.pdf 只抽文字。內嵌圖片不會經 VL、不會入庫;有內嵌圖時執行輸出
-    會出現 [WARN](掃描頁/圖表頁請另存 .png 用 mode="image" 補灌)。
+    .pdf 的內嵌圖會自動經 VL(8083)入庫:幾乎沒有文字的頁(掃描頁)整頁
+    render,文字頁的圖逐張 crop;過小的框(圖示/分隔線)略過,重複影像
+    (頁首 logo)只入庫一次。VL chunk 帶 origin="diagram"(檢索降權+REF
+    揭露「VL 辨識」)。任何一張 render/VL 失敗都會讓整份文件入庫失敗、
+    knowledge.json 零寫入——不降級、不部分寫入。圖多的 PDF 會明顯變慢
+    (每張圖一次 VL 呼叫),超過 10 分鐘請改用 CLI。
 
     依 RAG.py 的檔名類型偵測:檔名含 `_spec` / `datasheet` 會被當成 spec(權重最高),
     `manual` 當 manual,`_api` / `reference` 當 api,以此類推。所以檔名取貼切一點。
 
     支援副檔名:
-      - 文字: .pdf / .md / .txt(直接抽文字)
+      - 文字: .pdf / .md / .txt(抽文字;.pdf 內嵌圖另自動經 VL,見上)
       - 圖片: .png / .jpg / .jpeg / .gif / .webp(經 VL 模型抽說明,需要 llama-server VL port)
       - binary: .bin / .dat / .raw / .fw / .img / .rom / .hex
                 (hex dump + 可讀字串 + magic 偵測;偵測到 ELF magic 會自動切 ELF 解析)
@@ -838,13 +842,13 @@ def ingest_document(path: str, mode: str = "auto") -> str:
               外部檔案請先用 import_external_file 複製進來。
         mode: ingestion 模式,預設 "auto" 依副檔名選:
               "auto"     – pdf/md/txt → document, 圖片 → image, binary/ELF → binary
-              "document" – 強制純文字路徑(限 .pdf/.md/.txt)
+              "document" – 強制文件路徑(限 .pdf/.md/.txt;.pdf 內嵌圖仍自動經 VL)
               "image"    – 強制技術圖片(VL 分析,限圖片副檔名)
               "chat"     – 強制聊天截圖(VL 分析,限圖片副檔名)
               "binary"   – 強制 binary/ELF 路徑
 
     Returns:
-        RAG.py 的執行輸出(PDF 內嵌圖 [WARN] 也在這裡)+ 後續建議。
+        RAG.py 的執行輸出(PDF 內嵌圖的 VL 逐張進度也在這裡)+ 後續建議。
     """
     import subprocess
 

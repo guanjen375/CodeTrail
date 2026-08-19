@@ -1556,8 +1556,9 @@ def read_pdf(path: str, max_chars: int = PDF_ONESHOT_MAX_CHARS) -> str:
 
     補上「只看一眼 PDF」的通道：以前一次性入口只有 read_file（純文字）與
     analyze_file（圖片/binary），想看 PDF 只能 ingest → remove → reload。
-    內嵌圖只標註頁碼與張數、不做 VL 分析——要圖片內容請另存 .png 後用
-    ocr_image/analyze_file 或 ingest_document(mode="image")。
+    內嵌圖只標註頁碼與張數、不做 VL 分析——要圖片內容入 KB 就直接
+    ingest_document 這份 PDF（內嵌圖會自動經 VL 入庫）；只想看一次就把
+    該頁另存 .png 用 ocr_image/analyze_file。
 
     max_chars 是真 hard cap：最終字串（含 header、截斷訊息、內嵌圖摘要）
     保證 ≤ max(max_chars, 600)；600 是導引訊息的最低可讀空間。解析分批
@@ -1669,8 +1670,8 @@ def read_pdf(path: str, max_chars: int = PDF_ONESHOT_MAX_CHARS) -> str:
         pages_str = _format_page_ranges(list(image_pages))
         tails.append(
             f"\n[注意] 內嵌圖共 {sum(image_pages.values())} 張（頁 {pages_str}）"
-            "未包含在上面文字裡。需要圖片內容時，把該頁另存 .png 後用 "
-            "analyze_file 或 ingest_document(mode=\"image\") 處理。"
+            "未包含在上面文字裡。需要圖片內容時，直接 ingest_document 這份 PDF"
+            "（內嵌圖會自動經 VL 入庫），或把該頁另存 .png 用 analyze_file 看一次。"
         )
     if parsed_through < n_total:
         tails.append(
