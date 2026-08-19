@@ -538,7 +538,7 @@ def _get_code_graph():
 
 def _graph_for_query():
     """graph query 前置:staleness 同步(§7.5);尚未建立/損壞 → 明確錯誤
-    往上拋(§2;首次建置走 `python code_graph.py --root <AICODE_ROOT>`)。"""
+    往上拋(§2;錯誤訊息附可直接執行的建圖命令,見 CodeGraph.build_command)。"""
     graph = _get_code_graph()
     graph.ensure_fresh()
     return graph
@@ -651,10 +651,11 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
             或 anchors/files/edges(file anchor);每步 evidence 是
             "file:line",超限附 truncation metadata。
         mode="path":單元素 list,含 paths(每條是 edge list,逐步證據)。
-        graph 生命週期:首次建置是顯式維運動作(終端跑
-        `python code_graph.py --root <AICODE_ROOT>`),graph 尚未建立、
-        損壞或 schema 不符時 neighbors/path 直接報錯(訊息含建立命令),
-        semantic 不受影響;建好之後每次查詢自動偵測變更做增量。
+        graph 生命週期:首次建置是顯式維運動作;graph 尚未建立、損壞或
+        schema 不符時 neighbors/path 直接報錯,錯誤訊息內含**可直接複製
+        執行**的建立命令(實際 python interpreter + code_graph.py 絕對
+        路徑 + 實際專案 root),semantic 不受影響;建好之後每次查詢自動
+        偵測變更做增量。
     """
     if mode not in ("semantic", "neighbors", "path"):
         raise ValueError(f"mode 必須是 semantic|neighbors|path,收到 {mode!r}")

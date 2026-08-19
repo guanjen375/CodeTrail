@@ -30,19 +30,41 @@ def redact_url(url: str) -> str:
 
     所有會進錯誤訊息 / stderr / doctor 輸出的 URL 都必須先過這裡:
     policy 拒絕的錯誤本身就會被印出與往上拋,錯誤裡帶密碼等於把
-    credentials 洩進 log(GPT 審核二輪 #2)。parse 失敗原樣回傳
-    (parse 不了的字串也組不出 userinfo)。
+    credentials 洩進 log。
+
+    刻意**不讀** parts.port / parts.username:那些屬性對 malformed port
+    (``http://u:secret@h:bad/``)會拋 ValueError,一旦 fallback 成
+    「原樣回傳」就把 secret 洩出去(GPT 審核三輪 #2)。改為直接對 raw
+    netloc 字串砍掉最後一個 ``@`` 之前的 userinfo —— 無論 port / IPv6 /
+    形狀多壞都砍得掉;連 urlsplit 都失敗時走純字串 fallback,寧可砍多
+    也不放行 credentials。
     """
     try:
         parts = urlsplit(url)
-        if not (parts.username or parts.password):
-            return url
-        netloc = parts.hostname or ""
-        if parts.port:
-            netloc += f":{parts.port}"
-        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
     except ValueError:
+        return _redact_raw(url)
+    if "@" not in parts.netloc:
         return url
+    host_port = parts.netloc.rpartition("@")[2]
+    try:
+        return urlunsplit((parts.scheme, host_port, parts.path, parts.query, parts.fragment))
+    except ValueError:
+        return _redact_raw(url)
+
+
+def _redact_raw(url: str) -> str:
+    """字串層 fallback:找出 authority 區段,砍掉最後一個 @ 之前的內容。"""
+    scheme_sep = url.find("://")
+    start = scheme_sep + 3 if scheme_sep != -1 else 0
+    end = len(url)
+    for ch in "/?#":
+        i = url.find(ch, start)
+        if i != -1:
+            end = min(end, i)
+    netloc = url[start:end]
+    if "@" not in netloc:
+        return url
+    return url[:start] + netloc.rpartition("@")[2] + url[end:]
 
 MODEL_REMOTE_OK_ENV = "AICODE_MODEL_REMOTE_OK"
 KB_CONTEXT_REMOTE_OK_ENV = "AICODE_KB_CONTEXT_REMOTE_OK"

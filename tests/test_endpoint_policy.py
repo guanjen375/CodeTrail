@@ -349,3 +349,31 @@ def test_redact_url_helper():
     assert endpoint_policy.redact_url("http://u:p@h:1/x?q=1") == "http://h:1/x?q=1"
     assert endpoint_policy.redact_url("http://h:1/x") == "http://h:1/x"
     assert endpoint_policy.redact_url("not a url") == "not a url"
+
+
+def test_redact_url_survives_malformed_port_and_ipv6():
+    """三輪 #2:malformed port 會讓 urlsplit().port 拋 ValueError;redact 不得
+    因此 fallback 成原樣回傳(那正是洩漏路徑)。"""
+    # malformed port:credentials 仍必須被砍掉
+    out = endpoint_policy.redact_url("http://user:secret@10.0.0.5:bad/v1")
+    assert "secret" not in out and "user" not in out
+    assert "10.0.0.5:bad/v1" in out
+
+    # IPv6 正常與 malformed(未閉合 bracket)
+    assert endpoint_policy.redact_url("http://u:p@[::1]:8080/x") == "http://[::1]:8080/x"
+    out = endpoint_policy.redact_url("http://u:p@[::1:8080/x")
+    assert "u:p@" not in out and ":p@" not in out
+
+    # 無 credentials 的 malformed port 原樣(不誤傷)
+    assert endpoint_policy.redact_url("http://h:bad/x") == "http://h:bad/x"
+
+
+def test_policy_error_with_malformed_port_has_no_credentials(monkeypatch):
+    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+    with pytest.raises(endpoint_policy.EndpointPolicyError) as exc:
+        endpoint_policy.ensure_allowed("http://user:secret@10.0.0.5:8080/v1", "model")
+    assert "secret" not in str(exc.value)
+    # malformed port 的 URL:urlparse().hostname 仍可取,policy 照常判非 loopback
+    with pytest.raises(endpoint_policy.EndpointPolicyError) as exc:
+        endpoint_policy.ensure_allowed("http://user:secret@10.0.0.5:bad/v1", "model")
+    assert "secret" not in str(exc.value), "malformed port 不得成為洩漏繞道"

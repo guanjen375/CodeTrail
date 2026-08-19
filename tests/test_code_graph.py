@@ -576,9 +576,12 @@ def test_relative_from_import_alias_resolves(tmp_path):
 # GPT 審核二輪修正的回歸測試(2026-08-19)
 # ============================================================
 def test_incremental_unique_to_ambiguous_updates_existing_caller(tmp_path):
-    """審核二輪 #1:新增同名函式後,未變的 caller 檔必須重 resolve 成歧義。"""
+    """審核二輪 #1:**修改既有檔**新增同名函式後(增量的 catalog delta 路徑,
+    不是 added→full rebuild),未變的 caller 檔必須重 resolve 成歧義。"""
     (tmp_path / "lib_a.py").write_text(
         "def foo():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "lib_b.py").write_text(
+        "def unrelated():\n    return 0\n", encoding="utf-8")
     (tmp_path / "caller.py").write_text(
         "def run():\n    return foo()\n", encoding="utf-8")
     g = CodeGraph(str(tmp_path))
@@ -586,9 +589,10 @@ def test_incremental_unique_to_ambiguous_updates_existing_caller(tmp_path):
     edges = g.callees("run")
     assert len(edges) == 1 and edges[0]["resolved"], "起點:唯一定義 → resolved"
 
-    # 新增另一個同名定義;caller.py 本身完全沒變
+    # 修改既有的 lib_b.py 加入同名定義;caller.py 本身完全沒變、無檔案增刪
     (tmp_path / "lib_b.py").write_text(
-        "def foo():\n    return 2\n", encoding="utf-8")
+        "def unrelated():\n    return 0\n\n\ndef foo():\n    return 2\n",
+        encoding="utf-8")
     code_rag.invalidate_scan_cache(tmp_path)
     g.ensure_fresh()
 
@@ -663,3 +667,105 @@ def test_parser_fingerprint_includes_grammar_distribution_versions():
         except _im.PackageNotFoundError:
             version = "absent"
         assert version in fp, f"指紋缺 {dist} 版本({version}): {fp}"
+
+
+# ============================================================
+# GPT 審核三輪修正的回歸測試(2026-08-19)
+# ============================================================
+def test_added_file_switches_import_from_package_init_to_submodule(tmp_path):
+    """三輪 #1(fallback→精確):`from pkg import util` 原落 pkg/__init__.py,
+    新增 pkg/util.py 後 edge 必須切換(added → full rebuild)。"""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "app.py").write_text(
+        "from pkg import util\n\n\ndef entry():\n    return util\n", encoding="utf-8")
+    g = CodeGraph(str(tmp_path))
+    g.build()
+    assert g.file_includes("app.py") == ["pkg/__init__.py"], "起點:fallback 到 package init"
+
+    (pkg / "util.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
+    code_rag.invalidate_scan_cache(tmp_path)
+    g.ensure_fresh()
+    assert g.file_includes("app.py") == ["pkg/util.py"], (
+        "新增子模組後 import edge 必須切換,不得留在 __init__.py")
+
+
+@pytest.mark.skipif(not HAS_TS_C, reason="tree-sitter c 未安裝")
+def test_added_same_name_header_turns_unique_include_into_ambiguity(tmp_path):
+    """三輪 #1(唯一→歧義):新增第二個同名 header 後,既有 caller 的
+    include 不得維持確定解析。"""
+    inc_a = tmp_path / "inc_a"
+    inc_a.mkdir()
+    (inc_a / "config.h").write_text("#define A 1\n", encoding="utf-8")
+    (tmp_path / "m.c").write_text(
+        '#include "config.h"\n'
+        "int use_cfg(void) {\n"
+        "    return 0;\n"
+        "}\n",
+        encoding="utf-8")
+    g = CodeGraph(str(tmp_path))
+    g.build()
+    assert g.file_includes("m.c") == ["inc_a/config.h"], "起點:唯一 resolve"
+
+    inc_b = tmp_path / "inc_b"
+    inc_b.mkdir()
+    (inc_b / "config.h").write_text("#define B 1\n", encoding="utf-8")
+    code_rag.invalidate_scan_cache(tmp_path)
+    g.ensure_fresh()
+
+    conn = sqlite3.connect(g.db_file)
+    rows = conn.execute(
+        "SELECT dst_id, ambiguity_group FROM edges WHERE src_id='m.c'"
+        " AND type='includes'").fetchall()
+    conn.close()
+    assert len(rows) == 2, "同名兩候選:同一 include site 應產兩列"
+    assert all(group is not None for _dst, group in rows), (
+        "新增同名 header 後仍維持確定 include = 錯誤的確定性")
+
+
+def test_added_file_resolves_previously_unresolved_call(tmp_path):
+    """三輪 #1(未解析→已解析):新增定義檔後,既有 caller 的 unresolved
+    call 必須 resolve。"""
+    (tmp_path / "user.py").write_text(
+        "def use_it():\n    return target_fn()\n", encoding="utf-8")
+    g = CodeGraph(str(tmp_path))
+    g.build()
+    edges = g.callees("use_it")
+    assert edges and not edges[0]["resolved"], "起點:unresolved"
+
+    (tmp_path / "lib.py").write_text(
+        "def target_fn():\n    return 1\n", encoding="utf-8")
+    code_rag.invalidate_scan_cache(tmp_path)
+    g.ensure_fresh()
+
+    edges = g.callees("use_it")
+    assert edges and edges[0]["resolved"], "新增定義檔後必須 resolve"
+    assert edges[0]["dst_name"] == "target_fn"
+
+
+def test_missing_graph_error_command_is_directly_executable(tmp_path):
+    """三輪 #3:錯誤訊息裡的建圖命令必須「在任意 cwd 直接複製執行」就能建好
+    (實際 interpreter + 絕對 script 路徑 + 實際 root,shell-quoted)。"""
+    import re
+    import shlex
+
+    _write_py_repo(tmp_path)
+    g = CodeGraph(str(tmp_path))
+    with pytest.raises(CodeGraphError) as exc:
+        g.ensure_fresh()
+    m = re.search(r"`([^`]+)`", str(exc.value))
+    assert m, f"錯誤訊息必須含反引號包住的命令: {exc.value}"
+    cmd = shlex.split(m.group(1))
+    assert cmd[0] == sys.executable, "必須是實際 interpreter,不是裸 python"
+    assert Path(cmd[1]).is_absolute() and Path(cmd[1]).exists(), "script 必須是存在的絕對路徑"
+    assert str(tmp_path) in cmd, "必須帶實際 root,不是 <AICODE_ROOT> placeholder"
+
+    # 在「firmware repo」的 cwd(不是 CodeTrail repo)直接執行那條命令
+    elsewhere = tmp_path / "somewhere_else"
+    elsewhere.mkdir()
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                          cwd=str(elsewhere))
+    assert proc.returncode == 0, proc.stderr
+    g.ensure_fresh()  # 建好後不得再拋
+    assert g.find_nodes("entry")

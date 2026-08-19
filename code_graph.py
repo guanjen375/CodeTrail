@@ -290,6 +290,22 @@ class CodeGraph:
 
         self._scanner = _code_rag.CodeRAG(str(self.root))
 
+    def build_command(self) -> str:
+        """可直接複製執行的建圖命令(GPT 審核三輪 #3)。
+
+        使用者的 cwd 通常是被分析的 firmware repo,不是 CodeTrail repo,
+        而且 `python` 未必是 MCP 實際用的那顆(§0.3)——所以命令必須是:
+        當前 interpreter 的絕對路徑 + 本檔絕對路徑 + 實際 sandbox root,
+        全部 shell quote。
+        """
+        import shlex
+
+        return (
+            f"{shlex.quote(sys.executable)} "
+            f"{shlex.quote(str(Path(__file__).resolve()))} "
+            f"--root {shlex.quote(str(self.root))}"
+        )
+
     # -------- 掃描 --------
     def _scan_files(self) -> dict:
         return self._scanner._scan_code_files()
@@ -690,10 +706,11 @@ class CodeGraph:
     def ensure_fresh(self) -> None:
         """graph query 前置(§2 失效矩陣:缺 / 損壞 / schema 不符 → 明確錯誤):
 
-        - 檔不存在 → CodeGraphError,訊息載明建立命令(semantic 不受影響)。
-          graph **不做隱式 lazy build**:首次建置是顯式維運動作
-          (`python code_graph.py --root <AICODE_ROOT>`),查詢不得靜默付
-          全量建置成本 —— 這是施工單 §2 的契約,不是實作偏好。
+        - 檔不存在 → CodeGraphError,訊息載明**可直接執行**的建立命令
+          (build_command():實際 interpreter + 本檔絕對路徑 + 實際 root,
+          shell-quoted;semantic 不受影響)。graph **不做隱式 lazy build**:
+          首次建置是顯式維運動作,查詢不得靜默付全量建置成本 ——
+          這是施工單 §2 的契約,不是實作偏好。
         - 檔存在但損壞 / schema 不符 → CodeGraphError(不砍不蓋)。
         - scope fingerprint 或 parser 能力指紋(tree-sitter/grammar 版本/
           AICODE_H_LANG)變了 → full rebuild;
@@ -707,7 +724,7 @@ class CodeGraph:
                 )
             raise CodeGraphError(
                 "code graph 尚未建立(mode='semantic' 不受影響)。"
-                f"建立方式:在終端跑 `python {Path(__file__).name} --root <AICODE_ROOT>`"
+                f"建立方式:在終端跑 `{self.build_command()}`"
                 "(建好之後查詢會自動偵測變更做增量,不必重跑)"
             )
 
@@ -733,10 +750,28 @@ class CodeGraph:
             return
 
         current = {rel: info["hash"] for rel, info in files.items()}
-        changed = sorted(
-            rel for rel, h in current.items() if db_hashes.get(rel) != h
-        )
+        added = sorted(set(current) - set(db_hashes))
         deleted = sorted(set(db_hashes) - set(current))
+        changed = sorted(
+            rel for rel, h in current.items()
+            if rel in db_hashes and db_hashes[rel] != h
+        )
+
+        if added:
+            # file catalog 擴張 → full rebuild(GPT 審核三輪 #1):新檔案沒有
+            # 任何既有 incoming edge,反向相依查詢抓不到「本來 resolve 到別處
+            # /resolve 不到、現在該指向新檔」的 import/include(`from pkg
+            # import util` 原落在 pkg/__init__.py、新增 pkg/util.py 該切換;
+            # 新增同名 header 該把唯一 include 變歧義)。刪除與內容修改仍走
+            # 增量:指向被刪檔的邊查得到(reverse deps),callable 增刪由
+            # catalog delta 覆蓋。
+            print(
+                f"[CODE_GRAPH] file catalog changed (+{len(added)}); full rebuild",
+                file=sys.stderr,
+            )
+            self.build(verbose=False)
+            return
+
         if not changed and not deleted:
             return
         print(

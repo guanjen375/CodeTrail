@@ -31,6 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import endpoint_policy  # noqa: E402
 import opencode_context  # noqa: E402
 from deployment_profile import (  # noqa: E402
     ProfileError,
@@ -197,11 +198,6 @@ def check_endpoint_policy(r: Result) -> None:
     cfg = _read_config()
     if isinstance(cfg, Exception):
         return
-    try:
-        import endpoint_policy
-    except ImportError as exc:
-        r.fail(f"無法 import endpoint_policy: {exc}")
-        return
     from urllib.parse import urlparse
 
     remote = []
@@ -258,7 +254,8 @@ def check_llama_servers(r: Result, no_network: bool) -> dict[str, dict]:
     status: dict[str, dict] = {}
     if no_network:
         for attr, role, _ in _LLAMA_SERVERS:
-            r.info(f"llama-server {role}={getattr(cfg, attr, '?')} (--no-network skip)")
+            shown = endpoint_policy.redact_url(str(getattr(cfg, attr, '?') or '?'))
+            r.info(f"llama-server {role}={shown} (--no-network skip)")
         return status
 
     try:
@@ -273,6 +270,7 @@ def check_llama_servers(r: Result, no_network: bool) -> dict[str, dict]:
         if not url:
             r.warn(f"config.{attr} 沒值,跳過 {role} server 檢查")
             continue
+        shown_url = endpoint_policy.redact_url(url)
         try:
             health = llama_client.get_health(url)
         except Exception as e:
@@ -282,7 +280,7 @@ def check_llama_servers(r: Result, no_network: bool) -> dict[str, dict]:
             err_repr = ""
 
         if not health:
-            msg = f"llama-server [{role}] {url} 不可連{(' — ' + err_repr) if err_repr else ''}"
+            msg = f"llama-server [{role}] {shown_url} 不可連{(' — ' + err_repr) if err_repr else ''}"
             if required:
                 r.fail(msg + "\n        請確認對應 llama-server 已啟動")
             else:
@@ -291,7 +289,7 @@ def check_llama_servers(r: Result, no_network: bool) -> dict[str, dict]:
 
         srv_status = str(health.get("status", "")).lower()
         if srv_status != "ok":
-            r.warn(f"llama-server [{role}] {url} status={srv_status!r}")
+            r.warn(f"llama-server [{role}] {shown_url} status={srv_status!r}")
             status[role] = {"url": url, "health": health, "props": None}
             continue
 
@@ -309,7 +307,7 @@ def check_llama_servers(r: Result, no_network: bool) -> dict[str, dict]:
             settings = props.get("default_generation_settings") or {}
             n_ctx = settings.get("n_ctx") or props.get("n_ctx")
 
-        r.ok(f"llama-server [{role}] {url} model={model_name} n_ctx={n_ctx}")
+        r.ok(f"llama-server [{role}] {shown_url} model={model_name} n_ctx={n_ctx}")
 
     return status
 
