@@ -93,11 +93,37 @@ def test_fixture_copy_keeps_generated_cache_out_of_checked_in_tree(tmp_path: Pat
         for path in smoke.FIXTURE_DIR.rglob(".code_rag*")
     }
     roots = smoke.copy_fixture_repos(data, tmp_path)
-    smoke.install_offline_stubs()
-    smoke.build_rags(roots)
+    with smoke.install_offline_stubs():
+        smoke.build_rags(roots)
     after = {
         path.relative_to(smoke.FIXTURE_DIR)
         for path in smoke.FIXTURE_DIR.rglob(".code_rag*")
     }
     assert after == before
     assert any(path.name.startswith(".code_rag") for path in tmp_path.rglob(".code_rag*"))
+
+
+def test_offline_stubs_restore_process_global_clients_and_reranker():
+    import code_rag
+    import http_client
+    import llama_client
+
+    originals = (
+        llama_client.get_session,
+        http_client.get_session,
+        llama_client.embed_one,
+        llama_client.embed_batch,
+        code_rag.USE_RERANKER,
+    )
+    with smoke.install_offline_stubs():
+        assert llama_client.get_session is smoke._poison_get_session
+        assert http_client.get_session is smoke._poison_get_session
+        assert code_rag.USE_RERANKER is False
+
+    assert (
+        llama_client.get_session,
+        http_client.get_session,
+        llama_client.embed_one,
+        llama_client.embed_batch,
+        code_rag.USE_RERANKER,
+    ) == originals

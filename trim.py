@@ -25,6 +25,7 @@ from the context_budget gate when soft warning fires.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -369,6 +370,120 @@ def summarize_old_tool_output(text: str, tool_name: str) -> tuple[str, dict[str,
     }
 
 
+def trim_code_context_output(text: str, max_chars: int) -> tuple[str, dict[str, Any]]:
+    """Trim a context bundle as JSON while preserving uncertainty metadata.
+
+    ``code_rag_search(mode="context")`` puts evidence text before uncertainties.
+    Treating it as read_file output cuts the JSON head-first and silently removes
+    the very caveats that make the bundle honest.  This strategy trims evidence
+    text first, keeps the public top-level shape, and records transport trimming
+    as another uncertainty.
+    """
+    original = len(text)
+    if original <= max_chars:
+        return text, {"kept": original, "original": original, "trimmed": False}
+    try:
+        payload = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return trim_read_file_output(text, max_chars)
+    if not isinstance(payload, dict) or not isinstance(payload.get("evidence"), list) \
+            or not isinstance(payload.get("uncertainties"), list):
+        return trim_read_file_output(text, max_chars)
+
+    evidence = [dict(row) for row in payload.get("evidence", []) if isinstance(row, dict)]
+    original_texts = [str(row.get("text", "")) for row in evidence]
+    marker = f"{CTX_TRIMMED_MARKER} evidence text omitted by message budget"
+    for row in evidence:
+        row["text"] = marker
+    payload["evidence"] = evidence
+    payload["uncertainties"] = [
+        dict(row) for row in payload.get("uncertainties", []) if isinstance(row, dict)
+    ]
+    transport_reason = f"{CTX_TRIMMED_MARKER} evidence text reduced by message budget"
+    if not any(
+        row.get("target") == "code_rag_search tool output"
+        and row.get("reason") == transport_reason
+        for row in payload["uncertainties"]
+    ):
+        payload["uncertainties"].append({
+            "target": "code_rag_search tool output",
+            "reason": transport_reason,
+        })
+    payload["seeds"] = [
+        dict(row) for row in payload.get("seeds", []) if isinstance(row, dict)
+    ]
+    payload["truncated"] = True
+
+    def encode() -> str:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    result = encode()
+    dropped_evidence = 0
+    while len(result) > max_chars and payload["evidence"]:
+        payload["evidence"].pop()
+        original_texts.pop()
+        dropped_evidence += 1
+        result = encode()
+    if dropped_evidence:
+        payload["uncertainties"].append({
+            "target": f"{dropped_evidence} evidence ranges",
+            "reason": f"{CTX_TRIMMED_MARKER} ranges omitted by message budget",
+        })
+        result = encode()
+
+    # Seeds are reproducibility hints, but original uncertainty rows outrank them
+    # once evidence has already been removed.
+    while len(result) > max_chars and payload["seeds"]:
+        payload["seeds"].pop()
+        result = encode()
+
+    # Preserve the earliest concrete uncertainties.  If even bounded metadata is
+    # too large, replace only the tail with an explicit count instead of slicing
+    # JSON or silently losing caveats.
+    omitted_uncertainties = 0
+    while len(result) > max_chars and len(payload["uncertainties"]) > 1:
+        payload["uncertainties"].pop()
+        omitted_uncertainties += 1
+        result = encode()
+    if omitted_uncertainties:
+        summary_row = {
+            "target": f"{omitted_uncertainties} uncertainty rows",
+            "reason": f"{CTX_TRIMMED_MARKER} metadata tail omitted by message budget",
+        }
+        payload["uncertainties"].append(summary_row)
+        result = encode()
+        if len(result) > max_chars:
+            payload["uncertainties"].pop()
+            result = encode()
+
+    # Restore as much leading evidence text as the remaining transport budget can
+    # hold.  Binary search accounts for JSON escaping expansion.
+    for row, source in zip(payload["evidence"], original_texts):
+        low, high = 0, len(source)
+        while low < high:
+            mid = (low + high + 1) // 2
+            row["text"] = source[:mid] + "\n" + marker
+            if len(encode()) <= max_chars:
+                low = mid
+            else:
+                high = mid - 1
+        row["text"] = source[:low] + ("\n" if low else "") + marker
+        result = encode()
+
+    # Pathological huge query/status strings are not evidence or uncertainty.
+    if len(result) > max_chars:
+        payload["query"] = str(payload.get("query", ""))[:80]
+        payload["graph_status"] = str(payload.get("graph_status", ""))[:120]
+        result = encode()
+
+    return result, {
+        "kept": len(result),
+        "original": original,
+        "trimmed": True,
+        "window_kept": bool(payload["evidence"]),
+    }
+
+
 # ============================================================
 # Per-message trim entrypoint
 # ============================================================
@@ -381,8 +496,10 @@ def trim_tool_message(
     mode:
         "auto" — pick based on tool_name and length.
         "summarize" — force the deterministic [TOOL_SUMMARY] form (used for
-                      older tool outputs once newer ones exist).
+        older tool outputs once newer ones exist).
     """
+    if tool_name == "code_rag_search":
+        return trim_code_context_output(content, max_chars)
     if mode == "summarize":
         return summarize_old_tool_output(content, tool_name)
 
@@ -551,11 +668,18 @@ def trim_messages(
             # Mark it so we don't loop on it forever.
             break
         tool_name = _resolve_tool_name(messages, max_idx)
-        # Use the deterministic summary form, which preserves file:line
-        # anchors for read_file/grep and error lines for run_command.
-        # Already-summarized messages still get shortened by this call.
+        # code context is structured evidence: keep its uncertainty rows even
+        # during the final pressure pass.  Other tools use the deterministic
+        # fact summary (anchors/errors).
         already_summary = TOOL_SUMMARY_OPEN in content
-        new_content, meta = summarize_old_tool_output(content, tool_name)
+        if tool_name == "code_rag_search":
+            excess = max(1, _calc_messages_size(messages) - budget)
+            target_cap = max(256, len(content) - excess - 16)
+            new_content, meta = trim_code_context_output(
+                content, min(target_cap, len(content) - 1)
+            )
+        else:
+            new_content, meta = summarize_old_tool_output(content, tool_name)
         if not meta.get("trimmed") or len(new_content) >= len(content):
             # Couldn't shrink it any further (e.g. all anchors), fall back
             # to a stub but keep the tool name and anchors visible.

@@ -24,6 +24,7 @@ import config
 _MAX_QUERY_TERMS = 12
 _MAX_LEXICAL_HITS = 160
 _MAX_CANDIDATES = 48
+_MAX_UNCERTAINTIES = 64
 _SYMBOL_WINDOW_LINES = 80
 _INCLUDE_WINDOW_LINES = 60
 _LEXICAL_RADIUS = 8
@@ -67,7 +68,10 @@ def query_terms(query: str) -> list[str]:
     seen: set[str] = set()
     for raw in raw_terms:
         normalized = raw.lower()
-        if len(normalized) < 3 or normalized in _STOP_WORDS or normalized in seen:
+        is_cjk = re.fullmatch(r"[\u3400-\u9fff]+", normalized) is not None
+        minimum = 2 if is_cjk else 3
+        if len(normalized) < minimum \
+                or normalized in _STOP_WORDS or normalized in seen:
             continue
         seen.add(normalized)
         out.append(raw)
@@ -97,20 +101,26 @@ def collect_safe_lexical_hits(executor, query: str,
         if not isinstance(output, str) or output.startswith("錯誤:"):
             continue
         for line in output.splitlines():
-            match = re.match(r"^(.*):(\d+):(.*)$", line)
-            if match is None:
-                continue
-            raw_path, raw_line = match.group(1), match.group(2)
-            try:
-                target = executor._safe_path(raw_path)
-                if target is None or not target.is_file():
+            # rg emits path:line:text.  Both a legal path and the match text can
+            # contain `:123:`.  Try delimiters left-to-right and accept the first
+            # one whose path passes the existing sandbox and scoped-file checks.
+            parsed: tuple[str, int] | None = None
+            for delimiter in re.finditer(r":([1-9]\d*):", line):
+                raw_path = line[:delimiter.start()]
+                try:
+                    target = executor._safe_path(raw_path)
+                    if target is None or not target.is_file():
+                        continue
+                    rel_path = target.relative_to(executor.root).as_posix()
+                except (OSError, ValueError):
                     continue
-                rel_path = target.relative_to(executor.root).as_posix()
-            except (OSError, ValueError):
+                if rel_path in allowed:
+                    parsed = (rel_path, int(delimiter.group(1)))
+                    break
+            if parsed is None:
                 continue
-            if rel_path not in allowed:
-                continue
-            key = (rel_path, max(1, int(raw_line)))
+            rel_path, raw_line = parsed
+            key = (rel_path, max(1, raw_line))
             aggregated.setdefault(key, set()).add(term)
             if len(aggregated) >= _MAX_LEXICAL_HITS:
                 break
@@ -282,6 +292,11 @@ def _graph_candidates(graph, seeds: list[dict], allowed: set[str],
             neighborhood = graph.neighbors(
                 anchor["id"], edge_types=("calls",), direction="both", hops=1, limit=100
             )
+            if neighborhood.get("truncated"):
+                uncertainties.append({
+                    "target": seed["symbol"] or seed["path"],
+                    "reason": "graph traversal limit reached; additional call relations omitted",
+                })
             nodes = {node["id"]: node for node in neighborhood.get("nodes", [])}
             for edge in neighborhood.get("edges", []):
                 if not edge.get("resolved"):
@@ -305,6 +320,11 @@ def _graph_candidates(graph, seeds: list[dict], allowed: set[str],
                     candidates.append(_candidate_for_related_node(related, reason, priority))
 
         file_graph = graph.file_neighbors(seed["path"], hops=1, limit=100)
+        if file_graph.get("truncated"):
+            uncertainties.append({
+                "target": seed["path"],
+                "reason": "graph traversal limit reached; additional file relations omitted",
+            })
         for edge in file_graph.get("edges", []):
             if not edge.get("resolved"):
                 uncertainties.append({
@@ -432,7 +452,14 @@ def _dedupe_uncertainties(items: Iterable[dict]) -> list[dict]:
         if key not in seen:
             seen.add(key)
             out.append(normalized)
-    return out
+    if len(out) <= _MAX_UNCERTAINTIES:
+        return out
+    kept = out[:_MAX_UNCERTAINTIES - 1]
+    kept.append({
+        "target": f"{len(out) - len(kept)} additional uncertainties",
+        "reason": "uncertainty limit reached; additional unique items omitted",
+    })
+    return kept
 
 
 def build_code_context(
@@ -492,15 +519,16 @@ def build_code_context(
     ranked = rank_with_file_diversity(merge_candidate_ranges(candidates))
     discarded = ranked[_MAX_CANDIDATES:]
     ranked = ranked[:_MAX_CANDIDATES]
-    omitted_reasons: dict[str, int] = {}
+    candidate_limit_reasons: dict[str, int] = {}
     for candidate in discarded:
         for reason in candidate.reasons:
-            omitted_reasons[reason] = omitted_reasons.get(reason, 0) + 1
+            candidate_limit_reasons[reason] = candidate_limit_reasons.get(reason, 0) + 1
 
     evidence: list[dict] = []
     seen_content: set[str] = set()
     used_chars = 0
     truncated = bool(discarded)
+    budget_omitted_reasons: dict[str, int] = {}
 
     for candidate in ranked:
         text = read_window(candidate.path, candidate.start_line, candidate.end_line)
@@ -523,7 +551,7 @@ def build_code_context(
         if not isinstance(text, str) or text.startswith("錯誤:") or len(text) > remaining:
             truncated = True
             for reason in candidate.reasons:
-                omitted_reasons[reason] = omitted_reasons.get(reason, 0) + 1
+                budget_omitted_reasons[reason] = budget_omitted_reasons.get(reason, 0) + 1
             continue
 
         if not _has_numbered_source(text):
@@ -548,12 +576,23 @@ def build_code_context(
         })
         used_chars += len(text)
 
-    if omitted_reasons:
+    if candidate_limit_reasons:
         summary = ", ".join(
-            f"{reason}={count}" for reason, count in sorted(omitted_reasons.items())
+            f"{reason}={count}"
+            for reason, count in sorted(candidate_limit_reasons.items())
         )
         uncertainties.append({
-            "target": f"{sum(omitted_reasons.values())} candidate ranges",
+            "target": f"{sum(candidate_limit_reasons.values())} candidate ranges",
+            "reason": f"candidate limit omitted evidence types: {summary}",
+        })
+
+    if budget_omitted_reasons:
+        summary = ", ".join(
+            f"{reason}={count}"
+            for reason, count in sorted(budget_omitted_reasons.items())
+        )
+        uncertainties.append({
+            "target": f"{sum(budget_omitted_reasons.values())} candidate ranges",
             "reason": f"character budget omitted evidence types: {summary}",
         })
 

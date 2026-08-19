@@ -639,7 +639,7 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 max_chars 設 12000，依 evidence 的 path:line 分成已證實與仍不確定兩部分回答。
 ```
 
-`mode="context"` 會把 semantic seeds、確定的 1-hop caller/callee/include，以及相關 test/header/config/trace lexical evidence 合併去重後裝進固定字元 budget。`max_chars` 合法範圍是 `2000..30000`、預設 `12000`，`used_chars` 只計 `evidence[].text` 的實際字元，不宣稱 tokenizer token 數；歧義與 unresolved 只進 `uncertainties`，不偽裝成確定證據。所有 source window 仍由既有 sandboxed `read_file` 路徑讀取。graph 尚未建立或損壞時會降級回 semantic-only evidence 並標示 `graph_status`，不影響整次呼叫。
+`mode="context"` 會把 semantic seeds、確定的 1-hop caller/callee/include，以及相關 test/header/config/trace lexical evidence 合併去重後裝進固定字元 budget。`max_chars` 合法範圍是 `2000..30000`、預設 `12000`，`used_chars` 只計 `evidence[].text` 的實際字元，不宣稱 tokenizer token 數；歧義與 unresolved 只進 `uncertainties`，不偽裝成確定證據。candidate 數量、graph traversal 與字元 budget 的截斷原因會分開標示，後續 message trim 也優先保留 uncertainty。所有 source window 仍由既有 sandboxed `read_file` 路徑讀取。graph 尚未建立或損壞時會降級回 semantic-only evidence 並標示 `graph_status`，不影響整次呼叫。
 
 想看**跨檔案的呼叫關係**(誰呼叫誰、include 鏈),`code_rag_search` 除了語意搜尋還有 graph 模式:
 
@@ -648,7 +648,7 @@ max_chars 設 12000，依 evidence 的 path:line 分成已證實與仍不確定�
 把呼叫鏈每一步的檔案與行號列出來。
 ```
 
-graph 對 C/C++(tree-sitter)與 Python 抽 definitions / includes / calls。C/C++ 只把同 translation unit 定義、caller 可見 prototype 對應的唯一 external 定義、或 C++ exact qualified name 當成確定呼叫；`static` 不跨 translation unit，repo 內唯一同名但不可見也不會硬連。repo-owned quote/angle header 都可形成 transitive visibility closure，條件編譯候選在沒有 build variant 時維持 ambiguous；回傳會標 `resolution_basis`、`confidence` 與 condition。首次建置要在終端跑一次(手動形式是 `<MCP_PYTHON> <CODETRAIL_REPO>/code_graph.py --root <AICODE_ROOT>`);沒建就用 graph 模式會明確報錯,**錯誤訊息內就是一條含實際 interpreter 與絕對路徑、可直接複製執行的命令**(語意搜尋不受影響)。建好之後查詢自動偵測檔案變更；C/C++ 的 declaration/linkage/include visibility 變更會保守地整體重建，確保與 fresh build 相同。function pointer 與 macro 間接呼叫會誠實回報 unresolved。細節見 [docs/mcp-tools.md](docs/mcp-tools.md)。
+graph 對 C/C++(tree-sitter)與 Python 抽 definitions / includes / calls。C/C++ 只把同 translation unit 定義、實際 included header 的 static-inline 定義、caller 可見 prototype 對應的唯一 external 定義、或 C++ exact qualified name 當成確定呼叫；bare call 不會誤配別的 C++ scope/method，`static` 不跨 translation unit，repo 內唯一同名但不可見也不會硬連。quote header 與帶 namespace path 且唯一 suffix 命中的 angle header 可形成 transitive visibility closure；bare angle include 不會拿 repo 中的 vendored 同名檔猜 compiler 搜尋結果。條件編譯 singleton/多候選在沒有 build variant 時都保留為 unresolved/ambiguous candidate；回傳會標 `resolution_basis`、`confidence` 與 condition。首次建置要在終端跑一次(手動形式是 `<MCP_PYTHON> <CODETRAIL_REPO>/code_graph.py --root <AICODE_ROOT>`);沒建就用 graph 模式會明確報錯,**錯誤訊息內就是一條含實際 interpreter 與絕對路徑、可直接複製執行的命令**(語意搜尋不受影響)。v1 DB 重跑同一命令會在 transaction 中原地升級。建好之後查詢自動偵測檔案變更；C/C++ 的 declaration/linkage/include visibility 變更，或 Python 增量牽動 C/C++ caller 時，會保守地整體重建，確保與 fresh build 相同。function pointer 與 macro 間接呼叫會誠實回報 unresolved。細節見 [docs/mcp-tools.md](docs/mcp-tools.md)。
 
 想把**圖片**(截圖、架構圖、規格頁掃描)變成之後查得到的知識,就是「VL + RAG 一起用」—— `ingest_document` 餵圖片時會自動走 VL 把圖抽成文字再進 RAG,跟 PDF 走同一套:
 

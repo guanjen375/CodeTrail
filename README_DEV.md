@@ -153,15 +153,20 @@ python eval/run_eval.py --test-set all --verbose
 ### Code graph 的 C/C++ 保守解析
 
 `GRAPH_SCHEMA_VERSION=2` 保存 definition linkage/condition、function declarations，
-以及 edge 的 `resolution_basis`/condition。C/C++ call 只按下列證據順序解析：同檔定義、
-direct/transitive repo-header 可見 prototype 對應的唯一 external 定義、C++ exact
-qualified name；其餘維持 ambiguous 或 unresolved。`static` 與 anonymous namespace
-definition 不跨 translation unit，function pointer/macro 不猜。唯一對到 repo header 的
-quote/angle include 都進 visibility closure，零命中的 angle include 視為外部系統 header。
+以及 edge 的 `resolution_basis`/condition。既有 v1 DB 由同一條顯式 build command 在
+單一 SQLite transaction 中原地升級；升級失敗會 rollback，不要求手刪 DB。C/C++ call
+只按下列證據順序解析：同檔定義、實際 included header 的 static-inline 定義、C++ exact
+qualified name、direct/transitive repo-header 可見 prototype 對應的唯一 external 定義；
+其餘維持 ambiguous 或 unresolved。bare call 不會配到別的 C++ scope/method，條件不明的
+singleton 會保留為 unresolved candidate，不會消失或冒充確定邊。`static` 與 anonymous
+namespace definition 不跨 translation unit，function pointer/macro 不猜。quote include
+沿用 repo resolution；angle include 只有帶 namespace path 且唯一 suffix 命中才進
+visibility closure，bare `<stdint.h>` 不會因 repo 裡有 vendored shim 就誤配。
 
 C/C++ 任一檔案 add/change/delete 都把檔案 hash 當作完整 visibility fingerprint 並走
 full rebuild；這是刻意的保守 invalidation，避免 linkage/declaration/include closure 的
-partial cone 與 fresh build 漂移。Python 仍走既有增量路徑。相關 gate：
+partial cone 與 fresh build 漂移。Python 仍走既有增量路徑，但 callable catalog delta
+若牽動 C/C++ caller，會在寫 DB 前切換成 full rebuild。相關 gate：
 
 ```bash
 python scripts/run_tests.py tests/test_ast_parser_cpp.py tests/test_code_graph.py \
@@ -230,7 +235,7 @@ llama-server 啟動時 `-c <N>` 與 OpenCode `model.limit.context` 對齊。`scr
 | 模組 | 責任 |
 |---|---|
 | `context_budget.py` | token 估算(prompt / messages parts / tools schema)、`ContextUsage` dataclass、hard gate (`enforce_gate` → `ContextOverflowError`)、llama-server usage metrics 解析(支援 native `tokens_evaluated/tokens_predicted` 與 OpenAI `usage{}`,streaming + non-streaming)、JSONL telemetry。**不寫 prompt / 檔案內容** 進 log,只寫 count + metadata。 |
-| `code_context.py` | `code_rag_search(mode="context")` 的 deterministic 程式證據選取/overlap merge/content dedupe/字元裝箱。它不是 LLM context hard gate；source I/O 由呼叫端注入既有 `ToolExecutor.grep/read_file`，本模組不裸讀檔。固定 `max_chars=2000..30000`，`used_chars` 只加總 `evidence[].text`。 |
+| `code_context.py` | `code_rag_search(mode="context")` 的 deterministic 程式證據選取/overlap merge/content dedupe/字元裝箱。它不是 LLM context hard gate；source I/O 由呼叫端注入既有 `ToolExecutor.grep/read_file`，本模組不裸讀檔。固定 `max_chars=2000..30000`，`used_chars` 只加總 `evidence[].text`；candidate cap、graph traversal cap 與 character budget 各自如實標示，uncertainties 去重且有顯式上限。 |
 | `trim.py` | 對 `role=tool` 訊息做 priority-aware trim,加入明確 `[CTX_TRIMMED]` / `[TOOL_SUMMARY]` 標記。`role=system` / `role=user` 訊息**完全不動**(REF metadata 因此被保留)。run_command 保留 tail + error line;read_file 保留 header + window;舊輪 tool output 摘要成 deterministic facts(file:line 錨點、error 行)。 |
 | `context_signals.py` | **檢索訊號的唯一定義**:embedding 組字(retrieval 含 ctx / gate 只看原文)、schema 名稱與 required 對照、內容雜湊、BM25 來源文本、reranker passage。寫入端(`RAG.py`)與載入端(`knowledge.py`)一律 import 這裡——以前兩邊各寫一份同樣的字串,差一個字就變成「內容雜湊不一致」。 |
 | `context_generation.py` | chunk 級生成脈絡的產生器:窗策略(整份 / 階層式摘要 + target-centered section window)、prompt 版本、輸出衛生、write-through 快取與指紋、per-KB single-writer 鎖、覆蓋率閘、**專用的受限 HTTP client**(`trust_env=False`、拒絕 3xx、host 必須是 loopback)。 |

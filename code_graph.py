@@ -5,15 +5,17 @@
 範圍(只有這三種關係;references / inherits / impacted_tests 都不做):
   - definitions:file → symbol(全語言,nodes 來自 ast_parser.parse_file)
   - includes / imports:file → file
-      C/C++:tree-sitter 抽 quote include，並只在 angle include 可唯一對到
-      repo header 時納入；多候選保留 ambiguity，零命中的 angle include 視為
-      system/external 不入 graph。
+      C/C++:tree-sitter 抽 quote include；angle include 只有帶路徑 namespace
+      (如 <fw/service.h>)且唯一 suffix 命中 repo header 才納入。bare
+      <stdint.h> 即使 repo 內剛好有同名 vendored shim 也視為 system/external，
+      不可假裝 compiler include-search path 已知。
       Python:stdlib ast 抽 import / from-import,模組路徑對 repo 內
       ``x.py`` / ``x/__init__.py`` resolve;resolve 不到的(stdlib / 第三方)
       **不記**——Python 端分不出「作者宣稱專案內」,記下來全是噪音。
   - calls:symbol → symbol(resolved)或 symbol → NULL + unresolved_target。
-      C/C++ 只依 same-file definition、可見 prototype 對應的唯一 external
-      definition、或 exact qualified name resolve；全 repo 唯一同名不再足夠。
+      C/C++ 只依 same-file definition、included header 的 static-inline
+      definition、可見 prototype 對應的唯一 external definition、或 exact
+      qualified name resolve；全 repo 唯一同名不再足夠。
       同一 call site 多候選 → 多列共用 ambiguity_group,confidence=syntactic。
       macro 間接呼叫抽不到(能力限制,後續輪的 config extractor 補)。
 
@@ -67,7 +69,8 @@ GRAPH_SCHEMA_VERSION = 2
 _LANG_BY_EXT = {
     ".py": "python", ".pyx": "python", ".pyi": "python",
     ".c": "c",
-    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
+    ".hpp": "cpp", ".hh": "cpp", ".hxx": "cpp",
 }
 
 _CALLABLE_KINDS = ("function", "method")
@@ -271,29 +274,60 @@ def _function_declarations(node) -> list:
     return found
 
 
-def _include_guard_condition(content: str) -> str | None:
+def _ts_scope_prefix(node) -> str:
+    """Return the enclosing named namespace/class scope for a declaration."""
+    parts: list[str] = []
+    current = node.parent
+    while current is not None:
+        if current.type in {
+            "namespace_definition", "class_specifier", "struct_specifier",
+        }:
+            name_node = current.child_by_field_name("name")
+            if name_node is not None:
+                name = name_node.text.decode("utf-8", errors="replace").strip()
+                if name:
+                    parts.append(name)
+        current = current.parent
+    return "::".join(reversed(parts))
+
+
+def _include_guard_condition(rel_path: str, content: str) -> str | None:
     """辨識傳統 ``#ifndef X`` / ``#define X`` header guard。
 
     condition metadata 仍保存原始 guard；resolver 只把這個已由檔案形狀證明的
-    outer guard 視為 visibility-neutral。一般 ``#ifndef FEATURE`` 不猜。
+    outer guard 視為 visibility-neutral。只接受 header，且 guard 必須包住
+    整份檔案；`.c` weak-default block 與 header 內局部 feature block 都不猜。
     """
-    match = re.search(
-        r"(?m)^\s*#\s*ifndef\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", content
-    )
+    if Path(rel_path).suffix.lower() not in {".h", ".hpp", ".hh", ".hxx"}:
+        return None
+
+    # Comments may precede a guard or trail its #endif.  Removing them before
+    # inspecting directives avoids guessing from a later #ifndef in real code.
+    stripped = re.sub(r"/\*.*?\*/", "", content, flags=re.S)
+    stripped = re.sub(r"(?m)//.*$", "", stripped)
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return None
+    match = re.fullmatch(r"#\s*ifndef\s+([A-Za-z_][A-Za-z0-9_]*)", lines[0])
     if match is None:
         return None
     macro = match.group(1)
-    tail = content[match.end():]
-    define = re.search(
-        rf"(?m)^\s*#\s*define\s+{re.escape(macro)}(?:\s|$)", tail
-    )
-    if define is None:
+    if re.fullmatch(
+        rf"#\s*define\s+{re.escape(macro)}(?:\s+.*)?", lines[1]
+    ) is None:
         return None
-    # 只接受緊接在 guard 後、尚未出現非註解程式碼前的 define。
-    prefix = tail[:define.start()]
-    prefix = re.sub(r"/\*.*?\*/", "", prefix, flags=re.S)
-    prefix = re.sub(r"(?m)//.*$", "", prefix)
-    if prefix.strip():
+    if re.fullmatch(r"#\s*endif(?:\s+.*)?", lines[-1]) is None:
+        return None
+
+    depth = 0
+    for index, line in enumerate(lines):
+        if re.match(r"#\s*(?:if|ifdef|ifndef)\b", line):
+            depth += 1
+        elif re.match(r"#\s*endif\b", line):
+            depth -= 1
+            if depth < 0 or (depth == 0 and index != len(lines) - 1):
+                return None
+    if depth != 0:
         return None
     return f"#ifndef {macro}"
 
@@ -309,13 +343,13 @@ def _extract_c_relations(rel_path: str, content: str, lang: str,
     """
     ts_lang = _try_load_tree_sitter_language(lang) if HAS_TREE_SITTER else None
     if ts_lang is None:
-        return [], [], [], _include_guard_condition(content)
+        return [], [], [], _include_guard_condition(rel_path, content)
     from tree_sitter import Parser
 
     try:
         tree = Parser(ts_lang).parse(bytes(content, "utf-8"))
     except Exception:
-        return [], [], [], _include_guard_condition(content)
+        return [], [], [], _include_guard_condition(rel_path, content)
 
     includes: list[tuple[str, int, bool]] = []
     calls: list[tuple[str, str, int, str | None]] = []
@@ -367,8 +401,10 @@ def _extract_c_relations(rel_path: str, content: str, lang: str,
                     continue
                 name = _ts_declarator_name(declarator)
                 if name:
+                    scope = _ts_scope_prefix(node)
+                    qualified = name if "::" in name or not scope else f"{scope}::{name}"
                     declarations.append(
-                        (name.rsplit("::", 1)[-1], name, node.start_point[0] + 1,
+                        (name.rsplit("::", 1)[-1], qualified, node.start_point[0] + 1,
                          linkage, _ts_condition(node))
                     )
         elif node.type == "call_expression":
@@ -384,7 +420,7 @@ def _extract_c_relations(rel_path: str, content: str, lang: str,
             walk(child)
 
     walk(tree.root_node)
-    return includes, calls, declarations, _include_guard_condition(content)
+    return includes, calls, declarations, _include_guard_condition(rel_path, content)
 
 
 # ============================================================
@@ -442,70 +478,98 @@ class CodeGraph:
         return conn
 
     # -------- schema --------
+    _SCHEMA_STATEMENTS = (
+        """
+        CREATE TABLE IF NOT EXISTS files(
+            path TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL,
+            lang TEXT NOT NULL,
+            backend TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS nodes(
+            id TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            qualified_name TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            backend TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            linkage TEXT NOT NULL,
+            condition TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS declarations(
+            path TEXT NOT NULL,
+            name TEXT NOT NULL,
+            qualified_name TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            linkage TEXT NOT NULL,
+            condition TEXT,
+            backend TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS edges(
+            src_kind TEXT NOT NULL,
+            src_id   TEXT NOT NULL,
+            dst_kind TEXT,
+            dst_id   TEXT,
+            unresolved_target TEXT,
+            ambiguity_group TEXT,
+            type TEXT NOT NULL,
+            evidence_path TEXT NOT NULL,
+            evidence_line INTEGER NOT NULL,
+            backend TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            resolution_basis TEXT NOT NULL,
+            condition TEXT,
+            CHECK ((dst_id IS NULL) = (unresolved_target IS NOT NULL)
+                   OR ambiguity_group IS NOT NULL)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name)",
+        "CREATE INDEX IF NOT EXISTS idx_nodes_path ON nodes(path)",
+        "CREATE INDEX IF NOT EXISTS idx_declarations_name ON declarations(name)",
+        "CREATE INDEX IF NOT EXISTS idx_declarations_path ON declarations(path)",
+        "CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, type)",
+        "CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, type)",
+        """
+        CREATE TABLE IF NOT EXISTS index_metadata(
+            schema_version INTEGER NOT NULL,
+            scope_fingerprint TEXT NOT NULL,
+            parser_versions TEXT NOT NULL,
+            created TEXT NOT NULL,
+            updated TEXT NOT NULL
+        )
+        """,
+    )
+
     @staticmethod
     def _create_schema(conn: sqlite3.Connection) -> None:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS files(
-                path TEXT PRIMARY KEY,
-                content_hash TEXT NOT NULL,
-                lang TEXT NOT NULL,
-                backend TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS nodes(
-                id TEXT PRIMARY KEY,
-                path TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                name TEXT NOT NULL,
-                qualified_name TEXT NOT NULL,
-                start_line INTEGER NOT NULL,
-                end_line INTEGER NOT NULL,
-                backend TEXT NOT NULL,
-                confidence TEXT NOT NULL,
-                linkage TEXT NOT NULL,
-                condition TEXT
-            );
-            CREATE TABLE IF NOT EXISTS declarations(
-                path TEXT NOT NULL,
-                name TEXT NOT NULL,
-                qualified_name TEXT NOT NULL,
-                line INTEGER NOT NULL,
-                linkage TEXT NOT NULL,
-                condition TEXT,
-                backend TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS edges(
-                src_kind TEXT NOT NULL,
-                src_id   TEXT NOT NULL,
-                dst_kind TEXT,
-                dst_id   TEXT,
-                unresolved_target TEXT,
-                ambiguity_group TEXT,
-                type TEXT NOT NULL,
-                evidence_path TEXT NOT NULL,
-                evidence_line INTEGER NOT NULL,
-                backend TEXT NOT NULL,
-                confidence TEXT NOT NULL,
-                resolution_basis TEXT NOT NULL,
-                condition TEXT,
-                CHECK ((dst_id IS NULL) = (unresolved_target IS NOT NULL)
-                       OR ambiguity_group IS NOT NULL)
-            );
-            CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
-            CREATE INDEX IF NOT EXISTS idx_nodes_path ON nodes(path);
-            CREATE INDEX IF NOT EXISTS idx_declarations_name ON declarations(name);
-            CREATE INDEX IF NOT EXISTS idx_declarations_path ON declarations(path);
-            CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, type);
-            CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, type);
-            CREATE TABLE IF NOT EXISTS index_metadata(
-                schema_version INTEGER NOT NULL,
-                scope_fingerprint TEXT NOT NULL,
-                parser_versions TEXT NOT NULL,
-                created TEXT NOT NULL,
-                updated TEXT NOT NULL
-            );
-            """
-        )
+        # Execute statements individually: executescript() implicitly commits and
+        # would make the v1→v2 drop/create migration non-atomic.
+        for statement in CodeGraph._SCHEMA_STATEMENTS:
+            conn.execute(statement)
+
+    @staticmethod
+    def _schema_version(conn: sqlite3.Connection) -> int | None:
+        try:
+            row = conn.execute(
+                "SELECT schema_version FROM index_metadata LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        return int(row[0]) if row is not None else None
+
+    @staticmethod
+    def _drop_schema(conn: sqlite3.Connection) -> None:
+        for table in ("edges", "declarations", "nodes", "files", "index_metadata"):
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
 
     def _parser_versions(self) -> str:
         """抽取能力指紋:進 index_metadata,ensure_fresh 比對不符 → full rebuild。
@@ -530,7 +594,8 @@ class CodeGraph:
             f"tree-sitter:{_dist('tree-sitter')};"
             f"c:{_dist('tree-sitter-c')}:{int(c_ok)};"
             f"cpp:{_dist('tree-sitter-cpp')}:{int(cpp_ok)};"
-            f"h:{_h_ext_lang()}"
+            f"h:{_h_ext_lang()};"
+            "resolver:conservative-2"
         )
 
     # -------- 抽取單檔 --------
@@ -552,14 +617,29 @@ class CodeGraph:
         backend = symbols[0].backend if symbols else "none"
         id_pairs = _assign_node_ids(rel_path, lang, symbols)
 
+        def graph_linkage(sym: Symbol) -> str:
+            if lang not in ("c", "cpp") or sym.type not in _CALLABLE_KINDS:
+                return "not_applicable"
+            # Regex/ctags fallback does not prove storage duration.  Treating
+            # absent metadata as external can create cross-file false resolves.
+            if sym.backend != "tree-sitter":
+                return "unknown"
+            linkage = sym.linkage or "external"
+            if linkage == "internal" and Path(rel_path).suffix.lower() in {
+                ".h", ".hpp", ".hh", ".hxx",
+            }:
+                signature = sym.signature or sym.context or ""
+                if re.search(r"\b(?:inline|__inline|__inline__)\b", signature):
+                    return "header_inline"
+            return linkage
+
         node_rows = [
             (
                 nid, rel_path, sym.type, sym.name,
                 sym.qualified_name or sym.name,
                 sym.start_line, sym.end_line,
                 sym.backend or "unknown", "exact",
-                sym.linkage or ("external" if lang in ("c", "cpp") and sym.type in _CALLABLE_KINDS
-                                else "not_applicable"),
+                graph_linkage(sym),
                 sym.condition,
             )
             for nid, sym in id_pairs
@@ -719,7 +799,20 @@ class CodeGraph:
             lang = _lang_for(rel_path)
             edge_backend = "python-ast" if lang == "python" else "tree-sitter"
             for raw, lineno, is_angle in relations["includes"]:
-                candidates = self._resolve_include(raw, all_files)
+                if is_angle:
+                    # A bare <stdint.h> does not identify the repo's
+                    # include-search path.  A unique vendored shim with that
+                    # basename must not impersonate the compiler/system header.
+                    # Namespaced <fw/service.h> is accepted only by exact path
+                    # suffix, never by basename alone.
+                    target = raw.replace("\\", "/").strip("/")
+                    candidates = sorted(
+                        path for path in all_files
+                        if "/" in target
+                        and (path == target or path.endswith(f"/{target}"))
+                    )
+                else:
+                    candidates = self._resolve_include(raw, all_files)
                 if len(candidates) == 1:
                     unique_includes.setdefault(rel_path, set()).add(candidates[0])
                     edges.append((
@@ -781,11 +874,32 @@ class CodeGraph:
             prefix = f"{guard} > "
             return condition[len(prefix):] if condition.startswith(prefix) else condition
 
-        def definition_candidates(name: str) -> list[str]:
-            bare = name.rsplit("::", 1)[-1]
-            return list(dict.fromkeys(
-                callable_by_qualified.get(name, []) + callable_by_name.get(bare, [])
-            ))
+        def scope_of(qualified: str) -> str:
+            return qualified.rpartition("::")[0]
+
+        def definition_candidates(name: str, caller_id: str, lang: str) -> list[str]:
+            if lang not in ("c", "cpp"):
+                bare = name.rsplit("::", 1)[-1]
+                return list(dict.fromkeys(
+                    callable_by_qualified.get(name, []) + callable_by_name.get(bare, [])
+                ))
+            if "::" in name:
+                # Qualified syntax is an exact assertion.  Falling back to the
+                # bare catalog lets `ns::f()` bind to an unrelated global f.
+                return list(dict.fromkeys(callable_by_qualified.get(name, [])))
+
+            caller_scope = scope_of(str(node_by_id[caller_id][4]))
+            out = []
+            for target in callable_by_name.get(name, []):
+                target_qualified = str(node_by_id[target][4])
+                target_scope = scope_of(target_qualified)
+                # A bare call can see a qualified method/namespace member only
+                # from the same lexical scope.  We do not model using-declarations,
+                # so every other case remains unresolved.
+                if target_scope and target_scope != caller_scope:
+                    continue
+                out.append(target)
+            return list(dict.fromkeys(out))
 
         def target_condition_ok(target_id: str, call_condition: str | None) -> bool:
             target_path = node_by_id[target_id][1]
@@ -795,11 +909,19 @@ class CodeGraph:
             return call_condition is not None and target_condition == call_condition
 
         def declaration_visible(path: str, decl: tuple, call_name: str,
-                                call_condition: str | None) -> bool:
+                                caller_id: str, call_condition: str | None) -> bool:
             name, qualified, _line, linkage, condition = decl
             if linkage == "internal":
                 return False
-            if call_name not in {name, qualified} and call_name.rsplit("::", 1)[-1] != name:
+            if "::" in call_name:
+                name_matches = qualified == call_name
+            else:
+                caller_scope = scope_of(str(node_by_id[caller_id][4]))
+                expected = f"{caller_scope}::{call_name}" if caller_scope else call_name
+                # Unqualified lookup from a class/namespace may still reach a
+                # global declaration after checking the local scope.
+                name_matches = qualified in {call_name, expected}
+            if not name_matches:
                 return False
             condition = effective_condition(path, condition)
             return condition is None or (call_condition is not None and condition == call_condition)
@@ -837,7 +959,7 @@ class CodeGraph:
                 if caller_id not in node_by_id:
                     continue
                 effective_call_condition = effective_condition(rel_path, call_condition)
-                targets = definition_candidates(name)
+                targets = definition_candidates(name, caller_id, lang)
                 if lang not in ("c", "cpp"):
                     if len(targets) == 1:
                         add_resolved(
@@ -881,52 +1003,34 @@ class CodeGraph:
                     )
                     continue
 
-                # caller 在 variant 外、同 TU 有多個互斥條件定義時，無 build
-                # variant 可證明唯一目標；保留候選但不得進確定 path。
-                if not same_file and len(same_file_all) > 1:
+                # Condition-incompatible definitions are still useful candidates,
+                # but even a singleton is not a proven target without build flags.
+                if same_file_all:
                     add_ambiguous(
                         caller_id, name, same_file_all, rel_path, lineno, backend,
-                        call_condition, "ambiguous_condition",
+                        call_condition, "conditional_candidate",
                     )
                     continue
 
-                # 2. caller 本檔或 direct/transitive repo header 的 visible prototype。
-                visible_files = {rel_path} | include_closure(rel_path)
-                has_visible_declaration = any(
-                    declaration_visible(path, decl, name, effective_call_condition)
-                    for path in visible_files
-                    for decl in declarations_by_file.get(path, [])
-                )
-                external = [
-                    target for target in targets
-                    if node_by_id[target][1] != rel_path
-                    and node_by_id[target][9] == "external"
-                    and target_condition_ok(target, effective_call_condition)
-                ]
-                if has_visible_declaration and len(external) == 1:
-                    add_resolved(
-                        caller_id, external[0], rel_path, lineno, backend,
-                        call_condition, "visible_declaration", "resolved",
-                    )
-                elif has_visible_declaration and len(external) > 1:
-                    add_ambiguous(
-                        caller_id, name, external, rel_path, lineno, backend,
-                        call_condition, "ambiguous_visible_declaration",
-                    )
-                elif has_visible_declaration:
-                    # declaration 可見但 repo 內沒有可證明的 external definition。
-                    add_unresolved(
-                        caller_id, name, rel_path, lineno, backend, call_condition
-                    )
-                # 3. C++ exact qualified name；internal definition 仍不得跨檔。
-                elif lang == "cpp" and "::" in name:
-                    qualified = [
-                        target for target in callable_by_qualified.get(name, [])
+                # 2. Qualified C++ syntax may only bind an exact qualified
+                # definition.  Do this before prototype handling so a global bare
+                # declaration cannot consume `namespace::method()`.
+                if lang == "cpp" and "::" in name:
+                    qualified_all = [
+                        target for target in targets
                         if node_by_id[target][1] != rel_path
-                        and node_by_id[target][9] != "internal"
-                        and target_condition_ok(target, effective_call_condition)
+                        and node_by_id[target][9] == "external"
                     ]
-                    if len(qualified) == 1:
+                    qualified = [
+                        target for target in qualified_all
+                        if target_condition_ok(target, effective_call_condition)
+                    ]
+                    if effective_call_condition is None and len(qualified_all) > 1:
+                        add_ambiguous(
+                            caller_id, name, qualified_all, rel_path, lineno, backend,
+                            call_condition, "ambiguous_condition",
+                        )
+                    elif len(qualified) == 1:
                         add_resolved(
                             caller_id, qualified[0], rel_path, lineno, backend,
                             call_condition, "qualified",
@@ -936,14 +1040,107 @@ class CodeGraph:
                             caller_id, name, qualified, rel_path, lineno, backend,
                             call_condition, "ambiguous_qualified",
                         )
+                    elif qualified_all:
+                        add_ambiguous(
+                            caller_id, name, qualified_all, rel_path, lineno, backend,
+                            call_condition, "conditional_candidate",
+                        )
                     else:
                         add_unresolved(
                             caller_id, name, rel_path, lineno, backend, call_condition
                         )
+                    continue
+
+                # 3. Definitions in an actually included static-inline header are
+                # part of this translation unit.  They have internal linkage, but
+                # unlike a static function in another .c file they are visible here.
+                visible_files = {rel_path} | include_closure(rel_path)
+                header_inline_all = [
+                    target for target in targets
+                    if node_by_id[target][1] in visible_files - {rel_path}
+                    and node_by_id[target][9] == "header_inline"
+                ]
+                header_inline = [
+                    target for target in header_inline_all
+                    if target_condition_ok(target, effective_call_condition)
+                ]
+                if effective_call_condition is None and len(header_inline_all) > 1:
+                    add_ambiguous(
+                        caller_id, name, header_inline_all, rel_path, lineno, backend,
+                        call_condition, "ambiguous_header_inline",
+                    )
+                    continue
+                if len(header_inline) == 1:
+                    add_resolved(
+                        caller_id, header_inline[0], rel_path, lineno, backend,
+                        call_condition, "visible_header_inline",
+                    )
+                    continue
+                if len(header_inline) > 1:
+                    add_ambiguous(
+                        caller_id, name, header_inline, rel_path, lineno, backend,
+                        call_condition, "ambiguous_header_inline",
+                    )
+                    continue
+                if header_inline_all:
+                    add_ambiguous(
+                        caller_id, name, header_inline_all, rel_path, lineno, backend,
+                        call_condition, "conditional_candidate",
+                    )
+                    continue
+
+                # 4. caller 本檔或 direct/transitive repo header 的 visible prototype。
+                has_visible_declaration = any(
+                    declaration_visible(
+                        path, decl, name, caller_id, effective_call_condition
+                    )
+                    for path in visible_files
+                    for decl in declarations_by_file.get(path, [])
+                )
+                external_all = [
+                    target for target in targets
+                    if node_by_id[target][1] != rel_path
+                    and node_by_id[target][9] == "external"
+                ]
+                external = [
+                    target for target in external_all
+                    if target_condition_ok(target, effective_call_condition)
+                ]
+                if has_visible_declaration and effective_call_condition is None \
+                        and len(external_all) > 1:
+                    add_ambiguous(
+                        caller_id, name, external_all, rel_path, lineno, backend,
+                        call_condition, "ambiguous_condition",
+                    )
+                elif has_visible_declaration and len(external) == 1:
+                    add_resolved(
+                        caller_id, external[0], rel_path, lineno, backend,
+                        call_condition, "visible_declaration", "resolved",
+                    )
+                elif has_visible_declaration and len(external) > 1:
+                    add_ambiguous(
+                        caller_id, name, external, rel_path, lineno, backend,
+                        call_condition, "ambiguous_visible_declaration",
+                    )
+                elif has_visible_declaration and external_all:
+                    add_ambiguous(
+                        caller_id, name, external_all, rel_path, lineno, backend,
+                        call_condition, "conditional_candidate",
+                    )
+                elif has_visible_declaration:
+                    # declaration 可見但 repo 內沒有可證明的 external definition。
+                    add_unresolved(
+                        caller_id, name, rel_path, lineno, backend, call_condition
+                    )
                 elif len(external) > 1:
                     add_ambiguous(
                         caller_id, name, external, rel_path, lineno, backend,
                         call_condition, "ambiguous_syntactic_candidates",
+                    )
+                elif external_all and not external:
+                    add_ambiguous(
+                        caller_id, name, external_all, rel_path, lineno, backend,
+                        call_condition, "conditional_candidate",
                     )
                 else:
                     add_unresolved(
@@ -1020,13 +1217,19 @@ class CodeGraph:
         conn = self._connect()
         try:
             conn.execute("PRAGMA journal_mode=WAL")
-            self._create_schema(conn)
+            previous_schema = self._schema_version(conn)
             file_rows, node_rows, relations = self._collect_all(files)
             edges = self._edge_rows(file_rows, node_rows, relations)
             declarations = self._declaration_rows(relations)
             now = time.strftime("%Y-%m-%dT%H:%M:%S")
             conn.execute("BEGIN IMMEDIATE")
             try:
+                if previous_schema != GRAPH_SCHEMA_VERSION:
+                    # DDL is transactional in SQLite when issued statement by
+                    # statement.  A failed upgrade rolls back to the readable v1
+                    # graph instead of leaving a half-created v2 database.
+                    self._drop_schema(conn)
+                self._create_schema(conn)
                 conn.execute("DELETE FROM edges")
                 conn.execute("DELETE FROM declarations")
                 conn.execute("DELETE FROM nodes")
@@ -1048,7 +1251,9 @@ class CodeGraph:
         finally:
             conn.close()
         if verbose:
-            print(f"[CODE_GRAPH] rebuilt in place: {len(node_rows)} nodes", file=sys.stderr)
+            action = "migrated and rebuilt" if previous_schema != GRAPH_SCHEMA_VERSION \
+                else "rebuilt in place"
+            print(f"[CODE_GRAPH] {action}: {len(node_rows)} nodes", file=sys.stderr)
 
     # -------- staleness / 增量(§7.5) --------
     def _db_ready(self) -> bool:
@@ -1086,8 +1291,9 @@ class CodeGraph:
         if not self._db_ready():
             if self.db_file.exists():
                 raise CodeGraphError(
-                    "code graph 存在但 schema 不符或損壞;砍掉 "
-                    f"{self.db_file.name} 後重建(mode='semantic' 不受影響)"
+                    "code graph 存在但 schema 不符或損壞;請執行 "
+                    f"`{self.build_command()}` 原地升級/重建"
+                    "(mode='semantic' 不受影響)"
                 )
             raise CodeGraphError(
                 "code graph 尚未建立(mode='semantic' 不受影響)。"
@@ -1164,9 +1370,15 @@ class CodeGraph:
             f"[CODE_GRAPH] stale ({len(changed)} changed, {len(deleted)} deleted); "
             "incremental update", file=sys.stderr,
         )
-        self._incremental_update(files, changed, deleted)
+        if self._incremental_update(files, changed, deleted):
+            print(
+                "[CODE_GRAPH] Python catalog change reached C/C++ callers; full rebuild",
+                file=sys.stderr,
+            )
+            self.build(verbose=False)
 
-    def _incremental_update(self, files: dict, changed: list[str], deleted: list[str]) -> None:
+    def _incremental_update(self, files: dict, changed: list[str],
+                            deleted: list[str]) -> bool:
         """單一 transaction 涵蓋「變更檔 + 1-hop 反向依賴檔 + 同名 caller 檔」
         的 delete+insert。
 
@@ -1249,6 +1461,15 @@ class CodeGraph:
                         node_rows.extend(more_nodes)
                         relations.update(more_relations)
 
+                # A Python-only catalog delta can pull an unchanged C caller into
+                # the re-resolution set via a colliding function name.  Resolving
+                # that caller from a partial relation set omits declarations and
+                # transitive include closure, silently degrading a proven edge.
+                # Return before mutating the DB; the caller rebuilds from the full
+                # snapshot after this lock/connection are released.
+                if any(_lang_for(rel) in {"c", "cpp"} for rel in affected if rel in files):
+                    return True
+
                 all_dirty = sorted(affected)
                 ph = ",".join("?" * len(all_dirty))
 
@@ -1323,6 +1544,7 @@ class CodeGraph:
                 conn.close()
         finally:
             fs_safety.release_file_lock(lock_fd)
+        return False
 
     # ============================================================
     # Traversal API(§7.4;內部,不開新 MCP tool)

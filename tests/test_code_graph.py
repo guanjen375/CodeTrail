@@ -306,6 +306,51 @@ def test_corrupt_db_gives_explicit_error(tmp_path):
         fresh.find_nodes("entry")
 
 
+def test_explicit_build_migrates_v1_graph_in_place(tmp_path):
+    """The documented rebuild command must upgrade a pre-v2 DB without deletion."""
+    _write_py_repo(tmp_path)
+    graph = CodeGraph(str(tmp_path))
+    conn = sqlite3.connect(graph.db_file)
+    conn.executescript(
+        """
+        CREATE TABLE files(path TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
+                           lang TEXT NOT NULL, backend TEXT NOT NULL);
+        CREATE TABLE nodes(id TEXT PRIMARY KEY, path TEXT NOT NULL, kind TEXT NOT NULL,
+                           name TEXT NOT NULL, qualified_name TEXT NOT NULL,
+                           start_line INTEGER NOT NULL, end_line INTEGER NOT NULL,
+                           backend TEXT NOT NULL, confidence TEXT NOT NULL);
+        CREATE TABLE edges(src_kind TEXT NOT NULL, src_id TEXT NOT NULL, dst_kind TEXT,
+                           dst_id TEXT, unresolved_target TEXT, ambiguity_group TEXT,
+                           type TEXT NOT NULL, evidence_path TEXT NOT NULL,
+                           evidence_line INTEGER NOT NULL, backend TEXT NOT NULL,
+                           confidence TEXT NOT NULL);
+        CREATE TABLE index_metadata(schema_version INTEGER NOT NULL,
+                           scope_fingerprint TEXT NOT NULL,
+                           parser_versions TEXT NOT NULL,
+                           created TEXT NOT NULL, updated TEXT NOT NULL);
+        INSERT INTO index_metadata VALUES (1, 'legacy', 'legacy', 'old', 'old');
+        """
+    )
+    conn.close()
+
+    graph.build()
+
+    conn = sqlite3.connect(graph.db_file)
+    try:
+        assert conn.execute(
+            "SELECT schema_version FROM index_metadata"
+        ).fetchone() == (code_graph.GRAPH_SCHEMA_VERSION,)
+        assert {row[1] for row in conn.execute("PRAGMA table_info(nodes)")} >= {
+            "linkage", "condition"
+        }
+        assert conn.execute(
+            "SELECT COUNT(*) FROM declarations"
+        ).fetchone()[0] >= 0
+    finally:
+        conn.close()
+    assert graph.find_nodes("entry")
+
+
 def test_traversal_filters_out_of_scope_evidence(tmp_path):
     _write_py_repo(tmp_path)
     g = CodeGraph(str(tmp_path))

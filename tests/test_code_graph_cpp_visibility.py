@@ -210,6 +210,160 @@ def test_cpp_exact_qualified_name_is_a_conservative_fallback(tmp_path):
     assert edge["resolution_basis"] == "qualified"
 
 
+def test_cpp_bare_call_does_not_resolve_to_unrelated_method(tmp_path):
+    _write(
+        tmp_path,
+        "same.cpp",
+        "class Device { public: static int reset(void) { return 1; } };\n"
+        "int boot(void) { return reset(); }\n",
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "same.cpp", "boot")
+    assert edge["resolved"] is False
+    assert edge["unresolved_target"] == "reset"
+
+
+def test_cpp_bare_call_within_same_class_still_resolves_method(tmp_path):
+    _write(
+        tmp_path,
+        "same.cpp",
+        "class Device { public:\n"
+        "  static int reset(void) { return 1; }\n"
+        "  static int boot(void) { return reset(); }\n"
+        "};\n",
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "same.cpp", "boot")
+    assert edge["resolved"] is True
+    assert edge["dst_name"] == "reset"
+    assert edge["resolution_basis"] == "same_file"
+
+
+def test_cpp_method_can_resolve_visible_global_function(tmp_path):
+    _write(tmp_path, "api.h", "int global_reset(void);\n")
+    _write(tmp_path, "impl.cpp", "int global_reset(void) { return 1; }\n")
+    _write(
+        tmp_path,
+        "user.cpp",
+        '#include "api.h"\n'
+        "class Device { public: static int boot(void) { return global_reset(); } };\n",
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "user.cpp", "boot")
+    assert edge["resolved"] is True
+    assert edge["dst_name"] == "global_reset"
+    assert edge["resolution_basis"] == "visible_declaration"
+
+
+def test_cpp_qualified_call_is_not_consumed_by_bare_declaration(tmp_path):
+    _write(tmp_path, "api.h", "int commit(void);\n")
+    _write(tmp_path, "impl.cpp", "int commit(void) { return 1; }\n")
+    _write(
+        tmp_path,
+        "user.cpp",
+        '#include "api.h"\nint run(void) { return service::commit(); }\n',
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "user.cpp", "run")
+    assert edge["resolved"] is False
+    assert edge["unresolved_target"] == "service::commit"
+
+
+def test_bare_angle_include_does_not_resolve_to_vendored_shim(tmp_path):
+    _write(tmp_path, "include/stdint.h", "typedef unsigned fake_uint32_t;\n")
+    _write(tmp_path, "src/user.c", "#include <stdint.h>\nint run(void) { return 0; }\n")
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    assert graph.file_includes("src/user.c") == []
+    rows = graph.file_neighbors("src/user.c", limit=20)["edges"]
+    assert not any(edge["resolved"] for edge in rows)
+
+
+def test_single_conditional_definition_remains_an_explicit_candidate(tmp_path):
+    _write(
+        tmp_path,
+        "src/conditional.c",
+        "#ifdef FEATURE_X\n"
+        "int optional_impl(void) { return 1; }\n"
+        "#endif\n"
+        "int run(void) { return optional_impl(); }\n",
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "src/conditional.c", "run")
+    assert edge["resolved"] is False
+    assert edge["dst_name"] == "optional_impl"
+    assert edge["ambiguity_group"] is not None
+    assert edge["resolution_basis"] == "conditional_candidate"
+
+
+def test_weak_default_block_is_not_treated_as_include_guard(tmp_path):
+    _write(
+        tmp_path,
+        "src/defaults.c",
+        "#ifndef HAVE_PLATFORM_IMPL\n"
+        "#define HAVE_PLATFORM_IMPL\n"
+        "int platform_impl(void) { return 1; }\n"
+        "#endif\n"
+        "int run(void) { return platform_impl(); }\n",
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "src/defaults.c", "run")
+    assert edge["resolved"] is False
+    assert edge["resolution_basis"] == "conditional_candidate"
+
+
+def test_visible_header_static_inline_resolves_for_including_translation_unit(tmp_path):
+    _write(
+        tmp_path,
+        "include/registers.h",
+        "#ifndef REGISTERS_H\n#define REGISTERS_H\n"
+        "static inline int read_status(void) { return 7; }\n"
+        "#endif\n",
+    )
+    _write(
+        tmp_path,
+        "src/user.c",
+        '#include "registers.h"\nint poll(void) { return read_status(); }\n',
+    )
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "src/user.c", "poll")
+    assert edge["resolved"] is True
+    assert edge["dst_name"] == "read_status"
+    assert edge["resolution_basis"] == "visible_header_inline"
+
+
+def test_python_incremental_change_cannot_degrade_c_resolution(tmp_path):
+    _write_equivalence_repo(tmp_path)
+    _write(tmp_path, "helpers.py", "def unrelated():\n    return 0\n")
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+    [before] = _source_edges(graph, "src/user.c", "user_entry")
+    assert before["resolved"] is True
+
+    _write(tmp_path, "helpers.py", "def api_call():\n    return 0\n")
+    code_rag.invalidate_scan_cache(tmp_path)
+    graph.ensure_fresh()
+
+    [after] = _source_edges(graph, "src/user.c", "user_entry")
+    assert after["resolved"] is True
+    assert after["resolution_basis"] == "visible_declaration"
+
+
 def _write_equivalence_repo(root: Path) -> None:
     _write(root, "include/api.h", "int api_call(void);\n")
     _write(root, "src/api.c", "int api_call(void) { return 1; }\n")

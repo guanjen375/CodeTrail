@@ -29,6 +29,11 @@ def test_max_chars_accepts_documented_range(value):
     assert code_context.validate_max_chars(value) == value
 
 
+def test_two_character_chinese_query_term_is_kept_but_stop_words_are_filtered():
+    assert code_context.query_terms("中斷") == ["中斷"]
+    assert code_context.query_terms("哪個") == []
+
+
 def test_overlapping_ranges_merge_and_preserve_reasons():
     merged = code_context.merge_candidate_ranges([
         EvidenceCandidate("src/a.c", 10, 30, "seed", ("semantic",), 100, 12),
@@ -123,6 +128,98 @@ def test_safe_lexical_hits_support_config_and_filter_unscoped_paths(tmp_path):
     )
     assert {hit["path"] for hit in hits} == {"config/layout.cfg"}
     assert all("text" not in hit for hit in hits), "grep source text must not leak into metadata"
+
+
+def test_lexical_hit_parser_does_not_treat_colon_digits_in_match_text_as_line_number(
+    tmp_path,
+):
+    root = tmp_path / "repo"
+    source = root / "src/value.c"
+    source.parent.mkdir(parents=True)
+    source.write_text("int target = 123;\n", encoding="utf-8")
+    executor = ToolExecutor(str(root))
+    executor.grep = lambda *args, **kwargs: (
+        f"=== rg 'target' (1 matches) ===\n{source}:1:value:123: target"
+    )
+
+    assert code_context.collect_safe_lexical_hits(
+        executor, "target", {"src/value.c"}
+    ) == [{"path": "src/value.c", "line": 1, "terms": ["target"]}]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows filenames cannot contain colon")
+def test_lexical_hit_parser_accepts_safe_path_containing_colon_digits(tmp_path):
+    root = tmp_path / "repo"
+    source = root / "src/part:123:value.c"
+    source.parent.mkdir(parents=True)
+    source.write_text("int target = 1;\n", encoding="utf-8")
+    executor = ToolExecutor(str(root))
+    executor.grep = lambda *args, **kwargs: f"{source}:1:int target = 1;"
+
+    assert code_context.collect_safe_lexical_hits(
+        executor, "target", {"src/part:123:value.c"}
+    ) == [{"path": "src/part:123:value.c", "line": 1, "terms": ["target"]}]
+
+
+def test_candidate_limit_is_not_reported_as_character_budget_exhaustion():
+    semantic = [
+        {"path": f"src/f{i}.c", "symbol": f"f{i}", "line": 1, "end_line": 1}
+        for i in range(code_context._MAX_CANDIDATES + 5)
+    ]
+
+    def read_window(path, start, end):
+        return f"=== {path} (行 1-1 / 共 1 行) ===\n   1 | int {Path(path).stem}(void);\n"
+
+    bundle = code_context.build_code_context(
+        query="functions",
+        semantic_items=semantic,
+        index_items=[],
+        allowed_paths={item["path"] for item in semantic},
+        read_window=read_window,
+        max_chars=30000,
+        graph=None,
+        graph_status="unavailable",
+    )
+    reasons = [row["reason"] for row in bundle["uncertainties"]]
+    assert bundle["truncated"] is True
+    assert any("candidate limit" in reason for reason in reasons)
+    assert not any("character budget" in reason for reason in reasons)
+
+
+def test_uncertainties_are_deduplicated_and_bounded_with_explicit_marker():
+    rows = [
+        {"target": f"target_{i}", "reason": "unresolved"}
+        for i in range(code_context._MAX_UNCERTAINTIES + 20)
+    ]
+    bounded = code_context._dedupe_uncertainties(rows)
+    assert len(bounded) == code_context._MAX_UNCERTAINTIES
+    assert "uncertainty limit" in bounded[-1]["reason"]
+
+
+def test_graph_traversal_truncation_is_reported_as_uncertainty():
+    class TruncatedGraph:
+        def find_nodes(self, name, limit=20):
+            return [{"id": "seed", "path": "src/a.c", "start_line": 1}]
+
+        def neighbors(self, *args, **kwargs):
+            return {"nodes": [], "edges": [], "truncated": True}
+
+        def file_neighbors(self, *args, **kwargs):
+            return {"files": ["src/a.c"], "edges": [], "truncated": True}
+
+    bundle = code_context.build_code_context(
+        query="seed",
+        semantic_items=[{"path": "src/a.c", "symbol": "seed", "line": 1}],
+        index_items=[],
+        allowed_paths={"src/a.c"},
+        read_window=lambda path, start, end: (
+            f"=== {path} (行 1-1 / 共 1 行) ===\n   1 | int seed(void);\n"
+        ),
+        max_chars=2000,
+        graph=TruncatedGraph(),
+    )
+    assert any("graph traversal limit" in row["reason"]
+               for row in bundle["uncertainties"])
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink containment")

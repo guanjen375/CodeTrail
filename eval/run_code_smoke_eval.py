@@ -30,6 +30,8 @@ import statistics
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -95,10 +97,25 @@ def _poison_get_session():
     return _PoisonSession()
 
 
-def install_offline_stubs() -> None:
+@contextmanager
+def install_offline_stubs():
+    """Temporarily install deterministic offline clients and always restore them.
+
+    The eval also runs inside the normal pytest process.  Mutating these module
+    globals without a finally block makes later endpoint/reranker tests observe
+    poison clients and a disabled reranker when tests run in a single shard.
+    """
     import code_rag
     import http_client
     import llama_client
+
+    originals = {
+        (llama_client, "get_session"): llama_client.get_session,
+        (http_client, "get_session"): http_client.get_session,
+        (llama_client, "embed_one"): llama_client.embed_one,
+        (llama_client, "embed_batch"): llama_client.embed_batch,
+        (code_rag, "USE_RERANKER"): code_rag.USE_RERANKER,
+    }
 
     # Poison 兩個入口:llama_client 已用 from-import 存了自己的 reference,
     # 只 patch http_client.get_session 無效;兩個都 patch 防未來新 call site。
@@ -116,6 +133,22 @@ def install_offline_stubs() -> None:
 
     llama_client.embed_one = _stub_embed_one
     llama_client.embed_batch = _stub_embed_batch
+
+    try:
+        yield
+    finally:
+        for (module, name), value in originals.items():
+            setattr(module, name, value)
+
+
+def _with_offline_stubs(func):
+    """Keep the CLI runner's large body inside the scoped stub lifecycle."""
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        with install_offline_stubs():
+            return func(*args, **kwargs)
+
+    return wrapped
 
 
 # ============================================================
@@ -586,9 +619,8 @@ def evaluate_context_report(cases: list[dict], rags: dict, graphs: dict,
 # ============================================================
 # 主流程
 # ============================================================
+@_with_offline_stubs
 def run_offline(record_baseline: bool) -> int:
-    install_offline_stubs()
-
     data = load_cases()
     for name, info in data["repos"].items():
         _TRUE_EDGES_BY_REPO[name] = set(info["true_call_edges"])
