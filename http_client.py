@@ -28,8 +28,14 @@ def create_session() -> requests.Session:
     1. 自動重試：網路錯誤或 5xx 錯誤時自動重試
     2. 指數退避：重試間隔逐次增加
     3. 連接池：復用 TCP 連接，減少握手開銷
+    4. transport hardening：不讀環境 proxy / .netrc（trust_env=False），
+       不跟隨 redirect（max_redirects=0；呼叫端另以 allow_redirects=False
+       + 3xx fail-loud 把守）。prompt 可能含 NDA 內容，不能被 env proxy
+       或 redirect 靜默帶去別的 host。
     """
     session = requests.Session()
+    session.trust_env = False
+    session.max_redirects = 0
 
     retry_strategy = Retry(
         total=RETRY_TOTAL,

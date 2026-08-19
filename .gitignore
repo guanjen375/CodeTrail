@@ -22,10 +22,20 @@ CLAUDE.md
 # 快取
 .code_rag_cache.json
 .code_rag_cache_meta.json
+.code_rag_cache_meta.json.tmp*
 .code_rag_cache_emb.npz
+.code_rag_cache_emb.npz.tmp*
+.code_rag_cache.lock
 .rag_cache/
 .rag_embedding_cache.json
 *.egg-info/
+
+# Code graph(SQLite + WAL sidecar + staging + 鎖;§7.6)
+.code_rag_graph.sqlite3
+.code_rag_graph.sqlite3-wal
+.code_rag_graph.sqlite3-shm
+.code_rag_graph.sqlite3.tmp*
+.code_rag_graph.lock
 
 # OpenCode session 紀錄（可能含問題/回答的快取，勿提交）
 .opencode/

@@ -18,6 +18,7 @@
 |---|---|---|
 | 先看 repo 長什麼樣 | 請用工具 `list_dir` 看專案結構，找 entry point、測試和設定檔。 | `list_dir(...)` |
 | 不知道程式在哪 | 請先用工具 `code_rag_search` 搜尋「初始化流程」，再用工具 `read_file` 讀最相關檔案。 | `code_rag_search(...)`、`read_file(...)` |
+| 想看呼叫鏈 | 請用工具 `code_rag_search`,mode 設 "path",query 寫 "main -> uart_send",把每一步的檔案與行號列出來。 | `code_rag_search(query="main -> uart_send", mode="path")` |
 | 找某個字串或錯誤訊息 | 請用工具 `grep_code` 搜尋錯誤訊息「panic: xxx」，範圍限 C/C++ 檔，並顯示上下文。 | `grep_code(...)` |
 | 讀一個已知檔案 | 請用工具 `file_info` 看 `src/main.py` 大小，再用工具 `read_file` 讀前 120 行。 | `file_info(...)`、`read_file(...)` |
 | 查已匯入的 spec | 請用工具 `query_knowledge` 查 reset timing 限制，回答要附 REF。 | `query_knowledge(...)` |
@@ -36,7 +37,7 @@
 | 類型 | 工具 | 白話用途 |
 |---|---|---|
 | 專案探索 | `list_dir(path=".", depth=2)` | 看目錄樹，不要叫模型跑 `ls` |
-| 專案探索 | `code_rag_search(query, top_k=5)` | 用「這段程式在做什麼」去找可能的函式/class |
+| 專案探索 | `code_rag_search(query, top_k=5, mode="semantic", hops=1, include_evidence=False)` | 用「這段程式在做什麼」去找可能的函式/class。`mode="neighbors"`(query 放 symbol 名)看某符號的 1–2 hop 呼叫關係;`mode="path"`(query 寫 `"SRC -> DST"`)拿跨檔案呼叫鏈,每一步都附 `檔:行` 證據;`include_evidence=True` 讓 semantic 結果多帶分數組成 / parser backend / graph 1-hop 關係。graph 對 C/C++(tree-sitter)與 Python 抽 definitions / includes / calls;function pointer 與 macro 間接呼叫會誠實標 unresolved,不亂猜目標 |
 | 專案探索 | `grep_code(pattern, path=".", include=None, context=0)` | 搜錯誤訊息、函式名、設定名 |
 | 專案探索 | `file_info(path)` | 讀檔前先看大小，避免一次塞爆 context |
 | 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=50000)` | 讀檔案內容，長檔要分段 |
@@ -57,6 +58,8 @@
 ### 使用原則
 
 - 找程式碼時，先請模型用工具 `code_rag_search` 或 `grep_code`，再用工具 `read_file`。
+- 問「誰呼叫了 X」「X 怎麼一路呼叫到 Y」「這個檔直接 include 了誰」時,用 `code_rag_search` 的 `mode="neighbors"` / `mode="path"`;回傳的關係每一步都有 `檔:行` 證據,unresolved(function pointer / macro 間接呼叫)會明講。graph 在查詢時自動偵測檔案變更並增量更新。
+- 檔案變更偵測有一個 30 秒的快照窗(`AICODE_CODE_RAG_REFRESH_TTL`,設 0 關閉):透過 CodeTrail 工具(`apply_patch` / `run_command` / `run_lint`)寫檔會立即失效重掃;**在外部編輯器改檔**則最長 30 秒內的查詢可能還看到舊索引,屬既知取捨。
 - 長檔先用工具 `file_info` 看大小，再要求工具 `read_file` 分段讀。
 - 查 spec 先用工具 `query_knowledge`；數字、限制、預設值這類答錯很糟的題目，用工具 `query_knowledge_strict`。多份相似版本並存時傳 `source="檔名"`，filter 會在 top-k 前套用。
 - 外部檔案先用工具 `import_external_file`，再用工具 `analyze_file`、`ingest_document` 或 `read_file` 處理匯入後路徑。

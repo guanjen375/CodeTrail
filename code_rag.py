@@ -13,8 +13,11 @@ import os
 import re
 import sys
 import json
+import tempfile
 import time as _time
 import hashlib
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from functools import lru_cache
 
@@ -34,18 +37,47 @@ from config import (
     LLAMA_EMBED_BASE_URL, LLAMA_RERANK_BASE_URL,
     USE_RERANKER, RERANKER_MODEL, RERANKER_ALWAYS_ON
 )
+import fs_safety
 import llama_client
 from index_scope import load_index_scope, walk_index_files
 
 # 導入 AST 解析器
 from ast_parser import parse_file, get_parser_status
 
+# Cache schema 版本。v2(2026-08-19):generation 欄位(generation_id/npz_md5/
+# row_count)+ index entry 的 qualified_name/backend(§5-2 與 §6.2-6 合併一次
+# bump,只重建一次)。schema 不符 → stderr 說明 + 安全重建。
+CODE_RAG_CACHE_SCHEMA_VERSION = 2
+
+# 無 parser 的副檔名不入 symbol 掃描(§5-5):.txt/.md 沒有任何 symbol parser,
+# 進索引只產生零 symbol 的掃描 / hash 成本。刻意不動 CODE_EXTENSIONS ——
+# grep_code / list_dir 的可見範圍不變。
+CODE_RAG_SKIP_EXTENSIONS = frozenset({".txt", ".md"})
+
 # 索引專用的掃描快取。刻意**不**共用 utils 的 _SCAN_CACHE:那份是 agent.py 的
 # scan_project_metadata 在用,成員資格規則和索引不同,而且沒有 scope
 # fingerprint —— §7 要求 fingerprint 缺失或不一致時禁止 fast path,所以那份
 # 快取一律不可信。key 帶 fingerprint,scope 一改就自然失效。
+# 快照存 {rel_path: hash}(§5-3):TTL 內直接回快照,零 walk、零
+# compute_file_hash。TTL 由 config.CODE_RAG_REFRESH_TTL_SECONDS 控制(0=關閉);
+# MCP 的寫入工具(apply_patch / run_command / run_lint fix)在 finally 呼叫
+# invalidate_scan_cache() 主動失效。
 _INDEX_SCAN_CACHE: dict[tuple[str, str], dict] = {}
-_INDEX_SCAN_CACHE_TTL = 30  # 秒
+
+
+def invalidate_scan_cache(root: str | Path | None = None) -> None:
+    """清掉掃描快照。root=None 清全部;否則只清該 root(不分 fingerprint)。
+
+    寫入類工具(patch / command / lint fix)完成後呼叫 —— 不依 exit code 或
+    回傳文字判斷:patch 可能寫入後才驗證失敗,失敗的 formatter/build 也可能
+    已改檔,所以一律 finally 失效。
+    """
+    if root is None:
+        _INDEX_SCAN_CACHE.clear()
+        return
+    resolved = str(Path(root).resolve())
+    for key in [k for k in _INDEX_SCAN_CACHE if k[0] == resolved]:
+        del _INDEX_SCAN_CACHE[key]
 
 
 # 小檔走 content hash 的門檻 — 256 KiB 以下直接 hash 內容,
@@ -75,6 +107,43 @@ def compute_file_hash(filepath: Path, max_bytes: int = CONTENT_HASH_MAX_BYTES) -
 def _normalize_text_for_cache(text: str) -> str:
     """正規化文字以提高 cache 命中率"""
     return ' '.join(text.split())
+
+
+def plan_embed_batches(texts: list[str], max_items: int, max_chars: int) -> list[list[int]]:
+    """把 texts 依雙預算(筆數 ≤ max_items 且總 chars ≤ max_chars)切成 index 批。
+
+    保序;單筆超過 max_chars 時自成一批(不丟棄、不截斷 —— server 端自己有
+    context 上限,超長由它 fail-loud)。module-level 讓測試能直接鎖切分結果。
+    """
+    batches: list[list[int]] = []
+    current: list[int] = []
+    current_chars = 0
+    for i, text in enumerate(texts):
+        n = len(text)
+        if current and (len(current) >= max_items or current_chars + n > max_chars):
+            batches.append(current)
+            current = []
+            current_chars = 0
+        current.append(i)
+        current_chars += n
+    if current:
+        batches.append(current)
+    return batches
+
+
+@dataclass
+class RankedCandidate:
+    """單一 query 的排序結果(query-local,絕不寫回 self.index 的持久 item)。
+
+    rerank_score 是 None ⇔ 本次沒有實際執行 rerank;0.0 是有效的 cross-encoder
+    低分,不得當「沒有分數」。final_score = rerank_score if score_source=="rerank"
+    else combined_score;對外 score = round(final_score, 3)。
+    """
+    item: dict
+    rerank_score: float | None
+    combined_score: float
+    final_score: float
+    score_source: str  # "rerank" | "fusion"
 
 
 @lru_cache(maxsize=256)
@@ -121,8 +190,8 @@ class CodeRAG:
         cache_base = CODE_RAG_CACHE_FILE.replace('.json', '')
         self.cache_meta_file = self.folder / f"{cache_base}_meta.json"
         self.cache_emb_file = self.folder / f"{cache_base}_emb.npz"
-        # 舊版快取檔案（用於向後相容）
-        self.legacy_cache_file = self.folder / CODE_RAG_CACHE_FILE
+        # 單一 writer 鎖(§5-2);建立走 fs_safety 的 symlink 防線
+        self.cache_lock_file = self.folder / f"{cache_base}.lock"
         self.index = []
         self.embeddings = None  # numpy array, shape: (N, embedding_dim)
         # 增量快取：{file_rel_path: {"hash": str, "symbols": list, "embeddings": list}}
@@ -140,22 +209,6 @@ class CodeRAG:
         """計算單一檔案的 hash（用於增量快取驗證）。見 compute_file_hash。"""
         return compute_file_hash(filepath, self._CONTENT_HASH_MAX_BYTES)
 
-    def _compute_folder_hash(self) -> str:
-        """計算資料夾的 hash（用於舊格式快取驗證，向後相容）
-
-        成員資格與索引本身共用同一個判定（should_index_file），否則「有沒有變」
-        和「有沒有進索引」會各講各話。
-        """
-        files = []
-        for filepath, rel_path in walk_index_files(self.scope):
-            try:
-                stat = filepath.stat()
-                files.append(f"{rel_path}:{stat.st_size}:{stat.st_mtime}")
-            except OSError:
-                pass
-        files.sort()
-        return hashlib.md5("\n".join(files).encode()).hexdigest()
-
     def _scan_code_files(self, *, force_refresh: bool = False) -> dict:
         """掃描進索引的程式碼檔案，返回 {rel_path: {"filepath": Path, "hash": str}}
 
@@ -163,29 +216,35 @@ class CodeRAG:
         三態只是剪枝。fast path 的 key 綁 scope fingerprint,而且拿回來的每一條
         cached path 仍然要重過 should_index_file（§7.3:任何來源的 cached path
         都不得直接信任）。
+
+        TTL 快照(§5-3):TTL 內直接回快照的 {rel: {filepath, hash}} shallow
+        copy —— 零 os.walk、零 compute_file_hash。快照過期 / TTL=0 /
+        invalidate_scan_cache() 之後才 fresh 掃描。
         """
+        ttl = int(getattr(config, "CODE_RAG_REFRESH_TTL_SECONDS", 30))
         cache_key = (str(self.folder), self.scope.fingerprint)
-        if not force_refresh:
+        if not force_refresh and ttl > 0:
             cached = _INDEX_SCAN_CACHE.get(cache_key)
-            if cached is not None and _time.time() - cached["timestamp"] < _INDEX_SCAN_CACHE_TTL:
+            if cached is not None and _time.time() - cached["timestamp"] < ttl:
                 result = {}
-                for rel_path in cached["paths"]:
+                for rel_path, file_hash in cached["entries"].items():
+                    # 既有不變式:cached path 一律重過 should_index_file(純記憶體)
                     if not self.scope.should_index_file(rel_path):
                         continue
-                    filepath = self.folder / rel_path
-                    file_hash = self._compute_file_hash(filepath)
-                    if file_hash:
-                        result[rel_path] = {"filepath": filepath, "hash": file_hash}
+                    result[rel_path] = {"filepath": self.folder / rel_path, "hash": file_hash}
                 return result
 
         result = {}
         for filepath, rel_path in walk_index_files(self.scope):
+            # §5-5:無 parser 的副檔名不入 symbol 掃描(grep/list_dir 不受影響)
+            if Path(rel_path).suffix.lower() in CODE_RAG_SKIP_EXTENSIONS:
+                continue
             file_hash = self._compute_file_hash(filepath)
             if file_hash:
                 result[rel_path] = {"filepath": filepath, "hash": file_hash}
 
         _INDEX_SCAN_CACHE[cache_key] = {
-            "paths": list(result.keys()),
+            "entries": {rel_path: info["hash"] for rel_path, info in result.items()},
             "timestamp": _time.time(),
         }
         return result
@@ -200,6 +259,10 @@ class CodeRAG:
     def _load_file_cache(self) -> dict:
         """載入增量快取（每檔案粒度）
 
+        載入驗證(§5-2):schema 版本、embedding model、NPZ md5 世代一致性、
+        row_count。任一不符 → stderr 印明確原因 + 回空(安全重建),絕不讀
+        撕裂 / 半成品世代,也絕不 silent swallow。
+
         Returns:
             {rel_path: {"hash": str, "symbols": list, "embeddings": list}}
         """
@@ -210,129 +273,136 @@ class CodeRAG:
         try:
             with open(self.cache_meta_file, 'r', encoding='utf-8') as f:
                 meta = json.load(f)
-
-            # 檢查 embedding model 是否一致
-            if meta.get("embedding_model") != EMBEDDING_MODEL:
-                return {}
-
-            # scope 規則變了不代表要重 embed:embedding_model 相同就保留 per-file
-            # symbol/embedding cache,只重算 membership delta。這裡只記錄
-            # fingerprint 是否相符,由 _load_cache / _scan_code_files 決定要不要
-            # 拒絕「整包 fast load」。
-            self._scope_fingerprint_ok = (
-                meta.get("scope_fingerprint") == self.scope.fingerprint
-            )
-            return meta.get("file_cache", {})
-        except Exception:
+        except Exception as e:
+            print(f"[CODE_RAG] cache meta 損壞({type(e).__name__}: {e}),安全重建",
+                  file=sys.stderr)
             return {}
 
+        schema = meta.get("schema_version")
+        if schema != CODE_RAG_CACHE_SCHEMA_VERSION:
+            print(f"[CODE_RAG] cache schema {schema!r} != {CODE_RAG_CACHE_SCHEMA_VERSION},"
+                  "安全重建", file=sys.stderr)
+            return {}
+
+        if meta.get("embedding_model") != EMBEDDING_MODEL:
+            print("[CODE_RAG] cache embedding_model 與現行設定不符,安全重建",
+                  file=sys.stderr)
+            return {}
+
+        # 世代一致性:meta 記錄的 npz_md5 必須與磁碟上的 NPZ 相符。
+        # kill 在「NPZ 已替換、meta 未替換」之間會在這裡被抓到。
+        npz_md5 = meta.get("npz_md5")
+        if npz_md5 is not None:
+            if not self.cache_emb_file.exists():
+                print("[CODE_RAG] cache NPZ 缺失(meta 記錄應存在),安全重建",
+                      file=sys.stderr)
+                return {}
+            try:
+                actual_md5 = hashlib.md5(self.cache_emb_file.read_bytes()).hexdigest()
+            except OSError as e:
+                print(f"[CODE_RAG] cache NPZ 讀取失敗({e}),安全重建", file=sys.stderr)
+                return {}
+            if actual_md5 != npz_md5:
+                print("[CODE_RAG] cache NPZ md5 不符(世代不一致),安全重建",
+                      file=sys.stderr)
+                return {}
+
+        row_count = meta.get("row_count")
+        if row_count != len(meta.get("index", [])):
+            print(f"[CODE_RAG] cache row_count={row_count!r} 與 index 筆數不符,安全重建",
+                  file=sys.stderr)
+            return {}
+
+        # scope 規則變了不代表要重 embed:embedding_model 相同就保留 per-file
+        # symbol/embedding cache,只重算 membership delta。這裡只記錄
+        # fingerprint 是否相符,由 _load_cache / _scan_code_files 決定要不要
+        # 拒絕「整包 fast load」。
+        self._scope_fingerprint_ok = (
+            meta.get("scope_fingerprint") == self.scope.fingerprint
+        )
+        return meta.get("file_cache", {})
+
     def _load_cache(self) -> bool:
-        """嘗試載入快取（優先增量模式，向後相容舊格式）"""
-        # 載入增量快取
+        """嘗試載入快取(增量模式)。
+
+        schema v2 起只有增量路徑:pre-v2 的整包 fast load(folder_hash)與更早
+        的單檔 legacy JSON 都在 schema bump 時淘汰 —— 舊快取缺 qualified_name /
+        backend / generation 欄位,留著會變混血索引,一律重建一次(§5-2)。
+        _load_file_cache 已對不合格 meta 印 stderr 原因。
+        """
         self._file_cache = self._load_file_cache()
 
         # 如果有增量快取，使用增量模式
         if self._file_cache:
             return False  # 返回 False 讓 build_index 進行增量更新
 
-        # 向後相容：嘗試載入舊格式快取（folder_hash 模式）
-        folder_hash = self._compute_folder_hash()
-
-        if self.cache_meta_file.exists() and self.cache_emb_file.exists() and HAS_NUMPY:
-            try:
-                with open(self.cache_meta_file, 'r', encoding='utf-8') as f:
-                    meta = json.load(f)
-
-                # 舊格式用 folder_hash 驗證。scope_fingerprint 缺失或不符時一律
-                # 拒絕整包 fast load —— 否則會直接沿用「用別套範圍規則建的索引」。
-                if (
-                    self._scope_fingerprint_ok
-                    and meta.get("folder_hash") == folder_hash
-                    and meta.get("embedding_model") == EMBEDDING_MODEL
-                ):
-                    self.index = meta.get("index", [])
-                    emb_data = np.load(self.cache_emb_file)
-                    self.embeddings = emb_data['embeddings']
-
-                    # §7.3:cached path 一律重過 should_index_file,index 與
-                    # embeddings 必須同步裁切,不然 row 會對錯符號。
-                    self._filter_loaded_index()
-
-                    if len(self.index) > 0 and self.embeddings is not None:
-                        return True
-            except Exception:
-                pass
-
-        # 向後相容：舊版 JSON 格式。同樣要 scope_fingerprint 相符才准整包載入;
-        # 舊版 JSON 從來沒寫過 fingerprint,所以實務上一定走重建那條路。
-        if self.legacy_cache_file.exists() and self._scope_fingerprint_ok:
-            try:
-                with open(self.legacy_cache_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-
-                if data.get("folder_hash") != folder_hash:
-                    return False
-
-                old_index = data.get("index", [])
-                if not old_index:
-                    return False
-
-                self.index = []
-                embeddings_list = []
-                for item in old_index:
-                    emb = item.pop('embedding', [])
-                    self.index.append(item)
-                    embeddings_list.append(emb if emb else [0.0] * 1024)
-
-                if HAS_NUMPY:
-                    self.embeddings = np.array(embeddings_list, dtype=np.float32)
-                    self._save_cache()
-                    try:
-                        self.legacy_cache_file.unlink()
-                    except Exception:
-                        pass
-                else:
-                    for i, emb in enumerate(embeddings_list):
-                        self.index[i]['embedding'] = emb
-
-                return len(self.index) > 0
-            except Exception:
-                return False
-
         return False
 
-    def _filter_loaded_index(self) -> None:
-        """把整包載入的 index 重過一次 should_index_file（embeddings 同步裁切）。"""
-        if not self.index:
-            return
-        keep = [
-            i for i, item in enumerate(self.index)
-            if self.scope.should_index_file(item.get("path", ""))
-        ]
-        if len(keep) == len(self.index):
-            return
-        self.index = [self.index[i] for i in keep]
-        if HAS_NUMPY and self.embeddings is not None:
-            self.embeddings = self.embeddings[keep]
-
     def _save_cache(self):
-        """儲存快取（增量模式：每檔案粒度）"""
+        """儲存快取（增量模式：每檔案粒度）
+
+        §5-2 契約:
+        - flock(.code_rag_cache.lock)單一 writer;lock 檔建立走 fs_safety 的
+          symlink 防線(O_NOFOLLOW + fstat S_ISREG + 父目錄 realpath 在 root 內)。
+        - 寫序:NPZ temp → os.replace → 算 md5 → meta JSON(generation_id /
+          npz_md5 / row_count)temp → os.replace。kill 在任一點,讀端都能用
+          md5 / row_count 驗出撕裂世代並安全重建。
+        - 寫入失敗 raise(fail-loud),不得無聲吞掉。
+        """
+        lock_fd = fs_safety.acquire_file_lock(self.cache_lock_file, self.folder)
         try:
+            # 上次 crash 可能留下 tmp 殘留;持鎖下只清自家精確前綴
+            for stale in self.folder.glob(f"{self.cache_emb_file.name}.tmp*"):
+                stale.unlink(missing_ok=True)
+            for stale in self.folder.glob(f"{self.cache_meta_file.name}.tmp*"):
+                stale.unlink(missing_ok=True)
+
+            npz_md5 = None
+            if HAS_NUMPY and self.embeddings is not None:
+                fd, tmp_npz = tempfile.mkstemp(
+                    dir=self.folder,
+                    prefix=f"{self.cache_emb_file.name}.tmp",
+                    suffix=".npz",
+                )
+                os.close(fd)
+                try:
+                    np.savez_compressed(tmp_npz, embeddings=self.embeddings)
+                    os.replace(tmp_npz, self.cache_emb_file)
+                except BaseException:
+                    Path(tmp_npz).unlink(missing_ok=True)
+                    raise
+                npz_md5 = hashlib.md5(self.cache_emb_file.read_bytes()).hexdigest()
+            else:
+                # lazy / 無 numpy:沒有 dense 矩陣可存。刪掉舊 NPZ,避免留下
+                # 與新 meta 不同世代的殘影。
+                self.cache_emb_file.unlink(missing_ok=True)
+
             emb_dim = self.embeddings.shape[1] if HAS_NUMPY and self.embeddings is not None else None
             meta = {
+                "schema_version": CODE_RAG_CACHE_SCHEMA_VERSION,
+                "generation_id": uuid.uuid4().hex,
                 "embedding_model": EMBEDDING_MODEL,
                 "scope_fingerprint": self.scope.fingerprint,
                 "embedding_dim": emb_dim,
+                "npz_md5": npz_md5,
+                "row_count": len(self.index),
                 "index": self.index,
                 "file_cache": self._file_cache  # 增量快取
             }
-            with open(self.cache_meta_file, 'w', encoding='utf-8') as f:
-                json.dump(meta, f, ensure_ascii=False)
-
-            if HAS_NUMPY and self.embeddings is not None:
-                np.savez_compressed(self.cache_emb_file, embeddings=self.embeddings)
-        except Exception:
-            pass
+            fd, tmp_meta = tempfile.mkstemp(
+                dir=self.folder,
+                prefix=f"{self.cache_meta_file.name}.tmp",
+                suffix=".json",
+            )
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(meta, f, ensure_ascii=False)
+                os.replace(tmp_meta, self.cache_meta_file)
+            except BaseException:
+                Path(tmp_meta).unlink(missing_ok=True)
+                raise
+        finally:
+            fs_safety.release_file_lock(lock_fd)
 
     def _extract_symbols(self, filepath: Path, content: str) -> list[dict]:
         """從程式碼中提取符號（函式、類別）
@@ -364,6 +434,10 @@ class CodeRAG:
                 'line': sym.start_line,
                 'end_line': sym.end_line,  # 新增：符號結束行
                 'context': sym.context[:500],
+                # graph 前置(§6.2-6):stable ID 與 evidence 揭露依賴這兩欄。
+                # 只進 index entry / cache;預設回傳 shape 不出現(§8.1)。
+                'qualified_name': sym.qualified_name or sym.name,
+                'backend': sym.backend or 'unknown',
             }
             # 如果有 parent（method 屬於某個 class），記錄下來
             if sym.parent:
@@ -385,6 +459,39 @@ class CodeRAG:
         normalized = _normalize_text_for_cache(text)
         result = _cached_get_embedding(normalized)
         return list(result)
+
+    def _embed_texts_batched(self, texts: list[str]) -> list[list[float]]:
+        """批次 embedding(§5-4):依雙預算切批走 /v1/embeddings。
+
+        任一批失敗直接拋:/v1/embeddings 的契約錯誤(cardinality / index /
+        維度)保留原訊息;連線層例外包成既有的 unreachable 訊息。
+        不部分接受 —— 呼叫端(build/backfill/materialize)自己負責 reset。
+        """
+        if not texts:
+            return []
+        batches = plan_embed_batches(
+            texts, config.EMBED_BATCH_SIZE, config.EMBED_BATCH_MAX_CHARS
+        )
+        out: list[list[float] | None] = [None] * len(texts)
+        for batch_indices in batches:
+            contents = [texts[i] for i in batch_indices]
+            try:
+                vectors = llama_client.embed_batch(
+                    base_url=LLAMA_EMBED_BASE_URL,
+                    contents=contents,
+                    model=EMBEDDING_MODEL,
+                    timeout=300,
+                )
+            except llama_client.EmbeddingContractError:
+                raise  # /v1/embeddings 嚴格契約違規:訊息已明確,不重包
+            except Exception as exc:
+                raise RuntimeError(
+                    f"embedding server unreachable at {LLAMA_EMBED_BASE_URL}: {exc}. "
+                    "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+                ) from exc
+            for i, vec in zip(batch_indices, vectors):
+                out[i] = vec
+        return out  # plan_embed_batches 覆蓋每個 index,不會留 None
 
     def _build_embed_text(self, item: dict) -> str:
         """Build embed text from a symbol/item dict.
@@ -443,6 +550,8 @@ class CodeRAG:
                 'type': sym['type'],
                 'line': sym['line'],
                 'context': sym['context'][:500],
+                'qualified_name': sym.get('qualified_name', sym['symbol']),
+                'backend': sym.get('backend', 'unknown'),
             }
             if 'end_line' in sym:
                 index_entry['end_line'] = sym['end_line']
@@ -495,11 +604,24 @@ class CodeRAG:
         is_incremental = len(self._file_cache) > 0 and len(files_to_index) < len(current_files)
 
         if verbose:
+            # §6.2-5 能力揭露(反轉舊的「tree-sitter 在場才印」邏輯):主要語言
+            # degraded 時必須 WARN,而不是安靜地少報符號。counts/語言名 only,
+            # 永不印 NDA path。
             parser_status = get_parser_status()
-            if parser_status['has_tree_sitter']:
-                ts_langs = [k for k, v in parser_status['languages'].items() if v == 'tree-sitter']
-                if ts_langs:
-                    print(f"[CODE_RAG] 使用 tree-sitter: {', '.join(ts_langs)}")
+            degraded_main = sorted(
+                lang for lang in ('c', 'cpp')
+                if parser_status['languages'].get(lang) == 'regex-degraded'
+            )
+            if degraded_main:
+                print(
+                    f"[CODE_RAG] WARN: parser degraded to regex for "
+                    f"{', '.join(degraded_main)} — 多行 signature 函式會漏抽。"
+                    "安裝: pip install tree-sitter tree-sitter-c tree-sitter-cpp",
+                    file=sys.stderr,
+                )
+            ts_langs = [k for k, v in parser_status['languages'].items() if v == 'tree-sitter']
+            if ts_langs:
+                print(f"[CODE_RAG] 使用 tree-sitter: {', '.join(ts_langs)}")
 
             if is_incremental:
                 print(f"[CODE_RAG] 增量更新: {len(files_to_index)} 個檔案變更, "
@@ -527,13 +649,15 @@ class CodeRAG:
         if lazy_enabled and total_symbols > CODE_RAG_LAZY_EMBED_MAX_SYMBOLS:
             self._lazy_embed = True
 
-        # 索引變更的檔案
+        # 索引變更的檔案。§5-4:parse 階段一律不逐筆 embed
+        # (compute_embeddings=False → 空 embedding 佔位);dense 模式下由
+        # _backfill_cached_embedding_gaps 統一走 /v1/embeddings 批次補齊,
+        # lazy 模式維持空 embedding 延後到查詢。
         indexed_count = 0
         for rel_path, filepath, file_hash in files_to_index:
             try:
-                compute_embeddings = not (lazy_enabled and self._lazy_embed)
                 symbols, embeddings = self._index_single_file(
-                    filepath, rel_path, compute_embeddings=compute_embeddings
+                    filepath, rel_path, compute_embeddings=False
                 )
                 self.index.extend(symbols)
                 embeddings_list.extend(embeddings)
@@ -626,10 +750,15 @@ class CodeRAG:
             print("[CODE_RAG] index scope — " + "; ".join(lines))
 
     def _refresh_if_stale(self) -> None:
-        """Incrementally rebuild when files change during the current MCP session."""
+        """Incrementally rebuild when files change during the current MCP session.
+
+        §5-3:走 TTL 快照(_scan_code_files 的 fast path)。TTL 內重複查詢
+        零 walk、零 compute_file_hash;TTL 過期或被 invalidate_scan_cache()
+        主動失效後才 fresh 掃描。TTL=0 時每次都 fresh(行為同舊版)。
+        """
         if self._indexed_file_hashes is None:
             return
-        current_files = self._scan_code_files_fresh()
+        current_files = self._scan_code_files()
         current_hashes = {
             rel_path: info["hash"] for rel_path, info in current_files.items()
         }
@@ -648,27 +777,30 @@ class CodeRAG:
         self._indexed_file_hashes = None
 
     def _backfill_cached_embedding_gaps(self, embeddings_list: list, *, verbose: bool) -> None:
-        """dense 模式復用 per-file 快取時,把 lazy 模式留下的空 embedding 補回來。
+        """dense 模式下把空 embedding 一次批次補齊(/v1/embeddings,§5-4)。
 
-        lazy 模式(符號數 > CODE_RAG_LAZY_EMBED_MAX_SYMBOLS)會把 embedding 存成
-        [],延後到查詢時才算。之後索引縮小 —— index scope 變窄、大量檔案被刪 ——
-        使符號數掉回門檻以下時,build_index 會走 dense 路徑,那些空洞直接觸發
-        「refusing zero padding」fail-loud;而且失敗時不會寫回快取,所以**重啟
-        還是失敗**,索引就永久建不起來。索引縮小正是 index scope 的主要場景,
-        所以這裡把洞補起來,結果與「刪掉快取重建」一致。
+        空洞的兩個來源,處理方式相同:
+        - build_index 的 parse 階段一律不逐筆 embed(空 embedding 佔位);
+        - lazy 模式(符號數 > CODE_RAG_LAZY_EMBED_MAX_SYMBOLS)存下的 [],之後
+          索引縮小掉回門檻以下、build 轉走 dense 路徑時仍留在 per-file cache。
+          不補的話會觸發「refusing zero padding」fail-loud,而且失敗不寫快取,
+          重啟也一樣失敗 —— 索引就永久建不起來。
 
-        補算量上限就是新索引的符號數(dense 模式必然 ≤ lazy 門檻),不會比冷啟
-        重建更貴。
+        補算量上限就是 dense 索引的符號數(必然 ≤ lazy 門檻),批次切分依
+        EMBED_BATCH_SIZE / EMBED_BATCH_MAX_CHARS 雙預算。
         """
         missing = [i for i, embedding in enumerate(embeddings_list) if not embedding]
         if not missing:
             return
         if verbose:
-            print(f"[CODE_RAG] 補算 {len(missing)} 個 lazy 快取留下的空 embedding")
-        for i in missing:
-            embeddings_list[i] = self._get_embedding(
-                self._build_embed_text(self.index[i])
-            )
+            print(f"[CODE_RAG] 批次計算 {len(missing)} 個 embedding(/v1/embeddings)")
+        texts = [
+            _normalize_text_for_cache(self._build_embed_text(self.index[i]))
+            for i in missing
+        ]
+        vectors = self._embed_texts_batched(texts)
+        for i, vec in zip(missing, vectors):
+            embeddings_list[i] = vec
         # 寫回 per-file 快取,否則 _save_cache 會把洞原樣存回去,下次照樣爆。
         self._sync_embeddings_to_file_cache(embeddings_list)
 
@@ -687,18 +819,29 @@ class CodeRAG:
             ]
 
     def _materialize_dense_index(self) -> None:
-        """Embed every lazy symbol when lexical routing has no meaningful signal."""
-        rows = []
-        dimensions = set()
+        """Embed every lazy symbol when lexical routing has no meaningful signal.
+
+        缺 embedding 的符號統一走 /v1/embeddings 批次(§5-4),不再逐筆
+        round trip;已有 embedding 的直接沿用。
+        """
+        rows: list[list[float] | None] = [None] * len(self.index)
+        missing_indices = []
+        missing_texts = []
         for index, item in enumerate(self.index):
-            embedding = item.get("embedding") or self._get_embedding(
-                self._build_embed_text(item)
-            )
-            if not embedding:
+            embedding = item.get("embedding")
+            if embedding:
+                rows[index] = [float(value) for value in embedding]
+            else:
+                missing_indices.append(index)
+                missing_texts.append(
+                    _normalize_text_for_cache(self._build_embed_text(item))
+                )
+        vectors = self._embed_texts_batched(missing_texts)
+        for index, vec in zip(missing_indices, vectors):
+            if not vec:
                 raise RuntimeError(f"Code RAG symbol {index} returned an empty embedding")
-            row = [float(value) for value in embedding]
-            dimensions.add(len(row))
-            rows.append(row)
+            rows[index] = vec
+        dimensions = {len(row) for row in rows}
         if len(dimensions) != 1:
             raise RuntimeError(
                 f"Code RAG embedding dimension mismatch: {sorted(dimensions)}; "
@@ -865,16 +1008,30 @@ class CodeRAG:
 
         return top_score < 0.6
 
-    def _rerank_code_fallback(self, candidates: list, top_k: int, reason: str) -> list:
+    @staticmethod
+    def _fusion_candidates(candidates: list, top_k: int) -> list[RankedCandidate]:
+        """未執行 rerank 的路徑:score_source="fusion",rerank_score=None。"""
+        return [
+            RankedCandidate(
+                item=item,
+                rerank_score=None,
+                combined_score=combined,
+                final_score=combined,
+                score_source="fusion",
+            )
+            for combined, _emb, _kw, item in candidates[:top_k]
+        ]
+
+    def _rerank_code_fallback(self, candidates: list, top_k: int, reason: str) -> list[RankedCandidate]:
         """Fallback for Code RAG rerank. main_model is intentionally embedding here."""
         if config.RERANK_FALLBACK_POLICY == "error":
             raise RuntimeError(
                 "Code RAG reranker unavailable and AICODE_RERANK_FALLBACK_POLICY=error. "
                 f"Reason: {reason}"
             )
-        return [c[3] for c in candidates[:top_k]]
+        return self._fusion_candidates(candidates, top_k)
 
-    def _rerank_code_candidates(self, question: str, candidates: list, top_k: int) -> list:
+    def _rerank_code_candidates(self, question: str, candidates: list, top_k: int) -> list[RankedCandidate]:
         """使用 reranker 模型對程式碼候選進行二次排序
 
         Args:
@@ -883,17 +1040,20 @@ class CodeRAG:
             top_k: 返回數量
 
         Returns:
-            重排後的 item list
+            list[RankedCandidate](§5-1):分數 query-local,絕不寫回 self.index
+            的持久 item;cache 檔因此不可能出現 rerank 欄位。實際 rerank 過的
+            score_source="rerank"、final_score=rerank_score(0.0 是有效低分);
+            否則 "fusion"、rerank_score=None。
         """
         if not candidates:
             return []
 
         if not USE_RERANKER or len(candidates) <= top_k:
-            return [c[3] for c in candidates[:top_k]]
+            return self._fusion_candidates(candidates, top_k)
 
         # 條件觸發：判斷是否真的需要 rerank
         if not self._should_rerank(candidates, top_k):
-            return [c[3] for c in candidates[:top_k]]
+            return self._fusion_candidates(candidates, top_k)
 
         # 減少 rerank 的 candidates 數量
         rerank_count = min(15, top_k * 3)
@@ -908,7 +1068,7 @@ class CodeRAG:
                 for combined, emb_score, kw_score, item in items:
                     symbol = item.get('symbol', '')
                     path = item.get('path', '')
-                    context = item.get('context', '')[:600]
+                    context = item.get('context', '')[:config.CODE_RERANK_PASSAGE_MAX_CHARS]
                     parent_info = f" in {item.get('parent', '')}" if item.get('parent') else ""
                     sym_type = item.get('type', 'function')
                     passages.append(
@@ -922,9 +1082,18 @@ class CodeRAG:
                     model=RERANKER_MODEL,
                     timeout=60,
                 )
-                scored = [(score, items[i][3]) for i, score in enumerate(scores)]
-                scored.sort(reverse=True, key=lambda x: x[0])
-                return [c[1] for c in scored[:top_k]]
+                ranked = [
+                    RankedCandidate(
+                        item=items[i][3],
+                        rerank_score=float(score),
+                        combined_score=items[i][0],
+                        final_score=float(score),
+                        score_source="rerank",
+                    )
+                    for i, score in enumerate(scores)
+                ]
+                ranked.sort(reverse=True, key=lambda rc: rc.final_score)
+                return ranked[:top_k]
 
             except Exception as exc:
                 return self._rerank_code_fallback(
@@ -936,6 +1105,33 @@ class CodeRAG:
 
     def query(self, question: str, top_k: int = CODE_RAG_TOP_K, is_bug_fix: bool = False) -> list[dict]:
         """查詢相關程式碼位置（動態門檻 + reranker 二次排序）
+
+        回傳預設 shape(§8.1):每筆恰為 {path, symbol, type, line, score},
+        條件式附 end_line / parent;score = round(final_score, 3)。
+        要拿 score_components / backend 等 evidence,呼叫 query_ranked。
+        """
+        ranked = self.query_ranked(question, top_k=top_k, is_bug_fix=is_bug_fix)
+        results = []
+        for rc in ranked:
+            item = rc.item
+            result_item = {
+                'path': item['path'],
+                'symbol': item['symbol'],
+                'type': item['type'],
+                'line': item['line'],
+                'score': round(rc.final_score, 3),
+            }
+            # 新增 end_line 和 parent（如果有）
+            if 'end_line' in item:
+                result_item['end_line'] = item['end_line']
+            if 'parent' in item:
+                result_item['parent'] = item['parent']
+            results.append(result_item)
+        return results
+
+    def query_ranked(self, question: str, top_k: int = CODE_RAG_TOP_K,
+                     is_bug_fix: bool = False) -> list[RankedCandidate]:
+        """query 的完整結果(RankedCandidate;§8 evidence 模式的資料來源)。
 
         Lazy build：第一次 query 時才建立索引，避免不需要 CodeRAG 時浪費時間
         """
@@ -1069,33 +1265,9 @@ class CodeRAG:
             if len(candidates_for_rerank) >= top_k * 3:
                 break
 
-        # 使用 reranker 二次排序（條件觸發）
-        reranked_items = self._rerank_code_candidates(question, candidates_for_rerank, top_k)
-
-        # 轉換為結果格式
-        results = []
-        for item in reranked_items:
-            result_item = {
-                'path': item['path'],
-                'symbol': item['symbol'],
-                'type': item['type'],
-                'line': item['line'],
-                'score': round(item.get('_rerank_score', 0), 3) if '_rerank_score' in item else 0.0
-            }
-            # 從原始 candidates 取得原始 combined score（如果沒有 rerank score）
-            if result_item['score'] == 0.0:
-                for combined, _, _, orig_item in candidates_for_rerank:
-                    if orig_item is item:
-                        result_item['score'] = round(combined, 3)
-                        break
-            # 新增 end_line 和 parent（如果有）
-            if 'end_line' in item:
-                result_item['end_line'] = item['end_line']
-            if 'parent' in item:
-                result_item['parent'] = item['parent']
-            results.append(result_item)
-
-        return results
+        # 使用 reranker 二次排序（條件觸發)。分數是 query-local 的
+        # RankedCandidate(§5-1),絕不寫回 self.index 的持久 item。
+        return self._rerank_code_candidates(question, candidates_for_rerank, top_k)
 
     def get_candidates_prompt(self, question: str) -> str:
         """生成給 Agent 的候選提示"""

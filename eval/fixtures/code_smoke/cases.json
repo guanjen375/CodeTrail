@@ -1,0 +1,263 @@
+{
+  "_comment": "CodeTrail code smoke eval — 全合成 NDA-safe fixture。評分全部由 eval/run_code_smoke_eval.py 內建決定性計算,fixture 不攜帶任何可執行命令。",
+  "repos": {
+    "ism_mini": {
+      "root": "ism_mini",
+      "true_call_edges": [
+        "timer_isr->event_queue_push",
+        "button_isr->event_queue_push",
+        "dispatcher_drain_pending->event_queue_pop",
+        "dispatcher_drain_pending->sm_handle_event",
+        "sm_handle_event->sm_transition",
+        "main->event_queue_init",
+        "main->sm_init",
+        "main->sm_register_callback",
+        "main->dispatcher_drain_pending"
+      ],
+      "true_unresolved_calls": [
+        "sm_handle_event->cb"
+      ]
+    },
+    "variants_mini": {
+      "root": "variants_mini",
+      "true_call_edges": [],
+      "true_unresolved_calls": []
+    }
+  },
+  "cases": [
+    {
+      "id": "smoke_001",
+      "repo": "ism_mini",
+      "task_type": "localization",
+      "question": "push an event into the event queue",
+      "gold_files": ["src/event_queue.c"],
+      "gold_symbols": ["event_queue_push"],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": [],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_002",
+      "repo": "ism_mini",
+      "task_type": "localization",
+      "question": "where is timer_isr defined",
+      "gold_files": ["src/isr.c"],
+      "gold_symbols": ["timer_isr"],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": [],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_003",
+      "repo": "ism_mini",
+      "task_type": "localization",
+      "question": "register a callback for an event id",
+      "gold_files": ["src/state_machine.c"],
+      "gold_symbols": ["sm_register_callback"],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": [],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_004",
+      "repo": "ism_mini",
+      "task_type": "localization",
+      "question": "pop the next event from the queue",
+      "gold_files": ["src/event_queue.c"],
+      "gold_symbols": ["event_queue_pop"],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": [],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_005",
+      "repo": "ism_mini",
+      "task_type": "localization",
+      "question": "return the current state of the state machine",
+      "gold_files": ["src/state_machine.c"],
+      "gold_symbols": ["sm_current_state"],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": [],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_006",
+      "repo": "variants_mini",
+      "task_type": "localization",
+      "question": "max channels supported by this variant",
+      "gold_files": ["variant_config.c"],
+      "gold_symbols": ["variant_max_channels"],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": [],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_007",
+      "repo": "ism_mini",
+      "task_type": "localization",
+      "question": "where is sm_transition implemented",
+      "gold_files": ["src/state_machine.c"],
+      "gold_symbols": ["sm_transition"],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": ["tree_sitter"],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_008",
+      "repo": "ism_mini",
+      "task_type": "localization",
+      "question": "dispatcher_drain_pending 的實作在哪",
+      "gold_files": ["src/dispatcher.c"],
+      "gold_symbols": ["dispatcher_drain_pending"],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": ["tree_sitter"],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_009",
+      "repo": "ism_mini",
+      "task_type": "localization",
+      "question": "event_queue_reset_statistics definition",
+      "gold_files": ["src/event_queue.c"],
+      "gold_symbols": ["event_queue_reset_statistics"],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": ["tree_sitter"],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_010",
+      "repo": "ism_mini",
+      "task_type": "includes",
+      "question": "which repo headers does src/dispatcher.c directly include",
+      "target_file": "src/dispatcher.c",
+      "gold_files": [],
+      "gold_symbols": [],
+      "gold_edges": [
+        "src/dispatcher.c->include/dispatcher.h",
+        "src/dispatcher.c->include/event_queue.h",
+        "src/dispatcher.c->include/state_machine.h"
+      ],
+      "gold_paths": [],
+      "requires": ["graph"],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_011",
+      "repo": "ism_mini",
+      "task_type": "includes",
+      "question": "which repo headers does include/state_machine.h directly include",
+      "target_file": "include/state_machine.h",
+      "gold_files": [],
+      "gold_symbols": [],
+      "gold_edges": [
+        "include/state_machine.h->include/event_queue.h"
+      ],
+      "gold_paths": [],
+      "requires": ["graph"],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_012",
+      "repo": "ism_mini",
+      "task_type": "call_path",
+      "question": "main -> sm_transition",
+      "gold_files": [],
+      "gold_symbols": [],
+      "gold_edges": [
+        "main->dispatcher_drain_pending",
+        "dispatcher_drain_pending->sm_handle_event",
+        "sm_handle_event->sm_transition"
+      ],
+      "gold_paths": [
+        ["main", "dispatcher_drain_pending", "sm_handle_event", "sm_transition"]
+      ],
+      "requires": ["graph"],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_013",
+      "repo": "ism_mini",
+      "task_type": "call_path",
+      "question": "timer_isr -> event_queue_push",
+      "gold_files": [],
+      "gold_symbols": [],
+      "gold_edges": [
+        "timer_isr->event_queue_push"
+      ],
+      "gold_paths": [
+        ["timer_isr", "event_queue_push"]
+      ],
+      "requires": ["graph"],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_014",
+      "repo": "ism_mini",
+      "task_type": "call_path",
+      "question": "main -> event_queue_pop",
+      "gold_files": [],
+      "gold_symbols": [],
+      "gold_edges": [
+        "main->dispatcher_drain_pending",
+        "dispatcher_drain_pending->event_queue_pop"
+      ],
+      "gold_paths": [
+        ["main", "dispatcher_drain_pending", "event_queue_pop"]
+      ],
+      "requires": ["graph"],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_015",
+      "repo": "ism_mini",
+      "task_type": "call_path",
+      "question": "sm_handle_event dispatches through the callback table",
+      "source_symbol": "sm_handle_event",
+      "gold_files": [],
+      "gold_symbols": [],
+      "gold_edges": [
+        "sm_handle_event->cb"
+      ],
+      "gold_paths": [],
+      "requires": ["graph"],
+      "expected_unresolved": true,
+      "must_abstain": false
+    },
+    {
+      "id": "smoke_016",
+      "repo": "ism_mini",
+      "task_type": "abstain",
+      "question": "which function verifies the CRC32 checksum of a firmware image",
+      "gold_files": [],
+      "gold_symbols": [],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": [],
+      "expected_unresolved": false,
+      "must_abstain": true
+    }
+  ]
+}

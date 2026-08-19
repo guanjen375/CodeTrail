@@ -27,7 +27,6 @@ proxy。即使 URL 寫的是 loopback，`HTTPS_PROXY` 或一個 307/308 都能�
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import json
 import os
 import re
@@ -37,10 +36,10 @@ import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
 import config
 import context_budget
+import endpoint_policy
 from extracted_document import ExtractedDocument
 
 # ============================================================
@@ -90,7 +89,6 @@ SUMMARY_PROMPT_V1 = """你是文件摘要助理。
 # diagram = PDF 內嵌圖經 VL 抽述（RAG.extract_pdf_document 的自動路徑）。
 _GENERATIVE_ORIGINS = frozenset({"image", "screenshot", "diagram"})
 
-_LOOPBACK_NAMES = frozenset({"localhost", "ip6-localhost", "ip6-loopback"})
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _SENTENCE_END = re.compile(r"[.。!?！？；;]")
 
@@ -111,32 +109,21 @@ class ContextLockError(RuntimeError):
 # 端點安全（§13）
 # ============================================================
 def is_loopback_host(host: str) -> bool:
-    """host 正規化後是不是 loopback（雙棧）。"""
-    if not host:
-        return False
-    cleaned = host.strip().strip("[]").lower()
-    # IPv6 scope id（fe80::1%eth0）在比對前去掉
-    cleaned = cleaned.split("%", 1)[0]
-    try:
-        return ipaddress.ip_address(cleaned).is_loopback
-    except ValueError:
-        return cleaned in _LOOPBACK_NAMES
+    """host 正規化後是不是 loopback（雙棧）。實作在 endpoint_policy（共用）。"""
+    return endpoint_policy.is_loopback_host(host)
 
 
 def ensure_endpoint_allowed(base_url: str) -> None:
-    """非 loopback 端點需要顯式同意；錯誤訊息要講明會外送什麼。"""
-    host = urlparse(base_url).hostname or ""
-    if is_loopback_host(host):
-        return
-    if getattr(config, "KB_CONTEXT_REMOTE_OK", False):
-        return
-    raise ContextGenerationError(
-        f"KB_CONTEXT_GENERATE 需要把文件內容送到 {base_url}，那不是 loopback。\n"
-        "  會被送出去的東西：每個 chunk 的原文，以及它所在章節（文件太長時是整份\n"
-        "  文件的摘要）——等於整份文件都會離開這台機器。\n"
-        "  確定要這樣做的話設 AICODE_KB_CONTEXT_REMOTE_OK=1；否則把\n"
-        "  AICODE_LLAMA_BASE_URL 指回本機的 llama-server。"
-    )
+    """非 loopback 端點需要顯式同意；錯誤訊息要講明會外送什麼。
+
+    policy 本體在 endpoint_policy.ensure_allowed(role="kb_context")，與模型
+    流量共用同一套 loopback 判定；這裡只把 EndpointPolicyError 轉成既有的
+    ContextGenerationError 型別，呼叫端與測試的契約不變。
+    """
+    try:
+        endpoint_policy.ensure_allowed(base_url, "kb_context")
+    except endpoint_policy.EndpointPolicyError as exc:
+        raise ContextGenerationError(str(exc)) from None
 
 
 def _restricted_session():

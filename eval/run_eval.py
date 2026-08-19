@@ -61,9 +61,14 @@ def check_llama_health(max_retries: int = 3, timeout: int = 10) -> bool:
     """
     base_url = os.environ.get('AICODE_LLAMA_BASE_URL', 'http://localhost:8080')
 
+    # proxy 衛生:走共用硬化 session(trust_env=False、不跟 redirect),
+    # 避免 loopback health 探測被環境 proxy 帶去別的 host。
+    from http_client import get_session
+    session = get_session()
+
     for attempt in range(max_retries):
         try:
-            resp = requests.get(f"{base_url}/health", timeout=timeout)
+            resp = session.get(f"{base_url}/health", timeout=timeout, allow_redirects=False)
             if resp.status_code == 200:
                 print(f"[HEALTH] llama-server 正常運作中 ({base_url})")
                 return True

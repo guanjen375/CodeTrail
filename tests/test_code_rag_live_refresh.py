@@ -6,10 +6,18 @@ import code_rag
 
 
 def test_query_refreshes_changed_source_in_same_session(monkeypatch, tmp_path: Path):
+    """TTL=0(關閉快照)時行為同舊版:每次 query 都 fresh 掃描,立即看到改動。
+
+    §5-3 驗收之一:AICODE_CODE_RAG_REFRESH_TTL=0 行為同現狀。TTL>0 的
+    快照 / invalidation 行為由 tests/test_code_rag_quickfix.py 鎖。
+    """
     source = tmp_path / "module.py"
     source.write_text("def old_symbol():\n    return 1\n", encoding="utf-8")
+    monkeypatch.setattr(code_rag.config, "CODE_RAG_REFRESH_TTL_SECONDS", 0)
     rag = code_rag.CodeRAG(str(tmp_path))
     monkeypatch.setattr(rag, "_get_embedding", lambda _text: [1.0, 0.0])
+    monkeypatch.setattr(rag, "_embed_texts_batched",
+                        lambda texts: [[1.0, 0.0]] * len(texts))
     monkeypatch.setattr(code_rag, "CODE_RAG_LAZY_EMBED", False)
     monkeypatch.setattr(code_rag, "USE_RERANKER", False)
 
@@ -46,6 +54,9 @@ def test_lazy_semantic_query_materializes_dense_index_instead_of_arbitrary_slice
         return [0.0, 1.0]
 
     monkeypatch.setattr(rag, "_get_embedding", fake_embedding)
+    # materialize 走批次路徑(§5-4)
+    monkeypatch.setattr(rag, "_embed_texts_batched",
+                        lambda texts: [fake_embedding(t) for t in texts])
 
     results = rag.query("如何重新啟動加速器？", top_k=5)
 

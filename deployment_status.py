@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
 from deployment_profile import DeploymentProfile, ProfileError, ServiceProfile, resolve_model_reference
 
@@ -138,10 +138,24 @@ def _props_n_ctx(props: Mapping[str, Any]) -> int | None:
     return value if value > 0 else None
 
 
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """3xx 一律不跟隨:redirect_request 回 None → urllib 拋 HTTPError(URLError
+    子類),被呼叫端的既有 except 當 unreachable。loopback llama-server 不會回
+    3xx;會回的就不是我們要探測的東西。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# proxy 衛生:/health /props 是 loopback 探測,不得被環境 HTTP(S)_PROXY 帶去
+# 別的 host。ProxyHandler({}) = 無視環境 proxy。
+_LOCAL_PROBE_OPENER = build_opener(ProxyHandler({}), _NoRedirectHandler())
+
+
 def query_server(service: ServiceProfile) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     def get(path: str) -> dict[str, Any] | None:
         try:
-            with urlopen(f"{service.base_url}{path}", timeout=0.75) as response:  # noqa: S310
+            with _LOCAL_PROBE_OPENER.open(f"{service.base_url}{path}", timeout=0.75) as response:  # noqa: S310
                 data = json.loads(response.read().decode("utf-8"))
         except (OSError, URLError, ValueError):
             return None

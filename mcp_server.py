@@ -106,6 +106,7 @@ import config
 from config import KNOWLEDGE_FILE, KNOWLEDGE_EMB_FILE, RUN_COMMAND_TIMEOUT
 from knowledge import KnowledgeBase, load_knowledge_base_strict
 from knowledge_store import KnowledgeStoreError
+import code_rag as code_rag_module
 from code_rag import CodeRAG
 from agent_tools import ToolExecutor
 from media import set_sandbox_root, ocr_image, read_elf, read_binary, read_pdf, IMAGE_EXTENSIONS, ELF_EXTENSIONS, BINARY_EXTENSIONS
@@ -522,22 +523,215 @@ def query_knowledge_strict(question: str, source: Optional[str] = None) -> dict:
     return result
 
 
+_CODE_GRAPH = None
+
+
+def _get_code_graph():
+    """Lazy code graph singleton(與 CODE_RAG 同 root、同掃描快照)。"""
+    global _CODE_GRAPH
+    if _CODE_GRAPH is None:
+        import code_graph as _code_graph_module
+
+        _CODE_GRAPH = _code_graph_module.CodeGraph(AICODE_ROOT)
+    return _CODE_GRAPH
+
+
+def _graph_for_query():
+    """graph query 前置:staleness 同步(§7.5);缺/壞 → 明確錯誤往上拋。"""
+    graph = _get_code_graph()
+    graph.ensure_fresh()
+    return graph
+
+
+_GRAPH_RESPONSE_MAX_CHARS = 8000
+
+
+def _cap_graph_response(resp: dict) -> dict:
+    """全回應 ≤8000 chars;超限從 edges/nodes 尾端截,附 truncation metadata。"""
+    import json as _json
+
+    def _size(d):
+        return len(_json.dumps(d, ensure_ascii=False))
+
+    if _size(resp) <= _GRAPH_RESPONSE_MAX_CHARS:
+        return resp
+    original_edges = len(resp.get("edges", []))
+    original_nodes = len(resp.get("nodes", []))
+    while resp.get("edges") and _size(resp) > _GRAPH_RESPONSE_MAX_CHARS:
+        resp["edges"].pop()
+    while resp.get("nodes") and _size(resp) > _GRAPH_RESPONSE_MAX_CHARS:
+        resp["nodes"].pop()
+    resp["truncated"] = True
+    resp["truncation"] = {
+        "reason": f"response cap {_GRAPH_RESPONSE_MAX_CHARS} chars",
+        "edges_kept": len(resp.get("edges", [])),
+        "edges_total": original_edges,
+        "nodes_kept": len(resp.get("nodes", [])),
+        "nodes_total": original_nodes,
+    }
+    return resp
+
+
+def _slim_edge(edge: dict) -> dict:
+    """graph edge 的精簡輸出(逐步 file:line 證據)。"""
+    return {
+        "src": edge.get("src_name") or edge.get("src_id"),
+        "dst": edge.get("dst_name") or edge.get("dst_id"),
+        "unresolved_target": edge.get("unresolved_target"),
+        "type": edge.get("type"),
+        "evidence": f"{edge.get('evidence_path')}:{edge.get('evidence_line')}",
+        "backend": edge.get("backend"),
+        "confidence": edge.get("confidence"),
+        "resolved": edge.get("resolved", edge.get("dst_id") is not None),
+    }
+
+
 @_tool()
-def code_rag_search(query: str, top_k: int = 5) -> list[dict]:
-    """Find relevant code locations (file:line + symbol) inside AICODE_ROOT.
+def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
+                    hops: int = 1, include_evidence: bool = False) -> list[dict]:
+    """Find code locations, or traverse the code graph (calls/includes), inside AICODE_ROOT.
 
     Use this BEFORE read_file when you need to locate a function/class
     by intent rather than exact name. CodeRAG indexes symbols (functions,
-    classes, methods) with embeddings + keyword matching.
+    classes, methods) with embeddings + keyword matching. mode="neighbors" /
+    "path" 走 code graph(definitions/includes/calls,含逐步 file:line 證據)。
 
     Args:
-        query: 想找的程式碼行為,例如 "conv2d 的 padding 計算"。
-        top_k: 回傳前幾名(預設 5)。
+        query: mode="semantic" → 想找的程式碼行為,例如 "conv2d 的 padding 計算"。
+               mode="neighbors" → symbol 名(exact / qualified name 比對,取前 3
+               個 anchor)。
+               mode="path" → "SRC -> DST"(兩端都是 symbol 名;容忍空白)。
+        top_k: 回傳前幾名(預設 5;semantic 模式)。
+        mode: "semantic"(預設)| "neighbors"(1–2 hop 鄰居)| "path"
+              (呼叫鏈最短路徑,≤4 hop、最多 3 條)。
+        hops: neighbors 模式的跳數(1–2,預設 1)。
+        include_evidence: semantic 模式加開 score_components / backend /
+               confidence / relations(graph 1-hop,≤5 條/筆)/ graph_status。
+               預設 False = 回傳 shape 與既往完全一致。
 
     Returns:
-        [{"path": str, "line": int, "symbol": str, "score": float, ...}, ...]
+        mode="semantic":[{"path": str, "line": int, "symbol": str,
+            "score": float, ...}, ...](include_evidence=True 時每筆多
+            score_components/backend/confidence/relations/graph_status)。
+        mode="neighbors":單元素 list,含 anchors/nodes/edges(每步
+            evidence 是 "file:line")與 truncation metadata。
+        mode="path":單元素 list,含 paths(每條是 edge list,逐步證據)。
+        graph 檔缺席或損壞時 neighbors/path 直接報錯;semantic 不受影響。
     """
-    results = CODE_RAG.query(query, top_k=top_k)
+    if mode not in ("semantic", "neighbors", "path"):
+        raise ValueError(f"mode 必須是 semantic|neighbors|path,收到 {mode!r}")
+
+    if mode == "neighbors":
+        graph = _graph_for_query()
+        anchors = graph.find_nodes(query.strip())[:3]
+        if not anchors:
+            hints = graph.suggest_names(query.strip())
+            raise RuntimeError(
+                f"neighbors: 找不到 symbol {query.strip()!r}(exact/qualified 比對)。"
+                + (f"近似候選: {', '.join(hints)}" if hints else "graph 內無近似名稱。")
+            )
+        hops = min(max(int(hops), 1), 2)
+        nodes: list[dict] = []
+        edges: list[dict] = []
+        seen_nodes: set[str] = set()
+        truncated = False
+        for anchor in anchors:
+            result = graph.neighbors(
+                anchor["id"], edge_types=("calls", "defines"),
+                direction="both", hops=hops, limit=50,
+            )
+            truncated = truncated or result["truncated"]
+            for n in result["nodes"]:
+                if n["id"] not in seen_nodes:
+                    seen_nodes.add(n["id"])
+                    nodes.append(n)
+            edges.extend(_slim_edge(e) for e in result["edges"])
+        resp = {
+            "mode": "neighbors",
+            "query": query,
+            "anchors": [
+                {"id": a["id"], "name": a["name"], "qualified_name": a["qualified_name"],
+                 "path": a["path"], "line": a["start_line"], "backend": a["backend"]}
+                for a in anchors
+            ],
+            "nodes": [
+                {"name": n["name"], "qualified_name": n["qualified_name"],
+                 "kind": n["kind"], "path": n["path"], "line": n["start_line"],
+                 "backend": n["backend"]}
+                for n in nodes
+            ],
+            "edges": edges,
+            "graph_status": "ok",
+            "truncated": truncated,
+        }
+        return [_cap_graph_response(resp)]
+
+    if mode == "path":
+        src, sep, dst = query.partition("->")
+        src, dst = src.strip(), dst.strip()
+        if not sep or not src or not dst:
+            raise ValueError(
+                'mode="path" 的 query 必須是 "SRC -> DST"(兩端 symbol 名),'
+                f"收到 {query!r}"
+            )
+        graph = _graph_for_query()
+        paths = graph.shortest_evidence_paths({src}, {dst}, max_hops=4, limit=3)
+        resp = {
+            "mode": "path",
+            "src": src,
+            "dst": dst,
+            "paths": [[_slim_edge(e) for e in path] for path in paths],
+            "graph_status": "ok",
+        }
+        return [_cap_graph_response(resp)]
+
+    # ---- mode == "semantic" ----
+    ranked = CODE_RAG.query_ranked(query, top_k=top_k)
+    results = []
+    graph = None
+    graph_status = "ok"
+    if include_evidence:
+        try:
+            graph = _graph_for_query()
+        except Exception as exc:  # §2:semantic 不因 graph 缺席失敗
+            graph = None
+            graph_status = f"unavailable: {type(exc).__name__}: {exc}"[:200]
+
+    for rc in ranked:
+        item = rc.item
+        entry = {
+            'path': item['path'],
+            'symbol': item['symbol'],
+            'type': item['type'],
+            'line': item['line'],
+            'score': round(rc.final_score, 3),
+        }
+        if 'end_line' in item:
+            entry['end_line'] = item['end_line']
+        if 'parent' in item:
+            entry['parent'] = item['parent']
+        if include_evidence:
+            entry['score_components'] = {
+                'rerank_score': rc.rerank_score,
+                'combined_score': round(rc.combined_score, 4),
+                'score_source': rc.score_source,
+            }
+            entry['backend'] = item.get('backend', 'unknown')
+            entry['confidence'] = 'exact'
+            relations: list[dict] = []
+            if graph is not None:
+                try:
+                    lookup = item.get('qualified_name') or item['symbol']
+                    relations = [
+                        _slim_edge(e)
+                        for e in graph.relations_for_symbol(lookup, limit=5)
+                    ]
+                except Exception as exc:
+                    graph_status = f"relation lookup failed: {type(exc).__name__}"
+            entry['relations'] = relations
+            entry['graph_status'] = graph_status
+        results.append(entry)
+
     if data_flywheel.DATA_COLLECT_ENABLED:
         snippets = [
             {
@@ -555,7 +749,8 @@ def code_rag_search(query: str, top_k: int = 5) -> list[dict]:
             refs=[],
             top_score=top_score,
             code_snippets=snippets,
-            extra_meta={"top_k": top_k},
+            extra_meta={"top_k": top_k, "mode": mode,
+                        "include_evidence": include_evidence},
         )
     return results
 
@@ -661,7 +856,14 @@ def apply_patch(diff: str, dry_run: bool = False) -> str:
     Returns:
         套用結果摘要 + 自動驗證輸出(dry_run 時只有預覽)。
     """
-    return EXEC.apply_patch(patch=diff, dry_run=dry_run)
+    if dry_run:
+        return EXEC.apply_patch(patch=diff, dry_run=True)
+    try:
+        return EXEC.apply_patch(patch=diff, dry_run=False)
+    finally:
+        # 寫入類工具一律在 finally 失效掃描快照(§5-3):patch 可能寫入後
+        # 才驗證失敗,不能依 exit code 或回傳文字判斷「有沒有改到檔」。
+        code_rag_module.invalidate_scan_cache(AICODE_ROOT)
 
 
 @_tool()
@@ -726,7 +928,13 @@ def run_lint(path: str, fix: bool = True) -> str:
     Returns:
         Lint 工具的輸出(已截斷)。多工具時會依序嘗試到有可用工具為止。
     """
-    return EXEC.run_lint(path=path, fix=fix)
+    if not fix:
+        return EXEC.run_lint(path=path, fix=False)
+    try:
+        return EXEC.run_lint(path=path, fix=True)
+    finally:
+        # fix=True 會就地改檔;失敗的 formatter 也可能已改到一半(§5-3)。
+        code_rag_module.invalidate_scan_cache(AICODE_ROOT)
 
 
 @_tool()
@@ -1097,7 +1305,11 @@ def run_command(cmd: str) -> str:
     Returns:
         stdout + stderr(截斷後)+ 退出狀態。
     """
-    return EXEC.run_command(cmd, timeout=RUN_COMMAND_TIMEOUT)
+    try:
+        return EXEC.run_command(cmd, timeout=RUN_COMMAND_TIMEOUT)
+    finally:
+        # build / formatter / test 都可能寫檔;失敗的命令也可能已改檔(§5-3)。
+        code_rag_module.invalidate_scan_cache(AICODE_ROOT)
 
 
 if __name__ == "__main__":

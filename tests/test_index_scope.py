@@ -629,7 +629,7 @@ def test_scan_cache_fast_path_requires_matching_fingerprint(tree, clean_scan_cac
     code_rag = clean_scan_cache
     rag = code_rag.CodeRAG(str(tree))
     code_rag._INDEX_SCAN_CACHE[(str(rag.folder), "fingerprint-from-another-scope")] = {
-        "paths": ["vendor/keep.c"],
+        "entries": {"vendor/keep.c": "stale-hash"},
         "timestamp": _time.time(),
     }
     files = rag._scan_code_files()
@@ -643,17 +643,24 @@ def test_cached_paths_are_refiltered_through_should_index_file(tree, clean_scan_
     code_rag = clean_scan_cache
     rag = code_rag.CodeRAG(str(tree))
     code_rag._INDEX_SCAN_CACHE[(str(rag.folder), rag.scope.fingerprint)] = {
-        "paths": ["vendor/keep.c", "site-packages/mypkg/core.py", "src/core/engine.c"],
+        "entries": {
+            "vendor/keep.c": "h1",
+            "site-packages/mypkg/core.py": "h2",
+            "src/core/engine.c": "h3",
+        },
         "timestamp": _time.time(),
     }
-    assert set(rag._scan_code_files()) == {"src/core/engine.c"}
+    files = rag._scan_code_files()
+    assert set(files) == {"src/core/engine.c"}
+    # §5-3:TTL 內 fast path 直接回快照 hash,零 compute_file_hash
+    assert files["src/core/engine.c"]["hash"] == "h3"
 
 
 def _write_legacy_meta(rag, *, fingerprint, paths):
     np = pytest.importorskip("numpy")
     meta = {
         "embedding_model": __import__("code_rag").EMBEDDING_MODEL,
-        "folder_hash": rag._compute_folder_hash(),
+        "folder_hash": "legacy-folder-hash",  # pre-v2 格式;schema bump 後值不再被讀
         "index": [
             {"path": p, "symbol": f"sym_{i}", "type": "function", "line": 1}
             for i, p in enumerate(paths)
@@ -685,7 +692,12 @@ def test_legacy_bundle_load_refused_on_fingerprint_mismatch(tree, clean_scan_cac
     assert fresh._load_cache() is False
 
 
-def test_legacy_bundle_load_refilters_and_keeps_embeddings_aligned(tree, clean_scan_cache):
+def test_pre_v2_cache_is_rebuilt_with_stderr_reason(tree, clean_scan_cache, capsys):
+    """schema v2 起舊快取一律安全重建(§5-2 + §6.2-6 合併 bump,只重建一次)。
+
+    fingerprint 相符也不例外:pre-v2 index entry 缺 qualified_name / backend /
+    generation 欄位,留著會變混血索引。stderr 必須講明原因,不得 silent。
+    """
     code_rag = clean_scan_cache
     rag = code_rag.CodeRAG(str(tree))
     _write_legacy_meta(
@@ -695,10 +707,10 @@ def test_legacy_bundle_load_refilters_and_keeps_embeddings_aligned(tree, clean_s
     )
 
     fresh = code_rag.CodeRAG(str(tree))
-    assert fresh._load_cache() is True, "fingerprint 相符時 fast load 仍然要能用"
-    assert [item["path"] for item in fresh.index] == ["src/core/engine.c"]
-    assert fresh.embeddings.shape[0] == 1
-    assert float(fresh.embeddings[0][0]) == 1.0, "裁掉 index 卻沒同步裁 embeddings"
+    assert fresh._load_cache() is False, "pre-v2 快取必須重建,不得 fast load"
+    assert fresh.index == []
+    err = capsys.readouterr().err
+    assert "schema" in err, "重建原因必須寫到 stderr"
 
 
 def test_scope_change_recomputes_membership_without_reembedding(tree, tmp_path, monkeypatch,
@@ -707,13 +719,14 @@ def test_scope_change_recomputes_membership_without_reembedding(tree, tmp_path, 
     monkeypatch.setattr(code_rag, "CODE_RAG_LAZY_EMBED", False)
     calls: list[str] = []
 
-    def fake_embedding(text: str) -> list[float]:
-        calls.append(text)
-        return [1.0, 0.0]
+    def fake_embedding(texts: list[str]) -> list[list[float]]:
+        # 新契約(§5-4):build 走 _embed_texts_batched(批次)
+        calls.extend(texts)
+        return [[1.0, 0.0]] * len(texts)
 
     _write_scope(tmp_path, monkeypatch, tree, detectors=True)
     first = code_rag.CodeRAG(str(tree))
-    monkeypatch.setattr(first, "_get_embedding", fake_embedding)
+    monkeypatch.setattr(first, "_embed_texts_batched", fake_embedding)
     first.build_index(verbose=False)
     first_paths = {item["path"] for item in first.index}
     baseline_calls = len(calls)
@@ -723,7 +736,7 @@ def test_scope_change_recomputes_membership_without_reembedding(tree, tmp_path, 
     # detectors 關掉 → membership 變大,但既有檔案不該重 embed
     _write_scope(tmp_path, monkeypatch, tree, detectors=False)
     second = code_rag.CodeRAG(str(tree))
-    monkeypatch.setattr(second, "_get_embedding", fake_embedding)
+    monkeypatch.setattr(second, "_embed_texts_batched", fake_embedding)
     calls.clear()
     second.build_index(verbose=False)
     second_paths = {item["path"] for item in second.index}
@@ -735,7 +748,7 @@ def test_scope_change_recomputes_membership_without_reembedding(tree, tmp_path, 
     # 再切回來 → 多出來的檔案要退出索引
     _write_scope(tmp_path, monkeypatch, tree, detectors=True)
     third = code_rag.CodeRAG(str(tree))
-    monkeypatch.setattr(third, "_get_embedding", fake_embedding)
+    monkeypatch.setattr(third, "_embed_texts_batched", fake_embedding)
     third.build_index(verbose=False)
     assert {item["path"] for item in third.index} == first_paths
 
@@ -852,8 +865,10 @@ def _seed_cache_with_lazy_holes(rag, rel_paths, *, holes):
             "embeddings": [[] for _ in symbols] if rel in holes else [[1.0, 0.0]] * len(symbols),
         }
     rag.cache_meta_file.write_text(json.dumps({
+        "schema_version": code_rag.CODE_RAG_CACHE_SCHEMA_VERSION,
         "embedding_model": code_rag.EMBEDDING_MODEL,
         "scope_fingerprint": rag.scope.fingerprint,
+        "row_count": 0,
         "index": [],
         "file_cache": file_cache,
     }), encoding="utf-8")
@@ -872,7 +887,12 @@ def test_dense_rebuild_backfills_lazy_embedding_holes(tree, monkeypatch, clean_s
     _seed_cache_with_lazy_holes(rag, kept, holes=set(kept))
 
     calls: list[str] = []
-    monkeypatch.setattr(rag, "_get_embedding", lambda text: (calls.append(text), [1.0, 0.0])[1])
+
+    def fake_batch(texts: list[str]) -> list[list[float]]:
+        calls.extend(texts)
+        return [[1.0, 0.0]] * len(texts)
+
+    monkeypatch.setattr(rag, "_embed_texts_batched", fake_batch)
     rag.build_index(verbose=False)
 
     assert rag._lazy_embed is False
@@ -889,7 +909,8 @@ def test_dense_rebuild_backfills_lazy_embedding_holes(tree, monkeypatch, clean_s
 
     code_rag._INDEX_SCAN_CACHE.clear()
     restart = code_rag.CodeRAG(str(tree))
-    monkeypatch.setattr(restart, "_get_embedding", lambda _text: [1.0, 0.0])
+    monkeypatch.setattr(restart, "_embed_texts_batched",
+                        lambda texts: [[1.0, 0.0]] * len(texts))
     restart.build_index(verbose=False)          # 不得再拋
 
 
@@ -909,22 +930,23 @@ def test_lazy_index_shrunk_by_scope_still_builds(tmp_path, monkeypatch, clean_sc
             "".join(f"def vend_{i}_{j}(): pass\n" for j in range(10)), encoding="utf-8")
 
     monkeypatch.setenv("AICODE_INDEX_SCOPE_FILE", str(tmp_path / "absent.json"))
+    fake_batch = lambda texts: [[1.0, 0.0]] * len(texts)  # noqa: E731
     first = code_rag.CodeRAG(str(root))
-    monkeypatch.setattr(first, "_get_embedding", lambda _text: [1.0, 0.0])
+    monkeypatch.setattr(first, "_embed_texts_batched", fake_batch)
     first.build_index(verbose=False)
     assert first._lazy_embed is True, "fixture 沒有真的觸發 lazy 模式,這條就沒在測東西"
 
     _write_scope(tmp_path, monkeypatch, root, exclude=["vendor_env/**"])
     code_rag._INDEX_SCAN_CACHE.clear()
     second = code_rag.CodeRAG(str(root))
-    monkeypatch.setattr(second, "_get_embedding", lambda _text: [1.0, 0.0])
+    monkeypatch.setattr(second, "_embed_texts_batched", fake_batch)
     second.build_index(verbose=False)           # 回歸點:這裡原本會拋
     assert second._lazy_embed is False
     assert {item["path"] for item in second.index} == {"keep/a.py"}
 
     code_rag._INDEX_SCAN_CACHE.clear()
     third = code_rag.CodeRAG(str(root))
-    monkeypatch.setattr(third, "_get_embedding", lambda _text: [1.0, 0.0])
+    monkeypatch.setattr(third, "_embed_texts_batched", fake_batch)
     third.build_index(verbose=False)            # 重啟也不能炸
 
 
@@ -1032,12 +1054,12 @@ def test_backfill_failure_leaves_no_partial_index(tree, monkeypatch, clean_scan_
 
     outage = {"on": True}
 
-    def flaky(_text):
+    def flaky_batch(texts):
         if outage["on"]:
             raise RuntimeError("embedding server unreachable at test URL")
-        return [1.0, 0.0]
+        return [[1.0, 0.0]] * len(texts)
 
-    monkeypatch.setattr(rag, "_get_embedding", flaky)
+    monkeypatch.setattr(rag, "_embed_texts_batched", flaky_batch)
     with pytest.raises(RuntimeError, match="embedding server unreachable"):
         rag.build_index(verbose=False)
 

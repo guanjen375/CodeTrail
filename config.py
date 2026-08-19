@@ -627,6 +627,10 @@ CODE_RAG_ENABLED = True
 CODE_RAG_TOP_K = 8
 CODE_RAG_TOP_K_BUG = 5               # Bug 模式縮小 top_k，減少噪音
 CODE_RAG_CACHE_FILE = ".code_rag_cache.json"
+# Code graph(SQLite,WAL)。sidecar(-wal/-shm)與 staging(.tmp*)一律以
+# 這個名字為前綴;index_scope 的 artifact 前綴防線靠這點涵蓋它們。
+CODE_RAG_GRAPH_FILE = ".code_rag_graph.sqlite3"
+CODE_RAG_GRAPH_LOCK_FILE = ".code_rag_graph.lock"
 CODE_RAG_AUTO_PREREAD = True
 CODE_RAG_PREREAD_TOP_K = 3           # 減少預讀數量，降低 I/O（優化：5->3）
 CODE_RAG_PREREAD_TOP_K_BUG = 3       # Bug 模式預讀更少，靠 stack trace 補
@@ -639,6 +643,23 @@ CODE_RAG_THRESHOLD_BUG = 0.25        # Bug 類問題放寬門檻（eval調優: 0
 CODE_RAG_LAZY_EMBED = True
 CODE_RAG_LAZY_EMBED_MAX_SYMBOLS = 2000  # 放寬 lazy 門檻，減少即時 embedding（優化：1500->2000）
 CODE_RAG_LAZY_EMBED_QUERY_TOP_K = 150   # 減少候選數量（優化：200->150）
+
+# Code RAG 掃描快照 TTL(秒)。TTL 內重複查詢直接用 {path,hash} 快照:
+# 零 os.walk、零 compute_file_hash。0 = 關閉(每次查詢都 fresh 掃描)。
+# MCP 內部的寫入工具(apply_patch / run_command / run_lint fix)會主動
+# invalidate;外部編輯器在 TTL 窗內改檔屬既知取捨(docs/mcp-tools.md)。
+CODE_RAG_REFRESH_TTL_SECONDS = int(_os.environ.get("AICODE_CODE_RAG_REFRESH_TTL", "30"))
+
+# Code RAG rerank passage 上限(chars)。這是「誠實化」常數:context 在儲存時
+# 就被截到 500(index entry 的 context[:500]),再大的 slice 都是 no-op。
+# 要擴充 passage(例如 1200)必須同步動三個 producer(ast context 抽取、
+# index entry 截斷、這裡),屬後續輪,本輪維持 500。
+CODE_RERANK_PASSAGE_MAX_CHARS = 500
+
+# 批次 embedding 的雙預算(/v1/embeddings 嚴格契約,§5-4):
+# 單一 HTTP batch 的筆數上限與總字元上限,兩者皆過才裝得下。
+EMBED_BATCH_SIZE = int(_os.environ.get("AICODE_EMBED_BATCH_SIZE", "32"))
+EMBED_BATCH_MAX_CHARS = int(_os.environ.get("AICODE_EMBED_BATCH_MAX_CHARS", "20000"))
 
 # ============================================================
 # 嚴格模式設定

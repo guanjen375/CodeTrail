@@ -440,6 +440,8 @@ AICODE_MODEL=<CODE_MODEL> python deployment_profile.py show
 
 預設是 `error`:專用 reranker 不可用或呼叫失敗就直接報錯。`main_model` 可能很貴:嚴格模式下每條符合條件的 RAG query 都可能觸發主模型 rerank。只有你明確接受這個成本時才設定 `AICODE_RERANK_FALLBACK_POLICY=main_model`。
 
+**遠端模型端點需要顯式 opt-in(`AICODE_MODEL_REMOTE_OK`)**:CodeTrail 對 llama-server 的所有呼叫(completion / chat / embedding / reranking / props / slots / health)在送出前都會檢查端點——loopback 無條件放行;base_url 指向非 loopback 的機器時,必須先 `export AICODE_MODEL_REMOTE_OK=1`,否則呼叫直接報錯(fail-loud,錯誤訊息會印這個 env 名)。這是刻意的安全 migration:prompt 可能含 NDA 程式碼與文件內容,不能因為 profile 填了一個遠端 IP 就靜默外送。既有的遠端部署升級後會先報錯,設一次 env 即恢復。模型流量同時不讀環境 proxy(`trust_env=False`)、不跟隨任何 HTTP redirect(3xx 一律報錯)。KB chunk 脈絡生成(Contextual Retrieval)另有獨立的 `AICODE_KB_CONTEXT_REMOTE_OK`,兩者不互通。`python scripts/doctor.py` 會在啟動前檢查這條(非 loopback 端點 + 未設 opt-in = FAIL)。
+
 ### 4.2 Model registry(短名稱 → GGUF 路徑)
 
 讓 `AICODE_MODEL=<CODE_MODEL>` 這種短名稱自動對應到實際 GGUF 路徑,不用每次打絕對路徑:
@@ -627,6 +629,15 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 要改成 `--no-mmap`,是在 `~/.config/codetrail/deployment.json` 的 `services.<main|vl>.parameters` 加 `"no_mmap": true`(不是手動改 llama-server 指令 —— argv 每次由 deployment 重新產生)。CodeTrail **不替你決定**這一項,但套了 CPU-MoE 卻沒設時 `set_config.sh` 會警告,而且重跑會保留你的設定。詳見 [docs/troubleshooting.md](docs/troubleshooting.md)。
 
 如果想驗證 MCP transport 有沒有連上:OpenCode TUI 輸入 `/status`,應看到 `codetrail Connected`。**Connected 只代表 MCP 子行程完成連線,不代表模型在這一輪真的發出 tool call。** 真正執行時應看到 frontend 的工具卡 / 結果;若模型只印出 `<codetrail_list_dir .../>` 再用文字宣稱成功,那是假工具呼叫,照 [troubleshooting 的分層檢查](docs/troubleshooting.md#mcp-connected-but-no-tool-call)處理。
+
+想看**跨檔案的呼叫關係**(誰呼叫誰、include 鏈),`code_rag_search` 除了語意搜尋還有 graph 模式:
+
+```text
+請用工具 code_rag_search,mode 設 "path",query 寫 "main -> sm_transition",
+把呼叫鏈每一步的檔案與行號列出來。
+```
+
+graph 對 C/C++(tree-sitter)與 Python 抽 definitions / includes / calls,查詢時自動偵測檔案變更做增量更新;function pointer 與 macro 間接呼叫會誠實回報 unresolved。細節見 [docs/mcp-tools.md](docs/mcp-tools.md)。
 
 想把**圖片**(截圖、架構圖、規格頁掃描)變成之後查得到的知識,就是「VL + RAG 一起用」—— `ingest_document` 餵圖片時會自動走 VL 把圖抽成文字再進 RAG,跟 PDF 走同一套:
 

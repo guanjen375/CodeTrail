@@ -375,6 +375,20 @@ def _server_root_url(base_url: str) -> str:
     return root
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """loopback /props 探測不跟 3xx:回 None → HTTPError,呼叫端當 unreachable。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _local_probe_opener() -> urllib.request.OpenerDirector:
+    """proxy 衛生:不讀環境 HTTP(S)_PROXY、不跟 redirect 的 opener。"""
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirectHandler()
+    )
+
+
 def fetch_main_server_props(
     env: Mapping[str, str],
     *,
@@ -384,7 +398,7 @@ def fetch_main_server_props(
     url = _server_root_url(base_url) + "/props"
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _local_probe_opener().open(request, timeout=timeout) as response:
             payload = response.read(MAX_PROPS_BYTES + 1)
     except (OSError, urllib.error.URLError, TimeoutError):
         return None

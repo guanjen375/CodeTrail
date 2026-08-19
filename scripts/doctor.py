@@ -155,6 +155,99 @@ _LLAMA_SERVERS = [
 ]
 
 
+def check_parsers(r: Result) -> None:
+    """Code RAG parser backend 能力揭露(§6.2-5;offline,--no-network 也跑)。
+
+    python 恆為 stdlib ast;c/cpp 需要 tree-sitter(缺 → regex-degraded,
+    多行 signature 函式會漏抽,graph 抽取也拿不到 C/C++ 邊)。degraded 是
+    WARN 不是 FAIL:§2 失效矩陣要求顯式降級,不報錯。
+    """
+    try:
+        from ast_parser import get_parser_status
+    except Exception as exc:
+        r.fail(f"無法 import ast_parser: {exc}")
+        return
+
+    status = get_parser_status()
+    languages = status.get("languages", {})
+    r.info(
+        "parser backends: "
+        + ", ".join(f"{lang}={backend}" for lang, backend in sorted(languages.items()))
+    )
+    degraded_main = sorted(
+        lang for lang in ("c", "cpp") if languages.get(lang) == "regex-degraded"
+    )
+    if degraded_main:
+        r.warn(
+            f"c/cpp parser degraded to regex({', '.join(degraded_main)});"
+            "多行 signature 函式會漏抽、code graph 抽不到 C/C++ 邊。\n"
+            "        安裝: pip install tree-sitter tree-sitter-c tree-sitter-cpp"
+        )
+    else:
+        r.ok("parser: python=python-ast, c/cpp=tree-sitter")
+
+
+def check_endpoint_policy(r: Result) -> None:
+    """模型端點遠端 opt-in 檢查(只看 config + env,--no-network 也跑)。
+
+    Transport policy:llama_client 的每個呼叫送出前都會經
+    endpoint_policy.ensure_allowed(role="model") —— 端點非 loopback 且未設
+    AICODE_MODEL_REMOTE_OK=1 會 fail-loud。這裡把設定矛盾在啟動前抓出來。
+    """
+    cfg = _read_config()
+    if isinstance(cfg, Exception):
+        return
+    try:
+        import endpoint_policy
+    except ImportError as exc:
+        r.fail(f"無法 import endpoint_policy: {exc}")
+        return
+    from urllib.parse import urlparse
+
+    remote = []
+    for attr, role, _ in _LLAMA_SERVERS:
+        url = getattr(cfg, attr, "") or ""
+        host = urlparse(url).hostname or ""
+        if url and not endpoint_policy.is_loopback_host(host):
+            remote.append((role, url))
+
+    if remote:
+        opted_in = os.environ.get(
+            endpoint_policy.MODEL_REMOTE_OK_ENV, ""
+        ).lower() in ("1", "true", "yes")
+        detail = ", ".join(f"{role}={url}" for role, url in remote)
+        if opted_in:
+            r.warn(
+                f"非 loopback 模型端點({detail});"
+                f"{endpoint_policy.MODEL_REMOTE_OK_ENV}=1 已設,"
+                "prompt(可能含 NDA 內容)會送往遠端"
+            )
+        else:
+            r.fail(
+                f"非 loopback 模型端點({detail})但未設 "
+                f"{endpoint_policy.MODEL_REMOTE_OK_ENV}=1。\n"
+                "        所有模型呼叫(completion/embedding/reranking/health)"
+                "都會 fail-loud。\n"
+                f"        確定要用遠端模型請 export {endpoint_policy.MODEL_REMOTE_OK_ENV}=1。"
+            )
+    else:
+        r.ok("模型端點全部是 loopback(transport policy 無需 opt-in)")
+
+    if bool(getattr(cfg, "KB_CONTEXT_GENERATE", False)):
+        main_url = getattr(cfg, "LLAMA_BASE_URL", "") or ""
+        host = urlparse(main_url).hostname or ""
+        if (
+            main_url
+            and not endpoint_policy.is_loopback_host(host)
+            and not bool(getattr(cfg, "KB_CONTEXT_REMOTE_OK", False))
+        ):
+            r.fail(
+                f"KB_CONTEXT_GENERATE 開啟且 main={main_url} 非 loopback,"
+                f"但未設 {endpoint_policy.KB_CONTEXT_REMOTE_OK_ENV}=1;"
+                "chunk 脈絡生成會 fail-loud"
+            )
+
+
 def check_llama_servers(r: Result, no_network: bool) -> dict[str, dict]:
     """各 port 連線狀態,回傳 {role: {url, props, slots}} 給 check_models 用。"""
     cfg = _read_config()
@@ -839,7 +932,11 @@ def main(argv: list[str] | None = None) -> int:
     print("\n-- repo files --")
     check_repo_artifacts(r)
 
+    print("\n-- Code RAG parser --")
+    check_parsers(r)
+
     print("\n-- llama-server / 模型 --")
+    check_endpoint_policy(r)
     server_status = check_llama_servers(r, no_network=args.no_network)
     check_models(r, server_status)
 

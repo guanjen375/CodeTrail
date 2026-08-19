@@ -16,9 +16,33 @@
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any, Iterator
+from urllib.parse import urlparse
 
+import endpoint_policy
 from http_client import get_session
+
+
+def _ensure_allowed(url: str) -> None:
+    """所有 llama-server 呼叫送出前的端點 policy(role="model")。
+
+    loopback 無條件放行;非 loopback 需要 AICODE_MODEL_REMOTE_OK=1,否則
+    fail-loud。做在每個 call site 而不是 session 層:session 擋不住新增
+    call site 忘記掛 policy 的情況。
+    """
+    endpoint_policy.ensure_allowed(url, "model")
+
+
+def _reject_redirect(resp, url: str) -> None:
+    """3xx 一律 fail-loud。訊息含 status 與 Location host,絕不含 request body。"""
+    if 300 <= resp.status_code < 400:
+        location_host = urlparse(resp.headers.get("Location", "")).netloc or "?"
+        raise RuntimeError(
+            f"llama-server request to {url} was redirected "
+            f"(HTTP {resp.status_code} -> host {location_host!r}); "
+            "refusing to follow redirects (request body was not resent)"
+        )
 
 
 # ============================================================
@@ -73,13 +97,16 @@ def native_completion(
 
     session = get_session()
     url = base_url.rstrip("/") + "/completion"
+    _ensure_allowed(url)
 
     if not stream:
-        resp = session.post(url, json=payload, timeout=timeout)
+        resp = session.post(url, json=payload, timeout=timeout, allow_redirects=False)
+        _reject_redirect(resp, url)
         resp.raise_for_status()
         return resp.json()
 
-    resp = session.post(url, json=payload, timeout=timeout, stream=True)
+    resp = session.post(url, json=payload, timeout=timeout, stream=True, allow_redirects=False)
+    _reject_redirect(resp, url)
     resp.raise_for_status()
     return _iter_native_stream(resp)
 
@@ -151,13 +178,16 @@ def chat_completions(
 
     session = get_session()
     url = base_url.rstrip("/") + "/v1/chat/completions"
+    _ensure_allowed(url)
 
     if not stream:
-        resp = session.post(url, json=payload, timeout=timeout)
+        resp = session.post(url, json=payload, timeout=timeout, allow_redirects=False)
+        _reject_redirect(resp, url)
         resp.raise_for_status()
         return resp.json()
 
-    resp = session.post(url, json=payload, timeout=timeout, stream=True)
+    resp = session.post(url, json=payload, timeout=timeout, stream=True, allow_redirects=False)
+    _reject_redirect(resp, url)
     resp.raise_for_status()
     return _iter_openai_stream(resp)
 
@@ -256,6 +286,14 @@ def _iter_openai_stream(resp) -> Iterator[dict]:
 # ============================================================
 # /embedding
 # ============================================================
+class EmbeddingContractError(RuntimeError):
+    """/v1/embeddings 回應違反嚴格契約(cardinality / index / 維度 / 空向量)。
+
+    與「連不上 server」分開:契約錯誤代表 server 版本行為不符,重試無用,
+    呼叫端不得把它包裝成 unreachable。
+    """
+
+
 def embed_one(
     *,
     base_url: str,
@@ -272,7 +310,9 @@ def embed_one(
         payload["model"] = model
     session = get_session()
     url = base_url.rstrip("/") + "/embedding"
-    resp = session.post(url, json=payload, timeout=timeout)
+    _ensure_allowed(url)
+    resp = session.post(url, json=payload, timeout=timeout, allow_redirects=False)
+    _reject_redirect(resp, url)
     resp.raise_for_status()
     data = resp.json()
 
@@ -289,20 +329,61 @@ def embed_batch(
     model: str = "",
     timeout: int = 300,
 ) -> list[list[float]]:
-    """批次 embedding。回傳 [[float, ...], ...]。"""
-    payload: dict[str, Any] = {"content": contents}
-    if model:
-        payload["model"] = model
+    """批次 embedding,走 /v1/embeddings(OpenAI-compat)。回傳 [[float, ...], ...]。
+
+    llama.cpp 只在 /v1/embeddings 明確定義 array input;legacy /embedding 塞
+    list 會在某些版本退化成單一向量(32 筆進、1 條出),silent 對不上列。
+    嚴格契約(任一不符 → RuntimeError,不部分接受):
+      - 回應 data 筆數 == 輸入筆數
+      - data[].index 集合 == range(n)(按 index 還原順序,不信回傳排序)
+      - 維度全相等且無空向量
+    """
+    if not contents:
+        return []
+    payload: dict[str, Any] = {"input": list(contents), "model": model or "local"}
     session = get_session()
-    url = base_url.rstrip("/") + "/embedding"
-    resp = session.post(url, json=payload, timeout=timeout)
+    url = base_url.rstrip("/") + "/v1/embeddings"
+    _ensure_allowed(url)
+    resp = session.post(url, json=payload, timeout=timeout, allow_redirects=False)
+    _reject_redirect(resp, url)
     resp.raise_for_status()
     data = resp.json()
 
-    if isinstance(data, list):
-        return [_extract_first_embedding(item) for item in data]
-    # 單筆 fallback
-    return [_extract_first_embedding(data)]
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise EmbeddingContractError(
+            f"/v1/embeddings returned unexpected shape (no 'data' list) from {url}"
+        )
+    n = len(contents)
+    if len(items) != n:
+        raise EmbeddingContractError(
+            f"/v1/embeddings cardinality mismatch: sent {n} inputs, got {len(items)} rows"
+        )
+
+    out: list[list[float] | None] = [None] * n
+    for entry in items:
+        if not isinstance(entry, dict):
+            raise EmbeddingContractError("/v1/embeddings row is not an object")
+        idx = entry.get("index")
+        if not isinstance(idx, int) or not (0 <= idx < n):
+            raise EmbeddingContractError(f"/v1/embeddings row has invalid index {idx!r} (n={n})")
+        if out[idx] is not None:
+            raise EmbeddingContractError(f"/v1/embeddings returned duplicate index {idx}")
+        emb = entry.get("embedding")
+        if not isinstance(emb, list) or not emb:
+            raise EmbeddingContractError(f"/v1/embeddings row {idx} has an empty embedding")
+        try:
+            out[idx] = [float(x) for x in emb]
+        except (TypeError, ValueError) as exc:
+            raise EmbeddingContractError(f"/v1/embeddings row {idx} has non-numeric values") from exc
+
+    # index 集合 == range(n) 由「筆數相等 + 範圍內 + 不重複」三者聯合保證
+    dimensions = {len(v) for v in out}  # type: ignore[arg-type]
+    if len(dimensions) != 1:
+        raise EmbeddingContractError(
+            f"/v1/embeddings dimension mismatch across rows: {sorted(dimensions)}"
+        )
+    return out  # type: ignore[return-value]
 
 
 def _extract_first_embedding(data: Any) -> list[float]:
@@ -346,7 +427,9 @@ def rerank(
         payload["model"] = model
     session = get_session()
     url = base_url.rstrip("/") + "/reranking"
-    resp = session.post(url, json=payload, timeout=timeout)
+    _ensure_allowed(url)
+    resp = session.post(url, json=payload, timeout=timeout, allow_redirects=False)
+    _reject_redirect(resp, url)
     resp.raise_for_status()
     data = resp.json()
 
@@ -372,15 +455,21 @@ def rerank(
 def get_props(base_url: str, *, timeout: int = 5) -> dict | None:
     """讀 server props:回傳含 default_generation_settings.n_ctx、model_path、
     chat_template 等。連線失敗 / 非 200 → None。
+
+    回 None 前先在 stderr 留一行原因(policy 拒絕 / redirect 也是),
+    避免把「被 policy 擋掉」偽裝成 server down。
     """
     session = get_session()
     url = base_url.rstrip("/") + "/props"
     try:
-        resp = session.get(url, timeout=timeout)
+        _ensure_allowed(url)
+        resp = session.get(url, timeout=timeout, allow_redirects=False)
+        _reject_redirect(resp, url)
         if resp.status_code != 200:
             return None
         return resp.json()
-    except Exception:
+    except Exception as exc:
+        _log_probe_failure("/props", url, exc)
         return None
 
 
@@ -389,12 +478,15 @@ def get_slots(base_url: str, *, timeout: int = 5) -> list[dict] | None:
     session = get_session()
     url = base_url.rstrip("/") + "/slots"
     try:
-        resp = session.get(url, timeout=timeout)
+        _ensure_allowed(url)
+        resp = session.get(url, timeout=timeout, allow_redirects=False)
+        _reject_redirect(resp, url)
         if resp.status_code != 200:
             return None
         data = resp.json()
         return data if isinstance(data, list) else None
-    except Exception:
+    except Exception as exc:
+        _log_probe_failure("/slots", url, exc)
         return None
 
 
@@ -405,10 +497,27 @@ def get_health(base_url: str, *, timeout: int = 3) -> dict | None:
     session = get_session()
     url = base_url.rstrip("/") + "/health"
     try:
-        resp = session.get(url, timeout=timeout)
+        _ensure_allowed(url)
+        resp = session.get(url, timeout=timeout, allow_redirects=False)
+        _reject_redirect(resp, url)
         return resp.json() if resp.status_code == 200 else None
-    except Exception:
+    except Exception as exc:
+        _log_probe_failure("/health", url, exc)
         return None
+
+
+def _log_probe_failure(endpoint: str, url: str, exc: Exception) -> None:
+    """probe(health/props/slots)吞例外回 None 之前,stderr 留一行真實原因。
+
+    policy 拒絕與 3xx 的訊息尤其重要:沒有這行,遠端端點未 opt-in 會被
+    誤讀成「server 沒開」。連線層的例外(ConnectionError/timeout)訊息
+    不含 body,直接印。
+    """
+    print(
+        f"[llama_client] {endpoint} probe failed for {url}: "
+        f"{type(exc).__name__}: {exc}",
+        file=sys.stderr,
+    )
 
 
 def is_ready(base_url: str, *, timeout: int = 3) -> bool:

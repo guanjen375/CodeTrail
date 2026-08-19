@@ -5,6 +5,12 @@ requests>=2.28.0    # llama-server HTTP client
 mcp>=1.0.0          # MCP server（mcp_server.py 用）
 numpy>=1.21.0       # RAG / MMR 向量運算
 jieba>=0.42.1       # 中文 BM25 切詞（缺少時可降級，但預設安裝確保檢索品質）
+# C/C++ AST 解析（Code RAG symbol / graph 抽取;缺席時 c/cpp 降級 regex,
+# doctor 與 build_index 會標 regex-degraded）。釘版:grammar wheel 與
+# py-tree-sitter 之間有 ABI 相容窗(0.26 = language ABI ≤15),驗證過才釘。
+tree-sitter==0.26.0
+tree-sitter-c==0.24.2
+tree-sitter-cpp==0.23.4
 
 # 可選：缺了會由各功能 graceful skip，doctor 會提示
 # pip install "pymupdf4llm==1.28.0"               # RAG.py 從 PDF/MD 建知識庫(釘驗證版,上游 schema 常變動)

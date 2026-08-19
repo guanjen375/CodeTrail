@@ -108,7 +108,10 @@ def test_code_rag_main_model_policy_keeps_embedding_order(monkeypatch, tmp_path)
     monkeypatch.setattr(config, "RERANK_FALLBACK_POLICY", "main_model")
     monkeypatch.setattr(rag, "_check_reranker_available", lambda: False)
 
-    assert rag._rerank_code_candidates("question", candidates, top_k=2) == [
-        candidates[0][3],
-        candidates[1][3],
-    ]
+    out = rag._rerank_code_candidates("question", candidates, top_k=2)
+    # §5-1:未 rerank 走 fusion —— rerank_score 必須是 None(不是 0.0),
+    # final_score = combined,順序保持 embedding/fusion 排序。
+    assert [rc.item for rc in out] == [candidates[0][3], candidates[1][3]]
+    assert all(rc.score_source == "fusion" for rc in out)
+    assert all(rc.rerank_score is None for rc in out)
+    assert [rc.final_score for rc in out] == [candidates[0][0], candidates[1][0]]

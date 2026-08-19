@@ -30,7 +30,7 @@ class _CapturingSession:
         self._payload = payload
         self.calls: list[dict] = []
 
-    def post(self, url, json=None, timeout=None, stream=False):
+    def post(self, url, json=None, timeout=None, stream=False, allow_redirects=True):
         self.calls.append({"url": url, "json": json, "stream": stream})
         return _FakeResp(self._payload)
 
@@ -45,7 +45,7 @@ def test_chat_completions_forwards_sampling(monkeypatch):
     monkeypatch.setattr(llama_client, "get_session", lambda: sess)
 
     llama_client.chat_completions(
-        base_url="http://x:8080",
+        base_url="http://127.0.0.1:8080",
         messages=[{"role": "user", "content": "hi"}],
         temperature=0.0,
         top_p=0.95,
@@ -69,7 +69,7 @@ def test_chat_completions_omits_sampling_when_unset(monkeypatch):
     monkeypatch.setattr(llama_client, "get_session", lambda: sess)
 
     llama_client.chat_completions(
-        base_url="http://x:8080",
+        base_url="http://127.0.0.1:8080",
         messages=[{"role": "user", "content": "hi"}],
     )
 
@@ -85,7 +85,7 @@ def test_native_completion_min_p_is_opt_in(monkeypatch):
     # 不帶 min_p → payload 無 min_p(top_p/top_k 仍有舊預設,維持向後相容)
     sess = _CapturingSession({"content": "ok"})
     monkeypatch.setattr(llama_client, "get_session", lambda: sess)
-    llama_client.native_completion(base_url="http://x:8080", prompt="hi")
+    llama_client.native_completion(base_url="http://127.0.0.1:8080", prompt="hi")
     body = sess.calls[0]["json"]
     assert "min_p" not in body
     assert body["top_p"] == 0.95
@@ -94,7 +94,7 @@ def test_native_completion_min_p_is_opt_in(monkeypatch):
     # 帶 min_p=0 → 進 payload
     sess2 = _CapturingSession({"content": "ok"})
     monkeypatch.setattr(llama_client, "get_session", lambda: sess2)
-    llama_client.native_completion(base_url="http://x:8080", prompt="hi", min_p=0.0)
+    llama_client.native_completion(base_url="http://127.0.0.1:8080", prompt="hi", min_p=0.0)
     assert sess2.calls[0]["json"]["min_p"] == 0.0
 
 

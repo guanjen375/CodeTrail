@@ -22,7 +22,7 @@ class _CapturingSession:
         self._payload = payload
         self.calls: list[dict] = []
 
-    def post(self, url, json=None, timeout=None, stream=False):
+    def post(self, url, json=None, timeout=None, stream=False, allow_redirects=True):
         self.calls.append(
             {
                 "url": url,
@@ -43,7 +43,7 @@ def test_vision_completion_uses_current_llamacpp_image_url_api(monkeypatch):
     monkeypatch.setattr(llama_client, "get_session", lambda: session)
 
     result = llama_client.vision_completion(
-        base_url="http://vl:8083",
+        base_url="http://127.0.0.1:8083",
         prompt="忠實分析圖片",
         image_base64="YWJj",
         mime_type="image/png",
@@ -54,7 +54,7 @@ def test_vision_completion_uses_current_llamacpp_image_url_api(monkeypatch):
 
     assert result == "看到了"
     call = session.calls[0]
-    assert call["url"] == "http://vl:8083/v1/chat/completions"
+    assert call["url"] == "http://127.0.0.1:8083/v1/chat/completions"
     assert call["timeout"] == 45
     body = call["json"]
     assert body["max_tokens"] == 321
@@ -71,7 +71,7 @@ def test_vision_completion_requires_finite_output_budget():
 
     with pytest.raises(ValueError, match="max_tokens"):
         llama_client.vision_completion(
-            base_url="http://vl:8083",
+            base_url="http://127.0.0.1:8083",
             prompt="x",
             image_base64="YWJj",
             max_tokens=-1,
@@ -83,7 +83,7 @@ def test_legacy_native_image_data_fails_loud():
 
     with pytest.raises(ValueError, match="vision_completion"):
         llama_client.native_completion(
-            base_url="http://vl:8083",
+            base_url="http://127.0.0.1:8083",
             prompt="x",
             image_data=[{"id": 10, "data": "YWJj"}],
         )

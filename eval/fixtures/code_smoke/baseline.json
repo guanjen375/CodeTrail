@@ -1,0 +1,12 @@
+{
+  "recorded_with": {
+    "tree_sitter": false,
+    "graph_available": false
+  },
+  "localization": {
+    "file_recall_at_5": 1.0,
+    "symbol_recall_at_5": 0.8333
+  },
+  "tree_sitter_found": 0,
+  "abstain_ok": true
+}

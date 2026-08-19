@@ -18,7 +18,9 @@
 """
 
 import ast
+import os
 import re
+import shutil
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
@@ -94,6 +96,12 @@ class Symbol:
     docstring: Optional[str] = None  # 文檔字串
     type_hints: Optional[str] = None  # 類型提示
     comments: Optional[str] = None  # 相關註解
+    # graph 前置(§6.2-6):完整限定名(C++ A::B::f、Python Class.method;
+    # 無 parent 即本名)與產生此符號的 parser backend
+    # ("python-ast" | "tree-sitter" | "regex" | "ctags")。
+    # graph 的 stable node ID 依賴 qualified_name;backend 進 evidence 揭露。
+    qualified_name: Optional[str] = None
+    backend: Optional[str] = None
 
 
 class PythonASTParser:
@@ -119,6 +127,15 @@ class PythonASTParser:
         lines = content.split('\n')
         visitor = _PythonSymbolVisitor(lines, self)
         visitor.visit(tree)
+        for sym in visitor.symbols:
+            sym.backend = "python-ast"
+            if sym.qualified_name is None:
+                # 注意 class 的 parent 欄是「繼承的父類」不是 scope;只有
+                # method 的 parent 是其 class,才進 qualified 鏈。
+                if sym.type == "method" and sym.parent:
+                    sym.qualified_name = f"{sym.parent}.{sym.name}"
+                else:
+                    sym.qualified_name = sym.name
         return visitor.symbols
 
 
@@ -344,11 +361,16 @@ def _get_end_line(node) -> int:
 
 
 def _get_context(lines: list, start_line: int, end_line: int, max_lines: int = 15) -> str:
-    """取得符號的上下文（定義區塊）"""
-    # 取得符號開頭 + 少量內容，用於 embedding
+    """取得符號的上下文（定義區塊）
+
+    以 end_line 截斷:短函式的 context 不得吃到下一個函式的內容
+    (embedding / rerank passage 都吃這份,吃錯鄰居會把檢索訊號污染掉)。
+    上限仍是 max_lines(15 行);儲存端另有 500 chars 截斷。
+    """
     start_idx = start_line - 1
-    # 先取 signature + 前幾行，最多 max_lines
-    context_end = min(start_idx + max_lines, len(lines))
+    # signature + 前幾行:不超過 max_lines,也不超過符號自己的 end_line(1-based 含)
+    context_end = min(start_idx + max_lines, end_line, len(lines))
+    context_end = max(context_end, start_idx + 1)  # 保底含定義行自身
     context_lines = lines[start_idx:context_end]
     return '\n'.join(context_lines)
 
@@ -383,6 +405,14 @@ class TreeSitterParser:
         lines = content.split('\n')
 
         self._extract_symbols(tree.root_node, lines, symbols)
+        for sym in symbols:
+            sym.backend = "tree-sitter"
+            if sym.qualified_name is None:
+                if sym.type == "method" and sym.parent:
+                    sep = "::" if self.language_name in ("c", "cpp") else "."
+                    sym.qualified_name = f"{sym.parent}{sep}{sym.name}"
+                else:
+                    sym.qualified_name = sym.name
         return symbols
 
     def _extract_symbols(self, node, lines: list, symbols: list, parent_name: str = None):
@@ -456,8 +486,13 @@ class TreeSitterParser:
             if child.type not in ('class_body', 'statement_block'):
                 self._extract_js_symbols(child, lines, symbols, parent_name)
 
-    def _extract_cpp_symbols(self, node, lines: list, symbols: list, parent_name: str = None):
-        """提取 C/C++ 符號"""
+    def _extract_cpp_symbols(self, node, lines: list, symbols: list, parent_name: str = None,
+                             qualified_prefix: str = ""):
+        """提取 C/C++ 符號
+
+        qualified_prefix 是外層 namespace/class 鏈("NS::A::"),隨顯式 body
+        遞迴累積,用來組裝 qualified_name(graph stable ID 依賴它,§6.2-6)。
+        """
         node_type = node.type
 
         if node_type in ('class_specifier', 'struct_specifier'):
@@ -465,12 +500,21 @@ class TreeSitterParser:
             if name_node:
                 name = name_node.text.decode('utf-8')
                 sym_type = 'class' if node_type == 'class_specifier' else 'struct'
-                symbols.append(self._make_symbol(node, lines, name, sym_type))
-                # 遞迴處理 body
+                symbols.append(self._make_symbol(
+                    node, lines, name, sym_type,
+                    qualified_name=f"{qualified_prefix}{name}",
+                ))
+                # 顯式走完 body 後 return(§6.2-1):否則尾端的泛型遞迴會把
+                # body 再走一次,class 內每個 method 都輸出兩份(一份 method、
+                # 一份誤標 function)。
                 body = node.child_by_field_name('body')
                 if body:
                     for child in body.children:
-                        self._extract_cpp_symbols(child, lines, symbols, name)
+                        self._extract_cpp_symbols(
+                            child, lines, symbols, name, f"{qualified_prefix}{name}::"
+                        )
+                return
+            # 匿名 class/struct:自身不成符號,fall through 讓泛型遞迴進 body
 
         elif node_type == 'function_definition':
             declarator = node.child_by_field_name('declarator')
@@ -478,23 +522,38 @@ class TreeSitterParser:
                 name = self._get_cpp_function_name(declarator)
                 if name:
                     sym_type = 'method' if parent_name else 'function'
-                    symbols.append(self._make_symbol(node, lines, name, sym_type, parent_name))
+                    symbols.append(self._make_symbol(
+                        node, lines, name, sym_type, parent_name,
+                        qualified_name=f"{qualified_prefix}{name}",
+                    ))
 
         elif node_type == 'namespace_definition':
             name_node = node.child_by_field_name('name')
             if name_node:
                 name = name_node.text.decode('utf-8')
-                symbols.append(self._make_symbol(node, lines, name, 'namespace'))
+                symbols.append(self._make_symbol(
+                    node, lines, name, 'namespace',
+                    qualified_name=f"{qualified_prefix}{name}",
+                ))
+                body = node.child_by_field_name('body')
+                if body:
+                    for child in body.children:
+                        self._extract_cpp_symbols(
+                            child, lines, symbols, parent_name,
+                            f"{qualified_prefix}{name}::",
+                        )
+                return
+            # 匿名 namespace:fall through,內容物不帶前綴
 
         elif node_type == 'template_declaration':
             # template<...> class/function
             for child in node.children:
-                self._extract_cpp_symbols(child, lines, symbols, parent_name)
+                self._extract_cpp_symbols(child, lines, symbols, parent_name, qualified_prefix)
             return  # 已處理子節點
 
         # 遞迴
         for child in node.children:
-            self._extract_cpp_symbols(child, lines, symbols, parent_name)
+            self._extract_cpp_symbols(child, lines, symbols, parent_name, qualified_prefix)
 
     def _get_cpp_function_name(self, declarator) -> Optional[str]:
         """從 declarator 中提取函式名"""
@@ -624,16 +683,27 @@ class TreeSitterParser:
             if child.type not in ('block',):
                 self._extract_python_symbols(child, lines, symbols, parent_name)
 
-    def _make_symbol(self, node, lines: list, name: str, sym_type: str, parent: str = None) -> Symbol:
+    def _make_symbol(self, node, lines: list, name: str, sym_type: str, parent: str = None,
+                     qualified_name: str = None) -> Symbol:
         """建立 Symbol 物件"""
         start_line = node.start_point[0] + 1  # 轉為 1-based
         end_line = node.end_point[0] + 1
 
-        # 取得 context
+        # 取得 context:與 _get_context 同一契約 —— 以 end_line 截斷,
+        # 短符號的 context 不得吃到下一個符號。
         start_idx = start_line - 1
         max_lines = 15
-        context_end = min(start_idx + max_lines, len(lines))
+        context_end = min(start_idx + max_lines, end_line, len(lines))
+        context_end = max(context_end, start_idx + 1)
         context = '\n'.join(lines[start_idx:context_end])
+
+        # 最小 signature(§6.2-3):node 首行起到第一個 '{' 前的文字。
+        # 多行 signature(參數跨行)因此也拿得到完整參數列;空白正規化,
+        # 防禦性截 300 chars(巨型初始化列表之類)。
+        sig_source = ' '.join(lines[start_idx:context_end])
+        brace = sig_source.find('{')
+        signature = sig_source[:brace] if brace != -1 else sig_source
+        signature = ' '.join(signature.split()).strip()[:300] or None
 
         return Symbol(
             name=name,
@@ -641,7 +711,9 @@ class TreeSitterParser:
             start_line=start_line,
             end_line=end_line,
             context=context,
-            parent=parent
+            parent=parent,
+            signature=signature,
+            qualified_name=qualified_name,
         )
 
 
@@ -668,6 +740,14 @@ class RegexFallbackParser:
         elif ext == '.go':
             symbols = self._parse_go(lines)
 
+        sep = "::" if ext in ('.c', '.cpp', '.cc', '.cxx', '.h', '.hpp') else "."
+        for sym in symbols:
+            sym.backend = "regex"
+            if sym.qualified_name is None:
+                if sym.type == "method" and sym.parent:
+                    sym.qualified_name = f"{sym.parent}{sep}{sym.name}"
+                else:
+                    sym.qualified_name = sym.name
         return symbols
 
     def _parse_python(self, lines: list) -> list[Symbol]:
@@ -980,6 +1060,13 @@ class CtagsFallbackParser:
                 except json.JSONDecodeError:
                     continue
 
+            for sym in symbols:
+                sym.backend = "ctags"
+                if sym.qualified_name is None:
+                    if sym.type == "method" and sym.parent:
+                        sym.qualified_name = f"{sym.parent}.{sym.name}"
+                    else:
+                        sym.qualified_name = sym.name
             return symbols
 
         except Exception:
@@ -1017,6 +1104,13 @@ class CtagsFallbackParser:
         elif ext in ('.kt', '.kts'):
             symbols = self._parse_kotlin(lines)
 
+        for sym in symbols:
+            sym.backend = "regex"
+            if sym.qualified_name is None:
+                if sym.type == "method" and sym.parent:
+                    sym.qualified_name = f"{sym.parent}.{sym.name}"
+                else:
+                    sym.qualified_name = sym.name
         return symbols
 
     def _parse_java(self, lines: list) -> list[Symbol]:
@@ -1135,7 +1229,7 @@ def get_parser(filepath: Path):
             '.ts': 'typescript',
             '.tsx': 'tsx',
             '.c': 'c',
-            '.h': 'c',
+            '.h': _h_header_language(),
             '.cpp': 'cpp',
             '.cc': 'cpp',
             '.cxx': 'cpp',
@@ -1153,6 +1247,16 @@ def get_parser(filepath: Path):
     return RegexFallbackParser()
 
 
+def _h_header_language() -> str:
+    """`.h` 的語言判定(§6.2-2):預設 C(firmware 大宗是 C header)。
+
+    env AICODE_H_LANG=c|cpp 可整體覆寫;非法值靜默回 c(header 判定不值得
+    fail-loud,錯了頂多少抽 C++ 特有結構)。鄰檔推斷屬 Phase B。
+    """
+    value = os.environ.get("AICODE_H_LANG", "c").strip().lower()
+    return value if value in ("c", "cpp") else "c"
+
+
 def parse_file(filepath: Path, content: str) -> list[Symbol]:
     """解析檔案並提取符號"""
     parser = get_parser(filepath)
@@ -1161,18 +1265,24 @@ def parse_file(filepath: Path, content: str) -> list[Symbol]:
 
 # 提供解析器狀態資訊
 def get_parser_status() -> dict:
-    """取得解析器狀態"""
-    status = {
+    """逐語言的實際 parser backend(§6.2-4,誠實化)。
+
+    - python 恆為 "python-ast"(stdlib ast;裝不裝 tree-sitter 都一樣,
+      不得誤報 regex)。
+    - tree-sitter 語言:core + 該語言 grammar 都在才是 "tree-sitter",
+      否則 "regex-degraded"(doctor / build_index WARN / evidence 模式都吃
+      這個字串)。
+    - java/kotlin:探測 ctags 是否在 PATH → "ctags" | "regex-degraded"。
+    """
+    languages = {'python': 'python-ast'}
+    for lang in ['c', 'cpp', 'javascript', 'typescript', 'tsx', 'go', 'rust']:
+        ts_lang = _try_load_tree_sitter_language(lang) if HAS_TREE_SITTER else None
+        languages[lang] = 'tree-sitter' if ts_lang else 'regex-degraded'
+    ctags_backend = 'ctags' if shutil.which('ctags') else 'regex-degraded'
+    languages['java'] = ctags_backend
+    languages['kotlin'] = ctags_backend
+
+    return {
         'has_tree_sitter': HAS_TREE_SITTER,
-        'languages': {}
+        'languages': languages,
     }
-
-    if HAS_TREE_SITTER:
-        for lang in ['python', 'javascript', 'typescript', 'tsx', 'c', 'cpp', 'go', 'rust']:
-            ts_lang = _try_load_tree_sitter_language(lang)
-            status['languages'][lang] = 'tree-sitter' if ts_lang else 'regex'
-    else:
-        for lang in ['python', 'javascript', 'typescript', 'c', 'cpp', 'go', 'rust']:
-            status['languages'][lang] = 'ast' if lang == 'python' else 'regex'
-
-    return status

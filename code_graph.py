@@ -1,0 +1,983 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""code_graph — Code RAG 的跨檔案關係圖(§7 最小切片)。
+
+範圍(只有這三種關係;references / inherits / impacted_tests 都不做):
+  - definitions:file → symbol(全語言,nodes 來自 ast_parser.parse_file)
+  - includes / imports:file → file
+      C/C++:tree-sitter 抽 ``#include "..."``(引號形式),basename 對 repo
+      內檔案 resolve;唯一命中 → resolved,多候選 → ambiguity_group,
+      零命中 → unresolved。``<...>`` 系統 include 不入 graph。
+      Python:stdlib ast 抽 import / from-import,模組路徑對 repo 內
+      ``x.py`` / ``x/__init__.py`` resolve;resolve 不到的(stdlib / 第三方)
+      **不記**——Python 端分不出「作者宣稱專案內」,記下來全是噪音。
+  - calls:symbol → symbol(resolved)或 symbol → NULL + unresolved_target。
+      同一 call site 多候選 → 多列共用 ambiguity_group,confidence=syntactic。
+      macro 間接呼叫抽不到(能力限制,後續輪的 config extractor 補)。
+
+儲存(§7.2):``<root>/.code_rag_graph.sqlite3``,WAL。寫端由
+``<root>/.code_rag_graph.lock`` 的 flock 序列化;讀不取鎖,走 WAL snapshot。
+鎖序固定:先 flock 再開 SQLite 連線(防死鎖)。
+
+建置(§7.5):
+  - DB 已存在 → 同一正式 DB 內單一 transaction(BEGIN IMMEDIATE;全刪全插;
+    COMMIT)。**絕不對可能已被開啟的 DB 做 os.replace**——SQLite 明載那是
+    未定義行為(兩個 DB 共用同名 WAL 會互相損毀)。
+  - 首次建立才允許 staging:取鎖後**再檢查一次**檔案是否已出現(另一
+    process 可能剛建完)→ 出現就走 in-place;確認不存在才 tmp 建置 →
+    wal_checkpoint(TRUNCATE) → close → os.replace。
+  - staging 殘留(``.code_rag_graph.sqlite3.tmp*``)只在持鎖時清,且只清這個
+    精確前綴——拿不到鎖就不清,否則會刪到另一 process 的 active staging。
+  - WAL sidecar(``-wal`` / ``-shm``)管理權在 SQLite,程式與人都不得手動刪。
+
+staleness(§7.5):每次 graph query 先比對 §5-3 的掃描快照(與 code_rag
+共用同一 TTL 快照)與 files.content_hash,不符就同步跑增量 transaction
+(stderr 一行)再回答。graph 不是「只建一次」。
+
+已知限制(capability):增量只重抽「變更檔 + includes/imports 直接指向它的
+1-hop 反向依賴檔」;未變檔案裡的 unresolved call 不會因為別的檔新增了同名
+函式而自動 resolve(整體 rebuild 會)。
+"""
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import sqlite3
+import sys
+import time
+import uuid
+from pathlib import Path
+
+import config
+import fs_safety
+from ast_parser import (
+    HAS_TREE_SITTER,
+    Symbol,
+    _try_load_tree_sitter_language,
+    parse_file,
+)
+
+GRAPH_SCHEMA_VERSION = 1
+
+# 只有這些語言有 includes/calls 抽取器;其他語言仍有 defines(symbols)。
+_LANG_BY_EXT = {
+    ".py": "python", ".pyx": "python", ".pyi": "python",
+    ".c": "c",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp",
+}
+
+_CALLABLE_KINDS = ("function", "method")
+
+
+class CodeGraphError(RuntimeError):
+    """graph 檔缺 / 損壞 / schema 不符時,neighbors/path 類查詢的明確錯誤(§2)。"""
+
+
+def _h_ext_lang() -> str:
+    value = os.environ.get("AICODE_H_LANG", "c").strip().lower()
+    return value if value in ("c", "cpp") else "c"
+
+
+def _lang_for(rel_path: str) -> str:
+    ext = Path(rel_path).suffix.lower()
+    if ext == ".h":
+        return _h_ext_lang()
+    return _LANG_BY_EXT.get(ext, ext.lstrip(".") or "unknown")
+
+
+def normalize_signature(signature: str | None) -> str:
+    """參數型別序列的正規化(§7.2 stable ID tie-break)。
+
+    去空白、去參數名、保留型別序列:``foo(int a, uint32_t *out)`` →
+    ``int,uint32_t*``。同 arity 不同型別必須得到不同結果。
+    """
+    m = re.search(r"\(([^)]*)\)", signature or "")
+    if not m:
+        return ""
+    types = []
+    for raw in m.group(1).split(","):
+        raw = raw.strip()
+        if not raw or raw == "void":
+            continue
+        # 去掉尾端的參數名(identifier);純型別參數(如宣告 "int")會被整個
+        # 吃掉,fallback 回原文,不然型別本身就丟了。
+        stripped = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*$", "", raw).strip()
+        types.append("".join((stripped or raw).split()))
+    return ",".join(types)
+
+
+def make_node_id(rel_path: str, lang: str, kind: str, qualified_name: str,
+                 discriminator: str = "") -> str:
+    """stable node ID(§7.2)。
+
+    base = hash(relative_path, lang, kind, qualified_name)。僅當 base 衝突
+    (同檔同 kind 同 qualified_name,即 overload)時,呼叫端才傳
+    discriminator(normalized signature hash;仍撞再附 occurrence index)。
+    非 overload 函式修改 signature 不得改變 ID —— 所以 discriminator 平常是空。
+    """
+    payload = "\x1f".join([rel_path, lang, kind, qualified_name, discriminator])
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def _assign_node_ids(rel_path: str, lang: str, symbols: list[Symbol]) -> list[tuple[str, Symbol]]:
+    """整檔一次指派 stable ID,含 overload 消歧(§7.2)。"""
+    groups: dict[tuple[str, str], list[Symbol]] = {}
+    for sym in symbols:
+        key = (sym.type, sym.qualified_name or sym.name)
+        groups.setdefault(key, []).append(sym)
+
+    out: list[tuple[str, Symbol]] = []
+    for (kind, qualified), members in groups.items():
+        if len(members) == 1:
+            out.append((make_node_id(rel_path, lang, kind, qualified), members[0]))
+            continue
+        # overload:先用 normalized signature 消歧;normalized 後仍同
+        # (#ifdef 兩臂的同款定義)再附出現序,保證 PRIMARY KEY 不撞。
+        sig_seen: dict[str, int] = {}
+        for sym in sorted(members, key=lambda s: s.start_line):
+            sig_key = normalize_signature(sym.signature)
+            occurrence = sig_seen.get(sig_key, 0)
+            sig_seen[sig_key] = occurrence + 1
+            discriminator = f"sig:{sig_key}"
+            if occurrence:
+                discriminator += f"#\x1f{occurrence}"
+            out.append((make_node_id(rel_path, lang, kind, qualified, discriminator), sym))
+    order = {id(sym): i for i, (_, sym) in enumerate(out)}
+    out.sort(key=lambda pair: (pair[1].start_line, order[id(pair[1])]))
+    return out
+
+
+# ============================================================
+# 抽取器(§7.3)
+# ============================================================
+def _extract_python_relations(rel_path: str, content: str,
+                              nodes: list[tuple[str, Symbol]]):
+    """Python:stdlib ast 抽 imports 與 calls。回傳 (imports, calls)。
+
+    imports: [(module_parts: tuple, level: int, lineno)]
+    calls:   [(caller_node_id, callee_name, lineno, kind)]  kind="name"|"attr"
+    """
+    import ast as _ast
+
+    try:
+        tree = _ast.parse(content)
+    except SyntaxError:
+        return [], []
+
+    imports: list[tuple[tuple[str, ...], int, int]] = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            for alias in node.names:
+                imports.append((tuple(alias.name.split(".")), 0, node.lineno))
+        elif isinstance(node, _ast.ImportFrom):
+            parts = tuple(node.module.split(".")) if node.module else ()
+            imports.append((parts, node.level, node.lineno))
+
+    # caller 定位:call 行號落在哪個 function/method 的範圍內(取最內層)
+    callable_nodes = [
+        (nid, sym) for nid, sym in nodes if sym.type in _CALLABLE_KINDS
+    ]
+
+    def _enclosing(lineno: int) -> str | None:
+        best = None
+        best_span = None
+        for nid, sym in callable_nodes:
+            if sym.start_line <= lineno <= sym.end_line:
+                span = sym.end_line - sym.start_line
+                if best_span is None or span < best_span:
+                    best, best_span = nid, span
+        return best
+
+    calls: list[tuple[str, str, int, str]] = []
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, _ast.Name):
+            name, kind = func.id, "name"
+        elif isinstance(func, _ast.Attribute):
+            name, kind = func.attr, "attr"
+        else:
+            continue
+        caller = _enclosing(node.lineno)
+        if caller is None:
+            continue  # module-level call:本輪不建 file→symbol 的 call 邊
+        calls.append((caller, name, node.lineno, kind))
+    return imports, calls
+
+
+def _extract_c_relations(rel_path: str, content: str, lang: str,
+                         nodes: list[tuple[str, Symbol]]):
+    """C/C++:tree-sitter 抽 ``#include "..."`` 與 call_expression。
+
+    回傳 (includes, calls):
+      includes: [(raw_target: str, lineno)]      # 只有引號形式
+      calls:    [(caller_node_id, callee_name, lineno)]
+    """
+    ts_lang = _try_load_tree_sitter_language(lang) if HAS_TREE_SITTER else None
+    if ts_lang is None:
+        return [], []
+    from tree_sitter import Parser
+
+    try:
+        tree = Parser(ts_lang).parse(bytes(content, "utf-8"))
+    except Exception:
+        return [], []
+
+    includes: list[tuple[str, int]] = []
+    calls: list[tuple[str, str, int]] = []
+
+    callable_nodes = [
+        (nid, sym) for nid, sym in nodes if sym.type in _CALLABLE_KINDS
+    ]
+
+    def _enclosing(lineno: int) -> str | None:
+        best = None
+        best_span = None
+        for nid, sym in callable_nodes:
+            if sym.start_line <= lineno <= sym.end_line:
+                span = sym.end_line - sym.start_line
+                if best_span is None or span < best_span:
+                    best, best_span = nid, span
+        return best
+
+    def walk(node):
+        if node.type == "preproc_include":
+            path_node = node.child_by_field_name("path")
+            if path_node is not None and path_node.type == "string_literal":
+                raw = path_node.text.decode("utf-8", errors="replace").strip('"')
+                includes.append((raw, node.start_point[0] + 1))
+            # system_lib_string(<...>)刻意不入 graph
+        elif node.type == "call_expression":
+            fn = node.child_by_field_name("function")
+            if fn is not None and fn.type in ("identifier", "qualified_identifier",
+                                              "field_identifier"):
+                name = fn.text.decode("utf-8", errors="replace")
+                lineno = node.start_point[0] + 1
+                caller = _enclosing(lineno)
+                if caller is not None:
+                    calls.append((caller, name, lineno))
+        for child in node.children:
+            walk(child)
+
+    walk(tree.root_node)
+    return includes, calls
+
+
+# ============================================================
+# CodeGraph
+# ============================================================
+class CodeGraph:
+    def __init__(self, root: str):
+        self.root = Path(root).resolve()
+        self.db_file = self.root / config.CODE_RAG_GRAPH_FILE
+        self.lock_file = self.root / config.CODE_RAG_GRAPH_LOCK_FILE
+        # 掃描復用 code_rag 的 scope + TTL 快照(§5-3 共用;同 key 同快照,
+        # invalidate_scan_cache 同步失效兩邊)。
+        import code_rag as _code_rag
+
+        self._scanner = _code_rag.CodeRAG(str(self.root))
+
+    # -------- 掃描 --------
+    def _scan_files(self) -> dict:
+        return self._scanner._scan_code_files()
+
+    # -------- 連線 / 安全 --------
+    def _assert_db_path_safe(self) -> None:
+        """sqlite3.connect 不暴露 O_NOFOLLOW(§7.6):connect 前先以
+        O_NOFOLLOW 預建立/驗證路徑是 regular file,再交給 SQLite。"""
+        fs_safety.ensure_parent_within_root(self.db_file, self.root)
+        if self.db_file.exists() or self.db_file.is_symlink():
+            fd = fs_safety.open_regular_file_nofollow(self.db_file)
+            os.close(fd)
+
+    def _connect(self, path: Path | None = None) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(path or self.db_file))
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    # -------- schema --------
+    @staticmethod
+    def _create_schema(conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS files(
+                path TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                lang TEXT NOT NULL,
+                backend TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS nodes(
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                qualified_name TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                backend TEXT NOT NULL,
+                confidence TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS edges(
+                src_kind TEXT NOT NULL,
+                src_id   TEXT NOT NULL,
+                dst_kind TEXT,
+                dst_id   TEXT,
+                unresolved_target TEXT,
+                ambiguity_group TEXT,
+                type TEXT NOT NULL,
+                evidence_path TEXT NOT NULL,
+                evidence_line INTEGER NOT NULL,
+                backend TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                CHECK ((dst_id IS NULL) = (unresolved_target IS NOT NULL)
+                       OR ambiguity_group IS NOT NULL)
+            );
+            CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
+            CREATE INDEX IF NOT EXISTS idx_nodes_path ON nodes(path);
+            CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, type);
+            CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, type);
+            CREATE TABLE IF NOT EXISTS index_metadata(
+                schema_version INTEGER NOT NULL,
+                scope_fingerprint TEXT NOT NULL,
+                parser_versions TEXT NOT NULL,
+                created TEXT NOT NULL,
+                updated TEXT NOT NULL
+            );
+            """
+        )
+
+    def _parser_versions(self) -> str:
+        try:
+            import tree_sitter
+
+            ts = getattr(tree_sitter, "__version__", "?")
+        except ImportError:
+            ts = "absent"
+        return f"python-ast:{sys.version_info.major}.{sys.version_info.minor};tree-sitter:{ts}"
+
+    # -------- 抽取單檔 --------
+    def _extract_file(self, rel_path: str, filepath: Path, file_hash: str):
+        """回傳 (file_row, node_rows, raw_relations)。
+
+        raw_relations 的 resolve(跨檔)在 build/增量彙整時做。
+        """
+        try:
+            content = filepath.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        try:
+            symbols = parse_file(filepath, content)
+        except Exception:
+            symbols = []
+
+        lang = _lang_for(rel_path)
+        backend = symbols[0].backend if symbols else "none"
+        id_pairs = _assign_node_ids(rel_path, lang, symbols)
+
+        node_rows = [
+            (
+                nid, rel_path, sym.type, sym.name,
+                sym.qualified_name or sym.name,
+                sym.start_line, sym.end_line,
+                sym.backend or "unknown", "exact",
+            )
+            for nid, sym in id_pairs
+        ]
+
+        imports: list = []
+        includes: list = []
+        calls: list = []
+        if lang == "python":
+            imports, calls_py = _extract_python_relations(rel_path, content, id_pairs)
+            calls = [(caller, name, lineno, kind) for caller, name, lineno, kind in calls_py]
+        elif lang in ("c", "cpp"):
+            includes, calls_c = _extract_c_relations(rel_path, content, lang, id_pairs)
+            calls = [(caller, name, lineno, "name") for caller, name, lineno in calls_c]
+
+        file_row = (rel_path, file_hash, lang, backend)
+        return file_row, node_rows, {"imports": imports, "includes": includes, "calls": calls}
+
+    # -------- resolve --------
+    @staticmethod
+    def _resolve_import(parts: tuple, level: int, src_rel: str, all_files: set[str]) -> str | None:
+        """Python 模組 → repo 檔案。resolve 不到回 None(不記邊)。"""
+        if level:  # 相對 import:從 src 的 package 往上走 level-1 層
+            base = Path(src_rel).parent
+            for _ in range(level - 1):
+                base = base.parent
+            candidate_parts = list(base.parts) + list(parts)
+        else:
+            candidate_parts = list(parts)
+        if not candidate_parts:
+            return None
+        # 逐漸縮短:from a.b import name 中 name 可能是符號不是模組
+        for cut in range(len(candidate_parts), 0, -1):
+            head = candidate_parts[:cut]
+            for candidate in (
+                "/".join(head) + ".py",
+                "/".join(head + ["__init__.py"]),
+            ):
+                if candidate in all_files:
+                    return candidate
+        return None
+
+    @staticmethod
+    def _resolve_include(raw: str, all_files: set[str]) -> list[str]:
+        """引號 include → repo 檔案候選(basename 比對;可能 0/1/多個)。"""
+        target = raw.replace("\\", "/")
+        # 先試完整相對路徑,再退 basename
+        if target in all_files:
+            return [target]
+        base = target.rpartition("/")[2]
+        return sorted(f for f in all_files if f.rpartition("/")[2] == base)
+
+    # -------- build --------
+    def build(self, verbose: bool = False) -> None:
+        """整體建置(§7.5)。首建走 staging,已存在走 in-place transaction。"""
+        files = self._scan_files()
+        lock_fd = fs_safety.acquire_file_lock(self.lock_file, self.root)
+        try:
+            # staging 殘留清理:只在持鎖時、只清自家精確前綴(§7.5)
+            for stale in self.root.glob(f"{self.db_file.name}.tmp*"):
+                stale.unlink(missing_ok=True)
+
+            self._assert_db_path_safe()
+            if self.db_file.exists():
+                self._rebuild_in_place(files, verbose=verbose)
+            else:
+                self._staging_create(files, verbose=verbose)
+        finally:
+            fs_safety.release_file_lock(lock_fd)
+
+    def _collect_all(self, files: dict):
+        file_rows, node_rows, per_file_relations = [], [], {}
+        for rel_path in sorted(files):
+            extracted = self._extract_file(rel_path, files[rel_path]["filepath"],
+                                           files[rel_path]["hash"])
+            if extracted is None:
+                continue
+            file_row, nodes, relations = extracted
+            file_rows.append(file_row)
+            node_rows.extend(nodes)
+            per_file_relations[rel_path] = relations
+        return file_rows, node_rows, per_file_relations
+
+    def _edge_rows(self, file_rows, node_rows, per_file_relations):
+        """把 raw relations resolve 成 edges rows(跨檔一致視角)。"""
+        all_files = {row[0] for row in file_rows}
+        node_by_id = {row[0]: row for row in node_rows}
+        # name → node ids(callable 才是 call 的合法 dst)
+        callable_by_name: dict[str, list[str]] = {}
+        callable_by_qualified: dict[str, list[str]] = {}
+        for row in node_rows:
+            nid, _path, kind, name, qualified = row[0], row[1], row[2], row[3], row[4]
+            if kind in _CALLABLE_KINDS:
+                callable_by_name.setdefault(name, []).append(nid)
+                callable_by_qualified.setdefault(qualified, []).append(nid)
+
+        edges = []
+        for rel_path, relations in per_file_relations.items():
+            # defines:file → symbol
+            for row in node_rows:
+                if row[1] == rel_path:
+                    edges.append((
+                        "file", rel_path, "symbol", row[0], None, None,
+                        "defines", rel_path, row[5], row[7], "exact",
+                    ))
+            lang = _lang_for(rel_path)
+            edge_backend = "python-ast" if lang == "python" else "tree-sitter"
+
+            # includes(C/C++ 引號)
+            for raw, lineno in relations["includes"]:
+                candidates = self._resolve_include(raw, all_files)
+                if len(candidates) == 1:
+                    edges.append((
+                        "file", rel_path, "file", candidates[0], None, None,
+                        "includes", rel_path, lineno, edge_backend, "resolved",
+                    ))
+                elif not candidates:
+                    edges.append((
+                        "file", rel_path, None, None, raw, None,
+                        "includes", rel_path, lineno, edge_backend, "syntactic",
+                    ))
+                else:
+                    group = uuid.uuid4().hex[:12]
+                    for candidate in candidates:
+                        edges.append((
+                            "file", rel_path, "file", candidate, raw, group,
+                            "includes", rel_path, lineno, edge_backend, "syntactic",
+                        ))
+
+            # imports(Python;resolve 不到不記)
+            for parts, level, lineno in relations["imports"]:
+                dst = self._resolve_import(parts, level, rel_path, all_files)
+                if dst is not None:
+                    edges.append((
+                        "file", rel_path, "file", dst, None, None,
+                        "imports", rel_path, lineno, "python-ast", "resolved",
+                    ))
+
+            # calls
+            for call in relations["calls"]:
+                caller_id, name, lineno, kind = call
+                if caller_id not in node_by_id:
+                    continue
+                targets = callable_by_qualified.get(name) or callable_by_name.get(name) or []
+                # 自我遞迴以外,排除「同名即自己」誤指:多候選照實列 ambiguity
+                if len(targets) == 1:
+                    confidence = "resolved" if kind == "name" else "heuristic"
+                    edges.append((
+                        "symbol", caller_id, "symbol", targets[0], None, None,
+                        "calls", rel_path, lineno, edge_backend, confidence,
+                    ))
+                elif not targets:
+                    edges.append((
+                        "symbol", caller_id, None, None, name, None,
+                        "calls", rel_path, lineno, edge_backend, "syntactic",
+                    ))
+                else:
+                    group = uuid.uuid4().hex[:12]
+                    for target in sorted(targets):
+                        edges.append((
+                            "symbol", caller_id, "symbol", target, name, group,
+                            "calls", rel_path, lineno, edge_backend, "syntactic",
+                        ))
+        return edges
+
+    _INSERT_FILE = "INSERT INTO files(path, content_hash, lang, backend) VALUES (?,?,?,?)"
+    _INSERT_NODE = (
+        "INSERT INTO nodes(id, path, kind, name, qualified_name, start_line, end_line,"
+        " backend, confidence) VALUES (?,?,?,?,?,?,?,?,?)"
+    )
+    _INSERT_EDGE = (
+        "INSERT INTO edges(src_kind, src_id, dst_kind, dst_id, unresolved_target,"
+        " ambiguity_group, type, evidence_path, evidence_line, backend, confidence)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+    )
+
+    def _staging_create(self, files: dict, *, verbose: bool) -> None:
+        # 取鎖後二次檢查(§7.5):另一 process 可能剛建完
+        if self.db_file.exists():
+            self._rebuild_in_place(files, verbose=verbose)
+            return
+        tmp_path = self.root / f"{self.db_file.name}.tmp{os.getpid()}"
+        fd = fs_safety.open_regular_file_nofollow(tmp_path)
+        os.close(fd)
+        conn = self._connect(tmp_path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._create_schema(conn)
+            file_rows, node_rows, relations = self._collect_all(files)
+            edges = self._edge_rows(file_rows, node_rows, relations)
+            now = time.strftime("%Y-%m-%dT%H:%M:%S")
+            with conn:
+                conn.executemany(self._INSERT_FILE, file_rows)
+                conn.executemany(self._INSERT_NODE, node_rows)
+                conn.executemany(self._INSERT_EDGE, edges)
+                conn.execute(
+                    "INSERT INTO index_metadata VALUES (?,?,?,?,?)",
+                    (GRAPH_SCHEMA_VERSION, self._scanner.scope.fingerprint,
+                     self._parser_versions(), now, now),
+                )
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except BaseException:
+            conn.close()
+            tmp_path.unlink(missing_ok=True)
+            Path(f"{tmp_path}-wal").unlink(missing_ok=True)
+            Path(f"{tmp_path}-shm").unlink(missing_ok=True)
+            raise
+        conn.close()
+        os.replace(tmp_path, self.db_file)
+        if verbose:
+            print(f"[CODE_GRAPH] built: {len(node_rows)} nodes", file=sys.stderr)
+
+    def _rebuild_in_place(self, files: dict, *, verbose: bool) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._create_schema(conn)
+            file_rows, node_rows, relations = self._collect_all(files)
+            edges = self._edge_rows(file_rows, node_rows, relations)
+            now = time.strftime("%Y-%m-%dT%H:%M:%S")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM edges")
+                conn.execute("DELETE FROM nodes")
+                conn.execute("DELETE FROM files")
+                conn.execute("DELETE FROM index_metadata")
+                conn.executemany(self._INSERT_FILE, file_rows)
+                conn.executemany(self._INSERT_NODE, node_rows)
+                conn.executemany(self._INSERT_EDGE, edges)
+                conn.execute(
+                    "INSERT INTO index_metadata VALUES (?,?,?,?,?)",
+                    (GRAPH_SCHEMA_VERSION, self._scanner.scope.fingerprint,
+                     self._parser_versions(), now, now),
+                )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+        if verbose:
+            print(f"[CODE_GRAPH] rebuilt in place: {len(node_rows)} nodes", file=sys.stderr)
+
+    # -------- staleness / 增量(§7.5) --------
+    def _db_ready(self) -> bool:
+        if not self.db_file.exists():
+            return False
+        try:
+            conn = self._connect()
+        except sqlite3.Error:
+            return False
+        try:
+            row = conn.execute(
+                "SELECT schema_version, scope_fingerprint FROM index_metadata LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        finally:
+            conn.close()
+        if row is None or row[0] != GRAPH_SCHEMA_VERSION:
+            return False
+        return True
+
+    def ensure_fresh(self) -> None:
+        """query 前置:graph 缺 → CodeGraphError;落後 → 同步增量後回答。"""
+        if not self._db_ready():
+            if self.db_file.exists():
+                raise CodeGraphError(
+                    "code graph 存在但 schema 不符或損壞;砍掉 "
+                    f"{self.db_file.name} 後重建(mode='semantic' 不受影響)"
+                )
+            # 首次:直接建
+            self.build(verbose=False)
+            return
+
+        files = self._scan_files()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT scope_fingerprint FROM index_metadata LIMIT 1").fetchone()
+            db_hashes = dict(conn.execute("SELECT path, content_hash FROM files"))
+        finally:
+            conn.close()
+
+        if row and row[0] != self._scanner.scope.fingerprint:
+            print("[CODE_GRAPH] scope fingerprint changed; full rebuild", file=sys.stderr)
+            self.build(verbose=False)
+            return
+
+        current = {rel: info["hash"] for rel, info in files.items()}
+        changed = sorted(
+            rel for rel, h in current.items() if db_hashes.get(rel) != h
+        )
+        deleted = sorted(set(db_hashes) - set(current))
+        if not changed and not deleted:
+            return
+        print(
+            f"[CODE_GRAPH] stale ({len(changed)} changed, {len(deleted)} deleted); "
+            "incremental update", file=sys.stderr,
+        )
+        self._incremental_update(files, changed, deleted)
+
+    def _incremental_update(self, files: dict, changed: list[str], deleted: list[str]) -> None:
+        """單一 transaction 涵蓋「變更檔 + 1-hop 反向依賴檔」的 delete+insert。"""
+        lock_fd = fs_safety.acquire_file_lock(self.lock_file, self.root)
+        try:
+            conn = self._connect()
+            try:
+                dirty = set(changed) | set(deleted)
+                placeholders = ",".join("?" * len(dirty))
+                reverse = {
+                    row[0] for row in conn.execute(
+                        f"SELECT DISTINCT src_id FROM edges WHERE type IN"
+                        f" ('includes','imports') AND dst_kind='file'"
+                        f" AND dst_id IN ({placeholders})",
+                        sorted(dirty),
+                    )
+                }
+                affected = sorted((dirty | reverse) & (set(files) | set(deleted)))
+                re_extract = [rel for rel in affected if rel in files]
+
+                file_rows, node_rows, relations = [], [], {}
+                for rel in re_extract:
+                    extracted = self._extract_file(
+                        rel, files[rel]["filepath"], files[rel]["hash"])
+                    if extracted is None:
+                        continue
+                    row, nodes, rel_relations = extracted
+                    file_rows.append(row)
+                    node_rows.extend(nodes)
+                    relations[rel] = rel_relations
+
+                # resolve 對照的檔案全集 = 現存所有檔(含未重抽的)
+                all_files_rows = [(rel, files[rel]["hash"], _lang_for(rel), "") for rel in files]
+                edges = self._edge_rows(all_files_rows, node_rows, relations)
+                # _edge_rows 的 defines 只涵蓋重抽檔(relations keys),但它掃
+                # node_rows 全集;這裡 node_rows 本來就只含重抽檔,一致。
+
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    all_dirty = sorted(set(affected))
+                    ph = ",".join("?" * len(all_dirty))
+                    conn.execute(
+                        f"DELETE FROM edges WHERE evidence_path IN ({ph})", all_dirty)
+                    conn.execute(
+                        f"DELETE FROM edges WHERE src_kind='file' AND src_id IN ({ph})",
+                        all_dirty)
+                    conn.execute(f"DELETE FROM nodes WHERE path IN ({ph})", all_dirty)
+                    conn.execute(f"DELETE FROM files WHERE path IN ({ph})", all_dirty)
+                    conn.executemany(self._INSERT_FILE, file_rows)
+                    conn.executemany(self._INSERT_NODE, node_rows)
+                    conn.executemany(self._INSERT_EDGE, edges)
+                    # 指向已消失 node 的 calls → 標 unresolved(檔案刪除語意)
+                    conn.execute(
+                        """
+                        UPDATE edges SET unresolved_target = COALESCE(
+                            unresolved_target,
+                            (SELECT name FROM nodes WHERE id = edges.dst_id), '?'),
+                            dst_kind = NULL, dst_id = NULL, confidence='syntactic'
+                        WHERE type='calls' AND dst_id IS NOT NULL
+                          AND dst_id NOT IN (SELECT id FROM nodes)
+                        """
+                    )
+                    conn.execute(
+                        "UPDATE index_metadata SET updated = ?",
+                        (time.strftime("%Y-%m-%dT%H:%M:%S"),),
+                    )
+                    conn.commit()
+                except BaseException:
+                    conn.rollback()
+                    raise
+            finally:
+                conn.close()
+        finally:
+            fs_safety.release_file_lock(lock_fd)
+
+    # ============================================================
+    # Traversal API(§7.4;內部,不開新 MCP tool)
+    # ============================================================
+    def _require_ready(self):
+        if not self._db_ready():
+            raise CodeGraphError(
+                "code graph 不存在或不可讀;semantic 查詢不受影響,"
+                "neighbors/path 需要先成功 build"
+            )
+
+    def _query(self, sql: str, params=()):
+        conn = self._connect()
+        try:
+            return conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+
+    def find_nodes(self, name: str, limit: int = 20) -> list[dict]:
+        self._require_ready()
+        rows = self._query(
+            "SELECT id, path, kind, name, qualified_name, start_line, end_line,"
+            " backend, confidence FROM nodes WHERE name = ? OR qualified_name = ?"
+            " ORDER BY path, start_line LIMIT ?",
+            (name, name, limit),
+        )
+        return [self._node_dict(r) for r in rows]
+
+    @staticmethod
+    def _node_dict(r) -> dict:
+        return {
+            "id": r[0], "path": r[1], "kind": r[2], "name": r[3],
+            "qualified_name": r[4], "start_line": r[5], "end_line": r[6],
+            "backend": r[7], "confidence": r[8],
+        }
+
+    def _edge_dict(self, r, name_cache: dict) -> dict:
+        src_name = self._id_name(r[1], name_cache) if r[0] == "symbol" else r[1]
+        dst_name = (
+            self._id_name(r[3], name_cache) if (r[2] == "symbol" and r[3]) else r[3]
+        )
+        return {
+            "src_kind": r[0], "src_id": r[1], "src_name": src_name,
+            "dst_kind": r[2], "dst_id": r[3], "dst_name": dst_name,
+            "unresolved_target": r[4], "ambiguity_group": r[5],
+            "type": r[6], "evidence_path": r[7], "evidence_line": r[8],
+            "backend": r[9], "confidence": r[10],
+            "resolved": r[3] is not None,
+        }
+
+    _EDGE_COLS = ("src_kind, src_id, dst_kind, dst_id, unresolved_target,"
+                  " ambiguity_group, type, evidence_path, evidence_line,"
+                  " backend, confidence")
+
+    def _id_name(self, node_id: str, cache: dict) -> str:
+        if node_id not in cache:
+            rows = self._query("SELECT name FROM nodes WHERE id = ?", (node_id,))
+            cache[node_id] = rows[0][0] if rows else node_id
+        return cache[node_id]
+
+    def _evidence_in_scope(self, edge: dict) -> bool:
+        """§7.4 containment:evidence 路徑必須過 IndexScope.should_index_file。
+
+        DB 被外部竄改塞進 scope 外路徑時,查詢端把它濾掉,不把 root 外
+        (或已被 scope 排除)的路徑外洩到回答裡。刻意不耦合 media._safe_path。
+        """
+        return self._scanner.scope.should_index_file(edge.get("evidence_path", ""))
+
+    def neighbors(self, node_id: str, edge_types: tuple = ("calls",),
+                  direction: str = "both", hops: int = 1, limit: int = 50) -> dict:
+        """BFS ≤2 hops。回傳 {nodes, edges, truncated}。deterministic ordering。"""
+        self._require_ready()
+        hops = min(max(int(hops), 1), 2)
+        type_ph = ",".join("?" * len(edge_types))
+        seen_nodes = {node_id}
+        frontier = [node_id]
+        edges_out = []
+        truncated = False
+        name_cache: dict = {}
+        for _ in range(hops):
+            next_frontier = []
+            for nid in frontier:
+                clauses = []
+                if direction in ("out", "both"):
+                    clauses.append(("src_id", "dst_id"))
+                if direction in ("in", "both"):
+                    clauses.append(("dst_id", "src_id"))
+                for anchor_col, other_col in clauses:
+                    rows = self._query(
+                        f"SELECT {self._EDGE_COLS} FROM edges WHERE {anchor_col} = ?"
+                        f" AND type IN ({type_ph})"
+                        " ORDER BY evidence_path, evidence_line",
+                        (nid, *edge_types),
+                    )
+                    for r in rows:
+                        if len(edges_out) >= limit * 2:
+                            truncated = True
+                            break
+                        edge = self._edge_dict(r, name_cache)
+                        if not self._evidence_in_scope(edge):
+                            continue
+                        edges_out.append(edge)
+                        other = r[3] if other_col == "dst_id" else r[1]
+                        if other and other not in seen_nodes:
+                            if len(seen_nodes) >= limit:
+                                truncated = True
+                                continue
+                            seen_nodes.add(other)
+                            next_frontier.append(other)
+            frontier = next_frontier
+        node_rows = []
+        for nid in sorted(seen_nodes):
+            rows = self._query(
+                "SELECT id, path, kind, name, qualified_name, start_line, end_line,"
+                " backend, confidence FROM nodes WHERE id = ?", (nid,))
+            node_rows.extend(self._node_dict(r) for r in rows)
+        return {"nodes": node_rows, "edges": edges_out, "truncated": truncated}
+
+    def shortest_evidence_paths(self, src_names: set, dst_names: set,
+                                max_hops: int = 4, limit: int = 3) -> list[list[dict]]:
+        """resolved calls 邊上的最短路徑(≤max_hops、≤limit 條、cycle-safe)。"""
+        self._require_ready()
+        max_hops = min(int(max_hops), 4)
+        limit = min(int(limit), 3)
+        src_ids = {n["id"] for name in sorted(src_names) for n in self.find_nodes(name)}
+        dst_ids = {n["id"] for name in sorted(dst_names) for n in self.find_nodes(name)}
+        if not src_ids or not dst_ids:
+            missing = "src" if not src_ids else "dst"
+            raise CodeGraphError(f"path 端點 resolve 失敗({missing});用 find_nodes 檢查名稱")
+
+        name_cache: dict = {}
+        results: list[list[dict]] = []
+        # BFS(paths as edge lists);deterministic:鄰接按 (dst 名, evidence) 排序
+        queue: list[tuple[str, list]] = [(sid, []) for sid in sorted(src_ids)]
+        best_depth: dict[str, int] = {sid: 0 for sid in src_ids}
+        while queue and len(results) < limit:
+            nid, path = queue.pop(0)
+            if len(path) >= max_hops:
+                continue
+            rows = self._query(
+                f"SELECT {self._EDGE_COLS} FROM edges WHERE src_id = ?"
+                " AND type='calls' AND dst_id IS NOT NULL"
+                " ORDER BY evidence_path, evidence_line",
+                (nid,),
+            )
+            for r in rows:
+                dst = r[3]
+                on_path = {e["src_id"] for e in path} | {nid}
+                if dst in on_path:
+                    continue  # cycle
+                step = self._edge_dict(r, name_cache)
+                if not self._evidence_in_scope(step):
+                    continue
+                new_path = path + [step]
+                if dst in dst_ids:
+                    results.append(new_path)
+                    if len(results) >= limit:
+                        break
+                    continue
+                depth = len(new_path)
+                if best_depth.get(dst, max_hops + 1) > depth:
+                    best_depth[dst] = depth
+                    queue.append((dst, new_path))
+        return results
+
+    def callers(self, symbol_name: str) -> list[dict]:
+        self._require_ready()
+        ids = [n["id"] for n in self.find_nodes(symbol_name)]
+        out = []
+        name_cache: dict = {}
+        for nid in ids:
+            rows = self._query(
+                f"SELECT {self._EDGE_COLS} FROM edges WHERE dst_id = ? AND type='calls'"
+                " ORDER BY evidence_path, evidence_line", (nid,))
+            out.extend(e for e in (self._edge_dict(r, name_cache) for r in rows)
+                       if self._evidence_in_scope(e))
+        return out
+
+    def callees(self, symbol_name: str) -> list[dict]:
+        self._require_ready()
+        ids = [n["id"] for n in self.find_nodes(symbol_name)]
+        out = []
+        name_cache: dict = {}
+        for nid in ids:
+            rows = self._query(
+                f"SELECT {self._EDGE_COLS} FROM edges WHERE src_id = ? AND type='calls'"
+                " ORDER BY evidence_path, evidence_line", (nid,))
+            out.extend(e for e in (self._edge_dict(r, name_cache) for r in rows)
+                       if self._evidence_in_scope(e))
+        return out
+
+    def file_includes(self, rel_path: str) -> list[str]:
+        """某檔的 direct includes/imports(resolved dst rel paths,排序)。"""
+        self._require_ready()
+        rows = self._query(
+            "SELECT DISTINCT dst_id FROM edges WHERE src_kind='file' AND src_id = ?"
+            " AND type IN ('includes','imports') AND dst_id IS NOT NULL"
+            " ORDER BY dst_id", (rel_path,))
+        return [r[0] for r in rows]
+
+    def iter_call_edges(self) -> list[dict]:
+        self._require_ready()
+        name_cache: dict = {}
+        rows = self._query(
+            f"SELECT {self._EDGE_COLS} FROM edges WHERE type='calls'"
+            " ORDER BY evidence_path, evidence_line")
+        return [e for e in (self._edge_dict(r, name_cache) for r in rows)
+                if self._evidence_in_scope(e)]
+
+    def relations_for_symbol(self, name: str, limit: int = 5) -> list[dict]:
+        """include_evidence 用的 1-hop 摘要(≤limit 條)。graph 缺席由呼叫端處理。"""
+        edges = (self.callees(name) + self.callers(name))[:limit]
+        return edges
+
+    def suggest_names(self, text: str, limit: int = 5) -> list[str]:
+        """neighbors 無 anchor 時的近似候選(substring match,§8.2)。"""
+        self._require_ready()
+        pattern = f"%{text.strip()}%"
+        rows = self._query(
+            "SELECT DISTINCT name FROM nodes WHERE name LIKE ?"
+            " ORDER BY name LIMIT ?", (pattern, limit))
+        return [r[0] for r in rows]
+
+    def close(self) -> None:
+        """目前連線都是 per-query 開關;保留此 API 供呼叫端對稱使用。"""

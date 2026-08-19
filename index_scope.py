@@ -62,6 +62,8 @@ from pathlib import Path
 from config import (
     CODE_EXTENSIONS,
     CODE_RAG_CACHE_FILE,
+    CODE_RAG_GRAPH_FILE,
+    CODE_RAG_GRAPH_LOCK_FILE,
     IGNORED_FILES,
     IGNORED_PATTERNS,
     INDEX_CONDA_MARKER_DIR,
@@ -95,13 +97,19 @@ _PYTHON_DIR_RE = re.compile(INDEX_PYTHON_VERSION_DIR_RE)
 
 # 索引自己吐出來的產物永遠不進索引。committed 版本是在 walk 裡用 skip_files 擋的;
 # 現在檔名判定只有 should_index_file 一個入口,這條就得搬進 hard gate。
-# (目前三個名字都是 dotfile,dotfile 規則本來就會擋 —— 但那是巧合,不是契約。)
+# (目前名字都是 dotfile,dotfile 規則本來就會擋 —— 但那是巧合,不是契約。)
 _CACHE_BASE = CODE_RAG_CACHE_FILE.replace(".json", "")
 INDEX_ARTIFACT_FILES = frozenset({
     CODE_RAG_CACHE_FILE,
     f"{_CACHE_BASE}_meta.json",
     f"{_CACHE_BASE}_emb.npz",
+    f"{_CACHE_BASE}.lock",          # cache 單一 writer 鎖(§5-2)
+    CODE_RAG_GRAPH_FILE,            # code graph SQLite(§7)
+    CODE_RAG_GRAPH_LOCK_FILE,       # graph 寫端鎖(§7.5)
 })
+# 衍生檔以 artifact 名為前綴:SQLite 的 -wal/-shm sidecar、原子寫入的
+# .tmp* staging(cache NPZ/meta、graph 首建 staging)。前綴命中即視為 artifact。
+INDEX_ARTIFACT_PREFIXES = tuple(sorted(INDEX_ARTIFACT_FILES))
 
 # 壞 pattern 的訊息刻意不含 pattern 內容。這個檔的契約是「永不進 repo、永不出現在
 # 任何輸出」,而 pattern 就是樹狀結構本身(`nda_customer_x/...`);fatal 訊息會被貼進
@@ -736,7 +744,11 @@ class IndexScope:
         # --- hard gates ---
         # 純字串規則先跑、碰檔案系統的後跑:語意上全是 AND,順序只影響 syscall 成本。
         name = normalized.rpartition("/")[2]
-        if name.startswith(".") or name in INDEX_ARTIFACT_FILES:
+        if (
+            name.startswith(".")
+            or name in INDEX_ARTIFACT_FILES
+            or name.startswith(INDEX_ARTIFACT_PREFIXES)
+        ):
             return False                                   # committed code_rag 行為
         if Path(name).suffix.lower() not in CODE_EXTENSIONS:
             return False

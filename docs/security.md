@@ -113,6 +113,16 @@ aicode
 
 四個 llama-server(8080–8083)**預設只綁 `127.0.0.1`**:llama-server 沒有內建認證,綁 `0.0.0.0` 等於讓同網段任何機器都能呼叫你的模型 API。要讓其他機器連線必須明確選擇:`./set_config.sh --allow-remote`、`AICODE_BIND=all-interfaces`,或 deployment.json 各 service 的 `"bind": "all-interfaces"` —— 且只該在可信內網 / VPN 使用,必要時加防火牆規則。(2026-08 之前的舊版會把 localhost 靜默轉成 `0.0.0.0`,升級後預設收緊。)
 
+## 模型流量的 outbound policy(prompt 外送防線)
+
+上面講的是「誰能連進來」;這一段是「CodeTrail 自己會把 prompt 送去哪」。所有經 `llama_client` 的模型呼叫共用同一套 transport policy(`endpoint_policy.py`):
+
+- **非 loopback 端點需要顯式 opt-in**:`AICODE_LLAMA_*_BASE_URL` / deployment profile 指到別台機器時,必須 `export AICODE_MODEL_REMOTE_OK=1`,否則每個呼叫(completion / chat / embedding / reranking,連 health/props/slots 探測也一樣)都會 fail-loud,錯誤訊息印出確切 env 名。prompt 可能含 NDA 程式碼與文件內容——填一個遠端 IP 不等於同意外送。
+- **不讀環境 proxy**:共用 HTTP session `trust_env=False`,`HTTP(S)_PROXY` / `NO_PROXY` / `.netrc` 一律無視,prompt-bearing POST 不會被環境變數帶去別的 host。
+- **不跟隨 redirect**:任何 3xx 一律報錯(訊息含 status 與 Location host,絕不含 request body),拒絕把已送出的 POST 重送到別處。
+- KB chunk 脈絡生成(Contextual Retrieval)沿用獨立的 `AICODE_KB_CONTEXT_REMOTE_OK`(見 docs/rag.md);兩個 opt-in 不互通,各自守各自要外送的內容。
+- `python scripts/doctor.py` 啟動前就會檢查:端點非 loopback 且未設對應 opt-in → FAIL。
+
 ## Web 模式曝光面
 
 `aicode web` 預設只綁 `127.0.0.1`。A/B 機跨機器使用時推薦 `aicode_web`:它每次向本機 `tailscale ip -4` 取值,只綁該 `100.64.0.0/10` virtual interface，絕不綁 `0.0.0.0`。A 機可完全沒有 GUI，B 機開 launcher 印出的 `http://100.x.y.z:4096/` 即可；HTTP 封包仍包在 Tailscale 的加密 tunnel 內。

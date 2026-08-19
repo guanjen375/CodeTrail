@@ -16,7 +16,18 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import urlsplit
-from urllib.request import urlopen
+from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """loopback /health 探測不跟 3xx:回 None → HTTPError,呼叫端當 unreachable。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# proxy 衛生:health 探測不得被環境 HTTP(S)_PROXY 帶去別的 host。
+_LOCAL_PROBE_OPENER = build_opener(ProxyHandler({}), _NoRedirectHandler())
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -119,7 +130,7 @@ def _health_timeout(role: str, environ: Mapping[str, str], artifact_bytes: int =
 
 def _health_status(service: ServiceProfile) -> str:
     try:
-        with urlopen(f"{service.base_url}/health", timeout=2) as response:  # noqa: S310 - validated URL
+        with _LOCAL_PROBE_OPENER.open(f"{service.base_url}/health", timeout=2) as response:  # noqa: S310 - validated URL
             data = json.loads(response.read().decode("utf-8"))
     except (OSError, URLError, ValueError):
         return "unreachable"
