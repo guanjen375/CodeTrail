@@ -891,6 +891,7 @@ def test_missing_graph_error_command_is_directly_executable(tmp_path):
     assert g.find_nodes("entry")
 
 
+@pytest.mark.smoke
 def test_heuristic_attribute_call_never_enters_evidence_path(tmp_path):
     """`obj.target()` 只是「repo 內同名唯一」的猜測(confidence=heuristic)。
 

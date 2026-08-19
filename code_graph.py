@@ -1075,18 +1075,37 @@ class CodeGraph:
             longer = left_parts if len(left_parts) > common else right_parts
             return longer[common].startswith(("#else", "#elif"))
 
-        def condition_implies(outer: str, inner: str) -> bool:
-            """inner 是 outer 的內層 branch(同一條 chain 前綴)⇒ inner 成立時
-            outer 必成立。`#ifdef FEATURE` 的 include 對 `#ifdef FEATURE >
-            #ifdef MODE` 的呼叫是確定可見,不是條件候選。
+        def condition_literals(condition: str) -> frozenset:
+            """把 condition chain 轉成 literal 合取(每個 literal = (指示詞, 正負))。
 
-            互斥的 `#else` 分支在 tree-sitter 模型裡也是前綴關係
-            (`A` vs `A > #else`),所以這條一定要排在互斥判定之後。
+            tree-sitter 的 chain 是「條件樹上的一條路徑」:`#else`/`#elif`
+            節點是它所屬 `#if` 的子節點,所以 `A > #else` 代表 ¬A(不是 A 再
+            加一個條件),`A > #ifdef B` 代表 A ∧ B。轉成 literal 集合後,
+            跨檔案、不同巢狀順序的條件才能比較。
             """
-            outer_parts = outer.split(" > ")
-            inner_parts = inner.split(" > ")
-            return (len(outer_parts) < len(inner_parts)
-                    and inner_parts[:len(outer_parts)] == outer_parts)
+            literals: list[tuple[str, bool]] = []
+            for part in condition.split(" > "):
+                if part.startswith(("#else", "#elif")):
+                    if literals:  # 前一段分支取反
+                        head, positive = literals[-1]
+                        literals[-1] = (head, not positive)
+                    if part.startswith("#elif"):
+                        literals.append((part, True))
+                else:
+                    literals.append((part, True))
+            return frozenset(literals)
+
+        def condition_implies(outer: str, inner: str) -> bool:
+            """inner ⇒ outer:inner 的 literal 集合涵蓋 outer 的全部 literal。
+
+            `#ifdef MODE` 的 include 對 `#ifdef FEATURE > #ifdef MODE` 的呼叫
+            是確定可見(MODE 成立),即使兩者的巢狀順序/檔案不同。互斥的分支
+            不可能是子集(literal 正負相反),所以這條不會吃掉互斥判定。
+            """
+            outer_literals = condition_literals(outer)
+            inner_literals = condition_literals(inner)
+            return outer_literals != inner_literals \
+                and outer_literals <= inner_literals
 
         def condition_relation(condition: str | None,
                                call_condition: str | None) -> str:

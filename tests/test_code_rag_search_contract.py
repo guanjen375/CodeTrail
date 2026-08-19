@@ -30,8 +30,12 @@ CONTEXT_KEYS = {
 def mcp_module(monkeypatch, tmp_path: Path):
     pytest.importorskip("mcp", reason="mcp 套件未安裝")
     (tmp_path / "util.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
+    # 直接 name call:path mode 只走確定解析的邊,`util.helper()` 這種
+    # attribute call 只有 heuristic confidence,本來就不該進呼叫鏈
+    # (該行為的回歸測試在 tests/test_code_graph.py)。
     (tmp_path / "app.py").write_text(
-        "import util\n\n\ndef entry():\n    return util.helper()\n", encoding="utf-8")
+        "from util import helper\n\n\ndef entry():\n    return helper()\n",
+        encoding="utf-8")
 
     monkeypatch.setenv("AICODE_ROOT", str(tmp_path))
     monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")

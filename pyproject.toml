@@ -13,6 +13,11 @@ filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::PendingDeprecationWarning",
 ]
+# AGENTS.md §2.1 的 smoke 包:真實發生過的 bug 的 regression + 無聲失敗風險的
+# 契約檢查。`--strict-markers` 開著,marker 一定要在這裡登記才能用。
+markers = [
+    "smoke: 交付前必跑的最小回歸集(真實 bug regression / 契約防護)",
+]
 
 [tool.ruff]
 line-length = 110

@@ -688,6 +688,7 @@ def _conditional_repo(tmp_path):
     )
 
 
+@pytest.mark.smoke
 def test_conditional_include_is_only_a_conditional_candidate(tmp_path):
     """`#ifdef FEATURE` 內的 include + branch 外的呼叫 → 不可 resolved。"""
     _conditional_repo(tmp_path)
@@ -791,6 +792,7 @@ def test_conditional_static_inline_header_is_not_visible(tmp_path):
     assert edge["resolution_basis"] == "conditional_candidate"
 
 
+@pytest.mark.smoke
 def test_call_in_nested_branch_sees_outer_conditional_include(tmp_path):
     """include 在 `#ifdef FEATURE`、呼叫在其內層 `#ifdef MODE` → 外層條件已成立。"""
     _conditional_repo(tmp_path)
@@ -814,6 +816,7 @@ def test_call_in_nested_branch_sees_outer_conditional_include(tmp_path):
     assert edge["resolution_basis"] == "visible_declaration"
 
 
+@pytest.mark.smoke
 def test_header_included_in_both_branches_stays_visible_in_each(tmp_path):
     """同一 header 在 `#ifdef` 與 `#else` 各 include 一次 → 兩邊的呼叫都看得到。
 
@@ -840,3 +843,62 @@ def test_header_included_in_both_branches_stays_visible_in_each(tmp_path):
         assert edge["resolved"] is True, symbol
         assert edge["dst_name"] == "service", symbol
         assert edge["resolution_basis"] == "visible_declaration", symbol
+
+
+@pytest.mark.smoke
+def test_condition_implication_is_not_limited_to_textual_prefix(tmp_path):
+    """include 在 `#ifdef MODE`、呼叫在 `#ifdef FEATURE > #ifdef MODE`。
+
+    巢狀順序不同,但 MODE 在呼叫處確定成立 → 必須是可見,不是條件候選。
+    """
+    _conditional_repo(tmp_path)
+    _write(
+        tmp_path,
+        "src/cross.c",
+        "#ifdef MODE\n"
+        '#include "service.h"\n'
+        "#endif\n"
+        "#ifdef FEATURE\n"
+        "#ifdef MODE\n"
+        "int run_cross(void) { return service(); }\n"
+        "#endif\n"
+        "#endif\n",
+    )
+
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [edge] = _source_edges(graph, "src/cross.c", "run_cross")
+    assert edge["resolved"] is True
+    assert edge["dst_name"] == "service"
+    assert edge["resolution_basis"] == "visible_declaration"
+
+
+@pytest.mark.smoke
+def test_opposite_branch_of_the_same_macro_stays_excluded(tmp_path):
+    """反向保命:`#ifdef MODE` 的 include 對 `#ifdef MODE > #else` 的呼叫無效。"""
+    _conditional_repo(tmp_path)
+    _write(
+        tmp_path,
+        "src/opposite.c",
+        "#ifdef MODE\n"
+        '#include "service.h"\n'
+        "int run_on(void) { return service(); }\n"
+        "#else\n"
+        "int run_off(void) { return service(); }\n"
+        "#endif\n",
+    )
+
+    graph = CodeGraph(str(tmp_path))
+    graph.build()
+
+    [on_edge] = _source_edges(graph, "src/opposite.c", "run_on")
+    assert on_edge["resolved"] is True
+
+    # `#else` 分支證明 include 不成立 → 連 conditional 候選都不該給,
+    # 因為那個 header 在這個 branch 裡確定不存在。
+    [off_edge] = _source_edges(graph, "src/opposite.c", "run_off")
+    assert off_edge["resolved"] is False
+    assert off_edge["unresolved_target"] == "service"
+    assert off_edge["resolution_basis"] == "syntactic_only"
+

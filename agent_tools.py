@@ -1409,10 +1409,10 @@ class ToolExecutor:
     #   - 唯一匹配 → 套用(行號錯誤/缺省都無所謂)。
     #   - 多處匹配 → 有行號 hint 挑最近的一處;沒有 hint 或距離打平 →
     #     拒絕並列出候選行號(fail loud,絕不猜位置)。
-    #   - 零匹配 → 若 hunk 的「修改後內容」在檔案中唯一存在、與行號 hint 相符,
-    #     且 hint 那一帶沒有留著「像修改前」的反證,才視為已套用過(no-op,
-    #     重試安全)。多處相同、與 hint 明顯衝突、或 hint 附近仍是 pre-image
-    #     一律拒絕——否則會靜默跳過真正該改的地方。
+    #   - 零匹配 → 只有當「修改後內容」正好落在 @@ 宣告的新檔起始行(`+c`)
+    #     時才視為已套用過(no-op)。沒寫 `+c`、`+c` 越界或對不上位置一律
+    #     拒絕,並在訊息裡指出修改後內容在第幾行 —— 純內容比對分不出
+    #     「已套用」與「目標漂移、別處剛好相同」,猜錯就是靜默漏改。
     #     其餘情況拒絕,附最接近位置的期望/實際對照。
     # 逐行比對容忍度沿用舊版:行尾空白差異(rstrip)一律容忍;整檔 strict
     # 掃不到時退一步做縮排不敏感(strip)掃描。
@@ -1465,102 +1465,42 @@ class ToolExecutor:
                 )
         return ""
 
-    # 「已套用過」的判定窗:hint 落在檔案範圍內(不是模型隨手亂寫)時,
-    # post-image 必須就在提示附近才算同一處。純內容比對會把「檔案別處剛好
-    # 有一段相同的修改後內容」誤判成已套用,靜默跳過真正該改的地方。
-    ALREADY_APPLIED_HINT_WINDOW = 100
-
-    def _pattern_match_score(self, file_lines: list, pattern: list,
-                             pos: int) -> int:
-        """pattern 在 pos 的逐行相符數(loose):衡量「這裡還像不像修改前」。"""
-        score = 0
-        for offset, expect in enumerate(pattern):
-            index = pos + offset
-            if index >= len(file_lines):
-                break
-            if self._lines_match(file_lines[index], expect, loose=True):
-                score += 1
-        return score
-
     def _resolve_already_applied(self, idx: int, positions: list,
-                                 hint: int | None, line_count: int,
-                                 file_lines: list, pattern: list,
-                                 new_lines: list) -> tuple:
-        """零匹配時判斷「修改後內容」是否真的就是這個 hunk 的目標位置。
+                                 new_start: int | None, line_count: int) -> tuple:
+        """零匹配時判斷這個 hunk 是不是真的已經套用過。
+
+        只認一種硬證據:「修改後內容」出現的位置,正好是 hunk header 宣告的
+        **新檔起始行**(`@@ -a,b +c,d @@` 的 c)。post-image 本來就活在新檔
+        座標上,所以同一份 patch 重送時 c 一定對得上(多 hunk 也對得上,因為
+        c 已經含了前面 hunk 造成的位移)。
+
+        其餘情況一律 fail loud。純內容比對無法區分「已套用過」與「目標區塊
+        漂移、檔案別處剛好有相同內容」——猜錯就是靜默跳過真正該改的地方。
+        訊息會講清楚「修改後內容在行 N」,模型據此判斷要不要重送。
 
         Returns:
-            (pos, err):err 非 None 時視為定位失敗(fail loud,不當成 no-op)。
+            (pos, err):err 非 None 時視為定位失敗(不當成 no-op)。
         """
-        # 超出檔案範圍的行號沒有消歧資格:拿它挑「最近的一處」等於亂猜。
-        if hint is not None and not 1 <= hint <= line_count:
-            hint = None
         listed = ', '.join(str(p + 1) for p in positions[:5])
-        if len(positions) > 1:
-            if hint is None:
-                return None, (
-                    f"區塊 {idx + 1} 的 context 對不上,而「修改後內容」在檔案中"
-                    f"出現 {len(positions)} 處(行 {listed}),"
-                    "無法判斷是已套用過還是該改別處。"
-                    "請增加 context 行數,或在 @@ 標大約行號以消歧。"
-                )
-            best = min(positions, key=lambda p: abs(p - (hint - 1)))
-            ties = [
-                p for p in positions
-                if abs(p - (hint - 1)) == abs(best - (hint - 1))
-            ]
-            if len(ties) > 1:
-                return None, (
-                    f"區塊 {idx + 1} 的 context 對不上,而「修改後內容」在檔案中"
-                    f"出現 {len(positions)} 處(行 {listed}),"
-                    f"行號提示 {hint} 距離打平無法消歧。請增加 context 行數。"
-                )
-            chosen = best
-        else:
-            chosen = positions[0]
-
-        if hint is None:
-            # 沒有可用提示(缺省或整組亂寫)= 唯一性是唯一依據;
-            # 這條也是「重送同一份 patch 要冪等」的保命符。
-            return chosen, None
-
-        distance = abs(chosen - (hint - 1))
-        if distance > self.ALREADY_APPLIED_HINT_WINDOW:
+        if new_start is None or not 1 <= new_start <= line_count:
+            missing = "沒有寫新檔行號" if new_start is None else \
+                f"新檔行號 {new_start} 超出檔案範圍(共 {line_count} 行)"
             return None, (
-                f"區塊 {idx + 1} 的 context 對不上;行 {chosen + 1} 雖有相同的"
-                f"「修改後內容」,但距行號提示 {hint} 有 {distance} 行,"
-                "不能認定是同一處(很可能是別處剛好內容相同)。"
-                "請先 read_file 確認現況,再用該處的實際 context 重送。"
+                f"區塊 {idx + 1} 的 context 對不上,但檔案行 {listed} 有相同的"
+                f"「修改後內容」。@@ {missing},無法確認那就是這個區塊的位置"
+                "(目標區塊漂移時,別處的相同內容看起來一模一樣),"
+                "所以不宣稱已套用過。\n"
+                f"→ 若你確認這個區塊已經改過(行 {listed}),就不要再送它;"
+                "否則請先 read_file 確認現況,並在 @@ 補上 `+<新檔起始行>` "
+                "或增加 context 行數後重送。"
             )
-
-        # 唯一性 + 100 行窗仍擋不住「目標區塊漂移、別處剛好有相同修改後內容」:
-        # 那種情況 hint 指的那一帶會留著「像修改前」的內容。找出這個反證。
-        # 排除與 post-image 重疊的位置——同一區段的高分是套用成功的正常現象
-        # (context 行本來就不變),不是反證。
-        span = max(len(pattern), len(new_lines), 1)
-        chosen_score = self._pattern_match_score(file_lines, pattern, chosen)
-        rival_pos, rival_score = None, 0
-        low = max(0, hint - 1 - self.ALREADY_APPLIED_HINT_WINDOW)
-        high = min(len(file_lines) - 1, hint - 1 + self.ALREADY_APPLIED_HINT_WINDOW)
-        for pos in range(low, high + 1):
-            if abs(pos - chosen) < span:
-                continue
-            score = self._pattern_match_score(file_lines, pattern, pos)
-            if score > rival_score or (
-                score == rival_score and rival_pos is not None
-                and abs(pos - (hint - 1)) < abs(rival_pos - (hint - 1))
-            ):
-                rival_pos, rival_score = pos, score
-        # 過半數才算「像修改前」:單一空行/括號的巧合不足以推翻已套用。
-        if rival_pos is not None and rival_score >= chosen_score \
-                and rival_score * 2 >= len(pattern):
+        if (new_start - 1) not in positions:
             return None, (
-                f"區塊 {idx + 1} 的 context 對不上。行 {chosen + 1} 雖有相同的"
-                f"「修改後內容」,但行號提示 {hint} 附近(行 {rival_pos + 1})還留著"
-                f"像「修改前」的內容({rival_score}/{len(pattern)} 行相符),"
-                "不能認定已套用過——比較可能是目標區塊已漂移、別處剛好內容相同。"
-                "請先 read_file 確認現況,再用該處的實際 context 重送。"
+                f"區塊 {idx + 1} 的 context 對不上;「修改後內容」在檔案行 "
+                f"{listed},但 @@ 宣告的新檔起始行是 {new_start},兩者不一致,"
+                "不能認定是同一處。請先 read_file 確認現況再重送。"
             )
-        return chosen, None
+        return new_start - 1, None
 
     def _locate_hunks(self, file_lines: list, hunks: list) -> tuple:
         """把每個 hunk 定位到檔案位置。
@@ -1651,8 +1591,7 @@ class ToolExecutor:
                     )
                     if done:
                         done_pos, done_err = self._resolve_already_applied(
-                            idx, done, hint, line_count,
-                            file_lines, pattern, new_lines,
+                            idx, done, hunk.get('new_start'), line_count,
                         )
                         if done_err:
                             return None, done_err

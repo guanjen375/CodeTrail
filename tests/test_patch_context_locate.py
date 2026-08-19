@@ -8,7 +8,8 @@
   - 定位靠 (context+移除) 行內容,行號只當多處匹配時的提示。
   - `@@` 可以完全不帶行號;行數宣稱一律忽略。
   - 多處匹配且無法消歧 → fail loud 列出候選行號,絕不猜。
-  - 修改後內容已存在 → 視為已套用過(no-op,重試冪等)。
+  - 「修改後內容」正好落在 @@ 宣告的新檔起始行(`+c`)→ 視為已套用過(no-op);
+    沒寫 `+c` 或對不上 → fail loud 並指出修改後內容在第幾行(不猜)。
   - 模型把空白 context 行的行尾空白 strip 成 `""` → 不截斷 hunk。
 """
 from __future__ import annotations
@@ -180,13 +181,15 @@ def test_ambiguous_context_with_hint_picks_nearest(runner: ToolExecutor, tmp_pat
 # ---------------------------------------------------------------------------
 # 已套用過 → no-op(重試冪等)
 # ---------------------------------------------------------------------------
-def test_already_applied_hunk_is_noop(runner: ToolExecutor, tmp_path: Path):
+@pytest.mark.smoke
+def test_already_applied_hunk_with_new_start_is_noop(runner: ToolExecutor, tmp_path: Path):
+    """`@@ -a,b +c,d @@` 重送:修改後內容正好在新檔行 c → 成功的 no-op。"""
     target = tmp_path / "idem.py"
     target.write_text("a\nb\nc\n", encoding="utf-8")
     patch = (
         "--- a/idem.py\n"
         "+++ b/idem.py\n"
-        "@@\n"
+        "@@ -1,3 +1,3 @@\n"
         " a\n"
         "-b\n"
         "+B\n"
@@ -204,6 +207,33 @@ def test_already_applied_hunk_is_noop(runner: ToolExecutor, tmp_path: Path):
     # 不留備份殘骸
     leftovers = [p.name for p in tmp_path.iterdir() if ".orig" in p.name]
     assert leftovers == [], leftovers
+
+
+@pytest.mark.smoke
+def test_already_applied_bare_header_is_fail_loud(runner: ToolExecutor, tmp_path: Path):
+    """裸 `@@` 重送:沒有新檔行號就無法證明是同一處 → 不宣稱 no-op。
+
+    純內容比對分不出「已套用」與「目標漂移、別處剛好相同」,所以誠實報錯,
+    並指出修改後內容在第幾行,讓模型自己決定要不要重送。
+    """
+    target = tmp_path / "idem_bare.py"
+    target.write_text("a\nb\nc\n", encoding="utf-8")
+    patch = (
+        "--- a/idem_bare.py\n"
+        "+++ b/idem_bare.py\n"
+        "@@\n"
+        " a\n"
+        "-b\n"
+        "+B\n"
+        " c\n"
+    )
+    assert "✓" in runner.apply_patch(patch)
+    assert target.read_text(encoding="utf-8") == "a\nB\nc\n"
+
+    out = runner.apply_patch(patch)
+    assert "✗" in out and "沒有寫新檔行號" in out, out
+    assert "行 1" in out, out
+    assert target.read_text(encoding="utf-8") == "a\nB\nc\n"
 
 
 def test_pure_deletion_mismatch_stays_fail_loud(runner: ToolExecutor, tmp_path: Path):
@@ -348,6 +378,7 @@ def test_multi_hunk_bottom_up_no_drift(runner: ToolExecutor, tmp_path: Path):
 # ---------------------------------------------------------------------------
 # 純新增:越界行號 fail loud(舊版靜默 clamp 到 EOF)
 # ---------------------------------------------------------------------------
+@pytest.mark.smoke
 def test_pure_insertion_out_of_range_hint_is_rejected(runner: ToolExecutor, tmp_path: Path):
     """`@@ -999,0 +1000,1 @@` 對兩行檔 → 必須拒絕,不能夾到檔尾當成功。"""
     target = tmp_path / "oob.py"
@@ -437,6 +468,7 @@ def test_pure_insertion_into_empty_file(runner: ToolExecutor, tmp_path: Path):
 # ---------------------------------------------------------------------------
 # 「已套用過」判定:post-image 也要唯一 / 與 hint 相符
 # ---------------------------------------------------------------------------
+@pytest.mark.smoke
 def test_already_applied_needs_unique_post_image(runner: ToolExecutor, tmp_path: Path):
     """目標區塊漂移、但檔案裡有兩處相同的修改後內容 → 不能當 no-op。"""
     target = tmp_path / "dup.py"
@@ -470,12 +502,15 @@ def test_already_applied_conflicting_hint_is_rejected(runner: ToolExecutor, tmp_
         " tail\n"
     )
     out = runner.apply_patch(patch)
-    assert "✗" in out and "行號提示" in out, out
+    assert "✗" in out and "新檔起始行是 290" in out, out
     assert target.read_text(encoding="utf-8") == original
 
 
-def test_already_applied_still_idempotent_with_garbage_hint(runner: ToolExecutor, tmp_path: Path):
-    """行號整組亂寫(超出檔案)時,重送同一份 patch 仍必須是成功的 no-op。"""
+@pytest.mark.smoke
+def test_already_applied_with_out_of_range_new_start_is_rejected(
+    runner: ToolExecutor, tmp_path: Path,
+):
+    """行號整組亂寫(超出檔案)→ 沒有可用座標,不得宣稱已套用。"""
     target = tmp_path / "idem2.py"
     target.write_text("a\nb\nc\n", encoding="utf-8")
     patch = (
@@ -489,11 +524,12 @@ def test_already_applied_still_idempotent_with_garbage_hint(runner: ToolExecutor
     )
     assert "✓" in runner.apply_patch(patch)
     out = runner.apply_patch(patch)
-    assert "✓" in out and "✗" not in out, out
-    assert "已套用" in out and "行 1" in out, out
+    assert "✗" in out and "超出檔案範圍" in out, out
+    assert "行 1" in out, out
     assert target.read_text(encoding="utf-8") == "a\nB\nc\n"
 
 
+@pytest.mark.smoke
 def test_already_applied_rejected_when_hint_still_holds_pre_image(
     runner: ToolExecutor, tmp_path: Path,
 ):
@@ -513,6 +549,57 @@ def test_already_applied_rejected_when_hint_still_holds_pre_image(
         " tail\n"
     )
     out = runner.apply_patch(patch)
-    assert "✗" in out and "修改前" in out, out
-    assert "已套用" not in out.split("✗")[0], out
+    assert "✗" in out and "新檔起始行是 1" in out, out
     assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.smoke
+def test_already_applied_rejected_for_bare_header_when_pre_image_remains(
+    runner: ToolExecutor, tmp_path: Path,
+):
+    """裸 `@@`(沒有行號)也不能只靠「post-image 唯一」宣稱已套用。
+
+    目標區塊漂移時 post-image 一樣是唯一的;沒有 hint 就掃全檔找反證。
+    """
+    target = tmp_path / "drift_bare.py"
+    original = "x = 0\ntail\n\ndef other():\n    pass\n\nx = 2\ntail\n"
+    target.write_text(original, encoding="utf-8")
+    patch = (
+        "--- a/drift_bare.py\n"
+        "+++ b/drift_bare.py\n"
+        "@@\n"
+        "-x = 1\n"
+        "+x = 2\n"
+        " tail\n"
+    )
+    out = runner.apply_patch(patch)
+    assert "✗" in out and "沒有寫新檔行號" in out, out
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.smoke
+def test_already_applied_accepted_when_post_image_sits_on_hint(
+    runner: ToolExecutor, tmp_path: Path,
+):
+    """post-image 正好在 hint 指的行 → 即使別處有高度相似的舊版,也必須 no-op。"""
+    target = tmp_path / "exact.py"
+    original = (
+        "def a():\n    x = 2\n    return x\n"
+        "\n"
+        "def a_old():\n    x = 1\n    return x\n"
+    )
+    target.write_text(original, encoding="utf-8")
+    patch = (
+        "--- a/exact.py\n"
+        "+++ b/exact.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        " def a():\n"
+        "-    x = 1\n"
+        "+    x = 2\n"
+        "     return x\n"
+    )
+    out = runner.apply_patch(patch)
+    assert "✓" in out and "✗" not in out, out
+    assert "已套用" in out and "行 1" in out, out
+    assert target.read_text(encoding="utf-8") == original
+

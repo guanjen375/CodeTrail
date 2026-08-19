@@ -34,11 +34,13 @@ MAX_PARALLEL_JOBS = 4
 # 遞迴掃,否則 tests/integration/test_x.py 或 foo_test.py 會被並行模式靜默
 # 漏掉——序列 pytest 收得到、並行綠燈卻是假的。
 TEST_FILE_PATTERNS = ("test_*.py", "*_test.py")
-# pytest 的 norecursedirs 預設值(pyproject 沒有覆寫)。分片必須套用一模一樣的
-# 排除規則:多收或少收都是「並行與序列結果漂移」,而漂移的那一邊是靜默的。
+# pytest 的 norecursedirs 預設值(pyproject 沒有覆寫)+ pytest 自己內建、不在
+# norecursedirs 裡的 `__pycache__` 特例。分片必須套用一模一樣的排除規則:
+# 多收或少收都是「並行與序列結果漂移」,而漂移的那一邊是靜默的。
+# 對照組是真的 `pytest --collect-only`(見 tests/test_test_runner.py)。
 NORECURSE_DIR_PATTERNS = (
     "*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv",
-    "{arch}",
+    "{arch}", "__pycache__",
 )
 
 
