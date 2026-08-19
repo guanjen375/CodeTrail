@@ -12,7 +12,6 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
-import time
 from pathlib import Path
 
 import pytest
@@ -228,15 +227,25 @@ def test_second_process_must_not_delete_active_staging(tmp_path):
         script = textwrap.dedent(f"""
             import sys
             sys.path.insert(0, {str(REPO_ROOT)!r})
+            import fs_safety
             from code_graph import CodeGraph
+
+            real_acquire = fs_safety.acquire_file_lock
+            def announced_acquire(*args, **kwargs):
+                print("LOCK_ATTEMPT", flush=True)
+                return real_acquire(*args, **kwargs)
+            fs_safety.acquire_file_lock = announced_acquire
+
             CodeGraph({str(tmp_path)!r}).build()
             print("BUILD_DONE")
         """)
         proc = subprocess.Popen([sys.executable, "-c", script],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True)
-        # B 正在等鎖:staging 必須原封不動
-        time.sleep(1.5)
+        # 子行程在 blocking flock 前先送出握手；收到後即可確定 B 已走到
+        # 取鎖邊界，不必用固定 1.5 秒猜排程是否跑到了。
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "LOCK_ATTEMPT"
         assert proc.poll() is None, "B 應該還在等 A 的鎖"
         assert staging.exists(), "B 沒拿到鎖就清了 active staging"
         assert staging.read_text(encoding="utf-8") == "active staging of process A"

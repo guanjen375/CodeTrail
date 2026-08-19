@@ -16,6 +16,7 @@ import pytest
 np = pytest.importorskip("numpy")
 
 import config  # noqa: E402 - keep dependency-heavy imports behind importorskip
+import knowledge  # noqa: E402 - fixture must match the consumer's import-time model
 from knowledge import KnowledgeBase  # noqa: E402 - keep optional numpy skip offline-safe
 
 
@@ -37,7 +38,7 @@ def _build_kb_files(tmp_path: Path, n: int = 4, dim: int = 8):
     json_path.write_text(
         json.dumps({
             "chunks": chunks,
-            "metadata": {"embedding_model": config.EMBEDDING_MODEL, "documents": []},
+            "metadata": {"embedding_model": knowledge.EMBEDDING_MODEL, "documents": []},
         }, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -50,7 +51,7 @@ def _build_kb_files(tmp_path: Path, n: int = 4, dim: int = 8):
     np.savez_compressed(
         emb_path,
         embeddings=rng,
-        embedding_model=config.EMBEDDING_MODEL,
+        embedding_model=knowledge.EMBEDDING_MODEL,
         chunk_count=n,
         content_hash=_content_hash(chunks),
     )

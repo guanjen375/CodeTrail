@@ -106,16 +106,20 @@ def test_config_chat_sampling_defaults(monkeypatch):
 
     import config
 
-    for key in ("AICODE_CHAT_TOP_P", "AICODE_CHAT_TOP_K", "AICODE_CHAT_MIN_P"):
-        monkeypatch.delenv(key, raising=False)
-    importlib.reload(config)
+    try:
+        with monkeypatch.context() as patch:
+            for key in ("AICODE_CHAT_TOP_P", "AICODE_CHAT_TOP_K", "AICODE_CHAT_MIN_P"):
+                patch.delenv(key, raising=False)
+            importlib.reload(config)
 
-    assert config.CHAT_TOP_P == 0.95
-    assert config.CHAT_TOP_K == 20
-    assert config.CHAT_MIN_P == 0.0
-    assert isinstance(config.CHAT_TOP_P, float)
-    assert isinstance(config.CHAT_TOP_K, int)
-    assert isinstance(config.CHAT_MIN_P, float)
+            assert config.CHAT_TOP_P == 0.95
+            assert config.CHAT_TOP_K == 20
+            assert config.CHAT_MIN_P == 0.0
+            assert isinstance(config.CHAT_TOP_P, float)
+            assert isinstance(config.CHAT_TOP_K, int)
+            assert isinstance(config.CHAT_MIN_P, float)
+    finally:
+        importlib.reload(config)
 
 
 def test_config_chat_sampling_env_override(monkeypatch):
@@ -123,12 +127,12 @@ def test_config_chat_sampling_env_override(monkeypatch):
 
     import config
 
-    monkeypatch.setenv("AICODE_CHAT_TOP_K", "40")
-    importlib.reload(config)
     try:
-        assert config.CHAT_TOP_K == 40
+        with monkeypatch.context() as patch:
+            patch.setenv("AICODE_CHAT_TOP_K", "40")
+            importlib.reload(config)
+            assert config.CHAT_TOP_K == 40
     finally:
-        monkeypatch.delenv("AICODE_CHAT_TOP_K", raising=False)
         importlib.reload(config)
 
 

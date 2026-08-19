@@ -200,11 +200,10 @@ def test_check_models_fails_when_gguf_missing(monkeypatch, tmp_path):
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    # registry 需要重新 load 才會清空
-    import importlib
-
     import config
-    importlib.reload(config)
+    # check_models 讀的是當下 config registry；直接隔離這個依賴，避免 reload
+    # 整個 config module 後把 HOME 對應的 deployment profile 洩漏給後續測試。
+    monkeypatch.setattr(config, "MODEL_REGISTRY", {})
 
     r = doc.Result()
     doc.check_models(r, server_status={})

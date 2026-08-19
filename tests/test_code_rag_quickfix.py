@@ -4,7 +4,6 @@
 batch embedding、掃描層副檔名、context end_line。全部離線。"""
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import sys
@@ -42,6 +41,10 @@ def _make_repo(tmp_path: Path, n_files: int = 2, funcs_per_file: int = 2) -> Pat
 def _offline_rag(monkeypatch, root: Path) -> code_rag.CodeRAG:
     rag = code_rag.CodeRAG(str(root))
     monkeypatch.setattr(code_rag, "CODE_RAG_LAZY_EMBED", False)
+    # 這個 helper 的預設契約是完全離線。rerank 行為在上面的專屬案例中會
+    # 明確打開並 mock；其餘 cache / TTL / embedding 測試不該先等 /health
+    # retry 三秒，才因 fallback policy 決定能不能繼續。
+    monkeypatch.setattr(code_rag, "USE_RERANKER", False)
     monkeypatch.setattr(rag, "_get_embedding", lambda _text: [1.0, 0.0])
     monkeypatch.setattr(rag, "_embed_texts_batched",
                         lambda texts: [[1.0, 0.0]] * len(texts))
@@ -81,9 +84,9 @@ def test_consecutive_queries_leave_no_residue(monkeypatch, tmp_path):
         code_rag.llama_client, "rerank",
         lambda *, base_url, query, documents, model="", timeout=60: [9.0] * len(documents),
     )
-    keys_before = {id(item): set(item) for item in rag_index_snapshot(rag)}
     first = rag.query("func", top_k=3)
     assert first and first[0]["score"] == 9.0
+    keys_before = {id(item): set(item) for item in rag_index_snapshot(rag)}
 
     # 第二次 query 不 rerank → fusion 分數;第一輪的 9.0 不得殘留
     monkeypatch.setattr(rag, "_should_rerank", lambda candidates, top_k: False)
@@ -92,6 +95,7 @@ def test_consecutive_queries_leave_no_residue(monkeypatch, tmp_path):
 
     # 嚴禁把 query 分數寫進持久 item:index items 的 key 集合不得改變
     for item in rag_index_snapshot(rag):
+        assert set(item) == keys_before[id(item)]
         assert not any("rerank" in k for k in item), f"index item 被寫入 rerank 欄位: {sorted(item)}"
 
 
@@ -266,7 +270,6 @@ def mcp_module(monkeypatch, tmp_path: Path):
     sys.modules.pop("mcp_server", None)
     import mcp_server  # type: ignore
 
-    importlib.reload(mcp_server)
     yield mcp_server
     sys.modules.pop("mcp_server", None)
 

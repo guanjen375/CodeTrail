@@ -564,6 +564,9 @@ def test_build_index_summary_is_counts_only(tree, tmp_path, monkeypatch, capsys,
     _write_scope(tmp_path, monkeypatch, tree, exclude=["vendor_env/**"])
     rag = code_rag.CodeRAG(str(tree))
     monkeypatch.setattr(rag, "_get_embedding", lambda _text: [1.0, 0.0])
+    monkeypatch.setattr(
+        rag, "_embed_texts_batched", lambda texts: [[1.0, 0.0]] * len(texts)
+    )
     rag.build_index(verbose=True)
     out = capsys.readouterr().out
     assert "index scope" in out
@@ -580,6 +583,9 @@ def test_build_index_summary_silent_on_default_deployment(tmp_path, monkeypatch,
     (root / "src" / "mod.py").write_text("def mod(): pass\n", encoding="utf-8")
     rag = code_rag.CodeRAG(str(root))
     monkeypatch.setattr(rag, "_get_embedding", lambda _text: [1.0, 0.0])
+    monkeypatch.setattr(
+        rag, "_embed_texts_batched", lambda texts: [[1.0, 0.0]] * len(texts)
+    )
     rag.build_index(verbose=True)
     assert "index scope" not in capsys.readouterr().out
 

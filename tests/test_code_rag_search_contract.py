@@ -4,7 +4,6 @@
 evidence 模式欄位、neighbors/path 模式、graph 缺席行為。全部離線。"""
 from __future__ import annotations
 
-import importlib
 import sys
 from pathlib import Path
 
@@ -46,8 +45,6 @@ def mcp_module(monkeypatch, tmp_path: Path):
     code_rag._INDEX_SCAN_CACHE.clear()
     sys.modules.pop("mcp_server", None)
     import mcp_server  # type: ignore
-
-    importlib.reload(mcp_server)
 
     # 離線 stub:embedding 與 reranker 都不打 server
     monkeypatch.setattr(code_rag, "USE_RERANKER", False)

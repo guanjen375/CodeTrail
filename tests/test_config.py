@@ -1,7 +1,19 @@
 """config.py 健全性測試：確保關鍵設定值有合理型別與範圍。"""
 from __future__ import annotations
 
+import importlib
+
+import pytest
+
 import config
+
+
+@pytest.fixture
+def config_env(monkeypatch):
+    """Reload 測試結束後，以已還原的 process env 重建 config module。"""
+    with monkeypatch.context() as patch:
+        yield patch
+    importlib.reload(config)
 
 
 def test_model_strings_non_empty():
@@ -23,40 +35,36 @@ def test_llama_server_urls_are_strings():
         assert v.startswith("http://") or v.startswith("https://"), f"{attr}={v!r}"
 
 
-def test_model_registry_loads_from_env(monkeypatch):
+def test_model_registry_loads_from_env(config_env):
     """AICODE_MODEL_REGISTRY env (JSON 字串) 會被 _load_model_registry 吃進來。"""
-    import importlib
-    monkeypatch.setenv("AICODE_MODEL_REGISTRY", '{"foo": "/m/foo.gguf"}')
-    monkeypatch.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
+    config_env.setenv("AICODE_MODEL_REGISTRY", '{"foo": "/m/foo.gguf"}')
+    config_env.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
     importlib.reload(config)
     assert config.MODEL_REGISTRY == {"foo": "/m/foo.gguf"}
 
 
-def test_resolve_model_path_uses_registry(monkeypatch, tmp_path):
+def test_resolve_model_path_uses_registry(config_env, tmp_path):
     """有 registry 命中時走 registry 路徑。"""
-    import importlib
     gguf = tmp_path / "foo.gguf"
     gguf.write_text("not-a-real-gguf")
-    monkeypatch.setenv("AICODE_MODEL_REGISTRY", f'{{"foo": "{gguf}"}}')
-    monkeypatch.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
+    config_env.setenv("AICODE_MODEL_REGISTRY", f'{{"foo": "{gguf}"}}')
+    config_env.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
     importlib.reload(config)
     assert config.resolve_model_path("foo") == str(gguf)
 
 
-def test_resolve_model_path_passthrough_for_existing_file(monkeypatch, tmp_path):
+def test_resolve_model_path_passthrough_for_existing_file(config_env, tmp_path):
     """registry 沒命中但路徑存在 → 直接用路徑。"""
-    import importlib
     gguf = tmp_path / "bar.gguf"
     gguf.write_text("not-a-real-gguf")
-    monkeypatch.delenv("AICODE_MODEL_REGISTRY", raising=False)
-    monkeypatch.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
+    config_env.delenv("AICODE_MODEL_REGISTRY", raising=False)
+    config_env.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
     importlib.reload(config)
     assert config.resolve_model_path(str(gguf)) == str(gguf)
 
 
 def test_require_main_model_fails_when_unset(monkeypatch, tmp_path):
     """MODEL 為空時 require_main_model 必須 raise (fail-loud, 不 fallback)。"""
-    import pytest
     monkeypatch.delenv("AICODE_MODEL", raising=False)
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -74,7 +82,6 @@ def test_require_main_model_returns_value_when_set(monkeypatch):
 
 def test_require_main_model_rejects_external_provider(monkeypatch):
     """openai/ ollama/ anthropic/ 等外部 provider prefix 一律拒絕。"""
-    import pytest
     for value in ("anthropic/foo", "openai/gpt-4", "ollama/qwen3"):
         monkeypatch.setenv("AICODE_MODEL", value)
         with pytest.raises(RuntimeError) as exc:
@@ -96,7 +103,6 @@ def test_require_main_model_accepts_gguf_path(monkeypatch):
 
 def test_require_main_model_path_fails_when_file_missing(monkeypatch):
     """resolve_model_path 解到的檔不存在時必須 raise。"""
-    import pytest
     monkeypatch.setenv("AICODE_MODEL", "definitely-not-a-real-model")
     monkeypatch.delenv("AICODE_MODEL_REGISTRY", raising=False)
     monkeypatch.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
@@ -161,9 +167,8 @@ def test_get_answer_rules_returns_string():
     assert isinstance(s2, str) and "BIN" in s2 and "ELF" in s2
 
 
-def test_rerank_fallback_policy_defaults_to_error(monkeypatch):
-    import importlib
-    monkeypatch.delenv("AICODE_RERANK_FALLBACK_POLICY", raising=False)
+def test_rerank_fallback_policy_defaults_to_error(config_env):
+    config_env.delenv("AICODE_RERANK_FALLBACK_POLICY", raising=False)
     importlib.reload(config)
     assert config.RERANK_FALLBACK_POLICY == "error"
 

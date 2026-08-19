@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -151,11 +150,72 @@ def test_embedding_failure_is_a_tool_error_with_actionable_url(tmp_path: Path):
 # ---------------------------------------------------------------------------
 # 2) stdout 純淨度：每一非空 stdout 行都必須是合法 JSON-RPC
 # ---------------------------------------------------------------------------
+async def _raw_protocol_roundtrip(project: Path, msgs: list[dict]) -> tuple[bytes, bytes]:
+    """逐階段送 raw JSON-RPC，確認回應後才關 stdin。
+
+    一次 ``communicate(input=...)`` 會立刻送 EOF；FastMCP 忙碌或新版 anyio
+    排程下，shutdown 可能在已排入的 tools/call 寫回前取消它，形成與產品協定
+    無關的 load-dependent flake。這裡保持 stdin 開啟到 id=2 已收到。
+    """
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(REPO_ROOT / "mcp_server.py"),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(REPO_ROOT),
+        env=_server_env(project),
+    )
+    assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+    stderr_task = asyncio.create_task(proc.stderr.read())
+    captured: list[bytes] = []
+
+    async def send(message: dict) -> None:
+        proc.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
+        await proc.stdin.drain()
+
+    async def read_through(expected_id: int) -> None:
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                raise AssertionError(
+                    f"mcp_server 在回覆 id={expected_id} 前結束；"
+                    f"stdout={b''.join(captured)[:800]!r}"
+                )
+            captured.append(line)
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(obj, dict) and obj.get("id") == expected_id:
+                return
+
+    try:
+        await send(msgs[0])
+        await read_through(1)
+        for message in msgs[1:]:
+            await send(message)
+        await read_through(2)
+
+        proc.stdin.close()
+        await proc.stdin.wait_closed()
+        await proc.wait()
+        captured.append(await proc.stdout.read())
+        return b"".join(captured), await stderr_task
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        if not stderr_task.done():
+            stderr_task.cancel()
+        raise
+
+
 def test_mcp_stdout_is_pure_jsonrpc(tmp_path: Path):
     project = _make_project(tmp_path)
 
-    # 手動組 JSON-RPC 訊息（newline-delimited），一次餵進 stdin 後關閉 → server
-    # 處理完所有訊息、讀到 EOF 後自行結束。我們再檢查原始 stdout。
+    # 手動組 JSON-RPC 訊息（newline-delimited），依 initialize → initialized
+    # → tools/call 順序送入；收到 call 回應後才關 stdin，再檢查原始 stdout。
     msgs = [
         {
             "jsonrpc": "2.0",
@@ -175,21 +235,11 @@ def test_mcp_stdout_is_pure_jsonrpc(tmp_path: Path):
             "params": {"name": "list_dir", "arguments": {"path": "."}},
         },
     ]
-    stdin_data = "".join(json.dumps(m) + "\n" for m in msgs).encode("utf-8")
-
-    proc = subprocess.Popen(
-        [sys.executable, str(REPO_ROOT / "mcp_server.py")],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=str(REPO_ROOT),
-        env=_server_env(project),
-    )
     try:
-        stdout, stderr = proc.communicate(input=stdin_data, timeout=60)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout, stderr = proc.communicate()
+        stdout, stderr = asyncio.run(
+            asyncio.wait_for(_raw_protocol_roundtrip(project, msgs), timeout=60)
+        )
+    except TimeoutError:
         pytest.fail("mcp_server 沒在時限內完成 JSON-RPC 往返")
 
     stderr_text = stderr.decode("utf-8", errors="replace")

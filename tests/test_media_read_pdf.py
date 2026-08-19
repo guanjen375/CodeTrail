@@ -8,6 +8,7 @@ analyze_file（圖片/binary），.pdf 不在任何一格——「只看一眼�
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -72,28 +73,45 @@ def test_read_pdf_truncates_by_max_chars(pdf_sandbox: Path):
     assert "[已截斷]" in out, out
 
 
-def _build_image_pages_pdf(path: Path, n_pages: int) -> None:
-    fitz = pytest.importorskip("fitz", reason="需要 PyMuPDF（pymupdf4llm 相依）")
+def _build_blank_pdf(path: Path, n_pages: int) -> None:
+    """只提供 read_pdf 所需的真 page_count；內容由受控 converter stub 給。"""
+    fitz = pytest.importorskip("fitz", reason="需要 PyMuPDF")
     doc = fitz.open()
-    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 32, 32))
-    pix.clear_with(120)
     for _ in range(n_pages):
-        pg = doc.new_page()
-        pg.insert_image(fitz.Rect(72, 72, 200, 200), pixmap=pix)
+        doc.new_page()
     doc.save(str(path))
     doc.close()
 
 
-def _build_text_pages_pdf(path: Path, n_pages: int) -> None:
-    fitz = pytest.importorskip("fitz", reason="需要 PyMuPDF（pymupdf4llm 相依）")
-    doc = fitz.open()
-    for i in range(n_pages):
-        pg = doc.new_page()
-        # 多行寫入（insert_text 不會自動換行，單一長行會被版面裁掉導致抽出文字過短）
-        for j in range(12):
-            pg.insert_text((72, 80 + j * 14), f"page {i + 1} line {j} lorem ipsum dolor sit amet")
-    doc.save(str(path))
-    doc.close()
+def _stub_markdown(monkeypatch, page_factory):
+    """替換昂貴的 pymupdf4llm layout pipeline，保留 pages= 分批契約。"""
+    calls: list[list[int]] = []
+
+    def to_markdown(_path, *, pages, **_kwargs):
+        calls.append(list(pages))
+        return [page_factory(page_idx) for page_idx in pages]
+
+    fake = SimpleNamespace(to_markdown=to_markdown)
+    monkeypatch.setattr(media, "require_pymupdf4llm", lambda: fake)
+    return calls
+
+
+def _fake_text_page(page_idx: int) -> dict:
+    return {
+        "metadata": {"page_number": page_idx + 1},
+        "text": (f"page {page_idx + 1} lorem ipsum dolor sit amet " * 30).strip(),
+        "page_boxes": [],
+        "images": [],
+    }
+
+
+def _fake_image_page(page_idx: int) -> dict:
+    return {
+        "metadata": {"page_number": page_idx + 1},
+        "text": "",
+        "page_boxes": [{"class": "picture"}],
+        "images": [],
+    }
 
 
 # ============================================================
@@ -101,9 +119,9 @@ def _build_text_pages_pdf(path: Path, n_pages: int) -> None:
 # header/截斷訊息/逐頁圖片列表都不計入 budget（10,000 圖片頁 +
 # max_chars=100 實測輸出 59,230 字），且解析工作不受 cap 限制。
 # ============================================================
-def test_read_pdf_image_pages_are_range_summarized(pdf_sandbox: Path):
-    pytest.importorskip("pymupdf4llm", reason="PDF 檢視需要 pymupdf4llm")
-    _build_image_pages_pdf(pdf_sandbox / "imgs.pdf", 40)
+def test_read_pdf_image_pages_are_range_summarized(pdf_sandbox: Path, monkeypatch):
+    _build_blank_pdf(pdf_sandbox / "imgs.pdf", 40)
+    _stub_markdown(monkeypatch, _fake_image_page)
 
     out = media.read_pdf("imgs.pdf")
 
@@ -111,9 +129,9 @@ def test_read_pdf_image_pages_are_range_summarized(pdf_sandbox: Path):
     assert "頁 1, 2, 3" not in out, out   # 不逐頁列舉
 
 
-def test_read_pdf_output_is_hard_capped(pdf_sandbox: Path):
-    _build_image_pages_pdf(pdf_sandbox / "imgs2.pdf", 40)
-    pytest.importorskip("pymupdf4llm", reason="PDF 檢視需要 pymupdf4llm")
+def test_read_pdf_output_is_hard_capped(pdf_sandbox: Path, monkeypatch):
+    _build_blank_pdf(pdf_sandbox / "imgs2.pdf", 40)
+    _stub_markdown(monkeypatch, _fake_image_page)
 
     out = media.read_pdf("imgs2.pdf", max_chars=700)
 
@@ -123,20 +141,12 @@ def test_read_pdf_output_is_hard_capped(pdf_sandbox: Path):
 
 def test_read_pdf_stops_parsing_after_budget(pdf_sandbox: Path, monkeypatch):
     """達 budget 後的批次不再解析：高頁數 PDF 不會為被丟棄的內容卡住 MCP。"""
-    pymupdf4llm = pytest.importorskip("pymupdf4llm", reason="PDF 檢視需要 pymupdf4llm")
-    _build_text_pages_pdf(pdf_sandbox / "long.pdf", 60)
-
-    calls = {"n": 0}
-    real = pymupdf4llm.to_markdown
-
-    def counting(*args, **kwargs):
-        calls["n"] += 1
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(pymupdf4llm, "to_markdown", counting)
+    _build_blank_pdf(pdf_sandbox / "long.pdf", 60)
+    calls = _stub_markdown(monkeypatch, _fake_text_page)
 
     out = media.read_pdf("long.pdf", max_chars=800)
 
-    assert calls["n"] == 1, calls  # 60 頁 / 批 16 → 只解析第一批
+    assert len(calls) == 1, calls  # 60 頁 / 批 16 → 只解析第一批
+    assert calls[0] == list(range(16)), calls
     assert "[已截斷]" in out, out
     assert "未解析" in out, out

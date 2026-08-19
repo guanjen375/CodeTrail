@@ -8,7 +8,6 @@
 """
 from __future__ import annotations
 
-import importlib
 from pathlib import Path
 
 import pytest
@@ -47,7 +46,6 @@ def mcp_module(monkeypatch, tmp_path: Path):
     # 啟動 mcp_server 會嘗試 mcp.run() 在 module-level,
     # 但 mcp.run() 只在 __main__ guard 內呼叫 — 直接 import 安全。
     import mcp_server  # type: ignore
-    importlib.reload(mcp_server)
     return mcp_server
 
 
@@ -141,7 +139,9 @@ def test_ensure_kb_fresh_reloads_only_on_change(mcp_module):
     assert mcp_module.KB is fresh, "沒變更就不該動 KB"
 
 
-def test_query_knowledge_autoloads_kb_created_after_startup(mcp_module, tmp_path: Path):
+def test_query_knowledge_autoloads_kb_created_after_startup(
+    mcp_module, tmp_path: Path, monkeypatch
+):
     """啟動時沒有 knowledge.json,之後被 ingest 建出來 → 查詢要自動載入。
 
     這是 P3「reload 依賴人工記得」的 code 層保證:不呼叫
@@ -150,6 +150,14 @@ def test_query_knowledge_autoloads_kb_created_after_startup(mcp_module, tmp_path
     import json as _json
 
     fn = getattr(mcp_module.query_knowledge, "fn", mcp_module.query_knowledge)
+
+    # get_status() 只為顯示 Rerank/LLM 狀態會 probe /health；這條測試驗的是
+    # KB 檔案出現後自動重載，不需要也不允許接觸真 reranker。
+    monkeypatch.setattr(
+        mcp_module.KnowledgeBase,
+        "_check_reranker_available",
+        lambda _self: False,
+    )
 
     out_before = fn("任何問題")
     assert out_before.get("error") == "knowledge base not loaded"

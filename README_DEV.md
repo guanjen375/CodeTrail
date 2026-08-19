@@ -20,6 +20,12 @@ python deployment_profile.py validate
 ruff check tests scripts
 ```
 
+`python scripts/run_tests.py` 無參數時會以標準庫把 test file 分成最多 4 個
+隔離 shard 並行執行，不需要 `pytest-xdist`，而且不會拆開同一個 test module。
+資源較小或要重現序列順序時用 `AICODE_TEST_JOBS=1 python scripts/run_tests.py`。
+只要有傳 `-k`、`-x`、檔名或其他 pytest 參數，就維持原本的單一 pytest 行程與
+逐字轉發語意。
+
 核心日常入口是 OpenCode TUI；跨機 web 另有薄 launcher（兩者共用 `aicode` 安全前置）：
 
 ```bash
@@ -43,6 +49,7 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 ## 測試指南
 
 - `tests/test_cli.py` — 維護用腳本 help / error path smoke test
+- `tests/test_test_runner.py` — 完整測試分片的完整性、決定性與 worker 上限
 - `tests/test_config.py` — config 數值的範圍與型別 sanity
 - `tests/test_sandbox.py` — `_safe_path` 不會被 `..` / 絕對路徑 / symlink 騙過
 - `tests/test_patch.py` — apply_patch 的 happy path、逃逸、context 不符、max 限制

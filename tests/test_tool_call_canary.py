@@ -341,14 +341,14 @@ def test_frontend_model_argument_is_forwarded_to_canary_run(monkeypatch, tmp_pat
 def test_heartbeat_runner_reports_progress_and_captures_output(tmp_path, capsys):
     child = (
         "import time; print('canary-stdout', flush=True); "
-        "time.sleep(0.35); print('done', flush=True)"
+        "time.sleep(0.12); print('done', flush=True)"
     )
     result = canary._run_process_with_heartbeat(
         [sys.executable, "-c", child],
         root=tmp_path,
         env=dict(os.environ),
         timeout=30,
-        heartbeat=0.1,
+        heartbeat=0.03,
     )
     assert result.returncode == 0
     assert "canary-stdout" in result.stdout
@@ -363,8 +363,8 @@ def test_heartbeat_runner_timeout_preserves_partial_output(tmp_path):
             [sys.executable, "-c", child],
             root=tmp_path,
             env=dict(os.environ),
-            timeout=1,
-            heartbeat=0.1,
+            timeout=0.5,
+            heartbeat=0.03,
         )
     except subprocess.TimeoutExpired as exc:
         assert "early" in canary._coerce_text(exc.stdout)
