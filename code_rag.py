@@ -71,6 +71,17 @@ RETRIEVAL_SCORER_VERSION = 1
 #   - CodeGraph fingerprint:**否**(graph 不吃 embed text)
 #   - eval vector manifest:**是**
 #
+# **什麼時候要 bump**(權威定義,其他地方一律指向這裡):
+#   要 bump —— 任何會改變 render **輸出**的非預算語意變更。實務上就是動到
+#     `semantic_fields()` 或 `render_semantic_fields()` 的行為:欄位集合、欄位
+#     順序、label 文字("linkage:" 這種)、分隔方式、截斷演算法。
+#   不必 bump —— 單純的**預算數值**(CODE_RAG_EMBED_TEXT_MAX_CHARS 等,含
+#     AICODE_* 環境變數覆寫)。那些值本身在 cache_identity() 的 render_budgets
+#     裡,改了就會自己讓 cache 失效,不需要人工記得 bump。
+#
+# 只說「欄位集合或順序」是**不夠**的:label 改個字、分隔符換掉、截斷從尾端改成
+# 中間截,產出的字串都不一樣,而舊向量會被增量重建靜默沿用(它只比 file_hash)。
+#
 # v1:path / type / symbol / parent / signature / docstring / type_hints /
 #     context,context 吃 400 - used_len 的剩餘預算。
 # v2(P3A):canonical field ordering(含 leading comment、linkage、condition),
@@ -689,8 +700,9 @@ class CodeRAG:
 
         欄位集合與順序來自 CANONICAL_SEMANTIC_FIELDS —— 與 lexical scorer、
         reranker passage 同一份;預算是自己的 CODE_RAG_EMBED_TEXT_MAX_CHARS。
-        改這裡的欄位或預算都要 bump EMBED_TEXT_SCHEMA_VERSION,否則舊向量
-        會被增量重建靜默沿用(它只比 file_hash)。
+        改動 render **輸出**(欄位、順序、label、分隔、截斷演算法)要 bump
+        EMBED_TEXT_SCHEMA_VERSION;只改預算數值不必 —— 規則與理由見該常數的
+        宣告處。
         """
         return render_semantic_fields(item, config.CODE_RAG_EMBED_TEXT_MAX_CHARS)
 

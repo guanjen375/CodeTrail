@@ -287,10 +287,16 @@ C 的 `/** ... */` 寫在定義行**之上**,而 context 從定義行往下取,�
 所以 leading comment 是獨立欄位(`Symbol.comments`),邊界有四條:同 scope(只走
 sibling)、不跨空行、不跨 preprocessor 或其他節點、不吃檔頭 license。三個消費者
 **都**看得到它;只加進 embed text 而 lexical 還在掃舊 context 的話,那條 lane 會靜默
-看不到註解訊號。改**欄位集合或順序**要 bump `code_rag.EMBED_TEXT_SCHEMA_VERSION`;
-改**預算數值**(含 `AICODE_*` 環境變數覆寫)不必手動 bump —— 預算的實際值已經在
-`code_rag.cache_identity()` 裡,舊 cache 會自己失效。兩者都必要:增量重建只比
-file_hash,少了任何一邊都會靜默沿用用舊 render 算出來的向量。
+看不到註解訊號。
+
+`EMBED_TEXT_SCHEMA_VERSION` 的維護規則(權威定義在 `code_rag` 該常數的宣告處):
+**任何會改變 render 輸出的非預算語意變更都要 bump** —— 欄位集合、欄位順序、label
+文字、分隔方式、截斷演算法,只要 `semantic_fields()` / `render_semantic_fields()`
+的產出字串會變就算。只說「欄位集合或順序」是不夠的:label 改個字或截斷改個方向,
+字串一樣會變。**單純的預算數值不必 bump**(含 `AICODE_*` 覆寫)—— 那些值已經在
+`cache_identity()` 的 `render_budgets` 裡,改了自己就會讓 cache 失效。
+兩條機制都必要:增量重建只比 file_hash,少了任何一邊都會靜默沿用用舊 render
+算出來的向量。
 
 實測(fixture corpus,per_repo / runtime_hybrid):leading comment 讓 macro-average
 file recall 0.6683 → 0.7783、MRR 0.900 → 0.950,context coverage(1.000)、evidence
