@@ -40,17 +40,29 @@ aicode/doctor 與 `~/start.sh` 各讀一份設定(set_config 偵測到會警告)
   main 時一定 fail-loud，直到 `AICODE_MODEL` 或 local profile 明確指定。
 - `port` 與 `base_url`：必須一致；URL 只接受無 credentials/path/query 的 HTTP(S)。
 - `bind`：`local`(預設,loopback base_url 只綁 `127.0.0.1`)或 `all-interfaces`
-  (綁 `0.0.0.0`,對其他機器開放 —— llama-server 無認證,慎用)。env 覆寫:
+  (綁 `0.0.0.0`,對其他機器開放 —— CodeTrail 目前產生的 server 指令未啟用
+  認證,慎用)。env 覆寫:
   `MAIN_BIND` / `EMBED_BIND` / `RERANK_BIND` / `VL_BIND`,或 `AICODE_BIND` 一次
   套用四個 role。非 loopback 的 base_url host 不受影響、照原樣綁定。
 - `gpu_role`：只能是 `main` 或 `aux`。
 - `ctx`、`batch`、`ubatch`：正整數或明確 `null`；`null` 代表不傳該 llama.cpp flag。
-- `parameters`：role-specific allowlist；未知 key 直接拒絕。四個 role 都支援
-  `gpu_layers`(→ `-ngl`)、`flash_attention`(→ `-fa`)、`no_mmap`(→ `--no-mmap`)、
-  `parallel`(→ `-np`)；main 另支援新版
-  llama.cpp 的自動 VRAM 配置:`gpu_layers` 可為整數或 `"auto"`(`-ngl auto`)、
-  `fit`(`"on"`/`"off"` → `--fit`)、`fit_target`(MiB → `--fit-target`)、
-  以及 `cpu_moe: true`(→ `--cpu-moe`)；VL 也支援 `fit` / `fit_target`，讓最後
+- `parameters`：role-specific allowlist；未知 key 直接拒絕。完整清單以
+  `deployment_profile.py::_ROLE_PARAMETERS` 為單一事實來源，目前是：
+  - 四個 role 共用：`gpu_layers`、`flash_attention`、`no_mmap`、`parallel`。
+  - main：另有 `jinja`、`temperature`、`top_p`、`top_k`、`min_p`、
+    `presence_penalty`、`cache_type_k`、`cache_type_v`、`cpu_moe`、`n_cpu_moe`、
+    `threads`、`fit`、`fit_target`。
+  - embedding：另有固定角色旗標 `embedding` / `pooling` 與 `cache_ram`。
+  - reranker：另有固定角色旗標 `embedding` / `pooling` / `reranking` 與
+    `cache_ram`。
+  - VL：另有 `fit`、`fit_target`、`cpu_moe`、`n_cpu_moe`。
+
+  主要映射包括 `gpu_layers` → `-ngl`、`flash_attention` → `-fa`、`no_mmap` →
+  `--no-mmap`、`parallel` → `-np`；main 的 sampling / KV cache 欄位也會逐參數轉成
+  llama-server argv。`gpu_layers` 可為整數或 `"auto"`(`-ngl auto`)，`fit`
+  (`"on"`/`"off"` → `--fit`)、`fit_target`(MiB → `--fit-target`)與
+  `cpu_moe: true`(→ `--cpu-moe`)用於 VRAM / CPU-MoE 配置。VL 也支援
+  `fit` / `fit_target`，讓最後
   啟動的 VL 依其他 aux 實際占用保留 VRAM。`cpu_moe` 與部分 offload 的
   `n_cpu_moe`(→ `--n-cpu-moe`)**只允許 main 與 vl**(embedding / reranker
   拒絕),且同一個 role 不可同時設定這兩鍵。**`--fit` 與 CPU-MoE 互斥**:llama.cpp 的
@@ -90,6 +102,10 @@ aicode/doctor 與 `~/start.sh` 各讀一份設定(set_config 偵測到會警告)
   套了 CPU-MoE 卻沒設時 `set_config.sh` 會警告(llama.cpp 自己也會印
   `tensor overrides to CPU are used with mmap enabled`);**手動加在 main 或 vl 的設定,重跑
   `set_config.sh` 會保留**(`_PRESERVED_KEYS_BY_ROLE`),不會被當成「未涵蓋鍵」丟掉。
+  截至 2026-08，上游 [server 參數文件](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+  已將 `--no-mmap` 標為 deprecated，建議未來轉向 `--load-mode`。CodeTrail 仍保留
+  `no_mmap` 來相容目前驗證過的 build；上游若移除旗標，要同步遷移 profile
+  schema、launcher、preflight 與文件，不要只在 JSON 自行改鍵名。
 - main 的 `threads`(→ `-t`)**從來不是設定時的問題**,只有 `set_config.sh --threads N`
   明確指定時才會寫入。未指定 = auto:不傳 `-t`,llama.cpp 的預設 `-1` 會自己偵測
   (x86_64 Linux 上 hybrid CPU 只算 P-core,否則用實體核心數、排除 HT siblings),
@@ -112,6 +128,23 @@ Qwen3 是 causal 架構,除 compute buffer 外還有 KV cache,所以增幅遠高
 
 禁止 `extra_args`、shell 字串、相對 artifact path、帶控制字元的值。launcher 由驗證後
 欄位建立 argv，再逐參數 quote 給 tmux。
+
+## 遠端 endpoint 的雙重同意
+
+`bind: "all-interfaces"` / `./set_config.sh --allow-remote` 控制的是「其他機器能不能連進
+llama-server」；profile 的 `base_url` 控制的是「CodeTrail 把 request 送去哪」。這是兩個
+不同方向的資料邊界。
+
+任何 role 的 effective `base_url` 不是 loopback 時，CodeTrail 還要求顯式設定：
+
+```bash
+export AICODE_MODEL_REMOTE_OK=1
+```
+
+沒有這個值，completion、chat、embedding、reranking、health、props 與 slots 都會
+fail-loud。設定它只表示接受資料送到該 endpoint，不會自動提供 TLS、認證、防火牆或
+VPN。Contextual Retrieval 的生成路徑另用 `AICODE_KB_CONTEXT_REMOTE_OK=1`，兩個 opt-in
+不互通。完整威脅邊界見 [security.md](security.md)。
 
 ## GPU precedence
 

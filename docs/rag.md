@@ -1,6 +1,9 @@
 # RAG、附件與知識庫操作
 
-這份文件整理附件匯入、知識庫建立、Code-RAG 搜尋與規格查詢方式。CodeTrail 啟動聊天 frontend 前會硬性檢查 llama-server `:8081` (embedding)、`:8082` (reranker) 與 `:8083` (VL) 都 ready。
+這份文件整理附件匯入、知識庫建立與規格查詢方式。Code-RAG 的 semantic /
+context / graph 模式改集中在 [MCP 工具清單](mcp-tools.md#code_rag_search-四種模式)。
+CodeTrail 啟動聊天 frontend 前會硬性檢查 llama-server `:8081` (embedding)、
+`:8082` (reranker) 與 `:8083` (VL) 都 ready。
 
 [回到 README](../README.md)。
 
@@ -61,8 +64,10 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 \
 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot" \
 aicode
 
-# 整個家目錄都放開（最寬鬆，沒敏感檔的話最省事）
-AI_CODE_ALLOW_EXTERNAL_IMPORT=1 AI_CODE_IMPORT_ROOTS="$HOME" aicode
+# 只開一個專用交換目錄（比放寬整個 home 安全）
+AI_CODE_ALLOW_EXTERNAL_IMPORT=1 \
+AI_CODE_IMPORT_ROOTS="$HOME/codetrail-import" \
+aicode
 ```
 
 多個目錄用冒號分隔（跟 `$PATH` 一樣）。如果每次都用同一組設定，加進 `~/.bashrc` 就不用每次帶：
@@ -120,7 +125,10 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 
 ### 把附件做成知識庫讓模型隨時能查
 
-「知識庫」是這個專案放規格書、手冊、設計文件的地方。一旦把文件匯進去，之後對話遇到相關問題時，系統會自動找出最相關的幾段內容當作回答依據，並用 `REF1` `REF2` 標出每段是引用自哪份文件的哪個位置。
+「知識庫」是這個專案放規格書、手冊、設計文件的地方。呼叫
+`query_knowledge(...)` / `query_knowledge_strict(...)` 時，系統會找出最相關的幾段內容
+作為回答依據，並用 `REF1`、`REF2` 標出來源位置。模型會不會在沒被點名時自行呼叫查詢，
+仍取決於本輪行為規則；不是文件入庫後每一輪都會自動注入。
 
 比起每次都重新貼一份 PDF 給對話，這樣比較不會超出上下文長度限制，也比較不會記錯。
 

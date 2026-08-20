@@ -298,7 +298,7 @@ echo "[aicode] AICODE_ROOT=$AICODE_ROOT"
 
 # MCP / tool-call health gate:
 #   1) 每次都直接走 initialize → tools/list → list_dir，確認 server 真正暴露
-#      完整 17-tool contract，而不是相信模型對自身工具的文字描述。
+#      完整 18-tool contract，而不是相信模型對自身工具的文字描述。
 #   2) 用 fresh `opencode run --format json` 驗 active model 能產生 completed 的
 #      結構化 codetrail_list_dir event；成功結果依 model/config/template/root 指紋
 #      快取，避免每次啟動都花一次完整推理時間。

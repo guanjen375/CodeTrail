@@ -38,8 +38,8 @@
 | 類型 | 工具 | 白話用途 |
 |---|---|---|
 | 專案探索 | `list_dir(path=".", depth=2)` | 看目錄樹，不要叫模型跑 `ls` |
-| 專案探索 | `code_rag_search(query, top_k=5, mode="semantic", hops=1, include_evidence=False, max_chars=12000)` | 用「這段程式在做什麼」去找可能的函式/class/macro/typedef/enum/global。`mode="context"` 把 semantic seeds、確定 1-hop caller/callee/include 與相關 test/header/config/trace lexical evidence 合併去重後裝箱（Python attribute call 這種只靠同名比對的 edge 標成 `heuristic callee/caller candidate` 並同時列進 `uncertainties`，不算 confirmed）；`max_chars` 只在此模式使用，合法 `2000..30000`，`used_chars` 只計 evidence text，歧義/unresolved 只列在 `uncertainties`。candidate/traversal/character-budget 上限會分開說明。它不走 graph mode 的 8000-char cap；graph 缺席時回 semantic-only evidence 並標 `graph_status`。`mode="neighbors"`(query 放 symbol 名看 1–2 hop 呼叫關係;放 repo 相對檔案路徑如 `src/uart.c` 看該檔的 include/import 關係);`mode="path"`(query 寫 `"SRC -> DST"`)拿跨檔案呼叫鏈,每一步都附 `檔:行` 證據且只走確定解析的邊(同名多候選的歧義邊、Python attribute call 的 heuristic 邊都不入鏈);`include_evidence=True` 讓 semantic 結果多帶分數組成 / parser backend / graph 1-hop 關係。graph 對 C/C++(tree-sitter)與 Python 抽 definitions / includes / calls；C/C++ definition 涵蓋函式、帶 body 的 class/struct/union、macro / macro function、typedef、enum 與 enum constant、以及 file/namespace scope 的 global 物件（`extern` 純宣告、forward tag、函式原型、member 與 local 變數都不算定義）；`.hh` / `.hxx` 從掃描到 parser 都按 C++ header 處理。C/C++ 只信 same-file、included static-inline header definition、qualified identity 相符的可見 prototype 對應唯一 external definition、或 C++ exact qualified name，edge 會標 `resolution_basis` / `confidence` / condition。`static` 不跨 translation unit；quote header 與具 namespace path、非絕對且唯一 suffix 命中的 angle header 可形成 transitive visibility；bare angle 的單一 repo basename 不冒充 system header，多候選只列 ambiguity，絕對 angle path 不做 repo suffix 配對。`#ifdef` 內的 include 會保存自己的 condition：條件以 literal 合取比較（`#else`/`#elif` 視為前一段取反），呼叫端條件蘊含 include 條件時才形成可見性——巢狀順序不必相同，跨檔案也適用；無法證明相容時整條 include closure 降為 conditional 候選（ambiguous，不算 resolved），可證明互斥的分支則直接排除。條件候選跨 resolution stage 合併，只有可證明互斥的 branch 才排除；function pointer/macro 維持 unresolved。**首次建置是顯式動作**:graph 尚未建立時 graph 模式會報錯,**錯誤訊息內含一條可直接複製到終端執行的建立命令**(實際的 MCP python interpreter + CodeTrail repo 內 `code_graph.py` 的絕對路徑 + 實際專案 root——手動形式是 `<MCP_PYTHON> <CODETRAIL_REPO>/code_graph.py --root <AICODE_ROOT>`);舊版 DB(v1/v2)重跑同一命令會 transactionally 原地升級，損壞 DB 則須先移出/刪除 graph DB 再建；建好後自動偵測變更，C/C++ visibility 變更會 full rebuild，Python body-only edit 保持增量，只有 callable catalog identity delta 牽動 C caller 時才 full rebuild |
-| 專案探索 | `grep_code(pattern, path=".", include=None, context=0)` | 搜錯誤訊息、函式名、設定名 |
+| 專案探索 | `code_rag_search(query, top_k=5, mode="semantic", hops=1, include_evidence=False, max_chars=12000)` | 依語意定位 symbol、建立 bounded evidence，或查 call/include graph；四種模式與保守解析契約見下節 |
+| 專案探索 | `grep_code(pattern, path=".", include=None, context=0)` | 搜錯誤訊息、函式名、設定名；複雜 regex 會退回字面搜尋，並有 30 筆 match、單行 500 字元與整體 200,000 字元的硬上限，截斷會明示標記 |
 | 專案探索 | `file_info(path)` | 讀檔前先看大小，避免一次塞爆 context |
 | 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=50000)` | 讀檔案內容，長檔要分段 |
 | 文件/外部檔案 | `import_external_file(path, dest_name=None)` | 把允許來源的外部檔案複製進 `.aicode_uploads/` |
@@ -55,6 +55,56 @@
 | 修改/驗證 | `run_lint(path, fix=True)` | 對單一檔案跑格式化/lint；`fix=False` 走 check-only(不改檔) |
 | 修改/驗證 | `run_command(cmd)` | 跑白名單內的測試 / lint;build 命令(make/cmake/ninja/meson/bazel)需設 `AI_CODE_ENABLE_BUILD_COMMANDS=1` |
 | 行為教訓 | `record_lesson(rule, scope="project")` | 你糾正模型行為後,把糾正「提案」成一條行為規則;經你核准(permission ask)寫入 lessons store,之後 session 注入 context([docs/lessons.md](lessons.md)) |
+
+### `code_rag_search` 四種模式
+
+- `mode="semantic"`：用自然語言找 function / class / method / macro / typedef / enum /
+  translation-unit / namespace-scope global。`include_evidence=True` 時加上分數組成、
+  parser backend、confidence、
+  graph status 與最多 5 條一跳關係；預設維持精簡回傳。
+- `mode="context"`：先取 semantic seeds，再加入 confirmed 1-hop caller / callee /
+  include 與相關 test / header / config / trace lexical evidence，去重後裝進固定字元 budget。
+  `max_chars` 合法範圍為 `2000..30000`，預設 `12000`；`used_chars` 只計
+  `evidence[].text`，不是 tokenizer token。candidate、graph traversal 與 character budget 的
+  截斷會分開回報。歧義、unresolved 與 Python attribute-call heuristic 只進
+  `uncertainties`，不算 confirmed；graph 缺席時仍回 semantic-only evidence 並標示
+  `graph_status`。
+- `mode="neighbors"`：query 放 symbol 名可看 1–2 hop 關係；放 repo 相對檔案路徑
+  （例如 `src/uart.c`）可看 include / import 關係。
+- `mode="path"`：query 寫 `"SRC -> DST"`，回傳最多 3 條、最長 4 hop 的最短呼叫鏈。
+  每一步都附 `path:line`，只走 confirmed edge；同名歧義與 heuristic edge 不會混入鏈。
+
+graph 使用 tree-sitter 解析 C/C++，並解析 Python definitions / imports / calls。C/C++
+definition 涵蓋函式、帶 body 的 class / struct / union、macro、typedef、enum / enum
+constant 與 translation-unit / namespace scope global；純 prototype、`extern` 宣告、forward
+tag、member / local variable 不算 definition。解析會尊重 linkage、實際 include visibility、
+qualified identity 與可證明的 preprocessor condition；不夠確定的 function pointer、macro
+間接呼叫或條件候選維持 unresolved。
+
+graph 首次建置是顯式動作。DB 不存在或 schema 過舊時，錯誤訊息會附一條含實際 MCP
+Python、CodeTrail `code_graph.py` 絕對路徑與實際 project root 的可複製命令；手動形式為：
+
+```bash
+<MCP_PYTHON> <CODETRAIL_REPO>/code_graph.py --root <AICODE_ROOT>
+```
+
+舊版 DB 可用同一命令 transactionally 升級；DB 損壞則先移到不會 commit 的備份位置再建。
+建好後會偵測檔案變更，依 visibility / callable catalog 影響選擇增量或完整重建。
+
+Code-RAG 索引預設排除 ignored、虛擬環境、`third_party` / `vendor` / `external` / `build`
+類目錄與自己的 cache；
+這不會改變 `grep_code` / `list_dir`。要先看實際索引範圍，可在 CodeTrail checkout 跑
+唯讀、離線且預設不印路徑的統計：
+
+```bash
+python scripts/index_stats.py --root <AICODE_ROOT>
+```
+
+部署層需要額外 include / exclude 時才使用
+`~/.config/codetrail/index-scope.json`；schema 與 matcher 細節見
+[README_DEV 的索引範圍章節](../README_DEV.md#索引範圍-index-scope)。這份檔不得放進
+target repo，必須維持 owner-only 權限（POSIX `chmod 600`）；pattern 本身可能洩漏 NDA
+目錄結構。
 
 ### 使用原則
 

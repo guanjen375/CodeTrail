@@ -6,7 +6,21 @@
 
 ---
 
-## 常見問題
+## 快速分流
+
+這份文件按「安裝 / GPU → MCP / 模型行為 → KB → web → context → server →
+patch / command」排列。內容很長時可先用頁面搜尋找下列關鍵字：
+
+| 畫面或症狀 | 先搜尋 |
+|---|---|
+| CUDA / build 失敗 | `compute_120a`、`sm_52`、`rollback` |
+| MCP Connected 但沒有真工具呼叫 | `假工具 XML` |
+| MCP `-32000 Connection closed` | `Connection closed` |
+| 圖片或 ingest 逾時 | `10 秒超時`、`image_url` |
+| web / attach 連不上 | `Tailscale`、`attach`、`port 被占用` |
+| context 啟動閘擋下 | `ctx-safety`、`ctx-align` |
+| server / RAG 異常 | `llama-server 不可連`、`embedding`、`查 spec 沒結果` |
+| 修改工具被拒 | `apply_patch`、`run_command` |
 
 ### Build llama.cpp 時 `nvcc fatal : Unsupported gpu architecture 'compute_120a'`
 
@@ -19,7 +33,7 @@ nvidia-smi | grep "CUDA Version"   # 驅動上限,>= 12.8 才有救
 nvcc --version                      # 已安裝 toolkit
 ```
 
-修法見 [README §1.4](../README.md#14-僅-blackwell-gpu-需要升級-cuda-toolkit-到-13)。重點順序:
+修法見 [README §1.4](../README.md#14-blackwell-gpu-需要-cuda-toolkit-128-以上)。重點順序:
 
 1. 從 NVIDIA apt repo 裝 `cuda-toolkit-13-0`(**不要**裝 `cuda` 或 `cuda-13-0`,那兩個會連驅動拉下來打架)
 2. `sudo apt remove --purge nvidia-cuda-toolkit ...` 移除 Ubuntu 內建舊的(避免 `/usr/bin/nvcc` 被當第一順位)
@@ -221,7 +235,7 @@ python3 -m json.tool ~/.config/opencode/opencode.json >/dev/null
 opencode debug agent build | rg '"temperature": 0'
 ```
 
-`temperature: 0` 是降低隨機格式漂移的建議,不是保證任何模型都能正確 tool call。[OpenCode agent 設定](https://opencode.ai/docs/agents/)雖正式支援 agent-level `temperature`,custom `@ai-sdk/openai-compatible` provider 仍有版本相關的傳遞問題([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));所以 `opencode debug agent build` 只能證明設定已解析,不能單獨證明 request body 一定帶了它。要釘住所有未明示取樣值的請求,再把下面的鍵**合併進既有** `~/.config/codetrail/deployment.json`(保留其他 service / model / port):
+`temperature: 0` 是降低隨機格式漂移的建議,不是保證任何模型都能正確 tool call。[OpenCode agent 設定](https://dev.opencode.ai/docs/agents/)雖正式支援 agent-level `temperature`,custom `@ai-sdk/openai-compatible` provider 仍有版本相關的傳遞問題([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));所以 `opencode debug agent build` 只能證明設定已解析,不能單獨證明 request body 一定帶了它。要釘住所有未明示取樣值的請求,再把下面的鍵**合併進既有** `~/.config/codetrail/deployment.json`(保留其他 service / model / port):
 
 ```json
 {

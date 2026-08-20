@@ -50,11 +50,18 @@ CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透�
 |---|---|
 | 看 repo 架構 | `請用 list_dir 看專案結構，找 entry point、測試和設定檔。` |
 | 找錯誤訊息 | `請用 grep_code 搜尋 "panic: xxx"，再讀最可能的檔案。` |
+| 分析原因並控制 context | `請用 code_rag_search mode=context、max_chars=12000 收集證據，分成已證實與 uncertainty。` |
+| 看 caller / callee | `請用 code_rag_search mode=neighbors 查 uart_send，逐步附 path:line。` |
+| 看 A 到 B 的呼叫鏈 | `請用 code_rag_search mode=path，query="A -> B"，只列 confirmed edge。` |
 | 看已知檔案 | `請用 file_info 看 src/main.c 大小，再用 read_file 讀前 120 行。` |
 | 查已匯入 spec | `請用 query_knowledge 查 reset timing，回答要附 REF。` |
 | 高風險規格數字 | `請用 query_knowledge_strict 查最大值，證據不足就拒答。` |
 
 完整工具清單見 [MCP 工具清單](mcp-tools.md)。
+
+`mode="semantic"` / `mode="context"` 可在 graph 尚未建立時使用；`neighbors` / `path`
+需要先建立 graph DB。若尚未建立，工具錯誤會直接附上含實際 Python 與 project root 的
+可複製命令。不要猜 DB 路徑，照錯誤中的命令執行即可。
 
 ---
 
@@ -195,7 +202,7 @@ aicode
 
 ---
 
-## 5.5 糾正模型的做事方式(lessons)
+## 6. 糾正模型的做事方式(lessons)
 
 同一種糾正不想每個 session 重講一次時,糾正完接一句:
 
@@ -207,9 +214,17 @@ aicode
 
 ---
 
-## 6. Web 模式(瀏覽 / 續問歷史 session)
+## 7. Web 模式(瀏覽 / 續問歷史 session)
 
-§0 的 `aicode` 是 standalone TUI。如果你想用瀏覽器瀏覽歷史 session、點任一筆續問，或讓 web 與 TUI 同時看同一份對話，改用 web 模式。web backend 會 spawn CodeTrail MCP —— `set_config.sh` 已把偵測到的 Python 路徑寫進 OpenCode 設定,一般不需 activate 任何環境;若你是手動設定且用 venv,啟動的 shell 要先 activate(見 [安裝、設定與啟動](setup.md))。attach 端是純 client,不受此限。
+§0 的 `aicode` 是 standalone TUI。如果你想用瀏覽器瀏覽歷史 session、點任一筆續問，
+或讓瀏覽器與 TUI client 連到**同一個 backend**，改用 web 模式並讓 TUI 端走
+`aicode attach`。不要在同一個專案同時另開 standalone `aicode` 與 `aicode_web`；兩個
+backend 會共用 session 資料庫而互相干擾。
+
+web backend 會 spawn CodeTrail MCP。`set_config.sh` 會把 MCP Python 的絕對路徑寫進
+OpenCode 設定；但如果 CodeTrail 依賴只裝在 venv，`aicode` / `aicode_web` 的啟動前置
+仍應在 activate 後執行（見 [安裝、設定與啟動](setup.md)）。`aicode attach` 是純 client，
+不跑 backend preflight，也不需要 Python 環境。
 
 ### 啟動 web backend
 

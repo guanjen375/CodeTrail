@@ -1,6 +1,10 @@
 # 安全邊界與工作節奏
 
-這份文件整理 CodeTrail 在 OpenCode TUI 裡的安全邊界。重點是:CodeTrail 有自己的沙箱,但它只包住 CodeTrail MCP 工具;OpenCode 內建工具要另外用 permission 鎖住。
+這份文件整理 CodeTrail 在 OpenCode TUI / web backend 裡的安全邊界。重點是:
+CodeTrail 有自己的沙箱,但它只包住 CodeTrail MCP 工具；OpenCode 內建工具、provider、
+plugin 與專案設定仍要另外限制。操作責任與人工驗證原則見
+[Responsible Use](../RESPONSIBLE_USE.md)，保固與審計界線見
+[Disclaimer](../DISCLAIMER.md)。
 
 [回到 README](../README.md)。
 
@@ -15,13 +19,21 @@ cd <PROJECT_TO_ANALYZE>
 OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode
 ```
 
-並保留 README §4.2 範本裡的 OpenCode permission:只允許 `codetrail_*`,把 OpenCode 內建 `bash` / `read` / `write` / `edit` / `apply_patch` 等全部 `deny`。
+並保留 [README §4.3](../README.md#43-opencode-config) 範本裡的 OpenCode
+permission:只允許 `codetrail_*`,把 OpenCode 內建 `bash` / `read` / `write` / `edit` /
+`apply_patch` 等全部 `deny`。
 
 ---
 
 ## 沙箱真正保護什麼
 
-`aicode` 啟動時會把當前目錄設成 `AICODE_ROOT`。CodeTrail 的 18 個 MCP 工具只能在這個根目錄裡讀寫;從 `$HOME` 或 `/` 啟動會直接被拒絕。
+`aicode` 啟動時會把當前目錄設成 `AICODE_ROOT`。一般檔案讀寫都限制在這個根目錄；
+從 `$HOME` 或 `/` 啟動會直接被拒絕。兩個刻意而受限的例外是:
+
+- `import_external_file(...)` 在你顯式開啟後,可從指定來源白名單**讀取並複製**單一檔案到
+  `<AICODE_ROOT>/.aicode_uploads/`;後續工具仍只處理沙箱內副本。
+- `record_lesson(...)` 經 permission `ask` 核准後,只可寫固定的
+  `~/.config/codetrail/lessons.json`,不能由模型指定其他外部路徑。
 
 受 CodeTrail 沙箱保護的典型工具包含:
 
@@ -47,7 +59,7 @@ web 模式也一樣:
 OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode_web
 ```
 
-這會讓 OpenCode 忽略專案層級設定,避免 repo 自帶 config 把 `bash` / `read` / `write` 等內建工具重新放開。
+這會讓 OpenCode 忽略專案層級設定,避免 repo 自帶 config 把 `bash` / `read` / `write` 等內建工具重新放開。這個 env **只**關閉 project config，不會自動清掉 OpenCode 的全域、remote/custom、inline、managed 設定或已安裝 plugin。依 [OpenCode 的 config 合併與優先順序](https://dev.opencode.ai/docs/config/)，處理機密資料前仍要用 `opencode debug config` 檢查最終設定，並盤點已安裝 plugin。
 
 兩個此模式的副作用/防線要知道:
 
@@ -72,7 +84,9 @@ AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/specs" \
 aicode
 ```
 
-匯入後檔案會複製到專案底下 `.aicode_uploads/`。不要把整個 `$HOME` 加進白名單,除非你確認裡面沒有 SSH key、憑證、客戶資料或其他敏感檔。
+匯入後檔案會複製到專案底下 `.aicode_uploads/`。白名單應只放實際需要的最窄目錄；
+不要加入整個 `$HOME`、憑證目錄、共享根目錄或其他無關資料樹。來源檔與沙箱內副本都要
+依資料擁有者的保存與刪除政策處理。
 
 ---
 
@@ -101,17 +115,33 @@ aicode
 - `knowledge_emb.npz`
 - `data/`、`*.jsonl`
 - `.code_rag_cache_*`、`.rag_cache/`、`.rag_embedding_cache.json`
+- `.code_rag_graph.sqlite3*`、`.code_rag_graph.lock`
 - `.codetrail/`
 - `.aicode_uploads/`
 - `.opencode/`
 
-這個 repo 的 `.gitignore` 已經忽略上述主要路徑。若你在另一個 target project 使用 CodeTrail,也建議在那個 project 的 `.gitignore` 補上同樣項目。
+這個 repo 的 `.gitignore` 已經忽略上述主要路徑。若你在另一個 target project 使用
+CodeTrail,也建議在那個 project 的 `.gitignore` 補上同樣項目。`.gitignore` 不能保護
+被重新命名、複製或手動 export 的內容；commit / 分享前仍要看 `git status` 與實際 diff。
 
 ---
 
 ## 模型 API(llama-server)曝光面
 
-四個 llama-server(8080–8083)**預設只綁 `127.0.0.1`**:llama-server 沒有內建認證,綁 `0.0.0.0` 等於讓同網段任何機器都能呼叫你的模型 API。要讓其他機器連線必須明確選擇:`./set_config.sh --allow-remote`、`AICODE_BIND=all-interfaces`,或 deployment.json 各 service 的 `"bind": "all-interfaces"` —— 且只該在可信內網 / VPN 使用,必要時加防火牆規則。(2026-08 之前的舊版會把 localhost 靜默轉成 `0.0.0.0`,升級後預設收緊。)
+四個 CodeTrail 產生的 llama-server(8080–8083)**預設只綁
+`127.0.0.1`，且未啟用認證**。上游 llama-server 目前有 `--api-key` /
+`--api-key-file` 與 TLS 選項，但 CodeTrail 的 profile allowlist 與內部 HTTP client 尚未
+接上這些 credential；README OpenCode 範本的 `apiKey: "local"` 只是 provider 所需的
+非空值，不是 CodeTrail 部署的存取控制。因此以目前支援的路徑來看，綁
+`0.0.0.0` 就等於讓可抵達該 port 的機器都能呼叫模型 API。
+
+要讓其他機器連線必須明確選擇 `./set_config.sh --allow-remote`、
+`AICODE_BIND=all-interfaces`，或 deployment.json 各 service 的
+`"bind": "all-interfaces"`，而且只該在可信內網 / VPN 使用，必要時加防火牆規則。
+如要開發 credential 支援，必須同步改 profile schema、所有 `llama_client`
+call site、doctor / preflight 與 secret redaction，不能只手動在單一 server 加旗標。
+[上游 server 選項](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+可供查證。
 
 ## 模型流量的 outbound policy(prompt 外送防線)
 
@@ -122,6 +152,10 @@ aicode
 - **不跟隨 redirect**:任何 3xx 一律報錯(訊息含 status 與 Location host,絕不含 request body),拒絕把已送出的 POST 重送到別處。
 - KB chunk 脈絡生成(Contextual Retrieval)沿用獨立的 `AICODE_KB_CONTEXT_REMOTE_OK`(見 docs/rag.md);兩個 opt-in 不互通,各自守各自要外送的內容。
 - `python scripts/doctor.py` 啟動前就會檢查:端點非 loopback 且未設對應 opt-in → FAIL。
+
+這些規則只涵蓋 CodeTrail 經 `llama_client` 發出的請求。OpenCode 自己的 provider、內建
+web 工具、plugin 或其他 process 不會自動繼承 CodeTrail 的 endpoint policy。NDA 場景要
+同時保留 `enabled_providers` 與 permission 鎖定，並檢查 effective OpenCode config。
 
 ## Web 模式曝光面
 
@@ -138,6 +172,8 @@ aicode
 - 從具體專案目錄跑 `aicode` / `aicode_web`,不要從 `$HOME` 或 `/`。
 - `/status` 看到 `codetrail Connected` 後再開始工作。
 - 不信任 repo 時加 `OPENCODE_DISABLE_PROJECT_CONFIG=1`。
-- 保留 README §4.2 的 `permission` 鎖定。
+- 保留 [README §4.3](../README.md#43-opencode-config) 的 `enabled_providers` 與
+  `permission` 鎖定。
 - 需要外部附件才打開 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1`。
+- remote endpoint 只在明確接受資料外送時設定對應 opt-in。
 - commit 前跑 `git status` / `git diff`,確認沒有知識庫、上傳附件、jsonl 或 session 快取。

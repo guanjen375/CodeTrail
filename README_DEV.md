@@ -5,25 +5,34 @@ AI agent 改 repo 前看 `AGENTS.md`（安全紅線與禁止事項）；這裡�
 
 ---
 
-## 常用命令
+## 維護命令索引
+
+下面是命令目錄，不代表每個角色都能在每次修改中全部執行。實際執行權責以
+[AGENTS.md §2](AGENTS.md#2-測試-policy) 為準：預設 developer 在開發途中不跑測試，
+交付前只跑一次 smoke；只有本次 prompt 明示 `ROLE=REVIEWER` 才在程式碼收斂後跑一次
+full。靜態 consistency / compile 檢查不會收集 pytest，可在相關檔案變更後使用。
 
 ```bash
-# 本地驗證（不需要 llama-server）
+# 靜態檢查（不收集 pytest）
 python -m compileall -q .
-python scripts/run_tests.py
 python scripts/check_eval_consistency.py
 python scripts/check_readme_consistency.py
 AICODE_MODEL=test-model:latest python scripts/doctor.py --no-network
 python deployment_profile.py validate
 
+# 測試入口（何時能跑見 AGENTS.md §2）
+python scripts/run_tests.py -m smoke
+python scripts/run_tests.py
+
 # Lint（advisory，CI 不擋）
 ruff check tests scripts
 ```
 
-MCP runtime 目前刻意維持 SDK 1.x：`requirements.txt` 使用官方建議的
-`mcp>=1.28,<2`，因為程式仍 import `mcp.server.fastmcp.FastMCP`。乾淨安裝會取最新
-1.x；SDK 2.x migration 必須另案同步處理 import、transport、schema 與 OpenCode
-相容性，不能只移除 `<2`。`doctor` 會把缺少 MCP、低於 1.28 或 2.x 都列為 FAIL。
+截至 2026-08，MCP Python SDK 2.x 已是 stable；本 repo 仍刻意留在維護中的
+v1：`requirements.txt` 使用官方給未遷移專案的 `mcp>=1.28,<2`，因為程式
+仍 import `mcp.server.fastmcp.FastMCP`。SDK 2.x migration 必須另案同步處理 import、
+transport、schema 與 OpenCode 相容性，不能只移除 `<2`。`doctor` 會把缺少
+MCP、低於 1.28 或 2.x 都列為 FAIL。
 
 `python scripts/run_tests.py` 無參數時會以標準庫把 test file 分成最多 8 個
 隔離 shard 並行執行，不需要 `pytest-xdist`，而且不會拆開同一個 test module。
@@ -49,73 +58,61 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 
 ---
 
-## 加新功能的標準流程
+## 修改流程
 
-1. 改程式碼。
-2. 新加或更新 tests（至少：MCP smoke、安全邏輯、edge case）。新功能 → 新 test 檔；不要塞舊 test 檔。
-3. 跑 `python scripts/run_tests.py`、`python scripts/check_eval_consistency.py`、
-   `python -m compileall -q .` — 三個都過才送 PR / 提交。
-4. 如果改了 `config.py` / MCP tool schema / `README.md`，再跑一次 eval / readme consistency。
+1. 先確認本次角色與 [AGENTS.md](AGENTS.md) 的安全紅線，再做最小修改。
+2. 只有兩類情況新增測試：真實 bug 的 regression，或會無聲失敗的契約／安全檢查點。
+   新功能本身不自動等於要補儀式性測試。
+3. bug fix 必須走 red-before-green：先新增帶 `@pytest.mark.smoke` 的 regression，單跑取得
+   紅燈，再改實作並單跑同一 node 轉綠。這是 developer 開發途中唯一允許的測試例外。
+4. 依變更內容跑不會收集 pytest 的靜態 consistency / compile 檢查。
+5. developer 交付前只跑一次 `python scripts/run_tests.py -m smoke`；reviewer 才在收斂後對
+   目前 HEAD 跑一次 full。任何新失敗都要先處理，`0 tests collected` 不算通過。
+6. 不要自行 commit；使用者確認後才可提交。
 
 ---
 
 ## 測試指南
 
-- `tests/test_aicode_wrapper.py` — `aicode` wrapper:MCP wrapper 生成、舊 opencode.json 自動修復、`--model` 轉發與衝突
-- `tests/test_aicode_web_forwarding.py` — `aicode web` 的 port/hostname 注入、額外參數直通、preflight-only 早退
-- `tests/test_aicode_web_access.py` — `aicode web` 的存取控制:root safety、非本機 hostname 密碼閘、Tailscale 例外
-- `tests/test_aicode_attach.py` — `aicode attach` 與「無子指令時不得誤觸 web/attach」的回歸
-- `tests/test_script_help.py` — 維護腳本的 `--help` / 錯誤路徑 smoke(cheap return、不吐 Traceback)
-- `tests/test_test_runner.py` — 完整測試分片的完整性、決定性與 worker 上限
-- `tests/test_config.py` — config 數值的範圍與型別 sanity
-- `tests/test_fs_sandbox.py` — §3 第一道閘:`_safe_path` 擋 `..`/絕對路徑/symlink、`read_file` 的內容型別分流(BOM/UTF-16/二進位/預算)、`analyze_file` 入口不洩漏外部路徑存不存在;整份 smoke
-- `tests/test_patch_parser.py` — apply_patch 的 unified-diff parser:多檔 hunk、header 變體、格式異常拒絕;整份 smoke
-- `tests/test_patch_apply.py` — apply_patch 套用階段:context 必須匹配、max files/lines、行號選填、多處匹配 fail-loud、已套用冪等;整份 smoke
-- `tests/test_repeat_guard.py` — 唯讀查詢工具的重複呼叫偵測(同參數同結果 → 打斷文字;結果變了 → 歸零)
-- `tests/test_run_command.py` — 白名單 + shell 元字元 + 注入防護
-- `tests/test_repo_consistency.py` — README/docs ↔ `mcp_server.py`/`config.py` 不漂移,以及 eval ↔ config/source 不漂移
-- `tests/test_doctor.py` — doctor 各 check 的 happy / fail / skip 路徑(含 context/offload)
-- `tests/test_context_budget.py` — token 估算、hard gate、metrics 解析、telemetry 隱私
-- `tests/test_code_context.py` — bounded code evidence 的 range merge、content dedupe、
-  `2000..30000` 字元 budget，以及 symlink/binary/ignored-path 安全回歸
-- `tests/test_trim.py` — per-tool trim 策略、`[CTX_TRIMMED]`/`[TOOL_SUMMARY]` 標記、優先級
-- `tests/test_external_import.py` — `import_external_file` 白名單、副檔名、大小限制
-- `tests/test_mcp_startup.py` — 啟動閘三層:`validate_aicode_root` 純函式、mcp_server 真的有接上去(靜態)、真 spawn 一次驗 listening 與 `/` 被拒;整份 smoke
-- `tests/test_mcp_runtime_policy.py` — `runtime_policy` 的 patch/run_command/build 決策 + 兩條 startup banner 端對端錨點;整份 smoke
-- `tests/test_index_scope.py` — 索引範圍:三態走訪 ≡ `should_index_file` 的不變式、rescue 四測、Layer C loader fail-loud(schema/權限/pattern 衛生)、matcher 方言向量、symlink containment、快取 fingerprint 遷移、`index_stats` root 驗證;全部離線且用合成樹名
-- `tests/test_code_smoke_eval.py` — code inference fixture schema(舊 16 題 + 五類各 4 題 blocking core + bounded stretch)、deterministic plumbing stub、HTTP poison、chars-only context metrics 與 fixture cache 隔離
-- `tests/test_rag_rerank.py` — rerank policy(何時呼叫、失敗如何降級)+ MMR 不得蓋掉 cross-encoder 排序(rerank 分數當相關度、embedding 只算多樣性懲罰、min-max 正規化);離線
-- `tests/test_contextual_signals.py` — 雙訊號不變式:ctx 不進 evidence/REF/strict 來源、六個決策點逐一讀 gate、`_should_rerank` 三分支、merge 聚合 gate、lexical bypass 走 gate BM25、雙矩陣儲存與 required-schema 對照、旗標四象限;離線
-- `tests/test_context_generation.py` — 生成端:loopback 雙棧判定、非 loopback 需顯式同意、3xx/HTTP 錯當傳輸失敗、環境 proxy 隔離、快取檔名/權限/symlink 逃逸、write-through 與零呼叫冪等、指紋涵蓋模型檔 size+mtime、single-writer 鎖、窗公式含 `RESERVED_OUTPUT_TOKENS`、map/reduce 路徑、空回應重試一次、覆蓋率閘;HTTP 全 mock,離線
-- `tests/test_extracted_document.py` — `ExtractedDocument` 單一真相:章節 span 連續性、重複標題各自成節、chunk 的 char span 定位、PDF 頁 span/跨頁 page_range、「短頁被歸到上一頁章節」回歸、五個入口的 chunk 形狀一致;離線且用合成語料
-- `tests/test_tool_call_canary.py` — `aicode` 的兩層工具健檢：18-tool contract、假 XML 拒絕、completed event、設定指紋／24h cache、retry/FLAKY/fail-loud；所有 OpenCode／MCP／HTTP／LLM 路徑都 mock，pytest 絕不呼叫真模型
-- `tests/test_lessons.py` — lessons(行為教訓)store 驗證 fail-loud、20 條上限、scope/review_by 過濾、render 注入、過期停注入+複審提示、管理 CLI 與完整生命週期;純檔案系統,離線
-- `tests/test_web_server_scripts.py` — `aicode_web` 的 Tailscale IPv4 鎖定、headless tmux launcher、前景 preflight 擋下、參數防繞過與 stop/help smoke；Tailscale / OpenCode 不連真服務
-- `tests/test_gpu_safety.py` — `gpu_safety.py` 的 server /props 觀測、SafetyVerdict 分支;完全離線(nvidia-smi 與 llama-server HTTP 都用 hook 注入 fixture)
-- `tests/test_ctx_resolution.py` — n_ctx 多來源優先序,以及 `/props` 自動跟隨與 server 缺席時的 non-blocking fallback
-- `tests/test_server_lifecycle.py` — `check_status.py` 的 nvidia-smi process 計數/跨 GPU PID 去重/exit code,與 `stop_servers` 的等待與強制終止;nvidia-smi 完全用 stub
-- `tests/test_deployment_profile.py` — profile schema/precedence、惡意值拒絕、registry/mmproj、main/aux GPU precedence、`-ngl auto --fit` 參數驗證
-- `tests/test_deployment_status.py` — port/cmdline role 辨識、錯卡/錯模型;process 與 HTTP 都用 hook
-- `tests/test_server_launch.py` — launch_servers / stop_servers 各 `--scope` 的離線 dry-run(含壞設定檔退路)、啟動失敗 rollback(pipe-pane log、清 tmux session、`AICODE_NO_ROLLBACK`)、依模型大小放大的 health timeout、RAG server 腳本契約;tmux 用 monkeypatch
-- `tests/test_set_config_flow.py` — 問答流程與旗標契約:前置檢查(llama-server/依賴缺失通知)、純問答(使用者選擇題無預設值、四段式一角色一組、reranker internal buffer 必答且 `--yes` 需 `--rerank-ctx`、threads 不提問改 auto、範圍顯示用 `-`、選項外輸入重問、`--yes` 缺旗標指名報錯)、範圍驗證、超大配置不被容量擋下
-- `tests/test_set_config_artifacts.py` — 產出物:`~/start.sh`(nvidia-smi 提醒、GPU pin、bind 安全預設、legacy env 清除)、deployment.json、opencode.json 合併、備份/restore transaction、end-to-end dry-run
-- `tests/test_set_config_models.py` — 模型探索與 CPU-MoE:GPU/模型偵測分類、shard 齊全性、mmproj 多重配對、VL 不自動當 main、GGUF expert tensor 解析(含 per-layer 編號與 split shard)、`choose_cpu_moe_layers`(0=不 offload、≥ 上限=全放 RAM、build 缺旗標降級)、`cpu_moe`/`n_cpu_moe` 的 main+vl schema/argv(embedding/reranker 拒絕);大檔用 sparse fixture
-- `tests/_set_config_harness.py` — 上面三份共用的 fixture 產生器與兩種呼叫入口(`run()` in-process、`run_subprocess()` 走 `bash set_config.sh`);不是 test module
-- `tests/test_smoke_gate.py` — smoke 包的組成契約:AGENTS.md §3 的每個安全檢查點都必須帶 smoke 標記
-- `tests/_harness.py` — 跨 module 共用的重型 harness(aicode wrapper 子行程、mcp_server spawn/等待/收屍);不是 test module
+測試在 2026-08 已按 domain 合併；以下分組比逐檔複製歷史清單更不容易漂移：
+
+- launcher / config：`test_aicode_*`、`test_web_server_scripts.py`、
+  `test_set_config_*`、`test_deployment_*`、`test_server_*`、`test_model_resolution.py`、
+  `test_opencode_checks.py`、`test_tool_call_canary.py`、`test_config.py`、`test_doctor.py`。
+- MCP / sandbox / mutation：`test_mcp_*`、`test_fs_sandbox.py`、`test_external_import.py`、
+  `test_patch_parser.py`、`test_patch_apply.py`、`test_run_command.py`、
+  `test_run_lint.py`、`test_endpoint_policy.py`、`test_smoke_gate.py`。
+- Code-RAG / graph：`test_ast_parser_cpp.py`、`test_code_graph*.py`、
+  `test_code_rag_*.py`、`test_code_context.py`、`test_definition_metadata_propagation.py`、
+  `test_file_kind_policy.py`、`test_grep_output_budget.py`、`test_index_scope.py`、
+  `test_semantic_representation.py`、`test_repeat_guard.py`。
+- RAG / KB / media：`test_kb_store.py`、`test_rag_*.py`、
+  `test_embedding_fail_loud.py`、`test_extracted_document.py`、
+  `test_context_generation.py`、`test_contextual_signals.py`、
+  `test_media_read_pdf.py`、`test_vision_pipeline.py`。
+- inference / budgets / eval：`test_code_smoke_eval.py`、`test_retrieval_eval.py`、
+  `test_semantic_retrieval_eval.py`、`test_context_budget.py`、`test_trim.py`、
+  `test_gpu_safety.py`、`test_llama_sampling.py`、`test_ctx_*.py`。
+- repo infrastructure：`test_repo_consistency.py`、`test_test_runner.py`、
+  `test_script_help.py`、`test_data_flywheel.py`、`test_lessons.py`。
+
+`tests/_harness.py` 與 `tests/_set_config_harness.py` 是共用 harness，不是 pytest test
+module。smoke 的安全組成由 `tests/test_smoke_gate.py` 靜態守住；不要以手動檔案清單取代。
 
 ---
 
 ## 改 config / docs / eval 時要同步檢查
 
 `config.py`、`README.md`、`docs/*.md`、`eval/*.json`、`mcp_server.py` 的工具清單必須對齊。
-改這些任一處都要跑：
+修改途中先跑兩個不收集 pytest 的靜態檢查：
 
 ```bash
 python scripts/check_eval_consistency.py
 python scripts/check_readme_consistency.py
-python scripts/run_tests.py tests/test_repo_consistency.py
 ```
+
+pytest 部分仍依角色執行：developer 不另外單跑 `test_repo_consistency.py`，由交付前唯一一次
+smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要因本節把同一組測試重跑。
 
 漂移範例（已修，避免再犯）：
 - 改 `RERANKER_TOP_N` → 對應的 `eval/spec_holdout.json` gold_evidence 也要改
@@ -177,11 +174,12 @@ python scripts/run_tests.py tests/test_repo_consistency.py
 - `scripts/check_eval_consistency.py`：不跑 LLM，只檢查 eval expected 是否和 `config.py` / source code 漂移。
 - `tests/test_repo_consistency.py`：把 consistency check 接進 pytest。
 
-常用命令：
+下列命令是 eval 工具目錄，不是每次改碼的交付 checklist。developer 途中可跑第一條靜態
+drift check；其他 runner 只在任務明示要做 eval / benchmark 時使用，pytest 仍依本文開頭與
+AGENTS.md 的角色規則執行。
 
 ```bash
 python3 scripts/check_eval_consistency.py
-python3 scripts/run_tests.py tests/test_repo_consistency.py
 python3 eval/run_retrieval_eval.py
 python3 eval/run_code_smoke_eval.py                      # 全離線 gate
 python3 eval/run_code_smoke_eval.py --report-json /tmp/report.json   # A/B 用的完整 summary
@@ -256,13 +254,12 @@ C/C++ 任一檔案 add/change/delete 都把檔案 hash 當作完整 visibility f
 full rebuild；這是刻意的保守 invalidation，避免 linkage/declaration/include closure 的
 partial cone 與 fresh build 漂移。Python 仍走既有增量路徑；body-only edit 因 callable
 node-id catalog 沒變，不會只因同名 C call 就 fan-out。只有名稱、qualified identity 或
-overload identity 改變且牽動 C/C++ caller，才會在寫 DB 前切換成 full rebuild。相關 gate：
-
-```bash
-python scripts/run_tests.py tests/test_ast_parser_cpp.py tests/test_code_graph.py \
-  tests/test_code_graph_cpp_visibility.py
-python eval/run_code_smoke_eval.py
-```
+overload identity 改變且牽動 C/C++ caller，才會在寫 DB 前切換成 full rebuild。相關
+pytest gate 是 `tests/test_ast_parser_cpp.py`、`tests/test_code_graph.py` 與
+`tests/test_code_graph_cpp_visibility.py`；reviewer 由收斂後的 full 統一涵蓋。developer 修 bug 時
+只依 AGENTS.md §2.3 單跑自己新增的 regression node 取得 red / green，不另跑這三個
+module。`python eval/run_code_smoke_eval.py` 也只在本次任務明示要檢查 code-inference
+品質時執行。
 
 ---
 
