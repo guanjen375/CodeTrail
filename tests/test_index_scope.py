@@ -893,6 +893,44 @@ def _seed_cache_with_lazy_holes(rag, rel_paths, *, holes):
         "file_cache": file_cache,
     }), encoding="utf-8")
 
+    # fail-open 防線。少了這條,身分欄位一漂 loader 就拒絕這份 seeded cache →
+    # build_index 改走 full rebuild,而 full rebuild 同樣會算出 embeddings、
+    # 清掉 holes、restart 也不炸 —— 底下每一條 assertion 都還是綠的,卻完全沒有
+    # 驗到 lazy embedding hole 的 backfill。這正是這條 regression 曾經退化的方式。
+    loaded = rag._load_file_cache()
+    assert set(loaded) == set(rel_paths), (
+        "seeded cache 被 loader 拒絕了(身分欄位漂移?);"
+        "這條 regression 會靜默退化成 full rebuild"
+    )
+    return file_cache
+
+
+@pytest.mark.smoke
+def test_seeded_lazy_cache_is_actually_reused_not_rebuilt(tree, monkeypatch,
+                                                          clean_scan_cache):
+    """焦點版:證明 build_index 真的**復用**了 seeded cache,不是重新 parse。
+
+    seeded symbol 的名字是合成的(`sym_<path>_<i>`),真的去 parse fixture 檔案
+    永遠不會產出這種名字 —— 所以它出現在 index 裡,就是「這份 cache 被採用了」
+    的直接證據。整條 backfill regression 的前提就是這個,前提沒被驗證的話,
+    後面測什麼都不算數。
+    """
+    code_rag = clean_scan_cache
+    monkeypatch.setattr(code_rag, "CODE_RAG_LAZY_EMBED", True)
+    rag = code_rag.CodeRAG(str(tree))
+    kept = sorted(_indexed(rag.scope))
+    _seed_cache_with_lazy_holes(rag, kept, holes=set(kept))
+
+    monkeypatch.setattr(rag, "_embed_texts_batched",
+                        lambda texts: [[1.0, 0.0]] * len(texts))
+    rag.build_index(verbose=False)
+
+    seeded = {item["symbol"] for item in rag.index if item["symbol"].startswith("sym_")}
+    assert seeded, (
+        "index 裡沒有任何 seeded symbol —— cache 沒被復用,這條測試已經退化成 "
+        "full rebuild,不再驗 backfill"
+    )
+
 
 def test_dense_rebuild_backfills_lazy_embedding_holes(tree, monkeypatch, clean_scan_cache):
     """scope 縮小 → dense 模式復用 lazy 快取,空 embedding 必須被補算而不是 fail-loud。

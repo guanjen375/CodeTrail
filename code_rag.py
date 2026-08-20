@@ -461,12 +461,14 @@ class CodeRAG:
         # 版本消費矩陣(§6 P2-5):parser semantics 決定 symbol 集合、embed-text
         # schema 與 render 預算決定向量內容。增量重建只比 file_hash,這些一動舊
         # cache 就是錯的,而且錯得無聲 —— 必須在這裡擋掉。
-        identity = cache_identity()
-        for key in ("parser_semantics_version", "embed_text_schema_version",
-                    "render_budgets"):
-            if meta.get(key) != identity[key]:
+        #
+        # **遍歷整份 identity,不列舉 key**:寫死清單的話,以後在
+        # cache_identity() 加欄位,寫入端會存、loader 卻視而不見 —— 又是一個
+        # 只有「查出來的結果怪怪的」才會發現的無聲差異。
+        for key, expected in cache_identity().items():
+            if meta.get(key) != expected:
                 print(f"[CODE_RAG] cache {key} {meta.get(key)!r} != "
-                      f"{identity[key]!r},安全重建", file=sys.stderr)
+                      f"{expected!r},安全重建", file=sys.stderr)
                 return {}
 
         # 世代一致性:meta 記錄的 npz_md5 必須與磁碟上的 NPZ 相符。

@@ -588,3 +588,120 @@ def test_lazy_semantic_query_materializes_dense_index_instead_of_arbitrary_slice
 
     assert any(row["symbol"] == "symbol_199" for row in results)
     assert rag._lazy_embed is False
+
+
+# ============================================================
+# cache identity + _make_symbol 的輕量 node double
+#
+# 刻意放在這個**沒有全域 skip** 的檔案:這些行為與 tree-sitter 無關,
+# 掛在 tree-sitter skip 底下的話,缺 grammar 的環境就完全沒有這層防護 ——
+# 而那正是最需要 fail-safe 的環境。
+# ============================================================
+def _identity_seeded_rag(tmp_path: Path) -> CodeRAG:
+    """手工造 index + file_cache,不經過任何 parser。"""
+    (tmp_path / "a.c").write_text("int x;\n", encoding="utf-8")
+    rag = CodeRAG(str(tmp_path))
+    rag.index = [{
+        "path": "a.c", "symbol": "x", "type": "global", "line": 1,
+        "context": "int x;", "qualified_name": "x", "backend": "manual",
+    }]
+    rag._file_cache = {"a.c": {"hash": "h", "symbols": rag.index, "embeddings": []}}
+    rag._save_cache()
+    return rag
+
+
+@pytest.mark.smoke
+def test_make_symbol_tolerates_nodes_without_sibling_api():
+    """BUG REGRESSION:leading comment association 讓 _make_symbol 對 node 的
+    API 面變嚴格,結果打爆既有的輕量 test double。
+
+    `_make_symbol` 一直允許「只有 start_point / end_point」的 node 物件
+    (本檔上面驗 context 截斷的那條就是這樣)。P3A 之後它無條件呼叫
+    `_leading_comment()` 讀 `prev_named_sibling`,對那種 node 直接
+    AttributeError —— full suite 的確定性失敗,而 smoke 當時沒涵蓋到。
+    """
+    from ast_parser import TreeSitterParser
+
+    parser = TreeSitterParser.__new__(TreeSitterParser)
+    lines = ["int short_one(void) {", "    return 1;", "}"]
+    node = SimpleNamespace(start_point=(0, 0), end_point=(2, 0))
+
+    sym = parser._make_symbol(node, lines, "short_one", "function")
+    assert sym.end_line == 3
+    assert sym.comments is None, "拿不到 sibling 就是沒有 leading comment,不是崩潰"
+
+
+@pytest.mark.smoke
+def test_cache_identity_is_the_single_source_for_meta_and_validation():
+    """身分欄位只有一份定義,寫入端 / 驗證端 / 測試 fixture 都從這裡取。
+
+    各寫一份的失敗是無聲的:加欄位時 fixture 或 loader 會落後 —— 舊 cache 被拒、
+    測試改走 full rebuild,「還是綠的」卻不再驗它本來要驗的東西。
+    """
+    import ast_parser
+
+    identity = code_rag.cache_identity()
+    assert identity["schema_version"] == code_rag.CODE_RAG_CACHE_SCHEMA_VERSION
+    assert identity["parser_semantics_version"] == \
+        ast_parser.PARSER_SEMANTICS_VERSION
+    assert identity["embed_text_schema_version"] == \
+        code_rag.EMBED_TEXT_SCHEMA_VERSION
+    assert identity["render_budgets"] == {
+        "context_store": config.CODE_RAG_CONTEXT_STORE_MAX_CHARS,
+        "comment": config.CODE_RAG_COMMENT_MAX_CHARS,
+        "embed_text": config.CODE_RAG_EMBED_TEXT_MAX_CHARS,
+    }
+
+
+@pytest.mark.smoke
+def test_every_cache_identity_field_is_actually_validated(tmp_path: Path,
+                                                          monkeypatch):
+    """NEW SILENT CONTRACT:loader 必須**遍歷**整份 identity,不得列舉 key。
+
+    現有欄位在列舉版本下也擋得住,所以只poison 現有欄位驗不出差別。真正的風險
+    是**未來新增的欄位**:寫死清單的話,寫入端會存、loader 卻視而不見 —— 加了
+    一層防護卻沒生效,而且不會有任何紅字。這裡用一個 identity 裡有、但磁碟上的
+    meta 沒有的欄位來逼出那個差異。
+    """
+    _identity_seeded_rag(tmp_path)
+    assert CodeRAG(str(tmp_path))._load_file_cache(), "同身分應載入得到"
+
+    # 模擬「之後有人在 cache_identity() 加了一個欄位」:磁碟上的舊 meta 沒有它。
+    future = {**code_rag.cache_identity(), "future_identity_field": "v1"}
+    monkeypatch.setattr(code_rag, "cache_identity", lambda: future)
+    assert CodeRAG(str(tmp_path))._load_file_cache() == {}, (
+        "identity 新增的欄位沒有被驗證 —— loader 還在比對硬編碼的 key 清單"
+    )
+    monkeypatch.undo()
+
+    # 現有欄位當然也要各自擋得住。
+    baseline = code_rag.cache_identity()
+    for field in baseline:
+        poisoned = {**baseline, field: "___drifted___"}
+        monkeypatch.setattr(code_rag, "cache_identity", lambda p=poisoned: p)
+        assert CodeRAG(str(tmp_path))._load_file_cache() == {}, (
+            f"identity 欄位 {field} 改變了,loader 卻照樣接受舊 cache"
+        )
+        monkeypatch.undo()
+
+
+@pytest.mark.smoke
+def test_render_budget_change_invalidates_the_cache(tmp_path: Path, monkeypatch):
+    """BUG REGRESSION:改 render 預算的**環境變數**不會讓舊 embedding 失效。
+
+    這三個預算是 `AICODE_*` 環境變數可覆寫的,但 cache meta 原本只存固定的
+    schema 版本。重啟時把預算調大/調小,render 出來的 embed text 不同了,
+    增量重建卻只比 file_hash —— 舊向量被靜默沿用,沒有任何訊息提醒你現在查的
+    是用舊 render 算出來的向量。
+    """
+    _identity_seeded_rag(tmp_path)
+    assert CodeRAG(str(tmp_path))._load_file_cache(), "同預算應載入得到"
+
+    for name in ("CODE_RAG_EMBED_TEXT_MAX_CHARS",
+                 "CODE_RAG_CONTEXT_STORE_MAX_CHARS",
+                 "CODE_RAG_COMMENT_MAX_CHARS"):
+        monkeypatch.setattr(config, name, getattr(config, name) + 200)
+        assert CodeRAG(str(tmp_path))._load_file_cache() == {}, (
+            f"{name} 變了,舊向量是用別的 render 算的,不得沿用"
+        )
+        monkeypatch.undo()

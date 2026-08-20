@@ -660,7 +660,9 @@ CODE_RAG_REFRESH_TTL_SECONDS = int(_os.environ.get("AICODE_CODE_RAG_REFRESH_TTL"
 #
 # 這裡不再是「誠實化的 no-op 常數」:index entry 的 context 儲存上限已經獨立
 # 出來(CODE_RAG_CONTEXT_STORE_MAX_CHARS),放大 passage 才真的有效果。
-# 動任何一個都要 bump code_rag.EMBED_TEXT_SCHEMA_VERSION,否則舊向量會被沿用。
+# 這三個預算的**實際值**會進 code_rag.cache_identity(),所以改預算(含用
+# AICODE_* 環境變數覆寫)本身就會讓舊 cache 失效,不需要手動 bump 版本常數。
+# EMBED_TEXT_SCHEMA_VERSION 是留給「欄位集合或順序」改變時 bump 的。
 
 # index entry 儲存的 context 上限。這是**最上游**的截斷:它比下游任何預算小的
 # 話,下游放大都是 no-op(§3 洞 2 的原始病灶)。
