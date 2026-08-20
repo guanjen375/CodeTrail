@@ -58,7 +58,9 @@ from pathlib import Path
 import config
 import fs_safety
 from ast_parser import (
+    CPP_LINKED_OBJECT_KINDS,
     HAS_TREE_SITTER,
+    PARSER_SEMANTICS_VERSION,
     Symbol,
     _try_load_tree_sitter_language,
     parse_file,
@@ -696,6 +698,7 @@ class CodeGraph:
             f"c:{_dist('tree-sitter-c')}:{int(c_ok)};"
             f"cpp:{_dist('tree-sitter-cpp')}:{int(cpp_ok)};"
             f"h:{_h_ext_lang()};"
+            f"parser-semantics:{PARSER_SEMANTICS_VERSION};"
             "resolver:conservative-3"
         )
 
@@ -719,7 +722,16 @@ class CodeGraph:
         id_pairs = _assign_node_ids(rel_path, lang, symbols)
 
         def graph_linkage(sym: Symbol) -> str:
-            if lang not in ("c", "cpp") or sym.type not in _CALLABLE_KINDS:
+            # macro / typedef / enum / enum_constant 在 C/C++ 語意上根本沒有
+            # linkage,維持 not_applicable;global 物件有,而且 parser 已經算好了
+            # —— 舊版對非 callable 一律回 not_applicable,等於把它丟掉(§3 洞 2)。
+            if lang not in ("c", "cpp"):
+                return "not_applicable"
+            if sym.type in CPP_LINKED_OBJECT_KINDS:
+                if sym.backend != "tree-sitter":
+                    return "unknown"
+                return sym.linkage or "unknown"
+            if sym.type not in _CALLABLE_KINDS:
                 return "not_applicable"
             # Regex/ctags fallback does not prove storage duration.  Treating
             # absent metadata as external can create cross-file false resolves.

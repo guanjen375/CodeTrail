@@ -144,20 +144,49 @@ python scripts/run_tests.py tests/test_repo_consistency.py
 - `eval/run_code_smoke_eval.py`：全離線 code inference gate。保留歷史 16 題
   regression floor，另跑 20 題 blocking core(code2test / trace2code / edit2ripple /
   firmware semantics / selective retrieval，各 4 題)與最多 4 題 stretch；目前 fixture
-  是 20 + 2。CI structural lane 使用 parser/lexical/graph 與 HTTP poison，固定檢查
-  `12000` / `28000` 的純 `budget_chars`，不輸出 tokenizer token 單位。SHA-256
-  pseudo embedding 只叫 deterministic plumbing stub，不代表真 semantic 品質；
+  是 20 + 4(stretch 含 2 題 `comment2context`,那是 **provisional diagnostic
+  family**,不是 blocking core)。CI structural lane 使用 parser/lexical/graph 與 HTTP
+  poison，固定檢查 `12000` / `28000` 的純 `budget_chars`，不輸出 tokenizer token 單位。
+  SHA-256 pseudo embedding 只叫 deterministic plumbing stub，不代表真 semantic 品質；
   `--with-servers` 才是手動 real-model lane，永不成為 CI 必要條件。
+- `eval/semantic_retrieval.py` + `eval/fixtures/code_smoke/semantic_vectors.{json,f32}`：
+  **real semantic lane**。向量是 checked-in 的 float32 artifact(bge-m3、1024 維、
+  cls pooling、L2),document 與 query **兩種都錄**;manifest 記 model / pooling /
+  dimension / parser / render / scorer 版本與 corpus digest,不含本機絕對路徑。
+  正常執行完全離線,**任何 cache miss、render 不符、corpus digest 漂移或 checksum
+  不符一律 fail closed**(non-zero exit),絕不退回合成向量。
+  四條 lane:`lexical`(可比較基準)、`dense`(純 cached cosine)、
+  `runtime_hybrid`(**主 gate**;直接呼叫 `code_rag.hybrid_symbol_score` 與
+  `select_scored_candidates`,跑的是 production 那份 scoring 與 cutoff)、
+  `rrf_experimental`(選配診斷,**不得**冒充 production hybrid)。
+  scope:`per_repo` 是主 gate lane(對齊 runtime 每次只有一個 `AICODE_ROOT`),
+  `union` 只是 cross-repo distractor 的 stress 診斷;12k/28k context gate 走 `per_repo`。
+  file metric 先依 `repo_id:path` **聚合去重**再截 k,並對**完整 `gold_files`** 計分;
+  `seed_files` 另報 `seed_recall`,不取代主指標。
+- `eval/record_semantic_vectors.py`：**唯一**可以碰 loopback llama-server 的入口,
+  而且要顯式帶 `--record-vectors`。錄製前對 `/props` 與 effective profile 核對 role /
+  pooling / GGUF identity,錄製頭尾各 embed 一次 sentinel,漂移超容差就拒絕寫檔。
+  corpus、parser 語意、render schema 任一變更都要重錄(manifest digest 會自己擋)。
+- `eval/fixtures/code_smoke/semantic_retrieval_baseline.json`：semantic baseline,
+  含 corpus digest、render / scorer / model 版本與 per-family 數字。pipeline 版本或
+  corpus digest 一變就**跳過**no-regression 比較並印出原因 —— 不同 corpus 的數字
+  本來就不可比,硬比才是假訊號。
 - `scripts/check_eval_consistency.py`：不跑 LLM，只檢查 eval expected 是否和 `config.py` / source code 漂移。
 - `tests/test_repo_consistency.py`：把 consistency check 接進 pytest。
 
 常用命令：
 
 ```bash
-python scripts/check_eval_consistency.py
-python scripts/run_tests.py tests/test_repo_consistency.py
-python eval/run_retrieval_eval.py
-python eval/run_eval.py --test-set all --verbose
+python3 scripts/check_eval_consistency.py
+python3 scripts/run_tests.py tests/test_repo_consistency.py
+python3 eval/run_retrieval_eval.py
+python3 eval/run_code_smoke_eval.py                      # 全離線 gate
+python3 eval/run_code_smoke_eval.py --report-json /tmp/report.json   # A/B 用的完整 summary
+python3 eval/run_eval.py --test-set all --verbose
+
+# 只有這兩條會連 8081(改了 corpus / parser 語意 / render schema 才需要):
+python3 eval/record_semantic_vectors.py --record-vectors
+python3 eval/run_code_smoke_eval.py --record-semantic-baseline
 ```
 
 前三個命令不需要 llama-server；retrieval runner 固定回報 Recall@5、MRR、nDCG@5 與
@@ -168,6 +197,34 @@ python eval/run_eval.py --test-set all --verbose
 
 `GRAPH_SCHEMA_VERSION=3` 保存 definition linkage/condition、function declarations、
 include edge 的 preprocessor condition，以及 edge 的 `resolution_basis`/condition。
+
+C/C++ 的 **definition 語意**(`ast_parser.PARSER_SEMANTICS_VERSION`)只認
+translation-unit / namespace scope,並且逐個 declarator 判斷:
+
+| 寫法 | 結果 |
+|---|---|
+| `uint32_t g_error_counter;` | 1 個 `global`(C tentative definition) |
+| `static int a, *b;` | 2 個 internal-linkage `global` |
+| `extern int only_declared;` | **0 個**(純宣告) |
+| `extern int defined_here = 1;` | 1 個(有 initializer) |
+| `int prototype_only(int);` | **0 個**(函式原型) |
+| `static int (*handler)(int);` | 1 個 `global`(function pointer 是**物件**) |
+| `typedef int count_t, *count_ptr_t;` | 2 個 `typedef` |
+| `typedef enum { A, B } state_t;` | `typedef state_t` + `enum state_t`(用 alias)+ 2 個 `enum_constant` |
+| `struct driver_ops;` | **0 個**(forward tag 不是定義) |
+| `struct S { int x; };` | 1 個 `struct`(**要有 body** 才算型別定義) |
+
+stable kind 寫死在 `ast_parser`:`macro` / `macro_function` / `typedef` / `enum` /
+`enum_constant` / `global`。只有 `global` 有 linkage;macro / typedef / enum /
+enum_constant 在 C/C++ 語意上沒有 linkage,graph 誠實標 `not_applicable`,不硬掰。
+C 的 linkage 精確處理(`static`→internal、其餘 file scope→external);**C++ 縮限**:
+anonymous namespace 與 `static` 是 internal,namespace-scope 的 non-volatile
+`const`/`constexpr` 是 internal,`inline`/`extern` 是 external,template 內或帶未建模
+specifier(如 `thread_local`)一律標 `unknown` —— **不猜 external**。
+
+版本消費矩陣:`PARSER_SEMANTICS_VERSION` 進 CodeRAG cache meta、graph 的
+`_parser_versions()` 指紋與 eval vector manifest 三處。它是**語意**版本,不是 table
+shape —— 改它時**不要**順手 bump `GRAPH_SCHEMA_VERSION`。
 既有舊版 DB（v1/v2）由同一條顯式 build command 在單一 SQLite transaction 中原地
 升級；升級失敗會 rollback。真正損壞、無法由 SQLite
 開啟的 DB 不宣稱能原地重建：錯誤會要求先移出/刪除 graph DB，再執行 build command。
@@ -195,6 +252,59 @@ python eval/run_code_smoke_eval.py
 ```
 
 ---
+
+### Code RAG 的語意表示式與預算
+
+三個消費者共用**同一組 canonical 欄位**(`code_rag.CANONICAL_SEMANTIC_FIELDS`),
+但各有各的預算:
+
+| 消費者 | 預算常數 | 預設 |
+|---|---|---:|
+| index entry 儲存的 context | `CODE_RAG_CONTEXT_STORE_MAX_CHARS` | 1800 |
+| index entry 儲存的 leading comment | `CODE_RAG_COMMENT_MAX_CHARS` | 400 |
+| dense embedding document text | `CODE_RAG_EMBED_TEXT_MAX_CHARS` | 1200 |
+| lexical scorer 掃描文字 / identifier 數 | `CODE_RAG_LEXICAL_SCAN_MAX_CHARS` / `CODE_RAG_LEXICAL_MAX_IDENTIFIERS` | 1200 / 80 |
+| reranker passage | `CODE_RERANK_PASSAGE_MAX_CHARS` | 1800 |
+
+**儲存端是最上游的截斷**:`CODE_RAG_CONTEXT_STORE_MAX_CHARS` 比下游任何預算小的話,
+調大下游全部是 no-op(這是 2026-08-20 之前的真實狀況:context 在 index entry 就被截到
+500,所以「把 embed text 從 400 調大」完全沒有效果)。`tests/test_semantic_representation.py`
+靜態守住這條不變式。
+
+C 的 `/** ... */` 寫在定義行**之上**,而 context 從定義行往下取,結構上永遠拿不到 ——
+所以 leading comment 是獨立欄位(`Symbol.comments`),邊界有四條:同 scope(只走
+sibling)、不跨空行、不跨 preprocessor 或其他節點、不吃檔頭 license。三個消費者
+**都**看得到它;只加進 embed text 而 lexical 還在掃舊 context 的話,那條 lane 會靜默
+看不到註解訊號。改欄位或預算都要 bump `code_rag.EMBED_TEXT_SCHEMA_VERSION`——
+增量重建只比 file_hash,不 bump 就會沿用舊向量。
+
+實測(fixture corpus,per_repo / runtime_hybrid):leading comment 讓 macro-average
+file recall 0.6683 → 0.7783、MRR 0.900 → 0.950,context coverage(1.000)、evidence
+precision(0.293)與 used chars(76514)不變。**1200 與 1800 的 A/B 在這份 fixture 上
+分不出差異** —— 最長的 document 表示式只有 536 chars,兩個上限都不會截到任何東西。
+要調這個數字必須拿真實 firmware repo 重測,不能拿 fixture 的結果當依據。
+
+### FileKindPolicy(檔案類型的單一來源)
+
+`file_kind_policy.py` 是 `CODE_EXTENSIONS` 與 `GREP_DEFAULT_EXTENSIONS` 的**共同來源**。
+以前兩份手寫清單已經漂了:grep 那份比索引窄,連 `.cc` / `.cxx` / `.pyi` / `.pyx` /
+`.bash` / `.txt` / `.mk` / `.cfg` / `.cmake` / `.ini` / `.conf` / `.tcl` 都搜不到。
+
+三個投影:grep glob、index scope 成員資格、symbol parser route。canonical suffix 一律
+小寫(比對走 `Path.suffix.lower()`),但 **grep glob 是 case-sensitive**,所以 `.S` 會
+另外產一條 `*.S`;`Makefile` / `Makefile.*` / `Kconfig` / `Kconfig.*` 走 basename 規則,
+規則本身也進 index scope fingerprint(否則規則改了成員資格會靜默漂移)。
+
+新增的韌體類型:`.s` / `.asm` / `.ld` / `.lds` / `.dts` / `.dtsi` / `.inc` / `.def`。
+**這是 Level 1,只承諾 grep / search discoverability** —— 它們**不會**進 dense symbol
+retrieval(沒有 parser,進 symbol 掃描只有零 symbol 的 walk / hash 成本)。ASM 與
+linker script 的 symbol 抽取是 Level 2,整包延後:ASM 要 two-pass(先收 `.globl` /
+`.global`,再只配對相應 label,排除 `.L*`),linker script 要抽 MEMORY region /
+output section / `ENTRY()` / symbol assignment。寧可延後,也不要用粗 regex 製造大量
+假 symbol。`.md` / `.txt` 維持既有分工:留在可見範圍供 grep / list_dir 使用,但不進
+symbol 掃描。`.cfg` / `.json` / `.sh` / `.mk` 這些設定檔**仍在** symbol 掃描範圍 ——
+`_scan_code_files()` 的輸出同時是 bounded context 的 `allowed_paths`,把它們排掉會讓
+`config/*.cfg` 這類 gold evidence 變成讀不到。
 
 ## data flywheel 是什麼
 

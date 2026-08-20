@@ -11,9 +11,19 @@
      都被換成「任何操作都 raise」的物件。任何漏網 HTTP request 都會讓 runner
      立刻失敗 —— 這本身就是「零 server 接觸」的斷言。
 
+Semantic lane(施工規格 §6 P1A)另外走 checked-in 的 **real** 向量:
+``eval/semantic_retrieval.py`` 讀 ``semantic_vectors.json`` +
+``semantic_vectors.f32``,任何 cache miss / corpus 漂移一律 fail closed。錄製是
+另一支顯式 opt-in 程式 ``eval/record_semantic_vectors.py --record-vectors``,
+本檔的正常路徑永遠不連線。
+
 模式:
   --record-baseline   把現況數字寫進 eval/fixtures/code_smoke/baseline.json
                       (不 gate;Step 0 用)
+  --record-semantic-baseline
+                      把 real semantic lane 的現況寫進
+                      semantic_retrieval_baseline.json(含 corpus digest /
+                      render / scorer / model version;不 gate)
   (預設)             依 §3.5 判準 gate,任一組不過 exit 1
   --with-servers      manual real-model lane(真 dense+rerank;server 不在
                       graceful skip;永不入 CI gate)
@@ -37,6 +47,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from eval import semantic_retrieval as sr
 
 FIXTURE_DIR = Path(__file__).with_name("fixtures") / "code_smoke"
 CASES_FILE = FIXTURE_DIR / "cases.json"
@@ -262,25 +274,44 @@ def _workflow_ranked_items(case: dict, rag) -> list[dict]:
     return [dict(item, score=float(score)) for score, item in ranked if score > 0][:5]
 
 
-def eval_workflow_retrieval_case(case: dict, rags: dict) -> dict:
+def eval_workflow_retrieval_case(case: dict, rags: dict,
+                                 documents_by_repo: dict[str, list[dict]]) -> dict:
+    """Legacy CI structural lane,但計分已修掉 §3 洞 4 的兩個失真。
+
+    修正兩點(兩者都是**收緊**,不是放寬既有 gate):
+      1. 名次先依 ``repo_id:path`` **聚合去重**再截 5 —— 同一檔的多個 symbol
+         不該各占一個名次,否則那不是 file Recall@5,而且 parser symbol 數一變
+         排名就不公平地漂。
+      2. 主指標(file_recall@5 / MRR)對**完整 gold_files** 計分。舊版拿
+         ``seed_files`` 當 gold,edit2ripple 只量到起點、沒量到應連帶找到的
+         header / caller / test / config,系統性高估 evidence recall。
+         ``seed_files`` 改成獨立的 ``seed_recall`` 另報,既有 gate 用的
+         ``seed_hit`` 語意原封不動。
+    """
     rag = rags[case["repo"]]
-    raw_results = _workflow_ranked_items(case, rag)
-    compact = [
-        {
-            "path": item.get("path", "").replace("\\", "/"),
-            "symbol": item.get("symbol", ""),
-        }
-        for item in raw_results
-    ]
-    metrics = retrieval_metrics(compact, case.get("seed_files", case.get("gold_files", [])))
+    documents = documents_by_repo[case["repo"]]
+    ranking = [item for item in sr.lane_lexical(rag, case["question"], documents)
+               if item["score"] > 0]
+    aggregated = sr.aggregate_files(ranking)
+    aggregated_rows = [{"path": row["file_key"]} for row in aggregated]
+
+    gold_keys = sorted(sr.gold_file_keys(case, "gold_files"))
+    seed_keys = sorted(sr.gold_file_keys(case, "seed_files")) or gold_keys
+    metrics = retrieval_metrics(aggregated_rows, gold_keys)
+    seed_metrics = retrieval_metrics(aggregated_rows, seed_keys)
+
     return {
         "id": case["id"],
         "family": case["family"],
         "blocking": bool(case.get("blocking")),
         "lane": "ci_structural_lexical",
-        "results": compact,
+        "results": [
+            {"path": item["path"], "symbol": item["symbol"]} for item in ranking[:5]
+        ],
+        "ranked_files": [row["file_key"] for row in aggregated[:5]],
         **metrics,
-        "seed_hit": bool(metrics["hit_files"]),
+        "seed_recall_at_5": seed_metrics["file_recall_at_5"],
+        "seed_hit": bool(seed_metrics["hit_files"]),
     }
 
 
@@ -294,9 +325,95 @@ def summarize_retrieval_families(results: list[dict]) -> dict[str, dict]:
                 sum(item["file_recall_at_5"] for item in members) / len(members), 4
             ),
             "mrr": round(sum(item["mrr"] for item in members) / len(members), 4),
+            "seed_recall_at_5": round(
+                sum(item["seed_recall_at_5"] for item in members) / len(members), 4
+            ),
             "seed_hits": sum(item["seed_hit"] for item in members),
         }
     return summary
+
+
+# ============================================================
+# real semantic lanes(§6 P1A)
+# ============================================================
+def evaluate_semantic_retrieval(cases: list[dict], rags: dict) -> dict:
+    """跑 real-vector 的 per_repo(主 gate)與 union(stress 診斷)兩個 scope。
+
+    整段不連網:向量來自 checked-in artifact,缺任何一筆就 raise
+    ``VectorCacheError``,由呼叫端轉成 non-zero exit。
+    """
+    documents = sr.build_documents(rags)
+    corpus = sr.corpus_manifest(rags, documents)
+    pipeline = sr.pipeline_identity()
+
+    cache = sr.VectorCache.load()
+    cache.verify_pipeline(pipeline, corpus)
+    # pipeline_identity() 是**被比對**的子集;normalization / instruction 是錄製
+    # 當下觀測到的事實,一起揭露才看得出這批向量是怎麼來的。
+    recorded = cache.manifest["pipeline"]
+    pipeline = {
+        **pipeline,
+        "normalization": recorded.get("normalization", "unknown"),
+        "query_instruction_id": recorded.get("query_instruction_id", "none"),
+    }
+
+    by_repo: dict[str, list[dict]] = {repo_id: [] for repo_id in rags}
+    for document in documents:
+        by_repo[document["repo_id"]].append(document)
+
+    scopes: dict[str, dict] = {}
+    hybrid_seeds: dict[str, list[dict]] = {}
+    for scope in sr.CORPUS_SCOPES:
+        case_results = []
+        for case in cases:
+            corpus_slice = by_repo[case["repo"]] if scope == "per_repo" else documents
+            result = sr.evaluate_case(
+                case, rags[case["repo"]], corpus_slice, cache, scope
+            )
+            case_results.append(result)
+        scopes[scope] = {
+            "cases": case_results,
+            "families": {
+                lane: sr.summarize_by_family(case_results, lane) for lane in sr.LANES
+            },
+        }
+
+    # 12k / 28k context gate 走 per_repo 的 real hybrid,不再用 lexical-only helper。
+    for case in cases:
+        ranking = sr.lane_runtime_hybrid(
+            rags[case["repo"]],
+            case["question"],
+            cache.query_vector(case["id"], sr.render_query(case["question"])),
+            by_repo[case["repo"]],
+            cache,
+        )
+        hybrid_seeds[case["id"]] = [item["item"] for item in ranking[:sr.DEFAULT_TOP_K]]
+
+    return {
+        "available": True,
+        "reason": "",
+        "corpus": corpus,
+        "pipeline": pipeline,
+        "model": cache.model_summary(),
+        "primary_scope": "per_repo",
+        "primary_lane": "runtime_hybrid",
+        "scope_roles": {
+            "per_repo": "primary gate lane (matches runtime: one AICODE_ROOT at a time)",
+            "union": "stress diagnostic only (cross-repo distractor robustness)",
+        },
+        "lane_roles": {
+            "lexical": "comparable baseline",
+            "dense": "diagnostic (pure cached cosine)",
+            "runtime_hybrid": "primary gate (production pure scorer + cutoff)",
+            "rrf_experimental": "optional diagnostic; not production hybrid",
+        },
+        "scopes": scopes,
+        "_hybrid_seeds": hybrid_seeds,
+    }
+
+
+def unavailable_semantic_report(reason: str) -> dict:
+    return {"available": False, "reason": reason, "scopes": {}}
 
 
 # ============================================================
@@ -541,8 +658,14 @@ class _CountingExecutor:
 
 
 def evaluate_context_report(cases: list[dict], rags: dict, graphs: dict,
-                            roots: dict[str, Path]) -> dict:
-    """Run bounded context locally; all source text still goes through ToolExecutor."""
+                            roots: dict[str, Path],
+                            semantic_seeds: dict[str, list[dict]] | None = None) -> dict:
+    """Run bounded context locally; all source text still goes through ToolExecutor.
+
+    ``semantic_seeds`` 是 §6 P1A-3 要求的 **per_repo real hybrid** seeds。給了就
+    用它,沒給才退回 lexical-only 的 ``_workflow_ranked_items``(只有 semantic
+    artifact 不可用時才會走到,而那條路徑本身就會讓 gate 失敗)。
+    """
     try:
         import code_context
         from agent_tools import ToolExecutor
@@ -570,9 +693,12 @@ def evaluate_context_report(cases: list[dict], rags: dict, graphs: dict,
                 )
                 if graph is not None else []
             )
+            seeds = (semantic_seeds or {}).get(case["id"])
+            if seeds is None:
+                seeds = _workflow_ranked_items(case, rag)
             bundle = code_context.build_code_context(
                 query=case["question"],
-                semantic_items=_workflow_ranked_items(case, rag),
+                semantic_items=seeds,
                 index_items=rag.index,
                 allowed_paths=allowed_paths,
                 read_window=lambda path, start, end, _executor=executor: _executor.read_file(
@@ -616,11 +742,137 @@ def evaluate_context_report(cases: list[dict], rags: dict, graphs: dict,
     return {"available": True, "reason": "", "unit": "chars", "budgets": budgets}
 
 
+def print_semantic_report(report: dict) -> None:
+    if not report.get("available"):
+        print(f"semantic retrieval: UNAVAILABLE ({report.get('reason', '')})")
+        return
+    model = report["model"]
+    corpus = report["corpus"]
+    print(
+        "semantic retrieval: real vectors "
+        f"model={model['gguf'].get('basename', '?')} pooling={model.get('pooling')} "
+        f"dim={model.get('dimension')} norm={report['pipeline'].get('normalization')}"
+    )
+    print(
+        f"  corpus files={corpus['file_count']} documents={corpus['document_count']} "
+        f"file_digest={corpus['file_manifest_digest'][:12]}… "
+        f"doc_digest={corpus['document_manifest_digest'][:12]}…"
+    )
+    for scope in sr.CORPUS_SCOPES:
+        role = "PRIMARY GATE" if scope == report["primary_scope"] else "stress diagnostic"
+        print(f"  scope {scope} ({role}):")
+        for lane in sr.LANES:
+            families = report["scopes"][scope]["families"][lane]
+            for family, metrics in families.items():
+                print(
+                    f"    {lane:16s} {family:20s} "
+                    f"file_recall@5={metrics['file_recall_at_k']:.3f} "
+                    f"MRR={metrics['mrr']:.3f} "
+                    f"seed_recall@5={metrics['seed_recall_at_k']:.3f} "
+                    f"symbol_recall@5={metrics['symbol_recall_at_k']:.3f} "
+                    f"({metrics['cases']} cases)"
+                )
+
+
+def semantic_gate_failures(report: dict) -> list[str]:
+    """Semantic lane 的 gate。
+
+    P1A 階段只 gate **correctness**(§6 P1B):artifact 存在、pipeline/corpus
+    對得上、每個 lane 都有 per-family 輸出。P1A 之前這條 lane 根本不存在,
+    所以沒有可比基線,**不得**在這裡要求「四 family 無退步」。
+
+    P1B 錄下 semantic baseline 之後才加上 no-regression 判斷:同一個
+    pipeline / corpus 版本下,primary lane 的 per-family 指標不得低於 baseline。
+    corpus 或版本一變就跳過比較(數字本來就不可比),只驗 correctness。
+    """
+    failures: list[str] = []
+    for scope in sr.CORPUS_SCOPES:
+        if scope not in report["scopes"]:
+            failures.append(f"semantic scope {scope} missing")
+            continue
+        for lane in sr.LANES:
+            families = report["scopes"][scope]["families"].get(lane)
+            if not families:
+                failures.append(f"semantic lane {lane} produced no per-family output "
+                                f"in scope {scope}")
+
+    if not sr.SEMANTIC_BASELINE_FILE.exists():
+        return failures
+    baseline = json.loads(sr.SEMANTIC_BASELINE_FILE.read_text(encoding="utf-8"))
+    if baseline.get("pipeline") != report["pipeline"]:
+        print("semantic baseline: pipeline version moved — no-regression check skipped "
+              "(re-record the baseline for the new pipeline)")
+        return failures
+    if baseline.get("corpus", {}).get("document_manifest_digest") != \
+            report["corpus"]["document_manifest_digest"]:
+        print("semantic baseline: corpus changed — no-regression check skipped "
+              "(re-record vectors and baseline)")
+        return failures
+
+    scope = report["primary_scope"]
+    lane = report["primary_lane"]
+    recorded = baseline.get("scopes", {}).get(scope, {}).get("families", {}).get(lane, {})
+    current = report["scopes"][scope]["families"][lane]
+    for family, metrics in recorded.items():
+        now = current.get(family)
+        if now is None:
+            failures.append(f"semantic family {family} disappeared from {scope}/{lane}")
+            continue
+        for metric in ("file_recall_at_k", "mrr", "symbol_recall_at_k"):
+            if now[metric] + 1e-9 < metrics[metric]:
+                failures.append(
+                    f"semantic {scope}/{lane} {family} {metric} "
+                    f"{now[metric]:.4f} < baseline {metrics[metric]:.4f}"
+                )
+    return failures
+
+
+def semantic_baseline_payload(report: dict) -> dict:
+    """P1B:固定 semantic baseline —— 含 corpus digest / render / scorer / model。
+
+    只寫 aggregate 是不夠的,per-family 才看得出哪一族退步(§1.1)。
+    """
+    return {
+        "_comment": (
+            "Semantic retrieval baseline recorded after the P1A correctness fixes. "
+            "Compare later sprints against this, never against the pre-aggregation "
+            "lexical numbers. Re-record whenever corpus/render/scorer versions move."
+        ),
+        "model": report["model"],
+        "pipeline": report["pipeline"],
+        "corpus": report["corpus"],
+        "primary_scope": report["primary_scope"],
+        "primary_lane": report["primary_lane"],
+        "scopes": {
+            scope: {
+                "families": report["scopes"][scope]["families"],
+                "cases": {
+                    row["id"]: {
+                        lane: {
+                            "file_recall_at_k": round(
+                                row["lanes"][lane]["file_recall_at_k"], 6),
+                            "mrr": round(row["lanes"][lane]["mrr"], 6),
+                            "seed_recall_at_k": round(
+                                row["lanes"][lane]["seed_recall_at_k"], 6),
+                            "symbol_recall_at_k": round(
+                                row["lanes"][lane]["symbol"]["symbol_recall_at_k"], 6),
+                        }
+                        for lane in sr.LANES
+                    }
+                    for row in report["scopes"][scope]["cases"]
+                },
+            }
+            for scope in sr.CORPUS_SCOPES
+        },
+    }
+
+
 # ============================================================
 # 主流程
 # ============================================================
 @_with_offline_stubs
-def run_offline(record_baseline: bool) -> int:
+def run_offline(record_baseline: bool, record_semantic_baseline: bool = False,
+                report_json: str | None = None) -> int:
     data = load_cases()
     for name, info in data["repos"].items():
         _TRUE_EDGES_BY_REPO[name] = set(info["true_call_edges"])
@@ -677,9 +929,25 @@ def run_offline(record_baseline: bool) -> int:
         abstain_ok = all(r["empty"] for r in abstain_results)
 
         # --- task-family retrieval(pseudo embedding 只驗 plumbing,不是語意品質宣稱) ---
-        workflow_results = [eval_workflow_retrieval_case(c, rags) for c in workflow_cases]
+        documents_by_repo: dict[str, list[dict]] = {name: [] for name in rags}
+        for document in sr.build_documents(rags):
+            documents_by_repo[document["repo_id"]].append(document)
+        workflow_results = [
+            eval_workflow_retrieval_case(c, rags, documents_by_repo)
+            for c in workflow_cases
+        ]
         family_summary = summarize_retrieval_families(workflow_results)
-        context_report = evaluate_context_report(workflow_cases, rags, graphs, roots)
+
+        # --- real semantic lanes(fail closed:artifact 缺 / corpus 漂移就不通過)---
+        try:
+            semantic_report = evaluate_semantic_retrieval(workflow_cases, rags)
+        except sr.VectorCacheError as exc:
+            semantic_report = unavailable_semantic_report(str(exc))
+
+        context_report = evaluate_context_report(
+            workflow_cases, rags, graphs, roots,
+            semantic_report.pop("_hybrid_seeds", None),
+        )
 
         # --- graph 題 ---
         if graph_available:
@@ -733,6 +1001,7 @@ def run_offline(record_baseline: bool) -> int:
             "abstain": {"ok": abstain_ok, "cases": abstain_results},
             "retrieval_backend": "deterministic_pseudo_embedding_plumbing_stub",
             "task_families": {"summary": family_summary, "cases": workflow_results},
+            "semantic_retrieval": semantic_report,
             "graph_invariants": {"cases": graph_invariant_results},
             "context": context_report,
         }
@@ -760,8 +1029,11 @@ def run_offline(record_baseline: bool) -> int:
     for family, metrics in family_summary.items():
         print(
             f"family {family}: file_recall@5={metrics['file_recall_at_5']:.3f} "
-            f"MRR={metrics['mrr']:.3f} seeds={metrics['seed_hits']}/{metrics['cases']}"
+            f"MRR={metrics['mrr']:.3f} "
+            f"seed_recall@5={metrics['seed_recall_at_5']:.3f} "
+            f"seeds={metrics['seed_hits']}/{metrics['cases']}"
         )
+    print_semantic_report(semantic_report)
     for result in graph_invariant_results:
         suffix = " (graph unavailable)" if result.get("unavailable") else ""
         print(f"graph invariant {result['id']}: {'PASS' if result['pass'] else 'FAIL'}{suffix}")
@@ -782,6 +1054,28 @@ def run_offline(record_baseline: bool) -> int:
                 f"used={metrics['used_chars']} multi_round={metrics['multi_round_chars']} "
                 f"saved={metrics['saved_chars']} truncated_cases={metrics['truncation_cases']}"
             )
+
+    if report_json:
+        Path(report_json).write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False, default=str) + "\n",
+            encoding="utf-8",
+        )
+
+    if record_semantic_baseline:
+        if not semantic_report.get("available"):
+            print(
+                f"FAIL: semantic lane unavailable ({semantic_report.get('reason', '')}); "
+                "record vectors first",
+                file=sys.stderr,
+            )
+            return 1
+        sr.SEMANTIC_BASELINE_FILE.write_text(
+            json.dumps(semantic_baseline_payload(semantic_report), indent=2,
+                       ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"semantic baseline written to {sr.SEMANTIC_BASELINE_FILE}")
+        return 0
 
     if record_baseline:
         baseline = {
@@ -848,6 +1142,13 @@ def run_offline(record_baseline: bool) -> int:
         failures.append(
             f"representable-edge recall {precision.get('representable_recall', 0.0):.3f} != 1.0"
         )
+    if not semantic_report.get("available"):
+        failures.append(
+            f"real semantic lane unavailable: {semantic_report.get('reason', '')}"
+        )
+    else:
+        failures.extend(semantic_gate_failures(semantic_report))
+
     if not context_report["available"]:
         failures.append("bounded context unavailable")
     else:
@@ -904,13 +1205,24 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--record-baseline", action="store_true",
                         help="記錄現況到 baseline.json(不 gate)")
+    parser.add_argument("--record-semantic-baseline", action="store_true",
+                        help="記錄 real semantic lane 現況到 "
+                             "semantic_retrieval_baseline.json(不 gate)")
+    parser.add_argument("--report-json", default=None,
+                        help="把完整 summary 寫成 JSON(A/B 與外部分析用;不影響 gate)")
     parser.add_argument("--with-servers", action="store_true",
                         help="手動 warm-latency 模式(真 server;不入 gate)")
     args = parser.parse_args(argv)
 
     if args.with_servers:
         return run_with_servers()
-    return run_offline(record_baseline=args.record_baseline)
+    if args.record_baseline and args.record_semantic_baseline:
+        parser.error("--record-baseline 與 --record-semantic-baseline 不可同時使用")
+    return run_offline(
+        record_baseline=args.record_baseline,
+        record_semantic_baseline=args.record_semantic_baseline,
+        report_json=args.report_json,
+    )
 
 
 if __name__ == "__main__":

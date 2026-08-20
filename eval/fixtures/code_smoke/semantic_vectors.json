@@ -1,0 +1,1019 @@
+{
+  "_comment": "Real embedding vectors for the offline code smoke eval. Recorded by eval/record_semantic_vectors.py --record-vectors. Never hand-edit; re-record whenever the corpus, parser semantics or render schema change.",
+  "model": {
+    "role": "embedding",
+    "profile_key": "defaults",
+    "pooling": "cls",
+    "server_n_ctx": 8192,
+    "gguf": {
+      "basename": "bge-m3-f16.gguf",
+      "size_bytes": 1157671200,
+      "head_bytes": 16777216,
+      "head_sha256": "51bcf9be01d4d3b049178a7f19ebd2ae9601a43c82233759ebe5cfc090e0c623"
+    },
+    "dimension": 1024,
+    "llama_cpp": {
+      "revision": "version: 10276 (6ea215d17)"
+    }
+  },
+  "pipeline": {
+    "parser_semantics_version": 3,
+    "embed_text_schema_version": 2,
+    "query_render_schema_version": 1,
+    "retrieval_scorer_version": 1,
+    "corpus_manifest_version": 1,
+    "normalization": "l2",
+    "query_instruction_id": "none"
+  },
+  "corpus": {
+    "manifest_version": 1,
+    "file_count": 37,
+    "document_count": 97,
+    "file_manifest_digest": "3da19228f8e30709296f25641f5370e161ea3e854c8198d30e22479094d9dcf2",
+    "document_manifest_digest": "09cec2e08bfdcdd3a41bdfe98d70f948eab14cbc3afc7e967e37333b47ddf1d6"
+  },
+  "artifact": {
+    "file": "semantic_vectors.f32",
+    "dtype": "float32",
+    "byte_order": "little",
+    "shape": [
+      113,
+      1024
+    ],
+    "row_order": "documents[] in manifest order, then queries[]",
+    "sha256": "00812694287b1c5a490e71e2f451f04ff277df8f160046b20bd45b2cee6bc678"
+  },
+  "documents": [
+    {
+      "doc_id": "c60514002cc53af0",
+      "repo_id": "ism_mini",
+      "path": "include/dispatcher.h",
+      "kind": "macro",
+      "qualified_name": "ISM_DISPATCHER_H",
+      "rendered_text_sha256": "546ad74ca40b32810b5fb7543b5f6804bfff5a57b565866b6129043cb96efcba",
+      "vector_row": 0
+    },
+    {
+      "doc_id": "502c6bdaead5cedb",
+      "repo_id": "ism_mini",
+      "path": "include/event_queue.h",
+      "kind": "macro",
+      "qualified_name": "ISM_EVENT_QUEUE_H",
+      "rendered_text_sha256": "23a619a58e57ba91cb50d6fce7f89878e4b5c4c4c8913d6a67451dad10d74c72",
+      "vector_row": 1
+    },
+    {
+      "doc_id": "9d0503d60daf25ed",
+      "repo_id": "ism_mini",
+      "path": "include/event_queue.h",
+      "kind": "macro",
+      "qualified_name": "EVENT_QUEUE_CAPACITY",
+      "rendered_text_sha256": "bd994c203188b4b8e11775bf411a0f91944961ab6bd5bc28e095cedc829ef99f",
+      "vector_row": 2
+    },
+    {
+      "doc_id": "34d5702f0a962622",
+      "repo_id": "ism_mini",
+      "path": "include/event_queue.h",
+      "kind": "enum",
+      "qualified_name": "event_id_t",
+      "rendered_text_sha256": "3705910499089ebe1295f97da9e2d528452822ff2069cbdb13d7e03c6953b1ba",
+      "vector_row": 3
+    },
+    {
+      "doc_id": "3e8b1bb91a563248",
+      "repo_id": "ism_mini",
+      "path": "include/event_queue.h",
+      "kind": "enum_constant",
+      "qualified_name": "EVT_NONE",
+      "rendered_text_sha256": "63f72b0a4bd98c2c38983c0254f2a9c45e4642b3add3b0202a8aa63e901c33b8",
+      "vector_row": 4
+    },
+    {
+      "doc_id": "101dba0778cc82ba",
+      "repo_id": "ism_mini",
+      "path": "include/event_queue.h",
+      "kind": "enum_constant",
+      "qualified_name": "EVT_TIMER_TICK",
+      "rendered_text_sha256": "b2ba216f94a6c169c325f7eeb70dda3a36ba45acb3931d143920091843b78b74",
+      "vector_row": 5
+    },
+    {
+      "doc_id": "22985e18869bbdde",
+      "repo_id": "ism_mini",
+      "path": "include/event_queue.h",
+      "kind": "enum_constant",
+      "qualified_name": "EVT_BUTTON_PRESS",
+      "rendered_text_sha256": "cff742283fe500fe851232adf9196b3ebcc79e1190b230e00fb4648d1808e69f",
+      "vector_row": 6
+    },
+    {
+      "doc_id": "159b0ab395892818",
+      "repo_id": "ism_mini",
+      "path": "include/event_queue.h",
+      "kind": "enum_constant",
+      "qualified_name": "EVT_COMM_RX",
+      "rendered_text_sha256": "d17ba0a453910d8980d0d29f5cd7ac14c654324e19a6b26edb8a8b9fb6a908b1",
+      "vector_row": 7
+    },
+    {
+      "doc_id": "a4e8abf1eb013c97",
+      "repo_id": "ism_mini",
+      "path": "include/event_queue.h",
+      "kind": "typedef",
+      "qualified_name": "event_id_t",
+      "rendered_text_sha256": "611c1c3fd2a5e39453f1570cbe4d6d74306add0c6b35ba6b7cb9ffc11fade161",
+      "vector_row": 8
+    },
+    {
+      "doc_id": "db3ae71b64a256e7",
+      "repo_id": "ism_mini",
+      "path": "include/event_queue.h",
+      "kind": "typedef",
+      "qualified_name": "event_t",
+      "rendered_text_sha256": "b95278071675f4632a7707a1e17a7875dce60cb9220785e300c77fdcacbde08c",
+      "vector_row": 9
+    },
+    {
+      "doc_id": "1997e5c79b97b52d",
+      "repo_id": "ism_mini",
+      "path": "include/state_machine.h",
+      "kind": "macro",
+      "qualified_name": "ISM_STATE_MACHINE_H",
+      "rendered_text_sha256": "4eaa67cde43bffc5c397527e1d1be1f1b604d07a109c7cf3ed0e9f4e4553d099",
+      "vector_row": 10
+    },
+    {
+      "doc_id": "74233c5d6ac324d6",
+      "repo_id": "ism_mini",
+      "path": "include/state_machine.h",
+      "kind": "enum",
+      "qualified_name": "sm_state_t",
+      "rendered_text_sha256": "0a4f585ecb3953e2065457e3dc93b47a8aa471b62371f0578ca2b742330bfc6e",
+      "vector_row": 11
+    },
+    {
+      "doc_id": "e9b60c25cc629a65",
+      "repo_id": "ism_mini",
+      "path": "include/state_machine.h",
+      "kind": "enum_constant",
+      "qualified_name": "SM_STATE_IDLE",
+      "rendered_text_sha256": "f0271ed1fd50c5c42929f044e7c26f4e48755b7ecd4036eec6afc1cff0014a8e",
+      "vector_row": 12
+    },
+    {
+      "doc_id": "874f91a04daa2221",
+      "repo_id": "ism_mini",
+      "path": "include/state_machine.h",
+      "kind": "enum_constant",
+      "qualified_name": "SM_STATE_ACTIVE",
+      "rendered_text_sha256": "6e531f5b0661e1f0e55a9165de919f086cdf6a12eafa08a2cb153931846d0a64",
+      "vector_row": 13
+    },
+    {
+      "doc_id": "bc604442460e47a9",
+      "repo_id": "ism_mini",
+      "path": "include/state_machine.h",
+      "kind": "enum_constant",
+      "qualified_name": "SM_STATE_FAULT",
+      "rendered_text_sha256": "a6dc5b3183a95946c532706fb10e7ae34ff9451bfd7f3c0d85106c5f7b065e4f",
+      "vector_row": 14
+    },
+    {
+      "doc_id": "a718777b67d76ce4",
+      "repo_id": "ism_mini",
+      "path": "include/state_machine.h",
+      "kind": "typedef",
+      "qualified_name": "sm_state_t",
+      "rendered_text_sha256": "886253082f33ffe96eb8d0863e3434d252da7ea420e44fa6bec89c4a802be5cc",
+      "vector_row": 15
+    },
+    {
+      "doc_id": "51fb573da9cd316f",
+      "repo_id": "ism_mini",
+      "path": "include/state_machine.h",
+      "kind": "typedef",
+      "qualified_name": "sm_event_callback_t",
+      "rendered_text_sha256": "3d577372d368f602f74b1d9ed256482ba4576f4c85bc88bbe00cbb8ab6407f1d",
+      "vector_row": 16
+    },
+    {
+      "doc_id": "5cf8a7ec20018c4e",
+      "repo_id": "ism_mini",
+      "path": "src/dispatcher.c",
+      "kind": "function",
+      "qualified_name": "dispatcher_drain_pending",
+      "rendered_text_sha256": "f62be449214c2e29d80fc82328f6f30fc29adcc3ee70690edc3dae9a8ffa6001",
+      "vector_row": 17
+    },
+    {
+      "doc_id": "981664e2f1e9f47c",
+      "repo_id": "ism_mini",
+      "path": "src/event_queue.c",
+      "kind": "global",
+      "qualified_name": "queue_slots",
+      "rendered_text_sha256": "7e3c705ebfab004cdb7f7026a454ceeb356c20181b24d113f2e894027b114c50",
+      "vector_row": 18
+    },
+    {
+      "doc_id": "4a7c39c3c59ae64e",
+      "repo_id": "ism_mini",
+      "path": "src/event_queue.c",
+      "kind": "global",
+      "qualified_name": "queue_head",
+      "rendered_text_sha256": "1883c28531d0104fe8936bfafec17423fec514f67b19033f9d1628ca001e95d6",
+      "vector_row": 19
+    },
+    {
+      "doc_id": "ca860bc67807fc78",
+      "repo_id": "ism_mini",
+      "path": "src/event_queue.c",
+      "kind": "global",
+      "qualified_name": "queue_tail",
+      "rendered_text_sha256": "4a48ca3bdb770b5d444c105479d1b2e8c3058324bc690a1c5c2da11dc2ac2da3",
+      "vector_row": 20
+    },
+    {
+      "doc_id": "8e79b8cc212bf9e0",
+      "repo_id": "ism_mini",
+      "path": "src/event_queue.c",
+      "kind": "global",
+      "qualified_name": "queue_dropped",
+      "rendered_text_sha256": "a0995528c6a71ed7cb87ba15d32e20c030d02cbcf37c44ad5f7df999a5518f5c",
+      "vector_row": 21
+    },
+    {
+      "doc_id": "22ae4080444ee03f",
+      "repo_id": "ism_mini",
+      "path": "src/event_queue.c",
+      "kind": "global",
+      "qualified_name": "queue_high_watermark",
+      "rendered_text_sha256": "3f48684086b97e238e7615f9b3d38d7be646d4bd52290e37986d06b22583bfe8",
+      "vector_row": 22
+    },
+    {
+      "doc_id": "a4a74a1a8f944ddd",
+      "repo_id": "ism_mini",
+      "path": "src/event_queue.c",
+      "kind": "function",
+      "qualified_name": "event_queue_init",
+      "rendered_text_sha256": "86fbec98e61c1e41259bb7b8b316a42b6aef50edfb1bf93262a6d028181d0e0f",
+      "vector_row": 23
+    },
+    {
+      "doc_id": "c7de501b419aeb30",
+      "repo_id": "ism_mini",
+      "path": "src/event_queue.c",
+      "kind": "function",
+      "qualified_name": "event_queue_push",
+      "rendered_text_sha256": "ecd35182160708e35ea4cffe81d8dd185499846fc240eab43e01ce0eecff3288",
+      "vector_row": 24
+    },
+    {
+      "doc_id": "d398a0992e546bbc",
+      "repo_id": "ism_mini",
+      "path": "src/event_queue.c",
+      "kind": "function",
+      "qualified_name": "event_queue_pop",
+      "rendered_text_sha256": "3b4dbe2e1d1bb0fcff55ae994292546f80fc171980a14476b56bf3ddd5c7e315",
+      "vector_row": 25
+    },
+    {
+      "doc_id": "e427c70dd5435809",
+      "repo_id": "ism_mini",
+      "path": "src/event_queue.c",
+      "kind": "function",
+      "qualified_name": "event_queue_dropped_count",
+      "rendered_text_sha256": "1f980adf6109ef65be637b20effb3c285f4baa4460f5e8cb03a7cea6275e5cdb",
+      "vector_row": 26
+    },
+    {
+      "doc_id": "1b77c6d9fb5bc67d",
+      "repo_id": "ism_mini",
+      "path": "src/event_queue.c",
+      "kind": "function",
+      "qualified_name": "event_queue_reset_statistics",
+      "rendered_text_sha256": "6124349cf1ba89bcd6c1c9b769942796090229574946856e837dc26d5e79a016",
+      "vector_row": 27
+    },
+    {
+      "doc_id": "e6f81aebb596e716",
+      "repo_id": "ism_mini",
+      "path": "src/isr.c",
+      "kind": "global",
+      "qualified_name": "tick_count",
+      "rendered_text_sha256": "b08e54ed538f80b688b42d4cf3257a149c68a5516725840da8991069f7cfb1c8",
+      "vector_row": 28
+    },
+    {
+      "doc_id": "39489591c539afd4",
+      "repo_id": "ism_mini",
+      "path": "src/isr.c",
+      "kind": "function",
+      "qualified_name": "timer_isr",
+      "rendered_text_sha256": "93fd65e6b474e478d54926030cd924c6831a4fe9ae085310649ca63ae1b3d191",
+      "vector_row": 29
+    },
+    {
+      "doc_id": "1e5fee7f54d14b1f",
+      "repo_id": "ism_mini",
+      "path": "src/isr.c",
+      "kind": "function",
+      "qualified_name": "button_isr",
+      "rendered_text_sha256": "f75660d51890fe59b4b3a247ec5438b4cb5a1bf0c9cda795cef463258ff02eb0",
+      "vector_row": 30
+    },
+    {
+      "doc_id": "4d3c6abc31c4b07c",
+      "repo_id": "ism_mini",
+      "path": "src/main.c",
+      "kind": "function",
+      "qualified_name": "log_comm_event",
+      "rendered_text_sha256": "cba2b1e09a3520e535dd955304cd2532714e0a5eba66ec0229f11ce85eb611da",
+      "vector_row": 31
+    },
+    {
+      "doc_id": "c8c15387ca1da6e9",
+      "repo_id": "ism_mini",
+      "path": "src/main.c",
+      "kind": "function",
+      "qualified_name": "main",
+      "rendered_text_sha256": "ebe4b69260d7321fb74c0473306b572d30e3f9eac71ebfa0f806c39e38af6baa",
+      "vector_row": 32
+    },
+    {
+      "doc_id": "c98750000047b1a3",
+      "repo_id": "ism_mini",
+      "path": "src/state_machine.c",
+      "kind": "macro",
+      "qualified_name": "SM_CALLBACK_SLOTS",
+      "rendered_text_sha256": "7bd969e7c50b3b91cd44e66cf1c17873ac875beac1e7802479b98d9690cccde7",
+      "vector_row": 33
+    },
+    {
+      "doc_id": "8ee2f990eae8287b",
+      "repo_id": "ism_mini",
+      "path": "src/state_machine.c",
+      "kind": "global",
+      "qualified_name": "current_state",
+      "rendered_text_sha256": "054eccf74dd717a37f4b726b1b1e939fedaa30c5ecc4ef509b745dcdc3639527",
+      "vector_row": 34
+    },
+    {
+      "doc_id": "64a1505468b8b2fb",
+      "repo_id": "ism_mini",
+      "path": "src/state_machine.c",
+      "kind": "global",
+      "qualified_name": "callback_table",
+      "rendered_text_sha256": "cc5542e57fbb65c673fcf4c70de193b0bec76f9e4c8244ed3166eb2d08e17533",
+      "vector_row": 35
+    },
+    {
+      "doc_id": "d06bec67ae4b2e16",
+      "repo_id": "ism_mini",
+      "path": "src/state_machine.c",
+      "kind": "function",
+      "qualified_name": "sm_init",
+      "rendered_text_sha256": "15d3985250fd83ef4d933172bc867df71c92be97f7bbbb2573c4a062aabc17f3",
+      "vector_row": 36
+    },
+    {
+      "doc_id": "cc12a8229a8f0846",
+      "repo_id": "ism_mini",
+      "path": "src/state_machine.c",
+      "kind": "function",
+      "qualified_name": "sm_current_state",
+      "rendered_text_sha256": "b2905ac9c9c89f5f937e91d0bf0d06e565c2f3489269feffb847e0d5efbe8849",
+      "vector_row": 37
+    },
+    {
+      "doc_id": "173ee0ade4579710",
+      "repo_id": "ism_mini",
+      "path": "src/state_machine.c",
+      "kind": "function",
+      "qualified_name": "sm_register_callback",
+      "rendered_text_sha256": "1f0648fb65ff4bcbb68f2fed5415ae349f4ef690e0bc084a83979df75abc7e17",
+      "vector_row": 38
+    },
+    {
+      "doc_id": "15d0a25e9cb38235",
+      "repo_id": "ism_mini",
+      "path": "src/state_machine.c",
+      "kind": "function",
+      "qualified_name": "sm_transition",
+      "rendered_text_sha256": "a69f801613a567df2ca601e61022678e8936a89ed832f159095e19b10fd59027",
+      "vector_row": 39
+    },
+    {
+      "doc_id": "72cba29ea4b2d6ab",
+      "repo_id": "ism_mini",
+      "path": "src/state_machine.c",
+      "kind": "function",
+      "qualified_name": "sm_handle_event",
+      "rendered_text_sha256": "230660c27a30bbdf78f29bcce959bc7227049c03da95561b513802d13d607869",
+      "vector_row": 40
+    },
+    {
+      "doc_id": "567a91cc8da843f8",
+      "repo_id": "variants_mini",
+      "path": "variant_config.c",
+      "kind": "function",
+      "qualified_name": "variant_max_channels",
+      "rendered_text_sha256": "7ecacce159dfcab055b104f3073578faeb7f85f887d96e7da2f50fb28319388a",
+      "vector_row": 41
+    },
+    {
+      "doc_id": "2ab91770b3dc6686",
+      "repo_id": "variants_mini",
+      "path": "variant_config.c",
+      "kind": "function",
+      "qualified_name": "variant_max_channels",
+      "rendered_text_sha256": "93b53d223c7d7d6a94afa45d62d10dcf4ddbd38d67aa8d25f74bc459c2837b53",
+      "vector_row": 42
+    },
+    {
+      "doc_id": "17efca3794324dc3",
+      "repo_id": "variants_mini",
+      "path": "variant_config.c",
+      "kind": "function",
+      "qualified_name": "variant_default_baud",
+      "rendered_text_sha256": "e4c51df7bd8c9890f0af423f8d6ddf6c0ea5bf0ddcaa51f9b38aec259ec4738e",
+      "vector_row": 43
+    },
+    {
+      "doc_id": "5a03c33cce8e03c1",
+      "repo_id": "variants_mini",
+      "path": "variant_config.h",
+      "kind": "macro",
+      "qualified_name": "VARIANT_CONFIG_H",
+      "rendered_text_sha256": "876e52b808bda505a24349528bfc6c02d54f3cfbbc8909bcbd1ed7b82bab3cd4",
+      "vector_row": 44
+    },
+    {
+      "doc_id": "5f74073221dd08a9",
+      "repo_id": "workflow_mini",
+      "path": "config/runtime_limits.h",
+      "kind": "macro",
+      "qualified_name": "RUNTIME_LIMITS_H",
+      "rendered_text_sha256": "88b992487a03d7f3a0cee6296c818078c7ffc32d4be0cc7ef5e66df12bd67f76",
+      "vector_row": 45
+    },
+    {
+      "doc_id": "0fe9a8e94e77cc47",
+      "repo_id": "workflow_mini",
+      "path": "config/runtime_limits.h",
+      "kind": "macro",
+      "qualified_name": "RETRY_DEFAULT_ATTEMPTS",
+      "rendered_text_sha256": "21823bdcd7a7b1a316112960d29e445b9e02980d241ed98f7c7aeaeff2de7069",
+      "vector_row": 46
+    },
+    {
+      "doc_id": "b07469288485297b",
+      "repo_id": "workflow_mini",
+      "path": "config/runtime_limits.h",
+      "kind": "macro",
+      "qualified_name": "HEARTBEAT_TIMEOUT_TICKS",
+      "rendered_text_sha256": "0468636105e6756ca6103cfebc9b8720f83fcf870510a2f03d4132604e840278",
+      "vector_row": 47
+    },
+    {
+      "doc_id": "47e97d0c047bead4",
+      "repo_id": "workflow_mini",
+      "path": "config/runtime_limits.h",
+      "kind": "macro",
+      "qualified_name": "CONFIG_GENERATION",
+      "rendered_text_sha256": "01d74f0b92a27759679e3a2046761085cfc6de991005ce057424c7b721203f89",
+      "vector_row": 48
+    },
+    {
+      "doc_id": "970d98cdf36f3965",
+      "repo_id": "workflow_mini",
+      "path": "include/fw/alarm_queue.h",
+      "kind": "macro",
+      "qualified_name": "FW_ALARM_QUEUE_H",
+      "rendered_text_sha256": "f8ca8ccebf0ededd3de261ef0d97464b1ea08163ae907ee185db1e554793b21a",
+      "vector_row": 49
+    },
+    {
+      "doc_id": "b063366d646d7904",
+      "repo_id": "workflow_mini",
+      "path": "include/fw/alarm_queue.h",
+      "kind": "typedef",
+      "qualified_name": "alarm_record_t",
+      "rendered_text_sha256": "57ce1a028f32a4f6e99b251fa595b212ca797fba52a43afb626a5b8d8a8d85cd",
+      "vector_row": 50
+    },
+    {
+      "doc_id": "fcb9ea27aacd9583",
+      "repo_id": "workflow_mini",
+      "path": "include/fw/hook_api.h",
+      "kind": "macro",
+      "qualified_name": "FW_HOOK_API_H",
+      "rendered_text_sha256": "b84da3a4df9d8ba26ea751f04d4b4d486168e62456df183fe38b21a416f89d85",
+      "vector_row": 51
+    },
+    {
+      "doc_id": "0d61d96f84414410",
+      "repo_id": "workflow_mini",
+      "path": "include/fw/hook_api.h",
+      "kind": "typedef",
+      "qualified_name": "hook_callback_t",
+      "rendered_text_sha256": "4280e498d35f99b6e26fa61884a4db7135429bdeea5a566c838d5b1bf71d5283",
+      "vector_row": 52
+    },
+    {
+      "doc_id": "fc4d57e28adca250",
+      "repo_id": "workflow_mini",
+      "path": "include/fw/retry_policy.h",
+      "kind": "macro",
+      "qualified_name": "FW_RETRY_POLICY_H",
+      "rendered_text_sha256": "4a23f2be441e4da92223def65804db802682147d6d13aac9483af439738f3185",
+      "vector_row": 53
+    },
+    {
+      "doc_id": "76501c164c2906ac",
+      "repo_id": "workflow_mini",
+      "path": "include/fw/retry_policy.h",
+      "kind": "typedef",
+      "qualified_name": "retry_policy_t",
+      "rendered_text_sha256": "724c86098fce2250db764a2f685802d17c36d9cb2173d524096fa3d1a102b96b",
+      "vector_row": 54
+    },
+    {
+      "doc_id": "0f22f9181177e5b7",
+      "repo_id": "workflow_mini",
+      "path": "include/fw/service.h",
+      "kind": "macro",
+      "qualified_name": "FW_SERVICE_H",
+      "rendered_text_sha256": "4d5618b331e5c88190bc76c5add334702a46dc7efa43b891969e42b4c213ff7e",
+      "vector_row": 55
+    },
+    {
+      "doc_id": "03aedd37fe1a89df",
+      "repo_id": "workflow_mini",
+      "path": "include/fw/watchdog.h",
+      "kind": "macro",
+      "qualified_name": "FW_WATCHDOG_H",
+      "rendered_text_sha256": "6685ae5b86350fb30c7a8dfeda4f5668aa6116de08c1c44c4770310f6d0736a0",
+      "vector_row": 56
+    },
+    {
+      "doc_id": "5297a88aaa9d5a62",
+      "repo_id": "workflow_mini",
+      "path": "include/fw/watchdog.h",
+      "kind": "typedef",
+      "qualified_name": "watchdog_state_t",
+      "rendered_text_sha256": "64fa0485adc61d45085f766ab6da47b8644aa6c2e100ff23abbec1abb95c6906",
+      "vector_row": 57
+    },
+    {
+      "doc_id": "8da63e47f0b4d7ea",
+      "repo_id": "workflow_mini",
+      "path": "src/alarm_queue.c",
+      "kind": "global",
+      "qualified_name": "queue_slots",
+      "rendered_text_sha256": "863490f2be6dabb7cd3694773d74f2884d3300a14bd0af3adce48c49a86558b6",
+      "vector_row": 58
+    },
+    {
+      "doc_id": "2bcf554c5ab8ce69",
+      "repo_id": "workflow_mini",
+      "path": "src/alarm_queue.c",
+      "kind": "global",
+      "qualified_name": "pending_count",
+      "rendered_text_sha256": "8f0de836e95cc427e0a1bbddc4be7d1d9f06f2d44cbdceb63e884a0128ee3bff",
+      "vector_row": 59
+    },
+    {
+      "doc_id": "db98d0a1772a3206",
+      "repo_id": "workflow_mini",
+      "path": "src/alarm_queue.c",
+      "kind": "function",
+      "qualified_name": "alarm_queue_push",
+      "rendered_text_sha256": "bc8d94c54d10f4c478240af00c0c4acbbd17f21ed98c123dc166f5cbbf531d7a",
+      "vector_row": 60
+    },
+    {
+      "doc_id": "f50c5e1b62135bd7",
+      "repo_id": "workflow_mini",
+      "path": "src/alarm_queue.c",
+      "kind": "function",
+      "qualified_name": "alarm_queue_pending",
+      "rendered_text_sha256": "c30f685639e0757b875376ff488b7088d2e153021c9a247bfc2d0fd692e18725",
+      "vector_row": 61
+    },
+    {
+      "doc_id": "5fda01d997bfdbe8",
+      "repo_id": "workflow_mini",
+      "path": "src/app.c",
+      "kind": "function",
+      "qualified_name": "recovery_cycle",
+      "rendered_text_sha256": "6745747181ec6ebee095aad7915494f0585861d6045996441f6e00c889cffc0d",
+      "vector_row": 62
+    },
+    {
+      "doc_id": "a0da3b9715b9f1ad",
+      "repo_id": "workflow_mini",
+      "path": "src/app.c",
+      "kind": "function",
+      "qualified_name": "dispatch_alarm",
+      "rendered_text_sha256": "5ed22d6713227662ba9cc636d5a23bb8e1b9ffb64945bfed8bdd398ae9395a9d",
+      "vector_row": 63
+    },
+    {
+      "doc_id": "105d0c3c48ff4bcc",
+      "repo_id": "workflow_mini",
+      "path": "src/app.c",
+      "kind": "function",
+      "qualified_name": "install_hook",
+      "rendered_text_sha256": "160d233bb759ea7e95521234bd7536d909ff5717185811cf725922c6e069b162",
+      "vector_row": 64
+    },
+    {
+      "doc_id": "4c515d5437f2ab15",
+      "repo_id": "workflow_mini",
+      "path": "src/calibration.c",
+      "kind": "function",
+      "qualified_name": "calibration_load",
+      "rendered_text_sha256": "fb5d20b7c7c23a667dc9ed7f7b5cbcac0165e358e799200cdfed2bbc71ff2940",
+      "vector_row": 65
+    },
+    {
+      "doc_id": "38a866e77ff7ac53",
+      "repo_id": "workflow_mini",
+      "path": "src/config_guard.c",
+      "kind": "function",
+      "qualified_name": "config_guard_validate",
+      "rendered_text_sha256": "d78baa2419d062d59b3f7c3ff3d00e5795fdd3d1c3e6117c79fbf216758ecf80",
+      "vector_row": 66
+    },
+    {
+      "doc_id": "5e81b4ea4603218a",
+      "repo_id": "workflow_mini",
+      "path": "src/driver_a.c",
+      "kind": "function",
+      "qualified_name": "init",
+      "rendered_text_sha256": "1f218d27ef9cb764dbc8bd9b5555266cd394039ebf5ee44d7576e8c8f7b85c6e",
+      "vector_row": 67
+    },
+    {
+      "doc_id": "0ff2f954e5bf0e96",
+      "repo_id": "workflow_mini",
+      "path": "src/driver_a.c",
+      "kind": "function",
+      "qualified_name": "boot_driver_a",
+      "rendered_text_sha256": "e9f75c2d7c3605300c46c59ad68f6ac6641d5f6dd469b974b6f70ea6a04d88b4",
+      "vector_row": 68
+    },
+    {
+      "doc_id": "6702b50b6973e4a9",
+      "repo_id": "workflow_mini",
+      "path": "src/driver_b.c",
+      "kind": "function",
+      "qualified_name": "init",
+      "rendered_text_sha256": "a0c3cda857269c00e1a3d3b97c2d893033343af4692435b046a29ddbafc8b20c",
+      "vector_row": 69
+    },
+    {
+      "doc_id": "e89dcbac85535b76",
+      "repo_id": "workflow_mini",
+      "path": "src/driver_b.c",
+      "kind": "function",
+      "qualified_name": "boot_driver_b",
+      "rendered_text_sha256": "1597894181cfadf1667601a27ad2ea8efded4acdf334c9705bc45b185c85197c",
+      "vector_row": 70
+    },
+    {
+      "doc_id": "72eb364c6225c8e6",
+      "repo_id": "workflow_mini",
+      "path": "src/hook_dispatch.c",
+      "kind": "macro_function",
+      "qualified_name": "RUN_HOOK",
+      "rendered_text_sha256": "d232012d1620767e7aedf378801a33104aea1d44ecba05e08a978b7ac72045dc",
+      "vector_row": 71
+    },
+    {
+      "doc_id": "a5d5f163bc4b2612",
+      "repo_id": "workflow_mini",
+      "path": "src/hook_dispatch.c",
+      "kind": "global",
+      "qualified_name": "active_hook",
+      "rendered_text_sha256": "131e9ca7dcef9b183ae60d507a819f6be22f8c2b0bc99b5c6cd361542fccea7a",
+      "vector_row": 72
+    },
+    {
+      "doc_id": "dfaa32158d54e92f",
+      "repo_id": "workflow_mini",
+      "path": "src/hook_dispatch.c",
+      "kind": "function",
+      "qualified_name": "hook_register",
+      "rendered_text_sha256": "76e38c94d45c710445566954a0ade7a550a50037ff2f3bf1b9ac5278a6c649be",
+      "vector_row": 73
+    },
+    {
+      "doc_id": "f2edfd2c50e8c237",
+      "repo_id": "workflow_mini",
+      "path": "src/hook_dispatch.c",
+      "kind": "function",
+      "qualified_name": "hook_dispatch",
+      "rendered_text_sha256": "568b2ec73ae15671fd4db8644e2f2b6dd7cb5388c81686b7109caaa4a60e24e5",
+      "vector_row": 74
+    },
+    {
+      "doc_id": "763b9f2660d8c103",
+      "repo_id": "workflow_mini",
+      "path": "src/isr.c",
+      "kind": "function",
+      "qualified_name": "sensor_irq",
+      "rendered_text_sha256": "ed601ef126cea84f79ba8bba05b66a34276c7784857b03467f5ecf771da0afa1",
+      "vector_row": 75
+    },
+    {
+      "doc_id": "95f5e2536d56262d",
+      "repo_id": "workflow_mini",
+      "path": "src/private_driver.c",
+      "kind": "function",
+      "qualified_name": "private_reset",
+      "rendered_text_sha256": "7291e5c02dd86204526ff22c712da15c052c94a5a75c50009f84a0d6966b3803",
+      "vector_row": 76
+    },
+    {
+      "doc_id": "559d90121ff34afa",
+      "repo_id": "workflow_mini",
+      "path": "src/private_driver.c",
+      "kind": "function",
+      "qualified_name": "private_driver_reset",
+      "rendered_text_sha256": "9701b586afc95a7711ddbfac5dc8e3e18c6281fc4077324d6de66bb0e7e0a32d",
+      "vector_row": 77
+    },
+    {
+      "doc_id": "456b8197e4c9ee76",
+      "repo_id": "workflow_mini",
+      "path": "src/retry.c",
+      "kind": "function",
+      "qualified_name": "retry_execute",
+      "rendered_text_sha256": "12bc99f0c9ec394c9b35e007f6dc64b8c02e1199299563ed546cb6507b16e91c",
+      "vector_row": 78
+    },
+    {
+      "doc_id": "cc83e30d186dc62d",
+      "repo_id": "workflow_mini",
+      "path": "src/rogue.c",
+      "kind": "function",
+      "qualified_name": "rogue_entry",
+      "rendered_text_sha256": "05fe03695f95d5eac3a00baffcdd6b3da6ca63abf5913eee9d99116261a2d699",
+      "vector_row": 79
+    },
+    {
+      "doc_id": "39b7667ec865c55f",
+      "repo_id": "workflow_mini",
+      "path": "src/service.c",
+      "kind": "function",
+      "qualified_name": "service_commit",
+      "rendered_text_sha256": "afad8271322ddf65392a04dead6e5bb6dd5c0f69fd79408aec03a01e2bb3a2ce",
+      "vector_row": 80
+    },
+    {
+      "doc_id": "9e43be250876bbbf",
+      "repo_id": "workflow_mini",
+      "path": "src/service_user.c",
+      "kind": "function",
+      "qualified_name": "service_user_flush",
+      "rendered_text_sha256": "56544c59dc7808ac91d8d2b2a67fe1bfef98f4fe9fb8f3f6274964621b5438a0",
+      "vector_row": 81
+    },
+    {
+      "doc_id": "6569efe7316a1be3",
+      "repo_id": "workflow_mini",
+      "path": "src/variant.c",
+      "kind": "function",
+      "qualified_name": "variant_init",
+      "rendered_text_sha256": "aaa10437bcc4b491c0612a4df2d9d2c9ac2e7db97e3c863e33615c5e522147ee",
+      "vector_row": 82
+    },
+    {
+      "doc_id": "aa00b2d06943151c",
+      "repo_id": "workflow_mini",
+      "path": "src/variant.c",
+      "kind": "function",
+      "qualified_name": "variant_init",
+      "rendered_text_sha256": "c9a7bc079e15f0f06d18fa1f230acfda64da3ce82eec00e5335916ec29961852",
+      "vector_row": 83
+    },
+    {
+      "doc_id": "193e33159be2ada2",
+      "repo_id": "workflow_mini",
+      "path": "src/variant.c",
+      "kind": "function",
+      "qualified_name": "variant_boot",
+      "rendered_text_sha256": "c3e1a0836d0f8e07677f8e5469f2d711b78a1bf635242206ffaacb16560cb9bc",
+      "vector_row": 84
+    },
+    {
+      "doc_id": "cb6d7cfc43a3aefd",
+      "repo_id": "workflow_mini",
+      "path": "src/watchdog.c",
+      "kind": "function",
+      "qualified_name": "watchdog_note_heartbeat",
+      "rendered_text_sha256": "9877817dbb3a28f9dcfadbf1744412be60d5572d42142a98ef38eb451b00ea41",
+      "vector_row": 85
+    },
+    {
+      "doc_id": "926af052237cf231",
+      "repo_id": "workflow_mini",
+      "path": "src/watchdog.c",
+      "kind": "function",
+      "qualified_name": "watchdog_tick",
+      "rendered_text_sha256": "4dac70a3782c755253d55cbe52a8aef19f326e721727bdf98e0be8f6c28830c2",
+      "vector_row": 86
+    },
+    {
+      "doc_id": "8c5700b2476f8436",
+      "repo_id": "workflow_mini",
+      "path": "startup/bridge.c",
+      "kind": "function",
+      "qualified_name": "f17",
+      "rendered_text_sha256": "8c8e2301566e93bf422601ca5f2f74e77daed1af65264555da5207ad3337aa64",
+      "vector_row": 87
+    },
+    {
+      "doc_id": "af13ead0f9f6d193",
+      "repo_id": "workflow_mini",
+      "path": "tests/test_workflows.c",
+      "kind": "function",
+      "qualified_name": "verify_retry_budget_case",
+      "rendered_text_sha256": "40b3f49be1386793c944183570aef300da55a08989bf9ee75f7cd4453aebccf3",
+      "vector_row": 88
+    },
+    {
+      "doc_id": "f0b706404f26bd64",
+      "repo_id": "workflow_mini",
+      "path": "tests/test_workflows.c",
+      "kind": "function",
+      "qualified_name": "verify_missed_heartbeat_case",
+      "rendered_text_sha256": "62e43d6f8b49f6f6ccba21d41ee636f1ed461760b46c3fd40f5496b6d2ad4a0d",
+      "vector_row": 89
+    },
+    {
+      "doc_id": "04d9c5be77330e61",
+      "repo_id": "workflow_mini",
+      "path": "tests/test_workflows.c",
+      "kind": "function",
+      "qualified_name": "verify_oldest_alarm_case",
+      "rendered_text_sha256": "c06f7461640fb742aae08d5b33f6a079c7e29d1b22db1739f8015b3da54f7849",
+      "vector_row": 90
+    },
+    {
+      "doc_id": "fb5310fb4c0ceb18",
+      "repo_id": "workflow_mini",
+      "path": "tests/test_workflows.c",
+      "kind": "function",
+      "qualified_name": "verify_blank_calibration_case",
+      "rendered_text_sha256": "e29db17652dc1aa7300275913a89481f1a2d7c86b31b579807633bcef91029d7",
+      "vector_row": 91
+    },
+    {
+      "doc_id": "1790efbbcfe34978",
+      "repo_id": "workflow_mini",
+      "path": "tests/test_workflows.c",
+      "kind": "function",
+      "qualified_name": "verify_retry_layout_case",
+      "rendered_text_sha256": "7e983387fe8b7a36cec897f75562bd437b3f32ea318e610e69e007e8414ad568",
+      "vector_row": 92
+    },
+    {
+      "doc_id": "41cb313b4dc62fad",
+      "repo_id": "workflow_mini",
+      "path": "tests/test_workflows.c",
+      "kind": "function",
+      "qualified_name": "verify_watchdog_layout_case",
+      "rendered_text_sha256": "4c34dbf79bbe2c9916e71bcf32b4c5a5b14fb12e7a43bec343a1ad6091937c0d",
+      "vector_row": 93
+    },
+    {
+      "doc_id": "864f5eb426ecaf29",
+      "repo_id": "workflow_mini",
+      "path": "tests/test_workflows.c",
+      "kind": "function",
+      "qualified_name": "verify_alarm_layout_case",
+      "rendered_text_sha256": "b4941eb7dd8e12ab67ddcda7bcded7655995335eb239067fddabb8a44c99c248",
+      "vector_row": 94
+    },
+    {
+      "doc_id": "1bd42c7a6c3b1cab",
+      "repo_id": "workflow_mini",
+      "path": "tests/test_workflows.c",
+      "kind": "function",
+      "qualified_name": "verify_hook_signature_case",
+      "rendered_text_sha256": "4f4225fdd4391c6914f85f69fa1aacd121659bbd5d47b35d62e3f2f6c7c68078",
+      "vector_row": 95
+    },
+    {
+      "doc_id": "a75928341856312f",
+      "repo_id": "workflow_mini",
+      "path": "tests/test_workflows.c",
+      "kind": "function",
+      "qualified_name": "verify_config_generation_case",
+      "rendered_text_sha256": "96b8f49a50df2704909e6ea5215821aeb9ff7cf9266c05aff025d1161a44d162",
+      "vector_row": 96
+    }
+  ],
+  "queries": [
+    {
+      "case_id": "core_001",
+      "rendered_query_sha256": "0b42eaed552874fce11d629edf04d544c93fdb7f97baccb4be24e5840e55094d",
+      "instruction_id": "none",
+      "vector_row": 97
+    },
+    {
+      "case_id": "core_002",
+      "rendered_query_sha256": "165e0cb61ccdafb487b9ab88263ebfe1084eea74f4a4e5ab877e8b0f4da7c5c6",
+      "instruction_id": "none",
+      "vector_row": 98
+    },
+    {
+      "case_id": "core_003",
+      "rendered_query_sha256": "7be94b5bb395b34797541e55cc7b668f3e8d0d4919e1b6cf99233c7a9cce8d76",
+      "instruction_id": "none",
+      "vector_row": 99
+    },
+    {
+      "case_id": "core_004",
+      "rendered_query_sha256": "3b4a0dcb6210ceee470f1a2f9e674ec991ce38d5aec2ed87ae63f93aa13f1469",
+      "instruction_id": "none",
+      "vector_row": 100
+    },
+    {
+      "case_id": "core_005",
+      "rendered_query_sha256": "82f970b31912054b44b183e141783565eb297ca5ee522912081cc196a66c9832",
+      "instruction_id": "none",
+      "vector_row": 101
+    },
+    {
+      "case_id": "core_006",
+      "rendered_query_sha256": "69a160323dc77374137335378f29d7deaa552b1cbbd72c0f3c93b9cc71ea39fa",
+      "instruction_id": "none",
+      "vector_row": 102
+    },
+    {
+      "case_id": "core_007",
+      "rendered_query_sha256": "c754324b311a65cb4eb7d1dc771a5e487b99e2984ecf6bf2d044d381b52b9011",
+      "instruction_id": "none",
+      "vector_row": 103
+    },
+    {
+      "case_id": "core_008",
+      "rendered_query_sha256": "064cc3ebef72214ab4d991379458c9657139241c6437d07119184bbad6652262",
+      "instruction_id": "none",
+      "vector_row": 104
+    },
+    {
+      "case_id": "core_009",
+      "rendered_query_sha256": "1ad54988aba6e4f129bec43d9096b095848d0568f519b2219bd11e16d8ae7455",
+      "instruction_id": "none",
+      "vector_row": 105
+    },
+    {
+      "case_id": "core_010",
+      "rendered_query_sha256": "0486d8a70214d8ee830750b77e6eba78933a578c66b7bbad1987872f338aa04f",
+      "instruction_id": "none",
+      "vector_row": 106
+    },
+    {
+      "case_id": "core_011",
+      "rendered_query_sha256": "b0a73f24e3630a18b729de629e878192835603aea0834e0611118b6bed5a30c7",
+      "instruction_id": "none",
+      "vector_row": 107
+    },
+    {
+      "case_id": "core_012",
+      "rendered_query_sha256": "60d5909ccedd1dee2c5dc85dc480a22cd08a9f7e63925a7a757ee241857ab0fb",
+      "instruction_id": "none",
+      "vector_row": 108
+    },
+    {
+      "case_id": "stretch_001",
+      "rendered_query_sha256": "871bef4002883a91206fb5f0bfed3fb9391f9ca1799b26de89f04adfff83da03",
+      "instruction_id": "none",
+      "vector_row": 109
+    },
+    {
+      "case_id": "stretch_002",
+      "rendered_query_sha256": "71d15a3a5a7a216ee128060497a9711de56a7e3c8f0b5096bd46670083728ff0",
+      "instruction_id": "none",
+      "vector_row": 110
+    },
+    {
+      "case_id": "stretch_003",
+      "rendered_query_sha256": "94381d60a06853d3493e2de25613c523331894fe724e4e810679c395a323870d",
+      "instruction_id": "none",
+      "vector_row": 111
+    },
+    {
+      "case_id": "stretch_004",
+      "rendered_query_sha256": "9e7ff6c93a7008969c11e6a0703c060bee81e295daa0fee20a07a135643361bb",
+      "instruction_id": "none",
+      "vector_row": 112
+    }
+  ]
+}

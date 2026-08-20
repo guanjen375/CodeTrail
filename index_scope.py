@@ -59,6 +59,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import file_kind_policy
 from config import (
     CODE_EXTENSIONS,
     CODE_RAG_CACHE_FILE,
@@ -750,7 +751,9 @@ class IndexScope:
             or name.startswith(INDEX_ARTIFACT_PREFIXES)
         ):
             return False                                   # committed code_rag 行為
-        if Path(name).suffix.lower() not in CODE_EXTENSIONS:
+        # 成員資格走 FileKindPolicy(§6 P3B):suffix 或 basename 規則其一成立。
+        # Makefile / Kconfig 沒有副檔名,只看 suffix 會永遠搜不到。
+        if not file_kind_policy.is_indexable(name):
             return False
         if should_ignore_file(normalized):
             return False
@@ -793,6 +796,9 @@ class IndexScope:
             "b2_python_parents": sorted(INDEX_PYTHON_VERSION_PARENTS),
             "b2_egg_info_suffix": INDEX_EGG_INFO_SUFFIX,
             "code_extensions": sorted(CODE_EXTENSIONS),
+            # policy 規則本身(含 basename 規則)也要進指紋:規則改了而指紋沒動,
+            # 成員資格會靜默漂移,舊 scope 快照卻照樣被沿用。
+            "file_kind_policy": file_kind_policy.policy_fingerprint(),
             "ignored_files": sorted(IGNORED_FILES),
             "ignored_patterns": list(IGNORED_PATTERNS),
             "index_artifacts": sorted(INDEX_ARTIFACT_FILES),

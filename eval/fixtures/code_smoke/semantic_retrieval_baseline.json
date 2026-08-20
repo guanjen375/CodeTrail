@@ -1,0 +1,1179 @@
+{
+  "_comment": "Semantic retrieval baseline recorded after the P1A correctness fixes. Compare later sprints against this, never against the pre-aggregation lexical numbers. Re-record whenever corpus/render/scorer versions move.",
+  "model": {
+    "role": "embedding",
+    "profile_key": "defaults",
+    "pooling": "cls",
+    "server_n_ctx": 8192,
+    "gguf": {
+      "basename": "bge-m3-f16.gguf",
+      "size_bytes": 1157671200,
+      "head_bytes": 16777216,
+      "head_sha256": "51bcf9be01d4d3b049178a7f19ebd2ae9601a43c82233759ebe5cfc090e0c623"
+    },
+    "dimension": 1024,
+    "llama_cpp": {
+      "revision": "version: 10276 (6ea215d17)"
+    }
+  },
+  "pipeline": {
+    "parser_semantics_version": 3,
+    "embed_text_schema_version": 2,
+    "query_render_schema_version": 1,
+    "retrieval_scorer_version": 1,
+    "corpus_manifest_version": 1,
+    "normalization": "l2",
+    "query_instruction_id": "none"
+  },
+  "corpus": {
+    "manifest_version": 1,
+    "file_count": 37,
+    "document_count": 97,
+    "file_manifest_digest": "3da19228f8e30709296f25641f5370e161ea3e854c8198d30e22479094d9dcf2",
+    "document_manifest_digest": "09cec2e08bfdcdd3a41bdfe98d70f948eab14cbc3afc7e967e37333b47ddf1d6"
+  },
+  "primary_scope": "per_repo",
+  "primary_lane": "runtime_hybrid",
+  "scopes": {
+    "per_repo": {
+      "families": {
+        "lexical": {
+          "code2test": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "comment2context": {
+            "cases": 2,
+            "file_recall_at_k": 1.0,
+            "mrr": 0.75,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.6667
+          },
+          "edit2ripple": {
+            "cases": 4,
+            "file_recall_at_k": 0.9,
+            "mrr": 1.0,
+            "seed_recall_at_k": 0.875,
+            "symbol_recall_at_k": 0.7917
+          },
+          "low_lexical_overlap": {
+            "cases": 2,
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "trace2code": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "dense": {
+          "code2test": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "comment2context": {
+            "cases": 2,
+            "file_recall_at_k": 1.0,
+            "mrr": 0.6667,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.6667
+          },
+          "edit2ripple": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.9167
+          },
+          "low_lexical_overlap": {
+            "cases": 2,
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "trace2code": {
+            "cases": 4,
+            "file_recall_at_k": 0.875,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "runtime_hybrid": {
+          "code2test": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "comment2context": {
+            "cases": 2,
+            "file_recall_at_k": 0.75,
+            "mrr": 0.75,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.4167
+          },
+          "edit2ripple": {
+            "cases": 4,
+            "file_recall_at_k": 0.85,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.875
+          },
+          "low_lexical_overlap": {
+            "cases": 2,
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "trace2code": {
+            "cases": 4,
+            "file_recall_at_k": 0.7917,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "rrf_experimental": {
+          "code2test": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "comment2context": {
+            "cases": 2,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.6667
+          },
+          "edit2ripple": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.7917
+          },
+          "low_lexical_overlap": {
+            "cases": 2,
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "trace2code": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        }
+      },
+      "cases": {
+        "core_001": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_002": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_003": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_004": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_005": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_006": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_007": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 0.666667,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_008": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_009": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_010": {
+          "lexical": {
+            "file_recall_at_k": 0.6,
+            "mrr": 1.0,
+            "seed_recall_at_k": 0.5,
+            "symbol_recall_at_k": 0.5
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 0.6,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.5
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.5
+          }
+        },
+        "core_011": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 0.8,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_012": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.666667
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.666667
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.666667
+          }
+        },
+        "stretch_001": {
+          "lexical": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "stretch_002": {
+          "lexical": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "stretch_003": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.333333
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 0.333333,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.333333
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 0.5,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.333333
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.333333
+          }
+        },
+        "stretch_004": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 0.5,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.5
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        }
+      }
+    },
+    "union": {
+      "families": {
+        "lexical": {
+          "code2test": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "comment2context": {
+            "cases": 2,
+            "file_recall_at_k": 1.0,
+            "mrr": 0.75,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.6667
+          },
+          "edit2ripple": {
+            "cases": 4,
+            "file_recall_at_k": 0.9,
+            "mrr": 1.0,
+            "seed_recall_at_k": 0.875,
+            "symbol_recall_at_k": 0.7917
+          },
+          "low_lexical_overlap": {
+            "cases": 2,
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "trace2code": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.875
+          }
+        },
+        "dense": {
+          "code2test": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "comment2context": {
+            "cases": 2,
+            "file_recall_at_k": 1.0,
+            "mrr": 0.6667,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.6667
+          },
+          "edit2ripple": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.9167
+          },
+          "low_lexical_overlap": {
+            "cases": 2,
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "trace2code": {
+            "cases": 4,
+            "file_recall_at_k": 0.875,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "runtime_hybrid": {
+          "code2test": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "comment2context": {
+            "cases": 2,
+            "file_recall_at_k": 0.75,
+            "mrr": 0.75,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.4167
+          },
+          "edit2ripple": {
+            "cases": 4,
+            "file_recall_at_k": 0.85,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.7917
+          },
+          "low_lexical_overlap": {
+            "cases": 2,
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "trace2code": {
+            "cases": 4,
+            "file_recall_at_k": 0.7917,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "rrf_experimental": {
+          "code2test": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "comment2context": {
+            "cases": 2,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.6667
+          },
+          "edit2ripple": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.7917
+          },
+          "low_lexical_overlap": {
+            "cases": 2,
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "trace2code": {
+            "cases": 4,
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.875
+          }
+        }
+      },
+      "cases": {
+        "core_001": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_002": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_003": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_004": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_005": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.5
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.5
+          }
+        },
+        "core_006": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_007": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 0.666667,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_008": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_009": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_010": {
+          "lexical": {
+            "file_recall_at_k": 0.6,
+            "mrr": 1.0,
+            "seed_recall_at_k": 0.5,
+            "symbol_recall_at_k": 0.5
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 0.6,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.5
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.5
+          }
+        },
+        "core_011": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 0.8,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "core_012": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.666667
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.666667
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.666667
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.666667
+          }
+        },
+        "stretch_001": {
+          "lexical": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "stretch_002": {
+          "lexical": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        },
+        "stretch_003": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.333333
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 0.333333,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.333333
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 1.0,
+            "mrr": 0.5,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.333333
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.333333
+          }
+        },
+        "stretch_004": {
+          "lexical": {
+            "file_recall_at_k": 1.0,
+            "mrr": 0.5,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "dense": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          },
+          "runtime_hybrid": {
+            "file_recall_at_k": 0.5,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 0.5
+          },
+          "rrf_experimental": {
+            "file_recall_at_k": 1.0,
+            "mrr": 1.0,
+            "seed_recall_at_k": 1.0,
+            "symbol_recall_at_k": 1.0
+          }
+        }
+      }
+    }
+  }
+}

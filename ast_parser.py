@@ -30,6 +30,57 @@ _CPP_EXTENSIONS = frozenset({
     '.c', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.hh', '.hxx',
 })
 
+# Parser 的語意版本。symbol 的「哪些東西算 definition」、kind 拼法、linkage /
+# condition / storage_class 的判定規則一改就要 bump。
+#
+# 版本消費矩陣(施工規格 §6 P2-5):
+#   - CodeRAG cache:**是**(symbol 集合會變,舊 cache 的 index entry 不可信)
+#   - CodeGraph fingerprint:**是**(node / defines edge 會變)
+#   - eval vector manifest:**是**(corpus document 集合會變)
+#
+# v1(2026-08-19 之前的行為):C/C++ 只抽 class/struct/function/template。
+# v2(P2):macro / macro_function / typedef / enum / enum_constant / global,
+#        declaration 與 definition 分離,multi-declarator 逐一產生 symbol。
+PARSER_SEMANTICS_VERSION = 3
+
+# C/C++ 的 stable symbol kind。寫死成常數,避免 parser / cache / graph / test
+# 各自用不同拼法(kind 字串會進持久 cache 與 graph node,拼錯是無聲的)。
+CPP_MACRO_KIND = "macro"
+CPP_MACRO_FUNCTION_KIND = "macro_function"
+CPP_TYPEDEF_KIND = "typedef"
+CPP_ENUM_KIND = "enum"
+CPP_ENUM_CONSTANT_KIND = "enum_constant"
+CPP_GLOBAL_KIND = "global"
+
+# 只有 global 是有 linkage 的物件;macro / typedef / enum / enum_constant
+# 在 C/C++ 語意上根本沒有 linkage,不得硬掰一個值。
+CPP_LINKED_OBJECT_KINDS = frozenset({CPP_GLOBAL_KIND})
+CPP_NEW_DEFINITION_KINDS = frozenset({
+    CPP_MACRO_KIND, CPP_MACRO_FUNCTION_KIND, CPP_TYPEDEF_KIND,
+    CPP_ENUM_KIND, CPP_ENUM_CONSTANT_KIND, CPP_GLOBAL_KIND,
+})
+
+# 檔頭 license / copyright 樣板。緊貼第一個 symbol 的檔頭註解不是那個 symbol
+# 的說明,掛上去只會讓每個檔的第一個符號都帶著同一段法律文字進 embedding。
+_FILE_HEADER_MARKERS = (
+    "spdx-license-identifier", "copyright", "all rights reserved",
+    "licensed under", "license:", "gnu general public",
+)
+
+# leading comment 的行數上限。超長的區塊註解(整段設計說明)不該整段擠進
+# 每個 symbol 的表示式,那是 noise 不是訊號。
+MAX_LEADING_COMMENT_LINES = 12
+
+# translation-unit / namespace scope 的判定:往上走只能經過這些節點。
+# 碰到 compound_statement(函式本體)、field_declaration_list(struct/class
+# 本體)、parameter_list 等就不是 TU scope —— local 變數與 member 一律排除。
+_TU_SCOPE_ANCESTORS = frozenset({
+    "translation_unit",
+    "preproc_if", "preproc_ifdef", "preproc_elif", "preproc_else",
+    "linkage_specifier", "declaration_list", "namespace_definition",
+    "type_definition", "declaration", "template_declaration",
+})
+
 # 嘗試導入 tree-sitter
 try:
     import tree_sitter
@@ -111,6 +162,10 @@ class Symbol:
     # internal(`static`)與 external，condition 保存外層 preprocessor branch。
     linkage: Optional[str] = None
     condition: Optional[str] = None
+    # 原始 storage-class specifier("static" / "extern" / "inline" / ...,
+    # 多個以空白相連)。linkage 是推論結果,storage_class 是原文事實 ——
+    # 兩者分開存,推論規則之後改了還能回頭核對原始宣告。
+    storage_class: Optional[str] = None
 
 
 class PythonASTParser:
@@ -504,14 +559,44 @@ class TreeSitterParser:
         """
         node_type = node.type
 
-        if node_type in ('class_specifier', 'struct_specifier'):
+        if node_type in ('preproc_def', 'preproc_function_def'):
+            # macro definition。preprocessor 沒有 C scope,所以不限 TU scope;
+            # 但**不做** macro expansion / evaluation —— 只登記定義本身。
+            self._extract_macro(node, lines, symbols, qualified_prefix)
+            return
+
+        if node_type == 'type_definition':
+            self._extract_typedef(node, lines, symbols, parent_name, qualified_prefix)
+            return
+
+        if node_type == 'enum_specifier':
+            self._extract_enum(node, lines, symbols, qualified_prefix, alias=None)
+            return
+
+        if node_type == 'declaration':
+            # 物件定義(global / ops table / function pointer)。函式原型排除。
+            self._extract_declaration_objects(node, lines, symbols, qualified_prefix)
+            # 不 return:`struct S { ... } inst;` 的 struct 本體仍要走下面的遞迴。
+
+        if node_type in ('class_specifier', 'struct_specifier', 'union_specifier'):
             name_node = node.child_by_field_name('name')
-            if name_node:
+            # 只有帶 body 才是 type definition。`struct driver_ops;`(forward tag)
+            # 與 `struct driver_ops *p;` 裡的型別**引用**都不是定義 —— 舊版把
+            # 兩者都當 struct definition,是 §3 洞 1b 的假定義來源。
+            has_body = node.child_by_field_name('body') is not None or any(
+                child.type == 'field_declaration_list' for child in node.children
+            )
+            if name_node and has_body:
                 name = name_node.text.decode('utf-8')
-                sym_type = 'class' if node_type == 'class_specifier' else 'struct'
+                sym_type = {
+                    'class_specifier': 'class',
+                    'struct_specifier': 'struct',
+                    'union_specifier': 'union',
+                }[node_type]
                 symbols.append(self._make_symbol(
                     node, lines, name, sym_type,
                     qualified_name=f"{qualified_prefix}{name}",
+                    condition=self._preprocessor_condition(node),
                 ))
                 # 顯式走完 body 後 return(§6.2-1):否則尾端的泛型遞迴會把
                 # body 再走一次,class 內每個 method 都輸出兩份(一份 method、
@@ -523,6 +608,10 @@ class TreeSitterParser:
                             child, lines, symbols, name, f"{qualified_prefix}{name}::"
                         )
                 return
+            if not has_body:
+                # forward tag declaration 或型別引用:沒有 body 就沒有定義,
+                # 底下也沒有東西可遞迴。
+                return
             # 匿名 class/struct:自身不成符號,fall through 讓泛型遞迴進 body
 
         elif node_type == 'function_definition':
@@ -531,11 +620,13 @@ class TreeSitterParser:
                 name = self._get_cpp_function_name(declarator)
                 if name:
                     sym_type = 'method' if parent_name else 'function'
+                    storage, _quals = self._declaration_specifiers(node)
                     symbols.append(self._make_symbol(
                         node, lines, name, sym_type, parent_name,
                         qualified_name=f"{qualified_prefix}{name}",
                         linkage=self._cpp_function_linkage(node),
                         condition=self._preprocessor_condition(node),
+                        storage_class=" ".join(sorted(storage)) or None,
                     ))
 
         elif node_type == 'namespace_definition':
@@ -565,6 +656,266 @@ class TreeSitterParser:
         # 遞迴
         for child in node.children:
             self._extract_cpp_symbols(child, lines, symbols, parent_name, qualified_prefix)
+
+    # ------------------------------------------------------------
+    # leading comment association(施工規格 §6 P3A-2)
+    # ------------------------------------------------------------
+    @staticmethod
+    def _leading_comment(node, lines: list) -> Optional[str]:
+        """緊貼在定義**上方**、同一 scope 的註解區塊。
+
+        C 的 ``/** ... */`` 寫在定義行之上,而 context 是從定義行**往下**取 ——
+        結構上永遠拿不到。這裡從 node 的前一個同層 sibling 往回收。
+
+        邊界(四條都必要,少一條就會掛錯東西):
+          * **同 scope**:只走 sibling,不跨父節點。定義包在 ``#if`` 裡而註解在
+            外面時,兩者不是 sibling,自然不會被撈進來。
+          * **不跨空行**:中間有空行就停 —— 那通常是上一個 symbol 的尾註。
+          * **不跨 preprocessor / 其他節點**:sibling 不是 comment 就停。
+          * **不吃檔頭 license**:檔案第一個節點又長得像版權標頭就跳過。
+        """
+        collected: list = []
+        current = node
+        while True:
+            previous = current.prev_named_sibling
+            if previous is None or previous.type != "comment":
+                break
+            # 註解結尾與下一個節點開頭之間不得有空行。
+            if current.start_point[0] - previous.end_point[0] > 1:
+                break
+            if previous.prev_named_sibling is None:
+                text = previous.text.decode("utf-8", errors="replace").lower()
+                if any(marker in text for marker in _FILE_HEADER_MARKERS):
+                    break
+            collected.append(previous)
+            current = previous
+
+        if not collected:
+            return None
+        collected.reverse()
+        start = collected[0].start_point[0]
+        end = collected[-1].end_point[0]
+        if end - start + 1 > MAX_LEADING_COMMENT_LINES:
+            start = end - MAX_LEADING_COMMENT_LINES + 1
+        block = "\n".join(lines[start:end + 1])
+        return " ".join(block.split()) or None
+
+    # ------------------------------------------------------------
+    # C/C++ definition 語意(施工規格 §6 P2-2)
+    # ------------------------------------------------------------
+    @staticmethod
+    def _is_translation_unit_scope(node) -> bool:
+        """只有 translation-unit / namespace scope(含 preprocessor wrapper)算數。
+
+        function-local 變數、struct/class member、parameter 一律不是定義候選。
+        """
+        current = node.parent
+        while current is not None:
+            if current.type not in _TU_SCOPE_ANCESTORS:
+                return False
+            current = current.parent
+        return True
+
+    @staticmethod
+    def _declaration_specifiers(node) -> tuple[set, set]:
+        """從宣告節點取 storage-class specifier 與 type qualifier 的原文。"""
+        storage: set = set()
+        qualifiers: set = set()
+        for child in node.children:
+            text = child.text.decode('utf-8', errors='replace').strip()
+            if child.type == 'storage_class_specifier':
+                storage.add(text)
+            elif child.type == 'type_qualifier':
+                qualifiers.add(text)
+        return storage, qualifiers
+
+    @classmethod
+    def _declarator_name(cls, node) -> tuple:
+        """展開 declarator,回傳 (name, shape)。
+
+        shape:
+          ``object``              一般物件(含 pointer / array)
+          ``function_prototype``  ``int f(int);`` —— 宣告,不是定義,要排除
+          ``function_pointer``    ``int (*handler)(int);`` —— 是**物件**定義,
+                                  韌體的 ops table / callback slot 正是這一類
+        """
+        if node is None:
+            return None, 'object'
+        node_type = node.type
+        if node_type in ('identifier', 'type_identifier', 'field_identifier',
+                         'qualified_identifier', 'primitive_type'):
+            return node.text.decode('utf-8', errors='replace'), 'object'
+        if node_type == 'init_declarator':
+            # 有 initializer 一定是定義,即使外面掛了 extern。
+            name, _shape = cls._declarator_name(node.child_by_field_name('declarator'))
+            return name, 'object'
+        if node_type in ('pointer_declarator', 'array_declarator',
+                         'reference_declarator'):
+            return cls._declarator_name(node.child_by_field_name('declarator'))
+        if node_type == 'parenthesized_declarator':
+            for child in node.named_children:
+                name, shape = cls._declarator_name(child)
+                if name:
+                    return name, shape
+            return None, 'object'
+        if node_type == 'function_declarator':
+            inner = node.child_by_field_name('declarator')
+            if inner is None:
+                return None, 'object'
+            name, _shape = cls._declarator_name(inner)
+            if inner.type == 'parenthesized_declarator':
+                return name, 'function_pointer'
+            return name, 'function_prototype'
+        return None, 'object'
+
+    def _object_linkage(self, node, storage: set, qualifiers: set) -> str:
+        """物件(非函式)的 linkage。C 精確;C++ 證明不了就 unknown,不猜 external。"""
+        if 'static' in storage:
+            return 'internal'
+        current = node.parent
+        while current is not None:
+            if (current.type == 'namespace_definition'
+                    and current.child_by_field_name('name') is None):
+                return 'internal'
+            if current.type in ('template_declaration', 'template_instantiation'):
+                # template 內的 linkage 牽涉 instantiation 規則,證明不了。
+                return 'unknown'
+            current = current.parent
+        if 'extern' in storage:
+            return 'external'
+        if self.language_name == 'c':
+            # C:file-scope 無 static 即 external(tentative definition 也是)。
+            return 'external'
+        # C++:namespace-scope 的 non-volatile const / constexpr 預設 internal
+        # linkage —— 「非 static 就是 external」在 C++ 是錯的。
+        if 'inline' in storage or 'inline' in qualifiers:
+            return 'external'
+        const_like = ('const' in qualifiers or 'constexpr' in qualifiers
+                      or 'constexpr' in storage)
+        if const_like and 'volatile' not in qualifiers:
+            return 'internal'
+        if storage - {'extern', 'static', 'inline'}:
+            # thread_local / mutable / 其他沒建模的 specifier:不猜。
+            return 'unknown'
+        return 'external'
+
+    def _extract_macro(self, node, lines: list, symbols: list,
+                       qualified_prefix: str) -> None:
+        name_node = node.child_by_field_name('name')
+        if not name_node:
+            return
+        name = name_node.text.decode('utf-8', errors='replace')
+        kind = (CPP_MACRO_FUNCTION_KIND if node.type == 'preproc_function_def'
+                else CPP_MACRO_KIND)
+        symbols.append(self._make_symbol(
+            node, lines, name, kind,
+            qualified_name=f"{qualified_prefix}{name}",
+            condition=self._preprocessor_condition(node),
+        ))
+
+    def _extract_enum(self, node, lines: list, symbols: list,
+                      qualified_prefix: str, alias: Optional[str]) -> None:
+        """enum 定義 + 每個 enumerator。
+
+        匿名 enum 帶 typedef alias 時用 alias 當 enum 名(``typedef enum {..}
+        state_t;``);完全匿名時不造假名字,enumerator 的 parent 明確設 None。
+        """
+        if not self._is_translation_unit_scope(node):
+            return
+        body = node.child_by_field_name('body') or next(
+            (child for child in node.children if child.type == 'enumerator_list'), None
+        )
+        if body is None:
+            return  # `enum color c;` 的型別引用,不是定義
+        name_node = node.child_by_field_name('name')
+        enum_name = name_node.text.decode('utf-8', errors='replace') if name_node else alias
+        condition = self._preprocessor_condition(node)
+        if enum_name:
+            symbols.append(self._make_symbol(
+                node, lines, enum_name, CPP_ENUM_KIND,
+                qualified_name=f"{qualified_prefix}{enum_name}",
+                condition=condition,
+            ))
+        for child in body.named_children:
+            if child.type != 'enumerator':
+                continue
+            enumerator_name_node = child.child_by_field_name('name') or next(
+                (grand for grand in child.children if grand.type == 'identifier'), None
+            )
+            if enumerator_name_node is None:
+                continue
+            enumerator_name = enumerator_name_node.text.decode('utf-8', errors='replace')
+            symbols.append(self._make_symbol(
+                child, lines, enumerator_name, CPP_ENUM_CONSTANT_KIND,
+                parent=enum_name,
+                qualified_name=f"{qualified_prefix}{enumerator_name}",
+                condition=condition,
+            ))
+
+    def _extract_typedef(self, node, lines: list, symbols: list,
+                         parent_name: Optional[str], qualified_prefix: str) -> None:
+        """typedef:**每個 declarator 都是一個 typedef**,不是只取第一個。"""
+        if not self._is_translation_unit_scope(node):
+            return
+        condition = self._preprocessor_condition(node)
+        names: list[str] = []
+        for declarator in node.children_by_field_name('declarator'):
+            name, _shape = self._declarator_name(declarator)
+            if not name:
+                continue
+            names.append(name)
+            symbols.append(self._make_symbol(
+                node, lines, name, CPP_TYPEDEF_KIND,
+                qualified_name=f"{qualified_prefix}{name}",
+                condition=condition,
+                anchor_node=declarator,
+            ))
+
+        # typedef 內嵌的型別定義自己也要進索引;走完就不再讓泛型遞迴重複處理。
+        alias = names[0] if names else None
+        for child in node.children:
+            if child.type == 'enum_specifier':
+                self._extract_enum(child, lines, symbols, qualified_prefix, alias)
+            elif child.type in ('struct_specifier', 'union_specifier',
+                                'class_specifier'):
+                self._extract_cpp_symbols(
+                    child, lines, symbols, parent_name, qualified_prefix
+                )
+
+    def _extract_declaration_objects(self, node, lines: list, symbols: list,
+                                     qualified_prefix: str) -> None:
+        """translation-unit / namespace scope 的物件定義,逐 declarator 產生。
+
+        規則(§6 P2-2):
+          ``uint32_t g_error_counter;``      1 個 global(C tentative definition)
+          ``static int a, *b;``              2 個 internal-linkage definition
+          ``extern int only_declared;``      0 個(純宣告)
+          ``extern int defined_here = 1;``   1 個(有 initializer)
+          ``int prototype_only(int);``       0 個(函式原型)
+          ``static int (*handler)(int);``    1 個(function pointer 是物件)
+        """
+        if not self._is_translation_unit_scope(node):
+            return
+        storage, qualifiers = self._declaration_specifiers(node)
+        linkage = self._object_linkage(node, storage, qualifiers)
+        condition = self._preprocessor_condition(node)
+        storage_text = " ".join(sorted(storage)) or None
+
+        for declarator in node.children_by_field_name('declarator'):
+            name, shape = self._declarator_name(declarator)
+            if not name or shape == 'function_prototype':
+                continue
+            has_initializer = declarator.type == 'init_declarator'
+            if 'extern' in storage and not has_initializer:
+                continue  # 純宣告:別的 translation unit 才有定義
+            symbols.append(self._make_symbol(
+                node, lines, name, CPP_GLOBAL_KIND,
+                qualified_name=f"{qualified_prefix}{name}",
+                linkage=linkage,
+                condition=condition,
+                storage_class=storage_text,
+                anchor_node=declarator,
+            ))
 
     def _get_cpp_function_name(self, declarator) -> Optional[str]:
         """從 declarator 中提取函式名"""
@@ -738,16 +1089,24 @@ class TreeSitterParser:
 
     def _make_symbol(self, node, lines: list, name: str, sym_type: str, parent: str = None,
                      qualified_name: str = None, linkage: str = None,
-                     condition: str = None) -> Symbol:
-        """建立 Symbol 物件"""
-        start_line = node.start_point[0] + 1  # 轉為 1-based
-        end_line = node.end_point[0] + 1
+                     condition: str = None, storage_class: str = None,
+                     anchor_node=None) -> Symbol:
+        """建立 Symbol 物件
+
+        ``anchor_node`` 讓 multi-declarator 的每個 symbol 指到自己的 declarator
+        行號,而 context / signature 仍取自整條宣告(``node``)。
+        """
+        anchor = anchor_node if anchor_node is not None else node
+        start_line = anchor.start_point[0] + 1  # 轉為 1-based
+        end_line = max(anchor.end_point[0] + 1, start_line)
 
         # 取得 context:與 _get_context 同一契約 —— 以 end_line 截斷,
         # 短符號的 context 不得吃到下一個符號。
-        start_idx = start_line - 1
+        context_start = node.start_point[0] + 1
+        context_stop = max(node.end_point[0] + 1, context_start)
+        start_idx = context_start - 1
         max_lines = 15
-        context_end = min(start_idx + max_lines, end_line, len(lines))
+        context_end = min(start_idx + max_lines, context_stop, len(lines))
         context_end = max(context_end, start_idx + 1)
         context = '\n'.join(lines[start_idx:context_end])
 
@@ -760,6 +1119,7 @@ class TreeSitterParser:
         signature = ' '.join(signature.split()).strip()[:300] or None
 
         return Symbol(
+            comments=self._leading_comment(node, lines),
             name=name,
             type=sym_type,
             start_line=start_line,
@@ -770,6 +1130,7 @@ class TreeSitterParser:
             qualified_name=qualified_name,
             linkage=linkage,
             condition=condition,
+            storage_class=storage_class,
         )
 
 

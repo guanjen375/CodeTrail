@@ -37,22 +37,52 @@ from config import (
     LLAMA_EMBED_BASE_URL, LLAMA_RERANK_BASE_URL,
     USE_RERANKER, RERANKER_MODEL, RERANKER_ALWAYS_ON
 )
+import file_kind_policy
 import fs_safety
 import llama_client
 from index_scope import load_index_scope, walk_index_files
 
 # 導入 AST 解析器
-from ast_parser import parse_file, get_parser_status
+from ast_parser import PARSER_SEMANTICS_VERSION, parse_file, get_parser_status
 
 # Cache schema 版本。v2(2026-08-19):generation 欄位(generation_id/npz_md5/
 # row_count)+ index entry 的 qualified_name/backend(§5-2 與 §6.2-6 合併一次
 # bump,只重建一次)。schema 不符 → stderr 說明 + 安全重建。
-CODE_RAG_CACHE_SCHEMA_VERSION = 2
+# v3(P2):index entry 多了 linkage / condition / storage_class,而且 symbol
+# 集合本身因 parser semantics v2 而改變(macro/typedef/enum/global 進索引、
+# 假 struct definition 消失)。舊 cache 會變混血索引,一律重建一次。
+CODE_RAG_CACHE_SCHEMA_VERSION = 3
 
-# 無 parser 的副檔名不入 symbol 掃描(§5-5):.txt/.md 沒有任何 symbol parser,
-# 進索引只產生零 symbol 的掃描 / hash 成本。刻意不動 CODE_EXTENSIONS ——
-# grep_code / list_dir 的可見範圍不變。
-CODE_RAG_SKIP_EXTENSIONS = frozenset({".txt", ".md"})
+# Hybrid scorer 的語意版本。改 hybrid_symbol_score / select_scored_candidates
+# 的任何權重、bonus、override 或 cutoff 規則就要 bump。
+#
+# 版本消費矩陣(施工規格 §6 P2-5):
+#   - CodeRAG cache:**否**。scorer 是 query-local 的,不寫進 cache。
+#   - CodeGraph fingerprint:**否**。
+#   - eval vector manifest / baseline report:**是**。lane 分數換演算法後
+#     舊 baseline 不可比。
+RETRIEVAL_SCORER_VERSION = 1
+
+# Embed text 的 schema 版本。_build_embed_text 的欄位集合、順序或 budget 一改
+# 就要 bump —— 增量重建只比 file_hash,改 render 不會自動讓舊向量失效。
+#
+# 版本消費矩陣(施工規格 §6 P2-5):
+#   - CodeRAG cache:**是**(舊向量是用舊 render 算的)
+#   - CodeGraph fingerprint:**否**(graph 不吃 embed text)
+#   - eval vector manifest:**是**
+#
+# v1:path / type / symbol / parent / signature / docstring / type_hints /
+#     context,context 吃 400 - used_len 的剩餘預算。
+# v2(P3A):canonical field ordering(含 leading comment、linkage、condition),
+#          三個消費者共用同一組欄位、各自獨立預算。
+EMBED_TEXT_SCHEMA_VERSION = 2
+
+# 無 parser 的檔案不入 symbol 掃描(§5-5):.txt/.md 以及 P3B 新增的
+# .S/.ld/.dts/Makefile/Kconfig 都沒有 symbol parser,進索引只產生零 symbol 的
+# 掃描 / hash 成本。刻意不動 CODE_EXTENSIONS —— grep_code / list_dir 的可見
+# 範圍不變(Level 1 承諾的正是「全文搜得到」而不是「進 dense retrieval」)。
+# 判定改由 file_kind_policy 決定,清單不再各寫一份。
+CODE_RAG_SKIP_EXTENSIONS = file_kind_policy.SYMBOL_SCAN_SKIP_SUFFIXES
 
 # 索引專用的掃描快取。刻意**不**共用 utils 的 _SCAN_CACHE:那份是 agent.py 的
 # scan_project_metadata 在用,成員資格規則和索引不同,而且沒有 scope
@@ -146,6 +176,119 @@ class RankedCandidate:
     score_source: str  # "rerank" | "fusion"
 
 
+# Canonical 語意欄位順序(施工規格 §6 P3A-1)。**單一來源**:dense embed text、
+# lexical scorer、reranker passage 三個消費者都從這裡投影出自己的視角。
+#
+# 不共用一份的後果是無聲的:改了 embed text 而 lexical 還在掃舊 context,
+# 報表上只會看到「某條 lane 沒進步」,不會有人知道是它根本沒拿到那個欄位。
+# 三者**不必字串完全相同**,但不能有人看得到 comments、有人看不到。
+CANONICAL_SEMANTIC_FIELDS = (
+    "path", "type", "symbol", "parent", "signature",
+    "linkage", "condition", "comments", "docstring", "type_hints", "context",
+)
+
+
+def semantic_fields(item: dict) -> list[tuple[str, str]]:
+    """把 index entry 投影成 (label, text) 的 canonical 有序欄位。
+
+    label 空字串代表「直接放值、不加前綴」(path / kind / symbol 這類本身就是
+    識別資訊的欄位)。
+    """
+    fields: list[tuple[str, str]] = []
+
+    def push(label: str, value) -> None:
+        text = str(value or "").strip()
+        if text:
+            fields.append((label, text))
+
+    push("", item.get("path"))
+    push("", item.get("type"))
+    push("", item.get("symbol"))
+    if item.get("parent"):
+        push("in", item["parent"])
+    push("", item.get("signature"))
+    push("linkage:", item.get("linkage"))
+    push("condition:", item.get("condition"))
+    push("", item.get("comments"))
+    push("", item.get("docstring"))
+    push("types:", item.get("type_hints"))
+    push("", item.get("context"))
+    return fields
+
+
+def render_semantic_fields(item: dict, max_chars: int) -> str:
+    """依 canonical 順序組字串,超出預算就從尾端欄位開始截。
+
+    尾端是 context —— 最長也最可再生的欄位;symbol / signature / comments 這些
+    高密度的識別資訊排在前面,先被保住。
+    """
+    parts: list[str] = []
+    used = 0
+    for label, text in semantic_fields(item):
+        chunk = f"{label} {text}" if label else text
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        if len(chunk) > remaining:
+            chunk = chunk[:remaining]
+        parts.append(chunk)
+        used += len(chunk) + 1
+    return " ".join(parts)
+
+
+def lexical_scan_text(item: dict, max_chars: int) -> str:
+    """lexical scorer 掃描的文字:同一組 canonical 欄位,自己的預算。"""
+    return render_semantic_fields(item, max_chars)
+
+
+def hybrid_symbol_score(*, emb_score: float, kw_score: float, item_type: str,
+                        is_explicit_mention: bool,
+                        code_token_count: int) -> tuple[float, str]:
+    """Production 的 hybrid 融合分數。純函式,無 self / 無 I/O。
+
+    抽出來的理由(施工規格 §6 P1A-2):evaluator 的 ``runtime_hybrid`` lane
+    必須跑**同一份** production scoring,否則量到的是另一條演算法。這裡不是
+    RRF —— cosine + lexical + explicit-symbol override + type bonus 是四個
+    不同機制,RRF 只能當獨立的診斷 lane。
+
+    回傳 (combined_score, score_rule);score_rule 供 eval lane metadata 揭露
+    是哪條規則決定名次。
+    """
+    if is_explicit_mention:
+        # 明確點名:直接給很高分,即使 embedding 不太像
+        return 0.95, "explicit_symbol"
+    if kw_score >= 0.8 and code_token_count >= 2:
+        # 高 kw_score 但需要至少 2 個 code_tokens,避免短 query 誤判
+        return 0.9 + kw_score * 0.1, "lexical_dominant"
+    # 一般情況:function 類型給一點優先權
+    type_bonus = 0.05 if item_type == 'function' else 0.0
+    return 0.5 * emb_score + 0.5 * kw_score + type_bonus, "fusion"
+
+
+def select_scored_candidates(scores: list, *, threshold: float, top_k: int,
+                             is_short_query: bool, code_tokens_lower: set) -> list:
+    """Production 的門檻篩選 + candidate cutoff。純函式,無 self / 無 I/O。
+
+    scores 是已排序的 [(combined, emb_score, kw_score, item), ...]。
+    evaluator 的 runtime_hybrid lane 重用它,才會連 cutoff 行為都一致。
+    """
+    selected = []
+    for combined, emb_score, kw_score, item in scores:
+        if is_short_query:
+            symbol_lower = item.get("symbol", "").lower()
+            is_explicit = symbol_lower in code_tokens_lower
+            if combined >= threshold or is_explicit:
+                selected.append((combined, emb_score, kw_score, item))
+        else:
+            if combined >= threshold or kw_score >= 0.85:
+                selected.append((combined, emb_score, kw_score, item))
+
+        # 收集足夠的候選後停止（rerank 用）
+        if len(selected) >= top_k * 3:
+            break
+    return selected
+
+
 @lru_cache(maxsize=256)
 def _cached_get_embedding(text: str) -> tuple:
     """帶 LRU cache 的 embedding 查詢(CodeRAG 用,走 llama-server /embedding)。"""
@@ -236,8 +379,8 @@ class CodeRAG:
 
         result = {}
         for filepath, rel_path in walk_index_files(self.scope):
-            # §5-5:無 parser 的副檔名不入 symbol 掃描(grep/list_dir 不受影響)
-            if Path(rel_path).suffix.lower() in CODE_RAG_SKIP_EXTENSIONS:
+            # §5-5:無 parser 的檔案不入 symbol 掃描(grep/list_dir 不受影響)
+            if not file_kind_policy.enters_symbol_scan(rel_path):
                 continue
             file_hash = self._compute_file_hash(filepath)
             if file_hash:
@@ -287,6 +430,21 @@ class CodeRAG:
         if meta.get("embedding_model") != EMBEDDING_MODEL:
             print("[CODE_RAG] cache embedding_model 與現行設定不符,安全重建",
                   file=sys.stderr)
+            return {}
+
+        # 版本消費矩陣(§6 P2-5):parser semantics 決定 symbol 集合、
+        # embed-text schema 決定向量內容。增量重建只比 file_hash,這兩個
+        # 版本一動舊 cache 就是錯的,而且錯得無聲 —— 必須在這裡擋掉。
+        if meta.get("parser_semantics_version") != PARSER_SEMANTICS_VERSION:
+            print(f"[CODE_RAG] cache parser_semantics_version "
+                  f"{meta.get('parser_semantics_version')!r} != "
+                  f"{PARSER_SEMANTICS_VERSION},安全重建", file=sys.stderr)
+            return {}
+
+        if meta.get("embed_text_schema_version") != EMBED_TEXT_SCHEMA_VERSION:
+            print(f"[CODE_RAG] cache embed_text_schema_version "
+                  f"{meta.get('embed_text_schema_version')!r} != "
+                  f"{EMBED_TEXT_SCHEMA_VERSION},安全重建", file=sys.stderr)
             return {}
 
         # 世代一致性:meta 記錄的 npz_md5 必須與磁碟上的 NPZ 相符。
@@ -382,6 +540,8 @@ class CodeRAG:
                 "schema_version": CODE_RAG_CACHE_SCHEMA_VERSION,
                 "generation_id": uuid.uuid4().hex,
                 "embedding_model": EMBEDDING_MODEL,
+                "parser_semantics_version": PARSER_SEMANTICS_VERSION,
+                "embed_text_schema_version": EMBED_TEXT_SCHEMA_VERSION,
                 "scope_fingerprint": self.scope.fingerprint,
                 "embedding_dim": emb_dim,
                 "npz_md5": npz_md5,
@@ -433,7 +593,9 @@ class CodeRAG:
                 'type': sym.type,
                 'line': sym.start_line,
                 'end_line': sym.end_line,  # 新增：符號結束行
-                'context': sym.context[:500],
+                # 儲存端上限。這是最上游的截斷:比下游任何預算小的話,
+                # 下游放大都是 no-op(§3 洞 2)。
+                'context': sym.context[:config.CODE_RAG_CONTEXT_STORE_MAX_CHARS],
                 # graph 前置(§6.2-6):stable ID 與 evidence 揭露依賴這兩欄。
                 # 只進 index entry / cache;預設回傳 shape 不出現(§8.1)。
                 'qualified_name': sym.qualified_name or sym.name,
@@ -449,6 +611,14 @@ class CodeRAG:
                 symbol_dict['docstring'] = sym.docstring[:300]
             if sym.type_hints:
                 symbol_dict['type_hints'] = sym.type_hints
+            # C/C++ definition metadata(§6 P2-4)。parser 算出來卻沒往下傳的話,
+            # retrieval 與 graph 都看不到,「parser 支援」等於沒發生。
+            if sym.comments:
+                symbol_dict['comments'] = sym.comments[:config.CODE_RAG_COMMENT_MAX_CHARS]
+            for field in ('linkage', 'condition', 'storage_class'):
+                value = getattr(sym, field, None)
+                if value:
+                    symbol_dict[field] = value
 
             symbols.append(symbol_dict)
 
@@ -494,42 +664,14 @@ class CodeRAG:
         return out  # plan_embed_batches 覆蓋每個 index,不會留 None
 
     def _build_embed_text(self, item: dict) -> str:
-        """Build embed text from a symbol/item dict.
+        """Dense embedding 的 document text(消費者之一,§6 P3A-1)。
 
-        P0 改進：擴充 embedding 內容（signature, docstring, type_hints, parent）
+        欄位集合與順序來自 CANONICAL_SEMANTIC_FIELDS —— 與 lexical scorer、
+        reranker passage 同一份;預算是自己的 CODE_RAG_EMBED_TEXT_MAX_CHARS。
+        改這裡的欄位或預算都要 bump EMBED_TEXT_SCHEMA_VERSION,否則舊向量
+        會被增量重建靜默沿用(它只比 file_hash)。
         """
-        parts = []
-
-        # 基本資訊
-        parts.append(item.get('path', ''))
-        parts.append(item.get('type', ''))
-        parts.append(item.get('symbol', ''))
-
-        # P0 改進：加入 parent（類別/繼承）
-        if item.get('parent'):
-            parts.append(f"in {item['parent']}")
-
-        # P0 改進：加入 signature（函式簽名，優先於 context）
-        if item.get('signature'):
-            parts.append(item['signature'])
-
-        # P0 改進：加入 docstring（截取前 200 字元）
-        if item.get('docstring'):
-            parts.append(item['docstring'][:200])
-
-        # P0 改進：加入 type hints
-        if item.get('type_hints'):
-            parts.append(f"types: {item['type_hints']}")
-
-        # Context（補充剩餘空間）
-        context = item.get('context', '')
-        # 計算已用長度，調整 context 截取
-        used_len = sum(len(p) for p in parts)
-        max_context = max(100, 400 - used_len)
-        if context:
-            parts.append(context[:max_context])
-
-        return ' '.join(parts)
+        return render_semantic_fields(item, config.CODE_RAG_EMBED_TEXT_MAX_CHARS)
 
     def _index_single_file(self, filepath: Path, rel_path: str,
                            compute_embeddings: bool = True) -> tuple:
@@ -549,7 +691,7 @@ class CodeRAG:
                 'symbol': sym['symbol'],
                 'type': sym['type'],
                 'line': sym['line'],
-                'context': sym['context'][:500],
+                'context': sym['context'][:config.CODE_RAG_CONTEXT_STORE_MAX_CHARS],
                 'qualified_name': sym.get('qualified_name', sym['symbol']),
                 'backend': sym.get('backend', 'unknown'),
             }
@@ -564,6 +706,9 @@ class CodeRAG:
                 index_entry['docstring'] = sym['docstring'][:300]
             if 'type_hints' in sym and sym['type_hints']:
                 index_entry['type_hints'] = sym['type_hints']
+            for field in ('comments', 'linkage', 'condition', 'storage_class'):
+                if sym.get(field):
+                    index_entry[field] = sym[field]
 
             file_symbols.append(index_entry)
             file_embeddings.append(emb)
@@ -923,7 +1068,6 @@ class CodeRAG:
 
         symbol = item.get("symbol", "")
         path = item.get("path", "")
-        context = item.get("context", "")
 
         # 將 symbol 和 path 分解為 tokens
         target_tokens = self._tokenize_identifier(symbol)
@@ -931,10 +1075,13 @@ class CodeRAG:
         path_name = Path(path).stem if path else ""
         target_tokens.update(self._tokenize_identifier(path_name))
 
-        # 從 context 中提取 identifier tokens（限制數量避免太多雜訊）
+        # 掃 canonical 欄位而不是只掃 context(§6 P3A-1):leading comment 只放在
+        # 獨立欄位的話,lexical lane 會完全看不到註解訊號 —— 而那條 lane 沒進步
+        # 的原因不會出現在任何報表上。
+        scan_text = lexical_scan_text(item, config.CODE_RAG_LEXICAL_SCAN_MAX_CHARS)
         context_tokens = set()
-        context_identifiers = re.findall(r'[A-Za-z_][A-Za-z0-9_]{2,}', context[:500])
-        for ident in context_identifiers[:30]:  # 最多取 30 個 identifier
+        context_identifiers = re.findall(r'[A-Za-z_][A-Za-z0-9_]{2,}', scan_text)
+        for ident in context_identifiers[:config.CODE_RAG_LEXICAL_MAX_IDENTIFIERS]:
             context_tokens.update(self._tokenize_identifier(ident))
 
         # 計算 token 級別的精確匹配
@@ -1068,11 +1215,17 @@ class CodeRAG:
                 for combined, emb_score, kw_score, item in items:
                     symbol = item.get('symbol', '')
                     path = item.get('path', '')
-                    context = item.get('context', '')[:config.CODE_RERANK_PASSAGE_MAX_CHARS]
                     parent_info = f" in {item.get('parent', '')}" if item.get('parent') else ""
                     sym_type = item.get('type', 'function')
+                    # 同一組 canonical 欄位,但 cross-encoder 有自己的預算 ——
+                    # header 已經帶了 symbol/path,body 只補其餘欄位。
+                    body = render_semantic_fields(
+                        {k: v for k, v in item.items()
+                         if k not in ('path', 'type', 'symbol', 'parent')},
+                        config.CODE_RERANK_PASSAGE_MAX_CHARS,
+                    )
                     passages.append(
-                        f"{sym_type} {symbol}{parent_info}\nFile: {path}\n{context}"
+                        f"{sym_type} {symbol}{parent_info}\nFile: {path}\n{body}"
                     )
 
                 scores = llama_client.rerank(
@@ -1230,16 +1383,13 @@ class CodeRAG:
             symbol_lower = symbol.lower()
             is_explicit_mention = symbol_lower in code_tokens_lower
 
-            if is_explicit_mention:
-                # 明確點名：直接給很高分，即使 embedding 不太像
-                combined = 0.95
-            elif kw_score >= 0.8 and len(code_tokens) >= 2:
-                # 高 kw_score 但需要至少 2 個 code_tokens，避免短 query 誤判
-                combined = 0.9 + kw_score * 0.1
-            else:
-                # 一般情況：function 類型給一點優先權
-                type_bonus = 0.05 if item.get('type') == 'function' else 0
-                combined = 0.5 * emb_score + 0.5 * kw_score + type_bonus
+            combined, _rule = hybrid_symbol_score(
+                emb_score=emb_score,
+                kw_score=kw_score,
+                item_type=item.get('type', ''),
+                is_explicit_mention=is_explicit_mention,
+                code_token_count=len(code_tokens),
+            )
 
             scores.append((combined, emb_score, kw_score, item))
 
@@ -1250,20 +1400,13 @@ class CodeRAG:
         is_short_query = len(code_tokens) <= 2
 
         # 先做初步過濾（門檻篩選）
-        candidates_for_rerank = []
-        for combined, emb_score, kw_score, item in scores:
-            if is_short_query:
-                symbol_lower = item.get("symbol", "").lower()
-                is_explicit = any(t.lower() == symbol_lower for t in code_tokens)
-                if combined >= threshold or is_explicit:
-                    candidates_for_rerank.append((combined, emb_score, kw_score, item))
-            else:
-                if combined >= threshold or kw_score >= 0.85:
-                    candidates_for_rerank.append((combined, emb_score, kw_score, item))
-
-            # 收集足夠的候選後停止（rerank 用）
-            if len(candidates_for_rerank) >= top_k * 3:
-                break
+        candidates_for_rerank = select_scored_candidates(
+            scores,
+            threshold=threshold,
+            top_k=top_k,
+            is_short_query=is_short_query,
+            code_tokens_lower=code_tokens_lower,
+        )
 
         # 使用 reranker 二次排序（條件觸發)。分數是 query-local 的
         # RankedCandidate(§5-1),絕不寫回 self.index 的持久 item。

@@ -299,19 +299,15 @@ SKELETON_MAX_LINES = 200
 # ============================================================
 # 檔案過濾設定
 # ============================================================
-CODE_EXTENSIONS = {
-    ".cpp", ".c", ".h", ".hpp", ".hh", ".hxx", ".cc", ".cxx",
-    ".py", ".pyx", ".pyi",
-    ".json", ".yaml", ".yml", ".toml",
-    ".sh", ".bash", ".mk", ".cmake",
-    ".tcl", ".cfg", ".ini", ".conf",
-    ".rs", ".go", ".java", ".kt",
-    ".js", ".ts", ".jsx", ".tsx",
-    ".txt", ".md",
-}
+import file_kind_policy as _file_kind_policy  # noqa: E402
+# 兩份清單都由 file_kind_policy 產生(施工規格 §6 P3B)。以前是兩份手寫清單,
+# 而且已經漂了:grep 那份比索引窄,連 .cc / .cxx / .pyi / .mk / .cmake / .tcl
+# 這些既有格式都搜不到。單一 policy、多 consumer 投影就不會再漂。
+CODE_EXTENSIONS = set(_file_kind_policy.INDEX_SUFFIXES)
 
-# grep 預設搜尋的檔案類型（避免掃到圖片/大型二進位檔，提升效能）
-GREP_DEFAULT_EXTENSIONS = "*.py,*.c,*.cpp,*.h,*.hpp,*.hh,*.hxx,*.js,*.ts,*.jsx,*.tsx,*.go,*.rs,*.java,*.kt,*.sh,*.md,*.json,*.yaml,*.yml,*.toml"
+# grep 預設搜尋的檔案類型（避免掃到圖片/大型二進位檔，提升效能）。
+# glob 是 case-sensitive 的,policy 會同時產出 *.S 與 *.s。
+GREP_DEFAULT_EXTENSIONS = _file_kind_policy.grep_default_extensions()
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 # ============================================================
@@ -655,11 +651,47 @@ CODE_RAG_LAZY_EMBED_QUERY_TOP_K = 150   # 減少候選數量（優化：200->150
 # invalidate;外部編輯器在 TTL 窗內改檔屬既知取捨(docs/mcp-tools.md)。
 CODE_RAG_REFRESH_TTL_SECONDS = int(_os.environ.get("AICODE_CODE_RAG_REFRESH_TTL", "30"))
 
-# Code RAG rerank passage 上限(chars)。這是「誠實化」常數:context 在儲存時
-# 就被截到 500(index entry 的 context[:500]),再大的 slice 都是 no-op。
-# 要擴充 passage(例如 1200)必須同步動三個 producer(ast context 抽取、
-# index entry 截斷、這裡),屬後續輪,本輪維持 500。
-CODE_RERANK_PASSAGE_MAX_CHARS = 500
+# ============================================================
+# Code RAG 的語意表示式預算(施工規格 §6 P3A)
+# ============================================================
+# 三個消費者(dense embed text / lexical scorer / reranker passage)共用同一組
+# canonical 欄位,但**各有各的預算** —— 一條 8192-ctx 的 cross-encoder passage
+# 和一段要塞進 embedding 的短文字本來就不該同一個上限。
+#
+# 這裡不再是「誠實化的 no-op 常數」:index entry 的 context 儲存上限已經獨立
+# 出來(CODE_RAG_CONTEXT_STORE_MAX_CHARS),放大 passage 才真的有效果。
+# 動任何一個都要 bump code_rag.EMBED_TEXT_SCHEMA_VERSION,否則舊向量會被沿用。
+
+# index entry 儲存的 context 上限。這是**最上游**的截斷:它比下游任何預算小的
+# 話,下游放大都是 no-op(§3 洞 2 的原始病灶)。
+CODE_RAG_CONTEXT_STORE_MAX_CHARS = int(
+    _os.environ.get("AICODE_CODE_RAG_CONTEXT_STORE_MAX_CHARS", "1800")
+)
+
+# index entry 儲存的 leading comment 上限。
+CODE_RAG_COMMENT_MAX_CHARS = int(
+    _os.environ.get("AICODE_CODE_RAG_COMMENT_MAX_CHARS", "400")
+)
+
+# dense embedding document text 的總預算。
+CODE_RAG_EMBED_TEXT_MAX_CHARS = int(
+    _os.environ.get("AICODE_CODE_RAG_EMBED_TEXT_MAX_CHARS", "1200")
+)
+
+# lexical scorer 掃描的文字預算與 identifier 取樣上限。leading comment 只放在
+# 獨立欄位而 lexical lane 不掃的話,那條 lane 會完全看不到註解訊號。
+CODE_RAG_LEXICAL_SCAN_MAX_CHARS = int(
+    _os.environ.get("AICODE_CODE_RAG_LEXICAL_SCAN_MAX_CHARS", "1200")
+)
+CODE_RAG_LEXICAL_MAX_IDENTIFIERS = int(
+    _os.environ.get("AICODE_CODE_RAG_LEXICAL_MAX_IDENTIFIERS", "80")
+)
+
+# Code RAG rerank passage 上限(chars)。cross-encoder 吃得下比 embedding 更長的
+# passage,所以預算與 embed text 分開。
+CODE_RERANK_PASSAGE_MAX_CHARS = int(
+    _os.environ.get("AICODE_CODE_RERANK_PASSAGE_MAX_CHARS", "1800")
+)
 
 # 批次 embedding 的雙預算(/v1/embeddings 嚴格契約,§5-4):
 # 單一 HTTP batch 的筆數上限與總字元上限,兩者皆過才裝得下。

@@ -154,6 +154,39 @@ def test_declaration_is_not_a_definition():
     assert computes[0].start_line == 3
 
 
+@pytest.mark.smoke
+def test_struct_reference_is_not_a_definition():
+    """BUG REGRESSION:型別**引用**與 forward tag 被當成 struct definition。
+
+    重現(施工規格 §3 洞 1b):
+
+        struct nowhere_defined_ops;
+        extern struct nowhere_defined_ops g_ops;
+
+    修正前輸出 2 個 symbol,兩個都是 `struct nowhere_defined_ops` —— 一個來自
+    forward tag declaration,一個來自 extern 宣告裡的型別引用。兩者都不是定義,
+    而真正該被記錄的 file-scope 物件反而完全沒抽到。假定義是 precision 債:
+    檢索會把「這個 struct 定義在這裡」的錯誤證據餵給模型。
+    """
+    forward_only = (
+        "struct nowhere_defined_ops;\n"
+        "extern struct nowhere_defined_ops g_ops;\n"
+    )
+    assert _parse("a.c", forward_only) == [], (
+        "forward tag declaration 與 extern 宣告都不產生定義"
+    )
+
+    pointer_object = (
+        "struct referenced_ops;\n"
+        "static const struct referenced_ops *table;\n"
+    )
+    symbols = _parse("b.c", pointer_object)
+    assert [(sym.type, sym.name) for sym in symbols] == [("global", "table")], (
+        "型別引用不是 struct definition;真正的 file-scope 物件 table 才是"
+    )
+    assert symbols[0].linkage == "internal"
+
+
 def test_c_definition_linkage_and_preprocessor_condition_are_preserved():
     content = (
         "static int local_helper(void) { return 1; }\n"
@@ -299,3 +332,187 @@ def test_parser_status_reports_python_ast_and_ts_backends():
     for lang in ("go", "rust"):
         assert languages[lang] in ("tree-sitter", "regex-degraded")
     assert languages["java"] in ("ctags", "regex-degraded")
+
+
+# ============================================================
+# C/C++ definition 語意(施工規格 §6 P2-2)
+# 全部 NEW SILENT CONTRACT:壞掉不會有紅字,只會是索引裡少了東西 /
+# 多了假定義,而檢索品質的退步查不到源頭。
+# ============================================================
+@pytest.mark.smoke
+def test_firmware_top_level_entities_are_all_indexed():
+    """韌體 C 檔的暫存器位址、timeout、feature gate、狀態機、ops table、全域旗標。
+
+    修正前 11 個 top-level 實體只有 2 個進得了索引(而且那 2 個裡還有一個是
+    假的 struct 定義)。掉的正好是韌體 repo 最需要被檢索到的那一類。
+    """
+    content = (
+        "#define UART_BASE_ADDR 0x40001000\n"
+        "#define WDT_TIMEOUT_MS 500\n"
+        "#define LOG_ERR(fmt) log_write(2, fmt)\n"
+        "typedef struct { volatile uint32_t dr; } uart_regs_t;\n"
+        "typedef enum { STATE_IDLE = 0, STATE_BUSY = 1 } link_state_t;\n"
+        "struct driver_ops;\n"
+        "static const struct driver_ops uart_ops = {0};\n"
+        "uint32_t g_error_counter;\n"
+        "void uart_init(void) { }\n"
+        "int uart_send(const char *b) { return 0; }\n"
+    )
+    found = {(sym.type, sym.name) for sym in _parse("fw.c", content)}
+    assert found == {
+        ("macro", "UART_BASE_ADDR"),
+        ("macro", "WDT_TIMEOUT_MS"),
+        ("macro_function", "LOG_ERR"),
+        ("typedef", "uart_regs_t"),
+        ("typedef", "link_state_t"),
+        ("enum", "link_state_t"),
+        ("enum_constant", "STATE_IDLE"),
+        ("enum_constant", "STATE_BUSY"),
+        ("global", "uart_ops"),
+        ("global", "g_error_counter"),
+        ("function", "uart_init"),
+        ("function", "uart_send"),
+    }
+
+
+@pytest.mark.smoke
+def test_multi_declarator_globals_and_typedefs_each_produce_a_symbol():
+    """一條宣告有多個 declarator 時要逐一產生 symbol,不是只取第一個。"""
+    symbols = _parse(
+        "multi.c",
+        "typedef int count_t, *count_ptr_t;\n"
+        "static int a, *b, arr[4];\n",
+    )
+    assert [(sym.type, sym.name) for sym in symbols] == [
+        ("typedef", "count_t"),
+        ("typedef", "count_ptr_t"),
+        ("global", "a"),
+        ("global", "b"),
+        ("global", "arr"),
+    ]
+    assert all(sym.linkage == "internal" for sym in symbols if sym.type == "global")
+
+
+@pytest.mark.smoke
+def test_extern_without_initializer_is_declaration_but_with_one_is_definition():
+    """C 的 tentative definition / 純宣告 / extern+initializer 三者要分得開。"""
+    symbols = _parse(
+        "linkage.c",
+        "uint32_t g_error_counter;\n"      # tentative definition
+        "extern int only_declared;\n"      # 純宣告
+        "extern int defined_here = 1;\n",  # 有 initializer:是定義
+    )
+    assert [(sym.type, sym.name) for sym in symbols] == [
+        ("global", "g_error_counter"),
+        ("global", "defined_here"),
+    ]
+    assert symbols[0].linkage == "external"
+    assert symbols[1].storage_class == "extern"
+
+
+@pytest.mark.smoke
+def test_anonymous_typedef_enum_uses_the_alias_and_parents_its_enumerators():
+    """匿名 enum 不假設 AST 有 enum name;有 typedef alias 就用 alias。"""
+    symbols = _parse("e.c", "typedef enum { IDLE, BUSY } state_t;\n")
+    kinds = {(sym.type, sym.name, sym.parent) for sym in symbols}
+    assert kinds == {
+        ("typedef", "state_t", None),
+        ("enum", "state_t", None),
+        ("enum_constant", "IDLE", "state_t"),
+        ("enum_constant", "BUSY", "state_t"),
+    }
+
+    # 完全匿名(沒有 alias)時不得造假名字,enumerator 的 parent 明確是 None。
+    bare = _parse("e2.c", "enum { LONE_A, LONE_B };\n")
+    assert [(sym.type, sym.name, sym.parent) for sym in bare] == [
+        ("enum_constant", "LONE_A", None),
+        ("enum_constant", "LONE_B", None),
+    ]
+
+
+@pytest.mark.smoke
+def test_struct_and_class_need_a_body_to_be_a_type_definition():
+    """沒有 field_declaration_list 就不是型別定義,只是 forward tag 或引用。"""
+    assert _parse("s.c", "struct opaque_t;\nunion other_u;\nenum color_e;\n") == []
+    with_body = _parse("s2.c", "struct with_body { int x; };\n")
+    assert [(sym.type, sym.name) for sym in with_body] == [("struct", "with_body")]
+
+
+@pytest.mark.smoke
+def test_prototypes_members_locals_and_parameters_are_excluded():
+    """只處理 translation-unit / namespace scope 的定義。"""
+    symbols = _parse(
+        "scope.c",
+        "int prototype_only(int x);\n"
+        "struct holder { int member_field; };\n"
+        "void fn(int param) { int local_var; static int local_static; }\n",
+    )
+    names = {sym.name for sym in symbols}
+    assert names == {"holder", "fn"}
+    for excluded in ("prototype_only", "member_field", "param",
+                     "local_var", "local_static"):
+        assert excluded not in names
+
+
+@pytest.mark.smoke
+def test_function_pointer_object_is_a_global_not_a_prototype():
+    """`int (*handler)(int);` 是物件定義。韌體的 ops table / callback slot 靠這條。"""
+    symbols = _parse(
+        "ops.c",
+        "static int (*handler)(int);\n"
+        "static int (*const ops_table[4])(void);\n",
+    )
+    assert [(sym.type, sym.name) for sym in symbols] == [
+        ("global", "handler"),
+        ("global", "ops_table"),
+    ]
+
+
+@pytest.mark.smoke
+def test_cpp_object_linkage_narrows_instead_of_guessing_external():
+    """C++ namespace-scope const 是 internal;證明不了的標 unknown,不猜 external。"""
+    symbols = {
+        sym.name: sym
+        for sym in _parse(
+            "obj.cpp",
+            "const int kInternalConst = 5;\n"
+            "constexpr int kInternalConstexpr = 6;\n"
+            "extern const int kExternalConst = 7;\n"
+            "inline int kInlineVar = 8;\n"
+            "int kPlainExternal = 9;\n"
+            "volatile const int kVolatileConst = 11;\n"
+            "thread_local int kThreadLocal = 12;\n"
+            "namespace { int hidden_obj = 1; }\n",
+        )
+    }
+    assert symbols["kInternalConst"].linkage == "internal"
+    assert symbols["kInternalConstexpr"].linkage == "internal"
+    assert symbols["kExternalConst"].linkage == "external"
+    assert symbols["kInlineVar"].linkage == "external"
+    assert symbols["kPlainExternal"].linkage == "external"
+    # volatile 讓 const-implies-internal 的規則失效。
+    assert symbols["kVolatileConst"].linkage == "external"
+    assert symbols["kThreadLocal"].linkage == "unknown"
+    assert symbols["hidden_obj"].linkage == "internal"
+
+
+@pytest.mark.smoke
+def test_preprocessor_condition_is_kept_for_new_definition_kinds():
+    """#if 兩臂的同名 macro / global 都要保留各自的 condition,不得合併或丟失。"""
+    symbols = _parse(
+        "variant.c",
+        "#if defined(BOARD_ALPHA)\n"
+        "#define TIMEOUT_MS 100\n"
+        "static int variant_flag = 1;\n"
+        "#else\n"
+        "#define TIMEOUT_MS 200\n"
+        "static int variant_flag = 2;\n"
+        "#endif\n",
+    )
+    conditions = [(sym.type, sym.name, sym.condition) for sym in symbols]
+    assert conditions == [
+        ("macro", "TIMEOUT_MS", "#if defined(BOARD_ALPHA)"),
+        ("global", "variant_flag", "#if defined(BOARD_ALPHA)"),
+        ("macro", "TIMEOUT_MS", "#if defined(BOARD_ALPHA) > #else"),
+        ("global", "variant_flag", "#if defined(BOARD_ALPHA) > #else"),
+    ]

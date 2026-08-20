@@ -455,10 +455,15 @@ def test_tree_sitter_make_symbol_context_stops_at_end_line():
     assert "return 1" in sym.context
 
 
-def test_rerank_passage_constant_is_honest():
-    # 常數 = 儲存端真實上限(index entry context[:500]);擴充 passage 必須
-    # 同步動三個 producer,本輪不做(§5-6)。
-    assert config.CODE_RERANK_PASSAGE_MAX_CHARS == 500
+def test_rerank_passage_budget_is_real_not_a_no_op():
+    # 舊版鎖 500,因為儲存端就截在 500,放大 passage 是 no-op。
+    # P3A 把儲存端上限獨立出來(CODE_RAG_CONTEXT_STORE_MAX_CHARS)之後,
+    # 這個常數才真的有效果 —— 所以鎖的是不變式,不是那個數字。
+    assert config.CODE_RERANK_PASSAGE_MAX_CHARS > 0
+    assert (config.CODE_RERANK_PASSAGE_MAX_CHARS
+            <= config.CODE_RAG_CONTEXT_STORE_MAX_CHARS), (
+        "passage 預算超過儲存端上限的話,超出部分永遠是空的"
+    )
 
 
 # --------------------------------------------------------------------------

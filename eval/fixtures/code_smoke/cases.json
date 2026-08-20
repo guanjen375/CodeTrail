@@ -535,6 +535,144 @@
       "seed_files": ["startup/bridge.c"],
       "gold_files": ["startup/bridge.c", "config/linker_layout.cfg"],
       "gold_symbols": ["f17"]
+    },
+    {
+      "_comment": "comment2context is a PROVISIONAL DIAGNOSTIC family, not a blocking core family. It probes whether a question phrased from a source comment reaches the code that comment sits on. Promoting it to blocking requires explicit user approval of the BLOCKING_CORE_COUNT / CORE_FAMILIES contract change.",
+      "id": "stretch_003",
+      "repo": "workflow_mini",
+      "family": "comment2context",
+      "blocking": false,
+      "task_type": "workflow_retrieval",
+      "question": "which generated configuration gets reviewed when the retry policy or watchdog layout changes",
+      "seed_files": ["config/runtime_limits.h"],
+      "gold_files": ["config/runtime_limits.h"],
+      "gold_symbols": ["RETRY_DEFAULT_ATTEMPTS", "HEARTBEAT_TIMEOUT_TICKS", "CONFIG_GENERATION"]
+    },
+    {
+      "id": "stretch_004",
+      "repo": "workflow_mini",
+      "family": "comment2context",
+      "blocking": false,
+      "task_type": "workflow_retrieval",
+      "question": "where does the boot log line about a configuration generation mismatch originate",
+      "seed_files": ["src/config_guard.c"],
+      "gold_files": ["src/config_guard.c", "config/runtime_limits.h"],
+      "gold_symbols": ["config_guard_validate", "CONFIG_GENERATION"]
+    },
+    {
+      "_comment": "P2 gold cases: macro / global definitions that the pre-P2 C parser could not extract at all. requires=tree_sitter puts them in the exact-symbol gate, not in the blocking core family contract.",
+      "id": "p2_macro_001",
+      "repo": "ism_mini",
+      "task_type": "localization",
+      "question": "where is SM_CALLBACK_SLOTS defined",
+      "gold_files": [
+        "src/state_machine.c"
+      ],
+      "gold_symbols": [
+        "SM_CALLBACK_SLOTS"
+      ],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": [
+        "tree_sitter"
+      ],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "p2_macro_002",
+      "repo": "workflow_mini",
+      "task_type": "localization",
+      "question": "where is RETRY_DEFAULT_ATTEMPTS defined",
+      "gold_files": [
+        "config/runtime_limits.h"
+      ],
+      "gold_symbols": [
+        "RETRY_DEFAULT_ATTEMPTS"
+      ],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": [
+        "tree_sitter"
+      ],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "p2_macro_003",
+      "repo": "workflow_mini",
+      "task_type": "localization",
+      "question": "where is HEARTBEAT_TIMEOUT_TICKS defined",
+      "gold_files": [
+        "config/runtime_limits.h"
+      ],
+      "gold_symbols": [
+        "HEARTBEAT_TIMEOUT_TICKS"
+      ],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": [
+        "tree_sitter"
+      ],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "p2_macro_004",
+      "repo": "workflow_mini",
+      "task_type": "localization",
+      "question": "where is CONFIG_GENERATION defined",
+      "gold_files": [
+        "config/runtime_limits.h"
+      ],
+      "gold_symbols": [
+        "CONFIG_GENERATION"
+      ],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": [
+        "tree_sitter"
+      ],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "p2_global_001",
+      "repo": "ism_mini",
+      "task_type": "localization",
+      "question": "where is callback_table defined",
+      "gold_files": [
+        "src/state_machine.c"
+      ],
+      "gold_symbols": [
+        "callback_table"
+      ],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": [
+        "tree_sitter"
+      ],
+      "expected_unresolved": false,
+      "must_abstain": false
+    },
+    {
+      "id": "p2_global_002",
+      "repo": "ism_mini",
+      "task_type": "localization",
+      "question": "where is current_state defined",
+      "gold_files": [
+        "src/state_machine.c"
+      ],
+      "gold_symbols": [
+        "current_state"
+      ],
+      "gold_edges": [],
+      "gold_paths": [],
+      "requires": [
+        "tree_sitter"
+      ],
+      "expected_unresolved": false,
+      "must_abstain": false
     }
   ]
 }
