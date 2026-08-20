@@ -813,7 +813,18 @@ def semantic_gate_failures(report: dict) -> list[str]:
     lane = report["primary_lane"]
     recorded = baseline.get("scopes", {}).get(scope, {}).get("families", {}).get(lane, {})
     current = report["scopes"][scope]["families"][lane]
+
+    # **只有 blocking family 能擋 gate**,而且成員資格是從 case 的 blocking
+    # 欄位推出來的,不寫死清單。`comment2context` / `low_lexical_overlap` 是
+    # provisional diagnostic(fixture 明寫 blocking:false):它們的數字照報,
+    # 但無差別比較等於偷偷把 stretch 升格成 blocking,和 fixture 與文件矛盾。
+    blocking_families = {
+        row["family"] for row in report["scopes"][scope]["cases"]
+        if row.get("blocking")
+    }
     for family, metrics in recorded.items():
+        if family not in blocking_families:
+            continue
         now = current.get(family)
         if now is None:
             failures.append(f"semantic family {family} disappeared from {scope}/{lane}")

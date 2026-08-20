@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import ast_parser  # noqa: E402
 import code_rag  # noqa: E402
+import config  # noqa: E402
 from code_graph import CodeGraph  # noqa: E402
 
 pytestmark = [
@@ -165,3 +166,66 @@ def test_parser_semantics_version_is_in_the_graph_fingerprint(tmp_path: Path):
     finally:
         graph.close()
     assert f"parser-semantics:{ast_parser.PARSER_SEMANTICS_VERSION}" in fingerprint
+
+
+def test_render_budget_change_invalidates_the_coderag_cache(tmp_path: Path,
+                                                            monkeypatch):
+    """BUG REGRESSION:改 render 預算的**環境變數**不會讓舊 embedding 失效。
+
+    `CODE_RAG_EMBED_TEXT_MAX_CHARS` 等三個預算是 `AICODE_*` 環境變數可覆寫的,
+    但 cache meta 只存固定的 schema 版本。重啟時把預算調大/調小,render 出來的
+    embed text 不同了,增量重建卻只比 file_hash —— 舊向量被靜默沿用,而且是
+    無聲的:沒有任何訊息說「你現在查的是用舊 render 算的向量」。
+    """
+    _write(tmp_path, "src/fw.c", FIRMWARE_C)
+    rag = code_rag.CodeRAG(str(tmp_path))
+    rag.index, _ = rag._index_single_file(
+        tmp_path / "src/fw.c", "src/fw.c", compute_embeddings=False
+    )
+    rag._file_cache = {"src/fw.c": {"hash": "x", "symbols": rag.index,
+                                    "embeddings": []}}
+    rag._save_cache()
+
+    assert code_rag.CodeRAG(str(tmp_path))._load_file_cache(), "同預算應載入得到"
+
+    monkeypatch.setattr(config, "CODE_RAG_EMBED_TEXT_MAX_CHARS",
+                        config.CODE_RAG_EMBED_TEXT_MAX_CHARS + 200)
+    assert code_rag.CodeRAG(str(tmp_path))._load_file_cache() == {}, (
+        "embed text 預算變了,舊向量是用別的 render 算的,不得沿用"
+    )
+
+
+def test_storage_budget_change_invalidates_the_coderag_cache(tmp_path: Path,
+                                                             monkeypatch):
+    """儲存端上限同理:它決定 index entry 存了多少 context。"""
+    _write(tmp_path, "src/fw.c", FIRMWARE_C)
+    rag = code_rag.CodeRAG(str(tmp_path))
+    rag.index, _ = rag._index_single_file(
+        tmp_path / "src/fw.c", "src/fw.c", compute_embeddings=False
+    )
+    rag._file_cache = {"src/fw.c": {"hash": "x", "symbols": rag.index,
+                                    "embeddings": []}}
+    rag._save_cache()
+
+    monkeypatch.setattr(config, "CODE_RAG_CONTEXT_STORE_MAX_CHARS",
+                        config.CODE_RAG_CONTEXT_STORE_MAX_CHARS + 200)
+    assert code_rag.CodeRAG(str(tmp_path))._load_file_cache() == {}
+
+
+def test_cache_identity_is_the_single_source_for_meta_and_validation():
+    """身分欄位只有一份定義,測試 fixture 與 production 都從這裡取。
+
+    兩邊各寫一份的話,加欄位時 fixture 會靜默落後 —— 舊 cache 被拒、測試改走
+    full rebuild,於是那條測試「還是綠的」卻不再驗它本來要驗的東西。
+    """
+    identity = code_rag.cache_identity()
+    assert identity["schema_version"] == code_rag.CODE_RAG_CACHE_SCHEMA_VERSION
+    assert identity["parser_semantics_version"] == \
+        ast_parser.PARSER_SEMANTICS_VERSION
+    assert identity["embed_text_schema_version"] == \
+        code_rag.EMBED_TEXT_SCHEMA_VERSION
+    assert identity["render_budgets"] == {
+        "context_store": config.CODE_RAG_CONTEXT_STORE_MAX_CHARS,
+        "comment": config.CODE_RAG_COMMENT_MAX_CHARS,
+        "embed_text": config.CODE_RAG_EMBED_TEXT_MAX_CHARS,
+    }

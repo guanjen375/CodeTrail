@@ -170,7 +170,10 @@ python scripts/run_tests.py tests/test_repo_consistency.py
 - `eval/fixtures/code_smoke/semantic_retrieval_baseline.json`：semantic baseline,
   含 corpus digest、render / scorer / model 版本與 per-family 數字。pipeline 版本或
   corpus digest 一變就**跳過**no-regression 比較並印出原因 —— 不同 corpus 的數字
-  本來就不可比,硬比才是假訊號。
+  本來就不可比,硬比才是假訊號。**只有 blocking family 能擋 gate**,而且成員資格是從
+  case 的 `blocking` 欄位推出來的,不寫死清單;`comment2context` /
+  `low_lexical_overlap` 這類 provisional diagnostic 照常報數字,但退步不擋 gate ——
+  無差別比較等於偷偷把 stretch 升格成 blocking。
 - `scripts/check_eval_consistency.py`：不跑 LLM，只檢查 eval expected 是否和 `config.py` / source code 漂移。
 - `tests/test_repo_consistency.py`：把 consistency check 接進 pytest。
 
@@ -211,6 +214,8 @@ translation-unit / namespace scope,並且逐個 declarator 判斷:
 | `static int (*handler)(int);` | 1 個 `global`(function pointer 是**物件**) |
 | `typedef int count_t, *count_ptr_t;` | 2 個 `typedef` |
 | `typedef enum { A, B } state_t;` | `typedef state_t` + `enum state_t`(用 alias)+ 2 個 `enum_constant` |
+| `enum class State { Idle };` | enumerator 的 qualified_name 是 `State::Idle`(scoped) |
+| `enum Plain { PlainA };` | enumerator 的 qualified_name 是 `PlainA`(unscoped,本來就在外層 scope) |
 | `struct driver_ops;` | **0 個**(forward tag 不是定義) |
 | `struct S { int x; };` | 1 個 `struct`(**要有 body** 才算型別定義) |
 
@@ -225,6 +230,13 @@ specifier(如 `thread_local`)一律標 `unknown` —— **不猜 external**。
 版本消費矩陣:`PARSER_SEMANTICS_VERSION` 進 CodeRAG cache meta、graph 的
 `_parser_versions()` 指紋與 eval vector manifest 三處。它是**語意**版本,不是 table
 shape —— 改它時**不要**順手 bump `GRAPH_SCHEMA_VERSION`。
+
+cache 身分只有一份定義:`code_rag.cache_identity()`。它除了 schema / parser /
+embed-text 版本,還帶**實際的 render 預算值** —— 那三個預算是 `AICODE_*` 環境變數可
+覆寫的,只鎖 schema version 的話,重啟時改一個環境變數就會靜默沿用「用另一組 render
+算出來的」embedding。寫入端、驗證端與測試 fixture 都從 `cache_identity()` 取:各寫一份
+的失敗一樣無聲 —— 加了欄位而 fixture 沒跟上,舊 cache 被拒、那條測試改走 full rebuild,
+「還是綠的」卻不再驗它本來要驗的東西。
 既有舊版 DB（v1/v2）由同一條顯式 build command 在單一 SQLite transaction 中原地
 升級；升級失敗會 rollback。真正損壞、無法由 SQLite
 開啟的 DB 不宣稱能原地重建：錯誤會要求先移出/刪除 graph DB，再執行 build command。

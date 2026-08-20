@@ -311,3 +311,95 @@ def test_recorder_requires_explicit_opt_in():
     """錄製是唯一會碰 loopback server 的模式,必須顯式帶旗標。"""
     with pytest.raises(SystemExit):
         recorder.main([])
+
+
+# ============================================================
+# gate 只能擋 blocking family
+# ============================================================
+def _report(blocking_recall: float, stretch_recall: float) -> dict:
+    """最小 report:一個 blocking family、一個 non-blocking stretch family。"""
+    return {
+        "available": True,
+        "primary_scope": "per_repo",
+        "primary_lane": "runtime_hybrid",
+        "pipeline": {"parser_semantics_version": 1},
+        "corpus": {"document_manifest_digest": "d0"},
+        "scopes": {
+            "per_repo": {
+                "cases": [
+                    {"id": "core_x", "family": "code2test", "blocking": True},
+                    {"id": "stretch_x", "family": "comment2context",
+                     "blocking": False},
+                ],
+                "families": {
+                    # 每條 lane 都要有 per-family 輸出(correctness gate 會驗),
+                    # 所以 double 也把四條 lane 填滿,不是去弱化那個檢查。
+                    lane: {
+                        "code2test": {"cases": 1, "file_recall_at_k": blocking_recall,
+                                      "mrr": 1.0, "seed_recall_at_k": 1.0,
+                                      "symbol_recall_at_k": 1.0},
+                        "comment2context": {"cases": 1,
+                                            "file_recall_at_k": stretch_recall,
+                                            "mrr": 1.0, "seed_recall_at_k": 1.0,
+                                            "symbol_recall_at_k": 1.0},
+                    }
+                    for lane in sr.LANES
+                },
+            },
+            "union": {
+                "cases": [],
+                "families": {lane: {"code2test": {
+                    "cases": 1, "file_recall_at_k": 1.0, "mrr": 1.0,
+                    "seed_recall_at_k": 1.0, "symbol_recall_at_k": 1.0,
+                }} for lane in sr.LANES},
+            },
+        },
+    }
+
+
+def _baseline_file(tmp_path: Path, monkeypatch) -> Path:
+    path = tmp_path / "semantic_retrieval_baseline.json"
+    path.write_text(json.dumps({
+        "pipeline": {"parser_semantics_version": 1},
+        "corpus": {"document_manifest_digest": "d0"},
+        "scopes": {"per_repo": {"families": {"runtime_hybrid": {
+            "code2test": {"file_recall_at_k": 1.0, "mrr": 1.0,
+                          "symbol_recall_at_k": 1.0},
+            "comment2context": {"file_recall_at_k": 1.0, "mrr": 1.0,
+                                "symbol_recall_at_k": 1.0},
+        }}}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(sr, "SEMANTIC_BASELINE_FILE", path)
+    return path
+
+
+def test_non_blocking_stretch_family_does_not_gate(tmp_path: Path, monkeypatch):
+    """BUG REGRESSION:non-blocking stretch 被 baseline gate 升格成 blocking。
+
+    `comment2context` 與 `low_lexical_overlap` 在 fixture 裡明確是
+    `blocking: false`(provisional diagnostic family),但 no-regression 比較對
+    baseline 裡**每一個** family 一視同仁地產生 failure —— 等於偷偷把 stretch
+    變成擋 gate 的條件,和 fixture 與文件的宣稱直接矛盾。
+    """
+    _baseline_file(tmp_path, monkeypatch)
+
+    # stretch 掉下去:只能是診斷,不得擋 gate。
+    failures = smoke.semantic_gate_failures(_report(1.0, 0.10))
+    assert failures == [], f"non-blocking family 不得擋 gate,卻擋了:{failures}"
+
+    # blocking 掉下去:一定要擋。
+    failures = smoke.semantic_gate_failures(_report(0.10, 1.0))
+    assert any("code2test" in item for item in failures), (
+        "blocking family 退步必須擋 gate"
+    )
+    assert not any("comment2context" in item for item in failures)
+
+
+def test_blocking_family_set_comes_from_the_case_data(tmp_path: Path, monkeypatch):
+    """哪些 family 算 blocking 要從 case 的 blocking 欄位推,不得寫死清單。"""
+    _baseline_file(tmp_path, monkeypatch)
+    report = _report(0.10, 0.10)
+    # 把唯一的 blocking case 改成 non-blocking → 就不該再有任何 failure。
+    for row in report["scopes"]["per_repo"]["cases"]:
+        row["blocking"] = False
+    assert smoke.semantic_gate_failures(report) == []

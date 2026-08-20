@@ -241,6 +241,32 @@ def lexical_scan_text(item: dict, max_chars: int) -> str:
     return render_semantic_fields(item, max_chars)
 
 
+def cache_identity() -> dict:
+    """持久 cache 的身分欄位 —— **單一來源**,寫入端與驗證端都從這裡取。
+
+    刻意包含**實際的預算值**而不是只有 schema 版本:這些預算是環境變數可覆寫的
+    (`AICODE_CODE_RAG_EMBED_TEXT_MAX_CHARS` 等),只鎖 schema version 的話,重啟
+    時改一個環境變數就會靜默沿用「用另一組 render 算出來的」embedding —— 沒有
+    任何訊息會提醒你現在查的是舊向量。
+
+    兩邊各寫一份的另一個失敗模式同樣無聲:加了欄位而測試 fixture 沒跟上,舊 cache
+    被拒 → 那條測試改走 full rebuild,「還是綠的」卻不再驗它本來要驗的東西。
+    """
+    return {
+        "schema_version": CODE_RAG_CACHE_SCHEMA_VERSION,
+        "embedding_model": EMBEDDING_MODEL,
+        "parser_semantics_version": PARSER_SEMANTICS_VERSION,
+        "embed_text_schema_version": EMBED_TEXT_SCHEMA_VERSION,
+        # 只列**會改變已儲存內容**的預算。lexical scan 與 rerank passage 是
+        # query-time 才用的,不影響任何 cache 住的東西。
+        "render_budgets": {
+            "context_store": config.CODE_RAG_CONTEXT_STORE_MAX_CHARS,
+            "comment": config.CODE_RAG_COMMENT_MAX_CHARS,
+            "embed_text": config.CODE_RAG_EMBED_TEXT_MAX_CHARS,
+        },
+    }
+
+
 def hybrid_symbol_score(*, emb_score: float, kw_score: float, item_type: str,
                         is_explicit_mention: bool,
                         code_token_count: int) -> tuple[float, str]:
@@ -432,20 +458,16 @@ class CodeRAG:
                   file=sys.stderr)
             return {}
 
-        # 版本消費矩陣(§6 P2-5):parser semantics 決定 symbol 集合、
-        # embed-text schema 決定向量內容。增量重建只比 file_hash,這兩個
-        # 版本一動舊 cache 就是錯的,而且錯得無聲 —— 必須在這裡擋掉。
-        if meta.get("parser_semantics_version") != PARSER_SEMANTICS_VERSION:
-            print(f"[CODE_RAG] cache parser_semantics_version "
-                  f"{meta.get('parser_semantics_version')!r} != "
-                  f"{PARSER_SEMANTICS_VERSION},安全重建", file=sys.stderr)
-            return {}
-
-        if meta.get("embed_text_schema_version") != EMBED_TEXT_SCHEMA_VERSION:
-            print(f"[CODE_RAG] cache embed_text_schema_version "
-                  f"{meta.get('embed_text_schema_version')!r} != "
-                  f"{EMBED_TEXT_SCHEMA_VERSION},安全重建", file=sys.stderr)
-            return {}
+        # 版本消費矩陣(§6 P2-5):parser semantics 決定 symbol 集合、embed-text
+        # schema 與 render 預算決定向量內容。增量重建只比 file_hash,這些一動舊
+        # cache 就是錯的,而且錯得無聲 —— 必須在這裡擋掉。
+        identity = cache_identity()
+        for key in ("parser_semantics_version", "embed_text_schema_version",
+                    "render_budgets"):
+            if meta.get(key) != identity[key]:
+                print(f"[CODE_RAG] cache {key} {meta.get(key)!r} != "
+                      f"{identity[key]!r},安全重建", file=sys.stderr)
+                return {}
 
         # 世代一致性:meta 記錄的 npz_md5 必須與磁碟上的 NPZ 相符。
         # kill 在「NPZ 已替換、meta 未替換」之間會在這裡被抓到。
@@ -537,11 +559,8 @@ class CodeRAG:
 
             emb_dim = self.embeddings.shape[1] if HAS_NUMPY and self.embeddings is not None else None
             meta = {
-                "schema_version": CODE_RAG_CACHE_SCHEMA_VERSION,
+                **cache_identity(),
                 "generation_id": uuid.uuid4().hex,
-                "embedding_model": EMBEDDING_MODEL,
-                "parser_semantics_version": PARSER_SEMANTICS_VERSION,
-                "embed_text_schema_version": EMBED_TEXT_SCHEMA_VERSION,
                 "scope_fingerprint": self.scope.fingerprint,
                 "embedding_dim": emb_dim,
                 "npz_md5": npz_md5,

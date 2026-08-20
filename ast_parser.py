@@ -41,7 +41,7 @@ _CPP_EXTENSIONS = frozenset({
 # v1(2026-08-19 之前的行為):C/C++ 只抽 class/struct/function/template。
 # v2(P2):macro / macro_function / typedef / enum / enum_constant / global,
 #        declaration 與 definition 分離,multi-declarator 逐一產生 symbol。
-PARSER_SEMANTICS_VERSION = 3
+PARSER_SEMANTICS_VERSION = 4
 
 # C/C++ 的 stable symbol kind。寫死成常數,避免 parser / cache / graph / test
 # 各自用不同拼法(kind 字串會進持久 cache 與 graph node,拼錯是無聲的)。
@@ -677,7 +677,10 @@ class TreeSitterParser:
         collected: list = []
         current = node
         while True:
-            previous = current.prev_named_sibling
+            # `_make_symbol` 一直接受「只有 start_point / end_point」的輕量 node
+            # (測試用的 double 就是這樣)。leading comment 是加值資訊,拿不到
+            # sibling API 就當作沒有註解,不能因此把整個 symbol 抽取打爆。
+            previous = getattr(current, "prev_named_sibling", None)
             if previous is None or previous.type != "comment":
                 break
             # 註解結尾與下一個節點開頭之間不得有空行。
@@ -830,6 +833,16 @@ class TreeSitterParser:
         name_node = node.child_by_field_name('name')
         enum_name = name_node.text.decode('utf-8', errors='replace') if name_node else alias
         condition = self._preprocessor_condition(node)
+        # C++ scoped enum(`enum class` / `enum struct`)的 enumerator 是
+        # `State::Idle`,不是 `Idle`。unscoped enum 相反:enumerator 本來就落在
+        # 外層 scope,加前綴才是錯的。固定產生裸名的話,兩個 scoped enum 只要有
+        # 同名 enumerator 就會撞成同一個 qualified_name —— graph 的 stable node ID
+        # 依賴它,撞名等於查找結果不準。
+        is_scoped = any(child.type in ('class', 'struct') for child in node.children)
+        enumerator_prefix = (
+            f"{qualified_prefix}{enum_name}::" if is_scoped and enum_name
+            else qualified_prefix
+        )
         if enum_name:
             symbols.append(self._make_symbol(
                 node, lines, enum_name, CPP_ENUM_KIND,
@@ -848,7 +861,7 @@ class TreeSitterParser:
             symbols.append(self._make_symbol(
                 child, lines, enumerator_name, CPP_ENUM_CONSTANT_KIND,
                 parent=enum_name,
-                qualified_name=f"{qualified_prefix}{enumerator_name}",
+                qualified_name=f"{enumerator_prefix}{enumerator_name}",
                 condition=condition,
             ))
 

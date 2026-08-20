@@ -204,6 +204,10 @@ def pipeline_identity() -> dict:
         "query_render_schema_version": QUERY_RENDER_SCHEMA_VERSION,
         "retrieval_scorer_version": code_rag.RETRIEVAL_SCORER_VERSION,
         "corpus_manifest_version": CORPUS_MANIFEST_VERSION,
+        # 實際的 render 預算(環境變數可覆寫)。document 的 rendered_text_sha256
+        # 本來就抓得到差異,但那時的訊息是「這份文件的 render 不一樣」;把預算
+        # 列進來,錯誤會直接說是預算改了,不用再去猜。
+        "render_budgets": code_rag.cache_identity()["render_budgets"],
     }
 
 

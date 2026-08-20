@@ -882,9 +882,11 @@ def _seed_cache_with_lazy_holes(rag, rel_paths, *, holes):
             "symbols": symbols,
             "embeddings": [[] for _ in symbols] if rel in holes else [[1.0, 0.0]] * len(symbols),
         }
+    # 身分欄位從 production 的單一來源取(code_rag.cache_identity())。
+    # 手抄一份的話,新增欄位時這裡會靜默落後 → cache 被拒 → 這條 regression
+    # 改走 full rebuild,「還是綠的」卻不再驗 lazy embedding hole 的 backfill。
     rag.cache_meta_file.write_text(json.dumps({
-        "schema_version": code_rag.CODE_RAG_CACHE_SCHEMA_VERSION,
-        "embedding_model": code_rag.EMBEDDING_MODEL,
+        **code_rag.cache_identity(),
         "scope_fingerprint": rag.scope.fingerprint,
         "row_count": 0,
         "index": [],

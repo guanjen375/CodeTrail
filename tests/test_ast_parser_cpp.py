@@ -516,3 +516,54 @@ def test_preprocessor_condition_is_kept_for_new_definition_kinds():
         ("macro", "TIMEOUT_MS", "#if defined(BOARD_ALPHA) > #else"),
         ("global", "variant_flag", "#if defined(BOARD_ALPHA) > #else"),
     ]
+
+
+@pytest.mark.smoke
+def test_make_symbol_tolerates_nodes_without_sibling_api():
+    """BUG REGRESSION:leading comment association 讓 _make_symbol 對 node 的
+    API 面變嚴格,結果打爆既有的輕量 test double。
+
+    `_make_symbol` 一直允許「只有 start_point / end_point」的 node 物件
+    (tests/test_code_rag_index.py 就是這樣驗 context 截斷的)。P3A 之後它無條件
+    呼叫 `_leading_comment()` 讀 `prev_named_sibling`,對那種 node 直接
+    AttributeError —— full suite 的確定性失敗,而 smoke 沒涵蓋到。
+    """
+    from types import SimpleNamespace
+
+    from ast_parser import TreeSitterParser
+
+    parser = TreeSitterParser.__new__(TreeSitterParser)
+    lines = ["int short_one(void) {", "    return 1;", "}"]
+    node = SimpleNamespace(start_point=(0, 0), end_point=(2, 0))
+
+    sym = parser._make_symbol(node, lines, "short_one", "function")
+    assert sym.end_line == 3
+    assert sym.comments is None, "拿不到 sibling 就是沒有 leading comment,不是崩潰"
+
+
+@pytest.mark.smoke
+def test_scoped_enum_enumerators_are_qualified_by_their_enum():
+    """BUG REGRESSION:`enum class` 的 enumerator 少了 enum scope 前綴。
+
+    C++ scoped enum 的 enumerator 是 `State::Idle`,不是 `Idle`。固定產生裸名的話,
+    兩個 scoped enum 只要有同名 enumerator 就會撞成同一個 qualified name ——
+    graph 的 stable node ID 依賴 qualified_name,撞名等於查找結果不準。
+    unscoped enum 相反:enumerator 本來就在外層 scope,維持裸名才對。
+    """
+    symbols = _parse(
+        "enums.cpp",
+        "enum class State { Idle, Busy };\n"
+        "enum struct Mode { Idle, Fast };\n"
+        "enum Plain { PlainA };\n",
+    )
+    qualified = {
+        (sym.name, sym.parent): sym.qualified_name
+        for sym in symbols if sym.type == "enum_constant"
+    }
+    assert qualified[("Idle", "State")] == "State::Idle"
+    assert qualified[("Idle", "Mode")] == "Mode::Idle"
+    assert qualified[("Idle", "State")] != qualified[("Idle", "Mode")], (
+        "兩個 scoped enum 的同名 enumerator 不得撞成同一個 qualified name"
+    )
+    # unscoped enum:enumerator 在外層 scope,不加前綴。
+    assert qualified[("PlainA", "Plain")] == "PlainA"
