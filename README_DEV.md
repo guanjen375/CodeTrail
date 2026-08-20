@@ -232,8 +232,9 @@ specifier(如 `thread_local`)一律標 `unknown` —— **不猜 external**。
 shape —— 改它時**不要**順手 bump `GRAPH_SCHEMA_VERSION`。
 
 cache 身分只有一份定義:`code_rag.cache_identity()`。它除了 schema / parser /
-embed-text 版本,還帶**實際的 render 預算值** —— 那三個預算是 `AICODE_*` 環境變數可
-覆寫的,只鎖 schema version 的話,重啟時改一個環境變數就會靜默沿用「用另一組 render
+embed-text 版本,還帶**實際的 render 預算值**(清單以 `render_budgets`
+為準,別另外記個數)—— 那些預算是 `AICODE_*` 環境變數可覆寫的,只鎖 schema
+version 的話,重啟時改一個環境變數就會靜默沿用「用另一組 render
 算出來的」embedding。寫入端、驗證端與測試 fixture 都從 `cache_identity()` 取:各寫一份
 的失敗一樣無聲 —— 加了欄位而 fixture 沒跟上,舊 cache 被拒、那條測試改走 full rebuild,
 「還是綠的」卻不再驗它本來要驗的東西。

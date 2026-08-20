@@ -690,7 +690,7 @@ def test_every_cache_identity_field_is_actually_validated(tmp_path: Path,
 def test_render_budget_change_invalidates_the_cache(tmp_path: Path, monkeypatch):
     """BUG REGRESSION:改 render 預算的**環境變數**不會讓舊 embedding 失效。
 
-    這三個預算是 `AICODE_*` 環境變數可覆寫的,但 cache meta 原本只存固定的
+    這些預算是 `AICODE_*` 環境變數可覆寫的,但 cache meta 原本只存固定的
     schema 版本。重啟時把預算調大/調小,render 出來的 embed text 不同了,
     增量重建卻只比 file_hash —— 舊向量被靜默沿用,沒有任何訊息提醒你現在查的
     是用舊 render 算出來的向量。

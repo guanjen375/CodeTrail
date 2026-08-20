@@ -660,8 +660,11 @@ CODE_RAG_REFRESH_TTL_SECONDS = int(_os.environ.get("AICODE_CODE_RAG_REFRESH_TTL"
 #
 # 這裡不再是「誠實化的 no-op 常數」:index entry 的 context 儲存上限已經獨立
 # 出來(CODE_RAG_CONTEXT_STORE_MAX_CHARS),放大 passage 才真的有效果。
-# 這三個預算的**實際值**會進 code_rag.cache_identity(),所以改預算(含用
-# AICODE_* 環境變數覆寫)本身就會讓舊 cache 失效,不需要手動 bump 版本常數。
+# 底下**會改變已儲存內容**的那幾個預算(context / comment / docstring / embed
+# text),實際值會進 code_rag.cache_identity() 的 render_budgets,所以改它們
+# (含用 AICODE_* 環境變數覆寫)本身就會讓舊 cache 失效,不需要手動 bump 版本
+# 常數。lexical scan 與 rerank passage 是 query-time 才用的,不影響任何 cache
+# 住的東西,所以不在裡面 —— 權威清單以 cache_identity() 為準,別在這裡數個數。
 # 反過來說:**只有列在 render_budgets 裡的預算免 bump**,其他任何會改變 render
 # 輸出的修改(欄位、順序、label、分隔、截斷演算法,以及還沒進 render_budgets 的
 # 截斷數字)都得 bump EMBED_TEXT_SCHEMA_VERSION 或先納入 identity。
