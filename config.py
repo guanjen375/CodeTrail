@@ -662,8 +662,10 @@ CODE_RAG_REFRESH_TTL_SECONDS = int(_os.environ.get("AICODE_CODE_RAG_REFRESH_TTL"
 # 出來(CODE_RAG_CONTEXT_STORE_MAX_CHARS),放大 passage 才真的有效果。
 # 這三個預算的**實際值**會進 code_rag.cache_identity(),所以改預算(含用
 # AICODE_* 環境變數覆寫)本身就會讓舊 cache 失效,不需要手動 bump 版本常數。
-# EMBED_TEXT_SCHEMA_VERSION 是留給「會改變 render 輸出的非預算語意變更」——
-# 欄位、順序、label、分隔、截斷演算法都算;完整規則見 code_rag 該常數的宣告處。
+# 反過來說:**只有列在 render_budgets 裡的預算免 bump**,其他任何會改變 render
+# 輸出的修改(欄位、順序、label、分隔、截斷演算法,以及還沒進 render_budgets 的
+# 截斷數字)都得 bump EMBED_TEXT_SCHEMA_VERSION 或先納入 identity。
+# 完整規則與理由見 code_rag 該常數的宣告處。
 
 # index entry 儲存的 context 上限。這是**最上游**的截斷:它比下游任何預算小的
 # 話,下游放大都是 no-op(§3 洞 2 的原始病灶)。
@@ -674,6 +676,16 @@ CODE_RAG_CONTEXT_STORE_MAX_CHARS = int(
 # index entry 儲存的 leading comment 上限。
 CODE_RAG_COMMENT_MAX_CHARS = int(
     _os.environ.get("AICODE_CODE_RAG_COMMENT_MAX_CHARS", "400")
+)
+
+# index entry 儲存的 docstring 上限。以前寫死在 code_rag 兩處 `[:300]` ——
+# 沒有名字的數字進不了 cache_identity(),改了不會讓 cache 失效,而規則說
+# 「預算不必 bump」就會被誤讀成「這個數字也不必 bump」。具名後它進 identity,
+# 改動自動失效,規則因此變成機械可判定而不是靠人分類。
+# 注意 ast_parser 在建立 Symbol 時已經先截到 300(那一刀屬上游,歸
+# PARSER_SEMANTICS_VERSION 管):把這裡調大於上游值是 no-op。
+CODE_RAG_DOCSTRING_MAX_CHARS = int(
+    _os.environ.get("AICODE_CODE_RAG_DOCSTRING_MAX_CHARS", "300")
 )
 
 # dense embedding document text 的總預算。

@@ -649,6 +649,7 @@ def test_cache_identity_is_the_single_source_for_meta_and_validation():
     assert identity["render_budgets"] == {
         "context_store": config.CODE_RAG_CONTEXT_STORE_MAX_CHARS,
         "comment": config.CODE_RAG_COMMENT_MAX_CHARS,
+        "docstring": config.CODE_RAG_DOCSTRING_MAX_CHARS,
         "embed_text": config.CODE_RAG_EMBED_TEXT_MAX_CHARS,
     }
 
@@ -699,9 +700,35 @@ def test_render_budget_change_invalidates_the_cache(tmp_path: Path, monkeypatch)
 
     for name in ("CODE_RAG_EMBED_TEXT_MAX_CHARS",
                  "CODE_RAG_CONTEXT_STORE_MAX_CHARS",
-                 "CODE_RAG_COMMENT_MAX_CHARS"):
+                 "CODE_RAG_COMMENT_MAX_CHARS",
+                 "CODE_RAG_DOCSTRING_MAX_CHARS"):
         monkeypatch.setattr(config, name, getattr(config, name) + 200)
         assert CodeRAG(str(tmp_path))._load_file_cache() == {}, (
             f"{name} 變了,舊向量是用別的 render 算的,不得沿用"
         )
         monkeypatch.undo()
+
+
+@pytest.mark.smoke
+def test_no_render_affecting_cap_is_left_out_of_cache_identity():
+    """NEW SILENT CONTRACT:render 路徑上不得再有「沒進 identity 的截斷數字」。
+
+    規則寫成白名單(只有 render_budgets 裡的預算免 bump)之後,這條就是它的
+    機械檢查:code_rag 的 render 路徑不得出現硬編碼的 `[:數字]` 截斷 —— 那種
+    數字改了不會讓任何 cache 失效,而「預算不必 bump」又會被讀成它也不必 bump,
+    兩邊都不動,舊向量就被靜默沿用。docstring 的 `[:300]` 就是這樣漏掉的。
+    """
+    import re
+
+    source = (REPO_ROOT / "code_rag.py").read_text(encoding="utf-8")
+    # 只看真的會進 index entry / embed text 的欄位截斷。
+    offenders = re.findall(
+        r"\['(?:docstring|context|comments|signature|type_hints)'\]\[:\d+\]",
+        source,
+    ) + re.findall(
+        r"sym\.(?:docstring|context|comments|signature)\[:\d+\]", source
+    )
+    assert offenders == [], (
+        f"render 路徑上還有硬編碼截斷 {offenders} —— 要嘛改成具名預算並放進 "
+        "cache_identity() 的 render_budgets,要嘛 bump EMBED_TEXT_SCHEMA_VERSION"
+    )

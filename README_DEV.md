@@ -274,6 +274,7 @@ python eval/run_code_smoke_eval.py
 |---|---|---:|
 | index entry 儲存的 context | `CODE_RAG_CONTEXT_STORE_MAX_CHARS` | 1800 |
 | index entry 儲存的 leading comment | `CODE_RAG_COMMENT_MAX_CHARS` | 400 |
+| index entry 儲存的 docstring | `CODE_RAG_DOCSTRING_MAX_CHARS` | 300 |
 | dense embedding document text | `CODE_RAG_EMBED_TEXT_MAX_CHARS` | 1200 |
 | lexical scorer 掃描文字 / identifier 數 | `CODE_RAG_LEXICAL_SCAN_MAX_CHARS` / `CODE_RAG_LEXICAL_MAX_IDENTIFIERS` | 1200 / 80 |
 | reranker passage | `CODE_RERANK_PASSAGE_MAX_CHARS` | 1800 |
@@ -289,12 +290,21 @@ sibling)、不跨空行、不跨 preprocessor 或其他節點、不吃檔頭 lic
 **都**看得到它;只加進 embed text 而 lexical 還在掃舊 context 的話,那條 lane 會靜默
 看不到註解訊號。
 
-`EMBED_TEXT_SCHEMA_VERSION` 的維護規則(權威定義在 `code_rag` 該常數的宣告處):
-**任何會改變 render 輸出的非預算語意變更都要 bump** —— 欄位集合、欄位順序、label
-文字、分隔方式、截斷演算法,只要 `semantic_fields()` / `render_semantic_fields()`
-的產出字串會變就算。只說「欄位集合或順序」是不夠的:label 改個字或截斷改個方向,
-字串一樣會變。**單純的預算數值不必 bump**(含 `AICODE_*` 覆寫)—— 那些值已經在
-`cache_identity()` 的 `render_budgets` 裡,改了自己就會讓 cache 失效。
+`EMBED_TEXT_SCHEMA_VERSION` 的維護規則(權威定義在 `code_rag` 該常數的宣告處)
+寫成**白名單**:
+
+> **免 bump 的只有「已經列在 `cache_identity()` 的 `render_budgets` 裡的預算數值」**
+> (含 `AICODE_*` 覆寫)。其他任何會改變 render 輸出的修改 —— 欄位集合、欄位順序、
+> label 文字、分隔方式、截斷演算法,以及**任何還沒進 `render_budgets` 的截斷數字**
+> —— 一律「bump,或先把它納入 identity」。
+
+寫成白名單而不是「預算免 bump」,是因為後者會被讀成「這個數字也是預算,所以不必
+bump」,而沒進 identity 的數字改了又不會讓任何東西失效 —— 兩邊都不動,舊向量就被
+靜默沿用。踩過的例子是 docstring 的 `[:300]`:它確實是預算,但沒有名字也沒進
+identity;現在它是 `CODE_RAG_DOCSTRING_MAX_CHARS`,規則因此變成機械可判定。
+上游那一刀不歸這條規則管:`ast_parser` 建 `Symbol` 時就先截過 docstring /
+signature / condition,也決定 leading comment 取幾行 —— 那些屬
+`PARSER_SEMANTICS_VERSION`(同樣在 `cache_identity()` 裡)。
 兩條機制都必要:增量重建只比 file_hash,少了任何一邊都會靜默沿用用舊 render
 算出來的向量。
 

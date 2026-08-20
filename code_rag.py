@@ -63,8 +63,8 @@ CODE_RAG_CACHE_SCHEMA_VERSION = 3
 #     舊 baseline 不可比。
 RETRIEVAL_SCORER_VERSION = 1
 
-# Embed text 的 schema 版本。_build_embed_text 的欄位集合、順序或 budget 一改
-# 就要 bump —— 增量重建只比 file_hash,改 render 不會自動讓舊向量失效。
+# Embed text 的 schema 版本。增量重建只比 file_hash,改了 render 卻沒有任何
+# 東西會自動失效 —— 這個版本常數與 cache_identity() 是唯二的防線。
 #
 # 版本消費矩陣(施工規格 §6 P2-5):
 #   - CodeRAG cache:**是**(舊向量是用舊 render 算的)
@@ -72,15 +72,25 @@ RETRIEVAL_SCORER_VERSION = 1
 #   - eval vector manifest:**是**
 #
 # **什麼時候要 bump**(權威定義,其他地方一律指向這裡):
-#   要 bump —— 任何會改變 render **輸出**的非預算語意變更。實務上就是動到
-#     `semantic_fields()` 或 `render_semantic_fields()` 的行為:欄位集合、欄位
-#     順序、label 文字("linkage:" 這種)、分隔方式、截斷演算法。
-#   不必 bump —— 單純的**預算數值**(CODE_RAG_EMBED_TEXT_MAX_CHARS 等,含
-#     AICODE_* 環境變數覆寫)。那些值本身在 cache_identity() 的 render_budgets
-#     裡,改了就會自己讓 cache 失效,不需要人工記得 bump。
 #
-# 只說「欄位集合或順序」是**不夠**的:label 改個字、分隔符換掉、截斷從尾端改成
-# 中間截,產出的字串都不一樣,而舊向量會被增量重建靜默沿用(它只比 file_hash)。
+#   免 bump 的只有一種東西 —— **已經明確列在 cache_identity() 的 render_budgets
+#   裡的預算數值**(含 AICODE_* 環境變數覆寫)。那些值本身進 cache identity,
+#   改了就會自己讓 cache 失效,不需要人工記得 bump。
+#
+#   其他任何會改變 render **輸出**的修改,一律「bump,或先把它納入 identity」。
+#   包含但不限於:欄位集合、欄位順序、label 文字("linkage:" 這種)、分隔方式、
+#   截斷演算法,以及**任何還沒進 render_budgets 的截斷數字**。
+#
+# 為什麼要寫成「白名單」而不是「預算免 bump」:沒進 identity 的數字改了不會讓
+# 任何東西失效,而「預算不必 bump」這句話會被讀成「這個數字也不必 bump」——
+# 兩邊都不動,舊向量就被靜默沿用。曾經踩到的就是 docstring 的 `[:300]`:它是
+# 預算沒錯,但沒有名字、沒進 identity。現在它是
+# CODE_RAG_DOCSTRING_MAX_CHARS,規則因此變成機械可判定:**要嘛在
+# render_budgets 裡,要嘛就得 bump**,不用靠人分類「這算不算預算」。
+#
+# 上游那一刀不歸這裡管:ast_parser 建 Symbol 時就先截過 docstring / signature /
+# condition,也決定 leading comment 取幾行 —— 那些屬 PARSER_SEMANTICS_VERSION
+# (它同樣在 cache_identity() 裡)。
 #
 # v1:path / type / symbol / parent / signature / docstring / type_hints /
 #     context,context 吃 400 - used_len 的剩餘預算。
@@ -273,6 +283,7 @@ def cache_identity() -> dict:
         "render_budgets": {
             "context_store": config.CODE_RAG_CONTEXT_STORE_MAX_CHARS,
             "comment": config.CODE_RAG_COMMENT_MAX_CHARS,
+            "docstring": config.CODE_RAG_DOCSTRING_MAX_CHARS,
             "embed_text": config.CODE_RAG_EMBED_TEXT_MAX_CHARS,
         },
     }
@@ -640,7 +651,7 @@ class CodeRAG:
             if sym.signature:
                 symbol_dict['signature'] = sym.signature
             if sym.docstring:
-                symbol_dict['docstring'] = sym.docstring[:300]
+                symbol_dict['docstring'] = sym.docstring[:config.CODE_RAG_DOCSTRING_MAX_CHARS]
             if sym.type_hints:
                 symbol_dict['type_hints'] = sym.type_hints
             # C/C++ definition metadata(§6 P2-4)。parser 算出來卻沒往下傳的話,
@@ -736,7 +747,7 @@ class CodeRAG:
             if 'signature' in sym and sym['signature']:
                 index_entry['signature'] = sym['signature']
             if 'docstring' in sym and sym['docstring']:
-                index_entry['docstring'] = sym['docstring'][:300]
+                index_entry['docstring'] = sym['docstring'][:config.CODE_RAG_DOCSTRING_MAX_CHARS]
             if 'type_hints' in sym and sym['type_hints']:
                 index_entry['type_hints'] = sym['type_hints']
             for field in ('comments', 'linkage', 'condition', 'storage_class'):

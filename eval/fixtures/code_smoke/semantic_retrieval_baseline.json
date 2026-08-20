@@ -25,6 +25,7 @@
     "render_budgets": {
       "context_store": 1800,
       "comment": 400,
+      "docstring": 300,
       "embed_text": 1200
     },
     "normalization": "l2",
