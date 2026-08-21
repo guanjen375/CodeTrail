@@ -472,6 +472,14 @@ class CodeRAG:
         try:
             with open(self.cache_meta_file, 'r', encoding='utf-8') as f:
                 meta = json.load(f)
+        except MemoryError:
+            # 記憶體不足 != cache 壞掉。當成「損壞」會靜默丟棄一份完全有效的
+            # cache,接著整棵樹重建;重建後是 lazy 索引,_save_cache 的 lazy
+            # 分支會 unlink 掉既有的 .npz 並以無 embedding 的 meta 覆蓋原檔 ——
+            # 一次暫態記憶體不足就永久刪掉全部向量,而訊息還說是檔案損壞。
+            # 實測:330270 符號的樹 meta JSON 22.9GB,光 json.load 就要 100GB
+            # 以上位址空間,在忙碌的機器上這是真的會發生。一律 fail-loud。
+            raise
         except Exception as e:
             print(f"[CODE_RAG] cache meta 損壞({type(e).__name__}: {e}),安全重建",
                   file=sys.stderr)

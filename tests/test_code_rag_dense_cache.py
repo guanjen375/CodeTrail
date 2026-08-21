@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CodeRAG dense cache 的兩個真實 bug regression(2026-08-21,MetaWare 樹實測)。
+"""CodeRAG dense cache 的三個真實 bug regression(2026-08-21,MetaWare 樹實測)。
 
 D2:``_lazy_embed`` 只看符號數,不看 embedding 是否已備齊。一份**已經完整
     embed** 的索引每次載入仍被判為 lazy(``code_rag.py`` 的
@@ -8,7 +8,11 @@ D2:``_lazy_embed`` 只看符號數,不看 embedding 是否已備齊。一份**�
 
 D3:``build_index()`` 結尾無條件 ``_save_cache()``,即使 0 檔變更、0 檔刪除。
 
-兩者疊加的實測後果:330270 個符號的樹上,meta JSON 是 22.9GB,單次查詢會
+D4:``_load_file_cache`` 用 ``except Exception`` 把 ``MemoryError`` 也接住,
+    印成「cache meta 損壞,安全重建」。見該測試的 docstring —— 後果是永久
+    刪掉全部向量。
+
+D2+D3 疊加的實測後果:330270 個符號的樹上,meta JSON 是 22.9GB,單次查詢會
 觸發 **2 次**全量回寫,每次約 100 分鐘(實測寫入速率 3.6MB/s)。
 """
 from __future__ import annotations
@@ -116,3 +120,31 @@ def test_changed_file_still_writes_cache(monkeypatch, tmp_path):
 
     assert calls, "有新增檔案時必須回寫 cache"
     assert any(item.get("symbol") == "brand_new_symbol" for item in second.index)
+
+
+def test_memory_error_is_not_reported_as_corruption(monkeypatch, tmp_path):
+    """記憶體不足 != cache 壞掉,不得靜默丟棄一份有效的 cache。
+
+    實測(2026-08-21):330270 符號的樹上,meta JSON 是 22.9GB,光 json.load
+    就要 100GB 以上位址空間。記憶體不足時 MemoryError 會被
+    ``except Exception`` 接住並印成「cache meta 損壞,安全重建」,接著:
+      1. 整棵樹重建(該樹實測 55 分鐘);
+      2. 重建後 _lazy_embed=True,_save_cache 的 lazy 分支會 unlink 掉
+         既有的 .npz,並以無 embedding 的 meta 覆蓋原檔。
+    也就是一次暫態記憶體不足就永久刪掉全部向量。必須 fail-loud。
+    """
+    root = _make_repo(tmp_path)
+    seed = _rag(monkeypatch, root)
+    seed.build_index(verbose=False)
+    seed._materialize_dense_index()
+    assert seed.cache_meta_file.exists(), "前提:必須先有一份 cache"
+
+    victim = _rag(monkeypatch, root)
+
+    def out_of_memory(*_args, **_kwargs):
+        raise MemoryError()
+
+    monkeypatch.setattr(code_rag.json, "load", out_of_memory)
+
+    with pytest.raises(MemoryError):
+        victim._load_file_cache()
