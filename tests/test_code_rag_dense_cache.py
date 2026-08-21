@@ -17,6 +17,7 @@ D2+D3 疊加的實測後果:330270 個符號的樹上,meta JSON 是 22.9GB,單�
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -148,3 +149,73 @@ def test_memory_error_is_not_reported_as_corruption(monkeypatch, tmp_path):
 
     with pytest.raises(MemoryError):
         victim._load_file_cache()
+
+
+def _dense_seed(monkeypatch, root: Path) -> code_rag.CodeRAG:
+    rag = _rag(monkeypatch, root)
+    rag.build_index(verbose=False)
+    rag._materialize_dense_index()
+    assert rag.embeddings is not None
+    return rag
+
+
+def test_dense_save_keeps_vectors_out_of_meta_json(monkeypatch, tmp_path):
+    """D5:dense 模式下向量已經在 .npz 裡,不該又以 JSON 文字存一份。
+
+    實測:330270 符號的樹上,同一批向量在 .npz 是 1.25GB、在 meta JSON 是
+    22.9GB(18 倍)。而且 .npz 從頭到尾沒有被讀回過 —— 全檔沒有 np.load,
+    它唯一的用途是被算 md5 當世代 token。載入實際走的是那份 22.9GB JSON,
+    光 json.load 就要 100GB 以上位址空間。
+    """
+    root = _make_repo(tmp_path)
+    seed = _dense_seed(monkeypatch, root)
+
+    meta = json.loads(seed.cache_meta_file.read_text(encoding="utf-8"))
+    carriers = [
+        rel for rel, cached in meta.get("file_cache", {}).items()
+        if cached.get("embeddings")
+    ]
+    assert not carriers, (
+        f"dense 模式下 meta JSON 仍夾帶向量(檔案:{carriers});"
+        "向量應該只存在 .npz"
+    )
+
+
+def test_dense_cache_reloads_vectors_from_npz(monkeypatch, tmp_path):
+    """D5 的另一半:既然 JSON 不再存向量,載入就必須真的從 .npz 讀回來。"""
+    root = _make_repo(tmp_path)
+    seed = _dense_seed(monkeypatch, root)
+    expected = seed.embeddings.copy()
+
+    reloaded = _rag(monkeypatch, root)
+    reloaded.build_index(verbose=False)
+
+    assert reloaded.embeddings is not None, "重新載入後應該直接有 dense 矩陣"
+    assert reloaded.embeddings.shape == expected.shape
+    assert reloaded.embeddings == pytest.approx(expected)
+
+
+def test_legacy_cache_with_inline_vectors_still_loads(monkeypatch, tmp_path):
+    """相容:既有的舊 cache 仍夾帶向量,不得因為新格式而失效(重建要 55 分鐘)。"""
+    root = _make_repo(tmp_path)
+    seed = _dense_seed(monkeypatch, root)
+
+    # 把向量塞回 JSON,重現舊格式
+    meta = json.loads(seed.cache_meta_file.read_text(encoding="utf-8"))
+    rows = [list(map(float, row)) for row in seed.embeddings]
+    by_symbol = {
+        (it.get("path"), it.get("symbol"), it.get("line")): row
+        for it, row in zip(meta["index"], rows)
+    }
+    for cached in meta["file_cache"].values():
+        cached["embeddings"] = [
+            by_symbol.get((s.get("path"), s.get("symbol"), s.get("line")), [])
+            for s in cached.get("symbols", [])
+        ]
+    seed.cache_meta_file.write_text(json.dumps(meta, ensure_ascii=False),
+                                    encoding="utf-8")
+
+    legacy = _rag(monkeypatch, root)
+    legacy.build_index(verbose=False)
+    assert legacy.embeddings is not None, "舊格式 cache 應該仍能載入"
+    assert legacy.embeddings == pytest.approx(seed.embeddings)

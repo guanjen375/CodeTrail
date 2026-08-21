@@ -540,7 +540,55 @@ class CodeRAG:
         self._scope_fingerprint_ok = (
             meta.get("scope_fingerprint") == self.scope.fingerprint
         )
-        return meta.get("file_cache", {})
+
+        file_cache = meta.get("file_cache", {})
+        # 新格式的 dense cache 不在 JSON 存向量(見 _save_cache),要從 .npz
+        # 還原。舊 cache 仍夾帶 embeddings —— 原樣沿用,不必為了換格式重建。
+        if npz_md5 is not None and any(
+            "embeddings" not in cached for cached in file_cache.values()
+        ):
+            if not self._restore_embeddings_from_npz(meta.get("index", []), file_cache):
+                return {}
+        return file_cache
+
+    def _restore_embeddings_from_npz(self, index: list, file_cache: dict) -> bool:
+        """把 .npz 的向量還原回 per-file cache。回傳 False 代表不可信 → 重建。
+
+        對映鍵與 _sync_embeddings_to_file_cache 同一組 (path, symbol, line),
+        兩邊必須一致,否則會無聲錯配向量。
+        """
+        if not HAS_NUMPY:
+            print("[CODE_RAG] cache 向量存在 .npz 但沒有 numpy 可讀,安全重建",
+                  file=sys.stderr)
+            return False
+        try:
+            with np.load(self.cache_emb_file) as data:
+                matrix = data["embeddings"]
+        except MemoryError:
+            # 與 json.load 同一個理由:記憶體不足不是「壞掉」,靜默重建會把
+            # 既有向量覆蓋掉。fail-loud。
+            raise
+        except Exception as e:
+            print(f"[CODE_RAG] cache NPZ 解析失敗({type(e).__name__}: {e}),安全重建",
+                  file=sys.stderr)
+            return False
+        if matrix.ndim != 2 or matrix.shape[0] != len(index):
+            print(f"[CODE_RAG] cache NPZ 形狀 {matrix.shape} 與 index {len(index)} 筆"
+                  "不符,安全重建", file=sys.stderr)
+            return False
+        by_symbol = {
+            (item.get("path"), item.get("symbol"), item.get("line")): row
+            for item, row in zip(index, matrix.tolist())
+        }
+        for cached in file_cache.values():
+            cached["embeddings"] = [
+                by_symbol.get(
+                    (symbol.get("path"), symbol.get("symbol"), symbol.get("line")),
+                    [],
+                )
+                for symbol in cached.get("symbols", [])
+            ]
+        return True
 
     def _load_cache(self) -> bool:
         """嘗試載入快取(增量模式)。
@@ -598,6 +646,19 @@ class CodeRAG:
                 self.cache_emb_file.unlink(missing_ok=True)
 
             emb_dim = self.embeddings.shape[1] if HAS_NUMPY and self.embeddings is not None else None
+            # dense 模式下向量已經在 .npz 裡,再以 JSON 文字存一份是 18 倍膨脹
+            # (實測同一批 330270 個向量:.npz 1.25GB vs meta JSON 22.9GB),
+            # 而且載入時 json.load 的暫態峰值會衝到 100GB 以上位址空間。
+            # 只有 npz 真的寫成功才剝除 —— lazy 模式沒有 .npz 可還原,那些空
+            # placeholder 本來也不佔空間,原樣保留。
+            # 淺拷貝:symbols 等大物件仍是同一份參考,不額外吃記憶體。
+            if npz_md5 is not None:
+                file_cache_payload = {
+                    rel: {k: v for k, v in cached.items() if k != "embeddings"}
+                    for rel, cached in self._file_cache.items()
+                }
+            else:
+                file_cache_payload = self._file_cache
             meta = {
                 **cache_identity(),
                 "generation_id": uuid.uuid4().hex,
@@ -606,7 +667,7 @@ class CodeRAG:
                 "npz_md5": npz_md5,
                 "row_count": len(self.index),
                 "index": self.index,
-                "file_cache": self._file_cache  # 增量快取
+                "file_cache": file_cache_payload  # 增量快取
             }
             fd, tmp_meta = tempfile.mkstemp(
                 dir=self.folder,
