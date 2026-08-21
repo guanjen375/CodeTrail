@@ -185,9 +185,15 @@ python3 eval/run_code_smoke_eval.py                      # 全離線 gate
 python3 eval/run_code_smoke_eval.py --report-json /tmp/report.json   # A/B 用的完整 summary
 python3 eval/run_eval.py --test-set all --verbose
 
-# 只有這兩條會連 8081(改了 corpus / parser 語意 / render schema 才需要):
-python3 eval/record_semantic_vectors.py --record-vectors
-python3 eval/run_code_smoke_eval.py --record-semantic-baseline
+# 只有這兩條會連 8081。改了 corpus / parser 語意 / render schema,或 bump 了
+# RETRIEVAL_SCORER_VERSION 之後都要重錄(pipeline 不符時 eval gate 會 FAIL,
+# tests/test_semantic_retrieval_eval.py 也會紅)。
+# LLAMA_BIN 一定要設 —— 沒設的話 artifact 的 llama_cpp.revision 會靜默記成
+# "unknown",那份 checked-in fixture 就失去可驗證的 build 出處。
+LLAMA_BIN=~/llama.cpp/build/bin/llama-server \
+    python3 eval/record_semantic_vectors.py --record-vectors
+LLAMA_BIN=~/llama.cpp/build/bin/llama-server \
+    python3 eval/run_code_smoke_eval.py --record-semantic-baseline
 ```
 
 前三個命令不需要 llama-server；retrieval runner 固定回報 Recall@5、MRR、nDCG@5 與

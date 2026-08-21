@@ -20,7 +20,7 @@
     "parser_semantics_version": 4,
     "embed_text_schema_version": 2,
     "query_render_schema_version": 1,
-    "retrieval_scorer_version": 1,
+    "retrieval_scorer_version": 3,
     "corpus_manifest_version": 1,
     "render_budgets": {
       "context_store": 1800,

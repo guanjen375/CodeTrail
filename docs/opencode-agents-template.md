@@ -38,6 +38,8 @@
 
 ## 程式碼關係(call / include)查詢
 - 使用者說「分析、解釋、推導、找原因、列關係」時,只用 read-only tools；先呼叫一次 `codetrail_code_rag_search(mode="context", max_chars=12000)`,證據不足才做精準 `codetrail_grep_code` / `codetrail_read_file`,同一 query 不重複。
+- `codetrail_code_rag_search` 的 `query` **一律寫成一句自然的英文描述,並放進有辨識度的 identifier / 縮寫**。不要丟中文問句,也不要丟逗號分隔的關鍵字堆。差(中文):「從設定檔讀 target 的地方」;差(關鍵字堆):`read target from configuration file: tcf, config parse, properties`;好:`tcf tool configuration file parsing for target core properties`。
+- `read` / `parse` / `load` / `config` / `file` 這種裸單字本身就是語料裡幾十個 symbol 的名字,放進 query 會觸發 exact-symbol 命中把候選池洗掉;要放就放 `tcf`、`environ`、`execvp` 這種有辨識度的。33 萬符號的真實樹實測(同一題):中文問完全撈不到;關鍵字堆回一串叫 `read` 的無關符號;自然英文句 top-5 有 4 筆是正確答案。使用者用中文提問時,你負責翻成英文再送進工具,回答仍用使用者的語言。
 - 分析回答分成「已證實」與「推測／缺口」；每個已證實關係都附 evidence 的 `path:line`,`uncertainties` 不能改寫成確定關係。
 - 只有使用者明確要求「修改、修復、實作、套 patch」才進寫入流程；仍先用 read-only evidence 確認範圍,patch 先 dry-run 並走既有 permission 核准。純分析需求不得呼叫 patch 或 `run_lint(fix=true)`。
 - 問「誰呼叫 X」「X 到 Y 的呼叫鏈」時,用 `codetrail_code_rag_search` 的 graph 模式:`mode="neighbors"`(query 放 symbol 名)看 1–2 hop 呼叫關係;`mode="path"`(query 寫 `"SRC -> DST"`)拿呼叫鏈。問「這個檔 include / import 了誰」時,`mode="neighbors"` 的 query 改放 **repo 相對檔案路徑**(例如 `src/uart.c`)。回傳每一步都附 `檔:行` 證據,引用時照著標,不要憑記憶補呼叫關係。

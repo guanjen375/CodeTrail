@@ -646,7 +646,21 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
     mode="context" 一次回傳固定字元 budget 的 source evidence bundle。
 
     Args:
-        query: mode="semantic" → 想找的程式碼行為,例如 "conv2d 的 padding 計算"。
+        query: mode="semantic" → 想找的程式碼行為。**寫成一句自然的英文描述,
+               並且放進有辨識度的 identifier / 縮寫**;不要直接丟中文問句,也
+               不要丟逗號分隔的關鍵字堆。索引是拿原始碼算的 embedding,查詢與
+               程式碼同語言時召回率差很多。
+                 差(中文)   :「從設定檔讀 target 的地方」
+                 差(關鍵字堆):"read target from configuration file: tcf,
+                              config parse, properties, core definition"
+                 好         :"tcf tool configuration file parsing for
+                              target core properties"
+               `read` / `parse` / `load` / `config` / `file` 這種裸單字本身就是
+               語料裡幾十個 symbol 的名字,放進去會觸發 exact-symbol 命中並把
+               候選池洗掉 —— 要放就放 `tcf`、`environ`、`execvp` 這種有辨識度的。
+               33 萬符號的真實樹實測(同一個問題):中文問 → 正確答案完全撈不到;
+               關鍵字堆 → 回一串叫 `read` 的無關符號;自然英文句 → top-5 有 4 筆
+               是正確答案。
                mode="neighbors" → symbol 名(exact / qualified name 比對,取前 3
                個 anchor)或 repo 相對檔案路徑(如 "src/dispatcher.c",看該檔
                的 includes/imports 關係)。

@@ -669,9 +669,22 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 要做「分析、解釋、推導、找原因」時，優先用同一個既有工具的 bounded context 模式：
 
 ```text
-請用工具 code_rag_search,mode 設 "context",query 寫「為什麼 ISR event 沒進 idle state」,
+請用工具 code_rag_search,mode 設 "context",
+query 寫 "ISR event never reaching the idle state in sm_transition",
 max_chars 設 12000，依 evidence 的 path:line 分成已證實與仍不確定兩部分回答。
 ```
+
+**`query` 要寫成一句自然的英文描述,並放進有辨識度的 identifier / 縮寫。** 索引是拿原始碼算的
+embedding,查詢跟程式碼同語言時召回率差很多。33 萬符號的真實樹實測,同一個問題三種寫法:
+
+| query 寫法 | 結果 |
+|---|---|
+| 中文「從設定檔讀 target 的地方」 | 正確答案排 4429 名,候選池收不到 |
+| 關鍵字堆 `read target from configuration file: tcf, config parse, properties` | 回一串叫 `read` 的無關符號(裸單字 `read` 在語料裡是 54 個 symbol 的名字,exact-symbol 命中把候選池洗掉了) |
+| 自然英文句 `tcf tool configuration file parsing for target core properties` | top-5 有 4 筆是正確答案 |
+
+你仍然可以用中文跟模型對話 —— 依 [docs/opencode-agents-template.md](docs/opencode-agents-template.md)
+的規則,模型負責把問題翻成英文再送進工具,回答還是用你的語言。
 
 `mode="context"` 會把 semantic seeds、確定的 1-hop caller/callee/include，以及相關 test/header/config/trace lexical evidence 合併去重後裝進固定字元 budget。`max_chars` 合法範圍是 `2000..30000`、預設 `12000`，`used_chars` 只計 `evidence[].text` 的實際字元，不宣稱 tokenizer token 數；歧義與 unresolved 只進 `uncertainties`，不偽裝成確定證據。candidate 數量、graph traversal 與字元 budget 的截斷原因會分開標示。所有 source window 仍由既有 sandboxed `read_file` 路徑讀取。graph 尚未建立或損壞時會降級回 semantic-only evidence 並標示 `graph_status`，不影響整次呼叫。
 

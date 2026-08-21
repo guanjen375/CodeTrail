@@ -711,6 +711,15 @@ CODE_RERANK_PASSAGE_MAX_CHARS = int(
     _os.environ.get("AICODE_CODE_RERANK_PASSAGE_MAX_CHARS", "1800")
 )
 
+# 進 cross-encoder rerank 的候選數。曾經是兩處寫死的 top_k*3 與 min(15, top_k*3),
+# 於是不論 top_k 多少,reranker 永遠只看得到 15 筆 —— bi-encoder 排第 16 名以後的
+# 東西再對也翻不了身。真實樹實測(2026-08-21,330270 符號):池 15 → 100 的
+# rerank 成本是 0.2s → 1.0s,而 top1 的 cross-encoder 分數從 -3.885 拉到 -1.511。
+# 這個值進 RETRIEVAL_SCORER_VERSION 的語意版本(它改變名次),不進 CodeRAG cache。
+CODE_RAG_RERANK_CANDIDATE_POOL = int(
+    _os.environ.get("AICODE_CODE_RAG_RERANK_CANDIDATE_POOL", "100")
+)
+
 # 批次 embedding 的雙預算(/v1/embeddings 嚴格契約,§5-4):
 # 單一 HTTP batch 的筆數上限與總字元上限,兩者皆過才裝得下。
 EMBED_BATCH_SIZE = int(_os.environ.get("AICODE_EMBED_BATCH_SIZE", "32"))

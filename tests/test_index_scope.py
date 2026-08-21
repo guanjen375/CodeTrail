@@ -861,6 +861,20 @@ def test_index_stats_reports_rule_hits(tree, tmp_path):
 # ============================================================
 
 
+def _persisted_embeddings(rag):
+    """讀回**持久化**的 per-file 向量,走 loader 而不是直接讀 meta JSON。
+
+    dense 存檔時向量只在 .npz 裡,meta JSON 的 ``embeddings`` 鍵會被剝掉
+    (同一批 330270 個向量:.npz 1.25GB vs JSON 22.9GB),直接讀 JSON 會
+    KeyError。斷言要驗的是「快取裡不再有空洞」,那就得從 loader 的視角看 ——
+    順帶把 .npz 還原這條路也一起驗進去。
+    """
+    import code_rag
+
+    probe = code_rag.CodeRAG(str(rag.folder))
+    return probe._load_file_cache()
+
+
 def _seed_cache_with_lazy_holes(rag, rel_paths, *, holes):
     """手動寫一份 per-file 快取,holes 裡的檔案 embedding 全是 []（lazy 模式的產物）。
 
@@ -958,9 +972,10 @@ def test_dense_rebuild_backfills_lazy_embedding_holes(tree, monkeypatch, clean_s
     assert calls, "空洞應該被補算"
 
     # 快取要被修好,否則重啟又炸一次
-    meta = json.loads(rag.cache_meta_file.read_text(encoding="utf-8"))
+    persisted = _persisted_embeddings(rag)
+    assert persisted, "持久化的快取讀不回來"
     holes_left = [
-        rel for rel, entry in meta["file_cache"].items()
+        rel for rel, entry in persisted.items()
         for emb in entry["embeddings"] if not emb
     ]
     assert not holes_left, f"快取仍留著空 embedding: {sorted(set(holes_left))}"
@@ -1130,9 +1145,10 @@ def test_backfill_failure_leaves_no_partial_index(tree, monkeypatch, clean_scan_
     code_rag._INDEX_SCAN_CACHE.clear()
     rag.build_index(verbose=False)
     assert rag.index and rag.embeddings is not None
-    meta = json.loads(rag.cache_meta_file.read_text(encoding="utf-8"))
+    persisted = _persisted_embeddings(rag)
+    assert persisted, "持久化的快取讀不回來"
     assert not [
-        rel for rel, entry in meta["file_cache"].items()
+        rel for rel, entry in persisted.items()
         for emb in entry["embeddings"] if not emb
     ]
 

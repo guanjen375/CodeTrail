@@ -61,7 +61,7 @@ CODE_RAG_CACHE_SCHEMA_VERSION = 3
 #   - CodeGraph fingerprint:**否**。
 #   - eval vector manifest / baseline report:**是**。lane 分數換演算法後
 #     舊 baseline 不可比。
-RETRIEVAL_SCORER_VERSION = 2
+RETRIEVAL_SCORER_VERSION = 3
 
 # Embed text 的 schema 版本。增量重建只比 file_hash,改了 render 卻沒有任何
 # 東西會自動失效 —— 這個版本常數與 cache_identity() 是唯二的防線。
@@ -262,6 +262,24 @@ def lexical_scan_text(item: dict, max_chars: int) -> str:
     return render_semantic_fields(item, max_chars)
 
 
+def index_slice_aligns(index: list, cursor: int, symbols: list) -> bool:
+    """``index[cursor:cursor+len(symbols)]`` 是不是就是 ``symbols`` 本身。
+
+    向量在 .npz 裡是以 ``self.index`` 的**列序**存的,而 ``self.index`` 就是各檔
+    ``symbols`` 的串接 —— 還原因此是純位置對映,不需要任何鍵。這個函式只是把
+    「串接」這個不變式在讀盤時再驗一次:磁碟上的 meta 不可信,錯位比重建糟。
+    """
+    if cursor + len(symbols) > len(index):
+        return False
+    for offset, symbol in enumerate(symbols):
+        item = index[cursor + offset]
+        if (item.get("path"), item.get("symbol"), item.get("line"),
+                item.get("type")) != (symbol.get("path"), symbol.get("symbol"),
+                                      symbol.get("line"), symbol.get("type")):
+            return False
+    return True
+
+
 def cache_identity() -> dict:
     """持久 cache 的身分欄位 —— **單一來源**,寫入端與驗證端都從這裡取。
 
@@ -309,11 +327,16 @@ def hybrid_symbol_score(*, emb_score: float, kw_score: float, item_type: str,
     if kw_score >= 0.8 and code_token_count >= 2:
         # 高 kw_score 但需要至少 2 個 code_tokens,避免短 query 誤判
         return 0.9 + kw_score * 0.1, "lexical_dominant"
-    # 一般情況:function 類型給一點優先權
-    type_bonus = 0.05 if item_type == 'function' else 0.0
+    # 一般情況:function 類型給一點優先權 —— 但只在**有 lexical 訊號**時。
+    # 純語意 query(kw_score 恆為 0)下,這個平白的 +0.05 是加在一個很窄的
+    # cosine 帶上的:真實樹實測全語料 emb 落在 0.35-0.51,+0.05 等於把
+    # 每一個 function 都插到 global / macro / typedef 前面。實測
+    # 「環境變數怎麼傳給子行程」→ environ.c 的 _environ(global)dense 排名
+    # 369,combined 排名卻是 7793;拿掉 bonus 就回到 dense 的名次。
+    type_bonus = 0.05 if (item_type == 'function' and lexical_has_signal) else 0.0
     # 整個候選集都沒有 lexical 命中時(純 CJK 問句,或中文夾了語料裡不存在的
     # 英文詞),kw_score 恆為 0。此時仍對半混合等於把 embedding 門檻從 0.35
-    # 悄悄抬成 0.70(function 因 bonus 是 0.60)—— 實測 MetaWare 樹全語料
+    # 悄悄抬成 0.70(function 因 bonus 是 0.60)—— 實測 真實樹全語料
     # emb 上限只有 0.5112,於是純中文 query 結構性地永遠回零。
     # 判準是「有沒有實際命中」而非「有沒有抽出 token」:抽得出 token 但零命中
     # 的 query 一樣沒有 lexical 訊號可用。
@@ -322,12 +345,19 @@ def hybrid_symbol_score(*, emb_score: float, kw_score: float, item_type: str,
 
 
 def select_scored_candidates(scores: list, *, threshold: float, top_k: int,
-                             is_short_query: bool, code_tokens_lower: set) -> list:
+                             is_short_query: bool, code_tokens_lower: set,
+                             pool_size: int | None = None) -> list:
     """Production 的門檻篩選 + candidate cutoff。純函式,無 self / 無 I/O。
 
     scores 是已排序的 [(combined, emb_score, kw_score, item), ...]。
     evaluator 的 runtime_hybrid lane 重用它,才會連 cutoff 行為都一致。
+
+    pool_size 是要收給 rerank 的候選上限;None = 取
+    config.CODE_RAG_RERANK_CANDIDATE_POOL。舊值是寫死的 ``top_k * 3``。
     """
+    if pool_size is None:
+        pool_size = config.CODE_RAG_RERANK_CANDIDATE_POOL
+    pool_size = max(1, int(pool_size))
     selected = []
     for combined, emb_score, kw_score, item in scores:
         if is_short_query:
@@ -340,7 +370,7 @@ def select_scored_candidates(scores: list, *, threshold: float, top_k: int,
                 selected.append((combined, emb_score, kw_score, item))
 
         # 收集足夠的候選後停止（rerank 用）
-        if len(selected) >= top_k * 3:
+        if len(selected) >= pool_size:
             break
     return selected
 
@@ -554,8 +584,11 @@ class CodeRAG:
     def _restore_embeddings_from_npz(self, index: list, file_cache: dict) -> bool:
         """把 .npz 的向量還原回 per-file cache。回傳 False 代表不可信 → 重建。
 
-        對映鍵與 _sync_embeddings_to_file_cache 同一組 (path, symbol, line),
-        兩邊必須一致,否則會無聲錯配向量。
+        **位置對映**,不是鍵查表。曾經用 ``(path, symbol, line)`` 當 dict key,
+        但那個鍵不唯一:``typedef enum {...} Boolean;`` 一行會產生 typedef 與
+        enum 兩個同名同行的符號(真實樹實測 213 組碰撞 / 476 個符號),
+        dict 後寫覆蓋前寫 → 263 個符號拿到別人的向量,而且筆數對得上、shape
+        檢查過得了,完全無聲。npz 的列序就是 index 的序,位置對映沒有這個問題。
         """
         if not HAS_NUMPY:
             print("[CODE_RAG] cache 向量存在 .npz 但沒有 numpy 可讀,安全重建",
@@ -576,18 +609,20 @@ class CodeRAG:
             print(f"[CODE_RAG] cache NPZ 形狀 {matrix.shape} 與 index {len(index)} 筆"
                   "不符,安全重建", file=sys.stderr)
             return False
-        by_symbol = {
-            (item.get("path"), item.get("symbol"), item.get("line")): row
-            for item, row in zip(index, matrix.tolist())
-        }
-        for cached in file_cache.values():
-            cached["embeddings"] = [
-                by_symbol.get(
-                    (symbol.get("path"), symbol.get("symbol"), symbol.get("line")),
-                    [],
-                )
-                for symbol in cached.get("symbols", [])
-            ]
+        rows = matrix.tolist()
+        cursor = 0
+        for rel_path, cached in file_cache.items():
+            symbols = cached.get("symbols", [])
+            if not index_slice_aligns(index, cursor, symbols):
+                print("[CODE_RAG] cache index 與 file_cache 不同序(向量會錯位),"
+                      "安全重建", file=sys.stderr)
+                return False
+            cached["embeddings"] = rows[cursor:cursor + len(symbols)]
+            cursor += len(symbols)
+        if cursor != len(rows):
+            print(f"[CODE_RAG] cache file_cache 共 {cursor} 個符號但 NPZ 有 "
+                  f"{len(rows)} 列,安全重建", file=sys.stderr)
+            return False
         return True
 
     def _load_cache(self) -> bool:
@@ -912,9 +947,6 @@ class CodeRAG:
             total_symbols += len(cached.get("symbols", []))
             new_file_cache[rel_path] = cached
 
-        if lazy_enabled and total_symbols > CODE_RAG_LAZY_EMBED_MAX_SYMBOLS:
-            self._lazy_embed = True
-
         # 索引變更的檔案。§5-4:parse 階段一律不逐筆 embed
         # (compute_embeddings=False → 空 embedding 佔位);dense 模式下由
         # _backfill_cached_embedding_gaps 統一走 /v1/embeddings 批次補齊,
@@ -928,10 +960,6 @@ class CodeRAG:
                 self.index.extend(symbols)
                 embeddings_list.extend(embeddings)
                 total_symbols += len(symbols)
-
-                if lazy_enabled and not self._lazy_embed:
-                    if total_symbols > CODE_RAG_LAZY_EMBED_MAX_SYMBOLS:
-                        self._lazy_embed = True
 
                 # 更新快取
                 new_file_cache[rel_path] = {
@@ -954,18 +982,32 @@ class CodeRAG:
 
         self._file_cache = new_file_cache
 
-        # lazy 的定義是「還有符號沒 embed」,不是「符號很多」。上面的門檻只看
-        # total_symbols,所以一份**已經完整 embed** 的索引每次載入都會被判成
-        # lazy:dense 矩陣不建,查詢時再跑一次 _materialize_dense_index(),
-        # 結尾又全量回寫 cache。33 萬符號的樹上那份 meta JSON 是 22.9GB,
-        # 單次查詢因此付兩次約 100 分鐘的寫入。備齊了就不是 lazy。
-        if (
-            self._lazy_embed
-            and embeddings_list
-            and len(embeddings_list) == len(self.index)
-            and all(embeddings_list)
-        ):
-            self._lazy_embed = False
+        # embeddings_list 與 self.index 必須逐位置對應 —— 下面的 dense 矩陣
+        # 直接用位置取值,長度不一致就是無聲錯位。fail-loud。
+        if len(embeddings_list) != len(self.index):
+            self._reset_partial_index()
+            raise RuntimeError(
+                f"Code RAG cache is inconsistent: {len(embeddings_list)} embeddings "
+                f"for {len(self.index)} symbols; refusing a misaligned dense index"
+            )
+
+        # lazy 的判準是「**還缺幾個**向量」,不是「總共幾個符號」。
+        #
+        # 看總數的兩個實測後果(真實樹 330270 符號,2026-08-21):
+        #   1. 一份已經完整 embed 的索引每次載入都被判成 lazy → dense 矩陣不建、
+        #      查詢時重跑 _materialize_dense_index()、結尾全量回寫。
+        #   2. 只要**一個檔案**變動(實測 39 個符號)就留下 39 個
+        #      空洞,整份索引因此打回 lazy → _save_cache 的 lazy 分支 unlink 掉
+        #      1.25GB 的 .npz,並回寫 22.9GB 的舊格式 meta(實測 578.5s/21.34GB)。
+        #      _backfill_cached_embedding_gaps 本來就是要補這種空洞的,但它在
+        #      not self._lazy_embed 分支裡,舊判準下永遠走不到。
+        #
+        # 改看缺口之後:首次建索引(全空)照樣 lazy;增量補幾十個則走 dense
+        # backfill —— 補算量本來就有上限(≤ 門檻),不會退化成整棵樹重算。
+        missing_embeddings = sum(1 for embedding in embeddings_list if not embedding)
+        self._lazy_embed = bool(
+            lazy_enabled and missing_embeddings > CODE_RAG_LAZY_EMBED_MAX_SYMBOLS
+        )
 
         # 將 embedding 轉換為 numpy array 並預先 L2 normalize
         if HAS_NUMPY and embeddings_list and not self._lazy_embed:
@@ -1090,18 +1132,34 @@ class CodeRAG:
         self._sync_embeddings_to_file_cache(embeddings_list)
 
     def _sync_embeddings_to_file_cache(self, rows: list[list[float]]) -> None:
-        by_symbol = {
-            (item.get("path"), item.get("symbol"), item.get("line")): row
-            for item, row in zip(self.index, rows)
-        }
+        """把 dense 列寫回 per-file cache。與 _restore_embeddings_from_npz 同一
+        套位置對映 —— 用 (path, symbol, line) 當鍵會在同名同行的 typedef/enum
+        上無聲錯配(見該函式 docstring)。
+
+        這裡的不變式是程式碼建構出來的(self.index 就是各檔 symbols 的串接),
+        不是磁碟資料,所以不對就是 bug,fail-loud 而不是安全重建。
+
+        沒有 per-file cache 就直接 return:純記憶體索引(index 不是由
+        build_index 從 cache 串出來的)沒有東西可寫,也就沒有東西會錯位。
+        「少寫」不是這裡要防的失敗模式,「寫錯位置」才是。
+        """
+        if not self._file_cache:
+            return
+        cursor = 0
         for cached in self._file_cache.values():
-            cached["embeddings"] = [
-                by_symbol.get(
-                    (symbol.get("path"), symbol.get("symbol"), symbol.get("line")),
-                    [],
+            symbols = cached.get("symbols", [])
+            if not index_slice_aligns(self.index, cursor, symbols):
+                raise RuntimeError(
+                    "Code RAG index and per-file cache diverged; "
+                    "refusing to write misaligned embeddings"
                 )
-                for symbol in cached.get("symbols", [])
-            ]
+            cached["embeddings"] = list(rows[cursor:cursor + len(symbols)])
+            cursor += len(symbols)
+        if cursor != len(rows):
+            raise RuntimeError(
+                f"Code RAG per-file cache holds {cursor} symbols but {len(rows)} "
+                "embedding rows were produced; refusing a misaligned write"
+            )
 
     def _materialize_dense_index(self) -> None:
         """Embed every lazy symbol when lexical routing has no meaningful signal.
@@ -1343,7 +1401,7 @@ class CodeRAG:
             return self._fusion_candidates(candidates, top_k)
 
         # 減少 rerank 的 candidates 數量
-        rerank_count = min(15, top_k * 3)
+        rerank_count = max(top_k, config.CODE_RAG_RERANK_CANDIDATE_POOL)
 
         if self._check_reranker_available():
             try:

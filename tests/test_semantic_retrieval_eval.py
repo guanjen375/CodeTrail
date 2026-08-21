@@ -403,3 +403,35 @@ def test_blocking_family_set_comes_from_the_case_data(tmp_path: Path, monkeypatc
     for row in report["scopes"]["per_repo"]["cases"]:
         row["blocking"] = False
     assert smoke.semantic_gate_failures(report) == []
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("artifact", ["vectors", "baseline"])
+def test_checked_in_pipeline_identity_matches_the_current_code(artifact):
+    """錄好的 artifact 的 pipeline 欄位必須與**現在的程式碼**相符。
+
+    2026-08-21 踩到的無聲缺口:``RETRIEVAL_SCORER_VERSION`` 從 1 bump 到 2 之後,
+    ``eval/run_code_smoke_eval.py`` 直接 GATE FAIL(``vector cache stale``),
+    但整個 pytest 套件是綠的 —— 唯一碰真 artifact 的測試只 assert key 存在、
+    不比對值,而 ``VectorCache.load()`` 只有 eval 腳本會呼叫,不在測試裡。
+    於是「該重錄卻沒重錄」這件事只有真的去跑 eval 才看得到。
+
+    這條測試就是把 ``VectorCache.verify_pipeline`` 的那半邊搬進 pytest。
+    紅了就是要重錄:
+        python3 eval/record_semantic_vectors.py --record-vectors
+        python3 eval/run_code_smoke_eval.py --record-semantic-baseline
+    """
+    path = sr.VECTOR_MANIFEST_FILE if artifact == "vectors" else sr.SEMANTIC_BASELINE_FILE
+    if not path.exists():
+        pytest.skip(f"{path.name} not recorded in this checkout")
+
+    recorded = json.loads(path.read_text(encoding="utf-8")).get("pipeline", {})
+    drift = {
+        key: (recorded.get(key), value)
+        for key, value in sr.pipeline_identity().items()
+        if recorded.get(key) != value
+    }
+    assert not drift, (
+        f"{path.name} 的 pipeline 與現行程式碼不符(recorded, current):{drift};"
+        " artifact 要重錄,否則 eval gate 會 FAIL 而 pytest 看不到"
+    )

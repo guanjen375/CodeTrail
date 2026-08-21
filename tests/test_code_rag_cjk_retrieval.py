@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """純 CJK / 無 lexical 命中的 query 回零結果 —— 真實 bug regression(2026-08-21)。
 
-MetaWare 樹實測:「環境變數怎麼傳給子行程」回 0 筆,而語料裡有 environ.c、
-system.c 的 fork/execvp、run-lldbac.py 的 os.environ→subprocess。
+真實樹實測:「環境變數怎麼傳給子行程」回 0 筆,而語料裡有 environ.c、
+system.c 的 fork/execvp 這些該命中的東西。
 
 機制是算術的,不是偶發:``_extract_code_tokens`` 只抽 ``[A-Za-z_][A-Za-z0-9_]{2,}``,
 純中文問句抽出空集合 → 全語料 ``kw_score`` 皆 0 → fusion 的
@@ -157,3 +157,26 @@ def test_cjk_with_unmatched_ascii_token_returns_hits(monkeypatch, tmp_path):
     assert rag._extract_code_tokens(question), "前提:這題必須抽得出 ASCII token"
     hits = rag.query(question, top_k=5)
     assert hits, "有 token 但零命中的 query 回零結果"
+
+
+def test_type_bonus_only_applies_when_there_is_lexical_signal():
+    """純語意 query 不得給 function 平白的 +0.05 —— 那個 bonus 會壓掉 global。
+
+    真實樹實測(2026-08-21):「環境變數怎麼傳給子行程」的答案
+    ``environ.c::_environ`` 是 global,dense 排名 369,但 combined 排名 7793 ——
+    中間那 7400 名幾乎都是靠 +0.05 插隊的 function。全語料 emb 只落在
+    0.35-0.51 這條很窄的帶上,0.05 在這裡不是「一點優先權」而是決定性的。
+    有 lexical 訊號時維持原樣(上面 108 組參數的恆等性測試守住)。
+    """
+    func, _rule = hybrid_symbol_score(
+        emb_score=BAND_EMB, kw_score=0.0, item_type="function",
+        is_explicit_mention=False, code_token_count=0, lexical_has_signal=False,
+    )
+    glob, _rule = hybrid_symbol_score(
+        emb_score=BAND_EMB, kw_score=0.0, item_type="global",
+        is_explicit_mention=False, code_token_count=0, lexical_has_signal=False,
+    )
+    assert func == pytest.approx(glob), (
+        f"function={func:.4f} global={glob:.4f};同樣的 cosine 下 function 仍被加分"
+    )
+    assert func == pytest.approx(BAND_EMB), "無 lexical 訊號時 combined 就該等於 emb"
