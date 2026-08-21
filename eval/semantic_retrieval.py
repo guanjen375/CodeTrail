@@ -392,16 +392,20 @@ def lane_runtime_hybrid(rag, question: str, query_vector: list[float],
 
     tokens = rag._extract_code_tokens(question)
     tokens_lower = {t.lower() for t in tokens}
+    # production 的 query() 同樣先算完整份 kw_scores 才決定融合權重:
+    # 「有沒有 lexical 命中」是候選集的全域性質,逐筆算來不及。
+    kw_scores = [rag._token_match_score(tokens, doc["item"]) for doc in documents]
+    lexical_has_signal = any(score > 0 for score in kw_scores)
     scored: list[tuple[float, float, float, dict]] = []
-    for doc in documents:
+    for doc, kw_score in zip(documents, kw_scores):
         emb_score = cosine(query_vector, cache.document_vector(doc))
-        kw_score = rag._token_match_score(tokens, doc["item"])
         combined, rule = code_rag.hybrid_symbol_score(
             emb_score=emb_score,
             kw_score=kw_score,
             item_type=doc["kind"],
             is_explicit_mention=doc["symbol"].lower() in tokens_lower,
             code_token_count=len(tokens),
+            lexical_has_signal=lexical_has_signal,
         )
         scored.append((combined, emb_score, kw_score, dict(doc, score_rule=rule)))
 

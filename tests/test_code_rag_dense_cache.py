@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""CodeRAG dense cache 的兩個真實 bug regression(2026-08-21,MetaWare 樹實測)。
+
+D2:``_lazy_embed`` 只看符號數,不看 embedding 是否已備齊。一份**已經完整
+    embed** 的索引每次載入仍被判為 lazy(``code_rag.py`` 的
+    ``total_symbols > CODE_RAG_LAZY_EMBED_MAX_SYMBOLS``),於是 dense 矩陣
+    不建、查詢時再跑一次 ``_materialize_dense_index()``。
+
+D3:``build_index()`` 結尾無條件 ``_save_cache()``,即使 0 檔變更、0 檔刪除。
+
+兩者疊加的實測後果:330270 個符號的樹上,meta JSON 是 22.9GB,單次查詢會
+觸發 **2 次**全量回寫,每次約 100 分鐘(實測寫入速率 3.6MB/s)。
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import code_rag  # noqa: E402
+
+pytestmark = pytest.mark.smoke
+
+
+@pytest.fixture(autouse=True)
+def _clean_scan_cache():
+    code_rag._INDEX_SCAN_CACHE.clear()
+    yield
+    code_rag._INDEX_SCAN_CACHE.clear()
+
+
+def _make_repo(tmp_path: Path, n_files: int = 3, funcs_per_file: int = 3) -> Path:
+    for i in range(n_files):
+        body = "".join(
+            f"def func_{i}_{j}():\n    return {j}\n\n" for j in range(funcs_per_file)
+        )
+        (tmp_path / f"mod_{i}.py").write_text(body, encoding="utf-8")
+    return tmp_path
+
+
+def _rag(monkeypatch, root: Path, *, lazy_max: int = 1) -> code_rag.CodeRAG:
+    """離線 CodeRAG,且 lazy 門檻壓到必定觸發。"""
+    monkeypatch.setattr(code_rag, "CODE_RAG_LAZY_EMBED", True)
+    monkeypatch.setattr(code_rag, "CODE_RAG_LAZY_EMBED_MAX_SYMBOLS", lazy_max)
+    monkeypatch.setattr(code_rag, "USE_RERANKER", False)
+    rag = code_rag.CodeRAG(str(root))
+    monkeypatch.setattr(rag, "_get_embedding", lambda _text: [1.0, 0.0])
+    monkeypatch.setattr(rag, "_embed_texts_batched",
+                        lambda texts: [[1.0, 0.0]] * len(texts))
+    return rag
+
+
+def test_fully_embedded_index_is_not_treated_as_lazy(monkeypatch, tmp_path):
+    """D2:cache 裡每個符號都有 embedding 時,重新載入不得再判為 lazy。"""
+    root = _make_repo(tmp_path)
+
+    first = _rag(monkeypatch, root)
+    first.build_index(verbose=False)
+    assert first._lazy_embed is True, "前提:符號數必須超過 lazy 門檻"
+    first._materialize_dense_index()          # 補齊 embedding 並落盤
+    assert first._lazy_embed is False
+
+    second = _rag(monkeypatch, root)
+    second.build_index(verbose=False)
+    assert second._lazy_embed is False, (
+        "embedding 已全部在 cache 裡,不該再被當成 lazy —— 否則每次查詢都會"
+        "重跑 _materialize_dense_index() 並全量回寫 cache"
+    )
+    assert second.embeddings is not None, "非 lazy 就該直接建好 dense 矩陣"
+
+
+def test_unchanged_index_does_not_rewrite_cache(monkeypatch, tmp_path):
+    """D3:0 檔變更 0 檔刪除時,build_index 不得回寫 cache。"""
+    root = _make_repo(tmp_path)
+
+    first = _rag(monkeypatch, root)
+    first.build_index(verbose=False)
+    first._materialize_dense_index()
+
+    second = _rag(monkeypatch, root)
+    calls: list[int] = []
+    monkeypatch.setattr(second, "_save_cache", lambda: calls.append(1))
+    second.build_index(verbose=False)
+    assert calls == [], (
+        f"完全未變更的索引不該回寫 cache,實際呼叫 {len(calls)} 次"
+    )
+
+
+def test_changed_file_still_writes_cache(monkeypatch, tmp_path):
+    """D3 的反向防線:真的有變更時仍必須回寫,不能為了省 IO 而漏存。"""
+    root = _make_repo(tmp_path)
+
+    first = _rag(monkeypatch, root)
+    first.build_index(verbose=False)
+    first._materialize_dense_index()
+
+    (root / "mod_new.py").write_text(
+        "def brand_new_symbol():\n    return 1\n", encoding="utf-8"
+    )
+
+    second = _rag(monkeypatch, root)
+    calls: list[int] = []
+    original = code_rag.CodeRAG._save_cache
+
+    def counting_save():
+        calls.append(1)
+        return original(second)
+
+    monkeypatch.setattr(second, "_save_cache", counting_save)
+    second.build_index(verbose=False)
+
+    assert calls, "有新增檔案時必須回寫 cache"
+    assert any(item.get("symbol") == "brand_new_symbol" for item in second.index)

@@ -61,7 +61,7 @@ CODE_RAG_CACHE_SCHEMA_VERSION = 3
 #   - CodeGraph fingerprint:**否**。
 #   - eval vector manifest / baseline report:**是**。lane 分數換演算法後
 #     舊 baseline 不可比。
-RETRIEVAL_SCORER_VERSION = 1
+RETRIEVAL_SCORER_VERSION = 2
 
 # Embed text 的 schema 版本。增量重建只比 file_hash,改了 render 卻沒有任何
 # 東西會自動失效 —— 這個版本常數與 cache_identity() 是唯二的防線。
@@ -291,7 +291,8 @@ def cache_identity() -> dict:
 
 def hybrid_symbol_score(*, emb_score: float, kw_score: float, item_type: str,
                         is_explicit_mention: bool,
-                        code_token_count: int) -> tuple[float, str]:
+                        code_token_count: int,
+                        lexical_has_signal: bool) -> tuple[float, str]:
     """Production 的 hybrid 融合分數。純函式,無 self / 無 I/O。
 
     抽出來的理由(施工規格 §6 P1A-2):evaluator 的 ``runtime_hybrid`` lane
@@ -310,7 +311,14 @@ def hybrid_symbol_score(*, emb_score: float, kw_score: float, item_type: str,
         return 0.9 + kw_score * 0.1, "lexical_dominant"
     # 一般情況:function 類型給一點優先權
     type_bonus = 0.05 if item_type == 'function' else 0.0
-    return 0.5 * emb_score + 0.5 * kw_score + type_bonus, "fusion"
+    # 整個候選集都沒有 lexical 命中時(純 CJK 問句,或中文夾了語料裡不存在的
+    # 英文詞),kw_score 恆為 0。此時仍對半混合等於把 embedding 門檻從 0.35
+    # 悄悄抬成 0.70(function 因 bonus 是 0.60)—— 實測 MetaWare 樹全語料
+    # emb 上限只有 0.5112,於是純中文 query 結構性地永遠回零。
+    # 判準是「有沒有實際命中」而非「有沒有抽出 token」:抽得出 token 但零命中
+    # 的 query 一樣沒有 lexical 訊號可用。
+    kw_weight = 0.5 if lexical_has_signal else 0.0
+    return (1.0 - kw_weight) * emb_score + kw_weight * kw_score + type_bonus, "fusion"
 
 
 def select_scored_candidates(scores: list, *, threshold: float, top_k: int,
@@ -877,6 +885,19 @@ class CodeRAG:
 
         self._file_cache = new_file_cache
 
+        # lazy 的定義是「還有符號沒 embed」,不是「符號很多」。上面的門檻只看
+        # total_symbols,所以一份**已經完整 embed** 的索引每次載入都會被判成
+        # lazy:dense 矩陣不建,查詢時再跑一次 _materialize_dense_index(),
+        # 結尾又全量回寫 cache。33 萬符號的樹上那份 meta JSON 是 22.9GB,
+        # 單次查詢因此付兩次約 100 分鐘的寫入。備齊了就不是 lazy。
+        if (
+            self._lazy_embed
+            and embeddings_list
+            and len(embeddings_list) == len(self.index)
+            and all(embeddings_list)
+        ):
+            self._lazy_embed = False
+
         # 將 embedding 轉換為 numpy array 並預先 L2 normalize
         if HAS_NUMPY and embeddings_list and not self._lazy_embed:
             try:
@@ -926,7 +947,13 @@ class CodeRAG:
                 print(f"[CODE_RAG] lazy embed on: >{CODE_RAG_LAZY_EMBED_MAX_SYMBOLS} symbols")
             self._print_scope_summary()
 
-        self._save_cache()
+        # 0 檔變更 + 0 檔刪除 = cache 內容與剛讀進來的完全一致,回寫等於把同一份
+        # 位元組再寫一次。大樹上這一次就是 22.9GB / 約 100 分鐘,而且每個新
+        # process 都會付。有任何 delta(含首次建索引)才存。
+        if is_incremental and not files_to_index and not files_deleted:
+            pass
+        else:
+            self._save_cache()
 
     def _print_scope_summary(self) -> None:
         """索引範圍摘要 —— **只有計數,永遠不印路徑或 pattern 內容**。
@@ -1347,19 +1374,23 @@ class CodeRAG:
 
         code_tokens = self._extract_code_tokens(question)
         code_tokens_lower = {t.lower() for t in code_tokens}
-        kw_scores = None
+
+        # kw_scores 一律先算一次。同一份結果餵三個地方:lazy 分支用它決定要不要
+        # materialize、融合公式用它決定 lexical 半邊有沒有訊號可用、下面的計分
+        # 迴圈直接沿用。非 lazy 路徑原本是在計分迴圈裡逐筆算,總工作量不變,
+        # 只是把順序提前 —— 因為「有沒有 lexical 命中」是全域性質,逐筆算的時候
+        # 已經來不及拿來決定權重了。
+        kw_scores = []
+        explicit_indices = []
+        for i, item in enumerate(self.index):
+            kw_scores.append(self._token_match_score(code_tokens, item))
+            symbol_lower = item.get("symbol", "").lower()
+            if symbol_lower and symbol_lower in code_tokens_lower:
+                explicit_indices.append(i)
+        lexical_has_signal = any(score > 0 for score in kw_scores)
 
         if self._lazy_embed:
-            kw_scores = []
-            explicit_indices = []
-            for i, item in enumerate(self.index):
-                kw_score = self._token_match_score(code_tokens, item)
-                kw_scores.append(kw_score)
-                symbol_lower = item.get("symbol", "").lower()
-                if symbol_lower and symbol_lower in code_tokens_lower:
-                    explicit_indices.append(i)
-
-            if not any(score > 0 for score in kw_scores):
+            if not lexical_has_signal:
                 # All lexical scores tied at zero: slicing the first N symbols
                 # is arbitrary and makes dense recall effectively random.
                 self._materialize_dense_index()
@@ -1418,7 +1449,7 @@ class CodeRAG:
                 else:
                     emb_score = 0
 
-            kw_score = kw_scores[i] if kw_scores is not None else self._token_match_score(code_tokens, item)
+            kw_score = kw_scores[i]
 
             # 明確點名 symbol 時，大幅提高權重
             # 改進：用 symbol 精確匹配（正則邊界）而非單純 kw_score 門檻
@@ -1433,6 +1464,7 @@ class CodeRAG:
                 item_type=item.get('type', ''),
                 is_explicit_mention=is_explicit_mention,
                 code_token_count=len(code_tokens),
+                lexical_has_signal=lexical_has_signal,
             )
 
             scores.append((combined, emb_score, kw_score, item))
