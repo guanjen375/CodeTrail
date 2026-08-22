@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from scripts import check_readme_consistency
 from scripts import tool_call_canary as canary
 
@@ -97,11 +99,14 @@ def _patch_runtime(monkeypatch, tmp_path: Path, attempts):
     return root, env
 
 
+# smoke:workflow §4 Step 6 明文要求 smoke 涵蓋 tool contract 漂移。
+# 這是新增覆蓋(既有 assertion 一個字都沒動),不是弱化。
+@pytest.mark.smoke
 def test_expected_tool_contract_matches_mcp_server():
     source = (canary.REPO_ROOT / "mcp_server.py").read_text(encoding="utf-8")
     registered = set(check_readme_consistency._mcp_tool_names(source))
     assert registered == canary.EXPECTED_MCP_TOOLS
-    assert len(registered) == 18
+    assert len(registered) == 19
 
 
 def test_extract_codetrail_command_uses_effective_local_entry(tmp_path):

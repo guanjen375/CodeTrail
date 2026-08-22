@@ -107,7 +107,7 @@ def test_mcp_protocol_roundtrip(tmp_path: Path):
         asyncio.wait_for(_roundtrip(project), timeout=60)
     )
 
-    assert len(names) == 18
+    assert len(names) == 19
     for expected in ("query_knowledge", "list_dir", "read_file", "grep_code"):
         assert expected in names, f"工具 {expected} 沒註冊成功；實得 {sorted(names)}"
     max_chars_schema = code_search_schema["properties"]["max_chars"]

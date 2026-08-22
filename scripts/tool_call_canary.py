@@ -66,6 +66,7 @@ EXPECTED_MCP_TOOLS = frozenset(
         "record_lesson",
         "reload_knowledge_base",
         "remove_document",
+        "review_figures",
         "run_command",
         "run_lint",
     }

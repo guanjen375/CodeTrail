@@ -40,6 +40,7 @@ from typing import Dict, List, Optional, Tuple
 import config
 import context_budget
 import endpoint_policy
+import figure_extract
 from extracted_document import ExtractedDocument
 
 # ============================================================
@@ -86,8 +87,11 @@ SUMMARY_PROMPT_V1 = """你是文件摘要助理。
 """
 
 # VL 產物本身就是生成文本，再 contextualize 是生成疊生成。
-# diagram = PDF 內嵌圖經 VL 抽述（RAG.extract_pdf_document 的自動路徑）。
-_GENERATIVE_ORIGINS = frozenset({"image", "screenshot", "diagram"})
+# diagram = PDF 內嵌圖經 VL 抽述（RAG.extract_pdf_document 的 legacy 圖面路徑）。
+# figure_* = PDF 結構化 figure lane 的 canonical payload 衍生文字（契約 §4）：
+# 它的 content 是「JSON 真相的一種 render」，不是散文，替它生成脈絡既多花一輪主模型，
+# 也會把生成內容黏在逐格／逐行忠實的表格與 log 前面。
+_GENERATIVE_ORIGINS = frozenset({"image", "screenshot", "diagram"}) | figure_extract.FIGURE_ORIGINS
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _SENTENCE_END = re.compile(r"[.。!?！？；;]")
@@ -973,7 +977,14 @@ class ContextGenerator:
 
 
 def is_generative_origin(chunk: Dict) -> bool:
-    """VL 產物（圖片 / 截圖 / PDF 內嵌圖）不 contextualize：生成疊生成。"""
+    """VL 產物與 structured figure 不 contextualize：生成疊生成。
+
+    先看 `structured` 旗標再看 `origin`：`structured=True` 是 retrieval 端唯一的
+    判斷旗標（契約 §4），未來新增 figure origin 時不必回頭改這裡；漏改的症狀是
+    靜默的（多一輪主模型 + 多一段生成前綴，沒有人會收到警告）。
+    """
+    if bool(chunk.get("structured")):
+        return True
     return str(chunk.get("origin", "")) in _GENERATIVE_ORIGINS
 
 

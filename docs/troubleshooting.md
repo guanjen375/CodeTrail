@@ -172,9 +172,9 @@ RAM 不夠的就保持 mmap 接受偶爾卡頓,或換較小模型 / 調高 CPU-M
 | 工具註冊 | client 收到 CodeTrail 的工具 schema | OpenCode 的 tools / MCP 檢視;完整名稱見 [MCP 工具清單](mcp-tools.md) |
 | 本輪實際執行 | 模型真的發出結構化 tool call,client 執行後把結果送回模型 | TUI 工具卡,或 JSON event 的 `type: "tool_use"`、`state.status: "completed"` |
 
-新版 `aicode` 已把這兩個容易漏做的檢查接到啟動流程，不需要每次先叫模型背 18 個名字：
+新版 `aicode` 已把這兩個容易漏做的檢查接到啟動流程，不需要每次先叫模型背 19 個名字：
 
-- `MCP PASS — 18 tools + list_dir round-trip`：每次啟動都另起實際設定的 MCP command，完成 `initialize`、精確比對 18 個 schema，再真的執行無副作用的 `list_dir(path=".", depth=1)`。這一層完全不問 LLM。
+- `MCP PASS — 19 tools + list_dir round-trip`：每次啟動都另起實際設定的 MCP command，完成 `initialize`、精確比對 19 個 schema，再真的執行無副作用的 `list_dir(path=".", depth=1)`。這一層完全不問 LLM。
 - `MODEL PASS — structured codetrail_list_dir completed`：用 fresh headless session 跑 active model，只接受 JSON stream 裡 completed 的結構化 `tool_use`。純文字／XML 和模型自行宣稱成功都不會通過。
 - `MODEL live canary — <原因>`：第二層 cache 未命中（新專案、設定變動、快取過期或 `--force`）時，實跑前會先印出原因與單次上限秒數，執行中每 15 秒回報一次「仍在執行」。本地推理通常需要數十秒到數分鐘——看得到心跳就不是當機，完全靜默才是異常。
 - `MODEL PASS — cached ...`：相同專案、模型、OpenCode 設定、全域／專案 AGENTS、server `/props`（含 chat template 與取樣預設）曾在 24 小時內通過；MCP 第一層仍是本次 live 檢查。指紋任一部分改變會自動重測。
@@ -193,7 +193,7 @@ AICODE_TOOL_CANARY_WARN_ONLY=1 aicode
 AICODE_TOOL_CANARY_SKIP=1 aicode
 ```
 
-預設 cache TTL 是 86400 秒；需要更頻繁抽查可設 `AICODE_TOOL_CANARY_TTL_SECONDS=<SECONDS>`（設 `0` 等同每次 live model canary）。第一層或第二層 FAIL 時，訊息會刻意區分「MCP/config/18-tool contract」和「MCP 已通但 model/provider/chat-template 沒產生 tool call」，避免再把兩者混為一談。
+預設 cache TTL 是 86400 秒；需要更頻繁抽查可設 `AICODE_TOOL_CANARY_TTL_SECONDS=<SECONDS>`（設 `0` 等同每次 live model canary）。第一層或第二層 FAIL 時，訊息會刻意區分「MCP/config/19-tool contract」和「MCP 已通但 model/provider/chat-template 沒產生 tool call」，避免再把兩者混為一談。
 
 **「剛 ingest 文件就失憶」不等於整份 RAG 塞爆 context。** `ingest_document` 把全文切 chunk 後寫進 `knowledge.json`,它送回目前對話的只有有長度上限的執行摘要;`reload_knowledge_base` 只更新 MCP process 內的 KB singleton。只有之後呼叫 `query_knowledge` 時,召回的少量 REF 才會以 tool result 進入那個 session。新 session 不會因為 KB 裡文件變多就自動攜帶全文。同一個舊 session 累積很多 tool result 時仍可能變長,但要看實際 token / compaction,不能只看 ingest 發生過就下結論。
 
@@ -265,7 +265,7 @@ curl -s http://localhost:8080/props | jq -r '.chat_template' \
 
 例如模型只寫出自創的 `<codetrail_list_dir .../>`,不會因為看起來像 XML 就被 frontend 當成結構化呼叫。不要靠 prompt 手寫 / 猜測底層 tool-call markup;應讓 OpenCode、provider adapter 與 llama.cpp chat template 處理。
 
-若 server 已降溫但模型仍會否認工具,把 [OpenCode 全域 AGENTS.md 範本](opencode-agents-template.md) 合併進 `~/.config/opencode/AGENTS.md`,至少要「CodeTrail 工具存在性與真實呼叫」一段。完整列名是刻意的:只寫一句「優先用 `codetrail_*`」仍可能被較弱的本機模型忽略;新增或移除 MCP tool 時要同步 [工具清單](mcp-tools.md)與該範本(consistency check 會抓)。
+若 server 已降溫但模型仍會否認工具,把 [OpenCode 全域 AGENTS.md 範本](opencode-agents-template.md) 裝進 `~/.config/opencode/AGENTS.md`(`python scripts/opencode_contract_check.py --sync-agents-md`,會備份原檔),至少要「CodeTrail 工具存在性與真實呼叫」一段。**已經裝過的也要確認沒過期** —— 那份檔不會跟著 `git pull` 更新,工具清單一舊,模型就會否認新工具存在;`aicode` 啟動時的 `⚠ STALE: 全域 AGENTS.md 與範本不一致` 講的就是這件事。完整列名是刻意的:只寫一句「優先用 `codetrail_*`」仍可能被較弱的本機模型忽略;新增或移除 MCP tool 時要同步 [工具清單](mcp-tools.md)與該範本(consistency check 會抓)。
 
 改全域規則後完全退出並重開 OpenCode,用新 session 分別測「列出所有 CodeTrail 工具」與強制 `codetrail_list_dir`。前者只列清單、不出現工具卡是正常的;後者必須出現結構化 `tool_use`。降溫與規則都完成後仍反覆失敗,才表示這顆模型 / template 組合的工具呼叫能力不穩,應換成已驗證支援 tool calling 的模型或版本。
 
@@ -604,6 +604,101 @@ python3 scripts/required_model_servers_check.py
 新版 CodeTrail 走 llama.cpp 的 `/v1/chat/completions` `image_url` 多模態格式；舊版
 top-level `image_data` 可能被新版 llama.cpp 靜默忽略，造成模型只看提示詞猜圖。
 
+### PDF ingest 說 preflight 超過上限
+
+`ingest_document(path, preflight_only=True)`(或 `python RAG.py <pdf> knowledge.json --preflight`)
+報告超出上限時,**還沒有呼叫任何 VL、沒有算 embedding、沒有動 `knowledge.json`** —— 零寫入,
+不需要善後。報告會指出是哪一項超出:
+
+| 報告欄位 | 上限常數(env 同名加 `AICODE_` 前綴) | 預設 |
+|---|---|---|
+| `candidates` | `FIGURE_MAX_CANDIDATES_PER_DOC` / `FIGURE_MAX_CANDIDATES_PER_PAGE` | 200 / 12 |
+| `tiles` | `FIGURE_MAX_TILES_PER_CANDIDATE` | 8 |
+| `vl_calls_max` | `FIGURE_MAX_VL_CALLS_PER_DOC` | 120 |
+| `image_tokens_est` | `FIGURE_MAX_IMAGE_TOKENS_PER_DOC` / `FIGURE_MAX_IMAGE_TOKENS_PER_CALL` | 200000 / 4096 |
+
+> **這些欄位只涵蓋結構化 lane。** 既有自由文字 VL lane(純 raster 內嵌圖、掃描頁)的呼叫
+> **不受這些上限判定**;報告會另外印一個未受閘控的粗估(去重前,而且沒有 image-token
+> 估算)。所以「在預算內」**不等於**整份 PDF 的總成本在預算內。
+
+三種處理方式:
+
+1. 把 PDF 拆成較小的檔案分批入庫(通常最省事,也讓失敗範圍變小)。
+2. 調高對應上限,例如 `AICODE_FIGURE_MAX_VL_CALLS_PER_DOC=300 aicode`。
+   這些是**成本上限**,調高的代價是更慢、更吃資源。它們也會改變實際送進模型的東西
+   (image token 上限影響解析度、tile 上限影響怎麼切、candidate 上限影響哪些框被抽),
+   甚至可能超出你的 server / model 能吃的範圍 —— **不要假設調高之後結果一定一樣或更好**。
+   調完請重跑一次 preflight,並依 `verification_status` 與人工覆核判斷結果。
+3. 在終端機直接跑(沒有 MCP 的單次呼叫 timeout):
+
+```bash
+python RAG.py docs/datasheet.pdf knowledge.json
+```
+
+### ingest 逾時,但看得到中途輸出
+
+MCP 端是逐行讀子行程輸出的,所以逾時時**已經收到的每一行都會保留在回傳裡**(看得到卡在
+第幾張圖、第幾頁)。同時子行程連同它的 process group 會被 SIGTERM → SIGKILL 收掉,
+而且會**確認收屍**才敢說「已確認終止」。
+
+如果回傳寫的是「**無法確認子行程已終止**」,那就照它附的 `ps` / `kill` 命令自己確認一次 ——
+那代表 RAG.py 可能還在背景跑、**仍可能寫入 knowledge.json**,這次呼叫不能當成零寫入。
+
+正常情況下入庫是**原子提交**,逾時中止通常代表零寫入;要確認就呼叫 `reload_knowledge_base`
+看 chunk 數。
+接下來照回傳裡附的那條命令在終端機跑(它已經幫你把路徑做好 quoting,含空白也能直接複製)。
+PDF 的話回傳還會多附一條 `--preflight` 版本,先估成本再決定。
+
+如果回傳寫的是「輸出不完整」而不是逾時,那代表讀取子行程輸出的執行緒出了問題 —— 這種情況
+**不會**回報成功,因為手上的輸出不足以判斷入庫結果;一樣改用 CLI 重跑並看 chunk 數。
+
+### 查得到那張表,但嚴格模式拒絕用它回答數值
+
+這是設計行為,不是 bug。`query_knowledge_strict` 在 **code 層**排除未通過驗證的圖片內容
+(`needs_review` / `unverified` / `legacy_unverified`),所以它不會用沒被獨立證據佐證的圖片
+數值回答 register、bit range 或規格數字。被擋下的那些會出現在回傳的 `excluded_figures`
+(帶 source、頁碼、`figure_id`、kind、狀態與原因)與 `review_hint` —— **四條回傳路徑都有**,
+所以「全部候選都被擋」時你仍看得到「哪一頁、哪一張圖可用但待覆核」,不會被誤導成「查不到」。
+
+診斷順序:
+
+```text
+請用工具 review_figures,action 設 "list",列出待覆核的圖與原因。
+```
+
+看 `reasons`:
+
+- `▯` / glyph 衝突 → 該字元在原圖上就分不出來(例如 `8` 與 `B`、`0` 與 `O`)。這種只能人看原圖。
+- 缺 row/line、tile 縫合不確定、截斷 → 抽取沒能覆蓋完整,同樣要人工確認。
+- `legacy_unverified` → 這張是**舊 KB** 或**純 raster 路徑**的 chunk。舊 KB 的圖片 chunk 在
+  載入時一律補成這個狀態(只在記憶體內,不改你的 `knowledge.json`)。
+
+處理方式(先看那一筆有沒有 `figure_id`:有才是 structured、才進得了 `review_figures`):
+
+- **structured figure(有 `figure_id`)** → 可以用 `review_figures(action="fix", ...,
+  confirm_against_image=True)` 人工覆核(它會改知識庫,permission 是 `ask`,你會在核准框
+  看到完整參數)。
+- **原生表格(PDF 裡可以選取文字)** → `remove_document` 之後重新 `ingest_document`,
+  它會走結構化 lane,**可能**拿到可信狀態。但「有原生文字」不保證 `native_verified`:
+  那需要兩個一致的原生 evidence channel;只有一個通道時是 `unverified`,通道矛盾時是
+  `needs_review`。native lane 不呼叫 VL,所以也**不會**產生 `corroborated`。實際結果以
+  重 ingest 後 `review_figures(action="list")` 顯示的為準。
+- **掃描版 / 拍照版 / 舊 KB 的 VL chunk(沒有 `figure_id`)** → 這些**不會出現在
+  `review_figures` 裡**,沒有 canonical payload 可以 fix,重 ingest 也只會回到自由文字
+  VL lane。**本輪沒有把純 raster 升成 strict-trusted 的支援路徑** —— 要那些數字,只能自己
+  回去看原始 PDF 的那一頁,或改用有原生文字的來源重新入庫。
+- 覆核時如果 `list` 回 `payload: (讀不到)`,代表那份 review artifact 已經被清掉了;
+  `fix` 需要 canonical payload,只能重新 ingest 該文件。清除的影響見
+  [setup 的清除 PDF review artifacts](setup.md#清除-pdf-review-artifacts可能含-nda)。
+
+**升級注意**:舊安裝 `git pull` 之後,全域 `opencode.json` 可能還沒有
+`codetrail_review_figures: "ask"` 這個核准閘(新工具會被舊的 `codetrail_*: allow` wildcard
+直接放行)。`aicode` 每次啟動會自動補;不經 `aicode` 直接開 `opencode` 的話,先跑:
+
+```bash
+python3 <CODETRAIL_REPO>/scripts/opencode_contract_check.py --fix
+```
+
 ### llama-server 不可連 / 404
 
 代表對應 server 沒啟動,或 port 設錯。先 curl 試:
@@ -729,6 +824,8 @@ doctor 報:
 ```bash
 curl -s http://localhost:8081/health
 ```
+
+chunks 大於 0、一般 `query_knowledge` 也查得到,但 `query_knowledge_strict` 就是不用那張表的數字 —— 那不是「沒結果」,見上面[查得到那張表,但嚴格模式拒絕用它回答數值](#查得到那張表但嚴格模式拒絕用它回答數值)。
 
 ### `apply_patch(...)` 被拒絕
 

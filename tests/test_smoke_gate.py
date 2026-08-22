@@ -27,6 +27,7 @@ SAFETY_MODULES = {
     "test_mcp_startup.py": "mcp_server 啟動時的 AICODE_ROOT 驗證與 set_sandbox_root",
     "test_mcp_runtime_policy.py": "PATCH_ENABLED / RUN_COMMAND_ENABLED / build 命令預設",
     "test_endpoint_policy.py": "prompt 與文件內容只能送到本機 endpoint",
+    "test_figure_review.py": "figure_review.safe_figure_path(.codetrail/figures 邊界 + symlink + atomic write)",
 }
 
 

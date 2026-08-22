@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import json
 import math
 import os
@@ -17,11 +18,51 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Mapping
 
 
 class KnowledgeStoreError(RuntimeError):
     """The on-disk knowledge store is incomplete or internally inconsistent."""
+
+
+def chunk_id(chunk: Mapping) -> str:
+    """KB chunk 的 id 組法（**單一實作**）。
+
+    格式凍結為 ``f"{source}::p{page}::c{chunk_index}::{md5(content)[:8]}"``——與
+    ``RAG._commit_document_to_kb`` 原本的行內字面值逐字相同。人工修正 figure 時要重算
+    id，兩處各寫一份公式必然漂移（而漂移是靜默的：id 只是識別字串，錯了不會有人喊），
+    所以組法放在 store 層由兩邊共用。
+
+    **缺任一身分欄位或型別不對一律 fail-loud**（``KnowledgeStoreError``）。id 是
+    chunk 在 KB 內的身分：把缺 ``source`` 的 chunk 補成空字串，會讓兩個不同來源的
+    chunk 拿到同一個 id，後續的去重與人工修正就會覆寫到錯的東西。舊碼直接
+    ``chunk['source']`` / ``chunk['content'].encode()``，缺欄位本來就會 KeyError /
+    AttributeError——這裡維持同一條界線，只是換成訊息說得清楚的例外。
+    """
+    for name, types in (("source", str), ("page", int),
+                        ("chunk_index", int), ("content", str)):
+        if name not in chunk:
+            raise KnowledgeStoreError(
+                f"chunk 缺少身分欄位 {name!r}，無法產生 id"
+                f"（現有欄位：{sorted(chunk)[:10]}）；補預設值會讓不同 chunk 撞 id"
+            )
+        value = chunk[name]
+        if isinstance(value, bool) or not isinstance(value, types):
+            raise KnowledgeStoreError(
+                f"chunk 的 {name!r} 必須是 {types.__name__}，收到 "
+                f"{type(value).__name__}({value!r})"
+            )
+    source = chunk["source"]
+    if not source:
+        raise KnowledgeStoreError("chunk 的 'source' 不得是空字串——id 會失去來源身分")
+    page = chunk["page"]
+    chunk_index = chunk["chunk_index"]
+    if page < 0 or chunk_index < 0:
+        raise KnowledgeStoreError(
+            f"chunk 的 page={page} / chunk_index={chunk_index} 不得為負"
+        )
+    digest = hashlib.md5(chunk["content"].encode("utf-8")).hexdigest()[:8]
+    return f"{source}::p{page}::c{chunk_index}::{digest}"
 
 
 def _lock_path(json_path: Path) -> Path:

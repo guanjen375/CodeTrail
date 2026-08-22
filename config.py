@@ -2,7 +2,9 @@
 """
 智能程式碼分析器 - 設定檔
 """
+import math as _math
 import os as _os
+from pathlib import Path as _Path
 
 import deployment_profile as _deployment_profile
 import model_resolution as _model_resolution
@@ -205,6 +207,116 @@ def require_pymupdf4llm():
             f"請執行: {PYMUPDF4LLM_INSTALL_HINT}"
         )
     return pymupdf4llm
+
+
+# ============================================================
+# PDF 圖片結構化抽取(figure_extract / figure_candidates / figure_verify /
+# figure_review)的可攜上限
+# ============================================================
+# 這一組全部是「跨機器都成立」的結構性上限:候選數、tile 數、VL 呼叫數、
+# image token 預算、chunk 字元預算。**刻意不放**單機秒數、單一模型名稱、
+# 準確率假設——那些會讓別台機器的行為與這台不同(workflow §7)。
+# 需要調整的人改環境變數即可,不必改碼。
+class FigureConfigError(ValueError):
+    """`AICODE_FIGURE_*` 環境覆寫超出契約允許範圍。一律 fail-loud,不回退預設值。
+
+    為什麼不「壞值就用預設」:這一組裡有**安全語義旋鈕**。實例——
+    `AICODE_FIGURE_KIND_MARGIN=nan` 會讓 `top - second < margin` 永遠為 False
+    (NaN 的比較恆假),於是 table/terminal 分數再接近也不會進 KIND_UNKNOWN 的
+    dual pass,誤判就靜默通過;`AICODE_FIGURE_IOU_MERGE=-1` 會讓互不相交的候選
+    也被融合。靜默回退預設值會讓「我設了但沒生效」與「我設對了」看起來一樣,
+    所以壞值必須在 import 時就炸。
+    """
+
+
+def _figure_num(name: str, default: str, *, cast, lo, hi=None, lo_exclusive: bool = False):
+    """解析單一 AICODE_FIGURE_* 覆寫;非有限值或超出 [lo, hi] 一律 FigureConfigError。"""
+    raw = _os.environ.get(name, default)
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError) as exc:
+        raise FigureConfigError(f"{name}={raw!r} 不是合法的 {cast.__name__}") from exc
+    if isinstance(value, float) and not _math.isfinite(value):
+        raise FigureConfigError(f"{name}={raw!r} 不是有限數值(inf/nan 會讓安全比較恆假)")
+    too_low = value <= lo if lo_exclusive else value < lo
+    if too_low or (hi is not None and value > hi):
+        left = "(" if lo_exclusive else "["
+        bound = f"{left}{lo}, {hi}]" if hi is not None else (
+            f"> {lo}" if lo_exclusive else f">= {lo}")
+        raise FigureConfigError(f"{name}={raw!r} 超出允許範圍 {bound}")
+    return value
+
+
+def _figure_int(name: str, default: str, *, lo: int, hi: int | None = None) -> int:
+    return _figure_num(name, default, cast=int, lo=lo, hi=hi)
+
+
+def _figure_float(name: str, default: str, *, lo: float, hi: float,
+                  lo_exclusive: bool = False) -> float:
+    return _figure_num(name, default, cast=float, lo=lo, hi=hi, lo_exclusive=lo_exclusive)
+
+
+FIGURE_MAX_CANDIDATES_PER_PAGE = _figure_int(
+    "AICODE_FIGURE_MAX_CANDIDATES_PER_PAGE", "12", lo=1)
+FIGURE_MAX_CANDIDATES_PER_DOC = _figure_int(
+    "AICODE_FIGURE_MAX_CANDIDATES_PER_DOC", "200", lo=1)
+FIGURE_MAX_VL_CALLS_PER_DOC = _figure_int(
+    "AICODE_FIGURE_MAX_VL_CALLS_PER_DOC", "120", lo=0)
+FIGURE_MAX_TILES_PER_CANDIDATE = _figure_int(
+    "AICODE_FIGURE_MAX_TILES_PER_CANDIDATE", "8", lo=1)
+# 單次呼叫與整份文件的 image-token 預算。真值依 server/模型而異,preflight
+# 用 FIGURE_IMAGE_TOKEN_PATCH_PX 的 patch 估算(估算值,不是保證)。
+FIGURE_MAX_IMAGE_TOKENS_PER_CALL = _figure_int(
+    "AICODE_FIGURE_MAX_IMAGE_TOKENS_PER_CALL", "4096", lo=1)
+FIGURE_MAX_IMAGE_TOKENS_PER_DOC = _figure_int(
+    "AICODE_FIGURE_MAX_IMAGE_TOKENS_PER_DOC", "200000", lo=1)
+FIGURE_IMAGE_TOKEN_PATCH_PX = _figure_int(
+    "AICODE_FIGURE_IMAGE_TOKEN_PATCH_PX", "28", lo=1)
+# 結構化 chunk 的字元預算。row/line 是不可分割原子:超過預算就多切一個
+# chunk,單一 row/line 超過就整條保留並標 oversized(絕不拆格拆列)。
+FIGURE_CHUNK_MAX_CHARS = _figure_int(
+    "AICODE_FIGURE_CHUNK_MAX_CHARS", "1200", lo=1)
+# render 目標:以 DPI 為起點,再依「有效 glyph 高度」與 image-token 預算調整。
+FIGURE_RENDER_TARGET_DPI = _figure_int(
+    "AICODE_FIGURE_RENDER_TARGET_DPI", "200", lo=1)
+FIGURE_RENDER_MAX_SIDE_PX = _figure_int(
+    "AICODE_FIGURE_RENDER_MAX_SIDE_PX", "2200", lo=1)
+FIGURE_MIN_GLYPH_PX = _figure_int("AICODE_FIGURE_MIN_GLYPH_PX", "12", lo=1)
+FIGURE_TILE_OVERLAP_PX = _figure_int("AICODE_FIGURE_TILE_OVERLAP_PX", "48", lo=0)
+# 候選融合與 kind 判定。**這兩個是安全語義旋鈕**:
+#   IOU_MERGE 必須 > 0(0 會讓只要相交就融合,-1 會讓互不相交的也融合)
+#   KIND_MARGIN 在 (0, 1](**排除 0**,理由見下方);NaN/負值會讓 dual pass 永遠不觸發
+FIGURE_IOU_MERGE = _figure_float("AICODE_FIGURE_IOU_MERGE", "0.5", lo=0.01, hi=1.0)
+# KIND_MARGIN 的下界**排除 0**:兩處判定都是 `difference < margin`,margin 為 0 時連
+# 完全同分也不會進 KIND_UNKNOWN / kind_ambiguous,而是被任意選成 terminal——那不是
+# 「明確關閉 dual pass」,是「同分時靜默錯配」(workflow §5 table ⑨)。
+FIGURE_KIND_MARGIN = _figure_float("AICODE_FIGURE_KIND_MARGIN", "0.15",
+                                   lo=0.0, hi=1.0, lo_exclusive=True)
+# schema / validator 不合格時的重試次數(workflow §4 Step 1:重試一次仍失敗
+# → 整份 PDF 零寫入)
+FIGURE_EXTRACT_RETRIES = _figure_int("AICODE_FIGURE_EXTRACT_RETRIES", "1", lo=0, hi=5)
+# review artifacts(可能含 NDA 內容,見 docs/rag.md 的保存與清除說明)
+FIGURE_REVIEW_DIR = ".codetrail/figures"
+FIGURE_REVIEW_MAX_RUNS_PER_DOC = _figure_int(
+    "AICODE_FIGURE_REVIEW_MAX_RUNS_PER_DOC", "5", lo=1)
+# capability probe 快取(依 server/model/template fingerprint 失效)
+FIGURE_PROBE_TTL_SECONDS = _figure_int(
+    "AICODE_FIGURE_PROBE_TTL_SECONDS", "86400", lo=0)
+FIGURE_PROBE_FILE_ENV = "AICODE_FIGURE_PROBE_FILE"
+
+
+def FIGURE_PROBE_CACHE_FILE():
+    """capability probe 快取路徑(比照 lessons store 放 ~/.config/codetrail/)。
+
+    函式而不是常數:HOME 在測試裡會被 monkeypatch,import-time 綁值會讓
+    測試寫到真實 home。
+    """
+    override = _os.environ.get(FIGURE_PROBE_FILE_ENV, "").strip()
+    if override:
+        return _Path(override).expanduser()
+    home = _os.environ.get("HOME") or _os.path.expanduser("~")
+    return _Path(home) / ".config" / "codetrail" / "figure_probe.json"
+
 
 # 主模型只保留一個 n_ctx 概念：正常由 set_config 的 --ctx 寫入 deployment
 # profile / server -c；aicode 啟動時再從 server /props 觀測實值並以

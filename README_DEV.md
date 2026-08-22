@@ -17,6 +17,7 @@ full。靜態 consistency / compile 檢查不會收集 pytest，可在相關檔�
 python -m compileall -q .
 python scripts/check_eval_consistency.py
 python scripts/check_readme_consistency.py
+python scripts/opencode_contract_check.py            # 全域 opencode.json / AGENTS.md 漂移
 AICODE_MODEL=test-model:latest python scripts/doctor.py --no-network
 python deployment_profile.py validate
 
@@ -118,6 +119,8 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
 - 改 `RERANKER_TOP_N` → 對應的 `eval/spec_holdout.json` gold_evidence 也要改
 - `_parse_unified_diff` 從 `agent.py` 搬到 `agent_tools.py` → `eval/code_questions.json` 的 `file` 要改
 - 換 `EMBEDDING_MODEL` → `eval/spec_adversarial.json` 也要改
+- 在 `knowledge.py` 這類檔案大量增刪行 → `eval/code_questions.json` 釘的 `line` 會漂出 ±20(實際發生過:`query` 從 2172 移到 2810),要更新
+- 新增 / 移除 MCP 工具 → `docs/opencode-agents-template.md` 的工具清單要跟著改;使用者機器上那份 `~/.config/opencode/AGENTS.md` 由 `aicode` 每次啟動比對(`⚠ STALE`)
 
 如果你在 eval 裡放 line number，**只當作 hint，誤差 ±20 行內視為正確**；
 不要把 line number 當成嚴格契約。

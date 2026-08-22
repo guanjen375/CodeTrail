@@ -1609,6 +1609,7 @@ _OPENCODE_PERMISSION_TEMPLATE = {
     "codetrail_run_command": "ask",
     "codetrail_remove_document": "ask",
     "codetrail_record_lesson": "ask",
+    "codetrail_review_figures": "ask",
     "codetrail_import_external_file": "allow",
     "webfetch": "deny",
     "websearch": "deny",

@@ -37,6 +37,7 @@ CodeTrail 啟動聊天 frontend 前會硬性檢查 llama-server `:8081` (embeddi
 
 - `read_file` 直接把純文字內容讀進對話（拿到 PDF／二進位會回導引訊息，不會吐亂碼）。
 - `analyze_file` 會先做處理 — 圖片由 VL 做通用視覺分析（文字辨識、UI／終端機、表格、圖表、架構／流程關係與一般照片都包含），PDF 抽各頁文字（內嵌圖會標註頁碼張數但不做 VL），二進位檔則抓出檔頭格式和可讀字串 — 再把整理後的結果丟給模型。
+  `analyze_file` 對 `.pdf` 是一次性抽文字，**不做**結構化圖片抽取（表格 / 終端機畫面的 canonical JSON 與驗證狀態只在 `ingest_document` 的入庫路徑產生）。
 
 `analyze_file` 是「這一輪看一次就丟」，看完不會留在 KB 裡，未來其他對話查不到。如果想把這張截圖／這份 firmware 永久保存供之後查詢，改用 `ingest_document`（見「把附件做成知識庫讓模型隨時能查」），它接受相同的圖片／binary／ELF 副檔名，並會切 chunk、算 embedding 寫進 `knowledge.json`。
 
@@ -119,6 +120,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 
 - `analyze_file(path)` / `read_file(path)` **只讓目前這一輪對話先看附件**，不會寫入 `knowledge.json`。
 - `ingest_document(path)` 會**重新讀同一個原始檔案**、切 chunk、算 embedding、寫入 `knowledge.json` —— 它**不會接收 `analyze_file` 的文字輸出**，所以第 2 步看一次只是給你參考，省略也不影響入庫結果。
+  PDF 的結構化圖片抽取（表格 / 向量文字 log → canonical JSON + 驗證狀態）也是在這一步才發生，`analyze_file` 那一輪不會產生它。
 - ingest／remove 之後**查詢會自動偵測檔案變更並重載**（code 層保證，不再依賴人工記得）。`reload_knowledge_base()` 仍可用來「立即」載入並回報 chunk 數。
 
 （另外 `import_external_file` 只負責把外部檔案帶進沙箱，本身不寫 KB。）
@@ -134,12 +136,15 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 
 #### 支援格式
 
-- **文字**：`.pdf` / `.md` / `.txt`（抽文字。**PDF 內嵌圖會自動經 VL 入庫**：幾乎沒有文字的頁（掃描頁）整頁 render 成圖，文字頁裡的圖逐張裁切送 VL；過小的圖示/分隔線略過，重複影像（頁首 logo）只入庫一次。這些 chunk 帶 `origin="diagram"`，檢索時降權、REF 會標示「VL 辨識」。**任何一張圖 VL 失敗整份文件就不入庫**（零寫入），所以混合 PDF 需要 VL server（:8083）在線）
+- **文字**：`.pdf` / `.md` / `.txt`（抽文字。PDF 裡的圖走**兩條 lane**，範圍不一樣，詳見下面「[PDF 內的表格與終端機畫面](#pdf-內的表格與終端機畫面結構化抽取--人工覆核)」：
+  1. **結構化 lane** —— 只收**有結構性原生證據**的候選（原生 markdown 表格、`find_tables` 幾何、框線格、對齊的文字帶＝無框線 memory map / register map、**向量文字**的終端機 log）。產出 canonical JSON 與逐格/逐行證據，帶驗證狀態，看不清的字元放 `▯` 而不是猜。
+  2. **既有自由文字 VL lane** —— **純 raster** 的終端機截圖、掃描頁表格、方塊圖／流程圖仍走這條：幾乎沒有文字的頁（掃描頁）整頁 render 成圖，文字頁裡的圖逐張裁切送 VL；過小的圖示/分隔線略過，重複影像（頁首 logo）只入庫一次。這些 chunk 帶 `origin="diagram"`，檢索時降權、REF 會標示「VL 辨識」，而且**沒有** `▯`／逐格證據／strict gate 保護。
+  兩條 lane 任一失敗都是**整份文件不入庫**（零寫入）。走到 VL 的圖需要 VL server（:8083）在線；純文字＋原生表格的 PDF 則可能一次 VL 都不用呼叫）
 - **圖片**：`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp`（用 VL 模型看圖、抽出文字描述後切 chunk，需要先把 VL GGUF 掛在 llama-server :8083,設定見 [README §2.4](../README.md#24-vl-模型) 與 §3.2）
 - **binary**：`.bin` / `.dat` / `.raw` / `.fw` / `.img` / `.rom` / `.hex`（抽 hex dump、可讀字串、magic 偵測；遇到 ELF magic 自動切到 ELF 解析）
 - **ELF**：`.elf` / `.so` / `.o` / `.axf` / `.out` / `.ko`（抽 header / sections / symbols）
 
-純圖片掃描的 PDF（沒有可選文字）不再切不出內容：每頁會整頁 render 後經 VL 抽述入庫。文字＋圖混合的 PDF（datasheet 類）文字照舊切 chunk，圖另外產生 `origin="diagram"` 的 chunk，ingest 輸出會逐張列出「第 N/M 張、頁碼」進度。VL server 是啟動必要條件，若圖片分析失敗（ingest 會整份中止、知識庫不變），先跑 `python scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
+純圖片掃描的 PDF（沒有可選文字）不再切不出內容：每頁會整頁 render 後經 VL 抽述入庫。文字＋圖混合的 PDF（datasheet 類）文字照舊切 chunk，圖另外產生 `origin="diagram"` 的 chunk，ingest 輸出會逐張列出「第 N/M 張、頁碼」進度。圖很多的 PDF 建議先跑 `ingest_document(path, preflight_only=True)` 估成本（零寫入，見下節）。VL server 是啟動必要條件，若圖片分析失敗（ingest 會整份中止、知識庫不變），先跑 `python scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
 
 #### 三個步驟
 
@@ -183,7 +188,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 最後回報目前載入幾個 chunks。
 ```
 
-`chunks` 是「切好的文件段落」。回報 0 代表沒匯入到任何內容 — 常見原因：binary 太小或全是 0xff、圖片走 VL 卻抽不出可用描述。（純圖片掃描的 PDF 不再是原因：每頁會整頁 render 交給 VL；但 VL llama-server (:8083) 沒啟動時，PDF 會**整份 ingest 失敗**而不是回報 0。）
+`chunks` 是「切好的文件段落」。回報 0 代表沒匯入到任何內容 — 常見原因：binary 太小或全是 0xff、圖片走 VL 卻抽不出可用描述。（純圖片掃描的 PDF 不再是原因：每頁會整頁 render 交給 VL；但 VL llama-server (:8083) 沒啟動時，PDF 會**整份 ingest 失敗**而不是回報 0。preflight 超過上限也是直接結束並報告超出的項目，同樣不是回報 0。）
 
 **步驟 3：查**
 
@@ -214,7 +219,9 @@ batch size 上限是 32 (REF1)。
 
 > **不用先 `analyze_file`。** `ingest_document` 餵圖片時會**重新讀那個原始圖檔**、內部自己呼叫 VL 看圖（`RAG.py --image` → `process_technical_image` → VL server :8083），抽出文字後才切 chunk、算 embedding 寫進 `knowledge.json`。`analyze_file` 是另一條獨立的入口（走 `media.py`），只在你想「這一輪先看一眼畫面」時用，它的輸出不會被 ingest 吃進去，**不是 ingest 的前置步驟**。
 
-入庫後查詢時，圖片／截圖來源的 REF 會標 `origin: VL`（給人看的摘要則標 `·VL`），提醒模型這是視覺辨識的**機率性描述**、與原文抽取不同級——與文字 REF 衝突時以文字為準。規格數字題的拒答判斷也把 diagram/chat 排除在權威類型（spec/manual/api）之外。
+入庫後查詢時，圖片／截圖來源的 REF 會標 `origin: VL`（給人看的摘要則標 `·VL`），提醒模型這是視覺辨識的**機率性描述**、與原文抽取不同級。和文字抽取的 REF 衝突時**不會宣稱哪一邊必勝**——兩邊的數值與出處都會列出，並標明衝突未解，由你判斷（自動挑一邊等於把一個未解的矛盾包裝成結論）。
+
+規格數字題的證據閘現在看的是**驗證狀態**，不只是文件類型：所有既有的 VL 圖片／截圖 chunk 都算 `legacy_unverified`，因此 `query_knowledge_strict` **一律不用它們回答數值**（會出現在回傳的 `excluded_figures` 裡，帶頁碼與原因）。要讓一份 PDF 裡的表格恢復可信度，必須重新 ingest 走結構化 lane，或用 `review_figures` 人工覆核。
 
 圖片在專案目錄內（建議放 `docs/`）直接 ingest，之後就查得到：
 
@@ -239,6 +246,166 @@ batch size 上限是 32 (REF1)。
 
 - **預設走「技術圖片」路徑**（架構圖／流程圖／記憶體圖），抽的是畫面說明。若這張是**聊天截圖**、想抽的是對話內容，要顯式 `ingest_document('teams.png', mode='chat')`。
 - chunks 回報 0，圖片來源最常見的原因是 **VL server（:8083）沒起來** —— 圖片分析失敗就切不出內容。先跑 `python scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
+
+#### PDF 內的表格與終端機畫面:結構化抽取 + 人工覆核
+
+北極星是 **verified-or-abstain**:程式能以獨立證據確認,內容才進可信檢索;不能確認就保留
+原圖、頁碼、框與格/行位置,正文放 `▯` 並記原因,或該份 PDF 零寫入。raster 上被遮住或低於
+解析度的字元,沒有任何程式能還原真值 —— 能保證的只有「正確,或誠實拒絕」。所以
+**「查得到但標了待覆核」是正常狀態,不是 bug**。
+
+##### 這一輪涵蓋到哪裡(範圍限制,先看這段)
+
+| lane | 收哪些 | 拿得到什麼 |
+|---|---|---|
+| **結構化** | **有結構性原生證據**的候選:原生 markdown 表格、`find_tables` 幾何、框線格、對齊的文字帶（無框線 memory map / register map）、**向量文字**的終端機 log | canonical JSON、逐格/逐行證據、`▯`、驗證狀態、strict gate、`review_figures` 可覆核 |
+| **既有自由文字 VL** | **純 raster**:被拍成圖或掃描進來的表格、終端機截圖、方塊圖 / 流程圖 | 只有 VL 的文字描述（`origin="diagram"`，檢索降權）。**沒有** `▯`、沒有逐格證據、不會出現在 `review_figures` 裡 |
+
+也就是說:**掃描版 datasheet 的表格、手機拍的終端機畫面,本輪仍走舊路徑**。它們一律被視為
+`legacy_unverified`,`query_knowledge_strict` 不會用它們回答數值 —— 這是刻意的保守作法,
+不是漏掉。`diagram`（方塊圖）這個 kind 的 schema 有保留,但只給人工修正用,本輪沒有自動生產者。
+
+##### 六種驗證狀態
+
+| 狀態 | 意思 | strict 查詢用不用 |
+|---|---|---|
+| `native_verified` | 原生表格 geometry 與**至少另一個原生** evidence channel 在 row/cell 結構與 critical token 上一致（單次 `find_tables().extract()` 不算） | ✔ |
+| `corroborated` | 視覺抽取與獨立 PDF 文字/幾何證據**逐格或逐行**一致。terminal 的比對走空白正規化,所以**不等於**逐位元組一致（PDF 文字層證明不了 tab 還是多個 space） | ✔ |
+| `human_verified` | 你對**指定 revision** 的原圖明確確認/修正,且修正後的 payload 通過 validator | ✔ |
+| `needs_review` | 有 `▯`、衝突、漏 row/line、tile 縫合不確定、kind 歧義或截斷 | ✘ |
+| `unverified` | 結構合法、未發現衝突,但沒有獨立證據（無 anchor 的同模型多次取樣即使全等也只到這級） | ✘ |
+| `legacy_unverified` | 舊 KB 缺欄位的 figure chunk,含所有既有 VL 圖片 / 截圖 / diagram chunk | ✘ |
+
+後三種合稱 **flagged**,那是查詢時的 filter,不是第七種狀態。一張圖切成多個 chunk 時,聚合
+一律取**最差**的成員狀態(不會被第一個成員蓋掉)。
+
+##### 查詢端會怎麼表現
+
+- `query_knowledge_strict`:flagged 的圖片內容在 **code 層**就被擋掉,不進 REF、也不參與門檻
+  計算。被擋下的會出現在回傳的 `excluded_figures`(source / page / figure_id / figure_index /
+  kind / 狀態 / 原因)與 `review_hint`,而且**四條回傳路徑都有**(KB 未載入、證據太弱拒答、
+  不走嚴格模式、正常回答)。所以就算全部候選都被擋,你仍看得到「哪一頁、哪一張圖可用但待覆核」,
+  不會變成「查不到」的假象。
+- `query_knowledge`:會回未驗證內容,但 REF 與 metadata 都帶狀態、原因與實際的 row/line 範圍;
+  因預算截斷時會明說「未完整顯示」,不讓你以為整張 log 都在。
+
+##### 圖多的 PDF:先跑 preflight(零寫入)
+
+```text
+請用工具 ingest_document 匯入 docs/datasheet.pdf,preflight_only 設 True,
+回報候選數、tile 數、VL 呼叫次數、image token 估計,以及有沒有超過上限。
+```
+
+它在**任何 VL 呼叫、embedding 與 knowledge.json 寫入之前**算完就結束。超過上限會直接停下並
+指出是哪一項;上限在 `config.py` 的 `FIGURE_*`,可用同名 `AICODE_FIGURE_*` 環境變數覆寫。
+
+> **範圍限制(重要)**:preflight 的欄位與「有沒有超過上限」**只涵蓋結構化 lane**。
+> 既有自由文字 VL lane(純 raster 內嵌圖、掃描頁)的呼叫**不受這些上限判定** —— 報告會
+> 另外印一個未受閘控的粗估(去重前,而且**沒有** image-token 估算)。所以「在預算內」
+> **不等於**整份 PDF 的總成本在預算內:純 raster 圖很多的檔案仍可能發出大量 VL 呼叫。
+在終端機的等價寫法(同樣零寫入):
+
+```bash
+python RAG.py docs/datasheet.pdf knowledge.json --preflight
+```
+
+##### 零部分成功
+
+結構化 lane 的 schema / validator / row width / line contract / `finish_reason` 任一最終不合格
+→ **整份 PDF 零寫入**,舊 KB 與向量保持原狀(可能留下失敗的 review artifact,但不會冒充成功
+入庫)。需要 VL 的候選會在動 KB 之前先做 capability probe:端點真的吃 image content part、
+接受本專案的 nested `json_schema`、能完成一張極小且不含機敏內容的 canary 並通過外部 validator。
+不通過就 fail-loud 指出缺哪一項,不以「OpenAI-compatible」推定品質。
+
+##### 人工覆核:list → 改 → fix
+
+```text
+請用工具 review_figures,action 設 "list",列出目前待覆核的圖,說明每一張的原因。
+```
+
+回傳每一張的 `document_id`、`figure_id`、`revision`、頁碼與 bbox、kind、
+`extraction_status` / `verification_status`、`reasons` / `reason_details`、原圖(crop)路徑與
+`evidence_ref`。挑定一張後帶 `figure_id` 再 list 一次,就會附上完整的 canonical payload
+(多筆列出時不附 payload,整份表格 / log 會塞爆對話;輸出的表頭每次都會講這件事)。
+
+crop 那一行會標**模型到底有沒有看過這張圖**:`variants/` 裡的才是實際送模的,
+`review_assets/` 是只為覆核 render、從未送模的。拿一張模型沒看過的圖去「確認」模型的
+抽取結果,等於在確認一件沒發生過的事,所以工具會明講是哪一種。native lane(原生表格)
+本來就零 VL 呼叫,它的 crop 一律只供覆核。
+
+抽取失敗、因此依「零部分成功」沒有進知識庫的圖也會列出來(標 `in_kb: False` /
+`fixable: False`,從 review artifacts 讀),失敗原因看得到,只是不能直接 `fix`。
+
+改好之後送回:
+
+```text
+請用工具 review_figures,action 設 "fix",figure_id 設 <剛才那個>,
+expected_revision 設 <list 顯示的 revision>,payload_json 貼改好的 JSON,
+confirm_against_image 設 True。
+```
+
+要點:
+
+- **只收該 kind 的 structured payload**,拒絕自由文字全段替換。JSON 物件不得有重複 key
+  (Python 只會留最後一個 = 在 validator 之前無聲改寫你的值)。
+- `kind` 以 **KB 記錄的為準**;payload 自報的 kind 不符會被拒絕(不允許用 fix 改變類別)。
+- `expected_revision` 必填。revision 已被別人改過 → 回 **conflict、零寫入**,不做
+  last-write-wins。重新 list 看現況、確認你的修改仍正確,再送一次。
+- `confirm_against_image=True` 的意思是**你看著原圖確認過**。只把機器轉寫貼回來不算 ——
+  `human_verified` 是使用者的確認,不是模型的自證。所以這個工具的 permission 是 `ask`,
+  你會在核准框看到完整參數。
+- 流程:validate → render → kind-aware 重切 chunk → 重算受影響的 embedding / id / hash →
+  exclusive lock 內確認 revision 未變 → 原子替換。任一步失敗,舊 chunks / 向量 / manifest
+  全部保持可用。
+
+##### review artifacts:位置、NDA 與清除
+
+```
+<專案>/.codetrail/figures/<document_slug>/<run_id>/
+├── manifest.json          canonical manifest(figures / preflight / stats)
+├── assets/                原始 asset(從 PDF 抽出來的原圖)
+├── variants/              **實際送給模型的每一張圖**(crop / tile)
+├── review_assets/         **只為覆核 render、從未送給模型**的圖
+├── review.md              給人看的摘要
+└── revisions/<n>/         人工 fix 後的 canonical payload
+```
+
+- **可能含 NDA 內容**(原圖就是規格書的一塊)。`.gitignore` 已含 `.codetrail/`,不要 commit;
+  在別的 target repo 用 CodeTrail 時,也請在那個 repo 的 `.gitignore` 補同一行。
+- `FIGURE_REVIEW_MAX_RUNS_PER_DOC`(預設 5)是 **soft retention target,不是硬上限**:
+  被 KB `evidence_ref` 引用、`created_at` 判讀不出來、或清理失敗的 run 一律 fail-closed
+  保留下來,實際份數可能超過 5。**不要拿它當「機敏影像最多留幾份」的保證**;要確定清掉
+  就顯式刪除對應目錄並自己確認結果(見下一點)。
+- 要手動清:直接刪掉整個 `<document_slug>` 目錄。**清掉之後會發生什麼**(兩件事要分清楚):
+  - **查詢完全不受影響** —— KB 是 revision 的唯一真相,已入庫的 chunk 與向量都還在,
+    `query_knowledge` / strict 照常。
+  - 但 **`review_figures` 會壞掉一半** —— `list` 那幾張會降級成 `payload: (讀不到)`,
+    因為 canonical payload 與原圖都在 manifest 裡;**沒有 payload 就無法做 `fix`**。
+    要恢復覆核能力,只能 `remove_document` 之後重新 `ingest_document` 那份 PDF。
+  - `remove_document`(從 KB 移除文件)與清除 artifacts 是**兩件獨立的事**:前者讓查詢查不到,
+    後者讓覆核做不了。要徹底清掉一份 NDA 文件的痕跡,兩邊都要做。
+
+##### 舊 KB 怎麼辦
+
+先前入庫的圖片 chunk 缺這些欄位,載入時會在**記憶體內**補成 `legacy_unverified`
+(不回寫檔案,所以不會動到你的 `knowledge.json`)。影響:
+
+- `query_knowledge` 照常查得到,只是 REF 會標待覆核。
+- `query_knowledge_strict` **不再用它們回答數值**,改成在 `excluded_figures` 指出可用但待覆核。
+
+要不要重 ingest?看那份 PDF 的表格是不是**原生的**(可選取文字、`find_tables` 抓得到):
+
+- 是 → **可能**拿得到可信狀態,值得試。那些表會走結構化 lane;但「有原生文字」不等於
+  「一定 `native_verified`」—— 那需要**兩個一致的原生 evidence channel**,只有一個通道時
+  結果是 `unverified`,通道互相矛盾時是 `needs_review`。而且 native lane 不呼叫 VL,
+  所以**不會**產生 `corroborated`。實際拿到什麼狀態以 `review_figures(action="list")`
+  的結果為準,不要預先假設。
+- 不是(掃描版 / 拍照版 / 純 raster)→ 重 ingest 只會回到自由文字 VL lane,狀態一樣是
+  flagged,而且**這些不會出現在 `review_figures` 裡**(沒有 canonical payload 可以 fix)。
+  **本輪沒有把純 raster 升成 strict-trusted 的支援路徑**;要拿那些數字,只能自己回去看
+  原始 PDF 的那一頁,或改用有原生文字的來源重新入庫。
+
+重 ingest 的做法就是既有的維護流程:`remove_document` 舊的,再 `ingest_document` 一次。
 
 #### 規格題、數字題用嚴格模式
 
@@ -279,6 +446,7 @@ batch size 上限是 32 (REF1)。
 #### 三件容易踩的事
 
 1. **知識庫綁專案目錄**：`knowledge.json` 存在當前專案根目錄裡，換到另一個專案就要重新匯入。同一份規格書在多個專案要用就匯入多次。
+1a. **同檔名會互相覆蓋（已知限制）**：KB 裡的文件身分是 **basename**，所以 `a/spec.pdf` 和 `b/spec.pdf` 會互相取代 —— 後 ingest 的那份會把前一份的 chunk 換掉，**不會有任何警告**。入庫前請先把檔名改成唯一的（例如 `npu_a_spec.pdf` / `npu_b_spec.pdf`）。PDF review artifacts 用的是含路徑與 hash 的 `document_id`，**不會**被覆蓋，所以被取代的那份會留下沒人引用的孤兒 run 目錄；要清掉就照下面的方式刪 `.codetrail/figures/<document_slug>/`。
 2. **不要 commit**：`knowledge.json` 切碎了原始文件內容，NDA 場景幾乎一定包含敏感片段。已經在 [安全邊界與工作節奏](security.md) 的「不要 commit 的資料」列入不該 commit 的清單，建議在專案的 `.gitignore` 也加一行。
 3. **越具體越好**：把一整份 500 頁的手冊原封不動塞進去，不如先抽出實際會問到的章節整理成 markdown 再匯入。雜訊少，答案準。
 
@@ -292,6 +460,8 @@ batch size 上限是 32 (REF1)。
 操作流程的主體寫在上面的「把附件做成知識庫讓模型隨時能查」，這節只列幾個補充細節：
 
 - `knowledge.json` 存在當前專案根目錄下，預設會被 `.gitignore` 忽略。它保存切碎後的文件內容，NDA 場景下幾乎一定有敏感片段，**不要 commit**。
+- `.codetrail/figures/` 存 PDF 結構化圖片的 review artifacts（原圖、實際送模型的每個 variant、canonical manifest）。**同樣可能含 NDA 內容**，`.gitignore` 已含 `.codetrail/`，一樣不要 commit；清除方式與後果見下面的覆核章節。
+- **文件身分是 basename**：`ingest_document` 與 `remove_document` 都以 basename 認人，所以不同目錄下的同名 PDF 會互相覆蓋（無警告），而 review artifacts 用的是含路徑 hash 的 `document_id`、不會覆蓋，因而可能留下孤兒 run 目錄。入庫前先取唯一檔名。
 - `remove_document(...)` 用檔名 basename 比對，所以傳完整路徑（`docs/old_spec.pdf`）或單純檔名（`old_spec.pdf`）都可以。刪除會在同一把 store lock 內同步重寫 JSON 與剩餘 NPZ 向量；不會刪掉整份向量檔再期待 reload 偷偷重算。
 - 文件切段的大小、不同來源類型的搜尋權重，這些可調參數放在 `config.py` 的 `CHUNK_SETTINGS` 和 `SOURCE_TYPE_WEIGHTS`，預設值在大多數情境下已經夠用，要微調再去動。
 

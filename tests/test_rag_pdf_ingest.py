@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import types
 from pathlib import Path
@@ -27,6 +28,10 @@ class _FakePdfModule:
 
 def _fake_pdf(monkeypatch, pages):
     monkeypatch.setattr(RAG, "check_pymupdf4llm", lambda: _FakePdfModule(pages))
+
+
+# 覆核用影像 fixture 的 bytes；`digest` 一律由它算，不留空字串（契約 §21.3）。
+_STUB_PNG = b"\x89PNG\r\n\x1a\nstub"
 
 
 def _stub_render(monkeypatch):
@@ -728,3 +733,230 @@ def test_merge_adjacent_chunks_preserves_origin(tmp_path: Path):
 
     assert len(merged) == 1, "相鄰 chunk 應合併"
     assert merged[0]["origin"] == "image"
+
+
+# ==========================================================================
+# 2026-08-22:legacy 圖面路徑與新的 structured lane 共存（T7）。
+#
+# 兩條 lane 的邊界只有兩種壞法，而且都是靜默的:
+#   (a) 同頁的 chunk_index / figure_index 互踩 → chunk id 撞、REF 指錯圖;
+#   (b) 同一個框被兩條 lane 各收一次 → KB 內同一張圖兩份互相競爭的版本。
+# 這兩條就是守它們。structured lane 自己的契約在 tests/test_figure_ingest.py。
+# ==========================================================================
+def _structured_lane_stub(monkeypatch, tmp_path: Path, *, page: int, bbox, native_pos,
+                          page_text: str, table_md: str):
+    """把 figure 門面換成固定的一張 native table 結果（不碰 T3/T4 的真實實作）。"""
+    import dataclasses
+
+    figure_extract = pytest.importorskip("figure_extract")
+
+    @dataclasses.dataclass(frozen=True)
+    class _Cand:
+        index: int
+        page: int
+        bbox: tuple
+        page_rect: tuple
+        kind_scores: dict
+        kind: str
+        signals: dict
+        reasons: list
+        signature: str
+        native_table: dict
+        occurrences: list
+        asset_xref: object
+        asset_digest: str
+        figure_id: str
+        document_id: str
+
+    @dataclasses.dataclass(frozen=True)
+    class _Evidence:
+        page: int
+        raw_markdown: str
+        page_boxes: list
+
+    @dataclasses.dataclass(frozen=True)
+    class _Plan:
+        document_id: str
+        candidates: list
+        page_evidence: dict
+        stats: dict
+        preflight: dict
+        over_budget: list
+
+    @dataclasses.dataclass(frozen=True)
+    class _Result:
+        figure_id: str
+        document_id: str
+        page: int
+        figure_index: int
+        bbox: tuple
+        kind: str
+        revision: int
+        payload: dict
+        extraction_status: str
+        verification_status: str
+        reasons: list
+        reason_details: list
+        evidence: dict
+        occurrences: list
+        model_input_variant: str
+        variants: list
+        row_total: int
+        line_total: object
+
+    pdf = tmp_path / "mixed_lane_spec.pdf"
+    pdf.write_bytes(b"%PDF-fake-two-lanes")
+    monkeypatch.setenv("AICODE_ROOT", str(tmp_path))
+    page_rect = (0.0, 0.0, 595.0, 842.0)
+    document_id = figure_extract.document_id_for(pdf, tmp_path)
+    figure_id = figure_extract.figure_id_for(document_id, page, bbox, page_rect, "asset")
+    occurrences = [{"page": page, "bbox": list(bbox), "index": 0}]
+    boxes = [{"index": 0, "class": "table", "bbox": bbox, "pos": native_pos}]
+    columns = [{"column_id": "c1", "label": "Reg", "role": None},
+               {"column_id": "c2", "label": "Addr", "role": None}]
+    payload = {
+        "kind": figure_extract.KIND_TABLE,
+        "columns": columns,
+        "rows": [{"row_index": 1, "cells": [
+            {"column_id": "c1", "text": "CTRL9", "state": "observed", "inherited_from_row": None},
+            {"column_id": "c2", "text": "0x9000_0000", "state": "observed",
+             "inherited_from_row": None}]}],
+        "footnotes": [],
+    }
+    candidate = _Cand(
+        index=1, page=page, bbox=bbox, page_rect=page_rect,
+        kind_scores={"table": 1.0}, kind=figure_extract.KIND_TABLE,
+        # native_lane 是 lane 判定的唯一真相(契約 §15.1):有 native_table 的 table
+        # 候選走零 VL 的原生路徑。缺這個 key 會被 RAG._candidate_native_lane fail-loud。
+        signals={"native_lane": True}, reasons=[],
+        signature="sig",
+        native_table={"pos": native_pos, "markdown": table_md, "geometry": {},
+                      "strategy": "lines"},
+        occurrences=occurrences, asset_xref=None, asset_digest="asset",
+        figure_id=figure_id, document_id=document_id)
+    plan = _Plan(document_id=document_id, candidates=[candidate],
+                 page_evidence={page: _Evidence(page=page, raw_markdown=page_text,
+                                                page_boxes=boxes)},
+                 stats={}, preflight={"candidates": 1, "tiles": 0, "vl_calls_min": 0,
+                                      "vl_calls_max": 0, "image_tokens_est": 0,
+                                      "pages": 1, "native_tables": 1},
+                 over_budget=[])
+    result = _Result(
+        figure_id=figure_id, document_id=document_id, page=page, figure_index=1, bbox=bbox,
+        kind=figure_extract.KIND_TABLE, revision=1, payload=payload,
+        extraction_status=figure_extract.EXTRACTION_COMPLETE,
+        verification_status=figure_extract.VERIF_NATIVE, reasons=[], reason_details=[],
+        # native lane 零 VL、沒有模型影像輸入 → variants 必須是空的（契約 §6.4 / §15.6）
+        # 契約 §19.4：可信狀態不得配空 evidence（真 producer 會填 channels）
+        evidence={"channels": ["markdown_pos"],
+                  "cells": {"r1c1": {"anchor": "markdown_pos", "matched": True,
+                                     "raw": "CTRL9"},
+                            "r1c2": {"anchor": "markdown_pos", "matched": True,
+                                     "raw": "0x9000_0000"}},
+                  "lines": {},
+                  "unlocatable_tokens": [], "anchor_coverage": {}, "row_alignment": {},
+                  "line_alignment": {}, "stitch": {}},
+        occurrences=occurrences, model_input_variant="native",
+        variants=[], row_total=1, line_total=None)
+
+    def _set(name, value):
+        monkeypatch.setattr(figure_extract, name, value, raising=False)
+
+    _set("plan_document_figures", lambda *a, **k: plan)
+    _set("check_preflight", lambda *a, **k: None)
+    _set("format_preflight_report", lambda *a, **k: "[PREFLIGHT] stub")
+    _set("ensure_capability", lambda *a, **k: None)
+    # 每張進 KB 的 figure 都要留得下**完整未切片**的覆核用影像（Go/No-Go 5）。
+    # 這裡刻意填齊契約 §6.3 凍結的每一個 `Variant` 欄位:少填 tile metadata 的話，
+    # 「未切片」會變成兩邊各自猜出來的預設值，而不是這個 fixture 真的宣告的事實。
+    # `digest` 同理，要是**真的** sha256（契約 §21.3）:共用 validator 會拿它與 png
+    # 的實際內容核對，留空等於讓 fixture 宣稱一個產線上根本產不出來的 Variant。
+    _set("render_candidate_variants",
+         lambda _doc, cand: [types.SimpleNamespace(
+             figure_id=cand.figure_id, variant_id="crop@200dpi",
+             png=_STUB_PNG, width=460, height=80, bbox=tuple(cand.bbox),
+             tile_index=0, tile_total=1, overlap_px=0, est_image_tokens=64,
+             digest=hashlib.sha256(_STUB_PNG).hexdigest(), mime="image/png")])
+    _set("extract_document_figures", lambda *a, **k: [result])
+    # artifact 這一段刻意**不 stub**:native lane 的 `variants=[]`／`model_input_variant`
+    # 與 review_assets 的分離都是跨模組契約，writer 被換掉的話矛盾永遠不會浮出來
+    # （契約 §18.4）。`new_run_id` / `evidence_ref_for` / `write_run_artifacts` /
+    # `list_figures` 全部走真貨，只有偵測與抽取是替身。
+    _set("prune_old_runs", lambda *a, **k: None)
+    return pdf, figure_id
+
+
+TABLE_MD_LANE = "|Reg|Addr|\n|---|---|\n|CTRL9|0x9000_0000|\n"
+INTRO_LANE = "Lane coexistence page intro paragraph. \n\n"
+PAGE_LANE = INTRO_LANE + TABLE_MD_LANE + "\n\nTail paragraph. \n\n"
+POS_LANE = (len(INTRO_LANE), len(INTRO_LANE) + len(TABLE_MD_LANE) + 2)
+TABLE_BBOX_LANE = (60.0, 400.0, 520.0, 470.0)
+
+
+@pytest.mark.smoke
+def test_legacy_and_structured_lanes_coexist_without_index_collision(
+    monkeypatch, tmp_path: Path
+):
+    """同頁同時有 picture 框（legacy）與原生表格（structured）:兩邊索引不互踩。"""
+    pdf, figure_id = _structured_lane_stub(
+        monkeypatch, tmp_path, page=1, bbox=TABLE_BBOX_LANE, native_pos=POS_LANE,
+        page_text=PAGE_LANE, table_md=TABLE_MD_LANE)
+    _fake_pdf(monkeypatch, [
+        {"metadata": {"page_number": 1}, "text": PAGE_LANE,
+         "page_boxes": [{"class": "picture", "bbox": BIG_BBOX},
+                        {"class": "table", "bbox": TABLE_BBOX_LANE, "pos": POS_LANE}]},
+    ])
+    _stub_render(monkeypatch)
+    spy = _stub_vl(monkeypatch)
+
+    chunks = RAG.extract_pdf(str(pdf))
+
+    text = [c for c in chunks if not c.get("origin")]
+    legacy = [c for c in chunks if c.get("origin") == "diagram"]
+    structured = [c for c in chunks if c.get("structured")]
+
+    assert len(spy.calls) == 1, "picture 框仍走既有自由文字 VL"
+    assert legacy and all(c["figure_index"] == 1 for c in legacy)
+    assert structured and all(c["figure_index"] == 2 for c in structured), (
+        "structured 的頁內序號要接在 legacy 之後，"
+        f"實際 {[c['figure_index'] for c in structured]}")
+    assert all(c["origin"] == "figure_table" for c in structured)
+
+    indices = [c["chunk_index"] for c in chunks if c["page"] == 1]
+    assert len(indices) == len(set(indices)), f"chunk_index 重複: {indices}"
+    assert (max(c["chunk_index"] for c in text)
+            < min(c["chunk_index"] for c in legacy)
+            < min(c["chunk_index"] for c in structured)), (
+        "順序必須是 文字 → legacy → structured")
+
+    # 原 markdown 表被取代，同一列資料只出現一次
+    body = "\n".join(c["content"] for c in chunks)
+    assert body.count("0x9000_0000") == 1, body
+    assert f"figure={figure_id} page=1 rows=1" in "\n".join(c["content"] for c in text)
+
+
+@pytest.mark.smoke
+def test_structured_candidate_covering_a_picture_box_skips_the_legacy_crop(
+    monkeypatch, tmp_path: Path, capsys
+):
+    """picture 框與 structured 候選同框:legacy 不再送 VL，避免同一張圖兩份。"""
+    pdf, _figure_id = _structured_lane_stub(
+        monkeypatch, tmp_path, page=1, bbox=BIG_BBOX, native_pos=POS_LANE,
+        page_text=PAGE_LANE, table_md=TABLE_MD_LANE)
+    _fake_pdf(monkeypatch, [
+        {"metadata": {"page_number": 1}, "text": PAGE_LANE,
+         "page_boxes": [{"class": "picture", "bbox": BIG_BBOX},
+                        {"class": "table", "bbox": BIG_BBOX, "pos": POS_LANE}]},
+    ])
+    _stub_render(monkeypatch)
+    spy = _stub_vl(monkeypatch)
+
+    chunks = RAG.extract_pdf(str(pdf))
+
+    out = capsys.readouterr().out
+    assert spy.calls == [], "已由結構化 lane 收錄的框不得再送自由文字 VL"
+    assert not _diagram_chunks(chunks)
+    assert [c["figure_index"] for c in chunks if c.get("structured")] == [2], (
+        "legacy 的編號用『規劃出來的』最大值，跳過與否都不回頭重用")
+    assert "已由結構化 lane 收錄" in out
+    assert "\n".join(c["content"] for c in chunks).count("0x9000_0000") == 1

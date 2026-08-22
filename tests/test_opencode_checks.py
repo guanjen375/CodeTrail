@@ -7,7 +7,10 @@ tests/test_opencode_mcp_timeout_check.py(2026-08-20):同一份設定檔、同一
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
+
+import pytest
 
 from scripts import opencode_contract_check as check
 from scripts import opencode_ctx_check as occ
@@ -42,6 +45,10 @@ def _write(path, config) -> None:
 def _setup(monkeypatch, path) -> None:
     monkeypatch.setenv("OPENCODE_CONFIG", str(path))
     monkeypatch.delenv(check.SKIP_ENV, raising=False)
+    # 這一段的測試對象是 opencode.json 的契約遷移;全域 AGENTS.md 的檢查是同一支
+    # 腳本的另一件事(tmp_path 一律沒有那份檔,會判 missing 並在 --fix 時安裝)。
+    # 關掉它,免得兩個子系統的輸出互相污染 —— AGENTS.md 的行為由下面自己的測試驗。
+    monkeypatch.setenv(check.AGENTS_MD_SKIP_ENV, "1")
 
 
 def test_required_ask_tools_match_set_config_template():
@@ -99,6 +106,7 @@ def test_safe_config_untouched_no_backup(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "opencode.json"
     permission = dict(LEGACY_PERMISSION)
     permission["codetrail_record_lesson"] = "ask"
+    permission["codetrail_review_figures"] = "ask"
     _write(config_path, _legacy_config(
         permission=permission, instructions=[check.LESSONS_INSTRUCTION],
     ))
@@ -116,6 +124,7 @@ def test_explicit_user_value_is_respected_with_warning(monkeypatch, tmp_path, ca
     config_path = tmp_path / "opencode.json"
     permission = dict(LEGACY_PERMISSION)
     permission["codetrail_record_lesson"] = "allow"  # 使用者自己放寬
+    permission["codetrail_review_figures"] = "ask"
     _write(config_path, _legacy_config(
         permission=permission, instructions=[check.LESSONS_INSTRUCTION],
     ))
@@ -203,6 +212,220 @@ def test_fix_keeps_config_symlink(monkeypatch, tmp_path):
     assert link.is_symlink()
     updated = json.loads(target.read_text(encoding="utf-8"))
     assert updated["permission"]["codetrail_record_lesson"] == "ask"
+
+
+# --------------------------------------------------------------------------
+# 全域 ~/.config/opencode/AGENTS.md 的漂移偵測與同步。
+#
+# set_config.py 不產生這份檔,它一直只能靠使用者從 docs 複製貼上 —— 所以
+# `git pull` 之後會靜默停在舊版。實際發生過:live 停在 18 工具版整整 11 天,
+# 少了 codetrail_review_figures,沒有任何東西會叫。
+# --------------------------------------------------------------------------
+_TEMPLATE_TOOL_LINE = (
+    "- CodeTrail 工具共 2 個:`codetrail_read_file`、`codetrail_review_figures`。\n"
+)
+
+
+def _template_doc(tool_line: str = _TEMPLATE_TOOL_LINE, body: str = "- 其他規則。\n") -> str:
+    return "# 說明\n\n## 範本\n\n```markdown\n# 全域規則\n" + tool_line + body + "```\n"
+
+
+def _agents_setup(monkeypatch, tmp_path, doc_text: str) -> Path:
+    doc = tmp_path / "opencode-agents-template.md"
+    doc.write_text(doc_text, encoding="utf-8")
+    monkeypatch.setattr(check, "AGENTS_TEMPLATE_DOC", doc)
+    monkeypatch.delenv(check.AGENTS_MD_SKIP_ENV, raising=False)
+    config_path = tmp_path / "opencode.json"
+    permission = dict(LEGACY_PERMISSION)
+    for tool in check.REQUIRED_ASK_TOOLS:
+        permission[tool] = "ask"
+    _write(config_path, _legacy_config(
+        permission=permission, instructions=[check.LESSONS_INSTRUCTION],
+    ))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    monkeypatch.delenv(check.SKIP_ENV, raising=False)
+    return config_path
+
+
+@pytest.mark.smoke
+def test_agents_template_must_have_exactly_one_fenced_block():
+    """0 個或 2 個以上一律 raise:靜默挑第一個會在範本改版時裝錯內容進去。"""
+    assert check.extract_agents_template(_template_doc()).startswith("# 全域規則\n")
+
+    for bad in ("# 沒有 fenced block\n", _template_doc() + _template_doc()):
+        try:
+            check.extract_agents_template(bad)
+        except check.AgentsTemplateError:
+            pass
+        else:
+            raise AssertionError("形狀不對的範本必須 raise,不得靜默挑一個")
+
+
+@pytest.mark.smoke
+def test_shipped_template_has_a_usable_tool_anchor():
+    """真正出貨的範本必須抓得到「工具共 N 個」與工具名 —— 抓不到的話漂移偵測
+    會靜默退化成「永遠看起來沒問題」。"""
+    body = check.extract_agents_template(
+        check.AGENTS_TEMPLATE_DOC.read_text(encoding="utf-8")
+    )
+    count, tools = check._tool_anchor(body)
+    assert count is not None and int(count) == len(tools) >= 1
+
+
+@pytest.mark.smoke
+def test_agents_md_status_distinguishes_stale_from_customisation():
+    template = check.extract_agents_template(_template_doc())
+    assert check.agents_md_status(None, template)[0] == "missing"
+    assert check.agents_md_status(template, template)[0] == "ok"
+
+    # 工具清單對不上 = stale(會讓模型否認新工具存在)
+    stale = template.replace(
+        _TEMPLATE_TOOL_LINE.strip(),
+        "- CodeTrail 工具共 1 個:`codetrail_read_file`。",
+    )
+    status, notes = check.agents_md_status(stale, template)
+    assert status == "stale"
+    assert any("codetrail_review_figures" in note for note in notes)
+
+    # 工具清單一致、其餘不同 = 使用者自訂,不得當成 stale
+    customised = template + "\n## 我自己的段落\n- 用繁體中文回答。\n"
+    assert check.agents_md_status(customised, template)[0] == "drifted"
+
+
+@pytest.mark.smoke
+def test_stale_agents_md_is_warned_but_never_blocks_startup(monkeypatch, tmp_path, capsys):
+    """★ aicode 對非零 rc 是硬退出。漂移一律只能警告 ——
+    把「使用者自訂過 AGENTS.md」變成開不了 OpenCode 是不能接受的。"""
+    config_path = _agents_setup(monkeypatch, tmp_path, _template_doc())
+    live = config_path.parent / check.AGENTS_MD_NAME
+    stale_text = "# 全域規則\n- CodeTrail 工具共 1 個:`codetrail_read_file`。\n"
+    live.write_text(stale_text, encoding="utf-8")
+
+    assert check.main(["--fix"]) == 0
+    out = capsys.readouterr().out
+    assert "STALE" in out
+    assert "codetrail_review_figures" in out
+    assert "--sync-agents-md" in out
+    # 沒有明確要求同步時不得覆蓋 —— 那份檔可能被使用者改過
+    assert live.read_text(encoding="utf-8") == stale_text
+
+
+@pytest.mark.smoke
+def test_fix_installs_agents_md_only_when_absent(monkeypatch, tmp_path, capsys):
+    config_path = _agents_setup(monkeypatch, tmp_path, _template_doc())
+    live = config_path.parent / check.AGENTS_MD_NAME
+    assert not live.exists()
+
+    assert check.main(["--fix"]) == 0
+    assert "已安裝全域 AGENTS.md" in capsys.readouterr().out
+    assert live.read_text(encoding="utf-8") == check.extract_agents_template(
+        _template_doc()
+    )
+
+
+@pytest.mark.smoke
+def test_sync_agents_md_overwrites_and_keeps_backup(monkeypatch, tmp_path, capsys):
+    config_path = _agents_setup(monkeypatch, tmp_path, _template_doc())
+    live = config_path.parent / check.AGENTS_MD_NAME
+    live.write_text("# 舊版\n", encoding="utf-8")
+
+    assert check.main(["--sync-agents-md"]) == 0
+    out = capsys.readouterr().out
+    assert "SYNCED" in out
+    assert live.read_text(encoding="utf-8") == check.extract_agents_template(
+        _template_doc()
+    )
+    backups = [p for p in config_path.parent.iterdir() if ".bak" in p.name]
+    assert backups and any(
+        p.read_text(encoding="utf-8") == "# 舊版\n" for p in backups
+    )
+
+
+@pytest.mark.smoke
+def test_sync_agents_md_keeps_symlink_and_permissions(monkeypatch, tmp_path, capsys):
+    """把 dotfiles repo 的檔案 symlink 到 ~/.config/opencode/ 是常見做法:
+    直接 replace 到 symlink 本身會把連結換成普通檔,而且不會有任何錯誤訊息。
+    使用者 chmod 過的權限同樣不該被同步擅自放寬。"""
+    config_path = _agents_setup(monkeypatch, tmp_path, _template_doc())
+    real = tmp_path / "dotfiles-AGENTS.md"
+    real.write_text("# 舊版\n", encoding="utf-8")
+    real.chmod(0o600)
+    link = config_path.parent / check.AGENTS_MD_NAME
+    link.symlink_to(real)
+
+    assert check.main(["--sync-agents-md"]) == 0
+    assert link.is_symlink(), "symlink 被換成普通檔,dotfiles 從此不再同步"
+    assert real.read_text(encoding="utf-8") == check.extract_agents_template(
+        _template_doc()
+    )
+    assert stat.S_IMODE(real.stat().st_mode) == 0o600
+
+
+@pytest.mark.smoke
+def test_dangling_symlink_is_never_auto_installed(monkeypatch, tmp_path, capsys):
+    """★ `Path.exists()` 會跟隨 symlink,所以指向「還沒 clone 的 dotfiles」的失效
+    連結會被判成 missing,`--fix` 於是 `os.replace` 掉它、還宣稱「已安裝」——
+    使用者的 dotfiles 從此不再同步,而且沒有任何錯誤訊息。"""
+    config_path = _agents_setup(monkeypatch, tmp_path, _template_doc())
+    missing_target = tmp_path / "dotfiles-not-cloned-yet.md"
+    link = config_path.parent / check.AGENTS_MD_NAME
+    link.symlink_to(missing_target)
+
+    # 自動路徑:不得碰它,更不得阻斷啟動
+    assert check.main(["--fix"]) == 0
+    assert "UNKNOWN" in capsys.readouterr().out
+    assert link.is_symlink(), "失效的 symlink 被換成普通檔"
+    assert link.readlink() == missing_target
+    assert not missing_target.exists(), "不該憑空生出 dotfiles 那一端"
+
+    # 明確要求同步:受控失敗回 2,而不是靜默什麼都沒做卻回 0
+    assert check.main(["--sync-agents-md"]) == 2
+    assert "SYNC_FAILED" in capsys.readouterr().out
+    assert link.is_symlink() and link.readlink() == missing_target
+
+
+@pytest.mark.smoke
+def test_agents_md_check_can_be_silenced(monkeypatch, tmp_path, capsys):
+    """自訂過的人要有一個關掉提醒的出口,不然每次啟動都被念。"""
+    config_path = _agents_setup(monkeypatch, tmp_path, _template_doc())
+    (config_path.parent / check.AGENTS_MD_NAME).write_text("# 舊版\n", encoding="utf-8")
+    monkeypatch.setenv(check.AGENTS_MD_SKIP_ENV, "1")
+
+    assert check.main(["--fix"]) == 0
+    assert "AGENTS.md" not in capsys.readouterr().out
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("broken", ["template", "live"])
+def test_non_utf8_files_never_block_startup(monkeypatch, tmp_path, capsys, broken):
+    """★ `UnicodeDecodeError` 繼承 `ValueError` 而**不是** `OSError` —— 漏接的話
+    一個非 UTF-8 的檔案就會讓這支 preflight 拋例外回非零,而 `aicode` 對非零 rc
+    是硬退出(aicode:273),使用者直接開不了 OpenCode。"""
+    config_path = _agents_setup(monkeypatch, tmp_path, _template_doc())
+    live = config_path.parent / check.AGENTS_MD_NAME
+    if broken == "template":
+        bad = tmp_path / "bad-template.md"
+        bad.write_bytes(b"```markdown\n# \xff\xfe\n```\n")
+        monkeypatch.setattr(check, "AGENTS_TEMPLATE_DOC", bad)
+    else:
+        live.write_bytes(b"# \xff\xfe not utf-8\n")
+    before = live.read_bytes() if live.exists() else None
+
+    assert check.main(["--fix"]) == 0
+    assert "UNKNOWN" in capsys.readouterr().out
+    # 讀不到就不能亂寫:壞檔原封不動,也不得因此裝一份新的
+    assert (live.read_bytes() if live.exists() else None) == before
+
+
+@pytest.mark.smoke
+def test_unreadable_template_degrades_to_unknown(monkeypatch, tmp_path, capsys):
+    """範本檔不見了不能讓 aicode 開不起來。"""
+    config_path = _agents_setup(monkeypatch, tmp_path, _template_doc())
+    monkeypatch.setattr(check, "AGENTS_TEMPLATE_DOC", tmp_path / "nope.md")
+
+    assert check.main(["--fix"]) == 0
+    assert "UNKNOWN" in capsys.readouterr().out
+    assert not (config_path.parent / check.AGENTS_MD_NAME).exists()
 
 
 # --------------------------------------------------------------------------

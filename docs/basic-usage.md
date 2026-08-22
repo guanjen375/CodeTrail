@@ -21,7 +21,7 @@ cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-進入 TUI 前應先看到兩行健康狀態：`MCP PASS — 18 tools + list_dir round-trip`，以及 live 或 cached 的 `MODEL PASS`。前者每次都實跑；後者只有首次、24 小時到期或模型／設定／chat template／專案規則改變時才重新要求模型做一次真實結構化工具呼叫，所以平常不用先手動問 18 個工具。需要讀專案外附件時看「夾帶附件」；若 TUI 內後續某一輪仍異常，再用 `/status` 與 [常見問題的分層診斷](troubleshooting.md#mcp-connected-but-no-tool-call)交叉檢查。Connected 只證明 MCP transport 已初始化，模型在單一對話輪次仍可能失手。
+進入 TUI 前應先看到兩行健康狀態：`MCP PASS — 19 tools + list_dir round-trip`，以及 live 或 cached 的 `MODEL PASS`。前者每次都實跑；後者只有首次、24 小時到期或模型／設定／chat template／專案規則改變時才重新要求模型做一次真實結構化工具呼叫，所以平常不用先手動問 19 個工具。需要讀專案外附件時看「夾帶附件」；若 TUI 內後續某一輪仍異常，再用 `/status` 與 [常見問題的分層診斷](troubleshooting.md#mcp-connected-but-no-tool-call)交叉檢查。Connected 只證明 MCP transport 已初始化，模型在單一對話輪次仍可能失手。
 
 ---
 
@@ -150,11 +150,35 @@ aicode
 
 聊天截圖要抽對話內容改 `ingest_document('shot.png', mode='chat')`；圖片在專案外就先 `import_external_file` 再 ingest。
 
+PDF 裡的**表格 / 終端機畫面**（datasheet、register map、log）多的話，先估成本再入庫，
+最後覆核。preflight 是零寫入的（但它只算**結構化 lane** 的成本；純 raster 內嵌圖走的
+自由文字 VL 不受那些上限判定，所以「在預算內」不等於整份 PDF 都便宜）：
+
+```text
+請用工具 ingest_document 匯入 docs/datasheet.pdf，preflight_only 設 True，
+回報候選數、VL 呼叫次數與有沒有超過上限。
+```
+
+```text
+請用工具 ingest_document 匯入 docs/datasheet.pdf，
+完成後用工具 review_figures，action 設 "list"，列出待覆核的圖與原因。
+```
+
+REF 出現「待覆核」代表程式沒能用獨立證據佐證那張圖的內容 —— `query_knowledge_strict`
+**不會**拿它回答數值，但會在 `excluded_figures` 裡告訴你是哪一頁、哪一張、為什麼
+（那不是「查不到」）。**只有 structured figure（`excluded_figures` 帶 `figure_id` 的那些）**能用
+`review_figures(action="fix", ..., confirm_against_image=True)` 人工覆核（會改知識庫，
+permission 是 `ask`）。
+**注意範圍**：純 raster 的掃描頁表格與拍照的終端機畫面本輪仍走舊的 VL 描述路徑，
+不會出現在 `review_figures` 裡，本輪也沒有把它們升成 strict 可信的路徑——那些數字只能
+自己回去看原始 PDF 那一頁。細節見 [RAG、附件與知識庫操作](rag.md#pdf-內的表格與終端機畫面結構化抽取--人工覆核)。
+
 基本判斷：
 
 - `query_knowledge(...)` 適合一般查文件，速度較快。
 - `query_knowledge_strict(...)` 適合規格數字與限制，較慢但會做證據檢查。
 - 新增或移除文件後查詢會自動載入變更；`reload_knowledge_base(...)` 用來立即確認 chunk 數。
+- PDF 圖很多時先 `ingest_document(path, preflight_only=True)` 估成本（零寫入），再決定要在對話裡跑還是改用 CLI。
 - `knowledge.json` 會保存切碎後的文件內容，NDA 場景不要 commit。
 
 完整流程、支援格式、圖片 VL 分析、binary/ELF 匯入和舊文件移除見 [RAG、附件與知識庫操作](rag.md)。

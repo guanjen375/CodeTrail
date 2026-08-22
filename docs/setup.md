@@ -196,18 +196,67 @@ content 會經 SSH 加密隧道送到 GPU 主機。
 7. 安全同步 OpenCode active model 的 `limit.context` 為主 n_ctx(原子寫入 + 備份)
 8. 安全同步既有 `mcp.codetrail.timeout`
 9. 安全補齊既有 OpenCode config 缺少的 permission ask 覆寫與 lessons
-   `instructions` contract；只新增缺鍵、保留使用者值，原檔備份
+   `instructions` contract；只新增缺鍵、保留使用者值，原檔備份。同一步也比對
+   `~/.config/opencode/AGENTS.md` 與 [全域範本](opencode-agents-template.md):
+   沒有就自動安裝,工具清單過期印 `⚠ STALE` 並給同步命令,你自訂過的內容一律
+   不覆蓋 —— **這一項永遠不會擋住啟動**
 10. 把 active [lessons(行為教訓)](lessons.md) render 進 `.codetrail/lessons.md` 供 OpenCode 注入,並提示已過 `review_by` 的待複審清單
 11. 對三個 aux server 跑 hard preflight
-12. 直接對實際 `mcp.codetrail.command` 做 `initialize → tools/list → list_dir`,確認完整 18-tool contract 與只讀工具派發都正常
+12. 直接對實際 `mcp.codetrail.command` 做 `initialize → tools/list → list_dir`,確認完整 19-tool contract 與只讀工具派發都正常
 13. 用 fresh `opencode run --format json` 驗 active model 真的產生 completed 的結構化 `codetrail_list_dir` event；依 model/config/chat-template/project 指紋快取成功結果 24 小時
 14. 啟動 `opencode` 並原樣轉發使用者的 `-m / --model`
 
-第 12 項每次啟動都實跑，不靠模型自述；第 13 項首次、快取過期或指紋變動才實跑，所以不必每次手動問「列出 18 個工具」。第 13 項實跑（本地推理，通常數十秒起）前會先印出原因與單次上限，執行中每 15 秒回報進度——不是當機。`aicode web` 與委派它的 `aicode_web` 也會跑兩層檢查；`aicode attach` 是接既有 backend 的薄 client，不重跑。完整 PASS / FAIL、快取與緊急 override 說明見 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)。
+第 12 項每次啟動都實跑，不靠模型自述；第 13 項首次、快取過期或指紋變動才實跑，所以不必每次手動問「列出 19 個工具」。第 13 項實跑（本地推理，通常數十秒起）前會先印出原因與單次上限，執行中每 15 秒回報進度——不是當機。`aicode web` 與委派它的 `aicode_web` 也會跑兩層檢查；`aicode attach` 是接既有 backend 的薄 client，不重跑。完整 PASS / FAIL、快取與緊急 override 說明見 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)。
 
 ---
 
 ## 維運常用命令
+
+### 清除 PDF review artifacts(可能含 NDA)
+
+PDF 結構化圖片抽取會在專案內留下覆核用的檔案:
+
+```
+<專案>/.codetrail/figures/<document_slug>/<run_id>/
+├── manifest.json          canonical manifest
+├── assets/                原始 asset(從 PDF 抽出來的原圖)
+├── variants/              **實際送給模型的**每一張圖(crop / tile)
+├── review_assets/         **只為覆核 render、從未送給模型**的圖
+├── review.md              給人看的摘要
+└── revisions/<n>/         人工 fix 後的 canonical payload
+```
+
+原圖就是規格書的一塊,**可能含 NDA 內容**。這個 repo 的 `.gitignore` 已含 `.codetrail/`;
+在別的 target project 用 CodeTrail 時,請在那個 project 的 `.gitignore` 也補上同一行。
+`variants/` 與 `review_assets/` 的差別很重要:前者是**實際送給模型的**圖,後者只是為了
+讓人覆核而 render、**從未送給模型**;`review_figures(action="list")` 每一張都會標
+`crop_is_model_input`,只有標「模型輸入」的才是模型真的看過的那張。
+
+`FIGURE_REVIEW_MAX_RUNS_PER_DOC`(預設 5,可用 `AICODE_FIGURE_REVIEW_MAX_RUNS_PER_DOC`
+覆寫)是 **soft retention target,不是硬上限**:被 KB `evidence_ref` 引用、`created_at`
+判讀不出來、或清理失敗的 run 一律 fail-closed 保留,實際份數可能超過 5。
+**不要拿它當「機敏影像最多留幾份」的保證** —— 要確定清掉就照下面顯式刪除並自己確認結果。
+
+還有一個**已知限制**:KB 的文件身分是 basename,但 artifacts 的身分是含路徑 hash 的
+`document_id`。所以不同目錄下的同名 PDF 在 KB 會互相覆蓋、在 artifacts 不會,
+被取代的那份會留下沒人引用的**孤兒 run 目錄**,只能靠 run 數回收或下面的顯式刪除清掉。
+
+手動清除就是刪掉整個目錄:
+
+```bash
+rm -rf <專案>/.codetrail/figures/<document_slug>
+```
+
+**清掉之後的兩個後果要分清楚**:
+
+- **查詢完全不受影響**。KB(`knowledge.json` + `knowledge_emb.npz`)是 revision 的唯一真相,
+  已入庫的 chunk 與向量都還在。
+- **覆核能力會壞掉一半**。`review_figures(action="list")` 對那幾張會降級成 `payload: (讀不到)`,
+  而沒有 canonical payload 就**無法做 `fix`**。要恢復,只能 `remove_document` 之後重新
+  `ingest_document` 那份 PDF。
+
+`remove_document`(從 KB 移除文件)與清除 artifacts 是**兩件獨立的事**:前者讓查詢查不到,
+後者讓覆核做不了。要徹底清掉一份 NDA 文件的痕跡,兩邊都要做。
 
 ### 重啟單一 server(換模型 / 換 ctx / 加旗標)
 
@@ -266,6 +315,14 @@ nvidia-smi --query-gpu=memory.used,memory.free,memory.total --format=csv
 ```
 
 llama-server 端的 `-c <N>` 也是啟動旗標,改完要重啟 server,不能熱 reload。
+
+`~/.config/opencode/AGENTS.md`(決定模型會不會真的去用工具的全域規則)是**另一份檔**,`set_config.sh` 不產生它、`git pull` 也不會更新它。`aicode` 每次啟動會比對並在過期時提醒;要套用新版範本:
+
+```bash
+python scripts/opencode_contract_check.py --sync-agents-md   # 覆蓋並備份原檔
+```
+
+同步是覆蓋不是合併 —— 自訂段落要自己從 `AGENTS.md.codetrail.bak` 貼回來。自訂過不想每次被提醒就設 `AICODE_AGENTS_MD_CHECK_SKIP=1`。
 
 ---
 
