@@ -151,7 +151,7 @@ call site、doctor / preflight 與 secret redaction，不能只手動在單一 s
 - **不讀環境 proxy**:共用 HTTP session `trust_env=False`,`HTTP(S)_PROXY` / `NO_PROXY` / `.netrc` 一律無視,prompt-bearing POST 不會被環境變數帶去別的 host。
 - **不跟隨 redirect**:任何 3xx 一律報錯(訊息含 status 與 Location host,絕不含 request body),拒絕把已送出的 POST 重送到別處。
 - KB chunk 脈絡生成(Contextual Retrieval)沿用獨立的 `AICODE_KB_CONTEXT_REMOTE_OK`(見 docs/rag.md);兩個 opt-in 不互通,各自守各自要外送的內容。
-- `python scripts/doctor.py` 啟動前就會檢查:端點非 loopback 且未設對應 opt-in → FAIL。
+- `python3 scripts/doctor.py` 啟動前就會檢查:端點非 loopback 且未設對應 opt-in → FAIL。
 
 這些規則只涵蓋 CodeTrail 經 `llama_client` 發出的請求。OpenCode 自己的 provider、內建
 web 工具、plugin 或其他 process 不會自動繼承 CodeTrail 的 endpoint policy。NDA 場景要

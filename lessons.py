@@ -360,8 +360,8 @@ def _check_active_caps(data: dict, today: str) -> None:
         raise LessonsError(
             f"已達 active lessons 上限:{context} 將有 {count} 條"
             f"(上限 {LESSONS_MAX_ACTIVE})。拒絕寫入。\n"
-            "請先人工整併:python lessons.py list 檢視全部,"
-            "再用 python lessons.py delete <id>(或合併多條後重新記錄)。"
+            "請先人工整併:python3 lessons.py list 檢視全部,"
+            "再用 python3 lessons.py delete <id>(或合併多條後重新記錄)。"
         )
 
     globals_count = sum(
@@ -421,7 +421,7 @@ def _find(data: dict, lesson_id: str) -> dict:
         if lesson["id"] == lesson_id:
             return lesson
     raise LessonsError(
-        f"找不到 lesson {lesson_id}(python lessons.py list 檢視現有 id)"
+        f"找不到 lesson {lesson_id}(python3 lessons.py list 檢視現有 id)"
     )
 
 
@@ -621,7 +621,7 @@ def propose_lesson(
         if duplicate["review_by"] < (today or today_local()):
             message += (
                 "\n該條已過 review_by(目前停止注入);要重新啟用請使用者執行:"
-                f"python lessons.py renew {duplicate['id']}"
+                f"python3 lessons.py renew {duplicate['id']}"
             )
         return message
 
@@ -702,7 +702,7 @@ def main(argv: list[str] | None = None) -> int:
             expired = [x for x in data["lessons"] if x["review_by"] < today]
             print(f"\n共 {len(data['lessons'])} 條,EXPIRED {len(expired)} 條(store: {path})")
             if expired:
-                print("EXPIRED 已停止注入;複審:python lessons.py renew <id>,或 delete <id>。")
+                print("EXPIRED 已停止注入;複審:python3 lessons.py renew <id>,或 delete <id>。")
             return 0
 
         # 會改 store 的指令都走 mutate_lessons:整段讀改寫持有 exclusive

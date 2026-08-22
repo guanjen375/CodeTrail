@@ -3,16 +3,16 @@
 RAG 知識庫建立工具（增量模式）
 
 用法：
-    python RAG.py <input_file> <output_json>              # 一般文件（直接入庫）
-    python RAG.py <screenshot> <output_json> --chat       # 聊天截圖（互動式）
-    python RAG.py <image> <output_json> --image           # 技術圖片（互動式）
-    python RAG.py <url> <output_json> --url               # 網頁（互動式）
+    python3 RAG.py <input_file> <output_json>              # 一般文件（直接入庫）
+    python3 RAG.py <screenshot> <output_json> --chat       # 聊天截圖（互動式）
+    python3 RAG.py <image> <output_json> --image           # 技術圖片（互動式）
+    python3 RAG.py <url> <output_json> --url               # 網頁（互動式）
 
 範例：
-    python RAG.py manual.pdf knowledge.json
-    python RAG.py teams_chat.png knowledge.json --chat
-    python RAG.py npx6_arch.png knowledge.json --image
-    python RAG.py https://docs.example.com/guide knowledge.json --url
+    python3 RAG.py manual.pdf knowledge.json
+    python3 RAG.py teams_chat.png knowledge.json --chat
+    python3 RAG.py npx6_arch.png knowledge.json --image
+    python3 RAG.py https://docs.example.com/guide knowledge.json --url
 """
 
 import sys
@@ -1693,7 +1693,7 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             fx.check_preflight(plan)
         except fx.FigureBudgetError as exc:
             hint = ("  改用 CLI 先看報告再分批處理：\n"
-                    f"    python RAG.py {file_path} <knowledge.json> --preflight")
+                    f"    python3 RAG.py {file_path} <knowledge.json> --preflight")
             print(f"[ERROR] {filename} figure preflight 超出上限："
                   "未呼叫任何 VL、未算 embedding、未寫入 knowledge.json。", flush=True)
             print(fx.format_preflight_report(plan), flush=True)
@@ -3890,7 +3890,7 @@ def add_technical_image(image_file: str, output_file: str):
 # 入口
 # ============================================================
 def rebuild_cli(argv: List[str]) -> int:
-    """`python RAG.py rebuild ...`：chunk 脈絡的唯一執行路徑。
+    """`python3 RAG.py rebuild ...`：chunk 脈絡的唯一執行路徑。
 
     刻意用 argparse 另開一個子命令，不去擴充下面那個手工 argv parser——旗標語意
     （互斥、precedence、同給即錯）交給 argparse，不要再手寫一套。
@@ -3951,12 +3951,12 @@ def rebuild_cli(argv: List[str]) -> int:
 def print_usage():
     """印出使用說明"""
     print("用法:")
-    print("  python RAG.py <input_file> <output_json>             # 一般文件（直接入庫）")
-    print("  python RAG.py <input.pdf> <output_json> --preflight  # 只算 PDF figure 預算並印報告（零寫入）")
-    print("  python RAG.py rebuild --kb <output_json> <input>... [--preflight]  # 批次入庫（唯一會生成 chunk 脈絡的路徑）")
-    print("  python RAG.py <screenshot> <output_json> --chat      # 聊天截圖（互動式）")
-    print("  python RAG.py <image> <output_json> --image          # 技術圖片（互動式）")
-    print("  python RAG.py <url> <output_json> --url              # 網頁（互動式）")
+    print("  python3 RAG.py <input_file> <output_json>             # 一般文件（直接入庫）")
+    print("  python3 RAG.py <input.pdf> <output_json> --preflight  # 只算 PDF figure 預算並印報告（零寫入）")
+    print("  python3 RAG.py rebuild --kb <output_json> <input>... [--preflight]  # 批次入庫（唯一會生成 chunk 脈絡的路徑）")
+    print("  python3 RAG.py <screenshot> <output_json> --chat      # 聊天截圖（互動式）")
+    print("  python3 RAG.py <image> <output_json> --image          # 技術圖片（互動式）")
+    print("  python3 RAG.py <url> <output_json> --url              # 網頁（互動式）")
     print("")
     print("互動式模式（--chat/--image/--url）會：")
     print("  1. 分析/抓取內容並顯示完整結果")
@@ -3971,13 +3971,13 @@ def print_usage():
     print("  output_json  知識庫檔案 (不存在則建立，存在則 append)")
     print("")
     print("範例:")
-    print("  python RAG.py manual.pdf knowledge.json                       # PDF 直接入庫")
-    print("  python RAG.py manual.pdf knowledge.json --preflight           # 只看 figure 預算（exit 2 = 超出）")
-    print("  python RAG.py firmware.bin knowledge.json                     # binary/ELF 直接入庫")
-    print("  python RAG.py teams_chat.png knowledge.json --chat            # 聊天截圖")
-    print("  python RAG.py npx6_arch.png knowledge.json --image            # 技術圖片")
-    print("  python RAG.py teams_chat.png knowledge.json --chat -y         # 同上但不問")
-    print("  python RAG.py https://docs.example.com/guide knowledge.json --url  # 網頁")
+    print("  python3 RAG.py manual.pdf knowledge.json                       # PDF 直接入庫")
+    print("  python3 RAG.py manual.pdf knowledge.json --preflight           # 只看 figure 預算（exit 2 = 超出）")
+    print("  python3 RAG.py firmware.bin knowledge.json                     # binary/ELF 直接入庫")
+    print("  python3 RAG.py teams_chat.png knowledge.json --chat            # 聊天截圖")
+    print("  python3 RAG.py npx6_arch.png knowledge.json --image            # 技術圖片")
+    print("  python3 RAG.py teams_chat.png knowledge.json --chat -y         # 同上但不問")
+    print("  python3 RAG.py https://docs.example.com/guide knowledge.json --url  # 網頁")
     print("")
     print(f"支援的文字類型: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
     print(f"支援的圖片類型: {', '.join(sorted(IMAGE_EXTENSIONS))}")
@@ -4020,7 +4020,7 @@ def main(argv: List[str]) -> int:
     last_arg = args[-1]
 
     if last_arg in mode_flags:
-        # 模式：python RAG.py <input> <output> --chat/--image/--url [-y]
+        # 模式：python3 RAG.py <input> <output> --chat/--image/--url [-y]
         if len(args) != 3:
             print_usage()
             return 1
@@ -4079,7 +4079,7 @@ if __name__ == "__main__":
     if getattr(config_module, "KB_CONTEXT_GENERATE", False):
         print(
             "[INFO] KB_CONTEXT_GENERATE 是開的，但 chunk 脈絡只在 "
-            "`python RAG.py rebuild --kb <kb> <doc>` 這條路徑生成；這次不生成。"
+            "`python3 RAG.py rebuild --kb <kb> <doc>` 這條路徑生成；這次不生成。"
         )
 
     sys.exit(main(sys.argv[1:]))

@@ -220,7 +220,7 @@ def _handle_agents_md(args: argparse.Namespace, config_path: Path) -> int:
         return 0
 
     status, notes = agents_md_status(live, template)
-    sync_cmd = "python scripts/opencode_contract_check.py --sync-agents-md"
+    sync_cmd = "python3 scripts/opencode_contract_check.py --sync-agents-md"
 
     if args.sync_agents_md:
         if status == "ok":

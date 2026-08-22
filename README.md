@@ -53,7 +53,8 @@ chmod +x ./aicode ./aicode_web               # 2. 讓啟動指令可執行
 mkdir -p "$HOME/.local/bin"                  # 3. 準備使用者 bin 目錄
 ln -sfn "$PWD/aicode" "$HOME/.local/bin/aicode"       # 4. 安裝 TUI 指令
 ln -sfn "$PWD/aicode_web" "$HOME/.local/bin/aicode_web" #    安裝 web 指令
-command -v aicode aicode_web                 # 5. 兩者都應顯示 ~/.local/bin/...
+export PATH="$HOME/.local/bin:$PATH"         # 5. 讓目前這個 shell 立即看得到使用者 bin
+command -v aicode aicode_web                 #    兩者都應顯示 ~/.local/bin/...
 ./set_config.sh                              # 6. 一鍵設定(偵測 GPU/模型 → 互動問答 → 產生所有設定檔)
 ~/start.sh                                   # 7. 啟動四個 llama-server(tmux 背景)
 ```
@@ -67,7 +68,7 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 
 想改在**另一台電腦的瀏覽器**操作(實驗性 web 模式):A/B 機加入同一個 [Tailscale](https://tailscale.com/download) tailnet 後,同樣先 `cd <PROJECT_TO_ANALYZE>`,改跑 `aicode_web`,把印出的網址貼到 B 機瀏覽器;停止用 `aicode_web stop`。沒有 Tailscale 的 SSH fallback 與細節見 §5.4。
 
-- 第 5 步沒輸出，代表 `~/.local/bin` 不在 PATH；補進 shell PATH 後重試。
+- 第 5 步的 `export` 只處理目前 shell；§1.2 會把同一條 PATH 寫進 `~/.profile`，讓重新登入後仍生效。
 - `set_config.sh` 依 main → embedding → reranker → VL 分組問答；推薦值不是硬限制，
   寫入前會顯示摘要，舊設定有備份。完整問答與非互動旗標見 §3.1。
 - TUI / web 前四個 server 都必須 ready。`~/start.sh status|stop|logs|help` 是統一管理
@@ -76,7 +77,7 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
   `aicode_web`；TUI 要接現有 web backend 時用 `aicode attach`。安全與 web 細節分別見
   [docs/security.md](docs/security.md)與 §5.4。
 - 第一次跑 `aicode` 會自動把 [OpenCode 全域 AGENTS.md 範本](docs/opencode-agents-template.md)裝進 `~/.config/opencode/AGENTS.md`(那份檔決定模型會不會真的去用工具)。之後每次啟動都會比對:工具清單過期會印 `⚠ STALE` 並給同步命令,**但不會擋住啟動**。手動同步是
-  `python scripts/opencode_contract_check.py --sync-agents-md`(會備份原檔)。
+  `python3 scripts/opencode_contract_check.py --sync-agents-md`(會備份原檔)。
 
 ## 特別注意(首次部署最容易踩的)
 
@@ -125,11 +126,23 @@ node -v && npm -v    # 確認是目前 Node LTS，npm 可執行
 
 ### 1.2 安裝 OpenCode
 
+若 Node.js 是依上節用 apt / NodeSource 安裝，先把 npm global prefix 放進使用者目錄；
+否則 `npm install -g` 可能嘗試寫 `/usr` 而因權限失敗。這會在
+`~/.npmrc` 設定 `prefix=/home/<user>/.local`，不需要 `sudo`：
+
 ```bash
+mkdir -p "$HOME/.local/bin"
+npm config set prefix "$HOME/.local"
+grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.profile" 2>/dev/null || \
+  printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.profile"
+export PATH="$HOME/.local/bin:$PATH"
 npm install -g opencode-ai
 command -v opencode    # 確認可被找到
 opencode --version
 ```
+
+若使用 nvm / fnm / volta，global package 本來就在該工具管理的使用者目錄，跳過
+`npm config set prefix`，只執行安裝與版本確認即可。不要加 `sudo npm install -g`。
 
 這是 [OpenCode 官方安裝頁](https://dev.opencode.ai/docs/#install) 列出的 npm 路徑；上游若調整
 安裝方式或 runtime 要求，以該頁當前版本為準。
@@ -308,6 +321,16 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 
 ## 3. 設定與啟動:`./set_config.sh` + `~/start.sh`
 
+`~/.config` 下的實際檔案是**每台機器的 local state，不進 repo**。設定契約的單一來源是
+`set_config.sh`、`deployment_profile.py` 的封閉 schema / 安全預設，以及本節的 OpenCode
+範本；使用者不需要取得維護者的 dotfiles。照本節執行會依自己的模型、GPU 與 Python
+產生一套相容設定，而不是複製維護者的私有路徑或 UUID。
+
+正常路徑只讀 `~/.config/opencode/opencode.json`。如果 shell 已自行設定
+`OPENCODE_CONFIG=/其他位置/opencode.json`，`set_config.sh`、`aicode` 與健檢都會改讀／改寫
+那一份並在設定摘要提示；不打算使用自訂位置時，先 `unset OPENCODE_CONFIG`，避免以為改了
+預設檔但 runtime 實際讀另一份。`~/.config/opencode/` 裡其他備份或測試 JSON 不會自動載入。
+
 ### 3.1 `./set_config.sh` 做什麼
 
 **純問答式設定**:每一題由你作答,工具不提供預設值,也**不用估算擋你的輸入**——它只驗證輸入在合理範圍(例如選項只有 1/2 卻輸入 3 會重問),以及做結構性檢查(binary 旗標、模型齊全性、schema)。數值題會附一句方向(越大越吃什麼)與一個**推薦值**,但推薦不是限制,填區間外的值照樣接受。VRAM 塞不塞得下仍以啟動後 `nvidia-smi` 實測為準。在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`,它會依序:
@@ -326,7 +349,7 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
    **CPU-MoE 沒有 y/n 分流**:直接問「幾層 experts 留 RAM」,**`0` = 不 offload(experts 全留 GPU)**、`N` = 前 N 層留 RAM(`--n-cpu-moe N`)、輸入 **≥ 層數上限 = 全部留 RAM**(等同 `--cpu-moe`)。提示只有兩行:**數值越大 GPU 負載越低**,以及一個**推薦區間**——下界是權重剛好放得進這顆 GPU 目前 free VRAM 的層數、上界是全部移到 RAM(例如 `推薦數值:38-43`)。這個估算只算 GGUF 權重,沒有 KV cache / compute buffer / 共卡的附屬服務,所以是起點而不是保證。工具讀 GGUF tensor table 判斷:**不是 MoE(沒有 expert tensors)就不問**,並印出原因(dense 模型 offload 幾層都沒有意義)。main 與 VL 各問一次;embedding / reranker 永遠不套用。**VL 一旦套用 CPU-MoE,llama.cpp 的 `--fit` 就會失效**(它見到 tensor override 已被設定就直接放棄),所以工具會改寫 `-ngl 99 --fit off` 而不是假裝有 `--fit-target` 保護——這種情況沒有自動退讓的安全網,層數填太低會 OOM。
 
    `threads` **從頭到尾不問**——大部分人也不知道該填多少,所以預設就是 auto:不寫 `-t`,由 llama.cpp 自己偵測(hybrid CPU 只算 P-core,否則用實體核心數、排除 HT siblings),比工具自己數邏輯 CPU 準。真的要釘死才用進階旗標 `--threads N`。工具只驗證輸入範圍(上下限顯示成 `1024-1048576` 這種形式),**推薦值不會擋你**;三個附屬服務固定單 slot,最後啟動的 VL 用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用自動配置。答完顯示**設定摘要一頁**:按 **Enter 寫入**;**q** 離開不寫檔。OpenCode context、MCP timeout/Python 路徑一併對齊。
-4. **產生四個檔案**(transaction 寫入:要嘛全套完成、要嘛完全不動;既有檔自動備份 `*.bak-setconfig-<時間戳>`,`--restore-last-backup` 可整批還原):
+4. **產生四個 runtime 檔案與一個還原 manifest**(runtime 檔採 transaction 寫入:要嘛全套完成、要嘛完全不動;既有檔自動備份 `*.bak-setconfig-<時間戳>`,`--restore-last-backup` 可整批還原):
 
 | 產物 | 內容 |
 |---|---|
@@ -334,6 +357,7 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 | `~/.config/codetrail/deployment.json` | deployment profile local override:四個 role 的模型與主模型參數(全部來自你的作答);重跑時**保留你手動加的取樣參數**(temperature/top-p/…與 no_mmap),其他未涵蓋鍵會警告已捨棄 |
 | `~/.config/opencode/opencode.json` | **合併**而非重建:只更新 CodeTrail 管的欄位(model / provider.llamacpp / mcp.codetrail / 缺少的 permission 鍵),你原本的 provider、主題、其他 MCP server 都保留;與安全範本衝突的 permission 會尊重你的值但明確警告 |
 | `~/start.sh` | 啟動腳本:寫死你的 GPU 配置、主模型與驗證過的 `LLAMA_BIN`,呼叫 `scripts/launch_servers.py`;支援 `status` / `stop` / `logs` / `help` 子命令,打錯子命令會提示而不是誤啟動 |
+| `~/.config/codetrail/setconfig-last-transaction.json` | 只記最近一次四個 runtime 檔的備份對應，供 `--restore-last-backup` 整批還原；不是另一份設定來源 |
 
 結尾會自動印出**啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準;`~/start.sh` 啟動完成的最後一行也會提醒你用 `nvidia-smi` 稍微監控 GPU/VRAM(例如 `watch -n 1 nvidia-smi`),因為 set_config 不做任何容量估算。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
 
@@ -352,6 +376,23 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 重跑**不沿用舊選擇**；每次設定來自本次作答 / 旗標。只有你手動加進
 `deployment.json` 的取樣參數與 port / base_url 會保留。完整旗標見
 `./set_config.sh --help`。
+
+既有安裝在 `git pull` 後不會直接覆寫 home dotfiles。要確認舊 local state 仍與新版 repo
+相容，先在 `<CODETRAIL_REPO>` 跑以下唯讀檢查：
+
+```bash
+python3 deployment_profile.py validate
+python3 scripts/opencode_contract_check.py
+~/start.sh --dry-run
+```
+
+前兩條應分別顯示 profile `valid`，以及 OpenCode contract `SAFE`（不能有
+`MISSING` / `STALE` / `INVALID`）；dry-run 應正常列出四個 server command。三項都符合，
+就不必只因檔案日期較舊而重建。
+
+若檢查要求補新欄位、Python / `LLAMA_BIN` 路徑已換、模型 / GPU / 主 n_ctx 要改，才重跑
+`./set_config.sh`。重跑會重新詢問硬體選擇；先記下現值或用 `~/start.sh --dry-run` 留存摘要，
+不要假設它會沿用上一次答案。
 
 ### 3.2 啟動與停止
 
@@ -447,7 +488,7 @@ export AUX_GPU=<附屬模型_GPU_UUID_或_INDEX>   # EMBED_GPU / RERANK_GPU / VL
 python3 scripts/launch_servers.py --scope all --dry-run   # 先看最終參數;不啟動、不連網
 python3 scripts/launch_servers.py --scope all             # 啟動四個 tmux server,嚴格驗證 role / GPU / model / ctx / health
 python3 scripts/check_status.py --strict
-AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
+AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py
 ```
 
 `~/.config/codetrail/deployment.json` 可持久做局部覆寫(`profile` 欄位維持 `set_config.sh` 寫入的 `defaults` 即可):
@@ -465,7 +506,7 @@ AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
 所有 service 都有同級 `model`、`port`、`base_url`、`bind`(`local` 預設只綁 127.0.0.1 / `all-interfaces` 綁 0.0.0.0)、`gpu_role`、`ctx`、`batch`、`ubatch`、`parameters`;VL 另外有 `mmproj`。模型欄只接受 registry key 或 GGUF 絕對路徑,參數只接受 schema allowlist(含 embedding / reranker 專用的 `cache_ram` → `--cache-ram`，預設 `0`;main / vl 專用的 `cpu_moe` → `--cpu-moe` 與部分 offload 的 `n_cpu_moe` → `--n-cpu-moe`(同一 role 兩鍵互斥;embedding / reranker 一律拒絕),以及 `gpu_layers: "auto"`、`fit`、`fit_target`、`parallel`),沒有 raw shell `extra_args`;JSON 不會被 `source` / `eval`。schema 與 GPU precedence 詳見 [docs/deployment-profiles.md](docs/deployment-profiles.md)。可離線查看合併結果:
 
 ```bash
-AICODE_MODEL=<CODE_MODEL> python deployment_profile.py show
+AICODE_MODEL=<CODE_MODEL> python3 deployment_profile.py show
 ```
 
 `AICODE_RERANK_FALLBACK_POLICY` 只控制啟動後 reranker 呼叫失敗時的行為;啟動前 preflight 仍要求 reranker server ready:
@@ -478,7 +519,7 @@ AICODE_MODEL=<CODE_MODEL> python deployment_profile.py show
 
 預設是 `error`:專用 reranker 不可用或呼叫失敗就直接報錯。`main_model` 可能很貴:嚴格模式下每條符合條件的 RAG query 都可能觸發主模型 rerank。只有你明確接受這個成本時才設定 `AICODE_RERANK_FALLBACK_POLICY=main_model`。
 
-**遠端模型端點需要顯式 opt-in(`AICODE_MODEL_REMOTE_OK`)**:CodeTrail 對 llama-server 的所有呼叫(completion / chat / embedding / reranking / props / slots / health)在送出前都會檢查端點——loopback 無條件放行;base_url 指向非 loopback 的機器時,必須先 `export AICODE_MODEL_REMOTE_OK=1`,否則呼叫直接報錯(fail-loud,錯誤訊息會印這個 env 名)。這是刻意的安全 migration:prompt 可能含 NDA 程式碼與文件內容,不能因為 profile 填了一個遠端 IP 就靜默外送。既有的遠端部署升級後會先報錯,設一次 env 即恢復。模型流量同時不讀環境 proxy(`trust_env=False`)、不跟隨任何 HTTP redirect(3xx 一律報錯)。KB chunk 脈絡生成(Contextual Retrieval)另有獨立的 `AICODE_KB_CONTEXT_REMOTE_OK`,兩者不互通。`python scripts/doctor.py` 會在啟動前檢查這條(非 loopback 端點 + 未設 opt-in = FAIL)。
+**遠端模型端點需要顯式 opt-in(`AICODE_MODEL_REMOTE_OK`)**:CodeTrail 對 llama-server 的所有呼叫(completion / chat / embedding / reranking / props / slots / health)在送出前都會檢查端點——loopback 無條件放行;base_url 指向非 loopback 的機器時,必須先 `export AICODE_MODEL_REMOTE_OK=1`,否則呼叫直接報錯(fail-loud,錯誤訊息會印這個 env 名)。這是刻意的安全 migration:prompt 可能含 NDA 程式碼與文件內容,不能因為 profile 填了一個遠端 IP 就靜默外送。既有的遠端部署升級後會先報錯,設一次 env 即恢復。模型流量同時不讀環境 proxy(`trust_env=False`)、不跟隨任何 HTTP redirect(3xx 一律報錯)。KB chunk 脈絡生成(Contextual Retrieval)另有獨立的 `AICODE_KB_CONTEXT_REMOTE_OK`,兩者不互通。`python3 scripts/doctor.py` 會在啟動前檢查這條(非 loopback 端點 + 未設 opt-in = FAIL)。
 
 ### 4.2 Model registry(短名稱 → GGUF 路徑)
 
@@ -603,7 +644,7 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
   或可信 VPN 為主，見 [安全邊界](docs/security.md#模型-apillama-server曝光面)。
 - **工具呼叫很多的 Build agent 建議設 `agent.build.temperature: 0`**。這是 [OpenCode 官方 agent 設定](https://dev.opencode.ai/docs/agents/)支援的 override,可降低本機模型把工具呼叫格式「說成文字」或隨機改寫格式的機率;它不會替你連上 MCP,也只影響 Build agent。改完先用 `opencode debug agent build` 確認解析結果含 `"temperature": 0`,再完全退出並重開 OpenCode、開新 session 測試。
 - **解析到設定不等於每個版本都一定把它送進 request body**。OpenCode 的 custom `@ai-sdk/openai-compatible` provider 有已知的 `temperature` 傳遞問題([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));因此需要所有 client 都有一致的 server 預設時,仍應在 deployment profile 的 `services.main.parameters` 設 `temperature`。`top_p` / `top_k` / `min_p` 等 provider schema 不一定支援的參數也放 server 端。完整判讀與假工具呼叫排查見 [docs/troubleshooting.md](docs/troubleshooting.md#mcp-connected-but-no-tool-call);取樣值必須依目前主模型的文件設定,不要沿用其他模型的數值。
-- **Connected 卻回答「沒有 CodeTrail」時,保留全域工具存在性規則作為模型約束**。新版 `aicode` 的自動 canary 會在進 TUI 前抓出 MCP 斷線、工具清單漂移與假 XML，但模型仍可能在後續某一輪隨機失手；`~/.config/opencode/AGENTS.md` 可明訂 19 個 `codetrail_*`、禁止假 XML / 假成功,並要求不確定時先做無副作用的 `codetrail_list_dir` 驗證。完整可複製範本(含 RAG 自發查詢、防杜撰與驗證紀律)見 [docs/opencode-agents-template.md](docs/opencode-agents-template.md),安裝 / 同步用 `python scripts/opencode_contract_check.py --sync-agents-md`;**這份檔不會跟著 `git pull` 更新**,工具清單一舊模型就會否認新工具存在,所以 `aicode` 每次啟動都會比對並在過期時印 `⚠ STALE`。強制重測方式見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。`ingest_document` 只寫 KB,不會把整份文件永久塞進每個新 session,所以不要把「匯入後剛好亂答」直接判成 RAG context overflow。
+- **Connected 卻回答「沒有 CodeTrail」時,保留全域工具存在性規則作為模型約束**。新版 `aicode` 的自動 canary 會在進 TUI 前抓出 MCP 斷線、工具清單漂移與假 XML，但模型仍可能在後續某一輪隨機失手；`~/.config/opencode/AGENTS.md` 可明訂 19 個 `codetrail_*`、禁止假 XML / 假成功,並要求不確定時先做無副作用的 `codetrail_list_dir` 驗證。完整可複製範本(含 RAG 自發查詢、防杜撰與驗證紀律)見 [docs/opencode-agents-template.md](docs/opencode-agents-template.md),安裝 / 同步用 `python3 scripts/opencode_contract_check.py --sync-agents-md`;**這份檔不會跟著 `git pull` 更新**,工具清單一舊模型就會否認新工具存在,所以 `aicode` 每次啟動都會比對並在過期時印 `⚠ STALE`。強制重測方式見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。`ingest_document` 只寫 KB,不會把整份文件永久塞進每個新 session,所以不要把「匯入後剛好亂答」直接判成 RAG context overflow。
 - **要壓「模型杜撰不存在的具體事實」(條號 / 日期 / 數字),在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則**(OpenCode 會自動把它載入每一段對話,含純聊天)。範例與原理見 [docs/troubleshooting.md](docs/troubleshooting.md);[全域範本](docs/opencode-agents-template.md)已內建「事實準確性」段。注意這個 `~/.config/opencode/AGENTS.md` 是 OpenCode runtime 的全域規則檔,跟本 repo 根目錄那份「給修改 CodeTrail 原始碼的 agent 看的」`AGENTS.md` 是兩回事。
 - `limit.context: 65536` 是 OpenCode 對主 n_ctx 的 client-side 鏡像。正常不要分開調：用 `set_config.sh` 設一次主 n_ctx 並重啟 server；`aicode` 會觀測 server `-c` 的實值並自動同步此欄。
 - `permission` 區段:`*: deny` 是預設拒絕一切,只白名單 `codetrail_*`(經 CodeTrail 沙箱)。OpenCode 內建工具(`bash` / `read` / `write` 等)會繞過 CodeTrail 沙箱,所以這裡明確 `deny`。
@@ -612,7 +653,7 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 手動貼完先驗 JSON 格式:
 
 ```bash
-python -m json.tool ~/.config/opencode/opencode.json >/dev/null
+python3 -m json.tool ~/.config/opencode/opencode.json >/dev/null
 ```
 
 ---
@@ -622,7 +663,7 @@ python -m json.tool ~/.config/opencode/opencode.json >/dev/null
 ### 5.1 跑 doctor 自檢
 
 ```bash
-AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
+AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py
 ```
 
 (把 `<CODE_MODEL>` 換成你的 registry key —— `set_config.sh` 結尾的設定摘要有印,或看 `~/.config/codetrail/models.json`)

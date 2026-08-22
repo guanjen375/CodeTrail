@@ -596,7 +596,7 @@ class KnowledgeBase:
                 raise KnowledgeStoreError(
                     f"knowledge embedding schema mismatch: NPZ={hash_schema!r}, "
                     f"required one of {sorted(allowed)}. Rebuild the knowledge base "
-                    f"(python RAG.py rebuild --kb {self.path} <docs>)."
+                    f"(python3 RAG.py rebuild --kb {self.path} <docs>)."
                 )
 
             # 驗證內容雜湊一致（避免內容變更但數量相同的情況）

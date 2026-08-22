@@ -11,7 +11,7 @@
 照 [README](../README.md) 的 OpenCode TUI 流程完成後，先在 CodeTrail repo 裡跑：
 
 ```bash
-AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py
+AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py
 ```
 
 `<CODE_MODEL>` 是佔位符,必須替換成 MODEL_REGISTRY 裡登記的 bare name 或 GGUF 絕對路徑;如果你已經在 OpenCode JSON 設好同一顆模型,doctor 也能從設定檔解析。`FAIL` 要先處理;`WARN` 可以依訊息判斷是否需要調整。接著切到要分析的專案根目錄:
@@ -234,7 +234,7 @@ permission 是 `ask`）。
 把這條記成 lesson,之後的 session 都要遵守。
 ```
 
-模型會用 `record_lesson(...)` 提案一條祈使句行為規則,**你在核准框看到內容、同意才寫入**;下個 session 起由 `aicode` 自動注入(啟動輸出有 `[lessons] N 條 active lessons 已注入 ...`)。規則 90 天到期會停止注入並在啟動時提示複審。生命週期、上限與 `python lessons.py list / renew / delete` 管理指令見 [docs/lessons.md](lessons.md)。
+模型會用 `record_lesson(...)` 提案一條祈使句行為規則,**你在核准框看到內容、同意才寫入**;下個 session 起由 `aicode` 自動注入(啟動輸出有 `[lessons] N 條 active lessons 已注入 ...`)。規則 90 天到期會停止注入並在啟動時提示複審。生命週期、上限與 `python3 lessons.py list / renew / delete` 管理指令見 [docs/lessons.md](lessons.md)。
 
 ---
 

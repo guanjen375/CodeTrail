@@ -11,7 +11,7 @@
 ## 安裝
 
 ```bash
-python scripts/opencode_contract_check.py --sync-agents-md
+python3 scripts/opencode_contract_check.py --sync-agents-md
 ```
 
 這會把下面「範本」的 fenced block 內文寫進 `~/.config/opencode/AGENTS.md`(檔案已存在時先備份成 `AGENTS.md.codetrail.bak`)。想自己貼也可以 —— 內容就是那個 block,兩種方式等價。

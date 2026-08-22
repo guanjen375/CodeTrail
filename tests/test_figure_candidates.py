@@ -1686,7 +1686,7 @@ def test_preflight_report_command_is_copy_pasteable_and_leaks_no_text(tmp_path: 
                                     root=tmp_path, pdf_doc=_FakeDoc([page]))
     report = fc.format_preflight_report(plan)
 
-    command = (f"python RAG.py {shlex.quote(str(pdf.resolve()))} "
+    command = (f"python3 RAG.py {shlex.quote(str(pdf.resolve()))} "
                f"{shlex.quote(config.KNOWLEDGE_FILE)}")
     assert f"{command} --preflight\n" in report + "\n", report
     assert f"{command}\n" in report + "\n", report

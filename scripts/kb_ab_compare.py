@@ -20,13 +20,13 @@ NDA：預設只印 metadata 與計數，不印 chunk 內容；要看節錄得自
 
 範例：
     # 單一 KB 體檢（離線）
-    python scripts/kb_ab_compare.py ~/proj/knowledge.json
+    python3 scripts/kb_ab_compare.py ~/proj/knowledge.json
 
     # 重建前後對照（離線）
-    python scripts/kb_ab_compare.py old/knowledge.json new/knowledge.json
+    python3 scripts/kb_ab_compare.py old/knowledge.json new/knowledge.json
 
     # 加跑真題（需要 8081 embedding + 8082 reranker）
-    python scripts/kb_ab_compare.py old/knowledge.json new/knowledge.json \\
+    python3 scripts/kb_ab_compare.py old/knowledge.json new/knowledge.json \\
         --questions ~/step0_questions.txt
 """
 from __future__ import annotations

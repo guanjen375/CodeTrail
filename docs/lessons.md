@@ -80,17 +80,17 @@ session start(`aicode`)時:
 在 CodeTrail checkout 目錄執行:
 
 ```bash
-python lessons.py list              # 全部條目(含 EXPIRED 標記、hit_count)
-python lessons.py renew L-001      # 複審通過:review_by = 今天 + 90 天(--days 可調)
-python lessons.py delete L-001     # 淘汰
-python lessons.py hit L-001        # 人工記一次命中(見下)
+python3 lessons.py list              # 全部條目(含 EXPIRED 標記、hit_count)
+python3 lessons.py renew L-001      # 複審通過:review_by = 今天 + 90 天(--days 可調)
+python3 lessons.py delete L-001     # 淘汰
+python3 lessons.py hit L-001        # 人工記一次命中(見下)
 ```
 
 進階:`--file` 或 `AICODE_LESSONS_FILE` 可指定 store 路徑(預設 `~/.config/codetrail/lessons.json`)。
 
 ## hit_count 的誠實說明
 
-注入的 lessons.md 會要求模型:套用某條規則時在回覆中標註 `[L-003]` 這樣的編號,讓你**看得到規則有沒有生效**。但 OpenCode 端的對話輸出 CodeTrail 看不到,所以 `hit_count` 不會自動累計 —— 欄位保留給人工判斷:在對話裡看到模型標註了某條,想留下紀錄就 `python lessons.py hit L-003`。複審時 `hit_count` / `last_triggered` 是「這條還有沒有用」的參考,不是自動 decay 的依據(本機制刻意不做自動 decay)。
+注入的 lessons.md 會要求模型:套用某條規則時在回覆中標註 `[L-003]` 這樣的編號,讓你**看得到規則有沒有生效**。但 OpenCode 端的對話輸出 CodeTrail 看不到,所以 `hit_count` 不會自動累計 —— 欄位保留給人工判斷:在對話裡看到模型標註了某條,想留下紀錄就 `python3 lessons.py hit L-003`。複審時 `hit_count` / `last_triggered` 是「這條還有沒有用」的參考,不是自動 decay 的依據(本機制刻意不做自動 decay)。
 
 ## 驗證注入有生效
 

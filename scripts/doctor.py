@@ -5,10 +5,10 @@
 模型 GGUF 路徑對不對、AICODE_ROOT 安不安全、OpenCode / MCP 入口都在不在、KB 有沒有資料。
 
 使用：
-    AICODE_MODEL=<MODEL> python scripts/doctor.py                       # 全檢
-    AICODE_MODEL=<MODEL> python scripts/doctor.py --profile /abs/path/profile.json
-    AICODE_MODEL=<MODEL> python scripts/doctor.py --project /path/proj  # 把 /path/proj 當 AICODE_ROOT 檢查
-    AICODE_MODEL=<MODEL> python scripts/doctor.py --no-network          # 跳過 llama-server 線上檢查（CI 用）
+    AICODE_MODEL=<MODEL> python3 scripts/doctor.py                       # 全檢
+    AICODE_MODEL=<MODEL> python3 scripts/doctor.py --profile /abs/path/profile.json
+    AICODE_MODEL=<MODEL> python3 scripts/doctor.py --project /path/proj  # 把 /path/proj 當 AICODE_ROOT 檢查
+    AICODE_MODEL=<MODEL> python3 scripts/doctor.py --no-network          # 跳過 llama-server 線上檢查（CI 用）
 
 退出碼:
     0 = 全 PASS / 只有 WARN

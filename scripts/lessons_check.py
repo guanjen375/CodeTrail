@@ -124,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
             f"active lessons {len(active)} 條,超過上限 {lessons.LESSONS_MAX_ACTIVE},"
             "refuse to start。"
         )
-        _print("請人工整併:python lessons.py list 檢視,delete 或合併到剩餘條數 ≤ 上限。")
+        _print("請人工整併:python3 lessons.py list 檢視,delete 或合併到剩餘條數 ≤ 上限。")
         _print("緊急跳過(本 session 不注入): AICODE_LESSONS_SKIP=1 aicode")
         return 2
 
@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         _print(f"⚠ {len(expired)} 條 lessons 已過 review_by,本 session 起停止注入,待人工複審:")
         for lesson in expired:
             _print(f"  - {lesson['id']} (review_by={lesson['review_by']}) {lesson['rule']}")
-        _print("  複審通過 → python lessons.py renew <id>   淘汰 → python lessons.py delete <id>")
+        _print("  複審通過 → python3 lessons.py renew <id>   淘汰 → python3 lessons.py delete <id>")
 
     return 0
 

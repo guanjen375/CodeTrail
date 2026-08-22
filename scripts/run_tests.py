@@ -2,10 +2,10 @@
 """統一測試入口 — 隔離外部 pytest plugin，並加速完整測試。
 
 用途:
-    python scripts/run_tests.py            # 依 test file 分片並行跑全部 pytest(最多 8 shard)
-    AICODE_TEST_JOBS=1 python scripts/run_tests.py  # 序列完整測試
-    python scripts/run_tests.py -k cli     # 有 args 時等於 pytest -k cli（序列）
-    python scripts/run_tests.py -x -v ...  # args 原樣 forward
+    python3 scripts/run_tests.py            # 依 test file 分片並行跑全部 pytest(最多 8 shard)
+    AICODE_TEST_JOBS=1 python3 scripts/run_tests.py  # 序列完整測試
+    python3 scripts/run_tests.py -k cli     # 有 args 時等於 pytest -k cli（序列）
+    python3 scripts/run_tests.py -x -v ...  # args 原樣 forward
 
 為什麼存在:
     很多開發機器全域裝了 pytest plugin (ddtrace、xdist、pytest-django 等),
@@ -14,7 +14,7 @@
     在所有環境下都 deterministic。
 
 並行只套在「無參數完整測試」：-x / -k / node id 等 pytest 語意因此完全不變。
-不依賴 pytest-xdist；每個 shard 都是受控的 ``python -m pytest`` 子行程，且有
+不依賴 pytest-xdist；每個 shard 都是受控的 ``python3 -m pytest`` 子行程，且有
 獨立 cache / basetemp。Windows 保留既有 ACL shim，固定走序列模式。
 """
 from __future__ import annotations

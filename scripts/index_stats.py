@@ -6,9 +6,9 @@
 路徑本身就是 NDA 內容。要看路徑樣本請顯式加 ``--show-paths``(只印終端)。
 
 用法:
-    AICODE_ROOT=/path/to/project python scripts/index_stats.py
-    python scripts/index_stats.py --root /path/to/project
-    python scripts/index_stats.py --root /path/to/project --deep
+    AICODE_ROOT=/path/to/project python3 scripts/index_stats.py
+    python3 scripts/index_stats.py --root /path/to/project
+    python3 scripts/index_stats.py --root /path/to/project --deep
 
 符號數預設讀既有的 .code_rag_cache_meta.json;沒有(或涵蓋不全)就印 unknown。
 ``--deep`` 才真的跑 AST 解析,並且有檔數 / 時間預算,超過會標示 truncated。

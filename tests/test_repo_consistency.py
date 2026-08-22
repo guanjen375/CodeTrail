@@ -5,6 +5,11 @@
 """
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
+import pytest
+
 from scripts.check_eval_consistency import check_all as eval_check_all
 from scripts.check_readme_consistency import (
     _check_agents_template_tools,
@@ -21,6 +26,44 @@ from scripts.check_readme_consistency import (
     _readme_tool_names_in_table,
     check_all,
 )
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.mark.smoke
+def test_user_facing_python_commands_use_python3():
+    """基底安裝只保證 python3；文件與 CLI 提示不可要求額外的 python alias。"""
+    user_facing_sources = [
+        *sorted(REPO_ROOT.glob("*.md")),
+        *sorted((REPO_ROOT / "docs").rglob("*.md")),
+        REPO_ROOT / "RAG.py",
+        REPO_ROOT / "data_flywheel.py",
+        REPO_ROOT / "figure_candidates.py",
+        REPO_ROOT / "knowledge.py",
+        REPO_ROOT / "lessons.py",
+        REPO_ROOT / "mcp_server.py",
+        REPO_ROOT / "scripts" / "check_readme_consistency.py",
+        REPO_ROOT / "scripts" / "doctor.py",
+        REPO_ROOT / "scripts" / "index_stats.py",
+        REPO_ROOT / "scripts" / "kb_ab_compare.py",
+        REPO_ROOT / "scripts" / "lessons_check.py",
+        REPO_ROOT / "scripts" / "opencode_contract_check.py",
+        REPO_ROOT / "scripts" / "run_tests.py",
+        REPO_ROOT / "scripts" / "set_config.py",
+    ]
+    stale: list[str] = []
+    command = re.compile(
+        r"(?<![\w])python(?=[ \t]+(?:-m[ \t]+[A-Za-z0-9_.-]+|"
+        r"[A-Za-z0-9_./-]+\.py\b))"
+    )
+
+    for path in user_facing_sources:
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if command.search(line):
+                stale.append(f"{path.relative_to(REPO_ROOT)}:{lineno}: {line.strip()}")
+
+    assert not stale, "user-facing commands must use python3:\n" + "\n".join(stale)
 
 
 def test_no_readme_drift():

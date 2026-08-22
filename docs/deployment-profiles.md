@@ -13,8 +13,8 @@ profile,`set_config.sh` 產生的 local override 疊在基底上就是有效設�
 `"extends": "defaults"` 繼承基底:
 
 ```bash
-python deployment_profile.py show
-python deployment_profile.py --profile /absolute/path/to/experiment.json validate
+python3 deployment_profile.py show
+python3 deployment_profile.py --profile /absolute/path/to/experiment.json validate
 ```
 
 合併順序：

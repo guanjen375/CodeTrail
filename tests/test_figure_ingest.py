@@ -935,8 +935,8 @@ def test_preflight_over_budget_makes_zero_vl_zero_embedding_zero_write(
     assert harness.extract.calls == [], "超出預算不得呼叫抽取"
     assert vl_spy.calls == [] and embed_spy.calls == [] and save_spy.calls == []
     assert kb_path.read_bytes() == before
-    assert "python RAG.py" in str(exc.value) and "--preflight" in str(exc.value)
-    assert "python RAG.py" in out and "--preflight" in out
+    assert "python3 RAG.py" in str(exc.value) and "--preflight" in str(exc.value)
+    assert "python3 RAG.py" in out and "--preflight" in out
     assert "[PREFLIGHT] fake report" in out, "超出預算也要把完整報告印出來"
     assert "既有圖面路徑" in out, "報告要含 legacy 曝險估算"
     assert _dir_snapshot(tmp_path) == tree, "超出預算不得長出 NPZ / cache / lock 檔"

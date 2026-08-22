@@ -10,7 +10,7 @@
 
 使用方式：
 1. 自動收集：設定環境變數 AI_CODE_COLLECT_DATA=1
-2. 手動評分：執行 python data_flywheel.py rate --file data/interactions.jsonl
+2. 手動評分：執行 python3 data_flywheel.py rate --file data/interactions.jsonl
 
 資料格式：
 {

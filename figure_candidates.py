@@ -2748,6 +2748,6 @@ def format_preflight_report(plan: FigurePlan) -> str:
     quoted_source = shlex.quote(source_abs or source or "<pdf>")
     quoted_kb = shlex.quote(kb_path)
     lines.append("  建議改用 CLI（MCP 端不會 streaming，開始後才逾時等於沒有提示）：")
-    lines.append(f"    python RAG.py {quoted_source} {quoted_kb} --preflight")
-    lines.append(f"    python RAG.py {quoted_source} {quoted_kb}")
+    lines.append(f"    python3 RAG.py {quoted_source} {quoted_kb} --preflight")
+    lines.append(f"    python3 RAG.py {quoted_source} {quoted_kb}")
     return "\n".join(lines)

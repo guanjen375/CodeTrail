@@ -14,16 +14,16 @@ full。靜態 consistency / compile 檢查不會收集 pytest，可在相關檔�
 
 ```bash
 # 靜態檢查（不收集 pytest）
-python -m compileall -q .
-python scripts/check_eval_consistency.py
-python scripts/check_readme_consistency.py
-python scripts/opencode_contract_check.py            # 全域 opencode.json / AGENTS.md 漂移
-AICODE_MODEL=test-model:latest python scripts/doctor.py --no-network
-python deployment_profile.py validate
+python3 -m compileall -q .
+python3 scripts/check_eval_consistency.py
+python3 scripts/check_readme_consistency.py
+python3 scripts/opencode_contract_check.py            # 全域 opencode.json / AGENTS.md 漂移
+AICODE_MODEL=test-model:latest python3 scripts/doctor.py --no-network
+python3 deployment_profile.py validate
 
 # 測試入口（何時能跑見 AGENTS.md §2）
-python scripts/run_tests.py -m smoke
-python scripts/run_tests.py
+python3 scripts/run_tests.py -m smoke
+python3 scripts/run_tests.py
 
 # Lint（advisory，CI 不擋）
 ruff check tests scripts
@@ -35,11 +35,11 @@ v1：`requirements.txt` 使用官方給未遷移專案的 `mcp>=1.28,<2`，因�
 transport、schema 與 OpenCode 相容性，不能只移除 `<2`。`doctor` 會把缺少
 MCP、低於 1.28 或 2.x 都列為 FAIL。
 
-`python scripts/run_tests.py` 無參數時會以標準庫把 test file 分成最多 8 個
+`python3 scripts/run_tests.py` 無參數時會以標準庫把 test file 分成最多 8 個
 隔離 shard 並行執行，不需要 `pytest-xdist`，而且不會拆開同一個 test module。
 分片的檔案清單用 pytest 的預設收集規則遞迴掃 `tests/`（`test_*.py` 與 `*_test.py`，
 排除 norecursedirs 預設目錄），確保並行與序列收到完全相同的一組測試。
-資源較小或要重現序列順序時用 `AICODE_TEST_JOBS=1 python scripts/run_tests.py`。
+資源較小或要重現序列順序時用 `AICODE_TEST_JOBS=1 python3 scripts/run_tests.py`。
 只要有傳 `-k`、`-x`、檔名或其他 pytest 參數，就維持原本的單一 pytest 行程與
 逐字轉發語意。
 
@@ -67,7 +67,7 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 3. bug fix 必須走 red-before-green：先新增帶 `@pytest.mark.smoke` 的 regression，單跑取得
    紅燈，再改實作並單跑同一 node 轉綠。這是 developer 開發途中唯一允許的測試例外。
 4. 依變更內容跑不會收集 pytest 的靜態 consistency / compile 檢查。
-5. developer 交付前只跑一次 `python scripts/run_tests.py -m smoke`；reviewer 才在收斂後對
+5. developer 交付前只跑一次 `python3 scripts/run_tests.py -m smoke`；reviewer 才在收斂後對
    目前 HEAD 跑一次 full。任何新失敗都要先處理，`0 tests collected` 不算通過。
 6. 不要自行 commit；使用者確認後才可提交。
 
@@ -108,8 +108,8 @@ module。smoke 的安全組成由 `tests/test_smoke_gate.py` 靜態守住；不�
 修改途中先跑兩個不收集 pytest 的靜態檢查：
 
 ```bash
-python scripts/check_eval_consistency.py
-python scripts/check_readme_consistency.py
+python3 scripts/check_eval_consistency.py
+python3 scripts/check_readme_consistency.py
 ```
 
 pytest 部分仍依角色執行：developer 不另外單跑 `test_repo_consistency.py`，由交付前唯一一次
@@ -267,7 +267,7 @@ overload identity 改變且牽動 C/C++ caller，才會在寫 DB 前切換成 fu
 pytest gate 是 `tests/test_ast_parser_cpp.py`、`tests/test_code_graph.py` 與
 `tests/test_code_graph_cpp_visibility.py`；reviewer 由收斂後的 full 統一涵蓋。developer 修 bug 時
 只依 AGENTS.md §2.3 單跑自己新增的 regression node 取得 red / green，不另跑這三個
-module。`python eval/run_code_smoke_eval.py` 也只在本次任務明示要檢查 code-inference
+module。`python3 eval/run_code_smoke_eval.py` 也只在本次任務明示要檢查 code-inference
 品質時執行。
 
 ---
@@ -357,7 +357,11 @@ AI_CODE_COLLECT_DATA=1 aicode
 data/interactions.jsonl
 ```
 
-記錄內容包含 question、answer、refs、code snippets、mode、KB score、repo commit、model tag、agent tool calls、files read。這些資料在 NDA 場景通常含敏感內容，已由 `.gitignore` 排除。
+可用 `AI_CODE_DATA_FILE=/absolute/path/interactions.jsonl` 覆寫位置。這個變數只在
+`AI_CODE_COLLECT_DATA=1` 時有意義；自訂到 repo 外的路徑不受本 repo `.gitignore` 保護，
+檔案可能含 NDA prompt、回答與程式片段，應放在私有目錄並限制檔案權限。
+
+記錄內容包含 question、answer、refs、code snippets、mode、KB score、repo commit、model tag、agent tool calls、files read。這些資料在 NDA 場景通常含敏感內容；預設的 repo 內輸出已由 `.gitignore` 排除。
 
 OpenCode/MCP server 端只記 KB-shaped tools：
 
@@ -370,9 +374,9 @@ OpenCode/MCP server 端只記 KB-shaped tools：
 常用命令：
 
 ```bash
-python data_flywheel.py stats
-python data_flywheel.py rate --file data/interactions.jsonl
-python data_flywheel.py export --file data/interactions.jsonl --output data/training.jsonl
+python3 data_flywheel.py stats
+python3 data_flywheel.py rate --file data/interactions.jsonl
+python3 data_flywheel.py export --file data/interactions.jsonl --output data/training.jsonl
 ```
 
 ---
@@ -665,9 +669,9 @@ fallback)分數是 None,MMR 退回原本的 embedding 相關度,那條路徑行�
 
 ```bash
 # 生成(唯一會生成的路徑;MCP 的 ingest_document 永遠不生成)
-AICODE_KB_CONTEXT_GENERATE=1 python RAG.py rebuild --kb knowledge.json spec_a.pdf
-python RAG.py rebuild --kb knowledge.json spec_a.pdf --context      # 旗標 > config
-python RAG.py rebuild --kb knowledge.json spec_a.pdf --no-context   # 這次不生成
+AICODE_KB_CONTEXT_GENERATE=1 python3 RAG.py rebuild --kb knowledge.json spec_a.pdf
+python3 RAG.py rebuild --kb knowledge.json spec_a.pdf --context      # 旗標 > config
+python3 RAG.py rebuild --kb knowledge.json spec_a.pdf --no-context   # 這次不生成
 
 # 查詢端使用(同時是緊急 kill switch:關掉不必重建 KB)
 AICODE_KB_CONTEXT_USE=1 aicode
@@ -718,9 +722,9 @@ heading hierarchy 都分不開）；給兩份 KB 再加結構差異（**content 
 8081 / 8082。
 
 ```bash
-python scripts/kb_ab_compare.py ~/proj/knowledge.json                       # 體檢
-python scripts/kb_ab_compare.py old/knowledge.json new/knowledge.json       # 重建前後對照
-python scripts/kb_ab_compare.py old/knowledge.json new/knowledge.json \
+python3 scripts/kb_ab_compare.py ~/proj/knowledge.json                       # 體檢
+python3 scripts/kb_ab_compare.py old/knowledge.json new/knowledge.json       # 重建前後對照
+python3 scripts/kb_ab_compare.py old/knowledge.json new/knowledge.json \
     --questions ~/questions.txt                                             # 加跑真題
 ```
 
@@ -733,7 +737,7 @@ python scripts/kb_ab_compare.py old/knowledge.json new/knowledge.json \
 
 ```bash
 mkdir -p /tmp/kb-baseline && cd /tmp/kb-baseline
-for f in <doc1> <doc2>; do python /path/to/CodeTrail/RAG.py "$f" ./knowledge.json; done
+for f in <doc1> <doc2>; do python3 /path/to/CodeTrail/RAG.py "$f" ./knowledge.json; done
 ```
 
 （embedding 快取是 CWD 下的 `.rag_embedding_cache.json`；把舊的複製進來可大幅減少
@@ -747,9 +751,9 @@ for f in <doc1> <doc2>; do python /path/to/CodeTrail/RAG.py "$f" ./knowledge.jso
 issue,路徑本身就是 NDA 內容。
 
 ```bash
-AICODE_ROOT=/path/to/tree python scripts/index_stats.py
-python scripts/index_stats.py --root /path/to/tree --deep        # 真的跑 AST 算符號數
-python scripts/index_stats.py --root /path/to/tree --show-paths  # 顯式 opt-in 才印路徑樣本
+AICODE_ROOT=/path/to/tree python3 scripts/index_stats.py
+python3 scripts/index_stats.py --root /path/to/tree --deep        # 真的跑 AST 算符號數
+python3 scripts/index_stats.py --root /path/to/tree --show-paths  # 顯式 opt-in 才印路徑樣本
 ```
 
 root 只能來自 `--root` 或 `AICODE_ROOT`,都沒有就報錯不猜 cwd;驗證復用

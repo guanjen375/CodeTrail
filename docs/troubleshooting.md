@@ -265,7 +265,7 @@ curl -s http://localhost:8080/props | jq -r '.chat_template' \
 
 例如模型只寫出自創的 `<codetrail_list_dir .../>`,不會因為看起來像 XML 就被 frontend 當成結構化呼叫。不要靠 prompt 手寫 / 猜測底層 tool-call markup;應讓 OpenCode、provider adapter 與 llama.cpp chat template 處理。
 
-若 server 已降溫但模型仍會否認工具,把 [OpenCode 全域 AGENTS.md 範本](opencode-agents-template.md) 裝進 `~/.config/opencode/AGENTS.md`(`python scripts/opencode_contract_check.py --sync-agents-md`,會備份原檔),至少要「CodeTrail 工具存在性與真實呼叫」一段。**已經裝過的也要確認沒過期** —— 那份檔不會跟著 `git pull` 更新,工具清單一舊,模型就會否認新工具存在;`aicode` 啟動時的 `⚠ STALE: 全域 AGENTS.md 與範本不一致` 講的就是這件事。完整列名是刻意的:只寫一句「優先用 `codetrail_*`」仍可能被較弱的本機模型忽略;新增或移除 MCP tool 時要同步 [工具清單](mcp-tools.md)與該範本(consistency check 會抓)。
+若 server 已降溫但模型仍會否認工具,把 [OpenCode 全域 AGENTS.md 範本](opencode-agents-template.md) 裝進 `~/.config/opencode/AGENTS.md`(`python3 scripts/opencode_contract_check.py --sync-agents-md`,會備份原檔),至少要「CodeTrail 工具存在性與真實呼叫」一段。**已經裝過的也要確認沒過期** —— 那份檔不會跟著 `git pull` 更新,工具清單一舊,模型就會否認新工具存在;`aicode` 啟動時的 `⚠ STALE: 全域 AGENTS.md 與範本不一致` 講的就是這件事。完整列名是刻意的:只寫一句「優先用 `codetrail_*`」仍可能被較弱的本機模型忽略;新增或移除 MCP tool 時要同步 [工具清單](mcp-tools.md)與該範本(consistency check 會抓)。
 
 改全域規則後完全退出並重開 OpenCode,用新 session 分別測「列出所有 CodeTrail 工具」與強制 `codetrail_list_dir`。前者只列清單、不出現工具卡是正常的;後者必須出現結構化 `tool_use`。降溫與規則都完成後仍反覆失敗,才表示這顆模型 / template 組合的工具呼叫能力不穩,應換成已驗證支援 tool calling 的模型或版本。
 
@@ -538,7 +538,7 @@ export AICODE_CTX_SAFETY_DISABLE=1
 server 沒啟動 / 不可連時會印 `[ctx-safety] UNKNOWN` 並放行,不會擋啟動。手動驗證可以單跑:
 
 ```bash
-AICODE_MODEL=<CODE_MODEL> python scripts/ctx_safety_check.py
+AICODE_MODEL=<CODE_MODEL> python3 scripts/ctx_safety_check.py
 ```
 
 `<CODE_MODEL>` 是佔位符,必須替換成實際模型名稱或 GGUF 路徑。
@@ -606,7 +606,7 @@ top-level `image_data` 可能被新版 llama.cpp 靜默忽略，造成模型只�
 
 ### PDF ingest 說 preflight 超過上限
 
-`ingest_document(path, preflight_only=True)`(或 `python RAG.py <pdf> knowledge.json --preflight`)
+`ingest_document(path, preflight_only=True)`(或 `python3 RAG.py <pdf> knowledge.json --preflight`)
 報告超出上限時,**還沒有呼叫任何 VL、沒有算 embedding、沒有動 `knowledge.json`** —— 零寫入,
 不需要善後。報告會指出是哪一項超出:
 
@@ -632,7 +632,7 @@ top-level `image_data` 可能被新版 llama.cpp 靜默忽略，造成模型只�
 3. 在終端機直接跑(沒有 MCP 的單次呼叫 timeout):
 
 ```bash
-python RAG.py docs/datasheet.pdf knowledge.json
+python3 RAG.py docs/datasheet.pdf knowledge.json
 ```
 
 ### ingest 逾時,但看得到中途輸出
@@ -847,7 +847,7 @@ chunks 大於 0、一般 `query_knowledge` 也查得到,但 `query_knowledge_str
 命令不在白名單,或含 shell metacharacter。請模型改用已允許的最小命令,例如:
 
 ```text
-請改跑 python -m pytest tests/test_x.py,不要使用 &&、|、; 或 shell script。
+請改跑 pytest tests/test_x.py,不要使用 &&、|、; 或 shell script。
 ```
 
 ---

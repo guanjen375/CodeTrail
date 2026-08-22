@@ -26,7 +26,7 @@
 
 ```bash
 cd <CODETRAIL_REPO>
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 pip install -r requirements.txt
@@ -295,10 +295,10 @@ systemd:`systemctl --user stop codetrail-{main,embed,rerank,vl}`
 ~/start.sh status --strict
 
 # 主 server 載入的是哪顆 GGUF、ctx 多少?
-curl -s http://localhost:8080/props | python -m json.tool | head -20
+curl -s http://localhost:8080/props | python3 -m json.tool | head -20
 
 # slot 是否在處理請求?
-curl -s http://localhost:8080/slots | python -m json.tool
+curl -s http://localhost:8080/slots | python3 -m json.tool
 
 # VRAM 占用
 nvidia-smi --query-gpu=memory.used,memory.free,memory.total --format=csv
@@ -319,7 +319,7 @@ llama-server 端的 `-c <N>` 也是啟動旗標,改完要重啟 server,不能熱
 `~/.config/opencode/AGENTS.md`(決定模型會不會真的去用工具的全域規則)是**另一份檔**,`set_config.sh` 不產生它、`git pull` 也不會更新它。`aicode` 每次啟動會比對並在過期時提醒;要套用新版範本:
 
 ```bash
-python scripts/opencode_contract_check.py --sync-agents-md   # 覆蓋並備份原檔
+python3 scripts/opencode_contract_check.py --sync-agents-md   # 覆蓋並備份原檔
 ```
 
 同步是覆蓋不是合併 —— 自訂段落要自己從 `AGENTS.md.codetrail.bak` 貼回來。自訂過不想每次被提醒就設 `AICODE_AGENTS_MD_CHECK_SKIP=1`。

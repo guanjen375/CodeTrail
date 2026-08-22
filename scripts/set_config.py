@@ -2792,7 +2792,7 @@ def run(args: argparse.Namespace) -> int:
         print("[PASS] 第 1 層:設定檔已寫入並通過 schema 驗證(備份:*.bak-setconfig-*)")
         print("[待執行] 第 2 層:實際啟動與模型載入 → ~/start.sh(成功與否以此為準)")
         print("[待執行] 第 3 層:啟動後健檢 → ~/start.sh status(嚴格模式加 --strict)")
-        print(f"          與 AICODE_MODEL={plan.main_key} python scripts/doctor.py")
+        print(f"          與 AICODE_MODEL={plan.main_key} python3 scripts/doctor.py")
 
     preview_rc = 0
     if not args.dry_run and not args.no_preview:

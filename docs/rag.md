@@ -144,7 +144,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 - **binary**：`.bin` / `.dat` / `.raw` / `.fw` / `.img` / `.rom` / `.hex`（抽 hex dump、可讀字串、magic 偵測；遇到 ELF magic 自動切到 ELF 解析）
 - **ELF**：`.elf` / `.so` / `.o` / `.axf` / `.out` / `.ko`（抽 header / sections / symbols）
 
-純圖片掃描的 PDF（沒有可選文字）不再切不出內容：每頁會整頁 render 後經 VL 抽述入庫。文字＋圖混合的 PDF（datasheet 類）文字照舊切 chunk，圖另外產生 `origin="diagram"` 的 chunk，ingest 輸出會逐張列出「第 N/M 張、頁碼」進度。圖很多的 PDF 建議先跑 `ingest_document(path, preflight_only=True)` 估成本（零寫入，見下節）。VL server 是啟動必要條件，若圖片分析失敗（ingest 會整份中止、知識庫不變），先跑 `python scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
+純圖片掃描的 PDF（沒有可選文字）不再切不出內容：每頁會整頁 render 後經 VL 抽述入庫。文字＋圖混合的 PDF（datasheet 類）文字照舊切 chunk，圖另外產生 `origin="diagram"` 的 chunk，ingest 輸出會逐張列出「第 N/M 張、頁碼」進度。圖很多的 PDF 建議先跑 `ingest_document(path, preflight_only=True)` 估成本（零寫入，見下節）。VL server 是啟動必要條件，若圖片分析失敗（ingest 會整份中止、知識庫不變），先跑 `python3 scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
 
 #### 三個步驟
 
@@ -245,7 +245,7 @@ batch size 上限是 32 (REF1)。
 兩個常踩的點：
 
 - **預設走「技術圖片」路徑**（架構圖／流程圖／記憶體圖），抽的是畫面說明。若這張是**聊天截圖**、想抽的是對話內容，要顯式 `ingest_document('teams.png', mode='chat')`。
-- chunks 回報 0，圖片來源最常見的原因是 **VL server（:8083）沒起來** —— 圖片分析失敗就切不出內容。先跑 `python scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
+- chunks 回報 0，圖片來源最常見的原因是 **VL server（:8083）沒起來** —— 圖片分析失敗就切不出內容。先跑 `python3 scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
 
 #### PDF 內的表格與終端機畫面:結構化抽取 + 人工覆核
 
@@ -306,7 +306,7 @@ batch size 上限是 32 (REF1)。
 在終端機的等價寫法(同樣零寫入):
 
 ```bash
-python RAG.py docs/datasheet.pdf knowledge.json --preflight
+python3 RAG.py docs/datasheet.pdf knowledge.json --preflight
 ```
 
 ##### 零部分成功
@@ -475,7 +475,7 @@ confirm_against_image 設 True。
 
 ```bash
 # 生成：只有這條路徑會生成，MCP 的 ingest_document 永遠不會
-python RAG.py rebuild --kb knowledge.json spec_a.pdf --context
+python3 RAG.py rebuild --kb knowledge.json spec_a.pdf --context
 
 # 查詢時使用（也是緊急關閉開關，關掉不需要重建知識庫）
 AICODE_KB_CONTEXT_USE=1 aicode

@@ -243,7 +243,7 @@ def _check_doctor_commands_have_explicit_model(docs_text: str, issues: list[str]
         if re.match(r"^(?:python3?|python)\s+scripts/doctor\.py(?:\s|$)", stripped):
             issues.append(
                 "文件不可在未設定主模型時直接要求跑 doctor；請改成 "
-                "`AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py` 或移到 OpenCode JSON 設定後。"
+                "`AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py` 或移到 OpenCode JSON 設定後。"
             )
 
 

@@ -100,7 +100,7 @@ Code-RAG 索引預設排除 ignored、虛擬環境、`third_party` / `vendor` / 
 唯讀、離線且預設不印路徑的統計：
 
 ```bash
-python scripts/index_stats.py --root <AICODE_ROOT>
+python3 scripts/index_stats.py --root <AICODE_ROOT>
 ```
 
 部署層需要額外 include / exclude 時才使用

@@ -5,7 +5,7 @@ ai_code MCP server — 把 KnowledgeBase / CodeRAG / agent_tools 包成 MCP tool
 讓 OpenCode (或任何 MCP client) 可以接進來用。
 
 啟動:
-    AICODE_ROOT=/path/to/project python mcp_server.py
+    AICODE_ROOT=/path/to/project python3 mcp_server.py
 
 一般使用者不要直接跑這個檔案；請從專案目錄執行 `aicode`,
 由 OpenCode 透過 stdio 啟動 MCP server。
@@ -1782,7 +1782,7 @@ def ingest_document(path: str, mode: str = "auto", preflight_only: bool = False)
             hint += (
                 "\n\n注意: KB_CONTEXT_GENERATE 是開的,但這次入庫**沒有**生成 chunk 脈絡"
                 "(MCP 有 600 秒 timeout,大窗串行會超時)。要生成請在終端機跑:\n"
-                f"  python RAG.py rebuild --kb {kb_path} {doc_path} --context"
+                f"  python3 RAG.py rebuild --kb {kb_path} {doc_path} --context"
             )
     else:
         status = f"✗ 失敗 (exit {run.returncode})"

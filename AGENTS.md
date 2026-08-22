@@ -29,9 +29,9 @@
 - **smoke** ＝ 標 `@pytest.mark.smoke` 的測試：真實發生過的 bug 的 regression ＋ 無聲失敗風險的契約檢查。
   §3 的每個安全檢查點都必須在裡面（由 `tests/test_smoke_gate.py` 靜態守住）。整包目標 10 秒內。
 - **full** ＝ 整個 `tests/`。
-- 統一入口 `python scripts/run_tests.py`（無參數＝full，最多 8-shard 並行；帶任何 pytest 參數＝單行程逐字轉發）：
-  - smoke：`python scripts/run_tests.py -m smoke`
-  - full：`python scripts/run_tests.py`
+- 統一入口 `python3 scripts/run_tests.py`（無參數＝full，最多 8-shard 並行；帶任何 pytest 參數＝單行程逐字轉發）：
+  - smoke：`python3 scripts/run_tests.py -m smoke`
+  - full：`python3 scripts/run_tests.py`
 
 ### 2.2 執行權責
 
@@ -50,7 +50,7 @@
 ### 2.3 修 bug 鐵則：red-before-green
 
 1. 先寫 regression test，在**未修改**的程式碼上單跑它
-   （`python scripts/run_tests.py tests/test_x.py::test_y`），貼出紅燈輸出節錄。
+   （`python3 scripts/run_tests.py tests/test_x.py::test_y`），貼出紅燈輸出節錄。
 2. 再修程式碼，同一條測試轉綠，貼出綠燈節錄。
 3. 交付內容＝紅燈證據＋綠燈證據＋diff。缺紅燈證據的 bug fix 一律視為未驗證。
 
