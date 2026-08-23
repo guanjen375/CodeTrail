@@ -169,9 +169,10 @@ REF 出現「待覆核」代表程式沒能用獨立證據佐證那張圖的內�
 （那不是「查不到」）。**只有 structured figure（`excluded_figures` 帶 `figure_id` 的那些）**能用
 `review_figures(action="fix", ..., confirm_against_image=True)` 人工覆核（會改知識庫，
 permission 是 `ask`）。
-**注意範圍**：純 raster 的掃描頁表格與拍照的終端機畫面本輪仍走舊的 VL 描述路徑，
-不會出現在 `review_figures` 裡，本輪也沒有把它們升成 strict 可信的路徑——那些數字只能
-自己回去看原始 PDF 那一頁。細節見 [RAG、附件與知識庫操作](rag.md#pdf-內的表格與終端機畫面結構化抽取--人工覆核)。
+純 raster 的掃描頁表格、拍照的終端機畫面與 diagram 也會先分類並產生 structured figure，
+所以會出現在 `review_figures` 裡。它們通常缺少獨立原生證據，會維持 `unverified` 或
+`needs_review`，直到人工對原圖確認後才可能供 strict 查詢使用。細節見
+[RAG、附件與知識庫操作](rag.md#pdf-內的表格與終端機畫面結構化抽取--人工覆核)。
 
 基本判斷：
 

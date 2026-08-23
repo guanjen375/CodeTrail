@@ -64,6 +64,7 @@ KIND_TABLE = "table"
 KIND_TERMINAL = "terminal"
 KIND_DIAGRAM = "diagram"
 KIND_UNKNOWN = "unknown"
+KIND_RASTER = "raster"
 # tuple 而非 set：契約 §2.1 逐字如此，順序也是 schema / 報告的列舉順序。
 FIGURE_KINDS = (KIND_TABLE, KIND_TERMINAL, KIND_DIAGRAM)
 
@@ -359,7 +360,7 @@ def _require_kind(kind: str, *, allow: Iterable[str] = FIGURE_KINDS) -> str:
     if kind not in allow:
         raise FigureValidationError(
             f"kind={kind!r} 不是可用的 figure kind（可用：{sorted(allow)}；"
-            f"{KIND_UNKNOWN!r} 只是候選階段的 table/terminal 分數接近，不可入庫）"
+            f"{KIND_UNKNOWN!r} / {KIND_RASTER!r} 都只存在候選階段，不可直接入庫）"
         )
     return kind
 
@@ -425,8 +426,9 @@ def _validate_table(payload: dict) -> None:
         role = column["role"]
         if role is not None:
             _require_str(role, f"table.columns[{i}].role")
-    if not any(column["label"] for column in columns):
-        raise FigureValidationError("table.columns 的 label 全為空字串（契約 §2.3：header 非空）")
+    # raster 圖可能本來就沒有獨立表頭列。欄位身分由唯一 column_id 與每列固定寬度
+    # 保住；不得為了滿足 schema 把第一筆資料冒充成 header。ingest 端會把全空 label
+    # 標成 `header_missing` / needs_review，直到人看原圖確認，validator 只守結構不猜字。
 
     rows = payload["rows"]
     if not isinstance(rows, list):
@@ -755,9 +757,9 @@ def _canonicalize_terminal_impl(model_obj: dict) -> dict:
 def canonicalize_diagram(model_obj: dict) -> dict:
     """model 物件 → canonical diagram payload（補 `kind`，其餘原樣）。
 
-    本輪沒有自動生產者（契約 §13.1：raster / picture 候選維持既有 legacy VL lane），
-    但 `review_figures(action="fix")` 的人工修正吃這個 kind，所以 schema / validator /
-    renderer 一律完整實作。
+    純 raster / picture 候選會先以受限 schema 分類，再由這個 canonicalizer 接住
+    `diagram` 結果；table / terminal 則各自走專用 schema。`review_figures(action="fix")`
+    的人工修正也吃同一個 kind，所以 schema / validator / renderer 共用這個入口。
     """
     with _locator_sentinel():
         return _canonicalize_diagram_impl(model_obj)

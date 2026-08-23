@@ -643,16 +643,16 @@ def build_text_document(
 
 
 # ============================================================
-# PDF 結構化 figure lane（table / terminal）
+# PDF 結構化 figure lane（table / terminal / diagram）
 # ============================================================
 # 與下面「PDF 內嵌圖 → VL 自動入庫」那條 legacy lane 的分工（契約 §0.1 / §13.1）：
 #
-#   legacy lane：`class=picture` 的框 → 自由文字 VL → origin="diagram"
-#                本輪**逐位元組保留**（行為、print 訊息、錯誤字串、figure_index
-#                編號、去重規則全部不動），純 raster 終端機截圖與掃描頁表格仍走它。
-#   structured lane：**有結構性原生證據**的候選（原生 markdown 表、find_tables
-#                幾何、對齊 word band、向量文字 log）→ canonical JSON payload →
-#                origin="figure_table" / "figure_terminal"。
+#   legacy lane：沒有被 structured 候選覆蓋的舊 `class=picture` job → 自由文字 VL →
+#                origin="diagram"；既有 KB 的 legacy chunk 仍保留原語意。
+#   structured lane：有結構性原生證據的候選，以及夠大的純 raster / picture 候選。
+#                後者先用 image-bound schema 分成 table / terminal / diagram，再產生
+#                canonical JSON payload → origin="figure_table" / "figure_terminal" /
+#                "figure_diagram"。
 #
 # 兩條 lane 不互相承接失敗：structured 的 schema / validator 失敗一律整份 PDF
 # 零寫入（workflow §7「不保留自由文字 fallback」），不會降級成 legacy。
@@ -928,13 +928,10 @@ def _native_span(fx, candidate) -> Optional[Dict]:
 
 
 def _structured_candidates(fx, plan) -> List:
-    """哪些候選進 structured lane（契約 §13.1，使用者已拍板）。
+    """哪些候選進 structured lane。
 
-    `kind == KIND_DIAGRAM` **先排除**，而且排在 native evidence 判斷之前：帶著
-    `native_table` 的 diagram 候選若被放行，legacy picture 框會被 IoU 跳過，
-    既有 `test_real_pymupdf4llm_contract` 的 lane 分工就變了，而 Gate 0 的刻意
-    變更清單沒有它。`KIND_UNKNOWN` 只表示「table vs terminal 分數接近」，
-    不表示「不知道是不是圖」。
+    `KIND_RASTER` 是 candidate-only：必須先由 VL 的受限分類 schema 解成 table /
+    terminal / diagram，結果才可入庫。planner 已知的 diagram 仍不重複處理。
     """
     keep = []
     for candidate in plan.candidates:
@@ -944,7 +941,7 @@ def _structured_candidates(fx, plan) -> List:
         if getattr(candidate, "native_table", None) is not None:
             keep.append(candidate)
             continue
-        if kind in (fx.KIND_TABLE, fx.KIND_TERMINAL, fx.KIND_UNKNOWN):
+        if kind in (fx.KIND_TABLE, fx.KIND_TERMINAL, fx.KIND_UNKNOWN, fx.KIND_RASTER):
             keep.append(candidate)
     return keep
 
@@ -957,7 +954,7 @@ def _format_legacy_vl_estimate(fx, plan, legacy_jobs) -> str:
     不含「內嵌圖」三字（既有 `test_text_only_pdf_zero_vl_calls` 斷言它不出現）。
     """
     threshold = _iou_threshold()
-    kinds = (fx.KIND_TABLE, fx.KIND_TERMINAL, fx.KIND_UNKNOWN)
+    kinds = (fx.KIND_TABLE, fx.KIND_TERMINAL, fx.KIND_UNKNOWN, fx.KIND_RASTER)
     crops = [job for job in legacy_jobs if job["mode"] == "crop"]
     covered = 0
     for job in crops:
@@ -1728,6 +1725,8 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
                 # native lane 永遠不呼叫 VL（契約 §12.1），所以只有這些候選要 probe
                 if candidate.kind == fx.KIND_UNKNOWN:
                     kinds |= {fx.KIND_TABLE, fx.KIND_TERMINAL}
+                elif candidate.kind == fx.KIND_RASTER:
+                    kinds |= set(fx.FIGURE_KINDS)
                 elif candidate.kind in (fx.KIND_TABLE, fx.KIND_TERMINAL):
                     kinds.add(candidate.kind)
             fx.ensure_capability(
@@ -1754,6 +1753,14 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
                 rendered.append(variant)
             return produced
 
+        def _record_generated(variant):
+            """登記 verifier 由原始 pixels 產生的實際模型輸入（例如 ruled-grid 正規化）。"""
+            key = (getattr(variant, "figure_id", ""), getattr(variant, "variant_id", ""))
+            if key not in seen_variants:
+                seen_variants.add(key)
+                rendered.append(variant)
+            return variant
+
         def _progress(*parts):
             print("  " + " ".join(str(part) for part in parts), flush=True)
 
@@ -1779,7 +1786,21 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             results = list(fx.extract_document_figures(
                 plan, pdf_doc=pdf_doc, page_evidence=plan.page_evidence,
                 vl_base_url=LLAMA_VL_BASE_URL, vl_model=VL_MODEL,
-                render_variants=_record, on_progress=_progress))
+                render_variants=_record, record_generated_variant=_record_generated,
+                on_progress=_progress))
+
+            # renderer 可能先產生原圖，verifier 再以同尺寸的衍生 variant 取代它做
+            # structured extraction。只有 FigureResult.variants 宣告的 id 才真的送過
+            # 模型；其餘 renderer 中間產物不准混進 variants/ 冒充模型輸入。
+            declared_inputs = {
+                (figure.figure_id, variant_id)
+                for figure in results for variant_id in (figure.variants or [])
+            }
+            rendered[:] = [
+                variant for variant in rendered
+                if (getattr(variant, "figure_id", ""),
+                    getattr(variant, "variant_id", "")) in declared_inputs
+            ]
 
             by_fid = _verify_results_match_candidates(fx, filename, plan, results)
             _check_claimed_variants(fx, filename, results, rendered)
@@ -1896,14 +1917,13 @@ def extract_pdf_document(file_path: str, *, preflight_only: bool = False,
 
     兩條互不承接的 figure lane（契約 §0.1 / §13.1）：
 
-      - **legacy 圖面路徑**：`class=picture` 的框 → 自由文字 VL → `origin="diagram"`
-        的 chunk（見 `_plan_pdf_figure_jobs` 的分流規則）。render / VL 任何一張失敗
-        都 raise `PdfFigureError`——整份文件不入庫、零寫入。純 raster 終端機截圖與
-        掃描頁表格本輪仍走這一條。
-      - **structured lane**：有結構性原生證據的候選（原生 markdown 表、find_tables
-        幾何、對齊 word band、向量文字 log）→ canonical JSON payload →
-        `origin="figure_table"` / `"figure_terminal"`。schema / validator 失敗一律
-        `FigureExtractionError`，**不降級成自由文字**（workflow §7）。
+      - **legacy 圖面路徑**：只處理沒有被 structured 候選覆蓋的舊
+        `class=picture` job，產生自由文字 `origin="diagram"` chunk。
+      - **structured lane**：有結構性原生證據的候選，以及夠大的純 raster / picture
+        候選。raster 先依圖片分類成 table / terminal / diagram，再產生 canonical
+        JSON payload與 `origin="figure_table"` / `"figure_terminal"` /
+        `"figure_diagram"`。schema / validator 失敗一律 `FigureExtractionError`，
+        **不降級成自由文字**（workflow §7）。
 
     `FigureBudgetError` / `FigureCapabilityError` / `FigureExtractionError` /
     `FigureValidationError` 全部在 `_commit_document_to_kb` 之前拋出，所以與

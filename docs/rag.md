@@ -137,14 +137,14 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 #### 支援格式
 
 - **文字**：`.pdf` / `.md` / `.txt`（抽文字。PDF 裡的圖走**兩條 lane**，範圍不一樣，詳見下面「[PDF 內的表格與終端機畫面](#pdf-內的表格與終端機畫面結構化抽取--人工覆核)」：
-  1. **結構化 lane** —— 只收**有結構性原生證據**的候選（原生 markdown 表格、`find_tables` 幾何、框線格、對齊的文字帶＝無框線 memory map / register map、**向量文字**的終端機 log）。產出 canonical JSON 與逐格/逐行證據，帶驗證狀態，看不清的字元放 `▯` 而不是猜。
-  2. **既有自由文字 VL lane** —— **純 raster** 的終端機截圖、掃描頁表格、方塊圖／流程圖仍走這條：幾乎沒有文字的頁（掃描頁）整頁 render 成圖，文字頁裡的圖逐張裁切送 VL；過小的圖示/分隔線略過，重複影像（頁首 logo）只入庫一次。這些 chunk 帶 `origin="diagram"`，檢索時降權、REF 會標示「VL 辨識」，而且**沒有** `▯`／逐格證據／strict gate 保護。
+  1. **結構化 lane** —— 收原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，也收夠大的純 raster / picture。raster 先由 VL 分類成 table / terminal / diagram，再產出 canonical JSON、逐格/逐行證據與驗證狀態；看不清的字元放 `▯` 而不是猜。
+  2. **舊自由文字 VL 相容 lane** —— 只處理未被結構化候選覆蓋的舊 picture job，並維持既有 `origin="diagram"` KB chunk 的相容性；它沒有 canonical payload 或 strict gate。
   兩條 lane 任一失敗都是**整份文件不入庫**（零寫入）。走到 VL 的圖需要 VL server（:8083）在線；純文字＋原生表格的 PDF 則可能一次 VL 都不用呼叫）
 - **圖片**：`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp`（用 VL 模型看圖、抽出文字描述後切 chunk，需要先把 VL GGUF 掛在 llama-server :8083,設定見 [README §2.4](../README.md#24-vl-模型) 與 §3.2）
 - **binary**：`.bin` / `.dat` / `.raw` / `.fw` / `.img` / `.rom` / `.hex`（抽 hex dump、可讀字串、magic 偵測；遇到 ELF magic 自動切到 ELF 解析）
 - **ELF**：`.elf` / `.so` / `.o` / `.axf` / `.out` / `.ko`（抽 header / sections / symbols）
 
-純圖片掃描的 PDF（沒有可選文字）不再切不出內容：每頁會整頁 render 後經 VL 抽述入庫。文字＋圖混合的 PDF（datasheet 類）文字照舊切 chunk，圖另外產生 `origin="diagram"` 的 chunk，ingest 輸出會逐張列出「第 N/M 張、頁碼」進度。圖很多的 PDF 建議先跑 `ingest_document(path, preflight_only=True)` 估成本（零寫入，見下節）。VL server 是啟動必要條件，若圖片分析失敗（ingest 會整份中止、知識庫不變），先跑 `python3 scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
+純圖片掃描的 PDF（沒有可選文字）不再切不出內容：每頁會 render 後進入 raster 分類與結構化抽取。文字＋圖混合的 PDF（datasheet 類）文字照舊切 chunk，圖另外產生 table / terminal / diagram structured chunk。圖很多的 PDF 建議先跑 `ingest_document(path, preflight_only=True)` 估成本（零寫入，見下節）。VL server 是啟動必要條件，若圖片分析失敗（ingest 會整份中止、知識庫不變），先跑 `python3 scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
 
 #### 三個步驟
 
@@ -254,16 +254,16 @@ batch size 上限是 32 (REF1)。
 解析度的字元,沒有任何程式能還原真值 —— 能保證的只有「正確,或誠實拒絕」。所以
 **「查得到但標了待覆核」是正常狀態,不是 bug**。
 
-##### 這一輪涵蓋到哪裡(範圍限制,先看這段)
+##### 涵蓋範圍
 
 | lane | 收哪些 | 拿得到什麼 |
 |---|---|---|
-| **結構化** | **有結構性原生證據**的候選:原生 markdown 表格、`find_tables` 幾何、框線格、對齊的文字帶（無框線 memory map / register map）、**向量文字**的終端機 log | canonical JSON、逐格/逐行證據、`▯`、驗證狀態、strict gate、`review_figures` 可覆核 |
-| **既有自由文字 VL** | **純 raster**:被拍成圖或掃描進來的表格、終端機截圖、方塊圖 / 流程圖 | 只有 VL 的文字描述（`origin="diagram"`，檢索降權）。**沒有** `▯`、沒有逐格證據、不會出現在 `review_figures` 裡 |
+| **結構化** | 原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，以及夠大的純 raster / picture | raster 先分類成 table / terminal / diagram；再產生 canonical JSON、逐格/逐行證據、`▯`、驗證狀態、strict gate，且可用 `review_figures` 覆核 |
+| **舊自由文字 VL 相容路徑** | 未被結構化候選覆蓋的舊 picture job，以及既有 KB chunk | 只有 VL 文字描述（`origin="diagram"`，檢索降權），沒有 canonical payload |
 
-也就是說:**掃描版 datasheet 的表格、手機拍的終端機畫面,本輪仍走舊路徑**。它們一律被視為
-`legacy_unverified`,`query_knowledge_strict` 不會用它們回答數值 —— 這是刻意的保守作法,
-不是漏掉。`diagram`（方塊圖）這個 kind 的 schema 有保留,但只給人工修正用,本輪沒有自動生產者。
+掃描版 datasheet 的表格與手機拍的終端機畫面現在會成為 structured figure；因為通常沒有
+獨立原生證據，狀態仍多半是 `unverified` / `needs_review`，`query_knowledge_strict` 會擋下，
+直到人工對原圖確認。`diagram` 也有自動分類與 structured producer。
 
 ##### 六種驗證狀態
 
@@ -299,10 +299,9 @@ batch size 上限是 32 (REF1)。
 它在**任何 VL 呼叫、embedding 與 knowledge.json 寫入之前**算完就結束。超過上限會直接停下並
 指出是哪一項;上限在 `config.py` 的 `FIGURE_*`,可用同名 `AICODE_FIGURE_*` 環境變數覆寫。
 
-> **範圍限制(重要)**:preflight 的欄位與「有沒有超過上限」**只涵蓋結構化 lane**。
-> 既有自由文字 VL lane(純 raster 內嵌圖、掃描頁)的呼叫**不受這些上限判定** —— 報告會
-> 另外印一個未受閘控的粗估(去重前,而且**沒有** image-token 估算)。所以「在預算內」
-> **不等於**整份 PDF 的總成本在預算內:純 raster 圖很多的檔案仍可能發出大量 VL 呼叫。
+> preflight 涵蓋所有結構化候選，包含純 raster 的分類、雙樣本抽取與 image-token 估算。
+> 只有未被結構化候選覆蓋的舊 picture 相容 job 不受這些上限判定；若存在，報告會另外
+> 列出未受閘控的粗估。
 在終端機的等價寫法(同樣零寫入):
 
 ```bash
@@ -393,17 +392,16 @@ confirm_against_image 設 True。
 - `query_knowledge` 照常查得到,只是 REF 會標待覆核。
 - `query_knowledge_strict` **不再用它們回答數值**,改成在 `excluded_figures` 指出可用但待覆核。
 
-要不要重 ingest?看那份 PDF 的表格是不是**原生的**(可選取文字、`find_tables` 抓得到):
+要不要重 ingest?新版會同時處理原生與 raster 圖:
 
 - 是 → **可能**拿得到可信狀態,值得試。那些表會走結構化 lane;但「有原生文字」不等於
   「一定 `native_verified`」—— 那需要**兩個一致的原生 evidence channel**,只有一個通道時
   結果是 `unverified`,通道互相矛盾時是 `needs_review`。而且 native lane 不呼叫 VL,
   所以**不會**產生 `corroborated`。實際拿到什麼狀態以 `review_figures(action="list")`
   的結果為準,不要預先假設。
-- 不是(掃描版 / 拍照版 / 純 raster)→ 重 ingest 只會回到自由文字 VL lane,狀態一樣是
-  flagged,而且**這些不會出現在 `review_figures` 裡**(沒有 canonical payload 可以 fix)。
-  **本輪沒有把純 raster 升成 strict-trusted 的支援路徑**;要拿那些數字,只能自己回去看
-  原始 PDF 的那一頁,或改用有原生文字的來源重新入庫。
+- 不是(掃描版 / 拍照版 / 純 raster)→ 重 ingest 會先分類並產生 structured figure，可在
+  `review_figures` 看 canonical payload 與原圖。因為沒有獨立原生證據，預設仍會是
+  `unverified` / `needs_review`；人工逐圖確認後才能升成 `human_verified` 供 strict 查詢使用。
 
 重 ingest 的做法就是既有的維護流程:`remove_document` 舊的,再 `ingest_document` 一次。
 

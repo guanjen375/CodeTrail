@@ -307,7 +307,7 @@ CodeTrail 的內建 VL key 是 `qwen3.5-9b`。Qwen3.5-9B 是原生多模態模�
 
 > 「圖片 ingestion」就是 **VL + RAG 一起用**:`ingest_document(...)` 餵圖片時會自動呼叫 VL 把圖看成文字、再切 chunk 進知識庫,所以截圖/架構圖/規格頁能變成之後 `query_knowledge(...)` 查得到的內容。一次性看圖用 `analyze_file(...)`,要長期反覆查改用 `ingest_document(...)`;完整串接見 [docs/rag.md](docs/rag.md)。
 >
-> PDF 裡的圖分兩條路:**有結構性原生證據**的表格 / memory map / 向量文字終端機 log 走**結構化**抽取(canonical JSON + 逐格證據 + 驗證狀態,看不清的字元放 `▯` 而不是猜);**純 raster** 的掃描頁、拍照的表格與方塊圖仍走上面這條自由文字 VL 路徑。只有前者受嚴格模式的證據閘保護,也只有前者能用 `review_figures(...)` 人工覆核。
+> PDF 裡的表格 / memory map / 終端機 log / diagram 走**結構化**抽取:有原生文字或幾何就直接利用;只有像素的 raster / picture 則先由 VL 分成 table、terminal 或 diagram，再產生 canonical JSON、格/行級證據與驗證狀態。看不清的字元放 `▯` 而不是猜。這些候選都受嚴格模式的證據閘保護，也都能用 `review_figures(...)` 人工覆核;只有未被結構化候選覆蓋的舊 picture job 才保留自由文字 VL 相容路徑。
 
 ```bash
 HF_XET_HIGH_PERFORMANCE=1 hf download \
@@ -773,13 +773,13 @@ PDF 先估成本,再入庫,最後覆核:
 完成後用工具 review_figures,action 設 "list",列出待覆核的圖與原因。
 ```
 
-preflight 零寫入,但它的欄位與「有沒有超過上限」**只涵蓋結構化 lane** —— 既有自由文字 VL
-的呼叫不受這些上限判定,所以「在預算內」不等於整份 PDF 的總成本在預算內。
+preflight 零寫入;它會估算所有結構化候選，包含純 raster 的分類與雙樣本抽取。
+只有未被結構化候選覆蓋的舊自由文字 picture job 不在這個預算欄位裡。
 入庫後,**能以獨立證據確認的**表格才會被 `query_knowledge_strict` 拿來回答數值;不能確認的
 會標成待覆核並在回傳的 `excluded_figures` 裡列出頁碼與原因(不是「查不到」)。
 `review_figures(action="fix", ..., confirm_against_image=True)` 是人工覆核入口,permission 設
-`ask`。**範圍限制**:純 raster 的掃描頁表格與終端機截圖本輪仍走自由文字 VL,拿不到 `▯` /
-逐格證據 / strict gate,**也不會出現在 `review_figures` 裡**。完整說明見
+`ask`。純 raster 的掃描頁表格、終端機截圖與 diagram 也會保存原圖、bbox、輸入變體與
+`▯` / 逐格或逐行證據，並出現在 `review_figures` 裡。完整說明見
 [docs/rag.md](docs/rag.md#pdf-內的表格與終端機畫面結構化抽取--人工覆核)。
 
 更多操作模式(夾帶附件、注入 RAG、查 spec)見 [docs/basic-usage.md](docs/basic-usage.md);完整 19 個工具清單見 [docs/mcp-tools.md](docs/mcp-tools.md);被你糾正過的行為怎麼變成之後 session 都遵守的規則,見 [docs/lessons.md](docs/lessons.md)。

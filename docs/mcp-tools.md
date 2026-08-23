@@ -46,8 +46,8 @@
 | 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=50000)` | 讀檔案內容，長檔要分段 |
 | 文件/外部檔案 | `import_external_file(path, dest_name=None)` | 把允許來源的外部檔案複製進 `.aicode_uploads/` |
 | 文件/外部檔案 | `analyze_file(path)` | 用 VL 分析各類圖片、一次性抽 PDF 文字（不入 KB）、分析 ELF 或 firmware blob |
-| 文件/外部檔案 | `ingest_document(path, mode="auto", preflight_only=False)` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document`。PDF 的圖走兩條 lane（見下節）：**有結構性原生證據**的表格 / 向量文字 log 走結構化抽取並帶驗證狀態；純 raster 截圖、掃描頁、方塊圖仍走既有自由文字 VL（`origin="diagram"` 降權）。任一條失敗都整份不入庫、KB 不變。`preflight_only=True` 只估成本、零寫入（僅 .pdf） |
-| 文件/外部檔案 | `review_figures(action="list", document_id="", figure_id="", expected_revision=0, payload_json="", confirm_against_image=False)` | 覆核 PDF 結構化抽取的表格 / 終端機 log：`list` 唯讀列出 figure_id、頁碼、bbox、kind、驗證狀態、原因、原圖路徑與 canonical payload；`fix` 只收該 kind schema 的 structured payload + `expected_revision`，`confirm_against_image=True` 才升 `human_verified`。permission 設 `ask` |
+| 文件/外部檔案 | `ingest_document(path, mode="auto", preflight_only=False)` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document`。PDF 的原生表格 / 向量文字 log 與純 raster 截圖、掃描頁、方塊圖都走結構化抽取；raster 會先分類為 table / terminal / diagram，再帶 canonical payload、證據與驗證狀態。任一條失敗都整份不入庫、KB 不變。`preflight_only=True` 只估成本、零寫入（僅 .pdf） |
+| 文件/外部檔案 | `review_figures(action="list", document_id="", figure_id="", expected_revision=0, payload_json="", confirm_against_image=False)` | 覆核 PDF 結構化抽取的表格 / 終端機 log / diagram：`list` 唯讀列出 figure_id、頁碼、bbox、kind、驗證狀態、原因、原圖路徑與 canonical payload；`fix` 只收該 kind schema 的 structured payload + `expected_revision`，`confirm_against_image=True` 才升 `human_verified`。permission 設 `ask` |
 | 文件/外部檔案 | `remove_document(source)` | 從 KB 移除過期文件 |
 | 文件/外部檔案 | `reload_knowledge_base()` | 立即載入 KB 並回報 chunk 數（查詢本身會自動偵測變更，這是「馬上確認」用） |
 | 文件/外部檔案 | `query_knowledge(question, source=None)` | 查 KB；`source` 可用 basename 限定單一 spec/manual |
@@ -119,12 +119,12 @@ target repo，必須維持 owner-only 權限（POSIX `chmod 600`）；pattern �
 
 | lane | 收哪些候選 | 產出 | 有沒有 `▯` / 逐格證據 / strict gate |
 |---|---|---|---|
-| 結構化 | **有結構性原生證據**者:原生 markdown 表格、`find_tables` 幾何、框線格、對齊的文字帶（無框線 memory map / register map）、**向量文字**的終端機 log | canonical JSON（table / terminal）+ 衍生文字 chunk | 有 |
-| 既有自由文字 VL | **純 raster** 的終端機截圖、掃描頁表格、方塊圖 / 流程圖 | VL 的文字描述,`origin="diagram"`,檢索降權 | 沒有 |
+| 結構化 | 原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，以及夠大的純 raster / picture | raster 先分類成 table / terminal / diagram；再產生 canonical JSON + 衍生文字 chunk | 有 |
+| 舊自由文字 VL 相容路徑 | 未被結構化候選覆蓋的舊 picture job，以及既有 KB chunk | VL 文字描述，`origin="diagram"`，檢索降權 | 沒有 |
 
-換句話說:被拍成圖或掃描進來的表格,本輪**還是**走舊的 VL 描述路徑,不會出現在
-`review_figures` 裡,也不受 strict gate 保護(它們一律被當成 `legacy_unverified`,strict 查詢
-不會拿它們回答數值)。`diagram` 這個 kind 的 schema 保留給人工修正用,本輪沒有自動生產者。
+被拍成圖或掃描進來的表格與終端機會出現在 `review_figures`，但沒有獨立原生證據時通常是
+`unverified` / `needs_review`，strict 查詢仍會擋下，直到人工對原圖確認。`diagram` 也有
+自動分類與 structured producer。
 
 **六種 `verification_status`**(structured chunk 專屬;兩個正交欄位之一,另一個是
 `extraction_status ∈ {complete, failed}`)
@@ -164,7 +164,9 @@ target repo，必須維持 owner-only 權限（POSIX `chmod 600`）；pattern �
 指出是哪一項(上限是 `config.py` 的 `FIGURE_*`,可用同名 `AICODE_FIGURE_*` env 覆寫)。
 MCP 每次工具呼叫有 client timeout,開始之後才超時等於沒有提示 —— 所以先估。
 
-**範圍限制**:preflight 的欄位與「有沒有超過上限」**只涵蓋結構化 lane**。既有自由文字 VL lane(純 raster 內嵌圖、掃描頁)的呼叫**不受這些上限判定**——報告會另外印一個未受閘控的粗估(去重前、且**沒有** image-token 估算),所以「在預算內」不等於整份 PDF 的總成本在預算內。純 raster 圖很多的檔案仍可能發出大量 VL 呼叫。
+preflight 涵蓋所有結構化候選，包含純 raster 的分類、雙樣本抽取與 image-token 估算。
+只有未被結構化候選覆蓋的舊 picture 相容 job 不受這些上限判定；若存在，報告會另外列出
+未受閘控的粗估。
 
 **零部分成功**:結構化 lane 的 schema / validator / row width / line contract /
 `finish_reason` 任一最終不合格 → 整份 PDF 零寫入,舊 KB 與向量保持原狀。需要 VL 的候選會在
@@ -226,6 +228,6 @@ native lane(原生表格,零 VL 呼叫)**沒有任何模型影像輸入**,它的
 - 工具 `apply_patch` 和 `run_command` 有副作用；需要改檔或執行專案腳本時才允許。
 - 工具 `record_lesson` 只在「你糾正了模型的做事方式」之後用;工具報錯或答案錯誤不是觸發條件。寫入需要你核准,細節與管理指令見 [docs/lessons.md](lessons.md)。
 - 圖很多的 PDF 先用 `ingest_document(path, preflight_only=True)` 估成本（零寫入），再決定要不要在 MCP 裡跑或改走 CLI。
-- REF 標「待覆核」的圖片內容不得當成規格數值的定論；`query_knowledge_strict` 的 `excluded_figures` 就是被 gate 擋下、但確實存在的圖，照實轉述頁碼與原因。**只有 structured figure（`excluded_figures` 帶 `figure_id` 的那些）能用 `review_figures` 覆核**（`fix` 會改 KB，permission 是 `ask`）；舊 KB / 純 raster 的 VL chunk 不會出現在 `review_figures` 裡，本輪沒有把它們升成 strict-trusted 的路徑，只能回去看原始 PDF 那一頁。
+- REF 標「待覆核」的圖片內容不得當成規格數值的定論；`query_knowledge_strict` 的 `excluded_figures` 就是被 gate 擋下、但確實存在的圖，照實轉述頁碼與原因。**structured figure（`excluded_figures` 帶 `figure_id`）能用 `review_figures` 覆核**（`fix` 會改 KB，permission 是 `ask`）；新 ingest 的純 raster 也屬 structured figure。只有舊 KB 的 legacy VL chunk 沒有 canonical payload，不能在這裡覆核。
 
 ---

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import difflib
 import hashlib
 import json
 import os
@@ -493,7 +494,15 @@ _PROMPT_COMMON = (
 _PROMPT_BY_KIND = {
     "table": (
         "把圖中的表格轉成 JSON。\n"
-        "- `columns`：依左到右的欄位，`label` 是該欄表頭的原文。\n"
+        "- `columns`：先取**所有資料列**中可見垂直框線/儲存格邊界的聯集，建立全表最細的"
+        "原子欄，再由左到右輸出；只在某一列出現的短垂直線也算全表欄界。跨越多個原子欄"
+        "的合併格把文字放在最左原子格，其餘被覆蓋的原子格給空字串。"
+        "同一格內以空白分隔的多字詞仍是一格，絕不可因空白或換行自行增加欄位。"
+        "`label` 只能是圖片中**獨立表頭列**的原文；"
+        "圖片沒有獨立表頭列時，每個 `label` 都給空字串。絕不可把第一筆資料升格成表頭。"
+        "若最上列以數字索引/位址起頭、外觀與其餘資料列相同，或同一段文字也已放進"
+        "第一列 cells，它就是資料而不是表頭。表頭與第一筆資料不可重複；沒有表頭時"
+        "輸出形式是 `columns: [{\"label\":\"\"}, ...]`。\n"
         "- `rows`：每一列一個元素；`cells` 的長度必須**恰好等於** columns 的數量，"
         "順序與 columns 一一對應。看不清的格 `state` 填 \"unreadable\"，其餘填 \"observed\"。\n"
         "- `footnotes`：表格下方的註腳原文，沒有就給空陣列。\n"
@@ -502,9 +511,19 @@ _PROMPT_BY_KIND = {
     "terminal": (
         "把圖中的終端機/log 畫面轉成 JSON。\n"
         "- `lines`：**一個視覺行一個元素**，不合併、不拆行、不重排；空行也要輸出 "
-        "（`text` 給空字串），包括第一行與最後一行。\n"
+        "（`text` 給空字串）。保留兩段可見文字之間的空行，但視窗最上/最下的 padding、"
+        "捲軸後方或最後一行之後的大塊空白不是文字行，不得據此增加首尾空行。\n"
+        "- 圖中若有多個並排 terminal pane，依**左到右**逐 pane 轉錄；每個 pane 內再由"
+        "上到下。完成左 pane 後直接接右 pane，不按全圖 y 座標交錯，也不自行增加 pane"
+        "分隔文字。視窗標題列、按鈕、捲軸，以及覆蓋在畫面上的彩色說明/箭頭不屬於"
+        "monospace terminal stream，不要輸出。\n"
+        "- terminal 內容區裡獨立可見的 `_`、方塊或其他 cursor/prompt glyph 是原文，"
+        "必須保留成該視覺行的 `text`，不可改成空字串。最後一個可見 terminal glyph"
+        "所在行就是輸出末行；其後不得再附加空行。\n"
         "- 看不清的字元在 `text` 放 `▯`，候選寫進 `uncertain_spans` 的 `alternatives`；"
         "**不得**在正文寫成 `[不確定:A|B]` 這種形式。\n"
+        "- 絕不正規化或改寫符號：圖片的 `@` 不得改成 `0x`，`I/J`、`N/M`、`0/O`、"
+        "`&/$`、逗號與冒號必須逐字分辨；分不清就只在該字元放 `▯`。\n"
         "- `uncertain_spans` 的 start/end 是該行 `text` 的字元索引。\n"
         "不要輸出行號——那由程式指派。\n"
     ),
@@ -514,6 +533,26 @@ _PROMPT_BY_KIND = {
         "沒有的欄位給空字串或空陣列，不要省略 key。\n"
     ),
 }
+_RASTER_KIND_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["kind"],
+    "properties": {
+        "kind": {"type": "string", "enum": ["table", "terminal", "diagram"]},
+    },
+}
+_RASTER_KIND_PROMPT = (
+    "只分類圖片主要資訊的表示方式，不轉錄、不摘要、不解釋。\n"
+    "- table：重點是列與欄的配對，例如 register table、memory map、參數表。\n"
+    "- terminal：重點是逐行原文與順序，例如 shell/console/log、指令清單、程式碼或"
+    "白底終端截圖；不要求一定有提示符或深色背景。單行等寬的 console/status/prompt "
+    "文字條也算 terminal。圖片若幾乎只有一行文字，而那行是完整的操作指示、錯誤訊息、"
+    "執行狀態或程式輸出句子，必須判成 terminal。\n"
+    "- diagram：上述兩者都不是，例如方塊圖、流程圖、照片、logo、一般 UI。\n"
+    "一般 GUI 的按鈕、視窗標題、圖示或導覽標籤算 diagram；這類通常是短名詞或名稱，"
+    "不是一個操作/錯誤/狀態句。不要只因為其中有文字就判成 terminal。\n"
+    "只輸出 JSON 物件 {\"kind\":\"table|terminal|diagram\"}，不得增加其他 key。"
+)
 _SCHEMA_ECHO_SUFFIX = (
     "\n輸出必須嚴格符合下列 JSON Schema，**不得**出現 schema 以外的鍵：\n{schema}\n"
 )
@@ -538,6 +577,14 @@ def _prompt_for(kind: str, profile: str) -> str:
     if profile == "schema_echo":
         schema = json.dumps(figure_extract.model_json_schema(kind), ensure_ascii=False)
         body += _SCHEMA_ECHO_SUFFIX.format(schema=schema)
+    return body
+
+
+def _raster_kind_prompt(profile: str) -> str:
+    body = _RASTER_KIND_PROMPT
+    if profile == "schema_echo":
+        body += _SCHEMA_ECHO_SUFFIX.format(
+            schema=json.dumps(_RASTER_KIND_SCHEMA, ensure_ascii=False))
     return body
 
 
@@ -952,6 +999,8 @@ _ASSET_LEVEL_SLUGS = frozenset({
     "stitch_uncertain", "stitch_footnote_conflict", "repeat_sample_failed",
     "glyph_conflict", "sample_conflict", "sample_state_conflict", "sample_span_conflict",
     "model_unreadable", "unreadable_content", "two_samples_agree",
+    "header_missing", "header_promoted_from_first_row",
+    "sample_shape_mismatch",
 })
 
 
@@ -969,6 +1018,8 @@ _FAILURE_HINTS = {
     "not_json": "server 可能沒有真的套用 grammar 約束；先跑 capability probe 確認",
     "schema": "模型輸出的鍵與 schema 不符",
     "row_width": "每列的 cell 數必須等於欄數——不補不砍",
+    "grid_column_mismatch": "模型欄數與圖片中可確認的垂直框線不一致——不補不砍",
+    "grid_cell_occupancy_mismatch": "模型把內容放到錯的原子欄，或用尾端空格湊欄數",
     "line_contract": "一個 line 必須恰是一個視覺行，不得含 \\n / \\r",
     "empty_payload": "空 payload 不得入庫（那等於宣稱這張圖沒有內容）",
     "canonicalize": "canonicalize 失敗",
@@ -1075,6 +1126,283 @@ def _variant_mime(variant) -> str:
     if isinstance(mime, str) and mime.startswith("image/"):
         return mime
     return "image/png"
+
+
+def _raster_table_grid_hint(variant) -> dict | None:
+    """從 raster ruling lines 取得**只含幾何**的原子欄數提示。
+
+    這不是 OCR，也不會猜 cell 內容。先找橫跨大半寬度的水平框線，再在每兩條水平線
+    之間找近乎連續的垂直線；所有 row band 的垂直線聯集就是最細原子欄界。只有高對比、
+    至少兩條水平線、而且左右主邊界在多個 band 重現時才回提示，其餘一律 None。
+
+    典型的 register bitmap 會在第一列把數個 bit 欄切很細、後續列又合併。只看完整
+    高度的線會漏掉那些短欄界，模型就把 `C | R | R | R | PM Port` 黏成較少欄；取
+    row-band 聯集正是為了保住這種關係。
+    """
+    try:
+        import pymupdf
+
+        source = pymupdf.Pixmap(bytes(variant.png))
+        gray = pymupdf.Pixmap(pymupdf.csGRAY, source)
+    except Exception:  # noqa: BLE001 - 沒有可信幾何就不給 hint，不影響既有抽取
+        return None
+    width, height = int(gray.width), int(gray.height)
+    samples = bytes(gray.samples)
+    if width < 48 or height < 24 or gray.n != 1 or len(samples) != width * height:
+        return None
+
+    histogram = [0] * 256
+    for value in samples:
+        histogram[value] += 1
+
+    def percentile(fraction: float) -> int:
+        target = max(1, int(len(samples) * fraction))
+        seen = 0
+        for value, count in enumerate(histogram):
+            seen += count
+            if seen >= target:
+                return value
+        return 255
+
+    dark, light = percentile(0.05), percentile(0.90)
+    if light - dark < 60:
+        return None
+    threshold = (dark + light) // 2
+
+    def consecutive_groups(values: list[int]) -> list[list[int]]:
+        groups: list[list[int]] = []
+        for value in values:
+            if not groups or value > groups[-1][-1] + 1:
+                groups.append([value])
+            else:
+                groups[-1].append(value)
+        return groups
+
+    horizontal_pixels: list[int] = []
+    for y in range(height):
+        row = samples[y * width:(y + 1) * width]
+        if sum(value <= threshold for value in row) / width >= 0.45:
+            horizontal_pixels.append(y)
+    max_rule_thickness = max(6, int(round(height * 0.02)))
+    horizontal_groups = [
+        group for group in consecutive_groups(horizontal_pixels)
+        if len(group) <= max_rule_thickness
+    ]
+    horizontal = [int(round(sum(group) / len(group))) for group in horizontal_groups]
+    if len(horizontal) < 2:
+        return None
+
+    min_band_height = max(8, int(round(height * 0.02)))
+    max_vertical_thickness = max(6, int(round(width * 0.008)))
+    band_records: list[dict] = []
+    for top, bottom in zip(horizontal, horizontal[1:]):
+        if bottom - top < min_band_height:
+            continue
+        y_start, y_stop = top + 2, bottom - 1
+        span = y_stop - y_start
+        if span <= 0:
+            continue
+        counts = [0] * width
+        for y in range(y_start, y_stop):
+            row = samples[y * width:(y + 1) * width]
+            for x, value in enumerate(row):
+                if value <= threshold:
+                    counts[x] += 1
+        vertical_pixels = [x for x, count in enumerate(counts) if count / span >= 0.72]
+        vertical_groups = [
+            group for group in consecutive_groups(vertical_pixels)
+            if len(group) <= max_vertical_thickness
+        ]
+        centers = [int(round(sum(group) / len(group))) for group in vertical_groups]
+        if len(centers) >= 2:
+            band_records.append({"top": top, "bottom": bottom, "centers": centers})
+    if not band_records:
+        return None
+
+    tolerance = max(2, int(round(width * 0.003)))
+    clusters: list[dict] = []
+    for band_index, record in enumerate(band_records):
+        centers = record["centers"]
+        for center in centers:
+            nearest = min(
+                (cluster for cluster in clusters
+                 if abs(center - int(round(sum(cluster["xs"]) / len(cluster["xs"])))) <= tolerance),
+                key=lambda cluster: abs(
+                    center - int(round(sum(cluster["xs"]) / len(cluster["xs"])))),
+                default=None,
+            )
+            if nearest is None:
+                clusters.append({"xs": [center], "bands": {band_index}})
+            else:
+                nearest["xs"].append(center)
+                nearest["bands"].add(band_index)
+    clusters.sort(key=lambda cluster: sum(cluster["xs"]) / len(cluster["xs"]))
+    boundaries = [int(round(sum(cluster["xs"]) / len(cluster["xs"]))) for cluster in clusters]
+    columns = len(boundaries) - 1
+    if not (2 <= columns <= 64):
+        return None
+
+    repeated_required = (
+        1 if len(band_records) == 1
+        else max(2, (len(band_records) * 3 + 3) // 4)
+    )
+    repeated = [cluster for cluster in clusters if len(cluster["bands"]) >= repeated_required]
+    if len(repeated) < 2:
+        return None
+
+    band_spans: list[list[list[int]]] = []
+    band_nonempty: list[list[int]] = []
+    band_y: list[list[int]] = []
+    for record in band_records:
+        indices: list[int] = []
+        for center in record["centers"]:
+            nearest_index = min(
+                range(len(boundaries)), key=lambda index: abs(boundaries[index] - center)
+            )
+            if abs(boundaries[nearest_index] - center) > tolerance:
+                indices = []
+                break
+            indices.append(nearest_index)
+        if len(indices) < 2 or indices != sorted(set(indices)):
+            continue
+
+        spans: list[list[int]] = []
+        nonempty_leftmost: list[int] = []
+        top, bottom = int(record["top"]), int(record["bottom"])
+        y_margin = max(2, int(round((bottom - top) * 0.04)))
+        for left_index, right_index in zip(indices, indices[1:]):
+            # boundary index 0→1 包住 c1；3→8 包住 c4..c8。
+            first_column, last_column = left_index + 1, right_index
+            spans.append([first_column, last_column])
+            left, right = boundaries[left_index], boundaries[right_index]
+            x_margin = max(2, int(round((right - left) * 0.025)))
+            x_start, x_stop = left + x_margin, right - x_margin
+            y_start, y_stop = top + y_margin, bottom - y_margin
+            if x_stop <= x_start or y_stop <= y_start:
+                continue
+            dark_pixels = 0
+            area = (x_stop - x_start) * (y_stop - y_start)
+            for y in range(y_start, y_stop):
+                row = samples[y * width:(y + 1) * width]
+                dark_pixels += sum(value <= threshold for value in row[x_start:x_stop])
+            if dark_pixels >= max(8, int(round(area * 0.004))):
+                nonempty_leftmost.append(first_column)
+        band_spans.append(spans)
+        band_nonempty.append(nonempty_leftmost)
+        band_y.append([top, bottom])
+    return {
+        "method": "raster_rule_union_v1",
+        "columns": columns,
+        "image_width_px": width,
+        "boundaries_px": boundaries,
+        "horizontal_rules_px": horizontal,
+        "row_bands": len(band_spans),
+        "row_band_y_px": band_y,
+        "row_band_spans": band_spans,
+        "row_band_nonempty_leftmost": band_nonempty,
+    }
+
+
+def _normalize_ruled_grid_variant(variant, grid_hint: dict, *, where: str):
+    """把 ruled raster table 重排成同尺寸、等寬原子欄的模型輸入。
+
+    只 crop / scale 圖片中由框線包住的既有 pixels，不做 OCR、不新增文字。每個 row
+    band 仍依原圖保留 merged span；只有原子欄的顯示寬度變均等，避免 20px 的 bit 欄與
+    相鄰字黏在一起。輸出寬高不變，所以 preflight 的 image-token 預算仍精確。
+
+    原始 variant 由 RAG 留作 review asset；這個新 variant 有自己的 id / digest，必須由
+    `record_generated_variant` 登記，manifest 才不會拿原圖冒充真正模型輸入。
+    """
+    try:
+        import pymupdf
+
+        source = pymupdf.Pixmap(bytes(variant.png))
+        width, height = int(source.width), int(source.height)
+        columns = int(grid_hint["columns"])
+        source_boundaries = [int(value) for value in grid_hint["boundaries_px"]]
+        band_y = [[int(value) for value in pair]
+                  for pair in grid_hint["row_band_y_px"]]
+        band_spans = grid_hint["row_band_spans"]
+        if (
+            width != int(grid_hint["image_width_px"])
+            or len(source_boundaries) != columns + 1
+            or len(band_y) != len(band_spans)
+        ):
+            raise ValueError("grid hint 與 variant 尺寸/row band 數不一致")
+
+        target_boundaries = [int(round(index * width / columns))
+                             for index in range(columns + 1)]
+        document = pymupdf.open()
+        try:
+            page = document.new_page(width=width, height=height)
+            for (top, bottom), spans in zip(band_y, band_spans):
+                for raw_first, raw_last in spans:
+                    first, last = int(raw_first), int(raw_last)
+                    source_rect = pymupdf.IRect(
+                        source_boundaries[first - 1] + 2,
+                        top + 2,
+                        source_boundaries[last] - 2,
+                        bottom - 2,
+                    )
+                    if source_rect.is_empty:
+                        raise ValueError(f"grid cell c{first}-c{last} crop 為空")
+                    cell = pymupdf.Pixmap(
+                        source, source.width, source.height, source_rect
+                    )
+                    target_rect = pymupdf.Rect(
+                        target_boundaries[first - 1] + 3,
+                        top + 3,
+                        target_boundaries[last] - 3,
+                        bottom - 3,
+                    )
+                    page.insert_image(target_rect, pixmap=cell, keep_proportion=True)
+
+                visible_boundaries = sorted(
+                    {int(span[0]) - 1 for span in spans}
+                    | {int(span[1]) for span in spans}
+                )
+                for boundary in visible_boundaries:
+                    x = target_boundaries[boundary]
+                    page.draw_line((x, top), (x, bottom), color=(0, 0, 0), width=1)
+            horizontal = sorted({value for pair in band_y for value in pair})
+            for y in horizontal:
+                page.draw_line(
+                    (target_boundaries[0], y), (target_boundaries[-1], y),
+                    color=(0, 0, 0), width=1,
+                )
+            normalized = page.get_pixmap(matrix=pymupdf.Matrix(1, 1), alpha=False)
+            png = normalized.tobytes("png")
+        finally:
+            document.close()
+    except Exception as exc:  # noqa: BLE001
+        raise figure_extract.FigureExtractionError(
+            f"{where}: ruled raster grid 正規化失敗：{type(exc).__name__}: {exc}"
+        ) from exc
+
+    if normalized.width != width or normalized.height != height:
+        raise figure_extract.FigureExtractionError(
+            f"{where}: ruled raster grid 正規化改變尺寸 "
+            f"{width}x{height} → {normalized.width}x{normalized.height}；"
+            "preflight token 預算不再成立"
+        )
+    stitch = copy.deepcopy(getattr(variant, "stitch", {}) or {})
+    stitch["grid_normalized"] = {
+        "method": grid_hint.get("method"),
+        "columns": columns,
+        "source_digest": str(getattr(variant, "digest", "") or ""),
+    }
+    generated = replace(
+        variant,
+        variant_id=f"{getattr(variant, 'variant_id', 'vl')}+grid",
+        png=png,
+        width=normalized.width,
+        height=normalized.height,
+        digest=hashlib.sha256(png).hexdigest(),
+        stitch=stitch,
+        mime="image/png",
+    )
+    figure_extract.validate_variant(generated, where=f"{where}: grid-normalized variant")
+    return generated
 
 
 def _check_send_budget(variant, counters: dict, *, where: str) -> None:
@@ -1186,16 +1514,36 @@ def _parse_sample(kind: str, result) -> dict:
 
 
 def _call_extractor(*, kind: str, variant, base_url: str, model: str, profile: str,
-                    cache_prompt: bool):
+                    cache_prompt: bool, grid_hint: dict | None = None):
     """一次 structured VL 呼叫。
 
     取樣以單一 `top_k=1` 收斂；**不假設** `temperature=0` 會讓輸出可重現——實際
     greedy 行為依 server 版本與 sampler chain 而定，重複性只由 runtime 的第二次
     取樣實測（見 `evidence["repeatability"]`）。
     """
+    prompt = _prompt_for(kind, profile)
+    if kind == figure_extract.KIND_TABLE and grid_hint is not None:
+        band_maps = []
+        for band_index, spans in enumerate(grid_hint.get("row_band_spans", [])[:32], start=1):
+            rendered = " | ".join(
+                f"c{first}" if first == last else f"c{first}-c{last}"
+                for first, last in spans
+            )
+            band_maps.append(f"band{band_index}: {rendered}")
+        band_detail = "；".join(band_maps)
+        prompt += (
+            "\n程式只根據圖片直線像素（沒有 OCR）確認：這張圖的全表最細原子欄數是 "
+            f"{grid_hint['columns']}。`columns` 長度與每一列 `cells` 長度都必須恰好是 "
+            f"{grid_hint['columns']}；不得合併或拆分。這個數字是幾何約束，不代表任何"
+            "欄中文字。"
+            f"影像寬 {grid_hint.get('image_width_px')}px，原子欄界 x="
+            f"{grid_hint.get('boundaries_px')}。每個水平 row band 的可見合併範圍是："
+            f"{band_detail}。文字必須依它實際位於哪個 x 範圍放入對應欄，不可為了湊欄數"
+            "在尾端補空格；跨欄格只把內容放在 span 最左欄，其餘 covered cells 給空字串。\n"
+        )
     return llama_client.vision_json_completion(
         base_url=base_url,
-        prompt=_prompt_for(kind, profile),
+        prompt=prompt,
         image_base64=base64.b64encode(bytes(variant.png)).decode("ascii"),
         mime_type=_variant_mime(variant),
         model=model,
@@ -1207,9 +1555,77 @@ def _call_extractor(*, kind: str, variant, base_url: str, model: str, profile: s
     )
 
 
+def _call_raster_classifier(*, variant, base_url: str, model: str, profile: str,
+                            cache_prompt: bool):
+    """一次 image-bound raster kind 分類；只允許三個最終 figure kind。"""
+    return llama_client.vision_json_completion(
+        base_url=base_url,
+        prompt=_raster_kind_prompt(profile),
+        image_base64=base64.b64encode(bytes(variant.png)).decode("ascii"),
+        mime_type=_variant_mime(variant),
+        model=model,
+        max_tokens=32,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "figure_raster_kind_v1",
+                "strict": True,
+                "schema": copy.deepcopy(_RASTER_KIND_SCHEMA),
+            },
+        },
+        temperature=0.0, top_p=1.0, top_k=1,
+        timeout=int(config.VL_INGEST_TIMEOUT),
+        cache_prompt=cache_prompt,
+    )
+
+
+def _classify_raster_kind(variant, ctx: dict) -> dict:
+    """把 `KIND_RASTER` 解成 table / terminal / diagram；不合法就 fail-loud。
+
+    分類本身也計入同一份 VL / image-token 預算。重試只處理傳輸或 schema 失敗，
+    不會把模型輸出的自由文字猜回某個 kind。
+    """
+    attempts = 1 + max(0, int(config.FIGURE_EXTRACT_RETRIES))
+    last: _SampleFailure | None = None
+    for attempt in range(attempts):
+        _check_send_budget(variant, ctx["counters"], where=ctx["where"])
+        try:
+            result = _call_raster_classifier(
+                variant=variant, base_url=ctx["base_url"], model=ctx["model"],
+                profile=ctx["profile"], cache_prompt=(attempt == 0))
+        except Exception as exc:  # noqa: BLE001
+            last = _SampleFailure("transport", _http_error_detail(exc))
+            continue
+        if getattr(result, "truncated", True):
+            last = _SampleFailure(
+                "truncated",
+                f"raster kind finish_reason={getattr(result, 'finish_reason', '')!r}",
+            )
+            continue
+        try:
+            model_obj = json.loads(getattr(result, "text", "").strip())
+        except (AttributeError, json.JSONDecodeError, ValueError) as exc:
+            last = _SampleFailure("not_json", f"raster kind 不是 JSON：{exc}")
+            continue
+        if not isinstance(model_obj, dict) or set(model_obj) != {"kind"}:
+            last = _SampleFailure(
+                "schema", "raster kind 必須是只含 kind 的 JSON object")
+            continue
+        kind = model_obj.get("kind")
+        if kind not in figure_extract.FIGURE_KINDS:
+            last = _SampleFailure(
+                "schema", f"raster kind={kind!r} 不在允許集合")
+            continue
+        return {"kind": kind, "attempts": attempt + 1,
+                "variant": str(getattr(variant, "variant_id", "") or "")}
+    assert last is not None
+    raise last
+
+
 def _extract_variant_payload(*, kind: str, variant, base_url: str, model: str, profile: str,
                              where: str, allow_retry: bool, counters: dict,
-                             cache_prompt: bool = True) -> dict:
+                             cache_prompt: bool = True,
+                             grid_hint: dict | None = None) -> dict:
     """單一 variant 的抽取（含重試）。全部失敗 raise `_SampleFailure`。
 
     重試一律 `cache_prompt=False`：同一個 prompt 命中 server 的 prompt cache 只會
@@ -1223,15 +1639,54 @@ def _extract_variant_payload(*, kind: str, variant, base_url: str, model: str, p
         try:
             result = _call_extractor(
                 kind=kind, variant=variant, base_url=base_url, model=model,
-                profile=profile, cache_prompt=use_cache,
+                profile=profile, cache_prompt=use_cache, grid_hint=grid_hint,
             )
         except Exception as exc:  # noqa: BLE001 - 轉成統一的失敗語意
             last = _SampleFailure("transport", _http_error_detail(exc))
             continue
         try:
-            return _parse_sample(kind, result)
+            payload = _parse_sample(kind, result)
         except _SampleFailure as exc:
             last = exc
+            continue
+        if (
+            kind == figure_extract.KIND_TABLE
+            and grid_hint is not None
+            and len(payload["columns"]) != int(grid_hint["columns"])
+        ):
+            last = _SampleFailure(
+                "grid_column_mismatch",
+                f"圖片直線幾何是 {grid_hint['columns']} 個原子欄，模型回 "
+                f"{len(payload['columns'])} 欄",
+            )
+            continue
+        if kind == figure_extract.KIND_TABLE and grid_hint is not None:
+            labels = [str(column.get("label", "")) for column in payload["columns"]]
+            expected = grid_hint.get("row_band_nonempty_leftmost") or []
+            # rows 數等於 pixel row bands 時，模型就是把每個 band 都當資料列（不論它
+            # 是否又把第一列複製到 labels）。此時墨跡只驗「哪個幾何 cell 有內容」，
+            # 不驗文字本身；真正有獨立 header 的表通常是 rows == bands - 1。
+            if len(payload["rows"]) == len(expected):
+                mismatch = []
+                for row_index, (row, wanted) in enumerate(
+                    zip(payload["rows"], expected), start=1
+                ):
+                    actual = [
+                        index for index, cell in enumerate(row["cells"], start=1)
+                        if str(cell.get("text", "")).strip()
+                    ]
+                    if actual != list(wanted):
+                        mismatch.append(
+                            f"row {row_index}: pixel={list(wanted)} model={actual}"
+                        )
+                if mismatch:
+                    last = _SampleFailure(
+                        "grid_cell_occupancy_mismatch",
+                        "模型把文字放到錯的原子欄，或以尾端空格湊欄數："
+                        + "；".join(mismatch[:4]),
+                    )
+                    continue
+        return payload
     assert last is not None
     raise last
 
@@ -2082,13 +2537,18 @@ def align_terminal_lines(payload: dict, candidate: Candidate,
 
     channels: list[tuple[str, list[str]]] = []
     raw_markdown = getattr(evidence, "raw_markdown", "")
-    signal = _native_text_signal(candidate)
+    candidate_signals = getattr(candidate, "signals", None)
+    raster_auto = bool(
+        isinstance(candidate_signals, dict)
+        and candidate_signals.get("raster_auto") is True
+    )
+    signal = None if raster_auto else _native_text_signal(candidate)
     pos = signal["pos"] if signal else None
-    if pos is None:
+    if pos is None and not raster_auto:
         native = getattr(candidate, "native_table", None)
         if isinstance(native, dict):
             pos = native.get("pos")
-    if pos is None:
+    if pos is None and not raster_auto:
         pos = _page_box_pos_for(evidence, getattr(candidate, "bbox", None))
     if pos is not None:
         text, problem = _pos_slice(raw_markdown, pos)
@@ -2099,7 +2559,9 @@ def align_terminal_lines(payload: dict, candidate: Candidate,
     else:
         notes.append(["markdown_pos_unavailable", "沒有覆蓋這個候選的 page_box pos"])
 
-    words = _words_for_candidate(getattr(evidence, "words", None), getattr(candidate, "bbox", None))
+    words = ([] if raster_auto else
+             _words_for_candidate(getattr(evidence, "words", None),
+                                  getattr(candidate, "bbox", None)))
     if words:
         rows = _group_words_into_rows(words)
         channels.append(("words_geometry", [_join_words(row) for row in rows]))
@@ -2370,6 +2832,92 @@ def _raw_diff_spans(left: str, right: str):
     if not diffs:
         return []
     return _merge_raw_spans(diffs)
+
+
+def _reconcile_terminal_sample_shapes(payload_a: dict, payload_b: dict):
+    """把不同 line count 的兩份 terminal 樣本變成可審核的逐行 consensus。
+
+    table 少一列/一欄沒有 schema 內的安全表示，所以仍 hard fail；terminal 不同：每個
+    line 本來就是獨立原子，SequenceMatcher 能保住共同 subsequence。insert/delete 的行
+    不擇一，正文放單一 `▯`，alternatives 留「該行原文」與空字串（另一樣本缺行）。
+    因此順序不變、差異不消失，而且 strict gate 一定擋下。
+    """
+    lines_a = list(payload_a["lines"])
+    lines_b = list(payload_b["lines"])
+    texts_a = [line["text"] for line in lines_a]
+    texts_b = [line["text"] for line in lines_b]
+    matcher = difflib.SequenceMatcher(a=texts_a, b=texts_b, autojunk=False)
+    output: list[dict] = []
+    records: dict[str, dict] = {}
+    reasons = ["sample_shape_mismatch"]
+
+    def append_pair(left: dict | None, right: dict | None) -> None:
+        index = len(output) + 1
+        if left is not None and right is not None \
+                and left["text"] == right["text"] \
+                and left["uncertain_spans"] == right["uncertain_spans"]:
+            line = copy.deepcopy(left)
+            line["line_index"] = index
+            output.append(line)
+            return
+
+        left_text = left["text"] if left is not None else ""
+        right_text = right["text"] if right is not None else ""
+        line = {
+            "line_index": index,
+            "text": left_text,
+            "uncertain_spans": copy.deepcopy(
+                left.get("uncertain_spans", []) if left is not None else []
+            ),
+        }
+        if left is not None and right is not None and len(left_text) == len(right_text):
+            spans = _raw_diff_spans(left_text, right_text)
+        else:
+            spans = None
+        if spans:
+            record = {"agree": False, "verdict": "glyph", "mask_spans": spans}
+            reasons.append("glyph_conflict")
+        else:
+            record = {
+                "agree": False,
+                "verdict": "structural",
+                "alternatives": [left_text, right_text],
+                "sample_presence": [left is not None, right is not None],
+            }
+            reasons.append(
+                "sample_span_conflict"
+                if left_text == right_text and left is not None and right is not None
+                else "sample_conflict"
+            )
+        _apply_line_verdict(line, record)
+        records[str(index)] = record
+        output.append(line)
+
+    opcodes = []
+    for tag, a0, a1, b0, b1 in matcher.get_opcodes():
+        opcodes.append([tag, a0, a1, b0, b1])
+        if tag == "equal":
+            for offset in range(a1 - a0):
+                append_pair(lines_a[a0 + offset], lines_b[b0 + offset])
+            continue
+        left_block, right_block = lines_a[a0:a1], lines_b[b0:b1]
+        for offset in range(max(len(left_block), len(right_block))):
+            append_pair(
+                left_block[offset] if offset < len(left_block) else None,
+                right_block[offset] if offset < len(right_block) else None,
+            )
+
+    consensus = {"kind": figure_extract.KIND_TERMINAL, "lines": output}
+    evidence = {
+        "agreement": False,
+        "samples": 2,
+        "structural": False,
+        "consensus_applied": True,
+        "shape": {"a": len(lines_a), "b": len(lines_b), "consensus": len(output)},
+        "opcodes": opcodes,
+        "lines": records,
+    }
+    return consensus, evidence, _ordered_unique(reasons)
 
 
 def detect_disagreement(payload_a: dict, payload_b: dict, kind: str) -> tuple[dict, list[str]]:
@@ -2943,6 +3491,58 @@ def _normalize_model_unreadable(payload: dict, kind: str, findings: _Findings) -
                 )
 
 
+def _demote_duplicated_table_header(payload: dict, findings: _Findings | None = None) -> bool:
+    """把「第一筆資料又被複製成表頭」還原成無表頭表格。
+
+    raster 表沒有原生 header anchor；模型有時會同時把最上面的資料列放進
+    `columns[].label` **與** `rows[0]`。這不是兩種可任選的解讀：同一段圖中文字被
+    複製了兩次，而且左上角是數字索引。保留 rows 原文、把重複 label 清空不會丟資料；
+    同時標成 needs_review，避免這個格式修正被誤認成獨立驗證。
+
+    判定刻意很窄：左上 label 必須空白、第一格必須是純數字/hex 索引、至少兩個非空
+    label，且 80% 以上都與同欄第一格（忽略排版符號後）的開頭一致。碰不到這些條件
+    就 abstain，不猜表頭。
+    """
+    if payload.get("kind") != figure_extract.KIND_TABLE:
+        return False
+    columns = payload.get("columns") or []
+    rows = payload.get("rows") or []
+    if not columns or not rows or len(rows[0].get("cells") or []) != len(columns):
+        return False
+    labels = [str(column.get("label", "")) for column in columns]
+    if labels[0] != "":
+        return False
+
+    def compact(text: str) -> str:
+        return "".join(char.casefold() for char in str(text) if char.isalnum())
+
+    first_cells = [str(cell.get("text", "")) for cell in rows[0]["cells"]]
+    first_key = compact(first_cells[0])
+    if not re.fullmatch(r"(?:0x)?[0-9a-f]+h?", first_key, flags=re.IGNORECASE):
+        return False
+    nonempty = [index for index, label in enumerate(labels) if compact(label)]
+    if len(nonempty) < 2:
+        return False
+    matches = 0
+    for index in nonempty:
+        label_key = compact(labels[index])
+        cell_key = compact(first_cells[index])
+        if cell_key.startswith(label_key):
+            matches += 1
+    if matches * 5 < len(nonempty) * 4:
+        return False
+
+    for column in columns:
+        column["label"] = ""
+    if findings is not None:
+        findings.block(
+            "header_promoted_from_first_row",
+            "VL 同時把數字索引起頭的第一筆資料複製成表頭；已保留完整第一列並清空"
+            "重複 label，需由原圖覆核表頭語意",
+        )
+    return True
+
+
 def _finalize_payload(payload: dict, kind: str, findings: _Findings, *, where: str) -> None:
     """所有轉換（遮罩 / 接合 / fill-down / span 合併）完成後的最後一道。
 
@@ -3075,6 +3675,16 @@ def _build_result(candidate, kind: str, payload: dict, findings: _Findings, evid
                   *, lane: str, model_input_variant: str, variants: list[str],
                   where: str) -> FigureResult:
     _normalize_model_unreadable(payload, kind, findings)
+    if (
+        kind == figure_extract.KIND_TABLE
+        and not any(str(column.get("label", "")) for column in payload.get("columns", []))
+        and "header_missing" not in {slug for slug, _ in findings.blockers}
+    ):
+        findings.block(
+            "header_missing",
+            "圖片沒有可確認的獨立表頭；保留唯一 column_id 與固定列寬，但欄位語意需由"
+            "原圖覆核",
+        )
     coverage = evidence.get("anchor_coverage") or {}
     findings.atoms_total = int(coverage.get("atoms_total", 0) or 0)
     findings.atoms_anchorable = int(coverage.get("atoms_anchorable", 0) or 0)
@@ -3118,11 +3728,15 @@ def _failed_result(candidate, kind: str, reason: str) -> FigureResult:
     """抽取失敗時給 T5 寫 review artifact 用（契約 §12.2）。**永不**回傳給呼叫端。"""
     bbox = tuple(getattr(candidate, "bbox", (0.0, 0.0, 0.0, 0.0)))
     page = int(getattr(candidate, "page", 1) or 1)
+    failed_kind = (kind if kind in figure_extract.FIGURE_KINDS
+                   else figure_extract.KIND_DIAGRAM
+                   if kind == figure_extract.KIND_RASTER
+                   else figure_extract.KIND_TABLE)
     return FigureResult(
         figure_id=getattr(candidate, "figure_id", ""),
         document_id=getattr(candidate, "document_id", ""),
         page=page, figure_index=1, bbox=bbox,
-        kind=kind if kind in figure_extract.FIGURE_KINDS else figure_extract.KIND_TABLE,
+        kind=failed_kind,
         revision=1, payload=None,
         extraction_status=figure_extract.EXTRACTION_FAILED,
         verification_status=figure_extract.VERIF_NEEDS_REVIEW,
@@ -3376,6 +3990,197 @@ def _stitch_payloads(kind: str, payloads: list[dict], variants, findings: _Findi
     return {"kind": figure_extract.KIND_TERMINAL, "lines": lines}, stitch
 
 
+_DATA_AS_HEADER_RE = re.compile(
+    r"^(?:0[xX][0-9A-Fa-f_]+|[0-9][0-9A-Za-z_~./+\-]*)$"
+)
+
+
+def _looks_like_data_row_as_header(columns) -> bool:
+    """表頭第一格是否其實像位址/數值資料，而不是欄名。"""
+    labels = [str(column.get("label") or "").strip() for column in (columns or [])]
+    first = next((label for label in labels if label), "")
+    return bool(first and _DATA_AS_HEADER_RE.fullmatch(first) and len(labels) >= 2)
+
+
+def _shift_table_evidence_for_recovered_row(evidence: dict, labels: list[str], *,
+                                            previous: FigureResult) -> dict:
+    """把原本被當 header 的資料列插回 row 1，並同步 evidence locator。"""
+    updated = copy.deepcopy(evidence or {})
+    old_cells = updated.get("cells") if isinstance(updated.get("cells"), dict) else {}
+    shifted = {}
+    template = next(iter(old_cells.values()), {})
+    for key, record in old_cells.items():
+        match = re.fullmatch(r"r(\d+)(c\d+)", str(key))
+        shifted[f"r{int(match.group(1)) + 1}{match.group(2)}" if match else str(key)] = record
+
+    channels = list(updated.get("channels") or [])
+    for index, label in enumerate(labels, 1):
+        record = copy.deepcopy(template) if isinstance(template, dict) else {}
+        record.update({
+            "anchor": "cross_page_continuation",
+            "matched": True,
+            "channels": channels,
+            "raw": label,
+            "payload": label,
+            "critical_ok": True,
+        })
+        by_channel = record.get("by_channel")
+        if not isinstance(by_channel, dict):
+            by_channel = {}
+        for channel in channels:
+            item = dict(by_channel.get(channel) or {})
+            item.update({"verdict": "match", "critical_ok": True})
+            by_channel[channel] = item
+        record["by_channel"] = by_channel
+        shifted[f"r1c{index}"] = record
+    updated["cells"] = shifted
+
+    coverage = dict(updated.get("anchor_coverage") or {})
+    width = len(labels)
+    total = int(coverage.get("atoms_total", 0) or 0) + width
+    anchorable = int(coverage.get("atoms_anchorable", 0) or 0) + width
+    matched = int(coverage.get("atoms_matched", 0) or 0) + width
+    coverage.update({
+        "atoms_total": total,
+        "atoms_anchorable": anchorable,
+        "atoms_matched": matched,
+        "ratio": (matched / total) if total else 0.0,
+    })
+    updated["anchor_coverage"] = coverage
+
+    for row in (updated.get("row_alignment") or {}).values():
+        if not isinstance(row, dict):
+            continue
+        for key in ("pairs", "payload_rows", "anchor_rows"):
+            if isinstance(row.get(key), int):
+                row[key] += 1
+
+    native = dict(updated.get("native") or {})
+    grids = copy.deepcopy(native.get("channel_grids") or {})
+    for grid in grids.values():
+        if isinstance(grid, dict) and isinstance(grid.get("rows"), int):
+            grid["rows"] += 1
+    native["channel_grids"] = grids
+    native["cross_page_continuation"] = {
+        "from_figure_id": previous.figure_id,
+        "from_page": previous.page,
+        "recovered_row": 1,
+    }
+    updated["native"] = native
+    return updated
+
+
+def _repair_cross_page_table_continuations(results, candidates) -> list[FigureResult]:
+    """修正「續表沒有重印表頭，parser 把第一筆資料當 header」的可逆錯位。
+
+    只在上一頁表格延伸到頁尾、下一頁表格從頁首開始、左右邊界與欄數相同，且下一頁
+    第一格像位址/數值時觸發。修正後一律 `needs_review`，因為跨頁關係仍需人工對原圖確認。
+    """
+    by_id = {getattr(candidate, "figure_id", ""): candidate for candidate in candidates}
+
+    def table_box(candidate, fallback):
+        native = getattr(candidate, "native_table", None) if candidate is not None else None
+        geometry = native.get("geometry") if isinstance(native, dict) else None
+        box = _as_bbox(geometry.get("table_bbox")) if isinstance(geometry, dict) else None
+        return box or _as_bbox(fallback)
+
+    repaired: list[FigureResult] = []
+    for current in results:
+        if current.kind != figure_extract.KIND_TABLE or not isinstance(current.payload, dict):
+            repaired.append(current)
+            continue
+        candidate = by_id.get(current.figure_id)
+        signals = getattr(candidate, "signals", {}) if candidate is not None else {}
+        page_rect = _as_bbox((signals or {}).get("page_rect"))
+        current_table_box = table_box(candidate, current.bbox)
+        if ((current.evidence or {}).get("lane") != "native" or page_rect is None
+                or current_table_box[1] > page_rect[1] + (page_rect[3] - page_rect[1]) * 0.15
+                or not _looks_like_data_row_as_header(current.payload.get("columns"))):
+            repaired.append(current)
+            continue
+
+        previous_options = [
+            item for item in repaired
+            if item.kind == figure_extract.KIND_TABLE and item.page == current.page - 1
+            and isinstance(item.payload, dict)
+        ]
+        if not previous_options:
+            repaired.append(current)
+            continue
+        previous = max(previous_options, key=lambda item: item.bbox[3])
+        previous_candidate = by_id.get(previous.figure_id)
+        previous_signals = (getattr(previous_candidate, "signals", {})
+                            if previous_candidate is not None else {})
+        previous_rect = _as_bbox((previous_signals or {}).get("page_rect"))
+        previous_table_box = table_box(previous_candidate, previous.bbox)
+        previous_columns = previous.payload.get("columns") or []
+        current_columns = current.payload.get("columns") or []
+        same_width = len(previous_columns) == len(current_columns) and bool(current_columns)
+        aligned = (abs(previous_table_box[0] - current_table_box[0]) <= 12.0
+                   and abs(previous_table_box[2] - current_table_box[2]) <= 12.0)
+        reaches_bottom = bool(
+            previous_rect is not None
+            and previous_table_box[3] >= previous_rect[1]
+            + (previous_rect[3] - previous_rect[1]) * 0.75
+        )
+        if (not same_width or not aligned or not reaches_bottom
+                or _looks_like_data_row_as_header(previous_columns)):
+            repaired.append(current)
+            continue
+
+        recovered_labels = [str(column.get("label") or "") for column in current_columns]
+        new_columns = []
+        for index in range(len(current_columns)):
+            column = copy.deepcopy(current_columns[index])
+            column["label"] = str(previous_columns[index].get("label") or "")
+            new_columns.append(column)
+        recovered_cells = []
+        for index, label in enumerate(recovered_labels):
+            uncertain = figure_extract.UNREADABLE_GLYPH in label
+            recovered_cells.append({
+                "column_id": new_columns[index]["column_id"],
+                "text": label,
+                "state": (figure_extract.CELL_STATE_CONFLICT if uncertain
+                          else figure_extract.CELL_STATE_OBSERVED),
+                "inherited_from_row": None,
+            })
+        shifted_rows = []
+        for row in current.payload.get("rows") or []:
+            item = copy.deepcopy(row)
+            item["row_index"] = int(item["row_index"]) + 1
+            shifted_rows.append(item)
+        payload = {
+            "kind": figure_extract.KIND_TABLE,
+            "columns": new_columns,
+            "rows": [{"row_index": 1, "cells": recovered_cells}, *shifted_rows],
+            "footnotes": list(current.payload.get("footnotes") or []),
+        }
+        where = f"page={current.page} figure={current.figure_id}"
+        try:
+            figure_extract.validate_payload(payload, figure_extract.KIND_TABLE)
+        except figure_extract.FigureValidationError as exc:
+            raise figure_extract.FigureExtractionError(
+                f"{where}: 跨頁表頭修復後 payload 不合法：{exc}") from exc
+        evidence = _shift_table_evidence_for_recovered_row(
+            current.evidence, recovered_labels, previous=previous)
+        detail = (
+            f"第 {current.page} 頁位於頁首且首格 {recovered_labels[0]!r} 像資料；"
+            f"沿用第 {previous.page} 頁 {previous.figure_id} 的欄名，原表頭列恢復為 row 1"
+        )
+        repaired.append(replace(
+            current,
+            payload=payload,
+            verification_status=figure_extract.worst_verification([
+                current.verification_status, figure_extract.VERIF_NEEDS_REVIEW,
+            ]),
+            reasons=_ordered_unique(["cross_page_header_recovered", *current.reasons]),
+            reason_details=_ordered_unique([detail, *current.reason_details]),
+            evidence=evidence,
+            row_total=payload["rows"][-1]["row_index"] if payload["rows"] else 0,
+        ))
+    return repaired
+
+
 # ============================================================
 # 15. lane 路由與 orchestration
 # ============================================================
@@ -3398,6 +4203,8 @@ def _candidate_vl_kinds(candidate) -> set[str]:
     kind = getattr(candidate, "kind", figure_extract.KIND_UNKNOWN)
     if kind == figure_extract.KIND_UNKNOWN:
         return {figure_extract.KIND_TABLE, figure_extract.KIND_TERMINAL}
+    if kind == figure_extract.KIND_RASTER:
+        return set(figure_extract.FIGURE_KINDS)
     return {kind}
 
 
@@ -3551,10 +4358,15 @@ def _vl_extract(kind: str, variants, ctx: dict, *, allow_retry: bool,
                 cache_prompt: bool) -> list[dict]:
     payloads = []
     for variant in variants:
+        grid_hint = _raster_table_grid_hint(variant) if kind == figure_extract.KIND_TABLE else None
+        if grid_hint is not None:
+            ctx.setdefault("table_grid_hints", {})[
+                str(getattr(variant, "variant_id", "") or "vl")
+            ] = copy.deepcopy(grid_hint)
         payloads.append(_extract_variant_payload(
             kind=kind, variant=variant, base_url=ctx["base_url"], model=ctx["model"],
             profile=ctx["profile"], where=ctx["where"], allow_retry=allow_retry,
-            counters=ctx["counters"], cache_prompt=cache_prompt,
+            counters=ctx["counters"], cache_prompt=cache_prompt, grid_hint=grid_hint,
         ))
     return payloads
 
@@ -3565,6 +4377,8 @@ def _vl_result_for_kind(candidate, evidence, kind: str, variants, ctx: dict,
     where = ctx["where"]
     payloads = _vl_extract(kind, variants, ctx, allow_retry=allow_retry, cache_prompt=True)
     payload, stitch = _stitch_payloads(kind, payloads, variants, findings, where=where)
+    if kind == figure_extract.KIND_TABLE:
+        _demote_duplicated_table_header(payload, findings)
     _finalize_payload(payload, kind, findings, where=where)
     # asset-level（跟著影像走）與 occurrence-level（跟著這一頁的 anchor 走）必須
     # 分開。先前快取的是「已被第一頁 anchor 遮罩過」的結果，第二頁因此繼承了
@@ -3599,19 +4413,33 @@ def _vl_result_for_kind(candidate, evidence, kind: str, variants, ctx: dict,
                 _vl_extract(kind, variants, ctx, allow_retry=True, cache_prompt=False),
                 variants, findings, where=where,
             )[0]
+            if kind == figure_extract.KIND_TABLE:
+                _demote_duplicated_table_header(second)
         except _SampleFailure as exc:
             findings.block("repeat_sample_failed",
                            f"第二次取樣失敗（{exc.slug}）：{exc.detail}")
             repeatability = {"samples": 1, "identical": None, "second_cache_prompt": False,
                              "error": exc.slug}
         else:
-            disagreement, reasons = detect_disagreement(payload, second, kind)
+            if (
+                kind == figure_extract.KIND_TERMINAL
+                and len(payload["lines"]) != len(second["lines"])
+            ):
+                payload, disagreement, reasons = _reconcile_terminal_sample_shapes(
+                    payload, second
+                )
+                # duplicate occurrence 要直接沿用已遮罩、已補 placeholder 的 consensus；
+                # `_apply_disagreement()` 只能改既有行，不能重播 insert/delete。
+                pristine = copy.deepcopy(payload)
+            else:
+                disagreement, reasons = detect_disagreement(payload, second, kind)
             if disagreement.get("structural"):
                 raise figure_extract.FigureExtractionError(
                     f"{where}: 兩次取樣的結構不同（{reasons}），沒有安全的 canonical 結構；"
                     "沿用其中一份等於替使用者擇一。整份 PDF 零寫入"
                 )
-            _apply_disagreement(payload, kind, disagreement)
+            if not disagreement.get("consensus_applied"):
+                _apply_disagreement(payload, kind, disagreement)
             for slug in reasons:
                 findings.block(slug, f"兩次取樣不一致（{slug}）")
             repeatability = {
@@ -3632,17 +4460,25 @@ def _vl_result_for_kind(candidate, evidence, kind: str, variants, ctx: dict,
                        if item[0] in _ASSET_LEVEL_SLUGS and item not in asset_blockers]
     asset_notes += [item for item in findings.notes
                     if item[0] in _ASSET_LEVEL_SLUGS and item not in asset_notes]
+    grid_hints = copy.deepcopy(ctx.get("table_grid_hints") or {})
     ctx["asset_snapshot"] = {
         "kind": kind,
         "payload": pristine,
-        "disagreement": (repeatability or {}).get("detail"),
+        "disagreement": (
+            None if ((repeatability or {}).get("detail") or {}).get("consensus_applied")
+            else (repeatability or {}).get("detail")
+        ),
         "repeatability": repeatability,
         "stitch": stitch,
         "blockers": asset_blockers,
         "notes": asset_notes,
+        "raster_grid": grid_hints,
     }
 
-    evidence_dict = _build_evidence(alignment, repeatability=repeatability, stitch=stitch)
+    evidence_dict = _build_evidence(
+        alignment, repeatability=repeatability, stitch=stitch,
+        extra={"raster_grid": grid_hints} if grid_hints else None,
+    )
     return _build_result(
         candidate, kind, payload, findings, evidence_dict, lane="vl",
         model_input_variant=str(getattr(variants[0], "variant_id", "") or "vl"),
@@ -3650,7 +4486,63 @@ def _vl_result_for_kind(candidate, evidence, kind: str, variants, ctx: dict,
     )
 
 
+def _grid_normalized_variants(variants, ctx: dict) -> list:
+    """只替高信心 ruled table 產生等寬 grid variant；尺寸與預算不變。"""
+    normalized = []
+    for variant in variants:
+        hint = _raster_table_grid_hint(variant)
+        if hint is None or int(hint.get("row_bands", 0) or 0) < 2:
+            normalized.append(variant)
+            continue
+        generated = _normalize_ruled_grid_variant(variant, hint, where=ctx["where"])
+        recorder = ctx.get("record_generated_variant")
+        if recorder is not None:
+            recorder(generated)
+        normalized.append(generated)
+    return normalized
+
+
 def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureResult:
+    if kind == figure_extract.KIND_RASTER:
+        classification = _classify_raster_kind(variants[0], ctx)
+        resolved = classification["kind"]
+        extraction_variants = (
+            _grid_normalized_variants(variants, ctx)
+            if resolved == figure_extract.KIND_TABLE else variants
+        )
+        result = _vl_result_for_kind(
+            candidate, evidence, resolved, extraction_variants, ctx,
+            allow_retry=True,
+            # table / terminal 的逐格逐行內容要做第二樣本 disagreement；非目標 diagram
+            # 保持 unverified 單樣本，避免不相干圖片的描述差異拖垮整份 PDF。
+            second_sample=(resolved != figure_extract.KIND_DIAGRAM),
+        )
+        evidence_dict = dict(result.evidence)
+        evidence_dict["raster_classification"] = dict(classification)
+        # classifier 實際看過原始 variant；table extractor 則可能看 `+grid`。兩者都是
+        # 真正模型輸入，manifest 必須逐一保存，不能只宣告最後一次 extraction variant。
+        actual_variant_ids = _ordered_unique([
+            str(classification.get("variant", "") or ""),
+            *list(result.variants or []),
+        ])
+        actual_variant_ids = [variant_id for variant_id in actual_variant_ids if variant_id]
+        result = replace(
+            result,
+            reasons=_ordered_unique(["raster_kind_classified", *result.reasons]),
+            reason_details=_ordered_unique([
+                f"純 raster 以 image-bound schema 分類為 {resolved}",
+                *result.reason_details,
+            ]),
+            verification_status=figure_extract.worst_verification([
+                result.verification_status, figure_extract.VERIF_UNVERIFIED,
+            ]),
+            evidence=evidence_dict,
+            variants=actual_variant_ids,
+        )
+        snapshot = ctx.get("asset_snapshot")
+        if isinstance(snapshot, dict):
+            snapshot["raster_classification"] = dict(classification)
+        return result
     if kind != figure_extract.KIND_UNKNOWN:
         return _vl_result_for_kind(candidate, evidence, kind, variants, ctx,
                                    allow_retry=True, second_sample=True)
@@ -3693,7 +4585,7 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
 
 
 def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_base_url,
-                             vl_model, render_variants,
+                             vl_model, render_variants, record_generated_variant=None,
                              on_progress=None) -> list[FigureResult]:
     """把 `FigurePlan` 的候選變成 `FigureResult` list（契約 §6.4）。
 
@@ -3804,6 +4696,10 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
                         # kind 歧義的揭露也跟著影像走：duplicate 不重跑 dual pass，
                         # 但兩份 payload、分數與單邊錯誤仍要留得下來。
                         extra["ambiguous"] = cached["ambiguous"]
+                    if cached.get("raster_classification"):
+                        extra["raster_classification"] = cached["raster_classification"]
+                    if cached.get("raster_grid"):
+                        extra["raster_grid"] = copy.deepcopy(cached["raster_grid"])
                     result = _build_result(
                         candidate, resolved, payload, findings,
                         _build_evidence(alignment,
@@ -3819,7 +4715,8 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
                     variants = _validate_variants(candidate, render_variants(pdf_doc, candidate))
                     ctx = {"base_url": vl_base_url, "model": vl_model,
                            "profile": _resolve_prompt_profile(llama_client.get_props(vl_base_url)),
-                           "where": where, "counters": counters}
+                           "where": where, "counters": counters,
+                           "record_generated_variant": record_generated_variant}
                     result = _run_vl_lane(candidate, evidence, kind, variants, ctx)
                     snapshot = ctx.get("asset_snapshot")
                     if share_key and snapshot and snapshot["kind"] == result.kind:
@@ -3858,6 +4755,7 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
         per_page[page] = sequence
         results.append(replace(result, figure_index=sequence))
 
+    results = _repair_cross_page_table_continuations(results, candidates)
     progress(
         f"[figure] 完成 {len(results)} 張（VL 呼叫 {counters['vl_calls']} 次，"
         f"重複影像省下 {counters['vl_calls_saved']} 次）"

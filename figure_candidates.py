@@ -11,12 +11,11 @@
    斷言 `"[WARN]" not in out`）。整頁的結構性 channel 全滅時，那一頁不得產生任何
    table/terminal 候選——這正是既有 `tests/test_rag_pdf_ingest.py` 用
    `types.SimpleNamespace(page_count=..., close=...)` 假裝 pymupdf Document 仍能通過的依據。
-2. **不搶 legacy picture lane 的東西**（契約 §13.1，使用者已拍板）。structured lane 只收
-   「有結構性原生證據」的候選：原生 markdown 表格（`class=table` + 合法 `pos`）、
-   `find_tables` 幾何、ruled-line grid、對齊的 word band（無框線 memory map）、向量文字 log。
-   `kind == KIND_DIAGRAM` 與純 raster 一律延後給既有 `_plan_pdf_figure_jobs` lane，並記進
-   `stats["deferred_to_legacy_lane"]`。**已知範圍限制**：PDF 內的純 raster 終端機截圖與
-   掃描頁表格本輪仍走自由文字 VL lane（`origin="diagram"`），拿不到 `▯` / 逐格證據 / strict gate。
+2. **原生證據優先，純 raster 受監督。**原生 markdown 表格（`class=table` + 合法
+   `pos`）、`find_tables` 幾何、ruled-line grid、對齊的 word band（無框線 memory map）、
+   向量文字 log 直接形成 table / terminal 候選。夠大的純 raster / picture 則形成
+   `KIND_RASTER` 候選，後段先以受限 schema 分類成 table / terminal / diagram，再走同一套
+   canonical payload、`▯`、review artifact 與 strict gate；不再以自由文字描述冒充逐字證據。
 3. **不無聲截斷。** 超過任何上限都進 `over_budget` 並由 `check_preflight()` fail-loud；
    被丟棄的候選逐筆列進 `stats["dropped_candidates"]`。
 
@@ -87,6 +86,11 @@ def _fx():
 # 「暗底 >60%」「框內文字稀疏」這類必要條件）。
 MIN_CANDIDATE_SIDE_PT = 24.0        # 候選短邊下限（pt）
 MIN_CANDIDATE_AREA_PT2 = 2000.0     # 候選面積下限（pt²）
+RASTER_CANDIDATE_MIN_SIDE_PT = 30.0
+RASTER_CANDIDATE_MIN_AREA_PT2 = 4000.0
+RASTER_THIN_MIN_SIDE_PT = 12.0      # 扁長的一行 terminal crop 也可能是完整證據
+RASTER_THIN_MIN_AREA_PT2 = 3000.0
+RASTER_THIN_MIN_ASPECT = 6.0
 MIN_GRID_ROWS = 3                   # word band 群的最少帶數
 MIN_GRID_COLS = 2                   # 一帶內對齊欄的最少數量
 GRID_COL_TOL_PT = 4.0               # 欄左緣對齊容忍（pt）
@@ -186,9 +190,9 @@ class Candidate:
     """一個 structured 候選（**physical**：重複影像不合併，只共享 VL 計算）。
 
     `bbox` / `page_rect` 一律是 **unrotated、cropbox 相對**空間。
-    `kind` 只可能是 `table` / `terminal` / `unknown`——`unknown` **只**表示
-    「table 與 terminal 分數接近」（契約 §6.4 的 dual pass），不表示「不知道是不是圖」；
-    `diagram` 與純 raster 在輸出前就已延後給 legacy lane（契約 §13.1）。
+    `kind` 可能是 `table` / `terminal` / `unknown` / `raster`：`unknown` **只**表示
+    table 與 terminal 分數接近；`raster` 是 candidate-only 的未分類 picture，後段以
+    image-bound schema 分類成 table / terminal / diagram，絕不直接入庫。
     """
 
     index: int
@@ -341,6 +345,31 @@ def _rect_within(rect, box, tol: float = 1.0) -> bool:
 
 def _area(box) -> float:
     return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def _candidate_box_big_enough(box, *, raster: bool = False) -> bool:
+    """bbox 是否大到值得成為 figure 候選。
+
+    一般結構候選維持原本 24pt 短邊；raster 額外容許扁長的單行 terminal crop，
+    但仍要求 2000pt²，避免 PDF 字型把每個 glyph 暴露成 image instance 時淹沒
+    region gate。這個判定只影響 figure routing，不會丟掉 page text 或原始 PDF。
+    """
+    if _area(box) <= 0:
+        return False
+    width = box[2] - box[0]
+    height = box[3] - box[1]
+    if not raster:
+        return min(width, height) >= MIN_CANDIDATE_SIDE_PT \
+            and width * height >= MIN_CANDIDATE_AREA_PT2
+    normal = (min(width, height) >= RASTER_CANDIDATE_MIN_SIDE_PT
+              and width * height >= RASTER_CANDIDATE_MIN_AREA_PT2)
+    aspect = max(width, height) / max(min(width, height), 0.1)
+    thin_text_strip = (
+        min(width, height) >= RASTER_THIN_MIN_SIDE_PT
+        and width * height >= RASTER_THIN_MIN_AREA_PT2
+        and aspect >= RASTER_THIN_MIN_ASPECT
+    )
+    return normal or thin_text_strip
 
 
 def _intersection(a, b):
@@ -1257,7 +1286,7 @@ def _region_sources(evidence: PageEvidence) -> list[dict]:
 
     for entry in evidence.image_info or []:
         box = _as_bbox(entry.get("bbox"))
-        if box is None:
+        if box is None or not _candidate_box_big_enough(box, raster=True):
             continue
         regions.append({
             "channel": "image_info:raster",
@@ -1338,6 +1367,220 @@ def _deferred_entry(page: int, bbox, channels, reason: str) -> dict:
         "channels": sorted(set(channels), key=_channel_rank),
         "reason": reason,
     }
+
+
+def _has_terminal_signal(layout, bands) -> bool:
+    """是否有足以把向量文字升格成 terminal 的正面訊號。"""
+    return bool(
+        layout["prompt_lines"] + layout["timestamp_lines"] >= TERMINAL_SIGNAL_LINES
+        or layout["ansi_lines"] >= 1
+        or (_mono_score(bands) >= 0.6 and layout["loglevel_lines"] >= 1)
+    )
+
+
+def _has_table_signal(native_hit: bool, ruled, columns, tokens, bands) -> bool:
+    """是否有真正的列/欄關係，而不只是多行散文恰好左緣對齊。"""
+    if native_hit or ruled["grid"]:
+        return True
+    aligned = columns["col_support"] >= COL_SUPPORT_MIN
+    return bool(
+        aligned
+        and columns["n_columns"] >= MIN_GRID_COLS
+        and (tokens["header_like"] or tokens["hex_rows"] >= 2)
+    )
+
+
+def _raster_visual_digest(evidence: PageEvidence, bbox) -> str:
+    """候選框內所有 raster placement 的內容/相對位置 digest。
+
+    `image_info` 可能同時含真正截圖與上千個字型 glyph。這裡只做線性 hash，
+    不把它們重新變成 fusion region；因此既能區分兩張不同截圖，也不會恢復先前的
+    raw-region 誤殺或 O(n²) 行為。
+    """
+    records = []
+    for entry in evidence.image_info or []:
+        box = _as_bbox(entry.get("bbox"))
+        if box is None or not _overlaps(box, bbox):
+            continue
+        records.append({
+            "bbox": _rel_box(box, bbox),
+            "digest": str(entry.get("digest_hex") or ""),
+            "xref": entry.get("xref"),
+            "width": entry.get("width"),
+            "height": entry.get("height"),
+        })
+    if not records:
+        return ""
+    records.sort(key=lambda item: (item["bbox"], item["digest"], str(item["xref"])))
+    raw = json.dumps(records, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _raster_candidate_items(evidence: PageEvidence, regions, *, occupied, document_id: str,
+                            pdf_doc, stats: dict) -> list[dict]:
+    """把未被原生 structured 候選覆蓋的 raster/picture 變成受監督候選。
+
+    page-box picture 優先於 image_info；兩者共延時只產一個 physical candidate。
+    `page:fallback` 只在該頁沒有更精確框時使用。所有未採用來源都有明確 defer reason，
+    讓 preflight 不會把「沒進 structured」說成不存在。
+    """
+    fx = _fx()
+    threshold = float(config.FIGURE_IOU_MERGE)
+    priority = {"page_boxes:picture": 0, "image_info:raster": 1, "page:fallback": 2}
+    picture_pool = [r for r in regions if r["channel"] == "page_boxes:picture"]
+    # page_boxes 已經是上游對「這裡有一張完整圖片」的物理分組；同頁再把其內部每個
+    # image_info placement 各升一張，會把一張 screenshot 拆成數十個候選。只有上游
+    # 沒給 picture box 時，才以 figure-sized image_info / page fallback 補位。
+    pool = (picture_pool if picture_pool else
+            [r for r in regions if r["channel"] in ("image_info:raster", "page:fallback")])
+    pool.sort(key=lambda r: (priority[r["channel"]], r["bbox"][1], r["bbox"][0]))
+    chosen: list[dict] = []
+    disposition: dict[int, str] = {}
+
+    for region in pool:
+        box = _as_bbox(region.get("bbox"))
+        key = int(region["region_index"])
+        if box is None or not _candidate_box_big_enough(box, raster=True):
+            disposition[key] = "below_min_size"
+            continue
+        if any(_iou(box, other) >= threshold or _coverage(box, other) >= 0.90
+               for other in occupied):
+            disposition[key] = "covered_by_structured_candidate"
+            continue
+        if region["channel"] == "page:fallback" and chosen:
+            disposition[key] = "covered_by_raster_candidate"
+            continue
+
+        duplicate = False
+        for kept in chosen:
+            kept_box = kept["bbox"]
+            same_page_box_class = (
+                region["channel"] == kept["channel"] == "page_boxes:picture"
+            )
+            if (_iou(box, kept_box) >= 0.90
+                    or (not same_page_box_class
+                        and (_coverage(box, kept_box) >= 0.90
+                             or _coverage(kept_box, box) >= 0.90))):
+                duplicate = True
+                break
+        if duplicate:
+            disposition[key] = "covered_by_raster_candidate"
+            continue
+        chosen.append(region)
+
+    results: list[dict] = []
+    drawing_rects = (evidence.overlays or {}).get("drawing_rects") or []
+    channels_complete, missing_channels = _overlay_channels_complete(evidence)
+    for region in chosen:
+        bbox = _intersection(_as_bbox(region["bbox"]), evidence.page_rect)
+        if bbox is None:
+            disposition[int(region["region_index"])] = "bbox_outside_page"
+            continue
+        bbox = _round_box(bbox)
+        words_in = [w for w in evidence.words if _word_in(w, bbox, WORD_ASSIGN_DILATE_PT)]
+        bands = _word_bands(evidence.words, bbox)
+        rasters = [
+            entry for entry in evidence.image_info or []
+            if _as_bbox(entry.get("bbox")) and _overlaps(_as_bbox(entry["bbox"]), bbox)
+        ]
+        purity = _raster_purity(
+            bbox, rasters, bands, drawing_rects, evidence.overlays, pdf_doc,
+            channels_complete=channels_complete, missing_channels=missing_channels)
+        intrinsic_dpi = 0.0
+        if purity["pure"]:
+            width_pt = max(0.1, bbox[2] - bbox[0])
+            height_pt = max(0.1, bbox[3] - bbox[1])
+            intrinsic_dpi = min(
+                float(purity["width"]) * 72.0 / width_pt,
+                float(purity["height"]) * 72.0 / height_pt,
+            )
+        over_tokens = (
+            purity["pure"]
+            and estimate_image_tokens(purity["width"], purity["height"])
+            > int(config.FIGURE_MAX_IMAGE_TOKENS_PER_CALL)
+        )
+        below_render_target = (
+            purity["pure"]
+            and intrinsic_dpi < float(config.FIGURE_RENDER_TARGET_DPI) * 0.90
+        )
+        if over_tokens or below_render_target:
+            # 原始 binary 太大時直接送會被 budget 擋；太小時雖然放大不會創造新資訊，
+            # 但 1:1 的細小 glyph 會讓 VL 把 `@` 系統性讀成 `0x`。兩者都改走同 bbox 的
+            # page crop，由既有 zoom/token gate 受控 render；digest 仍保留作身分。
+            purity = dict(purity)
+            purity["pure"] = False
+            purity["reason"] = (
+                "intrinsic_over_token_budget_page_crop" if over_tokens
+                else "intrinsic_below_target_dpi_page_crop"
+            )
+            purity["intrinsic_dpi"] = round(intrinsic_dpi, 2) + 0.0
+            purity["xref"] = None
+        visual_digest = purity["digest_hex"] or _raster_visual_digest(evidence, bbox)
+        if not visual_digest:
+            # 沒有可 hash 的原始 raster placement 時寧可放棄跨頁去重，也不能把兩張
+            # 同尺寸的空白/掃描頁錯當同一張圖而共用模型輸出。
+            visual_digest = hashlib.sha256(
+                f"{document_id}:{evidence.page}:{bbox}".encode("utf-8")
+            ).hexdigest()
+        channels = [region["channel"]]
+        if rasters and "image_info:raster" not in channels:
+            channels.append("image_info:raster")
+        columns = _column_signal(bands)
+        signature = _content_signature(
+            bbox, channels, fx.KIND_RASTER, words_in, columns, visual_digest,
+            [], drawing_rects, None)
+        asset_digest = (purity["digest_hex"] if purity["pure"]
+                        else hashlib.sha256(signature.encode("utf-8")).hexdigest())
+        signals = {
+            "document_id": document_id,
+            "channels": sorted(set(channels), key=_channel_rank),
+            "bands": bands,
+            "columns": columns,
+            "ruled": _ruled_signal(drawing_rects, bbox),
+            "layout": _terminal_layout_signal(bands),
+            "tokens": _token_signal(bands),
+            "raster_purity": purity,
+            "raster_only": True,
+            "raster_auto": True,
+            "anchored": False,
+            "native_lane": False,
+            "native_text": None,
+            "page_rect": list(evidence.page_rect),
+            "rotation": evidence.rotation,
+        }
+        results.append({
+            "page": evidence.page,
+            "bbox": bbox,
+            "page_rect": evidence.page_rect,
+            "kind": fx.KIND_RASTER,
+            "kind_scores": {
+                fx.KIND_TABLE: 0.0, fx.KIND_TERMINAL: 0.0, fx.KIND_DIAGRAM: 0.0,
+            },
+            "signals": signals,
+            "reasons": ["kind_raster_auto", "vl_lane_raster_auto",
+                        "evidence_" + region["channel"].replace(":", "_")],
+            "signature": signature,
+            "native_table": None,
+            "asset_xref": purity["xref"] if purity["pure"] else None,
+            "asset_digest": asset_digest,
+            "score": 0.65,
+        })
+        disposition[int(region["region_index"])] = "raster_structured_candidate"
+
+    deferred = stats["deferred_to_legacy_lane"]
+    for region in regions:
+        key = int(region["region_index"])
+        reason = disposition.get(key)
+        if reason == "raster_structured_candidate":
+            continue
+        if reason is None:
+            reason = ("picture_only" if region["channel"].startswith("page_boxes")
+                      else "page_fallback_no_structural_evidence"
+                      if region["channel"] == "page:fallback"
+                      else "raster_no_structural_evidence")
+        deferred.append(_deferred_entry(
+            evidence.page, region["bbox"], [region["channel"]], reason))
+    return results
 
 
 def _score_kind(bands, columns, ruled, layout, tokens, native_hit: bool, raster_only: bool) -> dict:
@@ -1733,27 +1976,11 @@ def _page_candidates(evidence: PageEvidence, *, document_id: str, pdf_doc,
                                             [region["channel"]], "raw_regions_per_page"))
         return []
     others = [r for r in regions if not r["promoting"]]
-    if not promoting:
-        for region in others:
-            reason = ("picture_only" if region["channel"].startswith("page_boxes")
-                      else "page_fallback_no_structural_evidence"
-                      if region["channel"] == "page:fallback"
-                      else "raster_no_structural_evidence")
-            deferred.append(_deferred_entry(evidence.page, region["bbox"],
-                                            [region["channel"]], reason))
-        return []
-
     threshold = float(config.FIGURE_IOU_MERGE)
-    components = _components(promoting, threshold)
-    attachments, orphans = _attach_non_promoting(components, promoting, others, threshold)
+    components = _components(promoting, threshold) if promoting else []
+    attachments, _orphans = _attach_non_promoting(
+        components, promoting, others, threshold) if promoting else ([], list(others))
     stats["fusion_components"] += len(components)
-    for region in orphans:
-        reason = ("picture_only" if region["channel"].startswith("page_boxes")
-                  else "page_fallback_no_structural_evidence"
-                  if region["channel"] == "page:fallback"
-                  else "raster_no_structural_evidence")
-        deferred.append(_deferred_entry(evidence.page, region["bbox"],
-                                        [region["channel"]], reason))
 
     drawing_rects = (evidence.overlays or {}).get("drawing_rects") or []
     channels_complete, missing_channels = _overlay_channels_complete(evidence)
@@ -1800,16 +2027,41 @@ def _page_candidates(evidence: PageEvidence, *, document_id: str, pdf_doc,
 
         scores = _score_kind(bands, columns, ruled, layout, tokens, native_hit, raster_only)
         kind, kind_reasons = _route_kind(scores)
+        terminal_signal = _has_terminal_signal(layout, bands)
+        table_signal = _has_table_signal(native_hit, ruled, columns, tokens, bands)
+        if kind == fx_kind_terminal and not terminal_signal:
+            if table_signal:
+                kind = _fx().KIND_TABLE
+                kind_reasons = ["kind_table_positive_signal", "terminal_without_positive_signal"]
+            else:
+                deferred.append(_deferred_entry(
+                    evidence.page, bbox, channels, "no_positive_table_or_terminal_signal"))
+                continue
+        elif kind == _fx().KIND_UNKNOWN:
+            if table_signal and not terminal_signal:
+                kind = _fx().KIND_TABLE
+                kind_reasons = ["kind_table_positive_signal"]
+            elif terminal_signal and not table_signal:
+                kind = fx_kind_terminal
+                kind_reasons = ["kind_terminal_positive_signal"]
+            elif not table_signal and not terminal_signal:
+                deferred.append(_deferred_entry(
+                    evidence.page, bbox, channels, "no_positive_table_or_terminal_signal"))
+                continue
+        elif kind == _fx().KIND_TABLE and not table_signal:
+            deferred.append(_deferred_entry(
+                evidence.page, bbox, channels, "no_positive_table_or_terminal_signal"))
+            continue
         native_text = _native_text_span(evidence, bbox) if kind == fx_kind_terminal else None
         native_lane, lane_reasons = _resolve_native_lane(kind, native_table, native_text)
         if not kind:
             deferred.append(_deferred_entry(evidence.page, bbox, channels, kind_reasons[0]))
             continue
         if raster_only:
-            # 契約 §13.1：純 raster（零 word band、無結構性原生證據）一律不升格，
-            # 交給既有 legacy picture lane（第二道防線；孤兒 raster 在 fusion 前就擋掉了）
+            # promoting component 理論上不會只剩 raster；若上游 evidence 矛盾，讓後面的
+            # raster auto 分類接手，不要硬套 table / terminal kind。
             deferred.append(_deferred_entry(evidence.page, bbox, channels,
-                                            "raster_no_structural_evidence"))
+                                            "raster_component_reclassified"))
             continue
 
         purity = _raster_purity(
@@ -1883,6 +2135,11 @@ def _page_candidates(evidence: PageEvidence, *, document_id: str, pdf_doc,
             "score": max(scores.values()),
         })
 
+    # 未被原生候選覆蓋的 picture / raster 不再掉到自由文字 legacy lane；它們形成
+    # candidate-only 的 KIND_RASTER，後段先分類再套 table / terminal / diagram schema。
+    results.extend(_raster_candidate_items(
+        evidence, others, occupied=[item["bbox"] for item in results],
+        document_id=document_id, pdf_doc=pdf_doc, stats=stats))
     results.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
     return results
 
@@ -2260,6 +2517,7 @@ def _vl_profile(candidate: Candidate) -> dict:
     | VL / kind 已定 / 有 anchor | — | `T` | `2T(1+R)` |
     | VL / kind 已定 / 無 anchor | 需 disagreement detection | `2T` | `2T(1+R)` |
     | VL / KIND_UNKNOWN | dual pass 每 kind 一次、不重試、不取第二樣本 | `2T` | `2T` |
+    | VL / KIND_RASTER | 分類一次，再對勝出 kind 做無 anchor 雙樣本 | `1+2T` | `(1+R)+2T(1+R)` |
 
     `T` = tile 數、`R` = `config.FIGURE_EXTRACT_RETRIES`。
 
@@ -2306,6 +2564,20 @@ def _vl_profile(candidate: Candidate) -> dict:
     retries = max(0, int(config.FIGURE_EXTRACT_RETRIES))
     anchored = bool(candidate.signals.get("anchored"))
     unknown = candidate.kind == _fx().KIND_UNKNOWN
+    raster = candidate.kind == _fx().KIND_RASTER
+    if raster:
+        # classifier 只看第一個 tile；勝出 kind 的抽取仍涵蓋全部 T 個 tile並做第二樣本。
+        classifier_tokens = tokens[0] if tokens else 0
+        min_calls = 1 + 2 * tiles
+        max_calls = (1 + retries) + 2 * tiles * (1 + retries)
+        return {
+            "tiles": tiles,
+            "min": min_calls,
+            "max": max_calls,
+            "tokens_min": classifier_tokens + 2 * base_tokens,
+            "tokens_max": classifier_tokens * (1 + retries)
+                          + 2 * base_tokens * (1 + retries),
+        }
     if unknown:
         # dual pass：table、terminal 各一次 attempt，**不重試、不取第二樣本**
         min_mult = max_mult = 2
@@ -2448,6 +2720,32 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
             except Exception as exc:  # noqa: BLE001
                 stats.setdefault("candidate_errors", []).append(
                     {"page": evidence.page, "error": _slug(exc), "stage": "detect"})
+
+        # find_tables / page-box 常把一張原生大表與其中的 ruled 子區塊各報一次。
+        # 子區塊沒有自己的 header，若再送 VL 只會得到空 header 或與原生表互相競爭；
+        # 原生候選已完整覆蓋它時，只保留單一 canonical table。
+        native_by_page: dict[int, list[dict]] = {}
+        for item in detected:
+            if item.get("native_table"):
+                native_by_page.setdefault(item["page"], []).append(item)
+        deduped: list[dict] = []
+        for item in detected:
+            covered = (
+                not item.get("native_table")
+                and item.get("kind") == fx.KIND_TABLE
+                and any(
+                    _coverage(item["bbox"], native["bbox"]) >= 0.90
+                    for native in native_by_page.get(item["page"], [])
+                )
+            )
+            if covered:
+                stats["deferred_to_legacy_lane"].append(_deferred_entry(
+                    item["page"], item["bbox"],
+                    (item.get("signals") or {}).get("channels") or [],
+                    "covered_by_native_table"))
+                continue
+            deduped.append(item)
+        detected = deduped
 
         stats["deferred_to_legacy_lane"].sort(key=lambda e: (e["page"], e["bbox"][1], e["bbox"][0]))
         if not document_id:

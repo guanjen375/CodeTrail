@@ -617,9 +617,9 @@ top-level `image_data` 可能被新版 llama.cpp 靜默忽略，造成模型只�
 | `vl_calls_max` | `FIGURE_MAX_VL_CALLS_PER_DOC` | 120 |
 | `image_tokens_est` | `FIGURE_MAX_IMAGE_TOKENS_PER_DOC` / `FIGURE_MAX_IMAGE_TOKENS_PER_CALL` | 200000 / 4096 |
 
-> **這些欄位只涵蓋結構化 lane。** 既有自由文字 VL lane(純 raster 內嵌圖、掃描頁)的呼叫
-> **不受這些上限判定**;報告會另外印一個未受閘控的粗估(去重前,而且沒有 image-token
-> 估算)。所以「在預算內」**不等於**整份 PDF 的總成本在預算內。
+> 這些欄位涵蓋所有結構化候選，包含純 raster 的分類、雙樣本抽取與 image-token 估算。
+> 只有未被結構化候選覆蓋的舊自由文字 picture 相容 job 不受這些上限判定；若存在，
+> 報告會另外列出未受閘控的粗估。
 
 三種處理方式:
 

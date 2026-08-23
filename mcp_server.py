@@ -364,7 +364,7 @@ def _figure_review_hint(excluded) -> str:
 
     分兩種來源,因為可做的事完全不同:
       - **structured figure**(有 `figure_id`)→ `review_figures` 列得到、可以 fix。
-      - **legacy / 純 raster VL chunk**(沒有 `figure_id`)→ 本輪**不會**出現在
+      - **舊 KB legacy VL chunk**(沒有 `figure_id`)→ 本輪**不會**出現在
         `review_figures` 裡,也沒有 canonical payload 可以 fix。把使用者導向那條
         流程只會讓他找不到圖。這種只能回去看原始 PDF 頁,或改用有原生文字的來源。
     """
@@ -397,7 +397,7 @@ def _figure_review_hint(excluded) -> str:
         shown = legacy[:5]
         more = f" 等共 {len(legacy)} 張" if len(legacy) > len(shown) else ""
         parts.append(
-            "不可覆核(舊 KB / 純 raster 的視覺辨識):" + "；".join(shown) + more + "。"
+            "不可覆核(舊 KB legacy 視覺辨識):" + "；".join(shown) + more + "。"
             "這些**不會**出現在 review_figures 裡,本輪沒有升級成可信狀態的路徑;"
             "要確認數值請直接看原始 PDF 的那一頁,或改用有原生文字的來源重新入庫。"
         )
@@ -1523,18 +1523,17 @@ def ingest_document(path: str, mode: str = "auto", preflight_only: bool = False)
 
     ── PDF 的圖:兩條 lane(範圍不同,不要混為一談)──────────────────
 
-    A. **結構化 lane**(本輪新增):只收「有結構性原生證據」的候選 —— 原生
+    A. **結構化 lane**:收「有結構性原生證據」的候選 —— 原生
        markdown 表格、`find_tables` 幾何、框線格、對齊的文字帶(無框線 memory
-       map / register map)、**向量文字**的終端機 log。這條 lane 會產出 canonical
-       JSON(表格是 columns/rows/cells,終端機是逐行 lines),帶 `figure_id`、
+       map / register map)、**向量文字**的終端機 log；也收夠大的純 raster / picture，
+       先以圖片分類成 table / terminal / diagram。這條 lane 會產出 canonical
+       JSON(表格是 columns/rows/cells，終端機是逐行 lines),帶 `figure_id`、
        `revision`、頁碼、bbox、格/行級 evidence 與 `verification_status`。
        看不清的字元放 `▯` 並記原因,**不猜**。
 
-    B. **既有自由文字 VL lane**(行為不變):`origin="diagram"`。**純 raster 的
-       終端機截圖、掃描頁表格、方塊圖/流程圖仍走這條**——它們沒有可用的原生
-       文字證據,所以拿不到 `▯`、逐格證據與 strict gate,只有 VL 的文字描述。
-       幾乎沒有文字的頁整頁 render,文字頁的圖逐張 crop;過小的框略過,重複
-       影像只入庫一次。這條 lane **不承接** A 的失敗:A 失敗一律整份零寫入。
+    B. **既有自由文字 VL lane**:`origin="diagram"`，只處理沒有被 A 覆蓋的舊
+       picture job，並維持舊 KB 相容。這條 lane **不承接** A 的失敗:A 失敗一律
+       整份零寫入。
 
     六種 verification_status(structured chunk 專屬,兩個正交欄位之一):
       native_verified   原生表格 geometry 與至少另一個原生 evidence channel 在
@@ -1654,7 +1653,7 @@ def ingest_document(path: str, mode: str = "auto", preflight_only: bool = False)
     if resolved_mode == "binary" and ext not in (BINARY_EXTENSIONS | ELF_EXTENSIONS):
         return f"錯誤: mode='binary' 需要 binary/ELF 副檔名(你給的是 {ext})"
 
-    # preflight 只存在於 PDF 的結構化圖片 lane。其他組合直接擋下 —— 不啟動子行程,
+    # preflight 只存在於 PDF 的結構化圖片 lane（含 raster 分類/抽取）。其他組合直接擋下 —— 不啟動子行程,
     # 也不默默降級成正式入庫(那才是最糟的:使用者以為只是估算,結果整份寫進 KB)。
     pdf_document = (resolved_mode == "document" and ext == ".pdf")
     if preflight_only and not pdf_document:
@@ -1774,7 +1773,7 @@ def ingest_document(path: str, mode: str = "auto", preflight_only: bool = False)
         hint = ("\n\n下一次 query_knowledge 會自動偵測並載入新內容;"
                 "要立即載入+確認 chunk 數可呼叫 reload_knowledge_base()。")
         if pdf_document:
-            hint += ("\n提示: PDF 的結構化圖片(表格 / 向量文字終端機畫面)可能帶待覆核狀態;"
+            hint += ("\n提示: PDF 的結構化圖片(原生或 raster 的表格 / 終端機 / diagram)可能帶待覆核狀態;"
                      "用 review_figures(action=\"list\") 看有哪些、原因是什麼。")
         if getattr(config, "KB_CONTEXT_GENERATE", False):
             # MCP 這條路徑永遠不生成 chunk 脈絡:工具鏈有 600 秒 timeout,
@@ -2060,15 +2059,13 @@ def _render_figure_list(entries: list, *, with_payload: bool) -> str:
 def review_figures(action: str = "list", document_id: str = "", figure_id: str = "",
                    expected_revision: int = 0, payload_json: str = "",
                    confirm_against_image: bool = False) -> str:
-    """Review and correct structured figures (tables / terminal logs) extracted from PDFs.
+    """Review and correct structured figures extracted from PDFs.
 
-    `ingest_document` 對 PDF 做結構化圖片抽取(**只收有結構性原生證據的候選**:
-    原生 markdown 表格、`find_tables` 幾何、框線格、對齊的文字帶、向量文字 log)。
+    `ingest_document` 對 PDF 做結構化圖片抽取:除了原生 markdown 表格、
+    `find_tables` 幾何、框線格、對齊文字帶與向量文字 log，也收夠大的純 raster /
+    picture，先分類成 table / terminal / diagram。
     程式能以獨立證據確認的才進可信檢索;不能確認的會保留原圖、頁碼、框與格/行位置,
     正文放 `▯` 並記原因。這個工具就是那條「人工覆核」的門。
-
-    **範圍限制**:純 raster 的終端機截圖、掃描頁表格與方塊圖仍走既有的自由文字 VL
-    lane(`origin="diagram"`),它們**不會**出現在這裡,也拿不到 `▯` / 逐格證據。
 
     verified-or-abstain:這條管線不猜字元。看不清就 `▯` 或整份零寫入。
     所以「查得到但標了待覆核」是正常狀態,不是 bug。
@@ -2193,8 +2190,8 @@ def review_figures(action: str = "list", document_id: str = "", figure_id: str =
             where = "(" + "、".join(scope) + ")" if scope else ""
             return (
                 f"沒有找到 structured figure {where}。\n"
-                f"只有 PDF ingest 的結構化 lane 會產生它們(純 raster 截圖 / 掃描頁 / 方塊圖"
-                f"走既有的自由文字 VL lane,不在這裡)。\n"
+                f"只有 PDF ingest 的結構化 lane 會產生它們；舊 KB 的 legacy VL chunk "
+                f"沒有 figure_id，因此不在這裡。\n"
                 f"目前 KB: {KB.get_status()}"
             )
         flagged = sum(
