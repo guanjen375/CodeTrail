@@ -91,6 +91,14 @@ RASTER_CANDIDATE_MIN_AREA_PT2 = 4000.0
 RASTER_THIN_MIN_SIDE_PT = 12.0      # 扁長的一行 terminal crop 也可能是完整證據
 RASTER_THIN_MIN_AREA_PT2 = 3000.0
 RASTER_THIN_MIN_ASPECT = 6.0
+# 同一張圖的部件之間允許的留白（pt）與投影重疊下限。pymupdf4llm 會把一張關係圖
+# 的每個方塊/箭頭各報成一個 `picture` box；不聚合就會把整張圖切成互不相干的局部
+# crop，箭頭、layer 配對與上下游關係一起消失（question.md P0-1）。
+RASTER_GROUP_GAP_PT = 24.0
+RASTER_GROUP_OVERLAP_MIN = 0.30
+# 整頁 fallback 的「這頁真的有東西」下限。近乎無文字**且**只有幾條分隔線的頁
+# （章節扉頁、裝飾頁）整頁送 VL 只會拿回一段描述空白的自由文字，還佔掉預算。
+PAGE_FALLBACK_MIN_DRAWINGS = 6
 MIN_GRID_ROWS = 3                   # word band 群的最少帶數
 MIN_GRID_COLS = 2                   # 一帶內對齊欄的最少數量
 GRID_COL_TOL_PT = 4.0               # 欄左緣對齊容忍（pt）
@@ -131,6 +139,10 @@ _TABLE_STRATEGIES = ("lines", "lines_strict", "text")
 # markdown 是 ``- `$ dmesg | tail` `` 這種**加過裝飾**的逐行輸出，而且一個候選會對到
 # 五個 pos —— 那不是「一塊 pos 支撐的 raw markdown 文字」。
 _TEXT_BEARING_CLASSES = frozenset({"text", "code", "table", "section-header"})
+# 讀序上會「結束一張圖」的 page_box class。兩個 `picture` 之間夾了這些，它們就不是
+# 同一張圖的部件：caption 收尾、內文/清單分段。只用幾何相鄰而不看讀序，密集的
+# 操作說明頁會沿著 4pt 的縫隙把整頁串成一個 crop。
+_FIGURE_RUN_BREAK_CLASSES = frozenset(_TEXT_BEARING_CLASSES | {"caption", "list-item"})
 # fusion 的來源優先序（也決定 stats / signals 內 channel 的穩定排序）
 _CHANNEL_ORDER = (
     "find_tables:lines",
@@ -1199,6 +1211,25 @@ def _token_signal(bands) -> dict:
 # ============================================================
 # 7. 候選：來源 → IoU fusion → 升格閘 → kind 評分
 # ============================================================
+def _page_fallback_has_content(evidence: PageEvidence) -> bool:
+    """近乎無文字的頁上，整頁 fallback 值不值得一次 VL 呼叫。
+
+    `fallback` 只說「這頁沒有文字層」，沒說「這頁有內容」。任何 raster placement 都算
+    有內容（掃描頁、全頁封面）；純向量的頁則要嘛圖元夠多（線路圖 / 方塊圖），要嘛
+    墨跡面積夠大（單一大色塊）。三條分隔線的裝飾頁兩個都不到——它整頁送出去只會
+    換回一段描述空白的自由文字，還佔掉別頁的預算。
+
+    用**逐個圖元的面積和**而不是 cluster union：三條橫跨整頁的細線 union 很大，
+    真實墨跡卻不到 1000pt²。
+    """
+    if evidence.image_info:
+        return True
+    rects = (evidence.overlays or {}).get("drawing_rects") or []
+    if len(rects) >= PAGE_FALLBACK_MIN_DRAWINGS:
+        return True
+    return sum(_area(rect) for rect in rects) >= RASTER_CANDIDATE_MIN_AREA_PT2
+
+
 def _region_sources(evidence: PageEvidence) -> list[dict]:
     """把每個 channel 的原始區域攤平成 region list（unrotated 空間）。
 
@@ -1296,7 +1327,7 @@ def _region_sources(evidence: PageEvidence) -> list[dict]:
                        "digest_hex": entry.get("digest_hex", "")},
         })
 
-    if evidence.fallback and valid_page:
+    if evidence.fallback and valid_page and _page_fallback_has_content(evidence):
         regions.append({
             "channel": "page:fallback",
             "bbox": page_rect,
@@ -1416,46 +1447,147 @@ def _raster_visual_digest(evidence: PageEvidence, bbox) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _boxes_same_figure(a, b) -> bool:
+    """兩個 raster 框是不是同一張圖的相鄰部件（幾何側判定）。
+
+    相交一律算同一張。否則要求：**一軸貼著**（間隙 <= `RASTER_GROUP_GAP_PT`）而
+    **另一軸的投影重疊 >= 較短邊的 `RASTER_GROUP_OVERLAP_MIN`**。只看「靠近」不夠——
+    版面上下兩張不相干的圖也常只差十幾 pt，但它們的側向投影通常不會互相蓋住三成。
+    對角錯開（兩軸都有間隙）一律不算相鄰。
+    """
+    if _overlaps(a, b):
+        return True
+    x_gap = max(a[0] - b[2], b[0] - a[2])
+    y_gap = max(a[1] - b[3], b[1] - a[3])
+    x_overlap = min(a[2], b[2]) - max(a[0], b[0])
+    y_overlap = min(a[3], b[3]) - max(a[1], b[1])
+    x_span = min(a[2] - a[0], b[2] - b[0])
+    y_span = min(a[3] - a[1], b[3] - b[1])
+    if x_gap <= 0.0 and 0.0 < y_gap <= RASTER_GROUP_GAP_PT:
+        return x_span > 0.0 and x_overlap / x_span >= RASTER_GROUP_OVERLAP_MIN
+    if y_gap <= 0.0 and 0.0 < x_gap <= RASTER_GROUP_GAP_PT:
+        return y_span > 0.0 and y_overlap / y_span >= RASTER_GROUP_OVERLAP_MIN
+    return False
+
+
+def _picture_run_ids(evidence: PageEvidence) -> dict[int, int]:
+    """每個 `picture` page_box 的讀序段編號（`_ordinal` → run id）。
+
+    依上游給的閱讀順序掃一次，遇到 `_FIGURE_RUN_BREAK_CLASSES` 就換段。同一段內的
+    picture 才可能是同一張圖的部件。
+    """
+    runs: dict[int, int] = {}
+    run = 0
+    for box_entry in evidence.page_boxes:
+        ordinal = box_entry.get("_ordinal")
+        cls = box_entry.get("class")
+        if cls == "picture":
+            if _is_real_int(ordinal):
+                runs[int(ordinal)] = run
+        elif cls in _FIGURE_RUN_BREAK_CLASSES:
+            run += 1
+    return runs
+
+
+def _group_picture_regions(evidence: PageEvidence, regions) -> list[dict]:
+    """把 `page_boxes:picture` region 聚成 figure group（每個 group 一個候選）。
+
+    條件是**讀序同一段** ∧ **幾何相鄰**（`_boxes_same_figure`）。與 `_components()`
+    同樣的紀律：union-find 只在**原始 bbox** 上兩兩比對，不重算群 bbox 再迭代——
+    重算會沿著鏈把相鄰兩張圖橋接起來，而且結果會依輸入順序改變。
+    """
+    parent = list(range(len(regions)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    run_ids = _picture_run_ids(evidence)
+
+    def run_of(region) -> int:
+        ordinal = (region.get("detail") or {}).get("ordinal")
+        if not _is_real_int(ordinal):
+            return -1
+        return run_ids.get(int(ordinal), -1)
+
+    for i in range(len(regions)):
+        run_i = run_of(regions[i])
+        if run_i < 0:
+            continue
+        for j in range(i + 1, len(regions)):
+            if run_of(regions[j]) != run_i:
+                continue
+            if _boxes_same_figure(regions[i]["bbox"], regions[j]["bbox"]):
+                root_i, root_j = find(i), find(j)
+                if root_i != root_j:
+                    parent[max(root_i, root_j)] = min(root_i, root_j)
+
+    buckets: dict[int, list] = {}
+    for index in range(len(regions)):
+        buckets.setdefault(find(index), []).append(regions[index])
+    groups = []
+    for root in sorted(buckets):
+        members = buckets[root]
+        groups.append({
+            "channel": "page_boxes:picture",
+            "bbox": _round_box(_union_box([m["bbox"] for m in members])),
+            "members": members,
+        })
+    groups.sort(key=lambda g: (g["bbox"][1], g["bbox"][0]))
+    return groups
+
+
 def _raster_candidate_items(evidence: PageEvidence, regions, *, occupied, document_id: str,
                             pdf_doc, stats: dict) -> list[dict]:
     """把未被原生 structured 候選覆蓋的 raster/picture 變成受監督候選。
 
-    page-box picture 優先於 image_info；兩者共延時只產一個 physical candidate。
-    `page:fallback` 只在該頁沒有更精確框時使用。所有未採用來源都有明確 defer reason，
-    讓 preflight 不會把「沒進 structured」說成不存在。
+    `page_boxes:picture` 先依 `_group_picture_regions()` 聚成 figure group（一張關係圖
+    在上游是幾十個 picture box），group 的 union 才是候選框。接著才輪到 **未被任何
+    group 覆蓋的** figure-sized `image_info` placement——上游漏報 picture box 的大型
+    截圖只存在於 image_info，早期版本「這頁有 picture box 就整批不看 image_info」會讓
+    它既沒有 structured 候選、legacy lane 也讀不到（legacy 只讀 page_boxes），變成
+    無聲漏圖（question.md P0-2）。`page:fallback` 仍只在該頁沒有更精確框時使用。
+
+    所有未採用來源都有明確 defer reason，讓 preflight 不會把「沒進 structured」說成
+    不存在。
     """
     fx = _fx()
     threshold = float(config.FIGURE_IOU_MERGE)
+    units: list[dict] = _group_picture_regions(
+        evidence, [r for r in regions if r["channel"] == "page_boxes:picture"])
+    for region in regions:
+        if region["channel"] in ("image_info:raster", "page:fallback"):
+            units.append({"channel": region["channel"], "bbox": region["bbox"],
+                          "members": [region]})
     priority = {"page_boxes:picture": 0, "image_info:raster": 1, "page:fallback": 2}
-    picture_pool = [r for r in regions if r["channel"] == "page_boxes:picture"]
-    # page_boxes 已經是上游對「這裡有一張完整圖片」的物理分組；同頁再把其內部每個
-    # image_info placement 各升一張，會把一張 screenshot 拆成數十個候選。只有上游
-    # 沒給 picture box 時，才以 figure-sized image_info / page fallback 補位。
-    pool = (picture_pool if picture_pool else
-            [r for r in regions if r["channel"] in ("image_info:raster", "page:fallback")])
-    pool.sort(key=lambda r: (priority[r["channel"]], r["bbox"][1], r["bbox"][0]))
+    units.sort(key=lambda u: (priority[u["channel"]], u["bbox"][1], u["bbox"][0]))
     chosen: list[dict] = []
     disposition: dict[int, str] = {}
 
-    for region in pool:
-        box = _as_bbox(region.get("bbox"))
-        key = int(region["region_index"])
+    def _mark(unit: dict, reason: str) -> None:
+        for member in unit["members"]:
+            disposition[int(member["region_index"])] = reason
+
+    for unit in units:
+        box = _as_bbox(unit.get("bbox"))
         if box is None or not _candidate_box_big_enough(box, raster=True):
-            disposition[key] = "below_min_size"
+            _mark(unit, "below_min_size")
             continue
         if any(_iou(box, other) >= threshold or _coverage(box, other) >= 0.90
                for other in occupied):
-            disposition[key] = "covered_by_structured_candidate"
+            _mark(unit, "covered_by_structured_candidate")
             continue
-        if region["channel"] == "page:fallback" and chosen:
-            disposition[key] = "covered_by_raster_candidate"
+        if unit["channel"] == "page:fallback" and chosen:
+            _mark(unit, "covered_by_raster_candidate")
             continue
 
         duplicate = False
         for kept in chosen:
             kept_box = kept["bbox"]
             same_page_box_class = (
-                region["channel"] == kept["channel"] == "page_boxes:picture"
+                unit["channel"] == kept["channel"] == "page_boxes:picture"
             )
             if (_iou(box, kept_box) >= 0.90
                     or (not same_page_box_class
@@ -1464,17 +1596,17 @@ def _raster_candidate_items(evidence: PageEvidence, regions, *, occupied, docume
                 duplicate = True
                 break
         if duplicate:
-            disposition[key] = "covered_by_raster_candidate"
+            _mark(unit, "covered_by_raster_candidate")
             continue
-        chosen.append(region)
+        chosen.append(unit)
 
     results: list[dict] = []
     drawing_rects = (evidence.overlays or {}).get("drawing_rects") or []
     channels_complete, missing_channels = _overlay_channels_complete(evidence)
-    for region in chosen:
-        bbox = _intersection(_as_bbox(region["bbox"]), evidence.page_rect)
+    for unit in chosen:
+        bbox = _intersection(_as_bbox(unit["bbox"]), evidence.page_rect)
         if bbox is None:
-            disposition[int(region["region_index"])] = "bbox_outside_page"
+            _mark(unit, "bbox_outside_page")
             continue
         bbox = _round_box(bbox)
         words_in = [w for w in evidence.words if _word_in(w, bbox, WORD_ASSIGN_DILATE_PT)]
@@ -1522,7 +1654,7 @@ def _raster_candidate_items(evidence: PageEvidence, regions, *, occupied, docume
             visual_digest = hashlib.sha256(
                 f"{document_id}:{evidence.page}:{bbox}".encode("utf-8")
             ).hexdigest()
-        channels = [region["channel"]]
+        channels = [unit["channel"]]
         if rasters and "image_info:raster" not in channels:
             channels.append("image_info:raster")
         columns = _column_signal(bands)
@@ -1558,14 +1690,15 @@ def _raster_candidate_items(evidence: PageEvidence, regions, *, occupied, docume
             },
             "signals": signals,
             "reasons": ["kind_raster_auto", "vl_lane_raster_auto",
-                        "evidence_" + region["channel"].replace(":", "_")],
+                        "evidence_" + unit["channel"].replace(":", "_")]
+                       + (["raster_group_merged"] if len(unit["members"]) > 1 else []),
             "signature": signature,
             "native_table": None,
             "asset_xref": purity["xref"] if purity["pure"] else None,
             "asset_digest": asset_digest,
             "score": 0.65,
         })
-        disposition[int(region["region_index"])] = "raster_structured_candidate"
+        _mark(unit, "raster_structured_candidate")
 
     deferred = stats["deferred_to_legacy_lane"]
     for region in regions:
@@ -2517,7 +2650,7 @@ def _vl_profile(candidate: Candidate) -> dict:
     | VL / kind 已定 / 有 anchor | — | `T` | `2T(1+R)` |
     | VL / kind 已定 / 無 anchor | 需 disagreement detection | `2T` | `2T(1+R)` |
     | VL / KIND_UNKNOWN | dual pass 每 kind 一次、不重試、不取第二樣本 | `2T` | `2T` |
-    | VL / KIND_RASTER | 分類一次，再對勝出 kind 做無 anchor 雙樣本 | `1+2T` | `(1+R)+2T(1+R)` |
+    | VL / KIND_RASTER | 分類一次，再對勝出 kind 抽取 | `1+T` | `(1+R)+2T(1+R)` |
 
     `T` = tile 數、`R` = `config.FIGURE_EXTRACT_RETRIES`。
 
@@ -2566,15 +2699,22 @@ def _vl_profile(candidate: Candidate) -> dict:
     unknown = candidate.kind == _fx().KIND_UNKNOWN
     raster = candidate.kind == _fx().KIND_RASTER
     if raster:
-        # classifier 只看第一個 tile；勝出 kind 的抽取仍涵蓋全部 T 個 tile並做第二樣本。
+        # classifier 只看第一個 tile；勝出 kind 的抽取涵蓋全部 T 個 tile。
+        #
+        # ★ 下界是 `1 + T`，**不是** `1 + 2T`：classifier 解成 `diagram` 時
+        # `figure_verify._run_vl_lane()` 帶的是 `second_sample=False`（只有 table /
+        # terminal 的逐格逐行內容才做第二樣本），所以整份都是 diagram 的 PDF 真實
+        # 呼叫數會**小於**舊公式宣稱的「最少」。實測 example1.pdf：宣稱 54、實際 40。
+        # 名為 min 卻不是下界，會讓成本 / timeout 判讀失準，也讓「實際落在
+        # [min, max] 內」這條契約永遠測不出來。上界維持雙樣本 + 重試的最壞情況。
         classifier_tokens = tokens[0] if tokens else 0
-        min_calls = 1 + 2 * tiles
+        min_calls = 1 + tiles
         max_calls = (1 + retries) + 2 * tiles * (1 + retries)
         return {
             "tiles": tiles,
             "min": min_calls,
             "max": max_calls,
-            "tokens_min": classifier_tokens + 2 * base_tokens,
+            "tokens_min": classifier_tokens + base_tokens,
             "tokens_max": classifier_tokens * (1 + retries)
                           + 2 * base_tokens * (1 + retries),
         }
@@ -2639,6 +2779,7 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
         "page_box_space": {},
         "degenerate_tables": [],
         "deferred_to_legacy_lane": [],
+        "unconsumed_raster": [],
         "dropped_candidates": [],
         "duplicate_assets_shared": [],
         "candidates_detected": 0,
@@ -2926,6 +3067,30 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
             plan = _degraded_plan(document_id, stats, page_evidence)
             return _dataclass_replace(plan, over_budget=["planning_error"])
 
+        # ── raster orphan 帳（question.md 驗收條件 2）──
+        # `deferred_to_legacy_lane` 只是 planner 的 disposition，**不是**交接保證：
+        # legacy lane（`RAG._plan_pdf_figure_jobs`）只讀 `page_boxes`，所以只存在於
+        # `image_info` 的大型截圖被 defer 之後根本沒有任何 consumer——實測 p24 的
+        # 313x216pt 操作截圖就這樣兩邊都沒收。這裡把「夠大、又沒有任何 admitted
+        # 候選覆蓋」的 image_info 區域單獨列帳，讓 `dropped_candidates=0` 不再被
+        # 讀成「沒有圖被漏掉」。
+        admitted_boxes: dict[int, list] = {}
+        for candidate in candidates:
+            admitted_boxes.setdefault(candidate.page, []).append(candidate.bbox)
+        for entry in stats["deferred_to_legacy_lane"]:
+            if (entry.get("channels") or [""])[0] != "image_info:raster":
+                continue
+            box = _as_bbox(entry["bbox"])
+            if box is None or not _candidate_box_big_enough(box, raster=True):
+                continue
+            if any(_coverage(box, kept) >= 0.90
+                   for kept in admitted_boxes.get(entry["page"], ())):
+                continue
+            stats["unconsumed_raster"].append({
+                "page": entry["page"], "bbox": list(entry["bbox"]),
+                "channel": "image_info:raster", "reason": entry["reason"],
+            })
+
         preflight = {
             # ── 契約 §6.3 的七個凍結鍵 ──
             "candidates": len(candidates),
@@ -2944,6 +3109,7 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
             "candidates_detected": len(detected),
             "dropped_candidates": len(stats["dropped_candidates"]),
             "deferred_to_legacy_lane": len(stats["deferred_to_legacy_lane"]),
+            "unconsumed_raster": len(stats["unconsumed_raster"]),
         }
         return FigurePlan(document_id=document_id, candidates=candidates,
                           page_evidence=page_evidence, stats=stats,
@@ -3024,6 +3190,14 @@ def format_preflight_report(plan: FigurePlan) -> str:
             counts[entry["reason"]] = counts.get(entry["reason"], 0) + 1
         detail = "、".join(f"{k} {v}" for k, v in sorted(counts.items()))
         lines.append(f"  已延後給既有 picture lane：{len(deferred)}（{detail}）")
+    orphans = stats.get("unconsumed_raster") or []
+    if orphans:
+        # legacy lane 讀不到 `image_info`，所以這一段是「兩邊都沒有 consumer」的圖。
+        # 逐筆列出，不併成一個數字：`dropped_candidates=0` 已經被誤讀過一次。
+        lines.append(f"  沒有任何 consumer 的 raster 區域（結構化與既有 lane 都收不到）：{len(orphans)}")
+        for entry in orphans:
+            lines.append(f"    第 {entry['page']} 頁 bbox={entry['bbox']}"
+                         f" channel={entry['channel']} reason={entry['reason']}")
     dropped = stats.get("dropped_candidates") or []
     if dropped:
         lines.append(f"  被丟棄的候選（不無聲截斷）：{len(dropped)}")

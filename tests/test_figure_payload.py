@@ -309,11 +309,16 @@ def test_validator_rejects_bad_table_shape():
             "footnotes": [],
         })
 
+    # 全空 header：**結構**沒問題（欄數固定、column_id 唯一、每列對齊），所以
+    # validator 收下它。79ef673 起「有沒有可確認的表頭」由抽取端的 `header_missing`
+    # blocker 判（→ needs_review，永遠升不到 trusted），見
+    # `tests/test_figure_verify.py::test_empty_header_is_flagged_not_rejected`。
+    # 這裡硬拒的話，raster 截圖裡本來就沒有表頭列的表會讓**整份 PDF 零寫入**——
+    # 那是丟資料，不是 fail-safe；validator 只守結構，不猜字。
     empty_header = json.loads(json.dumps(base))
     for column in empty_header["columns"]:
         column["label"] = ""
-    with pytest.raises(fx.FigureValidationError, match="header 非空"):
-        fx.validate_payload(empty_header, fx.KIND_TABLE)
+    fx.validate_payload(empty_header, fx.KIND_TABLE)
 
 
 @pytest.mark.smoke

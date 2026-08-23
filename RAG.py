@@ -724,6 +724,36 @@ def _bbox_iou(a, b) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _bbox_coverage(inner, outer) -> float:
+    """`inner` 有多少比例落在 `outer` 內；退化框回 0.0。
+
+    IoU 不夠用：結構化 lane 會把一張關係圖的數十個 picture 子框聚成**一個**大候選，
+    大框與其中任一小框的 IoU 很低，但小框其實已經 100% 被收錄。只看 IoU 會讓既有
+    picture lane 把同一塊內容再 render、再送一次 VL（契約 §0.1 的重複入庫）。
+    """
+    try:
+        ax0, ay0, ax1, ay1 = (float(v) for v in inner)
+        bx0, by0, bx1, by1 = (float(v) for v in outer)
+    except (TypeError, ValueError):
+        return 0.0
+    iw = min(ax1, bx1) - max(ax0, bx0)
+    ih = min(ay1, by1) - max(ay0, by0)
+    area = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+    if iw <= 0 or ih <= 0 or area <= 0:
+        return 0.0
+    return (iw * ih) / area
+
+
+# 「這個 legacy crop 已經被結構化候選收錄」的覆蓋率門檻。
+FIGURE_JOB_COVERED_BY_CANDIDATE = 0.90
+
+
+def _job_covered_by(job_bbox, candidate_bbox, threshold: float) -> bool:
+    """legacy crop 是否已由某個結構化候選收錄（IoU 等價 **或** 幾乎整塊被包住）。"""
+    return (_bbox_iou(job_bbox, candidate_bbox) >= threshold
+            or _bbox_coverage(job_bbox, candidate_bbox) >= FIGURE_JOB_COVERED_BY_CANDIDATE)
+
+
 def _iou_threshold() -> float:
     return float(getattr(config_module, "FIGURE_IOU_MERGE", 0.5))
 
@@ -963,7 +993,7 @@ def _format_legacy_vl_estimate(fx, plan, legacy_jobs) -> str:
                 continue
             if int(getattr(candidate, "page", 0)) != job["page"]:
                 continue
-            if _bbox_iou(job["bbox"], getattr(candidate, "bbox", ())) >= threshold:
+            if _job_covered_by(job["bbox"], getattr(candidate, "bbox", ()), threshold):
                 covered += 1
                 break
     return (f"  [INFO] 既有圖面路徑：{len(legacy_jobs)} 張"
@@ -1547,8 +1577,12 @@ def _skip_covered_figure_jobs(jobs: List[Dict], covered: Dict[int, List]) -> Lis
     框」，跳掉會連整頁其他內容一起丟。`_plan_pdf_figure_jobs` 的規劃結果一個字都不改
     （含 figure_index 編號），過濾發生在呼叫端（契約 §0.1 逐位元組保留）。
 
+    判定用 `_job_covered_by()`：IoU 等價**或**這個 crop 幾乎整塊落在候選內。只看 IoU
+    的話，結構化 lane 把數十個 picture 子框聚成一個大候選之後，每個子框都會被 legacy
+    再 render 一次（同一塊內容入庫兩份）。
+
     已知限制：legacy 的 bbox 來自 `page_boxes`（可能是 rotated space），
-    `Candidate.bbox` 是 unrotated space；旋轉頁上 IoU 會算成 0 而跳不掉。
+    `Candidate.bbox` 是 unrotated space；旋轉頁上兩個判定都會算成 0 而跳不掉。
     """
     if not covered:
         return jobs
@@ -1556,11 +1590,12 @@ def _skip_covered_figure_jobs(jobs: List[Dict], covered: Dict[int, List]) -> Lis
     kept = []
     for job in jobs:
         if job["mode"] == "crop" and any(
-            _bbox_iou(job["bbox"], box) >= threshold
+            _job_covered_by(job["bbox"], box, threshold)
             for box in covered.get(job["page"], ())
         ):
             print(f"  [INFO] 第 {job['page']} 頁 圖 {job['figure_index']} "
-                  f"已由結構化 lane 收錄（IoU >= {threshold}），既有圖面路徑跳過",
+                  f"已由結構化 lane 收錄（IoU >= {threshold} 或"
+                  f"覆蓋率 >= {FIGURE_JOB_COVERED_BY_CANDIDATE}），既有圖面路徑跳過",
                   flush=True)
             continue
         kept.append(job)

@@ -1008,6 +1008,45 @@ WRONG_KIND_TABLE = table_json(
 )
 
 
+@pytest.mark.smoke
+def test_empty_header_is_flagged_not_rejected(monkeypatch):
+    """★ 全空表頭：收下結構，但**必須**標 `header_missing` 且永遠升不到 trusted。
+
+    79ef673 把「header 非空」從 `figure_extract._validate_table` 的硬拒改成這裡的
+    blocker，理由是 raster 截圖裡的表本來就可能沒有獨立表頭列，硬拒會讓整份 PDF
+    零寫入。**那個放寬只有在這條成立時才是安全的**——少了這條，全空表頭就會變成
+    「validator 收、抽取端也沒說話」的無聲通過（AGENTS.md §2.4 第二類）。
+    """
+    spy = VLSpy({"figure_table": table_json(
+        ["", ""],
+        [[("CTRL0", "observed"), ("0x8000_0100", "observed")],
+         [("CTRL1", "observed"), ("0x8000_0104", "observed")]],
+    )})
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+
+    result = extract([candidate(kind=figure_extract.KIND_TABLE)], {4: page_evidence()})[0]
+
+    assert "header_missing" in result.reasons, result.reasons
+    assert result.verification_status == figure_extract.VERIF_NEEDS_REVIEW, (
+        result.verification_status, result.reasons)
+    # 欄位身分仍要靠唯一 column_id + 固定列寬撐住，不得把第一筆資料冒充成 header
+    labels = [column["label"] for column in result.payload["columns"]]
+    assert labels == ["", ""], labels
+    assert len(result.payload["rows"]) == 2, result.payload["rows"]
+
+    # 對照組：同一張圖只要有一個非空 label 就不得再標 header_missing——否則這條
+    # 斷言只是在測「這個 fixture 反正都 needs_review」，抓不到 blocker 被拿掉。
+    spy = VLSpy({"figure_table": table_json(
+        ["Name", "Address"],
+        [[("CTRL0", "observed"), ("0x8000_0100", "observed")],
+         [("CTRL1", "observed"), ("0x8000_0104", "observed")]],
+    )})
+    install_vl(monkeypatch, spy)
+    labelled = extract([candidate(kind=figure_extract.KIND_TABLE)], {4: page_evidence()})[0]
+    assert "header_missing" not in labelled.reasons, labelled.reasons
+
+
 def test_kind_unknown_runs_each_extractor_exactly_once(monkeypatch):
     """契約 §12.2：ambiguous dual pass 每個 kind **恰好一次**，勝出的也不再打第二次。"""
     spy = VLSpy({"figure_table": WRONG_KIND_TABLE, "figure_terminal": GOOD_TERMINAL})

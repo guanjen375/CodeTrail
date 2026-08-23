@@ -410,23 +410,175 @@ def test_preflight_over_budget_raises_and_writes_nothing(tmp_path: Path, monkeyp
     ]), (), "prose"),
     ("三條裝飾線", _FakePage(drawings=[(72, 100, 400, 101), (72, 200, 400, 201),
                                        (72, 300, 400, 301)]), (), "lines"),
-    ("只有 image_info + 非法 pos 的 table box",
-     _FakePage(images=[{"bbox": (72, 100, 400, 400), "xref": 7, "width": 80, "height": 60,
-                        "digest": b"\x01" * 16, "has-mask": False,
-                        "transform": (328.0, 0.0, 0.0, 300.0, 72.0, 100.0)}]),
-     ({"class": "table", "bbox": (72, 100, 400, 400), "pos": (0, 9999)},), "short"),
 ])
 def test_regions_without_positive_structural_evidence_do_not_promote(
         label, page, boxes, text, tmp_path: Path):
-    """散文、裝飾線、只有像素的區域都**不得**升格成 structured 候選。
+    """散文與裝飾線都**不得**升格成 table / terminal 候選。
 
-    `image_info` 本身不是結構性 channel；`page_boxes:table` 沒有合法 `pos` 也不算。
-    這三個負例是 legacy picture lane 不被搶走的最小保證。
+    `page_boxes:table` 沒有合法 `pos` 不算結構性證據；近乎無文字又只有三條分隔線的
+    裝飾頁也不值得一次整頁 VL。這兩個負例守的是「不要對著空白內容宣稱有表 / 有 log」。
+
+    ⚠️ **只有像素**的區域不在這裡：79ef673 起純 raster 改走受監督的 `KIND_RASTER`
+    lane（見 `test_pixel_only_region_becomes_supervised_raster_candidate`），不再掉到
+    legacy 的自由文字描述。
     """
     pages = [_page_dict(1, text, boxes)]
     plan = _plan(pages, _FakeDoc([page]), tmp_path, name=f"{label}.pdf")
     assert plan.candidates == [], [
         (c.kind, c.bbox, c.reasons) for c in plan.candidates]
+
+
+@pytest.mark.smoke
+def test_pixel_only_region_becomes_supervised_raster_candidate(tmp_path: Path):
+    """只有像素的區域升格成 `KIND_RASTER`，**不得**直接被當成 table / terminal。
+
+    `image_info` 仍然不是結構性證據：它換到的是「先用 image-bound schema 分類、再走
+    同一套 canonical payload / `▯` / review artifact / strict gate」，而不是一個宣稱
+    自己是表的候選。`page_boxes:table` 的 `pos` 非法時也一樣不得讓它變成 table。
+
+    `KIND_RASTER` 是**候選階段**的 kind：`figure_extract` 不接受它入庫（見
+    `_require_kind`），所以升格本身不會讓任何未分類的東西進 KB。
+    """
+    page = _FakePage(images=[{"bbox": (72, 100, 400, 400), "xref": 7,
+                              "width": 80, "height": 60,
+                              "digest": b"\x01" * 16, "has-mask": False,
+                              "transform": (328.0, 0.0, 0.0, 300.0, 72.0, 100.0)}])
+    boxes = ({"class": "table", "bbox": (72, 100, 400, 400), "pos": (0, 9999)},)
+    plan = _plan([_page_dict(1, "short", boxes)], _FakeDoc([page]), tmp_path,
+                 name="pixels.pdf")
+
+    assert len(plan.candidates) == 1, [(c.kind, c.bbox) for c in plan.candidates]
+    candidate = plan.candidates[0]
+    assert candidate.kind == fe.KIND_RASTER, candidate.kind
+    assert candidate.bbox == (72.0, 100.0, 400.0, 400.0)
+    assert candidate.native_table is None
+    assert candidate.signals["native_lane"] is False
+    with pytest.raises(fe.FigureValidationError):
+        fe.validate_payload({"kind": fe.KIND_RASTER}, fe.KIND_RASTER)
+
+
+# ============================================================
+# smoke：raster 幾何（question.md 2026-08-23 實測 P0-1 / P0-2）
+# ============================================================
+def _relation_diagram_boxes():
+    """一張關係圖在 pymupdf4llm 眼中的樣子：14 個各自獨立的 `picture` box。
+
+    幾何逐字取自 `example1.pdf` 第 1 頁（左右兩側元件、四層、箭頭）。上游**沒有**
+    給任何一個框住整張圖的 box，只給了組成它的方塊與箭頭。
+    """
+    return [
+        (291, 243, 332, 276), (154, 248, 279, 288), (337, 248, 471, 288),
+        (294, 299, 330, 332), (154, 305, 279, 345), (337, 305, 471, 345),
+        (301, 333, 323, 366), (163, 348, 279, 379), (354, 348, 471, 379),
+        (297, 365, 327, 388), (160, 382, 284, 413), (333, 382, 471, 413),
+        (197, 423, 236, 446), (384, 423, 432, 446),
+    ]
+
+
+@pytest.mark.smoke
+def test_adjacent_picture_boxes_become_one_figure_candidate(tmp_path: Path):
+    """★ 一張關係圖不得被切成一堆局部 crop（question.md P0-1）。
+
+    實測 `example1.pdf` p1：上游把整張圖報成 14 個 `picture` box，舊版對其中夠大的
+    5 個各建一個候選，剩下 9 個直接 `below_min_size` 丟掉。輸出的 5 個 crop 沒有任何
+    一個含箭頭、layer label 或左右配對——**模型再準也救不回錯誤的 crop**。
+
+    這條釘住：同一讀序段內幾何相鄰的 picture 必須聚成**一個**候選，且它的 bbox 要
+    真的蓋住整張圖（union），不是其中最大的那一塊。
+    """
+    boxes = _relation_diagram_boxes()
+    page_boxes = [{"class": "text", "bbox": (56, 172, 571, 225), "pos": (0, 40)}]
+    page_boxes += [{"class": "picture", "bbox": box} for box in boxes]
+    page_boxes.append({"class": "caption", "bbox": (206, 438, 421, 450), "pos": (40, 80)})
+    pages = [_page_dict(1, "x" * 120, page_boxes)]
+
+    plan = _plan(pages, _FakeDoc([_FakePage()]), tmp_path, name="relation.pdf")
+
+    raster = [c for c in plan.candidates if c.kind == fe.KIND_RASTER]
+    assert len(raster) == 1, [(c.bbox, c.reasons) for c in plan.candidates]
+    expected = (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                max(b[2] for b in boxes), max(b[3] for b in boxes))
+    assert raster[0].bbox == pytest.approx(expected), (raster[0].bbox, expected)
+    assert "raster_group_merged" in raster[0].reasons
+
+
+@pytest.mark.smoke
+def test_unrelated_figures_on_one_page_do_not_merge(tmp_path: Path):
+    """聚合不得沿著版面縫隙把整頁串成一個 crop。
+
+    `example2.pdf` p24 的兩張終端機截圖只差 19pt，中間隔著一段內文。只看幾何相鄰
+    會把它們（以及再下面的操作截圖）連成一塊；讀序上夾著 text box 就不是同一張圖。
+    """
+    page_boxes = [
+        {"class": "picture", "bbox": (252, 214, 550, 266)},
+        {"class": "text", "bbox": (56, 271, 221, 283), "pos": (0, 20)},
+        {"class": "picture", "bbox": (252, 285, 492, 331)},
+    ]
+    plan = _plan([_page_dict(1, "x" * 120, page_boxes)], _FakeDoc([_FakePage()]),
+                 tmp_path, name="twofigs.pdf")
+
+    raster = sorted((c.bbox for c in plan.candidates if c.kind == fe.KIND_RASTER))
+    assert raster == [(252.0, 214.0, 550.0, 266.0), (252.0, 285.0, 492.0, 331.0)], raster
+
+
+@pytest.mark.smoke
+def test_uncovered_image_info_screenshot_is_not_masked_by_page_boxes(tmp_path: Path):
+    """★ 上游漏報 picture box 的大型截圖不得兩邊都收不到（question.md P0-2）。
+
+    實測 `example2.pdf` p24：`get_images` 報 1019 個 image object，其中右側 313x216pt
+    的操作截圖**只**存在於 `image_info`，`page_boxes` 沒有對應的 picture box。舊版的
+    pool 是「這頁有 picture box 就整批不看 image_info」，於是它被記成
+    `deferred_to_legacy_lane`——但 legacy lane（`RAG._plan_pdf_figure_jobs`）也只讀
+    `page_boxes`，一樣看不到它。兩邊都沒 consumer ＝ 無聲漏圖，而
+    `dropped_candidates=0` 還會讓報告看起來是乾淨的。
+    """
+    screenshot = (246.54, 305.7, 559.26, 521.76)
+    covered = (56.7, 107.76, 242.88, 192.0)
+    page_boxes = [{"class": "picture", "bbox": (56, 107, 243, 192)},
+                  {"class": "text", "bbox": (56, 208, 243, 221), "pos": (0, 20)},
+                  {"class": "picture", "bbox": (65, 305, 262, 481)}]
+    images = [
+        {"bbox": covered, "xref": 11, "width": 245, "height": 112,
+         "digest": b"\x01" * 16, "has-mask": False,
+         "transform": (186.18, 0.0, 0.0, 84.24, 56.7, 107.76)},
+        {"bbox": screenshot, "xref": 12, "width": 561, "height": 390,
+         "digest": b"\x02" * 16, "has-mask": False,
+         "transform": (312.72, 0.0, 0.0, 216.06, 246.54, 305.7)},
+    ]
+    plan = _plan([_page_dict(1, "x" * 120, page_boxes)],
+                 _FakeDoc([_FakePage(images=images)]), tmp_path, name="p24.pdf")
+
+    boxes = [c.bbox for c in plan.candidates if c.kind == fe.KIND_RASTER]
+    assert any(box == pytest.approx(screenshot) for box in boxes), (
+        f"只存在於 image_info 的大型截圖沒有候選 {boxes} "
+        f"{plan.stats['deferred_to_legacy_lane']}")
+    assert plan.stats["unconsumed_raster"] == [], plan.stats["unconsumed_raster"]
+    # 已被 picture box 收錄的那一張不得再多一個候選（重複送 VL、重複入庫）
+    assert not any(box == pytest.approx(covered) for box in boxes), boxes
+
+
+@pytest.mark.smoke
+def test_unconsumed_raster_is_reported_when_nothing_can_take_it(tmp_path: Path):
+    """沒有 consumer 的 raster 一定要現形，不得只留在 `deferred_to_legacy_lane`。
+
+    `deferred_to_legacy_lane` 只是 planner 的 disposition。這條用「大到算得上一張圖、
+    但因為與既有候選重疊而被 defer」的 image_info 反向確認：只要它沒有被任何 admitted
+    候選蓋住，就必須出現在 `unconsumed_raster` 與 preflight 報告裡。
+    """
+    orphan = (300.0, 300.0, 560.0, 520.0)
+    page_boxes = [{"class": "picture", "bbox": (60, 60, 260, 260)}]
+    images = [{"bbox": orphan, "xref": 12, "width": 80, "height": 60,
+               "digest": b"\x02" * 16, "has-mask": False,
+               "transform": (260.0, 0.0, 0.0, 220.0, 300.0, 300.0)}]
+    monkey_plan = _plan([_page_dict(1, "x" * 120, page_boxes)],
+                        _FakeDoc([_FakePage(images=images)]), tmp_path,
+                        name="orphan.pdf")
+    boxes = [c.bbox for c in monkey_plan.candidates]
+    assert any(box == pytest.approx(orphan) for box in boxes), boxes
+    # 這份 fixture 兩張圖都收得到；契約是「沒收到就得列帳」，所以列帳集合必須是空的，
+    # 而且 preflight 的鍵必須存在（缺鍵＝報告永遠不會提這件事）。
+    assert monkey_plan.preflight["unconsumed_raster"] == 0
+    assert monkey_plan.stats["unconsumed_raster"] == []
 
 
 # ============================================================
@@ -454,16 +606,25 @@ def test_kind_unknown_only_means_table_vs_terminal(monkeypatch):
 
 
 @pytest.mark.smoke
-def test_diagram_kind_candidates_are_deferred_to_legacy_lane(tmp_path: Path):
-    """向量圖（大量非直線圖元、無文字）→ 延後給 legacy picture lane，並記 reason slug。"""
+def test_diagram_kind_candidates_never_claim_to_be_table_or_terminal(tmp_path: Path):
+    """向量圖（大量非直線圖元、無文字）不得被硬套成 table / terminal。
+
+    79ef673 之前這種頁一律 defer 給 legacy 的自由文字 lane；現在它走受監督的
+    `KIND_RASTER`（先分類再套 schema）。**沒有變的**是這條：diagram 分數贏過
+    table/terminal 時，`_route_kind()` 必須先把它踢出 structured kind，並留下
+    `kind_diagram_legacy_lane` / `raster_component_reclassified` 之類的 reason slug——
+    否則它會頂著「這是一張表」的身分進 dual pass。
+    """
     shapes = [(100 + i * 3, 100 + i * 3, 140 + i * 3, 150 + i * 3) for i in range(12)]
     page = _FakePage(drawings=shapes + [(100, 100, 400, 101), (100, 200, 400, 201),
                                         (100, 300, 400, 301), (100, 100, 101, 300),
                                         (400, 100, 401, 300)])
     plan = _plan([_page_dict(1, "figure page")], _FakeDoc([page]), tmp_path)
     reasons = {entry["reason"] for entry in plan.stats["deferred_to_legacy_lane"]}
-    assert plan.candidates == []
-    assert reasons & {"kind_diagram_legacy_lane", "raster_no_structural_evidence"}, reasons
+    assert reasons & {"kind_diagram_legacy_lane", "raster_component_reclassified",
+                      "raster_no_structural_evidence"}, reasons
+    assert all(c.kind == fe.KIND_RASTER for c in plan.candidates), [
+        (c.kind, c.bbox, c.reasons) for c in plan.candidates]
 
 
 # ============================================================
@@ -898,8 +1059,16 @@ def test_duplicate_figures_keep_own_evidence_and_share_only_vl(tmp_path: Path):
 # smoke：§19.3 duplicate 的共享鍵與「preflight 數字 == 真實呼叫數」
 # ============================================================
 def _hex_rows_words(top=100.0, pitch=16.0, xs=(72.0, 170.0, 270.0)):
-    """table 與 terminal 分數接近的內容 → `KIND_UNKNOWN`（走 dual pass）。"""
-    rows = [("0x4000_0100", "RW", "clk"), ("0x4000_0104", "RO", "sts"),
+    """table 與 terminal 分數接近的內容 → `KIND_UNKNOWN`（走 dual pass）。
+
+    ★ 第一列第三格刻意是 `INFO`：`_route_kind()` 只看分數差距，但 79ef673 之後還有
+    一層正向訊號解歧——只有 **table 與 terminal 訊號同時成立**時 kind 才留在
+    `unknown`。少了這個 log level token，這個 fixture 會被判成純 table，下面四條
+    dual-pass 契約測試就會在「測試前提」那一行掛掉，而**真正的 dual pass 路徑完全
+    沒有被測到**。內容語意也對得上：一份帶 log level 欄的 register dump 本來就是
+    table / terminal 難分的典型。
+    """
+    rows = [("0x4000_0100", "RW", "INFO"), ("0x4000_0104", "RO", "sts"),
             ("0x4000_0108", "RW", "en")]
     words = []
     for row_index, row in enumerate(rows):
@@ -1000,11 +1169,11 @@ def _vl_stub_script():
     table = json.dumps({
         "columns": [{"label": "Address"}, {"label": "Mode"}, {"label": "Desc"}],
         "rows": [{"cells": [{"text": text, "state": "observed"} for text in row]}
-                 for row in (("0x4000_0100", "RW", "clk"), ("0x4000_0104", "RO", "sts"),
+                 for row in (("0x4000_0100", "RW", "INFO"), ("0x4000_0104", "RO", "sts"),
                              ("0x4000_0108", "RW", "en"))],
         "footnotes": []})
     terminal = json.dumps({"lines": [
-        {"text": "0x4000_0100 RW clk", "uncertain_spans": []},
+        {"text": "0x4000_0100 RW INFO", "uncertain_spans": []},
         {"text": "0x4000_0104 RO sts", "uncertain_spans": []},
         {"text": "0x4000_0108 RW en", "uncertain_spans": []}]})
     return {"figure_table": table, "figure_terminal": terminal}
@@ -1138,6 +1307,53 @@ def test_preflight_budget_brackets_real_vl_call_count(label, retries, tmp_path: 
     if expected_kind == fe.KIND_UNKNOWN:
         assert len(calls) == profile["max"] == 2 * tiles, (
             f"dual pass 恰好 table/terminal 各一次，不重試也不取第二樣本 {calls}")
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("retries", [0, 1])
+def test_raster_preflight_min_is_a_real_lower_bound(retries, tmp_path: Path, monkeypatch):
+    """★ `vl_calls_min` 必須真的是下界（question.md P1）。
+
+    `KIND_RASTER` 的舊公式是 `1 + 2T`（分類一次 + 雙樣本），但
+    `figure_verify._run_vl_lane()` 對解成 `diagram` 的圖帶的是 `second_sample=False`，
+    所以整份都是 diagram 的 PDF 真實呼叫數會**小於**宣稱的「最少」——實測
+    `example1.pdf` 宣稱 54、實際 40。名為 min 卻不是下界，成本 / timeout 判讀就會失準，
+    而且「實際落在 [min, max] 內」這條契約永遠測不出來。
+    """
+    figure_verify = pytest.importorskip("figure_verify", reason="T4 尚未交付")
+    monkeypatch.setattr(config, "FIGURE_EXTRACT_RETRIES", retries)
+
+    page_boxes = [{"class": "picture", "bbox": (100, 100, 460, 400)}]
+    plan = _plan([_page_dict(1, "x" * 120, page_boxes)], _FakeDoc([_FakePage()]),
+                 tmp_path, name=f"rasterbound-{retries}.pdf")
+    assert len(plan.candidates) == 1, [(c.kind, c.bbox) for c in plan.candidates]
+    candidate = plan.candidates[0]
+    assert candidate.kind == fe.KIND_RASTER, candidate.kind
+    tiles = len(candidate.signals["tile_plan"]["tiles"])
+    profile = fc._vl_profile(candidate)
+    assert profile["min"] == 1 + tiles, profile
+    assert profile["max"] == (1 + retries) + 2 * tiles * (1 + retries), profile
+    assert plan.preflight["vl_calls_min"] == profile["min"]
+    assert plan.preflight["vl_calls_max"] == profile["max"]
+
+    script = dict(_vl_stub_script())
+    script["figure_raster_kind_v1"] = json.dumps({"kind": "diagram"})
+    script["figure_diagram"] = json.dumps({
+        "title": "block diagram", "labels": ["host", "device"],
+        "components": [{"name": "host", "desc": "left"},
+                       {"name": "device", "desc": "right"}],
+        "relations": [{"src": "host", "dst": "device", "desc": "link"}],
+        "values": []})
+    calls: list[str] = []
+    _install_vl_stub(monkeypatch, figure_verify, calls=calls, script=script)
+    figure_verify.extract_document_figures(
+        plan, pdf_doc=None, page_evidence=plan.page_evidence,
+        vl_base_url="http://127.0.0.1:8083", vl_model="vl", render_variants=_stub_render)
+
+    assert calls == ["figure_raster_kind_v1"] + ["figure_diagram"] * tiles, calls
+    assert profile["min"] <= len(calls) <= profile["max"], (
+        f"實際 {len(calls)} 次不在 preflight 宣稱的 "
+        f"[{profile['min']}, {profile['max']}] 內 {calls}")
 
 
 @pytest.mark.smoke
@@ -1703,13 +1919,19 @@ def test_preflight_report_lists_dropped_and_deferred_exactly(tmp_path: Path, mon
                      images=[{"bbox": (400, 600, 560, 720), "xref": 3, "width": 40,
                               "height": 30, "digest": b"\x02" * 16, "has-mask": False,
                               "transform": (160.0, 0.0, 0.0, 120.0, 400.0, 600.0)}])
-    plan = _plan([_page_dict(1, "mixed")], _FakeDoc([page]), tmp_path)
+    # 角落的 20x20pt 圖示：太小不值得一次 VL → 必然落在「已延後」那一段報告裡。
+    boxes = ({"class": "picture", "bbox": (500, 40, 520, 60)},)
+    plan = _plan([_page_dict(1, "mixed", boxes)], _FakeDoc([page]), tmp_path)
     report = fc.format_preflight_report(plan)
 
     dropped = plan.stats["dropped_candidates"]
-    assert len(dropped) == 1, "測試前提：真的要有被丟掉的候選"
-    assert "被丟棄的候選（不無聲截斷）：1" in report
-    assert f"第 {dropped[0]['page']} 頁" in report and dropped[0]["reason"] in report
+    # 每頁上限 1，而這頁有 table / terminal / raster 三個候選 → 兩個被丟。
+    assert len(dropped) == 2, ("測試前提：真的要有被丟掉的候選", dropped)
+    assert "被丟棄的候選（不無聲截斷）：2" in report
+    for entry in dropped:
+        # **逐筆**都要在報告裡，不是只有第一筆——這條守的就是「不無聲截斷」。
+        assert f"第 {entry['page']} 頁 bbox={entry['bbox']}" in report, (entry, report)
+        assert entry["reason"] in report
 
     deferred = plan.stats["deferred_to_legacy_lane"]
     assert deferred, "測試前提：真的要有被延後給 legacy lane 的區域"
@@ -1987,12 +2209,15 @@ def test_cropbox_words_table_and_render_bbox_are_cropbox_relative(tmp_path: Path
         doc.close()
 
 
-def test_legacy_contract_pdf_yields_zero_structured_candidates(tmp_path: Path):
+def test_legacy_contract_pdf_promotes_pictures_as_raster_only(tmp_path: Path):
     """完整重建 `tests/test_rag_pdf_ingest.py::test_real_pymupdf4llm_contract` 的 PDF。
 
-    那條測試斷言 legacy lane 送出 **3 次** VL、figure 頁 `{2,3,4}`。只要這裡冒出任何
-    structured 候選，T7 的「IoU 跳過已被 structured 覆蓋的 picture 框」就會讓它變紅，
-    而 Gate 0 的刻意變更清單沒有它（契約 §13.1）。
+    79ef673 起這些純圖片頁**會**產生候選，但只能是 `KIND_RASTER`：先用 image-bound
+    schema 分類，再走同一套 canonical payload / strict gate。這條守兩件事：
+
+    1. 沒有任何候選頂著 table / terminal 的身分（那會直接進 dual pass 抽逐格內容）。
+    2. 太小的 picture（12x12pt 的角落圖示）不得升格——它同時也是 legacy lane 的
+       `_pdf_bbox_big_enough` 會濾掉的那一張，兩邊門檻必須一致。
     """
     fz = _fz()
     _p4l()
@@ -2022,16 +2247,24 @@ def test_legacy_contract_pdf_yields_zero_structured_candidates(tmp_path: Path):
     doc.close()
 
     plan, _doc, _pages = _plan_real(pdf, tmp_path)
-    assert plan.candidates == [], [(c.page, c.kind, c.reasons) for c in plan.candidates]
-    assert plan.preflight["vl_calls_max"] == 0
-    reasons = {e["reason"] for e in plan.stats["deferred_to_legacy_lane"]}
-    assert reasons <= {"picture_only", "raster_no_structural_evidence",
-                       "page_fallback_no_structural_evidence", "kind_diagram_legacy_lane"}, reasons
-    assert any(e["page"] == 2 for e in plan.stats["deferred_to_legacy_lane"])
+    assert plan.candidates, "純圖片頁不得再掉回自由文字 lane"
+    assert all(c.kind == fe.KIND_RASTER for c in plan.candidates), [
+        (c.page, c.kind, c.reasons) for c in plan.candidates]
+    assert {c.page for c in plan.candidates} == {2, 3, 4, 5}, [
+        (c.page, c.bbox) for c in plan.candidates]
+    # 角落的 12x12pt 圖示（`tiny`）在第 3 頁：不得成為候選，也不得被併進 `big`。
+    for candidate in plan.candidates:
+        assert not (candidate.bbox[0] >= tiny[0] - 1 and candidate.bbox[2] <= tiny[2] + 1)
+        if candidate.page == 3:
+            assert candidate.bbox[2] < tiny[0], (candidate.bbox, tiny)
+    assert plan.stats["unconsumed_raster"] == [], plan.stats["unconsumed_raster"]
 
 
 def test_near_textless_page_records_fallback_but_claims_nothing(tmp_path: Path):
-    """近乎無文字頁：`fallback` 要記下來，但**不得**因此宣稱有 table/terminal。"""
+    """近乎無文字頁：`fallback` 要記下來，但**不得**因此宣稱有 table/terminal。
+
+    掃描頁該被讀（79ef673 起走受監督的 `KIND_RASTER`），但那是「先分類再套 schema」，
+    不是 planner 直接判它是一張表。"""
     fz = _fz()
     pdf = tmp_path / "scan.pdf"
     doc = fz.open()
@@ -2045,8 +2278,11 @@ def test_near_textless_page_records_fallback_but_claims_nothing(tmp_path: Path):
     evidence = plan.page_evidence[1]
     assert evidence.fallback["reason"] == "near_zero_text"
     assert evidence.fallback["bbox"] == evidence.page_rect
-    assert plan.candidates == []
-    assert plan.stats["deferred_to_legacy_lane"]
+    assert plan.candidates, "整頁掃描圖不得無人接手"
+    assert all(c.kind == fe.KIND_RASTER for c in plan.candidates), [
+        (c.kind, c.reasons) for c in plan.candidates]
+    assert all(c.native_table is None and c.signals["native_lane"] is False
+               for c in plan.candidates)
 
 
 def test_tiles_cut_on_band_gaps_with_overlap_and_stitch_evidence(tmp_path: Path, monkeypatch):
