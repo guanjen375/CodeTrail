@@ -1332,7 +1332,9 @@ def test_raster_preflight_min_is_a_real_lower_bound(retries, tmp_path: Path, mon
     tiles = len(candidate.signals["tile_plan"]["tiles"])
     profile = fc._vl_profile(candidate)
     assert profile["min"] == 1 + tiles, profile
-    assert profile["max"] == (1 + retries) + 2 * tiles * (1 + retries), profile
+    # 上界含「猜錯 kind 時多一輪 diagram 退路」的 T(1+R)：raster 的 kind 是分類器猜的，
+    # 猜錯不該讓整份 PDF 零寫入（見 test_raster_classified_as_table_falls_back_...）。
+    assert profile["max"] == (1 + retries) + 3 * tiles * (1 + retries), profile
     assert plan.preflight["vl_calls_min"] == profile["min"]
     assert plan.preflight["vl_calls_max"] == profile["max"]
 
@@ -1354,6 +1356,84 @@ def test_raster_preflight_min_is_a_real_lower_bound(retries, tmp_path: Path, mon
     assert profile["min"] <= len(calls) <= profile["max"], (
         f"實際 {len(calls)} 次不在 preflight 宣稱的 "
         f"[{profile['min']}, {profile['max']}] 內 {calls}")
+
+
+@pytest.mark.smoke
+def test_raster_classified_as_table_falls_back_when_there_is_no_table(
+    tmp_path: Path, monkeypatch
+):
+    """★ 分類器猜錯 kind，不該讓整份 PDF 零寫入（2026-08-24 實際踩到）。
+
+    純掃描的 PDF 每一頁都是一張圖，raster 分類器得替它猜 table / terminal /
+    diagram。實際案例：一頁**純文字**（章節標題 + 編號清單 + URL，上面根本沒有
+    表格）被猜成 `table`，VL 於是誠實地回 `columns=0, rows=0` —— 那是**正確答案**，
+    卻被當成 `empty_payload` 硬失敗，整份 19 頁的 PDF 因此一個字都進不了 KB。
+
+    關鍵區別:純 raster 的 kind 是**我們猜的**，不是文件宣告的。猜錯的代價不該是
+    整份零寫入,而是改用 diagram（自由文字）再抽一次。原生表格（`find_tables`
+    的幾何說「這裡有表」）回空 payload 仍然是硬失敗——那才是真的抽取壞掉。
+    """
+    figure_verify = pytest.importorskip("figure_verify")
+
+    page_boxes = [{"class": "picture", "bbox": (100, 100, 460, 400)}]
+    plan = _plan([_page_dict(1, "x" * 120, page_boxes)], _FakeDoc([_FakePage()]),
+                 tmp_path, name="text-page-as-table.pdf")
+    candidate = plan.candidates[0]
+    assert candidate.kind == fe.KIND_RASTER, candidate.kind
+
+    script = dict(_vl_stub_script())
+    script["figure_raster_kind_v1"] = json.dumps({"kind": "table"})   # 猜成 table
+    script["figure_table"] = json.dumps({"columns": [], "rows": [], "footnotes": []})
+    script["figure_diagram"] = json.dumps({
+        "title": "1.1. NPX - Core control & Core status",
+        "labels": ["u-boot", "NPX firmware code"],
+        "components": [{"name": "u-boot", "desc": "branch npx-vpx"}],
+        "relations": [], "values": []})
+    calls: list[str] = []
+    _install_vl_stub(monkeypatch, figure_verify, calls=calls, script=script)
+
+    results = list(figure_verify.extract_document_figures(
+        plan, pdf_doc=None, page_evidence=plan.page_evidence,
+        vl_base_url="http://127.0.0.1:8083", vl_model="vl",
+        render_variants=_stub_render))
+
+    assert results, "猜錯 kind 不得讓整份 PDF 零寫入"
+    figure = results[0]
+    assert figure.kind == fe.KIND_DIAGRAM, f"應退回 diagram，實際 {figure.kind}"
+    assert figure.payload, "退回之後要有可入庫的 payload"
+    assert "raster_kind_reclassified" in figure.reasons, figure.reasons
+    assert figure.verification_status != fe.VERIF_HUMAN
+    assert "figure_diagram" in calls, calls
+
+
+@pytest.mark.smoke
+def test_a_broken_table_extraction_still_fails_the_document(tmp_path: Path, monkeypatch):
+    """對照組:**抽壞了**仍然是硬失敗,這條界線一步都不能讓。
+
+    退路只給 `empty_payload`（模型說「這裡沒有表」＝ kind 判錯）。`row_width` 這種
+    是模型確實抽到了東西、但格數對不上 —— 那是真的抽壞,放進 KB 會變成一張錯的表。
+    其餘 truncated / schema / line_contract / canonicalize / validator 同理。
+    """
+    figure_verify = pytest.importorskip("figure_verify")
+
+    plan = _plan([_page_dict(1, "x" * 120)], _FakeDoc([_lane_page("known_unanchored")]),
+                 tmp_path, name="broken-table.pdf")
+    candidate = plan.candidates[0]
+    assert candidate.kind == fe.KIND_TABLE, candidate.kind
+
+    script = dict(_vl_stub_script())
+    script["figure_table"] = json.dumps({
+        "columns": [{"label": "Address"}, {"label": "Mode"}],
+        "rows": [{"cells": [{"text": "0x4000_0100", "state": "observed"}]}],   # 少一格
+        "footnotes": []})
+    calls: list[str] = []
+    _install_vl_stub(monkeypatch, figure_verify, calls=calls, script=script)
+
+    with pytest.raises(fe.FigureExtractionError, match="row_width"):
+        list(figure_verify.extract_document_figures(
+            plan, pdf_doc=None, page_evidence=plan.page_evidence,
+            vl_base_url="http://127.0.0.1:8083", vl_model="vl",
+            render_variants=_stub_render))
 
 
 @pytest.mark.smoke

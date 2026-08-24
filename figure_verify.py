@@ -4636,13 +4636,38 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
             _grid_normalized_variants(variants, ctx)
             if resolved == figure_extract.KIND_TABLE else variants
         )
-        result = _vl_result_for_kind(
-            candidate, evidence, resolved, extraction_variants, ctx,
-            allow_retry=True,
-            # table / terminal 的逐格逐行內容要做第二樣本 disagreement；非目標 diagram
-            # 保持 unverified 單樣本，避免不相干圖片的描述差異拖垮整份 PDF。
-            second_sample=(resolved != figure_extract.KIND_DIAGRAM),
-        )
+        reclassified_from = ""
+        try:
+            result = _vl_result_for_kind(
+                candidate, evidence, resolved, extraction_variants, ctx,
+                allow_retry=True,
+                # table / terminal 的逐格逐行內容要做第二樣本 disagreement；非目標 diagram
+                # 保持 unverified 單樣本，避免不相干圖片的描述差異拖垮整份 PDF。
+                second_sample=(resolved != figure_extract.KIND_DIAGRAM),
+            )
+        except _SampleFailure as exc:
+            # **kind 猜錯不等於抽取壞掉。** 純 raster 的 kind 是 image-bound 分類器
+            # 猜的，不是文件宣告的：掃描 PDF 的每一頁都是一張圖，一頁純文字被猜成
+            # table，模型回「columns=0, rows=0」其實是**正確答案**。以前這會被當成
+            # empty_payload 硬失敗，於是一次猜錯就讓整份 PDF 零寫入（2026-08-24 實際
+            # 踩到：19 頁的規格書卡在第 3 頁的一頁文字）。
+            #
+            # 猜錯的正確處置是換一種猜法：改用 diagram（自由文字 schema）再抽一次。
+            # 只有「文件自己的幾何說這裡有表」（非 raster 的 KIND_TABLE / KIND_TERMINAL）
+            # 回空 payload 才是真的抽取壞掉，那條界線不動。
+            if exc.slug != "empty_payload" or resolved == figure_extract.KIND_DIAGRAM:
+                raise
+            reclassified_from = resolved
+            resolved = figure_extract.KIND_DIAGRAM
+            classification = {**classification, "kind": resolved,
+                              "reclassified_from": reclassified_from,
+                              "reclassified_reason": exc.slug}
+            print(f"  [INFO] {ctx.get('where', '')}: 分類成 {reclassified_from} 但抽不到"
+                  f"任何內容（{exc.detail}）；改以 diagram 重抽", flush=True)
+            result = _vl_result_for_kind(
+                candidate, evidence, resolved, variants, ctx,
+                allow_retry=True, second_sample=False,
+            )
         evidence_dict = dict(result.evidence)
         evidence_dict["raster_classification"] = dict(classification)
         # classifier 實際看過原始 variant；table extractor 則可能看 `+grid`。兩者都是
@@ -4652,13 +4677,18 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
             *list(result.variants or []),
         ])
         actual_variant_ids = [variant_id for variant_id in actual_variant_ids if variant_id]
+        extra_reasons = ["raster_kind_classified"]
+        extra_details = [f"純 raster 以 image-bound schema 分類為 {resolved}"]
+        if reclassified_from:
+            extra_reasons.append("raster_kind_reclassified")
+            extra_details.append(
+                f"先分類為 {reclassified_from}，但那個 schema 抽不到任何內容"
+                f"（分類猜錯，不是抽取失敗）；改以 {resolved} 重抽"
+            )
         result = replace(
             result,
-            reasons=_ordered_unique(["raster_kind_classified", *result.reasons]),
-            reason_details=_ordered_unique([
-                f"純 raster 以 image-bound schema 分類為 {resolved}",
-                *result.reason_details,
-            ]),
+            reasons=_ordered_unique([*extra_reasons, *result.reasons]),
+            reason_details=_ordered_unique([*extra_details, *result.reason_details]),
             verification_status=figure_extract.worst_verification([
                 result.verification_status, figure_extract.VERIF_UNVERIFIED,
             ]),
@@ -4670,8 +4700,40 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
             snapshot["raster_classification"] = dict(classification)
         return result
     if kind != figure_extract.KIND_UNKNOWN:
-        return _vl_result_for_kind(candidate, evidence, kind, variants, ctx,
-                                   allow_retry=True, second_sample=True)
+        try:
+            return _vl_result_for_kind(candidate, evidence, kind, variants, ctx,
+                                       allow_retry=True, second_sample=True)
+        except _SampleFailure as exc:
+            # 與上面 raster 分支同一條理由:**kind 猜錯不等於抽取壞掉**。
+            #
+            # 走到 VL lane 的 kind 一律是**推論**出來的(原生表格走 native lane,
+            # 根本不呼叫 VL)。實測案例:一頁純文字因為編號清單與縮排形成對齊的
+            # 文字帶,被 planner 判成 table 且 `anchored=True`,模型於是誠實地回
+            # 「columns=0, rows=0」——那是正確答案,卻讓整份 19 頁的 PDF 零寫入。
+            # `native_table` / `anchored` 都分不出「真的有表」與「判錯」,唯一知道
+            # 真相的是看過圖的模型本身。所以 `empty_payload` 一律當成 kind 判錯,
+            # 改用 diagram 重抽;**其餘失敗種類(truncated / schema / row_width /
+            # line_contract / canonicalize / validator)全部維持硬失敗**——那些才是
+            # 真的抽壞了,放進 KB 會變成錯的表。
+            if exc.slug != "empty_payload" or kind == figure_extract.KIND_DIAGRAM:
+                raise
+            print(f"  [INFO] {ctx.get('where', '')}: 判成 {kind} 但模型說這裡沒有內容"
+                  f"（{exc.detail}）；視為 kind 判錯，改以 diagram 重抽", flush=True)
+            result = _vl_result_for_kind(
+                candidate, evidence, figure_extract.KIND_DIAGRAM, variants, ctx,
+                allow_retry=True, second_sample=False)
+            return replace(
+                result,
+                reasons=_ordered_unique(["raster_kind_reclassified", *result.reasons]),
+                reason_details=_ordered_unique([
+                    f"先判為 {kind}，但模型在那個 schema 下抽不到任何內容"
+                    f"（kind 判錯，不是抽取失敗）；改以 diagram 重抽",
+                    *result.reason_details,
+                ]),
+                verification_status=figure_extract.worst_verification([
+                    result.verification_status, figure_extract.VERIF_UNVERIFIED,
+                ]),
+            )
 
     # KIND_UNKNOWN：table、terminal 各**一個** logical pass（不重試、不再取第二次
     # 樣本）。契約 §12.2 明定每個 kind 最多一次 attempt；勝出的 kind 再打一次

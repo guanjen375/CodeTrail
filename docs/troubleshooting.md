@@ -645,8 +645,8 @@ top-level `image_data` 可能被新版 llama.cpp 靜默忽略，造成模型只�
 |---|---|---|
 | `candidates` | `FIGURE_MAX_CANDIDATES_PER_DOC` / `FIGURE_MAX_CANDIDATES_PER_PAGE` | 200 / 12 |
 | `tiles` | `FIGURE_MAX_TILES_PER_CANDIDATE` | 8 |
-| `vl_calls_max` | `FIGURE_MAX_VL_CALLS_PER_DOC` | 120 |
-| `image_tokens_est` | `FIGURE_MAX_IMAGE_TOKENS_PER_DOC` / `FIGURE_MAX_IMAGE_TOKENS_PER_CALL` | 200000 / 4096 |
+| `vl_calls_max` | `FIGURE_MAX_VL_CALLS_PER_DOC` | 200 |
+| `image_tokens_est` | `FIGURE_MAX_IMAGE_TOKENS_PER_DOC` / `FIGURE_MAX_IMAGE_TOKENS_PER_CALL` | 400000 / 4096 |
 
 > 這些欄位涵蓋所有結構化候選，包含純 raster 的分類、雙樣本抽取與 image-token 估算。
 > 只有未被結構化候選覆蓋的舊自由文字 picture 相容 job 不受這些上限判定；若存在，

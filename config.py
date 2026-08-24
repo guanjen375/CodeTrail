@@ -260,16 +260,26 @@ FIGURE_MAX_CANDIDATES_PER_PAGE = _figure_int(
     "AICODE_FIGURE_MAX_CANDIDATES_PER_PAGE", "12", lo=1)
 FIGURE_MAX_CANDIDATES_PER_DOC = _figure_int(
     "AICODE_FIGURE_MAX_CANDIDATES_PER_DOC", "200", lo=1)
+# 2026-08-24 從 120 提到 200:raster 的上界公式因為新增「猜錯 kind 時多一輪 diagram
+# 退路」而從 (1+R)+2T(1+R) 變成 +T(1+R)(整整多 50%)。閘沒跟著調的話,原本剛好在
+# 預算內的文件會突然被擋下——而那一輪退路正是為了讓它們**進得去**才加的。
 FIGURE_MAX_VL_CALLS_PER_DOC = _figure_int(
-    "AICODE_FIGURE_MAX_VL_CALLS_PER_DOC", "120", lo=0)
+    "AICODE_FIGURE_MAX_VL_CALLS_PER_DOC", "200", lo=0)
 FIGURE_MAX_TILES_PER_CANDIDATE = _figure_int(
     "AICODE_FIGURE_MAX_TILES_PER_CANDIDATE", "8", lo=1)
 # 單次呼叫與整份文件的 image-token 預算。真值依 server/模型而異,preflight
 # 用 FIGURE_IMAGE_TOKEN_PATCH_PX 的 patch 估算(估算值,不是保證)。
+#
+# per-doc 的預設值 2026-08-24 從 200000 提到 400000。原因:VL 呼叫上限
+# (FIGURE_MAX_VL_CALLS_PER_DOC=120)× 單次上限(4096)＝ 491520,也就是呼叫數這道
+# 閘本來就允許到將近 50 萬 token;200000 比它緊一倍以上,於是**一般的規格書就會
+# 被 token 閘先擋下**——實測 19 頁 / 23 個圖片候選的 datasheet 是 221860,
+# 51 頁 / 32 個候選是 110196。400000 仍然低於 491520,所以它還是一道真的第二
+# 防線(擋圖特別大的病態文件),只是不再對正常文件誤擊。
 FIGURE_MAX_IMAGE_TOKENS_PER_CALL = _figure_int(
     "AICODE_FIGURE_MAX_IMAGE_TOKENS_PER_CALL", "4096", lo=1)
 FIGURE_MAX_IMAGE_TOKENS_PER_DOC = _figure_int(
-    "AICODE_FIGURE_MAX_IMAGE_TOKENS_PER_DOC", "200000", lo=1)
+    "AICODE_FIGURE_MAX_IMAGE_TOKENS_PER_DOC", "400000", lo=1)
 FIGURE_IMAGE_TOKEN_PATCH_PX = _figure_int(
     "AICODE_FIGURE_IMAGE_TOKEN_PATCH_PX", "28", lo=1)
 # 結構化 chunk 的字元預算。row/line 是不可分割原子:超過預算就多切一個

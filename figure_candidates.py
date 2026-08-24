@@ -2650,7 +2650,7 @@ def _vl_profile(candidate: Candidate) -> dict:
     | VL / kind 已定 / 有 anchor | — | `T` | `2T(1+R)` |
     | VL / kind 已定 / 無 anchor | 需 disagreement detection | `2T` | `2T(1+R)` |
     | VL / KIND_UNKNOWN | dual pass 每 kind 一次、不重試、不取第二樣本 | `2T` | `2T` |
-    | VL / KIND_RASTER | 分類一次，再對勝出 kind 抽取 | `1+T` | `(1+R)+2T(1+R)` |
+    | VL / KIND_RASTER | 分類一次，再對勝出 kind 抽取（猜錯 kind 時多一輪 diagram 退路） | `1+T` | `(1+R)+2T(1+R)+T(1+R)` |
 
     `T` = tile 數、`R` = `config.FIGURE_EXTRACT_RETRIES`。
 
@@ -2709,7 +2709,11 @@ def _vl_profile(candidate: Candidate) -> dict:
         # [min, max] 內」這條契約永遠測不出來。上界維持雙樣本 + 重試的最壞情況。
         classifier_tokens = tokens[0] if tokens else 0
         min_calls = 1 + tiles
-        max_calls = (1 + retries) + 2 * tiles * (1 + retries)
+        # 上界維持雙樣本 + 重試的最壞情況，**再加一輪 diagram 退路**：分類器猜成
+        # table / terminal 但那個 schema 抽不到任何內容時，`_run_vl_lane()` 會改用
+        # diagram 重抽一次（kind 是我們猜的，猜錯不該讓整份 PDF 零寫入）。少算這一輪
+        # 的話，預算閘會在**跑完宣稱的 max 之後**才於 runtime 中止，正是這張表要防的事。
+        max_calls = (1 + retries) + 2 * tiles * (1 + retries) + tiles * (1 + retries)
         return {
             "tiles": tiles,
             "min": min_calls,

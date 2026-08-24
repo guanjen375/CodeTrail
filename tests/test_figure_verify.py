@@ -375,15 +375,41 @@ def test_row_width_mismatch_is_fail_loud(monkeypatch):
         (figure_extract.KIND_TERMINAL, "figure_terminal", terminal_json([])),
     ],
 )
-def test_empty_payload_is_fail_loud(monkeypatch, kind, schema_name, text):
-    """空 payload 等於宣稱「這張圖沒有內容」，不得入庫。"""
-    spy = VLSpy({schema_name: text})
+def test_empty_payload_never_enters_the_kb_and_falls_back_to_diagram(
+    monkeypatch, kind, schema_name, text
+):
+    """空 payload 等於宣稱「這張圖沒有內容」，**不得入庫**——這一句沒有變。
+
+    變的是後果。2026-08-24 實測:走 VL lane 的 kind 一律是**推論**出來的(原生表格
+    走 native lane，根本不呼叫 VL)。一頁純文字因為編號清單與縮排形成對齊的文字帶，
+    被 planner 判成 table，模型於是誠實地回 `columns=0, rows=0` —— 那是**正確答案**，
+    舊規則卻把它當成抽取失敗、讓整份 19 頁的 PDF 零寫入。實際文件裡這種誤判有 10 處。
+
+    `native_table` / `anchored` 都分不出「真的有表」與「判錯」，唯一知道真相的是看過
+    圖的模型本身。所以 `empty_payload` 一律當成 kind 判錯，改以 diagram(自由文字
+    schema)重抽，並在 reasons 留下 `raster_kind_reclassified`。空 payload 本身仍然
+    一個欄位都沒有進 KB。
+
+    **其餘失敗種類全部維持硬失敗**(truncated / schema / row_width / line_contract /
+    canonicalize / validator)——那些是模型確實抽到了東西但抽壞了，見
+    `test_row_width_mismatch_is_fail_loud` 與同組的其他測試。
+    """
+    spy = VLSpy({schema_name: text, "figure_diagram": json.dumps({
+        "title": "a page of prose", "labels": ["section 1.1"],
+        "components": [{"name": "section 1.1", "desc": "test procedure"}],
+        "relations": [], "values": []})})
     install_vl(monkeypatch, spy)
     pass_probe(monkeypatch)
 
-    with pytest.raises(figure_extract.FigureExtractionError) as excinfo:
-        extract([candidate(kind=kind)], {4: page_evidence()})
-    assert "empty_payload" in str(excinfo.value)
+    result = extract([candidate(kind=kind)], {4: page_evidence()})[0]
+
+    assert result.kind == figure_extract.KIND_DIAGRAM, result.kind
+    assert result.payload, "退回之後要有可入庫的 payload"
+    assert "raster_kind_reclassified" in result.reasons, result.reasons
+    # 空 payload 的欄位一個都沒進來
+    assert "columns" not in result.payload and "lines" not in result.payload
+    assert result.verification_status in (
+        figure_extract.VERIF_UNVERIFIED, figure_extract.VERIF_NEEDS_REVIEW)
 
 
 @pytest.mark.smoke

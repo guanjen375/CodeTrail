@@ -317,6 +317,56 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
   --local-dir ~/models/qwen3.5-9b
 ```
 
+#### 灌 PDF 圖片的低標:兩件不同的事
+
+「模型跑得起來」跟「CodeTrail 願意讓它入庫」是兩回事。下面第一組是**程式層的硬性閘**
+——不滿足就直接擋下(而且是在任何 VL 呼叫與 KB 寫入之前),跟你有幾 GB VRAM 無關;
+第二組才是 VRAM 決定的**時間**。
+
+**① 程式層的硬性閘(不滿足 = 擋下,不是變慢)**
+
+| 閘 | 要求 | 不滿足會怎樣 |
+|---|---|---|
+| VL capability probe | server / 模型要真的吃圖、支援 `response_format` 的 `json_schema`、輸出不截斷、且**換一張圖輸出要跟著變** | `FigureCapabilityError`,逐項列出缺哪一項;零 VL 呼叫、零寫入 |
+| VL server `-c`(n_ctx) | 要放得下「單次 ≤ 4,096 image token + prompt + 輸出」(另保留 128) | 輸出預算被壓到很小 → 截斷 → 重試 → 最終硬失敗。**低標 `-c 8192`** |
+| 每份文件預算 | 候選 ≤ 200/份、≤ 12/頁;VL 呼叫 ≤ 200/份;tile ≤ 8/候選;image token ≤ 4,096/次、400,000/份 | `--preflight` exit 2,報告指出超出哪一項;零寫入。可用 `AICODE_FIGURE_MAX_*` 調高 |
+| MCP 工具逾時 | `ingest_document` 600 秒、preflight 180 秒 | **這條最容易咬到慢機器**:VL 慢 + 圖多 = 必然逾時。逃生門是 CLI(`python3 RAG.py <file> knowledge.json`,沒有逾時) |
+| 零部分成功 | 結構化抽取的 schema / row width / line contract / finish_reason 任一不合格 | 整份 PDF 零寫入(不會有半套錯資料進 KB)。唯一的例外是「模型說這裡沒有表」——那是 kind 判錯,會自動改用 diagram 重抽 |
+
+所以就算你只有一張小卡,只要 **VL 是真多模態 + 支援 structured output + `-c 8192`**,
+功能是完整的;差別只在下面的等待時間,而且慢到會撞 MCP 逾時的話,改走 CLI 就沒事。
+
+**② VRAM 決定的是時間(不是能不能做)**
+
+灌**純文字**(md / txt / 有文字層的 PDF)只用得到 embedding 模型(bge-m3 f16 約 1 GB
+VRAM),跟 VL 完全無關,一份文件幾秒到幾十秒。
+
+要灌**PDF 裡的圖 / 表 / 終端機畫面**才會動到 VL:結構化 lane 每張圖 1–4 次呼叫。
+同一台機器、同一顆 VL(Qwen3.6-35B-A3B Q8_K_XL,38.4 GB)、同一個請求
+(1,385 prompt token + 256 output)的實測:
+
+| VL 擺位 | prompt eval | decode | 單次呼叫 |
+|---|---|---|---|
+| 16 GB 卡 + `--cpu-moe`(experts 留在 RAM) | 145 tok/s | 33–37 tok/s | **17.5 秒** |
+| 完全放進 VRAM(跨兩張卡) | 1,647 tok/s | 102 tok/s | **3.4 秒** |
+
+prefill 差 **11 倍**,端到端差 **5 倍**。一份 19 頁 / 23 個圖片候選的規格書:放得進
+VRAM 約 10–20 分鐘,靠 `--cpu-moe` 則是 **3–4 小時**(而且必然撞上 MCP 的 600 秒,
+要改走 CLI)。
+
+抓法:`VL 模型 quant 後的大小 + 1–2 GB`(KV / compute buffer)小於**單卡可用** VRAM。
+8B Q4 約 5–6 GB → 8 GB 卡就夠;35B-A3B Q8 約 38 GB → 要 40 GB 級或跨卡。塞不下時
+`--cpu-moe` 仍然跑得動(需要等同模型大小的可用 RAM),但**先估成本再決定**:
+
+```text
+請用工具 ingest_document 對 docs/datasheet.pdf 設 preflight_only 為 True,
+回報 VL 呼叫次數。
+```
+
+拿到的「VL 呼叫 最多 N 次」乘上上表的單次秒數,就是這台機器的實際等待時間。等不起
+就換一顆放得進 VRAM 的小 VL —— 描述品質會降,但那可以用 `review_figures(...)` 人工
+覆核補回來;等三小時不行。
+
 ---
 
 ## 3. 設定與啟動:`./set_config.sh` + `~/start.sh`
