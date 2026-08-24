@@ -241,8 +241,18 @@ def seed(root: Path, *, payload=None, kind="table", ctx=False, status="unverifie
     return doc_id, fig_id, ref, kb_path
 
 
+def _cache_npz(kb_path: Path) -> Path:
+    import kb_cache
+
+    return kb_cache.cache_file(kb_path)
+
+
 def kb_bytes(kb_path: Path):
-    npz = kb_path.parent / config.KNOWLEDGE_EMB_FILE
+    # 向量在程式自管的隱藏 cache 裡（kb_cache 決定路徑）。這個 helper 是所有
+    # 「零寫入」斷言的眼睛：指錯地方它就永遠回 None，斷言會靜默失去意義。
+    import kb_cache
+
+    npz = kb_cache.cache_file(kb_path)
     return kb_path.read_bytes(), (npz.read_bytes() if npz.exists() else None)
 
 
@@ -1093,7 +1103,7 @@ def test_apply_fix_updates_payload_text_chunks_vectors_hash_status_and_summary(e
     for chunk in figure_chunks:
         assert chunk["id"] == knowledge_store.chunk_id(chunk)
         assert chunk["embedding"] == pytest.approx([0.6, 0.8])
-    matrix = np.load(kb_path.parent / config.KNOWLEDGE_EMB_FILE)["embeddings"]
+    matrix = np.load(_cache_npz(kb_path))["embeddings"]
     assert matrix.shape[0] == len(after["chunks"])
 
     # 不相干的 chunk 一個位元組都沒動
@@ -1172,7 +1182,7 @@ def test_apply_fix_recomputes_gate_vectors_for_a_contextual_kb(env):
                  confirm_against_image=True, rechunk=rechunk, embed=gate_embed)
 
     assert seen == [True]
-    data = np.load(kb_path.parent / config.KNOWLEDGE_EMB_FILE)
+    data = np.load(_cache_npz(kb_path))
     assert "embeddings_gate" in data.files
     after = RAG.load_knowledge_base(kb_path, _quiet=True)
     assert all(chunk.get("embedding_gate") for chunk in after["chunks"])

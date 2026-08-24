@@ -354,8 +354,37 @@ OpenCode command / wrapper。若它退出,最後一段 stderr 才是根因。常
   Python** 安裝 `requirements.txt`,或重跑 `set_config.sh`。
 - `[FATAL] AICODE_ROOT ...` → 必須從具體 project 目錄走 `aicode`,不可把 `/` 或 `$HOME`
   當 sandbox root。
-- `KnowledgeStoreError` → 既有 `knowledge.json` / `knowledge_emb.npz` 不相容或不完整;
-  依下一段處理。
+- `KnowledgeStoreError` → 既有 `knowledge.json` 與程式自管的 embeddings cache 不相容
+  或不完整;依下一段處理。
+
+#### KB 只有 `knowledge.json` 要管
+
+向量不是使用者要維護的檔案。它住在 `.codetrail/cache/embeddings/<kb-id>/`,由程式
+自己管:
+
+| 狀況 | 行為 |
+| --- | --- |
+| cache 不存在 | 依 `knowledge.json` 自動重建（`[INFO] embeddings cache 不存在或已過期…`） |
+| cache 的 generation / 內容雜湊 / 逐列 chunk id / model 對不上 | 舊 cache 一律丟棄並重建 |
+| 重建不了（例如 embedding server 連不上） | `[FATAL] embeddings cache 無法重建,未使用舊向量;查詢已中止。` |
+| `knowledge.json` 不存在 | KB 視為空,並清掉無主的 cache（`[INFO] knowledge.json 不存在…`） |
+| 舊版本留在 KB 旁邊的 `knowledge_emb.npz` | 完整驗證通過就遷移進 cache 再收掉;驗不過就淘汰並重建 |
+
+所以：**備份 / 複製 / 刪除知識庫只需要動 `knowledge.json`**。刪掉它就是空知識庫,
+不會有一份舊向量在旁邊讓人以為知識庫還在;把另一份 `knowledge.json` 複製過來覆蓋,
+即使 chunk 數剛好一樣也不會拿舊向量硬配（逐列 chunk id 會抓到）。cache 目錄可以隨時
+刪,下一次載入會自己長回來。
+
+要「一步到位重建成只有某一份文件」時用 fresh 模式:
+
+```bash
+python3 <CODETRAIL_REPO>/RAG.py <SOURCE_FILE> knowledge.json --fresh
+python3 <CODETRAIL_REPO>/RAG.py rebuild --kb knowledge.json <SOURCE_FILE>... --fresh
+```
+
+MCP 端對應 `ingest_document(path, fresh=True)`。它清空既有 chunks、讓舊 cache 失效、
+只留這一份文件,而且**不動** `.codetrail/figures/` 與其中的 `human_verified` 人工覆核
+資料（那是花時間換來的,不是 cache）。中途失敗會整批回滾,不會留下「新 JSON 配舊向量」。
 
 #### `KnowledgeStoreError: ... embedding model mismatch`
 
@@ -364,17 +393,19 @@ OpenCode command / wrapper。若它退出,最後一段 stderr 才是根因。常
 避免拿不同模型的向量混算;因為失敗發生在 MCP initialize 前,OpenCode 表面只看得到
 `-32000`。
 
-不要只手改 `knowledge.json` 的 `metadata.embedding_model`:伴隨的 `knowledge_emb.npz`
-也綁定 model、維度、content hash 與 generation,硬改標籤不能證明向量相容。先退出
-OpenCode,把舊 store 與 embedding cache **一起保留到不會被 commit 的備份目錄**:
+不要只手改 `knowledge.json` 的 `metadata.embedding_model`:那個欄位是 KB 對「自己是
+哪個模型建的」的宣告,硬改標籤不能證明 chunk 切法與向量相容。先退出 OpenCode,把舊
+store **保留到不會被 commit 的備份目錄**:
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
 mkdir -p .codetrail/kb-backup-<TIMESTAMP>
 mv knowledge.json .codetrail/kb-backup-<TIMESTAMP>/
-mv knowledge_emb.npz .codetrail/kb-backup-<TIMESTAMP>/        # 若存在
-mv .rag_embedding_cache.json .codetrail/kb-backup-<TIMESTAMP>/ # 若存在
 ```
+
+只要搬走 `knowledge.json` 就夠了 —— embeddings cache 是可重建資料,下一次載入時會
+自己被清掉；`.rag_embedding_cache.json`（文字→向量的增量快取）同理,留著只會讓之後
+的重建更快。
 
 如果暫時不需要文件 RAG,此時重跑 `aicode` 即可;沒有 `knowledge.json` 只代表空知識庫,
 不會阻止 MCP 連線。如果仍要查原本文件,先從備份列出來源,再用**目前設定的同一顆
@@ -392,8 +423,8 @@ python3 <CODETRAIL_REPO>/RAG.py <SOURCE_IMAGE> knowledge.json --image -y
 ```
 
 每個舊來源都重建完成後再啟動 `aicode`,用 `/status` 確認 `codetrail Connected`。
-`knowledge.json`、`knowledge_emb.npz`、embedding cache 與備份都可能含 NDA 衍生資料,
-不可 commit。
+`knowledge.json`、`.codetrail/`（含 embeddings cache 與 figure artifacts）、embedding
+cache 與備份都可能含 NDA 衍生資料,不可 commit。
 
 ### `aicode_web`: Tailscale 尚未連線 / IP 無效
 

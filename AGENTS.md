@@ -78,6 +78,8 @@
 - `agent_tools._validate_command` — run_command 白名單 + dangerous-pattern 過濾
 - `apply_patch` 的「context 必須匹配」、「max files / max lines」邏輯
 - `mcp_server.py` 啟動時 `set_sandbox_root(AICODE_ROOT, allow_external=False)`
+- `kb_cache` 的 embeddings 身分驗證（逐列 chunk id / generation / 內容雜湊 / model）
+  與「重建不了就 fail-loud、絕不沿用舊向量」——放寬它就是靜默錯答
 
 任何重構碰到上面這些東西，**新加測試**（開發者寫測試檔，執行依 §2.2 權責），
 不要直接刪 / weaken / 移除檢查點。

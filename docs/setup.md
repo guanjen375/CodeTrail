@@ -249,8 +249,8 @@ rm -rf <專案>/.codetrail/figures/<document_slug>
 
 **清掉之後的兩個後果要分清楚**:
 
-- **查詢完全不受影響**。KB(`knowledge.json` + `knowledge_emb.npz`)是 revision 的唯一真相,
-  已入庫的 chunk 與向量都還在。
+- **查詢完全不受影響**。KB(`knowledge.json`,向量是它衍生出來的 cache)是 revision 的
+  唯一真相,已入庫的 chunk 與向量都還在。
 - **覆核能力會壞掉一半**。`review_figures(action="list")` 對那幾張會降級成 `payload: (讀不到)`,
   而沒有 canonical payload 就**無法做 `fix`**。要恢復,只能 `remove_document` 之後重新
   `ingest_document` 那份 PDF。

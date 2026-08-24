@@ -112,7 +112,7 @@ aicode
 以下資料可能含 NDA 內容、使用者提問、模型回答或文件切片,都不該進 commit:
 
 - `knowledge.json`、`knowledge*.json`、`*.knowledge.json`
-- `knowledge_emb.npz`
+- `knowledge_emb.npz`(舊版本的 companion 向量檔;新版向量在 `.codetrail/` 底下)
 - `data/`、`*.jsonl`
 - `.code_rag_cache_*`、`.rag_cache/`、`.rag_embedding_cache.json`
 - `.code_rag_graph.sqlite3*`、`.code_rag_graph.lock`

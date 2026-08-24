@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 import config
+import kb_cache
 import knowledge
 import knowledge_store
 import RAG
@@ -134,7 +135,7 @@ def _kb() -> dict:
     }
 
 
-def test_incremental_restore_rejects_embedding_model_mismatch(tmp_path: Path):
+def test_incremental_restore_rejects_embedding_model_mismatch(tmp_path: Path, monkeypatch):
     path = tmp_path / config.KNOWLEDGE_FILE
     kb = _kb()
     path.write_text(
@@ -148,9 +149,16 @@ def test_incremental_restore_rejects_embedding_model_mismatch(tmp_path: Path):
         chunk_count=2,
         content_hash=RAG._chunks_content_hash(kb["chunks"]),
     )
+    # embedding server 打不通,重建一定失敗 → 唯一可接受的結果是 fail-loud
+    monkeypatch.setattr(RAG.llama_client, "embed_one",
+                        lambda **_kw: (_ for _ in ()).throw(OSError("no server")))
 
-    with pytest.raises(RuntimeError, match="embedding model"):
+    with pytest.raises(RuntimeError, match="embedding"):
         RAG.load_knowledge_base(path)
+
+    assert not (tmp_path / config.KNOWLEDGE_EMB_FILE).exists(), (
+        "model 對不上的向量是別的模型算的,不得留著"
+    )
 
 
 def test_save_rejects_mixed_dimensions_without_mutating_or_overwriting(tmp_path: Path):
@@ -171,7 +179,7 @@ def test_atomic_pair_write_rolls_back_npz_before_unlock_on_json_publish_failure(
     monkeypatch, tmp_path: Path
 ):
     path = tmp_path / config.KNOWLEDGE_FILE
-    embeddings_path = tmp_path / config.KNOWLEDGE_EMB_FILE
+    embeddings_path = kb_cache.cache_file(path)
     RAG.save_knowledge_base(_kb(), path)
     original_json = path.read_bytes()
     original_npz = embeddings_path.read_bytes()
@@ -194,7 +202,9 @@ def test_atomic_pair_write_rolls_back_npz_before_unlock_on_json_publish_failure(
 
     assert path.read_bytes() == original_json
     assert embeddings_path.read_bytes() == original_npz
-    assert not any("rollback" in item.name or ".tmp." in item.name for item in tmp_path.iterdir())
+    leftovers = [item for item in tmp_path.rglob("*")
+                 if "rollback" in item.name or ".tmp." in item.name]
+    assert leftovers == []
 
 
 def test_remove_document_rewrites_remaining_npz_and_reload_keeps_dense_search(monkeypatch, tmp_path: Path):
@@ -207,7 +217,7 @@ def test_remove_document_rewrites_remaining_npz_and_reload_keeps_dense_search(mo
     result = remove(path, "drop.md")
     assert result["removed_chunks"] == 1
 
-    data = np.load(tmp_path / config.KNOWLEDGE_EMB_FILE)
+    data = np.load(kb_cache.cache_file(path))
     assert data["embeddings"].shape == (1, 2)
     loaded = KnowledgeBase(str(path))
     assert loaded.loaded
@@ -220,11 +230,22 @@ def test_remove_document_rewrites_remaining_npz_and_reload_keeps_dense_search(mo
     assert rows and rows[0].chunk["source"] == "keep.md"
 
 
-def test_remove_aborts_if_vectors_are_missing_and_leaves_json_unchanged(tmp_path: Path):
+def test_remove_aborts_if_vectors_are_missing_and_leaves_json_unchanged(
+    tmp_path: Path, monkeypatch
+):
+    """向量重建不出來時,刪文件必須整批中止,`knowledge.json` 一個位元組都不能動。
+
+    2026-08-24 起 embeddings 是程式自管的 cache:少了它會**先自動重建**(那是
+    `knowledge.json` 才是唯一真相的直接結果)。這條測試守的是重建失敗的那一半——
+    絕不能因為「反正剩下的列數對得上」就拿舊向量去寫回一份新 KB。
+    """
     path = tmp_path / config.KNOWLEDGE_FILE
     kb = _kb()
     RAG.save_knowledge_base(kb, path)
-    (tmp_path / config.KNOWLEDGE_EMB_FILE).unlink()
+    kb_cache.cache_file(path).unlink()
+    (tmp_path / RAG.EMBEDDING_CACHE_FILE).unlink(missing_ok=True)
+    monkeypatch.setattr(RAG.llama_client, "embed_one",
+                        lambda **_kw: (_ for _ in ()).throw(OSError("no server")))
     before = path.read_bytes()
     remove = getattr(RAG, "remove_document_from_knowledge_base", None)
     assert callable(remove)

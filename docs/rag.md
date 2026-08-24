@@ -448,6 +448,37 @@ confirm_against_image 設 True。
 請用工具 reload_knowledge_base，回報目前載入幾個 chunks。
 ```
 
+想「整個重來，只留這一份」不用先 remove 再 ingest，一步就好：
+
+```text
+請用工具 ingest_document 匯入 docs/new_spec.pdf，fresh 設 True，
+回報清掉幾個 chunk、保留幾筆 human_verified。
+```
+
+`fresh=True` 會在**同一次原子提交**裡清空既有 chunks、讓舊向量失效、只留這一份文件；
+中途失敗整批回滾，不會出現「新 JSON 配舊向量」這種半套狀態。它**不會**動
+`.codetrail/figures/` 或其中的 `human_verified` 人工覆核資料——那是花時間換來的，
+不是 cache。CLI 對應 `python3 RAG.py <file> knowledge.json --fresh`（`rebuild`
+子命令也吃 `--fresh`，只對第一份文件生效，之後照常 append）。
+
+#### 只有 `knowledge.json` 要管
+
+向量不是使用者要維護的檔案：它是 `knowledge.json` 衍生出來的 cache，住在
+`.codetrail/cache/embeddings/<kb-id>/`，由程式自己管。
+
+- **備份 / 複製 / 刪除知識庫只要動 `knowledge.json`。** 複製到別的目錄照樣查得到
+  （向量會自動重建）；刪掉它就是空知識庫，旁邊不會留下一份舊向量讓人以為還在。
+- **cache 隨時可刪。** 下一次載入會印 `[INFO] embeddings cache 不存在或已過期，正在依
+  knowledge.json 重建。` 然後自己長回來。文字→向量的增量快取讓重建通常是全部命中。
+- **對不上就丟掉重算，不會硬配。** cache 帶著 embedding model、generation、內容雜湊、
+  chunk 數與**逐列的 chunk id**；任何一項對不上（例如你用另一份 chunk 數剛好相同的
+  `knowledge.json` 覆蓋原檔）都會丟棄重建，不存在「錯位一列、照樣回答」的情況。
+- **重建不了就中止查詢。** embedding server 連不上時會看到
+  `[FATAL] embeddings cache 無法重建，未使用舊向量；查詢已中止。`——寧可不回答，
+  也不用來路不明的向量回答。
+- **舊版本的 `knowledge_emb.npz`** 會在下一次載入時處理掉：完整驗證通過就遷移進
+  cache 再收掉，驗不過就直接淘汰並重建。不需要手動處理。
+
 #### 三件容易踩的事
 
 1. **知識庫綁專案目錄**：`knowledge.json` 存在當前專案根目錄裡，換到另一個專案就要重新匯入。同一份規格書在多個專案要用就匯入多次。
@@ -467,7 +498,8 @@ confirm_against_image 設 True。
 - `knowledge.json` 存在當前專案根目錄下，預設會被 `.gitignore` 忽略。它保存切碎後的文件內容，NDA 場景下幾乎一定有敏感片段，**不要 commit**。
 - `.codetrail/figures/` 存 PDF 結構化圖片的 review artifacts（原圖、實際送模型的每個 variant、canonical manifest）。**同樣可能含 NDA 內容**，`.gitignore` 已含 `.codetrail/`，一樣不要 commit；清除方式與後果見下面的覆核章節。
 - **文件身分是 basename**：`ingest_document` 與 `remove_document` 都以 basename 認人，所以不同目錄下的同名 PDF 會互相覆蓋（無警告），而 review artifacts 用的是含路徑 hash 的 `document_id`、不會覆蓋，因而可能留下孤兒 run 目錄。入庫前先取唯一檔名。
-- `remove_document(...)` 用檔名 basename 比對，所以傳完整路徑（`docs/old_spec.pdf`）或單純檔名（`old_spec.pdf`）都可以。刪除會在同一把 store lock 內同步重寫 JSON 與剩餘 NPZ 向量；不會刪掉整份向量檔再期待 reload 偷偷重算。
+- `remove_document(...)` 用檔名 basename 比對，所以傳完整路徑（`docs/old_spec.pdf`）或單純檔名（`old_spec.pdf`）都可以。刪除會在同一把 store lock 內同步重寫 JSON 與剩餘的向量列；不會刪掉整份向量檔再期待 reload 偷偷重算。
+- **embeddings 是程式自管的 cache**（`.codetrail/cache/embeddings/<kb-id>/`），不是要跟 `knowledge.json` 配對的檔案。缺了自動重建、身分對不上一律丟棄重建、重建不了就 fail-loud 中止查詢。詳見上面「只有 `knowledge.json` 要管」。
 - 文件切段的大小、不同來源類型的搜尋權重，這些可調參數放在 `config.py` 的 `CHUNK_SETTINGS` 和 `SOURCE_TYPE_WEIGHTS`，預設值在大多數情境下已經夠用，要微調再去動。
 
 ---
@@ -490,6 +522,6 @@ AICODE_KB_CONTEXT_USE=1 aicode
 
 1. **生成的文字不是證據。** 它只會影響「哪些 chunk 被撈上來、排第幾」，不會出現在 `[REF]` 的內容裡，也不會影響拒答判斷、信心度或數值證據判定——那些一律看原文算出來的分數。所以就算脈絡寫錯了，也不會讓一段不相關的原文被當成答案。
 2. **成本是每個 chunk 一次主模型呼叫。** 實測約 10–20 秒一個 chunk，幾百個 chunk 的規格書要跑十幾分鐘到一小時。文件沒改的話重跑會全部命中快取、零呼叫。
-3. **知識庫格式會變。** 開了之後 `knowledge_emb.npz` 會存兩組向量，舊版程式讀不了；要換回去就重新入庫一次（`--no-context`）。
+3. **知識庫格式會變。** 開了之後 embeddings cache 會存兩組向量（retrieval 一組、content-only 的 gate 一組），舊版程式讀不了；要換回去就重新入庫一次（`--no-context`）。向量本身不用管——它是程式自管的 cache，`knowledge.json` 才是要備份的那個檔。
 
 ---

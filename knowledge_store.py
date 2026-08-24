@@ -2,9 +2,13 @@
 
 The JSON document is the metadata/source-of-truth for chunks and the NPZ file
 holds row-aligned embeddings.  Every reader and writer in CodeTrail uses the
-same lock.  Writers stage both files in the destination directory, fsync them,
-then replace the live pair while holding the lock.  A generation id and content
-hash make a crash between the two replaces fail loudly instead of mixing data.
+same lock.  Writers stage both files in their own destination directory, fsync
+them, then replace the live pair while holding the lock.  A generation id, a
+content hash and per-row chunk ids make a crash between the two replaces fail
+loudly instead of mixing data.
+
+NPZ 住在哪裡、怎麼被驗、什麼時候該重建，全部由 ``kb_cache`` 決定；這一層只負責
+「把驗好的一對東西原子地換上去」。使用者只需要管 ``knowledge.json``。
 """
 from __future__ import annotations
 
@@ -182,6 +186,7 @@ def _write_npz_temp(
     content_hash: str,
     content_hash_schema: str,
     generation: str,
+    chunk_ids: list[str],
     gate_rows: list[list[float]] | None = None,
     gate_content_hash: str = "",
     gate_content_hash_schema: str = "",
@@ -191,6 +196,10 @@ def _write_npz_temp(
     `embeddings` 是 retrieval 訊號(可能含生成脈絡),`embeddings_gate` 是
     content-only 的決策訊號。兩組各帶自己的 schema / hash / 維度 / 列數,
     同一個 store_generation 下一次提交——分兩個檔就會有「只換到一半」的視窗。
+
+    `chunk_ids` 是**逐列**的 chunk 身分。內容雜湊只證明「這批 chunk 的集合沒變」,
+    證明不了「第 i 列就是第 i 個 chunk 的向量」;少了它,載入端就只能靠陣列順序
+    配對,而錯位一列的後果是查詢照常回答、只是答錯。
     """
     try:
         import numpy as np
@@ -200,6 +209,10 @@ def _write_npz_temp(
         ) from exc
 
     matrix = _normalized_matrix(rows, "embedding")
+    if len(chunk_ids) != matrix.shape[0]:
+        raise KnowledgeStoreError(
+            f"chunk id 數量與向量列數不符: {len(chunk_ids)} vs {matrix.shape[0]}"
+        )
     payload = {
         "embeddings": matrix,
         "embedding_model": embedding_model,
@@ -208,6 +221,7 @@ def _write_npz_temp(
         "content_hash": content_hash,
         "content_hash_schema": content_hash_schema,
         "store_generation": generation,
+        "chunk_ids": np.array(list(chunk_ids)),
     }
 
     if gate_rows is not None:
@@ -238,6 +252,18 @@ def _write_npz_temp(
         raise
 
 
+def _default_chunk_ids(chunks: list[dict]) -> list[str]:
+    """呼叫端沒給逐列身分時的預設來源。
+
+    late import 避開 import 期循環（``kb_cache`` 是 import 這個模組的那一邊）。
+    刻意**不**用 ``chunk_id()``：那是 fail-loud 的身分產生器，對缺 page /
+    chunk_index 的舊 chunk 會 raise，而「寫不出 cache」不該是缺欄位的懲罰。
+    """
+    from kb_cache import chunk_row_ids
+
+    return chunk_row_ids(chunks)
+
+
 def _backup_link(path: Path, generation: str) -> Path | None:
     if not path.exists():
         return None
@@ -263,10 +289,12 @@ def save_knowledge_store_atomic(
     kb: dict,
     json_path: Path,
     *,
-    embedding_file: str,
+    embedding_file: str | Path,
     embedding_model: str,
     content_hash: str,
     content_hash_schema: str,
+    chunk_ids: list[str] | None = None,
+    legacy_companion: Path | None = None,
     gate_content_hash: str | None = None,
     gate_content_hash_schema: str | None = None,
     already_locked: bool = False,
@@ -279,9 +307,17 @@ def save_knowledge_store_atomic(
     給了 ``gate_content_hash_schema`` 就同時寫出 content-only 的 gate 矩陣
     (取自每個 chunk 的 ``embedding_gate``)。沒給就只有單一矩陣——沒有任何
     ctx 的 KB 用不到第二套向量,retrieval 與 gate 本來就是同一組字。
+
+    ``embedding_file`` 可以是絕對路徑(現在的向量放在隱藏 cache 目錄,不再與
+    JSON 同目錄)。暫存檔一律 staging 在**向量檔自己的目錄**裡,`os.replace`
+    才保證是同一個檔案系統上的原子替換。
+
+    ``legacy_companion`` 給的話,提交成功後會把舊版本留在 JSON 旁邊的
+    companion NPZ 刪掉——它是可重建資料,留著只會讓使用者以為「刪了 JSON
+    知識庫還在」。
     """
     json_path = Path(json_path)
-    emb_path = json_path.parent / embedding_file
+    emb_path = json_path.parent / Path(embedding_file)
     chunks = list(kb.get("chunks", []))
     rows, dimension = validate_embeddings(chunks)
     with_gate = gate_content_hash_schema is not None
@@ -345,14 +381,17 @@ def save_knowledge_store_atomic(
             try:
                 json_tmp = _write_json_temp(json_path.parent, json_path.name, payload)
                 if rows:
+                    emb_path.parent.mkdir(parents=True, exist_ok=True)
                     emb_tmp = _write_npz_temp(
-                        json_path.parent,
+                        emb_path.parent,
                         emb_path.name,
                         rows,
                         embedding_model=embedding_model,
                         content_hash=content_hash,
                         content_hash_schema=content_hash_schema,
                         generation=generation,
+                        chunk_ids=list(chunk_ids if chunk_ids is not None
+                                       else _default_chunk_ids(chunks)),
                         gate_rows=gate_rows,
                         gate_content_hash=gate_content_hash or "",
                         gate_content_hash_schema=gate_content_hash_schema or "",
@@ -393,6 +432,11 @@ def save_knowledge_store_atomic(
                 json_backup.unlink(missing_ok=True)
             if emb_backup:
                 emb_backup.unlink(missing_ok=True)
+            # 提交成功之後才動舊位置那份:回滾路徑已經走完,不會出現「舊 JSON
+            # 還在、它的 companion 卻被刪掉」的狀態。
+            if legacy_companion is not None:
+                with contextlib.suppress(OSError):
+                    Path(legacy_companion).unlink(missing_ok=True)
             return json_path, emb_path if rows else None
     finally:
         if json_tmp:

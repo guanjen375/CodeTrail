@@ -1,4 +1,7 @@
-"""knowledge.json ↔ knowledge_emb.npz 的向量持久化契約。
+"""knowledge.json ↔ embeddings cache 的向量持久化契約。
+
+2026-08-24 起向量搬到 `kb_cache` 管理的隱藏 cache;這裡刻意仍用**舊位置**造 fixture,
+因為那正是使用者從舊版本升上來時的磁碟狀態(遷移路徑要一直測得到)。
 
 合併自 tests/test_rag_incremental.py 與 tests/test_npz_embedding_attach.py(2026-08-20)。
 兩份共用同一個 _content_hash helper(語意相同,只留一份)。
@@ -90,7 +93,8 @@ def test_incremental_save_preserves_old_embeddings_from_npz(tmp_path):
 
     save_knowledge_base(kb, kb_path)
 
-    data = np.load(tmp_path / config.KNOWLEDGE_EMB_FILE)
+    import kb_cache  # 向量現在住在程式自管的隱藏 cache,不再與 JSON 同目錄
+    data = np.load(kb_cache.cache_file(kb_path))
     embeddings = data["embeddings"]
     assert embeddings.shape == (3, 2)
     assert np.allclose(embeddings[0], [1.0, 0.0])

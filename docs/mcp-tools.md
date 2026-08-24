@@ -28,6 +28,7 @@
 | 看圖片、PDF、ELF、firmware | 請用工具 `analyze_file` 分析 `.aicode_uploads/error.png`（或 `docs/spec.pdf`），做通用 VL 圖片分析、PDF 一次性抽文字或 binary 分析。 | `analyze_file(...)` |
 | 把文件/圖片/binary 加進 KB | 請用工具 `ingest_document` 匯入 `docs/spec.pdf`（或 `arch.png`、`firmware.bin`）。之後查詢會自動載入；想立即確認 chunk 數再補 `reload_knowledge_base`。 | `ingest_document(...)`、`reload_knowledge_base()` |
 | 圖很多的 PDF，先估成本 | 請用工具 `ingest_document` 對 `docs/datasheet.pdf` 設 `preflight_only=True`，回報候選數、VL 呼叫次數與是否超過上限。 | `ingest_document(path, preflight_only=True)` |
+| 把 KB 重建成只有這一份文件 | 請用工具 `ingest_document` 匯入 `docs/spec_v2.pdf`，`fresh` 設 True，回報清掉幾個 chunk、保留幾筆 human_verified。 | `ingest_document(path, fresh=True)` |
 | 覆核 PDF 抽出來的表格 / log | 請用工具 `review_figures` 列出待覆核的圖，說明每一張的原因；我看過原圖再決定要不要修。 | `review_figures(action="list")`、`review_figures(action="fix", ...)` |
 | 移除舊文件 | 請用工具 `remove_document` 移除 `old_spec.pdf`（查詢會自動偵測變更）。 | `remove_document(...)` |
 | 準備改檔 | 請先用工具 `git_status` 和 `git_diff` 確認目前變更，再說明要改哪些檔案。 | `git_status(...)`、`git_diff(...)` |
@@ -46,7 +47,7 @@
 | 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=50000)` | 讀檔案內容，長檔要分段 |
 | 文件/外部檔案 | `import_external_file(path, dest_name=None)` | 把允許來源的外部檔案複製進 `.aicode_uploads/` |
 | 文件/外部檔案 | `analyze_file(path)` | 用 VL 分析各類圖片、一次性抽 PDF 文字（不入 KB）、分析 ELF 或 firmware blob |
-| 文件/外部檔案 | `ingest_document(path, mode="auto", preflight_only=False)` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document`。PDF 的原生表格 / 向量文字 log 與純 raster 截圖、掃描頁、方塊圖都走結構化抽取；raster 會先分類為 table / terminal / diagram，再帶 canonical payload、證據與驗證狀態。任一條失敗都整份不入庫、KB 不變。`preflight_only=True` 只估成本、零寫入（僅 .pdf） |
+| 文件/外部檔案 | `ingest_document(path, mode="auto", preflight_only=False, fresh=False)` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document`。PDF 的原生表格 / 向量文字 log 與純 raster 截圖、掃描頁、方塊圖都走結構化抽取；raster 會先分類為 table / terminal / diagram，再帶 canonical payload、證據與驗證狀態。任一條失敗都整份不入庫、KB 不變。`preflight_only=True` 只估成本、零寫入（僅 .pdf）。`fresh=True` 一步到位重建：清空既有 chunks、讓舊 embeddings cache 失效、只留這一份文件（同一次原子提交，失敗全回滾），**不刪** `.codetrail/figures/` 與 `human_verified`；不可與 `preflight_only` 併用 |
 | 文件/外部檔案 | `review_figures(action="list", document_id="", figure_id="", expected_revision=0, payload_json="", confirm_against_image=False)` | 覆核 PDF 結構化抽取的表格 / 終端機 log / diagram：`list` 唯讀列出 figure_id、頁碼、bbox、kind、驗證狀態、原因、原圖路徑與 canonical payload；`fix` 只收該 kind schema 的 structured payload + `expected_revision`，`confirm_against_image=True` 才升 `human_verified`。permission 設 `ask` |
 | 文件/外部檔案 | `remove_document(source)` | 從 KB 移除過期文件 |
 | 文件/外部檔案 | `reload_knowledge_base()` | 立即載入 KB 並回報 chunk 數（查詢本身會自動偵測變更，這是「馬上確認」用） |

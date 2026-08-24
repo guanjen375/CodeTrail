@@ -30,6 +30,7 @@ except ImportError:
     print("       建議執行: pip install jieba", file=sys.stderr)
 
 import context_signals
+import kb_cache
 import llama_client
 from knowledge_store import KnowledgeStoreError, knowledge_store_lock
 
@@ -338,7 +339,7 @@ class KnowledgeBase:
     6. 結構化輸出格式
     """
 
-    def __init__(self, json_path: str = KNOWLEDGE_FILE):
+    def __init__(self, json_path: str = KNOWLEDGE_FILE, *, allow_rebuild: bool = True):
         self.chunks = []
         self.documents = []
         self.loaded = False
@@ -359,9 +360,11 @@ class KnowledgeBase:
         # 「lexical 決策永遠看不到生成文字」這條硬保證。
         self._bm25 = None
         self._bm25_gate = None
-        # .npz embeddings 路徑（與 json 同目錄）
-        json_dir = Path(json_path).parent
-        self._emb_path = json_dir / KNOWLEDGE_EMB_FILE
+        # embeddings 是程式自管的 cache（位置與驗證規則都在 kb_cache）。
+        # `allow_rebuild=False` 給離線體檢工具用：它要報告「這份 KB 現在的磁碟
+        # 狀態能不能直接載入」，重算會把答案改掉。
+        self._allow_rebuild = allow_rebuild
+        self._emb_path = kb_cache.cache_file(json_path)
 
         # staleness 偵測：記下載入當下的檔案簽章，之後用 source_changed() 比對。
         # 刻意在 _load 之前取——若載入期間檔案又被改，下次比對會看到差異再重載一次。
@@ -369,6 +372,10 @@ class KnowledgeBase:
 
         if Path(json_path).exists():
             self._load(json_path)
+        else:
+            # JSON 不在了 ＝ 空 KB。無主的向量既不能查也不該留著讓使用者誤會
+            # 「知識庫還在」；不需要 file watcher，下一次進到這裡處理掉就行。
+            kb_cache.purge(json_path, announce=True)
 
     @staticmethod
     def _stat_signature(path: str):
@@ -430,29 +437,33 @@ class KnowledgeBase:
 
                 self.loaded = True
 
-                # 優先從 .npz 載入 embeddings（加速載入）
+                # 向量來源：程式自管的 embeddings cache（缺了會自動重建）
                 npz_loaded = self._load_embeddings_from_npz()
 
                 if not npz_loaded:
+                    # JSON 自己帶 inline 向量 ＝ 舊格式，維持原本的規則:
                     # 有 ctx 的 KB 一律不准走 legacy inline 回退。那條路徑會把
                     # retrieval 矩陣直接別名成 gate，於是 KB_CONTEXT_USE=0、拒答
                     # 門檻、信心判斷全都吃到含生成脈絡的向量——正是雙訊號要擋的
-                    # 循環 grounding。gate 向量只能來自驗過的 NPZ 第二組矩陣。
-                    if self._has_ctx:
-                        raise KnowledgeStoreError(
-                            "this knowledge base carries generated chunk context but its "
-                            f"embeddings could not be loaded from {self._emb_path}; refusing "
-                            "to fall back to inline vectors (that would alias the retrieval "
-                            "matrix as the decision gate). Rebuild the knowledge base."
-                        )
-                    # Legacy JSON may still contain inline embeddings.  Missing
-                    # vectors are not a lexical-only fallback: fail loudly.
-                    self._precompute_embeddings()
-                    if self.chunks and self._embeddings is None:
-                        raise KnowledgeStoreError(
-                            f"knowledge chunks have no usable embeddings and {self._emb_path} "
-                            "could not be loaded; rebuild the knowledge base"
-                        )
+                    # 循環 grounding。gate 向量只能來自驗過的第二組矩陣。
+                    if any(chunk.get("embedding") for chunk in self.chunks):
+                        if self._has_ctx:
+                            raise KnowledgeStoreError(
+                                "this knowledge base carries generated chunk context but its "
+                                f"embeddings could not be loaded from {self._emb_path}; refusing "
+                                "to fall back to inline vectors (that would alias the retrieval "
+                                "matrix as the decision gate). Rebuild the knowledge base."
+                            )
+                        self._precompute_embeddings()
+                        if self.chunks and self._embeddings is None:
+                            raise KnowledgeStoreError(
+                                f"knowledge chunks have no usable embeddings and {self._emb_path} "
+                                "could not be loaded; rebuild the knowledge base"
+                            )
+                    else:
+                        # 現行格式（向量只在 cache）：cache 是可重建資料，缺了就
+                        # 依 knowledge.json 重算。重算不了 ＝ fail-loud，絕不沿用。
+                        self._rebuild_embeddings_cache()
 
                 # P0 改進：預計算 BM25 索引
                 if BM25_ENABLED:
@@ -519,16 +530,14 @@ class KnowledgeBase:
         return context_signals.chunks_content_hash(self.chunks, schema=schema)
 
     def _load_embeddings_from_npz(self) -> bool:
-        """從 .npz 載入 embeddings（retrieval + gate 兩套）。
+        """從程式自管的 embeddings cache 取回向量（retrieval + gate 兩套）。
 
-        schema 走 required 對照，不是只拿 NPZ 自報的 schema 重算一次自己：那樣
-        legacy NPZ 永遠自驗通過，程式換了組字規則也察覺不到。
-
-        KB 只要有任何 chunk 帶 ctx，gate 矩陣就必須同時存在，缺了直接拒載——
-        絕不 fallback 到 contextual 向量當 gate 用。
+        路徑、身分驗證、舊位置 companion NPZ 的遷移/淘汰全部在 ``kb_cache``——
+        入庫端（RAG.py）走的是同一個函式。以前查詢端與入庫端各有一份幾乎相同
+        但寬嚴不一的檢查，一邊放行、一邊拒載的差異是無聲的。
 
         Returns:
-            True 如果成功載入，False 如果需要從 JSON 重建
+            True 載到了；False 代表沒有可用 cache（呼叫端決定重建還是 fail）。
         """
         self._has_ctx = context_signals.has_any_ctx(self.chunks)
 
@@ -539,116 +548,56 @@ class KnowledgeBase:
                     "numpy to load its two embedding matrices; install numpy"
                 )
             return False
-        if not self._emb_path.exists():
-            # 有 ctx 的情況由 _load 統一拒載（訊息在那邊，涵蓋所有 return False）
+
+        matrices, stale = kb_cache.locate(
+            self.path, self.chunks, getattr(self, "_loaded_metadata", {}))
+        if matrices is None:
+            # 原因留給重建路徑印出來（也留給 allow_rebuild=False 的體檢工具當理由）
+            self._cache_stale_reason = stale
             return False
+        self._attach_matrices(matrices)
+        return True
 
-        try:
-            with np.load(self._emb_path, allow_pickle=False) as data:
-                available = set(getattr(data, "files", []))
-                embeddings = data['embeddings'].copy()
-                emb_model = str(data.get('embedding_model', ''))
-                chunk_count = int(data.get('chunk_count', 0))
-                content_hash = str(data.get('content_hash', ''))
-                hash_schema = str(data.get(
-                    'content_hash_schema', context_signals.LEGACY_CONTENT_HASH_SCHEMA
-                ))
-                npz_generation = str(data.get('store_generation', ''))
-                stored_dimension = int(data.get('embedding_dimension', 0))
-                gate_embeddings = (
-                    data['embeddings_gate'].copy() if 'embeddings_gate' in available else None
-                )
-                gate_hash = str(data.get('gate_content_hash', ''))
-                gate_schema = str(data.get('gate_content_hash_schema', ''))
-        except KnowledgeStoreError:
-            raise
-        except Exception as e:
-            print(f"[WARN] 載入 .npz 失敗: {e}")
-            return False
+    def _rebuild_embeddings_cache(self) -> None:
+        """cache 缺了/過期了 → 依 knowledge.json 重算，失敗一律 fail-loud。
 
-        try:
-            # 驗證 embedding model 一致
-            if emb_model and emb_model != EMBEDDING_MODEL:
-                print(f"[WARN] .npz embedding model 不一致，將重建")
-                return False
+        「沿用舊向量」在這裡是**不存在的選項**：向量與 chunk 錯位的查詢照樣會回
+        答，只是答錯，而且沒有任何一行 log 會說出來。
+        """
+        if not self.chunks:
+            return
+        if not HAS_NUMPY:
+            raise KnowledgeStoreError(
+                "重建 embeddings cache 需要 numpy；請安裝 numpy 後重試"
+            )
+        stale = getattr(self, "_cache_stale_reason", "") or "embeddings cache 不可用"
+        if not self._allow_rebuild:
+            raise kb_cache.fatal(stale)
+        matrices = kb_cache.rebuild(
+            self.path, self.chunks, getattr(self, "_loaded_metadata", {}), reason=stale)
+        self._attach_matrices(matrices)
+        # 重算時 RAG.generate_embeddings 會把 gate 向量掛在 chunk 上；查詢端不留
+        # 那份（n×dim 的 Python float list），決策點一律用 chunk_idx 讀矩陣列。
+        for chunk in self.chunks:
+            chunk.pop("embedding_gate", None)
 
-            # 驗證 chunk 數量一致
-            if chunk_count != len(self.chunks):
-                print(f"[WARN] .npz chunk 數量不一致，將重建")
-                return False
-
-            if embeddings.ndim != 2 or embeddings.shape[0] != len(self.chunks):
-                print(f"[WARN] .npz embedding matrix shape 不一致，將重建")
-                return False
-            if stored_dimension and embeddings.shape[1] != stored_dimension:
-                print(f"[WARN] .npz embedding dimension metadata 不一致，將重建")
-                return False
-
-            json_generation = str(getattr(self, "_loaded_metadata", {}).get("store_generation", ""))
-            if json_generation and npz_generation != json_generation:
-                print(f"[WARN] .npz store generation 不一致，拒絕載入")
-                return False
-
-            # required-schema 對照：這是 fail-loud，不是「重建就好」——schema 不對
-            # 代表向量是用另一套組字算的，拿來查會靜默地錯。
-            allowed = context_signals.required_retrieval_schemas(has_ctx=self._has_ctx)
-            if hash_schema not in allowed:
-                raise KnowledgeStoreError(
-                    f"knowledge embedding schema mismatch: NPZ={hash_schema!r}, "
-                    f"required one of {sorted(allowed)}. Rebuild the knowledge base "
-                    f"(python3 RAG.py rebuild --kb {self.path} <docs>)."
-                )
-
-            # 驗證內容雜湊一致（避免內容變更但數量相同的情況）
-            current_hash = self._compute_content_hash(schema=hash_schema)
-            if content_hash and content_hash != current_hash:
-                print(f"[WARN] .npz 內容雜湊不一致，將重建")
-                return False
-
-            if self._has_ctx:
-                if gate_embeddings is None:
-                    raise KnowledgeStoreError(
-                        "this knowledge base carries generated chunk context but "
-                        f"{self._emb_path} has no gate (content-only) matrix; refusing to "
-                        "use contextual vectors for decisions. Rebuild the knowledge base."
-                    )
-                if gate_schema != context_signals.GATE_SCHEMA:
-                    raise KnowledgeStoreError(
-                        f"gate embedding schema mismatch: NPZ={gate_schema!r}, "
-                        f"required {context_signals.GATE_SCHEMA!r}. Rebuild the knowledge base."
-                    )
-                if gate_embeddings.ndim != 2 or gate_embeddings.shape != embeddings.shape:
-                    raise KnowledgeStoreError(
-                        "gate embedding matrix shape mismatch: "
-                        f"{getattr(gate_embeddings, 'shape', None)} vs {embeddings.shape}"
-                    )
-                current_gate_hash = self._compute_content_hash(
-                    schema=context_signals.GATE_SCHEMA
-                )
-                if gate_hash and gate_hash != current_gate_hash:
-                    raise KnowledgeStoreError(
-                        f"gate embedding content hash mismatch: NPZ={gate_hash}, "
-                        f"JSON={current_gate_hash}. Rebuild the knowledge base."
-                    )
-        except KnowledgeStoreError:
-            raise
-
+    def _attach_matrices(self, matrices) -> None:
+        """把驗過的矩陣接上查詢端的狀態。"""
+        embeddings = matrices.embeddings
+        gate_embeddings = matrices.gate_embeddings
         self._embeddings = embeddings
-        self._embeddings_normalized = True  # .npz 已預先正規化
+        self._embeddings_normalized = True  # cache 已預先正規化
         self._embedding_indices = list(range(len(self.chunks)))
         # 沒有 ctx 的 KB：retrieval 與 gate 是同一組字算出來的，直接別名。
         self._gate_embeddings = gate_embeddings if gate_embeddings is not None else embeddings
 
-        # P0：把 .npz 的 retrieval 向量掛回每個 chunk。
-        # RAG 存 knowledge.json 時為了體積「不再 inline embedding」（只留 .npz），
+        # P0：把 retrieval 向量掛回每個 chunk。
+        # RAG 存 knowledge.json 時為了體積「不再 inline embedding」（只留 cache），
         # 若這裡只設 self._embeddings 而不回填 chunk["embedding"]，下游的 MMR /
         # 污染控制（都讀 chunk.get("embedding")）會一律拿到空向量、把相似度算成 0。
-        # gate 向量刻意**不**掛回 chunk：那是 Python float list，n×dim 一份就夠痛，
-        # 決策點一律用 chunk_idx 讀矩陣列。
+        # gate 向量刻意**不**掛回 chunk。
         for i, chunk in enumerate(self.chunks):
             chunk["embedding"] = embeddings[i].tolist()
-
-        return True
 
     def _decision_order(self, candidates: list) -> list:
         """決策用的候選排序。
@@ -766,25 +715,11 @@ class KnowledgeBase:
         scores = np.dot(matrix[valid], q_vec)
         return {index: float(score) for index, score in zip(valid, scores)}
 
-    def _save_embeddings_to_npz(self):
-        """將 embeddings 儲存為 .npz（加速下次載入）
-
-        改進：儲存內容雜湊用於驗證
-        """
-        if not HAS_NUMPY or self._embeddings is None:
-            return
-
-        try:
-            content_hash = self._compute_content_hash()
-            np.savez_compressed(
-                self._emb_path,
-                embeddings=self._embeddings,
-                embedding_model=EMBEDDING_MODEL,
-                chunk_count=len(self.chunks),
-                content_hash=content_hash
-            )
-        except Exception as e:
-            print(f"[WARN] 儲存 .npz 失敗: {e}")
+    # 註：查詢端不再自己寫 cache。以前這裡有一個沒有任何呼叫端的
+    # `_save_embeddings_to_npz()`，它寫出的檔案缺 schema / generation / chunk_ids，
+    # 是「看起來能用、其實證明不了身分」的那種檔。寫入端只有兩條：
+    # `knowledge_store.save_knowledge_store_atomic`（入庫）與 `kb_cache.rebuild`
+    # （重算），兩條都寫完整身分。
 
     def _precompute_embeddings(self):
         """預計算並正規化 embeddings 到 numpy array（legacy：JSON inline 向量）

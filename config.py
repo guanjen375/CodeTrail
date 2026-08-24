@@ -526,7 +526,9 @@ INDEX_SCOPE_MAX_PATTERN_CHARS = 512
 # 知識庫 (RAG) 設定
 # ============================================================
 KNOWLEDGE_FILE = "knowledge.json"
-KNOWLEDGE_EMB_FILE = "knowledge_emb.npz"  # 獨立儲存 embeddings（加速載入）
+KNOWLEDGE_EMB_FILE = "knowledge_emb.npz"  # 舊版本放在 knowledge.json 旁邊的
+# companion NPZ。向量現在住在 kb_cache 管理的隱藏 cache
+# （.codetrail/cache/embeddings/<kb-id>/），這個常數只剩「偵測並淘汰舊檔」一個用途。
 
 # 分類型 Chunk 設定（依文件類型調整 chunk 大小與重疊）
 # 規格書/API 參考需要精細切分，手冊/一般文件可用較大區塊

@@ -782,6 +782,14 @@ preflight 零寫入;它會估算所有結構化候選，包含純 raster 的分�
 `▯` / 逐格或逐行證據，並出現在 `review_figures` 裡。完整說明見
 [docs/rag.md](docs/rag.md#pdf-內的表格與終端機畫面結構化抽取--人工覆核)。
 
+**知識庫只有 `knowledge.json` 一個檔要管。** 向量是它衍生出來的 cache(藏在
+`.codetrail/cache/embeddings/`),缺了會自動重建、身分對不上一律丟棄重建、重建不了就
+**中止查詢而不是拿舊向量湊合**。備份 / 複製 / 刪除知識庫只要動 `knowledge.json`;刪掉它
+就是空知識庫,旁邊不會留下一份舊向量。要把 KB 重建成只有某一份文件,用
+`ingest_document(path, fresh=True)`(CLI 是 `--fresh`)——它**不會**刪
+`.codetrail/figures/` 或其中的 `human_verified` 人工覆核資料。細節見
+[docs/rag.md](docs/rag.md#只有-knowledgejson-要管)。
+
 更多操作模式(夾帶附件、注入 RAG、查 spec)見 [docs/basic-usage.md](docs/basic-usage.md);完整 19 個工具清單見 [docs/mcp-tools.md](docs/mcp-tools.md);被你糾正過的行為怎麼變成之後 session 都遵守的規則,見 [docs/lessons.md](docs/lessons.md)。
 
 ### 5.4 Web 模式(目前測試中)

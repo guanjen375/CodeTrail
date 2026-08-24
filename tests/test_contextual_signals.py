@@ -69,6 +69,13 @@ def _chunk(
     return chunk
 
 
+def _cache_npz(tmp_path: Path) -> Path:
+    """向量現在住在程式自管的隱藏 cache（kb_cache 決定路徑），不再與 JSON 同目錄。"""
+    import kb_cache
+
+    return kb_cache.cache_file(tmp_path / config.KNOWLEDGE_FILE)
+
+
 def _write_kb(
     tmp_path: Path, chunks: list[dict], *, with_gate: bool, schema: str | None = None
 ) -> Path:
@@ -199,7 +206,7 @@ def test_save_writes_both_matrices_under_one_generation(tmp_path: Path, monkeypa
 
     RAG.save_knowledge_base(kb, tmp_path / config.KNOWLEDGE_FILE)
 
-    with np.load(tmp_path / config.KNOWLEDGE_EMB_FILE, allow_pickle=False) as data:
+    with np.load(_cache_npz(tmp_path), allow_pickle=False) as data:
         assert "embeddings_gate" in data.files
         assert data["embeddings"].shape == data["embeddings_gate"].shape
         assert str(data["content_hash_schema"]) == context_signals.CONTEXTUAL_INPUT_SCHEMA
@@ -236,7 +243,7 @@ def test_kb_without_ctx_stays_single_matrix_and_legacy_schema(tmp_path: Path, mo
 
     RAG.save_knowledge_base(kb, tmp_path / config.KNOWLEDGE_FILE)
 
-    with np.load(tmp_path / config.KNOWLEDGE_EMB_FILE, allow_pickle=False) as data:
+    with np.load(_cache_npz(tmp_path), allow_pickle=False) as data:
         assert "embeddings_gate" not in data.files
         assert str(data["content_hash_schema"]) == context_signals.CONTENT_INPUT_SCHEMA
 
@@ -295,7 +302,7 @@ def test_remove_document_keeps_both_matrices_in_sync(tmp_path: Path, monkeypatch
 
     RAG.remove_document_from_knowledge_base(path, "drop.md")
 
-    with np.load(tmp_path / config.KNOWLEDGE_EMB_FILE, allow_pickle=False) as data:
+    with np.load(_cache_npz(tmp_path), allow_pickle=False) as data:
         assert data["embeddings"].shape[0] == 1
         assert data["embeddings_gate"].shape[0] == 1
     assert KnowledgeBase(str(path)).loaded

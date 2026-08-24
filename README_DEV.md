@@ -728,8 +728,11 @@ python3 scripts/kb_ab_compare.py old/knowledge.json new/knowledge.json \
     --questions ~/questions.txt                                             # 加跑真題
 ```
 
-**兩份 KB 一定要放不同目錄**：`knowledge_emb.npz` 是固定檔名，同目錄兩份 JSON 會互相
-覆蓋向量檔；工具會直接擋下同目錄的組合，不會靜默比錯。預設只印 metadata 與計數，
+**兩份 KB 一定要放不同目錄**：工具會直接擋下同目錄的組合，不會靜默比錯。（2026-08-24
+起 embeddings cache 依 KB 檔名分目錄，同目錄兩份 JSON 其實已經不會互相覆蓋向量了；
+這條限制留著只是保守，兩份 KB 分開放本來就比較好對照。）另外體檢一律以
+`allow_rebuild=False` 載入：它要報告的是「這份 KB 現在的磁碟狀態能不能直接載入」，
+自動重建會把答案改掉。預設只印 metadata 與計數，
 不印 chunk 內容（NDA）；要看抽樣前綴得自己加 `--show-content`。問題檔與真實文件都
 不進 repo。
 

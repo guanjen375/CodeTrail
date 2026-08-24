@@ -12,8 +12,8 @@ embedding）、section / 其他欄位差在哪幾筆。重建前後對照用。
 用途三（需要 embedding + reranker server）：拿同一批問題打兩份 KB，並排印出
 各自的 REF（來源 / 頁 / 章節 / 分數），看檢索與章節標示的實際差別。
 
-**兩份 KB 一定要放在不同目錄**：`knowledge_emb.npz` 是固定檔名，同一個目錄放
-兩份 JSON 會互相覆蓋向量檔。
+**兩份 KB 一定要放在不同目錄**：這是保守限制。向量 cache 已依 KB 檔名分目錄、
+不會互相覆蓋了，但兩份 KB 分開放本來就比較好對照，所以這道閘留著。
 
 NDA：預設只印 metadata 與計數，不印 chunk 內容；要看節錄得自己加
 `--show-content`。問題檔與真實文件都不該進 repo。
@@ -50,16 +50,22 @@ def _load_kb(path: Path) -> dict:
 
 
 def _load_npz_meta(json_path: Path) -> dict:
-    """讀 NPZ 的 schema / 維度 / 列數；讀不到就回空 dict（離線體檢仍可用）。"""
+    """讀向量檔的 schema / 維度 / 列數；讀不到就回空 dict（離線體檢仍可用）。
+
+    路徑由 `kb_cache` 決定（隱藏 cache 優先，其次是舊版本留在 KB 旁邊的 companion
+    NPZ）——體檢不能自己猜位置，猜錯就會報「NPZ 不存在」而其實好好的。
+    """
     try:
         import numpy as np
-        from config import KNOWLEDGE_EMB_FILE
+        import kb_cache
     except ImportError as exc:
-        return {"error": f"numpy/config 不可用: {exc}"}
+        return {"error": f"numpy/kb_cache 不可用: {exc}"}
 
-    emb_path = json_path.parent / KNOWLEDGE_EMB_FILE
+    emb_path = kb_cache.cache_file(json_path)
     if not emb_path.is_file():
-        return {"error": f"NPZ 不存在: {emb_path}"}
+        emb_path = kb_cache.legacy_companion(json_path)
+    if not emb_path.is_file():
+        return {"error": f"embeddings cache 不存在: {kb_cache.cache_dir(json_path)}"}
     try:
         with np.load(emb_path, allow_pickle=False) as data:
             available = set(getattr(data, "files", []))
@@ -102,7 +108,10 @@ def loader_verdict(json_path: Path) -> tuple[bool, str]:
         return False, f"無法載入 knowledge 模組，這份 KB 沒有被驗證: {exc}"
 
     try:
-        kb = KnowledgeBase(json_path=str(json_path))
+        # 體檢要報告的是「這份 KB 現在的磁碟狀態能不能直接載入」。允許自動重建
+        # 會把答案改掉（缺 cache 的 KB 會被就地修好，報告就永遠是綠的），所以
+        # 這條路徑明確關掉重建。
+        kb = KnowledgeBase(json_path=str(json_path), allow_rebuild=False)
     except KnowledgeStoreError as exc:
         return False, str(exc)
     except Exception as exc:  # noqa: BLE001 - loader 任何例外都算拒載
@@ -333,7 +342,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="知識庫稽核 / A-B 比對（schema、chunk 欄位、真題 REF 對照）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="兩份 KB 必須放在不同目錄：knowledge_emb.npz 是固定檔名。",
+        epilog="兩份 KB 必須放在不同目錄（保守限制，見模組說明）。",
     )
     parser.add_argument("kb", type=Path, help="第一份 knowledge.json")
     parser.add_argument("other_kb", type=Path, nargs="?",

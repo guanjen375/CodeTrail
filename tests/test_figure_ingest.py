@@ -896,6 +896,9 @@ def test_extraction_failure_leaves_knowledge_json_byte_identical(tmp_path: Path,
 
     assert kb_path.read_bytes() == before, "抽取失敗後 knowledge.json 必須零寫入"
     assert not (tmp_path / RAG.KNOWLEDGE_EMB_FILE).exists(), "外掛向量也不得被寫出"
+    assert not RAG.kb_cache.cache_file(kb_path).exists(), (
+        "向量搬到隱藏 cache 之後,零寫入也要涵蓋那裡"
+    )
     assert embed_spy.calls == [], "抽取失敗不得先算 embedding"
     assert harness.write_artifacts.calls, "失敗也要留 review artifact"
     (_args, kwargs) = harness.write_artifacts.calls[-1]

@@ -110,7 +110,7 @@ assert AICODE_ROOT is not None  # for type checkers
 
 import config
 import code_context
-from config import KNOWLEDGE_FILE, KNOWLEDGE_EMB_FILE, RUN_COMMAND_TIMEOUT
+from config import KNOWLEDGE_FILE, RUN_COMMAND_TIMEOUT
 from knowledge import KnowledgeBase, load_knowledge_base_strict
 from knowledge_store import KnowledgeStoreError
 import code_rag as code_rag_module
@@ -1513,13 +1513,20 @@ def _run_rag_subprocess(cmd, *, timeout: int) -> _RagRun:
 
 
 @_tool()
-def ingest_document(path: str, mode: str = "auto", preflight_only: bool = False) -> str:
+def ingest_document(path: str, mode: str = "auto", preflight_only: bool = False,
+                   fresh: bool = False) -> str:
     """Ingest a file into the project knowledge base.
 
     呼叫 AICODE_ROOT/RAG.py 把指定檔案切 chunk + 算 embedding,append 到
     AICODE_ROOT/knowledge.json。查詢端會自動偵測檔案變更:下一次
     query_knowledge / query_knowledge_strict 會先重載 KB 再查,不依賴人工
     記得 reload。想「立即」載入並確認 chunk 數,可呼叫 reload_knowledge_base()。
+
+    **KB 只有 knowledge.json 一個檔要管**:向量是程式自管的 cache(藏在
+    `.codetrail/cache/embeddings/`),缺了會自動依 knowledge.json 重建、身分對不上
+    一律丟棄重建、重建不了就中止查詢而**不會**拿舊向量湊合。使用者要備份 / 複製 /
+    刪除知識庫,只需要動 knowledge.json;刪掉它之後,無主的向量會在下一次載入或
+    ingest 時自動清掉。
 
     ── PDF 的圖:兩條 lane(範圍不同,不要混為一談)──────────────────
 
@@ -1586,6 +1593,13 @@ def ingest_document(path: str, mode: str = "auto", preflight_only: bool = False)
         preflight_only: True 時只跑 `RAG.py --preflight` 估算成本並回報是否超過
               上限,**不呼叫 VL、不算 embedding、不動 knowledge.json**。
               只支援 .pdf + document 模式;其他組合會直接回錯誤而不啟動子行程。
+        fresh: True 時走「一步到位重建」:清空既有 KB chunks、讓舊 embeddings
+              cache 失效、只留這一份文件,全部在同一次原子提交裡完成。中途失敗
+              不會留下「新 JSON 配舊向量」或半套可查詢狀態(整批回滾)。
+              **不會**刪 `.codetrail/figures/` 或其中的 human_verified 人工覆核
+              資料;這份文件自己已通過驗證的人工修正會照 §15.7 沿用回來。
+              預設 False ＝ 既有的 append 語意,一個字都沒變。
+              不能與 preflight_only 併用(後者是零寫入的估算)。
 
     Returns:
         RAG.py 的執行輸出(逐行串流收集)+ 後續建議。逾時時**保留已經收到的
@@ -1663,6 +1677,12 @@ def ingest_document(path: str, mode: str = "auto", preflight_only: bool = False)
             f"      沒有 preflight 需求就把 preflight_only 拿掉,直接入庫。"
         )
 
+    if preflight_only and fresh:
+        return (
+            "錯誤: preflight_only 是零寫入的估算,不能同時 fresh=True(那是重建 KB)。\n"
+            "      先用 preflight_only=True 看成本,確認後再單獨呼叫 fresh=True。"
+        )
+
     kb_path = Path(AICODE_ROOT) / KNOWLEDGE_FILE
 
     # 組 CLI args
@@ -1672,10 +1692,13 @@ def ingest_document(path: str, mode: str = "auto", preflight_only: bool = False)
     elif resolved_mode == "chat":
         cmd += ["--chat", "-y"]
     # document / binary: 無額外 flag(走 add_document)
+    if fresh:
+        cmd += ["--fresh"]
     if preflight_only:
         cmd += ["--preflight"]  # 契約:旗標放最後
 
-    label = "ingest_document (preflight)" if preflight_only else "ingest_document"
+    label = ("ingest_document (preflight)" if preflight_only
+             else "ingest_document (fresh)" if fresh else "ingest_document")
     timeout = _PREFLIGHT_TIMEOUT_SECONDS if preflight_only else _INGEST_TIMEOUT_SECONDS
 
     try:
@@ -1798,7 +1821,7 @@ def remove_document(source: str) -> str:
     in each chunk (the same string ingest_document recorded).
 
     操作對象是 AICODE_ROOT/knowledge.json。刪除會在同一個 store lock 內同步
-    篩掉 NPZ 對應列並原子替換 JSON/NPZ；不會留下無向量的剩餘 chunks。
+    篩掉對應的向量列並原子替換 JSON ＋ embeddings cache；不會留下無向量的剩餘 chunks。
 
     查詢端會自動偵測檔案變更:下一次 query_knowledge 會先重載再查。
     想立即生效+看狀態可呼叫 reload_knowledge_base()。
@@ -1830,7 +1853,7 @@ def remove_document(source: str) -> str:
         f"刪了 {result['removed_chunks']} 個 chunk + "
         f"{result['removed_documents']} 筆 metadata.documents 紀錄"
         f"(source = '{target}'),剩 {result['remaining_chunks']} 個 chunk / "
-        f"{result['remaining_documents']} 個文件；NPZ 向量列已同步提交。\n"
+        f"{result['remaining_documents']} 個文件；向量列已在同一次提交裡同步。\n"
         f"剩餘 sources: {result['sources'] or '(無)'}\n\n"
         f"變更會在下一次查詢時自動載入;要立即生效可呼叫 reload_knowledge_base()。"
     )

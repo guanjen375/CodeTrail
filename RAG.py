@@ -45,6 +45,7 @@ from knowledge_store import (
 # - 所有模式都需要 llama-server embedding 端點 (預設 8081)
 
 import context_signals
+import kb_cache
 import llama_client
 
 # 執行期才讀的設定（旗標之類）走這個 module handle，不要 import-time 綁值；
@@ -2982,7 +2983,13 @@ def load_knowledge_base(
 
     `_already_locked` 給「load→改→save 要在同一把鎖裡完成」的呼叫端用。flock 是
     綁在 open file description 上的：同一個行程另開一個 fd 再上鎖會**擋住自己**，
-    所以不能靠重入。
+    所以不能靠重入。它同時也關掉 cache 自動重建：重算要連 embedding server，
+    在別人的 exclusive 交易裡做網路 I/O 會把整個 KB 鎖住幾十分鐘。呼叫端一律
+    先在鎖外 load 一次（那次會把 cache 補好），鎖內這次就只是重讀。
+
+    JSON 不在了 ＝ 空知識庫，而且**順手清掉無主的 embeddings cache**：使用者用
+    檔案總管刪掉 knowledge.json 之後，不該還留著一份看起來像知識庫的向量檔。
+    這一步不建立任何目錄，`--preflight` 那條零寫入路徑才不會長出 `.codetrail/`。
     """
     if output_path.exists():
         @contextlib.contextmanager
@@ -2996,10 +3003,13 @@ def load_knowledge_base(
         with _maybe_lock():
             with open(output_path, 'r', encoding='utf-8') as f:
                 kb = json.load(f)
-            _restore_embeddings_from_npz(kb, output_path)
+            _restore_embeddings_from_npz(
+                kb, output_path, allow_rebuild=not _already_locked)
             if not _quiet:
                 print(f"[INFO] 載入現有知識庫: {len(kb.get('chunks', []))} 個區塊")
             return kb
+
+    kb_cache.purge(output_path, announce=not _quiet)
 
     # 建立空的知識庫
     return {
@@ -3021,11 +3031,17 @@ def _chunks_content_hash(
     return context_signals.chunks_content_hash(chunks, schema=schema)
 
 
-def _restore_embeddings_from_npz(kb: Dict, output_path: Path) -> bool:
-    """把 JSON 外掛的 .npz embeddings 補回 chunks。
+def _restore_embeddings_from_npz(
+    kb: Dict, output_path: Path, *, allow_rebuild: bool = True
+) -> bool:
+    """把 chunks 的向量補回來（來源是程式自管的 embeddings cache）。
 
-    RAG JSON 為了減少體積不再保存 embedding；增量新增文件前必須先把舊
-    embeddings 還原，否則下一次 save 會把舊 chunks 寫成零向量。
+    RAG JSON 為了減少體積不保存 embedding；增量新增文件前必須先把舊 embeddings
+    還原，否則下一次 save 會把舊 chunks 寫成零向量。
+
+    驗證與重建的規則**只有一份**，在 ``kb_cache``：查詢端（knowledge.KnowledgeBase）
+    走的是同一個函式，兩邊不可能各自漂移出一套寬鬆版本。這裡只決定「驗不過時要
+    不要重算」：``allow_rebuild=False``（別人的 exclusive 交易裡）一律 fail-loud。
 
     KB 有任何 ctx 時，gate 矩陣（content-only 決策訊號）必須同時存在——缺了就
     fail-loud，絕不退回「拿 contextual 向量當 gate 用」：那等於讓生成脈絡抬高
@@ -3057,106 +3073,16 @@ def _restore_embeddings_from_npz(kb: Dict, output_path: Path) -> bool:
             )
         return True
 
-    try:
-        import numpy as np
-        from config import KNOWLEDGE_EMB_FILE
-    except ImportError:
-        return False
+    matrices, stale = kb_cache.locate(output_path, chunks, saved_metadata)
+    if matrices is None:
+        if not allow_rebuild:
+            raise kb_cache.fatal(stale)
+        # 重算會直接把兩套向量掛回 chunks（validate_embeddings 已驗過）
+        kb_cache.rebuild(output_path, chunks, saved_metadata, reason=stale)
+        return True
 
-    emb_path = output_path.parent / KNOWLEDGE_EMB_FILE
-    if not emb_path.exists():
-        raise KnowledgeStoreError(
-            f"knowledge embedding file is missing: {emb_path}. "
-            "Rebuild the knowledge base; refusing to continue with vectorless chunks."
-        )
-
-    try:
-        with np.load(emb_path, allow_pickle=False) as data:
-            embeddings = data["embeddings"].copy()
-            emb_model = str(data.get("embedding_model", ""))
-            chunk_count = int(data.get("chunk_count", 0))
-            content_hash = str(data.get("content_hash", ""))
-            hash_schema = str(data.get("content_hash_schema", LEGACY_CONTENT_HASH_SCHEMA))
-            npz_generation = str(data.get("store_generation", ""))
-            stored_dimension = int(data.get("embedding_dimension", 0))
-            has_gate_matrix = "embeddings_gate" in getattr(data, "files", [])
-            gate_embeddings = data["embeddings_gate"].copy() if has_gate_matrix else None
-            gate_hash = str(data.get("gate_content_hash", ""))
-            gate_schema = str(data.get("gate_content_hash_schema", ""))
-    except KeyError as e:
-        raise KnowledgeStoreError(f"knowledge embeddings are incomplete in {emb_path}: {e}") from e
-    except Exception as e:
-        raise KnowledgeStoreError(f"failed to load knowledge embeddings from {emb_path}: {e}") from e
-
-    if emb_model != EMBEDDING_MODEL or (saved_model and saved_model != EMBEDDING_MODEL):
-        raise KnowledgeStoreError(
-            "embedding model mismatch: "
-            f"JSON={saved_model or '(missing)'}, NPZ={emb_model or '(missing)'}, "
-            f"configured={EMBEDDING_MODEL}. Rebuild the whole knowledge base; "
-            "mixing vectors from different models is forbidden."
-        )
-
-    if chunk_count != len(chunks):
-        raise KnowledgeStoreError(
-            f"embedding chunk_count mismatch: NPZ={chunk_count}, JSON={len(chunks)}"
-        )
-
-    if getattr(embeddings, "ndim", 0) != 2 or embeddings.shape[0] != len(chunks):
-        raise KnowledgeStoreError(
-            f"embedding matrix shape mismatch: got {getattr(embeddings, 'shape', None)}, "
-            f"expected ({len(chunks)}, dimension)"
-        )
-    if stored_dimension and embeddings.shape[1] != stored_dimension:
-        raise KnowledgeStoreError(
-            f"embedding dimension metadata mismatch: NPZ matrix={embeddings.shape[1]}, "
-            f"metadata={stored_dimension}"
-        )
-
-    json_generation = str(kb.get("metadata", {}).get("store_generation", ""))
-    if json_generation and npz_generation != json_generation:
-        raise KnowledgeStoreError(
-            f"knowledge store generation mismatch: JSON={json_generation}, "
-            f"NPZ={npz_generation or '(missing)'}"
-        )
-
-    # Required-schema 對照：不能只信 NPZ 自報的 schema 再拿它重算 hash——
-    # 那樣 legacy NPZ 永遠自驗通過，程式換了組字規則也察覺不到。
-    allowed_schemas = context_signals.required_retrieval_schemas(has_ctx=needs_gate)
-    if hash_schema not in allowed_schemas:
-        raise KnowledgeStoreError(
-            f"knowledge embedding schema mismatch: NPZ={hash_schema!r}, "
-            f"required one of {sorted(allowed_schemas)}. Rebuild the knowledge base."
-        )
-
-    current_hash = _chunks_content_hash(chunks, schema=hash_schema)
-    if content_hash and content_hash != current_hash:
-        raise KnowledgeStoreError(
-            f"knowledge embedding content hash mismatch: NPZ={content_hash}, JSON={current_hash}"
-        )
-
-    if needs_gate:
-        if gate_embeddings is None:
-            raise KnowledgeStoreError(
-                f"knowledge store has generated chunk context but {emb_path} carries no "
-                "gate (content-only) matrix; refusing to fall back to contextual vectors "
-                "for decisions. Rebuild the knowledge base."
-            )
-        if gate_schema != context_signals.GATE_SCHEMA:
-            raise KnowledgeStoreError(
-                f"gate embedding schema mismatch: NPZ={gate_schema!r}, "
-                f"required {context_signals.GATE_SCHEMA!r}. Rebuild the knowledge base."
-            )
-        if getattr(gate_embeddings, "ndim", 0) != 2 or gate_embeddings.shape[0] != len(chunks):
-            raise KnowledgeStoreError(
-                "gate embedding matrix shape mismatch: got "
-                f"{getattr(gate_embeddings, 'shape', None)}, expected ({len(chunks)}, dimension)"
-            )
-        current_gate_hash = _chunks_content_hash(chunks, schema=context_signals.GATE_SCHEMA)
-        if gate_hash and gate_hash != current_gate_hash:
-            raise KnowledgeStoreError(
-                f"gate embedding content hash mismatch: NPZ={gate_hash}, JSON={current_gate_hash}"
-            )
-
+    embeddings = matrices.embeddings
+    gate_embeddings = matrices.gate_embeddings
     for index, chunk in enumerate(chunks):
         if not chunk.get("embedding"):
             row = embeddings[index]
@@ -3210,10 +3136,12 @@ def save_knowledge_base(kb: Dict, output_path: Path, *, _already_locked: bool = 
     _, saved_emb_path = save_knowledge_store_atomic(
         kb,
         output_path,
-        embedding_file=KNOWLEDGE_EMB_FILE,
+        embedding_file=kb_cache.cache_file(output_path),
         embedding_model=EMBEDDING_MODEL,
         content_hash=content_hash,
         content_hash_schema=retrieval_schema,
+        chunk_ids=kb_cache.chunk_row_ids(kb["chunks"]),
+        legacy_companion=kb_cache.legacy_companion(output_path),
         gate_content_hash=gate_hash,
         gate_content_hash_schema=context_signals.GATE_SCHEMA if needs_gate else None,
         already_locked=_already_locked,
@@ -3221,9 +3149,11 @@ def save_knowledge_base(kb: Dict, output_path: Path, *, _already_locked: bool = 
     if saved_emb_path:
         emb_size = saved_emb_path.stat().st_size / 1024 / 1024
         gate_note = "（含 gate 矩陣）" if needs_gate else ""
-        print(f"     Embeddings: {saved_emb_path.name} ({emb_size:.2f} MB){gate_note}")
+        print(f"     Embeddings: {emb_size:.2f} MB{gate_note}（程式自管的 cache，"
+              f"使用者不需要備份/複製）")
     else:
-        print(f"     Embeddings: 已移除空知識庫的 {KNOWLEDGE_EMB_FILE}")
+        print("     Embeddings: 空知識庫，已清除 embeddings cache")
+        kb_cache.purge(output_path)
 
     file_size = output_path.stat().st_size / 1024 / 1024  # MB
     print(f"\n[OK] 知識庫已更新!")
@@ -3240,13 +3170,17 @@ def remove_document_from_knowledge_base(output_path: Path, source: str) -> Dict:
     if not output_path.is_file():
         raise KnowledgeStoreError(f"knowledge JSON does not exist: {output_path}")
 
+    # 先在鎖外載一次：cache 缺了/過期了就在這裡重算完。重算要連 embedding server，
+    # 放進下面的 exclusive 交易會把整個 KB 鎖住整段網路 I/O。
+    load_knowledge_base(output_path, _quiet=True)
+
     with knowledge_store_lock(output_path, exclusive=True):
         try:
             with open(output_path, "r", encoding="utf-8") as handle:
                 kb = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
             raise KnowledgeStoreError(f"failed to read {output_path}: {exc}") from exc
-        _restore_embeddings_from_npz(kb, output_path)
+        _restore_embeddings_from_npz(kb, output_path, allow_rebuild=False)
 
         chunks = list(kb.get("chunks", []))
         documents = list(kb.setdefault("metadata", {}).get("documents", []))
@@ -3360,8 +3294,16 @@ def _commit_document_to_kb(
     label: str = "文件",
     generate_context: bool = False,
     figure_guard: Optional[Dict] = None,
+    fresh: bool = False,
 ) -> bool:
     """把一份 ExtractedDocument 併進知識庫（同名文件先移除舊 chunks）。
+
+    `fresh=True`：這一份文件成為新 KB 的全部內容——既有 chunks 在**同一次原子
+    提交**裡被換掉，舊向量隨著 generation 換新自動失效。`.codetrail/figures/`
+    與其中的人工覆核紀錄一個位元組都不動（那是花時間換來的資料，不是 cache）；
+    這份文件自己的 `human_verified` 已經在抽取階段沿用回來了（§15.7）。
+    中途任何一步失敗都不會清空 KB：清空只發生在 exclusive lock 內、提交之前，
+    而提交失敗會整批回滾。
 
     七個入口以前各自複製這段（載入 → 去重同名 → embedding → 配 id → append →
     save）。共用之後「一份文件怎麼進 KB」只有一條路；要在入庫前多做一步
@@ -3405,7 +3347,19 @@ def _commit_document_to_kb(
     # 這裡開始才碰共用狀態：整段 read-modify-write 在同一把鎖內。
     with knowledge_store_lock(output_path, exclusive=True):
         kb = load_knowledge_base(output_path, _already_locked=True)
+        # figure guard 必須看**清空之前**的 KB：它比對的是「這份文件的人工確認在
+        # 抽取期間有沒有被別人改掉」，看空的當然永遠一致。
         _assert_figure_guard(figure_guard, kb)
+
+        carried_human = 0
+        if fresh:
+            dropped_chunks = len(kb.get("chunks", []))
+            dropped_docs = len(kb["metadata"].get("documents", []))
+            carried_human = len(human_revision_baseline(new_chunks, document.source))
+            print(f"[INFO] fresh ingest：清空既有 {dropped_chunks} 個 chunk"
+                  f"（{dropped_docs} 份文件），舊 embeddings cache 一併失效")
+            kb["chunks"] = []
+            kb["metadata"]["documents"] = []
 
         # 檢查是否已存在同名文件（若有則先移除舊的）
         doc_name = document.source
@@ -3422,6 +3376,9 @@ def _commit_document_to_kb(
 
         # 儲存
         save_knowledge_base(kb, output_path, _already_locked=True)
+        if fresh:
+            print(f"[INFO] fresh ingest 已重建 KB，並保留 {carried_human} 筆 "
+                  "human_verified 紀錄。")
 
     # KB-aware prune 一律在 store lock 釋放之後：prune 自己要重讀 KB，在鎖內呼叫
     # 會自鎖。失敗只警告——KB 已經成功提交，舊 run 目錄留著只是佔空間。
@@ -3438,14 +3395,18 @@ def _commit_document_to_kb(
 
 
 def add_document(input_file: str, output_file: str, *, generate_context: bool = False,
-                 preflight_only: bool = False):
+                 preflight_only: bool = False, fresh: bool = False):
     """將文件加入知識庫
 
     `generate_context` 只有 `rebuild` 子命令會給 True——chunk 脈絡的唯一執行路徑
     是同步 CLI rebuild（MCP 那條有 600 秒 timeout，數十個大窗串行必然超時）。
 
     `preflight_only=True` 只算 PDF figure 預算並印報告，**零寫入**：不碰
-    knowledge.json / NPZ / embedding cache、不呼叫 VL、不算 embedding（契約 §11.4）。
+    knowledge.json / embeddings cache、不呼叫 VL、不算 embedding（契約 §11.4）。
+
+    `fresh=True` 是「一步到位重建」：清空既有 chunks、讓舊 embeddings cache 失效、
+    只留這一份文件，全部在同一次原子提交裡完成。`.codetrail/figures/` 與
+    `human_verified` 不受影響（見 `_commit_document_to_kb`）。預設 append 語意不變。
     """
     input_path = Path(input_file)
     output_path = Path(output_file)
@@ -3461,6 +3422,10 @@ def add_document(input_file: str, output_file: str, *, generate_context: bool = 
         print(f"        文字: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
         print(f"        二進位: {', '.join(sorted(BINARY_EXTENSIONS))}")
         print(f"        ELF: {', '.join(sorted(ELF_EXTENSIONS))}")
+        sys.exit(1)
+
+    if preflight_only and fresh:
+        print("[ERROR] --preflight 是零寫入的估算，不能同時 --fresh（那是重建 KB）")
         sys.exit(1)
 
     if preflight_only:
@@ -3485,7 +3450,7 @@ def add_document(input_file: str, output_file: str, *, generate_context: bool = 
 
     if not _commit_document_to_kb(
         document, output_file, label="文件", generate_context=generate_context,
-        figure_guard=getattr(document, _FIGURE_PRUNE_ATTR, None),
+        figure_guard=getattr(document, _FIGURE_PRUNE_ATTR, None), fresh=fresh,
     ):
         sys.exit(1)
 
@@ -3556,7 +3521,8 @@ def interactive_chat_screenshot(image_file: str, output_file: str):
         print("[INFO] 已取消，內容未儲存")
 
 
-def _add_chat_content_to_kb(image_path: Path, content: str, output_file: str):
+def _add_chat_content_to_kb(image_path: Path, content: str, output_file: str,
+                            *, fresh: bool = False):
     """將已分析的聊天內容加入知識庫（內部函式）"""
     # 自動快取分析結果
     cache_file = _save_to_cache(image_path.name, content, "chat")
@@ -3564,10 +3530,10 @@ def _add_chat_content_to_kb(image_path: Path, content: str, output_file: str):
         print(f"[INFO] 快取已存: {cache_file}")
 
     document = build_chat_document(image_path.name, content)
-    _commit_document_to_kb(document, output_file, label="截圖知識")
+    _commit_document_to_kb(document, output_file, label="截圖知識", fresh=fresh)
 
 
-def add_chat_screenshot(image_file: str, output_file: str):
+def add_chat_screenshot(image_file: str, output_file: str, *, fresh: bool = False):
     """將聊天截圖加入知識庫（相容舊 API，直接入庫不詢問）"""
     image_path = Path(image_file)
     output_path = Path(output_file)
@@ -3589,7 +3555,7 @@ def add_chat_screenshot(image_file: str, output_file: str):
     print(f"[INFO] 處理: {image_path.name}")
     document = process_chat_screenshot_document(str(image_path))
 
-    if not _commit_document_to_kb(document, output_file, label="截圖知識"):
+    if not _commit_document_to_kb(document, output_file, label="截圖知識", fresh=fresh):
         sys.exit(1)
 
 
@@ -3837,7 +3803,7 @@ def _add_url_content_to_kb(url: str, content: str, title: str, output_file: str)
     _commit_document_to_kb(document, output_file, label="網頁知識")
 
 
-def add_url(url: str, output_file: str):
+def add_url(url: str, output_file: str, *, fresh: bool = False):
     """將網頁內容加入知識庫（相容舊 API，直接入庫不詢問）"""
     output_path = Path(output_file)
 
@@ -3857,7 +3823,7 @@ def add_url(url: str, output_file: str):
         print("[ERROR] 無法從網頁提取內容，新增失敗")
         sys.exit(1)
 
-    _commit_document_to_kb(document, output_file, label="網頁知識")
+    _commit_document_to_kb(document, output_file, label="網頁知識", fresh=fresh)
 
 
 # ============================================================
@@ -3915,7 +3881,7 @@ def _add_image_content_to_kb(image_path: Path, content: str, output_file: str):
     _commit_document_to_kb(document, output_file, label="圖片知識")
 
 
-def add_technical_image(image_file: str, output_file: str):
+def add_technical_image(image_file: str, output_file: str, *, fresh: bool = False):
     """將技術圖片加入知識庫（相容舊 API，直接入庫不詢問）"""
     image_path = Path(image_file)
     output_path = Path(output_file)
@@ -3937,7 +3903,7 @@ def add_technical_image(image_file: str, output_file: str):
     print(f"[INFO] 處理: {image_path.name}")
     document = process_technical_image_document(str(image_path))
 
-    if not _commit_document_to_kb(document, output_file, label="圖片知識"):
+    if not _commit_document_to_kb(document, output_file, label="圖片知識", fresh=fresh):
         sys.exit(1)
 
 
@@ -3976,8 +3942,16 @@ def rebuild_cli(argv: List[str]) -> int:
         "--preflight", action="store_true",
         help="只算 PDF figure 預算並印報告，零寫入（exit 2 = 超出預算）",
     )
+    parser.add_argument(
+        "--fresh", action="store_true",
+        help=("先清空既有 chunks 再灌（第一份文件生效，之後的照舊 append）；"
+              "embeddings cache 隨新 generation 自動失效，.codetrail/figures/ 不動"),
+    )
     parser.set_defaults(context=None)
     args = parser.parse_args(argv)
+
+    if args.preflight and args.fresh:
+        parser.error("--preflight 是零寫入的估算，不能同時 --fresh")
 
     if args.preflight:
         print("[INFO] --preflight：只計算 figure 預算，不入庫、不生成 chunk 脈絡。")
@@ -3997,9 +3971,15 @@ def rebuild_cli(argv: List[str]) -> int:
     source = "CLI 旗標" if args.context is not None else "config"
     print(f"[INFO] chunk 脈絡生成: {'開' if generate_context else '關'}（來源: {source}）")
 
+    fresh = args.fresh
+    if fresh:
+        print("[INFO] --fresh：第一份文件會清空既有知識庫（figure artifacts 不動），"
+              "後續文件照常 append。")
     for document_path in args.documents:
         print(f"\n=== {document_path} ===")
-        add_document(document_path, args.kb, generate_context=generate_context)
+        add_document(document_path, args.kb, generate_context=generate_context,
+                     fresh=fresh)
+        fresh = False   # 只清一次，否則每一份都會把前一份洗掉
     return 0
 
 
@@ -4008,7 +3988,8 @@ def print_usage():
     print("用法:")
     print("  python3 RAG.py <input_file> <output_json>             # 一般文件（直接入庫）")
     print("  python3 RAG.py <input.pdf> <output_json> --preflight  # 只算 PDF figure 預算並印報告（零寫入）")
-    print("  python3 RAG.py rebuild --kb <output_json> <input>... [--preflight]  # 批次入庫（唯一會生成 chunk 脈絡的路徑）")
+    print("  python3 RAG.py rebuild --kb <output_json> <input>... [--preflight|--fresh]  # 批次入庫（唯一會生成 chunk 脈絡的路徑）")
+    print("  python3 RAG.py <input_file> <output_json> --fresh     # 清空既有 chunks 後只留這一份（figure artifacts 不動）")
     print("  python3 RAG.py <screenshot> <output_json> --chat      # 聊天截圖（互動式）")
     print("  python3 RAG.py <image> <output_json> --image          # 技術圖片（互動式）")
     print("  python3 RAG.py <url> <output_json> --url              # 網頁（互動式）")
@@ -4062,8 +4043,10 @@ def main(argv: List[str]) -> int:
     一個字都沒變，只有 figure lane 的兩種例外被映射成 2 / 1。
     """
     preflight_only = "--preflight" in argv
+    fresh = "--fresh" in argv
     auto_yes = any(arg in ("-y", "--yes") for arg in argv)
-    args = [arg for arg in argv if arg not in ("-y", "--yes", "--preflight")]
+    args = [arg for arg in argv
+            if arg not in ("-y", "--yes", "--preflight", "--fresh")]
 
     # 解析參數
     if len(args) < 2:
@@ -4087,19 +4070,23 @@ def main(argv: List[str]) -> int:
         output_file = args[1]
         mode = last_arg
 
+        if fresh and not auto_yes:
+            print("[ERROR] --fresh 會清空知識庫，互動模式請加 -y 明確確認")
+            return 1
+
         if mode == "--chat":
             if auto_yes:
-                add_chat_screenshot(input_file, output_file)
+                add_chat_screenshot(input_file, output_file, fresh=fresh)
             else:
                 interactive_chat_screenshot(input_file, output_file)
         elif mode == "--image":
             if auto_yes:
-                add_technical_image(input_file, output_file)
+                add_technical_image(input_file, output_file, fresh=fresh)
             else:
                 interactive_technical_image(input_file, output_file)
         elif mode == "--url":
             if auto_yes:
-                add_url(input_file, output_file)
+                add_url(input_file, output_file, fresh=fresh)
             else:
                 interactive_url(input_file, output_file)
         return 0
@@ -4111,7 +4098,7 @@ def main(argv: List[str]) -> int:
     input_file = args[0]
     output_file = args[1]
     try:
-        add_document(input_file, output_file, preflight_only=preflight_only)
+        add_document(input_file, output_file, preflight_only=preflight_only, fresh=fresh)
     except Exception as exc:  # noqa: BLE001 — 只攔 figure lane 的兩種，其餘原樣往上拋
         code = _pdf_cli_error_code(exc)
         if code is None:
