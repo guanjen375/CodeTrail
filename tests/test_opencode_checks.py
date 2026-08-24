@@ -263,13 +263,36 @@ def test_agents_template_must_have_exactly_one_fenced_block():
 
 @pytest.mark.smoke
 def test_shipped_template_has_a_usable_tool_anchor():
-    """真正出貨的範本必須抓得到「工具共 N 個」與工具名 —— 抓不到的話漂移偵測
-    會靜默退化成「永遠看起來沒問題」。"""
+    """真正出貨的範本必須抓得到工具或 namespace anchor —— 抓不到的話
+    漂移偵測會靜默退化成「永遠看起來沒問題」。"""
     body = check.extract_agents_template(
         check.AGENTS_TEMPLATE_DOC.read_text(encoding="utf-8")
     )
     count, tools = check._tool_anchor(body)
     assert count is not None and int(count) == len(tools) >= 1
+
+
+@pytest.mark.smoke
+def test_shipped_agents_prompt_stays_small_and_schema_driven():
+    """Regression:完整工具手冊塞進每輪 system prompt 時,真實 OpenCode request
+    只會回答「我現在呼叫工具」卻不產生 structured tool call。
+
+    全域檔只保留跨工具的不變式；工具清單與操作細節由本輪 schema / 文件承擔。
+    extract 階段也要 fail-loud，避免未跑測試的本機 checkout 安裝超長範本。
+    """
+    body = check.extract_agents_template(
+        check.AGENTS_TEMPLATE_DOC.read_text(encoding="utf-8")
+    )
+    assert len(body) <= 1600, f"全域 AGENTS.md 過長: {len(body)} chars"
+    assert "`codetrail_*`" in body
+    assert body.count("`codetrail_") <= 3, "全域 prompt 不得內嵌完整工具目錄"
+    assert "結構化" in body
+    assert "收到工具結果前" in body
+    assert "最多重試一次" in body
+
+    oversized = "# 說明\n\n```markdown\n" + ("x" * 1601) + "\n```\n"
+    with pytest.raises(check.AgentsTemplateError, match="過長"):
+        check.extract_agents_template(oversized)
 
 
 @pytest.mark.smoke

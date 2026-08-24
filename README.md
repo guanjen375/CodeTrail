@@ -76,7 +76,7 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 - 四個 server 預設只綁 `127.0.0.1`。同一專案不要同時開 standalone `aicode` 與
   `aicode_web`；TUI 要接現有 web backend 時用 `aicode attach`。安全與 web 細節分別見
   [docs/security.md](docs/security.md)與 §5.4。
-- 第一次跑 `aicode` 會自動把 [OpenCode 全域 AGENTS.md 範本](docs/opencode-agents-template.md)裝進 `~/.config/opencode/AGENTS.md`(那份檔決定模型會不會真的去用工具)。之後每次啟動都會比對:工具清單過期會印 `⚠ STALE` 並給同步命令,**但不會擋住啟動**。手動同步是
+- 第一次跑 `aicode` 會自動把 [OpenCode 全域 AGENTS.md 精簡範本](docs/opencode-agents-template.md)裝進 `~/.config/opencode/AGENTS.md`。它只保留結構化呼叫、證據與停止條件；**不要把完整工具清單或操作手冊貼進去**，那會增加每輪 system prompt，實際發生過模型只說「現在呼叫」卻不產生 tool call 的退化。舊版固定工具清單會印 `⚠ STALE` 並給同步命令，但不會擋住啟動。手動同步是
   `python3 scripts/opencode_contract_check.py --sync-agents-md`(會備份原檔)。
 
 ## 特別注意(首次部署最容易踩的)
@@ -660,8 +660,8 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
   或可信 VPN 為主，見 [安全邊界](docs/security.md#模型-apillama-server曝光面)。
 - **工具呼叫很多的 Build agent 建議設 `agent.build.temperature: 0`**。這是 [OpenCode 官方 agent 設定](https://dev.opencode.ai/docs/agents/)支援的 override,可降低本機模型把工具呼叫格式「說成文字」或隨機改寫格式的機率;它不會替你連上 MCP,也只影響 Build agent。改完先用 `opencode debug agent build` 確認解析結果含 `"temperature": 0`,再完全退出並重開 OpenCode、開新 session 測試。
 - **解析到設定不等於每個版本都一定把它送進 request body**。OpenCode 的 custom `@ai-sdk/openai-compatible` provider 有已知的 `temperature` 傳遞問題([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));因此需要所有 client 都有一致的 server 預設時,仍應在 deployment profile 的 `services.main.parameters` 設 `temperature`。`top_p` / `top_k` / `min_p` 等 provider schema 不一定支援的參數也放 server 端。完整判讀與假工具呼叫排查見 [docs/troubleshooting.md](docs/troubleshooting.md#mcp-connected-but-no-tool-call);取樣值必須依目前主模型的文件設定,不要沿用其他模型的數值。
-- **Connected 卻回答「沒有 CodeTrail」時,保留全域工具存在性規則作為模型約束**。新版 `aicode` 的自動 canary 會在進 TUI 前抓出 MCP 斷線、工具清單漂移與假 XML，但模型仍可能在後續某一輪隨機失手；`~/.config/opencode/AGENTS.md` 可明訂 19 個 `codetrail_*`、禁止假 XML / 假成功,並要求不確定時先做無副作用的 `codetrail_list_dir` 驗證。完整可複製範本(含 RAG 自發查詢、防杜撰與驗證紀律)見 [docs/opencode-agents-template.md](docs/opencode-agents-template.md),安裝 / 同步用 `python3 scripts/opencode_contract_check.py --sync-agents-md`;**這份檔不會跟著 `git pull` 更新**,工具清單一舊模型就會否認新工具存在,所以 `aicode` 每次啟動都會比對並在過期時印 `⚠ STALE`。強制重測方式見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。`ingest_document` 只寫 KB,不會把整份文件永久塞進每個新 session,所以不要把「匯入後剛好亂答」直接判成 RAG context overflow。
-- **要壓「模型杜撰不存在的具體事實」(條號 / 日期 / 數字),在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則**(OpenCode 會自動把它載入每一段對話,含純聊天)。範例與原理見 [docs/troubleshooting.md](docs/troubleshooting.md);[全域範本](docs/opencode-agents-template.md)已內建「事實準確性」段。注意這個 `~/.config/opencode/AGENTS.md` 是 OpenCode runtime 的全域規則檔,跟本 repo 根目錄那份「給修改 CodeTrail 原始碼的 agent 看的」`AGENTS.md` 是兩回事。
+- **Connected 卻只回答「我現在呼叫」時，先檢查全域 prompt 是否太肥**。`~/.config/opencode/AGENTS.md` 只能保留 `codetrail_*` schema anchor、禁止假 XML／假成功與停止條件；工具名稱和參數以本輪 schema 為準。不要明訂 19 個工具，也不要複製 RAG、graph、figure 的完整流程。實際 A/B 顯示，舊 4,869 字元範本和 OpenCode 完整 prompt 疊加時會讓模型以 `stop` 結束，僅移除舊範本就恢復 `codetrail_list_dir` 結構化呼叫。請用 `python3 scripts/opencode_contract_check.py --sync-agents-md` 同步[精簡範本](docs/opencode-agents-template.md)，完全退出後開新 session，再以 `AICODE_TOOL_CANARY_FORCE=1 aicode` 重驗；分層排查見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。`ingest_document` 只寫 KB，不會把全文永久塞進新 session。
+- **要壓「模型杜撰不存在的具體事實」(條號 / 日期 / 數字)，全域規則只留一條短約束**：沒有工具或使用者提供的證據就明說沒有，不要再貼長篇範例。OpenCode 會把全域檔載入每段對話；它跟 repo 根目錄那份給 coding agent 的 `AGENTS.md` 是兩回事。原理與按需提示方式見 [docs/troubleshooting.md](docs/troubleshooting.md)。
 - `limit.context: 65536` 是 OpenCode 對主 n_ctx 的 client-side 鏡像。正常不要分開調：用 `set_config.sh` 設一次主 n_ctx 並重啟 server；`aicode` 會觀測 server `-c` 的實值並自動同步此欄。
 - `permission` 區段:`*: deny` 是預設拒絕一切,只白名單 `codetrail_*`(經 CodeTrail 沙箱)。OpenCode 內建工具(`bash` / `read` / `write` 等)會繞過 CodeTrail 沙箱,所以這裡明確 `deny`。
 - `instructions` 的 `.codetrail/lessons.md` 是 [lessons(行為教訓)](docs/lessons.md)的注入點:`aicode` 每次啟動把已核准的行為規則 render 進該檔,OpenCode 連同 AGENTS.md 一起載入;檔案不存在時視同無匹配、直接略過。`codetrail_record_lesson` 設 `ask` 是 lessons 的人工核准閘 —— 模型只能「提案」,你在核准框看到 rule 內容、同意後才寫入。
@@ -746,8 +746,9 @@ embedding,查詢跟程式碼同語言時召回率差很多。33 萬符號的真�
 | 關鍵字堆 `read target from configuration file: tcf, config parse, properties` | 回一串叫 `read` 的無關符號(裸單字 `read` 在語料裡是 54 個 symbol 的名字,exact-symbol 命中把候選池洗掉了) |
 | 自然英文句 `tcf tool configuration file parsing for target core properties` | top-5 有 4 筆是正確答案 |
 
-你仍然可以用中文跟模型對話 —— 依 [docs/opencode-agents-template.md](docs/opencode-agents-template.md)
-的規則,模型負責把問題翻成英文再送進工具,回答還是用你的語言。
+你仍然可以用中文跟模型對話；`code_rag_search.query` 要用英文時，像上面的範例直接在當次
+問題要求模型翻成自然英文即可。不要為了這件事把整段 query 教學複製進每輪載入的全域
+[AGENTS.md](docs/opencode-agents-template.md)。
 
 `mode="context"` 會把 semantic seeds、確定的 1-hop caller/callee/include，以及相關 test/header/config/trace lexical evidence 合併去重後裝進固定字元 budget。`max_chars` 合法範圍是 `2000..30000`、預設 `12000`，`used_chars` 只計 `evidence[].text` 的實際字元，不宣稱 tokenizer token 數；歧義與 unresolved 只進 `uncertainties`，不偽裝成確定證據。candidate 數量、graph traversal 與字元 budget 的截斷原因會分開標示。所有 source window 仍由既有 sandboxed `read_file` 路徑讀取。graph 尚未建立或損壞時會降級回 semantic-only evidence 並標示 `graph_status`，不影響整次呼叫。
 
@@ -852,7 +853,7 @@ ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>
 | [docs/rag.md](docs/rag.md) | 讀檔、匯入附件(PDF / 圖片經 VL)、建立知識庫、圖片+RAG 一起用、查 spec |
 | [docs/mcp-tools.md](docs/mcp-tools.md) | CodeTrail 暴露的 19 個 MCP 工具與使用原則 |
 | [docs/lessons.md](docs/lessons.md) | lessons(行為教訓):糾正 → 提案 → 核准 → 注入 → 過期複審的完整生命週期與管理指令 |
-| [docs/opencode-agents-template.md](docs/opencode-agents-template.md) | OpenCode 全域 AGENTS.md 範本:工具存在性、RAG 自發查詢、行為教訓、防杜撰、驗證紀律 |
+| [docs/opencode-agents-template.md](docs/opencode-agents-template.md) | OpenCode 全域 AGENTS.md 精簡範本、1,600 字元預算與 prompt 過載排查 |
 | [docs/security.md](docs/security.md) | 沙箱邊界、OpenCode permission、外部匯入與 NDA 資料注意事項 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | `/status` / `/mcp`、ctx-safety、server 不可連、Blackwell CUDA、MoE 首字慢 |
 | [README_DEV.md](README_DEV.md) | 開發者維護命令、測試、eval、context gate 設計 |

@@ -11,8 +11,8 @@
   6. README OpenCode 範本的 MCP timeout == config.py 的 runtime 最小值
   7. README OpenCode 範本的 permission 區塊 == scripts/set_config.py 的
      _OPENCODE_PERMISSION_TEMPLATE(鍵、值、順序;codetrail_* 必須排在覆寫前)
-  8. docs/opencode-agents-template.md(全域 AGENTS.md 範本)的工具清單與
-     「工具共 N 個」數量 == mcp_server.py 實際工具
+  8. docs/opencode-agents-template.md 的文件用 manifest(安裝範本 fenced block
+     之外)與 mcp_server.py 實際工具一致
 
 退出碼:0=OK, 1=有 drift。
 """
@@ -135,10 +135,10 @@ def _check_agents_template_tools(
     mcp_tools: list[str],
     issues: list[str],
 ) -> None:
-    """docs/opencode-agents-template.md 的工具清單必須和 mcp_server.py 完全一致。
+    """文件用工具 manifest 必須和 mcp_server.py 完全一致。
 
-    全域 AGENTS.md 範本靠「完整列名 + 明確數量」壓小模型的工具幻覺;
-    清單漂移會直接把錯的工具名教給模型。
+    manifest 刻意放在可安裝 fenced block 外：人類文件仍要完整且可檢查，但不能
+    把整份目錄注入 OpenCode 的每一輪 system prompt。
     """
     if not template_text:
         issues.append("docs/opencode-agents-template.md 不存在(OpenCode 全域 AGENTS.md 範本)")
@@ -346,7 +346,7 @@ def check_all() -> list[str]:
     # 7. OpenCode permission template contract (README ↔ set_config.py)
     _check_permission_template_contract(readme_text, _read(SET_CONFIG), issues)
 
-    # 8. Global AGENTS.md template tool-list contract
+    # 8. Global AGENTS.md 文件用 manifest contract(不進可安裝 prompt)
     _check_agents_template_tools(_read(AGENTS_TEMPLATE_DOC), mcp_tools, issues)
 
     return issues

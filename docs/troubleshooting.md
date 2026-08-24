@@ -163,6 +163,7 @@ RAM 不夠的就保持 mmap 接受偶爾卡頓,或換較小模型 / 調高 CPU-M
 
 - `/status` 或 `opencode mcp list` 明明顯示 `codetrail Connected`,模型卻回答「沒有 CodeTrail 工具」,甚至改口說只有 `todos`、`web_search` 等別的工具。
 - 明確要求 `list_dir(path=".", depth=1)` 後,模型只輸出 `<codetrail_list_dir path="." depth="1"/>`,接著用自然語言宣稱「已成功取得目錄」,畫面上沒有工具卡、也沒有真實目錄內容。
+- 模型每輪都回答「我現在呼叫」「讓我直接使用工具」，但訊息隨即結束；使用者催促後只換句話重複，始終沒有工具卡。
 
 **先講結論:模型對「自己有哪些工具」的文字回答不是診斷資料,XML 長得像 tool call 也不代表執行過。** 要把三層狀態分開看:
 
@@ -265,9 +266,25 @@ curl -s http://localhost:8080/props | jq -r '.chat_template' \
 
 例如模型只寫出自創的 `<codetrail_list_dir .../>`,不會因為看起來像 XML 就被 frontend 當成結構化呼叫。不要靠 prompt 手寫 / 猜測底層 tool-call markup;應讓 OpenCode、provider adapter 與 llama.cpp chat template 處理。
 
-若 server 已降溫但模型仍會否認工具,把 [OpenCode 全域 AGENTS.md 範本](opencode-agents-template.md) 裝進 `~/.config/opencode/AGENTS.md`(`python3 scripts/opencode_contract_check.py --sync-agents-md`,會備份原檔),至少要「CodeTrail 工具存在性與真實呼叫」一段。**已經裝過的也要確認沒過期** —— 那份檔不會跟著 `git pull` 更新,工具清單一舊,模型就會否認新工具存在;`aicode` 啟動時的 `⚠ STALE: 全域 AGENTS.md 與範本不一致` 講的就是這件事。完整列名是刻意的:只寫一句「優先用 `codetrail_*`」仍可能被較弱的本機模型忽略;新增或移除 MCP tool 時要同步 [工具清單](mcp-tools.md)與該範本(consistency check 會抓)。
+若 server 已降溫但模型仍反覆承諾呼叫，先檢查 `~/.config/opencode/AGENTS.md`。**不要用更多規則修補**：舊版曾把 19 個工具、RAG、graph、figure 與 lessons 操作全部塞進這份每輪載入的檔案。真實 OpenCode request 的 A/B 結果是：保留舊 4,869 字元範本時以 `stop` 結束且零 tool call；只移除那份範本，其餘 request、20 個 schema 與 `tool_choice=auto` 不變，就正確呼叫 `codetrail_list_dir`。直接送同一批 CodeTrail schema 給 llama-server 也能正常呼叫，所以這種症狀是**全域提示與 frontend prompt 的交互過載**，不是 MCP transport 壞掉。
 
-改全域規則後完全退出並重開 OpenCode,用新 session 分別測「列出所有 CodeTrail 工具」與強制 `codetrail_list_dir`。前者只列清單、不出現工具卡是正常的;後者必須出現結構化 `tool_use`。降溫與規則都完成後仍反覆失敗,才表示這顆模型 / template 組合的工具呼叫能力不穩,應換成已驗證支援 tool calling 的模型或版本。
+同步 [1,600 字元內的精簡範本](opencode-agents-template.md)（會先備份原檔）：
+
+```bash
+python3 scripts/opencode_contract_check.py --sync-agents-md
+```
+
+精簡版只保留 `codetrail_*` schema anchor、結構化呼叫、證據與停止條件；完整工具名稱留在
+[工具清單](mcp-tools.md)，不再注入每一輪。看到 `⚠ STALE` 且說 live 還在使用舊版固定清單，
+就是這次遷移提醒。不要把備份中的完整工具手冊貼回去；若要保留語言或輸出格式偏好，只挑
+短規則合併。
+
+改完要完全退出並重開 OpenCode、建立新 session，再執行
+`AICODE_TOOL_CANARY_FORCE=1 aicode` 略過舊 cache。驗收時直接要求一次真實
+`codetrail_list_dir`；必須出現結構化 `tool_use`／工具卡，只有文字承諾不算。精簡、降溫與新
+session 都完成後仍反覆失敗，才判定這顆模型／template／frontend 版本組合的工具呼叫能力不穩，
+改用已量測支援 tool calling 的組合。不要把 `tool_choice=required` 當萬用補丁；本次完整 prompt
+A/B 中它輸出到長度上限仍沒有 tool call。
 
 ### 模型編造不存在的具體事實(條號 / 日期 / ticket 號 / 金額)—— 幻覺 / confabulation
 
@@ -292,14 +309,15 @@ curl -s http://localhost:8080/props | jq -r '.chat_template' \
 
 為什麼這裡仍建議在 server 旗標釘:OpenCode 官方支援 `agent.<name>.temperature`,但 custom openai-compatible provider 有版本相關的已知問題,可能解析了設定卻沒有把 `temperature` 送進 request body([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));`top_k` / `min_p` 又不一定在 provider schema 裡。agent override 適合針對 Build agent 降溫,server 參數則是所有未明示取樣值之 request 的共同 fallback。**改完 server 設定要重啟才生效。**
 
-**③ 在 `~/.config/opencode/AGENTS.md` 加一條防杜撰規則([全域範本](opencode-agents-template.md)已內建「事實準確性」段,裝過範本就不用再加)。** OpenCode 會把全域 `~/.config/opencode/AGENTS.md` 自動載入每一段對話(含純聊天)。加入類似:
+**③ 只保留一條短防杜撰規則。** [精簡全域範本](opencode-agents-template.md)已內建等價約束，
+同步過就不要再加。使用完全自訂的 `~/.config/opencode/AGENTS.md` 時，最多加入類似這一行：
 
 ```markdown
-## 事實準確性
-- 不要杜撰未提供的具體事實:合約條號、日期、ticket 編號、金額、API 名稱、檔案路徑、引用出處。
-- 沒有來源可佐證時,直接說「我手上沒有這項資訊」或輸出佔位符(如 `{待填}`),不要補一個看似合理的數字。
-- 區分「推測」與「事實」:要推測就明講這是推測,不要當成已知條件輸出。
+- 不要杜撰未提供的條號、日期、數字、API、路徑或引用；沒有證據就明說沒有，推測必須標明。
 ```
+
+不要把每種幻覺各寫一段規則或附大量反例；全域檔會進入每一輪，提示過載本身也會降低工具
+呼叫遵循率。
 
 (注意:這份 `~/.config/opencode/AGENTS.md` 是 OpenCode runtime 的全域規則,跟本 repo 根目錄那份「給修改 CodeTrail 原始碼的 AI agent 看的」`AGENTS.md` 不是同一個東西。)
 

@@ -18,7 +18,11 @@ CodeTrail 啟動聊天 frontend 前會硬性檢查 llama-server `:8081` (embeddi
 
 這兩件事分別對應下面的「在對話裡讓模型看到一個檔案」和「把附件做成知識庫讓模型隨時能查」。讀完這兩節就能開始實用。
 
-另外,模型要不要**自發**去查知識庫(不等你在對話裡點名工具),取決於模型行為規則,不是 RAG 本身。想提高自發查詢的機率,安裝 [OpenCode 全域 AGENTS.md 範本](opencode-agents-template.md):其中「知識庫(RAG)使用原則」用觸發條件式規則,讓模型遇到規格 / 數值 / 型號類問題先查一次 KB —— 不強制,也不拖慢一般對話。
+另外，模型要不要**自發**去查知識庫（不等你在對話裡點名工具），取決於 frontend 與模型的
+tool-call 能力，不是 RAG 本身。[OpenCode 全域 AGENTS.md 範本](opencode-agents-template.md)
+只保留「內部規格要先用唯讀工具取證」這種短約束；不要再加入整段 RAG 流程，長全域 prompt
+實際發生過反而讓模型不呼叫任何工具。重要問題請在當次 prompt 明講「先呼叫
+`query_knowledge` 查證再回答」，工具的詳細選項以本輪 schema 與本文件為準。
 
 ### 在對話裡讓模型看到一個檔案
 

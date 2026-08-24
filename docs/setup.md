@@ -198,7 +198,8 @@ content 會經 SSH 加密隧道送到 GPU 主機。
 9. 安全補齊既有 OpenCode config 缺少的 permission ask 覆寫與 lessons
    `instructions` contract；只新增缺鍵、保留使用者值，原檔備份。同一步也比對
    `~/.config/opencode/AGENTS.md` 與 [全域範本](opencode-agents-template.md):
-   沒有就自動安裝,工具清單過期印 `⚠ STALE` 並給同步命令,你自訂過的內容一律
+   沒有就自動安裝；舊版固定工具清單或缺少 `codetrail_*` schema anchor 時印
+   `⚠ STALE` 並給同步命令，你自訂過的內容一律
    不覆蓋 —— **這一項永遠不會擋住啟動**
 10. 把 active [lessons(行為教訓)](lessons.md) render 進 `.codetrail/lessons.md` 供 OpenCode 注入,並提示已過 `review_by` 的待複審清單
 11. 對三個 aux server 跑 hard preflight

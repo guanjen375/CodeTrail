@@ -64,16 +64,18 @@ REQUIRED_ASK_TOOLS = (
 LESSONS_INSTRUCTION = ".codetrail/lessons.md"
 
 # 全域 AGENTS.md(OpenCode 每段對話自動載入的行為規則)的來源範本。
-# set_config.py 不產生這份檔 —— 它一直只能靠使用者從文件複製貼上,所以
-# `git pull` 之後它會靜默停在舊版:工具清單少了新工具,模型於是否認新工具
-# 存在(那份清單就是最強的防幻覺錨點)。這裡負責把漂移講出來。
+# 這裡只放跨工具的不變式；實際工具名稱與參數由 OpenCode 每輪注入的 schema
+# 提供。把完整工具手冊複製進全域 prompt 曾讓模型只說「我現在呼叫」卻沒有
+# 產生 structured tool call，所以 extract 階段也守住硬性字元預算。
 AGENTS_TEMPLATE_DOC = REPO_ROOT / "docs" / "opencode-agents-template.md"
 AGENTS_MD_NAME = "AGENTS.md"
 AGENTS_MD_SKIP_ENV = "AICODE_AGENTS_MD_CHECK_SKIP"
+AGENTS_PROMPT_MAX_CHARS = 1600
+AGENTS_PROMPT_MAX_TOOL_MENTIONS = 3
 
 _AGENTS_FENCE_RE = re.compile(r"^```markdown\n(.*?)^```\s*$", re.S | re.M)
-_TOOL_COUNT_RE = re.compile(r"CodeTrail 工具共\s*(\d+)\s*個")
-_TOOL_NAME_RE = re.compile(r"`(codetrail_[a-z0-9_]+)`")
+_TOOL_COUNT_RE = re.compile(r"CodeTrail 工具(?:群)?共\s*(\d+)\s*個")
+_TOOL_NAME_RE = re.compile(r"`(codetrail_(?:[a-z0-9_]+|\*))`")
 
 
 def _print(line: str) -> None:
@@ -97,11 +99,27 @@ def extract_agents_template(text: str) -> str:
             f"{AGENTS_TEMPLATE_DOC.name} 必須剛好有一個 ```markdown fenced block,"
             f"實得 {len(blocks)} 個"
         )
-    return blocks[0]
+    body = blocks[0]
+    if len(body) > AGENTS_PROMPT_MAX_CHARS:
+        raise AgentsTemplateError(
+            f"全域 AGENTS.md 範本過長:{len(body)} chars > "
+            f"{AGENTS_PROMPT_MAX_CHARS};工具手冊請留在 fenced block 外"
+        )
+    tool_mentions = body.count("`codetrail_")
+    if tool_mentions > AGENTS_PROMPT_MAX_TOOL_MENTIONS:
+        raise AgentsTemplateError(
+            f"全域 AGENTS.md 範本內嵌過多工具名稱:{tool_mentions} > "
+            f"{AGENTS_PROMPT_MAX_TOOL_MENTIONS};請只保留 `codetrail_*` schema anchor"
+        )
+    return body
 
 
 def _tool_anchor(text: str) -> tuple[str | None, tuple[str, ...]]:
-    """回傳 (宣告的工具數, 列出的工具名)。抓不到工具行時回 (None, ())。"""
+    """回傳 (宣告的工具／namespace 數, anchor 名稱)。
+
+    舊版列出每個工具；精簡版只釘 ``codetrail_*`` namespace，避免把會漂移的
+    完整目錄注入每一輪。兩種形狀都要能讀，才能把舊版標成 stale 並提示同步。
+    """
     for line in text.splitlines():
         match = _TOOL_COUNT_RE.search(line)
         if match:
@@ -115,8 +133,8 @@ def agents_md_status(live: str | None, template: str) -> tuple[str, list[str]]:
     status:
       ``missing``  —— 沒有這份檔(從沒裝過)。
       ``ok``       —— 與範本逐字相同。
-      ``stale``    —— **工具清單對不上**。這條會讓模型否認新工具存在,是真的會壞事。
-      ``drifted``  —— 工具清單一致,其餘內容不同(使用者自訂,或範本改了說明性段落)。
+      ``stale``    —— 工具 anchor 對不上(含仍內嵌舊版固定工具清單)。
+      ``drifted``  —— 工具 anchor 一致,其餘內容不同(通常是使用者自訂)。
 
     只有 ``missing`` 值得自動寫入;``drifted`` 可能是刻意的自訂,不得覆蓋。
     """
@@ -129,6 +147,15 @@ def agents_md_status(live: str | None, template: str) -> tuple[str, list[str]]:
     tpl_count, tpl_tools = _tool_anchor(template)
     notes: list[str] = []
     if live_tools != tpl_tools or live_count != tpl_count:
+        if tpl_tools == ("codetrail_*",):
+            if live_count is None:
+                notes.append("live 的 AGENTS.md 缺少 `codetrail_*` schema anchor")
+            else:
+                notes.append(
+                    "live 仍使用舊版固定工具清單；完整目錄會增加每輪 prompt，"
+                    "也會隨工具版本漂移"
+                )
+            return "stale", notes
         if live_count is None:
             notes.append("live 的 AGENTS.md 沒有「CodeTrail 工具共 N 個」這一行")
         else:
@@ -201,8 +228,11 @@ def _handle_agents_md(args: argparse.Namespace, config_path: Path) -> int:
     # UnicodeDecodeError 繼承 ValueError 而**不是** OSError:漏接的話,
     # 一個非 UTF-8 的檔案就會讓這支 preflight 拋例外回非零,aicode 隨即硬退出。
     except (OSError, UnicodeError, AgentsTemplateError) as exc:
-        _print(f"UNKNOWN: 讀不到全域 AGENTS.md 範本({type(exc).__name__}: {exc});跳過該項檢查")
-        return 0
+        label = "SYNC_FAILED" if args.sync_agents_md else "UNKNOWN"
+        _print(f"{label}: 讀不到全域 AGENTS.md 範本({type(exc).__name__}: {exc});跳過該項檢查")
+        # 一般 aicode --fix 啟動路徑仍不能因範本問題卡死；但使用者明確要求
+        # --sync-agents-md 時，回 0 會製造「已同步」的假象，必須 fail-loud。
+        return 2 if args.sync_agents_md else 0
 
     target = config_path.parent / AGENTS_MD_NAME
     try:
@@ -242,7 +272,7 @@ def _handle_agents_md(args: argparse.Namespace, config_path: Path) -> int:
     if status == "missing":
         if not args.fix:
             _print(f"MISSING: 沒有全域 AGENTS.md ({target})")
-            _print(f"         模型會少掉工具存在性與 RAG 觸發規則。執行: {sync_cmd}")
+            _print(f"         模型會少掉結構化工具呼叫與證據約束。執行: {sync_cmd}")
             return 0
         try:
             _write_agents_md(target, template)
@@ -258,7 +288,7 @@ def _handle_agents_md(args: argparse.Namespace, config_path: Path) -> int:
     for note in notes:
         _print(f"         - {note}")
     if status == "stale":
-        _print("         工具清單是模型的防幻覺錨點,對不上時模型會否認新工具存在。")
+        _print("         請改用精簡 schema anchor；不要把完整工具手冊放進全域 prompt。")
     _print(f"         同步(會備份原檔): {sync_cmd}")
     _print(f"         自訂過不想再被提醒: {AGENTS_MD_SKIP_ENV}=1")
     return 0
