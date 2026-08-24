@@ -23,6 +23,9 @@
   `finish_reason` 截斷 / 接合後 payload 失去合法結構）→ 重試一次
   （`config.FIGURE_EXTRACT_RETRIES`）→ 仍失敗即 `FigureExtractionError`，
   **整份 PDF 零寫入**。沒有自由文字 fallback，沒有 legacy 開關。
+  其中**截斷是輸出預算不夠，不是內容不合格**：那一次重試會把 `max_tokens` 加大到
+  server context 還放得下的程度（`_next_output_budget()`），加不上去就不送——
+  同一個預算重送是逐字相同的請求，greedy 取樣必然重播同一個 `length`。
 * **驗證等級不足**（沒有第二個通道、anchor 覆蓋不全）→ `unverified`，正常入庫，
   但 strict query 用不到它。
 
@@ -80,6 +83,14 @@ NATIVE_MATCH_MARGIN = 0.15       # find_tables entry 對候選的 IoU 領先幅�
 CORROBORATION_MIN_COVERAGE = 1.0 # 刻意寫死：「逐格/逐行一致」不是百分比門檻
 HTTP_ERROR_DETAIL_MAX_CHARS = 500
 STITCH_MAX_OVERLAP_ATOMS = 64    # 沒有 stitch 提示時，overlap 搜尋的上限
+
+RASTER_KIND_MAX_TOKENS = 32      # raster kind 分類的輸出只有 `{"kind": "..."}`
+# 放大輸出預算時，替 chat template / 特殊 token 留的邊角。completion 若剛好貼齊
+# n_ctx，server 會在 KV cache 滿的那一刻再截一次——等於又白花一次呼叫。
+VL_CTX_RESERVE_TOKENS = 128
+# server 沒回 `usage.prompt_tokens`（或根本讀不到 n_ctx）時的保守放大幅度。
+# 沒有實測數字就不敢直接跳到 context 上限：那有可能連 prompt 都放不下。
+VL_BUDGET_FALLBACK_MULTIPLIER = 2
 
 # native_verified 的 required check：固定集合，缺任何一個 key 一律當 False。
 # 用 `all(dict.values())` 會踩到 `all({}) is True`——那等於「沒驗到就升級」。
@@ -558,6 +569,74 @@ _SCHEMA_ECHO_SUFFIX = (
 )
 
 
+def _server_n_ctx(props: dict | None) -> int | None:
+    """server 啟動時的 `-c`。讀不到一律 None——**不要猜一個預設值**。
+
+    猜出來的 n_ctx 會被拿去算「還放得下多少 output token」，猜大了就變成把
+    prompt 擠出 context 的靜默截斷，而那正是這個函式要幫忙避免的東西。
+    某些 server 版本把 n_ctx 放在頂層而不是 `default_generation_settings`
+    （`gpu_safety._server_info()` 讀的是同兩個位置）。
+    """
+    if not isinstance(props, dict):
+        return None
+    settings = props.get("default_generation_settings")
+    sources = [settings, props] if isinstance(settings, dict) else [props]
+    for source in sources:
+        value = source.get("n_ctx")
+        # bool 是 int 的子類；True 會變成 n_ctx=1。
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        number = int(value)
+        if number > 0:
+            return number
+    return None
+
+
+def _usage_prompt_tokens(result) -> int | None:
+    """這次呼叫實際吃掉的 prompt token（含影像）。server 沒回就 None。"""
+    usage = getattr(result, "usage", None)
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get("prompt_tokens")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = int(value)
+    return number if number > 0 else None
+
+
+def _next_output_budget(previous: int, result, server_n_ctx: int | None) -> tuple[int, str]:
+    """截斷之後，下一次該給多少 `max_tokens`。回 `(budget, 說明)`。
+
+    `budget <= previous` 代表**沒有更大的預算可用**：這時再送一次就是逐字相同的
+    請求，greedy 取樣必然重播同一個 `length`。呼叫端據此直接放棄那次呼叫，並把
+    說明字串放進錯誤訊息——使用者要看得到「已經用了多少 / server 還剩多少」才知道
+    是該調 `AICODE_VL_INGEST_MAX_TOKENS` 還是該把 llama-server 的 `-c` 開大。
+
+    截斷是**輸出預算不夠**，不是內容不合格：唯一有意義的重試就是把預算加大。
+    2026-08-24 實測 example1.pdf p3（block diagram）：2048 撞頂，6700 時只用 2161
+    就 `stop`——差 113 個 token 讓整份 8 頁 PDF 零寫入。
+    """
+    ceiling = int(config.FIGURE_VL_MAX_TOKENS_CEILING)
+    prompt_tokens = _usage_prompt_tokens(result)
+    if server_n_ctx is not None and prompt_tokens is not None:
+        headroom = server_n_ctx - prompt_tokens - VL_CTX_RESERVE_TOKENS
+        budget = min(ceiling, headroom)
+        note = (f"prompt {prompt_tokens} tokens、server n_ctx {server_n_ctx}"
+                f"（保留 {VL_CTX_RESERVE_TOKENS}）→ 輸出最多還放得下 {headroom}；"
+                f"天花板 AICODE_FIGURE_VL_MAX_TOKENS_CEILING={ceiling}")
+    else:
+        # 沒有實測 prompt 長度就只敢倍增，並且仍受 n_ctx 上限節制。
+        budget = min(ceiling, previous * VL_BUDGET_FALLBACK_MULTIPLIER)
+        if server_n_ctx is not None:
+            budget = min(budget, server_n_ctx - VL_CTX_RESERVE_TOKENS)
+        missing = "usage.prompt_tokens" if prompt_tokens is None else "n_ctx"
+        note = (f"server 沒回 {missing}，只能保守放大 "
+                f"{VL_BUDGET_FALLBACK_MULTIPLIER}×；天花板 "
+                f"AICODE_FIGURE_VL_MAX_TOKENS_CEILING={ceiling}"
+                + (f"、server n_ctx {server_n_ctx}" if server_n_ctx is not None else ""))
+    return budget, note
+
+
 def _resolve_prompt_profile(props: dict | None) -> str:
     """依 server 回報的能力挑 prompt profile。**只看 props，不看 model 名稱。**
 
@@ -1014,7 +1093,10 @@ class _SampleFailure(Exception):
 
 
 _FAILURE_HINTS = {
-    "truncated": "請提高 AICODE_VL_INGEST_MAX_TOKENS，或讓 tile 切小一點",
+    "truncated": ("重試已經自動把輸出預算加到 server context 的上限仍然不夠。"
+                  "把 llama-server 的 -c 開大（VL 服務），或提高 "
+                  "AICODE_VL_INGEST_MAX_TOKENS / AICODE_FIGURE_VL_MAX_TOKENS_CEILING，"
+                  "再不行就讓 tile 切小一點"),
     "not_json": "server 可能沒有真的套用 grammar 約束；先跑 capability probe 確認",
     "schema": "模型輸出的鍵與 schema 不符",
     "row_width": "每列的 cell 數必須等於欄數——不補不砍",
@@ -1514,12 +1596,15 @@ def _parse_sample(kind: str, result) -> dict:
 
 
 def _call_extractor(*, kind: str, variant, base_url: str, model: str, profile: str,
-                    cache_prompt: bool, grid_hint: dict | None = None):
+                    cache_prompt: bool, max_tokens: int, grid_hint: dict | None = None):
     """一次 structured VL 呼叫。
 
     取樣以單一 `top_k=1` 收斂；**不假設** `temperature=0` 會讓輸出可重現——實際
     greedy 行為依 server 版本與 sampler chain 而定，重複性只由 runtime 的第二次
     取樣實測（見 `evidence["repeatability"]`）。
+
+    `max_tokens` 由呼叫端給（不在這裡讀 config）：截斷之後的重試必須帶**不同**的
+    輸出預算，而「這次要給多少」是重試迴圈才知道的狀態。
     """
     prompt = _prompt_for(kind, profile)
     if kind == figure_extract.KIND_TABLE and grid_hint is not None:
@@ -1547,7 +1632,7 @@ def _call_extractor(*, kind: str, variant, base_url: str, model: str, profile: s
         image_base64=base64.b64encode(bytes(variant.png)).decode("ascii"),
         mime_type=_variant_mime(variant),
         model=model,
-        max_tokens=int(config.VL_INGEST_MAX_TOKENS),
+        max_tokens=int(max_tokens),
         response_format=figure_extract.response_format_for(kind),
         temperature=0.0, top_p=1.0, top_k=1,
         timeout=int(config.VL_INGEST_TIMEOUT),
@@ -1556,7 +1641,7 @@ def _call_extractor(*, kind: str, variant, base_url: str, model: str, profile: s
 
 
 def _call_raster_classifier(*, variant, base_url: str, model: str, profile: str,
-                            cache_prompt: bool):
+                            cache_prompt: bool, max_tokens: int = RASTER_KIND_MAX_TOKENS):
     """一次 image-bound raster kind 分類；只允許三個最終 figure kind。"""
     return llama_client.vision_json_completion(
         base_url=base_url,
@@ -1564,7 +1649,7 @@ def _call_raster_classifier(*, variant, base_url: str, model: str, profile: str,
         image_base64=base64.b64encode(bytes(variant.png)).decode("ascii"),
         mime_type=_variant_mime(variant),
         model=model,
-        max_tokens=32,
+        max_tokens=int(max_tokens),
         response_format={
             "type": "json_schema",
             "json_schema": {
@@ -1586,21 +1671,31 @@ def _classify_raster_kind(variant, ctx: dict) -> dict:
     不會把模型輸出的自由文字猜回某個 kind。
     """
     attempts = 1 + max(0, int(config.FIGURE_EXTRACT_RETRIES))
+    max_tokens = RASTER_KIND_MAX_TOKENS
     last: _SampleFailure | None = None
     for attempt in range(attempts):
         _check_send_budget(variant, ctx["counters"], where=ctx["where"])
         try:
             result = _call_raster_classifier(
                 variant=variant, base_url=ctx["base_url"], model=ctx["model"],
-                profile=ctx["profile"], cache_prompt=(attempt == 0))
+                profile=ctx["profile"], cache_prompt=(attempt == 0),
+                max_tokens=max_tokens)
         except Exception as exc:  # noqa: BLE001
             last = _SampleFailure("transport", _http_error_detail(exc))
             continue
         if getattr(result, "truncated", True):
+            # 分類的 schema 只有一個 key，撞頂通常代表 chat template 在 JSON 之前
+            # 還吐了東西。跟抽取一樣：同一個預算再打一次是逐字相同的請求。
+            budget, note = _next_output_budget(
+                max_tokens, result, ctx.get("server_n_ctx"))
             last = _SampleFailure(
                 "truncated",
-                f"raster kind finish_reason={getattr(result, 'finish_reason', '')!r}",
+                f"raster kind finish_reason={getattr(result, 'finish_reason', '')!r}"
+                f"（max_tokens={max_tokens}；{note}）",
             )
+            if budget <= max_tokens:
+                break
+            max_tokens = budget
             continue
         try:
             model_obj = json.loads(getattr(result, "text", "").strip())
@@ -1625,13 +1720,29 @@ def _classify_raster_kind(variant, ctx: dict) -> dict:
 def _extract_variant_payload(*, kind: str, variant, base_url: str, model: str, profile: str,
                              where: str, allow_retry: bool, counters: dict,
                              cache_prompt: bool = True,
-                             grid_hint: dict | None = None) -> dict:
+                             grid_hint: dict | None = None,
+                             server_n_ctx: int | None = None,
+                             budget_hints: dict | None = None) -> dict:
     """單一 variant 的抽取（含重試）。全部失敗 raise `_SampleFailure`。
 
     重試一律 `cache_prompt=False`：同一個 prompt 命中 server 的 prompt cache 只會
     把同一份壞輸出重播一次，等於白花一次呼叫。
+
+    **截斷的重試會換一個更大的 `max_tokens`**（`_next_output_budget()`）。
+    `finish_reason="length"` 說的是「這張圖的輸出比預算長」，不是「模型答錯」；
+    帶同一個預算重送，greedy 取樣只會生出同樣長的前綴再撞同一面牆。加不上去
+    （已經頂到 server context 或天花板）時就**不送**那次呼叫，直接把數字寫進失敗
+    訊息——留著那次呼叫只是多花一分鐘拿到同一個 `length`。
+
+    `budget_hints` 是同一次 ingest 內的「這張圖需要多少輸出」記憶（key 為
+    kind + 影像 digest）。第二次取樣與後續 occurrence 用同一張圖跑同一個 schema，
+    輸出長度不會變；沒有它的話每一次取樣都要再撞一次 2048 才學到同一件事。
     """
     attempts = 1 + (max(0, int(config.FIGURE_EXTRACT_RETRIES)) if allow_retry else 0)
+    hint_key = (kind, str(getattr(variant, "digest", "") or ""))
+    max_tokens = int(config.VL_INGEST_MAX_TOKENS)
+    if isinstance(budget_hints, dict):
+        max_tokens = max(max_tokens, int(budget_hints.get(hint_key, 0)))
     last: _SampleFailure | None = None
     for attempt in range(attempts):
         _check_send_budget(variant, counters, where=where)
@@ -1640,6 +1751,7 @@ def _extract_variant_payload(*, kind: str, variant, base_url: str, model: str, p
             result = _call_extractor(
                 kind=kind, variant=variant, base_url=base_url, model=model,
                 profile=profile, cache_prompt=use_cache, grid_hint=grid_hint,
+                max_tokens=max_tokens,
             )
         except Exception as exc:  # noqa: BLE001 - 轉成統一的失敗語意
             last = _SampleFailure("transport", _http_error_detail(exc))
@@ -1647,8 +1759,20 @@ def _extract_variant_payload(*, kind: str, variant, base_url: str, model: str, p
         try:
             payload = _parse_sample(kind, result)
         except _SampleFailure as exc:
-            last = exc
+            if exc.slug != "truncated":
+                last = exc
+                continue
+            budget, note = _next_output_budget(max_tokens, result, server_n_ctx)
+            last = _SampleFailure(
+                exc.slug, f"{exc.detail}（max_tokens={max_tokens}；{note}）")
+            if budget <= max_tokens:
+                break
+            max_tokens = budget
+            if isinstance(budget_hints, dict):
+                budget_hints[hint_key] = max_tokens
             continue
+        if isinstance(budget_hints, dict) and max_tokens > int(config.VL_INGEST_MAX_TOKENS):
+            budget_hints[hint_key] = max_tokens
         if (
             kind == figure_extract.KIND_TABLE
             and grid_hint is not None
@@ -4367,6 +4491,8 @@ def _vl_extract(kind: str, variants, ctx: dict, *, allow_retry: bool,
             kind=kind, variant=variant, base_url=ctx["base_url"], model=ctx["model"],
             profile=ctx["profile"], where=ctx["where"], allow_retry=allow_retry,
             counters=ctx["counters"], cache_prompt=cache_prompt, grid_hint=grid_hint,
+            server_n_ctx=ctx.get("server_n_ctx"),
+            budget_hints=ctx.setdefault("output_budgets", {}),  # 缺 key 時退成單次記憶
         ))
     return payloads
 
@@ -4623,6 +4749,10 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
     per_page: dict[int, int] = {}
     # key = planner 宣告的 `(asset_digest, requested kind)`（契約 §19.3）
     asset_cache: dict[tuple[str, str], dict] = {}
+    # key = `(kind, variant digest)` → 這張圖實測需要的輸出預算。整份文件共用：
+    # 同一張圖被截斷過一次就夠了，第二次取樣與其他 occurrence 不必再撞一次。
+    # 只影響 `max_tokens`（上限），不影響 prompt、取樣或 cache_prompt。
+    output_budgets: dict[tuple[str, str], int] = {}
     total = len(candidates)
 
     for position, candidate in enumerate(candidates):
@@ -4713,8 +4843,13 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
                     )
                 else:
                     variants = _validate_variants(candidate, render_variants(pdf_doc, candidate))
+                    # props 讀一次就好：prompt profile 與「輸出還放得下多少 token」
+                    # 是同一份 server 事實，分兩次讀等於允許兩邊各自漂移。
+                    props = llama_client.get_props(vl_base_url)
                     ctx = {"base_url": vl_base_url, "model": vl_model,
-                           "profile": _resolve_prompt_profile(llama_client.get_props(vl_base_url)),
+                           "profile": _resolve_prompt_profile(props),
+                           "server_n_ctx": _server_n_ctx(props),
+                           "output_budgets": output_budgets,
                            "where": where, "counters": counters,
                            "record_generated_variant": record_generated_variant}
                     result = _run_vl_lane(candidate, evidence, kind, variants, ctx)

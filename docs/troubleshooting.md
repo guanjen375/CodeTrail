@@ -635,6 +635,34 @@ top-level `image_data` 可能被新版 llama.cpp 靜默忽略，造成模型只�
 python3 RAG.py docs/datasheet.pdf knowledge.json
 ```
 
+### PDF ingest 失敗說「structured 抽取失敗(truncated)」
+
+`finish_reason="length"` 代表那張圖的結構化輸出**比輸出預算長**,不是模型答錯。
+一整份 PDF 會因此零寫入(契約:抽取失敗不得以半套內容入庫)。
+
+正常情況下你不需要做任何事:第一次抽取用 `AICODE_VL_INGEST_MAX_TOKENS`(預設 2048),
+撞頂之後那一次重試會**自動**把預算加大到 VL server 的 context 還放得下的程度
+(`n_ctx - 實際 prompt tokens - 128`),上限是 `AICODE_FIGURE_VL_MAX_TOKENS_CEILING`
+(預設 8192)。實測 `example1.pdf` p3 的 block diagram:2048 撞頂 → 自動升到 6385 →
+只用 2161 就寫完,17 個 component、33 條 relation 全部入庫。
+
+`max_tokens` 是**上限不是目標**,所以放大它不會讓短輸出變貴;天花板存在只是為了擋住
+「模型陷入重複、把整個 context 生滿」。
+
+真的看到這個錯誤時,訊息會帶出當時的數字(用了多少 max_tokens、prompt 多長、
+server n_ctx 多少)。依序試:
+
+1. 把 **VL server 的 `-c`** 開大 —— 8192 的 context 扣掉一張 1400x900 的圖之後,
+   輸出只剩約 6.4k token。這是最常見的真兇。
+2. 提高 `AICODE_FIGURE_VL_MAX_TOKENS_CEILING`(只有在 `-c` 已經很大時才會是瓶頸)。
+3. 提高 `AICODE_VL_INGEST_MAX_TOKENS`,讓**第一次**就給夠 —— 省掉那次注定撞頂的
+   呼叫(一張大圖大約 60 秒)。
+4. 調小 `AICODE_FIGURE_MAX_IMAGE_TOKENS_PER_CALL` 讓圖切成多個 tile,每個 tile 的
+   輸出自然變短(代價:更多次呼叫,而且跨 tile 要接合)。
+
+> 已經頂到 context 上限時**不會**再送一次相同的請求 —— 那只是多花一分鐘拿到同一個
+> `length`。所以這種失敗只會看到一次呼叫。
+
 ### ingest 逾時,但看得到中途輸出
 
 MCP 端是逐行讀子行程輸出的,所以逾時時**已經收到的每一行都會保留在回傳裡**(看得到卡在

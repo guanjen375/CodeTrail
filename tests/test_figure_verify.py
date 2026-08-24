@@ -240,6 +240,95 @@ def test_truncated_response_is_fail_loud(monkeypatch):
     assert len(spy.calls) == 1 + config.FIGURE_EXTRACT_RETRIES
 
 
+class BudgetSpy:
+    """假 VL：**依 `max_tokens` 決定會不會截斷**——真的 server 就是這樣。
+
+    `VLSpy` 的 finish_reason 是寫死的，所以它驗不出「重試有沒有換一個輸出預算」：
+    無論給多少 token 都回同一個答案。要驗預算就必須讓截斷與 `max_tokens` 連動。
+    """
+
+    def __init__(self, script, *, needs_tokens: int, prompt_tokens: int = 1409):
+        self.script = script
+        self.needs_tokens = needs_tokens
+        self.prompt_tokens = prompt_tokens
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        text = self.script[kwargs["response_format"]["json_schema"]["name"]]
+        budget = int(kwargs["max_tokens"])
+        if budget < self.needs_tokens:
+            # 撞頂：輸出被切在半路（湊巧能 parse 也不算數，見上一條測試）
+            return types.SimpleNamespace(
+                text=text[: max(1, len(text) * budget // self.needs_tokens)],
+                finish_reason="length", truncated=True,
+                usage={"prompt_tokens": self.prompt_tokens, "completion_tokens": budget},
+                raw={},
+            )
+        return types.SimpleNamespace(
+            text=text, finish_reason="stop", truncated=False,
+            usage={"prompt_tokens": self.prompt_tokens,
+                   "completion_tokens": self.needs_tokens},
+            raw={},
+        )
+
+    @property
+    def budgets(self) -> list[int]:
+        return [int(call["max_tokens"]) for call in self.calls]
+
+
+@pytest.mark.smoke
+def test_truncation_retry_raises_the_output_budget(monkeypatch):
+    """截斷後的重試**必須換一個更大的輸出預算**，否則注定重播同一次失敗。
+
+    2026-08-24 用 example1.pdf p3（1423x909 的 block diagram）對真 server 實測：
+    `max_tokens=2048` → `finish_reason="length"`；同一張圖給 6700 只花 2161 就
+    `stop`（prompt 1409 tokens，server `-c 8192`）。只差 113 個 token，整份 8 頁
+    PDF 卻零寫入——因為重試送的是**逐字相同**的請求，greedy 取樣必然再撞同一面牆。
+
+    截斷不是「模型答錯」，是「輸出預算不夠」；重試唯一有意義的變更就是把預算加大到
+    server context 還放得下的程度。
+    """
+    spy = BudgetSpy({"figure_table": REGISTER_TABLE}, needs_tokens=2161)
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+
+    results = extract([candidate()], {4: page_evidence()})
+
+    assert len(results) == 1, "第二次給夠預算就抽得出來，不該整份零寫入"
+    assert len(spy.calls) >= 2, spy.budgets
+    assert spy.budgets[0] == config.VL_INGEST_MAX_TOKENS, (
+        "第一次仍照使用者設定的預算送（不偷偷放大成本）", spy.budgets)
+    assert spy.budgets[1] > spy.budgets[0], (
+        "重試用同一個 max_tokens = 保證再截一次，等於白花一次 VL 呼叫", spy.budgets)
+    assert spy.prompt_tokens + spy.budgets[1] <= 8192, (
+        "放大後的預算必須還放得進 server 的 n_ctx", spy.budgets)
+    assert all(budget >= spy.budgets[1] for budget in spy.budgets[2:]), (
+        "同一張圖的後續取樣已經知道 2048 不夠，不該再從 2048 重來一次", spy.budgets)
+
+
+@pytest.mark.smoke
+def test_truncation_without_headroom_fails_without_repeating_the_call(monkeypatch):
+    """已經頂到 server context 時，不得再送一次注定截斷的相同請求。
+
+    「重試一次」的價值來自它與前一次**不同**。沒有更大的預算可用時，那一次呼叫
+    只會多花一次 VL 的時間再得到同一個 `length`，而錯誤訊息還是得說得出數字。
+    """
+    monkeypatch.setattr(config, "VL_INGEST_MAX_TOKENS", 8192)
+    spy = BudgetSpy({"figure_table": REGISTER_TABLE}, needs_tokens=99999)
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+
+    with pytest.raises(figure_extract.FigureExtractionError) as excinfo:
+        extract([candidate()], {4: page_evidence()})
+
+    assert len(spy.calls) == 1, ("沒有更大的預算可用還是重送一次", spy.budgets)
+    message = str(excinfo.value)
+    assert "truncated" in message
+    assert "8192" in message, ("訊息要帶得出 server n_ctx / 已用預算的實際數字", message)
+    assert "AICODE_VL_INGEST_MAX_TOKENS" in message
+
+
 @pytest.mark.smoke
 @pytest.mark.parametrize(
     "text, slug",

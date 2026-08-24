@@ -295,6 +295,18 @@ FIGURE_KIND_MARGIN = _figure_float("AICODE_FIGURE_KIND_MARGIN", "0.15",
 # schema / validator 不合格時的重試次數(workflow §4 Step 1:重試一次仍失敗
 # → 整份 PDF 零寫入)
 FIGURE_EXTRACT_RETRIES = _figure_int("AICODE_FIGURE_EXTRACT_RETRIES", "1", lo=0, hi=5)
+# 截斷(`finish_reason="length"`)之後,重試最多可以把輸出預算加到多少。
+#
+# 第一次抽取用 VL_INGEST_MAX_TOKENS(使用者設的成本上限)。截斷代表那張圖的
+# 結構化輸出「就是」比這個預算長,用同一個 max_tokens 再打一次,greedy 取樣會生出
+# 同樣長的前綴、撞同一面牆——那次呼叫的錢是白花的。所以重試會把預算加到 server
+# context 還放得下的程度,再由這個天花板收尾。
+#
+# max_tokens 是**上限不是目標**:schema 約束下的輸出該停還是會停,所以放大它不會
+# 讓短輸出變貴;成本只在真的需要那麼長時才發生。天花板的作用是擋住「模型陷入
+# 重複、把整個 context 生滿」的最壞情況。
+FIGURE_VL_MAX_TOKENS_CEILING = _figure_int(
+    "AICODE_FIGURE_VL_MAX_TOKENS_CEILING", "8192", lo=1)
 # review artifacts(可能含 NDA 內容,見 docs/rag.md 的保存與清除說明)
 FIGURE_REVIEW_DIR = ".codetrail/figures"
 FIGURE_REVIEW_MAX_RUNS_PER_DOC = _figure_int(
