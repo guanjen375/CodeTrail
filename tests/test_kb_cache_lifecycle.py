@@ -794,6 +794,67 @@ def test_a_security_error_while_reading_is_never_treated_as_a_bad_cache(
     assert _cache_files(tmp_path)[0].read_bytes() == cache_before, "不得順手刪掉"
 
 
+def test_same_generation_reader_never_deletes_a_freshly_rebuilt_cache(
+    tmp_path: Path, monkeypatch
+):
+    """同一代的 ABA：A、B 都讀到同一份壞 cache，B 先修好，A 不得把它刪掉。
+
+    世代檢查在這裡看不出差別（generation 一樣），所以答案不是「再多驗一次」，而是
+    **根本不預先刪 primary**：它會被下一次成功的重建原子覆蓋。留著一份反正每次載入
+    都會被拒絕的舊檔只花一點磁碟；刪掉別人剛修好的那份才是真的痛（下一次查詢又得
+    重算，而那一刻 embedding server 連不上就整個 KB 拒載）。
+    """
+    _stub_embed(monkeypatch)
+    kb_path = _save(tmp_path, _chunks("alpha body", "beta body"))
+    snapshot = json.loads(kb_path.read_text(encoding="utf-8"))
+
+    # A 讀到一份壞掉的 cache（generation 不變，只是內容雜湊被動過）
+    payload = _read_cache(tmp_path)
+    payload["content_hash"] = np.array("tampered")
+    _write_cache(tmp_path, payload)
+    matrices_a, stale_a = kb_cache.locate(
+        kb_path, snapshot["chunks"], snapshot["metadata"])
+    assert matrices_a is None and stale_a
+
+    # B 在同一代裡把它重建好了
+    kb_cache.rebuild(kb_path, snapshot["chunks"], snapshot["metadata"], reason="B")
+    healthy = _cache_files(tmp_path)[0].read_bytes()
+
+    # A 現在才走到「淘汰」那一步 —— 不得動到 B 的成果
+    kb_cache.locate(kb_path, snapshot["chunks"], snapshot["metadata"])
+
+    assert _cache_files(tmp_path)[0].read_bytes() == healthy
+    _no_embed_server(monkeypatch, tmp_path)
+    assert KnowledgeBase(str(kb_path)).loaded, "B 修好的 cache 必須還能直接用"
+
+
+def test_backup_never_hardlinks_through_a_symlinked_cache_file(
+    tmp_path: Path, monkeypatch
+):
+    """`os.link()` 預設 follow_symlinks=True：會把外部檔案連進 cache 當「舊版備份」。"""
+    _stub_embed(monkeypatch)
+    kb_path = _save(tmp_path, _chunks("alpha body", "beta body"))
+    outside = tmp_path.parent / "outside-link"
+    outside.mkdir(exist_ok=True)
+    victim = outside / "secret.npz"
+    victim.write_bytes(b"someone else's bytes")
+
+    cache = _cache_files(tmp_path)[0]
+    cache.unlink()
+    cache.symlink_to(victim)
+
+    # 事先擺好的連結會被入口的路徑檢查先攔下；競態版（檢查之後才被換掉）由
+    # tests/test_kb_store.py::test_backup_refuses_a_symlinked_embedding_file 守。
+    with pytest.raises(KnowledgeStoreError, match="symlink|普通檔案"):
+        RAG.save_knowledge_base(
+            {"metadata": {"documents": ["spec.md"],
+                          "embedding_model": config.EMBEDDING_MODEL},
+             "chunks": _chunks("gamma body")}, kb_path)
+
+    assert victim.read_bytes() == b"someone else's bytes"
+    assert not list(outside.glob("*rollback*")), "外部檔案不得被連進 / 複製成備份"
+
+
 # ==========================================================================
 # 使用者只需要理解一個檔：備份／複製 knowledge.json 就夠
 # ==========================================================================

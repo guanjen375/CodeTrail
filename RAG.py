@@ -3180,10 +3180,11 @@ def save_knowledge_base(kb: Dict, output_path: Path, *, _already_locked: bool = 
         print(f"     Embeddings: {emb_size:.2f} MB{gate_note}（程式自管的 cache，"
               f"使用者不需要備份/複製）")
     else:
+        # 檔案已經在上面那次原子提交裡（鎖內）刪掉了。這裡**什麼都不做**：
+        # 鎖已經放掉，刪檔會刪到別人剛提交的 cache，連 rmdir 空目錄都會讓正在
+        # 提交的 writer 收到 ENOENT（Linux 允許 rmdir 一個已被開啟的空目錄）。
+        # 留下的空目錄由下一次 purge_orphans()（鎖內）收乾淨。
         print("     Embeddings: 空知識庫，已清除 embeddings cache")
-        # 檔案已經在上面那次原子提交裡（鎖內）刪掉了；這裡只把空目錄收乾淨。
-        # 不能在這裡呼叫 purge()：鎖已經放掉，那會刪到別人剛提交的 cache。
-        kb_cache.prune_empty_dirs(output_path)
 
     file_size = output_path.stat().st_size / 1024 / 1024  # MB
     print(f"\n[OK] 知識庫已更新!")

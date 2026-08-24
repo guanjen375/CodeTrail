@@ -369,15 +369,29 @@ def purge(json_path, *, announce: bool = False) -> list[str]:
 
 
 def prune_empty_dirs(json_path) -> None:
-    """把空掉的 `<kb-id>` / `embeddings` / `cache` 收乾淨。
+    """把空掉的 `<kb-id>` / `embeddings` / `cache` 收乾淨（由深到淺）。
 
-    只 rmdir 空目錄（非空一定失敗），所以**不會**碰到別人剛寫進去的東西——
-    不像刪檔，這一步不需要鎖。`.codetrail/` 本身留著（figures 住在那裡）。
+    只 rmdir 空目錄（非空一定失敗）。**一律用 parent 的 dir fd 來 rmdir**：普通
+    路徑版是 check-then-use，中間那層在檢查之後被換成 symlink 的話，刪掉的會是
+    sandbox 外的空目錄。
+
+    呼叫端必須持有 store lock：Linux 允許 rmdir 一個「已被別人開著但還是空的」目錄，
+    所以在鎖外做這件事會讓正在提交的 writer 收到 ENOENT。目前只有 `purge()` 呼叫它，
+    而 `purge()` 只從鎖內的 `purge_orphans()` 進來。
     """
-    directory = cache_dir(json_path)
-    for parent in (directory, directory.parent, directory.parent.parent):
-        with contextlib.suppress(OSError):
-            parent.rmdir()
+    if not _HAS_OPENAT:   # pragma: no cover - 非 POSIX 的退路
+        directory = _checked_cache_dir(json_path)
+        for parent in (directory, directory.parent, directory.parent.parent):
+            with contextlib.suppress(OSError):
+                parent.rmdir()
+        return
+    names = _cache_dir_names(json_path)
+    for depth in range(len(names), 0, -1):
+        with _dir_fd(json_path, names[:depth - 1], create=False) as parent_fd:
+            if parent_fd is None:
+                return
+            with contextlib.suppress(OSError):
+                os.rmdir(names[depth - 1], dir_fd=parent_fd)
 
 
 def purge_orphans(json_path, *, announce: bool = False) -> list[str]:
@@ -646,6 +660,7 @@ def locate(json_path, chunks: Sequence[Mapping], metadata: Mapping,
             stale = reason if strict else f"舊位置的 {path.name}：{reason}"
             unusable.append((path, stale))
             continue
+
         if path is primary:
             return Matrices(payload["embeddings"], payload["embeddings_gate"],
                             "cache", primary), ""
@@ -658,8 +673,15 @@ def locate(json_path, chunks: Sequence[Mapping], metadata: Mapping,
         return Matrices(payload["embeddings"], payload["embeddings_gate"],
                         "legacy", target), ""
 
-    if mutate and unusable:
-        _discard_unusable(json_path, metadata, unusable)
+    if mutate:
+        # **不刪 primary**：它會被下一次成功的重建原子覆蓋掉。預先刪它會這樣壞掉——
+        # A、B 同時讀到**同一代**的壞 cache，B 先重建出有效的那份，A 隨後仍然照著
+        # 檔名把 B 的成果刪掉（generation 一樣，世代檢查看不出差別）。留著一份反正
+        # 每次載入都會被拒絕的舊檔，代價只有一點磁碟；刪掉別人剛修好的才是真的痛。
+        legacy_stale = [(path, why) for path, why in unusable
+                        if path == legacy_companion(json_path)]
+        if legacy_stale:
+            _discard_legacy(json_path, metadata, legacy_stale)
     return None, stale
 
 
@@ -680,16 +702,24 @@ def _unchanged_generation(json_path: Path, metadata: Mapping):
         yield current is not None and current == expected
 
 
-def _discard_unusable(json_path: Path, metadata: Mapping,
-                      unusable: Sequence[tuple[Path, str]]) -> None:
-    """淘汰驗不過的 cache——但只在 KB 還是同一代的時候。"""
+def _discard_legacy(json_path: Path, metadata: Mapping,
+                    unusable: Sequence[tuple[Path, str]]) -> None:
+    """淘汰驗不過的**舊位置** companion NPZ——只在 KB 還是同一代的時候。
+
+    只有舊位置那份需要主動刪：它不是我們寫的，沒有「下一次原子覆蓋」可以指望，
+    而留著會讓使用者以為「刪了 knowledge.json 知識庫還在」。它也不會被別的行程
+    重新產生（本程式只會刪它、不會寫它），所以沒有 primary 那種 ABA 問題。
+    """
     with _unchanged_generation(json_path, metadata) as same:
         if not same:
-            print("[INFO] KB 在這期間換代了；不動任何 embeddings cache"
-                  "（新一代的 cache 不歸這次判斷管）")
+            print("[INFO] KB 在這期間換代了；不動舊位置的 embeddings 檔"
+                  "（新一代的判斷不歸這次管）")
             return
         for path, reason in unusable:
-            _discard(json_path, path, reason)
+            print(f"[INFO] 丟棄不可用的 embeddings cache（{reason}）: {path}")
+            # 舊位置那份就在 KB 目錄裡；`unlink` 對 symlink 是刪連結本身，不會穿出去。
+            with contextlib.suppress(OSError):
+                path.unlink()
 
 
 def _migrate_legacy(json_path: Path, payload: dict, chunks, metadata) -> Optional[Path]:
@@ -712,25 +742,6 @@ def _migrate_legacy(json_path: Path, payload: dict, chunks, metadata) -> Optiona
         with contextlib.suppress(OSError):
             legacy.unlink()
         return target
-
-
-def _discard(json_path: Path, path: Path, reason: str) -> None:
-    """刪一份不可用的 cache。cache 檔一律用持有中的 dir fd 刪，不用路徑。"""
-    print(f"[INFO] 丟棄不可用的 embeddings cache（{reason}）: {path}")
-    if path == legacy_companion(json_path):
-        # 舊位置那份就在 KB 目錄裡；`unlink` 對 symlink 是刪連結本身，不會穿出去。
-        with contextlib.suppress(OSError):
-            path.unlink()
-        return
-    if not _HAS_OPENAT:   # pragma: no cover - 非 POSIX 的退路
-        with contextlib.suppress(OSError):
-            checked_cache_file(json_path).unlink()
-        return
-    with cache_dir_fd(json_path, create=False) as dfd:
-        if dfd is None:
-            return
-        with contextlib.suppress(OSError):
-            os.unlink(CACHE_FILENAME, dir_fd=dfd)
 
 
 # ==========================================================================

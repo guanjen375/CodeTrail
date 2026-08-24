@@ -267,6 +267,33 @@ def test_commit_refuses_to_start_when_no_backup_can_be_taken(monkeypatch, tmp_pa
     assert kb_cache.cache_file(path).read_bytes() == original_npz
 
 
+def test_backup_refuses_a_symlinked_embedding_file(tmp_path: Path):
+    """競態版：向量檔在入口檢查之後才被換成指向 sandbox 外的 symlink。
+
+    `os.link()` 預設 `follow_symlinks=True`，所以 hardlink 快路徑會把**外部檔案**
+    連進 cache 目錄當成「舊版備份」，而且成功之後根本不會走到有 O_NOFOLLOW 的
+    複製 fallback。備份前必須先確認它是普通檔案。
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "secret.bin"
+    victim.write_bytes(b"someone else's bytes")
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    (cache_dir / "embeddings.npz").symlink_to(victim)
+
+    fd = os.open(cache_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        slot = knowledge_store._EmbeddingSlot(cache_dir / "embeddings.npz", fd)
+        with pytest.raises(knowledge_store.KnowledgeStoreError, match="普通檔案"):
+            slot.backup("gen-x")
+    finally:
+        os.close(fd)
+
+    assert victim.read_bytes() == b"someone else's bytes"
+    assert list(cache_dir.glob("*rollback*")) == []
+
+
 def test_remove_document_rewrites_remaining_npz_and_reload_keeps_dense_search(monkeypatch, tmp_path: Path):
     path = tmp_path / config.KNOWLEDGE_FILE
     kb = _kb()

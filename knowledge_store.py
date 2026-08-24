@@ -19,6 +19,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import tempfile
 import uuid
 from pathlib import Path
@@ -285,6 +286,8 @@ class _EmbeddingSlot:
         self.name = path.name
         self.fd = dir_fd
 
+    _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
     def exists(self) -> bool:
         if self.fd is None:
             return self.path.exists()
@@ -293,6 +296,22 @@ class _EmbeddingSlot:
             return True
         except FileNotFoundError:
             return False
+
+    def _assert_regular(self) -> None:
+        """既有的向量檔必須是普通檔案。
+
+        `os.link()` 預設 `follow_symlinks=True`:向量檔在前置檢查之後被換成指向
+        sandbox 外的 symlink 時,hardlink 快路徑會把**外部檔案**連進 cache 目錄
+        (後面的 `_copy_at` 雖然有 O_NOFOLLOW,但 hardlink 成功就不會走到它)。
+        這個目錄樹由 CodeTrail 自動產生,不該有連結——看到就 fail-loud。
+        """
+        info = (os.lstat(self.name, dir_fd=self.fd) if self.fd is not None
+                else self.path.lstat())
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise KnowledgeStoreError(
+                f"拒絕備份 {self.path}：它不是普通檔案（symlink 或裝置檔？）。"
+                "這個目錄樹由 CodeTrail 自動產生，不應該有連結。"
+            )
 
     def backup(self, generation: str) -> str | None:
         """既有向量檔的回滾點。檔案不存在回 None；**做不出備份一律 raise**。
@@ -303,15 +322,22 @@ class _EmbeddingSlot:
         無聲消失。沒有回滾點就不准開始替換。
         """
         if self.fd is None:
+            if not self.path.exists():
+                return None
+            self._assert_regular()
             backup = _backup_link(self.path, generation)
             return str(backup) if backup else None
         if not self.exists():
             return None
+        self._assert_regular()
         name = f".{self.name}.rollback.{generation}"
         try:
-            os.link(self.name, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            # `follow_symlinks=False` 是第二道（`_assert_regular` 之後才被換掉的
+            # 競態）：linkat 不帶 AT_SYMLINK_FOLLOW 時，對 symlink 會直接 EPERM。
+            os.link(self.name, name, src_dir_fd=self.fd, dst_dir_fd=self.fd,
+                    follow_symlinks=False)
             return name
-        except OSError:
+        except (OSError, NotImplementedError):
             pass   # 跨檔案系統 / 不支援 hardlink → 改用 fd 安全複製
         try:
             self._copy_at(self.name, name)
@@ -392,12 +418,18 @@ def _default_chunk_ids(chunks: list[dict]) -> list[str]:
 
 
 def _backup_link(path: Path, generation: str) -> Path | None:
+    """回滾點（路徑版，給 JSON 與沒有 dir fd 的呼叫端用）。
+
+    `follow_symlinks=False` 是刻意的：`os.link` 預設會跟著 symlink 走，把連結指到
+    的**別的檔案**連進來當成「舊版備份」。linkat 不帶 AT_SYMLINK_FOLLOW 對 symlink
+    會 EPERM，於是退回 `copy2`；`copy2` 也失敗就往上拋（沒有回滾點就不該開始替換）。
+    """
     if not path.exists():
         return None
     backup = path.with_name(f".{path.name}.rollback.{generation}")
     try:
-        os.link(path, backup)
-    except OSError:
+        os.link(path, backup, follow_symlinks=False)
+    except (OSError, NotImplementedError):
         shutil.copy2(path, backup)
     return backup
 
