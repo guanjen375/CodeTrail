@@ -147,6 +147,132 @@ def _checked_cache_dir(json_path) -> Path:
     return current
 
 
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+# `os.replace` 與 `os.rename` 在 POSIX 是同一個 syscall，但只有 rename 會被列進
+# supports_dir_fd（figure_review 也用同一個代理判斷）；實際呼叫 replace，因為覆寫
+# 語意才是我們要的。
+_HAS_OPENAT = bool(
+    _O_DIRECTORY and _O_NOFOLLOW
+    and {os.open, os.unlink, os.rmdir, os.rename, os.stat, os.mkdir,
+         os.link}.issubset(os.supports_dir_fd)
+    and os.scandir in os.supports_fd
+)
+
+
+def _link_error(where: Path) -> KnowledgeStoreError:
+    return KnowledgeStoreError(
+        f"拒絕使用 {where}：它是 symlink。這個目錄樹由 CodeTrail 自動產生，"
+        "不應該有連結；若不是你自己建的，可能有人想誘導 CodeTrail 把向量寫到 "
+        "sandbox 外、或讓自動清除刪到外面的目錄。請檢查後移除它。"
+    )
+
+
+def _step_dir(parent_fd: int, name: str, where: Path, *, create: bool) -> Optional[int]:
+    """往下走一層目錄。`O_NOFOLLOW`：被換成 symlink 就開不起來，不會跟過去。"""
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise KnowledgeStoreError(f"無法建立 {where}: {exc}") from exc
+    try:
+        info = os.lstat(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise KnowledgeStoreError(f"無法 lstat {where}: {exc}") from exc
+    # 先 lstat 只是為了給出精確訊息（O_NOFOLLOW|O_DIRECTORY 對 symlink 回的是
+    # ENOTDIR，讀起來像「不是目錄」）；真正的防線是 O_NOFOLLOW 本身。
+    if stat.S_ISLNK(info.st_mode):
+        raise _link_error(where)
+    if not stat.S_ISDIR(info.st_mode):
+        raise KnowledgeStoreError(f"拒絕使用 {where}：它存在但不是目錄")
+    try:
+        return os.open(name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError as exc:
+        raise KnowledgeStoreError(
+            f"無法安全開啟 {where}（symlink 或型別不對？）: {exc}"
+        ) from exc
+
+
+@contextlib.contextmanager
+def _dir_fd(json_path, names: Sequence[str], *, create: bool):
+    """★ 安全檢查點：yield 走到 ``names`` 最後一層的目錄 fd（不存在就 yield None）。
+
+    從 KB 目錄出發逐層 `openat(O_DIRECTORY|O_NOFOLLOW)`，**整段 with 期間持有 fd**。
+    之後所有的讀 / 寫 / 刪都用 `dir_fd=` 進行 —— 檢查完才用路徑再 open 一次是
+    check-then-use，中途被換成 symlink 就越界了；持有 fd 等於釘住驗過的那個 inode，
+    路徑之後怎麼換都動不到我們。
+
+    平台缺 `openat` 家族（Windows）時退回 `_checked_cache_dir()` 的路徑檢查——那擋得住
+    「事先擺好的 symlink」，擋不住競態；本 repo 的 sandbox 模型以 POSIX 為準。
+    """
+    base = Path(json_path).parent
+    try:
+        base_fd = os.open(base, os.O_RDONLY | _O_DIRECTORY)
+    except OSError as exc:
+        raise KnowledgeStoreError(f"無法開啟 KB 目錄 {base}: {exc}") from exc
+    fd = base_fd
+    where = base
+    try:
+        for name in names:
+            where = where / name
+            nxt = _step_dir(fd, name, where, create=create)
+            os.close(fd)
+            fd = nxt
+            if fd is None:
+                break
+        yield fd
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _cache_dir_names(json_path) -> tuple[str, ...]:
+    return (*CACHE_RELDIR.parts, kb_id(json_path))
+
+
+@contextlib.contextmanager
+def cache_dir_fd(json_path, *, create: bool):
+    """cache 目錄（`<kb-id>`）的 fd。缺 openat 支援時 yield None 讓呼叫端走路徑版。"""
+    if not _HAS_OPENAT:
+        if create:
+            prepare_cache_target(json_path)
+        else:
+            checked_cache_dir_exists = _checked_cache_dir(json_path)
+            del checked_cache_dir_exists
+        yield None
+        return
+    with _dir_fd(json_path, _cache_dir_names(json_path), create=create) as fd:
+        yield fd
+
+
+def _rmtree_at(parent_fd: int, name: str, where: Path) -> None:
+    """用 dir_fd 遞迴刪掉一層；樹裡出現任何 symlink 一律 fail-loud（不跟過去、也不猜）。"""
+    try:
+        info = os.lstat(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise KnowledgeStoreError(f"無法 lstat {where}: {exc}") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise _link_error(where)
+    if not stat.S_ISDIR(info.st_mode):
+        os.unlink(name, dir_fd=parent_fd)
+        return
+    fd = os.open(name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        with os.scandir(fd) as entries:
+            children = [entry.name for entry in entries]
+        for child in children:
+            _rmtree_at(fd, child, where / child)
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
 def checked_cache_file(json_path) -> Path:
     """★ 驗過的 cache 檔路徑；檔案本身是 symlink 也一律 fail-loud。
 
@@ -214,7 +340,20 @@ def purge(json_path, *, announce: bool = False) -> list[str]:
     """
     removed: list[str] = []
     directory = _checked_cache_dir(json_path)   # symlink / 逃出 KB 目錄 → 不刪，直接 raise
-    if directory.is_dir():
+    if _HAS_OPENAT:
+        # 持有 `embeddings/` 的 fd 再刪 `<kb-id>`：檢查完才用路徑刪是 check-then-use，
+        # 中途 `.codetrail` 被換成外部 symlink 就會遞迴刪到 sandbox 外。
+        with _dir_fd(json_path, CACHE_RELDIR.parts, create=False) as parent_fd:
+            if parent_fd is not None:
+                name = kb_id(json_path)
+                try:
+                    os.lstat(name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+                else:
+                    _rmtree_at(parent_fd, name, directory)
+                    removed.append(str(directory))
+    elif directory.is_dir():   # pragma: no cover - 非 POSIX 的退路
         shutil.rmtree(directory, ignore_errors=True)
         if not directory.exists():
             removed.append(str(directory))
@@ -260,7 +399,28 @@ def _content_hash(chunks, schema: str) -> str:
     return context_signals.chunks_content_hash(chunks, schema=schema)
 
 
-def _read_npz(path: Path) -> dict:
+def _read_cache_npz(json_path) -> dict:
+    """讀 cache 檔：整段持有目錄 fd，檔案本身以 `O_NOFOLLOW` 開。"""
+    if not _HAS_OPENAT:   # pragma: no cover - 非 POSIX 的退路
+        return _read_npz(checked_cache_file(json_path))
+    with cache_dir_fd(json_path, create=False) as dfd:
+        if dfd is None:
+            raise FileNotFoundError(str(cache_dir(json_path)))
+        fd = os.open(CACHE_FILENAME, os.O_RDONLY | _O_NOFOLLOW, dir_fd=dfd)
+        with os.fdopen(fd, "rb") as handle:
+            return _read_npz(handle)
+
+
+def _read_legacy_npz(path: Path) -> dict:
+    """舊位置的 companion NPZ：以 `O_NOFOLLOW` 開，不跟著連結走。"""
+    if not _HAS_OPENAT:   # pragma: no cover - 非 POSIX 的退路
+        return _read_npz(path)
+    fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as handle:
+        return _read_npz(handle)
+
+
+def _read_npz(path) -> dict:
     np = _require_numpy()
     with np.load(path, allow_pickle=False) as data:
         available = set(getattr(data, "files", []))
@@ -350,11 +510,27 @@ def _verify(
         return (f"內容雜湊不符（cache={payload['content_hash']}, "
                 f"knowledge.json={current}）")
 
+    # legacy 的 `content-v1` 只是把每個 chunk 的 content **依序串接**後取 md5，
+    # 沒有分隔也沒有長度前綴：`["ab", "c"]` 與 `["a", "bc"]` 的雜湊完全相同、
+    # chunk 數也相同，但每一列向量對應到的 chunk 已經換人了。所以
+    # 「content-v1 ＋ 沒有 store generation ＋ 沒有逐列 chunk id」這個組合對
+    # 「切法改變但總文字不變」完全沒有鑑別力，一律重建。現行 schema 有長度前綴，
+    # 不受影響（見 context_signals.chunks_content_hash）。
+    if (schema == context_signals.LEGACY_CONTENT_HASH_SCHEMA
+            and not json_generation
+            and payload["chunk_ids"] is None):
+        return ("cache 用的是 content-v1 串接雜湊，又沒有 store generation 與逐列 "
+                "chunk id：重新切分（總文字不變）時證明不了每一列的對應")
+
     ids = payload["chunk_ids"]
     if ids is not None:
         expected = chunk_row_ids(chunks)
+        # 長度先單獨看：不然下面用第一個不同的位置去索引，空 list 會 IndexError，
+        # 變成「本來承諾丟棄重建，實際上炸在錯誤訊息裡」。
+        if len(ids) != len(expected):
+            return f"逐列 chunk id 數量不符（cache={len(ids)}, knowledge.json={len(expected)}）"
         if ids != expected:
-            first = next((i for i, (a, b) in enumerate(zip(ids, expected)) if a != b), 0)
+            first = next(i for i, (a, b) in enumerate(zip(ids, expected)) if a != b)
             return (f"逐列 chunk id 不符（第 {first} 列 cache={ids[first]!r}, "
                     f"knowledge.json={expected[first]!r}）")
     elif strict_identity:
@@ -408,7 +584,8 @@ def locate(json_path, chunks: Sequence[Mapping], metadata: Mapping,
         if not path.is_file():
             continue
         try:
-            payload = _read_npz(path)
+            payload = (_read_cache_npz(json_path) if path is primary
+                       else _read_legacy_npz(path))
         except Exception as exc:  # noqa: BLE001 — 壞檔是可重建的
             stale = f"{path.name} 讀不回來（{exc}）"
             if mutate:
@@ -453,14 +630,9 @@ def _discard(path: Path, reason: str) -> None:
 # ==========================================================================
 # 寫入
 # ==========================================================================
-def _write_npz(json_path, payload: Mapping, *, chunk_ids: Sequence[str]) -> Path:
-    """原子寫一份 cache（不需要 store lock：內容自帶身分，重寫同一份是冪等的）。
-
-    路徑驗證做兩次：`mkdir` 之前擋掉「已經擺好的 symlink」，`mkdir` 之後再驗一次
-    擋掉「在這中間才被換掉」。第二次很便宜，而漏掉它就等於把 NDA 向量寫到 sandbox 外。
-    """
+def npz_fields(payload: Mapping, chunk_ids: Sequence[str]) -> dict:
+    """cache NPZ 的完整欄位（含逐列身分）。寫入端只有這一份定義。"""
     np = _require_numpy()
-    path = prepare_cache_target(json_path)
     fields = {
         "embeddings": payload["embeddings"],
         "embedding_model": payload["embedding_model"] or EMBEDDING_MODEL,
@@ -479,6 +651,44 @@ def _write_npz(json_path, payload: Mapping, *, chunk_ids: Sequence[str]) -> Path
             gate_content_hash=payload["gate_content_hash"],
             gate_content_hash_schema=payload["gate_content_hash_schema"],
         )
+    return fields
+
+
+def write_npz_at(dir_fd: int, fields: Mapping, *, name: str = CACHE_FILENAME) -> None:
+    """在**已持有**的目錄 fd 裡原子寫一份 NPZ：temp(O_EXCL|O_NOFOLLOW) → fsync → replace。
+
+    整段只用 `dir_fd` 相對操作，所以路徑之後被換成 symlink 也影響不到我們——動到的
+    永遠是開 fd 當下驗過的那個 inode。
+    """
+    np = _require_numpy()
+    tmp = f".{name}.tmp.{os.getpid()}.{os.urandom(6).hex()}"
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _O_NOFOLLOW, 0o600,
+                 dir_fd=dir_fd)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            np.savez_compressed(handle, **dict(fields))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp, dir_fd=dir_fd)
+        raise
+
+
+def _write_npz(json_path, payload: Mapping, *, chunk_ids: Sequence[str]) -> Path:
+    """原子寫一份 cache（不需要 store lock：內容自帶身分，重寫同一份是冪等的）。"""
+    np = _require_numpy()
+    fields = npz_fields(payload, chunk_ids)
+    path = prepare_cache_target(json_path)
+    if _HAS_OPENAT:
+        with cache_dir_fd(json_path, create=True) as dfd:
+            if dfd is None:   # pragma: no cover - create=True 之後不該是 None
+                raise KnowledgeStoreError(f"無法開啟 embeddings cache 目錄: {path.parent}")
+            write_npz_at(dfd, fields)
+        return path
+    # pragma: no cover - 非 POSIX 的退路（只擋得住事先擺好的 symlink）
     fd, raw = tempfile.mkstemp(prefix=f".{path.name}.tmp.", dir=path.parent)
     tmp = Path(raw)
     try:
@@ -539,16 +749,62 @@ def rebuild(json_path, chunks, metadata, *, reason: str = "") -> Matrices:
         ),
         "gate_content_hash_schema": context_signals.GATE_SCHEMA if has_ctx else "",
     }
-    target = checked_cache_file(json_path)
+    target = _publish_rebuilt(json_path, payload, chunks, metadata)
+    return Matrices(matrix, gate_matrix, "rebuilt", target)
+
+
+def _json_generation(json_path: Path) -> Optional[str]:
+    """讀 knowledge.json 目前的 store_generation；讀不到回 None（代表狀態不明）。"""
     try:
-        _write_npz(json_path, payload, chunk_ids=chunk_row_ids(chunks))
+        with open(json_path, "r", encoding="utf-8") as handle:
+            return str(json.load(handle).get("metadata", {}).get("store_generation", ""))
+    except (OSError, ValueError):
+        return None
+
+
+def _publish_rebuilt(json_path: Path, payload: dict, chunks, metadata) -> Optional[Path]:
+    """把重算出來的向量寫進 cache——但只在 KB 還是同一代的時候。
+
+    重算是在**鎖外**做的（不然會持著 shared lock 打幾分鐘網路），所以中途可能有
+    人提交了新的一代：
+
+        1. 查詢 A 讀到 gen1，開始慢慢重算
+        2. ingest B 提交 gen2 的 JSON 與 cache
+        3. A 把 gen1 的向量蓋回固定檔名的 cache
+
+    身分驗證會擋住 gen1 向量被拿去查 gen2 的 chunk，所以**不會**靜默錯答；但 B
+    剛寫好的有效 cache 被毀了，下一次查詢得重算，而那一刻 embedding server 如果
+    連不上，整個 KB 就拒載。所以發布前取一次短的 exclusive lock 並重驗 generation：
+    不同代就不寫（這次的向量仍然對應手上這批 chunk，照常回傳給呼叫端用）。
+
+    這也是為什麼「重算絕不能在持有 store lock 時發生」：flock 綁在 open file
+    description 上，同一個行程持著 shared lock 再要 exclusive 會擋住自己。呼叫端
+    因此一律先放鎖再重算（`RAG.load_knowledge_base` 與 `KnowledgeBase._load` 都是）。
+    """
+    from knowledge_store import knowledge_store_lock
+
+    expected = str((metadata or {}).get("store_generation", ""))
+    try:
+        with knowledge_store_lock(json_path, exclusive=True):
+            current = _json_generation(json_path)
+            if current is None:
+                print("[WARN] 重算完成，但這時讀不到 knowledge.json；本次不寫入 cache")
+                return None
+            if current != expected:
+                print(f"[WARN] 重算期間 knowledge.json 已換代"
+                      f"（{expected or '(無)'} → {current or '(無)'}）；"
+                      "本次不寫入 cache，以免蓋掉新一代已經寫好的向量")
+                return None
+            target = _write_npz(json_path, payload, chunk_ids=chunk_row_ids(chunks))
+            # 舊位置那份已經沒有身分可言了，順手收掉，使用者才不會以為它還有用。
+            with contextlib.suppress(OSError):
+                legacy_companion(json_path).unlink(missing_ok=True)
+            return target
+    except KnowledgeStoreError:
+        raise
     except Exception as exc:  # noqa: BLE001 — 寫不進去只是下次還要重算，不影響正確性
         print(f"[WARN] embeddings cache 寫入失敗（這次的向量仍然是重算出來的）: {exc}")
-        target = None
-    # 舊位置那份已經沒有身分可言了，順手收掉，使用者才不會以為它還有用。
-    with contextlib.suppress(OSError):
-        legacy_companion(json_path).unlink(missing_ok=True)
-    return Matrices(matrix, gate_matrix, "rebuilt", target)
+        return None
 
 
 def _normalized(np, rows: Iterable[Iterable[float]], label: str):

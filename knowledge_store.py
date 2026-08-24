@@ -187,10 +187,11 @@ def _write_npz_temp(
     content_hash_schema: str,
     generation: str,
     chunk_ids: list[str],
+    dir_fd: int | None = None,
     gate_rows: list[list[float]] | None = None,
     gate_content_hash: str = "",
     gate_content_hash_schema: str = "",
-) -> Path:
+):
     """Stage the NPZ.  Both matrices live in one file, so publishing is one rename.
 
     `embeddings` 是 retrieval 訊號(可能含生成脈絡),`embeddings_gate` 是
@@ -239,6 +240,26 @@ def _write_npz_temp(
             gate_content_hash_schema=gate_content_hash_schema,
         )
 
+    if dir_fd is not None:
+        # 持有已驗證目錄 fd 的版本：staging 也一律相對操作，不留任何用路徑
+        # 再開一次的機會（那正是 TOCTOU 的來源）。回傳的是相對檔名。
+        name = f".{basename}.tmp.{os.getpid()}.{os.urandom(6).hex()}"
+        handle_fd = os.open(
+            name,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+            0o600, dir_fd=dir_fd,
+        )
+        try:
+            with os.fdopen(handle_fd, "wb") as handle:
+                np.savez_compressed(handle, **payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            return name
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(name, dir_fd=dir_fd)
+            raise
+
     fd, raw_path = tempfile.mkstemp(prefix=f".{basename}.tmp.", dir=directory)
     path = Path(raw_path)
     try:
@@ -250,6 +271,77 @@ def _write_npz_temp(
     except Exception:
         path.unlink(missing_ok=True)
         raise
+
+
+class _EmbeddingSlot:
+    """向量檔的四個動作（存在？備份、替換、刪除）——有 dir_fd 就一律走相對操作。
+
+    路徑版留著給沒有傳 fd 的呼叫端；行為逐字相同，差別只在「動到的是路徑還是
+    開 fd 當下驗過的那個 inode」。
+    """
+
+    def __init__(self, path: Path, dir_fd: int | None):
+        self.path = path
+        self.name = path.name
+        self.fd = dir_fd
+
+    def exists(self) -> bool:
+        if self.fd is None:
+            return self.path.exists()
+        try:
+            os.lstat(self.name, dir_fd=self.fd)
+            return True
+        except FileNotFoundError:
+            return False
+
+    def backup(self, generation: str) -> str | None:
+        if self.fd is None:
+            backup = _backup_link(self.path, generation)
+            return str(backup) if backup else None
+        if not self.exists():
+            return None
+        name = f".{self.name}.rollback.{generation}"
+        try:
+            os.link(self.name, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        except OSError:
+            return None
+        return name
+
+    def restore(self, backup) -> None:
+        if self.fd is None:
+            if backup and Path(backup).exists():
+                os.replace(Path(backup), self.path)
+            else:
+                self.path.unlink(missing_ok=True)
+            return
+        if backup and self.exists_name(backup):
+            os.replace(backup, self.name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.name, dir_fd=self.fd)
+
+    def exists_name(self, name: str) -> bool:
+        try:
+            os.lstat(name, dir_fd=self.fd)
+            return True
+        except (FileNotFoundError, TypeError):
+            return False
+
+    def drop_backup(self, backup) -> None:
+        if not backup:
+            return
+        if self.fd is None:
+            Path(backup).unlink(missing_ok=True)
+        else:
+            with contextlib.suppress(OSError):
+                os.unlink(backup, dir_fd=self.fd)
+
+    def remove(self) -> None:
+        if self.fd is None:
+            self.path.unlink(missing_ok=True)
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.name, dir_fd=self.fd)
 
 
 def _default_chunk_ids(chunks: list[dict]) -> list[str]:
@@ -294,6 +386,7 @@ def save_knowledge_store_atomic(
     content_hash: str,
     content_hash_schema: str,
     chunk_ids: list[str] | None = None,
+    embedding_dir_fd: int | None = None,
     legacy_companion: Path | None = None,
     gate_content_hash: str | None = None,
     gate_content_hash_schema: str | None = None,
@@ -315,6 +408,12 @@ def save_knowledge_store_atomic(
     ``legacy_companion`` 給的話,提交成功後會把舊版本留在 JSON 旁邊的
     companion NPZ 刪掉——它是可重建資料,留著只會讓使用者以為「刪了 JSON
     知識庫還在」。
+
+    ``embedding_dir_fd`` 給的話,向量檔的 staging / 備份 / 替換 / 刪除全部改用
+    `dir_fd` 相對操作(呼叫端負責持有那個已驗證的 fd)。路徑先檢查再用是
+    check-then-use:`.codetrail` 在檢查之後被換成指向 sandbox 外的 symlink,
+    NDA 向量就寫到外面去了。持有 fd 等於釘住驗過的 inode,路徑之後怎麼換都
+    影響不到這裡。沒給就走舊的 path-based 版本(其他呼叫端與測試不受影響)。
     """
     json_path = Path(json_path)
     emb_path = json_path.parent / Path(embedding_file)
@@ -370,10 +469,11 @@ def save_knowledge_store_atomic(
             with knowledge_store_lock(json_path, exclusive=True):
                 yield
 
+    slot = _EmbeddingSlot(emb_path, embedding_dir_fd)
     json_tmp: Path | None = None
-    emb_tmp: Path | None = None
+    emb_tmp = None            # path-based 是 Path，dir_fd 版是相對檔名 str
     json_backup: Path | None = None
-    emb_backup: Path | None = None
+    emb_backup = None
     json_replaced = False
     emb_replaced = False
     try:
@@ -381,11 +481,13 @@ def save_knowledge_store_atomic(
             try:
                 json_tmp = _write_json_temp(json_path.parent, json_path.name, payload)
                 if rows:
-                    emb_path.parent.mkdir(parents=True, exist_ok=True)
+                    if embedding_dir_fd is None:
+                        emb_path.parent.mkdir(parents=True, exist_ok=True)
                     emb_tmp = _write_npz_temp(
                         emb_path.parent,
                         emb_path.name,
                         rows,
+                        dir_fd=embedding_dir_fd,
                         embedding_model=embedding_model,
                         content_hash=content_hash,
                         content_hash_schema=content_hash_schema,
@@ -398,14 +500,20 @@ def save_knowledge_store_atomic(
                     )
 
                 json_backup = _backup_link(json_path, generation)
-                emb_backup = _backup_link(emb_path, generation)
+                emb_backup = slot.backup(generation)
 
                 if emb_tmp is not None:
-                    os.replace(emb_tmp, emb_path)
+                    if embedding_dir_fd is None:
+                        os.replace(emb_tmp, emb_path)
+                    else:
+                        os.replace(emb_tmp, slot.name,
+                                   src_dir_fd=embedding_dir_fd,
+                                   dst_dir_fd=embedding_dir_fd)
+                        os.fsync(embedding_dir_fd)
                     emb_tmp = None
                     emb_replaced = True
-                elif emb_path.exists():
-                    emb_path.unlink()
+                elif slot.exists():
+                    slot.remove()
                     emb_replaced = True
 
                 os.replace(json_tmp, json_path)
@@ -421,17 +529,13 @@ def save_knowledge_store_atomic(
                     else:
                         json_path.unlink(missing_ok=True)
                 if emb_replaced:
-                    if emb_backup and emb_backup.exists():
-                        os.replace(emb_backup, emb_path)
-                    else:
-                        emb_path.unlink(missing_ok=True)
+                    slot.restore(emb_backup)
                 _fsync_directory(json_path.parent)
                 raise
 
             if json_backup:
                 json_backup.unlink(missing_ok=True)
-            if emb_backup:
-                emb_backup.unlink(missing_ok=True)
+            slot.drop_backup(emb_backup)
             # 提交成功之後才動舊位置那份:回滾路徑已經走完,不會出現「舊 JSON
             # 還在、它的 companion 卻被刪掉」的狀態。
             if legacy_companion is not None:
@@ -441,9 +545,12 @@ def save_knowledge_store_atomic(
     finally:
         if json_tmp:
             json_tmp.unlink(missing_ok=True)
-        if emb_tmp:
-            emb_tmp.unlink(missing_ok=True)
+        if emb_tmp is not None:
+            if embedding_dir_fd is None:
+                Path(emb_tmp).unlink(missing_ok=True)
+            else:
+                with contextlib.suppress(OSError):
+                    os.unlink(emb_tmp, dir_fd=embedding_dir_fd)
         if json_backup:
             json_backup.unlink(missing_ok=True)
-        if emb_backup:
-            emb_backup.unlink(missing_ok=True)
+        slot.drop_backup(emb_backup)

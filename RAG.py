@@ -3012,12 +3012,18 @@ def load_knowledge_base(
         with _maybe_lock():
             with open(output_path, 'r', encoding='utf-8') as f:
                 kb = json.load(f)
-            if _restore_vectors:
-                _restore_embeddings_from_npz(
-                    kb, output_path, allow_rebuild=not _already_locked)
-            if not _quiet:
-                print(f"[INFO] 載入現有知識庫: {len(kb.get('chunks', []))} 個區塊")
-            return kb
+
+        # store lock 只保護「讀到一致的 JSON」。補向量（可能要連 embedding server
+        # 重算幾分鐘）一律在鎖外做：持著 shared lock 打網路的話，期間任何 writer
+        # 都拿不到 exclusive lock。cache 自帶身分，驗證不需要鎖；重算的發布會在
+        # kb_cache 裡自己取一次短鎖並確認 generation 沒變（見 kb_cache.rebuild）。
+        # `_already_locked=True` 的呼叫端本來就在別人的交易裡，那條路徑不重算。
+        if _restore_vectors:
+            _restore_embeddings_from_npz(
+                kb, output_path, allow_rebuild=not _already_locked)
+        if not _quiet:
+            print(f"[INFO] 載入現有知識庫: {len(kb.get('chunks', []))} 個區塊")
+        return kb
 
     kb_cache.purge(output_path, announce=not _quiet)
 
@@ -3144,23 +3150,26 @@ def save_knowledge_base(kb: Dict, output_path: Path, *, _already_locked: bool = 
         _chunks_content_hash(kb["chunks"], schema=context_signals.GATE_SCHEMA)
         if needs_gate else None
     )
-    # ★ 路徑一定要走驗過的那條：cache 路徑上任何一層是 symlink 就 fail-loud，
-    # 不能讓「寫向量」變成把 NDA 內容寫到 sandbox 外。空 KB 不建目錄（零寫入）。
+    # ★ 路徑一定要走驗過的那條，而且**整段提交期間持有那個目錄的 fd**：先檢查
+    # 路徑再用是 check-then-use，`.codetrail` 在中途被換成指向 sandbox 外的
+    # symlink，NDA 向量就寫到外面去了。空 KB 不建目錄（零寫入）。
     emb_target = (kb_cache.prepare_cache_target(output_path) if kb["chunks"]
                   else kb_cache.checked_cache_file(output_path))
-    _, saved_emb_path = save_knowledge_store_atomic(
-        kb,
-        output_path,
-        embedding_file=emb_target,
-        embedding_model=EMBEDDING_MODEL,
-        content_hash=content_hash,
-        content_hash_schema=retrieval_schema,
-        chunk_ids=kb_cache.chunk_row_ids(kb["chunks"]),
-        legacy_companion=kb_cache.legacy_companion(output_path),
-        gate_content_hash=gate_hash,
-        gate_content_hash_schema=context_signals.GATE_SCHEMA if needs_gate else None,
-        already_locked=_already_locked,
-    )
+    with kb_cache.cache_dir_fd(output_path, create=bool(kb["chunks"])) as emb_fd:
+        _, saved_emb_path = save_knowledge_store_atomic(
+            kb,
+            output_path,
+            embedding_file=emb_target,
+            embedding_model=EMBEDDING_MODEL,
+            content_hash=content_hash,
+            content_hash_schema=retrieval_schema,
+            chunk_ids=kb_cache.chunk_row_ids(kb["chunks"]),
+            embedding_dir_fd=emb_fd,
+            legacy_companion=kb_cache.legacy_companion(output_path),
+            gate_content_hash=gate_hash,
+            gate_content_hash_schema=context_signals.GATE_SCHEMA if needs_gate else None,
+            already_locked=_already_locked,
+        )
     if saved_emb_path:
         emb_size = saved_emb_path.stat().st_size / 1024 / 1024
         gate_note = "（含 gate 矩陣）" if needs_gate else ""
@@ -3314,8 +3323,9 @@ def _commit_document_to_kb(
     """把一份 ExtractedDocument 併進知識庫（同名文件先移除舊 chunks）。
 
     `fresh=True`：這一份文件成為新 KB 的全部內容——既有 chunks 在**同一次原子
-    提交**裡被換掉，舊向量隨著 generation 換新自動失效。`.codetrail/figures/`
-    與其中的人工覆核紀錄一個位元組都不動（那是花時間換來的資料，不是 cache）；
+    提交**裡被換掉，舊向量隨著 generation 換新自動失效。fresh **不會**為了 reset
+    去清 `.codetrail/figures/`（ingest 本來就會寫入這一次的 run、提交後也可能依
+    retention 回收沒被引用的舊 run，那與 fresh 無關）；
     這份文件自己的 `human_verified` 已經在抽取階段沿用回來了（§15.7）。
     中途任何一步失敗都不會清空 KB：清空只發生在 exclusive lock 內、提交之前，
     而提交失敗會整批回滾。

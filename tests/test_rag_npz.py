@@ -15,17 +15,24 @@ from pathlib import Path
 import pytest
 
 import config
+import context_signals
 from RAG import load_knowledge_base, save_knowledge_base
 
 # numpy 未裝就整份 skip(AGENTS.md §5:離線/缺套件要 graceful skip,不是 collect error)
 np = pytest.importorskip("numpy")
 
 
+# fixture 用的 store generation:JSON 與 NPZ 兩邊要一致,才是一組「證明得了身分」
+# 的舊檔。少了它 + content-v1 串接雜湊 + 沒有逐列 id,`["ab","c"]` 與 `["a","bc"]`
+# 這種重新切分是驗不出來的,載入端因此一律重建(2026-08-24 審核第二輪)。
+_GENERATION = "fixture-generation-0001"
+
+
 def _content_hash(chunks: list[dict]) -> str:
-    hasher = hashlib.md5()
-    for chunk in chunks:
-        hasher.update(chunk.get("content", "").encode("utf-8"))
-    return hasher.hexdigest()
+    """與寫入端同一份實作（現行 schema 有長度前綴，不會被串接碰撞騙過）。"""
+    return context_signals.chunks_content_hash(
+        chunks, schema=context_signals.CONTENT_INPUT_SCHEMA
+    )
 
 
 def test_load_knowledge_base_restores_external_npz_embeddings(tmp_path):
@@ -35,7 +42,9 @@ def test_load_knowledge_base_restores_external_npz_embeddings(tmp_path):
         {"source": "old.md", "page": 1, "chunk_index": 1, "content": "beta"},
     ]
     kb_path.write_text(
-        json.dumps({"metadata": {"documents": ["old.md"]}, "chunks": chunks}, ensure_ascii=False),
+        json.dumps({"metadata": {"documents": ["old.md"],
+                                 "store_generation": _GENERATION},
+                    "chunks": chunks}, ensure_ascii=False),
         encoding="utf-8",
     )
     np.savez_compressed(
@@ -44,6 +53,8 @@ def test_load_knowledge_base_restores_external_npz_embeddings(tmp_path):
         embedding_model=config.EMBEDDING_MODEL,
         chunk_count=2,
         content_hash=_content_hash(chunks),
+        content_hash_schema=context_signals.CONTENT_INPUT_SCHEMA,
+        store_generation=_GENERATION,
     )
 
     kb = load_knowledge_base(kb_path)
@@ -65,6 +76,7 @@ def test_incremental_save_preserves_old_embeddings_from_npz(tmp_path):
                     "documents": ["old.md"],
                     "total_documents": 1,
                     "total_chunks": 2,
+                    "store_generation": _GENERATION,
                 },
                 "chunks": old_chunks,
             },
@@ -78,6 +90,8 @@ def test_incremental_save_preserves_old_embeddings_from_npz(tmp_path):
         embedding_model=config.EMBEDDING_MODEL,
         chunk_count=2,
         content_hash=_content_hash(old_chunks),
+        content_hash_schema=context_signals.CONTENT_INPUT_SCHEMA,
+        store_generation=_GENERATION,
     )
     kb = load_knowledge_base(kb_path)
     kb["chunks"].append(
@@ -154,7 +168,8 @@ def _build_kb_files(tmp_path: Path, n: int = 4, dim: int = 8):
     json_path.write_text(
         json.dumps({
             "chunks": chunks,
-            "metadata": {"embedding_model": knowledge.EMBEDDING_MODEL, "documents": []},
+            "metadata": {"embedding_model": knowledge.EMBEDDING_MODEL, "documents": [],
+                         "store_generation": _GENERATION},
         }, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -170,6 +185,8 @@ def _build_kb_files(tmp_path: Path, n: int = 4, dim: int = 8):
         embedding_model=knowledge.EMBEDDING_MODEL,
         chunk_count=n,
         content_hash=_content_hash(chunks),
+        content_hash_schema=context_signals.CONTENT_INPUT_SCHEMA,
+        store_generation=_GENERATION,
     )
     return json_path, rng
 

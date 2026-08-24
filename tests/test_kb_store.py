@@ -188,7 +188,11 @@ def test_atomic_pair_write_rolls_back_npz_before_unlock_on_json_publish_failure(
     changed["chunks"][0]["content"] = "replacement content"
     real_replace = knowledge_store.os.replace
 
-    def fail_json_publish(source, destination):
+    def fail_json_publish(source, destination, **kwargs):
+        # 向量檔現在走 dir_fd 相對操作（src_dir_fd/dst_dir_fd），所以這個替身要吃得下
+        # 那兩個關鍵字；只有「用絕對路徑發布 JSON」那一次才注入失敗。
+        if kwargs:
+            return real_replace(source, destination, **kwargs)
         source_path = Path(source)
         destination_path = Path(destination)
         if destination_path == path and ".tmp." in source_path.name:

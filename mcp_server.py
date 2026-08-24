@@ -1601,8 +1601,10 @@ def ingest_document(path: str, mode: str = "auto", preflight_only: bool = False,
         fresh: True 時走「一步到位重建」:清空既有 KB chunks、讓舊 embeddings
               cache 失效、只留這一份文件,全部在同一次原子提交裡完成。中途失敗
               不會留下「新 JSON 配舊向量」或半套可查詢狀態(整批回滾)。
-              **不會**刪 `.codetrail/figures/` 或其中的 human_verified 人工覆核
-              資料。但「不刪」不等於「還能用」,兩種情況要分清楚:
+              **不會**為了 reset 而整批清除 `.codetrail/figures/`(ingest 本來就會
+              寫入這一次的 run,提交後也可能依 retention 回收該文件沒被引用的舊
+              run —— 那與 fresh 無關)。但「檔案留著」不等於「還能用」,兩種情況
+              要分清楚:
                 - **同一份文件**再 ingest:人工修正會照 §15.7 沿用回來(來源像素、
                   頁碼、正規化 bbox 全等時)。
                 - **被移出 KB 的其他文件**:artifact 檔案都在,但之後重新 ingest

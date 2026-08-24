@@ -460,7 +460,11 @@ confirm_against_image 設 True。
 `python3 RAG.py <file> knowledge.json --fresh`（`rebuild` 子命令也吃 `--fresh`，
 只對第一份文件生效，之後照常 append）。
 
-**`.codetrail/figures/` 一個位元組都不會被動**——那是花時間換來的人工資料，不是 cache。
+**fresh 不會額外整批清除 `.codetrail/figures/`**——那是花時間換來的人工資料，不是 cache。
+（ingest PDF 本來就會在那裡寫入這一次的 run，提交成功後也可能依 retention 回收該文件
+**沒有被 KB 引用**的舊 run；那是 ingest 一直以來的行為，與 fresh 無關。fresh 不會因為
+「這份文件被移出 KB」就去刪它的 artifacts。）
+
 但「檔案留著」和「還能用」是兩件事，這裡要講清楚：
 
 | | 之後重新 ingest 時 |

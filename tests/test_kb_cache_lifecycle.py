@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 import config
+import kb_cache
 import knowledge_store
 import RAG
 from knowledge import KnowledgeBase
@@ -303,7 +304,10 @@ def test_failed_fresh_ingest_leaves_the_previous_kb_and_cache_consistent(
     second.write_text("second document body about register 0x2000\n", encoding="utf-8")
     real_replace = knowledge_store.os.replace
 
-    def fail_json_publish(source, destination):
+    def fail_json_publish(source, destination, **kwargs):
+        # 向量檔走 dir_fd 相對操作；只攔「用絕對路徑發布 JSON」那一次。
+        if kwargs:
+            return real_replace(source, destination, **kwargs)
         if Path(destination) == kb_path and ".tmp." in Path(source).name:
             raise OSError("injected JSON publish failure")
         return real_replace(source, destination)
@@ -582,6 +586,99 @@ def test_gate_matrix_without_its_own_hash_is_not_trusted(tmp_path: Path, monkeyp
 
     with pytest.raises(KnowledgeStoreError, match="gate"):
         KnowledgeBase(str(kb_path))
+
+
+# ==========================================================================
+# 鎖外重建不得蓋掉「更新一代」剛寫好的 cache
+# ==========================================================================
+def test_a_slow_rebuild_never_overwrites_a_newer_generation_cache(
+    tmp_path: Path, monkeypatch
+):
+    """重算是在鎖外做的，所以中途可能有人提交了新的一代。
+
+    身分驗證會擋住舊向量被拿去查新 chunk（不會靜默錯答），但如果讓舊的重算結果
+    蓋回固定檔名的 cache，剛提交的**有效** cache 就毀了：下一次查詢必須重算，而
+    那一刻 embedding server 連不上的話整個 KB 直接拒載。
+    """
+    _stub_embed(monkeypatch)
+    kb_path = _save(tmp_path, _chunks("alpha body", "beta body"))
+    gen_one = json.loads(kb_path.read_text(encoding="utf-8"))["metadata"]["store_generation"]
+
+    # 查詢 A 手上是 gen1 的 chunks（重算是在鎖外做的，可能慢到幾分鐘）
+    old_chunks = json.loads(kb_path.read_text(encoding="utf-8"))["chunks"]
+    old_meta = {"store_generation": gen_one}
+
+    # ingest B 期間提交了 gen2（JSON 與 cache 一起換掉）
+    _save(tmp_path, _chunks("gen two one", "gen two two"))
+    gen_two_cache = _cache_files(tmp_path)[0].read_bytes()
+
+    # A 現在才算完並準備發布 —— 發布前會重驗 generation
+    matrices = kb_cache.rebuild(kb_path, old_chunks, old_meta, reason="test")
+
+    assert matrices.embeddings is not None, "呼叫端仍拿得到手上這批 chunk 的向量"
+    assert matrices.path is None, "但不得發布到 cache（那會蓋掉 gen2 剛寫好的）"
+    assert _cache_files(tmp_path)[0].read_bytes() == gen_two_cache, "gen2 的 cache 必須原封不動"
+
+    # 而且 gen2 仍然可以直接載入，不需要再重算一次
+    _no_embed_server(monkeypatch, tmp_path)
+    kb = KnowledgeBase(str(kb_path))
+    assert kb.loaded, kb.load_error
+    assert [c["content"] for c in kb.chunks] == ["gen two one", "gen two two"]
+
+
+# ==========================================================================
+# legacy content-v1 的串接雜湊擋不住「重新切分、總文字不變」
+# ==========================================================================
+def test_legacy_content_v1_without_generation_or_ids_is_rejected(
+    tmp_path: Path, monkeypatch
+):
+    """`["ab","c"]` 與 `["a","bc"]` 的 content-v1 雜湊完全相同、chunk 數也相同。
+
+    這種 NPZ 對「切法變了但總文字沒變」毫無鑑別力，遷移它等於把錯位的向量重新
+    認證一次。現行 schema 有長度前綴，不受影響。
+    """
+    kb_path = tmp_path / config.KNOWLEDGE_FILE
+    written = _chunks("ab", "c")
+    kb_path.write_text(
+        json.dumps({"metadata": {"documents": ["spec.md"],
+                                 "embedding_model": config.EMBEDDING_MODEL},
+                    "chunks": _chunks("a", "bc")}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    rows = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    np.savez_compressed(
+        _legacy_npz(tmp_path),
+        embeddings=rows,
+        embedding_model=config.EMBEDDING_MODEL,
+        embedding_dimension=2,
+        chunk_count=2,
+        content_hash=RAG.context_signals.chunks_content_hash(
+            written, schema=RAG.context_signals.LEGACY_CONTENT_HASH_SCHEMA),
+        content_hash_schema=RAG.context_signals.LEGACY_CONTENT_HASH_SCHEMA,
+    )
+    _no_embed_server(monkeypatch, tmp_path)
+
+    with pytest.raises(KnowledgeStoreError):
+        KnowledgeBase(str(kb_path))
+
+    assert not _legacy_npz(tmp_path).exists()
+
+
+# ==========================================================================
+# 空的 chunk_ids 要走「丟棄重建」，不是在錯誤訊息裡 IndexError
+# ==========================================================================
+def test_empty_chunk_ids_is_reported_not_crashed(tmp_path: Path, monkeypatch):
+    _stub_embed(monkeypatch)
+    kb_path = _save(tmp_path, _chunks("alpha body", "beta body"))
+    payload = _read_cache(tmp_path)
+    payload["chunk_ids"] = np.array([], dtype=payload["chunk_ids"].dtype)
+    _write_cache(tmp_path, payload)
+    _no_embed_server(monkeypatch, tmp_path)
+
+    with pytest.raises(KnowledgeStoreError) as excinfo:
+        KnowledgeBase(str(kb_path))
+
+    assert "chunk id" in str(excinfo.value)
 
 
 # ==========================================================================
