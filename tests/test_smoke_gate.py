@@ -20,6 +20,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 
 # AGENTS.md §3「安全相關不要砍」的檢查點 → 守它的測試檔。
 SAFETY_MODULES = {
+    "test_aicode_wrapper.py": "aicode 的 direct-MCP 契約與 experimental Code Mode fail-loud 閘",
     "test_fs_sandbox.py": "agent_tools.ToolExecutor._safe_path / media._safe_path",
     "test_run_command.py": "agent_tools._validate_command(白名單 + dangerous pattern)",
     "test_patch_apply.py": "apply_patch 的 context 必須匹配 / max files / max lines",

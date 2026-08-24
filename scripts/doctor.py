@@ -603,7 +603,7 @@ def check_opencode_ai_entry(r: Result) -> None:
     else:
         r.warn(
             "opencode-ai CLI `opencode` 不在 PATH — 日常唯一入口需要 OpenCode TUI，請：\n"
-            "        npm install -g opencode-ai"
+            "        npm install -g opencode-ai@latest"
         )
 
     installed, detail = _npm_global_package_status("opencode-ai")
@@ -614,12 +614,12 @@ def check_opencode_ai_entry(r: Result) -> None:
         if opencode:
             r.warn(
                 "找到 `opencode`，但 npm global package `opencode-ai` 未偵測到；"
-                "若這是舊套件或其他同名 CLI，請改用: npm install -g opencode-ai"
+                "若這是舊套件或其他同名 CLI，請改用: npm install -g opencode-ai@latest"
             )
         else:
             r.warn(
                 "npm global package `opencode-ai` 未偵測到 — 請：\n"
-                "        npm install -g opencode-ai"
+                "        npm install -g opencode-ai@latest"
             )
     else:
         r.info(f"npm package opencode-ai 未檢查 ({detail})")

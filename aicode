@@ -52,7 +52,7 @@ case "${1:-}" in
       ATTACH_URL="http://127.0.0.1:${AICODE_WEB_PORT:-4096}"
     fi
     if ! command -v opencode >/dev/null 2>&1; then
-      echo "[aicode] 'opencode' not found in PATH — install with: npm install -g opencode-ai" >&2
+      echo "[aicode] 'opencode' not found in PATH — install with: npm install -g opencode-ai@latest" >&2
       exit 127
     fi
     echo "[aicode] attach → $ATTACH_URL" >&2
@@ -156,9 +156,25 @@ EOF
 prepare_opencode_mcp_wrapper
 
 if ! command -v opencode >/dev/null 2>&1; then
-  echo "[aicode] 'opencode' not found in PATH — install with: npm install -g opencode-ai" >&2
+  echo "[aicode] 'opencode' not found in PATH — install with: npm install -g opencode-ai@latest" >&2
   exit 127
 fi
+
+# OpenCode 1.18.x 的 experimental Code Mode 會把原本直接暴露的
+# codetrail_* MCP tools 收進單一 `execute` tool。CodeTrail 現行 permission
+# template、AGENTS schema anchor 與 model canary 都以 direct tools 為契約；
+# 放行會直到較晚的 canary 才以「沒有 codetrail_list_dir event」失敗。
+# 顯式 opt-in 直接 fail-loud；未顯式設定時固定 false，避免較寬的
+# OPENCODE_EXPERIMENTAL=true 意外改掉 MCP 協定，同時不影響其他實驗功能。
+OPENCODE_CODE_MODE_VALUE="${OPENCODE_EXPERIMENTAL_CODE_MODE:-}"
+case "${OPENCODE_CODE_MODE_VALUE,,}" in
+  1|true|yes|on)
+    echo "[aicode] refusing OpenCode experimental Code Mode: CodeTrail requires direct codetrail_* MCP tools." >&2
+    echo "[aicode] set OPENCODE_EXPERIMENTAL_CODE_MODE=false and retry." >&2
+    exit 2
+    ;;
+esac
+export OPENCODE_EXPERIMENTAL_CODE_MODE=false
 
 if command -v python3 >/dev/null 2>&1; then
   PYBIN=python3

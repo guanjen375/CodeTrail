@@ -80,6 +80,28 @@ def test_aicode_prepares_opencode_mcp_wrapper(tmp_path):
     assert "exec python" in content and "mcp_server.py" in content
 
 
+@pytest.mark.smoke
+def test_aicode_refuses_experimental_opencode_code_mode(tmp_path):
+    """CodeTrail 的權限與 canary 契約要求 MCP tools 直接暴露。
+
+    OpenCode Code Mode 會把它們收進單一 ``execute`` tool；若 wrapper 繼續啟動，
+    使用者只會在較晚的 model canary 看到難以定位的 tool-call 失敗。
+    """
+    result, args_file = run_aicode_with_stub(
+        tmp_path,
+        [],
+        env_extra={
+            "AICODE_MODEL": "example-code-model:30b",
+            "OPENCODE_EXPERIMENTAL_CODE_MODE": "true",
+        },
+    )
+
+    assert result.returncode == 2
+    assert "experimental Code Mode" in result.stderr
+    assert "OPENCODE_EXPERIMENTAL_CODE_MODE=false" in result.stderr
+    assert not args_file.exists()
+
+
 def test_aicode_repairs_short_codetrail_timeout_before_starting_opencode(tmp_path):
     """更新 repo 後直接跑 aicode:舊的 10 秒 timeout 要在 client 啟動前修好,
     契約遷移(opencode_contract_check)也要接著補上寫入工具的 ask 核准閘與

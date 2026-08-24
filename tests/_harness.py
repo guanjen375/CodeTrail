@@ -113,7 +113,13 @@ def run_aicode_with_stub(
     stub_opencode.chmod(0o700)
 
     env = os.environ.copy()
-    for key in ("AICODE_MODEL", "AICODE_ROOT", "OPENCODE_CONFIG"):
+    for key in (
+        "AICODE_MODEL",
+        "AICODE_ROOT",
+        "OPENCODE_CONFIG",
+        "OPENCODE_EXPERIMENTAL",
+        "OPENCODE_EXPERIMENTAL_CODE_MODE",
+    ):
         env.pop(key, None)
     env.update(
         {

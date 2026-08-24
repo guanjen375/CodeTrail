@@ -136,7 +136,7 @@ npm config set prefix "$HOME/.local"
 grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.profile" 2>/dev/null || \
   printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.profile"
 export PATH="$HOME/.local/bin:$PATH"
-npm install -g opencode-ai
+npm install -g opencode-ai@latest
 command -v opencode    # 確認可被找到
 opencode --version
 ```
@@ -146,6 +146,18 @@ opencode --version
 
 這是 [OpenCode 官方安裝頁](https://dev.opencode.ai/docs/#install) 列出的 npm 路徑；上游若調整
 安裝方式或 runtime 要求，以該頁當前版本為準。
+
+CodeTrail **不在 repo 內釘死 OpenCode patch 版**：它是使用者層 CLI，而且
+`aicode` 的 model-canary 指紋已包含 `opencode --version`，升級後會自動讓舊 PASS
+cache 失效並重驗。截至 2026-08-25，stable `opencode-ai 1.18.21` 已實測通過
+19-tool schema、`list_dir` round-trip 與本機模型結構化 tool call；因此從 1.17.9
+升級是相容的，不需要改 `mcp.codetrail` 設定格式。
+
+但不要把「新版 MCP 改善」和 **experimental Code Mode** 混在一起。Code Mode 會把
+直接暴露的 `codetrail_*` tools 改成單一 `execute` 入口，現行 permission、全域
+AGENTS schema anchor 與 canary 契約都不是這個模式。`aicode` 會明確固定
+`OPENCODE_EXPERIMENTAL_CODE_MODE=false`（避免 `OPENCODE_EXPERIMENTAL=true` 意外連帶
+開啟），若使用者顯式設成 true 則會 fail-loud；要導入它必須另案同步調整上述三層。
 
 ### 1.3 安裝 CodeTrail Python 依賴
 
