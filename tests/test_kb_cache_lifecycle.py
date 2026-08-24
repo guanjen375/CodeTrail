@@ -682,6 +682,119 @@ def test_empty_chunk_ids_is_reported_not_crashed(tmp_path: Path, monkeypatch):
 
 
 # ==========================================================================
+# 舊快照不得刪除 / 覆蓋新世代的 cache（locate 這一條，rebuild 那條在上面）
+# ==========================================================================
+def test_a_stale_snapshot_never_discards_a_newer_generation_cache(
+    tmp_path: Path, monkeypatch
+):
+    """A 讀到 gen1（讀完就放鎖）→ B 提交 gen2 → A 才拿 gen1 的身分去驗 gen2 的 cache。
+
+    驗不過是必然的（本來就不是同一代），但**不可以**因此把 B 剛寫好的有效 cache
+    刪掉：下一次查詢就得重算，而那一刻 embedding server 連不上就整個 KB 拒載。
+    """
+    _stub_embed(monkeypatch)
+    kb_path = _save(tmp_path, _chunks("alpha body", "beta body"))
+    old_snapshot = json.loads(kb_path.read_text(encoding="utf-8"))
+
+    _save(tmp_path, _chunks("gen two one", "gen two two"))    # ← B 提交 gen2
+    gen_two_cache = _cache_files(tmp_path)[0].read_bytes()
+
+    matrices, stale = kb_cache.locate(
+        kb_path, old_snapshot["chunks"], old_snapshot["metadata"])
+
+    assert matrices is None and stale, "gen1 的身分當然驗不過 gen2 的 cache"
+    assert _cache_files(tmp_path)[0].read_bytes() == gen_two_cache, "但不得刪掉它"
+    _no_embed_server(monkeypatch, tmp_path)
+    assert KnowledgeBase(str(kb_path)).loaded, "gen2 仍然可以直接載入，不需要重算"
+
+
+def test_a_stale_snapshot_never_migrates_over_a_newer_generation_cache(
+    tmp_path: Path, monkeypatch
+):
+    """legacy 遷移更危險：它是直接把舊向量**寫**到新一代的 cache 檔上。"""
+    _stub_embed(monkeypatch)
+    chunks = _chunks("alpha body", "beta body")
+    kb_path = _write_legacy_pair(tmp_path, chunks, vectors=[[1.0, 0.0], [0.0, 1.0]])
+    old_snapshot = json.loads(kb_path.read_text(encoding="utf-8"))
+
+    _save(tmp_path, _chunks("gen two one", "gen two two"))    # ← B 提交 gen2
+    gen_two_cache = _cache_files(tmp_path)[0].read_bytes()
+
+    kb_cache.locate(kb_path, old_snapshot["chunks"], old_snapshot["metadata"])
+
+    assert _cache_files(tmp_path)[0].read_bytes() == gen_two_cache, "不得被舊向量蓋掉"
+
+
+def test_purge_does_not_delete_a_cache_that_a_writer_just_committed(
+    tmp_path: Path, monkeypatch
+):
+    """「JSON 不存在」是在鎖外看到的；清除前必須在鎖內重新確認。"""
+    _stub_embed(monkeypatch)
+    kb_path = tmp_path / config.KNOWLEDGE_FILE
+    _save(tmp_path, _chunks("alpha body", "beta body"))
+    live_cache = _cache_files(tmp_path)[0].read_bytes()
+
+    # 模擬「A 在 JSON 還不存在時就決定要清」：JSON 此刻是存在的（B 已提交完）
+    removed = kb_cache.purge_orphans(kb_path)
+
+    assert removed == []
+    assert _cache_files(tmp_path)[0].read_bytes() == live_cache
+
+
+# ==========================================================================
+# 路徑安全的錯誤不得被「壞檔就丟掉」那條路徑吞掉
+# ==========================================================================
+def test_a_symlinked_cache_dir_is_raised_not_swallowed_into_a_discard(
+    tmp_path: Path, monkeypatch
+):
+    """讀 cache 時撞到 symlink 是安全檢查點的錯，不是「壞檔」。
+
+    吞掉它就會往下走到淘汰邏輯，用普通路徑去 unlink —— 而那條路徑此刻正指向
+    sandbox 外的同名檔案。
+    """
+    _stub_embed(monkeypatch)
+    kb_path = _save(tmp_path, _chunks("alpha body", "beta body"))
+    snapshot = json.loads(kb_path.read_text(encoding="utf-8"))
+    outside = tmp_path.parent / "outside-discard"
+    outside.mkdir(exist_ok=True)
+    decoy = outside / "embeddings.npz"
+    decoy.write_bytes(b"someone else's file")
+
+    inner = tmp_path / ".codetrail" / "cache" / "embeddings"
+    shutil.rmtree(inner)
+    (inner.parent / "embeddings").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(KnowledgeStoreError, match="symlink"):
+        kb_cache.locate(kb_path, snapshot["chunks"], snapshot["metadata"])
+
+    assert decoy.is_file(), "絕不可以刪到 sandbox 外的同名檔案"
+
+
+def test_a_security_error_while_reading_is_never_treated_as_a_bad_cache(
+    tmp_path: Path, monkeypatch
+):
+    """競態版：路徑在入口檢查之後才被換掉，錯誤是在**讀取**時才冒出來。
+
+    那條 `except` 一旦把 KnowledgeStoreError 一起吃掉，就會被當成「壞檔」往下走到
+    淘汰邏輯。這裡直接注入那個例外，確認它是往上拋而不是變成一次刪除。
+    """
+    _stub_embed(monkeypatch)
+    kb_path = _save(tmp_path, _chunks("alpha body", "beta body"))
+    snapshot = json.loads(kb_path.read_text(encoding="utf-8"))
+    cache_before = _cache_files(tmp_path)[0].read_bytes()
+
+    def boom(_json_path):
+        raise KnowledgeStoreError("拒絕使用 …：它是 symlink（injected）")
+
+    monkeypatch.setattr(kb_cache, "_read_cache_npz", boom)
+
+    with pytest.raises(KnowledgeStoreError, match="symlink"):
+        kb_cache.locate(kb_path, snapshot["chunks"], snapshot["metadata"])
+
+    assert _cache_files(tmp_path)[0].read_bytes() == cache_before, "不得順手刪掉"
+
+
+# ==========================================================================
 # 使用者只需要理解一個檔：備份／複製 knowledge.json 就夠
 # ==========================================================================
 def test_copying_only_the_json_to_a_new_directory_still_works(tmp_path: Path, monkeypatch):

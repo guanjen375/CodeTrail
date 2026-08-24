@@ -211,6 +211,62 @@ def test_atomic_pair_write_rolls_back_npz_before_unlock_on_json_publish_failure(
     assert leftovers == []
 
 
+def test_rollback_restores_the_old_cache_when_hardlink_backup_is_unavailable(
+    monkeypatch, tmp_path: Path
+):
+    """跨檔案系統之類的情況 hardlink 會失敗；備份必須改用複製，不能靜默沒有備份。
+
+    以前 dir_fd 版的備份一失敗就回 None，於是「備份失敗」看起來跟「本來就沒有舊檔」
+    一樣——之後 JSON 發布失敗要回滾時，新 cache 被刪掉、舊的卻沒有可以還原。
+    """
+    path = tmp_path / config.KNOWLEDGE_FILE
+    RAG.save_knowledge_base(_kb(), path)
+    original_json = path.read_bytes()
+    original_npz = kb_cache.cache_file(path).read_bytes()
+
+    monkeypatch.setattr(knowledge_store.os, "link",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("no hardlinks")))
+    real_replace = knowledge_store.os.replace
+
+    def fail_json_publish(source, destination, **kwargs):
+        if kwargs:
+            return real_replace(source, destination, **kwargs)
+        if Path(destination) == path and ".tmp." in Path(source).name:
+            raise OSError("injected JSON publish failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(knowledge_store.os, "replace", fail_json_publish)
+    changed = _kb()
+    changed["chunks"][0]["content"] = "replacement content"
+
+    with pytest.raises(OSError, match="injected JSON publish failure"):
+        RAG.save_knowledge_base(changed, path)
+
+    assert path.read_bytes() == original_json
+    assert kb_cache.cache_file(path).read_bytes() == original_npz, "舊向量必須被還原"
+
+
+def test_commit_refuses_to_start_when_no_backup_can_be_taken(monkeypatch, tmp_path: Path):
+    """備份做不出來就不准開始替換——沒有回滾點的替換等於單向毀損。"""
+    path = tmp_path / config.KNOWLEDGE_FILE
+    RAG.save_knowledge_base(_kb(), path)
+    original_json = path.read_bytes()
+    original_npz = kb_cache.cache_file(path).read_bytes()
+
+    monkeypatch.setattr(knowledge_store.os, "link",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("no hardlinks")))
+    monkeypatch.setattr(knowledge_store.shutil, "copyfileobj",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    changed = _kb()
+    changed["chunks"][0]["content"] = "replacement content"
+
+    with pytest.raises(knowledge_store.KnowledgeStoreError, match="回滾點"):
+        RAG.save_knowledge_base(changed, path)
+
+    assert path.read_bytes() == original_json
+    assert kb_cache.cache_file(path).read_bytes() == original_npz
+
+
 def test_remove_document_rewrites_remaining_npz_and_reload_keeps_dense_search(monkeypatch, tmp_path: Path):
     path = tmp_path / config.KNOWLEDGE_FILE
     kb = _kb()

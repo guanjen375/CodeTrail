@@ -295,6 +295,13 @@ class _EmbeddingSlot:
             return False
 
     def backup(self, generation: str) -> str | None:
+        """既有向量檔的回滾點。檔案不存在回 None；**做不出備份一律 raise**。
+
+        路徑版的 `_backup_link` 在 hardlink 失敗時會 fallback 去複製；dir_fd 版
+        以前直接回 None，於是「備份失敗」看起來跟「本來就沒有舊檔」一樣——之後
+        JSON 發布失敗要回滾時，會把新 cache 刪掉卻沒有舊的可以還原，舊向量就這樣
+        無聲消失。沒有回滾點就不准開始替換。
+        """
         if self.fd is None:
             backup = _backup_link(self.path, generation)
             return str(backup) if backup else None
@@ -303,9 +310,37 @@ class _EmbeddingSlot:
         name = f".{self.name}.rollback.{generation}"
         try:
             os.link(self.name, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            return name
         except OSError:
-            return None
+            pass   # 跨檔案系統 / 不支援 hardlink → 改用 fd 安全複製
+        try:
+            self._copy_at(self.name, name)
+        except OSError as exc:
+            raise KnowledgeStoreError(
+                f"無法備份既有的向量檔 {self.name}: {exc}；"
+                "拒絕在沒有回滾點的情況下替換它"
+            ) from exc
         return name
+
+    def _copy_at(self, src: str, dst: str) -> None:
+        """以 dir_fd + O_NOFOLLOW 複製一份備份（失敗時不留半個檔）。"""
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        source_fd = os.open(src, os.O_RDONLY | nofollow, dir_fd=self.fd)
+        try:
+            target_fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY | nofollow,
+                                0o600, dir_fd=self.fd)
+        except OSError:
+            os.close(source_fd)
+            raise
+        try:
+            with os.fdopen(source_fd, "rb") as source, os.fdopen(target_fd, "wb") as target:
+                shutil.copyfileobj(source, target)
+                target.flush()
+                os.fsync(target.fileno())
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(dst, dir_fd=self.fd)
+            raise
 
     def restore(self, backup) -> None:
         if self.fd is None:

@@ -3025,7 +3025,11 @@ def load_knowledge_base(
             print(f"[INFO] 載入現有知識庫: {len(kb.get('chunks', []))} 個區塊")
         return kb
 
-    kb_cache.purge(output_path, announce=not _quiet)
+    if not _already_locked:
+        # JSON 不在了 ＝ 空 KB，順手清掉無主 cache。要在 exclusive lock 內確認
+        # 「真的沒有 JSON」，不然會刪掉別人正在提交的那一份（見 purge_orphans）。
+        # `_already_locked` 的呼叫端已經在別人的交易裡，不能再去拿鎖（會擋住自己）。
+        kb_cache.purge_orphans(output_path, announce=not _quiet)
 
     # 建立空的知識庫
     return {
@@ -3177,7 +3181,9 @@ def save_knowledge_base(kb: Dict, output_path: Path, *, _already_locked: bool = 
               f"使用者不需要備份/複製）")
     else:
         print("     Embeddings: 空知識庫，已清除 embeddings cache")
-        kb_cache.purge(output_path)
+        # 檔案已經在上面那次原子提交裡（鎖內）刪掉了；這裡只把空目錄收乾淨。
+        # 不能在這裡呼叫 purge()：鎖已經放掉，那會刪到別人剛提交的 cache。
+        kb_cache.prune_empty_dirs(output_path)
 
     file_size = output_path.stat().st_size / 1024 / 1024  # MB
     print(f"\n[OK] 知識庫已更新!")
@@ -3439,8 +3445,10 @@ def add_document(input_file: str, output_file: str, *, generate_context: bool = 
     knowledge.json / embeddings cache、不呼叫 VL、不算 embedding（契約 §11.4）。
 
     `fresh=True` 是「一步到位重建」：清空既有 chunks、讓舊 embeddings cache 失效、
-    只留這一份文件，全部在同一次原子提交裡完成。`.codetrail/figures/` 與
-    `human_verified` 不受影響（見 `_commit_document_to_kb`）。預設 append 語意不變。
+    只留這一份文件，全部在同一次原子提交裡完成。它**不會為了 reset 去清**
+    `.codetrail/figures/`；同一份文件的人工修正照 §15.7 沿用，被移出 KB 的其他文件
+    則是「檔案留著、但重新 ingest 不會自動恢復人工確認」（見 `_commit_document_to_kb`）。
+    預設 append 語意不變。
     """
     input_path = Path(input_file)
     output_path = Path(output_file)

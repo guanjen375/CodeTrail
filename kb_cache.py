@@ -362,14 +362,48 @@ def purge(json_path, *, announce: bool = False) -> list[str]:
         with contextlib.suppress(OSError):
             legacy.unlink()
             removed.append(str(legacy))
-    # 空掉的 embeddings/ 與 cache/ 一併收乾淨，但 `.codetrail/` 本身留著
-    # （figures 住在那裡）。
-    for parent in (directory.parent, directory.parent.parent):
-        with contextlib.suppress(OSError):
-            parent.rmdir()
+    prune_empty_dirs(json_path)
     if removed and announce:
         print(MSG_PURGED)
     return removed
+
+
+def prune_empty_dirs(json_path) -> None:
+    """把空掉的 `<kb-id>` / `embeddings` / `cache` 收乾淨。
+
+    只 rmdir 空目錄（非空一定失敗），所以**不會**碰到別人剛寫進去的東西——
+    不像刪檔，這一步不需要鎖。`.codetrail/` 本身留著（figures 住在那裡）。
+    """
+    directory = cache_dir(json_path)
+    for parent in (directory, directory.parent, directory.parent.parent):
+        with contextlib.suppress(OSError):
+            parent.rmdir()
+
+
+def purge_orphans(json_path, *, announce: bool = False) -> list[str]:
+    """`knowledge.json` 不在了才清無主 cache——整段在 exclusive lock 內。
+
+    沒有這把鎖會這樣壞掉：查詢 A 看到 JSON 還不存在 → ingest B 開始提交（先把向量
+    換上去，再原子換 JSON）→ A 把 B 剛寫好的 cache 刪掉，最後留下「有 JSON、沒有
+    向量」的 KB。所以鎖內要**重新確認**檔案真的還是不存在。
+
+    完全沒有東西要清時連鎖都不拿：`knowledge_store_lock` 會建出 `.<name>.lock`，
+    為了「確認沒東西可清」而在乾淨的專案裡長出一個檔案是沒有道理的。
+    """
+    json_path = Path(json_path)
+    # 路徑安全先驗（不建任何目錄）：被動手腳的話要在什麼都還沒做之前就 fail-loud，
+    # 不能因為「反正短路了沒事」就靜默跳過——使用者不會知道專案裡有那條連結。
+    directory = _checked_cache_dir(json_path)
+    if not directory.exists() and not legacy_companion(json_path).exists():
+        return []
+
+    from knowledge_store import knowledge_store_lock
+
+    with knowledge_store_lock(json_path, exclusive=True):
+        if json_path.exists():
+            # 有人剛提交完；這不是無主 cache。
+            return []
+        return purge(json_path, announce=announce)
 
 
 # ==========================================================================
@@ -568,9 +602,20 @@ def locate(json_path, chunks: Sequence[Mapping], metadata: Mapping,
     找得到就 ``(Matrices, "")``；找不到 / 驗不過就 ``(None, 原因)``——原因會原樣
     印給使用者看，讓「為什麼要重算」不是黑箱。
 
-    ``mutate=False`` ＝ 真正唯讀：不淘汰壞 cache、不遷移舊 NPZ、不寫任何檔。
-    離線體檢（`kb_ab_compare`）要報告的是**現在磁碟上的狀態**，看一眼就把它修好
-    的話，報告講的就不是使用者手上那份 KB 了。
+    **判斷本身完全唯讀**。真正動檔案（淘汰壞 cache、遷移舊 NPZ）一律另外走
+    `_unchanged_generation()`：取一次短的 exclusive lock 並重驗 KB 還是我們讀到的
+    那一代。少了這一步就會這樣壞掉：
+
+        1. 查詢 A 讀到 gen1（讀完就放鎖，因為重算不能持鎖）
+        2. ingest B 提交 gen2 的 JSON 與 cache
+        3. A 拿 gen1 的身分去驗 gen2 的 cache → 當然不符 → 把 B 剛寫好的**有效**
+           cache 刪掉（legacy 遷移更糟：直接用 gen1 的向量蓋過去）
+
+    身分驗證擋得住錯向量被查（不會靜默錯答），但下一次查詢就必須重算，而那一刻
+    embedding server 連不上的話整個 KB 拒載。
+
+    ``mutate=False`` ＝ 連那一步都不做。離線體檢（`kb_ab_compare`）要報告的是
+    **現在磁碟上的狀態**，看一眼就把它修好的話，報告講的就不是使用者手上那份 KB。
     """
     json_path = Path(json_path)
     if not chunks:
@@ -579,6 +624,7 @@ def locate(json_path, chunks: Sequence[Mapping], metadata: Mapping,
     primary = checked_cache_file(json_path)   # symlink / 逃出 KB 目錄 → fail-loud
     legacy = legacy_companion(json_path)
     stale = "embeddings cache 不存在"
+    unusable: list[tuple[Path, str]] = []
 
     for path, strict in ((primary, True), (legacy, False)):
         if not path.is_file():
@@ -586,17 +632,19 @@ def locate(json_path, chunks: Sequence[Mapping], metadata: Mapping,
         try:
             payload = (_read_cache_npz(json_path) if path is primary
                        else _read_legacy_npz(path))
+        except KnowledgeStoreError:
+            # 路徑安全檢查點的錯誤**絕不吞**：吞掉之後下面會用普通路徑去 unlink，
+            # 而那條路徑此刻可能正指向 sandbox 外的同名檔案。
+            raise
         except Exception as exc:  # noqa: BLE001 — 壞檔是可重建的
             stale = f"{path.name} 讀不回來（{exc}）"
-            if mutate:
-                _discard(path, stale)
+            unusable.append((path, stale))
             continue
         reason = _verify(payload, chunks=chunks, metadata=metadata,
                          strict_identity=strict)
         if reason is not None:
             stale = reason if strict else f"舊位置的 {path.name}：{reason}"
-            if mutate:
-                _discard(path, stale)
+            unusable.append((path, stale))
             continue
         if path is primary:
             return Matrices(payload["embeddings"], payload["embeddings_gate"],
@@ -604,27 +652,85 @@ def locate(json_path, chunks: Sequence[Mapping], metadata: Mapping,
         # 舊位置的 companion NPZ 身分驗證通過（model / generation / 有序內容雜湊 /
         # 列數 / 維度）→ 遷移進隱藏 cache 再把它收掉。它沒有逐列 chunk_ids，所以
         # 這裡刻意不說「完整驗證」；下一次 save 才會補上真正的逐列 id。
-        if not mutate:
-            return Matrices(payload["embeddings"], payload["embeddings_gate"],
-                            "legacy", path), ""
-        print(f"[INFO] 偵測到舊位置的 {path.name}，身分驗證通過；遷移到 {primary.parent}")
-        try:
-            _write_npz(json_path, payload, chunk_ids=chunk_row_ids(chunks))
-        except Exception as exc:  # noqa: BLE001 — 遷移失敗不該讓查詢死掉
-            print(f"[WARN] embeddings cache 遷移失敗（這次仍用已驗證的舊向量）: {exc}")
-        else:
-            with contextlib.suppress(OSError):
-                path.unlink()
+        target = path
+        if mutate:
+            target = _migrate_legacy(json_path, payload, chunks, metadata) or path
         return Matrices(payload["embeddings"], payload["embeddings_gate"],
-                        "legacy", primary), ""
+                        "legacy", target), ""
 
+    if mutate and unusable:
+        _discard_unusable(json_path, metadata, unusable)
     return None, stale
 
 
-def _discard(path: Path, reason: str) -> None:
+@contextlib.contextmanager
+def _unchanged_generation(json_path: Path, metadata: Mapping):
+    """取 exclusive lock 並 yield「KB 還是我們讀到的那一代嗎」。
+
+    呼叫端**必須**在沒有持有 store lock 的情況下進來：flock 綁在 open file
+    description 上，同一個行程持著 shared lock 再要 exclusive 會擋住自己。
+    `locate(mutate=True)` 與 `rebuild()` 都只從鎖外的載入路徑呼叫（見
+    `RAG.load_knowledge_base` 與 `KnowledgeBase._load`）。
+    """
+    from knowledge_store import knowledge_store_lock
+
+    expected = str((metadata or {}).get("store_generation", ""))
+    with knowledge_store_lock(json_path, exclusive=True):
+        current = _json_generation(json_path)
+        yield current is not None and current == expected
+
+
+def _discard_unusable(json_path: Path, metadata: Mapping,
+                      unusable: Sequence[tuple[Path, str]]) -> None:
+    """淘汰驗不過的 cache——但只在 KB 還是同一代的時候。"""
+    with _unchanged_generation(json_path, metadata) as same:
+        if not same:
+            print("[INFO] KB 在這期間換代了；不動任何 embeddings cache"
+                  "（新一代的 cache 不歸這次判斷管）")
+            return
+        for path, reason in unusable:
+            _discard(json_path, path, reason)
+
+
+def _migrate_legacy(json_path: Path, payload: dict, chunks, metadata) -> Optional[Path]:
+    """把驗過的舊 companion NPZ 搬進隱藏 cache——同樣只在 KB 還是同一代的時候。"""
+    with _unchanged_generation(json_path, metadata) as same:
+        if not same:
+            print("[WARN] 準備遷移舊 NPZ 時發現 KB 已換代；本次不搬，"
+                  "以免用舊向量蓋掉新一代已經寫好的 cache")
+            return None
+        legacy = legacy_companion(json_path)
+        print(f"[INFO] 偵測到舊位置的 {legacy.name}，身分驗證通過；"
+              f"遷移到 {cache_dir(json_path)}")
+        try:
+            target = _write_npz(json_path, payload, chunk_ids=chunk_row_ids(chunks))
+        except KnowledgeStoreError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 遷移失敗不該讓查詢死掉
+            print(f"[WARN] embeddings cache 遷移失敗（這次仍用已驗證的舊向量）: {exc}")
+            return None
+        with contextlib.suppress(OSError):
+            legacy.unlink()
+        return target
+
+
+def _discard(json_path: Path, path: Path, reason: str) -> None:
+    """刪一份不可用的 cache。cache 檔一律用持有中的 dir fd 刪，不用路徑。"""
     print(f"[INFO] 丟棄不可用的 embeddings cache（{reason}）: {path}")
-    with contextlib.suppress(OSError):
-        path.unlink()
+    if path == legacy_companion(json_path):
+        # 舊位置那份就在 KB 目錄裡；`unlink` 對 symlink 是刪連結本身，不會穿出去。
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return
+    if not _HAS_OPENAT:   # pragma: no cover - 非 POSIX 的退路
+        with contextlib.suppress(OSError):
+            checked_cache_file(json_path).unlink()
+        return
+    with cache_dir_fd(json_path, create=False) as dfd:
+        if dfd is None:
+            return
+        with contextlib.suppress(OSError):
+            os.unlink(CACHE_FILENAME, dir_fd=dfd)
 
 
 # ==========================================================================
@@ -781,19 +887,11 @@ def _publish_rebuilt(json_path: Path, payload: dict, chunks, metadata) -> Option
     description 上，同一個行程持著 shared lock 再要 exclusive 會擋住自己。呼叫端
     因此一律先放鎖再重算（`RAG.load_knowledge_base` 與 `KnowledgeBase._load` 都是）。
     """
-    from knowledge_store import knowledge_store_lock
-
-    expected = str((metadata or {}).get("store_generation", ""))
     try:
-        with knowledge_store_lock(json_path, exclusive=True):
-            current = _json_generation(json_path)
-            if current is None:
-                print("[WARN] 重算完成，但這時讀不到 knowledge.json；本次不寫入 cache")
-                return None
-            if current != expected:
-                print(f"[WARN] 重算期間 knowledge.json 已換代"
-                      f"（{expected or '(無)'} → {current or '(無)'}）；"
-                      "本次不寫入 cache，以免蓋掉新一代已經寫好的向量")
+        with _unchanged_generation(json_path, metadata) as same:
+            if not same:
+                print("[WARN] 重算期間 knowledge.json 已換代；本次不寫入 cache，"
+                      "以免蓋掉新一代已經寫好的向量")
                 return None
             target = _write_npz(json_path, payload, chunk_ids=chunk_row_ids(chunks))
             # 舊位置那份已經沒有身分可言了，順手收掉，使用者才不會以為它還有用。

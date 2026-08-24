@@ -375,7 +375,7 @@ class KnowledgeBase:
         else:
             # JSON 不在了 ＝ 空 KB。無主的向量既不能查也不該留著讓使用者誤會
             # 「知識庫還在」；不需要 file watcher，下一次進到這裡處理掉就行。
-            kb_cache.purge(json_path, announce=True)
+            kb_cache.purge_orphans(json_path, announce=True)
 
     @staticmethod
     def _stat_signature(path: str):
