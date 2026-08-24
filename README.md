@@ -787,7 +787,8 @@ preflight 零寫入;它會估算所有結構化候選，包含純 raster 的分�
 **中止查詢而不是拿舊向量湊合**。備份 / 複製 / 刪除知識庫只要動 `knowledge.json`;刪掉它
 就是空知識庫,旁邊不會留下一份舊向量。要把 KB 重建成只有某一份文件,用
 `ingest_document(path, fresh=True)`(CLI 是 `--fresh`)——它**不會**刪
-`.codetrail/figures/` 或其中的 `human_verified` 人工覆核資料。細節見
+`.codetrail/figures/` 的 artifact 檔案;同一份文件再 ingest 時人工修正會沿用,但
+**被移出 KB 的其他文件之後重新 ingest 不會自動恢復人工確認**。細節見
 [docs/rag.md](docs/rag.md#只有-knowledgejson-要管)。
 
 更多操作模式(夾帶附件、注入 RAG、查 spec)見 [docs/basic-usage.md](docs/basic-usage.md);完整 19 個工具清單見 [docs/mcp-tools.md](docs/mcp-tools.md);被你糾正過的行為怎麼變成之後 session 都遵守的規則,見 [docs/lessons.md](docs/lessons.md)。

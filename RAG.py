@@ -1312,7 +1312,10 @@ def _existing_human_entries(fx, root_path: Path, kb_path,
     if path is None or not path.is_file():
         return [], [], {}
     try:
-        kb = load_knowledge_base(path, _quiet=True)
+        # 只看 chunk 的 metadata（verification_status / revision），不需要向量：
+        # 為了盤點人工確認而去重算整個 KB 的 embedding 是白花錢，而且會讓「舊
+        # cache 壞掉」變成「人工修正靜默不沿用」。
+        kb = load_knowledge_base(path, _quiet=True, _restore_vectors=False)
     except Exception as exc:  # noqa: BLE001 — 讀不到既有 KB 不該讓 ingest 死掉
         print(f"  [INFO] 讀不到既有知識庫（{exc}），人工確認一律不沿用（fail-closed）",
               flush=True)
@@ -2977,7 +2980,8 @@ def generate_gate_embeddings(chunks: List[Dict], cache_dir: Path = None) -> List
 # 主程式
 # ============================================================
 def load_knowledge_base(
-    output_path: Path, *, _already_locked: bool = False, _quiet: bool = False
+    output_path: Path, *, _already_locked: bool = False, _quiet: bool = False,
+    _restore_vectors: bool = True,
 ) -> Dict:
     """載入現有知識庫，不存在則建立空的
 
@@ -2990,6 +2994,11 @@ def load_knowledge_base(
     JSON 不在了 ＝ 空知識庫，而且**順手清掉無主的 embeddings cache**：使用者用
     檔案總管刪掉 knowledge.json 之後，不該還留著一份看起來像知識庫的向量檔。
     這一步不建立任何目錄，`--preflight` 那條零寫入路徑才不會長出 `.codetrail/`。
+
+    `_restore_vectors=False` 只讀 JSON，不去碰向量。給「拿 chunk metadata 就夠」
+    的呼叫端用：fresh ingest（那些 chunk 馬上就要被丟掉）與 figure 的人工確認
+    盤點。少了這個旗標，fresh 會因為「舊 cache 壞掉」而在**清空之前**就中止——
+    但 fresh 的直覺正好相反：舊向量怎樣都不重要，反正整批要換掉。
     """
     if output_path.exists():
         @contextlib.contextmanager
@@ -3003,8 +3012,9 @@ def load_knowledge_base(
         with _maybe_lock():
             with open(output_path, 'r', encoding='utf-8') as f:
                 kb = json.load(f)
-            _restore_embeddings_from_npz(
-                kb, output_path, allow_rebuild=not _already_locked)
+            if _restore_vectors:
+                _restore_embeddings_from_npz(
+                    kb, output_path, allow_rebuild=not _already_locked)
             if not _quiet:
                 print(f"[INFO] 載入現有知識庫: {len(kb.get('chunks', []))} 個區塊")
             return kb
@@ -3073,7 +3083,8 @@ def _restore_embeddings_from_npz(
             )
         return True
 
-    matrices, stale = kb_cache.locate(output_path, chunks, saved_metadata)
+    matrices, stale = kb_cache.locate(output_path, chunks, saved_metadata,
+                                     mutate=allow_rebuild)
     if matrices is None:
         if not allow_rebuild:
             raise kb_cache.fatal(stale)
@@ -3133,10 +3144,14 @@ def save_knowledge_base(kb: Dict, output_path: Path, *, _already_locked: bool = 
         _chunks_content_hash(kb["chunks"], schema=context_signals.GATE_SCHEMA)
         if needs_gate else None
     )
+    # ★ 路徑一定要走驗過的那條：cache 路徑上任何一層是 symlink 就 fail-loud，
+    # 不能讓「寫向量」變成把 NDA 內容寫到 sandbox 外。空 KB 不建目錄（零寫入）。
+    emb_target = (kb_cache.prepare_cache_target(output_path) if kb["chunks"]
+                  else kb_cache.checked_cache_file(output_path))
     _, saved_emb_path = save_knowledge_store_atomic(
         kb,
         output_path,
-        embedding_file=kb_cache.cache_file(output_path),
+        embedding_file=emb_target,
         embedding_model=EMBEDDING_MODEL,
         content_hash=content_hash,
         content_hash_schema=retrieval_schema,
@@ -3346,15 +3361,20 @@ def _commit_document_to_kb(
 
     # 這裡開始才碰共用狀態：整段 read-modify-write 在同一把鎖內。
     with knowledge_store_lock(output_path, exclusive=True):
-        kb = load_knowledge_base(output_path, _already_locked=True)
+        # fresh 只需要舊 KB 的 chunk metadata（figure guard + 清掉幾個的計數），
+        # 那些向量下一行就要被丟掉了，沒有理由先把它們還原（甚至重算）出來。
+        kb = load_knowledge_base(output_path, _already_locked=True,
+                                 _restore_vectors=not fresh)
         # figure guard 必須看**清空之前**的 KB：它比對的是「這份文件的人工確認在
         # 抽取期間有沒有被別人改掉」，看空的當然永遠一致。
         _assert_figure_guard(figure_guard, kb)
 
         carried_human = 0
+        dropped_names: list = []
         if fresh:
             dropped_chunks = len(kb.get("chunks", []))
-            dropped_docs = len(kb["metadata"].get("documents", []))
+            dropped_names = [str(name) for name in kb["metadata"].get("documents", [])]
+            dropped_docs = len(dropped_names)
             carried_human = len(human_revision_baseline(new_chunks, document.source))
             print(f"[INFO] fresh ingest：清空既有 {dropped_chunks} 個 chunk"
                   f"（{dropped_docs} 份文件），舊 embeddings cache 一併失效")
@@ -3377,8 +3397,12 @@ def _commit_document_to_kb(
         # 儲存
         save_knowledge_base(kb, output_path, _already_locked=True)
         if fresh:
-            print(f"[INFO] fresh ingest 已重建 KB，並保留 {carried_human} 筆 "
-                  "human_verified 紀錄。")
+            print(f"[INFO] fresh ingest 已重建 KB，本文件沿用 {carried_human} 筆 "
+                  "human_verified。")
+            if dropped_docs > 1 or (dropped_docs == 1 and doc_name not in dropped_names):
+                print("[WARN] 被移出 KB 的其他文件：artifact 檔案（.codetrail/figures/）"
+                      "都保留著，但它們的人工確認**不會**在重新 ingest 時自動恢復"
+                      "（沿用需要該 figure 仍在 KB 內，見 _existing_human_entries）。")
 
     # KB-aware prune 一律在 store lock 釋放之後：prune 自己要重讀 KB，在鎖內呼叫
     # 會自鎖。失敗只警告——KB 已經成功提交，舊 run 目錄留著只是佔空間。
@@ -3441,8 +3465,9 @@ def add_document(input_file: str, output_file: str, *, generate_context: bool = 
         return
 
     # 先驗一次：壞掉的 KB 要在付出抽取／生成成本前就 fail。真正併入用的快照
-    # 是 _commit_document_to_kb 在鎖裡重新載的那一份。
-    load_knowledge_base(output_path, _quiet=True)
+    # 是 _commit_document_to_kb 在鎖裡重新載的那一份。非 fresh 時這一步同時把
+    # embeddings cache 補好（重算在鎖外做，不會卡住整個 KB）。
+    load_knowledge_base(output_path, _quiet=True, _restore_vectors=not fresh)
 
     # 處理新文件
     print(f"[INFO] 處理: {input_path.name}")

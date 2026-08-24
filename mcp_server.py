@@ -208,6 +208,11 @@ if os.environ.get("AICODE_NUM_CTX"):
 # knowledge.json 綁 AICODE_ROOT,不依賴 cwd
 _kb_path = str(Path(AICODE_ROOT) / KNOWLEDGE_FILE)
 _log(f"[MCP] 載入 KnowledgeBase ({_kb_path}) ...")
+# embeddings cache 缺了會在這裡依 knowledge.json 重算(進度會逐行印在這份 log 裡)。
+# 只有「cache 被刪 / 過期 / 換了 embedding model」才會發生,而且文字→向量的增量
+# 快取通常全命中;真的要重算一整份大 KB 時,initialize 會等到它算完——這是刻意的,
+# 讓 server「連上就是可查的」,而不是連上之後第一次查詢才 fatal。
+_log("[MCP]   （若 embeddings cache 不在或過期,這一步會先重建,下面會有進度）")
 KB = KnowledgeBase(_kb_path)
 _log(f"[MCP] {KB.get_status()}")
 
@@ -1597,7 +1602,13 @@ def ingest_document(path: str, mode: str = "auto", preflight_only: bool = False,
               cache 失效、只留這一份文件,全部在同一次原子提交裡完成。中途失敗
               不會留下「新 JSON 配舊向量」或半套可查詢狀態(整批回滾)。
               **不會**刪 `.codetrail/figures/` 或其中的 human_verified 人工覆核
-              資料;這份文件自己已通過驗證的人工修正會照 §15.7 沿用回來。
+              資料。但「不刪」不等於「還能用」,兩種情況要分清楚:
+                - **同一份文件**再 ingest:人工修正會照 §15.7 沿用回來(來源像素、
+                  頁碼、正規化 bbox 全等時)。
+                - **被移出 KB 的其他文件**:artifact 檔案都在,但之後重新 ingest
+                  **不會**自動恢復它們的人工確認,revision 會退回 1。沿用的前提是
+                  該 figure 仍在 KB 內(KB 是 revision 的唯一真相),光有 artifact
+                  證明不了使用者確認過的是哪一版。
               預設 False ＝ 既有的 append 語意,一個字都沒變。
               不能與 preflight_only 併用(後者是零寫入的估算)。
 

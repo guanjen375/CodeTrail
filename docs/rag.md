@@ -456,10 +456,21 @@ confirm_against_image 設 True。
 ```
 
 `fresh=True` 會在**同一次原子提交**裡清空既有 chunks、讓舊向量失效、只留這一份文件；
-中途失敗整批回滾，不會出現「新 JSON 配舊向量」這種半套狀態。它**不會**動
-`.codetrail/figures/` 或其中的 `human_verified` 人工覆核資料——那是花時間換來的，
-不是 cache。CLI 對應 `python3 RAG.py <file> knowledge.json --fresh`（`rebuild`
-子命令也吃 `--fresh`，只對第一份文件生效，之後照常 append）。
+中途失敗整批回滾，不會出現「新 JSON 配舊向量」這種半套狀態。CLI 對應
+`python3 RAG.py <file> knowledge.json --fresh`（`rebuild` 子命令也吃 `--fresh`，
+只對第一份文件生效，之後照常 append）。
+
+**`.codetrail/figures/` 一個位元組都不會被動**——那是花時間換來的人工資料，不是 cache。
+但「檔案留著」和「還能用」是兩件事，這裡要講清楚：
+
+| | 之後重新 ingest 時 |
+| --- | --- |
+| **同一份**文件 | 人工修正會沿用回來（來源像素 / 頁碼 / 正規化 bbox 全等時），revision 不倒退 |
+| 被 fresh **移出 KB 的其他文件** | artifact 檔案都在，但人工確認**不會**自動恢復，revision 退回 1 |
+
+原因是沿用的前提為「該 figure 仍在 KB 內」——KB 是 revision 的唯一真相，光有 artifact
+證明不了使用者當初確認的是哪一版。要恢復只能重新覆核。刪掉 `knowledge.json` 也是同一
+個情況。
 
 #### 只有 `knowledge.json` 要管
 

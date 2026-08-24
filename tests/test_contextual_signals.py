@@ -260,12 +260,41 @@ def test_legacy_kb_aliases_the_single_matrix_as_gate(tmp_path: Path):
     assert kb._bm25_gate is kb._bm25
 
 
-def test_ctx_kb_without_gate_matrix_is_refused(tmp_path: Path):
+def test_ctx_kb_without_gate_matrix_never_uses_it_and_rebuilds(tmp_path: Path, monkeypatch):
+    """有 ctx 卻沒有 gate 矩陣的 cache，一個位元組都不准拿去決策。
+
+    2026-08-24 起處置從「拒載，請你自己重建整個 KB」改成「丟棄那份 cache，依
+    knowledge.json 重算出**正確的** gate 矩陣」。安全性質一步都沒讓（gate 向量
+    仍然只能來自 content-only 的組字，絕不別名 retrieval 矩陣），變的只是修復
+    由程式做還是由人做。重算不出來的情形由下一條守。
+    """
     chunks = [
         _chunk("a", "原文一", ctx=CTX_TEXT, embedding=[1.0, 0.0]),
         _chunk("b", "原文二", ctx=CTX_TEXT, embedding=[0.0, 1.0]),
     ]
     path = _write_kb(tmp_path, chunks, with_gate=False)
+    monkeypatch.setattr(RAG.llama_client, "embed_one", lambda **_kw: [1.0, 0.0])
+
+    kb = KnowledgeBase(str(path))
+
+    assert kb.loaded, kb.load_error
+    assert kb._has_ctx is True
+    assert kb._gate_embeddings is not None
+    assert kb._gate_embeddings is not kb._embeddings, "gate 不得別名 retrieval 矩陣"
+    assert not (tmp_path / config.KNOWLEDGE_EMB_FILE).exists(), "沒有 gate 的舊 cache 要被淘汰"
+
+
+def test_ctx_kb_without_gate_matrix_is_fatal_when_it_cannot_be_rebuilt(
+    tmp_path: Path, monkeypatch
+):
+    """重算不出來時中止，而且訊息要說得出是缺 gate。絕不沿用那份 cache。"""
+    chunks = [
+        _chunk("a", "原文一", ctx=CTX_TEXT, embedding=[1.0, 0.0]),
+        _chunk("b", "原文二", ctx=CTX_TEXT, embedding=[0.0, 1.0]),
+    ]
+    path = _write_kb(tmp_path, chunks, with_gate=False)
+    monkeypatch.setattr(RAG.llama_client, "embed_one",
+                        lambda **_kw: (_ for _ in ()).throw(OSError("no server")))
 
     with pytest.raises(KnowledgeStoreError, match="gate"):
         KnowledgeBase(str(path))
@@ -320,7 +349,14 @@ def test_required_schema_sets():
     )
 
 
-def test_ctx_kb_with_legacy_retrieval_schema_is_refused(tmp_path: Path):
+def test_ctx_kb_with_legacy_retrieval_schema_never_uses_it_and_rebuilds(
+    tmp_path: Path, monkeypatch
+):
+    """cache 自報的組字 schema 不是這種 KB 該有的 → 那批向量是用另一套字算的。
+
+    同樣從「拒載」改成「丟棄並重建」：schema 白名單的比對一個字都沒放寬（仍然是
+    required 對照，不是拿 cache 自報的 schema 重算自己），只是驗不過之後改成重算。
+    """
     chunks = [
         _chunk("a", "原文一", ctx=CTX_TEXT, embedding=[1.0, 0.0], gate=[0.0, 1.0]),
         _chunk("b", "原文二", ctx=CTX_TEXT, embedding=[0.0, 1.0], gate=[1.0, 0.0]),
@@ -328,8 +364,29 @@ def test_ctx_kb_with_legacy_retrieval_schema_is_refused(tmp_path: Path):
     path = _write_kb(
         tmp_path, chunks, with_gate=True, schema=context_signals.CONTENT_INPUT_SCHEMA
     )
+    monkeypatch.setattr(RAG.llama_client, "embed_one", lambda **_kw: [1.0, 0.0])
 
-    with pytest.raises(KnowledgeStoreError, match="schema mismatch"):
+    kb = KnowledgeBase(str(path))
+
+    assert kb.loaded, kb.load_error
+    assert not (tmp_path / config.KNOWLEDGE_EMB_FILE).exists(), "schema 不符的舊 cache 要被淘汰"
+    with np.load(_cache_npz(tmp_path), allow_pickle=False) as data:
+        assert str(data["content_hash_schema"]) == context_signals.CONTEXTUAL_INPUT_SCHEMA
+
+
+def test_ctx_kb_with_legacy_retrieval_schema_is_fatal_when_it_cannot_be_rebuilt(
+    tmp_path: Path, monkeypatch
+):
+    chunks = [
+        _chunk("a", "原文一", ctx=CTX_TEXT, embedding=[1.0, 0.0], gate=[0.0, 1.0]),
+    ]
+    path = _write_kb(
+        tmp_path, chunks, with_gate=True, schema=context_signals.CONTENT_INPUT_SCHEMA
+    )
+    monkeypatch.setattr(RAG.llama_client, "embed_one",
+                        lambda **_kw: (_ for _ in ()).throw(OSError("no server")))
+
+    with pytest.raises(KnowledgeStoreError, match="schema"):
         KnowledgeBase(str(path))
 
 

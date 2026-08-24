@@ -451,6 +451,140 @@ def test_ingest_after_an_external_json_deletion_starts_from_an_empty_kb(
 
 
 # ==========================================================================
+# ★ 安全檢查點（AGENTS.md §3）：cache 路徑上的 symlink 一律 fail-closed
+#
+# purge 會 rmtree 整個 <kb-id> 目錄。`.codetrail` 被換成指向 sandbox 外的 symlink
+# 時，「刪掉 knowledge.json 之後自動清無主 cache」就變成遞迴刪除外部目錄；寫入端
+# 同樣會把 NDA 向量寫到外面。這一組守的是「拒絕並 raise」，不是「跳過檢查繼續做」。
+# ==========================================================================
+@pytest.mark.parametrize("link_at", [".codetrail", ".codetrail/cache"])
+def test_purge_refuses_to_delete_through_a_symlinked_cache_path(
+    tmp_path: Path, monkeypatch, link_at: str
+):
+    _stub_embed(monkeypatch)
+    kb_path = _save(tmp_path, _chunks("alpha body", "beta body"))
+    outside = tmp_path.parent / f"outside-{link_at.replace('/', '-')}"
+    outside.mkdir(exist_ok=True)
+    (outside / "precious.txt").write_text("do not delete", encoding="utf-8")
+
+    # 把 cache 路徑上的某一層換成指向 sandbox 外的 symlink
+    link = tmp_path / link_at
+    shutil.rmtree(tmp_path / ".codetrail")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+    kb_path.unlink()
+
+    with pytest.raises(KnowledgeStoreError, match="symlink"):
+        KnowledgeBase(str(kb_path))
+
+    assert (outside / "precious.txt").is_file(), "絕不可以刪到 sandbox 外"
+    assert link.is_symlink(), "連結本身也不該被動"
+
+
+def test_writing_the_cache_refuses_a_symlinked_path(tmp_path: Path, monkeypatch):
+    _stub_embed(monkeypatch)
+    outside = tmp_path.parent / "outside-write"
+    outside.mkdir(exist_ok=True)
+    (tmp_path / ".codetrail").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(KnowledgeStoreError, match="symlink"):
+        _save(tmp_path, _chunks("alpha body"))
+
+    assert list(outside.rglob("*.npz")) == [], "向量不得寫到 sandbox 外"
+
+
+# ==========================================================================
+# fresh 不該因為「舊 cache 壞掉」而做不了——舊向量整批要丟了
+# ==========================================================================
+def test_fresh_ingest_works_even_when_the_old_cache_is_unusable(
+    tmp_path: Path, monkeypatch
+):
+    _stub_embed(monkeypatch)
+    kb_path = tmp_path / config.KNOWLEDGE_FILE
+    first = tmp_path / "first.md"
+    first.write_text("first document body about register 0x1000\n", encoding="utf-8")
+    RAG.add_document(str(first), str(kb_path))
+    # 舊 cache 壞掉（刪掉 / 內容毀損都算），而且 embedding server 也回不來
+    for path in _cache_files(tmp_path):
+        path.write_bytes(b"not an npz at all")
+    second = tmp_path / "second.md"
+    second.write_text("second document body about register 0x2000\n", encoding="utf-8")
+
+    RAG.add_document(str(second), str(kb_path), fresh=True)
+
+    kb = json.loads(kb_path.read_text(encoding="utf-8"))
+    assert {chunk["source"] for chunk in kb["chunks"]} == {"second.md"}
+    assert KnowledgeBase(str(kb_path)).loaded
+
+
+# ==========================================================================
+# allow_rebuild=False 必須是真的唯讀（離線體檢不能順手把 KB 修好）
+# ==========================================================================
+def test_read_only_load_neither_discards_nor_migrates(tmp_path: Path, monkeypatch):
+    chunks = _chunks("alpha body", "beta body")
+    kb_path = _write_legacy_pair(tmp_path, chunks, vectors=[[1.0, 0.0], [0.0, 1.0]])
+    legacy_before = _legacy_npz(tmp_path).read_bytes()
+    _no_embed_server(monkeypatch, tmp_path)
+
+    kb = KnowledgeBase(str(kb_path), allow_rebuild=False)
+
+    assert kb.loaded, kb.load_error
+    assert _legacy_npz(tmp_path).read_bytes() == legacy_before, "唯讀載入不得搬走舊 NPZ"
+    assert _cache_files(tmp_path) == [], "唯讀載入不得寫出新 cache"
+
+
+def test_read_only_load_reports_instead_of_repairing_a_bad_cache(
+    tmp_path: Path, monkeypatch
+):
+    _stub_embed(monkeypatch)
+    kb_path = _save(tmp_path, _chunks("alpha body", "beta body"))
+    payload = _read_cache(tmp_path)
+    payload["content_hash"] = np.array("tampered")
+    _write_cache(tmp_path, payload)
+    before = _cache_files(tmp_path)[0].read_bytes()
+
+    with pytest.raises(KnowledgeStoreError, match="內容雜湊"):
+        KnowledgeBase(str(kb_path), allow_rebuild=False)
+
+    assert _cache_files(tmp_path)[0].read_bytes() == before, "唯讀載入不得淘汰壞 cache"
+
+
+# ==========================================================================
+# 舊 NPZ 缺核心身分：不可以「反正列數對」就認證它
+# ==========================================================================
+@pytest.mark.parametrize("drop", ["embedding_model", "content_hash"])
+def test_legacy_npz_without_core_identity_is_discarded(
+    tmp_path: Path, monkeypatch, drop: str
+):
+    chunks = _chunks("alpha body", "beta body")
+    kb_path = _write_legacy_pair(tmp_path, chunks, vectors=[[1.0, 0.0], [0.0, 1.0]])
+    with np.load(_legacy_npz(tmp_path), allow_pickle=False) as data:
+        payload = {key: data[key] for key in data.files if key != drop}
+    np.savez_compressed(_legacy_npz(tmp_path), **payload)
+    _no_embed_server(monkeypatch, tmp_path)
+
+    with pytest.raises(KnowledgeStoreError):
+        KnowledgeBase(str(kb_path))
+
+    assert not _legacy_npz(tmp_path).exists()
+
+
+def test_gate_matrix_without_its_own_hash_is_not_trusted(tmp_path: Path, monkeypatch):
+    """shape / schema 都對、但來源不明的 gate 矩陣照樣會進拒答判斷。"""
+    _stub_embed(monkeypatch)
+    chunks = [dict(chunk, ctx="生成脈絡一行") for chunk in _chunks("alpha body", "beta body")]
+    kb_path = _save(tmp_path, chunks)
+    payload = _read_cache(tmp_path)
+    assert "embeddings_gate" in payload
+    payload["gate_content_hash"] = np.array("")
+    _write_cache(tmp_path, payload)
+    _no_embed_server(monkeypatch, tmp_path)
+
+    with pytest.raises(KnowledgeStoreError, match="gate"):
+        KnowledgeBase(str(kb_path))
+
+
+# ==========================================================================
 # 使用者只需要理解一個檔：備份／複製 knowledge.json 就夠
 # ==========================================================================
 def test_copying_only_the_json_to_a_new_directory_still_works(tmp_path: Path, monkeypatch):

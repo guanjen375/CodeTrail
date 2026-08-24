@@ -395,86 +395,94 @@ class KnowledgeBase:
         return self._stat_signature(self.path) != self._source_stat
 
     def _load(self, path: str):
+        """讀 JSON（持 shared lock）→ 解析 / 補向量 / 建索引（**不持鎖**）。
+
+        store lock 只保護「讀到一致的 JSON」這一件事。以前整段載入都在鎖裡，
+        自動重建接上去之後就變成「持著 shared lock 打 embedding server 幾分鐘」，
+        期間任何 writer（ingest / remove / figure fix）都拿不到 exclusive lock。
+        向量 cache 自帶身分（generation + 內容雜湊 + 逐列 id），驗證不需要鎖；
+        真的在重建期間有人換掉 JSON，`source_changed()` 下一次查詢就會重載。
+        """
         try:
             with knowledge_store_lock(Path(path), exclusive=False):
                 with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
 
-                self.chunks = data.get("chunks", [])
-                self._index_chunks()
-                self._backfill_figure_verification()
-                metadata = data.get("metadata", {})
-                self._loaded_metadata = metadata
-                self.documents = metadata.get("documents", [])
+            self.chunks = data.get("chunks", [])
+            self._index_chunks()
+            self._backfill_figure_verification()
+            metadata = data.get("metadata", {})
+            self._loaded_metadata = metadata
+            self.documents = metadata.get("documents", [])
 
-                # 驗證 embedding model 一致性
-                saved_model = metadata.get("embedding_model", "")
-                if saved_model and saved_model != EMBEDDING_MODEL:
+            # 驗證 embedding model 一致性
+            saved_model = metadata.get("embedding_model", "")
+            if saved_model and saved_model != EMBEDDING_MODEL:
+                raise KnowledgeStoreError(
+                    "knowledge JSON embedding model mismatch: "
+                    f"saved={saved_model}, configured={EMBEDDING_MODEL}. "
+                    "Rebuild the knowledge base before querying."
+                )
+            self._embedding_mismatch = False
+
+            # 驗證 embedding 維度一致性（抽樣檢查前幾個 chunk）
+            if self.chunks:
+                sample_dims = set()
+                for chunk in self.chunks[:5]:
+                    emb = chunk.get("embedding", [])
+                    if emb:
+                        sample_dims.add(len(emb))
+
+                if len(sample_dims) > 1:
                     raise KnowledgeStoreError(
-                        "knowledge JSON embedding model mismatch: "
-                        f"saved={saved_model}, configured={EMBEDDING_MODEL}. "
-                        "Rebuild the knowledge base before querying."
+                        f"knowledge JSON embedding dimension mismatch: {sorted(sample_dims)}"
                     )
-                self._embedding_mismatch = False
+                self._embedding_dim_mismatch = False
+                self._embedding_dim = sample_dims.pop() if sample_dims else None
+            else:
+                self._embedding_dim_mismatch = False
+                self._embedding_dim = None
 
-                # 驗證 embedding 維度一致性（抽樣檢查前幾個 chunk）
-                if self.chunks:
-                    sample_dims = set()
-                    for chunk in self.chunks[:5]:
-                        emb = chunk.get("embedding", [])
-                        if emb:
-                            sample_dims.add(len(emb))
+            self.loaded = True
 
-                    if len(sample_dims) > 1:
+            # 向量來源：程式自管的 embeddings cache（缺了會自動重建）
+            npz_loaded = self._load_embeddings_from_npz()
+
+            if not npz_loaded:
+                # JSON 自己帶 inline 向量 ＝ 舊格式，維持原本的規則:
+                # 有 ctx 的 KB 一律不准走 legacy inline 回退。那條路徑會把
+                # retrieval 矩陣直接別名成 gate，於是 KB_CONTEXT_USE=0、拒答
+                # 門檻、信心判斷全都吃到含生成脈絡的向量——正是雙訊號要擋的
+                # 循環 grounding。gate 向量只能來自驗過的第二組矩陣。
+                if any(chunk.get("embedding") for chunk in self.chunks):
+                    if self._has_ctx:
                         raise KnowledgeStoreError(
-                            f"knowledge JSON embedding dimension mismatch: {sorted(sample_dims)}"
+                            "this knowledge base carries generated chunk context but its "
+                            f"embeddings could not be loaded from {self._emb_path}; refusing "
+                            "to fall back to inline vectors (that would alias the retrieval "
+                            "matrix as the decision gate). Rebuild the knowledge base."
                         )
-                    self._embedding_dim_mismatch = False
-                    self._embedding_dim = sample_dims.pop() if sample_dims else None
+                    self._precompute_embeddings()
+                    if self.chunks and self._embeddings is None:
+                        raise KnowledgeStoreError(
+                            f"knowledge chunks have no usable embeddings and {self._emb_path} "
+                            "could not be loaded; rebuild the knowledge base"
+                        )
                 else:
-                    self._embedding_dim_mismatch = False
-                    self._embedding_dim = None
+                    # 現行格式（向量只在 cache）：cache 是可重建資料，缺了就
+                    # 依 knowledge.json 重算。重算不了 ＝ fail-loud，絕不沿用。
+                    self._rebuild_embeddings_cache()
 
-                self.loaded = True
+            # P0 改進：預計算 BM25 索引
+            if BM25_ENABLED:
+                self._precompute_bm25_index()
 
-                # 向量來源：程式自管的 embeddings cache（缺了會自動重建）
-                npz_loaded = self._load_embeddings_from_npz()
-
-                if not npz_loaded:
-                    # JSON 自己帶 inline 向量 ＝ 舊格式，維持原本的規則:
-                    # 有 ctx 的 KB 一律不准走 legacy inline 回退。那條路徑會把
-                    # retrieval 矩陣直接別名成 gate，於是 KB_CONTEXT_USE=0、拒答
-                    # 門檻、信心判斷全都吃到含生成脈絡的向量——正是雙訊號要擋的
-                    # 循環 grounding。gate 向量只能來自驗過的第二組矩陣。
-                    if any(chunk.get("embedding") for chunk in self.chunks):
-                        if self._has_ctx:
-                            raise KnowledgeStoreError(
-                                "this knowledge base carries generated chunk context but its "
-                                f"embeddings could not be loaded from {self._emb_path}; refusing "
-                                "to fall back to inline vectors (that would alias the retrieval "
-                                "matrix as the decision gate). Rebuild the knowledge base."
-                            )
-                        self._precompute_embeddings()
-                        if self.chunks and self._embeddings is None:
-                            raise KnowledgeStoreError(
-                                f"knowledge chunks have no usable embeddings and {self._emb_path} "
-                                "could not be loaded; rebuild the knowledge base"
-                            )
-                    else:
-                        # 現行格式（向量只在 cache）：cache 是可重建資料，缺了就
-                        # 依 knowledge.json 重算。重算不了 ＝ fail-loud，絕不沿用。
-                        self._rebuild_embeddings_cache()
-
-                # P0 改進：預計算 BM25 索引
-                if BM25_ENABLED:
-                    self._precompute_bm25_index()
-
-                # 速度優化：記錄載入的 metadata 供快取驗證
-                self._cache_metadata = {
-                    "embedding_model": EMBEDDING_MODEL,
-                    "chunk_count": len(self.chunks),
-                    "bm25_enabled": BM25_ENABLED,
-                }
+            # 速度優化：記錄載入的 metadata 供快取驗證
+            self._cache_metadata = {
+                "embedding_model": EMBEDDING_MODEL,
+                "chunk_count": len(self.chunks),
+                "bm25_enabled": BM25_ENABLED,
+            }
 
         except KnowledgeStoreError as e:
             self.loaded = False
@@ -550,7 +558,9 @@ class KnowledgeBase:
             return False
 
         matrices, stale = kb_cache.locate(
-            self.path, self.chunks, getattr(self, "_loaded_metadata", {}))
+            self.path, self.chunks, getattr(self, "_loaded_metadata", {}),
+            # 不打算重建就等於「只是來看一眼」：不淘汰壞 cache、不遷移舊 NPZ。
+            mutate=self._allow_rebuild)
         if matrices is None:
             # 原因留給重建路徑印出來（也留給 allow_rebuild=False 的體檢工具當理由）
             self._cache_stale_reason = stale
