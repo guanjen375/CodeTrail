@@ -30,6 +30,108 @@ class KnowledgeStoreError(RuntimeError):
     """The on-disk knowledge store is incomplete or internally inconsistent."""
 
 
+class DocumentIdentityConflict(KnowledgeStoreError):
+    """兩個不同來源的檔案在 KB 內撞到同一個文件名稱。"""
+
+
+# 文件在 KB 內的識別字串是 **basename**（`chunk["source"]` 與
+# `metadata["documents"]` 都是 `Path(x).name`）。這個選擇讓 `remove_document("spec.pdf")`
+# 之類的操作對使用者是直覺的，但它同時代表 `a/spec.pdf` 與 `b/spec.pdf` 在 KB 裡
+# 是同一個身分——後灌的那份會把前一份整份換掉，而訊息與正常更新一字不差。
+#
+# `metadata["document_sources"]` 記下每份文件的來源身分（解析後的絕對路徑，或 URL），
+# 入庫前比對。對不上就 fail-loud：靜默覆蓋的後果是查詢照樣回答，只是答的是別份文件。
+DOCUMENT_SOURCES_KEY = "document_sources"
+
+
+def _document_sources(metadata: Mapping) -> dict:
+    raw = metadata.get(DOCUMENT_SOURCES_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if isinstance(k, str) and v}
+
+
+def check_document_identity(
+    metadata: Mapping, doc_name: str, identity: str
+) -> str | None:
+    """入庫前比對文件身分。撞名且來源不同 → `DocumentIdentityConflict`。
+
+    回傳非 None 時是給呼叫端印的警告字串（不是錯誤）。
+
+    三種情形：
+      1. `identity` 是空的（呼叫端給不出來源）→ 不擋、不記，維持既有語意。
+      2. KB 沒有這個名字的紀錄 → 放行（新文件，或舊 KB 還沒有 `document_sources`）。
+         後者只能警告：舊 KB 沒有留下來源，這時候猜「是同一個檔」或猜「不是」
+         都會錯一半，而錯的那一半是靜默的。下一次入庫就有紀錄可比。
+      3. 有紀錄且不同 → raise。
+    """
+    if not identity:
+        return None
+    recorded = _document_sources(metadata).get(doc_name)
+    if recorded is None:
+        documents = metadata.get("documents") or []
+        if doc_name in documents:
+            return (
+                f"知識庫裡已經有一份 '{doc_name}'，但舊版沒有記錄它的來源檔，"
+                f"無法確認這次是不是撞名（同名不同來源）。"
+                f"這一次採用 {identity}；如果它們其實是兩份不同的文件，"
+                f"請先把其中一份改名再重新入庫。"
+            )
+        return None
+    if recorded == identity:
+        return None
+    raise DocumentIdentityConflict(
+        f"知識庫裡已經有一份叫 '{doc_name}' 的文件，但它來自別的位置：\n"
+        f"  已在 KB：{recorded}\n"
+        f"  這一次：  {identity}\n"
+        f"KB 用檔名（basename）當文件識別，直接寫下去會把前一份整份換掉，"
+        f"而且訊息跟正常更新一模一樣——查詢仍然會回答，只是答的是另一份文件。\n"
+        f"三種處理方式：\n"
+        f"  1. 這兩個路徑其實是同一份文件（檔案搬過位置）："
+        f"先 remove_document(\"{doc_name}\") 再重新 ingest；\n"
+        f"  2. 兩份都要留：先把其中一份改名，再 ingest；\n"
+        f"  3. 要用這一份重建整個 KB：加 --fresh。"
+    )
+
+
+def record_document_identity(metadata: dict, doc_name: str, identity: str) -> None:
+    """記下這份文件的來源身分。`identity` 是空的就什麼都不做。"""
+    if not identity:
+        return
+    sources = _document_sources(metadata)
+    sources[doc_name] = identity
+    metadata[DOCUMENT_SOURCES_KEY] = sources
+
+
+def forget_document_identity(metadata: dict, doc_name: str) -> None:
+    """移除一份文件的身分紀錄（`remove_document` 用）。
+
+    不清的話身分紀錄會變成刪不掉的墓碑：使用者照著錯誤訊息刪了文件，
+    再灌同名的另一份還是被擋。
+    """
+    sources = _document_sources(metadata)
+    if sources.pop(doc_name, None) is not None:
+        metadata[DOCUMENT_SOURCES_KEY] = sources
+
+
+def sync_document_identities(metadata: dict) -> None:
+    """把身分紀錄對齊 `documents`：不在文件清單裡的一律移除。
+
+    放在提交路徑上，讓每一個 writer（ingest / remove / fresh）都自動收斂，
+    不必各自記得清。
+    """
+    sources = _document_sources(metadata)
+    if not sources:
+        metadata.pop(DOCUMENT_SOURCES_KEY, None)
+        return
+    documents = {str(name) for name in (metadata.get("documents") or [])}
+    kept = {name: value for name, value in sources.items() if name in documents}
+    if kept:
+        metadata[DOCUMENT_SOURCES_KEY] = kept
+    else:
+        metadata.pop(DOCUMENT_SOURCES_KEY, None)
+
+
 def chunk_id(chunk: Mapping) -> str:
     """KB chunk 的 id 組法（**單一實作**）。
 
@@ -506,6 +608,9 @@ def save_knowledge_store_atomic(
     metadata["store_generation"] = generation
     metadata["total_chunks"] = len(chunks)
     metadata["total_documents"] = len(metadata.get("documents", []))
+    # 每一個 writer 都經過這裡：身分紀錄在提交當下對齊文件清單，
+    # 不必指望 ingest / remove / fresh 各自記得清。
+    sync_document_identities(metadata)
     if with_gate:
         metadata["gate_embedding_dimension"] = gate_dimension
         metadata["gate_embedding_content_hash"] = gate_content_hash or ""

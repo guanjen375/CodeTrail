@@ -4,8 +4,11 @@
 目的：避免 eval 里 expected 值漂移（function 改名 / config key 改名 / 預期值跟實作不一致）。
 
 檢查：
-1. eval/code_questions.json 提到的 file 必須存在；symbol 必須能 grep 到
-   （只警告 line number，誤差 ±20 行內視為通過，超出即列為 drift）。
+1. eval/code_questions.json 提到的 file 必須存在；symbol 必須能 grep 到。
+   **錨點是 symbol，不是行號**：`line` 欄位是選填的舊格式，寫了才比對
+   （誤差 ±20 行內視為通過）。正常情況不要寫——任何一次無關的編輯都會把它
+   推出容忍值，於是每隔幾週就有人來手動改一個純粹派生的數字，而那個數字
+   在 `run_eval` 裡是即時從 symbol 解析出來的。
 2. eval/spec_questions.json + spec_holdout.json 如果 keyword 是 ALL_CAPS_CONFIG_KEY,
    該 key 必須在 config.py 裡找得到；如果還寫了 gold_evidence 數值，會比對該值是否
    和 config.py 內目前的設定值匹配。
@@ -42,8 +45,12 @@ def _config_keys(config_module) -> set[str]:
     }
 
 
-def _find_symbol_line(symbol: str, file_path: Path) -> int | None:
-    """在 file 裡用粗略 regex 找 `def symbol(` 或 `class symbol`。回傳 1-based 行號。"""
+def find_symbol_line(symbol: str, file_path: Path) -> int | None:
+    """在 file 裡用粗略 regex 找 `def symbol(` 或 `class symbol`。回傳 1-based 行號。
+
+    `eval/run_eval.py` 也用這一份：eval 的「定位正確」判定與這裡的 drift 檢查
+    必須是同一個解析規則，否則靜態檢查綠燈、實際評測卻對到別的行。
+    """
     try:
         text = file_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -53,6 +60,10 @@ def _find_symbol_line(symbol: str, file_path: Path) -> int | None:
         if pattern.match(line):
             return i
     return None
+
+
+# 舊名字的相容 alias（曾是私有 API）。
+_find_symbol_line = find_symbol_line
 
 
 def _candidate_paths(rel: str) -> Iterable[Path]:
@@ -81,13 +92,13 @@ def check_code_questions(issues: list[str]) -> None:
         actual_file = None
         actual_line = None
         if candidate:
-            ln = _find_symbol_line(symbol, candidate)
+            ln = find_symbol_line(symbol, candidate)
             if ln is not None:
                 actual_file, actual_line = candidate, ln
 
         if actual_file is None:
             for source in REPO_ROOT.glob("*.py"):
-                ln = _find_symbol_line(symbol, source)
+                ln = find_symbol_line(symbol, source)
                 if ln is not None:
                     actual_file, actual_line = source, ln
                     break

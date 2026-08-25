@@ -101,11 +101,20 @@ _REQUIRED_PACKAGES = [
     ("mcp", "MCP server 必要 — python3 -m pip install \"mcp>=1.28,<2\""),
     ("requests", "必要 — HTTP 請求"),
 ]
+# (import 名, 顯示名, 說明)。import 名與 pip 名不一定相同(elftools ↔ pyelftools),
+# 兩個都要講清楚，否則使用者照著 `pip install elftools` 打會裝到別的套件。
 _OPTIONAL_PACKAGES = [
-    ("numpy", "提升 RAG/MMR 速度，非必要 — pip install numpy"),
-    ("jieba", "中文 BM25 精準度，非必要 — pip install jieba"),
-    ("pymupdf4llm", "PDF ingestion 才需要 — pip install \"pymupdf4llm==1.28.0\"(釘驗證版)"),
-    ("html2text", "RAG.py --url 抓網頁才需要 — pip install html2text"),
+    ("numpy", "numpy", "提升 RAG/MMR 速度，非必要 — pip install numpy"),
+    ("jieba", "jieba", "中文 BM25 精準度，非必要 — pip install jieba"),
+    ("pymupdf4llm", "pymupdf4llm",
+     "PDF ingestion 才需要 — pip install \"pymupdf4llm==1.28.0\"(釘驗證版)"),
+    ("html2text", "html2text", "RAG.py --url 抓網頁才需要 — pip install html2text"),
+    # 缺它不會壞，但 ELF 報告會靜默降級成 readelf/objdump 文字解析:拿不到 DWARF
+    # compilation unit、notes 也少，而 report 只在自己的內文標了 fallback。
+    # doctor 不講的話，使用者是從「怎麼少了一段」才發現能力被降級的。
+    ("elftools", "pyelftools",
+     "ELF 結構化解析(DWARF/notes)才需要；沒裝會退回 readelf/objdump 文字解析 — "
+     "pip install pyelftools"),
 ]
 
 _MCP_REQUIREMENT = "mcp>=1.28,<2"
@@ -171,11 +180,11 @@ def check_packages(r: Result) -> None:
             r.ok(f"package {name}")
         except ImportError:
             r.fail(f"package {name} 沒裝 — {hint}")
-    for name, hint in _OPTIONAL_PACKAGES:
+    for name, shown, hint in _OPTIONAL_PACKAGES:
         try:
             importlib.import_module(name)
         except ImportError:
-            r.warn(f"package {name} 沒裝 — {hint}")
+            r.warn(f"package {shown} 沒裝 — {hint}")
             continue
         if name == "pymupdf4llm":
             # 釘版驗證：裝錯版比沒裝更糟（PDF 頁碼靜默全錯），所以是 FAIL 不是 WARN。
@@ -183,16 +192,16 @@ def check_packages(r: Result) -> None:
             try:
                 cfg = importlib.import_module("config")
             except Exception as e:
-                r.warn(f"package {name} 已裝但無法驗證釘版（config 載入失敗: {e}）")
+                r.warn(f"package {shown} 已裝但無法驗證釘版（config 載入失敗: {e}）")
                 continue
             try:
                 cfg.require_pymupdf4llm()
             except RuntimeError as e:
                 r.fail(str(e))
                 continue
-            r.ok(f"package {name}=={cfg.PYMUPDF4LLM_PIN} (optional, 釘版驗證通過)")
+            r.ok(f"package {shown}=={cfg.PYMUPDF4LLM_PIN} (optional, 釘版驗證通過)")
             continue
-        r.ok(f"package {name} (optional)")
+        r.ok(f"package {shown} (optional)")
 
 
 def _read_config():

@@ -29,6 +29,7 @@ except ImportError:
     print("[WARN] jieba 未安裝，中文 BM25 搜尋精準度可能較低", file=sys.stderr)
     print("       建議執行: pip install jieba", file=sys.stderr)
 
+import context_budget
 import context_signals
 import kb_cache
 import llama_client
@@ -326,6 +327,51 @@ class Bm25Index:
     doc_lens: list = field(default_factory=list)
     avg_doc_len: float = 1.0
     idf: dict = field(default_factory=dict)
+
+
+def _gated_completion(*, source: str, prompt: str, temperature: float,
+                      timeout: int) -> str:
+    """knowledge.py 內所有主模型 `/completion` 的唯一出口:先過 context gate。
+
+    README_DEV「加新的 LLM call site 時怎麼接 gate」的標準流程。這三個呼叫點
+    (query expansion / multi-query / LLM rerank)以前直接打 llama_client——它們
+    「通常不會吃滿 ctx」是真的,但 `_rerank_with_llm` 會把 15 個候選各 500 字
+    塞進 prompt,再加上使用者問題;超了之後 llama-server 是**從前面截掉**,於是
+    模型看到的是半份候選清單卻照樣回一組 DOC_n。那是靜默錯答,不是報錯。
+
+    回傳模型輸出;overflow 或呼叫失敗一律回空字串——這三個呼叫點全都是
+    best-effort 的檢索增強,呼叫端本來就有「拿不到就用原問題」的路徑。
+    Gate 觸發的細節(估算 token、utilization、[CTX_OVERFLOW])已經進 telemetry
+    與 stderr,不需要再把錯誤字串當成模型輸出往下傳。
+    """
+    model = config.require_main_model()
+    try:
+        usage = context_budget.check_and_log(
+            source=source,
+            requested_num_ctx=config.N_CTX,
+            prompt=prompt,
+            model=model,
+        )
+    except context_budget.ContextOverflowError:
+        return ""
+
+    try:
+        data = llama_client.native_completion(
+            base_url=LLAMA_BASE_URL,
+            prompt=prompt,
+            temperature=temperature,
+            stream=False,
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 — 呼叫端各自有 best-effort fallback
+        usage.error_type = type(exc).__name__
+        context_budget.log_metrics(usage)
+        raise
+
+    context_budget.parse_usage_from_response(data, usage)
+    context_budget.emit_post_call_line(usage)
+    context_budget.log_metrics(usage)
+    return (data.get("content") or data.get("response") or "").strip()
 
 
 class KnowledgeBase:
@@ -1133,15 +1179,12 @@ class KnowledgeBase:
 
 關鍵字:"""
 
-            model = config.require_main_model()
-            data = llama_client.native_completion(
-                base_url=LLAMA_BASE_URL,
+            result = _gated_completion(
+                source="kb_query_expansion",
                 prompt=prompt,
                 temperature=0,
-                stream=False,
                 timeout=30,
             )
-            result = (data.get("content") or data.get("response") or "").strip()
 
             # 同時支援半形和全形逗號
             raw_keywords = re.split(r'[,，]', result)
@@ -1269,17 +1312,15 @@ English:"""
                     continue
 
                 try:
-                    data = llama_client.native_completion(
-                        base_url=LLAMA_BASE_URL,
+                    result = _gated_completion(
+                        source="kb_multi_query",
                         prompt=prompt,
                         temperature=0.3,
-                        stream=False,
                         timeout=20,
                     )
                 except Exception:
                     continue
 
-                result = (data.get("content") or data.get("response") or "").strip()
                 if result and len(result) < 200:
                     if query_type == "translate":
                         # P0-3: 翻譯結果直接加入，並附上原始符號
@@ -2148,15 +2189,12 @@ English:"""
 排序結果:"""
 
         try:
-            model = config.require_main_model()
-            data = llama_client.native_completion(
-                base_url=LLAMA_BASE_URL,
+            result = _gated_completion(
+                source="kb_llm_rerank",
                 prompt=rerank_prompt,
                 temperature=0,
-                stream=False,
                 timeout=60,
             )
-            result = data.get("content") or data.get("response") or ""
 
             doc_indices = []
             for match in re.finditer(r'DOC_(\d+)', result):

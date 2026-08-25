@@ -80,12 +80,21 @@
 - `mcp_server.py` 啟動時 `set_sandbox_root(AICODE_ROOT, allow_external=False)`
 - `kb_cache` 的 embeddings 身分驗證（逐列 chunk id / generation / 內容雜湊 / model）
   與「重建不了就 fail-loud、絕不沿用舊向量」——放寬它就是靜默錯答
+- `knowledge_store` 的文件身分驗證（`metadata["document_sources"]`）與
+  `DocumentIdentityConflict`——KB 用 basename 當文件識別，所以 `a/spec.pdf` 與
+  `b/spec.pdf` 是同一個身分；拿掉這道閘，後灌的那份會把前一份整份換掉，訊息
+  跟正常更新一字不差，查詢照樣回答但答的是別份文件
+- `knowledge._gated_completion`——knowledge.py 所有主模型 `/completion` 的唯一
+  出口。繞過它等於沒有 context gate，超長 prompt 由 llama-server 從前面靜默截掉
 
 任何重構碰到上面這些東西，**新加測試**（開發者寫測試檔，執行依 §2.2 權責），
 不要直接刪 / weaken / 移除檢查點。
 
 新增安全檢查點時，守它的測試檔要標 smoke 並登記進 `tests/test_smoke_gate.py`
 的 `SAFETY_MODULES`；漏標是無聲的（smoke 綠燈但那個檢查點根本沒跑）。
+`SAFETY_MODULES` 記的是「檔名 → (說明, 必須存在且帶 smoke 的 node 名)」，不是
+只記檔名：只驗「這個檔至少有一個 smoke」的話，刪掉那條檢查點測試、或把
+module 層 `pytestmark` 換成單條 decorator，gate 都還是綠的。
 
 ---
 

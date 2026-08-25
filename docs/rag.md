@@ -501,7 +501,8 @@ confirm_against_image 設 True。
 #### 三件容易踩的事
 
 1. **知識庫綁專案目錄**：`knowledge.json` 存在當前專案根目錄裡，換到另一個專案就要重新匯入。同一份規格書在多個專案要用就匯入多次。
-1a. **同檔名會互相覆蓋（已知限制）**：KB 裡的文件身分是 **basename**，所以 `a/spec.pdf` 和 `b/spec.pdf` 會互相取代 —— 後 ingest 的那份會把前一份的 chunk 換掉，**不會有任何警告**。入庫前請先把檔名改成唯一的（例如 `npu_a_spec.pdf` / `npu_b_spec.pdf`）。PDF review artifacts 用的是含路徑與 hash 的 `document_id`，**不會**被覆蓋，所以被取代的那份會留下沒人引用的孤兒 run 目錄；要清掉就照下面的方式刪 `.codetrail/figures/<document_slug>/`。
+1a. **同檔名的兩份文件會被擋下**：KB 裡的文件身分是 **basename**，所以 `a/spec.pdf` 和 `b/spec.pdf` 在裡面是同一份。灌第二份時會**直接失敗並列出兩邊的完整路徑，零寫入**，不會把前一份靜默換掉。三種處理方式：確定是同一份文件搬過位置 → 先 `remove_document("spec.pdf")` 再灌；兩份都要留 → 先改成唯一檔名（例如 `npu_a_spec.pdf` / `npu_b_spec.pdf`）；要用這一份重建整個 KB → `ingest_document(..., fresh=True)`。同一個檔改過內容再灌一次是正常的更新，不受影響。
+    比對用的是解析過 symlink 的絕對路徑，記在 `knowledge.json` 的 `metadata.document_sources`。**舊 KB 沒有這份紀錄**，所以升級後第一次撞名只會警告並採用新的那份，第二次起才擋得住。PDF review artifacts 用的是含路徑與 hash 的 `document_id`，本來就不會互相覆蓋。
 2. **不要 commit**：`knowledge.json` 切碎了原始文件內容，NDA 場景幾乎一定包含敏感片段。已經在 [安全邊界與工作節奏](security.md) 的「不要 commit 的資料」列入不該 commit 的清單，建議在專案的 `.gitignore` 也加一行。
 3. **越具體越好**：把一整份 500 頁的手冊原封不動塞進去，不如先抽出實際會問到的章節整理成 markdown 再匯入。雜訊少，答案準。
 
@@ -516,7 +517,7 @@ confirm_against_image 設 True。
 
 - `knowledge.json` 存在當前專案根目錄下，預設會被 `.gitignore` 忽略。它保存切碎後的文件內容，NDA 場景下幾乎一定有敏感片段，**不要 commit**。
 - `.codetrail/figures/` 存 PDF 結構化圖片的 review artifacts（原圖、實際送模型的每個 variant、canonical manifest）。**同樣可能含 NDA 內容**，`.gitignore` 已含 `.codetrail/`，一樣不要 commit；清除方式與後果見下面的覆核章節。
-- **文件身分是 basename**：`ingest_document` 與 `remove_document` 都以 basename 認人，所以不同目錄下的同名 PDF 會互相覆蓋（無警告），而 review artifacts 用的是含路徑 hash 的 `document_id`、不會覆蓋，因而可能留下孤兒 run 目錄。入庫前先取唯一檔名。
+- **文件身分是 basename**：`ingest_document` 與 `remove_document` 都以 basename 認人。不同目錄下的同名文件會在入庫時 fail-loud（列出兩邊完整路徑、零寫入），不再靜默覆蓋；`remove_document` 會一併清掉來源紀錄，所以刪完可以灌另一份同名的。review artifacts 用的是含路徑 hash 的 `document_id`、本來就不會覆蓋。
 - `remove_document(...)` 用檔名 basename 比對，所以傳完整路徑（`docs/old_spec.pdf`）或單純檔名（`old_spec.pdf`）都可以。刪除會在同一把 store lock 內同步重寫 JSON 與剩餘的向量列；不會刪掉整份向量檔再期待 reload 偷偷重算。
 - **embeddings 是程式自管的 cache**（`.codetrail/cache/embeddings/<kb-id>/`），不是要跟 `knowledge.json` 配對的檔案。缺了自動重建、身分對不上一律丟棄重建、重建不了就 fail-loud 中止查詢。詳見上面「只有 `knowledge.json` 要管」。
 - 文件切段的大小、不同來源類型的搜尋權重，這些可調參數放在 `config.py` 的 `CHUNK_SETTINGS` 和 `SOURCE_TYPE_WEIGHTS`，預設值在大多數情境下已經夠用，要微調再去動。

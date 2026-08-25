@@ -47,6 +47,31 @@ from knowledge import KnowledgeBase
 from code_rag import CodeRAG
 from agent import run_agent
 from utils import call_llm, answer_with_self_check, extract_evidence_mapping
+from scripts.check_eval_consistency import find_symbol_line
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def resolve_expected_line(expected: dict) -> int:
+    """code 題的期望行號：以 symbol 為錨點即時解析，不吃 JSON 裡寫死的數字。
+
+    寫死的行號是純派生資料：symbol 一行沒動，上面隨便插幾十行就會讓它超出
+    `check_eval_consistency` 的 ±20 容忍值，於是「eval 漂移」變成每隔幾週要
+    手動改一個數字的例行公事，而每一次手改都可能把錯的數字寫回去。
+    解析用的是 `check_eval_consistency.find_symbol_line`（同一份規則），
+    所以靜態檢查看到的位置與這裡評分用的位置永遠一致。
+
+    `line` 仍然可以寫在 JSON 裡當覆寫值（舊格式相容）；解析不到 symbol 時
+    回 0，呼叫端會照舊把 `found_line` 判為 False。
+    """
+    explicit = expected.get('line')
+    if isinstance(explicit, int) and explicit > 0:
+        return explicit
+    symbol = expected.get('symbol') or ''
+    file_rel = expected.get('file') or ''
+    if not symbol or not file_rel:
+        return 0
+    return find_symbol_line(symbol, REPO_ROOT / file_rel) or 0
 
 
 def check_llama_health(max_retries: int = 3, timeout: int = 10) -> bool:
@@ -450,7 +475,7 @@ def eval_code_question(case: EvalCase, code_rag: CodeRAG, folder: str) -> EvalRe
 
     # 評估
     expected_file = case.expected.get('file', '')
-    expected_line = case.expected.get('line', 0)
+    expected_line = resolve_expected_line(case.expected)
     expected_symbol = case.expected.get('symbol', '')
 
     details = {

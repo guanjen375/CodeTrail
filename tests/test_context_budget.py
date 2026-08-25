@@ -467,3 +467,96 @@ def test_explicit_num_ctx_still_respected(monkeypatch):
     captured = _stub_gate(monkeypatch)
     utils.call_llm("hi", num_ctx=8192)
     assert captured["ctx"] == 8192
+
+
+# ---------------------------------------------------------------------------
+# knowledge.py 的主模型 call site 必須走 gate
+# ---------------------------------------------------------------------------
+# 這三個呼叫點以前直接打 llama_client。`_rerank_with_llm` 會把 15 個候選各 500
+# 字塞進 prompt,爆掉的時候 llama-server 是從前面截掉,模型看到半份候選清單卻
+# 照樣回一組 DOC_n —— 靜默錯答,沒有任何錯誤訊息。契約靠靜態檢查守:漏接的
+# call site 不會自己喊。
+
+def _knowledge_native_completion_callers() -> set[str]:
+    """回傳 knowledge.py 內呼叫 llama_client.native_completion 的函式名集合。"""
+    import ast
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parent.parent / "knowledge.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    callers: set[str] = set()
+    scopes: list[str] = []
+
+    class Walker(ast.NodeVisitor):
+        def visit_FunctionDef(self, node):  # noqa: N802
+            scopes.append(node.name)
+            self.generic_visit(node)
+            scopes.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef  # noqa: N815
+
+        def visit_Call(self, node):  # noqa: N802
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "native_completion"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "llama_client"
+            ):
+                callers.add(scopes[-1] if scopes else "<module>")
+            self.generic_visit(node)
+
+    Walker().visit(tree)
+    return callers
+
+
+@pytest.mark.smoke
+def test_knowledge_has_exactly_one_ungated_completion_entry():
+    assert _knowledge_native_completion_callers() == {"_gated_completion"}, (
+        "knowledge.py 的主模型 /completion 只能有 _gated_completion 一個出口。"
+        "新增的 call site 要改走它,否則那條路徑沒有 context gate —— "
+        "超長 prompt 會被 llama-server 從前面靜默截掉,不會報錯。"
+    )
+
+
+@pytest.mark.smoke
+def test_gated_completion_refuses_overflow_without_calling_the_server(monkeypatch):
+    import knowledge
+    import llama_client
+
+    def explode(**_kwargs):
+        raise AssertionError("gate 應該在送出前就擋下來")
+
+    monkeypatch.setattr(llama_client, "native_completion", explode)
+    monkeypatch.setattr(config, "require_main_model", lambda: "test-model")
+    monkeypatch.setattr(config, "N_CTX", 512)
+
+    huge = "x" * (512 * 100)
+    assert knowledge._gated_completion(
+        source="test_overflow", prompt=huge, temperature=0, timeout=5
+    ) == ""
+
+
+@pytest.mark.smoke
+def test_gated_completion_returns_model_text_when_within_budget(monkeypatch):
+    import knowledge
+    import llama_client
+
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return {"content": "  keyword-a, keyword-b  "}
+
+    monkeypatch.setattr(llama_client, "native_completion", fake)
+    monkeypatch.setattr(config, "require_main_model", lambda: "test-model")
+
+    out = knowledge._gated_completion(
+        source="test_ok", prompt="short question", temperature=0.3, timeout=20
+    )
+    assert out == "keyword-a, keyword-b"
+    assert seen["prompt"] == "short question"
+    assert seen["temperature"] == 0.3
+    assert seen["stream"] is False

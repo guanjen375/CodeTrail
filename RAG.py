@@ -28,9 +28,13 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
 from knowledge_store import (
+    DocumentIdentityConflict,
     KnowledgeStoreError,
+    check_document_identity,
     chunk_id,
+    forget_document_identity,
     knowledge_store_lock,
+    record_document_identity,
     save_knowledge_store_atomic,
     validate_embeddings,
 )
@@ -3237,6 +3241,9 @@ def remove_document_from_knowledge_base(output_path: Path, source: str) -> Dict:
 
         kb["chunks"] = kept_chunks
         kb["metadata"]["documents"] = kept_documents
+        # 身分紀錄要跟著走，否則它會變成刪不掉的墓碑：使用者照著衝突訊息刪了，
+        # 再灌同名的另一份還是被擋。（提交路徑上的 sync 也會收，這裡是明講意圖。）
+        forget_document_identity(kb["metadata"], target)
         save_knowledge_base(kb, output_path, _already_locked=True)
 
         return {
@@ -3318,6 +3325,18 @@ def _assert_figure_guard(guard: Optional[Dict], kb: Dict) -> None:
             "繼續寫入會用舊 revision 蓋掉別人剛完成的人工修正，整份零寫入；請重跑一次。")
 
 
+def _file_location(path) -> str:
+    """檔案來源的位置字串：解析過 symlink 的絕對路徑。
+
+    用解析後的路徑（而不是使用者打的字串）才不會把 `./spec.pdf`、
+    `~/docs/spec.pdf`、以及指向同一個檔的 symlink 判成三份不同的文件。
+    """
+    try:
+        return str(Path(path).resolve())
+    except OSError:
+        return str(Path(path).absolute())
+
+
 def _commit_document_to_kb(
     document: ExtractedDocument,
     output_file: str,
@@ -3326,8 +3345,18 @@ def _commit_document_to_kb(
     generate_context: bool = False,
     figure_guard: Optional[Dict] = None,
     fresh: bool = False,
+    source_location: str = "",
 ) -> bool:
     """把一份 ExtractedDocument 併進知識庫（同名文件先移除舊 chunks）。
+
+    `source_location` 是這份文件**來自哪裡**（解析後的絕對路徑，或 URL）。
+    刻意與 figure lane 的 `source_identity`（整檔 sha256，用來抓「抽取途中檔案被
+    換掉」）區分開：那是內容身分，同一個檔改過內容就會變；這裡要的是位置身分，
+    否則正常的「改了再灌一次」會被誤判成撞名。
+    KB 用 basename 當文件識別，所以 `a/spec.pdf` 與 `b/spec.pdf` 在裡面是同一個
+    身分；沒有這個欄位的話，後灌的那份會把前一份整份換掉，訊息還跟正常更新
+    一字不差。給了身分就會在寫入前比對，對不上一律 `DocumentIdentityConflict`
+    且零寫入。給空字串維持舊語意（不擋、不記）。
 
     `fresh=True`：這一份文件成為新 KB 的全部內容——既有 chunks 在**同一次原子
     提交**裡被換掉，舊向量隨著 generation 換新自動失效。fresh **不會**為了 reset
@@ -3397,9 +3426,18 @@ def _commit_document_to_kb(
                   f"（{dropped_docs} 份文件），舊 embeddings cache 一併失效")
             kb["chunks"] = []
             kb["metadata"]["documents"] = []
+            # fresh 是「這一份就是新 KB 的全部」：舊的身分紀錄留著會讓
+            # 下一步的比對拿已經不存在的文件當對照組。
+            kb["metadata"].pop("document_sources", None)
 
         # 檢查是否已存在同名文件（若有則先移除舊的）
         doc_name = document.source
+        # 撞名但來源不同一律在這裡 fail-loud——**還沒動到 kb**，所以是零寫入。
+        identity_warning = check_document_identity(
+            kb["metadata"], doc_name, source_location
+        )
+        if identity_warning:
+            print(f"[WARN] {identity_warning}")
         if doc_name in kb["metadata"]["documents"]:
             print(f"[INFO] 更新現有{label}: {doc_name}")
             kb["chunks"] = [c for c in kb["chunks"] if c["source"] != doc_name]
@@ -3410,6 +3448,7 @@ def _commit_document_to_kb(
         # Append 到知識庫
         kb["chunks"].extend(new_chunks)
         kb["metadata"]["documents"].append(doc_name)
+        record_document_identity(kb["metadata"], doc_name, source_location)
 
         # 儲存
         save_knowledge_base(kb, output_path, _already_locked=True)
@@ -3495,6 +3534,7 @@ def add_document(input_file: str, output_file: str, *, generate_context: bool = 
     if not _commit_document_to_kb(
         document, output_file, label="文件", generate_context=generate_context,
         figure_guard=getattr(document, _FIGURE_PRUNE_ATTR, None), fresh=fresh,
+        source_location=_file_location(input_path),
     ):
         sys.exit(1)
 
@@ -3574,7 +3614,8 @@ def _add_chat_content_to_kb(image_path: Path, content: str, output_file: str,
         print(f"[INFO] 快取已存: {cache_file}")
 
     document = build_chat_document(image_path.name, content)
-    _commit_document_to_kb(document, output_file, label="截圖知識", fresh=fresh)
+    _commit_document_to_kb(document, output_file, label="截圖知識", fresh=fresh,
+                           source_location=_file_location(image_path))
 
 
 def add_chat_screenshot(image_file: str, output_file: str, *, fresh: bool = False):
@@ -3599,7 +3640,8 @@ def add_chat_screenshot(image_file: str, output_file: str, *, fresh: bool = Fals
     print(f"[INFO] 處理: {image_path.name}")
     document = process_chat_screenshot_document(str(image_path))
 
-    if not _commit_document_to_kb(document, output_file, label="截圖知識", fresh=fresh):
+    if not _commit_document_to_kb(document, output_file, label="截圖知識", fresh=fresh,
+                                  source_location=_file_location(image_path)):
         sys.exit(1)
 
 
@@ -3844,7 +3886,8 @@ def _add_url_content_to_kb(url: str, content: str, title: str, output_file: str)
         print(f"[INFO] 快取已存: {cache_file}")
 
     document = build_url_document(url, content, title, fetched_at)
-    _commit_document_to_kb(document, output_file, label="網頁知識")
+    _commit_document_to_kb(document, output_file, label="網頁知識",
+                           source_location=url)
 
 
 def add_url(url: str, output_file: str, *, fresh: bool = False):
@@ -3867,7 +3910,8 @@ def add_url(url: str, output_file: str, *, fresh: bool = False):
         print("[ERROR] 無法從網頁提取內容，新增失敗")
         sys.exit(1)
 
-    _commit_document_to_kb(document, output_file, label="網頁知識", fresh=fresh)
+    _commit_document_to_kb(document, output_file, label="網頁知識", fresh=fresh,
+                           source_location=url)
 
 
 # ============================================================
@@ -3922,7 +3966,8 @@ def _add_image_content_to_kb(image_path: Path, content: str, output_file: str):
         print(f"[INFO] 快取已存: {cache_file}")
 
     document = build_image_document(image_path.name, content)
-    _commit_document_to_kb(document, output_file, label="圖片知識")
+    _commit_document_to_kb(document, output_file, label="圖片知識",
+                           source_location=_file_location(image_path))
 
 
 def add_technical_image(image_file: str, output_file: str, *, fresh: bool = False):
@@ -3947,7 +3992,8 @@ def add_technical_image(image_file: str, output_file: str, *, fresh: bool = Fals
     print(f"[INFO] 處理: {image_path.name}")
     document = process_technical_image_document(str(image_path))
 
-    if not _commit_document_to_kb(document, output_file, label="圖片知識", fresh=fresh):
+    if not _commit_document_to_kb(document, output_file, label="圖片知識", fresh=fresh,
+                                  source_location=_file_location(image_path)):
         sys.exit(1)
 
 
@@ -4168,4 +4214,10 @@ if __name__ == "__main__":
             "`python3 RAG.py rebuild --kb <kb> <doc>` 這條路徑生成；這次不生成。"
         )
 
-    sys.exit(main(sys.argv[1:]))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except DocumentIdentityConflict as exc:
+        # 這是使用者要處理的狀況（撞名），不是程式壞掉。MCP 的 ingest_document
+        # 會把這段 stdout 原樣轉給模型看，traceback 只會蓋掉真正該讀的三個選項。
+        print(f"[ERROR] {exc}")
+        sys.exit(1)

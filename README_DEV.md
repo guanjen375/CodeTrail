@@ -18,7 +18,7 @@ python3 -m compileall -q .
 python3 scripts/check_eval_consistency.py
 python3 scripts/check_readme_consistency.py
 python3 scripts/opencode_contract_check.py            # 全域 opencode.json / AGENTS.md 漂移
-AICODE_MODEL=test-model:latest python3 scripts/doctor.py --no-network
+python3 scripts/doctor.py --no-network        # 用機器上實際設定的模型；不要塞假 model 名
 python3 deployment_profile.py validate
 
 # 測試入口（何時能跑見 AGENTS.md §2）
@@ -40,8 +40,23 @@ MCP、低於 1.28 或 2.x 都列為 FAIL。
 分片的檔案清單用 pytest 的預設收集規則遞迴掃 `tests/`（`test_*.py` 與 `*_test.py`，
 排除 norecursedirs 預設目錄），確保並行與序列收到完全相同的一組測試。
 資源較小或要重現序列順序時用 `AICODE_TEST_JOBS=1 python3 scripts/run_tests.py`。
-只要有傳 `-k`、`-x`、檔名或其他 pytest 參數，就維持原本的單一 pytest 行程與
-逐字轉發語意。
+
+**`-m <expr>`（例如交付前的 `-m smoke`）走同一套分片**：它跟無參數一樣只是「選
+整個 `tests/` 的一個子集」，分片不改變任何一條測試的語意。此時
+「某個 shard 一條都沒選中」（pytest exit 5）算正常，但**全部** shard 都是 5 會
+回報 exit 5 並明講「這不是通過」——AGENTS.md §2.2 的 0 collected 規則。
+只要傳的是 `-k`、`-x`、node id、`--lf` 或其他組合，就維持原本的單一 pytest 行程與
+逐字轉發語意：`-x` 的 exitfirst、node id 的順序、`--lf` 依賴的共享 cache 在分片下
+都不再等價。
+
+分片權重（`.pytest_cache/shard_weights*.json`）**每次選取各記一份**：`-m smoke`
+量到的秒數寫進 `shard_weights.smoke.json`，不會污染完整測試用的
+`shard_weights.json`。權重的更新條件是「這個 shard 的 pytest session 有跑完」
+（exit 0/1/5），不是「有沒有全綠」——紅燈期正是最常重跑的時候，把那幾輪的實測
+全丟掉等於一直用檔案大小在猜。沒跑完的 shard（exit 2/3/4、訊號終止）其 junit
+是殘缺的，那些檔會保留上一輪的值。每次並行執行結束會多印一行合計「選中幾條 /
+各 shard 內耗時總和」，給 §2.1 的 smoke 10 秒目標做趨勢觀察；**不設硬秒數閾值**，
+不同機器差好幾倍，拿秒數當 gate 只會製造假紅燈。
 
 分片權重用「上一輪實測」而不是檔案大小：每個 shard 產一份 junit XML，全綠時
 把每檔耗時彙總寫進 `.pytest_cache/shard_weights.json`（已在 `.gitignore`），
@@ -87,7 +102,7 @@ aicode_web  # A/B 機已加入同一 tailnet 時
   `test_code_rag_*.py`、`test_code_context.py`、`test_definition_metadata_propagation.py`、
   `test_file_kind_policy.py`、`test_grep_output_budget.py`、`test_index_scope.py`、
   `test_semantic_representation.py`、`test_repeat_guard.py`。
-- RAG / KB / media：`test_kb_store.py`、`test_rag_*.py`、
+- RAG / KB / media：`test_kb_store.py`、`test_kb_document_identity.py`、`test_rag_*.py`、
   `test_embedding_fail_loud.py`、`test_extracted_document.py`、
   `test_context_generation.py`、`test_contextual_signals.py`、
   `test_media_read_pdf.py`、`test_vision_pipeline.py`。
@@ -99,6 +114,12 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 
 `tests/_harness.py` 與 `tests/_set_config_harness.py` 是共用 harness，不是 pytest test
 module。smoke 的安全組成由 `tests/test_smoke_gate.py` 靜態守住；不要以手動檔案清單取代。
+
+`test_smoke_gate.py` 的 `SAFETY_MODULES` 記的是「檔名 →（說明, 必須存在且帶 smoke 的
+node 名）」，對照 [AGENTS.md §3](AGENTS.md#3-安全相關不要砍) 的檢查點清單。只驗「這個檔
+至少有一個 smoke 標記」是不夠的：刪掉那條檢查點測試、或把 module 層 `pytestmark` 換成
+單條 decorator，gate 都還是綠的，而缺口是無聲的。**新增 §3 檢查點時，AGENTS.md 的條目與
+這裡的 node 清單要一起改**。
 
 ---
 
@@ -508,7 +529,20 @@ llama-server 啟動時 `-c <N>` 已經把 ctx + KV cache 鎖死,所以 doctor / 
 ### 沒有解的事(刻意留)
 
 - 估算還是 `CHARS_PER_TOKEN` heuristic。`actual_prompt_eval_count` 已蒐集,之後可以做 per-model 校正,但這次不引入 tokenizer 依賴。
-- `code_rag.py` / `knowledge.py` / `media.py` 內的 LLM call site 還沒接 gate;它們各自有 chunk 大小限制,通常不會吃滿 ctx,但若哪一天出 silent truncation 就要補。
+- `knowledge.py` 的三個主模型 call site(query expansion / multi-query / LLM rerank)
+  已經走 `_gated_completion`,那是它們的唯一出口。**不要**再從那個檔直接呼
+  `llama_client.native_completion`——`_rerank_with_llm` 會把 15 個候選各 500 字塞進
+  prompt,超了之後 llama-server 是從前面截掉,模型看到半份清單照樣回一組 DOC_n。
+- `code_rag.py` 與 `media.py` / `RAG.py` / `figure_verify.py` **刻意不接**這個 gate,
+  理由不是「還沒做」:
+  - `code_rag.py` 只打 `/embedding` 與 `/reranking`,那是另外兩台 server 的 input
+    limit,不是主模型 n_ctx。它們各自有明確的字元預算
+    (`CODE_RAG_EMBED_TEXT_MAX_CHARS` / `CODE_RERANK_PASSAGE_MAX_CHARS` /
+    `EMBED_BATCH_MAX_CHARS`)。拿主模型的 n_ctx 去擋這幾條是錯的閘。
+  - VL 那幾條的 prompt 全是固定模板字串(唯一的變數是 table 的 grid hint,幾百字),
+    真正吃 ctx 的是影像 token,而 `CHARS_PER_TOKEN` heuristic 量不到影像。在那裡
+    掛 gate 只會產生「已檢查」的假象。VL 的 ctx 由 server 啟動的 `-c` 與
+    `deployment_profile` 的 `services.vl.ctx` 管。
 - OpenCode TUI 主對話完全在 CodeTrail 視線外,doctor 只能驗 config 對齊,不能驗實際 prompt 是否爆。
 
 ---

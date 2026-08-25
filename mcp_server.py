@@ -1576,6 +1576,12 @@ def ingest_document(path: str, mode: str = "auto", preflight_only: bool = False,
     `legacy_unverified`(不回寫檔案),strict 查詢不再用它回答數值。要恢復可信度
     就 remove_document 後重新 ingest 那份 PDF。
 
+    **文件身分是檔名(basename)**:KB 用 `spec.pdf` 這種檔名當文件識別,所以
+    `a/spec.pdf` 與 `b/spec.pdf` 在裡面是同一份。灌第二份會直接失敗並列出兩邊
+    的完整路徑(零寫入),不會靜默把前一份換掉。要處理:確定是同一份文件搬過
+    位置就先 `remove_document("spec.pdf")`;兩份都要留就先改名;要用這一份重建
+    整個 KB 就加 `fresh=True`。同一個檔改過內容再灌一次是正常的更新,不受影響。
+
     依 RAG.py 的檔名類型偵測:檔名含 `_spec` / `datasheet` 會被當成 spec(權重最高),
     `manual` 當 manual,`_api` / `reference` 當 api,以此類推。所以檔名取貼切一點。
 
@@ -1838,6 +1844,9 @@ def remove_document(source: str) -> str:
 
     查詢端會自動偵測檔案變更:下一次 query_knowledge 會先重載再查。
     想立即生效+看狀態可呼叫 reload_knowledge_base()。
+
+    刪除同時會清掉這份文件的來源紀錄(`metadata["document_sources"]`),所以
+    刪完之後可以灌另一份同名、但來自別的目錄的文件。
 
     Args:
         source: 要刪的檔案名(basename),例如 "spec.pdf"。傳絕對路徑也行,
