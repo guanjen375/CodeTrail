@@ -954,11 +954,16 @@ GROUNDING_EXCLUDE_PATTERNS = [
 # ============================================================
 # 報告本身按重要度由前往後排（Header → Sections → Entry/反組譯 → Symbols → Strings），
 # 所以前綴切片就是「優先保留 header」。設定 hard cap 避免 context 超載。
-BIN_ELF_REPORT_MAX_CHARS = 25000      # 報告總長度上限（約 6K tokens）
-BIN_ELF_MAX_SECTIONS = 30             # Section 數量上限（縮減）
-BIN_ELF_MAX_FUNCS = 25                # Function 數量上限（縮減）
-BIN_ELF_MAX_OBJS = 12                 # Object 數量上限
-BIN_ELF_MAX_STRINGS = 80              # 字串數量上限（大幅縮減）
+BIN_ELF_REPORT_MAX_CHARS = 25000      # analyze_file 單次輸出總長度上限（約 6K tokens；每個 view 各自受限）
+BIN_ELF_MAX_SECTIONS = 30             # summary 的 Section 數量上限（view="sections" 看全部）
+BIN_ELF_MAX_FUNCS = 25                # summary 的 Top function 數量（view="symbols" 看全部）
+BIN_ELF_MAX_OBJS = 12                 # summary 的 Top object 數量
+BIN_ELF_MAX_STRINGS = 80              # summary 的 version 字串數量（view="strings" 看全部）
+BIN_ELF_VIEW_MAX_LIMIT = 5000         # analyze_file(limit=) 的上限：symbols / strings / relocs / dwarf 單次最多筆數
+# ingest_document 走的是長版多視角報告：入庫不該受 analyze_file 的 25K 限制（KB 的價值就是
+# 把完整 symbol / 字串 / DWARF / relocation 存下來給之後查），但仍要有上限避免一個巨型
+# firmware 把 KB 灌爆；超過會在報告尾端明講已截斷。
+BIN_ELF_INGEST_MAX_CHARS = 400000
 
 # ============================================================
 # 回答優先級規則（Single Source of Truth）

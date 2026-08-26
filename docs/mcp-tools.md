@@ -26,6 +26,7 @@
 | 查不能答錯的規格數字 | 請用工具 `query_knowledge_strict` 查 reset assert 最小時間，證據不夠就拒答。 | `query_knowledge_strict(...)` |
 | 看專案外的截圖/PDF/log | 請先用工具 `import_external_file` 匯入 `~/Downloads/error.png`，再分析回傳的新路徑。 | `import_external_file(...)` |
 | 看圖片、PDF、ELF、firmware | 請用工具 `analyze_file` 分析 `.aicode_uploads/error.png`（或 `docs/spec.pdf`），做通用 VL 圖片分析、PDF 一次性抽文字或 binary 分析。 | `analyze_file(...)` |
+| 深入看一個 ELF | 請用工具 `analyze_file` 分析 `build/app.elf`，`view` 設 "symbols"、`target` 設 "uart"（或 `view` 設 "disasm"、`target` 設 "Reset_Handler"；`view` 設 "dwarf"、`target` 設 "0x08001234"）。 | `analyze_file(path, view="symbols", target="uart")` |
 | 把文件/圖片/binary 加進 KB | 請用工具 `ingest_document` 匯入 `docs/spec.pdf`（或 `arch.png`、`firmware.bin`）。之後查詢會自動載入；想立即確認 chunk 數再補 `reload_knowledge_base`。 | `ingest_document(...)`、`reload_knowledge_base()` |
 | 圖很多的 PDF，先估成本 | 請用工具 `ingest_document` 對 `docs/datasheet.pdf` 設 `preflight_only=True`，回報候選數、VL 呼叫次數與是否超過上限。 | `ingest_document(path, preflight_only=True)` |
 | 把 KB 重建成只有這一份文件 | 請用工具 `ingest_document` 匯入 `docs/spec_v2.pdf`，`fresh` 設 True，回報清掉幾個 chunk、保留幾筆 human_verified。 | `ingest_document(path, fresh=True)` |
@@ -46,7 +47,7 @@
 | 專案探索 | `file_info(path)` | 讀檔前先看大小，避免一次塞爆 context |
 | 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=50000)` | 讀檔案內容，長檔要分段 |
 | 文件/外部檔案 | `import_external_file(path, dest_name=None)` | 把允許來源的外部檔案複製進 `.aicode_uploads/` |
-| 文件/外部檔案 | `analyze_file(path)` | 用 VL 分析各類圖片、一次性抽 PDF 文字（不入 KB）、分析 ELF 或 firmware blob |
+| 文件/外部檔案 | `analyze_file(path, view="summary", target="", limit=0)` | 用 VL 分析各類圖片、一次性抽 PDF 文字（不入 KB）、分析 ELF 或 firmware blob。ELF 預設給總覽；`view` 可切到 `symbols` / `disasm` / `dwarf` / `strings` / `sections` / `memmap` / `relocs` / `imports` / `dynamic` / `headers`，`target` 指定 symbol、0x 位址、regex 或 `key:value` 篩選，`limit` 控制筆數（上限 5000）；單次輸出上限 25,000 字元，截斷會指出該用哪個 view 縮小範圍。缺 pyelftools 時退回 readelf 文字解析並在報告開頭明列缺失能力；細節見[analyze_file 的 ELF 視角](#analyze_file-的-elf-視角) |
 | 文件/外部檔案 | `ingest_document(path, mode="auto", preflight_only=False, fresh=False)` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document`。PDF 的原生表格 / 向量文字 log 與純 raster 截圖、掃描頁、方塊圖都走結構化抽取；raster 會先分類為 table / terminal / diagram，再帶 canonical payload、證據與驗證狀態。任一條失敗都整份不入庫、KB 不變。`preflight_only=True` 只估成本、零寫入（僅 .pdf）。`fresh=True` 一步到位重建：清空既有 chunks、讓舊 embeddings cache 失效、只留這一份文件（同一次原子提交，失敗全回滾）。**不會為了 reset 去整批清除** `.codetrail/figures/`（ingest 本來就會寫入這一次的 run，提交後也可能依 retention 回收該文件沒被 KB 引用的舊 run — 那與 fresh 無關）。同一份文件再 ingest 時人工修正會沿用；但**被移出 KB 的其他文件之後重新 ingest 不會自動恢復人工確認**（revision 退回 1）。不可與 `preflight_only` 併用 |
 | 文件/外部檔案 | `review_figures(action="list", document_id="", figure_id="", expected_revision=0, payload_json="", confirm_against_image=False)` | 覆核 PDF 結構化抽取的表格 / 終端機 log / diagram：`list` 唯讀列出 figure_id、頁碼、bbox、kind、驗證狀態、原因、原圖路徑與 canonical payload；`fix` 只收該 kind schema 的 structured payload + `expected_revision`，`confirm_against_image=True` 才升 `human_verified`。permission 設 `ask` |
 | 文件/外部檔案 | `remove_document(source)` | 從 KB 移除過期文件 |
@@ -217,6 +218,29 @@ native lane(原生表格,零 VL 呼叫)**沒有任何模型影像輸入**,它的
 實際份數可能更多。**不要拿它當 NDA 影像份數的保證**;要確定清掉就顯式刪除對應目錄並確認結果。
 手動清除方式與後果見
 [RAG、附件與知識庫操作](rag.md#pdf-內的表格與終端機畫面結構化抽取--人工覆核)。
+
+### `analyze_file` 的 ELF 視角
+
+`analyze_file` 對 ELF（`.elf/.so/.o/.axf/.out/.ko`，以及內容是 ELF magic 的 `.bin`）不再只有一份固定摘要。`view` 選視角、`target` 指定要展開的東西、`limit` 控制筆數；每次輸出仍受 25,000 字元硬上限，但截斷訊息會明講「這是哪個 view、該用 target / limit 縮小範圍」，不會默默砍掉。
+
+| `view` | 內容 | `target` 寫法 |
+|---|---|---|
+| `summary`（預設） | Key Facts（架構 / 型別 / entry 對應的 symbol / stripped / linkage / symbol 統計含 LOCAL·UND·size=0 / relocation 數 / DWARF / 記憶體估算）、ELF header、LOAD segment、`.dynamic`、`.modinfo`、entry 反組譯（失敗會列原因）、Top functions（含 LOCAL/static）、imports、relocation 統計、DWARF CU、字串分類（version / diagnostic / format / url / path / command / config） | 不用 |
+| `symbols` | 完整 symbol 表：LOCAL / GLOBAL / WEAK、UND、size=0 全列，欄位 addr / size / type / bind / section / name（C++ 名稱附 demangle） | regex（`uart`）、篩選（`bind:LOCAL type:FUNC`、`ndx:UND`、`section:.text`、`table:.dynsym`，可混用）、`0x位址` = 反查落在哪個 symbol |
+| `disasm` | 反組譯；工具依序 objdump → 跨架構 `<triplet>-objdump` → capstone；全部不行時列出每個工具的失敗原因與補救（安裝對應 binutils / `pip install capstone` / 環境變數 `AICODE_OBJDUMP`） | symbol 名、`0x位址`、`0x起-0x迄`、`0x位址+bytes`；省略 = entry point；`.o/.ko` 可加 `section:.init.text`；`limit` = 指令數（預設 48、上限 1000） |
+| `dwarf` | 無 target：CU 列表（producer / 語言 / 位址範圍）與函式統計；regex：函式（low/high pc、來源檔:行、external/inline）＋ struct / union / class / enum / typedef 成員（offset、型別、bit field）；`0x位址`：對應來源檔:行與函式 | regex、`0x位址`、`kind:func` / `kind:type` |
+| `strings` | 全部可讀字串（ASCII 全檔 + UTF-16LE 前 4MB）含 offset、所屬 section、分類 | regex、`cat:diagnostic`（或 version / format / url / path / command / config / other）、`section:.rodata`、`min:12`、`enc:utf16` |
+| `sections` | 全部 section（type / addr / offset / size / flags / 所屬 segment）；指定 section 時給 hex dump + 字串 + 內含 symbol | section 名、`0x位址`；`limit` = dump bytes（預設 512、上限 8192） |
+| `memmap` | LOAD segment 的 VMA / LMA、section→segment、FLASH（Σ filesz）/ RAM（Σ 可寫 memsz）/ zero-init（Σ memsz−filesz）估算（規則明寫在輸出）、Cortex-M 向量表解讀（初始 SP、Reset、例外與 IRQ 對應的 handler symbol） | 不用；`limit` = IRQ 向量數 |
+| `relocs` | relocation：各 section 的數量與 type 統計、被引用最多的 symbol（標 UND）；指定 target 時逐筆列出並標出 caller 函式（`.o/.ko` 的呼叫關係證據） | regex（symbol 或 caller）、`section:.rela.text`、`type:R_ARM_CALL`、`0x<offset>` |
+| `imports` | 外部 symbol（`.dynsym` UND；`.o/.ko` 用 `.symtab` UND）依 API 家族分類，附 relocation 引用次數 | regex |
+| `dynamic` | `.dynamic` 全部 tag（NEEDED / SONAME / RPATH / RUNPATH / FLAGS / INIT_ARRAY…） | regex |
+| `headers` | ELF header、全部 program headers、section→segment、notes、`.comment`、`.modinfo` | 不用 |
+
+- 解析後端：優先 **pyelftools**（`requirements.txt` 已列入）；沒裝時退回 binutils `readelf` 文字解析，報告開頭會列出這條路徑**缺失的能力**（DWARF 型別、部分函式 / 行號精度）與補救命令，不是只標一個 parser 名字。兩條路徑填同一份模型、走同一套渲染，章節與欄位一致。
+- 反組譯覆蓋：系統 `objdump` 只認得自己的架構（Ubuntu 預設 x86）；ARM / AArch64 / RISC-V / MIPS / Xtensa / ARC 韌體要裝對應的 `binutils-<triplet>`（會自動找 `arm-none-eabi-objdump` 等常見名稱）、或 `pip install capstone`（不支援 ARC / 舊版 Xtensa）、或設 `AICODE_OBJDUMP=/path/to/objdump`。找不到時報告會說是哪個架構、試過哪些工具、各自的錯誤。
+- `ingest_document` 對 ELF 走**長版**多視角報告（summary + 完整 symbol 表 + memmap + relocation 逐筆含 caller + DWARF 函式 / 型別 + 全部分類字串），上限 `config.BIN_ELF_INGEST_MAX_CHARS`（400,000 字元），不受 `analyze_file` 單次 25K 的限制；超過會在尾端明講已截斷。
+- `view` / `target` / `limit` 只對 ELF 有效；對圖片、PDF、非 ELF 二進位會被忽略並在回覆開頭註明。
 
 ### apply_patch 的兩種格式
 

@@ -109,12 +109,15 @@ _OPTIONAL_PACKAGES = [
     ("pymupdf4llm", "pymupdf4llm",
      "PDF ingestion 才需要 — pip install \"pymupdf4llm==1.28.0\"(釘驗證版)"),
     ("html2text", "html2text", "RAG.py --url 抓網頁才需要 — pip install html2text"),
-    # 缺它不會壞，但 ELF 報告會靜默降級成 readelf/objdump 文字解析:拿不到 DWARF
-    # compilation unit、notes 也少，而 report 只在自己的內文標了 fallback。
-    # doctor 不講的話，使用者是從「怎麼少了一段」才發現能力被降級的。
+    # 缺它不會壞，但 ELF 報告會退回 readelf 文字解析:DWARF 型別(struct/enum 成員)拿不到、
+    # 函式/行號精度較低。報告開頭會明列缺失能力，doctor 也要講——requirements.txt 已列入，
+    # 這裡 WARN 代表安裝沒照 requirements 走。
     ("elftools", "pyelftools",
-     "ELF 結構化解析(DWARF/notes)才需要；沒裝會退回 readelf/objdump 文字解析 — "
-     "pip install pyelftools"),
+     "ELF 結構化解析(analyze_file / ingest 的 symbols / DWARF / relocation / memmap)；已在 requirements.txt，"
+     "沒裝會退回 readelf 文字解析並在報告開頭明列缺失能力 — pip install pyelftools"),
+    ("capstone", "capstone",
+     "選用:analyze_file view=\"disasm\" 在系統 objdump 不支援該架構(ARM/RISC-V 韌體在 x86 主機)時的"
+     "純 Python 反組譯後備；也可改裝對應的 binutils-<triplet> 或設 AICODE_OBJDUMP — pip install capstone"),
 ]
 
 _MCP_REQUIREMENT = "mcp>=1.28,<2"

@@ -83,6 +83,8 @@ CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透�
 
 ```text
 請用工具 analyze_file 分析 firmware/boot.bin，整理檔頭、magic 和可讀字串。
+請用工具 analyze_file 分析 build/app.elf，view 設 "symbols"、target 設 "uart"，列出所有 UART 相關的函式與位址。
+請用工具 analyze_file 分析 build/app.elf，view 設 "disasm"、target 設 "Reset_Handler"，解釋啟動序列。
 ```
 
 `read_file(...)` 適合文字；`analyze_file(...)` 適合圖片、PDF（一次性抽文字）、ELF、firmware binary。這些操作只把附件帶進目前對話，不會建立可長期查詢的知識庫。想讓圖片或附件之後反覆查，改用 §3 的 `ingest_document(...)`（圖片會自動走 VL 看圖再進 RAG）。

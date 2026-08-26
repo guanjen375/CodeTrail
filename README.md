@@ -170,7 +170,7 @@ python3 -m pip install --user --break-system-packages "pymupdf4llm==1.28.0"    #
 python3 -c "import mcp, numpy, requests; print('deps OK')"
 ```
 
-`<CODETRAIL_REPO>` 是這個 CodeTrail 的 repo 路徑,不是你要分析的專案路徑。`requirements.txt` 已含 `mcp` / `requests` / `numpy`,不必再單獨 `pip install mcp`。
+`<CODETRAIL_REPO>` 是這個 CodeTrail 的 repo 路徑,不是你要分析的專案路徑。`requirements.txt` 已含 `mcp` / `requests` / `numpy` / `pyelftools`(ELF 結構化解析;沒裝時 `analyze_file` 退回 readelf 文字解析並在報告開頭明列缺失能力),不必再單獨 `pip install mcp`。
 
 截至 2026-08，MCP Python SDK 2.x 已是 stable；但本 repo 的 runtime 仍使用 v1 `mcp.server.fastmcp.FastMCP`，所以 dependency 刻意固定為 `mcp>=1.28,<2`。乾淨安裝會取維護中的最新 1.x，不會誤升到不相容的 2.x；這也符合 [MCP Python SDK 官方給未遷移 v1 專案的建議](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/get-started/installation.md)。v2 遷移需另案同步處理 import、transport、schema 與 OpenCode 相容性，不應只移除 `<2`。若 `doctor` 報版本不符，執行 `python3 -m pip install --upgrade "mcp>=1.28,<2"`。
 
@@ -657,6 +657,8 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 `mcp.codetrail.timeout` 的單位是毫秒,而且套用到每一次 MCP tool call。圖片 VL 分析通常超過 10 秒,`ingest_document` 的內部上限則是 10 分鐘,因此範本使用 660000 ms(11 分鐘)。若沿用 OpenCode 常見的 `10000`,第一個圖片呼叫會在剛好 10 秒被 client 切斷,後續 `file_info` / `list_dir` 也可能排在尚未結束的圖片請求後面,看起來像整個 MCP server 一起超時。
 
 `aicode` 啟動時會把**既有** `mcp.codetrail` entry 中缺漏、型別錯誤或小於 660000 的 `timeout` 自動同步為專案常數,保留其餘 OpenCode JSON 設定,並在同目錄留下 `opencode.json.codetrail.bak`(若已存在則加數字後綴)。寫入採原子替換;設定檔格式錯誤或無法寫入時會 fail-loud,不會帶著已知錯誤啟動 OpenCode。只有緊急測試才用 `AICODE_MCP_TIMEOUT_CHECK_SKIP=1 aicode` 跳過。
+
+升級說明（ELF 分析改版）：工具仍是 19 個、名稱不變，但 `analyze_file` 新增 `view` / `target` / `limit` 三個參數（ELF 多視角：symbols / disasm / dwarf / strings / sections / memmap / relocs / imports / dynamic / headers，見 [MCP 工具清單](docs/mcp-tools.md#analyze_file-的-elf-視角)），tool schema 已變；`git pull` 後同樣要完全退出 OpenCode 開新 session。`pyelftools` 進入 `requirements.txt`，請重跑 `python3 -m pip install --user --break-system-packages -r requirements.txt`（或在 venv 內 `pip install -r requirements.txt`）；`ingest_document` 對 ELF 改走長版報告，舊 KB 裡已入庫的 ELF 想拿到完整 symbol / DWARF / relocation 內容要 `remove_document` 後重新 ingest。
 
 升級說明（patch／verify 改版）：工具仍是 19 個、名稱不變，但 `apply_patch`（新增 SEARCH/REPLACE 格式、byte-safe 寫入、唯讀 syntax check）與 `run_command`（新增 `timeout` 參數，1..600 秒）的 tool schema / description 已變。`git pull` 之後要**完全退出** OpenCode、開新 session 讓 MCP 重連——舊 session 拿到的是舊 schema，模型會照舊說明呼叫。不要把參數手冊貼進全域 `~/.config/opencode/AGENTS.md`：本輪 tool schema 才是唯一真值（見 [docs/opencode-agents-template.md](docs/opencode-agents-template.md)），格式與上限的人類文件在 [MCP 工具清單](docs/mcp-tools.md#apply_patch-的兩種格式)。
 

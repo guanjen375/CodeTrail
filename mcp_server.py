@@ -110,7 +110,7 @@ assert AICODE_ROOT is not None  # for type checkers
 
 import config
 import code_context
-from config import KNOWLEDGE_FILE, RUN_COMMAND_TIMEOUT, RUN_COMMAND_TIMEOUT_MAX, RUN_COMMAND_TIMEOUT_MIN
+from config import KNOWLEDGE_FILE, RUN_COMMAND_TIMEOUT, RUN_COMMAND_TIMEOUT_MAX, RUN_COMMAND_TIMEOUT_MIN, BIN_ELF_VIEW_MAX_LIMIT
 from knowledge import KnowledgeBase, load_knowledge_base_strict
 from knowledge_store import KnowledgeStoreError
 import code_rag as code_rag_module
@@ -1262,7 +1262,12 @@ def import_external_file(path: str, dest_name: Optional[str] = None) -> str:
 
 
 @_tool()
-def analyze_file(path: str) -> str:
+def analyze_file(
+    path: str,
+    view: str = "summary",
+    target: str = "",
+    limit: Annotated[int, Field(ge=0, le=BIN_ELF_VIEW_MAX_LIMIT)] = 0,
+) -> str:
     """Analyze a non-text file (image / PDF / ELF / binary firmware) inside AICODE_ROOT.
 
     依副檔名自動 dispatch:
@@ -1271,10 +1276,28 @@ def analyze_file(path: str) -> str:
         (要先在 llama-server VL port (8083) 掛載對應的 VL GGUF + mmproj)
       - PDF(.pdf) → 一次性抽各頁文字(不寫入 knowledge.json);
         內嵌圖會標註頁碼與張數但不做 VL 分析
-      - ELF(.elf/.so/.o/.axf/.out/.ko) → 解析 header / sections / symbols
-        (需要系統有 binutils 的 readelf / objdump)
+      - ELF(.elf/.so/.o/.axf/.out/.ko) → 結構化解析(pyelftools;缺少時退回 binutils readelf,
+        報告開頭會明列這條路徑缺失的能力)。預設 view="summary" 是總覽;要深入時用 view / target / limit:
+          view="symbols"  完整 symbol 表(含 LOCAL/static、UND、size=0);target=regex,或
+                          "bind:LOCAL type:FUNC uart" / "ndx:UND" / "section:.text" 篩選,或 0x位址反查
+          view="disasm"   反組譯;target=symbol 名 / 0x位址 / 0x起-0x迄(省略=entry point);limit=指令數;
+                          .o/.ko 可加 "section:.init.text"。objdump 不支援該架構時會明講原因與補救
+                          (跨架構 objdump / pip install capstone / 環境變數 AICODE_OBJDUMP)
+          view="dwarf"    無 target → CU 列表;target=regex → 函式(位址範圍、來源檔:行)與
+                          struct/union/enum/typedef 成員;target=0x位址 → 對應來源行與函式
+          view="strings"  全部可讀字串(offset / section / 分類);target=regex,或 "cat:diagnostic"、
+                          "section:.rodata"、"min:12"(分類:version/diagnostic/format/url/path/command/config)
+          view="sections" 全部 section(flags / 所屬 segment);target=section 名或 0x位址 → hex dump + 字串 + symbols
+          view="memmap"   LOAD segment 的 LMA/VMA、section→segment、FLASH/RAM/.bss 估算、Cortex-M 向量表
+          view="relocs"   relocation 統計與被引用最多的 symbol;target=regex → 逐筆 + caller(.o/.ko 呼叫關係證據)
+          view="imports"  外部 symbol 依 API 家族分類(含 relocation 引用次數)
+          view="dynamic" / view="headers"
+        每次輸出上限 25,000 字元;截斷訊息會指出該用哪個 view + target 縮小範圍,不會默默砍掉。
       - 二進位(.bin/.dat/.raw/.fw/.img/.rom/.hex) → hex dump + 字串提取 + magic 偵測
-        (若內容是 ELF magic 會自動切到 ELF 解析)
+        (若內容是 ELF magic 會自動切到 ELF 解析,view / target / limit 同上)
+
+    view / target / limit 只對 ELF(含 ELF magic 的 .bin)有效;圖片、PDF 與非 ELF 二進位
+    會忽略它們並在回覆開頭註明。
 
     用途:OpenCode 對話中想分析錯誤截圖、firmware blob、ELF binary,
     或「只看一眼」一份 PDF(不想汙染 KB)時呼叫。
@@ -1284,9 +1307,13 @@ def analyze_file(path: str) -> str:
 
     Args:
         path: 檔案路徑(絕對或相對 AICODE_ROOT)。
+        view: ELF 視角,預設 "summary";可選 headers / sections / memmap / symbols / imports /
+              relocs / dynamic / dwarf / disasm / strings(見上)。
+        target: 該 view 的目標或篩選:symbol 名、0x 位址、regex、"key:value" 條件(可混用,空白分隔)。
+        limit: 筆數 / 指令數 / dump bytes 上限;0 = 該 view 的預設;最大 5000。
 
     Returns:
-        對應類型的分析報告(VL 圖片分析 / ELF symbol 表 / binary 字串列)。
+        對應類型的分析報告(VL 圖片分析 / ELF 指定 view 的報告 / binary 字串列)。
     """
     # Sandbox: 路徑必須在 AICODE_ROOT 內,且必須是檔案。
     # 兩種失敗合併回同一句訊息,避免透過錯誤訊息的差異 probe 外部路徑是否存在
@@ -1303,15 +1330,23 @@ def analyze_file(path: str) -> str:
 
     ext = p.suffix.lower()
     path_str = str(p)
+    view_key = (view or "summary").strip().lower()
+    target_key = (target or "").strip()
+    limit_key = int(limit or 0)
+    params_given = view_key != "summary" or bool(target_key) or bool(limit_key)
+    ignored_note = (
+        "[注意] view / target / limit 只對 ELF(含 ELF magic 的 .bin)有效,此檔案類型已忽略這些參數。\n\n"
+        if params_given else ""
+    )
 
     if ext in IMAGE_EXTENSIONS:
-        return ocr_image(path_str)
+        return ignored_note + ocr_image(path_str)
     if ext == ".pdf":
-        return read_pdf(path_str)
+        return ignored_note + read_pdf(path_str)
     if ext in ELF_EXTENSIONS:
-        return read_elf(path_str)
+        return read_elf(path_str, view=view_key, target=target_key, limit=limit_key)
     if ext in BINARY_EXTENSIONS:
-        return read_binary(path_str)
+        return read_binary(path_str, view=view_key, target=target_key, limit=limit_key)
 
     return (
         f"錯誤: 不支援的副檔名 {ext}\n"

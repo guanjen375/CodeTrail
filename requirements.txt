@@ -11,9 +11,13 @@ jieba>=0.42.1       # 中文 BM25 切詞（缺少時可降級，但預設安裝�
 tree-sitter==0.26.0
 tree-sitter-c==0.24.2
 tree-sitter-cpp==0.23.4
+# ELF 結構化解析(analyze_file / ingest_document 的 symbols / DWARF 函式·行號·型別 /
+# relocation / memmap)。純 Python、無編譯依賴。沒裝時退回 binutils readelf 文字解析,
+# 報告開頭會明列缺失能力(DWARF 型別等),doctor 會 WARN。
+pyelftools>=0.30
 
 # 可選：缺了會由各功能 graceful skip，doctor 會提示
 # pip install "pymupdf4llm==1.28.0"               # RAG.py 從 PDF/MD 建知識庫(釘驗證版,上游 schema 常變動)
 # pip install html2text                            # RAG.py --url 抓網頁
-# pip install pyelftools                           # media.py ELF 結構化解析 (含 DWARF/notes)
+# pip install capstone                             # analyze_file view="disasm" 的純 Python 反組譯後備(objdump 不支援該架構時)
 # llama.cpp llama-server 本身要自己 build,見 docs/setup.md

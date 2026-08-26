@@ -2459,13 +2459,15 @@ def extract_text_file(file_path: str) -> List[Dict]:
 def extract_binary_document(file_path: str) -> ExtractedDocument:
     """提取 binary/ELF 內容（hex dump、magic、可讀字串、ELF symbol 等）。
 
-    用 media.read_binary 抽出可分析的 Markdown 報告（遇到 ELF magic 會自動切到
-    ELF 解析）。報告裡 【...】 章節標記會被轉成 ## 標題，方便語意切分。
+    用 media.read_binary_for_ingest 抽出可分析的 Markdown 報告：遇到 ELF magic 走
+    elf_analysis 的長版多視角報告（summary + 完整 symbol 表 + memmap + relocation 逐筆
+    含 caller + DWARF 函式 / 型別 + 全部分類字串，上限 config.BIN_ELF_INGEST_MAX_CHARS），
+    不受 analyze_file 單次 25K 的限制。報告裡 【...】 章節標記會被轉成 ## 標題，方便語意切分。
     """
     filename = Path(file_path).name
     # 延遲載入 media（其他模式不需要）
     try:
-        from media import read_binary, set_sandbox_root
+        from media import read_binary_for_ingest, set_sandbox_root
     except ImportError as e:
         print(f"[ERROR] binary/ELF 模式需要 media 模組: {e}")
         return ExtractedDocument(raw_text="", source=filename)
@@ -2475,10 +2477,10 @@ def extract_binary_document(file_path: str) -> ExtractedDocument:
         print(f"  [WARN] 檔案不存在: {file_path}")
         return ExtractedDocument(raw_text="", source=filename)
 
-    # read_binary 內建沙箱（_SANDBOX_ROOT），這裡設成檔案所在目錄即可
+    # read_binary_for_ingest 內建沙箱（_SANDBOX_ROOT），這裡設成檔案所在目錄即可
     set_sandbox_root(str(p.parent), allow_external=False)
 
-    content = read_binary(str(p))
+    content = read_binary_for_ingest(str(p))
     if (not content
             or content.startswith("[BIN 錯誤]")
             or content.startswith("[ELF 錯誤]")):
