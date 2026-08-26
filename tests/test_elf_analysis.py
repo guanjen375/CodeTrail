@@ -39,7 +39,7 @@ from tests._harness import import_mcp_module
 # 最小 ELF 產生器
 # ---------------------------------------------------------------------------
 
-def build_min_elf(path: Path) -> Path:
+def build_min_elf(path: Path, extra_und: int = 0) -> Path:
     """最小 ET_REL x86-64 ELF。
 
     .text    : helper_static(LOCAL FUNC, 8 bytes) / main(GLOBAL FUNC, 16 bytes) /
@@ -55,6 +55,8 @@ def build_min_elf(path: Path) -> Path:
     rodata = (b"error: bad thing %d\x00http://example.com/fw\x00/etc/fw.conf\x00"
               b"FW version 2.1 build 2026\x00" + b"a" * 3000 + b"!\x00")
     strtab = b"\x00demo.c\x00helper_static\x00main\x00asm_label\x00printf\x00"
+    extra_names = [f"s{i}" for i in range(extra_und)]          # 短名稱的外部參照（審核五 #3）
+    strtab += b"".join(n.encode() + b"\x00" for n in extra_names)
     shstrtab = (b"\x00.text\x00.rodata\x00.symtab\x00.strtab\x00.rela.text\x00.shstrtab\x00"
                 b".rela.rodata\x00")
 
@@ -75,6 +77,8 @@ def build_min_elf(path: Path) -> Path:
     symtab += sym("main", STB_GLOBAL, STT_FUNC, 1, 8, 16)                 # 3 (first global)
     symtab += sym("asm_label", STB_GLOBAL, STT_FUNC, 1, 24, 0)            # 4
     symtab += sym("printf", STB_GLOBAL, STT_NOTYPE, SHN_UNDEF, 0, 0)      # 5
+    for name in extra_names:
+        symtab += sym(name, STB_GLOBAL, STT_NOTYPE, SHN_UNDEF, 0, 0)
     R_X86_64_PLT32, R_X86_64_RELATIVE = 4, 8
     rela = struct.pack("<QQq", 13, (5 << 32) | R_X86_64_PLT32, -4)
     rela_rodata = struct.pack("<QQq", 0, (0 << 32) | R_X86_64_RELATIVE, 0x10)
@@ -126,7 +130,7 @@ def build_min_elf(path: Path) -> Path:
     return path
 
 
-def build_arm_exec_elf(path: Path, n_words: int = 4000) -> Path:
+def build_arm_exec_elf(path: Path, n_words: int = 4000, n_null_phdrs: int = 0) -> Path:
     """最小 ARM（EM_ARM）ET_EXEC：一個 LOAD segment @0x08000000，開頭像 Cortex-M 向量表
     （word0 = 初始 SP、word1 = Thumb reset），後面塞 n_words 個同樣的 handler 位址——
     模擬「.text 全是程式碼、只有前面一小段是向量表」的韌體。"""
@@ -134,15 +138,17 @@ def build_arm_exec_elf(path: Path, n_words: int = 4000) -> Path:
     data = struct.pack("<%dI" % len(words), *words)
     shstrtab = b"\x00.text\x00.shstrtab\x00"
     ehdr_size, phdr_size, shdr_size = 52, 32, 40
-    data_off = ehdr_size + phdr_size
+    n_phdrs = 1 + n_null_phdrs
+    data_off = ehdr_size + phdr_size * n_phdrs
     shstr_off = data_off + len(data)
     shoff = shstr_off + len(shstrtab)
     while shoff % 4:
         shoff += 1
     e_ident = b"\x7fELF" + bytes([1, 1, 1, 0]) + b"\x00" * 8
     ehdr = struct.pack("<16sHHIIIIIHHHHHH", e_ident, 2, 40, 1, 0x08000101, ehdr_size, shoff,
-                       0x05000200, ehdr_size, phdr_size, 1, shdr_size, 3, 2)
+                       0x05000200, ehdr_size, phdr_size, n_phdrs, shdr_size, 3, 2)
     phdr = struct.pack("<IIIIIIII", 1, data_off, 0x08000000, 0x08000000, len(data), len(data), 5, 4)
+    phdr += struct.pack("<IIIIIIII", 0, 0, 0, 0, 0, 0, 0, 0) * n_null_phdrs
     SHDR = "<IIIIIIIIII"
     shdrs = [
         struct.pack(SHDR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
@@ -151,7 +157,7 @@ def build_arm_exec_elf(path: Path, n_words: int = 4000) -> Path:
     ]
     buf = bytearray(shoff + shdr_size * len(shdrs))
     buf[0:ehdr_size] = ehdr
-    buf[ehdr_size:ehdr_size + phdr_size] = phdr
+    buf[ehdr_size:ehdr_size + len(phdr)] = phdr
     buf[data_off:data_off + len(data)] = data
     buf[shstr_off:shstr_off + len(shstrtab)] = shstrtab
     buf[shoff:] = b"".join(shdrs)
@@ -577,4 +583,58 @@ def test_bin_with_elf_magic_respects_tiny_max_chars(elf_path: Path, tmp_path: Pa
         out = media.read_binary(str(blob), max_chars=cap)
         assert len(out) <= cap, (cap, len(out))
     assert len(elf_analysis.build_report(elf_path, "summary", max_chars=100)) <= 100
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-26 第五輪靜態審核回修
+# ---------------------------------------------------------------------------
+
+@pytest.mark.smoke
+def test_headers_view_stops_generating_after_budget(tmp_path: Path, monkeypatch):
+    """審核五 #1：headers 先用 _segments_table 把全部 program header 建成 list 才交給 _Sink，
+    大量 segment 的 ELF 在預算生效前就先產生遠超預算的中間資料。渲染要在預算用完後停止產生。"""
+    p = build_arm_exec_elf(tmp_path / "many.elf", n_words=64, n_null_phdrs=3000)
+    media.set_sandbox_root(str(tmp_path), allow_external=False)
+    elf_analysis._MODEL_CACHE.clear()
+    model = elf_analysis.load_model(p)
+    assert len(model.segments) == 3001
+    calls = [0]
+    orig_append = elf_analysis._Sink.append
+
+    def counting_append(self, s):
+        calls[0] += 1
+        return orig_append(self, s)
+
+    monkeypatch.setattr(elf_analysis._Sink, "append", counting_append)
+    out = elf_analysis.render(model, "headers", "", 0, char_budget=1500)
+    assert len(out) <= 1500
+    assert calls[0] < 400, f"預算用完後仍產生了 {calls[0]} 行"
+
+
+@pytest.mark.smoke
+def test_sink_does_not_truncate_reports_that_fit(elf_path: Path):
+    """審核五 #2：_Sink 無條件預扣 200 字元，24,900 字元的報告在 25,000 上限下也會被截斷，
+    違反「沒超過上限就是完整」。"""
+    elf_analysis._MODEL_CACHE.clear()
+    model = elf_analysis.load_model(elf_path)
+    full = elf_analysis.render(model, "symbols", "", 0)
+    exact = elf_analysis.render(model, "symbols", "", 0, char_budget=len(full))
+    assert exact == full, "剛好放得下的報告不得被截斷"
+    less = elf_analysis.render(model, "symbols", "", 0, char_budget=len(full) - 1)
+    assert len(less) <= len(full) - 1 and "報告已截斷" in less, less[-200:]
+
+
+@pytest.mark.smoke
+def test_ingest_entry_cap_never_precedes_char_budget(tmp_path: Path):
+    """審核五 #3：ingest 假設每行至少 20 字元（cap // 20 筆），imports 的短名稱列只有幾個字元，
+    筆數上限會比字元預算先到，內容明明放得下卻被截斷。"""
+    p = build_min_elf(tmp_path / "many_und.elf", extra_und=400)
+    media.set_sandbox_root(str(tmp_path), allow_external=False)
+    elf_analysis._MODEL_CACHE.clear()
+    model = elf_analysis.load_model(p)
+    cap = 6000
+    n = elf_analysis._ingest_entry_cap(cap)
+    out = elf_analysis.render(model, "imports", "", n, hard_max=n, char_budget=cap)
+    assert len(out) <= cap
+    assert "s399" in out and "... +" not in out, out[-300:]
 

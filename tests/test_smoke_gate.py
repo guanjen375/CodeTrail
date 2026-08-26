@@ -113,6 +113,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         (
             "test_target_regex_is_guarded_against_redos",
             "test_target_regex_rejects_optional_quantifier_bomb",
+            "test_target_regex_rejects_alternation_chain_bomb",
             "test_filter_deadline_is_checked_even_with_zero_matches",
         ),
     ),

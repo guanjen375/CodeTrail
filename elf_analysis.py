@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import bisect
 import heapq
+import itertools
 import os
 import re
 import shutil
@@ -96,9 +97,9 @@ _REGEX_SUBJECT_MAX = 300         # regex 只看每個字串 / 名稱的前 N 個
 _REGEX_MAX_BRANCHES = 8          # 最上層 | 的分支數上限
 _REGEX_MAX_UNBOUNDED = 1         # * / + 合計上限
 _REGEX_MAX_OPTIONAL = 3          # ? 合計上限
-_SINK_NOTE_RESERVE = 200         # 字元預算內保留給截斷說明的空間
+_SINK_NOTE_MAX = 200             # 截斷說明的長度上限（截斷時才從尾端回收這段空間）
 _FILTER_TIME_BUDGET = 20.0       # 單一 view 的篩選時間預算（秒），超過就截斷並明講
-_INGEST_CHARS_PER_LINE = 20      # ingest 筆數保險：每行至少 20 字元，所以 cap // 20 筆永遠先撞到字元預算（真正的上限）
+_INGEST_CHARS_PER_LINE = 1       # ingest 筆數保險 = 字元預算：每行至少 1 字元 + 換行，字元預算一定先到（imports 短名稱也是）
 _INGEST_MIN_LINES = 200
 
 
@@ -2808,8 +2809,11 @@ class _Sink(list):
     """view 的行容器：累計字元數，達到預算就不再收（truncated=True）——渲染階段就有界。
 
     以前各 view 先完整產生再事後裁：symbols 幾萬行、strings 幾萬條會先建出幾十 MB 的
-    中間資料。現在每個 view 拿一個帶字元預算的容器，超過預算的行直接丟掉並計數，
-    最後 _finish() 補一行說明；預算內保留 _SINK_NOTE_RESERVE 給那行，所以輸出總長 ≤ 預算。
+    中間資料。現在每個 view 拿一個帶字元預算的容器：
+      - 放得下的行照收，**不預扣**任何空間——剛好放得下的報告一個字都不會少；
+      - 第一行放不下就 truncated，之後的行只計數不存；
+      - generator 來源在截斷後就不再消費（產生階段真的停止，不只是丟掉）；
+      - _finish() 補說明時才從尾端回收剛好夠的空間，所以輸出總長 ≤ 預算。
     """
 
     def __init__(self, budget: int, initial=()):
@@ -2818,25 +2822,39 @@ class _Sink(list):
         self.chars = 0
         self.truncated = False
         self.dropped = 0
-        self._limit = max(0, self.budget - _SINK_NOTE_RESERVE)
+        self.dropped_more = False   # generator 截斷後沒再消費：略過的行數只知道下限
         for x in initial:
             self.append(x)
 
+    def _cost(self, s: str) -> int:
+        # 最終是 "\n".join(lines)：只有第二行起才多一個換行，第一行不算——否則剛好放得下的
+        # 報告會被多算 1 個字元而誤判截斷。
+        return len(s) + (1 if len(self) else 0)
+
     def append(self, s: str) -> None:  # type: ignore[override]
-        if self.truncated or self.chars + len(s) + 1 > self._limit:
+        if self.truncated or self.chars + self._cost(s) > self.budget:
             self.truncated = True
             self.dropped += 1
             return
+        self.chars += self._cost(s)
         super().append(s)
-        self.chars += len(s) + 1
 
     def extend(self, items) -> None:  # type: ignore[override]
-        for x in items:
+        if isinstance(items, (list, tuple)):
+            for x in items:          # 已存在的小清單：全數計入 dropped（便宜）
+                self.append(x)
+            return
+        for x in items:              # generator：截斷後不再消費，產生階段停止
             self.append(x)
+            if self.truncated:
+                self.dropped_more = True
+                break
 
-    def force(self, s: str) -> None:
-        """截斷說明用：不受預算限制（預算已保留這段空間）。"""
-        super().append(s)
+    def pop_last(self) -> None:
+        if len(self):
+            popped = super().pop()
+            self.chars -= len(popped) + (1 if len(self) else 0)
+            self.dropped += 1
 
 
 def _sink(model: ElfModel, char_budget: Optional[int]) -> "_Sink":
@@ -2844,12 +2862,19 @@ def _sink(model: ElfModel, char_budget: Optional[int]) -> "_Sink":
 
 
 def _finish(out) -> List[str]:
+    """截斷時補一行說明；為了讓說明放進預算，從尾端回收剛好夠的行。放得下就原樣。"""
     if isinstance(out, _Sink) and out.truncated:
-        out.force(
-            f"… [報告已截斷：此 view 的輸出達到 {out.budget:,} 字元上限，已略過 {out.dropped:,} 行；"
-            f"用 target / limit 縮小範圍，或改用其他 view]"
-        )
-    return list(out)
+        while True:
+            note = (
+                f"… [報告已截斷：此 view 的輸出達到 {out.budget:,} 字元上限，"
+                f"已略過{'至少 ' if out.dropped_more else ' '}{out.dropped:,} 行；"
+                f"用 target / limit 縮小範圍，或改用其他 view]"
+            )[:_SINK_NOTE_MAX]
+            if out.chars + out._cost(note) <= out.budget or not len(out):
+                break
+            out.pop_last()
+        list.append(out, note[:out.budget] if len(note) > out.budget else note)
+    return out
 
 
 class _Deadline:
@@ -2924,23 +2949,21 @@ def _section_segment_map(model: ElfModel) -> Dict[str, List[int]]:
     return m
 
 
-def _sections_table(model: ElfModel, secs: List[Dict], header: bool = True) -> List[str]:
-    out: List[str] = []
+def _sections_table(model: ElfModel, secs, header: bool = True):
+    """Section 表（generator：同 _segments_table，預算用完就停）。"""
     seg_map = _section_segment_map(model)
     w = model.addr_width
     if header:
-        out.append(f"  [idx] {'name':<24} {'type':<12} {'addr':<{w + 2}} {'offset':<10} {'size':<10} flags  seg")
+        yield f"  [idx] {'name':<24} {'type':<12} {'addr':<{w + 2}} {'offset':<10} {'size':<10} flags  seg"
     for sec in secs:
         segs = seg_map.get(sec["name"], [])
         seg_txt = ",".join(str(i) for i in segs[:3]) + ("…" if len(segs) > 3 else "")
         name = sec["name"] or "(null)"
-        out.append(
+        yield (
             f"  [{sec['idx']:3d}] {name[:24]:<24} {sec['type'][:12]:<12} "
             f"{model.fmt_addr(sec['addr']):<{w + 2}} 0x{sec['offset']:06x}   0x{sec['size']:06x}   "
             f"{sec['flags'] or '-':<6} {seg_txt}"
         )
-    return _finish(out)
-
 
 def _important_sections(model: ElfModel) -> List[Dict]:
     important = {
@@ -3100,25 +3123,26 @@ def _elf_header_block(model: ElfModel) -> List[str]:
     return _finish(out)
 
 
-def _segments_table(model: ElfModel, max_rows: Optional[int] = None) -> List[str]:
+def _segments_table(model: ElfModel, max_rows: Optional[int] = None):
+    """Program header 表（generator：讓 _Sink 在預算用完後停止消費，不先建整份 list）。"""
     if not model.segments:
         if "segments" in model.failed:
-            return ["", f"【Program Headers】讀取失敗：{model.failed['segments']}"]
-        return []
+            yield ""
+            yield f"【Program Headers】讀取失敗：{model.failed['segments']}"
+        return
     w = model.addr_width
-    out = ["", "【Program Headers】" + (f"（{len(model.segments)} 個）" if max_rows is None else "")]
-    out.append(f"  {'#':<3} {'type':<14} {'offset':<10} {'vaddr(VMA)':<{w + 2}} {'paddr(LMA)':<{w + 2}} {'filesz':<10} {'memsz':<10} flg align")
+    yield ""
+    yield "【Program Headers】" + (f"（{len(model.segments)} 個）" if max_rows is None else "")
+    yield f"  {'#':<3} {'type':<14} {'offset':<10} {'vaddr(VMA)':<{w + 2}} {'paddr(LMA)':<{w + 2}} {'filesz':<10} {'memsz':<10} flg align"
     rows = model.segments if max_rows is None else model.segments[:max_rows]
     for seg in rows:
-        out.append(
+        yield (
             f"  {seg['idx']:<3} {seg['type'][:14]:<14} 0x{seg['offset']:06x}   "
             f"{model.fmt_addr(seg['vaddr']):<{w + 2}} {model.fmt_addr(seg['paddr']):<{w + 2}} "
             f"0x{seg['filesz']:06x}   0x{seg['memsz']:06x}   {seg['flags']} 0x{seg['align']:x}"
         )
     if max_rows is not None and len(model.segments) > max_rows:
-        out.append(f"  ... (共 {len(model.segments)} 個；view=\"headers\" 看全部)")
-    return _finish(out)
-
+        yield f"  ... (共 {len(model.segments)} 個；view=\"headers\" 看全部)"
 
 def _dynamic_block(model: ElfModel) -> List[str]:
     facts = model.dynamic
@@ -3647,6 +3671,8 @@ def view_headers(model: ElfModel, limit: int = 0, hard_max: Optional[int] = None
         out.append("")
         out.append("  Section → Segment:")
         for seg in model.segments:
+            if out.truncated:
+                break
             names = seg["sections"]
             out.append(f"    {seg['idx']:02d} {seg['type']:<12} {' '.join(names[:100])}"
                        + (f" …+{len(names) - 100}" if len(names) > 100 else ""))
@@ -3762,8 +3788,12 @@ def view_memmap(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opt
         line_budget = _limit_for("memmap", limit, hard_max) * 8 + 64   # 行數上限（sink 另有字元預算）
         emitted = 0
         for seg in loads:
+            if out.truncated:
+                break
             out.append(f"  LOAD #{seg['idx']} VMA {model.fmt_addr(seg['vaddr'])} LMA {model.fmt_addr(seg['paddr'])} {seg['flags']}:")
             for name in seg["sections"]:
+                if out.truncated:
+                    break
                 if emitted >= line_budget:
                     out.append("      ... 其餘 section 未列（limit=N）")
                     break
@@ -3963,9 +3993,9 @@ def view_relocs(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opt
     for r in model.relocs:
         if fields.get("section") and fields["section"] not in (r["section"], r["applies_to"]):
             continue
-        rows: List[str] = []
+        header_done = False
         for e in r["entries"]:
-            if deadline.expired():
+            if deadline.expired() or out.truncated:
                 break
             if fields.get("type") and e["type"].upper() != fields["type"].upper():
                 continue
@@ -3978,16 +4008,16 @@ def view_relocs(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opt
             matched += 1
             if shown >= n:
                 continue
+            if not header_done:            # 有第一筆才印 section 標題，直接寫進 sink，不先攢 rows
+                out.append(f"  -- {r['section']}（{r['count']:,} 筆）")
+                header_done = True
             add = ""
             if e["addend"] is not None and e["addend"] != 0:
                 add = f"{'+' if e['addend'] >= 0 else '-'}0x{abs(e['addend']):x}"
-            rows.append(f"  {r['applies_to'] or r['section']}+0x{e['offset']:x}  {e['type']}  {e['sym'] or '(none)'}{add}"
-                        + (f"  (in {caller})" if caller else ""))
+            out.append(f"  {r['applies_to'] or r['section']}+0x{e['offset']:x}  {e['type']}  {e['sym'] or '(none)'}{add}"
+                       + (f"  (in {caller})" if caller else ""))
             shown += 1
-        if rows:
-            out.append(f"  -- {r['section']}（{r['count']:,} 筆）")
-            out.extend(rows)
-        if deadline.hit:
+        if deadline.hit or out.truncated:
             break
     if matched == 0:
         out.append("  沒有符合的項目")
@@ -4086,6 +4116,8 @@ def view_dwarf(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opti
             out.append(f"  [WARN] DWARF 解析錯誤: {model._lazy['dwarf_error']}")
         out.append(f"  {'#':<4} {'name':<40} {'lang':<6} {'range':<{model.addr_width * 2 + 4}} producer")
         for i, c in enumerate(cus[:n]):
+            if out.truncated:
+                break
             name = c["name"]
             if name and not name.startswith("/") and c["comp_dir"]:
                 name = f"{c['comp_dir'].rstrip('/')}/{name}"
@@ -4107,6 +4139,8 @@ def view_dwarf(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opti
         if funcs:
             out.append(f"  {'range':<{model.addr_width * 2 + 4}} {'name':<36} source")
             for f_ in funcs[:n]:
+                if out.truncated:
+                    break
                 rng = (f"{model.fmt_addr(f_['low_pc'])}-{model.fmt_addr(f_['high_pc'])}" if f_["low_pc"] is not None and f_["high_pc"] is not None
                        else (model.fmt_addr(f_["low_pc"]) if f_["low_pc"] is not None else "(no code)"))
                 src = f"{f_['file']}:{f_['line']}" if f_["file"] else (f"line {f_['line']}" if f_["line"] else "")
@@ -4125,6 +4159,8 @@ def view_dwarf(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opti
             out.append(f"【DWARF 型別】符合 {text!r} 共 {len(types)} 個" + ("（已達上限）" if truncated else ""))
             line_start = len(out)
             for ti, t in enumerate(types):
+                if out.truncated:
+                    break
                 if len(out) - line_start >= n:          # 型別區塊以 limit 當行預算（每個型別可能幾十行）
                     out.append(f"  ... 其餘 {len(types) - ti} 個型別未列（limit=N 行預算；縮小 target）")
                     break
@@ -4218,7 +4254,9 @@ def view_strings(model: ElfModel, target: str = "", limit: int = 0, hard_max: Op
         out.extend(_strings_summary(model, max(BIN_ELF_MAX_STRINGS, n // 4))[1:])
         out.append("")
         out.append(f"【字串（依 offset，前 {min(n, len(items))} / {len(items):,}）】")
-        for it in items[:n]:
+        for it in itertools.islice(items, n):
+            if out.truncated:
+                break
             sec = f" [{it['section']}]" if it["section"] else ""
             cats = f" ({','.join(it['cats'])})" if it["cats"] else ""
             out.append(f"  0x{it['offset']:08x}{sec}{cats} {_clip(it['text'], 160)}")
@@ -4363,6 +4401,12 @@ def _fit_ingest_parts(parts: List[Tuple[str, str, str]], cap: int) -> str:
     return result
 
 
+def _ingest_entry_cap(cap: int) -> int:
+    """ingest 各 view 的筆數上限：等於字元預算——每行至少 1 字元 + 換行，所以永遠不會比
+    字元預算先到（imports 這種 4 空格 + 短名稱的行也一樣）；只是迴圈保險。"""
+    return max(_INGEST_MIN_LINES, int(cap) // _INGEST_CHARS_PER_LINE)
+
+
 def build_ingest_document(path, max_chars: Optional[int] = None) -> str:
     """ingest_document 用：多視角合併的長版報告（RAG 會把 【…】 標題切成章節）。
 
@@ -4375,8 +4419,8 @@ def build_ingest_document(path, max_chars: Optional[int] = None) -> str:
     model = load_model(Path(path))
     cap = max_chars or BIN_ELF_INGEST_MAX_CHARS
     # 每個 view 以 cap 為渲染階段的字元預算（_Sink 達預算即不再收行），中間資料 O(cap)；
-    # 筆數上限 cap // 20 只是迴圈保險（每行至少 20 字元，字元預算一定先到），不會提前截斷。
-    per_view = max(_INGEST_MIN_LINES, cap // _INGEST_CHARS_PER_LINE)
+    # 筆數上限 = 字元預算（每行至少 1 字元 + 換行），任何 view 都不可能比字元預算先到。
+    per_view = _ingest_entry_cap(cap)
     hdr = _hdr_lines(model)
     parts: List[Tuple[str, str, str]] = [
         ("summary", "", "\n".join(view_summary(model, 0, footer=False, char_budget=cap))),
