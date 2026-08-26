@@ -40,7 +40,7 @@ tool-call 能力，不是 RAG 本身。[OpenCode 全域 AGENTS.md 範本](openco
 兩個工具差別：
 
 - `read_file` 直接把純文字內容讀進對話（拿到 PDF／二進位會回導引訊息，不會吐亂碼）。
-- `analyze_file` 會先做處理 — 圖片由 VL 做通用視覺分析（文字辨識、UI／終端機、表格、圖表、架構／流程關係與一般照片都包含），PDF 抽各頁文字（內嵌圖會標註頁碼張數但不做 VL），二進位檔則抓出檔頭格式和可讀字串，ELF 給結構化總覽（header / 記憶體配置 / symbols 含 LOCAL / imports / relocation / DWARF / 字串分類），要深入時加 `view` 與 `target`（例如 `view="symbols", target="uart"`、`view="disasm", target="Reset_Handler"`、`view="dwarf", target="0x08001234"`，完整表見 [docs/mcp-tools.md](mcp-tools.md#analyze_file-的-elf-視角）） — 再把整理後的結果丟給模型。
+- `analyze_file` 會先做處理 — 圖片由 VL 做通用視覺分析（文字辨識、UI／終端機、表格、圖表、架構／流程關係與一般照片都包含），PDF 抽各頁文字（內嵌圖會標註頁碼張數但不做 VL），二進位檔則抓出檔頭格式和可讀字串，ELF 給結構化總覽（header / 記憶體配置 / symbols 含 LOCAL / imports / relocation / DWARF / 字串分類），要深入時加 `view` 與 `target`（例如 `view="symbols", target="uart"`、`view="disasm", target="Reset_Handler"`、`view="dwarf", target="0x08001234"`，完整表見 [docs/mcp-tools.md](mcp-tools.md#analyze_file-的-elf-視角)） — 再把整理後的結果丟給模型。
   `analyze_file` 對 `.pdf` 是一次性抽文字，**不做**結構化圖片抽取（表格 / 終端機畫面的 canonical JSON 與驗證狀態只在 `ingest_document` 的入庫路徑產生）。
 
 `analyze_file` 是「這一輪看一次就丟」，看完不會留在 KB 裡，未來其他對話查不到。如果想把這張截圖／這份 firmware 永久保存供之後查詢，改用 `ingest_document`（見「把附件做成知識庫讓模型隨時能查」），它接受相同的圖片／binary／ELF 副檔名，並會切 chunk、算 embedding 寫進 `knowledge.json`。

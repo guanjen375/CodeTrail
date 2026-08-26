@@ -230,16 +230,18 @@ native lane(原生表格,零 VL 呼叫)**沒有任何模型影像輸入**,它的
 | `disasm` | 反組譯；工具依序 objdump → 跨架構 `<triplet>-objdump` → capstone；全部不行時列出每個工具的失敗原因與補救（安裝對應 binutils / `pip install capstone` / 環境變數 `AICODE_OBJDUMP`） | symbol 名、`0x位址`、`0x起-0x迄`、`0x位址+bytes`；省略 = entry point；`.o/.ko` 可加 `section:.init.text`；`limit` = 指令數（預設 48、上限 1000） |
 | `dwarf` | 無 target：CU 列表（producer / 語言 / 位址範圍）與函式統計；regex：函式（low/high pc、來源檔:行、external/inline）＋ struct / union / class / enum / typedef 成員（offset、型別、bit field）；`0x位址`：對應來源檔:行與函式 | regex、`0x位址`、`kind:func` / `kind:type` |
 | `strings` | 全部可讀字串（ASCII 全檔 + UTF-16LE 前 4MB）含 offset、所屬 section、分類 | regex、`cat:diagnostic`（或 version / format / url / path / command / config / other）、`section:.rodata`、`min:12`、`enc:utf16` |
-| `sections` | 全部 section（type / addr / offset / size / flags / 所屬 segment）；指定 section 時給 hex dump + 字串 + 內含 symbol | section 名、`0x位址`；`limit` = dump bytes（預設 512、上限 8192） |
+| `sections` | 全部 section（type / addr / offset / size / flags / 所屬 segment）；指定 section 時給 hex dump + 字串 + 內含 symbol | section 名、`0x位址`；`limit` = dump bytes（預設 512、上限 4096） |
 | `memmap` | LOAD segment 的 VMA / LMA、section→segment、FLASH（Σ filesz）/ RAM（Σ 可寫 memsz）/ zero-init（Σ memsz−filesz）估算（規則明寫在輸出）、Cortex-M 向量表解讀（初始 SP、Reset、例外與 IRQ 對應的 handler symbol） | 不用；`limit` = IRQ 向量數 |
-| `relocs` | relocation：各 section 的數量與 type 統計、被引用最多的 symbol（標 UND）；指定 target 時逐筆列出並標出 caller 函式（`.o/.ko` 的呼叫關係證據） | regex（symbol 或 caller）、`section:.rela.text`、`type:R_ARM_CALL`、`0x<offset>` |
+| `relocs` | relocation：各 section 的數量與 type 統計、被引用最多的 symbol（標 UND）；指定 target 時逐筆列出並標出 caller 函式（`.o/.ko` 的呼叫關係證據） | `*`（全部逐筆，含沒有 symbol 的 `R_*_RELATIVE`）、regex（symbol / caller / type）、`section:.rela.text`、`type:R_ARM_CALL`、`0x<offset>` |
 | `imports` | 外部 symbol（`.dynsym` UND；`.o/.ko` 用 `.symtab` UND）依 API 家族分類，附 relocation 引用次數 | regex |
 | `dynamic` | `.dynamic` 全部 tag（NEEDED / SONAME / RPATH / RUNPATH / FLAGS / INIT_ARRAY…） | regex |
 | `headers` | ELF header、全部 program headers、section→segment、notes、`.comment`、`.modinfo` | 不用 |
 
 - 解析後端：優先 **pyelftools**（`requirements.txt` 已列入）；沒裝時退回 binutils `readelf` 文字解析，報告開頭會列出這條路徑**缺失的能力**（DWARF 型別、部分函式 / 行號精度）與補救命令，不是只標一個 parser 名字。兩條路徑填同一份模型、走同一套渲染，章節與欄位一致。
 - 反組譯覆蓋：系統 `objdump` 只認得自己的架構（Ubuntu 預設 x86）；ARM / AArch64 / RISC-V / MIPS / Xtensa / ARC 韌體要裝對應的 `binutils-<triplet>`（會自動找 `arm-none-eabi-objdump` 等常見名稱）、或 `pip install capstone`（不支援 ARC / 舊版 Xtensa）、或設 `AICODE_OBJDUMP=/path/to/objdump`。找不到時報告會說是哪個架構、試過哪些工具、各自的錯誤。
-- `ingest_document` 對 ELF 走**長版**多視角報告（summary + 完整 symbol 表 + memmap + relocation 逐筆含 caller + DWARF 函式 / 型別 + 全部分類字串），上限 `config.BIN_ELF_INGEST_MAX_CHARS`（400,000 字元），不受 `analyze_file` 單次 25K 的限制；超過會在尾端明講已截斷。
+- `ingest_document` 對 ELF 走**長版**多視角報告（summary + 完整 symbol 表 + relocation 逐筆含 caller + DWARF CU / 函式 / 型別 + 全部分類字串 + memmap / sections / imports / dynamic），各段**不設筆數配額**，整份以 `config.BIN_ELF_INGEST_MAX_CHARS`（400,000 字元）為上限，不受 `analyze_file` 單次 25K 的限制。沒超過上限就是完整；超過時各段**依比例截斷、各自註明**（原行數 / 字元數與該用哪個 view 分批查），不會有整段消失。解析層仍有安全上限並會在報告內註明：relocation 每個 section 保留前 20,000 筆（統計為全量）、DWARF 函式 50,000 個、字串 300,000 條。
+- `target` 的 regex 只允許保守子集：群組後接量詞（`(a+)+`、`(a|aa)+`）、超過 2 個無界量詞（`.*x.*y.*`）或超過 200 字元的樣式會改成**字面比對**並在輸出註明（Python 的 `re` 沒有 timeout，災難性回溯會卡住整個 MCP server）；regex 只看每個字串 / 名稱的前 2,000 個字元，單一 view 的篩選超過 20 秒會中止並標明結果不完整。
+- readelf fallback 會逐條記錄失敗的命令（timeout、非零 returncode、有輸出但解析不到），報告開頭列出，且對應段落改講「讀取失敗」而不是「沒有 symbol / 沒有 relocation」；readelf / objdump 一律以 `LC_ALL=C` 執行。
 - `view` / `target` / `limit` 只對 ELF 有效；對圖片、PDF、非 ELF 二進位會被忽略並在回覆開頭註明。
 
 ### apply_patch 的兩種格式

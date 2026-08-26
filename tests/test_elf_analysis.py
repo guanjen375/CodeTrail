@@ -22,10 +22,13 @@ from __future__ import annotations
 
 import shutil
 import struct
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
+import config
 import elf_analysis
 import media
 from tests._harness import import_mcp_module
@@ -42,14 +45,17 @@ def build_min_elf(path: Path) -> Path:
                asm_label(GLOBAL FUNC, size 0)
     .rodata  : 一條錯誤字串、一條 URL、一條路徑、一條版本字串（給字串分類用）
     .rela.text: main 內 offset 13 對 printf(UND) 的 R_X86_64_PLT32 -4
+    .rela.rodata: 一條沒有 symbol 的 R_X86_64_RELATIVE（審核 #1：symbol / caller 皆空的 reloc）
+    .rodata 另含一條 3000 個 'a' 的長字串（審核 #5：災難性回溯 regex 的受害者）
     """
     text = bytes([0x55, 0x48, 0x89, 0xE5, 0x5D, 0xC3, 0x90, 0x90])            # helper_static
     text += bytes([0x55, 0x48, 0x89, 0xE5, 0xE8, 0, 0, 0, 0, 0x31, 0xC0, 0x5D, 0xC3, 0x90, 0x90, 0x90])  # main
     text += bytes([0x90] * 8)                                                   # asm_label
     rodata = (b"error: bad thing %d\x00http://example.com/fw\x00/etc/fw.conf\x00"
-              b"FW version 2.1 build 2026\x00")
+              b"FW version 2.1 build 2026\x00" + b"a" * 3000 + b"!\x00")
     strtab = b"\x00demo.c\x00helper_static\x00main\x00asm_label\x00printf\x00"
-    shstrtab = b"\x00.text\x00.rodata\x00.symtab\x00.strtab\x00.rela.text\x00.shstrtab\x00"
+    shstrtab = (b"\x00.text\x00.rodata\x00.symtab\x00.strtab\x00.rela.text\x00.shstrtab\x00"
+                b".rela.rodata\x00")
 
     def stroff(table: bytes, name: str) -> int:
         return table.index(b"\x00" + name.encode() + b"\x00") + 1
@@ -68,8 +74,9 @@ def build_min_elf(path: Path) -> Path:
     symtab += sym("main", STB_GLOBAL, STT_FUNC, 1, 8, 16)                 # 3 (first global)
     symtab += sym("asm_label", STB_GLOBAL, STT_FUNC, 1, 24, 0)            # 4
     symtab += sym("printf", STB_GLOBAL, STT_NOTYPE, SHN_UNDEF, 0, 0)      # 5
-    R_X86_64_PLT32 = 4
+    R_X86_64_PLT32, R_X86_64_RELATIVE = 4, 8
     rela = struct.pack("<QQq", 13, (5 << 32) | R_X86_64_PLT32, -4)
+    rela_rodata = struct.pack("<QQq", 0, (0 << 32) | R_X86_64_RELATIVE, 0x10)
 
     off = 64
 
@@ -86,6 +93,7 @@ def build_min_elf(path: Path) -> Path:
     symtab_off = place(symtab, 8)
     strtab_off = place(strtab, 1)
     rela_off = place(rela, 8)
+    rela_ro_off = place(rela_rodata, 8)
     shstr_off = place(shstrtab, 1)
     while off % 8:
         off += 1
@@ -102,13 +110,15 @@ def build_min_elf(path: Path) -> Path:
         struct.pack(SHDR, stroff(shstrtab, ".strtab"), SHT_STRTAB, 0, 0, strtab_off, len(strtab), 0, 0, 1, 0),
         struct.pack(SHDR, stroff(shstrtab, ".rela.text"), SHT_RELA, SHF_INFO_LINK, 0, rela_off, len(rela), 3, 1, 8, 24),
         struct.pack(SHDR, stroff(shstrtab, ".shstrtab"), SHT_STRTAB, 0, 0, shstr_off, len(shstrtab), 0, 0, 1, 0),
+        struct.pack(SHDR, stroff(shstrtab, ".rela.rodata"), SHT_RELA, SHF_INFO_LINK, 0, rela_ro_off, len(rela_rodata), 3, 2, 8, 24),
     ]
     e_ident = b"\x7fELF" + bytes([2, 1, 1, 0]) + b"\x00" * 8
     ehdr = struct.pack("<16sHHIQQQIHHHHHH", e_ident, 1, 62, 1, 0, 0, shoff, 0, 64, 0, 0, 64, len(shdrs), 6)
     buf = bytearray(shoff + 64 * len(shdrs))
     buf[0:64] = ehdr
     for data, o in ((text, text_off), (rodata, rodata_off), (symtab, symtab_off),
-                    (strtab, strtab_off), (rela, rela_off), (shstrtab, shstr_off)):
+                    (strtab, strtab_off), (rela, rela_off), (rela_rodata, rela_ro_off),
+                    (shstrtab, shstr_off)):
         buf[o:o + len(data)] = data
     buf[shoff:] = b"".join(shdrs)
     path.write_bytes(bytes(buf))
@@ -196,6 +206,7 @@ def test_unknown_view_is_rejected_with_the_list(elf_path: Path):
         assert f"  {v}:" in out
 
 
+@pytest.mark.smoke
 def test_hard_cap_truncation_is_explained(elf_path: Path):
     out = elf_analysis.build_report(elf_path, "summary", max_chars=400)
     assert len(out) <= 400
@@ -236,6 +247,7 @@ def mcp_module(monkeypatch, tmp_path: Path):
     return import_mcp_module(monkeypatch, tmp_path)
 
 
+@pytest.mark.smoke
 def test_analyze_file_forwards_view_target_limit(mcp_module, tmp_path: Path, monkeypatch):
     build_min_elf(tmp_path / "fw.elf")
     calls: dict = {}
@@ -256,3 +268,93 @@ def test_analyze_file_forwards_view_target_limit(mcp_module, tmp_path: Path, mon
     assert out.startswith("[注意]") and out.endswith("IMG")
     # 預設參數 → 沒有任何前綴（既有 PDF dispatch 測試依賴這一點）
     assert fn("shot.png") == "IMG"
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-26 靜態審核回修（六條）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.smoke
+def test_ingest_keeps_relocs_without_symbol(elf_path: Path):
+    """審核 #1：ingest 用 regex "." 當「全部」，symbol / caller 皆空的 R_*_RELATIVE 不會入庫。"""
+    doc = media.read_binary_for_ingest(str(elf_path))
+    detail = doc.split("【Relocations 逐筆】", 1)[1]
+    assert "R_X86_64_RELATIVE" in detail and "printf" in detail, detail[:600]
+    # 明確的「全列」語法：target="*"
+    out = media.read_elf(str(elf_path), view="relocs", target="*")
+    assert "R_X86_64_RELATIVE" in out and "printf" in out
+
+
+@pytest.mark.smoke
+def test_readelf_fallback_reports_command_failure_not_stripped(elf_path: Path, monkeypatch):
+    """審核 #2：fallback 吞掉 readelf 失敗 → -sW 失敗被報成 fully stripped、-rW 失敗報成沒有 relocation。"""
+    if not shutil.which("readelf"):
+        pytest.skip("binutils readelf 不存在，無法驗 fallback")
+    monkeypatch.setattr(elf_analysis, "_HAS_PYELFTOOLS", False)
+    real_run = elf_analysis.run_cmd
+
+    def flaky(cmd, timeout=30):
+        if cmd[0] == "readelf" and cmd[1] in ("-sW", "-rW"):
+            return None, "timeout"
+        return real_run(cmd, timeout)
+
+    monkeypatch.setattr(elf_analysis, "run_cmd", flaky)
+    elf_analysis._MODEL_CACHE.clear()
+    media._ELF_CACHE.clear()
+    out = media.read_elf(str(elf_path))
+    assert "fully stripped" not in out, out
+    assert "readelf -sW" in out and "timeout" in out
+    relocs = media.read_elf(str(elf_path), view="relocs")
+    assert "沒有 relocation section" not in relocs
+    assert "readelf -rW" in relocs and "timeout" in relocs
+
+
+def test_dwarf_kind_filter_without_regex_lists_all(tmp_path: Path):
+    """審核 #3：文件說 target="kind:func" / "kind:type" 可用，實作沒有 regex 就退回 CU summary。"""
+    gcc = shutil.which("gcc")
+    if not gcc:
+        pytest.skip("需要 gcc 產生帶 DWARF 的目標檔")
+    src = tmp_path / "t.c"
+    src.write_text(
+        "struct pt { int x; int y; };\n"
+        "int add(int a, int b) { return a + b; }\n"
+        "int main(void) { struct pt p = {1, 2}; return add(p.x, p.y); }\n"
+    )
+    obj = tmp_path / "t.o"
+    subprocess.run([gcc, "-g", "-O0", "-c", "-o", str(obj), str(src)], check=True, capture_output=True)
+    media.set_sandbox_root(str(tmp_path), allow_external=False)
+    elf_analysis._MODEL_CACHE.clear()
+    funcs = media.read_elf(str(obj), view="dwarf", target="kind:func")
+    assert "【DWARF 函式】" in funcs and " add " in funcs and " main " in funcs, funcs
+    assert "個 CU；函式 DIE" not in funcs
+    types = media.read_elf(str(obj), view="dwarf", target="kind:type")
+    assert "【DWARF 型別】" in types and "struct pt" in types and "【DWARF 函式】" not in types, types
+
+
+@pytest.mark.smoke
+def test_ingest_budget_spreads_across_views(elf_path: Path):
+    """審核 #4：入庫「完整長版」在全域上限前先被各段固定配額砍掉，後段資料永遠查不到。
+    超過上限時要各段依比例截斷並註明，每一段都要留下。"""
+    full = media.read_binary_for_ingest(str(elf_path))
+    assert "此段截斷" not in full                      # 沒超過上限就是真的完整
+    small = elf_analysis.build_ingest_document(elf_path, max_chars=3000)
+    assert len(small) <= 3000
+    for heading in ("【Key Facts】", "【Symbols / .symtab】", "【Relocations 逐筆】", "【字串】"):
+        assert heading in small, heading
+    assert "此段截斷" in small and "BIN_ELF_INGEST_MAX_CHARS" in small
+
+
+@pytest.mark.smoke
+def test_target_regex_is_guarded_against_redos(elf_path: Path):
+    """審核 #5：target 直接 re.compile 後套到大量、可能很長的字串；災難性回溯會卡住同步的 MCP server。"""
+    evil = "(a+)+$"
+    t0 = time.monotonic()
+    out = media.read_elf(str(elf_path), view="strings", target=evil)
+    assert time.monotonic() - t0 < 5, "target regex 沒有 ReDoS 防護"
+    assert "字面" in out, out                          # 明講改用字面比對，不是默默換掉
+
+
+def test_section_dump_limit_matches_mcp_schema():
+    """文件小錯：sections dump 上限寫 8192，但 analyze_file 的 limit schema 只允許到 5000。"""
+    assert elf_analysis._SECTION_DUMP_MAX <= config.BIN_ELF_VIEW_MAX_LIMIT
+
