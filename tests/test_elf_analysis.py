@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import re
 import shutil
 import struct
 import subprocess
@@ -120,6 +121,39 @@ def build_min_elf(path: Path) -> Path:
                     (strtab, strtab_off), (rela, rela_off), (rela_rodata, rela_ro_off),
                     (shstrtab, shstr_off)):
         buf[o:o + len(data)] = data
+    buf[shoff:] = b"".join(shdrs)
+    path.write_bytes(bytes(buf))
+    return path
+
+
+def build_arm_exec_elf(path: Path, n_words: int = 4000) -> Path:
+    """最小 ARM（EM_ARM）ET_EXEC：一個 LOAD segment @0x08000000，開頭像 Cortex-M 向量表
+    （word0 = 初始 SP、word1 = Thumb reset），後面塞 n_words 個同樣的 handler 位址——
+    模擬「.text 全是程式碼、只有前面一小段是向量表」的韌體。"""
+    words = [0x20001000, 0x08000101] + [0x08000101] * (n_words - 2)
+    data = struct.pack("<%dI" % len(words), *words)
+    shstrtab = b"\x00.text\x00.shstrtab\x00"
+    ehdr_size, phdr_size, shdr_size = 52, 32, 40
+    data_off = ehdr_size + phdr_size
+    shstr_off = data_off + len(data)
+    shoff = shstr_off + len(shstrtab)
+    while shoff % 4:
+        shoff += 1
+    e_ident = b"\x7fELF" + bytes([1, 1, 1, 0]) + b"\x00" * 8
+    ehdr = struct.pack("<16sHHIIIIIHHHHHH", e_ident, 2, 40, 1, 0x08000101, ehdr_size, shoff,
+                       0x05000200, ehdr_size, phdr_size, 1, shdr_size, 3, 2)
+    phdr = struct.pack("<IIIIIIII", 1, data_off, 0x08000000, 0x08000000, len(data), len(data), 5, 4)
+    SHDR = "<IIIIIIIIII"
+    shdrs = [
+        struct.pack(SHDR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        struct.pack(SHDR, 1, 1, 6, 0x08000000, data_off, len(data), 0, 0, 4, 0),
+        struct.pack(SHDR, 7, 3, 0, 0, shstr_off, len(shstrtab), 0, 0, 1, 0),
+    ]
+    buf = bytearray(shoff + shdr_size * len(shdrs))
+    buf[0:ehdr_size] = ehdr
+    buf[ehdr_size:ehdr_size + phdr_size] = phdr
+    buf[data_off:data_off + len(data)] = data
+    buf[shstr_off:shstr_off + len(shstrtab)] = shstrtab
     buf[shoff:] = b"".join(shdrs)
     path.write_bytes(bytes(buf))
     return path
@@ -309,6 +343,7 @@ def test_readelf_fallback_reports_command_failure_not_stripped(elf_path: Path, m
     assert "readelf -rW" in relocs and "timeout" in relocs
 
 
+@pytest.mark.smoke
 def test_dwarf_kind_filter_without_regex_lists_all(tmp_path: Path):
     """審核 #3：文件說 target="kind:func" / "kind:type" 可用，實作沒有 regex 就退回 CU summary。"""
     gcc = shutil.which("gcc")
@@ -354,7 +389,124 @@ def test_target_regex_is_guarded_against_redos(elf_path: Path):
     assert "字面" in out, out                          # 明講改用字面比對，不是默默換掉
 
 
+@pytest.mark.smoke
 def test_section_dump_limit_matches_mcp_schema():
     """文件小錯：sections dump 上限寫 8192，但 analyze_file 的 limit schema 只允許到 5000。"""
     assert elf_analysis._SECTION_DUMP_MAX <= config.BIN_ELF_VIEW_MAX_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-26 第三輪靜態審核回修
+# ---------------------------------------------------------------------------
+
+@pytest.mark.smoke
+def test_arm_vector_table_is_bounded(tmp_path: Path):
+    """審核三 #1：ingest 把 10**9 當 limit 傳給 memmap，向量表會把整個 LOAD segment 讀成 IRQ。"""
+    p = build_arm_exec_elf(tmp_path / "cm.elf", n_words=4000)
+    media.set_sandbox_root(str(tmp_path), allow_external=False)
+    elf_analysis._MODEL_CACHE.clear()
+    model = elf_analysis.load_model(p)
+    vt = elf_analysis.arm_vector_table(model, limit=10 ** 9)
+    assert vt is not None
+    assert len(vt["entries"]) <= elf_analysis._VECTOR_MAX_ENTRIES <= 512, len(vt["entries"])
+    doc = media.read_binary_for_ingest(str(p))
+    assert doc.count("IRQ") < 600, doc.count("IRQ")
+
+
+@pytest.mark.smoke
+def test_ingest_render_limits_are_bounded_by_cap(elf_path: Path, monkeypatch):
+    """審核三 #2：400K 只裁最終字串；各 view 先以無上限完整 render，中間資料可到數十 MB。
+    每個 view 的筆數上限必須從全域上限推出來（行預算），不能是 10**9。"""
+    seen: list = []
+    real_render = elf_analysis.render
+
+    def spy(model, view="summary", target="", limit=0, **kw):
+        seen.append((view, limit))
+        return real_render(model, view, target, limit, **kw)
+
+    monkeypatch.setattr(elf_analysis, "render", spy)
+    elf_analysis.build_ingest_document(elf_path)
+    assert seen
+    line_budget = config.BIN_ELF_INGEST_MAX_CHARS // elf_analysis._INGEST_CHARS_PER_LINE
+    for view, limit in seen:
+        assert 0 < limit <= line_budget, (view, limit)
+
+
+def test_dwarf_types_respect_type_cap(tmp_path: Path, monkeypatch):
+    """審核三 #2：_DWARF_TYPE_CAP 定義了卻沒用；limit 很大時所有型別都會被建出來。"""
+    gcc = shutil.which("gcc")
+    if not gcc:
+        pytest.skip("需要 gcc 產生帶 DWARF 的目標檔")
+    src = tmp_path / "t.c"
+    src.write_text(
+        "struct a1 { int x; }; struct b2 { int y; }; struct c3 { int z; };\n"
+        "int main(void) { struct a1 a = {1}; struct b2 b = {2}; struct c3 c = {3}; return a.x + b.y + c.z; }\n"
+    )
+    obj = tmp_path / "t.o"
+    subprocess.run([gcc, "-g", "-O0", "-c", "-o", str(obj), str(src)], check=True, capture_output=True)
+    elf_analysis._MODEL_CACHE.clear()
+    model = elf_analysis.load_model(obj)
+    monkeypatch.setattr(elf_analysis, "_DWARF_TYPE_CAP", 2)
+    types, truncated = elf_analysis.dwarf_types(model, re.compile(""), 10 ** 9)
+    assert len(types) <= 2 and truncated, (len(types), truncated)
+
+
+@pytest.mark.smoke
+def test_target_regex_rejects_optional_quantifier_bomb(elf_path: Path):
+    """審核三 #3：heuristic 只數 + * {，一串 a?a?a?…a 的可選量詞炸彈照樣過關，然後同步 re.search 卡死。"""
+    evil = "a?" * 25 + "a" * 25 + "X"
+    t0 = time.monotonic()
+    out = media.read_elf(str(elf_path), view="strings", target=evil)
+    assert time.monotonic() - t0 < 5, "target regex 沒有擋住可選量詞炸彈"
+    assert "字面" in out, out
+
+
+@pytest.mark.smoke
+def test_filter_deadline_is_checked_even_with_zero_matches(elf_path: Path, monkeypatch):
+    """審核三 #3：deadline 只在「匹配數」到 2000 時檢查，零匹配的篩選永遠不會停。"""
+    monkeypatch.setattr(elf_analysis, "_FILTER_TIME_BUDGET", 0.0)
+    out = media.read_elf(str(elf_path), view="symbols", target="zzz_no_such_symbol_zzz")
+    assert "時間預算" in out, out
+    out = media.read_elf(str(elf_path), view="relocs", target="zzz_no_such_symbol_zzz")
+    assert "時間預算" in out, out
+
+
+@pytest.mark.smoke
+def test_readelf_fallback_failure_propagates_to_memmap_sections_dwarf(elf_path: Path, monkeypatch):
+    """審核三 #4：failed 只被 symbols / relocs / dynamic 消費；-lW / -SW 失敗後 memmap 仍說
+    「沒有 LOAD」、sections 說「被 strip」、DWARF 說「沒有 debug section」——同一份輸出自相矛盾。"""
+    if not shutil.which("readelf"):
+        pytest.skip("binutils readelf 不存在，無法驗 fallback")
+    monkeypatch.setattr(elf_analysis, "_HAS_PYELFTOOLS", False)
+    real_run = elf_analysis.run_cmd
+
+    def flaky(cmd, timeout=30):
+        if cmd[0] == "readelf" and cmd[1] in ("-lW", "-SW"):
+            return None, "timeout"
+        return real_run(cmd, timeout)
+
+    monkeypatch.setattr(elf_analysis, "run_cmd", flaky)
+    elf_analysis._MODEL_CACHE.clear()
+    media._ELF_CACHE.clear()
+    # 斷言鎖的是「錯誤結論」那句原文；「讀取失敗（不能當成沒有…）」是正確的講法
+    memmap = media.read_elf(str(elf_path), view="memmap")
+    assert "REL 檔（.o / .ko）沒有 LOAD segment" not in memmap and "readelf -lW" in memmap, memmap
+    sections = media.read_elf(str(elf_path), view="sections")
+    assert "沒有 section header（可能被 strip 掉）" not in sections and "readelf -SW" in sections, sections
+    dwarf = media.read_elf(str(elf_path), view="dwarf")
+    assert "【DWARF】沒有 debug section" not in dwarf and "讀取失敗" in dwarf, dwarf
+    summary = media.read_elf(str(elf_path))
+    assert "DWARF    : absent" not in summary, summary
+
+
+@pytest.mark.smoke
+def test_bin_with_elf_magic_respects_max_chars(elf_path: Path, tmp_path: Path):
+    """審核三 #5：.bin 內容是 ELF 時，[BIN→ELF] 前綴加在已截成 25K 的報告前，且 max_chars 沒轉傳。"""
+    blob = tmp_path / "fw.bin"
+    blob.write_bytes(elf_path.read_bytes())
+    media._BIN_CACHE.clear()
+    out = media.read_binary(str(blob), max_chars=3000)
+    assert out.startswith("[BIN→ELF]") and len(out) <= 3000, len(out)
+    out2 = media.read_binary(str(blob))
+    assert len(out2) <= config.BIN_ELF_REPORT_MAX_CHARS, len(out2)
 

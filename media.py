@@ -239,9 +239,9 @@ def _truncate_elf_report(full_report: str, max_chars: int = BIN_ELF_REPORT_MAX_C
 
 
 def _build_elf_report(filepath: Path, view: str = "summary", target: str = "",
-                      limit: int = 0) -> str:
+                      limit: int = 0, max_chars: Optional[int] = None) -> str:
     """相容入口：ELF 報告（指定 view）。錯誤以 [ELF 錯誤] 字串回傳。"""
-    return elf_analysis.build_report(filepath, view=view, target=target, limit=limit)
+    return elf_analysis.build_report(filepath, view=view, target=target, limit=limit, max_chars=max_chars)
 
 
 def _elf_params_note(view: str, target: str, limit: int) -> str:
@@ -571,8 +571,13 @@ def read_binary(path: str, max_strings: int = 200, view: str = "summary", target
 
         # 自動偵測 ELF：若是 ELF 則切換到 ELF 解析（view / target / limit 生效）
         if header.startswith(b"\x7fELF"):
-            result = ("[BIN→ELF] 偵測到 ELF magic，自動切換 ELF 解析模式:\n\n"
-                      + _build_elf_report(p, view=view_key, target=target_key, limit=limit_key))
+            # 前綴也算在 max_chars 內：ELF 報告的 cap 要扣掉前綴長度，最終值才不會超過上限
+            prefix = "[BIN→ELF] 偵測到 ELF magic，自動切換 ELF 解析模式:\n\n"
+            body = _build_elf_report(
+                p, view=view_key, target=target_key, limit=limit_key,
+                max_chars=max(1000, int(max_chars) - len(prefix)),
+            )
+            result = prefix + body
             _cache_set(_BIN_CACHE, cache_key, result, _BIN_CACHE_MAX)
             return result
 

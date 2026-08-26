@@ -65,7 +65,7 @@ VIEW_HELP: Dict[str, str] = {
     "summary": "總覽（預設）：Key Facts、header、記憶體配置、sections、symbols、imports、relocs、DWARF、字串分類",
     "headers": "ELF header、全部 program headers、notes、.comment、.modinfo",
     "sections": "全部 section（含 flags / 所屬 segment）；target=section 名或 0x位址 → 該 section 的 hex dump + 字串 + symbols",
-    "memmap": "LOAD segment 的 LMA/VMA、section→segment、FLASH/RAM/.bss 估算、Cortex-M 向量表解讀",
+    "memmap": "LOAD segment 的 LMA/VMA、section→segment、FLASH/RAM/.bss 估算、Cortex-M 向量表解讀（limit = IRQ 向量數，上限 496）",
     "symbols": "完整 symbol 表（含 LOCAL / UND / size=0）；target=regex、'bind:LOCAL type:FUNC uart' 這類篩選、或 0x位址（查包含該位址的 symbol）",
     "imports": "未定義（外部）symbol 依 API 家族分類（.dynsym UND；.o/.ko 用 .symtab UND）與 relocation 引用次數",
     "relocs": "relocation：各 section 統計、被引用最多的 symbol；target=regex 列出項目與 caller（.o/.ko 的呼叫關係證據）；target=\"*\" 全部逐筆（含沒有 symbol 的 RELATIVE）",
@@ -84,14 +84,17 @@ _DISASM_MAX_INSTR = 1000
 _SECTION_DUMP_DEFAULT = 512
 _SECTION_DUMP_MAX = 4096         # 必須 ≤ BIN_ELF_VIEW_MAX_LIMIT（analyze_file 的 limit schema 上限）
 _RELOC_ENTRY_CAP = 20000      # 每個 relocation section 保留的項目數（統計仍算全部）
-_STRINGS_CAP = 300000         # 字串掃描上限（分類成本）
-_DWARF_FUNC_CAP = 50000
-_DWARF_TYPE_CAP = 2000
+_STRINGS_CAP = 100000         # 字串掃描上限（每條 ~200 B 記憶體；超過會在報告註明）
+_DWARF_FUNC_CAP = 30000
+_DWARF_TYPE_CAP = 2000         # dwarf_types 的絕對上限（不管 limit 給多大）
+_DWARF_TYPE_MEMBERS_CAP = 256  # 每個型別保留的成員數
+_VECTOR_MAX_ENTRIES = 512      # Cortex-M 向量表：16 個核心例外 + 最多 496 個 IRQ
 _STRING_PREVIEW_CHARS = 120
 _REGEX_MAX_LEN = 200             # target regex 長度上限（更長就當字面）
-_REGEX_SUBJECT_MAX = 2000        # regex 只看每個字串 / 名稱的前 N 個字元
+_REGEX_SUBJECT_MAX = 500         # regex 只看每個字串 / 名稱的前 N 個字元（單次比對的回溯上界）
 _FILTER_TIME_BUDGET = 20.0       # 單一 view 的篩選時間預算（秒），超過就截斷並明講
-_INGEST_UNBOUNDED = 10 ** 9      # ingest 各 view 不設筆數配額，只受全域上限的比例分配
+_INGEST_CHARS_PER_LINE = 80      # ingest 行預算：每個 view 最多 cap // 80 行（渲染前就有界，不是事後裁）
+_INGEST_MIN_LINES = 200
 
 
 # ---------------------------------------------------------------------------
@@ -1225,7 +1228,8 @@ def _load_readelf(model: ElfModel) -> None:
 
     dbg = [s["name"] for s in model.sections if s["name"].startswith((".debug", ".zdebug"))]
     has_info = any(n in (".debug_info", ".zdebug_info") for n in dbg)
-    model.dwarf = {"present": bool(dbg), "debug_info": has_info, "sections": dbg}
+    model.dwarf = {"present": bool(dbg), "debug_info": has_info, "sections": dbg,
+                   "unknown": "sections" in model.failed}
     model.caps = {
         "dwarf_cus": has_info, "dwarf_functions": has_info,
         "dwarf_lines": has_info, "dwarf_types": False,
@@ -2067,6 +2071,7 @@ def dwarf_types(model: ElfModel, pattern: "re.Pattern[str]", limit: int) -> Tupl
     """符合 pattern 的 struct / union / class / enum / typedef（含成員）。回傳 (結果, 是否截斷)。"""
     if not model.caps.get("dwarf_types") or model.parser != "pyelftools":
         return [], False
+    limit = max(1, min(int(limit), _DWARF_TYPE_CAP))   # 不管呼叫端給多大，型別數有絕對上限
     results: Dict[Tuple[str, str], Dict] = {}
     truncated = False
     try:
@@ -2117,6 +2122,9 @@ def dwarf_types(model: ElfModel, pattern: "re.Pattern[str]", limit: int) -> Tupl
                     else:
                         try:
                             for ch in die.iter_children():
+                                if len(entry["members"]) >= _DWARF_TYPE_MEMBERS_CAP:
+                                    entry["members_truncated"] = True
+                                    break
                                 ca = ch.attributes
                                 if kind == "enum" and ch.tag == "DW_TAG_enumerator":
                                     cv = ca.get("DW_AT_const_value")
@@ -2614,10 +2622,12 @@ def arm_vector_table(model: ElfModel, limit: int = 48) -> Optional[Dict]:
         return None
     base: Optional[int] = None
     source = ""
+    max_words = _VECTOR_MAX_ENTRIES
     for name in _VECTOR_SECTION_NAMES:
         sec = model.section_by_name(name)
         if sec is not None and sec["size"] >= 8 and not sec["nobits"]:
             base, source = sec["addr"], f"section {name}"
+            max_words = min(max_words, sec["size"] // 4)   # 有明確的向量 section 就以它的大小為準
             break
     if base is None:
         loads = sorted((s for s in _load_segments(model) if s["filesz"] >= 8), key=lambda s: s["vaddr"])
@@ -2629,7 +2639,9 @@ def arm_vector_table(model: ElfModel, limit: int = 48) -> Optional[Dict]:
     if loc is None:
         return None
     off, avail = loc
-    count = min(16 + max(0, limit), avail // 4)
+    # limit 只是「想看幾個 IRQ」；真正的上界是 section 大小 / Cortex-M 架構上限，
+    # 否則 ingest 這類大 limit 會把整個 .text 讀成幾千個假 IRQ。
+    count = min(16 + max(0, limit), avail // 4, max_words)
     if count < 2:
         return None
     data = read_file_bytes(model, off, count * 4)
@@ -2674,31 +2686,129 @@ def _clip(s: str, n: int = _STRING_PREVIEW_CHARS) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
 
-def _is_redos_risk(pattern: str) -> bool:
-    """同 agent_tools.ToolExecutor._is_redos_risk 的判斷，再加兩條：群組後接量詞、無界量詞超過 2 個。
+def _regex_is_safe(pattern: str) -> Optional[str]:
+    """target regex 是否落在安全子集；回傳 None = 安全，否則是拒絕原因（人話）。
 
-    Python 的 re 沒有 timeout，也不釋放 GIL；一個災難性回溯的 target 會把同步的 MCP server
-    整個卡住。所以只允許保守的子集，其餘一律改字面比對（並在輸出明講）。
+    Python 的 re 沒有 timeout、也不釋放 GIL：一個災難性回溯的 target 會把同步的 MCP server
+    整個卡住，而任何「看起來危險」的 heuristic 都能被繞過（例如 a?a?a?…aaa 的可選量詞
+    炸彈完全沒有 + * { 也沒有群組）。所以改成正面表列：逐字元 tokenize，只允許
+      - 字面、`.`、字元類別 `[...]`、錨點 `^ $ \b`、頂層或群組內的 `|`
+      - 群組 `(...)` / `(?:...)` / `(?P<n>...)`，但群組後**不能接任何量詞**
+      - 單一 atom 的 `* +`（合計 ≤ 2）與 `?`（合計 ≤ 6）；可加 lazy `?`
+      - 不接受 `{n,m}`、backreference、lookaround、inline flag
+    搭配比對主體只看前 _REGEX_SUBJECT_MAX 字元，單次 re.search 的回溯就有上界
+    （約 500² × 2^6），不再依賴事後的 deadline 去救。
     """
     if len(pattern) > _REGEX_MAX_LEN:
-        return True
-    if re.search(r"\([^)]*[+*][^)]*\)[+*{]", pattern):      # (a+)+ / (a*)* / (a+){2,}
-        return True
-    if re.search(r"\)[+*{]", pattern):                       # 任何群組後接無界量詞（含 (a|aa)+）
-        return True
-    if re.search(r"\.\*.*\.\*", pattern) or re.search(r"\.\+.*\.\+", pattern):
-        return True
-    unescaped = re.sub(r"\\.", "", pattern)
-    if len(re.findall(r"[+*]|\{\d*,\}", unescaped)) > 2:      # 無界量詞 > 2 個（.*x.*y.* 之類）
-        return True
-    return False
+        return f"超過 {_REGEX_MAX_LEN} 字元"
+    n = len(pattern)
+    i = 0
+    depth = 0
+    unbounded = 0
+    optional = 0
+    prev = ""  # atom / anchor / alt / open / group_close / quant / ""
+    while i < n:
+        c = pattern[i]
+        if c == "\\":
+            if i + 1 >= n:
+                return "結尾的反斜線"
+            nxt = pattern[i + 1]
+            if nxt.isdigit():
+                return "backreference（\\1）"
+            prev = "anchor" if nxt in "bBAZz" else "atom"
+            i += 2
+            continue
+        if c == "[":
+            j = i + 1
+            if j < n and pattern[j] == "^":
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            while j < n and pattern[j] != "]":
+                if pattern[j] == "\\":
+                    j += 1
+                j += 1
+            if j >= n:
+                return "字元類別沒有結尾 ]"
+            prev = "atom"
+            i = j + 1
+            continue
+        if c == "(":
+            if pattern.startswith("(?", i):
+                if pattern.startswith(("(?=", "(?!", "(?<=", "(?<!"), i):
+                    return "lookaround"
+                if pattern.startswith("(?P=", i):
+                    return "具名 backreference"
+                if pattern.startswith("(?:", i):
+                    i += 3
+                elif pattern.startswith("(?P<", i):
+                    close = pattern.find(">", i)
+                    if close < 0:
+                        return "具名群組沒有結尾 >"
+                    i = close + 1
+                else:
+                    return "不支援的 (? 語法（inline flag 等）"
+            else:
+                i += 1
+            depth += 1
+            prev = "open"
+            continue
+        if c == ")":
+            if depth == 0:
+                return "多餘的 )"
+            depth -= 1
+            prev = "group_close"
+            i += 1
+            continue
+        if c in "*+":
+            if prev == "group_close":
+                return "群組後接量詞"
+            if prev in ("quant", "open", "alt", ""):
+                return "量詞前面沒有可重複的東西"
+            unbounded += 1
+            if unbounded > 2:
+                return "無界量詞（* / +）超過 2 個"
+            prev = "quant"
+            i += 1
+            if i < n and pattern[i] == "?":   # lazy
+                i += 1
+            continue
+        if c == "?":
+            if prev == "group_close":
+                return "群組後接量詞"
+            if prev in ("quant", "open", "alt", ""):
+                return "量詞前面沒有可重複的東西"
+            optional += 1
+            if optional > 6:
+                return "可選量詞（?）超過 6 個"
+            prev = "quant"
+            i += 1
+            if i < n and pattern[i] == "?":   # lazy
+                i += 1
+            continue
+        if c == "{":
+            return "不支援 {n,m} 量詞"
+        if c == "|":
+            prev = "alt"
+            i += 1
+            continue
+        if c in "^$":
+            prev = "anchor"
+            i += 1
+            continue
+        prev = "atom"
+        i += 1
+    if depth != 0:
+        return "括號不對稱"
+    return None
 
 
 def safe_regex(text: str) -> Tuple["re.Pattern[str]", Optional[str]]:
-    """target → (compiled, note)。有 ReDoS 風險或不合法就退回字面比對，note 說明原因。"""
-    if _is_redos_risk(text):
+    """target → (compiled, note)。不在安全子集或不合法就退回字面比對，note 說明原因。"""
+    reason = _regex_is_safe(text)
+    if reason:
         return re.compile(re.escape(text), re.I), (
-            f"target {text!r} 的樣式有災難性回溯風險（群組後接量詞 / 無界量詞過多 / 過長），已改用字面比對"
+            f"target {text!r} 不在安全 regex 子集內（{reason}），已改用字面比對"
         )
     try:
         return re.compile(text, re.I), None
@@ -2715,10 +2825,15 @@ def _rx(rx: "re.Pattern[str]", subject: str) -> bool:
 
 
 class _Deadline:
-    """篩選迴圈的時間預算：超過就停下來並讓報告明講「結果不完整」。"""
+    """篩選迴圈的時間預算：超過就停下來並讓報告明講「結果不完整」。
 
-    def __init__(self, seconds: float = _FILTER_TIME_BUDGET):
-        self.t_end = time.monotonic() + seconds
+    這不是硬 timeout（單次 re.search 無法中斷）；單次比對的上界靠 _regex_is_safe +
+    _REGEX_SUBJECT_MAX 保證，這裡只負責「很多筆加起來太久」的情況，每一筆都檢查。
+    """
+
+    def __init__(self, seconds: Optional[float] = None):
+        self.seconds = _FILTER_TIME_BUDGET if seconds is None else seconds
+        self.t_end = time.monotonic() + self.seconds
         self.hit = False
 
     def expired(self) -> bool:
@@ -2727,7 +2842,7 @@ class _Deadline:
         return self.hit
 
     def note(self) -> str:
-        return f"  [WARN] 篩選超過 {_FILTER_TIME_BUDGET:.0f} 秒時間預算已中止，以上結果不完整；請用更窄的 target"
+        return f"  [WARN] 篩選超過 {self.seconds:.0f} 秒時間預算已中止，以上結果不完整；請用更窄的 target"
 
 
 def _parse_filter(target: str, keys: Tuple[str, ...]) -> Tuple[Dict[str, str], Optional["re.Pattern[str]"], Optional[int], str, Optional[str]]:
@@ -2906,7 +3021,9 @@ def _key_facts(model: ElfModel) -> List[str]:
         out.append("  Relocs   : none")
 
     dw = model.dwarf
-    if dw.get("debug_info"):
+    if dw.get("unknown"):
+        dtxt = f"unknown（section 表讀取失敗：{model.failed.get('sections', '')}）"
+    elif dw.get("debug_info"):
         cus = dwarf_cus(model)
         dtxt = f"present ({len(cus)} CU" + (")" if cus else "; .debug_info 存在但解析不到 CU)")
         if model._lazy.get("dwarf_error"):
@@ -2920,7 +3037,9 @@ def _key_facts(model: ElfModel) -> List[str]:
     if model.build_id:
         out.append(f"  Build-id : {model.build_id}")
 
-    if _load_segments(model):
+    if "segments" in model.failed:
+        out.append(f"  Memory   : unknown（program header 讀取失敗：{model.failed['segments']}）")
+    elif _load_segments(model):
         acc = memory_accounting(model)
         out.append(
             f"  Memory   : image(LOAD filesz) {_fmt_bytes(acc['image'])}；"
@@ -2933,6 +3052,8 @@ def _key_facts(model: ElfModel) -> List[str]:
 def _elf_header_block(model: ElfModel) -> List[str]:
     h = model.header
     if not h:
+        if "header" in model.failed:
+            return ["", f"【ELF Header】讀取失敗：{model.failed['header']}"]
         return []
     out = ["", "【ELF Header】"]
     out.append(f"  Class: ELF{h.get('class')}")
@@ -2953,6 +3074,8 @@ def _elf_header_block(model: ElfModel) -> List[str]:
 
 def _segments_table(model: ElfModel, max_rows: Optional[int] = None) -> List[str]:
     if not model.segments:
+        if "segments" in model.failed:
+            return ["", f"【Program Headers】讀取失敗：{model.failed['segments']}"]
         return []
     w = model.addr_width
     out = ["", "【Program Headers】" + (f"（{len(model.segments)} 個）" if max_rows is None else "")]
@@ -3149,6 +3272,8 @@ def _reloc_ref_counts(model: ElfModel) -> Counter:
 def _imports_block(model: ElfModel, per_cat: int = 8, title: bool = True) -> List[str]:
     table, imports = _collect_imports(model)
     if not imports:
+        if "symbols" in model.failed:
+            return ["", f"【Imports】symbol table 讀取失敗：{model.failed['symbols']}（無法判斷外部參照）"]
         return []
     refs = _reloc_ref_counts(model)
     by_family = categorize_imports(sorted(set(imports)))
@@ -3242,6 +3367,8 @@ def _relocs_summary(model: ElfModel, top: int = 12) -> List[str]:
 
 def _dwarf_summary(model: ElfModel, max_cus: int = 20) -> List[str]:
     dw = model.dwarf
+    if dw.get("unknown"):
+        return ["", f"【DWARF】無法判斷有沒有 debug section：section 表讀取失敗（{model.failed.get('sections', '')}）"]
     if not dw.get("present"):
         return []
     out: List[str] = [""]
@@ -3332,6 +3459,10 @@ def _footer(model: ElfModel) -> List[str]:
 
 def _memmap_lines(model: ElfModel, limit: int, compact: bool) -> List[str]:
     out: List[str] = []
+    if "segments" in model.failed:
+        out.append("")
+        out.append(f"【記憶體配置】program header 讀取失敗：{model.failed['segments']}（不能當成沒有 LOAD segment）")
+        return out
     loads = _load_segments(model)
     if model.is_rel or not loads:
         usage = section_usage(model)
@@ -3402,17 +3533,16 @@ def _memmap_lines(model: ElfModel, limit: int, compact: bool) -> List[str]:
 # 各 view
 # ---------------------------------------------------------------------------
 
-def _limit_for(view: str, limit: int) -> int:
-    """limit=0 → 該 view 預設；一般上限 BIN_ELF_VIEW_MAX_LIMIT；_INGEST_UNBOUNDED 表示 ingest 不設配額。"""
+def _limit_for(view: str, limit: int, hard_max: Optional[int] = None) -> int:
+    """limit=0 → 該 view 預設；上限 = hard_max（ingest 的行預算）或 BIN_ELF_VIEW_MAX_LIMIT。"""
     default = _VIEW_DEFAULT_LIMIT.get(view, 200)
+    ceiling = int(hard_max) if hard_max else BIN_ELF_VIEW_MAX_LIMIT
     if not limit or limit <= 0:
-        return default
-    if limit >= _INGEST_UNBOUNDED:
-        return _INGEST_UNBOUNDED
-    return min(int(limit), BIN_ELF_VIEW_MAX_LIMIT)
+        return min(default, ceiling)
+    return min(int(limit), ceiling)
 
 
-def view_summary(model: ElfModel, limit: int = 0, footer: bool = True) -> List[str]:
+def view_summary(model: ElfModel, limit: int = 0, footer: bool = True, hard_max: Optional[int] = None) -> List[str]:
     blocks = [
         lambda: _key_facts(model),
         lambda: _elf_header_block(model),
@@ -3445,6 +3575,8 @@ def view_summary(model: ElfModel, limit: int = 0, footer: bool = True) -> List[s
 
 def _summary_sections(model: ElfModel, max_sections: int) -> List[str]:
     if not model.sections:
+        if "sections" in model.failed:
+            return ["", f"【Sections】section 表讀取失敗：{model.failed['sections']}（不能當成沒有 section）"]
         return []
     picked = _important_sections(model)[:max_sections]
     out = ["", f"【Sections】({len(picked)}/{len(model.sections)} 個；view=\"sections\" 看全部)"]
@@ -3452,7 +3584,7 @@ def _summary_sections(model: ElfModel, max_sections: int) -> List[str]:
     return out
 
 
-def view_headers(model: ElfModel, limit: int = 0) -> List[str]:
+def view_headers(model: ElfModel, limit: int = 0, hard_max: Optional[int] = None) -> List[str]:
     out = _hdr_lines(model)
     out.extend(_key_facts(model))
     out.extend(_elf_header_block(model))
@@ -3478,16 +3610,19 @@ def _hexdump(data: bytes, base: int, width: int = 16) -> List[str]:
     return lines
 
 
-def view_sections(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
+def view_sections(model: ElfModel, target: str = "", limit: int = 0, hard_max: Optional[int] = None) -> List[str]:
     out = _hdr_lines(model)
     if not model.sections:
-        out.append("沒有 section header（可能被 strip 掉）")
+        if "sections" in model.failed:
+            out.append(f"【Sections】section 表讀取失敗：{model.failed['sections']}（不能當成沒有 section）")
+        else:
+            out.append("沒有 section header（可能被 strip 掉）")
         return out
     fields, rx, addr, text, note = _parse_filter(target, ("dump",))
     if note:
         out.append(f"[注意] {note}")
     if not text:
-        n = _limit_for("sections", limit)
+        n = _limit_for("sections", limit, hard_max)
         out.append("")
         out.append(f"【Sections（全部 {len(model.sections)} 個）】flags: W=write A=alloc X=exec M=merge S=strings I=info L=link-order G=group T=TLS C=compressed")
         out.extend(_sections_table(model, model.sections[:n]))
@@ -3559,9 +3694,9 @@ def view_sections(model: ElfModel, target: str = "", limit: int = 0) -> List[str
     return out
 
 
-def view_memmap(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
+def view_memmap(model: ElfModel, target: str = "", limit: int = 0, hard_max: Optional[int] = None) -> List[str]:
     out = _hdr_lines(model)
-    out.extend(_memmap_lines(model, _limit_for("memmap", limit), compact=False))
+    out.extend(_memmap_lines(model, _limit_for("memmap", limit, hard_max), compact=False))
     loads = _load_segments(model)
     if loads and not model.is_rel:
         out.append("")
@@ -3581,7 +3716,7 @@ def view_memmap(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
     return out
 
 
-def view_symbols(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
+def view_symbols(model: ElfModel, target: str = "", limit: int = 0, hard_max: Optional[int] = None) -> List[str]:
     out = _hdr_lines(model)
     if not model.has_symbols():
         out.append("")
@@ -3593,7 +3728,7 @@ def view_symbols(model: ElfModel, target: str = "", limit: int = 0) -> List[str]
     fields, rx, addr, text, note = _parse_filter(target, ("bind", "type", "ndx", "section", "table", "vis"))
     if note:
         out.append(f"[注意] {note}")
-    n = _limit_for("symbols", limit)
+    n = _limit_for("symbols", limit, hard_max)
     deadline = _Deadline()
 
     if addr is not None:
@@ -3638,6 +3773,8 @@ def view_symbols(model: ElfModel, target: str = "", limit: int = 0) -> List[str]
         st = symtab_stats(syms)
         picked = []
         for s in syms:
+            if deadline.expired():
+                break
             if fields.get("bind") and s["bind"].upper() != fields["bind"].upper():
                 continue
             if fields.get("type") and s["type"].upper() != fields["type"].upper():
@@ -3653,8 +3790,6 @@ def view_symbols(model: ElfModel, target: str = "", limit: int = 0) -> List[str]
             if not s["name"] and (rx is not None or not fields):
                 continue
             picked.append(s)
-            if len(picked) % 2000 == 0 and deadline.expired():
-                break
         picked.sort(key=lambda s: (s["ndx"] == "UND", s["value"], s["name"]))
         out.append("")
         out.append(
@@ -3662,6 +3797,9 @@ def view_symbols(model: ElfModel, target: str = "", limit: int = 0) -> List[str]
             f"LOCAL {st['func_local']}；OBJECT {st['object']}；UND {st['und']}；size=0 {st['zero_size']}"
             + (f"；mapping {st['mapping']}" if st["mapping"] else "") + f"）；符合篩選 {len(picked)}，顯示 {min(budget, len(picked))}"
         )
+        if deadline.hit:
+            out.append(deadline.note())
+            break
         if not picked:
             continue
         demangle_names(model, [s["name"] for s in picked[:budget]])
@@ -3670,8 +3808,6 @@ def view_symbols(model: ElfModel, target: str = "", limit: int = 0) -> List[str]
             out.append(_symbol_row(model, s))
         if len(picked) > budget:
             out.append(f"  ... +{len(picked) - budget}（limit=N 或 target 縮小範圍；上限 {BIN_ELF_VIEW_MAX_LIMIT}）")
-        if deadline.hit:
-            out.append(deadline.note())
         budget = max(0, budget - min(budget, len(picked)))
         if budget == 0 and tname != tables[-1]:
             out.append("  （筆數預算已用完，其餘 table 略；用 target=\"table:.dynsym\" 指定）")
@@ -3681,14 +3817,17 @@ def view_symbols(model: ElfModel, target: str = "", limit: int = 0) -> List[str]
     return out
 
 
-def view_imports(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
+def view_imports(model: ElfModel, target: str = "", limit: int = 0, hard_max: Optional[int] = None) -> List[str]:
     out = _hdr_lines(model)
     table, imports = _collect_imports(model)
     if not imports:
         out.append("")
-        out.append("【Imports】沒有未定義（UND）symbol：靜態連結 / bare-metal 韌體，或完全 stripped。")
+        if "symbols" in model.failed:
+            out.append(f"【Imports】symbol table 讀取失敗：{model.failed['symbols']}（無法判斷外部參照）")
+        else:
+            out.append("【Imports】沒有未定義（UND）symbol：靜態連結 / bare-metal 韌體，或完全 stripped。")
         return out
-    n = _limit_for("imports", limit)
+    n = _limit_for("imports", limit, hard_max)
     _fields, rx, _addr, _text, note = _parse_filter(target, ())
     if note:
         out.append(f"[注意] {note}")
@@ -3717,7 +3856,7 @@ def view_imports(model: ElfModel, target: str = "", limit: int = 0) -> List[str]
     return out
 
 
-def view_relocs(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
+def view_relocs(model: ElfModel, target: str = "", limit: int = 0, hard_max: Optional[int] = None) -> List[str]:
     out = _hdr_lines(model)
     if not model.relocs:
         out.append("")
@@ -3729,7 +3868,7 @@ def view_relocs(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
     fields, rx, addr, text, note = _parse_filter(target, ("section", "type"))
     if note:
         out.append(f"[注意] {note}")
-    n = _limit_for("relocs", limit)
+    n = _limit_for("relocs", limit, hard_max)
     list_all = (text == "*")
     if not text and not fields:
         out.extend(_relocs_summary(model, top=30))
@@ -3747,6 +3886,8 @@ def view_relocs(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
             continue
         rows: List[str] = []
         for e in r["entries"]:
+            if deadline.expired():
+                break
             if fields.get("type") and e["type"].upper() != fields["type"].upper():
                 continue
             caller = _reloc_caller(model, r["applies_to"], e["offset"]) if model.is_rel else ""
@@ -3756,8 +3897,6 @@ def view_relocs(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
                 if rx is not None and not (_rx(rx, e["sym"] or "") or (caller and _rx(rx, caller)) or _rx(rx, e["type"])):
                     continue
             matched += 1
-            if matched % 2000 == 0 and deadline.expired():
-                break
             if shown >= n:
                 continue
             add = ""
@@ -3769,6 +3908,8 @@ def view_relocs(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
         if rows:
             out.append(f"  -- {r['section']}（{r['count']:,} 筆）")
             out.extend(rows)
+        if deadline.hit:
+            break
     if matched == 0:
         out.append("  沒有符合的項目")
     elif matched > shown:
@@ -3782,7 +3923,7 @@ def view_relocs(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
     return out
 
 
-def view_dynamic(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
+def view_dynamic(model: ElfModel, target: str = "", limit: int = 0, hard_max: Optional[int] = None) -> List[str]:
     out = _hdr_lines(model)
     if not model.dynamic:
         out.append("")
@@ -3792,7 +3933,7 @@ def view_dynamic(model: ElfModel, target: str = "", limit: int = 0) -> List[str]
             out.append("【.dynamic】沒有 .dynamic section：靜態連結 / bare-metal 韌體 / REL 檔（不是錯誤）")
         return out
     out.extend(_dynamic_block(model)[:-1])
-    n = _limit_for("dynamic", limit)
+    n = _limit_for("dynamic", limit, hard_max)
     tags = model.dynamic.get("tags", [])
     _fields, rx, _addr, _text, note = _parse_filter(target, ())
     if note:
@@ -3808,10 +3949,13 @@ def view_dynamic(model: ElfModel, target: str = "", limit: int = 0) -> List[str]
     return out
 
 
-def view_dwarf(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
+def view_dwarf(model: ElfModel, target: str = "", limit: int = 0, hard_max: Optional[int] = None) -> List[str]:
     out = _hdr_lines(model)
     dw = model.dwarf
     out.append("")
+    if dw.get("unknown"):
+        out.append(f"【DWARF】無法判斷有沒有 debug section：section 表讀取失敗（{model.failed.get('sections', '')}）")
+        return out
     if not dw.get("present"):
         out.append("【DWARF】沒有 debug section（stripped，或編譯時沒加 -g）。symbol 層資訊請用 view=\"symbols\"。")
         return out
@@ -3821,7 +3965,7 @@ def view_dwarf(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
     fields, rx, addr, text, note = _parse_filter(target, ("kind", "cu"))
     if note:
         out.append(f"[注意] {note}")
-    n = _limit_for("dwarf", limit)
+    n = _limit_for("dwarf", limit, hard_max)
     kind = fields.get("kind", "").lower()
     if kind and kind not in ("func", "function", "functions", "type", "types"):
         out.append(f"【DWARF】不支援的 kind={kind!r}（可用 kind:func / kind:type）")
@@ -3898,7 +4042,11 @@ def view_dwarf(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
             types, truncated = dwarf_types(model, rx, n if limit else min(n, 50))
             out.append("")
             out.append(f"【DWARF 型別】符合 {text!r} 共 {len(types)} 個" + ("（已達上限）" if truncated else ""))
-            for t in types:
+            line_start = len(out)
+            for ti, t in enumerate(types):
+                if len(out) - line_start >= n:          # 型別區塊以 limit 當行預算（每個型別可能幾十行）
+                    out.append(f"  ... 其餘 {len(types) - ti} 個型別未列（limit=N 行預算；縮小 target）")
+                    break
                 head = f"  {t['kind']} {t['name']}"
                 if t["size"] is not None:
                     head += f" ({t['size']} bytes)"
@@ -3917,8 +4065,8 @@ def view_dwarf(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
                 else:
                     for m in t["members"][:80]:
                         out.append(f"      {m['offset']:<8} {m['name']:<24} : {m['type']}{m['bits']}")
-                    if len(t["members"]) > 80:
-                        out.append(f"      … +{len(t['members']) - 80} 個成員")
+                    if len(t["members"]) > 80 or t.get("members_truncated"):
+                        out.append(f"      … +{max(0, len(t['members']) - 80)} 個成員" + ("（成員數超過保留上限）" if t.get("members_truncated") else ""))
         elif kind:
             out.append("")
             out.append("【DWARF 型別】這條解析路徑沒有型別能力（需要 pyelftools）")
@@ -3927,19 +4075,19 @@ def view_dwarf(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
     return out
 
 
-def view_disasm(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
+def view_disasm(model: ElfModel, target: str = "", limit: int = 0, hard_max: Optional[int] = None) -> List[str]:
     out = _hdr_lines(model)
     out.append("")
     out.append("【反組譯】")
-    _ok, lines = disassemble(model, target, _limit_for("disasm", limit))
+    _ok, lines = disassemble(model, target, _limit_for("disasm", limit, hard_max))
     out.extend(lines)
     return out
 
 
-def view_strings(model: ElfModel, target: str = "", limit: int = 0) -> List[str]:
+def view_strings(model: ElfModel, target: str = "", limit: int = 0, hard_max: Optional[int] = None) -> List[str]:
     out = _hdr_lines(model)
     items = model_strings(model)
-    n = _limit_for("strings", limit)
+    n = _limit_for("strings", limit, hard_max)
     fields, rx, _addr, text, note = _parse_filter(target, ("cat", "section", "min", "enc"))
     if note:
         out.append(f"[注意] {note}")
@@ -3964,10 +4112,10 @@ def view_strings(model: ElfModel, target: str = "", limit: int = 0) -> List[str]
     if rx is not None:
         matched: List[Dict] = []
         for i, it in enumerate(picked):
+            if i % 256 == 0 and deadline.expired():
+                break
             if _rx(rx, it["text"]):
                 matched.append(it)
-            if i % 2000 == 1999 and deadline.expired():
-                break
         picked = matched
 
     out.append("")
@@ -4012,7 +4160,8 @@ def _cap(text: str, max_chars: int, view: str) -> str:
     return text[: max(0, max_chars - len(note))] + note
 
 
-def render(model: ElfModel, view: str = "summary", target: str = "", limit: int = 0) -> str:
+def render(model: ElfModel, view: str = "summary", target: str = "", limit: int = 0,
+           hard_max: Optional[int] = None) -> str:
     view = (view or "summary").strip().lower()
     target = (target or "").strip()
     try:
@@ -4020,27 +4169,27 @@ def render(model: ElfModel, view: str = "summary", target: str = "", limit: int 
     except (TypeError, ValueError):
         limit = 0
     if view == "summary":
-        lines = view_summary(model, limit)
+        lines = view_summary(model, limit, hard_max=hard_max)
     elif view == "headers":
-        lines = view_headers(model, limit)
+        lines = view_headers(model, limit, hard_max)
     elif view == "sections":
-        lines = view_sections(model, target, limit)
+        lines = view_sections(model, target, limit, hard_max)
     elif view == "memmap":
-        lines = view_memmap(model, target, limit)
+        lines = view_memmap(model, target, limit, hard_max)
     elif view == "symbols":
-        lines = view_symbols(model, target, limit)
+        lines = view_symbols(model, target, limit, hard_max)
     elif view == "imports":
-        lines = view_imports(model, target, limit)
+        lines = view_imports(model, target, limit, hard_max)
     elif view == "relocs":
-        lines = view_relocs(model, target, limit)
+        lines = view_relocs(model, target, limit, hard_max)
     elif view == "dynamic":
-        lines = view_dynamic(model, target, limit)
+        lines = view_dynamic(model, target, limit, hard_max)
     elif view == "dwarf":
-        lines = view_dwarf(model, target, limit)
+        lines = view_dwarf(model, target, limit, hard_max)
     elif view == "disasm":
-        lines = view_disasm(model, target, limit)
+        lines = view_disasm(model, target, limit, hard_max)
     elif view == "strings":
-        lines = view_strings(model, target, limit)
+        lines = view_strings(model, target, limit, hard_max)
     else:
         raise ValueError(view)
     return "\n".join(lines)
@@ -4118,12 +4267,16 @@ def build_ingest_document(path, max_chars: Optional[int] = None) -> str:
     """ingest_document 用：多視角合併的長版報告（RAG 會把 【…】 標題切成章節）。
 
     analyze_file 的 summary 受 25K hard cap，入庫不該受同一個限制——KB 的價值就是
-    能把完整 symbol / 字串 / DWARF / relocation 存下來給之後查。這裡每個 view 不設筆數
-    配額（_INGEST_UNBOUNDED），整份再以 BIN_ELF_INGEST_MAX_CHARS 為上限：沒超過就是真的
-    完整；超過時各段依比例截斷並各自註明（見 _fit_ingest_parts），不會有整段消失。
+    能把完整 symbol / 字串 / DWARF / relocation 存下來給之後查。每個 view 的筆數上限是
+    「全域上限 ÷ 每行字元」的行預算（產生階段就有界，中間資料 O(cap)），整份再以
+    BIN_ELF_INGEST_MAX_CHARS 為上限：沒超過就是真的完整；超過時各段依比例截斷並各自
+    註明（見 _fit_ingest_parts），不會有整段消失。
     """
     model = load_model(Path(path))
     cap = max_chars or BIN_ELF_INGEST_MAX_CHARS
+    # 每個 view 的筆數上限從全域上限推出來（行預算），渲染前就有界；400K / 80 ≈ 5000 行。
+    # 400K 字元本來就裝不下更多行，所以這不是「配額」，是把上限提前到產生階段。
+    per_view = max(_INGEST_MIN_LINES, cap // _INGEST_CHARS_PER_LINE)
     hdr = _hdr_lines(model)
     parts: List[Tuple[str, str, str]] = [("summary", "", "\n".join(view_summary(model, 0, footer=False)))]
     # (view, target, target 提示)：順序 = 閱讀順序；比例分配時每一段都有份
@@ -4151,7 +4304,7 @@ def build_ingest_document(path, max_chars: Optional[int] = None) -> str:
         if view == "imports" and not _collect_imports(model)[1]:
             continue
         try:
-            lines = render(model, view, target, _INGEST_UNBOUNDED).split("\n")
+            lines = render(model, view, target, per_view, hard_max=per_view).split("\n")
         except Exception as e:
             parts.append((view, hint, f"【{view}】產生失敗: {type(e).__name__}: {e}"))
             continue

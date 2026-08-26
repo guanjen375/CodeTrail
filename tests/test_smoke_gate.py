@@ -107,6 +107,15 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_mcp_call_tool_rejects_non_strict_timeouts",
         ),
     ),
+    "test_elf_analysis.py": (
+        "elf_analysis.safe_regex:analyze_file target 只接受安全子集的 regex"
+        "(Python re 沒有 timeout、不釋放 GIL,一個災難性回溯的 target 會卡死整個同步 MCP server)",
+        (
+            "test_target_regex_is_guarded_against_redos",
+            "test_target_regex_rejects_optional_quantifier_bomb",
+            "test_filter_deadline_is_checked_even_with_zero_matches",
+        ),
+    ),
     "test_mcp_startup.py": (
         "mcp_server 啟動時的 AICODE_ROOT 驗證與 set_sandbox_root",
         (
