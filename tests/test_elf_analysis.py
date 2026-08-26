@@ -132,13 +132,19 @@ def build_min_elf(path: Path, extra_und: int = 0, extra_strings: int = 0, extra_
     return path
 
 
-def build_arm_exec_elf(path: Path, n_words: int = 4000, n_null_phdrs: int = 0, n_load_phdrs: int = 0) -> Path:
+def build_arm_exec_elf(path: Path, n_words: int = 4000, n_null_phdrs: int = 0, n_load_phdrs: int = 0,
+                       n_sections: int = 0) -> Path:
     """最小 ARM（EM_ARM）ET_EXEC：一個 LOAD segment @0x08000000，開頭像 Cortex-M 向量表
     （word0 = 初始 SP、word1 = Thumb reset），後面塞 n_words 個同樣的 handler 位址——
     模擬「.text 全是程式碼、只有前面一小段是向量表」的韌體。"""
     words = [0x20001000, 0x08000101] + [0x08000101] * (n_words - 2)
     data = struct.pack("<%dI" % len(words), *words)
     shstrtab = b"\x00.text\x00.shstrtab\x00"
+    sec_names = [f".s{i}" for i in range(n_sections)]          # 都落在同一個 LOAD 內的小 section
+    sec_name_off = {}
+    for name in sec_names:
+        sec_name_off[name] = len(shstrtab)
+        shstrtab += name.encode() + b"\x00"
     ehdr_size, phdr_size, shdr_size = 52, 32, 40
     n_phdrs = 1 + n_null_phdrs + n_load_phdrs
     data_off = ehdr_size + phdr_size * n_phdrs
@@ -148,7 +154,7 @@ def build_arm_exec_elf(path: Path, n_words: int = 4000, n_null_phdrs: int = 0, n
         shoff += 1
     e_ident = b"\x7fELF" + bytes([1, 1, 1, 0]) + b"\x00" * 8
     ehdr = struct.pack("<16sHHIIIIIHHHHHH", e_ident, 2, 40, 1, 0x08000101, ehdr_size, shoff,
-                       0x05000200, ehdr_size, phdr_size, n_phdrs, shdr_size, 3, 2)
+                       0x05000200, ehdr_size, phdr_size, n_phdrs, shdr_size, 3 + n_sections, 2)
     phdr = struct.pack("<IIIIIIII", 1, data_off, 0x08000000, 0x08000000, len(data), len(data), 5, 4)
     phdr += struct.pack("<IIIIIIII", 0, 0, 0, 0, 0, 0, 0, 0) * n_null_phdrs
     for i in range(n_load_phdrs):        # 額外的 LOAD：各自不同的 VMA/LMA，內容都指到同一段檔案資料
@@ -160,6 +166,9 @@ def build_arm_exec_elf(path: Path, n_words: int = 4000, n_null_phdrs: int = 0, n
         struct.pack(SHDR, 1, 1, 6, 0x08000000, data_off, len(data), 0, 0, 4, 0),
         struct.pack(SHDR, 7, 3, 0, 0, shstr_off, len(shstrtab), 0, 0, 1, 0),
     ]
+    for i, name in enumerate(sec_names):                          # 4 bytes 一個，全在 LOAD 範圍內
+        off = (4 * i) % max(4, len(data) - 4)
+        shdrs.append(struct.pack(SHDR, sec_name_off[name], 1, 2, 0x08000000 + off, data_off + off, 4, 0, 0, 1, 0))
     buf = bytearray(shoff + shdr_size * len(shdrs))
     buf[0:ehdr_size] = ehdr
     buf[ehdr_size:ehdr_size + len(phdr)] = phdr
@@ -755,4 +764,34 @@ def test_min_line_chars_never_exceed_the_shortest_possible_line():
     assert m["relocs"] <= 18, m["relocs"]
     assert m["strings"] <= 19 and m["symbols"] <= 44 and m["imports"] <= 5
     assert m["sections"] <= 85 and m["dynamic"] <= 21 and m["memmap"] <= 37 and m["disasm"] <= 32
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-26 第八輪（放行前最後一條）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.smoke
+def test_memmap_does_not_build_section_map_after_budget_exhausted(tmp_path: Path, monkeypatch):
+    """審核八：單一 LOAD 含大量 section 時，Section → LOAD 迴圈耗盡預算後仍呼叫
+    _section_segment_map() 建整份 dict/list（只為了 unmapped 那一行）。輸出已停就不該再物化。"""
+    p = build_arm_exec_elf(tmp_path / "secs.elf", n_words=2100, n_sections=2000)
+    media.set_sandbox_root(str(tmp_path), allow_external=False)
+    elf_analysis._MODEL_CACHE.clear()
+    model = elf_analysis.load_model(p)
+    assert len(model.sections) == 2003 and elf_analysis._n_load_segments(model) == 1
+    calls = [0]
+    real_map = elf_analysis._section_segment_map
+
+    def counting_map(m):
+        calls[0] += 1
+        return real_map(m)
+
+    monkeypatch.setattr(elf_analysis, "_section_segment_map", counting_map)
+    cap = 3000   # 第一段（LOAD 表 + 向量表）放得下，第二段（2000 個 section 的對照表）才耗盡
+    n = elf_analysis._ingest_entry_cap(cap)
+    out = elf_analysis.render(model, "memmap", "", n, hard_max=n, char_budget=cap)
+    assert len(out) <= cap
+    assert "【Section → LOAD segment】" in out          # 確實是在第二段耗盡，不是第一段
+    assert "報告已截斷" in out
+    assert calls[0] == 0, f"預算耗盡後仍建立了 section→segment map（{calls[0]} 次）"
 

@@ -3848,14 +3848,15 @@ def view_memmap(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opt
                 emitted += 1
             if emitted >= line_budget:
                 break
-        seg_map = _section_segment_map(model)
-        unmapped = list(itertools.islice(
-            (s for s in model.sections if s["name"] and "A" in s["flags"] and s["size"] > 0 and not seg_map.get(s["name"])),
-            21,
-        ))
-        if unmapped and not out.exhausted():
-            out.append("  不在任何 segment 內的 alloc section：" + ", ".join(s["name"] for s in unmapped[:20])
-                       + ("，…" if len(unmapped) > 20 else ""))
+        if not out.exhausted():   # 輸出已停就不再為了 unmapped 那一行建整份 section→segment map
+            seg_map = _section_segment_map(model)
+            unmapped = list(itertools.islice(
+                (s for s in model.sections if s["name"] and "A" in s["flags"] and s["size"] > 0 and not seg_map.get(s["name"])),
+                21,
+            ))
+            if unmapped:
+                out.append("  不在任何 segment 內的 alloc section：" + ", ".join(s["name"] for s in unmapped[:20])
+                           + ("，…" if len(unmapped) > 20 else ""))
     return _finish(out)
 
 
