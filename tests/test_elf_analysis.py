@@ -39,7 +39,7 @@ from tests._harness import import_mcp_module
 # 最小 ELF 產生器
 # ---------------------------------------------------------------------------
 
-def build_min_elf(path: Path, extra_und: int = 0) -> Path:
+def build_min_elf(path: Path, extra_und: int = 0, extra_strings: int = 0, extra_relocs: int = 0) -> Path:
     """最小 ET_REL x86-64 ELF。
 
     .text    : helper_static(LOCAL FUNC, 8 bytes) / main(GLOBAL FUNC, 16 bytes) /
@@ -54,6 +54,7 @@ def build_min_elf(path: Path, extra_und: int = 0) -> Path:
     text += bytes([0x90] * 8)                                                   # asm_label
     rodata = (b"error: bad thing %d\x00http://example.com/fw\x00/etc/fw.conf\x00"
               b"FW version 2.1 build 2026\x00" + b"a" * 3000 + b"!\x00")
+    rodata += b"".join(f"str_{i:05d}_payload_text".encode() + b"\x00" for i in range(extra_strings))
     strtab = b"\x00demo.c\x00helper_static\x00main\x00asm_label\x00printf\x00"
     extra_names = [f"s{i}" for i in range(extra_und)]          # 短名稱的外部參照（審核五 #3）
     strtab += b"".join(n.encode() + b"\x00" for n in extra_names)
@@ -81,6 +82,7 @@ def build_min_elf(path: Path, extra_und: int = 0) -> Path:
         symtab += sym(name, STB_GLOBAL, STT_NOTYPE, SHN_UNDEF, 0, 0)
     R_X86_64_PLT32, R_X86_64_RELATIVE = 4, 8
     rela = struct.pack("<QQq", 13, (5 << 32) | R_X86_64_PLT32, -4)
+    rela += b"".join(struct.pack("<QQq", 8 + (i % 16), (5 << 32) | R_X86_64_PLT32, -4) for i in range(extra_relocs))
     rela_rodata = struct.pack("<QQq", 0, (0 << 32) | R_X86_64_RELATIVE, 0x10)
 
     off = 64
@@ -130,7 +132,7 @@ def build_min_elf(path: Path, extra_und: int = 0) -> Path:
     return path
 
 
-def build_arm_exec_elf(path: Path, n_words: int = 4000, n_null_phdrs: int = 0) -> Path:
+def build_arm_exec_elf(path: Path, n_words: int = 4000, n_null_phdrs: int = 0, n_load_phdrs: int = 0) -> Path:
     """最小 ARM（EM_ARM）ET_EXEC：一個 LOAD segment @0x08000000，開頭像 Cortex-M 向量表
     （word0 = 初始 SP、word1 = Thumb reset），後面塞 n_words 個同樣的 handler 位址——
     模擬「.text 全是程式碼、只有前面一小段是向量表」的韌體。"""
@@ -138,7 +140,7 @@ def build_arm_exec_elf(path: Path, n_words: int = 4000, n_null_phdrs: int = 0) -
     data = struct.pack("<%dI" % len(words), *words)
     shstrtab = b"\x00.text\x00.shstrtab\x00"
     ehdr_size, phdr_size, shdr_size = 52, 32, 40
-    n_phdrs = 1 + n_null_phdrs
+    n_phdrs = 1 + n_null_phdrs + n_load_phdrs
     data_off = ehdr_size + phdr_size * n_phdrs
     shstr_off = data_off + len(data)
     shoff = shstr_off + len(shstrtab)
@@ -149,6 +151,9 @@ def build_arm_exec_elf(path: Path, n_words: int = 4000, n_null_phdrs: int = 0) -
                        0x05000200, ehdr_size, phdr_size, n_phdrs, shdr_size, 3, 2)
     phdr = struct.pack("<IIIIIIII", 1, data_off, 0x08000000, 0x08000000, len(data), len(data), 5, 4)
     phdr += struct.pack("<IIIIIIII", 0, 0, 0, 0, 0, 0, 0, 0) * n_null_phdrs
+    for i in range(n_load_phdrs):        # 額外的 LOAD：各自不同的 VMA/LMA，內容都指到同一段檔案資料
+        va = 0x08100000 + 0x1000 * i
+        phdr += struct.pack("<IIIIIIII", 1, data_off, va, va, len(data), len(data), 5, 4)
     SHDR = "<IIIIIIIIII"
     shdrs = [
         struct.pack(SHDR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
@@ -637,4 +642,86 @@ def test_ingest_entry_cap_never_precedes_char_budget(tmp_path: Path):
     out = elf_analysis.render(model, "imports", "", n, hard_max=n, char_budget=cap)
     assert len(out) <= cap
     assert "s399" in out and "... +" not in out, out[-300:]
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-26 第六輪靜態審核回修
+# ---------------------------------------------------------------------------
+
+def _count_sink_appends(monkeypatch) -> list:
+    calls = [0]
+    orig_append = elf_analysis._Sink.append
+
+    def counting_append(self, s):
+        calls[0] += 1
+        return orig_append(self, s)
+
+    monkeypatch.setattr(elf_analysis._Sink, "append", counting_append)
+    return calls
+
+
+@pytest.mark.smoke
+def test_symbols_candidate_heap_is_bounded_by_char_budget(elf_path: Path, monkeypatch):
+    """審核六 #1：ingest 把筆數上限拉到 400K 並套給所有 view，symbols 的 heapq.nsmallest 會保留
+    最多 400K 個候選——字元預算管不到。筆數上限要從「字元預算 ÷ 該 view 最短行長」推。"""
+    seen: list = []
+    real = elf_analysis.heapq.nsmallest
+
+    def spy(n, it, key=None):
+        seen.append(n)
+        return real(n, it, key=key)
+
+    monkeypatch.setattr(elf_analysis.heapq, "nsmallest", spy)
+    elf_analysis._MODEL_CACHE.clear()
+    model = elf_analysis.load_model(elf_path)
+    cap = 2000
+    n = elf_analysis._ingest_entry_cap(cap)
+    elf_analysis.render(model, "symbols", "", n, hard_max=n, char_budget=cap)
+    assert seen and max(seen) <= cap // 40 + 1, seen
+
+
+@pytest.mark.smoke
+def test_memmap_streams_to_sink(tmp_path: Path, monkeypatch):
+    """審核六 #1：_memmap_lines 先完整建 list（3000 個 LOAD 全列）才交給 _Sink。"""
+    p = build_arm_exec_elf(tmp_path / "loads.elf", n_words=64, n_load_phdrs=3000)
+    media.set_sandbox_root(str(tmp_path), allow_external=False)
+    elf_analysis._MODEL_CACHE.clear()
+    model = elf_analysis.load_model(p)
+    assert len(elf_analysis._load_segments(model)) == 3001
+    calls = _count_sink_appends(monkeypatch)
+    cap = 1500
+    n = elf_analysis._ingest_entry_cap(cap)
+    out = elf_analysis.render(model, "memmap", "", n, hard_max=n, char_budget=cap)
+    assert len(out) <= cap
+    assert calls[0] < 400, f"預算用完後仍產生了 {calls[0]} 行"
+
+
+@pytest.mark.smoke
+def test_strings_cat_all_stops_after_budget(tmp_path: Path, monkeypatch):
+    """審核六 #2：ingest 用的 target="cat:all" 分支沒檢查 out.truncated，最多 100K 條字串會全部格式化。"""
+    p = build_min_elf(tmp_path / "strs.elf", extra_strings=3000)
+    media.set_sandbox_root(str(tmp_path), allow_external=False)
+    elf_analysis._MODEL_CACHE.clear()
+    model = elf_analysis.load_model(p)
+    calls = _count_sink_appends(monkeypatch)
+    cap = 1500
+    n = elf_analysis._ingest_entry_cap(cap)
+    out = elf_analysis.render(model, "strings", "cat:all", n, hard_max=n, char_budget=cap)
+    assert len(out) <= cap
+    assert calls[0] < 400, f"預算用完後仍產生了 {calls[0]} 行"
+
+
+@pytest.mark.smoke
+def test_manual_stop_reports_at_least(tmp_path: Path):
+    """審核六 #3：relocs / memmap / DWARF / strings 在 out.truncated 時手動 break，省略了幾千行
+    卻報「已略過 1 行」；提前停止的都只知道下限，要寫「至少」。"""
+    p = build_min_elf(tmp_path / "relocs.elf", extra_relocs=2000)
+    media.set_sandbox_root(str(tmp_path), allow_external=False)
+    elf_analysis._MODEL_CACHE.clear()
+    model = elf_analysis.load_model(p)
+    cap = 1500
+    n = elf_analysis._ingest_entry_cap(cap)
+    out = elf_analysis.render(model, "relocs", "*", n, hard_max=n, char_budget=cap)
+    assert len(out) <= cap
+    assert "報告已截斷" in out and "至少" in out, out[-220:]
 

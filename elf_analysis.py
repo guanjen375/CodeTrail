@@ -101,6 +101,12 @@ _SINK_NOTE_MAX = 200             # 截斷說明的長度上限（截斷時才從
 _FILTER_TIME_BUDGET = 20.0       # 單一 view 的篩選時間預算（秒），超過就截斷並明講
 _INGEST_CHARS_PER_LINE = 1       # ingest 筆數保險 = 字元預算：每行至少 1 字元 + 換行，字元預算一定先到（imports 短名稱也是）
 _INGEST_MIN_LINES = 200
+# 各 view 一行至少幾個字元：筆數上限 = 字元預算 // 最短行長 + 1，永遠不會比字元預算先到，
+# 但也不會讓 heap / 候選清單長到遠超過預算能放的量（symbols 的 nsmallest、strings 的 picked）。
+_MIN_LINE_CHARS: Dict[str, int] = {
+    "symbols": 40, "relocs": 20, "strings": 16, "dwarf": 10, "imports": 5,
+    "sections": 50, "dynamic": 6, "memmap": 30, "disasm": 12,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -2856,6 +2862,12 @@ class _Sink(list):
             self.chars -= len(popped) + (1 if len(self) else 0)
             self.dropped += 1
 
+    def exhausted(self) -> bool:
+        """迴圈用：預算用完就回 True，同時記下「之後的行沒再產生」→ 說明改報「至少 N 行」。"""
+        if self.truncated:
+            self.dropped_more = True
+        return self.truncated
+
 
 def _sink(model: ElfModel, char_budget: Optional[int]) -> "_Sink":
     return _Sink(char_budget or BIN_ELF_REPORT_MAX_CHARS, _hdr_lines(model))
@@ -3521,48 +3533,48 @@ def _footer(model: ElfModel) -> List[str]:
     return _finish(out)
 
 
-def _memmap_lines(model: ElfModel, limit: int, compact: bool) -> List[str]:
-    out: List[str] = []
+def _memmap_lines(model: ElfModel, limit: int, compact: bool):
+    """記憶體配置（generator：直接串流進 _Sink，預算用完就停，不先建整份 list）。"""
     if "segments" in model.failed:
-        out.append("")
-        out.append(f"【記憶體配置】program header 讀取失敗：{model.failed['segments']}（不能當成沒有 LOAD segment）")
-        return _finish(out)
+        yield ("")
+        yield (f"【記憶體配置】program header 讀取失敗：{model.failed['segments']}（不能當成沒有 LOAD segment）")
+        return
     sec_failed = model.failed.get("sections")
     loads = _load_segments(model)
     if model.is_rel or not loads:
-        out.append("")
+        yield ("")
         if sec_failed:
-            out.append(f"【記憶體配置】沒有 LOAD segment，且 section 表讀取失敗：{sec_failed}（section 歸類無法計算）")
-            return _finish(out)
+            yield (f"【記憶體配置】沒有 LOAD segment，且 section 表讀取失敗：{sec_failed}（section 歸類無法計算）")
+            return
         usage = section_usage(model)
-        out.append("【記憶體配置】REL 檔（.o / .ko）沒有 LOAD segment；section 依 flags 歸類："
+        yield ("【記憶體配置】REL 檔（.o / .ko）沒有 LOAD segment；section 依 flags 歸類："
                    f"code {_fmt_bytes(usage['code'])}、rodata {_fmt_bytes(usage['rodata'])}、"
                    f"data {_fmt_bytes(usage['data'])}、bss(NOBITS) {_fmt_bytes(usage['bss'])}")
         if not compact:
             secs = [s for s in model.sections if "A" in s["flags"] and s["size"] > 0 and s["name"]]
-            out.append("")
-            out.extend(_sections_table(model, heapq.nlargest(max(limit, 200), secs, key=lambda s: s["size"])))
-        return _finish(out)
+            yield ("")
+            yield from (_sections_table(model, heapq.nlargest(max(limit, 200), secs, key=lambda s: s["size"])))
+        return
 
     acc = memory_accounting(model)
     usage = section_usage(model)
     w = model.addr_width
-    out.append("")
-    out.append("【記憶體配置（LOAD segments）】")
-    out.append(f"  {'#':<3} {'VMA(vaddr)':<{w + 2}} {'LMA(paddr)':<{w + 2}} {'filesz':<10} {'memsz':<10} flg  說明")
+    yield ("")
+    yield ("【記憶體配置（LOAD segments）】")
+    yield (f"  {'#':<3} {'VMA(vaddr)':<{w + 2}} {'LMA(paddr)':<{w + 2}} {'filesz':<10} {'memsz':<10} flg  說明")
     max_segs = 32 if compact else max(limit, 256)
     for si, (seg, kind) in enumerate(acc["segments"]):
         if si >= max_segs:
-            out.append(f"  ... +{len(acc['segments']) - si} 個 LOAD segment（view=\"memmap\" limit=N）")
+            yield (f"  ... +{len(acc['segments']) - si} 個 LOAD segment（view=\"memmap\" limit=N）")
             break
-        out.append(
+        yield (
             f"  {seg['idx']:<3} {model.fmt_addr(seg['vaddr']):<{w + 2}} {model.fmt_addr(seg['paddr']):<{w + 2}} "
             f"0x{seg['filesz']:06x}   0x{seg['memsz']:06x}   {seg['flags']}  {kind}"
         )
         if not compact and seg["sections"]:
             names = seg["sections"]
-            out.append(f"      sections: {' '.join(names[:64])}" + (f" …+{len(names) - 64}" if len(names) > 64 else ""))
-    out.append(
+            yield (f"      sections: {' '.join(names[:64])}" + (f" …+{len(names) - 64}" if len(names) > 64 else ""))
+    yield (
         f"  估算：image(FLASH/檔案內) = Σ LOAD filesz = {_fmt_bytes(acc['image'])}；"
         f"RAM = Σ 可寫 LOAD memsz = {_fmt_bytes(acc['ram'])}"
         + (f"（其中開機需從 LMA 複製的初始化資料 {_fmt_bytes(acc['init_data'])}）" if acc["init_data"] else "")
@@ -3570,19 +3582,19 @@ def _memmap_lines(model: ElfModel, limit: int, compact: bool) -> List[str]:
         f"唯讀就地執行 = {_fmt_bytes(acc['rom_in_place'])}"
     )
     if sec_failed:
-        out.append(f"  section 歸類：unknown（section 表讀取失敗：{sec_failed}）")
+        yield (f"  section 歸類：unknown（section 表讀取失敗：{sec_failed}）")
     else:
-        out.append(
+        yield (
             f"  section 歸類：code {_fmt_bytes(usage['code'])}、rodata {_fmt_bytes(usage['rodata'])}、"
             f"data {_fmt_bytes(usage['data'])}、bss {_fmt_bytes(usage['bss'])}"
         )
     if not compact:
-        out.append("  （Linux 使用者程式 LMA=VMA 是正常的；上面的 FLASH/RAM 說法只對 bare-metal 韌體有意義）")
+        yield ("  （Linux 使用者程式 LMA=VMA 是正常的；上面的 FLASH/RAM 說法只對 bare-metal 韌體有意義）")
 
     vt = arm_vector_table(model, limit if not compact else 16)
     if vt is not None:
-        out.append("")
-        out.append(f"【Cortex-M 向量表】@ {model.fmt_addr(vt['base'])}（{vt['source']}）")
+        yield ("")
+        yield (f"【Cortex-M 向量表】@ {model.fmt_addr(vt['base'])}（{vt['source']}）")
         entries = vt["entries"]
         shown = entries if not compact else entries[:16]
         i = 0
@@ -3595,27 +3607,33 @@ def _memmap_lines(model: ElfModel, limit: int, compact: bool) -> List[str]:
                     j += 1
             label = name if j == i else f"{name}..{shown[j][0]}"
             val = model.fmt_addr(w_) if i > 0 else model.fmt_addr(w_)
-            out.append(f"  {label:<22} {val}  {sym}")
+            yield (f"  {label:<22} {val}  {sym}")
             i = j + 1
         if compact and len(entries) > 16:
-            out.append(f"  ... IRQ 向量 {len(entries) - 16} 個（view=\"memmap\" limit=N 看更多）")
+            yield (f"  ... IRQ 向量 {len(entries) - 16} 個（view=\"memmap\" limit=N 看更多）")
     elif model.machine == "arm" and not compact:
-        out.append("")
-        out.append("  （未偵測到 Cortex-M 向量表：word0 不像初始 SP 或 word1 不是 Thumb 位址；A-profile / Linux ELF 屬正常）")
-    return _finish(out)
+        yield ("")
+        yield ("  （未偵測到 Cortex-M 向量表：word0 不像初始 SP 或 word1 不是 Thumb 位址；A-profile / Linux ELF 屬正常）")
+    return
 
 
 # ---------------------------------------------------------------------------
 # 各 view
 # ---------------------------------------------------------------------------
 
-def _limit_for(view: str, limit: int, hard_max: Optional[int] = None) -> int:
-    """limit=0 → 該 view 預設；上限 = hard_max（ingest 的行預算）或 BIN_ELF_VIEW_MAX_LIMIT。"""
+def _limit_for(view: str, limit: int, hard_max: Optional[int] = None,
+               char_budget: Optional[int] = None) -> int:
+    """limit=0 → 該 view 預設；上限 = min(hard_max 或 BIN_ELF_VIEW_MAX_LIMIT, 字元預算 // 最短行長 + 1)。
+
+    字元預算能放的行數就是筆數的天花板：再多的筆數也印不出來，只會讓候選 heap / 清單白白長大。
+    """
     default = _VIEW_DEFAULT_LIMIT.get(view, 200)
     ceiling = int(hard_max) if hard_max else BIN_ELF_VIEW_MAX_LIMIT
+    budget = int(char_budget) if char_budget else BIN_ELF_REPORT_MAX_CHARS
+    ceiling = min(ceiling, budget // _MIN_LINE_CHARS.get(view, 10) + 1)
     if not limit or limit <= 0:
-        return min(default, ceiling)
-    return min(int(limit), ceiling)
+        return max(1, min(default, ceiling))
+    return max(1, min(int(limit), ceiling))
 
 
 def view_summary(model: ElfModel, limit: int = 0, footer: bool = True, hard_max: Optional[int] = None,
@@ -3671,7 +3689,7 @@ def view_headers(model: ElfModel, limit: int = 0, hard_max: Optional[int] = None
         out.append("")
         out.append("  Section → Segment:")
         for seg in model.segments:
-            if out.truncated:
+            if out.exhausted():
                 break
             names = seg["sections"]
             out.append(f"    {seg['idx']:02d} {seg['type']:<12} {' '.join(names[:100])}"
@@ -3705,7 +3723,7 @@ def view_sections(model: ElfModel, target: str = "", limit: int = 0, hard_max: O
     if note:
         out.append(f"[注意] {note}")
     if not text:
-        n = _limit_for("sections", limit, hard_max)
+        n = _limit_for("sections", limit, hard_max, char_budget)
         out.append("")
         out.append(f"【Sections（全部 {len(model.sections)} 個）】flags: W=write A=alloc X=exec M=merge S=strings I=info L=link-order G=group T=TLS C=compressed")
         out.extend(_sections_table(model, model.sections[:n]))
@@ -3780,19 +3798,19 @@ def view_sections(model: ElfModel, target: str = "", limit: int = 0, hard_max: O
 def view_memmap(model: ElfModel, target: str = "", limit: int = 0, hard_max: Optional[int] = None,
                 char_budget: Optional[int] = None) -> List[str]:
     out = _sink(model, char_budget)
-    out.extend(_memmap_lines(model, _limit_for("memmap", limit, hard_max), compact=False))
+    out.extend(_memmap_lines(model, _limit_for("memmap", limit, hard_max, char_budget), compact=False))
     loads = _load_segments(model)
     if loads and not model.is_rel and "sections" not in model.failed:
         out.append("")
         out.append("【Section → LOAD segment】")
-        line_budget = _limit_for("memmap", limit, hard_max) * 8 + 64   # 行數上限（sink 另有字元預算）
+        line_budget = _limit_for("memmap", limit, hard_max, char_budget) * 8 + 64   # 行數上限（sink 另有字元預算）
         emitted = 0
         for seg in loads:
-            if out.truncated:
+            if out.exhausted():
                 break
             out.append(f"  LOAD #{seg['idx']} VMA {model.fmt_addr(seg['vaddr'])} LMA {model.fmt_addr(seg['paddr'])} {seg['flags']}:")
             for name in seg["sections"]:
-                if out.truncated:
+                if out.exhausted():
                     break
                 if emitted >= line_budget:
                     out.append("      ... 其餘 section 未列（limit=N）")
@@ -3825,7 +3843,7 @@ def view_symbols(model: ElfModel, target: str = "", limit: int = 0, hard_max: Op
     fields, rx, addr, text, note = _parse_filter(target, ("bind", "type", "ndx", "section", "table", "vis"))
     if note:
         out.append(f"[注意] {note}")
-    n = _limit_for("symbols", limit, hard_max)
+    n = _limit_for("symbols", limit, hard_max, char_budget)
     deadline = _Deadline()
 
     if addr is not None:
@@ -3932,7 +3950,7 @@ def view_imports(model: ElfModel, target: str = "", limit: int = 0, hard_max: Op
         else:
             out.append("【Imports】沒有未定義（UND）symbol：靜態連結 / bare-metal 韌體，或完全 stripped。")
         return _finish(out)
-    n = _limit_for("imports", limit, hard_max)
+    n = _limit_for("imports", limit, hard_max, char_budget)
     _fields, rx, _addr, _text, note = _parse_filter(target, ())
     if note:
         out.append(f"[注意] {note}")
@@ -3977,7 +3995,7 @@ def view_relocs(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opt
     fields, rx, addr, text, note = _parse_filter(target, ("section", "type"))
     if note:
         out.append(f"[注意] {note}")
-    n = _limit_for("relocs", limit, hard_max)
+    n = _limit_for("relocs", limit, hard_max, char_budget)
     list_all = (text == "*")
     if not text and not fields:
         out.extend(_relocs_summary(model, top=30))
@@ -3995,7 +4013,7 @@ def view_relocs(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opt
             continue
         header_done = False
         for e in r["entries"]:
-            if deadline.expired() or out.truncated:
+            if deadline.expired() or out.exhausted():
                 break
             if fields.get("type") and e["type"].upper() != fields["type"].upper():
                 continue
@@ -4017,7 +4035,7 @@ def view_relocs(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opt
             out.append(f"  {r['applies_to'] or r['section']}+0x{e['offset']:x}  {e['type']}  {e['sym'] or '(none)'}{add}"
                        + (f"  (in {caller})" if caller else ""))
             shown += 1
-        if deadline.hit or out.truncated:
+        if deadline.hit or out.exhausted():
             break
     if matched == 0:
         out.append("  沒有符合的項目")
@@ -4043,7 +4061,7 @@ def view_dynamic(model: ElfModel, target: str = "", limit: int = 0, hard_max: Op
             out.append("【.dynamic】沒有 .dynamic section：靜態連結 / bare-metal 韌體 / REL 檔（不是錯誤）")
         return _finish(out)
     out.extend(_dynamic_block(model)[:-1])
-    n = _limit_for("dynamic", limit, hard_max)
+    n = _limit_for("dynamic", limit, hard_max, char_budget)
     tags = model.dynamic.get("tags", [])
     _fields, rx, _addr, _text, note = _parse_filter(target, ())
     if note:
@@ -4076,7 +4094,7 @@ def view_dwarf(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opti
     fields, rx, addr, text, note = _parse_filter(target, ("kind", "cu"))
     if note:
         out.append(f"[注意] {note}")
-    n = _limit_for("dwarf", limit, hard_max)
+    n = _limit_for("dwarf", limit, hard_max, char_budget)
     kind = fields.get("kind", "").lower()
     if kind and kind not in ("func", "function", "functions", "type", "types"):
         out.append(f"【DWARF】不支援的 kind={kind!r}（可用 kind:func / kind:type）")
@@ -4116,7 +4134,7 @@ def view_dwarf(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opti
             out.append(f"  [WARN] DWARF 解析錯誤: {model._lazy['dwarf_error']}")
         out.append(f"  {'#':<4} {'name':<40} {'lang':<6} {'range':<{model.addr_width * 2 + 4}} producer")
         for i, c in enumerate(cus[:n]):
-            if out.truncated:
+            if out.exhausted():
                 break
             name = c["name"]
             if name and not name.startswith("/") and c["comp_dir"]:
@@ -4131,23 +4149,33 @@ def view_dwarf(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opti
         return _finish(out)
 
     if kind in ("", "func", "function", "functions"):
-        funcs = [f_ for f_ in dwarf_functions(model) if _rx(rx, f_["name"])]
-        if fields.get("cu"):
-            funcs = [f_ for f_ in funcs if fields["cu"] in (f_["cu"] or "")]
-        funcs.sort(key=lambda f_: (f_["low_pc"] is None, f_["low_pc"] or 0, f_["name"]))
-        out.append(f"【DWARF 函式】符合 {text!r} 共 {len(funcs)} 個（顯示 {min(n, len(funcs))}）")
+        matched_funcs = 0
+
+        def _fgen():
+            nonlocal matched_funcs
+            for f_ in dwarf_functions(model):
+                if not _rx(rx, f_["name"]):
+                    continue
+                if fields.get("cu") and fields["cu"] not in (f_["cu"] or ""):
+                    continue
+                matched_funcs += 1
+                yield f_
+
+        # 只留前 n 筆（依位址）：候選不整批留在記憶體
+        funcs = heapq.nsmallest(n, _fgen(), key=lambda f_: (f_["low_pc"] is None, f_["low_pc"] or 0, f_["name"]))
+        out.append(f"【DWARF 函式】符合 {text!r} 共 {matched_funcs} 個（顯示 {len(funcs)}）")
         if funcs:
             out.append(f"  {'range':<{model.addr_width * 2 + 4}} {'name':<36} source")
-            for f_ in funcs[:n]:
-                if out.truncated:
+            for f_ in funcs:
+                if out.exhausted():
                     break
                 rng = (f"{model.fmt_addr(f_['low_pc'])}-{model.fmt_addr(f_['high_pc'])}" if f_["low_pc"] is not None and f_["high_pc"] is not None
                        else (model.fmt_addr(f_["low_pc"]) if f_["low_pc"] is not None else "(no code)"))
                 src = f"{f_['file']}:{f_['line']}" if f_["file"] else (f"line {f_['line']}" if f_["line"] else "")
                 flags = "".join(x for x in ("E" if f_["external"] else "", "i" if f_["inline"] else "", "d" if f_["declaration"] else ""))
                 out.append(f"  {rng:<{model.addr_width * 2 + 4}} {f_['name'][:36]:<36} {src}" + (f"  [{flags}]" if flags else ""))
-            if len(funcs) > n:
-                out.append(f"  ... +{len(funcs) - n}（limit=N）")
+            if matched_funcs > len(funcs):
+                out.append(f"  ... +{matched_funcs - len(funcs)}（limit=N）")
             out.append("  [E]=external [i]=inline [d]=declaration only")
         elif not model.caps.get("dwarf_functions"):
             out.append("  （這條解析路徑沒有函式清單能力）")
@@ -4159,7 +4187,7 @@ def view_dwarf(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opti
             out.append(f"【DWARF 型別】符合 {text!r} 共 {len(types)} 個" + ("（已達上限）" if truncated else ""))
             line_start = len(out)
             for ti, t in enumerate(types):
-                if out.truncated:
+                if out.exhausted():
                     break
                 if len(out) - line_start >= n:          # 型別區塊以 limit 當行預算（每個型別可能幾十行）
                     out.append(f"  ... 其餘 {len(types) - ti} 個型別未列（limit=N 行預算；縮小 target）")
@@ -4197,7 +4225,7 @@ def view_disasm(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opt
     out = _sink(model, char_budget)
     out.append("")
     out.append("【反組譯】")
-    _ok, lines = disassemble(model, target, _limit_for("disasm", limit, hard_max))
+    _ok, lines = disassemble(model, target, _limit_for("disasm", limit, hard_max, char_budget))
     out.extend(lines)
     return _finish(out)
 
@@ -4206,7 +4234,7 @@ def view_strings(model: ElfModel, target: str = "", limit: int = 0, hard_max: Op
                  char_budget: Optional[int] = None) -> List[str]:
     out = _sink(model, char_budget)
     items = model_strings(model)
-    n = _limit_for("strings", limit, hard_max)
+    n = _limit_for("strings", limit, hard_max, char_budget)
     fields, rx, _addr, text, note = _parse_filter(target, ("cat", "section", "min", "enc"))
     if note:
         out.append(f"[注意] {note}")
@@ -4255,7 +4283,7 @@ def view_strings(model: ElfModel, target: str = "", limit: int = 0, hard_max: Op
         out.append("")
         out.append(f"【字串（依 offset，前 {min(n, len(items))} / {len(items):,}）】")
         for it in itertools.islice(items, n):
-            if out.truncated:
+            if out.exhausted():
                 break
             sec = f" [{it['section']}]" if it["section"] else ""
             cats = f" ({','.join(it['cats'])})" if it["cats"] else ""
@@ -4266,6 +4294,8 @@ def view_strings(model: ElfModel, target: str = "", limit: int = 0, hard_max: Op
 
     out.append(f"【字串】篩選 {target!r}：符合 {matched_count:,}，顯示 {len(picked)}")
     for it in picked:
+        if out.exhausted():
+            break
         sec_txt = f" [{it['section']}]" if it["section"] else ""
         enc_txt = " (u16)" if it["enc"] == "utf16" else ""
         cats = f" ({','.join(it['cats'])})" if it["cats"] else ""
