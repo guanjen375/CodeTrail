@@ -13,11 +13,28 @@
      _OPENCODE_PERMISSION_TEMPLATE(鍵、值、順序;codetrail_* 必須排在覆寫前)
   8. docs/opencode-agents-template.md 的文件用 manifest(安裝範本 fenced block
      之外)與 mcp_server.py 實際工具一致
+  9. apply_patch 上限契約:config.py 的 PATCH_MAX_FILES / PATCH_MAX_LINES_PER_FILE
+     必須逐字出現在 mcp_server.apply_patch docstring、agent_tools._APPLY_PATCH_TOOL
+     的 description 與 README / docs/mcp-tools.md;dry_run 七欄位(format / 檔案清單 /
+     blocks / budget / locations / new_file / would apply)在 MCP docstring 與 native
+     description 都要列出
+ 10. run_command timeout 契約(秒級 server 上限;與第 6 條 OpenCode client 的
+     毫秒 timeout 是兩個獨立契約):config.py 的 RUN_COMMAND_TIMEOUT{,_MIN,_MAX}
+     ↔ mcp_server.run_command 的 Annotated/Field 簽名與 docstring、
+     agent_tools._RUN_COMMAND_TOOL 的 description 與 timeout schema、README /
+     docs/mcp-tools.md / docs/security.md / docs/troubleshooting.md(各鎖完整肯定句)
+ 11. 驗證分層宣稱:apply_patch 只做同 process 的 syntax check、lint / test 顯式呼叫、
+     三個不同的 ask、troubleshooting「驗證不完整／未通過不是拒絕」;契約句要以句首形式出現
+     (擋「不能保證…」這類前綴否定);完整的舊肯定句(自動跑 lint / 所有驗證通過)不得殘留
+
+docstring 與 native schema description 一律用 ast 抽取(指定函式 / 指定 dict literal),
+不用「下一個字串」猜;每條 issue 固定寫成 `artifact: expected X, observed Y`。
 
 退出碼:0=OK, 1=有 drift。
 """
 from __future__ import annotations
 
+import ast
 import re
 import sys
 from pathlib import Path
@@ -29,6 +46,10 @@ MCP = REPO_ROOT / "mcp_server.py"
 CONFIG = REPO_ROOT / "config.py"
 SET_CONFIG = REPO_ROOT / "scripts" / "set_config.py"
 AGENTS_TEMPLATE_DOC = DOCS_DIR / "opencode-agents-template.md"
+AGENT_TOOLS = REPO_ROOT / "agent_tools.py"
+MCP_TOOLS_DOC = DOCS_DIR / "mcp-tools.md"
+SECURITY_DOC = DOCS_DIR / "security.md"
+TROUBLESHOOTING_DOC = DOCS_DIR / "troubleshooting.md"
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -279,6 +300,494 @@ def _check_forbidden_main_model_tokens(docs_text: str, issues: list[str]) -> Non
             issues.append(f"README/docs 不得出現舊主模型預設 / 推薦標記: {token!r}")
 
 
+# ---------------------------------------------------------------------------
+# 9–11:apply_patch / run_command / 驗證分層的 schema-description 契約
+#
+# 這三條檢查的是「模型實際看到的文字」:MCP tool docstring(FastMCP 直接當
+# description 送出)與 agent.py 用的 native schema。數字或宣稱跟 config /
+# 實作漂移是無聲失敗——模型照舊文件行動,工具卻拒絕或做了別的事。
+# 抽取一律走 ast:指定函式名的 docstring、指定 dict literal 的 description,
+# 不用「def 之後第一個三引號字串」這種會偷到下一個函式的猜法。
+# ---------------------------------------------------------------------------
+
+# dry_run 必須逐檔回報的七個欄位(施工單 A):每欄接受的關鍵字寫法。
+_DRY_RUN_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("format", ("format",)),
+    ("檔案清單", ("檔案清單",)),
+    ("blocks", ("blocks",)),
+    ("budget", ("budget",)),
+    ("locations", ("locations", "定位行")),
+    ("new_file", ("new_file",)),
+    ("would apply", ("would apply",)),
+)
+# 只拒絕「完整的舊肯定句」:反向文案(「不會自動跑 lint …」)不含這兩個逐字片段。
+_OLD_AUTO_VERIFY_CLAIMS = (
+    "套用後會自動跑 lint / typecheck / 相關測試",
+    "✓ 所有驗證通過",
+)
+
+
+def _issue(artifact: str, expected: str, observed: str) -> str:
+    return f"{artifact}: expected {expected}, observed {observed}"
+
+
+def _norm(text: str) -> str:
+    """折疊換行與縮排:docstring / markdown 會在片語中間換行。"""
+    return " ".join(text.split())
+
+
+def _config_int_constant_loose(config_text: str, name: str) -> int | None:
+    """同 _config_int_constant,但容忍行尾註解(`PATCH_MAX_FILES = 5  # ...`)。"""
+    match = re.search(
+        rf"^{re.escape(name)}\s*=\s*([0-9][0-9_]*)\s*(?:#.*)?$",
+        config_text,
+        re.MULTILINE,
+    )
+    return int(match.group(1).replace("_", "")) if match else None
+
+
+def _parse_module(text: str) -> ast.Module | None:
+    try:
+        return ast.parse(text)
+    except SyntaxError:
+        return None
+
+
+def _tool_function(text: str, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    module = _parse_module(text)
+    if module is None:
+        return None
+    for node in module.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    return None
+
+
+def _tool_docstring(text: str, name: str) -> str | None:
+    """指定 module-level 函式的 docstring;沒有該函式或它沒有 docstring → None。"""
+    fn = _tool_function(text, name)
+    if fn is None:
+        return None
+    return ast.get_docstring(fn, clean=False)
+
+
+def _tool_arg_signature(text: str, name: str, arg: str) -> tuple[str | None, str | None]:
+    """回傳 (annotation 原始碼, default 原始碼),用 ast.unparse 正規化空白。"""
+    fn = _tool_function(text, name)
+    if fn is None:
+        return None, None
+    positional = list(fn.args.posonlyargs) + list(fn.args.args)
+    defaults = list(fn.args.defaults)
+    pad = [None] * (len(positional) - len(defaults))
+    for a, default in zip(positional, pad + defaults):
+        if a.arg == arg:
+            return (
+                ast.unparse(a.annotation) if a.annotation is not None else None,
+                ast.unparse(default) if default is not None else None,
+            )
+    for a, default in zip(fn.args.kwonlyargs, fn.args.kw_defaults):
+        if a.arg == arg:
+            return (
+                ast.unparse(a.annotation) if a.annotation is not None else None,
+                ast.unparse(default) if default is not None else None,
+            )
+    return None, None
+
+
+def _render_str_node(node: ast.AST | None, names: dict[str, object] | None = None) -> str | None:
+    """把字串節點還原成文字:純字串、隱式串接(ast 已合併)、f-string(`{NAME}`
+    用 names 代入,代不到的保留 `{NAME}`)、`+` 串接。其他型別 → None。"""
+    names = names or {}
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            elif isinstance(value, ast.FormattedValue):
+                inner = value.value
+                if isinstance(inner, ast.Name) and inner.id in names:
+                    parts.append(str(names[inner.id]))
+                else:
+                    parts.append("{" + ast.unparse(inner) + "}")
+            else:
+                return None
+        return "".join(parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _render_str_node(node.left, names)
+        right = _render_str_node(node.right, names)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _native_tool_dict(text: str, var_name: str) -> ast.Dict | None:
+    module = _parse_module(text)
+    if module is None:
+        return None
+    for node in module.body:
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
+            continue
+        if any(isinstance(t, ast.Name) and t.id == var_name for t in node.targets):
+            return node.value
+    return None
+
+
+def _dict_get(node: ast.Dict | None, key: str) -> ast.AST | None:
+    if node is None:
+        return None
+    for k, v in zip(node.keys, node.values):
+        if isinstance(k, ast.Constant) and k.value == key:
+            return v
+    return None
+
+
+def _native_tool_function_dict(text: str, var_name: str) -> ast.Dict | None:
+    fn = _dict_get(_native_tool_dict(text, var_name), "function")
+    return fn if isinstance(fn, ast.Dict) else None
+
+
+def _native_tool_description(
+    text: str, var_name: str, names: dict[str, object] | None = None
+) -> str | None:
+    """`<var_name>["function"]["description"]` 的文字;找不到 → None。"""
+    return _render_str_node(_dict_get(_native_tool_function_dict(text, var_name), "description"), names)
+
+
+def _native_tool_param(text: str, var_name: str, param: str) -> ast.Dict | None:
+    params = _dict_get(_native_tool_function_dict(text, var_name), "parameters")
+    props = _dict_get(params if isinstance(params, ast.Dict) else None, "properties")
+    node = _dict_get(props if isinstance(props, ast.Dict) else None, param)
+    return node if isinstance(node, ast.Dict) else None
+
+
+def _native_tool_param_description(
+    text: str, var_name: str, param: str, names: dict[str, object] | None = None
+) -> str | None:
+    return _render_str_node(_dict_get(_native_tool_param(text, var_name, param), "description"), names)
+
+
+def _native_tool_param_bound(text: str, var_name: str, param: str, key: str) -> str | None:
+    """參數 schema 內 key(minimum / maximum / default / type)的原始碼(ast.unparse)。"""
+    node = _dict_get(_native_tool_param(text, var_name, param), key)
+    return ast.unparse(node) if node is not None else None
+
+
+def _require_phrase(text: str | None, phrase: str, artifact: str, issues: list[str]) -> None:
+    if text is None:
+        issues.append(_issue(artifact, f"text containing {phrase!r}", "surface missing"))
+    elif phrase not in _norm(text):
+        issues.append(_issue(artifact, f"text containing {phrase!r}", "phrase missing"))
+
+
+def _forbid_phrase(text: str | None, phrase: str, artifact: str, issues: list[str]) -> None:
+    if text is not None and phrase in _norm(text):
+        issues.append(_issue(artifact, f"no stale claim {phrase!r}", "stale claim present"))
+
+
+def _require_dry_run_fields(text: str | None, artifact: str, issues: list[str]) -> None:
+    labels = " / ".join(label for label, _ in _DRY_RUN_FIELDS)
+    if text is None:
+        issues.append(_issue(artifact, f"dry_run fields {labels}", "surface missing"))
+        return
+    flat = _norm(text)
+    missing = [label for label, alts in _DRY_RUN_FIELDS if not any(alt in flat for alt in alts)]
+    if missing:
+        issues.append(_issue(artifact, f"dry_run fields {labels}", f"missing {missing}"))
+
+
+# 肯定句檢查(S1 防線):契約子句必須以「肯定句」形式出現——
+#   1. 子句前一個非空白字元是句界 / 行首 / 括號 / 引號 / backtick / 全形或半形標點
+#      (「不能保證 apply_patch 不會…」的前一個字是「證」,不算);
+#   2. 往回看到上一個標點為止的那段文字(略過空白與「『(` 等 opener)不得含否定前綴
+#      (「結果不會明說「X」」:X 前面是引號,合法邊界,但引號前的子句含「不會」)。
+# 只要有一處出現是肯定句就算通過;一處都沒有 → 缺失或被否定。
+_CLAUSE_PUNCT = frozenset("。；;！!？?：:，,、—|()（）「」『』`\"'*-•")
+_CLAUSE_TERMINATORS = frozenset("。；;！!？?：:，,、—|)）」』")
+_CLAUSE_OPENERS = frozenset(" 「『（(`\"'*")
+# 引介標點:冒號 / 逗號 / 破折號緊接在否定詞之後時,否定作用域延伸到被引介的子句
+# (「不保證:全部通過才顯示 …」),不得被當成句界切斷;但「X 不會自動執行——請另行呼叫 Y」
+# 的否定只管到「自動執行」,破折號引介的 Y 仍是肯定句(以「否定詞是否緊接引介標點」區分)。
+_CLAUSE_INTRODUCERS = frozenset("：:，,、—–-")
+_NEGATION_PREFIXES = (
+    "不保證", "不能保證", "無法保證", "不會", "並非", "並不是", "不是",
+    "不必遵守", "不必", "不需", "不再", "請勿", "並不",
+)
+
+
+def _clause_is_affirmative(flat: str, index: int) -> bool:
+    j = index - 1
+    while j >= 0 and flat[j] == " ":
+        j -= 1
+    if j < 0:
+        return True
+    if flat[j] not in _CLAUSE_PUNCT:
+        return False
+    k = j
+    while k >= 0 and flat[k] in _CLAUSE_OPENERS:
+        k -= 1
+    if k >= 0 and flat[k] in _CLAUSE_INTRODUCERS:
+        left = k
+        while left >= 0 and (flat[left] in _CLAUSE_INTRODUCERS or flat[left] == " "):
+            left -= 1
+        head = flat[:left + 1]
+        if any(head.endswith(prefix) for prefix in _NEGATION_PREFIXES):
+            return False
+    m = k
+    while m >= 0 and flat[m] not in _CLAUSE_TERMINATORS:
+        m -= 1
+    window = flat[m + 1:k + 1]
+    return not any(prefix in window for prefix in _NEGATION_PREFIXES)
+
+
+def _require_sentence(text: str | None, clause: str, artifact: str, issues: list[str]) -> None:
+    """clause 必須以肯定句形式出現(見 _clause_is_affirmative),否則視為缺失或被前綴否定。"""
+    if text is None:
+        issues.append(_issue(artifact, f"sentence {clause!r}", "surface missing"))
+        return
+    flat = _norm(text)
+    start = 0
+    while True:
+        index = flat.find(clause, start)
+        if index < 0:
+            issues.append(_issue(artifact, f"sentence {clause!r}", "sentence missing or prefixed by a negation"))
+            return
+        if _clause_is_affirmative(flat, index):
+            return
+        start = index + 1
+
+
+def _segment(text: str | None, start_marker: str, end_marker: str | None) -> str | None:
+    """normalized text 中 start_marker 起、到 end_marker(不含)為止的片段;找不到 → None。"""
+    if text is None:
+        return None
+    flat = _norm(text)
+    begin = flat.find(start_marker)
+    if begin < 0:
+        return None
+    if end_marker is None:
+        return flat[begin:]
+    stop = flat.find(end_marker, begin)
+    return flat[begin:] if stop < 0 else flat[begin:stop]
+
+
+def _require_dry_run_clause(
+    text: str | None, segment: str | None, clause: str, artifact: str, issues: list[str]
+) -> None:
+    """dry_run 契約:完整正向 canonical clause 以肯定句出現在整個 surface(前綴否定
+    可能落在 segment 起點之前,所以句子檢查用全文),七欄位 token 則限制在 dry_run 段內。"""
+    if segment is None:
+        issues.append(_issue(artifact, "dry_run segment", "segment missing"))
+        return
+    _require_sentence(text, clause, artifact, issues)
+    _require_dry_run_fields(segment, artifact, issues)
+
+
+def _check_apply_patch_limits_contract(
+    mcp_text: str,
+    agent_tools_text: str,
+    config_text: str,
+    readme_text: str,
+    mcp_tools_text: str,
+    troubleshooting_text: str,
+    issues: list[str],
+) -> None:
+    """9. apply_patch 的 5 / 200 上限(兩種計數各自鎖句)、兩種格式、dry_run 七欄位。"""
+    files = _config_int_constant_loose(config_text, "PATCH_MAX_FILES")
+    lines = _config_int_constant_loose(config_text, "PATCH_MAX_LINES_PER_FILE")
+    if files is None or lines is None:
+        issues.append(_issue(
+            "config.py",
+            "integer PATCH_MAX_FILES and PATCH_MAX_LINES_PER_FILE",
+            f"PATCH_MAX_FILES={files} PATCH_MAX_LINES_PER_FILE={lines}",
+        ))
+        return
+
+    # MCP docstring(FastMCP 直接當 description 送給模型)
+    doc = _tool_docstring(mcp_text, "apply_patch")
+    artifact = "mcp_server.apply_patch docstring"
+    _require_phrase(doc, "SEARCH/REPLACE", artifact, issues)
+    _require_phrase(doc, "不要再包 Markdown fence", artifact, issues)
+    _require_sentence(doc, f"最多 {files} 個檔案", artifact, issues)
+    _require_sentence(doc, f"udiff 單檔 added+removed ≤ {lines} 行", artifact, issues)
+    _require_sentence(doc, f"S/R 單檔 payload budget = sum(SEARCH 行數 + REPLACE 行數) ≤ {lines}", artifact, issues)
+    _require_dry_run_clause(
+        doc, _segment(doc, "dry_run:", "Returns:"),
+        "dry_run: True 時只做 preflight 並逐檔回報七個欄位:format、檔案清單",
+        artifact + " dry_run", issues,
+    )
+    _require_sentence(doc, "全部通過才顯示 `would apply`", artifact + " dry_run", issues)
+
+    # native schema(agent.py 路徑)
+    top = _native_tool_description(agent_tools_text, "_APPLY_PATCH_TOOL")
+    artifact = "_APPLY_PATCH_TOOL.description"
+    _require_phrase(top, "SEARCH/REPLACE", artifact, issues)
+    _require_phrase(top, "不要包 Markdown fence", artifact, issues)
+    _require_sentence(
+        top, f"最多 {files} 個檔案、單檔 {lines} 行(udiff 算 added+removed;S/R 算 SEARCH+REPLACE 行數)",
+        artifact, issues,
+    )
+    _require_dry_run_clause(
+        top, _segment(top, "dry_run=true", None),
+        "dry_run=true 時只做 preflight,逐檔回報 format / 檔案清單 / blocks / payload budget / "
+        "locations(定位行) / new_file(是否新建),全部通過才顯示 would apply",
+        artifact + " dry_run", issues,
+    )
+    patch_desc = _native_tool_param_description(agent_tools_text, "_APPLY_PATCH_TOOL", "patch")
+    artifact = "_APPLY_PATCH_TOOL.patch.description"
+    _require_sentence(patch_desc, "SEARCH/REPLACE 格式:第一行是 repo 相對路徑", artifact, issues)
+    _require_sentence(patch_desc, "unified diff 格式:--- a/file / +++ b/file / @@", artifact, issues)
+    dry_desc = _native_tool_param_description(agent_tools_text, "_APPLY_PATCH_TOOL", "dry_run")
+    _require_dry_run_clause(
+        dry_desc, dry_desc,
+        "只做 preflight 並逐檔回報 format、檔案清單、blocks、payload budget、locations(定位行)、"
+        "new_file(是否新建),全部通過才顯示 would apply",
+        "_APPLY_PATCH_TOOL.dry_run.description", issues,
+    )
+
+    # 文件(具名,各自鎖兩種計數)
+    artifact = "README.md"
+    _require_phrase(readme_text, "SEARCH/REPLACE", artifact, issues)
+    _require_sentence(
+        readme_text,
+        f"最多 {files} 個檔案、單檔 {lines} 行（udiff 算 added+removed；S/R 算 payload budget = SEARCH+REPLACE 行數）",
+        artifact, issues,
+    )
+    artifact = "docs/mcp-tools.md"
+    _require_phrase(mcp_tools_text, "SEARCH/REPLACE", artifact, issues)
+    _require_sentence(mcp_tools_text, f"最多 {files} 個檔案", artifact, issues)
+    _require_sentence(mcp_tools_text, f"udiff 單檔 {lines} 行（added+removed）", artifact, issues)
+    _require_sentence(
+        mcp_tools_text,
+        f"S/R 單檔 payload budget = SEARCH 行數 + REPLACE 行數（同檔所有區塊合計）≤ {lines}",
+        artifact, issues,
+    )
+    _require_sentence(
+        mcp_tools_text,
+        "逐檔固定回報 `format`、檔案清單、`blocks`（區塊數）、`budget`（payload 用量／上限）、"
+        "`locations`（定位行）、`new_file`（是否新建）；全部通過才顯示唯一的一行 `would apply`",
+        artifact + " dry_run", issues,
+    )
+    artifact = "docs/troubleshooting.md"
+    _require_sentence(troubleshooting_text, "#### SEARCH/REPLACE 被拒絕", artifact, issues)
+    _require_sentence(troubleshooting_text, "#### unified diff 被拒絕", artifact, issues)
+    _require_sentence(troubleshooting_text, "這些都是整份 patch 拒絕、零寫入", artifact, issues)
+    _require_sentence(troubleshooting_text, f"一次改超過 {files} 個檔案或單檔 {lines} 行也會被拒", artifact, issues)
+
+
+def _check_run_command_timeout_contract(
+    mcp_text: str,
+    agent_tools_text: str,
+    config_text: str,
+    readme_text: str,
+    mcp_tools_text: str,
+    security_text: str,
+    troubleshooting_text: str,
+    issues: list[str],
+) -> None:
+    """10. run_command timeout 的秒級 server 上限(1..600、預設 60)三層 + 四份文件一致。
+
+    與第 6 條(OpenCode client 的毫秒 timeout,`mcp.codetrail.timeout`)是兩個
+    獨立契約:一個是 client 何時放棄等 server,一個是 server 願意等命令多久;
+    這裡的訊息刻意不提前者的數字,避免把兩個單位混在一起。
+    """
+    default = _config_int_constant_loose(config_text, "RUN_COMMAND_TIMEOUT")
+    minimum = _config_int_constant_loose(config_text, "RUN_COMMAND_TIMEOUT_MIN")
+    maximum = _config_int_constant_loose(config_text, "RUN_COMMAND_TIMEOUT_MAX")
+    if default is None or minimum is None or maximum is None:
+        issues.append(_issue(
+            "config.py",
+            "integer RUN_COMMAND_TIMEOUT / RUN_COMMAND_TIMEOUT_MIN / RUN_COMMAND_TIMEOUT_MAX",
+            f"default={default} min={minimum} max={maximum}",
+        ))
+        return
+    span = f"{minimum}..{maximum}"
+    names = {
+        "RUN_COMMAND_TIMEOUT": default,
+        "RUN_COMMAND_TIMEOUT_MIN": minimum,
+        "RUN_COMMAND_TIMEOUT_MAX": maximum,
+    }
+    doc_sentence = f"timeout 只接受整數 {span} 秒（server 端上限；client 可能更早截止）"
+
+    annotation, default_src = _tool_arg_signature(mcp_text, "run_command", "timeout")
+    artifact = "mcp_server.run_command signature"
+    expected_annotation = (
+        "Annotated[int, Field(strict=True, ge=RUN_COMMAND_TIMEOUT_MIN, le=RUN_COMMAND_TIMEOUT_MAX)]"
+    )
+    if annotation != expected_annotation:
+        issues.append(_issue(artifact, f"timeout annotation {expected_annotation}", repr(annotation)))
+    if default_src != "RUN_COMMAND_TIMEOUT":
+        issues.append(_issue(artifact, "timeout default RUN_COMMAND_TIMEOUT", repr(default_src)))
+
+    doc = _tool_docstring(mcp_text, "run_command")
+    artifact = "mcp_server.run_command docstring"
+    _require_sentence(doc, f"秒,整數 {span},預設 {default}", artifact, issues)
+    _require_sentence(doc, "MCP client 可能更早截止", artifact, issues)
+
+    top = _native_tool_description(agent_tools_text, "_RUN_COMMAND_TOOL", names)
+    artifact = "_RUN_COMMAND_TOOL.description"
+    _require_sentence(top, f"timeout {span} 秒(server 端上限;client 可能更早截止)", artifact, issues)
+    _require_phrase(top, "AI_CODE_ENABLE_BUILD_COMMANDS=1", artifact, issues)
+    _require_phrase(top, "git 不在白名單", artifact, issues)
+
+    for key, expected in (
+        ("type", "'integer'"),
+        ("minimum", "RUN_COMMAND_TIMEOUT_MIN"),
+        ("maximum", "RUN_COMMAND_TIMEOUT_MAX"),
+        ("default", "RUN_COMMAND_TIMEOUT"),
+    ):
+        observed = _native_tool_param_bound(agent_tools_text, "_RUN_COMMAND_TOOL", "timeout", key)
+        if observed != expected:
+            issues.append(_issue(f"_RUN_COMMAND_TOOL.timeout.{key}", expected, repr(observed)))
+    param_doc = _native_tool_param_description(agent_tools_text, "_RUN_COMMAND_TOOL", "timeout", names)
+    _require_sentence(
+        param_doc, f"超時秒數,{span},預設 {default}(server 端上限;client 可能更早截止)",
+        "_RUN_COMMAND_TOOL.timeout.description", issues,
+    )
+
+    _require_sentence(readme_text, doc_sentence, "README.md", issues)
+    _require_sentence(mcp_tools_text, doc_sentence, "docs/mcp-tools.md", issues)
+    _require_sentence(security_text, doc_sentence, "docs/security.md", issues)
+    _require_sentence(troubleshooting_text, doc_sentence, "docs/troubleshooting.md", issues)
+
+
+def _check_verification_layer_claims(
+    mcp_text: str,
+    agent_tools_text: str,
+    mcp_tools_text: str,
+    security_text: str,
+    troubleshooting_text: str,
+    issues: list[str],
+) -> None:
+    """11. 驗證分層:每個 surface 鎖完整肯定式契約句(句首形式);只拒絕完整的舊肯定句。"""
+    doc = _tool_docstring(mcp_text, "apply_patch")
+    artifact = "mcp_server.apply_patch docstring"
+    _require_sentence(doc, "lint / typecheck / test 不會自動執行", artifact, issues)
+    _require_sentence(doc, "失敗**不回滾**", artifact, issues)
+    _require_sentence(doc, "patch 已套用、未回滾", artifact, issues)
+    _require_sentence(doc, "請另行呼叫 `codetrail_run_lint(fix=False)`", artifact, issues)
+    for stale in _OLD_AUTO_VERIFY_CLAIMS:
+        _forbid_phrase(doc, stale, artifact, issues)
+
+    top = _native_tool_description(agent_tools_text, "_APPLY_PATCH_TOOL")
+    artifact = "_APPLY_PATCH_TOOL.description"
+    _require_sentence(top, "套用後只做唯讀 syntax check", artifact, issues)
+    _require_sentence(top, "lint / test 請另外呼叫 run_lint(fix=False) / run_command", artifact, issues)
+    for stale in _OLD_AUTO_VERIFY_CLAIMS:
+        _forbid_phrase(top, stale, artifact, issues)
+
+    artifact = "docs/mcp-tools.md"
+    _require_sentence(mcp_tools_text, "apply_patch 不會自動執行 lint / typecheck / test", artifact, issues)
+    for stale in _OLD_AUTO_VERIFY_CLAIMS:
+        _forbid_phrase(mcp_tools_text, stale, artifact, issues)
+    _require_sentence(security_text, "這是**三個不同的 ask**", "docs/security.md", issues)
+    _require_sentence(
+        troubleshooting_text, "「驗證不完整」或「驗證未通過」**不是拒絕**",
+        "docs/troubleshooting.md", issues,
+    )
+
+
 _PRODUCT_STATUS_PHRASES = [
     "成熟私有部署版",
     "不打算公開發布",
@@ -300,6 +809,10 @@ def check_all() -> list[str]:
     docs_text = _documentation_text()
     mcp_text = _read(MCP)
     config_text = _read(CONFIG)
+    agent_tools_text = _read(AGENT_TOOLS)
+    mcp_tools_text = _read(MCP_TOOLS_DOC)
+    security_text = _read(SECURITY_DOC)
+    troubleshooting_text = _read(TROUBLESHOOTING_DOC)
 
     # 1. tool count
     mcp_tools = _mcp_tool_names(mcp_text)
@@ -348,6 +861,19 @@ def check_all() -> list[str]:
 
     # 8. Global AGENTS.md 文件用 manifest contract(不進可安裝 prompt)
     _check_agents_template_tools(_read(AGENTS_TEMPLATE_DOC), mcp_tools, issues)
+
+    # 9–11. apply_patch 上限 / run_command timeout / 驗證分層(具名文件分別檢查)
+    _check_apply_patch_limits_contract(
+        mcp_text, agent_tools_text, config_text, readme_text, mcp_tools_text,
+        troubleshooting_text, issues,
+    )
+    _check_run_command_timeout_contract(
+        mcp_text, agent_tools_text, config_text, readme_text, mcp_tools_text, security_text,
+        troubleshooting_text, issues,
+    )
+    _check_verification_layer_claims(
+        mcp_text, agent_tools_text, mcp_tools_text, security_text, troubleshooting_text, issues
+    )
 
     return issues
 

@@ -737,15 +737,21 @@ QUERY_SYMBOL_PATTERN = r'[A-Z][A-Z0-9_]{2,}'
 QUERY_PRESERVE_SYMBOLS = True
 
 # ============================================================
-# P2 改進：Patch 驗證策略設定
+# Patch 驗證策略設定(apply_patch 套用後的自動驗證)
 # ============================================================
-PATCH_AUTO_VERIFY = True             # 自動驗證 patch
-PATCH_VERIFY_STEPS = [
-    "lint",                          # 1. 跑 lint/format
-    "typecheck",                     # 2. 跑靜態分析（如 mypy）
-    "test"                           # 3. 跑測試（如 pytest）
-]
-# 靜態分析命令（按語言）
+# apply_patch 套用後的自動驗證只做「同 process、無 subprocess、唯讀」的 syntax check
+# (patch_verify.py:.py/.pyi 用 ast.parse,C/C++ 用已載入的 tree-sitter grammar)。
+# lint / typecheck / test 一律不由 apply_patch 自動執行:它們各自是獨立的 OpenCode ask
+# (codetrail_run_lint / codetrail_run_command),藏在 apply_patch 裡等於把「寫檔」核准
+# 暗中擴張成「執行專案程式碼」核准(pytest plugin、conftest.py、build script 都會跑)。
+# 結果三態 passed / failed / skipped:有任何 skipped 就是「驗證不完整」,不會渲染成通過;
+# syntax 失敗不回滾(advisory gate),結果會明講「patch 已套用、未回滾」。
+PATCH_AUTO_VERIFY = True             # 只控制 syntax check;False = 連 syntax check 也不做
+PATCH_VERIFY_STEPS = ["syntax"]      # 唯一會被 apply_patch 消費的步驟
+# 舊值 "lint" / "typecheck" / "test" 仍可寫進 PATCH_VERIFY_STEPS,但 apply_patch 不再消費:
+# 會列為 skipped(step ... is no longer consumed by apply_patch)並歸入「驗證不完整」,
+# 不留看似可用、實際繞過權限的半套 opt-in。
+# 靜態分析命令(按語言)——不再由 apply_patch 消費;保留給日後顯式工具使用。
 TYPECHECK_COMMANDS = {
     '.py': ['mypy --ignore-missing-imports'],
     '.ts': ['tsc --noEmit'],
@@ -1046,6 +1052,12 @@ LINT_COMMANDS = {
 # 其他 runtime / 測試可透過環境變數 AI_CODE_RUN_TESTS=1 啟用。
 RUN_COMMAND_ENABLED = _os.environ.get('AI_CODE_RUN_TESTS', '').lower() in ('1', 'true', 'yes')
 RUN_COMMAND_TIMEOUT = 60
+# run_command 的 timeout(秒)三層契約:native tool schema、ToolExecutor 執行前 runtime
+# 驗證、mcp_server 的 Annotated[int, Field(strict=True, ge=MIN, le=MAX)] 都從這兩個常數來。
+# 這是 server 端接受的範圍;MCP client(OpenCode 等)可能更早截止,不保證 600 秒必在
+# client timeout 內。
+RUN_COMMAND_TIMEOUT_MIN = 1
+RUN_COMMAND_TIMEOUT_MAX = 600
 RUN_COMMAND_MAX_OUTPUT = 8000
 # 裁切策略：測試輸出保留尾巴（錯誤訊息通常在尾部）
 RUN_COMMAND_TAIL_RATIO = 0.7  # 超長輸出時，保留 70% 尾巴 + 30% 頭部
@@ -1071,7 +1083,7 @@ ALLOWED_COMMANDS = [
     # Go（最安全，不執行專案腳本）
     'go test',
 
-    # === 靜態分析命令（供 Patch 驗證使用）===
+    # === 靜態分析命令（供模型顯式呼叫 run_command 使用；apply_patch 不再自動執行）===
     # Python 型別檢查
     'mypy', 'python -m mypy',
     # TypeScript 型別檢查

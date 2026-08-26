@@ -19,7 +19,7 @@ pytestmark = pytest.mark.smoke
 @pytest.fixture
 def patchable(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(config, "PATCH_ENABLED", True)
-    # 跳過 patch 之後的 lint/typecheck/test 自動驗證（這些會嘗試呼叫真的 ruff/mypy/pytest）
+    # steps=[] = requested 為空,apply_patch 回報「驗證不完整」;它不會 spawn 任何工具
     monkeypatch.setattr(config, "PATCH_VERIFY_STEPS", [])
     monkeypatch.setattr(config, "RUN_COMMAND_ENABLED", False)
     return tmp_path
@@ -126,7 +126,8 @@ def test_apply_patch_too_many_files(patchable: Path, monkeypatch):
 def runner(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(config, "PATCH_ENABLED", True)
     monkeypatch.setattr(config, "RUN_COMMAND_ENABLED", False)
-    # 關掉自動驗證,避免測試需要 lint 工具
+    # PATCH_AUTO_VERIFY=False = 停用自動 syntax check(steps=[] 則是 requested 為空、回報「驗證不完整」);
+    # 兩者都不會 spawn 任何工具
     monkeypatch.setattr(config, "PATCH_AUTO_VERIFY", False)
     monkeypatch.setattr(config, "PATCH_VERIFY_STEPS", [])
     return ToolExecutor(str(tmp_path))

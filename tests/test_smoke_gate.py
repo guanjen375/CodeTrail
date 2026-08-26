@@ -58,7 +58,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_patch_apply.py": (
-        "apply_patch 的 context 必須匹配 / 批次原子性",
+        "apply_patch 的 context 必須匹配 / 全量 preflight＋best-effort rollback",
         (
             "test_dry_run_reports_context_mismatch",
             "test_multi_file_is_atomic",
@@ -74,6 +74,37 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_apply_patch_rejects_path_outside_sandbox",
             "test_apply_patch_rejects_mismatched_context",
             "test_apply_patch_too_many_files",
+        ),
+    ),
+    "test_patch_search_replace.py": (
+        "apply_patch SEARCH/REPLACE 的 sandbox(path escape / symlink)與唯一匹配、不重疊(定位錯就是靜默改錯處)",
+        (
+            "test_sr_path_escapes_rejected",
+            "test_sr_symlink_escape_rejected",
+            "test_sr_ambiguous_match_is_rejected_with_zero_writes",
+            "test_sr_overlapping_blocks_rejected",
+        ),
+    ),
+    "test_patch_byte_safety.py": (
+        "patch_engine 的 byte-safe 寫入(UTF-8 strict / CRLF 保留)與 batch 失敗的 best-effort rollback",
+        (
+            "test_non_utf8_file_is_rejected_and_bytes_untouched",
+            "test_crlf_file_keeps_crlf_after_patch",
+            "test_nested_new_file_then_batch_failure_removes_file_and_empty_dirs",
+        ),
+    ),
+    "test_patch_verify.py": (
+        "patch_verify:apply_patch 的自動驗證不得暗中 spawn subprocess(寫檔核准不得擴張成執行核准)",
+        (
+            "test_auto_verify_true_spawns_no_subprocess",
+            "test_patch_verify_module_import_allowlist_is_exact",
+        ),
+    ),
+    "test_run_command_timeout.py": (
+        "run_command timeout 1..600 的 executor 與 MCP 兩層邊界",
+        (
+            "test_executor_rejects_timeout_out_of_bounds",
+            "test_mcp_call_tool_rejects_non_strict_timeouts",
         ),
     ),
     "test_mcp_startup.py": (

@@ -411,3 +411,123 @@ def test_exact_call_edge_stays_confirmed_evidence():
     assert any("confirmed callee" in reason for reason in reasons), reasons
     assert not any("not confirmed evidence" in row["reason"]
                    for row in bundle["uncertainties"]), bundle["uncertainties"]
+
+
+# ---------------------------------------------------------------------------
+# workflow F:lexical / index evidence 不依賴 graph;graph 缺席時必有
+# relationship uncertainty(唯一產生點常數,警語永不截斷)。
+# ---------------------------------------------------------------------------
+def _numbered_window(path: str, start: int, end: int) -> str:
+    lines = [f"{line:4d} | {path}: line {line}" for line in range(start, end + 1)]
+    return f"=== {path} (行 {start}-{end} / 共 400 行) ===\n" + "\n".join(lines)
+
+
+_F_SEMANTIC = [{"path": "src/boot.c", "symbol": "boot_init", "line": 10, "end_line": 20}]
+_F_INDEX = [
+    {"path": "src/boot.c", "symbol": "boot_init", "line": 10, "end_line": 20,
+     "context": "void boot_init(void)"},
+    {"path": "tests/test_boot.c", "symbol": "test_boot_init_handoff", "line": 5,
+     "end_line": 12, "context": "boot_init handoff region check"},
+]
+_F_GREP_HITS = [{"path": "config/board.cfg", "line": 3, "terms": ["boot_init", "handoff"]}]
+_F_ALLOWED = {"src/boot.c", "tests/test_boot.c", "config/board.cfg"}
+
+
+def _f_bundle(**overrides):
+    kwargs = dict(
+        query="boot_init handoff region",
+        semantic_items=_F_SEMANTIC,
+        index_items=_F_INDEX,
+        allowed_paths=_F_ALLOWED,
+        read_window=_numbered_window,
+        max_chars=8000,
+        lexical_hits=_F_GREP_HITS,
+    )
+    kwargs.update(overrides)
+    return code_context.build_code_context(**kwargs)
+
+
+def _reason_tokens_by_path(bundle: dict) -> dict[str, set[str]]:
+    return {item["path"]: set(item["reason"].split("; ")) for item in bundle["evidence"]}
+
+
+def _relationship_rows(bundle: dict) -> list[dict]:
+    return [
+        row for row in bundle["uncertainties"]
+        if row["target"] == code_context.RELATIONSHIP_UNAVAILABLE_TARGET
+    ]
+
+
+@pytest.mark.smoke
+def test_graph_none_keeps_index_lexical_and_grep_evidence_and_reports_relationship_uncertainty():
+    bundle = _f_bundle(graph=None, graph_status="unavailable")
+
+    tokens = _reason_tokens_by_path(bundle)
+    assert "semantic" in tokens["src/boot.c"]
+    assert "lexical test candidate" in tokens["tests/test_boot.c"], tokens
+    assert "lexical config candidate" in tokens["config/board.cfg"], tokens
+    assert bundle["graph_status"] == "unavailable"
+
+    rows = _relationship_rows(bundle)
+    assert len(rows) == 1, bundle["uncertainties"]
+    assert rows[0]["reason"] == code_context.RELATIONSHIP_UNAVAILABLE_REASON.format(
+        category="unavailable"
+    )
+
+    # graph 正常(不拋例外)時:同一組輸入不加 relationship uncertainty,
+    # lexical evidence 也一樣在。
+    ok_graph = _stub_graph(
+        {"src_id": "seed", "dst_id": "callee", "dst_name": "target",
+         "resolved": True, "confidence": "exact",
+         "ambiguity_group": None, "type": "calls"},
+        {"id": "callee", "path": "src/b.py", "start_line": 1, "end_line": 3,
+         "name": "target"},
+    )
+    ok_bundle = _f_bundle(graph=ok_graph, graph_status="ok")
+    assert ok_bundle["graph_status"] == "ok"
+    assert _relationship_rows(ok_bundle) == []
+    assert {item["path"] for item in ok_bundle["evidence"]} == {
+        item["path"] for item in bundle["evidence"]
+    }
+
+
+@pytest.mark.smoke
+def test_graph_exception_degrades_but_lexical_evidence_survives_with_bounded_uncertainty():
+    class ExplodingGraph:
+        def find_nodes(self, name, limit=20):
+            raise RuntimeError("graph lookup exploded " + "x" * 400)
+
+        def neighbors(self, *args, **kwargs):  # pragma: no cover - find_nodes 先炸
+            raise AssertionError("neighbors must not be reached")
+
+        def file_neighbors(self, *args, **kwargs):  # pragma: no cover
+            raise AssertionError("file_neighbors must not be reached")
+
+    bundle = _f_bundle(graph=ExplodingGraph(), graph_status="ok")
+
+    assert bundle["graph_status"].startswith("degraded: RuntimeError")
+    assert len(bundle["graph_status"]) <= 200
+
+    tokens = _reason_tokens_by_path(bundle)
+    assert "semantic" in tokens["src/boot.c"]
+    assert "lexical test candidate" in tokens["tests/test_boot.c"], tokens
+    assert "lexical config candidate" in tokens["config/board.cfg"], tokens
+
+    rows = _relationship_rows(bundle)
+    assert len(rows) == 1, bundle["uncertainties"]
+    expected = code_context.RELATIONSHIP_UNAVAILABLE_REASON.format(category="degraded")
+    assert rows[0]["reason"] == expected
+    assert rows[0]["reason"].endswith("未看到 caller/callee 不代表不存在")
+
+
+@pytest.mark.smoke
+def test_graph_none_with_default_status_is_reported_as_unavailable():
+    bundle = _f_bundle(
+        index_items=[], lexical_hits=(), allowed_paths={"src/boot.c"}, graph=None,
+    )
+    assert bundle["graph_status"] == "unavailable"
+    rows = _relationship_rows(bundle)
+    assert len(rows) == 1, bundle["uncertainties"]
+    assert rows[0]["reason"] == code_context.RELATIONSHIP_UNAVAILABLE_REASON.format(
+        category="unavailable"
+    )

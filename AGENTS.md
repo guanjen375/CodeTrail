@@ -76,7 +76,10 @@
 - `agent_tools.ToolExecutor._safe_path` — 所有檔案讀寫的 sandbox 入口
 - `media._safe_path` — 圖片/ELF/binary 的 sandbox 入口
 - `agent_tools._validate_command` — run_command 白名單 + dangerous-pattern 過濾
-- `apply_patch` 的「context 必須匹配」、「max files / max lines」邏輯
+- `apply_patch` 的「context／SEARCH 必須逐字匹配（S/R 絕不用相似度代套）」、「max files / max lines
+  （udiff added+removed；S/R payload budget）」邏輯；`patch_engine` 的 byte-safe 寫入（UTF-8 strict、
+  BOM/CRLF 保留、symlink／dir-fd 防線、best-effort rollback）；`patch_verify` 的「驗證層不得 spawn
+  subprocess、skipped 不得算 passed」；`run_command` 的 timeout 1..600 三層邊界
 - `mcp_server.py` 啟動時 `set_sandbox_root(AICODE_ROOT, allow_external=False)`
 - `kb_cache` 的 embeddings 身分驗證（逐列 chunk id / generation / 內容雜湊 / model）
   與「重建不了就 fail-loud、絕不沿用舊向量」——放寬它就是靜默錯答

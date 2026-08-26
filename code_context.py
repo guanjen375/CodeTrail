@@ -10,6 +10,14 @@ content de-duplication, and a *character* packing budget.  It is deliberately no
 Filesystem access is injected.  Production callers must use the existing
 ``ToolExecutor.grep`` / ``ToolExecutor.read_file`` paths; this module never opens
 source files directly.
+
+Evidence sources are independent (workflow F): semantic seeds, index lexical
+candidates and safe grep hits never depend on the code graph.  The graph only
+adds *relationship* evidence (confirmed callers / callees / includes); when it
+is missing or its lookup fails, the bundle still carries semantic + lexical
+evidence and reports exactly one bounded uncertainty saying that relationship
+evidence is unavailable (``RELATIONSHIP_UNAVAILABLE_*`` below is the single
+source of that wording).
 """
 from __future__ import annotations
 
@@ -34,6 +42,28 @@ _PATH_DIVERSITY_PENALTY = 12.0
 # confidence="heuristic";當成確定證據會把 obj.target() 綁到不相干的同名函式。
 # 與 code_graph.CONFIRMED_EDGE_CONFIDENCE 同一組值(path mode 用同一條線)。
 _CONFIRMED_EDGE_CONFIDENCE = frozenset({"exact", "resolved"})
+
+# graph 缺席 / 損壞 / lookup 例外時的 relationship uncertainty 唯一產生點。
+# 分類只有兩個定長值:"unavailable"(graph 為 None,含 graph 尚未建立或損壞)
+# 與 "degraded"(graph 存在但 lookup 拋例外)。例外細節只留在 top-level
+# graph_status(既有 200 字元上限),這句警語本身永不截斷,mcp_server docstring
+# 與 README / docs 引用同一句。
+RELATIONSHIP_UNAVAILABLE_TARGET = "call/include relationships"
+RELATIONSHIP_UNAVAILABLE_REASON = (
+    "呼叫關係證據不可用（relationship evidence unavailable: graph {category}）；"
+    "未看到 caller/callee 不代表不存在"
+)
+_RELATIONSHIP_CATEGORIES = ("unavailable", "degraded")
+
+
+def relationship_unavailable_uncertainty(category: str) -> dict:
+    """The one bounded uncertainty emitted whenever relationship evidence is absent."""
+    if category not in _RELATIONSHIP_CATEGORIES:
+        raise ValueError(f"relationship category 必須是 {_RELATIONSHIP_CATEGORIES},收到 {category!r}")
+    return {
+        "target": RELATIONSHIP_UNAVAILABLE_TARGET,
+        "reason": RELATIONSHIP_UNAVAILABLE_REASON.format(category=category),
+    }
 
 _STOP_WORDS = frozenset({
     "about", "after", "also", "and", "because", "before", "change", "changing",
@@ -527,7 +557,15 @@ def build_code_context(
 
     candidates = list(seed_candidates)
     uncertainties: list[dict] = []
-    if graph is not None:
+    graph_status = str(graph_status)
+    relationship_category = None
+    if graph is None:
+        # graph 尚未建立 / 損壞:relationship evidence 缺席。呼叫端沒標狀態
+        # (預設 "ok")時一併正規化,回傳裡不得出現「graph_status: ok 但沒有 graph」。
+        relationship_category = "unavailable"
+        if graph_status == "ok":
+            graph_status = "unavailable"
+    else:
         try:
             graph_candidates, graph_uncertainties = _graph_candidates(
                 graph, seeds, allowed, normalized_items, str(query)
@@ -536,10 +574,16 @@ def build_code_context(
             uncertainties.extend(graph_uncertainties)
         except Exception as exc:
             graph_status = f"degraded: {type(exc).__name__}: {exc}"[:200]
+            relationship_category = "degraded"
 
-        # Graph is available: add local lexical/test/trace/config diversity.
-        candidates.extend(_index_lexical_candidates(str(query), normalized_items, allowed))
-        candidates.extend(_grep_lexical_candidates(lexical_hits, allowed))
+    # lexical / index / test / config diversity never depends on the graph
+    # (workflow F): graph None 或 lookup 失敗時這兩類候選照樣參與選取。
+    candidates.extend(_index_lexical_candidates(str(query), normalized_items, allowed))
+    candidates.extend(_grep_lexical_candidates(lexical_hits, allowed))
+
+    if relationship_category is not None:
+        # 放最前面:_dedupe_uncertainties 的上限裁尾,這條必須永遠留著。
+        uncertainties.insert(0, relationship_unavailable_uncertainty(relationship_category))
 
     ranked = rank_with_file_diversity(merge_candidate_ranges(candidates))
     discarded = ranked[_MAX_CANDIDATES:]

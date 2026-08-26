@@ -32,8 +32,8 @@
 | 覆核 PDF 抽出來的表格 / log | 請用工具 `review_figures` 列出待覆核的圖，說明每一張的原因；我看過原圖再決定要不要修。 | `review_figures(action="list")`、`review_figures(action="fix", ...)` |
 | 移除舊文件 | 請用工具 `remove_document` 移除 `old_spec.pdf`（查詢會自動偵測變更）。 | `remove_document(...)` |
 | 準備改檔 | 請先用工具 `git_status` 和 `git_diff` 確認目前變更，再說明要改哪些檔案。 | `git_status(...)`、`git_diff(...)` |
-| 套修改 | 請產生最小 unified diff（`@@` 不必帶行號，修改行前後 2–3 行 context 即可），先用工具 `apply_patch` 預覽，再正式套用。 | `apply_patch(...)` |
-| 修改後檢查 | 請用工具 `run_lint` 檢查剛改的檔案，再用工具 `run_command` 跑最小相關測試。 | `run_lint(...)`、`run_command(...)` |
+| 套修改 | 請產生 SEARCH/REPLACE 區塊（path 一行、`<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` 各自獨佔一行，SEARCH 逐字抄檔案現況；或最小 unified diff），先用工具 `apply_patch` 的 `dry_run` 預覽，再正式套用。 | `apply_patch(...)` |
+| 修改後檢查 | 請用工具 `run_lint`（`fix=False`）檢查剛改的檔案，再用工具 `run_command` 跑最小相關測試——`apply_patch` 不會代跑，這兩步各自需要你核准。 | `run_lint(...)`、`run_command(...)` |
 | 糾正模型的做事方式 | (糾正它之後)請用工具 `record_lesson` 把這條記成行為規則,之後的 session 都要遵守。 | `record_lesson(...)` |
 
 ### 依任務分類
@@ -55,9 +55,9 @@
 | 文件/外部檔案 | `query_knowledge_strict(question, source=None)` | 查高風險規格題，弱證據會拒答；可限定文件 |
 | 修改/驗證 | `git_status()` | 看工作樹目前有沒有改動 |
 | 修改/驗證 | `git_diff(path=None, staged=False)` | 看修改內容，不需要用 `run_command` 跑 git |
-| 修改/驗證 | `apply_patch(diff, dry_run=False)` | 套 unified diff（行號選填，靠 context 定位），會真的寫檔 |
+| 修改/驗證 | `apply_patch(diff, dry_run=False)` | 套 SEARCH/REPLACE 或 unified diff（同一次只能一種；參數已是字串，不要包 fence），會真的寫檔；最多 5 個檔案、單檔 200 行（udiff 算 added+removed；S/R 算 payload budget = SEARCH+REPLACE 行數，不是同一種計數）；UTF-8 strict，BOM／CRLF／檔尾換行／權限原樣保留，mixed newline 與 symlink 拒絕；套用後只做唯讀 syntax check（advisory、三態、失敗不回滾）；細節見[apply_patch 的兩種格式](#apply_patch-的兩種格式) |
 | 修改/驗證 | `run_lint(path, fix=True)` | 對單一檔案跑格式化/lint；`fix=False` 走 check-only(不改檔) |
-| 修改/驗證 | `run_command(cmd)` | 跑白名單內的測試 / lint;build 命令(make/cmake/ninja/meson/bazel)需設 `AI_CODE_ENABLE_BUILD_COMMANDS=1` |
+| 修改/驗證 | `run_command(cmd, timeout=60)` | 跑白名單命令；timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），預設 60。預設白名單 = 測試／靜態命令；build 命令(make/cmake/ninja/meson/bazel)需設 `AI_CODE_ENABLE_BUILD_COMMANDS=1`；git 不在白名單（用 `git_status` / `git_diff`） |
 | 行為教訓 | `record_lesson(rule, scope="project")` | 你糾正模型行為後,把糾正「提案」成一條行為規則;經你核准(permission ask)寫入 lessons store,之後 session 注入 context([docs/lessons.md](lessons.md)) |
 
 ### `code_rag_search` 四種模式
@@ -71,8 +71,11 @@
   `max_chars` 合法範圍為 `2000..30000`，預設 `12000`；`used_chars` 只計
   `evidence[].text`，不是 tokenizer token。candidate、graph traversal 與 character budget 的
   截斷會分開回報。歧義、unresolved 與 Python attribute-call heuristic 只進
-  `uncertainties`，不算 confirmed；graph 缺席時仍回 semantic-only evidence 並標示
-  `graph_status`。
+  `uncertainties`，不算 confirmed。graph 缺席或損壞時，lexical（grep / index）候選仍會
+  參與選取，實際 evidence 仍受既有 candidate 與字元 budget 約束；只有呼叫關係證據缺席，
+  `graph_status` 標示原因，`uncertainties` 會列出
+  `呼叫關係證據不可用（relationship evidence unavailable: graph unavailable）；未看到 caller/callee 不代表不存在`
+  （graph 查詢途中出錯時 `graph unavailable` 改為 `graph degraded`）。
 - `mode="neighbors"`：query 放 symbol 名可看 1–2 hop 關係；放 repo 相對檔案路徑
   （例如 `src/uart.c`）可看 include / import 關係。
 - `mode="path"`：query 寫 `"SRC -> DST"`，回傳最多 3 條、最長 4 hop 的最短呼叫鏈。
@@ -215,18 +218,53 @@ native lane(原生表格,零 VL 呼叫)**沒有任何模型影像輸入**,它的
 手動清除方式與後果見
 [RAG、附件與知識庫操作](rag.md#pdf-內的表格與終端機畫面結構化抽取--人工覆核)。
 
+### apply_patch 的兩種格式
+
+`apply_patch` 的 `diff` 參數同一次只接受一種格式；參數已是字串，**不要再包 Markdown fence**；混用、孤立 marker、fence、marker 外的說明文字都會被拒絕。路徑一律 repo-relative POSIX（`src/led.c`），兩種格式的規則不同：SEARCH/REPLACE 的 path 必須是 canonical 寫法——拒絕絕對路徑、Windows drive／UNC、反斜線、`/dev/null`、NUL 或控制字元，也拒絕 `.`／`..` component、`//` 與結尾 `/`（不做正規化、不 strip 前後空白）；unified diff 的 `--- a/` / `+++ b/` 路徑沿用既有正規化——容忍 `./` 前綴與重複 `/`（`.` component 會被丟掉），但同樣拒絕絕對路徑、drive、反斜線與 `..`。過去 `a/../b.py` 只要 resolve 進 root 就會被接受，現在兩種格式一律拒絕（安全面的行為變更）。
+
+**格式 A — SEARCH/REPLACE**（建議本地模型優先使用；不需要行號、不需要 context 前綴）：
+
+```text
+src/led.c
+<<<<<<< SEARCH
+void led_toggle(void) {
+    gpio_write(LED_PIN, !gpio_read(LED_PIN));
+}
+=======
+void led_toggle(void) {
+    gpio_toggle(LED_PIN);
+}
+>>>>>>> REPLACE
+```
+
+- path 是 marker 前一個非空行；三個 marker 必須各自獨佔完整的一行、逐字相同。內容本身需要一整行同樣的 marker 時改用 unified diff。
+- SEARCH 逐行 exact 比對，只容忍行尾空白；縮排不同就是不匹配，工具不會拿相似的位置代套。SEARCH 在檔案中出現多處 → 拒絕（S/R 沒有行號提示，請多帶幾行讓它唯一）；多個區塊都對同一份原始檔定位，互相重疊 → 拒絕。
+- 空 SEARCH（marker 之間沒有任何行）= 建立新檔，只在目標不存在、該檔恰一個區塊、REPLACE 非空時成立；檔案已存在（含 0 byte）一律拒絕。新檔為 LF、無 BOM，權限交給 umask。
+
+**格式 B — unified diff**（`--- a/f` / `+++ b/f` / `@@`）：定位靠 context 內容，行號選填、不必計算行數；多處匹配靠 `@@` 行號提示消歧、已套用過的 hunk 會跳過、純新增沒有 context 時只能靠行號且必須落在檔案範圍內。
+
+**上限**：最多 5 個檔案；udiff 單檔 200 行（added+removed）；S/R 單檔 payload budget = SEARCH 行數 + REPLACE 行數（同檔所有區塊合計）≤ 200——兩者不是同一種計數。
+
+**檔案安全（兩格式相同）**：既有檔以 UTF-8 strict 讀取，非 UTF-8 → 整份 patch 拒絕、零寫入；BOM、CRLF、檔尾有無換行、權限位元原樣保留；CR-only 或 mixed newline 一律拒絕；目標或路徑上有 symlink 一律拒絕。單檔寫入：既有檔 = 同目錄唯一 temp（`O_EXCL` 建立、fsync）＋ `os.replace` 原子替換（寫入前重驗 preimage 未變）；新檔 = 同目錄 temp ＋ 不覆寫發布（POSIX 用 hard link，同名檔在 preflight 後冒出就中止而不是覆蓋；檔案系統不支援 hard link 時退回 lstat 檢查＋replace，並在結果第一段明示降級）；沒有 dir_fd 的平台（Windows）退回逐層 lstat 重驗並同樣明示。多檔是「全量 preflight＋失敗時 best-effort rollback」，不是跨檔交易——第二檔 preflight 失敗時第一檔也不會被改，寫入途中失敗會盡力還原已寫入的檔案，還原不了的項目如實回報。
+
+**dry_run**：只做 preflight、零副作用（不建目錄、不留 temp、不跑驗證），逐檔固定回報 `format`、檔案清單、`blocks`（區塊數）、`budget`（payload 用量／上限）、`locations`（定位行）、`new_file`（是否新建）；全部通過才顯示唯一的一行 `would apply`。
+
+**不匹配時的回饋**：回覆會附最接近位置的檔案現況（逐行編號）與第一個差異（期望／實際），提示從現況逐字重建 SEARCH／context 後重送；40 行／2000 字元是同一次結果中**所有 mismatch 預覽的合計**上限，不是整份結果的長度上限；相似度只用來排名提示，絕不代套。
+
+**套用後的驗證**：只做同一 process、唯讀的 syntax check（`.py`/`.pyi` 用 ast；C/C++ 只在 tree-sitter grammar 載入時檢查；缺 grammar 或不支援的副檔名 = skipped，不算通過）。結果三態：`✓ 驗證完成且通過` / `⚠ 驗證不完整` / `✗ 驗證未通過——patch 已套用、未回滾`；syntax 是 advisory gate，失敗不回滾。apply_patch 不會自動執行 lint / typecheck / test，也不會呼叫會改檔的 formatter；`PATCH_AUTO_VERIFY=False` 時連 syntax check 也不做。lint 與測試請另行呼叫 `run_lint(fix=False)` 與 `run_command`，它們各自需要獨立核准。
+
 ### 使用原則
 
 - 分析、解釋、推導或找原因時，先用 `code_rag_search(mode="context")` 一次取得 bounded evidence；不足才做精準 `grep_code` / `read_file`，同一 query 不重複。
 - 只想定位程式碼時，用工具 `code_rag_search` 或 `grep_code`，再用工具 `read_file`。
-- 問「誰呼叫了 X」「X 怎麼一路呼叫到 Y」時,用 `code_rag_search` 的 `mode="neighbors"`(query 放 symbol 名)/ `mode="path"`;問「這個檔直接 include 了誰」時,`mode="neighbors"` 的 query 放 repo 相對檔案路徑。回傳的關係每一步都有 `檔:行` 證據,unresolved(function pointer / macro 間接呼叫)與歧義候選(同名多定義)會明講。graph 首次建置要在終端跑一次建立命令——沒建就查 graph 模式會明確報錯,**錯誤訊息就含完整可執行的那條命令**(實際 interpreter 與絕對路徑,直接複製貼上;semantic 不受影響);建好之後查詢自動偵測檔案變更做增量更新,安裝 tree-sitter grammar 或改 `AICODE_H_LANG` 後會自動整體重建。
+- 問「誰呼叫了 X」「X 怎麼一路呼叫到 Y」時,用 `code_rag_search` 的 `mode="neighbors"`(query 放 symbol 名)/ `mode="path"`;問「這個檔直接 include 了誰」時,`mode="neighbors"` 的 query 放 repo 相對檔案路徑。回傳的關係每一步都有 `檔:行` 證據,unresolved(function pointer / macro 間接呼叫)與歧義候選(同名多定義)會明講。graph 首次建置要在終端跑一次建立命令——沒建就查 graph 模式會明確報錯,**錯誤訊息就含完整可執行的那條命令**(實際 interpreter 與絕對路徑,直接複製貼上;semantic 不受影響);建好之後查詢自動偵測檔案變更做增量更新,安裝 tree-sitter grammar 或改 `AICODE_H_LANG` 後會自動整體重建。graph 可用時先查 `neighbors`;`graph_status` 為 unavailable 時改用 `mode="context"` / `grep_code`,並把 caller coverage 標為不完整——不能因為沒看到呼叫者就推論沒有呼叫者。
 - 檔案變更偵測有一個 30 秒的快照窗(`AICODE_CODE_RAG_REFRESH_TTL`,設 0 關閉):透過 CodeTrail 工具(`apply_patch` / `run_command` / `run_lint`)寫檔會立即失效重掃;**在外部編輯器改檔**則最長 30 秒內的查詢可能還看到舊索引,屬既知取捨。
 - 長檔先用工具 `file_info` 看大小，再要求工具 `read_file` 分段讀。
 - 查 spec 先用工具 `query_knowledge`；數字、限制、預設值這類答錯很糟的題目，用工具 `query_knowledge_strict`。多份相似版本並存時傳 `source="檔名"`，filter 會在 top-k 前套用。
 - 外部檔案先用工具 `import_external_file`，再用工具 `analyze_file`、`ingest_document` 或 `read_file` 處理匯入後路徑。
 - 新增或刪除文件後查詢會自動載入變更；要立即確認 chunk 數可用工具 `reload_knowledge_base`。
-- 改檔前先看工具 `git_status` / `git_diff`；改檔用工具 `apply_patch`。
-- 工具 `apply_patch` 和 `run_command` 有副作用；需要改檔或執行專案腳本時才允許。
+- 改檔前先看工具 `git_status` / `git_diff`；改檔用工具 `apply_patch`（SEARCH/REPLACE 或 unified diff 二擇一，先 `dry_run` 預覽）。
+- `apply_patch`（寫檔）、`run_lint(fix=True)`（格式化）、`run_command`（執行命令）是三個不同的 ask，各自需要你核准。apply_patch 不會自動執行 lint / typecheck / test；需要改檔或執行專案腳本時才允許。
 - 工具 `record_lesson` 只在「你糾正了模型的做事方式」之後用;工具報錯或答案錯誤不是觸發條件。寫入需要你核准,細節與管理指令見 [docs/lessons.md](lessons.md)。
 - 圖很多的 PDF 先用 `ingest_document(path, preflight_only=True)` 估成本（零寫入），再決定要不要在 MCP 裡跑或改走 CLI。
 - REF 標「待覆核」的圖片內容不得當成規格數值的定論；`query_knowledge_strict` 的 `excluded_figures` 就是被 gate 擋下、但確實存在的圖，照實轉述頁碼與原因。**structured figure（`excluded_figures` 帶 `figure_id`）能用 `review_figures` 覆核**（`fix` 會改 KB，permission 是 `ask`）；新 ingest 的純 raster 也屬 structured figure。只有舊 KB 的 legacy VL chunk 沒有 canonical payload，不能在這裡覆核。

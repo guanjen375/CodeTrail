@@ -23,7 +23,7 @@ llama-server HTTP endpoint。
 | 文件 RAG | PDF / Markdown / text / 圖片 / ELF / firmware 入庫、rerank、strict answer | `ingest_document`、`query_knowledge*` |
 | 多模態 | 截圖、圖表、掃描頁與 PDF 內的**純 raster** 內嵌圖走獨立 VL server | `analyze_file`、`ingest_document` |
 | PDF 圖片監督 | **有原生證據**的表格 / 向量文字 log 走結構化抽取，帶驗證狀態；未驗證內容被 strict 查詢排除，可人工覆核 | `ingest_document(preflight_only=…)`、`review_figures` |
-| 修改與驗證 | patch context matching、變更上限、lint / test 白名單 | `apply_patch`、`run_lint`、`run_command` |
+| 修改與驗證 | 兩種 patch 格式（SEARCH/REPLACE、unified diff）共用 sandbox、上限與 byte-safe 寫入：最多 5 個檔案、單檔 200 行（udiff 算 added+removed；S/R 算 payload budget = SEARCH+REPLACE 行數）；套用後只做唯讀 syntax check（三態、不回滾）；lint / test 走各自的 ask 閘；`run_command`：timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止） | `apply_patch`、`run_lint`、`run_command` |
 | 行為教訓 | 使用者核准後跨 session 注入，90 天複審 | `record_lesson` |
 | Frontend | `aicode` 為穩定主線；`aicode_web` / `aicode attach` 為選用 | shell wrappers |
 
@@ -658,6 +658,8 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 
 `aicode` 啟動時會把**既有** `mcp.codetrail` entry 中缺漏、型別錯誤或小於 660000 的 `timeout` 自動同步為專案常數,保留其餘 OpenCode JSON 設定,並在同目錄留下 `opencode.json.codetrail.bak`(若已存在則加數字後綴)。寫入採原子替換;設定檔格式錯誤或無法寫入時會 fail-loud,不會帶著已知錯誤啟動 OpenCode。只有緊急測試才用 `AICODE_MCP_TIMEOUT_CHECK_SKIP=1 aicode` 跳過。
 
+升級說明（patch／verify 改版）：工具仍是 19 個、名稱不變，但 `apply_patch`（新增 SEARCH/REPLACE 格式、byte-safe 寫入、唯讀 syntax check）與 `run_command`（新增 `timeout` 參數，1..600 秒）的 tool schema / description 已變。`git pull` 之後要**完全退出** OpenCode、開新 session 讓 MCP 重連——舊 session 拿到的是舊 schema，模型會照舊說明呼叫。不要把參數手冊貼進全域 `~/.config/opencode/AGENTS.md`：本輪 tool schema 才是唯一真值（見 [docs/opencode-agents-template.md](docs/opencode-agents-template.md)），格式與上限的人類文件在 [MCP 工具清單](docs/mcp-tools.md#apply_patch-的兩種格式)。
+
 主模型 context 也採同一原則：使用者只在 `set_config.sh` 設 `n_ctx`。`aicode` 會讀主 server `/props` 的實值，供 CodeTrail internal calls 使用，並把 OpenCode active model 的 `limit.context` 安全同步成同一值。同步只改該 model 的這一欄、原子寫入並留備份；無法唯一定位 model、JSON 損壞或寫入失敗時才 fail-loud。
 
 `aicode`（含 `aicode web` 與最終委派它的 `aicode_web`，不含只連既有 backend 的 `attach`）還會自動跑兩層工具健檢。第一層每次都直接對實際 MCP command 做 `initialize → tools/list → list_dir`，並要求工具集合精確等於文件列出的 19 個；第二層用 fresh `opencode run --format json` 要 active model 真正呼叫 `codetrail_list_dir`，只有 `tool_use.state.status=completed` 的結構化 event 才算 PASS，模型輸出的 XML／成功宣稱一律不算。模型層 PASS 依 OpenCode config、模型、server `/props`（含 chat template／取樣預設）、專案規則與版本指紋快取 24 小時；設定變更會自動失效。快取只有 hash／時間，不含 prompt、檔名或 tool output，臨時 canary session 也會在檢查後刪除。完整輸出與 override 見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。
@@ -762,7 +764,7 @@ embedding,查詢跟程式碼同語言時召回率差很多。33 萬符號的真�
 問題要求模型翻成自然英文即可。不要為了這件事把整段 query 教學複製進每輪載入的全域
 [AGENTS.md](docs/opencode-agents-template.md)。
 
-`mode="context"` 會把 semantic seeds、確定的 1-hop caller/callee/include，以及相關 test/header/config/trace lexical evidence 合併去重後裝進固定字元 budget。`max_chars` 合法範圍是 `2000..30000`、預設 `12000`，`used_chars` 只計 `evidence[].text` 的實際字元，不宣稱 tokenizer token 數；歧義與 unresolved 只進 `uncertainties`，不偽裝成確定證據。candidate 數量、graph traversal 與字元 budget 的截斷原因會分開標示。所有 source window 仍由既有 sandboxed `read_file` 路徑讀取。graph 尚未建立或損壞時會降級回 semantic-only evidence 並標示 `graph_status`，不影響整次呼叫。
+`mode="context"` 會把 semantic seeds、確定的 1-hop caller/callee/include，以及相關 test/header/config/trace lexical evidence 合併去重後裝進固定字元 budget。`max_chars` 合法範圍是 `2000..30000`、預設 `12000`，`used_chars` 只計 `evidence[].text` 的實際字元，不宣稱 tokenizer token 數；歧義與 unresolved 只進 `uncertainties`，不偽裝成確定證據。candidate 數量、graph traversal 與字元 budget 的截斷原因會分開標示。所有 source window 仍由既有 sandboxed `read_file` 路徑讀取。graph 尚未建立或損壞時，lexical（grep / index）候選仍會參與選取，實際 evidence 仍受既有 candidate 與字元 budget 約束；只有呼叫關係證據缺席，`graph_status` 標示原因，`uncertainties` 會列出 `呼叫關係證據不可用（relationship evidence unavailable: graph unavailable）；未看到 caller/callee 不代表不存在`（graph 查詢途中出錯時 `graph unavailable` 改為 `graph degraded`），不影響整次呼叫。
 
 想看**跨檔案的呼叫關係**(誰呼叫誰、include 鏈),`code_rag_search` 除了語意搜尋還有 graph 模式:
 
@@ -776,7 +778,9 @@ graph 會保守解析 C/C++(tree-sitter)與 Python 的 definitions / includes / 
 confirmed；同名歧義、function pointer、macro 間接呼叫與條件不足的候選會留在
 unresolved / uncertainty，不會硬接成呼叫鏈。首次使用 graph 模式要顯式建立 DB；尚未
 建立時的錯誤會附上含實際 interpreter、CodeTrail 路徑與專案 root 的可複製命令。建好後
-查詢會偵測變更並選擇增量或完整重建。完整 symbol 範圍、header visibility、條件式 include、
+查詢會偵測變更並選擇增量或完整重建。使用原則：graph 可用時先查 `neighbors`；`graph_status`
+為 unavailable 時改用 `mode="context"` / `grep_code`，並把 caller coverage 標為不完整——
+不能因為沒看到呼叫者就推論沒有呼叫者。完整 symbol 範圍、header visibility、條件式 include、
 response budget 與 schema 說明集中在 [MCP 工具清單](docs/mcp-tools.md)，不在 README 重複維護。
 
 想把**圖片**(截圖、架構圖、規格頁掃描)變成之後查得到的知識,就是「VL + RAG 一起用」—— `ingest_document` 餵圖片時會自動走 VL 把圖抽成文字再進 RAG,跟 PDF 走同一套:

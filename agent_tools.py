@@ -19,6 +19,7 @@ from typing import Optional
 
 import config
 import container_runner
+import patch_engine
 from media import BINARY_EXTENSIONS, ELF_EXTENSIONS
 from config import (
     IMAGE_EXTENSIONS,
@@ -27,12 +28,14 @@ from config import (
     MAX_GREP_OUTPUT_CHARS, MAX_LIST_DEPTH,
     IGNORED_PATTERNS, GREP_DEFAULT_EXTENSIONS, ALLOWED_DOT_DIRS,
     RUN_COMMAND_TIMEOUT, RUN_COMMAND_MAX_OUTPUT,
+    RUN_COMMAND_TIMEOUT_MIN, RUN_COMMAND_TIMEOUT_MAX,
     RUN_COMMAND_TAIL_RATIO, RUN_COMMAND_ERROR_PATTERNS,
     ALLOWED_COMMANDS,
     PATCH_MAX_FILES, PATCH_MAX_LINES_PER_FILE,
     LINT_COMMANDS,
 )
 from utils import should_ignore_dir, should_ignore_file
+import patch_verify
 
 
 # ============================================================
@@ -203,12 +206,28 @@ _RUN_COMMAND_TOOL = {
     "type": "function",
     "function": {
         "name": "run_command",
-        "description": "執行測試命令（白名單：pytest, ctest, npm test, cargo test, go test）",
+        "description": (
+            "執行白名單命令。預設白名單=測試/靜態命令(pytest, ctest, npm test, cargo test, "
+            "go test; mypy, tsc, ruff, black, isort, eslint, clang-format);"
+            "build 命令(make/cmake/ninja/meson/bazel build)只在 AI_CODE_ENABLE_BUILD_COMMANDS=1 "
+            "時加入;git 不在白名單(用 git_status / git_diff)。"
+            "timeout 1..600 秒(server 端上限;client 可能更早截止)。"
+            "apply_patch 不會自動呼叫這裡:lint / test 要另行呼叫 run_lint(fix=False) / run_command。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "要執行的命令，如 'pytest test_xxx.py -v' 或 'go test ./...'"},
-                "timeout": {"type": "integer", "description": "超時秒數，預設 60"}
+                "timeout": {
+                    "type": "integer",
+                    "minimum": RUN_COMMAND_TIMEOUT_MIN,
+                    "maximum": RUN_COMMAND_TIMEOUT_MAX,
+                    "default": RUN_COMMAND_TIMEOUT,
+                    "description": (
+                        f"超時秒數,{RUN_COMMAND_TIMEOUT_MIN}..{RUN_COMMAND_TIMEOUT_MAX},"
+                        f"預設 {RUN_COMMAND_TIMEOUT}(server 端上限;client 可能更早截止)"
+                    ),
+                },
             },
             "required": ["command"]
         }
@@ -222,17 +241,36 @@ _APPLY_PATCH_TOOL = {
     "type": "function",
     "function": {
         "name": "apply_patch",
-        "description": "套用 unified diff 格式的程式碼修改。修改會直接寫入檔案。定位靠 context 行內容,@@ 行號可省略、不必計算行數。",
+        "description": (
+            "套用程式碼修改,兩種格式擇一:SEARCH/REPLACE(建議)或 unified diff。"
+            "參數已是字串,不要包 Markdown fence。修改會直接寫入檔案;"
+            "最多 5 個檔案、單檔 200 行(udiff 算 added+removed;S/R 算 SEARCH+REPLACE 行數)。"
+            "S/R 的 SEARCH 逐行 exact 比對(只容忍行尾空白),多處匹配或縮排不同都會拒絕,不會代套。"
+            "套用後只做唯讀 syntax check(advisory,不回滾);lint / test 請另外呼叫 run_lint(fix=False) / run_command。"
+            "dry_run=true 時只做 preflight,逐檔回報 format / 檔案清單 / blocks / payload budget / "
+            "locations(定位行) / new_file(是否新建),全部通過才顯示 would apply。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "patch": {
                     "type": "string",
-                    "description": "unified diff 格式的修改內容。hunk header 寫 @@ 即可(行號選填,只當多處匹配時的提示);修改行前後帶 2-3 行 context,context 必須與檔案現況一致。例如：\n--- a/file.py\n+++ b/file.py\n@@\n context line\n-old line\n+new line\n+added line"
+                    "description": (
+                        "SEARCH/REPLACE 格式:第一行是 repo 相對路徑,接著三個 marker 各自獨佔一行。例如:\n"
+                        "src/led.c\n<<<<<<< SEARCH\n    gpio_write(LED_PIN, 1);\n=======\n"
+                        "    gpio_toggle(LED_PIN);\n>>>>>>> REPLACE\n"
+                        "空 SEARCH = 建新檔(目標不存在、該檔恰一個區塊、REPLACE 非空)。"
+                        "unified diff 格式:--- a/file / +++ b/file / @@(行號選填,靠 context 定位),"
+                        "修改行前後帶 2-3 行 context。"
+                    )
                 },
                 "dry_run": {
                     "type": "boolean",
-                    "description": "若為 true，只顯示會修改什麼，不實際寫入（預設 false）"
+                    "description": (
+                        "若為 true,只做 preflight 並逐檔回報 format、檔案清單、blocks、payload budget、"
+                        "locations(定位行)、new_file(是否新建),全部通過才顯示 would apply;"
+                        "不寫檔、零副作用（預設 false）"
+                    )
                 }
             },
             "required": ["patch"]
@@ -913,9 +951,37 @@ class ToolExecutor:
         return True, "", cmd_parts
 
     def run_command(self, command: str, timeout: int = RUN_COMMAND_TIMEOUT) -> str:
-        """執行白名單內的測試/建置命令"""
+        """執行白名單內的測試 / 靜態分析命令(build 命令需 opt-in)。
+
+        白名單(config.ALLOWED_COMMANDS)分三段:
+          - 測試 / 靜態命令是預設白名單(pytest / ctest / npm test / cargo test / go test;
+            mypy / tsc / ruff / black / isort / eslint / clang-format 等)。
+          - build 命令(make / cmake / ninja / meson / bazel build)只在
+            AI_CODE_ENABLE_BUILD_COMMANDS=1 時由 mcp_server 加入。
+          - git 不在白名單(用 git_status / git_diff)。
+        apply_patch 不再自動呼叫這裡:lint / test 由模型另行、顯式呼叫,讓各自的核准閘生效。
+
+        Args:
+            command: 完整命令列(shell=False,shlex 切詞後逐 token 驗證白名單、危險字元、路徑範圍)。
+            timeout: 秒,1..600(RUN_COMMAND_TIMEOUT_MIN..MAX),預設 60。這是 server 端上限;
+                     MCP client 可能更早截止,不保證 600 秒必在 client timeout 內。
+                     非整數(含 bool)或超出範圍在 spawn 之前拒絕,容器模式同樣受檢。
+        """
         if not config.RUN_COMMAND_ENABLED:
             return "錯誤: run_command 功能已停用（設定 AI_CODE_RUN_TESTS=1 才會啟用）"
+
+        # timeout 三層契約的 executor 層:int 且 1..600(bool 不算),在 spawn 之前拒絕;
+        # 回顯輸入時截到 80 字元,不把任意長字串整段回送。
+        if type(timeout) is not int or not (
+            RUN_COMMAND_TIMEOUT_MIN <= timeout <= RUN_COMMAND_TIMEOUT_MAX
+        ):
+            shown = repr(timeout)
+            if len(shown) > 80:
+                shown = shown[:80] + "…(截斷)"
+            return (
+                f"錯誤: timeout 必須是 {RUN_COMMAND_TIMEOUT_MIN}..{RUN_COMMAND_TIMEOUT_MAX} 的整數,"
+                f"收到 {type(timeout).__name__}: {shown}"
+            )
 
         # 統一驗證（容器/非容器模式都要過白名單）
         is_valid, error_msg, cmd_parts = self._validate_command(command)
@@ -998,187 +1064,358 @@ class ToolExecutor:
     # ============================================================
     # 改碼閉環工具
     # ============================================================
+    # ------------------------------------------------------------------
+    # per-file plan(兩格式共用的形狀:_locate_hunks 的 plan entry)
+    # ------------------------------------------------------------------
+    def _plan_search_replace(self, rel: str, blocks: list, snapshot, budget_used: int,
+                             parent_identity) -> tuple:
+        """S/R 的 per-file preflight。回 (FilePlan | None, err | None, MismatchRecord | None)。"""
+        empty = [block for block in blocks if not block.search]
+        if empty:
+            if snapshot is not None:
+                return None, "空 SEARCH 只能建立不存在的新檔（檔案已存在）", None
+            if len(blocks) != 1:
+                return None, f"空 SEARCH 必須是該檔唯一的區塊（共 {len(blocks)} 個區塊）", None
+            if not blocks[0].replace:
+                return None, "空 SEARCH 且空 REPLACE", None
+            plan = patch_engine.FilePlan(
+                rel, is_new=True, new_lines=list(blocks[0].replace), blocks=1, budget=budget_used,
+            )
+            return plan, None, None
+        if snapshot is None:
+            return None, "檔案不存在（非空 SEARCH 無法套用到不存在的檔案;要建新檔請用空 SEARCH）", None
+        entries, err, record = patch_engine.locate_sr_blocks(
+            patch_engine.body_lines(snapshot), blocks, path=rel,
+        )
+        if err is not None:
+            return None, err, record
+        plan = patch_engine.FilePlan(
+            rel, snapshot=snapshot, plan=entries, blocks=len(blocks), budget=budget_used,
+            parent_identity=parent_identity,
+        )
+        return plan, None, None
+
+    def _plan_unified_diff(self, rel: str, hunks: list, snapshot, budget_used: int,
+                           parent_identity) -> tuple:
+        """udiff 的 per-file preflight(定位邏輯沿用 _locate_hunks,行為不變)。"""
+        if snapshot is None:
+            plan = patch_engine.FilePlan(
+                rel, is_new=True,
+                new_bytes=self._compute_new_file_content(hunks).encode("utf-8"),
+                blocks=len(hunks), budget=budget_used,
+            )
+            return plan, None, None
+        records: list = []
+        entries, hunk_err = self._locate_hunks(
+            snapshot.text.split('\n'), hunks, path=rel, records=records,
+        )
+        if hunk_err:
+            return None, hunk_err, (records[0] if records else None)
+        plan = patch_engine.FilePlan(
+            rel, snapshot=snapshot, plan=entries, blocks=len(hunks), budget=budget_used,
+            parent_identity=parent_identity,
+        )
+        return plan, None, None
+
+    @staticmethod
+    def _render_preflight_errors(errors: list) -> list:
+        """✗ 行 + 其 mismatch 預覽;預覽由單一 renderer 對整次結果套總額(E)。"""
+        records = [record for _, record in errors if record is not None]
+        rendered = patch_engine.render_mismatch_records(records)
+        out = []
+        idx = 0
+        for text, record in errors:
+            out.append(text)
+            if record is not None:
+                out.extend(rendered[idx])
+                idx += 1
+        return out
+
+    @staticmethod
+    def _plan_locations(file_plan) -> str:
+        if file_plan.is_new:
+            return "new file"
+        pending = [e for e in file_plan.plan if e['status'] == 'apply']
+        return "; ".join(
+            f"行 {e['pos'] + 1}-{e['pos'] + max(e['replace_len'], 1)}" for e in pending
+        ) or "已全部套用過"
+
     def apply_patch(self, patch: str, dry_run: bool = False) -> str:
-        """套用 unified diff 格式的 patch"""
+        """套用 patch:unified diff 或 canonical SEARCH/REPLACE,兩格式共用同一條管線。
+
+        sandbox → 上限 → byte-level preflight(UTF-8 strict / newline / symlink /
+        定位)→ dry_run 回報或全量拒絕 → journaled 原子寫入(失敗 best-effort
+        rollback)→ 同 process 的 syntax 驗證(由 _verify_patched_files 決定)。
+        """
         if not config.PATCH_ENABLED:
-            return "錯誤: apply_patch 功能已停用（設定 AI_CODE_PATCH=1 才會啟用）"
+            return "✗ apply_patch 已停用（設定 AI_CODE_PATCH=1 才會啟用）"
+        max_files = PATCH_MAX_FILES
+        max_lines = PATCH_MAX_LINES_PER_FILE
+        safe = patch_engine.safe_display
 
         try:
-            changes = self._parse_unified_diff(patch)
-        except ValueError as e:
-            return f"錯誤: patch 解析失敗 - {e}"
+            text = patch_engine.normalize_patch_text(patch)
+            fmt = patch_engine.detect_format(text)
+        except patch_engine.PatchFormatError as e:
+            return f"✗ patch 格式錯誤: {e}"
 
-        if not changes:
-            return "錯誤: 無法從 patch 中解析出任何修改"
-
-        if len(changes) > PATCH_MAX_FILES:
-            return f"錯誤: 修改檔案數量超過限制（{len(changes)} > {PATCH_MAX_FILES}）"
-
-        # ============================================================
-        # Phase 1: preflight 全部檔案（不寫入任何東西）
-        #   - 路徑必須在 sandbox 內
-        #   - 行數限制
-        #   - 既有檔案的每個 hunk 必須能靠 context 內容定位
-        #     （dry_run 也要驗，與工具說明一致）
-        # ============================================================
-        plans = []      # [(filepath, target, hunks, plan_or_None, original_or_None)]
-        errors = []
-        for filepath, hunks in changes.items():
-            target = self._safe_path(filepath)
-            if not target:
-                errors.append(f"✗ {filepath}: 路徑不在專案內或無效")
-                continue
-
-            total_lines = sum(len(h['add']) + len(h['remove']) for h in hunks)
-            if total_lines > PATCH_MAX_LINES_PER_FILE:
-                errors.append(f"✗ {filepath}: 修改行數超過限制（{total_lines} > {PATCH_MAX_LINES_PER_FILE}）")
-                continue
-
-            if target.exists():
+        # 每個 parsed file 一筆 preflight record(成功或失敗都保留固定欄位,dry_run 逐筆輸出)
+        records = []     # dict(shown, blocks, budget, new_file, locations, error=(✗ 行, MismatchRecord|None)|None)
+        specs = []       # [(raw_path, payload)]
+        if fmt == "search_replace":
+            try:
+                blocks = patch_engine.parse_search_replace(text)
+            except patch_engine.PatchFormatError as e:
+                return f"✗ patch 格式錯誤: {e}"
+            grouped = {}
+            invalid = {}
+            for block in blocks:
                 try:
-                    original = target.read_text(encoding='utf-8', errors='replace')
-                except Exception as e:
-                    errors.append(f"✗ {filepath}: 讀取失敗 - {e}")
-                    continue
-                plan, hunk_err = self._locate_hunks(original.split('\n'), hunks)
-                if hunk_err:
-                    errors.append(f"✗ {filepath}: {hunk_err}")
-                    continue
-                plans.append((filepath, target, hunks, plan, original))
-            else:
-                plans.append((filepath, target, hunks, None, None))
-
-        # ---- dry_run: 只報告 preflight 結果，不寫入 ----
-        if dry_run:
-            results = []
-            for filepath, target, hunks, plan, original in plans:
-                total_lines = sum(len(h['add']) + len(h['remove']) for h in hunks)
-                if original is None:
-                    results.append(
-                        f"[DRY RUN] {filepath}: 將新建檔案 {len(hunks)} 個區塊, "
-                        f"{total_lines} 行"
+                    patch_engine.ensure_utf8_encodable(
+                        block.search + block.replace, what=f"區塊 {block.index}",
                     )
+                    rel = patch_engine.validate_sr_path(block.path)
+                except patch_engine.PatchFormatError as e:
+                    rec = invalid.get(block.path)
+                    if rec is None:
+                        rec = {
+                            "shown": safe(block.path), "blocks": 0, "budget": 0, "new_file": "?",
+                            "locations": "preflight failed",
+                            "error": (f"✗ {safe(block.path)}: {e}", None),
+                        }
+                        invalid[block.path] = rec
+                        records.append(rec)
+                    rec["blocks"] += 1
+                    rec["budget"] += len(block.search) + len(block.replace)
                     continue
-                pending = [e for e in plan if e['status'] == 'apply']
-                results.append(
-                    f"[DRY RUN] {filepath}: 將修改 {len(pending)} 個區塊, "
-                    f"{total_lines} 行（context 已依內容定位）"
-                )
-                for e in plan:
-                    if e['status'] == 'already':
-                        results.append(
-                            f"  區塊 {e['index'] + 1}: 已套用過(修改後內容見行 "
-                            f"{e['pos'] + 1}),將跳過"
-                        )
-                    else:
-                        end = e['pos'] + max(e['replace_len'], 1)
-                        results.append(
-                            f"  區塊 {e['index'] + 1}: 行 {e['pos'] + 1}-{end}"
-                            + ("（依 context 定位）" if e['relocated'] else "")
-                        )
-            results.extend(errors)
-            if errors:
-                results.append(
-                    "⚠ [DRY RUN] 上述 ✗ 檔案未通過 preflight；實際套用時整個 patch 會被拒絕，"
-                    "不會寫入任何檔案（atomic）。"
-                )
-            return "\n".join(results) if results else "沒有修改"
+                grouped.setdefault(rel, []).append(block)
+            specs = list(grouped.items())
+            file_count = len(specs) + len(invalid)
+        else:
+            try:
+                changes = self._parse_unified_diff(text)
+            except ValueError as e:
+                return f"✗ patch 解析失敗: {e}"
+            if not changes:
+                return "✗ 無法從 patch 中解析出任何修改"
+            specs = list(changes.items())
+            file_count = len(specs)
 
-        # ---- 原子性：任一檔 preflight 失敗 → 全部不套用 ----
-        if errors:
-            results = list(errors)
-            results.append("⚠ 因有檔案未通過 preflight，整個 patch 已被拒絕，未寫入任何檔案（atomic）。")
-            return "\n".join(results)
+        if file_count > max_files:
+            return f"✗ 修改檔案數量超過限制（{file_count} > {max_files}）"
 
         # ============================================================
-        # Phase 2: 實際套用（含失敗回滾）
-        #   每個既有檔案先寫一份唯一命名的備份（不覆蓋使用者既有 .orig）；
-        #   任一檔寫入拋錯 → 用備份把已寫入的檔案全部回滾。
+        # Phase 1: 全量 preflight(零寫入、零 mkdir、零 temp)
+        #   path 規則 → sandbox → 同檔多寫法 → 上限 → byte snapshot → 定位
+        #   任何預期的 OS / resolve 失敗都轉成 per-file ✗,不逸出 MCP。
         # ============================================================
-        written = []    # [(target, backup_path_or_None)]  None = 本次新建的檔案
-        results = []
+        plans = []
+        identity = {}
         try:
-            for filepath, target, hunks, plan, original in plans:
-                if original is None:
-                    # 先登記（backup=None 代表新建）再寫，確保寫到一半失敗時
-                    # rollback 也涵蓋這一檔（把它刪掉還原成「不存在」）。
-                    written.append((target, None))
-                    content = self._compute_new_file_content(hunks)
-                    target.write_text(content, encoding='utf-8')
-                    results.append(f"✓ {filepath}: 新建檔案")
+            ops = patch_engine.PathOps(self.root)
+        except OSError as e:
+            return f"✗ 無法開啟 sandbox root: {safe(str(e))}"
+        try:
+            for raw_path, payload in specs:
+                if fmt == "search_replace":
+                    rel = raw_path
+                    shown = rel
+                    blocks_n = len(payload)
+                    budget_used = sum(len(b.search) + len(b.replace) for b in payload)
+                    budget_label = "S/R payload budget 超過限制"
                 else:
-                    pending = [e for e in plan if e['status'] == 'apply']
-                    already = [e for e in plan if e['status'] == 'already']
-                    if not pending:
-                        # 冪等:所有區塊都已套用過 → 不碰檔案、不留備份。
-                        # 位置一定要報出來:no-op 若判錯,這是唯一的破綻。
-                        where = ", ".join(
-                            f"區塊{e['index'] + 1}→行 {e['pos'] + 1}" for e in already
+                    shown = str(raw_path)
+                    blocks_n = len(payload)
+                    budget_used = sum(len(h['add']) + len(h['remove']) for h in payload)
+                    budget_label = "修改行數超過限制"
+                rec = {
+                    "shown": safe(shown), "blocks": blocks_n, "budget": budget_used,
+                    "new_file": "?", "locations": "preflight failed", "error": None,
+                }
+                records.append(rec)
+                try:
+                    if fmt == "unified_diff":
+                        try:
+                            rel = patch_engine.clean_udiff_path(raw_path)
+                            patch_engine.ensure_utf8_encodable(
+                                (content for hunk in payload for _, content in hunk['lines']),
+                                what="hunk 內容",
+                            )
+                        except patch_engine.PatchFormatError as e:
+                            reason = "路徑不在專案內或無效" if "路徑" in str(e) else str(e)
+                            rec["error"] = (f"✗ {safe(shown)}: {reason}", None)
+                            continue
+
+                    target = self._safe_path(rel)
+                    if target is None:
+                        reason = (
+                            patch_engine.SYMLINK_REFUSED
+                            if patch_engine.has_symlink_component(self.root, rel)
+                            else "路徑不在專案內或無效"
                         )
-                        results.append(
-                            f"✓ {filepath}: 所有區塊({len(already)})都已套用過,"
-                            f"檔案未變更（{where}）"
+                        rec["error"] = (f"✗ {safe(shown)}: {reason}", None)
+                        continue
+                    key = str(target)
+                    if key in identity:
+                        rec["error"] = (
+                            f"✗ 同一檔案以多個 path 寫法出現: {safe(identity[key])}, {safe(shown)}", None,
                         )
                         continue
-                    fd, backup_name = tempfile.mkstemp(
-                        dir=str(target.parent), prefix=target.name + '.', suffix='.orig'
-                    )
-                    os.close(fd)
-                    backup_path = Path(backup_name)
-                    backup_path.write_text(original, encoding='utf-8')
-                    # backup 就緒後、寫入前先登記 → 若 write_text 中途失敗，
-                    # 這一檔也能從備份還原（否則會留下半寫入的檔案 + 孤兒備份）。
-                    written.append((target, backup_path))
-                    content = self._compute_patched_content(original, plan)
-                    target.write_text(content, encoding='utf-8')
-                    msg = f"✓ {filepath}: 已修改 {len(pending)} 個區塊"
-                    relocated = [e for e in pending if e['relocated']]
-                    if relocated:
-                        msg += (
-                            "（"
-                            + ", ".join(
-                                f"區塊{e['index'] + 1}依 context 定位於行 {e['pos'] + 1}"
-                                for e in relocated
-                            )
-                            + "）"
-                        )
-                    if already:
-                        msg += (
-                            "（另 "
-                            + ", ".join(
-                                f"區塊{e['index'] + 1}已套用過於行 {e['pos'] + 1}"
-                                for e in already
-                            )
-                            + ",跳過）"
-                        )
-                    results.append(msg)
-        except Exception as e:
-            rollback_notes = []
-            for tgt, backup_path in reversed(written):
-                try:
-                    if backup_path is None:
-                        tgt.unlink(missing_ok=True)  # 移除本次新建的檔案
-                    else:
-                        tgt.write_text(backup_path.read_text(encoding='utf-8'), encoding='utf-8')
-                except Exception as rexc:
-                    rollback_notes.append(f"⚠ 回滾 {tgt} 失敗: {rexc}")
-            for _, backup_path in written:
-                if backup_path is not None:
+                    identity[key] = shown
+
+                    if budget_used > max_lines:
+                        rec["error"] = (f"✗ {safe(rel)}: {budget_label}（{budget_used} > {max_lines}）", None)
+                        continue
+
                     try:
-                        backup_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-            msg = [f"✗ 套用失敗，已回滾所有變更（atomic）: {e}"]
+                        snapshot, parent_identity = ops.read_snapshot(rel)
+                    except patch_engine.SnapshotError as e:
+                        rec["error"] = (f"✗ {safe(rel)}: {e}", None)
+                        continue
+
+                    if fmt == "search_replace":
+                        file_plan, err, record = self._plan_search_replace(
+                            rel, payload, snapshot, budget_used, parent_identity,
+                        )
+                    else:
+                        file_plan, err, record = self._plan_unified_diff(
+                            rel, payload, snapshot, budget_used, parent_identity,
+                        )
+                    if err is not None:
+                        rec["new_file"] = "no" if snapshot is not None else "yes"
+                        rec["error"] = (f"✗ {safe(rel)}: {err}", record)
+                        continue
+                    rec["new_file"] = "yes" if file_plan.is_new else "no"
+                    rec["locations"] = self._plan_locations(file_plan)
+                    rec["plan"] = file_plan
+                    plans.append(file_plan)
+                except (OSError, RuntimeError, ValueError) as e:
+                    rec["error"] = (
+                        f"✗ {safe(shown)}: preflight 失敗（{type(e).__name__}: {safe(str(e))}）", None,
+                    )
+        finally:
+            preflight_notes = list(ops.notes)
+            ops.close()
+
+        errors = [rec["error"] for rec in records if rec["error"] is not None]
+
+        # ---- dry_run: 每個 parsed file 固定欄位一行(成功或失敗),再附錯誤;零副作用 ----
+        if dry_run:
+            lines = [f"[DRY RUN] 格式: {fmt}"]
+            error_records = [rec["error"][1] for rec in records if rec["error"] is not None]
+            rendered = patch_engine.render_mismatch_records(
+                [record for record in error_records if record is not None]
+            )
+            rendered_idx = 0
+            for rec in records:
+                lines.append(
+                    f"[DRY RUN] {rec['shown']}: format={fmt} blocks={rec['blocks']} "
+                    f"budget={rec['budget']}/{max_lines} new_file={rec['new_file']} "
+                    f"locations={rec['locations']}"
+                )
+                file_plan = rec.get("plan")
+                if file_plan is not None and not file_plan.is_new:
+                    for e in file_plan.plan:
+                        if e['status'] == 'already':
+                            lines.append(
+                                f"  區塊 {e['index'] + 1}: 已套用過(修改後內容見行 "
+                                f"{e['pos'] + 1}),將跳過"
+                            )
+                        elif e.get('relocated'):
+                            end = e['pos'] + max(e['replace_len'], 1)
+                            lines.append(f"  區塊 {e['index'] + 1}: 行 {e['pos'] + 1}-{end}（依 context 定位）")
+                if rec["error"] is not None:
+                    text_line, record = rec["error"]
+                    lines.append(text_line)
+                    if record is not None:
+                        lines.extend(rendered[rendered_idx])
+                        rendered_idx += 1
+            if errors:
+                lines.append(
+                    "⚠ [DRY RUN] 上述 ✗ 檔案未通過 preflight；實際套用時整份 patch 會被拒絕,"
+                    "不會寫入任何檔案（全量 preflight）"
+                )
+            else:
+                lines.append(f"[DRY RUN] would apply: {len(plans)} 個檔案")
+            return "\n".join(preflight_notes + lines)
+
+        # ---- 全量 preflight:任一檔失敗 → 整份拒絕、零寫入 ----
+        if errors:
+            out = preflight_notes + self._render_preflight_errors(errors)
+            out.append("⚠ 因有檔案未通過 preflight,整份 patch 已被拒絕,未寫入任何檔案（全量 preflight）")
+            return "\n".join(out)
+
+        # ============================================================
+        # Phase 2: journaled 寫入(單檔原子;多檔 best-effort rollback)
+        #   父目錄只在全量 preflight 通過後建立並逐層記錄;每次 mkdir / 讀 /
+        #   publish / rollback 都從 root 重走 lexical path 並比對 parent 身分,
+        #   寫入前重驗 preimage。
+        # ============================================================
+        tag = " [search_replace]" if fmt == "search_replace" else ""
+        try:
+            ops = patch_engine.PathOps(self.root)
+        except OSError as e:
+            return f"✗ 無法開啟 sandbox root: {safe(str(e))}"
+        journal = patch_engine.WriteJournal(ops)
+        results = []
+        written = []    # [(rel,)]:實際寫入 / 新建的檔(no-op 不算),供 verifier 使用
+        try:
+            for fp in plans:
+                if fp.is_new:
+                    fp.parent_identity = ops.ensure_parents(fp.rel, journal)
+            for fp in plans:
+                if fp.is_new:
+                    data = (
+                        fp.new_bytes if fp.new_bytes is not None
+                        else patch_engine.serialize_new_file(fp.new_lines)
+                    )
+                    ops.write_new(fp.rel, fp.parent_identity, data, journal)
+                    results.append(f"✓ {fp.rel}: 新建檔案{tag}")
+                    written.append((fp.rel,))
+                    continue
+                pending = [e for e in fp.plan if e['status'] == 'apply']
+                already = [e for e in fp.plan if e['status'] == 'already']
+                if not pending:
+                    # 冪等:所有區塊都已套用過 → 不碰檔案、不進 journal、不進 verifier。
+                    where = ", ".join(f"區塊{e['index'] + 1}→行 {e['pos'] + 1}" for e in already)
+                    results.append(
+                        f"✓ {fp.rel}: 所有區塊({len(already)})都已套用過,檔案未變更（{where}）"
+                    )
+                    continue
+                content = self._compute_patched_content(fp.snapshot.text, fp.plan)
+                data = patch_engine.render_bytes(fp.snapshot, content)
+                ops.write_existing(fp.rel, fp.parent_identity, fp.snapshot, data, journal)
+                msg = f"✓ {fp.rel}: 已修改 {len(pending)} 個區塊{tag}"
+                relocated = [e for e in pending if e.get('relocated')]
+                if relocated:
+                    msg += (
+                        "（"
+                        + ", ".join(
+                            f"區塊{e['index'] + 1}依 context 定位於行 {e['pos'] + 1}" for e in relocated
+                        )
+                        + "）"
+                    )
+                if already:
+                    msg += (
+                        "（另 "
+                        + ", ".join(f"區塊{e['index'] + 1}已套用過於行 {e['pos'] + 1}" for e in already)
+                        + ",跳過）"
+                    )
+                results.append(msg)
+                written.append((fp.rel,))
+        except Exception as e:
+            rollback_notes = journal.rollback()
+            notes = list(dict.fromkeys(preflight_notes + ops.notes))
+            ops.close()
+            msg = notes + [
+                "✗ 套用失敗；已執行 best-effort rollback（回滾本次已寫入的檔案;"
+                f"全量 preflight＋best-effort rollback,不是跨檔交易）: {safe(str(e), 400)}"
+            ]
             msg.extend(rollback_notes)
             return "\n".join(msg)
-
-        # ---- 成功：只刪除本次自己建立的備份（絕不動使用者既有 .orig）----
-        for _, backup_path in written:
-            if backup_path is not None:
-                try:
-                    backup_path.unlink()
-                except Exception:
-                    pass
+        ops.close()
+        results = list(dict.fromkeys(preflight_notes + ops.notes)) + results
+        plans = written
 
         # P2 改進：自動驗證流程
         successfully_patched = [p[0] for p in plans]
@@ -1191,92 +1428,93 @@ class ToolExecutor:
     def _verify_patched_files(self, filepaths: list) -> list:
         """P2 改進：驗證修改後的檔案
 
-        驗證步驟：
-        1. Lint/Format
-        2. 靜態分析（如 mypy）
-        3. 測試（若有）
+        現在只做「同 process、無 subprocess、唯讀」的 syntax check(patch_verify):
+          .py/.pyi 用 ast.parse;.pyx 明示 skipped;C/C++ 只在釘版 tree-sitter grammar
+          載入成功時檢查(ERROR + 零寬 MISSING 都算 failed);其他 suffix skipped。
+        三態 passed / failed / skipped:有任何 skipped 就是「驗證不完整」;syntax 是寫入
+        後的 advisory gate,失敗不回滾(第一行明講「patch 已套用、未回滾」)。
+        lint / typecheck / test 不再由這裡執行——那會把使用者對 apply_patch 的核准暗中
+        擴張成命令執行核准。要 lint / test 請另行呼叫 codetrail_run_lint(fix=False) /
+        codetrail_run_command,各自經過核准閘。這裡永不呼叫 run_lint / run_command /
+        subprocess;整個函式體包在最外層 try/except,永不把例外拋回 apply_patch
+        (寫入已完成,拋錯只會讓使用者看不到結果)。
+        唯一的讀檔路徑是這裡的區域函式 read_bytes:_safe_path → lstat(非 symlink、
+        regular)→ O_NOFOLLOW 開檔 → fstat → 讀到 EOF → 再 fstat,三次身分
+        (st_ino/st_dev)都一致才採用;patch_verify 自己永不開檔。
+
+        Args:
+            filepaths: 本次實際寫入 / 新建的 repo 相對路徑。
+
+        Returns:
+            要附加到 apply_patch 結果尾端的文字行;第一行固定是三態標題。
         """
-        results = []
-        all_passed = True
+        fallback_next_steps = (
+            "建議下一步: 對改過的檔案呼叫 codetrail_run_lint(fix=False) 做 lint 檢查；"
+            "codetrail_run_command(\"pytest ...\") 跑相關測試（各需獨立核准；apply_patch 不代跑）"
+        )
+        try:
+            import stat as _stat
 
-        # Step 1: Lint
-        if "lint" in getattr(config, 'PATCH_VERIFY_STEPS', []):
-            results.append("\n=== [1/3] Lint ===")
-            for filepath in filepaths:
-                ext = Path(filepath).suffix.lower()
-                if ext in LINT_COMMANDS:
-                    try:
-                        lint_result = self.run_lint(filepath, fix=True)
-                        if "✓" in lint_result:
-                            results.append(f"  ✓ {filepath}")
-                        elif "⚠" in lint_result or "錯誤" in lint_result:
-                            results.append(f"  ⚠ {filepath}: {lint_result[:80]}")
-                            all_passed = False
-                    except Exception as e:
-                        results.append(f"  ✗ {filepath}: {e}")
-                        all_passed = False
+            def same_identity(before, after) -> bool:
+                return (before.st_ino, before.st_dev) == (after.st_ino, after.st_dev)
 
-        # Step 2: Typecheck (靜態分析)
-        typecheck_cmds = getattr(config, 'TYPECHECK_COMMANDS', {})
-        if "typecheck" in getattr(config, 'PATCH_VERIFY_STEPS', []) and typecheck_cmds:
-            results.append("\n=== [2/3] 靜態分析 ===")
-            for filepath in filepaths:
-                ext = Path(filepath).suffix.lower()
-                if ext in typecheck_cmds:
-                    for cmd_template in typecheck_cmds[ext]:
-                        try:
-                            cmd = f"{cmd_template} {filepath}"
-                            result = self.run_command(cmd, timeout=30)
-                            if "error" in result.lower() or "Error" in result:
-                                results.append(f"  ⚠ {filepath}: 有型別錯誤")
-                                all_passed = False
-                            else:
-                                results.append(f"  ✓ {filepath}")
-                        except Exception as e:
-                            results.append(f"  ⚠ {filepath}: 跳過 ({e})")
-
-        # Step 3: 測試 (只執行相關測試，避免跑太久)
-        if "test" in getattr(config, 'PATCH_VERIFY_STEPS', []) and config.RUN_COMMAND_ENABLED:
-            results.append("\n=== [3/3] 測試 ===")
-            # 檢查是否有 pytest
-            test_patterns = []
-            for filepath in filepaths:
-                if filepath.endswith('.py'):
-                    # 嘗試找對應的測試檔案
-                    base = Path(filepath).stem
-                    test_patterns.append(f"test_{base}.py")
-                    test_patterns.append(f"{base}_test.py")
-
-            if test_patterns:
+            def read_bytes(rel_path: str) -> bytes:
+                target = self._safe_path(rel_path)
+                if target is None:
+                    raise patch_verify.ReadRefused("path outside sandbox")
                 try:
-                    # 只執行相關測試（用 -k 過濾）
-                    # 注意：不使用 pipe（|）和重導向，因為會被安全檢查擋掉
-                    # 輸出截斷改由 Python 處理
-                    keywords = " or ".join(p.replace('.py', '') for p in test_patterns[:3])
-                    test_cmd = f"pytest -x -q -k \"{keywords}\" --tb=short"
-                    test_result = self.run_command(test_cmd, timeout=60)
-                    # 截斷過長輸出（原本用 head -20 的功能）
-                    test_lines = test_result.split('\n')
-                    if len(test_lines) > 25:
-                        test_result = '\n'.join(test_lines[:25]) + f"\n... (截斷，共 {len(test_lines)} 行)"
-                    if "FAILED" in test_result or "ERROR" in test_result:
-                        results.append(f"  ✗ 測試失敗")
-                        results.append(f"    {test_result[:200]}")
-                        all_passed = False
-                    elif "passed" in test_result:
-                        results.append(f"  ✓ 測試通過")
-                    else:
-                        results.append(f"  - 沒有找到相關測試")
-                except Exception as e:
-                    results.append(f"  ⚠ 測試跳過: {e}")
+                    before = os.lstat(target)
+                except OSError as exc:
+                    raise patch_verify.ReadRefused(
+                        f"unreadable ({type(exc).__name__}: {exc.strerror or exc})"
+                    ) from exc
+                if _stat.S_ISLNK(before.st_mode) or not _stat.S_ISREG(before.st_mode):
+                    raise patch_verify.ReadRefused("target is not a regular file")
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+                try:
+                    fd = os.open(str(target), flags)
+                except OSError as exc:
+                    raise patch_verify.ReadRefused(
+                        f"unreadable ({type(exc).__name__}: {exc.strerror or exc})"
+                    ) from exc
+                try:
+                    opened = os.fstat(fd)
+                    if not _stat.S_ISREG(opened.st_mode) or not same_identity(before, opened):
+                        raise patch_verify.ReadRefused("file identity changed during read")
+                    chunks = []
+                    while True:
+                        chunk = os.read(fd, 1 << 16)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                    after = os.fstat(fd)
+                    if not same_identity(before, after) or not same_identity(opened, after):
+                        raise patch_verify.ReadRefused("file identity changed during read")
+                finally:
+                    os.close(fd)
+                return b"".join(chunks)
 
-        # 總結
-        if all_passed:
-            results.append("\n✓ 所有驗證通過")
-        else:
-            results.append("\n⚠ 有驗證項目未通過，建議檢查")
-
-        return results
+            auto_verify = bool(getattr(config, "PATCH_AUTO_VERIFY", True))
+            requested = [str(step) for step in (getattr(config, "PATCH_VERIFY_STEPS", None) or [])]
+            rel_paths = [str(path).replace("\\", "/") for path in filepaths]
+            if not auto_verify:
+                return patch_verify.render_report([], requested=requested, auto_verify=False)
+            try:
+                results = patch_verify.verify_files(rel_paths, requested, read_bytes=read_bytes)
+            except Exception as exc:
+                reason = f"verifier error ({type(exc).__name__}: {str(exc)[:120]})"
+                results = [
+                    patch_verify.StepResult(step, rel_path, "skipped", reason=reason)
+                    for rel_path in rel_paths
+                    for step in requested
+                ]
+            return patch_verify.render_report(results, requested=requested, auto_verify=True)
+        except Exception as exc:
+            # 最後一道:連 renderer / 常數都不信任,硬編安全文字。
+            return [
+                f"⚠ 驗證不完整（skipped: verifier error {type(exc).__name__}）——patch 已套用、未回滾",
+                fallback_next_steps,
+            ]
 
     # hunk header:行號/行數全部**選填**。`@@` / `@@ -26 +26 @@` /
     # `@@ -26,6 +26,13 @@ void f()` 都合法。實測(2026-08-19)本機小模型
@@ -1436,34 +1674,13 @@ class ToolExecutor:
                 positions.append(i)
         return positions
 
-    def _best_mismatch_report(self, file_lines: list, pattern: list) -> str:
-        """零匹配時的診斷:找匹配行數最多的位置,回報第一個不符的行。"""
-        # 掃描成本上限:超大檔 × 長 pattern 就不做逐位置評分(訊息仍完整)。
-        if not pattern or len(file_lines) * len(pattern) > 2_000_000:
-            return ""
-        best_pos, best_score = 0, -1
-        for i in range(len(file_lines)):
-            score = 0
-            for k, expect in enumerate(pattern):
-                if i + k >= len(file_lines):
-                    break
-                if self._lines_match(file_lines[i + k], expect, loose=True):
-                    score += 1
-            if score > best_score:
-                best_pos, best_score = i, score
-        for k, expect in enumerate(pattern):
-            actual = (
-                file_lines[best_pos + k]
-                if best_pos + k < len(file_lines) else "<檔案結尾>"
-            )
-            if not self._lines_match(actual, expect, loose=True):
-                return (
-                    f"最接近的位置是行 {best_pos + 1}(匹配 {best_score}/"
-                    f"{len(pattern)} 行),第一個不符在行 {best_pos + k + 1}:\n"
-                    f"  期望: {expect[:80]!r}\n"
-                    f"  實際: {actual[:80]!r}"
-                )
-        return ""
+    def _best_mismatch_report(self, file_lines: list, pattern: list, *,
+                              path: str = "", block_label: str = ""):
+        """零匹配時的診斷 record(E):相似度只做 deterministic ranking 挑顯示視窗,
+        永不產生套用位置;渲染與整次總額由 patch_engine.render_mismatch_records 負責。"""
+        return patch_engine.nearest_region_record(
+            file_lines, pattern, path=path, block_label=block_label,
+        )
 
     def _resolve_already_applied(self, idx: int, positions: list,
                                  new_start: int | None, line_count: int) -> tuple:
@@ -1502,7 +1719,8 @@ class ToolExecutor:
             )
         return new_start - 1, None
 
-    def _locate_hunks(self, file_lines: list, hunks: list) -> tuple:
+    def _locate_hunks(self, file_lines: list, hunks: list, *,
+                      path: str = "", records: list | None = None) -> tuple:
         """把每個 hunk 定位到檔案位置。
 
         Returns:
@@ -1564,6 +1782,10 @@ class ToolExecutor:
                         if abs(p - (hint - 1)) == abs(best - (hint - 1))
                     ]
                     if len(ties) > 1:
+                        if records is not None:
+                            records.append(patch_engine.ambiguity_record(
+                                file_lines, positions, path=path, block_label=f"區塊 {idx + 1}",
+                            ))
                         return None, (
                             f"區塊 {idx + 1} 的 context 在檔案中出現 "
                             f"{len(positions)} 處(行 "
@@ -1573,6 +1795,10 @@ class ToolExecutor:
                         )
                     pos = best
                 else:
+                    if records is not None:
+                        records.append(patch_engine.ambiguity_record(
+                            file_lines, positions, path=path, block_label=f"區塊 {idx + 1}",
+                        ))
                     return None, (
                         f"區塊 {idx + 1} 的 context 在檔案中出現 "
                         f"{len(positions)} 處(行 "
@@ -1594,6 +1820,10 @@ class ToolExecutor:
                             idx, done, hunk.get('new_start'), line_count,
                         )
                         if done_err:
+                            if records is not None:
+                                records.append(self._best_mismatch_report(
+                                    file_lines, pattern, path=path, block_label=f"區塊 {idx + 1}",
+                                ))
                             return None, done_err
                         plan.append({
                             'index': idx, 'status': 'already',
@@ -1601,11 +1831,14 @@ class ToolExecutor:
                             'new_lines': [], 'relocated': False,
                         })
                         continue
-                detail = self._best_mismatch_report(file_lines, pattern)
+                record = self._best_mismatch_report(
+                    file_lines, pattern, path=path, block_label=f"區塊 {idx + 1}",
+                )
+                if records is not None:
+                    records.append(record)
                 return None, (
                     f"區塊 {idx + 1} context 不匹配(在檔案中找不到對應內容)。"
-                    + (f"\n{detail}" if detail else "")
-                    + "\n提示: context 行必須與檔案現況一致;"
+                    "\n提示: context 行必須與檔案現況一致;"
                     "先 read_file 確認現況再重送。行號不需要準確,定位靠 context。"
                 )
 

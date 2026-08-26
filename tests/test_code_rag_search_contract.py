@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import code_context  # noqa: E402
 import code_rag  # noqa: E402
 
 # 預設 shape 的 key 契約(§8.1):必含 5 鍵;end_line/parent 僅在 item 具備時
@@ -230,12 +231,33 @@ def test_corrupt_graph_fails_graph_modes_but_not_semantic(mcp_module, tmp_path):
     assert all(r["graph_status"].startswith("unavailable") for r in results)
     assert all(r["relations"] == [] for r in results)
 
-    # context 降級成 semantic-only evidence，不因 graph 壞掉整體失敗。
+    # context 降級:semantic + lexical evidence 仍在,只有呼叫關係證據缺席,
+    # 不因 graph 壞掉整體失敗。(workflow F 唯一核准的既有斷言變更:原本要求
+    # 全部 reason 皆為 semantic,現在允許另含 lexical,但 semantic 不得消失,
+    # 且 relationship uncertainty 必須恰一條、文案精確。)
     [bundle] = mcp_module.code_rag_search("entry", mode="context", max_chars=2000)
     assert set(bundle) == CONTEXT_KEYS
     assert bundle["graph_status"].startswith("unavailable")
     assert bundle["evidence"]
-    assert all(item["reason"] == "semantic" for item in bundle["evidence"])
+    allowed_reasons = {
+        "semantic", "lexical match", "lexical test candidate",
+        "lexical header candidate", "lexical config candidate",
+    }
+    for item in bundle["evidence"]:
+        assert set(item["reason"].split("; ")) <= allowed_reasons, item["reason"]
+    seed_paths = {seed["path"] for seed in bundle["seeds"]}
+    assert any(
+        item["path"] in seed_paths and "semantic" in item["reason"].split("; ")
+        for item in bundle["evidence"]
+    ), bundle["evidence"]
+    relationship = [
+        row for row in bundle["uncertainties"]
+        if row["target"] == code_context.RELATIONSHIP_UNAVAILABLE_TARGET
+    ]
+    assert len(relationship) == 1, bundle["uncertainties"]
+    assert relationship[0]["reason"] == (
+        code_context.RELATIONSHIP_UNAVAILABLE_REASON.format(category="unavailable")
+    )
 
 
 # ============================================================
@@ -364,3 +386,84 @@ def test_cap_falls_back_to_minimal_when_lists_exhausted(mcp_module):
     capped = mcp_module._cap_graph_response(resp)
     assert len(json.dumps(capped, ensure_ascii=False)) <= mcp_module._GRAPH_RESPONSE_MAX_CHARS
     assert "error" in capped and capped["truncated"] is True
+
+
+# ============================================================
+# workflow F:graph 缺席時 mcp_server 不得預先清空 lexical_hits
+# ============================================================
+@pytest.fixture
+def mcp_module_isolated(monkeypatch, tmp_path: Path):
+    """同 `mcp_module`,但 HOME / USERPROFILE / XDG_CONFIG_HOME 全指向 tmp_path
+    (SEAMS S-E:新測試不得讀真實 ~/.config);root 另開 `repo/`,因為
+    mcp_server 會拒絕 AICODE_ROOT == $HOME。既有 fixture 不動。"""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".config").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "util.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
+    (root / "app.py").write_text(
+        "from util import helper\n\n\ndef entry():\n    return helper()\n",
+        encoding="utf-8")
+
+    code_rag._INDEX_SCAN_CACHE.clear()
+    mcp_server = import_mcp_module(monkeypatch, root)
+
+    monkeypatch.setattr(code_rag, "USE_RERANKER", False)
+    monkeypatch.setattr(mcp_server.CODE_RAG, "_get_embedding", lambda _t: [1.0, 0.0])
+    monkeypatch.setattr(mcp_server.CODE_RAG, "_embed_texts_batched",
+                        lambda texts: [[1.0, 0.0]] * len(texts))
+
+    import code_graph as _code_graph
+
+    _code_graph.CodeGraph(str(root)).build()
+
+    yield mcp_server
+    sys.modules.pop("mcp_server", None)
+    code_rag._INDEX_SCAN_CACHE.clear()
+
+
+@pytest.mark.smoke
+def test_context_mode_keeps_lexical_hits_when_graph_missing(mcp_module_isolated):
+    """graph 尚未建立時,只有 grep 才找得到的 config 檔仍要以 lexical evidence
+    入選(mcp_server 以前在 graph None 時直接把 lexical_hits 設成 []),而且
+    relationship uncertainty 恰一條;連跑兩輪確認沒有偷偷重建 graph。"""
+    mcp_server = mcp_module_isolated
+    root = Path(mcp_server.AICODE_ROOT)
+    (root / "config").mkdir()
+    (root / "config" / "app.cfg").write_text(
+        "ZQXV_LEXICAL_ONLY_TOKEN=1\nentry_window=fast\n", encoding="utf-8"
+    )
+    code_rag.invalidate_scan_cache(root)
+
+    for suffix in ("", "-wal", "-shm"):
+        p = root / f".code_rag_graph.sqlite3{suffix}"
+        if p.exists():
+            p.unlink()
+    mcp_server._CODE_GRAPH = None
+
+    for _round in range(2):
+        [bundle] = mcp_server.code_rag_search(
+            "ZQXV_LEXICAL_ONLY_TOKEN entry", mode="context", max_chars=4000
+        )
+        # 只有 grep 找得到:config 檔沒有 symbol,不在 index 裡
+        assert "config/app.cfg" not in {
+            item["path"] for item in mcp_server.CODE_RAG.index
+        }
+        assert bundle["graph_status"].startswith("unavailable")
+        cfg_rows = [item for item in bundle["evidence"] if item["path"] == "config/app.cfg"]
+        assert len(cfg_rows) == 1, bundle["evidence"]
+        assert "lexical config candidate" in set(cfg_rows[0]["reason"].split("; "))
+        relationship = [
+            row for row in bundle["uncertainties"]
+            if row["target"] == code_context.RELATIONSHIP_UNAVAILABLE_TARGET
+        ]
+        assert len(relationship) == 1, bundle["uncertainties"]
+        assert relationship[0]["reason"] == (
+            code_context.RELATIONSHIP_UNAVAILABLE_REASON.format(category="unavailable")
+        )
+        assert not (root / ".code_rag_graph.sqlite3").exists()

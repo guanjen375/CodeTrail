@@ -906,7 +906,21 @@ chunks 大於 0、一般 `query_knowledge` 也查得到,但 `query_knowledge_str
 
 ### `apply_patch(...)` 被拒絕
 
-先知道什麼**不會**造成拒絕:hunk 的行號/行數錯誤無害——定位靠 context
+`apply_patch` 同一次只接受一種格式(SEARCH/REPLACE 或 unified diff),參數已是字串、不要包 Markdown fence;混用、孤立 marker、fence、marker 外的說明文字都會被拒絕。兩種格式共用的拒絕原因:非 UTF-8 檔案、CR-only／mixed newline、目標或路徑上有 symlink、路徑不是 repo-relative POSIX(絕對路徑、Windows drive／UNC、`..`)——這些都是整份 patch 拒絕、零寫入。一次改超過 5 個檔案或單檔 200 行也會被拒。
+
+「驗證不完整」或「驗證未通過」**不是拒絕**:patch 已套用、未回滾,請看回覆裡的 syntax 診斷,或另行呼叫 `run_lint(fix=False)`。
+
+#### SEARCH/REPLACE 被拒絕
+
+- SEARCH 與檔案現況不逐字相同(縮排不同也算)→ 工具不會拿相似位置代套;先 `read_file(...)`
+  重讀,從現況逐字重建 SEARCH(錯誤訊息會附最接近位置的檔案現況與第一個差異)。
+- SEARCH 在檔案中出現多處 → S/R 沒有行號提示,一律拒絕;多帶幾行讓它唯一。
+- 多個區塊互相重疊、或第二個區塊要靠第一個區塊套用後才存在 → 拒絕(全部區塊都對同一份原始檔定位)。
+- 空 SEARCH 只能建立不存在的新檔;檔案已存在(含 0 byte)就會被拒。
+
+#### unified diff 被拒絕
+
+先知道什麼**不會**造成拒絕(只適用 unified diff):hunk 的行號/行數錯誤無害——定位靠 context
 內容,`@@` 可以完全不帶行號;已套用過的 hunk 會自動跳過(重試安全)。
 
 常見原因:
@@ -915,13 +929,12 @@ chunks 大於 0、一般 `query_knowledge` 也查得到,但 `query_knowledge_str
   重讀目標區段(錯誤訊息會附上最接近位置的期望/實際對照)。
 - context 行太少,在檔案中多處出現、無法消歧 → 增加 context 行數,
   或在 `@@` 標大約行號當提示。
-- 一次改超過檔案數或行數限制。
 
 把任務拆小,要求模型一次只改一個行為。
 
 ### `run_command(...)` 被拒絕
 
-命令不在白名單,或含 shell metacharacter。請模型改用已允許的最小命令,例如:
+命令不在白名單或含 shell metacharacter。timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），不是這個範圍的整數會在執行前被拒絕。請模型改用已允許的最小命令,例如:
 
 ```text
 請改跑 pytest tests/test_x.py,不要使用 &&、|、; 或 shell script。

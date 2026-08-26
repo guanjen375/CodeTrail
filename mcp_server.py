@@ -110,7 +110,7 @@ assert AICODE_ROOT is not None  # for type checkers
 
 import config
 import code_context
-from config import KNOWLEDGE_FILE, RUN_COMMAND_TIMEOUT
+from config import KNOWLEDGE_FILE, RUN_COMMAND_TIMEOUT, RUN_COMMAND_TIMEOUT_MAX, RUN_COMMAND_TIMEOUT_MIN
 from knowledge import KnowledgeBase, load_knowledge_base_strict
 from knowledge_store import KnowledgeStoreError
 import code_rag as code_rag_module
@@ -778,7 +778,11 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
         mode="path":單元素 list,含 paths(每條是 edge list,逐步證據)。
         mode="context":單元素 list,top-level keys 固定為 query/evidence/
             uncertainties/seeds/graph_status/truncated/budget_chars/used_chars。
-            graph 缺席或損壞時仍回 semantic-only evidence 並標 graph_status。
+            graph 缺席或損壞時仍回 semantic＋lexical evidence 並標 graph_status;
+            uncertainties 會列出
+            「呼叫關係證據不可用（relationship evidence unavailable: graph unavailable）；未看到 caller/callee 不代表不存在」
+            （graph 查詢途中出錯時 `graph unavailable` 改為 `graph degraded`）,
+            不得把「沒看到呼叫者」推論成「沒有呼叫者」。
         graph 生命週期:首次建置是顯式維運動作;graph 尚未建立、損壞或
         schema 不符時 neighbors/path 直接報錯,錯誤訊息內含**可直接複製
         執行**的建立命令(實際 python interpreter + code_graph.py 絕對
@@ -809,10 +813,10 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
             graph_status = f"unavailable: {type(exc).__name__}: {exc}"[:200]
 
         allowed_paths = set(CODE_RAG._scan_code_files())
-        lexical_hits = (
-            code_context.collect_safe_lexical_hits(EXEC, query, allowed_paths)
-            if graph is not None else []
-        )
+        # lexical grep 證據不依賴 graph(workflow F):graph 缺席時以前這裡直接
+        # 給 [],把 context 打成 semantic-only。仍用 scoped allowed_paths,
+        # collect_safe_lexical_hits 內部再過一次 _safe_path。
+        lexical_hits = code_context.collect_safe_lexical_hits(EXEC, query, allowed_paths)
         bundle = code_context.build_code_context(
             query=query,
             semantic_items=semantic_items,
@@ -1100,34 +1104,59 @@ def list_dir(path: str = ".", depth: int = 2, max_chars: int = 20000) -> str:
 
 @_tool()
 def apply_patch(diff: str, dry_run: bool = False) -> str:
-    """Apply a unified-diff patch to files inside AICODE_ROOT (writes to disk).
+    """Apply a patch to files inside AICODE_ROOT (writes to disk). 兩種格式擇一:SEARCH/REPLACE 或 unified diff。
 
-    ⚠ 預設會直接寫入檔案。定位靠 context 內容,**不靠行號**:
-      - hunk header 寫 `@@` 就好,**不必計算行數**;寫了 `@@ -N,M +N,M @@`
-        也只當提示用(context 在檔案中多處出現時用來挑最近的一處),
-        行號/行數錯了不會導致失敗。
-      - 每個 hunk 的修改行前後各帶 2–3 行 context 即可;context 行必須與
-        檔案現況一致(這是唯一的定位依據)。
-      - context 在檔案中多處出現且無行號提示 → 拒絕並列出候選行號
-        (fail loud,不猜位置)。
-      - **重送同一份 patch**:只有在 `@@` 有寫新檔起始行(`+c`)、而且該 hunk
-        的修改後內容正好落在新檔第 c 行時,才會判定「已套用過」並跳過。
-        裸 `@@` 或行號對不上時會誠實報錯,並告訴你修改後內容在第幾行 ——
-        別處剛好相同的內容看起來一模一樣,工具不猜(猜錯=靜默漏改)。
-        第一次套用仍然完全不需要行號。
-      - 完全沒有 context 的純新增只能靠行號,且行號必須落在檔案實際行數內
-        (0 = 插在檔首),越界直接拒絕。
-    每次最多改 PATCH_MAX_FILES 個檔案、單檔最多 PATCH_MAX_LINES_PER_FILE 行。
-    套用後會自動跑 lint / typecheck / 相關測試。
+    ⚠ 預設會直接寫入檔案。`diff` 參數已是字串,**不要再包 Markdown fence**(```)。
+    同一次呼叫只能用一種格式;混用、孤立 marker、fence、marker 外的說明文字都會被拒絕。
+
+    格式 A — SEARCH/REPLACE(建議本地模型優先使用;不需要行號、不需要 context 前綴):
+        src/led.c
+        <<<<<<< SEARCH
+        void led_toggle(void) {
+            gpio_write(LED_PIN, !gpio_read(LED_PIN));
+        }
+        =======
+        void led_toggle(void) {
+            gpio_toggle(LED_PIN);
+        }
+        >>>>>>> REPLACE
+      - path 是 marker 前一個非空行:repo 相對 POSIX 路徑;拒絕絕對路徑 / Windows drive /
+        UNC / `.` / `..` / `/dev/null` / NUL / 控制字元。三個 marker 必須是完整的一行、逐字相同。
+      - SEARCH 逐行 exact 比對(只容忍行尾空白;縮排不同 = 不匹配,不會用相似的位置代套);
+        在檔案中出現多處 → 拒絕(請多帶幾行讓它唯一);多個區塊對同一份原始檔定位,
+        互相重疊 → 拒絕。內容本身需要一整行 `<<<<<<< SEARCH` 之類 marker 時改用 unified diff。
+      - 空 SEARCH(marker 之間沒有任何行)= 建立新檔:只在目標不存在、該檔恰一個區塊、
+        REPLACE 非空時成立;檔案已存在(含 0 byte)一律拒絕。
+    格式 B — unified diff(`--- a/f` / `+++ b/f` / `@@`):定位靠 context 內容,行號選填、
+      不必計算行數;規則與過去相同(多處匹配靠行號提示消歧、已套用過的 hunk 會跳過、
+      純新增沒有 context 時只能靠行號且必須在檔案範圍內)。
+
+    上限:最多 5 個檔案;udiff 單檔 added+removed ≤ 200 行;S/R 單檔 payload budget = sum(SEARCH 行數 + REPLACE 行數) ≤ 200
+    (兩者不是同一種計數)。
+
+    檔案安全(兩格式相同):既有檔以 UTF-8 strict 讀取,非 UTF-8 → 整份 patch 拒絕、零寫入;
+    BOM / CRLF / 檔尾有無換行 / 權限位元原樣保留;CR-only 或 mixed newline 一律拒絕;
+    目標或路徑上有 symlink 一律拒絕。單檔寫入是同目錄 temp + 原子替換;多檔是「全量
+    preflight + 失敗時 best-effort rollback」,不是跨檔交易。新檔為 LF、無 BOM。
+
+    套用後只做同一 process、唯讀的 syntax check(.py/.pyi 用 ast;C/C++ 需 tree-sitter
+    grammar,缺席 = skipped 不算通過;其他副檔名 skipped);它是 advisory,失敗**不回滾**,
+    結果會明說「patch 已套用、未回滾」;`PATCH_AUTO_VERIFY=False` 時連 syntax check 也不做。
+    lint / typecheck / test 不會自動執行——請另行呼叫 `codetrail_run_lint(fix=False)` 與
+    `codetrail_run_command(...)`,它們各自需要獨立核准。
 
     Args:
-        diff: unified diff 內容(--- a/file / +++ b/file / @@)。
-        dry_run: True 時只解析 diff、檢查 context、列出將改的檔案/行數,
-                 但不寫檔、不跑驗證。先 dry_run 一次再正式 apply 是好習慣,
-                 尤其當前面的 read_file 跟 patch 之間隔了多個工具呼叫時。
+        diff: patch 內容字串(格式 A 或 B;不要包 fence)。
+        dry_run: True 時只做 preflight 並逐檔回報七個欄位:format、檔案清單（每個 parsed
+                 file 一行,含失敗的）、blocks、payload budget、locations（定位行）、new_file
+                 （是否新建）,全部通過才顯示 `would apply`;零副作用(不建目錄、不留 temp、
+                 不跑驗證)。先 dry_run 一次再正式 apply 是好習慣,尤其當前面的 read_file
+                 跟 patch 之間隔了多個工具呼叫時。
 
     Returns:
-        套用結果摘要 + 自動驗證輸出(dry_run 時只有預覽)。
+        逐檔結果(`✓` / `✗` 開頭);mismatch 時附最接近位置的檔案現況與第一個差異
+        (整次回覆的預覽總量有上限 40 行 / 2000 字元),之後是 syntax 驗證區塊
+        (dry_run 時只有預覽)。
     """
     if dry_run:
         return EXEC.apply_patch(patch=diff, dry_run=True)
@@ -2445,23 +2474,35 @@ def record_lesson(rule: str, scope: str = "project") -> str:
 
 
 @_tool()
-def run_command(cmd: str) -> str:
-    """Run a whitelisted command inside AICODE_ROOT.
+def run_command(
+    cmd: str,
+    timeout: Annotated[
+        int, Field(strict=True, ge=RUN_COMMAND_TIMEOUT_MIN, le=RUN_COMMAND_TIMEOUT_MAX)
+    ] = RUN_COMMAND_TIMEOUT,
+) -> str:
+    """Run a whitelisted command inside AICODE_ROOT (server-side timeout 1..600 s).
 
-    白名單範圍(config.ALLOWED_COMMANDS):
-      - 測試: pytest / ctest / npm test / cargo test / go test
-      - 靜態: mypy / tsc / ruff / black / isort / eslint / clang-format
-      - 建置: make / cmake / ninja / meson / bazel build
+    白名單(config.ALLOWED_COMMANDS)分三段:
+      - 預設白名單 = 測試與靜態命令:pytest / ctest / npm test / cargo test / go test;
+        mypy / tsc / ruff / black / isort / eslint / clang-format 等。
+      - build 命令(make / cmake / ninja / meson / bazel build)只在
+        AI_CODE_ENABLE_BUILD_COMMANDS=1 時加入白名單。
+      - git 不在白名單:改用 git_status / git_diff。
+    apply_patch 不會自動呼叫這裡:套用後只做同 process 的 syntax check,lint / test
+    要由你另行呼叫 codetrail_run_lint(fix=False) / codetrail_run_command,各自經過核准閘。
     輸出超長會 smart-truncate(優先保留含 FAIL/ERROR/Traceback 的段落)。
 
     Args:
-        cmd: 完整命令,例如 "pytest tests/test_x.py -v" 或 "make all"。
+        cmd: 完整命令,例如 "pytest tests/test_x.py -v" 或 "ruff check src"。
+        timeout: 秒,整數 1..600,預設 60。這是 server 端接受的上限;MCP client
+                 可能更早截止,不保證 600 秒必在 client timeout 內。非整數
+                 (含 true / 1.0 / "60")或超出範圍會在執行前被拒絕。
 
     Returns:
         stdout + stderr(截斷後)+ 退出狀態。
     """
     try:
-        return EXEC.run_command(cmd, timeout=RUN_COMMAND_TIMEOUT)
+        return EXEC.run_command(cmd, timeout=timeout)
     finally:
         # build / formatter / test 都可能寫檔;失敗的命令也可能已改檔(§5-3)。
         code_rag_module.invalidate_scan_cache(AICODE_ROOT)

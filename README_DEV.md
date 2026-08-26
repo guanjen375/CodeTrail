@@ -96,8 +96,9 @@ aicode_web  # A/B 機已加入同一 tailnet 時
   `test_set_config_*`、`test_deployment_*`、`test_server_*`、`test_model_resolution.py`、
   `test_opencode_checks.py`、`test_tool_call_canary.py`、`test_config.py`、`test_doctor.py`。
 - MCP / sandbox / mutation：`test_mcp_*`、`test_fs_sandbox.py`、`test_external_import.py`、
-  `test_patch_parser.py`、`test_patch_apply.py`、`test_run_command.py`、
-  `test_run_lint.py`、`test_endpoint_policy.py`、`test_smoke_gate.py`。
+  `test_patch_parser.py`、`test_patch_apply.py`、`test_patch_search_replace.py`、
+  `test_patch_byte_safety.py`、`test_patch_verify.py`、`test_run_command.py`、
+  `test_run_command_timeout.py`、`test_run_lint.py`、`test_endpoint_policy.py`、`test_smoke_gate.py`。
 - Code-RAG / graph：`test_ast_parser_cpp.py`、`test_code_graph*.py`、
   `test_code_rag_*.py`、`test_code_context.py`、`test_definition_metadata_propagation.py`、
   `test_file_kind_policy.py`、`test_grep_output_budget.py`、`test_index_scope.py`、
@@ -410,6 +411,42 @@ python3 data_flywheel.py export --file data/interactions.jsonl --output data/tra
 | 用途 | 固定題庫回歸測試 | 收集真實互動樣本 |
 | 日常 OpenCode 是否需要 | 不需要 | 不需要 |
 | 是否適合成熟產品 | 適合做 regression gate | 適合做資料閉環，但要更嚴格處理隱私 |
+
+---
+
+## apply_patch 架構（patch_engine.py / patch_verify.py）
+
+`agent_tools.ToolExecutor.apply_patch` 是唯一的寫檔管線；兩種輸入格式（SEARCH/REPLACE、unified diff）
+在 `patch_engine.py` 正規化成同一種 per-file plan 後，走同一條 sandbox → 上限 → preflight →
+journaled 寫入 → best-effort rollback。
+
+- `patch_engine.py`（不 import config / agent_tools；上限由呼叫端傳入）：格式偵測與嚴格 S/R
+  狀態機、path 規則、`FileSnapshot`（UTF-8 strict、BOM、LF/CRLF、mode/ino/dev）、exact+rstrip
+  定位、結構化 mismatch record 與單一 renderer（整次回覆的 mismatch 預覽合計 40 行／2000 字元）、
+  寫入層與 `WriteJournal`。POSIX 上以 dir_fd 錨定實作（逐層 `O_DIRECTORY|O_NOFOLLOW`、同目錄
+  temp、既有檔 `os.replace`、新檔以不覆蓋既存檔的方式發布）；沒有 dir_fd 的平台退回逐層 lstat
+  重驗，並在結果第一段明示。已驗證的行為契約（`tests/test_patch_byte_safety.py`）：preflight 後
+  preimage 被改 → 中止並回滾（`test_preimage_changed_after_preflight_aborts_and_rolls_back`）、
+  新檔目標在 preflight 後被競爭者建立 → 中止且不覆蓋
+  （`test_new_target_created_by_competitor_after_preflight_aborts`）、第一檔已寫入後被第三方修改
+  → rollback 保留現況並回報 conflict（`test_rollback_does_not_overwrite_third_party_modification`）、
+  dir_fd 退回路徑仍擋 symlink（`test_dirfd_fallback_reports_degraded_note_and_still_blocks_symlinks`）。
+  這些競態防線是以 monkeypatch 在既定時點注入變更來驗證，不是真實併發測試。
+- `patch_verify.py`：套用後的自動驗證只做同 process、無 subprocess、唯讀的 syntax check
+  （`.py`/`.pyi` 用 ast；C/C++ 只在釘版 tree-sitter grammar 載入時檢查 ERROR 與零寬 MISSING
+  node）；三態 passed / failed / skipped，任何 skipped 都渲染成「驗證不完整」，失敗不回滾。
+  import 集合由 `tests/test_patch_verify.py::test_patch_verify_module_import_allowlist_is_exact`
+  用 ast 釘成 allowlist，`test_auto_verify_true_spawns_no_subprocess` 守住不 spawn；lint / test
+  由 `codetrail_run_lint(fix=False)` / `codetrail_run_command` 顯式呼叫，各自經 OpenCode ask。
+- `run_command` 的 `timeout` 三層同值（native schema、executor、MCP
+  `Annotated[int, Field(strict=True, ge=1, le=600)]`），常數在 `config.RUN_COMMAND_TIMEOUT{,_MIN,_MAX}`；
+  `scripts/check_readme_consistency.py` 第 9–11 條把 5／200、1..600、dry_run 七欄位與驗證分層
+  宣稱釘在 MCP docstring、native description 與文件上。
+
+部署 canary（不進 CI、不是所有使用者必綠）：在受支援且乾淨的部署上跑
+`python3 scripts/opencode_contract_check.py` 與 `AICODE_TOOL_CANARY_FORCE=1 aicode` 的
+tool_call_canary，記錄 OpenCode 版本、MCP SDK 版本、模型／chat template 與結果四項；環境不可得時
+逐字回報 `not run: environment unavailable`，不阻擋離線驗收。
 
 ---
 

@@ -687,11 +687,10 @@ def evaluate_context_report(cases: list[dict], rags: dict, graphs: dict,
             allowed_paths = set(rag._scan_code_files())
             executor = ToolExecutor(str(roots[case["repo"]]))
             counting = _CountingExecutor(executor)
-            lexical_hits = (
-                code_context.collect_safe_lexical_hits(
-                    counting, case["question"], allowed_paths
-                )
-                if graph is not None else []
+            # lexical hits 不依賴 graph(workflow F;與 mcp_server 同一決策,
+            # eval fixture 一律建 graph,所以 gate 數值不變)。
+            lexical_hits = code_context.collect_safe_lexical_hits(
+                counting, case["question"], allowed_paths
             )
             seeds = (semantic_seeds or {}).get(case["id"])
             if seeds is None:
