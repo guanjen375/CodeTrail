@@ -573,11 +573,14 @@ def read_binary(path: str, max_strings: int = 200, view: str = "summary", target
         if header.startswith(b"\x7fELF"):
             # 前綴也算在 max_chars 內：ELF 報告的 cap 要扣掉前綴長度，最終值才不會超過上限
             prefix = "[BIN→ELF] 偵測到 ELF magic，自動切換 ELF 解析模式:\n\n"
+            cap = max(1, int(max_chars))
             body = _build_elf_report(
                 p, view=view_key, target=target_key, limit=limit_key,
-                max_chars=max(1000, int(max_chars) - len(prefix)),
+                max_chars=max(50, cap - len(prefix)),
             )
             result = prefix + body
+            if len(result) > cap:   # 極小的 max_chars 連前綴都放不下：上限仍然是上限，硬切
+                result = result[:cap]
             _cache_set(_BIN_CACHE, cache_key, result, _BIN_CACHE_MAX)
             return result
 

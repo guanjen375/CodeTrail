@@ -432,6 +432,7 @@ def test_ingest_render_limits_are_bounded_by_cap(elf_path: Path, monkeypatch):
         assert 0 < limit <= line_budget, (view, limit)
 
 
+@pytest.mark.smoke
 def test_dwarf_types_respect_type_cap(tmp_path: Path, monkeypatch):
     """審核三 #2：_DWARF_TYPE_CAP 定義了卻沒用；limit 很大時所有型別都會被建出來。"""
     gcc = shutil.which("gcc")
@@ -509,4 +510,71 @@ def test_bin_with_elf_magic_respects_max_chars(elf_path: Path, tmp_path: Path):
     assert out.startswith("[BIN→ELF]") and len(out) <= 3000, len(out)
     out2 = media.read_binary(str(blob))
     assert len(out2) <= config.BIN_ELF_REPORT_MAX_CHARS, len(out2)
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-26 第四輪靜態審核回修
+# ---------------------------------------------------------------------------
+
+@pytest.mark.smoke
+def test_target_regex_rejects_alternation_chain_bomb(elf_path: Path):
+    """審核四 #1：正面表列只管量詞，30 個連續 (a|aa) 群組（零量詞、長度 < 200）照樣通過，
+    對 a…a 再接不匹配字元就是指數回溯；單次 re.search 無法被 deadline 中斷。"""
+    evil = "^" + "(a|aa)" * 30 + "$"
+    t0 = time.monotonic()
+    out = media.read_elf(str(elf_path), view="strings", target=evil)
+    assert time.monotonic() - t0 < 5, "target regex 沒有擋住 alternation chain"
+    assert "字面" in out, out
+    # 最上層的 alternation 仍可用（各分支獨立、不會互相組合）
+    ok = media.read_elf(str(elf_path), view="symbols", target="helper_static|main")
+    assert "helper_static" in ok and "[注意]" not in ok, ok
+
+
+@pytest.mark.smoke
+def test_view_output_is_bounded_during_generation(elf_path: Path):
+    """審核四 #2：hard_max 只是筆數，各 view 仍先完整產生再事後裁；渲染階段就要以字元預算截止，
+    且輸出（含截斷說明）不得超過預算。"""
+    elf_analysis._MODEL_CACHE.clear()
+    model = elf_analysis.load_model(elf_path)
+    for view, target in (("symbols", ""), ("strings", "cat:all"), ("relocs", "*"), ("sections", "")):
+        full = elf_analysis.render(model, view, target, 0)          # 預設 25K 預算：這顆小 ELF 全部放得下
+        out = elf_analysis.render(model, view, target, 0, char_budget=600)
+        assert len(out) <= 600, (view, len(out))
+        if len(full) > 600:                                          # 真的被預算切到的才必須有說明
+            assert "字元" in out and "上限" in out, (view, out[-200:])
+        else:
+            assert out == full, view                                 # 放得下就一個字都不能少
+
+
+@pytest.mark.smoke
+def test_readelf_sections_only_failure_does_not_fake_memmap_stats(elf_path: Path, monkeypatch):
+    """審核四 #3：只有 -SW 失敗時，memmap 用空的 sections 算出 code/rodata/data/bss 全 0。"""
+    if not shutil.which("readelf"):
+        pytest.skip("binutils readelf 不存在，無法驗 fallback")
+    monkeypatch.setattr(elf_analysis, "_HAS_PYELFTOOLS", False)
+    real_run = elf_analysis.run_cmd
+
+    def flaky(cmd, timeout=30):
+        if cmd[0] == "readelf" and cmd[1] == "-SW":
+            return None, "timeout"
+        return real_run(cmd, timeout)
+
+    monkeypatch.setattr(elf_analysis, "run_cmd", flaky)
+    elf_analysis._MODEL_CACHE.clear()
+    media._ELF_CACHE.clear()
+    memmap = media.read_elf(str(elf_path), view="memmap")
+    assert "code 0 B" not in memmap, memmap
+    assert "readelf -SW" in memmap, memmap
+
+
+@pytest.mark.smoke
+def test_bin_with_elf_magic_respects_tiny_max_chars(elf_path: Path, tmp_path: Path):
+    """審核四 #4：body 至少 1,000 字元再加前綴，max_chars < ~1,050 時仍超限。"""
+    blob = tmp_path / "fw.bin"
+    blob.write_bytes(elf_path.read_bytes())
+    media._BIN_CACHE.clear()
+    for cap in (500, 300, 120):
+        out = media.read_binary(str(blob), max_chars=cap)
+        assert len(out) <= cap, (cap, len(out))
+    assert len(elf_analysis.build_report(elf_path, "summary", max_chars=100)) <= 100
 

@@ -89,10 +89,10 @@
   跟正常更新一字不差，查詢照樣回答但答的是別份文件
 - `knowledge._gated_completion`——knowledge.py 所有主模型 `/completion` 的唯一
   出口。繞過它等於沒有 context gate，超長 prompt 由 llama-server 從前面靜默截掉
-- `elf_analysis.safe_regex` / `_regex_is_safe`——`analyze_file` 的 `target` 只接受安全子集的
-  regex（不接受群組後接量詞、`{n,m}`、backreference、lookaround，`*`/`+` ≤ 2、`?` ≤ 6），其餘改字面
-  比對；比對主體只看前 500 字元。Python `re` 沒有 timeout 也不釋放 GIL，放寬它就是讓一個 target
-  卡死整個同步的 MCP server
+- `elf_analysis.safe_regex` / `_regex_is_safe`——`analyze_file` 的 `target` 只接受正面表列的安全
+  regex 子集（不收任何群組、`|` 只在最上層且 ≤ 8 分支、`*`/`+` 合計 ≤ 1、`?` ≤ 3、不接受 `{n,m}` /
+  backreference / lookaround / inline flag），其餘改字面比對；比對主體只看前 300 字元。Python `re`
+  沒有 timeout 也不釋放 GIL，放寬它就是讓一個 target 卡死整個同步的 MCP server
 
 任何重構碰到上面這些東西，**新加測試**（開發者寫測試檔，執行依 §2.2 權責），
 不要直接刪 / weaken / 移除檢查點。
