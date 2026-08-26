@@ -104,7 +104,9 @@ _INGEST_MIN_LINES = 200
 # 各 view 一行至少幾個字元：筆數上限 = 字元預算 // 最短行長 + 1，永遠不會比字元預算先到，
 # 但也不會讓 heap / 候選清單長到遠超過預算能放的量（symbols 的 nsmallest、strings 的 picked）。
 _MIN_LINE_CHARS: Dict[str, int] = {
-    "symbols": 40, "relocs": 20, "strings": 16, "dwarf": 10, "imports": 5,
+    # 每個值都 ≤ 該 view 真的能印出的最短一行（test_min_line_chars_never_exceed_the_shortest_possible_line）：
+    # relocs 最短 `  X+0x0  T  (none)` = 18；dwarf 型別區塊有 `  enum X` = 8 與只有 6 個空白開頭的值列。
+    "symbols": 40, "relocs": 16, "strings": 16, "dwarf": 6, "imports": 5,
     "sections": 50, "dynamic": 6, "memmap": 30, "disasm": 12,
 }
 
@@ -1592,12 +1594,25 @@ def is_mapping_symbol(name: str) -> bool:
     return bool(_MAPPING_SYM_RE.match(name or ""))
 
 
-def _load_segments(model: ElfModel) -> List[Dict]:
-    return [s for s in model.segments if s["type"] == "LOAD"]
+def _iter_load_segments(model: ElfModel):
+    """LOAD segment 的 generator：不建 list（大量 segment 的 ELF 不該為了一個 view 先物化全部）。"""
+    return (seg for seg in model.segments if seg["type"] == "LOAD")
 
+
+def _n_load_segments(model: ElfModel) -> int:
+    n = model._lazy.get("n_load")
+    if n is None:
+        n = sum(1 for _ in _iter_load_segments(model))
+        model._lazy["n_load"] = n
+    return n
+
+
+def _load_segments(model: ElfModel) -> List[Dict]:
+    """需要整份 list 的少數呼叫端（測試 / 小型用途）；渲染路徑一律用 _iter_load_segments。"""
+    return list(_iter_load_segments(model))
 
 def segment_for_addr(model: ElfModel, addr: int) -> Optional[Dict]:
-    for seg in _load_segments(model):
+    for seg in _iter_load_segments(model):
         if seg["vaddr"] <= addr < seg["vaddr"] + max(seg["memsz"], 1):
             return seg
     return None
@@ -1617,7 +1632,7 @@ def section_for_addr(model: ElfModel, addr: int) -> Optional[Dict]:
 
 def addr_to_file_offset(model: ElfModel, addr: int) -> Optional[Tuple[int, int]]:
     """虛擬位址 → (file offset, 從該處起檔案內還有幾個 bytes)。先看 LOAD segment 再看 section。"""
-    for seg in _load_segments(model):
+    for seg in _iter_load_segments(model):
         if seg["vaddr"] <= addr < seg["vaddr"] + seg["filesz"]:
             return seg["offset"] + (addr - seg["vaddr"]), seg["vaddr"] + seg["filesz"] - addr
     sec = section_for_addr(model, addr)
@@ -2567,10 +2582,31 @@ def disassemble(model: ElfModel, target: str = "", limit: int = 0) -> Tuple[bool
 # 記憶體配置 / 向量表
 # ---------------------------------------------------------------------------
 
+def _segment_kind(seg: Dict) -> str:
+    filesz, memsz = seg["filesz"], seg["memsz"]
+    writable = "W" in seg["flags"]
+    relocated = seg["paddr"] != seg["vaddr"]
+    if relocated and filesz > 0:
+        return "LMA≠VMA：開機由 LMA（FLASH）複製到 VMA（RAM）的初始化資料"
+    if writable and memsz > filesz:
+        return "可寫，含 zero-init（.bss 類）"
+    if writable:
+        return "可寫（RAM）"
+    if "E" in seg["flags"]:
+        return "唯讀可執行（程式碼，就地執行）"
+    return "唯讀（rodata / header）"
+
+
+def iter_segment_kinds(model: ElfModel):
+    """(LOAD segment, 分類說明) 的 generator：memmap 逐筆取用，預算用完就不再往下拉。"""
+    for seg in _iter_load_segments(model):
+        yield seg, _segment_kind(seg)
+
+
 def memory_accounting(model: ElfModel) -> Dict:
-    """LOAD segment 的 FLASH / RAM / .bss 估算（規則明寫在報告裡）。"""
-    acc = {"image": 0, "rom_in_place": 0, "ram": 0, "bss": 0, "init_data": 0, "segments": []}
-    for seg in _load_segments(model):
+    """LOAD segment 的 FLASH / RAM / .bss 估算（規則明寫在報告裡）。單趟、只算總量，不建清單。"""
+    acc = {"image": 0, "rom_in_place": 0, "ram": 0, "bss": 0, "init_data": 0}
+    for seg in _iter_load_segments(model):
         filesz, memsz = seg["filesz"], seg["memsz"]
         writable = "W" in seg["flags"]
         relocated = seg["paddr"] != seg["vaddr"]
@@ -2582,19 +2618,7 @@ def memory_accounting(model: ElfModel) -> Dict:
         else:
             acc["rom_in_place"] += memsz
         acc["bss"] += max(0, memsz - filesz)
-        if relocated and filesz > 0:
-            kind = "LMA≠VMA：開機由 LMA（FLASH）複製到 VMA（RAM）的初始化資料"
-        elif writable and memsz > filesz:
-            kind = "可寫，含 zero-init（.bss 類）"
-        elif writable:
-            kind = "可寫（RAM）"
-        elif "E" in seg["flags"]:
-            kind = "唯讀可執行（程式碼，就地執行）"
-        else:
-            kind = "唯讀（rodata / header）"
-        acc["segments"].append((seg, kind))
     return acc
-
 
 def section_usage(model: ElfModel) -> Dict[str, int]:
     """alloc section 依 flags 歸類：code / rodata / data / bss（bytes）。"""
@@ -2642,9 +2666,10 @@ def arm_vector_table(model: ElfModel, limit: int = 48) -> Optional[Dict]:
             max_words = min(max_words, sec["size"] // 4)   # 有明確的向量 section 就以它的大小為準
             break
     if base is None:
-        loads = sorted((s for s in _load_segments(model) if s["filesz"] >= 8), key=lambda s: s["vaddr"])
-        if loads:
-            base, source = loads[0]["vaddr"], f"最低 LOAD segment {model.fmt_addr(loads[0]['vaddr'])}"
+        first = min((s for s in _iter_load_segments(model) if s["filesz"] >= 8),
+                    key=lambda s: s["vaddr"], default=None)
+        if first is not None:
+            base, source = first["vaddr"], f"最低 LOAD segment {model.fmt_addr(first['vaddr'])}"
     if base is None:
         return None
     loc = addr_to_file_offset(model, base)
@@ -3102,7 +3127,7 @@ def _key_facts(model: ElfModel) -> List[str]:
 
     if "segments" in model.failed:
         out.append(f"  Memory   : unknown（program header 讀取失敗：{model.failed['segments']}）")
-    elif _load_segments(model):
+    elif _n_load_segments(model):
         acc = memory_accounting(model)
         out.append(
             f"  Memory   : image(LOAD filesz) {_fmt_bytes(acc['image'])}；"
@@ -3540,8 +3565,8 @@ def _memmap_lines(model: ElfModel, limit: int, compact: bool):
         yield (f"【記憶體配置】program header 讀取失敗：{model.failed['segments']}（不能當成沒有 LOAD segment）")
         return
     sec_failed = model.failed.get("sections")
-    loads = _load_segments(model)
-    if model.is_rel or not loads:
+    n_load = _n_load_segments(model)
+    if model.is_rel or not n_load:
         yield ("")
         if sec_failed:
             yield (f"【記憶體配置】沒有 LOAD segment，且 section 表讀取失敗：{sec_failed}（section 歸類無法計算）")
@@ -3563,9 +3588,9 @@ def _memmap_lines(model: ElfModel, limit: int, compact: bool):
     yield ("【記憶體配置（LOAD segments）】")
     yield (f"  {'#':<3} {'VMA(vaddr)':<{w + 2}} {'LMA(paddr)':<{w + 2}} {'filesz':<10} {'memsz':<10} flg  說明")
     max_segs = 32 if compact else max(limit, 256)
-    for si, (seg, kind) in enumerate(acc["segments"]):
+    for si, (seg, kind) in enumerate(iter_segment_kinds(model)):
         if si >= max_segs:
-            yield (f"  ... +{len(acc['segments']) - si} 個 LOAD segment（view=\"memmap\" limit=N）")
+            yield (f"  ... +{n_load - si} 個 LOAD segment（view=\"memmap\" limit=N）")
             break
         yield (
             f"  {seg['idx']:<3} {model.fmt_addr(seg['vaddr']):<{w + 2}} {model.fmt_addr(seg['paddr']):<{w + 2}} "
@@ -3799,13 +3824,13 @@ def view_memmap(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opt
                 char_budget: Optional[int] = None) -> List[str]:
     out = _sink(model, char_budget)
     out.extend(_memmap_lines(model, _limit_for("memmap", limit, hard_max, char_budget), compact=False))
-    loads = _load_segments(model)
-    if loads and not model.is_rel and "sections" not in model.failed:
+    if (_n_load_segments(model) and not model.is_rel and "sections" not in model.failed
+            and not out.exhausted()):
         out.append("")
         out.append("【Section → LOAD segment】")
         line_budget = _limit_for("memmap", limit, hard_max, char_budget) * 8 + 64   # 行數上限（sink 另有字元預算）
         emitted = 0
-        for seg in loads:
+        for seg in _iter_load_segments(model):
             if out.exhausted():
                 break
             out.append(f"  LOAD #{seg['idx']} VMA {model.fmt_addr(seg['vaddr'])} LMA {model.fmt_addr(seg['paddr'])} {seg['flags']}:")
@@ -3823,10 +3848,14 @@ def view_memmap(model: ElfModel, target: str = "", limit: int = 0, hard_max: Opt
                 emitted += 1
             if emitted >= line_budget:
                 break
-        unmapped = [s for s in model.sections if s["name"] and "A" in s["flags"] and s["size"] > 0
-                    and not _section_segment_map(model).get(s["name"])]
-        if unmapped:
-            out.append("  不在任何 segment 內的 alloc section：" + ", ".join(s["name"] for s in unmapped[:20]))
+        seg_map = _section_segment_map(model)
+        unmapped = list(itertools.islice(
+            (s for s in model.sections if s["name"] and "A" in s["flags"] and s["size"] > 0 and not seg_map.get(s["name"])),
+            21,
+        ))
+        if unmapped and not out.exhausted():
+            out.append("  不在任何 segment 內的 alloc section：" + ", ".join(s["name"] for s in unmapped[:20])
+                       + ("，…" if len(unmapped) > 20 else ""))
     return _finish(out)
 
 

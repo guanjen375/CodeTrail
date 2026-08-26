@@ -613,7 +613,9 @@ def test_headers_view_stops_generating_after_budget(tmp_path: Path, monkeypatch)
     monkeypatch.setattr(elf_analysis._Sink, "append", counting_append)
     out = elf_analysis.render(model, "headers", "", 0, char_budget=1500)
     assert len(out) <= 1500
-    assert calls[0] < 400, f"預算用完後仍產生了 {calls[0]} 行"
+    kept = out.count("\n") + 1
+    # 串流的定義：append 次數 ≈ 留下的行數 + 幾次被丟掉的嘗試；先建整份 list 會是幾千次
+    assert calls[0] <= kept + 8, f"保留 {kept} 行卻 append 了 {calls[0]} 次（預算用完後仍在產生）"
 
 
 @pytest.mark.smoke
@@ -689,11 +691,23 @@ def test_memmap_streams_to_sink(tmp_path: Path, monkeypatch):
     model = elf_analysis.load_model(p)
     assert len(elf_analysis._load_segments(model)) == 3001
     calls = _count_sink_appends(monkeypatch)
+    pulled = [0]
+    real_iter = elf_analysis.iter_segment_kinds
+
+    def counting_iter(m):
+        for item in real_iter(m):
+            pulled[0] += 1
+            yield item
+
+    monkeypatch.setattr(elf_analysis, "iter_segment_kinds", counting_iter)
     cap = 1500
     n = elf_analysis._ingest_entry_cap(cap)
     out = elf_analysis.render(model, "memmap", "", n, hard_max=n, char_budget=cap)
     assert len(out) <= cap
-    assert calls[0] < 400, f"預算用完後仍產生了 {calls[0]} 行"
+    kept = out.count("\n") + 1
+    assert calls[0] <= kept + 8, f"保留 {kept} 行卻 append 了 {calls[0]} 次"
+    # 審核七 #1：segment 分類也要是 lazy 的——不能為了前幾行先把 3001 個 LOAD 全部物化
+    assert pulled[0] <= kept + 8, f"只留 {kept} 行卻物化了 {pulled[0]} 個 LOAD segment"
 
 
 @pytest.mark.smoke
@@ -708,7 +722,8 @@ def test_strings_cat_all_stops_after_budget(tmp_path: Path, monkeypatch):
     n = elf_analysis._ingest_entry_cap(cap)
     out = elf_analysis.render(model, "strings", "cat:all", n, hard_max=n, char_budget=cap)
     assert len(out) <= cap
-    assert calls[0] < 400, f"預算用完後仍產生了 {calls[0]} 行"
+    kept = out.count("\n") + 1
+    assert calls[0] <= kept + 8, f"保留 {kept} 行卻 append 了 {calls[0]} 次（預算用完後仍在產生）"
 
 
 @pytest.mark.smoke
@@ -724,4 +739,20 @@ def test_manual_stop_reports_at_least(tmp_path: Path):
     out = elf_analysis.render(model, "relocs", "*", n, hard_max=n, char_budget=cap)
     assert len(out) <= cap
     assert "報告已截斷" in out and "至少" in out, out[-220:]
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-26 第七輪靜態審核回修
+# ---------------------------------------------------------------------------
+
+@pytest.mark.smoke
+def test_min_line_chars_never_exceed_the_shortest_possible_line():
+    """審核七 #3：筆數上限 = 字元預算 // 最短行長 + 1 的保證，前提是常數 ≤ 該 view 真的能印出的
+    最短一行。DWARF 型別區塊有 `  enum X`（8 字元）和只有 6 個空白開頭的值列；relocs 最短是
+    `  X+0x0  T  (none)`（18 字元）。"""
+    m = elf_analysis._MIN_LINE_CHARS
+    assert m["dwarf"] <= 6, m["dwarf"]
+    assert m["relocs"] <= 18, m["relocs"]
+    assert m["strings"] <= 19 and m["symbols"] <= 44 and m["imports"] <= 5
+    assert m["sections"] <= 85 and m["dynamic"] <= 21 and m["memmap"] <= 37 and m["disasm"] <= 32
 
