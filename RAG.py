@@ -3490,7 +3490,8 @@ def add_document(input_file: str, output_file: str, *, generate_context: bool = 
     只留這一份文件，全部在同一次原子提交裡完成。它**不會為了 reset 去清**
     `.codetrail/figures/`；同一份文件的人工修正照 §15.7 沿用，被移出 KB 的其他文件
     則是「檔案留著、但重新 ingest 不會自動恢復人工確認」（見 `_commit_document_to_kb`）。
-    預設 append 語意不變。
+    預設為合併語意：新 basename 加入，同一來源的同 basename 原子替換舊 chunks；
+    不同來源的同名文件仍由身分閘拒絕。
     """
     input_path = Path(input_file)
     output_path = Path(output_file)
@@ -4036,7 +4037,7 @@ def rebuild_cli(argv: List[str]) -> int:
     )
     parser.add_argument(
         "--fresh", action="store_true",
-        help=("先清空既有 chunks 再灌（第一份文件生效，之後的照舊 append）；"
+        help=("先清空既有 chunks 再灌（第一份文件生效，之後照常合併；同一來源 basename 更新）；"
               "embeddings cache 隨新 generation 自動失效，.codetrail/figures/ 不動"),
     )
     parser.set_defaults(context=None)
@@ -4066,7 +4067,7 @@ def rebuild_cli(argv: List[str]) -> int:
     fresh = args.fresh
     if fresh:
         print("[INFO] --fresh：第一份文件會清空既有知識庫（figure artifacts 不動），"
-              "後續文件照常 append。")
+              "後續文件照常合併（同一來源 basename 更新）。")
     for document_path in args.documents:
         print(f"\n=== {document_path} ===")
         add_document(document_path, args.kb, generate_context=generate_context,
@@ -4096,7 +4097,7 @@ def print_usage():
     print("  screenshot   聊天截圖圖片 (png/jpg/jpeg/gif/webp)")
     print("  image        技術圖片 (架構圖/流程圖/記憶體映射等)")
     print("  url          網頁 URL (http:// 或 https://)")
-    print("  output_json  知識庫檔案 (不存在則建立，存在則 append)")
+    print("  output_json  知識庫檔案 (不存在則建立，存在則合併；同一來源 basename 更新)")
     print("")
     print("範例:")
     print("  python3 RAG.py manual.pdf knowledge.json                       # PDF 直接入庫")

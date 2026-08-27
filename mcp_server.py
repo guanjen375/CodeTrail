@@ -1728,8 +1728,9 @@ def ingest_document(
 ) -> str:
     """Ingest a file into the project knowledge base.
 
-    呼叫 AICODE_ROOT/RAG.py 把指定檔案切 chunk + 算 embedding,append 到
-    AICODE_ROOT/knowledge.json。查詢端會自動偵測檔案變更:下一次
+    呼叫 AICODE_ROOT/RAG.py 把指定檔案切 chunk + 算 embedding,再以通過身分
+    驗證的文件 basename 為單位更新或加入 AICODE_ROOT/knowledge.json。查詢端會自動
+    偵測檔案變更:下一次
     query_knowledge / query_knowledge_strict 會先重載 KB 再查,不依賴人工
     記得 reload。想「立即」載入並確認 chunk 數,可呼叫 reload_knowledge_base()。
 
@@ -1796,7 +1797,9 @@ def ingest_document(
       - 圖片: .png / .jpg / .jpeg / .gif / .webp(經 VL 模型抽說明,需要 llama-server VL port)
       - binary: .bin / .dat / .raw / .fw / .img / .rom / .hex
                 (hex dump + 可讀字串 + magic 偵測;偵測到 ELF magic 會自動切 ELF 解析)
-      - ELF: .elf / .so / .o / .axf / .out / .ko(header / sections / symbols)
+      - ELF: .elf / .so / .o / .axf / .out / .ko
+             (長版多視角報告:summary / 完整 symbols / memmap / relocation caller /
+              DWARF 函式與型別 / 分類 strings / sections / imports / dynamic)
 
     Args:
         path: 檔案路徑(絕對或相對 AICODE_ROOT)。檔案必須在 AICODE_ROOT 內,
@@ -1823,7 +1826,8 @@ def ingest_document(
                   **不會**自動恢復它們的人工確認,revision 會退回 1。沿用的前提是
                   該 figure 仍在 KB 內(KB 是 revision 的唯一真相),光有 artifact
                   證明不了使用者確認過的是哪一版。
-              預設 False ＝ 既有的 append 語意,一個字都沒變。
+              預設 False ＝ 合併語意:新 basename 加入一份文件;同一來源的同
+              basename 原子替換舊 chunks。不同來源的同名文件仍由身分閘拒絕。
               不能與 preflight_only 併用(後者是零寫入的估算)。
 
     Returns:

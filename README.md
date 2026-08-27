@@ -339,7 +339,8 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 #### RAM 低標(VRAM 沒有)
 
 **VRAM 沒有硬性低標**。放不進 GPU 的部分 llama.cpp 會留在 CPU,功能完全一樣,差別只有
-速度;`set_config.sh` 也不做容量估算,能不能放得下以啟動後 `nvidia-smi` 實測為準。
+速度;`set_config.sh` 不會用整體容量估算擋住設定或保證模型一定能載入,能不能放得下仍以
+啟動後 `nvidia-smi` 實測為準（CPU-MoE 題目的權重 / free-VRAM 推薦區間只供參考）。
 
 **RAM 有**。四個 server 同時跑,每顆模型「沒放進 VRAM 的那一部分」都必須放得進 RAM:
 
@@ -347,7 +348,8 @@ HF_XET_HIGH_PERFORMANCE=1 hf download \
 RAM 低標 ≈ Σ(每顆模型的 GGUF 大小 − 該模型放進 VRAM 的部分) + 數 GB 系統餘裕
 ```
 
-llama.cpp 是 mmap 讀 GGUF 的,**RAM 不夠不會報錯**,而是每產一個 token 就回磁碟重讀,
+llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會以 mmap 讀 GGUF。
+走 mmap 路徑時,RAM 壓力未必會在載入時直接報錯,反而可能反覆從磁碟 page-in,
 症狀變成「跑得動、但慢到不像話」——很容易被誤判成模型或設定有問題。用
 `--cpu-moe` / `--n-cpu-moe` 把 experts 留在 RAM 時尤其要算清楚:那等於把幾乎整個模型
 搬進 RAM。確認方式是啟動後看 `free -g` 與 `ps -o rss= -p <pid>`,不要只看 `nvidia-smi`。
@@ -368,7 +370,7 @@ llama.cpp 是 mmap 讀 GGUF 的,**RAM 不夠不會報錯**,而是每產一個 to
 
 ### 3.1 `./set_config.sh` 做什麼
 
-**純問答式設定**:每一題由你作答,工具不提供預設值,也**不用估算擋你的輸入**——它只驗證輸入在合理範圍(例如選項只有 1/2 卻輸入 3 會重問),以及做結構性檢查(binary 旗標、模型齊全性、schema)。數值題會附一句方向(越大越吃什麼)與一個**推薦值**,但推薦不是限制,填區間外的值照樣接受。VRAM 塞不塞得下仍以啟動後 `nvidia-smi` 實測為準。在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`,它會依序:
+**純問答式設定**:每一題由你作答,工具不提供預設值,也**不用估算擋你的輸入**——它只驗證輸入在畫面列出的合法範圍(例如選項只有 1/2 卻輸入 3 會重問),以及做結構性檢查(binary 旗標、模型齊全性、schema)。部分數值題會附一句方向(越大越吃什麼)與**推薦值 / 推薦區間**,但推薦不是限制;只要仍在合法輸入範圍內,推薦區間外也照樣接受。VRAM 塞不塞得下仍以啟動後 `nvidia-smi` 實測為準。在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`,它會依序:
 
 1. **前置檢查**:Python 依賴(mcp/numpy/requests)、`tmux`、`nvidia-smi`、`llama-server` 是否存在且支援必要旗標(`--reranking` / `--mmproj` / `--fit` / `--cache-ram`;CPU-MoE 另需 `--cpu-moe` / `--n-cpu-moe`)。缺什麼直接在這一步就擋下並給**可複製的修復指令**(裝哪個套件、跑哪行 build),不會讓你答完所有問題才發現要重來;`llama-server` 因動態庫(如 CUDA lib)跑不起來時,會轉述原始錯誤並指向 `LD_LIBRARY_PATH`,不會誤報成「不支援旗標」。
 2. **偵測**:GPU 種類/VRAM、`~/models` 的 GGUF 自動分類成主聊天 / embedding / reranker / VL+mmproj 四類;多 shard 自動聚合並**驗證齊全性**(缺片直接列出檔名)。有 mmproj 的 VL 模型不會被排進 main 清單前面;四類缺一即在初步判定硬停。
@@ -397,7 +399,7 @@ llama.cpp 是 mmap 讀 GGUF 的,**RAM 不夠不會報錯**,而是每產一個 to
 | `~/start.sh` | 啟動腳本:寫死你的 GPU 配置、主模型與驗證過的 `LLAMA_BIN`,呼叫 `scripts/launch_servers.py`;支援 `status` / `stop` / `logs` / `help` 子命令,打錯子命令會提示而不是誤啟動 |
 | `~/.config/codetrail/setconfig-last-transaction.json` | 只記最近一次 transaction 實際包含的 runtime 檔案，供 `--restore-last-backup` 整批還原；不是另一份設定來源 |
 
-結尾會自動印出**啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準;`~/start.sh` 啟動完成的最後一行也會提醒你用 `nvidia-smi` 稍微監控 GPU/VRAM(例如 `watch -n 1 nvidia-smi`),因為 set_config 不做任何容量估算。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
+結尾會自動印出**啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準;`~/start.sh` 啟動完成的最後一行也會提醒你用 `nvidia-smi` 稍微監控 GPU/VRAM(例如 `watch -n 1 nvidia-smi`),因為 set_config 不做整體 VRAM 可行性判定,也不會拿容量估算保證一定能啟動。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
 
 非互動用法(自動化 / 重跑)是 `./set_config.sh --yes`。它會跳過提問與確認頁，
 但**所有使用者選擇題的值必須由旗標提供，缺哪個就報錯**：
@@ -779,7 +781,7 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 第一個請求**首字延遲(TTFT)**:
 
 - 用 `--no-mmap` 模式:約 5–15 秒
-- 用 mmap 模式(沒加 `--no-mmap`,**這是預設**):**第一次可能要 1–2 分鐘**,因為要從 SSD page-in MoE expert weights。畫面上 frontend 可能顯示「`...esc interrupt`」或類似等待狀態,**不要按 Esc**,等就對了
+- 沒設定 `no_mmap`:CodeTrail 會保留 llama.cpp 的預設 `--load-mode auto`;在支援 mmap 的裝置通常會走 mmap 路徑,**第一次可能要 1–2 分鐘**,因為要從 SSD page-in MoE expert weights。畫面上 frontend 可能顯示「`...esc interrupt`」或類似等待狀態,**不要按 Esc**,等就對了
 
 要改成 `--no-mmap`,是在 `~/.config/codetrail/deployment.json` 的 `services.<main|vl>.parameters` 加 `"no_mmap": true`(不是手動改 llama-server 指令 —— argv 每次由 deployment 重新產生)。CodeTrail **不替你決定**這一項,但套了 CPU-MoE 卻沒設時 `set_config.sh` 會警告,而且重跑會保留你的設定。詳見 [docs/troubleshooting.md](docs/troubleshooting.md)。
 

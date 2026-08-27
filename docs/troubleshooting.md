@@ -485,8 +485,10 @@ python3 <CODETRAIL_REPO>/RAG.py rebuild --kb knowledge.json <SOURCE_FILE>... --f
 ```
 
 MCP 端對應 `ingest_document(path, fresh=True)`。它清空既有 chunks、讓舊 cache 失效、
-只留這一份文件,而且**不動** `.codetrail/figures/` 與其中的 `human_verified` 人工覆核
-資料（那是花時間換來的,不是 cache）。中途失敗會整批回滾,不會留下「新 JSON 配舊向量」。
+只留這一份文件,而且不會因 fresh 整批刪除 `.codetrail/figures/` artifact。同一份文件
+重新 ingest 時,只有來源像素、頁碼與正規化 bbox 都相同的 `human_verified` 人工覆核才會
+沿用;被移出 KB 的其他文件即使 artifact 還在,之後重新 ingest 也不會自動恢復人工確認,
+revision 會回到 1。中途失敗會整批回滾,不會留下「新 JSON 配舊向量」。
 
 #### `KnowledgeStoreError: ... embedding model mismatch`
 

@@ -17,7 +17,8 @@
 
 [README §1.4](../README.md#14-blackwell-gpu-需要-cuda-toolkit-128-以上) 的 apt 流程只覆蓋 Ubuntu 24.04。其他情境:
 
-- **其他 Ubuntu 版本(22.04 / 20.04)**:apt repo URL 把 `ubuntu2404` 換成 `ubuntu2204` / `ubuntu2004`,其餘相同
+- **Ubuntu 22.04**:README 的 CUDA 13.0 apt 流程可把 repo URL 的 `ubuntu2404` 換成 `ubuntu2204`,其餘同版套件步驟相同
+- **Ubuntu 20.04**:[CUDA 13.0 的原生 Linux 支援表](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-installation-guide-linux/index.html#system-requirements)已不含 20.04,不能只換成 `ubuntu2004` 後仍照裝 `cuda-toolkit-13-0`。請升級到受支援的 Ubuntu,或改選仍支援 20.04 的封存版本(例如 [CUDA 12.8](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-installation-guide-linux/index.html#system-requirements),也符合 Blackwell 的 12.8 低標),並全程採用該版本對應的 repo、套件名與路徑
 - **不能 apt(離線、非 Ubuntu、container 內)**:從 [developer.nvidia.com/cuda-downloads](https://developer.nvidia.com/cuda-downloads) 下載 runfile installer,執行時**取消勾選 Driver**(避免覆蓋現有驅動),只裝 toolkit。安裝完手動 export `PATH` / `LD_LIBRARY_PATH` 指到對應路徑
 
 ### CodeTrail Python 依賴用 venv(隔離環境)

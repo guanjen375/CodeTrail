@@ -146,7 +146,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
   兩條 lane 任一失敗都是**整份文件不入庫**（零寫入）。走到 VL 的圖需要 VL server（:8083）在線；純文字＋原生表格的 PDF 則可能一次 VL 都不用呼叫）
 - **圖片**：`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp`（用 VL 模型看圖、抽出文字描述後切 chunk，需要先把 VL GGUF 掛在 llama-server :8083,設定見 [README §2.4](../README.md#24-vl-模型) 與 §3.2）
 - **binary**：`.bin` / `.dat` / `.raw` / `.fw` / `.img` / `.rom` / `.hex`（抽 hex dump、可讀字串、magic 偵測；遇到 ELF magic 自動切到 ELF 解析）
-- **ELF**：`.elf` / `.so` / `.o` / `.axf` / `.out` / `.ko`（抽 header / sections / symbols）
+- **ELF**：`.elf` / `.so` / `.o` / `.axf` / `.out` / `.ko`（走長版多視角報告：summary、完整 symbols、memmap、relocation caller、DWARF 函式與型別、分類 strings、sections / imports / dynamic）
 
 純圖片掃描的 PDF（沒有可選文字）不再切不出內容：每頁會 render 後進入 raster 分類與結構化抽取。文字＋圖混合的 PDF（datasheet 類）文字照舊切 chunk，圖另外產生 table / terminal / diagram structured chunk。圖很多的 PDF 建議先跑 `ingest_document(path, preflight_only=True)` 估成本（零寫入，見下節）。VL server 是啟動必要條件，若圖片分析失敗（ingest 會整份中止、知識庫不變），先跑 `python3 scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
 
@@ -462,7 +462,7 @@ confirm_against_image 設 True。
 `fresh=True` 會在**同一次原子提交**裡清空既有 chunks、讓舊向量失效、只留這一份文件；
 中途失敗整批回滾，不會出現「新 JSON 配舊向量」這種半套狀態。CLI 對應
 `python3 RAG.py <file> knowledge.json --fresh`（`rebuild` 子命令也吃 `--fresh`，
-只對第一份文件生效，之後照常 append）。
+只對第一份文件生效，之後照常合併；同一來源的 basename 會更新原文件）。
 
 **fresh 不會額外整批清除 `.codetrail/figures/`**——那是花時間換來的人工資料，不是 cache。
 （ingest PDF 本來就會在那裡寫入這一次的 run，提交成功後也可能依 retention 回收該文件
