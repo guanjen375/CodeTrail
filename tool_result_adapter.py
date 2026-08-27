@@ -260,6 +260,7 @@ _PARTIAL_MARKERS: dict[str, tuple[str, ...]] = {
         "\n... 用 read_file(",
     ),
     "grep_code": (
+        "\n... [truncated: too many matches]",
         "\n[CTX] rg 結果不完整",
         "\n⚠️ [CTX] grep 輸出已達",
         "\n⚠️ [CTX] grep 已達",
