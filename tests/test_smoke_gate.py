@@ -36,6 +36,26 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "aicode 的 direct-MCP 契約與 experimental Code Mode fail-loud 閘",
         ("test_aicode_refuses_experimental_opencode_code_mode",),
     ),
+    "test_mcp_tool_contract.py": (
+        "live MCP 19-tool 固定順序、typed schema 與 catalog budget",
+        ("test_live_catalog_is_bounded_typed_and_ordered",),
+    ),
+    "test_tool_result_budget.py": (
+        "省略 max_chars 時結果預算依 call-time n_ctx 的 12% 動態配置",
+        ("test_default_budget_tracks_n_ctx",),
+    ),
+    "test_opencode_checks.py": (
+        "受管 build prompt 不得教授被 permission deny 的 bare OpenCode 工具",
+        ("test_build_prompt_never_teaches_denied_tools",),
+    ),
+    "test_set_config_artifacts.py": (
+        "未通過完整 routing gate 的 build prompt 不得成為新安裝預設",
+        ("test_yes_run_keeps_unmeasured_build_prompt_out_of_default_artifacts",),
+    ),
+    "test_tool_call_canary.py": (
+        "explicit hard gate 與 implicit 四態 diagnostic 必須分離",
+        ("test_explicit_gate_and_implicit_diagnostic_are_separate",),
+    ),
     "test_fs_sandbox.py": (
         "agent_tools.ToolExecutor._safe_path / media._safe_path",
         (
@@ -144,6 +164,10 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_redirect_is_fail_loud_and_body_free",
             "test_shared_session_ignores_environment_proxy",
         ),
+    ),
+    "test_contextual_signals.py": (
+        "strict KB 拒答閘不得把同文件的強檢索誤當成使用者點名欄位的存在證據",
+        ("test_refuse_answer_rejects_explicitly_missing_identifier",),
     ),
     "test_figure_review.py": (
         "figure_review.safe_figure_path(.codetrail/figures 邊界 + symlink + atomic write)",

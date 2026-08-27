@@ -3,6 +3,9 @@
 `~/.config/opencode/AGENTS.md` 會被 OpenCode 放進**每一輪** system prompt，連純聊天也不例外。
 它只適合放跨工具、跨專案都成立的少量不變式；它不是 MCP 工具手冊。可用工具名稱、參數與
 用途已由 OpenCode 在本輪 tool schema 提供，完整的人類文件則在 [MCP 工具清單](mcp-tools.md)。
+OpenCode build agent 另有一份可明確 opt-in、取代其 default 的
+[CodeTrail 受管 build prompt](opencode-build-prompt.md)；兩份檔的用途不同，都不應塞入完整
+工具目錄。
 
 > [!WARNING]
 > 不要把完整工具清單、長篇 RAG 流程、graph／figure 操作手冊或大量範例貼進全域
@@ -42,6 +45,13 @@ python3 scripts/opencode_contract_check.py --sync-agents-md
 AICODE_TOOL_CANARY_FORCE=1 aicode
 ```
 
+這個 `--sync-agents-md` 只**寫入**全域 AGENTS 範本；同一次執行仍會唯讀回報其他 contract
+是否 `MISSING`。build prompt 預設不安裝；只有
+`./set_config.sh --enable-experimental-build-prompt` 會明確 opt-in。之後舊受管 reference 與
+canonical artifact 可由 `python3 scripts/opencode_contract_check.py --fix` 同步；明確自訂的
+build prompt string 會保留。合成 request 只證明 default replacement，而完整 routing A/B
+沒有任何 arm 通過全部 gate。
+
 ## 會安裝的範本
 
 ```markdown
@@ -80,4 +90,4 @@ AICODE_TOOL_CANARY_FORCE=1 aicode
 下面清單位於 fenced block **外面**，只供人類查閱與 consistency check；新增或移除 MCP 工具時
 要與 `mcp_server.py` 及 [MCP 工具清單](mcp-tools.md)同步，但不要移進上面的安裝範本。
 
-CodeTrail 工具共 19 個：`codetrail_analyze_file`、`codetrail_apply_patch`、`codetrail_code_rag_search`、`codetrail_file_info`、`codetrail_git_diff`、`codetrail_git_status`、`codetrail_grep_code`、`codetrail_import_external_file`、`codetrail_ingest_document`、`codetrail_list_dir`、`codetrail_query_knowledge`、`codetrail_query_knowledge_strict`、`codetrail_read_file`、`codetrail_record_lesson`、`codetrail_reload_knowledge_base`、`codetrail_remove_document`、`codetrail_review_figures`、`codetrail_run_command`、`codetrail_run_lint`。
+CodeTrail 工具共 19 個，依 live `tools/list` 固定順序：`codetrail_list_dir`、`codetrail_read_file`、`codetrail_grep_code`、`codetrail_code_rag_search`、`codetrail_file_info`、`codetrail_query_knowledge`、`codetrail_query_knowledge_strict`、`codetrail_git_status`、`codetrail_git_diff`、`codetrail_apply_patch`、`codetrail_run_lint`、`codetrail_run_command`、`codetrail_analyze_file`、`codetrail_ingest_document`、`codetrail_remove_document`、`codetrail_reload_knowledge_base`、`codetrail_review_figures`、`codetrail_import_external_file`、`codetrail_record_lesson`。

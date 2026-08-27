@@ -76,8 +76,14 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 - 四個 server 預設只綁 `127.0.0.1`。同一專案不要同時開 standalone `aicode` 與
   `aicode_web`；TUI 要接現有 web backend 時用 `aicode attach`。安全與 web 細節分別見
   [docs/security.md](docs/security.md)與 §5.4。
-- 第一次跑 `aicode` 會自動把 [OpenCode 全域 AGENTS.md 精簡範本](docs/opencode-agents-template.md)裝進 `~/.config/opencode/AGENTS.md`。它只保留結構化呼叫、證據與停止條件；**不要把完整工具清單或操作手冊貼進去**，那會增加每輪 system prompt，實際發生過模型只說「現在呼叫」卻不產生 tool call 的退化。舊版固定工具清單會印 `⚠ STALE` 並給同步命令，但不會擋住啟動。手動同步是
-  `python3 scripts/opencode_contract_check.py --sync-agents-md`(會備份原檔)。
+- [CodeTrail build prompt](docs/opencode-build-prompt.md) 的正式 A/B 未通過完整 routing gate，
+  所以 `set_config.sh` **預設不安裝**；只有明確給 `--enable-experimental-build-prompt` 才會
+  opt-in，且明確自訂的 prompt 仍會保留。
+  第一次跑 `aicode` 另會自動把 [OpenCode 全域 AGENTS.md 精簡範本](docs/opencode-agents-template.md)
+  裝進 `~/.config/opencode/AGENTS.md`。兩者都只保留跨工具不變式；**不要把完整工具清單或操作手冊
+  貼進去**，那會增加每輪 system prompt。舊版固定工具清單會印 `⚠ STALE` 並給同步命令，
+  但不會擋住啟動。手動同步是 `python3 scripts/opencode_contract_check.py --sync-agents-md`
+  （會備份原檔）。
 
 ## 特別注意(首次部署最容易踩的)
 
@@ -136,7 +142,7 @@ npm config set prefix "$HOME/.local"
 grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.profile" 2>/dev/null || \
   printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.profile"
 export PATH="$HOME/.local/bin:$PATH"
-npm install -g opencode-ai@latest
+npm install -g "opencode-ai@^1.17.0"
 command -v opencode    # 確認可被找到
 opencode --version
 ```
@@ -147,17 +153,18 @@ opencode --version
 這是 [OpenCode 官方安裝頁](https://dev.opencode.ai/docs/#install) 列出的 npm 路徑；上游若調整
 安裝方式或 runtime 要求，以該頁當前版本為準。
 
-CodeTrail **不在 repo 內釘死 OpenCode patch 版**：它是使用者層 CLI，而且
-`aicode` 的 model-canary 指紋已包含 `opencode --version`，升級後會自動讓舊 PASS
-cache 失效並重驗。截至 2026-08-25，stable `opencode-ai 1.18.21` 已實測通過
-19-tool schema、`list_dir` round-trip 與本機模型結構化 tool call；因此從 1.17.9
-升級是相容的，不需要改 `mcp.codetrail` 設定格式。
+CodeTrail 的 direct-tool client 契約是 **OpenCode `>=1.17.0,<2.0.0`**，所以安裝命令鎖在
+1.x major，不使用可能跨 major 的 `@latest`。`aicode` 在任何 wrapper／設定 writer、MCP 或
+模型子行程之前，先讀 `opencode --version` 與 `opencode debug config`；版本無法唯一解析、
+超出範圍，或 effective config 出現 V2-only 的 `mcp.servers`／任何 `codemode` 鍵，都會
+fail-loud。OpenCode V2 的 `mcp.servers.codetrail`、`codemode:false`、`disabled` 與 execution
+timeout 語意不同，不能用 V1 canary 猜測相容。
 
-但不要把「新版 MCP 改善」和 **experimental Code Mode** 混在一起。Code Mode 會把
-直接暴露的 `codetrail_*` tools 改成單一 `execute` 入口，現行 permission、全域
-AGENTS schema anchor 與 canary 契約都不是這個模式。`aicode` 會明確固定
-`OPENCODE_EXPERIMENTAL_CODE_MODE=false`（避免 `OPENCODE_EXPERIMENTAL=true` 意外連帶
-開啟），若使用者顯式設成 true 則會 fail-loud；要導入它必須另案同步調整上述三層。
+Code Mode 會把直接暴露的 `codetrail_*` tools 改成單一 `execute` 入口，現行 permission、
+全域 AGENTS schema anchor 與 canary 契約都不是這個模式。`aicode` 會固定
+`OPENCODE_EXPERIMENTAL_CODE_MODE=false`；若使用者顯式設成 true 則拒絕啟動。已記錄的
+OpenCode 1.18.21 catalog／request 資料只代表該相容列的量測，不把所有 1.x
+模型／template 組合自動宣稱為 routing supported。
 
 ### 1.3 安裝 CodeTrail Python 依賴
 
@@ -377,15 +384,18 @@ llama.cpp 是 mmap 讀 GGUF 的,**RAM 不夠不會報錯**,而是每產一個 to
    **CPU-MoE 沒有 y/n 分流**:直接問「幾層 experts 留 RAM」,**`0` = 不 offload(experts 全留 GPU)**、`N` = 前 N 層留 RAM(`--n-cpu-moe N`)、輸入 **≥ 層數上限 = 全部留 RAM**(等同 `--cpu-moe`)。提示只有兩行:**數值越大 GPU 負載越低**,以及一個**推薦區間**——下界是權重剛好放得進這顆 GPU 目前 free VRAM 的層數、上界是全部移到 RAM(例如 `推薦數值:38-43`)。這個估算只算 GGUF 權重,沒有 KV cache / compute buffer / 共卡的附屬服務,所以是起點而不是保證。工具讀 GGUF tensor table 判斷:**不是 MoE(沒有 expert tensors)就不問**,並印出原因(dense 模型 offload 幾層都沒有意義)。main 與 VL 各問一次;embedding / reranker 永遠不套用。**VL 一旦套用 CPU-MoE,llama.cpp 的 `--fit` 就會失效**(它見到 tensor override 已被設定就直接放棄),所以工具會改寫 `-ngl 99 --fit off` 而不是假裝有 `--fit-target` 保護——這種情況沒有自動退讓的安全網,層數填太低會 OOM。
 
    `threads` **從頭到尾不問**——大部分人也不知道該填多少,所以預設就是 auto:不寫 `-t`,由 llama.cpp 自己偵測(hybrid CPU 只算 P-core,否則用實體核心數、排除 HT siblings),比工具自己數邏輯 CPU 準。真的要釘死才用進階旗標 `--threads N`。工具只驗證輸入範圍(上下限顯示成 `1024-1048576` 這種形式),**推薦值不會擋你**;三個附屬服務固定單 slot,最後啟動的 VL 用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用自動配置。答完顯示**設定摘要一頁**:按 **Enter 寫入**;**q** 離開不寫檔。OpenCode context、MCP timeout/Python 路徑一併對齊。
-4. **產生四個 runtime 檔案與一個還原 manifest**(runtime 檔採 transaction 寫入:要嘛全套完成、要嘛完全不動;既有檔自動備份 `*.bak-setconfig-<時間戳>`,`--restore-last-backup` 可整批還原):
+4. **預設產生四個 runtime 檔案與一個還原 manifest**（runtime 檔採 transaction 寫入：要嘛
+   全套完成、要嘛完全不動；既有檔自動備份 `*.bak-setconfig-<時間戳>`，
+   `--restore-last-backup` 可整批還原）：
 
 | 產物 | 內容 |
 |---|---|
 | `~/.config/codetrail/models.json` | 主模型 registry key → GGUF 路徑(合併既有內容) |
 | `~/.config/codetrail/deployment.json` | deployment profile local override:四個 role 的模型與主模型參數(全部來自你的作答);重跑時**保留你手動加的取樣參數**(temperature/top-p/…與 no_mmap),其他未涵蓋鍵會警告已捨棄 |
-| `~/.config/opencode/opencode.json` | **合併**而非重建:只更新 CodeTrail 管的欄位(model / provider.llamacpp / mcp.codetrail / 缺少的 permission 鍵),你原本的 provider、主題、其他 MCP server 都保留;與安全範本衝突的 permission 會尊重你的值但明確警告 |
+| `~/.config/codetrail/opencode-build-prompt.md` | **只在** `--enable-experimental-build-prompt` 時產生的受管 prompt（mode `0644`）；唯一來源是 [docs/opencode-build-prompt.md](docs/opencode-build-prompt.md) 的 fenced block |
+| `~/.config/opencode/opencode.json` | **合併**而非重建（mode `0600`）：只更新 CodeTrail 管的欄位(model / provider.llamacpp / mcp.codetrail / 缺少的 permission 鍵)；實驗性旗標才補 `agent.build.prompt`，使用者自訂 prompt、provider、主題與其他 MCP server 都保留；與安全範本衝突的 permission 會尊重你的值但明確警告 |
 | `~/start.sh` | 啟動腳本:寫死你的 GPU 配置、主模型與驗證過的 `LLAMA_BIN`,呼叫 `scripts/launch_servers.py`;支援 `status` / `stop` / `logs` / `help` 子命令,打錯子命令會提示而不是誤啟動 |
-| `~/.config/codetrail/setconfig-last-transaction.json` | 只記最近一次四個 runtime 檔的備份對應，供 `--restore-last-backup` 整批還原；不是另一份設定來源 |
+| `~/.config/codetrail/setconfig-last-transaction.json` | 只記最近一次 transaction 實際包含的 runtime 檔案，供 `--restore-last-backup` 整批還原；不是另一份設定來源 |
 
 結尾會自動印出**啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準;`~/start.sh` 啟動完成的最後一行也會提醒你用 `nvidia-smi` 稍微監控 GPU/VRAM(例如 `watch -n 1 nvidia-smi`),因為 set_config 不做任何容量估算。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
 
@@ -566,7 +576,11 @@ registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf`
 
 ### 4.3 OpenCode config
 
-llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 即可。下面是手動設定範本(把所有 `<CODE_MODEL>` 換成你 4.2 裡用的 registry key);`set_config.sh` 會產生 / 合併其中由 CodeTrail 管理的欄位,而 `agent.build.temperature` 是工具呼叫型本機模型建議另外加上的覆寫。重跑 `set_config.sh` 時,這類非 CodeTrail 管理欄位會保留:
+llama-server 提供 OpenAI 相容 `/v1`，OpenCode 用 openai-compatible provider 即可。下面是
+手動設定範本（把所有 `<CODE_MODEL>` 換成你 4.2 裡用的 registry key）。`set_config.sh`
+會產生／合併 CodeTrail 管理的欄位；下例的 `agent.build.prompt` 是尚未 supported 的**選用**設定，
+只有 `--enable-experimental-build-prompt` 才會自動加入；
+`agent.build.temperature` 則是既有的選用覆寫，重跑時會保留：
 
 ```json
 {
@@ -582,6 +596,7 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 
   "agent": {
     "build": {
+      "prompt": "{file:/home/<user>/.config/codetrail/opencode-build-prompt.md}",
       "temperature": 0
     }
   },
@@ -654,6 +669,16 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 
 (`set_config.sh` 產生的 MCP `command` 會直接用偵測到的 Python 絕對路徑執行 `mcp_server.py`,不經 `.opencode/run-codetrail-mcp` wrapper。這只保證 **MCP 子行程**找到原 venv；若依賴只裝在 venv,`aicode` 的啟動前置仍應在 activate 後執行。上面範本用 wrapper 的寫法供手動設定者理解；正常安裝以 `set_config.sh` 產物為準。)
 
+`agent.build.prompt` 的 `{file:...}` 是**取代** OpenCode build agent 預設 prompt 的受管檔案，
+不是附加另一份完整工具手冊。一般安裝維持 OpenCode 現況，不會新增這個欄位；若明確使用
+`--enable-experimental-build-prompt`，`set_config.sh` 才會寫入目前 HOME 的絕對路徑。
+舊 CodeTrail 受管 reference 會同步，明確自訂的 string 會保留；opt-in 時遇到非 string
+壞值會 fail-loud，不猜測修復。canonical prompt
+與 `opencode.json` 同一 transaction 寫入、支援 symlink write-through 與整批 rollback；prompt
+是 `0644`，可能含 provider key 的 config 是 `0600`。這份合成 request evidence 只證明
+replacement semantics。完整 A/B 已執行，但沒有任何 arm 通過全部 gate，因此它不成為預設，
+也不能據此宣稱某模型組合 supported。`todowrite` 目前仍為 `allow`。
+
 `mcp.codetrail.timeout` 的單位是毫秒,而且套用到每一次 MCP tool call。圖片 VL 分析通常超過 10 秒,`ingest_document` 的內部上限則是 10 分鐘,因此範本使用 660000 ms(11 分鐘)。若沿用 OpenCode 常見的 `10000`,第一個圖片呼叫會在剛好 10 秒被 client 切斷,後續 `file_info` / `list_dir` 也可能排在尚未結束的圖片請求後面,看起來像整個 MCP server 一起超時。
 
 `aicode` 啟動時會把**既有** `mcp.codetrail` entry 中缺漏、型別錯誤或小於 660000 的 `timeout` 自動同步為專案常數,保留其餘 OpenCode JSON 設定,並在同目錄留下 `opencode.json.codetrail.bak`(若已存在則加數字後綴)。寫入採原子替換;設定檔格式錯誤或無法寫入時會 fail-loud,不會帶著已知錯誤啟動 OpenCode。只有緊急測試才用 `AICODE_MCP_TIMEOUT_CHECK_SKIP=1 aicode` 跳過。
@@ -664,7 +689,22 @@ llama-server 提供 OpenAI 相容 `/v1`,OpenCode 用 openai-compatible provider 
 
 主模型 context 也採同一原則：使用者只在 `set_config.sh` 設 `n_ctx`。`aicode` 會讀主 server `/props` 的實值，供 CodeTrail internal calls 使用，並把 OpenCode active model 的 `limit.context` 安全同步成同一值。同步只改該 model 的這一欄、原子寫入並留備份；無法唯一定位 model、JSON 損壞或寫入失敗時才 fail-loud。
 
-`aicode`（含 `aicode web` 與最終委派它的 `aicode_web`，不含只連既有 backend 的 `attach`）還會自動跑兩層工具健檢。第一層每次都直接對實際 MCP command 做 `initialize → tools/list → list_dir`，並要求工具集合精確等於文件列出的 19 個；第二層用 fresh `opencode run --format json` 要 active model 真正呼叫 `codetrail_list_dir`，只有 `tool_use.state.status=completed` 的結構化 event 才算 PASS，模型輸出的 XML／成功宣稱一律不算。模型層 PASS 依 OpenCode config、模型、server `/props`（含 chat template／取樣預設）、專案規則與版本指紋快取 24 小時；設定變更會自動失效。快取只有 hash／時間，不含 prompt、檔名或 tool output，臨時 canary session 也會在檢查後刪除。完整輸出與 override 見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。
+`aicode`（含 `aicode web` 與最終委派它的 `aicode_web`，不含只連既有 backend 的
+`attach`）有三道分開的工具檢查：先用 `scripts/opencode_direct_contract.py` 驗證
+OpenCode `>=1.17,<2` 的 direct `codetrail_*` 契約，且在任何 writer/MCP/model 前
+fail-loud；再每次對實際 MCP command 做 `initialize → tools/list → list_dir`，要求 live
+catalog 的 19 個名稱與固定順序精確符合契約，並把完整 typed schemas／instructions digest
+納入後續 fingerprint；typed schema 的 bounds/description/budget 由 static contract 驗證，
+routing catalog 則保存逐工具 schema counts/digests 與 token measurement。最後才跑模型 lane。
+
+模型 lane 也刻意分開：explicit prompt 點名 `codetrail_list_dir`，只接受 completed
+結構化 event，失敗可重試一次而連續失敗會 exit 2；成功後另跑一次**未點名工具**的 implicit
+routing 診斷，只分成 `optimal`／`suboptimal`／`fail`／`timeout`，四種都不擋啟動。
+explicit 與 implicit 使用 schema 2 的分離 cache lane；指紋包含模型、effective config、
+OpenCode 版本、live tools/instructions、有效 build prompt、AGENTS/lessons 與 server `/props`。
+cache 只存 fingerprint hash、status、時間與版本，不存 prompt、檔名、專案路徑、模型輸出或
+tool result；臨時 canary session 也會刪除。`supports_tools=false` 會在任何 model attempt 前
+直接拒絕。完整輸出見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。
 
 說明:
 
@@ -750,7 +790,7 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 ```text
 請用工具 code_rag_search,mode 設 "context",
 query 寫 "ISR event never reaching the idle state in sm_transition",
-max_chars 設 12000，依 evidence 的 path:line 分成已證實與仍不確定兩部分回答。
+省略 max_chars，依 evidence 的 path:line 分成已證實與仍不確定兩部分回答。
 ```
 
 **`query` 要寫成一句自然的英文描述,並放進有辨識度的 identifier / 縮寫。** 索引是拿原始碼算的
@@ -766,7 +806,23 @@ embedding,查詢跟程式碼同語言時召回率差很多。33 萬符號的真�
 問題要求模型翻成自然英文即可。不要為了這件事把整段 query 教學複製進每輪載入的全域
 [AGENTS.md](docs/opencode-agents-template.md)。
 
-`mode="context"` 會把 semantic seeds、確定的 1-hop caller/callee/include，以及相關 test/header/config/trace lexical evidence 合併去重後裝進固定字元 budget。`max_chars` 合法範圍是 `2000..30000`、預設 `12000`，`used_chars` 只計 `evidence[].text` 的實際字元，不宣稱 tokenizer token 數；歧義與 unresolved 只進 `uncertainties`，不偽裝成確定證據。candidate 數量、graph traversal 與字元 budget 的截斷原因會分開標示。所有 source window 仍由既有 sandboxed `read_file` 路徑讀取。graph 尚未建立或損壞時，lexical（grep / index）候選仍會參與選取，實際 evidence 仍受既有 candidate 與字元 budget 約束；只有呼叫關係證據缺席，`graph_status` 標示原因，`uncertainties` 會列出 `呼叫關係證據不可用（relationship evidence unavailable: graph unavailable）；未看到 caller/callee 不代表不存在`（graph 查詢途中出錯時 `graph unavailable` 改為 `graph degraded`），不影響整次呼叫。
+`mode="context"` 會把 semantic seeds、確定的 1-hop caller/callee/include，以及相關
+test/header/config/trace lexical evidence 合併去重後裝進 bounded budget。MCP 省略
+`max_chars` 時，結果使用**呼叫當下** `n_ctx` 的 12% token 代理預算；不是固定 12,000。
+明示 `max_chars` 的合法範圍是 `2000..30000`，超過預設 12% 時結果會標
+`context_risk`。`used_chars` 仍只計 `evidence[].text` 的實際字元，不宣稱 tokenizer token
+數；direct/core Python API 為相容舊呼叫才保留 12,000 字元 fallback。歧義與 unresolved
+只進 `uncertainties`，不偽裝成確定證據。candidate 數量、graph traversal 與字元 budget
+的截斷原因會分開標示。所有 source window 仍由既有 sandboxed `read_file` 路徑讀取。
+graph 尚未建立或損壞時，lexical（grep / index）候選仍會參與選取，實際 evidence 仍受既有
+candidate 與字元 budget 約束；只有呼叫關係證據缺席，`graph_status` 標示原因，
+`uncertainties` 會列出 `呼叫關係證據不可用（relationship evidence unavailable: graph unavailable）；未看到 caller/callee 不代表不存在`（graph 查詢途中出錯時
+`graph unavailable` 改為 `graph degraded`），不影響整次呼叫。
+
+所有 MCP 工具的精簡文字結果第一行固定是 `status: ok|partial|error`；只有 partial/error
+或截斷時才接可操作的 `next:`。省略結果上限時都依上述 12% 動態預算，並受各工具既有
+safety cap 約束。`read_file` 的 `next:` 會給不漏行的下一個 `start_line`；完整 renderer
+與 structured evidence 保留規則見 [MCP 工具清單](docs/mcp-tools.md#結果文字與預算契約)。
 
 想看**跨檔案的呼叫關係**(誰呼叫誰、include 鏈),`code_rag_search` 除了語意搜尋還有 graph 模式:
 
@@ -871,6 +927,7 @@ ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>
 | [docs/rag.md](docs/rag.md) | 讀檔、匯入附件(PDF / 圖片經 VL)、建立知識庫、圖片+RAG 一起用、查 spec |
 | [docs/mcp-tools.md](docs/mcp-tools.md) | CodeTrail 暴露的 19 個 MCP 工具與使用原則 |
 | [docs/lessons.md](docs/lessons.md) | lessons(行為教訓):糾正 → 提案 → 核准 → 注入 → 過期複審的完整生命週期與管理指令 |
+| [docs/opencode-build-prompt.md](docs/opencode-build-prompt.md) | CodeTrail 受管 build prompt、replacement evidence 與不宣稱 routing support 的邊界 |
 | [docs/opencode-agents-template.md](docs/opencode-agents-template.md) | OpenCode 全域 AGENTS.md 精簡範本、1,600 字元預算與 prompt 過載排查 |
 | [docs/security.md](docs/security.md) | 沙箱邊界、OpenCode permission、外部匯入與 NDA 資料注意事項 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | `/status` / `/mcp`、ctx-safety、server 不可連、Blackwell CUDA、MoE 首字慢 |

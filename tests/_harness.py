@@ -104,6 +104,11 @@ def run_aicode_with_stub(
     stub_opencode.write_text(
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
+        'if [ "${1:-}" = "--version" ]; then printf \'1.18.21\\n\'; exit 0; fi\n'
+        'if [ "${1:-}" = "debug" ] && [ "${2:-}" = "config" ]; then\n'
+        "  printf '{}\\n'\n"
+        "  exit 0\n"
+        "fi\n"
         ": > opencode_args.txt\n"
         "for arg in \"$@\"; do\n"
         "  printf '%s\\n' \"$arg\" >> opencode_args.txt\n"
@@ -171,6 +176,11 @@ def contains_subsequence(items: list[str], expected: list[str]) -> bool:
 OPENCODE_WEB_CAPABLE_STUB = (
     "#!/usr/bin/env bash\n"
     "set -euo pipefail\n"
+    'if [ "${1:-}" = "--version" ]; then printf \'1.18.21\\n\'; exit 0; fi\n'
+    'if [ "${1:-}" = "debug" ] && [ "${2:-}" = "config" ]; then\n'
+    "  printf '{}\\n'\n"
+    "  exit 0\n"
+    "fi\n"
     'if [ "${1:-}" = "web" ] && [ "${2:-}" = "--help" ]; then\n'
     "  printf 'opencode web\\n\\nstart opencode server and open web interface\\n'\n"
     "  exit 0\n"
@@ -187,6 +197,11 @@ OPENCODE_WEB_CAPABLE_STUB = (
 OPENCODE_WEB_OLD_STUB = (
     "#!/usr/bin/env bash\n"
     "set -euo pipefail\n"
+    'if [ "${1:-}" = "--version" ]; then printf \'1.18.21\\n\'; exit 0; fi\n'
+    'if [ "${1:-}" = "debug" ] && [ "${2:-}" = "config" ]; then\n'
+    "  printf '{}\\n'\n"
+    "  exit 0\n"
+    "fi\n"
     'if [ "${1:-}" = "web" ] && [ "${2:-}" = "--help" ]; then\n'
     "  printf 'opencode [project]\\n\\nstart opencode tui\\n'\n"
     "  exit 0\n"

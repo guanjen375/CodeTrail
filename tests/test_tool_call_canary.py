@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from scripts import check_readme_consistency
+from scripts import opencode_direct_contract as direct_contract
 from scripts import tool_call_canary as canary
 
 
@@ -75,7 +76,9 @@ def _patch_runtime(monkeypatch, tmp_path: Path, attempts):
     monkeypatch.setattr(
         canary,
         "run_protocol_check",
-        lambda config, root, env, timeout: None,
+        lambda config, root, env, timeout: canary.ProtocolEvidence(
+            "a" * 64, "b" * 64
+        ),
     )
     monkeypatch.setattr(
         canary,
@@ -83,6 +86,8 @@ def _patch_runtime(monkeypatch, tmp_path: Path, attempts):
         lambda env: {
             "model_path": "/models/local.gguf",
             "chat_template": "tool_calls",
+            "chat_template_caps": {"supports_tools": True, "supports_tool_calls": True},
+            "build_info": {"build_number": 123, "compiler": "synthetic"},
             "n_ctx": 65536,
             "default_generation_settings": {"params": {"temperature": 0.0}},
         },
@@ -95,6 +100,11 @@ def _patch_runtime(monkeypatch, tmp_path: Path, attempts):
         canary,
         "run_model_attempt",
         lambda **kwargs: next(iterator),
+    )
+    monkeypatch.setattr(
+        canary,
+        "run_implicit_model_attempt",
+        lambda **kwargs: canary.ImplicitEvidence(canary.ImplicitStatus.OPTIMAL),
     )
     return root, env
 
@@ -199,20 +209,95 @@ def test_fingerprint_changes_with_project_instructions(tmp_path):
     assert first != second
 
 
+def test_fingerprint_covers_live_protocol_template_build_and_prompt(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    env = {"HOME": str(tmp_path / "home")}
+    config = _config(root)
+    config["agent"]["build"]["prompt"] = "synthetic build prompt A"
+    props = {
+        "model_path": "/models/local.gguf",
+        "chat_template_caps": {
+            "supports_tools": True,
+            "supports_parallel_tool_calls": False,
+        },
+        "build_info": {"build_number": 10, "compiler": "synthetic-a"},
+    }
+    protocol = canary.ProtocolEvidence("a" * 64, "b" * 64)
+
+    def fingerprint(
+        *,
+        cfg=config,
+        server_props=props,
+        protocol_evidence=protocol,
+    ):
+        return canary.build_fingerprint(
+            root=root,
+            config=cfg,
+            selected_model="llamacpp/local-model",
+            props=server_props,
+            opencode_version="1.18.21",
+            env=env,
+            protocol_evidence=protocol_evidence,
+        )
+
+    baseline = fingerprint()
+    assert fingerprint(
+        protocol_evidence=canary.ProtocolEvidence("c" * 64, "b" * 64)
+    ) != baseline
+    assert fingerprint(
+        protocol_evidence=canary.ProtocolEvidence("a" * 64, "d" * 64)
+    ) != baseline
+    changed_caps = json.loads(json.dumps(props))
+    changed_caps["chat_template_caps"]["supports_parallel_tool_calls"] = True
+    assert fingerprint(server_props=changed_caps) != baseline
+    changed_build = json.loads(json.dumps(props))
+    changed_build["build_info"]["compiler"] = "synthetic-b"
+    assert fingerprint(server_props=changed_build) != baseline
+    changed_prompt = json.loads(json.dumps(config))
+    changed_prompt["agent"]["build"]["prompt"] = "synthetic build prompt B"
+    assert fingerprint(cfg=changed_prompt) != baseline
+    prompt_file = tmp_path / "managed-build-prompt.md"
+    prompt_file.write_text("managed prompt A", encoding="utf-8")
+    file_config = json.loads(json.dumps(config))
+    file_config["agent"]["build"]["prompt"] = f"{{file:{prompt_file}}}"
+    file_baseline = fingerprint(cfg=file_config)
+    prompt_file.write_text("managed prompt B", encoding="utf-8")
+    assert fingerprint(cfg=file_config) != file_baseline
+
+
 def test_cache_contains_only_fingerprint_metadata_and_is_private(tmp_path):
     cache_path = tmp_path / "private" / "canary.json"
     fingerprint = "f" * 64
     canary.save_cached_pass(cache_path, fingerprint, now=1_000.0)
+    canary.save_cached_implicit(
+        cache_path,
+        fingerprint,
+        canary.ImplicitStatus.SUBOPTIMAL,
+        now=1_001.0,
+    )
 
     text = cache_path.read_text(encoding="utf-8")
     data = json.loads(text)
-    assert set(data) == {"schema", "passes"}
-    assert set(data["passes"][fingerprint]) == {
+    assert set(data) == {"schema", "explicit", "implicit"}
+    assert data["schema"] == 2
+    assert len(data["explicit"]) == 1
+    assert len(data["implicit"]) == 1
+    assert set(data["explicit"][0]) == {
+        "fingerprint",
         "status",
         "checked_at",
         "canary_version",
     }
+    assert set(data["implicit"][0]) == set(data["explicit"][0])
+    assert data["explicit"][0]["fingerprint"] == fingerprint
+    assert data["explicit"][0]["status"] == "pass"
+    assert data["implicit"][0]["fingerprint"] == fingerprint
+    assert data["implicit"][0]["status"] == "suboptimal"
     assert "private-project-file.c" not in text
+    assert "prompt" not in text
+    assert "tool_output" not in text
+    assert "session" not in text
     assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
     assert canary.cached_pass_age(
         cache_path, fingerprint, now=1_100.0, ttl_seconds=101
@@ -220,6 +305,19 @@ def test_cache_contains_only_fingerprint_metadata_and_is_private(tmp_path):
     assert canary.cached_pass_age(
         cache_path, fingerprint, now=1_102.0, ttl_seconds=101
     ) is None
+    assert (
+        canary.cached_implicit_status(
+            cache_path, fingerprint, now=1_100.0, ttl_seconds=101
+        )
+        is canary.ImplicitStatus.SUBOPTIMAL
+    )
+
+    schema_one = tmp_path / "schema-one.json"
+    schema_one.write_text(
+        json.dumps({"schema": 1, "passes": {fingerprint: {"status": "pass"}}}),
+        encoding="utf-8",
+    )
+    assert canary._read_cache(schema_one) == canary._empty_cache()
 
 
 def test_successful_model_canary_is_cached_and_skips_second_call(monkeypatch, tmp_path):
@@ -239,10 +337,15 @@ def test_successful_model_canary_is_cached_and_skips_second_call(monkeypatch, tm
         force=False,
     ) == 0
 
+    cache = canary._read_cache(Path(env["AICODE_TOOL_CANARY_CACHE"]))
+    assert [entry["status"] for entry in cache["explicit"]] == ["pass"]
+    assert [entry["status"] for entry in cache["implicit"]] == ["optimal"]
+
     def should_not_run(**kwargs):  # pragma: no cover - called only on regression
-        raise AssertionError("fresh cache should bypass the slow model canary")
+        raise AssertionError("fresh lane cache should bypass both model canaries")
 
     monkeypatch.setattr(canary, "run_model_attempt", should_not_run)
+    monkeypatch.setattr(canary, "run_implicit_model_attempt", should_not_run)
     assert canary.run_all(
         root=root,
         env=env,
@@ -265,10 +368,14 @@ def test_retry_success_is_reported_flaky_and_not_cached(monkeypatch, tmp_path, c
         force=False,
     ) == 0
     assert "MODEL FLAKY" in capsys.readouterr().err
-    assert canary._read_cache(Path(env["AICODE_TOOL_CANARY_CACHE"]))["passes"] == {}
+    cache = canary._read_cache(Path(env["AICODE_TOOL_CANARY_CACHE"]))
+    assert cache["explicit"] == []
+    # The lanes are independent: flaky explicit is not cached, while the
+    # one-shot implicit diagnostic still records its own current status.
+    assert [entry["status"] for entry in cache["implicit"]] == ["optimal"]
 
 
-def test_two_model_failures_block_by_default_and_warn_only_can_continue(
+def test_two_explicit_model_failures_block_even_with_legacy_warn_only(
     monkeypatch, tmp_path
 ):
     failures = [
@@ -292,13 +399,20 @@ def test_two_model_failures_block_by_default_and_warn_only_can_continue(
         "run_model_attempt",
         lambda **kwargs: canary.ModelEvidence(False, "no structured event"),
     )
+    monkeypatch.setattr(
+        canary,
+        "run_implicit_model_attempt",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("implicit must not run after explicit failure")
+        ),
+    )
     assert canary.run_all(
         root=root2,
         env=env,
         explicit_model="",
         frontend_args=[],
         force=False,
-    ) == 0
+    ) == 2
 
 
 def test_run_model_attempt_passes_explicit_model_and_ignores_private_output(
@@ -413,7 +527,7 @@ def test_live_canary_announces_reason_for_expired_cache(monkeypatch, tmp_path, c
 
     cache_path = Path(env["AICODE_TOOL_CANARY_CACHE"])
     data = json.loads(cache_path.read_text(encoding="utf-8"))
-    for entry in data["passes"].values():
+    for entry in data["explicit"]:
         entry["checked_at"] -= 7200.0
     cache_path.write_text(json.dumps(data), encoding="utf-8")
 
@@ -453,3 +567,178 @@ def test_skip_mode_never_loads_opencode_or_model(monkeypatch, tmp_path, capsys):
     )
     assert canary.main([]) == 0
     assert "SKIP" in capsys.readouterr().out
+
+
+@pytest.mark.smoke
+def test_explicit_gate_and_implicit_diagnostic_are_separate(
+    monkeypatch, tmp_path, capsys
+):
+    """Explicit failure blocks; an implicit failure is diagnostic-only."""
+    root = tmp_path / "project"
+    root.mkdir()
+    env = {"AICODE_TOOL_CANARY_WARN_ONLY": "1"}
+    protocol = canary.ProtocolEvidence("a" * 64, "b" * 64)
+    monkeypatch.setattr(
+        canary,
+        "load_effective_opencode_config",
+        lambda root, env, timeout: _config(root),
+    )
+    monkeypatch.setattr(canary, "read_opencode_version", lambda root, env: "1.18.21")
+    monkeypatch.setattr(
+        canary,
+        "run_protocol_check",
+        lambda config, root, env, timeout: protocol,
+    )
+    monkeypatch.setattr(
+        canary,
+        "fetch_main_server_props",
+        lambda env: {"chat_template_caps": {"supports_tools": True}},
+    )
+    monkeypatch.setattr(
+        canary,
+        "run_model_attempt",
+        lambda **kwargs: canary.ModelEvidence(True, "completed"),
+    )
+    implicit_calls: list[int] = []
+
+    def implicit_failure(**kwargs):
+        implicit_calls.append(kwargs["timeout"])
+        return canary.ImplicitEvidence(canary.ImplicitStatus.FAIL)
+
+    monkeypatch.setattr(canary, "run_implicit_model_attempt", implicit_failure)
+    assert canary.run_all(
+        root=root,
+        env=env,
+        explicit_model="",
+        frontend_args=[],
+        force=True,
+    ) == 0
+    assert implicit_calls == [canary.DEFAULT_IMPLICIT_TIMEOUT_SECONDS]
+    assert "status=fail" in capsys.readouterr().err
+
+    attempts = iter(
+        [
+            canary.ModelEvidence(False, "no structured call"),
+            canary.ModelEvidence(False, "no structured call"),
+        ]
+    )
+    monkeypatch.setattr(canary, "run_model_attempt", lambda **kwargs: next(attempts))
+    monkeypatch.setattr(
+        canary,
+        "run_implicit_model_attempt",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("implicit must not run after explicit failure")
+        ),
+    )
+    assert canary.run_all(
+        root=root,
+        env=env,
+        explicit_model="",
+        frontend_args=[],
+        force=True,
+    ) == 2
+
+
+def test_implicit_classifier_accepts_only_completed_read_only_calls():
+    optimal = json.dumps(
+        {
+            "type": "tool_use",
+            "part": {
+                "tool": "codetrail_list_dir",
+                "state": {"status": "completed", "input": {"path": "./"}},
+            },
+        }
+    )
+    suboptimal = json.dumps(
+        {
+            "type": "tool_use",
+            "part": {
+                "tool": "codetrail_grep_code",
+                "state": {"status": "completed", "input": {"pattern": "x"}},
+            },
+        }
+    )
+    denied_writer = json.dumps(
+        {
+            "type": "tool_use",
+            "part": {
+                "tool": "codetrail_apply_patch",
+                "state": {"status": "completed", "input": {}},
+            },
+        }
+    )
+    assert canary.inspect_implicit_events(optimal).status is canary.ImplicitStatus.OPTIMAL
+    assert (
+        canary.inspect_implicit_events(suboptimal).status
+        is canary.ImplicitStatus.SUBOPTIMAL
+    )
+    assert canary.inspect_implicit_events(denied_writer).status is canary.ImplicitStatus.FAIL
+    assert "codetrail" not in canary.IMPLICIT_CANARY_PROMPT.lower()
+    assert "list_dir" not in canary.IMPLICIT_CANARY_PROMPT.lower()
+
+
+def test_supports_tools_false_stops_before_any_model_attempt(monkeypatch, tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    monkeypatch.setattr(
+        canary,
+        "load_effective_opencode_config",
+        lambda root, env, timeout: _config(root),
+    )
+    monkeypatch.setattr(canary, "read_opencode_version", lambda root, env: "1.18.21")
+    monkeypatch.setattr(
+        canary,
+        "run_protocol_check",
+        lambda config, root, env, timeout: canary.ProtocolEvidence("a", "b"),
+    )
+    monkeypatch.setattr(
+        canary,
+        "fetch_main_server_props",
+        lambda env: {"chat_template_caps": {"supports_tools": False}},
+    )
+    monkeypatch.setattr(
+        canary,
+        "run_model_attempt",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    assert canary.run_all(
+        root=root,
+        env={},
+        explicit_model="",
+        frontend_args=[],
+        force=True,
+    ) == 2
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("1.17.0", (1, 17, 0)),
+        ("opencode version v1.18.21", (1, 18, 21)),
+        ("1.18.23-beta.1", (1, 18, 23)),
+    ],
+)
+def test_direct_contract_version_parser(raw, expected):
+    assert direct_contract.parse_opencode_version(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("version", "config"),
+    [
+        ("1.16.9", {}),
+        ("2.0.0", {}),
+        ("not-a-version", {}),
+        ("1.18.21", {"mcp": {"servers": {}}}),
+        ("1.18.21", {"codemode": False}),
+        ("1.18.21", {"mcp": {"codetrail": {"codemode": False}}}),
+    ],
+)
+def test_direct_contract_rejects_unsupported_lifecycles(version, config):
+    with pytest.raises(direct_contract.DirectToolContractError) as caught:
+        direct_contract.require_direct_tool_contract(version, config)
+    message = str(caught.value)
+    assert "direct codetrail_*" in message
+    assert "mcp.servers.codetrail" in message
+    assert "codemode:false" in message
+    assert "disabled" in message
+    assert "execution timeout" in message

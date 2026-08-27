@@ -536,7 +536,8 @@ def test_query_knowledge_carries_excluded_figures(monkeypatch, tmp_path):
     _stub_query(monkeypatch, mcp, meta={"refs": [], "top_score": 0.4,
                                         "excluded_figures": _EXCLUDED})
 
-    result = tool_fn(mcp, "query_knowledge")("reset timing")
+    # Core payload contract: the transport adapter renders this separately.
+    result = mcp.query_knowledge("reset timing")
 
     assert result["excluded_figures"] == _EXCLUDED
     assert "review_figures" in result["review_hint"]
@@ -549,7 +550,7 @@ def test_query_knowledge_not_loaded_still_has_the_key(monkeypatch, tmp_path):
         loaded = False
     monkeypatch.setattr(mcp, "KB", _Empty())
 
-    result = tool_fn(mcp, "query_knowledge")("reset timing")
+    result = mcp.query_knowledge("reset timing")
     assert result["excluded_figures"] == []
     assert result["review_hint"] == ""
 
@@ -574,7 +575,7 @@ def test_strict_return_paths_all_carry_excluded_figures(
     monkeypatch.setattr(mcp, "answer_with_self_check",
                         lambda q, b, k, binary_ctx="": "答案")
 
-    result = tool_fn(mcp, "query_knowledge_strict")("reset assert 最小時間")
+    result = mcp.query_knowledge_strict("reset assert 最小時間")
 
     assert result["reason"] == expected_reason, result
     assert result["excluded_figures"] == _EXCLUDED, result
@@ -595,7 +596,7 @@ def test_legacy_raster_exclusion_is_not_sent_to_review_figures(monkeypatch, tmp_
     _stub_query(monkeypatch, mcp, meta={"refs": [], "top_score": 0.4,
                                         "excluded_figures": _LEGACY_EXCLUDED})
 
-    hint = tool_fn(mcp, "query_knowledge")("reset timing")["review_hint"]
+    hint = mcp.query_knowledge("reset timing")["review_hint"]
 
     assert "scanned.pdf p.12" in hint, hint
     assert "不可覆核" in hint, hint
@@ -612,7 +613,7 @@ def test_structured_and_legacy_exclusions_are_reported_separately(monkeypatch, t
         "excluded_figures": _EXCLUDED + _LEGACY_EXCLUDED,
     })
 
-    hint = tool_fn(mcp, "query_knowledge")("reset timing")["review_hint"]
+    hint = mcp.query_knowledge("reset timing")["review_hint"]
 
     assert "可覆核" in hint and "不可覆核" in hint, hint
     assert "review_figures" in hint, hint
@@ -626,7 +627,27 @@ def test_strict_kb_not_loaded_still_has_the_key(monkeypatch, tmp_path):
         loaded = False
     monkeypatch.setattr(mcp, "KB", _Empty())
 
-    result = tool_fn(mcp, "query_knowledge_strict")("reset assert 最小時間")
+    result = mcp.query_knowledge_strict("reset assert 最小時間")
     assert result["reason"] == "knowledge_base_not_loaded"
     assert result["excluded_figures"] == []
     assert result["review_hint"] == ""
+
+
+def test_query_transport_is_compact_and_keeps_exclusion_guidance(monkeypatch, tmp_path):
+    """OpenCode text is compact while structured clients retain the core payload."""
+    mcp = _mcp(monkeypatch, tmp_path)
+    _stub_query(monkeypatch, mcp, meta={
+        "refs": [{"source": "npu_spec.pdf", "page": 7}],
+        "top_score": 0.4,
+        "excluded_figures": _EXCLUDED,
+    })
+    transport = mcp.mcp._tool_manager.get_tool("query_knowledge").fn
+
+    result = transport(question="reset timing")
+    assert len(result.content) == 1
+    text = result.content[0].text
+    assert text.startswith("status: partial\nnext: "), text
+    assert "npu_spec.pdf p.7" in text, text
+    assert "review_figures" in text and "待覆核" in text, text
+    assert '"display"' not in text and '"refs"' not in text, text
+    assert result.structuredContent["excluded_figures"] == _EXCLUDED

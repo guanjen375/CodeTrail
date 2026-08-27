@@ -21,7 +21,30 @@ cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-進入 TUI 前應先看到兩行健康狀態：`MCP PASS — 19 tools + list_dir round-trip`，以及 live 或 cached 的 `MODEL PASS`。前者每次都實跑；後者只有首次、24 小時到期或模型／設定／chat template／專案規則改變時才重新要求模型做一次真實結構化工具呼叫，所以平常不用先手動問 19 個工具。需要讀專案外附件時看「夾帶附件」；若 TUI 內後續某一輪仍異常，再用 `/status` 與 [常見問題的分層診斷](troubleshooting.md#mcp-connected-but-no-tool-call)交叉檢查。Connected 只證明 MCP transport 已初始化，模型在單一對話輪次仍可能失手。
+進入 TUI 前會依序看到分層健康狀態：
+
+- `[direct-contract] PASS`：OpenCode 是 `>=1.17.0,<2.0.0`，effective config 使用 direct
+  `codetrail_*` 契約，沒有 V2-only `mcp.servers`／`codemode`。
+- `MCP PASS — 19 tools + list_dir round-trip`：每次都 live 初始化 MCP、精確檢查 19 個名稱與
+  固定順序，擷取完整 typed schemas／instructions digest，並執行一次唯讀 `list_dir`。
+  schema bounds/description/budget 由同一 public contract 的 static test 驗證；routing catalog
+  另保存逐工具 counts/digests 與 token measurement。
+- live／cached `MODEL PASS`（或 retry 成功的 `MODEL FLAKY`）：explicit prompt 點名
+  `codetrail_list_dir`，只有 completed 的結構化 event 才通過；連續兩次失敗會拒絕啟動。
+- `IMPLICIT ... status=optimal|suboptimal|fail|timeout`：未點名工具的自主 routing 診斷。
+  `optimal` 是理想結果，其餘三態會警告，但四態都不擋啟動。
+
+explicit 與 implicit 使用分離的 schema 2 cache lane；模型／設定／live catalog／有效 build
+prompt／AGENTS 或 server `/props` 改變都會換 fingerprint。需要讀專案外附件時看「夾帶附件」；
+若 TUI 內後續某一輪仍異常，再用 `/status` 與
+[常見問題的分層診斷](troubleshooting.md#mcp-connected-but-no-tool-call)交叉檢查。
+Connected 只證明 MCP transport 已初始化，模型在單一對話輪次仍可能失手。
+
+正常 `set_config.sh` 不會新增 `agent.build.prompt`：正式 routing A/B 沒有任何 arm 通過全部
+gate。若要明確實驗，可加 `--enable-experimental-build-prompt`，讓它指向
+`~/.config/codetrail/opencode-build-prompt.md`；這份短 prompt 取代 OpenCode build default，
+不是再附加完整工具手冊。既有自訂 string 會保留，opt-in 時型別錯誤會 fail-loud。合成
+request 只證明 replacement semantics，失敗的 routing A/B 不能當成模型支援宣告。
 
 ---
 
@@ -50,7 +73,7 @@ CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透�
 |---|---|
 | 看 repo 架構 | `請用 list_dir 看專案結構，找 entry point、測試和設定檔。` |
 | 找錯誤訊息 | `請用 grep_code 搜尋 "panic: xxx"，再讀最可能的檔案。` |
-| 分析原因並控制 context | `請用 code_rag_search mode=context、max_chars=12000 收集證據，分成已證實與 uncertainty。` |
+| 分析原因並控制 context | `請用 code_rag_search mode=context 收集證據；省略 max_chars，依動態預算分成已證實與 uncertainty。` |
 | 看 caller / callee | `請用 code_rag_search mode=neighbors 查 uart_send，逐步附 path:line。` |
 | 看 A 到 B 的呼叫鏈 | `請用 code_rag_search mode=path，query="A -> B"，只列 confirmed edge。` |
 | 看已知檔案 | `請用 file_info 看 src/main.c 大小，再用 read_file 讀前 120 行。` |
@@ -58,6 +81,20 @@ CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透�
 | 高風險規格數字 | `請用 query_knowledge_strict 查最大值，證據不足就拒答。` |
 
 完整工具清單見 [MCP 工具清單](mcp-tools.md)。
+
+### 怎麼讀工具結果
+
+每個 CodeTrail 工具的精簡文字結果第一行固定是 `status: ok|partial|error`。只有
+`partial`／`error` 或因 context budget 截斷時，第二行才有可直接照做的 `next:`；例如
+`read_file` 會給不漏行的下一個 `start_line`，`grep_code` 會要求縮小
+path/include/pattern。不要把 `partial` 當完整證據，也不要略過 `next:` 直接重送同一呼叫。
+
+未明示 `max_chars` 時，結果預算在**每次呼叫當下**依主模型 `n_ctx` 的 12% 計算，使用固定
+ASCII/CJK token 代理估算，再套各工具 safety cap；已不再是固定 12,000 字元。明示較大的
+`max_chars` 仍受 schema 範圍與 safety cap 限制，而且超過 12% 預設時會標
+`context_risk`。`code_rag_search(mode="context")` 回傳的 `used_chars` 仍只是
+`evidence[].text` 字元數，不是 tokenizer token。完整契約見
+[MCP 工具清單：結果文字與預算契約](mcp-tools.md#結果文字與預算契約)。
 
 `mode="semantic"` / `mode="context"` 可在 graph 尚未建立時使用；`neighbors` / `path`
 需要先建立 graph DB。若尚未建立，工具錯誤會直接附上含實際 Python 與 project root 的

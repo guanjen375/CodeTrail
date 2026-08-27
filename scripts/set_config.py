@@ -28,13 +28,16 @@ nvidia-smi 稍微監控)。
   6. 產物(先寫 staging、全部就緒才原子替換;既有檔備份 *.bak-setconfig-*):
      - ~/.config/codetrail/models.json     主模型 registry(合併既有)
      - ~/.config/codetrail/deployment.json deployment local override
+     - ~/.config/codetrail/opencode-build-prompt.md
+                                           實驗性 opt-in build prompt(0644;
+                                           只在 --enable-experimental-build-prompt)
      - ~/.config/opencode/opencode.json    只合併 CodeTrail 管的欄位,
                                            保留使用者既有 provider / mcp / 其他設定
      - ~/start.sh                          啟動腳本(支援 status / stop / logs 子命令)
   7. 安全預設:llama-server 只綁 127.0.0.1;要讓其他機器連線必須明確
      `--allow-remote`(或 deployment.json 的 bind: "all-interfaces")。
 
-`--restore-last-backup` 可把四個產物還原到最近一次備份。
+`--restore-last-backup` 可把該次 transaction 的產物還原到最近一次備份。
 純 stdlib;不 eval / source 任何內容;產物經 deployment_profile 的封閉 schema 驗證。
 """
 from __future__ import annotations
@@ -62,6 +65,14 @@ from deployment_profile import (  # noqa: E402
     RUNTIME_OVERRIDE_ENV_KEYS,
     ProfileError,
     load_effective_profile,
+)
+from scripts.opencode_build_prompt import (  # noqa: E402
+    BUILD_PROMPT_DOC,
+    BuildPromptError,
+    apply_build_prompt_contract,
+    build_prompt_path,
+    build_prompt_reference,
+    extract_build_prompt,
 )
 
 GIB = 1024**3
@@ -1681,6 +1692,7 @@ def _opencode_template(plan: Plan, python_bin: str,
 def build_opencode_config(
     plan: Plan, python_bin: str, existing_path: Path,
     main_base_url: str | None = None,
+    build_prompt_ref: str | None = None,
 ) -> tuple[dict, list[str]]:
     """只合併 CodeTrail 管的欄位;保留使用者既有 provider / mcp / 主題等設定。
 
@@ -1703,6 +1715,17 @@ def build_opencode_config(
     if existing is None:
         if not changes:
             changes.append("建立新的 opencode.json(完整範本)")
+        if build_prompt_ref is not None:
+            prompt_changes, prompt_warnings, prompt_errors = apply_build_prompt_contract(
+                template, build_prompt_ref
+            )
+            if prompt_errors:
+                raise SetupError(
+                    "OpenCode build prompt 契約無法套用:\n  - "
+                    + "\n  - ".join(prompt_errors)
+                )
+            changes.extend(prompt_changes)
+            changes.extend(f"⚠ {item}" for item in prompt_warnings)
         return template, changes
 
     merged = json.loads(json.dumps(existing))  # 深拷貝
@@ -1813,6 +1836,17 @@ def build_opencode_config(
         elif merged[key] != template[key]:
             changes.append(f"⚠ {key}={merged[key]!r} 與建議值 {template[key]!r} 不同,已保留你的設定")
     merged.setdefault("$schema", template["$schema"])
+    if build_prompt_ref is not None:
+        prompt_changes, prompt_warnings, prompt_errors = apply_build_prompt_contract(
+            merged, build_prompt_ref
+        )
+        if prompt_errors:
+            raise SetupError(
+                "OpenCode build prompt 契約無法套用:\n  - "
+                + "\n  - ".join(prompt_errors)
+            )
+        changes.extend(prompt_changes)
+        changes.extend(f"⚠ {item}" for item in prompt_warnings)
     return merged, changes
 
 
@@ -2058,7 +2092,7 @@ def _redact_for_display(content: str) -> str:
 
 def commit_files(targets: list[tuple[Path, str, int]], notes: list[str], dry_run: bool,
                  home: Path | None = None) -> None:
-    """四個產物的 transaction:全部先寫 staging,備份既有檔,再逐一原子替換;
+    """全部產物的 transaction:先寫 staging,備份既有檔,再逐一原子替換;
     任一步失敗 → 還原備份、清掉 staging,不留半套狀態。成功後寫入 transaction
     manifest(同一次設定的備份對應表),讓 --restore-last-backup 能整批一致還原。"""
     if dry_run:
@@ -2086,8 +2120,22 @@ def commit_files(targets: list[tuple[Path, str, int]], notes: list[str], dry_run
             real = _real_target(path)
             real.parent.mkdir(parents=True, exist_ok=True)
             tmp = real.with_name(f"{real.name}.setconfig-staging-{os.getpid()}")
-            tmp.write_text(content, encoding="utf-8")
-            tmp.chmod(mode)
+            # opencode.json may contain provider credentials.  Create every
+            # staging file private from birth; widening a public artifact to
+            # 0644 happens only after its complete contents are on disk.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    fd = -1
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                tmp.chmod(mode)
+            except BaseException:
+                if fd >= 0:
+                    os.close(fd)
+                tmp.unlink(missing_ok=True)
+                raise
             staged.append((tmp, path, real, mode))
     except BaseException:
         for tmp, _path, _real, _mode in staged:
@@ -2180,6 +2228,7 @@ def restore_last_backup(home: Path, dry_run: bool = False) -> int:
     targets = [
         home / ".config" / "codetrail" / "models.json",
         home / ".config" / "codetrail" / "deployment.json",
+        build_prompt_path(home),
         home / ".config" / "opencode" / "opencode.json",
         home / "start.sh",
     ]
@@ -2372,8 +2421,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="只顯示會寫入的內容,不動任何檔案")
     parser.add_argument("--allow-remote", action="store_true",
                         help="讓區網其他機器可連線模型 API(未指定只綁 127.0.0.1;llama-server 無認證,慎用)")
+    parser.add_argument(
+        "--enable-experimental-build-prompt",
+        action="store_true",
+        help="明確 opt-in 尚未通過 routing support gate 的 CodeTrail build prompt",
+    )
     parser.add_argument("--restore-last-backup", action="store_true",
-                        help="把四個產物還原到最近一次 *.bak-setconfig-* 備份後離開")
+                        help="把最近一次 transaction 的產物還原後離開")
     parser.add_argument("--skip-deps-check", action="store_true", help="跳過 Python 依賴檢查")
     parser.add_argument("--skip-binary-check", action="store_true",
                         help="跳過 llama-server / tmux 檢查(自動化測試用)")
@@ -2404,7 +2458,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _print_summary_page(plan: Plan, python_bin: str, opencode_changes: list[str],
-                        codetrail_dir: Path, opencode_path: Path, start_path: Path) -> None:
+                        codetrail_dir: Path, build_prompt_target: Path | None,
+                        opencode_path: Path, start_path: Path) -> None:
     offload = _offload_description(plan)
     print("\n=== 設定摘要(全部來自你的作答;確認一次即可)===")
     print(f"  主聊天    : {plan.main.candidate.describe()}")
@@ -2423,6 +2478,8 @@ def _print_summary_page(plan: Plan, python_bin: str, opencode_changes: list[str]
     print(f"  MCP Python: {python_bin}")
     print("  產物      :")
     print(f"    {codetrail_dir / 'models.json'} / {codetrail_dir / 'deployment.json'}")
+    if build_prompt_target is not None:
+        print(f"    {build_prompt_target} (實驗性 opt-in)")
     print(f"    {opencode_path}")
     print(f"    {start_path}")
     if opencode_changes:
@@ -2434,7 +2491,7 @@ def _print_summary_page(plan: Plan, python_bin: str, opencode_changes: list[str]
 
 
 def run(args: argparse.Namespace) -> int:
-    home = Path(os.path.expanduser("~"))
+    home = Path(os.path.abspath(os.path.expanduser("~")))
     if args.restore_last_backup:
         return restore_last_backup(home, dry_run=args.dry_run)
 
@@ -2502,6 +2559,25 @@ def run(args: argparse.Namespace) -> int:
         )
 
     codetrail_dir = home / ".config" / "codetrail"
+    build_prompt_target: Path | None = None
+    build_prompt_body: str | None = None
+    build_prompt_ref: str | None = None
+    if args.enable_experimental_build_prompt:
+        build_prompt_target = build_prompt_path(home)
+        try:
+            build_prompt_body = extract_build_prompt(
+                BUILD_PROMPT_DOC.read_text(encoding="utf-8")
+            )
+            build_prompt_ref = build_prompt_reference(build_prompt_target)
+        except (OSError, UnicodeError, BuildPromptError, ValueError) as exc:
+            raise SetupError(
+                "CodeTrail build prompt 無法載入或驗證:"
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        base_notes.append(
+            "⚠ 已明確啟用實驗性 build prompt；目前 support matrix 沒有任何 arm "
+            "通過完整 routing gate，這不是 supported 預設。"
+        )
     # OpenCode 與本 repo 的 config.py/aicode 都會先讀 OPENCODE_CONFIG;
     # set_config 若寫死預設路徑,設了這個變數的使用者會拿到 PASS 但完全沒生效的設定。
     opencode_env = (os.environ.get("OPENCODE_CONFIG") or "").strip()
@@ -2738,7 +2814,8 @@ def run(args: argparse.Namespace) -> int:
         if main_base_url is None and isinstance(main_service.get("port"), int):
             main_base_url = f"http://localhost:{main_service['port']}"
         opencode_config, opencode_changes = build_opencode_config(
-            plan, python_bin, opencode_path, main_base_url
+            plan, python_bin, opencode_path, main_base_url,
+            build_prompt_ref=build_prompt_ref,
         )
         opencode_json = json.dumps(opencode_config, ensure_ascii=False, indent=2) + "\n"
 
@@ -2748,6 +2825,7 @@ def run(args: argparse.Namespace) -> int:
             "plan": plan,
             "registry_json": registry_json,
             "deployment_json": deployment_json,
+            "build_prompt_body": build_prompt_body,
             "opencode_json": opencode_json,
             "opencode_changes": opencode_changes,
             "start_content": build_start_sh(plan),
@@ -2757,7 +2835,7 @@ def run(args: argparse.Namespace) -> int:
     bundle = _gather(notes)
     plan: Plan = bundle["plan"]
     _print_summary_page(plan, python_bin, bundle["opencode_changes"],
-                        codetrail_dir, opencode_path, start_path)
+                        codetrail_dir, build_prompt_target, opencode_path, start_path)
     if not args.yes and not args.dry_run:
         while True:
             answer = _input("\n[Enter] 採用並寫入 / [q] 離開: ").strip().lower()
@@ -2769,15 +2847,23 @@ def run(args: argparse.Namespace) -> int:
             print(f"  無效輸入 {answer!r}:Enter=採用寫入 / q=離開。")
 
     commit_mark = len(plan.notes)
+    commit_targets = [
+        (codetrail_dir / "models.json", bundle["registry_json"], 0o644),
+        (codetrail_dir / "deployment.json", bundle["deployment_json"], 0o644),
+    ]
+    if build_prompt_target is not None:
+        assert bundle["build_prompt_body"] is not None
+        # OpenCode 透過 agent.build.prompt 的 {file:/absolute/path} 讀這份檔。
+        # 它跟 config 必須同一個 transaction,避免留下存在但無法解析的 reference。
+        commit_targets.append((build_prompt_target, bundle["build_prompt_body"], 0o644))
+    # opencode.json 會保留使用者既有 provider 的 apiKey → 只給擁有者讀寫,
+    # 也不能把使用者原本的 0600 重跑成 0644。
+    commit_targets.extend([
+        (opencode_path, bundle["opencode_json"], 0o600),
+        (start_path, bundle["start_content"], 0o755),
+    ])
     commit_files(
-        [
-            (codetrail_dir / "models.json", bundle["registry_json"], 0o644),
-            (codetrail_dir / "deployment.json", bundle["deployment_json"], 0o644),
-            # opencode.json 會保留使用者既有 provider 的 apiKey → 只給擁有者讀寫,
-            # 也不能把使用者原本的 0600 重跑成 0644。
-            (opencode_path, bundle["opencode_json"], 0o600),
-            (start_path, bundle["start_content"], 0o755),
-        ],
+        commit_targets,
         plan.notes,
         args.dry_run,
         home=home,

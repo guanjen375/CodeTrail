@@ -21,6 +21,9 @@ python3 scripts/opencode_contract_check.py            # 全域 opencode.json / A
 python3 scripts/doctor.py --no-network        # 用機器上實際設定的模型；不要塞假 model 名
 python3 deployment_profile.py validate
 
+# 部署唯讀相容檢查（需要本機 OpenCode；不寫設定、不跑 MCP/model）
+python3 scripts/opencode_direct_contract.py --root <PROJECT_TO_ANALYZE>
+
 # 測試入口（何時能跑見 AGENTS.md §2）
 python3 scripts/run_tests.py -m smoke
 python3 scripts/run_tests.py
@@ -98,7 +101,8 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 - MCP / sandbox / mutation：`test_mcp_*`、`test_fs_sandbox.py`、`test_external_import.py`、
   `test_patch_parser.py`、`test_patch_apply.py`、`test_patch_search_replace.py`、
   `test_patch_byte_safety.py`、`test_patch_verify.py`、`test_run_command.py`、
-  `test_run_command_timeout.py`、`test_run_lint.py`、`test_endpoint_policy.py`、`test_smoke_gate.py`。
+  `test_run_command_timeout.py`、`test_run_lint.py`、`test_endpoint_policy.py`、
+  `test_mcp_tool_contract.py`、`test_tool_result_budget.py`、`test_smoke_gate.py`。
 - Code-RAG / graph：`test_ast_parser_cpp.py`、`test_code_graph*.py`、
   `test_code_rag_*.py`、`test_code_context.py`、`test_definition_metadata_propagation.py`、
   `test_file_kind_policy.py`、`test_grep_output_budget.py`、`test_index_scope.py`、
@@ -109,7 +113,8 @@ aicode_web  # A/B 機已加入同一 tailnet 時
   `test_media_read_pdf.py`、`test_vision_pipeline.py`。
 - inference / budgets / eval：`test_code_smoke_eval.py`、`test_retrieval_eval.py`、
   `test_semantic_retrieval_eval.py`、`test_context_budget.py`、`test_trim.py`、
-  `test_gpu_safety.py`、`test_llama_sampling.py`、`test_ctx_*.py`。
+  `test_gpu_safety.py`、`test_llama_sampling.py`、`test_ctx_*.py`、
+  `test_tool_routing_eval.py`。
 - repo infrastructure：`test_repo_consistency.py`、`test_test_runner.py`、
   `test_script_help.py`、`test_data_flywheel.py`、`test_lessons.py`。
 
@@ -142,7 +147,10 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
 - `_parse_unified_diff` 從 `agent.py` 搬到 `agent_tools.py` → `eval/code_questions.json` 的 `file` 要改
 - 換 `EMBEDDING_MODEL` → `eval/spec_adversarial.json` 也要改
 - 在 `knowledge.py` 這類檔案大量增刪行 → `eval/code_questions.json` 釘的 `line` 會漂出 ±20(實際發生過:`query` 從 2172 移到 2810),要更新
-- 新增 / 移除 MCP 工具 → 更新 `docs/opencode-agents-template.md` fenced block **外**的文件用 manifest；可安裝的全域 prompt 只保留 `codetrail_*` schema anchor，禁止把完整清單搬回去。使用者還在用舊版固定清單時，`aicode` 會提示 `⚠ STALE`
+- 新增／移除／重排 MCP 工具 → 先改 `mcp_contract.PUBLIC_TOOL_ORDER`，再同步
+  `docs/mcp-tools.md` 與 `docs/opencode-agents-template.md` fenced block **外**的固定順序
+  manifest；可安裝的全域 prompt 只保留 `codetrail_*` schema anchor，禁止把完整清單搬回去。
+  使用者還在用舊版固定清單時，`aicode` 會提示 `⚠ STALE`
 
 如果你在 eval 裡放 line number，**只當作 hint，誤差 ±20 行內視為正確**；
 不要把 line number 當成嚴格契約。
@@ -196,6 +204,28 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
   case 的 `blocking` 欄位推出來的,不寫死清單;`comment2context` /
   `low_lexical_overlap` 這類 provisional diagnostic 照常報數字,但退步不擋 gate ——
   無差別比較等於偷偷把 stretch 升格成 blocking。
+- `eval/fixtures/tool_routing/cases.json`：隔離 synthetic root 的 9 個檔案、1 份 KB 文件與
+  15 個中英／混合 routing cases；結果只保存分類、aggregate、token/latency/compaction
+  計數，不保存 prompt、assistant text、tool args/result、session id 或專案路徑。
+- `eval/fixtures/tool_routing/support_matrix.json`：6 個明示 arm 與逐列 compatibility／gate
+  真值。目前唯一一列仍是 `measured`；2026-08-27 已把逐 arm 凍結 digest、routing baseline
+  與完整 privacy-safe aggregates 寫回，但沒有任何 arm 通過全部 gate，所以**沒有任何列可
+  宣稱 supported**。harness 絕不改 matrix；gate 通過只輸出
+  `manual_status_change_required=true`，仍需人工審核後明示改狀態。特別注意：目前
+  `--arm` 只選擇／記錄 arm id，**不會替操作者切換 OpenCode config、tool schema、build
+  prompt 或 todowrite permission**。每個真模型 arm 必須先由維護者在隔離環境套用 exact
+  variant，核對凍結 config/artifact digest 與 matrix 中的 contract digest；不相符就
+  fail-loud。
+- `scripts/mcp_catalog.py`／`scripts/eval_tool_routing.py`：runtime catalog 預設從 effective
+  stdio MCP 實跑 `initialize/tools/list`；current arm 精確對照
+  `mcp_contract.PUBLIC_TOOL_ORDER`，任何名稱或順序 drift 都 fail-loud；完整 schema 只留
+  privacy-safe count/digest，typed bounds 另由 static contract gate 驗證。
+  `--catalog-only` 強制零模型並跳過 auxiliary model preflight；歷史 baseline 只能顯式用
+  `--arm baseline --frozen-contract`，逐欄 exact match 該 row 保存的
+  order/per-tool/digest/count，不能拿 current contract 冒充歷史資料。catalog-only 結果的
+  support gate 明確是 `passed=false`，不可能靠 catalog aggregate 升級 support status。
+  真模型 event parser 把 reasoning token／text 與 assistant text 分開；reasoning 永不參與
+  promise／marker 分類，也不會被保存成 assistant output。
 - `scripts/check_eval_consistency.py`：不跑 LLM，只檢查 eval expected 是否和 `config.py` / source code 漂移。
 - `tests/test_repo_consistency.py`：把 consistency check 接進 pytest。
 
@@ -209,6 +239,16 @@ python3 eval/run_retrieval_eval.py
 python3 eval/run_code_smoke_eval.py                      # 全離線 gate
 python3 eval/run_code_smoke_eval.py --report-json /tmp/report.json   # A/B 用的完整 summary
 python3 eval/run_eval.py --test-set all --verbose
+
+# routing catalog-only：先由維護者外部套用並凍結 <ARM>，CLI 不會代為切 variant
+python3 scripts/eval_tool_routing.py --root <SYNTHETIC_ROOT> \
+    --matrix-row <ROW_ID> --arm <ARM> \
+    --output /tmp/tool-routing-catalog.json --catalog-only
+
+# 歷史 baseline replay：--frozen-contract 只能和 baseline arm 併用
+python3 scripts/eval_tool_routing.py --root <SYNTHETIC_ROOT> \
+    --matrix-row <ROW_ID> --arm baseline --frozen-contract \
+    --output /tmp/tool-routing-baseline.json --catalog-only
 
 # 只有這兩條會連 8081。改了 corpus / parser 語意 / render schema,或 bump 了
 # RETRIEVAL_SCORER_VERSION 之後都要重錄(pipeline 不符時 eval gate 會 FAIL,
@@ -224,6 +264,47 @@ LLAMA_BIN=~/llama.cpp/build/bin/llama-server \
 前三個命令不需要 llama-server；retrieval runner 固定回報 Recall@5、MRR、nDCG@5 與
 數值證據精確率。加 `--predictions <json>` 時才另外計算 citation entailment、數值答案
 精確率、拒答率/拒答正確率。`eval/run_eval.py` 才需要本機 4 個 llama-server 與對應 GGUF。
+
+`scripts/eval_tool_routing.py` 不加 `--catalog-only` 才走真模型；這條只可在既有**明示授權**下，
+使用相容 OpenCode、選定 matrix row/arm、isolated synthetic root 與停用其他 MCP server
+執行。`--arm` 不做 variant composition；執行前還必須由維護者凍結並核對該 arm 的 exact
+config／artifact／contract digest。完整介面是：
+
+```bash
+python3 scripts/eval_tool_routing.py --root ROOT --matrix-row ROW_ID --arm ARM \
+    --output RESULT.json [--model provider/model] [--catalog-only] [--frozen-contract]
+```
+
+`--catalog-source in-process` 是 CI/testing 隱藏選項，而且只允許搭配 `--catalog-only`；日常
+量測不得用它取代 effective stdio MCP。主 tools/no-tools token probe 保持相同 minimal
+message/model/`max_tokens=1`/stream，只差 tools；任何一側 usage 缺失就整組 fallback。
+FastMCP instructions 另以對稱 apply-template/tokenize marginal delta 計入。沒有授權、沒有
+live-after 結果或 gate 未通過，都要明列未完成，不能把 `measured` 改寫成 `supported`。
+
+本次 checked-in 狀態是 2026-08-27 經明示授權、在同一個
+DeepSeek-V4-Flash UD-Q8_K_XL／Unsloth／OpenCode 1.18.21 row 完成的 privacy-safe aggregate。
+六個 arm 都先凍結 exact contract digest，再各跑完整 15-case fixture；這是量測證據，仍不是
+支援宣告：
+
+| arm | catalog tokens | tool recall | evidence adoption | 主要失敗／決策 |
+|---|---:|---:|---:|---|
+| `baseline` | 13,369 | 38.5% | 69.2% | bait=1、promise=1；row-local baseline |
+| `schema_only` | 14,446 | 38.5% | 69.2% | token、recall、grounding、guards 未過 |
+| `schema_plus_mcp_instructions` | 14,585 | 46.2% | 76.9% | bait=0，但 promise=1 且 recall／grounding 未過 |
+| `schema_instructions_build_prompt` | 14,585 | 38.5% | 76.9% | promise=0，但 recall／grounding／bait 未過 |
+| `schema_instructions_build_prompt_todowrite_deny` | 14,585 | 38.5% | 76.9% | 未改善；淘汰，runtime `todowrite` 維持 `allow` |
+| `english_descriptions` | 4,280 | 38.5% | 69.2% | 只過 token gate；bait=2、promise=2 |
+
+後續完整組合中，最佳 `selected_combo_v3_stop_on_evidence` 是 4,331 catalog tokens、61.5%
+tool recall（比 baseline +23.1 個百分點），但 evidence adoption 反降至 61.5%，且 bait=2、
+promise=1，所以仍淘汰。`selected_combo_v2_exact_routes` 另有 1 個 harness-invalid case；再後面的
+strict canary 仍無法穩定產生中英文規格工具呼叫，因此停止 prompt tuning，沒有拿部分 canary
+冒充 full gate。
+
+結果是 matrix row 保持 `measured`、`supported_arm=null`，每個正式 result 都是
+`manual_status_change_required=false`，人工升級條件未觸發。build prompt 預設為 false，只能用
+`--enable-experimental-build-prompt` 明確 opt-in；`todowrite` 維持 `allow`。所有 checked-in
+measurement 都是統計與相容性 digest，不含 prompt、專案路徑、工具參數或輸出。
 
 ### Code graph 的 C/C++ 保守解析
 
@@ -443,10 +524,22 @@ journaled 寫入 → best-effort rollback。
   `scripts/check_readme_consistency.py` 第 9–11 條把 5／200、1..600、dry_run 七欄位與驗證分層
   宣稱釘在 MCP docstring、native description 與文件上。
 
-部署 canary（不進 CI、不是所有使用者必綠）：在受支援且乾淨的部署上跑
-`python3 scripts/opencode_contract_check.py` 與 `AICODE_TOOL_CANARY_FORCE=1 aicode` 的
-tool_call_canary，記錄 OpenCode 版本、MCP SDK 版本、模型／chat template 與結果四項；環境不可得時
-逐字回報 `not run: environment unavailable`，不阻擋離線驗收。
+### Tool contract、build prompt 與部署 canary
+
+| 模組／入口 | 契約 |
+|---|---|
+| `mcp_contract.py` | `PUBLIC_TOOL_ORDER` 是 live 19-tool 名稱與順序唯一來源；同檔也定義 bounded FastMCP instructions 與 evidence-tool 集合。 |
+| `tool_result_adapter.py` | 每個 tool call 都產生單一 compact text block；首行 `status: ok|partial|error`，需要修復／續讀時才有 `next:`。省略 `max_chars` 時以 call-time `config.N_CTX` 的 12% token proxy 配置，明示過大值標 `context_risk`；三個 evidence tool 保留未改 core structured payload。 |
+| `scripts/opencode_build_prompt.py` | 從 `docs/opencode-build-prompt.md` 唯一 fenced block 抽 canonical body；一般安裝不新增 prompt，只有 `--enable-experimental-build-prompt` 明確 opt-in。之後舊 managed reference 才同步，custom string 保留、型別錯誤 fail-loud。prompt `0644` 與 config `0600` 同 transaction／symlink write-through／rollback。synthetic composition 只證明取代 default；完整 routing A/B 已失敗，不能宣稱 supported。 |
+| `scripts/opencode_direct_contract.py` | 在任何 writer/MCP/model 前只讀驗證 OpenCode `>=1.17,<2` direct contract；V2 `mcp.servers`、任何 `codemode` 或無法解析版本都 exit 2。 |
+| `scripts/tool_call_canary.py` | live MCP protocol；explicit 點名工具 hard gate（retry 一次）；implicit 未點名工具單次診斷，四態 `optimal/suboptimal/fail/timeout` 不擋啟動。schema 2 分離 cache lane 只存 hash/status/time/version；`supports_tools=false` 在 model attempt 前 fail。 |
+| `scripts/mcp_catalog.py`／`scripts/eval_tool_routing.py` | effective stdio catalog、privacy-safe routing classification/gates 與 frozen historical baseline replay；harness 永不自行把 matrix row 升級成 supported。 |
+
+部署 live-after 不進 CI，也不是所有開發環境必綠。受授權且相容的乾淨部署才執行
+`AICODE_TOOL_CANARY_FORCE=1 aicode` 與 routing eval 真模型 arm，記錄 OpenCode／MCP SDK、
+模型／chat template／effective config、explicit 與 implicit 結果。環境不可得時逐字回報
+`not run: environment unavailable`；未授權、未跑或 gate 未通過都保持 incomplete，不能阻擋
+離線驗收，也不能宣稱 `supported`。
 
 ---
 
@@ -464,7 +557,7 @@ llama-server 啟動時 `-c <N>` 與 OpenCode `model.limit.context` 對齊。`scr
 | 模組 | 責任 |
 |---|---|
 | `context_budget.py` | token 估算(prompt / messages parts / tools schema)、`ContextUsage` dataclass、hard gate (`enforce_gate` → `ContextOverflowError`)、llama-server usage metrics 解析(支援 native `tokens_evaluated/tokens_predicted` 與 OpenAI `usage{}`,streaming + non-streaming)、JSONL telemetry。**不寫 prompt / 檔案內容** 進 log,只寫 count + metadata。 |
-| `code_context.py` | `code_rag_search(mode="context")` 的 deterministic 程式證據選取/overlap merge/content dedupe/字元裝箱。它不是 LLM context hard gate；source I/O 由呼叫端注入既有 `ToolExecutor.grep/read_file`，本模組不裸讀檔。固定 `max_chars=2000..30000`，`used_chars` 只加總 `evidence[].text`；candidate cap、graph traversal cap 與 character budget 各自如實標示，uncertainties 去重且有顯式上限。 |
+| `code_context.py` | `code_rag_search(mode="context")` 的 deterministic 程式證據選取/overlap merge/content dedupe/字元裝箱。它不是 LLM context hard gate；source I/O 由呼叫端注入既有 `ToolExecutor.grep/read_file`，本模組不裸讀檔。明示 `max_chars` 的合法範圍固定為 `2000..30000`；MCP 省略時由 transport wrapper 依 call-time `n_ctx` 的 12% 配置（direct core 才保留歷史 12,000 fallback）。`used_chars` 只加總 `evidence[].text`；candidate cap、graph traversal cap 與 character budget 各自如實標示，uncertainties 去重且有顯式上限。 |
 | `trim.py` | 對 `role=tool` 訊息做 priority-aware trim,加入明確 `[CTX_TRIMMED]` / `[TOOL_SUMMARY]` 標記。`role=system` / `role=user` 訊息**完全不動**(REF metadata 因此被保留)。run_command 保留 tail + error line;read_file 保留 header + window;舊輪 tool output 摘要成 deterministic facts(file:line 錨點、error 行)。 |
 | `context_signals.py` | **檢索訊號的唯一定義**:embedding 組字(retrieval 含 ctx / gate 只看原文)、schema 名稱與 required 對照、內容雜湊、BM25 來源文本、reranker passage。寫入端(`RAG.py`)與載入端(`knowledge.py`)一律 import 這裡——以前兩邊各寫一份同樣的字串,差一個字就變成「內容雜湊不一致」。 |
 | `context_generation.py` | chunk 級生成脈絡的產生器:窗策略(整份 / 階層式摘要 + target-centered section window)、prompt 版本、輸出衛生、write-through 快取與指紋、per-KB single-writer 鎖、覆蓋率閘、**專用的受限 HTTP client**(`trust_env=False`、拒絕 3xx、host 必須是 loopback)。 |

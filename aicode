@@ -153,8 +153,6 @@ EOF
   mv "$tmp" "$wrapper"
 }
 
-prepare_opencode_mcp_wrapper
-
 if ! command -v opencode >/dev/null 2>&1; then
   echo "[aicode] 'opencode' not found in PATH — install with: npm install -g opencode-ai@latest" >&2
   exit 127
@@ -170,6 +168,8 @@ OPENCODE_CODE_MODE_VALUE="${OPENCODE_EXPERIMENTAL_CODE_MODE:-}"
 case "${OPENCODE_CODE_MODE_VALUE,,}" in
   1|true|yes|on)
     echo "[aicode] refusing OpenCode experimental Code Mode: CodeTrail requires direct codetrail_* MCP tools." >&2
+    echo "[aicode] supported client contract is OpenCode >=1.17.0,<2.0.0." >&2
+    echo "[aicode] OpenCode V2 uses mcp.servers.codetrail plus different codemode:false, disabled, and execution timeout semantics; Code Mode is outside this specification." >&2
     echo "[aicode] set OPENCODE_EXPERIMENTAL_CODE_MODE=false and retry." >&2
     exit 2
     ;;
@@ -188,6 +188,24 @@ if [ -z "$PYBIN" ]; then
   echo "[aicode] python3/python not found in PATH — required for main-model resolution and ctx safety check." >&2
   exit 2
 fi
+
+# Direct native-tool compatibility is the first OpenCode contract gate.  It
+# must run before generating the project wrapper or invoking any --fix writer,
+# MCP server, or model canary; otherwise an incompatible V2/Code Mode client
+# could mutate V1 config and only fail much later.  `aicode attach` already
+# exec'd above and deliberately remains a thin client.
+DIRECT_CONTRACT_CHECK="$CODETRAIL_HOME/scripts/opencode_direct_contract.py"
+if [ ! -f "$DIRECT_CONTRACT_CHECK" ]; then
+  echo "[aicode] missing required direct-tool contract check: $DIRECT_CONTRACT_CHECK" >&2
+  exit 2
+fi
+if ! "$PYBIN" "$DIRECT_CONTRACT_CHECK" --root "$ROOT"; then
+  echo "[aicode] OpenCode direct-tool contract refused to start (see [direct-contract] above)." >&2
+  exit 2
+fi
+
+# This is the first launcher write.  Keep it after the compatibility gate.
+prepare_opencode_mcp_wrapper
 
 # Resolve the same deployment profile used by launchers, doctor, status, and
 # preflight.  NUL-delimited KEY=VALUE records are imported one-by-one; profile
@@ -315,9 +333,10 @@ echo "[aicode] AICODE_ROOT=$AICODE_ROOT"
 # MCP / tool-call health gate:
 #   1) 每次都直接走 initialize → tools/list → list_dir，確認 server 真正暴露
 #      完整 19-tool contract，而不是相信模型對自身工具的文字描述。
-#   2) 用 fresh `opencode run --format json` 驗 active model 能產生 completed 的
-#      結構化 codetrail_list_dir event；成功結果依 model/config/template/root 指紋
-#      快取，避免每次啟動都花一次完整推理時間。
+#   2) explicit fresh `opencode run --format json` 必須產生 completed 的
+#      codetrail_list_dir event（硬 gate，可重試一次）。通過後另跑一次未點名
+#      工具的 implicit routing 診斷；optimal/suboptimal/fail/timeout 都不擋啟動。
+#      兩條 lane 依 model/config/template/root/protocol 指紋分開快取。
 # attach 是薄 client，前面已直接 exec，不會重跑 backend canary；standalone TUI 與
 # web backend 都會走這道 gate。`--` 後原樣交給 Python，只掃描 -m/--model，
 # 不會消耗或改寫稍後要轉發給 OpenCode 的參數。

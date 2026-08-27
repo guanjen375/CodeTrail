@@ -68,6 +68,36 @@ OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode_web
 
 ---
 
+## OpenCode direct-tool 相容閘
+
+CodeTrail 目前只支援 OpenCode `>=1.17.0,<2.0.0` 的 direct `codetrail_*` native MCP
+tools。`aicode`／`aicode web` 在產生 project wrapper、執行任何 `--fix` writer、啟動 MCP
+或模型前，先讀 `opencode --version` 與 `opencode debug config`；版本無法唯一解析、超出
+範圍，或 effective config 出現 V2-only 的 `mcp.servers`／任何 `codemode` 鍵，都會
+fail-loud。`aicode attach` 是只連既有 backend 的薄 client，不重跑 backend gate。
+
+OpenCode V2 改用 `mcp.servers.codetrail`，而 `codemode:false`、`disabled` 與 execution
+timeout 的語意也不同。Code Mode 又會把 direct tools 收成單一 `execute`。這些都不能用
+V1 的 permission 與 canary 靜默猜測；要導入必須另案定義完整 lifecycle contract。
+
+## 受管 build prompt 與 permission 分工
+
+正式 routing A/B 沒有 arm 通過全部 gate，所以 `set_config.sh` 預設不產生 build prompt。
+只有明確給 `--enable-experimental-build-prompt` 時，才產生
+`~/.config/codetrail/opencode-build-prompt.md`（`0644`），並讓
+`~/.config/opencode/opencode.json`（`0600`）指向它。canonical prompt 與 config 在同一
+transaction 中原子更新；既有 symlink 寫穿到 target，任一步失敗會 rollback，避免留下
+config 指向不存在 prompt 的半套狀態。明確的使用者自訂 string 一律保留；非 string 值
+fail-loud，不猜測重建。
+
+這份 build prompt 是取代 OpenCode build default 的短規則，不是 permission。它不會把
+`deny` 的 OpenCode 內建工具變成可用，也不會繞過 CodeTrail mutation 的 `ask`。目前
+`todowrite` 維持 `allow`；合成 request 只證明 replacement semantics，而已完成但失敗的
+routing A/B 不足以改 permission 或宣稱模型組合 supported。完整內容與邊界見
+[CodeTrail OpenCode build prompt](opencode-build-prompt.md)。
+
+---
+
 ## 外部檔案匯入
 
 預設不能讀專案外路徑。要匯入 `~/Downloads` 或 `/tmp` 的 log / 截圖 / spec,啟動時才打開:
@@ -103,7 +133,18 @@ aicode
 
 `record_lesson(...)` 是唯一會寫到 `AICODE_ROOT` 之外的工具,而且只寫一個固定路徑:`~/.config/codetrail/lessons.json`(per-deployment 的行為教訓 store,與 `deployment.json` 同層;不能被模型指到別的路徑)。它被 permission 設成 `ask`:模型只能「提案」,你會在核准框看到完整 rule 內容,核准後才落地。沒有無審核的自動寫入路徑;細節見 [docs/lessons.md](lessons.md)。
 
-升級防護:舊安裝 `git pull` 後,舊 opencode.json 的 `codetrail_*: allow` wildcard 會放行還沒有 ask 覆寫的新工具。`aicode` 每次啟動會自動把缺少的 ask 核准閘(與 lessons 的 instructions 項)補進全域 opencode.json(`scripts/opencode_contract_check.py --fix`,原檔備份、你明確設過的值一律尊重);不經 `aicode` 直接開 `opencode` 的話請先重跑 `./set_config.sh`。
+升級防護：舊安裝 `git pull` 後，舊 opencode.json 的 `codetrail_*: allow` wildcard 會放行
+還沒有 ask 覆寫的新工具。direct-tool 相容閘通過後，`aicode` 才會用
+`scripts/opencode_contract_check.py --fix` 原子補上缺少的 ask 核准閘、lessons
+instructions，並只同步已明確 opt-in 的舊受管 build prompt reference；缺少 prompt 維持現況，
+明確自訂值與備份都保留。prompt artifact 和 config 任一步寫失敗都一起 rollback。不經
+`aicode` 直接開 `opencode` 的話，
+請先重跑 `./set_config.sh`。
+
+tool canary 的 explicit hard gate 與 implicit diagnostic 分開使用 cache schema 2。cache 只存
+fingerprint hash、lane status、檢查時間與版本，不存 prompt、專案路徑、檔名、模型輸出、
+tool arguments 或 tool result；兩條 lane 不會互借另一列狀態。implicit 的
+`optimal|suboptimal|fail|timeout` 是部署診斷，不是資料或正確性保證。
 
 ---
 
@@ -171,6 +212,8 @@ web 工具、plugin 或其他 process 不會自動繼承 CodeTrail 的 endpoint 
 
 - 從具體專案目錄跑 `aicode` / `aicode_web`,不要從 `$HOME` 或 `/`。
 - `/status` 看到 `codetrail Connected` 後再開始工作。
+- 確認啟動前有 `[direct-contract] PASS` 與 `MCP PASS — 19 tools + list_dir round-trip`；
+  implicit 非 optimal 只代表 routing 診斷警告，explicit／direct failure 則會拒絕啟動。
 - 不信任 repo 時加 `OPENCODE_DISABLE_PROJECT_CONFIG=1`。
 - 保留 [README §4.3](../README.md#43-opencode-config) 的 `enabled_providers` 與
   `permission` 鎖定。

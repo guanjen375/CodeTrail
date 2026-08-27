@@ -111,16 +111,23 @@ def test_mcp_protocol_roundtrip(tmp_path: Path):
     for expected in ("query_knowledge", "list_dir", "read_file", "grep_code"):
         assert expected in names, f"工具 {expected} 沒註冊成功；實得 {sorted(names)}"
     max_chars_schema = code_search_schema["properties"]["max_chars"]
-    assert max_chars_schema["type"] == "integer"
-    assert max_chars_schema["default"] == 12000
-    assert max_chars_schema["minimum"] == 2000
-    assert max_chars_schema["maximum"] == 30000
+    assert max_chars_schema["default"] is None
+    integer_branch = next(
+        branch for branch in max_chars_schema["anyOf"] if branch.get("type") == "integer"
+    )
+    assert integer_branch["minimum"] == 2000
+    assert integer_branch["maximum"] == 30000
+    assert {branch.get("type") for branch in max_chars_schema["anyOf"]} == {"integer", "null"}
 
     assert listed.isError is False, _content_text(listed)
     listed_text = _content_text(listed)
+    assert len(listed.content) == 1
+    assert listed_text.startswith("status: ok\n"), listed_text
     assert "README.md" in listed_text or "mod.py" in listed_text, listed_text
 
     assert grepped.isError is False, _content_text(grepped)
+    assert len(grepped.content) == 1
+    assert _content_text(grepped).startswith("status: ok\n")
     assert "hello" in _content_text(grepped)
 
 
@@ -151,6 +158,7 @@ def test_embedding_failure_is_a_tool_error_with_actionable_url(tmp_path: Path):
     for result in (code_result, knowledge_result, ingest_result):
         error_text = _content_text(result)
         assert result.isError is True, error_text
+        assert error_text.startswith("status: error\nnext:"), error_text
         assert "http://%zz:8081" in error_text
         assert "8081 llama-server" in error_text
         assert "AICODE_LLAMA_EMBED_BASE_URL" in error_text

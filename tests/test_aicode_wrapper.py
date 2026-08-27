@@ -40,7 +40,16 @@ def test_aicode_prepares_opencode_mcp_wrapper(tmp_path):
     bin_dir.mkdir()
 
     stub_opencode = bin_dir / "opencode"
-    stub_opencode.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    stub_opencode.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "${1:-}" = "--version" ]; then printf \'1.18.21\\n\'; exit 0; fi\n'
+        'if [ "${1:-}" = "debug" ] && [ "${2:-}" = "config" ]; then\n'
+        "  printf '{}\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
     stub_opencode.chmod(0o700)
 
     env = {
@@ -223,3 +232,16 @@ def test_aicode_env_and_cli_same_model_passes_through(tmp_path):
 
     assert result.returncode == 0, f"exit={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
     assert read_stub_args(args_file) == ["--model", "foo-bar"]
+
+
+def test_direct_contract_gate_precedes_launcher_writers_and_canaries():
+    source = (REPO_ROOT / "aicode").read_text(encoding="utf-8")
+    gate = source.index(
+        'if ! "$PYBIN" "$DIRECT_CONTRACT_CHECK" --root "$ROOT"; then'
+    )
+    first_wrapper_write = source.index("\nprepare_opencode_mcp_wrapper\n")
+    first_config_fix = source.index("opencode_ctx_check.py\" --fix")
+    model_canary = source.index('TOOL_CANARY="$CODETRAIL_HOME/scripts/tool_call_canary.py"')
+    assert gate < first_wrapper_write < first_config_fix < model_canary
+    assert source.index("  attach)") < gate
+    assert source.index('SUBCMD="web"') < gate

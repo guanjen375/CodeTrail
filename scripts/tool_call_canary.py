@@ -4,14 +4,15 @@
 ``aicode`` runs this before starting OpenCode.  The protocol check is always
 live: it starts the effective ``mcp.codetrail.command``, performs
 initialize/tools/list, verifies the exact public tool contract, and calls the
-read-only ``list_dir`` tool.  The model check starts a fresh ``opencode run``
-session and accepts only a structured, completed ``codetrail_list_dir`` event;
-assistant prose or XML that merely looks like a tool call never counts.
+read-only ``list_dir`` tool.  A named explicit model probe is a hard gate and
+may retry once; a separate unnamed-intent probe runs once and records an
+optimal/suboptimal/fail/timeout diagnostic without blocking startup.
 
-The model check is comparatively slow, so successful results are cached by a
-configuration/runtime fingerprint.  Only the fingerprint and timestamp are
-stored -- never prompts, model output, tool output, project paths, or config
-contents.  Transient OpenCode canary sessions are deleted after inspection.
+The model checks are comparatively slow, so results are cached in separate
+explicit/implicit lanes by a configuration/runtime fingerprint.  Each record
+contains only fingerprint, status, time, and canary version -- never prompts,
+model/tool output, project paths, session ids, or config contents.  Transient
+OpenCode canary sessions are deleted after inspection.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -29,6 +31,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -37,44 +40,53 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from model_resolution import parse_cli_model_arg_detail  # noqa: E402
+from mcp_contract import PUBLIC_TOOL_NAMES, PUBLIC_TOOL_ORDER  # noqa: E402
+from scripts.opencode_direct_contract import (  # noqa: E402
+    DirectToolContractError,
+    require_direct_tool_contract,
+)
 
-CANARY_VERSION = 1
-CACHE_SCHEMA = 1
+CANARY_VERSION = 2
+CACHE_SCHEMA = 2
 DEFAULT_CACHE_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_MCP_TIMEOUT_SECONDS = 90
-DEFAULT_MODEL_TIMEOUT_SECONDS = 240
+DEFAULT_EXPLICIT_TIMEOUT_SECONDS = 120
+# Backward-compatible name for callers that previously had only one model lane.
+DEFAULT_MODEL_TIMEOUT_SECONDS = DEFAULT_EXPLICIT_TIMEOUT_SECONDS
+DEFAULT_IMPLICIT_TIMEOUT_SECONDS = 180
 DEFAULT_CONFIG_TIMEOUT_SECONDS = 30
 MODEL_CANARY_HEARTBEAT_SECONDS = 15
 MAX_CACHE_ENTRIES = 32
 MAX_PROPS_BYTES = 4 * 1024 * 1024
 
-EXPECTED_MCP_TOOLS = frozenset(
-    {
-        "analyze_file",
-        "apply_patch",
-        "code_rag_search",
-        "file_info",
-        "git_diff",
-        "git_status",
-        "grep_code",
-        "import_external_file",
-        "ingest_document",
-        "list_dir",
-        "query_knowledge",
-        "query_knowledge_strict",
-        "read_file",
-        "record_lesson",
-        "reload_knowledge_base",
-        "remove_document",
-        "review_figures",
-        "run_command",
-        "run_lint",
-    }
-)
+EXPECTED_MCP_TOOLS = PUBLIC_TOOL_NAMES
+EXPECTED_MCP_TOOL_ORDER = PUBLIC_TOOL_ORDER
 TARGET_FRONTEND_TOOL = "codetrail_list_dir"
 CANARY_PROMPT = (
     "請立即呼叫 codetrail_list_dir，path=\".\"、depth=1。"
     "必須實際呼叫工具，不准用文字回答工具是否存在。"
+)
+IMPLICIT_CANARY_PROMPT = (
+    "請實際檢查目前專案根目錄有哪些檔案與子目錄，然後只用一句話確認已完成檢查。"
+    "不要猜測，也不要只描述你打算怎麼做。"
+)
+
+# A completed call to one of these tools proves autonomous CodeTrail routing,
+# but is not the optimal response to the directory-listing intent above.
+IMPLICIT_READ_ONLY_FRONTEND_TOOLS = frozenset(
+    {
+        "codetrail_list_dir",
+        "codetrail_read_file",
+        "codetrail_grep_code",
+        "codetrail_code_rag_search",
+        "codetrail_file_info",
+        "codetrail_query_knowledge",
+        "codetrail_query_knowledge_strict",
+        "codetrail_git_status",
+        "codetrail_git_diff",
+        "codetrail_run_lint",
+        "codetrail_analyze_file",
+    }
 )
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -97,6 +109,25 @@ class ModelEvidence:
     reason: str
     session_ids: tuple[str, ...] = ()
     saw_tool_calls_finish: bool = False
+
+
+class ImplicitStatus(str, Enum):
+    OPTIMAL = "optimal"
+    SUBOPTIMAL = "suboptimal"
+    FAIL = "fail"
+    TIMEOUT = "timeout"
+
+
+@dataclass(frozen=True)
+class ProtocolEvidence:
+    tools_digest: str
+    instructions_digest: str
+
+
+@dataclass(frozen=True)
+class ImplicitEvidence:
+    status: ImplicitStatus
+    session_ids: tuple[str, ...] = ()
 
 
 def _print(message: str, *, error: bool = False) -> None:
@@ -279,7 +310,7 @@ async def _mcp_roundtrip(
     *,
     root: Path,
     env: Mapping[str, str],
-) -> tuple[set[str], bool]:
+) -> tuple[tuple[str, ...], bool, ProtocolEvidence]:
     try:
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
@@ -301,11 +332,30 @@ async def _mcp_roundtrip(
     with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as errlog:
         async with stdio_client(params, errlog=errlog) as (read, write):
             async with ClientSession(read, write) as session:
-                await session.initialize()
+                initialized = await session.initialize()
                 listed_tools = await session.list_tools()
-                names = {tool.name for tool in listed_tools.tools}
+                names = tuple(tool.name for tool in listed_tools.tools)
+                canonical_tools: list[Any] = []
+                for tool in listed_tools.tools:
+                    dump = getattr(tool, "model_dump", None)
+                    if callable(dump):
+                        canonical_tools.append(
+                            dump(mode="json", by_alias=True, exclude_none=True)
+                        )
+                    else:  # pragma: no cover - older compatible SDK fallback
+                        canonical_tools.append(str(tool))
+                instructions = getattr(initialized, "instructions", None)
+                instructions_text = instructions if isinstance(instructions, str) else ""
+                evidence = ProtocolEvidence(
+                    tools_digest=_json_digest(canonical_tools),
+                    # Match scripts.mcp_catalog.text_digest exactly: MCP
+                    # instructions identity is raw UTF-8, not JSON-quoted text.
+                    instructions_digest=hashlib.sha256(
+                        instructions_text.encode("utf-8")
+                    ).hexdigest(),
+                )
                 result = await session.call_tool("list_dir", {"path": ".", "depth": 1})
-                return names, bool(getattr(result, "isError", False))
+                return names, bool(getattr(result, "isError", False)), evidence
 
 
 def run_protocol_check(
@@ -314,10 +364,10 @@ def run_protocol_check(
     root: Path,
     env: Mapping[str, str],
     timeout: int,
-) -> None:
+) -> ProtocolEvidence:
     command = extract_codetrail_command(config, root=root)
     try:
-        names, list_dir_error = asyncio.run(
+        names, list_dir_error, evidence = asyncio.run(
             asyncio.wait_for(
                 _mcp_roundtrip(command, root=root, env=env),
                 timeout=timeout,
@@ -333,8 +383,9 @@ def run_protocol_check(
             f"（{type(exc).__name__}；server 詳細 log 已避免輸出）"
         ) from exc
 
-    missing = sorted(EXPECTED_MCP_TOOLS - names)
-    unexpected = sorted(names - EXPECTED_MCP_TOOLS)
+    name_set = frozenset(names)
+    missing = sorted(EXPECTED_MCP_TOOLS - name_set)
+    unexpected = sorted(name_set - EXPECTED_MCP_TOOLS)
     if missing or unexpected:
         details = []
         if missing:
@@ -345,8 +396,14 @@ def run_protocol_check(
             f"MCP 工具 contract 不符：預期 {len(EXPECTED_MCP_TOOLS)}、實得 {len(names)}；"
             + "；".join(details)
         )
+    if names != EXPECTED_MCP_TOOL_ORDER:
+        raise CanaryError(
+            "MCP 工具順序不符 canonical PUBLIC_TOOL_ORDER；"
+            "client catalog 與 routing fingerprint 不可靜默漂移"
+        )
     if list_dir_error:
         raise CanaryError("MCP list_dir round-trip 回傳 isError=true")
+    return evidence
 
 
 def _json_digest(value: Any) -> str:
@@ -362,7 +419,11 @@ def _json_digest(value: Any) -> str:
 
 def _file_digest(path: Path) -> str:
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while block := handle.read(1024 * 1024):
+                digest.update(block)
+        return digest.hexdigest()
     except FileNotFoundError:
         return "missing"
     except OSError:
@@ -442,6 +503,36 @@ def _model_file_signature(props: Mapping[str, Any]) -> dict[str, Any]:
     return signature
 
 
+_FILE_PROMPT_REFERENCE_RE = re.compile(r"^\{file:(.+)\}$", re.DOTALL)
+
+
+def _effective_build_prompt_digest(config: Mapping[str, Any]) -> str:
+    """Hash the prompt text OpenCode's build agent will actually load.
+
+    Managed prompts are file references.  Hashing only the reference would
+    leave a stale canary cache when the file changes in place, while storing
+    its content would violate the cache privacy contract.
+    """
+    agent = config.get("agent")
+    build = agent.get("build") if isinstance(agent, Mapping) else None
+    prompt = build.get("prompt") if isinstance(build, Mapping) else None
+    if not isinstance(prompt, str):
+        return _json_digest({"state": "missing-or-non-string"})
+    match = _FILE_PROMPT_REFERENCE_RE.fullmatch(prompt.strip())
+    if match is None:
+        return _json_digest({"kind": "inline", "text": prompt})
+    try:
+        path = Path(match.group(1)).expanduser()
+    except (OSError, ValueError):
+        return _json_digest({"kind": "file", "state": "invalid"})
+    return _json_digest(
+        {
+            "kind": "file",
+            "content_digest": _file_digest(path),
+        }
+    )
+
+
 def build_fingerprint(
     *,
     root: Path,
@@ -450,6 +541,7 @@ def build_fingerprint(
     props: Mapping[str, Any],
     opencode_version: str,
     env: Mapping[str, str],
+    protocol_evidence: ProtocolEvidence | None = None,
 ) -> str:
     home_raw = (env.get("HOME") or env.get("USERPROFILE") or "").strip()
     home = Path(home_raw).expanduser() if home_raw else None
@@ -485,6 +577,17 @@ def build_fingerprint(
         )
         if key in props
     }
+    # These two objects are deliberately included in full.  New llama.cpp
+    # capability/build fields must invalidate the cache without a canary code
+    # change selecting them one by one.
+    props_subset["chat_template_caps"] = props.get(
+        "chat_template_caps", {"state": "missing"}
+    )
+    props_subset["build_info"] = props.get("build_info", {"state": "missing"})
+    protocol = protocol_evidence or ProtocolEvidence(
+        tools_digest="unavailable",
+        instructions_digest="unavailable",
+    )
     payload = {
         "canary_version": CANARY_VERSION,
         "root": str(root),
@@ -493,6 +596,9 @@ def build_fingerprint(
         # Hash the resolved config inside the final digest.  This includes all
         # effective provider/MCP/agent settings without persisting credentials.
         "effective_config_hash": _json_digest(config),
+        "effective_build_prompt_digest": _effective_build_prompt_digest(config),
+        "live_tools_digest": protocol.tools_digest,
+        "mcp_instructions_digest": protocol.instructions_digest,
         "props": props_subset,
         "model_file": _model_file_signature(props),
         "files": tracked_files,
@@ -513,16 +619,64 @@ def resolve_cache_path(env: Mapping[str, str]) -> Path | None:
     return Path(home).expanduser() / ".cache" / "codetrail" / "tool-call-canary.json"
 
 
+_CACHE_LANES = ("explicit", "implicit")
+_CACHE_ENTRY_KEYS = frozenset(
+    {"fingerprint", "status", "checked_at", "canary_version"}
+)
+_CACHE_STATUSES = {
+    "explicit": frozenset({"pass"}),
+    "implicit": frozenset(status.value for status in ImplicitStatus),
+}
+
+
+def _empty_cache() -> dict[str, Any]:
+    return {"schema": CACHE_SCHEMA, "explicit": [], "implicit": []}
+
+
+def _valid_cache_entry(value: Any, *, lane: str) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and set(value) == _CACHE_ENTRY_KEYS
+        and isinstance(value.get("fingerprint"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value["fingerprint"])
+        and value.get("status") in _CACHE_STATUSES[lane]
+        and isinstance(value.get("checked_at"), (int, float))
+        and not isinstance(value.get("checked_at"), bool)
+        and math.isfinite(float(value["checked_at"]))
+        and isinstance(value.get("canary_version"), int)
+        and not isinstance(value.get("canary_version"), bool)
+    )
+
+
 def _read_cache(path: Path) -> dict[str, Any]:
+    """Read and privacy-sanitize schema 2; schema 1 is always a cache miss."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return {"schema": CACHE_SCHEMA, "passes": {}}
-    if not isinstance(data, dict) or data.get("schema") != CACHE_SCHEMA:
-        return {"schema": CACHE_SCHEMA, "passes": {}}
-    if not isinstance(data.get("passes"), dict):
-        data["passes"] = {}
+        return _empty_cache()
+    if not isinstance(raw, dict) or raw.get("schema") != CACHE_SCHEMA:
+        return _empty_cache()
+    data = _empty_cache()
+    for lane in _CACHE_LANES:
+        entries = raw.get(lane)
+        if isinstance(entries, list):
+            data[lane] = [
+                dict(entry)
+                for entry in entries
+                if _valid_cache_entry(entry, lane=lane)
+            ][:MAX_CACHE_ENTRIES]
     return data
+
+
+def _cache_entry(
+    path: Path,
+    lane: str,
+    fingerprint: str,
+) -> dict[str, Any] | None:
+    for entry in _read_cache(path)[lane]:
+        if entry["fingerprint"] == fingerprint:
+            return entry
+    return None
 
 
 def cached_pass_age(
@@ -534,8 +688,8 @@ def cached_pass_age(
 ) -> int | None:
     if ttl_seconds <= 0:
         return None
-    entry = _read_cache(path).get("passes", {}).get(fingerprint)
-    if not isinstance(entry, dict) or entry.get("status") != "pass":
+    entry = _cache_entry(path, "explicit", fingerprint)
+    if entry is None or entry.get("status") != "pass":
         return None
     checked_at = entry.get("checked_at")
     if not isinstance(checked_at, (int, float)):
@@ -544,6 +698,40 @@ def cached_pass_age(
     if age < -300 or age > ttl_seconds:
         return None
     return max(0, int(age))
+
+
+def cached_implicit_status(
+    path: Path,
+    fingerprint: str,
+    *,
+    now: float,
+    ttl_seconds: int,
+) -> ImplicitStatus | None:
+    """Return only the exact current-fingerprint diagnostic while fresh."""
+    if ttl_seconds <= 0:
+        return None
+    record = implicit_cache_record(path, fingerprint)
+    if record is None:
+        return None
+    status_value, checked_at = record
+    age = now - checked_at
+    if age < -300 or age > ttl_seconds:
+        return None
+    return status_value
+
+
+def implicit_cache_record(
+    path: Path,
+    fingerprint: str,
+) -> tuple[ImplicitStatus, float] | None:
+    """Return an exact lane record, including stale data for doctor display."""
+    entry = _cache_entry(path, "implicit", fingerprint)
+    if entry is None:
+        return None
+    try:
+        return ImplicitStatus(entry["status"]), float(entry["checked_at"])
+    except (KeyError, TypeError, ValueError):  # pragma: no cover - sanitized above
+        return None
 
 
 def _format_duration(seconds: float) -> str:
@@ -565,8 +753,8 @@ def _live_canary_reason(
     """Explain why a live model canary is about to run (new combo vs expiry)."""
     if ttl_seconds <= 0:
         return "AICODE_TOOL_CANARY_TTL_SECONDS=0，快取已停用"
-    entry = _read_cache(path).get("passes", {}).get(fingerprint)
-    if isinstance(entry, dict) and entry.get("status") == "pass":
+    entry = _cache_entry(path, "explicit", fingerprint)
+    if entry is not None and entry.get("status") == "pass":
         checked_at = entry.get("checked_at")
         if isinstance(checked_at, (int, float)):
             age = now - float(checked_at)
@@ -578,24 +766,37 @@ def _live_canary_reason(
     return "這個專案＋模型＋設定組合尚無通過紀錄（新專案或設定變動）"
 
 
-def save_cached_pass(path: Path, fingerprint: str, *, now: float) -> None:
+def _save_cache_entry(
+    path: Path,
+    fingerprint: str,
+    *,
+    lane: str,
+    status_value: str,
+    now: float,
+) -> None:
+    if lane not in _CACHE_LANES or status_value not in _CACHE_STATUSES.get(
+        lane, frozenset()
+    ):
+        raise ValueError("invalid canary cache lane/status")
+    if re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
+        raise ValueError("canary fingerprint must be a lowercase SHA-256 hex digest")
+    if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now):
+        raise ValueError("canary checked_at must be a finite number")
     data = _read_cache(path)
-    passes = data.setdefault("passes", {})
-    assert isinstance(passes, dict)
-    passes[fingerprint] = {
-        "status": "pass",
+    entries = [
+        entry for entry in data[lane] if entry.get("fingerprint") != fingerprint
+    ]
+    entries.append({
+        "fingerprint": fingerprint,
+        "status": status_value,
         "checked_at": now,
         "canary_version": CANARY_VERSION,
-    }
-    if len(passes) > MAX_CACHE_ENTRIES:
-        ordered = sorted(
-            passes.items(),
-            key=lambda item: (
-                item[1].get("checked_at", 0) if isinstance(item[1], dict) else 0
-            ),
-            reverse=True,
-        )
-        data["passes"] = dict(ordered[:MAX_CACHE_ENTRIES])
+    })
+    data[lane] = sorted(
+        entries,
+        key=lambda entry: entry.get("checked_at", 0),
+        reverse=True,
+    )[:MAX_CACHE_ENTRIES]
 
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -625,6 +826,34 @@ def save_cached_pass(path: Path, fingerprint: str, *, now: float) -> None:
                 Path(tmp_name).unlink()
             except OSError:
                 pass
+
+
+def save_cached_pass(path: Path, fingerprint: str, *, now: float) -> None:
+    """Cache a successful explicit transport/obedience probe."""
+    _save_cache_entry(
+        path,
+        fingerprint,
+        lane="explicit",
+        status_value="pass",
+        now=now,
+    )
+
+
+def save_cached_implicit(
+    path: Path,
+    fingerprint: str,
+    status_value: ImplicitStatus,
+    *,
+    now: float,
+) -> None:
+    """Cache one non-blocking autonomous-routing diagnostic."""
+    _save_cache_entry(
+        path,
+        fingerprint,
+        lane="implicit",
+        status_value=status_value.value,
+        now=now,
+    )
 
 
 def _event_session_ids(event: Mapping[str, Any]) -> list[str]:
@@ -694,6 +923,44 @@ def inspect_model_events(output: str) -> ModelEvidence:
     return ModelEvidence(False, reason, tuple(session_ids), saw_tool_calls_finish)
 
 
+def inspect_implicit_events(output: str) -> ImplicitEvidence:
+    """Classify only completed structured calls from the unnamed-intent probe."""
+    session_ids: list[str] = []
+    completed_read_only: list[tuple[str, dict[str, Any]]] = []
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        for session_id in _event_session_ids(event):
+            if session_id not in session_ids:
+                session_ids.append(session_id)
+        if event.get("type") != "tool_use":
+            continue
+        part = event.get("part")
+        part = part if isinstance(part, dict) else {}
+        state = part.get("state", event.get("state"))
+        state = state if isinstance(state, dict) else {}
+        if state.get("status") != "completed":
+            continue
+        tool = part.get("tool", event.get("tool"))
+        if tool not in IMPLICIT_READ_ONLY_FRONTEND_TOOLS:
+            continue
+        tool_input = state.get("input", part.get("input", event.get("input")))
+        completed_read_only.append(
+            (tool, tool_input if isinstance(tool_input, dict) else {})
+        )
+
+    for tool, tool_input in completed_read_only:
+        if tool == TARGET_FRONTEND_TOOL and tool_input.get("path") in (".", "", "./"):
+            return ImplicitEvidence(ImplicitStatus.OPTIMAL, tuple(session_ids))
+    if completed_read_only:
+        return ImplicitEvidence(ImplicitStatus.SUBOPTIMAL, tuple(session_ids))
+    return ImplicitEvidence(ImplicitStatus.FAIL, tuple(session_ids))
+
+
 def _coerce_text(value: str | bytes | None) -> str:
     if value is None:
         return ""
@@ -709,25 +976,18 @@ def run_model_attempt(
     model_override: str,
     timeout: int,
 ) -> ModelEvidence:
-    command = [
-        "opencode",
-        "run",
-        "--dir",
-        str(root),
-        "--agent",
-        "build",
-        "--format",
-        "json",
-        "--title",
-        "CodeTrail tool-call canary",
-    ]
-    if model_override:
-        command.extend(("--model", model_override))
-    command.append(CANARY_PROMPT)
+    command = _model_canary_command(
+        root=root,
+        model_override=model_override,
+        title="CodeTrail explicit tool-call canary",
+        prompt=CANARY_PROMPT,
+    )
     try:
         result = _run_process_with_heartbeat(command, root=root, env=env, timeout=timeout)
     except FileNotFoundError:
         return ModelEvidence(False, "找不到 opencode")
+    except OSError as exc:
+        return ModelEvidence(False, f"opencode run 無法啟動（{type(exc).__name__}）")
     except subprocess.TimeoutExpired as exc:
         evidence = inspect_model_events(_coerce_text(exc.stdout))
         return replace(evidence, success=False, reason=f"opencode run 超過 {timeout} 秒")
@@ -740,6 +1000,59 @@ def run_model_attempt(
             reason=f"opencode run exit {result.returncode}（輸出已避免顯示）",
         )
     return evidence
+
+
+def _model_canary_command(
+    *,
+    root: Path,
+    model_override: str,
+    title: str,
+    prompt: str,
+) -> list[str]:
+    command = [
+        "opencode",
+        "run",
+        "--dir",
+        str(root),
+        "--agent",
+        "build",
+        "--format",
+        "json",
+        "--title",
+        title,
+    ]
+    if model_override:
+        command.extend(("--model", model_override))
+    command.append(prompt)
+    return command
+
+
+def run_implicit_model_attempt(
+    *,
+    root: Path,
+    env: Mapping[str, str],
+    model_override: str,
+    timeout: int,
+) -> ImplicitEvidence:
+    command = _model_canary_command(
+        root=root,
+        model_override=model_override,
+        title="CodeTrail implicit routing diagnostic",
+        prompt=IMPLICIT_CANARY_PROMPT,
+    )
+    try:
+        result = _run_process_with_heartbeat(command, root=root, env=env, timeout=timeout)
+    except FileNotFoundError:
+        return ImplicitEvidence(ImplicitStatus.FAIL)
+    except OSError:
+        return ImplicitEvidence(ImplicitStatus.FAIL)
+    except subprocess.TimeoutExpired as exc:
+        partial = inspect_implicit_events(_coerce_text(exc.stdout))
+        return ImplicitEvidence(ImplicitStatus.TIMEOUT, partial.session_ids)
+    if result.returncode != 0:
+        failed = inspect_implicit_events(result.stdout)
+        return ImplicitEvidence(ImplicitStatus.FAIL, failed.session_ids)
+    return inspect_implicit_events(result.stdout)
 
 
 def delete_canary_sessions(
@@ -787,14 +1100,27 @@ def _model_selection(
 def _handle_failure(message: str, *, warn_only: bool) -> int:
     _print(f"FAIL — {message}", error=True)
     if warn_only:
-        _print("WARN-ONLY — 依 AICODE_TOOL_CANARY_WARN_ONLY=1 繼續啟動", error=True)
-        return 0
+        _print(
+            "AICODE_TOOL_CANARY_WARN_ONLY 已不會略過 explicit/direct gate；"
+            "只有 implicit routing 診斷不擋啟動",
+            error=True,
+        )
     _print(
-        "已拒絕啟動；若只是要進 TUI 排查，可暫用 "
-        "AICODE_TOOL_CANARY_WARN_ONLY=1 aicode（不要把它當永久修法）",
+        "已拒絕啟動；請修正 direct-tool / MCP / explicit tool-call 契約後重試",
         error=True,
     )
     return 2
+
+
+def _report_implicit(status_value: ImplicitStatus, *, cached: bool) -> None:
+    source = "cached" if cached else "live"
+    if status_value is ImplicitStatus.OPTIMAL:
+        _print(f"IMPLICIT {source} — status=optimal（自主選到根目錄列舉）")
+        return
+    _print(
+        f"IMPLICIT WARN — status={status_value.value}（{source}；不擋啟動）",
+        error=True,
+    )
 
 
 def run_all(
@@ -828,6 +1154,13 @@ def run_all(
             minimum=30,
             maximum=1800,
         )
+        implicit_timeout = _env_int(
+            env,
+            "AICODE_TOOL_CANARY_IMPLICIT_TIMEOUT_SECONDS",
+            DEFAULT_IMPLICIT_TIMEOUT_SECONDS,
+            minimum=30,
+            maximum=1800,
+        )
         ttl_seconds = _env_int(
             env,
             "AICODE_TOOL_CANARY_TTL_SECONDS",
@@ -836,10 +1169,24 @@ def run_all(
             maximum=30 * 24 * 60 * 60,
         )
         config = load_effective_opencode_config(root, env, timeout=config_timeout)
-        run_protocol_check(config, root=root, env=env, timeout=mcp_timeout)
+        opencode_version = read_opencode_version(root, env)
+        if opencode_version is None:
+            raise CanaryError("opencode --version 無法讀取或輸出為空")
+        try:
+            require_direct_tool_contract(opencode_version, config)
+        except DirectToolContractError as exc:
+            raise CanaryError(str(exc)) from exc
+        protocol_evidence = run_protocol_check(
+            config, root=root, env=env, timeout=mcp_timeout
+        )
     except CanaryError as exc:
         return _handle_failure(str(exc), warn_only=warn_only)
 
+    if not isinstance(protocol_evidence, ProtocolEvidence):
+        return _handle_failure(
+            "MCP protocol check 沒有回傳 live tools/instructions fingerprint evidence",
+            warn_only=warn_only,
+        )
     _print(f"MCP PASS — {len(EXPECTED_MCP_TOOLS)} tools + list_dir round-trip")
 
     try:
@@ -850,12 +1197,20 @@ def run_all(
         return _handle_failure(str(exc), warn_only=warn_only)
 
     props = fetch_main_server_props(env)
-    opencode_version = read_opencode_version(root, env)
+    caps = props.get("chat_template_caps") if isinstance(props, Mapping) else None
+    if isinstance(caps, Mapping) and caps.get("supports_tools") is False:
+        return _handle_failure(
+            "llama-server /props 明確回報 chat_template_caps.supports_tools=false；"
+            "未執行任何 model canary",
+            warn_only=warn_only,
+        )
     cache_path = resolve_cache_path(env)
-    cache_ready = props is not None and opencode_version is not None and cache_path is not None
+    cache_ready = props is not None and cache_path is not None
     fingerprint = ""
+    bypass_cache = force or _truthy(env.get("AICODE_TOOL_CANARY_FORCE"))
+    explicit_cached = False
     if cache_ready:
-        assert props is not None and opencode_version is not None
+        assert props is not None
         fingerprint = build_fingerprint(
             root=root,
             config=config,
@@ -863,8 +1218,9 @@ def run_all(
             props=props,
             opencode_version=opencode_version,
             env=env,
+            protocol_evidence=protocol_evidence,
         )
-        if force or _truthy(env.get("AICODE_TOOL_CANARY_FORCE")):
+        if bypass_cache:
             live_reason = "--force／AICODE_TOOL_CANARY_FORCE 略過快取"
         else:
             age = cached_pass_age(
@@ -875,66 +1231,120 @@ def run_all(
             )
             if age is not None:
                 _print(f"MODEL PASS — cached structured tool_use（{age // 60} 分鐘前）")
-                return 0
-            live_reason = _live_canary_reason(
-                cache_path,
-                fingerprint,
-                now=time.time(),
-                ttl_seconds=ttl_seconds,
-            )
+                explicit_cached = True
+                live_reason = ""
+            else:
+                live_reason = _live_canary_reason(
+                    cache_path,
+                    fingerprint,
+                    now=time.time(),
+                    ttl_seconds=ttl_seconds,
+                )
     else:
         live_reason = "server /props、opencode 版本或快取路徑不可用；本次結果不會快取"
 
-    # 這一步是整個 aicode 啟動流程唯一會安靜跑數十秒以上的地方；先講清楚
-    # 原因與預期時長，執行中再配合 heartbeat，避免被誤判成當機。
-    _print(f"MODEL live canary — {live_reason}")
-    _print(
-        "現在實跑一次 opencode run，驗證模型會真的呼叫 codetrail_list_dir；"
-        f"本地推理通常需要數十秒到數分鐘（單次上限 {model_timeout} 秒），"
-        f"執行中每 {MODEL_CANARY_HEARTBEAT_SECONDS} 秒回報進度，不是當機。"
-    )
-
-    last_reason = "未知錯誤"
-    for attempt in (1, 2):
-        evidence = run_model_attempt(
-            root=root,
-            env=env,
-            model_override=model_override,
-            timeout=model_timeout,
+    if not explicit_cached:
+        # 這一步是整個 aicode 啟動流程唯一會安靜跑數十秒以上的地方；先講清楚
+        # 原因與預期時長，執行中再配合 heartbeat，避免被誤判成當機。
+        _print(f"MODEL live canary — {live_reason}")
+        _print(
+            "現在實跑 explicit opencode run，驗證模型會真的呼叫 "
+            "codetrail_list_dir；"
+            f"單次上限 {model_timeout} 秒，執行中每 "
+            f"{MODEL_CANARY_HEARTBEAT_SECONDS} 秒回報進度，不是當機。"
         )
-        if evidence.session_ids and not delete_canary_sessions(
-            evidence.session_ids,
-            root=root,
-            env=env,
-        ):
-            _print("WARNING — 無法刪除本次暫存 OpenCode canary session", error=True)
+        last_reason = "未知錯誤"
+        explicit_passed = False
+        for attempt in (1, 2):
+            evidence = run_model_attempt(
+                root=root,
+                env=env,
+                model_override=model_override,
+                timeout=model_timeout,
+            )
+            if evidence.session_ids and not delete_canary_sessions(
+                evidence.session_ids,
+                root=root,
+                env=env,
+            ):
+                _print("WARNING — 無法刪除本次暫存 OpenCode canary session", error=True)
 
-        if evidence.success:
-            suffix = " + tool-calls finish" if evidence.saw_tool_calls_finish else ""
+            if evidence.success:
+                suffix = " + tool-calls finish" if evidence.saw_tool_calls_finish else ""
+                if attempt == 1:
+                    if cache_ready and fingerprint:
+                        try:
+                            assert cache_path is not None
+                            save_cached_pass(cache_path, fingerprint, now=time.time())
+                        except OSError:
+                            _print(
+                                "WARNING — explicit PASS，但快取寫入失敗；下次會重測",
+                                error=True,
+                            )
+                    _print(
+                        f"MODEL PASS — structured codetrail_list_dir completed{suffix}"
+                    )
+                else:
+                    _print(
+                        "MODEL FLAKY — explicit 第二次才成功；本次允許啟動但不快取，"
+                        "下次 aicode 會再測",
+                        error=True,
+                    )
+                explicit_passed = True
+                break
+
+            last_reason = evidence.reason
             if attempt == 1:
-                if cache_ready and fingerprint:
-                    try:
-                        assert cache_path is not None
-                        save_cached_pass(cache_path, fingerprint, now=time.time())
-                    except OSError:
-                        _print("WARNING — canary PASS，但快取寫入失敗；下次會重測", error=True)
-                _print(f"MODEL PASS — structured codetrail_list_dir completed{suffix}")
-            else:
-                _print(
-                    "MODEL FLAKY — 第二次才成功；本次允許啟動但不快取，"
-                    "下次 aicode 會再測",
-                    error=True,
-                )
+                _print(f"MODEL RETRY — 第一次失敗：{last_reason}", error=True)
+
+        if not explicit_passed:
+            return _handle_failure(
+                "MCP protocol 已通過，但 explicit 模型連續兩次未完成真實 tool call："
+                + last_reason,
+                warn_only=warn_only,
+            )
+
+    if cache_ready and fingerprint and not bypass_cache:
+        assert cache_path is not None
+        implicit_cached = cached_implicit_status(
+            cache_path,
+            fingerprint,
+            now=time.time(),
+            ttl_seconds=ttl_seconds,
+        )
+        if implicit_cached is not None:
+            _report_implicit(implicit_cached, cached=True)
             return 0
 
-        last_reason = evidence.reason
-        if attempt == 1:
-            _print(f"MODEL RETRY — 第一次失敗：{last_reason}", error=True)
-
-    return _handle_failure(
-        "MCP protocol 已通過，但模型連續兩次未完成真實 tool call：" + last_reason,
-        warn_only=warn_only,
+    _print(
+        "IMPLICIT live diagnostic — 以未點名工具的目錄意圖檢查自主 routing；"
+        f"只跑一次、上限 {implicit_timeout} 秒，任何結果都不擋啟動"
     )
+    implicit = run_implicit_model_attempt(
+        root=root,
+        env=env,
+        model_override=model_override,
+        timeout=implicit_timeout,
+    )
+    if implicit.session_ids and not delete_canary_sessions(
+        implicit.session_ids,
+        root=root,
+        env=env,
+    ):
+        _print("WARNING — 無法刪除本次 implicit canary session", error=True)
+    if cache_ready and fingerprint:
+        try:
+            assert cache_path is not None
+            save_cached_implicit(
+                cache_path,
+                fingerprint,
+                implicit.status,
+                now=time.time(),
+            )
+        except OSError:
+            _print("WARNING — implicit 診斷快取寫入失敗；下次會重測", error=True)
+    _report_implicit(implicit.status, cached=False)
+    return 0
 
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:

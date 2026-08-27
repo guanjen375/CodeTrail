@@ -155,6 +155,30 @@ python3 deployment_profile.py validate     # 確認 schema 過
 代價:前期載入慢 1.5–2.5 分鐘(把整份 weights 讀進 RAM),之後 TTFT 穩定在 5–15 秒。
 RAM 不夠的就保持 mmap 接受偶爾卡頓,或換較小模型 / 調高 CPU-MoE 層數。
 
+### `[direct-contract] FAIL`：OpenCode 版本／V2／Code Mode 不相容
+
+CodeTrail 目前只支援 OpenCode `>=1.17.0,<2.0.0` 直接暴露的 `codetrail_*` native MCP
+tools。這個 gate 是第一個 OpenCode preflight；看到 FAIL 時，還沒有產生 project wrapper、
+執行任何 `--fix` writer、啟動 MCP 或呼叫模型。
+
+```bash
+opencode --version
+opencode debug config | jq '{mcp, codemode}'
+python3 <CODETRAIL_REPO>/scripts/opencode_direct_contract.py --root <PROJECT_TO_ANALYZE>
+```
+
+- 版本低於 1.17 或已是 2.x：安裝相容 1.x，`npm install -g "opencode-ai@^1.17.0"`。
+- effective config 出現 `mcp.servers`：那是 V2 lifecycle shape，不能只改一個 key 硬套 V1；
+  移除／隔離 V2 config，回到 `mcp.codetrail` 形式。
+- 任何位置出現 `codemode`，或顯式
+  `OPENCODE_EXPERIMENTAL_CODE_MODE=true`：移除 V2-only key，並把 env 設為 false。Code Mode
+  會改成單一 `execute` tool，現行 permission、schema anchor 與 canary 不適用。
+- `opencode --version` 含多個版本或無法解析：先確認 PATH 沒混到另一個同名 CLI；gate 不會
+  猜其中一個版本放行。
+
+OpenCode V2 的 `mcp.servers.codetrail`、`codemode:false`、`disabled` 與 execution timeout
+語意都不同，需要另案實作完整契約；不要用 `AICODE_TOOL_CANARY_SKIP` 繞過 direct gate。
+
 <a id="mcp-connected-but-no-tool-call"></a>
 
 ### `/status` 是 Connected,但模型說沒有 CodeTrail 或只印出假工具 XML
@@ -173,28 +197,70 @@ RAM 不夠的就保持 mmap 接受偶爾卡頓,或換較小模型 / 調高 CPU-M
 | 工具註冊 | client 收到 CodeTrail 的工具 schema | OpenCode 的 tools / MCP 檢視;完整名稱見 [MCP 工具清單](mcp-tools.md) |
 | 本輪實際執行 | 模型真的發出結構化 tool call,client 執行後把結果送回模型 | TUI 工具卡,或 JSON event 的 `type: "tool_use"`、`state.status: "completed"` |
 
-新版 `aicode` 已把這兩個容易漏做的檢查接到啟動流程，不需要每次先叫模型背 19 個名字：
+新版 `aicode` 把相容性、transport、explicit hard gate 與 implicit diagnostic 分開，不需要
+每次先叫模型背 19 個名字：
 
-- `MCP PASS — 19 tools + list_dir round-trip`：每次啟動都另起實際設定的 MCP command，完成 `initialize`、精確比對 19 個 schema，再真的執行無副作用的 `list_dir(path=".", depth=1)`。這一層完全不問 LLM。
-- `MODEL PASS — structured codetrail_list_dir completed`：用 fresh headless session 跑 active model，只接受 JSON stream 裡 completed 的結構化 `tool_use`。純文字／XML 和模型自行宣稱成功都不會通過。
-- `MODEL live canary — <原因>`：第二層 cache 未命中（新專案、設定變動、快取過期或 `--force`）時，實跑前會先印出原因與單次上限秒數，執行中每 15 秒回報一次「仍在執行」。本地推理通常需要數十秒到數分鐘——看得到心跳就不是當機，完全靜默才是異常。
-- `MODEL PASS — cached ...`：相同專案、模型、OpenCode 設定、全域／專案 AGENTS、server `/props`（含 chat template 與取樣預設）曾在 24 小時內通過；MCP 第一層仍是本次 live 檢查。指紋任一部分改變會自動重測。
-- `MODEL FLAKY`：第一次失敗、retry 才成功。本次可進入，但不寫 PASS cache，所以下次 `aicode` 仍會再驗。連續兩次失敗預設拒絕進 TUI。
+- `[direct-contract] PASS — OpenCode ... direct codetrail_* contract`：在任何 wrapper／設定
+  writer、MCP 或模型子行程之前，確認 OpenCode `>=1.17.0,<2.0.0` 且 effective config
+  沒有 V2-only `mcp.servers`／任何 `codemode`。失敗 exit 2，不會先改 V1 config。
+- `MCP PASS — 19 tools + list_dir round-trip`：每次啟動都另起 effective MCP command，完成
+  `initialize`、依固定順序精確比對 19 個名稱，擷取完整 typed schemas／instructions digest，
+  再執行無副作用的 `list_dir(path=".", depth=1)`。這層完全不問 LLM；schema 的
+  bounds/description/budget 由 static contract 驗證，routing catalog 另保存逐工具
+  counts/digests 與 token measurement。
+- `MODEL live canary — <原因>`／`MODEL PASS — ...`：explicit prompt **點名**
+  `codetrail_list_dir`，只接受 JSON stream 裡 completed 的結構化 `tool_use`。純文字／XML
+  和模型自行宣稱成功都不算。首次失敗 retry 一次；第二次才成功印 `MODEL FLAKY`、本次
+  放行但不快取；連續兩次失敗 exit 2。
+- `IMPLICIT live diagnostic ...` 之後只會是 `status=optimal|suboptimal|fail|timeout`。
+  這一輪 prompt 不含工具名，只跑一次：exact completed root `list_dir` 是 `optimal`；選到
+  其他 allowlisted CodeTrail 唯讀工具是 `suboptimal`；沒有合格 call 是 `fail`；超時是
+  `timeout`。後三態會印 `IMPLICIT WARN`，但**四態都不擋啟動**。
 
-模型 canary 會刪除自己建立的臨時 OpenCode session；本身的 cache 只存 hash、PASS 時間與版本，不存 prompt、模型輸出、目錄內容或專案路徑。這是啟動抽查，不是「往後每個生成 token 都保證正確」；如果 TUI 裡稍後又碰到偶發失手，可直接退出後強制重測：
+explicit 與 implicit 是 schema 2 的兩條獨立 cache lane，不會互借另一列結果。fingerprint
+包含 selected/runtime identity、OpenCode 版本與 effective config、live tools/instructions、
+有效 build prompt、全域／專案 AGENTS、lessons 與 server `/props`（含 chat template、
+capabilities、build/取樣資訊）。cache 只存 hash、lane status、檢查時間與版本，不存 prompt、
+模型輸出、tool args/result、檔名、目錄內容、session id 或專案路徑；臨時 OpenCode session
+也會刪除。`/props` 明確回 `chat_template_caps.supports_tools=false` 時，在任何 model attempt
+前直接 fail-loud；缺欄位才繼續探針。
+
+這是啟動抽查，不是「往後每個生成 token 都保證正確」。如果 TUI 裡稍後又碰到偶發失手，
+可直接退出後強制重測兩條 model lane：
 
 ```bash
 AICODE_TOOL_CANARY_FORCE=1 aicode
 ```
 
-只在排查／救援時才用 override。`WARN_ONLY` 仍執行檢查並顯示失敗，但允許進 TUI；`SKIP` 連兩層都不執行：
+`AICODE_TOOL_CANARY_WARN_ONLY` 已**不能**略過 direct／MCP／explicit hard gate；只有 implicit
+本來就不擋。`SKIP` 會連 MCP 與兩條模型檢查都不執行，只能做緊急救援，不能當驗收：
 
 ```bash
-AICODE_TOOL_CANARY_WARN_ONLY=1 aicode
 AICODE_TOOL_CANARY_SKIP=1 aicode
 ```
 
-預設 cache TTL 是 86400 秒；需要更頻繁抽查可設 `AICODE_TOOL_CANARY_TTL_SECONDS=<SECONDS>`（設 `0` 等同每次 live model canary）。第一層或第二層 FAIL 時，訊息會刻意區分「MCP/config/19-tool contract」和「MCP 已通但 model/provider/chat-template 沒產生 tool call」，避免再把兩者混為一談。
+預設 cache TTL 是 86400 秒；需要更頻繁抽查可設
+`AICODE_TOOL_CANARY_TTL_SECONDS=<SECONDS>`（`0` 等同每次 live）。FAIL 訊息會刻意區分
+direct client、MCP/catalog、explicit model/provider/chat-template 與 non-blocking implicit
+routing，避免再把它們混為一談。
+
+`AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py` 會重建 current fingerprint，只回報該列
+的 implicit `optimal/suboptimal/fail/timeout` 與 fresh/stale；資料不足顯示 `unknown`，不會拿
+另一個模型／設定／專案的 cache row 冒充現況。
+
+### 工具結果第一行是 `status: partial` 或出現 `context_risk`
+
+所有工具結果的 compact text lane 第一行固定是 `status: ok|partial|error`。`partial` 不是
+工具失敗，通常代表 core result 自己標示 truncated、repeat guard 中止重複呼叫，或整份文字
+超過 context result budget。第二行 `next:` 是續讀／縮小範圍的動作：`read_file` 請直接用
+它給的下一個 `start_line`，`grep_code` 縮小 path/include/pattern，`list_dir` 縮小 path/depth。
+
+省略 `max_chars` 時，budget 依**呼叫當下**主模型 `n_ctx` 的 12% token proxy 計算，不再固定
+為 12,000 字元；結果仍受工具 safety cap。明示 `max_chars` 大於該 12% 預設時，回傳會加
+`context_risk: explicit max_chars exceeds the default 12% context budget`，提醒這次可能擠壓
+後續對話；不是靜默 clamp，也不是 server error。若看到 `[result truncated by context budget]`，
+照 `next:` 分頁／縮窄，不要用同參數連續重送。`code_rag_search` 的 `used_chars` 仍只計
+evidence text 字元，不是 tokenizer token。
 
 **「剛 ingest 文件就失憶」不等於整份 RAG 塞爆 context。** `ingest_document` 把全文切 chunk 後寫進 `knowledge.json`,它送回目前對話的只有有長度上限的執行摘要;`reload_knowledge_base` 只更新 MCP process 內的 KB singleton。只有之後呼叫 `query_knowledge` 時,召回的少量 REF 才會以 tool result 進入那個 session。新 session 不會因為 KB 裡文件變多就自動攜帶全文。同一個舊 session 累積很多 tool result 時仍可能變長,但要看實際 token / compaction,不能只看 ingest 發生過就下結論。
 
@@ -266,7 +332,25 @@ curl -s http://localhost:8080/props | jq -r '.chat_template' \
 
 例如模型只寫出自創的 `<codetrail_list_dir .../>`,不會因為看起來像 XML 就被 frontend 當成結構化呼叫。不要靠 prompt 手寫 / 猜測底層 tool-call markup;應讓 OpenCode、provider adapter 與 llama.cpp chat template 處理。
 
-若 server 已降溫但模型仍反覆承諾呼叫，先檢查 `~/.config/opencode/AGENTS.md`。**不要用更多規則修補**：舊版曾把 19 個工具、RAG、graph、figure 與 lessons 操作全部塞進這份每輪載入的檔案。真實 OpenCode request 的 A/B 結果是：保留舊 4,869 字元範本時以 `stop` 結束且零 tool call；只移除那份範本，其餘 request、20 個 schema 與 `tool_choice=auto` 不變，就正確呼叫 `codetrail_list_dir`。直接送同一批 CodeTrail schema 給 llama-server 也能正常呼叫，所以這種症狀是**全域提示與 frontend prompt 的交互過載**，不是 MCP transport 壞掉。
+若你曾用 `--enable-experimental-build-prompt` 明確 opt-in，再確認 Build agent 的有效 prompt；
+一般 `set_config.sh` 會保留欄位缺少的現況：
+
+```bash
+jq '.agent.build.prompt' ~/.config/opencode/opencode.json
+opencode debug agent build | rg 'prompt|CodeTrail build agent'
+python3 <CODETRAIL_REPO>/scripts/opencode_contract_check.py
+```
+
+已設定受管 reference 時，看到 `MISSING` 才跑
+`python3 <CODETRAIL_REPO>/scripts/opencode_contract_check.py --fix`。它會把 canonical prompt
+（`0644`）與 config（`0600`）當成同一 transaction 更新、寫穿既有 symlink 並保留備份；
+缺值不會自動 opt-in，舊 managed reference 會修，明確的 custom string 保留，非 string
+壞值則要求人工修正。這份短 prompt **取代** OpenCode build default，不是跟 default 或全域
+AGENTS 再疊一份工具手冊；canonical 內容見 [build prompt 文件](opencode-build-prompt.md)。
+合成 OpenCode 1.18.21 request 只證明 replacement semantics；完整 routing A/B 已跑但沒有 arm
+通過全部 gate，因此不能宣稱模型 supported，也沒有把 `todowrite` 從目前的 `allow` 改掉。
+
+若 server 已降溫但模型仍反覆承諾呼叫，先檢查 `~/.config/opencode/AGENTS.md`。**不要用更多規則修補**：舊版曾把 19 個工具、RAG、graph、figure 與 lessons 操作全部塞進這份每輪載入的檔案。真實 OpenCode request 的 A/B 結果是：保留舊 4,869 字元範本時以 `stop` 結束且零 tool call；只移除那份範本，其餘 request、19 個 CodeTrail schema 與 `tool_choice=auto` 不變，就正確呼叫 `codetrail_list_dir`。直接送同一批 CodeTrail schema 給 llama-server 也能正常呼叫，所以這種症狀是**全域提示與 frontend prompt 的交互過載**，不是 MCP transport 壞掉。
 
 同步 [1,600 字元內的精簡範本](opencode-agents-template.md)（會先備份原檔）：
 
@@ -460,9 +544,12 @@ tailscale ip -4
 `aicode web` 啟動前會偵測 opencode 是否真的支援 web 子指令。看到這個訊息代表你的 opencode 太舊、還沒內建 web backend。升級:
 
 ```bash
-npm install -g opencode-ai@latest
+npm install -g "opencode-ai@^1.17.0"
 opencode web --help    # 應印出 opencode web 的說明(含 --port / --hostname)
 ```
+
+不要用可能跨到 2.x 的 `@latest`；CodeTrail 的 direct-tool gate 只接受
+`>=1.17.0,<2.0.0`。
 
 偵測刻意不只看 exit code —— `opencode <任何字> --help` 在 yargs 下一律 exit 0,舊版會把 `web` 當成專案 positional,所以 `aicode web` 會額外檢查 `opencode web --help` 輸出裡有沒有 web 指令本身的 synopsis。升級後再跑一次 `aicode web` 即可。
 
@@ -760,17 +847,22 @@ PDF 的話回傳還會多附一條 `--preflight` 版本,先估成本再決定。
   那需要兩個一致的原生 evidence channel;只有一個通道時是 `unverified`,通道矛盾時是
   `needs_review`。native lane 不呼叫 VL,所以也**不會**產生 `corroborated`。實際結果以
   重 ingest 後 `review_figures(action="list")` 顯示的為準。
-- **掃描版 / 拍照版 / 舊 KB 的 VL chunk(沒有 `figure_id`)** → 這些**不會出現在
-  `review_figures` 裡**,沒有 canonical payload 可以 fix,重 ingest 也只會回到自由文字
-  VL lane。**本輪沒有把純 raster 升成 strict-trusted 的支援路徑** —— 要那些數字,只能自己
-  回去看原始 PDF 的那一頁,或改用有原生文字的來源重新入庫。
+- **新版 ingest 的掃描版／拍照版純 raster** → 先分類成 table／terminal／diagram 並產生
+  structured figure，所以會出現在 `review_figures`。沒有獨立原生證據時仍是
+  `unverified`／`needs_review`，strict 查詢不會採用；只有人對原圖以
+  `confirm_against_image=True` 核准指定 revision 後才可能成為 `human_verified`。
+- **舊 KB 的 legacy VL chunk（沒有 `figure_id`）** → 沒有 canonical payload 可 fix；要走
+  structured review 必須用新版重新 ingest 原始文件。沒有原圖或人工確認時，不得把純
+  raster 數字宣稱為 strict-trusted。
 - 覆核時如果 `list` 回 `payload: (讀不到)`,代表那份 review artifact 已經被清掉了;
   `fix` 需要 canonical payload,只能重新 ingest 該文件。清除的影響見
   [setup 的清除 PDF review artifacts](setup.md#清除-pdf-review-artifacts可能含-nda)。
 
 **升級注意**:舊安裝 `git pull` 之後,全域 `opencode.json` 可能還沒有
 `codetrail_review_figures: "ask"` 這個核准閘(新工具會被舊的 `codetrail_*: allow` wildcard
-直接放行)。`aicode` 每次啟動會自動補;不經 `aicode` 直接開 `opencode` 的話,先跑:
+直接放行)，也可能缺少 lessons instructions 或受管 `agent.build.prompt`。direct-tool
+相容閘通過後，`aicode` 會以 transaction 自動補缺值、尊重 custom prompt；不經
+`aicode` 直接開 `opencode` 的話，先跑：
 
 ```bash
 python3 <CODETRAIL_REPO>/scripts/opencode_contract_check.py --fix

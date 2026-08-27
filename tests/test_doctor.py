@@ -589,3 +589,72 @@ def test_require_pymupdf4llm_verifies_without_real_package(monkeypatch):
 
     fake.__version__ = config.PYMUPDF4LLM_PIN
     assert config.require_pymupdf4llm() is fake
+
+
+def test_doctor_reports_only_current_fingerprint_implicit_lane(tmp_path):
+    cache_path = tmp_path / "canary.json"
+    current = "a" * 64
+    other = "b" * 64
+    doc.tool_call_canary.save_cached_implicit(
+        cache_path,
+        other,
+        doc.tool_call_canary.ImplicitStatus.SUBOPTIMAL,
+        now=1000.0,
+    )
+
+    unknown = doc.Result()
+    doc.report_cached_implicit_status(
+        unknown,
+        cache_path=cache_path,
+        fingerprint=current,
+        now=1001.0,
+        ttl_seconds=3600,
+    )
+    assert not unknown.warns
+    assert not unknown.passes
+
+    doc.tool_call_canary.save_cached_implicit(
+        cache_path,
+        current,
+        doc.tool_call_canary.ImplicitStatus.TIMEOUT,
+        now=1002.0,
+    )
+    matched = doc.Result()
+    doc.report_cached_implicit_status(
+        matched,
+        cache_path=cache_path,
+        fingerprint=current,
+        now=1003.0,
+        ttl_seconds=3600,
+    )
+    assert any("status=timeout" in message for message in matched.warns)
+
+
+def test_doctor_direct_contract_marks_known_incompatible_client_as_fail(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(doc.shutil, "which", lambda name: "/bin/opencode")
+    monkeypatch.setattr(
+        doc,
+        "load_live_contract_inputs",
+        lambda **kwargs: ("2.0.0", {"mcp": {"servers": {}}}),
+    )
+    result = doc.Result()
+    assert doc.check_opencode_direct_contract(result, str(tmp_path)) is None
+    assert any("direct-tool contract 不相容" in message for message in result.fails)
+
+
+def test_doctor_no_network_does_not_probe_current_canary_fingerprint(monkeypatch):
+    monkeypatch.setattr(
+        doc.tool_call_canary,
+        "fetch_main_server_props",
+        lambda env: (_ for _ in ()).throw(AssertionError("must not probe")),
+    )
+    result = doc.Result()
+    doc.check_tool_call_canary_diagnostic(
+        result,
+        direct_inputs=("1.18.21", {}, Path.cwd()),
+        no_network=True,
+    )
+    assert not result.fails
+    assert not result.warns

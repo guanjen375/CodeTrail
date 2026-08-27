@@ -566,6 +566,37 @@ def test_refuse_answer_reads_top_emb_score_not_retrieval_score():
     assert utils.should_refuse_answer("這個 spec 的預設值是什麼", strong_content) is False
 
 
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "question",
+    (
+        "The ingested synthetic specification does not define orbit_lock_epoch.",
+        "已匯入的合成規格沒有定義 orbit_lock_epoch。",
+    ),
+)
+def test_refuse_answer_rejects_explicitly_missing_identifier(question: str):
+    """Strong same-document retrieval must not prove an explicitly absent field."""
+    metadata = {
+        "has_ref": True,
+        "top_emb_score": config.WEAK_REF_THRESHOLD + 0.2,
+        "top_retrieval_score": 0.99,
+        "has_authoritative_chunk": True,
+        "retrieved_chunks": ["The synthetic specification defines unrelated router limits."],
+    }
+
+    assert utils.should_refuse_answer(question, metadata) is True
+
+    metadata["retrieved_chunks"] = [
+        "This specification intentionally says nothing about orbit_lock_epoch."
+    ]
+    assert utils.should_refuse_answer(question, metadata) is True
+
+    metadata["retrieved_chunks"] = [
+        "The synthetic specification explicitly defines orbit_lock_epoch."
+    ]
+    assert utils.should_refuse_answer(question, metadata) is False
+
+
 # ============================================================
 # 證據文本面：ctx 不得出現
 # ============================================================

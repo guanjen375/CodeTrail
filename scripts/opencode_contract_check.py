@@ -2,7 +2,7 @@
 """Check or repair the CodeTrail-managed contract fields in OpenCode config.
 
 舊安裝 ``git pull`` 之後,mcp_server 立刻暴露新工具、aicode 開始 render
-lessons 注入檔,但全域 opencode.json 還停在舊範本,產生兩個升級破口:
+lessons 注入檔,但全域 opencode.json 還停在舊範本,產生三個升級破口:
 
   1. permission 缺新工具的 ask 覆寫 → 舊的 ``codetrail_*: allow`` wildcard
      直接放行(OpenCode 是 last-matching-rule-wins)。``record_lesson`` 這類
@@ -10,6 +10,8 @@ lessons 注入檔,但全域 opencode.json 還停在舊範本,產生兩個升級�
      「沒有任何無審核的自動寫入路徑」。
   2. instructions 缺 ``.codetrail/lessons.md`` → lessons render 了也不會被
      OpenCode 載入,啟動輸出卻顯示「已注入」。
+  3. 已明確 opt-in 的 agent.build.prompt 若仍指向 CodeTrail 受管檔，該 artifact
+     必須跟 canonical 內容同步；未設定 prompt 時維持 OpenCode 現況。
 
 ``aicode`` 每次啟動用 ``--fix`` 呼叫這裡,比照 opencode_mcp_timeout_check:
 只在既有 mcp.codetrail 設定存在時動作(那是「這份 config 由 CodeTrail 管」
@@ -47,6 +49,14 @@ from scripts.opencode_mcp_timeout_check import (  # noqa: E402
     _read_config,
     _truthy,
     resolve_config_path,
+)
+from scripts.opencode_build_prompt import (  # noqa: E402
+    BUILD_PROMPT_DOC,
+    BuildPromptError,
+    apply_build_prompt_contract,
+    build_prompt_path,
+    build_prompt_reference,
+    extract_build_prompt,
 )
 
 SKIP_ENV = "AICODE_OPENCODE_CONTRACT_CHECK_SKIP"
@@ -378,17 +388,134 @@ def _write_config(path: Path, data: dict[str, Any]) -> tuple[Path, Path]:
     return target, backup
 
 
+def _contract_home(env: dict[str, str]) -> Path | None:
+    """Resolve the same home root used by set_config for its prompt artifact."""
+    raw = (env.get("HOME") or env.get("USERPROFILE") or "").strip()
+    if not raw:
+        return None
+    return Path(os.path.abspath(Path(raw).expanduser()))
+
+
+def _real_write_target(path: Path, *, must_exist: bool) -> Path:
+    """Resolve a write-through target without replacing a symlink itself."""
+    if path.is_symlink():
+        return path.resolve(strict=must_exist)
+    if must_exist and not path.exists():
+        raise FileNotFoundError(path)
+    return path
+
+
+def _read_prompt_artifact(path: Path) -> tuple[str | None, str | None]:
+    """Return ``(content, error)``; a missing/dangling target is simply absent."""
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except FileNotFoundError:
+        return None, None
+    except (OSError, UnicodeError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _write_contract_updates(
+    config_path: Path,
+    data: dict[str, Any],
+    *,
+    write_config: bool,
+    prompt_path: Path | None,
+    prompt_body: str,
+    write_prompt: bool,
+) -> tuple[tuple[Path, Path | None] | None, tuple[Path, Path | None] | None]:
+    """Atomically update the managed prompt and config, rolling both back.
+
+    The prompt is replaced first so a newly written config never points at an
+    absent artifact.  Existing symlinks are written through.  Prompt mode is
+    always 0644 and a rewritten OpenCode config is always owner-only (0600).
+    """
+    specs: list[tuple[str, Path, Path, str, int]] = []
+    if write_prompt:
+        assert prompt_path is not None
+        specs.append((
+            "prompt",
+            prompt_path,
+            _real_write_target(prompt_path, must_exist=False),
+            prompt_body,
+            0o644,
+        ))
+    if write_config:
+        specs.append((
+            "config",
+            config_path,
+            _real_write_target(config_path, must_exist=True),
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            0o600,
+        ))
+
+    staged: list[tuple[str, Path, Path, Path]] = []
+    try:
+        for kind, logical, real, content, mode in specs:
+            real.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{real.name}.codetrail-", suffix=".tmp", dir=real.parent
+            )
+            temp = Path(temp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(temp, mode)
+            except BaseException:
+                temp.unlink(missing_ok=True)
+                raise
+            staged.append((kind, logical, real, temp))
+    except BaseException:
+        for _kind, _logical, _real, temp in staged:
+            temp.unlink(missing_ok=True)
+        raise
+
+    backups: dict[str, Path | None] = {}
+    replaced: list[tuple[str, Path]] = []
+    try:
+        for kind, _logical, real, _temp in staged:
+            backup = None
+            if real.exists():
+                backup = _next_backup_path(real)
+                shutil.copy2(real, backup)
+            backups[kind] = backup
+        for kind, _logical, real, temp in staged:
+            os.replace(temp, real)
+            replaced.append((kind, real))
+    except BaseException:
+        for kind, real in reversed(replaced):
+            backup = backups.get(kind)
+            if backup is None:
+                real.unlink(missing_ok=True)
+            else:
+                shutil.copy2(backup, real)
+        for _kind, _logical, _real, temp in staged:
+            temp.unlink(missing_ok=True)
+        for backup in backups.values():
+            if backup is not None:
+                backup.unlink(missing_ok=True)
+        raise
+
+    outcomes: dict[str, tuple[Path, Path | None]] = {
+        kind: (real, backups.get(kind))
+        for kind, _logical, real, _temp in staged
+    }
+    return outcomes.get("config"), outcomes.get("prompt")
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Check or repair CodeTrail ask-gates and lessons instructions "
-        "in OpenCode config."
+        description="Check or repair CodeTrail ask-gates, lessons instructions, "
+        "and an explicitly configured managed build prompt in OpenCode config."
     )
     parser.add_argument(
         "--fix",
         action="store_true",
-        help="atomically add missing ask-gate permissions and the lessons "
-        "instructions entry (backup kept); also installs the global AGENTS.md "
-        "when it is absent",
+        help="atomically add missing ask-gate permissions and lessons instructions, "
+        "and sync an existing managed build prompt (backups kept); also installs the global "
+        "AGENTS.md when it is absent",
     )
     parser.add_argument(
         "--sync-agents-md",
@@ -406,7 +533,8 @@ def main(argv: list[str] | None = None) -> int:
         _print(f"skipped via {SKIP_ENV}=1")
         return 0
 
-    path = resolve_config_path(dict(os.environ))
+    env = dict(os.environ)
+    path = resolve_config_path(env)
     if path is None:
         _print("UNKNOWN: 無法定位 opencode.json,跳過檢查")
         return 0
@@ -429,34 +557,137 @@ def main(argv: list[str] | None = None) -> int:
         return agents_rc
 
     changes, warnings, errors = apply_contract(data)
+
+    agent_value = data.get("agent")
+    prompt_contract_relevant = False
+    if "agent" in data:
+        if not isinstance(agent_value, dict):
+            prompt_contract_relevant = True
+        elif "build" in agent_value:
+            build_value = agent_value.get("build")
+            prompt_contract_relevant = (
+                not isinstance(build_value, dict) or "prompt" in build_value
+            )
+
+    home = _contract_home(env)
+    prompt_target: Path | None = None
+    prompt_reference: str | None = None
+    if home is None and prompt_contract_relevant:
+        errors.append(
+            "HOME/USERPROFILE is required to locate the managed OpenCode build prompt"
+        )
+    elif home is not None:
+        prompt_target = build_prompt_path(home)
+        try:
+            prompt_reference = build_prompt_reference(prompt_target)
+        except ValueError as exc:
+            errors.append(str(exc))
+
+    if prompt_reference is not None:
+        prompt_config_changes, prompt_warnings, prompt_errors = (
+            apply_build_prompt_contract(
+                data, prompt_reference, install_if_missing=False
+            )
+        )
+        changes.extend(prompt_config_changes)
+        warnings.extend(prompt_warnings)
+        errors.extend(prompt_errors)
+
     for warning in warnings:
         _print(f"⚠ {warning}")
     if errors:
         for item in errors:
             _print(f"INVALID: {item} ({path})")
-        _print("           自動修復不重建型別壞掉的欄位;請手動修正,或重跑 ./set_config.sh")
-        _print("           (會整組重建並備份原檔)。")
+        _print("           自動修復不猜測型別壞掉的欄位;請手動修正後重跑。")
+        if any(item.startswith("agent") for item in errors):
+            _print(
+                "           agent.build.prompt 請刪除壞值以採用 OpenCode 現況,"
+                "或改成你要保留的 string。"
+            )
         return 2
-    if not changes:
-        _print(f"SAFE: ask 核准閘與 lessons instructions 都已就緒 ({path})")
+
+    agent = data.get("agent")
+    build = agent.get("build") if isinstance(agent, dict) else None
+    configured_prompt = build.get("prompt") if isinstance(build, dict) else None
+    manages_prompt = (
+        prompt_reference is not None and configured_prompt == prompt_reference
+    )
+
+    prompt_body = ""
+    prompt_artifact_changes: list[str] = []
+    if manages_prompt:
+        assert prompt_target is not None
+        try:
+            prompt_body = extract_build_prompt(
+                BUILD_PROMPT_DOC.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, BuildPromptError) as exc:
+            _print(
+                "INVALID: CodeTrail build prompt 範本無法載入或驗證:"
+                f"{type(exc).__name__}: {exc}"
+            )
+            return 2
+        live_prompt, prompt_error = _read_prompt_artifact(prompt_target)
+        if prompt_error:
+            _print(f"INVALID: {prompt_target}: {prompt_error}")
+            return 2
+        if live_prompt is None:
+            prompt_artifact_changes.append(
+                f"建立 managed build prompt 檔案 {prompt_target}"
+            )
+        elif live_prompt != prompt_body:
+            prompt_artifact_changes.append(
+                f"更新 managed build prompt 檔案 {prompt_target}"
+            )
+
+    if not changes and not prompt_artifact_changes:
+        if manages_prompt:
+            suffix = ""
+        elif configured_prompt is None:
+            suffix = "；build prompt 未 opt-in，維持 OpenCode 現況"
+        else:
+            suffix = "；使用者自訂 build prompt 已保留"
+        _print(
+            "SAFE: ask 核准閘、lessons instructions 與 build prompt opt-in 契約都已就緒"
+            f"{suffix} ({path})"
+        )
         return 0
 
     if not args.fix:
         for item in changes:
+            _print(f"MISSING: {item}")
+        for item in prompt_artifact_changes:
             _print(f"MISSING: {item}")
         _print("           執行本腳本 --fix 自動補上(有備份),或重跑 ./set_config.sh。")
         _print(f"           緊急跳過(不建議): {SKIP_ENV}=1 aicode")
         return 2
 
     try:
-        target, backup = _write_config(path, data)
-    except OSError as exc:
+        config_outcome, prompt_outcome = _write_contract_updates(
+            path,
+            data,
+            write_config=bool(changes),
+            prompt_path=prompt_target,
+            prompt_body=prompt_body,
+            write_prompt=bool(prompt_artifact_changes),
+        )
+    except (OSError, RuntimeError) as exc:
         _print(f"FIX_FAILED: {path}: {type(exc).__name__}: {exc}")
         return 2
     for item in changes:
         _print(f"FIXED: {item}")
-    _print(f"       目標: {target}")
-    _print(f"       原設定備份: {backup}")
+    for item in prompt_artifact_changes:
+        _print(f"FIXED: {item}")
+    if prompt_outcome is not None:
+        prompt_written, prompt_backup = prompt_outcome
+        _print(f"       build prompt 目標: {prompt_written} (mode 0644)")
+        if prompt_backup is not None:
+            _print(f"       原 build prompt 備份: {prompt_backup}")
+    if config_outcome is not None:
+        target, backup = config_outcome
+        _print(f"       config 目標: {target} (mode 0600)")
+        if backup is not None:
+            _print(f"       原設定備份: {backup}")
     return 0
 
 

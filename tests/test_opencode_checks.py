@@ -7,12 +7,14 @@ tests/test_opencode_mcp_timeout_check.py(2026-08-20):同一份設定檔、同一
 from __future__ import annotations
 
 import json
+import re
 import stat
 from pathlib import Path
 
 import pytest
 
 from scripts import opencode_contract_check as check
+from scripts import opencode_build_prompt as build_prompt
 from scripts import opencode_ctx_check as occ
 from scripts import opencode_mcp_timeout_check as timeout_check
 from scripts import set_config as sc
@@ -33,6 +35,9 @@ def _legacy_config(**overrides) -> dict:
         "model": "llamacpp/mymodel",
         "mcp": {"codetrail": {"type": "local", "enabled": True, "timeout": 660000}},
         "permission": dict(LEGACY_PERMISSION),
+        # 舊 contract 測試專注 ask/instructions；明確 custom 值可證明新檢查不覆寫，
+        # 也避免這批既有案例在測試用 HOME 之外建立 managed prompt artifact。
+        "agent": {"build": {"prompt": "existing custom build prompt"}},
     }
     config.update(overrides)
     return config
@@ -212,6 +217,212 @@ def test_fix_keeps_config_symlink(monkeypatch, tmp_path):
     assert link.is_symlink()
     updated = json.loads(target.read_text(encoding="utf-8"))
     assert updated["permission"]["codetrail_record_lesson"] == "ask"
+
+
+# --------------------------------------------------------------------------
+# CodeTrail-managed OpenCode build prompt: bounded body, custom-value policy,
+# replacement semantics, and two-file repair transaction.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.smoke
+def test_build_prompt_never_teaches_denied_tools():
+    body = build_prompt.extract_build_prompt(
+        build_prompt.BUILD_PROMPT_DOC.read_text(encoding="utf-8")
+    )
+    assert len(body) <= build_prompt.BUILD_PROMPT_MAX_CHARS
+    schema_masked = re.sub(r"\bcodetrail_[a-z0-9_]+\b", "", body, flags=re.I)
+    for bare_name in ("bash", "read", "grep", "glob", "edit", "task"):
+        assert re.search(rf"\b{bare_name}\b", schema_masked, flags=re.I) is None
+    for required in (
+        "Keep answers concise",
+        "in parallel",
+        "before changing anything",
+        "cannot be verified",
+    ):
+        assert required in body
+
+    # The guard masks real CodeTrail schema names before checking bare names.
+    sample = "# Candidate\n\n```markdown\nUse `codetrail_read_file`.\n```\n"
+    assert "codetrail_read_file" in build_prompt.extract_build_prompt(sample)
+
+
+def test_build_prompt_merge_installs_updates_and_preserves_custom_values(tmp_path):
+    current = build_prompt.build_prompt_reference(
+        build_prompt.build_prompt_path(tmp_path / "new-home")
+    )
+
+    missing: dict = {"theme": "dark"}
+    changes, warnings, errors = build_prompt.apply_build_prompt_contract(missing, current)
+    assert changes and not warnings and not errors
+    assert missing["agent"]["build"]["prompt"] == current
+
+    gated_missing: dict = {"theme": "dark"}
+    changes, warnings, errors = build_prompt.apply_build_prompt_contract(
+        gated_missing, current, install_if_missing=False
+    )
+    assert not changes and not warnings and not errors
+    assert gated_missing == {"theme": "dark"}
+
+    old = build_prompt.build_prompt_reference(
+        build_prompt.build_prompt_path(tmp_path / "old-home")
+    )
+    managed = {"agent": {"build": {"prompt": old}}, "theme": "dark"}
+    changes, warnings, errors = build_prompt.apply_build_prompt_contract(managed, current)
+    assert changes and not warnings and not errors
+    assert managed["agent"]["build"]["prompt"] == current
+    assert managed["theme"] == "dark"
+
+    custom = {"agent": {"build": {"prompt": "My custom instructions"}}}
+    changes, warnings, errors = build_prompt.apply_build_prompt_contract(custom, current)
+    assert not changes and warnings and not errors
+    assert custom["agent"]["build"]["prompt"] == "My custom instructions"
+
+    for broken in (
+        {"agent": []},
+        {"agent": {"build": []}},
+        {"agent": {"build": {"prompt": ["wrong"]}}},
+    ):
+        before = json.loads(json.dumps(broken))
+        changes, warnings, errors = build_prompt.apply_build_prompt_contract(broken, current)
+        assert not changes and not warnings and errors
+        assert broken == before
+
+
+def test_synthetic_request_log_has_replacement_not_default_append():
+    """An external OpenCode capture, not code under test, proves composition."""
+    fixture = Path(__file__).with_name("fixtures") / "opencode_build_request_1_18_21.json"
+    evidence = json.loads(fixture.read_text(encoding="utf-8"))
+
+    assert evidence["format"] == "codetrail.opencode-build-request-evidence/v1"
+    assert evidence["capture"]["client_version"] == "1.18.21"
+    assert evidence["source_contract"]["tag"] == "v1.18.23"
+    assert evidence["request"]["roles"] == ["system", "user"]
+
+    configured = evidence["configuration"]["agent_build_prompt"]
+    captured_system = evidence["request"]["system"]
+    composition = evidence["source_contract"]["request_composition_excerpt"]
+    default_sentinel = evidence["source_contract"]["default_prompt_sentinel"]
+    assert "input.agent.prompt ? [input.agent.prompt]" in composition
+    assert "SystemPrompt.provider(input.model)" in composition
+    assert captured_system.splitlines()[0] == configured
+    assert "Here is some useful information about the environment" in captured_system
+    assert default_sentinel not in captured_system
+
+
+def test_synthetic_composition_does_not_change_todowrite_policy():
+    """Composition evidence is not the authorised routing A/B gate."""
+    assert sc._OPENCODE_PERMISSION_TEMPLATE["todowrite"] == "allow"
+
+
+def _safe_build_prompt_config() -> dict:
+    permission = dict(LEGACY_PERMISSION)
+    for tool in check.REQUIRED_ASK_TOOLS:
+        permission[tool] = "ask"
+    config = _legacy_config(
+        permission=permission,
+        instructions=[check.LESSONS_INSTRUCTION],
+    )
+    config.pop("agent")
+    return config
+
+
+def _setup_build_prompt_check(monkeypatch, home: Path, config_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    monkeypatch.delenv(check.SKIP_ENV, raising=False)
+    monkeypatch.setenv(check.AGENTS_MD_SKIP_ENV, "1")
+
+
+def test_contract_fix_does_not_install_unmeasured_prompt_by_default(
+    monkeypatch, tmp_path, capsys
+):
+    home = tmp_path / "home"
+    config_path = home / ".config/opencode/opencode.json"
+    config_path.parent.mkdir(parents=True)
+    original = _safe_build_prompt_config()
+    _write(config_path, original)
+    config_path.chmod(0o644)
+    _setup_build_prompt_check(monkeypatch, home, config_path)
+
+    before = config_path.read_bytes()
+    assert check.main([]) == 0
+    assert not build_prompt.build_prompt_path(home).exists()
+    capsys.readouterr()
+    assert check.main(["--fix"]) == 0
+    assert config_path.read_bytes() == before
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o644
+    assert not build_prompt.build_prompt_path(home).exists()
+    assert not config_path.with_name(config_path.name + check.BACKUP_SUFFIX).exists()
+    assert "opt-in" in capsys.readouterr().out
+
+
+def test_contract_check_preserves_custom_build_prompt(monkeypatch, tmp_path, capsys):
+    home = tmp_path / "home"
+    config_path = home / ".config/opencode/opencode.json"
+    config_path.parent.mkdir(parents=True)
+    config = _safe_build_prompt_config()
+    config["agent"] = {"build": {"prompt": "Custom prompt owned by user"}}
+    _write(config_path, config)
+    before = config_path.read_bytes()
+    _setup_build_prompt_check(monkeypatch, home, config_path)
+
+    assert check.main(["--fix"]) == 0
+    assert "user-customised" in capsys.readouterr().out
+    assert config_path.read_bytes() == before
+    assert not build_prompt.build_prompt_path(home).exists()
+    assert not config_path.with_name(config_path.name + check.BACKUP_SUFFIX).exists()
+
+
+def test_contract_prompt_symlink_is_written_through_with_0644(
+    monkeypatch, tmp_path, capsys
+):
+    home = tmp_path / "home"
+    config_path = home / ".config/opencode/opencode.json"
+    config_path.parent.mkdir(parents=True)
+    prompt_path = build_prompt.build_prompt_path(home)
+    prompt_path.parent.mkdir(parents=True)
+    real_prompt = tmp_path / "dotfiles" / "prompt.md"
+    real_prompt.parent.mkdir()
+    real_prompt.write_text("stale\n", encoding="utf-8")
+    real_prompt.chmod(0o600)
+    prompt_path.symlink_to(real_prompt)
+
+    config = _safe_build_prompt_config()
+    config["agent"] = {"build": {
+        "prompt": build_prompt.build_prompt_reference(prompt_path),
+    }}
+    _write(config_path, config)
+    config_path.chmod(0o600)
+    config_before = config_path.read_bytes()
+    _setup_build_prompt_check(monkeypatch, home, config_path)
+
+    assert check.main(["--fix"]) == 0
+    assert prompt_path.is_symlink()
+    assert real_prompt.read_text(encoding="utf-8") == build_prompt.extract_build_prompt(
+        build_prompt.BUILD_PROMPT_DOC.read_text(encoding="utf-8")
+    )
+    assert stat.S_IMODE(real_prompt.stat().st_mode) == 0o644
+    assert config_path.read_bytes() == config_before
+    assert "build prompt" in capsys.readouterr().out
+
+
+def test_contract_wrong_prompt_type_is_fail_loud_and_non_mutating(
+    monkeypatch, tmp_path, capsys
+):
+    home = tmp_path / "home"
+    config_path = home / ".config/opencode/opencode.json"
+    config_path.parent.mkdir(parents=True)
+    config = _safe_build_prompt_config()
+    config["agent"] = {"build": {"prompt": ["wrong"]}}
+    _write(config_path, config)
+    before = config_path.read_bytes()
+    _setup_build_prompt_check(monkeypatch, home, config_path)
+
+    assert check.main(["--fix"]) == 2
+    assert "agent.build.prompt" in capsys.readouterr().out
+    assert config_path.read_bytes() == before
+    assert not build_prompt.build_prompt_path(home).exists()
 
 
 # --------------------------------------------------------------------------

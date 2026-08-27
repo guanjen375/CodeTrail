@@ -55,6 +55,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from deployment_profile import _BUILTIN_DEFAULTS  # noqa: E402
+from mcp_contract import PUBLIC_TOOL_ORDER  # noqa: E402
 
 
 def _read(path: Path) -> str:
@@ -713,7 +714,9 @@ def _check_run_command_timeout_contract(
     annotation, default_src = _tool_arg_signature(mcp_text, "run_command", "timeout")
     artifact = "mcp_server.run_command signature"
     expected_annotation = (
-        "Annotated[int, Field(strict=True, ge=RUN_COMMAND_TIMEOUT_MIN, le=RUN_COMMAND_TIMEOUT_MAX)]"
+        "Annotated[int, Field(strict=True, ge=RUN_COMMAND_TIMEOUT_MIN, "
+        "le=RUN_COMMAND_TIMEOUT_MAX, description='Server timeout in seconds; strict integer "
+        "1..600; client may stop earlier.')]"
     )
     if annotation != expected_annotation:
         issues.append(_issue(artifact, f"timeout annotation {expected_annotation}", repr(annotation)))
@@ -814,8 +817,17 @@ def check_all() -> list[str]:
     security_text = _read(SECURITY_DOC)
     troubleshooting_text = _read(TROUBLESHOOTING_DOC)
 
-    # 1. tool count
-    mcp_tools = _mcp_tool_names(mcp_text)
+    # 1. tool count and shared public catalog. Definitions need not be in
+    # registration order: mcp_server queues them and consumes this constant.
+    defined_tools = _mcp_tool_names(mcp_text)
+    missing_runtime = sorted(set(PUBLIC_TOOL_ORDER) - set(defined_tools))
+    extra_runtime = sorted(set(defined_tools) - set(PUBLIC_TOOL_ORDER))
+    if missing_runtime or extra_runtime:
+        issues.append(
+            "mcp_server.py 與 mcp_contract.PUBLIC_TOOL_ORDER 不一致: "
+            f"missing={missing_runtime} extra={extra_runtime}"
+        )
+    mcp_tools = list(PUBLIC_TOOL_ORDER)
     claimed = _readme_claimed_tool_count(docs_text)
     if claimed is None:
         issues.append("文件沒寫「N 個 MCP 工具」/「暴露的 N 個工具」字樣 — 剛接觸專案者會不知道要連幾個")

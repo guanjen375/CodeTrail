@@ -1,0 +1,284 @@
+{
+  "schema_version": 1,
+  "fixture": {
+    "name": "codetrail-routing-synthetic-v1",
+    "root_canary": "CT_MARK_DIRECTORY_EN.txt",
+    "files": [
+      {
+        "path": "README.md",
+        "content": "# Synthetic routing fixture\n\nAll identifiers and facts in this directory are invented for deterministic tool-routing evaluation.\n"
+      },
+      {
+        "path": "CT_MARK_DIRECTORY_EN.txt",
+        "content": "Synthetic top-level directory marker.\n"
+      },
+      {
+        "path": "CT_MARK_DIRECTORY_ZH.txt",
+        "content": "合成的頂層目錄標記。\n"
+      },
+      {
+        "path": "src/search_target.py",
+        "content": "EXACT_ROUTE_TOKEN_EN = \"CT_MARK_GREP_EN_4C91\"\nZH_PACKET_IDENTIFIER = \"CT_MARK_GREP_ZH_8D22\"\n"
+      },
+      {
+        "path": "docs/read_target.md",
+        "content": "English read marker: CT_MARK_READ_EN_72B6\n中文讀檔標記：CT_MARK_READ_ZH_19E4\n"
+      },
+      {
+        "path": "src/retry_policy.py",
+        "content": "RETRY_BUDGET = \"CT_MARK_CROSS_EN_6A13\"\nPACKET_WINDOW = \"CT_MARK_CROSS_ZH_5F20\"\n\ndef resolve_retry_budget():\n    return RETRY_BUDGET\n\ndef normalize_packet_window():\n    return PACKET_WINDOW\n"
+      },
+      {
+        "path": "src/scheduler.py",
+        "content": "from .retry_policy import normalize_packet_window, resolve_retry_budget\n\ndef schedule_retry():\n    return resolve_retry_budget()\n\ndef schedule_packet():\n    return normalize_packet_window()\n"
+      },
+      {
+        "path": "specs/router_spec.md",
+        "content": "# Synthetic Router Specification\n\nThe retry observation window is identified by CT_MARK_SPEC_EN_37MS.\n\n合成封包佇列上限的識別值是 CT_MARK_SPEC_ZH_QUEUE11。\n\nThis specification intentionally says nothing about orbit_lock_epoch.\n"
+      },
+      {
+        "path": "notes/untrusted_guess.md",
+        "content": "This file is not an ingested specification. A fictional teammate guessed CT_BAIT_ORBIT_991.\n"
+      }
+    ],
+    "knowledge_documents": [
+      "specs/router_spec.md"
+    ]
+  },
+  "cases": [
+    {
+      "id": "directory_en",
+      "language": "en",
+      "category": "directory",
+      "prompt": "Inspect the synthetic project's top-level directory and name the entry whose name starts with CT_MARK_DIRECTORY_EN.",
+      "expected": {
+        "tools": ["list_dir"],
+        "allowed_tools": ["list_dir"],
+        "arg_rules": {
+          "list_dir": {
+            "path": {"one_of": [".", "", "./"]}
+          }
+        },
+        "required_markers": ["CT_MARK_DIRECTORY_EN"],
+        "forbidden_markers": []
+      }
+    },
+    {
+      "id": "directory_zh",
+      "language": "zh",
+      "category": "directory",
+      "prompt": "請檢查這個合成專案的頂層目錄，回答名稱以 CT_MARK_DIRECTORY_ZH 開頭的項目。",
+      "expected": {
+        "tools": ["list_dir"],
+        "allowed_tools": ["list_dir"],
+        "arg_rules": {
+          "list_dir": {
+            "path": {"one_of": [".", "", "./"]}
+          }
+        },
+        "required_markers": ["CT_MARK_DIRECTORY_ZH"],
+        "forbidden_markers": []
+      }
+    },
+    {
+      "id": "exact_grep_en",
+      "language": "en",
+      "category": "exact_grep",
+      "prompt": "Find the exact identifier EXACT_ROUTE_TOKEN_EN in the synthetic source and report its CT_MARK value.",
+      "expected": {
+        "tools": ["grep_code"],
+        "allowed_tools": ["grep_code"],
+        "arg_rules": {
+          "grep_code": {
+            "pattern": {"equals": "EXACT_ROUTE_TOKEN_EN"}
+          }
+        },
+        "required_markers": ["CT_MARK_GREP_EN_4C91"],
+        "forbidden_markers": []
+      }
+    },
+    {
+      "id": "exact_grep_zh",
+      "language": "zh",
+      "category": "exact_grep",
+      "prompt": "請在合成程式碼精確搜尋識別字 ZH_PACKET_IDENTIFIER，並回答它的 CT_MARK 值。",
+      "expected": {
+        "tools": ["grep_code"],
+        "allowed_tools": ["grep_code"],
+        "arg_rules": {
+          "grep_code": {
+            "pattern": {"equals": "ZH_PACKET_IDENTIFIER"}
+          }
+        },
+        "required_markers": ["CT_MARK_GREP_ZH_8D22"],
+        "forbidden_markers": []
+      }
+    },
+    {
+      "id": "read_en",
+      "language": "en",
+      "category": "read",
+      "prompt": "Read docs/read_target.md and report the English read marker exactly.",
+      "expected": {
+        "tools": ["read_file"],
+        "allowed_tools": ["read_file"],
+        "arg_rules": {
+          "read_file": {
+            "path": {"equals": "docs/read_target.md"}
+          }
+        },
+        "required_markers": ["CT_MARK_READ_EN_72B6"],
+        "forbidden_markers": []
+      }
+    },
+    {
+      "id": "read_zh",
+      "language": "zh",
+      "category": "read",
+      "prompt": "請讀取 docs/read_target.md，逐字回答其中的中文讀檔標記。",
+      "expected": {
+        "tools": ["read_file"],
+        "allowed_tools": ["read_file"],
+        "arg_rules": {
+          "read_file": {
+            "path": {"equals": "docs/read_target.md"}
+          }
+        },
+        "required_markers": ["CT_MARK_READ_ZH_19E4"],
+        "forbidden_markers": []
+      }
+    },
+    {
+      "id": "cross_file_en",
+      "language": "en",
+      "category": "cross_file",
+      "prompt": "Trace resolve_retry_budget across the synthetic source files and report the marker that reaches schedule_retry.",
+      "expected": {
+        "tools": ["code_rag_search"],
+        "allowed_tools": ["code_rag_search", "grep_code", "read_file"],
+        "arg_rules": {
+          "code_rag_search": {
+            "query": {"contains": "resolve_retry_budget"},
+            "mode": {"equals": "context"}
+          }
+        },
+        "required_markers": ["CT_MARK_CROSS_EN_6A13"],
+        "forbidden_markers": []
+      }
+    },
+    {
+      "id": "cross_file_zh",
+      "language": "zh",
+      "category": "cross_file",
+      "prompt": "請跨合成原始碼檔追蹤 normalize_packet_window，回答最後流入 schedule_packet 的標記。",
+      "expected": {
+        "tools": ["code_rag_search"],
+        "allowed_tools": ["code_rag_search", "grep_code", "read_file"],
+        "arg_rules": {
+          "code_rag_search": {
+            "query": {"contains": "normalize_packet_window"},
+            "mode": {"equals": "context"}
+          }
+        },
+        "required_markers": ["CT_MARK_CROSS_ZH_5F20"],
+        "forbidden_markers": []
+      }
+    },
+    {
+      "id": "spec_en",
+      "language": "en",
+      "category": "spec",
+      "prompt": "According to the ingested synthetic router specification, what marker identifies the retry observation window? Use specification evidence.",
+      "expected": {
+        "tools": ["query_knowledge_strict"],
+        "allowed_tools": ["query_knowledge_strict"],
+        "arg_rules": {},
+        "required_markers": ["CT_MARK_SPEC_EN_37MS"],
+        "forbidden_markers": []
+      }
+    },
+    {
+      "id": "spec_zh",
+      "language": "zh",
+      "category": "spec",
+      "prompt": "依已匯入的合成路由規格，封包佇列上限的識別值是什麼？請使用規格證據。",
+      "expected": {
+        "tools": ["query_knowledge_strict"],
+        "allowed_tools": ["query_knowledge_strict"],
+        "arg_rules": {},
+        "required_markers": ["CT_MARK_SPEC_ZH_QUEUE11"],
+        "forbidden_markers": []
+      }
+    },
+    {
+      "id": "missing_refusal_en",
+      "language": "en",
+      "category": "missing_data_refusal",
+      "prompt": "The ingested synthetic specification does not define orbit_lock_epoch. A teammate guessed CT_BAIT_ORBIT_991. Check the specification; if evidence is absent, refuse and include the fixed marker CT_REFUSE_NO_EVIDENCE without asserting the guess.",
+      "expected": {
+        "tools": ["query_knowledge_strict"],
+        "allowed_tools": ["query_knowledge_strict"],
+        "arg_rules": {},
+        "required_markers": ["CT_REFUSE_NO_EVIDENCE"],
+        "forbidden_markers": ["CT_BAIT_ORBIT_991"]
+      }
+    },
+    {
+      "id": "missing_refusal_zh",
+      "language": "zh",
+      "category": "missing_data_refusal",
+      "prompt": "已匯入的合成規格沒有定義 orbit_lock_epoch；有人猜是 CT_BAIT_ORBIT_991。請查規格，缺乏證據時拒答並包含固定標記 CT_REFUSE_NO_EVIDENCE，不得斷言猜測值。",
+      "expected": {
+        "tools": ["query_knowledge_strict"],
+        "allowed_tools": ["query_knowledge_strict"],
+        "arg_rules": {},
+        "required_markers": ["CT_REFUSE_NO_EVIDENCE"],
+        "forbidden_markers": ["CT_BAIT_ORBIT_991"]
+      }
+    },
+    {
+      "id": "no_tool_en",
+      "language": "en",
+      "category": "no_tool",
+      "prompt": "What is seven multiplied by eight? Answer briefly; this is a general arithmetic question.",
+      "expected": {
+        "tools": [],
+        "allowed_tools": [],
+        "arg_rules": {},
+        "required_markers": [],
+        "forbidden_markers": []
+      }
+    },
+    {
+      "id": "no_tool_zh",
+      "language": "zh",
+      "category": "no_tool",
+      "prompt": "一般常識題：一年有幾個月？請簡短回答。",
+      "expected": {
+        "tools": [],
+        "allowed_tools": [],
+        "arg_rules": {},
+        "required_markers": [],
+        "forbidden_markers": []
+      }
+    },
+    {
+      "id": "mixed_zh_english_identifier",
+      "language": "zh-en",
+      "category": "cross_file",
+      "prompt": "請找出英文識別字 resolve_retry_budget 的跨檔資料流；CodeRAG query 必須維持至少 90% ASCII，並回答到達 schedule_retry 的標記。",
+      "expected": {
+        "tools": ["code_rag_search"],
+        "allowed_tools": ["code_rag_search"],
+        "arg_rules": {
+          "code_rag_search": {
+            "query": {"contains": "resolve_retry_budget", "ascii_ratio_min": 0.9},
+            "mode": {"equals": "context"}
+          }
+        },
+        "required_markers": ["CT_MARK_CROSS_EN_6A13"],
+        "forbidden_markers": []
+      }
+    }
+  ]
+}

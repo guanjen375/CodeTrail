@@ -8,6 +8,13 @@
 
 ## CodeTrail 暴露的 19 個 MCP 工具
 
+live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_code`、
+`code_rag_search`、`file_info`、`query_knowledge`、`query_knowledge_strict`、
+`git_status`、`git_diff`、`apply_patch`、`run_lint`、`run_command`、`analyze_file`、
+`ingest_document`、`remove_document`、`reload_knowledge_base`、`review_figures`、
+`import_external_file`、`record_lesson`。名稱與順序的唯一來源是
+`mcp_contract.PUBLIC_TOOL_ORDER`；文件、canary 與 eval 都讀同一份契約。
+
 你不用手動寫 JSON 或自己呼 API。這些工具會出現在 frontend 的 MCP 工具列表裡；日常用法是在對話中直接要求模型「用工具 `<工具名>` 做某件事」。多數情況只講工具名就夠了，模型會自己補預設參數；需要指定檔案、行號、搜尋範圍時，再把那些條件寫進自然語言。
 
 判斷有沒有真的執行,要看 frontend 的工具卡 / 回傳結果或結構化 `tool_use` event,不要看模型如何描述自己的工具清單。`/status` 的 Connected 只證明 MCP transport 已連線;模型輸出 `<codetrail_list_dir .../>` 之類純文字後自行宣稱成功,仍是假呼叫。完整診斷見 [Connected 但沒有實際 tool call](troubleshooting.md#mcp-connected-but-no-tool-call)。
@@ -18,7 +25,7 @@
 |---|---|---|
 | 先看 repo 長什麼樣 | 請用工具 `list_dir` 看專案結構，找 entry point、測試和設定檔。 | `list_dir(...)` |
 | 不知道程式在哪 | 請先用工具 `code_rag_search` 搜尋「初始化流程」，再用工具 `read_file` 讀最相關檔案。 | `code_rag_search(...)`、`read_file(...)` |
-| 想一次取得有限推導證據 | 請用工具 `code_rag_search`,mode 設 "context",query 寫要分析的問題,max_chars 設 12000；依 path:line 區分已證實和 uncertainty。 | `code_rag_search(query="...", mode="context", max_chars=12000)` |
+| 想一次取得有限推導證據 | 請用工具 `code_rag_search`,mode 設 "context",query 寫要分析的問題；省略 max_chars 會依目前 n_ctx 配置結果預算。 | `code_rag_search(query="...", mode="context")` |
 | 想看呼叫鏈 | 請用工具 `code_rag_search`,mode 設 "path",query 寫 "main -> uart_send",把每一步的檔案與行號列出來。 | `code_rag_search(query="main -> uart_send", mode="path")` |
 | 找某個字串或錯誤訊息 | 請用工具 `grep_code` 搜尋錯誤訊息「panic: xxx」，範圍限 C/C++ 檔，並顯示上下文。 | `grep_code(...)` |
 | 讀一個已知檔案 | 請用工具 `file_info` 看 `src/main.py` 大小，再用工具 `read_file` 讀前 120 行。 | `file_info(...)`、`read_file(...)` |
@@ -42,10 +49,10 @@
 | 類型 | 工具 | 白話用途 |
 |---|---|---|
 | 專案探索 | `list_dir(path=".", depth=2)` | 看目錄樹，不要叫模型跑 `ls` |
-| 專案探索 | `code_rag_search(query, top_k=5, mode="semantic", hops=1, include_evidence=False, max_chars=12000)` | 依語意定位 symbol、建立 bounded evidence，或查 call/include graph；四種模式與保守解析契約見下節 |
+| 專案探索 | `code_rag_search(query, top_k=5, mode="semantic", hops=1, include_evidence=False, max_chars=None)` | 依語意定位 symbol、建立 bounded evidence，或查 call/include graph；省略 max_chars 時 transport 依 n_ctx 配置，四種模式與保守解析契約見下節 |
 | 專案探索 | `grep_code(pattern, path=".", include=None, context=0)` | 搜錯誤訊息、函式名、設定名；複雜 regex 會退回字面搜尋，並有 30 筆 match、單行 500 字元與整體 200,000 字元的硬上限，截斷會明示標記 |
 | 專案探索 | `file_info(path)` | 讀檔前先看大小，避免一次塞爆 context |
-| 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=50000)` | 讀檔案內容，長檔要分段 |
+| 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=None)` | 讀檔案內容；省略 max_chars 時依 n_ctx 配置，長檔依結果的精確 start_line 分段 |
 | 文件/外部檔案 | `import_external_file(path, dest_name=None)` | 把允許來源的外部檔案複製進 `.aicode_uploads/` |
 | 文件/外部檔案 | `analyze_file(path, view="summary", target="", limit=0)` | 用 VL 分析各類圖片、一次性抽 PDF 文字（不入 KB）、分析 ELF 或 firmware blob。ELF 預設給總覽；`view` 可切到 `symbols` / `disasm` / `dwarf` / `strings` / `sections` / `memmap` / `relocs` / `imports` / `dynamic` / `headers`，`target` 指定 symbol、0x 位址、regex 或 `key:value` 篩選，`limit` 控制筆數（上限 5000）；單次輸出上限 25,000 字元，截斷會指出該用哪個 view 縮小範圍。缺 pyelftools 時退回 readelf 文字解析並在報告開頭明列缺失能力；細節見[analyze_file 的 ELF 視角](#analyze_file-的-elf-視角) |
 | 文件/外部檔案 | `ingest_document(path, mode="auto", preflight_only=False, fresh=False)` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document`。PDF 的原生表格 / 向量文字 log 與純 raster 截圖、掃描頁、方塊圖都走結構化抽取；raster 會先分類為 table / terminal / diagram，再帶 canonical payload、證據與驗證狀態。任一條失敗都整份不入庫、KB 不變。`preflight_only=True` 只估成本、零寫入（僅 .pdf）。`fresh=True` 一步到位重建：清空既有 chunks、讓舊 embeddings cache 失效、只留這一份文件（同一次原子提交，失敗全回滾）。**不會為了 reset 去整批清除** `.codetrail/figures/`（ingest 本來就會寫入這一次的 run，提交後也可能依 retention 回收該文件沒被 KB 引用的舊 run — 那與 fresh 無關）。同一份文件再 ingest 時人工修正會沿用；但**被移出 KB 的其他文件之後重新 ingest 不會自動恢復人工確認**（revision 退回 1）。不可與 `preflight_only` 併用 |
@@ -69,7 +76,8 @@
   graph status 與最多 5 條一跳關係；預設維持精簡回傳。
 - `mode="context"`：先取 semantic seeds，再加入 confirmed 1-hop caller / callee /
   include 與相關 test / header / config / trace lexical evidence，去重後裝進固定字元 budget。
-  `max_chars` 合法範圍為 `2000..30000`，預設 `12000`；`used_chars` 只計
+  `max_chars` 合法範圍為 `2000..30000`；省略時 transport 依目前 `n_ctx` 的 12% 配置
+  結果預算（core Python API 仍保留歷史 12,000 字元行為）。`used_chars` 只計
   `evidence[].text`，不是 tokenizer token。candidate、graph traversal 與 character budget 的
   截斷會分開回報。歧義、unresolved 與 Python attribute-call heuristic 只進
   `uncertainties`，不算 confirmed。graph 缺席或損壞時，lexical（grep / index）候選仍會
@@ -113,6 +121,24 @@ python3 scripts/index_stats.py --root <AICODE_ROOT>
 [README_DEV 的索引範圍章節](../README_DEV.md#索引範圍-index-scope)。這份檔不得放進
 target repo，必須維持 owner-only 權限（POSIX `chmod 600`）；pattern 本身可能洩漏 NDA
 目錄結構。
+
+### 結果文字與預算契約
+
+OpenCode 只採用每次工具結果唯一的一個精簡文字 block。第一行固定是
+`status: ok|partial|error`；只有 partial、error 或截斷結果才在第二行給可操作的 `next:`。
+`read_file` 的 next 會給實際下一個 `start_line`，`grep_code`／`list_dir` 的 next 會要求縮小
+path、include、pattern 或 depth。錯誤的修復方式一定存在文字 block，不能只放在
+`structuredContent`。
+
+未明示 `max_chars` 時，結果 token 代理預算是目前 `n_ctx` 的 12%，估算固定為
+`ceil(ASCII 字元數 / 3) + ceil(非 ASCII 字元數 × 1.5)`。明示值仍受工具既有安全上限
+（`read_file` 50,000、`list_dir` 20,000、`code_rag_search` 30,000 字元）；高於 12% 預設
+預算時文字結果會標 `context_risk`。
+
+`code_rag_search`、`query_knowledge`、`query_knowledge_strict` 另外保留既有 core payload
+於 `structuredContent`，供會採用它的 MCP client 使用；文字 renderer 不重複輸出
+`text`／`display`／`refs` 三份同義內容。其他文字工具不宣告 `{"result": string}`
+outputSchema，避免同一 payload 被 SDK 重複序列化。
 
 ### PDF 圖片:結構化抽取與人工覆核
 

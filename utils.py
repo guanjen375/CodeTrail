@@ -555,6 +555,56 @@ def should_use_strict_mode(question: str, knowledge_ctx: str, kb_metadata: dict 
     return False
 
 
+_EXPLICIT_MISSING_IDENTIFIER_PATTERNS = (
+    re.compile(
+        r"\b(?:does not|doesn't|did not)\s+"
+        r"(?:define|document|mention|specify)\s+`?"
+        r"([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)`?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:沒有|未|沒)(?:明確)?(?:定義|規定|提到|記載|說明)\s*[`「『]?"
+        r"([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _explicitly_missing_identifier_lacks_evidence(
+    question: str,
+    kb_metadata: dict,
+) -> bool:
+    """Reject a claimed-absent field unless source text affirmatively defines it."""
+    identifiers = {
+        match.group(1).casefold()
+        for pattern in _EXPLICIT_MISSING_IDENTIFIER_PATTERNS
+        for match in pattern.finditer(question)
+    }
+    if not identifiers:
+        return False
+    chunks = kb_metadata.get("retrieved_chunks")
+    if not isinstance(chunks, list) or not all(isinstance(chunk, str) for chunk in chunks):
+        # Older callers without source text keep the score-based contract.
+        return False
+    evidence = "\n".join(chunks).casefold()
+    for identifier in identifiers:
+        if identifier not in evidence:
+            return True
+        escaped = re.escape(identifier)
+        negative_evidence = (
+            rf"\b(?:does not|doesn't|did not)\s+"
+            rf"(?:define|document|mention|specify)\s+`?{escaped}\b",
+            rf"\b(?:says?|states?)\s+(?:nothing|no information)\s+"
+            rf"(?:about|on)\s+`?{escaped}\b",
+            rf"(?:沒有|未|沒)(?:明確)?(?:定義|規定|提到|記載|說明)\s*"
+            rf"[`「『]?{escaped}\b",
+            rf"{escaped}\s*(?:沒有|未|沒)(?:被)?(?:定義|規定|提到|記載|說明)",
+        )
+        if any(re.search(pattern, evidence) for pattern in negative_evidence):
+            return True
+    return False
+
+
 def should_refuse_answer(question: str, kb_metadata: dict) -> bool:
     """
     判斷是否應該拒絕回答（REF 太弱且是 spec 問題）
@@ -579,6 +629,13 @@ def should_refuse_answer(question: str, kb_metadata: dict) -> bool:
 
     has_ref = kb_metadata.get("has_ref", False)
     if not has_ref:
+        return True
+
+    # A strong hit on the right document does not prove that a named field is
+    # present.  When the question explicitly says a snake_case identifier is
+    # undefined, require the retrieved source text itself to contain it before
+    # allowing the normal score/type gates to answer.
+    if _explicitly_missing_identifier_lacks_evidence(question, kb_metadata):
         return True
 
     # P0-5: 優先使用 embedding score（比 hybrid 更可靠）

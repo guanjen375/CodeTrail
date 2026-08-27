@@ -1,4 +1,4 @@
-"""set_config 的產出物:~/start.sh、deployment.json、opencode.json 合併、備份與 restore。
+"""set_config 的產出物、build prompt、opencode.json 合併、備份與 restore。
 
 從 tests/test_set_config.py 拆出(2026-08-20)。
 """
@@ -10,6 +10,10 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
+from scripts import opencode_build_prompt as build_prompt
+from scripts import set_config as set_config
 from tests._set_config_harness import (
     SCRIPT,
     TWO_GPUS,
@@ -22,7 +26,8 @@ from tests._set_config_harness import (
 )
 
 
-def test_yes_run_generates_all_artifacts(tmp_path):
+@pytest.mark.smoke
+def test_yes_run_keeps_unmeasured_build_prompt_out_of_default_artifacts(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_models(tmp_path)
     proc = run(tmp_path, *YES_TWO_GPU, "--models-dir", str(models))
@@ -69,6 +74,8 @@ def test_yes_run_generates_all_artifacts(tmp_path):
     assert mcp["timeout"] == 660000
     assert "mcp_server.py" in mcp["command"][2]
     assert opencode["permission"]["bash"] == "deny"
+    assert not build_prompt.build_prompt_path(home).exists()
+    assert "agent" not in opencode
 
     start = home / "start.sh"
     content = start.read_text(encoding="utf-8")
@@ -88,6 +95,35 @@ def test_yes_run_generates_all_artifacts(tmp_path):
     # 不再有容量預估字樣
     assert "容量預估" not in proc.stdout
     assert "建議配置" not in proc.stdout
+
+
+def test_experimental_build_prompt_requires_explicit_opt_in(tmp_path):
+    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = make_models(tmp_path)
+    proc = run(
+        tmp_path,
+        *YES_TWO_GPU,
+        "--enable-experimental-build-prompt",
+        "--no-preview",
+        "--models-dir",
+        str(models),
+    )
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    home = tmp_path / "home"
+    prompt_path = build_prompt.build_prompt_path(home)
+    prompt_body = build_prompt.extract_build_prompt(
+        build_prompt.BUILD_PROMPT_DOC.read_text(encoding="utf-8")
+    )
+    opencode = json.loads(
+        (home / ".config/opencode/opencode.json").read_text(encoding="utf-8")
+    )
+    assert prompt_path.read_text(encoding="utf-8") == prompt_body
+    assert stat.S_IMODE(prompt_path.stat().st_mode) == 0o644
+    assert opencode["agent"]["build"]["prompt"] == (
+        build_prompt.build_prompt_reference(prompt_path)
+    )
+    assert "不是 supported 預設" in proc.stdout
 
 def test_generated_start_sh_dry_run_pins_gpus_and_binds_loopback(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
@@ -212,10 +248,18 @@ def test_opencode_merge_preserves_user_config_and_respects_permission(tmp_path):
         },
         "mcp": {"other-server": {"type": "local", "command": ["echo"], "enabled": True}},
         "permission": {"*": "deny", "bash": "allow"},
+        "agent": {"build": {"prompt": "Keep my private build instructions."}},
     }
     (home / ".config/opencode/opencode.json").write_text(json.dumps(existing), encoding="utf-8")
 
-    proc = run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models))
+    proc = run(
+        tmp_path,
+        *YES_TWO_GPU,
+        "--enable-experimental-build-prompt",
+        "--no-preview",
+        "--models-dir",
+        str(models),
+    )
     assert proc.returncode == 0, proc.stderr
 
     merged = json.loads((home / ".config/opencode/opencode.json").read_text(encoding="utf-8"))
@@ -229,8 +273,39 @@ def test_opencode_merge_preserves_user_config_and_respects_permission(tmp_path):
     assert "codetrail" in merged["mcp"]
     assert merged["permission"]["bash"] == "allow"                     # 尊重使用者顯式設定…
     assert "已尊重你的設定" in proc.stdout                              # …但要警告
+    assert merged["agent"]["build"]["prompt"] == "Keep my private build instructions."
+    assert "user-customised" in proc.stdout
     assert "llamacpp" in merged["enabled_providers"]
     assert "openrouter" in merged["enabled_providers"]
+
+
+def test_opencode_build_prompt_wrong_type_aborts_before_transaction(tmp_path):
+    """agent/build/prompt 型別錯誤不得被重建，也不得留下半套 prompt artifact。"""
+    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = make_models(tmp_path)
+    home = tmp_path / "home"
+    opencode_path = home / ".config/opencode/opencode.json"
+    opencode_path.parent.mkdir(parents=True)
+    original = {
+        "theme": "keep-me",
+        "agent": {"build": {"prompt": ["not", "a", "string"]}},
+    }
+    opencode_path.write_text(json.dumps(original), encoding="utf-8")
+
+    proc = run(
+        tmp_path,
+        *YES_TWO_GPU,
+        "--enable-experimental-build-prompt",
+        "--no-preview",
+        "--models-dir",
+        str(models),
+    )
+
+    assert proc.returncode == 2
+    assert "agent.build.prompt" in proc.stderr
+    assert json.loads(opencode_path.read_text(encoding="utf-8")) == original
+    assert not build_prompt.build_prompt_path(home).exists()
+    assert not (home / ".config/codetrail/models.json").exists()
 
 def test_restore_last_backup_round_trips_whole_transaction(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
@@ -252,8 +327,53 @@ def test_restore_last_backup_round_trips_whole_transaction(tmp_path):
     assert restored == {"marker": "/old.gguf"}
     # …當時不存在的檔案被移除,不會殘留半套設定
     assert not (home / ".config/codetrail/deployment.json").exists()
+    assert not build_prompt.build_prompt_path(home).exists()
     assert not (home / ".config/opencode/opencode.json").exists()
     assert not (home / "start.sh").exists()
+
+
+def test_prompt_and_config_roll_back_as_one_transaction(monkeypatch, tmp_path):
+    """config replace 失敗時，已替換的 prompt 必須回到原內容與 mode。"""
+    home = tmp_path / "home"
+    prompt = build_prompt.build_prompt_path(home)
+    config = home / ".config/opencode/opencode.json"
+    prompt.parent.mkdir(parents=True)
+    config.parent.mkdir(parents=True)
+    prompt.write_text("old prompt\n", encoding="utf-8")
+    prompt.chmod(0o600)
+    config.write_text('{"old": true}\n', encoding="utf-8")
+    config.chmod(0o600)
+
+    real_replace = set_config.os.replace
+    calls = 0
+
+    def fail_second_replace(source, target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("synthetic config replace failure")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(set_config.os, "replace", fail_second_replace)
+    try:
+        set_config.commit_files(
+            [
+                (prompt, "new prompt\n", 0o644),
+                (config, '{"new": true}\n', 0o600),
+            ],
+            [],
+            False,
+            home=home,
+        )
+    except OSError as exc:
+        assert "synthetic config replace failure" in str(exc)
+    else:
+        raise AssertionError("synthetic replace failure was not propagated")
+
+    assert prompt.read_text(encoding="utf-8") == "old prompt\n"
+    assert stat.S_IMODE(prompt.stat().st_mode) == 0o600
+    assert config.read_text(encoding="utf-8") == '{"old": true}\n'
+    assert not (home / ".config/codetrail/setconfig-last-transaction.json").exists()
 
 def test_start_sh_pins_validated_llama_bin(tmp_path):
     """set_config 用 LLAMA_BIN 驗證旗標 → 產生的 start.sh 必須寫死同一顆 binary,
@@ -295,7 +415,7 @@ def test_rerun_has_no_carryover_current_answers_win(tmp_path):
     assert limit["context"] == 65536
 
 def test_symlinked_config_files_are_written_through(tmp_path):
-    """dotfiles 使用者的 opencode.json 是 symlink → 寫穿到目標,保留連結。"""
+    """dotfiles 的 config/prompt symlink 都寫穿到目標並保留連結。"""
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_models(tmp_path)
     home = tmp_path / "home"
@@ -303,15 +423,32 @@ def test_symlinked_config_files_are_written_through(tmp_path):
     dotfiles.mkdir()
     real = dotfiles / "opencode.json"
     real.write_text("{}", encoding="utf-8")
+    real_prompt = dotfiles / "opencode-build-prompt.md"
+    real_prompt.write_text("old managed prompt\n", encoding="utf-8")
     (home / ".config/opencode").mkdir(parents=True)
     (home / ".config/opencode/opencode.json").symlink_to(real)
+    (home / ".config/codetrail").mkdir(parents=True)
+    prompt_link = build_prompt.build_prompt_path(home)
+    prompt_link.symlink_to(real_prompt)
 
-    proc = run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models))
+    proc = run(
+        tmp_path,
+        *YES_TWO_GPU,
+        "--enable-experimental-build-prompt",
+        "--no-preview",
+        "--models-dir",
+        str(models),
+    )
     assert proc.returncode == 0, proc.stderr
     link = home / ".config/opencode/opencode.json"
     assert link.is_symlink()  # 連結還在,沒被換成一般檔
     merged = json.loads(real.read_text(encoding="utf-8"))
     assert merged["model"] == "llamacpp/big-chat-ud-q4-k-xl"  # 內容寫到目標
+    assert prompt_link.is_symlink()
+    assert real_prompt.read_text(encoding="utf-8") == build_prompt.extract_build_prompt(
+        build_prompt.BUILD_PROMPT_DOC.read_text(encoding="utf-8")
+    )
+    assert stat.S_IMODE(real_prompt.stat().st_mode) == 0o644
     assert "symlink" in proc.stdout
 
 def test_invalid_registry_entries_are_dropped_with_warning(tmp_path):
@@ -442,9 +579,35 @@ def test_opencode_json_written_owner_only_and_dry_run_redacts_api_keys(tmp_path)
     real = run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models))
     assert real.returncode == 0, real.stderr + real.stdout
     assert stat.S_IMODE(opencode_path.stat().st_mode) == 0o600
+    assert not build_prompt.build_prompt_path(home).exists()
     merged = json.loads(opencode_path.read_text(encoding="utf-8"))
     # 遮罩只影響顯示,實際寫入的金鑰原樣保留
     assert merged["provider"]["openrouter"]["options"]["apiKey"] == secret
+
+
+def test_transaction_staging_files_are_private_from_birth(monkeypatch, tmp_path):
+    """含憑證的 config 在 chmod 前也不得以 umask 決定的寬鬆 mode 存在。"""
+    creation_modes: list[int] = []
+    real_open = set_config.os.open
+
+    def capture_open(path, flags, mode=0o777, *, dir_fd=None):
+        creation_modes.append(mode)
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(set_config.os, "open", capture_open)
+    public = tmp_path / "prompt.md"
+    secret = tmp_path / "opencode.json"
+    set_config.commit_files(
+        [(public, "public\n", 0o644), (secret, '{"apiKey":"synthetic"}\n', 0o600)],
+        notes=[],
+        dry_run=False,
+    )
+
+    assert creation_modes == [0o600, 0o600]
+    assert stat.S_IMODE(public.stat().st_mode) == 0o644
+    assert stat.S_IMODE(secret.stat().st_mode) == 0o600
 
 def test_restart_subprocess_env_is_sanitized(monkeypatch):
     """[R] 自動重啟的 quit/start 子程序不得繼承泛用 SESSION/override env:

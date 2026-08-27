@@ -336,7 +336,8 @@ def apply_patch(diff: str, dry_run: bool = False) -> str:
 def run_command(
     cmd: str,
     timeout: Annotated[
-        int, Field(strict=True, ge=RUN_COMMAND_TIMEOUT_MIN, le=RUN_COMMAND_TIMEOUT_MAX)
+        int, Field(strict=True, ge=RUN_COMMAND_TIMEOUT_MIN, le=RUN_COMMAND_TIMEOUT_MAX,
+                   description='Server timeout in seconds; strict integer 1..600; client may stop earlier.')
     ] = RUN_COMMAND_TIMEOUT,
 ) -> str:
     """Run a whitelisted command (server-side timeout 1..600 s).
@@ -761,3 +762,129 @@ def test_prefix_negations_keeping_the_substring_are_reported(contract, surface, 
     issues = {"limits": _limits_issues, "timeout": _timeout_issues, "verification": _verification_issues}[contract](s)
     assert issues, f"只加否定前綴({after!r})仍應報 drift"
     assert all(issue.startswith(artifact) for issue in issues), issues
+
+
+# ---------------------------------------------------------------------------
+# Tool-routing integration:these assertions pin the user-facing surfaces to the
+# converged T1–T4 interfaces without weakening any historical consistency gate.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.smoke
+def test_public_tool_order_and_agents_manifest_are_exact_and_prompt_safe():
+    from mcp_contract import PUBLIC_TOOL_ORDER
+
+    mcp_doc = (REPO_ROOT / "docs/mcp-tools.md").read_text(encoding="utf-8")
+    agents_doc = (REPO_ROOT / "docs/opencode-agents-template.md").read_text(
+        encoding="utf-8"
+    )
+    order_sentence = "、".join(f"`{name}`" for name in PUBLIC_TOOL_ORDER)
+    assert order_sentence in mcp_doc.replace("\n", "")
+
+    install_blocks = re.findall(r"```markdown\n(.*?)\n```", agents_doc, re.DOTALL)
+    assert len(install_blocks) == 1
+    assert len(install_blocks[0]) <= 1_600
+    assert install_blocks[0].count("`codetrail_") <= 3
+    assert "codetrail_list_dir`、`codetrail_read_file" not in install_blocks[0]
+
+    manifest = agents_doc.split("## 文件用工具 manifest（不會安裝進 system prompt）", 1)[1]
+    listed = re.findall(r"`codetrail_([a-z0-9_]+)`", manifest)
+    assert listed == list(PUBLIC_TOOL_ORDER)
+
+
+@pytest.mark.smoke
+def test_result_budget_and_status_lane_docs_match_the_runtime_contract():
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    basic = (REPO_ROOT / "docs/basic-usage.md").read_text(encoding="utf-8")
+    troubleshooting = (REPO_ROOT / "docs/troubleshooting.md").read_text(
+        encoding="utf-8"
+    )
+    mcp_doc = (REPO_ROOT / "docs/mcp-tools.md").read_text(encoding="utf-8")
+    joined = "\n".join((readme, basic, troubleshooting, mcp_doc))
+
+    assert "status: ok|partial|error" in readme
+    assert "status: ok|partial|error" in basic
+    assert "status: ok|partial|error" in mcp_doc
+    assert "n_ctx" in joined and "12%" in joined and "context_risk" in joined
+    assert "call-time `config.N_CTX`" in (REPO_ROOT / "README_DEV.md").read_text(
+        encoding="utf-8"
+    )
+    assert not re.search(
+        r"max_chars[^\n]{0,100}(?:預設|default)[^\n]{0,20}(?:12000|12,000)",
+        "\n".join((readme, basic, troubleshooting)),
+        re.IGNORECASE,
+    )
+
+
+@pytest.mark.smoke
+def test_build_prompt_and_direct_canary_docs_keep_the_closed_world_boundaries():
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    basic = (REPO_ROOT / "docs/basic-usage.md").read_text(encoding="utf-8")
+    troubleshooting = (REPO_ROOT / "docs/troubleshooting.md").read_text(
+        encoding="utf-8"
+    )
+    security = (REPO_ROOT / "docs/security.md").read_text(encoding="utf-8")
+    developer = (REPO_ROOT / "README_DEV.md").read_text(encoding="utf-8")
+    user_docs = "\n".join((readme, basic, troubleshooting, security))
+
+    assert '"prompt": "{file:/home/<user>/.config/codetrail/opencode-build-prompt.md}"' in readme
+    assert '"todowrite": "allow"' in readme
+    assert "replacement semantics" in user_docs
+    assert "自訂" in user_docs and "transaction" in user_docs
+    assert "0644" in user_docs and "0600" in user_docs
+    assert ">=1.17.0,<2.0.0" in readme
+    assert ">=1.17.0,<2.0.0" in basic
+    assert ">=1.17.0,<2.0.0" in troubleshooting
+    assert ">=1.17.0,<2.0.0" in security
+    assert "mcp.servers" in user_docs and "codemode" in user_docs
+    assert "optimal|suboptimal|fail|timeout" in basic
+    assert "optimal|suboptimal|fail|timeout" in troubleshooting
+    assert "supports_tools=false" in readme
+    assert "schema 2" in developer
+
+
+@pytest.mark.smoke
+def test_routing_eval_docs_preserve_frozen_baseline_and_manual_support_status():
+    import json
+
+    developer = (REPO_ROOT / "README_DEV.md").read_text(encoding="utf-8")
+    matrix = json.loads(
+        (REPO_ROOT / "eval/fixtures/tool_routing/support_matrix.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert "--catalog-only" in developer
+    assert "--arm baseline --frozen-contract" in developer
+    assert "--catalog-source in-process" in developer
+    assert "manual_status_change_required=true" in developer
+    assert "不能把 `measured` 改寫成 `supported`" in developer
+    assert "`--arm` 只選擇／記錄 arm id" in developer
+    assert "`--arm` 不做 variant composition" in developer
+    assert "凍結 config/artifact digest" in developer
+    assert "selected_combo_v3_stop_on_evidence" in developer
+    assert "supported_arm=null" in developer
+    assert "runtime `todowrite` 維持 `allow`" in developer
+    assert len(matrix["arms"]) == 6
+    assert all(
+        re.fullmatch(r"[0-9a-f]{64}", arm["contract_digest"])
+        for arm in matrix["arms"].values()
+    )
+    assert matrix["rows"] and all(row["status"] == "measured" for row in matrix["rows"])
+    measured_arms = set(matrix["arms"]) - {"baseline"}
+    for row in matrix["rows"]:
+        assert row["baseline"]["routing"]["tool_needed"]["recall"] == 0.384615
+        assert row["decision"] == {
+            "supported_arm": None,
+            "build_prompt_default": False,
+            "todowrite_permission": "allow",
+            "reason": "No fully evaluated arm passed every support gate",
+        }
+        assert set(row["measurements"]) == measured_arms
+        assert all(
+            measurement["evaluation_scope"] == "full"
+            and measurement["support_gate_passed"] is False
+            for measurement in row["measurements"].values()
+        )
+        assert row["exploratory_candidates"]["selected_combo_v3_stop_on_evidence"][
+            "support_gate_passed"
+        ] is False

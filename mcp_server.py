@@ -14,6 +14,7 @@ ai_code MCP server — 把 KnowledgeBase / CodeRAG / agent_tools 包成 MCP tool
 import contextlib
 import functools
 import importlib.metadata
+import inspect
 import json
 import os
 import shlex
@@ -22,7 +23,7 @@ import sys
 import threading
 import io
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import Field
 
@@ -132,9 +133,17 @@ from scripts.required_model_servers_check import (
     run_checks as _run_required_model_checks,
 )
 import data_flywheel
+from mcp_contract import (
+    EVIDENCE_TOOL_NAMES,
+    MCP_INSTRUCTIONS,
+    MODEL_TOOL_DESCRIPTIONS,
+    PUBLIC_TOOL_ORDER,
+)
+from tool_result_adapter import adapt_tool_error, adapt_tool_result, resolve_result_budget
 
 try:
     from mcp.server.fastmcp import FastMCP
+    from mcp.types import ToolAnnotations
 except ImportError:
     _log(
         "[FATAL] 找不到 mcp 套件。請先安裝:\n"
@@ -304,9 +313,22 @@ def _record_kb_interaction(
         _log(f"[MCP] record_interaction 失敗 ({mode}): {type(e).__name__}: {e}")
 
 
-mcp = FastMCP("ai_code")
+mcp = FastMCP("ai_code", instructions=MCP_INSTRUCTIONS)
 
 _real_mcp_tool = mcp.tool
+_pending_tools: dict[str, tuple[object, tuple, dict]] = {}
+
+_RESULT_SAFETY_MAX_CHARS = {
+    "read_file": 50_000,
+    "list_dir": 20_000,
+    "code_rag_search": 30_000,
+}
+_DEFAULT_RESULT_SAFETY_MAX_CHARS = 200_000
+_READ_ONLY_TOOLS = frozenset({
+    "list_dir", "read_file", "grep_code", "code_rag_search", "file_info",
+    "query_knowledge", "query_knowledge_strict", "git_status", "git_diff",
+    "analyze_file",
+})
 
 # ---- 重複呼叫偵測(鬼打牆打斷)-------------------------------------------
 # 小模型會對同一組參數連續呼叫同一個查詢工具(觀察到 grep_code 連打六次,
@@ -347,7 +369,7 @@ def _tool(*d_args, **d_kwargs):
     """
     def decorator(fn):
         @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
+        def core_wrapper(*args, **kwargs):
             with contextlib.redirect_stdout(sys.stderr):
                 result = fn(*args, **kwargs)
             if fn.__name__ in _REPEAT_GUARDED_TOOLS and isinstance(result, str):
@@ -357,8 +379,71 @@ def _tool(*d_args, **d_kwargs):
                 if count >= _repeat_guard_mod.BANNER_THRESHOLD:
                     result = _repeat_guard_mod.banner(fn.__name__, count) + result
             return result
-        return _real_mcp_tool(*d_args, **d_kwargs)(wrapper)
+
+        @functools.wraps(fn)
+        def transport_wrapper(*args, **kwargs):
+            signature = inspect.signature(fn)
+            supplied = signature.bind_partial(*args, **kwargs).arguments
+            requested_max_chars = supplied.get("max_chars")
+            safety_max_chars = _RESULT_SAFETY_MAX_CHARS.get(
+                fn.__name__, _DEFAULT_RESULT_SAFETY_MAX_CHARS
+            )
+            budget = resolve_result_budget(
+                n_ctx=config.N_CTX,
+                requested_max_chars=requested_max_chars,
+                safety_max_chars=safety_max_chars,
+            )
+            call_kwargs = kwargs
+            if fn.__name__ in _RESULT_SAFETY_MAX_CHARS and requested_max_chars is None:
+                call_kwargs = dict(kwargs)
+                # FastMCP materialises omitted defaults as max_chars=None.  For
+                # code context, reserve part of the implicit result budget for
+                # graph/truncation metadata while keeping its 2,000-char floor.
+                call_kwargs["max_chars"] = (
+                    max(2_000, budget.char_limit * 3 // 4)
+                    if fn.__name__ == "code_rag_search"
+                    else budget.char_limit
+                )
+            try:
+                result = core_wrapper(*args, **call_kwargs)
+                return adapt_tool_result(fn.__name__, result, budget=budget)
+            except Exception as exc:
+                return adapt_tool_error(fn.__name__, exc, budget=budget)
+
+        name = fn.__name__
+        if name in _pending_tools:
+            raise RuntimeError(f"duplicate MCP tool registration: {name}")
+        register_kwargs = dict(d_kwargs)
+        register_kwargs.setdefault("description", MODEL_TOOL_DESCRIPTIONS[name])
+        read_only = name in _READ_ONLY_TOOLS
+        register_kwargs.setdefault(
+            "annotations",
+            ToolAnnotations(
+                readOnlyHint=read_only,
+                destructiveHint=not read_only,
+                idempotentHint=read_only,
+                openWorldHint=False,
+            ),
+        )
+        if name not in EVIDENCE_TOOL_NAMES:
+            register_kwargs.setdefault("structured_output", False)
+        _pending_tools[name] = (transport_wrapper, d_args, register_kwargs)
+        # Preserve direct/core calls and payloads. Test/runtime code that needs
+        # the historical decorated behavior can use `.fn`; the actual MCP
+        # registration adds the compact result adapter outside this layer.
+        fn.fn = core_wrapper
+        return fn
     return decorator
+
+
+def _register_public_tools() -> None:
+    missing = set(PUBLIC_TOOL_ORDER) - set(_pending_tools)
+    extra = set(_pending_tools) - set(PUBLIC_TOOL_ORDER)
+    if missing or extra:
+        raise RuntimeError(f"public MCP tool mismatch: missing={sorted(missing)} extra={sorted(extra)}")
+    for name in PUBLIC_TOOL_ORDER:
+        wrapper, args, kwargs = _pending_tools[name]
+        _real_mcp_tool(*args, **kwargs)(wrapper)
 
 
 def _figure_review_hint(excluded) -> str:
@@ -410,7 +495,10 @@ def _figure_review_hint(excluded) -> str:
 
 
 @_tool()
-def query_knowledge(question: str, source: Optional[str] = None) -> dict:
+def query_knowledge(
+    question: Annotated[str, Field(description="Natural-language question in English or Chinese.")],
+    source: Annotated[Optional[str], Field(description="Optional indexed document basename to restrict retrieval.")] = None,
+) -> dict:
     """Query the project knowledge base (PDF/spec/manual RAG).
 
     Use this when the user asks about specs, datasheets, manuals, or any
@@ -470,7 +558,10 @@ def query_knowledge(question: str, source: Optional[str] = None) -> dict:
 
 
 @_tool()
-def query_knowledge_strict(question: str, source: Optional[str] = None) -> dict:
+def query_knowledge_strict(
+    question: Annotated[str, Field(description="High-risk factual or numeric question requiring grounded refusal.")],
+    source: Annotated[Optional[str], Field(description="Optional indexed document basename to restrict retrieval.")] = None,
+) -> dict:
     """Strict-mode KB query: server-side LLM with refuse + 2-stage self-check.
 
     這是 server-side 嚴格模式(answer_with_self_check) — 把
@@ -723,9 +814,13 @@ def _slim_edge(edge: dict) -> dict:
 
 
 @_tool()
-def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
-                    hops: int = 1, include_evidence: bool = False,
-                    max_chars: Annotated[int, Field(ge=2000, le=30000)] = 12000
+def code_rag_search(
+                    query: Annotated[str, Field(description="Mostly-English intent, exact symbol/file, or 'SRC -> DST' according to mode.")],
+                    top_k: Annotated[int, Field(ge=1, le=50, description="Maximum semantic results before mode-specific caps; integer 1..50.")] = 5,
+                    mode: Annotated[Literal["semantic", "neighbors", "path", "context"], Field(description="Search operation: semantic, neighbors, path, or bounded context.")] = "semantic",
+                    hops: Annotated[int, Field(ge=1, le=2, description="Neighbor traversal depth; integer 1..2.")] = 1,
+                    include_evidence: Annotated[bool, Field(description="Include score components and graph relations in semantic results.")] = False,
+                    max_chars: Annotated[Optional[int], Field(ge=2000, le=30000, description="Optional context evidence character cap; integer 2000..30000; omitted uses 12% of n_ctx.")] = None,
                     ) -> list[dict]:
     """Find code locations, or traverse the code graph (calls/includes), inside AICODE_ROOT.
 
@@ -766,7 +861,7 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
                confidence / relations(graph 1-hop,≤5 條/筆)/ graph_status。
                預設 False = 回傳 shape 與既往完全一致。
         max_chars: context 模式 evidence text 的字元 budget，固定合法範圍
-               2000..30000，預設 12000；不代表 tokenizer token 數。
+               2000..30000；MCP 省略時依 n_ctx 12%，direct core 仍用 12000。
 
     Returns:
         mode="semantic":[{"path": str, "line": int, "symbol": str,
@@ -790,6 +885,10 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
         偵測變更做增量。context 不走 neighbors/path 的 8000-char response cap，
         只由自己的 max_chars 約束 evidence text。
     """
+    if max_chars is None:
+        # Direct/core callers retain the historical 12,000-character default;
+        # the registered transport wrapper injects the n_ctx-derived budget.
+        max_chars = 12_000
     if mode not in ("semantic", "neighbors", "path", "context"):
         raise ValueError(
             f"mode 必須是 semantic|neighbors|path|context,收到 {mode!r}"
@@ -1020,10 +1119,10 @@ def code_rag_search(query: str, top_k: int = 5, mode: str = "semantic",
 
 @_tool()
 def read_file(
-    path: str,
-    start_line: int = 1,
-    end_line: Optional[int] = None,
-    max_chars: int = 50000,
+    path: Annotated[str, Field(description="Repository-relative text file path inside AICODE_ROOT.")],
+    start_line: Annotated[int, Field(ge=1, le=2_147_483_647, description="First 1-based line to return; positive integer.")] = 1,
+    end_line: Annotated[Optional[int], Field(ge=1, le=2_147_483_647, description="Optional inclusive 1-based final line; positive integer.")] = None,
+    max_chars: Annotated[Optional[int], Field(ge=1, le=50_000, description="Optional output character cap; integer 1..50000; omitted uses 12% of n_ctx.")] = None,
 ) -> str:
     """Read a file inside AICODE_ROOT (sandbox-protected, returns numbered lines).
 
@@ -1036,7 +1135,7 @@ def read_file(
         end_line: 結束行(含)。None 表示從 start_line 一路讀到檔尾或
                   MAX_FILE_READ_CHARS 限制。長檔分頁時傳 (start, end) 區段比
                   整檔讀再截字元更省 context。
-        max_chars: MCP wrapper 截斷上限,避免炸 OpenCode context(預設 50000)。
+        max_chars: MCP wrapper 截斷上限；省略時依 n_ctx 12%，direct core 上限 50000。
                    ToolExecutor.read_file 內部還有 config.MAX_FILE_READ_CHARS
                    一道保險。
 
@@ -1044,22 +1143,37 @@ def read_file(
         帶行號的檔案內容。超過 max_chars 會在尾端標示截斷字數,並提示如何用
         start_line 接續往下讀。
     """
+    if max_chars is None:
+        max_chars = 50_000
     out = EXEC.read_file(path, start_line=start_line, end_line=end_line)
     if len(out) > max_chars:
-        out = (
-            out[:max_chars]
-            + f"\n\n... [MCP wrapper 截斷,原始 {len(out)} 字元] ..."
-            + f"\n[HINT] 用 read_file('{path}', start_line=<下一段起始>) 接續讀。"
+        original_len = len(out)
+        kept: list[str] = []
+        used = 0
+        next_line = start_line
+        for line in out.splitlines():
+            cost = len(line) + (1 if kept else 0)
+            if used + cost > max_chars:
+                break
+            kept.append(line)
+            used += cost
+            marker, separator, _rest = line.partition(" | ")
+            if separator and marker.strip().isdigit():
+                next_line = int(marker.strip()) + 1
+        out = "\n".join(kept).rstrip()
+        out += (
+            f"\n\n... [MCP wrapper 截斷,原始 {original_len} 字元] ..."
+            f"\n[HINT] 用 read_file(path={path!r}, start_line={next_line}) 接續讀。"
         )
     return out
 
 
 @_tool()
 def grep_code(
-    pattern: str,
-    path: Optional[str] = ".",
-    include: Optional[str] = None,
-    context: int = 0,
+    pattern: Annotated[str, Field(description="Exact text or safe regex pattern to find.")],
+    path: Annotated[Optional[str], Field(description="Repository-relative file or directory scope; '.' searches the root.")] = ".",
+    include: Annotated[Optional[str], Field(description="Optional comma-separated glob filter such as '*.c,*.h'.")] = None,
+    context: Annotated[int, Field(ge=0, le=5, description="Context lines before and after each match; integer 0..5.")] = 0,
 ) -> str:
     """Grep for a pattern across AICODE_ROOT (uses ripgrep if available).
 
@@ -1078,7 +1192,11 @@ def grep_code(
 
 
 @_tool()
-def list_dir(path: str = ".", depth: int = 2, max_chars: int = 20000) -> str:
+def list_dir(
+    path: Annotated[str, Field(description="Repository-relative directory path; '.' means AICODE_ROOT.")] = ".",
+    depth: Annotated[int, Field(ge=0, le=config.MAX_LIST_DEPTH, description="Recursive directory depth from 0 through MAX_LIST_DEPTH.")] = 2,
+    max_chars: Annotated[Optional[int], Field(ge=1, le=20_000, description="Optional output character cap; integer 1..20000; omitted uses 12% of n_ctx.")] = None,
+) -> str:
     """List the directory tree under AICODE_ROOT/<path> (sandbox-protected).
 
     Use this when the user asks "what files are here", "show project structure",
@@ -1091,19 +1209,28 @@ def list_dir(path: str = ".", depth: int = 2, max_chars: int = 20000) -> str:
     Args:
         path: 相對於 AICODE_ROOT 的目錄,預設 "." 表示 root 本身。
         depth: 遞迴層數(預設 2,上限受 config.MAX_LIST_DEPTH 限制)。
-        max_chars: 截斷上限,避免炸 context(預設 20000)。
+        max_chars: 截斷上限；省略時依 n_ctx 12%，direct core 上限 20000。
 
     Returns:
         Tree-style 列表,每行 `[DIR] name/` 或 `[FILE] name (size)`。
     """
+    if max_chars is None:
+        max_chars = 20_000
     out = EXEC.list_files(path=path, depth=depth)
     if len(out) > max_chars:
-        out = out[:max_chars] + f"\n\n... [MCP wrapper 截斷,原始 {len(out)} 字元] ..."
+        original_len = len(out)
+        out = out[:max_chars] + (
+            f"\n\n... [MCP wrapper 截斷,原始 {original_len} 字元] ..."
+            "\n[HINT] 縮小 path 或 depth 後重查。"
+        )
     return out
 
 
 @_tool()
-def apply_patch(diff: str, dry_run: bool = False) -> str:
+def apply_patch(
+    diff: Annotated[str, Field(description="SEARCH/REPLACE blocks or unified diff text without Markdown fences.")],
+    dry_run: Annotated[bool, Field(description="When true, perform zero-write preflight and report the seven-field plan.")] = False,
+) -> str:
     """Apply a patch to files inside AICODE_ROOT (writes to disk). 兩種格式擇一:SEARCH/REPLACE 或 unified diff。
 
     ⚠ 預設會直接寫入檔案。`diff` 參數已是字串,**不要再包 Markdown fence**(```)。
@@ -1169,7 +1296,9 @@ def apply_patch(diff: str, dry_run: bool = False) -> str:
 
 
 @_tool()
-def file_info(path: str) -> str:
+def file_info(
+    path: Annotated[str, Field(description="Repository-relative file or directory path inside AICODE_ROOT.")],
+) -> str:
     """Get quick metadata about a file or directory inside AICODE_ROOT.
 
     用來在 read_file 之前先衡量檔案大小、判斷要不要分段讀。對目錄會回報底下
@@ -1199,7 +1328,10 @@ def git_status() -> str:
 
 
 @_tool()
-def git_diff(path: Optional[str] = None, staged: bool = False) -> str:
+def git_diff(
+    path: Annotated[Optional[str], Field(description="Optional repository-relative path to limit the diff.")] = None,
+    staged: Annotated[bool, Field(description="When true, return the staged diff instead of worktree changes.")] = False,
+) -> str:
     """git diff inside AICODE_ROOT, optionally scoped to a path or to the index.
 
     Args:
@@ -1214,7 +1346,10 @@ def git_diff(path: Optional[str] = None, staged: bool = False) -> str:
 
 
 @_tool()
-def run_lint(path: str, fix: bool = True) -> str:
+def run_lint(
+    path: Annotated[str, Field(description="Repository-relative file or directory to lint.")],
+    fix: Annotated[bool, Field(description="When true, allow formatter fixes; false is check-only.")] = True,
+) -> str:
     """Run lint/format on a file using the toolchain configured in LINT_COMMANDS.
 
     依副檔名自動挑工具(例如 .py → ruff / black,.c/.cpp → clang-format,
@@ -1240,7 +1375,10 @@ def run_lint(path: str, fix: bool = True) -> str:
 
 
 @_tool()
-def import_external_file(path: str, dest_name: Optional[str] = None) -> str:
+def import_external_file(
+    path: Annotated[str, Field(description="Absolute source file path allowed by the external-import policy.")],
+    dest_name: Annotated[Optional[str], Field(description="Optional safe basename under .aicode_uploads; no directories.")] = None,
+) -> str:
     """Copy an allowed external file into AICODE_ROOT/.aicode_uploads/.
 
     This is the controlled "upload/import"入口 for OpenCode users who have a
@@ -1263,10 +1401,10 @@ def import_external_file(path: str, dest_name: Optional[str] = None) -> str:
 
 @_tool()
 def analyze_file(
-    path: str,
-    view: str = "summary",
-    target: str = "",
-    limit: Annotated[int, Field(ge=0, le=BIN_ELF_VIEW_MAX_LIMIT)] = 0,
+    path: Annotated[str, Field(description="Repository-relative image, PDF, ELF, or firmware path.")],
+    view: Annotated[Literal["summary", "headers", "sections", "memmap", "symbols", "imports", "relocs", "dynamic", "dwarf", "disasm", "strings"], Field(description="ELF analysis view; ignored for non-ELF inputs.")] = "summary",
+    target: Annotated[str, Field(description="Optional ELF symbol, address, safe regex, or key:value filter.")] = "",
+    limit: Annotated[int, Field(ge=0, le=BIN_ELF_VIEW_MAX_LIMIT, description="View-specific row/instruction/byte cap; 0 uses the view default.")] = 0,
 ) -> str:
     """Analyze a non-text file (image / PDF / ELF / binary firmware) inside AICODE_ROOT.
 
@@ -1582,8 +1720,12 @@ def _run_rag_subprocess(cmd, *, timeout: int) -> _RagRun:
 
 
 @_tool()
-def ingest_document(path: str, mode: str = "auto", preflight_only: bool = False,
-                   fresh: bool = False) -> str:
+def ingest_document(
+    path: Annotated[str, Field(description="Repository-relative document, image, chat, or binary file path.")],
+    mode: Annotated[Literal["auto", "document", "image", "chat", "binary"], Field(description="Ingestion parser mode: auto, document, image, chat, or binary.")] = "auto",
+    preflight_only: Annotated[bool, Field(description="For PDF only, estimate work with zero embeddings or KB writes.")] = False,
+    fresh: Annotated[bool, Field(description="Atomically rebuild the KB from this file; incompatible with preflight_only.")] = False,
+) -> str:
     """Ingest a file into the project knowledge base.
 
     呼叫 AICODE_ROOT/RAG.py 把指定檔案切 chunk + 算 embedding,append 到
@@ -1896,7 +2038,9 @@ def ingest_document(path: str, mode: str = "auto", preflight_only: bool = False,
 
 
 @_tool()
-def remove_document(source: str) -> str:
+def remove_document(
+    source: Annotated[str, Field(description="Indexed source basename to remove from knowledge.json.")],
+) -> str:
     """Remove all chunks of a given source file from the knowledge base.
 
     Use this to undo an `ingest_document` call, or to drop an outdated
@@ -2165,9 +2309,14 @@ def _render_figure_list(entries: list, *, with_payload: bool) -> str:
 
 
 @_tool()
-def review_figures(action: str = "list", document_id: str = "", figure_id: str = "",
-                   expected_revision: int = 0, payload_json: str = "",
-                   confirm_against_image: bool = False) -> str:
+def review_figures(
+    action: Annotated[Literal["list", "fix"], Field(description="Figure operation: list is read-only; fix mutates the KB.")] = "list",
+    document_id: Annotated[str, Field(description="Optional exact document_id or source basename filter.")] = "",
+    figure_id: Annotated[str, Field(description="Optional figure id for list; required for fix.")] = "",
+    expected_revision: Annotated[int, Field(ge=0, le=2_147_483_647, description="Expected current revision; 0 is allowed only for list.")] = 0,
+    payload_json: Annotated[str, Field(description="Canonical structured figure JSON; required for fix.")] = "",
+    confirm_against_image: Annotated[bool, Field(description="True only after a human checked the canonical payload against the image.")] = False,
+) -> str:
     """Review and correct structured figures extracted from PDFs.
 
     `ingest_document` 對 PDF 做結構化圖片抽取:除了原生 markdown 表格、
@@ -2471,7 +2620,10 @@ def reload_knowledge_base() -> str:
 
 
 @_tool()
-def record_lesson(rule: str, scope: str = "project") -> str:
+def record_lesson(
+    rule: Annotated[str, Field(description="Single-line imperative behavior rule of at most 200 characters.")],
+    scope: Annotated[Literal["project", "global"], Field(description="Rule scope: current project or this deployment globally.")] = "project",
+) -> str:
     """Propose a durable behavior rule after the USER corrected the agent's behavior.
 
     觸發條件(唯一):使用者糾正「你做事的方式」——例如「以後 migration 前要先
@@ -2510,9 +2662,10 @@ def record_lesson(rule: str, scope: str = "project") -> str:
 
 @_tool()
 def run_command(
-    cmd: str,
+    cmd: Annotated[str, Field(description="Complete command whose executable and arguments must pass the whitelist policy.")],
     timeout: Annotated[
-        int, Field(strict=True, ge=RUN_COMMAND_TIMEOUT_MIN, le=RUN_COMMAND_TIMEOUT_MAX)
+        int, Field(strict=True, ge=RUN_COMMAND_TIMEOUT_MIN, le=RUN_COMMAND_TIMEOUT_MAX,
+                   description="Server timeout in seconds; strict integer 1..600; client may stop earlier.")
     ] = RUN_COMMAND_TIMEOUT,
 ) -> str:
     """Run a whitelisted command inside AICODE_ROOT (server-side timeout 1..600 s).
@@ -2541,6 +2694,9 @@ def run_command(
     finally:
         # build / formatter / test 都可能寫檔;失敗的命令也可能已改檔(§5-3)。
         code_rag_module.invalidate_scan_cache(AICODE_ROOT)
+
+
+_register_public_tools()
 
 
 if __name__ == "__main__":

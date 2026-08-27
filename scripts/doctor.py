@@ -25,7 +25,9 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -51,6 +53,13 @@ from model_resolution import (  # noqa: E402
     opencode_config_candidates,
     resolve_main_model_from_env,
     resolve_opencode_main_model,
+)
+from scripts import tool_call_canary  # noqa: E402
+from scripts.opencode_direct_contract import (  # noqa: E402
+    DirectToolContractError,
+    load_live_contract_inputs,
+    parse_opencode_version,
+    require_direct_tool_contract,
 )
 
 OK = "[PASS]"
@@ -642,6 +651,138 @@ def check_opencode_in_path(r: Result) -> None:
     check_opencode_ai_entry(r)
 
 
+def check_opencode_direct_contract(
+    r: Result,
+    project: str | None,
+) -> tuple[str, dict[str, Any], Path] | None:
+    """Diagnose the same fail-loud client boundary enforced by ``aicode``."""
+    if shutil.which("opencode") is None:
+        r.info("direct-tool contract 未檢查：opencode 不在 PATH")
+        return None
+    raw_root = project or os.environ.get("AICODE_ROOT") or os.getcwd()
+    try:
+        root = Path(raw_root).expanduser().resolve(strict=True)
+    except (OSError, ValueError) as exc:
+        r.warn(f"direct-tool contract root 無法解析 ({type(exc).__name__})")
+        return None
+    if not root.is_dir():
+        r.warn("direct-tool contract 未檢查：project root 不是目錄")
+        return None
+    try:
+        version_raw, effective_config = load_live_contract_inputs(
+            root=root,
+            env=os.environ,
+        )
+    except DirectToolContractError as exc:
+        # Missing/unreadable local state is already covered by the entry/config
+        # checks.  Keep doctor usable as an installer diagnostic.
+        r.warn(f"OpenCode direct-tool contract 無法讀取：{exc}")
+        return None
+    try:
+        require_direct_tool_contract(version_raw, effective_config)
+    except DirectToolContractError as exc:
+        r.fail(f"OpenCode direct-tool contract 不相容：{exc}")
+        return None
+    version = parse_opencode_version(version_raw)
+    r.ok(
+        "OpenCode direct codetrail_* contract 相容 "
+        f"({'.'.join(map(str, version))})"
+    )
+    return version_raw, effective_config, root
+
+
+def report_cached_implicit_status(
+    r: Result,
+    *,
+    cache_path: Path,
+    fingerprint: str,
+    now: float,
+    ttl_seconds: int,
+) -> None:
+    """Report only an exact-fingerprint implicit lane; never borrow another row."""
+    record = tool_call_canary.implicit_cache_record(cache_path, fingerprint)
+    if record is None:
+        r.info("implicit routing status=unknown（current fingerprint 無快取資料）")
+        return
+    status_value, checked_at = record
+    age = now - checked_at
+    freshness = (
+        "stale"
+        if ttl_seconds <= 0 or age < -300 or age > ttl_seconds
+        else "fresh"
+    )
+    if status_value is tool_call_canary.ImplicitStatus.OPTIMAL:
+        r.ok(f"implicit routing status=optimal（current fingerprint；{freshness}）")
+    else:
+        r.warn(
+            f"implicit routing status={status_value.value}（current fingerprint；"
+            f"{freshness}；診斷不擋啟動）"
+        )
+
+
+def check_tool_call_canary_diagnostic(
+    r: Result,
+    *,
+    direct_inputs: tuple[str, dict[str, Any], Path] | None,
+    no_network: bool,
+) -> None:
+    """Reconstruct the live fingerprint and show its implicit diagnostic lane."""
+    if no_network:
+        r.info("implicit routing status=unknown（--no-network 未建立 current fingerprint）")
+        return
+    if direct_inputs is None:
+        r.info("implicit routing status=unknown（direct-tool identity 不可用）")
+        return
+    version_raw, effective_config, root = direct_inputs
+    props = tool_call_canary.fetch_main_server_props(os.environ)
+    if props is None:
+        r.info("implicit routing status=unknown（llama-server /props 不可用）")
+        return
+    try:
+        protocol = tool_call_canary.run_protocol_check(
+            effective_config,
+            root=root,
+            env=os.environ,
+            timeout=tool_call_canary.DEFAULT_MCP_TIMEOUT_SECONDS,
+        )
+        selected_model, _ = tool_call_canary._model_selection(
+            effective_config, "", []
+        )
+    except tool_call_canary.CanaryError as exc:
+        r.warn(f"implicit routing current fingerprint 無法建立：{exc}")
+        return
+    cache_path = tool_call_canary.resolve_cache_path(os.environ)
+    if cache_path is None:
+        r.info("implicit routing status=unknown（快取路徑不可用）")
+        return
+    fingerprint = tool_call_canary.build_fingerprint(
+        root=root,
+        config=effective_config,
+        selected_model=selected_model,
+        props=props,
+        opencode_version=version_raw,
+        env=os.environ,
+        protocol_evidence=protocol,
+    )
+    raw_ttl = os.environ.get("AICODE_TOOL_CANARY_TTL_SECONDS", "").strip()
+    try:
+        ttl_seconds = (
+            int(raw_ttl)
+            if raw_ttl
+            else tool_call_canary.DEFAULT_CACHE_TTL_SECONDS
+        )
+    except ValueError:
+        r.warn("implicit routing status=unknown（canary TTL 不是整數）")
+        return
+    report_cached_implicit_status(
+        r,
+        cache_path=cache_path,
+        fingerprint=fingerprint,
+        now=time.time(),
+        ttl_seconds=ttl_seconds,
+    )
+
+
 # ============================================================
 # Context settings
 # ============================================================
@@ -1015,7 +1156,15 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n-- opencode-ai entry --")
     check_opencode_ai_entry(r)
+    direct_inputs = check_opencode_direct_contract(r, args.project)
     check_opencode_model_config(r)
+
+    print("\n-- tool-call canary cache --")
+    check_tool_call_canary_diagnostic(
+        r,
+        direct_inputs=direct_inputs,
+        no_network=args.no_network,
+    )
 
     print("\n-- context settings --")
     check_context_settings(r)
