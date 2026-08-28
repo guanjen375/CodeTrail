@@ -781,6 +781,7 @@ def test_unreliable_channel_still_catches_a_real_value_difference():
     assert result.verification_status == figure_extract.VERIF_NEEDS_REVIEW
 
 
+@pytest.mark.smoke
 @pytest.mark.parametrize(
     "canonical, extracted, expected",
     [
@@ -788,11 +789,95 @@ def test_unreliable_channel_still_catches_a_real_value_difference():
         ("0x4000_0100", "0x40000100", True),
         ("0x4000_0100", "0x4000_0101", False),   # 值真的不同
         ("0x4000_0100", "0x4000_0100", False),   # 相同就不是 artifact
-        ("CTRL0", "CTRL 0", False),              # 原文沒有底線 ⇒ 前提不成立
+        ("CTRL0", "CTRL 0", True),               # 差異只在空白 ⇒ 同一類抽取缺陷
+        ("Dynamic clock input pin", "Dynamicclockinputpin", True),   # 實測：整格字間空白被吃掉
+        ("Run Control Sleep State output", "RunControlSleepModeoutput", False),   # 字真的不同
+        ("No.", "No\n.", True),                  # 實測：表頭被插進換行
     ],
 )
 def test_underscore_artifact_detection_is_tightly_scoped(canonical, extracted, expected):
     assert figure_verify._underscore_artifact(canonical, extracted) is expected
+
+
+PORT_MD = "| No. | Port Name |\n|---|---|\n| 1 | Dynamic clock input pin |\n"
+PORT_WORDS = words_from([
+    (10.0, [(10, 30, "No."), (70, 100, "Port"), (105, 140, "Name")]),
+    (30.0, [(10, 20, "1"), (70, 95, "Dynamic"), (98, 115, "clock"),
+            (118, 140, "input"), (143, 160, "pin")]),
+])
+
+
+def port_tables(header, port_name):
+    """跟 `unreliable_tables()` 同形狀，內容換成實測出問題的 p26 port table。"""
+    return {"lines": [{
+        "strategy": "lines", "ordinal": 0, "degenerate": False, "errors": [],
+        "bbox": (0.0, 0.0, 200.0, 80.0),
+        "geometry": {"table_bbox": (0.0, 0.0, 200.0, 80.0), "row_count": 2, "col_count": 2,
+                     "cells": [], "rows": [], "cols": [],
+                     "header_names": list(header),
+                     "extract_raw": [list(header), ["1", port_name]],
+                     "extract_unreliable_underscore": True},
+    }]}
+
+
+def port_candidate():
+    return candidate(native_table={"pos": (0, len(PORT_MD)), "markdown": PORT_MD,
+                                   "strategy": "lines", "geometry": UNRELIABLE_GEOMETRY})
+
+
+@pytest.mark.smoke
+def test_unreliable_channel_linebreak_in_header_is_not_a_conflict():
+    """實測：`Table.extract()` 把表頭 `No.` 讀成 `'No\\n.'`，兩個可靠通道都是 `No.`。
+
+    可靠通道之間表頭逐字一致；unreliable 通道去掉空白後等於它們，就不是 header_conflict。
+    """
+    result = figure_verify.verify_native_table(
+        port_candidate(),
+        page_evidence(raw_markdown=PORT_MD, words=PORT_WORDS,
+                      tables=port_tables(["No\n.", "Port Name"], "Dynamic clock input pin")),
+    )
+    assert "header_conflict" not in result.reasons
+    assert result.verification_status == figure_extract.VERIF_NATIVE
+
+
+@pytest.mark.smoke
+def test_unreliable_channel_missing_spaces_does_not_veto_the_cell():
+    """實測：`Table.extract()` 把 `Dynamic clock input pin` 的字間空白全部吃掉。
+
+    只有 unreliable 通道不同意、另一個可靠通道一致：差異照樣進 evidence，
+    但不得否決那一格。
+    """
+    result = figure_verify.verify_native_table(
+        port_candidate(),
+        page_evidence(raw_markdown=PORT_MD, words=PORT_WORDS,
+                      tables=port_tables(["No.", "Port Name"], "Dynamicclockinputpin")),
+    )
+    cell = result.payload["rows"][0]["cells"][1]
+    assert cell["text"] == "Dynamic clock input pin", "canonical 必須是頁面上真正的字"
+    artifacts = result.evidence["cells"]["r1c2"]["artifacts"]
+    assert artifacts[0]["reason"] == "extract_whitespace_artifact"
+    assert "cell_conflict" not in result.reasons
+    assert "critical_token_mismatch" not in result.reasons
+
+
+@pytest.mark.smoke
+def test_merge_verdict_keeps_texts_of_the_failing_channel():
+    """top-level `raw` / `payload` 必須對應 `anchor`（判不匹配的那個通道）。
+
+    之前每次呼叫都無條件覆寫，存下來的文字是最後一個通道的，跟 verdict 對不上
+    （實測 p26 r9c3：raw 與 payload 一字不差卻 verdict=glyph）。
+    """
+    record = {"anchor": None, "matched": None}
+    figure_verify._merge_verdict(record, "A", "structural", [], "x y", "xy",
+                                 figure_extract.KIND_TABLE)
+    figure_verify._merge_verdict(record, "B", "match", [], "xy", "xy",
+                                 figure_extract.KIND_TABLE)
+    assert record["anchor"] == "A"
+    assert record["raw"] == "x y"
+    assert record["payload"] == "xy"
+    assert record["matched"] is False
+    assert record["by_channel"]["B"]["raw"] == "xy"
+    assert record["by_channel"]["A"]["raw"] == "x y"
 
 
 def test_markdown_channel_markup_is_unwrapped():

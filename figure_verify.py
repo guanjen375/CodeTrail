@@ -2309,19 +2309,17 @@ _STRIP_UNDERSCORE_WS = re.compile(r"[\s_\u3000\u00a0]+")
 
 
 def _underscore_artifact(canonical: str, extracted: str) -> bool:
-    """差異是不是**那個已知的** `Table.extract()` 底線缺陷。
+    """差異是不是 `Table.extract()` 的已知空白/底線缺陷。
 
-    實測（pymupdf 1.28.0）：`0x4000_0100` 會被 `extract()` 讀成 `'0x4000 0100\n_'`
-    ——底線被抽成獨立的一段。這個缺陷有明確前提（原文含 `_`）與明確範圍（差異
-    只落在底線與空白的位置），所以可以精準辨識，而不是「對不上就放行」。
+    實測（pymupdf 1.28.0）：`0x4000_0100` 會被讀成 `'0x4000 0100\\n_'`；在部分 PDF
+    上整格字間空白會被吃掉（`'Dynamic clock input pin'` → `'Dynamicclockinputpin'`）。
+    兩者的共同特徵：差異只落在空白與底線的位置。
 
     只有標了 `extract_unreliable_underscore` 的通道會走這條；而且**只中和它的
     否決權**，那一格仍然要靠其他通道佐證，差異也照樣寫進 evidence。
     值真的不同（`0x4000_0100` vs `0x4000_0101`）時，去掉底線與空白後仍然不等，
     照樣是衝突。
     """
-    if "_" not in canonical:
-        return False
     if canonical == extracted:
         return False
     return (_STRIP_UNDERSCORE_WS.sub("", canonical)
@@ -2343,30 +2341,43 @@ def _merge_verdict(record: dict, channel: str, verdict: str, spans, anchor_text:
     # blocker」推論。缺了這一份，unreliable 通道的 artifact 也會讓該格看起來
     # 「被非 canonical 通道佐證過」。
     by_channel = record.setdefault("by_channel", {})
-    record["raw"] = anchor_text
-    record["payload"] = payload_text
+    # top-level `raw` / `payload` 永遠對應 `record["anchor"]`（最後一個判不匹配的
+    # 通道）：match / artifact 只在還沒有值時補上，不匹配才無條件覆寫。之前每次
+    # 呼叫都覆寫，存下來的文字是最後一個通道的，跟 verdict 對不上。每個通道自己
+    # 那一組則進 by_channel。
     if verdict == "match":
         by_channel[channel] = {
             "verdict": "match", "reliable": not unreliable,
             "critical_ok": (figure_extract.critical_tokens(payload_text, kind)
                             == figure_extract.critical_tokens(anchor_text, kind)),
+            "raw": anchor_text, "payload": payload_text,
         }
+        record.setdefault("raw", anchor_text)
+        record.setdefault("payload", payload_text)
         if record.get("matched") is None:
             record["matched"] = True
         record.setdefault("critical_ok", True)
         return
     if unreliable and _underscore_artifact(payload_text, anchor_text):
-        by_channel[channel] = {"verdict": "artifact", "reliable": False, "critical_ok": None}
+        reason = ("extract_underscore_artifact" if "_" in payload_text
+                  else "extract_whitespace_artifact")
+        by_channel[channel] = {"verdict": "artifact", "reliable": False, "critical_ok": None,
+                               "raw": anchor_text, "payload": payload_text}
         record.setdefault("artifacts", []).append(
-            {"channel": channel, "raw": anchor_text, "reason": "extract_underscore_artifact"}
+            {"channel": channel, "raw": anchor_text, "reason": reason}
         )
+        record.setdefault("raw", anchor_text)
+        record.setdefault("payload", payload_text)
         if record.get("matched") is None:
             record["matched"] = None
         record.setdefault("critical_ok", None)
         return
     record["matched"] = False
     record["anchor"] = channel
-    by_channel[channel] = {"verdict": verdict, "reliable": not unreliable, "critical_ok": False}
+    record["raw"] = anchor_text
+    record["payload"] = payload_text
+    by_channel[channel] = {"verdict": verdict, "reliable": not unreliable, "critical_ok": False,
+                           "raw": anchor_text, "payload": payload_text}
     if verdict == "glyph":
         record.setdefault("mask_spans", [])
         existing = {(s, e) for s, e, _ in record["mask_spans"]}
@@ -3364,16 +3375,33 @@ def _inject_geometry_records(payload: dict, alignment: dict) -> None:
     )
 
 
-def _native_checks(payload, channels, candidate, alignment) -> dict:
+def _native_checks(payload, channels, candidate, alignment, *,
+                   unreliable=frozenset()) -> dict:
     """native_verified 的固定 check 集合。缺任何一個 key 一律當 False。"""
     checks = {name: False for name in NATIVE_REQUIRED_CHECKS}
     checks["second_channel"] = len(channels) >= 2
 
-    headers = [
-        tuple(figure_extract.normalize_for_compare(label or "") for label in grid["header"])
-        for _name, grid in channels
-    ]
-    checks["header_agreement"] = bool(headers) and len(set(headers)) == 1
+    # 可靠通道之間表頭必須逐字（空白正規化後）一致；unreliable 通道（find_tables
+    # extract，實測會把 `No.` 讀成 `'No\n.'`）只要去掉空白＋底線後等於可靠通道的
+    # 表頭就算同意。沒有可靠通道時維持原本的嚴格比對。
+    def _header_key(grid, *, loose: bool) -> tuple:
+        labels = [figure_extract.normalize_for_compare(label or "") for label in grid["header"]]
+        if loose:
+            labels = [_STRIP_UNDERSCORE_WS.sub("", label) for label in labels]
+        return tuple(labels)
+
+    reliable = [(name, grid) for name, grid in channels if name not in unreliable]
+    flaky = [(name, grid) for name, grid in channels if name in unreliable]
+    if reliable:
+        strict_keys = {_header_key(grid, loose=False) for _name, grid in reliable}
+        loose_keys = {_header_key(grid, loose=True) for _name, grid in reliable}
+        checks["header_agreement"] = len(strict_keys) == 1 and all(
+            _header_key(grid, loose=True) in loose_keys for _name, grid in flaky
+        )
+    else:
+        checks["header_agreement"] = bool(channels) and len(
+            {_header_key(grid, loose=False) for _name, grid in channels}
+        ) == 1
     counts = {len(grid["rows"]) for _name, grid in channels}
     checks["row_count_agreement"] = len(counts) == 1 and counts.pop() == len(payload["rows"])
 
@@ -3452,7 +3480,7 @@ def verify_native_table(candidate: Candidate, evidence: PageEvidence) -> FigureR
     alignment = align_table_cells(payload, candidate, evidence)
     # rowspan 的正面矛盾也是 cell 級 evidence，要進 anchor 統計與 manifest。
     alignment.setdefault("cells", {}).update(span_conflicts)
-    checks = _native_checks(payload, channels, candidate, alignment)
+    checks = _native_checks(payload, channels, candidate, alignment, unreliable=_unreliable)
 
     for slug, detail in alignment.get("blockers", []):
         findings.block(slug, detail)
