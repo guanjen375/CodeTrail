@@ -1751,8 +1751,8 @@ def ingest_document(
        看不清的字元放 `▯` 並記原因,**不猜**。
 
     B. **既有自由文字 VL lane**:`origin="diagram"`，只處理沒有被 A 覆蓋的舊
-       picture job，並維持舊 KB 相容。這條 lane **不承接** A 的失敗:A 失敗一律
-       整份零寫入。
+       picture job，並維持舊 KB 相容。這條 lane **不承接** A 的失敗:A 抽壞的那一張
+       就是缺席,不會退回自由文字描述。
 
     六種 verification_status(structured chunk 專屬,兩個正交欄位之一):
       native_verified   原生表格 geometry 與至少另一個原生 evidence channel 在
@@ -1774,10 +1774,14 @@ def ingest_document(
     超過上限,**零寫入**。MCP 沒有 streaming,開始之後才超時等於沒有提示,所以
     圖多的 PDF 建議先跑這個。超出上限會直接結束(exit 2)並印出超出的項目。
 
-    **零部分成功**:結構化 lane 的 schema / validator / row width / line contract /
-    finish_reason 任一最終不合格 → 整份 PDF 零寫入,舊 KB 與向量保持原狀
-    (可留失敗的 review artifact,但不會冒充成功入庫)。需要 VL 的候選會在動 KB
-    之前先做 capability probe,不通過就 fail-loud 指出缺哪一項能力。
+    **抽壞的那一張缺席,不是整份零寫入**:結構化 lane 的 schema / validator /
+    row width / line contract / finish_reason 任一最終不合格 → **那一張圖不進 KB**
+    (不會冒充成功入庫,也不退回自由文字描述),其餘 figure 與全部文字 chunk 照常
+    入庫,stdout 會印出 `[figure] 失敗 N 張(不進 KB)` 列出是哪幾張;它們仍在同一份
+    review artifact 裡,用 `review_figures(action="list")` 看得到(`in_kb=false`)。
+    仍然整份 PDF 零寫入的是:VL 連不上/逾時(transport)、預算超限、capability probe
+    未過、來源檔中途被換掉,以及候選與結果對不上這類契約破裂。需要 VL 的候選會在
+    動 KB 之前先做 capability probe,不通過就 fail-loud 指出缺哪一項能力。
 
     **舊 KB**:先前入庫的圖片 chunk 缺欄位,載入時會在記憶體內標
     `legacy_unverified`(不回寫檔案),strict 查詢不再用它回答數值。要恢復可信度
@@ -2037,7 +2041,9 @@ def ingest_document(
             )
     else:
         status = f"✗ 失敗 (exit {run.returncode})"
-        hint = "\n\n入庫失敗;請依上方輸出排除錯誤後重試(結構化圖片抽取失敗時是零寫入,KB 不變)。"
+        hint = ("\n\n入庫失敗;請依上方輸出排除錯誤後重試"
+                "(VL 連線失敗 / 預算超限這類整份中止時是零寫入,KB 不變;"
+                "單張圖抽壞不會走到這裡,那是 exit 0 加一行 `[figure] 失敗 N 張`)。")
     return f"=== {label} {status} ===\n{out}{hint}"
 
 

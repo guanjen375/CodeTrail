@@ -985,10 +985,18 @@ def _validate_cross_entry_links(figures: list, *, where: str, failed: bool,
     `strict_new_write=True`（發布前）與 `False`（讀既有 manifest）的**唯一**差別是
     「要不要容忍舊的 evidence-only duplicate 形狀」。其餘檢查兩邊都是無條件的：
     代表 occurrence 必須存在、必須不是 duplicate、必須真的有落盤的模型輸入與完整原圖。
+
+    §20.2 的「完整原圖」是**逐 entry** 判的，不是逐 run：`failed:false` 的 run 允許
+    含 `extraction_status=failed` 的 entry（品質失敗，那一張不進 KB），而抽壞的候選
+    本來就可能連一張影像都產不出來。
     """
+    fx = _fx()
     by_id = {entry["figure_id"]: entry for entry in figures}
     for entry in figures:
         item = f"{where} figure={entry['figure_id']}"
+        # run 級的 `failed` 是「整份抽取中止」；entry 級的才是「這一張抽壞了」。
+        # 兩者對「要不要有完整原圖」的效果相同。
+        incomplete = failed or entry["extraction_status"] != fx.EXTRACTION_COMPLETE
         variant_id = entry["model_input_variant"]
         duplicate_of = entry["duplicate_of"]
         sentinel_target = _duplicate_model_input_target(variant_id)
@@ -1003,8 +1011,8 @@ def _validate_cross_entry_links(figures: list, *, where: str, failed: bool,
                          "——實際送模型的影像必須留得下來")
                 _require(variant_id in entry["variants"],
                          f"{item}: model_input_variant={variant_id!r} 不在 variants 宣告集合裡")
-            # ★ 契約 §20.2：成功的 run 裡每一張圖都要有完整未切片原圖。
-            if not failed:
+            # ★ 契約 §20.2：成功的 run 裡每一張**抽成功**的圖都要有完整未切片原圖。
+            if not incomplete:
                 _require(entry["asset_path"],
                          f"{item}: 成功的 run 卻沒有完整未切片原圖（asset_path 是空的）"
                          "——覆核的人完全拿不到這張圖（workflow §8-5）")
@@ -1021,7 +1029,7 @@ def _validate_cross_entry_links(figures: list, *, where: str, failed: bool,
         _require(representative["variant_paths"],
                  f"{item}: 代表 occurrence {duplicate_of!r} 沒有任何實際模型輸入檔"
                  "——這條 duplicate 連結追不回任何真的送過模型的影像")
-        if not failed:
+        if not incomplete:
             # ★ 契約 §20.2 的唯一例外：duplicate 自己可以沒有原圖（同一批像素），
             #   但它交叉引用的代表**必須**有。
             _require(representative["asset_path"],
@@ -1345,10 +1353,14 @@ def _figure_view(figure, position: int, *, document_id: str, failed: bool) -> di
              f"{where}: extraction_status={view['extraction_status']!r} 不合法")
     _require(view["verification_status"] in fx.VERIFICATION_RANK,
              f"{where}: verification_status={view['verification_status']!r} 不合法")
-    if not failed:
-        _require(view["extraction_status"] == fx.EXTRACTION_COMPLETE,
-                 f"{where}: 成功的 run 不得含 extraction_status=failed 的 figure"
-                 "（失敗請用 write_run_artifacts(failed=True)）")
+    if not failed and view["extraction_status"] == fx.EXTRACTION_FAILED:
+        # 品質失敗是 figure-level 的：那一張不進 KB，但要留在同一份 `failed:false`
+        # 的 manifest 裡供覆核。允許的形狀**只有**「什麼都沒抽出來」這一種——帶
+        # payload 的 failed entry，讀的人分不出它到底有沒有進 KB。
+        # （`model_input_variant` / `variants` 的形狀在下面型別驗過之後才檢查。）
+        _require(view["payload"] is None,
+                 f"{where}: extraction_status=failed 卻帶 payload"
+                 "——沒抽出來的圖不得有 canonical 內容")
     bbox = _strict_bbox(view["bbox"], where=f"{where} 的 bbox")
     occurrences = view["occurrences"]
     _require(isinstance(occurrences, list) and occurrences,
@@ -1391,6 +1403,13 @@ def _figure_view(figure, position: int, *, document_id: str, failed: bool) -> di
              and all(isinstance(x, str) and x for x in declared),
              f"{where}: variants 必須是 list[str]（可以是空 list，但不得缺欄位）")
     declared_variants = list(declared)
+    if not failed and view["extraction_status"] == fx.EXTRACTION_FAILED:
+        _require(variant == "failed",
+                 f"{where}: extraction_status=failed 的 model_input_variant 必須是 "
+                 f"'failed'，收到 {variant!r}")
+        _require(declared_variants == [],
+                 f"{where}: extraction_status=failed 不得宣告送過 variant，收到 "
+                 f"{declared_variants}")
     evidence = view["evidence"]
     _require(isinstance(evidence, dict), f"{where}: evidence 必須是 dict")
     _require_trusted_evidence(evidence, view, where=where)
@@ -1829,8 +1848,10 @@ def write_run_artifacts(root, *, document_id: str, run_id: str, figures, variant
             entry["asset_path"] = _rel(slug, run, ASSETS_DIR, f"{figure_id}{asset['suffix']}")
             entry["asset_digest"] = asset["digest"]
             entry["asset_is_model_input"] = asset["folder"] == VARIANTS_DIR
-        elif failed:
-            # 抽取中止的 run 本來就可能連影像都產不出來；失敗 artifact 仍要留得下來。
+        elif failed or entry["extraction_status"] != _fx().EXTRACTION_COMPLETE:
+            # 抽壞的候選本來就可能連影像都產不出來——整份抽取中止（`failed=True`）
+            # 與「只有這一張抽壞」（`failed:false` run 裡的 failed entry）都一樣；
+            # 兩者都不進 KB，失敗紀錄仍要留得下來。
             pass
         elif entry["duplicate_of"]:
             # ★ 契約 §20.2 的**唯一例外**：duplicate 是同一批像素，它自己可以沒有原圖，
@@ -2593,7 +2614,9 @@ def _artifact_only_entries(root_real: Path, document_id: str | None,
         result["payload"] = copy.deepcopy(entry["payload"])
         result["warnings"].append("artifact_only")
         if entry["payload"] is None:
-            result["payload_error"] = "抽取失敗，沒有 canonical payload（整份 PDF 零寫入）"
+            result["payload_error"] = (
+                "抽取失敗，沒有 canonical payload（這一張不進 KB；"
+                "整份零寫入的 run 見 manifest 的 failed:true）")
         _entry_from_manifest_figure(entry, manifest, result, root_real)
         out.append(result)
     return out

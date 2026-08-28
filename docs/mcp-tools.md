@@ -199,8 +199,11 @@ preflight 涵蓋所有結構化候選，包含純 raster 的分類、雙樣本�
 只有未被結構化候選覆蓋的舊 picture 相容 job 不受這些上限判定；若存在，報告會另外列出
 未受閘控的粗估。
 
-**零部分成功**:結構化 lane 的 schema / validator / row width / line contract /
-`finish_reason` 任一最終不合格 → 整份 PDF 零寫入,舊 KB 與向量保持原狀。需要 VL 的候選會在
+**抽壞的那一張缺席**:結構化 lane 的 schema / validator / row width / line contract /
+`finish_reason` 任一最終不合格 → **那一張圖不進 KB**(也不退回自由文字描述),其餘 figure 與
+全部文字 chunk 照常入庫,stdout 會印一行 `[figure] 失敗 N 張(不進 KB)` 說明是哪幾張。
+仍然**整份 PDF 零寫入**的是:VL 連不上 / 逾時、預算超限、capability probe 未過、來源檔中途
+被換掉,以及候選與結果對不上這類契約破裂;舊 KB 與向量保持原狀。需要 VL 的候選會在
 動 KB 之前先做 capability probe(端點真的吃 image content part、接受 nested `json_schema`、
 能完成一張極小且不含機敏內容的 canary 並通過外部 validator),不通過就 fail-loud 指出缺哪
 一項,不以「OpenAI-compatible」推定品質。
@@ -217,7 +220,7 @@ preflight 涵蓋所有結構化候選，包含純 raster 的分類、雙樣本�
 revision>, payload_json=<改過的 JSON>, confirm_against_image=True)`。要點:
 
 `list` 也會列出**抽取失敗、因此沒有進 KB 的圖**(標 `in_kb: False` / `fixable: False`,
-從 review artifacts 讀)——「零部分成功」代表它們不在知識庫裡,但失敗原因看得到。
+從 review artifacts 讀)——缺席就是缺席,不會有一份猜出來的內容頂替,但失敗原因看得到。
 
 - **只收該 kind 的 structured payload**,拒絕自由文字全段替換;JSON 物件不得有重複 key
   （Python 只留最後一個 = 無聲改寫）。

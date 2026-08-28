@@ -2733,3 +2733,298 @@ def test_a_local_crop_review_asset_never_publishes_a_successful_manifest(
     successful = [kwargs for (_a, kwargs) in harness.write_artifacts.calls
                   if kwargs.get("failed") is False]
     assert successful == [], "局部 crop 不得冒充完整原圖發布成功 manifest"
+
+
+# ============================================================
+# 26. 品質失敗只缺席那一張（figure-level），不再整份 PDF 零寫入
+# ============================================================
+# 2026-08-28 實際踩到：同一份 120 頁 PDF、同一版 code、同一顆 VL，08-24 灌得進去、
+# 08-28 灌不進去——三張圖的 VL 輸出剛好抽壞（p31 truncated、p39 empty_payload、
+# icatch p4 grid_cell_occupancy_mismatch）。VL 輸出本來就有隨機性，文件級的全有全無
+# 把它放大成「整份文件進不進得去看運氣」。新契約：品質失敗只讓**那一張**缺席，
+# 其餘 figure 與全部文字 chunk 照常入庫；`transport`（VL 連不上）維持整份零寫入。
+VL_BBOX_A = (60.0, 100.0, 520.0, 200.0)
+VL_BBOX_B = (60.0, 240.0, 520.0, 340.0)
+VL_BBOX_C = (60.0, 380.0, 520.0, 470.0)
+PNG_A = b"\x89PNG\r\n\x1a\n" + b"pixels-A"
+PNG_B = b"\x89PNG\r\n\x1a\n" + b"pixels-B"
+PNG_C = b"\x89PNG\r\n\x1a\n" + b"pixels-C"
+
+VL_PAGE_TEXT = (
+    "Chapter 7 describes the debug bus and its sideband signalling. \n\n"
+    "The drawing below is only available as a rasterised figure. \n\n"
+)
+
+GOOD_TABLE_JSON = json.dumps({
+    "columns": [{"label": "Reg"}, {"label": "Addr"}],
+    "rows": [{"cells": [{"text": "VLOK0", "state": "observed"},
+                        {"text": "0x9000_0000", "state": "observed"}]}],
+    "footnotes": [],
+})
+OTHER_TABLE_JSON = json.dumps({
+    "columns": [{"label": "Reg"}, {"label": "Addr"}],
+    "rows": [{"cells": [{"text": "INK0", "state": "observed"},
+                        {"text": "0x9000_0004", "state": "observed"}]}],
+    "footnotes": [],
+})
+EMPTY_DIAGRAM_JSON = json.dumps({
+    "title": "", "labels": [], "components": [], "relations": [], "values": [],
+})
+
+
+class _FakeVL:
+    """假 `vision_json_completion`：依 `(schema 名稱, 影像 bytes)` 回應。
+
+    真 VL lane 會重試、會取第二樣本，呼叫次數不固定；用影像 bytes 當 key 才能穩定
+    表達「這一張永遠壞、那一張永遠好」，而不必去數第幾次呼叫。
+    """
+
+    def __init__(self, script: dict):
+        self.script = script
+        self.calls: list = []
+
+    def __call__(self, **kwargs):
+        import base64 as _base64
+
+        self.calls.append(kwargs)
+        name = kwargs["response_format"]["json_schema"]["name"]
+        png = _base64.b64decode(kwargs["image_base64"])
+        entry = self.script[(name, png)]
+        if isinstance(entry, BaseException):
+            raise entry
+        text, finish = entry
+        return types.SimpleNamespace(
+            text=text, finish_reason=finish, truncated=finish not in ("stop", "eos"),
+            usage={}, raw={},
+        )
+
+
+def _use_real_vl_lane(monkeypatch, vl: _FakeVL):
+    """把 `extract_document_figures` 換回真貨；只有 VL 端點與 capability probe 是替身。
+
+    這四條測試要驗的正是 T4（`figure_verify`）與 T7（`RAG`）之間那條界線：哪些失敗
+    只讓一張圖缺席、哪些仍然整份零寫入。兩端都用替身的話，界線挪到哪裡都測不出來。
+    """
+    monkeypatch.setattr(figure_extract, "extract_document_figures",
+                        figure_verify.extract_document_figures, raising=False)
+    monkeypatch.setattr(
+        figure_verify, "ensure_capability",
+        lambda **_kw: figure_verify.ProbeResult(True, "fp", {"stub": True}, [], "stub"),
+        raising=False)
+    monkeypatch.setattr(figure_verify.llama_client, "vision_json_completion", vl,
+                        raising=False)
+    monkeypatch.setattr(
+        figure_verify.llama_client, "get_props",
+        lambda *_a, **_k: {"model_alias": "vl", "chat_template": "supports json_schema",
+                           "n_ctx": 8192},
+        raising=False)
+    return vl
+
+
+def _vl_case(tmp_path: Path, monkeypatch, specs, *, pages=None):
+    """建一份「每頁一張 VL-lane 圖」的假 PDF。
+
+    `specs`: [(page, bbox, png, kind, page_boxes), ...]，回 `(pdf, harness, figure_ids)`。
+    """
+    pdf = _write_pdf(tmp_path)
+    document_id = _document_id(pdf, tmp_path)
+    figure_ids, candidates, variants = [], [], []
+    evidence, boxes_by_page = {}, {}
+    for index, (page, bbox, png, kind, page_boxes) in enumerate(specs, 1):
+        fid = _figure_id(document_id, page, bbox, f"asset-{index}")
+        figure_ids.append(fid)
+        candidates.append(_candidate(document_id, fid, page=page, bbox=bbox, kind=kind,
+                                     index=index, native_lane=False,
+                                     occurrences=[_occurrence(page, bbox)]))
+        variants.append(FakeVariant(figure_id=fid, variant_id="crop@200dpi",
+                                    bbox=tuple(bbox), png=png))
+        boxes_by_page.setdefault(page, []).extend(page_boxes)
+    if pages is None:
+        pages = [_page(page, VL_PAGE_TEXT, boxes_by_page.get(page, []))
+                 for page in sorted({spec[0] for spec in specs})]
+    for page_info in pages:
+        number = page_info["metadata"]["page_number"]
+        evidence[number] = FakePageEvidence(page=number, raw_markdown=page_info["text"],
+                                            page_boxes=page_info["page_boxes"])
+    plan = _plan(document_id, candidates, evidence,
+                 preflight={"candidates": len(candidates), "tiles": 0, "vl_calls_min": 1,
+                            "vl_calls_max": 8, "image_tokens_est": 64,
+                            "pages": len(pages), "native_tables": 0})
+    harness = _harness(monkeypatch, tmp_path, pages, plan, [], variants=variants)
+    return pdf, harness, figure_ids
+
+
+def _manifests(tmp_path: Path) -> list:
+    return sorted((tmp_path / ".codetrail" / "figures").rglob("manifest.json"))
+
+
+def _manifest_entry(manifest_path: Path, figure_id: str) -> dict:
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return data, next(e for e in data["figures"] if e["figure_id"] == figure_id)
+
+
+@pytest.mark.smoke
+def test_quality_failure_skips_only_that_figure(tmp_path: Path, monkeypatch, capsys):
+    """★ 品質失敗（truncated）只讓那一張缺席：其餘 figure 與全部文字 chunk 照常入庫。
+
+    修正前：任何一張 VL-lane 圖重試後仍不合格 → `FigureExtractionError` → 整份 120 頁
+    PDF 零寫入。VL 輸出有隨機性，等於讓「整份文件進不進得去」變成擲骰子。
+    """
+    kb_path = _kb_ready(monkeypatch, tmp_path)
+    pdf, _harness_obj, (fid_bad, fid_ok) = _vl_case(tmp_path, monkeypatch, [
+        (1, VL_BBOX_A, PNG_A, figure_extract.KIND_TABLE, []),
+        (2, VL_BBOX_B, PNG_B, figure_extract.KIND_TABLE, []),
+    ])
+    _use_real_artifact_store(monkeypatch)
+    _use_real_vl_lane(monkeypatch, _FakeVL({
+        ("figure_table", PNG_A): (GOOD_TABLE_JSON, "length"),   # 永遠截斷
+        ("figure_table", PNG_B): (GOOD_TABLE_JSON, "stop"),
+    }))
+
+    RAG.add_document(str(pdf), str(kb_path))     # 不拋例外＝這一張缺席、其餘照常
+
+    out = capsys.readouterr().out
+    chunks = _kb_chunks(kb_path)
+    structured = [c for c in chunks if c.get("structured")]
+    text_chunks = [c for c in chunks if not c.get("structured")]
+
+    assert text_chunks, "文字 chunk 不得因為一張圖抽壞而全部消失"
+    assert {c["figure_id"] for c in structured} == {fid_ok}, (
+        "只有抽壞的那一張缺席", [c["figure_id"] for c in structured])
+    assert not [c for c in chunks if c.get("figure_id") == fid_bad]
+    assert not [c for c in chunks if c.get("origin") == "diagram"], (
+        "抽壞的 figure 不得退回 legacy 自由文字描述——缺席就是缺席")
+    assert "[figure] 失敗 1 張" in out, out
+
+    # 失敗的那一張仍要留在同一份 `failed:false` 的 manifest 裡供覆核
+    manifest_path = tmp_path / structured[0]["evidence_ref"]
+    manifest, entry = _manifest_entry(manifest_path, fid_bad)
+    assert manifest["failed"] is False
+    assert entry["extraction_status"] == figure_extract.EXTRACTION_FAILED
+    assert entry["payload"] is None
+    assert "truncated" in entry["reasons"], entry["reasons"]
+
+    listed = {item["figure_id"]: item
+              for item in figure_review.list_figures(tmp_path, chunks)}
+    assert listed[fid_bad]["in_kb"] is False
+    assert listed[fid_bad]["fixable"] is False
+    assert listed[fid_ok]["in_kb"] is True
+
+
+@pytest.mark.smoke
+def test_transport_failure_still_zero_writes(tmp_path: Path, monkeypatch):
+    """★ `transport`（VL 連不上）維持整份零寫入：那不是「這張圖抽不出來」。
+
+    連線斷掉時「剩下的圖沒問題」這句話沒有證據——後面每一張都會失敗，把它降級成
+    figure-level 只會讓半份文件安靜入庫。
+    """
+    kb_path = _kb_ready(monkeypatch, tmp_path)
+    before = kb_path.read_bytes()
+    pdf, _harness_obj, (fid_bad, _fid_ok) = _vl_case(tmp_path, monkeypatch, [
+        (1, VL_BBOX_A, PNG_A, figure_extract.KIND_TABLE, []),
+        (2, VL_BBOX_B, PNG_B, figure_extract.KIND_TABLE, []),
+    ])
+    _use_real_artifact_store(monkeypatch)
+    _use_real_vl_lane(monkeypatch, _FakeVL({
+        ("figure_table", PNG_A): ConnectionError("connection refused (stub)"),
+        ("figure_table", PNG_B): (GOOD_TABLE_JSON, "stop"),
+    }))
+
+    with pytest.raises(figure_extract.FigureExtractionError, match="transport"):
+        RAG.add_document(str(pdf), str(kb_path))
+
+    assert kb_path.read_bytes() == before, "VL 連線失敗必須整份零寫入"
+    manifests = _manifests(tmp_path)
+    assert manifests, "失敗也要留 per-figure 的覆核紀錄"
+    data = json.loads(manifests[-1].read_text(encoding="utf-8"))
+    assert data["failed"] is True
+
+
+@pytest.mark.smoke
+def test_empty_payload_and_occupancy_mismatch_are_figure_level(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """★ 另外兩種實際踩到的品質失敗也是 figure-level：diagram 空 payload、表格墨跡錯位。"""
+    kb_path = _kb_ready(monkeypatch, tmp_path)
+    pdf, _harness_obj, (fid_empty, fid_grid, fid_ok) = _vl_case(tmp_path, monkeypatch, [
+        (1, VL_BBOX_A, PNG_A, figure_extract.KIND_RASTER, []),
+        (2, VL_BBOX_B, PNG_B, figure_extract.KIND_TABLE, []),
+        (3, VL_BBOX_C, PNG_C, figure_extract.KIND_TABLE, []),
+    ])
+    _use_real_artifact_store(monkeypatch)
+    _use_real_vl_lane(monkeypatch, _FakeVL({
+        ("figure_raster_kind_v1", PNG_A): (json.dumps({"kind": "diagram"}), "stop"),
+        ("figure_diagram", PNG_A): (EMPTY_DIAGRAM_JSON, "stop"),
+        ("figure_table", PNG_B): (OTHER_TABLE_JSON, "stop"),
+        ("figure_table", PNG_C): (GOOD_TABLE_JSON, "stop"),
+    }))
+    # 像素幾何說「這一列只有第 1 欄有墨跡」，模型卻兩欄都填了字 → 墨跡錯位。
+    # 真的 hint 要靠 pymupdf 讀 ruling line 像素，離線測試只換掉那一步。
+    monkeypatch.setattr(
+        figure_verify, "_raster_table_grid_hint",
+        lambda variant: ({"columns": 2, "row_band_nonempty_leftmost": [[1]],
+                          "row_bands": 1, "row_band_spans": [], "image_width_px": 40,
+                          "boundaries_px": [0, 20, 40]}
+                         if bytes(variant.png) == PNG_B else None),
+        raising=False)
+
+    RAG.add_document(str(pdf), str(kb_path))     # 不拋例外＝這一張缺席、其餘照常
+
+    out = capsys.readouterr().out
+    chunks = _kb_chunks(kb_path)
+    structured = [c for c in chunks if c.get("structured")]
+    assert {c["figure_id"] for c in structured} == {fid_ok}, (
+        [c["figure_id"] for c in structured])
+    assert not [c for c in chunks if c.get("origin") == "diagram"]
+    assert "[figure] 失敗 2 張" in out, out
+
+    manifest_path = tmp_path / structured[0]["evidence_ref"]
+    manifest, empty_entry = _manifest_entry(manifest_path, fid_empty)
+    _data, grid_entry = _manifest_entry(manifest_path, fid_grid)
+    assert manifest["failed"] is False
+    for entry, slug in ((empty_entry, "empty_payload"),
+                        (grid_entry, "grid_cell_occupancy_mismatch")):
+        assert entry["extraction_status"] == figure_extract.EXTRACTION_FAILED
+        assert entry["payload"] is None
+        assert slug in entry["reasons"], (slug, entry["reasons"])
+
+    listed = {item["figure_id"]: item
+              for item in figure_review.list_figures(tmp_path, chunks)}
+    for fid in (fid_empty, fid_grid):
+        assert listed[fid]["in_kb"] is False
+        assert listed[fid]["fixable"] is False
+
+
+@pytest.mark.smoke
+def test_failed_figure_bbox_suppresses_legacy_picture_lane(tmp_path: Path, monkeypatch):
+    """★ 抽壞的那一張**不得**退回 legacy 自由文字 VL 描述。
+
+    失敗的 figure 的框沒有進 `covered` 的話，legacy picture lane 會撿起同一個框再產
+    一份自由文字描述——那正是 structured lane 存在的理由要排除的東西。
+    """
+    kb_path = _kb_ready(monkeypatch, tmp_path)
+    pdf, _harness_obj, (fid_bad,) = _vl_case(tmp_path, monkeypatch, [
+        (1, BIG_BBOX_FOR_LANE, PNG_A, figure_extract.KIND_TABLE,
+         [{"class": "picture", "bbox": BIG_BBOX_FOR_LANE}]),
+    ])
+    _use_real_artifact_store(monkeypatch)
+    _use_real_vl_lane(monkeypatch, _FakeVL({
+        ("figure_table", PNG_A): (GOOD_TABLE_JSON, "length"),
+    }))
+    rendered_legacy = []
+    monkeypatch.setattr(RAG, "_render_pdf_figure_png",
+                        lambda _doc, job: rendered_legacy.append(job) or b"PNG")
+    monkeypatch.setattr(RAG, "_describe_technical_image_base64",
+                        lambda *_a, **_k: "# 圖\n\n自由文字描述")
+
+    RAG.add_document(str(pdf), str(kb_path))     # 不拋例外＝這一張缺席、其餘照常
+
+    chunks = _kb_chunks(kb_path)
+    assert rendered_legacy == [], "失敗 figure 的框必須壓掉 legacy picture lane"
+    assert not [c for c in chunks if c.get("origin") == "diagram"]
+    assert not [c for c in chunks if c.get("structured")]
+    assert [c for c in chunks if not c.get("structured")], "文字 chunk 仍要入庫"
+    manifest_path = _manifests(tmp_path)[-1]
+    manifest, entry = _manifest_entry(manifest_path, fid_bad)
+    assert manifest["failed"] is False
+    assert entry["extraction_status"] == figure_extract.EXTRACTION_FAILED

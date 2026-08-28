@@ -155,7 +155,13 @@ class FigureCapabilityError(FigureError):
 
 
 class FigureExtractionError(FigureError):
-    """重試後仍失敗 → 整份 PDF 零寫入（不得以自由文字冒充成功入庫）。
+    """整份 PDF 零寫入的抽取失敗（不得以自由文字冒充成功入庫）。
+
+    留給「剩下的圖也不能信」的情況：VL 連不上 / 逾時（`transport`）、producer
+    contract 破裂（variant 形狀、tile 不連續、候選與結果對不上、來源檔被換掉）。
+    **單張圖的品質失敗不走這裡**：重試後仍不合格的那一張會以
+    `extraction_status=failed` 回傳，只有它不進 KB，其餘照常（見
+    `figure_verify.extract_document_figures`）。
 
     `.results` / `.failed` 由 `figure_verify` 掛上（契約 §12.2），供
     `figure_review.write_run_artifacts(failed=True)` 取用。

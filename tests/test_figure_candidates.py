@@ -1407,12 +1407,15 @@ def test_raster_classified_as_table_falls_back_when_there_is_no_table(
 
 
 @pytest.mark.smoke
-def test_a_broken_table_extraction_still_fails_the_document(tmp_path: Path, monkeypatch):
-    """對照組:**抽壞了**仍然是硬失敗,這條界線一步都不能讓。
+def test_a_broken_table_extraction_never_becomes_content(tmp_path: Path, monkeypatch):
+    """對照組:**抽壞了**就是缺席,這條界線一步都不能讓。
 
     退路只給 `empty_payload`（模型說「這裡沒有表」＝ kind 判錯）。`row_width` 這種
     是模型確實抽到了東西、但格數對不上 —— 那是真的抽壞,放進 KB 會變成一張錯的表。
     其餘 truncated / schema / line_contract / canonicalize / validator 同理。
+
+    2026-08-28 起處置是 figure-level（那一張不進 KB、其餘照常），不再是整份零寫入;
+    但「不得退回 diagram 自由文字、不得帶任何 payload」一個字都沒有放寬。
     """
     figure_verify = pytest.importorskip("figure_verify")
 
@@ -1429,11 +1432,18 @@ def test_a_broken_table_extraction_still_fails_the_document(tmp_path: Path, monk
     calls: list[str] = []
     _install_vl_stub(monkeypatch, figure_verify, calls=calls, script=script)
 
-    with pytest.raises(fe.FigureExtractionError, match="row_width"):
-        list(figure_verify.extract_document_figures(
-            plan, pdf_doc=None, page_evidence=plan.page_evidence,
-            vl_base_url="http://127.0.0.1:8083", vl_model="vl",
-            render_variants=_stub_render))
+    results = list(figure_verify.extract_document_figures(
+        plan, pdf_doc=None, page_evidence=plan.page_evidence,
+        vl_base_url="http://127.0.0.1:8083", vl_model="vl",
+        render_variants=_stub_render))
+
+    assert len(results) == 1, results
+    figure = results[0]
+    assert figure.extraction_status == fe.EXTRACTION_FAILED
+    assert figure.payload is None, "抽壞的表不得帶任何 canonical 內容"
+    assert figure.reasons == ["extraction_failed", "row_width"], figure.reasons
+    assert "row_width" in figure.reason_details[0]
+    assert "figure_diagram" not in calls, ("row_width 不得退回 diagram 自由文字", calls)
 
 
 @pytest.mark.smoke

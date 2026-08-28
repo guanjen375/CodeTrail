@@ -118,6 +118,28 @@ def variant(figure_id, *, variant_id="crop@200dpi", tile_index=0, tile_total=1,
     )
 
 
+def only_failure(results, *, slug: str):
+    """品質失敗的那一張（新契約：figure-level，不再拋例外）。
+
+    2026-08-28 起「重試後仍不合格」只讓那一張缺席：以 `extraction_status=failed`
+    回傳，呼叫端不寫進 KB，其餘候選照常抽完。這裡逐條驗「不得被當成內容用」的
+    形狀——`payload=None`、`model_input_variant="failed"`、`variants` 空、
+    `reasons` 說得出失敗種類。少任何一條，半套的失敗結果就可能被寫進 manifest 或
+    KB，而那正是這批測試原本用「整份零寫入」擋掉的東西。
+    """
+    failed = [r for r in results
+              if r.extraction_status == figure_extract.EXTRACTION_FAILED]
+    assert len(failed) == 1, [(r.figure_id, r.extraction_status) for r in results]
+    entry = failed[0]
+    assert entry.payload is None, "抽壞的圖不得帶 canonical 內容"
+    assert entry.model_input_variant == "failed"
+    assert list(entry.variants) == []
+    assert entry.verification_status == figure_extract.VERIF_NEEDS_REVIEW
+    assert entry.reasons == ["extraction_failed", slug], entry.reasons
+    assert entry.occurrences, "失敗紀錄也要指得出頁碼與框"
+    return entry
+
+
 def words_from(rows):
     """rows: [(y, [(x0, x1, text, block_no?), ...]), ...] → get_text("words") 的 8-tuple。"""
     out = []
@@ -225,17 +247,20 @@ def extract(candidates, evidences, *, render=None, on_progress=None):
 # ============================================================
 @pytest.mark.smoke
 def test_truncated_response_is_fail_loud(monkeypatch):
-    """`finish_reason="length"` 的輸出即使湊巧能 parse 也不得採用。"""
+    """`finish_reason="length"` 的輸出即使湊巧能 parse 也不得採用。
+
+    處置是 figure-level（那一張不進 KB），但「被截斷的內容一個字都不得入庫」
+    這條沒變——回來的是空的失敗紀錄，不是半份表格。
+    """
     spy = VLSpy({"figure_table": REGISTER_TABLE}, finish_reason="length")
     install_vl(monkeypatch, spy)
     pass_probe(monkeypatch)
 
-    with pytest.raises(figure_extract.FigureExtractionError) as excinfo:
-        extract([candidate()], {4: page_evidence()})
+    results = extract([candidate()], {4: page_evidence()})
 
-    message = str(excinfo.value)
-    assert "truncated" in message
-    assert "AICODE_VL_INGEST_MAX_TOKENS" in message, "截斷要給得出可行動的建議"
+    detail = only_failure(results, slug="truncated").reason_details[0]
+    assert "truncated" in detail
+    assert "AICODE_VL_INGEST_MAX_TOKENS" in detail, "截斷要給得出可行動的建議"
     # 重試一次（config.FIGURE_EXTRACT_RETRIES）之後才放棄
     assert len(spy.calls) == 1 + config.FIGURE_EXTRACT_RETRIES
 
@@ -319,14 +344,13 @@ def test_truncation_without_headroom_fails_without_repeating_the_call(monkeypatc
     install_vl(monkeypatch, spy)
     pass_probe(monkeypatch)
 
-    with pytest.raises(figure_extract.FigureExtractionError) as excinfo:
-        extract([candidate()], {4: page_evidence()})
+    results = extract([candidate()], {4: page_evidence()})
 
     assert len(spy.calls) == 1, ("沒有更大的預算可用還是重送一次", spy.budgets)
-    message = str(excinfo.value)
-    assert "truncated" in message
-    assert "8192" in message, ("訊息要帶得出 server n_ctx / 已用預算的實際數字", message)
-    assert "AICODE_VL_INGEST_MAX_TOKENS" in message
+    detail = only_failure(results, slug="truncated").reason_details[0]
+    assert "truncated" in detail
+    assert "8192" in detail, ("訊息要帶得出 server n_ctx / 已用預算的實際數字", detail)
+    assert "AICODE_VL_INGEST_MAX_TOKENS" in detail
 
 
 @pytest.mark.smoke
@@ -344,9 +368,8 @@ def test_http_200_but_not_schema_json_is_fail_loud(monkeypatch, text, slug):
     install_vl(monkeypatch, spy)
     pass_probe(monkeypatch)
 
-    with pytest.raises(figure_extract.FigureExtractionError) as excinfo:
-        extract([candidate()], {4: page_evidence()})
-    assert slug in str(excinfo.value)
+    results = extract([candidate()], {4: page_evidence()})
+    assert slug in only_failure(results, slug=slug).reason_details[0]
 
 
 @pytest.mark.smoke
@@ -360,11 +383,10 @@ def test_row_width_mismatch_is_fail_loud(monkeypatch):
     install_vl(monkeypatch, spy)
     pass_probe(monkeypatch)
 
-    with pytest.raises(figure_extract.FigureExtractionError) as excinfo:
-        extract([candidate()], {4: page_evidence()})
-    message = str(excinfo.value)
-    assert "row_width" in message
-    assert "2 格" in message and "3 欄" in message, "訊息要指得出是哪一列、差多少"
+    results = extract([candidate()], {4: page_evidence()})
+    detail = only_failure(results, slug="row_width").reason_details[0]
+    assert "row_width" in detail
+    assert "2 格" in detail and "3 欄" in detail, "訊息要指得出是哪一列、差多少"
 
 
 @pytest.mark.smoke
@@ -592,7 +614,11 @@ def test_probe_cache_stores_only_fingerprint_and_timestamp(monkeypatch, tmp_path
 
 @pytest.mark.smoke
 def test_failure_never_returns_partial_results(monkeypatch):
-    """先成功一張、下一張失敗 → raise，且成功那張只出現在 `.results`。"""
+    """先成功一張、下一張品質失敗 → 兩張都回來，壞的那張是**空的**失敗紀錄。
+
+    「不得回半套結果」在 figure-level 契約下更嚴格：失敗那張不准帶任何 payload
+    （半份表格比缺席更危險），而且不得把成功那張一起拖走。
+    """
     spy = VLSpy({"figure_table": [REGISTER_TABLE, REGISTER_TABLE, "{broken", "{broken"]})
     install_vl(monkeypatch, spy)
     pass_probe(monkeypatch)
@@ -600,16 +626,14 @@ def test_failure_never_returns_partial_results(monkeypatch):
     first = candidate(seed="ok", page=2, asset_digest="a")
     second = candidate(seed="bad", page=3, asset_digest="b", index=2)
 
-    with pytest.raises(figure_extract.FigureExtractionError) as excinfo:
-        extract([first, second], {2: page_evidence(page=2), 3: page_evidence(page=3)})
+    results = extract([first, second],
+                      {2: page_evidence(page=2), 3: page_evidence(page=3)})
 
-    error = excinfo.value
-    assert [r.figure_id for r in error.results] == [first.figure_id]
-    assert error.failed.figure_id == second.figure_id
-    assert error.failed.payload is None
-    assert error.failed.extraction_status == figure_extract.EXTRACTION_FAILED
-    assert error.failed.verification_status == figure_extract.VERIF_NEEDS_REVIEW
-    assert error.failed.occurrences, "失敗 artifact 也要指得出頁碼與框"
+    complete = [r for r in results
+                if r.extraction_status == figure_extract.EXTRACTION_COMPLETE]
+    assert [r.figure_id for r in complete] == [first.figure_id]
+    assert complete[0].payload, "壞掉的那張不得把成功那張一起拖走"
+    assert only_failure(results, slug="not_json").figure_id == second.figure_id
 
 
 @pytest.mark.smoke
@@ -1161,9 +1185,8 @@ def test_terminal_line_contract_is_enforced_on_the_model(monkeypatch):
     spy = VLSpy({"figure_terminal": bad})
     install_vl(monkeypatch, spy)
     pass_probe(monkeypatch)
-    with pytest.raises(figure_extract.FigureExtractionError) as excinfo:
-        extract([terminal_candidate()], {4: page_evidence()})
-    assert "line_contract" in str(excinfo.value)
+    results = extract([terminal_candidate()], {4: page_evidence()})
+    assert "line_contract" in only_failure(results, slug="line_contract").reason_details[0]
 
 
 def test_unlocatable_tokens_only_reach_the_sidecar():

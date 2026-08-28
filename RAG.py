@@ -1045,10 +1045,15 @@ def _occurrence_signature(occurrences) -> tuple:
 def _verify_results_match_candidates(fx, filename, plan, results) -> Dict[str, object]:
     """candidate ↔ FigureResult 必須一一對應，否則整份 PDF 零寫入。
 
-    extractor 少回一張、多回一張、回錯 document / 頁 / 框 / occurrence，或回一張
-    `extraction_status != complete`，都代表「每張候選可監督」與「零部分成功」
-    已經破了。這種情況**不得**降級成 `no_pos_cannot_replace`（那是保留原文的
-    正常路徑），必須 hard fail。
+    extractor 少回一張、多回一張、回錯 document / 頁 / 框 / occurrence，都代表
+    「每張候選可監督」已經破了。這種情況**不得**降級成 `no_pos_cannot_replace`
+    （那是保留原文的正常路徑），必須 hard fail。
+
+    `extraction_status` 只有兩種合法形狀，其餘一律 hard fail：
+    `complete` 必須帶 payload；`failed`（品質失敗、那一張不進 KB）必須是
+    `payload=None` **且** `model_input_variant="failed"`——半套的失敗結果
+    （有 payload 卻宣稱 failed、或宣稱送過某個 variant）會讓 manifest 記下一張
+    誰也說不清有沒有進 KB 的圖。
 
     occurrence 比對用 `(page, 量化 bbox, index)` 的**保序序列**，不是頁碼集合：
     降成集合的話，錯 bbox、錯 index、同頁重複次數不同都會通過。
@@ -1094,7 +1099,14 @@ def _verify_results_match_candidates(fx, filename, plan, results) -> Dict[str, o
             raise fx.FigureExtractionError(
                 f"{where}: occurrence 身分與候選不同（結果 {list(result_occ)}；"
                 f"候選 {list(candidate_occ)}）——manifest、crop 與 chunk 會指向不同位置")
-        if figure.extraction_status != fx.EXTRACTION_COMPLETE or figure.payload is None:
+        if figure.extraction_status == fx.EXTRACTION_FAILED:
+            if figure.payload is not None or figure.model_input_variant != "failed":
+                raise fx.FigureExtractionError(
+                    f"{where}: extraction_status=failed 卻帶 "
+                    f"payload={'有' if figure.payload else '無'}、"
+                    f"model_input_variant={figure.model_input_variant!r}"
+                    "（應為 None / 'failed'）。整份文件零寫入。")
+        elif figure.extraction_status != fx.EXTRACTION_COMPLETE or figure.payload is None:
             raise fx.FigureExtractionError(
                 f"{where}: extraction_status={figure.extraction_status!r}、"
                 f"payload={'有' if figure.payload else '無'}。整份文件零寫入。")
@@ -1657,6 +1669,25 @@ def _source_identity_snapshot(root_path: Path, file_path: str) -> Optional[str]:
             "無法證明後續每一步讀到的是同一份檔案，整份文件零寫入。") from exc
 
 
+def _failure_slug(figure) -> str:
+    """失敗 figure 的失敗種類（`reasons` 裡 `extraction_failed` 以外的那一個）。"""
+    for reason in figure.reasons or []:
+        if reason != "extraction_failed":
+            return str(reason)
+    return "unknown"
+
+
+def _format_failed_figures(failed: List) -> str:
+    """「哪幾張缺席」的單行摘要；沒有失敗就回空字串（不印）。"""
+    if not failed:
+        return ""
+    items = "；".join(
+        f"p{int(figure.page)} {figure.kind} {_failure_slug(figure)}"
+        for figure in failed
+    )
+    return f"[figure] 失敗 {len(failed)} 張（不進 KB）：{items}"
+
+
 def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict], *,
                                 root: Optional[str], preflight_only: bool,
                                 legacy_jobs: List[Dict], legacy_max_fig: Dict[int, int],
@@ -1668,6 +1699,7 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
     之前**必須先過 preflight。
     """
     inactive = {"active": False, "preflight_only": False, "figures": [],
+                "failed_figures": [], "failed_summary": "",
                 "replacements": {}, "page_source": {}, "covered": {},
                 "evidence_ref": {}, "guard": None}
     root_path = _figure_root(root)
@@ -1825,12 +1857,22 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
         # failed artifact，否則「失敗的候選仍可監督」這條就只在 extractor 自己
         # 拋錯時成立。
         results = []
+        failed_figures: List = []
         try:
-            results = list(fx.extract_document_figures(
+            extracted = list(fx.extract_document_figures(
                 plan, pdf_doc=pdf_doc, page_evidence=plan.page_evidence,
                 vl_base_url=LLAMA_VL_BASE_URL, vl_model=VL_MODEL,
                 render_variants=_record, record_generated_variant=_record_generated,
                 on_progress=_progress))
+            # 品質失敗的那幾張（`extraction_status=failed`）**不進 KB**，但要留在同一份
+            # `failed:false` 的 manifest 裡供覆核。從這裡開始只有 complete 的往下走：
+            # chunk、page partition、覆核影像、人工確認沿用都只對得起有 payload 的結果。
+            # 一一對應驗證是唯一的例外——它要看的是「每張候選都有交代」，所以吃未拆的
+            # 完整 list。
+            failed_figures = [figure for figure in extracted
+                              if figure.extraction_status != fx.EXTRACTION_COMPLETE]
+            results = [figure for figure in extracted
+                       if figure.extraction_status == fx.EXTRACTION_COMPLETE]
 
             # renderer 可能先產生原圖，verifier 再以同尺寸的衍生 variant 取代它做
             # structured extraction。只有 FigureResult.variants 宣告的 id 才真的送過
@@ -1845,7 +1887,7 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
                     getattr(variant, "variant_id", "")) in declared_inputs
             ]
 
-            by_fid = _verify_results_match_candidates(fx, filename, plan, results)
+            by_fid = _verify_results_match_candidates(fx, filename, plan, extracted)
             _check_claimed_variants(fx, filename, results, rendered)
             # 契約 §15.7：extract_document_figures 之後、build_figure_chunks 之前，
             # 而且要在寫 manifest 之前（新 run 的 manifest 也要記到人工 payload）。
@@ -1864,7 +1906,7 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
                 partial.append(failed)
             if not partial:
                 # post-validation 失敗時 extractor 沒有掛 partial，用它回的那批
-                partial = list(results)
+                partial = list(results) + list(failed_figures)
             _write_failed(partial)
             raise
 
@@ -1886,6 +1928,15 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             page = int(figure.page)
             sequence[page] = max(sequence.get(page, 0), legacy_max_fig.get(page, 0)) + 1
             numbered_dropped.append(_dc_replace(figure, figure_index=sequence[page]))
+        # 抽壞的那幾張排在最後編號：它們不進 KB，不該把已入庫那幾張的頁內序號往後推。
+        numbered_failed = []
+        for figure in sorted(failed_figures, key=lambda f: (f.page, f.figure_index)):
+            page = int(figure.page)
+            sequence[page] = max(sequence.get(page, 0), legacy_max_fig.get(page, 0)) + 1
+            numbered_failed.append(_dc_replace(figure, figure_index=sequence[page]))
+        failed_summary = _format_failed_figures(numbered_failed)
+        if failed_summary:
+            _progress(failed_summary)
         # 發布成功 manifest **之前**先重驗來源身分：先寫再驗的話，身分不符時會留下
         # 一份 `failed:false` 的 manifest，宣稱一次根本沒有成立的成功 run（契約 §18.2）。
         _assert_source_identity(fx, filename, source_path, root_path, document_id,
@@ -1893,7 +1944,8 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
 
         manifest = fx.write_run_artifacts(
             root_path, document_id=document_id, run_id=run_id,
-            figures=numbered_eligible + numbered_dropped, variants=rendered, failed=False,
+            figures=numbered_eligible + numbered_dropped + numbered_failed,
+            variants=rendered, failed=False,
             preflight=plan.preflight, stats=plan.stats,
             source_signatures=source_signatures, review_assets=review_assets,
             human_verifications=human_verifications)
@@ -1921,6 +1973,11 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
         covered: Dict[int, List] = {}
         for figure in numbered_eligible:
             covered.setdefault(int(figure.page), []).append(tuple(figure.bbox))
+        for figure in numbered_failed:
+            # 抽壞的那一張也要壓掉 legacy crop：不壓的話 `_pdf_figure_chunks` 會撿起
+            # 同一個框做自由文字描述，等於用「看圖說故事」補上 structured lane 明明
+            # 判定為不可信的內容。缺席就是缺席。
+            covered.setdefault(int(figure.page), []).append(tuple(figure.bbox))
         for page, boxes in retained.items():
             # 保留原 markdown 的表也要壓掉 legacy crop：文字層已經有那張表，
             # 再產一份自由文字描述就是第二個互相競爭的版本
@@ -1930,6 +1987,10 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             "active": True,
             "preflight_only": False,
             "figures": numbered_eligible,
+            # 不進 KB，但呼叫端要印得出「哪幾張缺席」——ingest 仍然 exit 0，
+            # 使用者只從 chunk 數看不出少了什麼。
+            "failed_figures": numbered_failed,
+            "failed_summary": failed_summary,
             "replacements": replacements,
             # 套替換前要確認「當初算 pos 的那份文字」與現在手上這份是同一個字串，
             # 畸形 metadata 讓兩個 page dict 撞同一頁碼時才不會切錯位置
@@ -2164,6 +2225,10 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
         ))
         print(f"[INFO] 結構化 figure 入庫: {len(numbered)} 張 → "
               f"{len(document.chunks) - before} 個 structured chunk", flush=True)
+    if lane.get("failed_summary"):
+        # 品質失敗只讓那一張缺席，ingest 仍然 exit 0——所以「少了哪幾張」必須自己
+        # 說出來，否則使用者只會看到一個比預期少的 chunk 數。
+        print(lane["failed_summary"], flush=True)
     return document
 
 

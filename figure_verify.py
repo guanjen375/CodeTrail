@@ -21,8 +21,11 @@
 ── 抽取失敗 vs 驗證等級不足（兩件不同的事）────────────────────────────
 * **抽取失敗**（JSON 壞掉 / schema 不合 / 欄寬不對 / 行 contract 違反 /
   `finish_reason` 截斷 / 接合後 payload 失去合法結構）→ 重試一次
-  （`config.FIGURE_EXTRACT_RETRIES`）→ 仍失敗即 `FigureExtractionError`，
-  **整份 PDF 零寫入**。沒有自由文字 fallback，沒有 legacy 開關。
+  （`config.FIGURE_EXTRACT_RETRIES`）→ 仍失敗即**這一張不進 KB**：回傳一筆
+  `extraction_status=failed` 的 `FigureResult`，其餘 figure 與全部文字 chunk 照常
+  入庫。沒有自由文字 fallback，沒有 legacy 開關——缺席就是缺席。
+  例外是 `transport`（VL 連不上）：連線斷掉時「剩下的圖沒問題」這句話沒有證據，
+  仍然 `FigureExtractionError`、**整份 PDF 零寫入**。
   其中**截斷是輸出預算不夠，不是內容不合格**：那一次重試會把 `max_tokens` 加大到
   server context 還放得下的程度（`_next_output_budget()`），加不上去就不送——
   同一個預算重送是逐字相同的請求，greedy 取樣必然重播同一個 `length`。
@@ -3877,7 +3880,13 @@ def _build_result(candidate, kind: str, payload: dict, findings: _Findings, evid
 
 
 def _failed_result(candidate, kind: str, reason: str) -> FigureResult:
-    """抽取失敗時給 T5 寫 review artifact 用（契約 §12.2）。**永不**回傳給呼叫端。"""
+    """抽取失敗時可覆核的 `FigureResult`（契約 §12.2）：`payload=None`、
+    `model_input_variant="failed"`、`variants=[]`。
+
+    兩個用途：整份零寫入（transport / producer contract）時掛在例外的 `.failed` 上供
+    T5 寫 failed artifact；品質失敗時由 `extract_document_figures` 直接回給呼叫端，
+    寫進同一份 `failed:false` 的 manifest（那一張不進 KB）。
+    """
     bbox = tuple(getattr(candidate, "bbox", (0.0, 0.0, 0.0, 0.0)))
     page = int(getattr(candidate, "page", 1) or 1)
     failed_kind = (kind if kind in figure_extract.FIGURE_KINDS
@@ -4806,9 +4815,18 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
     """把 `FigurePlan` 的候選變成 `FigureResult` list（契約 §6.4）。
 
     native lane（有原生文字/幾何）零 VL；VL lane 只用在沒有原生文字的候選。
-    任一 table/terminal 候選重試後仍不合格 → `FigureExtractionError`，訊息帶
-    `.results`（已完成的）與 `.failed`（失敗那張），供 T5 寫失敗 artifact；
-    **整份 PDF 零寫入**，函式不會回傳半套結果。
+
+    **品質失敗是 figure-level 的**：某個候選重試後仍不合格（`_SampleFailure`，
+    slug ≠ `transport`）→ 那一張以 `extraction_status=failed` / `payload=None` 回傳，
+    其餘候選照常抽完，呼叫端只是不把它寫進 KB。VL 輸出本來就有隨機性，文件級的
+    全有全無會把它放大成「整份文件進不進得去看運氣」（2026-08-28 實測：120 頁的
+    PDF 因為三張圖抽壞而完全灌不進去）。
+
+    `transport`（VL 連不上 / timeout，重試後仍失敗）仍是**整份 PDF 零寫入**：
+    連線斷掉時「剩下的圖沒問題」這句話沒有證據。producer contract 破了
+    （variant 形狀、tile 不連續、缺 PageEvidence 等 `FigureExtractionError`）也一樣。
+    這兩種情況的例外訊息帶 `.results`（已完成的）與 `.failed`（失敗那張），
+    供 T5 寫失敗 artifact。
 
     `ensure_capability` 在這裡再跑一次（fingerprint 快取讓 `RAG.py` 那次成為
     cache hit）：把「probe 不過 ⇒ 零抽取」變成本模組自己的不變式，而不是依賴
@@ -4835,6 +4853,9 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
         ensure_capability(base_url=vl_base_url, model=vl_model, kinds=vl_kinds)
 
     results: list[FigureResult] = []
+    # 品質失敗（`_SampleFailure`，slug ≠ transport）的那幾張：不進 KB，但要跟成功的
+    # 一起回給呼叫端，才留得下 `failed:false` manifest 裡可覆核的紀錄。
+    failed: list[FigureResult] = []
     counters: dict[str, int] = {"vl_calls": 0, "image_tokens": 0, "vl_calls_saved": 0}
     per_page: dict[int, int] = {}
     # key = planner 宣告的 `(asset_digest, requested kind)`（契約 §19.3）
@@ -4962,15 +4983,36 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
                         }
         except _SampleFailure as exc:
             hint = _FAILURE_HINTS.get(exc.slug, "")
+            if exc.slug == "transport":
+                # VL 連不上不是「這張圖抽不出來」：後面每一張都會失敗，降級成
+                # figure-level 只會讓半份文件安靜入庫。
+                message = (
+                    f"{where}: VL 連線失敗（transport）：{exc.detail}"
+                    + (f"。建議：{hint}" if hint else "")
+                    + "。重試後仍失敗 → 整份 PDF 零寫入"
+                )
+                error = figure_extract.FigureExtractionError(message)
+                error.results = results
+                error.failed = _failed_result(candidate, kind, message)
+                raise error from exc
             message = (
                 f"{where}: structured 抽取失敗（{exc.slug}）：{exc.detail}"
                 + (f"。建議：{hint}" if hint else "")
-                + "。重試後仍不合格 → 整份 PDF 零寫入"
+                + "。重試後仍不合格 → 這一張不進 KB，其餘照常"
             )
-            error = figure_extract.FigureExtractionError(message)
-            error.results = results
-            error.failed = _failed_result(candidate, kind, message)
-            raise error from exc
+            sequence = per_page.get(page, 0) + 1
+            per_page[page] = sequence
+            failed_result = replace(
+                _failed_result(candidate, kind, message),
+                figure_index=sequence,
+                reasons=["extraction_failed", exc.slug],
+            )
+            failed.append(failed_result)
+            # kind 印 `_failed_result` 正規化過的那個（raster 是候選階段的暫時分類，
+            # manifest 與 lane 摘要都記正規化後的 kind——三處說法要一致）。
+            progress(f"[figure] 失敗 p{page} kind={failed_result.kind} "
+                     f"slug={exc.slug}（這一張不進 KB）")
+            continue
         except figure_extract.FigureExtractionError as exc:
             exc.results = results
             exc.failed = _failed_result(candidate, kind, str(exc))
@@ -4980,9 +5022,10 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
         per_page[page] = sequence
         results.append(replace(result, figure_index=sequence))
 
+    # 只吃 complete 的：跨頁接續要拿得到 payload 才判得了「這是上一張的續表」。
     results = _repair_cross_page_table_continuations(results, candidates)
     progress(
         f"[figure] 完成 {len(results)} 張（VL 呼叫 {counters['vl_calls']} 次，"
         f"重複影像省下 {counters['vl_calls_saved']} 次）"
     )
-    return results
+    return results + failed

@@ -319,11 +319,18 @@ batch size 上限是 32 (REF1)。
 python3 RAG.py docs/datasheet.pdf knowledge.json --preflight
 ```
 
-##### 零部分成功
+##### 抽壞的那一張缺席,不是整份零寫入
 
 結構化 lane 的 schema / validator / row width / line contract / `finish_reason` 任一最終不合格
-→ **整份 PDF 零寫入**,舊 KB 與向量保持原狀(可能留下失敗的 review artifact,但不會冒充成功
-入庫)。需要 VL 的候選會在動 KB 之前先做 capability probe:端點真的吃 image content part、
+→ **那一張圖不進 KB**(不冒充成功入庫,也不退回自由文字描述),其餘 figure 與全部文字 chunk
+照常入庫;stdout 會印一行 `[figure] 失敗 N 張(不進 KB):p31 diagram truncated;…`,失敗的那幾張
+仍留在同一份 review artifact 裡,用 `review_figures(action="list")` 看得到(`in_kb: False`)。
+VL 的輸出本來就有隨機性,把它綁成文件級的全有全無,等於讓「整份文件進不進得去」看運氣。
+
+**仍然整份 PDF 零寫入**的是「剩下的圖也不能信」那幾種:VL 連不上 / 逾時、預算超限、
+capability probe 未過、來源檔中途被換掉,以及候選與結果對不上這類契約破裂——舊 KB 與向量
+保持原狀(可能留下 `failed:true` 的 review artifact)。需要 VL 的候選會在動 KB 之前先做
+capability probe:端點真的吃 image content part、
 接受本專案的 nested `json_schema`、能完成一張極小且不含機敏內容的 canary 並通過外部 validator。
 不通過就 fail-loud 指出缺哪一項,不以「OpenAI-compatible」推定品質。
 
@@ -343,8 +350,8 @@ crop 那一行會標**模型到底有沒有看過這張圖**:`variants/` 裡的�
 抽取結果,等於在確認一件沒發生過的事,所以工具會明講是哪一種。native lane(原生表格)
 本來就零 VL 呼叫,它的 crop 一律只供覆核。
 
-抽取失敗、因此依「零部分成功」沒有進知識庫的圖也會列出來(標 `in_kb: False` /
-`fixable: False`,從 review artifacts 讀),失敗原因看得到,只是不能直接 `fix`。
+抽取失敗、因此沒有進知識庫的圖也會列出來(標 `in_kb: False` / `fixable: False`,從 review
+artifacts 讀),失敗原因看得到,只是不能直接 `fix`——要救那一張就重新 ingest 那份 PDF。
 
 改好之後送回:
 
