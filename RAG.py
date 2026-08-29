@@ -49,6 +49,7 @@ from knowledge_store import (
 # - 所有模式都需要 llama-server embedding 端點 (預設 8081)
 
 import context_signals
+import ingest_notify
 import kb_cache
 import llama_client
 
@@ -1669,12 +1670,20 @@ def _source_identity_snapshot(root_path: Path, file_path: str) -> Optional[str]:
             "無法證明後續每一步讀到的是同一份檔案，整份文件零寫入。") from exc
 
 
-def _failure_slug(figure) -> str:
-    """失敗 figure 的失敗種類（`reasons` 裡 `extraction_failed` 以外的那一個）。"""
-    for reason in figure.reasons or []:
+def _failure_reason_slug(reasons) -> str:
+    """`reasons` 裡 `extraction_failed` 以外的第一個 slug；沒有就 `unknown`。
+
+    `extraction_failed` 只說「壞了」，不說壞在哪；使用者要看的是後面那個。
+    """
+    for reason in reasons or []:
         if reason != "extraction_failed":
             return str(reason)
     return "unknown"
+
+
+def _failure_slug(figure) -> str:
+    """失敗 figure 的失敗種類（`reasons` 裡 `extraction_failed` 以外的那一個）。"""
+    return _failure_reason_slug(figure.reasons)
 
 
 def _format_failed_figures(failed: List) -> str:
@@ -1716,6 +1725,11 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             "source": filename,
             "human_baseline": None,
             "wrote_run": False,
+            # 這條路徑沒有建立 run，也沒有任何 figure 抽壞；提交時的摘要仍然要
+            # 讀得到這兩個 key（少一個就得在提交點寫 `.get()` 分支，那就是第二份
+            # 對 guard 形狀的假設）。
+            "run_id": "",
+            "failed": [],
         }}
     if kb_path is None:
         # 呼叫端沒指定就用專案預設的知識庫（`mcp_server.ingest_document` 也是這一份）。
@@ -2004,6 +2018,17 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
                 "source": filename,
                 "human_baseline": human_baseline,
                 "wrote_run": True,
+                "run_id": str(run_id),
+                # 抽壞的那幾張不進 KB，所以提交點掃 KB chunks 是看不到它們的；
+                # 這裡順手記下來（零內容，只有頁碼／身分／固定 slug），提交後的
+                # 摘要才講得出「這一次少了哪幾張」。
+                "failed": [
+                    {"page": int(figure.page), "kind": str(figure.kind),
+                     "figure_id": str(figure.figure_id),
+                     "figure_index": int(figure.figure_index),
+                     "reason": _failure_slug(figure)}
+                    for figure in numbered_failed
+                ],
             },
         }
     finally:
@@ -3404,6 +3429,185 @@ def _file_location(path) -> str:
         return str(Path(path).absolute())
 
 
+_UNFIXABLE_ARTIFACT_WARNINGS = frozenset({
+    "artifact_unavailable", "artifact_missing_figure", "artifact_unreadable",
+})
+
+
+def _summary_item(entry: Dict) -> Dict:
+    """覆核清單的一列 → 摘要行的一個元素（只有身分，零內容）。"""
+    return {
+        "page": int(entry.get("page") or 0),
+        "figure_index": int(entry.get("figure_index") or 0),
+        "figure_id": str(entry.get("figure_id") or ""),
+        "kind": str(entry.get("kind") or ""),
+    }
+
+
+def _unfixable_reason(entry: Dict) -> str:
+    """為什麼這一張沒辦法就地覆核（值域凍結成三個 slug）。"""
+    warnings = {str(name) for name in (entry.get("warnings") or [])}
+    if warnings & _UNFIXABLE_ARTIFACT_WARNINGS:
+        return "artifact_missing"
+    if entry.get("payload") is None or entry.get("payload_error"):
+        return "payload_unreadable"
+    return "not_fixable"
+
+
+def _fallback_status_counts(committed_chunks) -> Dict:
+    """覆核清單讀不到時的退路：直接數 chunk 的 `verification_status`。
+
+    仍然以 **figure 為單位**（同一張圖被切成多個 chunk 只算一次），取最差的那個
+    狀態——與 `aggregate_status` 同一條規則，不然多切幾刀的表就會被高報成可信。
+    """
+    grouped: Dict[str, List[str]] = {}
+    for index, chunk in enumerate(committed_chunks or []):
+        if not isinstance(chunk, dict) or not chunk.get("structured"):
+            continue
+        status = str(chunk.get("verification_status") or "")
+        if not status:
+            continue
+        key = str(chunk.get("figure_id") or "") or f"#{index}"
+        grouped.setdefault(key, []).append(status)
+    if not grouped:
+        # 六個非 PDF 入口（截圖 / 網頁 / 圖片…）永遠走這裡：沒有 structured
+        # chunk 就不需要把 figure lane 的模組拉進來。
+        return {}
+    ranks = getattr(_figure_extract(), "VERIFICATION_RANK", {})
+    worst = {key: min(statuses, key=lambda name: ranks.get(name, -1))
+             for key, statuses in grouped.items()}
+    counts: Dict[str, int] = {}
+    for status in worst.values():
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _finish_summary_payload(payload: Dict) -> Dict:
+    """補上精確 total、把三個 list 截到協定上限。
+
+    `ingest_notify.format_summary_line` 是**逐字**序列化（寫出去的就是這份 dict），
+    所以「形狀完整」與「行不會無限長」都是產生端的責任：total 一定是截斷**之前**
+    的精確數量，list 才是被砍過的那一段。
+    """
+    for list_key, total_key in (("review", "review_total"),
+                                ("unfixable", "unfixable_total"),
+                                ("failed", "failed_total")):
+        items = payload.get(list_key) or []
+        payload[total_key] = len(items)
+        payload[list_key] = items[:ingest_notify.MAX_PAYLOAD_ITEMS]
+    return payload
+
+
+def _fallback_review_items(committed_chunks) -> List[Dict]:
+    """覆核清單讀不到時，直接從已提交的 chunk 挑出待覆核的圖（以 figure 為單位）。
+
+    判不出 `fixable`，所以 `needs_review` 一律當「可覆核」列出：那一類本來就有
+    下一步（去看原圖、修正）。`unverified` / `legacy_unverified` 則**不列** ——
+    它們沒有可執行的下一步，列出來只是假警報（契約 §2.3）。
+    """
+    fx = _figure_extract()
+    # **只有 `needs_review`**。`FLAGGED_VERIFICATION` 還含 `unverified` /
+    # `legacy_unverified` —— 契約 §2.3 明訂那兩種不列、不提:它們沒有「使用者
+    # 該做什麼」可講,列出來只是把每次 ingest 都變成一則假警報,然後使用者學會
+    # 忽略整個通知。「寧可多叫」在這裡是錯的,因為多叫的那些沒有下一步。
+    needs_review = getattr(fx, "VERIF_NEEDS_REVIEW", "needs_review")
+    seen: Dict[str, Dict] = {}
+    for chunk in committed_chunks or []:
+        if not isinstance(chunk, dict) or not chunk.get("structured"):
+            continue
+        if str(chunk.get("verification_status") or "") != needs_review:
+            continue
+        figure_id = str(chunk.get("figure_id") or "")
+        if not figure_id or figure_id in seen:
+            continue
+        seen[figure_id] = {
+            "page": int(chunk.get("page") or 0),
+            "figure_index": int(chunk.get("figure_index") or 0),
+            "figure_id": figure_id,
+            "kind": str(chunk.get("figure_kind") or ""),
+        }
+    return [seen[key] for key in sorted(seen)]
+
+
+def _ingest_summary_line(document: ExtractedDocument, committed_chunks,
+                         figure_guard: Optional[Dict]) -> str:
+    """本次 ingest 的單行機器可讀摘要（`ingest_notify` 的 payload 契約 §2.1）。
+
+    父行程（MCP server）拿得到的只有這條子行程的 stdout，所以「這一次發生了
+    什麼」必須由知情的這一端講。父行程自己去掃 KB 的話會把**別次 run**、甚至
+    別份文件的舊帳算進來——舊 run 的失敗每次 ingest 都重報一次，通知就廢了。
+
+    資料來源刻意用 `list_figures`（`review_figures(action="list")` 看到的同一份），
+    不另外自己掃 manifest：兩份實作一漂移，通知說有 3 張待覆核、工具列出 5 張。
+    """
+    guard = figure_guard or {}
+    root = str(guard.get("root") or "")
+    document_id = str(guard.get("document_id") or "")
+    run_id = str(guard.get("run_id") or "")
+    payload: Dict = {
+        "schema": ingest_notify.SUMMARY_SCHEMA,
+        "document": document.source,
+        "document_id": document_id,
+        "run_id": run_id,
+        "status_counts": {},
+        "review": [], "unfixable": [], "failed": [],
+    }
+
+    entries = None
+    if root and document_id:
+        try:
+            entries = _figure_extract().list_figures(
+                root, committed_chunks, document_id=document_id)
+        except Exception as exc:  # noqa: BLE001 — KB 已提交，摘要只能降級不能失敗
+            print(f"[WARN] 讀不到覆核清單（{exc}）；本次摘要只報抽取失敗的圖。")
+            entries = None
+
+    if entries is None:
+        # 退路：guard 自己記下來的失敗清單 ＋ chunk 級狀態統計。
+        payload["failed"] = [dict(item) for item in (guard.get("failed") or [])]
+        payload["status_counts"] = _fallback_status_counts(committed_chunks)
+        # **待覆核也要列出來**。只留 status_counts 的話，一次成功入庫、而且有
+        # needs_review 圖的 ingest 會回 `status: ok`、plugin 也不通知 —— 使用者
+        # 無聲漏掉必要的覆核，那正是這條通知鏈存在的理由。
+        # 這條路徑讀不到覆核清單，所以判不出 fixable：一律當成「可覆核」列出。
+        # 寧可多叫一次，也不要漏掉一張。
+        payload["review"] = _fallback_review_items(committed_chunks)
+        return ingest_notify.format_summary_line(_finish_summary_payload(payload))
+
+    fx = _figure_extract()
+    counts: Dict[str, int] = {}
+    for entry in entries:
+        status = str(entry.get("verification_status") or "")
+        item = _summary_item(entry)
+        if not entry.get("in_kb"):
+            # **只算本次 run**：artifacts 裡還躺著以前那幾次的失敗，全算進來的話
+            # 每次 ingest 都會重報同一批舊帳（「舊 run 零誤報」）。
+            if not run_id or str(entry.get("run_id") or "") != run_id:
+                continue
+            item["reason"] = _failure_reason_slug(entry.get("reasons"))
+            payload["failed"].append(item)
+            continue
+        if status:
+            counts[status] = counts.get(status, 0) + 1
+        # **只有 `needs_review` 會進通知**（契約 §2.3）。`unverified` /
+        # `legacy_unverified` 即使 artifact 壞掉也不列：它們本來就沒有「使用者
+        # 該做什麼」——叫人 remove + 重灌，重灌完多半還是 unverified、artifact
+        # 還是那樣，是一條**不會收斂**的指示。這也讓正常路徑與 fallback 路徑
+        # 給出同一套答案（兩邊不一致比兩邊都保守更糟）。
+        if status != fx.VERIF_NEEDS_REVIEW:
+            continue
+        if (not entry.get("fixable") or entry.get("payload_error")
+                or entry.get("payload") is None):
+            # 看不到 payload / 原圖就沒有可覆核的證據，`action="fix"` 幫不上忙；
+            # 唯一的路是 remove + 重灌。
+            item["reason"] = _unfixable_reason(entry)
+            payload["unfixable"].append(item)
+        else:
+            payload["review"].append(item)
+    payload["status_counts"] = counts
+    return ingest_notify.format_summary_line(_finish_summary_payload(payload))
+
+
 def _commit_document_to_kb(
     document: ExtractedDocument,
     output_file: str,
@@ -3538,6 +3742,14 @@ def _commit_document_to_kb(
             )
         except Exception as exc:  # noqa: BLE001 — 清理失敗不得回頭影響已提交的 KB
             print(f"[WARN] figure review artifacts 清理失敗（KB 已成功寫入）: {exc}")
+
+    # 摘要是這次 ingest 的**唯一**機器可讀出口，而且只在提交成功之後才印：
+    # 失敗路徑（回 False / raise）印了就是宣稱一次沒發生的入庫。放在 prune
+    # 之後是為了讓清掉的舊 run 不再出現在覆核清單裡。
+    try:
+        print(_ingest_summary_line(document, new_chunks, figure_guard), flush=True)
+    except Exception as exc:  # noqa: BLE001 — KB 已提交，摘要算不出來也不能倒退成失敗
+        print(f"[WARN] 本次 ingest 摘要產生失敗（KB 已成功寫入）: {exc}")
     return True
 
 

@@ -12,6 +12,9 @@ lessons 注入檔,但全域 opencode.json 還停在舊範本,產生三個升級�
      OpenCode 載入,啟動輸出卻顯示「已注入」。
   3. 已明確 opt-in 的 agent.build.prompt 若仍指向 CodeTrail 受管檔，該 artifact
      必須跟 canonical 內容同步；未設定 prompt 時維持 OpenCode 現況。
+  4. plugin 陣列缺 codetrail-notify → ingest 完成後「有待覆核」只留在工具結果
+     文字裡,TUI 不會跳任何東西;模型說「我來呼叫工具」卻沒真的呼叫時也沒人
+     歸因。註冊的是本 repo 的絕對路徑,所以 repo 搬家要換掉舊那一筆。
 
 ``aicode`` 每次啟動用 ``--fix`` 呼叫這裡,比照 opencode_mcp_timeout_check:
 只在既有 mcp.codetrail 設定存在時動作(那是「這份 config 由 CodeTrail 管」
@@ -33,6 +36,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -73,6 +77,13 @@ REQUIRED_ASK_TOOLS = (
 )
 LESSONS_INSTRUCTION = ".codetrail/lessons.md"
 
+# 使用者端通知 plugin。註冊進**全域** opencode.json 的 plugin 陣列(絕對路徑),
+# 不寫進被分析的 repo —— <project>/.opencode/ 是 OpenCode 的 session 目錄,
+# 把工具設定寫進客戶 repo 是資料外洩面。
+NOTIFY_PLUGIN_NAME = "codetrail-notify.js"
+NOTIFY_PLUGIN_PATH = REPO_ROOT / "opencode_plugins" / NOTIFY_PLUGIN_NAME
+NOTIFY_PLUGIN_SKIP_ENV = "AICODE_NOTIFY_PLUGIN_SKIP"
+
 # 全域 AGENTS.md(OpenCode 每段對話自動載入的行為規則)的來源範本。
 # 這裡只放跨工具的不變式；實際工具名稱與參數由 OpenCode 每輪注入的 schema
 # 提供。把完整工具手冊複製進全域 prompt 曾讓模型只說「我現在呼叫」卻沒有
@@ -82,6 +93,9 @@ AGENTS_MD_NAME = "AGENTS.md"
 AGENTS_MD_SKIP_ENV = "AICODE_AGENTS_MD_CHECK_SKIP"
 AGENTS_PROMPT_MAX_CHARS = 1600
 AGENTS_PROMPT_MAX_TOOL_MENTIONS = 3
+
+# plugin 陣列裡帶 scheme 的項(npm:foo / https://…)不是本機檔,不動它。
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
 _AGENTS_FENCE_RE = re.compile(r"^```markdown\n(.*?)^```\s*$", re.S | re.M)
 _TOOL_COUNT_RE = re.compile(r"CodeTrail 工具(?:群)?共\s*(\d+)\s*個")
@@ -304,6 +318,180 @@ def _handle_agents_md(args: argparse.Namespace, config_path: Path) -> int:
     return 0
 
 
+def _plugin_spec_text(spec: Any) -> str | None:
+    """從 plugin 陣列的一筆取出路徑字串。
+
+    OpenCode 的 plugin 項可以是字串,也可以是 ``[路徑, options]``。
+    取不出字串的形狀一律回 None —— 不認得就不動它。
+    """
+    if isinstance(spec, str):
+        return spec.strip()
+    if isinstance(spec, list) and spec and isinstance(spec[0], str):
+        return spec[0].strip()
+    return None
+
+
+def _plugin_local_path(text: str) -> str | None:
+    """把一筆 plugin 設定正規化成本機絕對路徑;不是本機絕對路徑就回 None。
+
+    實測(OpenCode 1.18.21):裸絕對路徑會被正規化成 ``file:///…`` 後載入 ——
+    兩種形式指的是同一個檔。判斷「已註冊」時只認其中一種,每次 ``--fix``
+    就會再 append 一筆,plugin 被載入兩次、toast 跳兩次。
+    """
+    if text.startswith("file://"):
+        parts = urlsplit(text)
+        if parts.netloc not in ("", "localhost"):
+            return None
+        # POSIX 上 url2pathname 就是 unquote;不 import urllib.request
+        # (它會連帶拉進 ssl/http.client,這支腳本是每次啟動都跑的 preflight)。
+        return os.path.abspath(unquote(parts.path))
+    if _URL_SCHEME_RE.match(text):
+        return None  # npm: / https: 之類的遠端 plugin,不是本機檔
+    expanded = os.path.expanduser(text)
+    if not os.path.isabs(expanded):
+        return None
+    return os.path.abspath(expanded)
+
+
+def _is_git_repo(dot_git: Path) -> bool:
+    """`.git` 是**真的** repo 嗎?
+
+    目錄要含 `HEAD` 才算(空目錄不算);worktree / submodule 的 `.git` 是一個檔案,
+    那也算。單純判 `exists()` 會把無關的空目錄當成 repo。
+    """
+    try:
+        if dot_git.is_file():
+            return True
+        return (dot_git / "HEAD").exists()
+    except OSError:
+        return False
+
+
+def _is_project_scoped_config(path: Path) -> bool:
+    """這份 opencode.json 會不會被 commit 進某個 repo?
+
+    判準是「它所在的目錄樹裡有沒有 `.git`」,不是「路徑含不含 `.opencode`」。
+    只認 `.opencode` 的話,`OPENCODE_CONFIG=<被分析的 repo>/opencode.json`
+    照樣會被寫入 —— 而那正是最該擋的情況。
+
+    寫進去的代價有兩個:一條本機絕對路徑(使用者名稱、CodeTrail 安裝位置)可能
+    隨著 commit 洩漏出去;而那份設定跟著 repo 到別台機器就會指向不存在的檔,
+    OpenCode 整個 instance 起不來。
+
+    真正的全域設定在 `~/.config/opencode/`,那底下正常不會有 `.git`。
+    """
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        resolved = Path(path).absolute()
+    folder = resolved.parent
+    # 往上走,但**只認真正的 repo**。兩個方向都踩過:
+    #   * 無界地找任何 `.git`：被無關祖先毒到 —— 這台機器就有一個空的
+    #     `/home/david/.git`（沒有 `HEAD`，不是 repo），某些環境還有 `/tmp/.git`。
+    #     結果連全域設定與 tmp 測試目錄都被判成「專案內」，plugin 永遠不註冊。
+    #   * 只看自己與上一層：`<repo>/config/opencode/opencode.json` 就漏掉了 ——
+    #     而那正是最該擋的（會把使用者名稱與絕對路徑寫進可 commit 的客戶 repo）。
+    # 所以往上走，但用 `_is_git_repo()` 驗過才算。
+    for candidate in [folder, *folder.parents]:
+        if _is_git_repo(candidate / ".git"):
+            return True
+    return folder.name == ".opencode"
+
+
+def _same_plugin_file(candidate: str, target: str) -> bool:
+    if candidate == target:
+        return True
+    try:
+        return os.path.realpath(candidate) == os.path.realpath(target)
+    except OSError:
+        return False
+
+
+def apply_plugin_contract(
+    data: dict[str, Any], plugin_path: Path
+) -> tuple[list[str], list[str], list[str]]:
+    """把通知 plugin 的絕對路徑補進 data["plugin"](in-place)。
+
+    回傳形狀與 ``apply_contract`` 相同 (變更, 警告, 阻斷錯誤)。冪等:
+    ``/abs/x.js`` 與 ``file:///abs/x.js`` 視為同一筆;同名但路徑不同
+    (repo 搬過家)就地取代,不再 append 第二筆。其他 plugin 一律保留。
+    """
+    changes: list[str] = []
+    warnings: list[str] = []
+    errors: list[str] = []
+    target = os.path.abspath(str(plugin_path))
+
+    entries = data.get("plugin")
+    if entries is None:
+        data["plugin"] = [target]
+        changes.append(f"plugin 註冊 CodeTrail 通知 plugin:{target}")
+        return changes, warnings, errors
+    if not isinstance(entries, list):
+        errors.append(f"plugin 必須是 JSON array,得到 {type(entries).__name__}")
+        return changes, warnings, errors
+
+    # 同名 **且是本機檔** 的才可能是「我們自己那一筆」。遠端的
+    # `https://…/codetrail-notify.js`、`npm:` 之類即使 basename 一樣,也是使用者
+    # 自己裝的別的東西 —— 覆寫它等於靜默移除一個無關 plugin,輕則行為改變,
+    # 重則 OpenCode 起不來,而使用者完全不知道是誰動的。
+    local_named: list[tuple[int, str, str]] = []
+    remote_named: list[str] = []
+    for index, spec in enumerate(entries):
+        text = _plugin_spec_text(spec)
+        if text is None:
+            continue
+        if os.path.basename(text.rstrip("/")) != NOTIFY_PLUGIN_NAME:
+            continue
+        local = _plugin_local_path(text)
+        if local is None:
+            remote_named.append(text)
+        else:
+            local_named.append((index, text, local))
+
+    if remote_named:
+        warnings.append(
+            "plugin 陣列裡有同名但非本機的項目,一律保留不動:"
+            + "、".join(remote_named)
+        )
+
+    # 收斂到**恰好一筆**:第一筆本機同名項改成 target,其餘同名的本機項一律移除。
+    # 以前的寫法是「找到 target 就提早 return」,於是
+    #   [target, <搬家前的舊路徑>]  或  [<舊路徑 A>, <舊路徑 B>]
+    # 這兩種設定永遠收斂不了 —— OpenCode 會載入**兩個** plugin instance,
+    # 同一件事跳兩次 toast、incident 也記兩筆。
+    if local_named:
+        # **優先保留已經指向 target 的那一筆**:它可能帶著使用者設定的 options
+        # (`[path, {...}]` 形式)。固定留第一筆的話,一份
+        # `[<舊路徑>, [target, {opts}]]` 設定會把 opts 丟掉。
+        preferred = next(
+            (i for i, (_idx, _t, local) in enumerate(local_named)
+             if _same_plugin_file(local, target)),
+            0,
+        )
+        keep_index, keep_text, keep_local = local_named[preferred]
+        duplicates = [index for pos, (index, _t, _l) in enumerate(local_named)
+                      if pos != preferred]
+        already = _same_plugin_file(keep_local, target) and not duplicates
+        if already:
+            return changes, warnings, errors           # 已經正好一筆,且就是 target
+
+        if not _same_plugin_file(keep_local, target):
+            spec = entries[keep_index]
+            entries[keep_index] = (
+                [target, *spec[1:]] if isinstance(spec, list) else target
+            )
+            changes.append(f"plugin 路徑更新(repo 搬家):{keep_text} → {target}")
+        for index in sorted(duplicates, reverse=True):
+            removed = _plugin_spec_text(entries[index])
+            del entries[index]
+            changes.append(f"plugin 移除重複的本機同名項:{removed}")
+        return changes, warnings, errors
+
+    entries.append(target)
+    changes.append(f"plugin 註冊 CodeTrail 通知 plugin:{target}")
+    return changes, warnings, errors
+
+
 def apply_contract(data: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
     """把缺少的契約鍵補進 data(in-place),回傳 (變更, 警告, 阻斷錯誤)。
 
@@ -513,9 +701,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--fix",
         action="store_true",
-        help="atomically add missing ask-gate permissions and lessons instructions, "
-        "and sync an existing managed build prompt (backups kept); also installs the global "
-        "AGENTS.md when it is absent",
+        help="atomically add missing ask-gate permissions, lessons instructions and the "
+        "CodeTrail notify plugin registration, and sync an existing managed build prompt "
+        "(backups kept); also installs the global AGENTS.md when it is absent",
     )
     parser.add_argument(
         "--sync-agents-md",
@@ -557,6 +745,27 @@ def main(argv: list[str] | None = None) -> int:
         return agents_rc
 
     changes, warnings, errors = apply_contract(data)
+
+    # 通知 plugin 的註冊走同一條「缺什麼補什麼」的路:上面已經確認這份 config
+    # 由 CodeTrail 管(有 mcp.codetrail),所以到這裡才動 plugin 陣列。
+    if _truthy(os.environ.get(NOTIFY_PLUGIN_SKIP_ENV)):
+        _print(f"通知 plugin 註冊已跳過({NOTIFY_PLUGIN_SKIP_ENV}=1);設定不動")
+    elif _is_project_scoped_config(path):
+        # 專案內的 `.opencode/opencode.json` 可能被 commit 進客戶 repo:
+        # 寫進去等於把本機絕對路徑(使用者名稱、CodeTrail 安裝位置)洩漏出去,
+        # 而且那份設定跟著 repo 走到別台機器就會指向不存在的檔。
+        _print(f"通知 plugin 註冊已跳過(專案內設定 {path});只有全域設定會註冊")
+    elif not NOTIFY_PLUGIN_PATH.is_file():
+        # 指向不存在的檔會讓 OpenCode 整個 instance 起不來 —— 寧可不註冊。
+        _print(f"⚠ WARN: 找不到通知 plugin({NOTIFY_PLUGIN_PATH});跳過註冊")
+        _print("        沒有它只是不會跳 toast,工具結果裡的文字標記照舊。")
+    else:
+        plugin_changes, plugin_warnings, plugin_errors = apply_plugin_contract(
+            data, NOTIFY_PLUGIN_PATH
+        )
+        changes.extend(plugin_changes)
+        warnings.extend(plugin_warnings)
+        errors.extend(plugin_errors)
 
     agent_value = data.get("agent")
     prompt_contract_relevant = False

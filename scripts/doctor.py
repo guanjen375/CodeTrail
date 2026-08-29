@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import importlib
 from importlib import metadata as importlib_metadata
+from datetime import datetime
 import json
 import os
 import re
@@ -651,6 +652,47 @@ def check_opencode_in_path(r: Result) -> None:
     check_opencode_ai_entry(r)
 
 
+# OpenCode 從 1.17.8 起才會用 MCP 的 progress notification 續 client timeout。
+# 比它舊的版本收得到通知但不續期,`ingest_document` 跑超過 `mcp.codetrail.timeout`
+# 一樣會被 client 切斷 —— 這件事在 UI 上看起來就是「server 掛了」,所以要講明白。
+OPENCODE_PROGRESS_MIN_VERSION = (1, 17, 8)
+
+
+def check_opencode_progress_support(r: Result) -> None:
+    """OpenCode 版本是否會拿 MCP progress 續 tool-call timeout。"""
+    if shutil.which("opencode") is None:
+        r.info("MCP progress 續期未檢查:opencode 不在 PATH")
+        return
+    try:
+        proc = subprocess.run(
+            ["opencode", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        r.info(f"MCP progress 續期未檢查:讀不到 opencode 版本 ({type(exc).__name__})")
+        return
+    raw = (proc.stdout or proc.stderr or "").strip()
+    try:
+        version = parse_opencode_version(raw)
+    except DirectToolContractError:
+        r.info("MCP progress 續期未檢查:opencode 版本字串無法唯一解析")
+        return
+    wanted = ".".join(map(str, OPENCODE_PROGRESS_MIN_VERSION))
+    if version >= OPENCODE_PROGRESS_MIN_VERSION:
+        r.ok(f"OpenCode {'.'.join(map(str, version))} 會用 MCP progress 續 tool-call timeout")
+    else:
+        r.warn(
+            f"OpenCode {'.'.join(map(str, version))} < {wanted}:MCP progress 通知**不會**"
+            "續 tool-call timeout。長時間的 ingest_document 仍可能在 "
+            "`mcp.codetrail.timeout` 到期時被 client 切斷(server 端還在跑)。\n"
+            "        請升級:npm install -g opencode-ai@latest"
+        )
+
+
 def check_opencode_direct_contract(
     r: Result,
     project: str | None,
@@ -1094,6 +1136,125 @@ def check_knowledge_base(r: Result, project: str | None) -> None:
         )
 
 
+def _lease_module():
+    """延後 import mcp_lease:模組不在 / 壞掉時 doctor 照樣跑完。"""
+    import mcp_lease  # noqa: PLC0415 — 只有這兩條檢查需要，不進 doctor 的 import 頭
+
+    return mcp_lease
+
+
+def check_mcp_lease(r: Result) -> None:
+    """印出每個 MCP instance 的 lease 狀態(live / exited / stale / unknown)。
+
+    這是純讀取:**不建目錄、不寫檔**。lease 由 MCP server 自己開;doctor 只是
+    把「哪個 instance 還活著、最後呼叫的是哪個工具」攤出來,所以任何情況都
+    不 FAIL(沒有 lease 只代表這台機器還沒跑過新版 server)。
+    """
+    try:
+        lease_mod = _lease_module()
+    except Exception as e:
+        r.info(f"mcp_lease 不可用({e})— 跳過 lease 檢查")
+        return
+    try:
+        directory = lease_mod.lease_dir()
+        leases = lease_mod.read_leases()
+    except Exception as e:
+        r.warn(f"讀取 MCP lease 失敗: {e}")
+        return
+
+    if not leases:
+        r.info(
+            f"{directory} 沒有 lease — 這台機器還沒用新版 MCP server 起過 session"
+            "(lease 由 server 自己開,doctor 不會建)"
+        )
+        return
+
+    now = time.time()
+    states: dict[str, int] = {}
+    for lease in leases:
+        state = lease_mod.classify_lease(lease, now)
+        states[state] = states.get(state, 0) + 1
+    summary = " ".join(f"{k}={v}" for k, v in sorted(states.items()))
+    r.ok(f"MCP lease {len(leases)} 份({summary}): {directory}")
+
+    # 只列最近幾份;lease 會累積到保留期滿才回收,全印會蓋掉別的檢查結果。
+    for lease in leases[-5:]:
+        state = lease_mod.classify_lease(lease, now)
+        boot = str(lease.get("boot_id") or "?")[:8]
+        last_tool = lease.get("last_tool") or "(尚未呼叫工具)"
+        last_status = lease.get("last_tool_status") or "-"
+        updated = lease.get("updated")
+        # lease 是外部檔案,`updated` 可能是一個「型別對、但轉不成 float」的巨大
+        # 整數(Python int 沒有上限)。`float()` 對它會丟 OverflowError ——
+        # 而這裡是**診斷**輸出,不該因為一行壞資料就中斷。
+        try:
+            age = (f"{now - float(updated):.0f}s 前"
+                   if isinstance(updated, (int, float))
+                   and not isinstance(updated, bool) else "?")
+        except (OverflowError, ValueError):
+            age = "?"
+        r.info(
+            f"  {state:<7} boot={boot} pid={lease.get('pid')} ppid={lease.get('ppid')} "
+            f"tools/list×{lease.get('tools_list_count')} 最後工具={last_tool}({last_status}) 更新於 {age}"
+        )
+    if states.get("stale"):
+        r.info(
+            "  stale = lease 停在最後一次寫入且 pid 已不在(SIGKILL / OOM / client 直接收掉子行程)。"
+            "被 client 正常收掉也會長這樣,單獨出現不代表故障。"
+        )
+
+
+def check_incidents(r: Result) -> None:
+    """印 incident 統計(工具脫離事件)。同樣純讀取,不 FAIL。"""
+    try:
+        lease_mod = _lease_module()
+    except Exception as e:
+        r.info(f"mcp_lease 不可用({e})— 跳過 incident 統計")
+        return
+    # 兩個數字都必須是**掃完整個檔**算出來的:doctor 把它們標成「共 N 筆」與
+    # 「最近 7 天 N 筆」,而截斷過的樣本只會往「看起來沒事」的方向少報。
+    try:
+        stats = lease_mod.incident_stats()
+        recent = lease_mod.recent_incident_count(7 * 24 * 3600)
+    except Exception as e:
+        r.warn(f"讀取 incidents 失敗: {e}")
+        return
+
+    total = sum(stats.values())
+    summary = " ".join(f"{k}={v}" for k, v in sorted(stats.items()))
+    if total == 0:
+        r.info(f"尚無 incident 紀錄({lease_mod.incidents_path()})")
+        return
+
+    line = f"incidents 共 {total} 筆({summary}),最近 7 天 {recent} 筆"
+    if recent:
+        r.warn(f"{line} — 看 docs/troubleshooting.md「MCP lease 與 incident」判斷是哪一層脫落")
+    else:
+        r.info(f"{line}")
+
+    # 分類統計說「發生過幾次」,但要判斷是哪一層脫落還要看**最近幾次長什麼樣**
+    # (`kind` + `detail` 的組合)。這裡只印固定 slug 與時間 —— incident 檔本身
+    # 就沒有訊息內容、檔名或路徑(那是它的格式契約),所以印出來也不會外洩。
+    try:
+        sample = lease_mod.read_incidents(limit=3)
+    except Exception as e:  # noqa: BLE001 — 診斷不得因為讀樣本失敗而中斷
+        r.info(f"(讀不到最近幾筆 incident: {e})")
+        return
+    for row in sample[-3:]:
+        # incident 檔可能被別的東西寫壞（inf / 越界的 ts）。`fromtimestamp` 對
+        # 這些值會丟例外，而這裡是**診斷**輸出 —— 讓 doctor 因為一行壞資料而中斷
+        # 就是把「幫你看哪裡壞了」變成「它自己也壞了」。
+        stamp = "?"
+        when = row.get("ts")
+        if isinstance(when, (int, float)) and not isinstance(when, bool):
+            try:
+                stamp = datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M")
+            except (OverflowError, OSError, ValueError):
+                stamp = "?"
+        r.info(f"  最近: {stamp} {row.get('kind', '?')}/{row.get('detail', '?')}"
+               f" (source={row.get('source', '?')})")
+
+
 def check_readme_consistency(r: Result) -> None:
     """如果 scripts/check_readme_consistency.py 存在就跑一次。"""
     script = REPO_ROOT / "scripts" / "check_readme_consistency.py"
@@ -1156,6 +1317,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n-- opencode-ai entry --")
     check_opencode_ai_entry(r)
+    check_opencode_progress_support(r)
     direct_inputs = check_opencode_direct_contract(r, args.project)
     check_opencode_model_config(r)
 
@@ -1175,6 +1337,10 @@ def main(argv: list[str] | None = None) -> int:
     print("\n-- AICODE_ROOT / project --")
     check_aicode_root(r, args.project)
     check_knowledge_base(r, args.project)
+
+    print("\n-- MCP lease / incidents --")
+    check_mcp_lease(r)
+    check_incidents(r)
 
     print("\n-- README / docs 一致性 --")
     check_readme_consistency(r)

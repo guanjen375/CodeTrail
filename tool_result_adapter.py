@@ -10,6 +10,7 @@ from typing import Any
 
 from mcp import types
 
+import ingest_notify
 from mcp_contract import EVIDENCE_TOOL_NAMES
 
 
@@ -279,6 +280,18 @@ def _status_for(tool_name: str, payload: object, body: str) -> tuple[str, str | 
     lower = body.lower()
     if body.startswith("⚠ [重複呼叫偵測]"):
         return "partial", "Do not repeat the same call; use the existing result or change tool/path/pattern."
+    # ingest 的成敗看的是子行程留下的 marker，不是前綴：一次 exit 0 的 ingest 也
+    # 可能留下待覆核的 figure（`status: ok` 會讓模型直接拿去回答），而逾時 /
+    # exit≠0 / 輸出不完整這幾種是 `=== ... ✗ ...` 開頭以外也可能發生的失敗。
+    busy = ingest_notify.classify_busy_body(tool_name, body)
+    if busy is not None:
+        # 任何 KB 工具都可能收到 busy(ingest 進行中)。那代表「沒有執行」，
+        # 不是「執行成功」——落成 ok 會讓模型停止重試並當作已完成。
+        return busy
+    if tool_name == "ingest_document":
+        ingest_status, ingest_step = ingest_notify.classify_ingest_body(body)
+        if ingest_status != "ok":
+            return ingest_status, ingest_step
     if _has_structured_error(payload):
         return "error", "Correct the reported input or environment problem, then retry once."
     if isinstance(payload, dict) and (
@@ -344,6 +357,46 @@ def _fit_body(
     return fitted, True
 
 
+def _fit_keeping_both_ends(
+    body: str, budget: ResultBudget, *, reserved: int
+) -> tuple[str, bool]:
+    """砍中段、保留頭尾。preflight 報告專用。
+
+    preflight 的報告**就是判斷依據本身**：頭是「超出了哪一項」，尾是三種處理
+    方式與那條可以直接複製的 CLI 命令。一般的尾端截斷會把後半整段砍掉 ——
+    使用者拿到一份看得到問題、卻看不到怎麼辦的報告，那比截斷更糟。
+    """
+    total_limit = budget.char_limit if budget.explicit else budget.token_limit
+    body_limit = max(0, total_limit - reserved)
+    if _measure(body, explicit=budget.explicit) <= body_limit:
+        return body, False
+
+    marker = "\n...[中段已截斷:preflight 報告的頭尾都是判斷依據]\n"
+    lines = body.split("\n")
+    head: list[str] = []
+    tail: list[str] = []
+    marker_cost = _measure(marker, explicit=budget.explicit)
+    used = marker_cost
+    front, back = 0, len(lines) - 1
+    take_front = True
+    while front <= back:
+        line = lines[front] if take_front else lines[back]
+        cost = _measure(line + "\n", explicit=budget.explicit)
+        if used + cost > body_limit:
+            break
+        used += cost
+        if take_front:
+            head.append(line)
+            front += 1
+        else:
+            tail.append(line)
+            back -= 1
+        take_front = not take_front
+    if not head and not tail:
+        return "", True
+    return "\n".join(head) + marker + "\n".join(reversed(tail)), True
+
+
 def _fit_review_figures_body(
     body: str, budget: ResultBudget, *, reserved: int
 ) -> tuple[str, bool]:
@@ -407,6 +460,8 @@ def adapt_tool_result(
             reserved = _measure(shell, explicit=budget.explicit)
             if tool_name == "review_figures":
                 body, _ = _fit_review_figures_body(full_body, budget, reserved=reserved)
+            elif ingest_notify.ZERO_WRITE_MARKER in full_body:
+                body, _ = _fit_keeping_both_ends(full_body, budget, reserved=reserved)
             else:
                 body, _ = _fit_body(full_body, budget, reserved=reserved)
             if tool_name != "read_file":
@@ -446,10 +501,15 @@ def adapt_tool_error(
 ) -> types.CallToolResult:
     """Keep exception repair guidance in the text lane and schema-compatible."""
     message = f"{type(error).__name__}: {error}"
-    prefix = (
-        "status: error\n"
-        "next: Correct the reported input or environment problem, then retry once.\n"
-    )
+    # busy 不是「輸入或環境有問題」:那次呼叫**根本沒有執行**,而正確的下一步是
+    # 等 ingest 結束再查(那時 KB 才是新版)。給通用的「修正後立即重試一次」會讓
+    # 模型把唯一一次重試耗在 ingest 還沒結束的時候,然後放棄查詢。
+    if str(error).lstrip().startswith(ingest_notify.BUSY_PREFIX):
+        next_line = ("Wait for the in-flight ingest to finish (its result comes back "
+                     "to the caller), then query again; this call did not run.")
+    else:
+        next_line = "Correct the reported input or environment problem, then retry once."
+    prefix = f"status: error\nnext: {next_line}\n"
     available = max(
         0,
         (budget.char_limit if budget.explicit else budget.token_limit)

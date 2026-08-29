@@ -13,6 +13,7 @@ JSON 解析(含重複 key)、kind 的權威來源、document_id/figure_id 配對
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -173,6 +174,25 @@ def test_list_shows_every_contract_field(monkeypatch, tmp_path):
     assert "不附 canonical payload" not in single, single
 
 
+def test_document_identity_is_matched_byte_for_byte(monkeypatch, tmp_path):
+    """文件身分不得被 `.strip()`。
+
+    POSIX basename 可以用空白或換行開頭/結尾,而 KB 存的是原始 basename。
+    通知(`ingest_notify`)給的建議命令用的正是逐位元組的身分;這裡若 strip,
+    使用者照著貼上去就會「查不到」或「整份列出來」——兩邊對不上,而且無聲。
+    """
+    mcp = _mcp(monkeypatch, tmp_path)
+    odd = " odd name.pdf "
+    _stub_list(monkeypatch, [_entry(source=odd, display_name=odd, document_id=odd)])
+
+    hit = tool_fn(mcp, "review_figures")(action="list", document_id=odd)
+    assert FIG in hit, hit
+
+    # strip 過的名字**不是**同一個身分,不得命中
+    missed = tool_fn(mcp, "review_figures")(action="list", document_id=odd.strip())
+    assert FIG not in missed, missed
+
+
 def test_multi_entry_list_always_says_why_payload_is_missing(monkeypatch, tmp_path):
     """提示不能只在「有待覆核」時出現;每一次多筆列出都要講,包括全部可信的時候。"""
     mcp = _mcp(monkeypatch, tmp_path)
@@ -224,7 +244,7 @@ def test_list_never_cuts_a_canonical_value_in_half(monkeypatch, tmp_path):
         idx = hit + 1
 
 
-def test_list_shows_extraction_failures_that_never_entered_the_kb(monkeypatch, tmp_path):
+def test_extraction_failure_is_stated_affirmatively(monkeypatch, tmp_path):
     """零部分成功 = 失敗的圖不進 KB。只掃 KB 的話它們會變成看不見的失敗。"""
     mcp = _mcp(monkeypatch, tmp_path)
     _stub_list(monkeypatch, [_entry(
@@ -238,8 +258,50 @@ def test_list_shows_extraction_failures_that_never_entered_the_kb(monkeypatch, t
 
     assert "in_kb: False" in out, out
     assert "fixable: False" in out, out
-    assert "抽取失敗" in out, out
+    # 判準要用**肯定句式**:「抽取失敗」四個字同時出現在反面文案
+    # (「不是抽取失敗」)裡,拿裸字串當標記時,renderer 把真失敗誤印成
+    # 「已被取代 / 不是抽取失敗」這條測試照樣會綠 —— 而覆核的人會被誤導。
+    assert "這張**抽取失敗**" in out, out
+    assert "不是抽取失敗" not in out, out
     assert "schema 重試後仍不合格" in out, out
+
+
+def test_docs_never_claim_a_single_bad_figure_blocks_the_whole_document():
+    """文件不得同時宣稱「任一條失敗整份不入庫」與「單張缺席、其餘照常入庫」。
+
+    兩句話並存時,使用者(和模型)會把一次**其餘內容已經提交**的結果誤判成
+    KB 沒變 —— 於是不去覆核、也不去 remove,而 KB 裡其實已經有那份文件了。
+    """
+    repo = Path(__file__).resolve().parent.parent
+    # 只禁兩個固定短句是不夠的:同一個錯誤講法有很多寫法。這裡列的是**語義**
+    # 等價的說法,而且涵蓋所有會被使用者/模型讀到的文件(含 troubleshooting)。
+    forbidden = (
+        "任一條失敗都整份不入庫",
+        "任一失敗都整份不入庫",
+        "任一失敗都是**整份文件不入庫**",
+        "任一失敗都是整份文件不入庫",
+        "一整份 PDF 會因此零寫入",
+        "整份 PDF 因此零寫入",
+        # 「圖片分析失敗 ⇒ 整份中止」是同一個錯誤語意的另一種寫法
+        "若圖片分析失敗（ingest 會整份中止",
+        "圖片分析失敗,ingest 會整份中止",
+        "圖片分析失敗，ingest 會整份中止",
+    )
+    for name in ("README.md", "docs/mcp-tools.md", "docs/rag.md",
+                 "docs/troubleshooting.md"):
+        text = (repo / name).read_text(encoding="utf-8")
+        for phrase in forbidden:
+            assert phrase not in text, (name, phrase)
+    # 反面:三份主要文件都要**明講**單張缺席的語意,不能只是把錯的句子刪掉。
+    # 錨點要是**完整肯定句**:裸「缺席」會被「抽取失敗的圖不會缺席」這種
+    # 反面文案命中 —— 那正是這條測試要擋的講法。
+    affirmative = ("那一張缺席", "只讓那一張缺席", "那幾張缺席")
+    negated = ("不會缺席", "不缺席", "沒有缺席")
+    for name in ("docs/mcp-tools.md", "docs/rag.md", "docs/troubleshooting.md"):
+        text = (repo / name).read_text(encoding="utf-8")
+        assert any(phrase in text for phrase in affirmative), name
+        for phrase in negated:
+            assert phrase not in text, (name, phrase)
 
 
 def test_superseded_old_run_is_not_called_an_extraction_failure(monkeypatch, tmp_path):
@@ -615,8 +677,16 @@ def test_structured_and_legacy_exclusions_are_reported_separately(monkeypatch, t
 
     hint = mcp.query_knowledge("reset timing")["review_hint"]
 
-    assert "可覆核" in hint and "不可覆核" in hint, hint
-    assert "review_figures" in hint, hint
+    # **不能用「可覆核」當標記**:它是「不可覆核」的子字串。structured 那一段
+    # 若被錯寫成 legacy 文案,`"可覆核" in hint` 照樣成立 —— 使用者被導去看原始
+    # PDF,而那張圖其實 review_figures 修得動。`review_figures` 同理:它也出現在
+    # legacy 那段的否定句「**不會**出現在 review_figures 裡」。
+    # 所以兩段各用自己的完整肯定句當錨點。
+    assert "可覆核(結構化抽取):" in hint, hint
+    assert "不可覆核(舊 KB legacy 視覺辨識):" in hint, hint
+    assert 'review_figures(action="fix"' in hint, hint          # 只有 structured 段有
+    assert "不會**出現在 review_figures 裡" in hint, hint        # 只有 legacy 段有
+    assert hint.index("可覆核(結構化抽取):") < hint.index("不可覆核("), hint
     assert hint.index("npu_spec.pdf") < hint.index("scanned.pdf"), hint
 
 

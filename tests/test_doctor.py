@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -658,3 +659,173 @@ def test_doctor_no_network_does_not_probe_current_canary_fingerprint(monkeypatch
     )
     assert not result.fails
     assert not result.warns
+
+
+# ============================================================
+# MCP lease / incidents(plan.txt §D)
+#
+# doctor 是使用者「模型說沒有工具」時第一個會跑的東西。這兩條檢查只讀不寫:
+# lease 目錄由 MCP server 自己建,doctor 建了反而會讓「有沒有跑過新版 server」
+# 這個判準失效;而且任何情況都不能 FAIL——lease 是診斷資料,不是安裝條件。
+# ============================================================
+def _isolate_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    import mcp_lease
+
+    assert str(mcp_lease.state_dir()).startswith(str(tmp_path))
+    return mcp_lease
+
+
+def test_check_mcp_lease_without_any_lease_is_informational(monkeypatch, tmp_path, capsys):
+    _isolate_state(monkeypatch, tmp_path)
+    r = doc.Result()
+    doc.check_mcp_lease(r)
+    doc.check_incidents(r)
+    out = capsys.readouterr().out
+    assert not r.fails
+    assert not r.warns
+    # 「輸出裡有 lease / incident 這兩個字」是假斷言:`mcp_lease` 整組壞掉時,
+    # 兩段診斷都會印「mcp_lease 不可用(...)— 跳過 ...」,那句話裡同樣有這兩個字,
+    # 於是整合失效也照樣綠燈。所以只認「真的跑到了沒有紀錄」那兩句。
+    assert "沒有 lease — 這台機器還沒用新版 MCP server 起過 session" in out, out
+    assert "尚無 incident 紀錄" in out, out
+    assert "mcp_lease 不可用" not in out, out
+    assert "跳過" not in out, out
+    assert not (tmp_path / "state").exists(), "doctor 不得建 state 目錄"
+
+
+def test_check_incidents_shows_a_recent_sample(monkeypatch, tmp_path, capsys):
+    """統計說「發生過幾次」,但要判斷哪一層脫落還得看最近幾次的 kind/detail。
+
+    這條同時是 `read_incidents()` 的生產接線:沒有它,那個凍結的 reader 在真實
+    診斷流程裡完全走不到,只有測試在用。
+    """
+    mcp_lease = _isolate_state(monkeypatch, tmp_path)
+    for kind, detail in (
+        ("client_mcp_failed", "mcp_status_failed"),
+        ("promise_without_call", "lease_stale"),
+    ):
+        mcp_lease._record_incident(kind=kind, session="s", detail=detail)
+
+    r = doc.Result()
+    doc.check_incidents(r)
+    out = capsys.readouterr().out
+
+    assert "incidents 共 2 筆" in out, out
+    assert "最近:" in out, out
+    assert "promise_without_call/lease_stale" in out, out
+    assert "client_mcp_failed/mcp_status_failed" in out, out
+
+
+def test_check_incidents_survives_a_corrupt_timestamp(monkeypatch, tmp_path, capsys):
+    """壞掉的 `ts` 不得讓 doctor 自己炸掉。
+
+    doctor 的工作就是「幫你看哪裡壞了」；一行壞資料讓它中斷，等於在最需要它的
+    時候失去診斷能力。`datetime.fromtimestamp(inf)` 會丟 OverflowError。
+    """
+    mcp_lease = _isolate_state(monkeypatch, tmp_path)
+    mcp_lease._record_incident(
+        kind="promise_without_call", session="s", detail="lease_stale")
+    path = mcp_lease.incidents_path()
+    rows = path.read_text(encoding="utf-8").splitlines()
+    broken = json.loads(rows[0])
+    broken["ts"] = float("inf")
+    path.write_text(json.dumps(broken) + "\n", encoding="utf-8")
+
+    r = doc.Result()
+    doc.check_incidents(r)          # 不得 raise
+    out = capsys.readouterr().out
+
+    assert "最近: ? promise_without_call/lease_stale" in out, out
+
+
+def test_check_mcp_lease_reports_live_and_stale_instances(monkeypatch, tmp_path, capsys):
+    """兩份 lease 各自要被判成**它應該是的那一種**。
+
+    「輸出裡出現 live 或 stale 或 unknown 其中之一」是假的斷言:兩份都被判成
+    unknown 時它照樣綠燈,而那正是 lease 診斷失效的樣子。
+    """
+    mcp_lease = _isolate_state(monkeypatch, tmp_path)
+    if mcp_lease._proc_starttime_ticks(os.getpid()) is None:
+        pytest.skip("這個平台讀不到 /proc/<pid>/stat,live 判定沒有意義")
+    mcp_lease.lease_dir().mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    live = {
+        "schema": 1, "boot_id": "1" * 16, "pid": os.getpid(), "ppid": os.getppid(),
+        "proc_started": mcp_lease._proc_starttime_ticks(os.getpid()),
+        "started": now, "updated": now, "tools_list_count": 2,
+        "last_tool": "read_file", "last_tool_time": now, "last_tool_status": "ok",
+        "exited": None, "exit_reason": None,
+    }
+    # SIGKILL 過的 instance:lease 停在最後一次寫入,pid 已經不在。
+    try:
+        dead_pid = int(Path("/proc/sys/kernel/pid_max").read_text(encoding="utf-8").strip()) + 1
+    except (OSError, ValueError):
+        dead_pid = 0x7FFFFFFF
+    killed = dict(live, boot_id="2" * 16, pid=dead_pid, started=now - 60, updated=now - 60)
+    (mcp_lease.lease_dir() / "1.json").write_text(json.dumps(live), encoding="utf-8")
+    (mcp_lease.lease_dir() / "2.json").write_text(json.dumps(killed), encoding="utf-8")
+    (mcp_lease.lease_dir() / "broken.json").write_text("{not json", encoding="utf-8")
+
+    r = doc.Result()
+    doc.check_mcp_lease(r)
+    out = capsys.readouterr().out
+    assert not r.fails
+    assert "MCP lease 2 份(live=1 stale=1)" in out   # 壞檔跳過,不算也不爆
+    # 逐份對到它應該的分類(欄寬 7 的狀態欄 + boot_id 前 8 碼)
+    assert f"{'stale':<7} boot=22222222 pid={dead_pid}" in out
+    assert f"{'live':<7} boot=11111111 pid={os.getpid()}" in out
+    assert "最後工具=read_file(ok)" in out
+
+
+def test_check_incidents_warns_on_recent_reports(monkeypatch, tmp_path, capsys):
+    mcp_lease = _isolate_state(monkeypatch, tmp_path)
+    mcp_lease._record_incident("promise_without_call", session="abc", detail="no_tool_part",
+                               source="plugin")
+    mcp_lease._record_incident("client_mcp_failed", session="abc", detail="mcp_status_failed",
+                               source="plugin")
+
+    r = doc.Result()
+    doc.check_incidents(r)
+    out = capsys.readouterr().out
+    assert not r.fails
+    assert r.warns, "最近 7 天有 incident 時要 WARN(但不能 FAIL)"
+    assert "promise_without_call=1" in out
+    assert "client_mcp_failed=1" in out
+
+
+def test_check_incidents_totals_are_not_truncated_samples(monkeypatch, tmp_path, capsys):
+    """doctor 標成「共 N 筆」/「最近 7 天 N 筆」的數字必須是全檔統計。
+
+    incident 一 burst 就會超過任何尾巴取樣上限,而取樣只會往「看起來沒事」的
+    方向少報——使用者照著那個數字判斷,會以為問題比實際小。
+    """
+    mcp_lease = _isolate_state(monkeypatch, tmp_path)
+    mcp_lease.state_dir().mkdir(parents=True, exist_ok=True)
+    line = json.dumps(
+        {"schema": 1, "ts": time.time(), "kind": "promise_without_call",
+         "session": "0" * 16, "detail": "no_tool_part", "source": "plugin"},
+        sort_keys=True,
+    ) + "\n"
+    mcp_lease.incidents_path().write_text(line * 600, encoding="utf-8")
+
+    r = doc.Result()
+    doc.check_incidents(r)
+    out = capsys.readouterr().out
+    assert not r.fails
+    assert "incidents 共 600 筆" in out
+    assert "promise_without_call=600" in out
+    assert "最近 7 天 600 筆" in out
+
+
+def test_lease_checks_never_fail_when_the_module_is_broken(monkeypatch, tmp_path):
+    _isolate_state(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        doc, "_lease_module", lambda: (_ for _ in ()).throw(ImportError("no mcp_lease"))
+    )
+    r = doc.Result()
+    doc.check_mcp_lease(r)
+    doc.check_incidents(r)
+    assert not r.fails
+    assert not r.warns

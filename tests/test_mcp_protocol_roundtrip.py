@@ -32,6 +32,10 @@ from mcp.client.stdio import stdio_client  # noqa: E402
 def _server_env(project: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["AICODE_ROOT"] = str(project)
+    # 真的起 server 就會真的寫一份 lease(mcp_lease.open_lease())。導到專案底下的
+    # tmp 目錄,測試才不會在使用者真正的 `~/.local/state/codetrail/mcp/` 留檔案
+    # ——被 kill 的那幾個還會是 `exited: null` 的孤兒,讓 doctor 報出不存在的 instance。
+    env["XDG_STATE_HOME"] = str(project / ".state")
     env["PYTHONIOENCODING"] = "utf-8"
     # 使用 requests 會立即拒絕的 malformed host，確保不會碰到真 server；也不必
     # 為三條 error path 各等一次 production retry/backoff。

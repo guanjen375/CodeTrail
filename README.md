@@ -683,6 +683,8 @@ replacement semantics。完整 A/B 已執行，但沒有任何 arm 通過全部 
 
 `mcp.codetrail.timeout` 的單位是毫秒,而且套用到每一次 MCP tool call。圖片 VL 分析通常超過 10 秒,`ingest_document` 的內部上限則是 10 分鐘,因此範本使用 660000 ms(11 分鐘)。若沿用 OpenCode 常見的 `10000`,第一個圖片呼叫會在剛好 10 秒被 client 切斷,後續 `file_info` / `list_dir` 也可能排在尚未結束的圖片請求後面,看起來像整個 MCP server 一起超時。
 
+`ingest_document` 現在跑在 server 的 worker thread 上,執行期間 MCP server 仍然回應其他工具呼叫;它每兩秒送一次 MCP progress 通知(只有經過秒數與已收到的輸出行數,不含任何文件內容)。OpenCode 自 1.17.8 起會拿這個通知續 tool-call timeout(UI 上不顯示),更舊的版本收得到但不續期 —— `python3 scripts/doctor.py` 會對此印 WARN。ingest 期間所有知識庫工具(`query_knowledge*`、`reload_knowledge_base`、`remove_document`、`review_figures`)與第二個 `ingest_document` 會**立刻**回「稍後重試」而不是排隊:那段時間 `knowledge.json` 正在被原子替換。`code_rag_search` 與檔案類工具不受影響。匯入結束後,若這一次有待覆核 / 無法修復 / 抽取失敗的圖,結果會在標頭下帶一段 `[CODETRAIL_ACTION_REQUIRED]` 待辦(只看這一次的 run);逾時、非零 exit 或輸出不完整則帶 `[CODETRAIL_INGEST_FAILED]`,工具狀態是 `error` 而不是 `ok`。
+
 `aicode` 啟動時會把**既有** `mcp.codetrail` entry 中缺漏、型別錯誤或小於 660000 的 `timeout` 自動同步為專案常數,保留其餘 OpenCode JSON 設定,並在同目錄留下 `opencode.json.codetrail.bak`(若已存在則加數字後綴)。寫入採原子替換;設定檔格式錯誤或無法寫入時會 fail-loud,不會帶著已知錯誤啟動 OpenCode。只有緊急測試才用 `AICODE_MCP_TIMEOUT_CHECK_SKIP=1 aicode` 跳過。
 
 升級說明（ELF 分析改版）：工具仍是 19 個、名稱不變，但 `analyze_file` 新增 `view` / `target` / `limit` 三個參數（ELF 多視角：symbols / disasm / dwarf / strings / sections / memmap / relocs / imports / dynamic / headers，見 [MCP 工具清單](docs/mcp-tools.md#analyze_file-的-elf-視角)），tool schema 已變；`git pull` 後同樣要完全退出 OpenCode 開新 session。`pyelftools` 進入 `requirements.txt`，請重跑 `python3 -m pip install --user --break-system-packages -r requirements.txt`（或在 venv 內 `pip install -r requirements.txt`）；`ingest_document` 對 ELF 改走長版報告，舊 KB 裡已入庫的 ELF 想拿到完整 symbol / DWARF / relocation 內容要 `remove_document` 後重新 ingest。

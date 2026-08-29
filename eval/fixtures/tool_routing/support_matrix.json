@@ -2,6 +2,7 @@
   "schema_version": 1,
   "gates": {
     "explicit_canary_min": 1.0,
+    "structured_call_success_min": 1.0,
     "tool_needed_recall_min": 0.9,
     "schema_valid_rate_min": 1.0,
     "no_tool_precision_min": 0.8,

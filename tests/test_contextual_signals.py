@@ -716,7 +716,14 @@ def test_mcp_ingest_reports_cli_rebuild_when_generation_is_on():
     source = (REPO_ROOT / "mcp_server.py").read_text(encoding="utf-8")
 
     assert "KB_CONTEXT_GENERATE" in source
-    assert "RAG.py rebuild" in source
+    # 建議命令必須用**真實的** `rag_script` 路徑與單行引用組出來:一般外部專案的
+    # cwd 底下沒有 `./RAG.py`,而路徑含空白或 shell 字元時,沒引用的命令會被拆錯。
+    # (以前這裡驗的是字面 `"RAG.py rebuild"` —— 那個字串在硬編相對路徑時才會出現,
+    #  也就是說它剛好把**錯的**寫法釘住了。)
+    assert "'rebuild', '--kb'" in source or '"rebuild", "--kb"' in source, source[:0]
+    assert "_shell_join([sys.executable, str(rag_script), 'rebuild'" in source
+    assert "'--context'" in source
+    assert "python3 RAG.py rebuild" not in source, "又退回硬編的相對路徑"
 
 
 def test_rebuild_flags_are_mutually_exclusive():

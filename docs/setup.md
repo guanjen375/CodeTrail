@@ -328,6 +328,8 @@ python3 scripts/opencode_contract_check.py --sync-agents-md   # 覆蓋並備份�
 
 同步是覆蓋不是合併 —— 自訂段落要自己從 `AGENTS.md.codetrail.bak` 貼回來。自訂過不想每次被提醒就設 `AICODE_AGENTS_MD_CHECK_SKIP=1`。
 
+同一支 preflight 還會把通知 plugin(`opencode_plugins/codetrail-notify.js`)以絕對路徑補進 `~/.config/opencode/opencode.json` 的 `plugin` 陣列 —— 有待人工覆核的匯入、以及「模型說要呼叫工具卻沒真的呼叫」時,TUI 才會跳提示(headless 的 `opencode run` 沒有 TUI,靠工具結果裡的文字標記;web 介面未實測)。repo 搬過位置只會換掉舊那一筆,不會重複註冊;不要它就設 `AICODE_NOTIFY_PLUGIN_SKIP=1` —— 那**只擋之後的註冊**,已經寫進 `plugin` 陣列的那一筆要自己手動刪掉。行為與 incident 檔見 [troubleshooting](troubleshooting.md)。
+
 ---
 
 ## 後續

@@ -904,6 +904,17 @@ def aggregate_outcomes(outcomes: Sequence[CaseOutcome]) -> dict[str, Any]:
             "marker_leak": classifications[Classification.MARKER_LEAK.value],
             "empty_turn": classifications[Classification.EMPTY_TURN.value],
             "fake_xml_counted_success": 0,
+            # **直接**數「該呼叫工具、卻一個 structured call 都沒有」的次數。
+            #   * 用直接計數而不是把 promise_without_call / empty_turn /
+            #     marker_leak 三個分類相加：只要有一種「沒發呼叫」的情況被歸到
+            #     別的分類（wrong_tool / invalid_args 的無呼叫變體），代理值就
+            #     漏算，成功率虛報成 1.0 而通過 100% 門檻。
+            #   * 但**必須限定在 `tool_needed`**：`expected_tools=[]` 的案例
+            #     本來就不該呼叫工具，它們必然 `schema_calls == 0`。把它們算進來
+            #     的話，一次完美路由也達不到 1.0 —— 門檻直接變成不可達。
+            "no_structured_call": sum(
+                item.schema_calls == 0 for item in valid if item.tool_needed
+            ),
         },
         "tokens": {
             "prompt": sum(item.prompt_tokens for item in outcomes),
@@ -934,6 +945,54 @@ def _nested_number(data: Mapping[str, Any], *keys: str) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     return None
+
+
+def structured_call_success_rate(aggregate: Mapping[str, Any]) -> float | None:
+    """Share of measured turns decided by structured events, not by model text.
+
+    Release gating must never rest on a model claiming "I called the tool".
+    This reuses what ``Classification`` / ``aggregate_outcomes`` already count —
+    no second statistic is collected:
+
+    * ``schema.valid_rate``: every structured call that did arrive validated
+      against its own tool schema.
+    * ``failure_guards.no_structured_call``: a **direct** count of turns where a
+      tool was needed and no structured call reached the server at all.  Summing
+      the ``promise_without_call`` / ``empty_turn`` / ``marker_leak``
+      classifications was a proxy: any no-call turn filed under another label
+      dropped out of it and the rate silently read 1.0.  The count is scoped to
+      ``tool_needed`` turns -- correct no-tool cases have no call by design, and
+      counting them would put the 1.0 threshold out of reach.
+
+    The rate is the product of both, so a run only scores 1.0 when every
+    measured turn was settled by structured evidence.  ``None`` means the run
+    cannot be judged -- no schema measurement, or a missing/zero/negative
+    ``tool_needed.count`` -- and the gate treats that as a failure, never as a
+    pass.  An absent denominator must not silently degrade to
+    ``schema.valid_rate``: that number says how many structured calls that did
+    arrive were well-formed, and it stays at 1.0 for a run where no call ever
+    arrived.  Releasing on it would be releasing on an unmeasured aggregate.
+    """
+
+    schema_rate = _nested_number(aggregate, "schema", "valid_rate")
+    if schema_rate is None:
+        return None
+    guards = aggregate.get("failure_guards")
+    guards = guards if isinstance(guards, Mapping) else {}
+    # 直接用「完全沒有 structured call 的輪數」，不要再把幾個分類名相加當代理值:
+    # 分類法一改（或某個「沒發呼叫」的情況被歸到 wrong_tool / invalid_args），
+    # 那個代理值就會漏算，成功率虛報成 1.0 而通過 100% 門檻。
+    text_only = guards.get("no_structured_call")
+    if not isinstance(text_only, int) or isinstance(text_only, bool) or text_only < 0:
+        return None
+    # 分母要跟分子同一個母體:分子只數「該呼叫工具卻沒呼叫」的輪次,分母就得是
+    # 「該呼叫工具」的輪次數。**不接受 `model_denominator` 當退路** —— 那是全部
+    # valid 案例,母體不同會把 share 稀釋掉。量不到就是量不到,回 None 讓 gate 擋下。
+    denominator = _nested_number(aggregate, "tool_needed", "count")
+    if denominator is None or denominator <= 0:
+        return None
+    share = min(text_only / denominator, 1.0)
+    return round(schema_rate * (1.0 - share), 6)
 
 
 def evaluate_support_gate(
@@ -967,15 +1026,24 @@ def evaluate_support_gate(
     grounding_min = float(thresholds.get("evidence_adoption_min", 0.9))
     improvement = float(thresholds.get("low_baseline_recall_improvement", 0.1))
     catalog_ratio = float(thresholds.get("catalog_token_ratio_max", 0.6))
+    structured_min = float(thresholds.get("structured_call_success_min", 1.0))
 
     failure_guards = aggregate.get("failure_guards")
     failure_guards = failure_guards if isinstance(failure_guards, Mapping) else {}
     grounding = aggregate.get("grounding")
     grounding = grounding if isinstance(grounding, Mapping) else {}
 
+    structured_rate = structured_call_success_rate(aggregate)
+
     checks = {
         "harness_valid_all_cases": aggregate.get("harness_invalid_count") == 0,
         "explicit_canary_100_percent": explicit_canary_rate == 1.0,
+        # Release eligibility = every explicit canary attempt passed AND the
+        # structured-call success rate met its floor.  A model asserting that it
+        # used a tool is not evidence and never moves this check.
+        "structured_call_success": (
+            structured_rate is not None and structured_rate >= structured_min
+        ),
         "tool_needed_recall": recall is not None and recall >= recall_min,
         "schema_valid_100_percent": schema_rate == 1.0,
         "no_tool_precision": (

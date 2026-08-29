@@ -143,12 +143,14 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 - **文字**：`.pdf` / `.md` / `.txt`（抽文字。PDF 裡的圖走**兩條 lane**，範圍不一樣，詳見下面「[PDF 內的表格與終端機畫面](#pdf-內的表格與終端機畫面結構化抽取--人工覆核)」：
   1. **結構化 lane** —— 收原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，也收夠大的純 raster / picture。raster 先由 VL 分類成 table / terminal / diagram，再產出 canonical JSON、逐格/逐行證據與驗證狀態；看不清的字元放 `▯` 而不是猜。
   2. **舊自由文字 VL 相容 lane** —— 只處理未被結構化候選覆蓋的舊 picture job，並維持既有 `origin="diagram"` KB chunk 的相容性；它沒有 canonical payload 或 strict gate。
-  兩條 lane 任一失敗都是**整份文件不入庫**（零寫入）。走到 VL 的圖需要 VL server（:8083）在線；純文字＋原生表格的 PDF 則可能一次 VL 都不用呼叫）
+  單張抽壞只讓**那一張缺席**（其餘 figure 與全部文字 chunk 照常入庫，結果會列出是哪幾張）；
+  整份文件零寫入的是「剩下的圖也不能信」那幾種：VL 連不上／逾時、預算超限、
+  capability probe 未過、來源檔中途被換掉。走到 VL 的圖需要 VL server（:8083）在線；純文字＋原生表格的 PDF 則可能一次 VL 都不用呼叫）
 - **圖片**：`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp`（用 VL 模型看圖、抽出文字描述後切 chunk，需要先把 VL GGUF 掛在 llama-server :8083,設定見 [README §2.4](../README.md#24-vl-模型) 與 §3.2）
 - **binary**：`.bin` / `.dat` / `.raw` / `.fw` / `.img` / `.rom` / `.hex`（抽 hex dump、可讀字串、magic 偵測；遇到 ELF magic 自動切到 ELF 解析）
 - **ELF**：`.elf` / `.so` / `.o` / `.axf` / `.out` / `.ko`（走長版多視角報告：summary、完整 symbols、memmap、relocation caller、DWARF 函式與型別、分類 strings、sections / imports / dynamic）
 
-純圖片掃描的 PDF（沒有可選文字）不再切不出內容：每頁會 render 後進入 raster 分類與結構化抽取。文字＋圖混合的 PDF（datasheet 類）文字照舊切 chunk，圖另外產生 table / terminal / diagram structured chunk。圖很多的 PDF 建議先跑 `ingest_document(path, preflight_only=True)` 估成本（零寫入，見下節）。VL server 是啟動必要條件，若圖片分析失敗（ingest 會整份中止、知識庫不變），先跑 `python3 scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
+純圖片掃描的 PDF（沒有可選文字）不再切不出內容：每頁會 render 後進入 raster 分類與結構化抽取。文字＋圖混合的 PDF（datasheet 類）文字照舊切 chunk，圖另外產生 table / terminal / diagram structured chunk。圖很多的 PDF 建議先跑 `ingest_document(path, preflight_only=True)` 估成本（零寫入，見下節）。VL server 是啟動必要條件。**VL 連不上／逾時**這類整條 lane 起不來的情況，ingest 會整份中止、知識庫不變；但**單張抽壞只讓那一張缺席**（其餘 figure 與全部文字 chunk 照常入庫）。遇到前者先跑 `python3 scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
 
 #### 三個步驟
 
@@ -333,6 +335,30 @@ capability probe 未過、來源檔中途被換掉,以及候選與結果對不�
 capability probe:端點真的吃 image content part、
 接受本專案的 nested `json_schema`、能完成一張極小且不含機敏內容的 canary 並通過外部 validator。
 不通過就 fail-loud 指出缺哪一項,不以「OpenAI-compatible」推定品質。
+
+##### ingest 結束後怎麼知道要不要動
+
+`ingest_document` 的結果**只在真的有待辦時**才會列出待辦。第一行的 `status:` 就是判準:
+
+| `status:` | 意思 | 你要做什麼 |
+|---|---|---|
+| `ok` | 入庫完成,而且沒有任何待覆核 / 抽壞的圖 | 直接查 |
+| `partial`（正式 ingest） | 入庫完成,但有圖需要你決定 | 照結果裡 `[CODETRAIL_ACTION_REQUIRED]` 那一段做 |
+| `partial`（preflight 超限） | **零寫入**:一個位元組都沒進 KB,只是估算超出上限 | 照 `[CODETRAIL_ACTION_REQUIRED]` 縮小範圍或調高上限,再**重新**呼叫一次(拿掉 `preflight_only`)。結果會同時帶 `[CODETRAIL_ZERO_WRITE]` |
+| `error` | 逾時 / exit≠0 / 輸出不完整 | 依錯誤訊息排除後重跑;**不要**拿這次的結果當入庫成功 |
+
+`[CODETRAIL_ACTION_REQUIRED]` 那一段最多分三類,每類最多列 5 筆(超出會註明還有幾筆),
+而且每類都直接給下一步:
+
+- **待覆核**(原圖可讀) → `review_figures(action="list", document_id=...)` 看原因,對照原圖後
+  `action="fix"`。
+- **無法覆核**(payload / 原圖讀不到,例如 review artifact 被清掉) → 就地修不了,
+  `remove_document(...)` 後重新 ingest。
+- **抽取失敗**(那一張不進 KB) → 接受它缺席(其餘內容已入庫),或 `remove_document(...)` 後重灌。
+
+`unverified` / `legacy_unverified` 以及全部可信的情況**不會**出現在這一段。每次入庫都印一句
+罐頭提示等於沒有提示:你會學會跳過它,真的有待覆核時也一起跳過。同理,這一段只算**這一次**
+的 run——artifacts 裡上一次 run 留下的失敗不會被重報一次。
 
 ##### 人工覆核:list → 改 → fix
 

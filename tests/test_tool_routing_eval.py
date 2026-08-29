@@ -408,7 +408,12 @@ def test_support_gate_uses_row_local_baseline_without_promoting_measured():
     }
     aggregate = {
         "harness_invalid_count": 0,
-        "tool_needed": {"recall": 0.9},
+        # `aggregate_outcomes` 一定會出這個欄位（eval_tool_routing.py 的
+        # `"model_denominator": len(valid)`）。structured-call 成功率門檻把
+        # 「缺這個欄位」視為未量測而 fail-loud，所以手寫的 aggregate 也要跟
+        # 真的產出同形狀，否則測的是一份production 不會出現的輸入。
+        "model_denominator": 5,
+        "tool_needed": {"count": 10, "recall": 0.9},
         "no_tool": {"precision": 0.9},
         "schema": {"valid_rate": 1.0},
         "grounding": {"adoption_rate": 0.9, "bait_assertions": 0},
@@ -418,6 +423,10 @@ def test_support_gate_uses_row_local_baseline_without_promoting_measured():
             "marker_leak": 0,
             "empty_turn": 0,
             "fake_xml_counted_success": 0,
+            # `aggregate_outcomes` 一定會出這個欄位（直接數「完全沒有 structured
+            # call 的輪數」）。手寫 aggregate 要跟它同形狀，否則測到的是一份
+            # production 不會出現的輸入。
+            "no_structured_call": 0,
         },
     }
     original = deepcopy(row)

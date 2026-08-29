@@ -17,6 +17,7 @@ import importlib.metadata
 import inspect
 import json
 import os
+import re
 import shlex
 import signal
 import sys
@@ -142,7 +143,9 @@ from mcp_contract import (
 from tool_result_adapter import adapt_tool_error, adapt_tool_result, resolve_result_budget
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    import anyio
+    from anyio import to_thread as anyio_to_thread
+    from mcp.server.fastmcp import Context, FastMCP
     from mcp.types import ToolAnnotations
 except ImportError:
     _log(
@@ -150,6 +153,11 @@ except ImportError:
         "        pip install mcp"
     )
     sys.exit(3)
+
+# ingest 通知(RAG.py 印的那一行摘要 → 給模型的待辦區塊)與 ingest 期間的
+# busy / stdout 協調。兩個都是純模組,不 import 回 mcp_server。
+import ingest_notify
+import ingest_runtime
 
 
 # OpenCode runtime defaults: patch/run_tests 預設開,但尊重 env 顯式關閉。
@@ -337,6 +345,7 @@ _READ_ONLY_TOOLS = frozenset({
 # 文字,所以不會遮蔽新資訊。只掛唯讀查詢工具;寫入/執行類(apply_patch /
 # run_command / run_lint / ingest...)的重複呼叫是合法工作流,不打斷。
 import repeat_guard as _repeat_guard_mod
+import mcp_lease
 
 _REPEAT_GUARD = _repeat_guard_mod.RepeatGuard()
 _REPEAT_GUARDED_TOOLS = frozenset({
@@ -348,6 +357,99 @@ _REPEAT_GUARDED_TOOLS = frozenset({
     "git_diff",
     "analyze_file",
 })
+
+
+# ---- 長時間工具:async endpoint + 同步 worker thread ------------------------
+# FastMCP 1.x 的同步工具是**直接在 event loop 上**呼叫的
+# (`func_metadata.call_fn_with_arg_validation` 走 `return fn(...)`),所以
+# `ingest_document` 跑 600 秒就等於整個 MCP server 600 秒不回應任何請求。
+# 這裡的作法:工具本體維持同步(schema / 文件一致性檢查 / 直接呼叫都不變),
+# 只有註冊給 FastMCP 的那層 wrapper 是 async,把 body 丟到 worker thread。
+#
+# 為什麼用「名字表」而不是 `@_tool(offload=True)`:
+# `scripts/check_readme_consistency.py` 用 `@_tool()\n def <name>(` 的字面樣式
+# 數工具數,decorator 帶參數或改成 `async def` 都會讓 ingest_document 從清單裡
+# 靜默消失(工具數 19 → 18)。那份腳本是共用契約,不由這裡改。
+_OFFLOAD_TOOLS = frozenset({"ingest_document"})
+
+
+async def _run_offloaded(core, args, call_kwargs, ctx):
+    """在 worker thread 跑同步 body,同時每 N 秒送一次零內容的 progress。
+
+    - `abandon_on_cancel=True`:被取消時不等 worker(不然 shutdown 會被 600 秒
+      的子行程卡住),改成立刻收掉子行程,worker 隨即結束。
+    - 例外**不**讓它穿過 task group:anyio 4 會把它包成 ExceptionGroup,
+      `adapt_tool_error` 就看不到原本的錯誤訊息(embedding fail-loud 的 URL 提示
+      會整段消失)。所以先接住、離開 task group 之後再原樣拋。
+    """
+    # 呼叫紀錄在**離開 event loop 之前**配好:worker 是被放生的,取消若發生在它
+    # 讀取之前,讀到的會是取消後的狀態而通過比對(見 ingest_runtime.new_call)。
+    ingest_call = ingest_runtime.new_call()
+
+    def _call_in_scope():
+        with ingest_runtime.call_scope(ingest_call):
+            return core(*args, **call_kwargs)
+
+    call = _call_in_scope
+    outcome: dict = {}
+
+    async def pump() -> None:
+        """定時器 ＋（有 ctx 時）零內容的 progress 通知。
+
+        **這個 task 一定要跑,即使沒有 ctx、即使 progress 送不出去。**
+        它有兩個作用,第二個才是關鍵:
+
+          1. 送 MCP progress（只有秒數與行數,零文件內容、零路徑）。
+          2. **讓 event loop 上永遠有一個待觸發的 timer。** 這個 runtime
+             （Python 3.14 + AnyIO < 4.15，見 `_needs_py314_stdio_pulse`）會漏掉
+             worker thread 的喚醒：`run_sync` 的執行緒明明跑完了，loop 卻要等
+             「下一個 timer」才會醒。沒有 timer 就是**永遠不醒** —— 整個 ingest
+             （連同整台 server）就停在那裡。真的發生過：一次 full 的
+             `test_small_context_budget_keeps_marker_and_next` 卡了十分鐘。
+
+        所以送不出去時只是**停止上報**，絕不能 `return` 把 timer 一起收掉。
+        """
+        reporting = ctx is not None
+        while True:
+            interval = ingest_runtime.INGEST_PROGRESS_INTERVAL_SECONDS
+            await anyio.sleep(max(0.01, float(interval)))
+            snapshot = ingest_runtime.progress_snapshot()
+            if snapshot is None or not reporting:
+                continue
+            elapsed, lines = snapshot
+            try:
+                await ctx.report_progress(
+                    round(elapsed, 1),
+                    None,
+                    f"ingest running {int(elapsed)}s, {lines} output lines",
+                )
+            except Exception:
+                # 沒有 progress token / client 不支援 / 送出失敗 → 安全降級:
+                # 不再上報,但 timer 繼續跑（見上面第 2 點）。
+                reporting = False
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(pump)
+        try:
+            outcome["value"] = await anyio_to_thread.run_sync(
+                call, abandon_on_cancel=True
+            )
+        except Exception as exc:
+            outcome["error"] = exc
+        except BaseException:
+            # 取消 / 中斷:worker 被放生,子行程必須立刻收掉,否則 RAG.py 會在
+            # 背景繼續寫 knowledge.json。
+            #   * 用 `cancel_call(call_id)` 而不是全域 cancel:第二個本來就該回
+            #     busy 的 ingest 若先被取消,不能連帶殺掉第一個仍在跑的那次匯入。
+            #   * 用 cancel 而不是 shutdown:取消一次之後,下一次 ingest 必須還能跑。
+            ingest_runtime.cancel_call(ingest_call)
+            raise
+        finally:
+            task_group.cancel_scope.cancel()
+
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
 
 
 def _tool(*d_args, **d_kwargs):
@@ -366,11 +468,26 @@ def _tool(*d_args, **d_kwargs):
 
     另外對唯讀查詢工具掛 RepeatGuard:同參數且同結果的連續重複呼叫,
     會在結果前面加打斷文字(見 repeat_guard.py 的動機說明)。
+
+    第三件事:ingest 期間對 KB 類工具掛 busy 閘(ingest_runtime.guard)。
+    knowledge.json 正在被原子替換,期間照常查詢會回「剛好抓到的那一版」,
+    而且訊息跟正常查詢一字不差 —— 那是靜默錯答。
     """
     def decorator(fn):
+        offload = fn.__name__ in _OFFLOAD_TOOLS
+
         @functools.wraps(fn)
         def core_wrapper(*args, **kwargs):
-            with contextlib.redirect_stdout(sys.stderr):
+            busy = ingest_runtime.guard(fn.__name__)   # evidence tool 忙碌時 raise
+            if busy is not None:
+                return busy
+            # offload 的工具跑在 worker thread:不得用全域 redirect_stdout。
+            # 那是換掉 `sys.stdout` 這個全域名字,跨執行緒時兩個 context manager
+            # 的還原順序會交錯,先結束的那個會把真正的 stdout 還回來,worker 的
+            # print 隨即打進 JSON-RPC 通道。改用 thread-local 的 divert。
+            redirect = (ingest_runtime.divert_stdout() if offload
+                        else contextlib.redirect_stdout(sys.stderr))
+            with redirect:
                 result = fn(*args, **kwargs)
             if fn.__name__ in _REPEAT_GUARDED_TOOLS and isinstance(result, str):
                 count = _REPEAT_GUARD.observe(
@@ -380,8 +497,7 @@ def _tool(*d_args, **d_kwargs):
                     result = _repeat_guard_mod.banner(fn.__name__, count) + result
             return result
 
-        @functools.wraps(fn)
-        def transport_wrapper(*args, **kwargs):
+        def prepare_call(args, kwargs):
             signature = inspect.signature(fn)
             supplied = signature.bind_partial(*args, **kwargs).arguments
             requested_max_chars = supplied.get("max_chars")
@@ -404,11 +520,31 @@ def _tool(*d_args, **d_kwargs):
                     if fn.__name__ == "code_rag_search"
                     else budget.char_limit
                 )
+            return budget, call_kwargs
+
+        @functools.wraps(fn)
+        def transport_wrapper(*args, **kwargs):
+            budget, call_kwargs = prepare_call(args, kwargs)
             try:
                 result = core_wrapper(*args, **call_kwargs)
                 return adapt_tool_result(fn.__name__, result, budget=budget)
             except Exception as exc:
                 return adapt_tool_error(fn.__name__, exc, budget=budget)
+
+        @functools.wraps(fn)
+        async def async_transport_wrapper(*args, **kwargs):
+            # FastMCP 依型別註記把 Context 注入成 kwarg(見 ingest_document 的
+            # `ctx` 參數說明);同步 body 用不到它,progress 由這一層負責。
+            ctx = kwargs.pop("ctx", None)
+            budget, call_kwargs = prepare_call(args, kwargs)
+            try:
+                result = await _run_offloaded(core_wrapper, args, call_kwargs, ctx)
+                return adapt_tool_result(fn.__name__, result, budget=budget)
+            except Exception as exc:
+                return adapt_tool_error(fn.__name__, exc, budget=budget)
+
+        if offload:
+            transport_wrapper = async_transport_wrapper
 
         name = fn.__name__
         if name in _pending_tools:
@@ -443,7 +579,10 @@ def _register_public_tools() -> None:
         raise RuntimeError(f"public MCP tool mismatch: missing={sorted(missing)} extra={sorted(extra)}")
     for name in PUBLIC_TOOL_ORDER:
         wrapper, args, kwargs = _pending_tools[name]
-        _real_mcp_tool(*args, **kwargs)(wrapper)
+        # mcp_lease 記「這個 instance 最後呼叫了哪個工具、結果是什麼」,
+        # 讓「模型說它呼叫了工具但其實沒有」這件事可以歸因(見 mcp_lease.py)。
+        # 它自己吞掉所有例外:lease 壞掉不得讓工具失敗。
+        _real_mcp_tool(*args, **kwargs)(mcp_lease.record_tool_calls(name, wrapper))
 
 
 def _figure_review_hint(excluded) -> str:
@@ -1514,6 +1653,26 @@ def _truncate_middle(text: str, limit: int = _SUBPROCESS_OUTPUT_MAX_CHARS) -> st
     return f"{head}\n...[截斷中段 {dropped} 字元]...\n\n{tail}"
 
 
+def _clean_subprocess_output(text: str) -> str:
+    """把子行程輸出洗乾淨,才可以嵌進工具結果。
+
+    兩件事:
+      1. 拿掉 RAG.py 的機器可讀摘要行(`[CODETRAIL_INGEST_SUMMARY] {...}`)——
+         它已經被解析成待辦區塊,再原樣印一次只是浪費 context。
+      2. 拿掉三個固定 marker 的字面字串。子行程輸出裡有檔名與 log,而檔名可以
+         叫 `[CODETRAIL_ACTION_REQUIRED].pdf`;沒洗就嵌進結果 = plugin 誤報、
+         adapter 把成功的 ingest 判成 error。
+    """
+    # **只按 `\n` 切**,與解析層同一條規則。`splitlines()` 還會切 U+0085 /
+    # U+2028 / U+2029 —— 合法 basename 含那些字元時,摘要行會被拆成兩半:
+    # 前半被當成摘要刪掉,後半那段**半截 JSON** 就留在模型看得到的輸出裡。
+    kept = [
+        line for line in text.split("\n")
+        if not line.lstrip().startswith(ingest_notify.SUMMARY_PREFIX)
+    ]
+    return ingest_notify.strip_markers("\n".join(kept))
+
+
 # ---- RAG.py 子行程:逐行串流 + 有界終止 -------------------------------------
 # 舊版是 `subprocess.run(capture_output=True, timeout=600)`。`capture_output`
 # 直到子行程結束才把 pipe 讀回來,所以逾時那一刻 TimeoutExpired 帶回的輸出等於
@@ -1546,29 +1705,48 @@ def _signal_group(proc, sig, pgid=None) -> None:
         proc.send_signal(sig)
 
 
+_SHELL_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _shell_escape(token: str) -> str:
+    """shell-safe 且**一定是單行**的引用形式;內容逐字可還原。
+
+    `shlex.quote` 對含換行的檔名會產生一段**跨行**的單引號字串。那條命令本身
+    是對的,但它會把檔名後半段推到新的一行 —— 檔名若剛好以 marker 開頭,那個
+    marker 就落在行首,adapter 會把一次成功的 ingest 判成 partial/error,
+    plugin 也會跳假 toast。清洗檔名不行(那會給出指向不存在檔案的命令),
+    所以改用 bash/zsh 的 ANSI-C 引用 `$'...'`:控制字元變成 `\n` 這種轉義,
+    貼進 shell 執行時**還原成原本的位元組**,而輸出永遠是一行。
+    """
+    if not _SHELL_CTRL_RE.search(token):
+        return shlex.quote(token)
+    body = (token.replace("\\", "\\\\").replace("'", "\\'")
+            .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
+    body = _SHELL_CTRL_RE.sub(lambda m: "\\x%02x" % ord(m.group()), body)
+    return "$'" + body + "'"
+
+
+def _shell_join(argv) -> str:
+    """`shlex.join` 的單行版本(見 `_shell_escape`)。"""
+    return " ".join(_shell_escape(str(token)) for token in argv)
+
+
 def _terminate_child(proc, *, pgid=None, grace: float = _TERMINATE_GRACE_SECONDS) -> bool:
     """SIGTERM → 限時等待 → SIGKILL → **確認收屍**。回傳「是否確認已結束」。
 
     回 `False` 代表**無法確認**子行程已死。呼叫端此時絕不可宣稱「已終止」——
     RAG.py 可能還在跑、還在寫 knowledge.json,而使用者會以為是零寫入。
+
+    實作**只有一份**,在 `ingest_runtime.reap_child`:這裡以前是另一份幾乎一樣
+    的複製,而那一份在 leader 的 `wait()` 成功時就回 True —— leader 先退場時,
+    仍在寫 KB 的後代會被當成「已確認終止」。兩份收屍邏輯一漂移就是這種結果,
+    所以這裡只留轉呼叫。
     """
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            if proc.poll() is not None:
-                return True
-        except Exception:
-            return False  # 連 poll 都問不到,就不能宣稱已終止
-        _signal_group(proc, sig, pgid=pgid)
-        try:
-            proc.wait(timeout=grace)
-            return True
-        except Exception:
-            continue
-    # SIGKILL 之後仍等不到(uninterruptible sleep / 訊號送不到)→ 最後確認一次。
-    try:
-        return proc.poll() is not None
-    except Exception:
-        return False
+    # 送訊號那一步仍走本模組的 `_signal_group`：既有測試 monkeypatch 的是這個
+    # 名字，注入進去它才真的生效（不注入就是「測試以為擋住了、其實沒有」）。
+    return ingest_runtime.reap_child(
+        proc, pgid=pgid, grace=grace, send=_signal_group
+    )
 
 
 class _RagRun:
@@ -1638,6 +1816,11 @@ def _run_rag_subprocess(cmd, *, timeout: int) -> _RagRun:
     lines: list[str] = []
     reader_error: list[BaseException] = []
 
+    # spawn **之前**取這次呼叫的身分:spawn 與登記之間如果發生收屍(request 被
+    # 取消、server 退出),這個子行程不在任何名單裡,會在背景繼續寫 knowledge.json。
+    # register_child 看那份紀錄的 cancelled 旗標,已取消就地收掉並 raise。
+    spawn_call = ingest_runtime.current_call()
+
     proc = subprocess.Popen(
         cmd,
         cwd=AICODE_ROOT,
@@ -1651,22 +1834,41 @@ def _run_rag_subprocess(cmd, *, timeout: int) -> _RagRun:
         start_new_session=True,
     )
     # spawn 之後**立刻**記下 pgid:之後每一條失敗路徑都要能收掉這個 group。
+    # `start_new_session=True` ⇒ pgid == pid（附錄 B.3）。所以**第一件事**就是用
+    # pid 登記,不要等 `getpgid()` 回來 —— 那兩行之間收到 SIGTERM 的話,handler
+    # 看不到這個 process group,server 硬退出後它會繼續寫 knowledge.json。
+    ingest_runtime.register_pgid(proc.pid)
     try:
         pgid = os.getpgid(proc.pid)
     except Exception:
-        pgid = None
+        # `start_new_session=True` 讓子行程成為新 session／process group 的
+        # leader,所以它的 pgid **必然等於它的 pid**。`getpgid()` 只會因為
+        # 「查詢當下子行程已經被 reap」之類的競態而失敗 —— 那時退回 None 等於
+        # 從此追不到後代,而 `NO_GROUP` 會被當成「收乾淨了」。用 pid 當 pgid
+        # 是這個 spawn 方式下的確定事實,不是猜測。
+        pgid = proc.pid
+    if pgid != proc.pid:            # 理論上不會發生;真發生了兩個都要追
+        ingest_runtime.register_pgid(pgid)
+    # 登記給 ingest_runtime.shutdown():server 退出 / request 被取消時,
+    # 由它負責 SIGTERM → SIGKILL → reap,不留背景還在寫 KB 的子行程。
+    ingest_runtime.register_child(proc, pgid, call=spawn_call)
 
     def _pump() -> None:
-        try:
-            for line in proc.stdout:
-                lines.append(line)
-                # 刻意不把子行程的每一行原樣寫進 MCP server log:RAG.py 的圖片 /
-                # 聊天路徑會印出抽取內容(可能含 NDA),那等於在未說明 retention 的
-                # 地方多存一份。只留不含內容的心跳。
-                if len(lines) % _HEARTBEAT_EVERY_LINES == 0:
-                    _log(f"[MCP] ingest 進行中… 已收到 {len(lines)} 行輸出")
-        except BaseException as exc:  # noqa: BLE001 - 交回主線,不吞
-            reader_error.append(exc)
+        # reader 是另一條執行緒,不吃 worker 的 thread-local divert;自己也要
+        # 導一次,否則這裡(或它呼叫到的東西)的 print 會落到 JSON-RPC 通道。
+        with ingest_runtime.divert_stdout():
+            try:
+                for line in proc.stdout:
+                    lines.append(line)
+                    # 零內容的進度:只有行數,給 MCP progress 通知用。
+                    ingest_runtime.note_progress(len(lines))
+                    # 刻意不把子行程的每一行原樣寫進 MCP server log:RAG.py 的圖片 /
+                    # 聊天路徑會印出抽取內容(可能含 NDA),那等於在未說明 retention 的
+                    # 地方多存一份。只留不含內容的心跳。
+                    if len(lines) % _HEARTBEAT_EVERY_LINES == 0:
+                        _log(f"[MCP] ingest 進行中… 已收到 {len(lines)} 行輸出")
+            except BaseException as exc:  # noqa: BLE001 - 交回主線,不吞
+                reader_error.append(exc)
 
     reader = threading.Thread(target=_pump, name="rag-stdout-reader", daemon=True)
     timed_out = False
@@ -1693,9 +1895,38 @@ def _run_rag_subprocess(cmd, *, timeout: int) -> _RagRun:
         with contextlib.suppress(Exception):
             proc.stdout.close()
         if reader_stuck:
-            # 還有人持有 pipe 寫端 = group 沒清乾淨。再收一次,並且不再宣稱已終止。
+            # 還有人持有 pipe 寫端 = group 可能沒清乾淨。再收一次 —— 而且**要用
+            # 它的結果**:硬寫 `False` 會讓一個已經確認收乾淨的 group 永遠不被
+            # unregister,死 pgid 留在 signal 快照(號碼重用時會殺到無關行程),
+            # KB 的 busy 也會多守著。
+            #
+            # 但**只信 group 檢查是不夠的**:reader 還活著本身就是「有人持有
+            # pipe 寫端」的證據,與「group 空了」互相矛盾時要採信保守的那一邊。
+            # 所以收完再給 reader 一次結束的機會:它真的結束了(EOF)才承認終止。
+            confirmed = _terminate_child(proc, pgid=pgid)
+            reader.join(timeout=_READER_JOIN_SECONDS)
+            terminated = confirmed and not reader.is_alive()
+            if not terminated:
+                # 保守保留的**理由**要傳下去:`_sweep_leftovers` 只看 leader 與
+                # group,兩邊都會說「乾淨了」,於是下一次 `busy_reason()` 就把 busy
+                # 解除 —— 而 reader 還握著 pipe 寫端,那個 writer 可能還在寫 KB。
+                # `confirmed` 要一起傳:這條路徑**自己**收了屍,已經知道整個
+                # group 空了。不傳的話,`_child_settled()` 得等 reader 放手才會
+                # 去問 group —— 而 reader 可能握著 pipe 很久,那段期間一個已死
+                # 的 pgid 就一直留在 signal 快照裡,號碼被重用時會誤殺。
+                ingest_runtime.hold_child(proc, reader.is_alive,
+                                          group_gone=confirmed)
+            # 輸出仍然不完整(`complete` 另外看 `reader_stuck`),所以這裡即使是
+            # True 也**不會**讓結果宣稱入庫成功。
+        elif terminated and not ingest_runtime.group_settled(pgid):
+            # leader 自己跑完 ≠ group 空了:後代若把 stdout 關掉/重導,reader 會
+            # 正常結束、`wait()` 也會回來,看起來一切正常 —— 但那個後代還在寫
+            # knowledge.json。解除登記就等於放掉最後一個追蹤它的人。
             _terminate_child(proc, pgid=pgid)
-            terminated = False
+            terminated = ingest_runtime.group_settled(pgid)
+        if terminated:
+            # 確認死了才從登記簿拿掉;確認不了就**留著**,讓 server 退出時再收一次。
+            ingest_runtime.unregister_child(proc)
 
     if fatal is not None:
         if not terminated:
@@ -1725,6 +1956,7 @@ def ingest_document(
     mode: Annotated[Literal["auto", "document", "image", "chat", "binary"], Field(description="Ingestion parser mode: auto, document, image, chat, or binary.")] = "auto",
     preflight_only: Annotated[bool, Field(description="For PDF only, estimate work with zero embeddings or KB writes.")] = False,
     fresh: Annotated[bool, Field(description="Atomically rebuild the KB from this file; incompatible with preflight_only.")] = False,
+    ctx: Optional[Context] = None,
 ) -> str:
     """Ingest a file into the project knowledge base.
 
@@ -1833,6 +2065,10 @@ def ingest_document(
               預設 False ＝ 合併語意:新 basename 加入一份文件;同一來源的同
               basename 原子替換舊 chunks。不同來源的同名文件仍由身分閘拒絕。
               不能與 preflight_only 併用(後者是零寫入的估算)。
+        ctx: **不是模型參數**,不出現在 JSON schema 裡(FastMCP 依型別註記自動
+              注入並排除)。這個工具跑在 worker thread,由外層 async wrapper 用
+              它每兩秒送一次零內容的 progress(只有秒數與已收到的行數)。
+              同步 body 用不到它,直接呼叫時留 None 即可。
 
     Returns:
         RAG.py 的執行輸出(逐行串流收集)+ 後續建議。逾時時**保留已經收到的
@@ -1841,6 +2077,11 @@ def ingest_document(
         可能仍在背景寫入 knowledge.json」,並附上查證命令——絕不謊報已終止。
         preflight 的報告**完整原樣印出、不截斷**(那份報告就是超限與否的判斷依據);
         正式 ingest 的進度 log 過長時仍會截斷中段。
+        這一次匯入若有待覆核 / 無法修復 / 抽取失敗的圖,結果會在標頭下、log 前
+        帶一段 `[CODETRAIL_ACTION_REQUIRED]` 待辦(來源是 RAG.py 印的那一行摘要,
+        只看本次 run,不掃整個 KB);逾時 / 非零 exit / 輸出不完整則帶
+        `[CODETRAIL_INGEST_FAILED]`,由 adapter 判成 error。
+        ingest 期間所有 KB 類工具與第二個 ingest 會立刻收到 busy,不排隊。
     """
     # RAG.py 跟 mcp_server.py 同一個 repo(ai_code),不是在 AICODE_ROOT
     rag_script = Path(__file__).parent / "RAG.py"
@@ -1852,6 +2093,13 @@ def ingest_document(
         doc_path = Path(AICODE_ROOT) / path
     doc_path = doc_path.resolve()
 
+    # 使用者輸入(路徑、mode、副檔名)一旦被回顯進結果,就可能挾帶 marker:
+    # 一個叫 `[CODETRAIL_ACTION_REQUIRED].pdf` 的路徑會讓一次**錯誤**結果被
+    # adapter 判成 partial,還會讓 plugin 跳一次假 toast。所以清洗一次、
+    # 之後所有訊息**一律**用這幾個變數,不再直接內插原值。
+    shown_path = ingest_notify.strip_markers(str(doc_path))
+    shown_mode = ingest_notify.strip_markers(str(mode))
+
     # NDA 沙箱:輸入檔案必須在 AICODE_ROOT 內
     try:
         doc_path.relative_to(Path(AICODE_ROOT).resolve())
@@ -1859,18 +2107,19 @@ def ingest_document(
         return (
             f"錯誤: 檔案必須在 AICODE_ROOT 內(NDA 沙箱)。\n"
             f"      要灌外部檔案,請先用 import_external_file 複製進 {AICODE_ROOT}。\n"
-            f"      你給的路徑: {doc_path}"
+            f"      你給的路徑: {shown_path}"
         )
 
     if not doc_path.is_file():
-        return f"錯誤: 檔案不存在 {doc_path}"
+        return f"錯誤: 檔案不存在 {shown_path}"
 
     TEXT_EXTENSIONS = {".pdf", ".md", ".txt"}
     ext = doc_path.suffix.lower()
+    shown_ext = ingest_notify.strip_markers(ext)
     all_supported = TEXT_EXTENSIONS | IMAGE_EXTENSIONS | BINARY_EXTENSIONS | ELF_EXTENSIONS
     if ext not in all_supported:
         return (
-            f"錯誤: 不支援的副檔名 {ext}\n"
+            f"錯誤: 不支援的副檔名 {shown_ext}\n"
             f"      文字: {sorted(TEXT_EXTENSIONS)}\n"
             f"      圖片: {sorted(IMAGE_EXTENSIONS)}\n"
             f"      binary: {sorted(BINARY_EXTENSIONS)}\n"
@@ -1880,7 +2129,7 @@ def ingest_document(
     # 決定要走哪個 RAG.py 模式
     valid_modes = {"auto", "document", "image", "chat", "binary"}
     if mode not in valid_modes:
-        return f"錯誤: 不支援的 mode={mode!r}(支援:{sorted(valid_modes)})"
+        return f"錯誤: 不支援的 mode={shown_mode!r}(支援:{sorted(valid_modes)})"
 
     if mode == "auto":
         if ext in TEXT_EXTENSIONS:
@@ -1894,11 +2143,11 @@ def ingest_document(
 
     # 校驗 mode 與副檔名搭配
     if resolved_mode == "document" and ext not in TEXT_EXTENSIONS:
-        return f"錯誤: mode='document' 需要 .pdf/.md/.txt(你給的是 {ext})"
+        return f"錯誤: mode='document' 需要 .pdf/.md/.txt(你給的是 {shown_ext})"
     if resolved_mode in ("image", "chat") and ext not in IMAGE_EXTENSIONS:
-        return f"錯誤: mode={resolved_mode!r} 需要圖片副檔名(你給的是 {ext})"
+        return f"錯誤: mode={shown_mode!r} 需要圖片副檔名(你給的是 {shown_ext})"
     if resolved_mode == "binary" and ext not in (BINARY_EXTENSIONS | ELF_EXTENSIONS):
-        return f"錯誤: mode='binary' 需要 binary/ELF 副檔名(你給的是 {ext})"
+        return f"錯誤: mode='binary' 需要 binary/ELF 副檔名(你給的是 {shown_ext})"
 
     # preflight 只存在於 PDF 的結構化圖片 lane（含 raster 分類/抽取）。其他組合直接擋下 —— 不啟動子行程,
     # 也不默默降級成正式入庫(那才是最糟的:使用者以為只是估算,結果整份寫進 KB)。
@@ -1906,7 +2155,7 @@ def ingest_document(
     if preflight_only and not pdf_document:
         return (
             f"錯誤: preflight_only 只支援 .pdf 的 document 模式"
-            f"(結構化圖片抽取只在 PDF 路徑;你給的是 ext={ext}、mode={resolved_mode!r})。\n"
+            f"(結構化圖片抽取只在 PDF 路徑;你給的是 ext={shown_ext}、mode={shown_mode!r})。\n"
             f"      沒有 preflight 需求就把 preflight_only 拿掉,直接入庫。"
         )
 
@@ -1930,20 +2179,38 @@ def ingest_document(
     if preflight_only:
         cmd += ["--preflight"]  # 契約:旗標放最後
 
+    # 給使用者複製貼上的那條命令 —— **必須在旗標補完之後才組**,而且要逐字。
+    #   * 早組:preflight 失敗時印出來的命令會少掉 `--preflight`,使用者照著跑
+    #     就從「零寫入估算」變成「真的整份寫進 KB」。--image/--chat/--fresh 同理。
+    #   * 清洗:`strip_markers` 會把合法檔名 `[CODETRAIL_ACTION_REQUIRED].pdf`
+    #     顯示成 `.pdf`,那條命令就指向一個不存在的檔。身分一律逐字,
+    #     marker 誤判改由「只認行首」處理(見 ingest_notify.classify_ingest_body)。
+    shown_cmd = _shell_join(cmd)
+
     label = ("ingest_document (preflight)" if preflight_only
              else "ingest_document (fresh)" if fresh else "ingest_document")
     timeout = _PREFLIGHT_TIMEOUT_SECONDS if preflight_only else _INGEST_TIMEOUT_SECONDS
 
     try:
-        run = _run_rag_subprocess(cmd, timeout=timeout)
+        # busy 從 spawn 之前一路維持到「子行程確認收乾淨」之後才解除
+        # (_run_rag_subprocess 回來時已經 join 過 reader、關過 pipe)。
+        with ingest_runtime.begin(label):
+            run = _run_rag_subprocess(cmd, timeout=timeout)
+    except ingest_runtime.IngestBusyError as busy:
+        # guard 與 begin 之間的競態:兩個 ingest 同時進來,只有一個能啟動。
+        return str(busy)
     except Exception as e:
         return f"錯誤: {type(e).__name__}: {e}"
 
-    out = run.output
+    # 摘要行必須從**未截斷**的輸出解析;log 那一份則洗掉 marker 與摘要行,
+    # 免得檔名或 RAG.py 的 log 剛好含 marker,讓 plugin 誤報、adapter 誤判。
+    summary = ingest_notify.parse_summary_line(run.output)
+    action_block = ingest_notify.render_action_block(summary) if summary else []
+    out = _clean_subprocess_output(run.output)
 
     # 逾時:保留已收到的輸出,附精確可複製的 CLI 命令(shlex quoting,路徑含空白也安全)
     if run.timed_out:
-        formal = shlex.join(cmd)
+        formal = shown_cmd
         hint = ["", f"錯誤: 超過 {timeout} 秒上限。"]
         if run.terminated:
             hint += [
@@ -1959,10 +2226,15 @@ def ingest_document(
         if pdf_document and not preflight_only:
             hint += [
                 "先估成本(零寫入,只支援 PDF):",
-                f"  {shlex.join(cmd + ['--preflight'])}",
+                # `--fresh` 與 `--preflight` 互斥(RAG.py 會直接拒絕)。
+                # 這條是「先估成本」的建議,所以要拿掉 --fresh 再加 --preflight,
+                # 不然使用者複製貼上得到的是一條必定被拒的命令。
+                f"  {_shell_join([a for a in cmd if a != '--fresh'] + ['--preflight'])}",
             ]
         return (
             f"=== {label} ✗ 逾時 ({timeout} 秒) ===\n"
+            # marker 放標頭下、log 前:結果預算截斷是從尾端砍,放前面才砍不到。
+            f"{ingest_notify.FAILED_MARKER} 逾時中止,這一次匯入沒有完成。\n"
             + _truncate_middle(out)
             + "\n".join(hint)
         )
@@ -1995,56 +2267,76 @@ def ingest_document(
         else:
             detail = "子行程的終止狀態無法確認"
         return (
-            f"=== {label} ✗ 輸出不完整 ===\n{out}\n\n"
+            f"=== {label} ✗ 輸出不完整 ===\n"
+            f"{ingest_notify.FAILED_MARKER} 子行程輸出不完整,不能據此判斷入庫成功。\n"
+            f"{out}\n\n"
             f"錯誤: {detail}\n"
             + (run.leftover_warning() or "")
             + f"      上面的輸出可能不完整,不能據此判斷入庫成功。"
             f"請呼叫 reload_knowledge_base() 確認實際 chunk 數,或改用 CLI:\n"
-            f"  {shlex.join(cmd)}"
+            f"  {shown_cmd}"
         )
 
     if preflight_only:
         # 契約:exit 0 = 在預算內、exit 2 = 超出預算(報告仍完整印出)、其餘 = 錯誤
+        notice = ""
         if run.returncode == 0:
             status = "✓ 在預算內"
             hint = ("\n\n這是**零寫入**的估算(沒有呼叫 VL、沒有算 embedding、沒有動 "
                     "knowledge.json)。要實際入庫請把 preflight_only 拿掉再呼叫一次。")
         elif run.returncode == 2:
             status = "✗ 超出上限(零寫入)"
+            # 超限是「要使用者決定怎麼縮小」,不是錯誤 → partial + next。
+            notice = (
+                f"{ingest_notify.ACTION_REQUIRED_MARKER} preflight 超出上限,"
+                "這一次零寫入;請先照下面三種處理方式擇一,再重新呼叫。\n"
+                # 零寫入 marker 讓 adapter 給出**不同的** next:正式 ingest 的內容
+                # 已經在 KB 裡,preflight 一個位元組都沒寫 —— 共用一句會讓模型
+                # 以為入庫成功,然後去查一份不存在的文件。
+                f"{ingest_notify.ZERO_WRITE_MARKER} 這一次沒有任何內容進入 knowledge.json。\n"
+            )
             hint = (
                 "\n\n超出上限時**沒有**任何寫入。三種處理方式:\n"
                 "  1. 把 PDF 拆成較小的檔案分批入庫;\n"
                 "  2. 調高對應上限(env,例如 AICODE_FIGURE_MAX_VL_CALLS_PER_DOC / "
                 "AICODE_FIGURE_MAX_IMAGE_TOKENS_PER_DOC / "
                 "AICODE_FIGURE_MAX_CANDIDATES_PER_DOC),上面報告會指出是哪一項;\n"
-                f"  3. 在終端機直接跑(沒有 MCP 逾時):\n     {shlex.join(cmd)}"
+                f"  3. 在終端機直接跑(沒有 MCP 逾時):\n     {shown_cmd}"
             )
         else:
             status = f"✗ 失敗 (exit {run.returncode})"
+            notice = (f"{ingest_notify.FAILED_MARKER} preflight 沒有跑完"
+                      f"(exit {run.returncode}),這份估算不可信。\n")
             hint = "\n\npreflight 失敗;請依上方輸出排除錯誤後重試(這條路徑不會寫入 KB)。"
-        return f"=== {label} {status} ===\n{out}{hint}"
+        return f"=== {label} {status} ===\n{notice}{out}{hint}"
 
     if run.returncode == 0:
         status = "✓ 完成"
+        # 通知只講**這一次 run** 真的有的待辦(來源是 RAG.py 的摘要行),
+        # 三類都沒有就一個字都不印 —— 舊版那句無條件的「PDF 可能帶待覆核狀態」
+        # 每次都出現,等於沒有訊號,使用者也判斷不出要不要動。
+        notice = ("\n".join(action_block) + "\n") if action_block else ""
         hint = ("\n\n下一次 query_knowledge 會自動偵測並載入新內容;"
                 "要立即載入+確認 chunk 數可呼叫 reload_knowledge_base()。")
-        if pdf_document:
-            hint += ("\n提示: PDF 的結構化圖片(原生或 raster 的表格 / 終端機 / diagram)可能帶待覆核狀態;"
-                     "用 review_figures(action=\"list\") 看有哪些、原因是什麼。")
         if getattr(config, "KB_CONTEXT_GENERATE", False):
             # MCP 這條路徑永遠不生成 chunk 脈絡:工具鏈有 600 秒 timeout,
             # 數十個大窗串行必然超時。功能開著就要講明白該去哪裡做。
             hint += (
                 "\n\n注意: KB_CONTEXT_GENERATE 是開的,但這次入庫**沒有**生成 chunk 脈絡"
                 "(MCP 有 600 秒 timeout,大窗串行會超時)。要生成請在終端機跑:\n"
-                f"  python3 RAG.py rebuild --kb {kb_path} {doc_path} --context"
+                # 用**真實的** rag_script 路徑與單行引用:一般外部專案的
+                # cwd 底下沒有 `./RAG.py`,而路徑含空白或 shell 字元時,
+                # 沒引用的命令會被拆錯、甚至執行到非預期的東西。
+                f"  {_shell_join([sys.executable, str(rag_script), 'rebuild', '--kb', str(kb_path), str(doc_path), '--context'])}"
             )
     else:
         status = f"✗ 失敗 (exit {run.returncode})"
+        notice = (f"{ingest_notify.FAILED_MARKER} 入庫失敗(exit {run.returncode}),"
+                  "KB 沒有這一份文件的新內容。\n")
         hint = ("\n\n入庫失敗;請依上方輸出排除錯誤後重試"
                 "(VL 連線失敗 / 預算超限這類整份中止時是零寫入,KB 不變;"
                 "單張圖抽壞不會走到這裡,那是 exit 0 加一行 `[figure] 失敗 N 張`)。")
-    return f"=== {label} {status} ===\n{out}{hint}"
+    return f"=== {label} {status} ===\n{notice}{out}{hint}"
 
 
 @_tool()
@@ -2435,7 +2727,10 @@ def review_figures(
     # 使用者手上多半只有 basename,直接把 basename 丟給 backend filter 會零命中。
     entries = figure_extract.list_figures(root, list(KB.chunks), document_id=None)
 
-    wanted_doc = (document_id or "").strip()
+    # **不得 `.strip()`**:合法 basename 可以用空白或換行開頭/結尾,而 KB 存的是
+    # 原始 basename。strip 過之後這裡會查不到(或整份列出來),而通知裡給的那條
+    # 建議命令用的正是逐位元組的身分 —— 兩邊對不上,使用者照著做就是失敗。
+    wanted_doc = document_id or ""
     if wanted_doc:
         entries = [
             e for e in entries
@@ -2714,7 +3009,47 @@ if __name__ == "__main__":
     # 交還真正的 stdout 給 JSON-RPC transport。此後只有 FastMCP transport 寫
     # stdout；工具內的 incidental print() 由 @_tool 的 redirect_stdout 擋回 stderr。
     sys.stdout = _REAL_STDOUT
+    # 交還之後 sys.stdout 改成 router:是否導到 stderr 由**執行緒**決定,
+    # 不再靠全域 redirect_stdout(那個在 ingest worker 與其他工具重疊時會
+    # 在錯誤的時機還原,讓 print 打進 JSON-RPC 通道)。
+    ingest_runtime.install_stdout_router(_REAL_STDOUT)
+    mcp_lease.instrument_tools_list(mcp)
+    mcp_lease.open_lease()
+
+    def _exit_on_terminating_signal(signum, _frame):
+        """SIGTERM / SIGHUP:**就地**做完清理再硬退出。
+
+        預設的 SIGTERM 是直接結束行程 —— `finally` 一行都不會執行,於是
+        `ingest_runtime.shutdown()` 沒收屍、`close_lease()` 沒標記退出:
+        以獨立 process group 起的 RAG.py 會活下來繼續改寫 knowledge.json,
+        而 lease 停在最後一次寫入,doctor 只能報 `stale`(看起來像 OOM)。
+        OpenCode 與一般 supervisor 關掉 server 用的正是 SIGTERM。
+
+        為什麼不是 `raise SystemExit` 讓 `finally` 去做:MCP 的 stdio reader 是
+        一條**阻塞在 stdin 上的非 daemon 執行緒**,主協程結束之後直譯器還要等它,
+        於是行程掛在那裡不退出(實測 SIGTERM 後 30 秒仍未結束)。所以這裡自己
+        把清理做完,再 `os._exit()` —— 清理有做到,而且一定退得掉。
+        """
+        # **不得**呼叫任何會取鎖的東西。handler 跑在主執行緒的任意 bytecode
+        # 邊界上:主執行緒若正好持有 `ingest_runtime._state_lock` 或
+        # `mcp_lease._LOCK`,handler 再去取同一把鎖就是自己鎖自己 ——
+        # 行程從此不動,supervisor 只能 SIGKILL,而那條路連 lease 都不會被標記。
+        # 也不得 `proc.wait()`(可能永遠回不來)。
+        with contextlib.suppress(Exception):
+            ingest_runtime.reap_from_signal()
+        with contextlib.suppress(Exception):
+            mcp_lease.close_lease_from_signal(reason=f"signal:{int(signum)}")
+        with contextlib.suppress(Exception):
+            sys.stderr.flush()
+        os._exit(128 + int(signum))
+
+    for _sig in (signal.SIGTERM, signal.SIGHUP):
+        with contextlib.suppress(Exception):   # 平台不支援就算了,不得因此起不來
+            signal.signal(_sig, _exit_on_terminating_signal)
     try:
         _run_mcp_stdio()
     finally:
+        # 先收子行程:留著它就是「使用者以為 server 關了,實際還有東西在寫 KB」。
+        ingest_runtime.shutdown()
+        mcp_lease.close_lease()
         close_session()

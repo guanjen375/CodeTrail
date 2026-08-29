@@ -319,6 +319,11 @@ def spawn_mcp(tmp_root: Path, env_overrides: dict[str, str] | None = None) -> su
     """
     env = os.environ.copy()
     env["AICODE_ROOT"] = str(tmp_root)
+    # 真的起一個 MCP server 就會真的寫一份 lease(mcp_lease.open_lease())。
+    # 不把 state 目錄導到 tmp 的話,每一條 live-server 測試都會在使用者真正的
+    # `~/.local/state/codetrail/mcp/` 留下檔案;被 kill 的那幾個還會留下
+    # `exited: null` 的孤兒 lease,讓 doctor 之後報出根本不存在的 instance。
+    env["XDG_STATE_HOME"] = str(tmp_root / ".state")
     env["PYTHONIOENCODING"] = "utf-8"
     env["AICODE_LLAMA_BASE_URL"] = "http://127.0.0.1:65535"
     env["AICODE_MODEL"] = "example-code-model"

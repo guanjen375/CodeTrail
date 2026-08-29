@@ -54,6 +54,10 @@ def _setup(monkeypatch, path) -> None:
     # 腳本的另一件事(tmp_path 一律沒有那份檔,會判 missing 並在 --fix 時安裝)。
     # 關掉它,免得兩個子系統的輸出互相污染 —— AGENTS.md 的行為由下面自己的測試驗。
     monkeypatch.setenv(check.AGENTS_MD_SKIP_ENV, "1")
+    # 同理:通知 plugin 的註冊是同一支腳本的另一件事(自己的測試檔在
+    # tests/test_opencode_notify_plugin.py)。這一段只驗 opencode.json 的
+    # 契約遷移,關掉它才不會讓每個案例都多出一個 plugin 陣列的變數。
+    monkeypatch.setenv(check.NOTIFY_PLUGIN_SKIP_ENV, "1")
 
 
 def test_required_ask_tools_match_set_config_template():
@@ -332,6 +336,10 @@ def _setup_build_prompt_check(monkeypatch, home: Path, config_path: Path) -> Non
     monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
     monkeypatch.delenv(check.SKIP_ENV, raising=False)
     monkeypatch.setenv(check.AGENTS_MD_SKIP_ENV, "1")
+    # 同理:通知 plugin 的註冊是同一支腳本的另一件事(自己的測試檔在
+    # tests/test_opencode_notify_plugin.py)。這一段只驗 opencode.json 的
+    # 契約遷移,關掉它才不會讓每個案例都多出一個 plugin 陣列的變數。
+    monkeypatch.setenv(check.NOTIFY_PLUGIN_SKIP_ENV, "1")
 
 
 def test_contract_fix_does_not_install_unmeasured_prompt_by_default(
@@ -455,6 +463,10 @@ def _agents_setup(monkeypatch, tmp_path, doc_text: str) -> Path:
     ))
     monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
     monkeypatch.delenv(check.SKIP_ENV, raising=False)
+    # 同理:通知 plugin 的註冊是同一支腳本的另一件事(自己的測試檔在
+    # tests/test_opencode_notify_plugin.py)。這一段只驗 opencode.json 的
+    # 契約遷移,關掉它才不會讓每個案例都多出一個 plugin 陣列的變數。
+    monkeypatch.setenv(check.NOTIFY_PLUGIN_SKIP_ENV, "1")
     return config_path
 
 

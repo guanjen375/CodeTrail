@@ -8,6 +8,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -25,3 +27,21 @@ os.environ.pop("AI_CODE_DATA_FILE", None)
 os.environ["AICODE_INDEX_SCOPE_FILE"] = str(
     REPO_ROOT / ".pytest_cache" / "no-such-index-scope.json"
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ingest_runtime():
+    """`ingest_runtime` 的 busy / 子行程登記是 module-global,不得跨測試外洩。
+
+    這裡放 conftest 而不是各測試模組自己寫一份:漏掉的那個模組不會報錯,
+    只會出現「另一條測試留下的殘存子行程」把後面每一條的 ingest 擋成 busy ——
+    症狀出現在別人身上,而且看起來像被測邏輯壞了。這種漏標一定要靠共用掛點。
+
+    `import` 放在函式裡:`ingest_runtime` 只在有 MCP 相關測試時才需要,
+    不該讓每一個純函式測試都付這個 import 成本。
+    """
+    import ingest_runtime
+
+    ingest_runtime._reset_for_tests()
+    yield
+    ingest_runtime._reset_for_tests()

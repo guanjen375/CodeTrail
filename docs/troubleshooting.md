@@ -248,6 +248,96 @@ routing，避免再把它們混為一談。
 的 implicit `optimal/suboptimal/fail/timeout` 與 fresh/stale；資料不足顯示 `unknown`，不會拿
 另一個模型／設定／專案的 cache row 冒充現況。
 
+### TUI 跳出 CodeTrail 的 toast(待處理項目 / 沒有真的呼叫工具)
+
+`aicode` 每次啟動會把 `<CODETRAIL_REPO>/opencode_plugins/codetrail-notify.js` 以**絕對路徑**
+註冊進全域 `opencode.json` 的 `plugin` 陣列(`scripts/opencode_contract_check.py --fix`;
+只在這份 config 已經有 `mcp.codetrail` 時動作,只補缺的那一筆,不寫進被分析的 repo)。
+它只做兩件事,而且**不會改動任何工具結果**:
+
+- 工具結果裡出現 `[CODETRAIL_ACTION_REQUIRED]` 時跳一次 toast(同一次呼叫只跳一次)。
+  要做什麼寫在工具結果本文裡 —— 通常是用 `review_figures` 看原因,或移除後重灌那份文件。
+- session idle 時,若最後一則回覆**沒有任何工具卡**、文字卻明確宣稱「我來呼叫某工具」,
+  就先問 OpenCode 自己的 MCP 狀態,再看 CodeTrail MCP server 的 lease,然後跳一次恢復動作
+  (重開 session;仍然沒有工具呼叫就 `AICODE_TOOL_CANARY_FORCE=1 aicode` 重驗)。
+  **不會自動重試**;判不出 server 狀態時文案就說判不出來,不會宣稱「server 死了」。
+
+同一件事會寫一筆到 `${XDG_STATE_HOME:-~/.local/state}/codetrail/incidents.jsonl`
+(0600;只有時間、分類、固定 slug 與 session id 的雜湊 —— 沒有訊息內容、檔名或路徑)。
+
+- toast 只在 TUI 出現。`opencode run`(headless)沒有 TUI,那條路徑靠工具結果裡的
+  `[CODETRAIL_ACTION_REQUIRED]` 文字本身;web 介面尚未實測,不保證。
+- 不要這個 plugin:設 `AICODE_NOTIFY_PLUGIN_SKIP=1`(不註冊也不警告)。已經註冊過的話,
+  自己把 `opencode.json` 的 `plugin` 陣列裡那一筆刪掉。
+- plugin 檔不存在時 preflight 只印 WARN、不寫設定 —— 指向不存在的檔會讓整個 OpenCode
+  instance 起不來,寧可沒有通知。
+
+### MCP lease 與 incident:session 中途「模型說沒工具」到底是哪一層掉的
+
+啟動抽查只證明「那一刻是好的」。session 開了幾小時之後才失手時,要分的是三種
+完全不同的原因,而它們在畫面上長得一模一樣:
+
+| 現象 | 真正發生的事 | 看哪裡 |
+|---|---|---|
+| MCP server 已經不在了 | 子行程被 SIGKILL / OOM / client 收掉 | lease 是 `stale` |
+| server 活著,但模型沒發 structured call | 模型只用文字宣稱「我呼叫了工具」 | lease 是 `live`,`incident kind=promise_without_call` |
+| 呼叫發出去了但 client 端失敗 | OpenCode 端 `Not connected` 之類 | `incident kind=client_mcp_failed` / `structured_call_failed` |
+
+每個 MCP server 行程啟動時會在 `~/.local/state/codetrail/mcp/<boot_id>.json`
+(遵守 `XDG_STATE_HOME`)開一份自己的 **lease**。一份行程一個檔,不是共用一個心跳檔
+——canary、TUI、web、`opencode run` 各起一個 MCP 子行程,共用一個檔只會互相覆寫。
+lease 裡只有 pid / ppid / 開始與更新時間 / `tools/list` 次數 / 最後一個工具名與狀態,
+**沒有**工具參數、結果、檔名或路徑,權限 0600。
+
+`AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py` 的 `-- MCP lease / incidents --`
+那一段會把它們攤開,四種狀態的意思是:
+
+- `live` —— pid 還在,而且該行程的啟動時刻(`/proc/<pid>/stat` 第 22 欄)與 lease
+  開檔當下記下的那一格**逐值相同**。這是精確身分比對,不是時間窗:pid 會被重用,
+  重用出來的行程本來就落在任何合理的時間窗裡面。
+- `exited` —— server 自己正常收尾寫下的退出時間與原因。**只有正常關閉才會有**。
+- `stale` —— lease 停在最後一次寫入、pid 已經不在。SIGKILL / OOM 會長這樣,
+  client 正常收掉子行程也會長這樣,所以單獨出現不代表故障。
+- `unknown` —— pid 還在但啟動時刻對不上(pid 被重用)、這台機器讀不到行程資訊,
+  或那是一份還沒有身分欄位的舊 lease。這裡刻意**不猜**:寧可說不知道,
+  也不要宣稱一個早就死掉的 server 還活著。
+
+incident 由 OpenCode plugin 寫在 `~/.local/state/codetrail/incidents.jsonl`
+(0600,超過 1 MiB 轉存 `incidents.jsonl.1`,只留一份)。每行只有時間、`kind`、
+固定 slug 的 `detail`、來源,以及 **session id 的 sha256 前 16 碼**——沒有原始
+session id、沒有訊息內容、沒有路徑。doctor 印的「共 N 筆」與「最近 7 天 N 筆」
+都是掃完兩個檔算出來的完整數字,不是尾巴取樣;最近 7 天有紀錄時印 WARN。
+要重來一次直接刪掉這兩個檔即可,它們純粹是診斷資料。
+
+真的碰上時的處置順序:lease 是 `stale` → 重開 session(server 已經不在,重試沒有用);
+lease 是 `live` 而 incident 是 `promise_without_call` → 退出後
+`AICODE_TOOL_CANARY_FORCE=1 aicode` 強制重測兩條 model lane。
+
+### 什麼情況才算「這個模型可以發布」
+
+`scripts/eval_tool_routing.py` 的 support gate 每一項都要過,其中兩項就是為了不讓
+「模型說它呼叫了工具」變成證據:
+
+- `explicit_canary_100_percent` —— 點名 `codetrail_list_dir` 的 explicit canary
+  必須**全部**成功(`scripts/tool_call_canary.py` 的 hard gate,純文字或假 XML 不算)。
+- `structured_call_success` —— routing eval 的 **structured-call 成功率**要達到
+  `gates.structured_call_success_min`(預設 1.0)。這個比率由既有量測相乘得到:
+  `schema.valid_rate` ×(1 − 沒有 structured call 的回合佔比)。
+  後面那一項用的是**直接計數** `failure_guards.no_structured_call`:
+  「該呼叫工具(`tool_needed`)、卻一個 structured call 都沒有」的回合數,
+  分母是 `tool_needed.count`。
+  - 不用「把 `promise_without_call` / `empty_turn` / `marker_leak` 三種分類相加」
+    當代理值:只要有一種「沒發呼叫」的情況被歸到別的分類,代理值就漏算,
+    成功率會虛報成 1.0。
+  - 也**不能**把正確的 no-tool 案例算進去(它們必然沒有 call):算進去的話
+    一次完美路由也達不到 1.0,門檻變成不可達。所以分子分母都限定在
+    `tool_needed` 這個母體,`model_denominator`(全部 valid 案例)不當退路。
+  - 量不到一律當**不通過**——沒有 schema 量測,或 `tool_needed.count` 缺席 / 為 0
+    都算量不到,這時不會退回去用 `schema.valid_rate` 頂替(那個數字只說
+    「已經送達的 call 有多少合格」,一次 call 都沒送出去的 run 它照樣是 1.0)。
+
+兩項都過才有資格談發布;`measured` 不會自動升 `supported`,狀態一律人工決定。
+
 ### 工具結果第一行是 `status: partial` 或出現 `context_risk`
 
 所有工具結果的 compact text lane 第一行固定是 `status: ok|partial|error`。`partial` 不是
@@ -776,7 +866,10 @@ python3 RAG.py docs/datasheet.pdf knowledge.json
 ### PDF ingest 失敗說「structured 抽取失敗(truncated)」
 
 `finish_reason="length"` 代表那張圖的結構化輸出**比輸出預算長**,不是模型答錯。
-一整份 PDF 會因此零寫入(契約:抽取失敗不得以半套內容入庫)。
+**那一張缺席,其餘照常入庫**(契約:抽壞的不得以半套內容入庫,但不牽連整份文件)。
+結果會列出是哪幾張,`review_figures(action="list")` 也看得到(`in_kb=false`)。
+仍然整份零寫入的是「剩下的圖也不能信」那幾種:VL 連不上 / 逾時、預算超限、
+capability probe 未過、來源檔中途被換掉。
 
 正常情況下你不需要做任何事:第一次抽取用 `AICODE_VL_INGEST_MAX_TOKENS`(預設 2048),
 撞頂之後那一次重試會**自動**把預算加大到 VL server 的 context 還放得下的程度

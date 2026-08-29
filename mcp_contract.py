@@ -94,7 +94,9 @@ MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
     "ingest_document": (
         "Add a sandboxed document/image/binary to knowledge.json. PDF preflight_only=true estimates cost with zero KB writes; fresh=true "
-        "rebuilds the KB and cannot be combined with preflight. Query tools auto-reload after success."
+        "rebuilds the KB and cannot be combined with preflight. Query tools auto-reload after success. This call can run for minutes; "
+        "knowledge-base tools and a second ingest report busy until it finishes, so wait for this result instead of retrying. When the "
+        "result contains [CODETRAIL_ACTION_REQUIRED], report the listed figures and their next step instead of calling it done."
     ),
     "remove_document": "Remove every knowledge-base chunk for one source basename; query tools auto-reload afterward.",
     "reload_knowledge_base": "Force immediate fail-loud reload of knowledge.json and report status; normal queries already auto-reload.",
