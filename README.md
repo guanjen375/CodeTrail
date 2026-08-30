@@ -326,7 +326,7 @@ CodeTrail 的內建 VL key 是 `qwen3.5-9b`。Qwen3.5-9B 是原生多模態模�
 
 > 「圖片 ingestion」就是 **VL + RAG 一起用**:`ingest_document(...)` 餵圖片時會自動呼叫 VL 把圖看成文字、再切 chunk 進知識庫,所以截圖/架構圖/規格頁能變成之後 `query_knowledge(...)` 查得到的內容。一次性看圖用 `analyze_file(...)`,要長期反覆查改用 `ingest_document(...)`;完整串接見 [docs/rag.md](docs/rag.md)。
 >
-> PDF 裡的表格 / memory map / 終端機 log / diagram 走**結構化**抽取:有原生文字或幾何就直接利用;只有像素的 raster / picture 則先由 VL 分成 table、terminal 或 diagram，再產生 canonical JSON、格/行級證據與驗證狀態。看不清的字元放 `▯` 而不是猜。這些候選都受嚴格模式的證據閘保護，也都能用 `review_figures(...)` 人工覆核;只有未被結構化候選覆蓋的舊 picture job 才保留自由文字 VL 相容路徑。
+> PDF 裡的表格 / memory map / 終端機 log / 整頁散文 / diagram 走**結構化**抽取:有原生文字或幾何就直接利用;只有像素的 raster / picture 則先由 VL 分成 table、terminal、prose 或 diagram，再產生 canonical JSON、格/行級證據與驗證狀態;判定**不是圖面**（封面、logo、照片）的直接跳過，零抽取、零 chunk。看不清的字元放 `▯` 而不是猜。這些候選都受嚴格模式的證據閘保護，也都能用 `review_figures(...)` 人工覆核。**沒被這條 lane 收的頁與區域就是缺席**:不入庫、也不做自由文字描述,ingest 會逐筆列出頁碼、bbox 與原因(2026-08-30 移除舊的自由文字 VL 相容路徑)。
 
 ```bash
 HF_XET_HIGH_PERFORMANCE=1 hf download \
@@ -869,7 +869,8 @@ PDF 先估成本,再入庫,最後覆核:
 ```
 
 preflight 零寫入;它會估算所有結構化候選，包含純 raster 的分類與雙樣本抽取。
-只有未被結構化候選覆蓋的舊自由文字 picture job 不在這個預算欄位裡。
+沒被收成候選的區域不進預算(它們不會被送出去),報告改在「不會進 KB 的頁 / 區域」
+那一段逐筆列出。
 入庫後,**能以獨立證據確認的**表格才會被 `query_knowledge_strict` 拿來回答數值;不能確認的
 會標成待覆核並在回傳的 `excluded_figures` 裡列出頁碼與原因(不是「查不到」)。
 `review_figures(action="fix", ..., confirm_against_image=True)` 是人工覆核入口,permission 設

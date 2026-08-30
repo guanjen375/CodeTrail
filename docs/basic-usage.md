@@ -190,8 +190,8 @@ aicode
 聊天截圖要抽對話內容改 `ingest_document('shot.png', mode='chat')`；圖片在專案外就先 `import_external_file` 再 ingest。
 
 PDF 裡的**表格 / 終端機畫面**（datasheet、register map、log）多的話，先估成本再入庫，
-最後覆核。preflight 是零寫入的（但它只算**結構化 lane** 的成本；純 raster 內嵌圖走的
-自由文字 VL 不受那些上限判定，所以「在預算內」不等於整份 PDF 都便宜）：
+最後覆核。preflight 是零寫入的，而且涵蓋所有會被送出去的候選（沒被收成候選的區域不會
+被送，改在「不會進 KB 的頁 / 區域」那一段逐筆列出）：
 
 ```text
 請用工具 ingest_document 匯入 docs/datasheet.pdf，preflight_only 設 True，

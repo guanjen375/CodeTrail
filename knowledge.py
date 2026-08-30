@@ -98,7 +98,8 @@ VERIFICATION_RANK = {
 
 # 舊 VL lane（自由文字視覺描述）與新的 structured figure lane。
 VL_ORIGINS = {"image", "screenshot", "diagram"}
-FIGURE_ORIGINS = frozenset({"figure_table", "figure_terminal", "figure_diagram"})
+FIGURE_ORIGINS = frozenset({"figure_table", "figure_terminal", "figure_prose",
+                            "figure_diagram"})
 
 # 給人看的狀態說明。字串本身是 REF 的一部分，模型會照著判斷能不能引用。
 _VERIFICATION_LABELS = {
@@ -132,6 +133,22 @@ _FIGURE_META_KEYS = (
     "extraction_status", "evidence_ref", "model_input_variant",
 )
 
+# `RAG.PDF_TABLE_REPLACED_MARKER` 留在文字 chunk 裡的單行 marker。原生表格被
+# structured chunk 收錄之後，原位置只剩這一行，所以命中它的文字 chunk 本身**沒有
+# 那張表的任何內容**——查詢期不跟著 figure_id 走回去，使用者就只拿得到一個頁碼。
+#
+# 這裡刻意不 import RAG（那會把 PyMuPDF / embedding client 拖進 MCP 熱路徑），
+# 兩邊共用的只有這一個字面格式；`tests/test_rag_pdf_ingest.py` 有一條 smoke 拿
+# `RAG.PDF_TABLE_REPLACED_MARKER` 實際 format 一次再餵給這個 pattern，漂了就紅。
+_REPLACED_FIGURE_MARKER_RE = re.compile(
+    r"\[表格已改以結構化 chunk 收錄：figure=(fig_[0-9a-f]{16}) page=(-?\d+) rows=(-?\d+)\]"
+)
+# 一個 marker 最多帶回幾個 part、一次查詢最多帶回幾個 figure chunk。
+# 不設上限的話，一張 200 列的大表會把整個 REF 預算吃光，連原本命中的段落都擠掉；
+# 帶回來的 part 仍會照常揭露 `rows=a-b/total` 與 `part_index/part_total`。
+MARKER_RESOLVE_MAX_PER_FIGURE = 2
+MARKER_RESOLVE_MAX_TOTAL = 4
+
 # 衍生文字的 scaffolding 辨識（figure_extract §2.7 的凍結格式）：第一行一定是
 # `[FIGURE ...]`；terminal 第二行是動態 fence；table 第二、三行是真實表頭與分隔列。
 # 用「認出來才扣」而不是寫死行數：認不出來就不宣稱顯示了哪幾列（誠實降級），
@@ -149,6 +166,14 @@ def _is_structured_chunk(chunk: dict) -> bool:
 def _is_figure_chunk(chunk: dict) -> bool:
     """圖片來源的 chunk：新的 structured lane，或舊的自由文字 VL lane。"""
     return _is_structured_chunk(chunk) or chunk.get("origin") in VL_ORIGINS
+
+
+def _as_int_or(value, default: int) -> int:
+    """任意值 → int；轉不動就回 default（排序鍵不得因為一個壞欄位而 raise）。"""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def _ordered_unique(values) -> list:
@@ -2379,6 +2404,57 @@ English:"""
             return []
         return [v / emb_count for v in emb_sum]
 
+    def _resolve_replaced_figures(self, chunks: list) -> list:
+        """把文字 chunk 裡的取代 marker 解回對應的 structured figure chunk。
+
+        原生表格被 structured chunk 收錄之後，原位置只留下一行 marker。命中那個文字
+        chunk 等於命中一個「這裡本來有一張表」的註記——表的內容在**另一個** chunk
+        裡，檢索分數卻算在文字那一份上。不跟著走回去的話，以表名/上下文提問永遠只
+        拿得到頁碼。
+
+        規則：
+        - 只認同一份文件（`source` 相同）的 figure_id。marker 只帶 basename 級的身分，
+          跨文件跟過去就可能指到另一份同名 PDF 的表。
+        - 已經在選集裡的不重複加入。
+        - 帶回來的 part 依 `part_index` 取前幾個，並受兩道上限節制（見模組常數）。
+        - **附加在後面**，不改變既有名次：marker 解析是補脈絡，不是重新排序。
+        """
+        if not chunks:
+            return chunks
+        wanted: list = []
+        seen = {id(chunk) for chunk in chunks}
+        present = {(str(c.get("source", "")), str(c.get("figure_id", "")))
+                   for c in chunks if c.get("figure_id")}
+        for chunk in chunks:
+            if _is_structured_chunk(chunk):
+                continue
+            source = str(chunk.get("source", ""))
+            for match in _REPLACED_FIGURE_MARKER_RE.finditer(str(chunk.get("content", ""))):
+                key = (source, match.group(1))
+                if key in present:
+                    continue
+                present.add(key)
+                wanted.append(key)
+        if not wanted:
+            return chunks
+
+        resolved: list = []
+        for source, figure_id in wanted:
+            parts = [c for c in self.chunks
+                     if str(c.get("figure_id", "")) == figure_id
+                     and str(c.get("source", "")) == source
+                     and id(c) not in seen]
+            parts.sort(key=lambda c: (_as_int_or(c.get("part_index"), 1),
+                                      _as_int_or(c.get("chunk_index"), 0)))
+            for part in parts[:MARKER_RESOLVE_MAX_PER_FIGURE]:
+                if len(resolved) >= MARKER_RESOLVE_MAX_TOTAL:
+                    break
+                seen.add(id(part))
+                resolved.append(part)
+            if len(resolved) >= MARKER_RESOLVE_MAX_TOTAL:
+                break
+        return list(chunks) + resolved
+
     def _merge_adjacent_chunks(self, chunks: list) -> list:
         """合併同一頁的相鄰 chunk
 
@@ -2745,6 +2821,11 @@ English:"""
             f"  figure_id: {chunk.get('figure_id', '') or '?'} "
             f"rev={chunk.get('revision', '?')} kind={chunk.get('figure_kind', '') or '?'}"
         ]
+        caption = str(chunk.get("figure_caption", "") or "").strip()
+        if caption:
+            # 題名來自鄰近的文字層（不是從圖裡讀出來的），所以標明「文字層」——
+            # 模型才不會把它當成 payload 的一部分逐字引用成圖內文字。
+            lines.append(f"  caption: {caption}（取自文字層，非圖內內容）")
         raw = str(chunk.get("verification_status", "") or "")
         label = _VERIFICATION_LABELS.get(status, "未知狀態")
         # 「未知」只用在**真的不是已知狀態**的字串上。被 sibling / revision 降級不是
@@ -2956,6 +3037,10 @@ English:"""
             top_chunks = self._select_with_pollution_control(
                 top_chunks, prelim_pollution_risk, prelim_emb_scores, trust_map
             )
+
+        # marker → figure chunk：在合併/過濾**之前**補進來，後面的 strict gate、
+        # 截斷計畫與去重才會一視同仁地作用在它身上（待覆核的圖照樣會被擋下）。
+        top_chunks = self._resolve_replaced_figures(top_chunks)
 
         merged_chunks = self._merge_adjacent_chunks(top_chunks)
 

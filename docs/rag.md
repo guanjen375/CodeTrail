@@ -140,9 +140,8 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 
 #### 支援格式
 
-- **文字**：`.pdf` / `.md` / `.txt`（抽文字。PDF 裡的圖走**兩條 lane**，範圍不一樣，詳見下面「[PDF 內的表格與終端機畫面](#pdf-內的表格與終端機畫面結構化抽取--人工覆核)」：
-  1. **結構化 lane** —— 收原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，也收夠大的純 raster / picture。raster 先由 VL 分類成 table / terminal / diagram，再產出 canonical JSON、逐格/逐行證據與驗證狀態；看不清的字元放 `▯` 而不是猜。
-  2. **舊自由文字 VL 相容 lane** —— 只處理未被結構化候選覆蓋的舊 picture job，並維持既有 `origin="diagram"` KB chunk 的相容性；它沒有 canonical payload 或 strict gate。
+- **文字**：`.pdf` / `.md` / `.txt`（抽文字。PDF 裡的圖只走**一條 lane**，詳見下面「[PDF 內的表格與終端機畫面](#pdf-內的表格與終端機畫面結構化抽取--人工覆核)」：**結構化 lane** 收原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，也收夠大的純 raster / picture。raster 先由 VL 分類成 table / terminal / prose / diagram，或判定**不是圖面**（封面、logo、照片）而直接跳過；被收的則產出 canonical JSON、逐格/逐行證據與驗證狀態，看不清的字元放 `▯` 而不是猜。
+  這條 lane 沒收的頁與區域就是**缺席**：不入庫、不做自由文字描述，改由 ingest 輸出與摘要逐筆列出頁碼、bbox 與原因（2026-08-30 移除舊的自由文字 VL 相容 lane；既有 KB 裡的 `origin="diagram"` chunk 仍照原語意保留）。
   單張抽壞只讓**那一張缺席**（其餘 figure 與全部文字 chunk 照常入庫，結果會列出是哪幾張）；
   整份文件零寫入的是「剩下的圖也不能信」那幾種：VL 連不上／逾時、預算超限、
   capability probe 未過、來源檔中途被換掉。走到 VL 的圖需要 VL server（:8083）在線；純文字＋原生表格的 PDF 則可能一次 VL 都不用呼叫）
@@ -150,7 +149,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 - **binary**：`.bin` / `.dat` / `.raw` / `.fw` / `.img` / `.rom` / `.hex`（抽 hex dump、可讀字串、magic 偵測；遇到 ELF magic 自動切到 ELF 解析）
 - **ELF**：`.elf` / `.so` / `.o` / `.axf` / `.out` / `.ko`（走長版多視角報告：summary、完整 symbols、memmap、relocation caller、DWARF 函式與型別、分類 strings、sections / imports / dynamic）
 
-純圖片掃描的 PDF（沒有可選文字）不再切不出內容：每頁會 render 後進入 raster 分類與結構化抽取。文字＋圖混合的 PDF（datasheet 類）文字照舊切 chunk，圖另外產生 table / terminal / diagram structured chunk。圖很多的 PDF 建議先跑 `ingest_document(path, preflight_only=True)` 估成本（零寫入，見下節）。VL server 是啟動必要條件。**VL 連不上／逾時**這類整條 lane 起不來的情況，ingest 會整份中止、知識庫不變；但**單張抽壞只讓那一張缺席**（其餘 figure 與全部文字 chunk 照常入庫）。遇到前者先跑 `python3 scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
+純圖片掃描的 PDF（沒有可選文字）不再切不出內容：每頁會 render 後進入 raster 分類與結構化抽取；被分類成整頁散文的會走 `prose`（逐行轉錄），不再被硬塞進 diagram 的 components/relations schema。橫放的頁（`/Rotate != 0`）上游的 markdown 恆為空，ingest 會把 rotation 歸零後重抽那一頁的正文；真的抽不出來才列進缺席清單。文字＋圖混合的 PDF（datasheet 類）文字照舊切 chunk，圖另外產生 table / terminal / prose / diagram structured chunk。圖很多的 PDF 建議先跑 `ingest_document(path, preflight_only=True)` 估成本（零寫入，見下節）。VL server 是啟動必要條件。**VL 連不上／逾時**這類整條 lane 起不來的情況，ingest 會整份中止、知識庫不變；但**單張抽壞只讓那一張缺席**（其餘 figure 與全部文字 chunk 照常入庫）。遇到前者先跑 `python3 scripts/required_model_servers_check.py` 看 `image_url` 多模態 probe。
 
 #### 三個步驟
 
@@ -262,14 +261,21 @@ batch size 上限是 32 (REF1)。
 
 ##### 涵蓋範圍
 
-| lane | 收哪些 | 拿得到什麼 |
+| 情況 | 收哪些 | 拿得到什麼 |
 |---|---|---|
-| **結構化** | 原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，以及夠大的純 raster / picture | raster 先分類成 table / terminal / diagram；再產生 canonical JSON、逐格/逐行證據、`▯`、驗證狀態、strict gate，且可用 `review_figures` 覆核 |
-| **舊自由文字 VL 相容路徑** | 未被結構化候選覆蓋的舊 picture job，以及既有 KB chunk | 只有 VL 文字描述（`origin="diagram"`，檢索降權），沒有 canonical payload |
+| **結構化 lane 收錄** | 原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，以及夠大的純 raster / picture | raster 先分類成 table / terminal / prose / diagram；再產生 canonical JSON、逐格/逐行證據、`▯`、驗證狀態、strict gate，且可用 `review_figures` 覆核 |
+| **判定不是圖面** | 封面、logo、商標、裝飾線條、產品照片、單純的 GUI 圖示 | 零 VL 抽取、零 chunk；只留在 review artifact 的「判定不是圖面」一節與 ingest 的缺席清單 |
+| **lane 沒收** | 沒有結構性證據的區域、超出上限被丟掉的候選、整頁 abstain 的頁 | **不入庫**；ingest 輸出與摘要列出頁碼、bbox 與原因。需要那幾頁就用 `read_pdf(path, pages="…")` 直接看原檔 |
 
 掃描版 datasheet 的表格與手機拍的終端機畫面現在會成為 structured figure；因為通常沒有
 獨立原生證據，狀態仍多半是 `unverified` / `needs_review`，`query_knowledge_strict` 會擋下，
-直到人工對原圖確認。`diagram` 也有自動分類與 structured producer。
+直到人工對原圖確認。整頁散文走 `prose`（逐行轉錄），`diagram` 也有自動分類與 structured producer。
+
+figure chunk 會帶所在章節與 caption（`Table 3-1 …` / `圖 2-4 …`）。兩者**只當檢索訊號**
+（embedding + BM25 + REF 上一行標示），不進 canonical payload——它們來自鄰近的文字層，
+不是從圖裡讀出來的。caption 只在「同一頁、同一家族的圖數與 caption 數完全相等」時才配對；
+對不上就整頁不掛，掛錯 caption 比沒有 caption 更糟。原生表格被 structured chunk 取代後，
+原位置那行 marker 在**查詢期**會被跟回去，把對應的 figure chunk 一併帶進 REF。
 
 ##### 六種驗證狀態
 
@@ -324,7 +330,7 @@ python3 RAG.py docs/datasheet.pdf knowledge.json --preflight
 ##### 抽壞的那一張缺席,不是整份零寫入
 
 結構化 lane 的 schema / validator / row width / line contract / `finish_reason` 任一最終不合格
-→ **那一張圖不進 KB**(不冒充成功入庫,也不退回自由文字描述),其餘 figure 與全部文字 chunk
+→ **那一張圖不進 KB**(不冒充成功入庫,也沒有自由文字退路),其餘 figure 與全部文字 chunk
 照常入庫;stdout 會印一行 `[figure] 失敗 N 張(不進 KB):p31 diagram truncated;…`,失敗的那幾張
 仍留在同一份 review artifact 裡,用 `review_figures(action="list")` 看得到(`in_kb: False`)。
 VL 的輸出本來就有隨機性,把它綁成文件級的全有全無,等於讓「整份文件進不進得去」看運氣。
@@ -347,7 +353,7 @@ capability probe:端點真的吃 image content part、
 | `partial`（preflight 超限） | **零寫入**:一個位元組都沒進 KB,只是估算超出上限 | 照 `[CODETRAIL_ACTION_REQUIRED]` 縮小範圍或調高上限,再**重新**呼叫一次(拿掉 `preflight_only`)。結果會同時帶 `[CODETRAIL_ZERO_WRITE]` |
 | `error` | 逾時 / exit≠0 / 輸出不完整 | 依錯誤訊息排除後重跑;**不要**拿這次的結果當入庫成功 |
 
-`[CODETRAIL_ACTION_REQUIRED]` 那一段最多分三類,每類最多列 5 筆(超出會註明還有幾筆),
+`[CODETRAIL_ACTION_REQUIRED]` 那一段最多分四類,每類最多列 5 筆(超出會註明還有幾筆),
 而且每類都直接給下一步:
 
 - **待覆核**(原圖可讀) → `review_figures(action="list", document_id=...)` 看原因,對照原圖後
@@ -355,8 +361,12 @@ capability probe:端點真的吃 image content part、
 - **無法覆核**(payload / 原圖讀不到,例如 review artifact 被清掉) → 就地修不了,
   `remove_document(...)` 後重新 ingest。
 - **抽取失敗**(那一張不進 KB) → 接受它缺席(其餘內容已入庫),或 `remove_document(...)` 後重灌。
+- **未進知識庫**(整條 lane 沒跑、旋轉頁正文抽不出來、預算把候選丟掉) → 那些內容查詢時
+  完全不存在,用 `read_pdf(path, pages="…")` 直接讀原頁;`structured_lane_inactive` 代表檔案
+  不在專案根內,搬進去再 ingest 一次才會有 figure。
 
-`unverified` / `legacy_unverified` 以及全部可信的情況**不會**出現在這一段。每次入庫都印一句
+「偵測器判定這一塊不是結構化圖面」這類**沒有下一步**的缺席不列進這一段(完整清單在 ingest
+自己的輸出裡)。`unverified` / `legacy_unverified` 以及全部可信的情況也**不會**出現在這一段。每次入庫都印一句
 罐頭提示等於沒有提示:你會學會跳過它,真的有待覆核時也一起跳過。同理,這一段只算**這一次**
 的 run——artifacts 裡上一次 run 留下的失敗不會被重報一次。
 

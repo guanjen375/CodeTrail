@@ -34,58 +34,25 @@ def _fake_pdf(monkeypatch, pages):
 _STUB_PNG = b"\x89PNG\r\n\x1a\nstub"
 
 
-def _stub_render(monkeypatch):
-    """替換 pymupdf 開檔與 render：bytes 由 job 決定，dedup 邏輯吃真 hash。
+def _stub_open(monkeypatch):
+    """替換 pymupdf 開檔：假 PDF bytes 也能走完 structured lane 的開檔前置。
 
-    crop 的 bytes 只看 bbox（同一框 → 同一張圖 → 相同 bytes，跨頁去重可測）；
-    整頁 render 的 bytes 帶頁碼（不同頁預設視為不同內容）。
+    2026-08-30：legacy 圖面路徑（`_render_pdf_figure_png` / `_pdf_figure_chunks`）
+    已移除，所以這裡不再需要假 renderer——沒被 structured lane 收錄的框現在是
+    **缺席**，不會有人去 render 它。
     """
     monkeypatch.setattr(
         RAG, "_open_pdf_document",
         lambda _path: types.SimpleNamespace(page_count=9999, close=lambda: None),
     )
 
-    def _render(_doc, job):
-        if job["mode"] == "page":
-            return f"PNG:page:{job['page']}".encode()
-        return f"PNG:crop:{job['bbox']}".encode()
-
-    monkeypatch.setattr(RAG, "_render_pdf_figure_png", _render)
-
-
-VL_DESCRIPTION = (
-    "# 架構圖\n\n## 概述\nNPU 方塊圖，含 8 個運算核心與 4MB 共享 SRAM，"
-    "經 AXI 匯流排連接 DMA 引擎。"
-)
-
-
-class _VLSpy:
-    """假 VL：記錄每次呼叫；fail=True 時模擬 VL 端失敗。"""
-
-    def __init__(self, description: str = VL_DESCRIPTION, fail: bool = False):
-        self.calls = []
-        self.description = description
-        self.fail = fail
-
-    def __call__(self, image_base64: str, mime_type: str) -> str:
-        self.calls.append((image_base64, mime_type))
-        if self.fail:
-            raise RuntimeError("VL server unreachable (stub)")
-        return self.description
-
-
-def _stub_vl(monkeypatch, **kwargs) -> _VLSpy:
-    spy = _VLSpy(**kwargs)
-    monkeypatch.setattr(RAG, "_describe_technical_image_base64", spy)
-    return spy
-
 
 def _text_chunks(chunks):
-    return [c for c in chunks if c.get("origin") != "diagram"]
+    return [c for c in chunks if not c.get("origin")]
 
 
-def _diagram_chunks(chunks):
-    return [c for c in chunks if c.get("origin") == "diagram"]
+def _figure_chunks(chunks):
+    return [c for c in chunks if c.get("origin")]
 
 
 LONG_TEXT_A = "Chapter 1 Overview. The NPU has 8 compute cores and a shared 4MB SRAM block."
@@ -108,8 +75,7 @@ def test_new_metadata_page_number_key(monkeypatch):
         {"metadata": {"page_number": 3}, "text": LONG_TEXT_B,
          "page_boxes": [{"class": "text"}, {"class": "picture", "bbox": BIG_BBOX}]},
     ])
-    _stub_render(monkeypatch)
-    _stub_vl(monkeypatch)
+    _stub_open(monkeypatch)
 
     chunks = RAG.extract_pdf("fake_spec.pdf")
 
@@ -118,8 +84,8 @@ def test_new_metadata_page_number_key(monkeypatch):
     assert {c["page"] for c in text} == {1, 3}, (
         f"頁碼應反映實體頁，實際: {sorted({c['page'] for c in text})}"
     )
-    # 內嵌圖也要落在正確頁（沿用同一個 page_number 相容 helper）
-    assert {c["page"] for c in _diagram_chunks(chunks)} == {2, 3}
+    # 2026-08-30：沒被 structured lane 收錄的 picture 框是**缺席**，不再產生 chunk。
+    assert not _figure_chunks(chunks)
 
 
 def test_legacy_metadata_page_key_still_works(monkeypatch):
@@ -135,27 +101,26 @@ def test_legacy_metadata_page_key_still_works(monkeypatch):
 
 
 # ============================================================
-# 內嵌圖自動 VL：分流
+# 內嵌圖：structured lane 沒收就是缺席
 # ============================================================
-def test_text_only_pdf_zero_vl_calls(monkeypatch, capsys):
-    """純文字 PDF：零 VL 呼叫、零 diagram chunk、文字 chunk 照舊。"""
+def test_text_only_pdf_stays_silent(monkeypatch, capsys):
+    """純文字 PDF：零 figure chunk、零缺席提示、文字 chunk 照舊。"""
     _fake_pdf(monkeypatch, [
         {"metadata": {"page_number": 1}, "text": LONG_TEXT_A,
          "page_boxes": [{"class": "text"}]},
         {"metadata": {"page_number": 2}, "text": LONG_TEXT_B, "page_boxes": []},
     ])
-    spy = _stub_vl(monkeypatch)
 
     chunks = RAG.extract_pdf("fake.pdf")
 
     out = capsys.readouterr().out
-    assert spy.calls == [], "純文字 PDF 不得觸發任何 VL 呼叫"
-    assert chunks and not _diagram_chunks(chunks)
+    assert chunks and not _figure_chunks(chunks)
     assert "內嵌圖" not in out
+    assert "沒有進知識庫" not in out, "沒有圖的 PDF 不得講缺席（罐頭提示）"
 
 
-def test_mixed_pdf_text_chunks_unchanged_plus_diagram(monkeypatch):
-    """混合 PDF：文字 chunk 與純文字路徑逐位元組相同，另產 diagram chunk。"""
+def test_mixed_pdf_text_chunks_unchanged_and_pictures_are_absent(monkeypatch, capsys):
+    """混合 PDF：文字 chunk 與純文字路徑逐位元組相同；picture 框改成列帳缺席。"""
     def _pages(with_pics: bool):
         boxes = [{"class": "picture", "bbox": BIG_BBOX}] if with_pics else []
         return [
@@ -167,245 +132,21 @@ def test_mixed_pdf_text_chunks_unchanged_plus_diagram(monkeypatch):
     baseline = RAG.extract_pdf("fake_spec.pdf")
 
     _fake_pdf(monkeypatch, _pages(True))
-    _stub_render(monkeypatch)
-    spy = _stub_vl(monkeypatch)
-    chunks = RAG.extract_pdf("fake_spec.pdf")
+    _stub_open(monkeypatch)
+    document = RAG.extract_pdf_document("fake_spec.pdf")
 
-    text = _text_chunks(chunks)
+    text = _text_chunks(document.chunks)
     assert [c["content"] for c in text] == [c["content"] for c in baseline]
     assert [c["page"] for c in text] == [c["page"] for c in baseline]
-
-    figs = _diagram_chunks(chunks)
-    assert len(spy.calls) == 1
-    assert figs, "混合 PDF 應另產 diagram chunk"
-    assert all(c["page"] == 2 for c in figs)
-    assert all(c["type"] == "diagram" for c in figs)
-    assert all(c["figure_index"] == 1 for c in figs)
-
-
-def test_image_only_page_produces_chunks(monkeypatch):
-    """無文字頁（掃描頁）：整頁 render 經 VL，chunk 數 > 0（現行為 0）。"""
-    _fake_pdf(monkeypatch, [
-        {"metadata": {"page_number": 1}, "text": "",
-         "page_boxes": [{"class": "picture", "bbox": BIG_BBOX}]},
-    ])
-    _stub_render(monkeypatch)
-    spy = _stub_vl(monkeypatch)
-
-    chunks = RAG.extract_pdf("scan.pdf")
-
-    assert len(chunks) > 0
-    assert all(c.get("origin") == "diagram" for c in chunks)
-    assert all(c["page"] == 1 for c in chunks)
-    assert len(spy.calls) == 1
-
-
-def test_multiple_figures_same_page_distinguishable(monkeypatch):
-    """同頁多張影像：figure 索引可區分，chunk_index 不互相覆蓋。"""
-    _fake_pdf(monkeypatch, [
-        {"metadata": {"page_number": 1}, "text": LONG_TEXT_A,
-         "page_boxes": [{"class": "picture", "bbox": BIG_BBOX},
-                        {"class": "picture", "bbox": BIG_BBOX_2}]},
-    ])
-    _stub_render(monkeypatch)
-    spy = _stub_vl(monkeypatch)
-
-    chunks = RAG.extract_pdf("fake_spec.pdf")
-
-    figs = _diagram_chunks(chunks)
-    assert len(spy.calls) == 2
-    assert {c["figure_index"] for c in figs} == {1, 2}
-    # 同頁所有 chunk（文字+圖）index 不得重複，否則 chunk id 空間互踩
-    indices = [c["chunk_index"] for c in chunks if c["page"] == 1]
-    assert len(indices) == len(set(indices)), f"chunk_index 重複: {indices}"
-
-
-def test_duplicate_images_dedup(monkeypatch, capsys):
-    """重複影像（頁首 logo 類）：只產一個 chunk，記錄首次出現頁碼。"""
-    _fake_pdf(monkeypatch, [
-        {"metadata": {"page_number": 1}, "text": LONG_TEXT_A,
-         "page_boxes": [{"class": "picture", "bbox": BIG_BBOX}]},
-        {"metadata": {"page_number": 2}, "text": LONG_TEXT_B,
-         "page_boxes": [{"class": "picture", "bbox": BIG_BBOX}]},
-    ])
-    _stub_render(monkeypatch)  # 同 bbox → 同 bytes → 同 hash
-    spy = _stub_vl(monkeypatch)
-
-    chunks = RAG.extract_pdf("fake_spec.pdf")
-
-    figs = _diagram_chunks(chunks)
-    assert len(spy.calls) == 1, "同一張圖只送一次 VL"
-    assert figs and {c["page"] for c in figs} == {1}, "chunk 應記錄首次出現的頁碼"
-    assert "去重" in capsys.readouterr().out
-
-
-def test_tiny_images_not_sent_to_vl(monkeypatch, capsys):
-    """過小影像（圖示/項目符號/分隔線）：不送 VL、不產 chunk。"""
-    _fake_pdf(monkeypatch, [
-        {"metadata": {"page_number": 1}, "text": LONG_TEXT_A,
-         "page_boxes": [{"class": "picture", "bbox": TINY_BBOX}]},
-    ])
-    spy = _stub_vl(monkeypatch)
-
-    chunks = RAG.extract_pdf("fake_spec.pdf")
-
-    assert spy.calls == []
-    assert not _diagram_chunks(chunks)
-    assert "過小" in capsys.readouterr().out
-
-
-def test_tiny_only_image_page_is_skipped(monkeypatch, capsys):
-    """幾乎沒文字且圖全過小的頁：不整頁 render（避免 VL 看空白頁）。"""
-    _fake_pdf(monkeypatch, [
-        {"metadata": {"page_number": 1}, "text": LONG_TEXT_A, "page_boxes": []},
-        {"metadata": {"page_number": 2}, "text": "",
-         "page_boxes": [{"class": "picture", "bbox": TINY_BBOX}]},
-    ])
-    spy = _stub_vl(monkeypatch)
-
-    chunks = RAG.extract_pdf("fake_spec.pdf")
-
-    assert spy.calls == []
-    assert not _diagram_chunks(chunks)
-    assert "只有過小影像" in capsys.readouterr().out
-
-
-def test_legacy_images_key_with_bbox_processed(monkeypatch):
-    """舊版把內嵌圖放在 images list：一樣分流、一樣送 VL。"""
-    _fake_pdf(monkeypatch, [
-        {"metadata": {"page": 0}, "text": LONG_TEXT_A},
-        {"metadata": {"page": 1}, "text": "", "images": [{"bbox": list(BIG_BBOX)}]},
-        {"metadata": {"page": 2}, "text": LONG_TEXT_B,
-         "images": [{"bbox": list(BIG_BBOX_2)}]},
-    ])
-    _stub_render(monkeypatch)
-    spy = _stub_vl(monkeypatch)
-
-    chunks = RAG.extract_pdf("fake.pdf")
-
-    figs = _diagram_chunks(chunks)
-    assert len(spy.calls) == 2
-    assert {c["page"] for c in figs} == {2, 3}
-
-
-def test_missing_bbox_degrades_to_page_render(monkeypatch, capsys):
-    """偵測到圖但 bbox 解析不出（舊 schema）：降級整頁 render，不無聲丟圖。"""
-    _fake_pdf(monkeypatch, [
-        {"metadata": {"page_number": 1}, "text": LONG_TEXT_A,
-         "page_boxes": [{"class": "picture"}]},  # 沒有 bbox
-    ])
-    _stub_render(monkeypatch)
-    spy = _stub_vl(monkeypatch)
-
-    chunks = RAG.extract_pdf("fake_spec.pdf")
-
-    figs = _diagram_chunks(chunks)
-    assert len(spy.calls) == 1
-    assert figs and all(c["page"] == 1 for c in figs)
-    assert "缺 bbox" in capsys.readouterr().out
+    assert not _figure_chunks(document.chunks), "沒有自由文字 lane 了"
+    absent = getattr(document, RAG._ABSENT_ATTR, None)
+    assert any(item["page"] == 2 for item in absent or []), absent
+    assert "沒有進知識庫" in capsys.readouterr().out
 
 
 # ============================================================
 # hard fail 與 per-doc 原子性
 # ============================================================
-MIXED_PAGES_FOR_FAIL = [
-    {"metadata": {"page_number": 1}, "text": LONG_TEXT_A, "page_boxes": []},
-    {"metadata": {"page_number": 2}, "text": "",
-     "page_boxes": [{"class": "picture", "bbox": BIG_BBOX}]},
-]
-
-
-def test_vl_failure_hard_fails_and_kb_bytes_unchanged(monkeypatch, tmp_path: Path):
-    """VL 呼叫失敗：raise（帶檔案/頁碼/圖索引/原始錯誤），knowledge.json 位元組不變。"""
-    pdf = tmp_path / "mixed_spec.pdf"
-    pdf.write_bytes(b"%PDF-fake")  # 內容無關：to_markdown/render 都被替換
-    kb_path = tmp_path / "knowledge.json"
-    kb_path.write_text(json.dumps({
-        "metadata": {
-            "embedding_model": RAG.EMBEDDING_MODEL,
-            "documents": ["old_doc.md"],
-            "total_documents": 1,
-            "total_chunks": 0,
-        },
-        "chunks": [],
-    }, ensure_ascii=False), encoding="utf-8")
-    before = kb_path.read_bytes()
-
-    _fake_pdf(monkeypatch, MIXED_PAGES_FOR_FAIL)
-    _stub_render(monkeypatch)
-    _stub_vl(monkeypatch, fail=True)
-
-    with pytest.raises(RAG.PdfFigureError) as exc:
-        RAG.add_document(str(pdf), str(kb_path))
-
-    msg = str(exc.value)
-    assert "mixed_spec.pdf" in msg, msg
-    assert "第 2 頁" in msg and "圖 1" in msg, msg
-    assert "VL server unreachable" in msg, msg
-    assert kb_path.read_bytes() == before, "失敗後 knowledge.json 必須零寫入"
-
-
-def test_render_failure_hard_fails(monkeypatch):
-    """render 失敗同樣 hard fail：圖絕不無聲消失。"""
-    _fake_pdf(monkeypatch, MIXED_PAGES_FOR_FAIL)
-    monkeypatch.setattr(
-        RAG, "_open_pdf_document",
-        lambda _path: types.SimpleNamespace(page_count=9999, close=lambda: None),
-    )
-
-    def _boom(_doc, _job):
-        raise ValueError("pixmap allocation failed (stub)")
-
-    monkeypatch.setattr(RAG, "_render_pdf_figure_png", _boom)
-    spy = _stub_vl(monkeypatch)
-
-    with pytest.raises(RAG.PdfFigureError) as exc:
-        RAG.extract_pdf("fake_spec.pdf")
-
-    assert "render 失敗" in str(exc.value)
-    assert spy.calls == []
-
-
-def test_render_precondition_failure_keeps_full_location(monkeypatch, tmp_path: Path):
-    """render helper 自己的前置檢查（頁碼超界）也必須帶檔案/頁/圖/第 N 張。
-
-    舊版讓 helper 自拋 PdfFigureError 再被裸 re-raise，訊息只剩「第 2 頁」，
-    缺檔名與 figure 索引——與 fail-loud「可直接定位」的承諾不符。
-
-    用真 pymupdf render：PDF 實際只有 1 頁，但 metadata 報 2 頁（模擬 schema
-    漂移／畸形檔），第 1 張正常 render、第 2 張撞前置檢查。
-    """
-    fitz = pytest.importorskip("fitz", reason="需要 PyMuPDF（pymupdf4llm 相依）")
-
-    pdf = tmp_path / "spec.pdf"
-    doc = fitz.open()
-    page = doc.new_page()
-    page.insert_text((72, 72), LONG_TEXT_A)
-    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 64, 64))
-    pix.clear_with(120)
-    page.insert_image(fitz.Rect(*BIG_BBOX), pixmap=pix)
-    doc.save(str(pdf))
-    doc.close()
-
-    _fake_pdf(monkeypatch, [
-        {"metadata": {"page_number": 1}, "text": LONG_TEXT_A,
-         "page_boxes": [{"class": "picture", "bbox": BIG_BBOX}]},
-        {"metadata": {"page_number": 2}, "text": LONG_TEXT_B,
-         "page_boxes": [{"class": "picture", "bbox": BIG_BBOX_2}]},
-    ])
-    monkeypatch.setattr(RAG, "_describe_technical_image_base64",
-                        lambda *_a, **_k: VL_DESCRIPTION)
-
-    with pytest.raises(RAG.PdfFigureError) as exc:
-        RAG.extract_pdf(str(pdf))
-
-    msg = str(exc.value)
-    assert "spec.pdf" in msg, msg
-    assert "第 2 頁" in msg and "圖 1" in msg, msg
-    assert "第 2/2 張" in msg, msg
-    assert "頁碼超出範圍" in msg and "PDF 共 1 頁" in msg, msg
-
-
 def test_empty_vl_description_is_hard_fail(monkeypatch):
     """VL 回空/純空白：嚴格核心要 raise，不得產生空 chunk。"""
     monkeypatch.setattr(
@@ -416,14 +157,14 @@ def test_empty_vl_description_is_hard_fail(monkeypatch):
 
 
 # ============================================================
-# 整合：真 pymupdf4llm + 真 render（VL 打樁）
+# 整合：真 pymupdf4llm 的 page dict
 # ============================================================
 def test_real_pymupdf4llm_contract(tmp_path: Path, capsys, monkeypatch):
-    """整合測試：真 pymupdf4llm 的 page dict + 真 pymupdf render 必須撐起整條分流。
+    """整合測試：真 pymupdf4llm 的 page dict 必須撐起頁碼與內嵌圖偵測。
 
     這是抓「上游又改 schema」的活網——當年 page → page_number 改名讓所有
     chunk 歸 1 頁；現在 page_boxes 的 class/bbox 再變動，會直接讓內嵌圖
-    偵測或 crop 破掉。
+    偵測破掉（症狀從「多一張圖」變成「缺席帳少一筆」，一樣是無聲的）。
     """
     fitz = pytest.importorskip("fitz", reason="需要 PyMuPDF（pymupdf4llm 相依）")
     pytest.importorskip("pymupdf4llm", reason="PDF ingestion 需要 pymupdf4llm")
@@ -449,29 +190,23 @@ def test_real_pymupdf4llm_contract(tmp_path: Path, capsys, monkeypatch):
     doc.save(str(pdf))
     doc.close()
 
-    spy = _stub_vl(monkeypatch)
-
-    chunks = RAG.extract_pdf(str(pdf))
+    document = RAG.extract_pdf_document(str(pdf))
 
     out = capsys.readouterr().out
-    text = _text_chunks(chunks)
-    figs = _diagram_chunks(chunks)
+    text = _text_chunks(document.chunks)
     assert {c["page"] for c in text} == {1, 3, 4, 5}, (
         "頁碼歸 1 → pymupdf4llm 的 metadata key 又變了，去修 _pdf_page_number"
     )
-    assert {c["page"] for c in figs} == {2, 3, 4}, (
-        "內嵌圖分流結果不對（p2 整頁、p3 crop、p4 首見、p5 應去重）→ "
-        f"實際: {sorted({c['page'] for c in figs})}；"
-        "偵測不到圖表示 page_boxes schema 又變了"
-    )
-    assert len(spy.calls) == 3, "p5 與 p4 同圖應去重，只剩 3 次 VL 呼叫"
-    # 送 VL 的必須是真 PNG（render 產物）
-    import base64
-    for image_b64, mime in spy.calls:
-        assert mime == "image/png"
-        assert base64.b64decode(image_b64)[:8] == b"\x89PNG\r\n\x1a\n"
-    assert "去重" in out
-    assert "過小" in out  # p3 的 12x12 圖示要被門檻擋下
+    assert not _figure_chunks(document.chunks), (
+        "tmp_path 不在專案根內 → structured lane 不啟動 → 一張圖都不該入庫")
+    # 圖仍要被**看見**：偵測不到 picture box 的話缺席帳會少一筆，而那是無聲的。
+    absent = getattr(document, RAG._ABSENT_ATTR, None) or []
+    assert {item["page"] for item in absent} == {2, 3, 4, 5}, (
+        f"內嵌圖偵測結果不對（實際列帳頁碼 {sorted({i['page'] for i in absent})}）；"
+        "偵測不到圖表示 page_boxes schema 又變了")
+    assert all(str(item["reason"]).startswith("structured_lane_inactive")
+               for item in absent), absent
+    assert "沒有進知識庫" in out
     assert "[WARN]" not in out
 
 
@@ -893,70 +628,202 @@ POS_LANE = (len(INTRO_LANE), len(INTRO_LANE) + len(TABLE_MD_LANE) + 2)
 TABLE_BBOX_LANE = (60.0, 400.0, 520.0, 470.0)
 
 
-@pytest.mark.smoke
-def test_legacy_and_structured_lanes_coexist_without_index_collision(
-    monkeypatch, tmp_path: Path
-):
-    """同頁同時有 picture 框（legacy）與原生表格（structured）:兩邊索引不互踩。"""
-    pdf, figure_id = _structured_lane_stub(
-        monkeypatch, tmp_path, page=1, bbox=TABLE_BBOX_LANE, native_pos=POS_LANE,
-        page_text=PAGE_LANE, table_md=TABLE_MD_LANE)
-    _fake_pdf(monkeypatch, [
-        {"metadata": {"page_number": 1}, "text": PAGE_LANE,
-         "page_boxes": [{"class": "picture", "bbox": BIG_BBOX},
-                        {"class": "table", "bbox": TABLE_BBOX_LANE, "pos": POS_LANE}]},
-    ])
-    _stub_render(monkeypatch)
-    spy = _stub_vl(monkeypatch)
+# ============================================================
+# 2026-08-30 旋轉頁：pymupdf4llm 的 markdown 恆為空，正文不得無聲消失
+# ============================================================
+ROTATED_BODY = "CTRL0 register controls the clock gate for the NPU compute cores."
 
-    chunks = RAG.extract_pdf(str(pdf))
 
-    text = [c for c in chunks if not c.get("origin")]
-    legacy = [c for c in chunks if c.get("origin") == "diagram"]
-    structured = [c for c in chunks if c.get("structured")]
-
-    assert len(spy.calls) == 1, "picture 框仍走既有自由文字 VL"
-    assert legacy and all(c["figure_index"] == 1 for c in legacy)
-    assert structured and all(c["figure_index"] == 2 for c in structured), (
-        "structured 的頁內序號要接在 legacy 之後，"
-        f"實際 {[c['figure_index'] for c in structured]}")
-    assert all(c["origin"] == "figure_table" for c in structured)
-
-    indices = [c["chunk_index"] for c in chunks if c["page"] == 1]
-    assert len(indices) == len(set(indices)), f"chunk_index 重複: {indices}"
-    assert (max(c["chunk_index"] for c in text)
-            < min(c["chunk_index"] for c in legacy)
-            < min(c["chunk_index"] for c in structured)), (
-        "順序必須是 文字 → legacy → structured")
-
-    # 原 markdown 表被取代，同一列資料只出現一次
-    body = "\n".join(c["content"] for c in chunks)
-    assert body.count("0x9000_0000") == 1, body
-    assert f"figure={figure_id} page=1 rows=1" in "\n".join(c["content"] for c in text)
+def _rotated_two_page_pdf(path: Path) -> None:
+    """兩頁、同一段正文，第二頁 /Rotate 90（釘版 1.28.0 的 markdown 恆為空）。"""
+    fitz = pytest.importorskip("fitz", reason="需要 PyMuPDF（pymupdf4llm 相依）")
+    doc = fitz.open()
+    for _ in range(2):
+        page = doc.new_page()
+        page.insert_text((72, 100), ROTATED_BODY, fontsize=11)
+    doc[1].set_rotation(90)
+    doc.save(str(path))
+    doc.close()
 
 
 @pytest.mark.smoke
-def test_structured_candidate_covering_a_picture_box_skips_the_legacy_crop(
-    monkeypatch, tmp_path: Path, capsys
-):
-    """picture 框與 structured 候選同框:legacy 不再送 VL，避免同一張圖兩份。"""
-    pdf, _figure_id = _structured_lane_stub(
-        monkeypatch, tmp_path, page=1, bbox=BIG_BBOX, native_pos=POS_LANE,
-        page_text=PAGE_LANE, table_md=TABLE_MD_LANE)
-    _fake_pdf(monkeypatch, [
-        {"metadata": {"page_number": 1}, "text": PAGE_LANE,
-         "page_boxes": [{"class": "picture", "bbox": BIG_BBOX},
-                        {"class": "table", "bbox": BIG_BBOX, "pos": POS_LANE}]},
-    ])
-    _stub_render(monkeypatch)
-    spy = _stub_vl(monkeypatch)
+def test_rotated_page_body_text_is_not_silently_dropped(tmp_path: Path):
+    """★ 旋轉頁的正文必須入庫。
+
+    釘版 pymupdf4llm 1.28.0 對 `rotation != 0` 的頁 `to_markdown(page_chunks=True)`
+    回空字串（實測；同頁 `page.get_text()` 有全文）。舊碼在 `if not content: continue`
+    直接跳過那一頁——零 chunk、零 WARN、摘要零提示，而橫放的 register map / 大表頁
+    正是 datasheet 最常旋轉的頁。
+    """
+    pytest.importorskip("pymupdf4llm", reason="PDF ingestion 需要 pymupdf4llm")
+    pdf = tmp_path / "rotated_spec.pdf"
+    _rotated_two_page_pdf(pdf)
 
     chunks = RAG.extract_pdf(str(pdf))
+
+    pages = {c["page"] for c in chunks}
+    assert pages == {1, 2}, f"旋轉頁的正文整頁消失了，實際頁碼: {sorted(pages)}"
+    page2 = [c for c in chunks if c["page"] == 2]
+    assert any("CTRL0" in c["content"] for c in page2), (
+        f"第 2 頁有 chunk 但抽不到正文: {[c['content'][:40] for c in page2]}")
+
+
+# ============================================================
+# 2026-08-30 structured lane 是唯一的圖面 lane：沒收就是缺席，且要列帳
+# ============================================================
+@pytest.mark.smoke
+def test_structured_lane_absence_is_reported_not_described(tmp_path: Path, capsys):
+    """★ structured lane 收不到的圖 = 缺席，不再退回自由文字描述。
+
+    舊碼在這裡會走 legacy lane：`class=picture` 的框直接送 VL 產生
+    `origin="diagram"` 的自由文字 chunk——沒有 ▯、沒有 review artifact、沒有
+    evidence_ref，事後從 KB 與摘要都看不出那段是「看圖說故事」。現在那一頁必須
+    (1) 零 figure chunk，(2) 在 ingest 的輸出與摘要 payload 裡列出頁碼與原因。
+    """
+    fitz = pytest.importorskip("fitz", reason="需要 PyMuPDF（pymupdf4llm 相依）")
+    pytest.importorskip("pymupdf4llm", reason="PDF ingestion 需要 pymupdf4llm")
+    pdf = tmp_path / "picture_spec.pdf"            # tmp_path 不在專案根內 → lane 不啟動
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), LONG_TEXT_A)
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 64, 64))
+    pix.clear_with(120)
+    page.insert_image(fitz.Rect(*BIG_BBOX), pixmap=pix)
+    doc.save(str(pdf))
+    doc.close()
+
+    document = RAG.extract_pdf_document(str(pdf))
 
     out = capsys.readouterr().out
-    assert spy.calls == [], "已由結構化 lane 收錄的框不得再送自由文字 VL"
-    assert not _diagram_chunks(chunks)
-    assert [c["figure_index"] for c in chunks if c.get("structured")] == [2], (
-        "legacy 的編號用『規劃出來的』最大值，跳過與否都不回頭重用")
-    assert "已由結構化 lane 收錄" in out
-    assert "\n".join(c["content"] for c in chunks).count("0x9000_0000") == 1
+    assert not [c for c in document.chunks if c.get("origin") == "diagram"], (
+        "legacy 自由文字 lane 已移除，不得再產生 origin=diagram 的 chunk")
+    absent = getattr(document, RAG._ABSENT_ATTR, None)
+    assert absent, "圖沒進 KB 卻沒有任何缺席紀錄＝無聲漏圖"
+    assert any(item["page"] == 1 and
+               str(item["reason"]).startswith("structured_lane_inactive")
+               for item in absent), absent
+    assert "沒有進知識庫" in out, out
+
+
+@pytest.mark.smoke
+def test_text_only_pdf_reports_no_absence(tmp_path: Path, capsys):
+    """純文字 PDF 一句缺席都不准講——罐頭提示會讓使用者學會跳過整段。"""
+    fitz = pytest.importorskip("fitz", reason="需要 PyMuPDF（pymupdf4llm 相依）")
+    pytest.importorskip("pymupdf4llm", reason="PDF ingestion 需要 pymupdf4llm")
+    pdf = tmp_path / "text_only.pdf"
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), LONG_TEXT_A)
+    doc.save(str(pdf))
+    doc.close()
+
+    document = RAG.extract_pdf_document(str(pdf))
+
+    assert getattr(document, RAG._ABSENT_ATTR, None) == []
+    assert "沒有進知識庫" not in capsys.readouterr().out
+
+
+# ============================================================
+# 2026-08-30 figure chunk 的 caption 與章節；marker 在查詢期解得回來
+# ============================================================
+CAPTION_LANE = "Table 3-1 Register map for the NPU control block\n\n"
+SECTION_LANE = "## 3.2 Registers\n\n"
+PAGE_CAPTIONED = (SECTION_LANE + INTRO_LANE + CAPTION_LANE + TABLE_MD_LANE
+                  + "\n\nTail paragraph. \n\n")
+POS_CAPTIONED = (len(SECTION_LANE) + len(INTRO_LANE) + len(CAPTION_LANE),
+                 len(SECTION_LANE) + len(INTRO_LANE) + len(CAPTION_LANE)
+                 + len(TABLE_MD_LANE) + 2)
+
+
+@pytest.mark.smoke
+def test_structured_figure_chunk_carries_caption_and_section(monkeypatch, tmp_path: Path):
+    """★ figure chunk 要帶 caption 與所在章節，而且只當檢索訊號。
+
+    caption（`Table 3-1 …`）留在鄰近的文字 chunk、figure chunk 的 section 固定空字串
+    時，以表名提問命中的是那個只剩 marker 的文字 chunk，不是 figure chunk——圖的內容
+    與圖的名字在檢索面是斷開的。
+    """
+    import context_signals
+
+    pdf, figure_id = _structured_lane_stub(
+        monkeypatch, tmp_path, page=1, bbox=TABLE_BBOX_LANE, native_pos=POS_CAPTIONED,
+        page_text=PAGE_CAPTIONED, table_md=TABLE_MD_LANE)
+    _fake_pdf(monkeypatch, [{"metadata": {"page_number": 1}, "text": PAGE_CAPTIONED,
+                             "page_boxes": []}])
+    _stub_open(monkeypatch)
+
+    chunks = RAG.extract_pdf_document(str(pdf), root=str(tmp_path)).chunks
+
+    figure_chunks = [c for c in chunks if c.get("figure_id") == figure_id]
+    assert figure_chunks, [c.get("origin") for c in chunks]
+    chunk = figure_chunks[0]
+    assert chunk["figure_caption"] == "Table 3-1 Register map for the NPU control block", chunk
+    assert chunk["section"] == "3.2 Registers", chunk["section"]
+    # 只進檢索訊號：payload 的衍生文字（evidence）一個字都不含 caption
+    assert "Register map" not in chunk["content"], chunk["content"]
+    assert "Table 3-1" in context_signals.bm25_document_text(chunk, use_ctx=False)
+    assert "Table 3-1" in context_signals.gate_embedding_input(chunk)
+
+
+@pytest.mark.smoke
+def test_replaced_table_marker_resolves_to_the_figure_chunk(monkeypatch, tmp_path: Path):
+    """★ 文字 chunk 裡的取代 marker，查詢期要跟得回去那張 figure chunk。
+
+    `PDF_TABLE_REPLACED_MARKER` 以前只寫不讀：marker 指名的 figure_id 在查詢期沒有
+    任何 consumer，所以命中帶 marker 的文字 chunk 時，使用者只拿得到一個頁碼。
+    """
+    figure_id = "fig_0123456789abcdef"
+    text_chunk = {
+        "id": "t1", "source": "spec.pdf", "page": 3, "chunk_index": 0, "type": "spec",
+        "section": "3.2 Registers", "embedding": [0.0, 1.0],
+        "content": "控制暫存器的定義見下表。" + RAG.PDF_TABLE_REPLACED_MARKER.format(
+            figure_id=figure_id, page=3, rows=2),
+    }
+    figure_chunk = {
+        "id": "f1", "source": "spec.pdf", "page": 3, "chunk_index": 1, "type": "spec",
+        "section": "3.2 Registers", "embedding": [0.0, 1.0],
+        "content": f"[FIGURE kind=table id={figure_id} rev=1 page=3 rows=1-2/2 "
+                   "status=native_verified]\n| Reg | Addr |\n| --- | --- |\n"
+                   "| CTRL9 | 0x9000_0000 |",
+        "structured": True, "origin": "figure_table", "figure_kind": "table",
+        "figure_id": figure_id, "revision": 1, "figure_index": 1,
+        "verification_status": "native_verified", "extraction_status": "complete",
+        "evidence_ref": ".codetrail/figures/x/run/manifest.json",
+    }
+    kb = knowledge.KnowledgeBase(str(tmp_path / "missing.json"))
+    kb.loaded = True
+    kb.chunks = [text_chunk, figure_chunk]
+    kb.documents = ["spec.pdf"]
+    kb._index_chunks()
+    monkeypatch.setattr(
+        kb, "_hybrid_search",
+        lambda *_a, **_k: [knowledge.Candidate(
+            chunk_idx=0, chunk=text_chunk, rrf_score=0.5,
+            retrieval_score=0.9, gate_score=0.9)],
+    )
+    monkeypatch.setattr(
+        kb, "_rerank_with_model",
+        lambda _q, candidates, _top_k, **_kw: [(None, c.chunk) for c in candidates],
+    )
+    monkeypatch.setattr(kb, "_get_embedding", lambda _t: [0.0, 1.0])
+    monkeypatch.setattr(knowledge, "USE_MMR", False)
+
+    model_text, _display, meta = kb.query("CTRL9 的位址是多少？")
+
+    assert "0x9000_0000" in model_text, model_text
+    assert any(ref.get("figure_id") == figure_id for ref in meta["refs"]), meta["refs"]
+
+
+@pytest.mark.smoke
+def test_marker_pattern_matches_the_real_marker_format():
+    """knowledge.py 的 marker pattern 與 RAG 的 marker 字面必須同步。
+
+    兩邊刻意不共用常數（knowledge.py 在 MCP 啟動熱路徑上，不能 import RAG），
+    所以漂移是無聲的：marker 照樣寫進 KB，查詢期卻再也解不回那張 figure chunk。
+    """
+    marker = RAG.PDF_TABLE_REPLACED_MARKER.format(
+        figure_id="fig_0123456789abcdef", page=7, rows=42)
+    match = knowledge._REPLACED_FIGURE_MARKER_RE.search(marker)
+
+    assert match is not None, marker
+    assert match.group(1) == "fig_0123456789abcdef"
+    assert match.group(2) == "7" and match.group(3) == "42"

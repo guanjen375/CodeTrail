@@ -43,6 +43,7 @@ GATE_SCHEMA = CONTENT_INPUT_SCHEMA
 
 SOURCE_TAG = "[SOURCE]"
 SECTION_TAG = "[SECTION_METADATA]"
+CAPTION_TAG = "[CAPTION]"
 CTX_TAG = "[CTX]"
 
 
@@ -81,13 +82,25 @@ def required_retrieval_schemas(*, has_ctx: bool) -> frozenset:
 # embedding 組字
 # ============================================================
 def _prefix_lines(chunk: Dict) -> List[str]:
+    """組字前綴：來源、章節、figure caption。
+
+    `figure_caption`（「Table 3-1 …」）是 2026-08-30 才有的欄位，而且只有 structured
+    figure chunk 會帶。**沒有這個欄位時輸出逐位元組不變**，所以既有 KB 的 NPZ 內容
+    雜湊不會因為這一行而失效（schema 名稱因此也不必改版）。
+
+    caption 來自鄰近的文字層，不是從圖裡讀出來的，所以它只能當檢索訊號：進得了
+    embedding 與 BM25，進不了 `content`（那份是 canonical payload 的衍生 evidence）。
+    """
     source = Path(str(chunk.get("source", ""))).name
     section = str(chunk.get("section", "")).strip()
+    caption = str(chunk.get("figure_caption", "") or "").strip()
     lines = []
     if source:
         lines.append(f"{SOURCE_TAG} {source}")
     if section:
         lines.append(f"{SECTION_TAG} {section}")
+    if caption:
+        lines.append(f"{CAPTION_TAG} {caption}")
     return lines
 
 
@@ -167,18 +180,24 @@ def chunk_body(chunk: Dict) -> str:
 
 
 def bm25_document_text(chunk: Dict, *, use_ctx: bool) -> str:
-    """BM25 索引的來源文本：章節 + 來源 +（ctx）+ 去前綴本文。
+    """BM25 索引的來源文本：章節 +（caption）+ 來源 +（ctx）+ 去前綴本文。
 
-    `use_ctx=False` 的輸出與加入 contextual retrieval 之前逐位元組相同——
-    gate BM25 索引就是靠這一點維持「決策看到的還是原本那套 lexical 分數」。
+    `use_ctx=False` 且沒有 `figure_caption` 時，輸出與加入 contextual retrieval 之前
+    **逐位元組相同**——gate BM25 索引就是靠這一點維持「決策看到的還是原本那套
+    lexical 分數」，所以 caption 只在真的有值時才插一段（空字串不得留下多餘空白）。
+
+    caption 一定要進 BM25：以表名提問（「Table 3-1 的 opcode」）靠的就是逐字比對，
+    只放進 embedding 的話，最該命中的那張圖反而輸給引用它的內文段落。
     """
     title = str(chunk.get("section", ""))
     source = str(chunk.get("source", ""))
+    caption = str(chunk.get("figure_caption", "") or "").strip()
     body = chunk_body(chunk)
     ctx = chunk_ctx(chunk) if use_ctx else ""
+    head = f"{title} {caption}" if caption else title
     if ctx:
-        return f"{title} {source} {ctx} {body}"
-    return f"{title} {source} {body}"
+        return f"{head} {source} {ctx} {body}"
+    return f"{head} {source} {body}"
 
 
 def reranker_passage(chunk: Dict, *, use_ctx: bool, max_chars: int) -> str:

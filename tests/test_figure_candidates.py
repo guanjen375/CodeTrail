@@ -4,7 +4,7 @@
 
 這個檔守的是**無聲失敗**（AGENTS.md §2.4 第二類）：
 
-- 沒有結構性證據卻宣稱有表 / 有 log（會把 legacy picture lane 的圖搶走，
+- 沒有結構性證據卻宣稱有表 / 有 log（會讓一張根本不是表的圖被硬套 table schema，
   既有 `tests/test_rag_pdf_ingest.py::test_real_pymupdf4llm_contract` 會紅）
 - `pos` / bbox 被靜默改值（`int(1.9)`、`int("3")`）→ 切到錯的原文
 - 文件身分建不起來時捏一個假 ID → 同名不同路徑的 PDF 互相套用 human verification
@@ -317,7 +317,7 @@ def test_fake_document_yields_no_structural_candidates(tmp_path: Path):
     """`types.SimpleNamespace(page_count=..., close=...)`：什麼 API 都沒有。
 
     這正是 `tests/test_rag_pdf_ingest.py` 的既有 stub。所有結構性 channel 都不可用的頁
-    **不得**產生任何候選——沒有證據就不宣稱，legacy picture lane 因此完整保留。
+    **不得**產生任何候選——沒有證據就不宣稱，那一頁的區域改由缺席帳列出。
     連 `class=table` + 合法 `pos` 都不夠：頁物件拿不到就沒有任何東西能佐證那個框。
     """
     pages = [_page_dict(1, TABLE_MD + "x" * 40, [
@@ -528,8 +528,7 @@ def test_uncovered_image_info_screenshot_is_not_masked_by_page_boxes(tmp_path: P
     實測 `example2.pdf` p24：`get_images` 報 1019 個 image object，其中右側 313x216pt
     的操作截圖**只**存在於 `image_info`，`page_boxes` 沒有對應的 picture box。舊版的
     pool 是「這頁有 picture box 就整批不看 image_info」，於是它被記成
-    `deferred_to_legacy_lane`——但 legacy lane（`RAG._plan_pdf_figure_jobs`）也只讀
-    `page_boxes`，一樣看不到它。兩邊都沒 consumer ＝ 無聲漏圖，而
+    `deferred_regions`——而 defer 之後根本沒有任何 consumer，等於無聲漏圖，
     `dropped_candidates=0` 還會讓報告看起來是乾淨的。
     """
     screenshot = (246.54, 305.7, 559.26, 521.76)
@@ -551,7 +550,7 @@ def test_uncovered_image_info_screenshot_is_not_masked_by_page_boxes(tmp_path: P
     boxes = [c.bbox for c in plan.candidates if c.kind == fe.KIND_RASTER]
     assert any(box == pytest.approx(screenshot) for box in boxes), (
         f"只存在於 image_info 的大型截圖沒有候選 {boxes} "
-        f"{plan.stats['deferred_to_legacy_lane']}")
+        f"{plan.stats['deferred_regions']}")
     assert plan.stats["unconsumed_raster"] == [], plan.stats["unconsumed_raster"]
     # 已被 picture box 收錄的那一張不得再多一個候選（重複送 VL、重複入庫）
     assert not any(box == pytest.approx(covered) for box in boxes), boxes
@@ -559,9 +558,9 @@ def test_uncovered_image_info_screenshot_is_not_masked_by_page_boxes(tmp_path: P
 
 @pytest.mark.smoke
 def test_unconsumed_raster_is_reported_when_nothing_can_take_it(tmp_path: Path):
-    """沒有 consumer 的 raster 一定要現形，不得只留在 `deferred_to_legacy_lane`。
+    """沒有 consumer 的 raster 一定要現形，不得只留在 `deferred_regions`。
 
-    `deferred_to_legacy_lane` 只是 planner 的 disposition。這條用「大到算得上一張圖、
+    `deferred_regions` 只是 planner 的 disposition。這條用「大到算得上一張圖、
     但因為與既有候選重疊而被 defer」的 image_info 反向確認：只要它沒有被任何 admitted
     候選蓋住，就必須出現在 `unconsumed_raster` 與 preflight 報告裡。
     """
@@ -594,7 +593,7 @@ def test_kind_unknown_only_means_table_vs_terminal(monkeypatch):
     monkeypatch.setattr(config, "FIGURE_KIND_MARGIN", 0.15)
     kind, reasons = fc._route_kind({fe.KIND_TABLE: 0.30, fe.KIND_TERMINAL: 0.35,
                                     fe.KIND_DIAGRAM: 0.40})
-    assert kind == "" and reasons == ["kind_diagram_legacy_lane"], (kind, reasons)
+    assert kind == "" and reasons == ["kind_diagram_not_admitted"], (kind, reasons)
 
     kind, _ = fc._route_kind({fe.KIND_TABLE: 0.50, fe.KIND_TERMINAL: 0.45,
                               fe.KIND_DIAGRAM: 0.10})
@@ -612,7 +611,7 @@ def test_diagram_kind_candidates_never_claim_to_be_table_or_terminal(tmp_path: P
     79ef673 之前這種頁一律 defer 給 legacy 的自由文字 lane；現在它走受監督的
     `KIND_RASTER`（先分類再套 schema）。**沒有變的**是這條：diagram 分數贏過
     table/terminal 時，`_route_kind()` 必須先把它踢出 structured kind，並留下
-    `kind_diagram_legacy_lane` / `raster_component_reclassified` 之類的 reason slug——
+    `kind_diagram_not_admitted` / `raster_component_reclassified` 之類的 reason slug——
     否則它會頂著「這是一張表」的身分進 dual pass。
     """
     shapes = [(100 + i * 3, 100 + i * 3, 140 + i * 3, 150 + i * 3) for i in range(12)]
@@ -620,8 +619,8 @@ def test_diagram_kind_candidates_never_claim_to_be_table_or_terminal(tmp_path: P
                                         (100, 300, 400, 301), (100, 100, 101, 300),
                                         (400, 100, 401, 300)])
     plan = _plan([_page_dict(1, "figure page")], _FakeDoc([page]), tmp_path)
-    reasons = {entry["reason"] for entry in plan.stats["deferred_to_legacy_lane"]}
-    assert reasons & {"kind_diagram_legacy_lane", "raster_component_reclassified",
+    reasons = {entry["reason"] for entry in plan.stats["deferred_regions"]}
+    assert reasons & {"kind_diagram_not_admitted", "raster_component_reclassified",
                       "raster_no_structural_evidence"}, reasons
     assert all(c.kind == fe.KIND_RASTER for c in plan.candidates), [
         (c.kind, c.bbox, c.reasons) for c in plan.candidates]
@@ -665,8 +664,8 @@ def test_bbox_outside_page_is_deferred_not_used(tmp_path: Path):
     plan = _plan([_page_dict(1, "page")], _FakeDoc([page]), tmp_path)
     assert plan.candidates == []
     assert any(e["reason"] == "bbox_outside_page"
-               for e in plan.stats["deferred_to_legacy_lane"]), \
-        plan.stats["deferred_to_legacy_lane"]
+               for e in plan.stats["deferred_regions"]), \
+        plan.stats["deferred_regions"]
 
 
 # ============================================================
@@ -1279,7 +1278,7 @@ def test_preflight_budget_brackets_real_vl_call_count(label, retries, tmp_path: 
     plan = _plan([_page_dict(1, "x" * 40)], _FakeDoc([_lane_page(label)]), tmp_path,
                  name=f"lane-{label}-{retries}.pdf")
     assert plan.candidates, (
-        f"測試前提：{label} 必須產生候選 {plan.stats['deferred_to_legacy_lane']}")
+        f"測試前提：{label} 必須產生候選 {plan.stats['deferred_regions']}")
     candidate = plan.candidates[0]
     assert candidate.kind == expected_kind, (label, candidate.kind, candidate.kind_scores)
     assert candidate.signals["anchored"] is expected_anchored, label
@@ -1758,7 +1757,7 @@ def test_multiple_table_pos_in_one_component_disqualifies_the_group(tmp_path: Pa
     plan = _plan([_page_dict(1, raw, boxes)],
                  _FakeDoc([_FakePage(words=_register_rows())]), tmp_path, name="ambpos.pdf")
     assert plan.candidates == [], [(c.kind, c.native_table) for c in plan.candidates]
-    reasons = [e["reason"] for e in plan.stats["deferred_to_legacy_lane"]]
+    reasons = [e["reason"] for e in plan.stats["deferred_regions"]]
     assert "ambiguous_table_pos" in reasons, reasons
 
 
@@ -1851,7 +1850,7 @@ def test_pathological_region_count_is_capped_before_quadratic_fusion(tmp_path: P
     assert plan.candidates == []
     assert "raw_regions_per_page:1" in plan.over_budget
     assert all(e["reason"] == "raw_regions_per_page"
-               for e in plan.stats["deferred_to_legacy_lane"])
+               for e in plan.stats["deferred_regions"])
     with pytest.raises(fe.FigureBudgetError, match="raw_regions_per_page"):
         fc.check_preflight(plan)
 
@@ -2023,9 +2022,9 @@ def test_preflight_report_lists_dropped_and_deferred_exactly(tmp_path: Path, mon
         assert f"第 {entry['page']} 頁 bbox={entry['bbox']}" in report, (entry, report)
         assert entry["reason"] in report
 
-    deferred = plan.stats["deferred_to_legacy_lane"]
-    assert deferred, "測試前提：真的要有被延後給 legacy lane 的區域"
-    assert "已延後給既有 picture lane" in report
+    deferred = plan.stats["deferred_regions"]
+    assert deferred, "測試前提：真的要有沒被收為候選的區域"
+    assert "未收為候選的區域" in report
     for reason in {entry["reason"] for entry in deferred}:
         assert reason in report
 
@@ -2306,7 +2305,7 @@ def test_legacy_contract_pdf_promotes_pictures_as_raster_only(tmp_path: Path):
     schema 分類，再走同一套 canonical payload / strict gate。這條守兩件事：
 
     1. 沒有任何候選頂著 table / terminal 的身分（那會直接進 dual pass 抽逐格內容）。
-    2. 太小的 picture（12x12pt 的角落圖示）不得升格——它同時也是 legacy lane 的
+    2. 太小的 picture（12x12pt 的角落圖示）不得升格——它同時也是既有尺寸門檻的
        `_pdf_bbox_big_enough` 會濾掉的那一張，兩邊門檻必須一致。
     """
     fz = _fz()
@@ -2560,7 +2559,7 @@ def test_pure_raster_variant_carries_original_bytes_and_mime(tmp_path: Path):
     real = fz.open(str(pdf))
     try:
         plan = fc.plan_document_figures(str(pdf), pages, root=tmp_path, pdf_doc=real)
-        assert plan.candidates, plan.stats["deferred_to_legacy_lane"]
+        assert plan.candidates, plan.stats["deferred_regions"]
         candidate = plan.candidates[0]
         assert candidate.asset_xref is not None, candidate.signals["raster_purity"]
         assert candidate.signals["raster_purity"]["pure"] is True
@@ -2606,7 +2605,7 @@ def test_overlay_forces_page_crop_instead_of_raw_asset(overlay, tmp_path: Path):
         plan = fc.plan_document_figures(str(pdf), pages, root=tmp_path, pdf_doc=real)
         assert plan.candidates, (
             "測試前提：這個 fixture 必須產生候選，否則 purity 分支根本沒被執行到 "
-            f"（deferred={plan.stats['deferred_to_legacy_lane']}）")
+            f"（deferred={plan.stats['deferred_regions']}）")
         candidate = plan.candidates[0]
         assert candidate.asset_xref is None, candidate.signals["raster_purity"]
         assert candidate.signals["raster_purity"]["reason"] in (

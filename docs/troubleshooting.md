@@ -846,8 +846,8 @@ top-level `image_data` 可能被新版 llama.cpp 靜默忽略，造成模型只�
 | `image_tokens_est` | `FIGURE_MAX_IMAGE_TOKENS_PER_DOC` / `FIGURE_MAX_IMAGE_TOKENS_PER_CALL` | 400000 / 4096 |
 
 > 這些欄位涵蓋所有結構化候選，包含純 raster 的分類、雙樣本抽取與 image-token 估算。
-> 只有未被結構化候選覆蓋的舊自由文字 picture 相容 job 不受這些上限判定；若存在，
-> 報告會另外列出未受閘控的粗估。
+> 沒被收成候選的區域不進預算——它們不會被送出去，報告改在「不會進 KB 的頁 / 區域」
+> 那一段逐筆列出頁碼、bbox 與原因。
 
 三種處理方式:
 
@@ -942,8 +942,10 @@ PDF 的話回傳還會多附一條 `--preflight` 版本,先估成本再決定。
   那需要兩個一致的原生 evidence channel;只有一個通道時是 `unverified`,通道矛盾時是
   `needs_review`。native lane 不呼叫 VL,所以也**不會**產生 `corroborated`。實際結果以
   重 ingest 後 `review_figures(action="list")` 顯示的為準。
-- **新版 ingest 的掃描版／拍照版純 raster** → 先分類成 table／terminal／diagram 並產生
-  structured figure，所以會出現在 `review_figures`。沒有獨立原生證據時仍是
+- **新版 ingest 的掃描版／拍照版純 raster** → 先分類成 table／terminal／prose／diagram
+  並產生 structured figure，所以會出現在 `review_figures`；被判定「不是圖面」（封面、logo、
+  照片）的則零抽取、零 chunk，只出現在 ingest 的缺席清單與 review artifact 的
+  「判定不是圖面」一節。沒有獨立原生證據時仍是
   `unverified`／`needs_review`，strict 查詢不會採用；只有人對原圖以
   `confirm_against_image=True` 核准指定 revision 後才可能成為 `human_verified`。
 - **舊 KB 的 legacy VL chunk（沒有 `figure_id`）** → 沒有 canonical payload 可 fix；要走

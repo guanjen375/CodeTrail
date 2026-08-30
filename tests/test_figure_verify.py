@@ -2963,3 +2963,64 @@ def test_share_key_prefers_the_planner_declaration():
     with pytest.raises(figure_extract.FigureExtractionError) as excinfo:
         figure_verify._share_key(drifted, figure_extract.KIND_TABLE, where="w")
     assert "不一致" in str(excinfo.value)
+
+
+# ============================================================
+# 2026-08-30 raster 分類器：「非圖面」與「純文字頁」兩個出口
+# ============================================================
+def raster_kind(name: str) -> str:
+    return json.dumps({"kind": name})
+
+
+def prose_json(lines):
+    return json.dumps({
+        "lines": [{"text": text, "uncertain_spans": list(spans)} for text, spans in lines]
+    })
+
+
+@pytest.mark.smoke
+def test_raster_classified_as_not_a_figure_is_skipped_with_zero_extraction(monkeypatch):
+    """★ 封面 / logo / 照片：分類器要能說「這不是圖面」，然後**什麼都不做**。
+
+    舊 enum 只有 table / terminal / diagram，prompt 還明寫 diagram 涵蓋照片、logo、
+    一般 UI，所以每一張封面整頁 JPEG 都被硬產出一份 components/relations payload：
+    至少兩次 VL 呼叫、一個永遠 unverified 的 chunk，佔掉檢索 top-k 與覆核清單。
+    """
+    spy = VLSpy({"figure_raster_kind_v1": raster_kind("none")})
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+
+    result = extract([candidate(kind=figure_extract.KIND_RASTER)], {4: page_evidence()})[0]
+
+    assert result.extraction_status == figure_extract.EXTRACTION_SKIPPED, result
+    assert result.payload is None, "非圖面不得留下任何 payload"
+    assert spy.schema_names() == ["figure_raster_kind_v1"], (
+        f"分類完就該停手，實際又呼叫了 {spy.schema_names()}")
+    assert "raster_not_a_figure" in result.reasons, result.reasons
+
+
+@pytest.mark.smoke
+def test_raster_classified_as_prose_transcribes_lines_not_diagram(monkeypatch):
+    """★ 掃描 / 被平面化成影像的整頁散文：逐行轉錄，不套 diagram schema。
+
+    diagram 的 payload 是 components / relations / values——把一頁散文塞進去，段落
+    結構會被改寫成「元件與關係」，而那是模型編出來的，不是原文。
+    """
+    spy = VLSpy({
+        "figure_raster_kind_v1": raster_kind("prose"),
+        "figure_prose": prose_json([
+            ("3.2 Register Map", []),
+            ("", []),
+            ("The CTRL0 register controls the clock gate.", []),
+        ]),
+    })
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+
+    result = extract([candidate(kind=figure_extract.KIND_RASTER)], {4: page_evidence()})[0]
+
+    assert result.kind == figure_extract.KIND_PROSE, result.kind
+    assert result.extraction_status == figure_extract.EXTRACTION_COMPLETE, result
+    assert [line["text"] for line in result.payload["lines"]] == [
+        "3.2 Register Map", "", "The CTRL0 register controls the clock gate."], result.payload
+    assert "figure_diagram" not in spy.schema_names(), spy.schema_names()

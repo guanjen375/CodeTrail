@@ -146,19 +146,25 @@ outputSchema，避免同一 payload 被 SDK 重複序列化。
 原圖、頁碼、框與格/行位置,正文放 `▯` 並記原因,或該份 PDF 零寫入。raster 上被遮住或低於
 解析度的字元沒有任何程式能還原真值,能保證的只有「正確,或誠實拒絕」。
 
-**兩條 lane,範圍不同(重要)**
+**只有一條 lane,沒收就是缺席(重要)**
 
-| lane | 收哪些候選 | 產出 | 有沒有 `▯` / 逐格證據 / strict gate |
+| 情況 | 收哪些候選 | 產出 | 有沒有 `▯` / 逐格證據 / strict gate |
 |---|---|---|---|
-| 結構化 | 原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，以及夠大的純 raster / picture | raster 先分類成 table / terminal / diagram；再產生 canonical JSON + 衍生文字 chunk | 有 |
-| 舊自由文字 VL 相容路徑 | 未被結構化候選覆蓋的舊 picture job，以及既有 KB chunk | VL 文字描述，`origin="diagram"`，檢索降權 | 沒有 |
+| 結構化 lane 收錄 | 原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，以及夠大的純 raster / picture | raster 先分類成 table / terminal / prose / diagram；再產生 canonical JSON + 衍生文字 chunk | 有 |
+| 判定不是圖面 | 封面、logo、商標、裝飾線條、產品照片、單純的 GUI 圖示 | 零抽取、零 chunk（只留在 review artifact 與缺席清單） | 不適用 |
+| lane 沒收 | 沒有結構性證據的區域、超出上限的候選、整頁 abstain 的頁 | **不入庫**，ingest 列出頁碼 / bbox / 原因 | 不適用 |
 
 被拍成圖或掃描進來的表格與終端機會出現在 `review_figures`，但沒有獨立原生證據時通常是
-`unverified` / `needs_review`，strict 查詢仍會擋下，直到人工對原圖確認。`diagram` 也有
-自動分類與 structured producer。
+`unverified` / `needs_review`，strict 查詢仍會擋下，直到人工對原圖確認。整頁散文走
+`prose`（逐行轉錄），`diagram` 也有自動分類與 structured producer。2026-08-30 移除了舊的
+自由文字 VL 相容 lane（既有 KB 的 `origin="diagram"` chunk 仍照原語意保留）。
+
+figure chunk 會帶所在章節與 caption（`Table 3-1 …`）。兩者只當檢索訊號（embedding + BM25
++ REF 上一行標示），不進 canonical payload。原生表格被取代後留在文字層的 marker，在查詢期
+會被跟回去，把對應的 figure chunk 一併帶進 REF。
 
 **六種 `verification_status`**(structured chunk 專屬;兩個正交欄位之一,另一個是
-`extraction_status ∈ {complete, failed}`)
+`extraction_status ∈ {complete, failed, skipped}`)
 
 | 狀態 | 意思 | strict 查詢用不用 |
 |---|---|---|
@@ -196,11 +202,11 @@ outputSchema，避免同一 payload 被 SDK 重複序列化。
 MCP 每次工具呼叫有 client timeout,開始之後才超時等於沒有提示 —— 所以先估。
 
 preflight 涵蓋所有結構化候選，包含純 raster 的分類、雙樣本抽取與 image-token 估算。
-只有未被結構化候選覆蓋的舊 picture 相容 job 不受這些上限判定；若存在，報告會另外列出
-未受閘控的粗估。
+沒被收成候選的區域不進預算——它們根本不會被送出去，報告改在「不會進 KB 的頁 / 區域」
+那一段逐筆列出。
 
 **抽壞的那一張缺席**:結構化 lane 的 schema / validator / row width / line contract /
-`finish_reason` 任一最終不合格 → **那一張圖不進 KB**(也不退回自由文字描述),其餘 figure 與
+`finish_reason` 任一最終不合格 → **那一張圖不進 KB**(沒有自由文字退路),其餘 figure 與
 全部文字 chunk 照常入庫,stdout 會印一行 `[figure] 失敗 N 張(不進 KB)` 說明是哪幾張。
 仍然**整份 PDF 零寫入**的是:VL 連不上 / 逾時、預算超限、capability probe 未過、來源檔中途
 被換掉,以及候選與結果對不上這類契約破裂;舊 KB 與向量保持原狀。需要 VL 的候選會在
@@ -322,6 +328,7 @@ void led_toggle(void) {
 - `apply_patch`（寫檔）、`run_lint(fix=True)`（格式化）、`run_command`（執行命令）是三個不同的 ask，各自需要你核准。apply_patch 不會自動執行 lint / typecheck / test；需要改檔或執行專案腳本時才允許。
 - 工具 `record_lesson` 只在「你糾正了模型的做事方式」之後用;工具報錯或答案錯誤不是觸發條件。寫入需要你核准,細節與管理指令見 [docs/lessons.md](lessons.md)。
 - 圖很多的 PDF 先用 `ingest_document(path, preflight_only=True)` 估成本（零寫入），再決定要不要在 MCP 裡跑或改走 CLI。
-- REF 標「待覆核」的圖片內容不得當成規格數值的定論；`query_knowledge_strict` 的 `excluded_figures` 就是被 gate 擋下、但確實存在的圖，照實轉述頁碼與原因。**structured figure（`excluded_figures` 帶 `figure_id`）能用 `review_figures` 覆核**（`fix` 會改 KB，permission 是 `ask`）；新 ingest 的純 raster 也屬 structured figure。只有舊 KB 的 legacy VL chunk 沒有 canonical payload，不能在這裡覆核。
+- REF 標「待覆核」的圖片內容不得當成規格數值的定論；`query_knowledge_strict` 的 `excluded_figures` 就是被 gate 擋下、但確實存在的圖，照實轉述頁碼與原因。**structured figure（`excluded_figures` 帶 `figure_id`）能用 `review_figures` 覆核**（`fix` 會改 KB，permission 是 `ask`）；新 ingest 的純 raster 也屬 structured figure。只有舊 KB 的 legacy VL chunk 沒有 canonical payload，不能在這裡覆核。被分類器判定「不是
+圖面」的（封面、logo）不會進 KB、也不進覆核清單，它們只出現在 ingest 的缺席清單裡。
 
 ---

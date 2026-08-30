@@ -1547,8 +1547,8 @@ def _raster_candidate_items(evidence: PageEvidence, regions, *, occupied, docume
     在上游是幾十個 picture box），group 的 union 才是候選框。接著才輪到 **未被任何
     group 覆蓋的** figure-sized `image_info` placement——上游漏報 picture box 的大型
     截圖只存在於 image_info，早期版本「這頁有 picture box 就整批不看 image_info」會讓
-    它既沒有 structured 候選、legacy lane 也讀不到（legacy 只讀 page_boxes），變成
-    無聲漏圖（question.md P0-2）。`page:fallback` 仍只在該頁沒有更精確框時使用。
+    它變成零 consumer 的無聲漏圖（question.md P0-2）。`page:fallback` 仍只在該頁沒有
+    更精確框時使用。
 
     所有未採用來源都有明確 defer reason，讓 preflight 不會把「沒進 structured」說成
     不存在。
@@ -1700,7 +1700,7 @@ def _raster_candidate_items(evidence: PageEvidence, regions, *, occupied, docume
         })
         _mark(unit, "raster_structured_candidate")
 
-    deferred = stats["deferred_to_legacy_lane"]
+    deferred = stats["deferred_regions"]
     for region in regions:
         key = int(region["region_index"])
         reason = disposition.get(key)
@@ -1752,7 +1752,8 @@ def _score_kind(bands, columns, ruled, layout, tokens, native_hit: bool, raster_
 def _route_kind(scores) -> tuple[str, list[str]]:
     """kind 路由（契約 §13.1 / 審核 BLOCKER 4）。
 
-    **先**獨立判斷是否延後給 legacy lane，**再**只在 table 與 terminal 之間比大小。
+    **先**獨立判斷 diagram 是否勝出（勝出即不收為候選），**再**只在 table 與
+    terminal 之間比大小。
     `KIND_UNKNOWN` 因此只可能是「table 與 terminal 分數接近」，不可能是
     「diagram 第一、terminal 第二且差距小」繞進來的（那是舊版三選一 argmax 的漏洞）。
     """
@@ -1761,7 +1762,7 @@ def _route_kind(scores) -> tuple[str, list[str]]:
     terminal = scores[fx.KIND_TERMINAL]
     diagram = scores[fx.KIND_DIAGRAM]
     if diagram > max(table, terminal):
-        return "", ["kind_diagram_legacy_lane"]
+        return "", ["kind_diagram_not_admitted"]
     margin = float(config.FIGURE_KIND_MARGIN)
     if abs(table - terminal) < margin:
         return fx.KIND_UNKNOWN, ["kind_margin_below_threshold"]
@@ -2073,7 +2074,7 @@ def _resolve_native_lane(kind: str, native_table, native_text) -> tuple[bool, li
 def _page_candidates(evidence: PageEvidence, *, document_id: str, pdf_doc,
                      stats: dict) -> list[dict]:
     """一頁的候選（尚未指派文件級 index / figure_id）。"""
-    deferred = stats["deferred_to_legacy_lane"]
+    deferred = stats["deferred_regions"]
     page_rect = evidence.page_rect
     if _area(page_rect) <= 0:
         return []
@@ -2268,8 +2269,8 @@ def _page_candidates(evidence: PageEvidence, *, document_id: str, pdf_doc,
             "score": max(scores.values()),
         })
 
-    # 未被原生候選覆蓋的 picture / raster 不再掉到自由文字 legacy lane；它們形成
-    # candidate-only 的 KIND_RASTER，後段先分類再套 table / terminal / diagram schema。
+    # 未被原生候選覆蓋的 picture / raster 形成 candidate-only 的 KIND_RASTER，
+    # 後段先分類再套對應 schema；分類不出圖面的那些一律缺席，不再有自由文字退路。
     results.extend(_raster_candidate_items(
         evidence, others, occupied=[item["bbox"] for item in results],
         document_id=document_id, pdf_doc=pdf_doc, stats=stats))
@@ -2750,7 +2751,8 @@ def _degraded_plan(document_id: str, stats: dict, page_evidence: dict) -> Figure
         "candidates": 0, "tiles": 0, "vl_calls_min": 0, "vl_calls_max": 0,
         "image_tokens_est": 0, "pages": len(page_evidence), "native_tables": 0,
         "image_tokens_min": 0, "candidates_detected": 0, "dropped_candidates": 0,
-        "deferred_to_legacy_lane": len(stats.get("deferred_to_legacy_lane") or []),
+        "deferred_regions": len(stats.get("deferred_regions") or []),
+        "absent_regions": len(stats.get("absent_regions") or []),
     }
     return FigurePlan(document_id=document_id, candidates=[], page_evidence=page_evidence,
                       stats=stats, preflight=preflight, over_budget=[])
@@ -2782,8 +2784,10 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
         "unavailable_channels": {},
         "page_box_space": {},
         "degenerate_tables": [],
-        "deferred_to_legacy_lane": [],
+        "deferred_regions": [],
         "unconsumed_raster": [],
+        # 這一份 PDF 有內容、卻不會進 KB 的頁與區域（頁碼 / bbox / 固定 slug）。
+        "absent_regions": [],
         "dropped_candidates": [],
         "duplicate_assets_shared": [],
         "candidates_detected": 0,
@@ -2858,7 +2862,8 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
             if not document_id:
                 continue
             # 契約 §13.2：本函式絕不 raise。偵測器自己出意外時只記 slug 並讓那一頁 abstain，
-            # 整份 ingest 不會因為單頁畸形資料而掛掉（legacy lane 仍照舊處理該頁）。
+            # 整份 ingest 不會因為單頁畸形資料而掛掉——但 abstain **就是缺席**，
+            # 那一頁的區域會進 `absent_regions`，由 ingest 摘要列出頁碼與原因。
             try:
                 detected.extend(_page_candidates(evidence, document_id=document_id,
                                                  pdf_doc=document, stats=stats))
@@ -2884,7 +2889,7 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
                 )
             )
             if covered:
-                stats["deferred_to_legacy_lane"].append(_deferred_entry(
+                stats["deferred_regions"].append(_deferred_entry(
                     item["page"], item["bbox"],
                     (item.get("signals") or {}).get("channels") or [],
                     "covered_by_native_table"))
@@ -2892,7 +2897,7 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
             deduped.append(item)
         detected = deduped
 
-        stats["deferred_to_legacy_lane"].sort(key=lambda e: (e["page"], e["bbox"][1], e["bbox"][0]))
+        stats["deferred_regions"].sort(key=lambda e: (e["page"], e["bbox"][1], e["bbox"][0]))
         if not document_id:
             return _degraded_plan("", stats, page_evidence)
 
@@ -3068,32 +3073,61 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
             # 交付部分候選 = structured table 悄悄消失、PDF 卻照樣部分寫入，違反北極星。
             # 維持「plan 不 raise」，但回**零候選的降級 plan** 並讓下一個 gate
             # (`check_preflight`) 明確 fail-loud（local review BLOCKER #9）。
+            for entry in stats["candidate_errors"]:
+                # 整份 lane 停用＝這一頁（以及其他所有頁）的圖一張都不會進 KB。
+                stats["absent_regions"].append({
+                    "page": int(entry.get("page") or 0), "bbox": None,
+                    "channel": "page", "reason": f"planning_error:{entry.get('error', '')}",
+                })
             plan = _degraded_plan(document_id, stats, page_evidence)
             return _dataclass_replace(plan, over_budget=["planning_error"])
 
-        # ── raster orphan 帳（question.md 驗收條件 2）──
-        # `deferred_to_legacy_lane` 只是 planner 的 disposition，**不是**交接保證：
-        # legacy lane（`RAG._plan_pdf_figure_jobs`）只讀 `page_boxes`，所以只存在於
-        # `image_info` 的大型截圖被 defer 之後根本沒有任何 consumer——實測 p24 的
-        # 313x216pt 操作截圖就這樣兩邊都沒收。這裡把「夠大、又沒有任何 admitted
-        # 候選覆蓋」的 image_info 區域單獨列帳，讓 `dropped_candidates=0` 不再被
-        # 讀成「沒有圖被漏掉」。
+        # ── 缺席帳（`deferred_regions` 只是 planner 的 disposition，不是交接保證）──
+        # 2026-08-30 之後 structured lane 是**唯一**的圖面 lane：沒被收成候選的區域
+        # 就是不會進 KB。所以「夠大、又沒有任何 admitted 候選覆蓋」的 defer 一律列帳，
+        # 不再只看 `image_info:raster`（那個窄口徑是 legacy lane 只讀 page_boxes 時代的
+        # 產物）。`unconsumed_raster` 保留原本的窄口徑語義供既有報告/測試使用，
+        # `absent_regions` 才是「這一份 PDF 少了什麼」的完整清單。
         admitted_boxes: dict[int, list] = {}
         for candidate in candidates:
             admitted_boxes.setdefault(candidate.page, []).append(candidate.bbox)
-        for entry in stats["deferred_to_legacy_lane"]:
-            if (entry.get("channels") or [""])[0] != "image_info:raster":
-                continue
+
+        def _uncovered(entry) -> list | None:
             box = _as_bbox(entry["bbox"])
             if box is None or not _candidate_box_big_enough(box, raster=True):
-                continue
+                return None
             if any(_coverage(box, kept) >= 0.90
                    for kept in admitted_boxes.get(entry["page"], ())):
+                return None
+            return box
+
+        for entry in stats["deferred_regions"]:
+            if _uncovered(entry) is None:
                 continue
-            stats["unconsumed_raster"].append({
+            channel = (entry.get("channels") or [""])[0]
+            if channel == "image_info:raster":
+                stats["unconsumed_raster"].append({
+                    "page": entry["page"], "bbox": list(entry["bbox"]),
+                    "channel": "image_info:raster", "reason": entry["reason"],
+                })
+            stats["absent_regions"].append({
                 "page": entry["page"], "bbox": list(entry["bbox"]),
-                "channel": "image_info:raster", "reason": entry["reason"],
+                "channel": channel, "reason": entry["reason"],
             })
+        for entry in stats["dropped_candidates"]:
+            # 被上限丟掉的候選一定是「已經成形的圖」，不再過尺寸門檻。
+            stats["absent_regions"].append({
+                "page": entry["page"], "bbox": list(entry["bbox"]),
+                "channel": "candidate", "reason": entry["reason"],
+            })
+        for entry in stats["page_number_mismatch"]:
+            # 整頁 abstain：連 evidence 都不敢用，那一頁的圖一張都不會進 KB。
+            stats["absent_regions"].append({
+                "page": int(entry.get("metadata_page") or 0), "bbox": None,
+                "channel": "page", "reason": entry["reason"],
+            })
+        stats["absent_regions"].sort(
+            key=lambda e: (e["page"], (e["bbox"] or [0, 0])[1], (e["bbox"] or [0, 0])[0]))
 
         preflight = {
             # ── 契約 §6.3 的七個凍結鍵 ──
@@ -3112,8 +3146,9 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
             "native_lane_candidates": native_lane_count,
             "candidates_detected": len(detected),
             "dropped_candidates": len(stats["dropped_candidates"]),
-            "deferred_to_legacy_lane": len(stats["deferred_to_legacy_lane"]),
+            "deferred_regions": len(stats["deferred_regions"]),
             "unconsumed_raster": len(stats["unconsumed_raster"]),
+            "absent_regions": len(stats["absent_regions"]),
         }
         return FigurePlan(document_id=document_id, candidates=candidates,
                           page_evidence=page_evidence, stats=stats,
@@ -3187,18 +3222,26 @@ def format_preflight_report(plan: FigurePlan) -> str:
         suffix = item.split(":", 1)[1] if ":" in item else ""
         where = f"（{suffix}）" if suffix else ""
         lines.append(f"  超出上限：{item}{where} — {label} 上限 {limit}")
-    deferred = stats.get("deferred_to_legacy_lane") or []
+    deferred = stats.get("deferred_regions") or []
     if deferred:
         counts: dict[str, int] = {}
         for entry in deferred:
             counts[entry["reason"]] = counts.get(entry["reason"], 0) + 1
         detail = "、".join(f"{k} {v}" for k, v in sorted(counts.items()))
-        lines.append(f"  已延後給既有 picture lane：{len(deferred)}（{detail}）")
+        lines.append(f"  未收為候選的區域：{len(deferred)}（{detail}）")
+    absent = stats.get("absent_regions") or []
+    if absent:
+        # structured lane 是唯一的圖面 lane，所以這一段就是「這份 PDF 會少掉什麼」。
+        lines.append(f"  不會進 KB 的頁 / 區域（缺席）：{len(absent)}")
+        for entry in absent:
+            where = f"bbox={entry['bbox']}" if entry.get("bbox") else "整頁"
+            lines.append(f"    第 {entry['page']} 頁 {where}"
+                         f" channel={entry['channel']} reason={entry['reason']}")
     orphans = stats.get("unconsumed_raster") or []
     if orphans:
-        # legacy lane 讀不到 `image_info`，所以這一段是「兩邊都沒有 consumer」的圖。
+        # 只存在於 `image_info` 的大型截圖：沒有任何 consumer 的圖。
         # 逐筆列出，不併成一個數字：`dropped_candidates=0` 已經被誤讀過一次。
-        lines.append(f"  沒有任何 consumer 的 raster 區域（結構化與既有 lane 都收不到）：{len(orphans)}")
+        lines.append(f"  只存在於 image_info、沒有候選覆蓋的 raster 區域：{len(orphans)}")
         for entry in orphans:
             lines.append(f"    第 {entry['page']} 頁 bbox={entry['bbox']}"
                          f" channel={entry['channel']} reason={entry['reason']}")

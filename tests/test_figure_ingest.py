@@ -4,9 +4,8 @@
 chunk 取代之後不得留下第二份、`pos` 不可信時不得亂切正文、抽取失敗與預算超限
 一律零寫入、structured chunk 的 content 不得經過通用 normalize 與 splitter。
 
-與 `tests/test_rag_pdf_ingest.py` 的分工:那一份守既有 legacy 圖面路徑
-（`class=picture` → 自由文字 VL → `origin="diagram"`）的逐位元組保留;這一份守
-新的 structured lane 與兩條 lane 的邊界。
+與 `tests/test_rag_pdf_ingest.py` 的分工:那一份守 PDF 逐頁抽取（頁碼、旋轉頁正文、
+「沒被 structured lane 收錄就是缺席」的列帳）;這一份守 structured lane 自己的契約。
 """
 from __future__ import annotations
 
@@ -153,7 +152,7 @@ PAGE1 = INTRO + TABLE_MD + TAIL
 # 而 raw[end] 是下一段的首字（不是換行）→ 剛好打到 marker 的後綴換行守衛。
 POS1 = (len(INTRO), len(INTRO) + len(TABLE_MD) + 3)
 
-BIG_BBOX_FOR_LANE = (72.0, 400.0, 300.0, 630.0)   # legacy picture 框，與表格不重疊
+BIG_BBOX_FOR_LANE = (72.0, 400.0, 300.0, 630.0)   # 同頁的 picture 框，與表格不重疊
 GROUND_TRUTH = [
     ["CTRL0", "0x4000_0100", "[7:4]", "RW", "clock select"],
     ["CTRL1", "0x4000_0104", "[3:0]", "RO", "status flags"],
@@ -941,7 +940,6 @@ def test_preflight_over_budget_makes_zero_vl_zero_embedding_zero_write(
     assert "python3 RAG.py" in str(exc.value) and "--preflight" in str(exc.value)
     assert "python3 RAG.py" in out and "--preflight" in out
     assert "[PREFLIGHT] fake report" in out, "超出預算也要把完整報告印出來"
-    assert "既有圖面路徑" in out, "報告要含 legacy 曝險估算"
     assert _dir_snapshot(tmp_path) == tree, "超出預算不得長出 NPZ / cache / lock 檔"
 
 
@@ -1101,8 +1099,11 @@ def test_capability_probe_skipped_when_only_native_tables(tmp_path: Path, monkey
     assert harness.ensure_capability.calls == [], "native lane 永遠不呼叫 VL（契約 §12.1）"
 
 
-def test_diagram_candidate_with_native_table_stays_in_legacy_lane(tmp_path: Path, monkeypatch):
-    """`kind=KIND_DIAGRAM` 一律不進 structured lane，即使它帶著 native_table。"""
+def test_diagram_candidate_with_native_table_is_never_extracted(tmp_path: Path, monkeypatch):
+    """`kind=KIND_DIAGRAM` 一律不進 structured lane，即使它帶著 native_table。
+
+    2026-08-30 之後它也沒有別的去處：原 markdown 表照樣留在文字層，這張候選本身
+    只會出現在缺席帳裡。"""
     kb_path = _kb_ready(monkeypatch, tmp_path)
     pdf = _write_pdf(tmp_path)
     document_id = _document_id(pdf, tmp_path)
@@ -1124,10 +1125,12 @@ def test_diagram_candidate_with_native_table_stays_in_legacy_lane(tmp_path: Path
 
 
 @pytest.mark.smoke
-def test_retained_raw_table_suppresses_the_overlapping_legacy_crop(tmp_path: Path, monkeypatch):
-    """`pos` 不可信而保留原 markdown 時，重疊的 picture 框也要壓掉。
+def test_retained_raw_table_leaves_exactly_one_copy_in_the_kb(tmp_path: Path, monkeypatch):
+    """`pos` 不可信而保留原 markdown 時，KB 裡只能有那一份原文。
 
-    否則文字層留一份表、legacy VL 再產一份自由文字描述 = 兩個互相競爭的版本。
+    重疊的 picture 框在 2026-08-30 之前會被 legacy lane 撿去做自由文字描述，於是
+    文字層一份、VL 一份 = 兩個互相競爭的版本。現在那條 lane 沒了，這條守的是
+    「保留原文之後不得再冒出第二份」。
     """
     kb_path = _kb_ready(monkeypatch, tmp_path)
     pdf = _write_pdf(tmp_path)
@@ -1141,16 +1144,11 @@ def test_retained_raw_table_suppresses_the_overlapping_legacy_crop(tmp_path: Pat
     evidence = {1: FakePageEvidence(page=1, raw_markdown=PAGE1, page_boxes=boxes)}
     _harness(monkeypatch, tmp_path, pages, _plan(document_id, [candidate], evidence),
              [_result(document_id, figure_id)])
-    vl_spy = _Spy(result="# 圖\n\n描述")
-    monkeypatch.setattr(RAG, "_describe_technical_image_base64", vl_spy)
-    monkeypatch.setattr(RAG, "_render_pdf_figure_png", lambda _d, _j: b"PNG")
-
     RAG.add_document(str(pdf), str(kb_path))
 
-    assert vl_spy.calls == [], "保留原 markdown 的表，重疊的 legacy crop 必須跳過"
     chunks = _kb_chunks(kb_path)
     assert _occurrences_in(chunks, "0x4000_0100") == 1
-    assert not [c for c in chunks if c.get("origin") == "diagram"]
+    assert not [c for c in chunks if c.get("origin")], "不得有任何 figure chunk"
 
 
 def test_prune_runs_once_after_a_successful_commit(tmp_path: Path, monkeypatch):
@@ -1815,7 +1813,7 @@ def test_one_bad_occurrence_retains_the_whole_shared_group(tmp_path: Path, monke
 # ============================================================
 @pytest.mark.smoke
 def test_manifest_and_kb_agree_on_figure_index(tmp_path: Path, monkeypatch):
-    """legacy offset 要在**寫 artifact 之前**套用，manifest 與 KB 不得用兩套序號。"""
+    """頁內序號要在**寫 artifact 之前**編好，manifest 與 KB 不得用兩套序號。"""
     kb_path = _kb_ready(monkeypatch, tmp_path)
     pdf = _write_pdf(tmp_path)
     document_id = _document_id(pdf, tmp_path)
@@ -1830,9 +1828,6 @@ def test_manifest_and_kb_agree_on_figure_index(tmp_path: Path, monkeypatch):
     harness = _harness(monkeypatch, tmp_path, pages,
                        _plan(document_id, [candidate], evidence),
                        [_result(document_id, figure_id)])
-    monkeypatch.setattr(RAG, "_render_pdf_figure_png", lambda _d, _j: b"PNG")
-    monkeypatch.setattr(RAG, "_describe_technical_image_base64", lambda *_a, **_k: "# 圖\n\n描述")
-
     RAG.add_document(str(pdf), str(kb_path))
 
     (_args, kwargs) = harness.write_artifacts.calls[-1]
@@ -1843,7 +1838,8 @@ def test_manifest_and_kb_agree_on_figure_index(tmp_path: Path, monkeypatch):
     assert manifest_index == kb_index, (
         f"manifest 與 KB 的 figure_index 不同:{manifest_index} vs {kb_index}"
         "——覆核與檢索會用到兩套身分")
-    assert set(kb_index.values()) == {2}, "同頁有 legacy 圖時 structured 要接在它之後"
+    assert set(kb_index.values()) == {1}, (
+        "structured lane 是唯一的圖面 lane，頁內序號從 1 起，不再讓號給別人")
 
 
 @pytest.mark.smoke
@@ -2269,9 +2265,9 @@ def test_context_generation_sends_zero_requests_for_structured_chunks(tmp_path: 
 def test_legacy_only_pdf_still_verifies_the_source_before_commit(tmp_path: Path, monkeypatch):
     """零 structured candidate 的 PDF 一樣要帶 guard。
 
-    text-only / legacy-only 也會產生文字 chunk 與 legacy 圖面 chunk；來源在中途被
-    換掉時，同一份 KB 就會混進 A 版文字與 B 版圖面。以前 `guard=None` 讓這條路徑
-    從 planner 到提交前完全不再核對來源（契約 §18.2）。
+    lane 沒啟動也會產生文字 chunk；來源在中途被換掉時，同一份 KB 就會混進 A 版
+    文字與 B 版 figure。以前 `guard=None` 讓這條路徑從 planner 到提交前完全不再
+    核對來源（契約 §18.2）。
     """
     kb_path = _kb_ready(monkeypatch, tmp_path)
     before = kb_path.read_bytes()
@@ -2892,8 +2888,8 @@ def test_quality_failure_skips_only_that_figure(tmp_path: Path, monkeypatch, cap
     assert {c["figure_id"] for c in structured} == {fid_ok}, (
         "只有抽壞的那一張缺席", [c["figure_id"] for c in structured])
     assert not [c for c in chunks if c.get("figure_id") == fid_bad]
-    assert not [c for c in chunks if c.get("origin") == "diagram"], (
-        "抽壞的 figure 不得退回 legacy 自由文字描述——缺席就是缺席")
+    assert not [c for c in chunks if c.get("figure_id") == fid_bad], (
+        "抽壞的 figure 不得以任何形式入庫——缺席就是缺席")
     assert "[figure] 失敗 1 張" in out, out
 
     # 失敗的那一張仍要留在同一份 `failed:false` 的 manifest 裡供覆核
@@ -2995,36 +2991,3 @@ def test_empty_payload_and_occupancy_mismatch_are_figure_level(
         assert listed[fid]["fixable"] is False
 
 
-@pytest.mark.smoke
-def test_failed_figure_bbox_suppresses_legacy_picture_lane(tmp_path: Path, monkeypatch):
-    """★ 抽壞的那一張**不得**退回 legacy 自由文字 VL 描述。
-
-    失敗的 figure 的框沒有進 `covered` 的話，legacy picture lane 會撿起同一個框再產
-    一份自由文字描述——那正是 structured lane 存在的理由要排除的東西。
-    """
-    kb_path = _kb_ready(monkeypatch, tmp_path)
-    pdf, _harness_obj, (fid_bad,) = _vl_case(tmp_path, monkeypatch, [
-        (1, BIG_BBOX_FOR_LANE, PNG_A, figure_extract.KIND_TABLE,
-         [{"class": "picture", "bbox": BIG_BBOX_FOR_LANE}]),
-    ])
-    _use_real_artifact_store(monkeypatch)
-    _use_real_vl_lane(monkeypatch, _FakeVL({
-        ("figure_table", PNG_A): (GOOD_TABLE_JSON, "length"),
-    }))
-    rendered_legacy = []
-    monkeypatch.setattr(RAG, "_render_pdf_figure_png",
-                        lambda _doc, job: rendered_legacy.append(job) or b"PNG")
-    monkeypatch.setattr(RAG, "_describe_technical_image_base64",
-                        lambda *_a, **_k: "# 圖\n\n自由文字描述")
-
-    RAG.add_document(str(pdf), str(kb_path))     # 不拋例外＝這一張缺席、其餘照常
-
-    chunks = _kb_chunks(kb_path)
-    assert rendered_legacy == [], "失敗 figure 的框必須壓掉 legacy picture lane"
-    assert not [c for c in chunks if c.get("origin") == "diagram"]
-    assert not [c for c in chunks if c.get("structured")]
-    assert [c for c in chunks if not c.get("structured")], "文字 chunk 仍要入庫"
-    manifest_path = _manifests(tmp_path)[-1]
-    manifest, entry = _manifest_entry(manifest_path, fid_bad)
-    assert manifest["failed"] is False
-    assert entry["extraction_status"] == figure_extract.EXTRACTION_FAILED

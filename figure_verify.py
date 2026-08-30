@@ -541,18 +541,37 @@ _PROMPT_BY_KIND = {
         "- `uncertain_spans` 的 start/end 是該行 `text` 的字元索引。\n"
         "不要輸出行號——那由程式指派。\n"
     ),
+    "prose": (
+        "把圖中的整頁文章轉成 JSON。這是一頁散文/說明文字，不是終端機畫面。\n"
+        "- `lines`：**一個視覺行一個元素**，由上到下、依原本的閱讀順序；不合併、"
+        "不拆行、不重排、不改寫標點。段落之間的空行原樣保留（`text` 給空字串），"
+        "但頁首/頁尾的大塊留白不是文字行，不得據此增加首尾空行。\n"
+        "- 多欄排版依**欄**轉錄：先整條左欄由上到下，再整條右欄，不按全頁 y 座標"
+        "交錯。標題、編號、項目符號、頁碼、頁首頁尾都是原文，照它們出現的位置輸出。\n"
+        "- 不要摘要、不要翻譯、不要補上原文沒有的標點或編號；表格與圖片區塊裡的"
+        "文字不在這裡輸出。\n"
+        "- 看不清的字元在 `text` 放 `▯`，候選寫進 `uncertain_spans` 的 "
+        "`alternatives`；**不得**在正文寫成 `[不確定:A|B]` 這種形式。\n"
+        "- `uncertain_spans` 的 start/end 是該行 `text` 的字元索引。\n"
+        "不要輸出行號——那由程式指派。\n"
+    ),
     "diagram": (
         "把圖中的方塊圖/流程圖轉成 JSON：`title`、`labels`、`components`（name/desc）、"
         "`relations`（src/dst/desc）、`values`（key/value/desc）。\n"
         "沒有的欄位給空字串或空陣列，不要省略 key。\n"
     ),
 }
+# 分類器的值域比 `FIGURE_KINDS` 多一個 `none`：**「這不是圖面」必須說得出口**。
+# 舊 enum 只有 table / terminal / diagram，prompt 還把照片與 logo 掛在 diagram 底下，
+# 於是每一張封面整頁 JPEG 都被硬產出一份 components/relations payload——至少兩次 VL
+# 呼叫，換來一個永遠 unverified、卻佔著檢索 top-k 與覆核清單的 chunk。
 _RASTER_KIND_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "required": ["kind"],
     "properties": {
-        "kind": {"type": "string", "enum": ["table", "terminal", "diagram"]},
+        "kind": {"type": "string",
+                 "enum": ["table", "terminal", "prose", "diagram", "none"]},
     },
 }
 _RASTER_KIND_PROMPT = (
@@ -562,11 +581,19 @@ _RASTER_KIND_PROMPT = (
     "白底終端截圖；不要求一定有提示符或深色背景。單行等寬的 console/status/prompt "
     "文字條也算 terminal。圖片若幾乎只有一行文字，而那行是完整的操作指示、錯誤訊息、"
     "執行狀態或程式輸出句子，必須判成 terminal。\n"
-    "- diagram：上述兩者都不是，例如方塊圖、流程圖、照片、logo、一般 UI。\n"
-    "一般 GUI 的按鈕、視窗標題、圖示或導覽標籤算 diagram；這類通常是短名詞或名稱，"
+    "- prose：整頁或整段的**文章**，例如掃描的內文頁、被轉成影像的說明段落、"
+    "條款、步驟敘述。重點是段落與句子，不是列欄配對、也不是終端機輸出。\n"
+    "- diagram：以線條、方塊與箭頭表達結構或流程的圖，例如方塊圖、流程圖、"
+    "時序圖、電路圖、狀態機。\n"
+    "- none：**不是資訊圖面**，例如封面、logo、商標、裝飾線條、產品或人物照片、"
+    "純色/材質背景、單純的 GUI 按鈕與圖示。看不出承載什麼資訊時也選 none。\n"
+    "一般 GUI 的按鈕、視窗標題、圖示或導覽標籤算 none；這類通常是短名詞或名稱，"
     "不是一個操作/錯誤/狀態句。不要只因為其中有文字就判成 terminal。\n"
-    "只輸出 JSON 物件 {\"kind\":\"table|terminal|diagram\"}，不得增加其他 key。"
+    "只輸出 JSON 物件 {\"kind\":\"table|terminal|prose|diagram|none\"}，"
+    "不得增加其他 key。"
 )
+# 分類器允許回傳的值域（含 `none`）。
+RASTER_KIND_VALUES = frozenset(_RASTER_KIND_SCHEMA["properties"]["kind"]["enum"])
 _SCHEMA_ECHO_SUFFIX = (
     "\n輸出必須嚴格符合下列 JSON Schema，**不得**出現 schema 以外的鍵：\n{schema}\n"
 )
@@ -902,6 +929,7 @@ def _canary_call(*, kind: str, png: bytes, base_url: str, model: str, profile: s
     canonicalize = {
         figure_extract.KIND_TABLE: figure_extract.canonicalize_table,
         figure_extract.KIND_TERMINAL: figure_extract.canonicalize_terminal,
+        figure_extract.KIND_PROSE: figure_extract.canonicalize_prose,
         figure_extract.KIND_DIAGRAM: figure_extract.canonicalize_diagram,
     }[kind]
     try:
@@ -935,7 +963,7 @@ def _run_probe(*, base_url: str, model: str, kinds: Sequence[str], profile: str)
     """實際跑 canary。回傳 `(checks, missing, detail_lines)`。
 
     **一律**先跑 3 欄 / 5 欄的 table pair（全域 image-dependence probe），再依需求
-    補該 kind 的 schema canary。因此最多 4 次呼叫（table×2 + terminal + diagram）。
+    補該 kind 的 schema canary。因此最多 5 次呼叫（table×2 + terminal + prose + diagram）。
 
     只驗結構契約（schema / 未截斷 / required / validator / 欄寬 / 行 contract）與
     「圖真的進到模型」。**不驗模型是否答對字**——把準確率當通過條件等於在 CI 之外
@@ -973,7 +1001,8 @@ def _run_probe(*, base_url: str, model: str, kinds: Sequence[str], profile: str)
     for kind in kinds:
         if kind == figure_extract.KIND_TABLE:
             continue  # pair 已經涵蓋
-        spec = _CANARY_TERMINAL if kind == figure_extract.KIND_TERMINAL else _CANARY_TABLE_3COL
+        spec = (_CANARY_TERMINAL if kind in figure_extract.LINE_KINDS
+                else _CANARY_TABLE_3COL)
         png = _render_canary_png(spec)
         sub, _obj, _payload, lines = _canary_call(
             kind=kind, png=png, base_url=base_url, model=model, profile=profile,
@@ -1561,7 +1590,7 @@ def _parse_sample(kind: str, result) -> dict:
                     "row_width",
                     f"rows[{position}] 有 {len(cells)} 格，但表有 {len(columns)} 欄",
                 )
-    elif kind == figure_extract.KIND_TERMINAL:
+    elif kind in figure_extract.LINE_KINDS:
         lines = model_obj.get("lines")
         if not isinstance(lines, list):
             raise _SampleFailure("schema", "lines 必須是 list")
@@ -1585,6 +1614,7 @@ def _parse_sample(kind: str, result) -> dict:
     canonicalize = {
         figure_extract.KIND_TABLE: figure_extract.canonicalize_table,
         figure_extract.KIND_TERMINAL: figure_extract.canonicalize_terminal,
+        figure_extract.KIND_PROSE: figure_extract.canonicalize_prose,
         figure_extract.KIND_DIAGRAM: figure_extract.canonicalize_diagram,
     }[kind]
     try:
@@ -1668,10 +1698,11 @@ def _call_raster_classifier(*, variant, base_url: str, model: str, profile: str,
 
 
 def _classify_raster_kind(variant, ctx: dict) -> dict:
-    """把 `KIND_RASTER` 解成 table / terminal / diagram；不合法就 fail-loud。
+    """把 `KIND_RASTER` 解成 table / terminal / prose / diagram / `none`；不合法就 fail-loud。
 
     分類本身也計入同一份 VL / image-token 預算。重試只處理傳輸或 schema 失敗，
-    不會把模型輸出的自由文字猜回某個 kind。
+    不會把模型輸出的自由文字猜回某個 kind。回 `none`（不是圖面）時呼叫端就此停手，
+    不做第二次呼叫。
     """
     attempts = 1 + max(0, int(config.FIGURE_EXTRACT_RETRIES))
     max_tokens = RASTER_KIND_MAX_TOKENS
@@ -1710,7 +1741,7 @@ def _classify_raster_kind(variant, ctx: dict) -> dict:
                 "schema", "raster kind 必須是只含 kind 的 JSON object")
             continue
         kind = model_obj.get("kind")
-        if kind not in figure_extract.FIGURE_KINDS:
+        if kind not in RASTER_KIND_VALUES:
             last = _SampleFailure(
                 "schema", f"raster kind={kind!r} 不在允許集合")
             continue
@@ -2948,7 +2979,7 @@ def _apply_alignment(payload: dict, kind: str, alignment: dict) -> None:
                 record = records.get(f"r{row['row_index']}{cell['column_id']}")
                 if record is not None and record.get("matched") is False:
                     _apply_cell_verdict(cell, record)
-    elif kind == figure_extract.KIND_TERMINAL:
+    elif kind in figure_extract.LINE_KINDS:
         records = alignment.get("lines", {})
         for line in payload["lines"]:
             record = records.get(str(line["line_index"]))
@@ -3045,7 +3076,7 @@ def _reconcile_terminal_sample_shapes(payload_a: dict, payload_b: dict):
                 right_block[offset] if offset < len(right_block) else None,
             )
 
-    consensus = {"kind": figure_extract.KIND_TERMINAL, "lines": output}
+    consensus = {"kind": payload_a["kind"], "lines": output}
     evidence = {
         "agreement": False,
         "samples": 2,
@@ -3170,7 +3201,7 @@ def _apply_disagreement(payload: dict, kind: str, evidence: dict) -> None:
                 record = records.get(f"r{row['row_index']}{cell['column_id']}")
                 if record is not None and not record.get("agree", True):
                     _apply_cell_verdict(cell, record)
-    elif kind == figure_extract.KIND_TERMINAL:
+    elif kind in figure_extract.LINE_KINDS:
         records = evidence.get("lines", {})
         for line in payload["lines"]:
             record = records.get(str(line["line_index"]))
@@ -3613,7 +3644,7 @@ def _payload_sentinels(payload: dict, kind: str) -> list[str]:
                     found.append(
                         f"row {row['row_index']} 的 {cell['column_id']} state={cell['state']}"
                     )
-    elif kind == figure_extract.KIND_TERMINAL:
+    elif kind in figure_extract.LINE_KINDS:
         for line in payload["lines"]:
             if glyph in line["text"]:
                 found.append(f"line {line['line_index']} 含 {glyph}")
@@ -3638,7 +3669,7 @@ def _normalize_model_unreadable(payload: dict, kind: str, findings: _Findings) -
                         "model_unreadable",
                         f"row {row['row_index']} 的 {cell['column_id']}：模型自報看不清",
                     )
-    elif kind == figure_extract.KIND_TERMINAL:
+    elif kind in figure_extract.LINE_KINDS:
         for line in payload["lines"]:
             if line["uncertain_spans"]:
                 findings.block(
@@ -3850,7 +3881,7 @@ def _build_result(candidate, kind: str, payload: dict, findings: _Findings, evid
     row_total = line_total = None
     if kind == figure_extract.KIND_TABLE:
         row_total = payload["rows"][-1]["row_index"] if payload["rows"] else 0
-    elif kind == figure_extract.KIND_TERMINAL:
+    elif kind in figure_extract.LINE_KINDS:
         line_total = payload["lines"][-1]["line_index"] if payload["lines"] else 0
 
     bbox = tuple(getattr(candidate, "bbox", (0.0, 0.0, 0.0, 0.0)))
@@ -4148,7 +4179,7 @@ def _stitch_payloads(kind: str, payloads: list[dict], variants, findings: _Findi
         keys.extend(incoming_keys[k:])
     for position, line in enumerate(lines, 1):
         line["line_index"] = position
-    return {"kind": figure_extract.KIND_TERMINAL, "lines": lines}, stitch
+    return {"kind": kind, "lines": lines}, stitch
 
 
 _DATA_AS_HEADER_RE = re.compile(
@@ -4446,8 +4477,15 @@ def _run_native_lane(candidate, evidence, kind: str, where: str) -> FigureResult
         return _verify_native_terminal(candidate, evidence)
     if kind == figure_extract.KIND_DIAGRAM:
         raise figure_extract.FigureExtractionError(
-            f"{where}: diagram 候選不該進 structured lane（契約 §13.1：本輪由 legacy "
-            "picture lane 處理），native lane 也組不出 diagram payload"
+            f"{where}: diagram 候選不該進 structured lane（契約 §13.1），"
+            "native lane 也組不出 diagram payload"
+        )
+    if kind == figure_extract.KIND_PROSE:
+        # prose 只從 raster 分類器出來，而那條路一定是 VL lane。planner 直接宣稱
+        # prose 代表契約破了——native lane 沒有任何通道能產生逐行散文的 canonical 值。
+        raise figure_extract.FigureExtractionError(
+            f"{where}: prose 只可能由 raster 分類器產生（VL lane），"
+            "planner 不得直接宣稱 prose 候選"
         )
 
     # KIND_UNKNOWN：table 與 terminal **各一次**，再由兩份 semantic validator 評分。
@@ -4555,7 +4593,7 @@ def _vl_result_for_kind(candidate, evidence, kind: str, variants, ctx: dict,
         align_table_cells(payload, candidate, evidence)
         if kind == figure_extract.KIND_TABLE
         else align_terminal_lines(payload, candidate, evidence)
-        if kind == figure_extract.KIND_TERMINAL
+        if kind in figure_extract.LINE_KINDS
         else _empty_alignment("no_anchor_evidence", "diagram 沒有格/行級 anchor",
                               atoms_total=0, key="cells")
     )
@@ -4585,7 +4623,7 @@ def _vl_result_for_kind(candidate, evidence, kind: str, variants, ctx: dict,
                              "error": exc.slug}
         else:
             if (
-                kind == figure_extract.KIND_TERMINAL
+                kind in figure_extract.LINE_KINDS
                 and len(payload["lines"]) != len(second["lines"])
             ):
                 payload, disagreement, reasons = _reconcile_terminal_sample_shapes(
@@ -4665,10 +4703,43 @@ def _grid_normalized_variants(variants, ctx: dict) -> list:
     return normalized
 
 
+def _skipped_result(candidate, classification: dict, *, where: str) -> FigureResult:
+    """分類器說「這不是圖面」：零 payload、零 chunk，但**留得下紀錄**。
+
+    `extraction_status=skipped` 與 `failed` 刻意分開：封面 / logo / 照片不是抽壞了，
+    把它們塞進 failed 會讓每一份 PDF 的通知都掛著幾筆「抽取失敗、請覆核」的假警報，
+    而真的抽壞的那幾張就淹在裡面。`verification_status` 給 `unverified`——這一張沒有
+    任何 payload 可信，但也沒有任何東西需要人去看。
+    """
+    bbox = tuple(getattr(candidate, "bbox", (0.0, 0.0, 0.0, 0.0)))
+    page = int(getattr(candidate, "page", 1) or 1)
+    return FigureResult(
+        figure_id=getattr(candidate, "figure_id", ""),
+        document_id=getattr(candidate, "document_id", ""),
+        page=page, figure_index=1, bbox=bbox,
+        kind=figure_extract.KIND_DIAGRAM,   # 佔位：manifest 的 kind 欄位不接受 raster
+        revision=1, payload=None,
+        extraction_status=figure_extract.EXTRACTION_SKIPPED,
+        verification_status=figure_extract.VERIF_UNVERIFIED,
+        reasons=["raster_not_a_figure"],
+        reason_details=[f"{where}: 分類器判定這不是資訊圖面（封面 / logo / 照片 / 裝飾），"
+                        "不做抽取、不進 KB"],
+        evidence={"lane": "vl", "raster_classification": dict(classification)},
+        occurrences=_occurrences_for(candidate, page, bbox),
+        model_input_variant="skipped", variants=[],
+        row_total=None, line_total=None,
+    )
+
+
 def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureResult:
     if kind == figure_extract.KIND_RASTER:
         classification = _classify_raster_kind(variants[0], ctx)
         resolved = classification["kind"]
+        if resolved == figure_extract.KIND_NOT_A_FIGURE:
+            # **分類完就停手**：不呼叫抽取、不產 payload、不佔覆核清單。
+            print(f"  [INFO] {ctx.get('where', '')}: 分類為「不是圖面」，跳過抽取",
+                  flush=True)
+            return _skipped_result(candidate, classification, where=ctx["where"])
         extraction_variants = (
             _grid_normalized_variants(variants, ctx)
             if resolved == figure_extract.KIND_TABLE else variants
@@ -4694,6 +4765,16 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
             # 回空 payload 才是真的抽取壞掉，那條界線不動。
             if exc.slug != "empty_payload" or resolved == figure_extract.KIND_DIAGRAM:
                 raise
+            if resolved == figure_extract.KIND_PROSE:
+                # 判成一頁文章、模型卻說一行字都沒有 → 這張本來就不是圖面。
+                # 再用 diagram 套一次只會得到一份空的 components/relations。
+                print(f"  [INFO] {ctx.get('where', '')}: 分類成 prose 但抽不到任何一行"
+                      f"（{exc.detail}）；視為不是圖面，跳過", flush=True)
+                return _skipped_result(
+                    candidate,
+                    {**classification, "reclassified_from": resolved,
+                     "reclassified_reason": exc.slug},
+                    where=ctx["where"])
             reclassified_from = resolved
             resolved = figure_extract.KIND_DIAGRAM
             classification = {**classification, "kind": resolved,
@@ -4914,7 +4995,7 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
                         align_table_cells(payload, candidate, evidence)
                         if resolved == figure_extract.KIND_TABLE
                         else align_terminal_lines(payload, candidate, evidence)
-                        if resolved == figure_extract.KIND_TERMINAL
+                        if resolved in figure_extract.LINE_KINDS
                         else _empty_alignment("no_anchor_evidence", "diagram 無格/行級 anchor",
                                               atoms_total=0, key="cells")
                     )

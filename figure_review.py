@@ -124,7 +124,7 @@ _FIGURE_RESULT_FIELDS = (
 
 # `model_input_variant` 的兩個哨兵：`native`＝原生結構抽取（零 VL、沒有影像），
 # `failed`＝抽取中止（T4 的 failed result）。兩者都不是一份影像，不必有對應檔案。
-_MODEL_INPUT_SENTINELS = ("native", "failed")
+_MODEL_INPUT_SENTINELS = ("native", "failed", "skipped")
 
 # 第三種哨兵（契約 §19.1，跨模組凍結）：重複影像的第二個 occurrence 從未送過模型，
 # producer 產生 `model_input_variant = f"duplicate_of:{代表 occurrence 的 figure_id}"`。
@@ -889,7 +889,9 @@ def _validate_manifest(data, *, slug: str, run_id: str,
                  f"{item}: current_revision={entry['current_revision']} "
                  f"小於初始 revision={entry['revision']}")
         _require(entry["kind"] in fx.FIGURE_KINDS, f"{item}: kind={entry['kind']!r} 不合法")
-        _require(entry["extraction_status"] in (fx.EXTRACTION_COMPLETE, fx.EXTRACTION_FAILED),
+        _require(entry["extraction_status"] in (fx.EXTRACTION_COMPLETE,
+                                                fx.EXTRACTION_FAILED,
+                                                fx.EXTRACTION_SKIPPED),
                  f"{item}: extraction_status={entry['extraction_status']!r} 不合法")
         _require(entry["verification_status"] in fx.VERIFICATION_RANK,
                  f"{item}: verification_status={entry['verification_status']!r} 不合法")
@@ -1311,7 +1313,7 @@ def _require_trusted_evidence(evidence: dict, view: dict, *, where: str) -> None
         return
     if kind == fx.KIND_TABLE:
         key, atoms = "cells", len(payload.get("rows") or [])
-    elif kind == fx.KIND_TERMINAL:
+    elif kind in fx.LINE_KINDS:
         key, atoms = "lines", len(payload.get("lines") or [])
     else:
         return                      # diagram 沒有格/行級粒度，只驗 channels
@@ -1349,7 +1351,8 @@ def _figure_view(figure, position: int, *, document_id: str, failed: bool) -> di
         _require(isinstance(value, int) and not isinstance(value, bool) and value >= 1,
                  f"{where}: {name}={value!r} 必須是 >= 1 的 int")
     _require(view["kind"] in fx.FIGURE_KINDS, f"{where}: kind={view['kind']!r} 不合法")
-    _require(view["extraction_status"] in (fx.EXTRACTION_COMPLETE, fx.EXTRACTION_FAILED),
+    _require(view["extraction_status"] in (fx.EXTRACTION_COMPLETE, fx.EXTRACTION_FAILED,
+                                          fx.EXTRACTION_SKIPPED),
              f"{where}: extraction_status={view['extraction_status']!r} 不合法")
     _require(view["verification_status"] in fx.VERIFICATION_RANK,
              f"{where}: verification_status={view['verification_status']!r} 不合法")
@@ -1361,6 +1364,13 @@ def _figure_view(figure, position: int, *, document_id: str, failed: bool) -> di
         _require(view["payload"] is None,
                  f"{where}: extraction_status=failed 卻帶 payload"
                  "——沒抽出來的圖不得有 canonical 內容")
+    if view["extraction_status"] == fx.EXTRACTION_SKIPPED:
+        # 「不是圖面」：沒有抽取，就不得有任何 canonical 內容或模型輸入宣稱。
+        _require(view["payload"] is None,
+                 f"{where}: extraction_status=skipped 卻帶 payload")
+        _require(view["model_input_variant"] == "skipped",
+                 f"{where}: extraction_status=skipped 的 model_input_variant 必須是 "
+                 f"'skipped'，收到 {view['model_input_variant']!r}")
     bbox = _strict_bbox(view["bbox"], where=f"{where} 的 bbox")
     occurrences = view["occurrences"]
     _require(isinstance(occurrences, list) and occurrences,
@@ -2075,7 +2085,7 @@ def _preview(entry: dict, limit: int = 3) -> list[str]:
         for row in payload.get("rows", [])[:limit]:
             lines.append("| " + " | ".join(str(cell.get("text", ""))
                                            for cell in row.get("cells", [])) + " |")
-    elif entry["kind"] == fx.KIND_TERMINAL:
+    elif entry["kind"] in fx.LINE_KINDS:
         for line in payload.get("lines", [])[:limit]:
             lines.append(str(line.get("text", "")))
     else:
@@ -2090,10 +2100,17 @@ def _render_review(manifest: dict) -> str:
     """`review.md`：人工覆核用的摘要（狀態、原因、原圖路徑、修正指令、清除方式）。"""
     fx = _fx()
     figures = manifest["figures"]
+    # `skipped`（分類器判定不是圖面）**不列進待覆核**：封面 / logo / 照片沒有任何
+    # 「使用者該做什麼」，塞進覆核清單只會讓真的要看的那幾張淹在裡面。它們仍留在
+    # manifest 裡（下面單獨一節），所以「這張圖去哪了」查得到。
+    skipped = [entry for entry in figures
+               if entry["extraction_status"] == fx.EXTRACTION_SKIPPED]
     flagged = [entry for entry in figures
-               if entry["verification_status"] in fx.FLAGGED_VERIFICATION
-               or entry["extraction_status"] != fx.EXTRACTION_COMPLETE]
-    trusted = [entry for entry in figures if entry not in flagged]
+               if entry not in skipped
+               and (entry["verification_status"] in fx.FLAGGED_VERIFICATION
+                    or entry["extraction_status"] != fx.EXTRACTION_COMPLETE)]
+    trusted = [entry for entry in figures
+               if entry not in flagged and entry not in skipped]
 
     out = [
         f"# Figure review — {manifest['display_name']}",
@@ -2195,6 +2212,7 @@ def _render_review(manifest: dict) -> str:
 
     _section("待覆核（needs_review / unverified / legacy_unverified / 抽取失敗）", flagged)
     _section("已驗證（native_verified / corroborated / human_verified）", trusted)
+    _section("判定不是圖面（skipped，未入庫、不需覆核）", skipped)
 
     out.extend([
         "## 保存與清除（NDA）",
@@ -2810,7 +2828,7 @@ def apply_fix(root, kb_path, *, document_id: str, figure_id: str, expected_revis
     if kind == fx.KIND_TABLE:
         rows = payload["rows"]
         row_total = rows[-1]["row_index"] if rows else 0
-    elif kind == fx.KIND_TERMINAL:
+    elif kind in fx.LINE_KINDS:
         lines = payload["lines"]
         line_total = lines[-1]["line_index"] if lines else 0
 

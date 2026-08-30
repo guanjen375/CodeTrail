@@ -618,8 +618,7 @@ def test_text_only_guard_carries_run_id_and_failed(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("AICODE_ROOT", raising=False)
     lane = RAG._run_structured_figure_lane(
         str(tmp_path / "missing.pdf"), "missing.pdf", [],
-        root=str(tmp_path), preflight_only=False,
-        legacy_jobs=[], legacy_max_fig={}, source_identity="doc-identity")
+        root=str(tmp_path), preflight_only=False, source_identity="doc-identity")
 
     assert lane["active"] is False
     assert lane["guard"]["run_id"] == ""
@@ -651,3 +650,59 @@ def test_every_figure_guard_literal_declares_the_new_keys():
     assert len(guards) == 2, "guard 建構點數量變了，摘要的資料來源要跟著檢查"
     for keys in guards:
         assert {"run_id", "failed"} <= keys
+
+
+# ============================================================
+# 2026-08-30 缺席清單（structured lane 是唯一的圖面 lane）
+# ============================================================
+@pytest.mark.smoke
+def test_summary_line_carries_absent_regions(tmp_path: Path):
+    """★ 缺席清單要走摘要行到父行程，而且只有動得了手的那幾筆進通知。
+
+    抽取端是唯一知道「什麼沒進 KB」的一端：提交點掃 KB chunks 永遠看不到缺席的
+    東西。少了這條通道，一份被整條 lane 略過的 PDF 會 exit 0、chunk 數看起來正常，
+    使用者問了得到「查無資料」只會以為文件裡沒寫。
+    """
+    document = ExtractedDocument(raw_text="x", chunks=[], source="spec.pdf")
+    setattr(document, RAG._ABSENT_ATTR, [
+        {"page": 2, "bbox": None, "channel": "text",
+         "reason": "rotated_90_text_unavailable"},
+        {"page": 3, "bbox": [10.0, 20.0, 300.0, 400.0], "channel": "page_boxes:picture",
+         "reason": "picture_only"},
+    ])
+
+    line = RAG._ingest_summary_line(document, [], None)
+    payload = ingest_notify.parse_summary_line(line)
+
+    assert payload is not None, line
+    assert payload["absent_total"] == 2
+    assert {item["reason"] for item in payload["absent"]} == {
+        "rotated_90_text_unavailable", "picture_only"}
+    block = "\n".join(ingest_notify.render_action_block(payload))
+    assert "rotated_90_text_unavailable" in block, block
+    assert "picture_only" not in block, (
+        "偵測器判定不是結構化圖面的區域沒有下一步，列進通知只會變成罐頭提示")
+
+
+@pytest.mark.smoke
+def test_not_a_figure_is_never_reported_as_an_extraction_failure(monkeypatch):
+    """★ 分類器判定「不是圖面」的那幾張不得混進「抽取失敗」。
+
+    封面、logo、產品照片同樣沒進 KB（`in_kb: False`），但它們沒有任何下一步。
+    報成抽取失敗的話，每一份 datasheet 的通知都會掛著幾筆「請覆核」的假警報，
+    真的抽壞的那一張就淹在裡面——那正是這條通知鏈存在的理由被抵銷掉。
+    """
+    entries = [
+        {"in_kb": False, "run_id": "run-2", "page": 1, "figure_index": 1,
+         "figure_id": "fig-cover", "kind": "diagram",
+         "extraction_status": "skipped", "reasons": ["raster_not_a_figure"]},
+        {"in_kb": False, "run_id": "run-2", "page": 7, "figure_index": 1,
+         "figure_id": "fig-bad", "kind": "table",
+         "extraction_status": "failed",
+         "reasons": ["extraction_failed", "row_width_mismatch"]},
+    ]
+    payload = _summary_payload_for(monkeypatch, entries, run_id="run-2")
+
+    assert payload["failed_total"] == 1, payload["failed"]
+    assert payload["failed"][0]["figure_id"] == "fig-bad"
+    assert "fig-cover" not in json.dumps(payload)

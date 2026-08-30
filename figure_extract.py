@@ -62,11 +62,23 @@ import config
 # ============================================================
 KIND_TABLE = "table"
 KIND_TERMINAL = "terminal"
+# `prose` = 掃描件 / 被平面化成影像的整頁散文。payload 形狀與 terminal 同一家族
+# （逐行、行序即語義），但語意與 prompt 不同：terminal 假設等寬 console stream，
+# 對一頁散文下那套指令會得到「窗框、捲軸不要輸出」這種不適用的約束。
+# **不得**把散文塞進 diagram：那份 schema 是 components / relations / values，
+# 段落結構會被改寫成模型編出來的元件關係。
+KIND_PROSE = "prose"
 KIND_DIAGRAM = "diagram"
 KIND_UNKNOWN = "unknown"
 KIND_RASTER = "raster"
+# `raster` 分類器可以回這個：**這不是圖面**（封面、logo、照片、裝飾）。
+# 回它就跳過抽取，零 payload、零 chunk、零第二次 VL 呼叫。
+KIND_NOT_A_FIGURE = "none"
 # tuple 而非 set：契約 §2.1 逐字如此，順序也是 schema / 報告的列舉順序。
-FIGURE_KINDS = (KIND_TABLE, KIND_TERMINAL, KIND_DIAGRAM)
+FIGURE_KINDS = (KIND_TABLE, KIND_TERMINAL, KIND_PROSE, KIND_DIAGRAM)
+# 逐行 payload 家族（`lines` / `line_index`）。分派一律問這個集合，不要逐一比對
+# kind——漏掉一處的症狀是 prose 被當成 diagram 處理，而那是無聲的。
+LINE_KINDS = frozenset({KIND_TERMINAL, KIND_PROSE})
 
 CELL_STATE_OBSERVED = "observed"
 CELL_STATE_INHERITED = "inherited"
@@ -85,6 +97,10 @@ UNREADABLE_GLYPH = "\u25af"
 
 EXTRACTION_COMPLETE = "complete"
 EXTRACTION_FAILED = "failed"
+# 分類器說「這不是圖面」：既不是成功抽取，也不是抽取失敗。分成第三種狀態是刻意的
+# ——併進 failed 會讓每張封面 / logo 都變成一則「抽取失敗、去覆核」的假警報，
+# 併進 complete 則需要一份根本不存在的 payload。
+EXTRACTION_SKIPPED = "skipped"
 
 VERIF_NATIVE = "native_verified"
 VERIF_CORROBORATED = "corroborated"
@@ -108,6 +124,7 @@ VERIFICATION_RANK = {
 ORIGIN_BY_KIND = {
     KIND_TABLE: "figure_table",
     KIND_TERMINAL: "figure_terminal",
+    KIND_PROSE: "figure_prose",
     KIND_DIAGRAM: "figure_diagram",
 }
 FIGURE_ORIGINS = frozenset(ORIGIN_BY_KIND.values())
@@ -122,6 +139,7 @@ VL_ORIGINS = {"image", "screenshot", "diagram"}
 SCHEMA_NAME_BY_KIND = {
     KIND_TABLE: "figure_table",
     KIND_TERMINAL: "figure_terminal",
+    KIND_PROSE: "figure_prose",
     KIND_DIAGRAM: "figure_diagram",
 }
 
@@ -358,6 +376,12 @@ _MODEL_SCHEMAS = {
 }
 
 
+# `prose` 的送模 schema 與 `terminal` 逐位元組相同（形狀是同一家族，差別在 prompt）。
+# 用深拷貝而不是共用同一個 dict：schema 會被 `copy.deepcopy` 之外的路徑讀，
+# 共用物件時任何一邊的就地修改都會靜默地改到另一邊。
+_MODEL_SCHEMAS[KIND_PROSE] = copy.deepcopy(_MODEL_SCHEMAS[KIND_TERMINAL])
+
+
 def _require_kind(kind: str, *, allow: Iterable[str] = FIGURE_KINDS) -> str:
     # 先確認是 str：kind 可能來自外部 JSON，若是 list/dict，`in` 對 set/dict 會拋
     # TypeError 而不是契約 §5 指定的 FigureValidationError。
@@ -512,21 +536,26 @@ def _validate_table(payload: dict) -> None:
     _require_str_list(payload["footnotes"], "table.footnotes")
 
 
-def _validate_terminal(payload: dict) -> None:
-    _require_exact_keys(payload, ("kind", "lines"), "terminal payload")
+def _validate_lines(payload: dict, kind: str = KIND_TERMINAL) -> None:
+    """逐行 payload（`terminal` / `prose`）的 validator。
+
+    兩個 kind 的形狀逐位元組相同——差別只在 prompt 與語意，所以驗證共用一份實作，
+    訊息前綴帶各自的 kind（`prose.lines[3]` 才定位得到）。
+    """
+    _require_exact_keys(payload, ("kind", "lines"), f"{kind} payload")
     lines = payload["lines"]
     if not isinstance(lines, list):
-        raise FigureValidationError(f"terminal.lines 必須是 list，收到 {type(lines).__name__}")
+        raise FigureValidationError(f"{kind}.lines 必須是 list，收到 {type(lines).__name__}")
     previous = 0
     for position, line in enumerate(lines):
-        where = f"terminal.lines[{position}]"
+        where = f"{kind}.lines[{position}]"
         _require_exact_keys(line, ("line_index", "text", "uncertain_spans"), where)
         line_index = line["line_index"]
         if not _is_int(line_index):
             raise FigureValidationError(f"{where}.line_index 必須是 int（bool 不算），收到 {line_index!r}")
         if position == 0 and line_index != 1:
             raise FigureValidationError(
-                f"terminal.lines[0].line_index 必須是 1，收到 {line_index}（契約 §2.3：從 1 起）"
+                f"{kind}.lines[0].line_index 必須是 1，收到 {line_index}（契約 §2.3：從 1 起）"
             )
         if line_index <= previous:
             raise FigureValidationError(
@@ -597,7 +626,8 @@ def _validate_diagram(payload: dict) -> None:
 
 _VALIDATORS = {
     KIND_TABLE: _validate_table,
-    KIND_TERMINAL: _validate_terminal,
+    KIND_TERMINAL: _validate_lines,
+    KIND_PROSE: lambda payload: _validate_lines(payload, KIND_PROSE),
     KIND_DIAGRAM: _validate_diagram,
 }
 
@@ -719,20 +749,26 @@ def canonicalize_terminal(model_obj: dict) -> dict:
     自行拆行——拆了之後行序就變成模型的自由裁量，而行序正是 log 的語義。
     """
     with _locator_sentinel():
-        return _canonicalize_terminal_impl(model_obj)
+        return _canonicalize_lines_impl(model_obj, KIND_TERMINAL)
 
 
-def _canonicalize_terminal_impl(model_obj: dict) -> dict:
-    """實作；context-free 訊息的 `LOCATOR_UNKNOWN` 前綴由 `canonicalize_terminal()` 統一補上。"""
-    schema = _MODEL_SCHEMAS[KIND_TERMINAL]["properties"]
-    _require_model_object(model_obj, _MODEL_SCHEMAS[KIND_TERMINAL], "model terminal")
+def canonicalize_prose(model_obj: dict) -> dict:
+    """model 物件 → canonical prose payload（形狀同 terminal，語意是散文逐行轉錄）。"""
+    with _locator_sentinel():
+        return _canonicalize_lines_impl(model_obj, KIND_PROSE)
+
+
+def _canonicalize_lines_impl(model_obj: dict, kind: str = KIND_TERMINAL) -> dict:
+    """實作；context-free 訊息的 `LOCATOR_UNKNOWN` 前綴由兩個門面統一補上。"""
+    schema = _MODEL_SCHEMAS[kind]["properties"]
+    _require_model_object(model_obj, _MODEL_SCHEMAS[kind], f"model {kind}")
 
     raw_lines = model_obj["lines"]
     if not isinstance(raw_lines, list):
-        raise FigureValidationError("model terminal.lines 必須是 list")
+        raise FigureValidationError(f"model {kind}.lines 必須是 list")
     lines = []
     for position, line in enumerate(raw_lines):
-        where = f"model terminal.lines[{position}]"
+        where = f"model {kind}.lines[{position}]"
         _require_model_object(line, schema["lines"]["items"], where)
         text = _require_str(line["text"], f"{where}.text")
         if "\n" in text or "\r" in text:
@@ -755,8 +791,8 @@ def _canonicalize_terminal_impl(model_obj: dict) -> dict:
             })
         lines.append({"line_index": position + 1, "text": text, "uncertain_spans": spans})
 
-    payload = {"kind": KIND_TERMINAL, "lines": lines}
-    validate_payload(payload, KIND_TERMINAL)
+    payload = {"kind": kind, "lines": lines}
+    validate_payload(payload, kind)
     return payload
 
 
@@ -1392,26 +1428,32 @@ def _fence_for(texts: Iterable[str]) -> str:
     return "`" * max(3, longest + 1)
 
 
-def render_terminal_text(payload: dict, *, line_slice, meta: dict) -> str:
-    """terminal 的衍生顯示文字：header 行 + 動態 fence 包住的逐行原文。
+def render_terminal_text(payload: dict, *, line_slice, meta: dict,
+                         kind: str = KIND_TERMINAL) -> str:
+    """逐行 payload（`terminal` / `prose`）的衍生顯示文字：header + fence 包住的原文。
 
     行內容**逐位元組保留**：不 strip、不 reflow、不做 overlap。首行 / 中央 / 末行的
     空行都在 fence 之間原樣保留。解析回來的方式是位置式的（第 0 行 header、第 1 行
-    開 fence、最後一行關 fence），中間的行以 `\\n` 切開即為原始行——因為 validator
-    保證單行不含 `\\n`/`\\r`，而 fence 保證比內容裡任何 backtick run 都長。
+    開 fence、最後一行關 fence），中間的行以 `\n` 切開即為原始行——因為 validator
+    保證單行不含 `\n`/`\r`，而 fence 保證比內容裡任何 backtick run 都長。
+
+    prose 沿用**同一個** fence 結構：衍生文字只給 embedding / BM25 與 REF 顯示，
+    JSON 才是真相；換一種結構就等於多一條 `knowledge.py` 要認的 scaffolding 格式，
+    而認錯的症狀是截斷揭露算錯行數（無聲）。
     """
     with _locator_sentinel():
-        return _render_terminal_text_impl(payload, line_slice=line_slice, meta=meta)
+        return _render_lines_text_impl(payload, line_slice=line_slice, meta=meta, kind=kind)
 
 
-def _render_terminal_text_impl(payload: dict, *, line_slice, meta: dict) -> str:
+def _render_lines_text_impl(payload: dict, *, line_slice, meta: dict,
+                            kind: str = KIND_TERMINAL) -> str:
     """實作；context-free 訊息的 `LOCATOR_UNKNOWN` 前綴由 `render_terminal_text()` 統一補上。"""
-    validate_payload(payload, KIND_TERMINAL)
+    validate_payload(payload, kind)
     _validate_meta(meta)
-    lines, span, total = _select_items(payload, KIND_TERMINAL, line_slice)
+    lines, span, total = _select_items(payload, kind, line_slice)
     texts = [line["text"] for line in lines]
     fence = _fence_for(texts)
-    out = [_header_line(KIND_TERMINAL, meta, range_kw="lines", span=span, total=total), fence]
+    out = [_header_line(kind, meta, range_kw="lines", span=span, total=total), fence]
     out.extend(texts)
     out.append(fence)
     return "\n".join(out)
@@ -1523,7 +1565,7 @@ def _chunk_payload_impl(payload: dict, kind: str, *, meta: dict, max_chars: int 
         field, index_key, range_key, flag_key = "lines", "line_index", "line_range", "oversized_line"
 
         def _render(span):
-            return render_terminal_text(payload, line_slice=span, meta=meta)
+            return render_terminal_text(payload, line_slice=span, meta=meta, kind=kind)
 
         def _item_cost(item):
             return len(item["text"]) + 1
@@ -1646,7 +1688,7 @@ def _payload_uncertainty(payload: dict, kind: str) -> list[str]:
     """
     found: list[str] = []
     field, index_key = (("rows", "row_index") if kind == KIND_TABLE
-                        else ("lines", "line_index") if kind == KIND_TERMINAL else (None, None))
+                        else ("lines", "line_index") if kind in LINE_KINDS else (None, None))
     if field is not None:
         indices = [item[index_key] for item in payload[field]]
         if indices != list(range(1, len(indices) + 1)):
@@ -1658,7 +1700,7 @@ def _payload_uncertainty(payload: dict, kind: str) -> list[str]:
                     found.append(f"row {row['row_index']} 的 {cell['column_id']} 含 {UNREADABLE_GLYPH}")
                 if cell["state"] in (CELL_STATE_UNREADABLE, CELL_STATE_CONFLICT):
                     found.append(f"row {row['row_index']} 的 {cell['column_id']} state={cell['state']}")
-    elif kind == KIND_TERMINAL:
+    elif kind in LINE_KINDS:
         for line in payload["lines"]:
             if UNREADABLE_GLYPH in line["text"]:
                 found.append(f"line {line['line_index']} 含 {UNREADABLE_GLYPH}")
@@ -1773,8 +1815,33 @@ def _validate_figure_view(view: dict, *, source: str, position: int) -> None:
         )
 
 
+_CONTEXT_FIELDS = ("caption", "section", "heading_hierarchy")
+
+
+def _figure_context(context_by_figure, figure_id: str, where: str) -> dict:
+    """這張圖的檢索訊號欄位；缺就是空字串，型別錯一律 fail-closed。
+
+    悄悄把一個非 str（例如 None 或 list）寫進 `section` 會讓 BM25 組字與 REF 顯示
+    各自壞在不同地方，而且都不會拋——所以在唯一入口驗完型別再寫。
+    """
+    raw = (context_by_figure or {}).get(figure_id) or {}
+    if not isinstance(raw, dict):
+        raise FigureValidationError(
+            f"{where}: context_by_figure[{figure_id!r}] 必須是 dict，收到 {type(raw).__name__}")
+    resolved = {}
+    for name in _CONTEXT_FIELDS:
+        value = raw.get(name, "")
+        if not isinstance(value, str):
+            raise FigureValidationError(
+                f"{where}: context_by_figure[{figure_id!r}][{name!r}] 必須是 str，"
+                f"收到 {type(value).__name__}")
+        resolved[name] = value
+    return resolved
+
+
 def build_figure_chunks(figures, *, source: str, doc_type: str,
-                        next_chunk_index: dict, evidence_ref_by_figure: dict) -> list[dict]:
+                        next_chunk_index: dict, evidence_ref_by_figure: dict,
+                        context_by_figure: dict | None = None) -> list[dict]:
     """`FigureResult` list → KB chunk dict list（契約 §4 的形狀）。
 
     這是 structured figure chunk 的**唯一產生點**，所以三件事在這裡強制：
@@ -1794,8 +1861,13 @@ def build_figure_chunks(figures, *, source: str, doc_type: str,
     每張圖的 `page`/`bbox` 必須對得上**首個** occurrence（契約 §4）。
 
     `next_chunk_index`（頁碼 → 下一個可用 chunk_index）就地更新，語意與既有
-    `RAG._pdf_figure_chunks` 相同：figure chunk 的 index 接在該頁「文字 chunk +
-    legacy diagram chunk」之後，chunk id 才不會撞。
+    以前的 legacy 圖面路徑相同：figure chunk 的 index 接在該頁文字 chunk 之後，
+    chunk id 才不會撞。
+
+    `context_by_figure`（`figure_id` → `{"caption", "section", "heading_hierarchy"}`）是
+    **檢索訊號**，不是證據：caption（「Table 3-1 …」）與所在章節都來自鄰近的文字層，
+    不是從圖裡讀出來的，所以它們只進 chunk 的 metadata 欄位，**絕不**進 `content`
+    （content 就是 canonical payload 的衍生文字＝evidence）。沒給就是空字串。
 
     **不經** `normalize_document_text()` / `normalize_table_content()` / 任何 splitter /
     `detect_content_type()` / overlap / heading 前綴——那些正是本模組存在的理由（見檔頭）。
@@ -1901,7 +1973,7 @@ def build_figure_chunks(figures, *, source: str, doc_type: str,
         row_total = line_total = None
         if kind == KIND_TABLE:
             row_total = payload["rows"][-1]["row_index"] if payload["rows"] else 0
-        elif kind == KIND_TERMINAL:
+        elif kind in LINE_KINDS:
             line_total = payload["lines"][-1]["line_index"] if payload["lines"] else 0
         for name, derived in (("row_total", row_total), ("line_total", line_total)):
             declared = view[name]
@@ -1934,6 +2006,7 @@ def build_figure_chunks(figures, *, source: str, doc_type: str,
         except FigureError as exc:
             raise FigureValidationError(f"{where}: {strip_locator(exc)}") from exc
 
+        context = _figure_context(context_by_figure, figure_id, where)
         base = shadow.get(page, 0)
         if not _is_int(base) or base < 0:
             raise FigureValidationError(f"{where}: next_chunk_index[{page}]={base!r} 不是合法起始索引")
@@ -1956,8 +2029,10 @@ def build_figure_chunks(figures, *, source: str, doc_type: str,
                 "chunk_index": base + offset,
                 "content": part["content"],
                 "type": doc_type,
-                "section": "",
-                "heading_hierarchy": "",
+                "section": context.get("section", ""),
+                "heading_hierarchy": context.get("heading_hierarchy", ""),
+                # 只當檢索訊號（embedding / BM25 / REF 標示），不進 evidence payload
+                "figure_caption": context.get("caption", ""),
                 "overlap_prefix_chars": 0,
                 "heading_prefix_chars": 0,
                 "char_start": 0,

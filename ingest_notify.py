@@ -46,12 +46,37 @@ MAX_PAYLOAD_ITEMS = 50        # 摘要行每個 list 最多幾個元素（*_tota
 _ALL_MARKERS = (SUMMARY_PREFIX, ACTION_REQUIRED_MARKER, FAILED_MARKER,
                 ZERO_WRITE_MARKER)
 
-# payload 的三個 list ↔ 對應的精確總數欄位。
+# payload 的 figure 身分 list ↔ 對應的精確總數欄位。
 _LIST_KEYS = (
     ("review", "review_total"),
     ("unfixable", "unfixable_total"),
     ("failed", "failed_total"),
 )
+
+# 缺席清單（頁碼 / bbox / slug，不是 figure 身分，所以另外一份形狀）。
+ABSENT_KEY = "absent"
+ABSENT_TOTAL_KEY = "absent_total"
+
+# **只有這些原因會進通知**；其餘只進摘要 payload 與 ingest 的 stdout 完整清單。
+# 判準與 §2.3 同一條：使用者動得了手才列。整條 lane 沒跑（檔案不在專案根內）、
+# 正文抽不出來、預算把候選丟掉、planner 自己出意外——這四類都有明確的下一步。
+# 「這一塊我們判定不是結構化圖面」沒有下一步，逐筆列出只會讓每次 ingest 都變成
+# 一則罐頭通知，然後使用者連真的要處理的那幾筆也一起跳過。
+ACTIONABLE_ABSENT_PREFIXES = (
+    "structured_lane_inactive",
+    "rotated_",
+    "page_text_recovery_failed",
+    "planning_error",
+    "candidates_per_page",
+    "candidate_build_error",
+)
+
+
+def is_actionable_absent(reason: object) -> bool:
+    """這一筆缺席要不要進通知（見 `ACTIONABLE_ABSENT_PREFIXES`）。"""
+    text = reason if isinstance(reason, str) else ""
+    return any(text.startswith(prefix) for prefix in ACTIONABLE_ABSENT_PREFIXES)
+
 
 # `unfixable` 的 reason 值域（凍結）。RAG.py 只准送這三個之一。
 UNFIXABLE_REASONS = ("payload_unreadable", "artifact_missing", "not_fixable")
@@ -102,6 +127,37 @@ def _clean_item(item: object) -> dict:
     return cleaned
 
 
+def _as_float(value: object):
+    """bbox 座標 → float；轉不動或非有限值一律回 None（整筆 bbox 因此作廢）。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number not in (float("inf"), float("-inf")) else None
+
+
+def _clean_absent_item(item: object) -> dict:
+    """正規化一筆缺席紀錄：`page` / `bbox` / `channel` / `reason`，其餘丟掉。
+
+    缺席紀錄不是 figure 身分（沒有 figure_id，可能連 bbox 都沒有），所以刻意不共用
+    `_clean_item`：共用會讓通知印出一堆 `#0`、空 kind，看起來像資料壞掉。
+    """
+    source = item if isinstance(item, dict) else {}
+    raw = source.get("bbox")
+    bbox = None
+    if isinstance(raw, (list, tuple)) and len(raw) == 4:
+        coords = [_as_float(v) for v in raw]
+        bbox = coords if all(v is not None for v in coords) else None
+    return {
+        "page": _as_int(source.get("page")),
+        "bbox": bbox,
+        "channel": _clean_scalar(source.get("channel", "")),
+        "reason": _clean_scalar(source.get("reason", "")),
+    }
+
+
 def _as_int(value: object) -> int:
     """任意值 → int；轉不動一律回 0。
 
@@ -144,6 +200,13 @@ def normalize_payload(payload: object) -> dict:
         # 而 list 本身已經被 MAX_PAYLOAD_ITEMS 砍過）。
         result[total_key] = _as_int(total) if total is not None else len(items)
         result[list_key] = items[:MAX_PAYLOAD_ITEMS]
+    raw_absent = source.get(ABSENT_KEY)
+    absent = [_clean_absent_item(item) for item in raw_absent] \
+        if isinstance(raw_absent, list) else []
+    absent_total = source.get(ABSENT_TOTAL_KEY)
+    result[ABSENT_TOTAL_KEY] = (
+        _as_int(absent_total) if absent_total is not None else len(absent))
+    result[ABSENT_KEY] = absent[:MAX_PAYLOAD_ITEMS]
     return result
 
 
@@ -213,17 +276,32 @@ def _listing(items: list, total: int) -> list[str]:
     return lines
 
 
+def _absent_listing(items: list) -> list[str]:
+    """缺席清單的逐筆行（頁碼 / bbox / slug，零文件內容）。"""
+    lines = []
+    for item in items[:MAX_LISTED_ITEMS]:
+        where = f"bbox={[round(v, 1) for v in item['bbox']]}" if item["bbox"] else "整頁"
+        page = f"p{item['page']}" if item["page"] else "整份文件"
+        lines.append(f"  - {page} {where} ({item['reason']})")
+    remaining = len(items) - min(len(items), MAX_LISTED_ITEMS)
+    if remaining > 0:
+        lines.append(f"  …還有 {remaining} 筆")
+    return lines
+
+
 def render_action_block(payload: dict) -> list[str]:
     """要使用者動手的事情；沒有就回 `[]`（零項目零輸出）。
 
-    只列「使用者不動手就會拿到錯答案」的三類。`unverified` / `legacy_unverified`
+    只列「使用者不動手就會拿到錯答案」的幾類。`unverified` / `legacy_unverified`
     以及全部可信的情況一律不提：每次 ingest 都印一句罐頭提示等於沒有提示，
-    使用者會學會跳過它，真的有待覆核時也一起跳過。
+    使用者會學會跳過它，真的有待覆核時也一起跳過。缺席也照同一條規矩過濾
+    （見 `ACTIONABLE_ABSENT_PREFIXES`）——完整清單在 ingest 自己的 stdout。
     """
     data = normalize_payload(payload)
     review, unfixable, failed = data["review"], data["unfixable"], data["failed"]
+    absent = [item for item in data[ABSENT_KEY] if is_actionable_absent(item["reason"])]
     totals = (data["review_total"], data["unfixable_total"], data["failed_total"])
-    if not (review or unfixable or failed or any(totals)):
+    if not (review or unfixable or failed or absent or any(totals)):
         return []
 
     document = data["document"] or "（未知文件）"
@@ -231,7 +309,8 @@ def render_action_block(payload: dict) -> list[str]:
     # 合法檔名可以叫 `a"b.pdf`，直接塞進 `remove_document("...")` 會產生一段
     # 不可執行、而且會誤導模型的呼叫。
     quoted = json.dumps(document, ensure_ascii=False)
-    lines = [f"{ACTION_REQUIRED_MARKER} {quoted}：{sum(totals)} 項需要你決定"]
+    lines = [f"{ACTION_REQUIRED_MARKER} {quoted}："
+             f"{sum(totals) + len(absent)} 項需要你決定"]
     # 工具名與參數名要與 mcp_server 的簽章一致：`review_figures` 吃的是
     # `document_id`（可以給 basename），`ingest_document` 吃的是**路徑**，
     # 所以這裡不編一個路徑出來——payload 只有 basename。
@@ -252,6 +331,14 @@ def render_action_block(payload: dict) -> list[str]:
         lines.extend(_listing(failed, data["failed_total"]))
         lines.append('  → 接受這一張缺席（其餘內容已入庫），或 remove_document'
                      f'({quoted}) 之後用原本的路徑重灌')
+    if absent:
+        # 缺席的內容在查詢時是**完全不存在**的：不說出來，使用者問了得到「查無資料」
+        # 只會以為文件裡沒寫。這裡只列動得了手的那幾筆（完整清單在 ingest stdout）。
+        lines.append(f"未進知識庫 {len(absent)} 個頁 / 區域（查詢時不會出現）：")
+        lines.extend(_absent_listing(absent))
+        lines.append('  → 需要那幾頁的內容就用 read_pdf(path, pages="…") 直接讀原頁；'
+                     'structured_lane_inactive 代表整條圖面 lane 沒跑（檔案不在專案根內），'
+                     '把 PDF 放進專案根再 ingest_document(...) 一次才會有 figure')
     return lines
 
 

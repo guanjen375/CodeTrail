@@ -133,13 +133,6 @@ IMAGE_MIME_TYPES = {
 BINARY_EXTENSIONS = {".bin", ".dat", ".raw", ".fw", ".img", ".rom", ".hex"}
 ELF_EXTENSIONS = {".elf", ".so", ".o", ".axf", ".out", ".ko"}
 
-# PDF 內嵌圖 → VL 自動入庫（常駐啟用，無設定開關；純文字 PDF 產生零 job、零 VL 成本）
-PDF_FIGURE_RENDER_DPI = 200        # render 解析度：VL 要能讀出圖中文字
-PDF_FIGURE_MAX_SIDE_PX = 2200      # render 最長邊上限（整頁 A4 約等效 190 DPI）
-PDF_FIGURE_MIN_SIDE_PT = 30        # picture 框最短邊門檻（pt）：圖示/分隔線不送 VL
-PDF_FIGURE_MIN_AREA_PT2 = 4000     # picture 框面積門檻（pt²）：約 0.77 平方英吋
-PDF_PAGE_TEXT_NEAR_ZERO_CHARS = 20 # 頁文字（strip 後）低於此 → 「近乎 0」，整頁 render
-
 # PDF native table 被 structured chunk 取代後，原位置留下的單行 marker（契約 §6.7 步驟 7）。
 # 一定要是單行：它會被丟進既有的通用 splitter，多行會被當成段落而改變切點。
 PDF_TABLE_REPLACED_MARKER = (
@@ -149,6 +142,9 @@ PDF_TABLE_REPLACED_MARKER = (
 # extract_pdf_document 掛在 ExtractedDocument 上的私有屬性（KB-aware prune 的資料通道）。
 # 刻意用動態屬性而非 dataclass 欄位:`extracted_document.py` 不歸 T7 擁有,不加 schema 欄位。
 _FIGURE_PRUNE_ATTR = "_codetrail_figure_prune"
+# 同一條資料通道：這次 ingest **有內容、但沒有進 KB** 的頁與區域（頁碼 / bbox /
+# 固定 slug，零文件內容）。缺席只在提交點的摘要裡講得清楚，抽取端是唯一知情的一端。
+_ABSENT_ATTR = "_codetrail_absent_regions"
 
 # ============================================================
 # 文件類型識別
@@ -649,19 +645,17 @@ def build_text_document(
 
 
 # ============================================================
-# PDF 結構化 figure lane（table / terminal / diagram）
+# PDF 結構化 figure lane（table / terminal / prose / diagram）
 # ============================================================
-# 與下面「PDF 內嵌圖 → VL 自動入庫」那條 legacy lane 的分工（契約 §0.1 / §13.1）：
+# PDF 的圖面只有這一條 lane（契約 §0.1 / §13.1；2026-08-30 移除 legacy 自由文字 lane）：
+# 有結構性原生證據的候選，以及夠大的純 raster / picture 候選，後者先用 image-bound
+# schema 分成 table / terminal / prose / diagram（或「不是圖面」而跳過），再產生
+# canonical JSON payload → origin="figure_table" / "figure_terminal" / "figure_prose"
+# / "figure_diagram"。
 #
-#   legacy lane：沒有被 structured 候選覆蓋的舊 `class=picture` job → 自由文字 VL →
-#                origin="diagram"；既有 KB 的 legacy chunk 仍保留原語意。
-#   structured lane：有結構性原生證據的候選，以及夠大的純 raster / picture 候選。
-#                後者先用 image-bound schema 分成 table / terminal / diagram，再產生
-#                canonical JSON payload → origin="figure_table" / "figure_terminal" /
-#                "figure_diagram"。
-#
-# 兩條 lane 不互相承接失敗：structured 的 schema / validator 失敗一律整份 PDF
-# 零寫入（workflow §7「不保留自由文字 fallback」），不會降級成 legacy。
+# schema / validator 失敗一律整份 PDF 零寫入（workflow §7「不保留自由文字 fallback」）；
+# lane 沒收的頁與區域是**缺席**，由 `format_absent_regions()` 與 ingest 摘要列出頁碼、
+# bbox 與原因。既有 KB 裡的 `origin="diagram"` chunk 仍保留原語意（legacy_unverified）。
 class PdfPreflightUnavailable(RuntimeError):
     """`--preflight` 無法產出預算報告（PDF 解析失敗、或結構化 lane 未啟動）。
 
@@ -730,38 +724,123 @@ def _bbox_iou(a, b) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def _bbox_coverage(inner, outer) -> float:
-    """`inner` 有多少比例落在 `outer` 內；退化框回 0.0。
-
-    IoU 不夠用：結構化 lane 會把一張關係圖的數十個 picture 子框聚成**一個**大候選，
-    大框與其中任一小框的 IoU 很低，但小框其實已經 100% 被收錄。只看 IoU 會讓既有
-    picture lane 把同一塊內容再 render、再送一次 VL（契約 §0.1 的重複入庫）。
-    """
-    try:
-        ax0, ay0, ax1, ay1 = (float(v) for v in inner)
-        bx0, by0, bx1, by1 = (float(v) for v in outer)
-    except (TypeError, ValueError):
-        return 0.0
-    iw = min(ax1, bx1) - max(ax0, bx0)
-    ih = min(ay1, by1) - max(ay0, by0)
-    area = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
-    if iw <= 0 or ih <= 0 or area <= 0:
-        return 0.0
-    return (iw * ih) / area
-
-
-# 「這個 legacy crop 已經被結構化候選收錄」的覆蓋率門檻。
-FIGURE_JOB_COVERED_BY_CANDIDATE = 0.90
-
-
-def _job_covered_by(job_bbox, candidate_bbox, threshold: float) -> bool:
-    """legacy crop 是否已由某個結構化候選收錄（IoU 等價 **或** 幾乎整塊被包住）。"""
-    return (_bbox_iou(job_bbox, candidate_bbox) >= threshold
-            or _bbox_coverage(job_bbox, candidate_bbox) >= FIGURE_JOB_COVERED_BY_CANDIDATE)
-
-
 def _iou_threshold() -> float:
     return float(getattr(config_module, "FIGURE_IOU_MERGE", 0.5))
+
+
+# figure caption 的辨識（只認**行首**的圖表編號；行中間的「見 Table 3-1」是引用不是題名）。
+# 兩個 pattern 分開是刻意的：中英文的分隔慣例不同（`Table 3-1. Foo` vs `表 3-1 Foo`），
+# 合成一條會讓其中一邊的編號吃進題名。
+_CAPTION_PATTERNS = (
+    ("table", re.compile(
+        r"^\s{0,3}(?:\*\*|__)?\s*"
+        r"(?P<label>(?:Table|TABLE|Tab\.)\s*[0-9A-Za-z][0-9A-Za-z.\-‐-―]*)"
+        r"\s*[.:。：\-–—]?\s+(?P<title>\S.*?)\s*(?:\*\*|__)?\s*$")),
+    ("figure", re.compile(
+        r"^\s{0,3}(?:\*\*|__)?\s*"
+        r"(?P<label>(?:Figure|FIGURE|Fig\.|FIG\.)\s*[0-9A-Za-z][0-9A-Za-z.\-‐-―]*)"
+        r"\s*[.:。：\-–—]?\s+(?P<title>\S.*?)\s*(?:\*\*|__)?\s*$")),
+    ("table", re.compile(
+        r"^\s{0,3}(?P<label>(?:表|附表)\s*[0-9][0-9.\-‐-―]*)"
+        r"[\s、:：]*(?P<title>\S.*?)\s*$")),
+    ("figure", re.compile(
+        r"^\s{0,3}(?P<label>(?:圖|图|附圖)\s*[0-9][0-9.\-‐-―]*)"
+        r"[\s、:：]*(?P<title>\S.*?)\s*$")),
+)
+# caption 一行最多這麼長；超過就不是題名，是把整段內文誤認成 caption。
+MAX_CAPTION_CHARS = 200
+
+
+def _page_captions(page_text: str, page_start: int) -> List[Dict]:
+    """一頁文字裡的 caption 候選（依出現順序）。
+
+    只認行首的圖表編號：datasheet 的內文到處都是「見 Table 3-1」，把那些也算進來
+    的話，一頁的 caption 數會遠多於圖數，配對就只能整頁放棄。
+    """
+    found: List[Dict] = []
+    offset = 0
+    for line in page_text.split("\n"):
+        stripped = line.strip()
+        if 0 < len(stripped) <= MAX_CAPTION_CHARS:
+            for family, pattern in _CAPTION_PATTERNS:
+                match = pattern.match(line)
+                if match:
+                    found.append({
+                        "family": family,
+                        "offset": page_start + offset,
+                        "text": f"{match.group('label')} {match.group('title')}".strip(),
+                    })
+                    break
+        offset += len(line) + 1        # +1 = 被 split 掉的那個 "\n"
+    return found
+
+
+def _caption_family(kind: str) -> str:
+    """figure kind → caption 家族。table 找「Table N」，其餘找「Figure N」。"""
+    return "table" if kind == "table" else "figure"
+
+
+def _figure_retrieval_context(document, figures) -> Dict[str, Dict[str, str]]:
+    """每張 structured figure 的 caption 與所在章節（**只**當檢索訊號）。
+
+    caption 與 figure 的配對規則刻意保守：同一頁、同一個 caption 家族的數量**完全
+    相等**時才依閱讀順序一一配對，否則整頁放棄。掛錯 caption 比沒有 caption 更糟
+    ——「Table 3-1 的 opcode」會穩定命中另一張表，而且看起來完全正常。
+
+    章節取 caption 所在位置的那一節；沒有 caption 就退回該頁起點。兩者都是文件級
+    走訪的結果（`ExtractedDocument.section_index_for_offset`），與文字 chunk 同一套
+    座標，不會出現「同一頁的文字 chunk 說第 3.2 節、figure 說空字串」。
+    """
+    spans = {page: (start, end) for page, start, end in (document.page_spans or [])}
+    raw = document.raw_text or ""
+    # offset → 文字 chunk 的 heading_hierarchy（figure 沿用它所在位置那一段的階層）
+    text_chunks = sorted(
+        (c for c in document.chunks if not c.get("structured")),
+        key=lambda c: int(c.get("char_start", 0) or 0),
+    )
+
+    def _heading_at(offset: int) -> str:
+        found = ""
+        for chunk in text_chunks:
+            if int(chunk.get("char_start", 0) or 0) > offset:
+                break
+            if int(chunk.get("char_end", 0) or 0) > offset:
+                found = str(chunk.get("heading_hierarchy", "") or "")
+        return found
+
+    def _section_at(offset: int) -> str:
+        index = document.section_index_for_offset(offset)
+        sections = document.sections or []
+        return sections[index].title if 0 <= index < len(sections) else ""
+
+    by_page: Dict[int, List] = {}
+    for figure in figures:
+        by_page.setdefault(int(figure.page), []).append(figure)
+
+    context: Dict[str, Dict[str, str]] = {}
+    for page, page_figures in by_page.items():
+        span = spans.get(page)
+        page_start = span[0] if span else 0
+        captions = _page_captions(raw[span[0]:span[1]], page_start) if span else []
+        page_figures.sort(key=lambda f: (float(f.bbox[1]), float(f.bbox[0])))
+        for family in ("table", "figure"):
+            group = [f for f in page_figures if _caption_family(str(f.kind)) == family]
+            available = [c for c in captions if c["family"] == family]
+            if not group or len(group) != len(available):
+                continue
+            for figure, caption in zip(group, available):
+                context[figure.figure_id] = {
+                    "caption": caption["text"],
+                    "section": _section_at(caption["offset"]),
+                    "heading_hierarchy": _heading_at(caption["offset"]),
+                }
+        for figure in page_figures:
+            context.setdefault(figure.figure_id, {
+                "caption": "",
+                "section": _section_at(page_start),
+                "heading_hierarchy": _heading_at(page_start),
+            })
+    return context
 
 
 def build_structured_figure_document(
@@ -771,6 +850,7 @@ def build_structured_figure_document(
     doc_type: str,
     next_chunk_index: Dict[int, int],
     evidence_ref_by_figure: Dict[str, str],
+    context_by_figure: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> List[Dict]:
     """structured figure chunk 的唯一入口：薄封裝 `figure_extract.build_figure_chunks`。
 
@@ -780,8 +860,9 @@ def build_structured_figure_document(
     `Key: Value`、terminal 的首尾空行與行首空白會被 strip 掉——那是 workflow §8
     第 2 條「原文」的直接違反。通用語意切分本身不改（契約 §6.7）。
 
-    `next_chunk_index` 由 `build_figure_chunks` 就地更新（與 `_pdf_figure_chunks`
-    同語意）：整批成功才提交，中途失敗時呼叫端的 dict 完全不變。
+    `next_chunk_index` 由 `build_figure_chunks` 就地更新：整批成功才提交，中途失敗時
+    呼叫端的 dict 完全不變。`context_by_figure` 是 caption / 章節這類**檢索訊號**，
+    同樣原樣轉傳（它們不進 content，見 `build_figure_chunks` 的說明）。
     """
     return _figure_extract().build_figure_chunks(
         figures,
@@ -789,6 +870,7 @@ def build_structured_figure_document(
         doc_type=doc_type,
         next_chunk_index=next_chunk_index,
         evidence_ref_by_figure=evidence_ref_by_figure,
+        context_by_figure=context_by_figure,
     )
 
 
@@ -963,48 +1045,89 @@ def _native_span(fx, candidate) -> Optional[Dict]:
     return None
 
 
-def _structured_candidates(fx, plan) -> List:
-    """哪些候選進 structured lane。
+def _structured_candidates(fx, plan) -> Tuple[List, List[Dict]]:
+    """哪些候選進 structured lane；回 `(keep, absent)`。
 
     `KIND_RASTER` 是 candidate-only：必須先由 VL 的受限分類 schema 解成 table /
-    terminal / diagram，結果才可入庫。planner 已知的 diagram 仍不重複處理。
+    terminal / diagram / prose，結果才可入庫。
+
+    structured lane 是**唯一**的圖面 lane（2026-08-30），所以這裡濾掉的候選就是
+    「不會進 KB」——每一個都要留下頁碼、bbox 與原因，否則它就是無聲缺席。
     """
-    keep = []
+    keep, absent = [], []
+    accepted = (fx.KIND_TABLE, fx.KIND_TERMINAL, fx.KIND_UNKNOWN, fx.KIND_RASTER)
     for candidate in plan.candidates:
         kind = getattr(candidate, "kind", "")
-        if kind == fx.KIND_DIAGRAM:
-            continue
-        if getattr(candidate, "native_table", None) is not None:
+        if kind != fx.KIND_DIAGRAM and (
+                getattr(candidate, "native_table", None) is not None or kind in accepted):
             keep.append(candidate)
             continue
-        if kind in (fx.KIND_TABLE, fx.KIND_TERMINAL, fx.KIND_UNKNOWN, fx.KIND_RASTER):
-            keep.append(candidate)
-    return keep
+        absent.append({
+            "page": int(getattr(candidate, "page", 0) or 0),
+            "bbox": [float(v) for v in (getattr(candidate, "bbox", ()) or ())] or None,
+            "channel": "candidate",
+            "reason": f"candidate_kind_not_supported:{kind or 'unknown'}",
+        })
+    return keep, absent
 
 
-def _format_legacy_vl_estimate(fx, plan, legacy_jobs) -> str:
-    """legacy 圖面路徑的 VL 次數預估。
+def _pdf_picture_pages(pages: List[Dict]) -> List[int]:
+    """哪些頁的上游 page dict 宣稱有內嵌圖（`class=picture`，舊 schema 是 `images`）。
 
-    `plan.preflight` 只算 structured 候選（契約 §13.4 的已知限制），使用者看到的
-    預算若少了這一段，圖多表少的 PDF 會「preflight 過關、實際跑很久」。訊息刻意
-    不含「內嵌圖」三字（既有 `test_text_only_pdf_zero_vl_calls` 斷言它不出現）。
+    structured lane 沒啟動時（stub 路徑、檔案不在專案根內）唯一的圖面線索。沒有它
+    就分不出「這份 PDF 本來就沒有圖」與「有圖、但整條 lane 一次都沒跑」——前者不該
+    吵，後者不說就是無聲缺席。
     """
-    threshold = _iou_threshold()
-    kinds = (fx.KIND_TABLE, fx.KIND_TERMINAL, fx.KIND_UNKNOWN, fx.KIND_RASTER)
-    crops = [job for job in legacy_jobs if job["mode"] == "crop"]
-    covered = 0
-    for job in crops:
-        for candidate in plan.candidates:
-            if getattr(candidate, "kind", "") not in kinds:
-                continue
-            if int(getattr(candidate, "page", 0)) != job["page"]:
-                continue
-            if _job_covered_by(job["bbox"], getattr(candidate, "bbox", ()), threshold):
-                covered += 1
-                break
-    return (f"  [INFO] 既有圖面路徑：{len(legacy_jobs)} 張"
-            f"（預估 {covered} 張已由結構化候選覆蓋將跳過）→ 最多 "
-            f"{len(legacy_jobs) - covered} 次 VL 呼叫（去重前）")
+    found: List[int] = []
+    for page_info in pages or []:
+        if not isinstance(page_info, dict):
+            continue
+        has_picture = any(
+            isinstance(box, dict) and box.get("class") == "picture"
+            for box in page_info.get("page_boxes") or ()
+        ) or bool(page_info.get("images"))
+        if has_picture:
+            found.append(_pdf_page_number(page_info.get("metadata")))
+    return found
+
+
+def _absent_from_plan(plan, extra: List[Dict]) -> List[Dict]:
+    """planner 算出來的缺席清單 ＋ 呼叫端自己濾掉的候選（形狀一致、順序穩定）。"""
+    entries = [dict(item) for item in (getattr(plan, "stats", None) or {}).get(
+        "absent_regions", ())]
+    entries.extend(dict(item) for item in extra)
+    entries.sort(key=lambda e: (int(e.get("page") or 0),
+                                (e.get("bbox") or [0.0, 0.0])[1],
+                                (e.get("bbox") or [0.0, 0.0])[0],
+                                str(e.get("reason") or "")))
+    return entries
+
+
+# 缺席清單在 stdout 逐筆列出的上限（超過補一行「…還有 N 筆」）。
+MAX_LISTED_ABSENT = 10
+
+
+def format_absent_regions(filename: str, absent: List[Dict]) -> str:
+    """「這一次有東西沒進 KB」的人類可讀區塊；沒有就回空字串。
+
+    ingest 仍然 exit 0，使用者只從 chunk 數看不出少了什麼；而缺席的內容在查詢時
+    是**完全不存在**的，不說出來就會變成「問了得到查無資料、以為文件裡沒寫」。
+    只列頁碼、bbox 與固定 slug——一個字的文件內容都不含（AGENTS.md §6）。
+    """
+    if not absent:
+        return ""
+    lines = [f"[INFO] {filename}: {len(absent)} 個頁 / 區域沒有進知識庫"
+             "（查詢時不會出現，需要就用 read_pdf 直接看原頁）"]
+    for entry in absent[:MAX_LISTED_ABSENT]:
+        bbox = entry.get("bbox")
+        where = f"bbox={[round(float(v), 1) for v in bbox]}" if bbox else "整頁"
+        page = int(entry.get("page") or 0)
+        location = f"第 {page} 頁" if page else "整份文件"
+        lines.append(f"  - {location} {where} reason={entry.get('reason', '')}")
+    remaining = len(absent) - min(len(absent), MAX_LISTED_ABSENT)
+    if remaining > 0:
+        lines.append(f"  …還有 {remaining} 筆（完整清單見 preflight 報告）")
+    return "\n".join(lines)
 
 
 def _bbox_close(a, b, tolerance: float = 1e-6) -> bool:
@@ -1050,11 +1173,12 @@ def _verify_results_match_candidates(fx, filename, plan, results) -> Dict[str, o
     「每張候選可監督」已經破了。這種情況**不得**降級成 `no_pos_cannot_replace`
     （那是保留原文的正常路徑），必須 hard fail。
 
-    `extraction_status` 只有兩種合法形狀，其餘一律 hard fail：
+    `extraction_status` 只有三種合法形狀，其餘一律 hard fail：
     `complete` 必須帶 payload；`failed`（品質失敗、那一張不進 KB）必須是
-    `payload=None` **且** `model_input_variant="failed"`——半套的失敗結果
-    （有 payload 卻宣稱 failed、或宣稱送過某個 variant）會讓 manifest 記下一張
-    誰也說不清有沒有進 KB 的圖。
+    `payload=None` **且** `model_input_variant="failed"`；`skipped`（分類器判定不是
+    圖面）必須是 `payload=None` **且** `model_input_variant="skipped"`——半套的結果
+    （有 payload 卻宣稱 failed/skipped、或宣稱送過某個 variant）會讓 manifest 記下
+    一張誰也說不清有沒有進 KB 的圖。
 
     occurrence 比對用 `(page, 量化 bbox, index)` 的**保序序列**，不是頁碼集合：
     降成集合的話，錯 bbox、錯 index、同頁重複次數不同都會通過。
@@ -1107,6 +1231,14 @@ def _verify_results_match_candidates(fx, filename, plan, results) -> Dict[str, o
                     f"payload={'有' if figure.payload else '無'}、"
                     f"model_input_variant={figure.model_input_variant!r}"
                     "（應為 None / 'failed'）。整份文件零寫入。")
+        elif figure.extraction_status == fx.EXTRACTION_SKIPPED:
+            # 「不是圖面」：分類完就停手，所以既沒有 payload、也沒有送過抽取 variant。
+            if figure.payload is not None or figure.model_input_variant != "skipped":
+                raise fx.FigureExtractionError(
+                    f"{where}: extraction_status=skipped 卻帶 "
+                    f"payload={'有' if figure.payload else '無'}、"
+                    f"model_input_variant={figure.model_input_variant!r}"
+                    "（應為 None / 'skipped'）。整份文件零寫入。")
         elif figure.extraction_status != fx.EXTRACTION_COMPLETE or figure.payload is None:
             raise fx.FigureExtractionError(
                 f"{where}: extraction_status={figure.extraction_status!r}、"
@@ -1468,7 +1600,7 @@ def _plan_page_replacements(fx, filename, plan, results, by_fid, page_texts):
     raw markdown 文字（terminal 的 native 正文）。漏掉後者就會讓原始 log 與
     structured chunk 同時留在 KB。
 
-    回傳 `(eligible, dropped, page_items, retained_bboxes)`。
+    回傳 `(eligible, dropped, page_items)`。
 
     **座標單位是「候選自己的 (page, bbox)」**：T3 的候選是 physical 的——同一份內容
     出現在第 1、2 頁就是**兩個**候選，各自有自己的 `pos`，只共享 VL 計算。拿共享的
@@ -1484,7 +1616,6 @@ def _plan_page_replacements(fx, filename, plan, results, by_fid, page_texts):
                        for c in plan.candidates}
     eligible, dropped = [], []
     page_items: Dict[int, List] = {}
-    retained: Dict[int, List] = {}
     pending: Dict[str, tuple] = {}
     problems: Dict[str, str] = {}
     groups: Dict[tuple, List[str]] = {}
@@ -1551,7 +1682,6 @@ def _plan_page_replacements(fx, filename, plan, results, by_fid, page_texts):
               f"保留{what}（不重複入庫）", flush=True)
         dropped.append(_with_reason(
             figure, "no_pos_cannot_replace", f"{filename} figure={figure.figure_id}: {problem}"))
-        retained.setdefault(int(figure.page), []).append(tuple(figure.bbox))
 
     for figure_id, (figure, page, pos, native_kind, _group) in list(pending.items()):
         if figure_id in problems:
@@ -1588,39 +1718,7 @@ def _plan_page_replacements(fx, filename, plan, results, by_fid, page_texts):
 
     for figure, _page, _pos, _native_kind, _group in pending.values():
         eligible.append(figure)
-    return eligible, dropped, page_items, retained
-
-
-def _skip_covered_figure_jobs(jobs: List[Dict], covered: Dict[int, List]) -> List[Dict]:
-    """已被 structured 候選（或保留原 markdown 的表）覆蓋的 picture 框不再送 VL。
-
-    **只作用在 `mode == "crop"`**：`mode == "page"` 是整頁 render，不是「那個 picture
-    框」，跳掉會連整頁其他內容一起丟。`_plan_pdf_figure_jobs` 的規劃結果一個字都不改
-    （含 figure_index 編號），過濾發生在呼叫端（契約 §0.1 逐位元組保留）。
-
-    判定用 `_job_covered_by()`：IoU 等價**或**這個 crop 幾乎整塊落在候選內。只看 IoU
-    的話，結構化 lane 把數十個 picture 子框聚成一個大候選之後，每個子框都會被 legacy
-    再 render 一次（同一塊內容入庫兩份）。
-
-    已知限制：legacy 的 bbox 來自 `page_boxes`（可能是 rotated space），
-    `Candidate.bbox` 是 unrotated space；旋轉頁上兩個判定都會算成 0 而跳不掉。
-    """
-    if not covered:
-        return jobs
-    threshold = _iou_threshold()
-    kept = []
-    for job in jobs:
-        if job["mode"] == "crop" and any(
-            _job_covered_by(job["bbox"], box, threshold)
-            for box in covered.get(job["page"], ())
-        ):
-            print(f"  [INFO] 第 {job['page']} 頁 圖 {job['figure_index']} "
-                  f"已由結構化 lane 收錄（IoU >= {threshold} 或"
-                  f"覆蓋率 >= {FIGURE_JOB_COVERED_BY_CANDIDATE}），既有圖面路徑跳過",
-                  flush=True)
-            continue
-        kept.append(job)
-    return kept
+    return eligible, dropped, page_items
 
 
 def _assert_source_identity(fx, filename: str, source_path, root_path, expected: str, *,
@@ -1699,7 +1797,6 @@ def _format_failed_figures(failed: List) -> str:
 
 def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict], *,
                                 root: Optional[str], preflight_only: bool,
-                                legacy_jobs: List[Dict], legacy_max_fig: Dict[int, int],
                                 kb_path=None, source_identity: Optional[str] = None) -> Dict:
     """契約 §6.7 的步驟 2–7（合格性判定），一次做完。
 
@@ -1709,14 +1806,14 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
     """
     inactive = {"active": False, "preflight_only": False, "figures": [],
                 "failed_figures": [], "failed_summary": "",
-                "replacements": {}, "page_source": {}, "covered": {},
-                "evidence_ref": {}, "guard": None}
+                "replacements": {}, "page_source": {},
+                "evidence_ref": {}, "guard": None, "absent": []}
     root_path = _figure_root(root)
     source_path = Path(file_path)
     if source_identity is not None:
-        # **不論 structured lane 有沒有啟動**都要帶 guard：text-only / legacy-only 的
-        # PDF 一樣會產生文字 chunk 與 legacy 圖面 chunk，來源在中途被換掉時，同一份 KB
-        # 就會混進 A 版文字與 B 版圖面（契約 §18.2）。`human_baseline=None` 表示這條
+        # **不論 structured lane 有沒有啟動**都要帶 guard：lane 沒啟動的 PDF 一樣會
+        # 產生文字 chunk，來源在中途被換掉時，同一份 KB 就會混進 A 版文字與 B 版
+        # figure（契約 §18.2）。`human_baseline=None` 表示這條
         # 路徑沒有讀過人工確認基線，提交前只驗來源身分。
         inactive = {**inactive, "guard": {
             "root": str(root_path),
@@ -1735,19 +1832,27 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
         # 呼叫端沒指定就用專案預設的知識庫（`mcp_server.ingest_document` 也是這一份）。
         kb_path = root_path / getattr(config_module, "KNOWLEDGE_FILE", "knowledge.json")
 
-    def _blocked(message: str) -> Dict:
+    def _blocked(message: str, slug: str) -> Dict:
         print(f"  [INFO] {message}", flush=True)
         if preflight_only:
             raise PdfPreflightUnavailable(
                 f"{filename}: 無法產生 figure preflight 報告——{message}")
-        return inactive
+        # lane 沒啟動＝這份 PDF 的圖一張都不會進 KB。只在**上游真的宣稱有圖**時列帳：
+        # 純文字 PDF 每次都印一句「圖沒進去」就是罐頭提示，使用者會學會跳過整段。
+        return {**inactive, "absent": [
+            {"page": page, "bbox": None, "channel": "page",
+             "reason": f"structured_lane_inactive:{slug}"}
+            for page in _pdf_picture_pages(pages)
+        ]}
 
     if not source_path.is_file():
-        return _blocked("沒有實體檔案（stub / 測試路徑），PDF 結構化 figure lane 不啟動")
+        return _blocked("沒有實體檔案（stub / 測試路徑），PDF 結構化 figure lane 不啟動",
+                        "no_source_file")
     if not _path_within(source_path, root_path):
         return _blocked(
             f"{filename} 不在專案根 {root_path} 內，無法建立 document identity"
-            "（契約 §2.5），PDF 結構化 figure lane 不啟動；圖面仍走既有路徑")
+            "（契約 §2.5），PDF 結構化 figure lane 不啟動；該檔的圖不會進知識庫",
+            "outside_root")
 
     fx = _figure_extract()
     try:
@@ -1783,18 +1888,17 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             print(f"[ERROR] {filename} figure preflight 超出上限："
                   "未呼叫任何 VL、未算 embedding、未寫入 knowledge.json。", flush=True)
             print(fx.format_preflight_report(plan), flush=True)
-            print(_format_legacy_vl_estimate(fx, plan, legacy_jobs), flush=True)
             print(hint, flush=True)
             raise fx.FigureBudgetError(f"{exc}\n{hint}") from exc
 
         if preflight_only:
             print(fx.format_preflight_report(plan), flush=True)
-            print(_format_legacy_vl_estimate(fx, plan, legacy_jobs), flush=True)
             return {**inactive, "active": True, "preflight_only": True}
 
-        candidates = _structured_candidates(fx, plan)
+        candidates, filtered_absent = _structured_candidates(fx, plan)
         if not candidates:
-            return inactive
+            # 零候選也可能是「這頁的圖全部落在 lane 之外」，缺席帳照樣要交出去。
+            return {**inactive, "absent": _absent_from_plan(plan, filtered_absent)}
         if not plan.document_id:
             # T3 對「身分建立不了」的降級 plan 會回零候選；真走到這裡代表契約破了，
             # 而空 document_id 會一路帶到 chunk 與 artifact 目錄上。
@@ -1872,6 +1976,7 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
         # 拋錯時成立。
         results = []
         failed_figures: List = []
+        skipped_figures: List = []
         try:
             extracted = list(fx.extract_document_figures(
                 plan, pdf_doc=pdf_doc, page_evidence=plan.page_evidence,
@@ -1884,7 +1989,12 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             # 一一對應驗證是唯一的例外——它要看的是「每張候選都有交代」，所以吃未拆的
             # 完整 list。
             failed_figures = [figure for figure in extracted
-                              if figure.extraction_status != fx.EXTRACTION_COMPLETE]
+                              if figure.extraction_status == fx.EXTRACTION_FAILED]
+            # 「不是圖面」與「抽壞了」要分開：前者沒有下一步（封面 / logo / 照片），
+            # 混進 failed 會讓每份 PDF 的通知都掛著幾筆假警報，真的抽壞的那幾張
+            # 就淹在裡面。兩者都不進 KB，但只有 failed 進待覆核與通知。
+            skipped_figures = [figure for figure in extracted
+                               if figure.extraction_status == fx.EXTRACTION_SKIPPED]
             results = [figure for figure in extracted
                        if figure.extraction_status == fx.EXTRACTION_COMPLETE]
 
@@ -1920,34 +2030,41 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
                 partial.append(failed)
             if not partial:
                 # post-validation 失敗時 extractor 沒有掛 partial，用它回的那批
-                partial = list(results) + list(failed_figures)
+                partial = list(results) + list(failed_figures) + list(skipped_figures)
             _write_failed(partial)
             raise
 
         page_texts = _first_page_texts(pages)
-        eligible, dropped, page_items, retained = _plan_page_replacements(
+        eligible, dropped, page_items = _plan_page_replacements(
             fx, filename, plan, results, by_fid, page_texts)
 
         # figure_index 的最終編號要在**寫 artifact 之前**完成：manifest 記 T4 的內部
-        # 序號、KB/REF 記加了 legacy offset 之後的序號，覆核的人與檢索就會用到兩套
+        # 序號、KB/REF 記另一套序號，覆核的人與檢索就會用到兩套
         # 身分（同一張圖在 manifest 是 1、在 REF 是 2）。
         sequence: Dict[int, int] = {}
         numbered_eligible = []
         for figure in sorted(eligible, key=lambda f: (f.page, f.figure_index)):
             page = int(figure.page)
-            sequence[page] = max(sequence.get(page, 0), legacy_max_fig.get(page, 0)) + 1
+            sequence[page] = sequence.get(page, 0) + 1
             numbered_eligible.append(_dc_replace(figure, figure_index=sequence[page]))
         numbered_dropped = []
         for figure in sorted(dropped, key=lambda f: (f.page, f.figure_index)):
             page = int(figure.page)
-            sequence[page] = max(sequence.get(page, 0), legacy_max_fig.get(page, 0)) + 1
+            sequence[page] = sequence.get(page, 0) + 1
             numbered_dropped.append(_dc_replace(figure, figure_index=sequence[page]))
         # 抽壞的那幾張排在最後編號：它們不進 KB，不該把已入庫那幾張的頁內序號往後推。
         numbered_failed = []
         for figure in sorted(failed_figures, key=lambda f: (f.page, f.figure_index)):
             page = int(figure.page)
-            sequence[page] = max(sequence.get(page, 0), legacy_max_fig.get(page, 0)) + 1
+            sequence[page] = sequence.get(page, 0) + 1
             numbered_failed.append(_dc_replace(figure, figure_index=sequence[page]))
+        # 判定不是圖面的排在最後：它們不進 KB、不進待覆核，但要留在 manifest 裡，
+        # 「這張圖去哪了」才查得到。
+        numbered_skipped = []
+        for figure in sorted(skipped_figures, key=lambda f: (f.page, f.figure_index)):
+            page = int(figure.page)
+            sequence[page] = sequence.get(page, 0) + 1
+            numbered_skipped.append(_dc_replace(figure, figure_index=sequence[page]))
         failed_summary = _format_failed_figures(numbered_failed)
         if failed_summary:
             _progress(failed_summary)
@@ -1958,7 +2075,8 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
 
         manifest = fx.write_run_artifacts(
             root_path, document_id=document_id, run_id=run_id,
-            figures=numbered_eligible + numbered_dropped + numbered_failed,
+            figures=(numbered_eligible + numbered_dropped + numbered_failed
+                     + numbered_skipped),
             variants=rendered, failed=False,
             preflight=plan.preflight, stats=plan.stats,
             source_signatures=source_signatures, review_assets=review_assets,
@@ -1982,21 +2100,6 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
                 for start_pos, end_pos, _figure_id, text in items
             ]
 
-        # 候選是 physical 的（每個實體位置一個候選），所以壓 legacy crop 也只看
-        # 該 figure 自己的 (page, bbox)；別頁的同一張圖有它自己的 figure 去壓。
-        covered: Dict[int, List] = {}
-        for figure in numbered_eligible:
-            covered.setdefault(int(figure.page), []).append(tuple(figure.bbox))
-        for figure in numbered_failed:
-            # 抽壞的那一張也要壓掉 legacy crop：不壓的話 `_pdf_figure_chunks` 會撿起
-            # 同一個框做自由文字描述，等於用「看圖說故事」補上 structured lane 明明
-            # 判定為不可信的內容。缺席就是缺席。
-            covered.setdefault(int(figure.page), []).append(tuple(figure.bbox))
-        for page, boxes in retained.items():
-            # 保留原 markdown 的表也要壓掉 legacy crop：文字層已經有那張表，
-            # 再產一份自由文字描述就是第二個互相競爭的版本
-            covered.setdefault(page, []).extend(boxes)
-
         return {
             "active": True,
             "preflight_only": False,
@@ -2009,7 +2112,13 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             # 套替換前要確認「當初算 pos 的那份文字」與現在手上這份是同一個字串，
             # 畸形 metadata 讓兩個 page dict 撞同一頁碼時才不會切錯位置
             "page_source": {page: page_texts[page] for page in replacements},
-            "covered": covered,
+            # 有東西、卻沒有經過這條 lane 進 KB 的頁與區域（頁碼 / bbox / 固定 slug）。
+            "absent": _absent_from_plan(plan, filtered_absent + [
+                {"page": int(figure.page),
+                 "bbox": [float(v) for v in figure.bbox],
+                 "channel": "candidate", "reason": "raster_not_a_figure"}
+                for figure in numbered_skipped
+            ]),
             "evidence_ref": {figure.figure_id: evidence_ref for figure in numbered_eligible},
             "guard": {
                 "root": str(root_path),
@@ -2044,20 +2153,21 @@ def extract_pdf_document(file_path: str, *, preflight_only: bool = False,
     raw_text 並記下頁 span——章節範圍因此是文件級的，不再受制於「這一頁看得
     到哪些標題」。
 
-    兩條互不承接的 figure lane（契約 §0.1 / §13.1）：
+    圖面只有**一條** lane（2026-08-30 起；契約 §0.1 / §13.1）：有結構性原生證據的
+    候選，以及夠大的純 raster / picture 候選，一律走 **structured lane**——raster 先
+    依圖片分類成 table / terminal / prose / diagram（或「不是圖面」而跳過），再產生
+    canonical JSON payload 與 `origin="figure_*"`。schema / validator 失敗一律
+    `FigureExtractionError`，**不降級成自由文字**（workflow §7）。
 
-      - **legacy 圖面路徑**：只處理沒有被 structured 候選覆蓋的舊
-        `class=picture` job，產生自由文字 `origin="diagram"` chunk。
-      - **structured lane**：有結構性原生證據的候選，以及夠大的純 raster / picture
-        候選。raster 先依圖片分類成 table / terminal / diagram，再產生 canonical
-        JSON payload與 `origin="figure_table"` / `"figure_terminal"` /
-        `"figure_diagram"`。schema / validator 失敗一律 `FigureExtractionError`，
-        **不降級成自由文字**（workflow §7）。
+    structured lane 沒收的頁與區域就是**缺席**：不入庫、不做自由文字描述，改由
+    `format_absent_regions()` 與 ingest 摘要逐筆列出頁碼、bbox 與原因。以前那條
+    legacy 自由文字 lane（`origin="diagram"`）已經移除——它沒有 ▯、沒有 review
+    artifact、沒有 evidence_ref，事後從 KB 與摘要都看不出「這段是看圖說故事」。
 
     `FigureBudgetError` / `FigureCapabilityError` / `FigureExtractionError` /
-    `FigureValidationError` 全部在 `_commit_document_to_kb` 之前拋出，所以與
-    `PdfFigureError` 一樣是「整份文件零寫入」；這與「PDF 本身打不開 → 回空
-    document」的既有語意刻意不同：前者是圖會無聲消失的部分成功，後者是整份明顯失敗。
+    `FigureValidationError` 全部在 `_commit_document_to_kb` 之前拋出，所以是「整份
+    文件零寫入」；這與「PDF 本身打不開 → 回空 document」的既有語意刻意不同：
+    前者是圖會無聲消失的部分成功，後者是整份明顯失敗。
 
     `preflight_only=True` 只跑到預算計算並印報告，**零寫入、零 VL、零 embedding**；
     算不出報告（PDF 解析失敗、結構化 lane 未啟動）時 raise `PdfPreflightUnavailable`
@@ -2107,21 +2217,9 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
     # 根據文件類型取得 chunk 設定
     chunk_size, chunk_overlap = get_chunk_settings(doc_type)
 
-    # 內嵌圖逐頁分流：哪些頁整頁 render、哪些 picture 框逐一 crop。
-    # **一定要吃未經 partition 的 pages**：它用該頁文字長度決定整頁 render vs crop，
-    # 餵改過的文字進去會讓既有分流規則悄悄變樣（契約 §0.1 逐位元組保留）。
-    figure_jobs, figure_stats = _plan_pdf_figure_jobs(pages)
-    # structured chunk 的頁內序號接在 legacy 之後。用「規劃出來的最大 figure_index」
-    # 而非實際產出的 chunk 數：去重 / IoU 跳過都不會讓 structured 編號回頭撞到 legacy。
-    legacy_max_fig: Dict[int, int] = {}
-    for job in figure_jobs:
-        legacy_max_fig[job["page"]] = max(
-            legacy_max_fig.get(job["page"], 0), job["figure_index"])
-
     lane = _run_structured_figure_lane(
         file_path, filename, pages,
-        root=root, preflight_only=preflight_only, legacy_jobs=figure_jobs,
-        legacy_max_fig=legacy_max_fig, kb_path=kb_path,
+        root=root, preflight_only=preflight_only, kb_path=kb_path,
         source_identity=source_identity,
     )
     if preflight_only:
@@ -2135,6 +2233,54 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
     text_chunk_counts: Dict[int, int] = {}
     offset = 0  # 下一頁在 raw_text 中的起點
     pending_replacements = dict(lane["replacements"])
+    # 這次 ingest **有內容、但沒有進 KB** 的頁與區域。提交點的摘要靠它講「少了什麼」。
+    absent: List[Dict] = list(lane["absent"])
+    # 旋轉頁正文退路的兩個懶開 handle（`None` 未開、`False` 開不起來）：
+    #   probe_doc  — 路徑開檔，只讀 `page.rotation`（便宜；空白頁很常見）
+    #   stream_doc — bytes 開檔，只在**真的有旋轉頁**時才建（見 `_open_pdf_from_bytes`）
+    probe_doc: List = [None]
+    stream_doc: List = [None]
+
+    def _lazy_open(holder: List, opener, what: str):
+        if holder[0] is None:
+            try:
+                holder[0] = opener(file_path)
+            except Exception as exc:  # noqa: BLE001 — 退路失敗只降級成「列帳」
+                holder[0] = False
+                print(f"  [WARN] {filename}: 開不了 PDF 做{what}: {exc}", flush=True)
+        return holder[0]
+
+    def _recover_page_text(page_number: int) -> str:
+        """markdown 交白卷的頁的正文退路；抽不出來就記進 absent 帳（不 raise）。"""
+        probe = _lazy_open(probe_doc, _open_pdf_document, "旋轉頁偵測")
+        if not probe:
+            return ""
+        try:
+            rotation = _pdf_page_rotation(probe, page_number)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [WARN] {filename}: 第 {page_number} 頁讀不到 rotation: {exc}",
+                  flush=True)
+            return ""
+        if not rotation:
+            # rotation == 0 卻沒有 markdown 的頁就是真的沒有文字層（掃描頁 / 空白頁）。
+            # 再抽一次只會得到同一個空字串，而「有圖沒文字」由 figure 那條帳處理。
+            return ""
+        recovered = ""
+        stream = _lazy_open(stream_doc, _open_pdf_from_bytes, "旋轉頁正文退路")
+        if stream:
+            try:
+                recovered = _pdf_unrotated_page_markdown(stream, page_number)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  [WARN] {filename}: 第 {page_number} 頁正文退路失敗: {exc}",
+                      flush=True)
+        if not recovered.strip():
+            absent.append({"page": page_number, "bbox": None,
+                           "reason": f"rotated_{rotation}_text_unavailable",
+                           "channel": "text"})
+            return ""
+        print(f"  [INFO] {filename}: 第 {page_number} 頁旋轉 {rotation}°，"
+              "上游 markdown 為空；已把 /Rotate 歸零後重抽正文", flush=True)
+        return recovered
 
     for page_info in pages:
         page_num = _pdf_page_number(page_info.get('metadata'))
@@ -2155,6 +2301,11 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
 
         content = raw_page_text.strip()
 
+        if not content:
+            # `pieces` 非空代表這一頁本來就有原文（pos 算得出來），不可能走到這裡；
+            # 真走到就是 partition 把整頁吃掉了，退路會拿回**未經 partition** 的
+            # 文字，讓被 structured chunk 收錄的表再出現一次。寧可缺席。
+            content = "" if pieces else _recover_page_text(page_num).strip()
         if not content:
             continue
 
@@ -2197,6 +2348,13 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
         page_texts.append(page_text)
         offset += len(page_text) + len(PAGE_SEPARATOR)
 
+    for holder in (probe_doc, stream_doc):
+        # 退路 handle 用完就關：stream_doc 在記憶體裡改過 /Rotate，留著只會讓誰誤用。
+        if holder[0]:
+            with contextlib.suppress(Exception):
+                holder[0].close()
+        holder[0] = False
+
     if pending_replacements:
         # 有 structured chunk 要取代的表，但那一頁根本沒被走訪到 → 原表會留在別處
         raise _figure_extract().FigureExtractionError(
@@ -2218,24 +2376,7 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
     document.assign_section_indices()
     document.apply_section_titles()
     setattr(document, _FIGURE_PRUNE_ATTR, lane["guard"])
-
-    # 內嵌圖 → VL → diagram chunks（hard fail：任何一張失敗，整份文件不入庫）
-    if figure_stats["skipped_small"]:
-        print(f"  [INFO] {figure_stats['skipped_small']} 個過小 picture 框"
-              f"（圖示/項目符號/分隔線類，短邊 <{PDF_FIGURE_MIN_SIDE_PT}pt 或"
-              f"面積 <{PDF_FIGURE_MIN_AREA_PT2}pt²）不送 VL")
-    if figure_stats["degraded_pages"]:
-        pages_str = ", ".join(str(p) for p in figure_stats["degraded_pages"])
-        print(f"  [INFO] 第 {pages_str} 頁偵測到內嵌圖但缺 bbox（舊 schema），"
-              "降級為整頁 render——寧可多看，不無聲丟圖")
-    if figure_stats["dropped_tiny_only_pages"]:
-        pages_str = ", ".join(str(p) for p in figure_stats["dropped_tiny_only_pages"])
-        print(f"  [INFO] 第 {pages_str} 頁只有過小影像、幾乎沒有文字，未送 VL")
-    figure_jobs = _skip_covered_figure_jobs(figure_jobs, lane["covered"])
-    if figure_jobs:
-        document.chunks.extend(
-            _pdf_figure_chunks(file_path, filename, figure_jobs, text_chunk_counts)
-        )
+    setattr(document, _ABSENT_ATTR, absent)
 
     if lane["figures"]:
         before = len(document.chunks)
@@ -2247,6 +2388,9 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
             doc_type=doc_type,
             next_chunk_index=text_chunk_counts,
             evidence_ref_by_figure=lane["evidence_ref"],
+            # caption / 章節在**文字 chunk 都建好之後**才算得出來：它們的座標系是
+            # 文件級 raw_text 的 offset，而那份 raw_text 就是上面那個迴圈拼出來的。
+            context_by_figure=_figure_retrieval_context(document, numbered),
         ))
         print(f"[INFO] 結構化 figure 入庫: {len(numbered)} 張 → "
               f"{len(document.chunks) - before} 個 structured chunk", flush=True)
@@ -2254,6 +2398,9 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
         # 品質失敗只讓那一張缺席，ingest 仍然 exit 0——所以「少了哪幾張」必須自己
         # 說出來，否則使用者只會看到一個比預期少的 chunk 數。
         print(lane["failed_summary"], flush=True)
+    absent_summary = format_absent_regions(filename, absent)
+    if absent_summary:
+        print(absent_summary, flush=True)
     return document
 
 
@@ -2263,16 +2410,8 @@ def extract_pdf(file_path: str) -> List[Dict]:
 
 
 # ============================================================
-# PDF 內嵌圖 → VL 自動入庫
+# PDF 逐頁抽取的輔助
 # ============================================================
-class PdfFigureError(RuntimeError):
-    """PDF 內嵌圖 render / VL 失敗（hard fail：整份文件不入庫、零寫入）。
-
-    訊息一律帶檔案、頁碼、figure 索引與底層原始錯誤——失敗要能直接定位到
-    是哪一張圖、哪一端出的問題。
-    """
-
-
 def _pdf_page_number(meta: Optional[Dict]) -> int:
     """pymupdf4llm 頁碼相容 helper（唯一定義）。
 
@@ -2286,229 +2425,67 @@ def _pdf_page_number(meta: Optional[Dict]) -> int:
     return int(page_num)
 
 
-def _pdf_picture_bboxes(page_info: Dict) -> List[Optional[Tuple[float, float, float, float]]]:
-    """一頁裡所有內嵌圖的 bbox（pt 座標）。
+def _pdf_page_rotation(pdf_doc, page_number: int) -> int:
+    """第 page_number 頁的 /Rotate；超出範圍回 0。"""
+    index = page_number - 1
+    if index < 0 or index >= int(pdf_doc.page_count):
+        return 0
+    return int(getattr(pdf_doc[index], "rotation", 0) or 0)
 
-    新版 schema 在 page_boxes（class=picture、帶 bbox）；舊版在 images。
-    解析不出 bbox 的偵測結果回 None——呼叫端會降級整頁 render，絕不因為
-    讀不到框就讓那張圖無聲消失。
+
+def _open_pdf_from_bytes(file_path: str):
+    """**從 bytes** 開同一份 PDF（旋轉頁正文退路專用）。
+
+    ⚠️ 釘版 pymupdf 1.28.0 / pymupdf4llm 1.28.0 實測的上游地雷：同一個**路徑**上跑過
+    一次 `to_markdown()` 之後，再 `pymupdf.open(<同一路徑>)`、把 /Rotate 歸零、對那一頁
+    重抽，`text` **恆為空字串**；改用 `pymupdf.open(stream=...)` 就正常。同一支程式裡
+    先抽別的檔不會有事——是路徑本身被記住了。（`page.get_text()` 在兩種情況下都拿得到
+    字，所以症狀只出現在 pymupdf4llm 這一層，不容易從 pymupdf 那邊看出來。）
+
+    退路是「正文救不救得回來」的最後一關，不能建立在這個行為上。用 bytes 開檔多讀一次
+    檔案，而整份 sha256（`_source_identity_snapshot`）本來每次 ingest 都會讀一次，
+    這不是新的成本量級。**只在真的有旋轉頁需要救時才呼叫。**
     """
-    def _bbox_of(entry) -> Optional[Tuple[float, float, float, float]]:
-        if not isinstance(entry, dict):
-            return None
-        raw = entry.get('bbox')
-        if raw is None:
-            return None
-        try:
-            x0, y0, x1, y1 = (float(v) for v in tuple(raw))
-        except (TypeError, ValueError):
-            return None
-        # 退化框（零寬/負向）保留原值：交給尺寸門檻過濾，不當成「缺 bbox」
-        return (x0, y0, x1, y1)
+    import pymupdf
 
-    pics = [b for b in page_info.get('page_boxes') or []
-            if isinstance(b, dict) and b.get('class') == 'picture']
-    if pics:
-        return [_bbox_of(b) for b in pics]
-    return [_bbox_of(e) for e in page_info.get('images') or []]
+    return pymupdf.open(stream=Path(file_path).read_bytes(), filetype="pdf")
 
 
-def _pdf_bbox_big_enough(bbox: Tuple[float, float, float, float]) -> bool:
-    """尺寸門檻：過小的 picture 框（圖示、項目符號、分隔線）不送 VL。"""
-    x0, y0, x1, y1 = bbox
-    width = x1 - x0
-    height = y1 - y0
-    return (min(width, height) >= PDF_FIGURE_MIN_SIDE_PT
-            and width * height >= PDF_FIGURE_MIN_AREA_PT2)
+def _pdf_unrotated_page_markdown(stream_doc, page_number: int) -> str:
+    """把 `stream_doc` 第 page_number 頁的 /Rotate 歸零後重抽 markdown。
 
+    釘版 pymupdf4llm 1.28.0 對 `rotation != 0` 的頁，`to_markdown(page_chunks=True)`
+    回的 `text` **恆為空字串**（上游限制，`figure_candidates` 檔頭已記載；同一頁
+    `page.get_text()` 有全文）。舊碼在 `if not content: continue` 直接跳過那一頁，
+    於是橫放的 register map / 大表頁整頁正文零 chunk、零 WARN、摘要零提示。
 
-def _plan_pdf_figure_jobs(pages: List[Dict]) -> Tuple[List[Dict], Dict]:
-    """逐頁分流：決定每頁怎麼 render 內嵌圖。
+    退路刻意**仍走 pymupdf4llm**，只是先把該頁的 /Rotate 歸零：`page.get_text()` 拿得到
+    字，但那是另一種形狀的文字（沒有標題、沒有 code fence），混進來會讓同一份 PDF 有
+    兩套切點。歸零後產出的 markdown 與其他頁逐字同一種形狀。
 
-    規則（依該頁文字長度與 picture 框）：
-      - 文字近乎 0（< PDF_PAGE_TEXT_NEAR_ZERO_CHARS）且有夠大的圖 → 整頁 render 一張
-      - 有文字 + 有 picture 框 → 每個夠大的框各 crop 一張
-      - 有文字 + 無 picture 框 → 純文字路徑，零 VL 成本
-    偵測到圖但 bbox 解析不出（舊 schema）→ 該頁降級整頁 render。
-
-    job：{"page", "figure_index"(頁內 1-based), "mode": "page"|"crop", "bbox"}。
-    figure_index 只對「會送 VL 的圖」編號，同頁多張以它區分。
+    **不寫檔、不共用別人的 handle**：structured lane 的 `pdf_doc` 拿 rotation 做座標
+    換算（`page.derotation_matrix`），在它身上歸零等於把整條幾何算錯。
     """
-    jobs: List[Dict] = []
-    stats: Dict = {
-        "skipped_small": 0,          # 過小、不送 VL 的框數
-        "degraded_pages": [],        # 缺 bbox、降級整頁 render 的頁
-        "dropped_tiny_only_pages": [],  # 幾乎沒文字、圖又全過小而整頁未送 VL 的頁
-    }
-    for page_info in pages:
-        page_num = _pdf_page_number(page_info.get('metadata'))
-        text_len = len((page_info.get('text') or '').strip())
-        bboxes = _pdf_picture_bboxes(page_info)
-        if not bboxes:
+    index = page_number - 1
+    if index < 0 or index >= int(stream_doc.page_count):
+        return ""
+    stream_doc[index].set_rotation(0)
+    produced = check_pymupdf4llm().to_markdown(
+        stream_doc, pages=[index], page_chunks=True, write_images=False)
+    for info in produced or []:
+        if not isinstance(info, dict):
             continue
-        known = [b for b in bboxes if b is not None]
-        missing_bbox = len(bboxes) - len(known)
-        passing = [b for b in known if _pdf_bbox_big_enough(b)]
-        stats["skipped_small"] += len(known) - len(passing)
-
-        if text_len < PDF_PAGE_TEXT_NEAR_ZERO_CHARS:
-            if passing or missing_bbox:
-                jobs.append({"page": page_num, "figure_index": 1,
-                             "mode": "page", "bbox": None})
-            else:
-                stats["dropped_tiny_only_pages"].append(page_num)
-        elif missing_bbox:
-            stats["degraded_pages"].append(page_num)
-            jobs.append({"page": page_num, "figure_index": 1,
-                         "mode": "page", "bbox": None})
-        else:
-            for k, bbox in enumerate(passing, 1):
-                jobs.append({"page": page_num, "figure_index": k,
-                             "mode": "crop", "bbox": bbox})
-    return jobs, stats
+        if _pdf_page_number(info.get("metadata")) != page_number:
+            # 上游若改了 `pages=` 的頁碼語義，硬用會把 A 頁的正文寫成 B 頁的 chunk。
+            continue
+        return str(info.get("text") or "")
+    return ""
 
 
 def _open_pdf_document(file_path: str):
     """render 用的 pymupdf 開檔（獨立函式：測試以假 renderer 取代）。"""
     import pymupdf  # pymupdf4llm 的相依，PDF 模式必然裝了
     return pymupdf.open(file_path)
-
-
-def _render_pdf_figure_png(pdf_doc, job: Dict) -> bytes:
-    """把一個 figure job render 成 PNG bytes。
-
-    解析度以 PDF_FIGURE_RENDER_DPI 為目標（VL 要能讀出圖中文字），最長邊
-    超過 PDF_FIGURE_MAX_SIDE_PX 時等比例降。crop 框先外擴到整數 pt 再與頁面
-    相交——量化讓同一張圖（頁首 logo）每頁 render 出逐位元組相同的 PNG，
-    內容 hash 去重才會生效。
-
-    失敗一律拋**原因**（ValueError），不自己拼檔案／頁碼／圖索引：那些由
-    `_pdf_figure_chunks` 統一包成 PdfFigureError。這裡自作主張拼一半，錯誤
-    訊息就會依失敗種類時有時無地缺欄位。
-    """
-    import math
-
-    import pymupdf
-
-    page_index = job["page"] - 1
-    if page_index < 0 or page_index >= pdf_doc.page_count:
-        raise ValueError(f"頁碼超出範圍（PDF 共 {pdf_doc.page_count} 頁）")
-    page = pdf_doc[page_index]
-
-    if job["mode"] == "page":
-        rect = page.rect
-        clip = None
-    else:
-        x0, y0, x1, y1 = job["bbox"]
-        rect = pymupdf.Rect(math.floor(x0), math.floor(y0),
-                            math.ceil(x1), math.ceil(y1))
-        rect.intersect(page.rect)
-        if rect.is_empty or rect.width < 2 or rect.height < 2:
-            raise ValueError(f"picture 框與頁面沒有有效交集（bbox={job['bbox']}）")
-        clip = rect
-
-    zoom = PDF_FIGURE_RENDER_DPI / 72.0
-    long_side = max(rect.width, rect.height)
-    if long_side * zoom > PDF_FIGURE_MAX_SIDE_PX:
-        zoom = PDF_FIGURE_MAX_SIDE_PX / long_side
-    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=clip, alpha=False)
-    if pix.width < 2 or pix.height < 2:
-        raise ValueError(f"render 結果過小（{pix.width}x{pix.height}px）")
-    return pix.tobytes("png")
-
-
-def _pdf_figure_chunks(
-    file_path: str,
-    filename: str,
-    jobs: List[Dict],
-    next_chunk_index: Dict[int, int],
-) -> List[Dict]:
-    """把 figure jobs 逐張 render → VL 抽述 → 切成 diagram chunks。
-
-    - 去重：以 render 出的 PNG 內容 hash 判定，同一張圖（頁首 logo、浮水印）
-      只送一次 VL，chunk 記錄首次出現的頁碼與 figure 索引。
-    - 進度：影像多的文件會明顯變慢，逐張印「第 N/M 張」與頁碼。
-    - 失敗（render / VL 連不上 / 逾時 / 回空）一律 raise PdfFigureError：
-      呼叫端在任何 KB 寫入之前，整份文件因此零寫入。
-    """
-    import base64
-
-    total = len(jobs)
-    n_page_renders = sum(1 for j in jobs if j["mode"] == "page")
-    n_crops = total - n_page_renders
-    print(f"[INFO] PDF 內嵌圖自動經 VL 入庫: 共 {total} 張"
-          f"（整頁 render {n_page_renders} 張、區塊 crop {n_crops} 張）", flush=True)
-
-    try:
-        pdf_doc = _open_pdf_document(file_path)
-    except Exception as exc:
-        raise PdfFigureError(
-            f"無法開啟 PDF 進行圖面 render: {filename}: {exc}"
-        ) from exc
-
-    figure_chunks: List[Dict] = []
-    seen: Dict[str, Tuple[int, int]] = {}  # PNG hash → (首見頁碼, figure_index)
-    dup_count = 0
-    try:
-        for n, job in enumerate(jobs, 1):
-            where = f"第 {job['page']} 頁 圖 {job['figure_index']}"
-            try:
-                png = _render_pdf_figure_png(pdf_doc, job)
-            except Exception as exc:
-                # 所有 render 失敗（含 helper 自己的前置檢查）都經這一條包裝，
-                # 定位資訊才不會依失敗種類而時有時無
-                raise PdfFigureError(
-                    f"內嵌圖 render 失敗: {filename} {where}"
-                    f"（第 {n}/{total} 張）: {exc}"
-                ) from exc
-
-            digest = hashlib.sha256(png).hexdigest()
-            if digest in seen:
-                first_page, first_fig = seen[digest]
-                dup_count += 1
-                print(f"  [{n}/{total}] {where}: 與第 {first_page} 頁 "
-                      f"圖 {first_fig} 內容相同，去重跳過", flush=True)
-                continue
-
-            label = "整頁" if job["mode"] == "page" else "區塊"
-            print(f"  [{n}/{total}] {where}（{label}）→ VL 分析中...", flush=True)
-            try:
-                description = _describe_technical_image_base64(
-                    base64.b64encode(png).decode("ascii"), "image/png"
-                )
-            except Exception as exc:
-                raise PdfFigureError(
-                    f"內嵌圖 VL 分析失敗: {filename} {where}（第 {n}/{total} 張）。"
-                    f"VL 端錯誤: {exc}。整份文件不入庫（零寫入）。"
-                ) from exc
-            seen[digest] = (job["page"], job["figure_index"])
-
-            # 與獨立圖片入庫同一份切法/型別（type=diagram → 檢索降權 0.8），
-            # 但 source 是 PDF 檔名：重灌/移除這份 PDF 時 figure chunk 一起走。
-            fig_doc = build_text_document(
-                description,
-                source=filename,
-                base_type='diagram',
-                doc_type='diagram',
-                page=job["page"],
-                extra={"origin": "diagram", "figure_index": job["figure_index"]},
-            )
-            if not fig_doc.chunks:
-                raise PdfFigureError(
-                    f"VL 描述切不出任何 chunk: {filename} {where}"
-                )
-            base = next_chunk_index.get(job["page"], 0)
-            for j, chunk in enumerate(fig_doc.chunks):
-                chunk["chunk_index"] = base + j
-            next_chunk_index[job["page"]] = base + len(fig_doc.chunks)
-            figure_chunks.extend(fig_doc.chunks)
-    finally:
-        with contextlib.suppress(Exception):
-            pdf_doc.close()
-
-    print(f"[INFO] 內嵌圖入庫完成: {total} 張 → {len(seen)} 張獨特"
-          f"（去重 {dup_count} 張）、{len(figure_chunks)} 個 diagram chunk", flush=True)
-    return figure_chunks
 
 
 def extract_text_file_document(file_path: str) -> ExtractedDocument:
@@ -3388,8 +3365,8 @@ def _assert_figure_guard(guard: Optional[Dict], kb: Dict) -> None:
     兩件事只能在鎖內驗，而且必須在寫回之前：
 
     1. **來源身分**：抽取期間（`to_markdown` → 圖面 render → embedding，可能是幾十
-       分鐘）來源檔可能被換掉。文字 chunk 來自舊版、structured figure 與 legacy 圖面
-       可能來自新版，混進同一份 KB 就是無法察覺的版本錯配。
+       分鐘）來源檔可能被換掉。文字 chunk 來自舊版、structured figure 可能來自新版，
+       混進同一份 KB 就是無法察覺的版本錯配。
     2. **人工修正的樂觀併發檢查**：carry-over 是在鎖外讀的。讀到 revision 3 之後、
        寫回之前，另一個 `review_figures fix` 可能已經提交 revision 4；這裡不擋的話
        我們會用 revision 3 覆蓋它，revision 倒退、人工成果無聲消失（§15.7 的單調性
@@ -3491,7 +3468,9 @@ def _finish_summary_payload(payload: Dict) -> Dict:
     """
     for list_key, total_key in (("review", "review_total"),
                                 ("unfixable", "unfixable_total"),
-                                ("failed", "failed_total")):
+                                ("failed", "failed_total"),
+                                (ingest_notify.ABSENT_KEY,
+                                 ingest_notify.ABSENT_TOTAL_KEY)):
         items = payload.get(list_key) or []
         payload[total_key] = len(items)
         payload[list_key] = items[:ingest_notify.MAX_PAYLOAD_ITEMS]
@@ -3551,6 +3530,14 @@ def _ingest_summary_line(document: ExtractedDocument, committed_chunks,
         "run_id": run_id,
         "status_counts": {},
         "review": [], "unfixable": [], "failed": [],
+        # 缺席清單走抽取端掛上來的那一份：提交點掃 KB 是看不到「沒進 KB 的東西」的。
+        ingest_notify.ABSENT_KEY: [
+            {"page": int(item.get("page") or 0),
+             "bbox": list(item["bbox"]) if item.get("bbox") else None,
+             "channel": str(item.get("channel") or ""),
+             "reason": str(item.get("reason") or "")}
+            for item in (getattr(document, _ABSENT_ATTR, None) or [])
+        ],
     }
 
     entries = None
@@ -3580,6 +3567,12 @@ def _ingest_summary_line(document: ExtractedDocument, committed_chunks,
         status = str(entry.get("verification_status") or "")
         item = _summary_item(entry)
         if not entry.get("in_kb"):
+            if str(entry.get("extraction_status") or "") == fx.EXTRACTION_SKIPPED:
+                # 分類器判定「不是圖面」（封面 / logo / 照片）：同樣沒進 KB，但它
+                # **不是抽取失敗**，也沒有任何下一步。報成失敗的話，每一份 datasheet
+                # 的通知都會掛著幾筆假警報，真的抽壞的那一張就淹在裡面。這一類只
+                # 出現在缺席帳（`absent`）與 review artifact 的「判定不是圖面」一節。
+                continue
             # **只算本次 run**：artifacts 裡還躺著以前那幾次的失敗，全算進來的話
             # 每次 ingest 都會重報同一批舊帳（「舊 run 零誤報」）。
             if not run_id or str(entry.get("run_id") or "") != run_id:
