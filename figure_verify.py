@@ -4703,16 +4703,35 @@ def _grid_normalized_variants(variants, ctx: dict) -> list:
     return normalized
 
 
-def _skipped_result(candidate, classification: dict, *, where: str) -> FigureResult:
+def _skipped_result(candidate, classification: dict, *, where: str,
+                    duplicate: dict | None = None) -> FigureResult:
     """分類器說「這不是圖面」：零 payload、零 chunk，但**留得下紀錄**。
 
     `extraction_status=skipped` 與 `failed` 刻意分開：封面 / logo / 照片不是抽壞了，
     把它們塞進 failed 會讓每一份 PDF 的通知都掛著幾筆「抽取失敗、請覆核」的假警報，
     而真的抽壞的那幾張就淹在裡面。`verification_status` 給 `unverified`——這一張沒有
     任何 payload 可信，但也沒有任何東西需要人去看。
+
+    **分類器確實把那張圖送進了模型**，所以 `model_input_variant` / `variants` 必須
+    如實宣告它（契約 §15.6）。宣稱 `variants=[]` 會讓 review.md 印出「無模型影像輸入
+    （原生結構抽取，零 VL 呼叫）」——那是假的，而且被誤判成 `none` 的圖從此沒有任何
+    影像可以事後檢查。`duplicate` 非空時這個 occurrence **沒有**送過模型，改掛
+    duplicate 哨兵並交叉引用真的送過的那一張。
     """
     bbox = tuple(getattr(candidate, "bbox", (0.0, 0.0, 0.0, 0.0)))
     page = int(getattr(candidate, "page", 1) or 1)
+    evidence: dict = {"lane": "vl", "raster_classification": dict(classification)}
+    if duplicate:
+        evidence["duplicate_of"] = duplicate["figure_id"]
+        evidence["duplicate_model_input"] = dict(duplicate)
+        variant_id = f"{DUPLICATE_VARIANT_PREFIX}{duplicate['figure_id']}"
+        variants: list[str] = []
+    else:
+        # 分類器讀的是 `classification["variant"]`（`_classify_raster_kind` 回填）。
+        # 真的拿不到 id 時退回哨兵——寧可說「無法定位那張影像」，也不要指一個
+        # 不存在的 variant 檔（writer 會在發布時才 fail，那時整份 PDF 已經跑完）。
+        variant_id = str(classification.get("variant") or "") or "skipped"
+        variants = [] if variant_id == "skipped" else [variant_id]
     return FigureResult(
         figure_id=getattr(candidate, "figure_id", ""),
         document_id=getattr(candidate, "document_id", ""),
@@ -4724,9 +4743,9 @@ def _skipped_result(candidate, classification: dict, *, where: str) -> FigureRes
         reasons=["raster_not_a_figure"],
         reason_details=[f"{where}: 分類器判定這不是資訊圖面（封面 / logo / 照片 / 裝飾），"
                         "不做抽取、不進 KB"],
-        evidence={"lane": "vl", "raster_classification": dict(classification)},
+        evidence=evidence,
         occurrences=_occurrences_for(candidate, page, bbox),
-        model_input_variant="skipped", variants=[],
+        model_input_variant=variant_id, variants=variants,
         row_total=None, line_total=None,
     )
 
@@ -4739,7 +4758,24 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
             # **分類完就停手**：不呼叫抽取、不產 payload、不佔覆核清單。
             print(f"  [INFO] {ctx.get('where', '')}: 分類為「不是圖面」，跳過抽取",
                   flush=True)
-            return _skipped_result(candidate, classification, where=ctx["where"])
+            result = _skipped_result(candidate, classification, where=ctx["where"])
+            # 同一張 logo 常出現在每一頁。planner 已經把 duplicate 的預算算成**零次
+            # VL**（`vl_share_key`），這條路徑不進 asset cache 的話，每個 occurrence
+            # 都會重跑一次分類——preflight 說 0、實際跑滿，而且同一張圖還可能在不同
+            # 頁得到不同分類。
+            if result.variants:
+                # 只在「代表 occurrence 真的有一份落盤的模型輸入」時才快取：沒有的話
+                # duplicate 就交叉引用不到任何真實影像，而那會在發布 manifest 時才
+                # fail——那時整份 PDF 已經跑完了。寧可讓那個退化情形多跑幾次分類。
+                ctx["asset_snapshot"] = {
+                    "kind": result.kind,
+                    "payload": None,
+                    "skipped": True,
+                    "raster_classification": dict(classification),
+                    "blockers": [], "notes": [],
+                    "disagreement": None, "repeatability": None, "stitch": None,
+                }
+            return result
         extraction_variants = (
             _grid_normalized_variants(variants, ctx)
             if resolved == figure_extract.KIND_TABLE else variants
@@ -4972,7 +5008,18 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
                 # payload / alignment 則走**解歧後**的 kind。先前只存解歧後的 kind，
                 # `unknown` 的重複候選因此永遠命不中——preflight 說第二筆 0 次，
                 # 實際卻又跑了一整輪 dual pass（實測 4 次）。
-                if cached is not None:
+                if cached is not None and cached.get("skipped"):
+                    # 「不是圖面」的重播：每個 occurrence 有自己的 figure_id / bbox /
+                    # occurrences，但都不送模型，交叉引用真的送過的那一張。
+                    counters["vl_calls_saved"] += 1
+                    result = _skipped_result(
+                        candidate,
+                        {**dict(cached.get("raster_classification") or {}),
+                         "duplicate_of": cached["figure_id"]},
+                        where=where,
+                        duplicate=_duplicate_reference(cached, candidate, where=where),
+                    )
+                elif cached is not None:
                     resolved = cached["resolved_kind"]
                     counters["vl_calls_saved"] += 1
                     findings = _Findings()

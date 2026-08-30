@@ -201,11 +201,20 @@ def bm25_document_text(chunk: Dict, *, use_ctx: bool) -> str:
 
 
 def reranker_passage(chunk: Dict, *, use_ctx: bool, max_chars: int) -> str:
-    """cross-encoder 的 document 側文本。"""
+    """cross-encoder 的 document 側文本。
+
+    caption 也要在這裡：reranker 預設永遠啟用，只進 embedding 與 BM25 的話，圖被
+    召回之後仍可能在 rerank 的 top-N 被丟掉——以表名提問還是查不到那張圖。
+    沒有 `figure_caption` 的 chunk 輸出逐位元組不變（既有 KB 的分數不得被動到）。
+    """
     source = chunk.get("source", "")
     section = chunk.get("section", "")
+    caption = str(chunk.get("figure_caption", "") or "").strip()
     content = str(chunk.get("content", ""))[:max_chars]
+    head = f"Source: {source}\nSection: {section}"
+    if caption:
+        head += f"\nCaption: {caption}"
     ctx = chunk_ctx(chunk) if use_ctx else ""
     if ctx:
-        return f"Source: {source}\nSection: {section}\nContext: {ctx}\n{content}"
-    return f"Source: {source}\nSection: {section}\n{content}"
+        return f"{head}\nContext: {ctx}\n{content}"
+    return f"{head}\n{content}"

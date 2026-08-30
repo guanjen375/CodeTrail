@@ -994,3 +994,21 @@ def test_audit_is_fatal_when_the_loader_cannot_be_imported(monkeypatch, tmp_path
 
     assert accepted is False
     assert "沒有被驗證" in reason
+
+
+def test_reranker_passage_carries_the_figure_caption():
+    """caption 也要進 cross-encoder 的 document 側。
+
+    reranker 預設永遠啟用：caption 只進 embedding 與 BM25 的話，圖被召回之後仍可能
+    在 rerank 的 top-N 被丟掉——以表名提問還是查不到那張圖。
+    """
+    chunk = _chunk("a", "原文內容")
+    chunk["figure_caption"] = "Table 3-1 Register map"
+
+    passage = context_signals.reranker_passage(chunk, use_ctx=False, max_chars=999)
+
+    assert "Table 3-1 Register map" in passage, passage
+    # 沒有 caption 的 chunk 逐位元組不變（既有 KB 的 rerank 分數不得被動到）
+    plain = _chunk("a", "原文內容")
+    assert context_signals.reranker_passage(plain, use_ctx=False, max_chars=999) == (
+        f"Source: {plain['source']}\nSection: {plain['section']}\n{plain['content']}")

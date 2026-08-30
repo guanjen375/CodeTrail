@@ -98,6 +98,10 @@ VERIFICATION_RANK = {
 
 # 舊 VL lane（自由文字視覺描述）與新的 structured figure lane。
 VL_ORIGINS = {"image", "screenshot", "diagram"}
+# 逐行 payload 家族（衍生文字的 scaffolding 完全相同：header + 動態 fence）。
+# 與 `figure_extract.LINE_KINDS` 是同一份事實，漂了是無聲的——`tests/
+# test_figure_retrieval.py` 有一條 smoke 比對兩邊相等。
+LINE_FIGURE_KINDS = frozenset({"terminal", "prose"})
 FIGURE_ORIGINS = frozenset({"figure_table", "figure_terminal", "figure_prose",
                             "figure_diagram"})
 
@@ -2720,7 +2724,7 @@ English:"""
         if not lines or not lines[0].startswith(_FIGURE_HEADER_PREFIX):
             return None
         kind = str(chunk.get("figure_kind", "") or "")
-        if kind == "terminal":
+        if kind in LINE_FIGURE_KINDS:
             if len(lines) >= 2 and _FENCE_RE.match(lines[1]):
                 return 2
             return None

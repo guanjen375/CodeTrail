@@ -2991,3 +2991,57 @@ def test_empty_payload_and_occupancy_mismatch_are_figure_level(
         assert listed[fid]["fixable"] is False
 
 
+
+
+@pytest.mark.smoke
+def test_payload_totals_covers_every_line_family_kind():
+    """★ 人工確認過的 prose 沿用回來時，`line_total` 不得被算成 None。
+
+    `build_figure_chunks` 對逐行家族 fail-closed 要求 `line_total`；沿用時算成 None
+    會讓**整份文件**被拒絕入庫——而觸發條件是「使用者做了正確的事（人工覆核）」。
+    """
+    lines = {"kind": figure_extract.KIND_PROSE,
+             "lines": [{"line_index": 1, "text": "a", "uncertain_spans": []},
+                       {"line_index": 2, "text": "b", "uncertain_spans": []}]}
+
+    assert RAG._payload_totals(figure_extract, lines, figure_extract.KIND_PROSE) == (None, 2)
+    assert RAG._payload_totals(
+        figure_extract, {**lines, "kind": figure_extract.KIND_TERMINAL},
+        figure_extract.KIND_TERMINAL) == (None, 2)
+
+
+@pytest.mark.smoke
+def test_not_a_figure_keeps_its_model_input_in_the_manifest(tmp_path: Path, monkeypatch):
+    """★ 判定「不是圖面」的那一張，manifest 仍要指得出分類器看過哪份影像。
+
+    分類器**確實**把圖送進了模型。宣稱 `variants=[]` 會讓 review.md 印出「無模型影像
+    輸入（原生結構抽取，零 VL 呼叫）」——那是假的，而且被誤判成 none 的封面/logo
+    從此沒有任何影像可以事後檢查是不是判錯了。
+    """
+    kb_path = _kb_ready(monkeypatch, tmp_path)
+    pdf, _harness_obj, (fid,) = _vl_case(tmp_path, monkeypatch, [
+        (1, BIG_BBOX_FOR_LANE, PNG_A, figure_extract.KIND_RASTER,
+         [{"class": "picture", "bbox": BIG_BBOX_FOR_LANE}]),
+    ])
+    _use_real_artifact_store(monkeypatch)
+    _use_real_vl_lane(monkeypatch, _FakeVL({
+        ("figure_raster_kind_v1", PNG_A): (json.dumps({"kind": "none"}), "stop"),
+    }))
+
+    RAG.add_document(str(pdf), str(kb_path))      # 不拋例外＝那一張缺席、其餘照常
+
+    chunks = _kb_chunks(kb_path)
+    assert not [c for c in chunks if c.get("structured")], "非圖面不得產生任何 chunk"
+    assert [c for c in chunks if not c.get("structured")], "文字 chunk 仍要入庫"
+
+    manifest, entry = _manifest_entry(_manifests(tmp_path)[-1], fid)
+    assert manifest["failed"] is False
+    assert entry["extraction_status"] == figure_extract.EXTRACTION_SKIPPED
+    assert entry["payload"] is None
+    assert entry["model_input_variant"] == "crop@200dpi", entry["model_input_variant"]
+    assert entry["variants"] == ["crop@200dpi"], entry["variants"]
+    assert entry["variant_paths"].get("crop@200dpi"), (
+        "分類器看過的那張影像必須真的落盤", entry["variant_paths"])
+    review = (_manifests(tmp_path)[-1].parent / "review.md").read_text(encoding="utf-8")
+    assert "零 VL 呼叫" not in review, review
+    assert "判定不是圖面" in review, review

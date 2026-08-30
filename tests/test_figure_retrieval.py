@@ -1045,3 +1045,28 @@ def test_flagged_structured_chunk_does_not_inherit_spec_weight(tmp_path: Path):
         config.SOURCE_TYPE_WEIGHTS["spec"]
     assert kb._get_source_weight(_plain_chunk("x", doc_type="diagram", origin="diagram")) == \
         config.SOURCE_TYPE_WEIGHTS["diagram"]
+
+
+@pytest.mark.smoke
+def test_prose_scaffolding_is_recognised_like_terminal():
+    """★ prose 的衍生文字與 terminal 同一種 scaffolding，截斷計畫必須認得。
+
+    認不出來就回 None：strict 會把它當成「連一行完整資料都沒顯示」而排除，一般查詢
+    則可能留下一個沒有關閉的 code fence。prose 是掃描頁最常見的 kind，這條漏掉等於
+    整批掃描件在 REF 裡都算不出顯示範圍。
+    """
+    lines = ["[FIGURE kind=prose id=fig_0123456789abcdef rev=1 page=2 lines=1-2/2 "
+             "status=unverified]", "```", "第一行", "第二行", "```"]
+
+    assert knowledge.KnowledgeBase._structured_scaffold_lines(
+        lines, {"figure_kind": "prose"}) == 2
+    assert knowledge.KnowledgeBase._structured_scaffold_lines(
+        lines, {"figure_kind": "terminal"}) == 2, "terminal 的既有行為不得改變"
+
+
+@pytest.mark.smoke
+def test_knowledge_line_family_matches_figure_extract():
+    """knowledge.py 的逐行家族副本必須與 figure_extract 相等（漂了是無聲的）。"""
+    import figure_extract
+
+    assert set(knowledge.LINE_FIGURE_KINDS) == set(figure_extract.LINE_KINDS)

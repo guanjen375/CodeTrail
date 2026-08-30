@@ -3024,3 +3024,49 @@ def test_raster_classified_as_prose_transcribes_lines_not_diagram(monkeypatch):
     assert [line["text"] for line in result.payload["lines"]] == [
         "3.2 Register Map", "", "The CTRL0 register controls the clock gate."], result.payload
     assert "figure_diagram" not in spy.schema_names(), spy.schema_names()
+
+
+@pytest.mark.smoke
+def test_not_a_figure_is_classified_once_across_duplicate_images(monkeypatch):
+    """★ 同一張 logo 出現在很多頁：分類只跑一次，其餘 occurrence 沿用。
+
+    planner 已經把 duplicate 的預算算成**零次 VL**（`vl_share_key`）。「不是圖面」
+    這條路徑若不進 asset cache，每個 occurrence 都會重跑一次分類——preflight 說 0、
+    實際跑滿，還可能同一張圖在不同頁得到不同分類。
+    """
+    spy = VLSpy({"figure_raster_kind_v1": raster_kind("none")})
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+    share = {"asset_digest": "digest-1", "requested_kind": figure_extract.KIND_RASTER}
+    candidates = [
+        candidate(kind=figure_extract.KIND_RASTER, page=4, seed="dup-a",
+                  signals={"native_lane": False, "vl_share_key": share}),
+        candidate(kind=figure_extract.KIND_RASTER, page=5, seed="dup-b",
+                  signals={"native_lane": False, "vl_share_key": share}),
+    ]
+
+    results = extract(candidates, {4: page_evidence(page=4), 5: page_evidence(page=5)})
+
+    assert len(spy.calls) == 1, f"分類跑了 {len(spy.calls)} 次，duplicate 沒有沿用"
+    assert len(results) == 2
+    assert all(r.extraction_status == figure_extract.EXTRACTION_SKIPPED for r in results), results
+    assert {r.page for r in results} == {4, 5}, "每個 occurrence 都要有自己的結果"
+
+
+@pytest.mark.smoke
+def test_skipped_result_records_the_image_the_classifier_actually_saw(monkeypatch):
+    """★ 分類器確實看過那張圖，manifest 不得說成「零 VL 呼叫」。
+
+    `variants=[]` + `model_input_variant="skipped"` 會讓 review.md 印出
+    「**無模型影像輸入**（原生結構抽取，零 VL 呼叫）」——那是假的，而且誤判成
+    `none` 的圖從此沒有任何影像可以事後檢查。
+    """
+    spy = VLSpy({"figure_raster_kind_v1": raster_kind("none")})
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+
+    result = extract([candidate(kind=figure_extract.KIND_RASTER)], {4: page_evidence()})[0]
+
+    assert result.extraction_status == figure_extract.EXTRACTION_SKIPPED
+    assert result.model_input_variant == "crop@200dpi", result.model_input_variant
+    assert list(result.variants) == ["crop@200dpi"], result.variants

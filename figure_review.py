@@ -1365,12 +1365,11 @@ def _figure_view(figure, position: int, *, document_id: str, failed: bool) -> di
                  f"{where}: extraction_status=failed 卻帶 payload"
                  "——沒抽出來的圖不得有 canonical 內容")
     if view["extraction_status"] == fx.EXTRACTION_SKIPPED:
-        # 「不是圖面」：沒有抽取，就不得有任何 canonical 內容或模型輸入宣稱。
+        # 「不是圖面」：沒有抽取，所以沒有 canonical 內容。但分類器**確實看過**那張
+        # 圖，`model_input_variant` 要指得出是哪一份——那份影像與 `variants` /
+        # `variant_paths` 的一致性由 `_validate_cross_entry_links()` 一體把關。
         _require(view["payload"] is None,
                  f"{where}: extraction_status=skipped 卻帶 payload")
-        _require(view["model_input_variant"] == "skipped",
-                 f"{where}: extraction_status=skipped 的 model_input_variant 必須是 "
-                 f"'skipped'，收到 {view['model_input_variant']!r}")
     bbox = _strict_bbox(view["bbox"], where=f"{where} 的 bbox")
     occurrences = view["occurrences"]
     _require(isinstance(occurrences, list) and occurrences,
@@ -2240,7 +2239,16 @@ _IMMUTABLE_CHUNK_FIELDS = (
     "source", "type", "figure_kind", "page", "bbox", "revision", "evidence_ref",
     "figure_index", "row_total", "line_total", "model_input_variant", "occurrences",
     "part_total",
+    # 檢索訊號（caption / 章節）：同一張圖的每個 part 一定相同，不一致代表有人只
+    # 改了一半——症狀是同一張表有些 part 找得到、有些找不到。
+    "figure_caption", "section", "heading_hierarchy",
 )
+
+# `apply_fix` 重建 chunk 時要原樣帶回去的檢索訊號。它們**不是** payload 的一部分
+# （來自鄰近文字層），所以人工修正不會改動它們；但不明確帶回去的話，
+# `build_figure_chunks` 會把三個欄位一起重設成空字串，向量也跟著照沒有 caption 的
+# 文本重算——使用者做了正確的事（覆核），檢索反而退步。
+_RETRIEVAL_CONTEXT_FIELDS = ("figure_caption", "section", "heading_hierarchy")
 
 
 def _empty_result(document_id: str, figure_id: str) -> dict:
@@ -2886,7 +2894,12 @@ def apply_fix(root, kb_path, *, document_id: str, figure_id: str, expected_revis
     next_index = {page: base}
     new_chunks = fx.build_figure_chunks(
         [view], source=source, doc_type=doc_type,
-        next_chunk_index=next_index, evidence_ref_by_figure={figure_id: evidence_ref})
+        next_chunk_index=next_index, evidence_ref_by_figure={figure_id: evidence_ref},
+        context_by_figure={figure_id: {
+            "caption": str(first.get("figure_caption", "") or ""),
+            "section": str(first.get("section", "") or ""),
+            "heading_hierarchy": str(first.get("heading_hierarchy", "") or ""),
+        }})
     _cross_check_parts(parts, new_chunks, kind=kind, where=where)
     for chunk in new_chunks:
         chunk["id"] = knowledge_store.chunk_id(chunk)

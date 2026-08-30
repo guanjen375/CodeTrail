@@ -817,11 +817,25 @@ def _figure_retrieval_context(document, figures) -> Dict[str, Dict[str, str]]:
     for figure in figures:
         by_page.setdefault(int(figure.page), []).append(figure)
 
+    def _anchor_offset(page: int) -> Optional[int]:
+        """這一頁在 raw_text 的定位點；證明不出來就回 None。
+
+        `page_spans` 只收「產出過文字」的頁，所以純圖片頁查不到 span。退回 offset 0
+        會讓那一頁所有 figure 都被標成**文件開頭那一節**——一個看起來完全正常、卻
+        指錯章節的檢索訊號。沿用前一頁**末端**的章節則是可證明的：沒有文字的頁不
+        可能開新的一節，所以那一節到這裡仍然有效。前面沒有任何有文字的頁時留空。
+        """
+        span = spans.get(page)
+        if span:
+            return span[0]
+        earlier = [end for number, (_start, end) in spans.items() if number < page]
+        return max(earlier) - 1 if earlier else None
+
     context: Dict[str, Dict[str, str]] = {}
     for page, page_figures in by_page.items():
         span = spans.get(page)
-        page_start = span[0] if span else 0
-        captions = _page_captions(raw[span[0]:span[1]], page_start) if span else []
+        anchor = _anchor_offset(page)
+        captions = _page_captions(raw[span[0]:span[1]], span[0]) if span else []
         page_figures.sort(key=lambda f: (float(f.bbox[1]), float(f.bbox[0])))
         for family in ("table", "figure"):
             group = [f for f in page_figures if _caption_family(str(f.kind)) == family]
@@ -837,8 +851,8 @@ def _figure_retrieval_context(document, figures) -> Dict[str, Dict[str, str]]:
         for figure in page_figures:
             context.setdefault(figure.figure_id, {
                 "caption": "",
-                "section": _section_at(page_start),
-                "heading_hierarchy": _heading_at(page_start),
+                "section": _section_at(anchor) if anchor is not None else "",
+                "heading_hierarchy": _heading_at(anchor) if anchor is not None else "",
             })
     return context
 
@@ -1176,7 +1190,8 @@ def _verify_results_match_candidates(fx, filename, plan, results) -> Dict[str, o
     `extraction_status` 只有三種合法形狀，其餘一律 hard fail：
     `complete` 必須帶 payload；`failed`（品質失敗、那一張不進 KB）必須是
     `payload=None` **且** `model_input_variant="failed"`；`skipped`（分類器判定不是
-    圖面）必須是 `payload=None` **且** `model_input_variant="skipped"`——半套的結果
+    圖面）必須是 `payload=None`，且 `model_input_variant` 指得出分類器看過的那一份
+    影像（或 duplicate 哨兵）——半套的結果
     （有 payload 卻宣稱 failed/skipped、或宣稱送過某個 variant）會讓 manifest 記下
     一張誰也說不清有沒有進 KB 的圖。
 
@@ -1232,13 +1247,15 @@ def _verify_results_match_candidates(fx, filename, plan, results) -> Dict[str, o
                     f"model_input_variant={figure.model_input_variant!r}"
                     "（應為 None / 'failed'）。整份文件零寫入。")
         elif figure.extraction_status == fx.EXTRACTION_SKIPPED:
-            # 「不是圖面」：分類完就停手，所以既沒有 payload、也沒有送過抽取 variant。
-            if figure.payload is not None or figure.model_input_variant != "skipped":
+            # 「不是圖面」：分類完就停手，所以沒有 payload。但**分類器確實看過那張
+            # 圖**，`model_input_variant` 要指得出是哪一份（或 duplicate 哨兵）——
+            # 宣稱「無模型輸入」會讓 manifest 說成零 VL，誤判的圖也就無從事後檢查。
+            if figure.payload is not None or not str(figure.model_input_variant or ""):
                 raise fx.FigureExtractionError(
                     f"{where}: extraction_status=skipped 卻帶 "
                     f"payload={'有' if figure.payload else '無'}、"
                     f"model_input_variant={figure.model_input_variant!r}"
-                    "（應為 None / 'skipped'）。整份文件零寫入。")
+                    "（應為 None / 非空 variant）。整份文件零寫入。")
         elif figure.extraction_status != fx.EXTRACTION_COMPLETE or figure.payload is None:
             raise fx.FigureExtractionError(
                 f"{where}: extraction_status={figure.extraction_status!r}、"
@@ -1433,7 +1450,7 @@ def _payload_totals(fx, payload: Dict, kind: str) -> Tuple[Optional[int], Option
     if kind == fx.KIND_TABLE:
         rows = payload.get("rows") or []
         return (rows[-1]["row_index"] if rows else 0), None
-    if kind == fx.KIND_TERMINAL:
+    if kind in fx.LINE_KINDS:
         lines = payload.get("lines") or []
         return None, (lines[-1]["line_index"] if lines else 0)
     return None, None
@@ -2001,9 +2018,12 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             # renderer 可能先產生原圖，verifier 再以同尺寸的衍生 variant 取代它做
             # structured extraction。只有 FigureResult.variants 宣告的 id 才真的送過
             # 模型；其餘 renderer 中間產物不准混進 variants/ 冒充模型輸入。
+            # skipped 也算數：分類器真的把那張圖送進了模型，影像必須留得下來，
+            # 否則被誤判成「不是圖面」的圖就沒有任何東西可以事後檢查。
             declared_inputs = {
                 (figure.figure_id, variant_id)
-                for figure in results for variant_id in (figure.variants or [])
+                for figure in results + skipped_figures
+                for variant_id in (figure.variants or [])
             }
             rendered[:] = [
                 variant for variant in rendered
@@ -2012,7 +2032,7 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             ]
 
             by_fid = _verify_results_match_candidates(fx, filename, plan, extracted)
-            _check_claimed_variants(fx, filename, results, rendered)
+            _check_claimed_variants(fx, filename, results + skipped_figures, rendered)
             # 契約 §15.7：extract_document_figures 之後、build_figure_chunks 之前，
             # 而且要在寫 manifest 之前（新 run 的 manifest 也要記到人工 payload）。
             results, human_verifications, human_baseline = _carry_over_human_verification(
@@ -3472,6 +3492,15 @@ def _finish_summary_payload(payload: Dict) -> Dict:
                                 (ingest_notify.ABSENT_KEY,
                                  ingest_notify.ABSENT_TOTAL_KEY)):
         items = payload.get(list_key) or []
+        if list_key == ingest_notify.ABSENT_KEY:
+            # 讀端要到 `render_action_block` 才過濾 actionable，所以**這裡先排**：
+            # 一份 datasheet 很容易有上百筆「這塊不是結構化圖面」，照原順序截到 50
+            # 筆的話，旋轉頁正文抽不出來這種真的要處理的那一筆就永遠到不了父行程。
+            # 穩定分割，兩邊各自維持原本的頁序。
+            items = ([item for item in items
+                      if ingest_notify.is_actionable_absent(item.get("reason"))]
+                     + [item for item in items
+                        if not ingest_notify.is_actionable_absent(item.get("reason"))])
         payload[total_key] = len(items)
         payload[list_key] = items[:ingest_notify.MAX_PAYLOAD_ITEMS]
     return payload

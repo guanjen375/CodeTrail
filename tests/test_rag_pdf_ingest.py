@@ -827,3 +827,37 @@ def test_marker_pattern_matches_the_real_marker_format():
     assert match is not None, marker
     assert match.group(1) == "fig_0123456789abcdef"
     assert match.group(2) == "7" and match.group(3) == "42"
+
+
+@pytest.mark.smoke
+def test_figure_on_a_textless_page_does_not_inherit_the_first_section():
+    """★ 沒有文字 span 的頁（純圖片頁）不得把 figure 掛到文件開頭那一節。
+
+    `page_spans` 只收「產出過文字」的頁，所以純圖片頁查不到 span。退回 offset 0 的話，
+    只要第一節從 0 開始，那一頁所有 figure 都會被標成第一節——一個看起來完全正常、
+    但指錯章節的檢索訊號。
+    """
+    import types
+
+    from extracted_document import ExtractedDocument, Section
+
+    raw = "# 1 Overview\n\nintro text\n\n# 7 Appendix\n\ntail text"
+    document = ExtractedDocument(
+        raw_text=raw,
+        sections=[Section(title="1 Overview", level=1, char_span=(0, 25)),
+                  Section(title="7 Appendix", level=1, char_span=(25, len(raw)))],
+        chunks=[],
+        source="spec.pdf",
+        # 第 1、2 頁有文字（分屬兩節），第 3 頁是純圖片頁（沒有 span）
+        page_spans=[(1, 0, 25), (2, 25, len(raw))],
+    )
+    figure = types.SimpleNamespace(page=3, bbox=(10.0, 20.0, 300.0, 400.0),
+                                   kind="diagram", figure_id="fig_00000000000000ff")
+
+    context = RAG._figure_retrieval_context(document, [figure])["fig_00000000000000ff"]
+
+    assert context["caption"] == ""
+    assert context["section"] != "1 Overview", (
+        "退回 offset 0 會讓純圖片頁的 figure 全部掛到文件開頭那一節")
+    assert context["section"] in ("", "7 Appendix"), (
+        f"沒有 span 的頁只能留空或沿用前一頁所在章節，實際 {context['section']!r}")

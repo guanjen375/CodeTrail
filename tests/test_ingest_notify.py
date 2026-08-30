@@ -706,3 +706,26 @@ def test_not_a_figure_is_never_reported_as_an_extraction_failure(monkeypatch):
     assert payload["failed_total"] == 1, payload["failed"]
     assert payload["failed"][0]["figure_id"] == "fig-bad"
     assert "fig-cover" not in json.dumps(payload)
+
+
+@pytest.mark.smoke
+def test_actionable_absence_survives_the_payload_truncation(monkeypatch):
+    """★ 缺席清單先截到 50 筆、之後才過濾 actionable → 通知會整個漏掉。
+
+    一份 datasheet 很容易有上百筆「這塊不是結構化圖面」的缺席；旋轉頁正文抽不出來
+    這種**真的要處理**的那一筆排在後面時，就永遠到不了父行程。
+    """
+    document = ExtractedDocument(raw_text="x", chunks=[], source="spec.pdf")
+    noise = [{"page": page, "bbox": [1.0, 2.0, 3.0, 4.0], "channel": "page_boxes:picture",
+              "reason": "picture_only"}
+             for page in range(1, ingest_notify.MAX_PAYLOAD_ITEMS + 10)]
+    setattr(document, RAG._ABSENT_ATTR, noise + [
+        {"page": 999, "bbox": None, "channel": "text",
+         "reason": "rotated_90_text_unavailable"}])
+
+    payload = ingest_notify.parse_summary_line(
+        RAG._ingest_summary_line(document, [], None))
+
+    assert payload["absent_total"] == len(noise) + 1
+    block = "\n".join(ingest_notify.render_action_block(payload))
+    assert "rotated_90_text_unavailable" in block, block

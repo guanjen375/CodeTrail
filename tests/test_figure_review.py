@@ -203,7 +203,7 @@ def make_variant(fig_id: str, variant_id="crop@200dpi", data=PNG, tile_index=0, 
 
 
 def seed(root: Path, *, payload=None, kind="table", ctx=False, status="unverified",
-         extra_text_chunks=1):
+         extra_text_chunks=1, context=None):
     """寫出 artifacts ＋ 一個真的 KB（走 RAG 的原子提交）。回傳 (doc_id, fig_id, ref, kb_path)。"""
     payload = payload if payload is not None else table_payload()
     doc_id = document_id(root)
@@ -219,7 +219,8 @@ def seed(root: Path, *, payload=None, kind="table", ctx=False, status="unverifie
     next_index = {3: 0}
     chunks = fx.build_figure_chunks([figure], source="spec.pdf", doc_type="spec",
                                     next_chunk_index=next_index,
-                                    evidence_ref_by_figure={fig_id: ref})
+                                    evidence_ref_by_figure={fig_id: ref},
+                                    context_by_figure=({fig_id: context} if context else None))
     for chunk in chunks:
         chunk["embedding"] = [1.0, 0.0]
         if ctx:
@@ -3229,3 +3230,33 @@ def test_a_local_crop_claiming_tile_total_one_cannot_pose_as_the_full_image(env)
         root, document_id=doc_id, run_id=fr.new_run_id(), figures=[figure], variants=[good])
     entry = json.loads(manifest_path.read_text(encoding="utf-8"))["figures"][0]
     assert (root / entry["asset_path"]).read_bytes() == good["png"]
+
+
+@pytest.mark.smoke
+def test_apply_fix_keeps_the_caption_and_section_retrieval_signals(env):
+    """★ 人工修正不得清掉 caption / 章節這些檢索訊號。
+
+    `apply_fix` 會重建 chunk 並重算向量。重建時若不把 `figure_caption` / `section` /
+    `heading_hierarchy` 帶回去，使用者一按 fix，以表名提問就再也命不中這張圖，而且
+    向量是照「沒有 caption」的文本重算的——狀態變成 human_verified、檢索卻退步了。
+    """
+    root, _outside = env
+    context = {"caption": "Table 3-1 Register map",
+               "section": "3.2 Registers",
+               "heading_hierarchy": "3 Control > 3.2 Registers"}
+    doc_id, fig_id, _ref, kb_path = seed(root, context=context)
+    before = RAG.load_knowledge_base(kb_path, _quiet=True)
+    assert {c.get("figure_caption") for c in before["chunks"] if c.get("structured")} == {
+        "Table 3-1 Register map"}, "測試前提：seed 出來的 chunk 真的帶 caption"
+
+    fr.apply_fix(root, kb_path, document_id=doc_id, figure_id=fig_id,
+                 expected_revision=1, payload=table_payload(rows=CORRECTED_ROWS),
+                 kind="table", confirm_against_image=True, rechunk=rechunk, embed=embed)
+
+    after = RAG.load_knowledge_base(kb_path, _quiet=True)
+    figure_chunks = [c for c in after["chunks"] if c.get("structured")]
+    assert figure_chunks
+    assert {c["figure_caption"] for c in figure_chunks} == {"Table 3-1 Register map"}
+    assert {c["section"] for c in figure_chunks} == {"3.2 Registers"}
+    assert {c["heading_hierarchy"] for c in figure_chunks} == {
+        "3 Control > 3.2 Registers"}
