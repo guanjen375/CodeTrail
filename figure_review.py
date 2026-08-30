@@ -2153,9 +2153,15 @@ def _render_review(manifest: dict) -> str:
                 out.append(
                     f"- **實際模型輸入**: 無（與 `{duplicate_of}` 是同一張影像，"
                     "只送過一次模型；模型實際看的是那一張）")
-            elif not variant_paths:
+            elif not variant_paths and entry.get("model_input_variant") == "native":
                 # native lane：零 VL、模型從頭到尾沒看過任何影像。
                 out.append("- **無模型影像輸入**（原生結構抽取，零 VL 呼叫）")
+            elif not variant_paths:
+                # 抽壞的那幾張 `variants=[]`（結果沒辦法可靠宣告自己送過什麼），但
+                # 模型**很可能已經被呼叫過多次**。說成「零 VL 呼叫」會讓看的人以為
+                # 這張圖從沒進過模型，於是往錯的方向查。
+                out.append("- **模型輸入未保存**（走的是 VL lane，抽取中止前可能已經"
+                           "呼叫過模型；下方若有覆核用影像，那是事後補 render 的）")
             else:
                 out.append(
                     f"- **實際模型輸入**: variant `{entry['model_input_variant']}`"
@@ -2892,13 +2898,19 @@ def apply_fix(root, kb_path, *, document_id: str, figure_id: str, expected_revis
     base = _chunk_index_base(chunks_snapshot, source=source, page=page,
                              exclude=excluded, count=len(parts))
     next_index = {page: base}
+    # payload / metadata 的驗證失敗**刻意讓 `FigureValidationError` 穿出去**（既有
+    # 契約：那個型別比 `FigureReviewError` 具體，看的人一眼知道是內容不合格而不是
+    # 流程出錯）。KB 此時尚未被改動，兩者都是零寫入。
     new_chunks = fx.build_figure_chunks(
         [view], source=source, doc_type=doc_type,
         next_chunk_index=next_index, evidence_ref_by_figure={figure_id: evidence_ref},
+        # **原樣**交給 `build_figure_chunks` 的 fail-closed validator。`str()` 會把
+        # list / dict / 數字這類畸形 metadata 靜默轉成 Python repr 再寫進
+        # embedding 與 BM25——而所有 part 帶同一個畸形值時，一致性檢查也攔不住。
         context_by_figure={figure_id: {
-            "caption": str(first.get("figure_caption", "") or ""),
-            "section": str(first.get("section", "") or ""),
-            "heading_hierarchy": str(first.get("heading_hierarchy", "") or ""),
+            "caption": first.get("figure_caption", ""),
+            "section": first.get("section", ""),
+            "heading_hierarchy": first.get("heading_hierarchy", ""),
         }})
     _cross_check_parts(parts, new_chunks, kind=kind, where=where)
     for chunk in new_chunks:

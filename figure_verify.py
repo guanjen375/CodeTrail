@@ -4097,6 +4097,29 @@ def _stitch_payloads(kind: str, payloads: list[dict], variants, findings: _Findi
         overlap_px = variant.overlap_px
         return cap, has_geometry, overlap_px
 
+    if kind == figure_extract.KIND_DIAGRAM:
+        # diagram 沒有列/行原子，接不出「重疊了幾列」這種幾何證據，所以只能取聯集
+        # 並**誠實標成不確定**：同一個元件在兩片裡叫不同名字時，我們證明不了它是
+        # 同一個。以前這個分支根本不存在（會 KeyError 在 `payloads[0]["lines"]`），
+        # 而被切片的 raster 一旦解成 diagram 就會走到這裡。
+        merged = {"kind": figure_extract.KIND_DIAGRAM,
+                  "title": next((p["title"] for p in payloads if p["title"]), ""),
+                  "labels": [], "components": [], "relations": [], "values": []}
+        for field in ("labels", "components", "relations", "values"):
+            seen: list = []
+            for payload in payloads:
+                for item in payload[field]:
+                    if item not in seen:
+                        seen.append(item)
+            merged[field] = seen
+        stitch["uncertain"] = True
+        findings.note(
+            "stitch_diagram_union",
+            f"{len(payloads)} 片 tile 的 diagram 內容取聯集：diagram 沒有列/行級"
+            "原子，跨片的元件身分無法證明，重複或分屬兩片的關係都可能沒有合併",
+        )
+        return merged, stitch
+
     if kind == figure_extract.KIND_TABLE:
         labels = [tuple(c["label"] for c in p["columns"]) for p in payloads]
         if len(set(labels)) != 1:
@@ -4754,6 +4777,18 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
     if kind == figure_extract.KIND_RASTER:
         classification = _classify_raster_kind(variants[0], ctx)
         resolved = classification["kind"]
+        if resolved == figure_extract.KIND_NOT_A_FIGURE and len(variants) > 1:
+            # ★ 分類器**只看得到第一片**。切片的候選是大圖（高表格 / 長 log），第一片
+            # 剛好是留白或 logo 就把整張圖標成缺席，而後面幾片根本不會被檢查、也不進
+            # actionable 通知——那就是無聲漏內容。所以多片候選一律**不得**被跳過，
+            # 改走 diagram（自由文字退路）：多一個 chunk 遠好過整張表消失。
+            print(f"  [INFO] {ctx.get('where', '')}: 第一片被判成「不是圖面」，"
+                  f"但這個候選有 {len(variants)} 片；不跳過，改以 diagram 抽取",
+                  flush=True)
+            classification = {**classification, "kind": figure_extract.KIND_DIAGRAM,
+                              "reclassified_from": figure_extract.KIND_NOT_A_FIGURE,
+                              "reclassified_reason": "multi_tile_cannot_be_skipped"}
+            resolved = figure_extract.KIND_DIAGRAM
         if resolved == figure_extract.KIND_NOT_A_FIGURE:
             # **分類完就停手**：不呼叫抽取、不產 payload、不佔覆核清單。
             print(f"  [INFO] {ctx.get('where', '')}: 分類為「不是圖面」，跳過抽取",
@@ -4801,16 +4836,11 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
             # 回空 payload 才是真的抽取壞掉，那條界線不動。
             if exc.slug != "empty_payload" or resolved == figure_extract.KIND_DIAGRAM:
                 raise
-            if resolved == figure_extract.KIND_PROSE:
-                # 判成一頁文章、模型卻說一行字都沒有 → 這張本來就不是圖面。
-                # 再用 diagram 套一次只會得到一份空的 components/relations。
-                print(f"  [INFO] {ctx.get('where', '')}: 分類成 prose 但抽不到任何一行"
-                      f"（{exc.detail}）；視為不是圖面，跳過", flush=True)
-                return _skipped_result(
-                    candidate,
-                    {**classification, "reclassified_from": resolved,
-                     "reclassified_reason": exc.slug},
-                    where=ctx["where"])
+            # prose 抽不到任何一行**不是**「這不是圖面」的證據：模糊的掃描頁、模型
+            # 當下失手都會回空。把它解釋成 none 會讓一張真的有字的頁不進 KB、也不
+            # 進失敗通知，而且那條路徑還會丟掉 extractor 實際送過的其他 tile、
+            # reason detail 也會謊稱是分類器判的。一律走與 table / terminal 相同的
+            # diagram 退路：至少留得下可覆核的 payload 與完整的模型輸入紀錄。
             reclassified_from = resolved
             resolved = figure_extract.KIND_DIAGRAM
             classification = {**classification, "kind": resolved,

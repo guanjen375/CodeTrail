@@ -3260,3 +3260,30 @@ def test_apply_fix_keeps_the_caption_and_section_retrieval_signals(env):
     assert {c["section"] for c in figure_chunks} == {"3.2 Registers"}
     assert {c["heading_hierarchy"] for c in figure_chunks} == {
         "3 Control > 3.2 Registers"}
+
+
+@pytest.mark.smoke
+def test_apply_fix_refuses_a_malformed_retrieval_context(env):
+    """★ 畸形的 caption metadata 不得被 `str()` 悄悄轉成 Python repr 寫進檢索訊號。
+
+    所有 part 都帶同一個畸形值時，跨 part 一致性檢查也攔不住，於是
+    `"['Table', '3-1']"` 這種字串會直接進 embedding 與 BM25。
+    `figure_extract` 的 context validator 是 fail-closed 的，這裡不得繞過它。
+    """
+    root, _outside = env
+    doc_id, fig_id, _ref, kb_path = seed(root)
+    kb = RAG.load_knowledge_base(kb_path, _quiet=True)
+    for chunk in kb["chunks"]:
+        if chunk.get("structured"):
+            chunk["figure_caption"] = ["Table", "3-1"]        # 畸形：不是 str
+    RAG.save_knowledge_base(kb, kb_path)                      # 走原子提交，向量不失效
+    before = kb_path.read_bytes()
+
+    with pytest.raises(fx.FigureValidationError) as exc:
+        fr.apply_fix(root, kb_path, document_id=doc_id, figure_id=fig_id,
+                     expected_revision=1, payload=table_payload(rows=CORRECTED_ROWS),
+                     kind="table", confirm_against_image=True,
+                     rechunk=rechunk, embed=embed)
+
+    assert "caption" in str(exc.value) and "必須是 str" in str(exc.value), exc.value
+    assert kb_path.read_bytes() == before, "拒絕就要零寫入"

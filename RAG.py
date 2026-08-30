@@ -818,18 +818,16 @@ def _figure_retrieval_context(document, figures) -> Dict[str, Dict[str, str]]:
         by_page.setdefault(int(figure.page), []).append(figure)
 
     def _anchor_offset(page: int) -> Optional[int]:
-        """這一頁在 raw_text 的定位點；證明不出來就回 None。
+        """這一頁在 raw_text 的定位點；證明不出來就回 None（章節因此留空）。
 
         `page_spans` 只收「產出過文字」的頁，所以純圖片頁查不到 span。退回 offset 0
-        會讓那一頁所有 figure 都被標成**文件開頭那一節**——一個看起來完全正常、卻
-        指錯章節的檢索訊號。沿用前一頁**末端**的章節則是可證明的：沒有文字的頁不
-        可能開新的一節，所以那一節到這裡仍然有效。前面沒有任何有文字的頁時留空。
+        會讓那一頁所有 figure 都被標成**文件開頭那一節**。沿用前一個文字頁的章節也
+        不行：掃描頁完全可能在**影像裡**開新的一節，只是沒有文字層——那只是把「錯掛
+        第一節」換成「可能錯掛前一節」，而錯掛的檢索訊號看起來與正確的一模一樣。
+        證明不出來就不宣稱。
         """
         span = spans.get(page)
-        if span:
-            return span[0]
-        earlier = [end for number, (_start, end) in spans.items() if number < page]
-        return max(earlier) - 1 if earlier else None
+        return span[0] if span else None
 
     context: Dict[str, Dict[str, str]] = {}
     for page, page_figures in by_page.items():
@@ -1437,6 +1435,42 @@ def _ensure_review_assets(fx, filename, pdf_doc, results, by_fid, rendered) -> D
     return review_assets
 
 
+def _best_effort_review_assets(fx, filename, pdf_doc, figures, by_fid, rendered,
+                               already: Dict[str, List]) -> Dict[str, List]:
+    """不進 KB 的那幾張（失敗 / 判定不是圖面）的完整覆核影像；產不出來就算了。
+
+    與 `_ensure_review_assets` 的差別**只有一個**：這裡不 fail-loud。那條是「進 KB
+    的圖一定要有監督依據」的硬閘；這裡的圖根本不進 KB，為了拿不到一張診斷用影像
+    就讓整份文件零寫入，等於把 figure-level 的失敗又升級回 document-level——而那正是
+    2026-08-28 花一整輪拆掉的東西。
+    """
+    produced: Dict[str, List] = {}
+    sent_ids: Dict[str, set] = {}
+    for variant in rendered:
+        sent_ids.setdefault(getattr(variant, "figure_id", ""), set()).add(
+            getattr(variant, "variant_id", ""))
+    for figure in figures:
+        figure_id = str(figure.figure_id)
+        candidate = by_fid.get(figure_id)
+        if candidate is None or figure_id in already:
+            continue
+        where = f"{filename} 第 {figure.page} 頁 figure={figure_id}"
+        try:
+            variants = _full_candidate_variants(fx, pdf_doc, candidate)
+            already_sent = sent_ids.get(figure_id, set())
+            full = [variant for variant in variants
+                    if getattr(variant, "variant_id", "") not in already_sent
+                    and _is_full_image(fx, variant, candidate_bbox=candidate.bbox,
+                                       where=f"{where} 的覆核用影像")]
+        except Exception as exc:  # noqa: BLE001 — 診斷用影像，拿不到不影響已完成的工作
+            print(f"  [WARN] {where}: 取不到覆核用原圖（{exc}）；"
+                  "這一張不進 KB，仍照常繼續", flush=True)
+            continue
+        if full:
+            produced[figure_id] = full[:1]
+    return produced
+
+
 def _with_reason(figure, slug: str, detail: str):
     return _dc_replace(
         figure,
@@ -2039,6 +2073,12 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
                 fx, filename, root_path, kb_path, by_fid, results)
             review_assets = _ensure_review_assets(
                 fx, filename, pdf_doc, results, by_fid, rendered)
+            # 抽壞 / 判定不是圖面的那幾張也留一張完整原圖：沒有影像的失敗 artifact
+            # 診斷不了、也覆核不了。**best-effort**——這幾張本來就不進 KB，為了它們
+            # 把整份文件變成零寫入是把 figure-level 的失敗又升級回 document-level。
+            review_assets.update(_best_effort_review_assets(
+                fx, filename, pdf_doc, failed_figures + skipped_figures, by_fid,
+                rendered, review_assets))
         except fx.FigureError as exc:
             # `.failed` 是單一 FigureResult（T4 的 `_failed_result`），`.results` 是 list；
             # 兩種形狀都要吃下去——這裡再拋 TypeError 會把原始抽取錯誤整個蓋掉。

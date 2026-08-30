@@ -857,7 +857,7 @@ def test_figure_on_a_textless_page_does_not_inherit_the_first_section():
     context = RAG._figure_retrieval_context(document, [figure])["fig_00000000000000ff"]
 
     assert context["caption"] == ""
-    assert context["section"] != "1 Overview", (
-        "退回 offset 0 會讓純圖片頁的 figure 全部掛到文件開頭那一節")
-    assert context["section"] in ("", "7 Appendix"), (
-        f"沒有 span 的頁只能留空或沿用前一頁所在章節，實際 {context['section']!r}")
+    assert context["section"] == "", (
+        "沒有文字層就證明不出這一頁屬於哪一節：掃描頁完全可能在影像裡開新的一節。"
+        f"退回 offset 0 會掛到第一節、沿用前一頁會掛到前一節，實際 {context['section']!r}")
+    assert context["heading_hierarchy"] == ""

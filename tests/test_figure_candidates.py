@@ -1330,10 +1330,11 @@ def test_raster_preflight_min_is_a_real_lower_bound(retries, tmp_path: Path, mon
     assert candidate.kind == fe.KIND_RASTER, candidate.kind
     tiles = len(candidate.signals["tile_plan"]["tiles"])
     profile = fc._vl_profile(candidate)
-    assert profile["min"] == 1 + tiles, profile
-    # 上界含「猜錯 kind 時多一輪 diagram 退路」的 T(1+R)：raster 的 kind 是分類器猜的，
-    # 猜錯不該讓整份 PDF 零寫入（見 test_raster_classified_as_table_falls_back_...）。
-    assert profile["max"] == (1 + retries) + 3 * tiles * (1 + retries), profile
+    # 單片候選的真下界是 1：分類器可以回 `none`（不是圖面）而完全不抽取。
+    assert profile["min"] == (1 if tiles <= 1 else 1 + tiles), profile
+    # 上界不含第三輪：`empty_payload` 只可能從第一次抽取冒出來，所以「第二樣本」與
+    # 「diagram 退路」互斥，兩條路的抽取成本都是 2T(1+R)，不是相加。
+    assert profile["max"] == (1 + retries) + 2 * tiles * (1 + retries), profile
     assert plan.preflight["vl_calls_min"] == profile["min"]
     assert plan.preflight["vl_calls_max"] == profile["max"]
 

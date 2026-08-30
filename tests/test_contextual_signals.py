@@ -996,6 +996,7 @@ def test_audit_is_fatal_when_the_loader_cannot_be_imported(monkeypatch, tmp_path
     assert "沒有被驗證" in reason
 
 
+@pytest.mark.smoke
 def test_reranker_passage_carries_the_figure_caption():
     """caption 也要進 cross-encoder 的 document 側。
 

@@ -2651,7 +2651,7 @@ def _vl_profile(candidate: Candidate) -> dict:
     | VL / kind 已定 / 有 anchor | — | `T` | `2T(1+R)` |
     | VL / kind 已定 / 無 anchor | 需 disagreement detection | `2T` | `2T(1+R)` |
     | VL / KIND_UNKNOWN | dual pass 每 kind 一次、不重試、不取第二樣本 | `2T` | `2T` |
-    | VL / KIND_RASTER | 分類一次，再對勝出 kind 抽取（猜錯 kind 時多一輪 diagram 退路） | `1+T` | `(1+R)+2T(1+R)+T(1+R)` |
+    | VL / KIND_RASTER | 分類一次，再對勝出 kind 抽取（猜錯 kind 時改走 diagram，與第二樣本互斥） | `1`（T=1，可回 `none` 零抽取）/ `1+T` | `(1+R)+2T(1+R)` |
 
     `T` = tile 數、`R` = `config.FIGURE_EXTRACT_RETRIES`。
 
@@ -2702,24 +2702,31 @@ def _vl_profile(candidate: Candidate) -> dict:
     if raster:
         # classifier 只看第一個 tile；勝出 kind 的抽取涵蓋全部 T 個 tile。
         #
-        # ★ 下界是 `1 + T`，**不是** `1 + 2T`：classifier 解成 `diagram` 時
-        # `figure_verify._run_vl_lane()` 帶的是 `second_sample=False`（只有 table /
-        # terminal 的逐格逐行內容才做第二樣本），所以整份都是 diagram 的 PDF 真實
-        # 呼叫數會**小於**舊公式宣稱的「最少」。實測 example1.pdf：宣稱 54、實際 40。
-        # 名為 min 卻不是下界，會讓成本 / timeout 判讀失準，也讓「實際落在
-        # [min, max] 內」這條契約永遠測不出來。上界維持雙樣本 + 重試的最壞情況。
+        # ★ 下界不是 `1 + T`：classifier 解成 `diagram` 時 `_run_vl_lane()` 帶的是
+        # `second_sample=False`（只有 table / terminal 的逐格逐行內容才做第二樣本），
+        # 所以整份都是 diagram 的 PDF 真實呼叫數會**小於**舊公式宣稱的「最少」。
+        # 實測 example1.pdf：宣稱 54、實際 40。名為 min 卻不是下界，會讓成本 /
+        # timeout 判讀失準，也讓「實際落在 [min, max] 內」這條契約永遠測不出來。
+        #
+        # 2026-08-30 再減一項：分類器可以回 `none`（不是圖面）而**完全不抽取**。
+        # 那條路只可能發生在單片候選上（多片候選的第一片說 none 也不得跳過，見
+        # `figure_verify._run_vl_lane()`），所以 T == 1 時真下界是 1 次分類。
         classifier_tokens = tokens[0] if tokens else 0
-        min_calls = 1 + tiles
-        # 上界維持雙樣本 + 重試的最壞情況，**再加一輪 diagram 退路**：分類器猜成
-        # table / terminal 但那個 schema 抽不到任何內容時，`_run_vl_lane()` 會改用
-        # diagram 重抽一次（kind 是我們猜的，猜錯不該讓整份 PDF 零寫入）。少算這一輪
-        # 的話，預算閘會在**跑完宣稱的 max 之後**才於 runtime 中止，正是這張表要防的事。
-        max_calls = (1 + retries) + 2 * tiles * (1 + retries) + tiles * (1 + retries)
+        single_tile = tiles <= 1
+        min_calls = 1 if single_tile else 1 + tiles
+        # 上界＝分類一次 ＋ 抽取。**第二樣本與 diagram 退路互斥**：`empty_payload`
+        # 只可能從第一次 `_vl_extract` 冒出來（第二樣本的失敗被 `repeat_sample_failed`
+        # 吃掉，不會往上拋），所以「抽一次 + 第二樣本」與「抽一次 + diagram 重抽」
+        # 兩條路的成本都是 `2T(1+R)`，不是相加。舊公式多算了一個 `T(1+R)`，會讓
+        # `check_preflight()` 錯擋其實在預算內的文件。
+        max_calls = (1 + retries) + 2 * tiles * (1 + retries)
         return {
             "tiles": tiles,
             "min": min_calls,
             "max": max_calls,
-            "tokens_min": classifier_tokens + base_tokens,
+            # T == 1 的 `none` 路徑只送那一張圖給分類器，之後一個 token 都不再送。
+            "tokens_min": (classifier_tokens if single_tile
+                           else classifier_tokens + base_tokens),
             "tokens_max": classifier_tokens * (1 + retries)
                           + 2 * base_tokens * (1 + retries),
         }

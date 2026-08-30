@@ -3070,3 +3070,63 @@ def test_skipped_result_records_the_image_the_classifier_actually_saw(monkeypatc
     assert result.extraction_status == figure_extract.EXTRACTION_SKIPPED
     assert result.model_input_variant == "crop@200dpi", result.model_input_variant
     assert list(result.variants) == ["crop@200dpi"], result.variants
+
+
+@pytest.mark.smoke
+def test_multi_tile_candidate_is_never_skipped_on_the_first_tile_alone(monkeypatch):
+    """★ 分類器只看得到第一片：切片候選不得因為那一片是留白/logo 就整張缺席。
+
+    高表格與長 log 都會被切片。第一片回 `none` 就把整個候選標成 skipped 的話，
+    後面幾片根本不會被檢查，而 `raster_not_a_figure` 又不進 actionable 通知——
+    一整張 register table 就這樣無聲消失。
+    """
+    spy = VLSpy({
+        "figure_raster_kind_v1": raster_kind("none"),
+        "figure_diagram": json.dumps({
+            "title": "register map", "labels": ["CTRL0"],
+            "components": [{"name": "CTRL0", "desc": "0x4000_0100"}],
+            "relations": [], "values": []}),
+    })
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+
+    def _render(_doc, cand):
+        # tiled 的編號是 1-based（缺號 / 越界會讓接合靜默錯序）
+        return [variant(cand.figure_id, variant_id=f"crop@200dpi#tile{i}of2",
+                        tile_index=i, tile_total=2, png=f"PNG-{i}".encode(),
+                        bbox=cand.bbox)
+                for i in (1, 2)]
+
+    result = extract([candidate(kind=figure_extract.KIND_RASTER, seed="tiled")],
+                     {4: page_evidence()}, render=_render)[0]
+
+    assert result.extraction_status == figure_extract.EXTRACTION_COMPLETE, result
+    assert result.kind == figure_extract.KIND_DIAGRAM, result.kind
+    assert result.payload, "多片候選不得零 payload 缺席"
+
+
+@pytest.mark.smoke
+def test_prose_with_an_empty_transcription_falls_back_to_diagram(monkeypatch):
+    """★ prose 抽不到任何一行**不是**「這不是圖面」的證據。
+
+    模糊的掃描頁、模型當下失手都會回空。解釋成 `none` 的話那一頁既不進 KB、也不進
+    失敗通知，而且那條路徑還會丟掉 extractor 實際送過的其他 tile、reason detail 也
+    謊稱是分類器判的。一律走與 table / terminal 相同的 diagram 退路。
+    """
+    spy = VLSpy({
+        "figure_raster_kind_v1": raster_kind("prose"),
+        "figure_prose": prose_json([]),
+        "figure_diagram": json.dumps({
+            "title": "scanned page", "labels": ["3.2 Registers"],
+            "components": [{"name": "3.2 Registers", "desc": "register map"}],
+            "relations": [], "values": []}),
+    })
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+
+    result = extract([candidate(kind=figure_extract.KIND_RASTER)], {4: page_evidence()})[0]
+
+    assert result.extraction_status == figure_extract.EXTRACTION_COMPLETE, result
+    assert result.kind == figure_extract.KIND_DIAGRAM, result.kind
+    assert "raster_kind_reclassified" in result.reasons, result.reasons
+    assert "figure_diagram" in spy.schema_names(), spy.schema_names()
