@@ -1356,10 +1356,13 @@ def _figure_view(figure, position: int, *, document_id: str, failed: bool) -> di
              f"{where}: extraction_status={view['extraction_status']!r} 不合法")
     _require(view["verification_status"] in fx.VERIFICATION_RANK,
              f"{where}: verification_status={view['verification_status']!r} 不合法")
-    if not failed and view["extraction_status"] == fx.EXTRACTION_FAILED:
-        # 品質失敗是 figure-level 的：那一張不進 KB，但要留在同一份 `failed:false`
-        # 的 manifest 裡供覆核。允許的形狀**只有**「什麼都沒抽出來」這一種——帶
-        # payload 的 failed entry，讀的人分不出它到底有沒有進 KB。
+    if view["extraction_status"] == fx.EXTRACTION_FAILED:
+        # 允許的形狀**只有**「什麼都沒抽出來」這一種——帶 payload 的 failed entry，
+        # 讀的人分不出它到底有沒有進 KB。
+        # **不分 run 級 `failed`**：`_failed_result()` 是唯一的產生點，它在文件級中止
+        # 與 figure-level 品質失敗兩種情境下產出的形狀完全一樣，所以放行整份中止的
+        # manifest 只是留一個誰也不會踩、但踩到就無聲的洞。`_figure_view()` 只走
+        # 發布路徑（讀既有 manifest 走 `_validate_manifest()`），無條件強制不影響相容性。
         # （`model_input_variant` / `variants` 的形狀在下面型別驗過之後才檢查。）
         _require(view["payload"] is None,
                  f"{where}: extraction_status=failed 卻帶 payload"
@@ -1412,7 +1415,9 @@ def _figure_view(figure, position: int, *, document_id: str, failed: bool) -> di
              and all(isinstance(x, str) and x for x in declared),
              f"{where}: variants 必須是 list[str]（可以是空 list，但不得缺欄位）")
     declared_variants = list(declared)
-    if not failed and view["extraction_status"] == fx.EXTRACTION_FAILED:
+    if view["extraction_status"] == fx.EXTRACTION_FAILED:
+        # 同上：不分 run 級 `failed`。真相在 `evidence["sent_variants"]`（send ledger），
+        # `variants` 依契約必須是空的。
         _require(variant == "failed",
                  f"{where}: extraction_status=failed 的 model_input_variant 必須是 "
                  f"'failed'，收到 {variant!r}")
@@ -1857,12 +1862,12 @@ def write_run_artifacts(root, *, document_id: str, run_id: str, figures, variant
                      f"figure={figure_id}: 落盤的模型輸入 {sorted(actual)} 與 send "
                      f"ledger {sorted(expected)} 不一致——失敗 artifact 的模型輸入"
                      "必須逐份對得起來")
-        if failed:
-            # 抽取中止的結果沒辦法可靠地宣告自己送過什麼（T4 的 failed result 是
-            # `variants=[]`），但已經送出去的影像仍要留得下來供覆核。這裡不比對，
-            # 真相由 `variant_paths`（實際落盤）與 `variants`（結果自報）各自表達。
-            pass
-        elif entry["duplicate_of"]:
+        # ★ 這裡是發布路徑,run 級的 `failed` **不再整段放行**：失敗 entry 走上面的
+        # send ledger 雙向核對、成功 entry 走 `declared == actual`、其餘 incomplete
+        # 走 `declared <= actual`。以前無條件 `pass`,等於整份中止的 artifact 完全
+        # 不驗模型輸入的可指認性。（讀既有 manifest 走 `_validate_manifest()`,
+        # 那條路徑另有 `strict_new_write=False` 的相容分支。）
+        if entry["duplicate_of"]:
             # 重複影像只送一次 VL：影像存在代表 occurrence 底下，這裡只能是子集
             _require(actual <= declared,
                      f"figure={figure_id}: 落盤的模型 variant {sorted(actual - declared)} "

@@ -134,9 +134,17 @@ def terminal_payload(lines=TERMINAL_LINES):
 
 
 def make_figure(doc_id: str, fig_id: str, payload, *, kind="table", revision=1,
-                status="unverified", extraction="complete", variants=("crop@200dpi",),
-                model_input="crop@200dpi", page=3, figure_index=1, reasons=(),
+                status="unverified", extraction="complete", variants=None,
+                model_input=None, page=3, figure_index=1, reasons=(),
                 reason_details=(), sent_variants=None):
+    if model_input is None:
+        # 真 producer（`figure_verify._failed_result`）對抽壞的結果一律用 "failed"
+        # 哨兵、且 `variants=[]`——中止時它宣告不出自己送過哪一份，真相在
+        # `evidence["sent_variants"]`。fixture 沿用 complete 的預設值等於在測一個
+        # 產線上不存在的形狀。
+        model_input = "failed" if extraction == "failed" else "crop@200dpi"
+    if variants is None:
+        variants = () if extraction == "failed" else ("crop@200dpi",)
     row_total = line_total = None
     if payload is not None and kind == fx.KIND_TABLE:
         row_total = payload["rows"][-1]["row_index"] if payload["rows"] else 0
@@ -674,10 +682,16 @@ def test_failed_run_keeps_evidence_and_never_claims_a_payload(env):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["failed"] is True
     assert manifest["figures"][0]["payload"] is None
-    # 成功的 run 不得夾帶 failed 成員
-    with pytest.raises(fx.FigureReviewError, match="failed"):
-        fr.write_run_artifacts(root, document_id=doc_id, run_id=fr.new_run_id(),
-                               figures=[figure], variants=[make_variant(fig_id)])
+    # `failed:false` 的 run **可以**夾帶 failed 成員：品質失敗是 figure-level 的，
+    # 那一張缺席、其餘照常入庫（2026-08-28 起的設計，見
+    # tests/test_figure_ingest.py::test_quality_failure_skips_only_that_figure）。
+    # 形狀仍然要成立——那條由 test_failed_entry_shape_is_enforced_even_in_an_aborted_run 守。
+    ok_path = fr.write_run_artifacts(root, document_id=doc_id, run_id=fr.new_run_id(),
+                                     figures=[figure], variants=[make_variant(fig_id)])
+    ok = json.loads(ok_path.read_text(encoding="utf-8"))
+    assert ok["failed"] is False
+    assert ok["figures"][0]["extraction_status"] == "failed"
+    assert ok["figures"][0]["payload"] is None
 
 
 # ============================================================
@@ -3339,3 +3353,32 @@ def test_failed_entry_that_declares_variants_is_refused(env):
     with pytest.raises(fx.FigureReviewError, match="不得宣告送過 variant"):
         fr.write_run_artifacts(root, document_id=doc_id, run_id=fr.new_run_id(),
                                figures=[figure], variants=[make_variant(fig)])
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("overrides, fragment", [
+    ({"payload": "carry"}, "卻帶 payload"),
+    ({"variants": ("never-sent",)}, "不得宣告送過 variant"),
+    ({"model_input": "crop@200dpi"}, "必須是 'failed'"),
+])
+def test_failed_entry_shape_is_enforced_even_in_an_aborted_run(env, overrides, fragment):
+    """★ 整份中止（`failed=True`）的 manifest 裡，failed entry 的形狀一樣要成立。
+
+    上一輪只把 send ledger 補成強制,形狀檢查（payload=None /
+    model_input_variant="failed" / variants=[]）仍被 `not failed` 這個閘跳過 ——
+    於是文件級中止的 artifact 可以夾帶一個「有 payload 的 failed entry」,讀的人
+    分不出它到底有沒有進 KB。`_figure_view()` 只走發布路徑,舊 manifest 讀回來不經過
+    這裡,所以無條件強制不影響相容性。
+    """
+    root, _outside = env
+    doc_id = document_id(root)
+    fig = figure_id(doc_id)
+    fields = {"variants": (), "model_input": "failed", **overrides}
+    payload = table_payload() if fields.pop("payload", None) else None
+    figure = make_figure(doc_id, fig, payload, extraction="failed",
+                         status="needs_review", **fields)
+
+    with pytest.raises(fx.FigureReviewError, match=fragment):
+        fr.write_run_artifacts(root, document_id=doc_id, run_id=fr.new_run_id(),
+                               figures=[figure], variants=[make_variant(fig)],
+                               failed=True)
