@@ -1270,19 +1270,27 @@ def _model_input_variants(rendered, figures) -> List:
       writer 會逐份核對。
     * **失敗結果的 send ledger**（`evidence["sent_variants"]`）—— 中止的結果沒辦法
       可靠宣告自己送過什麼（契約上 `variants=[]`），但導致失敗的那張影像必須留得
-      下來才診斷得了。
+      下來才診斷得了。失敗結果**只**看 ledger：它的 `variants` 非空就是 producer
+      漂移，聯集起來會讓一個多報的 id 被寫成「送進模型的影像」。
 
     刻意**不**「整張圖的 renderer 產物全留」：三片裡第一片就失敗時後兩片根本沒送，
     寫進 `variant_paths`（writer 稱之為「送進模型的影像」）就是謊報。
     """
+    fx = _figure_extract()
     keep = set()
     for figure in figures or []:
         figure_id = getattr(figure, "figure_id", "")
+        evidence = getattr(figure, "evidence", None) or {}
+        ledger = [str(v) for v in (evidence.get("sent_variants") or [])]
+        if getattr(figure, "extraction_status", "") == fx.EXTRACTION_FAILED:
+            # **失敗結果只認 ledger**：契約上它的 `variants` 必須是空的，非空就是
+            # producer 漂移。把兩邊聯集起來的話，一個多報的 variant 就會被寫成
+            # 「送進模型的影像」，而它可能根本沒送出去。
+            keep.update((figure_id, variant_id) for variant_id in ledger)
+            continue
         for variant_id in (getattr(figure, "variants", None) or []):
             keep.add((figure_id, str(variant_id)))
-        evidence = getattr(figure, "evidence", None) or {}
-        for variant_id in (evidence.get("sent_variants") or []):
-            keep.add((figure_id, str(variant_id)))
+        keep.update((figure_id, variant_id) for variant_id in ledger)
     return [variant for variant in rendered
             if (getattr(variant, "figure_id", ""),
                 getattr(variant, "variant_id", "")) in keep]

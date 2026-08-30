@@ -1240,6 +1240,18 @@ def _validate_variants(candidate: Candidate, variants) -> list[Variant]:
             f"但 tile_total={total}（缺號的 tile 會讓接合靜默錯序）"
         )
     items.sort(key=lambda v: v.tile_index)
+    # `variant_id` 是**落盤檔名與 manifest 宣告共用的身分**。兩片不同 bytes 共用同一
+    # 個 id 時，兩片都會送進模型、都會參與 payload，但 ledger 去重、artifact 只保存
+    # 第一片，writer 的 set 比對也看不出差異——覆核的人對著第一片的 bytes 找第二片
+    # 的內容。放在最後：結構性問題（tile 重號 / 不連續 / tile_total）要先報自己的
+    # 訊息，不然定位會被這一條蓋掉。
+    variant_ids = [str(getattr(v, "variant_id", "") or "") for v in items]
+    if len(set(variant_ids)) != len(variant_ids):
+        raise figure_extract.FigureExtractionError(
+            f"figure={figure_id} 的 variant_id 有重號：{sorted(variant_ids)}"
+            "（id 是落盤檔名與 manifest 宣告共用的身分，重號會讓保存下來的 bytes "
+            "與模型實際讀的那一份對不上）"
+        )
     return items
 
 
@@ -5164,7 +5176,7 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
             error = figure_extract.FigureExtractionError(
                 f"{where}: plan 沒有這一頁的 PageEvidence，無法驗證（零寫入）"
             )
-            error.results = results
+            error.results = results + failed
             error.failed = _failed_result(candidate, kind, str(error), lane=lanes[position])
             raise error
 
@@ -5296,7 +5308,9 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
                     + "。重試後仍失敗 → 整份 PDF 零寫入"
                 )
                 error = figure_extract.FigureExtractionError(message)
-                error.results = results
+                # **`results + failed`**：先前已經記下的品質失敗不得在這裡消失，
+                # 否則最終 artifact 少了那幾張，連它們實際送過的影像也會被刪掉。
+                error.results = results + failed
                 error.failed = _failed_result(candidate, kind, message, lane=lane,
                                               sent=sent_variants)
                 raise error from exc
@@ -5318,8 +5332,12 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
             progress(f"[figure] 失敗 p{page} kind={failed_result.kind} "
                      f"slug={exc.slug}（這一張不進 KB）")
             continue
-        except figure_extract.FigureExtractionError as exc:
-            exc.results = results
+        except figure_extract.FigureError as exc:
+            # **`FigureError` 而不是 `FigureExtractionError`**：`_check_send_budget()`
+            # 丟的是 `FigureBudgetError`，只接子類的話那條路徑會帶著空的 `.results`
+            # 逃出去，呼叫端只能寫出零 figure 的失敗 artifact——已經送出去的影像與
+            # 當前候選一起從稽核紀錄消失。
+            exc.results = results + failed
             exc.failed = _failed_result(candidate, kind, str(exc), lane=lane,
                                         sent=sent_variants)
             raise

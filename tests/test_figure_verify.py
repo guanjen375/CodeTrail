@@ -97,7 +97,7 @@ def page_evidence(*, page=4, raw_markdown="", page_boxes=None, words=None, table
     )
 
 
-def variant(figure_id, *, variant_id="crop@200dpi", tile_index=0, tile_total=1,
+def variant(figure_id, *, variant_id=None, tile_index=0, tile_total=1,
             overlap_px=0, est_image_tokens=120, mime="image/png", png=b"\x89PNG-stub",
             width=400, height=200, bbox=(0.0, 0.0, 200.0, 80.0), digest=None,
             stitch=None):
@@ -108,6 +108,12 @@ def variant(figure_id, *, variant_id="crop@200dpi", tile_index=0, tile_total=1,
     正是這條接縫連續四輪沒被抓到的成因**——producer 漂移時測試照樣綠。要驗
     「digest 與 bytes 對不上」這種情境時才明寫 `digest=`。
     """
+    if variant_id is None:
+        # 真 producer 的 tiled variant 是 `crop@Ndpi#tileKofM`，每片一個 id。所有片
+        # 共用一個預設 id 的 fixture 在產線上不存在，而 `variant_id` 是落盤檔名與
+        # manifest 宣告共用的身分——重號的 fixture 會讓測試在一個不可能的形狀上跑。
+        variant_id = ("crop@200dpi" if tile_total == 1
+                      else f"crop@200dpi#tile{tile_index}of{tile_total}")
     if digest is None:
         # 型別壞掉的 png 也要能組出 fixture（那正是要被 validator 擋下的案例）。
         digest = hashlib.sha256(png).hexdigest() if isinstance(png, bytes) else ""
@@ -3459,3 +3465,78 @@ def test_grid_variant_stays_declared_after_the_diagram_fallback(monkeypatch):
     assert result.kind == figure_extract.KIND_DIAGRAM, result.kind
     assert "crop@200dpi+grid" in result.variants, (
         "真的送過模型的 +grid 必須留在宣告集合裡", result.variants)
+
+
+@pytest.mark.smoke
+def test_duplicate_variant_id_with_different_bytes_is_refused_before_sending(monkeypatch):
+    """★ 兩片不同 bytes 共用同一個 `variant_id` → 送出前就要擋。
+
+    只驗 `tile_index` 唯一擋不住這件事：兩片都會送進模型、都會參與 payload，但
+    ledger 去重、artifact 只保存第一片，writer 的 set 比對也看不出差異——覆核的人
+    對著第一片的 bytes 找第二片的內容。
+    """
+    figure = fig_id("collide")
+    items = [variant(figure, variant_id="crop@200dpi#tile1of2", tile_index=1,
+                     tile_total=2, png=b"PNG-A"),
+             variant(figure, variant_id="crop@200dpi#tile1of2", tile_index=2,
+                     tile_total=2, png=b"PNG-B")]
+
+    with pytest.raises(figure_extract.FigureExtractionError, match="variant_id"):
+        figure_verify._validate_variants(candidate(seed="collide"), items)
+
+
+@pytest.mark.smoke
+def test_budget_abort_still_carries_the_partial_results(monkeypatch):
+    """★ runtime 預算中止不得產生零 figure 的失敗 artifact。
+
+    `_check_send_budget()` 丟的是 `FigureBudgetError`，而 candidate loop 只接
+    `FigureExtractionError` —— 例外因此沒有 `.results` / `.failed`，呼叫端只能寫出
+    `_write_failed([])`：已經送出去的影像與當前候選一起從稽核紀錄消失。
+    """
+    spy = VLSpy({"figure_table": REGISTER_TABLE})
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+    monkeypatch.setattr(config, "FIGURE_MAX_VL_CALLS_PER_DOC", 1)
+
+    with pytest.raises(figure_extract.FigureBudgetError) as exc:
+        extract([candidate(page=4, seed="a", native_lane=False),
+                 candidate(page=5, seed="b", native_lane=False)],
+                {4: page_evidence(page=4), 5: page_evidence(page=5)})
+
+    assert getattr(exc.value, "results", None) is not None, "缺 .results → 稽核紀錄整批消失"
+    assert getattr(exc.value, "failed", None) is not None, "缺 .failed → 當前候選也沒了"
+
+
+@pytest.mark.smoke
+def test_document_level_failure_keeps_the_earlier_quality_failures(monkeypatch):
+    """★ 先前已經記下的 figure-level 失敗，不得在後續文件級失敗時消失。
+
+    品質失敗累積在 `failed`，但 transport / producer-contract 失敗只設
+    `error.results = results` —— 第一張品質失敗、第二張 transport 失敗時，最終的
+    failed artifact 不會有第一張，連它實際送過的影像也會被一起刪掉。
+    """
+    # 第一張：欄寬對不上 → 品質失敗（硬失敗，不會被當成 kind 猜錯）。
+    # 第二張：傳輸失敗 → 文件級中止。
+    bad_width = table_json(["Name", "Addr"], [[("CTRL0", "observed")]])
+
+    def _script(kw):
+        return (bad_width if base64.b64decode(kw["image_base64"]) == b"PNG-quality"
+                else RuntimeError("boom"))
+
+    spy = VLSpy({"figure_table": _script})
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+    monkeypatch.setattr(config, "FIGURE_EXTRACT_RETRIES", 0)
+
+    def _render(_doc, cand):
+        png = b"PNG-quality" if cand.page == 4 else b"PNG-transport"
+        return [variant(cand.figure_id, png=png, bbox=cand.bbox)]
+
+    with pytest.raises(figure_extract.FigureExtractionError) as exc:
+        extract([candidate(page=4, seed="quality", native_lane=False),
+                 candidate(page=5, seed="transport", native_lane=False)],
+                {4: page_evidence(page=4), 5: page_evidence(page=5)}, render=_render)
+
+    carried = {getattr(f, "figure_id", "") for f in (exc.value.results or [])}
+    assert fig_id("quality") in carried, (
+        "第一張的品質失敗紀錄被丟掉了", sorted(carried))

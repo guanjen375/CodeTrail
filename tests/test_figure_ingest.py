@@ -3081,3 +3081,27 @@ def test_failed_figure_keeps_the_model_input_that_broke_it(tmp_path: Path, monke
     # 「送進模型的影像」，看的人不知道該信哪一句。
     assert "影像已不可用" not in review, review
     assert "抽取中止" in review and "實際送出去過" in review, review
+
+
+@pytest.mark.smoke
+def test_failed_result_that_over_declares_variants_is_refused(tmp_path: Path, monkeypatch):
+    """★ failed entry 的模型輸入只認 send ledger，多報的 id 不得被寫成「已送」。
+
+    契約上失敗結果的 `variants` 必須是空的。producer 漂移（或別的 caller 傳進來）
+    時，把 `variants` 與 ledger 聯集就會讓一個根本沒送出去的影像出現在
+    `variant_paths`——writer 稱之為「送進模型的影像」，覆核的人會對著它找失敗原因。
+    """
+    figure = types.SimpleNamespace(
+        figure_id="fig_0123456789abcdef", document_id="d",
+        variants=["never-sent"],                       # ← 多報
+        evidence={"sent_variants": ["really-sent"], "lane": "vl"},
+        extraction_status=figure_extract.EXTRACTION_FAILED,
+    )
+    rendered = [types.SimpleNamespace(figure_id="fig_0123456789abcdef",
+                                      variant_id=name)
+                for name in ("never-sent", "really-sent", "renderer-only")]
+
+    kept = RAG._model_input_variants(rendered, [figure])
+
+    assert [v.variant_id for v in kept] == ["really-sent"], (
+        [v.variant_id for v in kept])

@@ -1837,6 +1837,16 @@ def write_run_artifacts(root, *, document_id: str, run_id: str, figures, variant
         entry["duplicate_of"] = _duplicate_of(entry, figure_id)
         actual = {item["variant_id"] for item in mine}
         declared = set(entry["variants"])
+        ledger = (entry.get("evidence") or {}).get("sent_variants")
+        if isinstance(ledger, list) and entry["extraction_status"] == _fx().EXTRACTION_FAILED:
+            # 失敗 entry 的真相**只有** send ledger（`variants` 依契約是空的）。
+            # 雙向核對:少了就是導致失敗的影像沒留下來、多了就是把沒送出去的
+            # renderer 產物寫成了模型輸入。兩種都讓覆核的人看錯東西。
+            expected = {str(item) for item in ledger}
+            _require(actual == expected,
+                     f"figure={figure_id}: 落盤的模型輸入 {sorted(actual)} 與 send "
+                     f"ledger {sorted(expected)} 不一致——失敗 artifact 的模型輸入"
+                     "必須逐份對得起來")
         if failed:
             # 抽取中止的結果沒辦法可靠地宣告自己送過什麼（T4 的 failed result 是
             # `variants=[]`），但已經送出去的影像仍要留得下來供覆核。這裡不比對，
