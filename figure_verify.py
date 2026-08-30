@@ -1155,6 +1155,26 @@ _FAILURE_HINTS = {
 }
 
 
+def _require_unique_variant_ids(figure_id: str, items, *, where: str) -> None:
+    """整批 variant 的 `variant_id` 必須唯一。
+
+    `variant_id` 是**落盤檔名與 manifest 宣告共用的身分**。兩份不同 bytes 共用同一個
+    id 時，兩份都會送進模型、都會參與 payload，但 recorder 遇到碰撞只留先前那一份、
+    ledger 也去重，artifact 於是對不回模型實際讀的那一張——覆核的人對著 A 的 bytes
+    找 B 的內容，而且從 manifest 上完全看不出來。
+
+    **要驗兩次**：原始 variants 一次，`+grid` 這類送模前才產生的衍生 variant 之後
+    再一次。原始集合裡剛好已經有人叫 `x+grid` 時，只驗第一次是看不到碰撞的。
+    """
+    ids = [str(getattr(item, "variant_id", "") or "") for item in items]
+    if len(set(ids)) != len(ids):
+        raise figure_extract.FigureExtractionError(
+            f"figure={figure_id} 的 variant_id 有重號（{where}）：{sorted(ids)}"
+            "（id 是落盤檔名與 manifest 宣告共用的身分，重號會讓保存下來的 bytes "
+            "與模型實際讀的那一份對不上）"
+        )
+
+
 def _validate_variants(candidate: Candidate, variants) -> list[Variant]:
     """送出前驗 variant 的身分與 tile 完整性——**任何 VL 呼叫之前**的那道閘。
 
@@ -1240,18 +1260,9 @@ def _validate_variants(candidate: Candidate, variants) -> list[Variant]:
             f"但 tile_total={total}（缺號的 tile 會讓接合靜默錯序）"
         )
     items.sort(key=lambda v: v.tile_index)
-    # `variant_id` 是**落盤檔名與 manifest 宣告共用的身分**。兩片不同 bytes 共用同一
-    # 個 id 時，兩片都會送進模型、都會參與 payload，但 ledger 去重、artifact 只保存
-    # 第一片，writer 的 set 比對也看不出差異——覆核的人對著第一片的 bytes 找第二片
-    # 的內容。放在最後：結構性問題（tile 重號 / 不連續 / tile_total）要先報自己的
-    # 訊息，不然定位會被這一條蓋掉。
-    variant_ids = [str(getattr(v, "variant_id", "") or "") for v in items]
-    if len(set(variant_ids)) != len(variant_ids):
-        raise figure_extract.FigureExtractionError(
-            f"figure={figure_id} 的 variant_id 有重號：{sorted(variant_ids)}"
-            "（id 是落盤檔名與 manifest 宣告共用的身分，重號會讓保存下來的 bytes "
-            "與模型實際讀的那一份對不上）"
-        )
+    # 放在最後：結構性問題（tile 重號 / 不連續 / tile_total）要先報自己的訊息，
+    # 不然定位會被 id 重號蓋掉。
+    _require_unique_variant_ids(figure_id, items, where="送 VL 之前")
     return items
 
 
@@ -4952,6 +4963,11 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
             _grid_normalized_variants(variants, ctx)
             if resolved == figure_extract.KIND_TABLE else variants
         )
+        # `+grid` 是送模**之前才產生**的：原始集合裡若已經有人叫 `x+grid`，只驗原始
+        # variants 是看不到碰撞的。正規化之後再驗一次整批。
+        _require_unique_variant_ids(
+            str(getattr(candidate, "figure_id", "") or ""), extraction_variants,
+            where="grid 正規化之後")
         # 上面那條 policy 改判（多片候選不得被跳過）也算 reclassification：不接上來的話
         # manifest 會說成「分類器直接判成 diagram」，覆核的人就查不到它其實回了 none。
         reclassified_from = policy_reclassified_from

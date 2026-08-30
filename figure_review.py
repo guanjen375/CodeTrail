@@ -1837,11 +1837,21 @@ def write_run_artifacts(root, *, document_id: str, run_id: str, figures, variant
         entry["duplicate_of"] = _duplicate_of(entry, figure_id)
         actual = {item["variant_id"] for item in mine}
         declared = set(entry["variants"])
-        ledger = (entry.get("evidence") or {}).get("sent_variants")
-        if isinstance(ledger, list) and entry["extraction_status"] == _fx().EXTRACTION_FAILED:
+        if entry["extraction_status"] == _fx().EXTRACTION_FAILED:
             # 失敗 entry 的真相**只有** send ledger（`variants` 依契約是空的）。
-            # 雙向核對:少了就是導致失敗的影像沒留下來、多了就是把沒送出去的
-            # renderer 產物寫成了模型輸入。兩種都讓覆核的人看錯東西。
+            # 缺 ledger / 型別不對時**不得整段略過驗證**：那樣一個 failed result 就能
+            # 帶著任意落盤 variant 或 `variants=["never-sent"]` 成功發布，而那正是
+            # producer contract 漂移該 fail-loud 的情境。
+            # 這裡是 `write_run_artifacts()`（發布路徑），所以無條件強制。讀既有
+            # manifest 走的是 `_validate_manifest()`，那邊沒有這條——舊 artifact 沒有
+            # 這個欄位是正常的，讀取端不該因此打不開。
+            ledger = (entry.get("evidence") or {}).get("sent_variants")
+            _require(isinstance(ledger, list)
+                     and all(isinstance(item, str) for item in ledger),
+                     f"figure={figure_id}: extraction_status=failed 卻沒有可用的 "
+                     f"send ledger（evidence['sent_variants'] 必須是 list[str]，"
+                     f"收到 {type(ledger).__name__}）——沒有它就說不出模型到底看過"
+                     "哪幾張，落盤的影像也無從核對")
             expected = {str(item) for item in ledger}
             _require(actual == expected,
                      f"figure={figure_id}: 落盤的模型輸入 {sorted(actual)} 與 send "

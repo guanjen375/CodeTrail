@@ -3540,3 +3540,35 @@ def test_document_level_failure_keeps_the_earlier_quality_failures(monkeypatch):
     carried = {getattr(f, "figure_id", "") for f in (exc.value.results or [])}
     assert fig_id("quality") in carried, (
         "第一張的品質失敗紀錄被丟掉了", sorted(carried))
+
+
+@pytest.mark.smoke
+def test_grid_normalization_that_collides_with_an_existing_id_is_refused(monkeypatch):
+    """★ `+grid` 是**送模之前才產生**的，唯一性必須在正規化之後再驗一次。
+
+    原始集合有 `x` 與 `x+grid`、只有 `x` 被正規化時，送模集合就會出現兩份不同 bytes
+    共用 `x+grid`。recorder 遇到碰撞靜默保留先前那一份、ledger 也去重，最終 artifact
+    對不回模型實際讀的那一張——只驗原始 variants 的檢查完全看不到這件事。
+    """
+    spy = VLSpy({"figure_raster_kind_v1": raster_kind("table"),
+                 "figure_table": REGISTER_TABLE})
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+    monkeypatch.setattr(
+        figure_verify, "_grid_normalized_variants",
+        # 兩片都被正規化成同一個 id（真實情境：原始集合裡已經有人叫 `x+grid`）
+        lambda variants, ctx: [variant(v.figure_id, variant_id="crop@200dpi+grid",
+                                       tile_index=v.tile_index, tile_total=v.tile_total,
+                                       png=v.png, bbox=v.bbox)
+                               for v in variants])
+
+    def _render(_doc, cand):
+        return [variant(cand.figure_id, tile_index=i, tile_total=2,
+                        png=f"PNG-{i}".encode(), bbox=cand.bbox)
+                for i in (1, 2)]
+
+    # producer contract 破了（同 id 不同 bytes）→ 與 `_validate_variants()` 的其他
+    # 違規同一個待遇：整份文件零寫入，不是「這一張缺席」。
+    with pytest.raises(figure_extract.FigureExtractionError, match="variant_id"):
+        extract([candidate(kind=figure_extract.KIND_RASTER)],
+                {4: page_evidence()}, render=_render)

@@ -2020,24 +2020,37 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             for candidate in candidates
         }
         rendered: List = []
-        seen_variants = set()
+        seen_variants: Dict[Tuple[str, str], str] = {}
+
+        def _remember(variant) -> None:
+            """登記一份 variant；同 id 不同 bytes 一律 fail-loud。
+
+            以前這裡只是 `continue`：同一個 id 的第二份被靜默丟掉，artifact 保存的是
+            **先前那一份**的 bytes，而模型讀的是後來那一份——覆核的人對著錯的圖找內容，
+            manifest 上完全看不出來。
+            """
+            key = (getattr(variant, "figure_id", ""), getattr(variant, "variant_id", ""))
+            digest = str(getattr(variant, "digest", "") or "")
+            previous = seen_variants.get(key)
+            if previous is None:
+                seen_variants[key] = digest
+                rendered.append(variant)
+                return
+            if previous != digest:
+                raise fx.FigureExtractionError(
+                    f"{filename}: variant {key[1]!r}（figure={key[0]}）被登記兩次而且"
+                    f"bytes 不同（{previous[:12]}… vs {digest[:12]}…）。id 是落盤檔名"
+                    "與 manifest 宣告共用的身分，保存下來的會與模型實際讀的對不上。")
 
         def _record(doc_arg, candidate):
             produced = fx.render_candidate_variants(doc_arg, candidate) or []
             for variant in produced:
-                key = (getattr(variant, "figure_id", ""), getattr(variant, "variant_id", ""))
-                if key in seen_variants:
-                    continue
-                seen_variants.add(key)
-                rendered.append(variant)
+                _remember(variant)
             return produced
 
         def _record_generated(variant):
             """登記 verifier 由原始 pixels 產生的實際模型輸入（例如 ruled-grid 正規化）。"""
-            key = (getattr(variant, "figure_id", ""), getattr(variant, "variant_id", ""))
-            if key not in seen_variants:
-                seen_variants.add(key)
-                rendered.append(variant)
+            _remember(variant)
             return variant
 
         def _progress(*parts):

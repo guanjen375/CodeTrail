@@ -136,7 +136,7 @@ def terminal_payload(lines=TERMINAL_LINES):
 def make_figure(doc_id: str, fig_id: str, payload, *, kind="table", revision=1,
                 status="unverified", extraction="complete", variants=("crop@200dpi",),
                 model_input="crop@200dpi", page=3, figure_index=1, reasons=(),
-                reason_details=()):
+                reason_details=(), sent_variants=None):
     row_total = line_total = None
     if payload is not None and kind == fx.KIND_TABLE:
         row_total = payload["rows"][-1]["row_index"] if payload["rows"] else 0
@@ -157,6 +157,12 @@ def make_figure(doc_id: str, fig_id: str, payload, *, kind="table", revision=1,
         "model_input_variant": model_input, "row_total": row_total,
         "line_total": line_total, "variants": list(variants),
         "evidence": {
+            # 抽壞的結果依契約 `variants=[]`（中止時宣告不出自己送過什麼），真相在
+            # send ledger。真 producer（`figure_verify._failed_result`）一律會帶這個
+            # 欄位，所以 fixture 也要帶——沒帶的話測的是產線上不存在的形狀。
+            **({"sent_variants": list(
+                sent_variants if sent_variants is not None else ["crop@200dpi"])}
+               if extraction == "failed" else {}),
             "channels": ["markdown_pos", "words_geometry"],
             # 可信狀態不得配空 evidence（契約 §19.4）→ fixture 要給 kind 對應的
             # 格/行級對齊，否則連 `native_verified` 都寫不出去（這是刻意的）。
@@ -3287,3 +3293,49 @@ def test_apply_fix_refuses_a_malformed_retrieval_context(env):
 
     assert "caption" in str(exc.value) and "必須是 str" in str(exc.value), exc.value
     assert kb_path.read_bytes() == before, "拒絕就要零寫入"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("overrides, fragment", [
+    ({}, "send ledger"),                                  # 完全沒有 ledger
+    ({"sent_variants": "crop@200dpi"}, "send ledger"),    # 型別不對（str 不是 list）
+    ({"sent_variants": [1]}, "send ledger"),              # 元素不是 str
+])
+def test_failed_entry_without_a_usable_ledger_is_refused(env, overrides, fragment):
+    """★ failed entry 缺 ledger／型別不對時，writer 不得整段略過驗證。
+
+    雙向核對只在 `sent_variants` 恰好是 list 時執行，而 `failed=True` 又跳過後續的
+    declared/actual 檢查——於是缺 ledger 的失敗結果可以帶著任意落盤 variant 發布。
+    那正是 producer contract 漂移該 fail-loud 的情境。
+    """
+    root, _outside = env
+    doc_id = document_id(root)
+    fig = figure_id(doc_id)
+    figure = make_figure(doc_id, fig, None, extraction="failed", status="needs_review",
+                         variants=(), model_input="failed")
+    figure["evidence"] = {"failure": "boom", "lane": "vl", **overrides}
+
+    with pytest.raises(fx.FigureReviewError, match=fragment):
+        fr.write_run_artifacts(root, document_id=doc_id, run_id=fr.new_run_id(),
+                               figures=[figure], variants=[make_variant(fig)])
+
+
+@pytest.mark.smoke
+def test_failed_entry_that_declares_variants_is_refused(env):
+    """★ 失敗結果依契約 `variants=[]`；非空就是 producer 漂移，不得靜默發布。
+
+    這條由既有的 `_validate_view()` 擋（比 send-ledger 核對更早），這裡把它與
+    ledger 那幾條放在一起，是為了讓「failed entry 的模型輸入契約」在同一個地方
+    讀得完——少了任何一條，多報的 id 就會被寫成「送進模型的影像」。
+    """
+    root, _outside = env
+    doc_id = document_id(root)
+    fig = figure_id(doc_id)
+    figure = make_figure(doc_id, fig, None, extraction="failed", status="needs_review",
+                         variants=("never-sent",), model_input="failed")
+    figure["evidence"] = {"failure": "boom", "lane": "vl",
+                          "sent_variants": ["crop@200dpi"]}
+
+    with pytest.raises(fx.FigureReviewError, match="不得宣告送過 variant"):
+        fr.write_run_artifacts(root, document_id=doc_id, run_id=fr.new_run_id(),
+                               figures=[figure], variants=[make_variant(fig)])
