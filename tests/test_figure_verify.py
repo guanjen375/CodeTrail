@@ -12,6 +12,7 @@ prompt cache 冒充獨立佐證、自我佐證升級成 corroborated、以及失
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -166,6 +167,10 @@ class VLSpy:
         seq = self._per_schema.get(name, 0)
         self._per_schema[name] = seq + 1
         entry = self.script[name]
+        if callable(entry):
+            # 依**影像**決定回應。list 是依呼叫序的，重試會吃掉下一筆，所以表達不出
+            # 「這一片永遠是空的、那一片永遠有內容」——多 tile 的案例只能這樣寫。
+            entry = entry(kwargs)
         text = entry[min(seq, len(entry) - 1)] if isinstance(entry, list) else entry
         if isinstance(text, Exception):
             raise text
@@ -3080,12 +3085,18 @@ def test_multi_tile_candidate_is_never_skipped_on_the_first_tile_alone(monkeypat
     後面幾片根本不會被檢查，而 `raster_not_a_figure` 又不進 actionable 通知——
     一整張 register table 就這樣無聲消失。
     """
+    # ★ 第一片**永遠忠實地回空**（它真的是留白 / logo），重試幾次都一樣——這才是
+    # 原始案例。上一輪這條讓兩片都回同一份非空 diagram，於是完全沒驗到
+    # 「第一片空了之後還讀不讀得到第二片」。
+    blank = json.dumps({"title": "", "labels": [], "components": [],
+                        "relations": [], "values": []})
+    filled = json.dumps({"title": "register map", "labels": ["CTRL0"],
+                         "components": [{"name": "CTRL0", "desc": "0x4000_0100"}],
+                         "relations": [], "values": []})
     spy = VLSpy({
         "figure_raster_kind_v1": raster_kind("none"),
-        "figure_diagram": json.dumps({
-            "title": "register map", "labels": ["CTRL0"],
-            "components": [{"name": "CTRL0", "desc": "0x4000_0100"}],
-            "relations": [], "values": []}),
+        "figure_diagram": lambda kw: (
+            blank if base64.b64decode(kw["image_base64"]) == b"PNG-1" else filled),
     })
     install_vl(monkeypatch, spy)
     pass_probe(monkeypatch)
@@ -3102,7 +3113,14 @@ def test_multi_tile_candidate_is_never_skipped_on_the_first_tile_alone(monkeypat
 
     assert result.extraction_status == figure_extract.EXTRACTION_COMPLETE, result
     assert result.kind == figure_extract.KIND_DIAGRAM, result.kind
-    assert result.payload, "多片候選不得零 payload 缺席"
+    assert [c["name"] for c in result.payload["components"]] == ["CTRL0"], (
+        "第一片留白就中止的話，第二片的內容一個字都讀不到", result.payload)
+    assert spy.schema_names().count("figure_diagram") >= 2, (
+        "第一片空了之後仍要繼續讀第二片", spy.schema_names())
+    # 分類器回的是 none，被 policy 改判成 diagram——manifest 要說得出這件事
+    assert "raster_kind_reclassified" in result.reasons, result.reasons
+    assert result.evidence["raster_classification"]["reclassified_from"] == "none", (
+        result.evidence["raster_classification"])
 
 
 @pytest.mark.smoke
@@ -3130,3 +3148,33 @@ def test_prose_with_an_empty_transcription_falls_back_to_diagram(monkeypatch):
     assert result.kind == figure_extract.KIND_DIAGRAM, result.kind
     assert "raster_kind_reclassified" in result.reasons, result.reasons
     assert "figure_diagram" in spy.schema_names(), spy.schema_names()
+
+
+@pytest.mark.smoke
+def test_diagram_stitch_keeps_duplicate_looking_components(monkeypatch):
+    """★ 兩片 tile 出現同名同描述的元件，不得被折成一個。
+
+    diagram 沒有列/行級原子，跨片的元件身分證明不了——圖上完全可能真的有兩個一模
+    一樣標示的方塊。去重會把 multiplicity 永久刪掉，而 canonical payload 事後救不回來。
+    """
+    same = {"title": "", "labels": ["clk"],
+            "components": [{"name": "PLL", "desc": "phase locked loop"}],
+            "relations": [], "values": []}
+    spy = VLSpy({"figure_raster_kind_v1": raster_kind("diagram"),
+                 "figure_diagram": json.dumps(same)})
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+
+    def _render(_doc, cand):
+        return [variant(cand.figure_id, variant_id=f"crop@200dpi#tile{i}of2",
+                        tile_index=i, tile_total=2, png=f"PNG-{i}".encode(),
+                        bbox=cand.bbox)
+                for i in (1, 2)]
+
+    result = extract([candidate(kind=figure_extract.KIND_RASTER)],
+                     {4: page_evidence()}, render=_render)[0]
+
+    assert [c["name"] for c in result.payload["components"]] == ["PLL", "PLL"], (
+        "去重會把兩個不同的方塊折成一個", result.payload["components"])
+    assert result.payload["labels"] == ["clk", "clk"], result.payload["labels"]
+    assert result.evidence["stitch"]["uncertain"] is True

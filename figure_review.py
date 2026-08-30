@@ -1847,6 +1847,15 @@ def write_run_artifacts(root, *, document_id: str, run_id: str, figures, variant
             _require(actual <= declared,
                      f"figure={figure_id}: 落盤的模型 variant {sorted(actual - declared)} "
                      "沒有被 FigureResult.variants 宣告過")
+        elif entry["extraction_status"] != _fx().EXTRACTION_COMPLETE:
+            # 抽壞 / 判定不是圖面的 entry：結果沒辦法可靠宣告自己送過什麼（中止時
+            # `variants=[]`），但導致失敗的那幾張影像**要留得下來**才診斷得了。
+            # 保留重要的那個方向——「宣告的每一份都要真的落盤」——但允許落盤的比
+            # 宣告的多；多出來的是同一張圖的 renderer 產物，真相由 `variant_paths`
+            # （實際落盤）與 `variants`（結果自報）各自表達，與 run 級中止同一套說法。
+            _require(declared <= actual,
+                     f"figure={figure_id}: 宣告送模的 variants {sorted(declared - actual)} "
+                     "沒有落盤——實際模型輸入必須每一份都保存得下來")
         else:
             _require(declared == actual,
                      f"figure={figure_id}: 宣告送模的 variants {sorted(declared)} 與實際落盤的 "
@@ -2157,11 +2166,20 @@ def _render_review(manifest: dict) -> str:
                 # native lane：零 VL、模型從頭到尾沒看過任何影像。
                 out.append("- **無模型影像輸入**（原生結構抽取，零 VL 呼叫）")
             elif not variant_paths:
-                # 抽壞的那幾張 `variants=[]`（結果沒辦法可靠宣告自己送過什麼），但
-                # 模型**很可能已經被呼叫過多次**。說成「零 VL 呼叫」會讓看的人以為
-                # 這張圖從沒進過模型，於是往錯的方向查。
-                out.append("- **模型輸入未保存**（走的是 VL lane，抽取中止前可能已經"
-                           "呼叫過模型；下方若有覆核用影像，那是事後補 render 的）")
+                # 抽壞的那幾張 `variants=[]`（結果沒辦法可靠宣告自己送過什麼）。
+                # **lane 要照結果自己記的講**：`_failed_result` 同時服務 native lane、
+                # VL lane 與送模之前的 producer failure，從「有沒有 variant 檔」反推
+                # 會把 native 的失敗說成 VL（反之亦然），看的人就往錯的方向查。
+                lane = str((entry.get("evidence") or {}).get("lane", "") or "")
+                if lane == "native":
+                    out.append("- **無模型影像輸入**（原生結構抽取，零 VL 呼叫）")
+                elif lane:
+                    out.append(f"- **模型輸入未保存**（走的是 {lane} lane，抽取中止前"
+                               "可能已經呼叫過模型；下方若有覆核用影像，那是事後補"
+                               " render 的）")
+                else:
+                    out.append("- **模型輸入未保存**（這筆沒有記下走哪條 lane，"
+                               "無法判斷模型有沒有看過這張圖）")
             else:
                 out.append(
                     f"- **實際模型輸入**: variant `{entry['model_input_variant']}`"

@@ -109,6 +109,3 @@ module 層 `pytestmark` 換成單條 decorator，gate 都還是綠的。
 - CI 不可以依賴 llama-server / GPU / 大型 GGUF 下載。
 - 任何測試用到 LLM 都要 mock 或 graceful skip（`pytest.importorskip` 或 `pytest.skip`）——
   這是**撰寫**測試的規範，執行權責見 §1.2。
-
-
-

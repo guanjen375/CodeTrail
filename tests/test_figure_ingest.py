@@ -3045,3 +3045,35 @@ def test_not_a_figure_keeps_its_model_input_in_the_manifest(tmp_path: Path, monk
     review = (_manifests(tmp_path)[-1].parent / "review.md").read_text(encoding="utf-8")
     assert "零 VL 呼叫" not in review, review
     assert "判定不是圖面" in review, review
+
+
+@pytest.mark.smoke
+def test_failed_figure_keeps_the_model_input_that_broke_it(tmp_path: Path, monkeypatch):
+    """★ 抽壞那一張的**實際模型輸入**要留得下來，事後補 render 的原圖重現不了它。
+
+    `_failed_result` 的 `variants=[]`（中止的結果沒辦法可靠宣告自己送過什麼）。照
+    declared 濾 rendered 的話，導致失敗的那張影像會跟著被刪掉，失敗 artifact 就只
+    剩一行錯誤訊息，診斷不了也覆核不了。
+    """
+    kb_path = _kb_ready(monkeypatch, tmp_path)
+    pdf, _harness_obj, (fid,) = _vl_case(tmp_path, monkeypatch, [
+        (1, BIG_BBOX_FOR_LANE, PNG_A, figure_extract.KIND_TABLE,
+         [{"class": "picture", "bbox": BIG_BBOX_FOR_LANE}]),
+    ])
+    _use_real_artifact_store(monkeypatch)
+    _use_real_vl_lane(monkeypatch, _FakeVL({
+        ("figure_table", PNG_A): (GOOD_TABLE_JSON, "length"),      # 永遠截斷 → 品質失敗
+    }))
+
+    RAG.add_document(str(pdf), str(kb_path))     # 不拋例外＝這一張缺席、其餘照常
+
+    manifest_path = _manifests(tmp_path)[-1]
+    manifest, entry = _manifest_entry(manifest_path, fid)
+    assert manifest["failed"] is False
+    assert entry["extraction_status"] == figure_extract.EXTRACTION_FAILED
+    assert entry["variant_paths"], (
+        "導致失敗的那張影像必須留得下來", entry["variant_paths"])
+    for relative in entry["variant_paths"].values():
+        assert (tmp_path / relative).is_file(), relative
+    review = (manifest_path.parent / "review.md").read_text(encoding="utf-8")
+    assert "零 VL 呼叫" not in review, "走 VL lane 的失敗不得說成零 VL"

@@ -1541,3 +1541,27 @@ def test_state_machine_constants_are_partitioned():
     for name in ("FigureValidationError", "FigureBudgetError", "FigureCapabilityError",
                  "FigureExtractionError", "FigureReviewError"):
         assert issubclass(getattr(fx, name), fx.FigureError)
+
+
+@pytest.mark.smoke
+def test_retrieval_context_rejects_an_explicit_null():
+    """★ 明確寫進去的 `null` 是型別錯誤，不是「沒有這個欄位」。
+
+    缺欄位已經由 `.get(name, "")` 給了空字串；把 null 悄悄當成空字串，等於替一份
+    壞掉的 metadata 決定它的意思。list / dict / 數字同理（那些會被 `str()` 轉成
+    Python repr 寫進 embedding 與 BM25，而看起來完全正常）。
+    """
+    figure = _figure()
+    for bad in (None, ["Table", "3-1"], {"a": 1}, 3):
+        with pytest.raises(fx.FigureValidationError, match="必須是 str"):
+            fx.build_figure_chunks(
+                [figure], source="spec.pdf", doc_type="spec",
+                next_chunk_index={3: 0},
+                evidence_ref_by_figure={figure.figure_id: "ref/manifest.json"},
+                context_by_figure={figure.figure_id: {"caption": bad}})
+    # 缺欄位仍然合法（舊 KB 的 chunk 沒有這些欄位）
+    chunks = fx.build_figure_chunks(
+        [figure], source="spec.pdf", doc_type="spec", next_chunk_index={3: 0},
+        evidence_ref_by_figure={figure.figure_id: "ref/manifest.json"},
+        context_by_figure={figure.figure_id: {"section": "3.2 Registers"}})
+    assert chunks[0]["figure_caption"] == "" and chunks[0]["section"] == "3.2 Registers"

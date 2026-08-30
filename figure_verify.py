@@ -3910,7 +3910,7 @@ def _build_result(candidate, kind: str, payload: dict, findings: _Findings, evid
     )
 
 
-def _failed_result(candidate, kind: str, reason: str) -> FigureResult:
+def _failed_result(candidate, kind: str, reason: str, *, lane: str = "") -> FigureResult:
     """抽取失敗時可覆核的 `FigureResult`（契約 §12.2）：`payload=None`、
     `model_input_variant="failed"`、`variants=[]`。
 
@@ -3933,7 +3933,10 @@ def _failed_result(candidate, kind: str, reason: str) -> FigureResult:
         extraction_status=figure_extract.EXTRACTION_FAILED,
         verification_status=figure_extract.VERIF_NEEDS_REVIEW,
         reasons=["extraction_failed"], reason_details=[reason],
-        evidence={"failure": reason},
+        # `lane` 要留得下來：`_failed_result` 同時服務 native lane、VL lane 與「送模
+        # 之前」的 producer failure。少了它，review.md 只能從「有沒有 variant 檔」
+        # 反推，而那會把 native lane 的失敗說成「走的是 VL lane」（反之亦然）。
+        evidence={"failure": reason, "lane": lane},
         occurrences=_occurrences_for(candidate, page, bbox),
         model_input_variant="failed", variants=[],
         row_total=None, line_total=None,
@@ -4106,17 +4109,16 @@ def _stitch_payloads(kind: str, payloads: list[dict], variants, findings: _Findi
                   "title": next((p["title"] for p in payloads if p["title"]), ""),
                   "labels": [], "components": [], "relations": [], "values": []}
         for field in ("labels", "components", "relations", "values"):
-            seen: list = []
-            for payload in payloads:
-                for item in payload[field]:
-                    if item not in seen:
-                        seen.append(item)
-            merged[field] = seen
+            # **不去重**：同名同描述的兩個元件在圖上完全可能是兩個不同的方塊，
+            # 折成一個就是把 multiplicity 永久刪掉，而且 canonical payload 事後救不
+            # 回來。重疊帶造成的重複則由 `uncertain` 揭露——寧可多一筆看得見的重複，
+            # 也不要少一筆看不見的實體。
+            merged[field] = [item for payload in payloads for item in payload[field]]
         stitch["uncertain"] = True
         findings.note(
             "stitch_diagram_union",
-            f"{len(payloads)} 片 tile 的 diagram 內容取聯集：diagram 沒有列/行級"
-            "原子，跨片的元件身分無法證明，重複或分屬兩片的關係都可能沒有合併",
+            f"{len(payloads)} 片 tile 的 diagram 內容直接串接（不去重）：diagram 沒有"
+            "列/行級原子，跨片的元件身分無法證明，重疊帶上的元件可能出現兩次",
         )
         return merged, stitch
 
@@ -4577,30 +4579,63 @@ def _resolve_ambiguous(outcomes: dict, *, where: str) -> FigureResult:
 
 
 def _vl_extract(kind: str, variants, ctx: dict, *, allow_retry: bool,
-                cache_prompt: bool) -> list[dict]:
-    payloads = []
-    for variant in variants:
+                cache_prompt: bool) -> tuple[list[dict], list, list[int]]:
+    """逐片抽取。回 `(payloads, 對應的 variants, 空白片的 1-based 序號)`。
+
+    **切片候選的單一空白片不得中止整張圖**：tile 是同一張圖的垂直切片，最上面那一片
+    是留白、頁首或 logo 完全正常。舊碼在第一片就 raise，於是後面幾片一次都沒被讀過
+    ——症狀是「一整張 register table 因為上緣有塊空白而整張消失」。空白片只從接合輸入
+    裡拿掉並列進 `empty_tiles`；**全部都空**才維持原本的 `empty_payload` 語義（那時
+    「這張圖沒有內容」才是模型真的說出來的話）。
+
+    單片候選一個字都不變：`len(variants) == 1` 時直接往上拋，`empty_payload` 仍是
+    「kind 猜錯了」的訊號（`_run_vl_lane` 據以改走 diagram）。
+    """
+    payloads: list[dict] = []
+    kept: list = []
+    empty_tiles: list[int] = []
+    for index, variant in enumerate(variants, 1):
         grid_hint = _raster_table_grid_hint(variant) if kind == figure_extract.KIND_TABLE else None
         if grid_hint is not None:
             ctx.setdefault("table_grid_hints", {})[
                 str(getattr(variant, "variant_id", "") or "vl")
             ] = copy.deepcopy(grid_hint)
-        payloads.append(_extract_variant_payload(
-            kind=kind, variant=variant, base_url=ctx["base_url"], model=ctx["model"],
-            profile=ctx["profile"], where=ctx["where"], allow_retry=allow_retry,
-            counters=ctx["counters"], cache_prompt=cache_prompt, grid_hint=grid_hint,
-            server_n_ctx=ctx.get("server_n_ctx"),
-            budget_hints=ctx.setdefault("output_budgets", {}),  # 缺 key 時退成單次記憶
-        ))
-    return payloads
+        try:
+            payload = _extract_variant_payload(
+                kind=kind, variant=variant, base_url=ctx["base_url"], model=ctx["model"],
+                profile=ctx["profile"], where=ctx["where"], allow_retry=allow_retry,
+                counters=ctx["counters"], cache_prompt=cache_prompt, grid_hint=grid_hint,
+                server_n_ctx=ctx.get("server_n_ctx"),
+                budget_hints=ctx.setdefault("output_budgets", {}),  # 缺 key 時退成單次記憶
+            )
+        except _SampleFailure as exc:
+            if exc.slug != "empty_payload" or len(variants) == 1:
+                raise
+            empty_tiles.append(index)
+            continue
+        payloads.append(payload)
+        kept.append(variant)
+    if not payloads:
+        raise _SampleFailure(
+            "empty_payload",
+            f"{len(variants)} 片 tile 全部沒有內容（模型對每一片都說這裡什麼都沒有）")
+    return payloads, kept, empty_tiles
 
 
 def _vl_result_for_kind(candidate, evidence, kind: str, variants, ctx: dict,
                         *, allow_retry: bool, second_sample: bool) -> FigureResult:
     findings = _Findings()
     where = ctx["where"]
-    payloads = _vl_extract(kind, variants, ctx, allow_retry=allow_retry, cache_prompt=True)
-    payload, stitch = _stitch_payloads(kind, payloads, variants, findings, where=where)
+    payloads, kept, empty_tiles = _vl_extract(
+        kind, variants, ctx, allow_retry=allow_retry, cache_prompt=True)
+    if empty_tiles:
+        # 留白片被跳過是**內容的一部分**：不說的話，衍生文字看起來就像整張圖都在這裡。
+        findings.note(
+            "blank_tile_skipped",
+            f"第 {empty_tiles} 片 tile（共 {len(variants)} 片）沒有任何內容，"
+            "已從接合輸入移除；其餘片照常抽取",
+        )
+    payload, stitch = _stitch_payloads(kind, payloads, kept, findings, where=where)
     if kind == figure_extract.KIND_TABLE:
         _demote_duplicated_table_header(payload, findings)
     _finalize_payload(payload, kind, findings, where=where)
@@ -4634,8 +4669,9 @@ def _vl_result_for_kind(candidate, evidence, kind: str, variants, ctx: dict,
         try:
             second = _stitch_payloads(
                 kind,
-                _vl_extract(kind, variants, ctx, allow_retry=True, cache_prompt=False),
-                variants, findings, where=where,
+                *_vl_extract(kind, variants, ctx,
+                             allow_retry=True, cache_prompt=False)[:2],
+                findings, where=where,
             )[0]
             if kind == figure_extract.KIND_TABLE:
                 _demote_duplicated_table_header(second)
@@ -4777,6 +4813,7 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
     if kind == figure_extract.KIND_RASTER:
         classification = _classify_raster_kind(variants[0], ctx)
         resolved = classification["kind"]
+        policy_reclassified_from = ""
         if resolved == figure_extract.KIND_NOT_A_FIGURE and len(variants) > 1:
             # ★ 分類器**只看得到第一片**。切片的候選是大圖（高表格 / 長 log），第一片
             # 剛好是留白或 logo 就把整張圖標成缺席，而後面幾片根本不會被檢查、也不進
@@ -4789,6 +4826,7 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
                               "reclassified_from": figure_extract.KIND_NOT_A_FIGURE,
                               "reclassified_reason": "multi_tile_cannot_be_skipped"}
             resolved = figure_extract.KIND_DIAGRAM
+            policy_reclassified_from = figure_extract.KIND_NOT_A_FIGURE
         if resolved == figure_extract.KIND_NOT_A_FIGURE:
             # **分類完就停手**：不呼叫抽取、不產 payload、不佔覆核清單。
             print(f"  [INFO] {ctx.get('where', '')}: 分類為「不是圖面」，跳過抽取",
@@ -4815,7 +4853,9 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
             _grid_normalized_variants(variants, ctx)
             if resolved == figure_extract.KIND_TABLE else variants
         )
-        reclassified_from = ""
+        # 上面那條 policy 改判（多片候選不得被跳過）也算 reclassification：不接上來的話
+        # manifest 會說成「分類器直接判成 diagram」，覆核的人就查不到它其實回了 none。
+        reclassified_from = policy_reclassified_from
         try:
             result = _vl_result_for_kind(
                 candidate, evidence, resolved, extraction_variants, ctx,
@@ -5023,7 +5063,7 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
                 f"{where}: plan 沒有這一頁的 PageEvidence，無法驗證（零寫入）"
             )
             error.results = results
-            error.failed = _failed_result(candidate, kind, str(error))
+            error.failed = _failed_result(candidate, kind, str(error), lane=lanes[position])
             raise error
 
         lane = lanes[position]
@@ -5151,7 +5191,7 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
                 )
                 error = figure_extract.FigureExtractionError(message)
                 error.results = results
-                error.failed = _failed_result(candidate, kind, message)
+                error.failed = _failed_result(candidate, kind, message, lane=lane)
                 raise error from exc
             message = (
                 f"{where}: structured 抽取失敗（{exc.slug}）：{exc.detail}"
@@ -5161,7 +5201,7 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
             sequence = per_page.get(page, 0) + 1
             per_page[page] = sequence
             failed_result = replace(
-                _failed_result(candidate, kind, message),
+                _failed_result(candidate, kind, message, lane=lane),
                 figure_index=sequence,
                 reasons=["extraction_failed", exc.slug],
             )
@@ -5173,7 +5213,7 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
             continue
         except figure_extract.FigureExtractionError as exc:
             exc.results = results
-            exc.failed = _failed_result(candidate, kind, str(exc))
+            exc.failed = _failed_result(candidate, kind, str(exc), lane=lane)
             raise
 
         sequence = per_page.get(page, 0) + 1

@@ -1830,12 +1830,10 @@ def _figure_context(context_by_figure, figure_id: str, where: str) -> dict:
             f"{where}: context_by_figure[{figure_id!r}] 必須是 dict，收到 {type(raw).__name__}")
     resolved = {}
     for name in _CONTEXT_FIELDS:
+        # 缺欄位（舊 KB）已經由 `.get(name, "")` 給了空字串；走到這裡的 `None` 是
+        # **明確寫進去的 null**，那是型別錯誤，不是「沒有這個欄位」。悄悄當成空字串
+        # 就等於替一份壞掉的 metadata 決定它的意思。
         value = raw.get(name, "")
-        if value is None:
-            # JSON 對「沒有這個欄位」的表示法；舊 KB 的 chunk 常見。當空字串處理，
-            # 但 list / dict / 數字仍然拒收——那些會被 str() 轉成 Python repr 寫進
-            # embedding 與 BM25，而看起來完全正常。
-            value = ""
         if not isinstance(value, str):
             raise FigureValidationError(
                 f"{where}: context_by_figure[{figure_id!r}][{name!r}] 必須是 str，"

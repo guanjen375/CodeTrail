@@ -2059,10 +2059,17 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
                 for figure in results + skipped_figures
                 for variant_id in (figure.variants or [])
             }
+            # 抽壞的那幾張**全部保留**：`_failed_result` 的 `variants=[]`（中止的結果
+            # 沒辦法可靠宣告自己送過什麼），照 declared 濾就等於把導致失敗的那張圖
+            # 一起刪掉——事後補 render 的完整原圖重現不了它。writer 對 incomplete
+            # entry 只要求「宣告的都要落盤」，不要求相等，兩邊因此對得起來。
+            incomplete_ids = {figure.figure_id
+                              for figure in failed_figures + skipped_figures}
             rendered[:] = [
                 variant for variant in rendered
                 if (getattr(variant, "figure_id", ""),
                     getattr(variant, "variant_id", "")) in declared_inputs
+                or getattr(variant, "figure_id", "") in incomplete_ids
             ]
 
             by_fid = _verify_results_match_candidates(fx, filename, plan, extracted)
