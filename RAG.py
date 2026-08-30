@@ -2059,17 +2059,22 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
                 for figure in results + skipped_figures
                 for variant_id in (figure.variants or [])
             }
-            # 抽壞的那幾張**全部保留**：`_failed_result` 的 `variants=[]`（中止的結果
-            # 沒辦法可靠宣告自己送過什麼），照 declared 濾就等於把導致失敗的那張圖
-            # 一起刪掉——事後補 render 的完整原圖重現不了它。writer 對 incomplete
-            # entry 只要求「宣告的都要落盤」，不要求相等，兩邊因此對得起來。
-            incomplete_ids = {figure.figure_id
-                              for figure in failed_figures + skipped_figures}
+            # 抽壞的那幾張靠 **send ledger**（`evidence["sent_variants"]`）：
+            # `_failed_result` 的 `variants=[]`（中止的結果沒辦法可靠宣告自己送過
+            # 什麼），照 declared 濾會把導致失敗的那張圖一起刪掉——事後補 render 的
+            # 完整原圖重現不了它。但也**不能整包留**：三片裡第一片就失敗時，後兩片
+            # 根本沒送出去，寫進 `variant_paths`（「送進模型的影像」）就是謊報；
+            # table 的 grid 正規化同理，extractor 只看過 `+grid` 那一份。
+            sent_inputs = {
+                (figure.figure_id, str(variant_id))
+                for figure in failed_figures + skipped_figures
+                for variant_id in ((figure.evidence or {}).get("sent_variants") or [])
+            }
+            keep = declared_inputs | sent_inputs
             rendered[:] = [
                 variant for variant in rendered
                 if (getattr(variant, "figure_id", ""),
-                    getattr(variant, "variant_id", "")) in declared_inputs
-                or getattr(variant, "figure_id", "") in incomplete_ids
+                    getattr(variant, "variant_id", "")) in keep
             ]
 
             by_fid = _verify_results_match_candidates(fx, filename, plan, extracted)

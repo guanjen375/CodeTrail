@@ -1824,7 +1824,13 @@ def _figure_context(context_by_figure, figure_id: str, where: str) -> dict:
     悄悄把一個非 str（例如 None 或 list）寫進 `section` 會讓 BM25 組字與 REF 顯示
     各自壞在不同地方，而且都不會拋——所以在唯一入口驗完型別再寫。
     """
-    raw = (context_by_figure or {}).get(figure_id) or {}
+    # `or {}` 會把 `None` / `[]` / `""` 一律吞成空 dict，繞過下面的型別檢查——欄位層
+    # 修得再嚴，外層還是 fail-open。**缺 key** 才是合法的「這張圖沒給 context」。
+    mapping = {} if context_by_figure is None else context_by_figure
+    if not isinstance(mapping, dict):
+        raise FigureValidationError(
+            f"{where}: context_by_figure 必須是 dict 或 None，收到 {type(mapping).__name__}")
+    raw = mapping.get(figure_id, {}) if figure_id in mapping else {}
     if not isinstance(raw, dict):
         raise FigureValidationError(
             f"{where}: context_by_figure[{figure_id!r}] 必須是 dict，收到 {type(raw).__name__}")

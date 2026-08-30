@@ -3178,3 +3178,137 @@ def test_diagram_stitch_keeps_duplicate_looking_components(monkeypatch):
         "去重會把兩個不同的方塊折成一個", result.payload["components"])
     assert result.payload["labels"] == ["clk", "clk"], result.payload["labels"]
     assert result.evidence["stitch"]["uncertain"] is True
+
+
+@pytest.mark.smoke
+def test_blank_tile_never_lets_the_rest_be_trusted(monkeypatch):
+    """★ 少一片就是內容不完整，剩下的部分**不得**升成 trusted。
+
+    模型把有內容的 tile 誤回空時，那一片會無聲消失；anchor coverage 只算剩下的原子，
+    於是一份缺片的 payload 可以拿到 corroborated 而進 strict query。容忍空白片是為了
+    「不要整張圖消失」，不是為了「假裝它是完整的」——只記 note 攔不住 `_decide_status`。
+    """
+    rows = [[("CTRL0", "observed"), ("0x8000_0100", "observed")]]
+    spy = VLSpy({
+        "figure_table": lambda kw: (
+            table_json(["Name", "Addr"], []) if base64.b64decode(kw["image_base64"]) == b"PNG-2"
+            else table_json(["Name", "Addr"], rows)),
+    })
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+
+    def _render(_doc, cand):
+        return [variant(cand.figure_id, variant_id=f"crop@200dpi#tile{i}of2",
+                        tile_index=i, tile_total=2, png=f"PNG-{i}".encode(),
+                        bbox=cand.bbox)
+                for i in (1, 2)]
+
+    result = extract([candidate(kind=figure_extract.KIND_TABLE, native_lane=False)],
+                     {4: page_evidence()}, render=_render)[0]
+
+    assert result.extraction_status == figure_extract.EXTRACTION_COMPLETE, result
+    assert "blank_tile_dropped" in result.reasons, result.reasons
+    assert result.verification_status == figure_extract.VERIF_NEEDS_REVIEW, (
+        "缺片的 payload 不得是 trusted", result.verification_status)
+
+
+@pytest.mark.smoke
+def test_two_samples_that_drop_different_tiles_are_a_disagreement(monkeypatch):
+    """★ 兩次取樣各自漏掉不同的 tile → 比較的根本不是同一份內容。
+
+    第二次取樣是無 anchor 時唯一的驗證手段。丟掉 `empty_tiles` 的話，「兩次一致」
+    可能只是兩個不同 tile 子集剛好長得像——內容不同時還會撞上既有的
+    `sample_shape_mismatch` 硬失敗，**內容剛好相同時就完全無聲**，這條守的是後者。
+    """
+    blank = table_json(["Name", "Addr"], [])
+    # 兩片的內容**剛好一樣**（同一張表被切在重複帶上就會這樣）。於是兩次取樣的
+    # 拼接結果逐字相同、比對「一致」——但它們讀的根本是不同的 tile 子集。
+    same = table_json(["Name", "Addr"],
+                      [[("CTRL0", "observed"), ("0x8000_0100", "observed")]])
+
+    def _script(kw):
+        png = base64.b64decode(kw["image_base64"])
+        first_sample = kw.get("cache_prompt", True)
+        # 第一次取樣：第 2 片空；第二次取樣：第 1 片空
+        return blank if png == (b"PNG-2" if first_sample else b"PNG-1") else same
+
+    # diagram 不做第二樣本（`second_sample=(resolved != KIND_DIAGRAM)`），
+    # 所以這條必須走會取第二樣本的 kind。
+    spy = VLSpy({"figure_raster_kind_v1": raster_kind("table"),
+                 "figure_table": _script})
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+    # 重試一律 `cache_prompt=False`，會與「第二次取樣」用同一個旗標；關掉重試，
+    # 這個 fixture 才分得出兩次取樣。
+    monkeypatch.setattr(config, "FIGURE_EXTRACT_RETRIES", 0)
+
+    def _render(_doc, cand):
+        return [variant(cand.figure_id, variant_id=f"crop@200dpi#tile{i}of2",
+                        tile_index=i, tile_total=2, png=f"PNG-{i}".encode(),
+                        bbox=cand.bbox)
+                for i in (1, 2)]
+
+    result = extract([candidate(kind=figure_extract.KIND_RASTER)],
+                     {4: page_evidence()}, render=_render)[0]
+
+    assert "sample_tile_subset_mismatch" in result.reasons, result.reasons
+    assert result.verification_status == figure_extract.VERIF_NEEDS_REVIEW, result
+
+
+@pytest.mark.smoke
+def test_diagram_stitch_never_drops_a_second_title(monkeypatch):
+    """★ 兩片各抽到不同標題時，第二個標題不得永久消失。
+
+    payload 的 `title` 只有一格，取第一個非空值等於把另一個丟掉，而 canonical
+    payload 事後救不回來。至少要 fail 出來讓人看得到兩個候選。
+    """
+    def _script(kw):
+        png = base64.b64decode(kw["image_base64"])
+        title = "Clock tree" if png == b"PNG-1" else "Reset tree"
+        return json.dumps({"title": title, "labels": [], "components": [],
+                           "relations": [], "values": [{"key": "k", "value": "v",
+                                                        "desc": "d"}]})
+
+    spy = VLSpy({"figure_raster_kind_v1": raster_kind("diagram"),
+                 "figure_diagram": _script})
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+
+    def _render(_doc, cand):
+        return [variant(cand.figure_id, variant_id=f"crop@200dpi#tile{i}of2",
+                        tile_index=i, tile_total=2, png=f"PNG-{i}".encode(),
+                        bbox=cand.bbox)
+                for i in (1, 2)]
+
+    result = extract([candidate(kind=figure_extract.KIND_RASTER)],
+                     {4: page_evidence()}, render=_render)[0]
+
+    assert "stitch_title_conflict" in result.reasons, result.reasons
+    detail = " ".join(result.reason_details)
+    assert "Clock tree" in detail and "Reset tree" in detail, detail
+
+
+@pytest.mark.smoke
+def test_failed_result_records_only_the_tiles_that_were_actually_sent(monkeypatch):
+    """★ 三片裡第一片就失敗時，後兩片根本沒送出去，不得被寫成「送進模型的影像」。
+
+    `_failed_result` 的 `variants=[]`（中止的結果沒辦法可靠宣告自己送過什麼），
+    呼叫端若因此整包保留 renderer 產物，manifest 就會把沒送過的 tile 也列成模型輸入
+    ——覆核的人會對著一張模型從沒看過的圖找失敗原因。
+    """
+    spy = VLSpy({"figure_table": table_json(["Name"], [])}, finish_reason="length")
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+
+    def _render(_doc, cand):
+        return [variant(cand.figure_id, variant_id=f"crop@200dpi#tile{i}of3",
+                        tile_index=i, tile_total=3, png=f"PNG-{i}".encode(),
+                        bbox=cand.bbox)
+                for i in (1, 2, 3)]
+
+    result = extract([candidate(kind=figure_extract.KIND_TABLE, native_lane=False)],
+                     {4: page_evidence()}, render=_render)[0]
+
+    assert result.extraction_status == figure_extract.EXTRACTION_FAILED, result
+    assert result.evidence["sent_variants"] == ["crop@200dpi#tile1of3"], (
+        "只有第一片送出去過", result.evidence.get("sent_variants"))

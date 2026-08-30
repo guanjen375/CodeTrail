@@ -1565,3 +1565,23 @@ def test_retrieval_context_rejects_an_explicit_null():
         evidence_ref_by_figure={figure.figure_id: "ref/manifest.json"},
         context_by_figure={figure.figure_id: {"section": "3.2 Registers"}})
     assert chunks[0]["figure_caption"] == "" and chunks[0]["section"] == "3.2 Registers"
+
+
+@pytest.mark.smoke
+def test_retrieval_context_rejects_a_non_dict_entry():
+    """★ 外層的 `None` / `[]` / `""` 不得被當成「這張圖沒有 context」。
+
+    `(context_by_figure or {}).get(fid) or {}` 會把它們一律吞成空 dict，繞過下一行
+    的型別檢查——欄位層修得再嚴，外層還是 fail-open。**缺 key** 才是合法的「沒給」。
+    """
+    figure = _figure()
+    common = dict(source="spec.pdf", doc_type="spec",
+                  evidence_ref_by_figure={figure.figure_id: "ref/manifest.json"})
+    for bad in (None, [], "", 0):
+        with pytest.raises(fx.FigureValidationError, match="必須是 dict"):
+            fx.build_figure_chunks([figure], next_chunk_index={3: 0},
+                                   context_by_figure={figure.figure_id: bad}, **common)
+    # 整張圖不在 mapping 裡＝沒給，合法
+    chunks = fx.build_figure_chunks([figure], next_chunk_index={3: 0},
+                                    context_by_figure={}, **common)
+    assert chunks[0]["figure_caption"] == ""
