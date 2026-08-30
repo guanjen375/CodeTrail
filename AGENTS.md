@@ -1,5 +1,3 @@
-# AGENTS.md — 給 AI coding agent 的工作規範
-
 這個 repo 是一個 **本地 RAG / Code-RAG / MCP 工具集**。終端使用者透過 OpenCode TUI
 和 `aicode` wrapper（或薄的 `aicode_web` 背景 launcher）連到這個專案，用本地 llama.cpp `llama-server` 跑模型,
 分析 NDA / 內部 firmware repo。
@@ -124,10 +122,5 @@ module 層 `pytestmark` 換成單條 decorator，gate 都還是綠的。
 - 任何測試用到 LLM 都要 mock 或 graceful skip（`pytest.importorskip` 或 `pytest.skip`）——
   這是**撰寫**測試的規範，執行權責見 §2.2。
 
----
 
-## 6. NDA / 機敏資料
 
-- `knowledge.json`、`data/`、`*.jsonl`、`.code_rag_cache_*` 全部在 `.gitignore` 裡。
-- 任何 PR 都不能 commit 這些檔。
-- 如果你 grep 到 NDA 客戶名 / 規格書檔名 hardcode 在程式碼裡，**那是 bug**，要報告。
