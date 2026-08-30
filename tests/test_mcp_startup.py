@@ -23,8 +23,8 @@ import pytest
 from root_safety import validate_aicode_root as _validate
 from tests._harness import REPO_ROOT, spawn_mcp, terminate_proc, wait_for_marker
 
-# smoke:安全層(AGENTS.md §2.1 第 2 款「無聲失敗風險的契約」)
-# AGENTS.md §3 安全檢查點:mcp_server 啟動時的 AICODE_ROOT 驗證與 sandbox root 設定。
+# smoke:安全層(AGENTS.md §1.1 第 2 款「無聲失敗風險的契約」)
+# AGENTS.md §2 安全檢查點:mcp_server 啟動時的 AICODE_ROOT 驗證與 sandbox root 設定。
 pytestmark = pytest.mark.smoke
 
 # CI 沒裝 mcp 時 skip;日常 OpenCode 路線需要 mcp。

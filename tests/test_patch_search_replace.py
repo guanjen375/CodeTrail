@@ -3,7 +3,7 @@
 workflow A/E(2026-08-26)的新功能安全契約。S/R 沒有行號 hint:多處匹配一律拒絕、
 僅縮排相似的候選只當提示絕不代套、所有 block 對同一份原始 snapshot 定位。
 
-全部標 smoke(AGENTS.md §2.1 第 2 款「無聲失敗風險的契約」):S/R 走的是與 udiff
+全部標 smoke(AGENTS.md §1.1 第 2 款「無聲失敗風險的契約」):S/R 走的是與 udiff
 同一條 sandbox → limit → preflight → write → rollback 管線,任何一條鬆掉都是靜默寫錯檔。
 """
 from __future__ import annotations

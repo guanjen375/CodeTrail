@@ -1,7 +1,7 @@
 """figure_review —— `.codetrail/figures/**` 的路徑安全與人工修正交易。
 
-**整檔 module-level smoke**（AGENTS.md §2.1 第 2 款「無聲失敗風險的契約」）：
-這個模組是 AGENTS.md §3 意義下的新安全檢查點——它是唯一把 NDA 內容（原始頁面影像、
+**整檔 module-level smoke**（AGENTS.md §1.1 第 2 款「無聲失敗風險的契約」）：
+這個模組是 AGENTS.md §2 意義下的新安全檢查點——它是唯一把 NDA 內容（原始頁面影像、
 送模型的 crop、逐字 payload）寫進專案目錄的地方，也是唯一把「人工確認過的內容」推進
 知識庫的地方。破了都是無聲的：路徑逃出去不會有人喊，KB 半更新也不會有人喊。
 
@@ -291,7 +291,7 @@ def mkdir_secure(path: Path) -> Path:
 
 
 # ============================================================
-# 1. 路徑安全（AGENTS.md §3 檢查點）
+# 1. 路徑安全（AGENTS.md §2 檢查點）
 # ============================================================
 @pytest.mark.parametrize("component", ["..", ".", "a/b", "/etc/passwd", "", "x\x00y",
                                        "..\\evil", "a" * 129])

@@ -9,7 +9,7 @@
 3. JSON 不在了 ＝ 空 KB，而且無主 cache（含舊位置的 companion NPZ）要被清掉。
 4. `.codetrail/figures/` 不是 cache，fresh ingest 一個位元組都不准動它。
 
-為什麼一定要 smoke（AGENTS.md §2.1 第 2 款「無聲失敗風險的契約」）：這裡每一條
+為什麼一定要 smoke（AGENTS.md §1.1 第 2 款「無聲失敗風險的契約」）：這裡每一條
 的失敗模式都是**靜默錯答**——向量與 chunk 錯位一列，查詢照樣回答，只是答錯，
 而且沒有任何一行 log 會說出來。
 """
@@ -455,7 +455,7 @@ def test_ingest_after_an_external_json_deletion_starts_from_an_empty_kb(
 
 
 # ==========================================================================
-# ★ 安全檢查點（AGENTS.md §3）：cache 路徑上的 symlink 一律 fail-closed
+# ★ 安全檢查點（AGENTS.md §2）：cache 路徑上的 symlink 一律 fail-closed
 #
 # purge 會 rmtree 整個 <kb-id> 目錄。`.codetrail` 被換成指向 sandbox 外的 symlink
 # 時，「刪掉 knowledge.json 之後自動清無主 cache」就變成遞迴刪除外部目錄；寫入端

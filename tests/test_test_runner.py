@@ -168,7 +168,7 @@ def test_repo_discovery_is_a_superset_of_top_level_glob():
 
 
 # ---------------------------------------------------------------------------
-# marker 選取的分片契約(AGENTS.md §2.1 的 smoke 走這條路)
+# marker 選取的分片契約(AGENTS.md §1.1 的 smoke 走這條路)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.smoke

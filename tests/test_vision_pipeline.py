@@ -5,7 +5,7 @@ import copy
 
 import pytest
 
-# smoke:AGENTS.md §2.1 第 1 款「真實發生過的 bug 的 regression」
+# smoke:AGENTS.md §1.1 第 1 款「真實發生過的 bug 的 regression」
 # 真實 bug regression:VL 流程。
 pytestmark = pytest.mark.smoke
 

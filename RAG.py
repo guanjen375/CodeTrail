@@ -670,7 +670,7 @@ def _figure_extract():
 
     一律 `import figure_extract` 後走 module attribute 取用，不用
     `from figure_extract import x`——那會在 import 時把函式快照進本模組，測試
-    monkeypatch 門面就打不到（同 AGENTS.md §4 對 config 的規定）。
+    monkeypatch 門面就打不到（同 AGENTS.md §3 對 config 的規定）。
     """
     import figure_extract
     return figure_extract
@@ -1124,7 +1124,7 @@ def format_absent_regions(filename: str, absent: List[Dict]) -> str:
 
     ingest 仍然 exit 0，使用者只從 chunk 數看不出少了什麼；而缺席的內容在查詢時
     是**完全不存在**的，不說出來就會變成「問了得到查無資料、以為文件裡沒寫」。
-    只列頁碼、bbox 與固定 slug——一個字的文件內容都不含（AGENTS.md §6）。
+    只列頁碼、bbox 與固定 slug——一個字的文件內容都不含（NDA）。
     """
     if not absent:
         return ""

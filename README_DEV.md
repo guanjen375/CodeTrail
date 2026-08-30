@@ -8,7 +8,7 @@ AI agent 改 repo 前看 `AGENTS.md`（安全紅線與禁止事項）；這裡�
 ## 維護命令索引
 
 下面是命令目錄，不代表每個角色都能在每次修改中全部執行。實際執行權責以
-[AGENTS.md §2](AGENTS.md#2-測試-policy) 為準：預設 developer 在開發途中不跑測試，
+[AGENTS.md §1](AGENTS.md#2-測試-policy) 為準：預設 developer 在開發途中不跑測試，
 交付前只跑一次 smoke；只有本次 prompt 明示 `ROLE=REVIEWER` 才在程式碼收斂後跑一次
 full。靜態 consistency / compile 檢查不會收集 pytest，可在相關檔案變更後使用。
 
@@ -24,7 +24,7 @@ python3 deployment_profile.py validate
 # 部署唯讀相容檢查（需要本機 OpenCode；不寫設定、不跑 MCP/model）
 python3 scripts/opencode_direct_contract.py --root <PROJECT_TO_ANALYZE>
 
-# 測試入口（何時能跑見 AGENTS.md §2）
+# 測試入口（何時能跑見 AGENTS.md §1）
 python3 scripts/run_tests.py -m smoke
 python3 scripts/run_tests.py
 
@@ -47,7 +47,7 @@ MCP、低於 1.28 或 2.x 都列為 FAIL。
 **`-m <expr>`（例如交付前的 `-m smoke`）走同一套分片**：它跟無參數一樣只是「選
 整個 `tests/` 的一個子集」，分片不改變任何一條測試的語意。此時
 「某個 shard 一條都沒選中」（pytest exit 5）算正常，但**全部** shard 都是 5 會
-回報 exit 5 並明講「這不是通過」——AGENTS.md §2.2 的 0 collected 規則。
+回報 exit 5 並明講「這不是通過」——AGENTS.md §1.2 的 0 collected 規則。
 只要傳的是 `-k`、`-x`、node id、`--lf` 或其他組合，就維持原本的單一 pytest 行程與
 逐字轉發語意：`-x` 的 exitfirst、node id 的順序、`--lf` 依賴的共享 cache 在分片下
 都不再等價。
@@ -122,7 +122,7 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 module。smoke 的安全組成由 `tests/test_smoke_gate.py` 靜態守住；不要以手動檔案清單取代。
 
 `test_smoke_gate.py` 的 `SAFETY_MODULES` 記的是「檔名 →（說明, 必須存在且帶 smoke 的
-node 名）」，對照 [AGENTS.md §3](AGENTS.md#3-安全相關不要砍) 的檢查點清單。只驗「這個檔
+node 名）」，對照 [AGENTS.md §2](AGENTS.md#3-安全相關不要砍) 的檢查點清單。只驗「這個檔
 至少有一個 smoke 標記」是不夠的：刪掉那條檢查點測試、或把 module 層 `pytestmark` 換成
 單條 decorator，gate 都還是綠的，而缺口是無聲的。**新增 §3 檢查點時，AGENTS.md 的條目與
 這裡的 node 清單要一起改**。
@@ -369,7 +369,7 @@ node-id catalog 沒變，不會只因同名 C call 就 fan-out。只有名稱、
 overload identity 改變且牽動 C/C++ caller，才會在寫 DB 前切換成 full rebuild。相關
 pytest gate 是 `tests/test_ast_parser_cpp.py`、`tests/test_code_graph.py` 與
 `tests/test_code_graph_cpp_visibility.py`；reviewer 由收斂後的 full 統一涵蓋。developer 修 bug 時
-只依 AGENTS.md §2.3 單跑自己新增的 regression node 取得 red / green，不另跑這三個
+只依 AGENTS.md §1.3 單跑自己新增的 regression node 取得 red / green，不另跑這三個
 module。`python3 eval/run_code_smoke_eval.py` 也只在本次任務明示要檢查 code-inference
 品質時執行。
 

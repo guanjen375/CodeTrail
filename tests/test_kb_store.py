@@ -18,7 +18,7 @@ import knowledge_store
 import RAG
 from knowledge import KnowledgeBase
 
-# smoke:AGENTS.md §2.1 第 1 款「真實發生過的 bug 的 regression」
+# smoke:AGENTS.md §1.1 第 1 款「真實發生過的 bug 的 regression」
 # 真實 bug regression:KB staleness 誤判與刪文件後的 npz 重寫。
 pytestmark = pytest.mark.smoke
 

@@ -32,7 +32,7 @@ schema / shape / 雜湊不符——這些以前是「拒載，請你自己重建
 「JSON 自己宣告的 embedding model 與目前設定不符」不歸這裡管：那不是 cache
 的問題，是 KB 對自己身分的宣告，由載入端 fail-loud（切模型通常也要換切法）。
 
-### 路徑安全（AGENTS.md §3）
+### 路徑安全（AGENTS.md §2）
 
 cache 目錄是這個模組**唯一會遞迴刪除**的東西。`.codetrail` / `cache` /
 `embeddings` 任何一層被換成 symlink，purge 就會刪到 sandbox 外、寫入也會把 NDA
@@ -103,7 +103,7 @@ def legacy_companion(json_path) -> Path:
 
 
 def _checked_cache_dir(json_path) -> Path:
-    """★ 安全檢查點：驗過的 cache 目錄路徑（AGENTS.md §3）。
+    """★ 安全檢查點：驗過的 cache 目錄路徑（AGENTS.md §2）。
 
     純驗證，**不建立任何目錄**（`--preflight` 的零寫入斷言要看得到這一點）。
     從 KB 目錄逐層往下 lstat：任何一層是 symlink 或不是目錄一律 fail-loud。

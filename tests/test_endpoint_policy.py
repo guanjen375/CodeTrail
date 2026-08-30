@@ -19,7 +19,7 @@ import endpoint_policy  # noqa: E402
 import http_client  # noqa: E402
 import llama_client  # noqa: E402
 
-# smoke:安全層(AGENTS.md §2.1 第 2 款「無聲失敗風險的契約」)
+# smoke:安全層(AGENTS.md §1.1 第 2 款「無聲失敗風險的契約」)
 # 安全檢查點:prompt / 文件內容只能送到本機 endpoint,不得外流。
 pytestmark = pytest.mark.smoke
 

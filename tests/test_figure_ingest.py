@@ -2234,7 +2234,7 @@ def test_context_generation_sends_zero_requests_for_structured_chunks(tmp_path: 
          "origin": "diagram"},
     ]
     document = ExtractedDocument(raw_text="doc", chunks=chunks, source="reg_spec.pdf")
-    # 離線:不得碰 /props、不得讀本機 model 設定（AGENTS.md §5）
+    # 離線:不得碰 /props、不得讀本機 model 設定（AGENTS.md §4）
     monkeypatch.setattr(context_generation, "model_identity",
                         lambda *_a, **_k: {"n_ctx": 4096})
     # cache_dir 一定要明示指到 tmp_path：不給的話 `cache_root_for()` 會退回

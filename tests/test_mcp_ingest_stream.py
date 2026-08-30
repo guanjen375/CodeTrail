@@ -1,6 +1,6 @@
 """`ingest_document` 的子行程契約:逐行串流、逾時收屍、preflight 轉送。
 
-為什麼需要這一包(AGENTS.md §2.4 兩款都命中):
+為什麼需要這一包(AGENTS.md §1.4 兩款都命中):
 
 1. **真實 bug 的 regression**(workflow.md §1 表格點名):舊版用
    `subprocess.run(capture_output=True, timeout=600)`。`capture_output` 直到子行程

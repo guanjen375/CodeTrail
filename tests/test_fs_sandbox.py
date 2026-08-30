@@ -1,4 +1,4 @@
-"""檔案存取的 sandbox 與型別分流 —— AGENTS.md §3 的第一道閘。
+"""檔案存取的 sandbox 與型別分流 —— AGENTS.md §2 的第一道閘。
 
 合併自 tests/test_sandbox.py、tests/test_read_file_gating.py、
 tests/test_analyze_file_sandbox.py(2026-08-20):三份都在驗同一件事的不同層——
@@ -16,8 +16,8 @@ import media
 from agent_tools import ToolExecutor
 from tests._harness import import_mcp_module
 
-# smoke:安全層(AGENTS.md §2.1 第 2 款「無聲失敗風險的契約」)
-# AGENTS.md §3 安全檢查點:agent_tools.ToolExecutor._safe_path 與 media._safe_path。
+# smoke:安全層(AGENTS.md §1.1 第 2 款「無聲失敗風險的契約」)
+# AGENTS.md §2 安全檢查點:agent_tools.ToolExecutor._safe_path 與 media._safe_path。
 # 整份標 smoke —— sandbox 破了是無聲的:路徑逃出去不會有人喊,只會安靜地讀到
 # AICODE_ROOT 外的檔。
 pytestmark = pytest.mark.smoke

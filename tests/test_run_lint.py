@@ -13,7 +13,7 @@ import pytest
 import config
 from agent_tools import ToolExecutor
 
-# smoke:AGENTS.md §2.1 第 1 款「真實發生過的 bug 的 regression」
+# smoke:AGENTS.md §1.1 第 1 款「真實發生過的 bug 的 regression」
 # 真實 bug regression:fix=False 仍跑會改檔的命令。
 pytestmark = pytest.mark.smoke
 

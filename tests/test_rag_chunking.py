@@ -9,7 +9,7 @@ import pytest
 import RAG
 from RAG import split_by_semantic_with_sections
 
-# smoke:AGENTS.md §2.1 第 1 款「真實發生過的 bug 的 regression」
+# smoke:AGENTS.md §1.1 第 1 款「真實發生過的 bug 的 regression」
 # 無聲失敗契約:切塊不得遺失內容、表頭要重複。
 pytestmark = pytest.mark.smoke
 

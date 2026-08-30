@@ -22,7 +22,7 @@ from agent_tools import ToolExecutor
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# smoke:安全層(AGENTS.md §2.1 第 2 款「無聲失敗風險的契約」)。
+# smoke:安全層(AGENTS.md §1.1 第 2 款「無聲失敗風險的契約」)。
 pytestmark = pytest.mark.smoke
 
 TITLE_PASSED = "✓ 驗證完成且通過（requested: syntax）"

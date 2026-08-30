@@ -47,7 +47,7 @@ render 時再把 unrotated bbox 乘回 `page.rotation_matrix` 得到 `get_pixmap
 - rotation + cropbox 併發時 `page_boxes[].bbox` 與任何可證明的 transform 都對不上。
 
 本模組**完全不寫檔、不呼叫 VL、不算 embedding、不碰 KB**（純讀 + 記憶體），
-因此不是 AGENTS.md §3 的安全模組，不需登記 `tests/test_smoke_gate.py::SAFETY_MODULES`。
+因此不是 AGENTS.md §2 的安全模組，不需登記 `tests/test_smoke_gate.py::SAFETY_MODULES`。
 """
 from __future__ import annotations
 
@@ -3197,8 +3197,8 @@ def _limit_for(item: str) -> tuple[str, str]:
 def format_preflight_report(plan: FigurePlan) -> str:
     """給人看的 preflight 報告（`RAG.py --preflight` 與 `FigureBudgetError` 共用）。
 
-    **只含計數、頁碼、bbox 與穩定 slug，絕不含任何頁面文字 / cell 內容**（NDA，
-    AGENTS.md §6）。含可直接複製貼上的 CLI 命令——MCP 端 `capture_output` 不會 streaming，
+    **只含計數、頁碼、bbox 與穩定 slug，絕不含任何頁面文字 / cell 內容**（NDA）。
+    含可直接複製貼上的 CLI 命令——MCP 端 `capture_output` 不會 streaming，
     開始後才逾時等於完全沒有提示（workflow §1 / §4 Step 2）。
     """
     pre = plan.preflight

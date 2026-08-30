@@ -4,26 +4,26 @@
 
 如果你是 AI coding agent（Codex / OpenCode 等）正在改這個 repo，請先把這份檔讀完。
 維護命令、eval 漂移檢查見 [README_DEV.md](README_DEV.md)——那份檔是**閱讀用參考**，
-裡面的測試命令誰能執行由角色決定（見 §2）。
+裡面的測試命令誰能執行由角色決定（見 §1）。
 
 ---
 
-## 2. 測試 policy
+## 1. 測試 policy
 
-### 2.1 兩包制
+### 1.1 兩包制
 
 - **smoke** ＝ 標 `@pytest.mark.smoke` 的測試：真實發生過的 bug 的 regression ＋ 無聲失敗風險的契約檢查。
-  §3 的每個安全檢查點都必須在裡面（由 `tests/test_smoke_gate.py` 靜態守住）。整包目標 10 秒內。
+  §2 的每個安全檢查點都必須在裡面（由 `tests/test_smoke_gate.py` 靜態守住）。整包目標 10 秒內。
 - **full** ＝ 整個 `tests/`。
 - 統一入口 `python3 scripts/run_tests.py`（無參數＝full，最多 8-shard 並行；帶任何 pytest 參數＝單行程逐字轉發）：
   - smoke：`python3 scripts/run_tests.py -m smoke`
   - full：`python3 scripts/run_tests.py`
 
-### 2.2 執行權責
+### 1.2 執行權責
 
 - **開發者**（預設角色）：改碼過程**不執行測試**。只允許兩種執行：
   1. 交付前跑一次 smoke。
-  2. 修 bug 時單跑自己新寫的那條 regression test（見 §2.3）。
+  2. 修 bug 時單跑自己新寫的那條 regression test（見 §1.3）。
   除此之外禁止執行測試及任何會間接觸發測試的命令。交付時註明：
   `Tests: smoke only — reviewer owns full execution.`
 - **審核者**（僅限使用者在本次 prompt 明示 `ROLE=REVIEWER`）：先完成靜態審核並集中提出問題；
@@ -33,7 +33,7 @@
   基線外任何新失敗＝未完成，不得回報成功。
   `0 tests collected`（pytest exit code 5）不是通過，必須回報異常。
 
-### 2.3 修 bug 鐵則：red-before-green
+### 1.3 修 bug 鐵則：red-before-green
 
 1. 先寫 regression test，在**未修改**的程式碼上單跑它
    （`python3 scripts/run_tests.py tests/test_x.py::test_y`），貼出紅燈輸出節錄。
@@ -42,15 +42,15 @@
 
 這類 regression test 一律標 `@pytest.mark.smoke`。
 
-### 2.4 什麼時候寫新測試
+### 1.4 什麼時候寫新測試
 
 只有兩種情況：
-1. 真實發生過的 bug → regression（走 §2.3）。
-2. 無聲失敗風險的契約，含 §3 安全層檢查點的防護測試。
+1. 真實發生過的 bug → regression（走 §1.3）。
+2. 無聲失敗風險的契約，含 §2 安全層檢查點的防護測試。
 
 其餘一律不寫：不追 coverage 數字、不為新功能寫儀式性測試、不為 parser 寫 parser。
 
-### 2.5 動到既有測試就要講
+### 1.5 動到既有測試就要講
 
 改既有測試不必事先請示，但**交付時要逐條列出動到哪些測試檔、測試名與理由**——
 包含改斷言、刪測試、放寬容忍值。理由要說得出「行為為什麼該變」，不能是「這樣才會綠」。
@@ -59,7 +59,7 @@
 
 ---
 
-## 3. 安全相關不要砍
+## 2. 安全相關不要砍
 
 - `agent_tools.ToolExecutor._safe_path` — 所有檔案讀寫的 sandbox 入口
 - `media._safe_path` — 圖片/ELF/binary 的 sandbox 入口
@@ -82,7 +82,7 @@
   backreference / lookaround / inline flag），其餘改字面比對；比對主體只看前 300 字元。Python `re`
   沒有 timeout 也不釋放 GIL，放寬它就是讓一個 target 卡死整個同步的 MCP server
 
-任何重構碰到上面這些東西，**新加測試**（開發者寫測試檔，執行依 §2.2 權責），
+任何重構碰到上面這些東西，**新加測試**（開發者寫測試檔，執行依 §1.2 權責），
 不要直接刪 / weaken / 移除檢查點。
 
 新增安全檢查點時，守它的測試檔要標 smoke 並登記進 `tests/test_smoke_gate.py`
@@ -93,7 +93,7 @@ module 層 `pytestmark` 換成單條 decorator，gate 都還是綠的。
 
 ---
 
-## 4. 不要做的事
+## 3. 不要做的事
 
 - 不要把 `from config import X`（snapshot）混 `import config; config.X = ...`（mutation）— 動態值只用 `import config`。
 - 不要為了讓 lint 漂亮，刪未檢查影響的 unused import — 有些是 side-effect import。
@@ -104,11 +104,11 @@ module 層 `pytestmark` 換成單條 decorator，gate 都還是綠的。
 
 ---
 
-## 5. 預設離線
+## 4. 預設離線
 
 - CI 不可以依賴 llama-server / GPU / 大型 GGUF 下載。
 - 任何測試用到 LLM 都要 mock 或 graceful skip（`pytest.importorskip` 或 `pytest.skip`）——
-  這是**撰寫**測試的規範，執行權責見 §2.2。
+  這是**撰寫**測試的規範，執行權責見 §1.2。
 
 
 

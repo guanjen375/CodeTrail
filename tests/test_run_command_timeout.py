@@ -21,7 +21,7 @@ from agent_tools import ToolExecutor
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# smoke:安全層(AGENTS.md §2.1 第 2 款「無聲失敗風險的契約」)。
+# smoke:安全層(AGENTS.md §1.1 第 2 款「無聲失敗風險的契約」)。
 pytestmark = pytest.mark.smoke
 
 TIMEOUT_ERROR_TITLE = "錯誤: timeout 必須是 1..600 的整數"

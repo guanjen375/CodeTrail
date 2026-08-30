@@ -3,7 +3,7 @@
 全部離線：VL 一律用 stub，`ensure_capability` 的 canary 圖也可以被換掉，所以
 CI 不需要 llama-server，也不需要 PyMuPDF（除了明確標注的那一條）。
 
-smoke 的挑選標準（AGENTS.md §2.1 第 2 款「無聲失敗風險的契約」）：只收
+smoke 的挑選標準（AGENTS.md §1.1 第 2 款「無聲失敗風險的契約」）：只收
 「會讓錯誤內容安靜入庫」的最小案例——截斷／非 schema JSON／欄寬錯／空 payload
 被當成成功、字元衝突被擇一、遮罩偏移算錯、probe 沒過還是抽了、第二次取樣重播
 prompt cache 冒充獨立佐證、自我佐證升級成 corroborated、以及失敗時回傳半套結果。
@@ -1238,7 +1238,7 @@ def test_empty_header_is_flagged_not_rejected(monkeypatch):
     79ef673 把「header 非空」從 `figure_extract._validate_table` 的硬拒改成這裡的
     blocker，理由是 raster 截圖裡的表本來就可能沒有獨立表頭列，硬拒會讓整份 PDF
     零寫入。**那個放寬只有在這條成立時才是安全的**——少了這條，全空表頭就會變成
-    「validator 收、抽取端也沒說話」的無聲通過（AGENTS.md §2.4 第二類）。
+    「validator 收、抽取端也沒說話」的無聲通過（AGENTS.md §1.4 第二類）。
     """
     spy = VLSpy({"figure_table": table_json(
         ["", ""],

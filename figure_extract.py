@@ -35,7 +35,7 @@ chunk dict。`build_figure_chunks()` 是 structured figure chunk 進 KB 的**唯
 
 匯入紀律
 --------
-只依賴標準庫 + `import config`（AGENTS.md §4：動態值一律 `import config`，不得
+只依賴標準庫 + `import config`（AGENTS.md §3：動態值一律 `import config`，不得
 `from config import X` 取 import-time snapshot）。**不** import pymupdf / numpy /
 requests / RAG / knowledge —— 這個檔是整條鏈的地基，smoke 要能在毫秒級跑完。
 
@@ -1514,7 +1514,7 @@ def chunk_payload(payload: dict, kind: str, *, meta: dict, max_chars: int | None
     `chunk_payload` 從來不需要接受 positional `meta`，兩條契約沒有衝突（契約 §17.1
     已正式推翻先前「取交集」的口頭裁決）。
     `max_chars=None` → 呼叫時才讀 `config.FIGURE_CHUNK_MAX_CHARS`（契約 §10-A；
-    import-time snapshot 會讓測試 monkeypatch 失效，也違反 AGENTS.md §4）。
+    import-time snapshot 會讓測試 monkeypatch 失效，也違反 AGENTS.md §3）。
 
     切法：
     - table：row 是不可分割原子，依 char 預算聚合多列；縮到只剩一列仍超過預算 → 該列

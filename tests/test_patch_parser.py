@@ -11,8 +11,8 @@ import pytest
 import config
 from agent_tools import ToolExecutor
 
-# smoke:安全層(AGENTS.md §2.1 第 2 款「無聲失敗風險的契約」)
-# AGENTS.md §3 安全檢查點:apply_patch 的 parser —— 誤讀 diff 就會改錯檔案。
+# smoke:安全層(AGENTS.md §1.1 第 2 款「無聲失敗風險的契約」)
+# AGENTS.md §2 安全檢查點:apply_patch 的 parser —— 誤讀 diff 就會改錯檔案。
 pytestmark = pytest.mark.smoke
 
 

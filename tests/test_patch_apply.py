@@ -1,7 +1,7 @@
 """apply_patch 的套用階段:context 必須匹配、行號定位、已套用偵測、上限保護。
 
 合併自 tests/test_patch_safety.py 與 tests/test_patch_context_locate.py(2026-08-20)。
-這是 AGENTS.md §3 點名的安全檢查點之一(context 必須匹配 / max files / max lines),
+這是 AGENTS.md §2 點名的安全檢查點之一(context 必須匹配 / max files / max lines),
 整份都標 smoke。
 """
 from __future__ import annotations
@@ -13,8 +13,8 @@ import pytest
 import config
 from agent_tools import ToolExecutor
 
-# smoke:安全層(AGENTS.md §2.1 第 2 款「無聲失敗風險的契約」)
-# AGENTS.md §3 安全檢查點:apply_patch 的「context 必須匹配」與 max files / max lines。
+# smoke:安全層(AGENTS.md §1.1 第 2 款「無聲失敗風險的契約」)
+# AGENTS.md §2 安全檢查點:apply_patch 的「context 必須匹配」與 max files / max lines。
 pytestmark = pytest.mark.smoke
 
 

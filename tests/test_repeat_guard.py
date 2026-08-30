@@ -15,7 +15,7 @@ import pytest
 from repeat_guard import BANNER_THRESHOLD, RepeatGuard, args_key, banner
 from tests._harness import import_mcp_module
 
-# smoke:AGENTS.md §2.1 第 1 款「真實發生過的 bug 的 regression」
+# smoke:AGENTS.md §1.1 第 1 款「真實發生過的 bug 的 regression」
 # 真實 bug regression(repeat.png 2026-08-19):鬼打牆打斷。
 pytestmark = pytest.mark.smoke
 

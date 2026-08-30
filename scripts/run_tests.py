@@ -20,7 +20,7 @@
 順序、--lf 依賴的共享 cache 在分片下都不再等價,而不等價的那一邊是靜默的。
 
 marker 模式下「某個 shard 一條都沒選中」是正常的(pytest exit 5),不算失敗;但
-**所有** shard 都是 5 就代表整包 0 collected,那依 AGENTS.md §2.2 必須回報異常而
+**所有** shard 都是 5 就代表整包 0 collected,那依 AGENTS.md §1.2 必須回報異常而
 不是通過。
 
 不依賴 pytest-xdist；每個 shard 都是受控的 ``python3 -m pytest`` 子行程，且有
@@ -292,7 +292,7 @@ def summarize_shard_outcomes(
     - 無 marker(完整測試):每個 shard 都必須 exit 0。連 exit 5 都算失敗——
       完整測試的每個 shard 都握著真的測試檔,收不到東西代表 collection 壞了。
     - 有 marker:個別 shard exit 5(這一片沒有東西被選中)是正常的,但**全部**
-      都是 5 就等於整包 0 collected。AGENTS.md §2.2 明講那不是通過,所以這裡
+      都是 5 就等於整包 0 collected。AGENTS.md §1.2 明講那不是通過,所以這裡
       回 5 而不是 0——marker 打錯字最容易長成這個形狀,而它跟「全部都過」在
       exit code 上只差這一個判斷。
     """
@@ -311,7 +311,7 @@ def summarize_shard_outcomes(
 def _print_run_summary(junit_paths: Sequence[Path]) -> None:
     """把各 shard 的 junit 併成一行「選了幾條 / 花多久」。
 
-    AGENTS.md §2.1 給 smoke 定了 10 秒目標,但在那之前沒有任何地方把數字講出來:
+    AGENTS.md §1.1 給 smoke 定了 10 秒目標,但在那之前沒有任何地方把數字講出來:
     shard 各自的 pytest 尾行散在輸出裡,誰也不會去加總。這裡只報告,不設硬閾值——
     不同機器的絕對秒數差好幾倍,拿秒數當 gate 只會製造假紅燈。
     """

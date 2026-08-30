@@ -18,7 +18,7 @@ import config
 import context_signals
 from RAG import load_knowledge_base, save_knowledge_base
 
-# numpy 未裝就整份 skip(AGENTS.md §5:離線/缺套件要 graceful skip,不是 collect error)
+# numpy 未裝就整份 skip(AGENTS.md §4:離線/缺套件要 graceful skip,不是 collect error)
 np = pytest.importorskip("numpy")
 
 
@@ -152,7 +152,7 @@ def test_save_empty_knowledge_base_removes_stale_npz(tmp_path):
 import knowledge  # noqa: E402 - fixture must match the consumer's import-time model
 from knowledge import KnowledgeBase  # noqa: E402 - keep optional numpy skip offline-safe
 
-# smoke:AGENTS.md §2.1 第 1 款「真實發生過的 bug 的 regression」
+# smoke:AGENTS.md §1.1 第 1 款「真實發生過的 bug 的 regression」
 # 真實 bug regression(P0-5):npz 向量沒掛回 chunk → 相似度全 0。
 pytestmark = pytest.mark.smoke
 

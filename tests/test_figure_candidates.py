@@ -2,7 +2,7 @@
 
 契約：`wf/CONTRACT.md` §6.3 / §12.4 / §13.1–§13.2；workflow §4 Step 2、§5、§8。
 
-這個檔守的是**無聲失敗**（AGENTS.md §2.4 第二類）：
+這個檔守的是**無聲失敗**（AGENTS.md §1.4 第二類）：
 
 - 沒有結構性證據卻宣稱有表 / 有 log（會讓一張根本不是表的圖被硬套 table schema，
   既有 `tests/test_rag_pdf_ingest.py::test_real_pymupdf4llm_contract` 會紅）

@@ -1,6 +1,6 @@
 """`review_figures` 的 MCP 公開邊界,以及兩個 query 工具的 `excluded_figures`。
 
-為什麼不能用 T5 的 `figure_review` 測試代替(AGENTS.md §2.4 第 2 款):
+為什麼不能用 T5 的 `figure_review` 測試代替(AGENTS.md §1.4 第 2 款):
 JSON 解析(含重複 key)、kind 的權威來源、document_id/figure_id 配對、人工確認閘、
 例外分流(可重試的 conflict vs 必須 fail-loud 的路徑違規)、以及輸出渲染的截斷規則
 **全部住在 `mcp_server.py`**。`list_figures` / `apply_fix` 的測試一行都不會經過它們,

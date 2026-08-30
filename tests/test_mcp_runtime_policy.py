@@ -22,8 +22,8 @@ import pytest
 from runtime_policy import EXTRA_BUILD_COMMANDS, env_bool, resolve_runtime_policy
 from tests._harness import spawn_mcp, terminate_proc, wait_for_marker
 
-# smoke:安全層(AGENTS.md §2.1 第 2 款「無聲失敗風險的契約」)
-# AGENTS.md §3/§4:patch / run_command / build 命令的預設值與 env 尊重。
+# smoke:安全層(AGENTS.md §1.1 第 2 款「無聲失敗風險的契約」)
+# AGENTS.md §2/§4:patch / run_command / build 命令的預設值與 env 尊重。
 pytestmark = pytest.mark.smoke
 
 pytest.importorskip("mcp", reason="mcp 套件未安裝;OpenCode + MCP 路線才需要")

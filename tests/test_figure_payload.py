@@ -1,6 +1,6 @@
 """figure_extract 的 canonical model 契約：payload → validator → render → chunk → KB dict。
 
-為什麼這些測試存在（AGENTS.md §2.4 的第二類：無聲失敗風險的契約）
+為什麼這些測試存在（AGENTS.md §1.4 的第二類：無聲失敗風險的契約）
 ------------------------------------------------------------------
 structured figure lane 的整個價值就是「不改寫原文、不錯配欄位、不猜字元」。這三件事
 壞掉的時候**不會有任何錯誤訊息**：表格少一欄、log 首行空行被吃掉、`▯` 的位置飄一格、
@@ -485,7 +485,7 @@ def test_non_oversized_parts_never_exceed_max_chars():
 
 @pytest.mark.smoke
 def test_chunk_payload_reads_config_at_call_time():
-    """契約 §10-A / AGENTS.md §4：預設值不得是 import-time snapshot。"""
+    """契約 §10-A / AGENTS.md §3：預設值不得是 import-time snapshot。"""
     table = _table([[f"REG{i}", f"0x{i:04X}_0000"] for i in range(20)])
     wide = fx.chunk_payload(table, fx.KIND_TABLE, meta=_meta())
     original = config.FIGURE_CHUNK_MAX_CHARS

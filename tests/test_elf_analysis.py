@@ -1,6 +1,6 @@
 """ELF 分析（elf_analysis / media.read_elf / analyze_file 的 ELF 視角）契約。
 
-來源：2026-08-26 comment.md 列出的 11 條 ELF 分析缺口。依 AGENTS.md §2.4 這裡只放兩類：
+來源：2026-08-26 comment.md 列出的 11 條 ELF 分析缺口。依 AGENTS.md §1.4 這裡只放兩類：
 
 1. 真實發生過的無聲失真（regression，標 smoke）：
    - summary 只列 GLOBAL/WEAK 且 size>0 的 symbol，firmware 常見的 LOCAL/static 函式、

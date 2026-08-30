@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """figure_review — `.codetrail/figures/**` 的路徑安全、review artifacts 與人工修正交易。
 
-這個模組是 **AGENTS.md §3 意義下的新安全檢查點**（與 `agent_tools._safe_path` /
+這個模組是 **AGENTS.md §2 意義下的新安全檢查點**（與 `agent_tools._safe_path` /
 `media._safe_path` 同級）：它是唯一會把 PDF 原圖、送模型的 crop 與 canonical payload
 寫進專案目錄的地方，也是唯一會把「人工確認過的內容」推進知識庫的地方。
 守它的測試是 `tests/test_figure_review.py`（整檔 module-level smoke）。
@@ -252,7 +252,7 @@ def _require_openat_support() -> None:
 
 
 # ============================================================
-# 1. 路徑安全（openat 鏈；★ AGENTS.md §3 檢查點）
+# 1. 路徑安全（openat 鏈；★ AGENTS.md §2 檢查點）
 # ============================================================
 def _safe_component(name, *, what: str) -> str:
     """單一路徑元件的白名單。`/` `\\` `\\0` `.` `..` 與其他字元一律拒絕。

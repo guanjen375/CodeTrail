@@ -6,7 +6,7 @@ import pytest
 from gpu_safety import SafetyVerdict
 from scripts import ctx_safety_check as ctx
 
-# smoke:AGENTS.md §2.1 第 1 款「真實發生過的 bug 的 regression」
+# smoke:AGENTS.md §1.1 第 1 款「真實發生過的 bug 的 regression」
 # 真實 bug regression:ctx 安全閘。
 pytestmark = pytest.mark.smoke
 

@@ -21,7 +21,7 @@ import pytest
 import config
 from agent_tools import ToolExecutor, _clip_grep_line, _collect_within_budget
 
-# smoke:AGENTS.md §2.1 第 1 款「真實發生過的 bug 的 regression」
+# smoke:AGENTS.md §1.1 第 1 款「真實發生過的 bug 的 regression」
 # 真實 bug regression:grep 輸出預算。
 pytestmark = pytest.mark.smoke
 

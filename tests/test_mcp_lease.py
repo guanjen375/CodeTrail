@@ -1,6 +1,6 @@
 """mcp_lease 的 lease / incident 契約,以及 routing 發布門檻(plan.txt §D、SEAMS §6)。
 
-這些是「無聲失敗風險的契約」(AGENTS.md §2.4 第 2 類):
+這些是「無聲失敗風險的契約」(AGENTS.md §1.4 第 2 類):
 
 - lease 判錯方向是靜默的。把 SIGKILL 的 lease 判成 `exited`,或把被重用的 pid
   判成 `live`,診斷會理直氣壯地說「server 好好的」,而使用者正卡在沒有工具的

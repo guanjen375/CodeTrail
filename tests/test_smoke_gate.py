@@ -1,4 +1,4 @@
-"""smoke 包的組成契約:AGENTS.md §3 的安全檢查點一律要在 smoke 裡。
+"""smoke 包的組成契約:AGENTS.md §2 的安全檢查點一律要在 smoke 裡。
 
 為什麼需要這條:smoke 是交付前唯一必跑的閘。2026-08-20 之前它只有 17 條,
 全部集中在最近兩週動過的四個檔——§3 點名的安全層(sandbox / 命令白名單 /
@@ -30,7 +30,7 @@ import pytest
 
 TESTS_DIR = Path(__file__).resolve().parent
 
-# AGENTS.md §3「安全相關不要砍」的檢查點 → (守它的說明, 必須存在且帶 smoke 的 node)。
+# AGENTS.md §2「安全相關不要砍」的檢查點 → (守它的說明, 必須存在且帶 smoke 的 node)。
 SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     "test_aicode_wrapper.py": (
         "aicode 的 direct-MCP 契約與 experimental Code Mode fail-loud 閘",
@@ -397,7 +397,7 @@ def test_safety_checkpoint_file_still_exists(filename: str):
     path = TESTS_DIR / filename
     description = SAFETY_MODULES[filename][0]
     assert path.is_file(), (
-        f"{filename} 不存在了。它守的是 AGENTS.md §3 的 {description};"
+        f"{filename} 不存在了。它守的是 AGENTS.md §2 的 {description};"
         f"檔案改名的話要同步更新 SAFETY_MODULES。"
     )
 
@@ -411,7 +411,7 @@ def test_safety_contract_node_is_in_the_smoke_package(filename: str, node: str):
 
     present = _all_test_functions(path)
     assert node in present, (
-        f"{filename}::{node} 不見了。它是 AGENTS.md §3「{description}」的檢查點之一。"
+        f"{filename}::{node} 不見了。它是 AGENTS.md §2「{description}」的檢查點之一。"
         f"改名或合併測試時要同步更新 SAFETY_MODULES —— 只留下同檔的其他測試,"
         f"這個檢查點就靜默地不再被守了。"
     )
@@ -419,7 +419,7 @@ def test_safety_contract_node_is_in_the_smoke_package(filename: str, node: str):
     smoke, module_level = _smoke_nodes(path)
     assert node in smoke, (
         f"{filename}::{node} 沒有 smoke 標記(module 層 pytestmark="
-        f"{module_level})。它守的是 AGENTS.md §3 的「{description}」;"
+        f"{module_level})。它守的是 AGENTS.md §2 的「{description}」;"
         f"交付前只跑 smoke 的話,這個檢查點等於沒被守。"
     )
 

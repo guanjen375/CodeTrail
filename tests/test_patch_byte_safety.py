@@ -7,7 +7,7 @@
   - 巢狀新檔沒有父目錄 → 寫入失敗,但舊的 rollback 對半成品目錄無能為力。
   - in-place write_text 不是原子替換,也不重驗 preimage。
 
-全部標 smoke(AGENTS.md §2.1:真實 bug 的 regression + 無聲失敗風險的契約)。
+全部標 smoke(AGENTS.md §1.1:真實 bug 的 regression + 無聲失敗風險的契約)。
 newline fixture 全部在測試內用 bytes 合成,不依賴 checkout 的 core.autocrlf。
 """
 from __future__ import annotations
