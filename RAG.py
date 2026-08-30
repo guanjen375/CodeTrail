@@ -1261,6 +1261,33 @@ def _verify_results_match_candidates(fx, filename, plan, results) -> Dict[str, o
     return by_fid
 
 
+def _model_input_variants(rendered, figures) -> List:
+    """`rendered` 裡真的當過模型輸入的那幾份（其餘是 renderer 中間產物）。
+
+    兩個來源，缺一不可：
+
+    * **成功 / 跳過的結果自報的 `variants`** —— 那是它們對「我送了什麼」的宣告，
+      writer 會逐份核對。
+    * **失敗結果的 send ledger**（`evidence["sent_variants"]`）—— 中止的結果沒辦法
+      可靠宣告自己送過什麼（契約上 `variants=[]`），但導致失敗的那張影像必須留得
+      下來才診斷得了。
+
+    刻意**不**「整張圖的 renderer 產物全留」：三片裡第一片就失敗時後兩片根本沒送，
+    寫進 `variant_paths`（writer 稱之為「送進模型的影像」）就是謊報。
+    """
+    keep = set()
+    for figure in figures or []:
+        figure_id = getattr(figure, "figure_id", "")
+        for variant_id in (getattr(figure, "variants", None) or []):
+            keep.add((figure_id, str(variant_id)))
+        evidence = getattr(figure, "evidence", None) or {}
+        for variant_id in (evidence.get("sent_variants") or []):
+            keep.add((figure_id, str(variant_id)))
+    return [variant for variant in rendered
+            if (getattr(variant, "figure_id", ""),
+                getattr(variant, "variant_id", "")) in keep]
+
+
 def _check_claimed_variants(fx, filename, results, rendered) -> None:
     """`FigureResult.variants` 宣稱送過模型的 variant，必須真的被 renderer 產出過。
 
@@ -2013,7 +2040,10 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             try:
                 fx.write_run_artifacts(
                     root_path, document_id=document_id, run_id=run_id,
-                    figures=partial, variants=rendered, failed=True,
+                    # 這裡也要照 ledger 過濾:整包寫進去的話,三片裡第一片 transport
+                    # failure 時,後兩片(根本沒送出去)會被寫成「送進模型的影像」。
+                    figures=partial, variants=_model_input_variants(rendered, partial),
+                    failed=True,
                     preflight=plan.preflight, stats=plan.stats,
                     source_signatures=source_signatures, review_assets={},
                     human_verifications=None)
@@ -2052,30 +2082,7 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             # renderer 可能先產生原圖，verifier 再以同尺寸的衍生 variant 取代它做
             # structured extraction。只有 FigureResult.variants 宣告的 id 才真的送過
             # 模型；其餘 renderer 中間產物不准混進 variants/ 冒充模型輸入。
-            # skipped 也算數：分類器真的把那張圖送進了模型，影像必須留得下來，
-            # 否則被誤判成「不是圖面」的圖就沒有任何東西可以事後檢查。
-            declared_inputs = {
-                (figure.figure_id, variant_id)
-                for figure in results + skipped_figures
-                for variant_id in (figure.variants or [])
-            }
-            # 抽壞的那幾張靠 **send ledger**（`evidence["sent_variants"]`）：
-            # `_failed_result` 的 `variants=[]`（中止的結果沒辦法可靠宣告自己送過
-            # 什麼），照 declared 濾會把導致失敗的那張圖一起刪掉——事後補 render 的
-            # 完整原圖重現不了它。但也**不能整包留**：三片裡第一片就失敗時，後兩片
-            # 根本沒送出去，寫進 `variant_paths`（「送進模型的影像」）就是謊報；
-            # table 的 grid 正規化同理，extractor 只看過 `+grid` 那一份。
-            sent_inputs = {
-                (figure.figure_id, str(variant_id))
-                for figure in failed_figures + skipped_figures
-                for variant_id in ((figure.evidence or {}).get("sent_variants") or [])
-            }
-            keep = declared_inputs | sent_inputs
-            rendered[:] = [
-                variant for variant in rendered
-                if (getattr(variant, "figure_id", ""),
-                    getattr(variant, "variant_id", "")) in keep
-            ]
+            rendered[:] = _model_input_variants(rendered, extracted)
 
             by_fid = _verify_results_match_candidates(fx, filename, plan, extracted)
             _check_claimed_variants(fx, filename, results + skipped_figures, rendered)

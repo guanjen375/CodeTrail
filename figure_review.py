@@ -2180,6 +2180,13 @@ def _render_review(manifest: dict) -> str:
                 else:
                     out.append("- **模型輸入未保存**（這筆沒有記下走哪條 lane，"
                                "無法判斷模型有沒有看過這張圖）")
+            elif _is_sentinel_variant(entry["model_input_variant"]):
+                # 抽取中止的結果依契約是 `model_input_variant="failed"`（說不出送過
+                # 哪幾份），但影像現在留得下來了。照舊印「variant failed（影像已不可
+                # 用）」再接一段「送進模型的影像」是自相矛盾的。
+                out.append(
+                    f"- **模型輸入**: 抽取中止（`{entry['model_input_variant']}`），"
+                    "結果宣告不出送過哪幾份；下面列出的是**實際送出去過**的影像")
             else:
                 out.append(
                     f"- **實際模型輸入**: variant `{entry['model_input_variant']}`"
@@ -2191,7 +2198,10 @@ def _render_review(manifest: dict) -> str:
                 out.append(
                     f"- 覆核用影像（**未送模型**，{len(review_paths)} 份）: "
                     + ", ".join(f"`{path}`" for path in sorted(review_paths.values())))
-            if entry["crop_path"] and not entry.get("crop_is_model_input"):
+            if (entry["crop_path"] and not entry.get("crop_is_model_input")
+                    and entry["crop_path"] not in set(variant_paths.values())):
+                # crop 本身就是某個模型 variant 時不得說「未送模型」——同一個檔案
+                # 在上面列成「送進模型的影像」、在這裡又說沒送過。
                 out.append(f"- 對圖用的圖: `{entry['crop_path']}`（覆核用，未送模型）")
             if entry["row_total"] is not None:
                 out.append(f"- 列數: {entry['row_total']}")

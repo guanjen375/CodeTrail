@@ -1111,8 +1111,22 @@ _ASSET_LEVEL_SLUGS = frozenset({
     "glyph_conflict", "sample_conflict", "sample_state_conflict", "sample_span_conflict",
     "model_unreadable", "unreadable_content", "two_samples_agree",
     "header_missing", "header_promoted_from_first_row",
-    "sample_shape_mismatch",
+    "sample_shape_mismatch", "sample_tile_subset_mismatch", "blank_tile_dropped",
+    "stitch_title_conflict", "stitch_tile_gap",
 })
+
+
+class _TileSubsetMismatch(Exception):
+    """兩次取樣漏掉的 tile 不同 → 兩份樣本不可比，直接中止 disagreement 比較。
+
+    刻意**不是** `_SampleFailure` 的子類：那一族代表「這次抽取不合格」，會被上層
+    當成 kind 猜錯或品質失敗處理。這裡兩份 payload 都是合格的，只是不可比。
+    """
+
+    def __init__(self, first: list[int], second: list[int]):
+        super().__init__(f"empty tiles {first} vs {second}")
+        self.first = list(first)
+        self.second = list(second)
 
 
 class _SampleFailure(Exception):
@@ -1757,7 +1771,8 @@ def _extract_variant_payload(*, kind: str, variant, base_url: str, model: str, p
                              cache_prompt: bool = True,
                              grid_hint: dict | None = None,
                              server_n_ctx: int | None = None,
-                             budget_hints: dict | None = None) -> dict:
+                             budget_hints: dict | None = None,
+                             sent_ledger: list | None = None) -> dict:
     """單一 variant 的抽取（含重試）。全部失敗 raise `_SampleFailure`。
 
     重試一律 `cache_prompt=False`：同一個 prompt 命中 server 的 prompt cache 只會
@@ -1781,6 +1796,10 @@ def _extract_variant_payload(*, kind: str, variant, base_url: str, model: str, p
     last: _SampleFailure | None = None
     for attempt in range(attempts):
         _check_send_budget(variant, counters, where=where)
+        # 預算通過＝這一份**真的會送出去**。登記在檢查之前的話，被預算擋下
+        # （一個 byte 都沒送）的那張也會被記成模型輸入。
+        if sent_ledger is not None:
+            _record_sent({"sent_variants": sent_ledger}, variant)
         use_cache = cache_prompt and attempt == 0
         try:
             result = _call_extractor(
@@ -4095,10 +4114,31 @@ def _stitch_payloads(kind: str, payloads: list[dict], variants, findings: _Findi
                               "overlap_matched": [], "boundaries": [], "caps": []}
 
     def boundary(index: int):
-        """第 index 張 tile（1-based）與前一張之間的去重額度。"""
+        """第 index 張 tile（1-based，指 `variants` 裡的位置）與前一張之間的去重額度。
+
+        ★ **中間有片被丟掉時一律回 0**：空白片被移除之後 `variants` 會壓縮成
+        `[tile1, tile3]`，而 tile3 帶的重疊幾何講的是「我與 tile2 重疊多少」。拿它去
+        比 tile1 的尾端，只要兩處剛好有相同的列/行就會被誤判成重疊而去重——那是在
+        已經缺一片的 payload 上再刪一筆內容，而且刪完看起來完全正常。
+        """
         variant = variants[index - 1] if index - 1 < len(variants) else None
+        previous = variants[index - 2] if index - 2 >= 0 else None
         if variant is None:
             return 0, False, 0
+        if previous is not None:
+            try:
+                contiguous = int(variant.tile_index) == int(previous.tile_index) + 1
+            except (TypeError, ValueError):
+                contiguous = False
+            if not contiguous:
+                stitch["uncertain"] = True
+                findings.block(
+                    "stitch_tile_gap",
+                    f"tile {getattr(previous, 'tile_index', '?')} 與 "
+                    f"{getattr(variant, 'tile_index', '?')} 之間有缺口（中間的片沒有"
+                    "內容而被移除），重疊幾何對不上，這個接縫不做去重",
+                )
+                return 0, False, 0
         cap, has_geometry = _boundary_overlap(variant)
         # 同上：已過 `_validate_variants()` 那道閘，保證是精確非負整數（§21.7）。
         overlap_px = variant.overlap_px
@@ -4623,10 +4663,6 @@ def _vl_extract(kind: str, variants, ctx: dict, *, allow_retry: bool,
             ctx.setdefault("table_grid_hints", {})[
                 str(getattr(variant, "variant_id", "") or "vl")
             ] = copy.deepcopy(grid_hint)
-        # ★ send ledger：**送出去之前**登記。抽壞時 `variants=[]`（中止的結果沒辦法
-        # 可靠宣告自己送過什麼），呼叫端只能靠這份帳分辨「模型看過的那幾張」與
-        # 「renderer 產出但還沒輪到的那幾張」——三片裡第一片就失敗時，後兩片根本沒送。
-        _record_sent(ctx, variant)
         try:
             payload = _extract_variant_payload(
                 kind=kind, variant=variant, base_url=ctx["base_url"], model=ctx["model"],
@@ -4634,6 +4670,9 @@ def _vl_extract(kind: str, variants, ctx: dict, *, allow_retry: bool,
                 counters=ctx["counters"], cache_prompt=cache_prompt, grid_hint=grid_hint,
                 server_n_ctx=ctx.get("server_n_ctx"),
                 budget_hints=ctx.setdefault("output_budgets", {}),  # 缺 key 時退成單次記憶
+                # ★ send ledger 在 `_check_send_budget()` **通過之後**才登記：在這裡
+                # 登記的話，被預算擋下（一個 byte 都沒送出去）的那張也會被記成已送。
+                sent_ledger=ctx.get("sent_variants"),
             )
         except _SampleFailure as exc:
             if exc.slug != "empty_payload" or len(variants) == 1:
@@ -4700,18 +4739,28 @@ def _vl_result_for_kind(candidate, evidence, kind: str, variants, ctx: dict,
             second_payloads, second_kept, second_empty = _vl_extract(
                 kind, variants, ctx, allow_retry=True, cache_prompt=False)
             if second_empty != empty_tiles:
-                # 兩次取樣各自漏掉不同的片 → 比較的根本不是同一份內容，
-                # 「兩次一致」只是兩個不同 tile 子集剛好長得像。
+                # 兩次取樣各自漏掉不同的片 → 比較的根本不是同一份內容。**立刻停止
+                # 比較**：繼續比下去會在兩片內容剛好相同時記下 `two_samples_agree`，
+                # 而那個 slug 是 asset-level 的、會被 duplicate occurrence 沿用 ——
+                # 代表 occurrence 是 needs_review，duplicate 卻只繼承「兩次一致」，
+                # 再被那一頁的 anchor 升成 corroborated。
                 findings.block(
                     "sample_tile_subset_mismatch",
                     f"第一次取樣的空白片是 {empty_tiles}、第二次是 {second_empty}；"
-                    "兩份樣本涵蓋的 tile 不同，一致與否證明不了任何事",
+                    "兩份樣本涵蓋的 tile 不同，一致與否證明不了任何事，不做比較",
                 )
+                raise _TileSubsetMismatch(empty_tiles, second_empty)
             second = _stitch_payloads(
                 kind, second_payloads, second_kept, findings, where=where,
             )[0]
             if kind == figure_extract.KIND_TABLE:
                 _demote_duplicated_table_header(second)
+        except _TileSubsetMismatch as exc:
+            # 不是「取樣失敗」（那是抽不出來），而是「這兩份不可比」。分開記，
+            # 否則覆核的人會以為第二次取樣連 payload 都沒產出。
+            repeatability = {"samples": 2, "identical": None, "comparable": False,
+                             "second_cache_prompt": False,
+                             "empty_tiles": [list(exc.first), list(exc.second)]}
         except _SampleFailure as exc:
             findings.block("repeat_sample_failed",
                            f"第二次取樣失敗（{exc.slug}）：{exc.detail}")
@@ -4850,6 +4899,7 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
     if kind == figure_extract.KIND_RASTER:
         classification = _classify_raster_kind(variants[0], ctx)
         resolved = classification["kind"]
+        classified_kind = resolved          # 分類器原本回的那個，之後不再改寫
         policy_reclassified_from = ""
         if resolved == figure_extract.KIND_NOT_A_FIGURE and len(variants) > 1:
             # ★ 分類器**只看得到第一片**。切片的候選是大圖（高表格 / 長 log），第一片
@@ -4933,13 +4983,20 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
         evidence_dict["raster_classification"] = dict(classification)
         # classifier 實際看過原始 variant；table extractor 則可能看 `+grid`。兩者都是
         # 真正模型輸入，manifest 必須逐一保存，不能只宣告最後一次 extraction variant。
+        # **以 send ledger 為準**。`result.variants` 只講得出最後一輪抽取用的那幾份：
+        # table 走 `+grid` 之後又因為 empty_payload 退回 diagram 時，真正送過模型的
+        # `+grid` 就不在裡面，呼叫端會把它從 `variants/` 刪掉——覆核的人於是看不到
+        # 模型實際讀的那張圖。ledger 是逐次送出前登記的，不會漏也不會多。
         actual_variant_ids = _ordered_unique([
+            *list(ctx.get("sent_variants") or []),
             str(classification.get("variant", "") or ""),
             *list(result.variants or []),
         ])
         actual_variant_ids = [variant_id for variant_id in actual_variant_ids if variant_id]
         extra_reasons = ["raster_kind_classified"]
-        extra_details = [f"純 raster 以 image-bound schema 分類為 {resolved}"]
+        # `resolved` 可能已經被改寫過（policy 改判或 empty_payload 退路）。第一條講的
+        # 是**分類器原本回什麼**，用改寫後的值會與下一行自己打架。
+        extra_details = [f"純 raster 以 image-bound schema 分類為 {classified_kind}"]
         if reclassified_from:
             extra_reasons.append("raster_kind_reclassified")
             if classification.get("reclassified_reason") == "multi_tile_cannot_be_skipped":

@@ -3312,3 +3312,150 @@ def test_failed_result_records_only_the_tiles_that_were_actually_sent(monkeypatc
     assert result.extraction_status == figure_extract.EXTRACTION_FAILED, result
     assert result.evidence["sent_variants"] == ["crop@200dpi#tile1of3"], (
         "只有第一片送出去過", result.evidence.get("sent_variants"))
+
+
+@pytest.mark.smoke
+def test_tile_subset_mismatch_survives_the_duplicate_replay(monkeypatch):
+    """★ 「兩次取樣讀的不是同一份」這個 blocker 必須跟著影像走。
+
+    它若不在 `_ASSET_LEVEL_SLUGS` 裡，代表 occurrence 是 needs_review，duplicate
+    卻只繼承白名單裡的 `two_samples_agree`，再被那一頁的 anchor 升成 corroborated
+    ——同一張圖在兩頁得到相反的可信度。
+    """
+    blank = table_json(["Name", "Addr"], [])
+    same = table_json(["Name", "Addr"],
+                      [[("CTRL0", "observed"), ("0x8000_0100", "observed")]])
+
+    def _script(kw):
+        png = base64.b64decode(kw["image_base64"])
+        first_sample = kw.get("cache_prompt", True)
+        return blank if png == (b"PNG-2" if first_sample else b"PNG-1") else same
+
+    spy = VLSpy({"figure_raster_kind_v1": raster_kind("table"), "figure_table": _script})
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+    monkeypatch.setattr(config, "FIGURE_EXTRACT_RETRIES", 0)
+    share = {"asset_digest": "digest-1", "requested_kind": figure_extract.KIND_RASTER}
+
+    def _render(_doc, cand):
+        return [variant(cand.figure_id, variant_id=f"crop@200dpi#tile{i}of2",
+                        tile_index=i, tile_total=2, png=f"PNG-{i}".encode(),
+                        bbox=cand.bbox)
+                for i in (1, 2)]
+
+    results = extract(
+        [candidate(kind=figure_extract.KIND_RASTER, page=4, seed="rep",
+                   signals={"native_lane": False, "vl_share_key": share}),
+         candidate(kind=figure_extract.KIND_RASTER, page=5, seed="dup",
+                   signals={"native_lane": False, "vl_share_key": share})],
+        {4: page_evidence(page=4), 5: page_evidence(page=5)}, render=_render)
+
+    assert len(results) == 2
+    for figure in results:
+        assert "sample_tile_subset_mismatch" in figure.reasons, (figure.page, figure.reasons)
+        assert figure.verification_status == figure_extract.VERIF_NEEDS_REVIEW, figure
+
+
+@pytest.mark.smoke
+def test_a_gap_between_kept_tiles_disables_overlap_dedup(monkeypatch):
+    """★ 中間那片被移除之後，剩下兩片之間的重疊幾何**對不上**，不得拿來去重。
+
+    `kept=[tile1, tile3]` 時 tile3 帶的「我與 tile2 重疊多少」會被拿去比 tile1 的
+    尾端；兩處剛好有相同的列就會被誤刪——在已經缺一片的 payload 上再刪一筆，而且
+    刪完看起來完全正常。
+    """
+    row = [("CTRL0", "observed"), ("0x8000_0100", "observed")]
+    blank = table_json(["Name", "Addr"], [])
+    filled = table_json(["Name", "Addr"], [row])
+    spy = VLSpy({"figure_table": lambda kw: (
+        blank if base64.b64decode(kw["image_base64"]) == b"PNG-2" else filled)})
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+
+    def _render(_doc, cand):
+        return [variant(cand.figure_id, variant_id=f"crop@200dpi#tile{i}of3",
+                        tile_index=i, tile_total=3, overlap_px=12,
+                        png=f"PNG-{i}".encode(), bbox=cand.bbox)
+                for i in (1, 2, 3)]
+
+    result = extract([candidate(kind=figure_extract.KIND_TABLE, native_lane=False)],
+                     {4: page_evidence()}, render=_render)[0]
+
+    assert "stitch_tile_gap" in result.reasons, result.reasons
+    assert len(result.payload["rows"]) == 2, (
+        "tile1 與 tile3 各一列，缺口上不得去重", result.payload["rows"])
+
+
+@pytest.mark.smoke
+def test_first_audit_line_reports_what_the_classifier_actually_said(monkeypatch):
+    """★ 第一條 audit 文案要講**分類器原本回什麼**，不能用被改寫過的 kind。
+
+    用改寫後的值會與下一行自己打架：「分類為 diagram」「分類器其實回 none」。
+    """
+    spy = VLSpy({
+        "figure_raster_kind_v1": raster_kind("none"),
+        "figure_diagram": json.dumps({
+            "title": "t", "labels": [], "components": [{"name": "a", "desc": "b"}],
+            "relations": [], "values": []}),
+    })
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+
+    def _render(_doc, cand):
+        return [variant(cand.figure_id, variant_id=f"crop@200dpi#tile{i}of2",
+                        tile_index=i, tile_total=2, png=f"PNG-{i}".encode(),
+                        bbox=cand.bbox)
+                for i in (1, 2)]
+
+    result = extract([candidate(kind=figure_extract.KIND_RASTER)],
+                     {4: page_evidence()}, render=_render)[0]
+
+    first = result.reason_details[0]
+    assert "分類為 none" in first, first
+    assert "分類為 diagram" not in first, first
+
+
+@pytest.mark.smoke
+def test_send_ledger_skips_a_variant_the_budget_refused(monkeypatch):
+    """★ 被 send budget 擋下的那一份**一個 byte 都沒送出去**，不得記進 ledger。"""
+    pass_probe(monkeypatch)
+    ledger: list[str] = []
+    counters = {"vl_calls": 10 ** 9, "image_tokens": 10 ** 9, "vl_calls_saved": 0}
+
+    with pytest.raises(figure_extract.FigureBudgetError):
+        figure_verify._extract_variant_payload(
+            kind=figure_extract.KIND_TABLE, variant=variant(fig_id("budget")),
+            base_url="http://127.0.0.1:8083", model="vl", profile="strict_json",
+            where="page=4", allow_retry=False, counters=counters,
+            sent_ledger=ledger)
+
+    assert ledger == [], ledger
+
+
+@pytest.mark.smoke
+def test_grid_variant_stays_declared_after_the_diagram_fallback(monkeypatch):
+    """★ table 走 `+grid` 之後又退回 diagram 時，`+grid` 仍是真的送過模型的影像。
+
+    `result.variants` 只講得出最後一輪抽取用的那幾份，`+grid` 因此會從 `variants/`
+    被刪掉——覆核的人看不到模型實際讀的那張圖，也就查不出 grid 正規化是不是幫倒忙。
+    """
+    spy = VLSpy({
+        "figure_raster_kind_v1": raster_kind("table"),
+        "figure_table": table_json(["Name"], []),      # 空 → 退回 diagram
+        "figure_diagram": json.dumps({
+            "title": "t", "labels": [], "components": [{"name": "a", "desc": "b"}],
+            "relations": [], "values": []}),
+    })
+    install_vl(monkeypatch, spy)
+    pass_probe(monkeypatch)
+    monkeypatch.setattr(
+        figure_verify, "_grid_normalized_variants",
+        lambda variants, ctx: [variant(v.figure_id, variant_id=f"{v.variant_id}+grid",
+                                       png=v.png, bbox=v.bbox)
+                               for v in variants])
+
+    result = extract([candidate(kind=figure_extract.KIND_RASTER)], {4: page_evidence()})[0]
+
+    assert result.kind == figure_extract.KIND_DIAGRAM, result.kind
+    assert "crop@200dpi+grid" in result.variants, (
+        "真的送過模型的 +grid 必須留在宣告集合裡", result.variants)

@@ -3077,3 +3077,7 @@ def test_failed_figure_keeps_the_model_input_that_broke_it(tmp_path: Path, monke
         assert (tmp_path / relative).is_file(), relative
     review = (manifest_path.parent / "review.md").read_text(encoding="utf-8")
     assert "零 VL 呼叫" not in review, "走 VL lane 的失敗不得說成零 VL"
+    # 影像留得下來之後，顯示層不得再自相矛盾：先說「影像已不可用」、又列出
+    # 「送進模型的影像」，看的人不知道該信哪一句。
+    assert "影像已不可用" not in review, review
+    assert "抽取中止" in review and "實際送出去過" in review, review
