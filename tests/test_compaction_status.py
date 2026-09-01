@@ -98,6 +98,28 @@ def test_drift_is_disclosed_next_to_the_mode(tmp_path):
     assert any("不一致" in line for line in lines)
 
 
+def test_the_threshold_is_shown_next_to_the_mode(tmp_path):
+    """只印模式的話,使用者分不出「還沒到門檻」與「plugin 根本沒載入」。"""
+    config_path, env = _takeover(tmp_path, cm.MODE_CODETRAIL)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["model"] = "llamacpp/big"
+    config["provider"] = {
+        "llamacpp": {"models": {"big": {"limit": {"context": 131072, "output": 8192}}}}
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    derived, _ = cm.derive_for_config(config)
+    lines = status.status_lines(env)
+    assert any(str(derived.idle_threshold) in line for line in lines), lines
+
+
+def test_manual_mode_says_compact_only_works_in_the_full_tui(tmp_path):
+    """`/compact` 在 --mini 會被當成一般訊息送給模型(模型還會說「好的」),
+    在 `opencode run` 則是 Command not found —— 兩種都像成功了。"""
+    _, env = _takeover(tmp_path, cm.MODE_MANUAL)
+    lines = status.status_lines(env)
+    assert any("/compact" in line and "TUI" in line for line in lines), lines
+
+
 def test_an_unreadable_state_never_blocks_the_banner(monkeypatch, tmp_path):
     """讀狀態爆炸也只是少一行資訊 —— exit 0,而且仍然說得出「原生行為」。"""
     def boom(*args, **kwargs):

@@ -75,6 +75,7 @@ INCIDENT_DETAILS = (
     "summary_empty",
     "summary_reasoning_only",
     "summary_error",
+    "summary_format",
     "race_unanswered_user",
     "race_parent_mismatch",
     "config_drift",

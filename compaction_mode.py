@@ -47,6 +47,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 from pathlib import Path
 from typing import Any
@@ -193,6 +194,36 @@ def canonical_block(marker: str, doc: Path | None = None) -> str:
             f"{target} 裡以 {marker!r} 起首的 ```text 區塊有 {len(matches)} 個,必須剛好 1 個"
         )
     return matches[0]
+
+
+#: 規則 1 規定的固定欄位數。改這個數字之前先改文件 —— 兩邊不一致時
+#: `rule_headings()` 會 fail-loud,不會回一個少一欄的清單。
+RULE_HEADING_COUNT = 7
+
+
+def rule_headings(doc: Path | None = None) -> tuple[str, ...]:
+    """規則 1 規定的七個固定欄位標題,**從 canonical 區塊解析出來**(順序即契約)。
+
+    為什麼用解析而不是再抄一份字面值:壓縮後的格式核對要拿這七個標題去比對
+    模型產出的摘要。抄一份的話,改了文件卻沒改這裡,核對就會用舊標題去驗新
+    規則 —— 而合法的摘要會被判成漂移、漂移的摘要會被放行,兩種都是靜默的。
+    plugin 端(`parseRuleHeadings`)對 `RULES_TEXT` 做同樣的解析,由跨語言測試
+    釘住兩邊解出來的東西相同。
+    """
+    block = canonical_block(RULES_BLOCK_MARKER, doc)
+    start = block.find("\n1. ")
+    end = block.find("\n2. ", start + 1) if start >= 0 else -1
+    if start < 0 or end < 0:
+        raise CompactionModeError(
+            "壓縮規則區塊裡找不到第 1 條(固定欄位)的範圍,無法解析七個標題"
+        )
+    names = tuple(re.findall(r"##\s*([^\s、。]+)", block[start:end]))
+    if len(names) != RULE_HEADING_COUNT:
+        raise CompactionModeError(
+            f"壓縮規則第 1 條解析出 {len(names)} 個標題,應該剛好 "
+            f"{RULE_HEADING_COUNT} 個:{names}"
+        )
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -480,13 +511,91 @@ def compaction_model_limits(config: dict[str, Any], fallback: str | None = None)
     model = configured if explicit else fallback
     if not isinstance(model, str) or "/" not in model:
         return None, None, explicit
-    provider_id, model_id = model.split("/", 1)
+    return model, model_limit(config, model), explicit
+
+
+def model_limit(config: dict[str, Any], ref: Any) -> dict[str, Any] | None:
+    """``provider.<id>.models.<id>.limit``;查不到就 None。"""
+    if not isinstance(ref, str) or "/" not in ref:
+        return None
+    provider_id, model_id = ref.split("/", 1)
     providers = config.get("provider")
     provider = providers.get(provider_id) if isinstance(providers, dict) else None
     models = provider.get("models") if isinstance(provider, dict) else None
     spec = models.get(model_id) if isinstance(models, dict) else None
     limit = spec.get("limit") if isinstance(spec, dict) else None
-    return model, (limit if isinstance(limit, dict) else None), explicit
+    return limit if isinstance(limit, dict) else None
+
+
+def derive_for_config(
+    config: dict[str, Any],
+) -> tuple[DerivedSettings, str] | None:
+    """依這份**有效設定**的模型限制推導受管值,回 ``(受管值, 顯示用來源)``。
+
+    回 ``None`` 代表這份設定沒有足以推導的模型資訊 —— 是「無從得知」,不是錯。
+    該有的 limit 查不到、或推不出可用門檻時 raise ``CompactionModeError``,
+    訊息本身就是要給人看的那一句。
+
+    為什麼要收在這裡:doctor 的漂移比對與 `aicode` 橫幅顯示的門檻必須是同一個
+    數字,而 runtime 的 plugin 也用同一條公式重算。各寫一份的話,doctor 說一致、
+    橫幅印另一個數字,而使用者看到的停用理由來自第三個。
+    """
+    main_model = config.get("model")
+    model, limit, explicit = compaction_model_limits(config, fallback=main_model)
+    if model is None:
+        return None
+    section, _ = _section(config)
+    reserved = section.get("reserved") if isinstance(section, dict) else None
+    if limit is None:
+        if explicit:
+            # 明確設了 compaction agent 的模型卻查不到 limit:runtime 會用
+            # `client.config.providers()` 拿到它的真實 limit 重算並可能停用,
+            # 這裡靜靜跳過就會回報「一致」而 plugin 那端已經停了。
+            raise CompactionModeError(
+                f"agent.compaction.model 設成 {model},但設定裡沒有它的 limit;"
+                "無法確認受管值是否與 runtime 一致(plugin 會用真實 limit 重算)"
+            )
+        return None
+    try:
+        derived = derive_settings(
+            context_limit=limit.get("context"),
+            output_limit=limit.get("output"),
+            input_limit=limit.get("input"),
+            reserved=reserved,
+        )
+    except CompactionModeError as exc:
+        raise CompactionModeError(
+            f"目前的 {model} 推導不出可用的壓縮門檻({exc});"
+            "壓縮 plugin 會停用自動壓縮,請重跑 ./set_config.sh"
+        ) from exc
+    if not (explicit and main_model != model):
+        return derived, f"{model}(context={limit.get('context')})"
+
+    # 摘要模型與主模型不同時,受管值是兩者的合併值:觸發之前那段對話壓的是
+    # 主模型,只按摘要模型算的話,摘要模型 context 較大時主模型會先 overflow。
+    main_limit = model_limit(config, main_model)
+    if main_limit is None:
+        raise CompactionModeError(
+            f"agent.compaction.model 設成 {model},但設定裡沒有主模型 "
+            f"{main_model} 的 limit;無法確認受管值是否與 runtime 一致"
+            "(plugin 會用兩個模型的真實 limit 合併重算)"
+        )
+    try:
+        derived = combine_settings(
+            derived,
+            derive_settings(
+                context_limit=main_limit.get("context"),
+                output_limit=main_limit.get("output"),
+                input_limit=main_limit.get("input"),
+                reserved=reserved,
+            ),
+        )
+    except CompactionModeError as exc:
+        raise CompactionModeError(
+            f"主模型 {main_model} 推導不出可用的壓縮門檻({exc});"
+            "壓縮 plugin 會停用自動壓縮,請重跑 ./set_config.sh"
+        ) from exc
+    return derived, f"{model} 與主模型 {main_model} 取合併值"
 
 
 def state_dir(env: Any = None) -> Path:

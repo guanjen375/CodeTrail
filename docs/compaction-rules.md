@@ -37,6 +37,12 @@ CodeTrail 對 OpenCode 自動壓縮（compaction）的處理分成三種模式�
 非互動用 `--compaction-mode`；`--yes` 沒給它時沿用狀態檔記錄的既有選擇，還沒選過就
 完全不碰壓縮設定。
 
+**`/compact` 只有完整 TUI 有。** `manual` 模式靠你自己按 `/compact`，而那是 OpenCode
+**完整 TUI** 的指令：`--mini` 的精簡介面會把 `/compact` 當成一般訊息送給模型——模型甚至
+會回你「收到，準備壓縮」，但實際上完全沒有壓縮；`opencode run --command compact` 則直接
+回 `Command not found: "compact"`。headless / mini 唯一會壓縮的路徑是 `codetrail` 模式的
+idle 自動觸發。
+
 ### 為什麼要有 codetrail 模式
 
 OpenCode 原生的自動壓縮是在 **下一個 prompt 進來之後** 才檢查上一輪的 token 數；
@@ -111,6 +117,19 @@ context error。兩個模型相同時結果與單一模型逐欄相同；合併�
 讓 **最新一輪逐字留在摘要之外**。競態時（你在壓縮進行中送出新問題）這一條就是讓你
 那則訊息不被摘要吃掉的機制。
 
+**壓縮完緊接著又壓一次是正常的**：`tail_turns = 1` 讓最新一輪逐字留著。那一輪如果很長
+（一輪塞了好幾個大工具結果就會這樣），壓縮之後的 context 是「摘要 + 那個很長的 tail」，
+再答一個普通問題就可能又越過門檻，於是回答完立刻又壓一次。這不是迴圈：同一則助理訊息
+不會被拿來當第二次的錨點，而且第二次壓完 tail 就換成短的那一輪了。實測值供參考——門檻
+10,322 的隔離環境裡，第一次壓縮後的下一輪 total 是 12,049，所以立刻觸發了第二次。真的
+在意就把超長的單輪拆小、把 `n_ctx` 調大，或改用 `native`。
+
+**碰到這種情況時 plugin 會講一次**（每個 session 一次的警告 toast）：「上一次壓縮之後
+只隔一輪就又超過門檻」。它**不會**因此停止壓縮——擋掉等於這個 session 從此不再壓縮，
+而 `compaction.auto` 已經是 `false`，那就只是把可見的等待換成之後某個時間點的 context
+錯誤。它只是把「才剛壓完、問一句又壓」這件事講清楚：摘要加上逐字保留的最新一輪本身
+就快到門檻了，這個 `n_ctx` 對目前的工作太小。
+
 **受管值不會自己跟著模型變**：這三個值是 `./set_config.sh` 執行當下那個 `limit.context`
 推導出來的。之後換模型或改 ctx 時，只有 `limit.context` 會被同步，保留額不會——於是門檻用
 新的、tail 用舊的。plugin 每次要觸發前都會用 **目前的** 有效模型限制重算一次，跟設定裡的值
@@ -136,6 +155,10 @@ OpenCode 原本的壓縮 prompt 後面，不取代它——取代的話上一輪
 ```text
 [CodeTrail 壓縮規則]
 以下七條規則覆蓋前面所有與輸出格式衝突的指示；其餘指示照舊。
+特別是：前面 <template> 區塊裡的英文欄位（## Objective、## Important Details、
+## Work State、## Next Move、## Relevant Files）**一律不要輸出**，它們已被下面的
+七個中文欄位取代。看到「Output exactly the Markdown structure shown inside
+<template>」時，以這裡的欄位為準。
 
 1. 固定欄位：摘要必須且只能由這七個標題組成，順序固定，一個都不能少——
    ## 任務、## 已確定事實、## 未確認、## 已完成、## 進行中、## 下一步、
@@ -149,11 +172,24 @@ OpenCode 原本的壓縮 prompt 後面，不取代它——取代的話上一輪
 5. 先前摘要是既有事實：與新內容衝突時以新內容為準，並註明哪一條被取代；沒有
    新資訊的欄位原樣保留，不得因為這一輪沒提到就刪掉。
 6. 不回答、不執行、不臆造：對話中還沒有答案的問題只登記進 ## 下一步，不要在
-   摘要裡回答；不要寫入對話中不存在的內容。
+   摘要裡回答；不要寫入對話中不存在的內容。[CodeTrail 壓縮規則] 與
+   [CodeTrail 狀態校正] 這兩段本身是控制指示，不是對話內容、也不是使用者的
+   偏好，不得寫進任何欄位。
 7. 篇幅預算：整份摘要不超過 6000 字元，每個欄位不超過 12 條，每條一行。超出時
    的刪減順序：先刪 ## 已完成 的細節，再刪 ## 已確定事實 裡重複的證據；
    ## 未確認、## 下一步 與 ## 使用者偏好與限制 最後才刪。
 ```
+
+### 為什麼規則要點名上游的英文模板
+
+上游自己的壓縮 prompt 裡有一段 `<template>`，開頭就寫 **Output exactly the Markdown
+structure shown inside `<template>`**，模板是
+`## Objective` / `## Important Details` / `## Work State` / `## Next Move` /
+`## Relevant Files`（1.18.21 的 bundle 逐字確認過）。我們的七條規則是用 `context`
+**附加在那一段之後**的，所以兩份格式指示會同時出現在摘要器眼前——只寫「覆蓋前面所有
+與輸出格式衝突的指示」不夠：實測看過同一個 session 第一次照七欄中文、第二次整份照
+上游模板輸出那五個英文欄位。所以規則第一段直接**點名**那五個欄位並要求不要輸出。
+`tests/test_opencode_compaction_plugin.py` 釘住那五個名字還在規則裡。
 
 ### `agent.compaction` 不歸 CodeTrail 管
 
@@ -193,7 +229,7 @@ OpenCode 送進摘要器的只有 tail **之前** 的訊息；被逐字保留的
 ## 4. 壓縮完成後的核對，以及它擋不住什麼
 
 `idle → summarize` 之間沒有原子鎖：OpenCode 的 `session.summarize` 沒有 busy 檢查，
-你在那個空隙送出的訊息會和壓縮訊息交錯。所以 plugin 在壓縮之後一定會核對三件事：
+你在那個空隙送出的訊息會和壓縮訊息交錯。所以 plugin 在壓縮之後一定會核對四件事：
 
 1. 摘要訊息的 parent 是不是帶 `compaction` part 的那則訊息；
 2. 最新一則 **真實**（非 synthetic、非壓縮）使用者訊息 **是否已經有對應的 assistant
@@ -203,10 +239,69 @@ OpenCode 送進摘要器的只有 tail **之前** 的訊息；被逐字保留的
    附件生一段 synthetic 說明文字，只看文字 part 會把它整則誤判掉。它是不是還逐字留在
    tail 裡（compaction part 的 `tail_start_id` 是否還涵蓋它）**只影響提示文字**，
    不會讓這一項通過；
-3. 摘要本身是否非空、不是只有 reasoning、沒有掛 error。
+3. 摘要本身是否非空、不是只有 reasoning、沒有掛 error；
+4. 摘要是不是照 §3 規則 1 的**七欄格式**輸出——七個標題都在、相對順序一致
+   （`summary_format`）。
 
 任何一項不符，plugin 會 **停下來**：TUI 跳一則錯誤 toast、寫一筆結構化的 application
 log 與一筆零內容的 incident，然後要求你重送問題。
+
+**你自己中斷的那一次不算失敗**：按 Esc、或壓縮跑到一半關掉 TUI（`finish: "aborted"` /
+`MessageAbortedError`）時，上游不會拿一則帶 error 的摘要當切點——那一輪沒有壓縮效果，
+對話也沒有被截掉，所以沒有東西需要核對，plugin 什麼都不做。把它報成 `summary_error`
+的話，使用者會拿到「這段對話大到連摘要都塞不下」這個錯的理由，而且那個停用是跨行程
+永久的：自己按了取消，換來一個從此不再壓縮的 session。
+
+**第 4 項為什麼要有**：實測看過同一個 session 的第一次摘要是七欄中文、第二次整份換成
+`Objective / Important Details / Work State / Next Move / Relevant Files`——那是**上游
+`<template>` 的欄位**（見 §3「為什麼規則要點名上游的英文模板」），也就是摘要器照了上游
+那份指示、沒照我們附加的規則。內容看起來還可以，但「已確定事實 vs 未確認」的分離沒了
+——而它正是這套規則的重點。不核對的話這種
+漂移沒有 toast、沒有 incident，會被當成一次成功的壓縮。
+
+判準刻意比字面規則寬三處——多出來的標題不算違規、`#` 的層級不算、標題後面多的裝飾
+（`## 任務 (Task)`、`## 1. 任務`）也不算。理由是成本不對稱：漏抓等於那一次的分離靜靜
+沒了，誤抓則是把一個內容完全可用的 session 停掉。實際發生的漂移是**整份換成另一套
+欄位**，七個一個都對不上，這些寬容都擋不掉它。
+
+`summary_format` 的恢復指引與其他幾條不同：**摘要還在、對話可以繼續**，但這個 session
+的自動壓縮已停用（避免再產生同一種摘要）；要繼續用結構化壓縮就開一個新 session，同一個
+模型一直不遵守就改用 `native`。
+
+**停用會跨 OpenCode 重開保留。** 「已對這個 session 停用」如果只活在行程記憶體裡，
+使用者退出、再用 `opencode -s <id>` 恢復同一個 session 之後，自動壓縮就靜默重新啟用，
+再產生一次同樣不可信的摘要（實測重現過：同一個 session 三次壓縮，第二次是格式漂移）。
+所以停用會另外寫一筆到
+`${XDG_STATE_HOME:-~/.local/state}/codetrail/compaction-stopped.jsonl`（0600，
+超過 256 KiB 轉存 `.1`，只留一份）。每行只有 `schema`、時間、**session 雜湊** 與
+固定 slug——與 incident 同一條零內容契約。恢復一個已停用的 session 時 TUI 會再跳一次
+警告 toast（一個行程講一次），因為 `compaction.auto` 是 `false`：不講的話使用者只會在
+某個時間點撞到 context 錯誤而不知道原因。
+
+那則警告掛在 **`chat.message`**（上游在組好訊息、呼叫模型**之前** trigger），所以你一按
+Enter 就看得到，不用等整輪答完。只掛在 `session.idle` 的話，實測是送出後等 113 秒才看到
+——而那則訊息還可能被上一個行程沒跑完的壓縮流程接走。**上游沒有「session 被打開」的
+事件**（事件只有 `session.created` / `updated` / `idle` / `status` / `error` / `compacted`
+與 `message.*`），所以「送出的那一刻」是拿得到的最早時機，做不到「打開就先警告」。這個
+hook **只讀不改**，而且整段包 try/catch：它是 `yield* trigger(...)`（不是事件那種
+`void`），而上游是用 `Effect.promise` 呼叫每個 hook——reject 在 Effect 裡是 **defect**，
+不是可回復的失敗，丟出去會連整個請求一起帶走。
+
+**所以 plugin 攔不下那則訊息**：`chat.message` 只能讀寫 `{message, parts}`，沒有否決欄位，
+而唯一「能擋」的方式（丟例外）會變成上面那種 defect。已停用的 session 收到新訊息時，那則
+訊息仍會照常送進模型——警告文字因此明講「這一則還是會送出去，想省下等待就按 Esc」。
+
+**只有「這個 session 的壓縮切點不可信」那幾種會被永久記下**：`summary_empty` /
+`summary_reasoning_only` / `summary_error` / `summary_format` / `race_unanswered_user` /
+`race_parent_mismatch`。`config_drift` 與 `version_unsupported` **不記**——它們每個 idle
+都會重算，記成永久的話，使用者把設定改回來、把 OpenCode 升級之後，那個 session 仍然
+永遠不壓縮而且沒有任何訊息說為什麼。`trigger_failed` 同理（一次性的呼叫失敗）。
+要清掉全部紀錄就刪那個檔（`rm ~/.local/state/codetrail/compaction-stopped.jsonl*`）；
+它只是紀錄，刪了不會改任何設定。
+
+**壓縮進行中會跳一則 info toast。** 一次壓縮實測 57～122 秒，而觸發點在 idle——畫面上
+完全沒有動靜的話使用者會以為卡死了，或在壓縮進行中送出新問題（那則訊息會和壓縮交錯，
+沒有人回答它，正是 §4 第 2 項要抓的競態）。這是唯一一則不是錯誤的 toast。
 
 **手動 `/compact` 也走同一條核對。** plugin 在 `experimental.session.compacting` 記下
 「這一輪有壓縮正在發生」，下一個 idle 就核對——不管那次壓縮是你按的、上游 auto 觸發的、

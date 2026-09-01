@@ -34,7 +34,7 @@
 
 import { constants, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { appendFile, chmod, lstat, mkdir, open, rename, stat } from "node:fs/promises";
+import { appendFile, chmod, lstat, mkdir, open, readFile, rename, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -70,6 +70,7 @@ const DETAIL_SLUGS = [
   "summary_empty",
   "summary_reasoning_only",
   "summary_error",
+  "summary_format",
   "race_unanswered_user",
   "race_parent_mismatch",
   "config_drift",
@@ -121,9 +122,33 @@ const RECONCILIATION_MAX_CHARS = 8000;
 const TRUNCATION_MARK = "…[截斷]";
 
 // ── docs/compaction-rules.md 的兩個 ```text 區塊（逐字）─────────────────
-const RULES_TEXT = "[CodeTrail 壓縮規則]\n以下七條規則覆蓋前面所有與輸出格式衝突的指示；其餘指示照舊。\n\n1. 固定欄位：摘要必須且只能由這七個標題組成，順序固定，一個都不能少——\n   ## 任務、## 已確定事實、## 未確認、## 已完成、## 進行中、## 下一步、\n   ## 使用者偏好與限制。該欄位沒有內容就寫 (無)。\n2. 逐字保留識別碼：檔案路徑、符號與函式名、行號、指令、設定鍵、錯誤訊息、\n   數字與單位一律原文照抄，不翻譯、不改寫、不縮寫、不補齊。\n3. 事實與推測分離：只有對話裡出現過證據的才進 ## 已確定事實，每條註明來源\n   （工具名或檔案路徑）；推測、假設、還沒驗證的結論一律進 ## 未確認。\n4. 以最新狀態淘汰舊結論：同一件事有多個版本時只保留最後一個；已經做完的項目\n   從 ## 下一步 移到 ## 已完成，不得因為舊摘要提過就復活。\n5. 先前摘要是既有事實：與新內容衝突時以新內容為準，並註明哪一條被取代；沒有\n   新資訊的欄位原樣保留，不得因為這一輪沒提到就刪掉。\n6. 不回答、不執行、不臆造：對話中還沒有答案的問題只登記進 ## 下一步，不要在\n   摘要裡回答；不要寫入對話中不存在的內容。\n7. 篇幅預算：整份摘要不超過 6000 字元，每個欄位不超過 12 條，每條一行。超出時\n   的刪減順序：先刪 ## 已完成 的細節，再刪 ## 已確定事實 裡重複的證據；\n   ## 未確認、## 下一步 與 ## 使用者偏好與限制 最後才刪。";
+const RULES_TEXT = "[CodeTrail 壓縮規則]\n以下七條規則覆蓋前面所有與輸出格式衝突的指示；其餘指示照舊。\n特別是：前面 <template> 區塊裡的英文欄位（## Objective、## Important Details、\n## Work State、## Next Move、## Relevant Files）**一律不要輸出**，它們已被下面的\n七個中文欄位取代。看到「Output exactly the Markdown structure shown inside\n<template>」時，以這裡的欄位為準。\n\n1. 固定欄位：摘要必須且只能由這七個標題組成，順序固定，一個都不能少——\n   ## 任務、## 已確定事實、## 未確認、## 已完成、## 進行中、## 下一步、\n   ## 使用者偏好與限制。該欄位沒有內容就寫 (無)。\n2. 逐字保留識別碼：檔案路徑、符號與函式名、行號、指令、設定鍵、錯誤訊息、\n   數字與單位一律原文照抄，不翻譯、不改寫、不縮寫、不補齊。\n3. 事實與推測分離：只有對話裡出現過證據的才進 ## 已確定事實，每條註明來源\n   （工具名或檔案路徑）；推測、假設、還沒驗證的結論一律進 ## 未確認。\n4. 以最新狀態淘汰舊結論：同一件事有多個版本時只保留最後一個；已經做完的項目\n   從 ## 下一步 移到 ## 已完成，不得因為舊摘要提過就復活。\n5. 先前摘要是既有事實：與新內容衝突時以新內容為準，並註明哪一條被取代；沒有\n   新資訊的欄位原樣保留，不得因為這一輪沒提到就刪掉。\n6. 不回答、不執行、不臆造：對話中還沒有答案的問題只登記進 ## 下一步，不要在\n   摘要裡回答；不要寫入對話中不存在的內容。[CodeTrail 壓縮規則] 與\n   [CodeTrail 狀態校正] 這兩段本身是控制指示，不是對話內容、也不是使用者的\n   偏好，不得寫進任何欄位。\n7. 篇幅預算：整份摘要不超過 6000 字元，每個欄位不超過 12 條，每條一行。超出時\n   的刪減順序：先刪 ## 已完成 的細節，再刪 ## 已確定事實 裡重複的證據；\n   ## 未確認、## 下一步 與 ## 使用者偏好與限制 最後才刪。";
 
 const RECONCILIATION_HEADER = "[CodeTrail 狀態校正]\n以下是最近幾個已經完成的回合節錄，只用來校正 ## 已完成 與 ## 下一步 的狀態，\n不是新的對話內容：凡是在這裡看得到已經做完的項目，不得再出現在 ## 下一步。\n節錄由新到舊排列，已依配額截斷，截斷處標 …[截斷]。";
+
+/**
+ * 規則 1 的七個固定欄位標題，**從 `RULES_TEXT` 解析出來**（Python 端
+ * `compaction_mode.rule_headings()` 對同一段文字做同樣的解析，由跨語言測試
+ * 釘住兩邊解出來的東西相同）。
+ *
+ * 為什麼不再抄一份字面值：壓縮後的格式核對拿這七個標題去驗模型產出的摘要。
+ * 抄一份的話，改了規則卻沒改這裡，合法摘要會被判成漂移、漂移的摘要會被放行
+ * —— 兩種都是靜默的。
+ */
+function parseRuleHeadings(text) {
+  const source = String(text || "");
+  const start = source.indexOf("\n1. ");
+  const end = start >= 0 ? source.indexOf("\n2. ", start + 1) : -1;
+  if (start < 0 || end < 0) return [];
+  const names = [];
+  const pattern = /##\s*([^\s、。]+)/g;
+  const scope = source.slice(start, end);
+  let match;
+  while ((match = pattern.exec(scope)) !== null) names.push(match[1]);
+  return names;
+}
+
+const RULE_HEADINGS = parseRuleHeadings(RULES_TEXT);
 
 // 一個 session 最多提醒一次的上限，避免長 session 無限長大。
 const MAX_TRACKED_SESSIONS = 200;
@@ -141,6 +166,14 @@ function incidentsPath(env = process.env, home = homedir()) {
 
 function rotatedIncidentsPath(env = process.env, home = homedir()) {
   return join(stateDir(env, home), INCIDENTS_ROTATED_FILE);
+}
+
+function stoppedPath(env = process.env, home = homedir()) {
+  return join(stateDir(env, home), STOPPED_FILE);
+}
+
+function rotatedStoppedPath(env = process.env, home = homedir()) {
+  return join(stateDir(env, home), STOPPED_ROTATED_FILE);
 }
 
 function modeStatePath(home = homedir(), env = process.env) {
@@ -585,6 +618,27 @@ function isFailedAssistant(entry) {
   return Boolean(info.error) || info.finish === "error" || info.finish === "aborted";
 }
 
+/**
+ * 這一次壓縮是不是「上一次壓縮之後只隔了一輪」。
+ *
+ * 是的話代表摘要 + 逐字保留的最新一輪本身就快到門檻了 —— 再壓一次換不到多少
+ * 空間。不擋它（擋了就是這個 session 從此不再壓縮，而 `compaction.auto` 已經是
+ * false），但要講一次：使用者看到的否則只是「才剛壓完,問一句又壓」。
+ */
+function compactedJustBefore(messages, anchorIndex) {
+  const list = Array.isArray(messages) ? messages : [];
+  const summaryIndex = newestIndex(list, (entry) => {
+    const info = entryInfo(entry);
+    return Boolean(info) && info.role === "assistant" && info.summary === true;
+  });
+  if (summaryIndex < 0 || summaryIndex > anchorIndex) return false;
+  let turns = 0;
+  for (let i = summaryIndex + 1; i <= anchorIndex; i++) {
+    if (isRealUser(list[i])) turns += 1;
+  }
+  return turns <= 1;
+}
+
 function lastNonSummaryAssistantIndex(messages) {
   return newestIndex(messages, isCompletedAnswer);
 }
@@ -696,9 +750,62 @@ function verifyCompaction(messages, since, seen) {
   return last;
 }
 
+/**
+ * 摘要裡以**行首** `#` 出現的標題，依出現順序，已去掉編號前綴。
+ *
+ * 只認行首：摘要正文引用到的 `## 已確定事實` 不會被誤判成一個欄位。
+ */
+function summaryHeadings(text) {
+  const found = [];
+  for (const line of String(text || "").split("\n")) {
+    const match = /^\s{0,3}#{1,6}\s*(.+?)\s*$/.exec(line);
+    if (!match) continue;
+    found.push(match[1].replace(/^\d+\s*[.、)）]\s*/, ""));
+  }
+  return found;
+}
+
+/**
+ * 七欄契約（docs/compaction-rules.md §3 規則 1）有沒有被遵守。
+ *
+ * 判準是「七個欄位**都在**，而且相對**順序**與規則一致」。刻意比字面規則寬三處：
+ * 多出來的標題不算違規、`#` 的層級不算、標題後面多的裝飾（`## 任務 (Task)`）也不算。
+ * 理由是這條檢查的成本不對稱：漏抓 = 使用者那次壓縮的「已確定事實 vs 未確認」分離
+ * 靜靜沒了；誤抓 = 一個內容完全可用的 session 被停掉自動壓縮並跳錯誤 toast。實際
+ * 發生過的漂移是**整份換成另一套欄位**（英文五欄），七個一個都對不上，上面任何一種
+ * 寬容都擋不掉它。
+ *
+ * 解析不出契約（`RULE_HEADINGS` 是空的）時回 true：那是我們自己的 bug，不該因此
+ * 停掉使用者的 session；那種情況由跨語言測試在交付前擋下。
+ */
+function summaryFollowsContract(text) {
+  if (!RULE_HEADINGS.length) return true;
+  const found = summaryHeadings(text);
+  let cursor = 0;
+  for (const heading of RULE_HEADINGS) {
+    const index = found.findIndex(
+      (name, position) => position >= cursor && name.startsWith(heading),
+    );
+    if (index < 0) return false;
+    cursor = index + 1;
+  }
+  return true;
+}
+
+/** 使用者自己中斷的那一次壓縮（Esc、或壓縮跑到一半關掉 TUI）。 */
+function isAbortedSummary(info) {
+  const name = info && info.error && info.error.name;
+  return info.finish === "aborted" || name === "MessageAbortedError";
+}
+
 function verifyOneSummary(list, summaryIndex) {
   const summary = list[summaryIndex];
   const info = entryInfo(summary);
+  // 使用者自己中斷的壓縮不是失真：上游不會拿一則帶 error 的摘要當切點，所以
+  // 那一輪「沒有壓縮效果」，對話沒有被截掉，沒有東西需要核對。報成
+  // `summary_error` 的話，會用「這段對話大到連摘要都塞不下」這個錯的理由停掉
+  // 一個好好的 session —— 而停用現在是**跨行程永久**的。
+  if (isAbortedSummary(info)) return { ok: true, detail: null, retained: true };
   if (info.error) return { ok: false, detail: "summary_error", retained: false };
   if (!info.finish) return { ok: false, detail: "trigger_failed", retained: false };
 
@@ -726,6 +833,11 @@ function verifyOneSummary(list, summaryIndex) {
       detail: "race_unanswered_user",
       retained: tailRetains(list, userIndex),
     };
+  }
+  // 格式核對放在最後：前面幾條都是「這一輪壓縮本身壞了」，比「摘要格式漂了」
+  // 更急（使用者得重送）。兩者同時發生時先講那一條。
+  if (!summaryFollowsContract(text)) {
+    return { ok: false, detail: "summary_format", retained: false };
   }
   return { ok: true, detail: null, retained: true };
 }
@@ -817,6 +929,38 @@ function hashSession(sessionID) {
     .slice(0, 16);
 }
 
+/**
+ * 「這個 session 已停用自動壓縮」的跨行程紀錄。
+ *
+ * 為什麼需要它：`stoppedSessions` 只活在這個 OpenCode 行程裡。使用者看到「已對這個
+ * session 停用」的 toast、退出、再用 `opencode -s <id>` 恢復同一個 session 之後，
+ * 記憶體裡什麼都沒了 —— 自動壓縮**靜默重新啟用**，於是再產生一次同樣不符契約的
+ * 摘要。實測重現過（同一個 session 三次壓縮，第二次是格式漂移）。
+ *
+ * 內容與 incident 同一條零內容契約：只有 session 雜湊與固定 slug。這不是安全邊界
+ * （授權狀態在 owner-only 的 compaction.json），所以讀取不做 symlink／權限檢查，
+ * 只擋明顯不合理的大小。
+ */
+const STOPPED_FILE = "compaction-stopped.jsonl";
+const STOPPED_ROTATED_FILE = "compaction-stopped.jsonl.1";
+const STOPPED_SCHEMA = 1;
+const STOPPED_MAX_BYTES = 262144;
+/**
+ * 只有「這個 session 的壓縮切點已經不可信」這一類才寫成永久紀錄。
+ *
+ * `config_drift` 與 `version_unsupported` 每個 idle 都會重算：寫成永久的話，使用者
+ * 把設定改回來、把 OpenCode 升級之後，那個 session 仍然永遠不會再壓縮，而且沒有任何
+ * 訊息說明為什麼。`trigger_failed` 是一次性的呼叫失敗，同理。
+ */
+const DURABLE_STOP_DETAILS = [
+  "summary_empty",
+  "summary_reasoning_only",
+  "summary_error",
+  "summary_format",
+  "race_unanswered_user",
+  "race_parent_mismatch",
+];
+
 /** 與 codetrail-notify.js 同一份寫入契約：零內容、固定 slug、0600、1 MiB rotate。 */
 async function recordIncident(entry, options = {}) {
   const env = options.env || process.env;
@@ -851,9 +995,84 @@ async function recordIncident(entry, options = {}) {
   return true;
 }
 
+/**
+ * 記下「這個 session 已停用自動壓縮」。回 true 代表真的寫了。
+ *
+ * 只寫 `DURABLE_STOP_DETAILS` 裡的成因（見那個常數的說明）。零內容：session 只留
+ * 雜湊，detail 是固定 slug。
+ */
+async function recordStopped(sessionID, detail, options = {}) {
+  if (!DURABLE_STOP_DETAILS.includes(detail)) return false;
+  const env = options.env || process.env;
+  const home = options.home || homedir();
+  const now = options.now || Date.now;
+  const dir = stateDir(env, home);
+  const target = stoppedPath(env, home);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  try {
+    const info = await stat(target);
+    if (info.size >= STOPPED_MAX_BYTES) {
+      await rename(target, rotatedStoppedPath(env, home));
+    }
+  } catch {
+    /* 還沒有這個檔就不用 rotate */
+  }
+  const line =
+    JSON.stringify({
+      schema: STOPPED_SCHEMA,
+      ts: now() / 1000,
+      session: hashSession(sessionID),
+      detail: detail,
+    }) + "\n";
+  await appendFile(target, line, { encoding: "utf8", mode: 0o600 });
+  await chmod(target, 0o600);
+  return true;
+}
+
+/**
+ * 讀停用紀錄，回 `Map<session 雜湊, 最後一次的 detail>`。
+ *
+ * 讀不到（還沒有這個檔、權限、壞行）一律當成「沒有紀錄」：這是 UX 狀態，不該讓
+ * 一個讀不到的檔把整個 session 的壓縮鎖死。壞行逐行跳過，不整份放棄。
+ */
+async function readStopped(options = {}) {
+  const env = options.env || process.env;
+  const home = options.home || homedir();
+  const found = new Map();
+  for (const target of [rotatedStoppedPath(env, home), stoppedPath(env, home)]) {
+    let raw;
+    try {
+      const info = await stat(target);
+      // rotate 之後單檔不會超過上限太多；異常大的檔（例如被指到別的東西）不讀。
+      if (!info.isFile() || info.size > STOPPED_MAX_BYTES * 2) continue;
+      raw = await readFile(target, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of raw.split("\n")) {
+      if (!line) continue;
+      let parsed;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (!parsed || parsed.schema !== STOPPED_SCHEMA) continue;
+      if (typeof parsed.session !== "string" || !parsed.session) continue;
+      const detail = DETAIL_SLUGS.includes(parsed.detail) ? parsed.detail : "unknown";
+      found.set(parsed.session, detail);
+    }
+  }
+  return found;
+}
+
 // ── 文案 ────────────────────────────────────────────────────────────────
 const RESEND_HINT =
   "請停掉這個 session，開一個新的，把畫面上還看得到的問題與必要狀態重送一次。不會自動重試，也沒有恢復舊 context 這回事。";
+
+function resumedMessage(detail) {
+  return `這個 session 先前已被 CodeTrail 停用自動壓縮（${detail}），恢復 session 之後仍然停用 —— 那一次的壓縮切點不會因為重開而變得可信。你剛送出的這一則訊息還是會照常送出去：plugin 沒有辦法攔下它（上游的 chat.message hook 只能讀寫內容，沒有否決），想省下等待就現在按 Esc 中斷。這個模式的 compaction.auto 是 false，所以上游也不會替這個 session 壓縮：繼續用下去的話，context 滿了會是一個可見的錯誤。要在有壓縮的情況下繼續，請開一個新的 session。`;
+}
 
 function stopMessage(detail, retained) {
   if (detail === "summary_empty" || detail === "summary_reasoning_only") {
@@ -866,6 +1085,9 @@ function stopMessage(detail, retained) {
     return retained
       ? `你在壓縮進行中送出的問題還逐字留著，但沒有人會回答它（壓縮把回合接走了）。${RESEND_HINT}`
       : `你在壓縮進行中送出的問題沒有被回答，而且已經不在保留的範圍內。${RESEND_HINT}`;
+  }
+  if (detail === "summary_format") {
+    return `壓縮完成了，但摘要沒有照 CodeTrail 的七欄格式輸出（摘要器照了上游 <template> 的英文欄位、或換過摘要模型 / agent.compaction.prompt）。摘要本身還在、對話可以繼續，但「已確定事實 / 未確認」的分離這一次沒有保證。CodeTrail 已對這個 session 停用自動壓縮，以免再產生同樣的摘要；要繼續用結構化壓縮請開一個新 session，同一個模型一直不遵守就改用 ./set_config.sh --compaction-mode native。`;
   }
   if (detail === "race_parent_mismatch") {
     return `壓縮和你的新訊息交錯了：摘要掛在你的問題上、沒有形成壓縮切點，所以這一輪沒有壓縮效果，摘要文字也不是對你問題的回答。${RESEND_HINT}`;
@@ -892,6 +1114,19 @@ const CodetrailCompaction = async (input = {}) => {
   // 開新的」。只存 id 的 Set 很便宜,所以上限可以放大很多。
   const stoppedSessions = new Set();
   const MAX_STOPPED_SESSIONS = MAX_TRACKED_SESSIONS * 20;
+  // 跨行程的那一半:惰性讀一次(第一個 idle 才讀),之後留在記憶體。
+  // 每個 idle 都重讀的話,每次壓縮判斷都要多一次檔案 I/O,而這份紀錄在同一個
+  // 行程裡只會被我們自己加東西。
+  let durableStops = null;
+  const durableStopMap = async () => {
+    if (durableStops) return durableStops;
+    try {
+      durableStops = await readStopped();
+    } catch {
+      durableStops = new Map();
+    }
+    return durableStops;
+  };
 
   /**
    * 兩層淘汰。第一層只丟「既不在處理中、也沒有停用」的最舊一筆：踢掉 busy 的
@@ -986,11 +1221,11 @@ const CodetrailCompaction = async (input = {}) => {
     return { state, config, entry, degraded: false };
   };
 
-  const toast = async (message, variant) => {
+  const toast = async (message, variant, duration = 15000) => {
     try {
       if (!client || !client.tui || typeof client.tui.showToast !== "function") return;
       await client.tui.showToast({
-        body: { title: "CodeTrail 壓縮", message, variant, duration: 15000 },
+        body: { title: "CodeTrail 壓縮", message, variant, duration },
       });
     } catch {
       /* headless 沒有 TUI —— 錯誤走 app.log 與 incident */
@@ -1029,11 +1264,44 @@ const CodetrailCompaction = async (input = {}) => {
     if (stoppedSessions.size > MAX_STOPPED_SESSIONS) {
       stoppedSessions.delete(stoppedSessions.values().next().value);
     }
+    // 先寫永久紀錄再通知:寫得進去的話,使用者退出後恢復同一個 session 仍然停用。
+    try {
+      if (await recordStopped(sessionID, detail)) {
+        (await durableStopMap()).set(hashSession(sessionID), detail);
+      }
+    } catch {
+      /* 寫不進 state 目錄時退回只在這個行程內停用 */
+    }
     if (entry.notified.has(detail)) return;
     entry.notified.add(detail);
     await toast(stopMessage(detail, extra.retained === true), "error");
     await log(detail, sessionID, extra);
     await note(detail, sessionID);
+  };
+
+  /**
+   * 這個 session 先前被停用過嗎？是的話講一次（每個行程一次）。
+   *
+   * 回 true 代表停用中，呼叫端不得再觸發壓縮。
+   *
+   * 為什麼要在 `chat.message` 也叫一次：停用只在 `session.idle` 講的話，使用者恢復
+   * 一個已停用的 session 之後要先送出訊息、等整輪答完（實測 113 秒）才看得到警告，
+   * 而那則訊息可能已經被上一個行程沒跑完的壓縮流程接走。上游沒有「session 被打開」
+   * 的事件（事件只有 created / updated / idle / status / …），所以送出的那一刻是
+   * 我們拿得到的最早時機。
+   */
+  const warnIfStopped = async (sessionID) => {
+    if (!sessionID) return false;
+    const durable = (await durableStopMap()).get(hashSession(sessionID));
+    if (!durable) return false;
+    const entry = track(sessionID);
+    entry.stopped = true;
+    stoppedSessions.add(sessionID);
+    if (entry.notified.has(durable)) return true;
+    entry.notified.add(durable);
+    await toast(resumedMessage(durable), "warning", 30000);
+    await log(durable, sessionID, { resumed: true });
+    return true;
   };
 
   const messagesOf = async (sessionID) => {
@@ -1098,6 +1366,22 @@ const CodetrailCompaction = async (input = {}) => {
         if (block) output.context.push(block);
       } catch {
         /* fail-open：規則加不上去也不能讓壓縮整個掛掉 */
+      }
+    },
+
+    /**
+     * 使用者送出訊息的那一刻（上游在組好 parts、呼叫模型**之前** trigger）。
+     *
+     * 這裡**只讀不改**：不碰 `output.message` / `output.parts`。唯一的作用是把
+     * 「這個 session 已停用自動壓縮」講在使用者等一整輪之前。整段包 try/catch ——
+     * 上游這個 hook 是 `yield* trigger(...)`（不是 event 的 `void`），reject 出去
+     * 會讓使用者的訊息整個送不出去。
+     */
+    async "chat.message"(hookInput) {
+      try {
+        await warnIfStopped(hookInput && hookInput.sessionID);
+      } catch {
+        /* fail-open：一則提醒不得擋住使用者送訊息 */
       }
     },
 
@@ -1246,6 +1530,12 @@ const CodetrailCompaction = async (input = {}) => {
       }
     }
     if (entry.stopped) return;
+    // **跨重開的停用**。`stoppedSessions` 只活在這個行程裡:使用者看到停用的
+    // toast、退出、再 `opencode -s <id>` 恢復同一個 session 之後,不查這份紀錄的話
+    // 自動壓縮會靜默重新啟用,再產生一次同樣不可信的摘要(實測重現過)。
+    // 一般情況下 `chat.message` 已經先講過了,這裡是最後一道(例如整段恢復流程
+    // 都沒有經過 chat.message 的路徑)。
+    if (await warnIfStopped(sessionID)) return;
     const raw = await modeState();
     if (!raw) return;                                     // 沒有狀態檔 = 沒有接管
     if (raw.mode === MODE_NATIVE) {
@@ -1306,7 +1596,26 @@ const CodetrailCompaction = async (input = {}) => {
     if (!derived) return;
     if (totalTokens(anchor) < derived.idleThreshold) return;
 
+    if (compactedJustBefore(messages, anchorIndex) && !entry.notified.has("back_to_back")) {
+      entry.notified.add("back_to_back");
+      await toast(
+        `上一次壓縮之後只隔一輪就又超過門檻（${derived.idleThreshold} tokens）：` +
+          "摘要加上逐字保留的最新一輪本身就快到門檻了，再壓一次換不到多少空間，" +
+          "而每一次都要一到兩分鐘。把 n_ctx 調大、或開一個新的 session 比較划算。",
+        "warning",
+        30000,
+      );
+    }
+
     entry.lastTriggerID = anchor.id;
+    // 實測一次壓縮要 57～122 秒,而觸發點在 idle:畫面上完全沒有動靜,使用者會
+    // 以為卡死了。這是唯一一則不是錯誤的 toast。
+    await toast(
+      "壓縮中：正在把這段對話換成摘要。長對話可能要一到兩分鐘，期間不要送新訊息" +
+        "（送了會和壓縮交錯，那則訊息不會有人回答）。",
+      "info",
+      60000,
+    );
     const since = Date.now();
     try {
       await client.session.summarize({
@@ -1378,6 +1687,18 @@ CodetrailCompaction.internals = {
   compactedAfter,
   configIdentity,
   countSummariesSince,
+  compactedJustBefore,
+  isAbortedSummary,
+  DURABLE_STOP_DETAILS,
+  STOPPED_MAX_BYTES,
+  STOPPED_SCHEMA,
+  readStopped,
+  recordStopped,
+  stoppedPath,
+  RULE_HEADINGS,
+  parseRuleHeadings,
+  summaryFollowsContract,
+  summaryHeadings,
   landedSummaries,
   effectiveConfigPath,
   recordIncident,

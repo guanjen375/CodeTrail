@@ -34,8 +34,11 @@ SWITCH_HINT = (
 )
 
 
-def _drift_lines(cm, state: dict, env: dict) -> list[str]:
-    """有效設定與狀態檔記錄的模式對不上的話,回一行警告(沒有就回空 list)。
+def _config_lines(cm, state: dict, env: dict) -> list[str]:
+    """有效設定那一半:漂移警告 + 目前的觸發門檻。
+
+    門檻要印出來的理由:短對話永遠不會壓縮(這是對的),但畫面上只寫「模式=
+    codetrail」的話,使用者無從分辨「還沒到門檻」與「plugin 根本沒載入」。
 
     讀設定失敗一律當成「沒話說」:這一段是加值資訊,不能變成新的失敗來源。
     """
@@ -50,14 +53,26 @@ def _drift_lines(cm, state: dict, env: dict) -> list[str]:
                 f"⚠ 狀態檔記錄的是另一份 opencode.json(目前有效的是 {path});"
                 "對這一份重跑 ./set_config.sh 才會對得起來"
             ]
+        lines = []
         if cm.effective_drift(config, state=state, plugin_path=cm.PLUGIN_PATH):
-            return [
+            lines.append(
                 "⚠ 有效設定與記錄的模式不一致,壓縮 plugin 會停用自動壓縮;"
                 "跑 python3 scripts/doctor.py 看是哪一個鍵"
-            ]
+            )
+        try:
+            derived = cm.derive_for_config(config)
+        except cm.CompactionModeError as exc:
+            return [*lines, f"⚠ 門檻算不出來:{exc}"]
+        if derived is not None:
+            settings = derived[0]
+            lines.append(
+                f"idle 門檻={settings.idle_threshold} tokens、"
+                f"tail 保留={settings.preserve_recent_tokens} tokens"
+                "(對話還沒到門檻就不會壓縮,那是正常的)"
+            )
+        return lines
     except Exception:  # noqa: BLE001 — 一行資訊不得因為任何讀取問題而中斷
         return []
-    return []
 
 
 def status_lines(env: dict | None = None) -> list[str]:
@@ -89,7 +104,12 @@ def status_lines(env: dict | None = None) -> list[str]:
         return [f"壓縮模式={mode}({label})"]
 
     lines = [f"壓縮模式={mode} {cm.EXPERIMENTAL_TAG}——{label}"]
-    lines.extend(_drift_lines(cm, state, values))
+    lines.extend(_config_lines(cm, state, values))
+    if mode == cm.MODE_MANUAL:
+        # manual 靠使用者自己按 /compact,而那是完整 TUI 才有的指令:--mini 會把
+        # 它當成一般訊息送給模型(模型還會回「好的,開始壓縮」),
+        # `opencode run --command compact` 直接回 Command not found。
+        lines.append("/compact 只有完整 TUI 有效(--mini 與 opencode run 都不支援)")
     # 第一行已經帶 EXPERIMENTAL_TAG,這裡不再重複那個 emoji —— 兩行都掛 🧪
     # 只會讓人略過第二行,而第二行才是那條還原命令。
     lines.append(SWITCH_HINT)

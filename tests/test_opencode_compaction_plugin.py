@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -45,6 +46,7 @@ FROZEN_COMPACTION_DETAILS = (
     "summary_empty",
     "summary_reasoning_only",
     "summary_error",
+    "summary_format",
     "race_unanswered_user",
     "race_parent_mismatch",
     "config_drift",
@@ -112,7 +114,7 @@ def test_incident_constants_are_the_frozen_contract():
     assert _js_literal("INCIDENT_KIND") == FROZEN_INCIDENT_KIND
     assert tuple(_js_literal("INCIDENT_KINDS")) == tuple(cm_lease().INCIDENT_KINDS)
     assert tuple(_js_literal("DETAIL_SLUGS")) == tuple(cm_lease().INCIDENT_DETAILS)
-    # 壓縮自己的 8 個成因必須都在封閉集合裡,而且順序固定
+    # 壓縮自己的 9 個成因必須都在封閉集合裡,而且順序固定
     slugs = _js_literal("DETAIL_SLUGS")
     assert tuple(slugs[slugs.index("summary_empty"):slugs.index("unknown")]) == (
         FROZEN_COMPACTION_DETAILS
@@ -376,6 +378,22 @@ def _assistant(mid, parent, text, ts, *, summary=False, finish="stop", error=Non
     return {"info": info, "parts": parts}
 
 
+def _summary(body: str = "(無)") -> str:
+    """一份**符合七欄契約**的摘要(§3 規則 1)。
+
+    格式核對上線之後,凡是「應該被接受」的 fixture 都要用它:舊的
+    `SUMMARY_OK` 只有一個標題,現在會(正確地)被判成 summary_format。
+    標題從 canonical 文件解析,不在測試裡再抄一份。
+    """
+    return "\n".join(
+        f"## {name}\n{body if index == 0 else '(無)'}"
+        for index, name in enumerate(cm.rule_headings())
+    )
+
+
+SUMMARY_OK = _summary()
+
+
 def _answered_turn(n, ts, *, tokens=0, tools=()):
     return [
         _user(f"u{n}", f"問題 {n}", ts),
@@ -397,7 +415,7 @@ def test_verify_accepts_a_clean_compaction(tmp_path):
     messages = [
         *_answered_turn(1, 100),
         _user("c1", None, 200, compaction=True, tail_start_id="u1"),
-        _assistant("s1a", "c1", "## 任務\n...", 201, summary=True),
+        _assistant("s1a", "c1", SUMMARY_OK, 201, summary=True),
     ]
     assert _verify(tmp_path, messages, since=150)["ok"] is True
 
@@ -421,6 +439,132 @@ def test_verify_detects_blank_and_reasoning_only_summaries(tmp_path, text, reaso
     assert verdict["ok"] is False and verdict["detail"] == detail
 
 
+@pytest.mark.parametrize(
+    "finish,error",
+    [
+        ("aborted", None),
+        ("error", {"name": "MessageAbortedError", "data": {"message": "aborted"}}),
+    ],
+)
+def test_a_compaction_the_user_aborted_is_not_a_failure(tmp_path, finish, error):
+    """按 Esc / 壓縮跑到一半關掉 TUI:那一輪沒有壓縮效果,不是失真。
+
+    報成 `summary_error` 的話,使用者會拿到「這段對話大到連摘要都塞不下」這個
+    錯的理由,而且那個停用是**跨行程永久**的 —— 自己按取消換來一個從此不再
+    壓縮的 session。
+    """
+    messages = [
+        *_answered_turn(1, 100),
+        _user("c1", None, 200, compaction=True, tail_start_id="u1"),
+        _assistant("s1a", "c1", None, 201, summary=True, finish=finish, error=error),
+    ]
+    verdict = _verify(tmp_path, messages, since=150)
+    assert verdict["ok"] is True, verdict
+
+
+def test_verify_rejects_a_summary_that_left_the_seven_field_contract(tmp_path):
+    """實測發生過:同一個 session 第一次是七欄中文,第二次整份換成英文五欄。
+
+    內容看起來還可以,但「已確定事實 vs 未確認」的分離沒了 —— 而那正是這套
+    規則的重點。不核對的話這種漂移沒有 toast、沒有 incident,會被當成一次
+    成功的壓縮。
+    """
+    drifted = (
+        "## Objective\n修 crc\n\n## Important Details\n- AUTO-1042\n\n"
+        "## Work State\n- 進行中\n\n## Next Move\n- 執行 verify_crc()\n\n"
+        "## Relevant Files\n- firmware/omega.c"
+    )
+    messages = [
+        *_answered_turn(1, 100),
+        _user("c1", None, 200, compaction=True, tail_start_id="u1"),
+        _assistant("s1a", "c1", drifted, 201, summary=True),
+    ]
+    verdict = _verify(tmp_path, messages, since=150)
+    assert verdict["ok"] is False and verdict["detail"] == "summary_format"
+
+
+def test_verify_rejects_a_summary_missing_one_field(tmp_path):
+    """少一欄也是漂移:規則 1 是「一個都不能少」。"""
+    partial = "\n".join(
+        f"## {name}\n(無)" for name in cm.rule_headings() if name != "未確認"
+    )
+    messages = [
+        *_answered_turn(1, 100),
+        _user("c1", None, 200, compaction=True, tail_start_id="u1"),
+        _assistant("s1a", "c1", partial, 201, summary=True),
+    ]
+    verdict = _verify(tmp_path, messages, since=150)
+    assert verdict["ok"] is False and verdict["detail"] == "summary_format"
+
+
+def test_verify_rejects_the_seven_fields_out_of_order(tmp_path):
+    """順序也是契約:規則 1 明寫「順序固定」。"""
+    names = list(cm.rule_headings())
+    names[1], names[2] = names[2], names[1]
+    swapped = "\n".join(f"## {name}\n(無)" for name in names)
+    messages = [
+        *_answered_turn(1, 100),
+        _user("c1", None, 200, compaction=True, tail_start_id="u1"),
+        _assistant("s1a", "c1", swapped, 201, summary=True),
+    ]
+    verdict = _verify(tmp_path, messages, since=150)
+    assert verdict["ok"] is False and verdict["detail"] == "summary_format"
+
+
+def test_verify_tolerates_an_extra_heading_and_inline_mentions(tmp_path):
+    """多一個 ## 備註 不該停掉一個內容完全可用的 session。
+
+    行內提到欄位名(規則本身被抄進摘要正文時就會這樣)也不算一個欄位 ——
+    只有行首的 `##` 算標題。
+    """
+    text = SUMMARY_OK + "\n\n## 備註\n- 摘要器補的,規則裡提到 ## 未確認 這幾個字"
+    messages = [
+        *_answered_turn(1, 100),
+        _user("c1", None, 200, compaction=True, tail_start_id="u1"),
+        _assistant("s1a", "c1", text, 201, summary=True),
+    ]
+    assert _verify(tmp_path, messages, since=150)["ok"] is True
+
+
+def test_verify_tolerates_heading_levels_and_decorations(tmp_path):
+    """`# 1. 任務 (Task)` 仍然是那個欄位。
+
+    這條檢查的成本不對稱:漏抓是那一次壓縮的分離靜靜沒了,誤抓是把一個內容
+    完全可用的 session 停掉並跳錯誤 toast。裝飾與層級不是失真來源。
+    """
+    text = "\n".join(
+        f"# {index + 1}. {name} (Field)\n(無)"
+        for index, name in enumerate(cm.rule_headings())
+    )
+    messages = [
+        *_answered_turn(1, 100),
+        _user("c1", None, 200, compaction=True, tail_start_id="u1"),
+        _assistant("s1a", "c1", text, 201, summary=True),
+    ]
+    assert _verify(tmp_path, messages, since=150)["ok"] is True
+
+
+def test_the_rules_override_the_upstream_template_by_name():
+    """規則必須**點名**上游 <template> 的五個英文欄位。
+
+    上游自己的壓縮 prompt 明寫「Output exactly the Markdown structure shown inside
+    <template>」,模板就是 Objective / Important Details / Work State / Next Move /
+    Relevant Files(1.18.21 的 bundle 逐字確認)。我們的規則是**附加**在那一段之後,
+    只寫「覆蓋衝突的指示」不夠 —— 實測看過模型整份照上游模板輸出。拿掉這幾個名字
+    是無聲的:摘要照樣產出,只是換了一套欄位。
+    """
+    block = cm.canonical_block(cm.RULES_BLOCK_MARKER)
+    for heading in ("Objective", "Important Details", "Work State", "Next Move",
+                    "Relevant Files"):
+        assert heading in block, f"規則沒有點名上游模板的 {heading}"
+
+
+def test_rule_headings_are_parsed_the_same_in_both_languages(tmp_path):
+    """兩端各自解析同一段 RULES_TEXT。解出來不一樣的話,格式核對會用錯的標題
+    去驗摘要 —— 合法摘要被判漂移、漂移摘要被放行,兩種都是靜默的。"""
+    assert _js(tmp_path, "emit(I.RULE_HEADINGS);") == list(cm.rule_headings())
+
+
 def test_verify_detects_a_summary_error(tmp_path):
     """壓縮請求本身塞不下時錯誤掛在 summary 訊息上,而且不會發 session.compacted。"""
     messages = [
@@ -442,7 +586,7 @@ def test_verify_detects_the_user_before_compaction_race(tmp_path):
         *_answered_turn(1, 100),
         _user("u2", "壓縮進行中送出的新問題", 200),
         _user("c1", None, 201, compaction=True, tail_start_id="u2"),
-        _assistant("s1a", "c1", "## 任務\n...", 202, summary=True),
+        _assistant("s1a", "c1", SUMMARY_OK, 202, summary=True),
     ]
     verdict = _verify(tmp_path, messages, since=150)
     assert verdict["ok"] is False
@@ -460,7 +604,7 @@ def test_verify_reports_a_question_that_left_the_tail(tmp_path):
         *_answered_turn(1, 100),
         _user("u2", "被切進摘要的問題", 200),
         _user("c1", None, 201, compaction=True),      # 沒有 tail_start_id
-        _assistant("s1a", "c1", "## 任務\n...", 202, summary=True),
+        _assistant("s1a", "c1", SUMMARY_OK, 202, summary=True),
     ]
     verdict = _verify(tmp_path, messages, since=150)
     assert verdict["detail"] == "race_unanswered_user" and verdict["retained"] is False
@@ -472,7 +616,7 @@ def test_verify_detects_the_compaction_before_user_race(tmp_path):
         *_answered_turn(1, 100),
         _user("c1", None, 200, compaction=True),
         _user("u2", "壓縮進行中送出的新問題", 201),
-        _assistant("s1a", "u2", "## 任務\n...", 202, summary=True),
+        _assistant("s1a", "u2", SUMMARY_OK, 202, summary=True),
     ]
     verdict = _verify(tmp_path, messages, since=150)
     assert verdict["ok"] is False and verdict["detail"] == "race_parent_mismatch"
@@ -622,8 +766,33 @@ if (P.autocontinue) {
   await hooks['experimental.compaction.autocontinue']({ sessionID: 's1' }, out);
   calls.push({ kind: 'autocontinue', enabled: out.enabled });
 }
+if (P.restartEvents || P.restartChat) {
+  // OpenCode 重開後恢復同一個 session:新的 plugin 實例、同一個 HOME。
+  // 記憶體裡的 stoppedSessions / sessions Map 全部重來。
+  const restarted = await CodetrailCompaction({ client });
+  if (P.restartChat) {
+    // 使用者送出第一則訊息(上游在呼叫模型之前 trigger 這個 hook)。
+    await restarted['chat.message']({ sessionID: 's1', messageID: 'u9', agent: 'build' });
+    calls.push({ kind: 'chat-returned' });
+  }
+  for (const ev of (P.restartEvents || [])) await restarted.event({ event: ev });
+}
 emit({ calls, summarized });
 """
+
+def _alerts(result):
+    """會打擾使用者的呼叫:錯誤／警告 toast 與 application log。
+
+    觸發壓縮時會跳一則 **info** 進度 toast(一次壓縮實測 57～122 秒,畫面完全沒有
+    動靜的話使用者會以為卡死),那一則不算「吵人」——這些案例守的是「一切正常時
+    不得跳錯誤、不得寫 error log」。
+    """
+    return [
+        call for call in result["calls"]
+        if call["kind"] == "log"
+        or (call["kind"] == "toast" and call.get("variant") != "info")
+    ]
+
 
 _IDLE = {"type": "session.idle", "properties": {"sessionID": "s1"}}
 _PROVIDERS = {"providers": [{"id": "llamacpp", "models": {
@@ -682,7 +851,7 @@ def _compacted_session(tokens=120_000):
     return [
         *_big_session(tokens),
         _user("c1", None, 300, compaction=True, tail_start_id="u2", stamp=1),
-        _assistant("s1a", "c1", "## 任務\n(無)", 301, summary=True, stamp=2),
+        _assistant("s1a", "c1", SUMMARY_OK, 301, summary=True, stamp=2),
     ]
 
 
@@ -692,7 +861,7 @@ def test_idle_triggers_compaction_above_the_derived_threshold(tmp_path):
     assert result["summarized"] == 1
     call = next(c for c in result["calls"] if c["kind"] == "summarize")
     assert call["body"] == {"providerID": "llamacpp", "modelID": "m"}
-    assert not [c for c in result["calls"] if c["kind"] in ("toast", "log")]
+    assert not _alerts(result)
 
 
 def test_idle_stays_quiet_below_the_threshold(tmp_path):
@@ -872,7 +1041,7 @@ def test_repeated_idle_events_compact_at_most_once(tmp_path):
                        messages=_big_session(120_000),
                        afterMessages=_compacted_session())
     assert result["summarized"] == 1
-    assert not [c for c in result["calls"] if c["kind"] in ("toast", "log")]
+    assert not _alerts(result)
 
 
 @pytest.mark.smoke
@@ -885,30 +1054,159 @@ def test_an_already_compacted_anchor_is_not_compacted_again_after_a_restart(tmp_
     already = [
         *_big_session(120_000),
         _user("c0", None, 300, compaction=True, tail_start_id="u2"),
-        _assistant("s0a", "c0", "## 任務\n(無)", 301, summary=True),
+        _assistant("s0a", "c0", SUMMARY_OK, 301, summary=True),
     ]
     result = _run_idle(tmp_path, messages=already)
     assert result["summarized"] == 0
-    assert not [c for c in result["calls"] if c["kind"] in ("toast", "log")]
+    assert not _alerts(result)
+
+
+DRIFTED_SUMMARY = (
+    "## Objective\n修 crc\n\n## Important Details\n- AUTO-1042\n\n"
+    "## Work State\n- 進行中\n\n## Next Move\n- 執行 verify_crc()\n\n"
+    "## Relevant Files\n- firmware/omega.c"
+)
+
+
+def _stopped_ledger(tmp_path: Path) -> Path:
+    return (tmp_path / "home" / ".local" / "state" / "codetrail"
+            / "compaction-stopped.jsonl")
+
+
+def test_a_stopped_session_stays_stopped_after_opencode_restarts(tmp_path):
+    """停用必須跨 OpenCode 重開。
+
+    實測重現:格式漂移被抓到、session 停用,使用者退出後照 TUI 提示用
+    `opencode -s <id>` 恢復同一個 session,再次超過門檻就又壓了第三次 ——
+    因為「已停用」只活在上一個行程的記憶體裡。使用者收到的訊息卻是
+    「已對這個 session 停用」,而且這個模式的 compaction.auto 是 false,
+    所以他不會從別的地方發現。
+    """
+    after = [
+        *_big_session(120_000),
+        _user("c1", None, 300, compaction=True, tail_start_id="u2", stamp=1),
+        _assistant("s1a", "c1", DRIFTED_SUMMARY, 301, summary=True, stamp=2),
+        # 恢復之後又問了一題並答完:時間戳在摘要之後,所以錨點防護擋不住它
+        # (`compactedAfter` 比的是時間,不是陣列位置)。
+        _user("u3", "第三個問題", 400, stamp=3),
+        _assistant("a3", "u3", "第三個回答", 401, tokens=120_000, stamp=4),
+    ]
+    result = _run_idle(tmp_path, messages=_big_session(120_000),
+                       afterMessages=after, restartEvents=[_IDLE])
+    assert result["summarized"] == 1, result["calls"]
+    details = [c["extra"]["detail"] for c in result["calls"] if c["kind"] == "log"]
+    assert "summary_format" in details
+    # 恢復之後要講一次為什麼不壓縮了,不能安靜地什麼都不做。
+    assert any(c["kind"] == "toast" and "恢復 session 之後仍然停用" in c["message"]
+               for c in result["calls"]), result["calls"]
+
+
+def test_a_resumed_stopped_session_warns_when_the_user_sends_not_after_the_answer(tmp_path):
+    """恢復一個已停用的 session:警告要在**送出的那一刻**,不是整輪答完之後。
+
+    實測:只靠 `session.idle` 的話,使用者恢復 session、送出第一則訊息,要等
+    113 秒整輪答完才看到「先前已停用」——而那則訊息還可能被上一個行程沒跑完的
+    壓縮流程接走。上游沒有「session 被打開」的事件(只有 created / updated /
+    idle / status …),所以 `chat.message` 是拿得到的最早時機。
+    """
+    after = [
+        *_big_session(120_000),
+        _user("c1", None, 300, compaction=True, tail_start_id="u2", stamp=1),
+        _assistant("s1a", "c1", DRIFTED_SUMMARY, 301, summary=True, stamp=2),
+    ]
+    result = _run_idle(tmp_path, messages=_big_session(120_000), afterMessages=after,
+                       restartChat=True, restartEvents=[_IDLE])
+    calls = result["calls"]
+    warned = next(
+        (index for index, call in enumerate(calls)
+         if call["kind"] == "toast" and "恢復 session 之後仍然停用" in call["message"]),
+        None,
+    )
+    assert warned is not None, calls
+    returned = [index for index, call in enumerate(calls)
+                if call["kind"] == "chat-returned"][0]
+    assert warned < returned, calls          # 訊息還沒送進模型就講了
+
+
+def test_a_config_drift_stop_is_never_remembered_across_restarts(tmp_path):
+    """設定漂移每個 idle 都會重算 —— 寫成永久紀錄的話,使用者把設定改回來、
+    OpenCode 升級之後,那個 session 仍然永遠不壓縮,而且沒有任何訊息說為什麼。"""
+    drifted = {"compaction": {"auto": True, "tail_turns": 1,
+                              "preserve_recent_tokens": 23920}}
+    result = _run_idle(tmp_path, config=drifted, messages=_big_session(120_000))
+    assert result["summarized"] == 0
+    details = [c["extra"]["detail"] for c in result["calls"] if c["kind"] == "log"]
+    assert details == ["config_drift"]
+    assert not _stopped_ledger(tmp_path).exists()
+
+
+def test_the_stopped_ledger_is_content_free_and_owner_only(tmp_path):
+    """跟 incident 同一條零內容契約:只有 session 雜湊與固定 slug。"""
+    after = [
+        *_big_session(120_000),
+        _user("c1", None, 300, compaction=True, tail_start_id="u2", stamp=1),
+        _assistant("s1a", "c1", DRIFTED_SUMMARY, 301, summary=True, stamp=2),
+    ]
+    _run_idle(tmp_path, messages=_big_session(120_000), afterMessages=after)
+    ledger = _stopped_ledger(tmp_path)
+    lines = [json.loads(line) for line in
+             ledger.read_text(encoding="utf-8").splitlines() if line]
+    assert len(lines) == 1
+    entry = lines[0]
+    assert set(entry) == {"schema", "ts", "session", "detail"}
+    assert entry["detail"] == "summary_format"
+    assert entry["session"] != "s1" and len(entry["session"]) == 16
+    assert stat.S_IMODE(ledger.stat().st_mode) == 0o600
+    assert "第三個問題" not in ledger.read_text(encoding="utf-8")
 
 
 def test_a_new_answered_turn_after_a_compaction_can_trigger_again(tmp_path):
-    """擋的是「同一個錨點」,不是「壓過就永遠不壓」。"""
+    """擋的是「同一個錨點」,不是「壓過就永遠不壓」。
+
+    壓完只隔一輪就又超過門檻(實測的「連續壓縮」)照壓 —— 擋掉等於這個 session
+    從此不再壓縮,而 `compaction.auto` 已經是 false。但要講一次為什麼,否則使用者
+    看到的只是「才剛壓完,問一句又壓」。
+    """
     messages = [
         *_big_session(120_000),
         _user("c0", None, 300, compaction=True, tail_start_id="u2"),
-        _assistant("s0a", "c0", "## 任務\n(無)", 301, summary=True),
+        _assistant("s0a", "c0", SUMMARY_OK, 301, summary=True),
         _user("u3", "壓縮之後的新問題", 400),
         _assistant("a3", "u3", "新回答", 401, tokens=120_000),
     ]
     after = [
         *messages,
         _user("c1", None, 500, compaction=True, tail_start_id="u3", stamp=1),
-        _assistant("s1a", "c1", "## 任務\n(無)", 501, summary=True, stamp=2),
+        _assistant("s1a", "c1", SUMMARY_OK, 501, summary=True, stamp=2),
     ]
     result = _run_idle(tmp_path, messages=messages, afterMessages=after)
     assert result["summarized"] == 1
-    assert not [c for c in result["calls"] if c["kind"] in ("toast", "log")]
+    warned = [c for c in result["calls"]
+              if c["kind"] == "toast" and c["variant"] == "warning"]
+    assert len(warned) == 1 and "只隔一輪" in warned[0]["message"], result["calls"]
+    # 這不是失敗:不寫 log、不寫 incident、不停用。
+    assert not [c for c in result["calls"] if c["kind"] == "log"]
+
+
+def test_two_turns_after_a_compaction_is_not_reported_as_back_to_back(tmp_path):
+    """正常節奏不該跳那則警告 —— 每次壓縮都講一遍就沒有人會看。"""
+    messages = [
+        *_big_session(1000),
+        _user("c0", None, 300, compaction=True, tail_start_id="u2"),
+        _assistant("s0a", "c0", SUMMARY_OK, 301, summary=True),
+        _user("u3", "第三個問題", 400),
+        _assistant("a3", "u3", "第三個回答", 401, tokens=1000),
+        _user("u4", "第四個問題", 500),
+        _assistant("a4", "u4", "第四個回答", 501, tokens=120_000),
+    ]
+    after = [
+        *messages,
+        _user("c1", None, 600, compaction=True, tail_start_id="u4", stamp=1),
+        _assistant("s1a", "c1", SUMMARY_OK, 601, summary=True, stamp=2),
+    ]
+    result = _run_idle(tmp_path, messages=messages, afterMessages=after)
+    assert result["summarized"] == 1
+    assert not _alerts(result), result["calls"]
 
 
 def test_a_failed_summarize_call_stops_and_reports(tmp_path):
@@ -922,7 +1220,7 @@ def test_a_race_after_compaction_is_reported_once(tmp_path):
         *_big_session(120_000),
         _user("u3", "壓縮進行中送出的問題", 300, stamp=1),
         _user("c1", None, 301, compaction=True, tail_start_id="u3", stamp=2),
-        _assistant("s1a", "c1", "## 任務\n(無)", 302, summary=True, stamp=3),
+        _assistant("s1a", "c1", SUMMARY_OK, 302, summary=True, stamp=3),
     ]
     result = _run_idle(tmp_path, events=[_IDLE, _IDLE],
                        messages=_big_session(120_000), afterMessages=after)
@@ -930,7 +1228,9 @@ def test_a_race_after_compaction_is_reported_once(tmp_path):
     assert len(logs) == 1
     assert logs[0]["extra"] == {"detail": "race_unanswered_user",
                                 "session": _session_hash("s1"), "retained": True}
-    toast = next(c for c in result["calls"] if c["kind"] == "toast")
+    # 進度 toast(info)排在前面,要的是那則錯誤 toast。
+    toast = next(c for c in result["calls"]
+                 if c["kind"] == "toast" and c["variant"] == "error")
     assert "重送" in toast["message"]
 
 
@@ -984,6 +1284,9 @@ try {
   await hooks['experimental.session.compacting']({ sessionID: 's1' }, out);
   const auto = { enabled: true };
   await hooks['experimental.compaction.autocontinue']({ sessionID: 's1' }, auto);
+  // chat.message 上游是 `yield* trigger(...)`,不是事件的 `void`:reject 出去
+  // 會讓使用者的訊息整個送不出去。
+  await hooks['chat.message']({ sessionID: 's1', messageID: 'u9' });
   await new Promise((resolve) => setTimeout(resolve, 50));
   emit({ rejected, context: out.context.length, enabled: auto.enabled });
 } catch (error) {
@@ -1036,7 +1339,7 @@ def test_an_attachment_only_user_is_a_real_question(tmp_path):
         *_answered_turn(1, 100),
         _attachment_user("u2", 200),
         _user("c1", None, 201, compaction=True, tail_start_id="u2"),
-        _assistant("s1a", "c1", "## 任務\n(無)", 202, summary=True),
+        _assistant("s1a", "c1", SUMMARY_OK, 202, summary=True),
     ]
     verdict = _verify(tmp_path, messages, since=150)
     assert verdict["ok"] is False and verdict["detail"] == "race_unanswered_user"
@@ -1055,7 +1358,7 @@ def test_a_tool_call_step_is_not_a_completed_answer(tmp_path):
         _assistant("a2", "u2", None, 201, finish="tool-calls",
                    tools=[("codetrail_read_file", "completed")], tokens=120_000),
         _user("c1", None, 202, compaction=True, tail_start_id="u2"),
-        _assistant("s1a", "c1", "## 任務\n(無)", 203, summary=True),
+        _assistant("s1a", "c1", SUMMARY_OK, 203, summary=True),
     ]
     verdict = _verify(tmp_path, messages, since=150)
     assert verdict["ok"] is False and verdict["detail"] == "race_unanswered_user"
@@ -1089,7 +1392,7 @@ def test_reconciliation_never_renders_a_summary_as_an_answer(tmp_path):
     messages = [
         *_answered_turn(1, 100),
         _user("c1", None, 200, compaction=True, tail_start_id="u1"),
-        _assistant("s1a", "c1", "## 任務\n這是摘要正文", 201, summary=True),
+        _assistant("s1a", "c1", _summary("這是摘要正文"), 201, summary=True),
     ]
     result = _reconcile(tmp_path, messages)
     assert "這是摘要正文" not in result["text"]
@@ -1305,7 +1608,7 @@ def test_native_with_a_pre_existing_plugin_stays_silent(tmp_path):
     result = _run_idle(tmp_path, install=False, config=config,
                        messages=_big_session(120_000), compacting=True)
     assert result["summarized"] == 0
-    assert not [c for c in result["calls"] if c["kind"] in ("toast", "log")]
+    assert not _alerts(result)
 
 
 @pytest.mark.smoke
@@ -1457,7 +1760,7 @@ def test_a_bigger_compaction_model_does_not_raise_the_main_model_threshold(tmp_p
                        afterMessages=_compacted_session())
     assert result["summarized"] == 1
     # 受管值是兩者的較小值(＝主模型的),所以不該被判成漂移。
-    assert not [c for c in result["calls"] if c["kind"] in ("toast", "log")]
+    assert not _alerts(result)
 
 
 @pytest.mark.smoke
@@ -1492,7 +1795,7 @@ def test_an_sdk_error_response_is_not_treated_as_drift(tmp_path):
     }
     result = _js(tmp_path, body, spec, home=home)
     assert result["summarized"] == 0
-    assert not [c for c in result["calls"] if c["kind"] in ("toast", "log")]
+    assert not _alerts(result)
     # degraded:規則照加、autocontinue 照關,只是不觸發
     compacting = next(c for c in result["calls"] if c["kind"] == "compacting")
     assert compacting["context"][0] == cm.canonical_block(cm.RULES_BLOCK_MARKER)
@@ -1551,7 +1854,7 @@ def test_two_interleaved_compactions_are_both_verified(tmp_path):
         _user("c1", None, 200, compaction=True, tail_start_id="u1"),
         _assistant("s1a", "c1", "", 201, summary=True),          # 空摘要
         _user("c2", None, 300, compaction=True, tail_start_id="u1"),
-        _assistant("s2a", "c2", "## 任務\n(無)", 301, summary=True),  # 正常
+        _assistant("s2a", "c2", SUMMARY_OK, 301, summary=True),  # 正常
     ]
     verdict = _verify(tmp_path, messages, since=150)
     assert verdict["ok"] is False and verdict["detail"] == "summary_empty"
@@ -1634,7 +1937,7 @@ def test_native_or_unmanaged_never_verifies_a_manual_compact(tmp_path, mode):
     assert "summary_empty" not in details
     if mode is None:
         # 完全沒有狀態檔:一句話都不該說
-        assert not [c for c in result["calls"] if c["kind"] in ("toast", "log")]
+        assert not _alerts(result)
     else:
         # native 但 plugin 仍被載入,本來就該報 config_drift —— 那是另一件事
         assert details == ["config_drift"]
@@ -1650,7 +1953,7 @@ def test_two_compactions_are_both_verified_even_when_one_lands_first(tmp_path):
     after_a = [
         *_answered_turn(1, 100),
         _user("c1", None, 200, compaction=True, tail_start_id="u1", stamp=1),
-        _assistant("s1a", "c1", "## 任務\n(無)", 201, summary=True, stamp=2),
+        _assistant("s1a", "c1", SUMMARY_OK, 201, summary=True, stamp=2),
     ]
     body = _compact_then_idle_driver().replace(
         "summarized = 1;",
@@ -1725,7 +2028,7 @@ def test_a_summary_still_streaming_is_not_a_failure(tmp_path):
     messages = [
         *_answered_turn(1, 100),
         _user("c1", None, 200, compaction=True, tail_start_id="u1"),
-        _assistant("s1a", "c1", "## 任務\n(無)", 201, summary=True),
+        _assistant("s1a", "c1", SUMMARY_OK, 201, summary=True),
         _user("c2", None, 299, compaction=True, tail_start_id="u1"),
         streaming,
     ]
@@ -1748,7 +2051,7 @@ def test_a_summary_that_lands_late_is_still_verified(tmp_path):
     late_empty = [
         *_answered_turn(1, 100),
         _user("c1", None, 200, compaction=True, tail_start_id="u1"),
-        _assistant("s1a", "c1", "## 任務\n(無)", early + 1, summary=True),
+        _assistant("s1a", "c1", SUMMARY_OK, early + 1, summary=True),
         _user("c2", None, 250, compaction=True, tail_start_id="u1"),
         # B 比 A 早開始、晚完成:created 停在 early + 2
         _assistant("s2a", "c2", "", early + 2, summary=True),

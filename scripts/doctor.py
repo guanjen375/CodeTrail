@@ -1363,89 +1363,20 @@ def _recomputed_compaction_drift(compaction_mode, config: dict, mode: str) -> li
     寫進設定的保留額是 set_config 當時那個 ctx 推導出來的;之後換模型或改 ctx
     只有 `limit.context` 會被同步。門檻用新的、tail 用舊的,plugin 會因此停用
     自動壓縮 —— doctor 不比對的話會回報「一致」,兩邊講相反的話。
+
+    推導本身在 `compaction_mode.derive_for_config`(與 aicode 橫幅顯示的門檻
+    同一份實作);這裡只負責把結果跟設定裡的值比對。
     """
     if mode not in compaction_mode.PLUGIN_MODES:
         return []
-    # 上游做 tail selection 與摘要用的是 **compaction agent 的模型**;設了
-    # `agent.compaction.model` 就是它,否則才是主模型。只看 config.model 的話,
-    # runtime 會用小模型重算並停用,doctor 卻回報 PASS。
-    def limit_of(ref):
-        if not isinstance(ref, str) or "/" not in ref:
-            return None
-        provider_id, model_id = ref.split("/", 1)
-        providers = config.get("provider")
-        provider = providers.get(provider_id) if isinstance(providers, dict) else None
-        models = provider.get("models") if isinstance(provider, dict) else None
-        entry = models.get(model_id) if isinstance(models, dict) else None
-        found = entry.get("limit") if isinstance(entry, dict) else None
-        return found if isinstance(found, dict) else None
-
-    agent = config.get("agent")
-    compaction_agent = agent.get("compaction") if isinstance(agent, dict) else None
-    configured = (
-        compaction_agent.get("model") if isinstance(compaction_agent, dict) else None
-    )
-    explicit = isinstance(configured, str) and "/" in configured
-    main_model = config.get("model")
-    model = configured if explicit else main_model
-    if not isinstance(model, str) or "/" not in model:
-        return []
-    limit = limit_of(model)
-    if not isinstance(limit, dict):
-        if explicit:
-            # 明確設了 compaction agent 的模型卻查不到 limit:runtime 會用
-            # `client.config.providers()` 拿到它的真實 limit 重算並可能停用,
-            # 這裡跳過就會回報「一致」而 plugin 那端已經停了。
-            return [
-                f"agent.compaction.model 設成 {model},但設定裡沒有它的 limit;"
-                "無法確認受管值是否與 runtime 一致(plugin 會用真實 limit 重算)"
-            ]
-        return []
-    section = config.get(compaction_mode.COMPACTION_SECTION)
-    reserved = section.get("reserved") if isinstance(section, dict) else None
     try:
-        derived = compaction_mode.derive_settings(
-            context_limit=limit.get("context"),
-            output_limit=limit.get("output"),
-            input_limit=limit.get("input"),
-            reserved=reserved,
-        )
+        result = compaction_mode.derive_for_config(config)
     except compaction_mode.CompactionModeError as exc:
-        return [
-            f"目前的 {model} 推導不出可用的壓縮門檻({exc});"
-            "壓縮 plugin 會停用自動壓縮,請重跑 ./set_config.sh"
-        ]
-    if explicit and main_model != model:
-        # 摘要模型與主模型不同時,受管值是兩者的較小值(compaction_mode
-        # .combine_settings):觸發之前那段對話壓的是主模型,只按摘要模型比對
-        # 的話,摘要模型 context 較大時 doctor 會對「主模型早就會 overflow」的
-        # 設定回報一致。
-        main_limit = limit_of(main_model)
-        if not isinstance(main_limit, dict):
-            return [
-                f"agent.compaction.model 設成 {model},但設定裡沒有主模型 "
-                f"{main_model} 的 limit;無法確認受管值是否與 runtime 一致"
-                "(plugin 會用兩個模型的真實 limit 取較小值重算)"
-            ]
-        try:
-            derived = compaction_mode.combine_settings(
-                derived,
-                compaction_mode.derive_settings(
-                    context_limit=main_limit.get("context"),
-                    output_limit=main_limit.get("output"),
-                    input_limit=main_limit.get("input"),
-                    reserved=reserved,
-                ),
-            )
-        except compaction_mode.CompactionModeError as exc:
-            return [
-                f"主模型 {main_model} 推導不出可用的壓縮門檻({exc});"
-                "壓縮 plugin 會停用自動壓縮,請重跑 ./set_config.sh"
-            ]
-    if explicit and main_model != model:
-        source = f"{model} 與主模型 {main_model} 取較小值"
-    else:
-        source = f"{model}(context={limit.get('context')})"
+        return [str(exc)]
+    if result is None:
+        return []                       # 沒有模型資訊 —— 無從得知,不是漂移
+    derived, source = result
+    section = config.get(compaction_mode.COMPACTION_SECTION)
     issues = []
     for key, expected in derived.config_values.items():
         actual = section.get(key) if isinstance(section, dict) else None

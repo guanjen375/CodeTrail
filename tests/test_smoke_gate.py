@@ -395,7 +395,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     ),
     "test_opencode_compaction_plugin.py": (
         "壓縮 plugin:規則以 context 附加(不得取代 prompt 而丟掉 prior summary)、"
-        "跨語言凍結值與狀態 digest、壓縮後的核對(空摘要／兩種競態)、"
+        "跨語言凍結值與狀態 digest、壓縮後的核對(空摘要／兩種競態／七欄格式漂移)、"
+        "停用必須跨 OpenCode 重開保留(且只記不可信的那幾種成因)、恢復後要在"
+        "使用者送出的那一刻就講(不是整輪答完之後)、"
         "不得觸發的每一種狀態、以及零內容與 fail-open",
         (
             "test_compacting_hook_never_replaces_the_upstream_prompt",
@@ -412,6 +414,16 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_reconciliation_excludes_pending_synthetic_and_failed_turns",
             "test_reconciliation_never_leaks_tool_arguments_or_output",
             "test_verify_detects_a_summary_error",
+            "test_verify_rejects_a_summary_that_left_the_seven_field_contract",
+            "test_a_compaction_the_user_aborted_is_not_a_failure",
+            "test_verify_rejects_a_summary_missing_one_field",
+            "test_verify_rejects_the_seven_fields_out_of_order",
+            "test_rule_headings_are_parsed_the_same_in_both_languages",
+            "test_the_rules_override_the_upstream_template_by_name",
+            "test_a_stopped_session_stays_stopped_after_opencode_restarts",
+            "test_a_resumed_stopped_session_warns_when_the_user_sends_not_after_the_answer",
+            "test_a_config_drift_stop_is_never_remembered_across_restarts",
+            "test_the_stopped_ledger_is_content_free_and_owner_only",
             "test_idle_does_nothing_without_a_mode_state_file",
             "test_an_unusable_state_file_means_no_takeover",
             "test_a_symlinked_state_file_is_never_trusted",

@@ -292,6 +292,12 @@ routing，避免再把它們混為一談。
 | 送出新問題,畫面先跑一段摘要才回答 | OpenCode 原生行為(`native`,或這台機器還沒選過模式):它在**下一個 prompt 進來之後**才檢查上一輪的 token 數 | 重跑 `./set_config.sh` 選 `codetrail`,再**完全退出 OpenCode 重開** |
 | toast 說「空摘要」/「壓縮請求失敗」 | 壓縮已經發生,但摘要是空的或掛了 error。OpenCode 仍把它當成一次成功的切點,前面的對話已離開模型視野 | 停掉這個 session、開新的,把畫面上還看得到的問題與必要狀態重送。**不會自動 revert** |
 | toast 說「你在壓縮進行中送出的問題沒有人會回答」 | 你的訊息和壓縮訊息交錯了(上游 `session.summarize` 沒有 busy 檢查) | 跟上面同一條:停掉這個 session、開新的、重送。plugin 已經對這個 session 停用,而且那一輪的壓縮切點已經不可信 —— 在原 session 重送不會回到乾淨狀態 |
+| toast 說「摘要沒有照 CodeTrail 的七欄格式輸出」 | 模型這一次沒有遵守規則 1(實測看過第一次是七欄中文、第二次整份換成 `Objective / Important Details / …`)。摘要還在,但「已確定事實 vs 未確認」的分離這一次沒有保證 | **不必重送**:對話可以繼續。這個 session 的自動壓縮已停用,要繼續用結構化壓縮請開新 session;同一個模型一直不遵守就 `./set_config.sh --compaction-mode native` |
+| 剛壓完,問一句普通問題又壓一次 | `tail_turns=1` 逐字保留的那一輪很長(一輪多個大工具結果),壓完之後「摘要 + 長 tail」再加一個回答就又過門檻 | 正常行為,不是迴圈(同一則助理訊息不會當第二次錨點)。把超長的單輪拆小,或改用 `native` |
+| `--mini` 或 `opencode run` 裡的 `/compact` 沒有作用 | `/compact` 是**完整 TUI** 的指令。`--mini` 會把它當成一般訊息送給模型(模型還會回「收到,準備壓縮」),`run --command compact` 直接回 `Command not found` | 用完整 TUI(直接 `aicode`)按 `/compact`;headless / mini 只有 `codetrail` 模式的 idle 自動觸發會壓縮 |
+| 恢復舊 session 後**一送出訊息**就跳「先前已停用自動壓縮,恢復後仍然停用」 | 那個 session 之前有一次壓縮不可信(空摘要／格式漂移／競態),停用紀錄寫在 `~/.local/state/codetrail/compaction-stopped.jsonl`,跨重開有效 | 開一個新 session 才會有壓縮。這個模式 `compaction.auto=false`,所以繼續用那個 session 的話 context 滿了會是可見的錯誤。真的要清掉:`rm ~/.local/state/codetrail/compaction-stopped.jsonl*`(只是紀錄,不改任何設定) |
+| 打開已停用的 session 時沒有警告,要送出訊息才有 | OpenCode 沒有「session 被打開」的事件,plugin 最早能講話的時機是你按 Enter 送出的那一刻(呼叫模型之前) | 這是 API 邊界,不是漏報。警告會在模型開始跑之前出現,不用等整輪答完 |
+| 壓縮跑很久,像卡住了 | 一次壓縮實測 57～122 秒(摘要模型要讀整段對話) | 觸發時會先跳一則 info toast。**期間不要送新訊息**——會和壓縮交錯,那則訊息不會有人回答(plugin 會偵測到並要你重送) |
 | toast 說「CodeTrail 壓縮已停用:有效設定與記錄的模式不一致」 | 專案層 `opencode.json` 或手改覆蓋了 `compaction.*` | `python3 scripts/doctor.py` 看是哪一個鍵;把覆蓋拿掉或重跑 `./set_config.sh` |
 | `aicode` 啟動印 `[direct-contract] ⚠ WARN — 壓縮模式 ... 需要 OpenCode >= 1.18.17` | 壓縮語意在那之前不同 | 升級 OpenCode,或 `./set_config.sh --compaction-mode native`。這道閘只在 `aicode` preflight,直接跑 `opencode` 不會檢查(plugin 讀不到目前執行中的版本) |
 | 一輪工具很多,結果整輪報 context error | `codetrail` / `manual` 模式關掉 `compaction.auto`,同時也關掉**同一輪內**的壓縮與 provider overflow 自動回復 | 這是本模式明確接受的取捨。把那個問題拆小,或改用 `native` |
@@ -335,6 +341,10 @@ lease 裡只有 pid / ppid / 開始與更新時間 / `tools/list` 次數 / 最�
 - `unknown` —— pid 還在但啟動時刻對不上(pid 被重用)、這台機器讀不到行程資訊,
   或那是一份還沒有身分欄位的舊 lease。這裡刻意**不猜**:寧可說不知道,
   也不要宣稱一個早就死掉的 server 還活著。
+
+壓縮的停用紀錄是**另一個**檔:`~/.local/state/codetrail/compaction-stopped.jsonl`
+(0600,超過 256 KiB 轉存 `.1`)。每行只有 `schema`、時間、session 雜湊與固定 slug,
+用來讓「已對這個 session 停用」跨 OpenCode 重開仍然有效。
 
 incident 由 OpenCode plugin 寫在 `~/.local/state/codetrail/incidents.jsonl`
 (0600,超過 1 MiB 轉存 `incidents.jsonl.1`,只留一份)。每行只有時間、`kind`、

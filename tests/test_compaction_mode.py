@@ -182,6 +182,28 @@ def test_canonical_rule_block_has_exactly_seven_numbered_rules():
     )
 
 
+def test_rule_headings_come_from_the_document(tmp_path):
+    """七個欄位標題必須是從文件解析出來的,不是另外抄一份。
+
+    格式核對(plugin 的 summary_format)拿這七個去驗模型產出的摘要。抄一份的話,
+    改了規則卻沒改核對,合法摘要會被判成漂移、漂移摘要會被放行 —— 兩種都是靜默的。
+    """
+    headings = cm.rule_headings()
+    assert len(headings) == cm.RULE_HEADING_COUNT
+    block = cm.canonical_block(cm.RULES_BLOCK_MARKER)
+    for name in headings:
+        assert f"## {name}" in block
+
+    doc = tmp_path / "rules.md"
+    doc.write_text(
+        "```text\n[CodeTrail 壓縮規則]\n1. 固定欄位:## 任務、## 只有兩個。\n"
+        "2. 其他\n```\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(cm.CompactionModeError):
+        cm.rule_headings(doc=doc)
+
+
 def test_canonical_block_is_fail_loud_when_the_doc_drifts(tmp_path):
     doc = tmp_path / "rules.md"
     doc.write_text("# 沒有規則區塊\n", encoding="utf-8")

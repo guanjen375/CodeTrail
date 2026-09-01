@@ -98,8 +98,11 @@
   壓縮後必須核對 summary parent 帶 compaction part、最新真實 user 已被回答、摘要非空
   非 reasoning-only 且無 error,不符就停止並要求重送(不自動續答、不自動 revert);
   pending / synthetic / 出錯回合 / 子 session 不得進狀態校正節錄,節錄不得帶工具參數或
-  輸出;incident 與 application log 只放固定 slug 與 session 雜湊;整個 hook 必須
-  fail-open(上游用 `void hook.event(...)` 派送,reject 出去就是 unhandled rejection)
+  輸出;incident 與 application log 只放固定 slug 與 session 雜湊;停用必須寫進
+  `compaction-stopped.jsonl` 才能跨行程(只記摘要/競態那幾種成因,`config_drift` 與
+  `version_unsupported` 每個 idle 重算所以不得記),`chat.message` 只讀不改且整段包
+  try/catch(上游是 `yield* trigger(...)`,reject 會讓使用者的訊息送不出去);整個 hook
+  必須 fail-open(事件用 `void hook.event(...)` 派送,reject 出去就是 unhandled rejection)
 
 任何重構碰到上面這些東西，**新加測試**（開發者寫測試檔，執行依 §1.2 權責），
 不要直接刪 / weaken / 移除檢查點。

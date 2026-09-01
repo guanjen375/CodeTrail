@@ -423,6 +423,7 @@ def test_incident_detail_slugs_match_the_frozen_cross_language_set():
         "summary_empty",
         "summary_reasoning_only",
         "summary_error",
+        "summary_format",
         "race_unanswered_user",
         "race_parent_mismatch",
         "config_drift",
