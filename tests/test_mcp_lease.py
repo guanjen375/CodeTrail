@@ -185,6 +185,7 @@ def test_lease_write_failure_is_silent(tmp_path, monkeypatch):
         "promise_without_call": 0,
         "client_mcp_failed": 0,
         "structured_call_failed": 0,
+        "compaction_stopped": 0,
         "other": 0,
     }
 
@@ -398,11 +399,15 @@ def test_incident_stats_counts_every_kind_and_buckets_the_unknown():
 
 
 def test_incident_detail_slugs_match_the_frozen_cross_language_set():
-    """SEAMS 附錄 A.1 的 11 個 slug,逐字逐序凍結。
+    """跨語言 detail slug 集合,逐字逐序凍結。
 
-    T3 的 JS 端照同一份寫入。任何一端自己增刪一個 slug 都是靜默的:對方寫的
-    合法狀態會被正規化掉,那些事件在事後統計裡等於憑空消失,而且沒有任何
-    錯誤訊息可以看。
+    兩個 JS plugin(codetrail-notify / codetrail-compaction)照同一份寫入。
+    任何一端自己增刪一個 slug 都是靜默的:對方寫的合法狀態會被正規化掉,
+    那些事件在事後統計裡等於憑空消失,而且沒有任何錯誤訊息可以看。
+
+    前 10 個是 SEAMS 附錄 A.1 的原始集合;後 8 個是壓縮 plugin 的
+    `compaction_stopped` 成因(docs/compaction-rules.md §4)。`unknown` 是
+    界外 fallback,必須留在最後。
     """
     assert mcp_lease.INCIDENT_DETAILS == (
         "mcp_status_failed",
@@ -415,6 +420,14 @@ def test_incident_detail_slugs_match_the_frozen_cross_language_set():
         "lease_unknown",
         "no_tool_part",
         "tool_error",
+        "summary_empty",
+        "summary_reasoning_only",
+        "summary_error",
+        "race_unanswered_user",
+        "race_parent_mismatch",
+        "config_drift",
+        "version_unsupported",
+        "trigger_failed",
         "unknown",
     )
     # 界外值一律 `unknown`——`other` 不在這個契約的值域裡。
@@ -496,6 +509,7 @@ def test_readers_return_empty_when_nothing_exists():
         "promise_without_call": 0,
         "client_mcp_failed": 0,
         "structured_call_failed": 0,
+        "compaction_stopped": 0,
         "other": 0,
     }
     assert not mcp_lease.state_dir().exists(), "讀取端不得建目錄"

@@ -18,8 +18,24 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import compaction_mode  # noqa: E402
+from scripts.opencode_mcp_timeout_check import resolve_config_path  # noqa: E402
+
 MIN_OPENCODE_VERSION = (1, 17, 0)
 MAX_OPENCODE_MAJOR = 2
+# 壓縮功能自己的下限:1.18.15 起摘要請求的歷史從 model messages 改成序列化
+# 文字,1.18.17 起 tail_turns 預設消失、保留額上限由 8k 改 15k。同一份規則在
+# 那之前拿到的是**不同語意** —— 那正是計畫禁止的「靜默退回」,所以與
+# direct-tool 契約分開判,不影響其餘功能的 1.17.0 下限。
+MIN_COMPACTION_VERSION = compaction_mode.MIN_COMPACTION_OPENCODE_VERSION
+#: aicode 把 preflight 量到的版本用這個變數傳給 OpenCode 行程;壓縮 plugin
+#: 讀它來決定要不要停用。公開的 plugin / SDK API 沒有「目前執行中版本」這個
+#: 欄位(`Session.version` 是 session 建立時的),所以只能由這一端遞下去。
+COMPACTION_VERSION_ENV = "AICODE_OPENCODE_VERSION"
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30
 
 _VERSION_RE = re.compile(
@@ -130,6 +146,48 @@ def require_direct_tool_contract(
         )
 
 
+def compaction_version_warning(
+    version: tuple[int, int, int],
+    state: Mapping[str, Any] | None,
+    config_path: Path | None = None,
+) -> str | None:
+    """壓縮模式需要的最低版本沒到時,回一句可照做的提醒;否則 None。
+
+    刻意**不是** FAIL:CodeTrail 其餘功能在 1.17.0 以上都正常,而且 plugin
+    自己在 runtime 也會拒絕觸發。這裡只負責讓它在啟動時就看得見 —— 不然
+    使用者會以為壓縮已經照新規則在跑。
+    """
+    if not state or state.get("mode") not in compaction_mode.PLUGIN_MODES:
+        return None
+    if config_path is not None and not compaction_mode.state_matches_config(
+        state, config_path
+    ):
+        # 那份狀態描述的是另一份 opencode.json;plugin 也會因為身分不符而完全
+        # 不接管,這時警告版本(還寫一筆 incident)是報一個不存在的問題。
+        return None
+    if tuple(version) >= tuple(MIN_COMPACTION_VERSION):
+        return None
+    minimum = ".".join(map(str, MIN_COMPACTION_VERSION))
+    current = ".".join(map(str, version))
+    return (
+        f"壓縮模式 {state['mode']} 需要 OpenCode >= {minimum},目前是 {current}:"
+        "壓縮語意在那之前不同,plugin 不會觸發任何壓縮。請升級 OpenCode,或"
+        "重跑 ./set_config.sh --compaction-mode native"
+    )
+
+
+def _record_version_incident() -> None:
+    """記一筆零內容的 `compaction_stopped/version_unsupported`。fail-open。"""
+    try:
+        import mcp_lease
+
+        mcp_lease._record_incident(
+            "compaction_stopped", detail="version_unsupported", source="server"
+        )
+    except Exception:  # noqa: BLE001 — preflight 不得因為診斷紀錄而失敗
+        pass
+
+
 def load_live_contract_inputs(
     *,
     root: Path,
@@ -191,6 +249,14 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
         help="seconds allowed for each read-only OpenCode inspection",
     )
+    parser.add_argument(
+        "--print-version-env",
+        action="store_true",
+        help=(
+            f"print one `{COMPACTION_VERSION_ENV}=<version>` line on stdout so the "
+            "launcher can export the running OpenCode version to the compaction plugin"
+        ),
+    )
     return parser.parse_args(list(argv))
 
 
@@ -226,6 +292,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             message = _contract_guidance(message)
         print(f"[direct-contract] FAIL — {message}", file=sys.stderr)
         return 2
+    warning = compaction_version_warning(
+        version, compaction_mode.load_state(), resolve_config_path(dict(os.environ))
+    )
+    if warning:
+        print(f"[direct-contract] ⚠ WARN — {warning}", file=sys.stderr)
+        # plugin 端讀不到「目前正在跑的版本」(`Session.version` 是 session
+        # 建立時的版本),所以這道閘只有 preflight 做得到,incident 也由這裡寫:
+        # headless 沒有 toast,doctor 的統計是唯一看得到它的地方。
+        _record_version_incident()
+    if args.print_version_env:
+        # aicode 匯入這一行並 export,plugin 才有辦法知道**目前執行中**的版本。
+        # 沒有這個變數時 plugin 不做版本判斷(直接跑 `opencode` 的 session)。
+        print(f"{COMPACTION_VERSION_ENV}={'.'.join(map(str, version))}")
     print(
         "[direct-contract] PASS — OpenCode "
         f"{'.'.join(map(str, version))} direct codetrail_* contract"

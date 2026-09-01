@@ -101,7 +101,7 @@ def test_interactive_flow_answers_everything_and_validates_ranges(tmp_path):
 
     # main 先按 Enter(無效)再輸入 3(超出 1-2,無效)才輸入 1;
     # main GPU 先輸入 5(不存在)再輸入 0;其餘照標準作答。
-    stdin = "\n3\n1\n5\n0\n65536\n1\n1\n1\n8192\n1\n\n"
+    stdin = "\n3\n1\n5\n0\n65536\n1\n1\n1\n8192\n1\n1\n\n"
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models), stdin=stdin)
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "【主聊天模型】 — 偵測到的候選" in proc.stdout
@@ -111,13 +111,14 @@ def test_interactive_flow_answers_everything_and_validates_ranges(tmp_path):
     assert "設定摘要" in proc.stdout
     assert "(預設)" not in proc.stdout             # 不再有任何預設標記
     assert "建議配置" not in proc.stdout           # 不再有建議配置頁
-    # 一個角色問完才換下一個(四段標題依序出現)
+    # 一個角色問完才換下一個(五段標題依序出現;第 5 段是壓縮模式)
     for step, title in ((1, "主聊天模型"), (2, "embedding 模型"),
-                        (3, "reranker 模型"), (4, "VL 模型")):
-        assert f"=== [{step}/4] {title} ===" in proc.stdout
+                        (3, "reranker 模型"), (4, "VL 模型"), (5, "壓縮模式")):
+        assert f"=== [{step}/5] {title} ===" in proc.stdout
     assert (
-        proc.stdout.index("=== [1/4]") < proc.stdout.index("=== [2/4]")
-        < proc.stdout.index("=== [3/4]") < proc.stdout.index("=== [4/4]")
+        proc.stdout.index("=== [1/5]") < proc.stdout.index("=== [2/5]")
+        < proc.stdout.index("=== [3/5]") < proc.stdout.index("=== [4/5]")
+        < proc.stdout.index("=== [5/5]")
     )
     assert (tmp_path / "home" / "start.sh").exists()
     deployment = read_deployment(tmp_path)
@@ -142,7 +143,7 @@ def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
         cwd=REPO_ROOT,
         env={**build_env(tmp_path), "HOME": str(home2), "USERPROFILE": str(home2)},
         # 全部答完,摘要頁按 q → 不寫入
-        input="1\n0\n65536\n1\n1\n1\n8192\n1\nq\n",
+        input="1\n0\n65536\n1\n1\n1\n8192\n1\n1\nq\n",
         capture_output=True,
         text=True,
         timeout=60,
@@ -159,7 +160,7 @@ def test_summary_invalid_input_reprompts_instead_of_aborting(tmp_path):
     models = make_models(tmp_path)
     proc = run(
         tmp_path, "--no-preview", "--models-dir", str(models),
-        stdin="1\n0\n65536\n1\n1\n1\n8192\n1\nzz\nq\n",
+        stdin="1\n0\n65536\n1\n1\n1\n8192\n1\n1\nzz\nq\n",
     )
     assert proc.returncode == 0, proc.stderr
     assert "無效輸入 'zz'" in proc.stdout
@@ -367,7 +368,7 @@ def test_interactive_main_ctx_rejects_above_maximum(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_models(tmp_path)
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n9999999\n65536\n1\n1\n1\n8192\n1\n\n")
+                stdin="1\n0\n9999999\n65536\n1\n1\n1\n8192\n1\n1\n\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "無效輸入:請輸入 1024-1048576 的整數" in proc.stdout
     assert read_deployment(tmp_path)["services"]["main"]["ctx"] == 65536

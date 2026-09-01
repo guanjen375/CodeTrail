@@ -176,6 +176,13 @@ case "${OPENCODE_CODE_MODE_VALUE,,}" in
 esac
 export OPENCODE_EXPERIMENTAL_CODE_MODE=false
 
+# AICODE_COMPACTION_STATE only exists for the private compaction-quality eval,
+# which points the plugin at a throw-away ownership state bound to its own
+# temporary config.  A value left over in the caller's shell would make the
+# runtime plugin read a different (or missing) state than every diagnostic here
+# does — contract check, doctor and the canary all read the real one.  Strip it.
+unset AICODE_COMPACTION_STATE
+
 if command -v python3 >/dev/null 2>&1; then
   PYBIN=python3
 elif command -v python >/dev/null 2>&1; then
@@ -199,9 +206,23 @@ if [ ! -f "$DIRECT_CONTRACT_CHECK" ]; then
   echo "[aicode] missing required direct-tool contract check: $DIRECT_CONTRACT_CHECK" >&2
   exit 2
 fi
-if ! "$PYBIN" "$DIRECT_CONTRACT_CHECK" --root "$ROOT"; then
+DIRECT_CONTRACT_OUT=""
+if ! DIRECT_CONTRACT_OUT="$("$PYBIN" "$DIRECT_CONTRACT_CHECK" --root "$ROOT" --print-version-env)"; then
+  printf '%s\n' "$DIRECT_CONTRACT_OUT"
   echo "[aicode] OpenCode direct-tool contract refused to start (see [direct-contract] above)." >&2
   exit 2
+fi
+printf '%s\n' "$DIRECT_CONTRACT_OUT" | grep -v '^AICODE_OPENCODE_VERSION=' || true
+# Hand the measured OpenCode version to the compaction plugin.  The public
+# plugin/SDK API has no "currently running version" field (`Session.version` is
+# the version that *created* the session), so this preflight is the only place
+# that can gate compaction on it.  Only an exact `MAJOR.MINOR.PATCH` value is
+# accepted; anything else is dropped rather than exported.
+OPENCODE_VERSION_LINE="$(printf '%s\n' "$DIRECT_CONTRACT_OUT" | grep '^AICODE_OPENCODE_VERSION=' | head -n 1 || true)"
+if [[ "$OPENCODE_VERSION_LINE" =~ ^AICODE_OPENCODE_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+  export AICODE_OPENCODE_VERSION="${BASH_REMATCH[1]}"
+else
+  unset AICODE_OPENCODE_VERSION
 fi
 
 # This is the first launcher write.  Keep it after the compatibility gate.

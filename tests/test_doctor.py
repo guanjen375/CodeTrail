@@ -829,3 +829,229 @@ def test_lease_checks_never_fail_when_the_module_is_broken(monkeypatch, tmp_path
     doc.check_incidents(r)
     assert not r.fails
     assert not r.warns
+
+
+# ---------------------------------------------------------------------------
+# 壓縮模式
+# ---------------------------------------------------------------------------
+def _compaction_fixture(monkeypatch, tmp_path: Path, mode: str):
+    """在 tmp HOME 裡放一份模式狀態檔與對應的 opencode.json,回 (config_path, config)。"""
+    import compaction_mode
+
+    config_path = tmp_path / "opencode.json"
+    config: dict = {}
+    derived = (
+        compaction_mode.derive_settings(context_limit=131072, output_limit=8192)
+        if mode in compaction_mode.PLUGIN_MODES
+        else None
+    )
+    _, _, errors, state = compaction_mode.apply_mode(
+        config, mode=mode, derived=derived, prior_state=None,
+        config_path=config_path, plugin_path=compaction_mode.PLUGIN_PATH,
+    )
+    assert errors == []
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    compaction_mode.save_state(
+        state, path=tmp_path / ".config" / "codetrail" / "compaction.json"
+    )
+    return config_path, config
+
+
+def test_compaction_mode_absent_state_is_informational(monkeypatch, tmp_path):
+    """沒有狀態檔 = 沒有接管,不能報成問題。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    r = doc.Result()
+    doc.check_compaction_mode(r)
+    assert not r.fails and not r.warns
+
+
+def test_compaction_mode_reports_a_consistent_setup(monkeypatch, tmp_path):
+    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    r = doc.Result()
+    doc.check_compaction_mode(r)
+    assert not r.warns and not r.fails
+    assert any("codetrail" in item for item in r.passes)
+
+
+@pytest.mark.smoke
+def test_compaction_mode_warns_when_the_effective_config_drifted(monkeypatch, tmp_path):
+    """手改全域設定把 auto 翻回 true 時,plugin 會停用自動壓縮。
+
+    headless 沒有 TUI toast,這條訊息就只剩 doctor 與 OpenCode 的 application
+    log 看得到——doctor 不講的話,使用者只會覺得「壓縮怎麼不動了」。
+    """
+    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
+    config["compaction"]["auto"] = True
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    r = doc.Result()
+    doc.check_compaction_mode(r)
+    assert any("compaction.auto" in item for item in r.warns), r.warns
+    assert not r.fails
+
+
+@pytest.mark.smoke
+def test_compaction_mode_sees_a_project_level_override(monkeypatch, tmp_path):
+    """OpenCode 會把 `<project>/.opencode/opencode.json` 疊在全域之上。
+
+    只讀全域的話,doctor 會對「全域一致、專案層把 auto 翻回 true」回報一致,
+    而 plugin 那端已經因為漂移停用 —— 兩邊講的話相反,使用者無從判斷。
+    """
+    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    project = tmp_path / "project"
+    (project / ".opencode").mkdir(parents=True)
+    (project / ".opencode" / "opencode.json").write_text(
+        json.dumps({"compaction": {"auto": True}}), encoding="utf-8"
+    )
+
+    r = doc.Result()
+    doc.check_compaction_mode(r, project)
+    assert any("compaction.auto" in item for item in r.warns), r.warns
+
+    # 文件教的是直接跑 `python3 scripts/doctor.py`(沒有 --project),
+    # 而 OpenCode 疊的是**當下目錄**的專案設定 —— 那條路徑也要看得到。
+    monkeypatch.chdir(project)
+    cwd_result = doc.Result()
+    doc.check_compaction_mode(cwd_result)
+    assert any("compaction.auto" in item for item in cwd_result.warns), cwd_result.warns
+
+
+@pytest.mark.smoke
+def test_compaction_mode_reports_an_unreadable_project_config(monkeypatch, tmp_path):
+    """帶註解的 `.jsonc` 讀不了時要講,不能靜靜當成沒有 override。"""
+    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    project = tmp_path / "project"
+    (project / ".opencode").mkdir(parents=True)
+    (project / ".opencode" / "opencode.jsonc").write_text(
+        '{\n  // 註解\n  "compaction": {"auto": true}\n}', encoding="utf-8"
+    )
+    r = doc.Result()
+    doc.check_compaction_mode(r, project)
+    assert not r.passes or not any("一致" in item for item in r.passes)
+
+
+@pytest.mark.smoke
+def test_compaction_mode_recomputes_the_managed_values_for_the_current_model(
+    monkeypatch, tmp_path
+):
+    """`limit.context` 被改小之後,寫進設定的保留額不會自己重算。
+
+    plugin 會因此停用自動壓縮;doctor 只比對「設定 vs 狀態檔」的話會回報
+    「一致」,兩邊對同一份設定講相反的話。
+    """
+    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
+    config["model"] = "llamacpp/m"
+    config["provider"] = {
+        "llamacpp": {"models": {"m": {"limit": {"context": 65536, "output": 8192}}}}
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    r = doc.Result()
+    doc.check_compaction_mode(r)
+    assert any("preserve_recent_tokens" in item for item in r.warns), r.warns
+
+
+@pytest.mark.smoke
+def test_compaction_state_override_is_disclosed(monkeypatch, tmp_path):
+    """留在殼層裡的 eval-only override 會讓 runtime 讀另一份狀態。"""
+    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    monkeypatch.setenv("AICODE_COMPACTION_STATE", str(tmp_path / "other.json"))
+    r = doc.Result()
+    doc.check_compaction_mode(r)
+    assert any("AICODE_COMPACTION_STATE" in item for item in r.warns), r.warns
+
+
+@pytest.mark.smoke
+def test_compaction_mode_sees_a_project_level_model_override(monkeypatch, tmp_path):
+    """專案改選一個 context 較小的模型時,runtime 會用那個模型重算並停用。
+
+    doctor 只疊 `compaction` / `plugin` 的話仍會回報一致 —— 兩邊講相反的話。
+    """
+    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
+    config["model"] = "llamacpp/big"
+    config["provider"] = {
+        "llamacpp": {"models": {
+            "big": {"limit": {"context": 131072, "output": 8192}},
+            "small": {"limit": {"context": 65536, "output": 8192}},
+        }}
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    clean = doc.Result()
+    doc.check_compaction_mode(clean, tmp_path / "empty")
+    assert not clean.warns
+
+    project = tmp_path / "project"
+    (project / ".opencode").mkdir(parents=True)
+    (project / ".opencode" / "opencode.json").write_text(
+        json.dumps({"model": "llamacpp/small"}), encoding="utf-8"
+    )
+    r = doc.Result()
+    doc.check_compaction_mode(r, project)
+    assert any("preserve_recent_tokens" in item for item in r.warns), r.warns
+
+
+@pytest.mark.smoke
+def test_compaction_mode_recomputes_for_the_compaction_agent_model(monkeypatch, tmp_path):
+    """上游用 `agent.compaction.model` 做 tail selection 與摘要。
+
+    只看 `config.model` 的話,runtime 會用小模型重算並停用,doctor 卻回報 PASS。
+    """
+    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
+    config["model"] = "llamacpp/big"
+    config["provider"] = {
+        "llamacpp": {"models": {
+            "big": {"limit": {"context": 131072, "output": 8192}},
+            "small": {"limit": {"context": 65536, "output": 8192}},
+        }}
+    }
+    config["agent"] = {"compaction": {"model": "llamacpp/small"}}
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    r = doc.Result()
+    doc.check_compaction_mode(r, tmp_path / "empty")
+    assert any("preserve_recent_tokens" in item for item in r.warns), r.warns
+
+
+@pytest.mark.smoke
+def test_compaction_mode_reads_both_project_config_files(monkeypatch, tmp_path):
+    """OpenCode 依序載入 `.json` 與 `.jsonc`,不是找到一份就停。"""
+    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    project = tmp_path / "project"
+    (project / ".opencode").mkdir(parents=True)
+    (project / ".opencode" / "opencode.json").write_text(
+        json.dumps({"instructions": ["x"]}), encoding="utf-8"
+    )
+    (project / ".opencode" / "opencode.jsonc").write_text(
+        json.dumps({"compaction": {"auto": True}}), encoding="utf-8"
+    )
+    r = doc.Result()
+    doc.check_compaction_mode(r, project)
+    assert any("compaction.auto" in item for item in r.warns), r.warns
+
+
+@pytest.mark.smoke
+def test_project_configs_merge_their_plugin_arrays(monkeypatch, tmp_path):
+    """OpenCode 合併 plugin origins;第二份蓋掉第一份的話 doctor 會報「缺 plugin」。"""
+    import compaction_mode
+
+    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
+    config.pop("plugin", None)
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    project = tmp_path / "project"
+    (project / ".opencode").mkdir(parents=True)
+    (project / ".opencode" / "opencode.json").write_text(
+        json.dumps({"plugin": [str(compaction_mode.PLUGIN_PATH)]}), encoding="utf-8"
+    )
+    (project / ".opencode" / "opencode.jsonc").write_text(
+        json.dumps({"plugin": ["npm:other"]}), encoding="utf-8"
+    )
+    _path, merged, error = doc._load_opencode_config_for_compaction(project)
+    assert error is None
+    assert str(compaction_mode.PLUGIN_PATH) in merged["plugin"]
+    assert "npm:other" in merged["plugin"]

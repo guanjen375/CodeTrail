@@ -14,10 +14,11 @@ nvidia-smi 稍微監控)。
      reranker / VL+mmproj);多 shard 聚合並驗證齊全性(缺片直接列出)。
   3. 背景初步判定:GPU 數與四類模型是否齊全,缺什麼通知什麼。
   4. 互動問答,一個角色問完才進下一個(每組先列出偵測結果再提問):
-       [1/4] 主聊天模型 → 模型、GPU、ctx、CPU-MoE 層數
-       [2/4] embedding  → 模型、GPU
-       [3/4] reranker   → 模型、GPU、internal buffer(ctx)
-       [4/4] VL         → 模型、GPU、mmproj、CPU-MoE 層數
+       [1/5] 主聊天模型 → 模型、GPU、ctx、CPU-MoE 層數
+       [2/5] embedding  → 模型、GPU
+       [3/5] reranker   → 模型、GPU、internal buffer(ctx)
+       [4/5] VL         → 模型、GPU、mmproj、CPU-MoE 層數
+       [5/5] 壓縮模式   → codetrail / native / manual(見 docs/compaction-rules.md)
      CPU-MoE 沒有 y/n 分流:直接問層數,0 = 不 offload(一般模式)、
      N = 前 N 層 experts 留 RAM、≥ 層數上限 = 全部留 RAM(等同 --cpu-moe);
      模型不是 MoE(GGUF 沒有 expert tensors)時直接略過並印出原因。
@@ -29,6 +30,8 @@ nvidia-smi 稍微監控)。
   6. 產物(先寫 staging、全部就緒才原子替換;既有檔備份 *.bak-setconfig-*):
      - ~/.config/codetrail/models.json     主模型 registry(合併既有)
      - ~/.config/codetrail/deployment.json deployment local override
+     - ~/.config/codetrail/compaction.json  壓縮模式與接管前原值(0600;
+                                           這一題有明確答案時才寫)
      - ~/.config/codetrail/opencode-build-prompt.md
                                            實驗性 opt-in build prompt(0644;
                                            只在 --enable-experimental-build-prompt)
@@ -49,6 +52,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -61,6 +65,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import compaction_mode  # noqa: E402
 from deployment_profile import (  # noqa: E402
     _BARE_MODEL_RE,  # registry key 合法性的唯一定義處(避免本檔複製一份造成分叉)
     RUNTIME_OVERRIDE_ENV_KEYS,
@@ -74,6 +79,9 @@ from scripts.opencode_build_prompt import (  # noqa: E402
     build_prompt_path,
     build_prompt_reference,
     extract_build_prompt,
+)
+from scripts.opencode_contract_check import (  # noqa: E402
+    _is_project_scoped_config,  # 「這份設定會不會被 commit 進客戶 repo」的單一判準
 )
 
 GIB = 1024**3
@@ -1134,6 +1142,43 @@ def cpu_moe_recommendation(layout: ModelLayout, gpu: Gpu | None,
     return f"{fit}-{ceiling}"
 
 
+def choose_compaction_mode(
+    override: str | None,
+    assume_yes: bool,
+    prior_mode: str | None,
+) -> str | None:
+    """壓縮模式:互動必答(沒有預設值),`--yes` 一律要旗標或沿用既有選擇。
+
+    回 None 代表「這次不碰壓縮設定」—— `--yes` 沒給旗標、而且這台機器也還沒
+    選過的情況。這是刻意的 fail-closed:舊的 `--yes` 腳本重跑不會突然多一個
+    壓縮 plugin,而且沒有狀態檔就等於沒有接管。
+    """
+    if override is not None:
+        if override not in compaction_mode.COMPACTION_MODES:
+            raise SetupError(
+                "--compaction-mode 只接受 "
+                + " / ".join(compaction_mode.COMPACTION_MODES)
+            )
+        return override
+    if assume_yes:
+        return prior_mode
+    options = list(compaction_mode.COMPACTION_MODES)
+    span = _range(1, len(options))
+    print("\n壓縮(compaction)是 OpenCode 把長對話換成摘要的機制。")
+    print("原生行為是「下一個 prompt 進來才檢查」,所以你送出新問題時會先看到一段摘要。")
+    if prior_mode is not None:
+        print(f"目前記錄的選擇:{prior_mode}({compaction_mode.MODE_LABELS[prior_mode]})")
+    for pos, mode in enumerate(options, start=1):
+        print(f"  [{pos}] {compaction_mode.MODE_LABELS[mode]}")
+    print("  細節與取捨(含 codetrail/manual 會放棄 mid-turn 壓縮這一點):"
+          "docs/compaction-rules.md")
+    while True:
+        raw = _input(f"請輸入編號 {span}: ").strip()
+        if raw.isdecimal() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1]
+        print(f"  無效輸入:{raw!r}(編號只有 {span})")
+
+
 def choose_cpu_moe_layers(
     role_label: str,
     layout: ModelLayout | None,
@@ -1641,6 +1686,11 @@ _OPENCODE_PERMISSION_TEMPLATE = {
 
 DEFAULT_MAIN_BASE_URL = "http://localhost:8080"
 
+# 寫進 opencode.json 的 `limit.output`。壓縮門檻與 tail 保留額都是從
+# (limit.context, limit.output) 推導出來的,所以這個值必須只有一個來源:
+# 兩處各寫一份 8192 的話,改了其中一個門檻就會跟實際設定對不上。
+OPENCODE_OUTPUT_LIMIT = 8192
+
 # lessons(行為教訓)注入:aicode 每次啟動把 active lessons render 成專案內的
 # 這個檔案,OpenCode 以 instructions 相對路徑(相對專案 root)載入。檔案不存在
 # 時 OpenCode 視同 glob 無匹配、直接略過,所以對沒跑過 aicode 的目錄無害。
@@ -1672,7 +1722,7 @@ def _opencode_template(plan: Plan, python_bin: str,
                 "models": {
                     plan.main_key: {
                         "name": plan.main_key,
-                        "limit": {"context": plan.ctx, "output": 8192},
+                        "limit": {"context": plan.ctx, "output": OPENCODE_OUTPUT_LIMIT},
                     }
                 },
             }
@@ -2092,10 +2142,17 @@ def _redact_for_display(content: str) -> str:
 
 
 def commit_files(targets: list[tuple[Path, str, int]], notes: list[str], dry_run: bool,
-                 home: Path | None = None) -> None:
+                 home: Path | None = None,
+                 private: tuple[Path, ...] = ()) -> None:
     """全部產物的 transaction:先寫 staging,備份既有檔,再逐一原子替換;
     任一步失敗 → 還原備份、清掉 staging,不留半套狀態。成功後寫入 transaction
-    manifest(同一次設定的備份對應表),讓 --restore-last-backup 能整批一致還原。"""
+    manifest(同一次設定的備份對應表),讓 --restore-last-backup 能整批一致還原。
+
+    ``private`` 列出的目標多三道:不跟隨 symlink(目標與其父目錄)、父目錄一律
+    建成／收斂成 0700。壓縮的 ownership 紀錄走這一條 —— 它決定「切回 native
+    時要把什麼寫回使用者的設定」,跟著 symlink 過去就是把寫入導到別的檔,
+    目錄對其他帳號開放就是把那份紀錄交給別人改。所有檢查都在 staging 階段
+    完成,任何一條不過就整批中止,不會留下半套。"""
     if dry_run:
         for path, content, _mode in targets:
             display = _redact_for_display(content)
@@ -2103,7 +2160,81 @@ def commit_files(targets: list[tuple[Path, str, int]], notes: list[str], dry_run
             print(f"\n--- [dry-run] 將寫入 {path}{suffix} ---\n{display}", end="")
         return
 
+    private_set = {Path(os.path.abspath(str(item))) for item in private}
+
+    def _is_private(path: Path) -> bool:
+        return Path(os.path.abspath(str(path))) in private_set
+
+    def _private_dir_fd(path: Path) -> int:
+        """拿到 private target 父目錄的 fd。
+
+        路徑檢查完再用路徑寫入,中間那個空隙足夠把目錄或目標換成 symlink。
+        所以建立、chmod、rename 全部改走同一個 dir fd(與
+        `compaction_mode.save_state` 同一條路徑),路徑只用來取名字。
+        """
+        try:
+            before = path.parent.stat().st_mode & 0o777 if path.parent.is_dir() else None
+        except OSError:
+            before = None
+        try:
+            fd = compaction_mode._open_state_dir(path.parent, create=True)
+        except compaction_mode.CompactionModeError as exc:
+            raise SetupError(f"{path.parent} 無法安全使用:{exc}") from exc
+        after = os.fstat(fd).st_mode & 0o777
+        if before is not None and before != after:
+            # 改到使用者自己的目錄權限,不能靜靜做。
+            notes.append(
+                f"{path.parent} 權限由 {before:o} 收斂成 {after:o}"
+                "(壓縮接管紀錄不得讓其他帳號讀寫)"
+            )
+        return fd
+
+    def _private_exists(dir_fd: int, name: str) -> bool:
+        try:
+            os.lstat(name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _private_write(dir_fd: int, name: str, content: bytes, mode: int = 0o600) -> None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(name, flags, mode, dir_fd=dir_fd)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), mode)
+
+    def _private_backup(dir_fd: int, real: Path, notes: list[str]) -> Path | None:
+        try:
+            fd = os.open(real.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
+        except FileNotFoundError:
+            return None
+        # 讀不到就**中止整批**。回 None 等於宣稱「原本沒有這個檔」,commit 會照樣
+        # 覆寫它,manifest 留下 existed:true / backup:null —— 那份 ownership
+        # 紀錄從此還原不回來。public `_backup()` 也是讓 copy error 傳出去。
+        with os.fdopen(fd, "rb") as handle:
+            content = handle.read()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = real.with_name(f"{real.name}.bak-setconfig-{stamp}")
+        _private_write(dir_fd, backup.name, content)
+        notes.append(f"已備份原有 {real} → {backup.name}")
+        return backup
+
     def _real_target(path: Path) -> Path:
+        if _is_private(path):
+            try:
+                existing = os.lstat(path)
+            except FileNotFoundError:
+                existing = None
+            except OSError as exc:
+                raise SetupError(f"無法檢查 {path}:{exc}") from exc
+            if existing is not None and stat.S_ISLNK(existing.st_mode):
+                raise SetupError(
+                    f"{path} 是 symlink;這個檔不接受連結(寫入會被導到別的檔案)。"
+                    "請先移除它再重跑。"
+                )
+            return path
         # dotfiles 使用者常把 ~/.config 下的檔案做成 symlink;os.replace 會把
         # 連結本身換成一般檔。改寫到連結目標,保留使用者的連結結構。
         if not path.is_symlink():
@@ -2115,54 +2246,120 @@ def commit_files(targets: list[tuple[Path, str, int]], notes: list[str], dry_run
         notes.append(f"{path} 是 symlink → 實際寫入 {real}(保留連結)。")
         return real
 
-    staged: list[tuple[Path, Path, Path, int]] = []
+    staged: list[tuple[Path, Path, Path, int, int | None]] = []
+    dir_fds: list[int] = []
+
+    def _cleanup_staged() -> None:
+        for tmp, _path, _real, _mode, dir_fd in staged:
+            if dir_fd is None:
+                tmp.unlink(missing_ok=True)
+            else:
+                try:
+                    os.unlink(tmp.name, dir_fd=dir_fd)
+                except OSError:
+                    pass
+
     try:
         for path, content, mode in targets:
             real = _real_target(path)
-            real.parent.mkdir(parents=True, exist_ok=True)
+            dir_fd = None
+            if _is_private(path):
+                dir_fd = _private_dir_fd(real)
+                dir_fds.append(dir_fd)
+            else:
+                real.parent.mkdir(parents=True, exist_ok=True)
             tmp = real.with_name(f"{real.name}.setconfig-staging-{os.getpid()}")
             # opencode.json may contain provider credentials.  Create every
             # staging file private from birth; widening a public artifact to
             # 0644 happens only after its complete contents are on disk.
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if dir_fd is None:
+                fd = os.open(tmp, flags, 0o600)
+            else:
+                fd = os.open(
+                    tmp.name, flags | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=dir_fd
+                )
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     fd = -1
                     handle.write(content)
                     handle.flush()
                     os.fsync(handle.fileno())
-                tmp.chmod(mode)
+                    os.fchmod(handle.fileno(), mode)
             except BaseException:
                 if fd >= 0:
                     os.close(fd)
-                tmp.unlink(missing_ok=True)
+                if dir_fd is None:
+                    tmp.unlink(missing_ok=True)
+                else:
+                    try:
+                        os.unlink(tmp.name, dir_fd=dir_fd)
+                    except OSError:
+                        pass
                 raise
-            staged.append((tmp, path, real, mode))
+            staged.append((tmp, path, real, mode, dir_fd))
     except BaseException:
-        for tmp, _path, _real, _mode in staged:
-            tmp.unlink(missing_ok=True)
+        _cleanup_staged()
+        for fd in dir_fds:
+            os.close(fd)
         raise
 
     backups: dict[Path, Path | None] = {}
     existed: dict[Path, bool] = {}
     replaced: list[tuple[Path, Path]] = []
     try:
-        for _tmp, path, real, _mode in staged:
-            existed[path] = path.exists()
-            backups[path] = _backup(real, notes)
-        for tmp, path, real, _mode in staged:
-            os.replace(tmp, real)
+        for _tmp, path, real, _mode, dir_fd in staged:
+            if dir_fd is None:
+                existed[path] = path.exists()
+                backups[path] = _backup(real, notes)
+            else:
+                # private target:目錄可能在 fd 開啟之後被換掉,所以連讀舊內容
+                # 與寫備份都走同一個 fd,路徑只用來取名字。
+                existed[path] = _private_exists(dir_fd, real.name)
+                backups[path] = _private_backup(dir_fd, real, notes)
+        for tmp, path, real, _mode, dir_fd in staged:
+            if dir_fd is None:
+                os.replace(tmp, real)
+            else:
+                os.replace(tmp.name, real.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
             replaced.append((path, real))
     except BaseException:
+        fd_of = {path: dir_fd for _tmp, path, _real, _mode, dir_fd in staged}
         for path, real in replaced:
             backup = backups.get(path)
-            if backup is not None:
-                shutil.copy2(backup, real)
-            else:
-                real.unlink(missing_ok=True)
-        for tmp, _path, _real, _mode in staged:
-            Path(tmp).unlink(missing_ok=True)
+            dir_fd = fd_of.get(path)
+            try:
+                if dir_fd is None:
+                    if backup is not None:
+                        shutil.copy2(backup, real)
+                    else:
+                        real.unlink(missing_ok=True)
+                elif backup is not None:
+                    # 連讀回備份也走同一個 fd:父路徑被換掉時,用 pathname 讀
+                    # 會拿到另一個目錄裡的同名檔,再把那些 bytes 寫進原目錄。
+                    fd = os.open(
+                        backup.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=dir_fd,
+                    )
+                    with os.fdopen(fd, "rb") as handle:
+                        _private_write(dir_fd, real.name, handle.read())
+                else:
+                    os.unlink(real.name, dir_fd=dir_fd)
+            except OSError as rollback_exc:
+                # 靜默吞掉的話,可能留下新版 config 配舊 ownership state,而函式
+                # 開頭宣稱的是「不留半套狀態」。
+                notes.append(
+                    f"⚠ 回滾 {real} 失敗({rollback_exc});這個檔可能停在中間狀態,"
+                    "請手動檢查(備份在 *.bak-setconfig-*)"
+                )
+                print(
+                    f"[set_config] ✗ 回滾 {real} 失敗:{rollback_exc}", file=sys.stderr
+                )
+        _cleanup_staged()
         raise
+    finally:
+        for fd in dir_fds:
+            os.close(fd)
 
     global _COMMITTED
     _COMMITTED = True
@@ -2174,16 +2371,82 @@ def commit_files(targets: list[tuple[Path, str, int]], notes: list[str], dry_run
                 str(path): {
                     "existed": existed.get(path, False),
                     "backup": str(backups[path]) if backups.get(path) else None,
+                    # symlink 目標當時指向哪裡。只記邏輯路徑的話,之後 link 被
+                    # 改指到 B,restore 會拿 A 的舊內容覆寫 B。
+                    "real": str(real),
                 }
-                for _tmp, path, _real, _mode in staged
+                for _tmp, path, real, _mode, _dir_fd in staged
             },
         }
+        manifest_file = _manifest_path(home)
         try:
-            _manifest_path(home).write_text(
+            manifest_file.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
         except OSError as exc:
-            notes.append(f"⚠ transaction manifest 寫入失敗({exc});--restore-last-backup 會退回逐檔模式。")
+            # 舊 manifest 留著比沒有更糟:restore 會照**上一次** transaction 還原,
+            # 把剛寫好的設定換成另一個世代的組合。寧可沒有 manifest。
+            removed = ""
+            try:
+                if manifest_file.exists():
+                    manifest_file.unlink()
+                    removed = ";已移除上一次的 manifest(它已經不描述現況)"
+            except OSError:
+                removed = ";⚠ 上一次的 manifest 也刪不掉,--restore-last-backup 前請先手動移除它"
+            notes.append(
+                f"⚠ transaction manifest 寫入失敗({exc})"
+                f"{removed};--restore-last-backup 會退回逐檔模式。"
+            )
+
+
+def _restore_one(target: Path, backup: Path, state_target: Path) -> None:
+    """把一份備份寫回去。
+
+    壓縮狀態檔走 dir fd + 0600(與 `commit_files` 的 private 目標同一條路徑):
+    `shutil.copy2` 會跟著父目錄的 symlink 走,而且權限跟著備份跑 —— 還原出一份
+    plugin 必定拒絕的 state 等於還原完就不接管了。
+    """
+    if target != state_target:
+        shutil.copy2(backup, target)
+        return
+    content = backup.read_bytes()
+    dir_fd = compaction_mode._open_state_dir(target.parent, create=True)
+    temp_name = f".{target.name}.restore-{os.getpid()}"
+    try:
+        # staging + replace,不是原地 truncate:寫到一半 crash / ENOSPC 時,
+        # `O_TRUNC` 已經把舊檔破壞掉了,而那是唯一的 ownership 紀錄。
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(temp_name, flags, 0o600, dir_fd=dir_fd)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+                os.fchmod(handle.fileno(), 0o600)
+            os.replace(temp_name, target.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            temp_name = None
+        finally:
+            if temp_name is not None:
+                try:
+                    os.unlink(temp_name, dir_fd=dir_fd)
+                except OSError:
+                    pass
+    finally:
+        os.close(dir_fd)
+
+
+def _remove_one(target: Path, state_target: Path) -> None:
+    """刪除一個還原目標。狀態檔走 dir fd,不跟著被換掉的父目錄。"""
+    if target != state_target:
+        target.unlink(missing_ok=True)
+        return
+    dir_fd = compaction_mode._open_state_dir(target.parent, create=False, enforce_mode=False)
+    try:
+        os.unlink(target.name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 def restore_last_backup(home: Path, dry_run: bool = False) -> int:
@@ -2195,29 +2458,153 @@ def restore_last_backup(home: Path, dry_run: bool = False) -> int:
     if manifest_file.is_file():
         try:
             manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-            targets = manifest.get("targets", {})
+            targets = manifest.get("targets", {}) if isinstance(manifest, dict) else None
         except (OSError, json.JSONDecodeError) as exc:
-            print(f"[set_config] manifest 無法解析({exc}),退回逐檔模式。", file=sys.stderr)
-            targets = {}
+            # 退回逐檔最新備份會混合不同 transaction 的產物。manifest 存在卻讀
+            # 不了時停下來,讓使用者自己決定,比默默還原出一組拼裝設定安全。
+            print(
+                f"[set_config] transaction manifest 讀不了({exc}):"
+                f"{manifest_file}。不退回逐檔模式(那會混合不同次設定的備份);"
+                "請自行檢查該檔,或刪掉它再重試。",
+                file=sys.stderr,
+            )
+            return 2
+        if not isinstance(manifest, dict) or not manifest.get("targets") or (
+            "targets" in manifest and not isinstance(manifest.get("targets"), dict)
+        ) or any(
+            not isinstance(info, dict)
+            for info in (manifest.get("targets") or {}).values()
+        ):
+            # 語法合法但形狀壞掉(含 `{}` 與空 targets)。落到逐檔 fallback 會
+            # 混合世代,`.items()` 直接拋則是 traceback —— 兩者都比明講一句糟。
+            print(
+                f"[set_config] transaction manifest 形狀不對或沒有目標:{manifest_file}。"
+                "不退回逐檔模式(那會混合不同次設定的備份);請自行檢查該檔,"
+                "或刪掉它再重試。",
+                file=sys.stderr,
+            )
+            return 2
         if targets:
             print(f"[set_config] 依 transaction {manifest.get('transaction')} 整批還原:")
-            restored = 0
+            # 兩趟。先把每一筆都驗過再動手 —— 邊驗邊改的話,發現第 5 筆的備份
+            # 不見時前 4 筆已經被寫回去了,結果是 codetrail 版的 config 配
+            # native 版的 ownership 紀錄,正好是 transaction 要避免的世代混合。
+            problems: list[str] = []
+            plan_actions: list[tuple[Path, Path | None]] = []
+            state_target = compaction_mode.state_path({"HOME": str(home)})
             for target_str, info in targets.items():
                 target = Path(target_str)
-                if info.get("existed") and info.get("backup"):
-                    backup = Path(info["backup"])
-                    if backup.is_file():
-                        if not dry_run:
-                            shutil.copy2(backup, target)
-                        print(f"  {prefix}還原 {target} ← {backup.name}")
-                        restored += 1
-                    else:
-                        print(f"  ⚠ 備份不見了:{backup}(略過 {target.name})")
+                # symlink 只對「不接受連結」的私有目標是問題。其餘產物
+                # (opencode.json 等)是刻意支援 symlink 並寫穿的,對它們報錯
+                # 會讓 dotfiles 使用者永遠無法還原。
+                if target == state_target and os.path.islink(target):
+                    problems.append(
+                        f"{target} 是 symlink;這個檔不接受連結。請先移除它"
+                    )
+                    continue
+                real_ref = info.get("real")
+                real_target = Path(real_ref) if isinstance(real_ref, str) else target
+                # `real` 是 transaction 當時的實體目標。比對時**不得**再對它跑一次
+                # realpath:設定後把那個普通檔換成指向別處的 symlink 時,兩邊會
+                # 一起解析到新目標而比對通過,然後把舊內容寫到別人的檔案裡。
+                try:
+                    current_real = Path(os.path.realpath(target))
+                except OSError:
+                    current_real = target
+                if isinstance(real_ref, str) and current_real != real_target:
+                    problems.append(
+                        f"{target} 現在指向 {current_real},與設定當時的 "
+                        f"{real_target} 不同;還原會把舊內容寫到別的檔案"
+                    )
+                    continue
+                if os.path.islink(real_target):
+                    problems.append(
+                        f"{real_target} 設定當時是普通檔,現在是 symlink;"
+                        "還原會跟著它覆寫別的檔案"
+                    )
+                    continue
+                if info.get("existed"):
+                    backup_ref = info.get("backup")
+                    if not backup_ref:
+                        # manifest 說原檔存在卻沒有備份路徑。落到「移除」分支
+                        # 會把現存的檔案刪掉 —— 那不是還原,是資料遺失。
+                        problems.append(
+                            f"manifest 說 {target.name} 原本存在卻沒有備份路徑,無法還原"
+                        )
+                        continue
+                    backup = Path(backup_ref)
+                    if not backup.is_file():
+                        problems.append(f"備份不見了:{backup}(對應 {target.name})")
+                        continue
+                    plan_actions.append((real_target, backup))
                 else:
-                    if not dry_run:
-                        target.unlink(missing_ok=True)
-                    print(f"  {prefix}移除 {target}(該次設定前不存在)")
+                    plan_actions.append((real_target, None))
+            if problems:
+                for item in problems:
+                    print(f"  ✗ {item}", file=sys.stderr)
+                print(
+                    "[set_config] 這次 transaction 無法完整還原,已中止,"
+                    "沒有動任何檔案(不同檔案停在不同世代比不還原更糟)。",
+                    file=sys.stderr,
+                )
+                return 2
+            # 動手前先把現況收進記憶體:第 1 個 copy 成功、第 2 個遇到 ENOSPC
+            # 時要能整批回去,否則不同檔案會停在不同世代。
+            snapshot: dict[Path, tuple[bytes, int] | None] = {}
+            if not dry_run:
+                for target, _backup in plan_actions:
+                    try:
+                        snapshot[target] = (
+                            target.read_bytes(), target.stat().st_mode & 0o777
+                        )
+                    except FileNotFoundError:
+                        snapshot[target] = None
+                    except OSError as exc:
+                        print(f"  ✗ 讀不到 {target}:{exc}", file=sys.stderr)
+                        print(
+                            "[set_config] 無法在還原前保留現況,已中止,沒有動任何檔案。",
+                            file=sys.stderr,
+                        )
+                        return 2
+            restored = 0
+            try:
+                for target, backup in plan_actions:
+                    if backup is not None:
+                        if not dry_run:
+                            _restore_one(target, backup, state_target)
+                        print(f"  {prefix}還原 {target} ← {backup.name}")
+                    else:
+                        if not dry_run:
+                            _remove_one(target, state_target)
+                        print(f"  {prefix}移除 {target}(該次設定前不存在)")
                     restored += 1
+            except (OSError, compaction_mode.CompactionModeError) as exc:
+                print(f"  ✗ 還原中途失敗:{exc}", file=sys.stderr)
+                rollback_failed = []
+                for target, saved in snapshot.items():
+                    try:
+                        if saved is None:
+                            target.unlink(missing_ok=True)
+                        else:
+                            content, mode = saved
+                            target.write_bytes(content)
+                            # 連權限一起回去:備份可能是 0644,而原檔(含 API
+                            # key 的 opencode.json)是 0600。
+                            target.chmod(mode)
+                    except OSError as rollback_exc:
+                        rollback_failed.append(f"{target}({rollback_exc})")
+                if rollback_failed:
+                    print(
+                        "[set_config] ✗ 回滾也失敗了,以下檔案可能停在中間狀態,"
+                        "請手動檢查:" + "、".join(rollback_failed),
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "[set_config] 已把動過的檔案回到還原前的狀態;請先處理上面的錯誤。",
+                        file=sys.stderr,
+                    )
+                return 2
             if dry_run:
                 print(f"[dry-run] 以上 {restored}/{len(targets)} 個動作未執行(拿掉 --dry-run 才會還原)。")
             else:
@@ -2229,11 +2616,13 @@ def restore_last_backup(home: Path, dry_run: bool = False) -> int:
     targets = [
         home / ".config" / "codetrail" / "models.json",
         home / ".config" / "codetrail" / "deployment.json",
+        compaction_mode.state_path({"HOME": str(home)}),
         build_prompt_path(home),
         home / ".config" / "opencode" / "opencode.json",
         home / "start.sh",
     ]
     restored = 0
+    state_target = compaction_mode.state_path({"HOME": str(home)})
     for target in targets:
         backups = sorted(target.parent.glob(f"{target.name}.bak-setconfig-*"))
         if not backups:
@@ -2241,7 +2630,11 @@ def restore_last_backup(home: Path, dry_run: bool = False) -> int:
             continue
         latest = backups[-1]
         if not dry_run:
-            shutil.copy2(latest, target)
+            try:
+                _restore_one(target, latest, state_target)
+            except (OSError, compaction_mode.CompactionModeError) as exc:
+                print(f"  ✗ {target} 還原失敗:{exc}", file=sys.stderr)
+                return 2
         print(f"  {prefix}還原 {target} ← {latest.name}")
         restored += 1
     if restored == 0:
@@ -2419,6 +2812,14 @@ def _parser() -> argparse.ArgumentParser:
              f"≥ 層數上限=全部({_range(0, MAX_N_CPU_MOE)})",
     )
     parser.set_defaults(cpu_moe=None, n_cpu_moe=None, vl_cpu_moe=None, vl_n_cpu_moe=None)
+    parser.add_argument(
+        "--compaction-mode", choices=list(compaction_mode.COMPACTION_MODES),
+        help=(
+            "OpenCode 壓縮模式(見 docs/compaction-rules.md)。互動模式是第 5 題;"
+            "--yes 沒給這個旗標時沿用 ~/.config/codetrail/compaction.json 記錄的選擇,"
+            "還沒選過就完全不碰壓縮設定"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="只顯示會寫入的內容,不動任何檔案")
     parser.add_argument("--allow-remote", action="store_true",
                         help="讓區網其他機器可連線模型 API(未指定只綁 127.0.0.1;llama-server 無認證,慎用)")
@@ -2460,7 +2861,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def _print_summary_page(plan: Plan, python_bin: str, opencode_changes: list[str],
                         codetrail_dir: Path, build_prompt_target: Path | None,
-                        opencode_path: Path, start_path: Path) -> None:
+                        opencode_path: Path, start_path: Path,
+                        compaction_choice: str | None = None,
+                        compaction_derived=None,
+                        compaction_state_path: Path | None = None) -> None:
     offload = _offload_description(plan)
     print("\n=== 設定摘要(全部來自你的作答;確認一次即可)===")
     print(f"  主聊天    : {plan.main.candidate.describe()}")
@@ -2477,8 +2881,18 @@ def _print_summary_page(plan: Plan, python_bin: str, opencode_changes: list[str]
     bind = "0.0.0.0(區網可連,無認證!)" if plan.allow_remote else "127.0.0.1(僅本機)"
     print(f"  綁定      : {bind}")
     print(f"  MCP Python: {python_bin}")
+    if compaction_choice is None:
+        print("  壓縮模式  : 不變更(OpenCode 原生行為)")
+    else:
+        print(f"  壓縮模式  : {compaction_choice}"
+              f"({compaction_mode.MODE_LABELS[compaction_choice]})")
+        if compaction_derived is not None:
+            print(f"              idle 門檻={compaction_derived.idle_threshold} tokens、"
+                  f"tail 保留={compaction_derived.preserve_recent_tokens} tokens")
     print("  產物      :")
     print(f"    {codetrail_dir / 'models.json'} / {codetrail_dir / 'deployment.json'}")
+    if compaction_choice is not None and compaction_state_path is not None:
+        print(f"    {compaction_state_path}")
     if build_prompt_target is not None:
         print(f"    {build_prompt_target} (實驗性 opt-in)")
     print(f"    {opencode_path}")
@@ -2589,6 +3003,29 @@ def run(args: argparse.Namespace) -> int:
         )
     else:
         opencode_path = home / ".config" / "opencode" / "opencode.json"
+    compaction_state_path = compaction_mode.state_path({"HOME": str(home)})
+    prior_compaction_state, compaction_state_reason = compaction_mode.inspect_state(
+        path=compaction_state_path
+    )
+    if compaction_state_reason:
+        base_notes.append(f"⚠ {compaction_state_reason}(這次會當成還沒選過壓縮模式)")
+    if prior_compaction_state is not None and not compaction_mode.state_matches_config(
+        prior_compaction_state, opencode_path
+    ):
+        if prior_compaction_state.get("mode") in compaction_mode.PLUGIN_MODES:
+            # 那份紀錄裡有「接管前原值」,是另一份 opencode.json 唯一的還原依據。
+            # 拿它去動這一份會把 A 的原值寫進 B,而且 A 從此回不去原生。
+            raise SetupError(
+                f"{compaction_state_path} 記錄的壓縮接管是另一份 opencode.json"
+                f"(這次的目標是 {opencode_path})。請先用原本那份設定跑一次"
+                " ./set_config.sh --compaction-mode native 還原,或移除該狀態檔後重試。"
+            )
+        base_notes.append(
+            f"{compaction_state_path} 記錄的是另一份 opencode.json 的 native 選擇"
+            "(沒有待還原的值),這次會以目前這份重新記錄。"
+        )
+        prior_compaction_state = None
+
     start_path = home / "start.sh"
     if start_path.exists():
         try:
@@ -2603,7 +3040,7 @@ def run(args: argparse.Namespace) -> int:
     def _section(step: int, title: str) -> None:
         """一個角色一組:先印標題,再問這個角色的所有題目(--yes 不需要分組。)"""
         if not args.yes:
-            print(f"\n=== [{step}/4] {title} ===")
+            print(f"\n=== [{step}/5] {title} ===")
 
     def _layout_of(candidate: ModelCandidate, role_label: str,
                    notes: list[str]) -> ModelLayout | None:
@@ -2619,7 +3056,7 @@ def run(args: argparse.Namespace) -> int:
 
         順序固定為「一個角色問完才換下一個」:模型 → GPU → 該角色的數值題。
         """
-        # ---- [1/4] 主聊天模型:模型 → GPU → ctx → CPU-MoE 層數 ----
+        # ---- [1/5] 主聊天模型:模型 → GPU → ctx → CPU-MoE 層數 ----
         _section(1, "主聊天模型")
         # 互動也必須明確列出 main 候選,不能靜默拿排序第一顆;否則多顆
         # 大模型並存時,使用者會在不知道模型名稱的情況下替錯誤的模型選模式。
@@ -2690,7 +3127,7 @@ def run(args: argparse.Namespace) -> int:
         elif cores and threads > cores:
             notes.append(f"⚠ --threads {threads} 超過偵測到的核心數({cores}),通常反而較慢。")
 
-        # ---- [2/4] embedding:模型 → GPU ----
+        # ---- [2/5] embedding:模型 → GPU ----
         _section(2, "embedding 模型")
         embed_cand = choose_candidate("【embedding 模型】", candidates["embedding"],
                                       args.embed_model, assume_yes=args.yes,
@@ -2698,7 +3135,7 @@ def run(args: argparse.Namespace) -> int:
         embed_gpu = choose_gpu("【embedding 模型】", gpus, args.embed_gpu,
                                assume_yes=args.yes, flag_name="--embed-gpu")
 
-        # ---- [3/4] reranker:模型 → GPU → internal buffer(ctx)----
+        # ---- [3/5] reranker:模型 → GPU → internal buffer(ctx)----
         _section(3, "reranker 模型")
         rerank_cand = choose_candidate("【reranker 模型】", candidates["reranker"],
                                        args.rerank_model, assume_yes=args.yes,
@@ -2707,7 +3144,7 @@ def run(args: argparse.Namespace) -> int:
                                 assume_yes=args.yes, flag_name="--rerank-gpu")
         reranker_ctx = choose_reranker_ctx(rerank_cand, args.reranker_ctx, assume_yes=args.yes)
 
-        # ---- [4/4] VL:模型 → GPU → mmproj → CPU-MoE 層數 ----
+        # ---- [4/5] VL:模型 → GPU → mmproj → CPU-MoE 層數 ----
         _section(4, "VL 模型")
         vl_cand = choose_candidate("【VL 模型】", candidates["vl"], args.vl_model,
                                    assume_yes=args.yes, flag_name="--vl-model")
@@ -2818,6 +3255,125 @@ def run(args: argparse.Namespace) -> int:
             plan, python_bin, opencode_path, main_base_url,
             build_prompt_ref=build_prompt_ref,
         )
+
+        # ---- [5/5] 壓縮模式 ----
+        _section(5, "壓縮模式")
+        template_model = f"llamacpp/{plan.main_key}"
+        prior_mode = (
+            prior_compaction_state.get("mode") if prior_compaction_state else None
+        )
+        chosen_mode = choose_compaction_mode(
+            args.compaction_mode, assume_yes=args.yes, prior_mode=prior_mode
+        )
+        compaction_state = None
+        derived = None
+        if chosen_mode is None:
+            notes.append(
+                "壓縮模式:這次不碰(--yes 沒給 --compaction-mode,而且還沒選過)。"
+                "OpenCode 維持原生行為;要改用 CodeTrail 壓縮請加"
+                " --compaction-mode codetrail。"
+            )
+        else:
+            if chosen_mode in compaction_mode.PLUGIN_MODES:
+                if _is_project_scoped_config(opencode_path):
+                    # <project>/.opencode/opencode.json 可能被 commit 進客戶
+                    # repo;寫進去等於把本機絕對路徑(使用者名稱、CodeTrail
+                    # 安裝位置)洩漏出去,而且那份設定跟著 repo 走到別台機器
+                    # 就會指向不存在的檔。contract check 對通知 plugin 用的是
+                    # 同一條判準。
+                    raise SetupError(
+                        f"OPENCODE_CONFIG 指到專案內的設定({opencode_path});"
+                        f"壓縮模式 {chosen_mode} 需要註冊本機絕對路徑的 plugin,"
+                        "那會把安裝路徑寫進可能被 commit 的檔案。請對全域設定"
+                        "(~/.config/opencode/opencode.json)設定壓縮模式,"
+                        "或用 --compaction-mode native。"
+                    )
+                # 受管值必須用 **compaction agent 實際會用的模型** 推導。使用者
+                # 設過 `agent.compaction.model` 時我們會保留它,拿主模型推導的話
+                # 設定寫完的第一個 idle 就會被 runtime 判成 config_drift。
+                agent_model, agent_limit, agent_explicit = (
+                    compaction_mode.compaction_model_limits(opencode_config)
+                )
+                if agent_explicit and agent_limit is None:
+                    # 明確設了 compaction agent 的模型,但 opencode.json 裡查不到
+                    # 它的 limit。靜默退回主模型公式的話,plugin 會用那個模型的
+                    # 真實 limit 重算,設定寫完的第一個 idle 就判 config_drift。
+                    raise SetupError(
+                        f"agent.compaction.model 設成 {agent_model},但 opencode.json 的 "
+                        f"provider.*.models 裡沒有它的 limit。壓縮的受管值必須依那個模型"
+                        "推導,查不到就無法保證與 runtime 一致。請在設定裡補上它的 "
+                        "limit.context / limit.output,或移除 agent.compaction.model 後重試"
+                        "(也可以改用 --compaction-mode native)。"
+                    )
+                section = opencode_config.get("compaction")
+                reserved = (
+                    section.get("reserved") if isinstance(section, dict) else None
+                )
+                separate_summariser = (
+                    agent_limit is not None and agent_model != template_model
+                )
+                if separate_summariser:
+                    context_limit = agent_limit.get("context")
+                    output_limit = agent_limit.get("output", OPENCODE_OUTPUT_LIMIT)
+                else:
+                    context_limit = plan.ctx
+                    output_limit = OPENCODE_OUTPUT_LIMIT
+                try:
+                    derived = compaction_mode.derive_settings(
+                        context_limit=context_limit,
+                        output_limit=output_limit,
+                        input_limit=(agent_limit or {}).get("input"),
+                        reserved=reserved,
+                    )
+                    if separate_summariser:
+                        # 摘要模型 context 比主模型大時,只按它推導的門檻主模型
+                        # 根本裝不下 —— 觸發之前那段對話壓的是主模型,而
+                        # `auto=false` 已經關掉上游的 overflow 回復。
+                        derived = compaction_mode.combine_settings(
+                            derived,
+                            compaction_mode.derive_settings(
+                                context_limit=plan.ctx,
+                                output_limit=OPENCODE_OUTPUT_LIMIT,
+                                reserved=reserved,
+                            ),
+                        )
+                        notes.append(
+                            f"壓縮受管值依 agent.compaction.model({agent_model})的 "
+                            f"limit.context={context_limit} 與主模型 ctx={plan.ctx} "
+                            "兩者的較小值推導"
+                        )
+                except compaction_mode.CompactionModeError as exc:
+                    raise SetupError(
+                        f"壓縮模式 {chosen_mode} 無法套用在 ctx={context_limit} 的"
+                        f"壓縮模型({agent_model or plan.main_key}):{exc}"
+                    ) from exc
+                if not derived.tail_holds_a_full_headroom_turn:
+                    notes.append(
+                        f"⚠ ctx={plan.ctx} 偏小:tail 保留額"
+                        f"({derived.preserve_recent_tokens} tokens)裝不下一整個"
+                        f" headroom({derived.headroom} tokens)大小的回合。"
+                        "壓縮進行中送出的長問題可能被切進摘要——plugin 會偵測到並"
+                        "要求重送(docs/compaction-rules.md §2)。"
+                    )
+            # 目錄 / 權限的前置檢查:狀態檔是 ownership 的唯一依據,目錄不安全
+            # 就不該把它寫下去。只檢查、不建立 —— 使用者在摘要頁按 q 或跑
+            # --dry-run 時,這裡不得留下任何痕跡(真正的寫入走 commit_files)。
+            unsafe = compaction_mode.check_state_dir(compaction_state_path.parent)
+            if unsafe:
+                raise SetupError(f"壓縮模式無法套用:{unsafe}")
+            c_changes, c_warnings, c_errors, compaction_state = compaction_mode.apply_mode(
+                opencode_config,
+                mode=chosen_mode,
+                derived=derived,
+                prior_state=prior_compaction_state,
+                config_path=opencode_path,
+                plugin_path=compaction_mode.PLUGIN_PATH,
+            )
+            if c_errors:
+                raise SetupError("壓縮模式無法套用:\n  - " + "\n  - ".join(c_errors))
+            opencode_changes.extend(c_changes)
+            notes.extend(f"⚠ {item}" for item in c_warnings)
+
         opencode_json = json.dumps(opencode_config, ensure_ascii=False, indent=2) + "\n"
 
         # 寫入正式檔之前,用 staging 內容跑一次 deployment_profile 完整驗證。
@@ -2830,13 +3386,23 @@ def run(args: argparse.Namespace) -> int:
             "opencode_json": opencode_json,
             "opencode_changes": opencode_changes,
             "start_content": build_start_sh(plan),
+            "compaction_mode": chosen_mode,
+            "compaction_derived": derived,
+            "compaction_state_json": (
+                compaction_mode.state_payload(compaction_state)
+                if compaction_state is not None
+                else None
+            ),
         }
 
     notes = list(base_notes)
     bundle = _gather(notes)
     plan: Plan = bundle["plan"]
     _print_summary_page(plan, python_bin, bundle["opencode_changes"],
-                        codetrail_dir, build_prompt_target, opencode_path, start_path)
+                        codetrail_dir, build_prompt_target, opencode_path, start_path,
+                        compaction_choice=bundle["compaction_mode"],
+                        compaction_derived=bundle["compaction_derived"],
+                        compaction_state_path=compaction_state_path)
     if not args.yes and not args.dry_run:
         while True:
             answer = _input("\n[Enter] 採用並寫入 / [q] 離開: ").strip().lower()
@@ -2863,11 +3429,18 @@ def run(args: argparse.Namespace) -> int:
         (opencode_path, bundle["opencode_json"], 0o600),
         (start_path, bundle["start_content"], 0o755),
     ])
+    if bundle["compaction_state_json"] is not None:
+        # 壓縮模式的 ownership 紀錄:記著接管前每個受管鍵的原值,是切回 native
+        # 唯一的還原依據,所以必須跟 opencode.json 同一個 transaction 進退。
+        commit_targets.append(
+            (compaction_state_path, bundle["compaction_state_json"], 0o600)
+        )
     commit_files(
         commit_targets,
         plan.notes,
         args.dry_run,
         home=home,
+        private=(compaction_state_path,),
     )
     for note in plan.notes[commit_mark:]:
         print(f"  - {note}")
@@ -2923,6 +3496,11 @@ def main(argv: list[str] | None = None) -> int:
         return run(args)
     except SetupError as exc:
         print(f"\n[set_config] {exc}", file=sys.stderr)
+        return 2
+    except compaction_mode.CompactionModeError as exc:
+        # 壓縮狀態寫不出來(例如 prior 是兩端序列化方式不同的值)。走與
+        # SetupError 同一條乾淨診斷,不要吐 traceback。
+        print(f"\n[set_config] 壓縮模式無法套用:{exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         if _COMMITTED:

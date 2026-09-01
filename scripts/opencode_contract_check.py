@@ -12,6 +12,9 @@ lessons 注入檔,但全域 opencode.json 還停在舊範本,產生三個升級�
      OpenCode 載入,啟動輸出卻顯示「已注入」。
   3. 已明確 opt-in 的 agent.build.prompt 若仍指向 CodeTrail 受管檔，該 artifact
      必須跟 canonical 內容同步；未設定 prompt 時維持 OpenCode 現況。
+  5. 壓縮 plugin(codetrail-compaction)只在 ~/.config/codetrail/compaction.json
+     記錄了 codetrail / manual 模式時才註冊;native 或沒有狀態檔一律不補。
+     受管的 compaction.* 值只警告不修 —— 值被改過代表那不再是 CodeTrail 的。
   4. plugin 陣列缺 codetrail-notify → ingest 完成後「有待覆核」只留在工具結果
      文字裡,TUI 不會跳任何東西;模型說「我來呼叫工具」卻沒真的呼叫時也沒人
      歸因。註冊的是本 repo 的絕對路徑,所以 repo 搬家要換掉舊那一筆。
@@ -44,6 +47,15 @@ if str(REPO_ROOT) not in sys.path:
 
 # 沿用同一套 config 定位(OPENCODE_CONFIG 覆寫)、讀取與備份命名,避免兩個
 # preflight 對「opencode.json 在哪」各說各話。
+import compaction_mode  # noqa: E402
+from scripts.opencode_build_prompt import (  # noqa: E402
+    BUILD_PROMPT_DOC,
+    BuildPromptError,
+    apply_build_prompt_contract,
+    build_prompt_path,
+    build_prompt_reference,
+    extract_build_prompt,
+)
 from scripts.opencode_mcp_timeout_check import (  # noqa: E402
     BACKUP_SUFFIX as BACKUP_SUFFIX,  # re-export:測試與呼叫端取備份路徑用
 )
@@ -53,14 +65,6 @@ from scripts.opencode_mcp_timeout_check import (  # noqa: E402
     _read_config,
     _truthy,
     resolve_config_path,
-)
-from scripts.opencode_build_prompt import (  # noqa: E402
-    BUILD_PROMPT_DOC,
-    BuildPromptError,
-    apply_build_prompt_contract,
-    build_prompt_path,
-    build_prompt_reference,
-    extract_build_prompt,
 )
 
 SKIP_ENV = "AICODE_OPENCODE_CONTRACT_CHECK_SKIP"
@@ -83,6 +87,13 @@ LESSONS_INSTRUCTION = ".codetrail/lessons.md"
 NOTIFY_PLUGIN_NAME = "codetrail-notify.js"
 NOTIFY_PLUGIN_PATH = REPO_ROOT / "opencode_plugins" / NOTIFY_PLUGIN_NAME
 NOTIFY_PLUGIN_SKIP_ENV = "AICODE_NOTIFY_PLUGIN_SKIP"
+
+# 壓縮 plugin 的註冊**不是**無條件的:它只在使用者用 ./set_config.sh 明確選了
+# codetrail / manual 時才該存在(那份選擇記在 ~/.config/codetrail/compaction.json)。
+# 沿用通知 plugin 的「缺就補」會讓切回 native 之後,下一次 aicode 啟動又把它補
+# 回去 —— 使用者以為關掉了,實際上沒有。
+COMPACTION_PLUGIN_NAME = compaction_mode.PLUGIN_FILENAME
+COMPACTION_PLUGIN_PATH = compaction_mode.PLUGIN_PATH
 
 # 全域 AGENTS.md(OpenCode 每段對話自動載入的行為規則)的來源範本。
 # 這裡只放跨工具的不變式；實際工具名稱與參數由 OpenCode 每輪注入的 schema
@@ -492,6 +503,98 @@ def apply_plugin_contract(
     return changes, warnings, errors
 
 
+def _apply_compaction_contract(
+    data: dict[str, Any],
+    path: Path,
+    changes: list[str],
+    warnings: list[str],
+    errors: list[str],
+    env: dict[str, str] | None = None,
+    fix: bool = False,
+    pending: dict[str, Any] | None = None,
+) -> tuple[list[str], list[str], list[str]]:
+    """依 ~/.config/codetrail/compaction.json 記錄的模式處理壓縮 plugin 與受管值。
+
+    三條規則:
+
+      * 沒有狀態檔 / 狀態檔壞掉 → **什麼都不做**。舊安裝 git pull 之後不會突然
+        多一個壓縮 plugin。
+      * 模式是 native → 不註冊;還留著我們寫下去的那一筆就警告(不自動移除:
+        移除 plugin 是行為改變,交給 ./set_config.sh --compaction-mode native)。
+      * 模式是 codetrail / manual → plugin 缺就補(升級修復),但受管的
+        `compaction.*` 值只**警告**不修:值變了代表使用者或專案設定改過它,
+        在每次啟動偷改回來就是跟使用者搶方向盤。
+    """
+    try:
+        state_file = compaction_mode.state_path(os.environ if env is None else env)
+    except compaction_mode.CompactionModeError as exc:
+        warnings.append(f"壓縮模式狀態檔位置無法解析:{exc}")
+        return changes, warnings, errors
+    state, reason = compaction_mode.inspect_state(path=state_file)
+    if reason:
+        warnings.append(f"壓縮模式狀態檔已忽略:{reason}")
+        return changes, warnings, errors
+    if state is None:
+        return changes, warnings, errors
+    if not compaction_mode.state_matches_config(state, path):
+        warnings.append(
+            "壓縮模式狀態檔記錄的是另一份 opencode.json;這份設定的壓縮欄位不動"
+        )
+        return changes, warnings, errors
+
+    mode = state.get("mode")
+    if mode not in compaction_mode.PLUGIN_MODES:
+        drift = compaction_mode.effective_drift(
+            data, state=state, plugin_path=COMPACTION_PLUGIN_PATH
+        )
+        warnings.extend(f"{item}(重跑 ./set_config.sh 可收斂)" for item in drift)
+        return changes, warnings, errors
+
+    if _is_project_scoped_config(path):
+        _print(f"壓縮 plugin 註冊已跳過(專案內設定 {path});只有全域設定會註冊")
+        return changes, warnings, errors
+    if not COMPACTION_PLUGIN_PATH.is_file():
+        _print(f"⚠ WARN: 找不到壓縮 plugin({COMPACTION_PLUGIN_PATH});跳過註冊")
+        return changes, warnings, errors
+
+    plugin_changes, plugin_warnings, plugin_errors, entry = (
+        compaction_mode.apply_plugin_entry(
+            data,
+            plugin_path=COMPACTION_PLUGIN_PATH,
+            prior_state=state,
+            register=True,
+        )
+    )
+    changes.extend(plugin_changes)
+    warnings.extend(plugin_warnings)
+    errors.extend(plugin_errors)
+    if plugin_errors:
+        return changes, warnings, errors
+    # 搬家修復之後,狀態檔記的還是舊路徑。不同步的話下一次搬家時舊路徑不再符合
+    # ownership 雜湊,會被當成別人的 plugin —— 於是留下兩筆或一筆指向不存在的檔。
+    recorded = state.get(compaction_mode.PLUGIN_SECTION)
+    # **只有 --fix 才寫**(check-only 的契約是「不寫任何檔」)。實際寫入由
+    # `main()` 以 state → config 的順序執行,config 失敗時把 state 回滾回
+    # `previous` —— 兩個檔要一起成立,單獨一邊成功都是修不回來的分裂。
+    if fix and pending is not None and isinstance(recorded, dict) and entry.get(
+        "path_hash"
+    ) and recorded.get("path_hash") != entry["path_hash"]:
+        updated = json.loads(json.dumps(state))
+        updated[compaction_mode.PLUGIN_SECTION] = entry
+        updated["digest"] = compaction_mode._state_digest(updated)
+        pending["state"] = updated
+        pending["previous"] = json.loads(json.dumps(state))
+        pending["path"] = state_file
+        changes.append("壓縮狀態檔的 plugin 路徑紀錄待同步(repo 搬家)")
+
+    for item in compaction_mode.effective_drift(data, state=state):
+        warnings.append(
+            f"{item};已尊重目前的值,壓縮 plugin 會偵測到這個不一致並停用自動壓縮。"
+            "要收斂請重跑 ./set_config.sh"
+        )
+    return changes, warnings, errors
+
+
 def apply_contract(data: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
     """把缺少的契約鍵補進 data(in-place),回傳 (變更, 警告, 阻斷錯誤)。
 
@@ -767,6 +870,12 @@ def main(argv: list[str] | None = None) -> int:
         warnings.extend(plugin_warnings)
         errors.extend(plugin_errors)
 
+    pending_compaction_state: dict[str, Any] = {}
+    changes, warnings, errors = _apply_compaction_contract(
+        data, path, changes, warnings, errors, env=env, fix=bool(args.fix),
+        pending=pending_compaction_state,
+    )
+
     agent_value = data.get("agent")
     prompt_contract_relevant = False
     if "agent" in data:
@@ -871,6 +980,27 @@ def main(argv: list[str] | None = None) -> int:
         _print(f"           緊急跳過(不建議): {SKIP_ENV}=1 aicode")
         return 2
 
+    # 狀態檔與 config 必須**一起**成立,所以先寫 state、config 失敗就回滾。
+    # 反過來(config 先成功、state 後失敗)留下的分裂修不回來:config 已經是新
+    # 路徑、ownership 還停在舊路徑的雜湊,重跑 ./set_config.sh 時新路徑雖然是
+    # exact match 卻對不上舊雜湊,`owned_now` 為 false,ownership 會被記成
+    # `path_hash=None` —— 之後切回 native 就沒有證據移除那筆 plugin,native 下
+    # 它照樣被載入並回報 config_drift,而且沒有任何指令能收斂。
+    rollback_state = None
+    if pending_compaction_state.get("state") is not None:
+        try:
+            compaction_mode.save_state(
+                pending_compaction_state["state"],
+                path=pending_compaction_state["path"],
+            )
+        except (compaction_mode.CompactionModeError, OSError) as exc:
+            _print(
+                f"FIX_FAILED: 壓縮狀態檔的 plugin 路徑紀錄同步失敗({exc});"
+                f"設定 {path} 沒有被修改。修好狀態檔目錄的權限或空間後重試。"
+            )
+            return 2
+        rollback_state = pending_compaction_state.get("previous")
+
     try:
         config_outcome, prompt_outcome = _write_contract_updates(
             path,
@@ -882,6 +1012,16 @@ def main(argv: list[str] | None = None) -> int:
         )
     except (OSError, RuntimeError) as exc:
         _print(f"FIX_FAILED: {path}: {type(exc).__name__}: {exc}")
+        if rollback_state is not None:
+            try:
+                compaction_mode.save_state(
+                    rollback_state, path=pending_compaction_state["path"]
+                )
+            except (compaction_mode.CompactionModeError, OSError) as back:
+                _print(
+                    f"⚠ WARN: 壓縮狀態檔回滾失敗({back});ownership 紀錄已指向新"
+                    "路徑而設定還是舊的。請重跑 ./set_config.sh 重新建立。"
+                )
         return 2
     for item in changes:
         _print(f"FIXED: {item}")

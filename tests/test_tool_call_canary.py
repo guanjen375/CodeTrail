@@ -266,6 +266,143 @@ def test_fingerprint_covers_live_protocol_template_build_and_prompt(tmp_path):
     assert fingerprint(cfg=file_config) != file_baseline
 
 
+@pytest.mark.smoke
+def test_fingerprint_covers_the_compaction_contract(tmp_path, monkeypatch):
+    """壓縮模式、規則檔與 compaction agent 都會改變模型下一輪看到的東西。
+
+    不納入 fingerprint 的話,切換模式或換掉同一個路徑下的規則／prompt 內容,
+    canary 會沿用舊的判定 —— 而那份判定是在別一套壓縮語意下量到的。
+    """
+    import compaction_mode
+
+    root = tmp_path / "project"
+    root.mkdir()
+    home = tmp_path / "home"
+    env = {"HOME": str(home)}
+    config = _config(root)
+
+    def fingerprint(cfg=None):
+        return canary.build_fingerprint(
+            root=root,
+            config=cfg or config,
+            selected_model="llamacpp/local-model",
+            props={"model_path": "/models/local.gguf"},
+            opencode_version="1.18.21",
+            env=env,
+        )
+
+    baseline = fingerprint()
+
+    # 1) 模式狀態:沒有 → codetrail
+    state_config: dict = {}
+    _, _, errors, state = compaction_mode.apply_mode(
+        state_config, mode=compaction_mode.MODE_CODETRAIL,
+        derived=compaction_mode.derive_settings(context_limit=131072, output_limit=8192),
+        prior_state=None, config_path=root / "opencode.json",
+    )
+    assert errors == []
+    compaction_mode.save_state(
+        state, path=home / ".config" / "codetrail" / "compaction.json"
+    )
+    with_mode = fingerprint()
+    assert with_mode != baseline
+
+    # 2) compaction agent 的 inline prompt
+    inline = json.loads(json.dumps(config))
+    inline["agent"]["compaction"] = {"prompt": "summary style A", "temperature": 0}
+    inline_baseline = fingerprint(cfg=inline)
+    assert inline_baseline != with_mode
+    changed = json.loads(json.dumps(inline))
+    changed["agent"]["compaction"]["temperature"] = 1
+    assert fingerprint(cfg=changed) != inline_baseline
+
+    # 3) `{file:...}` 形式的 compaction prompt:同一個路徑換內容也必須失效
+    prompt_file = tmp_path / "compaction-prompt.md"
+    prompt_file.write_text("managed compaction prompt A", encoding="utf-8")
+    file_config = json.loads(json.dumps(config))
+    file_config["agent"]["compaction"] = {"prompt": f"{{file:{prompt_file}}}"}
+    file_baseline = fingerprint(cfg=file_config)
+    prompt_file.write_text("managed compaction prompt B", encoding="utf-8")
+    assert fingerprint(cfg=file_config) != file_baseline
+
+    # 4) 模式不變、只有受管值變(例如換了 ctx 重跑 set_config)
+    other: dict = {}
+    _, _, errors, other_state = compaction_mode.apply_mode(
+        other, mode=compaction_mode.MODE_CODETRAIL,
+        derived=compaction_mode.derive_settings(context_limit=65536, output_limit=8192),
+        prior_state=None, config_path=root / "opencode.json",
+    )
+    assert errors == []
+    assert other_state["digest"] != state["digest"]
+    compaction_mode.save_state(
+        other_state, path=home / ".config" / "codetrail" / "compaction.json"
+    )
+    assert fingerprint() != with_mode
+    compaction_mode.save_state(
+        state, path=home / ".config" / "codetrail" / "compaction.json"
+    )
+    assert fingerprint() == with_mode
+
+    # 5) plugin 檔與 canonical 規則檔:同一個路徑換內容必須失效
+    for attr, name in (("PLUGIN_PATH", "plugin.js"), ("RULES_DOC", "rules.md")):
+        stand_in = tmp_path / name
+        stand_in.write_text("A", encoding="utf-8")
+        monkeypatch.setattr(compaction_mode, attr, stand_in)
+        before = fingerprint()
+        stand_in.write_text("B", encoding="utf-8")
+        assert fingerprint() != before, attr
+
+    # 6) OPENCODE_CONFIG 指到內容相同、路徑不同的一份:plugin 會因為身分不符
+    #    停用,所以壓縮語意其實變了 —— 內容雜湊完全看不出來
+    twin = tmp_path / "twin-opencode.json"
+    twin.write_text("{}", encoding="utf-8")
+    bound = canary.build_fingerprint(
+        root=root, config=config, selected_model="llamacpp/local-model",
+        props={"model_path": "/models/local.gguf"}, opencode_version="1.18.21",
+        env={**env, "OPENCODE_CONFIG": str(root / "opencode.json")},
+    )
+    foreign = canary.build_fingerprint(
+        root=root, config=config, selected_model="llamacpp/local-model",
+        props={"model_path": "/models/local.gguf"}, opencode_version="1.18.21",
+        env={**env, "OPENCODE_CONFIG": str(twin)},
+    )
+    assert bound != foreign
+
+
+@pytest.mark.smoke
+def test_native_mode_does_not_invalidate_on_unused_compaction_files(tmp_path, monkeypatch):
+    """native / 沒接管時 plugin 與規則檔不參與 runtime,改它們不該重跑 canary。"""
+    import compaction_mode
+
+    root = tmp_path / "project"
+    root.mkdir()
+    home = tmp_path / "home"
+    env = {"HOME": str(home)}
+    config = _config(root)
+    state = compaction_mode.build_state(
+        mode=compaction_mode.MODE_NATIVE, config_path=root / "opencode.json",
+        managed={}, plugin={"registered": False, "prior_present": False},
+        section_present=False,
+    )
+    compaction_mode.save_state(
+        state, path=home / ".config" / "codetrail" / "compaction.json"
+    )
+
+    def fingerprint():
+        return canary.build_fingerprint(
+            root=root, config=config, selected_model="llamacpp/local-model",
+            props={"model_path": "/models/local.gguf"}, opencode_version="1.18.21",
+            env=env,
+        )
+
+    stand_in = tmp_path / "plugin.js"
+    stand_in.write_text("A", encoding="utf-8")
+    monkeypatch.setattr(compaction_mode, "PLUGIN_PATH", stand_in)
+    before = fingerprint()
+    stand_in.write_text("B", encoding="utf-8")
+    assert fingerprint() == before
+
+
 def test_cache_contains_only_fingerprint_metadata_and_is_private(tmp_path):
     cache_path = tmp_path / "private" / "canary.json"
     fingerprint = "f" * 64

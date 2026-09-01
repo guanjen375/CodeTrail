@@ -236,8 +236,11 @@ def test_aicode_env_and_cli_same_model_passes_through(tmp_path):
 
 def test_direct_contract_gate_precedes_launcher_writers_and_canaries():
     source = (REPO_ROOT / "aicode").read_text(encoding="utf-8")
+    # 這一行同時是「相容性閘」與「把量到的 OpenCode 版本交給壓縮 plugin」的
+    # 唯一入口(--print-version-env)。順序契約不變:任何 writer / canary 之前。
     gate = source.index(
-        'if ! "$PYBIN" "$DIRECT_CONTRACT_CHECK" --root "$ROOT"; then'
+        'if ! DIRECT_CONTRACT_OUT="$("$PYBIN" "$DIRECT_CONTRACT_CHECK" '
+        '--root "$ROOT" --print-version-env)"; then'
     )
     first_wrapper_write = source.index("\nprepare_opencode_mcp_wrapper\n")
     first_config_fix = source.index("opencode_ctx_check.py\" --fix")

@@ -17,7 +17,7 @@ full。靜態 consistency / compile 檢查不會收集 pytest，可在相關檔�
 python3 -m compileall -q .
 python3 scripts/check_eval_consistency.py
 python3 scripts/check_readme_consistency.py
-python3 scripts/opencode_contract_check.py            # 全域 opencode.json / AGENTS.md 漂移
+python3 scripts/opencode_contract_check.py            # 全域 opencode.json / AGENTS.md / 壓縮 plugin 漂移
 python3 scripts/doctor.py --no-network        # 用機器上實際設定的模型；不要塞假 model 名
 python3 deployment_profile.py validate
 
@@ -151,6 +151,15 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
   `docs/mcp-tools.md` 與 `docs/opencode-agents-template.md` fenced block **外**的固定順序
   manifest；可安裝的全域 prompt 只保留 `codetrail_*` schema anchor，禁止把完整清單搬回去。
   使用者還在用舊版固定清單時，`aicode` 會提示 `⚠ STALE`
+- 改壓縮的七條摘要規則或門檻公式 → `docs/compaction-rules.md` 的兩個 ```text 區塊是
+  **唯一來源**，`opencode_plugins/codetrail-compaction.js` 的 `RULES_TEXT` /
+  `RECONCILIATION_HEADER` 逐字沿用它們，`compaction_mode.derive_settings` 與 plugin 的
+  `deriveSettings()` 是同一條公式的兩份實作。三處任一改了另外兩處沒跟上，只會讓門檻與
+  保留額對不上——沒有任何錯誤訊息。`tests/test_opencode_compaction_plugin.py` 逐字比對
+- 新增 incident kind / detail slug → `mcp_lease.py`、`opencode_plugins/codetrail-notify.js`、
+  `opencode_plugins/codetrail-compaction.js` 與 `tests/test_opencode_notify_plugin.py` 的
+  凍結 tuple 必須一起改（跨語言封閉集合；一端沒跟上就把另一端寫的合法值正規化成
+  `unknown`，那些事件在 doctor 的統計裡等於憑空消失）
 
 如果你在 eval 裡放 line number，**只當作 hint，誤差 ±20 行內視為正確**；
 不要把 line number 當成嚴格契約。
@@ -216,6 +225,26 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
   prompt 或 todowrite permission**。每個真模型 arm 必須先由維護者在隔離環境套用 exact
   variant，核對凍結 config/artifact digest 與 matrix 中的 contract digest；不相符就
   fail-loud。
+- `session_eval.py`／`scripts/session_eval.py`：明示 opt-in 的私人 session-model eval。
+  `opencode export` 只負責來源封存；mined draft 排除所有歷史 assistant text，curated suite
+  禁止 `expected_answer`／`gold_answer` 類欄位，只接受外部 verifier、`human_pairwise` 或
+  `unscored`。原始 prompt／candidate answer 只寫 `.codetrail/session_eval` 的 0700/0600
+  私有產物，永不放進 checked-in `eval/`；runner 核對 live GGUF 與 project-state digest，
+  並雙層關閉寫入／執行工具。每題原子 checkpoint；resume 必須重驗 suite／模型／現場，
+  單題 timeout 記為該題失敗而不丟掉先前結果。完整流程見 `docs/session-model-eval.md`。
+  **壓縮語意**：replay config 一律同時拿掉 CodeTrail plugin **與**受管的 `compaction.*`
+  ——只拿掉其中一邊會形成「上游 auto 關閉、idle 觸發那一端又不在」的混合語意，長案例
+  會變成互動端不會發生的 provider 錯誤，而 `compaction_events` 靜靜讀到 0。以壓縮本身
+  為題的 suite 才用 `--keep-compaction`,它會**同時**保留受管設定、把壓縮 plugin 加回
+  replay config、在 0700 暫存目錄寫一份綁定該臨時 config 的拋棄式 ownership state
+  (`AICODE_COMPACTION_STATE`),並量測 OpenCode 版本傳給 plugin 的版本閘。這四樣任一
+  不成立(plugin 檔不在、global 缺受管鍵、受管值不是候選/compaction agent 模型推導的、
+  版本低於 1.18.17)就 `SessionEvalError` —— 少了這些前置檢查,結果會是「完全沒有壓縮」
+  而沒有人知道。`scripts/eval_tool_routing.py`
+  走的是**有效**全域設定（plugin 與 `compaction.*` 都在），所以那條路徑的語意就是
+  使用者目前的模式；不同模式的結果不可比，`effective_config_digest` 已經涵蓋這一點。
+  摘要**品質**（七條規則、五輪權重、舊結論淘汰）只走這條私人 eval，不進 smoke / full——
+  用 mock 驗模型輸出品質等於沒驗。
 - `scripts/mcp_catalog.py`／`scripts/eval_tool_routing.py`：runtime catalog 預設從 effective
   stdio MCP 實跑 `initialize/tools/list`；current arm 精確對照
   `mcp_contract.PUBLIC_TOOL_ORDER`，任何名稱或順序 drift 都 fail-loud；完整 schema 只留

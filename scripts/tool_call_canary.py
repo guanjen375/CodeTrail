@@ -30,21 +30,24 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from model_resolution import parse_cli_model_arg_detail  # noqa: E402
+import compaction_mode  # noqa: E402
 from mcp_contract import PUBLIC_TOOL_NAMES, PUBLIC_TOOL_ORDER  # noqa: E402
+from model_resolution import parse_cli_model_arg_detail  # noqa: E402
 from scripts.opencode_direct_contract import (  # noqa: E402
     DirectToolContractError,
     require_direct_tool_contract,
 )
+from scripts.opencode_mcp_timeout_check import resolve_config_path  # noqa: E402
 
 CANARY_VERSION = 2
 CACHE_SCHEMA = 2
@@ -506,16 +509,16 @@ def _model_file_signature(props: Mapping[str, Any]) -> dict[str, Any]:
 _FILE_PROMPT_REFERENCE_RE = re.compile(r"^\{file:(.+)\}$", re.DOTALL)
 
 
-def _effective_build_prompt_digest(config: Mapping[str, Any]) -> str:
-    """Hash the prompt text OpenCode's build agent will actually load.
+def _effective_agent_prompt_digest(config: Mapping[str, Any], agent_name: str) -> str:
+    """Hash the prompt text one OpenCode agent will actually load.
 
     Managed prompts are file references.  Hashing only the reference would
     leave a stale canary cache when the file changes in place, while storing
     its content would violate the cache privacy contract.
     """
     agent = config.get("agent")
-    build = agent.get("build") if isinstance(agent, Mapping) else None
-    prompt = build.get("prompt") if isinstance(build, Mapping) else None
+    entry = agent.get(agent_name) if isinstance(agent, Mapping) else None
+    prompt = entry.get("prompt") if isinstance(entry, Mapping) else None
     if not isinstance(prompt, str):
         return _json_digest({"state": "missing-or-non-string"})
     match = _FILE_PROMPT_REFERENCE_RE.fullmatch(prompt.strip())
@@ -531,6 +534,108 @@ def _effective_build_prompt_digest(config: Mapping[str, Any]) -> str:
             "content_digest": _file_digest(path),
         }
     )
+
+
+def _effective_build_prompt_digest(config: Mapping[str, Any]) -> str:
+    return _effective_agent_prompt_digest(config, "build")
+
+
+def _compaction_agent_digest(config: Mapping[str, Any]) -> str:
+    """Hash everything that decides how a compaction request is built.
+
+    ``agent.compaction`` can override the compaction agent's model,
+    temperature, options and system prompt (agent.ts).  A different summary
+    engine produces a different conversation the model then reasons over, so
+    a canary verdict recorded under one compaction agent must not be reused
+    under another.  ``prompt`` is resolved through the same ``{file:...}``
+    path as the build prompt: swapping the file's contents in place has to
+    invalidate the cache.
+    """
+    agent = config.get("agent")
+    entry = agent.get("compaction") if isinstance(agent, Mapping) else None
+    if not isinstance(entry, Mapping):
+        return _json_digest({"state": "absent"})
+    return _json_digest(
+        {
+            "prompt": _effective_agent_prompt_digest(config, "compaction"),
+            "model": entry.get("model"),
+            "temperature": entry.get("temperature"),
+            "options": entry.get("options"),
+        }
+    )
+
+
+def _compaction_mode_digest(env: Mapping[str, str]) -> str:
+    """Hash the compaction mode contract this run is operating under.
+
+    Mode decides whether the compaction plugin is loaded, whether upstream
+    auto-compaction is on, and what the retained tail looks like — all of
+    which change what the model sees on the next turn.
+
+    ``bound`` is not redundant with ``effective_config_hash``: the plugin
+    refuses any ownership state that is not bound to the config actually in
+    effect, so pointing ``OPENCODE_CONFIG`` at a byte-identical copy under a
+    different path silently turns compaction off while every content hash
+    stays the same.
+
+    The plugin file and the canonical rule text are only hashed when a mode
+    that loads them is active — editing them under ``native`` changes nothing
+    about the run and must not cost a live canary.
+    """
+    # override 存在時,runtime plugin 讀的就是**那一份**:mode、bound 與要不要
+    # 雜湊 plugin/rules 都要跟著它,否則 default state 是 native 而 override 是
+    # codetrail 時,規則檔換內容仍會沿用舊 verdict。
+    override = (env.get("AICODE_COMPACTION_STATE") or "").strip()
+    if override:
+        state_path = Path(override).expanduser()
+    else:
+        try:
+            state_path = compaction_mode.state_path(env)
+        except compaction_mode.CompactionModeError:
+            state_path = None
+    state = compaction_mode.load_state(path=state_path) if state_path else None
+    mode = state.get("mode") if state else None
+    payload: dict[str, Any] = {
+        "mode": mode,
+        "state_digest": state.get("digest") if state else None,
+        "bound": _compaction_state_binding(state, env),
+        # The private compaction eval points the runtime plugin at a different
+        # ownership state.  A verdict recorded under that override describes a
+        # different compaction contract than a normal run and must not be reused
+        # — and two different overrides are two different contracts, so hash the
+        # state they actually select rather than just "an override is set".
+        "state_override": _compaction_override_digest(env),
+    }
+    if mode in compaction_mode.PLUGIN_MODES:
+        payload["plugin"] = _file_digest(compaction_mode.PLUGIN_PATH)
+        payload["rules"] = _file_digest(compaction_mode.RULES_DOC)
+    return _json_digest(payload)
+
+
+def _compaction_override_digest(env: Mapping[str, str]) -> str | None:
+    """Identify the ownership state an ``AICODE_COMPACTION_STATE`` override selects."""
+    raw = (env.get("AICODE_COMPACTION_STATE") or "").strip()
+    if not raw:
+        return None
+    state = compaction_mode.load_state(path=Path(raw).expanduser())
+    if state is None:
+        return _json_digest({"path": _file_digest(Path(raw).expanduser()), "state": "rejected"})
+    return _json_digest({"mode": state.get("mode"), "digest": state.get("digest")})
+
+
+def _compaction_state_binding(
+    state: Mapping[str, Any] | None, env: Mapping[str, str]
+) -> str:
+    """Does the recorded ownership state describe the config in effect here?"""
+    if not state:
+        return "no-state"
+    try:
+        config_path = resolve_config_path(dict(env))
+    except Exception:  # noqa: BLE001 — 診斷用,不得讓 fingerprint 掛掉
+        return "unresolved"
+    if config_path is None:
+        return "unresolved"
+    return "bound" if compaction_mode.state_matches_config(state, config_path) else "foreign"
 
 
 def build_fingerprint(
@@ -597,6 +702,8 @@ def build_fingerprint(
         # effective provider/MCP/agent settings without persisting credentials.
         "effective_config_hash": _json_digest(config),
         "effective_build_prompt_digest": _effective_build_prompt_digest(config),
+        "compaction_agent_digest": _compaction_agent_digest(config),
+        "compaction_mode_digest": _compaction_mode_digest(env),
         "live_tools_digest": protocol.tools_digest,
         "mcp_instructions_digest": protocol.instructions_digest,
         "props": props_subset,

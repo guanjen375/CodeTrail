@@ -35,7 +35,8 @@ llama-server HTTP endpoint。
 
 第一次部署照下方 Quick Start；完成後的日常操作看
 [基本操作](docs/basic-usage.md)。遇到錯誤直接查
-[常見問題](docs/troubleshooting.md)。
+[常見問題](docs/troubleshooting.md)。要用真實 OpenCode session 比較新舊主模型時，使用
+[session model eval](docs/session-model-eval.md)；歷史模型回答不會被當成標準答案。
 
 ## 🚀 Quick Start(7 步設定完成)
 
@@ -378,15 +379,19 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 
    | 組 | 題目 |
    |---|---|
-   | `[1/4]` 主聊天模型 | 模型 → GPU → `ctx` → **CPU-MoE 層數** |
-   | `[2/4]` embedding | 模型 → GPU |
-   | `[3/4]` reranker | 模型 → GPU → **internal buffer(`-c/-b/-ub`)** |
-   | `[4/4]` VL | 模型 → GPU → mmproj → **CPU-MoE 層數** |
+   | `[1/5]` 主聊天模型 | 模型 → GPU → `ctx` → **CPU-MoE 層數** |
+   | `[2/5]` embedding | 模型 → GPU |
+   | `[3/5]` reranker | 模型 → GPU → **internal buffer(`-c/-b/-ub`)** |
+   | `[4/5]` VL | 模型 → GPU → mmproj → **CPU-MoE 層數** |
+   | `[5/5]` 壓縮模式 | `codetrail` / `native` / `manual`(見 [docs/compaction-rules.md](docs/compaction-rules.md)) |
+
+   **`[5/5]` 壓縮模式**決定 OpenCode 什麼時候把長對話換成摘要。原生行為是「下一個 prompt 進來才檢查」,所以你送出新問題時會先看到一段摘要;`codetrail` 把觸發點移到「助理答完、session 進 idle」之後,並用固定欄位的摘要規則。代價是 `compaction.auto=false` 會**一併關掉同一輪工具迴圈中的壓縮與 provider overflow 自動回復**——單一超長工具輪會變成可見的 context error。`native` 完全交回 OpenCode(並精確還原接管前的值),`manual` 用同一套規則但只在你按 `/compact` 時執行。這一題也沒有預設值。**非互動**用 `--compaction-mode {codetrail,native,manual}`;`--yes` 沒給這個旗標時沿用 `~/.config/codetrail/compaction.json` 記錄的選擇,**還沒選過就完全不碰壓縮設定**(舊安裝重跑不會突然多一個 plugin)。
 
    **CPU-MoE 沒有 y/n 分流**:直接問「幾層 experts 留 RAM」,**`0` = 不 offload(experts 全留 GPU)**、`N` = 前 N 層留 RAM(`--n-cpu-moe N`)、輸入 **≥ 層數上限 = 全部留 RAM**(等同 `--cpu-moe`)。提示只有兩行:**數值越大 GPU 負載越低**,以及一個**推薦區間**——下界是權重剛好放得進這顆 GPU 目前 free VRAM 的層數、上界是全部移到 RAM(例如 `推薦數值:38-43`)。這個估算只算 GGUF 權重,沒有 KV cache / compute buffer / 共卡的附屬服務,所以是起點而不是保證。工具讀 GGUF tensor table 判斷:**不是 MoE(沒有 expert tensors)就不問**,並印出原因(dense 模型 offload 幾層都沒有意義)。main 與 VL 各問一次;embedding / reranker 永遠不套用。**VL 一旦套用 CPU-MoE,llama.cpp 的 `--fit` 就會失效**(它見到 tensor override 已被設定就直接放棄),所以工具會改寫 `-ngl 99 --fit off` 而不是假裝有 `--fit-target` 保護——這種情況沒有自動退讓的安全網,層數填太低會 OOM。
 
    `threads` **從頭到尾不問**——大部分人也不知道該填多少,所以預設就是 auto:不寫 `-t`,由 llama.cpp 自己偵測(hybrid CPU 只算 P-core,否則用實體核心數、排除 HT siblings),比工具自己數邏輯 CPU 準。真的要釘死才用進階旗標 `--threads N`。工具只驗證輸入範圍(上下限顯示成 `1024-1048576` 這種形式),**推薦值不會擋你**;三個附屬服務固定單 slot,最後啟動的 VL 用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用自動配置。答完顯示**設定摘要一頁**:按 **Enter 寫入**;**q** 離開不寫檔。OpenCode context、MCP timeout/Python 路徑一併對齊。
-4. **預設產生四個 runtime 檔案與一個還原 manifest**（runtime 檔採 transaction 寫入：要嘛
+4. **產生四個 runtime 檔案與一個還原 manifest**（選了壓縮模式時再多一份 owner-only 的
+   壓縮狀態檔；runtime 檔採 transaction 寫入：要嘛
    全套完成、要嘛完全不動；既有檔自動備份 `*.bak-setconfig-<時間戳>`，
    `--restore-last-backup` 可整批還原）：
 
@@ -397,12 +402,14 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 | `~/.config/codetrail/opencode-build-prompt.md` | **只在** `--enable-experimental-build-prompt` 時產生的受管 prompt（mode `0644`）；唯一來源是 [docs/opencode-build-prompt.md](docs/opencode-build-prompt.md) 的 fenced block |
 | `~/.config/opencode/opencode.json` | **合併**而非重建（mode `0600`）：只更新 CodeTrail 管的欄位(model / provider.llamacpp / mcp.codetrail / 缺少的 permission 鍵)；實驗性旗標才補 `agent.build.prompt`，使用者自訂 prompt、provider、主題與其他 MCP server 都保留；與安全範本衝突的 permission 會尊重你的值但明確警告 |
 | `~/start.sh` | 啟動腳本:寫死你的 GPU 配置、主模型與驗證過的 `LLAMA_BIN`,呼叫 `scripts/launch_servers.py`;支援 `status` / `stop` / `logs` / `help` 子命令,打錯子命令會提示而不是誤啟動 |
+| `~/.config/codetrail/compaction.json` | **只在 `[5/5]` 有明確答案時產生**(mode `0600`):壓縮模式、目標 config 的身分雜湊、以及接管前每個 `compaction.*` 受管鍵的「原值／原本不存在」。切回 `native` 時只還原**現在的值仍等於 CodeTrail 寫下去那個**的鍵;你事後手改過的一律原封不動。沒有這個檔就等於沒有接管 |
 | `~/.config/codetrail/setconfig-last-transaction.json` | 只記最近一次 transaction 實際包含的 runtime 檔案，供 `--restore-last-backup` 整批還原；不是另一份設定來源 |
 
 結尾會自動印出**啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準;`~/start.sh` 啟動完成的最後一行也會提醒你用 `nvidia-smi` 稍微監控 GPU/VRAM(例如 `watch -n 1 nvidia-smi`),因為 set_config 不做整體 VRAM 可行性判定,也不會拿容量估算保證一定能啟動。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
 
 非互動用法(自動化 / 重跑)是 `./set_config.sh --yes`。它會跳過提問與確認頁，
-但**所有使用者選擇題的值必須由旗標提供，缺哪個就報錯**：
+但**所有使用者選擇題的值必須由旗標提供，缺哪個就報錯**（`--compaction-mode`
+是唯一的例外，見下方最後一項）：
 
 - 模型 / GPU：`--main-model` / `--main-gpu`、`--embed-model` / `--embed-gpu`、
   `--rerank-model` / `--rerank-gpu`、`--vl-model` / `--vl-gpu`。VL 配對不唯一時
@@ -412,10 +419,14 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 - MoE：main 使用 `--cpu-moe` / `--no-cpu-moe` / `--n-cpu-moe N`；VL 使用
   `--vl-cpu-moe` / `--no-vl-cpu-moe` / `--vl-n-cpu-moe N`。`N=0` 等同不 offload。
 - 網路：`--allow-remote` 才會開放區網連線；未指定只綁 `127.0.0.1`。
+- 壓縮模式：`--compaction-mode {codetrail,native,manual}`。**這一項不給不會報錯**——
+  沒給時沿用 `~/.config/codetrail/compaction.json` 記錄的既有選擇，這台機器還沒選過
+  就完全不碰壓縮設定。理由是「沒有那個狀態檔＝沒有接管」是安全預設：舊的 `--yes`
+  自動化腳本重跑一次，不該因此突然多一個 plugin 與 `compaction.auto=false`。
 
-重跑**不沿用舊選擇**；每次設定來自本次作答 / 旗標。只有你手動加進
-`deployment.json` 的取樣參數與 port / base_url 會保留。完整旗標見
-`./set_config.sh --help`。
+重跑**不沿用舊選擇**（唯一例外是上面那條 `--compaction-mode`，它沿用狀態檔記錄的
+模式）；其餘每次設定都來自本次作答 / 旗標。只有你手動加進 `deployment.json` 的取樣
+參數與 port / base_url 會保留。完整旗標見 `./set_config.sh --help`。
 
 既有安裝在 `git pull` 後不會直接覆寫 home dotfiles。要確認舊 local state 仍與新版 repo
 相容，先在 `<CODETRAIL_REPO>` 跑以下唯讀檢查：

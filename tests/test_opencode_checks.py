@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from scripts import opencode_contract_check as check
 from scripts import opencode_build_prompt as build_prompt
+from scripts import opencode_contract_check as check
 from scripts import opencode_ctx_check as occ
 from scripts import opencode_mcp_timeout_check as timeout_check
 from scripts import set_config as sc
@@ -49,6 +49,11 @@ def _write(path, config) -> None:
 
 def _setup(monkeypatch, path) -> None:
     monkeypatch.setenv("OPENCODE_CONFIG", str(path))
+    # HOME 決定 managed prompt artifact 與壓縮模式狀態檔的位置。不釘住的話,
+    # 這批案例會去讀開發者本機真正的 ~/.config/codetrail/compaction.json ——
+    # 綠燈與否取決於跑測試的人設過什麼模式。
+    monkeypatch.setenv("HOME", str(path.parent))
+    monkeypatch.setenv("USERPROFILE", str(path.parent))
     monkeypatch.delenv(check.SKIP_ENV, raising=False)
     # 這一段的測試對象是 opencode.json 的契約遷移;全域 AGENTS.md 的檢查是同一支
     # 腳本的另一件事(tmp_path 一律沒有那份檔,會判 missing 並在 --fix 時安裝)。
@@ -1075,3 +1080,291 @@ def test_mcp_timeout_check_explicit_skip(monkeypatch, capsys):
 
     assert timeout_check.main() == 0
     assert "skipped" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# 壓縮模式:plugin 的註冊不是無條件的
+# ---------------------------------------------------------------------------
+def _install_compaction_state(monkeypatch, tmp_path, mode, config_path):
+    """在測試用 HOME 裡放一份合法的模式狀態檔,回傳套用後的 config。"""
+    import compaction_mode
+
+    config: dict = {}
+    derived = (
+        compaction_mode.derive_settings(context_limit=131072, output_limit=8192)
+        if mode in compaction_mode.PLUGIN_MODES
+        else None
+    )
+    _, _, errors, state = compaction_mode.apply_mode(
+        config, mode=mode, derived=derived, prior_state=None,
+        config_path=config_path, plugin_path=compaction_mode.PLUGIN_PATH,
+    )
+    assert errors == []
+    compaction_mode.save_state(
+        state, path=tmp_path / ".config" / "codetrail" / "compaction.json"
+    )
+    return config
+
+
+@pytest.mark.smoke
+def test_compaction_plugin_is_never_registered_without_a_mode_state(monkeypatch, tmp_path):
+    """沒有狀態檔 = 沒有接管。舊安裝 git pull 之後不得突然多一個壓縮 plugin。"""
+    import compaction_mode
+
+    config_path = tmp_path / "opencode.json"
+    _write(config_path, _legacy_config())
+    _setup(monkeypatch, config_path)
+    assert check.main(["--fix"]) == 0
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    entries = data.get("plugin", [])
+    assert all(
+        compaction_mode.plugin_local_path(str(item)) != str(compaction_mode.PLUGIN_PATH)
+        for item in entries
+    )
+
+
+@pytest.mark.smoke
+def test_compaction_plugin_is_not_re_added_after_switching_to_native(monkeypatch, tmp_path):
+    """切回 native 之後,下一次 aicode 啟動不得把 plugin 補回去。"""
+    import compaction_mode
+
+    config_path = tmp_path / "opencode.json"
+    _install_compaction_state(monkeypatch, tmp_path, compaction_mode.MODE_NATIVE, config_path)
+    _write(config_path, _legacy_config())
+    _setup(monkeypatch, config_path)
+    assert check.main(["--fix"]) == 0
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "plugin" not in data or str(compaction_mode.PLUGIN_PATH) not in data["plugin"]
+
+
+def test_compaction_plugin_is_restored_in_codetrail_mode(monkeypatch, tmp_path, capsys):
+    """升級修復:模式是 codetrail 而 plugin 掉了 → 補回來。"""
+    import compaction_mode
+
+    config_path = tmp_path / "opencode.json"
+    managed = _install_compaction_state(
+        monkeypatch, tmp_path, compaction_mode.MODE_CODETRAIL, config_path
+    )
+    config = _legacy_config()
+    config["compaction"] = managed["compaction"]      # 受管值仍在,但 plugin 沒註冊
+    _write(config_path, config)
+    _setup(monkeypatch, config_path)
+    assert check.main(["--fix"]) == 0
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert str(compaction_mode.PLUGIN_PATH) in data["plugin"]
+    assert "壓縮" in capsys.readouterr().out
+
+
+@pytest.mark.smoke
+def test_drifted_compaction_values_are_warned_not_silently_rewritten(
+    monkeypatch, tmp_path, capsys
+):
+    """受管值被專案設定或手改翻掉時只警告 —— 每次啟動偷改回來是跟使用者搶方向盤。"""
+    import compaction_mode
+
+    config_path = tmp_path / "opencode.json"
+    managed = _install_compaction_state(
+        monkeypatch, tmp_path, compaction_mode.MODE_CODETRAIL, config_path
+    )
+    config = _legacy_config()
+    config["compaction"] = dict(managed["compaction"])
+    config["compaction"]["auto"] = True               # 使用者翻回來了
+    config["plugin"] = [str(compaction_mode.PLUGIN_PATH)]
+    _write(config_path, config)
+    _setup(monkeypatch, config_path)
+    assert check.main(["--fix"]) == 0
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data["compaction"]["auto"] is True         # 沒有被偷改回去
+    out = capsys.readouterr().out
+    assert "compaction.auto" in out
+
+
+@pytest.mark.smoke
+def test_a_moved_repo_syncs_the_recorded_plugin_path(monkeypatch, tmp_path, capsys):
+    """搬家修復之後狀態檔還記著舊路徑的話,第二次搬家會留下兩筆或一筆失效路徑。"""
+    import compaction_mode
+
+    config_path = tmp_path / "opencode.json"
+    old_path = str(tmp_path / "old" / "opencode_plugins" / compaction_mode.PLUGIN_FILENAME)
+    state = compaction_mode.build_state(
+        mode=compaction_mode.MODE_CODETRAIL, config_path=config_path,
+        managed={
+            key: {"prior": {"present": False}, "value": value}
+            for key, value in compaction_mode.derive_settings(
+                context_limit=131072, output_limit=8192
+            ).config_values.items()
+        },
+        plugin={
+            "registered": True, "prior_present": False, "entry": "string",
+            "path_hash": compaction_mode.plugin_path_hash(old_path),
+        },
+        section_present=False,
+    )
+    compaction_mode.save_state(
+        state, path=tmp_path / ".config" / "codetrail" / "compaction.json"
+    )
+    config = _legacy_config()
+    config["compaction"] = compaction_mode.derive_settings(
+        context_limit=131072, output_limit=8192
+    ).config_values
+    config["plugin"] = [old_path]
+    _write(config_path, config)
+    _setup(monkeypatch, config_path)
+
+    assert check.main(["--fix"]) == 0
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data["plugin"] == [str(compaction_mode.PLUGIN_PATH)]
+    updated = compaction_mode.load_state(
+        path=tmp_path / ".config" / "codetrail" / "compaction.json"
+    )
+    assert updated["plugin"]["path_hash"] == compaction_mode.plugin_path_hash(
+        str(compaction_mode.PLUGIN_PATH)
+    )
+
+
+def test_a_state_file_for_another_config_touches_nothing(monkeypatch, tmp_path, capsys):
+    import compaction_mode
+
+    config_path = tmp_path / "opencode.json"
+    _install_compaction_state(
+        monkeypatch, tmp_path, compaction_mode.MODE_CODETRAIL,
+        Path("/elsewhere/opencode.json"),
+    )
+    _write(config_path, _legacy_config())
+    _setup(monkeypatch, config_path)
+    assert check.main(["--fix"]) == 0
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "compaction" not in data
+    assert str(compaction_mode.PLUGIN_PATH) not in data.get("plugin", [])
+    assert "另一份 opencode.json" in capsys.readouterr().out
+
+
+@pytest.mark.smoke
+def test_check_only_never_writes_the_compaction_state(monkeypatch, tmp_path):
+    """沒有 --fix 就不寫任何檔。先改了 state 再 exit 2 的話,config 停在舊路徑
+    而 ownership 已指向新路徑,下一次修復會把舊那筆當成別人的並留下兩筆。
+    """
+    import compaction_mode
+
+    config_path = tmp_path / "opencode.json"
+    old_path = str(tmp_path / "old" / "opencode_plugins" / compaction_mode.PLUGIN_FILENAME)
+    state = compaction_mode.build_state(
+        mode=compaction_mode.MODE_CODETRAIL, config_path=config_path,
+        managed={
+            key: {"prior": {"present": False}, "value": value}
+            for key, value in compaction_mode.derive_settings(
+                context_limit=131072, output_limit=8192
+            ).config_values.items()
+        },
+        plugin={
+            "registered": True, "prior_present": False, "entry": "string",
+            "path_hash": compaction_mode.plugin_path_hash(old_path),
+        },
+        section_present=False,
+    )
+    state_file = tmp_path / ".config" / "codetrail" / "compaction.json"
+    compaction_mode.save_state(state, path=state_file)
+    before = state_file.read_bytes()
+
+    config = _legacy_config()
+    config["compaction"] = compaction_mode.derive_settings(
+        context_limit=131072, output_limit=8192
+    ).config_values
+    config["plugin"] = [old_path]
+    _write(config_path, config)
+    _setup(monkeypatch, config_path)
+
+    check.main([])                                        # check-only
+    assert state_file.read_bytes() == before
+
+
+@pytest.mark.smoke
+def test_a_failed_config_write_leaves_the_compaction_state_untouched(monkeypatch, tmp_path):
+    """state 先改、config 後失敗的話,ownership 指向新路徑而 config 停在舊的。
+
+    下一次修復會把舊那筆當成別人的,另加一筆新路徑 → 兩筆同名 plugin。
+    """
+    import compaction_mode
+
+    config_path = tmp_path / "opencode.json"
+    old_path = str(tmp_path / "old" / "opencode_plugins" / compaction_mode.PLUGIN_FILENAME)
+    state = compaction_mode.build_state(
+        mode=compaction_mode.MODE_CODETRAIL, config_path=config_path,
+        managed={
+            key: {"prior": {"present": False}, "value": value}
+            for key, value in compaction_mode.derive_settings(
+                context_limit=131072, output_limit=8192
+            ).config_values.items()
+        },
+        plugin={
+            "registered": True, "prior_present": False, "entry": "string",
+            "path_hash": compaction_mode.plugin_path_hash(old_path),
+        },
+        section_present=False,
+    )
+    state_file = tmp_path / ".config" / "codetrail" / "compaction.json"
+    compaction_mode.save_state(state, path=state_file)
+    before = state_file.read_bytes()
+
+    config = _legacy_config()
+    config["compaction"] = compaction_mode.derive_settings(
+        context_limit=131072, output_limit=8192
+    ).config_values
+    config["plugin"] = [old_path]
+    _write(config_path, config)
+    _setup(monkeypatch, config_path)
+
+    def _boom(*args, **kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(check, "_write_contract_updates", _boom)
+    assert check.main(["--fix"]) == 2
+    assert state_file.read_bytes() == before
+
+
+@pytest.mark.smoke
+def test_a_failed_state_write_leaves_the_config_untouched(monkeypatch, tmp_path):
+    """state 寫不進去時 config 也不得被改,而且不得回報成功。
+
+    反過來(config 已是新路徑、state 還停在舊 hash)的分裂**修不回來**:重跑
+    ./set_config.sh 時新路徑雖然是 exact match 卻對不上舊 hash,ownership 會被
+    記成 path_hash=None,之後切回 native 就沒有證據移除那筆 plugin。
+    """
+    import compaction_mode
+
+    config_path = tmp_path / "opencode.json"
+    old_path = str(tmp_path / "old" / "opencode_plugins" / compaction_mode.PLUGIN_FILENAME)
+    state = compaction_mode.build_state(
+        mode=compaction_mode.MODE_CODETRAIL, config_path=config_path,
+        managed={
+            key: {"prior": {"present": False}, "value": value}
+            for key, value in compaction_mode.derive_settings(
+                context_limit=131072, output_limit=8192
+            ).config_values.items()
+        },
+        plugin={
+            "registered": True, "prior_present": False, "entry": "string",
+            "path_hash": compaction_mode.plugin_path_hash(old_path),
+        },
+        section_present=False,
+    )
+    state_file = tmp_path / ".config" / "codetrail" / "compaction.json"
+    compaction_mode.save_state(state, path=state_file)
+    before_state = state_file.read_bytes()
+
+    config = _legacy_config()
+    config["compaction"] = compaction_mode.derive_settings(
+        context_limit=131072, output_limit=8192
+    ).config_values
+    config["plugin"] = [old_path]
+    _write(config_path, config)
+    before_config = config_path.read_bytes()
+    _setup(monkeypatch, config_path)
+
+    def _boom(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(compaction_mode, "save_state", _boom)
+    assert check.main(["--fix"]) == 2
+    assert config_path.read_bytes() == before_config
+    assert state_file.read_bytes() == before_state

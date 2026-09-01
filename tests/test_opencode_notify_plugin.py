@@ -42,6 +42,7 @@ FROZEN_INCIDENT_KINDS = (
     "promise_without_call",
     "client_mcp_failed",
     "structured_call_failed",
+    "compaction_stopped",
 )
 FROZEN_INCIDENT_FIELDS = ("schema", "ts", "kind", "session", "detail", "source")
 # SEAMS 附錄 A.1 的封閉集合。順序也釘住:兩端逐字比對才擋得住「靜默改名」。
@@ -56,6 +57,14 @@ FROZEN_DETAIL_SLUGS = (
     "lease_unknown",
     "no_tool_part",
     "tool_error",
+    "summary_empty",
+    "summary_reasoning_only",
+    "summary_error",
+    "race_unanswered_user",
+    "race_parent_mismatch",
+    "config_drift",
+    "version_unsupported",
+    "trigger_failed",
     "unknown",
 )
 

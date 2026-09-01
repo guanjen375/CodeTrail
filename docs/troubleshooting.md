@@ -21,6 +21,7 @@ patch / command」排列。內容很長時可先用頁面搜尋找下列關鍵�
 | context 啟動閘擋下 | `ctx-safety`、`ctx-align` |
 | server / RAG 異常 | `llama-server 不可連`、`embedding`、`查 spec 沒結果` |
 | 修改工具被拒 | `apply_patch`、`run_command` |
+| 送出新問題卻先跑出一段摘要 / 壓縮停住要你重送 | `壓縮` |
 
 ### Build llama.cpp 時 `nvcc fatal : Unsupported gpu architecture 'compute_120a'`
 
@@ -269,8 +270,37 @@ routing，避免再把它們混為一談。
   `[CODETRAIL_ACTION_REQUIRED]` 文字本身;web 介面尚未實測,不保證。
 - 不要這個 plugin:設 `AICODE_NOTIFY_PLUGIN_SKIP=1`(不註冊也不警告)。已經註冊過的話,
   自己把 `opencode.json` 的 `plugin` 陣列裡那一筆刪掉。
+- 壓縮 plugin(`codetrail-compaction.js`)是**另一個** plugin,註冊條件也不同:只有在
+  `~/.config/codetrail/compaction.json` 記錄了 `codetrail` / `manual` 模式時才會補;
+  沒有那個檔(或記錄的是 `native`)就完全不註冊。要拿掉它請重跑
+  `./set_config.sh --compaction-mode native`,不要手動刪 —— 那樣接管前的原值就沒人還原了。
 - plugin 檔不存在時 preflight 只印 WARN、不寫設定 —— 指向不存在的檔會讓整個 OpenCode
   instance 起不來,寧可沒有通知。
+
+### 送出新問題卻先跑出一段摘要,或壓縮停住要你重送
+
+先確認你選了哪個壓縮模式:`python3 scripts/doctor.py` 的 `-- 壓縮模式 --` 一段會印出
+目前記錄的模式,以及有效設定跟它一不一致。三種模式的完整說明、門檻公式與取捨在
+[compaction-rules.md](compaction-rules.md)。
+
+| 畫面 | 意思 | 怎麼辦 |
+|---|---|---|
+| 送出新問題,畫面先跑一段摘要才回答 | OpenCode 原生行為(`native`,或這台機器還沒選過模式):它在**下一個 prompt 進來之後**才檢查上一輪的 token 數 | 重跑 `./set_config.sh` 選 `codetrail`,再**完全退出 OpenCode 重開** |
+| toast 說「空摘要」/「壓縮請求失敗」 | 壓縮已經發生,但摘要是空的或掛了 error。OpenCode 仍把它當成一次成功的切點,前面的對話已離開模型視野 | 停掉這個 session、開新的,把畫面上還看得到的問題與必要狀態重送。**不會自動 revert** |
+| toast 說「你在壓縮進行中送出的問題沒有人會回答」 | 你的訊息和壓縮訊息交錯了(上游 `session.summarize` 沒有 busy 檢查) | 跟上面同一條:停掉這個 session、開新的、重送。plugin 已經對這個 session 停用,而且那一輪的壓縮切點已經不可信 —— 在原 session 重送不會回到乾淨狀態 |
+| toast 說「CodeTrail 壓縮已停用:有效設定與記錄的模式不一致」 | 專案層 `opencode.json` 或手改覆蓋了 `compaction.*` | `python3 scripts/doctor.py` 看是哪一個鍵;把覆蓋拿掉或重跑 `./set_config.sh` |
+| `aicode` 啟動印 `[direct-contract] ⚠ WARN — 壓縮模式 ... 需要 OpenCode >= 1.18.17` | 壓縮語意在那之前不同 | 升級 OpenCode,或 `./set_config.sh --compaction-mode native`。這道閘只在 `aicode` preflight,直接跑 `opencode` 不會檢查(plugin 讀不到目前執行中的版本) |
+| 一輪工具很多,結果整輪報 context error | `codetrail` / `manual` 模式關掉 `compaction.auto`,同時也關掉**同一輪內**的壓縮與 provider overflow 自動回復 | 這是本模式明確接受的取捨。把那個問題拆小,或改用 `native` |
+
+`opencode run`(headless)沒有 TUI,上面的 toast 不會出現。同一件事會留兩份紀錄:
+
+- 一筆 `compaction_stopped` 的零內容 incident(與 MCP incident 同一個檔)——
+  `python3 scripts/doctor.py` 會統計並印出最近幾筆的 `kind/detail`。
+- 一筆 service 為 `codetrail-compaction` 的 **OpenCode** application log。那是 OpenCode
+  自己的 log,doctor 不讀它;要看的話用 OpenCode 的 log(例如 `opencode --print-logs`
+  或它的 log 目錄)。
+
+**壓縮設定改了要重開 OpenCode 才生效**:OpenCode 只在啟動時讀設定。
 
 ### MCP lease 與 incident:session 中途「模型說沒工具」到底是哪一層掉的
 

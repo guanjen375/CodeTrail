@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import argparse
 import importlib
-from importlib import metadata as importlib_metadata
-from datetime import datetime
 import json
 import os
 import re
@@ -27,6 +25,8 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
@@ -1204,6 +1204,28 @@ def check_mcp_lease(r: Result) -> None:
         )
 
 
+def _recent_incident_count(lease_mod, kind: str, window: int = 7 * 24 * 3600) -> int:
+    """指定 kind 在時間窗內的筆數。讀不到就回 0(診斷不得因此中斷)。
+
+    `read_incidents()` 預設只回最後 500 筆(它自己的 docstring 說那是顯示樣本)。
+    七天內那一筆壓縮事件後面若累積了 500 筆別的 incident,用預設值就會漏掉它,
+    然後顯示「最近 7 天沒有新的」。所以這裡明確要整份。
+    """
+    try:
+        rows = lease_mod.read_incidents(limit=10**9)
+    except Exception:  # noqa: BLE001
+        return 0
+    cutoff = time.time() - window
+    count = 0
+    for row in rows:
+        if row.get("kind") != kind:
+            continue
+        ts = row.get("ts")
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts >= cutoff:
+            count += 1
+    return count
+
+
 def check_incidents(r: Result) -> None:
     """印 incident 統計(工具脫離事件)。同樣純讀取,不 FAIL。"""
     try:
@@ -1227,7 +1249,22 @@ def check_incidents(r: Result) -> None:
         return
 
     line = f"incidents 共 {total} 筆({summary}),最近 7 天 {recent} 筆"
-    if recent:
+    # `recent` 是全 kind 的合計。拿它來點名壓縮的話,八天前的一筆
+    # compaction_stopped 加上今天一筆 promise_without_call 就會報成
+    # 「最近有壓縮問題」—— 兩件無關的事。
+    recent_compaction = _recent_incident_count(lease_mod, "compaction_stopped")
+    if recent_compaction:
+        r.warn(
+            f"{line} — 最近 7 天 compaction_stopped={recent_compaction}:"
+            "壓縮停在不確定狀態,看 docs/compaction-rules.md §4"
+        )
+    elif stats.get("compaction_stopped"):
+        # 舊事件不該讓正常環境永久黃燈。
+        r.info(
+            f"{line} — 累計 compaction_stopped={stats['compaction_stopped']}"
+            "(最近 7 天沒有新的)"
+        )
+    elif recent:
         r.warn(f"{line} — 看 docs/troubleshooting.md「MCP lease 與 incident」判斷是哪一層脫落")
     else:
         r.info(f"{line}")
@@ -1253,6 +1290,257 @@ def check_incidents(r: Result) -> None:
                 stamp = "?"
         r.info(f"  最近: {stamp} {row.get('kind', '?')}/{row.get('detail', '?')}"
                f" (source={row.get('source', '?')})")
+
+
+def check_compaction_mode(r: Result, project: Path | None = None) -> None:
+    """印壓縮模式與有效設定是否一致。純讀取,不改任何設定。
+
+    為什麼要在 doctor 裡:模式只在 OpenCode **啟動時** 生效,而專案層
+    opencode.json 或手改都能翻掉受管值。plugin 遇到不一致會停用自動壓縮並
+    在 TUI 跳一次 toast —— headless 沒有 TUI,那條訊息就只剩這裡與
+    application log 看得到。
+    """
+    try:
+        import compaction_mode
+    except Exception as e:  # noqa: BLE001 — 診斷不得因為 import 失敗而中斷
+        r.info(f"compaction_mode 不可用({e})— 跳過壓縮模式檢查")
+        return
+    override = (os.environ.get("AICODE_COMPACTION_STATE") or "").strip()
+    if override:
+        # 這個 env 只給私人壓縮 eval 用。留在殼層裡的話,runtime plugin 讀的是
+        # 另一份(或不存在的)狀態,而這裡與 contract check、canary 讀的都是真的
+        # 那一份 —— 診斷會說接管中,實際上完全沒接管。
+        r.warn(
+            f"AICODE_COMPACTION_STATE 已設定({override}):OpenCode 裡的壓縮 plugin "
+            "會讀那一份,而不是 ~/.config/codetrail/compaction.json。這個變數只給"
+            "私人壓縮 eval 用,一般使用請 unset(aicode 啟動時會自動清掉)。"
+        )
+    state, reason = compaction_mode.inspect_state()
+    if reason:
+        r.warn(f"壓縮模式狀態檔已忽略:{reason}")
+        return
+    if state is None:
+        r.info("壓縮模式:未設定(OpenCode 原生行為);要改用 CodeTrail 壓縮請重跑 ./set_config.sh")
+        return
+    mode = state["mode"]
+    label = compaction_mode.MODE_LABELS.get(mode, mode)
+    r.info(f"壓縮模式:{mode}({label})")
+
+    config_path, config, error = _load_opencode_config_for_compaction(project)
+    if error:
+        r.info(f"  (讀不到有效 OpenCode 設定:{error};跳過一致性檢查)")
+        return
+    if config_path is not None and not compaction_mode.state_matches_config(
+        state, config_path
+    ):
+        r.warn(
+            f"壓縮模式狀態檔記錄的是另一份 opencode.json(目前有效的是 {config_path});"
+            "對這一份重跑 ./set_config.sh 才會對得起來"
+        )
+        return
+    drift = compaction_mode.effective_drift(
+        config, state=state, plugin_path=compaction_mode.PLUGIN_PATH
+    )
+    drift.extend(_recomputed_compaction_drift(compaction_mode, config, mode))
+    if drift:
+        for item in drift:
+            r.warn(f"壓縮設定漂移:{item}")
+        r.info("  → plugin 偵測到這個不一致就會停用自動壓縮;重跑 ./set_config.sh 可收斂")
+    else:
+        r.ok(f"壓縮有效設定與模式一致({mode})")
+
+
+def _recomputed_compaction_drift(compaction_mode, config: dict, mode: str) -> list[str]:
+    """受管值有沒有跟著**目前的**模型限制走。
+
+    寫進設定的保留額是 set_config 當時那個 ctx 推導出來的;之後換模型或改 ctx
+    只有 `limit.context` 會被同步。門檻用新的、tail 用舊的,plugin 會因此停用
+    自動壓縮 —— doctor 不比對的話會回報「一致」,兩邊講相反的話。
+    """
+    if mode not in compaction_mode.PLUGIN_MODES:
+        return []
+    # 上游做 tail selection 與摘要用的是 **compaction agent 的模型**;設了
+    # `agent.compaction.model` 就是它,否則才是主模型。只看 config.model 的話,
+    # runtime 會用小模型重算並停用,doctor 卻回報 PASS。
+    def limit_of(ref):
+        if not isinstance(ref, str) or "/" not in ref:
+            return None
+        provider_id, model_id = ref.split("/", 1)
+        providers = config.get("provider")
+        provider = providers.get(provider_id) if isinstance(providers, dict) else None
+        models = provider.get("models") if isinstance(provider, dict) else None
+        entry = models.get(model_id) if isinstance(models, dict) else None
+        found = entry.get("limit") if isinstance(entry, dict) else None
+        return found if isinstance(found, dict) else None
+
+    agent = config.get("agent")
+    compaction_agent = agent.get("compaction") if isinstance(agent, dict) else None
+    configured = (
+        compaction_agent.get("model") if isinstance(compaction_agent, dict) else None
+    )
+    explicit = isinstance(configured, str) and "/" in configured
+    main_model = config.get("model")
+    model = configured if explicit else main_model
+    if not isinstance(model, str) or "/" not in model:
+        return []
+    limit = limit_of(model)
+    if not isinstance(limit, dict):
+        if explicit:
+            # 明確設了 compaction agent 的模型卻查不到 limit:runtime 會用
+            # `client.config.providers()` 拿到它的真實 limit 重算並可能停用,
+            # 這裡跳過就會回報「一致」而 plugin 那端已經停了。
+            return [
+                f"agent.compaction.model 設成 {model},但設定裡沒有它的 limit;"
+                "無法確認受管值是否與 runtime 一致(plugin 會用真實 limit 重算)"
+            ]
+        return []
+    section = config.get(compaction_mode.COMPACTION_SECTION)
+    reserved = section.get("reserved") if isinstance(section, dict) else None
+    try:
+        derived = compaction_mode.derive_settings(
+            context_limit=limit.get("context"),
+            output_limit=limit.get("output"),
+            input_limit=limit.get("input"),
+            reserved=reserved,
+        )
+    except compaction_mode.CompactionModeError as exc:
+        return [
+            f"目前的 {model} 推導不出可用的壓縮門檻({exc});"
+            "壓縮 plugin 會停用自動壓縮,請重跑 ./set_config.sh"
+        ]
+    if explicit and main_model != model:
+        # 摘要模型與主模型不同時,受管值是兩者的較小值(compaction_mode
+        # .combine_settings):觸發之前那段對話壓的是主模型,只按摘要模型比對
+        # 的話,摘要模型 context 較大時 doctor 會對「主模型早就會 overflow」的
+        # 設定回報一致。
+        main_limit = limit_of(main_model)
+        if not isinstance(main_limit, dict):
+            return [
+                f"agent.compaction.model 設成 {model},但設定裡沒有主模型 "
+                f"{main_model} 的 limit;無法確認受管值是否與 runtime 一致"
+                "(plugin 會用兩個模型的真實 limit 取較小值重算)"
+            ]
+        try:
+            derived = compaction_mode.combine_settings(
+                derived,
+                compaction_mode.derive_settings(
+                    context_limit=main_limit.get("context"),
+                    output_limit=main_limit.get("output"),
+                    input_limit=main_limit.get("input"),
+                    reserved=reserved,
+                ),
+            )
+        except compaction_mode.CompactionModeError as exc:
+            return [
+                f"主模型 {main_model} 推導不出可用的壓縮門檻({exc});"
+                "壓縮 plugin 會停用自動壓縮,請重跑 ./set_config.sh"
+            ]
+    if explicit and main_model != model:
+        source = f"{model} 與主模型 {main_model} 取較小值"
+    else:
+        source = f"{model}(context={limit.get('context')})"
+    issues = []
+    for key, expected in derived.config_values.items():
+        actual = section.get(key) if isinstance(section, dict) else None
+        if not compaction_mode.json_equal(actual, expected):
+            issues.append(
+                f"{compaction_mode.COMPACTION_SECTION}.{key} 是 {actual!r},"
+                f"但目前的 {source}應該是 {expected!r};"
+                "重跑 ./set_config.sh 才會重算"
+            )
+    return issues
+
+
+def _project_config_overlay(project: Path | None) -> dict:
+    """讀 `<project>/.opencode/opencode.json(c)`(OpenCode 會把它疊在全域之上)。
+
+    不讀這一份的話,doctor 會對「全域一致、專案層把 auto 翻回 true」的情況
+    回報「一致」,而 plugin 那端已經因為漂移停用了 —— 兩邊講的話相反。
+    """
+    # 沒給 --project 時用目前目錄:文件教的就是直接跑 `python3 scripts/doctor.py`,
+    # 而 OpenCode 疊的是**當下專案**的設定。
+    root = Path(project) if project is not None else Path.cwd()
+    merged: dict = {}
+    # OpenCode 會**依序載入兩份**,不是找到一份就停。只讀第一份的話,另一份的
+    # compaction / model 覆寫會整個漏掉。
+    for name in ("opencode.json", "opencode.jsonc"):
+        candidate = root / ".opencode" / name
+        try:
+            if not candidate.is_file():
+                continue
+            value = json.loads(candidate.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        except ValueError:
+            # `.jsonc` 允許註解,`json.loads` 讀不了。靜靜略過的話,doctor 會拿
+            # 沒有 override 的全域設定回報「一致」,而 plugin 那端已經停用。
+            return {"__unreadable__": str(candidate)}
+        if isinstance(value, dict):
+            merged = _merge_deep(merged, value) if merged else value
+    return merged
+
+
+def _load_opencode_config_for_compaction(project: Path | None):
+    """回 (config_path, config, error)。只讀不寫;專案層設定疊在全域之上。"""
+    try:
+        import model_resolution
+
+        path, value, error = model_resolution.load_first_opencode_config(os.environ)
+    except Exception as e:  # noqa: BLE001
+        return None, {}, str(e)
+    if error or path is None or not isinstance(value, dict):
+        return None, {}, error or "找不到 opencode.json"
+    overlay = _project_config_overlay(project)
+    if overlay.get("__unreadable__"):
+        return path, value, f"專案層設定讀不了(可能是帶註解的 .jsonc):{overlay['__unreadable__']}"
+    if not overlay:
+        return path, value, None
+    merged = json.loads(json.dumps(value))
+    # `model` / `provider` 也要疊:專案改選一個 context 較小的模型時,runtime
+    # 會用那個模型重算門檻並停用,只疊 compaction 的話 doctor 仍會回報一致。
+    for key in ("compaction", "plugin", "model", "provider", "agent"):
+        if key not in overlay:
+            continue
+        if key == "plugin":
+            # OpenCode 合併 plugin origins(全域 + 專案),不是取代。
+            merged[key] = _merge_plugin_lists(
+                merged.get(key) if isinstance(merged.get(key), list) else [],
+                overlay[key] if isinstance(overlay[key], list) else [],
+            )
+        elif isinstance(overlay[key], dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_deep(merged[key], overlay[key])
+        else:
+            merged[key] = overlay[key]
+    return path, merged, None
+
+
+def _merge_deep(base: dict, overlay: dict) -> dict:
+    """OpenCode 的 config 疊法是深合併,不是整段換掉。
+
+    `plugin` 特別處理:OpenCode 合併 plugin origins。用覆蓋的話,兩份 project
+    config 各帶一個 plugin 時第二份會把第一份蓋掉,doctor 於是可能報「缺
+    CodeTrail plugin」而實際上兩個都載入了。
+    """
+    out = dict(base)
+    for key, value in overlay.items():
+        if key == "plugin" and isinstance(value, list) and isinstance(out.get(key), list):
+            out[key] = _merge_plugin_lists(out[key], value)
+        elif isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge_deep(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _merge_plugin_lists(base: list, extra: list) -> list:
+    seen, combined = set(), []
+    for item in [*base, *extra]:
+        marker = json.dumps(item, sort_keys=True, ensure_ascii=False)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        combined.append(item)
+    return combined
 
 
 def check_readme_consistency(r: Result) -> None:
@@ -1337,6 +1625,9 @@ def main(argv: list[str] | None = None) -> int:
     print("\n-- AICODE_ROOT / project --")
     check_aicode_root(r, args.project)
     check_knowledge_base(r, args.project)
+
+    print("\n-- 壓縮模式 --")
+    check_compaction_mode(r, args.project)
 
     print("\n-- MCP lease / incidents --")
     check_mcp_lease(r)

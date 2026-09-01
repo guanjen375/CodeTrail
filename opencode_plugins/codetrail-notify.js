@@ -45,10 +45,14 @@ const INCIDENTS_ROTATED_FILE = "incidents.jsonl.1";
 const INCIDENT_SCHEMA = 1;
 const INCIDENT_MAX_BYTES = 1048576;
 const INCIDENT_SOURCE = "plugin";
+// `compaction_stopped` 是壓縮 plugin（codetrail-compaction.js）寫的 kind。
+// 這個檔自己不寫它，但集合是跨語言凍結的：少一個就會把對方寫的合法 kind
+// 正規化掉，那些事件在 doctor 的統計裡等於憑空消失。
 const INCIDENT_KINDS = [
   "promise_without_call",
   "client_mcp_failed",
   "structured_call_failed",
+  "compaction_stopped",
 ];
 // detail 只能是固定 slug：自由文字會把使用者的訊息／檔名寫進 incident 檔。
 const DETAIL_SLUGS = [
@@ -62,6 +66,14 @@ const DETAIL_SLUGS = [
   "lease_unknown",
   "no_tool_part",
   "tool_error",
+  "summary_empty",
+  "summary_reasoning_only",
+  "summary_error",
+  "race_unanswered_user",
+  "race_parent_mismatch",
+  "config_drift",
+  "version_unsupported",
+  "trigger_failed",
   "unknown",
 ];
 

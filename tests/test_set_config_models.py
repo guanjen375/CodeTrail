@@ -363,7 +363,7 @@ def test_interactive_prompt_accepts_typed_n_cpu_moe(tmp_path):
     # main、main GPU(選 1 = 15000 MiB free)、ctx、CPU-MoE 層數先 abc(無效)再 3、
     # embed GPU、reranker、reranker GPU、reranker ctx、VL GPU、摘要確認。
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n1\n65536\nabc\n3\n1\n1\n1\n8192\n1\n\n")
+                stdin="1\n1\n65536\nabc\n3\n1\n1\n1\n8192\n1\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "主聊天模型 CPU-MoE 留在 RAM 的層數(0-1024)" in proc.stdout
@@ -384,7 +384,7 @@ def test_interactive_n_cpu_moe_over_max_index_means_full_cpu_moe(tmp_path):
     models = moe_models_needing_cpu_moe(tmp_path)
 
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n65536\n42\n1\n1\n1\n8192\n1\n\n")
+                stdin="1\n0\n65536\n42\n1\n1\n1\n8192\n1\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "推薦數值:" in proc.stdout
@@ -398,7 +398,7 @@ def test_interactive_cpu_moe_zero_means_no_offload(tmp_path):
     models = moe_models_needing_cpu_moe(tmp_path)
 
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n65536\n0\n1\n1\n1\n8192\n1\n\n")
+                stdin="1\n0\n65536\n0\n1\n1\n1\n8192\n1\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "0 = 不 offload" in proc.stdout
@@ -428,7 +428,7 @@ def test_build_without_n_cpu_moe_support_degrades_to_full_cpu_moe(tmp_path):
     models = moe_models_needing_cpu_moe(tmp_path)
 
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n65536\n3\n1\n1\n1\n8192\n1\n\n")
+                stdin="1\n0\n65536\n3\n1\n1\n1\n8192\n1\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "不支援 --n-cpu-moe" in proc.stdout
@@ -507,7 +507,7 @@ def test_flat_dir_vl_pairing_asks_explicitly_in_interactive(tmp_path):
     # main(3 候選選 1)、main GPU、ctx、embed GPU、reranker 唯一自動、reranker GPU、
     # reranker ctx、VL 明確選 [2] media-large、VL GPU、摘要確認。
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n65536\n1\n1\n8192\n2\n1\n\n")
+                stdin="1\n0\n65536\n1\n1\n8192\n2\n1\n1\n\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "【VL 模型】 — 偵測到的候選" in proc.stdout
     deployment = read_deployment(tmp_path)

@@ -320,6 +320,12 @@ nvidia-smi --query-gpu=memory.used,memory.free,memory.total --format=csv
 
 llama-server 端的 `-c <N>` 也是啟動旗標,改完要重啟 server,不能熱 reload。
 
+**壓縮模式同理**:`~/.config/opencode/opencode.json` 的 `compaction.*` 與 `plugin` 只在
+OpenCode **啟動時** 讀,所以 `./set_config.sh --compaction-mode ...` 之後必須完全退出
+OpenCode 再重開。模式與接管前的原值記在 `~/.config/codetrail/compaction.json`(0600);
+不要手改或手刪它 —— 那是切回 `native` 時唯一的還原依據。三種模式的取捨見
+[compaction-rules.md](compaction-rules.md)。
+
 `~/.config/opencode/AGENTS.md`(決定模型會不會真的去用工具的全域規則)是**另一份檔**,`set_config.sh` 不產生它、`git pull` 也不會更新它。`aicode` 每次啟動會比對並在過期時提醒;要套用新版範本:
 
 ```bash

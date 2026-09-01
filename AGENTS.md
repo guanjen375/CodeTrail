@@ -81,6 +81,25 @@
   regex 子集（不收任何群組、`|` 只在最上層且 ≤ 8 分支、`*`/`+` 合計 ≤ 1、`?` ≤ 3、不接受 `{n,m}` /
   backreference / lookaround / inline flag），其餘改字面比對；比對主體只看前 300 字元。Python `re`
   沒有 timeout 也不釋放 GIL，放寬它就是讓一個 target 卡死整個同步的 MCP server
+- `session_eval` 的私人 session 評測邊界——mined/curated 資料不得把歷史 assistant 回答當
+  oracle；private writer 必須維持目錄 0700、檔案 0600、拒絕 symlink；read-only replay 必須
+  deny 寫入／執行工具並以前後 project-state digest 偵測現場變動；checkpoint/resume 必須綁定
+  suite digest、live model fingerprint、case 順序與逐題 project-state digest，單題 timeout 不得
+  讓已完成結果無聲消失。原始 NDA prompt、工具輸出、candidate answer 不得寫入 checked-in
+  `eval/` 或 privacy-safe aggregate
+- `compaction_mode` 的壓縮模式 ownership 狀態檔——owner-only(目錄 0700／檔 0600、拒
+  symlink 與 symlink 父目錄、dir-fd 原子寫入)、`digest` 必須涵蓋 `prior`(還原時會被
+  寫回設定的正是它)、狀態綁定單一目標 config、以及「沒有狀態檔 = 沒有接管」的
+  fail-closed 預設。切回 native 只能還原**仍有 ownership 證據**的值(JSON 型別嚴格
+  相等),放寬任何一條就是靜默改掉或刪掉使用者的 OpenCode 設定
+- `opencode_plugins/codetrail-compaction.js` 的壓縮契約——七條規則只能經
+  `experimental.session.compacting` 的 `context` **附加**(改用 `prompt` 取代會讓
+  `previousSummary` 從此不進摘要器,而且完全無聲);`autocontinue` 一律 `false`;
+  壓縮後必須核對 summary parent 帶 compaction part、最新真實 user 已被回答、摘要非空
+  非 reasoning-only 且無 error,不符就停止並要求重送(不自動續答、不自動 revert);
+  pending / synthetic / 出錯回合 / 子 session 不得進狀態校正節錄,節錄不得帶工具參數或
+  輸出;incident 與 application log 只放固定 slug 與 session 雜湊;整個 hook 必須
+  fail-open(上游用 `void hook.event(...)` 派送,reject 出去就是 unhandled rejection)
 
 任何重構碰到上面這些東西，**新加測試**（開發者寫測試檔，執行依 §1.2 權責），
 不要直接刪 / weaken / 移除檢查點。
