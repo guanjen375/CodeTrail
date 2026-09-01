@@ -1,5 +1,16 @@
 # OpenCode 壓縮模式與摘要規則
 
+> **🧪 實驗功能（開發中、仍在測試階段）：行為與受管值可能再變。**
+> 指的是 `codetrail` 與 `manual`——CodeTrail 接管壓縮的那條路徑。摘要規則、觸發
+> 門檻與寫進 `opencode.json` 的受管值都還在調整，升級之後可能不一樣；碰到怪狀況
+> 請先切回 `native` 再回報。
+>
+> **`native` 不在實驗範圍內。** 那條路徑就是「不接管」，行為與這個功能出現之前
+> 一模一樣：互動問答第 5 題選 `native`，或
+> `./set_config.sh --compaction-mode native`。**沒有
+> `~/.config/codetrail/compaction.json` 就等於沒有接管**——`git pull` 之後不會有
+> 任何東西自己啟用。
+
 CodeTrail 對 OpenCode 自動壓縮（compaction）的處理分成三種模式，由
 `./set_config.sh` 顯式選擇並記錄在 owner-only 的狀態檔
 `~/.config/codetrail/compaction.json`。**沒有那個狀態檔就等於沒有接管**：舊安裝
@@ -16,13 +27,14 @@ CodeTrail 對 OpenCode 自動壓縮（compaction）的處理分成三種模式�
 
 | 模式 | `compaction.auto` | plugin | 何時壓縮 |
 | --- | --- | --- | --- |
-| `codetrail`（建議） | `false` | 載入 | 助理答完、session 進 idle 之後由 plugin 主動觸發 |
-| `manual` | `false` | 載入 | 只有你自己按 `/compact` 時；plugin 不主動觸發 |
+| `codetrail` 🧪 實驗中 | `false` | 載入 | 助理答完、session 進 idle 之後由 plugin 主動觸發 |
+| `manual` 🧪 實驗中 | `false` | 載入 | 只有你自己按 `/compact` 時；plugin 不主動觸發 |
 | `native` | 還原成你原本的值 | 不載入(接管前你自己就有的那筆會保留) | 完全交回 OpenCode |
 
 `./set_config.sh` 的第 5 題 **沒有預設值**（跟其他使用者選擇題一樣，Enter 不能過關）——
-顯式選擇本身就是「授權 CodeTrail 接管這幾個欄位」的那個動作。`codetrail` 只是建議與第一個
-選項。非互動用 `--compaction-mode`；`--yes` 沒給它時沿用狀態檔記錄的既有選擇，還沒選過就
+顯式選擇本身就是「授權 CodeTrail 接管這幾個欄位」的那個動作。`codetrail` 只是第一個
+選項,不是預設值——它與 `manual` 都還在測試階段(問答與 `aicode` 啟動橫幅都會標 🧪)。
+非互動用 `--compaction-mode`；`--yes` 沒給它時沿用狀態檔記錄的既有選擇，還沒選過就
 完全不碰壓縮設定。
 
 ### 為什麼要有 codetrail 模式

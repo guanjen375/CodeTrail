@@ -279,9 +279,13 @@ routing，避免再把它們混為一談。
 
 ### 送出新問題卻先跑出一段摘要,或壓縮停住要你重送
 
-先確認你選了哪個壓縮模式:`python3 scripts/doctor.py` 的 `-- 壓縮模式 --` 一段會印出
-目前記錄的模式,以及有效設定跟它一不一致。三種模式的完整說明、門檻公式與取捨在
-[compaction-rules.md](compaction-rules.md)。
+先確認你選了哪個壓縮模式:`aicode` 啟動橫幅有一行 `[aicode] 壓縮模式=...`,
+`python3 scripts/doctor.py` 的 `-- 壓縮模式 --` 一段則會再印出有效設定跟它一不一致。
+三種模式的完整說明、門檻公式與取捨在 [compaction-rules.md](compaction-rules.md)。
+
+**`codetrail` / `manual` 還在測試階段**(兩處顯示都會標 🧪):行為與受管值可能再變。
+遇到下表以外的怪狀況,先 `./set_config.sh --compaction-mode native` 切回原生壓縮再回報
+——那條路徑會精確還原接管前的值,行為與這個功能出現之前一模一樣。
 
 | 畫面 | 意思 | 怎麼辦 |
 |---|---|---|

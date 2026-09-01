@@ -135,6 +135,31 @@ def test_native_keeps_a_value_the_user_set_before_takeover(tmp_path):
     }
 
 
+def test_first_run_native_never_touches_the_config(tmp_path):
+    """第一次就選 native:壓縮相關的設定必須跟這個功能不存在時一模一樣。
+
+    這是「選原本的壓縮 = 原本的行為」那條保證,而它很容易在重構時被破壞:
+    native 不需要推導受管值,所以順手補一句「至少寫上預設」看起來人畜無害
+    —— 實際上是把使用者原本的 OpenCode 壓縮行為改掉,而畫面上只會顯示
+    「壓縮模式:native」。plugin 同理:多註冊一筆就等於接管了。
+    """
+    models = _setup(tmp_path)
+    opencode = _home(tmp_path) / ".config" / "opencode" / "opencode.json"
+    opencode.parent.mkdir(parents=True, exist_ok=True)
+    before = {"compaction": {"auto": True, "reserved": 4096}, "plugin": ["./mine.js"]}
+    opencode.write_text(json.dumps(before), encoding="utf-8")
+
+    base = (*YES_TWO_GPU, "--no-preview", "--models-dir", str(models))
+    proc = run(tmp_path, *base, "--compaction-mode", "native")
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+
+    config = _opencode(tmp_path)
+    assert config["compaction"] == before["compaction"]   # 一個鍵都沒動
+    assert config["plugin"] == ["./mine.js"]              # 沒有塞壓縮 plugin
+    state = cm.load_state(path=_state_path(tmp_path))
+    assert state["mode"] == "native" and state["managed"] == {}
+
+
 def test_rerunning_the_same_mode_keeps_the_original_prior(tmp_path):
     """重跑 set_config 不得把「接管前原值」換成 CodeTrail 自己寫的值。"""
     models = _setup(tmp_path)

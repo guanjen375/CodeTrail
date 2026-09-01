@@ -1324,7 +1324,14 @@ def check_compaction_mode(r: Result, project: Path | None = None) -> None:
         return
     mode = state["mode"]
     label = compaction_mode.MODE_LABELS.get(mode, mode)
-    r.info(f"壓縮模式:{mode}({label})")
+    r.info(f"壓縮模式:{mode}{compaction_mode.mode_tag(mode)}({label})")
+    if compaction_mode.is_experimental(mode):
+        # 這個模式還在測試階段。健檢是使用者最可能發現「原來我在用它」的地方,
+        # 所以還原的那行命令要在這裡就給,不要只留在文件裡。
+        r.info(
+            f"  {compaction_mode.EXPERIMENTAL_NOTICE};"
+            "要回原生行為:./set_config.sh --compaction-mode native"
+        )
 
     config_path, config, error = _load_opencode_config_for_compaction(project)
     if error:

@@ -362,12 +362,14 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     ),
     "test_set_config_compaction.py": (
         "set_config 的壓縮模式:--yes 沒給旗標一律不接管、受管值等於同一條公式的推導、"
-        "切回 native 精確還原、dry-run/放棄不留檔、狀態檔綁定單一 config",
+        "選 native(第一次選或切回來)都是原本的行為、dry-run/放棄不留檔、"
+        "狀態檔綁定單一 config",
         (
             "test_yes_without_the_flag_never_takes_over",
             "test_codetrail_mode_writes_the_derived_managed_values",
             "test_switching_back_to_native_restores_and_deregisters",
             "test_native_keeps_a_value_the_user_set_before_takeover",
+            "test_first_run_native_never_touches_the_config",
             "test_rerunning_the_same_mode_keeps_the_original_prior",
             "test_dry_run_writes_nothing",
             "test_quitting_at_the_summary_writes_nothing",

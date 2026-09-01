@@ -383,6 +383,17 @@ fi
 if [ -n "${AICODE_LLAMA_BASE_URL:-}" ]; then
   echo "[aicode] AICODE_LLAMA_BASE_URL=${AICODE_LLAMA_BASE_URL} (主 LLM server)"
 fi
+
+# 目前的壓縮模式(OpenCode 什麼時候把長對話換成一段摘要)。模式只在 OpenCode
+# 啟動時生效、選擇記在 ~/.config/codetrail/compaction.json,所以不印的話使用者
+# 整段 session 都不知道自己在用哪一個 —— codetrail / manual 還在測試階段,更該
+# 講。純讀取、fail-open:那支腳本自己吞掉所有例外並永遠 exit 0,`|| true` 是第
+# 二道保險。這一行是資訊不是閘,不得擋住啟動。
+COMPACTION_STATUS="$CODETRAIL_HOME/scripts/compaction_status.py"
+if [ -f "$COMPACTION_STATUS" ]; then
+  "$PYBIN" "$COMPACTION_STATUS" --prefix '[aicode]' || true
+fi
+
 echo "[aicode] NOTE: 主 n_ctx 只需用 ./set_config.sh 設一次；改完重啟 server。"
 echo "         CodeTrail budget 與 OpenCode active model limit.context 會自動跟隨。"
 echo "         Check loaded model with: curl -s \${AICODE_LLAMA_BASE_URL:-http://localhost:8080}/props"

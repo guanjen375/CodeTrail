@@ -1,5 +1,8 @@
 """OpenCode 壓縮模式(compaction mode)的單一真值。
 
+**這套接管仍在測試階段**(`codetrail` / `manual`;見 `EXPERIMENTAL_NOTICE`)。
+`native` 不在其中 —— 那條路徑就是「不接管」,行為與這個功能出現之前一模一樣。
+
 CodeTrail 對 OpenCode 的自動壓縮有三種模式,由 `./set_config.sh` 顯式選擇:
 
   * ``codetrail``  結構化壓縮(建議,但那一題沒有預設值):關掉上游「下一個
@@ -68,6 +71,31 @@ MODE_LABELS = {
     MODE_NATIVE: "OpenCode 原生壓縮(還原你原本的設定)",
     MODE_MANUAL: "手動結構化壓縮(同一套規則,只在 /compact 時執行)",
 }
+
+# ---- 開發階段標示 --------------------------------------------------------
+#: CodeTrail 接管壓縮(codetrail / manual)還在測試階段。`native` 不標 ——
+#: 那條路徑就是「不接管」,沒有實驗成分。
+#:
+#: 為什麼要有這兩個常數:同一句話要出現在 set_config 的問答、set_config 的
+#: 設定摘要、aicode 啟動橫幅、doctor 與使用者文件。五個地方各寫各的,拿掉
+#: 其中一個就會有人在完全不知道的情況下把長對話交給一個還在調整的機制。
+EXPERIMENTAL_MODES = PLUGIN_MODES
+#: 短標籤:接在模式名後面(選項列、狀態行、摘要頁)。
+EXPERIMENTAL_TAG = "🧪 實驗中"
+#: 完整說明:自成一行的警告(問答、啟動橫幅、文件標題下)。**不含**行動建議 ——
+#: 每個呼叫端接的下一句不一樣(問答說「選 native」、橫幅說那行命令),寫進來
+#: 就會有一半的地方讀起來像廢話。
+EXPERIMENTAL_NOTICE = "🧪 實驗功能(開發中、仍在測試階段):行為與受管值可能再變"
+
+
+def is_experimental(mode: str | None) -> bool:
+    """這個模式還在測試階段嗎?(`native` = 原本的行為,不是。)"""
+    return mode in EXPERIMENTAL_MODES
+
+
+def mode_tag(mode: str | None) -> str:
+    """顯示用後綴:實驗模式回 `" 🧪 實驗中"`,其餘回空字串。"""
+    return f" {EXPERIMENTAL_TAG}" if is_experimental(mode) else ""
 
 # ---- plugin 與規則 --------------------------------------------------------
 PLUGIN_FILENAME = "codetrail-compaction.js"

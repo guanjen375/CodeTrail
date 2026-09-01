@@ -320,6 +320,10 @@ nvidia-smi --query-gpu=memory.used,memory.free,memory.total --format=csv
 
 llama-server 端的 `-c <N>` 也是啟動旗標,改完要重啟 server,不能熱 reload。
 
+**壓縮接管仍是實驗功能**(🧪 開發中、仍在測試階段):`codetrail` / `manual` 的摘要規則、
+觸發門檻與受管值都可能再變。`native` 不在其中——那就是 OpenCode 原本的行為,也是唯一
+「什麼都不接管」的選項。
+
 **壓縮模式同理**:`~/.config/opencode/opencode.json` 的 `compaction.*` 與 `plugin` 只在
 OpenCode **啟動時** 讀,所以 `./set_config.sh --compaction-mode ...` 之後必須完全退出
 OpenCode 再重開。模式與接管前的原值記在 `~/.config/codetrail/compaction.json`(0600);

@@ -18,7 +18,8 @@ nvidia-smi 稍微監控)。
        [2/5] embedding  → 模型、GPU
        [3/5] reranker   → 模型、GPU、internal buffer(ctx)
        [4/5] VL         → 模型、GPU、mmproj、CPU-MoE 層數
-       [5/5] 壓縮模式   → codetrail / native / manual(見 docs/compaction-rules.md)
+       [5/5] 壓縮模式   → codetrail / native / manual(見 docs/compaction-rules.md;
+                          codetrail / manual 仍是實驗功能,native = 原本的行為)
      CPU-MoE 沒有 y/n 分流:直接問層數,0 = 不 offload(一般模式)、
      N = 前 N 層 experts 留 RAM、≥ 層數上限 = 全部留 RAM(等同 --cpu-moe);
      模型不是 MoE(GGUF 沒有 expert tensors)時直接略過並印出原因。
@@ -1166,10 +1167,20 @@ def choose_compaction_mode(
     span = _range(1, len(options))
     print("\n壓縮(compaction)是 OpenCode 把長對話換成摘要的機制。")
     print("原生行為是「下一個 prompt 進來才檢查」,所以你送出新問題時會先看到一段摘要。")
+    # 這一題沒有預設值,選下去就是授權接管 —— 所以「還在測試階段」必須印在
+    # 選項之前,而不是事後在文件裡。native 是唯一維持原本行為的選項。
+    print(f"{compaction_mode.EXPERIMENTAL_NOTICE}——只影響 "
+          f"{' / '.join(compaction_mode.EXPERIMENTAL_MODES)} 這兩個模式。")
+    print(f"  要維持你原本的壓縮行為,請選 native"
+          f"(第 {options.index(compaction_mode.MODE_NATIVE) + 1} 項);"
+          "選了之後隨時可以用 ./set_config.sh --compaction-mode native 還原。")
     if prior_mode is not None:
-        print(f"目前記錄的選擇:{prior_mode}({compaction_mode.MODE_LABELS[prior_mode]})")
+        print(f"目前記錄的選擇:{prior_mode}"
+              f"({compaction_mode.MODE_LABELS[prior_mode]})"
+              f"{compaction_mode.mode_tag(prior_mode)}")
     for pos, mode in enumerate(options, start=1):
-        print(f"  [{pos}] {compaction_mode.MODE_LABELS[mode]}")
+        print(f"  [{pos}] {compaction_mode.MODE_LABELS[mode]}"
+              f"{compaction_mode.mode_tag(mode)}")
     print("  細節與取捨(含 codetrail/manual 會放棄 mid-turn 壓縮這一點):"
           "docs/compaction-rules.md")
     while True:
@@ -2816,6 +2827,8 @@ def _parser() -> argparse.ArgumentParser:
         "--compaction-mode", choices=list(compaction_mode.COMPACTION_MODES),
         help=(
             "OpenCode 壓縮模式(見 docs/compaction-rules.md)。互動模式是第 5 題;"
+            f"{'/'.join(compaction_mode.EXPERIMENTAL_MODES)} 仍是實驗功能(開發中),"
+            "native = OpenCode 原本的行為;"
             "--yes 沒給這個旗標時沿用 ~/.config/codetrail/compaction.json 記錄的選擇,"
             "還沒選過就完全不碰壓縮設定"
         ),
@@ -2885,7 +2898,11 @@ def _print_summary_page(plan: Plan, python_bin: str, opencode_changes: list[str]
         print("  壓縮模式  : 不變更(OpenCode 原生行為)")
     else:
         print(f"  壓縮模式  : {compaction_choice}"
+              f"{compaction_mode.mode_tag(compaction_choice)}"
               f"({compaction_mode.MODE_LABELS[compaction_choice]})")
+        if compaction_mode.is_experimental(compaction_choice):
+            print(f"              {compaction_mode.EXPERIMENTAL_NOTICE};"
+                  "隨時可用 ./set_config.sh --compaction-mode native 還原")
         if compaction_derived is not None:
             print(f"              idle 門檻={compaction_derived.idle_threshold} tokens、"
                   f"tail 保留={compaction_derived.preserve_recent_tokens} tokens")

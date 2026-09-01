@@ -18,6 +18,7 @@ python3 -m compileall -q .
 python3 scripts/check_eval_consistency.py
 python3 scripts/check_readme_consistency.py
 python3 scripts/opencode_contract_check.py            # 全域 opencode.json / AGENTS.md / 壓縮 plugin 漂移
+python3 scripts/compaction_status.py          # 目前的壓縮模式(aicode 橫幅那一行;純讀取)
 python3 scripts/doctor.py --no-network        # 用機器上實際設定的模型；不要塞假 model 名
 python3 deployment_profile.py validate
 
@@ -151,6 +152,11 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
   `docs/mcp-tools.md` 與 `docs/opencode-agents-template.md` fenced block **外**的固定順序
   manifest；可安裝的全域 prompt 只保留 `codetrail_*` schema anchor，禁止把完整清單搬回去。
   使用者還在用舊版固定清單時，`aicode` 會提示 `⚠ STALE`
+- 壓縮接管(`codetrail` / `manual`)**還在測試階段**:標示的單一來源是
+  `compaction_mode.EXPERIMENTAL_TAG` / `EXPERIMENTAL_NOTICE`,由 set_config 的問答與
+  摘要頁、`scripts/compaction_status.py`(aicode 啟動橫幅)、`scripts/doctor.py` 與
+  `docs/compaction-rules.md` / `README.md` 共用。要拿掉「實驗中」是一次全域決定,
+  不是改其中一處——`tests/test_compaction_status.py` 釘住問答與文件都還帶著它
 - 改壓縮的七條摘要規則或門檻公式 → `docs/compaction-rules.md` 的兩個 ```text 區塊是
   **唯一來源**，`opencode_plugins/codetrail-compaction.js` 的 `RULES_TEXT` /
   `RECONCILIATION_HEADER` 逐字沿用它們，`compaction_mode.derive_settings` 與 plugin 的
