@@ -875,7 +875,7 @@ def test_live_server_spawners_never_write_into_the_user_state_dir():
     tests_dir = Path(__file__).resolve().parent
     spawners = {
         "_harness.py": "spawn_mcp",
-        "test_mcp_protocol_roundtrip.py": "_server_env",
+        "test_mcp_server.py": "_server_env",
     }
     for filename, func_name in spawners.items():
         source = (tests_dir / filename).read_text(encoding="utf-8")

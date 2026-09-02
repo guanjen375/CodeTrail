@@ -1597,7 +1597,7 @@ class ToolExecutor:
                         # 個非空行仍是 hunk body(' '/'+'/'-'),這些空行就是被
                         # strip 的 context blank line;否則是分隔/EOF sentinel,
                         # 結束 hunk(EOF sentinel 誤算的舊 bug 見
-                        # tests/test_patch_parser_edge.py)。
+                        # tests/test_apply_patch.py)。
                         if hunk_line == "":
                             j = i
                             while j < len(lines) and lines[j] == "":

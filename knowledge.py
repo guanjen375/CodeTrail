@@ -142,7 +142,7 @@ _FIGURE_META_KEYS = (
 # 那張表的任何內容**——查詢期不跟著 figure_id 走回去，使用者就只拿得到一個頁碼。
 #
 # 這裡刻意不 import RAG（那會把 PyMuPDF / embedding client 拖進 MCP 熱路徑），
-# 兩邊共用的只有這一個字面格式；`tests/test_rag_pdf_ingest.py` 有一條 smoke 拿
+# 兩邊共用的只有這一個字面格式；`tests/test_rag_ingest.py` 有一條 smoke 拿
 # `RAG.PDF_TABLE_REPLACED_MARKER` 實際 format 一次再餵給這個 pattern，漂了就紅。
 _REPLACED_FIGURE_MARKER_RE = re.compile(
     r"\[表格已改以結構化 chunk 收錄：figure=(fig_[0-9a-f]{16}) page=(-?\d+) rows=(-?\d+)\]"

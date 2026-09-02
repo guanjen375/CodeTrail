@@ -9,7 +9,7 @@
 1. **沒有證據就不宣稱。** 任一 evidence channel 取不到只記進
    `PageEvidence.unavailable`，**不 raise、不印任何東西**（`RAG.extract_pdf` 的既有測試
    斷言 `"[WARN]" not in out`）。整頁的結構性 channel 全滅時，那一頁不得產生任何
-   table/terminal 候選——這正是既有 `tests/test_rag_pdf_ingest.py` 用
+   table/terminal 候選——這正是既有 `tests/test_rag_ingest.py` 用
    `types.SimpleNamespace(page_count=..., close=...)` 假裝 pymupdf Document 仍能通過的依據。
 2. **原生證據優先，純 raster 受監督。**原生 markdown 表格（`class=table` + 合法
    `pos`）、`find_tables` 幾何、ruled-line grid、對齊的 word band（無框線 memory map）、

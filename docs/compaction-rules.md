@@ -189,7 +189,7 @@ structure shown inside `<template>`**，模板是
 **附加在那一段之後**的，所以兩份格式指示會同時出現在摘要器眼前——只寫「覆蓋前面所有
 與輸出格式衝突的指示」不夠：實測看過同一個 session 第一次照七欄中文、第二次整份照
 上游模板輸出那五個英文欄位。所以規則第一段直接**點名**那五個欄位並要求不要輸出。
-`tests/test_opencode_compaction_plugin.py` 釘住那五個名字還在規則裡。
+`tests/test_opencode_plugins.py` 釘住那五個名字還在規則裡。
 
 ### `agent.compaction` 不歸 CodeTrail 管
 

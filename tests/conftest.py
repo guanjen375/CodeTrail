@@ -45,3 +45,21 @@ def _isolate_ingest_runtime():
     ingest_runtime._reset_for_tests()
     yield
     ingest_runtime._reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_code_rag_scan_cache():
+    """`code_rag._INDEX_SCAN_CACHE` 是 module-global,不得跨測試外洩。
+
+    原本有 8 個測試模組各自抄一份同樣的 autouse fixture;漏抄的那個模組不會
+    報錯,只會在別的 root 撿到上一條測試的掃描結果。這裡只在 `code_rag` **已經**
+    被 import 時清它:沒 import 過就沒有 cache 可清,也不必讓純函式測試多付
+    一次 import。
+    """
+    module = sys.modules.get("code_rag")
+    if module is not None:
+        module._INDEX_SCAN_CACHE.clear()
+    yield
+    module = sys.modules.get("code_rag")
+    if module is not None:
+        module._INDEX_SCAN_CACHE.clear()

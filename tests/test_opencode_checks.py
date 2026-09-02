@@ -60,7 +60,7 @@ def _setup(monkeypatch, path) -> None:
     # 關掉它,免得兩個子系統的輸出互相污染 —— AGENTS.md 的行為由下面自己的測試驗。
     monkeypatch.setenv(check.AGENTS_MD_SKIP_ENV, "1")
     # 同理:通知 plugin 的註冊是同一支腳本的另一件事(自己的測試檔在
-    # tests/test_opencode_notify_plugin.py)。這一段只驗 opencode.json 的
+    # tests/test_opencode_plugins.py)。這一段只驗 opencode.json 的
     # 契約遷移,關掉它才不會讓每個案例都多出一個 plugin 陣列的變數。
     monkeypatch.setenv(check.NOTIFY_PLUGIN_SKIP_ENV, "1")
 
@@ -342,7 +342,7 @@ def _setup_build_prompt_check(monkeypatch, home: Path, config_path: Path) -> Non
     monkeypatch.delenv(check.SKIP_ENV, raising=False)
     monkeypatch.setenv(check.AGENTS_MD_SKIP_ENV, "1")
     # 同理:通知 plugin 的註冊是同一支腳本的另一件事(自己的測試檔在
-    # tests/test_opencode_notify_plugin.py)。這一段只驗 opencode.json 的
+    # tests/test_opencode_plugins.py)。這一段只驗 opencode.json 的
     # 契約遷移,關掉它才不會讓每個案例都多出一個 plugin 陣列的變數。
     monkeypatch.setenv(check.NOTIFY_PLUGIN_SKIP_ENV, "1")
 
@@ -469,7 +469,7 @@ def _agents_setup(monkeypatch, tmp_path, doc_text: str) -> Path:
     monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
     monkeypatch.delenv(check.SKIP_ENV, raising=False)
     # 同理:通知 plugin 的註冊是同一支腳本的另一件事(自己的測試檔在
-    # tests/test_opencode_notify_plugin.py)。這一段只驗 opencode.json 的
+    # tests/test_opencode_plugins.py)。這一段只驗 opencode.json 的
     # 契約遷移,關掉它才不會讓每個案例都多出一個 plugin 陣列的變數。
     monkeypatch.setenv(check.NOTIFY_PLUGIN_SKIP_ENV, "1")
     return config_path

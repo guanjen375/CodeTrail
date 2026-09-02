@@ -14,7 +14,7 @@
  *    export 都當 plugin 呼叫，多 export 一個 helper 就等於多一個假 plugin。
  *    測試要用的內部函式掛在 factory 的 `.internals` 上（module export 看不到）。
  *  - 常數字面值與 Python 端（ingest_notify / mcp_lease）逐字一致，
- *    由 tests/test_opencode_notify_plugin.py 的跨語言一致性測試釘住。
+ *    由 tests/test_opencode_plugins.py 的跨語言一致性測試釘住。
  *  - headless（`opencode run`）沒有 TUI，toast 不會顯示；那條路徑靠工具結果
  *    裡的文字標記本身。web 介面未實測，不宣稱支援。
  */

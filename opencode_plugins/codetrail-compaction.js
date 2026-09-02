@@ -29,7 +29,7 @@
  *    export 都當 plugin 呼叫，多 export 一個 helper 就等於多一個假 plugin。
  *    測試要用的內部函式掛在 factory 的 `.internals` 上。
  *  - 常數字面值與 Python 端（compaction_mode / mcp_lease）逐字一致，
- *    由 tests/test_opencode_compaction_plugin.py 的跨語言測試釘住。
+ *    由 tests/test_opencode_plugins.py 的跨語言測試釘住。
  */
 
 import { constants, realpathSync } from "node:fs";

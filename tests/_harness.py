@@ -21,7 +21,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Wrapper 的 server n_ctx 自動偵測由 tests/test_ctx_resolution.py 單獨覆蓋。
+# Wrapper 的 server n_ctx 自動偵測由 tests/test_deployment.py 單獨覆蓋。
 # 這批測試關心 CLI 轉發、root safety、設定合併與 wrapper 生成；給定明確 ctx 可避免
 # 每個 case 都對離線的 localhost:8080 重複等待同一個 HTTP timeout。
 OFFLINE_CTX = "65536"
@@ -302,7 +302,7 @@ def run_aicode_subcmd_with_stub(
 # ---------------------------------------------------------------------------
 # mcp_server.py 子行程:啟動 → 等 stderr 里程碑 → 收屍
 #
-# test_mcp_startup.py 與 test_mcp_runtime_policy.py 原本各有一份一模一樣的
+# test_mcp_startup.py 與 test_mcp_runtime_policy.py(現在都併在 test_mcp_server.py)原本各有一份一模一樣的
 # _spawn_mcp / _terminate。
 # ---------------------------------------------------------------------------
 
@@ -314,7 +314,7 @@ def spawn_mcp(tmp_root: Path, env_overrides: dict[str, str] | None = None) -> su
 
     - 指向一個必定沒人聽的 llama base URL,確保子行程不會真的去打模型。
     - 給假的 AICODE_MODEL:mcp_server 啟動會 require_main_model(),沒設會 exit 3;
-      主模型解析本身有 tests/test_model_resolution.py 覆蓋。
+      主模型解析本身有 tests/test_deployment.py 覆蓋。
     - 即使 env_overrides 蓋掉 HOME,也要讓子行程找得到 mcp 套件 → 顯式帶 PYTHONPATH。
     """
     env = os.environ.copy()
@@ -377,7 +377,7 @@ def terminate_proc(proc: subprocess.Popen) -> None:
 # ---------------------------------------------------------------------------
 # in-process 重新 import mcp_server
 #
-# test_fs_sandbox / test_code_rag_index / test_code_rag_search_contract /
+# test_fs_sandbox / test_code_rag_index / test_code_rag_search /
 # test_repeat_guard 原本各有一份幾乎一樣的 mcp_module fixture(約 25 行 × 4)。
 # 差別只在「先在 root 底下放什麼檔案」,那部分留在各自的 fixture 裡。
 # ---------------------------------------------------------------------------

@@ -37,7 +37,7 @@ B 設定的 native,會把 A 的原值寫進 B;而被人手改過的 `prior` 會�
 **數值不是拍腦袋的百分比**:門檻與 tail 保留額由上游 `overflow.ts` /
 `compaction.ts` 的公式,加上 CodeTrail 自己的單次工具結果預算推導出來
 (見 `derive_settings`)。JS plugin 端有逐字相同的一份,由
-`tests/test_opencode_compaction_plugin.py` 的跨語言測試釘住:兩邊只要有一邊
+`tests/test_opencode_plugins.py` 的跨語言測試釘住:兩邊只要有一邊
 改了公式,plugin 的觸發門檻就會跟寫進 opencode.json 的保留額對不起來,而
 兩邊各自的測試都是綠的。
 """

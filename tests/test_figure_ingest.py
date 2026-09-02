@@ -4,7 +4,7 @@
 chunk 取代之後不得留下第二份、`pos` 不可信時不得亂切正文、抽取失敗與預算超限
 一律零寫入、structured chunk 的 content 不得經過通用 normalize 與 splitter。
 
-與 `tests/test_rag_pdf_ingest.py` 的分工:那一份守 PDF 逐頁抽取（頁碼、旋轉頁正文、
+與 `tests/test_rag_ingest.py` 的分工:那一份守 PDF 逐頁抽取（頁碼、旋轉頁正文、
 「沒被 structured lane 收錄就是缺席」的列帳）;這一份守 structured lane 自己的契約。
 """
 from __future__ import annotations

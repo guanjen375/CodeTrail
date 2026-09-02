@@ -39,34 +39,39 @@ v1：`requirements.txt` 使用官方給未遷移專案的 `mcp>=1.28,<2`，因�
 transport、schema 與 OpenCode 相容性，不能只移除 `<2`。`doctor` 會把缺少
 MCP、低於 1.28 或 2.x 都列為 FAIL。
 
-`python3 scripts/run_tests.py` 無參數時會以標準庫把 test file 分成最多 8 個
-隔離 shard 並行執行，不需要 `pytest-xdist`，而且不會拆開同一個 test module。
-分片的檔案清單用 pytest 的預設收集規則遞迴掃 `tests/`（`test_*.py` 與 `*_test.py`，
-排除 norecursedirs 預設目錄），確保並行與序列收到完全相同的一組測試。
+`python3 scripts/run_tests.py` 無參數時先用真的 `pytest --collect-only` 收一次，再以標準庫把
+**test node**（不是檔案）分成最多 16 個隔離 shard 並行執行，不需要 `pytest-xdist`。
+收集交給 pytest 自己，所以並行與序列收到的永遠是同一組測試。小檔整檔留在同一個
+shard；比一個 shard 平均負載一半還重的檔才切開——以檔案為單位分片時，一個 8 秒的檔
+就是整包的牆鐘下限，而合併測試檔之後這種檔只會更多。
 資源較小或要重現序列順序時用 `AICODE_TEST_JOBS=1 python3 scripts/run_tests.py`。
 
 **`-m <expr>`（例如交付前的 `-m smoke`）走同一套分片**：它跟無參數一樣只是「選
-整個 `tests/` 的一個子集」，分片不改變任何一條測試的語意。此時
-「某個 shard 一條都沒選中」（pytest exit 5）算正常，但**全部** shard 都是 5 會
-回報 exit 5 並明講「這不是通過」——AGENTS.md §1.2 的 0 collected 規則。
-只要傳的是 `-k`、`-x`、node id、`--lf` 或其他組合，就維持原本的單一 pytest 行程與
-逐字轉發語意：`-x` 的 exitfirst、node id 的順序、`--lf` 依賴的共享 cache 在分片下
-都不再等價。
+整個 `tests/` 的一個子集」，分片不改變任何一條測試的語意。collect 階段一條都沒選中
+就直接回 exit 5 並明講「這不是通過」——AGENTS.md §1.2 的 0 collected 規則；不會啟動
+任何 shard。每個 shard 拿到的都是 collect 真的選中的 node，所以任何 shard 非 0（含 5）
+都算失敗。只要傳的是 `-k`、`-x`、node id、`--lf` 或其他組合，就維持原本的單一 pytest
+行程與逐字轉發語意：`-x` 的 exitfirst、node id 的順序、`--lf` 依賴的共享 cache 在分片
+下都不再等價。
 
-分片權重（`.pytest_cache/shard_weights*.json`）**每次選取各記一份**：`-m smoke`
-量到的秒數寫進 `shard_weights.smoke.json`，不會污染完整測試用的
-`shard_weights.json`。權重的更新條件是「這個 shard 的 pytest session 有跑完」
-（exit 0/1/5），不是「有沒有全綠」——紅燈期正是最常重跑的時候，把那幾輪的實測
-全丟掉等於一直用檔案大小在猜。沒跑完的 shard（exit 2/3/4、訊號終止）其 junit
-是殘缺的，那些檔會保留上一輪的值。每次並行執行結束會多印一行合計「選中幾條 /
-各 shard 內耗時總和」，給 §2.1 的 smoke 10 秒目標做趨勢觀察；**不設硬秒數閾值**，
-不同機器差好幾倍，拿秒數當 gate 只會製造假紅燈。
+**`--changed[=REF]` 只跑改動波及的測試檔**（可加 `-m smoke`）：改動 = git 工作樹的
+修改／staged／untracked，`--changed=main` 再加上 `main...HEAD` 的提交差異。對應規則：
+改到 repo 模組 → import 圖上（直接或間接）用到它的測試檔，加上文字上提到
+`<name>.py` 的測試檔（用 subprocess 跑 script 的測試不會 import）；改到 `aicode`、
+`set_config.sh`、plugin `.js` 等非 Python 檔 → 文字上提到檔名的測試檔；改到測試檔
+→ 它自己加 smoke gate。它是 **fail-closed** 的：任何一個改動對不到測試檔（或動到
+conftest／harness／pyproject／requirements／`tests/fixtures/`）就退回完整測試並講明
+原因。它是開發途中的加速，不取代交付前的 smoke 與審核者的 full。
 
-分片權重用「上一輪實測」而不是檔案大小：每個 shard 產一份 junit XML，全綠時
-把每檔耗時彙總寫進 `.pytest_cache/shard_weights.json`（已在 `.gitignore`），
-下一輪直接照它 largest-first 分。沒有這份檔（第一次跑／剛新增的測試檔）才退回
-「檔案大小 + `subprocess.` 密度」的啟發式。檔案大小是很差的耗時預測——同樣 30KB，
-一個可能是 40 條純函式斷言（0.03s），另一個是 17 條各 fork 一次 `aicode`（5.6s）。
+分片權重（`.pytest_cache/shard_weights*.json`）記的是**每條 node** 上一輪的實測秒數，
+**每次選取各記一份**：`-m smoke` 量到的寫進 `shard_weights.smoke.json`，不污染完整
+測試用的 `shard_weights.json`（`--changed` 沿用對應 marker 的那份；同一條 node 的耗時
+不因選檔而變）。沒有紀錄的 node（第一次跑／剛新增）用同檔已知 node 的中位數，整檔都
+沒紀錄才用預設值。權重的更新條件是「這個 shard 的 pytest session 有跑完」（exit 0/1/5），
+不是「有沒有全綠」——紅燈期正是最常重跑的時候。沒跑完的 shard（exit 2/3/4、訊號終止）
+其 junit 是殘缺的，那些 node 保留上一輪的值。每次並行執行結束會多印合計「選中幾條／
+各 shard 內耗時總和」與最慢的幾條（≥0.5s），給 §1.1 的 smoke 10 秒目標做趨勢觀察；
+**不設硬秒數閾值**，不同機器差好幾倍，拿秒數當 gate 只會製造假紅燈。
 
 核心日常入口是 OpenCode TUI；跨機 web 另有薄 launcher（兩者共用 `aicode` 安全前置）：
 
@@ -94,30 +99,35 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 
 ## 測試指南
 
-測試在 2026-08 已按 domain 合併；以下分組比逐檔複製歷史清單更不容易漂移：
+測試在 2026-09 依主題合併成 35 個檔（原本 95 個）；一個檔 = 一個被測主題，檔頭
+docstring 說明它涵蓋哪些原始檔與為什麼：
 
-- launcher / config：`test_aicode_*`、`test_web_server_scripts.py`、
-  `test_set_config_*`、`test_deployment_*`、`test_server_*`、`test_model_resolution.py`、
-  `test_opencode_checks.py`、`test_tool_call_canary.py`、`test_config.py`、`test_doctor.py`。
-- MCP / sandbox / mutation：`test_mcp_*`、`test_fs_sandbox.py`、`test_external_import.py`、
-  `test_patch_parser.py`、`test_patch_apply.py`、`test_patch_search_replace.py`、
-  `test_patch_byte_safety.py`、`test_patch_verify.py`、`test_run_command.py`、
-  `test_run_command_timeout.py`、`test_run_lint.py`、`test_endpoint_policy.py`、
-  `test_mcp_tool_contract.py`、`test_tool_result_budget.py`、`test_smoke_gate.py`。
-- Code-RAG / graph：`test_ast_parser_cpp.py`、`test_code_graph*.py`、
-  `test_code_rag_*.py`、`test_code_context.py`、`test_definition_metadata_propagation.py`、
-  `test_file_kind_policy.py`、`test_grep_output_budget.py`、`test_index_scope.py`、
-  `test_semantic_representation.py`、`test_repeat_guard.py`。
-- RAG / KB / media：`test_kb_store.py`、`test_kb_document_identity.py`、`test_rag_*.py`、
-  `test_embedding_fail_loud.py`、`test_extracted_document.py`、
-  `test_context_generation.py`、`test_contextual_signals.py`、
-  `test_media_read_pdf.py`、`test_vision_pipeline.py`。
-- inference / budgets / eval：`test_code_smoke_eval.py`、`test_retrieval_eval.py`、
-  `test_semantic_retrieval_eval.py`、`test_context_budget.py`、`test_trim.py`、
-  `test_gpu_safety.py`、`test_llama_sampling.py`、`test_ctx_*.py`、
-  `test_tool_routing_eval.py`。
-- repo infrastructure：`test_repo_consistency.py`、`test_test_runner.py`、
-  `test_script_help.py`、`test_data_flywheel.py`、`test_lessons.py`。
+- launcher / config：`test_aicode.py`（aicode wrapper、web、attach）、`test_set_config.py`
+  （set_config.sh 的問答、模型、artifacts、壓縮段）、`test_server_scripts.py`
+  （launch／stop／check_status、aicode_web）、`test_deployment.py`（deployment profile、
+  模型解析、GPU 與 ctx 安全、config）、`test_doctor.py`（doctor + tool-call canary）、
+  `test_opencode_checks.py`、`test_lessons.py`。
+- OpenCode 壓縮 / plugin：`test_compaction_mode.py`（ownership 狀態檔 + status 行）、
+  `test_opencode_plugins.py`（codetrail-compaction.js 與 codetrail-notify.js 的跨語言契約）。
+- MCP / sandbox / mutation：`test_mcp_server.py`（啟動、runtime policy、工具目錄、
+  JSON-RPC roundtrip、結果預算、external import）、`test_mcp_ingest.py`（ingest 子行程、
+  stream、通知）、`test_mcp_lease.py`、`test_fs_sandbox.py`（read／list／grep／read_pdf 的
+  sandbox 與預算）、`test_elf_analysis.py`、`test_run_command.py`（白名單、timeout、lint）、
+  `test_apply_patch.py`（udiff parser、apply、S/R、byte-safe）、`test_patch_verify.py`、
+  `test_endpoint_policy.py`。
+- Code-RAG / graph：`test_code_graph.py`（tree-sitter 解析、graph、C++ 可見性、metadata）、
+  `test_code_rag_index.py`（索引、dense cache、index scope、檔案種類）、
+  `test_code_rag_search.py`（檢索契約、CJK、code_context、repeat guard、semantic）。
+- RAG / KB / 圖面：`test_knowledge_store.py`（文件身分、kb_cache、embedding fail-loud、npz）、
+  `test_rag_ingest.py`（chunking、PDF ingest、extracted_document、context generation）、
+  `test_rag_retrieval.py`（reranker／MMR、檢索回歸、context signals）、
+  `test_figure_candidates.py`、`test_figure_ingest.py`、`test_figure_review.py`、
+  `test_figure_verify.py`、`test_figure_retrieval.py`（payload、檢索、review_figures 工具）、
+  `test_vision_pipeline.py`。
+- inference / budgets / eval：`test_context_budget.py`（context gate + trim）、
+  `test_evals.py`（code smoke／retrieval／semantic／tool routing／flywheel／session eval）。
+- repo infrastructure：`test_repo_consistency.py`（含 scripts `--help`）、
+  `test_test_runner.py`、`test_smoke_gate.py`。
 
 `tests/_harness.py` 與 `tests/_set_config_harness.py` 是共用 harness，不是 pytest test
 module。smoke 的安全組成由 `tests/test_smoke_gate.py` 靜態守住；不要以手動檔案清單取代。
@@ -156,14 +166,14 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
   `compaction_mode.EXPERIMENTAL_TAG` / `EXPERIMENTAL_NOTICE`,由 set_config 的問答與
   摘要頁、`scripts/compaction_status.py`(aicode 啟動橫幅)、`scripts/doctor.py` 與
   `docs/compaction-rules.md` / `README.md` 共用。要拿掉「實驗中」是一次全域決定,
-  不是改其中一處——`tests/test_compaction_status.py` 釘住問答與文件都還帶著它
+  不是改其中一處——`tests/test_compaction_mode.py` 釘住問答與文件都還帶著它
 - 改壓縮的七條摘要規則或門檻公式 → `docs/compaction-rules.md` 的兩個 ```text 區塊是
   **唯一來源**，`opencode_plugins/codetrail-compaction.js` 的 `RULES_TEXT` /
   `RECONCILIATION_HEADER` 逐字沿用它們，`compaction_mode.derive_settings` 與 plugin 的
   `deriveSettings()` 是同一條公式的兩份實作。三處任一改了另外兩處沒跟上，只會讓門檻與
-  保留額對不上——沒有任何錯誤訊息。`tests/test_opencode_compaction_plugin.py` 逐字比對
+  保留額對不上——沒有任何錯誤訊息。`tests/test_opencode_plugins.py` 逐字比對
 - 新增 incident kind / detail slug → `mcp_lease.py`、`opencode_plugins/codetrail-notify.js`、
-  `opencode_plugins/codetrail-compaction.js` 與 `tests/test_opencode_notify_plugin.py` 的
+  `opencode_plugins/codetrail-compaction.js` 與 `tests/test_opencode_plugins.py` 的
   凍結 tuple 必須一起改（跨語言封閉集合；一端沒跟上就把另一端寫的合法值正規化成
   `unknown`，那些事件在 doctor 的統計裡等於憑空消失）
 
@@ -287,7 +297,7 @@ python3 scripts/eval_tool_routing.py --root <SYNTHETIC_ROOT> \
 
 # 只有這兩條會連 8081。改了 corpus / parser 語意 / render schema,或 bump 了
 # RETRIEVAL_SCORER_VERSION 之後都要重錄(pipeline 不符時 eval gate 會 FAIL,
-# tests/test_semantic_retrieval_eval.py 也會紅)。
+# tests/test_evals.py 也會紅)。
 # LLAMA_BIN 一定要設 —— 沒設的話 artifact 的 llama_cpp.revision 會靜默記成
 # "unknown",那份 checked-in fixture 就失去可驗證的 build 出處。
 LLAMA_BIN=~/llama.cpp/build/bin/llama-server \
@@ -402,10 +412,9 @@ full rebuild；這是刻意的保守 invalidation，避免 linkage/declaration/i
 partial cone 與 fresh build 漂移。Python 仍走既有增量路徑；body-only edit 因 callable
 node-id catalog 沒變，不會只因同名 C call 就 fan-out。只有名稱、qualified identity 或
 overload identity 改變且牽動 C/C++ caller，才會在寫 DB 前切換成 full rebuild。相關
-pytest gate 是 `tests/test_ast_parser_cpp.py`、`tests/test_code_graph.py` 與
-`tests/test_code_graph_cpp_visibility.py`；reviewer 由收斂後的 full 統一涵蓋。developer 修 bug 時
-只依 AGENTS.md §1.3 單跑自己新增的 regression node 取得 red / green，不另跑這三個
-module。`python3 eval/run_code_smoke_eval.py` 也只在本次任務明示要檢查 code-inference
+pytest gate 是 `tests/test_code_graph.py`（tree-sitter 解析、graph、C++ 可見性都在這一個
+檔）；reviewer 由收斂後的 full 統一涵蓋。developer 修 bug 時只依 AGENTS.md §1.3 單跑自己
+新增的 regression node 取得 red / green，不另跑整個 module。`python3 eval/run_code_smoke_eval.py` 也只在本次任務明示要檢查 code-inference
 品質時執行。
 
 ---
@@ -426,7 +435,7 @@ module。`python3 eval/run_code_smoke_eval.py` 也只在本次任務明示要檢
 
 **儲存端是最上游的截斷**:`CODE_RAG_CONTEXT_STORE_MAX_CHARS` 比下游任何預算小的話,
 調大下游全部是 no-op(這是 2026-08-20 之前的真實狀況:context 在 index entry 就被截到
-500,所以「把 embed text 從 400 調大」完全沒有效果)。`tests/test_semantic_representation.py`
+500,所以「把 embed text 從 400 調大」完全沒有效果)。`tests/test_code_rag_search.py`
 靜態守住這條不變式。
 
 C 的 `/** ... */` 寫在定義行**之上**,而 context 從定義行往下取,結構上永遠拿不到 ——
@@ -541,7 +550,7 @@ journaled 寫入 → best-effort rollback。
   定位、結構化 mismatch record 與單一 renderer（整次回覆的 mismatch 預覽合計 40 行／2000 字元）、
   寫入層與 `WriteJournal`。POSIX 上以 dir_fd 錨定實作（逐層 `O_DIRECTORY|O_NOFOLLOW`、同目錄
   temp、既有檔 `os.replace`、新檔以不覆蓋既存檔的方式發布）；沒有 dir_fd 的平台退回逐層 lstat
-  重驗，並在結果第一段明示。已驗證的行為契約（`tests/test_patch_byte_safety.py`）：preflight 後
+  重驗，並在結果第一段明示。已驗證的行為契約（`tests/test_apply_patch.py`）：preflight 後
   preimage 被改 → 中止並回滾（`test_preimage_changed_after_preflight_aborts_and_rolls_back`）、
   新檔目標在 preflight 後被競爭者建立 → 中止且不覆蓋
   （`test_new_target_created_by_competitor_after_preflight_aborts`）、第一檔已寫入後被第三方修改
@@ -607,7 +616,7 @@ llama-server 啟動時 `-c <N>` 與 OpenCode `model.limit.context` 對齊。`scr
 **絕不寫入**: 完整 prompt、tool output、檔案內容、user question 文字。
 `trim.py` 回的 `TrimSummary.to_dict()` 也只是 count 與 action label。
 `tests/test_context_budget.py::test_log_writes_metadata_only_no_prompt` 與
-`tests/test_trim.py::test_trim_messages_emits_telemetry_metadata_only` 是
+`tests/test_context_budget.py::test_trim_messages_emits_telemetry_metadata_only` 是
 強制這條 invariant 的 fail-fast 測試。
 
 `*.jsonl` 已在 `.gitignore`;`.codetrail/` 目錄也另外列出。
@@ -723,7 +732,7 @@ grep 得到,只是不再吃掉語意檢索的名額。這條界線是刻意的:�
 > `decide_dir()` 的三態(`PRUNE` / `TRAVERSE_ONLY` / `INDEX`)只是剪枝優化,必須保守:
 > `PRUNE` 僅在「其下不可能存在任何能通過 `should_index_file` 的檔案」時才允許。
 
-`tests/test_index_scope.py::test_tri_state_walk_matches_should_index_file` 對合成樹全量
+`tests/test_code_rag_index.py::test_tri_state_walk_matches_should_index_file` 對合成樹全量
 枚舉逐檔求值當基準,再跑三態走訪比對 —— 任何 `PRUNE` 吃掉應索引檔案就立刻紅。改剪枝
 邏輯時先看那條測試。
 
@@ -793,7 +802,7 @@ root 內)→ 不是實際載入的 index-scope.json → 是 regular file。
 - Glob 方言:gitwildmatch 子集,in-repo 實作(不引入 `pathspec` 依賴),比對「相對 root
   的 POSIX 路徑」、case-sensitive、`**` globstar、前導 `/` 錨定 root。**目錄比對補尾斜線
   再比** —— 所以 `vendor_env/**` 不匹配 `"vendor_env"` 但匹配 `"vendor_env/"`。
-  向量鎖在 `tests/test_index_scope.py::test_matcher_vectors`。
+  向量鎖在 `tests/test_code_rag_index.py::test_matcher_vectors`。
 
 ### 快取遷移
 
@@ -978,8 +987,7 @@ root 只能來自 `--root` 或 `AICODE_ROOT`,都沒有就報錯不猜 cwd;驗證
 
 - `eval/`
 - `scripts/check_eval_consistency.py`
-- `tests/test_repo_consistency.py`
-- `tests/test_script_help.py` 裡 `eval/run_eval.py --help` 的 smoke test
+- `tests/test_repo_consistency.py`（含 `eval/run_eval.py --help` 的 smoke test）
 - `README.md`、`README_DEV.md` 裡的 eval 說明
 
 若刪 data flywheel，至少同步處理：

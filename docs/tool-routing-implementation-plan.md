@@ -18,7 +18,7 @@
    全部保留，不放寬。
 3. `tests/test_repo_consistency.py` 的既有安全 assertion 不修改、不刪除、不改弱；
    不用 skip、xfail 或容忍值放寬過關。
-4. `tests/test_code_rag_search_contract.py` 的 core payload shape 與 `CONTEXT_KEYS` 不變。
+4. `tests/test_code_rag_search.py` 的 core payload shape 與 `CONTEXT_KEYS` 不變。
 5. CI、smoke 與 full 不依賴 OpenCode、llama-server、GPU、網路或 NDA 資料。
 6. eval fixture 只含合成資料；持久結果不得含 prompt、root/path、tool args、tool output、
    session id 或其他可能辨識專案的內容。
@@ -199,7 +199,7 @@ Ownership：
 - `scripts/eval_tool_routing.py`（新增）
 - `eval/fixtures/tool_routing/cases.json`（新增）
 - `eval/fixtures/tool_routing/support_matrix.json`（新增）
-- `tests/test_tool_routing_eval.py`（新增；純合成 classifier/privacy contract）
+- `tests/test_evals.py`（新增；純合成 classifier/privacy contract）
 
 驗收：
 
@@ -225,10 +225,10 @@ Ownership：
 - `mcp_server.py`
 - `docs/mcp-tools.md`
 - `scripts/check_readme_consistency.py`
-- `tests/test_mcp_tool_contract.py`（新增）
-- `tests/test_tool_result_budget.py`（新增）
-- 經明示核准後：`tests/test_mcp_figure_tools.py`、
-  `tests/test_mcp_protocol_roundtrip.py`
+- `tests/test_mcp_server.py`（新增）
+- `tests/test_mcp_server.py`（新增）
+- 經明示核准後：`tests/test_figure_retrieval.py`、
+  `tests/test_mcp_server.py`
 
 驗收：
 
@@ -252,7 +252,7 @@ Ownership：
 - `scripts/opencode_build_prompt.py`（新增）
 - `scripts/set_config.py`
 - `scripts/opencode_contract_check.py`
-- `tests/test_set_config_artifacts.py`
+- `tests/test_set_config.py`
 - `tests/test_opencode_checks.py`
 
 驗收：
@@ -273,9 +273,9 @@ Ownership：
 - `scripts/tool_call_canary.py`
 - `scripts/doctor.py`
 - `aicode`
-- `tests/test_tool_call_canary.py`
 - `tests/test_doctor.py`
-- `tests/test_aicode_wrapper.py`
+- `tests/test_doctor.py`
+- `tests/test_aicode.py`
 
 驗收：
 
@@ -285,7 +285,7 @@ Ownership：
    optimal/suboptimal/fail/timeout，未知資料不拿別列冒充。
 3. cache 與 fingerprint 符合前述 privacy／identity contract。
 4. `supports_tools=false` 不執行 model attempt；缺欄位才繼續探針。
-5. `tests/test_tool_call_canary.py::test_explicit_gate_and_implicit_diagnostic_are_separate`
+5. `tests/test_doctor.py::test_explicit_gate_and_implicit_diagnostic_are_separate`
    標 smoke。
 
 ### T5 — 文件與 acceptance integration
@@ -330,22 +330,22 @@ Ownership：
 
 ### A. workflow 已列的 10 個既有 test node
 
-- `tests/test_mcp_figure_tools.py::test_query_knowledge_carries_excluded_figures`
-- `tests/test_mcp_figure_tools.py::test_query_knowledge_not_loaded_still_has_the_key`
-- `tests/test_mcp_figure_tools.py::test_strict_return_paths_all_carry_excluded_figures`
-- `tests/test_mcp_figure_tools.py::test_legacy_raster_exclusion_is_not_sent_to_review_figures`
-- `tests/test_mcp_figure_tools.py::test_structured_and_legacy_exclusions_are_reported_separately`
-- `tests/test_mcp_figure_tools.py::test_strict_kb_not_loaded_still_has_the_key`
-- `tests/test_tool_call_canary.py::test_cache_contains_only_fingerprint_metadata_and_is_private`
-- `tests/test_tool_call_canary.py::test_successful_model_canary_is_cached_and_skips_second_call`
-- `tests/test_tool_call_canary.py::test_retry_success_is_reported_flaky_and_not_cached`
-- `tests/test_tool_call_canary.py::test_two_model_failures_block_by_default_and_warn_only_can_continue`
+- `tests/test_figure_retrieval.py::test_query_knowledge_carries_excluded_figures`
+- `tests/test_figure_retrieval.py::test_query_knowledge_not_loaded_still_has_the_key`
+- `tests/test_figure_retrieval.py::test_strict_return_paths_all_carry_excluded_figures`
+- `tests/test_figure_retrieval.py::test_legacy_raster_exclusion_is_not_sent_to_review_figures`
+- `tests/test_figure_retrieval.py::test_structured_and_legacy_exclusions_are_reported_separately`
+- `tests/test_figure_retrieval.py::test_strict_kb_not_loaded_still_has_the_key`
+- `tests/test_doctor.py::test_cache_contains_only_fingerprint_metadata_and_is_private`
+- `tests/test_doctor.py::test_successful_model_canary_is_cached_and_skips_second_call`
+- `tests/test_doctor.py::test_retry_success_is_reported_flaky_and_not_cached`
+- `tests/test_doctor.py::test_two_model_failures_block_by_default_and_warn_only_can_continue`
 
 核准後仍只能把原 assertion 移到 core payload／新 lane 契約，維持同等或更強；不得刪弱。
 
 ### B. 盤點新增發現的第 11 個既有 test node
 
-- `tests/test_mcp_protocol_roundtrip.py::test_mcp_protocol_roundtrip`
+- `tests/test_mcp_server.py::test_mcp_protocol_roundtrip`
 
 理由：它目前鎖死 public `code_rag_search.max_chars` 為 integer、default `12000`、min 2000、
 max 30000。FastMCP 1.28 會把預設值補入 kwargs；要真正分辨「省略」並套 n_ctx 12%，

@@ -5,7 +5,7 @@
 這個檔守的是**無聲失敗**（AGENTS.md §1.4 第二類）：
 
 - 沒有結構性證據卻宣稱有表 / 有 log（會讓一張根本不是表的圖被硬套 table schema，
-  既有 `tests/test_rag_pdf_ingest.py::test_real_pymupdf4llm_contract` 會紅）
+  既有 `tests/test_rag_ingest.py::test_real_pymupdf4llm_contract` 會紅）
 - `pos` / bbox 被靜默改值（`int(1.9)`、`int("3")`）→ 切到錯的原文
 - 文件身分建不起來時捏一個假 ID → 同名不同路徑的 PDF 互相套用 human verification
 - metadata 頁碼與實體頁對不上 → A 頁的 evidence 配到 B 頁的像素
@@ -316,7 +316,7 @@ def test_mutable_dataclass_defaults_are_per_instance():
 def test_fake_document_yields_no_structural_candidates(tmp_path: Path):
     """`types.SimpleNamespace(page_count=..., close=...)`：什麼 API 都沒有。
 
-    這正是 `tests/test_rag_pdf_ingest.py` 的既有 stub。所有結構性 channel 都不可用的頁
+    這正是 `tests/test_rag_ingest.py` 的既有 stub。所有結構性 channel 都不可用的頁
     **不得**產生任何候選——沒有證據就不宣稱，那一頁的區域改由缺席帳列出。
     連 `class=table` + 合法 `pos` 都不夠：頁物件拿不到就沒有任何東西能佐證那個框。
     """
@@ -2300,7 +2300,7 @@ def test_cropbox_words_table_and_render_bbox_are_cropbox_relative(tmp_path: Path
 
 
 def test_legacy_contract_pdf_promotes_pictures_as_raster_only(tmp_path: Path):
-    """完整重建 `tests/test_rag_pdf_ingest.py::test_real_pymupdf4llm_contract` 的 PDF。
+    """完整重建 `tests/test_rag_ingest.py::test_real_pymupdf4llm_contract` 的 PDF。
 
     79ef673 起這些純圖片頁**會**產生候選，但只能是 `KIND_RASTER`：先用 image-bound
     schema 分類，再走同一套 canonical payload / strict gate。這條守兩件事：
