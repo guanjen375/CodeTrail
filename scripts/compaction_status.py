@@ -15,13 +15,15 @@ OpenCode **啟動時** 生效,選擇又記在 `~/.config/codetrail/compaction.js
 
 顯示的模式與 runtime 實際生效的模式必須是同一個來源:這裡讀的是
 `compaction_mode.inspect_state()`(plugin、contract check、doctor 讀的也是它),
-不是另外猜一份。有效設定與模式對不上時 plugin 會停用自動壓縮,所以那種情況
-這裡也要講——只印「壓縮模式=codetrail」而實際上已經停用,比不印還糟。
+不是另外猜一份。plugin 會停用的每一種情況——有效設定與模式對不上、狀態檔綁在
+另一份 opencode.json、OpenCode 版本低於壓縮語意的下限——這裡都要講,而且後面
+那幾行也要跟著改口:只印「壓縮模式=codetrail」而實際上什麼都沒做,比不印還糟。
 """
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -31,14 +33,46 @@ if str(REPO_ROOT) not in sys.path:
 
 #: 與 opencode_plugins/codetrail-compaction.js 的 `KEEP_REASONING_ENV` 逐字相同。
 KEEP_REASONING_ENV = "CODETRAIL_KEEP_REASONING"
+#: 同上,plugin 的 `OPENCODE_VERSION_ENV`。`aicode` 的 preflight 量到之後遞下來,
+#: 沒有這個變數 = 不是 aicode 起的 session,plugin 那端也不做版本判斷。
+OPENCODE_VERSION_ENV = "AICODE_OPENCODE_VERSION"
+#: plugin `parseVersion()` 的 Python 對應 —— 認得的形狀要一模一樣,否則兩邊會
+#: 對同一個字串給出不同的支援與否。
+_VERSION_RE = re.compile(r"^\s*v?(\d+)\.(\d+)\.(\d+)\s*$")
 
 SWITCH_HINT = (
     "行為仍在調整;要回 OpenCode 原生行為:./set_config.sh --compaction-mode native"
 )
 
 
-def _config_lines(cm, state: dict, env: dict) -> list[str]:
-    """有效設定那一半:漂移警告 + 目前的觸發門檻。
+def _version_lines(cm, env: dict) -> tuple[bool | None, list[str]]:
+    """OpenCode 版本支不支援這一版的壓縮語意 —— 回 (支援?, 要顯示的行)。
+
+    `None` = 不知道(沒有經過 `aicode` preflight,plugin 那端同樣不判斷)。
+    量得到而且太舊時 plugin **整個**停用(壓縮與歷史 reasoning 兩邊都不做),
+    所以這裡非講不可:不講的話畫面只寫「模式=codetrail」,而 runtime 什麼
+    都沒做。
+    """
+    raw = str(env.get(OPENCODE_VERSION_ENV) or "").strip()
+    match = _VERSION_RE.match(raw)
+    if match is None:
+        return None, []
+    minimum = tuple(cm.MIN_COMPACTION_OPENCODE_VERSION)
+    if tuple(int(part) for part in match.groups()) >= minimum:
+        return True, []
+    return False, [
+        f"⚠ OpenCode {raw} 低於 {'.'.join(map(str, minimum))},壓縮 plugin 會整個"
+        "停用(那之前的訊息序列化語意不同);升級 OpenCode,"
+        "或 ./set_config.sh --compaction-mode native"
+    ]
+
+
+def _config_lines(cm, state: dict, env: dict) -> tuple[bool | None, list[str]]:
+    """有效設定那一半:身分/漂移警告 + 目前的觸發門檻。
+
+    回 (狀態檔是不是綁在目前有效的那份 config, 要顯示的行);`None` = 讀不到
+    設定,無從得知。身分對不上時 plugin 直接當成「沒有接管」,所以那個結果
+    要回給呼叫端 —— 其他行也不能再照著「已接管」的口徑寫。
 
     門檻要印出來的理由:短對話永遠不會壓縮(這是對的),但畫面上只寫「模式=
     codetrail」的話,使用者無從分辨「還沒到門檻」與「plugin 根本沒載入」。
@@ -50,10 +84,11 @@ def _config_lines(cm, state: dict, env: dict) -> list[str]:
 
         path, config, error = model_resolution.load_first_opencode_config(env)
         if error or path is None or not isinstance(config, dict):
-            return []
+            return None, []
         if not cm.state_matches_config(state, path):
-            return [
+            return False, [
                 f"⚠ 狀態檔記錄的是另一份 opencode.json(目前有效的是 {path});"
+                "壓縮 plugin 會當成沒有接管而完全不動作,"
                 "對這一份重跑 ./set_config.sh 才會對得起來"
             ]
         lines = []
@@ -65,7 +100,7 @@ def _config_lines(cm, state: dict, env: dict) -> list[str]:
         try:
             derived = cm.derive_for_config(config)
         except cm.CompactionModeError as exc:
-            return [*lines, f"⚠ 門檻算不出來:{exc}"]
+            return True, [*lines, f"⚠ 門檻算不出來:{exc}"]
         if derived is not None:
             settings = derived[0]
             lines.append(
@@ -73,22 +108,33 @@ def _config_lines(cm, state: dict, env: dict) -> list[str]:
                 f"tail 保留={settings.preserve_recent_tokens} tokens"
                 "(對話還沒到門檻就不會壓縮,那是正常的)"
             )
-        return lines
+        return True, lines
     except Exception:  # noqa: BLE001 — 一行資訊不得因為任何讀取問題而中斷
-        return []
+        return None, []
 
 
-def _reasoning_line(env: dict) -> list[str]:
+def _reasoning_line(env: dict, active: bool | None) -> list[str]:
     """舊回合的 reasoning 有沒有被丟掉——那是最大的一筆 context 差異。
 
     為什麼要印:plugin 會把「最新一則使用者訊息之前」的 assistant reasoning
     從送進模型的訊息裡拿掉(每段對話省下三到五成的成長)。這偏離 DeepSeek-V4
     官方模板「有 tools 就全留」的行為,是模型相依的品質取捨——使用者至少要
     知道自己在哪一邊,以及關掉它的那個變數叫什麼。
+
+    `active` 是「transform 這個 hook 真的會跑嗎」。它有三道閘,這裡三道都要
+    看齊:逃生口(下面那個環境變數)、版本、以及有效的模式狀態。只看逃生口
+    的話,版本太舊或狀態檔綁在另一份 config 時畫面照樣寫「不進模型」,而
+    整段歷史 reasoning 其實原封不動地送進去——使用者以為 context 已經縮了,
+    真的撞到上限時還會照著這一行去找錯方向。漂移(`effective_drift`)刻意
+    不算:那停的是自動壓縮,transform 本來就不看它。
     """
     raw = str(env.get(KEEP_REASONING_ENV) or "").strip().lower()
     if raw in ("1", "true", "yes", "on"):
         return [f"舊回合 reasoning=保留({KEEP_REASONING_ENV} 已設定)"]
+    if active is False:
+        return ["舊回合 reasoning=照送(壓縮 plugin 未生效,見上面的 ⚠)"]
+    if active is None:
+        return ["舊回合 reasoning=未知(讀不到有效設定,無法確認 plugin 會不會生效)"]
     return [
         "舊回合 reasoning=不進模型(省 context;"
         f"要保留就設 {KEEP_REASONING_ENV}=1)"
@@ -141,8 +187,19 @@ def status_lines(env: dict | None = None) -> list[str]:
         return [f"壓縮模式={mode}({label})"]
 
     lines = [f"壓縮模式={mode} {cm.EXPERIMENTAL_TAG}——{label}"]
-    lines.extend(_config_lines(cm, state, values))
-    lines.extend(_reasoning_line(values))
+    version_ok, version_lines = _version_lines(cm, values)
+    identity_ok, config_lines = _config_lines(cm, state, values)
+    lines.extend(version_lines)
+    lines.extend(config_lines)
+    # plugin 的每一個 hook 都先過「版本 + 有效的模式狀態」這兩道;其中任何
+    # 一道擋下來,runtime 就什麼都不做,後面的行不得再照「已接管」的口徑寫。
+    if version_ok is False or identity_ok is False:
+        active: bool | None = False
+    elif identity_ok is True:
+        active = True
+    else:
+        active = None
+    lines.extend(_reasoning_line(values, active))
     lines.extend(_pending_managed_lines(cm, state))
     if mode == cm.MODE_MANUAL:
         # manual 靠使用者自己按 /compact,而那是完整 TUI 才有的指令:--mini 會把

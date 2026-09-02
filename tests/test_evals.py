@@ -1709,6 +1709,60 @@ def test_keep_compaction_accepts_a_bigger_compaction_agent_model():
 
 
 @pytest.mark.smoke
+def test_keep_compaction_accepts_a_config_written_before_prune_became_managed(
+    tmp_path: Path,
+):
+    """`--keep-compaction` 的三層檢查必須講同一套話。
+
+    前兩層(`_evaluation_config` / `_write_replay_compaction_state`)只要求
+    契約鍵,理由寫在那裡:`prune` 之後才變成受管鍵,舊安裝的設定照樣壓縮得
+    好好的。可是 replay 必經的 `_require_compaction_runtime` 拿的是完整的
+    `derived.config_values`(裡面有 `prune=True`)去逐鍵比對,於是同一份設定
+    前兩層放行、第三層在 replay 開始前就 SessionEvalError ——「相容舊設定」
+    等於沒做,而使用者自己把 `prune` 關掉也一樣開不起來。
+
+    runtime 那端的判準才是對的參考:plugin 只為 `CONTRACT_COMPACTION_KEYS`
+    停用自動壓縮(見 compaction_mode.effective_drift),`prune` 不符不會讓
+    這個 eval 量到「沒有壓縮」。
+    """
+    import compaction_mode
+
+    derived = compaction_mode.derive_settings(context_limit=131072, output_limit=8192)
+    base = {
+        "provider": {"llamacpp": {"models": {
+            "candidate": {"limit": {"context": 131072, "output": 8192}},
+        }}},
+        "plugin": [],
+    }
+    absent = {
+        key: value for key, value in derived.config_values.items() if key != "prune"
+    }
+    disabled = {**derived.config_values, "prune": False}
+    for name, section in (("舊安裝沒有 prune", absent), ("使用者關掉 prune", disabled)):
+        config = json.loads(json.dumps(base))
+        config["compaction"] = dict(section)
+        kept = session_eval_cli._evaluation_config(
+            config, "llamacpp/candidate", keep_compaction=True
+        )
+        assert kept["compaction"] == section, name
+        state_dir = tmp_path / name.replace(" ", "_")
+        state_dir.mkdir()
+        config_path = state_dir / "opencode-eval.json"
+        config_path.write_text("{}", encoding="utf-8")
+        session_eval_cli._write_replay_compaction_state(state_dir, kept, config_path)
+        # replay 的必經之路 —— 前兩層放行的設定不得在這裡被擋下來
+        session_eval_cli._require_compaction_runtime(kept, "llamacpp/candidate", "1.18.21")
+
+    # 契約鍵仍然要擋:那幾個不符,plugin 第一次 idle 就停用自動壓縮。
+    broken = json.loads(json.dumps(base))
+    broken["compaction"] = {**derived.config_values, "tail_turns": 9}
+    with pytest.raises(session_eval.SessionEvalError, match="different model"):
+        session_eval_cli._require_compaction_runtime(
+            broken, "llamacpp/candidate", "1.18.21"
+        )
+
+
+@pytest.mark.smoke
 def test_compaction_identity_resolves_a_file_prompt(tmp_path: Path):
     """同一個路徑下的 prompt 內容被換掉,fingerprint 必須跟著變。"""
     prompt = tmp_path / "prompt.md"

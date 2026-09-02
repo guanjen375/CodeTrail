@@ -185,6 +185,11 @@ def test_mode_constants_match_the_python_module():
     assert set(cm.CONTRACT_COMPACTION_KEYS) < set(cm.MANAGED_COMPACTION_KEYS)
     assert _compaction_js_literal("PRUNE_OLD_TOOL_OUTPUT") is cm.PRUNE_OLD_TOOL_OUTPUT
     assert _compaction_js_literal("KEEP_REASONING_ENV") == compaction_status.KEEP_REASONING_ENV
+    # `aicode` 橫幅要跟 transform 的版本閘看齊,兩邊得讀同一個變數名。
+    assert (
+        _compaction_js_literal("OPENCODE_VERSION_ENV")
+        == compaction_status.OPENCODE_VERSION_ENV
+    )
     assert _compaction_js_literal("MODE_STATE_FILE") == cm.STATE_FILENAME
     assert tuple(_compaction_js_literal("CONFIG_DIR_PARTS")) == cm.STATE_DIR_PARTS
     assert _compaction_js_literal("TOOL_RESULT_CONTEXT_FRACTION") == cm.TOOL_RESULT_CONTEXT_FRACTION
@@ -852,7 +857,8 @@ def _effective_config_path(home: Path) -> Path:
     return home / ".config" / "opencode" / "opencode.json"
 
 
-def _install_state(home: Path, mode: str, *, config_path: Path | None = None):
+def _install_state(home: Path, mode: str, *, config_path: Path | None = None,
+                   plugin_path: Path | None = None):
     """在 tmp HOME 裡放一份合法的模式狀態檔(digest 由 Python 端算)。"""
     target = config_path or _effective_config_path(home)
     config: dict = {}
@@ -863,6 +869,7 @@ def _install_state(home: Path, mode: str, *, config_path: Path | None = None):
     )
     _, _, errors, state = cm.apply_mode(
         config, mode=mode, derived=derived, prior_state=None, config_path=target,
+        plugin_path=plugin_path,
     )
     assert errors == []
     assert state is not None
@@ -2263,6 +2270,59 @@ def test_an_unsupported_opencode_version_turns_the_transform_off(tmp_path):
     assert _types(result) == [
         ["text"], ["text", "reasoning"], ["text"], ["text", "reasoning", "tool"],
     ]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "name,extra_env,bind_elsewhere,stripped",
+    [
+        ("supported", {"AICODE_OPENCODE_VERSION": "1.18.21"}, False, True),
+        ("old-version", {"AICODE_OPENCODE_VERSION": "1.18.16"}, False, False),
+        ("other-config", {}, True, False),
+    ],
+)
+def test_the_status_line_says_what_the_transform_will_actually_do(
+    tmp_path, name, extra_env, bind_elsewhere, stripped
+):
+    """`aicode` 橫幅那一行不得宣稱 runtime 不會做的事。
+
+    transform 有三道閘,`compaction_status` 原本只看其中一道
+    (`CODETRAIL_KEEP_REASONING`)。版本低於下限、或狀態檔綁在另一份
+    opencode.json 時,plugin 直接跳過 transform,而橫幅照樣印
+    「舊回合 reasoning=不進模型」—— 使用者以為 context 已經縮了,實際整段
+    歷史 reasoning 照送,長對話撞 context 上限時還會照著這行找錯方向。
+
+    所以這條用**同一組環境**同時驗兩端:JS 那邊 reasoning 有沒有被拿掉,
+    Python 這邊那一行有沒有跟著改口。
+    """
+    base = tmp_path / name
+    base.mkdir(parents=True, exist_ok=True)
+    home = base / "home"
+    home.mkdir(exist_ok=True)
+    elsewhere = home / ".config" / "opencode" / "another.json" if bind_elsewhere else None
+    config = _install_state(
+        home, cm.MODE_CODETRAIL, config_path=elsewhere, plugin_path=cm.PLUGIN_PATH
+    )
+    live = _effective_config_path(home)
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.write_text(json.dumps(config), encoding="utf-8")
+
+    result = _js(base, _TRANSFORM_DRIVER,
+                 {"messages": json.loads(json.dumps(_TWO_TURNS))},
+                 home=home, extra_env=extra_env)
+    kept = ["text", "reasoning"] if not stripped else ["text"]
+    assert _types(result) == [
+        ["text"], kept, ["text"], ["text", "reasoning", "tool"],
+    ], name
+
+    env = {"HOME": str(home), "USERPROFILE": str(home), **extra_env}
+    lines = compaction_status.status_lines(env)
+    joined = "\n".join(lines)
+    assert ("不進模型" in joined) is stripped, (name, lines)
+    if not stripped:
+        # 只是不說謊還不夠:使用者要知道是哪一道閘擋住的,不然「reasoning 沒省到」
+        # 就是一個查不出原因的現象。
+        assert any(line.startswith("⚠") for line in lines), (name, lines)
 
 
 @pytest.mark.smoke

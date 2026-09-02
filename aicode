@@ -634,6 +634,11 @@ fi
 launch_delay="${AICODE_LAUNCH_DELAY:-3}"
 case "$launch_delay" in
   ''|*[!0-9]*) launch_delay=3 ;;
+  # 全是數字還不夠:bash 算術把前導零當八進位。`08` 通得過下面的 -gt
+  # (test 用的是另一個 parser),再減一就以 "value too great for base" 失敗 ——
+  # 而這支腳本是 set -e,於是 wrapper 在 exec opencode 之前就結束;`010` 不會
+  # 爆,但安靜地倒數 8 秒。10# 強制十進位。
+  *) launch_delay=$((10#$launch_delay)) ;;
 esac
 if [ -t 1 ] && [ "$launch_delay" -gt 0 ]; then
   while [ "$launch_delay" -gt 0 ]; do

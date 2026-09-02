@@ -1911,21 +1911,47 @@ class ToolExecutor:
             env={**os.environ, "LC_ALL": "C"},
         )
 
-    @staticmethod
-    def _git_not_a_repo(result: subprocess.CompletedProcess) -> bool:
-        # git status:exit 128 + "fatal: not a git repository";
-        # git diff:exit 129 + "warning: Not a git repository. Use --no-index ..." + usage。
-        return result.returncode != 0 and "not a git repository" in result.stderr.lower()
+    # git 對兩件不同的事說同一句 "not a git repository":
+    #   * **discovery 失敗**(真的不在倉庫裡)——訊息一定帶括號:
+    #     "(or any of the parent directories): .git" 或
+    #     "(or any parent up to mount point /)"。
+    #   * **git 環境/metadata 壞了**——"not a git repository: '<path>'",
+    #     `GIT_DIR` 指到不存在的路徑、`.git` 檔指向壞掉的 gitdir 都是這一種。
+    #     那個專案其實在版控裡,只是 git 用不了。
+    # 後者被當成前者的話,模型會拿到「不需要 git 檢查,直接 apply_patch」的
+    # **成功**通知:改檔前的 git 檢查被跳過,現場既有的修改完全不會被看到。
+    _GIT_DISCOVERY_FAILURE = "not a git repository (or any "
+
+    def _git_failure_message(self, result: subprocess.CompletedProcess, label: str) -> str:
+        """把失敗的 git 命令翻成使用者訊息:跳過通知 vs 錯誤。
+
+        不能只看失敗那條命令自己的 stderr —— `git diff` 對兩種情況印的是
+        **一模一樣**的 "warning: Not a git repository. Use --no-index ..."。
+        所以失敗時另外問一次 `git rev-parse`:它的訊息才分得出來,而且只在
+        失敗路徑上多跑一次。
+        """
+        try:
+            probe = self._run_git(['rev-parse', '--is-inside-work-tree'], timeout=10)
+        except Exception:  # noqa: BLE001 — 探測失敗就退回原本那條命令的錯誤
+            probe = None
+        if probe is not None and probe.returncode != 0:
+            if self._GIT_DISCOVERY_FAILURE in probe.stderr.lower():
+                return self.GIT_NOT_A_REPO_NOTICE
+            broken = probe.stderr.strip() or f"git rev-parse 失敗(exit {probe.returncode})"
+            return (
+                f"錯誤: git 環境異常(不是「沒有 git 倉庫」):{broken}。"
+                "檢查 GIT_DIR / GIT_WORK_TREE 或損壞的 .git"
+            )
+        detail = result.stderr.strip()
+        return f"錯誤: {detail or f'{label} 失敗(exit {result.returncode})'}"
 
     def git_status(self) -> str:
         """顯示 git 工作目錄狀態;非 git 專案回固定跳過通知(不是錯誤)"""
         try:
             result = self._run_git(['status', '--porcelain', '-uall'], timeout=10)
 
-            if self._git_not_a_repo(result):
-                return self.GIT_NOT_A_REPO_NOTICE
             if result.returncode != 0:
-                return f"錯誤: {result.stderr.strip() or f'git status 失敗(exit {result.returncode})'}"
+                return self._git_failure_message(result, "git status")
 
             output = result.stdout.strip()
             if not output:
@@ -1976,10 +2002,8 @@ class ToolExecutor:
 
             result = self._run_git(cmd[1:], timeout=30)
 
-            if self._git_not_a_repo(result):
-                return self.GIT_NOT_A_REPO_NOTICE
             if result.returncode != 0:
-                return f"錯誤: {result.stderr.strip() or f'git diff 失敗(exit {result.returncode})'}"
+                return self._git_failure_message(result, "git diff")
 
             output = result.stdout.strip()
             if not output:

@@ -396,15 +396,28 @@ def _require_compaction_runtime(
             raise session_eval.SessionEvalError(
                 f"--keep-compaction cannot derive a compaction threshold for {label}: {exc}"
             ) from exc
+    # Only the contract keys.  This preflight exists to predict whether the
+    # plugin will disable itself at the first idle, and that decision is made
+    # over ``CONTRACT_COMPACTION_KEYS`` alone (compaction_mode.effective_drift,
+    # and the JS side does the same).  Comparing the full ``config_values``
+    # would also demand ``prune``, which ``_evaluation_config`` deliberately
+    # accepts as absent -- a config written before ``prune`` became managed
+    # compacts correctly, and so does one where the user turned it off.  Two
+    # layers giving opposite answers about the same config is the bug: the
+    # replay never starts, and the "works with older settings" promise is void.
+    expected_values = {
+        key: derived.config_values[key]
+        for key in compaction_mode.CONTRACT_COMPACTION_KEYS
+    }
     mismatched = [
-        key for key, expected in derived.config_values.items()
+        key for key, expected in expected_values.items()
         if not isinstance(section, Mapping)
         or not compaction_mode.json_equal(section.get(key), expected)
     ]
     if mismatched:
         raise session_eval.SessionEvalError(
             "--keep-compaction: the managed compaction values were derived for a "
-            f"different model; {label} needs {derived.config_values} but the config "
+            f"different model; {label} needs {expected_values} but the config "
             f"has {dict(section) if isinstance(section, Mapping) else None} "
             f"(mismatched: {', '.join(mismatched)})"
         )

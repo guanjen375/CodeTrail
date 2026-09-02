@@ -841,6 +841,48 @@ def test_git_tools_outside_a_repo_return_a_skip_notice_not_a_retryable_error(tmp
     assert "non-git" in MCP_INSTRUCTIONS
 
 
+@pytest.mark.smoke
+@pytest.mark.parametrize("broken", ["git-dir", "gitfile"])
+def test_a_broken_git_environment_is_not_reported_as_a_missing_repo(
+    tmp_path: Path, monkeypatch, broken: str
+):
+    """git 對兩件不同的事說同一句 "not a git repository"。
+
+    真的不在倉庫裡是 **discovery** 失敗(`(or any of the parent directories)` /
+    `(or any parent up to mount point ...)`);而 `GIT_DIR` 指到不存在的路徑、
+    或 `.git` 檔指向壞掉的 gitdir 時是 `not a git repository: '<path>'` ——
+    那個專案其實在版控裡,只是 git 用不了。
+
+    只比 stderr 子字串的話,後者會拿到「不需要 git 檢查,直接 apply_patch;
+    不要重試」的**成功**通知:模型於是跳過改檔前的 git 檢查,現場既有的修改
+    完全不會被看到,而畫面上沒有任何異常。
+
+    `git diff` 更沒得比對:兩種情況都印一模一樣的
+    `warning: Not a git repository. Use --no-index ...`,所以判斷不能只看
+    失敗那條命令自己的訊息。
+    """
+    from agent_tools import ToolExecutor
+
+    if shutil.which("git") is None:
+        pytest.skip("環境沒有 git")
+    root = tmp_path / "proj"
+    root.mkdir()
+    if broken == "git-dir":
+        assert subprocess.run(
+            ["git", "-C", str(root), "init", "-q"], capture_output=True
+        ).returncode == 0
+        monkeypatch.setenv("GIT_DIR", str(tmp_path / "gone" / "definitely-not-here"))
+    else:
+        # worktree metadata 壞掉:`.git` 檔指向一個不存在的 gitdir
+        (root / ".git").write_text(f"gitdir: {tmp_path / 'gone'}\n", encoding="utf-8")
+
+    executor = ToolExecutor(str(root))
+    for name in ("git_status", "git_diff"):
+        body = getattr(executor, name)()
+        assert "不需要 git 檢查" not in body, (broken, name, body)
+        assert body.startswith("錯誤"), (broken, name, body)
+
+
 def test_budgeted_evidence_keeps_metadata_before_bulk_text():
     budget = ResultBudget(220, 660, explicit=False, context_risk=False)
     code_payload = [{

@@ -254,6 +254,33 @@ def test_direct_contract_gate_precedes_launcher_writers_and_canaries():
     assert source.index('SUBCMD="web"') < gate
 
 
+
+@pytest.mark.parametrize("value,expected", [
+    ("08", 8), ("010", 10), ("007", 7), ("3", 3), ("0", 0), ("x", 3), ("", 3),
+])
+def test_launch_delay_is_read_as_base_ten(value, expected):
+    """倒數秒數帶前導零時,bash 會把它當八進位。
+
+    `AICODE_LAUNCH_DELAY=08` 通得過 `[ "$x" -gt 0 ]`(test 用的是另一個
+    parser),下一行 `$((launch_delay - 1))` 卻以 "value too great for base"
+    失敗 —— 而 aicode 是 `set -e`,於是 wrapper 在 `exec opencode` 之前就結束:
+    使用者只看到倒數的第一行,然後沒有 TUI。`010` 不會爆,但倒數 8 秒。
+
+    這裡直接跑 `aicode` 裡那段正規化,不抄一份。
+    """
+    bash = require_working_bash()
+    source = (REPO_ROOT / "aicode").read_text(encoding="utf-8")
+    start = source.index('launch_delay="${AICODE_LAUNCH_DELAY:-3}"')
+    snippet = source[start:source.index("esac", start) + len("esac")]
+    proc = subprocess.run(
+        [bash, "-euo", "pipefail", "-c",
+         snippet + '\nprintf "%s %s\\n" "$launch_delay" "$((launch_delay - 1))"'],
+        env={**os.environ, "AICODE_LAUNCH_DELAY": value},
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == [str(expected), str(expected - 1)]
+
 # ── 原 test_aicode_attach.py:`aicode attach` 子指令,以及沒有子指令時不得誤觸 web/attach ──
 
 # ---- aicode attach -------------------------------------------------------
