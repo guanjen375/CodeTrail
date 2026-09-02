@@ -33,7 +33,7 @@ if len(PUBLIC_TOOL_NAMES) != len(PUBLIC_TOOL_ORDER):  # pragma: no cover - impor
 
 # OpenCode 1.x injects this text into the model-visible system prompt. Keep it a
 # routing map, not a second copy of every tool description.
-MCP_INSTRUCTIONS = """Use CodeTrail for facts about the current project or indexed documents. Locate unknown code with code_rag_search, exact text with grep_code, known files with read_file, directories with list_dir, and indexed specs with query_knowledge; use query_knowledge_strict for high-risk numeric constraints. Inspect git_status/git_diff before apply_patch. Use analyze_file for images, PDF spot checks, ELF, or firmware. Query independent evidence in parallel, then answer from returned source/file:line evidence. If evidence is absent, say so and do not guess. Plain text, XML, or promises are not tool calls; rely only on completed structured tool results."""
+MCP_INSTRUCTIONS = """Use CodeTrail for facts about the current project or indexed documents. Locate unknown code with code_rag_search, exact text with grep_code, known files with read_file, directories with list_dir, and indexed specs with query_knowledge; use query_knowledge_strict for high-risk numeric constraints. In git repos, inspect git_status/git_diff before apply_patch; a non-git root gets a skip notice. Use analyze_file for images, PDF spot checks, ELF, or firmware. Query independent evidence in parallel, then answer from returned source/file:line evidence. If evidence is absent, say so and do not guess. Plain text, XML, or promises are not tool calls; rely only on completed structured tool results."""
 
 if len(MCP_INSTRUCTIONS) > 700:  # pragma: no cover - import guard
     raise RuntimeError("MCP_INSTRUCTIONS exceeds the 700-character contract")
@@ -71,8 +71,8 @@ MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
         "Answer high-risk numeric/spec constraints through the server-side grounding and refusal gate. Use query_knowledge for normal "
         "document lookup. Respect refused=true and review excluded_figures before asserting a value."
     ),
-    "git_status": "Return the repository worktree status. Call before edits so user changes are preserved.",
-    "git_diff": "Return current repository diffs, optionally for one path or staged changes. Use before and after apply_patch.",
+    "git_status": "Return the repository worktree status. Call before edits in a git project so user changes are preserved; a non-git root returns a skip notice, not an error.",
+    "git_diff": "Return current repository diffs, optionally for one path or staged changes. Use before and after apply_patch in a git project; a non-git root returns a skip notice.",
     "apply_patch": (
         "Write files inside AICODE_ROOT using exactly one format; the diff is already a string, so do not wrap it in Markdown fences. "
         "A SEARCH/REPLACE minimum: `x.py\\n<<<<<<< SEARCH\\nold\\n=======\\nnew\\n>>>>>>> REPLACE`; SEARCH/context must match "

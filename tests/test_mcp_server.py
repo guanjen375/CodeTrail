@@ -63,6 +63,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -805,6 +806,39 @@ def test_success_content_words_do_not_forge_error_or_partial_status():
     for result in (info, read, grep):
         assert result.isError is False
         assert result.content[0].text.startswith("status: ok\n")
+
+
+@pytest.mark.smoke
+def test_git_tools_outside_a_repo_return_a_skip_notice_not_a_retryable_error(tmp_path: Path):
+    """2026-09-02 實機:非 git 專案改檔前,模型照 MCP_INSTRUCTIONS 先呼 git_status,
+    拿到 `status: error` + 「Correct the reported input or environment problem, then
+    retry once」。那句是給「輸入或環境壞了、修好再試」的;「不是 git 倉庫」沒有東西
+    可修,回錯誤只會讓模型多繞一圈(這次它沒理,但下次不一定)。非 git 專案要拿到
+    status ok 的固定跳過通知,而且 instructions 不能再無條件要求先看 git。"""
+    from agent_tools import ToolExecutor
+
+    if shutil.which("git") is None:
+        pytest.skip("環境沒有 git")
+    root = tmp_path / "proj"
+    root.mkdir()
+    probe = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--git-dir"], capture_output=True, text=True
+    )
+    if probe.returncode == 0:
+        pytest.skip("tmp_path 落在某個 git 工作樹內,無法模擬非 git 專案")
+
+    budget = ResultBudget(2_000, 6_000, explicit=False, context_risk=False)
+    for name in ("git_status", "git_diff"):
+        body = getattr(ToolExecutor(str(root)), name)()
+        assert "不是 git 倉庫" in body, (name, body)
+        assert not body.startswith("錯誤"), (name, body)
+        result = adapt_tool_result(name, body, budget=budget)
+        assert result.isError is False, (name, result.content[0].text)
+        text = result.content[0].text
+        assert text.startswith("status: ok\n"), (name, text)
+        assert "retry" not in text, (name, text)
+    assert "Inspect git_status/git_diff before apply_patch" not in MCP_INSTRUCTIONS
+    assert "non-git" in MCP_INSTRUCTIONS
 
 
 def test_budgeted_evidence_keeps_metadata_before_bulk_text():

@@ -61,8 +61,8 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 文件/外部檔案 | `reload_knowledge_base()` | 立即載入 KB 並回報 chunk 數（查詢本身會自動偵測變更，這是「馬上確認」用） |
 | 文件/外部檔案 | `query_knowledge(question, source=None)` | 查 KB；`source` 可用 basename 限定單一 spec/manual |
 | 文件/外部檔案 | `query_knowledge_strict(question, source=None)` | 查高風險規格題，弱證據會拒答；可限定文件 |
-| 修改/驗證 | `git_status()` | 看工作樹目前有沒有改動 |
-| 修改/驗證 | `git_diff(path=None, staged=False)` | 看修改內容，不需要用 `run_command` 跑 git |
+| 修改/驗證 | `git_status()` | 看工作樹目前有沒有改動；非 git 專案回固定的跳過通知（`status: ok`，不是錯誤、不用重試） |
+| 修改/驗證 | `git_diff(path=None, staged=False)` | 看修改內容，不需要用 `run_command` 跑 git；非 git 專案同樣回跳過通知 |
 | 修改/驗證 | `apply_patch(diff, dry_run=False)` | 套 SEARCH/REPLACE 或 unified diff（同一次只能一種；參數已是字串，不要包 fence），會真的寫檔；最多 5 個檔案、單檔 200 行（udiff 算 added+removed；S/R 算 payload budget = SEARCH+REPLACE 行數，不是同一種計數）；UTF-8 strict，BOM／CRLF／檔尾換行／權限原樣保留，mixed newline 與 symlink 拒絕；套用後只做唯讀 syntax check（advisory、三態、失敗不回滾）；細節見[apply_patch 的兩種格式](#apply_patch-的兩種格式) |
 | 修改/驗證 | `run_lint(path, fix=True)` | 對單一檔案跑格式化/lint；`fix=False` 走 check-only(不改檔) |
 | 修改/驗證 | `run_command(cmd, timeout=60)` | 跑白名單命令；timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），預設 60。預設白名單 = 測試／靜態命令；build 命令(make/cmake/ninja/meson/bazel)需設 `AI_CODE_ENABLE_BUILD_COMMANDS=1`；git 不在白名單（用 `git_status` / `git_diff`） |
@@ -324,7 +324,7 @@ void led_toggle(void) {
 - 查 spec 先用工具 `query_knowledge`；數字、限制、預設值這類答錯很糟的題目，用工具 `query_knowledge_strict`。多份相似版本並存時傳 `source="檔名"`，filter 會在 top-k 前套用。
 - 外部檔案先用工具 `import_external_file`，再用工具 `analyze_file`、`ingest_document` 或 `read_file` 處理匯入後路徑。
 - 新增或刪除文件後查詢會自動載入變更；要立即確認 chunk 數可用工具 `reload_knowledge_base`。
-- 改檔前先看工具 `git_status` / `git_diff`；改檔用工具 `apply_patch`（SEARCH/REPLACE 或 unified diff 二擇一，先 `dry_run` 預覽）。
+- git 專案改檔前先看工具 `git_status` / `git_diff`（非 git 專案會回跳過通知，直接改檔）；改檔用工具 `apply_patch`（SEARCH/REPLACE 或 unified diff 二擇一，先 `dry_run` 預覽）。
 - `apply_patch`（寫檔）、`run_lint(fix=True)`（格式化）、`run_command`（執行命令）是三個不同的 ask，各自需要你核准。apply_patch 不會自動執行 lint / typecheck / test；需要改檔或執行專案腳本時才允許。
 - 工具 `record_lesson` 只在「你糾正了模型的做事方式」之後用;工具報錯或答案錯誤不是觸發條件。寫入需要你核准,細節與管理指令見 [docs/lessons.md](lessons.md)。
 - 圖很多的 PDF 先用 `ingest_document(path, preflight_only=True)` 估成本（零寫入），再決定要不要在 MCP 裡跑或改走 CLI。

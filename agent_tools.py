@@ -1889,19 +1889,43 @@ class ToolExecutor:
             lines[entry['pos']:entry['pos'] + entry['replace_len']] = entry['new_lines']
         return '\n'.join(lines)
 
-    def git_status(self) -> str:
-        """顯示 git 工作目錄狀態"""
-        try:
-            result = subprocess.run(
-                ['git', 'status', '--porcelain', '-uall'],
-                cwd=str(self.root),
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
+    # 非 git 專案:回固定的跳過通知,不是「錯誤:」。tool_result_adapter 把「錯誤:」
+    # 開頭一律包成 status error + 「修正後重試一次」,可是「不是 git 倉庫」沒有東西
+    # 可修;MCP_INSTRUCTIONS 要模型改檔前先看 git,非 git 專案每次都會撞到這裡,
+    # 回錯誤只是讓模型多繞一圈(2026-09-02 實機:一個沒有 .git 的 firmware 資料夾)。
+    GIT_NOT_A_REPO_NOTICE = (
+        "此專案不是 git 倉庫(AICODE_ROOT 與上層目錄都沒有 .git)。"
+        "不需要 git 檢查,直接 apply_patch;不要重試 git_status / git_diff。"
+    )
 
+    def _run_git(self, args: list, timeout: int) -> subprocess.CompletedProcess:
+        # LC_ALL=C:下面靠 stderr 的英文 "not a git repository" 判斷非 git 專案,
+        # 使用者 LANG 是中文時 git 會翻譯訊息,判斷就落空。只影響訊息語言,
+        # porcelain 的路徑引號規則(core.quotePath)與 locale 無關。
+        return subprocess.run(
+            ['git', *args],
+            cwd=str(self.root),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+
+    @staticmethod
+    def _git_not_a_repo(result: subprocess.CompletedProcess) -> bool:
+        # git status:exit 128 + "fatal: not a git repository";
+        # git diff:exit 129 + "warning: Not a git repository. Use --no-index ..." + usage。
+        return result.returncode != 0 and "not a git repository" in result.stderr.lower()
+
+    def git_status(self) -> str:
+        """顯示 git 工作目錄狀態;非 git 專案回固定跳過通知(不是錯誤)"""
+        try:
+            result = self._run_git(['status', '--porcelain', '-uall'], timeout=10)
+
+            if self._git_not_a_repo(result):
+                return self.GIT_NOT_A_REPO_NOTICE
             if result.returncode != 0:
-                return f"錯誤: {result.stderr.strip() or '不是 git 倉庫'}"
+                return f"錯誤: {result.stderr.strip() or f'git status 失敗(exit {result.returncode})'}"
 
             output = result.stdout.strip()
             if not output:
@@ -1950,16 +1974,12 @@ class ToolExecutor:
                     return f"錯誤: 路徑不在專案內 '{path}'"
                 cmd.append(str(target.relative_to(self.root)))
 
-            result = subprocess.run(
-                cmd,
-                cwd=str(self.root),
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
+            result = self._run_git(cmd[1:], timeout=30)
 
+            if self._git_not_a_repo(result):
+                return self.GIT_NOT_A_REPO_NOTICE
             if result.returncode != 0:
-                return f"錯誤: {result.stderr.strip() or '不是 git 倉庫'}"
+                return f"錯誤: {result.stderr.strip() or f'git diff 失敗(exit {result.returncode})'}"
 
             output = result.stdout.strip()
             if not output:

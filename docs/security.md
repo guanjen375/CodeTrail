@@ -124,7 +124,7 @@ aicode
 
 `apply_patch(...)` 會寫檔、`run_lint(...)`（`fix=True`）會格式化檔案、`run_command(...)` 會跑白名單命令——這是**三個不同的 ask**,每一個都要你分別核准。`apply_patch` 套用後只做同一 process、唯讀的 syntax check(advisory、失敗不回滾),不會執行 lint／typecheck／test,也不會呼叫會改檔的 formatter;核准「寫檔」不會暗中擴張成「執行專案程式碼」。建議工作節奏:
 
-1. 先要求模型用 `git_status(...)` / `git_diff(...)` 看目前工作樹。
+1. 先要求模型用 `git_status(...)` / `git_diff(...)` 看目前工作樹（非 git 專案會回跳過通知，這步略過）。
 2. 要分析時明講「不要改檔」。
 3. 要改檔時要求先列出會改哪些檔案,再套最小 patch(先 `dry_run` 預覽)。
 4. 修改後由你決定是否用 `run_lint(fix=False)` / `run_command(...)` 跑最小相關檢查(各自核准)。

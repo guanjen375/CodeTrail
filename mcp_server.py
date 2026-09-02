@@ -1458,7 +1458,8 @@ def git_status() -> str:
     """git status --porcelain for AICODE_ROOT, with human-readable status labels.
 
     比讓模型自己呼 `run_command('git status')` 好,因為 `git` 不在白名單裡 ——
-    那條路會被擋掉。需要 AICODE_ROOT 是 git working tree,不是就會回錯誤訊息。
+    那條路會被擋掉。AICODE_ROOT 不是 git working tree 時回固定的跳過通知
+    (status ok,不是錯誤):非 git 專案不需要 git 檢查,直接 apply_patch 即可。
 
     Returns:
         每個變更檔案一行:`<狀態文字>: <path>`。乾淨時回固定字串。
@@ -1479,7 +1480,8 @@ def git_diff(
                 False → 工作樹 vs HEAD(預設)。
 
     Returns:
-        diff 文字。過長會頭尾保留、中段截斷。沒有差異時回固定字串。
+        diff 文字。過長會頭尾保留、中段截斷。沒有差異時回固定字串;
+        非 git 專案回與 git_status 相同的跳過通知(不是錯誤)。
     """
     return EXEC.git_diff(path=path, staged=staged)
 
