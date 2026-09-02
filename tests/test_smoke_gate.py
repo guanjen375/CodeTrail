@@ -242,7 +242,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "live MCP 19-tool 固定順序、typed schema 與 catalog budget；"
         "省略 max_chars 時結果預算依 call-time n_ctx 的 12% 動態配置；"
         "mcp_server 啟動時的 AICODE_ROOT 驗證與 set_sandbox_root；"
-        "PATCH_ENABLED / RUN_COMMAND_ENABLED / build 命令預設",
+        "PATCH_ENABLED / RUN_COMMAND_ENABLED / build 命令預設；"
+        "git 工具的兩種結果不得互換——真的沒有倉庫回跳過通知(不是 retryable error)，"
+        "而 GIT_DIR/.git 壞掉時必須是錯誤(誤報成「沒有倉庫」等於放行模型跳過改檔前的 git 檢查)",
         (
             "test_live_catalog_is_bounded_typed_and_ordered",
             "test_default_budget_tracks_n_ctx",
@@ -255,6 +257,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_explicit_patch_zero_disables_patch",
             "test_explicit_run_tests_zero_disables_run_command",
             "test_build_commands_opt_in",
+            "test_git_tools_outside_a_repo_return_a_skip_notice_not_a_retryable_error",
+            "test_a_broken_git_environment_is_not_reported_as_a_missing_repo",
         ),
     ),
     "test_mcp_ingest.py": (
