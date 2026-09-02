@@ -109,7 +109,7 @@ def test_yes_missing_value_errors_name_the_flag(tmp_path):
     # 兩顆 GPU → 每個 role 都要 GPU 旗標(缺 --vl-gpu 驗證)
     no_vl_gpu = run(
         tmp_path, "--yes", "--main-model", "1", "--rerank-model", "1",
-        "--main-gpu", "0", "--embed-gpu", "1", "--rerank-gpu", "1",
+        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2",
         *NUM_FLAGS, "--models-dir", str(models),
     )
     assert no_vl_gpu.returncode == 2
@@ -118,7 +118,7 @@ def test_yes_missing_value_errors_name_the_flag(tmp_path):
     # 數值也沒有預設:缺 --ctx 就報錯
     no_ctx = run(
         tmp_path, "--yes", "--main-model", "1", "--rerank-model", "1",
-        "--main-gpu", "0", "--embed-gpu", "1", "--rerank-gpu", "1", "--vl-gpu", "1",
+        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
         "--rerank-ctx", "8192", "--models-dir", str(models),
     )
     assert no_ctx.returncode == 2
@@ -127,7 +127,7 @@ def test_yes_missing_value_errors_name_the_flag(tmp_path):
     # reranker internal buffer 現在也是使用者題 → 缺 --rerank-ctx 一樣報錯
     no_rerank_ctx = run(
         tmp_path, "--yes", "--main-model", "1", "--rerank-model", "1",
-        "--main-gpu", "0", "--embed-gpu", "1", "--rerank-gpu", "1", "--vl-gpu", "1",
+        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
         "--ctx", "65536", "--models-dir", str(models),
     )
     assert no_rerank_ctx.returncode == 2
@@ -139,13 +139,13 @@ def test_interactive_flow_answers_everything_and_validates_ranges(tmp_path):
     models = make_models(tmp_path)
 
     # main 先按 Enter(無效)再輸入 3(超出 1-2,無效)才輸入 1;
-    # main GPU 先輸入 5(不存在)再輸入 0;其餘照標準作答。
-    stdin = "\n3\n1\n5\n0\n65536\n1\n1\n1\n8192\n1\n1\n\n"
+    # main GPU 先輸入 5(不存在)再輸入 1;其餘照標準作答。
+    stdin = "\n3\n1\n5\n1\n65536\n2\n1\n2\n8192\n2\n1\n\n"
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models), stdin=stdin)
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "【主聊天模型】 — 偵測到的候選" in proc.stdout
     assert "編號只有 1-2" in proc.stdout           # 選項 1/2 輸入 3 → 重問
-    assert "無效的 GPU index" in proc.stdout       # GPU 0/1 輸入 5 → 重問
+    assert "無效的 GPU 編號" in proc.stdout        # GPU 1/2 輸入 5 → 重問
     assert "只有一個候選,自動選用" in proc.stdout  # embedding / VL 唯一候選
     assert "設定摘要" in proc.stdout
     assert "(預設)" not in proc.stdout             # 不再有任何預設標記
@@ -182,7 +182,7 @@ def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
         cwd=REPO_ROOT,
         env={**build_env(tmp_path), "HOME": str(home2), "USERPROFILE": str(home2)},
         # 全部答完,摘要頁按 q → 不寫入
-        input="1\n0\n65536\n1\n1\n1\n8192\n1\n1\nq\n",
+        input="1\n1\n65536\n2\n1\n2\n8192\n2\n1\nq\n",
         capture_output=True,
         text=True,
         timeout=60,
@@ -199,7 +199,7 @@ def test_summary_invalid_input_reprompts_instead_of_aborting(tmp_path):
     models = make_models(tmp_path)
     proc = run(
         tmp_path, "--no-preview", "--models-dir", str(models),
-        stdin="1\n0\n65536\n1\n1\n1\n8192\n1\n1\nzz\nq\n",
+        stdin="1\n1\n65536\n2\n1\n2\n8192\n2\n1\nzz\nq\n",
     )
     assert proc.returncode == 0, proc.stderr
     assert "無效輸入 'zz'" in proc.stdout
@@ -213,13 +213,13 @@ def test_flags_override_model_and_gpu(tmp_path):
         tmp_path,
         "--yes", "--no-preview", "--models-dir", str(models),
         "--main-model", "1", "--rerank-model", "1",
-        "--main-gpu", "1", "--embed-gpu", "0", "--rerank-gpu", "1", "--vl-gpu", "1",
+        "--main-gpu", "2", "--embed-gpu", "1", "--rerank-gpu", "2", "--vl-gpu", "2",
         *NUM_FLAGS,
     )
     assert proc.returncode == 0, proc.stderr
     content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
     assert "export MAIN_GPU=GPU-bbbb-2000" in content
-    # aux 三顆不同卡(embed=0、rerank/vl=1)→ 逐 role export
+    # aux 三顆不同卡(embed=GPU 1、rerank/vl=GPU 2)→ 逐 role export
     assert "export EMBED_GPU=GPU-aaaa-5090" in content
 
 def test_no_gpu_notifies_and_fails(tmp_path):
@@ -260,7 +260,7 @@ def test_missing_llama_binary_fails_with_build_hint(tmp_path):
             # big-chat 假檔不是 GGUF → layout 無法解析;--cpu-moe 仍尊重旗標,
             # 但 build 不支援就要硬停。
             "--fit --reranking --mmproj --cache-ram",      # 沒有 --cpu-moe
-            ("--cpu-moe", "--no-preview", "--main-model", "1", "--main-gpu", "0",
+            ("--cpu-moe", "--no-preview", "--main-model", "1", "--main-gpu", "1",
              "--ctx", "65536"),
             "需要 llama-server 的 --cpu-moe",
             "重新 build",
@@ -418,7 +418,7 @@ def test_interactive_main_ctx_rejects_above_maximum(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_models(tmp_path)
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n9999999\n65536\n1\n1\n1\n8192\n1\n1\n\n")
+                stdin="1\n1\n9999999\n65536\n2\n1\n2\n8192\n2\n1\n\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "無效輸入:請輸入 1024-1048576 的整數" in proc.stdout
     assert read_deployment(tmp_path)["services"]["main"]["ctx"] == 65536
@@ -436,7 +436,7 @@ def test_small_main_ctx_clamps_batch_instead_of_failing_validation(tmp_path):
         tmp_path,
         "--yes", "--no-preview", "--models-dir", str(models),
         "--main-model", "1", "--rerank-model", "1",
-        "--main-gpu", "0", "--embed-gpu", "1", "--rerank-gpu", "1", "--vl-gpu", "1",
+        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
         "--ctx", "1024", "--threads", "8", "--rerank-ctx", "8192",
     )
     assert proc.returncode == 0, proc.stderr + proc.stdout
@@ -623,7 +623,7 @@ def test_incomplete_shards_are_reported_with_missing_names(tmp_path):
     proc = run(
         tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
         "--rerank-model", "1",
-        "--main-gpu", "0", "--embed-gpu", "1", "--rerank-gpu", "1", "--vl-gpu", "1",
+        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
         *NUM_FLAGS,
     )
     assert proc.returncode == 0, proc.stderr
@@ -841,7 +841,7 @@ def test_only_vl_main_candidate_proceeds_with_warning(tmp_path):
     proc = run(
         tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
         "--rerank-model", "1",
-        "--main-gpu", "0", "--embed-gpu", "1", "--rerank-gpu", "1", "--vl-gpu", "1",
+        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
         *NUM_FLAGS,
     )
     assert proc.returncode == 0, proc.stderr
@@ -900,15 +900,15 @@ def test_interactive_prompt_accepts_typed_n_cpu_moe(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = moe_models_needing_cpu_moe(tmp_path)
 
-    # main、main GPU(選 1 = 15000 MiB free)、ctx、CPU-MoE 層數先 abc(無效)再 3、
+    # main、main GPU(選 2 = 15000 MiB free)、ctx、CPU-MoE 層數先 abc(無效)再 3、
     # embed GPU、reranker、reranker GPU、reranker ctx、VL GPU、摘要確認。
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n1\n65536\nabc\n3\n1\n1\n1\n8192\n1\n1\n\n")
+                stdin="1\n2\n65536\nabc\n3\n2\n1\n2\n8192\n2\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "主聊天模型 CPU-MoE 留在 RAM 的層數(0-1024)" in proc.stdout
     # 提示只留兩件事:(1) 方向 (2) 依 GGUF 權重 + nvidia-smi free VRAM 算的推薦區間。
-    # 權重 26 GiB(10 層 × 2 GiB experts + 6 GiB dense)、GPU 1 free 15000 MiB
+    # 權重 26 GiB(10 層 × 2 GiB experts + 6 GiB dense)、GPU 2 free 15000 MiB
     # → 要移走 6 層才放得進,上界是全部移到 RAM 的 10。
     assert "數值越大 → GPU 負載越低(0 = 不 offload)。" in proc.stdout
     assert "推薦數值:6-10" in proc.stdout
@@ -924,7 +924,7 @@ def test_interactive_n_cpu_moe_over_max_index_means_full_cpu_moe(tmp_path):
     models = moe_models_needing_cpu_moe(tmp_path)
 
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n65536\n42\n1\n1\n1\n8192\n1\n1\n\n")
+                stdin="1\n1\n65536\n42\n2\n1\n2\n8192\n2\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "推薦數值:" in proc.stdout
@@ -938,7 +938,7 @@ def test_interactive_cpu_moe_zero_means_no_offload(tmp_path):
     models = moe_models_needing_cpu_moe(tmp_path)
 
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n65536\n0\n1\n1\n1\n8192\n1\n1\n\n")
+                stdin="1\n1\n65536\n0\n2\n1\n2\n8192\n2\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "0 = 不 offload" in proc.stdout
@@ -955,7 +955,7 @@ def test_build_without_n_cpu_moe_support_degrades_to_full_cpu_moe(tmp_path):
     models = moe_models_needing_cpu_moe(tmp_path)
 
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n65536\n3\n1\n1\n1\n8192\n1\n1\n\n")
+                stdin="1\n1\n65536\n3\n2\n1\n2\n8192\n2\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "不支援 --n-cpu-moe" in proc.stdout
@@ -980,7 +980,7 @@ def test_model_path_flag_rescues_missing_category(tmp_path):
         tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
         "--main-model", "1",
         "--rerank-model", str(external / "my-reranker.gguf"),
-        "--main-gpu", "0", "--embed-gpu", "1", "--rerank-gpu", "1", "--vl-gpu", "1",
+        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
         *NUM_FLAGS,
     )
     assert proc.returncode == 0, proc.stderr + proc.stdout
@@ -1007,7 +1007,7 @@ def test_flat_dir_vl_pairing_fails_loud_on_yes(tmp_path):
     proc = run(
         tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
         "--main-model", "1",
-        "--main-gpu", "0", "--embed-gpu", "1", "--rerank-gpu", "1", "--vl-gpu", "1",
+        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
         *NUM_FLAGS,
     )
     assert proc.returncode == 2, proc.stdout + proc.stderr
@@ -1019,7 +1019,7 @@ def test_flat_dir_vl_pairing_fails_loud_on_yes(tmp_path):
         tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
         "--main-model", "1",
         "--vl-model", str(models / "flat" / "media-large-q4.gguf"),
-        "--main-gpu", "0", "--embed-gpu", "1", "--rerank-gpu", "1", "--vl-gpu", "1",
+        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
         *NUM_FLAGS,
     )
     assert explicit.returncode == 0, explicit.stderr + explicit.stdout
@@ -1034,7 +1034,7 @@ def test_flat_dir_vl_pairing_asks_explicitly_in_interactive(tmp_path):
     # main(3 候選選 1)、main GPU、ctx、embed GPU、reranker 唯一自動、reranker GPU、
     # reranker ctx、VL 明確選 [2] media-large、VL GPU、摘要確認。
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n0\n65536\n1\n1\n8192\n2\n1\n1\n\n")
+                stdin="1\n1\n65536\n2\n2\n8192\n2\n2\n1\n\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "【VL 模型】 — 偵測到的候選" in proc.stdout
     deployment = read_deployment(tmp_path)
@@ -2050,7 +2050,7 @@ def test_rerun_has_no_carryover_current_answers_win(tmp_path):
     first = run(
         tmp_path, "--yes", "--no-preview", "--models-dir", str(models),
         "--main-model", "1", "--rerank-model", "1",
-        "--main-gpu", "0", "--embed-gpu", "1", "--rerank-gpu", "1", "--vl-gpu", "1",
+        "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2", "--vl-gpu", "2",
         "--ctx", "32768", "--threads", "12", "--rerank-ctx", "4096",
     )
     assert first.returncode == 0, first.stderr
@@ -2657,7 +2657,7 @@ def test_dry_run_writes_nothing(tmp_path):
 def test_quitting_at_the_summary_writes_nothing(tmp_path):
     models = _setup(tmp_path)
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-               stdin="1\n0\n65536\n1\n1\n1\n8192\n1\n1\nq\n")
+               stdin="1\n1\n65536\n2\n1\n2\n8192\n2\n1\nq\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "未寫入任何檔案" in proc.stdout
     assert not (_home(tmp_path) / ".config").exists()
@@ -2668,7 +2668,7 @@ def test_interactive_question_has_no_default(tmp_path):
     """其餘使用者選擇題都沒有預設值;這題按 Enter 也不能過關。"""
     models = _setup(tmp_path)
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-               stdin="1\n0\n65536\n1\n1\n1\n8192\n1\n\n9\n3\n\n")
+               stdin="1\n1\n65536\n2\n1\n2\n8192\n2\n\n9\n3\n\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "=== [5/5] 壓縮模式 ===" in proc.stdout
     assert proc.stdout.count("編號只有 1-3") == 2     # 空白與 9 各重問一次
@@ -2680,8 +2680,8 @@ def test_a_context_too_small_for_the_contract_is_fail_loud(tmp_path):
     """推不出門檻時必須明講,不能寫一個算不出來的受管值。"""
     models = _setup(tmp_path)
     proc = run(tmp_path, "--yes", "--main-model", "1", "--rerank-model", "1",
-               "--main-gpu", "0", "--embed-gpu", "1", "--rerank-gpu", "1",
-               "--vl-gpu", "1", "--ctx", "16384", "--rerank-ctx", "8192",
+               "--main-gpu", "1", "--embed-gpu", "2", "--rerank-gpu", "2",
+               "--vl-gpu", "2", "--ctx", "16384", "--rerank-ctx", "8192",
                "--no-preview", "--models-dir", str(models),
                "--compaction-mode", "codetrail")
     assert proc.returncode != 0

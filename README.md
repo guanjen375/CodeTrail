@@ -412,8 +412,10 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 是唯一的例外，見下方最後一項）：
 
 - 模型 / GPU：`--main-model` / `--main-gpu`、`--embed-model` / `--embed-gpu`、
-  `--rerank-model` / `--rerank-gpu`、`--vl-model` / `--vl-gpu`。VL 配對不唯一時
-  再給 `--vl-mmproj`；單一候選、單卡或唯一 mmproj 會自動選用。
+  `--rerank-model` / `--rerank-gpu`、`--vl-model` / `--vl-gpu`。模型與 GPU 的編號
+  **都從 1 起算**(GPU 編號 = `nvidia-smi` index + 1;互動選單與每張卡的描述行都會
+  印出對應的 nvidia-smi index)。VL 配對不唯一時再給 `--vl-mmproj`；單一候選、單卡或
+  唯一 mmproj 會自動選用。
 - 數值：`--ctx` 與 `--rerank-ctx`。`--threads` 是非必要的進階旗標；不給就是
   auto，不寫 `-t`。
 - MoE：main 使用 `--cpu-moe` / `--no-cpu-moe` / `--n-cpu-moe N`；VL 使用
@@ -772,6 +774,9 @@ aicode
 ```
 
 `aicode` 不用帶參數:主模型會依「env `AICODE_MODEL` > `-m` 旗標 > deployment.json > opencode.json」解析,`set_config.sh` 已把後兩者設好。
+
+啟動前置全部通過後會倒數 3 秒才進 OpenCode TUI(TUI 一接管畫面就會蓋掉前面的檢查訊息)。
+不想等就 `AICODE_LAUNCH_DELAY=0 aicode`;輸出不是終端機(導向檔案、被腳本收 stdout)時不倒數。
 
 要讓模型讀專案外的附件(`~/Downloads` 的 log / 截圖 / spec)就多加一個開關:
 

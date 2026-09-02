@@ -24,6 +24,8 @@ nvidia-smi 稍微監控)。
      N = 前 N 層 experts 留 RAM、≥ 層數上限 = 全部留 RAM(等同 --cpu-moe);
      模型不是 MoE(GGUF 沒有 expert tensors)時直接略過並印出原因。
      只有一個候選(或一顆 GPU)時自動選用;其餘必答。
+     模型與 GPU 的選單編號都從 1 起算(GPU 編號 = nvidia-smi index + 1,
+     每張卡的描述行仍會印出 nvidia-smi index 供對照)。
      threads 不再是問題:未給 --threads 就不寫 -t,交給 llama.cpp 自己的預設。
      最後顯示摘要一頁(Enter 寫入 / q 離開)。
   5. 非互動:`--yes` 跳過提問與確認,但所有使用者選擇題的值必須由旗標提供
@@ -182,8 +184,18 @@ class Gpu:
         """啟動時綁 GPU 用的識別:UUID 比 index 穩(PCI 順序可能變)。"""
         return self.uuid if self.uuid and self.uuid != "N/A" else str(self.index)
 
+    @property
+    def choice(self) -> int:
+        """使用者看到與輸入的編號:1 起算,與模型選單一致(= nvidia-smi index + 1)。
+
+        index 是 nvidia-smi 的 0-based 編號,仍是對照 nvidia-smi 輸出的唯一依據,
+        所以 describe() 會一併印出來;綁卡用的是 selector(UUID),不受這層顯示影響。
+        """
+        return self.index + 1
+
     def describe(self) -> str:
-        return f"GPU {self.index}: {self.name} | VRAM {self.total_mib} MiB(free {self.free_mib} MiB)"
+        return (f"GPU {self.choice}: {self.name} | VRAM {self.total_mib} MiB"
+                f"(free {self.free_mib} MiB,nvidia-smi index {self.index})")
 
 
 @dataclass(frozen=True)
@@ -1014,31 +1026,40 @@ def choose_gpu(
     *,
     flag_name: str,
 ) -> Gpu:
-    """GPU 選擇:沒有預設值。單卡自動選用;多卡必須輸入偵測到的 index。"""
-    by_index = {gpu.index: gpu for gpu in gpus}
+    """GPU 選擇:沒有預設值。單卡自動選用;多卡必須輸入選單編號(1 起算)。
+
+    編號與模型選單一致從 1 起算;nvidia-smi 的 0-based index 只出現在每張卡的
+    描述行裡(供對照 nvidia-smi),不是輸入格式。
+    """
+    by_choice = {gpu.choice: gpu for gpu in gpus}
+    span = _range(min(by_choice), max(by_choice))
     if override is not None:
-        if not override.isdecimal() or int(override) not in by_index:
-            raise SetupError(
-                f"{role_label}:GPU index '{override}' 不在偵測結果中"
-                f"(可用:{sorted(by_index)})。"
+        if not override.isdecimal() or int(override) not in by_choice:
+            legacy = (
+                "(GPU 編號自 1 起算,不再是 nvidia-smi 的 0-based index)"
+                if override.strip() == "0" else ""
             )
-        return by_index[int(override)]
+            raise SetupError(
+                f"{role_label}:GPU 編號 '{override}' 不在偵測結果中"
+                f"(可用:{span}){legacy}。"
+            )
+        return by_choice[int(override)]
     if len(gpus) == 1:
         return gpus[0]
     if assume_yes:
         raise SetupError(
-            f"{role_label}:偵測到多顆 GPU;--yes 模式需要用 {flag_name} 指定 GPU index"
-            f"(可用:{sorted(by_index)})。"
+            f"{role_label}:偵測到多顆 GPU;--yes 模式需要用 {flag_name} 指定 GPU 編號"
+            f"(可用:{span};1 起算)。"
         )
 
     print(f"\n{role_label} — 要放哪顆 GPU?")
     for gpu in gpus:
-        print(f"  [{gpu.index}] {gpu.describe()}")
+        print(f"  {gpu.describe()}")
     while True:
-        raw = _input(f"請輸入 GPU index(可用:{sorted(by_index)}): ").strip()
-        if raw.isdecimal() and int(raw) in by_index:
-            return by_index[int(raw)]
-        print(f"  無效的 GPU index:{raw!r}(可用:{sorted(by_index)})")
+        raw = _input(f"請輸入 GPU 編號({span}): ").strip()
+        if raw.isdecimal() and int(raw) in by_choice:
+            return by_choice[int(raw)]
+        print(f"  無效的 GPU 編號:{raw!r}(可用:{span})")
 
 
 def choose_int(label: str, override: int | None, assume_yes: bool, *,
@@ -1978,11 +1999,11 @@ def build_start_sh(plan: Plan) -> str:
 # 偵測到的 GPU:
 {gpu_lines}
 #
-# 配置(模型 @ GPU index):
-#   main      = {plan.main_key} @ GPU {plan.main.gpu.index}
-#   embedding = {plan.embedding.candidate.path.name} @ GPU {plan.embedding.gpu.index}
-#   reranker  = {plan.reranker.candidate.path.name} @ GPU {plan.reranker.gpu.index} (internal buffer={plan.reranker_ctx})
-#   vl        = {plan.vl.candidate.path.name} @ GPU {plan.vl.gpu.index}
+# 配置(模型 @ GPU 編號,1 起算,與上面偵測清單一致):
+#   main      = {plan.main_key} @ GPU {plan.main.gpu.choice}
+#   embedding = {plan.embedding.candidate.path.name} @ GPU {plan.embedding.gpu.choice}
+#   reranker  = {plan.reranker.candidate.path.name} @ GPU {plan.reranker.gpu.choice} (internal buffer={plan.reranker_ctx})
+#   vl        = {plan.vl.candidate.path.name} @ GPU {plan.vl.gpu.choice}
 #
 # 啟動參數(全部來自你在 set_config 的作答):ctx={plan.ctx}, threads={_threads_description(plan)}, {offload}
 #   reranker:-c/-b/-ub {plan.reranker_ctx};附屬服務:-np {AUX_PARALLEL}
@@ -2848,7 +2869,8 @@ def _parser() -> argparse.ArgumentParser:
                         help="跳過 llama-server / tmux 檢查(自動化測試用)")
     for role in ("main", "embed", "rerank", "vl"):
         parser.add_argument(f"--{role}-model", help=f"{role} 模型:候選編號(從 1 起)或 .gguf 絕對路徑")
-        parser.add_argument(f"--{role}-gpu", help=f"{role} 要綁的 GPU index")
+        parser.add_argument(f"--{role}-gpu",
+                            help=f"{role} 要綁的 GPU 編號(從 1 起,= nvidia-smi index + 1)")
     parser.add_argument("--vl-mmproj", help="VL mmproj .gguf 絕對路徑(同目錄唯一 mmproj 時自動配對)")
     parser.add_argument("--ctx", "--n-ctx", dest="ctx", type=int,
                         help=f"主模型 n_ctx(-c),{_range(MIN_MAIN_CTX, MAX_MAIN_CTX)}")
@@ -2881,14 +2903,14 @@ def _print_summary_page(plan: Plan, python_bin: str, opencode_changes: list[str]
     offload = _offload_description(plan)
     print("\n=== 設定摘要(全部來自你的作答;確認一次即可)===")
     print(f"  主聊天    : {plan.main.candidate.describe()}")
-    print(f"              → GPU {plan.main.gpu.index}({plan.main.gpu.name})")
-    print(f"  embedding : {plan.embedding.candidate.path.name} → GPU {plan.embedding.gpu.index}")
+    print(f"              → GPU {plan.main.gpu.choice}({plan.main.gpu.name})")
+    print(f"  embedding : {plan.embedding.candidate.path.name} → GPU {plan.embedding.gpu.choice}")
     print(
-        f"  reranker  : {plan.reranker.candidate.path.name} → GPU {plan.reranker.gpu.index}"
+        f"  reranker  : {plan.reranker.candidate.path.name} → GPU {plan.reranker.gpu.choice}"
         f"（internal buffer={plan.reranker_ctx}）"
     )
     print(f"  VL        : {plan.vl.candidate.path.name} + {plan.vl.mmproj.name}"
-          f" → GPU {plan.vl.gpu.index}")
+          f" → GPU {plan.vl.gpu.choice}")
     print(f"              {_vl_offload_description(plan)}")
     print(f"  主模型參數: ctx={plan.ctx}、threads={_threads_description(plan)}、{offload}")
     bind = "0.0.0.0(區網可連,無認證!)" if plan.allow_remote else "127.0.0.1(僅本機)"

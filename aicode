@@ -627,4 +627,21 @@ if [ "${AICODE_PREFLIGHT_ONLY:-0}" = "1" ]; then
   exit 0
 fi
 
+# OpenCode TUI 一啟動就接管整個畫面,上面所有預檢/修復訊息會瞬間被蓋掉。
+# 給使用者幾秒看完再進去。倒數只在輸出是終端機時做:被導向檔案或在測試裡
+# 用 pipe 收 stdout 時直接啟動(否則每次呼叫都白等這幾秒)。
+# AICODE_LAUNCH_DELAY=0 可關掉。
+launch_delay="${AICODE_LAUNCH_DELAY:-3}"
+case "$launch_delay" in
+  ''|*[!0-9]*) launch_delay=3 ;;
+esac
+if [ -t 1 ] && [ "$launch_delay" -gt 0 ]; then
+  while [ "$launch_delay" -gt 0 ]; do
+    printf '\r[aicode] 檢查完成,OpenCode %d 秒後啟動(Ctrl-C 取消)… ' "$launch_delay"
+    sleep 1
+    launch_delay=$((launch_delay - 1))
+  done
+  printf '\r[aicode] 檢查完成,OpenCode 啟動中…                    \n'
+fi
+
 exec opencode "${OPENCODE_ARGS[@]}"
