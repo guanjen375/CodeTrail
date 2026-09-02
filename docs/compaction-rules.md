@@ -117,6 +117,11 @@ context error。兩個模型相同時結果與單一模型逐欄相同；合併�
 讓 **最新一輪逐字留在摘要之外**。競態時（你在壓縮進行中送出新問題）這一條就是讓你
 那則訊息不被摘要吃掉的機制。
 
+**受管值一共四個**：`auto` / `tail_turns` / `preserve_recent_tokens` 與 `prune`。前三個
+是「壓縮契約」——被改掉之後觸發點與保留範圍就跟推導出來的不一樣，plugin 會停用自動壓縮
+（`config_drift`）。`prune` 不是：它只決定舊工具輸出佔多少 context，改掉之後壓縮照樣正確，
+所以 plugin **不會**為它停用任何東西。它做什麼、代價是什麼見 §6。
+
 **壓縮完緊接著又壓一次是正常的**：`tail_turns = 1` 讓最新一輪逐字留著。那一輪如果很長
 （一輪塞了好幾個大工具結果就會這樣），壓縮之後的 context 是「摘要 + 那個很長的 tail」，
 再答一個普通問題就可能又越過門檻，於是回答完立刻又壓一次。這不是迴圈：同一則助理訊息
@@ -130,7 +135,7 @@ context error。兩個模型相同時結果與單一模型逐欄相同；合併�
 錯誤。它只是把「才剛壓完、問一句又壓」這件事講清楚：摘要加上逐字保留的最新一輪本身
 就快到門檻了，這個 `n_ctx` 對目前的工作太小。
 
-**受管值不會自己跟著模型變**：這三個值是 `./set_config.sh` 執行當下那個 `limit.context`
+**受管值不會自己跟著模型變**：`preserve_recent_tokens` 這一類的值是 `./set_config.sh` 執行當下那個 `limit.context`
 推導出來的。之後換模型或改 ctx 時，只有 `limit.context` 會被同步，保留額不會——於是門檻用
 新的、tail 用舊的。plugin 每次要觸發前都會用 **目前的** 有效模型限制重算一次，跟設定裡的值
 不符就停用自動壓縮並要求你重跑 `./set_config.sh`（`config_drift`）。算不出可用門檻的模型
@@ -352,7 +357,70 @@ session、最後一則助理訊息出錯或被中斷、最新一則真實使用�
 
 ---
 
-## 6. 相關
+## 6. 壓縮之外：兩個把 context 壓低的機制
+
+壓縮是「滿了才處理」。這兩個是「一路上少放一點進去」，跟摘要規則無關，但它們決定
+**多久才會滿一次**——所以放在同一份文件。兩個都只在 `codetrail` / `manual` 模式生效。
+
+### 6.1 舊回合的 reasoning 不進模型
+
+plugin 掛在 `experimental.chat.messages.transform`（上游在每次呼叫模型之前、以及把
+歷史送進摘要器之前各 trigger 一次），把 **最新一則真實使用者訊息之前** 的 assistant
+`reasoning` part 拿掉。它之後的一律保留，所以同一輪的工具迴圈仍然看得到自己上一步在
+想什麼。
+
+**為什麼**：OpenCode 對 openai-compatible provider、model id 含 `deepseek` 的模型會自動
+帶上 `interleaved: { field: "reasoning_content" }`，於是每一則歷史 assistant 訊息都把
+完整 reasoning 送回去；DeepSeek-V4 的 chat template 又在「請求帶 `tools`」時對所有訊息
+`keep_reasoning`。實測一段真實對話：兩次壓縮之間 context 漲了 88k–108k tokens，其中
+模型輸出 25k–50k tokens，而那幾乎全部是 reasoning（62k–151k 字元）。那些內容對「下一步
+該做什麼」幾乎沒有貢獻——結論已經寫在回答與工具結果裡了。摘要器那一端同理：一次壓縮的
+71,594 tokens 輸入裡有 36,745 是 reasoning（51%）。
+
+**代價，兩個，都要知道**：
+
+1. **偏離模型官方行為**。DeepSeek-V4 的 encoder 在有 tools 時是刻意全留的，丟掉它是
+   模型相依的品質賭注。`CODETRAIL_KEEP_REASONING=1`（環境變數）可以單獨關掉這一項，
+   不必連結構化壓縮一起切回 `native`。`aicode` 啟動橫幅會顯示目前在哪一邊。
+2. **每個新問題多一次 prefill**。改動歷史等於改動 prompt 前綴，下一輪的快取會在「上一輪
+   第一則 assistant」處失效，要重算上一輪的非 reasoning 內容（工具輸入輸出與回答）。
+   實測那段對話單輪工具輸出 400–25,000 字元，換算約 0.5–30 秒。
+
+**不做的事**：不動 `reasoning` 以外的任何 part、不重排、不新增，認不出「最新一則真實
+使用者訊息」時整段不動。這個 hook 是 `yield* trigger(...)` 而且 hook 用 `Effect.promise`
+呼叫——reject 在 Effect 裡是 defect，會連整個請求一起帶走，所以整段包 try/catch，任何
+一步不確定就什麼都不做。
+
+### 6.2 舊工具輸出會被換成一行（`compaction.prune`）
+
+`prune` 是上游的鍵，預設 `false`；CodeTrail 接管時寫成 `true`。行為（1.18.21 逐字確認）：
+從最新往回走，跳過最近兩個 user turn，累計工具輸出估算 tokens；超過 40,000（`PRUNE_PROTECT`）
+之後的那些是候選，候選總量超過 20,000（`PRUNE_MINIMUM`）時才真的執行。執行的方式是在
+那些 tool part 上補一個時間戳，於是 **送進模型的那一份** 變成
+`[Old tool result content cleared]`。
+
+**DB 裡的原文不動**，TUI 往上捲仍然看得到；被清掉的是模型視野裡的那一份。門檻是硬編碼
+的，不能調。
+
+**代價**：被清掉的工具結果進不了下一次摘要的「已確定事實」，模型要再看就得重叫工具。
+換來的是舊工具輸出有一個 40k tokens 的上限，而不是一路累積到壓縮為止。
+
+### 6.3 升級須知：舊安裝要重跑一次 `./set_config.sh`
+
+`prune` 是**後來才**加進受管鍵的。狀態檔（`~/.config/codetrail/compaction.json`）記的是
+**接管當下**那幾個鍵，所以 `git pull` 之後舊的狀態檔沒有 `prune` 的 ownership 紀錄——
+CodeTrail 不會去寫一個自己沒有授權紀錄的鍵（寫了就等於偷偷接管，而且切回 `native` 時
+還原不回去）。
+
+在那之前一切照常：壓縮照壓、不跳任何錯誤、`prune` 維持你現在的值。要納入管理就重跑
+`./set_config.sh`。`aicode` 啟動橫幅與 `python3 scripts/doctor.py` 都會把還沒接管的
+受管鍵列出來。
+
+6.1 的 reasoning 處理不受這條影響——它不寫設定，載入 plugin 就生效。
+
+---
+
+## 7. 相關
 
 - 症狀排查：[troubleshooting.md](troubleshooting.md)
 - 安裝與設定流程：[setup.md](setup.md)

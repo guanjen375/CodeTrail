@@ -1348,16 +1348,30 @@ def check_compaction_mode(r: Result, project: Path | None = None) -> None:
     drift = compaction_mode.effective_drift(
         config, state=state, plugin_path=compaction_mode.PLUGIN_PATH
     )
-    drift.extend(_recomputed_compaction_drift(compaction_mode, config, mode))
+    drift.extend(_recomputed_compaction_drift(compaction_mode, config, mode, state))
     if drift:
         for item in drift:
             r.warn(f"壓縮設定漂移:{item}")
         r.info("  → plugin 偵測到這個不一致就會停用自動壓縮;重跑 ./set_config.sh 可收斂")
     else:
         r.ok(f"壓縮有效設定與模式一致({mode})")
+    # 這一版新增、但這份狀態檔還沒接管的受管鍵。CodeTrail 對它們沒有 ownership
+    # 證據,所以不會自己補(補了就還原不回去);不講的話使用者升級之後永遠拿不到
+    # 新受管值而且沒有任何訊息。
+    pending = compaction_mode.unmanaged_keys(state)
+    if pending:
+        keys = "、".join(
+            f"{compaction_mode.COMPACTION_SECTION}.{key}" for key in pending
+        )
+        r.warn(
+            f"這一版新增了受管值({keys}),但目前的狀態檔是接管前寫的,還沒管到它們;"
+            "重跑 ./set_config.sh 才會納入(在那之前這些鍵維持你現在的值,壓縮本身照常)"
+        )
 
 
-def _recomputed_compaction_drift(compaction_mode, config: dict, mode: str) -> list[str]:
+def _recomputed_compaction_drift(
+    compaction_mode, config: dict, mode: str, state: dict | None = None
+) -> list[str]:
     """受管值有沒有跟著**目前的**模型限制走。
 
     寫進設定的保留額是 set_config 當時那個 ctx 推導出來的;之後換模型或改 ctx
@@ -1377,8 +1391,18 @@ def _recomputed_compaction_drift(compaction_mode, config: dict, mode: str) -> li
         return []                       # 沒有模型資訊 —— 無從得知,不是漂移
     derived, source = result
     section = config.get(compaction_mode.COMPACTION_SECTION)
+    managed = (state or {}).get("managed")
+    owned = managed if isinstance(managed, dict) else None
     issues = []
     for key, expected in derived.config_values.items():
+        # 只比契約鍵(`prune` 改掉不會讓壓縮失真,plugin 也不會為它停用),而且
+        # 只比**這份狀態檔真的接管過**的那幾個 —— 受管鍵的集合會隨版本長大,
+        # 拿新版的清單去要求舊狀態檔沒接管過的鍵,升級當天每個人都會看到一條
+        # 假的漂移,而 plugin 那端根本沒有停用。
+        if key not in compaction_mode.CONTRACT_COMPACTION_KEYS:
+            continue
+        if owned is not None and key not in owned:
+            continue
         actual = section.get(key) if isinstance(section, dict) else None
         if not compaction_mode.json_equal(actual, expected):
             issues.append(

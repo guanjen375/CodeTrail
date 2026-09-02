@@ -113,8 +113,34 @@ STATE_FILE_MODE = 0o600
 STATE_DIR_MODE = 0o700
 
 # ---- 受管欄位 ------------------------------------------------------------
-#: opencode.json 的 ``compaction`` 物件裡由 CodeTrail 擁有的鍵。
-MANAGED_COMPACTION_KEYS = ("auto", "tail_turns", "preserve_recent_tokens")
+#: opencode.json 的 ``compaction`` 物件裡由 CodeTrail 擁有的鍵 —— 接管時會寫、
+#: 切回 native 時會還原的那一組。
+MANAGED_COMPACTION_KEYS = ("auto", "tail_turns", "preserve_recent_tokens", "prune")
+#: 受管鍵裡「值不符 = 壓縮契約破了」的那一組。
+#:
+#: 為什麼要跟 ``MANAGED_COMPACTION_KEYS`` 分開:漂移偵測的後果是**停用那個
+#: session 的自動壓縮並跳錯誤 toast**。``auto`` / ``tail_turns`` /
+#: ``preserve_recent_tokens`` 被改掉,觸發點與逐字保留的範圍就跟推導出來的
+#: 不一樣,再壓下去會失真 —— 停用是對的。``prune`` 不是:它只決定舊工具輸出
+#: 佔多少 context,關掉之後壓縮照樣正確,只是對話長得比較快。為它停掉整個
+#: session 的壓縮不成比例。
+#:
+#: 這條分界順帶讓「新增受管鍵」不再是破壞性升級:舊安裝的狀態檔沒有新鍵,
+#: 而新鍵不在契約集合裡,所以 ``git pull`` 之後不會每個 session 都跳
+#: config_drift。要納入管理得重跑 ``./set_config.sh``(見 ``unmanaged_keys``)。
+CONTRACT_COMPACTION_KEYS = ("auto", "tail_turns", "preserve_recent_tokens")
+#: ``compaction.prune`` 的受管值。上游預設 false(1.18.21 的 schema 註解逐字
+#: 寫著 default: false)。開了之後,超過最近兩個 user turn 的舊工具輸出在累積
+#: 到上游 ``PRUNE_PROTECT``(40000 tokens)之上、而且可修剪的量超過
+#: ``PRUNE_MINIMUM``(20000 tokens)時,送進模型的那一份會被換成
+#: ``[Old tool result content cleared]``。**只換送進模型的那一份** —— 上游只在
+#: part 上補一個 ``state.time.compacted`` 時間戳,DB 裡的原文與 TUI 顯示不動。
+#:
+#: 為什麼要開:CodeTrail 的工具結果預算是 context 的 12%,一段對話累積數十萬
+#: 字元的工具輸出是常態,而那些輸出在被摘要之前會一直佔著 context。
+#: 代價寫清楚:被清掉的工具結果進不了下一次摘要的「已確定事實」,模型要再看
+#: 就得重叫工具。這是刻意的取捨,不是沒想到。
+PRUNE_OLD_TOOL_OUTPUT = True
 COMPACTION_SECTION = "compaction"
 PLUGIN_SECTION = "plugin"
 
@@ -293,6 +319,7 @@ class DerivedSettings:
             "auto": False,
             "tail_turns": TAIL_TURNS,
             "preserve_recent_tokens": self.preserve_recent_tokens,
+            "prune": PRUNE_OLD_TOOL_OUTPUT,
         }
 
     @property
@@ -671,9 +698,9 @@ def _digest_safe(value: Any, path: str) -> None:
       * 物件的鍵順序與非 ASCII 字串 —— Python 的 `sort_keys` 按 code point、
         JS 的 `.sort()` 按 UTF-16 code unit;lone surrogate 的跳脫方式也不同。
 
-    所以只接受**純量**,而且字串限 ASCII。這三個受管鍵(`auto` / `tail_turns`
-    / `preserve_recent_tokens`)在上游 schema 裡本來就是 boolean / number,
-    容器或非 ASCII 字串都不是有意義的值,擋掉不構成實務限制。
+    所以只接受**純量**,而且字串限 ASCII。受管鍵(`auto` / `tail_turns` /
+    `preserve_recent_tokens` / `prune`)在上游 schema 裡本來就是 boolean /
+    number,容器或非 ASCII 字串都不是有意義的值,擋掉不構成實務限制。
     """
     if value is None or isinstance(value, bool):
         return
@@ -1086,6 +1113,27 @@ def owns(state: dict[str, Any] | None, key: str, config: dict[str, Any]) -> bool
     if error is not None or not isinstance(section, dict) or key not in section:
         return False
     return json_equal(section[key], entry["value"])
+
+
+def unmanaged_keys(state: dict[str, Any] | None) -> tuple[str, ...]:
+    """這一版新增、但這份狀態檔還沒接管的受管鍵。
+
+    受管鍵的集合會隨版本長大,而狀態檔只記得**接管當下**那幾個。那些新鍵
+    CodeTrail 沒有任何 ownership 證據,所以不會去寫它們 —— 寫了就等於在使用者
+    沒有授權的情況下接管一個鍵,而且切回 native 時還原不回去。
+
+    但也不能靜靜當作沒這回事:使用者 `git pull` 之後永遠拿不到新的受管值,
+    而且沒有任何訊息說為什麼。所以由呼叫端(doctor、`aicode` 橫幅)把這個
+    清單講出來,收斂方式一律是重跑 ``./set_config.sh``。
+
+    native 模式回空 tuple:那條路徑本來就什麼都不管。
+    """
+    if not state or state.get("mode") not in PLUGIN_MODES:
+        return ()
+    managed = state.get("managed")
+    if not isinstance(managed, dict):
+        return ()
+    return tuple(key for key in MANAGED_COMPACTION_KEYS if key not in managed)
 
 
 def apply_mode(
@@ -1531,6 +1579,10 @@ def effective_drift(
         return [error]
     if mode in PLUGIN_MODES:
         for key, entry in state.get("managed", {}).items():
+            # `prune` 之類的非契約鍵改掉不會讓壓縮失真,不報成漂移 ——
+            # 報了就等於為一個「只影響 context 用量」的鍵停掉整個 session。
+            if key not in CONTRACT_COMPACTION_KEYS:
+                continue
             expected = entry.get("value")
             present = isinstance(section, dict) and key in section
             shown = repr(section[key]) if present else "(不存在)"

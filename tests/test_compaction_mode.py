@@ -64,6 +64,7 @@ def test_derive_settings_follows_the_upstream_formula():
         "auto": False,
         "tail_turns": 1,
         "preserve_recent_tokens": 23920,
+        "prune": True,
     }
 
 
@@ -427,7 +428,7 @@ def test_native_restores_exactly_what_was_taken_over(tmp_path):
     assert restored is not None
     assert restored["mode"] == cm.MODE_NATIVE and restored["managed"] == {}
     assert restored["section_present"] is state["section_present"]
-    assert config["compaction"] == {"auto": True}          # 原本沒有的兩個鍵被移除
+    assert config["compaction"] == {"auto": True}          # 原本沒有的三個鍵被移除
     assert "plugin" not in config                          # 空陣列一併移除
     assert changes
 
@@ -619,6 +620,80 @@ def test_effective_drift_reports_every_managed_key_and_the_plugin(tmp_path):
 def test_effective_drift_is_silent_without_state(tmp_path):
     """沒有狀態檔 = 沒有接管。這時任何設定都不算漂移。"""
     assert cm.effective_drift({"compaction": {"auto": True}}, state=None) == []
+
+
+def test_prune_is_taken_over_and_restored_but_never_called_drift(tmp_path):
+    """`prune` 是受管鍵(會寫、會還原)但不是契約鍵(改了不算漂移)。
+
+    兩件事都要守:
+      * 不寫/不還原的話,切回 native 會把 `prune: true` 永遠留在使用者的設定裡。
+      * 併進契約集合的話,使用者把它關掉就換來一則錯誤 toast 與「這個 session
+        從此不壓縮」—— 它只影響 context 用量,壓縮本身照樣正確。
+    """
+    plugin = tmp_path / "codetrail-compaction.js"
+    config_path = tmp_path / "opencode.json"
+    config: dict = {}
+    _, _, errors, state = cm.apply_mode(
+        config, mode=cm.MODE_CODETRAIL, derived=_derived(), prior_state=None,
+        config_path=config_path, plugin_path=plugin,
+    )
+    assert errors == []
+    assert config["compaction"]["prune"] is True
+    assert state["managed"]["prune"]["prior"] == {"present": False}
+
+    flipped = json.loads(json.dumps(config))
+    flipped["compaction"]["prune"] = False
+    assert cm.effective_drift(flipped, state=state, plugin_path=plugin) == []
+
+    cm.apply_mode(config, mode=cm.MODE_NATIVE, derived=None, prior_state=state,
+                  config_path=config_path, plugin_path=plugin)
+    assert "compaction" not in config                      # 接管前這個區塊不存在
+
+
+def test_native_leaves_a_prune_value_the_user_set_before_takeover(tmp_path):
+    """接管前使用者自己設過 `prune: false` 時,還原要回到他的值。"""
+    plugin = tmp_path / "codetrail-compaction.js"
+    config_path = tmp_path / "opencode.json"
+    config = {"compaction": {"prune": False}}
+    _, warnings, _, state = cm.apply_mode(
+        config, mode=cm.MODE_CODETRAIL, derived=_derived(), prior_state=None,
+        config_path=config_path, plugin_path=plugin,
+    )
+    assert config["compaction"]["prune"] is True
+    assert any("prune" in warning for warning in warnings)
+    cm.apply_mode(config, mode=cm.MODE_NATIVE, derived=None, prior_state=state,
+                  config_path=config_path, plugin_path=plugin)
+    assert config["compaction"] == {"prune": False}
+
+
+def test_unmanaged_keys_names_what_an_older_state_file_never_took_over(tmp_path):
+    """受管鍵的集合會長大;舊狀態檔只記得接管當下那幾個。
+
+    CodeTrail 對新鍵沒有 ownership 證據,所以不會自己補(補了就還原不回去)。
+    但也不能靜靜當作沒這回事 —— 使用者升級之後永遠拿不到新受管值而且沒有訊息。
+    """
+    config_path = tmp_path / "opencode.json"
+    legacy = cm.build_state(
+        mode=cm.MODE_CODETRAIL, config_path=config_path,
+        managed={key: {"prior": {"present": False},
+                       "value": _derived().config_values[key]}
+                 for key in cm.CONTRACT_COMPACTION_KEYS},
+        plugin={"registered": True, "prior_present": False},
+        section_present=False,
+    )
+    assert cm.validate_state(legacy) is not None           # 舊狀態檔仍然合法
+    assert cm.unmanaged_keys(legacy) == ("prune",)
+
+    config = {"compaction": dict(_derived().config_values)}
+    del config["compaction"]["prune"]
+    assert cm.effective_drift(config, state=legacy) == []  # 沒接管的鍵不算漂移
+
+    _, _, _, current = cm.apply_mode(
+        {}, mode=cm.MODE_CODETRAIL, derived=_derived(), prior_state=None,
+        config_path=config_path,
+    )
+    assert cm.unmanaged_keys(current) == ()
+    assert cm.unmanaged_keys(None) == ()
 
 
 def test_native_mode_flags_a_still_registered_plugin(tmp_path):

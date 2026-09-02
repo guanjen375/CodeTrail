@@ -286,14 +286,19 @@ def _evaluation_config(
                 f"{compaction_mode.PLUGIN_PATH} is missing"
             )
         section = config.get(COMPACTION_SECTION)
+        # Only the contract keys are required: those are the ones compaction
+        # cannot happen without.  ``prune`` is managed too, but a config written
+        # before it became managed still compacts correctly, so demanding it
+        # would refuse a configuration the user really runs.
         missing = [
-            key for key in compaction_mode.MANAGED_COMPACTION_KEYS
+            key for key in compaction_mode.CONTRACT_COMPACTION_KEYS
             if not isinstance(section, dict) or key not in section
         ]
         if missing:
             raise session_eval.SessionEvalError(
                 "--keep-compaction needs the managed compaction settings in the "
-                f"global config; missing: {', '.join(missing)}"
+                f"global config; missing: {', '.join(missing)}. "
+                "Re-run ./set_config.sh to write them."
             )
         config["plugin"] = [str(compaction_mode.PLUGIN_PATH)]
         return config
@@ -304,9 +309,12 @@ def _evaluation_config(
     # long case would turn into a provider error that never happens in the real
     # client, and ``compaction_events`` would silently read zero.
     #
-    # Only CodeTrail's own keys go.  ``prune`` and ``reserved`` are upstream
-    # schema the user may have set independently; replacing those with upstream
-    # defaults would measure a configuration the user does not run.
+    # Only CodeTrail's own keys go.  ``reserved`` is upstream schema the user may
+    # have set independently; replacing it with the upstream default would
+    # measure a configuration the user does not run.  ``prune`` *is* one of ours
+    # (see ``compaction_mode.MANAGED_COMPACTION_KEYS``), so it goes with the rest
+    # -- a replay without the plugin must also drop the tool-output pruning that
+    # only CodeTrail's takeover turns on.
     section = config.get(COMPACTION_SECTION)
     if isinstance(section, dict):
         for key in compaction_mode.MANAGED_COMPACTION_KEYS:
@@ -482,9 +490,10 @@ def _write_replay_compaction_state(
         for key in compaction_mode.MANAGED_COMPACTION_KEYS
         if key in section
     }
-    if len(managed) != len(compaction_mode.MANAGED_COMPACTION_KEYS):
+    if any(key not in managed for key in compaction_mode.CONTRACT_COMPACTION_KEYS):
         raise session_eval.SessionEvalError(
-            "--keep-compaction needs every managed compaction key in the global config"
+            "--keep-compaction needs every contract compaction key in the global "
+            "config; re-run ./set_config.sh to write them"
         )
     state = compaction_mode.build_state(
         mode=compaction_mode.MODE_CODETRAIL,

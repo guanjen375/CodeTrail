@@ -29,6 +29,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+#: 與 opencode_plugins/codetrail-compaction.js 的 `KEEP_REASONING_ENV` 逐字相同。
+KEEP_REASONING_ENV = "CODETRAIL_KEEP_REASONING"
+
 SWITCH_HINT = (
     "行為仍在調整;要回 OpenCode 原生行為:./set_config.sh --compaction-mode native"
 )
@@ -75,6 +78,40 @@ def _config_lines(cm, state: dict, env: dict) -> list[str]:
         return []
 
 
+def _reasoning_line(env: dict) -> list[str]:
+    """舊回合的 reasoning 有沒有被丟掉——那是最大的一筆 context 差異。
+
+    為什麼要印:plugin 會把「最新一則使用者訊息之前」的 assistant reasoning
+    從送進模型的訊息裡拿掉(每段對話省下三到五成的成長)。這偏離 DeepSeek-V4
+    官方模板「有 tools 就全留」的行為,是模型相依的品質取捨——使用者至少要
+    知道自己在哪一邊,以及關掉它的那個變數叫什麼。
+    """
+    raw = str(env.get(KEEP_REASONING_ENV) or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return [f"舊回合 reasoning=保留({KEEP_REASONING_ENV} 已設定)"]
+    return [
+        "舊回合 reasoning=不進模型(省 context;"
+        f"要保留就設 {KEEP_REASONING_ENV}=1)"
+    ]
+
+
+def _pending_managed_lines(cm, state: dict) -> list[str]:
+    """這一版新增、但狀態檔還沒接管的受管鍵。
+
+    CodeTrail 對這些鍵沒有 ownership 證據,所以不會自己補(補了就代表在沒有
+    授權的情況下接管,而且切回 native 還原不回去)。不講的話使用者升級之後
+    永遠拿不到新受管值,而且沒有任何訊息。
+    """
+    try:
+        pending = cm.unmanaged_keys(state)
+    except Exception:  # noqa: BLE001 — 一行資訊不得變成新的失敗來源
+        return []
+    if not pending:
+        return []
+    keys = "、".join(f"{cm.COMPACTION_SECTION}.{key}" for key in pending)
+    return [f"這一版新增了受管值({keys}),重跑 ./set_config.sh 才會生效"]
+
+
 def status_lines(env: dict | None = None) -> list[str]:
     """回要顯示的行(第一行是摘要,其餘是補充)。任何情況都回得出東西。"""
     values = dict(os.environ if env is None else env)
@@ -105,6 +142,8 @@ def status_lines(env: dict | None = None) -> list[str]:
 
     lines = [f"壓縮模式={mode} {cm.EXPERIMENTAL_TAG}——{label}"]
     lines.extend(_config_lines(cm, state, values))
+    lines.extend(_reasoning_line(values))
+    lines.extend(_pending_managed_lines(cm, state))
     if mode == cm.MODE_MANUAL:
         # manual 靠使用者自己按 /compact,而那是完整 TUI 才有的指令:--mini 會把
         # 它當成一般訊息送給模型(模型還會回「好的,開始壓縮」),

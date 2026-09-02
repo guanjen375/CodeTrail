@@ -91,7 +91,13 @@
   symlink 與 symlink 父目錄、dir-fd 原子寫入)、`digest` 必須涵蓋 `prior`(還原時會被
   寫回設定的正是它)、狀態綁定單一目標 config、以及「沒有狀態檔 = 沒有接管」的
   fail-closed 預設。切回 native 只能還原**仍有 ownership 證據**的值(JSON 型別嚴格
-  相等),放寬任何一條就是靜默改掉或刪掉使用者的 OpenCode 設定
+  相等),放寬任何一條就是靜默改掉或刪掉使用者的 OpenCode 設定;
+  `MANAGED_COMPACTION_KEYS`(接管/還原)與 `CONTRACT_COMPACTION_KEYS`(值不符就
+  停用自動壓縮)是兩組,不得合併——把只影響 context 用量的鍵(`prune`)併進契約集合,
+  等於為它停掉整個 session 的壓縮,而且每次新增受管鍵都會讓舊狀態檔的安裝在
+  升級當天全部跳 config_drift;新增受管鍵時 **不得**由 runtime 或 contract check
+  自己補寫(沒有 ownership 紀錄就還原不回去),只能由 `unmanaged_keys` 報出來、
+  使用者重跑 set_config
 - `opencode_plugins/codetrail-compaction.js` 的壓縮契約——七條規則只能經
   `experimental.session.compacting` 的 `context` **附加**(改用 `prompt` 取代會讓
   `previousSummary` 從此不進摘要器,而且完全無聲);`autocontinue` 一律 `false`;
@@ -102,7 +108,13 @@
   `compaction-stopped.jsonl` 才能跨行程(只記摘要/競態那幾種成因,`config_drift` 與
   `version_unsupported` 每個 idle 重算所以不得記),`chat.message` 只讀不改且整段包
   try/catch(上游是 `yield* trigger(...)`,reject 會讓使用者的訊息送不出去);整個 hook
-  必須 fail-open(事件用 `void hook.event(...)` 派送,reject 出去就是 unhandled rejection)
+  必須 fail-open(事件用 `void hook.event(...)` 派送,reject 出去就是 unhandled rejection);
+  `experimental.chat.messages.transform` 只准拿掉「最新一則真實使用者訊息之前」的
+  assistant `reasoning` part(`stripHistoricalReasoning`)——不新增、不重排、不動其他
+  part、認不出那則使用者訊息就整段不動,而且必須就地換陣列元素(上游 trigger 之後
+  用的是原本那個陣列參考,換掉 `output.messages` 完全無效);它同樣包 try/catch,
+  上游是 `yield* trigger(...)` 且以 `Effect.promise` 呼叫,reject 是 defect,會讓
+  整個請求掛掉
 
 任何重構碰到上面這些東西，**新加測試**（開發者寫測試檔，執行依 §1.2 權責），
 不要直接刪 / weaken / 移除檢查點。

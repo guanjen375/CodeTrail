@@ -108,7 +108,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_compaction_mode.py": (
-        "壓縮模式的 ownership 狀態檔:owner-only 權限與 symlink 防線、digest 涵蓋 prior、綁定單一 config、以及「沒有狀態檔 = 沒有接管」的 fail-closed",
+        "壓縮模式的 ownership 狀態檔:owner-only 權限與 symlink 防線、digest 涵蓋 prior、綁定單一 config、以及「沒有狀態檔 = 沒有接管」的 fail-closed;受管鍵與契約鍵是兩組(prune 會寫會還原但改了不算漂移),新增受管鍵不得讓舊狀態檔失效",
         (
             "test_combining_two_models_keeps_the_single_model_relationships",
             "test_save_state_is_owner_only_and_atomic",
@@ -128,6 +128,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_replaced_entry_is_not_hijacked_even_after_we_registered_once",
             "test_switching_to_native_after_a_repo_move_removes_the_old_entry",
             "test_a_native_baseline_is_recomputed_from_the_current_config",
+            "test_prune_is_taken_over_and_restored_but_never_called_drift",
+            "test_native_leaves_a_prune_value_the_user_set_before_takeover",
+            "test_unmanaged_keys_names_what_an_older_state_file_never_took_over",
             "test_state_refuses_values_the_two_languages_serialise_differently",
             "test_a_pre_existing_plugin_is_not_claimed_by_a_repo_move",
             "test_an_entry_we_added_after_a_move_is_still_ours_at_native",
@@ -135,7 +138,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     ),
     "test_opencode_plugins.py": (
         "codetrail-notify 的跨語言字面契約、唯一 export、plugin 失敗不得改動工具結果,以及註冊不得寫進被分析的 repo；"
-        "壓縮 plugin:規則以 context 附加(不得取代 prompt 而丟掉 prior summary)、跨語言凍結值與狀態 digest、壓縮後的核對(空摘要／兩種競態／七欄格式漂移)、停用必須跨 OpenCode 重開保留(且只記不可信的那幾種成因)、恢復後要在使用者送出的那一刻就講(不是整輪答完之後)、不得觸發的每一種狀態、以及零內容與 fail-open",
+        "壓縮 plugin:規則以 context 附加(不得取代 prompt 而丟掉 prior summary)、跨語言凍結值與狀態 digest、壓縮後的核對(空摘要／兩種競態／七欄格式漂移)、停用必須跨 OpenCode 重開保留(且只記不可信的那幾種成因)、恢復後要在使用者送出的那一刻就講(不是整輪答完之後)、不得觸發的每一種狀態、以及零內容與 fail-open；"
+        "messages.transform 只准拿掉最新一則真實使用者訊息之前的 reasoning(就地換陣列元素、不動其他 part、認不出就整段不動、絕不 reject)、prune 是受管但非契約鍵(改了不得停用、舊狀態檔升級當天不得全部跳 config_drift)",
         (
             "test_marker_literal_is_the_frozen_contract",
             "test_notify_incident_constants_are_the_frozen_contract",
@@ -197,6 +201,16 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_an_already_compacted_anchor_is_not_compacted_again_after_a_restart",
             "test_effective_config_drift_disables_the_plugin",
             "test_manual_mode_still_reports_effective_config_drift",
+            "test_old_turn_reasoning_is_dropped_and_the_current_turn_is_kept",
+            "test_the_transform_mutates_the_array_in_place",
+            "test_only_reasoning_parts_are_touched",
+            "test_the_transform_does_nothing_without_a_state_file_or_in_native_mode",
+            "test_the_keep_reasoning_escape_hatch_turns_the_transform_off",
+            "test_an_unsupported_opencode_version_turns_the_transform_off",
+            "test_the_transform_never_rejects_on_a_shape_it_does_not_understand",
+            "test_a_history_without_a_real_user_message_is_left_alone",
+            "test_a_changed_prune_is_never_reported_as_drift",
+            "test_a_state_file_written_before_prune_became_managed_still_compacts",
             "test_a_verification_that_cannot_run_stops_and_reports",
             "test_the_version_gate_uses_the_measured_running_version",
             "test_the_state_path_override_still_enforces_every_check",

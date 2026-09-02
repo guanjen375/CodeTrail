@@ -1423,15 +1423,16 @@ def test_replay_config_drops_the_managed_compaction_override():
         "plugin": ["/abs/codetrail-compaction.js"],
         "compaction": {
             "auto": False, "tail_turns": 1, "preserve_recent_tokens": 23920,
-            # 上游 schema、跟 CodeTrail 無關的兩個鍵:使用者可能自己設過
+            # `prune` 是 CodeTrail 的受管鍵(接管才會開),`reserved` 不是 ——
+            # 後者是上游 schema,使用者可能自己設過。
             "prune": True, "reserved": 12000,
         },
     }
 
     result = session_eval_cli._evaluation_config(config, "llamacpp/candidate")
     assert result["plugin"] == []
-    # 只拿掉 CodeTrail 擁有的三個鍵;把整段刪掉是在評測使用者沒有在跑的設定
-    assert result["compaction"] == {"prune": True, "reserved": 12000}
+    # 只拿掉 CodeTrail 擁有的鍵;把整段刪掉是在評測使用者沒有在跑的設定
+    assert result["compaction"] == {"reserved": 12000}
     for key in compaction_mode.MANAGED_COMPACTION_KEYS:
         assert key not in result["compaction"]
 

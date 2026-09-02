@@ -172,6 +172,16 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
   `RECONCILIATION_HEADER` 逐字沿用它們，`compaction_mode.derive_settings` 與 plugin 的
   `deriveSettings()` 是同一條公式的兩份實作。三處任一改了另外兩處沒跟上，只會讓門檻與
   保留額對不上——沒有任何錯誤訊息。`tests/test_opencode_plugins.py` 逐字比對
+- 新增 `compaction.*` 受管鍵 → `compaction_mode.MANAGED_COMPACTION_KEYS` 與 plugin 端的
+  同名常數要一起改,而且**預設不要進** `CONTRACT_COMPACTION_KEYS`:契約鍵的意思是「值
+  不符就停用那個 session 的自動壓縮」,只有「改了會讓壓縮失真」的鍵才配得上這個後果。
+  新鍵一律不由 runtime 或 contract check 自己補寫(沒有 ownership 紀錄就切不回 native),
+  由 `compaction_mode.unmanaged_keys()` 報出來、使用者重跑 `./set_config.sh`
+- 舊回合 reasoning 的處理在 plugin 的 `experimental.chat.messages.transform`
+  (`stripHistoricalReasoning`)。它改的是**送進模型的訊息本身**,多砍一個 part 是靜默
+  失真、砍到 tool part 會讓 provider 直接報錯,所以只准動 `reasoning`、只准就地換陣列
+  元素。逃生口是 `CODETRAIL_KEEP_REASONING=1`(`scripts/compaction_status.py` 與 plugin
+  各有一份同名常數,由 `tests/test_opencode_plugins.py` 比對)
 - 新增 incident kind / detail slug → `mcp_lease.py`、`opencode_plugins/codetrail-notify.js`、
   `opencode_plugins/codetrail-compaction.js` 與 `tests/test_opencode_plugins.py` 的
   凍結 tuple 必須一起改（跨語言封閉集合；一端沒跟上就把另一端寫的合法值正規化成

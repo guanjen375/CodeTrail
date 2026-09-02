@@ -55,6 +55,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import compaction_mode as cm  # noqa: E402
+from scripts import compaction_status  # noqa: E402
 from scripts import opencode_contract_check as check  # noqa: E402
 
 pytestmark = pytest.mark.smoke
@@ -173,6 +174,17 @@ def test_mode_constants_match_the_python_module():
     assert tuple(_compaction_js_literal("PLUGIN_MODES")) == cm.PLUGIN_MODES
     assert tuple(_compaction_js_literal("AUTO_TRIGGER_MODES")) == cm.AUTO_TRIGGER_MODES
     assert tuple(_compaction_js_literal("MANAGED_COMPACTION_KEYS")) == cm.MANAGED_COMPACTION_KEYS
+    assert (
+        tuple(_compaction_js_literal("CONTRACT_COMPACTION_KEYS"))
+        == cm.CONTRACT_COMPACTION_KEYS
+    )
+    # 兩組不得合併:契約鍵是「值不符就停用這個 session 的自動壓縮」,受管鍵是
+    # 「接管時會寫、切回 native 時會還原」。把 prune 併進契約集合,等於為一個
+    # 只影響 context 用量的鍵停掉整段壓縮;而每次新增受管鍵也會讓舊狀態檔的
+    # 安裝在升級當天全部跳 config_drift。
+    assert set(cm.CONTRACT_COMPACTION_KEYS) < set(cm.MANAGED_COMPACTION_KEYS)
+    assert _compaction_js_literal("PRUNE_OLD_TOOL_OUTPUT") is cm.PRUNE_OLD_TOOL_OUTPUT
+    assert _compaction_js_literal("KEEP_REASONING_ENV") == compaction_status.KEEP_REASONING_ENV
     assert _compaction_js_literal("MODE_STATE_FILE") == cm.STATE_FILENAME
     assert tuple(_compaction_js_literal("CONFIG_DIR_PARTS")) == cm.STATE_DIR_PARTS
     assert _compaction_js_literal("TOOL_RESULT_CONTEXT_FRACTION") == cm.TOOL_RESULT_CONTEXT_FRACTION
@@ -2107,6 +2119,256 @@ def test_a_summary_that_lands_late_is_still_verified(tmp_path):
         "emit(I.countSummariesSince(P.messages, P.since, P.seen));",
         {"messages": late_empty, "since": early, "seen": ["s1a", "s2a"]},
     ) == 0
+
+
+# ---------------------------------------------------------------------------
+# 8. 舊回合 reasoning 不進模型(docs/compaction-rules.md §6.1)
+# ---------------------------------------------------------------------------
+# 為什麼要守:這個 hook 改的是**送進模型的訊息本身**。多砍一個 part 的後果是
+# 靜默的 —— 對話照常、工具照跑,只是模型少看到東西;砍掉工具結果或拆散
+# tool-call/tool-result 配對還會讓 provider 直接報錯。而「換掉 output.messages」
+# 這種寫法在上游眼中是完全無效的(它之後用的是原本那個陣列參考),測不出來的話
+# 整個功能會安靜地什麼都沒做。
+_TRANSFORM_DRIVER = """
+const hooks = await CodetrailCompaction({ client: {} });
+const out = { messages: P.messages };
+await hooks['experimental.chat.messages.transform']({}, out);
+emit({ sameArray: out.messages === P.messages, messages: P.messages });
+"""
+
+
+def _transform(tmp_path, messages, *, mode=cm.MODE_CODETRAIL, install=True,
+               extra_env=None):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    if install:
+        _install_state(home, mode)
+    return _js(tmp_path, _TRANSFORM_DRIVER, {"messages": messages},
+               home=home, extra_env=extra_env)
+
+
+def _types(result):
+    return [[part["type"] for part in entry["parts"]] for entry in result["messages"]]
+
+
+_TWO_TURNS = [
+    _user("u1", "第一個問題", 100),
+    _assistant("a1", "u1", "第一個回答", 101, reasoning="舊的思考過程"),
+    _user("u2", "第二個問題", 200),
+    _assistant("a2", "u2", "查一下", 201, reasoning="這一輪的思考",
+               tools=(("codetrail_read_file", "completed"),)),
+]
+
+
+@pytest.mark.smoke
+def test_old_turn_reasoning_is_dropped_and_the_current_turn_is_kept(tmp_path):
+    """界線是「最新一則真實使用者訊息」:它之後的 reasoning 必須留著。
+
+    全砍掉的話,同一輪的工具迴圈就看不到自己上一步在想什麼 —— 那是這一輪還在
+    用的東西,不是歷史。
+    """
+    result = _transform(tmp_path, json.loads(json.dumps(_TWO_TURNS)))
+    assert _types(result) == [
+        ["text"],                       # u1
+        ["text"],                       # a1:舊回合 —— reasoning 沒了
+        ["text"],                       # u2(最新一則真實使用者訊息 = 界線)
+        ["text", "reasoning", "tool"],  # a2:這一輪的,原樣留著
+    ]
+
+
+@pytest.mark.smoke
+def test_the_transform_mutates_the_array_in_place(tmp_path):
+    """上游 trigger 之後用的是**原本那個陣列參考**。
+
+    改成 `output.messages = [...]` 的話上游根本看不到,整個功能安靜地沒作用,
+    而所有「有沒有砍掉」的斷言仍然可以是綠的(因為我們自己讀的是新陣列)。
+    """
+    result = _transform(tmp_path, json.loads(json.dumps(_TWO_TURNS)))
+    assert result["sameArray"] is True
+
+
+@pytest.mark.smoke
+def test_only_reasoning_parts_are_touched(tmp_path):
+    """reasoning 以外一個 part 都不准動,順序也不准變。
+
+    砍到 tool part 會拆散 tool-call/tool-result 的配對,provider 直接報錯;
+    砍到 text 則是靜默失真。
+    """
+    messages = [
+        _user("u1", "第一個問題", 100),
+        _assistant("a1", "u1", "先看檔案", 101, reasoning="舊的思考",
+                   tools=(("codetrail_read_file", "completed"),
+                          ("codetrail_grep_code", "completed"))),
+        _assistant("a1b", "u1", "第一個回答", 102, reasoning="還是舊的"),
+        _user("u2", "第二個問題", 200),
+        _assistant("a2", "u2", "第二個回答", 201),
+    ]
+    result = _transform(tmp_path, messages)
+    assert _types(result) == [
+        ["text"], ["text", "tool", "tool"], ["text"], ["text"], ["text"],
+    ]
+    # 訊息本身(id 與順序)完全不動
+    assert [entry["info"]["id"] for entry in result["messages"]] == [
+        "u1", "a1", "a1b", "u2", "a2",
+    ]
+    tools = result["messages"][1]["parts"][1:]
+    assert [part["state"]["output"] for part in tools] == ["機密內容不得外流"] * 2
+
+
+@pytest.mark.smoke
+def test_the_transform_does_nothing_without_a_state_file_or_in_native_mode(tmp_path):
+    """「沒有狀態檔 = 沒有接管」對這個 hook 一樣成立。"""
+    for name, kwargs in (("no-state", {"install": False}),
+                         ("native", {"mode": cm.MODE_NATIVE})):
+        result = _transform(tmp_path / name, json.loads(json.dumps(_TWO_TURNS)),
+                            **kwargs)
+        assert _types(result) == [
+            ["text"], ["text", "reasoning"], ["text"], ["text", "reasoning", "tool"],
+        ], name
+
+
+@pytest.mark.smoke
+def test_manual_mode_also_drops_old_reasoning(tmp_path):
+    """manual 只是不主動觸發壓縮;省 context 這件事兩個模式都要。"""
+    result = _transform(tmp_path, json.loads(json.dumps(_TWO_TURNS)),
+                        mode=cm.MODE_MANUAL)
+    assert _types(result) == [
+        ["text"], ["text"], ["text"], ["text", "reasoning", "tool"],
+    ]
+
+
+@pytest.mark.smoke
+def test_the_keep_reasoning_escape_hatch_turns_the_transform_off(tmp_path):
+    """丟掉歷史 reasoning 是模型相依的品質賭注,要能單獨關掉。
+
+    沒有這個逃生口的話,唯一的退路是連結構化壓縮一起切回 native。
+    """
+    result = _transform(
+        tmp_path, json.loads(json.dumps(_TWO_TURNS)),
+        extra_env={compaction_status.KEEP_REASONING_ENV: "1"},
+    )
+    assert _types(result) == [
+        ["text"], ["text", "reasoning"], ["text"], ["text", "reasoning", "tool"],
+    ]
+
+
+@pytest.mark.smoke
+def test_an_unsupported_opencode_version_turns_the_transform_off(tmp_path):
+    """版本閘擋不住的東西不做:1.18.17 以前的訊息序列化語意沒驗過。"""
+    result = _transform(
+        tmp_path, json.loads(json.dumps(_TWO_TURNS)),
+        extra_env={"AICODE_OPENCODE_VERSION": "1.18.16"},
+    )
+    assert _types(result) == [
+        ["text"], ["text", "reasoning"], ["text"], ["text", "reasoning", "tool"],
+    ]
+
+
+@pytest.mark.smoke
+def test_the_transform_never_rejects_on_a_shape_it_does_not_understand(tmp_path):
+    """上游是 `yield* trigger(...)`、hook 用 `Effect.promise` 呼叫 —— reject 是
+    defect,會連整個請求一起帶走。認不出來就整段不動,絕不丟例外。"""
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    _install_state(home, cm.MODE_CODETRAIL)
+    result = _js(
+        tmp_path,
+        """
+        const hooks = await CodetrailCompaction({ client: {} });
+        const seen = [];
+        for (const out of [{}, { messages: null }, { messages: 'x' },
+                           { messages: [null, 7, { info: {}, parts: null }] },
+                           { messages: [{ info: { role: 'assistant' },
+                                          parts: [{ type: 'reasoning', text: 'x' }] }] }]) {
+          try {
+            await hooks['experimental.chat.messages.transform']({}, out);
+            seen.push('ok');
+          } catch (error) { seen.push(String(error)); }
+        }
+        emit(seen);
+        """,
+        {}, home=home,
+    )
+    assert result == ["ok"] * 5
+
+
+@pytest.mark.smoke
+def test_a_history_without_a_real_user_message_is_left_alone(tmp_path):
+    """認不出「最新一則真實使用者訊息」就整段不動(fail-open)。
+
+    猜錯的代價是砍掉**當前這一輪**自己的思路,而省下來的 context 遠不值那個。
+    synthetic 的 auto-continue 訊息不算真實使用者訊息。
+    """
+    messages = [
+        _user("c1", None, 100, compaction=True, tail_start_id="u0"),
+        _assistant("s1a", "c1", SUMMARY_OK, 101, summary=True),
+        _assistant("a9", "c1", "續答", 102, reasoning="還在想"),
+    ]
+    result = _transform(tmp_path, messages)
+    assert _types(result) == [["compaction"], ["text"], ["text", "reasoning"]]
+
+
+# ---------------------------------------------------------------------------
+# 9. prune:受管但不是契約鍵(docs/compaction-rules.md §6.2 / §6.3)
+# ---------------------------------------------------------------------------
+@pytest.mark.smoke
+def test_a_changed_prune_is_never_reported_as_drift(tmp_path):
+    """`prune` 被改掉不會讓壓縮失真,不得因此停用整個 session。
+
+    併進契約集合的話,使用者(或專案層設定)把 prune 關掉就會換來一則錯誤 toast
+    與「這個 session 從此不壓縮」—— 對一個只影響 context 用量的鍵不成比例。
+    """
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    config = _install_state(home, cm.MODE_CODETRAIL)
+    assert config["compaction"]["prune"] is True
+    flipped = json.loads(json.dumps(config))
+    flipped["compaction"]["prune"] = False
+    assert cm.effective_drift(flipped, state=cm.load_state(
+        path=home / ".config" / "codetrail" / cm.STATE_FILENAME)) == []
+    result = _run_idle(tmp_path, config=flipped, messages=_big_session(120_000),
+                       afterMessages=_compacted_session())
+    assert result["summarized"] == 1
+    assert not _alerts(result)
+
+
+@pytest.mark.smoke
+def test_a_state_file_written_before_prune_became_managed_still_compacts(tmp_path):
+    """升級路徑:舊狀態檔只記得三個受管鍵,設定裡也沒有 `prune`。
+
+    拿新版的受管鍵清單去要求舊狀態檔沒接管過的鍵,升級當天每個 session 都會被
+    判 config_drift 而永久停用 —— 而使用者什麼都沒改。
+    """
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    derived = cm.derive_settings(context_limit=131072, output_limit=8192)
+    legacy_values = {
+        key: value for key, value in derived.config_values.items()
+        if key in cm.CONTRACT_COMPACTION_KEYS
+    }
+    state = cm.build_state(
+        mode=cm.MODE_CODETRAIL,
+        config_path=_effective_config_path(home),
+        managed={key: {"prior": {"present": False}, "value": value}
+                 for key, value in legacy_values.items()},
+        plugin={"registered": True, "prior_present": False, "entry": "string",
+                "path_hash": cm.plugin_path_hash(str(cm.PLUGIN_PATH))},
+        section_present=False,
+    )
+    cm.save_state(state, path=home / ".config" / "codetrail" / cm.STATE_FILENAME)
+    assert cm.unmanaged_keys(state) == ("prune",)
+
+    result = _js(tmp_path, _DRIVER, {
+        "session": {"id": "s1", "version": "1.18.21", "title": "t"},
+        "config": {"compaction": dict(legacy_values)},
+        "providers": _PROVIDERS,
+        "events": [_IDLE],
+        "messages": _big_session(120_000),
+        "afterMessages": _compacted_session(),
+    }, home=home)
+    assert result["summarized"] == 1
+    assert not _alerts(result)
 
 
 # ---------------------------------------------------------------------------

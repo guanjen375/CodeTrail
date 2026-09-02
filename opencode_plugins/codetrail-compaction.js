@@ -2,7 +2,7 @@
  * codetrail-compaction —— 把 OpenCode 的自動壓縮搬到「答完之後」，並把摘要
  * 收斂成固定欄位。契約與取捨的完整說明在 docs/compaction-rules.md。
  *
- * 三件事，其餘什麼都不做：
+ * 五件事，其餘什麼都不做：
  *
  * 1. `experimental.session.compacting`：把七條摘要規則與一段有字元上限的
  *    「狀態校正」節錄，用 `context`（**附加**）掛在上游 prompt 後面。
@@ -14,6 +14,14 @@
  *    「有效設定被翻回 auto:true」那種情況的保險。
  * 3. `event`（`session.idle`）：codetrail 模式下依推導出來的門檻主動觸發
  *    `session.summarize`，完成後**核對**摘要有沒有真的落在該落的位置。
+ * 4. `chat.message`：只讀不改。恢復一個已停用的 session 時，在使用者按下
+ *    Enter 的那一刻就把「這個 session 不會再壓縮」講出來（上游沒有「session
+ *    被打開」的事件，這是拿得到的最早時機）。
+ * 5. `experimental.chat.messages.transform`：把**舊回合**的 assistant
+ *    reasoning 從送進模型的那一份訊息裡拿掉（`stripHistoricalReasoning`）。
+ *    最新一則真實使用者訊息之後的一律保留，所以同一輪的工具迴圈看得到自己
+ *    上一步在想什麼。這是省 context，不是安全檢查：任何一步不確定就整段
+ *    不動。
  *
  * ── 紅線 ──────────────────────────────────────────────────────────────
  *  - **fail-open**：每個查詢／toast／寫檔各自 try/catch。上游用
@@ -89,7 +97,15 @@ const MODE_MANUAL = "manual";
 const COMPACTION_MODES = ["codetrail", "native", "manual"];
 const PLUGIN_MODES = ["codetrail", "manual"];
 const AUTO_TRIGGER_MODES = ["codetrail"];
-const MANAGED_COMPACTION_KEYS = ["auto", "tail_turns", "preserve_recent_tokens"];
+const MANAGED_COMPACTION_KEYS = ["auto", "tail_turns", "preserve_recent_tokens", "prune"];
+// 受管鍵裡「值不符 = 壓縮契約破了」的那一組（compaction_mode 端逐字相同）。
+// `prune` 刻意不在裡面：它只決定舊工具輸出佔多少 context，改掉之後壓縮照樣
+// 正確，為它停掉整個 session 的自動壓縮並跳錯誤 toast 不成比例。這條分界也
+// 讓「新增受管鍵」不再是破壞性升級 —— 舊狀態檔沒有新鍵，而新鍵不在契約集合
+// 裡，所以 git pull 之後不會每個 session 都跳 config_drift。
+const CONTRACT_COMPACTION_KEYS = ["auto", "tail_turns", "preserve_recent_tokens"];
+// `compaction.prune` 的受管值（上游 schema 預設 false）。
+const PRUNE_OLD_TOOL_OUTPUT = true;
 const COMPACTION_SECTION = "compaction";
 
 // 推導常數（compaction_mode.derive_settings 的 JS 對應；跨語言測試逐字比對）
@@ -110,6 +126,12 @@ const MIN_COMPACTION_OPENCODE_VERSION = [1, 18, 17];
 // 地方）量好之後用這個環境變數遞下來。沒有這個變數＝不是 aicode 起的 session，
 // 這一端就不做版本判斷（那條路徑本來就沒有任何 CodeTrail preflight）。
 const OPENCODE_VERSION_ENV = "AICODE_OPENCODE_VERSION";
+
+// 舊回合 reasoning 的逃生口：設成 1 / true / yes / on 就完全不動 reasoning。
+// 為什麼要有：丟掉歷史 reasoning 是模型相依的品質取捨（DeepSeek-V4 的官方
+// 模板在有 tools 時是全部保留的），品質有疑慮時應該能單獨關掉這一項，而不是
+// 連結構化壓縮一起切回 native。
+const KEEP_REASONING_ENV = "CODETRAIL_KEEP_REASONING";
 
 // 壓縮品質 eval 用的逃生口：replay 會把 OPENCODE_CONFIG 換成臨時檔，真正的
 // 狀態檔身分對不上。指到另一份**同樣要通過全部安全檢查**的狀態檔（owner-only、
@@ -211,6 +233,12 @@ function versionSupported(env = process.env) {
   const parsed = parseVersion(raw);
   if (!parsed) return null;
   return versionAtLeast(parsed, MIN_COMPACTION_OPENCODE_VERSION);
+}
+
+/** 使用者要求整段保留舊回合的 reasoning 嗎？（`CODETRAIL_KEEP_REASONING`） */
+function keepReasoningRequested(env = process.env) {
+  const raw = String((env && env[KEEP_REASONING_ENV]) || "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
 }
 
 // ── 模式狀態 ────────────────────────────────────────────────────────────
@@ -407,12 +435,14 @@ function deriveSettings(limits) {
     tailCap,
     preserveRecentTokens,
     idleThreshold,
-    // 這三個就是應該出現在 opencode.json 的受管值（compaction_mode 的
-    // `DerivedSettings.config_values`）。runtime 拿它跟有效設定對照。
+    // 這四個就是應該出現在 opencode.json 的受管值（compaction_mode 的
+    // `DerivedSettings.config_values`）。runtime 拿它跟有效設定對照 —— 但只對照
+    // `CONTRACT_COMPACTION_KEYS` 那幾個，見那個常數的註解。
     configValues: {
       auto: false,
       tail_turns: TAIL_TURNS,
       preserve_recent_tokens: preserveRecentTokens,
+      prune: PRUNE_OLD_TOOL_OUTPUT,
     },
   };
 }
@@ -460,6 +490,7 @@ function combineSettings(summariser, live) {
       auto: false,
       tail_turns: TAIL_TURNS,
       preserve_recent_tokens: preserveRecentTokens,
+      prune: PRUNE_OLD_TOOL_OUTPUT,
     },
   };
 }
@@ -511,7 +542,8 @@ function effectiveDrift(config, state) {
   }
   const drift = [];
   const managed = state.managed || {};
-  for (const key of MANAGED_COMPACTION_KEYS) {
+  // 只看契約鍵。`prune` 被改掉不會讓壓縮失真，報成漂移等於為它停掉整個 session。
+  for (const key of CONTRACT_COMPACTION_KEYS) {
     const entry = managed[key];
     if (!entry || !("value" in entry)) continue;
     const present = section !== undefined && section !== null && key in section;
@@ -645,6 +677,54 @@ function lastNonSummaryAssistantIndex(messages) {
 
 function newestRealUserIndex(messages) {
   return newestIndex(messages, isRealUser);
+}
+
+/**
+ * 把**舊回合**的 assistant reasoning part 從送進模型的那一份訊息裡拿掉，
+ * 回傳拿掉的 part 數。
+ *
+ * 界線是「最新一則**真實**使用者訊息」：它之後的一律保留，所以同一輪的工具
+ * 迴圈看得到自己上一步在想什麼；它之前的整段丟掉。
+ *
+ * ── 為什麼要做 ────────────────────────────────────────────────────────
+ * OpenCode 對 openai-compatible + model id 含 `deepseek` 會自動帶
+ * `interleaved: { field: "reasoning_content" }`，於是**每一則**歷史 assistant
+ * 訊息都會把完整 reasoning 送回去；DeepSeek-V4 的模板又在「請求帶 tools」時
+ * 對所有訊息 `keep_reasoning`。實測一段對話兩次壓縮之間漲的 9 萬 token 裡，
+ * 三到五成是歷史 reasoning，而它對「下一步該做什麼」幾乎沒有貢獻 —— 結論已經
+ * 寫在回答與工具結果裡了。
+ *
+ * ── 明確的取捨 ────────────────────────────────────────────────────────
+ * 這偏離 DeepSeek-V4 官方 encoder 的行為（它有 tools 就全留），是**模型相依**
+ * 的品質賭注；`CODETRAIL_KEEP_REASONING=1` 可以單獨關掉。另外，改動歷史等於
+ * 動了 prompt 前綴：下一輪會從「上一輪第一則 assistant」開始重新 prefill，
+ * 代價是每個新問題多幾秒到幾十秒（重算的是上一輪的非 reasoning 內容）。
+ *
+ * ── 為什麼是就地換元素 ────────────────────────────────────────────────
+ * 上游 trigger 之後用的是**原本那個陣列參考**（`{messages: C}` 傳進來，之後
+ * 用的還是 `C`），所以換掉 `output.messages` 不會被看到，只能改陣列元素。
+ * 元素本身淺拷貝、`parts` 換成過濾後的新陣列 —— 傳進來的物件在主迴圈那邊
+ * 還有別的用途，不就地砍它的 `parts`。
+ *
+ * 認不出「最新一則真實使用者訊息」時回 0、什麼都不動（fail-open）：這是省
+ * context 的最佳化，猜錯的代價是砍掉當前這一輪自己的思路。
+ */
+function stripHistoricalReasoning(messages) {
+  if (!Array.isArray(messages)) return 0;
+  const cut = newestRealUserIndex(messages);
+  if (cut < 0) return 0;
+  let removed = 0;
+  for (let index = 0; index < cut; index++) {
+    const entry = messages[index];
+    const info = entryInfo(entry);
+    if (!info || info.role !== "assistant") continue;
+    const parts = entryParts(entry);
+    const kept = parts.filter((part) => !part || part.type !== "reasoning");
+    if (kept.length === parts.length) continue;
+    removed += parts.length - kept.length;
+    messages[index] = { ...entry, parts: kept };
+  }
+  return removed;
 }
 
 function isAnswered(messages, userID) {
@@ -1385,6 +1465,37 @@ const CodetrailCompaction = async (input = {}) => {
       }
     },
 
+    /**
+     * 每一次送進模型之前都會過這裡：主迴圈的每一步，以及壓縮時送進摘要器的
+     * 那一份 head（上游對兩條路徑 trigger 同一個 hook）。
+     *
+     * 只做一件事：把舊回合的 assistant reasoning 拿掉（見
+     * `stripHistoricalReasoning`）。不加、不改、不重排任何訊息。
+     *
+     * 閘刻意只有三道 —— 模式、版本、逃生口：
+     *   - **不看 session 停用狀態**：這個 hook 的 `hookInput` 是 `{}`，上游根本
+     *     沒給 sessionID。而且已停用的 session 不會再壓縮，context 只會一直
+     *     長，正是最需要省的那一個。
+     *   - **不看 config drift**：漂移的是壓縮門檻與 tail 保留額，跟「歷史
+     *     reasoning 要不要送」無關；而且 `gate()` 會為此多打一次
+     *     `config.get()`，這個 hook 每一步都跑。
+     *
+     * 整段 try/catch：上游是 `yield* trigger(...)`（不是事件的 `void`），而 hook
+     * 是用 `Effect.promise` 呼叫的 —— reject 在 Effect 裡是 defect，丟出去會
+     * 連整個請求一起帶走。省 context 的最佳化絕不能讓一輪送不出去。
+     */
+    async "experimental.chat.messages.transform"(hookInput, output) {
+      try {
+        if (keepReasoningRequested()) return;
+        if (versionSupported() === false) return;
+        const state = await modeState();
+        if (!state || !PLUGIN_MODES.includes(state.mode)) return;
+        stripHistoricalReasoning(output && output.messages);
+      } catch {
+        /* fail-open：不動就是了，原本的訊息照樣送出去 */
+      }
+    },
+
     async "experimental.compaction.autocontinue"(hookInput, output) {
       try {
         if (!(await gate(hookInput && hookInput.sessionID))) return;
@@ -1474,7 +1585,7 @@ const CodetrailCompaction = async (input = {}) => {
    * `limit.context` 被改（換模型 / 改 ctx）時只有它會被同步，保留額不會，於是
    * 門檻用新的、tail 用舊的。回 true 代表已經報過並停用，呼叫端要 return。
    */
-  async function reportStaleManagedValues(sessionID, entry, config, messages) {
+  async function reportStaleManagedValues(sessionID, entry, config, messages, state) {
     const anchorIndex = lastNonSummaryAssistantIndex(messages);
     const anchor = anchorIndex >= 0 ? entryInfo(messages[anchorIndex]) : null;
     const { limits, derived } = await derivedForCompaction(config, anchor);
@@ -1487,7 +1598,13 @@ const CodetrailCompaction = async (input = {}) => {
     }
     const managed = derived.configValues;
     const section = config && config[COMPACTION_SECTION];
-    const stale = Object.keys(managed).some(
+    // 只比契約鍵，而且只比**這份狀態檔真的接管過**的那幾個：受管鍵的集合會隨
+    // 版本長大，拿新版的清單去要求舊狀態檔沒接管過的鍵，等於升級當天每個
+    // session 都被判 config_drift 而永久停用。
+    const owned = state && state.managed && typeof state.managed === "object"
+      ? state.managed
+      : {};
+    const stale = CONTRACT_COMPACTION_KEYS.filter((key) => key in owned).some(
       (key) => !section || typeof section !== "object" || section[key] !== managed[key],
     );
     if (stale) {
@@ -1568,7 +1685,7 @@ const CodetrailCompaction = async (input = {}) => {
 
     // 受管值有沒有跟著**目前**的有效模型走 —— manual 也要查。手按 /compact 用的
     // 是同一組 tail 設定，模型換小了一樣會拿舊保留額。
-    if (await reportStaleManagedValues(sessionID, entry, config, messages)) return;
+    if (await reportStaleManagedValues(sessionID, entry, config, messages, state)) return;
     if (!AUTO_TRIGGER_MODES.includes(state.mode)) return; // manual：不主動觸發
 
     // 不確定的狀態一律不壓縮：最後一則助理出錯／被中斷、或還沒完成。
@@ -1656,8 +1773,11 @@ CodetrailCompaction.internals = {
   INCIDENT_MAX_BYTES,
   INCIDENT_SCHEMA,
   INCIDENT_SOURCE,
+  CONTRACT_COMPACTION_KEYS,
+  KEEP_REASONING_ENV,
   MANAGED_COMPACTION_KEYS,
   MIN_COMPACTION_OPENCODE_VERSION,
+  PRUNE_OLD_TOOL_OUTPUT,
   MODE_STATE_FILE,
   OPENCODE_VERSION_ENV,
   STATE_PATH_ENV,
@@ -1678,6 +1798,7 @@ CodetrailCompaction.internals = {
   incidentsPath,
   isCompletedAnswer,
   isRealUser,
+  keepReasoningRequested,
   isSyntheticUser,
   modeStatePath,
   modelLimits,
@@ -1709,6 +1830,7 @@ CodetrailCompaction.internals = {
   selectRecentTurns,
   stateDir,
   stopMessage,
+  stripHistoricalReasoning,
   summaryText,
   tailRetains,
   totalTokens,
