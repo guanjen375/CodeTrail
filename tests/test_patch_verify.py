@@ -32,7 +32,7 @@ TITLE_DISABLED = (
     "——patch 已套用、未回滾"
 )
 SECTION_SYNTAX = "=== 自動驗證 (requested: syntax) ==="
-NEXT_STEPS = "建議下一步: 對改過的檔案呼叫 codetrail_run_lint(fix=False)"
+NEXT_STEPS = "建議下一步: 對改過的檔案呼叫 run_lint(fix=False)"
 
 
 @pytest.fixture
@@ -157,7 +157,7 @@ def test_legacy_steps_are_not_consumed_and_do_not_spawn(runner: ToolExecutor, tm
     for step in ("lint", "typecheck", "test"):
         assert (
             f"○ x.py: {step} skipped: step '{step}' is no longer consumed by apply_patch; "
-            "call codetrail_run_lint(fix=False) / codetrail_run_command explicitly"
+            "call run_lint(fix=False) / run_command explicitly"
         ) in lines, lines
     assert lint_calls == [] and cmd_calls == [] and spawn_guard == []
 
@@ -232,7 +232,7 @@ def test_native_and_executor_docstrings_are_updated():
     assert "git 不在白名單" in run_command_doc
     assert "client 可能更早截止" in run_command_doc
     verify_doc = " ".join(docs["_verify_patched_files"].split())
-    assert "codetrail_run_lint(fix=False)" in verify_doc
+    assert "run_lint(fix=False)" in verify_doc
     assert "syntax check" in verify_doc
     config_src = (REPO_ROOT / "config.py").read_text(encoding="utf-8")
     assert "供 Patch 驗證使用" not in config_src
@@ -613,8 +613,8 @@ def test_more_than_collect_cap_error_nodes_are_counted_in_remainder(monkeypatch)
 def test_next_steps_hint_uses_public_tool_name_without_path_argument(runner: ToolExecutor,
                                                                      tmp_path: Path, monkeypatch,
                                                                      spawn_guard):
-    """SEAMS S-D 固定文字:兩條渲染路徑(renderer 與 fallback)都寫 `codetrail_run_lint(fix=False)`,
-    不得寫成 `codetrail_run_lint(path, fix=False)`。"""
+    """SEAMS S-D 固定文字:兩條渲染路徑(renderer 與 fallback)都寫 `run_lint(fix=False)`,
+    不得寫成 `run_lint(path, fix=False)`。"""
     import patch_verify
 
     passed = patch_verify.StepResult("syntax", "x.py", "passed")
@@ -626,12 +626,12 @@ def test_next_steps_hint_uses_public_tool_name_without_path_argument(runner: Too
     # 測試端固定的完整肯定句(不從 production 匯入):任何前綴否定(例如「請勿呼叫」)
     # 或改寫都會讓逐字比對失敗;舊的 `path` 形式另以否定斷言保留。
     expected_hint = (
-        "建議下一步: 對改過的檔案呼叫 codetrail_run_lint(fix=False) 做 lint 檢查；"
-        "codetrail_run_command(\"pytest ...\") 跑相關測試（各需獨立核准；apply_patch 不代跑）"
+        "建議下一步: 對改過的檔案呼叫 run_lint(fix=False) 做 lint 檢查；"
+        "run_command(\"pytest ...\") 跑相關測試（各需獨立核准；apply_patch 不代跑）"
     )
     for hint in rendered:
         assert hint == expected_hint, hint
-        assert "codetrail_run_lint(path" not in hint, hint
+        assert "run_lint(path" not in hint, hint
 
     (tmp_path / "x.py").write_text("x = 1\n", encoding="utf-8")
     monkeypatch.setattr(patch_verify, "render_report",
@@ -639,7 +639,7 @@ def test_next_steps_hint_uses_public_tool_name_without_path_argument(runner: Too
     fallback = runner._verify_patched_files(["x.py"])
     assert fallback[0] == FALLBACK_TITLE
     assert fallback[-1] == expected_hint, fallback
-    assert "codetrail_run_lint(path" not in fallback[-1], fallback
+    assert "run_lint(path" not in fallback[-1], fallback
 
 
 def test_render_precedence_failed_over_skipped_over_passed():

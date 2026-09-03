@@ -142,29 +142,41 @@ def session_hash(session_id: str) -> str:
     return text_digest(session_id)[:16]
 
 
+_REPO_ROOT = Path(__file__).resolve().parent
+
+
+def _private_error(message: str) -> SessionEvalError:
+    return SessionEvalError(message)
+
+
 def _private_directory(path: Path) -> PrivateDirectory:
-    """Create/open one private directory without following the final symlink."""
+    """Create/open one private directory through the shared owner-only guard.
+
+    repo 底下的私人目錄(``.codetrail/session_eval/...``)以 repo root 當 anchor:
+    ``.codetrail`` 以下逐層 ``O_NOFOLLOW``;repo 以外的自訂輸出目錄以它的父目錄
+    當 anchor(祖先 realpath 解析,最後一層不跟 symlink)。
+    """
+    import client_paths
 
     target = Path(path).expanduser()
-    try:
-        if target.is_symlink():
-            raise SessionEvalError(f"refusing private output directory symlink: {target}")
-        target.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if target.is_symlink():
-            raise SessionEvalError(f"private output directory became a symlink: {target}")
-        st = target.stat(follow_symlinks=False)
-    except OSError as exc:
-        raise SessionEvalError(f"cannot create private output directory: {target}") from exc
-    if not stat.S_ISDIR(st.st_mode):
-        raise SessionEvalError(f"private output path is not a directory: {target}")
-    if hasattr(os, "getuid") and st.st_uid != os.getuid():
-        raise SessionEvalError(f"private output directory is not owned by this user: {target}")
-    try:
-        os.chmod(target, 0o700, follow_symlinks=False)
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(target, flags)
-    except OSError as exc:
-        raise SessionEvalError(f"cannot safely open private output directory: {target}") from exc
+    if not target.is_absolute():
+        target = Path.cwd() / target
+    anchor = _REPO_ROOT if _REPO_ROOT in target.parents else target.parent
+
+    def _guard(resolved: Path) -> None:
+        # 私人產物只准落在 repo 之外或 repo 內 git ignore 的 `.codetrail/`;
+        # 每一次開啟都判(anchor 以上的 symlink 可以在兩次操作之間被改指)。
+        repo = Path(os.path.realpath(_REPO_ROOT))
+        private = repo / ".codetrail"
+        if (resolved == repo or repo in resolved.parents) and not (
+            resolved == private or private in resolved.parents
+        ):
+            raise SessionEvalError(
+                f"private output directory {resolved} is inside the repository "
+                f"but not under {private}"
+            )
+
+    fd = client_paths.open_private_dir(target, _private_error, anchor=anchor, guard=_guard)
     return PrivateDirectory(target, fd)
 
 
@@ -295,6 +307,74 @@ def validate_opencode_export(value: object) -> dict[str, Any]:
         if not isinstance(message.get("parts"), list):
             raise SessionEvalError(f"OpenCode messages[{index}].parts must be an array")
     return value
+
+
+def export_from_store(
+    session_id: str,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    sanitized: bool = False,
+) -> dict[str, Any]:
+    """把 CodeTrail 自家 session store 的 JSONL 轉成 export 形狀。
+
+    以前這一格是 `opencode export`。**raw export 是來源封存**:助理回答與工具
+    結果都保留(它們是之後人工建 verifier 用的 file/tool evidence),寫進 0600 的
+    私人目錄。``sanitized=True`` 才把助理文字與工具輸出拿掉(只留工具名),給要
+    分享出去的那一份。
+
+    「歷史助理回答不得當 oracle」是**挖掘層**(``draft_from_export`` 只讀 user
+    text)與 suite schema 的契約,不是靠匯出時把證據丟掉來達成。
+    """
+    messages: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("type") == "compaction":
+            # append-only 檔裡原始對話都還在;compaction 記錄只是「送模型的那一份」
+            # 從哪裡起算。來源封存要的是原始對話,所以這筆略過、**不**清掉前段。
+            continue
+        if record.get("type") != "message":
+            continue
+        role = record.get("role")
+        content = record.get("content")
+        if role == "user":
+            if record.get("synthetic"):
+                continue
+            # 角色放在 `info.role`:validator 讀的是那一格(`_message_role`),
+            # 頂層 `role` 會讓每一份匯出在第一則就被判成 unsupported role。
+            messages.append(
+                {
+                    "info": {"role": "user"},
+                    "parts": [{"type": "text", "text": content if isinstance(content, str) else ""}],
+                }
+            )
+        elif role == "assistant":
+            parts: list[dict[str, Any]] = []
+            if isinstance(content, str) and content.strip() and not sanitized:
+                parts.append({"type": "text", "text": content})
+            for call in record.get("tool_calls") or ():
+                function = call.get("function") if isinstance(call, Mapping) else None
+                name = function.get("name") if isinstance(function, Mapping) else None
+                part: dict[str, Any] = {"type": "tool", "tool": name or "?", "state": {"status": "called"}}
+                if isinstance(call, Mapping) and isinstance(call.get("id"), str):
+                    part["id"] = call["id"]
+                arguments = function.get("arguments") if isinstance(function, Mapping) else None
+                if not sanitized and isinstance(arguments, str):
+                    # 參數是 verifier 要用的證據(哪個檔、哪個 pattern);分享版拿掉。
+                    part["arguments"] = arguments
+                parts.append(part)
+            messages.append({"info": {"role": "assistant"}, "parts": parts})
+        elif role == "tool":
+            # 工具結果掛在宣告它的那則 assistant 底下(OpenCode 的形狀)。
+            state: dict[str, Any] = {"status": record.get("tool_status") or "completed"}
+            if not sanitized and isinstance(content, str):
+                state["output"] = content
+            part = {"type": "tool", "tool": record.get("name") or "?", "state": state}
+            if isinstance(record.get("tool_call_id"), str):
+                part["id"] = record["tool_call_id"]
+            if messages and messages[-1]["info"]["role"] == "assistant":
+                messages[-1]["parts"].append(part)
+            else:
+                messages.append({"info": {"role": "assistant"}, "parts": [part]})
+    return {"info": {"id": session_id}, "messages": messages}
 
 
 def neutralize_followup(text: str) -> dict[str, Any]:

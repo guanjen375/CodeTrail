@@ -2,7 +2,7 @@
 """CodeTrail 安裝 / 啟動前自檢工具(preflight)。
 
 一次跑完就知道：Python 版本對不對、必要套件裝了沒、llama-server 通不通、
-模型 GGUF 路徑對不對、AICODE_ROOT 安不安全、OpenCode / MCP 入口都在不在、KB 有沒有資料。
+模型 GGUF 路徑對不對、AICODE_ROOT 安不安全、客戶端 / MCP 入口都在不在、KB 有沒有資料。
 
 使用：
     AICODE_MODEL=<MODEL> python3 scripts/doctor.py                       # 全檢
@@ -37,7 +37,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import endpoint_policy  # noqa: E402
-import opencode_context  # noqa: E402
 from deployment_profile import (  # noqa: E402
     ProfileError,
     load_effective_profile,
@@ -49,19 +48,10 @@ from deployment_status import (  # noqa: E402
     query_gpu_processes,
 )
 from model_resolution import (  # noqa: E402
-    load_first_opencode_config,
     main_model_references_equivalent,
-    opencode_config_candidates,
     resolve_main_model_from_env,
-    resolve_opencode_main_model,
 )
 from scripts import tool_call_canary  # noqa: E402
-from scripts.opencode_direct_contract import (  # noqa: E402
-    DirectToolContractError,
-    load_live_contract_inputs,
-    parse_opencode_version,
-    require_direct_tool_contract,
-)
 
 OK = "[PASS]"
 WARN = "[WARN]"
@@ -618,121 +608,6 @@ def _npm_global_package_status(package: str) -> tuple[bool | None, str]:
     return False, detail
 
 
-def check_opencode_ai_entry(r: Result) -> None:
-    opencode = shutil.which("opencode")
-    if opencode:
-        r.ok(f"opencode-ai CLI `opencode` 在 PATH: {opencode}")
-    else:
-        r.warn(
-            "opencode-ai CLI `opencode` 不在 PATH — 日常唯一入口需要 OpenCode TUI，請：\n"
-            "        npm install -g opencode-ai@latest"
-        )
-
-    installed, detail = _npm_global_package_status("opencode-ai")
-    if installed is True:
-        suffix = f" ({detail})" if detail else ""
-        r.ok(f"npm package opencode-ai 已安裝{suffix}")
-    elif installed is False:
-        if opencode:
-            r.warn(
-                "找到 `opencode`，但 npm global package `opencode-ai` 未偵測到；"
-                "若這是舊套件或其他同名 CLI，請改用: npm install -g opencode-ai@latest"
-            )
-        else:
-            r.warn(
-                "npm global package `opencode-ai` 未偵測到 — 請：\n"
-                "        npm install -g opencode-ai@latest"
-            )
-    else:
-        r.info(f"npm package opencode-ai 未檢查 ({detail})")
-
-
-def check_opencode_in_path(r: Result) -> None:
-    """Backward-compatible wrapper for older tests/imports."""
-    check_opencode_ai_entry(r)
-
-
-# OpenCode 從 1.17.8 起才會用 MCP 的 progress notification 續 client timeout。
-# 比它舊的版本收得到通知但不續期,`ingest_document` 跑超過 `mcp.codetrail.timeout`
-# 一樣會被 client 切斷 —— 這件事在 UI 上看起來就是「server 掛了」,所以要講明白。
-OPENCODE_PROGRESS_MIN_VERSION = (1, 17, 8)
-
-
-def check_opencode_progress_support(r: Result) -> None:
-    """OpenCode 版本是否會拿 MCP progress 續 tool-call timeout。"""
-    if shutil.which("opencode") is None:
-        r.info("MCP progress 續期未檢查:opencode 不在 PATH")
-        return
-    try:
-        proc = subprocess.run(
-            ["opencode", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            stdin=subprocess.DEVNULL,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        r.info(f"MCP progress 續期未檢查:讀不到 opencode 版本 ({type(exc).__name__})")
-        return
-    raw = (proc.stdout or proc.stderr or "").strip()
-    try:
-        version = parse_opencode_version(raw)
-    except DirectToolContractError:
-        r.info("MCP progress 續期未檢查:opencode 版本字串無法唯一解析")
-        return
-    wanted = ".".join(map(str, OPENCODE_PROGRESS_MIN_VERSION))
-    if version >= OPENCODE_PROGRESS_MIN_VERSION:
-        r.ok(f"OpenCode {'.'.join(map(str, version))} 會用 MCP progress 續 tool-call timeout")
-    else:
-        r.warn(
-            f"OpenCode {'.'.join(map(str, version))} < {wanted}:MCP progress 通知**不會**"
-            "續 tool-call timeout。長時間的 ingest_document 仍可能在 "
-            "`mcp.codetrail.timeout` 到期時被 client 切斷(server 端還在跑)。\n"
-            "        請升級:npm install -g opencode-ai@latest"
-        )
-
-
-def check_opencode_direct_contract(
-    r: Result,
-    project: str | None,
-) -> tuple[str, dict[str, Any], Path] | None:
-    """Diagnose the same fail-loud client boundary enforced by ``aicode``."""
-    if shutil.which("opencode") is None:
-        r.info("direct-tool contract 未檢查：opencode 不在 PATH")
-        return None
-    raw_root = project or os.environ.get("AICODE_ROOT") or os.getcwd()
-    try:
-        root = Path(raw_root).expanduser().resolve(strict=True)
-    except (OSError, ValueError) as exc:
-        r.warn(f"direct-tool contract root 無法解析 ({type(exc).__name__})")
-        return None
-    if not root.is_dir():
-        r.warn("direct-tool contract 未檢查：project root 不是目錄")
-        return None
-    try:
-        version_raw, effective_config = load_live_contract_inputs(
-            root=root,
-            env=os.environ,
-        )
-    except DirectToolContractError as exc:
-        # Missing/unreadable local state is already covered by the entry/config
-        # checks.  Keep doctor usable as an installer diagnostic.
-        r.warn(f"OpenCode direct-tool contract 無法讀取：{exc}")
-        return None
-    try:
-        require_direct_tool_contract(version_raw, effective_config)
-    except DirectToolContractError as exc:
-        r.fail(f"OpenCode direct-tool contract 不相容：{exc}")
-        return None
-    version = parse_opencode_version(version_raw)
-    r.ok(
-        "OpenCode direct codetrail_* contract 相容 "
-        f"({'.'.join(map(str, version))})"
-    )
-    return version_raw, effective_config, root
-
-
 def report_cached_implicit_status(
     r: Result,
     *,
@@ -765,31 +640,33 @@ def report_cached_implicit_status(
 def check_tool_call_canary_diagnostic(
     r: Result,
     *,
-    direct_inputs: tuple[str, dict[str, Any], Path] | None,
+    project: str | None,
     no_network: bool,
 ) -> None:
     """Reconstruct the live fingerprint and show its implicit diagnostic lane."""
     if no_network:
         r.info("implicit routing status=unknown（--no-network 未建立 current fingerprint）")
         return
-    if direct_inputs is None:
-        r.info("implicit routing status=unknown（direct-tool identity 不可用）")
+    raw_root = project or os.environ.get("AICODE_ROOT") or ""
+    if not raw_root:
+        r.info("implicit routing status=unknown（沒有 AICODE_ROOT / --project）")
         return
-    version_raw, effective_config, root = direct_inputs
+    try:
+        root = Path(raw_root).expanduser().resolve(strict=True)
+    except (OSError, ValueError):
+        r.info("implicit routing status=unknown（root 無法解析）")
+        return
     props = tool_call_canary.fetch_main_server_props(os.environ)
     if props is None:
         r.info("implicit routing status=unknown（llama-server /props 不可用）")
         return
     try:
         protocol = tool_call_canary.run_protocol_check(
-            effective_config,
             root=root,
             env=os.environ,
             timeout=tool_call_canary.DEFAULT_MCP_TIMEOUT_SECONDS,
         )
-        selected_model, _ = tool_call_canary._model_selection(
-            effective_config, "", []
-        )
+        selected_model, _ = tool_call_canary._model_selection(os.environ, "", [])
     except tool_call_canary.CanaryError as exc:
         r.warn(f"implicit routing current fingerprint 無法建立：{exc}")
         return
@@ -799,10 +676,8 @@ def check_tool_call_canary_diagnostic(
         return
     fingerprint = tool_call_canary.build_fingerprint(
         root=root,
-        config=effective_config,
         selected_model=selected_model,
         props=props,
-        opencode_version=version_raw,
         env=os.environ,
         protocol_evidence=protocol,
     )
@@ -828,6 +703,46 @@ def check_tool_call_canary_diagnostic(
 # ============================================================
 # Context settings
 # ============================================================
+def check_client_entry(r: Result) -> None:
+    """客戶端進入點在不在。CodeTrail 不再需要 Node / npm / opencode-ai。"""
+    entry = REPO_ROOT / "codetrail_chat.py"
+    if entry.is_file():
+        r.ok(f"CodeTrail 客戶端進入點存在: {entry}")
+    else:
+        r.fail(f"找不到客戶端進入點 {entry} — `aicode` 會起不來")
+    missing = [
+        name
+        for name in ("client_engine.py", "client_mcp.py", "client_prompt.py", "client_store.py")
+        if not (REPO_ROOT / name).is_file()
+    ]
+    if missing:
+        r.fail(f"客戶端模組缺少 {', '.join(missing)}")
+
+
+def check_legacy_opencode_install(r: Result) -> None:
+    """舊 OpenCode 安裝留下的 CodeTrail 設定。
+
+    為什麼是 doctor 的事:那些值(`compaction.auto=false`、指向本 repo 的
+    plugin 路徑)現在沒有人負責。plugin 檔一旦被刪,使用者在**其他專案**開
+    OpenCode 都會失敗,而錯誤訊息不會提到 CodeTrail。
+    """
+    try:
+        import opencode_migrate
+
+        plan = opencode_migrate.plan_migration()
+    except Exception as exc:  # noqa: BLE001 - 診斷不得因此中斷
+        r.info(f"舊 OpenCode 設定未檢查({type(exc).__name__})")
+        return
+    if not plan.needed:
+        r.ok("沒有舊 OpenCode 安裝留下的 CodeTrail 設定")
+        return
+    r.warn(
+        "偵測到舊 OpenCode 安裝留下的 CodeTrail 設定(壓縮受管值 / plugin 項)。\n"
+        "        跑一次 ./set_config.sh 會在同一個 transaction 裡還原並撤銷註冊;\n"
+        "        先看一眼:python3 opencode_migrate.py --check"
+    )
+
+
 def check_context_settings(r: Result) -> None:
     """印出單一主 n_ctx 與 internal dynamic sizing 狀態。
 
@@ -858,7 +773,7 @@ def check_context_settings(r: Result) -> None:
     )
     r.info(
         "設定方式: ./set_config.sh 只填一次主 n_ctx；server -c、CodeTrail budget 與 "
-        "OpenCode active model limit.context 會使用同一值。"
+        "客戶端的 context gate / 壓縮門檻都用同一值。"
     )
 
     if os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX"):
@@ -899,107 +814,6 @@ def check_llama_runtime(r: Result, no_network: bool, server_status: dict[str, di
         r.warn(f"主 llama-server 有 {busy}/{total} 個 slot 正在處理 (n_ctx={n_ctx})")
     else:
         r.ok(f"主 llama-server slot 全閒置 ({total} slots, n_ctx={n_ctx})")
-
-
-def check_opencode_model_config(r: Result) -> None:
-    """驗證 opencode.json 的 model 欄位跟 AICODE_MODEL 對得起來。
-
-    我們不再要求特定 provider key (openai-compat / llamacpp / 等使用者自選),
-    只要 model 欄位 strip provider/ 後的 bare 跟 main_model 一致即可。
-    """
-    cfg = _read_config()
-    if isinstance(cfg, Exception):
-        return
-
-    try:
-        main_model = cfg.require_main_model()
-    except RuntimeError as exc:
-        r.fail(f"main model is missing or invalid: {exc}")
-        return
-
-    env_model_set = bool(os.environ.get("AICODE_MODEL", "").strip())
-    explicit_config = bool(os.environ.get("OPENCODE_CONFIG", "").strip())
-    env_overrides_global_config = env_model_set and not explicit_config
-
-    def config_problem(msg: str) -> None:
-        if env_overrides_global_config:
-            r.warn(
-                msg
-                + f" — AICODE_MODEL={main_model} 已設定;新版 aicode 會在啟動時拒絕"
-                + " env/opencode 不一致。請修正 OpenCode config,或啟動時明確傳"
-                + " -m/--model 給 OpenCode。"
-            )
-        else:
-            r.fail(msg)
-
-    path, oc, error = load_first_opencode_config(os.environ)
-    if error:
-        config_problem(f"OpenCode config 讀取失敗: {path} -- {error}")
-        return
-    if not oc:
-        r.info("OpenCode config 不存在;若不走 OpenCode TUI 可忽略")
-        return
-
-    oc_res = resolve_opencode_main_model(os.environ)
-    if oc_res.error:
-        where = f" {oc_res.path}" if oc_res.path else ""
-        config_problem(f"OpenCode config model invalid{where}: {oc_res.error}")
-        return
-    if not oc_res.model:
-        config_problem(f"OpenCode config {path} 必須設 \"model\" 欄位")
-        return
-
-    if not main_model_references_equivalent(oc_res.model, main_model, os.environ):
-        config_problem(
-            f"OpenCode config model={oc_res.model!r} 跟 CodeTrail main model={main_model!r} 不一致"
-        )
-        return
-
-    r.ok(f"OpenCode config {path} model 跟 AICODE_MODEL 對齊 ({main_model})")
-
-
-def check_opencode_config_drift(r: Result, project: str | None) -> None:
-    """看 opencode.json active model 的 limit.context 跟 CodeTrail ctx cap 是否對齊。
-
-    僅 warn,絕不自動改使用者設定。
-    """
-    candidates = []
-    if os.environ.get("OPENCODE_CONFIG"):
-        candidates.extend(opencode_config_candidates(os.environ))
-    else:
-        if project:
-            candidates.append(Path(project) / "opencode.json")
-        if os.environ.get("AICODE_ROOT"):
-            candidates.append(Path(os.environ["AICODE_ROOT"]) / "opencode.json")
-        candidates.append(REPO_ROOT / "opencode.json")
-        candidates.extend(opencode_config_candidates(os.environ))
-    found = next((p for p in candidates if p.is_file()), None)
-    if not found:
-        r.info("找不到 opencode.json(沒走 OpenCode TUI 路線可忽略)")
-        return
-
-    cfg = _read_config()
-    if isinstance(cfg, Exception):
-        return
-    internal_ctx_cap = int(getattr(cfg, "N_CTX", getattr(cfg, "NUM_CTX", 0)) or 0)
-
-    env = {**os.environ, "OPENCODE_CONFIG": str(found)}
-    limit = opencode_context.resolve_active_opencode_context_limit(env, [])
-    if limit.error:
-        r.warn(f"opencode.json active model limit.context 讀取失敗: {found} — {limit.error}")
-        return
-    if limit.context is None:
-        r.info(f"opencode.json={found} active model 未設定 limit.context")
-        return
-
-    if internal_ctx_cap and limit.context != internal_ctx_cap:
-        r.warn(
-            f"opencode.json={found} active model={limit.raw_model or limit.model} "
-            f"limit.context={limit.context} 與主 n_ctx={internal_ctx_cap} 不一致。\n"
-            "        aicode 啟動時會安全自動同步；doctor 本身只診斷、不修改設定。"
-        )
-    else:
-        r.ok(f"opencode.json={found} active model limit.context 與 internal ctx cap 一致")
 
 
 def check_main_server_ctx_alignment(r: Result, server_status: dict[str, dict]) -> None:
@@ -1293,216 +1107,57 @@ def check_incidents(r: Result) -> None:
 
 
 def check_compaction_mode(r: Result, project: Path | None = None) -> None:
-    """印壓縮模式與有效設定是否一致。純讀取,不改任何設定。
+    """目前的壓縮模式與門檻。
 
-    為什麼要在 doctor 裡:模式只在 OpenCode **啟動時** 生效,而專案層
-    opencode.json 或手改都能翻掉受管值。plugin 遇到不一致會停用自動壓縮並
-    在 TUI 跳一次 toast —— headless 沒有 TUI,那條訊息就只剩這裡與
-    application log 看得到。
+    為什麼要在 doctor 裡:模式記在 `~/.config/codetrail/client.json`,沒有人會
+    每次去 cat 它;而「印著 codetrail 但實際上推不出門檻」比不印還糟。
     """
     try:
-        import compaction_mode
-    except Exception as e:  # noqa: BLE001 — 診斷不得因為 import 失敗而中斷
-        r.info(f"compaction_mode 不可用({e})— 跳過壓縮模式檢查")
+        import client_compaction
+        import client_config
+    except Exception as exc:  # noqa: BLE001
+        r.info(f"壓縮模式未檢查(客戶端模組不可用:{exc})")
         return
-    override = (os.environ.get("AICODE_COMPACTION_STATE") or "").strip()
-    if override:
-        # 這個 env 只給私人壓縮 eval 用。留在殼層裡的話,runtime plugin 讀的是
-        # 另一份(或不存在的)狀態,而這裡與 contract check、canary 讀的都是真的
-        # 那一份 —— 診斷會說接管中,實際上完全沒接管。
-        r.warn(
-            f"AICODE_COMPACTION_STATE 已設定({override}):OpenCode 裡的壓縮 plugin "
-            "會讀那一份,而不是 ~/.config/codetrail/compaction.json。這個變數只給"
-            "私人壓縮 eval 用,一般使用請 unset(aicode 啟動時會自動清掉)。"
-        )
-    state, reason = compaction_mode.inspect_state()
-    if reason:
-        r.warn(f"壓縮模式狀態檔已忽略:{reason}")
+    try:
+        settings = client_config.load_client_settings()
+    except Exception as exc:  # noqa: BLE001
+        r.fail(f"client.json 不可信:{exc};重跑 ./set_config.sh 重新選一次")
         return
-    if state is None:
-        r.info("壓縮模式:未設定(OpenCode 原生行為);要改用 CodeTrail 壓縮請重跑 ./set_config.sh")
-        return
-    mode = state["mode"]
-    label = compaction_mode.MODE_LABELS.get(mode, mode)
-    r.info(f"壓縮模式:{mode}{compaction_mode.mode_tag(mode)}({label})")
-    if compaction_mode.is_experimental(mode):
-        # 這個模式還在測試階段。健檢是使用者最可能發現「原來我在用它」的地方,
-        # 所以還原的那行命令要在這裡就給,不要只留在文件裡。
+    if not settings.present:
         r.info(
-            f"  {compaction_mode.EXPERIMENTAL_NOTICE};"
-            "要回原生行為:./set_config.sh --compaction-mode native"
-        )
-
-    config_path, config, error = _load_opencode_config_for_compaction(project)
-    if error:
-        r.info(f"  (讀不到有效 OpenCode 設定:{error};跳過一致性檢查)")
-        return
-    if config_path is not None and not compaction_mode.state_matches_config(
-        state, config_path
-    ):
-        r.warn(
-            f"壓縮模式狀態檔記錄的是另一份 opencode.json(目前有效的是 {config_path});"
-            "對這一份重跑 ./set_config.sh 才會對得起來"
+            f"壓縮模式:未設定(沒有 {settings.path};客戶端退成 manual)。"
+            "要自動壓縮請重跑 ./set_config.sh"
         )
         return
-    drift = compaction_mode.effective_drift(
-        config, state=state, plugin_path=compaction_mode.PLUGIN_PATH
+    mode = settings.compaction_mode
+    if mode == client_compaction.MODE_OFF:
+        r.ok("壓縮模式=off(完全不壓縮;context 滿了會是可見的錯誤)")
+        return
+    try:
+        derived = client_compaction.derive(config.N_CTX)
+    except Exception as exc:  # noqa: BLE001
+        r.fail(
+            f"壓縮模式={mode},但這個 n_ctx({config.N_CTX})推不出可用門檻:{exc}。"
+            "runtime 不會壓縮;把 n_ctx 調大或改用 off"
+        )
+        return
+    r.ok(
+        f"壓縮模式={mode} 🧪 實驗中(idle 門檻={derived.idle_threshold} tokens、"
+        f"tail 保留={derived.preserve_recent_tokens} tokens)"
     )
-    drift.extend(_recomputed_compaction_drift(compaction_mode, config, mode, state))
-    if drift:
-        for item in drift:
-            r.warn(f"壓縮設定漂移:{item}")
-        r.info("  → plugin 偵測到這個不一致就會停用自動壓縮;重跑 ./set_config.sh 可收斂")
-    else:
-        r.ok(f"壓縮有效設定與模式一致({mode})")
-    # 這一版新增、但這份狀態檔還沒接管的受管鍵。CodeTrail 對它們沒有 ownership
-    # 證據,所以不會自己補(補了就還原不回去);不講的話使用者升級之後永遠拿不到
-    # 新受管值而且沒有任何訊息。
-    pending = compaction_mode.unmanaged_keys(state)
-    if pending:
-        keys = "、".join(
-            f"{compaction_mode.COMPACTION_SECTION}.{key}" for key in pending
-        )
+    if settings.permission:
+        overrides = "、".join(f"{k}={v}" for k, v in sorted(settings.permission.items()))
+        r.info(f"權限覆寫:{overrides}")
+    try:
+        stopped = client_compaction.read_stopped()
+    except Exception:  # noqa: BLE001
+        stopped = {}
+    if stopped:
         r.warn(
-            f"這一版新增了受管值({keys}),但目前的狀態檔是接管前寫的,還沒管到它們;"
-            "重跑 ./set_config.sh 才會納入(在那之前這些鍵維持你現在的值,壓縮本身照常)"
+            f"有 {len(stopped)} 個舊 session 因摘要不可信而停用了自動壓縮"
+            "(紀錄在 compaction-stopped.jsonl;刪掉那個檔就清空)"
         )
 
-
-def _recomputed_compaction_drift(
-    compaction_mode, config: dict, mode: str, state: dict | None = None
-) -> list[str]:
-    """受管值有沒有跟著**目前的**模型限制走。
-
-    寫進設定的保留額是 set_config 當時那個 ctx 推導出來的;之後換模型或改 ctx
-    只有 `limit.context` 會被同步。門檻用新的、tail 用舊的,plugin 會因此停用
-    自動壓縮 —— doctor 不比對的話會回報「一致」,兩邊講相反的話。
-
-    推導本身在 `compaction_mode.derive_for_config`(與 aicode 橫幅顯示的門檻
-    同一份實作);這裡只負責把結果跟設定裡的值比對。
-    """
-    if mode not in compaction_mode.PLUGIN_MODES:
-        return []
-    try:
-        result = compaction_mode.derive_for_config(config)
-    except compaction_mode.CompactionModeError as exc:
-        return [str(exc)]
-    if result is None:
-        return []                       # 沒有模型資訊 —— 無從得知,不是漂移
-    derived, source = result
-    section = config.get(compaction_mode.COMPACTION_SECTION)
-    managed = (state or {}).get("managed")
-    owned = managed if isinstance(managed, dict) else None
-    issues = []
-    for key, expected in derived.config_values.items():
-        # 只比契約鍵(`prune` 改掉不會讓壓縮失真,plugin 也不會為它停用),而且
-        # 只比**這份狀態檔真的接管過**的那幾個 —— 受管鍵的集合會隨版本長大,
-        # 拿新版的清單去要求舊狀態檔沒接管過的鍵,升級當天每個人都會看到一條
-        # 假的漂移,而 plugin 那端根本沒有停用。
-        if key not in compaction_mode.CONTRACT_COMPACTION_KEYS:
-            continue
-        if owned is not None and key not in owned:
-            continue
-        actual = section.get(key) if isinstance(section, dict) else None
-        if not compaction_mode.json_equal(actual, expected):
-            issues.append(
-                f"{compaction_mode.COMPACTION_SECTION}.{key} 是 {actual!r},"
-                f"但目前的 {source}應該是 {expected!r};"
-                "重跑 ./set_config.sh 才會重算"
-            )
-    return issues
-
-
-def _project_config_overlay(project: Path | None) -> dict:
-    """讀 `<project>/.opencode/opencode.json(c)`(OpenCode 會把它疊在全域之上)。
-
-    不讀這一份的話,doctor 會對「全域一致、專案層把 auto 翻回 true」的情況
-    回報「一致」,而 plugin 那端已經因為漂移停用了 —— 兩邊講的話相反。
-    """
-    # 沒給 --project 時用目前目錄:文件教的就是直接跑 `python3 scripts/doctor.py`,
-    # 而 OpenCode 疊的是**當下專案**的設定。
-    root = Path(project) if project is not None else Path.cwd()
-    merged: dict = {}
-    # OpenCode 會**依序載入兩份**,不是找到一份就停。只讀第一份的話,另一份的
-    # compaction / model 覆寫會整個漏掉。
-    for name in ("opencode.json", "opencode.jsonc"):
-        candidate = root / ".opencode" / name
-        try:
-            if not candidate.is_file():
-                continue
-            value = json.loads(candidate.read_text(encoding="utf-8"))
-        except OSError:
-            continue
-        except ValueError:
-            # `.jsonc` 允許註解,`json.loads` 讀不了。靜靜略過的話,doctor 會拿
-            # 沒有 override 的全域設定回報「一致」,而 plugin 那端已經停用。
-            return {"__unreadable__": str(candidate)}
-        if isinstance(value, dict):
-            merged = _merge_deep(merged, value) if merged else value
-    return merged
-
-
-def _load_opencode_config_for_compaction(project: Path | None):
-    """回 (config_path, config, error)。只讀不寫;專案層設定疊在全域之上。"""
-    try:
-        import model_resolution
-
-        path, value, error = model_resolution.load_first_opencode_config(os.environ)
-    except Exception as e:  # noqa: BLE001
-        return None, {}, str(e)
-    if error or path is None or not isinstance(value, dict):
-        return None, {}, error or "找不到 opencode.json"
-    overlay = _project_config_overlay(project)
-    if overlay.get("__unreadable__"):
-        return path, value, f"專案層設定讀不了(可能是帶註解的 .jsonc):{overlay['__unreadable__']}"
-    if not overlay:
-        return path, value, None
-    merged = json.loads(json.dumps(value))
-    # `model` / `provider` 也要疊:專案改選一個 context 較小的模型時,runtime
-    # 會用那個模型重算門檻並停用,只疊 compaction 的話 doctor 仍會回報一致。
-    for key in ("compaction", "plugin", "model", "provider", "agent"):
-        if key not in overlay:
-            continue
-        if key == "plugin":
-            # OpenCode 合併 plugin origins(全域 + 專案),不是取代。
-            merged[key] = _merge_plugin_lists(
-                merged.get(key) if isinstance(merged.get(key), list) else [],
-                overlay[key] if isinstance(overlay[key], list) else [],
-            )
-        elif isinstance(overlay[key], dict) and isinstance(merged.get(key), dict):
-            merged[key] = _merge_deep(merged[key], overlay[key])
-        else:
-            merged[key] = overlay[key]
-    return path, merged, None
-
-
-def _merge_deep(base: dict, overlay: dict) -> dict:
-    """OpenCode 的 config 疊法是深合併,不是整段換掉。
-
-    `plugin` 特別處理:OpenCode 合併 plugin origins。用覆蓋的話,兩份 project
-    config 各帶一個 plugin 時第二份會把第一份蓋掉,doctor 於是可能報「缺
-    CodeTrail plugin」而實際上兩個都載入了。
-    """
-    out = dict(base)
-    for key, value in overlay.items():
-        if key == "plugin" and isinstance(value, list) and isinstance(out.get(key), list):
-            out[key] = _merge_plugin_lists(out[key], value)
-        elif isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = _merge_deep(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
-def _merge_plugin_lists(base: list, extra: list) -> list:
-    seen, combined = set(), []
-    for item in [*base, *extra]:
-        marker = json.dumps(item, sort_keys=True, ensure_ascii=False)
-        if marker in seen:
-            continue
-        seen.add(marker)
-        combined.append(item)
-    return combined
 
 
 def check_readme_consistency(r: Result) -> None:
@@ -1565,16 +1220,14 @@ def main(argv: list[str] | None = None) -> int:
     print("\n-- RAG rerank policy --")
     check_rerank_policy(r, no_network=args.no_network, server_status=server_status)
 
-    print("\n-- opencode-ai entry --")
-    check_opencode_ai_entry(r)
-    check_opencode_progress_support(r)
-    direct_inputs = check_opencode_direct_contract(r, args.project)
-    check_opencode_model_config(r)
+    print("\n-- CodeTrail 客戶端 --")
+    check_client_entry(r)
+    check_legacy_opencode_install(r)
 
     print("\n-- tool-call canary cache --")
     check_tool_call_canary_diagnostic(
         r,
-        direct_inputs=direct_inputs,
+        project=args.project,
         no_network=args.no_network,
     )
 
@@ -1582,7 +1235,6 @@ def main(argv: list[str] | None = None) -> int:
     check_context_settings(r)
     check_llama_runtime(r, no_network=args.no_network, server_status=server_status)
     check_main_server_ctx_alignment(r, server_status)
-    check_opencode_config_drift(r, args.project)
 
     print("\n-- AICODE_ROOT / project --")
     check_aicode_root(r, args.project)

@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 ai_code MCP server — 把 KnowledgeBase / CodeRAG / agent_tools 包成 MCP tools,
-讓 OpenCode (或任何 MCP client) 可以接進來用。
+讓 CodeTrail 客戶端(或任何 MCP client)可以接進來用。
 
 啟動:
     AICODE_ROOT=/path/to/project python3 mcp_server.py
 
 一般使用者不要直接跑這個檔案；請從專案目錄執行 `aicode`,
-由 OpenCode 透過 stdio 啟動 MCP server。
+由客戶端透過 stdio 啟動 MCP server。
 """
 
 import contextlib
@@ -160,7 +160,7 @@ import ingest_notify
 import ingest_runtime
 
 
-# OpenCode runtime defaults: patch/run_tests 預設開,但尊重 env 顯式關閉。
+# Runtime defaults: patch/run_tests 預設開,但尊重 env 顯式關閉。
 # 早期版本是無條件 force-on,使用者設 AI_CODE_PATCH=0 也會被吞掉 — 那違反
 # CodeTrail 「fail loud over silent fallback」 的原則。改成 env-aware default。
 _POLICY = resolve_runtime_policy()
@@ -196,7 +196,7 @@ if os.environ.get("AICODE_MODEL", "").strip():
 else:
     _log(
         f"[MCP] Using model: {_resolved_main_model} "
-        "(resolved from ~/.config/opencode/opencode.json)"
+        "(resolved from the deployment profile)"
     )
 
 if os.environ.get(REQUIRED_MODELS_SKIP_ENV, "").lower() in ("1", "true", "yes"):
@@ -1408,8 +1408,8 @@ def apply_patch(
     套用後只做同一 process、唯讀的 syntax check(.py/.pyi 用 ast;C/C++ 需 tree-sitter
     grammar,缺席 = skipped 不算通過;其他副檔名 skipped);它是 advisory,失敗**不回滾**,
     結果會明說「patch 已套用、未回滾」;`PATCH_AUTO_VERIFY=False` 時連 syntax check 也不做。
-    lint / typecheck / test 不會自動執行——請另行呼叫 `codetrail_run_lint(fix=False)` 與
-    `codetrail_run_command(...)`,它們各自需要獨立核准。
+    lint / typecheck / test 不會自動執行——請另行呼叫 `run_lint(fix=False)` 與
+    `run_command(...)`,它們各自需要獨立核准。
 
     Args:
         diff: patch 內容字串(格式 A 或 B;不要包 fence)。
@@ -2984,7 +2984,7 @@ def run_command(
         AI_CODE_ENABLE_BUILD_COMMANDS=1 時加入白名單。
       - git 不在白名單:改用 git_status / git_diff。
     apply_patch 不會自動呼叫這裡:套用後只做同 process 的 syntax check,lint / test
-    要由你另行呼叫 codetrail_run_lint(fix=False) / codetrail_run_command,各自經過核准閘。
+    要由你另行呼叫 run_lint(fix=False) / run_command,各自經過核准閘。
     輸出超長會 smart-truncate(優先保留含 FAIL/ERROR/Traceback 的段落)。
 
     Args:
@@ -3007,7 +3007,6 @@ _register_public_tools()
 
 
 if __name__ == "__main__":
-    _log("[MCP] server ready, listening on stdio.")
     # 交還真正的 stdout 給 JSON-RPC transport。此後只有 FastMCP transport 寫
     # stdout；工具內的 incidental print() 由 @_tool 的 redirect_stdout 擋回 stderr。
     sys.stdout = _REAL_STDOUT
@@ -3048,6 +3047,10 @@ if __name__ == "__main__":
     for _sig in (signal.SIGTERM, signal.SIGHUP):
         with contextlib.suppress(Exception):   # 平台不支援就算了,不得因此起不來
             signal.signal(_sig, _exit_on_terminating_signal)
+    # ready marker 是**最後**一件事:lease 已寫、SIGTERM handler 已裝。印早了,
+    # supervisor / 測試看到 marker 就送 SIGTERM,信號落在上面那幾行之間時,
+    # 預設的 SIGTERM 直接結束行程 —— 沒有 lease、沒有收屍、finally 一行都不跑。
+    _log("[MCP] server ready, listening on stdio.")
     try:
         _run_mcp_stdio()
     finally:

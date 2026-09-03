@@ -1,11 +1,12 @@
-# CodeTrail — OpenCode + llama.cpp 本地 MCP 工作台
+# CodeTrail — llama.cpp 本地 Code-RAG / MCP 工作台
 
-CodeTrail 是給 OpenCode 使用的本地 Code-RAG / RAG / MCP 後端。模型可以在受限的
-專案根目錄內搜尋與讀取程式碼、查已匯入的規格文件、分析圖片與 firmware binary、
-建立 patch，並只透過白名單執行驗證命令。
+CodeTrail 是一套本地 Code-RAG / RAG / MCP 後端,**以及它自己的聊天客戶端**。
+模型可以在受限的專案根目錄內搜尋與讀取程式碼、查已匯入的規格文件、分析圖片與
+firmware binary、建立 patch,並只透過白名單執行驗證命令。
 
-目前的主線入口是 standalone TUI `aicode`；`aicode_web` 是跨機瀏覽器用的實驗性
-入口。CodeTrail 定位為**成熟私有部署版**，適合本機、離線、NDA / firmware /
+目前的主線入口是終端客戶端 `aicode`;`aicode_web` 是跨機瀏覽器用的實驗性入口。
+**部署不需要 Node / npm / opencode-ai** —— 客戶端是純 Python,與 MCP server 走
+同一份 `requirements.txt`。CodeTrail 定位為**成熟私有部署版**，適合本機、離線、NDA / firmware /
 private repo 分析；**不打算公開發布**成 PyPI package、Docker image 或 SaaS。安全
 邊界有自動測試保護，但未做公開產品級安全審計。
 
@@ -28,14 +29,15 @@ llama-server HTTP endpoint。
 | Frontend | `aicode` 為穩定主線；`aicode_web` / `aicode attach` 為選用 | shell wrappers |
 
 > [!IMPORTANT]
-> 「本地優先」不等於無條件保證資料不離機。遠端 llama-server、額外 OpenCode
-> provider、OpenCode 內建工具或專案自己的 `opencode.json` 都可能改變資料邊界。
+> 「本地優先」不等於無條件保證資料不離機。遠端 llama-server 端點就會改變資料
+> 邊界(所以非 loopback 端點需要顯式 opt-in);web 模式暴露到 loopback 以外時,
+> 存取邊界就是那組密碼或 tailnet ACL。
 > NDA 場景請保留本文件的 provider / permission 鎖定，並先讀
 > [安全邊界](docs/security.md)與 [Responsible Use](RESPONSIBLE_USE.md)。
 
 第一次部署照下方 Quick Start；完成後的日常操作看
 [基本操作](docs/basic-usage.md)。遇到錯誤直接查
-[常見問題](docs/troubleshooting.md)。要用真實 OpenCode session 比較新舊主模型時，使用
+[常見問題](docs/troubleshooting.md)。要用真實對話 session 比較新舊主模型時，使用
 [session model eval](docs/session-model-eval.md)；歷史模型回答不會被當成標準答案。
 
 ## 🚀 Quick Start(7 步設定完成)
@@ -64,7 +66,7 @@ command -v aicode aicode_web                 #    兩者都應顯示 ~/.local/bi
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
-aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
+aicode        # CodeTrail 終端客戶端;/tools 應列出 19 個工具
 ```
 
 想改在**另一台電腦的瀏覽器**操作(實驗性 web 模式):A/B 機加入同一個 [Tailscale](https://tailscale.com/download) tailnet 後,同樣先 `cd <PROJECT_TO_ANALYZE>`,改跑 `aicode_web`,把印出的網址貼到 B 機瀏覽器;停止用 `aicode_web stop`。沒有 Tailscale 的 SSH fallback 與細節見 §5.4。
@@ -77,28 +79,30 @@ aicode        # OpenCode TUI;/status 應顯示 codetrail Connected
 - 四個 server 預設只綁 `127.0.0.1`。同一專案不要同時開 standalone `aicode` 與
   `aicode_web`；TUI 要接現有 web backend 時用 `aicode attach`。安全與 web 細節分別見
   [docs/security.md](docs/security.md)與 §5.4。
-- [CodeTrail build prompt](docs/opencode-build-prompt.md) 的正式 A/B 未通過完整 routing gate，
-  所以 `set_config.sh` **預設不安裝**；只有明確給 `--enable-experimental-build-prompt` 才會
-  opt-in，且明確自訂的 prompt 仍會保留。
-  第一次跑 `aicode` 另會自動把 [OpenCode 全域 AGENTS.md 精簡範本](docs/opencode-agents-template.md)
-  裝進 `~/.config/opencode/AGENTS.md`。兩者都只保留跨工具不變式；**不要把完整工具清單或操作手冊
-  貼進去**，那會增加每輪 system prompt。舊版固定工具清單會印 `⚠ STALE` 並給同步命令，
-  但不會擋住啟動。手動同步是 `python3 scripts/opencode_contract_check.py --sync-agents-md`
-  （會備份原檔）。
+- system prompt 由客戶端自組:內建基底規則(硬上限 1,600 字元)＋ MCP 工具路由圖
+  ＋ 專案 `AGENTS.md` ＋ `.codetrail/lessons.md` ＋ 選用的
+  `~/.config/codetrail/instructions.md`。**不要把完整工具清單或操作手冊貼進去** ——
+  工具名稱、參數與用途以本輪 tool schema 為唯一真值,重複一份只會增加每輪 prompt。
+  要關掉專案內的那兩份就設 `CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1`。
+- **從舊版(OpenCode)升級的機器**:`./set_config.sh` 會偵測 CodeTrail 曾經寫進
+  `~/.config/opencode/opencode.json` 的壓縮受管值與 plugin 項,在寫完自己的設定後
+  **接著**還原並撤銷註冊(遷移自己有備份與原子替換;只還原現值仍等於 CodeTrail
+  寫入值的鍵;判不出狀態或遷移失敗都 exit 2,不會假裝成功)。先看一眼可跑
+  `python3 opencode_migrate.py --check`。
 
 ## 特別注意(首次部署最容易踩的)
 
 > [!WARNING]
 > 動手前掃一遍 —— 這幾點踩了通常會卡很久,或踩到 NDA / 安全:
 >
-> 1. **CodeTrail MCP server 跑在 `set_config.sh` 當下偵測到的那顆 Python 上**(路徑會寫死進 `~/.config/opencode/opencode.json`)。但 `aicode` 的啟動前置仍使用目前 PATH 的 `python3` / `python`；依賴若只裝在 venv,每次啟動前仍要 activate。重建 venv 或升級 Python 後要**重跑 `./set_config.sh`**。
+> 1. **客戶端與 MCP server 都跑在 `aicode` 當下 PATH 的 `python3` 上。** 依賴若只裝在 venv,每次啟動前仍要 activate。重建 venv 或升級 Python 後要**重跑 `./set_config.sh`**(它會重新偵測並寫進啟動腳本)。
 > 2. **四個 llama-server 都要起**:main `8080` + embedding `8081` + reranker `8082` + VL `8083`。三顆副模型是硬性需求,缺一個啟動前 preflight 就擋下;reranker 預設不降級。見 §3。
 > 3. **不要從 `$HOME` 或 `/` 啟動** —— 沙箱會直接拒絕。先 `cd` 進你要分析的**具體專案目錄**再跑。
-> 4. **換模型或主 n_ctx 就重跑 `./set_config.sh` + 重啟 server**:TUI 按 `/models` 只切 OpenCode 的 model id,**不會 reload llama-server、也不會通知 CodeTrail MCP**。主 n_ctx 只填一次；`set_config.sh` 會寫入 deployment / server `-c`，`aicode` 啟動時再讓 CodeTrail budget 與 OpenCode active model 的 `limit.context` 自動跟隨，不用另設 max。
+> 4. **換模型或主 n_ctx 就重跑 `./set_config.sh` + 重啟 server。** llama-server 一啟動就鎖死一顆模型與一個 `-c`;客戶端只會跟隨它,沒有「在對話裡換模型」這回事。主 n_ctx 只填一次;`set_config.sh` 寫進 deployment / server `-c`,`aicode` 啟動時觀測 `/props` 的實值並讓 CodeTrail 的 context 預算跟著它。
 > 5. **啟動後立即 rollback,先看 server log**:`~/start.sh` 前台只會回報 process 已結束,真正根因用 `~/start.sh logs main` 查看;新 GGUF 也可能需要更新並重新 build llama.cpp。詳細判讀與修復見 [docs/troubleshooting.md](docs/troubleshooting.md)。
 > 6. **CodeTrail 沙箱鎖在「你啟動的那個資料夾」(`AICODE_ROOT`)** —— 綁在 process 上,**不會跟著你在 UI 切資料夾或切對話而移動**。web UI 那顆「切換資料夾」按鈕對 CodeTrail 無效(切過去還是只讀啟動目錄)。換專案 = 到那個目錄重新啟動一個(TUI 重開 `aicode`;web 另起一個 backend)。
 > 7. **web 模式目前是實驗性的(開發中)** —— 穩定、proven 的主力是 standalone TUI(`aicode`);跨機器 web 的簡化入口是 `aicode_web`,低階前景入口才是 `aicode web`。
-> 8. **CodeTrail 沙箱只蓋它那 19 個 MCP 工具** —— OpenCode 內建的 `bash` / `read` / `write` 不走這層,所以範本把它們全 `deny`,**別放寬那份 permission**。外部匯入與 lessons 是兩個受限例外,見 [docs/security.md](docs/security.md)。分析不信任 repo 時,連被分析 repo 自帶的 `opencode.json` 都可能翻掉你的鎖定,請用 `OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode`。
+> 8. **模型只有那 19 個 MCP 工具** —— 客戶端沒有內建的 `bash` / `read` / `write`,所以沙箱邊界就是 MCP server 的邊界。外部匯入與 lessons 是兩個受限例外,見 [docs/security.md](docs/security.md)。分析不信任 repo 時,那個 repo 自帶的 `AGENTS.md` 與 `.codetrail/lessons.md` 會進 system prompt;不想要就用 `CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1 aicode`。
 > 9. **首次 MoE 對話首字會慢(可能 1–2 分鐘),別按 Esc** —— 它在 page-in expert weights,不是當掉;slot / GPU 在動就是正常。
 > 10. **NDA / 衍生資料不要 commit**:`knowledge*.json`、`knowledge_emb.npz`、`*.jsonl`、`.codetrail/`、`data/`、`.aicode_uploads/`、`.opencode/` 與 Code-RAG cache / graph DB 等已在 `.gitignore`。commit 前同時看 `git status` 與 `git diff`；`.gitignore` 擋不住被改名或複製的內容。
 > 11. **任一步 FAIL 對應的修法見 [docs/troubleshooting.md](docs/troubleshooting.md)。**
@@ -120,7 +124,7 @@ sudo apt install -y \
   ripgrep tmux
 ```
 
-另外裝**目前受支援的 Node.js LTS + npm**(§1.2 裝 OpenCode 用)。如果 distro 內建
+(Node.js 只在你另有用途時才需要;CodeTrail 本身不用。)如果 distro 內建
 Node.js 不是 LTS，可用 NodeSource 的 LTS 渠道：
 
 ```bash
@@ -131,41 +135,15 @@ node -v && npm -v    # 確認是目前 Node LTS，npm 可執行
 
 已經有 nvm / fnm / volta 的用熟悉的方式裝當前 Node LTS 即可。
 
-### 1.2 安裝 OpenCode
+### 1.2 CodeTrail 不需要 Node / npm
 
-若 Node.js 是依上節用 apt / NodeSource 安裝，先把 npm global prefix 放進使用者目錄；
-否則 `npm install -g` 可能嘗試寫 `/usr` 而因權限失敗。這會在
-`~/.npmrc` 設定 `prefix=/home/<user>/.local`，不需要 `sudo`：
+舊版的日常入口是 OpenCode TUI,所以要先裝 `opencode-ai`。**現在不用了**:
+CodeTrail 有自己的終端客戶端(`codetrail_chat.py`,由 `aicode` 啟動),純 Python、
+與 MCP server 共用同一份 `requirements.txt`。上一節裝 Node 只是為了其他用途,
+CodeTrail 本身不需要它。
 
-```bash
-mkdir -p "$HOME/.local/bin"
-npm config set prefix "$HOME/.local"
-grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.profile" 2>/dev/null || \
-  printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.profile"
-export PATH="$HOME/.local/bin:$PATH"
-npm install -g "opencode-ai@^1.17.0"
-command -v opencode    # 確認可被找到
-opencode --version
-```
-
-若使用 nvm / fnm / volta，global package 本來就在該工具管理的使用者目錄，跳過
-`npm config set prefix`，只執行安裝與版本確認即可。不要加 `sudo npm install -g`。
-
-這是 [OpenCode 官方安裝頁](https://dev.opencode.ai/docs/#install) 列出的 npm 路徑；上游若調整
-安裝方式或 runtime 要求，以該頁當前版本為準。
-
-CodeTrail 的 direct-tool client 契約是 **OpenCode `>=1.17.0,<2.0.0`**，所以安裝命令鎖在
-1.x major，不使用可能跨 major 的 `@latest`。`aicode` 在任何 wrapper／設定 writer、MCP 或
-模型子行程之前，先讀 `opencode --version` 與 `opencode debug config`；版本無法唯一解析、
-超出範圍，或 effective config 出現 V2-only 的 `mcp.servers`／任何 `codemode` 鍵，都會
-fail-loud。OpenCode V2 的 `mcp.servers.codetrail`、`codemode:false`、`disabled` 與 execution
-timeout 語意不同，不能用 V1 canary 猜測相容。
-
-Code Mode 會把直接暴露的 `codetrail_*` tools 改成單一 `execute` 入口，現行 permission、
-全域 AGENTS schema anchor 與 canary 契約都不是這個模式。`aicode` 會固定
-`OPENCODE_EXPERIMENTAL_CODE_MODE=false`；若使用者顯式設成 true 則拒絕啟動。已記錄的
-OpenCode 1.18.21 catalog／request 資料只代表該相容列的量測，不把所有 1.x
-模型／template 組合自動宣稱為 routing supported。
+已經裝過 `opencode-ai` 的機器不必移除,但升級後請跑一次 `./set_config.sh` ——
+它會把 CodeTrail 曾經寫進你 OpenCode 設定的東西還原並撤銷註冊(見 §3.1)。
 
 ### 1.3 安裝 CodeTrail Python 依賴
 
@@ -180,7 +158,7 @@ python3 -c "import mcp, numpy, requests; print('deps OK')"
 
 `<CODETRAIL_REPO>` 是這個 CodeTrail 的 repo 路徑,不是你要分析的專案路徑。`requirements.txt` 已含 `mcp` / `requests` / `numpy` / `pyelftools`(ELF 結構化解析;沒裝時 `analyze_file` 退回 readelf 文字解析並在報告開頭明列缺失能力),不必再單獨 `pip install mcp`。
 
-截至 2026-08，MCP Python SDK 2.x 已是 stable；但本 repo 的 runtime 仍使用 v1 `mcp.server.fastmcp.FastMCP`，所以 dependency 刻意固定為 `mcp>=1.28,<2`。乾淨安裝會取維護中的最新 1.x，不會誤升到不相容的 2.x；這也符合 [MCP Python SDK 官方給未遷移 v1 專案的建議](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/get-started/installation.md)。v2 遷移需另案同步處理 import、transport、schema 與 OpenCode 相容性，不應只移除 `<2`。若 `doctor` 報版本不符，執行 `python3 -m pip install --upgrade "mcp>=1.28,<2"`。
+截至 2026-08，MCP Python SDK 2.x 已是 stable；但本 repo 的 runtime 仍使用 v1 `mcp.server.fastmcp.FastMCP`，所以 dependency 刻意固定為 `mcp>=1.28,<2`。乾淨安裝會取維護中的最新 1.x，不會誤升到不相容的 2.x；這也符合 [MCP Python SDK 官方給未遷移 v1 專案的建議](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/get-started/installation.md)。v2 遷移需另案同步處理 import、transport 與 schema，不應只移除 `<2`。若 `doctor` 報版本不符，執行 `python3 -m pip install --upgrade "mcp>=1.28,<2"`。
 
 > 想隔離環境的話也可以用 venv(`python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`,見 [docs/setup.md](docs/setup.md))。**只把依賴裝在 venv 時,跑 `./set_config.sh` 與每次啟動 `aicode` 前都要 activate**:set_config 會把當下 Python 的絕對路徑寫進 MCP command,但 `aicode` 自己的啟動前置仍會使用 PATH 裡的 `python3` / `python` 跑檢查腳本。若之後重建或更換 venv,也要重跑 `./set_config.sh`。
 
@@ -360,12 +338,12 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 ## 3. 設定與啟動:`./set_config.sh` + `~/start.sh`
 
 `~/.config` 下的實際檔案是**每台機器的 local state，不進 repo**。設定契約的單一來源是
-`set_config.sh`、`deployment_profile.py` 的封閉 schema / 安全預設，以及本節的 OpenCode
+`set_config.sh`、`deployment_profile.py` 的封閉 schema / 安全預設，以及本節的客戶端
 範本；使用者不需要取得維護者的 dotfiles。照本節執行會依自己的模型、GPU 與 Python
 產生一套相容設定，而不是複製維護者的私有路徑或 UUID。
 
-正常路徑只讀 `~/.config/opencode/opencode.json`。如果 shell 已自行設定
-`OPENCODE_CONFIG=/其他位置/opencode.json`，`set_config.sh`、`aicode` 與健檢都會改讀／改寫
+正常路徑只讀 `~/.config/codetrail/`。如果 shell 仍設著舊的
+`OPENCODE_CONFIG=/其他位置/opencode.json`，遷移工具會改讀／改寫
 那一份並在設定摘要提示；不打算使用自訂位置時，先 `unset OPENCODE_CONFIG`，避免以為改了
 預設檔但 runtime 實際讀另一份。`~/.config/opencode/` 裡其他備份或測試 JSON 不會自動載入。
 
@@ -383,13 +361,13 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
    | `[2/5]` embedding | 模型 → GPU |
    | `[3/5]` reranker | 模型 → GPU → **internal buffer(`-c/-b/-ub`)** |
    | `[4/5]` VL | 模型 → GPU → mmproj → **CPU-MoE 層數** |
-   | `[5/5]` 壓縮模式 🧪 | `codetrail` / `native` / `manual`(見 [docs/compaction-rules.md](docs/compaction-rules.md);`codetrail` / `manual` 仍在測試階段) |
+   | `[5/5]` 壓縮模式 🧪 | `codetrail` / `manual` / `off`(見 [docs/compaction-rules.md](docs/compaction-rules.md);前兩者仍在測試階段) |
 
-   **`[5/5]` 壓縮模式**決定 OpenCode 什麼時候把長對話換成摘要。**🧪 這一題的 `codetrail` / `manual` 是實驗功能(開發中、仍在測試階段):摘要規則、觸發門檻與受管值都可能再變。選 `native` 就是你原本的行為——OpenCode 自己的壓縮,CodeTrail 完全不接管;沒有 `~/.config/codetrail/compaction.json` 也等於沒有接管,`git pull` 不會自己啟用。**原生行為是「下一個 prompt 進來才檢查」,所以你送出新問題時會先看到一段摘要;`codetrail` 把觸發點移到「助理答完、session 進 idle」之後,並用固定欄位的摘要規則。代價是 `compaction.auto=false` 會**一併關掉同一輪工具迴圈中的壓縮與 provider overflow 自動回復**——單一超長工具輪會變成可見的 context error。`native` 完全交回 OpenCode(並精確還原接管前的值),`manual` 用同一套規則但只在你按 `/compact` 時執行。`codetrail` / `manual` 另外附帶兩個「一路上少放一點進 context」的措施:**舊回合的 assistant reasoning 不送進模型**(最新一則問題之後的照留;要關掉設 `CODETRAIL_KEEP_REASONING=1`)、以及 `compaction.prune`(很舊的工具結果在模型視野裡換成一行,DB 與畫面上的原文不動)。兩者與代價見 [docs/compaction-rules.md §6](docs/compaction-rules.md);升級舊安裝要重跑一次 `./set_config.sh` 才會納管 `prune`。這一題也沒有預設值。**非互動**用 `--compaction-mode {codetrail,native,manual}`;`--yes` 沒給這個旗標時沿用 `~/.config/codetrail/compaction.json` 記錄的選擇,**還沒選過就完全不碰壓縮設定**(舊安裝重跑不會突然多一個 plugin)。
+   **`[5/5]` 壓縮模式**決定客戶端什麼時候把長對話換成一段結構化摘要。**🧪 `codetrail` / `manual` 是實驗功能(開發中、仍在測試階段):摘要規則與觸發門檻可能再變。沒有 `~/.config/codetrail/client.json` 就等於沒有接管,`git pull` 不會自己啟用。** `codetrail` 的觸發點在「助理答完、對話進 idle」之後,所以摘要不會插在你的問題前面;`manual` 用同一套規則但只在你按 `/compact` 時執行;`off` 完全不壓縮——context 滿了會是一個**可見的錯誤**,不會自動補救。三種模式都附帶兩個「一路上少放一點進 context」的措施:**舊回合的 assistant reasoning 不送進模型**(最新一則問題之後的照留;要關掉設 `CODETRAIL_KEEP_REASONING=1`)、以及**舊工具輸出剪枝**(很舊的工具結果在模型視野裡換成一行,session 檔與畫面上的原文不動)。兩者與代價見 [docs/compaction-rules.md §6](docs/compaction-rules.md)。這一題沒有預設值。**非互動**用 `--compaction-mode {codetrail,manual,off}`;`--yes` 沒給這個旗標時沿用 `client.json` 記錄的選擇,**還沒選過就完全不碰壓縮設定**。
 
    **CPU-MoE 沒有 y/n 分流**:直接問「幾層 experts 留 RAM」,**`0` = 不 offload(experts 全留 GPU)**、`N` = 前 N 層留 RAM(`--n-cpu-moe N`)、輸入 **≥ 層數上限 = 全部留 RAM**(等同 `--cpu-moe`)。提示只有兩行:**數值越大 GPU 負載越低**,以及一個**推薦區間**——下界是權重剛好放得進這顆 GPU 目前 free VRAM 的層數、上界是全部移到 RAM(例如 `推薦數值:38-43`)。這個估算只算 GGUF 權重,沒有 KV cache / compute buffer / 共卡的附屬服務,所以是起點而不是保證。工具讀 GGUF tensor table 判斷:**不是 MoE(沒有 expert tensors)就不問**,並印出原因(dense 模型 offload 幾層都沒有意義)。main 與 VL 各問一次;embedding / reranker 永遠不套用。**VL 一旦套用 CPU-MoE,llama.cpp 的 `--fit` 就會失效**(它見到 tensor override 已被設定就直接放棄),所以工具會改寫 `-ngl 99 --fit off` 而不是假裝有 `--fit-target` 保護——這種情況沒有自動退讓的安全網,層數填太低會 OOM。
 
-   `threads` **從頭到尾不問**——大部分人也不知道該填多少,所以預設就是 auto:不寫 `-t`,由 llama.cpp 自己偵測(hybrid CPU 只算 P-core,否則用實體核心數、排除 HT siblings),比工具自己數邏輯 CPU 準。真的要釘死才用進階旗標 `--threads N`。工具只驗證輸入範圍(上下限顯示成 `1024-1048576` 這種形式),**推薦值不會擋你**;三個附屬服務固定單 slot,最後啟動的 VL 用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用自動配置。答完顯示**設定摘要一頁**:按 **Enter 寫入**;**q** 離開不寫檔。OpenCode context、MCP timeout/Python 路徑一併對齊。
+   `threads` **從頭到尾不問**——大部分人也不知道該填多少,所以預設就是 auto:不寫 `-t`,由 llama.cpp 自己偵測(hybrid CPU 只算 P-core,否則用實體核心數、排除 HT siblings),比工具自己數邏輯 CPU 準。真的要釘死才用進階旗標 `--threads N`。工具只驗證輸入範圍(上下限顯示成 `1024-1048576` 這種形式),**推薦值不會擋你**;三個附屬服務固定單 slot,最後啟動的 VL 用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用自動配置。答完顯示**設定摘要一頁**:按 **Enter 寫入**;**q** 離開不寫檔。
 4. **產生四個 runtime 檔案與一個還原 manifest**（選了壓縮模式時再多一份 owner-only 的
    壓縮狀態檔；runtime 檔採 transaction 寫入：要嘛
    全套完成、要嘛完全不動；既有檔自動備份 `*.bak-setconfig-<時間戳>`，
@@ -399,10 +377,8 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 |---|---|
 | `~/.config/codetrail/models.json` | 主模型 registry key → GGUF 路徑(合併既有內容) |
 | `~/.config/codetrail/deployment.json` | deployment profile local override:四個 role 的模型與主模型參數(全部來自你的作答);重跑時**保留你手動加的取樣參數**(temperature/top-p/…與 no_mmap),其他未涵蓋鍵會警告已捨棄 |
-| `~/.config/codetrail/opencode-build-prompt.md` | **只在** `--enable-experimental-build-prompt` 時產生的受管 prompt（mode `0644`）；唯一來源是 [docs/opencode-build-prompt.md](docs/opencode-build-prompt.md) 的 fenced block |
-| `~/.config/opencode/opencode.json` | **合併**而非重建（mode `0600`）：只更新 CodeTrail 管的欄位(model / provider.llamacpp / mcp.codetrail / 缺少的 permission 鍵)；實驗性旗標才補 `agent.build.prompt`，使用者自訂 prompt、provider、主題與其他 MCP server 都保留；與安全範本衝突的 permission 會尊重你的值但明確警告 |
+| `~/.config/codetrail/client.json` | 壓縮模式與權限覆寫（mode `0600`）；**這一題有明確答案時才寫**，沒有這個檔就等於沒有接管 |
 | `~/start.sh` | 啟動腳本:寫死你的 GPU 配置、主模型與驗證過的 `LLAMA_BIN`,呼叫 `scripts/launch_servers.py`;支援 `status` / `stop` / `logs` / `help` 子命令,打錯子命令會提示而不是誤啟動 |
-| `~/.config/codetrail/compaction.json` | **只在 `[5/5]` 有明確答案時產生**(mode `0600`):壓縮模式、目標 config 的身分雜湊、以及接管前每個 `compaction.*` 受管鍵的「原值／原本不存在」。切回 `native` 時只還原**現在的值仍等於 CodeTrail 寫下去那個**的鍵;你事後手改過的一律原封不動。沒有這個檔就等於沒有接管 |
 | `~/.config/codetrail/setconfig-last-transaction.json` | 只記最近一次 transaction 實際包含的 runtime 檔案，供 `--restore-last-backup` 整批還原；不是另一份設定來源 |
 
 結尾會自動印出**啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準;`~/start.sh` 啟動完成的最後一行也會提醒你用 `nvidia-smi` 稍微監控 GPU/VRAM(例如 `watch -n 1 nvidia-smi`),因為 set_config 不做整體 VRAM 可行性判定,也不會拿容量估算保證一定能啟動。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
@@ -421,10 +397,10 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 - MoE：main 使用 `--cpu-moe` / `--no-cpu-moe` / `--n-cpu-moe N`；VL 使用
   `--vl-cpu-moe` / `--no-vl-cpu-moe` / `--vl-n-cpu-moe N`。`N=0` 等同不 offload。
 - 網路：`--allow-remote` 才會開放區網連線；未指定只綁 `127.0.0.1`。
-- 壓縮模式：`--compaction-mode {codetrail,native,manual}`。**這一項不給不會報錯**——
-  沒給時沿用 `~/.config/codetrail/compaction.json` 記錄的既有選擇，這台機器還沒選過
-  就完全不碰壓縮設定。理由是「沒有那個狀態檔＝沒有接管」是安全預設：舊的 `--yes`
-  自動化腳本重跑一次，不該因此突然多一個 plugin 與 `compaction.auto=false`。
+- 壓縮模式：`--compaction-mode {codetrail,manual,off}`。**這一項不給不會報錯**——
+  沒給時沿用 `~/.config/codetrail/client.json` 記錄的既有選擇，這台機器還沒選過
+  就不寫 `client.json`。理由是「沒有那個檔＝沒有接管」是安全預設：舊的 `--yes`
+  自動化腳本重跑一次，不該因此突然開啟自動壓縮。
 
 重跑**不沿用舊選擇**（唯一例外是上面那條 `--compaction-mode`，它沿用狀態檔記錄的
 模式）；其餘每次設定都來自本次作答 / 旗標。只有你手動加進 `deployment.json` 的取樣
@@ -435,11 +411,11 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 
 ```bash
 python3 deployment_profile.py validate
-python3 scripts/opencode_contract_check.py
+python3 opencode_migrate.py --check
 ~/start.sh --dry-run
 ```
 
-前兩條應分別顯示 profile `valid`，以及 OpenCode contract `SAFE`（不能有
+前兩條應分別顯示 profile `valid`，以及遷移工具回報「沒有需要遷移的東西」（不能有
 `MISSING` / `STALE` / `INVALID`）；dry-run 應正常列出四個 server command。三項都符合，
 就不必只因檔案日期較舊而重建。
 
@@ -589,165 +565,44 @@ EOF
 
 registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf` 路徑。多 shard 模型指向第一片即可。也可以跳過 registry 直接把 `AICODE_MODEL` 設絕對路徑,但 registry 比較好維護。附屬模型不需要 registry:`set_config.sh` 直接把絕對路徑寫進 deployment.json。
 
-### 4.3 OpenCode config
+### 4.3 客戶端設定(`~/.config/codetrail/client.json`)
 
-llama-server 提供 OpenAI 相容 `/v1`，OpenCode 用 openai-compatible provider 即可。下面是
-手動設定範本（把所有 `<CODE_MODEL>` 換成你 4.2 裡用的 registry key）。`set_config.sh`
-會產生／合併 CodeTrail 管理的欄位；下例的 `agent.build.prompt` 是尚未 supported 的**選用**設定，
-只有 `--enable-experimental-build-prompt` 才會自動加入；
-`agent.build.temperature` 則是既有的選用覆寫，重跑時會保留：
+`./set_config.sh` 的第 5 題會寫這一份。它只放兩件**使用者顯式選過**的事:
 
 ```json
 {
-  "$schema": "https://opencode.ai/config.json",
-
-  "share": "disabled",
-  "autoupdate": false,
-
-  "enabled_providers": ["llamacpp"],
-
-  "model": "llamacpp/<CODE_MODEL>",
-  "small_model": "llamacpp/<CODE_MODEL>",
-
-  "agent": {
-    "build": {
-      "prompt": "{file:/home/<user>/.config/codetrail/opencode-build-prompt.md}",
-      "temperature": 0
-    }
-  },
-
-  "provider": {
-    "llamacpp": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "llama.cpp local",
-      "options": {
-        "baseURL": "http://localhost:8080/v1",
-        "apiKey": "dummy"
-      },
-      "models": {
-        "<CODE_MODEL>": {
-          "name": "<CODE_MODEL>",
-          "limit": { "context": 65536, "output": 8192 }
-        }
-      }
-    }
-  },
-
-  "mcp": {
-    "codetrail": {
-      "type": "local",
-      "command": [
-        "bash",
-        "-lc",
-        "root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P); exec \"$root/.opencode/run-codetrail-mcp\""
-      ],
-      "enabled": true,
-      "timeout": 660000
-    }
-  },
-
-  "instructions": [".codetrail/lessons.md"],
-
-  "permission": {
-    "*": "deny",
-
-    "question": "allow",
-    "todowrite": "allow",
-    "plan_enter": "allow",
-    "plan_exit": "allow",
-
-    "codetrail_*": "allow",
-    "codetrail_apply_patch": "ask",
-    "codetrail_run_lint": "ask",
-    "codetrail_run_command": "ask",
-    "codetrail_remove_document": "ask",
-    "codetrail_record_lesson": "ask",
-    "codetrail_review_figures": "ask",
-    "codetrail_import_external_file": "allow",
-
-    "webfetch": "deny",
-    "websearch": "deny",
-    "bash": "deny",
-    "read": "deny",
-    "grep": "deny",
-    "glob": "deny",
-    "edit": "deny",
-    "write": "deny",
-    "apply_patch": "deny",
-    "external_directory": "deny",
-    "task": "deny",
-    "skill": "deny",
-    "lsp": "deny"
-  }
+  "schema": 1,
+  "compaction_mode": "codetrail",
+  "permission": {}
 }
 ```
 
-(`set_config.sh` 產生的 MCP `command` 會直接用偵測到的 Python 絕對路徑執行 `mcp_server.py`,不經 `.opencode/run-codetrail-mcp` wrapper。這只保證 **MCP 子行程**找到原 venv；若依賴只裝在 venv,`aicode` 的啟動前置仍應在 activate 後執行。上面範本用 wrapper 的寫法供手動設定者理解；正常安裝以 `set_config.sh` 產物為準。)
+- `compaction_mode`:`codetrail`(助理答完、對話進 idle 之後自動壓縮)/
+  `manual`(只有你按 `/compact`)/ `off`(完全不壓縮;context 滿了會是可見的錯誤)。
+  **沒有這個檔就等於沒有接管**,客戶端退成 `manual` 並在啟動橫幅講明。
+- `permission`:每個工具的核准覆寫(`allow` / `ask` / `deny`),不寫就用預設。
 
-`agent.build.prompt` 的 `{file:...}` 是**取代** OpenCode build agent 預設 prompt 的受管檔案，
-不是附加另一份完整工具手冊。一般安裝維持 OpenCode 現況，不會新增這個欄位；若明確使用
-`--enable-experimental-build-prompt`，`set_config.sh` 才會寫入目前 HOME 的絕對路徑。
-舊 CodeTrail 受管 reference 會同步，明確自訂的 string 會保留；opt-in 時遇到非 string
-壞值會 fail-loud，不猜測修復。canonical prompt
-與 `opencode.json` 同一 transaction 寫入、支援 symlink write-through 與整批 rollback；prompt
-是 `0644`，可能含 provider key 的 config 是 `0600`。這份合成 request evidence 只證明
-replacement semantics。完整 A/B 已執行，但沒有任何 arm 通過全部 gate，因此它不成為預設，
-也不能據此宣稱某模型組合 supported。`todowrite` 目前仍為 `allow`。
+檔案是 0600:它決定寫入工具要不要人工核准,能被別人改就等於能繞過核准。
 
-`mcp.codetrail.timeout` 的單位是毫秒,而且套用到每一次 MCP tool call。圖片 VL 分析通常超過 10 秒,`ingest_document` 的內部上限則是 10 分鐘,因此範本使用 660000 ms(11 分鐘)。若沿用 OpenCode 常見的 `10000`,第一個圖片呼叫會在剛好 10 秒被 client 切斷,後續 `file_info` / `list_dir` 也可能排在尚未結束的圖片請求後面,看起來像整個 MCP server 一起超時。
+#### 工具權限預設
 
-`ingest_document` 現在跑在 server 的 worker thread 上,執行期間 MCP server 仍然回應其他工具呼叫;它每兩秒送一次 MCP progress 通知(只有經過秒數與已收到的輸出行數,不含任何文件內容)。OpenCode 自 1.17.8 起會拿這個通知續 tool-call timeout(UI 上不顯示),更舊的版本收得到但不續期 —— `python3 scripts/doctor.py` 會對此印 WARN。ingest 期間所有知識庫工具(`query_knowledge*`、`reload_knowledge_base`、`remove_document`、`review_figures`)與第二個 `ingest_document` 會**立刻**回「稍後重試」而不是排隊:那段時間 `knowledge.json` 正在被原子替換。`code_rag_search` 與檔案類工具不受影響。匯入結束後,若這一次有待覆核 / 無法修復 / 抽取失敗的圖,結果會在標頭下帶一段 `[CODETRAIL_ACTION_REQUIRED]` 待辦(只看這一次的 run);逾時、非零 exit 或輸出不完整則帶 `[CODETRAIL_INGEST_FAILED]`,工具狀態是 `error` 而不是 `ok`。
+唯讀工具直接執行;下面六個每次都會跳核准框,框裡**完整顯示參數**(含整份 patch):
+`apply_patch`、`run_lint`、`run_command`、`remove_document`、`record_lesson`、
+`review_figures`。
 
-`aicode` 啟動時會把**既有** `mcp.codetrail` entry 中缺漏、型別錯誤或小於 660000 的 `timeout` 自動同步為專案常數,保留其餘 OpenCode JSON 設定,並在同目錄留下 `opencode.json.codetrail.bak`(若已存在則加數字後綴)。寫入採原子替換;設定檔格式錯誤或無法寫入時會 fail-loud,不會帶著已知錯誤啟動 OpenCode。只有緊急測試才用 `AICODE_MCP_TIMEOUT_CHECK_SKIP=1 aicode` 跳過。
+評測與啟動抽查走的是另一條 policy(`--policy readonly`):凡是 `tools/list` 沒有
+標 `readOnlyHint` 的工具一律 deny,而且 MCP server 那一層也會關掉寫入與執行
+(`AI_CODE_PATCH=0` / `AI_CODE_RUN_TESTS=0`)——兩層都在,繞過一層仍然寫不進去。
 
-升級說明（ELF 分析改版）：工具仍是 19 個、名稱不變，但 `analyze_file` 新增 `view` / `target` / `limit` 三個參數（ELF 多視角：symbols / disasm / dwarf / strings / sections / memmap / relocs / imports / dynamic / headers，見 [MCP 工具清單](docs/mcp-tools.md#analyze_file-的-elf-視角)），tool schema 已變；`git pull` 後同樣要完全退出 OpenCode 開新 session。`pyelftools` 進入 `requirements.txt`，請重跑 `python3 -m pip install --user --break-system-packages -r requirements.txt`（或在 venv 內 `pip install -r requirements.txt`）；`ingest_document` 對 ELF 改走長版報告，舊 KB 裡已入庫的 ELF 想拿到完整 symbol / DWARF / relocation 內容要 `remove_document` 後重新 ingest。
+#### MCP 呼叫的 read timeout
 
-升級說明（patch／verify 改版）：工具仍是 19 個、名稱不變，但 `apply_patch`（新增 SEARCH/REPLACE 格式、byte-safe 寫入、唯讀 syntax check）與 `run_command`（新增 `timeout` 參數，1..600 秒）的 tool schema / description 已變。`git pull` 之後要**完全退出** OpenCode、開新 session 讓 MCP 重連——舊 session 拿到的是舊 schema，模型會照舊說明呼叫。不要把參數手冊貼進全域 `~/.config/opencode/AGENTS.md`：本輪 tool schema 才是唯一真值（見 [docs/opencode-agents-template.md](docs/opencode-agents-template.md)），格式與上限的人類文件在 [MCP 工具清單](docs/mcp-tools.md#apply_patch-的兩種格式)。
+每一次 MCP 呼叫的 read timeout 固定 **660 秒**(`config.MCP_CALL_TIMEOUT_SECONDS`),
+呼叫端不能放寬。理由是 `ingest_document` 的內部上限是 600 秒:更短的 timeout 會讓
+client 在 server 還在寫 `knowledge.json` 的時候放棄。到期時客戶端會送
+`notifications/cancelled` 並在寬限期內等 server 回覆,寬限期過就 SIGTERM 該 MCP
+instance(server 自己的 handler 會收乾淨 ingest 子行程)。
 
-主模型 context 也採同一原則：使用者只在 `set_config.sh` 設 `n_ctx`。`aicode` 會讀主 server `/props` 的實值，供 CodeTrail internal calls 使用，並把 OpenCode active model 的 `limit.context` 安全同步成同一值。同步只改該 model 的這一欄、原子寫入並留備份；無法唯一定位 model、JSON 損壞或寫入失敗時才 fail-loud。
-
-`aicode`（含 `aicode web` 與最終委派它的 `aicode_web`，不含只連既有 backend 的
-`attach`）有三道分開的工具檢查：先用 `scripts/opencode_direct_contract.py` 驗證
-OpenCode `>=1.17,<2` 的 direct `codetrail_*` 契約，且在任何 writer/MCP/model 前
-fail-loud；再每次對實際 MCP command 做 `initialize → tools/list → list_dir`，要求 live
-catalog 的 19 個名稱與固定順序精確符合契約，並把完整 typed schemas／instructions digest
-納入後續 fingerprint；typed schema 的 bounds/description/budget 由 static contract 驗證，
-routing catalog 則保存逐工具 schema counts/digests 與 token measurement。最後才跑模型 lane。
-
-模型 lane 也刻意分開：explicit prompt 點名 `codetrail_list_dir`，只接受 completed
-結構化 event，失敗可重試一次而連續失敗會 exit 2；成功後另跑一次**未點名工具**的 implicit
-routing 診斷，只分成 `optimal`／`suboptimal`／`fail`／`timeout`，四種都不擋啟動。
-explicit 與 implicit 使用 schema 2 的分離 cache lane；指紋包含模型、effective config、
-OpenCode 版本、live tools/instructions、有效 build prompt、AGENTS/lessons 與 server `/props`。
-cache 只存 fingerprint hash、status、時間與版本，不存 prompt、檔名、專案路徑、模型輸出或
-tool result；臨時 canary session 也會刪除。`supports_tools=false` 會在任何 model attempt 前
-直接拒絕。完整輸出見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。
-
-說明:
-
-- `llamacpp` 是 provider key,可改名(`local`、`llmcpp`、隨意),但要跟 `"model"` 那段的 prefix 對齊。
-- `enabled_providers` 鎖定只啟用本機 provider:設了之後 OpenCode 的 model picker(TUI 與 web)**只會出現你的本機模型**,雲端 provider(OpenCode Zen、Anthropic、OpenAI 等)完全不列出、無法誤選 —— **NDA 場景強烈建議保留**,避免把程式碼送到雲端模型。陣列內字串要跟你的 provider key 一致(這裡是 `llamacpp`)。
-- `apiKey` 在目前範本只是 OpenCode provider 要求的非空值；CodeTrail 產生的
-  llama-server 沒有啟用 key 驗證，它不是存取控制。上游的 `--api-key` / TLS
-  尚未接進 CodeTrail profile 與內部 client；遠端部署仍以 loopback + SSH tunnel
-  或可信 VPN 為主，見 [安全邊界](docs/security.md#模型-apillama-server曝光面)。
-- **工具呼叫很多的 Build agent 建議設 `agent.build.temperature: 0`**。這是 [OpenCode 官方 agent 設定](https://dev.opencode.ai/docs/agents/)支援的 override,可降低本機模型把工具呼叫格式「說成文字」或隨機改寫格式的機率;它不會替你連上 MCP,也只影響 Build agent。改完先用 `opencode debug agent build` 確認解析結果含 `"temperature": 0`,再完全退出並重開 OpenCode、開新 session 測試。
-- **解析到設定不等於每個版本都一定把它送進 request body**。OpenCode 的 custom `@ai-sdk/openai-compatible` provider 有已知的 `temperature` 傳遞問題([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));因此需要所有 client 都有一致的 server 預設時,仍應在 deployment profile 的 `services.main.parameters` 設 `temperature`。`top_p` / `top_k` / `min_p` 等 provider schema 不一定支援的參數也放 server 端。完整判讀與假工具呼叫排查見 [docs/troubleshooting.md](docs/troubleshooting.md#mcp-connected-but-no-tool-call);取樣值必須依目前主模型的文件設定,不要沿用其他模型的數值。
-- **Connected 卻只回答「我現在呼叫」時，先檢查全域 prompt 是否太肥**。`~/.config/opencode/AGENTS.md` 只能保留 `codetrail_*` schema anchor、禁止假 XML／假成功與停止條件；工具名稱和參數以本輪 schema 為準。不要明訂 19 個工具，也不要複製 RAG、graph、figure 的完整流程。實際 A/B 顯示，舊 4,869 字元範本和 OpenCode 完整 prompt 疊加時會讓模型以 `stop` 結束，僅移除舊範本就恢復 `codetrail_list_dir` 結構化呼叫。請用 `python3 scripts/opencode_contract_check.py --sync-agents-md` 同步[精簡範本](docs/opencode-agents-template.md)，完全退出後開新 session，再以 `AICODE_TOOL_CANARY_FORCE=1 aicode` 重驗；分層排查見 [troubleshooting](docs/troubleshooting.md#mcp-connected-but-no-tool-call)。`ingest_document` 只寫 KB，不會把全文永久塞進新 session。
-- **要壓「模型杜撰不存在的具體事實」(條號 / 日期 / 數字)，全域規則只留一條短約束**：沒有工具或使用者提供的證據就明說沒有，不要再貼長篇範例。OpenCode 會把全域檔載入每段對話；它跟 repo 根目錄那份給 coding agent 的 `AGENTS.md` 是兩回事。原理與按需提示方式見 [docs/troubleshooting.md](docs/troubleshooting.md)。
-- `limit.context: 65536` 是 OpenCode 對主 n_ctx 的 client-side 鏡像。正常不要分開調：用 `set_config.sh` 設一次主 n_ctx 並重啟 server；`aicode` 會觀測 server `-c` 的實值並自動同步此欄。
-- `permission` 區段:`*: deny` 是預設拒絕一切,只白名單 `codetrail_*`(經 CodeTrail 沙箱)。OpenCode 內建工具(`bash` / `read` / `write` 等)會繞過 CodeTrail 沙箱,所以這裡明確 `deny`。
-- `instructions` 的 `.codetrail/lessons.md` 是 [lessons(行為教訓)](docs/lessons.md)的注入點:`aicode` 每次啟動把已核准的行為規則 render 進該檔,OpenCode 連同 AGENTS.md 一起載入;檔案不存在時視同無匹配、直接略過。`codetrail_record_lesson` 設 `ask` 是 lessons 的人工核准閘 —— 模型只能「提案」,你在核准框看到 rule 內容、同意後才寫入。
-
-手動貼完先驗 JSON 格式:
-
-```bash
-python3 -m json.tool ~/.config/opencode/opencode.json >/dev/null
-```
-
----
-
-## 5. 自檢與啟動 TUI
+## 5. 自檢與啟動客戶端
 
 ### 5.1 跑 doctor 自檢
 
@@ -773,9 +628,9 @@ cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-`aicode` 不用帶參數:主模型會依「env `AICODE_MODEL` > `-m` 旗標 > deployment.json > opencode.json」解析,`set_config.sh` 已把後兩者設好。
+`aicode` 不用帶參數:主模型會依「env `AICODE_MODEL` > `-m` 旗標 > deployment.json」解析,`set_config.sh` 已把最後一項設好。
 
-啟動前置全部通過後會倒數 3 秒才進 OpenCode TUI(TUI 一接管畫面就會蓋掉前面的檢查訊息)。
+啟動前置全部通過後會倒數 3 秒才進客戶端(它一接管畫面就會蓋掉前面的檢查訊息)。
 不想等就 `AICODE_LAUNCH_DELAY=0 aicode`;輸出不是終端機(導向檔案、被腳本收 stdout)時不倒數。
 
 要讓模型讀專案外的附件(`~/Downloads` 的 log / 截圖 / spec)就多加一個開關:
@@ -794,7 +649,7 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 請用工具 list_dir 看當前目錄結構,挑出 entry point、主要模組和測試目錄,簡單整理。
 ```
 
-模型應該會透過 CodeTrail MCP 呼叫 `list_dir`(OpenCode log 裡可能顯示成 `codetrail_list_dir`)讀真實目錄,然後回給你整理結果。
+模型應該會透過 CodeTrail MCP 呼叫 `list_dir` 讀真實目錄,然後回給你整理結果。工具名是**裸名**(沒有 `codetrail_` 前綴——那是 OpenCode 加的)。
 
 第一個請求**首字延遲(TTFT)**:
 
@@ -803,7 +658,7 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 
 要改成 `--no-mmap`,是在 `~/.config/codetrail/deployment.json` 的 `services.<main|vl>.parameters` 加 `"no_mmap": true`(不是手動改 llama-server 指令 —— argv 每次由 deployment 重新產生)。CodeTrail **不替你決定**這一項,但套了 CPU-MoE 卻沒設時 `set_config.sh` 會警告,而且重跑會保留你的設定。詳見 [docs/troubleshooting.md](docs/troubleshooting.md)。
 
-如果想驗證 MCP transport 有沒有連上:OpenCode TUI 輸入 `/status`,應看到 `codetrail Connected`。**Connected 只代表 MCP 子行程完成連線,不代表模型在這一輪真的發出 tool call。** 真正執行時應看到 frontend 的工具卡 / 結果;若模型只印出 `<codetrail_list_dir .../>` 再用文字宣稱成功,那是假工具呼叫,照 [troubleshooting 的分層檢查](docs/troubleshooting.md#mcp-connected-but-no-tool-call)處理。
+如果想驗證 MCP transport 有沒有連上:客戶端輸入 `/tools`,應列出 19 個工具。**列得出來只代表 MCP 子行程完成連線,不代表模型在這一輪真的發出 tool call。** 真正執行時畫面上會有一行 `· list_dir(path=.) → completed`;若模型只印出 `<list_dir .../>` 再用文字宣稱成功,那是假工具呼叫 —— 客戶端會偵測到並提示一次,細節照 [troubleshooting 的分層檢查](docs/troubleshooting.md#mcp-connected-but-no-tool-call)處理。
 
 要做「分析、解釋、推導、找原因」時，優先用同一個既有工具的 bounded context 模式：
 
@@ -823,8 +678,8 @@ embedding,查詢跟程式碼同語言時召回率差很多。33 萬符號的真�
 | 自然英文句 `tcf tool configuration file parsing for target core properties` | top-5 有 4 筆是正確答案 |
 
 你仍然可以用中文跟模型對話；`code_rag_search.query` 要用英文時，像上面的範例直接在當次
-問題要求模型翻成自然英文即可。不要為了這件事把整段 query 教學複製進每輪載入的全域
-[AGENTS.md](docs/opencode-agents-template.md)。
+問題要求模型翻成自然英文即可。不要為了這件事把整段 query 教學複製進每輪載入的
+`~/.config/codetrail/instructions.md`。
 
 `mode="context"` 會把 semantic seeds、確定的 1-hop caller/callee/include，以及相關
 test/header/config/trace lexical evidence 合併去重後裝進 bounded budget。MCP 省略
@@ -907,7 +762,7 @@ preflight 零寫入;它會估算所有結構化候選，包含純 raster 的分�
 
 ### 5.4 Web 模式(目前測試中)
 
-> ⚠️ **CodeTrail 的沙箱綁在「你啟動 backend 的那個資料夾」(`AICODE_ROOT`)—— 綁在 process 上,不會跟著你在 UI 切資料夾、或切對話而移動。** 所以 OpenCode web UI 那顆「切換資料夾 / 開其他專案」按鈕**對 CodeTrail 完全無效**:切過去後 CodeTrail 工具還是只讀**啟動目錄**(讀不到沙箱外,所以不是 escape,但會讓你誤以為切了)。**請無視那顆切換器。** 換專案時先 `aicode_web stop`,再到新專案目錄重開。
+> ⚠️ **CodeTrail 的沙箱綁在「你啟動 backend 的那個資料夾」(`AICODE_ROOT`)—— 綁在 process 上,不會跟著對話移動。** 換專案時先 `aicode_web stop`,再到新專案目錄重開。
 >
 > (TUI 沒有這顆切換器,你 `cd 專案 && aicode` 在裡面開幾個對話都是鎖在同一個專案,自然不會錯亂;換專案就重開一個 `aicode`。)
 
@@ -948,9 +803,7 @@ ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>
 | [docs/rag.md](docs/rag.md) | 讀檔、匯入附件(PDF / 圖片經 VL)、建立知識庫、圖片+RAG 一起用、查 spec |
 | [docs/mcp-tools.md](docs/mcp-tools.md) | CodeTrail 暴露的 19 個 MCP 工具與使用原則 |
 | [docs/lessons.md](docs/lessons.md) | lessons(行為教訓):糾正 → 提案 → 核准 → 注入 → 過期複審的完整生命週期與管理指令 |
-| [docs/opencode-build-prompt.md](docs/opencode-build-prompt.md) | CodeTrail 受管 build prompt、replacement evidence 與不宣稱 routing support 的邊界 |
-| [docs/opencode-agents-template.md](docs/opencode-agents-template.md) | OpenCode 全域 AGENTS.md 精簡範本、1,600 字元預算與 prompt 過載排查 |
-| [docs/security.md](docs/security.md) | 沙箱邊界、OpenCode permission、外部匯入與 NDA 資料注意事項 |
+| [docs/security.md](docs/security.md) | 沙箱邊界、工具權限、外部匯入與 NDA 資料注意事項 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | `/status` / `/mcp`、ctx-safety、server 不可連、Blackwell CUDA、MoE 首字慢 |
 | [README_DEV.md](README_DEV.md) | 開發者維護命令、測試、eval、context gate 設計 |
 | [AGENTS.md](AGENTS.md) | AI coding agent 修改本 repo 時必讀的安全規範 |

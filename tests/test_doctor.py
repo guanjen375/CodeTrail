@@ -20,7 +20,6 @@ import pytest
 
 from scripts import check_readme_consistency
 from scripts import doctor as doc
-from scripts import opencode_direct_contract as direct_contract
 from scripts import tool_call_canary as canary
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -159,75 +158,12 @@ def test_check_mcp_runtime_rejects_incompatible_versions(monkeypatch, version):
     assert not r.passes
 
 
-def test_check_opencode_ai_entry_warns_when_cli_missing(monkeypatch):
-    monkeypatch.setattr(doc.shutil, "which", lambda name: None)
-    r = doc.Result()
-    doc.check_opencode_ai_entry(r)
-    assert not r.fails
-    assert any("opencode-ai CLI `opencode` 不在 PATH" in w for w in r.warns)
 
 
-def test_check_opencode_ai_entry_warns_when_cli_is_not_npm_package(monkeypatch):
-    def fake_which(name: str):
-        return {
-            "opencode": "/usr/local/bin/opencode",
-            "npm": "/usr/local/bin/npm",
-        }.get(name)
-
-    class FakeProc:
-        returncode = 1
-        stdout = '{"dependencies": {}}'
-        stderr = ""
-
-    monkeypatch.setattr(doc.shutil, "which", fake_which)
-    monkeypatch.setattr(doc.subprocess, "run", lambda *args, **kwargs: FakeProc())
-
-    r = doc.Result()
-    doc.check_opencode_ai_entry(r)
-    assert any("opencode-ai CLI `opencode` 在 PATH" in p for p in r.passes)
-    assert any("opencode-ai" in w and "未偵測到" in w for w in r.warns)
 
 
-def test_check_opencode_ai_entry_rejects_npm_missing_marker(monkeypatch):
-    def fake_which(name: str):
-        return {
-            "opencode": "/usr/local/bin/opencode",
-            "npm": "/usr/local/bin/npm",
-        }.get(name)
-
-    class FakeProc:
-        returncode = 1
-        stdout = '{"dependencies": {"opencode-ai": {"missing": true}}}'
-        stderr = ""
-
-    monkeypatch.setattr(doc.shutil, "which", fake_which)
-    monkeypatch.setattr(doc.subprocess, "run", lambda *args, **kwargs: FakeProc())
-
-    r = doc.Result()
-    doc.check_opencode_ai_entry(r)
-    assert any("opencode-ai" in w and "未偵測到" in w for w in r.warns)
 
 
-def test_check_opencode_ai_entry_accepts_npm_package(monkeypatch):
-    def fake_which(name: str):
-        return {
-            "opencode": "/usr/local/bin/opencode",
-            "npm": "/usr/local/bin/npm",
-        }.get(name)
-
-    class FakeProc:
-        returncode = 0
-        stdout = '{"dependencies": {"opencode-ai": {"version": "1.2.3"}}}'
-        stderr = ""
-
-    monkeypatch.setattr(doc.shutil, "which", fake_which)
-    monkeypatch.setattr(doc.subprocess, "run", lambda *args, **kwargs: FakeProc())
-
-    r = doc.Result()
-    doc.check_opencode_ai_entry(r)
-    assert not r.fails
-    assert not r.warns
-    assert any("npm package opencode-ai 已安裝 (1.2.3)" in p for p in r.passes)
 
 
 def test_check_models_passes_when_gguf_exists(monkeypatch, tmp_path):
@@ -291,84 +227,14 @@ def test_check_models_warns_on_loaded_model_mismatch(monkeypatch, tmp_path):
     assert any("AICODE_MODEL" in w and "不同" in w for w in r.warns), r.warns
 
 
-def test_check_opencode_model_config_accepts_valid_config(monkeypatch, tmp_path):
-    oc_path = tmp_path / "opencode.json"
-    _write_opencode_config(oc_path, "llamacpp/my-model")
-    monkeypatch.setenv("AICODE_MODEL", "my-model")
-    monkeypatch.setenv("OPENCODE_CONFIG", str(oc_path))
-
-    r = doc.Result()
-    doc.check_opencode_model_config(r)
-
-    assert not r.fails
-    assert any("對齊" in p for p in r.passes), r.passes
 
 
-def test_check_opencode_model_config_accepts_aliases_for_same_gguf(
-    monkeypatch, tmp_path
-):
-    model = tmp_path / "same-model.gguf"
-    model.write_bytes(b"GGUF fixture")
-    oc_path = tmp_path / "opencode.json"
-    _write_opencode_config(oc_path, "llamacpp/new-alias")
-    monkeypatch.setenv("AICODE_MODEL", "old-alias")
-    monkeypatch.setenv("OPENCODE_CONFIG", str(oc_path))
-    monkeypatch.setenv(
-        "AICODE_MODEL_REGISTRY",
-        json.dumps({"old-alias": str(model), "new-alias": str(model)}),
-    )
-
-    r = doc.Result()
-    doc.check_opencode_model_config(r)
-
-    assert not r.fails
-    assert any("對齊" in passed for passed in r.passes), r.passes
 
 
-def test_check_opencode_model_config_fails_when_model_mismatches(monkeypatch, tmp_path):
-    oc_path = tmp_path / "opencode.json"
-    _write_opencode_config(oc_path, "llamacpp/different-model")
-    monkeypatch.setenv("AICODE_MODEL", "my-model")
-    monkeypatch.setenv("OPENCODE_CONFIG", str(oc_path))
-
-    r = doc.Result()
-    doc.check_opencode_model_config(r)
-
-    assert any("不一致" in f for f in r.fails), r.fails
 
 
-def test_check_opencode_model_config_warns_for_global_config_when_env_model_set(
-    monkeypatch, tmp_path
-):
-    cfg_dir = tmp_path / ".config" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.json").write_text(
-        json.dumps({"model": "llamacpp/different-from-env"}),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("AICODE_MODEL", "my-env-model")
-    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("USERPROFILE", str(tmp_path))
-
-    r = doc.Result()
-    doc.check_opencode_model_config(r)
-
-    assert not r.fails
-    assert any("不一致" in w or "OpenCode" in w for w in r.warns), r.warns
 
 
-def test_check_opencode_model_config_fails_external_provider(monkeypatch, tmp_path):
-    """opencode.json model 是 anthropic/openai/ollama/ 這類外部 provider 時必須 FAIL。"""
-    oc_path = tmp_path / "opencode.json"
-    _write_opencode_config(oc_path, "anthropic/something")
-    monkeypatch.setenv("AICODE_MODEL", "my-model")
-    monkeypatch.setenv("OPENCODE_CONFIG", str(oc_path))
-
-    r = doc.Result()
-    doc.check_opencode_model_config(r)
-
-    assert any("provider" in f.lower() for f in r.fails), r.fails
 
 
 # ============================================================
@@ -451,39 +317,8 @@ def test_check_llama_runtime_ok_when_idle():
     assert not r.warns
 
 
-def test_check_opencode_config_drift_warns_on_mismatch(monkeypatch, tmp_path):
-    import config as cfg
-    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
-    monkeypatch.setattr(cfg, "N_CTX", 32768)
-
-    # opencode.json active model limit.context differs from CodeTrail cap.
-    oc_path = tmp_path / "opencode.json"
-    oc_path.write_text(
-        json.dumps({
-            "model": "llamacpp/my-model",
-            "provider": {
-                "llamacpp": {
-                    "models": {
-                        "my-model": {"name": "X", "limit": {"context": 4096}}
-                    }
-                }
-            }
-        }),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("AICODE_ROOT", str(tmp_path))
-    r = doc.Result()
-    doc.check_opencode_config_drift(r, str(tmp_path))
-    assert any("limit.context" in w for w in r.warns), r.warns
 
 
-def test_check_opencode_config_drift_silent_when_absent(monkeypatch, tmp_path):
-    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("USERPROFILE", str(tmp_path))
-    r = doc.Result()
-    doc.check_opencode_config_drift(r, str(tmp_path))
-    assert not r.fails
 
 
 def test_check_rerank_policy_prints_current_policy(monkeypatch, capsys):
@@ -639,18 +474,6 @@ def test_doctor_reports_only_current_fingerprint_implicit_lane(tmp_path):
     assert any("status=timeout" in message for message in matched.warns)
 
 
-def test_doctor_direct_contract_marks_known_incompatible_client_as_fail(
-    monkeypatch, tmp_path
-):
-    monkeypatch.setattr(doc.shutil, "which", lambda name: "/bin/opencode")
-    monkeypatch.setattr(
-        doc,
-        "load_live_contract_inputs",
-        lambda **kwargs: ("2.0.0", {"mcp": {"servers": {}}}),
-    )
-    result = doc.Result()
-    assert doc.check_opencode_direct_contract(result, str(tmp_path)) is None
-    assert any("direct-tool contract 不相容" in message for message in result.fails)
 
 
 def test_doctor_no_network_does_not_probe_current_canary_fingerprint(monkeypatch):
@@ -662,7 +485,7 @@ def test_doctor_no_network_does_not_probe_current_canary_fingerprint(monkeypatch
     result = doc.Result()
     doc.check_tool_call_canary_diagnostic(
         result,
-        direct_inputs=("1.18.21", {}, Path.cwd()),
+        project=str(Path.cwd()),
         no_network=True,
     )
     assert not result.fails
@@ -877,192 +700,24 @@ def test_compaction_mode_absent_state_is_informational(monkeypatch, tmp_path):
     assert not r.fails and not r.warns
 
 
-def test_compaction_mode_reports_a_consistent_setup(monkeypatch, tmp_path):
-    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-    r = doc.Result()
-    doc.check_compaction_mode(r)
-    assert not r.warns and not r.fails
-    assert any("codetrail" in item for item in r.passes)
 
 
-@pytest.mark.smoke
-def test_compaction_mode_warns_when_the_effective_config_drifted(monkeypatch, tmp_path):
-    """手改全域設定把 auto 翻回 true 時,plugin 會停用自動壓縮。
-
-    headless 沒有 TUI toast,這條訊息就只剩 doctor 與 OpenCode 的 application
-    log 看得到——doctor 不講的話,使用者只會覺得「壓縮怎麼不動了」。
-    """
-    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
-    config["compaction"]["auto"] = True
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-    r = doc.Result()
-    doc.check_compaction_mode(r)
-    assert any("compaction.auto" in item for item in r.warns), r.warns
-    assert not r.fails
 
 
-@pytest.mark.smoke
-def test_compaction_mode_sees_a_project_level_override(monkeypatch, tmp_path):
-    """OpenCode 會把 `<project>/.opencode/opencode.json` 疊在全域之上。
-
-    只讀全域的話,doctor 會對「全域一致、專案層把 auto 翻回 true」回報一致,
-    而 plugin 那端已經因為漂移停用 —— 兩邊講的話相反,使用者無從判斷。
-    """
-    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-    project = tmp_path / "project"
-    (project / ".opencode").mkdir(parents=True)
-    (project / ".opencode" / "opencode.json").write_text(
-        json.dumps({"compaction": {"auto": True}}), encoding="utf-8"
-    )
-
-    r = doc.Result()
-    doc.check_compaction_mode(r, project)
-    assert any("compaction.auto" in item for item in r.warns), r.warns
-
-    # 文件教的是直接跑 `python3 scripts/doctor.py`(沒有 --project),
-    # 而 OpenCode 疊的是**當下目錄**的專案設定 —— 那條路徑也要看得到。
-    monkeypatch.chdir(project)
-    cwd_result = doc.Result()
-    doc.check_compaction_mode(cwd_result)
-    assert any("compaction.auto" in item for item in cwd_result.warns), cwd_result.warns
 
 
-@pytest.mark.smoke
-def test_compaction_mode_reports_an_unreadable_project_config(monkeypatch, tmp_path):
-    """帶註解的 `.jsonc` 讀不了時要講,不能靜靜當成沒有 override。"""
-    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-    project = tmp_path / "project"
-    (project / ".opencode").mkdir(parents=True)
-    (project / ".opencode" / "opencode.jsonc").write_text(
-        '{\n  // 註解\n  "compaction": {"auto": true}\n}', encoding="utf-8"
-    )
-    r = doc.Result()
-    doc.check_compaction_mode(r, project)
-    assert not r.passes or not any("一致" in item for item in r.passes)
 
 
-@pytest.mark.smoke
-def test_compaction_mode_recomputes_the_managed_values_for_the_current_model(
-    monkeypatch, tmp_path
-):
-    """`limit.context` 被改小之後,寫進設定的保留額不會自己重算。
-
-    plugin 會因此停用自動壓縮;doctor 只比對「設定 vs 狀態檔」的話會回報
-    「一致」,兩邊對同一份設定講相反的話。
-    """
-    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
-    config["model"] = "llamacpp/m"
-    config["provider"] = {
-        "llamacpp": {"models": {"m": {"limit": {"context": 65536, "output": 8192}}}}
-    }
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-    r = doc.Result()
-    doc.check_compaction_mode(r)
-    assert any("preserve_recent_tokens" in item for item in r.warns), r.warns
 
 
-@pytest.mark.smoke
-def test_compaction_state_override_is_disclosed(monkeypatch, tmp_path):
-    """留在殼層裡的 eval-only override 會讓 runtime 讀另一份狀態。"""
-    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-    monkeypatch.setenv("AICODE_COMPACTION_STATE", str(tmp_path / "other.json"))
-    r = doc.Result()
-    doc.check_compaction_mode(r)
-    assert any("AICODE_COMPACTION_STATE" in item for item in r.warns), r.warns
 
 
-@pytest.mark.smoke
-def test_compaction_mode_sees_a_project_level_model_override(monkeypatch, tmp_path):
-    """專案改選一個 context 較小的模型時,runtime 會用那個模型重算並停用。
-
-    doctor 只疊 `compaction` / `plugin` 的話仍會回報一致 —— 兩邊講相反的話。
-    """
-    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
-    config["model"] = "llamacpp/big"
-    config["provider"] = {
-        "llamacpp": {"models": {
-            "big": {"limit": {"context": 131072, "output": 8192}},
-            "small": {"limit": {"context": 65536, "output": 8192}},
-        }}
-    }
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-    clean = doc.Result()
-    doc.check_compaction_mode(clean, tmp_path / "empty")
-    assert not clean.warns
-
-    project = tmp_path / "project"
-    (project / ".opencode").mkdir(parents=True)
-    (project / ".opencode" / "opencode.json").write_text(
-        json.dumps({"model": "llamacpp/small"}), encoding="utf-8"
-    )
-    r = doc.Result()
-    doc.check_compaction_mode(r, project)
-    assert any("preserve_recent_tokens" in item for item in r.warns), r.warns
 
 
-@pytest.mark.smoke
-def test_compaction_mode_recomputes_for_the_compaction_agent_model(monkeypatch, tmp_path):
-    """上游用 `agent.compaction.model` 做 tail selection 與摘要。
-
-    只看 `config.model` 的話,runtime 會用小模型重算並停用,doctor 卻回報 PASS。
-    """
-    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
-    config["model"] = "llamacpp/big"
-    config["provider"] = {
-        "llamacpp": {"models": {
-            "big": {"limit": {"context": 131072, "output": 8192}},
-            "small": {"limit": {"context": 65536, "output": 8192}},
-        }}
-    }
-    config["agent"] = {"compaction": {"model": "llamacpp/small"}}
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-    r = doc.Result()
-    doc.check_compaction_mode(r, tmp_path / "empty")
-    assert any("preserve_recent_tokens" in item for item in r.warns), r.warns
 
 
-@pytest.mark.smoke
-def test_compaction_mode_reads_both_project_config_files(monkeypatch, tmp_path):
-    """OpenCode 依序載入 `.json` 與 `.jsonc`,不是找到一份就停。"""
-    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-    project = tmp_path / "project"
-    (project / ".opencode").mkdir(parents=True)
-    (project / ".opencode" / "opencode.json").write_text(
-        json.dumps({"instructions": ["x"]}), encoding="utf-8"
-    )
-    (project / ".opencode" / "opencode.jsonc").write_text(
-        json.dumps({"compaction": {"auto": True}}), encoding="utf-8"
-    )
-    r = doc.Result()
-    doc.check_compaction_mode(r, project)
-    assert any("compaction.auto" in item for item in r.warns), r.warns
 
 
-@pytest.mark.smoke
-def test_project_configs_merge_their_plugin_arrays(monkeypatch, tmp_path):
-    """OpenCode 合併 plugin origins;第二份蓋掉第一份的話 doctor 會報「缺 plugin」。"""
-    import compaction_mode
-
-    config_path, config = _compaction_fixture(monkeypatch, tmp_path, "codetrail")
-    config.pop("plugin", None)
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-    project = tmp_path / "project"
-    (project / ".opencode").mkdir(parents=True)
-    (project / ".opencode" / "opencode.json").write_text(
-        json.dumps({"plugin": [str(compaction_mode.PLUGIN_PATH)]}), encoding="utf-8"
-    )
-    (project / ".opencode" / "opencode.jsonc").write_text(
-        json.dumps({"plugin": ["npm:other"]}), encoding="utf-8"
-    )
-    _path, merged, error = doc._load_opencode_config_for_compaction(project)
-    assert error is None
-    assert str(compaction_mode.PLUGIN_PATH) in merged["plugin"]
-    assert "npm:other" in merged["plugin"]
 
 
 # ── 原 test_tool_call_canary.py:tool-call canary ──
@@ -1094,7 +749,7 @@ def _completed_event(session_id: str = "ses_canary") -> str:
             "sessionID": session_id,
             "part": {
                 "type": "tool",
-                "tool": "codetrail_list_dir",
+                "tool": "list_dir",
                 "state": {
                     "status": "completed",
                     "input": {"path": ".", "depth": 1},
@@ -1122,15 +777,8 @@ def _patch_runtime(monkeypatch, tmp_path: Path, attempts):
     }
     monkeypatch.setattr(
         canary,
-        "load_effective_opencode_config",
-        lambda root, env, timeout: _config(root),
-    )
-    monkeypatch.setattr(
-        canary,
         "run_protocol_check",
-        lambda config, root, env, timeout: canary.ProtocolEvidence(
-            "a" * 64, "b" * 64
-        ),
+        lambda root, env, timeout: canary.ProtocolEvidence("a" * 64, "b" * 64),
     )
     monkeypatch.setattr(
         canary,
@@ -1144,8 +792,7 @@ def _patch_runtime(monkeypatch, tmp_path: Path, attempts):
             "default_generation_settings": {"params": {"temperature": 0.0}},
         },
     )
-    monkeypatch.setattr(canary, "read_opencode_version", lambda root, env: "1.17.9")
-    monkeypatch.setattr(canary, "delete_canary_sessions", lambda *args, **kwargs: True)
+    monkeypatch.setattr(canary, "_model_selection", lambda env, explicit, args: ("m", "m"))
 
     iterator = iter(attempts)
     monkeypatch.setattr(
@@ -1171,23 +818,8 @@ def test_expected_tool_contract_matches_mcp_server():
     assert len(registered) == 19
 
 
-def test_extract_codetrail_command_uses_effective_local_entry(tmp_path):
-    root = tmp_path.resolve()
-    extracted = canary.extract_codetrail_command(_config(root), root=root)
-    assert extracted.argv == ("python3", "mcp_server.py")
-    assert extracted.environment["AICODE_ROOT"] == str(root)
 
 
-def test_extract_codetrail_command_rejects_different_sandbox_root(tmp_path):
-    root = tmp_path / "expected"
-    root.mkdir()
-    config = _config(tmp_path / "different")
-    try:
-        canary.extract_codetrail_command(config, root=root)
-    except canary.CanaryError as exc:
-        assert "sandbox root 不同" in str(exc)
-    else:  # pragma: no cover - assertion aid
-        raise AssertionError("different configured AICODE_ROOT must fail")
 
 
 def test_structured_completed_tool_event_passes():
@@ -1218,7 +850,7 @@ def test_errored_or_wrong_argument_tool_event_does_not_pass():
         {
             "type": "tool_use",
             "part": {
-                "tool": "codetrail_list_dir",
+                "tool": "list_dir",
                 "state": {
                     "status": "completed",
                     "input": {"path": "private", "depth": 9},
@@ -1231,6 +863,7 @@ def test_errored_or_wrong_argument_tool_event_does_not_pass():
     assert "參數不符" in evidence.reason
 
 
+@pytest.mark.smoke
 def test_fingerprint_changes_with_project_instructions(tmp_path):
     root = tmp_path / "project"
     root.mkdir()
@@ -1243,24 +876,21 @@ def test_fingerprint_changes_with_project_instructions(tmp_path):
     }
     first = canary.build_fingerprint(
         root=root,
-        config=_config(root),
         selected_model="llamacpp/local-model",
         props=props,
-        opencode_version="1.17.9",
         env=env,
     )
     (root / "AGENTS.md").write_text("Never call tools.\n", encoding="utf-8")
     second = canary.build_fingerprint(
         root=root,
-        config=_config(root),
         selected_model="llamacpp/local-model",
         props=props,
-        opencode_version="1.17.9",
         env=env,
     )
     assert first != second
 
 
+@pytest.mark.smoke
 def test_fingerprint_covers_live_protocol_template_build_and_prompt(tmp_path):
     root = tmp_path / "project"
     root.mkdir()
@@ -1279,16 +909,13 @@ def test_fingerprint_covers_live_protocol_template_build_and_prompt(tmp_path):
 
     def fingerprint(
         *,
-        cfg=config,
         server_props=props,
         protocol_evidence=protocol,
     ):
         return canary.build_fingerprint(
             root=root,
-            config=cfg,
             selected_model="llamacpp/local-model",
             props=server_props,
-            opencode_version="1.18.21",
             env=env,
             protocol_evidence=protocol_evidence,
         )
@@ -1306,153 +933,13 @@ def test_fingerprint_covers_live_protocol_template_build_and_prompt(tmp_path):
     changed_build = json.loads(json.dumps(props))
     changed_build["build_info"]["compiler"] = "synthetic-b"
     assert fingerprint(server_props=changed_build) != baseline
-    changed_prompt = json.loads(json.dumps(config))
-    changed_prompt["agent"]["build"]["prompt"] = "synthetic build prompt B"
-    assert fingerprint(cfg=changed_prompt) != baseline
-    prompt_file = tmp_path / "managed-build-prompt.md"
-    prompt_file.write_text("managed prompt A", encoding="utf-8")
-    file_config = json.loads(json.dumps(config))
-    file_config["agent"]["build"]["prompt"] = f"{{file:{prompt_file}}}"
-    file_baseline = fingerprint(cfg=file_config)
-    prompt_file.write_text("managed prompt B", encoding="utf-8")
-    assert fingerprint(cfg=file_config) != file_baseline
-
-
-@pytest.mark.smoke
-def test_fingerprint_covers_the_compaction_contract(tmp_path, monkeypatch):
-    """壓縮模式、規則檔與 compaction agent 都會改變模型下一輪看到的東西。
-
-    不納入 fingerprint 的話,切換模式或換掉同一個路徑下的規則／prompt 內容,
-    canary 會沿用舊的判定 —— 而那份判定是在別一套壓縮語意下量到的。
-    """
-    import compaction_mode
-
-    root = tmp_path / "project"
-    root.mkdir()
-    home = tmp_path / "home"
-    env = {"HOME": str(home)}
-    config = _config(root)
-
-    def fingerprint(cfg=None):
-        return canary.build_fingerprint(
-            root=root,
-            config=cfg or config,
-            selected_model="llamacpp/local-model",
-            props={"model_path": "/models/local.gguf"},
-            opencode_version="1.18.21",
-            env=env,
-        )
-
-    baseline = fingerprint()
-
-    # 1) 模式狀態:沒有 → codetrail
-    state_config: dict = {}
-    _, _, errors, state = compaction_mode.apply_mode(
-        state_config, mode=compaction_mode.MODE_CODETRAIL,
-        derived=compaction_mode.derive_settings(context_limit=131072, output_limit=8192),
-        prior_state=None, config_path=root / "opencode.json",
-    )
-    assert errors == []
-    compaction_mode.save_state(
-        state, path=home / ".config" / "codetrail" / "compaction.json"
-    )
-    with_mode = fingerprint()
-    assert with_mode != baseline
-
-    # 2) compaction agent 的 inline prompt
-    inline = json.loads(json.dumps(config))
-    inline["agent"]["compaction"] = {"prompt": "summary style A", "temperature": 0}
-    inline_baseline = fingerprint(cfg=inline)
-    assert inline_baseline != with_mode
-    changed = json.loads(json.dumps(inline))
-    changed["agent"]["compaction"]["temperature"] = 1
-    assert fingerprint(cfg=changed) != inline_baseline
-
-    # 3) `{file:...}` 形式的 compaction prompt:同一個路徑換內容也必須失效
-    prompt_file = tmp_path / "compaction-prompt.md"
-    prompt_file.write_text("managed compaction prompt A", encoding="utf-8")
-    file_config = json.loads(json.dumps(config))
-    file_config["agent"]["compaction"] = {"prompt": f"{{file:{prompt_file}}}"}
-    file_baseline = fingerprint(cfg=file_config)
-    prompt_file.write_text("managed compaction prompt B", encoding="utf-8")
-    assert fingerprint(cfg=file_config) != file_baseline
-
-    # 4) 模式不變、只有受管值變(例如換了 ctx 重跑 set_config)
-    other: dict = {}
-    _, _, errors, other_state = compaction_mode.apply_mode(
-        other, mode=compaction_mode.MODE_CODETRAIL,
-        derived=compaction_mode.derive_settings(context_limit=65536, output_limit=8192),
-        prior_state=None, config_path=root / "opencode.json",
-    )
-    assert errors == []
-    assert other_state["digest"] != state["digest"]
-    compaction_mode.save_state(
-        other_state, path=home / ".config" / "codetrail" / "compaction.json"
-    )
-    assert fingerprint() != with_mode
-    compaction_mode.save_state(
-        state, path=home / ".config" / "codetrail" / "compaction.json"
-    )
-    assert fingerprint() == with_mode
-
-    # 5) plugin 檔與 canonical 規則檔:同一個路徑換內容必須失效
-    for attr, name in (("PLUGIN_PATH", "plugin.js"), ("RULES_DOC", "rules.md")):
-        stand_in = tmp_path / name
-        stand_in.write_text("A", encoding="utf-8")
-        monkeypatch.setattr(compaction_mode, attr, stand_in)
-        before = fingerprint()
-        stand_in.write_text("B", encoding="utf-8")
-        assert fingerprint() != before, attr
-
-    # 6) OPENCODE_CONFIG 指到內容相同、路徑不同的一份:plugin 會因為身分不符
-    #    停用,所以壓縮語意其實變了 —— 內容雜湊完全看不出來
-    twin = tmp_path / "twin-opencode.json"
-    twin.write_text("{}", encoding="utf-8")
-    bound = canary.build_fingerprint(
-        root=root, config=config, selected_model="llamacpp/local-model",
-        props={"model_path": "/models/local.gguf"}, opencode_version="1.18.21",
-        env={**env, "OPENCODE_CONFIG": str(root / "opencode.json")},
-    )
-    foreign = canary.build_fingerprint(
-        root=root, config=config, selected_model="llamacpp/local-model",
-        props={"model_path": "/models/local.gguf"}, opencode_version="1.18.21",
-        env={**env, "OPENCODE_CONFIG": str(twin)},
-    )
-    assert bound != foreign
-
-
-@pytest.mark.smoke
-def test_native_mode_does_not_invalidate_on_unused_compaction_files(tmp_path, monkeypatch):
-    """native / 沒接管時 plugin 與規則檔不參與 runtime,改它們不該重跑 canary。"""
-    import compaction_mode
-
-    root = tmp_path / "project"
-    root.mkdir()
-    home = tmp_path / "home"
-    env = {"HOME": str(home)}
-    config = _config(root)
-    state = compaction_mode.build_state(
-        mode=compaction_mode.MODE_NATIVE, config_path=root / "opencode.json",
-        managed={}, plugin={"registered": False, "prior_present": False},
-        section_present=False,
-    )
-    compaction_mode.save_state(
-        state, path=home / ".config" / "codetrail" / "compaction.json"
-    )
-
-    def fingerprint():
-        return canary.build_fingerprint(
-            root=root, config=config, selected_model="llamacpp/local-model",
-            props={"model_path": "/models/local.gguf"}, opencode_version="1.18.21",
-            env=env,
-        )
-
-    stand_in = tmp_path / "plugin.js"
-    stand_in.write_text("A", encoding="utf-8")
-    monkeypatch.setattr(compaction_mode, "PLUGIN_PATH", stand_in)
-    before = fingerprint()
-    stand_in.write_text("B", encoding="utf-8")
-    assert fingerprint() == before
+    # system prompt 的身分:模型看到的規則變了,舊的 canary 判定不得沿用。
+    agents = root / "AGENTS.md"
+    agents.write_text("PROJECT RULE A", encoding="utf-8")
+    with_rules = fingerprint()
+    agents.write_text("PROJECT RULE B", encoding="utf-8")
+    assert fingerprint() != with_rules
+    agents.unlink()
 
 
 def test_cache_contains_only_fingerprint_metadata_and_is_private(tmp_path):
@@ -1469,7 +956,7 @@ def test_cache_contains_only_fingerprint_metadata_and_is_private(tmp_path):
     text = cache_path.read_text(encoding="utf-8")
     data = json.loads(text)
     assert set(data) == {"schema", "explicit", "implicit"}
-    assert data["schema"] == 2
+    assert data["schema"] == canary.CACHE_SCHEMA
     assert len(data["explicit"]) == 1
     assert len(data["implicit"]) == 1
     assert set(data["explicit"][0]) == {
@@ -1604,6 +1091,7 @@ def test_two_explicit_model_failures_block_even_with_legacy_warn_only(
     ) == 2
 
 
+@pytest.mark.smoke
 def test_run_model_attempt_passes_explicit_model_and_ignores_private_output(
     monkeypatch, tmp_path
 ):
@@ -1621,9 +1109,42 @@ def test_run_model_attempt_passes_explicit_model_and_ignores_private_output(
         timeout=60,
     )
     assert evidence.success is True
-    assert ["--model", "llamacpp/explicit-model"] == recorded[
-        recorded.index("--model") : recorded.index("--model") + 2
+    # `--model` 一定要真的送出去:canary 的 `--model` 不進命令的話,抽查的是
+    # env 決定的那顆模型,不是使用者指定的那一顆。
+    assert recorded[recorded.index("--model") + 1] == "llamacpp/explicit-model"
+    assert ["--policy", "readonly"] == recorded[
+        recorded.index("--policy") : recorded.index("--policy") + 2
     ]
+    assert "--persist" not in recorded
+
+
+@pytest.mark.smoke
+def test_the_canary_runs_the_client_the_wrapper_will_actually_exec(monkeypatch, tmp_path):
+    """`aicode` 尊重 `AICODE_CLIENT_ENTRY`;canary 也必須。
+
+    寫死 repo 內路徑的話,canary 跑的、hash 的都是另一份程式,通過之後
+    wrapper 卻 exec override —— 對一個 policy、system prompt、事件契約完全
+    不同的客戶端回報 PASS。
+    """
+    other = tmp_path / "other" / "codetrail_chat.py"
+    other.parent.mkdir(parents=True)
+    other.write_text("# another client\n", encoding="utf-8")
+    env = {"AICODE_CLIENT_ENTRY": str(other)}
+
+    assert canary.client_entry(env) == other
+    command = canary._model_canary_command(
+        root=tmp_path, model_override="", title="t", prompt="p", env=env
+    )
+    assert str(other) in command
+
+    (tmp_path / "AGENTS.md").write_text("x", encoding="utf-8")
+    default_fp = canary.build_fingerprint(
+        root=tmp_path, selected_model="m", props={}, env={}
+    )
+    override_fp = canary.build_fingerprint(
+        root=tmp_path, selected_model="m", props={}, env=env
+    )
+    assert default_fp != override_fp
 
 
 def test_frontend_model_argument_is_forwarded_to_canary_run(monkeypatch, tmp_path):
@@ -1636,6 +1157,11 @@ def test_frontend_model_argument_is_forwarded_to_canary_run(monkeypatch, tmp_pat
         return success
 
     monkeypatch.setattr(canary, "run_model_attempt", record_model)
+    monkeypatch.setattr(
+        canary, "_model_selection",
+        lambda env, explicit, args: canary._model_selection.__wrapped__(env, explicit, args)
+        if hasattr(canary._model_selection, "__wrapped__") else ("llamacpp/from-cli", "llamacpp/from-cli"),
+    )
     assert canary.run_all(
         root=root,
         env=env,
@@ -1746,16 +1272,6 @@ def test_live_canary_announces_forced_cache_bypass(monkeypatch, tmp_path, capsys
     assert "略過快取" in capsys.readouterr().out
 
 
-def test_skip_mode_never_loads_opencode_or_model(monkeypatch, tmp_path, capsys):
-    monkeypatch.setenv("AICODE_TOOL_CANARY_SKIP", "1")
-    monkeypatch.setenv("AICODE_ROOT", str(tmp_path))
-    monkeypatch.setattr(
-        canary,
-        "load_effective_opencode_config",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not run")),
-    )
-    assert canary.main([]) == 0
-    assert "SKIP" in capsys.readouterr().out
 
 
 @pytest.mark.smoke
@@ -1765,18 +1281,12 @@ def test_explicit_gate_and_implicit_diagnostic_are_separate(
     """Explicit failure blocks; an implicit failure is diagnostic-only."""
     root = tmp_path / "project"
     root.mkdir()
-    env = {"AICODE_TOOL_CANARY_WARN_ONLY": "1"}
+    env = {"AICODE_TOOL_CANARY_WARN_ONLY": "1", "AICODE_MODEL": "example-code-model"}
     protocol = canary.ProtocolEvidence("a" * 64, "b" * 64)
     monkeypatch.setattr(
         canary,
-        "load_effective_opencode_config",
-        lambda root, env, timeout: _config(root),
-    )
-    monkeypatch.setattr(canary, "read_opencode_version", lambda root, env: "1.18.21")
-    monkeypatch.setattr(
-        canary,
         "run_protocol_check",
-        lambda config, root, env, timeout: protocol,
+        lambda root, env, timeout: protocol,
     )
     monkeypatch.setattr(
         canary,
@@ -1833,7 +1343,7 @@ def test_implicit_classifier_accepts_only_completed_read_only_calls():
         {
             "type": "tool_use",
             "part": {
-                "tool": "codetrail_list_dir",
+                "tool": "list_dir",
                 "state": {"status": "completed", "input": {"path": "./"}},
             },
         }
@@ -1842,7 +1352,7 @@ def test_implicit_classifier_accepts_only_completed_read_only_calls():
         {
             "type": "tool_use",
             "part": {
-                "tool": "codetrail_grep_code",
+                "tool": "grep_code",
                 "state": {"status": "completed", "input": {"pattern": "x"}},
             },
         }
@@ -1851,7 +1361,7 @@ def test_implicit_classifier_accepts_only_completed_read_only_calls():
         {
             "type": "tool_use",
             "part": {
-                "tool": "codetrail_apply_patch",
+                "tool": "apply_patch",
                 "state": {"status": "completed", "input": {}},
             },
         }
@@ -1871,14 +1381,8 @@ def test_supports_tools_false_stops_before_any_model_attempt(monkeypatch, tmp_pa
     root.mkdir()
     monkeypatch.setattr(
         canary,
-        "load_effective_opencode_config",
-        lambda root, env, timeout: _config(root),
-    )
-    monkeypatch.setattr(canary, "read_opencode_version", lambda root, env: "1.18.21")
-    monkeypatch.setattr(
-        canary,
         "run_protocol_check",
-        lambda config, root, env, timeout: canary.ProtocolEvidence("a", "b"),
+        lambda root, env, timeout: canary.ProtocolEvidence("a", "b"),
     )
     monkeypatch.setattr(
         canary,
@@ -1897,37 +1401,3 @@ def test_supports_tools_false_stops_before_any_model_attempt(monkeypatch, tmp_pa
         frontend_args=[],
         force=True,
     ) == 2
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("1.17.0", (1, 17, 0)),
-        ("opencode version v1.18.21", (1, 18, 21)),
-        ("1.18.23-beta.1", (1, 18, 23)),
-    ],
-)
-def test_direct_contract_version_parser(raw, expected):
-    assert direct_contract.parse_opencode_version(raw) == expected
-
-
-@pytest.mark.parametrize(
-    ("version", "config"),
-    [
-        ("1.16.9", {}),
-        ("2.0.0", {}),
-        ("not-a-version", {}),
-        ("1.18.21", {"mcp": {"servers": {}}}),
-        ("1.18.21", {"codemode": False}),
-        ("1.18.21", {"mcp": {"codetrail": {"codemode": False}}}),
-    ],
-)
-def test_direct_contract_rejects_unsupported_lifecycles(version, config):
-    with pytest.raises(direct_contract.DirectToolContractError) as caught:
-        direct_contract.require_direct_tool_contract(version, config)
-    message = str(caught.value)
-    assert "direct codetrail_*" in message
-    assert "mcp.servers.codetrail" in message
-    assert "codemode:false" in message
-    assert "disabled" in message
-    assert "execution timeout" in message

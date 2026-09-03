@@ -30,7 +30,7 @@ safety-critical, security-sensitive, regulated, or high-impact systems.
 ## Confidentiality and network behavior
 
 Local defaults do not by themselves guarantee that data remains on one machine.
-The effective boundary also depends on llama-server endpoints, OpenCode providers
+The effective boundary also depends on llama-server endpoints, the CodeTrail chat client
 and built-in tools, project-level configuration, plugins, proxies, imported files,
 and other software in the environment. Users are responsible for inspecting the
 effective configuration, access controls, logs, generated caches, and network

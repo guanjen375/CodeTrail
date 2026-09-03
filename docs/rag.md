@@ -19,7 +19,7 @@ CodeTrail 啟動聊天 frontend 前會硬性檢查 llama-server `:8081` (embeddi
 這兩件事分別對應下面的「在對話裡讓模型看到一個檔案」和「把附件做成知識庫讓模型隨時能查」。讀完這兩節就能開始實用。
 
 另外，模型要不要**自發**去查知識庫（不等你在對話裡點名工具），取決於 frontend 與模型的
-tool-call 能力，不是 RAG 本身。[OpenCode 全域 AGENTS.md 範本](opencode-agents-template.md)
+tool-call 能力，不是 RAG 本身。[客戶端的內建基底規則](../README.md)
 只保留「內部規格要先用唯讀工具取證」這種短約束；不要再加入整段 RAG 流程，長全域 prompt
 實際發生過反而讓模型不呼叫任何工具。重要問題請在當次 prompt 明講「先呼叫
 `query_knowledge` 查證再回答」，工具的詳細選項以本輪 schema 與本文件為準。
@@ -178,7 +178,7 @@ export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
 
 `ingest_document` 會把整份文件切成多段、算出每段的向量、存進專案根目錄的 `knowledge.json`。之後的 `query_knowledge` 會**自動偵測檔案變更並重載**，忘了 reload 也查得到；`reload_knowledge_base` 的用途是「立即」載入並回報 chunk 數（像上面範例那樣馬上確認匯入結果），或在自動偵測疑似失效時強制重載。
 
-這裡的「吃進記憶體」是 **MCP server 的 KB singleton / 向量索引**,不是把整份文件塞進 OpenCode 聊天 context。`ingest_document` 回到當前對話的只有執行摘要,`reload_knowledge_base` 只有狀態;等你呼叫 `query_knowledge` 時,才會把命中的少量 chunks 當 tool result 帶進那個 session。因此 KB 文件數變多會增加索引與 retrieval 工作,但不會讓每個新 session 自動帶著全文。若模型在 ingest 後看似「失憶」,先依 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)檢查實際 token、compaction 與真 / 假 tool call,不要直接歸因於 RAG context overflow。
+這裡的「吃進記憶體」是 **MCP server 的 KB singleton / 向量索引**,不是把整份文件塞進聊天 context。`ingest_document` 回到當前對話的只有執行摘要,`reload_knowledge_base` 只有狀態;等你呼叫 `query_knowledge` 時,才會把命中的少量 chunks 當 tool result 帶進那個 session。因此 KB 文件數變多會增加索引與 retrieval 工作,但不會讓每個新 session 自動帶著全文。若模型在 ingest 後看似「失憶」,先依 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)檢查實際 token、compaction 與真 / 假 tool call,不要直接歸因於 RAG context overflow。
 
 預設依副檔名自動分派到對應的處理路徑（見上方「支援格式」清單）。圖片預設走「技術圖片」路徑（架構圖／流程圖／記憶體圖），抽出的是畫面說明；若這張是聊天截圖、想抽出對話內容，要顯式傳 `mode="chat"`：`ingest_document("teams.png", mode="chat")`。
 

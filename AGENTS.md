@@ -1,6 +1,7 @@
-這個 repo 是一個 **本地 RAG / Code-RAG / MCP 工具集**。終端使用者透過 OpenCode TUI
-和 `aicode` wrapper（或薄的 `aicode_web` 背景 launcher）連到這個專案，用本地 llama.cpp `llama-server` 跑模型,
-分析 NDA / 內部 firmware repo。
+這個 repo 是一個 **本地 RAG / Code-RAG / MCP 工具集,以及它自己的聊天客戶端**。
+終端使用者透過 `aicode` wrapper(或薄的 `aicode_web` 背景 launcher)啟動
+`codetrail_chat.py`,用本地 llama.cpp `llama-server` 跑模型,分析 NDA / 內部
+firmware repo。部署**不需要 Node / npm / opencode-ai**。
 
 如果你是 AI coding agent（Codex / OpenCode 等）正在改這個 repo，請先把這份檔讀完。
 維護命令、eval 漂移檢查見 [README_DEV.md](README_DEV.md)——那份檔是**閱讀用參考**，
@@ -15,7 +16,7 @@
 - **smoke** ＝ 標 `@pytest.mark.smoke` 的測試：真實發生過的 bug 的 regression ＋ 無聲失敗風險的契約檢查。
   §2 的每個安全檢查點都必須在裡面（由 `tests/test_smoke_gate.py` 靜態守住）。整包目標 10 秒內。
 - **full** ＝ 整個 `tests/`。
-- 統一入口 `python3 scripts/run_tests.py`（無參數＝full，最多 8-shard 並行；帶任何 pytest 參數＝單行程逐字轉發）：
+- 統一入口 `python3 scripts/run_tests.py`（無參數＝full，最多 16-shard 並行；帶任何 pytest 參數＝單行程逐字轉發）：
   - smoke：`python3 scripts/run_tests.py -m smoke`
   - full：`python3 scripts/run_tests.py`
 
@@ -69,6 +70,68 @@
   BOM/CRLF 保留、symlink／dir-fd 防線、best-effort rollback）；`patch_verify` 的「驗證層不得 spawn
   subprocess、skipped 不得算 passed」；`run_command` 的 timeout 1..600 三層邊界
 - `mcp_server.py` 啟動時 `set_sandbox_root(AICODE_ROOT, allow_external=False)`
+- `client_mcp` 的取消契約——SDK 在 read timeout / task 取消時**不送**
+  `notifications/cancelled`(契約測試釘住,不是註解),所以客戶端自己配發 request id、
+  在 Ctrl-C 與 timeout 兩種情況都送取消、寬限期過就 SIGTERM 該 instance 並把**所有**
+  進行中的呼叫回成 error 再重新 spawn;每次呼叫的 read timeout 固定
+  (`config.MCP_CALL_TIMEOUT_SECONDS`,呼叫端不得放寬——能調小就等於 ingest 還在寫
+  `knowledge.json` 時 client 已經放棄);`tools/list` 的順序在 `start()` 就驗;
+  MCP stderr 預設不落檔(它含查詢原文與絕對路徑),記憶體尾端有上限
+- `client_store` 的 session 檔——對話逐字含 NDA 內容:必須落在 state 目錄而不是被分析的
+  repo(相對 `XDG_STATE_HOME` 與專案內的 state 目錄都要擋)、目錄 0700、檔 0600、
+  讀寫兩端都拒 symlink 與 hard link、append 不得建出沒有 header 的檔、header 綁這個
+  專案與這個 session
+- `client_policy` 的兩個 policy——readonly 的判準是 `tools/list` 的 `readOnlyHint`
+  (**只有 JSON true 才算唯讀**;`bool("false")` 是 True),不是寫死名單,所以漏加名單的
+  新工具一樣被 deny;互動模式的六個 ask 工具沒核准就不得執行,核准框**完整顯示參數**
+  (含整份 patch),重問有上限。readonly session 另有第二層:MCP server 收到
+  `AI_CODE_PATCH=0` / `AI_CODE_RUN_TESTS=0`,context metrics 也關掉
+- `client_engine` 的訊息轉換——reasoning 剝除只動 reasoning 欄位、只丟最新一則**真實**
+  使用者訊息之前的、認不出那則訊息就整段不動;prune 只改送模型的那一份,session 檔與
+  畫面保留原文;懸空的 tool_call 必須補在**宣告它的那則 assistant 之後**(補在尾端會排出
+  `assistant(tool_calls) → user → tool` 這種不合法的相鄰順序);只有工具結果的 text block
+  進模型(`structuredContent` 只給 UI / eval);多個 Engine 共用同一個 MCP instance 時
+  **共用同一把模型鎖**(llama-server 單 slot,各自 new 一把等於沒有鎖)
+- `client_engine.cancel()` 的協作式取消——web 的 `/api/cancel` 與 attach 的 Ctrl-C 走這條
+  (終端 REPL 是 `KeyboardInterrupt`)。串流每收一個 chunk 看一次旗標、進行中的 MCP 呼叫
+  要用 `begin_call` 登記給 `cancel()` 走完整取消契約(一步到位的 `call()` 只有
+  KeyboardInterrupt 一條路);中斷**不是答案**——歷史不得多出 assistant 訊息,懸空的
+  tool_call 由 `run_tool_loop` 的 heal 補上「已中斷」結果;web 端中斷後仍要送終結
+  `step_finish(reason=cancelled)`,否則等 terminal 的 attach 永遠停在那裡
+- `client_prompt` 的來源檔讀取——每一輪都會進 system prompt,所以父目錄被 symlink 重導
+  就要 fail-loud(只驗最終檔案擋不住「把 `.codetrail` 換成 symlink」),而且用
+  `O_NOFOLLOW` + `fstat` 讀,不是 path-based 檢查再 `read_text`
+- `client_compaction` 的核對與節錄——空 / 只有 reasoning / 七欄格式漂移都必須停用該對話
+  的自動壓縮並寫 ledger(跨行程保留,只記不可信的那幾種成因);節錄不得帶工具參數或輸出、
+  不得含 pending / synthetic / 出錯回合(engine 要把不是答案的那則標成 error);同一錨點
+  不重壓(錨點用內容身分,不是位置);摘要請求送的是與一般 payload **同一份** pruned 內容;
+  壓縮**先落檔再換記憶體**(反過來就是畫面宣告成功、重開拿回原始歷史);換 session 要
+  `rebind()`(上一段的摘要與停用狀態不得跟過去)
+- `client_paths` 的 owner-only 三件套——`client.json`、session JSONL 與壓縮 ledger 共用
+  同一套防線:dir fd 錨定父目錄、`O_NOFOLLOW` 開檔、`fstat` 驗普通檔 / owner /
+  `st_nlink == 1`。path-based 的 `is_symlink()` 再 `read_text()` 是 check-then-use,
+  兩次 lookup 之間換掉那個名字就穿過去了。讀取端**不得**順手把目錄建出來
+  (「沒有設定檔 = 沒有接管」要連目錄都不留痕跡)
+- `config.CLIENT_MAX_OUTPUT_TOKENS` 是**同一個數字**:實送的 `max_tokens`、context gate 的
+  保留額、壓縮門檻推導的 `max_output`。上限綁 `compaction_mode.UPSTREAM_OUTPUT_TOKEN_MAX`
+  (公式會把它夾在那裡、把 0 翻成它),超出範圍一律 import 時 fail-loud——不然就是
+  「送 65536、門檻按 32000 算」而且完全無聲
+- `client_web` 的存取邊界——沒有 `AICODE_WEB_PASSWORD` 就不准離開 loopback,而且是
+  **server 自己**擋(只靠 wrapper 的話,直接叫 `codetrail_chat.py web --hostname 0.0.0.0`
+  就繞過去了);Tailscale 例外要三方一致(env、CIDR、`tailscale ip -4` 當下回報);
+  密碼比對先轉 bytes(`compare_digest` 對非 ASCII 的 str 會丟 `TypeError`,那等於非 ASCII
+  密碼永遠登入失敗而且回 500),而且密碼不得進 tmux 指令列 / pane scrollback / MCP 子行程
+  (核准後的 `run_command` 會繼承那份環境);跨站頁面不得驅動這個 server——比對
+  `Origin`/`Referer` 與 `Host`,API 端點只收 `application/json`(`text/plain` 的 simple POST
+  是跨站唯一免 preflight 的形狀,而無密碼模式根本不用 cookie,SameSite 擋不到它);
+  approval 必須在第一個回答就原子移除(先 deny 再 grant 不得翻成核准)且只認真的 bool
+  (`bool("false")` 是 True);同一個 session 一次只跑一輪(模型鎖只序列化 HTTP 呼叫,
+  保護不到 session 狀態);事件要有 backlog(新 session 一定是先 POST 才訂閱得到);
+  失敗也要送 terminal `step_finish`(只送 error 的話 attach 會永遠等下去);resume 不得
+  先建一個新的持久 session 再換過去(那會留下空白孤兒檔)
+- `opencode_migrate` ——唯一會寫使用者 OpenCode 設定的路徑。只還原**現值仍等於 CodeTrail
+  寫入值**的鍵(既有 ownership 語意)、只移除 path 對得上的 plugin 項、`mcp.codetrail` 與
+  `permission` 不動、沒有狀態檔也沒有我們的 plugin 項的機器零寫入
 - `kb_cache` 的 embeddings 身分驗證（逐列 chunk id / generation / 內容雜湊 / model）
   與「重建不了就 fail-loud、絕不沿用舊向量」——放寬它就是靜默錯答
 - `knowledge_store` 的文件身分驗證（`metadata["document_sources"]`）與
@@ -98,23 +161,14 @@
   升級當天全部跳 config_drift;新增受管鍵時 **不得**由 runtime 或 contract check
   自己補寫(沒有 ownership 紀錄就還原不回去),只能由 `unmanaged_keys` 報出來、
   使用者重跑 set_config
-- `opencode_plugins/codetrail-compaction.js` 的壓縮契約——七條規則只能經
-  `experimental.session.compacting` 的 `context` **附加**(改用 `prompt` 取代會讓
-  `previousSummary` 從此不進摘要器,而且完全無聲);`autocontinue` 一律 `false`;
-  壓縮後必須核對 summary parent 帶 compaction part、最新真實 user 已被回答、摘要非空
-  非 reasoning-only 且無 error,不符就停止並要求重送(不自動續答、不自動 revert);
-  pending / synthetic / 出錯回合 / 子 session 不得進狀態校正節錄,節錄不得帶工具參數或
-  輸出;incident 與 application log 只放固定 slug 與 session 雜湊;停用必須寫進
-  `compaction-stopped.jsonl` 才能跨行程(只記摘要/競態那幾種成因,`config_drift` 與
-  `version_unsupported` 每個 idle 重算所以不得記),`chat.message` 只讀不改且整段包
-  try/catch(上游是 `yield* trigger(...)`,reject 會讓使用者的訊息送不出去);整個 hook
-  必須 fail-open(事件用 `void hook.event(...)` 派送,reject 出去就是 unhandled rejection);
-  `experimental.chat.messages.transform` 只准拿掉「最新一則真實使用者訊息之前」的
-  assistant `reasoning` part(`stripHistoricalReasoning`)——不新增、不重排、不動其他
-  part、認不出那則使用者訊息就整段不動,而且必須就地換陣列元素(上游 trigger 之後
-  用的是原本那個陣列參考,換掉 `output.messages` 完全無效);它同樣包 try/catch,
-  上游是 `yield* trigger(...)` 且以 `Effect.promise` 呼叫,reject 是 defect,會讓
-  整個請求掛掉
+- `opencode_plugins/*.js` 現在是**inert stub**(單一 export、零副作用、只 toast 一次
+  「請執行遷移」)。上面那些壓縮 hook 契約(規則以 context 附加、`autocontinue=false`、
+  壓縮後核對、`messages.transform` 只動歷史 reasoning、fail-open)已經整組搬進
+  `client_compaction` / `client_engine`,由 `tests/test_client_compaction.py` 與
+  `tests/test_client_engine.py` 守。stub 的契約(`tests/test_repo_consistency.py` 靜態
+  釘住):每個檔恰好一個 export、只回傳 `event` 這一個 hook、只在 `session.created`
+  toast 一次、不得有 `tool.execute*` / `chat.*` / `experimental.*` 之類的 hook、不得
+  import / require 任何模組、不得讀檔或發網路請求;不要把邏輯加回 JS 那邊。
 
 任何重構碰到上面這些東西，**新加測試**（開發者寫測試檔，執行依 §1.2 權責），
 不要直接刪 / weaken / 移除檢查點。
@@ -132,8 +186,8 @@ module 層 `pytestmark` 換成單條 decorator，gate 都還是綠的。
 - 不要把 `from config import X`（snapshot）混 `import config; config.X = ...`（mutation）— 動態值只用 `import config`。
 - 不要為了讓 lint 漂亮，刪未檢查影響的 unused import — 有些是 side-effect import。
 - 不要把 ALLOWED_COMMANDS 加 `rm` / `sudo` / `curl` / `bash`。
-- 不要把 `RUN_COMMAND_ENABLED` / `PATCH_ENABLED` 在 `config.py` 的預設改成 `True`。OpenCode runtime 若要開，必須維持在 `mcp_server.py` 這類明確啟動點。
-- 不要在 `mcp_server.py` 加新 tool 卻沒同步更新 `README.md` 工具清單 — 模型會誤用，使用者也會困惑（`aicode` 健檢會要求工具集合與文件精確一致）。使用者機器上依 README 建議建立的 `~/.config/opencode/AGENTS.md` 若列了工具清單，也要提醒一併更新。
+- 不要把 `RUN_COMMAND_ENABLED` / `PATCH_ENABLED` 在 `config.py` 的預設改成 `True`。runtime 若要開，必須維持在 `mcp_server.py` 這類明確啟動點。
+- 不要在 `mcp_server.py` 加新 tool 卻沒同步更新 `README.md` / `docs/mcp-tools.md` 工具清單 — 模型會誤用，使用者也會困惑（`aicode` 健檢會要求工具集合與文件精確一致）。新的**寫入**工具要不要人工核准是另一件事:互動 policy 的預設是 allow,要核准就得加進 `client_policy.ASK_TOOLS`。
 - 不要 `git commit` 沒被使用者確認過的修改。
 
 ---

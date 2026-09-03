@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 
-# --- 凍結的字面字串（OpenCode plugin 以「精確比對」認這幾個字串）-------------
+# --- 凍結的字面字串（客戶端以「精確比對」認這幾個字串）-------------
 SUMMARY_PREFIX = "[CODETRAIL_INGEST_SUMMARY]"
 ACTION_REQUIRED_MARKER = "[CODETRAIL_ACTION_REQUIRED]"
 FAILED_MARKER = "[CODETRAIL_INGEST_FAILED]"

@@ -1,6 +1,6 @@
 """MCP server 的 per-instance lease 與 incident 記錄(plan.txt §D / SEAMS §6)。
 
-**為什麼不是一個心跳檔**:canary、TUI、web、`opencode run` 各自起一個 MCP
+**為什麼不是一個心跳檔**:canary、終端客戶端、web、headless run 各自起一個 MCP
 子行程。四個行程寫同一個檔會互相覆寫,於是「server 還活著嗎」永遠只看得到
 最後一個寫入者,而那正是最沒有診斷價值的一份。改成一行程一份 lease
 (檔名 = 本行程一次性的 `boot_id`,不是 pid),plugin 用 `ppid == 自己的 pid`
@@ -591,7 +591,7 @@ def classify_lease(lease: dict, now: float) -> str:
 # ============================================================
 # incident
 # ============================================================
-def _record_incident(
+def record_incident(
     kind: str,
     *,
     session: str | None = None,
@@ -601,11 +601,13 @@ def _record_incident(
 ) -> None:
     """寫一筆 incident(JSONL,0600,零內容零路徑)。失敗靜默。
 
-    **私有,而且刻意不是 production 寫入端**:正式寫入端是 T3 的 OpenCode
-    plugin(JS)。這個函式的角色是把「一行 incident 長什麼樣」用可執行的形式
-    定死——欄位、slug 正規化、rotation 門檻、0600——好讓 §7 的跨語言一致性
-    測試有東西可以對。取名底線開頭是為了不讓它看起來像一條公開 API:
-    誰在 Python 這邊呼叫它,誰就是在寫一條 plugin 不會產生的紀錄。
+    **這是正式寫入端。** 以前不是:那時候唯一會寫 incident 的是 OpenCode 的
+    JS plugin,Python 這邊只保留一份「一行 incident 長什麼樣」的可執行定義,
+    所以刻意取名底線開頭。CodeTrail 自己的聊天客戶端接手之後,假工具呼叫
+    (`promise_without_call`)與壓縮停用(`compaction_stopped`)都由 Python
+    偵測與記錄,再叫它 `_record_incident` 只會讓呼叫端以為自己在碰私有 API。
+
+    欄位、slug 正規化、rotation 門檻與 0600 仍然是跨語言契約的定義處。
     """
     try:
         record = {
@@ -723,3 +725,7 @@ def recent_incident_count(within_seconds: float, now: float | None = None) -> in
         return count
     except Exception:
         return 0
+
+
+#: 舊名的相容別名。新程式碼一律用 `record_incident`。
+_record_incident = record_incident

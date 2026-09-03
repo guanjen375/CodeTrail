@@ -133,7 +133,7 @@ def _render_query_knowledge_strict(payload: dict[str, Any]) -> str:
 def _render_code_rag(payload: object) -> str:
     """Render line-atomic evidence with routing metadata first.
 
-    The untouched core remains in structuredContent.  OpenCode reads only this
+    The untouched core remains in structuredContent.  The client reads only this
     text lane, so it must keep graph/truncation/uncertainty facts even when the
     lower-priority source windows do not fit.
     """

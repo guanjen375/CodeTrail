@@ -841,7 +841,7 @@ def run_evaluation(
     # CodeTrail 不內建主模型, 沒設好直接 fail-loud (require_main_model raise)。
     import config as _eval_config
     _resolved = _eval_config.require_main_model()
-    _source = "AICODE_MODEL env" if os.environ.get("AICODE_MODEL", "").strip() else "opencode.json"
+    _source = "AICODE_MODEL env" if os.environ.get("AICODE_MODEL", "").strip() else "deployment profile"
     print(f"Using model: {_resolved} (from {_source})")
     print(f"N_CTX: {_eval_config.N_CTX}")
 

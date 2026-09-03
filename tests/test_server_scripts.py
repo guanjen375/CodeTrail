@@ -1339,3 +1339,25 @@ def test_rejects_unknown_cli_input(args, needle):
 
 def test_web_entry_is_executable():
     assert os.access(WEB_ENTRY, os.X_OK)
+
+
+@pytest.mark.smoke
+def test_aicode_web_never_exports_legacy_opencode_secrets_into_the_launch_line(tmp_path):
+    """升級機器上殘留的 `OPENCODE_SERVER_PASSWORD` 之類變數不得被展開進 tmux 指令列
+    (dry-run stdout、pane scrollback、capture-pane 都看得到);`OPENCODE_CONFIG`
+    是路徑、遷移偵測要看,照常透傳。"""
+    proc = _run_aicode_web(
+        WEB_ENTRY,
+        ["--dry-run", "--local"],
+        cwd=tmp_path,
+        env_extra={
+            "OPENCODE_SERVER_PASSWORD": "legacy-secret-sentinel",
+            "OPENCODE_CONFIG_CONTENT": "content-secret-sentinel",
+            "OPENCODE_CONFIG": "/x/opencode.json",
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "legacy-secret-sentinel" not in proc.stdout
+    assert "content-secret-sentinel" not in proc.stdout
+    launch = next(line for line in proc.stdout.splitlines() if line.startswith("launch="))
+    assert "export OPENCODE_CONFIG=/x/opencode.json" in launch

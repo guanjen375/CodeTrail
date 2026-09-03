@@ -63,6 +63,9 @@ class ContextUsage:
     actual_eval_count: int | None = None
     prompt_tokens_per_second: float | None = None
     output_tokens_per_second: float | None = None
+    #: 保留額是呼叫端明講的(客戶端 request),還是退回內部預設。
+    #: 只影響 overflow 訊息要指哪一個 env,不進 JSONL 之外的任何判斷。
+    reserve_is_explicit: bool = False
     # When the gate refuses, we still want to log the attempt for visibility.
     error_type: str | None = None
     timestamp: float = field(default_factory=time.time)
@@ -135,12 +138,36 @@ def _count_message_content_chars(content: Any) -> int:
         return 0
 
 
+#: 助理訊息上可能攜帶 thinking 內容的欄位。llama-server 對 DeepSeek 系模板會
+#: 把它原樣送回模型,所以它**是**送出去的 payload 的一部分。漏算它的話,一段
+#: 帶長 reasoning 的歷史會被閘判成安全,再由 llama-server 從前面靜默截掉——
+#: 那正是這個安全層要擋的東西。
+REASONING_FIELDS: tuple[str, ...] = ("reasoning_content", "reasoning")
+
+
+def _count_reasoning_chars(message: dict) -> int:
+    total = 0
+    for key in REASONING_FIELDS:
+        value = message.get(key)
+        if isinstance(value, str):
+            total += len(value)
+        elif value is not None:
+            total += _count_message_content_chars(value)
+    return total
+
+
 def estimate_message_chars(messages: list[dict]) -> tuple[int, int, int]:
-    """Return (total_chars, message_count, tool_message_count)."""
+    """Return (total_chars, message_count, tool_message_count).
+
+    計的是「轉換後實際會送出去的那一份」:呼叫端必須先做完 prune 與 reasoning
+    剝除,再把結果交給這裡。這一層只負責把 payload 裡真的存在的欄位全部算進
+    去,包含 assistant 的 reasoning_content。
+    """
     total = 0
     tool_count = 0
     for m in messages or []:
         total += _count_message_content_chars(m.get("content"))
+        total += _count_reasoning_chars(m)
         # Tool calls / tool name / arguments JSON also occupy context.
         tool_calls = m.get("tool_calls")
         if isinstance(tool_calls, list):
@@ -210,6 +237,7 @@ def build_usage(
     model: str | None = None,
     did_trim: bool = False,
     trim_summary: dict[str, Any] | None = None,
+    reserved_output_tokens: int | None = None,
 ) -> ContextUsage:
     """Compute a ContextUsage snapshot for a pending request.
 
@@ -230,7 +258,15 @@ def build_usage(
 
     cpt = _chars_per_token()
     est_in = int(total_chars / max(cpt, 0.1))
-    reserved = int(getattr(config, "RESERVED_OUTPUT_TOKENS", 4096) or 0)
+    # 保留額 = **這一次 request 實送的 max_tokens**。呼叫端沒有帶(knowledge.py
+    # 那類內部呼叫)才退回 config.RESERVED_OUTPUT_TOKENS。兩個常數不得混用:
+    # 客戶端送 8192 卻只保留 4096 的話,閘會放行一個生成到一半就撐爆的 prompt。
+    if reserved_output_tokens is None:
+        reserved = int(getattr(config, "RESERVED_OUTPUT_TOKENS", 4096) or 0)
+        reserve_is_explicit = False
+    else:
+        reserved = max(0, int(reserved_output_tokens))
+        reserve_is_explicit = True
     est_total = est_in + reserved
 
     effective_ctx = max(int(requested_num_ctx or 0), 1)
@@ -251,6 +287,7 @@ def build_usage(
         dynamic_ctx_max=int(getattr(config, "N_CTX", 0) or 0),
         estimated_input_tokens=est_in,
         reserved_output_tokens=reserved,
+        reserve_is_explicit=reserve_is_explicit,
         estimated_total_tokens=est_total,
         utilization_pct=round(util * 100.0, 2),
         soft_warning=util >= soft and util < hard,
@@ -280,6 +317,21 @@ class ContextOverflowError(RuntimeError):
         super().__init__(overflow_message(usage))
 
 
+#: 呼叫端帶了自己的保留額(客戶端 request)時,該調的是這一個 env。
+CLIENT_RESERVE_ENV = "AICODE_CLIENT_MAX_OUTPUT_TOKENS"
+#: 沒帶保留額(knowledge.py 的內部呼叫)時,該調的是這一個。
+INTERNAL_RESERVE_ENV = "AICODE_RESERVED_OUTPUT_TOKENS"
+
+
+def _reserve_env_name(usage: ContextUsage) -> str:
+    """指出**這一次**的保留額該調哪一個 env。
+
+    依「呼叫端有沒有自己帶保留額」判斷,不是比對數值:兩個常數剛好被設成同一
+    個數字時,knowledge 路徑會被指去改客戶端的 env,照做也不會有任何改變。
+    """
+    return CLIENT_RESERVE_ENV if usage.reserve_is_explicit else INTERNAL_RESERVE_ENV
+
+
 def overflow_message(usage: ContextUsage) -> str:
     hard_pct = int(round(float(getattr(config, "CTX_HARD_THRESHOLD", 0.90)) * 100))
     soft_pct = int(round(float(getattr(config, "CTX_SOFT_THRESHOLD", 0.80)) * 100))
@@ -294,9 +346,10 @@ def overflow_message(usage: ContextUsage) -> str:
         "  - 縮小問題範圍 / 拆成多步\n"
         "  - 減少 tool output（read_file 指定行範圍、grep 縮小 pattern）\n"
         "  - 若確實需要更大 context，請重跑 ./set_config.sh 設定主模型 n_ctx，\n"
-        "    再重啟 llama-server；CodeTrail 與 OpenCode 會跟著同一個值。\n"
+        "    再重啟 llama-server；CodeTrail 的預算會跟著同一個值。\n"
         "  - RAG 太多 REF：縮小 KNOWLEDGE_TOP_K 或讓 query 更具體\n"
-        "  - 設定 AICODE_RESERVED_OUTPUT_TOKENS 較小（預設 4096）若你只需要短回答"
+        f"  - 只需要短回答時可把 {_reserve_env_name(usage)} 調小"
+        f"（目前保留 {usage.reserved_output_tokens}）"
     )
 
 
@@ -348,6 +401,13 @@ def parse_usage_from_response(data: dict, usage: ContextUsage) -> None:
 
     timings = data.get("timings")
     if isinstance(timings, dict):
+        # llama-server 的 /v1/chat/completions 串流最後一個 chunk 只帶 `timings`,
+        # 沒有 `usage`。不把 prompt_n / predicted_n 收下來的話,事件流與 eval 的
+        # token 統計永遠是 0 —— 看起來像「這一輪沒有輸出」。
+        if pec is None and isinstance(timings.get("prompt_n"), (int, float)):
+            usage.actual_prompt_eval_count = int(timings["prompt_n"])
+        if ec is None and isinstance(timings.get("predicted_n"), (int, float)):
+            usage.actual_eval_count = int(timings["predicted_n"])
         if isinstance(timings.get("prompt_per_second"), (int, float)):
             usage.prompt_tokens_per_second = float(timings["prompt_per_second"])
         if isinstance(timings.get("predicted_per_second"), (int, float)):
@@ -508,6 +568,7 @@ def check_and_log(
     model: str | None = None,
     did_trim: bool = False,
     trim_summary: dict[str, Any] | None = None,
+    reserved_output_tokens: int | None = None,
     emit: bool = True,
 ) -> ContextUsage:
     """Compute usage, enforce the hard gate, emit CLI lines, log to JSONL.
@@ -525,6 +586,7 @@ def check_and_log(
         model=model,
         did_trim=did_trim,
         trim_summary=trim_summary,
+        reserved_output_tokens=reserved_output_tokens,
     )
     if emit:
         emit_pre_call_lines(usage)

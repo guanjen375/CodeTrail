@@ -47,7 +47,7 @@ class TokenMeasurementError(RuntimeError):
 
 @dataclass(frozen=True)
 class StdioMcpCommand:
-    """Effective local MCP command extracted from OpenCode configuration."""
+    """The stdio command that starts one MCP server, plus its extra environment."""
 
     argv: tuple[str, ...]
     environment: dict[str, str]
@@ -64,7 +64,7 @@ class CatalogTool:
     raw: dict[str, Any]
 
     def openai_tool(self, *, name_prefix: str = "codetrail_") -> dict[str, Any]:
-        """Return the function-tool shape OpenCode sends to its model provider."""
+        """Return the function-tool shape the client sends to llama-server."""
 
         return {
             "type": "function",
@@ -104,6 +104,8 @@ class CatalogSnapshot:
     input_schema_chars: int
     output_schema_chars: int
     catalog_chars: int
+    #: 這一格是 OpenCode 時代量的「送進 provider 的有效字元數」。名字保留原樣
+    #: 是刻意的:frozen baseline 的 digest 涵蓋它,改名等於讓歷史那一列永遠對不上。
     opencode_effective_chars: int
     tools_digest: str
     instructions_digest: str
@@ -371,70 +373,6 @@ async def catalog_from_stdio(
         raise
     except Exception as exc:
         raise CatalogError(f"MCP initialize/tools/list failed ({type(exc).__name__})") from exc
-
-
-def load_effective_opencode_config(
-    root: Path,
-    *,
-    environment: Mapping[str, str] | None = None,
-    timeout_seconds: int = 30,
-) -> dict[str, Any]:
-    """Read OpenCode's merged config without starting a model session."""
-
-    env = os.environ.copy()
-    if environment:
-        env.update(environment)
-    try:
-        completed = subprocess.run(
-            ["opencode", "debug", "config"],
-            cwd=str(root),
-            env=env,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise CatalogError("opencode is not installed") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise CatalogError("opencode debug config timed out") from exc
-    if completed.returncode != 0:
-        raise CatalogError(f"opencode debug config exited {completed.returncode}")
-    try:
-        value = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise CatalogError("opencode debug config did not return JSON") from exc
-    if not isinstance(value, dict):
-        raise CatalogError("effective OpenCode config is not a JSON object")
-    return value
-
-
-def extract_stdio_command(config: Mapping[str, Any]) -> StdioMcpCommand:
-    """Extract the current OpenCode V1 direct local ``mcp.codetrail`` entry."""
-
-    mcp = config.get("mcp")
-    entry = mcp.get("codetrail") if isinstance(mcp, Mapping) else None
-    if not isinstance(entry, Mapping):
-        raise CatalogError("effective config has no mcp.codetrail entry")
-    if entry.get("enabled") is False:
-        raise CatalogError("effective config disables mcp.codetrail")
-    if entry.get("type") not in (None, "local"):
-        raise CatalogError("mcp.codetrail is not a local stdio server")
-    command = entry.get("command")
-    if not (
-        isinstance(command, Sequence)
-        and not isinstance(command, (str, bytes))
-        and command
-        and all(isinstance(item, str) and item for item in command)
-    ):
-        raise CatalogError("mcp.codetrail.command must be a non-empty string array")
-    raw_environment = entry.get("environment", {})
-    if not isinstance(raw_environment, Mapping) or not all(
-        isinstance(key, str) and isinstance(value, str) for key, value in raw_environment.items()
-    ):
-        raise CatalogError("mcp.codetrail.environment must map strings to strings")
-    return StdioMcpCommand(tuple(command), dict(raw_environment))
 
 
 def build_chat_probe_payload(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mine private OpenCode sessions and run evidence-first model comparisons.
+"""Mine private CodeTrail sessions and run evidence-first model comparisons.
 
 This is a manual, explicitly authorised eval lane.  It is not part of pytest,
 CI, ``aicode`` startup, or the checked-in NDA-safe fixtures under ``eval/``.
@@ -7,7 +7,6 @@ CI, ``aicode`` startup, or the checked-in NDA-safe fixtures under ``eval/``.
 from __future__ import annotations
 
 import argparse
-import copy
 import hashlib
 import json
 import os
@@ -25,8 +24,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import client_compaction  # noqa: E402
+import client_config  # noqa: E402
 import compaction_mode  # noqa: E402
-import deployment_profile  # noqa: E402
+import deployment_profile
 import model_resolution  # noqa: E402
 import root_safety  # noqa: E402
 import session_eval  # noqa: E402
@@ -34,34 +35,28 @@ from scripts.eval_tool_routing import (  # noqa: E402
     EvalError,
     LocalJsonClient,
     parse_event_stream,
-    read_opencode_version,
 )
 
 DEFAULT_PRIVATE_DIR = REPO_ROOT / ".codetrail" / "session_eval"
-# The compaction section CodeTrail may own in the global config.  Replay drops
-# it together with the plugin so the two never disagree (see _evaluation_config).
-COMPACTION_SECTION = compaction_mode.COMPACTION_SECTION
-# Must match `STATE_PATH_ENV` in opencode_plugins/codetrail-compaction.js.
-COMPACTION_STATE_ENV = "AICODE_COMPACTION_STATE"
-# Must match `COMPACTION_VERSION_ENV` in scripts/opencode_direct_contract.py.
-COMPACTION_VERSION_ENV = "AICODE_OPENCODE_VERSION"
 MAX_SUBPROCESS_OUTPUT_BYTES = 64 * 1024 * 1024
 DEFAULT_TURN_TIMEOUT = 600
 _SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
 _SAFE_CANDIDATE_LABEL_RE = re.compile(r"^[a-z][a-z0-9_]{2,79}$")
 
-# Defense in depth for replay against a real private project.  OpenCode denies
-# these exact tools after the broad codetrail_* allow rule, while the MCP server
-# separately receives AI_CODE_PATCH=0 / AI_CODE_RUN_TESTS=0.
+# Defense in depth for replay against a real private project.  The client's
+# read-only policy denies every tool the server does not annotate readOnlyHint,
+# while the MCP server separately receives AI_CODE_PATCH=0 / AI_CODE_RUN_TESTS=0.
+# 這份名單是**測試釘住的下限**,不是判準:判準是 readOnlyHint,所以漏加名單的
+# 新工具一樣被 deny。名字改成裸名(客戶端沒有 `codetrail_` 前綴)。
 MUTATING_FRONTEND_TOOLS = (
-    "codetrail_apply_patch",
-    "codetrail_run_lint",
-    "codetrail_run_command",
-    "codetrail_ingest_document",
-    "codetrail_remove_document",
-    "codetrail_review_figures",
-    "codetrail_import_external_file",
-    "codetrail_record_lesson",
+    "apply_patch",
+    "run_lint",
+    "run_command",
+    "ingest_document",
+    "remove_document",
+    "review_figures",
+    "import_external_file",
+    "record_lesson",
 )
 
 
@@ -115,23 +110,20 @@ def _load_suite(path: Path) -> dict[str, Any]:
 
 
 def _export_one(session_id: str, output_dir: Path, *, sanitized: bool) -> Path:
-    if not _SAFE_SESSION_ID_RE.fullmatch(session_id):
-        raise session_eval.SessionEvalError("session id is invalid")
-    command = ["opencode", "export", session_id]
-    if sanitized:
-        command.append("--sanitize")
-    completed = _bounded_run(command, cwd=REPO_ROOT, env=os.environ, timeout=120)
-    if completed.returncode != 0:
-        raise session_eval.SessionEvalError("opencode export failed")
+    """從 CodeTrail 自家 session store 匯出一個對話(不再呼叫 `opencode export`)。"""
+    import client_store
+
+    root = os.environ.get("AICODE_ROOT") or os.getcwd()
+    store = client_store.SessionStore(root)
     try:
-        value = json.loads(completed.stdout.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise session_eval.SessionEvalError("opencode export returned invalid JSON") from exc
-    exported = session_eval.validate_opencode_export(value)
-    if exported["info"]["id"] != session_id:
-        raise session_eval.SessionEvalError("opencode export returned a different session id")
-    digest = session_eval.session_hash(session_id)
-    return session_eval.write_private_json(output_dir, f"export-{digest}.json", exported)
+        records = store.read(session_id)
+    except client_store.SessionStoreError as exc:
+        raise session_eval.SessionEvalError(f"session 讀取失敗: {exc}") from exc
+    exported = session_eval.validate_opencode_export(
+        session_eval.export_from_store(session_id, records, sanitized=sanitized)
+    )
+    name = f"{session_eval.session_hash(session_id)}.json"
+    return session_eval.write_private_json(output_dir, name, exported)
 
 
 def command_export(args: argparse.Namespace) -> int:
@@ -140,7 +132,7 @@ def command_export(args: argparse.Namespace) -> int:
         raise session_eval.SessionEvalError("export needs at least one --session")
     if len(sessions) > session_eval.MAX_SESSIONS:
         raise session_eval.SessionEvalError("too many sessions requested")
-    output_dir = args.output_dir.expanduser()
+    output_dir = _private_output_dir(args.output_dir)
     for session_id in sessions:
         _export_one(session_id, output_dir, sanitized=args.sanitize)
     _print(f"exported {len(sessions)} session(s) into private storage")
@@ -153,7 +145,9 @@ def command_mine(args: argparse.Namespace) -> int:
         raise session_eval.SessionEvalError("mine source directory must be a regular directory")
     paths = sorted(source_dir.glob(args.glob))
     corpus = session_eval.mine_export_files(paths)
-    output = session_eval.write_private_json(args.output_dir, args.output_name, corpus)
+    output = session_eval.write_private_json(
+        _private_output_dir(args.output_dir), args.output_name, corpus
+    )
     manual = sum(
         bool(draft["mining"]["requires_manual_curation"]) for draft in corpus["drafts"]
     )
@@ -173,6 +167,27 @@ def command_validate(args: argparse.Namespace) -> int:
         + ", ".join(f"{key}={value}" for key, value in sorted(kinds.items()))
     )
     return 0
+
+
+def _private_output_dir(raw: Path) -> Path:
+    """私人產物(prompt、candidate answer、盲測 key)只准落在兩種地方:
+
+    repo 之外,或 repo 裡 git ignore 的 ``.codetrail/``。指到 ``<repo>/eval/`` 這種
+    可追蹤的位置會把 NDA 內容送進下一次 commit。
+    """
+    target = Path(raw).expanduser()
+    if not target.is_absolute():
+        target = Path.cwd() / target
+    real = Path(os.path.realpath(target))
+    repo = Path(os.path.realpath(REPO_ROOT))
+    if real == repo or repo in real.parents:
+        private = repo / ".codetrail"
+        if real != private and private not in real.parents:
+            raise session_eval.SessionEvalError(
+                f"output directory {target} is inside the repository but not under "
+                f"{private}; private eval artifacts must not land in a tracked path"
+            )
+    return target
 
 
 def _validate_project_root(raw: str) -> Path:
@@ -231,8 +246,31 @@ def project_state_digest(root: Path, state_paths: Sequence[str]) -> str:
             continue
         except OSError as exc:
             raise session_eval.SessionEvalError("cannot inspect a suite state path") from exc
-        if target.is_symlink() or not stat.S_ISREG(st.st_mode):
-            raise session_eval.SessionEvalError("suite state paths must be regular non-symlink files")
+        if target.is_symlink():
+            raise session_eval.SessionEvalError("suite state paths must not be symlinks")
+        if stat.S_ISDIR(st.st_mode):
+            # `.codetrail` 是目錄:逐檔雜湊(排序過),名字與內容都算數。
+            # 只 hash 目錄本身的 mtime 會漏掉「改了一個檔但大小相同」。
+            digest.update(b"dir")
+            for child in sorted(target.rglob("*")):
+                try:
+                    child_st = child.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                digest.update(str(child.relative_to(target)).encode("utf-8"))
+                if not stat.S_ISREG(child_st.st_mode):
+                    digest.update(b"non-regular")
+                    continue
+                digest.update(str(child_st.st_size).encode("ascii"))
+                try:
+                    with child.open("rb") as handle:
+                        for block in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(block)
+                except OSError:
+                    digest.update(b"unreadable")
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            raise session_eval.SessionEvalError("suite state paths must be regular files")
         digest.update(str(st.st_size).encode("ascii"))
         try:
             with target.open("rb") as handle:
@@ -243,238 +281,17 @@ def project_state_digest(root: Path, state_paths: Sequence[str]) -> str:
     return digest.hexdigest()
 
 
-def _global_config() -> tuple[Path, dict[str, Any]]:
-    path, value, error = model_resolution.load_first_opencode_config(os.environ)
-    if error or path is None or not isinstance(value, dict):
-        raise session_eval.SessionEvalError("cannot load the OpenCode config for replay")
-    return path, value
 
 
-def _evaluation_config(
-    value: Mapping[str, Any], model: str, *, keep_compaction: bool = False
-) -> dict[str, Any]:
-    provider, separator, model_id = model.partition("/")
-    if not separator or not provider or not model_id:
-        raise session_eval.SessionEvalError("--model must use provider/model syntax")
-    config = copy.deepcopy(dict(value))
-    providers = config.get("provider")
-    provider_spec = providers.get(provider) if isinstance(providers, dict) else None
-    models = provider_spec.get("models") if isinstance(provider_spec, dict) else None
-    if not isinstance(models, dict) or model_id not in models:
-        raise session_eval.SessionEvalError("candidate model is absent from OpenCode config")
-    config["model"] = model
-    permission = config.get("permission")
-    if not isinstance(permission, dict):
-        permission = {}
-        config["permission"] = permission
-    for tool in MUTATING_FRONTEND_TOOLS:
-        permission[tool] = "deny"
-    for builtin in ("bash", "read", "grep", "glob", "edit", "write", "apply_patch", "task"):
-        permission[builtin] = "deny"
-    # Notifications and project-relative lesson files are not part of a frozen
-    # replay contract.  The global AGENTS instructions still apply uniformly.
-    config["plugin"] = []
-    config["instructions"] = []
-    if keep_compaction:
-        # The one suite whose subject *is* compaction keeps both halves: the
-        # managed ``compaction.*`` values and the plugin that acts on them.
-        # Anything less is the hybrid described below, so a missing plugin file
-        # is a hard error rather than a silent downgrade to one half.
-        if not compaction_mode.PLUGIN_PATH.is_file():
-            raise session_eval.SessionEvalError(
-                "--keep-compaction needs the compaction plugin, but "
-                f"{compaction_mode.PLUGIN_PATH} is missing"
-            )
-        section = config.get(COMPACTION_SECTION)
-        # Only the contract keys are required: those are the ones compaction
-        # cannot happen without.  ``prune`` is managed too, but a config written
-        # before it became managed still compacts correctly, so demanding it
-        # would refuse a configuration the user really runs.
-        missing = [
-            key for key in compaction_mode.CONTRACT_COMPACTION_KEYS
-            if not isinstance(section, dict) or key not in section
-        ]
-        if missing:
-            raise session_eval.SessionEvalError(
-                "--keep-compaction needs the managed compaction settings in the "
-                f"global config; missing: {', '.join(missing)}. "
-                "Re-run ./set_config.sh to write them."
-            )
-        config["plugin"] = [str(compaction_mode.PLUGIN_PATH)]
-        return config
-    # Dropping the plugin without dropping the settings it was written for
-    # leaves a hybrid nobody runs interactively: upstream auto-compaction
-    # disabled (``compaction.auto = false`` also disables mid-turn compaction
-    # and provider-overflow replay) with nothing left to compact at idle.  A
-    # long case would turn into a provider error that never happens in the real
-    # client, and ``compaction_events`` would silently read zero.
-    #
-    # Only CodeTrail's own keys go.  ``reserved`` is upstream schema the user may
-    # have set independently; replacing it with the upstream default would
-    # measure a configuration the user does not run.  ``prune`` *is* one of ours
-    # (see ``compaction_mode.MANAGED_COMPACTION_KEYS``), so it goes with the rest
-    # -- a replay without the plugin must also drop the tool-output pruning that
-    # only CodeTrail's takeover turns on.
-    section = config.get(COMPACTION_SECTION)
-    if isinstance(section, dict):
-        for key in compaction_mode.MANAGED_COMPACTION_KEYS:
-            section.pop(key, None)
-        if not section:
-            config.pop(COMPACTION_SECTION, None)
-    return config
 
 
-def _require_compaction_runtime(
-    config: Mapping[str, Any], model: str, opencode_version: str | None
-) -> None:
-    """`--keep-compaction` 必須真的能壓縮,否則結果是「沒有壓縮」而沒人知道。
-
-    兩件事會讓 plugin 在第一次 idle 就停用,而 eval 照常把 `compaction_events=0`
-    寫成結果:候選模型的有效限制推導不出設定裡那組受管值(global 是用另一個
-    模型的 ctx 算的),以及 OpenCode 版本低於壓縮語意的下限。
-    """
-    minimum = compaction_mode.MIN_COMPACTION_OPENCODE_VERSION
-    parsed = None
-    if isinstance(opencode_version, str):
-        parts = opencode_version.split(".")
-        if len(parts) >= 3 and all(part.isdigit() for part in parts[:3]):
-            parsed = tuple(int(part) for part in parts[:3])
-    if parsed is None or parsed < minimum:
-        raise session_eval.SessionEvalError(
-            "--keep-compaction needs OpenCode >= "
-            f"{'.'.join(map(str, minimum))}; measured {opencode_version!r}"
-        )
-    # 上游用 `agent.compaction.model` 做 tail selection 與摘要;驗候選模型
-    # 而不驗它,runtime 會照樣以另一個模型重算並停用。反過來只驗它也不行 ——
-    # 觸發之前那段對話壓的是候選模型,受管值是兩者的合併值
-    # (compaction_mode.combine_settings,writer / plugin / doctor 走同一條)。
-    def limit_of(ref: str):
-        provider_id, _, model_id = ref.partition("/")
-        providers = config.get("provider")
-        provider = providers.get(provider_id) if isinstance(providers, Mapping) else None
-        models = provider.get("models") if isinstance(provider, Mapping) else None
-        entry = models.get(model_id) if isinstance(models, Mapping) else None
-        found = entry.get("limit") if isinstance(entry, Mapping) else None
-        return found if isinstance(found, Mapping) else None
-
-    agent = config.get("agent")
-    compaction_agent = agent.get("compaction") if isinstance(agent, Mapping) else None
-    configured = (
-        compaction_agent.get("model") if isinstance(compaction_agent, Mapping) else None
-    )
-    live_model = model
-    summariser_model = (
-        configured if isinstance(configured, str) and "/" in configured else model
-    )
-    section = config.get(compaction_mode.COMPACTION_SECTION)
-    reserved = section.get("reserved") if isinstance(section, Mapping) else None
-    per_model = {}
-    for ref in dict.fromkeys((summariser_model, live_model)):
-        limit = limit_of(ref)
-        if limit is None:
-            raise session_eval.SessionEvalError(
-                f"--keep-compaction needs limit.context/limit.output for {ref}"
-            )
-        try:
-            per_model[ref] = compaction_mode.derive_settings(
-                context_limit=limit.get("context"),
-                output_limit=limit.get("output"),
-                input_limit=limit.get("input"),
-                reserved=reserved,
-            )
-        except compaction_mode.CompactionModeError as exc:
-            raise session_eval.SessionEvalError(
-                f"--keep-compaction cannot derive a compaction threshold for {ref}: {exc}"
-            ) from exc
-    derived = per_model[summariser_model]
-    label = summariser_model
-    if summariser_model != live_model:
-        label = f"{summariser_model} + {live_model}"
-        try:
-            derived = compaction_mode.combine_settings(derived, per_model[live_model])
-        except compaction_mode.CompactionModeError as exc:
-            raise session_eval.SessionEvalError(
-                f"--keep-compaction cannot derive a compaction threshold for {label}: {exc}"
-            ) from exc
-    # Only the contract keys.  This preflight exists to predict whether the
-    # plugin will disable itself at the first idle, and that decision is made
-    # over ``CONTRACT_COMPACTION_KEYS`` alone (compaction_mode.effective_drift,
-    # and the JS side does the same).  Comparing the full ``config_values``
-    # would also demand ``prune``, which ``_evaluation_config`` deliberately
-    # accepts as absent -- a config written before ``prune`` became managed
-    # compacts correctly, and so does one where the user turned it off.  Two
-    # layers giving opposite answers about the same config is the bug: the
-    # replay never starts, and the "works with older settings" promise is void.
-    expected_values = {
-        key: derived.config_values[key]
-        for key in compaction_mode.CONTRACT_COMPACTION_KEYS
-    }
-    mismatched = [
-        key for key, expected in expected_values.items()
-        if not isinstance(section, Mapping)
-        or not compaction_mode.json_equal(section.get(key), expected)
-    ]
-    if mismatched:
-        raise session_eval.SessionEvalError(
-            "--keep-compaction: the managed compaction values were derived for a "
-            f"different model; {label} needs {expected_values} but the config "
-            f"has {dict(section) if isinstance(section, Mapping) else None} "
-            f"(mismatched: {', '.join(mismatched)})"
-        )
 
 
-def _compaction_identity(config: Mapping[str, Any], keep_compaction: bool) -> dict[str, Any]:
-    """The compaction semantics this replay runs under.
-
-    Two runs that differ here are not comparable and must not share a resume
-    checkpoint: one may compact at idle under CodeTrail's rules while the other
-    runs upstream defaults, and a suite half-collected under each would be
-    silently merged.
-    """
-    section = config.get(compaction_mode.COMPACTION_SECTION)
-    agent = config.get("agent")
-    identity: dict[str, Any] = {
-        "keep_compaction": bool(keep_compaction),
-        "section": section if isinstance(section, Mapping) else None,
-        "plugin": list(config.get("plugin") or []),
-        # `agent.compaction` 決定摘要用哪個模型、什麼溫度、什麼 system prompt。
-        # 中途換掉它,兩半結果不可比 —— 一般 replay 也一樣(它跑的是上游原生
-        # 壓縮,而那同樣會用這個 agent)。
-        "agent": _compaction_agent_identity(agent),
-    }
-    if keep_compaction:
-        identity["plugin_digest"] = _file_digest(compaction_mode.PLUGIN_PATH)
-        identity["rules_digest"] = _file_digest(compaction_mode.RULES_DOC)
-    return identity
 
 
 _FILE_PROMPT_REFERENCE_RE = re.compile(r"^\{file:(.+)\}$", re.DOTALL)
 
 
-def _compaction_agent_identity(agent: Any) -> dict[str, Any] | None:
-    """`agent.compaction` 的身分,`{file:...}` 解析成內容雜湊。
-
-    只存原始 mapping 的話,同一個路徑下的 prompt 內容被換掉,fingerprint 不變,
-    兩種摘要 system prompt 的結果會併進同一個 checkpoint。canary 早就這樣做了
-    (`tool_call_canary._effective_agent_prompt_digest`),這裡沿用同一條規則。
-    """
-    entry = agent.get("compaction") if isinstance(agent, Mapping) else None
-    if not isinstance(entry, Mapping):
-        return None
-    identity = {key: entry[key] for key in sorted(entry) if key != "prompt"}
-    prompt = entry.get("prompt")
-    if isinstance(prompt, str):
-        match = _FILE_PROMPT_REFERENCE_RE.fullmatch(prompt.strip())
-        if match is None:
-            identity["prompt"] = {"kind": "inline", "digest": session_eval.text_digest(prompt)}
-        else:
-            identity["prompt"] = {
-                "kind": "file",
-                "digest": _file_digest(Path(match.group(1)).expanduser()),
-            }
-    elif prompt is not None:
-        identity["prompt"] = {"kind": "unknown"}
-    return identity
 
 
 def _file_digest(path: Path) -> str:
@@ -484,42 +301,33 @@ def _file_digest(path: Path) -> str:
         return "unavailable"
 
 
-def _write_replay_compaction_state(
-    directory: Path, config: Mapping[str, Any], config_path: Path
-) -> Path:
-    """Bind a throw-away ownership state to the replay config.
 
-    Only ``--keep-compaction`` uses this.  It never touches the real
-    ``~/.config/codetrail/compaction.json``: that file describes the user's
-    actual OpenCode config and must keep describing it.
+
+
+
+def replay_client_config(*, keep_compaction: bool) -> dict[str, Any]:
+    """replay 用的 ``client.json``。**不讀使用者的那一份。**
+
+    frozen suite 的可比性要求每個 candidate 在同一組壓縮語意下跑。讀使用者的
+    設定等於「同一份 suite 在兩台機器上量到不同東西」;而一台從來沒設過
+    client.json 的新部署會直接沒有壓縮,卻沒有任何欄位記得這件事。
+
+    * 預設 ``off``:一般 replay 量的是模型本身,不是壓縮。
+    * ``--keep-compaction``:唯一以壓縮為主題的那個 suite,用 ``codetrail``。
     """
-    section = config.get(compaction_mode.COMPACTION_SECTION)
-    if not isinstance(section, Mapping):
-        raise session_eval.SessionEvalError(
-            "--keep-compaction needs managed compaction settings in the global config"
-        )
-    managed = {
-        key: {"prior": {"present": False}, "value": section[key]}
-        for key in compaction_mode.MANAGED_COMPACTION_KEYS
-        if key in section
+    return {
+        "schema": client_config.SCHEMA,
+        "compaction_mode": (
+            client_compaction.MODE_CODETRAIL if keep_compaction else client_compaction.MODE_OFF
+        ),
+        # replay 是唯讀的:寫入工具在 policy 與 MCP server 兩層都已經關掉,
+        # 這裡不再開任何覆寫。
+        "permission": {},
     }
-    if any(key not in managed for key in compaction_mode.CONTRACT_COMPACTION_KEYS):
-        raise session_eval.SessionEvalError(
-            "--keep-compaction needs every contract compaction key in the global "
-            "config; re-run ./set_config.sh to write them"
-        )
-    state = compaction_mode.build_state(
-        mode=compaction_mode.MODE_CODETRAIL,
-        config_path=config_path,
-        managed=managed,
-        plugin={"registered": True, "prior_present": False, "entry": "string"},
-        section_present=True,
-    )
-    return compaction_mode.save_state(state, path=directory / "compaction-replay.json")
 
 
-def _write_temp_config(directory: Path, value: Mapping[str, Any]) -> Path:
-    path = directory / "opencode-eval.json"
+def _write_replay_client_config(directory: Path, value: Mapping[str, Any]) -> Path:
+    path = directory / "client.json"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags, 0o600)
@@ -533,13 +341,53 @@ def _write_temp_config(directory: Path, value: Mapping[str, Any]) -> Path:
     return path
 
 
-def _normalise_base_url(config: Mapping[str, Any], model: str, env: Mapping[str, str]) -> str:
-    provider = model.split("/", 1)[0]
-    providers = config.get("provider")
-    provider_spec = providers.get(provider) if isinstance(providers, Mapping) else None
-    options = provider_spec.get("options") if isinstance(provider_spec, Mapping) else None
-    configured = options.get("baseURL") if isinstance(options, Mapping) else None
-    base = env.get("AICODE_LLAMA_BASE_URL") or configured or "http://localhost:8080"
+def _compaction_identity(*, keep_compaction: bool, n_ctx: Any) -> dict[str, Any]:
+    """這次 replay 跑在什麼壓縮語意底下。
+
+    兩個在這裡不同的 run 不可比,也不得共用 resume checkpoint:一個會在 idle
+    依 CodeTrail 的規則壓縮,另一個完全不壓,而兩半結果會被靜默合併。
+    """
+    identity: dict[str, Any] = {
+        "keep_compaction": bool(keep_compaction),
+        "mode": (
+            client_compaction.MODE_CODETRAIL if keep_compaction else client_compaction.MODE_OFF
+        ),
+        "rules_digest": _file_digest(compaction_mode.RULES_DOC),
+    }
+    if not keep_compaction:
+        return identity
+    # 壓縮真的要能發生:推不出門檻的 n_ctx 會讓「有壓縮」這件事靜默消失,
+    # 而 `compaction_events` 照樣讀到 0。
+    if not isinstance(n_ctx, int) or isinstance(n_ctx, bool):
+        raise session_eval.SessionEvalError(
+            "--keep-compaction needs the live n_ctx from /props to derive a threshold"
+        )
+    try:
+        derived = client_compaction.derive(n_ctx)
+    except compaction_mode.CompactionModeError as exc:
+        raise session_eval.SessionEvalError(
+            f"--keep-compaction cannot derive a compaction threshold for n_ctx={n_ctx}: {exc}"
+        ) from exc
+    identity["threshold"] = derived.idle_threshold
+    identity["preserve_recent_tokens"] = derived.preserve_recent_tokens
+    return identity
+
+
+def client_identity() -> str:
+    """跑這次 replay 的客戶端身分(以前這一格是 ``opencode --version``)。"""
+    parts = []
+    for name in ("client_engine.py", "client_prompt.py", "codetrail_chat.py"):
+        try:
+            parts.append(
+                session_eval.text_digest((REPO_ROOT / name).read_text(encoding="utf-8"))
+            )
+        except OSError:
+            parts.append("missing")
+    return session_eval.text_digest("|".join(parts))
+
+
+def _normalise_base_url(env: Mapping[str, str]) -> str:
+    base = env.get("AICODE_LLAMA_BASE_URL") or "http://localhost:8080"
     if not isinstance(base, str) or not base.strip():
         raise session_eval.SessionEvalError("candidate model endpoint is invalid")
     base = base.rstrip("/")
@@ -570,19 +418,31 @@ def _same_model_artifact(expected: Path, actual_raw: str) -> bool:
         return False
 
 
+def bare_model(value: str) -> str:
+    """`--model` 接受的三種寫法都化成客戶端真正用的那一個:
+
+    - registry bare name(`qwen3-coder-30b`)原樣;
+    - GGUF 路徑(絕對 / `~` / `.gguf` 結尾)原樣——`split("/")` 會把絕對路徑砍成相對的;
+    - 舊式 `llamacpp/<bare>`(OpenCode 時代的 provider/model)剝掉前綴。
+    外部 provider(openai/ 等)直接拒絕:CodeTrail 只跑本地 llama-server。
+    """
+    resolved = model_resolution.normalize_main_model(str(value or ""), "--model")
+    if not resolved.ok:
+        raise session_eval.SessionEvalError(resolved.error or f"invalid --model {value!r}")
+    return resolved.model
+
+
 def _candidate_identity(
     *,
     model: str,
-    config: Mapping[str, Any],
     env: Mapping[str, str],
     keep_compaction: bool = False,
-    opencode_version: str | None = None,
 ) -> dict[str, Any]:
-    bare = model.split("/", 1)[1]
+    bare = bare_model(model)
     expected_path = Path(
         deployment_profile.resolve_model_reference(bare, env, must_exist=True)
     )
-    client = LocalJsonClient(_normalise_base_url(config, model, env), timeout_seconds=120)
+    client = LocalJsonClient(_normalise_base_url(env), timeout_seconds=120)
     props = client.get_json("/props")
     if not _same_model_artifact(expected_path, _path_from_props(props)):
         raise session_eval.SessionEvalError(
@@ -614,8 +474,11 @@ def _candidate_identity(
         # Compaction changes what the model sees on every turn after the first
         # summary, so two runs under different compaction semantics are not the
         # same candidate and must not share a resume checkpoint.
-        "compaction": _compaction_identity(config, keep_compaction),
-        "opencode_version": opencode_version,
+        "compaction": _compaction_identity(
+            keep_compaction=keep_compaction,
+            n_ctx=props.get("n_ctx", settings.get("n_ctx")),
+        ),
+        "client_version": client_identity(),
     }
     identity["fingerprint"] = session_eval.json_digest(identity)
     return identity
@@ -661,24 +524,29 @@ def _run_turn(
     env: Mapping[str, str],
     timeout: int,
     session_id: str | None,
+    persist: bool = False,
 ) -> tuple[dict[str, Any], str]:
+    # read-only replay:客戶端這一層 deny 全部非唯讀工具,MCP server 那一層
+    # 再關一次(AI_CODE_PATCH=0 / AI_CODE_RUN_TESTS=0),context metrics 也關掉。
+    #
+    # 多輪 case 必須 `--persist --session`:每一輪各起一個 ephemeral 行程的話,
+    # 模型完全看不到上一輪 —— 「第二輪要引用第一輪的結論」這種 case 量到的是
+    # 一個不存在的能力。單輪 case 仍然不落檔(session 檔逐字含 NDA 內容)。
     command = [
-        "opencode",
-        "run",
-        "--dir",
+        sys.executable,
+        str(REPO_ROOT / "codetrail_chat.py"),
+        "--root",
         str(root),
-        "--agent",
-        "build",
-        "--format",
-        "json",
-        "--title",
-        "CodeTrail private session evaluation",
-        "--model",
-        model,
+        "--policy",
+        "readonly",
     ]
-    if session_id:
-        command.extend(("--session", session_id))
-    command.append(prompt)
+    if persist:
+        if session_id:
+            command.extend(["--session", session_id])
+        command.extend(["run", "--persist"])
+    else:
+        command.append("run")
+    command.extend(["--format", "json", prompt])
     started = time.monotonic()
     timed_out = False
     try:
@@ -686,7 +554,7 @@ def _run_turn(
         stdout_bytes = completed.stdout
         returncode = completed.returncode
     except _CommandTimedOut as exc:
-        # OpenCode emits its JSON event stream incrementally.  A timeout is a
+        # The client emits its JSON event stream incrementally.  A timeout is a
         # model outcome, not a reason to discard earlier cases or private
         # cleanup metadata.  Parse only the bounded partial stdout; stderr is
         # deliberately not persisted because it may contain project details.
@@ -711,7 +579,7 @@ def _run_turn(
     elif len(sessions) == 1:
         resolved_session = sessions[0]
     else:
-        raise session_eval.SessionEvalError("OpenCode replay did not expose exactly one session id")
+        raise session_eval.SessionEvalError("replay did not expose exactly one session id")
     calls = [
         {
             "tool": call.bare_tool,
@@ -741,19 +609,40 @@ def _run_turn(
     )
 
 
+#: replay 一定會看的專案內狀態。`.gitignore` 掉的東西不會出現在 git diff 裡,
+#: 但它們正是唯讀 replay 最可能被寫到的地方(KB、context metrics、上傳暫存)。
+#: suite 沒列 state_paths 時仍然要驗這幾條,否則「前後 project state 不變」
+#: 這個保證可以被三個明訂路徑繞過。
+DEFAULT_STATE_PATHS = (
+    ".codetrail",
+    "knowledge.json",
+    ".aicode_uploads",
+)
+
+
+def _state_paths(case: Mapping[str, Any]) -> list[str]:
+    listed = case.get("state_paths") or []
+    return sorted({*(str(item) for item in listed), *DEFAULT_STATE_PATHS})
+
+
 def _delete_generated_session(session_id: str, *, root: Path, env: Mapping[str, str]) -> bool:
-    if not _SAFE_SESSION_ID_RE.fullmatch(session_id):
-        return False
+    """多輪 replay 會落檔(模型要看得到上一輪);跑完就刪掉。
+
+    session 檔逐字含 NDA prompt 與工具輸出,不能留在使用者的 session 清單裡。
+    """
     try:
-        completed = _bounded_run(
-            ["opencode", "session", "delete", session_id],
-            cwd=root,
-            env=env,
-            timeout=30,
-        )
-    except session_eval.SessionEvalError:
+        import client_store
+
+        previous = dict(os.environ)
+        try:
+            os.environ.update({k: v for k, v in env.items() if isinstance(v, str)})
+            client_store.SessionStore(root).delete(session_id)
+        finally:
+            os.environ.clear()
+            os.environ.update(previous)
+    except Exception:  # noqa: BLE001 - 刪不掉要回報,不是丟 traceback
         return False
-    return completed.returncode == 0
+    return True
 
 
 def _run_case(
@@ -765,31 +654,44 @@ def _run_case(
     keep_sessions: bool,
 ) -> dict[str, Any]:
     root = _validate_project_root(case["project_root"])
-    before = project_state_digest(root, case.get("state_paths", []))
+    state_paths = _state_paths(case)
+    before = project_state_digest(root, state_paths)
     turn_results: list[dict[str, Any]] = []
     generated_session: str | None = None
     cleanup_ok = True
+    # 只有多輪 case 需要落檔(模型要看得到上一輪)。單輪維持 ephemeral。
+    persist = len(case["turns"]) > 1
+    failure: BaseException | None = None
     try:
-        for turn in case["turns"]:
-            result, generated_session = _run_turn(
-                root=root,
-                prompt=turn["text"],
-                model=model,
-                env={**env, "AICODE_ROOT": str(root)},
-                timeout=timeout,
-                session_id=generated_session,
-            )
-            turn_results.append(result)
-            if result["harness_error"] or not result["terminal"]:
-                break
+        try:
+            for turn in case["turns"]:
+                result, generated_session = _run_turn(
+                    root=root,
+                    prompt=turn["text"],
+                    model=model,
+                    env={**env, "AICODE_ROOT": str(root)},
+                    timeout=timeout,
+                    session_id=generated_session,
+                    persist=persist,
+                )
+                turn_results.append(result)
+                if result["harness_error"] or not result["terminal"]:
+                    break
+        finally:
+            if persist and generated_session and not keep_sessions:
+                cleanup_ok = _delete_generated_session(generated_session, root=root, env=env)
+    except BaseException as exc:
+        failure = exc
+        raise
     finally:
-        if generated_session and not keep_sessions:
-            cleanup_ok = _delete_generated_session(generated_session, root=root, env=env)
-    after = project_state_digest(root, case.get("state_paths", []))
-    if before != after:
-        raise session_eval.SessionEvalError(
-            f"project state changed during read-only replay for case {case['id']}"
-        )
+        # 最後一道防線**一定**要跑:replay child 改了現場之後丟例外,如果 digest
+        # 放在 try 外面,那個改動就沒有人看到。
+        after = project_state_digest(root, state_paths)
+        if before != after:
+            suffix = f"(after {type(failure).__name__})" if failure is not None else ""
+            raise session_eval.SessionEvalError(
+                f"project state changed during read-only replay for case {case['id']}{suffix}"
+            )
     checks = session_eval.evaluate_checks(case["verifier"]["checks"], turn_results)
     automatic_pass = all(item["passed"] for item in checks) if checks else None
     if not cleanup_ok:
@@ -865,7 +767,7 @@ def _resume_cases(
     # prevents a long overnight run from silently comparing different trees.
     for case, saved_case in zip(suite_cases, saved_cases, strict=True):
         root = _validate_project_root(case["project_root"])
-        current = project_state_digest(root, case.get("state_paths", []))
+        current = project_state_digest(root, _state_paths(case))
         if saved_case["project_state_digest"] != current:
             raise session_eval.SessionEvalError(
                 f"resume checkpoint project state drifted for case {case['id']}"
@@ -879,14 +781,11 @@ def command_run(args: argparse.Namespace) -> int:
         raise session_eval.SessionEvalError(
             "--candidate-label must match [a-z][a-z0-9_]{2,79}"
         )
-    output_dir = args.output_dir.expanduser()
+    output_dir = _private_output_dir(args.output_dir)
     output_name = f"result-{args.candidate_label}.json"
     output_path = output_dir / output_name
-    _config_path, global_config = _global_config()
-    evaluation_config = _evaluation_config(
-        global_config, args.model, keep_compaction=bool(getattr(args, "keep_compaction", False))
-    )
-    bare = args.model.split("/", 1)[1] if "/" in args.model else ""
+    keep_compaction = bool(getattr(args, "keep_compaction", False))
+    bare = bare_model(args.model)
     env = os.environ.copy()
     env.update(
         {
@@ -895,33 +794,26 @@ def command_run(args: argparse.Namespace) -> int:
             "AI_CODE_PATCH": "0",
             "AI_CODE_RUN_TESTS": "0",
             "AICODE_LESSONS_SKIP": "1",
-            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
-            "OPENCODE_EXPERIMENTAL_CODE_MODE": "false",
+            # 專案內的 AGENTS.md / lessons 不進 replay 的 system prompt:
+            # frozen suite 的可比性要求每個 candidate 看到同一份指示。
+            "CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS": "1",
+            # replay 的契約是前後 project state 不變。
+            "AICODE_CTX_METRICS_ENABLED": "0",
         }
     )
     with tempfile.TemporaryDirectory(prefix="codetrail-session-eval-") as raw_temp:
         temp_dir = Path(raw_temp)
         temp_dir.chmod(0o700)
-        config_path = _write_temp_config(temp_dir, evaluation_config)
-        env["OPENCODE_CONFIG"] = str(config_path)
-        keep_compaction = bool(getattr(args, "keep_compaction", False))
-        # 版本一律量:一般 replay 跑的是上游原生壓縮,1.18.16 與 1.18.21 的
-        # 壓縮語意不同,前半後半混在一起就不可比。
-        opencode_version = read_opencode_version(REPO_ROOT, env)
-        env[COMPACTION_VERSION_ENV] = opencode_version
-        if keep_compaction:
-            # The plugin refuses any ownership state that is not bound to the
-            # config actually in effect, and the replay config is a fresh temp
-            # path.  Write a throw-away state bound to *that* path inside the
-            # 0700 temp dir and point the plugin at it; every other check
-            # (owner-only, no symlink, digest, mode) still applies.
-            env[COMPACTION_STATE_ENV] = str(
-                _write_replay_compaction_state(temp_dir, evaluation_config, config_path)
+        # replay 用自己寫的 client.json,不讀使用者那一份:同一份 suite 在兩台
+        # 機器上必須量到同一件事,而一台沒設過 client.json 的新部署會直接沒有
+        # 壓縮(而且沒有任何欄位記得)。
+        env["CODETRAIL_CLIENT_CONFIG"] = str(
+            _write_replay_client_config(
+                temp_dir, replay_client_config(keep_compaction=keep_compaction)
             )
-            _require_compaction_runtime(evaluation_config, args.model, opencode_version)
+        )
         identity = _candidate_identity(
-            model=args.model, config=evaluation_config, env=env,
-            keep_compaction=keep_compaction, opencode_version=opencode_version,
+            model=args.model, env=env, keep_compaction=keep_compaction,
         )
         candidate = {
             "label": args.candidate_label,
@@ -981,8 +873,9 @@ def command_bundle(args: argparse.Namespace) -> int:
     left = session_eval.read_json_file(args.left)
     right = session_eval.read_json_file(args.right)
     bundle, key = session_eval.build_blind_bundle(suite, left, right)
-    review_path = session_eval.write_private_json(args.output_dir, "review.json", bundle)
-    key_path = session_eval.write_private_json(args.output_dir, "review-key.json", key)
+    bundle_dir = _private_output_dir(args.output_dir)
+    review_path = session_eval.write_private_json(bundle_dir, "review.json", bundle)
+    key_path = session_eval.write_private_json(bundle_dir, "review-key.json", key)
     markdown_path = session_eval.write_private_bytes(
         args.output_dir,
         "review.md",
@@ -996,14 +889,14 @@ def command_bundle(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Mine private OpenCode sessions and compare local chat models"
+        description="Mine private CodeTrail sessions and compare local chat models"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    export = sub.add_parser("export", help="export explicit OpenCode sessions into private storage")
-    export.add_argument("--session", action="append", required=True, help="OpenCode session id")
+    export = sub.add_parser("export", help="export explicit CodeTrail sessions into private storage")
+    export.add_argument("--session", action="append", required=True, help="CodeTrail session id")
     export.add_argument("--output-dir", type=Path, default=DEFAULT_PRIVATE_DIR / "exports")
-    export.add_argument("--sanitize", action="store_true", help="ask OpenCode to redact transcript/file data")
+    export.add_argument("--sanitize", action="store_true", help="strip assistant text and tool output (keep tool names) for sharing")
     export.set_defaults(func=command_export)
 
     mine = sub.add_parser("mine", help="remove assistant turns and produce user-only draft timelines")
@@ -1020,7 +913,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="replay one curated suite against the currently loaded model")
     run.add_argument("--suite", type=Path, required=True)
     run.add_argument("--candidate-label", required=True, help="private stable label used only in sealed results")
-    run.add_argument("--model", required=True, help="OpenCode provider/model id")
+    run.add_argument("--model", required=True, help="model as aicode -m takes it: registry name or GGUF path (legacy llamacpp/<name> is accepted and stripped); the value is kept verbatim in the result identity")
     run.add_argument("--output-dir", type=Path, default=DEFAULT_PRIVATE_DIR / "runs")
     run.add_argument("--turn-timeout", type=int, default=DEFAULT_TURN_TIMEOUT)
     run.add_argument("--skip-aux-preflight", action="store_true", help="only for suites that cannot call RAG/VL")
@@ -1029,10 +922,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-compaction",
         action="store_true",
         help=(
-            "keep BOTH halves of the compaction contract in the replay: the "
-            "managed compaction.* settings and the CodeTrail compaction plugin. "
-            "Only for a suite whose subject is compaction itself; every other "
-            "suite runs with both removed"
+            "replay with the client's own structured compaction (mode codetrail) "
+            "instead of compaction off. Only for a suite whose subject is "
+            "compaction itself; every other suite runs with compaction off"
         ),
     )
     run.add_argument(
@@ -1065,9 +957,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print(f"FAIL — {type(exc).__name__}", error=True)
         return 2
     except (EvalError, compaction_mode.CompactionModeError) as exc:
-        # `read_opencode_version` 失敗會丟 eval_tool_routing 的 EvalError,
-        # 壓縮狀態寫不出來會丟 CompactionModeError。兩者都在 commit 之前安全
-        # 失敗,但沒有接的話會吐 traceback 而不是既有的乾淨診斷。
+        # 壓縮門檻推不出來會丟 CompactionModeError,catalog 契約會丟 EvalError。
+        # 兩者都在 commit 之前安全失敗,但沒有接的話會吐 traceback 而不是既有
+        # 的乾淨診斷。
         _print(f"FAIL — {exc}", error=True)
         return 2
 

@@ -8,7 +8,8 @@ tests/test_ctx_resolution.py、tests/test_llama_sampling.py、tests/test_config.
 
 - deployment profile:絕對路徑 profile 繼承 safe-defaults、優先序、惡意值拒收、命令建構。
 - deployment status:依 cmdline port 認角色、GPU / 模型 / mmproj 錯配偵測。
-- 主模型解析鏈:argv/env/opencode.json 的解析與 fail-loud、呼叫時機、必要 server 檢查
+- 主模型解析鏈:argv/env/deployment profile 的解析與 fail-loud、呼叫時機、必要 server 檢查
+  (opencode.json 已不在鏈上,只留「它不得再影響解析」的守門測試)
   (原本又併自 test_resolve_main_model / test_main_model_calltime /
   test_required_model_servers_check,2026-08-20)。
 - gpu_safety:server-based ctx safety verdict + GPU info 回報。完全離線:所有
@@ -692,6 +693,8 @@ def model_resolution_env(monkeypatch, tmp_path):
 
 
 def _write_home_opencode(tmp_path: Path, model: str = "llamacpp/from-json") -> Path:
+    """寫一份殘留的 OpenCode 設定。**只用來證明它不再影響解析。**
+    """
     cfg_dir = tmp_path / ".config" / "opencode"
     cfg_dir.mkdir(parents=True)
     path = cfg_dir / "opencode.json"
@@ -713,77 +716,13 @@ def _write_alias_registry(tmp_path: Path, aliases: tuple[str, ...]) -> Path:
 
 
 @pytest.mark.parametrize(
-    ("json_model", "env_model", "argv", "expected"),
-    [
-        pytest.param("llamacpp/from-env", "from-env", [], "from-env", id="same_model_allowed"),
-        pytest.param(
-            "llamacpp/from-json", "from-cli", ["--model", "llamacpp/from-cli"], "from-cli",
-            id="cli_overrides_json",
-        ),
-    ],
-)
-def test_env_model_with_opencode_json(
-    model_resolution_env, monkeypatch, tmp_path, capsys, json_model, env_model, argv, expected
-):
-    """- same_model_allowed:env 與 opencode.json 指到同一個模型 → 放行,印出 env 值。
-    - cli_overrides_json:CLI 明確給的模型可以壓過 opencode.json(env 與 CLI 一致)。"""
-    _write_home_opencode(tmp_path, json_model)
-    monkeypatch.setenv("AICODE_MODEL", env_model)
-
-    assert rmm.main(argv) == 0
-    assert capsys.readouterr().out.strip() == expected
-
-
-def test_env_and_opencode_registry_aliases_for_same_gguf_allowed(
-    model_resolution_env, monkeypatch, tmp_path, capsys
-):
-    _write_alias_registry(tmp_path, ("old-alias", "new-alias"))
-    _write_home_opencode(tmp_path, "llamacpp/new-alias")
-    monkeypatch.setenv("AICODE_MODEL", "old-alias")
-
-    assert rmm.main([]) == 0
-    assert capsys.readouterr().out.strip() == "old-alias"
-
-
-def test_env_and_opencode_json_conflict_fails(model_resolution_env, monkeypatch, tmp_path, capsys):
-    _write_home_opencode(tmp_path, "llamacpp/from-json")
-    monkeypatch.setenv("AICODE_MODEL", "from-env")
-
-    rc = rmm.main([])
-
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "opencode.json" in err
-    assert "different models" in err
-
-
-@pytest.mark.parametrize(
-    ("json_model", "argv", "expected"),
-    [
-        pytest.param(
-            "llamacpp/from-json", ["-m", "from-arg"], "from-arg", id="argv_overrides_json"
-        ),
-        pytest.param("llamacpp/from-json", [], "from-json", id="json_fallback"),
-        pytest.param("just-bare-name", [], "just-bare-name", id="json_bare_model"),
-    ],
-)
-def test_opencode_json_without_env(model_resolution_env, tmp_path, capsys, json_model, argv, expected):
-    """env 沒設時 opencode.json 的角色:
-    - argv_overrides_json:argv 有給 → argv 贏過 opencode.json。
-    - json_fallback:env 與 argv 都沒給 → 退回 opencode.json。
-    - json_bare_model:opencode.json 不再強制 require ollama/ 前綴(或任何 prefix);
-      bare 也接受。"""
-    _write_home_opencode(tmp_path, json_model)
-
-    assert rmm.main(argv) == 0
-    assert capsys.readouterr().out.strip() == expected
-
-
-@pytest.mark.parametrize(
     ("env_model", "argv_model", "expected"),
     [
         pytest.param("same-model", "same-model", "same-model", id="same_model_allowed"),
-        pytest.param("foo-bar", "llamacpp/foo-bar", "foo-bar", id="custom_provider_prefix_strips_to_bare"),
+        pytest.param(
+            "foo-bar", "llamacpp/foo-bar", "foo-bar",
+            id="custom_provider_prefix_strips_to_bare",
+        ),
     ],
 )
 def test_env_and_argv_agree(model_resolution_env, monkeypatch, capsys, env_model, argv_model, expected):
@@ -890,37 +829,8 @@ def test_env_rejects_external_provider(model_resolution_env, monkeypatch, capsys
     assert "外部 provider" in err or "provider prefix" in err
 
 
-def test_opencode_config_env_path_is_used(model_resolution_env, monkeypatch, tmp_path, capsys):
-    _write_home_opencode(tmp_path, "llamacpp/home-model")
-    custom = tmp_path / "custom-opencode.json"
-    custom.write_text(json.dumps({"model": "llamacpp/custom-model"}), encoding="utf-8")
-    monkeypatch.setenv("OPENCODE_CONFIG", str(custom))
-
-    assert rmm.main([]) == 0
-    assert capsys.readouterr().out.strip() == "custom-model"
-
-
-def test_opencode_json_rejects_external_provider(model_resolution_env, tmp_path, capsys):
-    _write_home_opencode(tmp_path, "anthropic/something")
-
-    rc = rmm.main([])
-
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "外部 provider" in err or "provider prefix" in err
-
-
 def test_placeholder_in_env_fails(model_resolution_env, monkeypatch, capsys):
     monkeypatch.setenv("AICODE_MODEL", "<CODE_MODEL>")
-
-    rc = rmm.main([])
-
-    assert rc == 2
-    assert "placeholder" in capsys.readouterr().err
-
-
-def test_placeholder_in_opencode_json_fails(model_resolution_env, tmp_path, capsys):
-    _write_home_opencode(tmp_path, "llamacpp/<CODE_MODEL>")
 
     rc = rmm.main([])
 
@@ -934,22 +844,51 @@ def test_no_source_at_all_fails_loud(model_resolution_env, capsys):
     assert rc == 2
     err = capsys.readouterr().err
     assert "AICODE_MODEL" in err
-    assert "opencode.json" in err
+    assert "opencode" not in err
+
+
+@pytest.mark.smoke
+def test_opencode_json_is_no_longer_a_model_source(model_resolution_env, tmp_path, capsys):
+    """`opencode.json` 已經不在主模型解析鏈上。
+
+    CodeTrail 啟動的是自己的客戶端,沒有第二個 TUI 要對齊。沿用那份設定裡的
+    模型等於「使用者以為在跑 A、實際在跑 B」。
+    """
+    _write_home_opencode(tmp_path, "llamacpp/from-json")
+    assert rmm.main([]) == 2
+    err = capsys.readouterr().err
+    assert "from-json" not in err
+
+
+@pytest.mark.smoke
+def test_a_broken_opencode_json_never_blocks_startup(
+    model_resolution_env, monkeypatch, tmp_path, capsys
+):
+    """一台根本沒在用 OpenCode 的機器,不該因為那份殘留檔壞掉而無法啟動。"""
+    cfg_dir = tmp_path / ".config" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.json").write_text("{ not json", encoding="utf-8")
+    monkeypatch.setenv("AICODE_MODEL", "review-model")
+
+    assert rmm.main([]) == 0
+    assert capsys.readouterr().out.strip() == "review-model"
+
+
+@pytest.mark.smoke
+def test_a_conflicting_opencode_json_is_not_a_conflict_any_more(
+    model_resolution_env, monkeypatch, tmp_path, capsys
+):
+    _write_home_opencode(tmp_path, "llamacpp/from-json")
+    monkeypatch.setenv("AICODE_MODEL", "from-env")
+
+    assert rmm.main([]) == 0
+    assert capsys.readouterr().out.strip() == "from-env"
 
 
 def test_empty_string_treated_as_unset(model_resolution_env, monkeypatch, capsys):
     monkeypatch.setenv("AICODE_MODEL", "   ")
 
     assert rmm.main([]) == 2
-
-
-def test_malformed_opencode_json_fails_loud(model_resolution_env, tmp_path, capsys):
-    cfg_dir = tmp_path / ".config" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.json").write_text("not json", encoding="utf-8")
-
-    assert rmm.main([]) == 2
-    assert "opencode.json" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------

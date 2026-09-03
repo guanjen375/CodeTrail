@@ -1389,106 +1389,12 @@ def stat_mode(path: Path) -> int:
     return os.stat(path, follow_symlinks=False).st_mode & 0o777
 
 
-@pytest.mark.smoke
-def test_replay_config_denies_every_mutating_tool():
-    config = {
-        "provider": {"llamacpp": {"models": {"candidate": {}}}},
-        "permission": {"codetrail_*": "allow"},
-        "plugin": ["private-plugin"],
-        "instructions": ["private-instructions"],
-    }
-
-    result = session_eval_cli._evaluation_config(config, "llamacpp/candidate")
-
-    for tool in session_eval_cli.MUTATING_FRONTEND_TOOLS:
-        assert result["permission"][tool] == "deny"
-    for builtin in ("bash", "read", "grep", "glob", "edit", "write", "apply_patch", "task"):
-        assert result["permission"][builtin] == "deny"
-    assert result["plugin"] == []
-    assert result["instructions"] == []
 
 
-@pytest.mark.smoke
-def test_replay_config_drops_the_managed_compaction_override():
-    """把 plugin 拿掉卻留著它的 compaction 設定,就是沒人跑過的混合語意。
-
-    `compaction.auto=false` 連 mid-turn 壓縮與 provider-overflow 回復一起關掉,
-    而 idle 觸發的那一端(plugin)已經不在。長案例會變成互動端不會發生的
-    provider 錯誤,而 `compaction_events` 靜靜地讀到 0。
-    """
-    import compaction_mode
-
-    config = {
-        "provider": {"llamacpp": {"models": {"candidate": {}}}},
-        "plugin": ["/abs/codetrail-compaction.js"],
-        "compaction": {
-            "auto": False, "tail_turns": 1, "preserve_recent_tokens": 23920,
-            # `prune` 是 CodeTrail 的受管鍵(接管才會開),`reserved` 不是 ——
-            # 後者是上游 schema,使用者可能自己設過。
-            "prune": True, "reserved": 12000,
-        },
-    }
-
-    result = session_eval_cli._evaluation_config(config, "llamacpp/candidate")
-    assert result["plugin"] == []
-    # 只拿掉 CodeTrail 擁有的鍵;把整段刪掉是在評測使用者沒有在跑的設定
-    assert result["compaction"] == {"reserved": 12000}
-    for key in compaction_mode.MANAGED_COMPACTION_KEYS:
-        assert key not in result["compaction"]
-
-    # 受管鍵是整段唯一內容時,連空的區塊也不留
-    only_managed = json.loads(json.dumps(config))
-    only_managed["compaction"] = {
-        key: config["compaction"][key] for key in compaction_mode.MANAGED_COMPACTION_KEYS
-    }
-    assert "compaction" not in session_eval_cli._evaluation_config(
-        only_managed, "llamacpp/candidate"
-    )
 
 
-@pytest.mark.smoke
-def test_keep_compaction_loads_both_halves_or_neither():
-    """`--keep-compaction` 是為了評測壓縮本身;只留設定不留 plugin 什麼都測不到。"""
-    import compaction_mode
-
-    config = {
-        "provider": {"llamacpp": {"models": {"candidate": {}}}},
-        "plugin": [],
-        "compaction": {"auto": False, "tail_turns": 1, "preserve_recent_tokens": 23920},
-    }
-    kept = session_eval_cli._evaluation_config(
-        config, "llamacpp/candidate", keep_compaction=True
-    )
-    assert kept["compaction"] == config["compaction"]
-    assert kept["plugin"] == [str(compaction_mode.PLUGIN_PATH)]
 
 
-@pytest.mark.smoke
-def test_keep_compaction_binds_a_throwaway_state_to_the_replay_config(tmp_path: Path):
-    """plugin 拒絕綁在別份 config 的狀態,而 replay 的 config 是臨時新路徑。
-
-    這份臨時狀態必須(a)綁在那個臨時 config、(b)owner-only、(c)不碰使用者
-    真正的 ~/.config/codetrail/compaction.json。
-    """
-    import compaction_mode
-
-    config_path = tmp_path / "opencode-eval.json"
-    config_path.write_text("{}", encoding="utf-8")
-    state_path = session_eval_cli._write_replay_compaction_state(
-        tmp_path,
-        {"compaction": {"auto": False, "tail_turns": 1, "preserve_recent_tokens": 23920}},
-        config_path,
-    )
-    assert stat_mode(state_path) == 0o600
-    state = compaction_mode.load_state(path=state_path)
-    assert state is not None and state["mode"] == "codetrail"
-    assert compaction_mode.state_matches_config(state, config_path)
-    assert state_path.parent == tmp_path
-
-    with pytest.raises(session_eval.SessionEvalError):
-        session_eval_cli._write_replay_compaction_state(
-            tmp_path, {"compaction": {"auto": False}}, config_path
-        )
 
 
 @pytest.mark.smoke
@@ -1615,159 +1521,381 @@ def test_resume_checkpoint_rejects_project_state_drift(monkeypatch, tmp_path: Pa
         session_eval_cli._resume_cases(suite, candidate, checkpoint)
 
 
-@pytest.mark.smoke
-def test_keep_compaction_refuses_a_runtime_that_cannot_compact():
-    """壓縮品質 eval 不能安靜產出「完全沒有壓縮」的結果。
 
-    受管值是用另一個模型的 ctx 推導的、或 OpenCode 版本低於壓縮語意下限時,
-    plugin 第一次 idle 就停用,而 eval 照常把 compaction_events=0 寫成結果。
+
+
+
+
+
+
+
+
+
+
+
+# ── session eval 的 replay 契約(S4 審核回修)──
+# 去 OpenCode 化之後 replay 跑的是我們自己的客戶端,所以壓縮語意由 client.json
+# 決定、多輪要真的接得起來、而且 gitignore 掉的路徑一樣算 project state。
+
+@pytest.mark.smoke
+def test_the_replay_pins_its_own_compaction_mode(tmp_path):
+    """replay 不讀使用者的 client.json。
+
+    讀它等於同一份 suite 在兩台機器上量到不同東西;而一台從來沒設過
+    client.json 的新部署會直接沒有壓縮,卻沒有任何欄位記得這件事。
     """
-    import compaction_mode
+    off = session_eval_cli.replay_client_config(keep_compaction=False)
+    kept = session_eval_cli.replay_client_config(keep_compaction=True)
+    assert off["compaction_mode"] == "off"
+    assert kept["compaction_mode"] == "codetrail"
+    assert off["permission"] == {} and kept["permission"] == {}
 
-    derived = compaction_mode.derive_settings(context_limit=131072, output_limit=8192)
-    config = {
-        "provider": {"llamacpp": {"models": {
-            "candidate": {"limit": {"context": 131072, "output": 8192}},
-            "small": {"limit": {"context": 65536, "output": 8192}},
-        }}},
-        "compaction": dict(derived.config_values),
-    }
-    # 版本夠新 + 受管值對得上 → 通過
-    session_eval_cli._require_compaction_runtime(config, "llamacpp/candidate", "1.18.21")
-
-    with pytest.raises(session_eval.SessionEvalError, match="OpenCode >="):
-        session_eval_cli._require_compaction_runtime(
-            config, "llamacpp/candidate", "1.18.16"
-        )
-    with pytest.raises(session_eval.SessionEvalError, match="different model"):
-        session_eval_cli._require_compaction_runtime(config, "llamacpp/small", "1.18.21")
+    path = session_eval_cli._write_replay_client_config(tmp_path, kept)
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
 
 
 @pytest.mark.smoke
-def test_compaction_identity_covers_the_compaction_agent():
-    """`agent.compaction` 決定摘要用哪個模型/溫度/prompt;中途換掉就不可比。"""
-    base = {"compaction": {"auto": False}, "plugin": []}
-    other = {"compaction": {"auto": False}, "plugin": [],
-             "agent": {"compaction": {"model": "llamacpp/other"}}}
-    assert (
-        session_eval_cli._compaction_identity(base, False)
-        != session_eval_cli._compaction_identity(other, False)
-    )
+def test_two_compaction_semantics_are_not_the_same_candidate():
+    """兩個在這裡不同的 run 不可比,也不得共用 resume checkpoint。"""
+    off = session_eval_cli._compaction_identity(keep_compaction=False, n_ctx=131072)
+    kept = session_eval_cli._compaction_identity(keep_compaction=True, n_ctx=131072)
+    assert off != kept
+    assert kept["threshold"] > 0
 
 
 @pytest.mark.smoke
-def test_keep_compaction_validates_the_compaction_agent_model():
-    """驗候選模型而不驗 compaction agent 的模型,runtime 仍會用它重算並停用。"""
-    import compaction_mode
-
-    derived = compaction_mode.derive_settings(context_limit=131072, output_limit=8192)
-    config = {
-        "provider": {"llamacpp": {"models": {
-            "candidate": {"limit": {"context": 131072, "output": 8192}},
-            "small": {"limit": {"context": 65536, "output": 8192}},
-        }}},
-        "compaction": dict(derived.config_values),
-        "agent": {"compaction": {"model": "llamacpp/small"}},
-    }
-    with pytest.raises(session_eval.SessionEvalError, match="different model"):
-        session_eval_cli._require_compaction_runtime(config, "llamacpp/candidate", "1.18.21")
+def test_keep_compaction_needs_a_derivable_threshold():
+    """推不出門檻會讓「有壓縮」靜默消失,而 compaction_events 照樣讀到 0。"""
+    with pytest.raises(session_eval.SessionEvalError):
+        session_eval_cli._compaction_identity(keep_compaction=True, n_ctx=None)
+    with pytest.raises(session_eval.SessionEvalError):
+        session_eval_cli._compaction_identity(keep_compaction=True, n_ctx=1024)
 
 
 @pytest.mark.smoke
-def test_keep_compaction_accepts_a_bigger_compaction_agent_model():
-    """摘要模型比候選模型大時,正確的合併值必須被接受。
+def test_a_multi_turn_case_actually_continues_the_conversation(monkeypatch, tmp_path):
+    """每一輪各起一個 ephemeral 行程的話,模型完全看不到上一輪。
 
-    只按摘要模型驗的話,`set_config` 寫出來的正確設定會被判成
-    「derived for a different model」,eval 根本開不起來。
+    「第二輪要引用第一輪的結論」這種 case 量到的會是一個不存在的能力。
     """
-    import compaction_mode
+    commands: list[list[str]] = []
 
-    config = {
-        "provider": {"llamacpp": {"models": {
-            "candidate": {"limit": {"context": 65536, "output": 8192}},
-            "huge": {"limit": {"context": 1048576, "output": 8192}},
-        }}},
-        "agent": {"compaction": {"model": "llamacpp/huge"}},
-    }
-    combined = compaction_mode.combine_settings(
-        compaction_mode.derive_settings(context_limit=1048576, output_limit=8192),
-        compaction_mode.derive_settings(context_limit=65536, output_limit=8192),
-    )
-    config["compaction"] = dict(combined.config_values)
-    session_eval_cli._require_compaction_runtime(config, "llamacpp/candidate", "1.18.21")
-
-    # 只按摘要模型算出來的那組值才該被拒絕。
-    config["compaction"] = dict(
-        compaction_mode.derive_settings(
-            context_limit=1048576, output_limit=8192
-        ).config_values
-    )
-    with pytest.raises(session_eval.SessionEvalError, match="different model"):
-        session_eval_cli._require_compaction_runtime(
-            config, "llamacpp/candidate", "1.18.21"
+    def _fake_run(command, *, cwd, env, timeout):
+        if command and command[0] == "git":
+            return subprocess.CompletedProcess(command, 1, b"", b"")
+        commands.append(list(command))
+        payload = json.dumps(
+            {"type": "step_finish", "sessionID": "20260101T000000-abcdef01",
+             "part": {"type": "step-finish", "reason": "stop"}}
         )
+        return subprocess.CompletedProcess(command, 0, payload.encode("utf-8"), b"")
+
+    monkeypatch.setattr(session_eval_cli, "_bounded_run", _fake_run)
+    monkeypatch.setattr(session_eval_cli, "_delete_generated_session", lambda *_a, **_k: True)
+    root = tmp_path / "project"
+    root.mkdir()
+
+    session_eval_cli._run_case(
+        {
+            "id": "c1",
+            "project_root": str(root),
+            "task_type": "qa",
+            "turns": [{"text": "第一輪"}, {"text": "第二輪"}],
+            "verifier": {"oracle_kind": "manual", "checks": []},
+        },
+        model="llamacpp/m", env={}, timeout=30, keep_sessions=False,
+    )
+    assert len(commands) == 2
+    assert "--persist" in commands[0]
+    assert commands[1][commands[1].index("--session") + 1] == "20260101T000000-abcdef01"
 
 
 @pytest.mark.smoke
-def test_keep_compaction_accepts_a_config_written_before_prune_became_managed(
-    tmp_path: Path,
-):
-    """`--keep-compaction` 的三層檢查必須講同一套話。
+def test_a_single_turn_case_never_writes_a_session_file(monkeypatch, tmp_path):
+    """session 檔逐字含 NDA prompt 與工具輸出。單輪不需要落檔。"""
+    commands: list[list[str]] = []
 
-    前兩層(`_evaluation_config` / `_write_replay_compaction_state`)只要求
-    契約鍵,理由寫在那裡:`prune` 之後才變成受管鍵,舊安裝的設定照樣壓縮得
-    好好的。可是 replay 必經的 `_require_compaction_runtime` 拿的是完整的
-    `derived.config_values`(裡面有 `prune=True`)去逐鍵比對,於是同一份設定
-    前兩層放行、第三層在 replay 開始前就 SessionEvalError ——「相容舊設定」
-    等於沒做,而使用者自己把 `prune` 關掉也一樣開不起來。
+    def _fake_run(command, *, cwd, env, timeout):
+        if command and command[0] == "git":
+            return subprocess.CompletedProcess(command, 1, b"", b"")
+        commands.append(list(command))
+        payload = json.dumps(
+            {"type": "step_finish", "sessionID": "20260101T000000-abcdef01",
+             "part": {"type": "step-finish", "reason": "stop"}}
+        )
+        return subprocess.CompletedProcess(command, 0, payload.encode("utf-8"), b"")
 
-    runtime 那端的判準才是對的參考:plugin 只為 `CONTRACT_COMPACTION_KEYS`
-    停用自動壓縮(見 compaction_mode.effective_drift),`prune` 不符不會讓
-    這個 eval 量到「沒有壓縮」。
+    monkeypatch.setattr(session_eval_cli, "_bounded_run", _fake_run)
+    root = tmp_path / "project"
+    root.mkdir()
+    session_eval_cli._run_case(
+        {
+            "id": "c1",
+            "project_root": str(root),
+            "task_type": "qa",
+            "turns": [{"text": "只有一輪"}],
+            "verifier": {"oracle_kind": "manual", "checks": []},
+        },
+        model="llamacpp/m", env={}, timeout=30, keep_sessions=False,
+    )
+    assert "--persist" not in commands[0]
+
+
+@pytest.mark.smoke
+def test_the_state_digest_covers_the_ignored_paths(tmp_path):
+    """`.codetrail` / `knowledge.json` / `.aicode_uploads` 都在 .gitignore 裡。
+
+    只靠 git diff 偵測的話,唯讀 replay 最可能寫到的那三個地方剛好全部漏掉。
     """
-    import compaction_mode
+    root = tmp_path / "project"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    (root / ".gitignore").write_text(
+        ".codetrail/\nknowledge.json\n.aicode_uploads/\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.email=a@b", "-c", "user.name=x",
+         "commit", "-qm", "init"],
+        check=True,
+    )
+    paths = session_eval_cli._state_paths({})
+    assert set(session_eval_cli.DEFAULT_STATE_PATHS) <= set(paths)
 
-    derived = compaction_mode.derive_settings(context_limit=131072, output_limit=8192)
-    base = {
-        "provider": {"llamacpp": {"models": {
-            "candidate": {"limit": {"context": 131072, "output": 8192}},
-        }}},
-        "plugin": [],
-    }
-    absent = {
-        key: value for key, value in derived.config_values.items() if key != "prune"
-    }
-    disabled = {**derived.config_values, "prune": False}
-    for name, section in (("舊安裝沒有 prune", absent), ("使用者關掉 prune", disabled)):
-        config = json.loads(json.dumps(base))
-        config["compaction"] = dict(section)
-        kept = session_eval_cli._evaluation_config(
-            config, "llamacpp/candidate", keep_compaction=True
-        )
-        assert kept["compaction"] == section, name
-        state_dir = tmp_path / name.replace(" ", "_")
-        state_dir.mkdir()
-        config_path = state_dir / "opencode-eval.json"
-        config_path.write_text("{}", encoding="utf-8")
-        session_eval_cli._write_replay_compaction_state(state_dir, kept, config_path)
-        # replay 的必經之路 —— 前兩層放行的設定不得在這裡被擋下來
-        session_eval_cli._require_compaction_runtime(kept, "llamacpp/candidate", "1.18.21")
-
-    # 契約鍵仍然要擋:那幾個不符,plugin 第一次 idle 就停用自動壓縮。
-    broken = json.loads(json.dumps(base))
-    broken["compaction"] = {**derived.config_values, "tail_turns": 9}
-    with pytest.raises(session_eval.SessionEvalError, match="different model"):
-        session_eval_cli._require_compaction_runtime(
-            broken, "llamacpp/candidate", "1.18.21"
-        )
+    before = session_eval_cli.project_state_digest(root, paths)
+    (root / ".codetrail").mkdir()
+    (root / ".codetrail" / "context_metrics.jsonl").write_text("{}\n", encoding="utf-8")
+    assert session_eval_cli.project_state_digest(root, paths) != before
 
 
 @pytest.mark.smoke
-def test_compaction_identity_resolves_a_file_prompt(tmp_path: Path):
-    """同一個路徑下的 prompt 內容被換掉,fingerprint 必須跟著變。"""
-    prompt = tmp_path / "prompt.md"
-    prompt.write_text("A", encoding="utf-8")
-    config = {"agent": {"compaction": {"prompt": f"{{file:{prompt}}}"}}}
-    before = session_eval_cli._compaction_identity(config, False)
-    prompt.write_text("B", encoding="utf-8")
-    assert session_eval_cli._compaction_identity(config, False) != before
+def test_the_store_export_uses_the_role_shape_the_validator_reads():
+    """角色放在 `info.role`;頂層 `role` 會讓每一份匯出在第一則就被拒。"""
+    export = session_eval.export_from_store(
+        "20260101T000000-abcdef01",
+        [
+            {"type": "message", "role": "user", "content": "問題"},
+            {"type": "message", "role": "assistant", "content": "答案"},
+        ],
+    )
+    assert session_eval.validate_opencode_export(export) is export
+    assert export["messages"][0]["info"]["role"] == "user"
+    # raw export 是來源封存:助理回答留著(之後人工建 verifier 要用的證據)。
+    assert export["messages"][1]["parts"] == [{"type": "text", "text": "答案"}]
+    # 「歷史助理回答不得當 oracle」是挖掘層的契約:draft 只讀 user text。
+    draft = session_eval.draft_from_export(export)
+    assert "答案" not in json.dumps(draft, ensure_ascii=False)
+
+
+@pytest.mark.smoke
+def test_a_sanitized_export_strips_assistant_text_and_tool_output():
+    """`--sanitize` 是給要分享出去的那一份:助理文字與工具輸出拿掉,工具名留著。"""
+    records = [
+        {"type": "message", "role": "user", "content": "問題"},
+        {"type": "message", "role": "assistant", "content": None,
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"type": "message", "role": "tool", "tool_call_id": "c1", "name": "read_file",
+         "content": "SECRET FILE BODY", "tool_status": "completed"},
+        {"type": "message", "role": "assistant", "content": "答案 SECRET"},
+    ]
+    raw = session_eval.export_from_store("20260101T000000-abcdef01", records)
+    clean = session_eval.export_from_store("20260101T000000-abcdef01", records, sanitized=True)
+    assert "SECRET FILE BODY" in json.dumps(raw, ensure_ascii=False)
+    assert "SECRET" not in json.dumps(clean, ensure_ascii=False)
+    tools = [part["tool"] for message in clean["messages"] for part in message["parts"]
+             if part.get("type") == "tool"]
+    assert "read_file" in tools
+    assert session_eval.validate_opencode_export(clean) is clean
+
+
+# ── 總審第 1 輪回修:私人產物不得落進可追蹤路徑;例外路徑也要驗 project state ──
+
+@pytest.mark.smoke
+def test_private_eval_output_never_lands_in_a_tracked_repo_path(tmp_path):
+    """candidate answer / prompt / 盲測 key 指到 `<repo>/eval/` 就會進下一次 commit。"""
+    repo = session_eval_cli.REPO_ROOT
+    with pytest.raises(session_eval.SessionEvalError, match="tracked path"):
+        session_eval_cli._private_output_dir(repo / "eval" / "private-oops")
+    with pytest.raises(session_eval.SessionEvalError, match="tracked path"):
+        session_eval_cli._private_output_dir(repo)
+    assert session_eval_cli._private_output_dir(repo / ".codetrail" / "session_eval" / "x")
+    assert session_eval_cli._private_output_dir(tmp_path / "outside")
+
+
+@pytest.mark.smoke
+def test_the_state_digest_still_runs_when_the_replay_child_blows_up(monkeypatch, tmp_path):
+    """replay child 改了現場之後丟例外:最後一道防線要照樣跑,而且要講的是現場變了。"""
+    root = tmp_path / "project"
+    root.mkdir()
+
+    def _fake_run(command, *, cwd, env, timeout):
+        if command and command[0] == "git":
+            return subprocess.CompletedProcess(command, 1, b"", b"")
+        (root / "knowledge.json").write_text("{}", encoding="utf-8")   # 改到現場
+        raise RuntimeError("child exploded")
+
+    monkeypatch.setattr(session_eval_cli, "_bounded_run", _fake_run)
+    with pytest.raises(session_eval.SessionEvalError, match="project state changed"):
+        session_eval_cli._run_case(
+            {
+                "id": "c1", "project_root": str(root), "task_type": "qa",
+                "turns": [{"text": "q"}],
+                "verifier": {"oracle_kind": "manual", "checks": []},
+            },
+            model="llamacpp/m", env={}, timeout=30, keep_sessions=False,
+        )
+
+
+# ── checkpoint / resume 的四個綁定(suite digest、model fingerprint、case 順序、完成標記)──
+
+def _checkpoint_fixture(tmp_path: Path):
+    suite = _suite()
+    suite["cases"][0]["project_root"] = str(tmp_path)
+    second = json.loads(json.dumps(suite["cases"][0]))
+    second["id"] = "second_case"
+    second["source"]["session_hash"] = "fedcba9876543210"
+    second["source"]["export_digest"] = "2" * 64
+    suite["cases"].append(second)
+    candidate = {"label": "candidate_one", "model": "llamacpp/candidate", "fingerprint": "b" * 64}
+    completed_case = {
+        "case_id": "code_case",
+        "project_state_digest": "a" * 64,
+        "turns": [{"assistant_text": "answer", "terminal": True,
+                   "harness_error": False, "timed_out": False}],
+        "automatic_pass": True,
+        "cleanup_ok": True,
+    }
+    checkpoint = session_eval_cli._candidate_result_payload(suite, candidate, [completed_case])
+    session_eval.validate_candidate_result(checkpoint)
+    return suite, candidate, checkpoint
+
+
+@pytest.mark.smoke
+def test_resume_checkpoint_rejects_a_different_suite(monkeypatch, tmp_path: Path):
+    suite, candidate, checkpoint = _checkpoint_fixture(tmp_path)
+    suite["cases"][1]["turns"][0]["text"] = "改過的題目"          # suite digest 變了
+    with pytest.raises(session_eval.SessionEvalError, match="different suite"):
+        session_eval_cli._resume_cases(suite, candidate, checkpoint)
+
+
+@pytest.mark.smoke
+def test_resume_checkpoint_rejects_a_different_live_model(monkeypatch, tmp_path: Path):
+    suite, candidate, checkpoint = _checkpoint_fixture(tmp_path)
+    live = dict(candidate, fingerprint="c" * 64)
+    with pytest.raises(session_eval.SessionEvalError, match="fingerprint"):
+        session_eval_cli._resume_cases(suite, live, checkpoint)
+
+
+@pytest.mark.smoke
+def test_resume_checkpoint_rejects_a_reordered_suite(monkeypatch, tmp_path: Path):
+    suite, candidate, checkpoint = _checkpoint_fixture(tmp_path)
+    # suite 本身沒變(digest 相同),但 checkpoint 完成的是第二題而不是第一題:
+    # 已完成的集合不再是 suite 的有序前綴。
+    checkpoint["cases"][0]["case_id"] = "second_case"
+    with pytest.raises(session_eval.SessionEvalError, match="ordered suite prefix"):
+        session_eval_cli._resume_cases(suite, candidate, checkpoint)
+
+
+@pytest.mark.smoke
+def test_resume_checkpoint_rejects_an_inconsistent_completion_marker(monkeypatch, tmp_path: Path):
+    suite, candidate, checkpoint = _checkpoint_fixture(tmp_path)
+    checkpoint["aggregate"]["complete"] = True                     # 兩題只跑了一題卻說完成
+    with pytest.raises(session_eval.SessionEvalError, match="completion marker"):
+        session_eval_cli._resume_cases(suite, candidate, checkpoint)
+
+
+# ── 總審第 2 輪回修:raw export 是來源封存;private dir 每次都判 containment ──
+
+@pytest.mark.smoke
+def test_raw_export_keeps_the_original_conversation_across_a_compaction():
+    """append-only 檔裡原始對話都還在;compaction 記錄只是送模型那一份的起點,
+    遇到它不得把前段清掉(最後一筆是 compaction 時甚至會匯出空的)。"""
+    records = [
+        {"type": "message", "role": "user", "content": "第一問"},
+        {"type": "message", "role": "assistant", "content": None,
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "grep_code", "arguments": '{"pattern": "NDA"}'}}]},
+        {"type": "message", "role": "tool", "tool_call_id": "c1", "name": "grep_code",
+         "content": "hit: secret.c:3", "tool_status": "completed"},
+        {"type": "message", "role": "assistant", "content": "第一答"},
+        {"type": "compaction", "history": [{"role": "user", "content": "摘要", "synthetic": True}]},
+    ]
+    raw = session_eval.export_from_store("20260101T000000-abcdef01", records)
+    texts = json.dumps(raw, ensure_ascii=False)
+    assert "第一問" in texts and "第一答" in texts and "hit: secret.c:3" in texts
+    tool_parts = [p for m in raw["messages"] for p in m["parts"] if p.get("type") == "tool"]
+    assert any(p.get("id") == "c1" and p.get("arguments") == '{"pattern": "NDA"}' for p in tool_parts)
+    clean = session_eval.export_from_store("20260101T000000-abcdef01", records, sanitized=True)
+    assert '"pattern"' not in json.dumps(clean, ensure_ascii=False)
+    assert session_eval.validate_opencode_export(raw) is raw
+
+
+@pytest.mark.smoke
+def test_the_private_directory_guard_refuses_tracked_repo_paths_at_open_time(tmp_path):
+    repo = session_eval._REPO_ROOT
+    with pytest.raises(session_eval.SessionEvalError, match="not under"):
+        session_eval._private_directory(repo / "eval" / "private-oops")
+    with session_eval._private_directory(tmp_path / "outside") as private:
+        assert private.path.is_dir()
+
+
+# ── 總審第 3 輪回修(F3-9):routing eval 的 --model 要真的傳給逐題 client ──
+
+@pytest.mark.smoke
+def test_the_routing_client_attempt_sends_the_requested_model(monkeypatch, tmp_path):
+    """15 題逐題跑的 client 以前沒帶 --model:跑的是呼叫環境 AICODE_MODEL 那顆(或啟動失敗),
+    結果卻歸到指定模型的 identity。"""
+    seen: dict = {}
+
+    def _run(command, **kwargs):
+        seen["command"] = list(command)
+        seen["env"] = dict(kwargs["env"])
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(routing.subprocess, "run", _run)
+    routing._run_client_attempt(
+        project=tmp_path, prompt="which tool?", model="llamacpp/expected-model",
+        environment={"AICODE_MODEL": "different-model", "PATH": os.environ.get("PATH", "")},
+        timeout_seconds=5,
+    )
+    command = seen["command"]
+    # 送的是客戶端真正用的 bare name:直接執行的 codetrail_chat.py 不會剝 llamacpp/。
+    assert command[command.index("--model") + 1] == "expected-model"
+    assert command.index("--model") < command.index("run")
+    assert seen["env"]["AICODE_MODEL"] == "expected-model"
+
+
+@pytest.mark.smoke
+def test_routing_probes_accept_the_same_model_forms_as_aicode():
+    """`--model` 收 bare registry name / GGUF 路徑(同 `aicode -m`);舊式 llamacpp/ 仍接受,
+    外部 provider 拒絕。以前 bare name 在連模型前就被 provider/model 語法檢查擋掉。"""
+    for form in ("expected-model", "llamacpp/expected-model", "/models/foo.gguf"):
+        assert routing._model_server_base_url({}, model=form, environment={}) == "http://localhost:8080"
+    with pytest.raises(routing.EvalError):
+        routing._model_server_base_url({}, model="openai/gpt-4o", environment={})
+
+
+@pytest.mark.smoke
+def test_session_eval_accepts_bare_gguf_and_legacy_models():
+    """`--model` 依 help 傳 bare name 以前直接 IndexError;GGUF 絕對路徑被 split 砍成相對路徑。"""
+    assert session_eval_cli.bare_model("qwen3-coder-30b") == "qwen3-coder-30b"
+    assert session_eval_cli.bare_model("llamacpp/qwen3-coder-30b") == "qwen3-coder-30b"
+    assert session_eval_cli.bare_model("/models/foo.gguf") == "/models/foo.gguf"
+    with pytest.raises(session_eval.SessionEvalError):
+        session_eval_cli.bare_model("openai/gpt-4o")
+
+
+@pytest.mark.smoke
+def test_every_direct_model_request_in_the_routing_eval_uses_the_normalised_model():
+    """routing eval 實際打到 llama-server 的每個 request(base_url probe、catalog token probe、
+    canary、逐題 client)都要用正規化後的 bare name;result identity 的 selected_model 才保留
+    使用者原字串。以前 legacy `llamacpp/x` 只有逐題 client 正規化,直接 probe 的 payload 仍是原字串。"""
+    import inspect
+
+    source = inspect.getsource(routing)
+    start = source.index("    probe_model = _bare_model(configured_model)")
+    region = source[start:source.index("\ndef ", start)]
+    assert "model=args.model," not in region
+    assert region.count("model=configured_model,") == region.count("selected_model=configured_model,")
+    assert region.count("model=probe_model,") >= 4        # base_url、token probe、canary、逐題 client

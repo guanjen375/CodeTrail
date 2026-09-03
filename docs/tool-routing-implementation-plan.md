@@ -1,5 +1,15 @@
 # MCP 工具使用可靠性：實作切分與介面凍結
 
+> **這是一份歷史規劃文件(OpenCode 時代)。** 它記錄的是 2026-08 那次工具可靠性
+> 施工的開工契約與驗收條件,不是現在的架構。當時的前端是 OpenCode,所以文中的
+> `scripts/opencode_*.py`、build prompt、direct-tool 相容閘與 `opencode.json` 都
+> **已經不存在**;去 OpenCode 化之後,對應的東西是 `client_prompt`(system prompt)、
+> `mcp_contract`(工具目錄與 routing 指示)與 `client_policy`(核准閘)。
+>
+> 保留它是因為裡面的量測結論與介面凍結決定仍然成立(`eval/fixtures/tool_routing/`
+> 那一列 opencode 世代的 row 就是這次量的);要看**現在**怎麼運作,請讀
+> [docs/setup.md](setup.md) 與 [docs/security.md](security.md)。
+
 本文件是 `/home/david/workflow.md` 的開工契約。它只定義子任務邊界、對外介面、
 驗收條件與審核流程；規劃 commit 完成前不修改產品程式碼。
 
@@ -107,11 +117,11 @@ partial/error/truncated 才有第二行 `next:`。錯誤修復指引不得只存
 
 ### OpenCode build prompt
 
-新增 `scripts/opencode_build_prompt.py` 與 `docs/opencode-build-prompt.md`，提供：
+新增 `scripts/opencode_build_prompt.py` 與 `README.md`，提供：
 
 ```python
 BUILD_PROMPT_MAX_CHARS = 1500
-BUILD_PROMPT_RELATIVE_PATH = Path(".config/codetrail/opencode-build-prompt.md")
+BUILD_PROMPT_RELATIVE_PATH = Path(".config/codetrail/../README.md")
 def extract_build_prompt(text: str) -> str: ...
 def build_prompt_path(home: Path) -> Path: ...
 def build_prompt_reference(path: Path) -> str: ...
@@ -165,7 +175,7 @@ class ImplicitEvidence:
 ```
 
 explicit timeout 預設 120 秒，仍要求 completed
-`codetrail_list_dir(path=".", depth=1)`，失敗硬擋；可重試一次，第二次成功仍為 flaky 且
+`list_dir(path=".", depth=1)`，失敗硬擋；可重試一次，第二次成功仍為 flaky 且
 不快取。implicit timeout 預設 180 秒，只跑一次，prompt 不含工具名；完成 list_dir 且
 path 為 `.`／空字串／`./` 是 optimal，其他明確 allowlist 的唯讀 CodeTrail tool 是
 suboptimal，否則 fail；suboptimal/fail/timeout 只警告。
@@ -248,7 +258,7 @@ Ownership：
 
 Ownership：
 
-- `docs/opencode-build-prompt.md`（新增）
+- `README.md`（新增）
 - `scripts/opencode_build_prompt.py`（新增）
 - `scripts/set_config.py`
 - `scripts/opencode_contract_check.py`
@@ -258,7 +268,7 @@ Ownership：
 驗收：
 
 1. canonical prompt ≤1,500 chars，保留簡潔回答、平行唯讀查詢、先查再改、無證據拒答；
-   不教授 bare bash/read/grep/glob/edit/task，且不誤傷 `codetrail_read_file` 等 schema 名。
+   不教授 bare bash/read/grep/glob/edit/task，且不誤傷 `read_file` 等 schema 名。
 2. 新裝、重跑、custom prompt、型別錯誤、symlink、permission 與 transaction 行為明確。
 3. synthetic request log 證明 build prompt 取代而非附加 OpenCode default prompt。
 4. `tests/test_opencode_checks.py::test_build_prompt_never_teaches_denied_tools` 標 smoke。
@@ -299,7 +309,7 @@ Ownership：
 - `docs/basic-usage.md`
 - `docs/troubleshooting.md`
 - `docs/security.md`
-- `docs/opencode-agents-template.md`（只改 fenced block 外 manifest/說明）
+- `README.md`（只改 fenced block 外 manifest/說明）
 - `tests/test_repo_consistency.py`（只新增 assertion，既有 assertion 不動）
 - `tests/test_smoke_gate.py`（精確登記本次新增的安全/契約 smoke nodes）
 

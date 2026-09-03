@@ -12,7 +12,7 @@
   * 「沒有狀態檔 = 沒有接管」的 fail-closed 預設 —— 弄反的話舊安裝
     git pull 之後會突然多一個壓縮 plugin。
 
-`aicode` 啟動橫幅那一行「目前壓縮模式」(scripts/compaction_status.py)也在這裡
+`aicode` 啟動橫幅那一行「目前壓縮模式」(client_status.py,經 codetrail_chat.py status)也在這裡
 (原 tests/test_compaction_status.py),同樣只寫會靜默失敗的東西:
 
   * **顯示的模式必須來自 runtime 用的同一份狀態**(`compaction_mode.inspect_state`)。
@@ -38,7 +38,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import compaction_mode as cm  # noqa: E402
-from scripts import compaction_status as status  # noqa: E402
 
 pytestmark = pytest.mark.smoke
 
@@ -558,22 +557,6 @@ def test_plugin_entry_recognises_the_file_url_form(tmp_path):
     assert not changes
 
 
-def test_plugin_local_path_matches_the_contract_check_normaliser(tmp_path):
-    """兩個 writer 對「同一個 plugin 檔」的判準必須一致。"""
-    from scripts import opencode_contract_check as occ
-
-    cases = [
-        "/abs/path/plugin.js",
-        "file:///abs/path/plugin.js",
-        "file://localhost/abs/path/plugin.js",
-        "file://remote/abs/path/plugin.js",
-        "npm:some-plugin",
-        "https://example.invalid/p.js",
-        "relative/plugin.js",
-        "~/plugin.js",
-    ]
-    for case in cases:
-        assert cm.plugin_local_path(case) == occ._plugin_local_path(case), case
 
 
 @pytest.mark.parametrize(
@@ -1013,86 +996,20 @@ def _takeover(tmp_path: Path, mode: str) -> tuple[Path, dict]:
     return config_path, env
 
 
-def test_no_state_reads_as_untouched_native(tmp_path):
-    """沒有狀態檔 = 沒有接管。不能報成問題,也不能猜一個模式出來。"""
-    home = tmp_path / "home"
-    home.mkdir()
-    lines = status.status_lines({"HOME": str(home), "USERPROFILE": str(home)})
-    assert len(lines) == 1
-    assert "native" in lines[0] and "未接管" in lines[0]
-    assert cm.EXPERIMENTAL_TAG not in lines[0]
 
 
-def test_a_takeover_shows_the_mode_and_the_experimental_tag(tmp_path):
-    _, env = _takeover(tmp_path, cm.MODE_CODETRAIL)
-    lines = status.status_lines(env)
-    assert cm.MODE_CODETRAIL in lines[0]
-    assert cm.EXPERIMENTAL_TAG in lines[0]
-    # 還原的那行命令要在畫面上,不是只在文件裡。
-    assert any("--compaction-mode native" in line for line in lines)
 
 
-def test_native_state_is_not_marked_experimental(tmp_path):
-    """明確選了 native 就是原本的行為 —— 標成實驗功能會勸退正確的選擇。"""
-    _, env = _takeover(tmp_path, cm.MODE_NATIVE)
-    lines = status.status_lines(env)
-    assert lines[0].startswith(f"壓縮模式={cm.MODE_NATIVE}")
-    assert cm.EXPERIMENTAL_TAG not in "\n".join(lines)
 
 
-def test_an_ignored_state_file_never_shows_a_stale_mode(tmp_path):
-    """狀態檔不可信時 runtime 也是「沒有接管」,顯示要跟它同一個判準。"""
-    _, env = _takeover(tmp_path, cm.MODE_CODETRAIL)
-    state_file = Path(env["HOME"]) / ".config" / "codetrail" / "compaction.json"
-    state_file.chmod(0o644)          # world-readable → inspect_state 拒收
-    lines = status.status_lines(env)
-    assert cm.MODE_CODETRAIL not in "\n".join(lines)
-    assert "未接管" in lines[0]
 
 
-def test_drift_is_disclosed_next_to_the_mode(tmp_path):
-    """有效設定跟模式對不上時 plugin 會停用自動壓縮;只印模式等於報喜不報憂。"""
-    config_path, env = _takeover(tmp_path, cm.MODE_CODETRAIL)
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    config["compaction"]["auto"] = True          # 使用者/專案設定改回去了
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-    lines = status.status_lines(env)
-    assert any("不一致" in line for line in lines)
 
 
-def test_the_threshold_is_shown_next_to_the_mode(tmp_path):
-    """只印模式的話,使用者分不出「還沒到門檻」與「plugin 根本沒載入」。"""
-    config_path, env = _takeover(tmp_path, cm.MODE_CODETRAIL)
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    config["model"] = "llamacpp/big"
-    config["provider"] = {
-        "llamacpp": {"models": {"big": {"limit": {"context": 131072, "output": 8192}}}}
-    }
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-    derived, _ = cm.derive_for_config(config)
-    lines = status.status_lines(env)
-    assert any(str(derived.idle_threshold) in line for line in lines), lines
 
 
-def test_manual_mode_says_compact_only_works_in_the_full_tui(tmp_path):
-    """`/compact` 在 --mini 會被當成一般訊息送給模型(模型還會說「好的」),
-    在 `opencode run` 則是 Command not found —— 兩種都像成功了。"""
-    _, env = _takeover(tmp_path, cm.MODE_MANUAL)
-    lines = status.status_lines(env)
-    assert any("/compact" in line and "TUI" in line for line in lines), lines
 
 
-def test_an_unreadable_state_never_blocks_the_banner(monkeypatch, tmp_path):
-    """讀狀態爆炸也只是少一行資訊 —— exit 0,而且仍然說得出「原生行為」。"""
-    def boom(*args, **kwargs):
-        raise OSError("state file exploded")
-
-    monkeypatch.setattr(cm, "inspect_state", boom)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("USERPROFILE", str(tmp_path))
-    assert status.main([]) == 0
-    lines = status.status_lines()
-    assert len(lines) == 1 and "native" in lines[0]
 
 
 def test_render_indents_continuation_lines_under_the_prefix():
@@ -1102,27 +1019,80 @@ def test_render_indents_continuation_lines_under_the_prefix():
     assert out[1] == " " * len("[aicode] ") + "第二行"
 
 
-def test_aicode_prints_the_mode_without_letting_it_block_startup():
-    """靜態契約:aicode 得真的印這一行,而且不得把它變成一道閘。"""
-    source = (REPO_ROOT / "aicode").read_text(encoding="utf-8")
-    call = source.index('"$PYBIN" "$COMPACTION_STATUS" --prefix')
-    assert "|| true" in source[call:source.index("\n", call)]
-    # 兩條真正的啟動路徑(standalone TUI 與 web backend)之前都要印得到;
-    # `attach` 是薄 client,在整段 preflight 之前就 exec,本來就沒有橫幅。
-    assert call < source.index('exec opencode "${OPENCODE_ARGS[@]}"')
-    assert call < source.index("exec opencode web --port")
 
 
-def test_the_experimental_marker_is_still_in_the_wizard_and_the_docs():
-    """拿掉「實驗中」是一次全域決定,不是改其中一處就算數。"""
-    wizard = (REPO_ROOT / "scripts" / "set_config.py").read_text(encoding="utf-8")
-    assert "EXPERIMENTAL_NOTICE" in wizard and "mode_tag" in wizard
-    # 整份都在講壓縮的那一份只要有標示就好。
-    rules = (REPO_ROOT / "docs" / "compaction-rules.md").read_text(encoding="utf-8")
-    assert "🧪" in rules, "docs/compaction-rules.md 少了還在測試階段的標示"
-    # 其餘文件講很多題目,只數整份的 🧪 太寬鬆(web 模式等別的實驗功能也有):
-    # 要求它出現在講壓縮的那一行上。
-    for doc in ("README.md", "docs/setup.md"):
-        lines = (REPO_ROOT / doc).read_text(encoding="utf-8").splitlines()
-        marked = [line for line in lines if "壓縮" in line and "🧪" in line]
-        assert marked, f"{doc} 講壓縮模式的地方少了還在測試階段的標示"
+
+
+# ============================================================
+# 客戶端的壓縮狀態行(client_status.py;原 scripts/compaction_status.py)
+# ============================================================
+# 這一行是資訊,不是閘:任何讀取問題都必須 exit 0 並退成「未接管」。
+# 顯示的模式必須來自 runtime 用的同一份設定(client.json)——印 codetrail 而實際
+# 上沒接管(或反過來)比不印還糟。
+
+import client_status as status  # noqa: E402
+
+
+@pytest.mark.smoke
+def test_no_client_config_reads_as_untouched(tmp_path):
+    lines = status.status_lines({"HOME": str(tmp_path)})
+    assert "壓縮模式=manual" in lines[0]
+    assert "未接管" in lines[0]
+
+
+@pytest.mark.smoke
+def test_a_takeover_shows_the_mode_and_the_experimental_tag(tmp_path):
+    import client_config
+
+    path = client_config.config_path({"HOME": str(tmp_path)})
+    path.parent.mkdir(parents=True)
+    path.write_text('{"schema": 1, "compaction_mode": "codetrail", "permission": {}}',
+                    encoding="utf-8")
+    path.chmod(0o600)
+    lines = status.status_lines({"HOME": str(tmp_path), "AICODE_N_CTX": "131072"})
+    assert "壓縮模式=codetrail" in lines[0]
+    assert "🧪" in lines[0]
+    assert any("idle 門檻=" in line for line in lines)
+
+
+@pytest.mark.smoke
+def test_an_unreadable_config_never_shows_a_stale_mode(tmp_path):
+    import client_config
+
+    path = client_config.config_path({"HOME": str(tmp_path)})
+    path.parent.mkdir(parents=True)
+    path.write_text('{"schema": 1, "compaction_mode": "codetrail"}', encoding="utf-8")
+    path.chmod(0o644)                       # 權限過寬 → runtime 也起不來
+    lines = status.status_lines({"HOME": str(tmp_path)})
+    assert "不可信" in lines[0]
+    assert "壓縮模式=codetrail" not in lines[0]
+
+
+@pytest.mark.smoke
+def test_a_context_too_small_is_disclosed_next_to_the_mode(tmp_path):
+    import client_config
+
+    path = client_config.config_path({"HOME": str(tmp_path)})
+    path.parent.mkdir(parents=True)
+    path.write_text('{"schema": 1, "compaction_mode": "codetrail", "permission": {}}',
+                    encoding="utf-8")
+    path.chmod(0o600)
+    lines = status.status_lines({"HOME": str(tmp_path), "AICODE_N_CTX": "8192"})
+    assert any("推不出可用的壓縮門檻" in line for line in lines)
+
+
+@pytest.mark.smoke
+def test_the_status_line_never_raises(tmp_path):
+    """讀取問題不得變成新的失敗來源。"""
+    assert status.status_lines({})
+    assert status.main(["--prefix", "[aicode]"]) == 0
+
+
+@pytest.mark.smoke
+def test_the_reasoning_line_says_what_the_client_will_actually_do(tmp_path):
+    on = status.status_lines({"HOME": str(tmp_path)})
+    assert any("舊回合 reasoning=不進模型" in line for line in on)
+    off = status.status_lines(
+        {"HOME": str(tmp_path), status.KEEP_REASONING_ENV: "1"}
+    )
+    assert any("舊回合 reasoning=保留" in line for line in off)

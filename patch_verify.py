@@ -3,7 +3,7 @@
 """patch_verify — apply_patch 套用後的自動驗證:同 process、無 subprocess、唯讀的 syntax check。
 
 為什麼只做 syntax(workflow C):
-  OpenCode 把 codetrail_apply_patch、codetrail_run_lint、codetrail_run_command 分成三個
+  客戶端把 apply_patch、run_lint、run_command 分成三個
   獨立的 ask 核准閘。舊版 verifier 在 apply_patch 內自動跑 run_lint(fix=True)、mypy、
   猜測式 pytest——使用者只核准了「寫檔」,卻同時執行了 target repo 的程式碼(pytest
   plugin、conftest.py、build script),等於把寫檔核准暗中擴張成命令執行核准。
@@ -53,8 +53,8 @@ TITLE_DISABLED = TITLE_INCOMPLETE_FMT.format(
     detail="auto verification disabled, PATCH_AUTO_VERIFY=False"
 )
 NEXT_STEPS_HINT = (
-    "建議下一步: 對改過的檔案呼叫 codetrail_run_lint(fix=False) 做 lint 檢查；"
-    "codetrail_run_command(\"pytest ...\") 跑相關測試（各需獨立核准；apply_patch 不代跑）"
+    "建議下一步: 對改過的檔案呼叫 run_lint(fix=False) 做 lint 檢查；"
+    "run_command(\"pytest ...\") 跑相關測試（各需獨立核准；apply_patch 不代跑）"
 )
 
 
@@ -249,7 +249,7 @@ def verify_files(rel_paths: Iterable[str], steps: Iterable[str], *,
                 elif step in LEGACY_STEPS:
                     results.append(StepResult(step, rel, "skipped", reason=(
                         f"step '{step}' is no longer consumed by apply_patch; "
-                        "call codetrail_run_lint(fix=False) / codetrail_run_command explicitly"
+                        "call run_lint(fix=False) / run_command explicitly"
                     )))
                 else:
                     results.append(StepResult(

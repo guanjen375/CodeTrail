@@ -440,16 +440,21 @@ def test_incident_detail_slugs_match_the_frozen_cross_language_set():
     ]
 
 
-def test_incident_writer_is_not_public_api():
-    """`_record_incident` / `_hash_session` 是**寫入格式的定義**,不是公開 API。
+def test_the_incident_writer_is_the_python_one_and_session_hashing_stays_private():
+    """`record_incident` 現在是**正式寫入端**;`_hash_session` 仍然是私有。
 
-    正式寫入端是 T3 的 OpenCode plugin(JS)。留一個公開的 Python 寫入函式,
-    rotation / privacy 這幾條測試就會變成在驗一條沒有人走的路徑,而真正會
-    寫檔的那一端(JS)一個字都沒被測到——綠燈與正確性徹底脫鉤。
+    以前這條測試要求 `record_incident` **不得**是公開 API:那時唯一會寫
+    incident 的是 OpenCode 的 JS plugin,Python 這一份只是格式定義,公開它會
+    讓 rotation / privacy 那幾條測試變成在驗一條沒有人走的路徑。CodeTrail 自
+    己的聊天客戶端接手之後,假工具呼叫與壓縮停用都由 Python 偵測與記錄,所
+    以「Python 不寫 incident」這個前提本身已經不成立——繼續禁止公開名稱只會
+    逼呼叫端去碰底線開頭的函式。
+
+    `_hash_session` 仍然保持私有:它是零內容契約的一部分,不是給呼叫端用的。
     """
-    assert not hasattr(mcp_lease, "record_incident")
+    assert callable(mcp_lease.record_incident)
+    assert mcp_lease._record_incident is mcp_lease.record_incident
     assert not hasattr(mcp_lease, "hash_session")
-    assert callable(mcp_lease._record_incident)
     assert callable(mcp_lease._hash_session)
 
 
@@ -892,3 +897,23 @@ def test_live_server_spawners_never_write_into_the_user_state_dir():
             f"{filename}::{func_name} 沒有把 XDG_STATE_HOME 導到 tmp;"
             "起一個 server 就會在使用者的 state 目錄留下 lease"
         )
+
+
+@pytest.mark.smoke
+def test_the_ready_marker_is_printed_only_after_the_lease_and_signal_handlers_are_armed():
+    """「server ready」必須是**最後**一件事:lease 已寫、SIGTERM handler 已裝。
+
+    順序反過來的話,supervisor / 測試看到 marker 就送 SIGTERM,信號落在 marker 與
+    `open_lease()` / `signal.signal()` 之間時,預設的 SIGTERM 直接結束行程 —— 沒有
+    lease、沒有收屍、`finally` 一行都不跑。這是平行分片下才露出來的競態
+    (`test_sigterm_still_runs_the_shutdown_cleanup` 偶發紅燈),所以用靜態順序釘住。
+    """
+    source = (Path(__file__).resolve().parent.parent / "mcp_server.py").read_text(
+        encoding="utf-8"
+    )
+    main_block = source[source.index('if __name__ == "__main__":'):]
+    ready = main_block.index("server ready, listening on stdio")
+    lease = main_block.index("mcp_lease.open_lease()")
+    handlers = main_block.index("signal.signal(_sig, _exit_on_terminating_signal)")
+    assert lease < ready, "open_lease() 必須在 ready marker 之前"
+    assert handlers < ready, "SIGTERM handler 必須在 ready marker 之前裝好"

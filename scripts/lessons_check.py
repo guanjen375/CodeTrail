@@ -4,10 +4,9 @@
 做三件事:
   1. 載入 per-deployment 的 lessons store(~/.config/codetrail/lessons.json)。
   2. 把「scope 相符且未過 review_by」的 active lessons render 成
-     <AICODE_ROOT>/.codetrail/lessons.md —— OpenCode 經 opencode.json 的
-     "instructions": [".codetrail/lessons.md"] 把它跟 AGENTS.md 一起載入
-     context(set_config.sh 會補這個欄位)。沒有 active lessons 也會寫檔
-     (內容標明為空),避免 instructions 指到不存在的檔案。
+     <AICODE_ROOT>/.codetrail/lessons.md —— 客戶端把它跟專案 AGENTS.md 一起
+     接進 system prompt(見 client_prompt.py)。沒有 active lessons 也會寫檔
+     (內容標明為空),讓「有沒有注入」看得出來。
   3. 已過 review_by 的 lessons 停止注入,並在這裡醒目列出待複審清單
      (renew / delete 指令)。
 
@@ -18,10 +17,10 @@
     AICODE_LESSONS_FILE    lessons.json 覆寫路徑(測試 / 進階)
     AICODE_LESSONS_SKIP    =1 時跳過注入(緊急逃生;不 render、不提示,
                            並移除先前 render 的 lessons.md,避免舊規則殘留)
-    OPENCODE_DISABLE_PROJECT_CONFIG
-                           非空時(比照 OpenCode 的 JS truthiness,含 "0")
-                           OpenCode 不載入專案內 instructions:render 了也
-                           不會進 context,所以這裡不寫檔、明講不注入,
+    CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS
+                           非空時(比照舊的 JS truthiness,含 "0")
+                           客戶端不載入專案內 instructions:render 了也
+                           不會進 system prompt,所以這裡不寫檔、明講不注入,
                            並一樣移除殘留檔。
 
 退出碼:
@@ -35,7 +34,7 @@
 - 過期 → 停止注入 + 醒目提示,但不擋啟動:過期是時間自然發生的,
   不是使用者設定錯誤,擋下來等於懲罰沒天天複審的人。
 - 「說有注入就必須真的有」:任何不會注入的路徑(SKIP / 安全模式)都要
-  明講,並把舊 render 檔清掉,不讓 OpenCode 載到上個 session 的規則。
+  明講,並把舊 render 檔清掉,不讓客戶端載到上個 session 的規則。
 """
 from __future__ import annotations
 
@@ -58,7 +57,7 @@ def _print(line: str) -> None:
 def _drop_stale_context(root_arg: str) -> None:
     """SKIP / 安全模式:移除先前 render 的 lessons.md(best-effort)。
 
-    不移除的話,全域 opencode.json 的 instructions 仍指著舊檔,上一個
+    不移除的話,客戶端組 system prompt 時仍會讀到舊檔,上一個
     session 的規則會在「已跳過」的 session 裡繼續被載入。這條路是緊急
     逃生口,所以失敗只 WARN 不擋啟動。
     """
@@ -73,7 +72,7 @@ def _drop_stale_context(root_arg: str) -> None:
             _print(f"已移除先前 render 的 {lessons.LESSONS_CONTEXT_RELPATH}(避免舊規則被注入)")
     except (lessons.LessonsError, OSError) as exc:
         _print(f"WARN: 無法移除舊的 {lessons.LESSONS_CONTEXT_RELPATH}: {exc}")
-        _print("WARN: 若該檔仍被 OpenCode 載入,上個 session 的 lessons 可能繼續生效。")
+        _print("WARN: 若該檔仍在,上個 session 的 lessons 可能繼續進 system prompt。")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -86,11 +85,11 @@ def main(argv: list[str] | None = None) -> int:
         _drop_stale_context(args.root)
         return 0
 
-    # OpenCode 對這個 env 是 JS truthiness:任何非空字串(含 "0")都算開啟。
-    # 開啟時 OpenCode 從全域設定目錄解析相對 instructions,不讀專案目錄,
+    # 這個 env 沿用 JS truthiness:任何非空字串(含 "0")都算開啟。
+    # 開啟時客戶端不讀專案內的 AGENTS.md 與 lessons.md,
     # render 了也不會進 context —— 這裡不寫檔(不動不信任的 repo)並明講。
-    if os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG"):
-        _print("OPENCODE_DISABLE_PROJECT_CONFIG 生效:OpenCode 此模式不載入專案內 instructions,")
+    if os.environ.get("CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS"):
+        _print("CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS 生效:客戶端不載入專案內 instructions,")
         _print("lessons 本 session 不注入(安全模式;不讀 store、不寫入這個 repo)。")
         _drop_stale_context(args.root)
         return 0

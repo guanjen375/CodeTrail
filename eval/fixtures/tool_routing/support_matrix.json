@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "gates": {
     "explicit_canary_min": 1.0,
     "structured_call_success_min": 1.0,
@@ -17,33 +17,44 @@
   },
   "arms": {
     "baseline": {
-      "description": "Effective pre-change OpenCode and MCP configuration",
-      "contract_digest": "419f98859663b3e3d6b0cfe4059d1cc94c3375930236b3e5f149dbf2ca5f447b"
+      "description": "Effective pre-change OpenCode and MCP configuration(OpenCode 時代的歷史量測;現在的客戶端沒有這個組態)",
+      "contract_digest": "419f98859663b3e3d6b0cfe4059d1cc94c3375930236b3e5f149dbf2ca5f447b",
+      "era": "opencode"
     },
     "schema_only": {
-      "description": "Typed current schemas with historical raw tool docstrings, no MCP instructions or build prompt",
-      "contract_digest": "3c341835c15f29ea783f29a73b98fa4a168c34e0ab73aee0dd1560777aadf994"
+      "description": "Typed current schemas with historical raw tool docstrings, no MCP instructions or build prompt(OpenCode 時代的歷史量測;現在的客戶端沒有這個組態)",
+      "contract_digest": "3c341835c15f29ea783f29a73b98fa4a168c34e0ab73aee0dd1560777aadf994",
+      "era": "opencode"
     },
     "schema_plus_mcp_instructions": {
-      "description": "Schema-only parent plus compact FastMCP routing instructions",
-      "contract_digest": "dae3fe185a5c8a7d088d0d855c377d10d4e4e7cea6c4ba765509a7d378637e10"
+      "description": "Schema-only parent plus compact FastMCP routing instructions(OpenCode 時代的歷史量測;現在的客戶端沒有這個組態)",
+      "contract_digest": "dae3fe185a5c8a7d088d0d855c377d10d4e4e7cea6c4ba765509a7d378637e10",
+      "era": "opencode"
     },
     "schema_instructions_build_prompt": {
-      "description": "Instructions parent plus the managed CodeTrail build prompt, retaining raw tool docstrings",
-      "contract_digest": "6043aa29b911410964c208dcb6b53a89b2188a8be10740b6f1a3b9a63d64d63c"
+      "description": "Instructions parent plus the managed CodeTrail build prompt, retaining raw tool docstrings(OpenCode 時代的歷史量測;現在的客戶端沒有這個組態)",
+      "contract_digest": "6043aa29b911410964c208dcb6b53a89b2188a8be10740b6f1a3b9a63d64d63c",
+      "era": "opencode"
     },
     "schema_instructions_build_prompt_todowrite_deny": {
-      "description": "Build-prompt arm with todowrite denied for an isolated decision",
-      "contract_digest": "7bf07fb4b393ee3f77fd9d7d299ce60cbbee97db87e5177f8979f331cb4ada13"
+      "description": "Build-prompt arm with todowrite denied for an isolated decision(OpenCode 時代的歷史量測;現在的客戶端沒有這個組態)",
+      "contract_digest": "7bf07fb4b393ee3f77fd9d7d299ce60cbbee97db87e5177f8979f331cb4ada13",
+      "era": "opencode"
     },
     "english_descriptions": {
-      "description": "Build-prompt parent with compact English machine-level descriptions as the only contract delta",
-      "contract_digest": "415ced76d02e329e81c50d67f88e907303668998677b75f87ad497f593443879"
+      "description": "Build-prompt parent with compact English machine-level descriptions as the only contract delta(OpenCode 時代的歷史量測;現在的客戶端沒有這個組態)",
+      "contract_digest": "415ced76d02e329e81c50d67f88e907303668998677b75f87ad497f593443879",
+      "era": "opencode"
+    },
+    "client_baseline": {
+      "description": "CodeTrail 自家客戶端的現行契約:typed schema + MCP instructions + BASE_RULES + 六個 ask 工具",
+      "era": "client",
+      "contract_digest": "b11afcdc37c41deceb81deb797fa135a093ad8bb4fccb958e8978a58b743d34d"
     }
   },
   "rows": [
     {
-      "id": "deepseek-v4-flash-ud-q8-k-xl__unsloth__opencode-1.18.21",
+      "id": "deepseek-v4-flash-ud-q8-k-xl__unsloth__opencode-1-18-21-historical",
       "status": "measured",
       "compatibility": {
         "model_family": "DeepSeek-V4-Flash",
@@ -64,11 +75,11 @@
         },
         "chat_template_caps_digest": "2a455e088c6b4055cf6987d4392828d31390e5dcaaca6f849648f24906127274",
         "n_ctx": 131072,
-        "opencode_version": "1.18.21",
         "llama_cpp_build_digest": "23e7bacc54bf7eb8fb730bedc22f92e73028dd58c379a769fd167cf79bfe3b4f",
         "effective_config_digest": null,
         "global_agents_digest": "37cddfd0d6b9e67d3a3947bb64dad91e4e366393f9219221dc003cafa3e73ed6",
-        "fixture_digest": "2dc61d5c866e9c9aac1757452db09a6495ccdaa6e0ae22073fc8c32e4471f20a"
+        "fixture_digest": "2dc61d5c866e9c9aac1757452db09a6495ccdaa6e0ae22073fc8c32e4471f20a",
+        "client_version": "1.18.21"
       },
       "arms": [
         "baseline",
@@ -115,25 +126,120 @@
             "run_command"
           ],
           "per_tool": [
-            {"name": "query_knowledge", "description_chars": 960, "input_schema_chars": 247, "output_schema_chars": 0},
-            {"name": "query_knowledge_strict", "description_chars": 1731, "input_schema_chars": 254, "output_schema_chars": 0},
-            {"name": "code_rag_search", "description_chars": 3207, "input_schema_chars": 528, "output_schema_chars": 199},
-            {"name": "read_file", "description_chars": 597, "input_schema_chars": 380, "output_schema_chars": 135},
-            {"name": "grep_code", "description_chars": 462, "input_schema_chars": 398, "output_schema_chars": 135},
-            {"name": "list_dir", "description_chars": 600, "input_schema_chars": 261, "output_schema_chars": 134},
-            {"name": "apply_patch", "description_chars": 2161, "input_schema_chars": 204, "output_schema_chars": 137},
-            {"name": "file_info", "description_chars": 258, "input_schema_chars": 132, "output_schema_chars": 135},
-            {"name": "git_status", "description_chars": 236, "input_schema_chars": 68, "output_schema_chars": 136},
-            {"name": "git_diff", "description_chars": 275, "input_schema_chars": 225, "output_schema_chars": 134},
-            {"name": "run_lint", "description_chars": 495, "input_schema_chars": 192, "output_schema_chars": 134},
-            {"name": "import_external_file", "description_chars": 644, "input_schema_chars": 246, "output_schema_chars": 146},
-            {"name": "analyze_file", "description_chars": 2424, "input_schema_chars": 359, "output_schema_chars": 138},
-            {"name": "ingest_document", "description_chars": 4606, "input_schema_chars": 352, "output_schema_chars": 141},
-            {"name": "remove_document", "description_chars": 667, "input_schema_chars": 144, "output_schema_chars": 141},
-            {"name": "review_figures", "description_chars": 4372, "input_schema_chars": 542, "output_schema_chars": 140},
-            {"name": "reload_knowledge_base", "description_chars": 321, "input_schema_chars": 79, "output_schema_chars": 147},
-            {"name": "record_lesson", "description_chars": 979, "input_schema_chars": 205, "output_schema_chars": 139},
-            {"name": "run_command", "description_chars": 852, "input_schema_chars": 228, "output_schema_chars": 137}
+            {
+              "name": "query_knowledge",
+              "description_chars": 960,
+              "input_schema_chars": 247,
+              "output_schema_chars": 0
+            },
+            {
+              "name": "query_knowledge_strict",
+              "description_chars": 1731,
+              "input_schema_chars": 254,
+              "output_schema_chars": 0
+            },
+            {
+              "name": "code_rag_search",
+              "description_chars": 3207,
+              "input_schema_chars": 528,
+              "output_schema_chars": 199
+            },
+            {
+              "name": "read_file",
+              "description_chars": 597,
+              "input_schema_chars": 380,
+              "output_schema_chars": 135
+            },
+            {
+              "name": "grep_code",
+              "description_chars": 462,
+              "input_schema_chars": 398,
+              "output_schema_chars": 135
+            },
+            {
+              "name": "list_dir",
+              "description_chars": 600,
+              "input_schema_chars": 261,
+              "output_schema_chars": 134
+            },
+            {
+              "name": "apply_patch",
+              "description_chars": 2161,
+              "input_schema_chars": 204,
+              "output_schema_chars": 137
+            },
+            {
+              "name": "file_info",
+              "description_chars": 258,
+              "input_schema_chars": 132,
+              "output_schema_chars": 135
+            },
+            {
+              "name": "git_status",
+              "description_chars": 236,
+              "input_schema_chars": 68,
+              "output_schema_chars": 136
+            },
+            {
+              "name": "git_diff",
+              "description_chars": 275,
+              "input_schema_chars": 225,
+              "output_schema_chars": 134
+            },
+            {
+              "name": "run_lint",
+              "description_chars": 495,
+              "input_schema_chars": 192,
+              "output_schema_chars": 134
+            },
+            {
+              "name": "import_external_file",
+              "description_chars": 644,
+              "input_schema_chars": 246,
+              "output_schema_chars": 146
+            },
+            {
+              "name": "analyze_file",
+              "description_chars": 2424,
+              "input_schema_chars": 359,
+              "output_schema_chars": 138
+            },
+            {
+              "name": "ingest_document",
+              "description_chars": 4606,
+              "input_schema_chars": 352,
+              "output_schema_chars": 141
+            },
+            {
+              "name": "remove_document",
+              "description_chars": 667,
+              "input_schema_chars": 144,
+              "output_schema_chars": 141
+            },
+            {
+              "name": "review_figures",
+              "description_chars": 4372,
+              "input_schema_chars": 542,
+              "output_schema_chars": 140
+            },
+            {
+              "name": "reload_knowledge_base",
+              "description_chars": 321,
+              "input_schema_chars": 79,
+              "output_schema_chars": 147
+            },
+            {
+              "name": "record_lesson",
+              "description_chars": 979,
+              "input_schema_chars": 205,
+              "output_schema_chars": 139
+            },
+            {
+              "name": "run_command",
+              "description_chars": 852,
+              "input_schema_chars": 228,
+              "output_schema_chars": 137
+            }
           ]
         },
         "routing": {
@@ -313,6 +419,43 @@
           "schema_valid_rate": 1.0,
           "ask_permission_preserved": true
         }
+      },
+      "era": "opencode",
+      "note": "OpenCode 1.18.21 時代的量測。去 OpenCode 化之後這個 row 的身分永遠對不上現行客戶端(client_version 已經不是 opencode --version),保留它是為了不抹掉真的量過的數字,不是為了給現在的執行當基準。"
+    },
+    {
+      "id": "deepseek-v4-flash-ud-q8-k-xl__unsloth__codetrail-client",
+      "status": "unsupported",
+      "era": "client",
+      "note": "客戶端時代的 row。catalog 契約已量;routing 指標尚未在新客戶端下重量,所以 status 是 unsupported(fail-closed)。跑一次完整 model lane 通過gate 之後,才由人改成 supported。",
+      "compatibility": {
+        "model_family": "DeepSeek-V4-Flash",
+        "quantization": "UD-Q8_K_XL",
+        "template_family": "Unsloth",
+        "client_version": null,
+        "chat_template_digest": null,
+        "chat_template_caps": null,
+        "chat_template_caps_digest": null,
+        "n_ctx": null,
+        "llama_cpp_build_digest": null,
+        "effective_config_digest": null,
+        "global_agents_digest": null,
+        "fixture_digest": null,
+        "selected_model_digest": null,
+        "runtime_model_digest": null
+      },
+      "arms": [
+        "client_baseline"
+      ],
+      "baseline": {
+        "catalog": {
+          "tool_count": 19,
+          "note": "以 --catalog-only --catalog-source in-process 量得,零模型。"
+        }
+      },
+      "decision": {
+        "supported_arm": null,
+        "reason": "routing 指標尚未在新客戶端下重量。"
       }
     }
   ]

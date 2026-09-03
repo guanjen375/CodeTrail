@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -380,3 +381,62 @@ def test_policy_error_with_malformed_port_has_no_credentials(monkeypatch):
     with pytest.raises(endpoint_policy.EndpointPolicyError) as exc:
         endpoint_policy.ensure_allowed("http://user:secret@10.0.0.5:bad/v1", "model")
     assert "secret" not in str(exc.value), "malformed port 不得成為洩漏繞道"
+
+
+# ============================================================
+# 串流解碼(2026-09-03 regression)
+# ============================================================
+# llama-server 的 SSE 是 `text/event-stream`,而 requests 對 `text/*` 在沒有
+# 明確 charset 時退回 ISO-8859-1(RFC 2616)。用 `decode_unicode=True` 交給它
+# 解的話,中文答案會整段變成 mojibake —— 而且是**靜默**的:JSON 照樣 parse
+# 得過,只是每個中文字都變成三個拉丁字母。實測 headless run 回過
+# 「æ ¹æ `README.md`」。所以解碼一律由這裡自己做,固定 UTF-8。
+
+
+class _FakeStreamResponse:
+    """模仿 requests 的 streaming response:iter_lines() 預設回 bytes。"""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+        self.encoding = "ISO-8859-1"   # requests 對 text/* 的預設
+        self.closed = False
+
+    def iter_lines(self, decode_unicode=False):
+        for line in self._lines:
+            if decode_unicode:
+                # requests 會用 self.encoding 解碼;這正是 bug 的來源。
+                yield line.decode(self.encoding)
+            else:
+                yield line
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.smoke
+def test_streaming_chunks_are_decoded_as_utf8():
+    """中文答案不得因為 server 沒宣告 charset 就變成 mojibake。"""
+    payload = {"choices": [{"delta": {"content": "根據 `README.md`,這是一個小專案"}}]}
+    line = ("data: " + json.dumps(payload, ensure_ascii=False)).encode("utf-8")
+    resp = _FakeStreamResponse([line])
+    chunks = list(llama_client._iter_openai_stream(resp))
+    assert chunks[0]["choices"][0]["delta"]["content"] == "根據 `README.md`,這是一個小專案"
+
+
+@pytest.mark.smoke
+def test_native_streaming_chunks_are_decoded_as_utf8():
+    line = ("data: " + json.dumps({"content": "最大值 1024"}, ensure_ascii=False)).encode("utf-8")
+    resp = _FakeStreamResponse([line])
+    chunks = list(llama_client._iter_native_stream(resp))
+    assert chunks[0]["content"] == "最大值 1024"
+
+
+@pytest.mark.smoke
+def test_a_closed_stream_releases_the_server_slot():
+    """中斷時必須關掉 response,否則 llama-server 的 slot 一直被佔著。"""
+    line = ("data: " + json.dumps({"choices": [{"delta": {"content": "x"}}]})).encode("utf-8")
+    resp = _FakeStreamResponse([line, line])
+    stream = llama_client._iter_openai_stream(resp)
+    next(stream)
+    stream.close()
+    assert resp.closed is True

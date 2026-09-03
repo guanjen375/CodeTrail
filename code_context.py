@@ -5,7 +5,7 @@
 This module owns deterministic code-evidence selection, overlapping-range merge,
 content de-duplication, and a *character* packing budget.  It is deliberately not
 ``context_budget.py`` (the LLM request hard gate), and it does not replace
-``context_signals.py`` or ``opencode_context.py``.
+``context_signals.py``.
 
 Filesystem access is injected.  Production callers must use the existing
 ``ToolExecutor.grep`` / ``ToolExecutor.read_file`` paths; this module never opens

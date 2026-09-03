@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """Verify CodeTrail MCP wiring and the active model's real tool-call path.
 
-``aicode`` runs this before starting OpenCode.  The protocol check is always
-live: it starts the effective ``mcp.codetrail.command``, performs
-initialize/tools/list, verifies the exact public tool contract, and calls the
-read-only ``list_dir`` tool.  A named explicit model probe is a hard gate and
-may retry once; a separate unnamed-intent probe runs once and records an
+``aicode`` runs this before starting the CodeTrail client.  The protocol check
+is always live: it starts ``mcp_server.py`` through the same
+``client_mcp.McpClient`` the client itself uses, performs initialize/tools/list,
+verifies the exact public tool contract, and calls the read-only ``list_dir``
+tool.  A named explicit model probe is a hard gate and may retry once; a
+separate unnamed-intent probe runs once and records an
 optimal/suboptimal/fail/timeout diagnostic without blocking startup.
+
+The model probes run the real headless client (``codetrail_chat.py run
+--format json``) under the **read-only** permission policy, so a canary can
+never write to the project, and **ephemeral** session storage, so it never
+leaves a conversation in the user's session list.
 
 The model checks are comparatively slow, so results are cached in separate
 explicit/implicit lanes by a configuration/runtime fingerprint.  Each record
 contains only fingerprint, status, time, and canary version -- never prompts,
-model/tool output, project paths, session ids, or config contents.  Transient
-OpenCode canary sessions are deleted after inspection.
+model/tool output, project paths, session ids, or config contents.
 """
 from __future__ import annotations
 
@@ -40,33 +45,49 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import compaction_mode  # noqa: E402
-from mcp_contract import PUBLIC_TOOL_NAMES, PUBLIC_TOOL_ORDER  # noqa: E402
-from model_resolution import parse_cli_model_arg_detail  # noqa: E402
-from scripts.opencode_direct_contract import (  # noqa: E402
-    DirectToolContractError,
-    require_direct_tool_contract,
-)
-from scripts.opencode_mcp_timeout_check import resolve_config_path  # noqa: E402
+import client_events  # noqa: E402
+import client_mcp  # noqa: E402
+import client_prompt  # noqa: E402
+import config as codetrail_config  # noqa: E402
+from mcp_contract import MCP_INSTRUCTIONS, PUBLIC_TOOL_NAMES, PUBLIC_TOOL_ORDER  # noqa: E402
+from model_resolution import parse_cli_model_arg_detail, resolve_main_model_from_env  # noqa: E402
 
-CANARY_VERSION = 2
-CACHE_SCHEMA = 2
+# 3:客戶端換掉 OpenCode,指紋輸入整組改變(不再有 opencode 設定 / 版本 /
+# build prompt;改為客戶端版本與 system prompt digest)。舊快取項不得沿用。
+CANARY_VERSION = 3
+CACHE_SCHEMA = 3
+DEFAULT_CLIENT_ENTRY = REPO_ROOT / "codetrail_chat.py"
+CLIENT_ENTRY_ENV = "AICODE_CLIENT_ENTRY"
+
+
+def client_entry(env: Mapping[str, str] | None = None) -> Path:
+    """canary 要驗的**就是 wrapper 等一下會 exec 的那一個**客戶端。
+
+    `aicode` 尊重 `AICODE_CLIENT_ENTRY`;canary 寫死 repo 內的路徑的話,
+    它跑的、hash 的都是另一份程式,通過之後 wrapper 卻 exec override ——
+    對一個 policy、system prompt、事件契約完全不同的客戶端回報 PASS。
+    """
+    environ = os.environ if env is None else env
+    override = str(environ.get(CLIENT_ENTRY_ENV, "")).strip()
+    return Path(override).expanduser() if override else DEFAULT_CLIENT_ENTRY
+
+
+CLIENT_ENTRY = DEFAULT_CLIENT_ENTRY
 DEFAULT_CACHE_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_MCP_TIMEOUT_SECONDS = 90
 DEFAULT_EXPLICIT_TIMEOUT_SECONDS = 120
 # Backward-compatible name for callers that previously had only one model lane.
 DEFAULT_MODEL_TIMEOUT_SECONDS = DEFAULT_EXPLICIT_TIMEOUT_SECONDS
 DEFAULT_IMPLICIT_TIMEOUT_SECONDS = 180
-DEFAULT_CONFIG_TIMEOUT_SECONDS = 30
 MODEL_CANARY_HEARTBEAT_SECONDS = 15
 MAX_CACHE_ENTRIES = 32
 MAX_PROPS_BYTES = 4 * 1024 * 1024
 
 EXPECTED_MCP_TOOLS = PUBLIC_TOOL_NAMES
 EXPECTED_MCP_TOOL_ORDER = PUBLIC_TOOL_ORDER
-TARGET_FRONTEND_TOOL = "codetrail_list_dir"
+TARGET_FRONTEND_TOOL = "list_dir"
 CANARY_PROMPT = (
-    "請立即呼叫 codetrail_list_dir，path=\".\"、depth=1。"
+    "請立即呼叫 list_dir，path=\".\"、depth=1。"
     "必須實際呼叫工具，不准用文字回答工具是否存在。"
 )
 IMPLICIT_CANARY_PROMPT = (
@@ -78,17 +99,16 @@ IMPLICIT_CANARY_PROMPT = (
 # but is not the optimal response to the directory-listing intent above.
 IMPLICIT_READ_ONLY_FRONTEND_TOOLS = frozenset(
     {
-        "codetrail_list_dir",
-        "codetrail_read_file",
-        "codetrail_grep_code",
-        "codetrail_code_rag_search",
-        "codetrail_file_info",
-        "codetrail_query_knowledge",
-        "codetrail_query_knowledge_strict",
-        "codetrail_git_status",
-        "codetrail_git_diff",
-        "codetrail_run_lint",
-        "codetrail_analyze_file",
+        "list_dir",
+        "read_file",
+        "grep_code",
+        "code_rag_search",
+        "file_info",
+        "query_knowledge",
+        "query_knowledge_strict",
+        "git_status",
+        "git_diff",
+        "analyze_file",
     }
 )
 
@@ -98,12 +118,6 @@ _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
 
 class CanaryError(RuntimeError):
     """An actionable health-check failure whose message is safe to print."""
-
-
-@dataclass(frozen=True)
-class McpCommand:
-    argv: tuple[str, ...]
-    environment: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -221,7 +235,7 @@ def _run_process_with_heartbeat(
                 except subprocess.TimeoutExpired:
                     elapsed = int(time.monotonic() - started)
                     _print(
-                        f"opencode run 仍在執行… 已 {elapsed} 秒"
+                        f"headless run 仍在執行… 已 {elapsed} 秒"
                         f"（單次上限 {timeout} 秒）"
                     )
                     continue
@@ -233,157 +247,69 @@ def _run_process_with_heartbeat(
             raise
 
 
-def load_effective_opencode_config(
-    root: Path,
-    env: Mapping[str, str],
-    *,
-    timeout: int = DEFAULT_CONFIG_TIMEOUT_SECONDS,
-) -> dict[str, Any]:
-    """Ask OpenCode for the merged config rather than guessing merge order."""
-    try:
-        result = _run_process(
-            ["opencode", "debug", "config"],
-            root=root,
-            env=env,
-            timeout=timeout,
-        )
-    except FileNotFoundError as exc:
-        raise CanaryError("找不到 opencode，無法解析實際生效設定") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise CanaryError(f"opencode debug config 超過 {timeout} 秒") from exc
-
-    if result.returncode != 0:
-        raise CanaryError(
-            f"opencode debug config 失敗（exit {result.returncode}）；"
-            "請先直接執行該命令檢查設定"
-        )
-    try:
-        config = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise CanaryError("opencode debug config 沒有回傳合法 JSON") from exc
-    if not isinstance(config, dict):
-        raise CanaryError("opencode debug config 的根節點不是 JSON object")
-    return config
-
-
-def extract_codetrail_command(
-    config: Mapping[str, Any],
-    *,
-    root: Path,
-) -> McpCommand:
-    mcp = config.get("mcp")
-    entry = mcp.get("codetrail") if isinstance(mcp, dict) else None
-    if not isinstance(entry, dict):
-        raise CanaryError("實際 OpenCode 設定沒有 mcp.codetrail entry")
-    if entry.get("enabled") is False:
-        raise CanaryError("實際 OpenCode 設定把 mcp.codetrail.enabled 關閉了")
-    if entry.get("type") not in (None, "local"):
-        raise CanaryError("mcp.codetrail 不是 local stdio MCP，無法執行本機 protocol canary")
-
-    command = entry.get("command")
-    if not (
-        isinstance(command, list)
-        and command
-        and all(isinstance(part, str) and part for part in command)
-    ):
-        raise CanaryError("mcp.codetrail.command 必須是非空字串陣列")
-
-    raw_environment = entry.get("environment", {})
-    if not isinstance(raw_environment, dict) or not all(
-        isinstance(key, str) and isinstance(value, str)
-        for key, value in raw_environment.items()
-    ):
-        raise CanaryError("mcp.codetrail.environment 必須是字串對字串的 object")
-    configured_root = raw_environment.get("AICODE_ROOT")
-    if configured_root:
-        try:
-            configured_path = Path(configured_root).expanduser().resolve()
-        except (OSError, ValueError) as exc:
-            raise CanaryError("mcp.codetrail.environment.AICODE_ROOT 無法解析") from exc
-        if configured_path != root:
-            raise CanaryError(
-                "mcp.codetrail.environment.AICODE_ROOT 與本次 aicode sandbox root 不同"
-            )
-
-    return McpCommand(tuple(command), dict(raw_environment))
-
-
-async def _mcp_roundtrip(
-    command: McpCommand,
-    *,
-    root: Path,
-    env: Mapping[str, str],
+def run_protocol_roundtrip(
+    *, root: Path, env: Mapping[str, str], timeout: int
 ) -> tuple[tuple[str, ...], bool, ProtocolEvidence]:
-    try:
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
-    except ImportError as exc:
-        raise CanaryError("目前 Python 找不到 mcp 套件，無法做 protocol canary") from exc
+    """initialize → tools/list → list_dir,走客戶端真正用的那一條路。
 
-    server_env = dict(env)
-    server_env.update(command.environment)
-    server_env["AICODE_ROOT"] = str(root)
-    params = StdioServerParameters(
-        command=command.argv[0],
-        args=list(command.argv[1:]),
-        env=server_env,
-        cwd=root,
+    以前這裡要先問 `opencode debug config` 拿 `mcp.codetrail.command`,因為
+    OpenCode 才是決定「實際會執行什麼」的那一端。現在客戶端自己 spawn
+    `mcp_server.py`,所以「實際會執行什麼」就是 `client_mcp` 裡那一行 —— 再去
+    讀一份設定只會製造另一個會漂移的來源。
+    """
+    client = client_mcp.McpClient(
+        root,
+        env={key: str(value) for key, value in env.items()},
+        start_timeout=float(timeout),
     )
-
-    # MCP server startup logs may include project-local filenames.  Keep them
-    # in an anonymous temporary file and never echo/store them on success.
-    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as errlog:
-        async with stdio_client(params, errlog=errlog) as (read, write):
-            async with ClientSession(read, write) as session:
-                initialized = await session.initialize()
-                listed_tools = await session.list_tools()
-                names = tuple(tool.name for tool in listed_tools.tools)
-                canonical_tools: list[Any] = []
-                for tool in listed_tools.tools:
-                    dump = getattr(tool, "model_dump", None)
-                    if callable(dump):
-                        canonical_tools.append(
-                            dump(mode="json", by_alias=True, exclude_none=True)
-                        )
-                    else:  # pragma: no cover - older compatible SDK fallback
-                        canonical_tools.append(str(tool))
-                instructions = getattr(initialized, "instructions", None)
-                instructions_text = instructions if isinstance(instructions, str) else ""
-                evidence = ProtocolEvidence(
-                    tools_digest=_json_digest(canonical_tools),
-                    # Match scripts.mcp_catalog.text_digest exactly: MCP
-                    # instructions identity is raw UTF-8, not JSON-quoted text.
-                    instructions_digest=hashlib.sha256(
-                        instructions_text.encode("utf-8")
-                    ).hexdigest(),
-                )
-                result = await session.call_tool("list_dir", {"path": ".", "depth": 1})
-                return names, bool(getattr(result, "isError", False)), evidence
+    try:
+        try:
+            specs = client.tools()
+        except client_mcp.McpClientError as exc:
+            raise CanaryError(f"MCP initialize/tools/list 失敗:{exc}") from exc
+        names = tuple(spec.name for spec in specs)
+        canonical = [
+            {
+                "name": spec.name,
+                "description": spec.description,
+                "inputSchema": spec.input_schema,
+                "readOnlyHint": spec.read_only,
+            }
+            for spec in specs
+        ]
+        evidence = ProtocolEvidence(
+            tools_digest=_json_digest(canonical),
+            # Match scripts.mcp_catalog.text_digest exactly: MCP instructions
+            # identity is raw UTF-8, not JSON-quoted text.
+            instructions_digest=hashlib.sha256(
+                MCP_INSTRUCTIONS.encode("utf-8")
+            ).hexdigest(),
+        )
+        try:
+            result = client.call("list_dir", {"path": ".", "depth": 1})
+        except client_mcp.McpClientError as exc:
+            raise CanaryError(f"MCP list_dir round-trip 失敗:{exc}") from exc
+        return names, bool(result.is_error), evidence
+    finally:
+        client.close()
 
 
 def run_protocol_check(
-    config: Mapping[str, Any],
     *,
     root: Path,
     env: Mapping[str, str],
     timeout: int,
 ) -> ProtocolEvidence:
-    command = extract_codetrail_command(config, root=root)
     try:
-        names, list_dir_error, evidence = asyncio.run(
-            asyncio.wait_for(
-                _mcp_roundtrip(command, root=root, env=env),
-                timeout=timeout,
-            )
+        names, list_dir_error, evidence = run_protocol_roundtrip(
+            root=root, env=env, timeout=timeout
         )
-    except TimeoutError as exc:
-        raise CanaryError(f"MCP initialize/tools/list/list_dir 超過 {timeout} 秒") from exc
     except CanaryError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         raise CanaryError(
             "MCP initialize/tools/list/list_dir 失敗"
-            f"（{type(exc).__name__}；server 詳細 log 已避免輸出）"
+            f"({type(exc).__name__};server 詳細 log 已避免輸出)"
         ) from exc
 
     name_set = frozenset(names)
@@ -396,12 +322,12 @@ def run_protocol_check(
         if unexpected:
             details.append(f"未同步新增={unexpected}")
         raise CanaryError(
-            f"MCP 工具 contract 不符：預期 {len(EXPECTED_MCP_TOOLS)}、實得 {len(names)}；"
-            + "；".join(details)
+            f"MCP 工具 contract 不符:預期 {len(EXPECTED_MCP_TOOLS)}、實得 {len(names)};"
+            + ";".join(details)
         )
     if names != EXPECTED_MCP_TOOL_ORDER:
         raise CanaryError(
-            "MCP 工具順序不符 canonical PUBLIC_TOOL_ORDER；"
+            "MCP 工具順序不符 canonical PUBLIC_TOOL_ORDER;"
             "client catalog 與 routing fingerprint 不可靜默漂移"
         )
     if list_dir_error:
@@ -476,21 +402,6 @@ def fetch_main_server_props(
     return props if isinstance(props, dict) else None
 
 
-def read_opencode_version(root: Path, env: Mapping[str, str]) -> str | None:
-    try:
-        result = _run_process(
-            ["opencode", "--version"],
-            root=root,
-            env=env,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    return result.stdout.strip()
-
-
 def _model_file_signature(props: Mapping[str, Any]) -> dict[str, Any]:
     model_path = props.get("model_path")
     if not isinstance(model_path, str) or not model_path:
@@ -506,145 +417,42 @@ def _model_file_signature(props: Mapping[str, Any]) -> dict[str, Any]:
     return signature
 
 
-_FILE_PROMPT_REFERENCE_RE = re.compile(r"^\{file:(.+)\}$", re.DOTALL)
+def _client_prompt_digest(root: Path, env: Mapping[str, str]) -> str:
+    """這一輪模型真的會看到的 system prompt 的身分。
 
-
-def _effective_agent_prompt_digest(config: Mapping[str, Any], agent_name: str) -> str:
-    """Hash the prompt text one OpenCode agent will actually load.
-
-    Managed prompts are file references.  Hashing only the reference would
-    leave a stale canary cache when the file changes in place, while storing
-    its content would violate the cache privacy contract.
+    以前這一格是 OpenCode 的 build prompt 與全域 AGENTS.md;現在 system prompt
+    由客戶端自組(內建基底規則 + MCP 路由圖 + 專案 AGENTS.md + lessons +
+    使用者全域指示)。任何一段變了,模型的路由行為就可能不同,舊的 canary
+    判定不得沿用。
     """
-    agent = config.get("agent")
-    entry = agent.get(agent_name) if isinstance(agent, Mapping) else None
-    prompt = entry.get("prompt") if isinstance(entry, Mapping) else None
-    if not isinstance(prompt, str):
-        return _json_digest({"state": "missing-or-non-string"})
-    match = _FILE_PROMPT_REFERENCE_RE.fullmatch(prompt.strip())
-    if match is None:
-        return _json_digest({"kind": "inline", "text": prompt})
     try:
-        path = Path(match.group(1)).expanduser()
-    except (OSError, ValueError):
-        return _json_digest({"kind": "file", "state": "invalid"})
-    return _json_digest(
-        {
-            "kind": "file",
-            "content_digest": _file_digest(path),
-        }
-    )
-
-
-def _effective_build_prompt_digest(config: Mapping[str, Any]) -> str:
-    return _effective_agent_prompt_digest(config, "build")
-
-
-def _compaction_agent_digest(config: Mapping[str, Any]) -> str:
-    """Hash everything that decides how a compaction request is built.
-
-    ``agent.compaction`` can override the compaction agent's model,
-    temperature, options and system prompt (agent.ts).  A different summary
-    engine produces a different conversation the model then reasons over, so
-    a canary verdict recorded under one compaction agent must not be reused
-    under another.  ``prompt`` is resolved through the same ``{file:...}``
-    path as the build prompt: swapping the file's contents in place has to
-    invalidate the cache.
-    """
-    agent = config.get("agent")
-    entry = agent.get("compaction") if isinstance(agent, Mapping) else None
-    if not isinstance(entry, Mapping):
-        return _json_digest({"state": "absent"})
-    return _json_digest(
-        {
-            "prompt": _effective_agent_prompt_digest(config, "compaction"),
-            "model": entry.get("model"),
-            "temperature": entry.get("temperature"),
-            "options": entry.get("options"),
-        }
-    )
+        return client_prompt.build_system_prompt(root, env=env).digest
+    except Exception:  # noqa: BLE001 - 指紋壞掉只該讓快取失效,不該擋啟動
+        return "unavailable"
 
 
 def _compaction_mode_digest(env: Mapping[str, str]) -> str:
-    """Hash the compaction mode contract this run is operating under.
-
-    Mode decides whether the compaction plugin is loaded, whether upstream
-    auto-compaction is on, and what the retained tail looks like — all of
-    which change what the model sees on the next turn.
-
-    ``bound`` is not redundant with ``effective_config_hash``: the plugin
-    refuses any ownership state that is not bound to the config actually in
-    effect, so pointing ``OPENCODE_CONFIG`` at a byte-identical copy under a
-    different path silently turns compaction off while every content hash
-    stays the same.
-
-    The plugin file and the canonical rule text are only hashed when a mode
-    that loads them is active — editing them under ``native`` changes nothing
-    about the run and must not cost a live canary.
-    """
-    # override 存在時,runtime plugin 讀的就是**那一份**:mode、bound 與要不要
-    # 雜湊 plugin/rules 都要跟著它,否則 default state 是 native 而 override 是
-    # codetrail 時,規則檔換內容仍會沿用舊 verdict。
-    override = (env.get("AICODE_COMPACTION_STATE") or "").strip()
-    if override:
-        state_path = Path(override).expanduser()
-    else:
-        try:
-            state_path = compaction_mode.state_path(env)
-        except compaction_mode.CompactionModeError:
-            state_path = None
-    state = compaction_mode.load_state(path=state_path) if state_path else None
-    mode = state.get("mode") if state else None
-    payload: dict[str, Any] = {
-        "mode": mode,
-        "state_digest": state.get("digest") if state else None,
-        "bound": _compaction_state_binding(state, env),
-        # The private compaction eval points the runtime plugin at a different
-        # ownership state.  A verdict recorded under that override describes a
-        # different compaction contract than a normal run and must not be reused
-        # — and two different overrides are two different contracts, so hash the
-        # state they actually select rather than just "an override is set".
-        "state_override": _compaction_override_digest(env),
-    }
-    if mode in compaction_mode.PLUGIN_MODES:
-        payload["plugin"] = _file_digest(compaction_mode.PLUGIN_PATH)
-        payload["rules"] = _file_digest(compaction_mode.RULES_DOC)
-    return _json_digest(payload)
-
-
-def _compaction_override_digest(env: Mapping[str, str]) -> str | None:
-    """Identify the ownership state an ``AICODE_COMPACTION_STATE`` override selects."""
-    raw = (env.get("AICODE_COMPACTION_STATE") or "").strip()
-    if not raw:
-        return None
-    state = compaction_mode.load_state(path=Path(raw).expanduser())
-    if state is None:
-        return _json_digest({"path": _file_digest(Path(raw).expanduser()), "state": "rejected"})
-    return _json_digest({"mode": state.get("mode"), "digest": state.get("digest")})
-
-
-def _compaction_state_binding(
-    state: Mapping[str, Any] | None, env: Mapping[str, str]
-) -> str:
-    """Does the recorded ownership state describe the config in effect here?"""
-    if not state:
-        return "no-state"
+    """壓縮模式的身分。模式換了,對話被截斷的時機就換了。"""
     try:
-        config_path = resolve_config_path(dict(env))
-    except Exception:  # noqa: BLE001 — 診斷用,不得讓 fingerprint 掛掉
-        return "unresolved"
-    if config_path is None:
-        return "unresolved"
-    return "bound" if compaction_mode.state_matches_config(state, config_path) else "foreign"
+        import client_config
+
+        settings = client_config.load_client_settings(env)
+        return _json_digest(
+            {
+                "present": settings.present,
+                "mode": settings.compaction_mode,
+                "permission": settings.permission,
+            }
+        )
+    except Exception:  # noqa: BLE001
+        return "unavailable"
 
 
 def build_fingerprint(
     *,
     root: Path,
-    config: Mapping[str, Any],
     selected_model: str,
     props: Mapping[str, Any],
-    opencode_version: str,
     env: Mapping[str, str],
     protocol_evidence: ProtocolEvidence | None = None,
 ) -> str:
@@ -653,16 +461,22 @@ def build_fingerprint(
     tracked_files = {
         "canary": _file_digest(Path(__file__)),
         "mcp_server": _file_digest(REPO_ROOT / "mcp_server.py"),
+        # 客戶端本身是路由行為的一部分:engine 的訊息組裝、工具 schema 轉換與
+        # 權限 policy 改了,模型看到的東西就不同,舊判定不得沿用。
+        "client_engine": _file_digest(REPO_ROOT / "client_engine.py"),
+        "client_prompt": _file_digest(REPO_ROOT / "client_prompt.py"),
+        "client_chat": _file_digest(client_entry(env)),
+        # override 的路徑本身也要進指紋:同名但指到別的 checkout 時,
+        # 只 hash 內容也可能剛好相同(例如兩份都還沒改)。
+        "client_entry_path": str(client_entry(env)),
         "project_agents": _file_digest(root / "AGENTS.md"),
         # lessons 注入檔也是模型看到的「專案規則」:內容變了要讓 model canary
         # 快取失效(aicode 會在 canary 之前先 render 好這個檔)。
         "project_lessons": _file_digest(root / ".codetrail" / "lessons.md"),
-        "project_opencode_json": _file_digest(root / ".opencode" / "opencode.json"),
-        "project_opencode_jsonc": _file_digest(root / ".opencode" / "opencode.jsonc"),
     }
     if home is not None:
-        tracked_files["global_agents"] = _file_digest(
-            home / ".config" / "opencode" / "AGENTS.md"
+        tracked_files["user_instructions"] = _file_digest(
+            client_prompt.user_instructions_path(env)
         )
         tracked_files["deployment"] = _file_digest(
             home / ".config" / "codetrail" / "deployment.json"
@@ -697,12 +511,9 @@ def build_fingerprint(
         "canary_version": CANARY_VERSION,
         "root": str(root),
         "selected_model": selected_model,
-        "opencode_version": opencode_version,
-        # Hash the resolved config inside the final digest.  This includes all
-        # effective provider/MCP/agent settings without persisting credentials.
-        "effective_config_hash": _json_digest(config),
-        "effective_build_prompt_digest": _effective_build_prompt_digest(config),
-        "compaction_agent_digest": _compaction_agent_digest(config),
+        # 模型真的會看到的 system prompt 的身分(取代舊的 build prompt /
+        # 全域 AGENTS.md 兩格)。
+        "system_prompt_digest": _client_prompt_digest(root, env),
         "compaction_mode_digest": _compaction_mode_digest(env),
         "live_tools_digest": protocol.tools_digest,
         "mcp_instructions_digest": protocol.instructions_digest,
@@ -963,16 +774,10 @@ def save_cached_implicit(
     )
 
 
-def _event_session_ids(event: Mapping[str, Any]) -> list[str]:
-    candidates = [event.get("sessionID"), event.get("session_id")]
-    part = event.get("part")
-    if isinstance(part, dict):
-        candidates.extend((part.get("sessionID"), part.get("session_id")))
-    return [
-        value
-        for value in candidates
-        if isinstance(value, str) and _SAFE_SESSION_ID.fullmatch(value)
-    ]
+# 事件流的解析只有一份(client_events),canary / routing eval / session_eval
+# replay 共用。各自寫一份的話,同一次 run 在兩邊會得到不同判定,而兩邊都不會
+# 報錯。
+_event_session_ids = client_events.event_session_ids
 
 
 def inspect_model_events(output: str) -> ModelEvidence:
@@ -981,13 +786,7 @@ def inspect_model_events(output: str) -> ModelEvidence:
     saw_completed_target = False
     saw_tool_calls_finish = False
 
-    for line in output.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
+    for event in client_events.iter_events(output):
         for session_id in _event_session_ids(event):
             if session_id not in session_ids:
                 session_ids.append(session_id)
@@ -1019,14 +818,14 @@ def inspect_model_events(output: str) -> ModelEvidence:
     if saw_completed_target:
         return ModelEvidence(
             True,
-            "收到 completed 的結構化 codetrail_list_dir(path='.', depth=1)",
+            "收到 completed 的結構化 list_dir(path='.', depth=1)",
             tuple(session_ids),
             saw_tool_calls_finish,
         )
     if saw_target:
-        reason = "收到 codetrail_list_dir event，但不是 completed 或參數不符"
+        reason = "收到 list_dir event，但不是 completed 或參數不符"
     else:
-        reason = "沒有收到結構化 codetrail_list_dir tool_use（純文字/XML 不算）"
+        reason = "沒有收到結構化 list_dir tool_use（純文字/XML 不算）"
     return ModelEvidence(False, reason, tuple(session_ids), saw_tool_calls_finish)
 
 
@@ -1034,13 +833,7 @@ def inspect_implicit_events(output: str) -> ImplicitEvidence:
     """Classify only completed structured calls from the unnamed-intent probe."""
     session_ids: list[str] = []
     completed_read_only: list[tuple[str, dict[str, Any]]] = []
-    for line in output.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
+    for event in client_events.iter_events(output):
         for session_id in _event_session_ids(event):
             if session_id not in session_ids:
                 session_ids.append(session_id)
@@ -1088,23 +881,24 @@ def run_model_attempt(
         model_override=model_override,
         title="CodeTrail explicit tool-call canary",
         prompt=CANARY_PROMPT,
+        env=env,
     )
     try:
         result = _run_process_with_heartbeat(command, root=root, env=env, timeout=timeout)
     except FileNotFoundError:
-        return ModelEvidence(False, "找不到 opencode")
+        return ModelEvidence(False, "找不到 python 直譯器或客戶端進入點")
     except OSError as exc:
-        return ModelEvidence(False, f"opencode run 無法啟動（{type(exc).__name__}）")
+        return ModelEvidence(False, f"headless run 無法啟動（{type(exc).__name__}）")
     except subprocess.TimeoutExpired as exc:
         evidence = inspect_model_events(_coerce_text(exc.stdout))
-        return replace(evidence, success=False, reason=f"opencode run 超過 {timeout} 秒")
+        return replace(evidence, success=False, reason=f"headless run 超過 {timeout} 秒")
 
     evidence = inspect_model_events(result.stdout)
     if result.returncode != 0:
         return replace(
             evidence,
             success=False,
-            reason=f"opencode run exit {result.returncode}（輸出已避免顯示）",
+            reason=f"headless run exit {result.returncode}（輸出已避免顯示）",
         )
     return evidence
 
@@ -1115,22 +909,28 @@ def _model_canary_command(
     model_override: str,
     title: str,
     prompt: str,
+    env: Mapping[str, str] | None = None,
 ) -> list[str]:
+    """真的跑一次 headless 客戶端。
+
+    ``--policy readonly``:canary 絕不能寫到使用者的專案。
+    **不帶** ``--persist``:headless 預設 ephemeral,所以抽查不會在 session
+    清單裡留下對話。``title`` 保留在簽名裡是為了呼叫端可讀,ephemeral 的
+    session 沒有標題可存。
+    """
+    del title  # ephemeral session 沒有要存的標題
     command = [
-        "opencode",
-        "run",
-        "--dir",
+        sys.executable,
+        str(client_entry(env)),
+        "--root",
         str(root),
-        "--agent",
-        "build",
-        "--format",
-        "json",
-        "--title",
-        title,
+        "--policy",
+        "readonly",
     ]
     if model_override:
-        command.extend(("--model", model_override))
-    command.append(prompt)
+        # 不帶的話 canary --model 指定的模型根本沒送出去,抽查的是別顆模型。
+        command.extend(["--model", model_override])
+    command.extend(["run", "--format", "json", prompt])
     return command
 
 
@@ -1146,6 +946,7 @@ def run_implicit_model_attempt(
         model_override=model_override,
         title="CodeTrail implicit routing diagnostic",
         prompt=IMPLICIT_CANARY_PROMPT,
+        env=env,
     )
     try:
         result = _run_process_with_heartbeat(command, root=root, env=env, timeout=timeout)
@@ -1162,34 +963,15 @@ def run_implicit_model_attempt(
     return inspect_implicit_events(result.stdout)
 
 
-def delete_canary_sessions(
-    session_ids: Sequence[str],
-    *,
-    root: Path,
-    env: Mapping[str, str],
-) -> bool:
-    ok = True
-    for session_id in dict.fromkeys(session_ids):
-        if not _SAFE_SESSION_ID.fullmatch(session_id):
-            continue
-        try:
-            result = _run_process(
-                ["opencode", "session", "delete", session_id],
-                root=root,
-                env=env,
-                timeout=30,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            ok = False
-            continue
-        ok = ok and result.returncode == 0
-    return ok
-
-
 def _model_selection(
-    config: Mapping[str, Any], explicit: str, frontend_args: Sequence[str]
+    env: Mapping[str, str], explicit: str, frontend_args: Sequence[str]
 ) -> tuple[str, str]:
-    """Return (selected model for fingerprint, CLI override for opencode run)."""
+    """Return (selected model for the fingerprint, model to run the probe with).
+
+    以前 active model 來自 `opencode debug config` 的 `model` 欄位;現在 `aicode`
+    已經把解析結果 export 成 `AICODE_MODEL`,客戶端讀的也是它 —— 再去猜一份
+    只會製造兩個可能不一致的答案。
+    """
     if explicit:
         return explicit, explicit
     parsed = parse_cli_model_arg_detail(frontend_args)
@@ -1198,10 +980,12 @@ def _model_selection(
     if parsed.values:
         selected = parsed.values[-1]
         return selected, selected
-    configured = config.get("model")
-    if not isinstance(configured, str) or not configured.strip():
-        raise CanaryError("OpenCode 實際設定沒有 active model，且本次未傳 -m/--model")
-    return configured.strip(), ""
+    resolved = resolve_main_model_from_env(dict(env))
+    if not resolved.ok or not resolved.model:
+        raise CanaryError(
+            "找不到主模型(AICODE_MODEL / deployment profile 都沒有),且本次未傳 -m/--model"
+        )
+    return resolved.model, resolved.model
 
 
 def _handle_failure(message: str, *, warn_only: bool) -> int:
@@ -1240,13 +1024,6 @@ def run_all(
 ) -> int:
     warn_only = _truthy(env.get("AICODE_TOOL_CANARY_WARN_ONLY"))
     try:
-        config_timeout = _env_int(
-            env,
-            "AICODE_TOOL_CANARY_CONFIG_TIMEOUT_SECONDS",
-            DEFAULT_CONFIG_TIMEOUT_SECONDS,
-            minimum=5,
-            maximum=300,
-        )
         mcp_timeout = _env_int(
             env,
             "AICODE_TOOL_CANARY_MCP_TIMEOUT_SECONDS",
@@ -1275,17 +1052,7 @@ def run_all(
             minimum=0,
             maximum=30 * 24 * 60 * 60,
         )
-        config = load_effective_opencode_config(root, env, timeout=config_timeout)
-        opencode_version = read_opencode_version(root, env)
-        if opencode_version is None:
-            raise CanaryError("opencode --version 無法讀取或輸出為空")
-        try:
-            require_direct_tool_contract(opencode_version, config)
-        except DirectToolContractError as exc:
-            raise CanaryError(str(exc)) from exc
-        protocol_evidence = run_protocol_check(
-            config, root=root, env=env, timeout=mcp_timeout
-        )
+        protocol_evidence = run_protocol_check(root=root, env=env, timeout=mcp_timeout)
     except CanaryError as exc:
         return _handle_failure(str(exc), warn_only=warn_only)
 
@@ -1298,7 +1065,7 @@ def run_all(
 
     try:
         selected_model, model_override = _model_selection(
-            config, explicit_model, frontend_args
+            env, explicit_model, frontend_args
         )
     except CanaryError as exc:
         return _handle_failure(str(exc), warn_only=warn_only)
@@ -1320,10 +1087,8 @@ def run_all(
         assert props is not None
         fingerprint = build_fingerprint(
             root=root,
-            config=config,
             selected_model=selected_model,
             props=props,
-            opencode_version=opencode_version,
             env=env,
             protocol_evidence=protocol_evidence,
         )
@@ -1348,15 +1113,15 @@ def run_all(
                     ttl_seconds=ttl_seconds,
                 )
     else:
-        live_reason = "server /props、opencode 版本或快取路徑不可用；本次結果不會快取"
+        live_reason = "server /props 或快取路徑不可用；本次結果不會快取"
 
     if not explicit_cached:
         # 這一步是整個 aicode 啟動流程唯一會安靜跑數十秒以上的地方；先講清楚
         # 原因與預期時長，執行中再配合 heartbeat，避免被誤判成當機。
         _print(f"MODEL live canary — {live_reason}")
         _print(
-            "現在實跑 explicit opencode run，驗證模型會真的呼叫 "
-            "codetrail_list_dir；"
+            "現在實跑 explicit headless run（唯讀權限、不落 session），"
+            "驗證模型會真的呼叫 list_dir；"
             f"單次上限 {model_timeout} 秒，執行中每 "
             f"{MODEL_CANARY_HEARTBEAT_SECONDS} 秒回報進度，不是當機。"
         )
@@ -1369,12 +1134,9 @@ def run_all(
                 model_override=model_override,
                 timeout=model_timeout,
             )
-            if evidence.session_ids and not delete_canary_sessions(
-                evidence.session_ids,
-                root=root,
-                env=env,
-            ):
-                _print("WARNING — 無法刪除本次暫存 OpenCode canary session", error=True)
+            # headless 預設 ephemeral:canary 的對話從來沒有落檔,所以沒有
+            # 「刪掉暫存 session」這一步。事件流仍帶精確 session id,只是那個
+            # id 不對應任何檔案。
 
             if evidence.success:
                 suffix = " + tool-calls finish" if evidence.saw_tool_calls_finish else ""
@@ -1389,7 +1151,7 @@ def run_all(
                                 error=True,
                             )
                     _print(
-                        f"MODEL PASS — structured codetrail_list_dir completed{suffix}"
+                        f"MODEL PASS — structured {TARGET_FRONTEND_TOOL} completed{suffix}"
                     )
                 else:
                     _print(
@@ -1433,12 +1195,6 @@ def run_all(
         model_override=model_override,
         timeout=implicit_timeout,
     )
-    if implicit.session_ids and not delete_canary_sessions(
-        implicit.session_ids,
-        root=root,
-        env=env,
-    ):
-        _print("WARNING — 無法刪除本次 implicit canary session", error=True)
     if cache_ready and fingerprint:
         try:
             assert cache_path is not None
@@ -1457,7 +1213,7 @@ def run_all(
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", help="sandbox/project root；預設 AICODE_ROOT 或 cwd")
-    parser.add_argument("--model", default="", help="OpenCode provider/model override")
+    parser.add_argument("--model", default="", help="model override for the headless client (a registry name or GGUF path, as aicode -m)")
     parser.add_argument("--force", action="store_true", help="ignore a valid model-canary cache")
     parser.add_argument(
         "frontend_args",

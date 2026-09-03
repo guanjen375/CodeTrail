@@ -1,11 +1,11 @@
-# 用真實 OpenCode session 比較主聊天模型
+# 用真實對話 session 比較主聊天模型
 
 這條 lane 回答的是：「哪顆本地模型比較能完成我的真實工作？」它不把任何歷史
 assistant 回答當成標準答案，也不會在 `aicode` 啟動或 CI 中自動執行。
 
 ## 資料與評分原則
 
-- OpenCode session 只提供真實問題分布、使用者補充的證據與弱失敗訊號。
+- 歷史 session 只提供真實問題分布、使用者補充的證據與弱失敗訊號。
 - `expected_answer`、`gold_answer`、`reference_answer` 等欄位在 suite schema 中被明確拒絕。
 - 正確性只來自 source/tool evidence、repo state、外部 build/硬體結果或匿名人工 A/B。
 - 沒有可靠 oracle 的題必須標 `human_pairwise` 或 `unscored`；「session 結束」不算成功。
@@ -23,8 +23,9 @@ assistant 回答當成標準答案，也不會在 `aicode` 啟動或 CI 中自�
 
 ## 1. 匯出選定 session
 
-session id 可由 OpenCode UI／`opencode session list` 取得。匯出是明示動作，不會掃描
-整個 OpenCode DB：
+session id 可由 `aicode` 的 `/sessions`、`codetrail_chat.py sessions` 或
+`python3 scripts/session_eval.py` 的輸出取得。匯出是明示動作,只讀你點名的那幾個
+session 檔,不會掃整個 session 目錄:
 
 ```bash
 python3 scripts/session_eval.py export \
@@ -38,7 +39,7 @@ python3 scripts/session_eval.py export \
 
 ```bash
 python3 scripts/session_eval.py mine \
-  --source-dir /private/opencode_exports --glob 'ses_*.json'
+  --source-dir /private/session_exports --glob '*.json'
 ```
 
 `drafts.json` 只保留 user text。短句糾正（例如只要求「真的用工具」）變成 failure signal；
@@ -115,24 +116,29 @@ runner 不會替操作者停／啟 server。先載入候選 GGUF，確認四個 
 AICODE_MODEL=<BARE_MODEL> python3 scripts/session_eval.py run \
   --suite .codetrail/session_eval/suite.json \
   --candidate-label candidate_1 \
-  --model llamacpp/<BARE_MODEL> \
+  --model <BARE_MODEL> \
   --resume
 ```
 
 每次 run 都會：
 
 1. 從 `/props` 核對目前載入的 GGUF 路徑與指定 candidate；不一致直接拒絕。
-2. 使用相同 suite、OpenCode config、tools、n_ctx 與 production sampling。
-3. 透過臨時 OpenCode config deny 所有 CodeTrail 寫入／執行工具，並在 MCP 端另設
-   `AI_CODE_PATCH=0`、`AI_CODE_RUN_TESTS=0`。
-4. 每題前後比對 Git 狀態、diff 與 `state_paths` 內容 digest；read-only replay 改到現場即失敗。
+2. 使用相同 suite、tools、n_ctx 與 production sampling。壓縮語意由 eval **自己**釘死
+   (臨時 `client.json`:預設 `off`,`--keep-compaction` 才是 `codetrail`),不讀你的
+   `~/.config/codetrail/client.json` —— 否則同一份 suite 在兩台機器上量到的不是同一件事。
+3. 客戶端走 `--policy readonly`(判準是 `readOnlyHint`,不是寫死名單),MCP server 端另設
+   `AI_CODE_PATCH=0`、`AI_CODE_RUN_TESTS=0`、`AICODE_CTX_METRICS_ENABLED=0`。
+4. 每題前後比對 Git 狀態、diff 與 `state_paths` 內容 digest;`.codetrail/`、
+   `knowledge.json`、`.aicode_uploads/` 這三個被 gitignore 的路徑**一律**納入(它們正是
+   唯讀 replay 最可能被寫到的地方)。read-only replay 改到現場即失敗。
 5. 只保存 assistant text、completed tool 名稱／參數 digest、token、latency 與 verifier 結果；
-   tool output 不落盤。預設刪除本次生成的暫存 OpenCode session。
+   tool output 不落盤。單輪 case 完全不落 session 檔;多輪 case 必須落檔(模型要看得到上一
+   輪),跑完就刪除。
 6. 每完成一題就原子覆寫 `result-<candidate>.json` checkpoint；`--resume` 會重新核對
    suite digest、live model fingerprint、case 順序與每個已完成 case 的 project-state digest。
    任一項不同就拒絕續跑，不能把隔天改過的 tree 混進同一候選結果。
 7. 單題超時是該模型在固定 SLA 下的失敗，不是整包消失：runner 解析有界的 partial JSON
-   stream、標記 `timed_out=true`／`harness_error=true`、清掉暫存 session，checkpoint 後繼續
+   stream、標記 `timed_out=true`／`harness_error=true`、清掉暫存 session,checkpoint 後繼續
    下一題。private stderr 與 partial tool output 都不寫入結果。
 
 第一次使用某個 `candidate-label` 時可省略 `--resume`；若同名結果已存在，runner 會拒絕

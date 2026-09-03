@@ -37,7 +37,7 @@ ELF_EXTENSIONS = {".elf", ".so", ".o", ".axf", ".out", ".ko"}
 # 一次性 PDF 檢視（read_pdf）
 PDF_EXTENSIONS = {".pdf"}
 MAX_PDF_SIZE = 50 * 1024 * 1024  # 50MB
-PDF_ONESHOT_MAX_CHARS = 30000    # read_pdf 輸出上限（避免炸 OpenCode context）
+PDF_ONESHOT_MAX_CHARS = 30000    # read_pdf 輸出上限（避免炸模型 context）
 
 # 檔案大小限制
 MAX_BINARY_SIZE = 50 * 1024 * 1024  # 50MB

@@ -871,3 +871,114 @@ def test_strict_question_ref_metadata_survives_trim():
     assert out[0]["content"] == system_prompt
     assert "REF1" in out[0]["content"]
     assert "REF2" in out[0]["content"]
+
+
+# ============================================================
+# 客戶端送出的那一份 payload（AGENTS.md §2 的 gate 延伸）
+# ============================================================
+# 閘要擋的是「llama-server 會從前面靜默截掉」的 prompt，所以它必須對**轉換後
+# 實際送出的 payload** 計數，並以**這一次 request 實送的 max_tokens** 當保留額。
+
+
+@pytest.mark.smoke
+def test_a_payload_with_reasoning_estimates_higher_than_one_without():
+    """assistant 的 reasoning_content 是送出去的 payload,必須被算進去。
+
+    llama.cpp 對 DeepSeek 系模板在帶 tools 時會把歷史 reasoning 全部送回模型。
+    漏算它的話,一段帶長 reasoning 的歷史會被閘判成安全,然後被 server 從前面
+    截掉——正是這個安全層要擋的東西。
+    """
+    plain = [{"role": "assistant", "content": "answer"}]
+    with_reasoning = [
+        {"role": "assistant", "content": "answer", "reasoning_content": "t" * 40_000}
+    ]
+    plain_tokens, _ = context_budget.estimate_tokens(messages=plain)
+    reasoning_tokens, _ = context_budget.estimate_tokens(messages=with_reasoning)
+    assert reasoning_tokens > plain_tokens
+    assert abs((reasoning_tokens - plain_tokens) - 40_000 / config.CHARS_PER_TOKEN) <= 1
+
+
+@pytest.mark.smoke
+def test_both_reasoning_field_names_are_counted():
+    """llama.cpp 用 `reasoning_content`,其他 provider 用 `reasoning`。
+
+    只算其中一個的話,另一種形狀的 payload 會被閘判成安全。
+    """
+    for field in context_budget.REASONING_FIELDS:
+        plain, _ = context_budget.estimate_tokens(
+            messages=[{"role": "assistant", "content": "a"}]
+        )
+        with_field, _ = context_budget.estimate_tokens(
+            messages=[{"role": "assistant", "content": "a", field: "t" * 7_000}]
+        )
+        assert with_field > plain, field
+
+
+@pytest.mark.smoke
+def test_stripping_reasoning_lowers_the_estimate_again():
+    """prune / reasoning 剝除之後的訊息才是被計數的那一份。"""
+    history = [
+        {"role": "assistant", "content": "a", "reasoning_content": "t" * 10_000},
+        {"role": "assistant", "content": "b", "reasoning_content": "t" * 10_000},
+    ]
+    before, _ = context_budget.estimate_tokens(messages=history)
+    stripped = [{k: v for k, v in m.items() if k != "reasoning_content"} for m in history]
+    after, _ = context_budget.estimate_tokens(messages=stripped)
+    assert after < before
+
+
+@pytest.mark.smoke
+def test_the_reserve_is_this_request_max_tokens(monkeypatch):
+    """保留額等於本次 request 實送的 max_tokens,不是 knowledge 的內部常數。"""
+    monkeypatch.setattr(config, "RESERVED_OUTPUT_TOKENS", 4096, raising=False)
+    usage = context_budget.build_usage(
+        source="client",
+        requested_num_ctx=131072,
+        messages=[{"role": "user", "content": "hi"}],
+        reserved_output_tokens=config.CLIENT_MAX_OUTPUT_TOKENS,
+    )
+    assert usage.reserved_output_tokens == config.CLIENT_MAX_OUTPUT_TOKENS
+    assert usage.reserved_output_tokens != config.RESERVED_OUTPUT_TOKENS
+    assert usage.estimated_total_tokens == (
+        usage.estimated_input_tokens + config.CLIENT_MAX_OUTPUT_TOKENS
+    )
+
+
+@pytest.mark.smoke
+def test_an_omitted_reserve_still_uses_the_internal_default(monkeypatch):
+    monkeypatch.setattr(config, "RESERVED_OUTPUT_TOKENS", 4096, raising=False)
+    usage = context_budget.build_usage(
+        source="strict_check",
+        requested_num_ctx=32768,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert usage.reserved_output_tokens == 4096
+
+
+def test_streaming_timings_fill_in_the_token_counts():
+    """llama-server 的串流最後一個 chunk 只帶 `timings`,沒有 `usage`。
+
+    不收它的話,事件流與 eval 的 token 統計永遠是 0。
+    """
+    usage = context_budget.build_usage(source="client", requested_num_ctx=32768)
+    context_budget.parse_usage_from_stream_chunk(
+        {
+            "choices": [{"finish_reason": "stop", "delta": {}}],
+            "timings": {"prompt_n": 303, "predicted_n": 83},
+        },
+        usage,
+    )
+    assert usage.actual_prompt_eval_count == 303
+    assert usage.actual_eval_count == 83
+
+
+def test_an_explicit_usage_block_still_wins_over_timings():
+    usage = context_budget.build_usage(source="client", requested_num_ctx=32768)
+    context_budget.parse_usage_from_response(
+        {
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+            "timings": {"prompt_n": 999, "predicted_n": 999},
+        },
+        usage,
+    )
+    assert (usage.actual_prompt_eval_count, usage.actual_eval_count) == (10, 20)

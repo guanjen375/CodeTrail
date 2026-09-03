@@ -389,7 +389,7 @@ def _run_check(tmp_path, monkeypatch, store_data=None, raw=None):
         store.write_text(raw, encoding="utf-8")
     monkeypatch.setenv(lessons.LESSONS_FILE_ENV, str(store))
     monkeypatch.delenv("AICODE_LESSONS_SKIP", raising=False)
-    monkeypatch.delenv("OPENCODE_DISABLE_PROJECT_CONFIG", raising=False)
+    monkeypatch.delenv("CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS", raising=False)
     return root, lessons_check.main(["--root", str(root)])
 
 
@@ -466,7 +466,7 @@ def test_check_skip_removes_stale_render(tmp_path, monkeypatch, capsys):
 
 
 def test_check_safe_mode_is_honest_and_removes_stale(tmp_path, monkeypatch, capsys):
-    """OPENCODE_DISABLE_PROJECT_CONFIG 模式:OpenCode 從全域設定目錄解析相對
+    """CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS 模式:OpenCode 從全域設定目錄解析相對
     instructions,專案內的 lessons.md 根本不會被載入 —— 這裡必須明講不注入、
     不動不信任的 repo(清殘留除外)、也不讀 store(壞 store 不擋安全模式)。"""
     data = lessons.empty_store()
@@ -481,7 +481,7 @@ def test_check_safe_mode_is_honest_and_removes_stale(tmp_path, monkeypatch, caps
     # JS truthiness(非空即真,"0" 也算開啟)。
     store = tmp_path / "store" / "lessons.json"
     store.write_text("{bad", encoding="utf-8")
-    monkeypatch.setenv("OPENCODE_DISABLE_PROJECT_CONFIG", "0")
+    monkeypatch.setenv("CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS", "0")
     assert lessons_check.main(["--root", str(root)]) == 0
     out = capsys.readouterr().out
     assert "不注入" in out and "已移除" in out
@@ -497,7 +497,7 @@ def test_check_refuses_symlinked_codetrail(tmp_path, monkeypatch, capsys):
     (root / ".codetrail").symlink_to(outside)
     monkeypatch.setenv(lessons.LESSONS_FILE_ENV, str(tmp_path / "store" / "lessons.json"))
     monkeypatch.delenv("AICODE_LESSONS_SKIP", raising=False)
-    monkeypatch.delenv("OPENCODE_DISABLE_PROJECT_CONFIG", raising=False)
+    monkeypatch.delenv("CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS", raising=False)
 
     assert lessons_check.main(["--root", str(root)]) == 2
     out = capsys.readouterr().out
@@ -520,7 +520,7 @@ def test_write_context_refuses_symlinked_lessons_md(tmp_path):
 def test_check_rejects_missing_root(tmp_path, monkeypatch):
     monkeypatch.setenv(lessons.LESSONS_FILE_ENV, str(tmp_path / "lessons.json"))
     monkeypatch.delenv("AICODE_LESSONS_SKIP", raising=False)
-    monkeypatch.delenv("OPENCODE_DISABLE_PROJECT_CONFIG", raising=False)
+    monkeypatch.delenv("CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS", raising=False)
     assert lessons_check.main(["--root", str(tmp_path / "nope")]) == 2
 
 
@@ -564,39 +564,8 @@ def test_cli_reports_corrupt_store(tmp_path, capsys):
 # opencode.json 契約(instructions 注入 + record_lesson permission)
 # ---------------------------------------------------------------------------
 
-def test_permission_template_gates_record_lesson_after_wildcard():
-    keys = list(sc._OPENCODE_PERMISSION_TEMPLATE)
-    assert sc._OPENCODE_PERMISSION_TEMPLATE["codetrail_record_lesson"] == "ask"
-    # OpenCode 是 last-matching-rule-wins:ask 覆寫必須排在 codetrail_* 之後
-    assert keys.index("codetrail_record_lesson") > keys.index("codetrail_*")
 
 
-def test_opencode_merge_adds_instructions_and_preserves_user_entries(tmp_path):
-    class FakePlan:  # build_opencode_config 只用 plan.main_key / plan.ctx
-        main_key = "mymodel"
-        ctx = 4096
-
-    existing = tmp_path / "opencode.json"
-
-    # 全新檔:範本要含 lessons 注入
-    config, _ = sc.build_opencode_config(FakePlan(), "python3", existing)
-    assert config["instructions"] == [sc._OPENCODE_LESSONS_INSTRUCTION]
-
-    # 既有檔已有自己的 instructions:保留並補上 lessons 項
-    existing.write_text(json.dumps({
-        "model": "llamacpp/mymodel",
-        "instructions": ["CONTRIBUTING.md"],
-    }), encoding="utf-8")
-    merged, changes = sc.build_opencode_config(FakePlan(), "python3", existing)
-    assert merged["instructions"] == ["CONTRIBUTING.md", sc._OPENCODE_LESSONS_INSTRUCTION]
-    assert any("instructions" in c for c in changes)
-
-    # 已經有 lessons 項:不重複加
-    existing.write_text(json.dumps({
-        "instructions": ["CONTRIBUTING.md", sc._OPENCODE_LESSONS_INSTRUCTION],
-    }), encoding="utf-8")
-    merged, changes = sc.build_opencode_config(FakePlan(), "python3", existing)
-    assert merged["instructions"].count(sc._OPENCODE_LESSONS_INSTRUCTION) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +585,7 @@ def test_full_lifecycle_correction_to_review(tmp_path, monkeypatch, capsys):
     root.mkdir()
     monkeypatch.setenv(lessons.LESSONS_FILE_ENV, str(store))
     monkeypatch.delenv("AICODE_LESSONS_SKIP", raising=False)
-    monkeypatch.delenv("OPENCODE_DISABLE_PROJECT_CONFIG", raising=False)
+    monkeypatch.delenv("CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS", raising=False)
     context = root / lessons.LESSONS_CONTEXT_RELPATH
 
     # 1. 使用者糾正 → 模型提案 → ask 核准 → 寫入
@@ -648,3 +617,35 @@ def test_full_lifecycle_correction_to_review(tmp_path, monkeypatch, capsys):
     lessons.save_lessons(store, data)
     assert lessons_check.main(["--root", str(root)]) == 0
     assert "migration 前先確認" in context.read_text(encoding="utf-8")
+
+
+@pytest.mark.smoke
+def test_record_lesson_stays_behind_a_human_approval():
+    """`record_lesson` 寫的是**未來每一輪都會生效**的行為規則。
+
+    以前這道閘在 opencode.json 的 permission 表(`codetrail_*: allow` 之後把它
+    覆成 ask);現在它在客戶端的 policy 裡。閘掉了就是模型可以自己給自己立規則。
+    """
+    import client_policy
+
+    assert "record_lesson" in client_policy.ASK_TOOLS
+    policy = client_policy.InteractivePolicy()
+    assert policy.decide(
+        "record_lesson", read_only=False, arguments={}
+    ) is client_policy.Decision.ASK
+
+
+@pytest.mark.smoke
+def test_the_rendered_lessons_file_reaches_the_system_prompt(tmp_path, monkeypatch):
+    """docs/lessons.md 的三步驗證:render 出來的檔要真的進 system prompt。"""
+    import client_prompt
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv(client_prompt.DISABLE_PROJECT_INSTRUCTIONS_ENV, raising=False)
+    root = tmp_path / "project"
+    (root / ".codetrail").mkdir(parents=True)
+    (root / ".codetrail" / "lessons.md").write_text(
+        "- [L-001] 回答前先讀 README", encoding="utf-8"
+    )
+    prompt = client_prompt.build_system_prompt(root)
+    assert "[L-001] 回答前先讀 README" in prompt.text

@@ -19,7 +19,7 @@ requested <= server n_ctx 一律 SAFE 放行 ——「小於」不是安全問�
     AICODE_CTX_SAFETY_DISABLE     =1 時整個檢查跳過 (除錯 / 緊急逃生)
 
 退出碼:
-    0  SAFE / UNKNOWN / 使用者覆蓋          → 可以繼續 exec opencode
+    0  SAFE / UNKNOWN / 使用者覆蓋          → 可以繼續 exec 客戶端
     2  UNSAFE 或 AICODE_MODEL 未設且使用者沒覆蓋 → wrapper 應該 abort
 
 設計守則:
@@ -67,7 +67,7 @@ def main() -> int:
         _print("        CodeTrail 不內建預設主模型, 無法做 ctx 安全檢查。")
         _print("        請啟動 llama-server (建議 port 8080) 並設定:")
         _print("          export AICODE_MODEL=<MODEL>  # registry name 或 GGUF 路徑")
-        _print("        或透過 aicode wrapper 自動解析 (aicode 會讀 opencode.json 主模型)。")
+        _print("        或透過 aicode wrapper 自動解析 (aicode 會解析 deployment profile 的主模型)。")
         _print("        若刻意要跳過檢查 (例如 CI), 設 AICODE_CTX_SAFETY_DISABLE=1。")
         _print("refuse to start.")
         return 2

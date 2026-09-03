@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# aicode_web — 在目前專案背景(tmux)啟動 OpenCode web backend。
+# aicode_web — 在目前專案背景(tmux)啟動 CodeTrail web backend。
 #
 # 預設為 Tailscale 模式:只綁 A 機的 Tailscale IPv4(100.64.0.0/10),
 # B 機用印出的網址直接開;不會 listen 在 LAN / 公網介面。
@@ -18,7 +18,8 @@
 #   AICODE_WEB_PORT      backend port,預設 4096(要跟 attach / ssh tunnel 一致)
 #   WEB_SESSION          tmux session 名稱,預設 codetrail-web
 #   WEB_HEALTH_TIMEOUT   等待 backend ready 的秒數,預設 720(首次 tool canary 可能數分鐘)
-#   AICODE_MODEL 等 AICODE_* / AI_CODE_* / OPENCODE_* 變數照常透傳給 aicode web
+#   AICODE_MODEL 等 AICODE_* / AI_CODE_* 變數照常透傳給 aicode web(OPENCODE_* 只透傳 OPENCODE_CONFIG)
+#   AICODE_WEB_PASSWORD 例外:它**不會**進 tmux 指令列(見下面的密碼交接)
 #
 # 啟動後:
 #   aicode_web stop            停止 backend
@@ -92,7 +93,7 @@ usage() {
 選項:
   --local       不用 Tailscale,只綁 127.0.0.1(B 機走 ssh -L 4096:127.0.0.1:4096)
   --tailscale   明確指定 Tailscale 模式(預設即是;只綁 `tailscale ip -4` 回報的位址)
-  --dry-run     只印解析結果,不啟動 tmux / OpenCode
+  --dry-run     只印解析結果,不啟動 tmux / backend
   -h, --help    顯示本說明
   --            後面的參數原樣交給 aicode web
 
@@ -334,13 +335,38 @@ fi
 
 # 組 backend 啟動指令。⚠️ tmux pane 不會繼承呼叫端 shell 的環境變數,所以這裡把
 # CodeTrail 相關的 AICODE_* / AI_CODE_* / OPENCODE_* 明確 export 進去 —— 否則
-# AICODE_WEB_PORT、AI_CODE_* 透傳、OPENCODE_SERVER_PASSWORD 會被默默丟掉。
-# 之後 cd 專案 → activate venv(有的話)→ exec aicode web [forward]。
+# AICODE_WEB_PORT 與 AI_CODE_* 透傳會被默默丟掉。
+#
+# `OPENCODE_*` 只透傳 `OPENCODE_CONFIG`(一個路徑,遷移偵測要看它):升級機器上
+# 可能還留著 `OPENCODE_SERVER_PASSWORD` / `OPENCODE_CONFIG_CONTENT` 之類的舊變數,
+# 整組展開進 LAUNCH 等於把舊密碼印進 dry-run 與 tmux scrollback。
+#
+# **AICODE_WEB_PASSWORD 例外**:值不得出現在這個字串裡。它會被
+# `tmux send-keys` 打進 pane(留在 scrollback,失敗時還會被 capture-pane 收走),
+# 而且 --dry-run 會直接印到 stdout。改成寫進一個 0600 的暫存檔,由 pane 自己
+# 讀完就刪 —— 指令列上只剩路徑。
 LAUNCH=""
+SECRET_FILE=""
 while IFS= read -r _var; do
     [[ -n "$_var" ]] || continue
+    if [[ "$_var" == "AICODE_WEB_PASSWORD" ]]; then
+        continue
+    fi
     LAUNCH+="export $_var=$(web_shell_quote "${!_var}") && "
-done < <(compgen -v | grep -E '^(AICODE_|AI_CODE_|OPENCODE_)' | sort || true)
+done < <(compgen -v | grep -E '^(AICODE_|AI_CODE_)|^OPENCODE_CONFIG$' | sort || true)
+if [[ -n "${AICODE_WEB_PASSWORD:-}" ]]; then
+    if (( DRY_RUN )); then
+        LAUNCH+="export AICODE_WEB_PASSWORD=\"\$(cat <密碼暫存檔)\" && "
+    else
+        SECRET_DIR="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/codetrail-web.XXXXXX")"
+        chmod 700 "$SECRET_DIR"
+        SECRET_FILE="$SECRET_DIR/password"
+        ( umask 077; printf '%s' "$AICODE_WEB_PASSWORD" > "$SECRET_FILE" )
+        trap 'rm -rf -- "$SECRET_DIR"' EXIT
+        LAUNCH+="export AICODE_WEB_PASSWORD=\"\$(cat $(web_shell_quote "$SECRET_FILE"))\" && "
+        LAUNCH+="rm -f $(web_shell_quote "$SECRET_FILE") && "
+    fi
+fi
 if (( TAILSCALE_MODE )); then
     # aicode_web 的 GUI 在 B 機。抑制 OpenCode 嘗試從純文字 A 機呼叫 xdg-open;
     # --local 模式不改使用者既有的 browser 行為。
@@ -506,7 +532,7 @@ while (( SECONDS < deadline )); do
     fi
     if backend_session_gone; then
         echo "ERROR: web backend 啟動後立刻結束(多半是 aicode web 的 preflight 擋下:" >&2
-        echo "       llama-server 沒起 / 主模型未設 / Tailscale 斷線 / opencode 太舊)。" >&2
+        echo "       llama-server 沒起 / 主模型未設 / Tailscale 斷線 / 沙箱 root 被拒)。" >&2
         exit 1
     fi
     if backend_pane_dead; then

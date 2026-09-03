@@ -1,6 +1,6 @@
 # MCP 工具清單
 
-這份文件列出 CodeTrail MCP server 暴露給 OpenCode 的工具，以及工具使用原則。
+這份文件列出 CodeTrail MCP server 暴露給聊天客戶端的工具，以及工具使用原則。
 
 [回到 README](../README.md)。
 
@@ -17,7 +17,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 
 你不用手動寫 JSON 或自己呼 API。這些工具會出現在 frontend 的 MCP 工具列表裡；日常用法是在對話中直接要求模型「用工具 `<工具名>` 做某件事」。多數情況只講工具名就夠了，模型會自己補預設參數；需要指定檔案、行號、搜尋範圍時，再把那些條件寫進自然語言。
 
-判斷有沒有真的執行,要看 frontend 的工具卡 / 回傳結果或結構化 `tool_use` event,不要看模型如何描述自己的工具清單。`/status` 的 Connected 只證明 MCP transport 已連線;模型輸出 `<codetrail_list_dir .../>` 之類純文字後自行宣稱成功,仍是假呼叫。完整診斷見 [Connected 但沒有實際 tool call](troubleshooting.md#mcp-connected-but-no-tool-call)。
+判斷有沒有真的執行,要看畫面上的 `· <工具> → completed` 或結構化 `tool_use` event,不要看模型如何描述自己的工具清單。`/tools` 列得出來只證明 MCP transport 已連線;模型輸出 `<list_dir .../>` 之類純文字後自行宣稱成功,仍是假呼叫。完整診斷見 [列得出工具但沒有實際 tool call](troubleshooting.md#mcp-connected-but-no-tool-call)。
 
 ### 最常用講法
 
@@ -124,7 +124,7 @@ target repo，必須維持 owner-only 權限（POSIX `chmod 600`）；pattern �
 
 ### 結果文字與預算契約
 
-OpenCode 只採用每次工具結果唯一的一個精簡文字 block。第一行固定是
+客戶端只把每次工具結果唯一的那個精簡文字 block 送進模型。第一行固定是
 `status: ok|partial|error`；只有 partial、error 或截斷結果才在第二行給可操作的 `next:`。
 `read_file` 的 next 會給實際下一個 `start_line`，`grep_code`／`list_dir` 的 next 會要求縮小
 path、include、pattern 或 depth。錯誤的修復方式一定存在文字 block，不能只放在

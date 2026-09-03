@@ -3,7 +3,7 @@
 
 設計重點:server 啟動時的 `-c <N>` (= /props 的 n_ctx) 是 runtime 真值。
 aicode 啟動時跑這支,把讀到的值以 AICODE_N_CTX 傳給 CodeTrail，並自動同步
-OpenCode 的鏡像欄位；使用者不需要維護另一個 max。
+客戶端與 MCP server 都從這裡取值；使用者不需要維護另一個 max。
 
 合約:
     stdout  只印一個整數 n_ctx;讀不到就「什麼都不印」(空字串)。

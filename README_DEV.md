@@ -1,6 +1,6 @@
 # CodeTrail 開發者備忘
 
-這份文件說明 OpenCode 日常使用以外的開發者基礎設施。專案首頁主要看 `README.md`；
+這份文件說明日常使用以外的開發者基礎設施。專案首頁主要看 `README.md`；
 AI agent 改 repo 前看 `AGENTS.md`（安全紅線與禁止事項）；這裡只放維護命令與內部工具。
 
 ---
@@ -17,13 +17,13 @@ full。靜態 consistency / compile 檢查不會收集 pytest，可在相關檔�
 python3 -m compileall -q .
 python3 scripts/check_eval_consistency.py
 python3 scripts/check_readme_consistency.py
-python3 scripts/opencode_contract_check.py            # 全域 opencode.json / AGENTS.md / 壓縮 plugin 漂移
-python3 scripts/compaction_status.py          # 目前的壓縮模式(aicode 橫幅那一行;純讀取)
+python3 opencode_migrate.py --check                   # 舊 OpenCode 安裝殘留(只偵測,不寫檔)
+python3 codetrail_chat.py status              # 目前的壓縮模式(aicode 橫幅那一行;純讀取)
 python3 scripts/doctor.py --no-network        # 用機器上實際設定的模型；不要塞假 model 名
 python3 deployment_profile.py validate
 
-# 部署唯讀相容檢查（需要本機 OpenCode；不寫設定、不跑 MCP/model）
-python3 scripts/opencode_direct_contract.py --root <PROJECT_TO_ANALYZE>
+# 舊 OpenCode 安裝的一次性遷移(唯一會寫使用者 opencode.json 的路徑;有備份)
+python3 opencode_migrate.py
 
 # 測試入口（何時能跑見 AGENTS.md §1）
 python3 scripts/run_tests.py -m smoke
@@ -36,7 +36,7 @@ ruff check tests scripts
 截至 2026-08，MCP Python SDK 2.x 已是 stable；本 repo 仍刻意留在維護中的
 v1：`requirements.txt` 使用官方給未遷移專案的 `mcp>=1.28,<2`，因為程式
 仍 import `mcp.server.fastmcp.FastMCP`。SDK 2.x migration 必須另案同步處理 import、
-transport、schema 與 OpenCode 相容性，不能只移除 `<2`。`doctor` 會把缺少
+transport 與 schema，不能只移除 `<2`。`doctor` 會把缺少
 MCP、低於 1.28 或 2.x 都列為 FAIL。
 
 `python3 scripts/run_tests.py` 無參數時先用真的 `pytest --collect-only` 收一次，再以標準庫把
@@ -73,7 +73,7 @@ conftest／harness／pyproject／requirements／`tests/fixtures/`）就退回完
 各 shard 內耗時總和」與最慢的幾條（≥0.5s），給 §1.1 的 smoke 10 秒目標做趨勢觀察；
 **不設硬秒數閾值**，不同機器差好幾倍，拿秒數當 gate 只會製造假紅燈。
 
-核心日常入口是 OpenCode TUI；跨機 web 另有薄 launcher（兩者共用 `aicode` 安全前置）：
+核心日常入口是 CodeTrail 終端客戶端;跨機 web 另有薄 launcher(兩者共用 `aicode` 安全前置):
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
@@ -106,9 +106,11 @@ docstring 說明它涵蓋哪些原始檔與為什麼：
   （set_config.sh 的問答、模型、artifacts、壓縮段）、`test_server_scripts.py`
   （launch／stop／check_status、aicode_web）、`test_deployment.py`（deployment profile、
   模型解析、GPU 與 ctx 安全、config）、`test_doctor.py`（doctor + tool-call canary）、
-  `test_opencode_checks.py`、`test_lessons.py`。
-- OpenCode 壓縮 / plugin：`test_compaction_mode.py`（ownership 狀態檔 + status 行）、
-  `test_opencode_plugins.py`（codetrail-compaction.js 與 codetrail-notify.js 的跨語言契約）。
+  `test_lessons.py`。
+- 客戶端:`test_client_mcp.py`(取消契約)、`test_client_store.py`(session 檔私密性)、
+  `test_client_engine.py`(訊息轉換 / 權限 / 工具迴圈)、`test_client_cli.py`(事件流與前端)、
+  `test_client_compaction.py`(壓縮規則與門檻)、`test_client_web.py`(存取邊界)、
+  `test_opencode_migrate.py`(舊安裝遷移)。
 - MCP / sandbox / mutation：`test_mcp_server.py`（啟動、runtime policy、工具目錄、
   JSON-RPC roundtrip、結果預算、external import）、`test_mcp_ingest.py`（ingest 子行程、
   stream、通知）、`test_mcp_lease.py`、`test_fs_sandbox.py`（read／list／grep／read_pdf 的
@@ -159,31 +161,30 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
 - 換 `EMBEDDING_MODEL` → `eval/spec_adversarial.json` 也要改
 - 在 `knowledge.py` 這類檔案大量增刪行 → `eval/code_questions.json` 釘的 `line` 會漂出 ±20(實際發生過:`query` 從 2172 移到 2810),要更新
 - 新增／移除／重排 MCP 工具 → 先改 `mcp_contract.PUBLIC_TOOL_ORDER`，再同步
-  `docs/mcp-tools.md` 與 `docs/opencode-agents-template.md` fenced block **外**的固定順序
+  `docs/mcp-tools.md` 的固定順序
   manifest；可安裝的全域 prompt 只保留 `codetrail_*` schema anchor，禁止把完整清單搬回去。
   使用者還在用舊版固定清單時，`aicode` 會提示 `⚠ STALE`
 - 壓縮接管(`codetrail` / `manual`)**還在測試階段**:標示的單一來源是
   `compaction_mode.EXPERIMENTAL_TAG` / `EXPERIMENTAL_NOTICE`,由 set_config 的問答與
-  摘要頁、`scripts/compaction_status.py`(aicode 啟動橫幅)、`scripts/doctor.py` 與
+  摘要頁、`client_status.py`(`codetrail_chat.py status`,aicode 啟動橫幅)、`scripts/doctor.py` 與
   `docs/compaction-rules.md` / `README.md` 共用。要拿掉「實驗中」是一次全域決定,
   不是改其中一處——`tests/test_compaction_mode.py` 釘住問答與文件都還帶著它
 - 改壓縮的七條摘要規則或門檻公式 → `docs/compaction-rules.md` 的兩個 ```text 區塊是
-  **唯一來源**，`opencode_plugins/codetrail-compaction.js` 的 `RULES_TEXT` /
-  `RECONCILIATION_HEADER` 逐字沿用它們，`compaction_mode.derive_settings` 與 plugin 的
-  `deriveSettings()` 是同一條公式的兩份實作。三處任一改了另外兩處沒跟上，只會讓門檻與
-  保留額對不上——沒有任何錯誤訊息。`tests/test_opencode_plugins.py` 逐字比對
-- 新增 `compaction.*` 受管鍵 → `compaction_mode.MANAGED_COMPACTION_KEYS` 與 plugin 端的
-  同名常數要一起改,而且**預設不要進** `CONTRACT_COMPACTION_KEYS`:契約鍵的意思是「值
+  **唯一來源**，`client_compaction.py` 的
+  `RECONCILIATION_HEADER` 逐字沿用它們，門檻公式只有 `compaction_mode.derive_settings`
+  一份實作（客戶端直接呼叫它）。文件與程式任一改了另一邊沒跟上，只會讓門檻與
+  保留額對不上——沒有任何錯誤訊息。`tests/test_client_compaction.py` 逐字比對
+- 新增 `compaction.*` 受管鍵（只影響 `opencode_migrate` 還原舊安裝的範圍）→ 改
+  `compaction_mode.MANAGED_COMPACTION_KEYS`,而且**預設不要進** `CONTRACT_COMPACTION_KEYS`:契約鍵的意思是「值
   不符就停用那個 session 的自動壓縮」,只有「改了會讓壓縮失真」的鍵才配得上這個後果。
   新鍵一律不由 runtime 或 contract check 自己補寫(沒有 ownership 紀錄就切不回 native),
   由 `compaction_mode.unmanaged_keys()` 報出來、使用者重跑 `./set_config.sh`
-- 舊回合 reasoning 的處理在 plugin 的 `experimental.chat.messages.transform`
-  (`stripHistoricalReasoning`)。它改的是**送進模型的訊息本身**,多砍一個 part 是靜默
-  失真、砍到 tool part 會讓 provider 直接報錯,所以只准動 `reasoning`、只准就地換陣列
-  元素。逃生口是 `CODETRAIL_KEEP_REASONING=1`(`scripts/compaction_status.py` 與 plugin
-  各有一份同名常數,由 `tests/test_opencode_plugins.py` 比對)
-- 新增 incident kind / detail slug → `mcp_lease.py`、`opencode_plugins/codetrail-notify.js`、
-  `opencode_plugins/codetrail-compaction.js` 與 `tests/test_opencode_plugins.py` 的
+- 舊回合 reasoning 的處理在 `client_engine.strip_historical_reasoning()`(送模型前的
+  訊息轉換)。它改的是**送進模型的那一份訊息**,多砍一個欄位是靜默失真、砍到 tool
+  訊息會讓 llama-server 直接報錯,所以只准動 `reasoning` 欄位、只准動最新一則真實使用者
+  訊息之前的、認不出那則訊息就整段不動;session 檔與畫面保留原文。逃生口是
+  `CODETRAIL_KEEP_REASONING=1`(`client_status.py` 與 engine 各有一份同名常數)
+- 新增 incident kind / detail slug → `mcp_lease.py` 與 `tests/test_mcp_lease.py` 的
   凍結 tuple 必須一起改（跨語言封閉集合；一端沒跟上就把另一端寫的合法值正規化成
   `unknown`，那些事件在 doctor 的統計裡等於憑空消失）
 
@@ -194,7 +195,7 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
 
 ## eval 是什麼
 
-`eval/` 是固定題庫與離線回歸評測，不會記錄使用者對話，也不會被 OpenCode/MCP runtime 自動使用。
+`eval/` 是固定題庫與離線回歸評測，不會記錄使用者對話，也不會被 runtime 自動使用。
 
 主要檔案：
 
@@ -242,33 +243,28 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
 - `eval/fixtures/tool_routing/cases.json`：隔離 synthetic root 的 9 個檔案、1 份 KB 文件與
   15 個中英／混合 routing cases；結果只保存分類、aggregate、token/latency/compaction
   計數，不保存 prompt、assistant text、tool args/result、session id 或專案路徑。
-- `eval/fixtures/tool_routing/support_matrix.json`：6 個明示 arm 與逐列 compatibility／gate
-  真值。目前唯一一列仍是 `measured`；2026-08-27 已把逐 arm 凍結 digest、routing baseline
-  與完整 privacy-safe aggregates 寫回，但沒有任何 arm 通過全部 gate，所以**沒有任何列可
-  宣稱 supported**。harness 絕不改 matrix；gate 通過只輸出
-  `manual_status_change_required=true`，仍需人工審核後明示改狀態。特別注意：目前
-  `--arm` 只選擇／記錄 arm id，**不會替操作者切換 OpenCode config、tool schema、build
-  prompt 或 todowrite permission**。每個真模型 arm 必須先由維護者在隔離環境套用 exact
-  variant，核對凍結 config/artifact digest 與 matrix 中的 contract digest；不相符就
-  fail-loud。
+- `eval/fixtures/tool_routing/support_matrix.json`：OpenCode 時代的 6 個 arm（歷史 row，
+  `measured`）與客戶端時代的 `client_baseline`（`unsupported`，尚未重量）兩種 row 並存。
+  2026-08-27 寫回的逐 arm 凍結 digest、routing baseline 與 privacy-safe aggregates 只屬於
+  歷史 row；客戶端 row 還沒有任何量測，所以**沒有任何列可宣稱 supported**。harness 絕不改 matrix；gate 通過只輸出
+  `manual_status_change_required=true`，仍需人工審核後明示改狀態。特別注意：
+  `--arm` 只選擇／記錄 arm id，**不會替操作者切換 tool schema 或客戶端規則**；歷史 row 綁的
+  是當年凍結 config/artifact digest，客戶端 row 的 contract digest 綁的是 `client_prompt` 的
+  規則檔與工具 catalog，不相符就 fail-loud。
 - `session_eval.py`／`scripts/session_eval.py`：明示 opt-in 的私人 session-model eval。
-  `opencode export` 只負責來源封存；mined draft 排除所有歷史 assistant text，curated suite
+  session store 的匯出只負責來源封存；mined draft 排除所有歷史 assistant text，curated suite
   禁止 `expected_answer`／`gold_answer` 類欄位，只接受外部 verifier、`human_pairwise` 或
   `unscored`。原始 prompt／candidate answer 只寫 `.codetrail/session_eval` 的 0700/0600
   私有產物，永不放進 checked-in `eval/`；runner 核對 live GGUF 與 project-state digest，
   並雙層關閉寫入／執行工具。每題原子 checkpoint；resume 必須重驗 suite／模型／現場，
   單題 timeout 記為該題失敗而不丟掉先前結果。完整流程見 `docs/session-model-eval.md`。
-  **壓縮語意**：replay config 一律同時拿掉 CodeTrail plugin **與**受管的 `compaction.*`
-  ——只拿掉其中一邊會形成「上游 auto 關閉、idle 觸發那一端又不在」的混合語意，長案例
-  會變成互動端不會發生的 provider 錯誤，而 `compaction_events` 靜靜讀到 0。以壓縮本身
-  為題的 suite 才用 `--keep-compaction`,它會**同時**保留受管設定、把壓縮 plugin 加回
-  replay config、在 0700 暫存目錄寫一份綁定該臨時 config 的拋棄式 ownership state
-  (`AICODE_COMPACTION_STATE`),並量測 OpenCode 版本傳給 plugin 的版本閘。這四樣任一
-  不成立(plugin 檔不在、global 缺受管鍵、受管值不是候選/compaction agent 模型推導的、
-  版本低於 1.18.17)就 `SessionEvalError` —— 少了這些前置檢查,結果會是「完全沒有壓縮」
-  而沒有人知道。`scripts/eval_tool_routing.py`
-  走的是**有效**全域設定（plugin 與 `compaction.*` 都在），所以那條路徑的語意就是
-  使用者目前的模式；不同模式的結果不可比，`effective_config_digest` 已經涵蓋這一點。
+  **壓縮語意**：replay 一律以 `replay_client_config()` 跑客戶端,預設壓縮模式 `off`
+  ——長案例撞到 context 上限就是該題失敗,不會靜靜壓縮掉一半題目。以壓縮本身為題的
+  suite 才用 `--keep-compaction`,它讓 replay 用 `codetrail` 模式(客戶端自己的
+  `client_compaction`),而且 `_compaction_identity()` 會把模式、live `n_ctx` 推導出的
+  門檻與保留額一起寫進結果 identity——不同模式 / 不同 n_ctx 的結果不可比。
+  `scripts/eval_tool_routing.py` 走的是**使用者目前有效的**客戶端設定,語意就是使用者
+  目前的模式;`effective_config_digest` 已經涵蓋這一點。
   摘要**品質**（七條規則、五輪權重、舊結論淘汰）只走這條私人 eval，不進 smoke / full——
   用 mock 驗模型輸出品質等於沒驗。
 - `scripts/mcp_catalog.py`／`scripts/eval_tool_routing.py`：runtime catalog 預設從 effective
@@ -321,13 +317,13 @@ LLAMA_BIN=~/llama.cpp/build/bin/llama-server \
 精確率、拒答率/拒答正確率。`eval/run_eval.py` 才需要本機 4 個 llama-server 與對應 GGUF。
 
 `scripts/eval_tool_routing.py` 不加 `--catalog-only` 才走真模型；這條只可在既有**明示授權**下，
-使用相容 OpenCode、選定 matrix row/arm、isolated synthetic root 與停用其他 MCP server
+選定 matrix row/arm、isolated synthetic root 與停用其他 MCP server
 執行。`--arm` 不做 variant composition；執行前還必須由維護者凍結並核對該 arm 的 exact
 config／artifact／contract digest。完整介面是：
 
 ```bash
 python3 scripts/eval_tool_routing.py --root ROOT --matrix-row ROW_ID --arm ARM \
-    --output RESULT.json [--model provider/model] [--catalog-only] [--frozen-contract]
+    --output RESULT.json [--model MODEL] [--catalog-only] [--frozen-contract]
 ```
 
 `--catalog-source in-process` 是 CI/testing 隱藏選項，而且只允許搭配 `--catalog-only`；日常
@@ -336,10 +332,16 @@ message/model/`max_tokens=1`/stream，只差 tools；任何一側 usage 缺失�
 FastMCP instructions 另以對稱 apply-template/tokenize marginal delta 計入。沒有授權、沒有
 live-after 結果或 gate 未通過，都要明列未完成，不能把 `measured` 改寫成 `supported`。
 
-本次 checked-in 狀態是 2026-08-27 經明示授權、在同一個
-DeepSeek-V4-Flash UD-Q8_K_XL／Unsloth／OpenCode 1.18.21 row 完成的 privacy-safe aggregate。
-六個 arm 都先凍結 exact contract digest，再各跑完整 15-case fixture；這是量測證據，仍不是
-支援宣告：
+**這張表是 OpenCode 時代的量測。** 2026-08-27 經明示授權、在
+DeepSeek-V4-Flash UD-Q8_K_XL／Unsloth row 完成的 privacy-safe aggregate;六個 arm 都先凍結
+exact contract digest，再各跑完整 15-case fixture。去 OpenCode 化之後,`build prompt` 與
+`todowrite` 這兩個當時的變因**已經不存在**(現在的等價物是客戶端的 `BASE_RULES` 與
+`client_policy.ASK_TOOLS`),所以那六個 arm 不可能再被跑一次;matrix 裡對應的 row 是
+`...__opencode-1-18-21-historical`,標了 `era: "opencode"`。
+
+客戶端時代的 row(`...__codetrail-client` / `client_baseline` arm)目前只量了 catalog 契約,
+routing 指標**尚未**在新客戶端下重量,所以 `status` 是 `unsupported`(fail-closed)。下面
+仍是量測證據，仍不是支援宣告:
 
 | arm | catalog tokens | tool recall | evidence adoption | 主要失敗／決策 |
 |---|---:|---:|---:|---|
@@ -356,10 +358,9 @@ promise=1，所以仍淘汰。`selected_combo_v2_exact_routes` 另有 1 個 harn
 strict canary 仍無法穩定產生中英文規格工具呼叫，因此停止 prompt tuning，沒有拿部分 canary
 冒充 full gate。
 
-結果是 matrix row 保持 `measured`、`supported_arm=null`，每個正式 result 都是
-`manual_status_change_required=false`，人工升級條件未觸發。build prompt 預設為 false，只能用
-`--enable-experimental-build-prompt` 明確 opt-in；`todowrite` 維持 `allow`。所有 checked-in
-measurement 都是統計與相容性 digest，不含 prompt、專案路徑、工具參數或輸出。
+結果是歷史 row 保持 `measured`、`supported_arm=null`，每個正式 result 都是
+`manual_status_change_required=false`，人工升級條件未觸發。所有 checked-in measurement
+都是統計與相容性 digest，不含 prompt、專案路徑、工具參數或輸出。
 
 ### Code graph 的 C/C++ 保守解析
 
@@ -520,7 +521,7 @@ data/interactions.jsonl
 
 記錄內容包含 question、answer、refs、code snippets、mode、KB score、repo commit、model tag、agent tool calls、files read。這些資料在 NDA 場景通常含敏感內容；預設的 repo 內輸出已由 `.gitignore` 排除。
 
-OpenCode/MCP server 端只記 KB-shaped tools：
+MCP server 端只記 KB-shaped tools：
 
 - `query_knowledge`
 - `query_knowledge_strict`
@@ -544,7 +545,7 @@ python3 data_flywheel.py export --file data/interactions.jsonl --output data/tra
 |---|---|---|
 | 會自動記錄對話 | 不會 | 會，但必須設 `AI_CODE_COLLECT_DATA=1` |
 | 用途 | 固定題庫回歸測試 | 收集真實互動樣本 |
-| 日常 OpenCode 是否需要 | 不需要 | 不需要 |
+| 日常使用是否需要 | 不需要 | 不需要 |
 | 是否適合成熟產品 | 適合做 regression gate | 適合做資料閉環，但要更嚴格處理隱私 |
 
 ---
@@ -572,7 +573,7 @@ journaled 寫入 → best-effort rollback。
   node）；三態 passed / failed / skipped，任何 skipped 都渲染成「驗證不完整」，失敗不回滾。
   import 集合由 `tests/test_patch_verify.py::test_patch_verify_module_import_allowlist_is_exact`
   用 ast 釘成 allowlist，`test_auto_verify_true_spawns_no_subprocess` 守住不 spawn；lint / test
-  由 `codetrail_run_lint(fix=False)` / `codetrail_run_command` 顯式呼叫，各自經 OpenCode ask。
+  由 `run_lint(fix=False)` / `run_command` 顯式呼叫，各自經人工核准。
 - `run_command` 的 `timeout` 三層同值（native schema、executor、MCP
   `Annotated[int, Field(strict=True, ge=1, le=600)]`），常數在 `config.RUN_COMMAND_TIMEOUT{,_MIN,_MAX}`；
   `scripts/check_readme_consistency.py` 第 9–11 條把 5／200、1..600、dry_run 七欄位與驗證分層
@@ -584,13 +585,11 @@ journaled 寫入 → best-effort rollback。
 |---|---|
 | `mcp_contract.py` | `PUBLIC_TOOL_ORDER` 是 live 19-tool 名稱與順序唯一來源；同檔也定義 bounded FastMCP instructions 與 evidence-tool 集合。 |
 | `tool_result_adapter.py` | 每個 tool call 都產生單一 compact text block；首行 `status: ok|partial|error`，需要修復／續讀時才有 `next:`。省略 `max_chars` 時以 call-time `config.N_CTX` 的 12% token proxy 配置，明示過大值標 `context_risk`；三個 evidence tool 保留未改 core structured payload。 |
-| `scripts/opencode_build_prompt.py` | 從 `docs/opencode-build-prompt.md` 唯一 fenced block 抽 canonical body；一般安裝不新增 prompt，只有 `--enable-experimental-build-prompt` 明確 opt-in。之後舊 managed reference 才同步，custom string 保留、型別錯誤 fail-loud。prompt `0644` 與 config `0600` 同 transaction／symlink write-through／rollback。synthetic composition 只證明取代 default；完整 routing A/B 已失敗，不能宣稱 supported。 |
-| `scripts/opencode_direct_contract.py` | 在任何 writer/MCP/model 前只讀驗證 OpenCode `>=1.17,<2` direct contract；V2 `mcp.servers`、任何 `codemode` 或無法解析版本都 exit 2。 |
 | `scripts/tool_call_canary.py` | live MCP protocol；explicit 點名工具 hard gate（retry 一次）；implicit 未點名工具單次診斷，四態 `optimal/suboptimal/fail/timeout` 不擋啟動。schema 2 分離 cache lane 只存 hash/status/time/version；`supports_tools=false` 在 model attempt 前 fail。 |
 | `scripts/mcp_catalog.py`／`scripts/eval_tool_routing.py` | effective stdio catalog、privacy-safe routing classification/gates 與 frozen historical baseline replay；harness 永不自行把 matrix row 升級成 supported。 |
 
 部署 live-after 不進 CI，也不是所有開發環境必綠。受授權且相容的乾淨部署才執行
-`AICODE_TOOL_CANARY_FORCE=1 aicode` 與 routing eval 真模型 arm，記錄 OpenCode／MCP SDK、
+`AICODE_TOOL_CANARY_FORCE=1 aicode` 與 routing eval 真模型 arm，記錄客戶端／MCP SDK、
 模型／chat template／effective config、explicit 與 implicit 結果。環境不可得時逐字回報
 `not run: environment unavailable`；未授權、未跑或 gate 未通過都保持 incomplete，不能阻擋
 離線驗收，也不能宣稱 `supported`。
@@ -601,9 +600,9 @@ journaled 寫入 → best-effort rollback。
 
 CodeTrail 自己對 llama-server `/completion` 與 `/v1/chat/completions` 發送的每一
 個 prompt 都會先經過 `context_budget` 的「估算 → soft warn → hard refuse →
-telemetry」流程。OpenCode TUI 也走 `/v1/chat/completions` 但走的是它自己的 client
+telemetry」流程。客戶端走的是同一條 `/v1/chat/completions`,而且經過同一個 gate
 (`@ai-sdk/openai-compatible`),**不會** 經過這個模組,所以它的 context 仍然要靠
-llama-server 啟動時 `-c <N>` 與 OpenCode `model.limit.context` 對齊。`scripts/doctor.py`
+llama-server 啟動時的 `-c <N>` 是唯一的 n_ctx 來源。`scripts/doctor.py`
 只掃描、絕不寫檔；正常 `aicode` preflight 則會針對 active model 原子同步這個鏡像欄位並留備份。
 
 ### 模組分工
@@ -689,8 +688,6 @@ llama-server 啟動時 `-c <N>` 已經把 ctx + KV cache 鎖死,所以 doctor / 
 | `n_ctx.py` / `config.py::N_CTX` | 主模型 n_ctx 的集中解析。正常設定入口是 `set_config.sh --ctx`；runtime 以 `AICODE_N_CTX` 傳遞 server 實值。`NUM_CTX` / `DYNAMIC_NUM_CTX_MAX` 只保留程式碼相容 alias，永遠等於 `N_CTX`。舊 `AICODE_DYNAMIC_NUM_CTX_MAX` 只暫時相容讀取並警告 deprecated。 |
 | `scripts/resolve_server_ctx.py` | CLI 取值器。讀主 llama-server `/props` 拿真實 `n_ctx`，只把整數印到 stdout(讀不到就印空字串、永遠 exit 0)。`aicode` 將實值 export 成 `AICODE_N_CTX`；讀不到時回到 deployment profile 的 `services.main.ctx`。 |
 | `scripts/ctx_safety_check.py` | CLI 入口(容量閘)。讀 `AICODE_MODEL` / 主 n_ctx / `AICODE_LLAMA_BASE_URL`，呼 `gpu_safety.check_safety()`；requested `<=` server n_ctx 放行，只有 `>` 才 refuse。安全 gate、`AICODE_ACCEPT_CTX_RISK` 與 `AICODE_CTX_SAFETY_DISABLE` 仍保留。 |
-| `opencode_context.py` / `scripts/opencode_ctx_check.py` | 解析 OpenCode active model 的 `provider.*.models.*.limit.context`。純檢查模式不寫檔；`aicode` 使用 `--fix`，只同步 active model 的該欄、保留其他 JSON、原子替換並建立 `.codetrail.bak`。無法唯一定位、解析或寫入時 fail-loud；`AICODE_ACCEPT_CTX_RISK=1` 可維持不一致而不寫入。 |
-| `scripts/opencode_mcp_timeout_check.py` | OpenCode MCP client timeout 契約。純檢查模式供診斷；`aicode` 使用 `--fix`，只在既有 `mcp.codetrail` entry 內將缺漏、無效或過短的 `timeout` 提升到 `config.OPENCODE_MCP_TIMEOUT_MIN_MS`。修復會保留其他 JSON 欄位、原子替換並建立 `.codetrail.bak`；設定無法解析/寫入則 fail-loud。 |
 | `context_budget.py::_emit_runtime_offload_check_once` | runtime 觀測 hook:`[CTX] WARNING` 或 `[CTX_OVERFLOW]` 觸發時順手查一次 `/slots` + `/props`,把 server 真實 n_ctx / 忙碌 slot 數 黏在 log 後面。每個 process 只跑一次,任何錯誤靜默吞掉。 |
 
 ### 設計守則
@@ -727,7 +724,7 @@ llama-server 啟動時 `-c <N>` 已經把 ctx + KV cache 鎖死,所以 doctor / 
     真正吃 ctx 的是影像 token,而 `CHARS_PER_TOKEN` heuristic 量不到影像。在那裡
     掛 gate 只會產生「已檢查」的假象。VL 的 ctx 由 server 啟動的 `-c` 與
     `deployment_profile` 的 `services.vl.ctx` 管。
-- OpenCode TUI 主對話完全在 CodeTrail 視線外,doctor 只能驗 config 對齊,不能驗實際 prompt 是否爆。
+- 客戶端的每一次模型呼叫都經過 context gate,所以「prompt 會不會爆」現在是可以擋的;doctor 仍只驗設定對齊。
 
 ---
 
@@ -1006,4 +1003,4 @@ root 只能來自 `--root` 或 `AICODE_ROOT`,都沒有就報錯不猜 cwd;驗證
 - `mcp_server.py` 裡 `_record_kb_interaction` 接線
 - `README.md`、`README_DEV.md` 裡的資料飛輪說明
 
-目前建議先保留：它們不影響 OpenCode 日常使用，但對之後把工具做成更成熟的私有產品有價值。
+目前建議先保留：它們不影響日常使用，但對之後把工具做成更成熟的私有產品有價值。

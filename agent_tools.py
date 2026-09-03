@@ -1434,8 +1434,8 @@ class ToolExecutor:
         三態 passed / failed / skipped:有任何 skipped 就是「驗證不完整」;syntax 是寫入
         後的 advisory gate,失敗不回滾(第一行明講「patch 已套用、未回滾」)。
         lint / typecheck / test 不再由這裡執行——那會把使用者對 apply_patch 的核准暗中
-        擴張成命令執行核准。要 lint / test 請另行呼叫 codetrail_run_lint(fix=False) /
-        codetrail_run_command,各自經過核准閘。這裡永不呼叫 run_lint / run_command /
+        擴張成命令執行核准。要 lint / test 請另行呼叫 run_lint(fix=False) /
+        run_command,各自經過核准閘。這裡永不呼叫 run_lint / run_command /
         subprocess;整個函式體包在最外層 try/except,永不把例外拋回 apply_patch
         (寫入已完成,拋錯只會讓使用者看不到結果)。
         唯一的讀檔路徑是這裡的區域函式 read_bytes:_safe_path → lstat(非 symlink、
@@ -1449,8 +1449,8 @@ class ToolExecutor:
             要附加到 apply_patch 結果尾端的文字行;第一行固定是三態標題。
         """
         fallback_next_steps = (
-            "建議下一步: 對改過的檔案呼叫 codetrail_run_lint(fix=False) 做 lint 檢查；"
-            "codetrail_run_command(\"pytest ...\") 跑相關測試（各需獨立核准；apply_patch 不代跑）"
+            "建議下一步: 對改過的檔案呼叫 run_lint(fix=False) 做 lint 檢查；"
+            "run_command(\"pytest ...\") 跑相關測試（各需獨立核准；apply_patch 不代跑）"
         )
         try:
             import stat as _stat

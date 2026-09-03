@@ -15,7 +15,9 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import socket
 import sys
 from dataclasses import dataclass
 from typing import Any, Iterator
@@ -118,20 +120,52 @@ def native_completion(
     return _iter_native_stream(resp)
 
 
-def _iter_native_stream(resp) -> Iterator[dict]:
-    """llama.cpp stream 是 SSE 格式:每行 `data: {json}\\n\\n`。"""
-    for raw in resp.iter_lines(decode_unicode=True):
+def _iter_sse_lines(resp) -> Iterator[str]:
+    """SSE 的每一行,**固定以 UTF-8 解碼**。
+
+    不能用 ``iter_lines(decode_unicode=True)``:llama-server 的串流是
+    ``text/event-stream`` 而且不帶 charset,requests 對 ``text/*`` 在那種情況
+    退回 ISO-8859-1(RFC 2616)。於是中文答案整段變成 mojibake —— 而且是
+    靜默的:JSON 照樣 parse 得過,只是每個中文字都變成三個拉丁字母。
+    (2026-09-03 實測 headless run 回過「æ ¹æ `README.md`」。)
+
+    llama.cpp 的 JSON 一律是 UTF-8,所以這裡就固定 UTF-8;``errors="replace"``
+    只是不讓一個壞 byte 中斷整段串流。
+    """
+    for raw in resp.iter_lines():
         if not raw:
             continue
-        line = raw.strip()
-        if line.startswith("data:"):
-            line = line[len("data:"):].strip()
-        if not line or line == "[DONE]":
-            continue
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
-            continue
+        yield raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+
+
+class StreamProtocolError(RuntimeError):
+    """SSE 串流裡出現解析不了的 `data:` 行。
+
+    以前這種行被靜默 `continue`:中間掉了一塊、後面照樣收到 finish_reason=stop,
+    缺字的回答 / 摘要就被當成完整的。現在直接丟出來,呼叫端把這一輪當成截斷。
+    """
+
+
+def _iter_native_stream(resp) -> Iterator[dict]:
+    """llama.cpp stream 是 SSE 格式:每行 `data: {json}\\n\\n`。
+
+    ``finally: resp.close()`` 的理由與 ``_iter_openai_stream`` 相同:中斷時
+    要立刻把連線關掉,llama-server 才會放掉那個 slot。
+    """
+    try:
+        for raw in _iter_sse_lines(resp):
+            line = raw.strip()
+            if line.startswith("data:"):
+                line = line[len("data:"):].strip()
+            if not line or line == "[DONE]":
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    finally:
+        with contextlib.suppress(Exception):
+            resp.close()
 
 
 # ============================================================
@@ -313,7 +347,53 @@ def chat_completions(
     resp = session.post(url, json=payload, timeout=timeout, stream=True, allow_redirects=False)
     _reject_redirect(resp, url)
     resp.raise_for_status()
-    return _iter_openai_stream(resp)
+    return OpenAIStream(resp)
+
+
+def _shutdown_response(resp: Any) -> None:
+    """從**別的執行緒**把一個串流中的 response 收掉。
+
+    只呼叫 ``resp.close()`` 不夠:另一個執行緒正阻塞在 ``recv()`` 裡,Linux 的
+    ``close(fd)`` 不會叫醒它(它手上還握著那個 file reference),要等到下一行資料或
+    600 秒 timeout。``shutdown(SHUT_RDWR)`` 才會讓阻塞中的 ``recv`` 立刻以 EOF 返回。
+    socket 的位置走 requests → urllib3 → http.client 那條屬性鏈,拿不到就退回 close。
+    """
+    raw = getattr(resp, "raw", None)
+    candidates = []
+    fp = getattr(raw, "_fp", None)                      # http.client.HTTPResponse
+    buffered = getattr(fp, "fp", None)                  # io.BufferedReader
+    candidates.append(getattr(getattr(buffered, "raw", None), "_sock", None))   # socket.SocketIO
+    candidates.append(getattr(getattr(raw, "_connection", None), "sock", None))  # urllib3 conn
+    for sock in candidates:
+        shutdown = getattr(sock, "shutdown", None)
+        if callable(shutdown):
+            with contextlib.suppress(Exception):
+                shutdown(socket.SHUT_RDWR)
+            break
+    with contextlib.suppress(Exception):
+        resp.close()
+
+
+class OpenAIStream:
+    """``chat_completions(stream=True)`` 回的可迭代物件。
+
+    ``close()`` 可以從**別的執行緒**呼叫(取消用):它關的是底層 socket / response,
+    **不碰** generator——對正在另一個執行緒執行中的 generator 呼叫 ``close()`` 只會得到
+    ``ValueError: generator already executing``,底層連線根本沒關。
+    """
+
+    def __init__(self, resp: Any) -> None:
+        self._resp = resp
+        self._iterator = _iter_openai_stream(resp)
+
+    def __iter__(self) -> "OpenAIStream":
+        return self
+
+    def __next__(self) -> dict:
+        return next(self._iterator)
+
+    def close(self) -> None:
+        _shutdown_response(self._resp)
 
 
 def _vision_image_messages(prompt: str, image_base64: str, mime_type: str) -> list[dict]:
@@ -654,19 +734,29 @@ def vision_json_completion(
 
 
 def _iter_openai_stream(resp) -> Iterator[dict]:
-    """OpenAI SSE:`data: {json}` 一行一個 delta,結束時是 `data: [DONE]`。"""
-    for raw in resp.iter_lines(decode_unicode=True):
-        if not raw:
-            continue
-        line = raw.strip()
-        if line.startswith("data:"):
-            line = line[len("data:"):].strip()
-        if not line or line == "[DONE]":
-            continue
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    """OpenAI SSE:`data: {json}` 一行一個 delta,結束時是 `data: [DONE]`。
+
+    ``finally: resp.close()`` 是必要的,不是整潔:呼叫端 Ctrl-C 時
+    generator 收到 GeneratorExit,若不明確關掉 response,連線會一直開著,
+    llama-server 那個 slot 也就一直被這個請求佔著 —— 下一個問題排在後面等它
+    自己生成完。等 GC 回收是不確定的時機。
+    """
+    try:
+        for raw in _iter_sse_lines(resp):
+            line = raw.strip()
+            if line.startswith("data:"):
+                line = line[len("data:"):].strip()
+            if not line or line == "[DONE]":
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise StreamProtocolError(
+                    f"malformed SSE payload ({len(line)} bytes): {line[:60]!r}"
+                ) from exc
+    finally:
+        with contextlib.suppress(Exception):
+            resp.close()
 
 
 # ============================================================

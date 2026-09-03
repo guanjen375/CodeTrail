@@ -9,7 +9,8 @@ is consulted lazily between AICODE_MODEL and the OpenCode-config fallback.
 CodeTrail 只跑 llama.cpp llama-server。AICODE_MODEL 可以是:
   - registry 裡登記的 bare name(例如 "qwen3-coder-30b")
   - GGUF 絕對路徑(例如 "/models/qwen3-coder-30b-q4_k_m.gguf")
-opencode.json `model` 欄位若是 "<provider>/<name>" 形式 (例如 OpenAI 留下的舊
+`opencode.json` 只剩遷移診斷會讀(見 opencode_migrate);它已經**不在**主模型
+解析鏈上。下面這段講的是那個歷史格式:`model` 欄位若是 "<provider>/<name>" 形式 (例如 OpenAI 留下的舊
 設定 "openai/gpt-4o"),會被視為非本機 provider 拒絕 — 因為我們不打外部 API。
 """
 from __future__ import annotations
@@ -241,6 +242,9 @@ def load_first_opencode_config(
 def resolve_opencode_main_model(
     env: Mapping[str, str] | None = None,
 ) -> ModelResolution:
+    """**只給遷移診斷用**,不在主模型解析鏈上(見 resolve_main_model_from_env)。
+
+    """
     path, data, error = load_first_opencode_config(env)
     if error:
         return ModelResolution(source="opencode.json", path=path, present=True, error=error)
@@ -313,4 +317,7 @@ def resolve_main_model_from_env(
             profile_model,
             f"deployment profile {deployment.selected_profile} main.model",
         )
-    return resolve_opencode_main_model(environ)
+    # 沒有 opencode.json fallback:CodeTrail 已經不啟動 OpenCode,靜默沿用
+    # 那份設定裡的模型等於「使用者以為在跑 A、實際在跑 B」,而一份**壞掉**的
+    # opencode.json 還會讓一個根本沒在用 OpenCode 的安裝拒絕啟動。
+    return ModelResolution(source="deployment profile", present=False)

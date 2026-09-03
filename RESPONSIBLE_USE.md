@@ -15,17 +15,18 @@ practices. It is **guidance, not an additional restriction on the MIT License**.
 
 ## Keep the effective data boundary explicit
 
-CodeTrail is local-first, but the complete workflow includes OpenCode,
-llama-server, optional remote endpoints, plugins, project configuration, and the
+CodeTrail is local-first, but the complete workflow includes the CodeTrail chat
+client, llama-server, optional remote endpoints, project configuration, and the
 host operating system. Before handling confidential material:
 
 1. Keep model servers on loopback unless remote access is deliberately required.
-2. Keep `enabled_providers` limited to the intended local provider and deny
-   OpenCode built-in file, shell, and web tools when the CodeTrail sandbox is the
-   required boundary.
-3. For untrusted repositories, start with
-   `OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode` so project configuration cannot
-   silently loosen global permissions.
+2. The client exposes only the CodeTrail MCP tools; there is no second set of
+   built-in file, shell, or web tools that could reach outside the sandbox.
+   The sandbox root is the directory you launch `aicode` from.
+3. For untrusted repositories, remember that the project's `AGENTS.md` and
+   `.codetrail/lessons.md` are injected into the system prompt. Read them first,
+   or start `aicode` with `CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1` so project
+   files cannot influence the agent.
 4. Review all effective model endpoints. A non-loopback endpoint means prompts or
    retrieved content can leave the current machine.
 5. Import the minimum necessary files. Do not whitelist an entire home directory

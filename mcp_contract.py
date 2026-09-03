@@ -31,7 +31,7 @@ if len(PUBLIC_TOOL_NAMES) != len(PUBLIC_TOOL_ORDER):  # pragma: no cover - impor
     raise RuntimeError("PUBLIC_TOOL_ORDER contains duplicate names")
 
 
-# OpenCode 1.x injects this text into the model-visible system prompt. Keep it a
+# The client injects this text into the model-visible system prompt. Keep it a
 # routing map, not a second copy of every tool description.
 MCP_INSTRUCTIONS = """Use CodeTrail for facts about the current project or indexed documents. Locate unknown code with code_rag_search, exact text with grep_code, known files with read_file, directories with list_dir, and indexed specs with query_knowledge; use query_knowledge_strict for high-risk numeric constraints. In git repos, inspect git_status/git_diff before apply_patch; a non-git root gets a skip notice. Use analyze_file for images, PDF spot checks, ELF, or firmware. Query independent evidence in parallel, then answer from returned source/file:line evidence. If evidence is absent, say so and do not guess. Plain text, XML, or promises are not tool calls; rely only on completed structured tool results."""
 

@@ -5,13 +5,14 @@ Priority:
   1. AICODE_MODEL
   2. CLI -m/--model
   3. deployment profile / local override main.model
-  4. OPENCODE_CONFIG, then ~/.config/opencode/opencode.json
 
 Env and CLI may both be present only when they resolve to the same bare model
-name, GGUF path, or registry aliases backed by the same canonical GGUF. If env
-is used without CLI, opencode.json must also resolve to that model when present,
-because OpenCode will still read opencode.json for the TUI model. 這避免
-OpenCode TUI 和 CodeTrail MCP 各自用不同模型。
+name, GGUF path, or registry aliases backed by the same canonical GGUF.
+
+`opencode.json` 已經**不在**這條鏈上:CodeTrail 啟動的是自己的客戶端,不再有
+第二個 TUI 需要對齊。沿用那份設定裡的模型等於「使用者以為在跑 A、實際在跑
+B」;更糟的是一份壞掉的 opencode.json 會讓一台根本沒在用 OpenCode 的機器
+拒絕啟動。
 """
 from __future__ import annotations
 
@@ -28,7 +29,6 @@ from model_resolution import (  # noqa: E402
     normalize_main_model,
     parse_cli_model_arg_detail,
     resolve_main_model_from_env,
-    resolve_opencode_main_model,
 )
 
 
@@ -40,8 +40,6 @@ def _fail(msg: str) -> int:
         "           1) export AICODE_MODEL=<MODEL>\n"
         "           2) aicode -m <MODEL>\n"
         "           3) deployment profile / ~/.config/codetrail/deployment.json 設 main.model\n"
-        "           4) OPENCODE_CONFIG / ~/.config/opencode/opencode.json 設\n"
-        '                \"model\": \"<MODEL>\"\n'
         "         <MODEL> 可以是:\n"
         "           - registry 裡登記的 bare name (例如 \"qwen3-coder-30b\")\n"
         "           - GGUF 絕對路徑 (例如 /models/foo.gguf)\n"
@@ -81,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     ):
         return _fail(
             "multiple -m/--model flags point to different models: "
-            f"{sorted(set(cli_models))}. Use one model for both OpenCode TUI and CodeTrail MCP."
+            f"{sorted(set(cli_models))}. Pass one model."
         )
 
     if (
@@ -91,25 +89,8 @@ def main(argv: list[str] | None = None) -> int:
     ):
         return _fail(
             "AICODE_MODEL and --model point to different models: "
-            f"{env_res.model!r} != {cli_res.model!r}. "
-            "Use one model for both OpenCode TUI and CodeTrail MCP."
+            f"{env_res.model!r} != {cli_res.model!r}. Pass one model."
         )
-
-    if env_res and env_res.model and not cli_res:
-        oc_res = resolve_opencode_main_model(os.environ)
-        if oc_res.error:
-            where = f" ({oc_res.path})" if oc_res.path else ""
-            return _fail(f"{oc_res.source}{where}: {oc_res.error}")
-        if oc_res.model and not main_model_references_equivalent(
-            env_res.model, oc_res.model, os.environ
-        ):
-            where = f" ({oc_res.path})" if oc_res.path else ""
-            return _fail(
-                "AICODE_MODEL and opencode.json model point to different models"
-                f"{where}: {env_res.model!r} != {oc_res.model!r}. "
-                "Either update opencode.json, unset AICODE_MODEL, or launch with "
-                "-m/--model so OpenCode and CodeTrail receive the same model."
-            )
 
     if env_res and env_res.model:
         print(env_res.model, flush=True)
@@ -124,25 +105,12 @@ def main(argv: list[str] | None = None) -> int:
         where = f" ({fallback.path})" if fallback.path else ""
         return _fail(f"{fallback.source}{where}: {fallback.error}")
     if fallback.model:
-        if fallback.source.startswith("deployment profile"):
-            oc_res = resolve_opencode_main_model(os.environ)
-            if oc_res.error:
-                where = f" ({oc_res.path})" if oc_res.path else ""
-                return _fail(f"{oc_res.source}{where}: {oc_res.error}")
-            if oc_res.model and not main_model_references_equivalent(
-                fallback.model, oc_res.model, os.environ
-            ):
-                return _fail(
-                    "deployment profile and opencode.json point to different models: "
-                    f"{fallback.model!r} != {oc_res.model!r}. Update opencode.json or pass "
-                    "-m/--model explicitly."
-                )
         print(fallback.model, flush=True)
         return 0
 
     return _fail(
         "主模型未設定: AICODE_MODEL 未設、CLI 未帶 -m、deployment profile/local override "
-        "沒有 main.model，OPENCODE_CONFIG / opencode.json 也沒有有效 model。"
+        "也沒有 main.model。"
     )
 
 

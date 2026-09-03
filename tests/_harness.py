@@ -81,6 +81,32 @@ def bash_compatible_path(bash: str, path: Path) -> str:
     return str(path)
 
 
+
+# CodeTrail 客戶端 stub:記錄它被傳了什麼參數,不真的起 engine。
+# 這是 `AICODE_CLIENT_ENTRY` 這個 seam 的唯一用途 —— 與舊版「把假的 opencode
+# 放進 PATH」是同一種可替換面。
+CLIENT_STUB = (
+    "#!/usr/bin/env python3\n"
+    "import sys, pathlib\n"
+    # wrapper 會先用 --check-args 叫真正的 parser 驗一次參數(不跑 preflight)。
+    # 替身把這一步交給**真正的** codetrail_chat parser:接縫測試才驗得到
+    # 「打錯旗標要在 preflight 之前被打回」,而且什麼都不記。
+    "if '--check-args' in sys.argv:\n"
+    "    import codetrail_chat\n"
+    "    raise SystemExit(codetrail_chat.main(sys.argv[1:]))\n"
+    # 啟動橫幅的 `status --prefix ...` 也是純資訊呼叫:替身不記、exit 0。
+    "if sys.argv[1:2] == ['status']: raise SystemExit(0)\n"
+    "pathlib.Path('client_args.txt').write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+)
+
+
+def write_client_stub(bin_dir: Path) -> Path:
+    stub = bin_dir / "codetrail_chat_stub.py"
+    stub.write_text(CLIENT_STUB, encoding="utf-8")
+    stub.chmod(0o700)
+    return stub
+
+
 def run_aicode_with_stub(
     tmp_path: Path,
     args: list[str],
@@ -100,22 +126,7 @@ def run_aicode_with_stub(
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
 
-    stub_opencode = bin_dir / "opencode"
-    stub_opencode.write_text(
-        "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n"
-        'if [ "${1:-}" = "--version" ]; then printf \'1.18.21\\n\'; exit 0; fi\n'
-        'if [ "${1:-}" = "debug" ] && [ "${2:-}" = "config" ]; then\n'
-        "  printf '{}\\n'\n"
-        "  exit 0\n"
-        "fi\n"
-        ": > opencode_args.txt\n"
-        "for arg in \"$@\"; do\n"
-        "  printf '%s\\n' \"$arg\" >> opencode_args.txt\n"
-        "done\n",
-        encoding="utf-8",
-    )
-    stub_opencode.chmod(0o700)
+    client_stub = write_client_stub(bin_dir)
 
     env = os.environ.copy()
     for key in (
@@ -138,6 +149,12 @@ def run_aicode_with_stub(
             # CLI forwarding tests are offline.  The canary has dedicated
             # mocked tests and must never contact a real model from pytest.
             "AICODE_TOOL_CANARY_SKIP": "1",
+            "AICODE_CLIENT_ENTRY": str(client_stub),
+            # HOME 被導到 tmp,user-site 的套件(mcp 等)就不在 sys.path 上了。
+            # preflight 的每個子行程都要找得到它們。
+            "PYTHONPATH": os.pathsep.join(
+                [p for p in sys.path if p] + [os.environ.get("PYTHONPATH", "")]
+            ).rstrip(os.pathsep),
         }
     )
     if env_extra:
@@ -152,7 +169,7 @@ def run_aicode_with_stub(
         stdin=subprocess.DEVNULL,
         env=env,
     )
-    return result, subdir / "opencode_args.txt"
+    return result, subdir / "client_args.txt"
 
 
 def read_stub_args(path: Path) -> list[str]:
@@ -171,62 +188,20 @@ def contains_subsequence(items: list[str], expected: list[str]) -> bool:
 # aicode web / aicode attach 子指令
 # ---------------------------------------------------------------------------
 
-# web-capable opencode:`web --help` 印出 web 指令自己的 synopsis 行並 exit 0;
-# 其他呼叫(含真正的 exec)記錄 args 到 cwd 的 opencode_args.txt。
-OPENCODE_WEB_CAPABLE_STUB = (
-    "#!/usr/bin/env bash\n"
-    "set -euo pipefail\n"
-    'if [ "${1:-}" = "--version" ]; then printf \'1.18.21\\n\'; exit 0; fi\n'
-    'if [ "${1:-}" = "debug" ] && [ "${2:-}" = "config" ]; then\n'
-    "  printf '{}\\n'\n"
-    "  exit 0\n"
-    "fi\n"
-    'if [ "${1:-}" = "web" ] && [ "${2:-}" = "--help" ]; then\n'
-    "  printf 'opencode web\\n\\nstart opencode server and open web interface\\n'\n"
-    "  exit 0\n"
-    "fi\n"
-    ": > opencode_args.txt\n"
-    'for arg in "$@"; do\n'
-    "  printf '%s\\n' \"$arg\" >> opencode_args.txt\n"
-    "done\n"
-)
-
-# 舊版 opencode:沒有 web 子指令,yargs 把 web 當專案 positional,`--help` 短路
-# 印預設說明(**沒有** `opencode web` synopsis)且一樣 exit 0 —— 真實模擬舊版,
-# 用來證明能力偵測不靠 exit code。
-OPENCODE_WEB_OLD_STUB = (
-    "#!/usr/bin/env bash\n"
-    "set -euo pipefail\n"
-    'if [ "${1:-}" = "--version" ]; then printf \'1.18.21\\n\'; exit 0; fi\n'
-    'if [ "${1:-}" = "debug" ] && [ "${2:-}" = "config" ]; then\n'
-    "  printf '{}\\n'\n"
-    "  exit 0\n"
-    "fi\n"
-    'if [ "${1:-}" = "web" ] && [ "${2:-}" = "--help" ]; then\n'
-    "  printf 'opencode [project]\\n\\nstart opencode tui\\n'\n"
-    "  exit 0\n"
-    "fi\n"
-    ": > opencode_args.txt\n"
-    'for arg in "$@"; do\n'
-    "  printf '%s\\n' \"$arg\" >> opencode_args.txt\n"
-    "done\n"
-)
-
-
 def run_aicode_subcmd_with_stub(
     tmp_path: Path,
     args: list[str],
     *,
-    opencode_stub: str = OPENCODE_WEB_CAPABLE_STUB,
     env_extra: dict[str, str] | None = None,
     set_model: bool = True,
+    extra_dirs: tuple[str, ...] = (),
     tailscale_ip: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
-    """跑 `aicode <args>`,用可注入的 opencode stub。回傳 (result, args_file)。
+    """跑 `aicode <args>`(web / attach 子指令)。回傳 (result, args_file)。
 
     跟 `run_aicode_with_stub` 不同處:預設會設好 AICODE_MODEL(web 路徑沿用模型
-    解析,沒設會 fail),並允許注入 opencode stub 與 OPENCODE_SERVER_PASSWORD /
-    AICODE_WEB_PORT / AICODE_ROOT 等環境變數。
+    解析,沒設會 fail),並允許注入 AICODE_WEB_PASSWORD / AICODE_WEB_PORT /
+    AICODE_ROOT 等環境變數。
     """
     require_git()
     bash = require_working_bash()
@@ -237,14 +212,14 @@ def run_aicode_subcmd_with_stub(
     subprocess.run(["git", "init", "-q"], cwd=project, check=True)
     subdir = project / "src"
     subdir.mkdir()
+    for name in extra_dirs:            # 給「位置參數是目錄」這類測試用
+        (subdir / name).mkdir(parents=True, exist_ok=True)
     home = tmp_path / "home"
     home.mkdir()
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
 
-    stub_opencode = bin_dir / "opencode"
-    stub_opencode.write_text(opencode_stub, encoding="utf-8")
-    stub_opencode.chmod(0o700)
+    client_stub = write_client_stub(bin_dir)
     if tailscale_ip is not None:
         stub_tailscale = bin_dir / "tailscale"
         stub_tailscale.write_text(
@@ -265,8 +240,7 @@ def run_aicode_subcmd_with_stub(
         "OPENCODE_CONFIG",
         "AICODE_WEB_PORT",
         "AICODE_WEB_TAILSCALE_IP",
-        "OPENCODE_SERVER_PASSWORD",
-        "OPENCODE_SERVER_USERNAME",
+        "AICODE_WEB_PASSWORD",
     ):
         env.pop(key, None)
     env.update(
@@ -279,6 +253,10 @@ def run_aicode_subcmd_with_stub(
             "AICODE_CTX_SAFETY_DISABLE": "1",
             "AICODE_REQUIRED_MODELS_CHECK_SKIP": "1",
             "AICODE_TOOL_CANARY_SKIP": "1",
+            "AICODE_CLIENT_ENTRY": str(client_stub),
+            "PYTHONPATH": os.pathsep.join(
+                [p for p in sys.path if p] + [os.environ.get("PYTHONPATH", "")]
+            ).rstrip(os.pathsep),
         }
     )
     if set_model:
@@ -296,7 +274,7 @@ def run_aicode_subcmd_with_stub(
         stdin=subprocess.DEVNULL,
         env=env,
     )
-    return result, subdir / "opencode_args.txt"
+    return result, subdir / "client_args.txt"
 
 
 # ---------------------------------------------------------------------------

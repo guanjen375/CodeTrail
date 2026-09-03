@@ -78,13 +78,14 @@ def resolve_model_path(name_or_path: str) -> str:
 #   1. AICODE_MODEL=<MODEL>                 (環境變數,最優先)
 #   2. aicode -m <MODEL> / --model <MODEL>  (CLI 旗標)
 #   3. deployment profile / local override 的 main.model
-#   4. OPENCODE_CONFIG or ~/.config/opencode/opencode.json ("model": "<MODEL>")
+#
+# 刻意**沒有** opencode.json fallback:CodeTrail 已經不啟動 OpenCode。
 #
 # <MODEL> 可以是:
 #   - registry 裡登記的 bare name(例如 "qwen3-coder-30b")
 #   - GGUF 絕對路徑(例如 "/models/qwen3-coder-30b-q4_k_m.gguf")
 #
-# 三個都找不到、或值是 placeholder (含 '<' / '>') 時, MODEL 為空字串;
+# 都找不到、或值是 placeholder (含 '<' / '>') 時, MODEL 為空字串;
 # 要實際呼叫 LLM 的呼叫端必須先用 require_main_model() 取值,沒設好就 fail-loud。
 
 # embedding / reranker / VL 在 llama.cpp 架構下,model id 只是 informational
@@ -103,26 +104,16 @@ VL_INGEST_MAX_TOKENS = int(_os.environ.get("AICODE_VL_INGEST_MAX_TOKENS", "2048"
 VL_ANALYZE_TIMEOUT = int(_os.environ.get("AICODE_VL_ANALYZE_TIMEOUT", "180"))
 VL_INGEST_TIMEOUT = int(_os.environ.get("AICODE_VL_INGEST_TIMEOUT", "300"))
 
-# OpenCode 的 MCP timeout 是 client 端全域上限，必須略高於 ingest_document 的
-# 600 秒內部上限。aicode 啟動前會把既有 codetrail entry 自動同步到這個最小值，
-# 避免 10 秒 timeout 造成圖片與後續工具連鎖失敗。
-OPENCODE_MCP_TIMEOUT_MIN_MS = 660_000
+# CodeTrail 客戶端對每一次 MCP 呼叫的固定 read timeout。必須略高於
+# ingest_document 的 600 秒內部上限,否則圖片匯入會在 server 還在跑的時候被
+# client 端放棄。SDK 的 progress 通知**不會**重設它(只拿來顯示進度),到期
+# 走 client_mcp 的取消契約(送 notifications/cancelled、寬限期、SIGTERM)。
+MCP_CALL_TIMEOUT_SECONDS = 660
 
-
-def _read_opencode_main_model() -> str:
-    """讀使用者 OpenCode global config 的 `model` 欄位 (最後 fallback)。
-
-    刻意只讀 OPENCODE_CONFIG 或 `~/.config/opencode/opencode.json`,不掃描其他
-    位置 (例如專案 local opencode.json) — 主模型是使用者帳號級別的偏好, 不是
-    per-project 設定。
-    讀不到、parse 失敗、值是 placeholder 都回空字串, 留給呼叫端 fail-loud。
-    """
-    resolved = _model_resolution.resolve_opencode_main_model(_os.environ)
-    return resolved.model if resolved.ok else ""
 
 
 def _resolve_main_model() -> str:
-    """主模型來源: AICODE_MODEL > profile/local override > opencode.json。
+    """主模型來源: AICODE_MODEL > profile/local override。
 
     回傳 bare model name(可能是 registry key,可能是 GGUF 路徑),找不到時回空字串。
     `aicode` wrapper 會另外處理 `-m` / `--model` CLI 旗標 (在這裡看不到),
@@ -149,7 +140,7 @@ def require_main_model() -> str:
             "  1) export AICODE_MODEL=<MODEL>                    (最優先)\n"
             "  2) aicode -m <MODEL>                              (per-run CLI 旗標)\n"
             "  3) deployment profile / local override 設 main.model\n"
-            "  4) 在 ~/.config/opencode/opencode.json 設 \"model\": \"<MODEL>\"\n"
+
             "<MODEL> 可以是 MODEL_REGISTRY 裡的 bare name 或 GGUF 絕對路徑。\n"
             "Registry 維護在 ~/.config/codetrail/models.json,或用 AICODE_MODEL_REGISTRY env。\n"
             "CodeTrail 不會替你預設或推薦。"
@@ -375,7 +366,7 @@ CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
 # ============================================================
 # CodeTrail 自己呼叫 llama-server native /completion 與 /v1/chat/completions 時，
 # 必須在送出前估算 prompt token 數、保留輸出空間，並在超過硬上限時拒絕送出。
-# 這些設定只影響 CodeTrail internal LLM calls；OpenCode TUI 直接打 llama-server /v1
+# 這些設定只影響 CodeTrail internal LLM calls;聊天客戶端的取樣值另由 client_engine 明示送出
 # (透過 openai-compatible provider)，server 端的 -c (n_ctx) 才是它真正的上限。
 #
 # - AICODE_RESERVED_OUTPUT_TOKENS: 估算時保留給模型輸出的 token 數
@@ -383,6 +374,33 @@ CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
 # - AICODE_CTX_HARD_THRESHOLD: 使用率超過此值時拒絕送出
 # - AICODE_CTX_GATE_ENABLED: 設成 0 可暫時停用 gate（除錯用，不建議生產關閉）
 RESERVED_OUTPUT_TOKENS = int(_os.environ.get("AICODE_RESERVED_OUTPUT_TOKENS", "4096"))
+
+# 客戶端(聊天迴圈)單次回覆的輸出上限。**唯一常數**:同時當
+#   1) /v1/chat/completions 送出的 max_tokens,
+#   2) context gate 這一次 request 的保留額,
+#   3) 壓縮門檻推導裡的 max_output。
+# 三者用同一個數字才會自洽 —— 保留額比實際 max_tokens 小的話,閘放行的
+# prompt 仍可能在生成途中把 ctx 撐爆並被 llama-server 從前面靜默截掉。
+# 刻意**不**沿用 RESERVED_OUTPUT_TOKENS:那是 knowledge.py 內部呼叫(短答、
+# 自我檢查)的保留額,兩者的用途與合理值都不同。
+# 上限 32000:壓縮門檻的推導公式(compaction_mode.effective_max_output)把
+# max_output 夾在這個數字,所以更大的值會讓「實送的 max_tokens」與「門檻推導
+# 用的 max_output」變成兩個數 —— 門檻不再由實際輸出上限推出來。0 在同一條
+# 公式裡會被翻成 32000,也不是使用者的意思。兩種都 fail-loud,不靜默改寫。
+CLIENT_MAX_OUTPUT_TOKENS_CAP = 32000
+try:
+    CLIENT_MAX_OUTPUT_TOKENS = int(_os.environ.get("AICODE_CLIENT_MAX_OUTPUT_TOKENS", "8192"))
+except ValueError as _exc:  # pragma: no cover - import guard
+    raise RuntimeError(
+        "AICODE_CLIENT_MAX_OUTPUT_TOKENS 必須是整數,得到 "
+        f"{_os.environ.get('AICODE_CLIENT_MAX_OUTPUT_TOKENS')!r}"
+    ) from _exc
+if not 0 < CLIENT_MAX_OUTPUT_TOKENS <= CLIENT_MAX_OUTPUT_TOKENS_CAP:  # pragma: no cover - import guard
+    raise RuntimeError(
+        f"AICODE_CLIENT_MAX_OUTPUT_TOKENS 必須介於 1..{CLIENT_MAX_OUTPUT_TOKENS_CAP},"
+        f"得到 {CLIENT_MAX_OUTPUT_TOKENS}。它同時是實送的 max_tokens、context gate 的"
+        "保留額與壓縮門檻的 max_output;超出這個範圍時三者不再是同一個數字。"
+    )
 CTX_SOFT_THRESHOLD = float(_os.environ.get("AICODE_CTX_SOFT_THRESHOLD", "0.80"))
 CTX_HARD_THRESHOLD = float(_os.environ.get("AICODE_CTX_HARD_THRESHOLD", "0.90"))
 CTX_GATE_ENABLED = _os.environ.get("AICODE_CTX_GATE_ENABLED", "1").lower() in ("1", "true", "yes")
@@ -409,7 +427,7 @@ MAX_FILE_READ_CHARS = 50000
 MAX_GREP_RESULTS = 30
 # grep 輸出的硬預算。MAX_GREP_RESULTS 只限制「match 筆數」,不限制位元組:
 # 生成檔/壓縮 JSON 這類超長行的專案,25 個 match 就能撐出 1.3 GB 字串,
-# 經 MCP stdio 送出去會把前端打死(實測 OpenCode 的 worker thread 99% 空轉)。
+# 經 MCP stdio 送出去會把前端打死(實測舊前端的 worker thread 99% 空轉)。
 # 與 read_file 的 MAX_FILE_READ_CHARS 同一個概念:單行先截斷,整體再設上限。
 MAX_GREP_LINE_CHARS = 500        # 單行超過就截斷(context 行與 match 行同樣適用)
 MAX_GREP_OUTPUT_CHARS = 200_000  # 整體輸出上限;超過即停止收集並標明已截斷
@@ -447,7 +465,7 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 # ============================================================
 # MCP 外部檔案匯入設定
 # ============================================================
-# OpenCode MCP server 預設只能讀 AICODE_ROOT 內的檔案。若使用者要分析
+# MCP server 預設只能讀 AICODE_ROOT 內的檔案。若使用者要分析
 # Downloads/tmp 裡的截圖、PDF、firmware blob，先透過 import_external_file
 # 複製進 AICODE_ROOT/.aicode_uploads/，再交給 read_file / analyze_file /
 # ingest_document。此入口預設關閉，避免 MCP server 任意讀本機檔案。
@@ -741,7 +759,7 @@ QUERY_PRESERVE_SYMBOLS = True
 # ============================================================
 # apply_patch 套用後的自動驗證只做「同 process、無 subprocess、唯讀」的 syntax check
 # (patch_verify.py:.py/.pyi 用 ast.parse,C/C++ 用已載入的 tree-sitter grammar)。
-# lint / typecheck / test 一律不由 apply_patch 自動執行:它們各自是獨立的 OpenCode ask
+# lint / typecheck / test 一律不由 apply_patch 自動執行:它們各自是客戶端獨立的 ask
 # (codetrail_run_lint / codetrail_run_command),藏在 apply_patch 裡等於把「寫檔」核准
 # 暗中擴張成「執行專案程式碼」核准(pytest plugin、conftest.py、build script 都會跑)。
 # 結果三態 passed / failed / skipped:有任何 skipped 就是「驗證不完整」,不會渲染成通過;
@@ -886,8 +904,8 @@ STRICT_MODE_TEMPERATURE = 0.0        # 嚴格模式下溫度壓到最低
 # CodeTrail 自己的呼叫除了把 temperature 壓到 0.0/0.2,這裡再把 top_p / top_k /
 # min_p 也明確送出，不依賴 server 端預設。
 #
-# 注意:這只影響 CodeTrail internal calls。OpenCode TUI 直接打 llama-server /v1,
-# 不經過這裡 —— OpenCode 聊天路徑的取樣必須在 llama-server 啟動旗標釘
+# 注意:這只影響 CodeTrail internal calls。聊天客戶端的取樣值由 client_engine 每次
+# 請求明示送出(CHAT_TOP_P / CHAT_TOP_K / CHAT_MIN_P);不經客戶端的直接呼叫才吃 server 預設
 # (見 README §3.1 與 docs/troubleshooting.md「模型編造不存在的具體事實」)。
 CHAT_TOP_P = float(_os.environ.get("AICODE_CHAT_TOP_P", "0.95"))
 CHAT_TOP_K = int(_os.environ.get("AICODE_CHAT_TOP_K", "20"))
@@ -1002,7 +1020,7 @@ def get_answer_rules(has_binary: bool = False) -> str:
 # 改碼閉環設定 (Patch / Git / Lint)
 # ============================================================
 # ⚠️ 安全警告：apply_patch 會直接修改檔案，請謹慎使用
-# 預設關閉；mcp_server.py 會在 OpenCode runtime 明確啟用。
+# 預設關閉;mcp_server.py 這個明確啟動點才會啟用。
 # 其他 runtime / 測試可透過環境變數 AI_CODE_PATCH=1 啟用。
 PATCH_ENABLED = _os.environ.get('AI_CODE_PATCH', '').lower() in ('1', 'true', 'yes')
 PATCH_MAX_FILES = 5              # 單次 patch 最多修改 5 個檔案
@@ -1053,13 +1071,13 @@ LINT_COMMANDS = {
 # 即使有白名單，make/cmake/npm 等都會執行專案內的腳本
 # 建議：分析陌生 repo 時保持 False，只對自己的專案開啟
 #
-# 預設關閉；mcp_server.py 會在 OpenCode runtime 明確啟用。
+# 預設關閉;mcp_server.py 這個明確啟動點才會啟用。
 # 其他 runtime / 測試可透過環境變數 AI_CODE_RUN_TESTS=1 啟用。
 RUN_COMMAND_ENABLED = _os.environ.get('AI_CODE_RUN_TESTS', '').lower() in ('1', 'true', 'yes')
 RUN_COMMAND_TIMEOUT = 60
 # run_command 的 timeout(秒)三層契約:native tool schema、ToolExecutor 執行前 runtime
 # 驗證、mcp_server 的 Annotated[int, Field(strict=True, ge=MIN, le=MAX)] 都從這兩個常數來。
-# 這是 server 端接受的範圍;MCP client(OpenCode 等)可能更早截止,不保證 600 秒必在
+# 這是 server 端接受的範圍;MCP client 可能更早截止,不保證 600 秒必在
 # client timeout 內。
 RUN_COMMAND_TIMEOUT_MIN = 1
 RUN_COMMAND_TIMEOUT_MAX = 600

@@ -22,8 +22,8 @@
   → 模型呼叫 record_lesson 提案(rule 必須是單行祈使句行為規則)
   → permission ask:你在核准框看到 rule,核准才寫入 lessons.json
   → 下個 session:aicode 啟動時把 active lessons render 進
-    <AICODE_ROOT>/.codetrail/lessons.md,OpenCode 經 opencode.json 的
-    "instructions" 連同 AGENTS.md 一起載入 context
+    <AICODE_ROOT>/.codetrail/lessons.md,客戶端組 system prompt 時
+    連同專案 AGENTS.md 一起載入
   → 90 天後過 review_by:該條停止注入,aicode 啟動時醒目列出待複審清單
   → 你複審:renew(再延 90 天)或 delete
 ```
@@ -57,7 +57,9 @@
 
 被你拒絕的提案就結束,模型不該換句話重試;內容完全相同的重複提案也不會寫入第二條(回報既有編號,重試因此安全)。**沒有任何無審核的自動寫入路徑。**
 
-升級注意:舊安裝 `git pull` 後,全域 opencode.json 可能還沒有 `codetrail_record_lesson: "ask"` 這個核准閘(新工具會被舊的 `codetrail_*: allow` wildcard 直接放行)、也沒有 lessons 的 `instructions` 項(render 了也不載入)。`aicode` 每次啟動會用 `scripts/opencode_contract_check.py --fix` 自動補齊缺少的鍵(原檔備份、你明確設過的值一律尊重);不經 `aicode` 直接開 `opencode` 的話,請先重跑 `./set_config.sh`。
+核准閘不再依賴任何外部設定:`record_lesson` 寫死在 `client_policy.ASK_TOOLS` 裡,所以
+「這個工具要不要人工核准」不會因為某份設定檔沒更新而靜默失效。`.codetrail/lessons.md`
+也由客戶端自己讀進 system prompt,不需要註冊 `instructions` 項。
 
 ## 上限與 fail-loud
 
@@ -70,10 +72,10 @@ session start(`aicode`)時:
 - 有條目過 review_by → 照常啟動,但該條停止注入,並醒目列出待複審清單與 renew / delete 指令;
 - `.codetrail` 被 symlink/junction 指到專案外 → 拒絕啟動(沙箱寫入防線,render 一個 byte 都不寫;不信任的 repo 可能用這招把檔案導出沙箱)。
 
-跳過與安全模式(兩者都會**移除**先前 render 的 `.codetrail/lessons.md`,避免上個 session 的規則殘留被 OpenCode 載入):
+跳過與安全模式(兩者都會**移除**先前 render 的 `.codetrail/lessons.md`,避免上個 session 的規則殘留又被載入):
 
 - `AICODE_LESSONS_SKIP=1`:本 session 不注入(緊急逃生口);
-- `OPENCODE_DISABLE_PROJECT_CONFIG=1`(分析不信任 repo 的安全模式,見 [docs/security.md](security.md)):OpenCode 這個模式從全域設定目錄解析相對 instructions、不讀專案內檔案,lessons **不會注入** —— `aicode` 會明講,不會謊報「已注入」。注意 OpenCode 對這個 env 是「非空即真」,`=0` 也算開啟。
+- `CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1`(分析不信任 repo 的安全模式,見 [docs/security.md](security.md)):客戶端這個模式完全不讀專案內的 `AGENTS.md` 與 `.codetrail/lessons.md`,lessons **不會注入** —— `aicode` 會明講,不會謊報「已注入」。這個 env 是「非空即真」,`=0` 也算開啟。
 
 ## 管理指令
 
@@ -90,7 +92,7 @@ python3 lessons.py hit L-001        # 人工記一次命中(見下)
 
 ## hit_count 的誠實說明
 
-注入的 lessons.md 會要求模型:套用某條規則時在回覆中標註 `[L-003]` 這樣的編號,讓你**看得到規則有沒有生效**。但 OpenCode 端的對話輸出 CodeTrail 看不到,所以 `hit_count` 不會自動累計 —— 欄位保留給人工判斷:在對話裡看到模型標註了某條,想留下紀錄就 `python3 lessons.py hit L-003`。複審時 `hit_count` / `last_triggered` 是「這條還有沒有用」的參考,不是自動 decay 的依據(本機制刻意不做自動 decay)。
+注入的 lessons.md 會要求模型:套用某條規則時在回覆中標註 `[L-003]` 這樣的編號,讓你**看得到規則有沒有生效**。但那個標註在對話輸出裡,MCP server 這一端看不到,所以 `hit_count` 不會自動累計 —— 欄位保留給人工判斷:在對話裡看到模型標註了某條,想留下紀錄就 `python3 lessons.py hit L-003`。複審時 `hit_count` / `last_triggered` 是「這條還有沒有用」的參考,不是自動 decay 的依據(本機制刻意不做自動 decay)。
 
 ## 驗證注入有生效
 

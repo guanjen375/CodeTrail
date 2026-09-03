@@ -1,7 +1,7 @@
 # 安全邊界與工作節奏
 
-這份文件整理 CodeTrail 在 OpenCode TUI / web backend 裡的安全邊界。重點是:
-CodeTrail 有自己的沙箱,但它只包住 CodeTrail MCP 工具；OpenCode 內建工具、provider、
+這份文件整理 CodeTrail 在 CodeTrail 客戶端 / web backend 裡的安全邊界。重點是:
+CodeTrail 有自己的沙箱,但它只包住 CodeTrail MCP 工具；客戶端內建工具(已不存在)、provider、
 plugin 與專案設定仍要另外限制。操作責任與人工驗證原則見
 [Responsible Use](../RESPONSIBLE_USE.md)，保固與審計界線見
 [Disclaimer](../DISCLAIMER.md)。
@@ -16,12 +16,12 @@ plugin 與專案設定仍要另外限制。操作責任與人工驗證原則見
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
-OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode
+CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1 aicode
 ```
 
-並保留 [README §4.3](../README.md#43-opencode-config) 範本裡的 OpenCode
-permission:只允許 `codetrail_*`,把 OpenCode 內建 `bash` / `read` / `write` / `edit` /
-`apply_patch` 等全部 `deny`。
+客戶端**只**暴露 CodeTrail 的 19 個 MCP 工具:沒有第二套內建的 shell / 檔案 / web 工具
+可以繞過沙箱。要更嚴的話,`~/.config/codetrail/client.json` 的 `permission` 可以把任何
+工具改成 `ask` 或 `deny`(只能收緊,不能放寬 readonly policy)。
 
 ---
 
@@ -41,60 +41,61 @@ permission:只允許 `codetrail_*`,把 OpenCode 內建 `bash` / `read` / `write`
 - 附件與知識庫:`import_external_file(...)`、`analyze_file(...)`、`ingest_document(...)`、`query_knowledge(...)`
 - 修改與驗證:`git_status(...)`、`git_diff(...)`、`apply_patch(...)`、`run_lint(...)`、`run_command(...)`
 
-OpenCode 內建的 `bash` / `read` / `write` / `edit` 不經過 CodeTrail,所以 README 的 `opencode.json` 範本把它們設成 `deny`。不要為了方便把這些打開,除非你清楚知道該 repo 與目前 session 的風險。
+模型能呼叫的就只有上面這些:客戶端把 `tools/list` 的結果原樣交給模型,沒有另一組不經過
+CodeTrail 的內建工具。互動模式下 `apply_patch` / `run_lint` / `run_command` /
+`remove_document` / `record_lesson` / `review_figures` 六個必須人工核准,核准框**完整顯示
+參數**(含整份 patch)。
 
 ---
 
 ## 不信任 repo 的額外防線
 
-OpenCode 可能讀取專案內的 `opencode.json`,而專案層級 config 可能覆蓋你的全域 permission。分析不信任 repo 時,用:
+不信任的 repo 影響得到的是**送進模型的指示**:專案根目錄的 `AGENTS.md` 與
+`.codetrail/lessons.md` 每一輪都會進 system prompt。分析不信任 repo 時,用:
 
 ```bash
-OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode
+CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1 aicode
 ```
 
 web 模式也一樣:
 
 ```bash
-OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode_web
+CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1 aicode_web
 ```
 
-這會讓 OpenCode 忽略專案層級設定,避免 repo 自帶 config 把 `bash` / `read` / `write` 等內建工具重新放開。這個 env **只**關閉 project config，不會自動清掉 OpenCode 的全域、remote/custom、inline、managed 設定或已安裝 plugin。依 [OpenCode 的 config 合併與優先順序](https://dev.opencode.ai/docs/config/)，處理機密資料前仍要用 `opencode debug config` 檢查最終設定，並盤點已安裝 plugin。
+這會讓客戶端完全不讀專案內的 `AGENTS.md` 與 `.codetrail/lessons.md`。它**只**關閉專案來源;
+`~/.config/codetrail/instructions.md`(你自己的)與內建基底規則照常載入 —— 那是刻意的,你的
+規則不該被分析對象關掉。
 
 兩個此模式的副作用/防線要知道:
 
-- OpenCode 此模式改從全域設定目錄解析相對 instructions,不讀專案內檔案,所以 [lessons](lessons.md) 該 session **不會注入** —— `aicode` 啟動輸出會明講,並清掉先前 render 殘留的 `.codetrail/lessons.md`,不會謊報「已注入」。(OpenCode 對這個 env 是「非空即真」,`=0` 也算開啟。)
+- [lessons](lessons.md) 該 session **不會注入** —— `aicode` 啟動輸出會明講,並清掉先前
+  render 殘留的 `.codetrail/lessons.md`,不會謊報「已注入」。(這個 env 是「非空即真」,
+  `=0` 也算開啟。)
 - 不信任 repo 可能把 `.codetrail` 換成指向專案外的 symlink/junction,誘導 lessons render 把檔案寫出沙箱;`aicode` 啟動時偵測到會直接拒絕啟動,一個 byte 都不寫。
 
 ---
 
-## OpenCode direct-tool 相容閘
+## 客戶端就是唯一的前端
 
-CodeTrail 目前只支援 OpenCode `>=1.17.0,<2.0.0` 的 direct `codetrail_*` native MCP
-tools。`aicode`／`aicode web` 在產生 project wrapper、執行任何 `--fix` writer、啟動 MCP
-或模型前，先讀 `opencode --version` 與 `opencode debug config`；版本無法唯一解析、超出
-範圍，或 effective config 出現 V2-only 的 `mcp.servers`／任何 `codemode` 鍵，都會
-fail-loud。`aicode attach` 是只連既有 backend 的薄 client，不重跑 backend gate。
+`aicode` 啟動的是 CodeTrail 自己的 `codetrail_chat.py`,不再需要 Node / npm /
+opencode-ai,也沒有第二個 client 的版本相容閘要顧。模型看到什麼由三件事決定,全部在這個
+repo 裡:`client_prompt`(system prompt)、`mcp_contract`(工具目錄與 routing 指示)、
+`client_policy`(哪些工具要核准)。
 
-OpenCode V2 改用 `mcp.servers.codetrail`，而 `codemode:false`、`disabled` 與 execution
-timeout 的語意也不同。Code Mode 又會把 direct tools 收成單一 `execute`。這些都不能用
-V1 的 permission 與 canary 靜默猜測；要導入必須另案定義完整 lifecycle contract。
+`aicode attach` 是只連既有 backend 的薄 client,不重跑 backend preflight。
 
-## 受管 build prompt 與 permission 分工
+## system prompt 與 permission 分工
 
-正式 routing A/B 沒有 arm 通過全部 gate，所以 `set_config.sh` 預設不產生 build prompt。
-只有明確給 `--enable-experimental-build-prompt` 時，才產生
-`~/.config/codetrail/opencode-build-prompt.md`（`0644`），並讓
-`~/.config/opencode/opencode.json`（`0600`）指向它。canonical prompt 與 config 在同一
-transaction 中原子更新；既有 symlink 寫穿到 target，任一步失敗會 rollback，避免留下
-config 指向不存在 prompt 的半套狀態。明確的使用者自訂 string 一律保留；非 string 值
-fail-loud，不猜測重建。
+system prompt 由客戶端組,順序固定:內建基底規則(`client_prompt.BASE_RULES`,上限 1,600
+字元)→ MCP routing 指示 → 專案 `AGENTS.md` → `.codetrail/lessons.md` →
+`~/.config/codetrail/instructions.md`。每一個來源檔都以 `O_NOFOLLOW` + `fstat` 讀,而且
+**父目錄**被 symlink 重導就 fail-loud —— 只驗最終檔案擋不住「把 `.codetrail` 換成 symlink」。
 
-這份 build prompt 是取代 OpenCode build default 的短規則，不是 permission。它不會把
-`deny` 的 OpenCode 內建工具變成可用，也不會繞過 CodeTrail mutation 的 `ask`。目前
-`todowrite` 維持 `allow`；合成 request 只證明 replacement semantics，而已完成但失敗的
-routing A/B 不足以改 permission 或宣稱模型組合 supported。完整內容與邊界見
-[CodeTrail OpenCode build prompt](opencode-build-prompt.md)。
+system prompt 不是 permission:它不會讓被 `deny` 的工具變成可用,也不會繞過六個 ask 工具的
+人工核准。權限的唯一來源是 `client_policy` 加上 `client.json` 的 `permission` 覆寫,
+而 readonly session 另有第二層(MCP server 自己收到 `AI_CODE_PATCH=0` /
+`AI_CODE_RUN_TESTS=0`)。
 
 ---
 
@@ -133,13 +134,10 @@ aicode
 
 `record_lesson(...)` 是唯一會寫到 `AICODE_ROOT` 之外的工具,而且只寫一個固定路徑:`~/.config/codetrail/lessons.json`(per-deployment 的行為教訓 store,與 `deployment.json` 同層;不能被模型指到別的路徑)。它被 permission 設成 `ask`:模型只能「提案」,你會在核准框看到完整 rule 內容,核准後才落地。沒有無審核的自動寫入路徑;細節見 [docs/lessons.md](lessons.md)。
 
-升級防護：舊安裝 `git pull` 後，舊 opencode.json 的 `codetrail_*: allow` wildcard 會放行
-還沒有 ask 覆寫的新工具。direct-tool 相容閘通過後，`aicode` 才會用
-`scripts/opencode_contract_check.py --fix` 原子補上缺少的 ask 核准閘、lessons
-instructions，並只同步已明確 opt-in 的舊受管 build prompt reference；缺少 prompt 維持現況，
-明確自訂值與備份都保留。prompt artifact 和 config 任一步寫失敗都一起 rollback。不經
-`aicode` 直接開 `opencode` 的話，
-請先重跑 `./set_config.sh`。
+升級防護：核准閘不再依賴任何外部設定檔。哪些工具要人工核准寫死在
+`client_policy.ASK_TOOLS`,所以「新加的寫入工具被舊 wildcard 靜默放行」這個問題由構造
+消失。舊安裝升級後仍請跑一次 `./set_config.sh`,它會把 CodeTrail 曾經寫進你 OpenCode
+設定的東西還原並撤銷註冊(見 [README §3.1](../README.md))。
 
 tool canary 的 explicit hard gate 與 implicit diagnostic 分開使用 cache schema 2。cache 只存
 fingerprint hash、lane status、檢查時間與版本，不存 prompt、專案路徑、檔名、模型輸出、
@@ -172,8 +170,7 @@ CodeTrail,也建議在那個 project 的 `.gitignore` 補上同樣項目。`.git
 四個 CodeTrail 產生的 llama-server(8080–8083)**預設只綁
 `127.0.0.1`，且未啟用認證**。上游 llama-server 目前有 `--api-key` /
 `--api-key-file` 與 TLS 選項，但 CodeTrail 的 profile allowlist 與內部 HTTP client 尚未
-接上這些 credential；README OpenCode 範本的 `apiKey: "local"` 只是 provider 所需的
-非空值，不是 CodeTrail 部署的存取控制。因此以目前支援的路徑來看，綁
+接上這些 credential。因此以目前支援的路徑來看，綁
 `0.0.0.0` 就等於讓可抵達該 port 的機器都能呼叫模型 API。
 
 要讓其他機器連線必須明確選擇 `./set_config.sh --allow-remote`、
@@ -194,29 +191,34 @@ call site、doctor / preflight 與 secret redaction，不能只手動在單一 s
 - KB chunk 脈絡生成(Contextual Retrieval)沿用獨立的 `AICODE_KB_CONTEXT_REMOTE_OK`(見 docs/rag.md);兩個 opt-in 不互通,各自守各自要外送的內容。
 - `python3 scripts/doctor.py` 啟動前就會檢查:端點非 loopback 且未設對應 opt-in → FAIL。
 
-這些規則只涵蓋 CodeTrail 經 `llama_client` 發出的請求。OpenCode 自己的 provider、內建
-web 工具、plugin 或其他 process 不會自動繼承 CodeTrail 的 endpoint policy。NDA 場景要
-同時保留 `enabled_providers` 與 permission 鎖定，並檢查 effective OpenCode config。
+這些規則涵蓋 CodeTrail 經 `llama_client` 發出的**所有**請求 —— 客戶端的聊天迴圈與壓縮
+摘要都走這條路,沒有第二個 provider stack 會繞過它。同一台機器上的其他 process 當然不受
+這裡管;NDA 場景仍要確認 `~/.config/codetrail/deployment.json` 的端點全是 loopback。
 
 ## Web 模式曝光面
 
 `aicode web` 預設只綁 `127.0.0.1`。A/B 機跨機器使用時推薦 `aicode_web`:它每次向本機 `tailscale ip -4` 取值,只綁該 `100.64.0.0/10` virtual interface，絕不綁 `0.0.0.0`。A 機可完全沒有 GUI，B 機開 launcher 印出的 `http://100.x.y.z:4096/` 即可；HTTP 封包仍包在 Tailscale 的加密 tunnel 內。
 
-`aicode_web` 沒有應用層密碼,因此 **tailnet ACL 是存取邊界**；共享 / 多人 tailnet 應限制哪些裝置或使用者能連 A 機的 4096 port。wrapper 傳入值、hostname、Tailscale CLI 當下 IP 只要有一項不一致就拒絕。普通 `aicode web` 若刻意綁 LAN IP / `0.0.0.0` 或開 `--mdns`,仍必須先設定 `OPENCODE_SERVER_PASSWORD`。
+`aicode_web` 預設沒有應用層密碼,因此 **tailnet ACL 是存取邊界**；共享 / 多人 tailnet 應限制哪些裝置或使用者能連 A 機的 4096 port。wrapper 傳入值、hostname、Tailscale CLI 當下 IP 只要有一項不一致就拒絕。普通 `aicode web` 若刻意綁 LAN IP / `0.0.0.0` 或開 `--mdns`(對區網廣播這個服務),仍必須先
+設定 `AICODE_WEB_PASSWORD`,而且是 **server 自己**擋 —— 直接叫
+`codetrail_chat.py web --hostname 0.0.0.0` 一樣被拒。設了密碼時它不會出現在 tmux 指令列、
+pane scrollback,也不會傳給 MCP 子行程(核准後的 `run_command` 會繼承那份環境)。
 
-不要用 `tailscale funnel`,因為它會把 OpenCode web backend 暴露到公網。想維持純 loopback 也可使用 SSH port-forward；這兩條都不會放寬 CodeTrail MCP sandbox。
+無密碼的 loopback backend 也不接受跨站請求:server 比對 `Origin`/`Referer` 與 `Host`,而且
+API 端點只收 `application/json`(`text/plain` 的 simple POST 是跨站頁面唯一免 preflight 的
+形狀)。同一個 session 一次只跑一輪,核准只能回答一次且必須是真的 boolean。
+
+不要用 `tailscale funnel`,因為它會把 web backend 暴露到公網。想維持純 loopback 也可使用 SSH port-forward；這兩條都不會放寬 CodeTrail MCP sandbox。
 
 ---
 
 ## 快速檢查表
 
 - 從具體專案目錄跑 `aicode` / `aicode_web`,不要從 `$HOME` 或 `/`。
-- `/status` 看到 `codetrail Connected` 後再開始工作。
-- 確認啟動前有 `[direct-contract] PASS` 與 `MCP PASS — 19 tools + list_dir round-trip`；
-  implicit 非 optimal 只代表 routing 診斷警告，explicit／direct failure 則會拒絕啟動。
-- 不信任 repo 時加 `OPENCODE_DISABLE_PROJECT_CONFIG=1`。
-- 保留 [README §4.3](../README.md#43-opencode-config) 的 `enabled_providers` 與
-  `permission` 鎖定。
+- 確認啟動前有 `MCP PASS — 19 tools + list_dir round-trip`；implicit 非 optimal 只代表
+  routing 診斷警告，explicit failure 則會拒絕啟動。
+- 不信任 repo 時加 `CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1`。
+- 要更嚴的權限時,用 `~/.config/codetrail/client.json` 的 `permission`(只能收緊)。
 - 需要外部附件才打開 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1`。
 - remote endpoint 只在明確接受資料外送時設定對應 opt-in。
 - commit 前跑 `git status` / `git diff`,確認沒有知識庫、上傳附件、jsonl 或 session 快取。

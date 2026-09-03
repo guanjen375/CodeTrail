@@ -3,7 +3,7 @@
 
 Catalog-only mode performs a live MCP ``initialize``/``tools/list`` capture and
 never starts a model.  The model path uses a synthetic project embedded in the
-fixture, accepts only completed structured OpenCode events, retries one missing
+fixture, accepts only completed structured client events, retries one missing
 terminal event once, and persists only privacy-safe classifications and
 aggregates.
 
@@ -43,7 +43,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts import opencode_direct_contract  # noqa: E402
+import client_events  # noqa: E402
+import client_mcp  # noqa: E402
+import client_policy  # noqa: E402
+import client_prompt  # noqa: E402
+import model_resolution  # noqa: E402
 from scripts.mcp_catalog import (  # noqa: E402
     CatalogError,
     CatalogSnapshot,
@@ -52,18 +56,16 @@ from scripts.mcp_catalog import (  # noqa: E402
     assert_public_tool_contract,
     catalog_from_fastmcp,
     catalog_from_stdio,
-    extract_stdio_command,
     json_digest,
-    load_effective_opencode_config,
     measure_catalog_prompt_tokens,
     text_digest,
 )
 
 DEFAULT_CASES_PATH = REPO_ROOT / "eval" / "fixtures" / "tool_routing" / "cases.json"
 DEFAULT_MATRIX_PATH = REPO_ROOT / "eval" / "fixtures" / "tool_routing" / "support_matrix.json"
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
 FIXTURE_SCHEMA_VERSION = 1
-MATRIX_SCHEMA_VERSION = 1
+MATRIX_SCHEMA_VERSION = 2
 DEFAULT_MCP_TIMEOUT_SECONDS = 120
 DEFAULT_MODEL_TIMEOUT_SECONDS = 180
 MAX_HTTP_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -409,108 +411,28 @@ def materialize_synthetic_fixture(data: Mapping[str, Any], destination: Path) ->
         target.write_text(item["content"], encoding="utf-8")
 
 
-def _event_part(event: Mapping[str, Any]) -> Mapping[str, Any]:
-    part = event.get("part")
-    return part if isinstance(part, Mapping) else {}
+# 事件流的形狀與解析集中在 client_events:canary、routing eval 與 session_eval
+# replay 走同一份。各自寫一份解析器的代價是靜默的——某一端多認一種形狀時,
+# 同一次 run 在兩邊會得到不同判定,而兩邊都不會報錯。
+_event_part = client_events.event_part
+_safe_nonnegative_int = client_events.safe_nonnegative_int
+_event_session_ids = client_events.event_session_ids
 
 
-def _safe_nonnegative_int(value: object) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
-
-
-def _event_session_ids(event: Mapping[str, Any]) -> list[str]:
-    part = _event_part(event)
-    values = (
-        event.get("sessionID"),
-        event.get("session_id"),
-        part.get("sessionID"),
-        part.get("session_id"),
-    )
-    return [value for value in values if isinstance(value, str) and _SAFE_SESSION_ID_RE.fullmatch(value)]
-
-
-def _event_generated_text(event: Mapping[str, Any]) -> str:
-    """Extract assistant-generated text, never a tool's state.output payload."""
-
-    event_type = str(event.get("type", ""))
-    part = _event_part(event)
-    part_type = str(part.get("type", ""))
-    if event_type == "reasoning" or part_type == "reasoning":
-        return ""
-    if event_type not in ("text", "assistant_text") and part_type not in (
-        "text",
-        "assistant-text",
-    ):
-        return ""
-    for container in (part, event):
-        for key in ("text", "content"):
-            value = container.get(key)
-            if isinstance(value, str):
-                return value
-    return ""
+_event_generated_text = client_events.event_generated_text
 
 
 def _completed_tool_call(event: Mapping[str, Any]) -> CompletedToolCall | None:
-    part = _event_part(event)
-    event_type = str(event.get("type", ""))
-    part_type = str(part.get("type", ""))
-    if event_type not in ("tool_use", "tool-use") and part_type not in (
-        "tool",
-        "tool-use",
-    ):
+    call = client_events.completed_tool_call(event)
+    if call is None:
         return None
-    state_value = part.get("state", event.get("state"))
-    state = state_value if isinstance(state_value, Mapping) else {}
-    if state.get("status") != "completed":
-        return None
-    tool = part.get("tool", event.get("tool"))
-    if not isinstance(tool, str) or not tool:
-        return None
-    raw_arguments = state.get("input", part.get("input", event.get("input")))
-    arguments = dict(raw_arguments) if isinstance(raw_arguments, Mapping) else None
-    return CompletedToolCall(tool, arguments)
+    return CompletedToolCall(call.tool, call.arguments)
 
 
-def _is_terminal_event(event: Mapping[str, Any]) -> bool:
-    part = _event_part(event)
-    event_type = str(event.get("type", "")).replace("-", "_")
-    part_type = str(part.get("type", "")).replace("-", "_")
-    if event_type not in ("step_finish", "message_finish", "session_finish") and part_type not in (
-        "step_finish",
-        "message_finish",
-        "session_finish",
-    ):
-        return False
-    reason = part.get("reason", event.get("reason"))
-    # A tool-calls step is an intermediate boundary.  Success requires the
-    # later terminal assistant step, so prose/XML cannot impersonate a call.
-    return reason not in ("tool-calls", "tool_calls")
+_is_terminal_event = client_events.is_terminal_event
 
 
-def _token_values(event: Mapping[str, Any]) -> tuple[int, int, int, int, int]:
-    part = _event_part(event)
-    tokens_value = part.get("tokens", event.get("tokens"))
-    if not isinstance(tokens_value, Mapping):
-        return (0, 0, 0, 0, 0)
-    prompt = _safe_nonnegative_int(
-        tokens_value.get("input", tokens_value.get("prompt", tokens_value.get("prompt_tokens")))
-    )
-    output = _safe_nonnegative_int(
-        tokens_value.get("output", tokens_value.get("completion", tokens_value.get("output_tokens")))
-    )
-    reasoning = _safe_nonnegative_int(tokens_value.get("reasoning"))
-    cache_value = tokens_value.get("cache")
-    cache = 0
-    if isinstance(cache_value, Mapping):
-        cache = sum(
-            _safe_nonnegative_int(cache_value.get(key)) for key in ("read", "write", "input", "output")
-        )
-    else:
-        cache = _safe_nonnegative_int(cache_value)
-    total = _safe_nonnegative_int(tokens_value.get("total"))
-    if total == 0:
-        total = prompt + output + reasoning + cache
-    return prompt, output, reasoning, cache, total
+_token_values = client_events.token_values
 
 
 def parse_event_stream(
@@ -519,7 +441,7 @@ def parse_event_stream(
     latency_ms: int = 0,
     harness_error: bool = False,
 ) -> AttemptTrace:
-    """Deterministically parse OpenCode JSONL without retaining raw events."""
+    """Deterministically parse the client's JSONL event stream without retaining raw events."""
 
     completed: list[CompletedToolCall] = []
     generated: list[str] = []
@@ -528,13 +450,7 @@ def parse_event_stream(
     prompt_tokens = output_tokens = reasoning_tokens = cache_tokens = total_tokens = 0
     compactions = 0
 
-    for line in output.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
+    for event in client_events.iter_events(output):
         for session_id in _event_session_ids(event):
             if session_id not in sessions:
                 sessions.append(session_id)
@@ -1175,40 +1091,26 @@ def write_private_result(path: Path, value: Mapping[str, Any]) -> None:
             Path(temp_name).unlink(missing_ok=True)
 
 
-def parse_opencode_version(raw: str) -> tuple[int, int, int]:
+def client_identity(root: Path) -> str:
+    """跑這次評測的客戶端身分。
+
+    以前這一格是 `opencode --version` —— 那是決定「模型看到什麼、工具怎麼被
+    呼叫」的那一端。現在那一端是我們自己的客戶端,所以身分換成 engine /
+    prompt / 進入點三個檔的內容雜湊加上 system prompt 的 digest。
+    """
+    parts = []
+    for name in ("client_engine.py", "client_prompt.py", "codetrail_chat.py"):
+        try:
+            parts.append(text_digest((REPO_ROOT / name).read_text(encoding="utf-8")))
+        except OSError:
+            parts.append("missing")
     try:
-        return opencode_direct_contract.parse_opencode_version(raw)
-    except opencode_direct_contract.DirectToolContractError as exc:
-        raise EvalError("OpenCode version is not uniquely parseable") from exc
+        import client_prompt
 
-
-def read_opencode_version(root: Path, environment: Mapping[str, str]) -> str:
-    try:
-        completed = subprocess.run(
-            ["opencode", "--version"],
-            cwd=str(root),
-            env=dict(environment),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise EvalError("OpenCode version check failed") from exc
-    if completed.returncode != 0 or not completed.stdout.strip():
-        raise EvalError("OpenCode version check failed")
-    version = parse_opencode_version(completed.stdout)
-    return ".".join(str(part) for part in version)
-
-
-def require_direct_contract(version_raw: str, config: Mapping[str, Any]) -> None:
-    """Delegate the frozen direct-tool lifecycle contract to T4's checker."""
-
-    try:
-        opencode_direct_contract.require_direct_tool_contract(version_raw, config)
-    except opencode_direct_contract.DirectToolContractError as exc:
-        raise EvalError("OpenCode direct-tool contract is unsupported") from exc
+        parts.append(client_prompt.build_system_prompt(root).digest)
+    except Exception:  # noqa: BLE001
+        parts.append("prompt-unavailable")
+    return text_digest("|".join(parts))[:16]
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1287,17 +1189,37 @@ def _normalise_server_root(base_url: str) -> str:
     return value[:-3] if value.endswith("/v1") else value
 
 
+def _looks_like_model_path(value: str) -> bool:
+    return value.startswith(("/", "~", "./", "../")) or value.lower().endswith(".gguf")
+
+
+def _bare_model(value: str) -> str:
+    """逐題 client 與 canary 拿到的模型名稱必須是客戶端真正用的那一個:bare registry
+    name 或 GGUF 路徑。舊式 `llamacpp/<name>` 剝掉前綴;外部 provider 一律拒絕。"""
+    resolved = model_resolution.normalize_main_model(str(value or ""), "--model")
+    if not resolved.ok:
+        raise EvalError(resolved.error or f"invalid --model {value!r}")
+    return resolved.model
+
+
 def _model_server_base_url(
     config: Mapping[str, Any],
     *,
     model: str,
     environment: Mapping[str, str],
 ) -> str:
-    """Bind direct token/props probes to the endpoint OpenCode will use."""
+    """Bind direct token/props probes to the endpoint the client will use.
 
+    `config` 是空的(去 OpenCode 化之後沒有第二份 provider 設定);留著參數是為了
+    result identity 的 digest 形狀不變。真正的來源是 `AICODE_LLAMA_BASE_URL`。
+    """
+
+    # `--model` 跟 `aicode -m` 一樣收 bare registry name / GGUF 路徑;舊式
+    # `llamacpp/<name>` 仍接受(provider 段只用來對照 config 裡的 baseURL,沒有就是本地)。
+    _bare_model(model)                       # 外部 provider 在這裡就拒絕
     provider_name, separator, _model_name = model.partition("/")
-    if not separator or not provider_name:
-        raise EvalError("model identity must use provider/model syntax")
+    if not separator or _looks_like_model_path(model):
+        provider_name = "llamacpp"
     providers = config.get("provider")
     provider = providers.get(provider_name) if isinstance(providers, Mapping) else None
     options = provider.get("options") if isinstance(provider, Mapping) else None
@@ -1310,7 +1232,7 @@ def _model_server_base_url(
     configured_root = _normalise_server_root(configured) if configured else None
     environment_root = _normalise_server_root(environment_url) if environment_url else None
     if configured_root and environment_root and configured_root != environment_root:
-        raise EvalError("model endpoint environment and effective OpenCode config disagree")
+        raise EvalError("model endpoint environment and configured provider baseURL disagree")
     return environment_root or configured_root or "http://localhost:8080"
 
 
@@ -1318,7 +1240,7 @@ def compatibility_identity(
     *,
     row: Mapping[str, Any],
     arm: str,
-    opencode_version: str | None,
+    client_version: str | None,
     catalog: CatalogSnapshot,
     props: Mapping[str, Any] | None = None,
     effective_config: Mapping[str, Any] | None = None,
@@ -1354,20 +1276,23 @@ def compatibility_identity(
         build_digest = text_digest(str(build_info))
     else:
         build_digest = None
+    # 「這一臂的契約」= 模型實際看到的東西。OpenCode 時代那兩格是 build prompt
+    # 與 todowrite 權限;現在那兩件事的等價物是客戶端的基底規則與 ask 工具集合
+    # (`effective_config` 永遠是空的,留著它們等於把兩個常數 hash 進去)。
     arm_contract_digest = json_digest(
         {
             "tools_digest": catalog.tools_digest,
             "instructions_digest": catalog.instructions_digest,
-            "build_prompt_digest": build_prompt_digest,
-            "todowrite_permission": todowrite,
+            "client_rules_digest": _client_rules_digest(),
+            "ask_tools": sorted(client_policy.ASK_TOOLS),
         }
     )
-    home_raw = environment.get("HOME") or environment.get("USERPROFILE")
+    # 以前這一格 hash 的是 OpenCode 的全域 AGENTS.md;現在模型每一輪看到的
+    # 使用者層規則是 `~/.config/codetrail/instructions.md`,hash 它(鍵名不改,
+    # result / matrix 的形狀維持;歷史 row 的值本來就對不上現行客戶端)。
     global_agents_digest = None
-    if isinstance(home_raw, str) and home_raw:
-        global_agents_digest = _file_digest_state(
-            Path(home_raw).expanduser() / ".config" / "opencode" / "AGENTS.md"
-        )
+    if environment.get("HOME") or environment.get("USERPROFILE"):
+        global_agents_digest = _file_digest_state(client_prompt.user_instructions_path(environment))
     return {
         "matrix_row": row.get("id"),
         "arm": arm,
@@ -1380,7 +1305,7 @@ def compatibility_identity(
         "chat_template_caps": dict(caps) if isinstance(caps, Mapping) else None,
         "chat_template_caps_digest": json_digest(caps) if isinstance(caps, Mapping) else None,
         "n_ctx": n_ctx,
-        "opencode_version": opencode_version,
+        "client_version": client_version,
         "llama_cpp_build_digest": build_digest,
         "tools_digest": catalog.tools_digest,
         "instructions_digest": catalog.instructions_digest,
@@ -1391,6 +1316,11 @@ def compatibility_identity(
         "global_agents_digest": global_agents_digest,
         "fixture_digest": fixture_digest,
     }
+
+
+def _client_rules_digest() -> str:
+    """客戶端基底規則的 digest(OpenCode 時代 build prompt 的等價物)。"""
+    return text_digest(client_prompt.BASE_RULES)
 
 
 def _effective_prompt_digest(value: object) -> str:
@@ -1434,7 +1364,7 @@ def assert_compatibility(row: Mapping[str, Any], identity: Mapping[str, Any]) ->
         "chat_template_caps",
         "chat_template_caps_digest",
         "n_ctx",
-        "opencode_version",
+        "client_version",
         "llama_cpp_build_digest",
         "effective_config_digest",
         "global_agents_digest",
@@ -1464,7 +1394,7 @@ def _schemas(catalog: CatalogSnapshot) -> dict[str, Mapping[str, Any]]:
     return {tool.name: tool.input_schema for tool in catalog.tools}
 
 
-def _run_opencode_attempt(
+def _run_client_attempt(
     *,
     project: Path,
     prompt: str,
@@ -1472,28 +1402,35 @@ def _run_opencode_attempt(
     environment: Mapping[str, str],
     timeout_seconds: int,
 ) -> AttemptTrace:
+    # 真的跑一次 headless 客戶端,而且是**唯讀**權限:routing eval 只驗模型會
+    # 不會選對工具,它沒有理由能寫到 fixture 專案裡。不帶 --persist,所以
+    # 評測不會在使用者的 session 清單裡留下對話(也就沒有「刪掉暫存 session」
+    # 這一步)。
     command = [
-        "opencode",
-        "run",
-        "--dir",
+        sys.executable,
+        str(REPO_ROOT / "codetrail_chat.py"),
+        "--root",
         str(project),
-        "--agent",
-        "build",
-        "--format",
-        "json",
-        "--title",
-        "CodeTrail synthetic routing evaluation",
+        "--policy",
+        "readonly",
     ]
+    child_env = dict(environment)
     if model:
-        command.extend(("--model", model))
-    command.append(prompt)
+        # 跟 canary 一樣把 --model 真的送出去:不然 15 題逐題跑的是呼叫環境
+        # AICODE_MODEL 指的那顆(或直接啟動失敗),結果卻歸到指定模型的 identity。
+        # 送的是正規化後的 bare name(直接執行的 codetrail_chat.py 不會像 aicode
+        # wrapper 那樣剝掉 llamacpp/ 前綴)。
+        bare = _bare_model(model)
+        command.extend(["--model", bare])
+        child_env["AICODE_MODEL"] = bare
+    command.extend(["run", "--format", "json", prompt])
     started = time.monotonic()
     timed_out = False
     try:
         completed = subprocess.run(
             command,
             cwd=str(project),
-            env=dict(environment),
+            env=child_env,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -1527,26 +1464,13 @@ def _delete_sessions(
     project: Path,
     environment: Mapping[str, str],
 ) -> bool:
-    ok = True
-    for session_id in dict.fromkeys(session_ids):
-        if not _SAFE_SESSION_ID_RE.fullmatch(session_id):
-            continue
-        try:
-            completed = subprocess.run(
-                ["opencode", "session", "delete", session_id],
-                cwd=str(project),
-                env=dict(environment),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=30,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            ok = False
-        else:
-            ok = ok and completed.returncode == 0
-    return ok
+    """headless 預設 ephemeral —— 評測的對話從來沒有落檔,沒有東西要刪。
+
+    保留這個函式(永遠回 True)是為了讓報告欄位與呼叫端的形狀不變;真正的
+    保證在 `codetrail_chat run` 不帶 `--persist`。
+    """
+    del session_ids, project, environment
+    return True
 
 
 def _run_explicit_canary_gate(
@@ -1595,28 +1519,19 @@ def _run_explicit_canary_gate(
     }
 
 
-def _ask_permission_contract(config: Mapping[str, Any]) -> bool:
-    try:
-        from scripts.opencode_contract_check import REQUIRED_ASK_TOOLS
-    except ImportError:
-        return False
-    permission = config.get("permission")
-    if not isinstance(permission, Mapping):
-        return False
-    return all(permission.get(tool) == "ask" for tool in REQUIRED_ASK_TOOLS)
+def _ask_permission_contract(_config: Mapping[str, Any] | None = None) -> bool:
+    """六個寫入工具仍然是 ask。
 
+    以前這是讀 opencode.json 的 `permission`;現在權限是客戶端的 policy,所以
+    契約檢查的對象換成那份 policy 本身 —— 而 eval 一律跑 readonly,連 ask 都
+    不會發生。保留這個函式是為了讓報告欄位語意不變。
+    """
+    import client_policy
 
-def _assert_isolated_mcp_config(config: Mapping[str, Any]) -> None:
-    """Refuse live scoring while another enabled MCP can contaminate the fixture."""
-
-    mcp = config.get("mcp")
-    if not isinstance(mcp, Mapping):
-        raise EvalError("routing eval requires the effective mcp.codetrail config")
-    for name, entry in mcp.items():
-        if name == "codetrail":
-            continue
-        if not isinstance(entry, Mapping) or entry.get("enabled") is not False:
-            raise EvalError("routing eval requires every non-CodeTrail MCP server to be disabled")
+    return client_policy.ASK_TOOLS == frozenset(
+        {"apply_patch", "run_lint", "run_command", "remove_document",
+         "record_lesson", "review_figures"}
+    )
 
 
 async def _prepare_synthetic_knowledge(
@@ -1724,7 +1639,12 @@ async def _acquire_catalog(
                 else:
                     os.environ[key] = value
         return catalog, None
-    command = extract_stdio_command(effective_config)
+    # 客戶端啟動 MCP server 的方式就是這一條;沒有第二份 OpenCode 設定可以抽。
+    # 走 client_mcp 的常數而不是自己拼路徑,兩邊才不會各自漂移。
+    command = StdioMcpCommand(
+        (sys.executable, str(client_mcp.SERVER_SCRIPT)),
+        {"AICODE_ROOT": str(root)},
+    )
     if args.catalog_only:
         command_environment = dict(command.environment)
         command_environment[MODEL_SERVER_PREFLIGHT_SKIP_ENV] = "1"
@@ -1742,7 +1662,7 @@ def _catalog_result(
     *,
     row: Mapping[str, Any],
     arm: str,
-    opencode_version: str | None,
+    client_version: str | None,
     catalog: CatalogSnapshot,
     effective_config: Mapping[str, Any],
     fixture_digest: str,
@@ -1755,7 +1675,7 @@ def _catalog_result(
         "compatibility": compatibility_identity(
             row=row,
             arm=arm,
-            opencode_version=opencode_version,
+            client_version=client_version,
             catalog=catalog,
             effective_config=effective_config,
             selected_model=configured_model if isinstance(configured_model, str) else None,
@@ -1810,18 +1730,17 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         # preflight does not affect initialize/tools/list contract bytes.
         environment[MODEL_SERVER_PREFLIGHT_SKIP_ENV] = "1"
 
-    # The in-process path is the deliberately offline CI path: it must not
-    # depend on an OpenCode executable.  Runtime stdio capture checks the client
-    # version/direct contract before starting MCP or model subprocesses.
+    # The in-process path is the deliberately offline CI path.  The stdio path
+    # now starts our own ``mcp_server.py`` through the same command the client
+    # uses, so there is no external client to version-check any more; the
+    # identity that matters is the CodeTrail client itself.
+    effective_config: dict[str, Any] = {}
     if args.catalog_source == "in-process":
         if not args.catalog_only:
             raise EvalError("in-process catalog source is catalog-only")
-        opencode_version = None
-        effective_config: dict[str, Any] = {}
+        client_version = None
     else:
-        opencode_version = read_opencode_version(root, environment)
-        effective_config = load_effective_opencode_config(root, environment=environment)
-        require_direct_contract(opencode_version, effective_config)
+        client_version = client_identity(root)
     catalog, command = await _acquire_catalog(
         args=args,
         root=root,
@@ -1839,33 +1758,31 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         return _catalog_result(
             row=row,
             arm=args.arm,
-            opencode_version=opencode_version,
+            client_version=client_version,
             catalog=catalog,
             effective_config=effective_config,
             fixture_digest=json_digest(cases_data),
             environment=environment,
         )
-    assert opencode_version is not None
+    assert client_version is not None
     if command is None:
         raise EvalError("model evaluation requires the effective stdio MCP catalog")
-    _assert_isolated_mcp_config(effective_config)
-    if command.environment.get("AICODE_ROOT"):
-        raise EvalError("routing eval requires an MCP command without a fixed AICODE_ROOT")
-    if command.environment.get("AI_CODE_COLLECT_DATA", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    ):
-        raise EvalError("routing eval refuses an MCP config that persists data-flywheel records")
+    # 命令是我們自己組的,AICODE_ROOT 一定指向這次評測的 sandbox root;
+    # 這裡守的是「不得在評測途中打開 data flywheel」。
+    if command.environment.get("AI_CODE_COLLECT_DATA", "").lower() in ("1", "true", "yes"):
+        raise EvalError("routing eval refuses an MCP command that persists data-flywheel records")
 
     configured_model = args.model
     if not configured_model:
         configured_model = effective_config.get("model")
     if not isinstance(configured_model, str) or not configured_model:
         raise EvalError("model evaluation requires --model or effective config.model")
+    # 實際打到 llama-server 的每一個 request(直接 token probe、canary、逐題 client)
+    # 都用正規化後的 bare name;result identity 的 selected_model 保留使用者原字串。
+    probe_model = _bare_model(configured_model)
     base_url = _model_server_base_url(
         effective_config,
-        model=configured_model,
+        model=probe_model,
         environment=environment,
     )
     client = LocalJsonClient(base_url, timeout_seconds=args.model_timeout)
@@ -1876,7 +1793,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     identity = compatibility_identity(
         row=row,
         arm=args.arm,
-        opencode_version=opencode_version,
+        client_version=client_version,
         catalog=catalog,
         props=props,
         effective_config=effective_config,
@@ -1888,7 +1805,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     assert_arm_contract(matrix, args.arm, identity)
 
     token_measurement = measure_catalog_prompt_tokens(
-        model=configured_model,
+        model=probe_model,
         catalog=catalog,
         post_json=client.post_json,
     )
@@ -1916,17 +1833,17 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         explicit_canary = _run_explicit_canary_gate(
             project=project,
-            model=args.model,
+            model=probe_model,
             environment=model_env,
             timeout_seconds=min(args.model_timeout, 120),
         )
         schemas = _schemas(catalog)
         for case in cases:
             attempts: list[AttemptTrace] = []
-            first = _run_opencode_attempt(
+            first = _run_client_attempt(
                 project=project,
                 prompt=case["prompt"],
-                model=args.model,
+                model=probe_model,
                 environment=model_env,
                 timeout_seconds=args.model_timeout,
             )
@@ -1937,10 +1854,10 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 environment=model_env,
             )
             if not first.terminal:
-                second = _run_opencode_attempt(
+                second = _run_client_attempt(
                     project=project,
                     prompt=case["prompt"],
-                    model=args.model,
+                    model=probe_model,
                     environment=model_env,
                     timeout_seconds=args.model_timeout,
                 )
@@ -1990,7 +1907,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--matrix-row", required=True)
     parser.add_argument("--arm", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--model", help="OpenCode provider/model override")
+    parser.add_argument("--model", help="model override for the headless client (a registry name or GGUF path, as aicode -m)")
     parser.add_argument(
         "--catalog-only",
         action="store_true",

@@ -1,6 +1,6 @@
 # 基本操作
 
-這份文件整理 CodeTrail 的基本操作：環境驗收、正常對話、夾帶附件、注入 RAG。完整 OpenCode TUI 安裝主線放在 [README](../README.md)；進階/替代安裝補充放在 [setup.md](setup.md)；工具細節放在 [MCP 工具清單](mcp-tools.md)。
+這份文件整理 CodeTrail 的基本操作：環境驗收、正常對話、夾帶附件、注入 RAG。完整 CodeTrail 客戶端 安裝主線放在 [README](../README.md)；進階/替代安裝補充放在 [setup.md](setup.md)；工具細節放在 [MCP 工具清單](mcp-tools.md)。
 
 [回到 README](../README.md)。
 
@@ -8,13 +8,13 @@
 
 ## 0. 環境驗收
 
-照 [README](../README.md) 的 OpenCode TUI 流程完成後，先在 CodeTrail repo 裡跑：
+照 [README](../README.md) 的 CodeTrail 客戶端 流程完成後，先在 CodeTrail repo 裡跑：
 
 ```bash
 AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py
 ```
 
-`<CODE_MODEL>` 是佔位符,必須替換成 MODEL_REGISTRY 裡登記的 bare name 或 GGUF 絕對路徑;如果你已經在 OpenCode JSON 設好同一顆模型,doctor 也能從設定檔解析。`FAIL` 要先處理;`WARN` 可以依訊息判斷是否需要調整。接著切到要分析的專案根目錄:
+`<CODE_MODEL>` 是佔位符,必須替換成 MODEL_REGISTRY 裡登記的 bare name 或 GGUF 絕對路徑;deployment profile 的 `main.model` 設好時,doctor 也能從那裡解析。`FAIL` 要先處理;`WARN` 可以依訊息判斷是否需要調整。接著切到要分析的專案根目錄:
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
@@ -23,28 +23,28 @@ aicode
 
 進入 TUI 前會依序看到分層健康狀態：
 
-- `[direct-contract] PASS`：OpenCode 是 `>=1.17.0,<2.0.0`，effective config 使用 direct
-  `codetrail_*` 契約，沒有 V2-only `mcp.servers`／`codemode`。
+- `[client] PASS`：客戶端進入點存在且可執行(`AICODE_CLIENT_ENTRY` 可覆寫,覆寫時
+  canary 驗的就是被覆寫的那一份)。
 - `MCP PASS — 19 tools + list_dir round-trip`：每次都 live 初始化 MCP、精確檢查 19 個名稱與
   固定順序，擷取完整 typed schemas／instructions digest，並執行一次唯讀 `list_dir`。
   schema bounds/description/budget 由同一 public contract 的 static test 驗證；routing catalog
   另保存逐工具 counts/digests 與 token measurement。
 - live／cached `MODEL PASS`（或 retry 成功的 `MODEL FLAKY`）：explicit prompt 點名
-  `codetrail_list_dir`，只有 completed 的結構化 event 才通過；連續兩次失敗會拒絕啟動。
+  `list_dir`，只有 completed 的結構化 event 才通過；連續兩次失敗會拒絕啟動。
 - `IMPLICIT ... status=optimal|suboptimal|fail|timeout`：未點名工具的自主 routing 診斷。
   `optimal` 是理想結果，其餘三態會警告，但四態都不擋啟動。
 
-explicit 與 implicit 使用分離的 schema 2 cache lane；模型／設定／live catalog／有效 build
-prompt／AGENTS 或 server `/props` 改變都會換 fingerprint。需要讀專案外附件時看「夾帶附件」；
-若 TUI 內後續某一輪仍異常，再用 `/status` 與
+explicit 與 implicit 使用分離的 cache lane；模型／設定／live catalog／客戶端檔案／system
+prompt／專案 AGENTS 或 server `/props` 改變都會換 fingerprint。需要讀專案外附件時看「夾帶附件」；
+若 TUI 內後續某一輪仍異常，再用 `/status`(模型、context、壓縮模式與 session 位置)與
 [常見問題的分層診斷](troubleshooting.md#mcp-connected-but-no-tool-call)交叉檢查。
-Connected 只證明 MCP transport 已初始化，模型在單一對話輪次仍可能失手。
+`/tools` 列得出來只證明 MCP transport 已初始化，模型在單一對話輪次仍可能失手。
 
-正常 `set_config.sh` 不會新增 `agent.build.prompt`：正式 routing A/B 沒有任何 arm 通過全部
-gate。若要明確實驗，可加 `--enable-experimental-build-prompt`，讓它指向
-`~/.config/codetrail/opencode-build-prompt.md`；這份短 prompt 取代 OpenCode build default，
-不是再附加完整工具手冊。既有自訂 string 會保留，opt-in 時型別錯誤會 fail-loud。合成
-request 只證明 replacement semantics，失敗的 routing A/B 不能當成模型支援宣告。
+模型看到的 system prompt 由客戶端組:內建基底規則(`client_prompt.BASE_RULES`,上限
+1,600 字元)+ MCP routing 指示 + 專案 `AGENTS.md` + `.codetrail/lessons.md` +
+`~/.config/codetrail/instructions.md`。沒有第二份 build prompt 可以設,也不需要 ——
+失敗的 routing A/B 不能當成模型支援宣告(那次量測的紀錄見
+`eval/fixtures/tool_routing/support_matrix.json` 的 opencode 世代 row)。
 
 ---
 
@@ -61,7 +61,7 @@ CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透�
 最後用 file:line 列出「證據」和「推測」。
 ```
 
-正常情況下，你會看到 frontend 顯示 `list_dir(...)`、`grep_code(...)`、`code_rag_search(...)`、`read_file(...)` 這類工具的呼叫卡與真實結果,模型再用檔名與行號回答。單純輸出 `<codetrail_list_dir .../>` 文字不算呼叫。如果它沒有讀檔就直接回答，可以要求：
+正常情況下，你會看到 frontend 顯示 `list_dir(...)`、`grep_code(...)`、`code_rag_search(...)`、`read_file(...)` 這類工具的呼叫卡與真實結果,模型再用檔名與行號回答。單純輸出 `<list_dir .../>` 文字不算呼叫。如果它沒有讀檔就直接回答，可以要求：
 
 ```text
 請先用工具查證，不要只根據一般經驗回答。
@@ -285,10 +285,10 @@ permission 是 `ask`）。
 `aicode attach`。不要在同一個專案同時另開 standalone `aicode` 與 `aicode_web`；兩個
 backend 會共用 session 資料庫而互相干擾。
 
-web backend 會 spawn CodeTrail MCP。`set_config.sh` 會把 MCP Python 的絕對路徑寫進
-OpenCode 設定；但如果 CodeTrail 依賴只裝在 venv，`aicode` / `aicode_web` 的啟動前置
-仍應在 activate 後執行（見 [安裝、設定與啟動](setup.md)）。`aicode attach` 是純 client，
-不跑 backend preflight，也不需要 Python 環境。
+web backend 會 spawn CodeTrail MCP(用啟動它的那個 Python)。如果 CodeTrail 依賴只裝在
+venv，`aicode` / `aicode_web` 的啟動前置仍應在 activate 後執行（見
+[安裝、設定與啟動](setup.md)）。`aicode attach` 是薄 client：不跑 backend preflight、
+不起 MCP,但它是同一支 `codetrail_chat.py`,所以還是需要 Python。
 
 ### 啟動 web backend
 
@@ -309,9 +309,19 @@ aicode_web
 
 沒用 Tailscale時,低階入口仍可用 `aicode web`(前景、預設 `127.0.0.1:4096`)或 `aicode_web --local`(背景),再從 B 機做 SSH tunnel:`ssh -L 4096:127.0.0.1:4096 <帳號>@<A機>`。完整步驟見 [README §5.4](../README.md#54-web-模式目前測試中)。
 
-首頁就是 session 清單,點任一筆即可載入該 session 繼續對話。
+首頁是對話畫面;輸入 `/sessions` 列出這個專案已保存的對話,`/resume <id>` 接續其中一筆,
+`/compact` 立刻壓縮目前這一段。「中斷」按鈕(`POST /api/cancel`)對正在跑的回合與正在跑的
+手動壓縮都有效;瀏覽器網路短斷後 EventSource 自動重連會帶 `Last-Event-ID`,只補沒收到的
+事件,不重播已顯示的回答。全域選項放在子指令前面:`aicode --policy readonly web`、
+`aicode -m <model> web`、`aicode --session <id> web`(瀏覽器第一個對話直接接續那個 session)。
 
-驗證 MCP 連通:在 web 介面挑一個 session 問「請用工具 list_dir 看當前目錄結構」，模型應該透過 CodeTrail 呼叫 `list_dir(...)` 回真實結果(OpenCode log 裡可能顯示成 `codetrail_list_dir`)。
+自己寫前端、跑在另一個 origin 時,用 `--cors https://your.front.end`(可重複)明列允許的
+來源;有密碼時以 JSON `POST /api/login {"password": …}` 登入,回應帶 `{"token": …}`,
+SSE 用 `/api/events?session=<id>&token=<token>` 訂閱(原生 EventSource 不能帶
+Authorization 標頭;query token **只對明列的來源有效**,同來源頁面一律走 cookie)。
+
+驗證 MCP 連通:問「請用工具 list_dir 看當前目錄結構」,畫面上會出現一行
+`· list_dir → completed`,然後才是模型整理的結果。
 
 ### Attach TUI 到同一個 backend
 
@@ -323,8 +333,21 @@ aicode attach http://127.0.0.1:4096 -c     # 指定 url，並用 -c 續接上一
 aicode attach -s <SESSION_ID>              # 接上指定 session
 ```
 
-attach 端與 web 端**共用同一份 session 與狀態**:web 發問後 TUI 看得到新訊息，TUI 切 session 也會反映在 web。CodeTrail MCP 只在 backend 冷啟一次，attach 端不會再起第二個。TUI 內 `/status` 應看到 `codetrail Connected`。
+attach 端與 web 端連的是**同一個 backend**:同一份 session 檔、同一個 MCP instance、同一把
+模型鎖。CodeTrail MCP 只在 backend 冷啟一次,attach 端不會再起第二個。attach 內可用
+`/sessions`、`/resume <id>`、`/compact`,與 web 介面同一組指令。
+
+同一個 session 一次只能有一輪在跑:web 與 attach 同時對同一段對話送出時,後到的那個會拿到
+`409`(「這個對話已經有一輪在跑」),而不是把兩輪的歷史交錯寫進同一個 session。
+
+要中斷進行中的一輪:web 介面按「中斷」、attach 按 Ctrl-C(它會對 backend 送
+`/api/cancel`,再等 backend 收尾;再按一次才真的放棄等待)。中斷不是答案:那一輪不會留下
+半句 assistant 訊息,進行中的工具呼叫會走 MCP 的取消契約收掉。
 
 ### 安全注意(重要)
 
-未設 `OPENCODE_SERVER_PASSWORD` 時 OpenCode server 沒有應用層密碼。`aicode_web` 的無密碼例外非常窄:wrapper 傳入的 hostname、`tailscale ip -4` 當下值與 Tailscale `100.64.0.0/10` 必須三者吻合,且只 listen 該 virtual interface；傳輸由 Tailscale 加密、授權由 tailnet ACL 負責。普通 `aicode web` 若綁任何非 loopback 位址(`0.0.0.0` / LAN IP)或開 `--mdns`,仍會強制要求密碼。**絕不可用 `tailscale funnel`**。詳見 [安全邊界與工作節奏](security.md)。
+未設 `AICODE_WEB_PASSWORD` 時 backend 沒有應用層密碼,所以**它自己**拒絕綁 loopback 以外的位址
+(不是只靠 wrapper 擋:直接叫 `codetrail_chat.py web --hostname 0.0.0.0` 一樣會被拒)。
+`aicode_web` 的無密碼例外非常窄:wrapper 傳入的 hostname、`tailscale ip -4` 當下值與 Tailscale `100.64.0.0/10` 必須三者吻合,且只 listen 該 virtual interface；傳輸由 Tailscale 加密、授權由 tailnet ACL 負責。普通 `aicode web` 若綁任何非 loopback 位址(`0.0.0.0` / LAN IP)或開 `--mdns`(對區網廣播這個
+服務),仍會強制要求密碼;`--mdns` 另外要求綁在區網可達的位址(廣播一個別人連不到的位址沒有
+意義)。設了密碼時,它不會出現在 tmux 指令列、pane scrollback 或 MCP 子行程的環境裡。**絕不可用 `tailscale funnel`**。詳見 [安全邊界與工作節奏](security.md)。

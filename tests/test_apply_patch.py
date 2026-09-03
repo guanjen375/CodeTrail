@@ -1861,8 +1861,8 @@ def test_public_mcp_param_is_diff_and_executor_param_is_patch():
     assert "syntax check" in doc, doc
     assert "patch 已套用、未回滾" in doc, doc
     assert "PATCH_AUTO_VERIFY=False" in doc, doc
-    assert "codetrail_run_lint(fix=False)" in doc, doc
-    assert "codetrail_run_command" in doc, doc
+    assert "run_lint(fix=False)" in doc, doc
+    assert "run_command" in doc, doc
     assert "套用後會自動跑 lint / typecheck / 相關測試" not in doc, "舊的完整宣稱句必須消失"
     # dry_run 七欄位
     for field in ("format", "檔案清單", "blocks", "budget", "locations", "new_file", "would apply"):

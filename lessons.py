@@ -29,7 +29,7 @@ start 提示待複審 → 人工 renew / delete。
   - 上限 LESSONS_MAX_ACTIVE 條 *可注入* lessons:任何一個 context(某個專案
     看到的 global + 該專案 project lessons)都不得超過;add / renew 時就拒絕,
     避免把任何專案的 session start 弄壞。
-  - hit_count 走簡化實作:注入 prompt 要求模型套用時標註 [L-xxx],但 OpenCode
+  - hit_count 走簡化實作:注入 prompt 要求模型套用時標註 [L-xxx],但客戶端
     端的對話輸出 CodeTrail 看不到,所以欄位保留給人工判斷(CLI ``hit`` 手動
     +1),不為此加自動 parser 機制。
 
@@ -553,9 +553,9 @@ def write_context_file(root: Path, active: list[dict]) -> Path:
 def remove_context_file(root: Path) -> bool:
     """移除先前 render 的注入檔,回傳是否真的有檔被移除。
 
-    AICODE_LESSONS_SKIP / OPENCODE_DISABLE_PROJECT_CONFIG 的路徑用:不移除
-    的話,全域 opencode.json 的 instructions 仍指著舊檔,上一個 session 的
-    規則會在「已跳過」的 session 裡繼續被載入。同樣先過 symlink 邊界檢查。
+    AICODE_LESSONS_SKIP / CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS 的路徑用:
+    不移除的話,客戶端仍會把舊檔接進 system prompt,上一個 session 的規則會在
+    「已跳過」的 session 裡繼續生效。同樣先過 symlink 邊界檢查。
     """
     target = _context_target(root)
     if not target.exists():

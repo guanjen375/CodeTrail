@@ -7,19 +7,18 @@
   2. 文件工具表內每個 backtick 工具名都在 mcp_server.py 裡定義
   3. config.py 的附屬模型由 deployment profile 取得，避免三處 hardcode 漂移
   4. README 必須包含「成熟私有部署版」/「不公開發布」之類產品狀態語句
-  5. README / docs 必須提到 llama-server / GGUF / <CODE_MODEL> placeholder / OpenCode JSON 範本
-  6. README OpenCode 範本的 MCP timeout == config.py 的 runtime 最小值
-  7. README OpenCode 範本的 permission 區塊 == scripts/set_config.py 的
-     _OPENCODE_PERMISSION_TEMPLATE(鍵、值、順序;codetrail_* 必須排在覆寫前)
-  8. docs/opencode-agents-template.md 的文件用 manifest(安裝範本 fenced block
-     之外)與 mcp_server.py 實際工具一致
+  5. README / docs 必須提到 llama-server / GGUF / <CODE_MODEL> placeholder / AICODE_MODEL
+  6. README 講的 MCP read timeout == config.MCP_CALL_TIMEOUT_SECONDS
+  7. README 的權限說明 == client_policy.ASK_TOOLS
+     client_policy.ASK_TOOLS(哪些工具需要人工核准)
+  8. README 講得出客戶端的啟動方式,且不再教使用者安裝 opencode-ai
   9. apply_patch 上限契約:config.py 的 PATCH_MAX_FILES / PATCH_MAX_LINES_PER_FILE
      必須逐字出現在 mcp_server.apply_patch docstring、agent_tools._APPLY_PATCH_TOOL
      的 description 與 README / docs/mcp-tools.md;dry_run 七欄位(format / 檔案清單 /
      blocks / budget / locations / new_file / would apply)在 MCP docstring 與 native
      description 都要列出
- 10. run_command timeout 契約(秒級 server 上限;與第 6 條 OpenCode client 的
-     毫秒 timeout 是兩個獨立契約):config.py 的 RUN_COMMAND_TIMEOUT{,_MIN,_MAX}
+ 10. run_command timeout 契約(秒級 server 上限;與第 6 條客戶端每次 MCP 呼叫的
+     read timeout 是兩個獨立契約):config.py 的 RUN_COMMAND_TIMEOUT{,_MIN,_MAX}
      ↔ mcp_server.run_command 的 Annotated/Field 簽名與 docstring、
      agent_tools._RUN_COMMAND_TOOL 的 description 與 timeout schema、README /
      docs/mcp-tools.md / docs/security.md / docs/troubleshooting.md(各鎖完整肯定句)
@@ -45,7 +44,6 @@ DOCS_DIR = REPO_ROOT / "docs"
 MCP = REPO_ROOT / "mcp_server.py"
 CONFIG = REPO_ROOT / "config.py"
 SET_CONFIG = REPO_ROOT / "scripts" / "set_config.py"
-AGENTS_TEMPLATE_DOC = DOCS_DIR / "opencode-agents-template.md"
 AGENT_TOOLS = REPO_ROOT / "agent_tools.py"
 MCP_TOOLS_DOC = DOCS_DIR / "mcp-tools.md"
 SECURITY_DOC = DOCS_DIR / "security.md"
@@ -62,11 +60,17 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.is_file() else ""
 
 
+#: 標了「歷史文件」的規劃紀錄:描述的是 OpenCode 時代的施工,不是現在的使用者文件。
+_HISTORICAL_DOCS = frozenset({"tool-routing-implementation-plan.md"})
+
+
 def _documentation_text() -> str:
     """合併 README 與 docs/*.md，讓細節搬到 docs 後仍能做 drift check。"""
     parts = [_read(README)]
     if DOCS_DIR.is_dir():
         for path in sorted(DOCS_DIR.glob("*.md")):
+            if path.name in _HISTORICAL_DOCS:
+                continue
             parts.append(_read(path))
     return "\n\n".join(parts)
 
@@ -136,109 +140,64 @@ def _config_int_constant(config_text: str, name: str) -> int | None:
     return int(match.group(1).replace("_", "")) if match else None
 
 
-def _check_opencode_timeout_contract(
+def _check_mcp_timeout_contract(
     readme_text: str,
     config_text: str,
     issues: list[str],
 ) -> None:
-    minimum = _config_int_constant(config_text, "OPENCODE_MCP_TIMEOUT_MIN_MS")
+    """README 講的 MCP read timeout 必須等於 config.py 的常數。
+
+    以前這一格是寫進 opencode.json 的毫秒 timeout;現在客戶端每次呼叫用的是
+    `config.MCP_CALL_TIMEOUT_SECONDS`(秒)。文件寫錯的後果一樣:使用者以為
+    ingest 有 660 秒,實際被更早放棄。
+    """
+    minimum = _config_int_constant(config_text, "MCP_CALL_TIMEOUT_SECONDS")
     if minimum is None:
-        issues.append("check_readme_consistency.py 無法解析 OPENCODE_MCP_TIMEOUT_MIN_MS")
+        issues.append("check_readme_consistency.py 無法解析 MCP_CALL_TIMEOUT_SECONDS")
         return
-    if f'"timeout": {minimum}' not in readme_text:
+    if f"{minimum} 秒" not in readme_text:
         issues.append(
-            "README OpenCode JSON 範本的 mcp.codetrail.timeout 必須等於 "
-            f"config.py OPENCODE_MCP_TIMEOUT_MIN_MS={minimum}"
+            f"README 必須寫出 MCP 每次呼叫的固定 read timeout({minimum} 秒);"
+            f"來源是 config.py MCP_CALL_TIMEOUT_SECONDS={minimum}"
         )
 
 
-def _check_agents_template_tools(
-    template_text: str,
-    mcp_tools: list[str],
-    issues: list[str],
-) -> None:
-    """文件用工具 manifest 必須和 mcp_server.py 完全一致。
-
-    manifest 刻意放在可安裝 fenced block 外：人類文件仍要完整且可檢查，但不能
-    把整份目錄注入 OpenCode 的每一輪 system prompt。
-    """
-    if not template_text:
-        issues.append("docs/opencode-agents-template.md 不存在(OpenCode 全域 AGENTS.md 範本)")
-        return
-    listed = set(re.findall(r"`codetrail_([a-z0-9_]+)`", template_text))
-    actual = set(mcp_tools)
-    missing = sorted(actual - listed)
-    extra = sorted(listed - actual)
-    if missing:
-        issues.append(f"opencode-agents-template.md 工具清單缺少 mcp_server.py 的工具: {missing}")
-    if extra:
-        issues.append(f"opencode-agents-template.md 列了 mcp_server.py 沒有的工具: {extra}")
-    m = re.search(r"工具共\s*(\d+)\s*個", template_text)
-    if m is None:
-        issues.append("opencode-agents-template.md 範本必須寫「CodeTrail 工具共 N 個」")
-    elif int(m.group(1)) != len(mcp_tools):
-        issues.append(
-            f"opencode-agents-template.md 說「工具共 {m.group(1)} 個」"
-            f"但 mcp_server.py 實際有 {len(mcp_tools)} 個"
-        )
-
-
-_PERMISSION_PAIR_RE = re.compile(r'"([*a-zA-Z0-9_]+)"\s*:\s*"(allow|ask|deny)"')
-
-
-def _permission_pairs(block: str) -> list[tuple[str, str]]:
-    """依出現順序抓 "key": "allow|ask|deny" 配對(順序即 OpenCode 的規則順序)。"""
-    return [(m.group(1), m.group(2)) for m in _PERMISSION_PAIR_RE.finditer(block)]
-
-
-def _readme_permission_block(readme_text: str) -> str | None:
-    m = re.search(r'"permission"\s*:\s*\{([^{}]*)\}', readme_text)
-    return m.group(1) if m else None
-
-
-def _set_config_permission_block(set_config_text: str) -> str | None:
-    m = re.search(r"_OPENCODE_PERMISSION_TEMPLATE\s*=\s*\{([^{}]*)\}", set_config_text)
-    return m.group(1) if m else None
-
-
-def _check_permission_template_contract(
+def _check_permission_contract(
     readme_text: str,
-    set_config_text: str,
+    policy_text: str,
     issues: list[str],
 ) -> None:
-    """README permission 範本必須和 set_config.py 範本完全一致(含順序)。
+    """README 的權限表必須和 client_policy.ASK_TOOLS 完全一致。
 
-    OpenCode permission 是 last-matching-rule-wins:`codetrail_*` 若排在
-    `codetrail_<tool>` 的 ask/deny 覆寫之後,覆寫會被 wildcard 蓋掉而失效,
-    所以順序也是契約的一部分。
+    以前這一格比對的是 opencode.json 的 permission 範本(順序也是契約,因為
+    OpenCode 是 last-matching-rule-wins)。現在權限是客戶端的 policy,順序不再
+    有意義,但**哪些工具要人工核准**仍然是使用者看得到的契約 —— 文件少列一個,
+    使用者就會以為那個工具不會問。
     """
-    readme_block = _readme_permission_block(readme_text)
-    template_block = _set_config_permission_block(set_config_text)
-    if readme_block is None:
-        issues.append('README 找不到 "permission": {...} JSON 範本區塊')
+    match = re.search(r"ASK_TOOLS:\s*frozenset\[str\]\s*=\s*frozenset\(\s*\{([^}]*)\}", policy_text)
+    if match is None:
+        issues.append("client_policy.py 找不到 ASK_TOOLS")
         return
-    if template_block is None:
-        issues.append("scripts/set_config.py 找不到 _OPENCODE_PERMISSION_TEMPLATE")
+    ask_tools = sorted(re.findall(r'"([a-z_]+)"', match.group(1)))
+    if not ask_tools:
+        issues.append("client_policy.ASK_TOOLS 解析不出任何工具名")
         return
-    readme_pairs = _permission_pairs(readme_block)
-    template_pairs = _permission_pairs(template_block)
-    if readme_pairs != template_pairs:
+    missing = [name for name in ask_tools if f"`{name}`" not in readme_text]
+    if missing:
         issues.append(
-            "README permission 範本和 set_config.py _OPENCODE_PERMISSION_TEMPLATE "
-            f"不一致(鍵/值/順序):README={readme_pairs} vs set_config={template_pairs}"
+            f"README 的權限說明缺少需要人工核准的工具: {missing}"
+            "(來源是 client_policy.ASK_TOOLS)"
         )
-    for pairs, where in ((readme_pairs, "README"), (template_pairs, "set_config.py")):
-        keys = [k for k, _ in pairs]
-        if "codetrail_*" not in keys:
-            issues.append(f"{where} permission 範本缺少 codetrail_* 規則")
-            continue
-        wild = keys.index("codetrail_*")
-        early = [k for k in keys[:wild] if k.startswith("codetrail_") and k != "codetrail_*"]
-        if early:
-            issues.append(
-                f"{where} permission 範本順序錯誤:{early} 排在 codetrail_* 之前,"
-                "OpenCode 是 last-matching-rule-wins,這些覆寫會被 wildcard 蓋掉"
-            )
+
+
+def _check_client_entry_documented(readme_text: str, issues: list[str]) -> None:
+    """README 必須講客戶端進入點,而且不得再教使用者裝 opencode-ai。"""
+    if "codetrail_chat.py" not in readme_text and "aicode" not in readme_text:
+        issues.append("README 必須說明 CodeTrail 客戶端的啟動方式(aicode / codetrail_chat.py)")
+    if "npm install -g opencode-ai" in readme_text:
+        issues.append(
+            "README 仍在教使用者安裝 opencode-ai;CodeTrail 已不再啟動 OpenCode"
+        )
 
 
 def _check_code_model_placeholder_contract(readme_text: str, docs_text: str, issues: list[str]) -> None:
@@ -254,9 +213,10 @@ def _check_code_model_placeholder_contract(readme_text: str, docs_text: str, iss
         if needle not in docs_text:
             issues.append(msg)
 
-    # opencode.json 範本必含 `"model": "<some-provider>/<CODE_MODEL>"`(provider 名稱使用者自選)
-    if not re.search(r'"model"\s*:\s*"[a-zA-Z][a-zA-Z0-9_-]*/<CODE_MODEL>"', readme_text):
-        issues.append('README OpenCode JSON 範本缺少 "model": "<provider>/<CODE_MODEL>" (provider 名使用者自選)')
+    # 主模型的設定位置換成 deployment profile / registry;README 必須講得出
+    # 使用者要在哪裡填 <CODE_MODEL>,否則第一次設定就卡住。
+    if "AICODE_MODEL" not in readme_text:
+        issues.append("README 必須說明主模型怎麼指定(AICODE_MODEL / deployment profile)")
 
 
 def _check_doctor_commands_have_explicit_model(docs_text: str, issues: list[str]) -> None:
@@ -769,7 +729,7 @@ def _check_verification_layer_claims(
     _require_sentence(doc, "lint / typecheck / test 不會自動執行", artifact, issues)
     _require_sentence(doc, "失敗**不回滾**", artifact, issues)
     _require_sentence(doc, "patch 已套用、未回滾", artifact, issues)
-    _require_sentence(doc, "請另行呼叫 `codetrail_run_lint(fix=False)`", artifact, issues)
+    _require_sentence(doc, "請另行呼叫 `run_lint(fix=False)`", artifact, issues)
     for stale in _OLD_AUTO_VERIFY_CLAIMS:
         _forbid_phrase(doc, stale, artifact, issues)
 
@@ -798,6 +758,26 @@ _PRODUCT_STATUS_PHRASES = [
     "未做公開",
     "公開產品級安全審計",
 ]
+
+
+_STALE_DOC_PATTERNS = (
+    (r"--compaction-mode\s+native", "`--compaction-mode native`(parser 只收 codetrail / manual / off)"),
+    (r"~/\.config/codetrail/compaction\.json", "`~/.config/codetrail/compaction.json`(壓縮模式現在記在 client.json)"),
+    (r"--enable-experimental-build-prompt", "`--enable-experimental-build-prompt`(旗標已移除)"),
+    (r"scripts/opencode_[a-z_]+\.py", "`scripts/opencode_*.py`(已刪除)"),
+    (r"scripts/compaction_status\.py", "`scripts/compaction_status.py`(已併進 `codetrail_chat.py status`)"),
+)
+
+
+def _check_no_stale_client_docs(docs_text: str, issues: list[str]) -> None:
+    """使用者文件不得教已經不存在的旗標 / 檔案 / 腳本。
+
+    `docs/tool-routing-implementation-plan.md` 是標了「歷史文件」的規劃紀錄,
+    `_documentation_text()` 不含它。
+    """
+    for pattern, label in _STALE_DOC_PATTERNS:
+        if re.search(pattern, docs_text):
+            issues.append(f"docs: expected no mention of {label}, observed a match for /{pattern}/")
 
 
 def check_all() -> list[str]:
@@ -865,14 +845,17 @@ def check_all() -> list[str]:
     _check_doctor_commands_have_explicit_model(docs_text, issues)
     _check_forbidden_main_model_tokens(docs_text, issues)
 
-    # 6. OpenCode client timeout contract
-    _check_opencode_timeout_contract(readme_text, config_text, issues)
+    # 6. client MCP read-timeout contract
+    _check_mcp_timeout_contract(readme_text, config_text, issues)
+    # 12. 去 OpenCode 化之後不存在的東西,文件不得再教:`--compaction-mode native`
+    #     (parser 只收 codetrail / manual / off)與 OpenCode 時代的 ownership 狀態檔。
+    _check_no_stale_client_docs(docs_text, issues)
 
     # 7. OpenCode permission template contract (README ↔ set_config.py)
-    _check_permission_template_contract(readme_text, _read(SET_CONFIG), issues)
+    _check_permission_contract(readme_text, _read(REPO_ROOT / "client_policy.py"), issues)
+    _check_client_entry_documented(readme_text, issues)
 
     # 8. Global AGENTS.md 文件用 manifest contract(不進可安裝 prompt)
-    _check_agents_template_tools(_read(AGENTS_TEMPLATE_DOC), mcp_tools, issues)
 
     # 9–11. apply_patch 上限 / run_command timeout / 驗證分層(具名文件分別檢查)
     _check_apply_patch_limits_contract(
