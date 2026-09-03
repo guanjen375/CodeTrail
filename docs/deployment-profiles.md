@@ -27,9 +27,9 @@ launcher CLI / environment
 ```
 
 `AICODE_DEPLOYMENT_CONFIG=/absolute/path.json` 可在測試或多帳號環境改 local override
-位置。注意:產生的 `~/start.sh` 啟動時會刻意 unset 這批 runtime override(防
+位置。注意:產生的 `~/start_opencode.sh` 啟動時會刻意 unset 這批 runtime override(防
 `.bashrc` 殘留覆寫),`set_config.sh` 也只寫入預設路徑——長期設定這個變數會讓
-aicode_opencode/doctor 與 `~/start.sh` 各讀一份設定(set_config 偵測到會警告)。它適合
+aicode_opencode/doctor 與 `~/start_opencode.sh` 各讀一份設定(set_config 偵測到會警告)。它適合
 一次性測試,不適合當常駐設定。
 
 ## Service schema

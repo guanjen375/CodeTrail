@@ -59,7 +59,7 @@ cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc
 ```
 
-### `~/start.sh` 只顯示 process 已結束並 rollback
+### `~/start_opencode.sh` 只顯示 process 已結束並 rollback
 
 **使用者前台通常只會看到摘要**:
 
@@ -80,7 +80,7 @@ server 是預期行為,不代表錯誤紀錄也消失了。
 `~/.local/state/codetrail/logs/main.log`。最簡單的讀法是:
 
 ```bash
-~/start.sh logs main
+~/start_opencode.sh logs main
 ```
 
 不要只憑前台的 generic rollback 訊息就重裝 CUDA、重抓模型或刪 tmux session;
@@ -95,7 +95,7 @@ llama_model_load: error loading model: unknown model architecture: '<architectur
 實際執行的 binary 與版本:
 
 ```bash
-~/start.sh --dry-run | grep 'llama-server'
+~/start_opencode.sh --dry-run | grep 'llama-server'
 ~/llama.cpp/build/bin/llama-server --version
 git -C ~/llama.cpp log -1 --oneline
 ```
@@ -109,7 +109,7 @@ git pull --ff-only
 cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF
 cmake --build build --config Release -j
 ~/llama.cpp/build/bin/llama-server --version
-~/start.sh
+~/start_opencode.sh
 ```
 
 更新後若仍是同一個 `unknown model architecture`,先查該架構是否已進 llama.cpp
@@ -136,7 +136,7 @@ nvidia-smi -l 1                                              # GPU 是否在動
 若 slot 都 idle、GPU 0% 連續超過 30 秒,代表請求**沒打到 server**(問題在 OpenCode / MCP 層,不是 llama-server)。看 OpenCode log:`ls -t ~/.local/share/opencode/log/*.log | head -1`。
 
 長期解法:把 `no_mmap` 加進該 role 的 deployment 參數。**不要手動改 llama-server 指令** ——
-`~/start.sh` 的 argv 每次都由 `~/.config/codetrail/deployment.json` 重新產生,手改會被下次啟動蓋掉。
+`~/start_opencode.sh` 的 argv 每次都由 `~/.config/codetrail/deployment.json` 重新產生,手改會被下次啟動蓋掉。
 
 ```bash
 # 編輯 ~/.config/codetrail/deployment.json,在該 role 的 parameters 加一行:
@@ -144,9 +144,9 @@ nvidia-smi -l 1                                              # GPU 是否在動
 python3 deployment_profile.py validate     # 確認 schema 過
 
 # 改 main 的:整組重啟
-~/start.sh stop && ~/start.sh
+~/start_opencode.sh stop && ~/start_opencode.sh
 # 只改 vl 的:不必動主模型,重啟三顆附屬即可
-~/start.sh stop --scope aux && ~/start.sh --scope aux
+~/start_opencode.sh stop --scope aux && ~/start_opencode.sh --scope aux
 ```
 
 **main 與 vl 都適用** —— VL 一旦套用 CPU-MoE(`--vl-n-cpu-moe` / `--vl-cpu-moe`)就會踩到同一個坑。
@@ -450,7 +450,7 @@ opencode debug agent build | rg '"temperature": 0'
 }
 ```
 
-改 server 設定後執行 `~/start.sh stop` → `~/start.sh` 重啟才會生效。`set_config.sh` 重跑時會保留手動加入的 allowlisted 取樣參數。重啟後不要只看 JSON,直接確認 server 實際預設已變成 `0.0`:
+改 server 設定後執行 `~/start_opencode.sh stop` → `~/start_opencode.sh` 重啟才會生效。`set_config.sh` 重跑時會保留手動加入的 allowlisted 取樣參數。重啟後不要只看 JSON,直接確認 server 實際預設已變成 `0.0`:
 
 ```bash
 curl -s http://localhost:8080/props \
@@ -523,7 +523,7 @@ A/B 中它輸出到長度上限仍沒有 tool call。
 { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.0 }
 ```
 
-(等價於 server 旗標 `--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.0`;改完 `~/start.sh stop` → `~/start.sh` 重啟生效。)
+(等價於 server 旗標 `--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.0`;改完 `~/start_opencode.sh stop` → `~/start_opencode.sh` 重啟生效。)
 
 為什麼這裡仍建議在 server 旗標釘:OpenCode 官方支援 `agent.<name>.temperature`,但 custom openai-compatible provider 有版本相關的已知問題,可能解析了設定卻沒有把 `temperature` 送進 request body([opencode#25755](https://github.com/anomalyco/opencode/issues/25755));`top_k` / `min_p` 又不一定在 provider schema 裡。agent override 適合針對 Build agent 降溫,server 參數則是所有未明示取樣值之 request 的共同 fallback。**改完 server 設定要重啟才生效。**
 
@@ -789,8 +789,8 @@ aicode_opencode
 unset AICODE_DYNAMIC_NUM_CTX_MAX AICODE_NUM_CTX  # 清掉舊版 shell 設定(若有)
 cd <CODETRAIL_REPO>
 ./set_config.sh                                  # 主 n_ctx 只填這一次
-~/start.sh stop
-~/start.sh
+~/start_opencode.sh stop
+~/start_opencode.sh
 cd <PROJECT_TO_ANALYZE>
 aicode_opencode
 ```
@@ -1069,8 +1069,8 @@ reranker 的 buffer 則是設定時的必答題(互動輸入或 `--rerank-ctx`),
 套到它的 `-c/-b/-ub`。重啟三顆附屬 server 套用:
 
 ```bash
-~/start.sh stop --scope aux
-~/start.sh --scope aux
+~/start_opencode.sh stop --scope aux
+~/start_opencode.sh --scope aux
 ```
 
 若是手動啟動 embedding / reranker，也要讓 `-b`、`-ub` 至少容納最長輸入；

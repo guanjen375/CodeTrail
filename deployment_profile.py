@@ -539,7 +539,7 @@ def _environment_model(value: str, role: str, where: str) -> str:
 
 
 # role → 欄位 → 可覆寫該欄位的 env 名稱。這是 runtime override 的唯一定義處;
-# RUNTIME_OVERRIDE_ENV_KEYS 由此推導,set_config / start.sh 產生器 / 測試一律引用它,
+# RUNTIME_OVERRIDE_ENV_KEYS 由此推導,set_config / start_opencode.sh 產生器 / 測試一律引用它,
 # 不再各自維護清單(GPT 評估 #13:清單分叉會讓 .bashrc 舊變數蓋過新設定)。
 _ENV_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
     "main": {
@@ -583,7 +583,7 @@ _ENV_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
         },
 }
 
-# 會影響有效 deployment 設定的全部環境變數(供 set_config / start.sh / 測試清理用):
+# 會影響有效 deployment 設定的全部環境變數(供 set_config / start_opencode.sh / 測試清理用):
 # _ENV_FIELDS 推導的 per-role 覆寫 + profile/registry 選擇 + GPU selector。
 RUNTIME_OVERRIDE_ENV_KEYS: tuple[str, ...] = tuple(sorted(
     {name for fields in _ENV_FIELDS.values() for names in fields.values() for name in names}

@@ -80,7 +80,7 @@ def _resolve_model_identity(base_url: str) -> dict:
     if not props:
         raise RecordError(
             f"embedding server /props unreachable at {base_url}; "
-            "start it with `~/start.sh --scope aux` before recording"
+            "start it with `~/start_opencode.sh --scope aux` before recording"
         )
     served_path = str(props.get("model_path") or props.get("model_alias") or "")
     if not served_path:

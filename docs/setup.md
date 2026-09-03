@@ -1,6 +1,6 @@
 # 替代安裝、進階配置與維運
 
-[README Quick Start](../README.md) 的 `./set_config.sh` + `~/start.sh` 已涵蓋主流程
+[README Quick Start](../README.md) 的 `./set_config.sh` + `~/start_opencode.sh` 已涵蓋主流程
 (手動 profile 流程見 README §4)。這份文件只補充:
 
 - README 沒涵蓋的安裝替代路徑(其他 distro、runfile installer、conda env)
@@ -118,7 +118,7 @@ disown
 
 CodeTrail repo 跑在你工作機(CPU 即可),llama-server 跑在另一台 GPU 主機。CodeTrail 透過 HTTP 呼叫對方的 8080 / 8081 / 8082 / 8083。
 
-先在 GPU 主機照 [README §3](../README.md)(`./set_config.sh` + `~/start.sh`)建立四個
+先在 GPU 主機照 [README §3](../README.md)(`./set_config.sh` + `~/start_opencode.sh`)建立四個
 server。主 server 的 `-c` 決定主 n_ctx(`set_config.sh` 沒有預設值,由你輸入)；
 CodeTrail 會讀 server 實值，`aicode_opencode` 也會同步 OpenCode active model 的
 `limit.context`。連線方式選下面其中一種，不要混用。
@@ -288,7 +288,7 @@ systemctl --user restart codetrail-main
 tmux:
 
 ```bash
-~/start.sh stop
+~/start_opencode.sh stop
 ```
 
 systemd:`systemctl --user stop codetrail-{main,embed,rerank,vl}`
@@ -296,7 +296,7 @@ systemd:`systemctl --user stop codetrail-{main,embed,rerank,vl}`
 ### 看 server 狀態
 
 ```bash
-~/start.sh status --strict
+~/start_opencode.sh status --strict
 
 # 主 server 載入的是哪顆 GGUF、ctx 多少?
 curl -s http://localhost:8080/props | python3 -m json.tool | head -20

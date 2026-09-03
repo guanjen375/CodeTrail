@@ -178,7 +178,7 @@ def _wait_for_health(service: ServiceProfile, timeout: int, session: str) -> Non
         if dead:
             raise ProfileError(
                 f"{service.role} 的 llama-server {reason};模型載入失敗或參數錯誤。"
-                f"完整錯誤:~/start.sh logs {service.role}"
+                f"完整錯誤:~/start_opencode.sh logs {service.role}"
             )
         now = time.monotonic()
         if now >= next_report:
@@ -307,14 +307,14 @@ def _start_role(
                 detail = (pipe.stderr or pipe.stdout).strip() or f"exit {pipe.returncode}"
                 print(
                     f"[!] ⚠ 無法為 {service.role} 接上 tmux pipe-pane({detail});"
-                    f"啟動照常進行,但 ~/start.sh logs {service.role} 將看不到輸出",
+                    f"啟動照常進行,但 ~/start_opencode.sh logs {service.role} 將看不到輸出",
                     file=sys.stderr,
                 )
         except OSError as exc:
             # log 寫不進去不該擋啟動,但也不能無聲吞掉,否則使用者以為 logs 可用。
             print(
                 f"[!] ⚠ 無法建立 {service.role} 的 log 檔({exc});"
-                f"啟動照常進行,但 ~/start.sh logs {service.role} 將看不到輸出",
+                f"啟動照常進行,但 ~/start_opencode.sh logs {service.role} 將看不到輸出",
                 file=sys.stderr,
             )
     subprocess.run(["tmux", "respawn-window", "-k", "-t", target, command_line], check=True)
@@ -405,10 +405,10 @@ def _rollback_started(
         print(f"[rollback] server log 已保存:{log_dir}/({', '.join(saved)}).log", file=sys.stderr)
     print(
         f"[rollback] 已自動停止本次啟動的服務並清理 tmux({', '.join(created_sessions)});"
-        "修正後直接重新執行 ~/start.sh 即可。",
+        "修正後直接重新執行 ~/start_opencode.sh 即可。",
         file=sys.stderr,
     )
-    print("[rollback] 要保留現場除錯:AICODE_NO_ROLLBACK=1 ~/start.sh", file=sys.stderr)
+    print("[rollback] 要保留現場除錯:AICODE_NO_ROLLBACK=1 ~/start_opencode.sh", file=sys.stderr)
 
 
 def launch(
@@ -438,7 +438,7 @@ def launch(
     if existing:
         raise ProfileError(
             f"tmux session(s) already exist: {', '.join(existing)}; "
-            "先執行 ~/start.sh stop 再重新啟動"
+            "先執行 ~/start_opencode.sh stop 再重新啟動"
         )
     for service in services:
         resolve_model_reference(service.model, environ, must_exist=True)
@@ -448,7 +448,7 @@ def launch(
             raise ProfileError(f"{service.role} port {service.port} is already in use ({service.base_url})")
 
     log_dir = _state_log_dir(environ)
-    print(f"[i] server log 即時寫入:{log_dir}/<role>.log(~/start.sh logs <role> 可查看)")
+    print(f"[i] server log 即時寫入:{log_dir}/<role>.log(~/start_opencode.sh logs <role> 可查看)")
     started_sessions: set[str] = set()
     created_sessions: list[str] = []
     started_roles: list[ServiceProfile] = []
@@ -484,7 +484,7 @@ def launch(
         raise
 
     print("\nCodeTrail model servers ready.")
-    # 絕對路徑:這行常被從 $HOME 執行的 ~/start.sh 帶出來,相對路徑會找不到。
+    # 絕對路徑:這行常被從 $HOME 執行的 ~/start_opencode.sh 帶出來,相對路徑會找不到。
     status_py = Path(__file__).resolve().parent / "check_status.py"
     print(f"  python3 {shlex.quote(str(status_py))} --strict")
 

@@ -296,14 +296,14 @@ A 機和 B 機已登入同一個 tailnet 時,使用背景 launcher:
 
 ```bash
 # A 機先啟動四個模型 server(每次開機一次)
-~/start.sh
+~/start_opencode.sh
 
 # 再鎖定要分析的專案並啟動 web
 cd <PROJECT_TO_ANALYZE>
 aicode_opencode_web
 ```
 
-如果 A 機的啟動檔放在桌面,第一行可改成 `cd ~/Desktop && ./start.sh`；標準 `set_config.sh` 產物則是 `~/start.sh`。`aicode_opencode_web` 會讀 `tailscale ip -4`,只綁 A 機的 Tailscale IPv4 與固定 port `4096`(可用 `AICODE_WEB_PORT` 覆寫)，在 tmux 背景執行，ready 後印出 B 機要開的 `http://100.x.y.z:4096/`。A 機沒有 GUI 是預期情況。
+如果 A 機的啟動檔放在桌面,第一行可改成 `cd ~/Desktop && ./start_opencode.sh`；標準 `set_config.sh` 產物則是 `~/start_opencode.sh`。`aicode_opencode_web` 會讀 `tailscale ip -4`,只綁 A 機的 Tailscale IPv4 與固定 port `4096`(可用 `AICODE_WEB_PORT` 覆寫)，在 tmux 背景執行，ready 後印出 B 機要開的 `http://100.x.y.z:4096/`。A 機沒有 GUI 是預期情況。
 
 沙箱 root 檢查、模型解析、ctx safety 與 `AI_CODE_*` 透傳全部跟 standalone TUI 一致 —— 例如要讀專案外附件一樣加 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode_opencode_web`。停止 backend 用 `aicode_opencode_web stop`。
 

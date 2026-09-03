@@ -5,7 +5,7 @@
 驗證值;CPU-MoE 另依 GGUF 權重與 nvidia-smi 的 free VRAM 給推薦區間,
 全部只供參考、不擋合法輸入。使用者選擇題由使用者作答,工具只驗證輸入在
 合理範圍(例如選項只有 1-2 卻輸入 3 會重問)。
-VRAM 塞不塞得下以啟動後實測為準(產生的 ~/start.sh 啟動完會提醒用
+VRAM 塞不塞得下以啟動後實測為準(產生的 ~/start_opencode.sh 啟動完會提醒用
 nvidia-smi 稍微監控)。
 
   1. 前置檢查:Python 依賴、tmux、nvidia-smi、llama-server 與必要旗標
@@ -40,7 +40,7 @@ nvidia-smi 稍微監控)。
                                            只在 --enable-experimental-build-prompt)
      - ~/.config/opencode/opencode.json    只合併 CodeTrail 管的欄位,
                                            保留使用者既有 provider / mcp / 其他設定
-     - ~/start.sh                          啟動腳本(支援 status / stop / logs 子命令)
+     - ~/start_opencode.sh                 啟動腳本(支援 status / stop / logs 子命令)
   7. 安全預設:llama-server 只綁 127.0.0.1;要讓其他機器連線必須明確
      `--allow-remote`(或 deployment.json 的 bind: "all-interfaces")。
 
@@ -128,11 +128,11 @@ _AUX_MODEL_HINTS = {
     "vl": ("qwen3.5-9b", "qwen3-vl"),
 }
 
-# 這些 env 會蓋過設定檔;驗證/預覽時剔除,產生的 ~/start.sh 也會先 unset,
+# 這些 env 會蓋過設定檔;驗證/預覽時剔除,產生的 ~/start_opencode.sh 也會先 unset,
 # 模擬「全新 shell」行為,避免 .bashrc 裡的舊 override 讓新設定看似無效。
 # 唯一來源是 deployment_profile.RUNTIME_OVERRIDE_ENV_KEYS(loader 讀哪些就清哪些)。
 _OVERRIDE_ENV_KEYS = RUNTIME_OVERRIDE_ENV_KEYS
-# tmux session 名稱不屬於 deployment 設定,但 start.sh 內也要一併清掉,
+# tmux session 名稱不屬於 deployment 設定,但 start_opencode.sh 內也要一併清掉,
 # 確保 launch / stop 兩條路看到同一組 session 名。
 _SESSION_ENV_KEYS = ("MAIN_SESSION", "AUX_SESSION", "SESSION")
 
@@ -355,7 +355,7 @@ def _check_tmux(skip: bool, notes: list[str]) -> None:
 
 def _llama_bin() -> Path:
     """LLAMA_BIN 一律轉成絕對路徑:相對路徑在這裡驗證會過(對 set_config 的 cwd),
-    但寫進 ~/start.sh 後從別的目錄執行就找不到 binary。"""
+    但寫進 ~/start_opencode.sh 後從別的目錄執行就找不到 binary。"""
     raw = os.environ.get("LLAMA_BIN")
     if raw:
         return Path(os.path.abspath(os.path.expanduser(raw)))
@@ -385,7 +385,7 @@ def check_llama_binary(skip: bool, notes: list[str]) -> dict[str, bool]:
         help_text = proc.stdout + proc.stderr
     except (OSError, subprocess.TimeoutExpired) as exc:
         # 連 --help 都跑不動的 binary 不能假定支援任何旗標:非明確 skip 一律硬停,
-        # 否則會在 [2/5] 顯示 PASS、到 ~/start.sh 才發現整組啟動不了。
+        # 否則會在 [2/5] 顯示 PASS、到 ~/start_opencode.sh 才發現整組啟動不了。
         message = (
             f"[FAIL] llama-server --help 無法執行:{binary}\n"
             f"    {exc}\n"
@@ -1386,7 +1386,7 @@ def build_main_parameters(candidate: ModelCandidate, ctx: int, threads: int | No
                           n_cpu_moe: int | None = None) -> tuple[dict, int, int]:
     """依使用者選定的模式組裝主模型參數;不改寫使用者的作答,一律 -ngl 99。
 
-    VRAM 放不放得下由使用者以啟動後 nvidia-smi 實測確認(~/start.sh 結尾會提醒)。
+    VRAM 放不放得下由使用者以啟動後 nvidia-smi 實測確認(~/start_opencode.sh 結尾會提醒)。
     threads 不是互動題:只有 --threads 才會寫 -t,否則交給 llama.cpp 自己的預設。
     """
     parameters: dict = {
@@ -1470,7 +1470,7 @@ def build_models_registry(plan: Plan, registry_path: Path, notes: list[str]) -> 
             notes.append(f"{registry_path} 無法解析,將重建(原檔已備份)。")
 
     # 既有項目先過 loader 同款格式驗證:一個壞 key 會讓啟動時整份 registry 被拒,
-    # 與其留到 ~/start.sh 才爆,不如現在剔除並提醒(原檔有備份)。
+    # 與其留到 ~/start_opencode.sh 才爆,不如現在剔除並提醒(原檔有備份)。
     merged: dict = {}
     stale: list[str] = []
     for key, value in existing.items():
@@ -2009,14 +2009,14 @@ def build_start_sh(plan: Plan) -> str:
 #   reranker:-c/-b/-ub {plan.reranker_ctx};附屬服務:-np {AUX_PARALLEL}
 #   VL:{_vl_offload_description(plan)}
 #   綁定:{bind_note}
-#   完整參數在 ~/.config/codetrail/deployment.json;實際指令預覽:~/start.sh --dry-run
+#   完整參數在 ~/.config/codetrail/deployment.json;實際指令預覽:~/start_opencode.sh --dry-run
 #
 # 子命令:
-#   ~/start.sh                     啟動四個 llama-server(tmux 背景)
-#   ~/start.sh status [--strict]   檢查四個 server 狀態(= scripts/check_status.py)
-#   ~/start.sh stop [--force]      全部停止,等到 process 退出、VRAM 釋放完畢才返回(= scripts/stop_servers.py)
-#   ~/start.sh logs [role] [行數|-f] 看 server log(role 可省略,預設 main;啟動起即時寫入)
-#   ~/start.sh help                顯示子命令說明
+#   ~/start_opencode.sh              啟動四個 llama-server(tmux 背景)
+#   ~/start_opencode.sh status [--strict] 檢查四個 server 狀態(= scripts/check_status.py)
+#   ~/start_opencode.sh stop [--force]    全部停止,等到 process 退出、VRAM 釋放完畢才返回(= scripts/stop_servers.py)
+#   ~/start_opencode.sh logs [role] [行數|-f] 看 server log(role 可省略,預設 main;啟動起即時寫入)
+#   ~/start_opencode.sh help                顯示子命令說明
 set -euo pipefail
 
 # 先清掉會遮蔽 ~/.config/codetrail 設定檔的舊環境變數(例如寫在 ~/.bashrc 的
@@ -2041,13 +2041,13 @@ case "${{1:-}}" in
     ;;
   stop|quit)
     # --scope 預設 all;後面使用者旗標可覆寫(argparse last-wins),
-    # 例:~/start.sh stop --scope aux 只停三顆附屬、不動主模型。
+    # 例:~/start_opencode.sh stop --scope aux 只停三顆附屬、不動主模型。
     shift
     exec python3 {stop_py} --scope all "$@"
     ;;
   logs)
     if [ "$#" -gt 3 ]; then
-      echo "logs 參數過多(用法:~/start.sh logs [role] [行數|-f];role 可省略,預設 main)" >&2
+      echo "logs 參數過多(用法:~/start_opencode.sh logs [role] [行數|-f];role 可省略,預設 main)" >&2
       exit 2
     fi
     role="${{2:-main}}"
@@ -2072,7 +2072,7 @@ case "${{1:-}}" in
     esac
     log_file="${{XDG_STATE_HOME:-$HOME/.local/state}}/codetrail/logs/$role.log"
     if [ ! -f "$log_file" ]; then
-      echo "找不到 $log_file — 該 role 尚未啟動過(先執行 ~/start.sh)" >&2
+      echo "找不到 $log_file — 該 role 尚未啟動過(先執行 ~/start_opencode.sh)" >&2
       exit 1
     fi
     if [ "$tail_spec" = "-f" ] || [ "$tail_spec" = "f" ]; then
@@ -2082,7 +2082,7 @@ case "${{1:-}}" in
     ;;
   help|-h|--help)
     cat <<'CODETRAIL_USAGE'
-用法:~/start.sh [子命令|啟動器旗標]
+用法:~/start_opencode.sh [子命令|啟動器旗標]
   (無參數)                 啟動四個 llama-server(tmux 背景)
   --dry-run                只印出將執行的四條 llama-server 指令(其餘旗標見 python3 scripts/launch_servers.py --help)
   --scope aux|main         只啟動部分角色(aux=三顆附屬、main=主模型;stop --scope aux 同理只停附屬)
@@ -2109,7 +2109,7 @@ if [ "$rc" -eq 0 ]; then
     *" --dry-run "*) ;;  # 純預覽沒有真的啟動,不需要監控提醒
     *)
       echo ""
-      echo "[start.sh] 提醒:set_config 的 VRAM 數字只是粗估(未計 KV cache/compute buffer),請用 nvidia-smi 稍微監控 GPU/VRAM 使用狀況(例如:watch -n 1 nvidia-smi);異常時用 ~/start.sh logs <role> 查原因。"
+      echo "[start_opencode.sh] 提醒:set_config 的 VRAM 數字只是粗估(未計 KV cache/compute buffer),請用 nvidia-smi 稍微監控 GPU/VRAM 使用狀況(例如:watch -n 1 nvidia-smi);異常時用 ~/start_opencode.sh logs <role> 查原因。"
       ;;
   esac
 fi
@@ -2651,7 +2651,7 @@ def restore_last_backup(home: Path, dry_run: bool = False) -> int:
         compaction_mode.state_path({"HOME": str(home)}),
         build_prompt_path(home),
         home / ".config" / "opencode" / "opencode.json",
-        home / "start.sh",
+        home / "start_opencode.sh",
     ]
     restored = 0
     state_target = compaction_mode.state_path({"HOME": str(home)})
@@ -2690,9 +2690,9 @@ def _fresh_env(plan: Plan) -> dict[str, str]:
 
 
 def _sanitized_subprocess_env() -> dict[str, str]:
-    """啟停子程序用的乾淨環境:同 ~/start.sh 開頭的 unset(override + session 名)。
+    """啟停子程序用的乾淨環境:同 ~/start_opencode.sh 開頭的 unset(override + session 名)。
 
-    stop_servers / start.sh 必須看到同一組「預設」session 名;桌面環境常見的泛用
+    stop_servers / start_opencode.sh 必須看到同一組「預設」session 名;桌面環境常見的泛用
     SESSION 變數若流進 stop_servers,會殺錯無關的 tmux session、漏掉真正的
     codetrail-rag,接著重啟就撞 session already exist。
     """
@@ -2750,10 +2750,10 @@ def preview_start_commands(plan: Plan) -> int:
             timeout=120,
         )
     except subprocess.TimeoutExpired:
-        print("⚠ 啟動參數預覽逾時(120 秒);設定檔已寫入,可直接用 ~/start.sh --dry-run 重試預覽。",
+        print("⚠ 啟動參數預覽逾時(120 秒);設定檔已寫入,可直接用 ~/start_opencode.sh --dry-run 重試預覽。",
               file=sys.stderr)
         return 1
-    print("\n=== 推薦啟動參數(~/start.sh 實際會執行的指令)===")
+    print("\n=== 推薦啟動參數(~/start_opencode.sh 實際會執行的指令)===")
     if proc.stdout:
         print(proc.stdout, end="")
     if proc.returncode != 0:
@@ -2766,7 +2766,7 @@ def preview_start_commands(plan: Plan) -> int:
 def running_codetrail_sessions() -> list[str]:
     if not shutil.which("tmux"):
         return []
-    # 探測「env 指定名 ∪ 預設名」:~/start.sh 內部會 unset session env 再啟動,
+    # 探測「env 指定名 ∪ 預設名」:~/start_opencode.sh 內部會 unset session env 再啟動,
     # 實際 session 幾乎都是預設名;桌面環境把通用變數 SESSION 設走時,
     # 只看 env 會漏掉真正在跑的 codetrail-rag。
     names: list[str] = []
@@ -2808,7 +2808,7 @@ def _n_cpu_moe_arg(raw: str) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="CodeTrail 一鍵設定:偵測 GPU/模型 → 互動問答(只驗證輸入範圍,"
-                    "不用估算擋輸入)→ 產生設定檔與 ~/start.sh",
+                    "不用估算擋輸入)→ 產生設定檔與 ~/start_opencode.sh",
     )
     parser.add_argument("--models-dir", help="模型目錄(未指定時用 $MODELS_DIR 或 ~/models)")
     parser.add_argument(
@@ -2997,8 +2997,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"      ⚠ {warning}")
 
     # deployment/registry 的 env override(文件允許的自訂路徑)只影響 aicode_opencode/doctor
-    # 等 runtime 讀取;本工具固定寫預設路徑,產生的 ~/start.sh 也刻意 unset 這些變數
-    # (防 .bashrc 殘留)。設了卻不提醒,使用者會拿到「aicode_opencode 與 start.sh 各讀一份」。
+    # 等 runtime 讀取;本工具固定寫預設路徑,產生的 ~/start_opencode.sh 也刻意 unset 這些變數
+    # (防 .bashrc 殘留)。設了卻不提醒,使用者會拿到「aicode_opencode 與 start_opencode.sh 各讀一份」。
     split_env = [
         key for key in ("AICODE_DEPLOYMENT_CONFIG", "AICODE_PROFILE",
                         "AICODE_MODEL_REGISTRY", "AICODE_MODEL_REGISTRY_FILE")
@@ -3007,8 +3007,8 @@ def run(args: argparse.Namespace) -> int:
     if split_env:
         base_notes.append(
             "⚠ 偵測到環境變數 " + "、".join(split_env)
-            + ":本工具只寫入預設路徑(~/.config/codetrail/*),而 ~/start.sh 啟動時會刻意"
-            " unset 這些 override——aicode_opencode/doctor 會讀你的自訂檔,~/start.sh 卻讀預設檔,"
+            + ":本工具只寫入預設路徑(~/.config/codetrail/*),而 ~/start_opencode.sh 啟動時會刻意"
+            " unset 這些 override——aicode_opencode/doctor 會讀你的自訂檔,~/start_opencode.sh 卻讀預設檔,"
             "兩邊將各用一份設定。建議 unset 後重跑;要用自訂檔請自行維護其內容。"
         )
 
@@ -3065,7 +3065,7 @@ def run(args: argparse.Namespace) -> int:
         )
         prior_compaction_state = None
 
-    start_path = home / "start.sh"
+    start_path = home / "start_opencode.sh"
     if start_path.exists():
         try:
             if GENERATED_MARKER not in start_path.read_text(encoding="utf-8", errors="replace"):
@@ -3263,7 +3263,7 @@ def run(args: argparse.Namespace) -> int:
         notes.append(
             "CPU-MoE 那題顯示的 GPU 用量只算 GGUF 權重(未計 KV cache / compute buffer /"
             " 共卡的附屬服務),是找起點用的粗估;VRAM/RAM 真的放不放得下,"
-            "以 ~/start.sh 啟動後 nvidia-smi 實測為準(啟動結尾會提醒)。"
+            "以 ~/start_opencode.sh 啟動後 nvidia-smi 實測為準(啟動結尾會提醒)。"
         )
         if allow_remote:
             notes.append("⚠ --allow-remote:四個 llama-server 會綁 0.0.0.0,同網段任何人都能呼叫模型 API"
@@ -3489,8 +3489,8 @@ def run(args: argparse.Namespace) -> int:
         print("[dry-run] 未寫入任何檔案;以上為將寫入的完整內容。")
     else:
         print("[PASS] 第 1 層:設定檔已寫入並通過 schema 驗證(備份:*.bak-setconfig-*)")
-        print("[待執行] 第 2 層:實際啟動與模型載入 → ~/start.sh(成功與否以此為準)")
-        print("[待執行] 第 3 層:啟動後健檢 → ~/start.sh status(嚴格模式加 --strict)")
+        print("[待執行] 第 2 層:實際啟動與模型載入 → ~/start_opencode.sh(成功與否以此為準)")
+        print("[待執行] 第 3 層:啟動後健檢 → ~/start_opencode.sh status(嚴格模式加 --strict)")
         print(f"          與 AICODE_MODEL={plan.main_key} python3 scripts/doctor.py")
 
     preview_rc = 0
@@ -3503,7 +3503,7 @@ def run(args: argparse.Namespace) -> int:
             print(f"\n⚠ 偵測到 CodeTrail server 正在執行(tmux:{', '.join(running)});"
                   "新設定要重啟才會生效。")
             if args.yes:
-                print("  之後執行:~/start.sh stop && ~/start.sh")
+                print("  之後執行:~/start_opencode.sh stop && ~/start_opencode.sh")
             else:
                 answer = _input_optional(
                     "  [R] 現在自動重啟 / [S] 稍後自行重啟(Enter=S): ", "s"
@@ -3514,11 +3514,11 @@ def run(args: argparse.Namespace) -> int:
                         return rc
 
     print("\n下一步:")
-    print("  ~/start.sh                        # 啟動四個 llama-server(tmux)")
-    print("  ~/start.sh status                 # 確認四個 server 都 ready")
+    print("  ~/start_opencode.sh               # 啟動四個 llama-server(tmux)")
+    print("  ~/start_opencode.sh status        # 確認四個 server 都 ready")
     print("  cd <你要分析的專案> && aicode_opencode      # 進 TUI;/status 應顯示 codetrail Connected")
     print("  cd <你要分析的專案> && aicode_opencode_web  # A 機背景 web;B 機開它印出的 Tailscale URL")
-    print("  ~/start.sh stop                   # 收工:關掉全部 tmux server 視窗")
+    print("  ~/start_opencode.sh stop          # 收工:關掉全部 tmux server 視窗")
     return 1 if preview_rc != 0 else 0
 
 
@@ -3544,7 +3544,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         if _COMMITTED:
             print("\n[set_config] 已中斷:設定檔「已完整寫入」,中斷的只是後續預覽/重啟步驟;"
-                  "可直接執行 ~/start.sh。(備份:*.bak-setconfig-*)", file=sys.stderr)
+                  "可直接執行 ~/start_opencode.sh。(備份:*.bak-setconfig-*)", file=sys.stderr)
         else:
             print("\n[set_config] 已取消,未寫入任何檔案。(寫入採 transaction:要嘛全套完成、"
                   "要嘛完全未動;若過去跑過,舊檔的 .bak-setconfig-* 備份仍在)", file=sys.stderr)

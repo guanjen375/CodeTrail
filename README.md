@@ -57,7 +57,7 @@ ln -sfn "$PWD/aicode_opencode_web" "$HOME/.local/bin/aicode_opencode_web" #    �
 export PATH="$HOME/.local/bin:$PATH"         # 5. 讓目前這個 shell 立即看得到使用者 bin
 command -v aicode_opencode aicode_opencode_web                 #    兩者都應顯示 ~/.local/bin/...
 ./set_config.sh                              # 6. 一鍵設定(偵測 GPU/模型 → 互動問答 → 產生所有設定檔)
-~/start.sh                                   # 7. 啟動四個 llama-server(tmux 背景)
+~/start_opencode.sh                                   # 7. 啟動四個 llama-server(tmux 背景)
 ```
 
 然後就可以到任何要分析的專案直接用:
@@ -72,7 +72,7 @@ aicode_opencode        # OpenCode TUI;/status 應顯示 codetrail Connected
 - 第 5 步的 `export` 只處理目前 shell；§1.2 會把同一條 PATH 寫進 `~/.profile`，讓重新登入後仍生效。
 - `set_config.sh` 依 main → embedding → reranker → VL 分組問答；推薦值不是硬限制，
   寫入前會顯示摘要，舊設定有備份。完整問答與非互動旗標見 §3.1。
-- TUI / web 前四個 server 都必須 ready。`~/start.sh status|stop|logs|help` 是統一管理
+- TUI / web 前四個 server 都必須 ready。`~/start_opencode.sh status|stop|logs|help` 是統一管理
   入口；重新啟動前先 stop。完整行為見 §3.2–§3.3。
 - 四個 server 預設只綁 `127.0.0.1`。同一專案不要同時開 standalone `aicode_opencode` 與
   `aicode_opencode_web`；TUI 要接現有 web backend 時用 `aicode_opencode attach`。安全與 web 細節分別見
@@ -95,7 +95,7 @@ aicode_opencode        # OpenCode TUI;/status 應顯示 codetrail Connected
 > 2. **四個 llama-server 都要起**:main `8080` + embedding `8081` + reranker `8082` + VL `8083`。三顆副模型是硬性需求,缺一個啟動前 preflight 就擋下;reranker 預設不降級。見 §3。
 > 3. **不要從 `$HOME` 或 `/` 啟動** —— 沙箱會直接拒絕。先 `cd` 進你要分析的**具體專案目錄**再跑。
 > 4. **換模型或主 n_ctx 就重跑 `./set_config.sh` + 重啟 server**:TUI 按 `/models` 只切 OpenCode 的 model id,**不會 reload llama-server、也不會通知 CodeTrail MCP**。主 n_ctx 只填一次；`set_config.sh` 會寫入 deployment / server `-c`，`aicode_opencode` 啟動時再讓 CodeTrail budget 與 OpenCode active model 的 `limit.context` 自動跟隨，不用另設 max。
-> 5. **啟動後立即 rollback,先看 server log**:`~/start.sh` 前台只會回報 process 已結束,真正根因用 `~/start.sh logs main` 查看;新 GGUF 也可能需要更新並重新 build llama.cpp。詳細判讀與修復見 [docs/troubleshooting.md](docs/troubleshooting.md)。
+> 5. **啟動後立即 rollback,先看 server log**:`~/start_opencode.sh` 前台只會回報 process 已結束,真正根因用 `~/start_opencode.sh logs main` 查看;新 GGUF 也可能需要更新並重新 build llama.cpp。詳細判讀與修復見 [docs/troubleshooting.md](docs/troubleshooting.md)。
 > 6. **CodeTrail 沙箱鎖在「你啟動的那個資料夾」(`AICODE_ROOT`)** —— 綁在 process 上,**不會跟著你在 UI 切資料夾或切對話而移動**。web UI 那顆「切換資料夾」按鈕對 CodeTrail 無效(切過去還是只讀啟動目錄)。換專案 = 到那個目錄重新啟動一個(TUI 重開 `aicode_opencode`;web 另起一個 backend)。
 > 7. **web 模式目前是實驗性的(開發中)** —— 穩定、proven 的主力是 standalone TUI(`aicode_opencode`);跨機器 web 的簡化入口是 `aicode_opencode_web`,低階前景入口才是 `aicode_opencode web`。
 > 8. **CodeTrail 沙箱只蓋它那 19 個 MCP 工具** —— OpenCode 內建的 `bash` / `read` / `write` 不走這層,所以範本把它們全 `deny`,**別放寬那份 permission**。外部匯入與 lessons 是兩個受限例外,見 [docs/security.md](docs/security.md)。分析不信任 repo 時,連被分析 repo 自帶的 `opencode.json` 都可能翻掉你的鎖定,請用 `OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode_opencode`。
@@ -357,7 +357,7 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 
 ---
 
-## 3. 設定與啟動:`./set_config.sh` + `~/start.sh`
+## 3. 設定與啟動:`./set_config.sh` + `~/start_opencode.sh`
 
 `~/.config` 下的實際檔案是**每台機器的 local state，不進 repo**。設定契約的單一來源是
 `set_config.sh`、`deployment_profile.py` 的封閉 schema / 安全預設，以及本節的 OpenCode
@@ -401,11 +401,11 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 | `~/.config/codetrail/deployment.json` | deployment profile local override:四個 role 的模型與主模型參數(全部來自你的作答);重跑時**保留你手動加的取樣參數**(temperature/top-p/…與 no_mmap),其他未涵蓋鍵會警告已捨棄 |
 | `~/.config/codetrail/opencode-build-prompt.md` | **只在** `--enable-experimental-build-prompt` 時產生的受管 prompt（mode `0644`）；唯一來源是 [docs/opencode-build-prompt.md](docs/opencode-build-prompt.md) 的 fenced block |
 | `~/.config/opencode/opencode.json` | **合併**而非重建（mode `0600`）：只更新 CodeTrail 管的欄位(model / provider.llamacpp / mcp.codetrail / 缺少的 permission 鍵)；實驗性旗標才補 `agent.build.prompt`，使用者自訂 prompt、provider、主題與其他 MCP server 都保留；與安全範本衝突的 permission 會尊重你的值但明確警告 |
-| `~/start.sh` | 啟動腳本:寫死你的 GPU 配置、主模型與驗證過的 `LLAMA_BIN`,呼叫 `scripts/launch_servers.py`;支援 `status` / `stop` / `logs` / `help` 子命令,打錯子命令會提示而不是誤啟動 |
+| `~/start_opencode.sh` | 啟動腳本:寫死你的 GPU 配置、主模型與驗證過的 `LLAMA_BIN`,呼叫 `scripts/launch_servers.py`;支援 `status` / `stop` / `logs` / `help` 子命令,打錯子命令會提示而不是誤啟動 |
 | `~/.config/codetrail/compaction.json` | **只在 `[5/5]` 有明確答案時產生**(mode `0600`):壓縮模式、目標 config 的身分雜湊、以及接管前每個 `compaction.*` 受管鍵的「原值／原本不存在」。切回 `native` 時只還原**現在的值仍等於 CodeTrail 寫下去那個**的鍵;你事後手改過的一律原封不動。沒有這個檔就等於沒有接管 |
 | `~/.config/codetrail/setconfig-last-transaction.json` | 只記最近一次 transaction 實際包含的 runtime 檔案，供 `--restore-last-backup` 整批還原；不是另一份設定來源 |
 
-結尾會自動印出**啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準;`~/start.sh` 啟動完成的最後一行也會提醒你用 `nvidia-smi` 稍微監控 GPU/VRAM(例如 `watch -n 1 nvidia-smi`),因為 set_config 不做整體 VRAM 可行性判定,也不會拿容量估算保證一定能啟動。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
+結尾會自動印出**啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start_opencode.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start_opencode.sh` 實際啟動為準;`~/start_opencode.sh` 啟動完成的最後一行也會提醒你用 `nvidia-smi` 稍微監控 GPU/VRAM(例如 `watch -n 1 nvidia-smi`),因為 set_config 不做整體 VRAM 可行性判定,也不會拿容量估算保證一定能啟動。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
 
 非互動用法(自動化 / 重跑)是 `./set_config.sh --yes`。它會跳過提問與確認頁，
 但**所有使用者選擇題的值必須由旗標提供，缺哪個就報錯**（`--compaction-mode`
@@ -436,7 +436,7 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 ```bash
 python3 deployment_profile.py validate
 python3 scripts/opencode_contract_check.py
-~/start.sh --dry-run
+~/start_opencode.sh --dry-run
 ```
 
 前兩條應分別顯示 profile `valid`，以及 OpenCode contract `SAFE`（不能有
@@ -444,25 +444,25 @@ python3 scripts/opencode_contract_check.py
 就不必只因檔案日期較舊而重建。
 
 若檢查要求補新欄位、Python / `LLAMA_BIN` 路徑已換、模型 / GPU / 主 n_ctx 要改，才重跑
-`./set_config.sh`。重跑會重新詢問硬體選擇；先記下現值或用 `~/start.sh --dry-run` 留存摘要，
+`./set_config.sh`。重跑會重新詢問硬體選擇；先記下現值或用 `~/start_opencode.sh --dry-run` 留存摘要，
 不要假設它會沿用上一次答案。
 
 ### 3.2 啟動與停止
 
 ```bash
-~/start.sh              # 啟動 main + embedding + reranker + VL(各自 tmux 視窗,驗 /health 才算 ready)
-~/start.sh --dry-run    # 只印出將執行的四條 llama-server 指令,不啟動
-~/start.sh status       # 檢查四個 server 狀態(= scripts/check_status.py)
-~/start.sh stop         # 關閉全部並等到 VRAM 釋放完畢(主模型 + 三附屬模型;= scripts/stop_servers.py)
-~/start.sh logs vl      # 看該 role 的 server log(加 -f 持續追蹤,如 logs main -f)
-~/start.sh help         # 子命令說明(打錯子命令會提示,不會誤觸啟動)
+~/start_opencode.sh              # 啟動 main + embedding + reranker + VL(各自 tmux 視窗,驗 /health 才算 ready)
+~/start_opencode.sh --dry-run    # 只印出將執行的四條 llama-server 指令,不啟動
+~/start_opencode.sh status       # 檢查四個 server 狀態(= scripts/check_status.py)
+~/start_opencode.sh stop         # 關閉全部並等到 VRAM 釋放完畢(主模型 + 三附屬模型;= scripts/stop_servers.py)
+~/start_opencode.sh logs vl      # 看該 role 的 server log(加 -f 持續追蹤,如 logs main -f)
+~/start_opencode.sh help         # 子命令說明(打錯子命令會提示,不會誤觸啟動)
 ```
 
 啟動時的行為(對剛接觸專案者友善):
 
-- **server log 從第一個 byte 就持續寫入** `~/.local/state/codetrail/logs/<role>.log`:launcher 先開好 tmux 視窗、接上 log 管線,才把 llama-server 放進去跑,所以即使因參數或模型錯誤**秒退**,完整錯誤也已在檔案裡;視窗本身也會帶著 exit code 留在原地(remain-on-exit)供檢視,`~/start.sh logs <role>` 直接看。
+- **server log 從第一個 byte 就持續寫入** `~/.local/state/codetrail/logs/<role>.log`:launcher 先開好 tmux 視窗、接上 log 管線,才把 llama-server 放進去跑,所以即使因參數或模型錯誤**秒退**,完整錯誤也已在檔案裡;視窗本身也會帶著 exit code 留在原地(remain-on-exit)供檢視,`~/start_opencode.sh logs <role>` 直接看。
 - **載入進度**:大模型載入要幾分鐘,等待期間每 15 秒回報「載入中,已等待 N 秒(process 存活)」,不會看起來像當機;health 等待上限依主模型大小自動放大。llama-server process 一死就立即失敗,不會空等 timeout。
-- **失敗自動清理**:某個 role 啟動失敗時,launcher 自動關閉本次啟動的其他服務並釋放 port,然後告訴你「修正後直接重跑 `~/start.sh`」—— 不會留下半套 tmux 讓下次啟動卡 `session already exist`(要保留現場除錯:`AICODE_NO_ROLLBACK=1`)。
+- **失敗自動清理**:某個 role 啟動失敗時,launcher 自動關閉本次啟動的其他服務並釋放 port,然後告訴你「修正後直接重跑 `~/start_opencode.sh`」—— 不會留下半套 tmux 讓下次啟動卡 `session already exist`(要保留現場除錯:`AICODE_NO_ROLLBACK=1`)。
 - **綁定**:預設四個 server 只綁 `127.0.0.1`;`--allow-remote` 設定過的才綁 `0.0.0.0`。
 
 | 預設 port | 角色 | 必要 |
@@ -474,7 +474,7 @@ python3 scripts/opencode_contract_check.py
 
 會分四個 `llama-server` 是因為它一次只能載一顆 GGUF,不同角色用不同模式(`--jinja` / `--embedding --pooling cls` / `--embedding --pooling rank --reranking` / `--mmproj`)。`aicode_opencode` / `mcp_server.py` 都會硬性檢查三顆副模型已 ready。
 
-只重啟部分角色:`~/start.sh stop --scope aux` + `~/start.sh --scope aux`(只動三顆附屬、不重載主模型),或 `~/start.sh --scope main`(只起主模型)。
+只重啟部分角色:`~/start_opencode.sh stop --scope aux` + `~/start_opencode.sh --scope aux`(只動三顆附屬、不重載主模型),或 `~/start_opencode.sh --scope main`(只起主模型)。
 
 > **tmux 你會用到的 4 個指令**(其他都不用學):
 > - `Ctrl-b d` —— 把目前 session 放背景,回到原本 shell
@@ -482,7 +482,7 @@ python3 scripts/opencode_contract_check.py
 > - `tmux a -t <名字>` —— 接回去看某個 session 的即時 log
 > - `Ctrl-b n` —— 同 session 內切換 window(RAG session 內含 embed / rerank / vl 三個 window)
 >
-> (關 server 不用學 tmux 指令,直接 `~/start.sh stop`。)
+> (關 server 不用學 tmux 指令,直接 `~/start_opencode.sh stop`。)
 
 ### 3.3 驗活與維運
 
@@ -498,18 +498,18 @@ tmux ls
 查看四個 role 是否都正確跑在指定 GPU 上:
 
 ```bash
-~/start.sh status
+~/start_opencode.sh status
 
 # CI / 自動化需要用 exit code 擋下時:
-~/start.sh status --strict
+~/start_opencode.sh status --strict
 ```
 
-`~/start.sh status` 會把 `nvidia-smi` PID 與 `/proc/<PID>/cmdline` 的 `--port` 對上有效 profile,逐 role 顯示 PID、GPU UUID、model、`n_ctx`、health。預設 report-only,即使異常仍 exit 0;`--strict` 遇到缺 service、錯 GPU、錯 model、錯 ctx 或 unhealthy 就失敗。
+`~/start_opencode.sh status` 會把 `nvidia-smi` PID 與 `/proc/<PID>/cmdline` 的 `--port` 對上有效 profile,逐 role 顯示 PID、GPU UUID、model、`n_ctx`、health。預設 report-only,即使異常仍 exit 0;`--strict` 遇到缺 service、錯 GPU、錯 model、錯 ctx 或 unhealthy 就失敗。
 
 之後要關掉全部:
 
 ```bash
-~/start.sh stop
+~/start_opencode.sh stop
 ```
 
 偵錯時要看 server log(平常不用):`tmux a -t codetrail-main` 或 `tmux a -t codetrail-rag`(rag 內按 `Ctrl-b n` 切 embed/rerank/vl window,看完 `Ctrl-b d` 退出)。
@@ -530,7 +530,7 @@ launcher CLI / env > ~/.config/codetrail/deployment.json local override > 選用
 
 安全基底 `safe-defaults` 直接內建在 `deployment_profile.py`(不宣稱硬體的向下相容預設,含 port、base_url 與附屬模型預設);`set_config.sh` 產生的 `~/.config/codetrail/deployment.json` 疊在上面。要做一次性實驗設定,`AICODE_PROFILE` 可指向絕對路徑 `.json` profile(用 `"extends": "defaults"` 繼承基底),不設定時就是基底加上你的 local override。
 
-手動啟動範例(等價於 `~/start.sh` 做的事):
+手動啟動範例(等價於 `~/start_opencode.sh` 做的事):
 
 ```bash
 cd <CODETRAIL_REPO>
@@ -914,7 +914,7 @@ preflight 零寫入;它會估算所有結構化候選，包含純 raster 的分�
 `aicode_opencode_web` 指令本身在 Quick Start 步驟 2–5 已隨 `aicode_opencode` 一併安裝(`command -v aicode_opencode_web` 應有輸出)。前提只有兩個:
 
 - A 機(跑模型、可只有文字終端)和 B 機(有 GUI / 瀏覽器)已安裝 [Tailscale](https://tailscale.com/download)、登入同一個 tailnet。
-- A 機已先執行 `set_config.sh` 產生的模型啟動檔:標準位置跑 `~/start.sh`；若你把它放在桌面,就在桌面目錄跑 `./start.sh`。四個 llama-server 要先 ready。
+- A 機已先執行 `set_config.sh` 產生的模型啟動檔:標準位置跑 `~/start_opencode.sh`；若你把它放在桌面,就在桌面目錄跑 `./start_opencode.sh`。四個 llama-server 要先 ready。
 
 之後每次只做:
 
