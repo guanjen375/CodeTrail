@@ -3,7 +3,7 @@
 
 This module intentionally has no dependency on config.py. It is used by
 config.py, scripts/resolve_main_model.py, and scripts/doctor.py, including
-before the aicode wrapper has exported AICODE_MODEL. The deployment profile
+before the aicode_opencode wrapper has exported AICODE_MODEL. The deployment profile
 is consulted lazily between AICODE_MODEL and the OpenCode-config fallback.
 
 CodeTrail 只跑 llama.cpp llama-server。AICODE_MODEL 可以是:

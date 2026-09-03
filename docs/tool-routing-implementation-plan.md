@@ -272,7 +272,7 @@ Ownership：
 - `scripts/opencode_direct_contract.py`（新增）
 - `scripts/tool_call_canary.py`
 - `scripts/doctor.py`
-- `aicode`
+- `aicode_opencode`
 - `tests/test_doctor.py`
 - `tests/test_doctor.py`
 - `tests/test_aicode.py`

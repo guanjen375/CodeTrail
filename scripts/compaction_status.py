@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""目前的 OpenCode 壓縮模式——給 `aicode` 啟動橫幅用的幾行摘要。
+"""目前的 OpenCode 壓縮模式——給 `aicode_opencode` 啟動橫幅用的幾行摘要。
 
 為什麼要印這個:壓縮模式決定「長對話什麼時候被換成一段摘要」,但它只在
 OpenCode **啟動時** 生效,選擇又記在 `~/.config/codetrail/compaction.json`
@@ -33,8 +33,8 @@ if str(REPO_ROOT) not in sys.path:
 
 #: 與 opencode_plugins/codetrail-compaction.js 的 `KEEP_REASONING_ENV` 逐字相同。
 KEEP_REASONING_ENV = "CODETRAIL_KEEP_REASONING"
-#: 同上,plugin 的 `OPENCODE_VERSION_ENV`。`aicode` 的 preflight 量到之後遞下來,
-#: 沒有這個變數 = 不是 aicode 起的 session,plugin 那端也不做版本判斷。
+#: 同上,plugin 的 `OPENCODE_VERSION_ENV`。`aicode_opencode` 的 preflight 量到之後遞下來,
+#: 沒有這個變數 = 不是 aicode_opencode 起的 session,plugin 那端也不做版本判斷。
 OPENCODE_VERSION_ENV = "AICODE_OPENCODE_VERSION"
 #: plugin `parseVersion()` 的 Python 對應 —— 認得的形狀要一模一樣,否則兩邊會
 #: 對同一個字串給出不同的支援與否。
@@ -48,7 +48,7 @@ SWITCH_HINT = (
 def _version_lines(cm, env: dict) -> tuple[bool | None, list[str]]:
     """OpenCode 版本支不支援這一版的壓縮語意 —— 回 (支援?, 要顯示的行)。
 
-    `None` = 不知道(沒有經過 `aicode` preflight,plugin 那端同樣不判斷)。
+    `None` = 不知道(沒有經過 `aicode_opencode` preflight,plugin 那端同樣不判斷)。
     量得到而且太舊時 plugin **整個**停用(壓縮與歷史 reasoning 兩邊都不做),
     所以這裡非講不可:不講的話畫面只寫「模式=codetrail」,而 runtime 什麼
     都沒做。
@@ -213,7 +213,7 @@ def status_lines(env: dict | None = None) -> list[str]:
 
 
 def render(lines: list[str], prefix: str = "") -> str:
-    """第一行帶 prefix,後續行對齊到 prefix 之後(aicode 橫幅的既有排版)。"""
+    """第一行帶 prefix,後續行對齊到 prefix 之後(aicode_opencode 橫幅的既有排版)。"""
     if not prefix:
         return "\n".join(lines)
     pad = " " * (len(prefix) + 1)
@@ -229,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--prefix", default="",
-        help="每行前綴(例:'[aicode]');後續行自動對齊到前綴之後",
+        help="每行前綴(例:'[aicode_opencode]');後續行自動對齊到前綴之後",
     )
     args = parser.parse_args([] if argv is None else argv)
     try:

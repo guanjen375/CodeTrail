@@ -76,7 +76,7 @@ def resolve_model_path(name_or_path: str) -> str:
 # 使用者必須自己挑一顆 GGUF 模型,並透過下列任一方式告訴 CodeTrail:
 #
 #   1. AICODE_MODEL=<MODEL>                 (環境變數,最優先)
-#   2. aicode -m <MODEL> / --model <MODEL>  (CLI 旗標)
+#   2. aicode_opencode -m <MODEL> / --model <MODEL>  (CLI 旗標)
 #   3. deployment profile / local override 的 main.model
 #   4. OPENCODE_CONFIG or ~/.config/opencode/opencode.json ("model": "<MODEL>")
 #
@@ -104,7 +104,7 @@ VL_ANALYZE_TIMEOUT = int(_os.environ.get("AICODE_VL_ANALYZE_TIMEOUT", "180"))
 VL_INGEST_TIMEOUT = int(_os.environ.get("AICODE_VL_INGEST_TIMEOUT", "300"))
 
 # OpenCode 的 MCP timeout 是 client 端全域上限，必須略高於 ingest_document 的
-# 600 秒內部上限。aicode 啟動前會把既有 codetrail entry 自動同步到這個最小值，
+# 600 秒內部上限。aicode_opencode 啟動前會把既有 codetrail entry 自動同步到這個最小值，
 # 避免 10 秒 timeout 造成圖片與後續工具連鎖失敗。
 OPENCODE_MCP_TIMEOUT_MIN_MS = 660_000
 
@@ -125,7 +125,7 @@ def _resolve_main_model() -> str:
     """主模型來源: AICODE_MODEL > profile/local override > opencode.json。
 
     回傳 bare model name(可能是 registry key,可能是 GGUF 路徑),找不到時回空字串。
-    `aicode` wrapper 會另外處理 `-m` / `--model` CLI 旗標 (在這裡看不到),
+    `aicode_opencode` wrapper 會另外處理 `-m` / `--model` CLI 旗標 (在這裡看不到),
     它應該在啟動子行程前把 AICODE_MODEL 設好。
     """
     resolved = _model_resolution.resolve_main_model_from_env(_os.environ)
@@ -147,7 +147,7 @@ def require_main_model() -> str:
             "請先下載一顆 GGUF 模型(例如從 huggingface 抓 qwen3-coder-30b 的 q4_k_m),\n"
             "啟動 llama-server 後,任選一種方式設定模型:\n"
             "  1) export AICODE_MODEL=<MODEL>                    (最優先)\n"
-            "  2) aicode -m <MODEL>                              (per-run CLI 旗標)\n"
+            "  2) aicode_opencode -m <MODEL>                              (per-run CLI 旗標)\n"
             "  3) deployment profile / local override 設 main.model\n"
             "  4) 在 ~/.config/opencode/opencode.json 設 \"model\": \"<MODEL>\"\n"
             "<MODEL> 可以是 MODEL_REGISTRY 裡的 bare name 或 GGUF 絕對路徑。\n"
@@ -341,7 +341,7 @@ def FIGURE_PROBE_CACHE_FILE():
 
 
 # 主模型只保留一個 n_ctx 概念：正常由 set_config 的 --ctx 寫入 deployment
-# profile / server -c；aicode 啟動時再從 server /props 觀測實值並以
+# profile / server -c；aicode_opencode 啟動時再從 server /props 觀測實值並以
 # AICODE_N_CTX 傳給 runtime。沒經 wrapper 時，回到 effective profile 的 main.ctx。
 _PROFILE_MAIN_CTX = _DEPLOYMENT_PROFILE.service("main").ctx or _n_ctx.DEFAULT_N_CTX
 N_CTX_RESOLUTION = _n_ctx.resolve_n_ctx(

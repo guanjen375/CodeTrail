@@ -1397,7 +1397,7 @@ def test_ctx_safety_passes_when_requested_below_server(monkeypatch, capsys):
     """requested < server n_ctx → SAFE,放行 (exit 0)。
 
     「小於」不是安全問題(不截斷,只是沒用滿 server 容量),不該擋。正常情況下
-    aicode 會自動把 requested 帶成 == server,這條主要保障使用者手動設小一點時
+    aicode_opencode 會自動把 requested 帶成 == server,這條主要保障使用者手動設小一點時
     不會被無謂擋住,也是把舊版 e129d48「小於就 refuse」死鎖拿掉的回歸測試。
     """
     monkeypatch.setenv("AICODE_MODEL", "custom-model")

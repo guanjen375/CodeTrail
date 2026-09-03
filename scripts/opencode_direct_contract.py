@@ -32,7 +32,7 @@ MAX_OPENCODE_MAJOR = 2
 # 那之前拿到的是**不同語意** —— 那正是計畫禁止的「靜默退回」,所以與
 # direct-tool 契約分開判,不影響其餘功能的 1.17.0 下限。
 MIN_COMPACTION_VERSION = compaction_mode.MIN_COMPACTION_OPENCODE_VERSION
-#: aicode 把 preflight 量到的版本用這個變數傳給 OpenCode 行程;壓縮 plugin
+#: aicode_opencode 把 preflight 量到的版本用這個變數傳給 OpenCode 行程;壓縮 plugin
 #: 讀它來決定要不要停用。公開的 plugin / SDK API 沒有「目前執行中版本」這個
 #: 欄位(`Session.version` 是 session 建立時的),所以只能由這一端遞下去。
 COMPACTION_VERSION_ENV = "AICODE_OPENCODE_VERSION"
@@ -302,7 +302,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # headless 沒有 toast,doctor 的統計是唯一看得到它的地方。
         _record_version_incident()
     if args.print_version_env:
-        # aicode 匯入這一行並 export,plugin 才有辦法知道**目前執行中**的版本。
+        # aicode_opencode 匯入這一行並 export,plugin 才有辦法知道**目前執行中**的版本。
         # 沒有這個變數時 plugin 不做版本判斷(直接跑 `opencode` 的 session)。
         print(f"{COMPACTION_VERSION_ENV}={'.'.join(map(str, version))}")
     print(

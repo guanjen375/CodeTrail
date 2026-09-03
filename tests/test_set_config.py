@@ -2331,7 +2331,7 @@ def test_rerun_keeps_hand_edited_port_and_base_url(tmp_path):
     assert "對齊 deployment 的 main endpoint" in rerun.stdout
 
 def test_opencode_config_env_var_is_honored(tmp_path):
-    """OpenCode 與 config.py/aicode 都先讀 OPENCODE_CONFIG;set_config 寫死預設
+    """OpenCode 與 config.py/aicode_opencode 都先讀 OPENCODE_CONFIG;set_config 寫死預設
     路徑會做出「顯示 PASS 但完全沒生效」的設定。"""
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_models(tmp_path)
@@ -2423,7 +2423,7 @@ def test_restore_last_backup_dry_run_previews_without_touching_files(tmp_path):
     assert (home / "start.sh").exists()
 
 def test_deployment_env_override_split_brain_warns(tmp_path):
-    """AICODE_DEPLOYMENT_CONFIG 等 override 有設時要警告:aicode 會讀自訂檔、
+    """AICODE_DEPLOYMENT_CONFIG 等 override 有設時要警告:aicode_opencode 會讀自訂檔、
     ~/start.sh 卻刻意 unset,兩邊將各用一份設定。"""
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_models(tmp_path)

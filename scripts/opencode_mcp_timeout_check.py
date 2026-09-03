@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check or repair the OpenCode timeout used for CodeTrail MCP calls.
 
-``aicode`` invokes this script with ``--fix`` before starting OpenCode.  The
+``aicode_opencode`` invokes this script with ``--fix`` before starting OpenCode.  The
 repair is deliberately narrow: it only changes ``mcp.codetrail.timeout`` in an
 existing CodeTrail MCP entry, preserves every other JSON setting, writes the
 replacement atomically, and keeps a backup of the previous file.
@@ -192,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
         _print(f"INVALID: timeout={timeout!r}，必須是 >= {minimum} 的整數毫秒 ({path})")
     _print("           圖片 VL 通常超過 10 秒；ingest_document 最長可到 10 分鐘。")
     _print(f"           請執行此腳本的 --fix，或把 mcp.codetrail.timeout 改成 {minimum}。")
-    _print(f"           緊急跳過（不建議）: {SKIP_ENV}=1 aicode")
+    _print(f"           緊急跳過（不建議）: {SKIP_ENV}=1 aicode_opencode")
     return 2
 
 

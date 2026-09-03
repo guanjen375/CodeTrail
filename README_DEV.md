@@ -18,7 +18,7 @@ python3 -m compileall -q .
 python3 scripts/check_eval_consistency.py
 python3 scripts/check_readme_consistency.py
 python3 scripts/opencode_contract_check.py            # 全域 opencode.json / AGENTS.md / 壓縮 plugin 漂移
-python3 scripts/compaction_status.py          # 目前的壓縮模式(aicode 橫幅那一行;純讀取)
+python3 scripts/compaction_status.py          # 目前的壓縮模式(aicode_opencode 橫幅那一行;純讀取)
 python3 scripts/doctor.py --no-network        # 用機器上實際設定的模型；不要塞假 model 名
 python3 deployment_profile.py validate
 
@@ -57,7 +57,7 @@ shard；比一個 shard 平均負載一半還重的檔才切開——以檔案�
 **`--changed[=REF]` 只跑改動波及的測試檔**（可加 `-m smoke`）：改動 = git 工作樹的
 修改／staged／untracked，`--changed=main` 再加上 `main...HEAD` 的提交差異。對應規則：
 改到 repo 模組 → import 圖上（直接或間接）用到它的測試檔，加上文字上提到
-`<name>.py` 的測試檔（用 subprocess 跑 script 的測試不會 import）；改到 `aicode`、
+`<name>.py` 的測試檔（用 subprocess 跑 script 的測試不會 import）；改到 `aicode_opencode`、
 `set_config.sh`、plugin `.js` 等非 Python 檔 → 文字上提到檔名的測試檔；改到測試檔
 → 它自己加 smoke gate。它是 **fail-closed** 的：任何一個改動對不到測試檔（或動到
 conftest／harness／pyproject／requirements／`tests/fixtures/`）就退回完整測試並講明
@@ -73,12 +73,12 @@ conftest／harness／pyproject／requirements／`tests/fixtures/`）就退回完
 各 shard 內耗時總和」與最慢的幾條（≥0.5s），給 §1.1 的 smoke 10 秒目標做趨勢觀察；
 **不設硬秒數閾值**，不同機器差好幾倍，拿秒數當 gate 只會製造假紅燈。
 
-核心日常入口是 OpenCode TUI；跨機 web 另有薄 launcher（兩者共用 `aicode` 安全前置）：
+核心日常入口是 OpenCode TUI；跨機 web 另有薄 launcher（兩者共用 `aicode_opencode` 安全前置）：
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
-aicode
-aicode_web  # A/B 機已加入同一 tailnet 時
+aicode_opencode
+aicode_opencode_web  # A/B 機已加入同一 tailnet 時
 ```
 
 ---
@@ -102,9 +102,9 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 測試在 2026-09 依主題合併成 35 個檔（原本 95 個）；一個檔 = 一個被測主題，檔頭
 docstring 說明它涵蓋哪些原始檔與為什麼：
 
-- launcher / config：`test_aicode.py`（aicode wrapper、web、attach）、`test_set_config.py`
+- launcher / config：`test_aicode.py`（aicode_opencode wrapper、web、attach）、`test_set_config.py`
   （set_config.sh 的問答、模型、artifacts、壓縮段）、`test_server_scripts.py`
-  （launch／stop／check_status、aicode_web）、`test_deployment.py`（deployment profile、
+  （launch／stop／check_status、aicode_opencode_web）、`test_deployment.py`（deployment profile、
   模型解析、GPU 與 ctx 安全、config）、`test_doctor.py`（doctor + tool-call canary）、
   `test_opencode_checks.py`、`test_lessons.py`。
 - OpenCode 壓縮 / plugin：`test_compaction_mode.py`（ownership 狀態檔 + status 行）、
@@ -161,10 +161,10 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
 - 新增／移除／重排 MCP 工具 → 先改 `mcp_contract.PUBLIC_TOOL_ORDER`，再同步
   `docs/mcp-tools.md` 與 `docs/opencode-agents-template.md` fenced block **外**的固定順序
   manifest；可安裝的全域 prompt 只保留 `codetrail_*` schema anchor，禁止把完整清單搬回去。
-  使用者還在用舊版固定清單時，`aicode` 會提示 `⚠ STALE`
+  使用者還在用舊版固定清單時，`aicode_opencode` 會提示 `⚠ STALE`
 - 壓縮接管(`codetrail` / `manual`)**還在測試階段**:標示的單一來源是
   `compaction_mode.EXPERIMENTAL_TAG` / `EXPERIMENTAL_NOTICE`,由 set_config 的問答與
-  摘要頁、`scripts/compaction_status.py`(aicode 啟動橫幅)、`scripts/doctor.py` 與
+  摘要頁、`scripts/compaction_status.py`(aicode_opencode 啟動橫幅)、`scripts/doctor.py` 與
   `docs/compaction-rules.md` / `README.md` 共用。要拿掉「實驗中」是一次全域決定,
   不是改其中一處——`tests/test_compaction_mode.py` 釘住問答與文件都還帶著它
 - 改壓縮的七條摘要規則或門檻公式 → `docs/compaction-rules.md` 的兩個 ```text 區塊是
@@ -505,7 +505,7 @@ symbol 掃描。`.cfg` / `.json` / `.sh` / `.mk` 這些設定檔**仍在** symbo
 `data_flywheel.py` 才是互動資料收集器。它預設關閉，只有設定環境變數才會寫資料：
 
 ```bash
-AI_CODE_COLLECT_DATA=1 aicode
+AI_CODE_COLLECT_DATA=1 aicode_opencode
 ```
 
 預設輸出：
@@ -590,7 +590,7 @@ journaled 寫入 → best-effort rollback。
 | `scripts/mcp_catalog.py`／`scripts/eval_tool_routing.py` | effective stdio catalog、privacy-safe routing classification/gates 與 frozen historical baseline replay；harness 永不自行把 matrix row 升級成 supported。 |
 
 部署 live-after 不進 CI，也不是所有開發環境必綠。受授權且相容的乾淨部署才執行
-`AICODE_TOOL_CANARY_FORCE=1 aicode` 與 routing eval 真模型 arm，記錄 OpenCode／MCP SDK、
+`AICODE_TOOL_CANARY_FORCE=1 aicode_opencode` 與 routing eval 真模型 arm，記錄 OpenCode／MCP SDK、
 模型／chat template／effective config、explicit 與 implicit 結果。環境不可得時逐字回報
 `not run: environment unavailable`；未授權、未跑或 gate 未通過都保持 incomplete，不能阻擋
 離線驗收，也不能宣稱 `supported`。
@@ -604,7 +604,7 @@ CodeTrail 自己對 llama-server `/completion` 與 `/v1/chat/completions` 發送
 telemetry」流程。OpenCode TUI 也走 `/v1/chat/completions` 但走的是它自己的 client
 (`@ai-sdk/openai-compatible`),**不會** 經過這個模組,所以它的 context 仍然要靠
 llama-server 啟動時 `-c <N>` 與 OpenCode `model.limit.context` 對齊。`scripts/doctor.py`
-只掃描、絕不寫檔；正常 `aicode` preflight 則會針對 active model 原子同步這個鏡像欄位並留備份。
+只掃描、絕不寫檔；正常 `aicode_opencode` preflight 則會針對 active model 原子同步這個鏡像欄位並留備份。
 
 ### 模組分工
 
@@ -687,15 +687,15 @@ llama-server 啟動時 `-c <N>` 已經把 ctx + KV cache 鎖死,所以 doctor / 
 |---|---|
 | `gpu_safety.py` | 純 library:`query_gpu_info()` 跑 nvidia-smi 拿 GPU info(純診斷)、`query_server_info()` 打 llama-server `/props` 抓 `default_generation_settings.n_ctx` + `model_path`、`check_safety(requested_ctx, base_url)` 比對後包成 `SafetyVerdict`。所有 I/O 都用 hook 參數注入,測試可完全離線 mock。 |
 | `n_ctx.py` / `config.py::N_CTX` | 主模型 n_ctx 的集中解析。正常設定入口是 `set_config.sh --ctx`；runtime 以 `AICODE_N_CTX` 傳遞 server 實值。`NUM_CTX` / `DYNAMIC_NUM_CTX_MAX` 只保留程式碼相容 alias，永遠等於 `N_CTX`。舊 `AICODE_DYNAMIC_NUM_CTX_MAX` 只暫時相容讀取並警告 deprecated。 |
-| `scripts/resolve_server_ctx.py` | CLI 取值器。讀主 llama-server `/props` 拿真實 `n_ctx`，只把整數印到 stdout(讀不到就印空字串、永遠 exit 0)。`aicode` 將實值 export 成 `AICODE_N_CTX`；讀不到時回到 deployment profile 的 `services.main.ctx`。 |
+| `scripts/resolve_server_ctx.py` | CLI 取值器。讀主 llama-server `/props` 拿真實 `n_ctx`，只把整數印到 stdout(讀不到就印空字串、永遠 exit 0)。`aicode_opencode` 將實值 export 成 `AICODE_N_CTX`；讀不到時回到 deployment profile 的 `services.main.ctx`。 |
 | `scripts/ctx_safety_check.py` | CLI 入口(容量閘)。讀 `AICODE_MODEL` / 主 n_ctx / `AICODE_LLAMA_BASE_URL`，呼 `gpu_safety.check_safety()`；requested `<=` server n_ctx 放行，只有 `>` 才 refuse。安全 gate、`AICODE_ACCEPT_CTX_RISK` 與 `AICODE_CTX_SAFETY_DISABLE` 仍保留。 |
-| `opencode_context.py` / `scripts/opencode_ctx_check.py` | 解析 OpenCode active model 的 `provider.*.models.*.limit.context`。純檢查模式不寫檔；`aicode` 使用 `--fix`，只同步 active model 的該欄、保留其他 JSON、原子替換並建立 `.codetrail.bak`。無法唯一定位、解析或寫入時 fail-loud；`AICODE_ACCEPT_CTX_RISK=1` 可維持不一致而不寫入。 |
-| `scripts/opencode_mcp_timeout_check.py` | OpenCode MCP client timeout 契約。純檢查模式供診斷；`aicode` 使用 `--fix`，只在既有 `mcp.codetrail` entry 內將缺漏、無效或過短的 `timeout` 提升到 `config.OPENCODE_MCP_TIMEOUT_MIN_MS`。修復會保留其他 JSON 欄位、原子替換並建立 `.codetrail.bak`；設定無法解析/寫入則 fail-loud。 |
+| `opencode_context.py` / `scripts/opencode_ctx_check.py` | 解析 OpenCode active model 的 `provider.*.models.*.limit.context`。純檢查模式不寫檔；`aicode_opencode` 使用 `--fix`，只同步 active model 的該欄、保留其他 JSON、原子替換並建立 `.codetrail.bak`。無法唯一定位、解析或寫入時 fail-loud；`AICODE_ACCEPT_CTX_RISK=1` 可維持不一致而不寫入。 |
+| `scripts/opencode_mcp_timeout_check.py` | OpenCode MCP client timeout 契約。純檢查模式供診斷；`aicode_opencode` 使用 `--fix`，只在既有 `mcp.codetrail` entry 內將缺漏、無效或過短的 `timeout` 提升到 `config.OPENCODE_MCP_TIMEOUT_MIN_MS`。修復會保留其他 JSON 欄位、原子替換並建立 `.codetrail.bak`；設定無法解析/寫入則 fail-loud。 |
 | `context_budget.py::_emit_runtime_offload_check_once` | runtime 觀測 hook:`[CTX] WARNING` 或 `[CTX_OVERFLOW]` 觸發時順手查一次 `/slots` + `/props`,把 server 真實 n_ctx / 忙碌 slot 數 黏在 log 後面。每個 process 只跑一次,任何錯誤靜默吞掉。 |
 
 ### 設計守則
 
-- **fail-loud,不偷偷 clamp**:`ctx_safety_check` 遇到 `UNSAFE`(requested > server)一定 print verdict + 對齊方案然後 `exit 2`,**不會為了避開 UNSAFE 自動把 requested 改小**。(這跟 aicode 啟動時「從 server 讀 n_ctx 自動設成 budget」是兩回事:後者是拿 source of truth 當預設值,不是為了掩蓋失敗而 clamp。)
+- **fail-loud,不偷偷 clamp**:`ctx_safety_check` 遇到 `UNSAFE`(requested > server)一定 print verdict + 對齊方案然後 `exit 2`,**不會為了避開 UNSAFE 自動把 requested 改小**。(這跟 aicode_opencode 啟動時「從 server 讀 n_ctx 自動設成 budget」是兩回事:後者是拿 source of truth 當預設值,不是為了掩蓋失敗而 clamp。)
 - **UNKNOWN 一律放行**:server 不可連 / `/props` 沒給 n_ctx → 只 warn 不擋。否則 CI、遠端 server、新版 server 改 schema 時會被卡住。
 - **server 是 source of truth**:不再做 KV cache 公式預測;server `-c` 就是答案。
 
@@ -892,7 +892,7 @@ python3 RAG.py rebuild --kb knowledge.json spec_a.pdf --context      # 旗標 > 
 python3 RAG.py rebuild --kb knowledge.json spec_a.pdf --no-context   # 這次不生成
 
 # 查詢端使用(同時是緊急 kill switch:關掉不必重建 KB)
-AICODE_KB_CONTEXT_USE=1 aicode
+AICODE_KB_CONTEXT_USE=1 aicode_opencode
 ```
 
 | 環境變數 | 預設 | 作用 |

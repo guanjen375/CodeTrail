@@ -697,7 +697,7 @@ def check_opencode_direct_contract(
     r: Result,
     project: str | None,
 ) -> tuple[str, dict[str, Any], Path] | None:
-    """Diagnose the same fail-loud client boundary enforced by ``aicode``."""
+    """Diagnose the same fail-loud client boundary enforced by ``aicode_opencode``."""
     if shutil.which("opencode") is None:
         r.info("direct-tool contract 未檢查：opencode 不在 PATH")
         return None
@@ -925,7 +925,7 @@ def check_opencode_model_config(r: Result) -> None:
         if env_overrides_global_config:
             r.warn(
                 msg
-                + f" — AICODE_MODEL={main_model} 已設定;新版 aicode 會在啟動時拒絕"
+                + f" — AICODE_MODEL={main_model} 已設定;新版 aicode_opencode 會在啟動時拒絕"
                 + " env/opencode 不一致。請修正 OpenCode config,或啟動時明確傳"
                 + " -m/--model 給 OpenCode。"
             )
@@ -996,7 +996,7 @@ def check_opencode_config_drift(r: Result, project: str | None) -> None:
         r.warn(
             f"opencode.json={found} active model={limit.raw_model or limit.model} "
             f"limit.context={limit.context} 與主 n_ctx={internal_ctx_cap} 不一致。\n"
-            "        aicode 啟動時會安全自動同步；doctor 本身只診斷、不修改設定。"
+            "        aicode_opencode 啟動時會安全自動同步；doctor 本身只診斷、不修改設定。"
         )
     else:
         r.ok(f"opencode.json={found} active model limit.context 與 internal ctx cap 一致")
@@ -1005,8 +1005,8 @@ def check_opencode_config_drift(r: Result, project: str | None) -> None:
 def check_main_server_ctx_alignment(r: Result, server_status: dict[str, dict]) -> None:
     """主 llama-server 真實 n_ctx 應該等於 CodeTrail internal ctx cap。
 
-    正常情況下 aicode 啟動時會用 scripts/resolve_server_ctx.py 自動把 CodeTrail ctx
-    cap 設成 == server n_ctx,所以不會漂移。doctor 是獨立跑、不經過 aicode 的自動
+    正常情況下 aicode_opencode 啟動時會用 scripts/resolve_server_ctx.py 自動把 CodeTrail ctx
+    cap 設成 == server n_ctx,所以不會漂移。doctor 是獨立跑、不經過 aicode_opencode 的自動
     觀測；若 deployment profile 的 main.ctx 與 server -c 不同，這裡會先 warn。
     server 沒連上 (--no-network / 未啟動 /
     沒給 n_ctx) 一律跳過,不擋健檢。
@@ -1100,14 +1100,14 @@ def check_repo_artifacts(r: Result) -> None:
         else:
             r.fail(f"{rel} 不存在 — repo 是否完整？")
 
-    aicode_bin = REPO_ROOT / "aicode"
+    aicode_bin = REPO_ROOT / "aicode_opencode"
     if aicode_bin.is_file():
         if os.access(aicode_bin, os.X_OK):
-            r.ok("aicode 存在且可執行")
+            r.ok("aicode_opencode 存在且可執行")
         else:
-            r.fail("aicode 存在但沒有執行權 — chmod +x aicode")
+            r.fail("aicode_opencode 存在但沒有執行權 — chmod +x aicode_opencode")
     else:
-        r.fail("aicode 不存在 — 使用者入口不可用")
+        r.fail("aicode_opencode 不存在 — 使用者入口不可用")
 
 
 def check_knowledge_base(r: Result, project: str | None) -> None:
@@ -1313,7 +1313,7 @@ def check_compaction_mode(r: Result, project: Path | None = None) -> None:
         r.warn(
             f"AICODE_COMPACTION_STATE 已設定({override}):OpenCode 裡的壓縮 plugin "
             "會讀那一份,而不是 ~/.config/codetrail/compaction.json。這個變數只給"
-            "私人壓縮 eval 用,一般使用請 unset(aicode 啟動時會自動清掉)。"
+            "私人壓縮 eval 用,一般使用請 unset(aicode_opencode 啟動時會自動清掉)。"
         )
     state, reason = compaction_mode.inspect_state()
     if reason:
@@ -1378,7 +1378,7 @@ def _recomputed_compaction_drift(
     只有 `limit.context` 會被同步。門檻用新的、tail 用舊的,plugin 會因此停用
     自動壓縮 —— doctor 不比對的話會回報「一致」,兩邊講相反的話。
 
-    推導本身在 `compaction_mode.derive_for_config`(與 aicode 橫幅顯示的門檻
+    推導本身在 `compaction_mode.derive_for_config`(與 aicode_opencode 橫幅顯示的門檻
     同一份實作);這裡只負責把結果跟設定裡的值比對。
     """
     if mode not in compaction_mode.PLUGIN_MODES:

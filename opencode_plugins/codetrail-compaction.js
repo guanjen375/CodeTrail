@@ -121,9 +121,9 @@ const MIN_COMPACTION_OPENCODE_VERSION = [1, 18, 17];
 
 // 公開的 plugin / SDK API 沒有任何欄位是「**目前正在跑的** OpenCode 版本」：
 // `Session.version` 是那個 session **被建立時**寫入的版本，升級後恢復舊 session
-// 會永遠被誤判成太舊，降級則會誤判成通過。所以版本由 `aicode` 的 preflight
+// 會永遠被誤判成太舊，降級則會誤判成通過。所以版本由 `aicode_opencode` 的 preflight
 // （`scripts/opencode_direct_contract.py`，唯一讀得到 `opencode --version` 的
-// 地方）量好之後用這個環境變數遞下來。沒有這個變數＝不是 aicode 起的 session，
+// 地方）量好之後用這個環境變數遞下來。沒有這個變數＝不是 aicode_opencode 起的 session，
 // 這一端就不做版本判斷（那條路徑本來就沒有任何 CodeTrail preflight）。
 const OPENCODE_VERSION_ENV = "AICODE_OPENCODE_VERSION";
 
@@ -224,7 +224,7 @@ function versionAtLeast(version, minimum) {
 /**
  * 這個 runtime 的壓縮語意支援嗎？
  *
- * 回 `null` 代表「不知道」（沒有經過 aicode preflight），這時不擋——那條路徑
+ * 回 `null` 代表「不知道」（沒有經過 aicode_opencode preflight），這時不擋——那條路徑
  * 本來就沒有任何 CodeTrail preflight。量得到而且太舊就回 false，plugin 停用。
  */
 function versionSupported(env = process.env) {

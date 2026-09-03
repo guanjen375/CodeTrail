@@ -2,7 +2,7 @@
 """Resolve the one main-model n_ctx value used by CodeTrail.
 
 Normal users set the value once through ``set_config.sh --ctx``.  At runtime
-``aicode`` observes the main llama-server and transports that value through
+``aicode_opencode`` observes the main llama-server and transports that value through
 ``AICODE_N_CTX`` so CodeTrail and OpenCode can follow it.  The old
 ``AICODE_DYNAMIC_NUM_CTX_MAX`` name remains a read-only compatibility alias;
 it is deliberately not the primary setting because it exposes an internal

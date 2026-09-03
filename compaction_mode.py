@@ -78,7 +78,7 @@ MODE_LABELS = {
 #: 那條路徑就是「不接管」,沒有實驗成分。
 #:
 #: 為什麼要有這兩個常數:同一句話要出現在 set_config 的問答、set_config 的
-#: 設定摘要、aicode 啟動橫幅、doctor 與使用者文件。五個地方各寫各的,拿掉
+#: 設定摘要、aicode_opencode 啟動橫幅、doctor 與使用者文件。五個地方各寫各的,拿掉
 #: 其中一個就會有人在完全不知道的情況下把長對話交給一個還在調整的機制。
 EXPERIMENTAL_MODES = PLUGIN_MODES
 #: 短標籤:接在模式名後面(選項列、狀態行、摘要頁)。
@@ -563,7 +563,7 @@ def derive_for_config(
     該有的 limit 查不到、或推不出可用門檻時 raise ``CompactionModeError``,
     訊息本身就是要給人看的那一句。
 
-    為什麼要收在這裡:doctor 的漂移比對與 `aicode` 橫幅顯示的門檻必須是同一個
+    為什麼要收在這裡:doctor 的漂移比對與 `aicode_opencode` 橫幅顯示的門檻必須是同一個
     數字,而 runtime 的 plugin 也用同一條公式重算。各寫一份的話,doctor 說一致、
     橫幅印另一個數字,而使用者看到的停用理由來自第三個。
     """
@@ -1123,7 +1123,7 @@ def unmanaged_keys(state: dict[str, Any] | None) -> tuple[str, ...]:
     沒有授權的情況下接管一個鍵,而且切回 native 時還原不回去。
 
     但也不能靜靜當作沒這回事:使用者 `git pull` 之後永遠拿不到新的受管值,
-    而且沒有任何訊息說為什麼。所以由呼叫端(doctor、`aicode` 橫幅)把這個
+    而且沒有任何訊息說為什麼。所以由呼叫端(doctor、`aicode_opencode` 橫幅)把這個
     清單講出來,收斂方式一律是重跑 ``./set_config.sh``。
 
     native 模式回空 tuple:那條路徑本來就什麼都不管。

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve CodeTrail's explicit main llama.cpp model for the aicode wrapper.
+"""Resolve CodeTrail's explicit main llama.cpp model for the aicode_opencode wrapper.
 
 Priority:
   1. AICODE_MODEL
@@ -33,12 +33,12 @@ from model_resolution import (  # noqa: E402
 
 
 def _fail(msg: str) -> int:
-    print(f"[aicode] {msg}", file=sys.stderr, flush=True)
+    print(f"[aicode_opencode] {msg}", file=sys.stderr, flush=True)
     print(
-        "[aicode] CodeTrail 不內建、不推薦主聊天 / 程式推導模型。\n"
+        "[aicode_opencode] CodeTrail 不內建、不推薦主聊天 / 程式推導模型。\n"
         "         請先下載一顆 GGUF 並啟動 llama-server, 然後任選一種方式設定:\n"
         "           1) export AICODE_MODEL=<MODEL>\n"
-        "           2) aicode -m <MODEL>\n"
+        "           2) aicode_opencode -m <MODEL>\n"
         "           3) deployment profile / ~/.config/codetrail/deployment.json 設 main.model\n"
         "           4) OPENCODE_CONFIG / ~/.config/opencode/opencode.json 設\n"
         '                \"model\": \"<MODEL>\"\n'

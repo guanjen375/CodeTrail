@@ -6,7 +6,7 @@
 - README 沒涵蓋的安裝替代路徑(其他 distro、runfile installer、conda env)
 - tmux 以外的 process manager(systemd / screen / nohup + disown)
 - 多機部署(CodeTrail 跟 GPU server 分開)
-- `aicode` wrapper 詳細行為
+- `aicode_opencode` wrapper 詳細行為
 - 維運常用命令(重啟、reload、kill 所有 server)
 
 ---
@@ -35,8 +35,8 @@ pip install "pymupdf4llm==1.28.0"    # 選用:RAG 從 PDF 建知識庫才用;釘
 ```
 
 `set_config.sh` 會把當下 venv Python 的絕對路徑寫進 OpenCode 的 MCP command；不過
-`aicode` 本身仍會從目前 PATH 選 `python3` / `python` 執行 deployment、endpoint 與 server
-preflight。因此若依賴只裝在 venv，每次跑 `set_config.sh`、`aicode` 或 `aicode_web` 前都要
+`aicode_opencode` 本身仍會從目前 PATH 選 `python3` / `python` 執行 deployment、endpoint 與 server
+preflight。因此若依賴只裝在 venv，每次跑 `set_config.sh`、`aicode_opencode` 或 `aicode_opencode_web` 前都要
 先 `source <CODETRAIL_REPO>/.venv/bin/activate`。不建議修改 venv 自己的 activate 腳本；
 可在自己的 shell 設一個明確 alias / function。重建 venv 後要再跑一次 `set_config.sh`，
 更新寫進設定檔的 Python 絕對路徑。
@@ -120,7 +120,7 @@ CodeTrail repo 跑在你工作機(CPU 即可),llama-server 跑在另一台 GPU �
 
 先在 GPU 主機照 [README §3](../README.md)(`./set_config.sh` + `~/start.sh`)建立四個
 server。主 server 的 `-c` 決定主 n_ctx(`set_config.sh` 沒有預設值,由你輸入)；
-CodeTrail 會讀 server 實值，`aicode` 也會同步 OpenCode active model 的
+CodeTrail 會讀 server 實值，`aicode_opencode` 也會同步 OpenCode active model 的
 `limit.context`。連線方式選下面其中一種，不要混用。
 
 ### 路徑 A:可信 VPN / 內網直連
@@ -136,12 +136,12 @@ AICODE_LLAMA_RERANK_BASE_URL=http://<GPU_HOST>:8082 \
 AICODE_LLAMA_VL_BASE_URL=http://<GPU_HOST>:8083 \
 AICODE_MODEL_REMOTE_OK=1 \
 AICODE_MODEL=<CODE_MODEL> \
-aicode
+aicode_opencode
 ```
 
-(不用另設 ctx max —— `aicode` 會讀 `AICODE_LLAMA_BASE_URL` 指到的遠端 server `/props`，把主 `n_ctx` 傳給 CodeTrail 與 OpenCode。)
+(不用另設 ctx max —— `aicode_opencode` 會讀 `AICODE_LLAMA_BASE_URL` 指到的遠端 server `/props`，把主 `n_ctx` 傳給 CodeTrail 與 OpenCode。)
 
-把 `~/.config/opencode/opencode.json` 的 provider `baseURL` 改成 `http://<GPU_HOST>:8080/v1`；active model 的 `limit.context` 會在第一次 `aicode` 啟動時同步(上例是 32768，原檔會備份)。
+把 `~/.config/opencode/opencode.json` 的 provider `baseURL` 改成 `http://<GPU_HOST>:8080/v1`；active model 的 `limit.context` 會在第一次 `aicode_opencode` 啟動時同步(上例是 32768，原檔會備份)。
 
 `AICODE_MODEL_REMOTE_OK=1` 是必要的明確同意：沒有它，CodeTrail 對非 loopback endpoint 的
 health / props / completion / embedding / reranking 呼叫都會 fail-loud。這個 opt-in 不會提供
@@ -175,7 +175,7 @@ AICODE_LLAMA_EMBED_BASE_URL=http://127.0.0.1:18081 \
 AICODE_LLAMA_RERANK_BASE_URL=http://127.0.0.1:18082 \
 AICODE_LLAMA_VL_BASE_URL=http://127.0.0.1:18083 \
 AICODE_MODEL=<CODE_MODEL> \
-aicode
+aicode_opencode
 ```
 
 同時把 OpenCode provider `baseURL` 設為 `http://127.0.0.1:18080/v1`。有效 endpoint
@@ -184,9 +184,9 @@ content 會經 SSH 加密隧道送到 GPU 主機。
 
 ---
 
-## `aicode` wrapper 詳細行為
+## `aicode_opencode` wrapper 詳細行為
 
-`aicode` 是一個 shell wrapper,啟動 `opencode` 之前做十四件事:
+`aicode_opencode` 是一個 shell wrapper,啟動 `opencode` 之前做十四件事:
 
 1. 把目前目錄設成 `AICODE_ROOT`(沙箱根)
 2. 拒絕 `AICODE_ROOT=/` 或 `AICODE_ROOT=$HOME`(可能誤刪 / 誤改大量檔案)
@@ -208,7 +208,7 @@ content 會經 SSH 加密隧道送到 GPU 主機。
 13. 用 fresh `opencode run --format json` 驗 active model 真的產生 completed 的結構化 `codetrail_list_dir` event；依 model/config/chat-template/project 指紋快取成功結果 24 小時
 14. 啟動 `opencode` 並原樣轉發使用者的 `-m / --model`
 
-第 12 項每次啟動都實跑，不靠模型自述；第 13 項首次、快取過期或指紋變動才實跑，所以不必每次手動問「列出 19 個工具」。第 13 項實跑（本地推理，通常數十秒起）前會先印出原因與單次上限，執行中每 15 秒回報進度——不是當機。`aicode web` 與委派它的 `aicode_web` 也會跑兩層檢查；`aicode attach` 是接既有 backend 的薄 client，不重跑。完整 PASS / FAIL、快取與緊急 override 說明見 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)。
+第 12 項每次啟動都實跑，不靠模型自述；第 13 項首次、快取過期或指紋變動才實跑，所以不必每次手動問「列出 19 個工具」。第 13 項實跑（本地推理，通常數十秒起）前會先印出原因與單次上限，執行中每 15 秒回報進度——不是當機。`aicode_opencode web` 與委派它的 `aicode_opencode_web` 也會跑兩層檢查；`aicode_opencode attach` 是接既有 backend 的薄 client，不重跑。完整 PASS / FAIL、快取與緊急 override 說明見 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)。
 
 ---
 
@@ -308,14 +308,14 @@ curl -s http://localhost:8080/slots | python3 -m json.tool
 nvidia-smi --query-gpu=memory.used,memory.free,memory.total --format=csv
 ```
 
-### reload OpenCode / `aicode` 設定
+### reload OpenCode / `aicode_opencode` 設定
 
-`aicode` 啟動時讀一次 `~/.config/opencode/opencode.json` 與 `~/.config/codetrail/models.json`,**之後改檔不會自動生效**。要大改配置(換模型 / 換 GPU / 換 ctx)最省事的是重跑 `<CODETRAIL_REPO>/set_config.sh`(會重生成全部設定並備份舊檔)。手動改的話,要套用新設定:
+`aicode_opencode` 啟動時讀一次 `~/.config/opencode/opencode.json` 與 `~/.config/codetrail/models.json`,**之後改檔不會自動生效**。要大改配置(換模型 / 換 GPU / 換 ctx)最省事的是重跑 `<CODETRAIL_REPO>/set_config.sh`(會重生成全部設定並備份舊檔)。手動改的話,要套用新設定:
 
 ```bash
 # 退出 TUI(Ctrl-D 或在 TUI 內輸入 /exit)
 # 改設定
-# 重新 aicode
+# 重新 aicode_opencode
 ```
 
 llama-server 端的 `-c <N>` 也是啟動旗標,改完要重啟 server,不能熱 reload。
@@ -330,7 +330,7 @@ OpenCode 再重開。模式與接管前的原值記在 `~/.config/codetrail/comp
 不要手改或手刪它 —— 那是切回 `native` 時唯一的還原依據。三種模式的取捨見
 [compaction-rules.md](compaction-rules.md)。
 
-`~/.config/opencode/AGENTS.md`(決定模型會不會真的去用工具的全域規則)是**另一份檔**,`set_config.sh` 不產生它、`git pull` 也不會更新它。`aicode` 每次啟動會比對並在過期時提醒;要套用新版範本:
+`~/.config/opencode/AGENTS.md`(決定模型會不會真的去用工具的全域規則)是**另一份檔**,`set_config.sh` 不產生它、`git pull` 也不會更新它。`aicode_opencode` 每次啟動會比對並在過期時提醒;要套用新版範本:
 
 ```bash
 python3 scripts/opencode_contract_check.py --sync-agents-md   # 覆蓋並備份原檔
@@ -344,6 +344,6 @@ python3 scripts/opencode_contract_check.py --sync-agents-md   # 覆蓋並備份�
 
 ## 後續
 
-`aicode` 啟動之後的 TUI 操作流程見 [docs/basic-usage.md](basic-usage.md)。RAG / 知識庫見
+`aicode_opencode` 啟動之後的 TUI 操作流程見 [docs/basic-usage.md](basic-usage.md)。RAG / 知識庫見
 [docs/rag.md](rag.md)；Code-RAG / graph 見
 [MCP 工具清單](mcp-tools.md#code_rag_search-四種模式)。

@@ -21,10 +21,10 @@
 你糾正模型行為
   → 模型呼叫 record_lesson 提案(rule 必須是單行祈使句行為規則)
   → permission ask:你在核准框看到 rule,核准才寫入 lessons.json
-  → 下個 session:aicode 啟動時把 active lessons render 進
+  → 下個 session:aicode_opencode 啟動時把 active lessons render 進
     <AICODE_ROOT>/.codetrail/lessons.md,OpenCode 經 opencode.json 的
     "instructions" 連同 AGENTS.md 一起載入 context
-  → 90 天後過 review_by:該條停止注入,aicode 啟動時醒目列出待複審清單
+  → 90 天後過 review_by:該條停止注入,aicode_opencode 啟動時醒目列出待複審清單
   → 你複審:renew(再延 90 天)或 delete
 ```
 
@@ -57,15 +57,15 @@
 
 被你拒絕的提案就結束,模型不該換句話重試;內容完全相同的重複提案也不會寫入第二條(回報既有編號,重試因此安全)。**沒有任何無審核的自動寫入路徑。**
 
-升級注意:舊安裝 `git pull` 後,全域 opencode.json 可能還沒有 `codetrail_record_lesson: "ask"` 這個核准閘(新工具會被舊的 `codetrail_*: allow` wildcard 直接放行)、也沒有 lessons 的 `instructions` 項(render 了也不載入)。`aicode` 每次啟動會用 `scripts/opencode_contract_check.py --fix` 自動補齊缺少的鍵(原檔備份、你明確設過的值一律尊重);不經 `aicode` 直接開 `opencode` 的話,請先重跑 `./set_config.sh`。
+升級注意:舊安裝 `git pull` 後,全域 opencode.json 可能還沒有 `codetrail_record_lesson: "ask"` 這個核准閘(新工具會被舊的 `codetrail_*: allow` wildcard 直接放行)、也沒有 lessons 的 `instructions` 項(render 了也不載入)。`aicode_opencode` 每次啟動會用 `scripts/opencode_contract_check.py --fix` 自動補齊缺少的鍵(原檔備份、你明確設過的值一律尊重);不經 `aicode_opencode` 直接開 `opencode` 的話,請先重跑 `./set_config.sh`。
 
 ## 上限與 fail-loud
 
 可注入的 active lessons 上限 **20 條**(每個專案看到的 global + 該專案 project 條目合計)。滿了之後 `record_lesson` 與 `renew` 都會拒絕並要求人工整併 —— 不會靜默丟掉舊的、也不會只注入前 20 條。條數就 20,所以全量注入、不做 embedding 檢索與自動 decay / 衝突解決。
 
-session start(`aicode`)時:
+session start(`aicode_opencode`)時:
 
-- lessons store 損壞 → **拒絕啟動**(fail-loud),修復或 `AICODE_LESSONS_SKIP=1 aicode` 緊急跳過(該 session 不注入);
+- lessons store 損壞 → **拒絕啟動**(fail-loud),修復或 `AICODE_LESSONS_SKIP=1 aicode_opencode` 緊急跳過(該 session 不注入);
 - active 超過 20(只可能手改 JSON 造成)→ 拒絕啟動,要求整併;
 - 有條目過 review_by → 照常啟動,但該條停止注入,並醒目列出待複審清單與 renew / delete 指令;
 - `.codetrail` 被 symlink/junction 指到專案外 → 拒絕啟動(沙箱寫入防線,render 一個 byte 都不寫;不信任的 repo 可能用這招把檔案導出沙箱)。
@@ -73,7 +73,7 @@ session start(`aicode`)時:
 跳過與安全模式(兩者都會**移除**先前 render 的 `.codetrail/lessons.md`,避免上個 session 的規則殘留被 OpenCode 載入):
 
 - `AICODE_LESSONS_SKIP=1`:本 session 不注入(緊急逃生口);
-- `OPENCODE_DISABLE_PROJECT_CONFIG=1`(分析不信任 repo 的安全模式,見 [docs/security.md](security.md)):OpenCode 這個模式從全域設定目錄解析相對 instructions、不讀專案內檔案,lessons **不會注入** —— `aicode` 會明講,不會謊報「已注入」。注意 OpenCode 對這個 env 是「非空即真」,`=0` 也算開啟。
+- `OPENCODE_DISABLE_PROJECT_CONFIG=1`(分析不信任 repo 的安全模式,見 [docs/security.md](security.md)):OpenCode 這個模式從全域設定目錄解析相對 instructions、不讀專案內檔案,lessons **不會注入** —— `aicode_opencode` 會明講,不會謊報「已注入」。注意 OpenCode 對這個 env 是「非空即真」,`=0` 也算開啟。
 
 ## 管理指令
 
@@ -94,7 +94,7 @@ python3 lessons.py hit L-001        # 人工記一次命中(見下)
 
 ## 驗證注入有生效
 
-1. `aicode` 啟動輸出應有一行 `[lessons] N 條 active lessons 已注入 .codetrail/lessons.md`。
+1. `aicode_opencode` 啟動輸出應有一行 `[lessons] N 條 active lessons 已注入 .codetrail/lessons.md`。
 2. 開新 session 問模型:「目前 context 裡有哪些 CodeTrail lessons?」它應能列出編號與內容。
 3. 改用 `cat <AICODE_ROOT>/.codetrail/lessons.md` 直接看注入內容(此檔自動產生,勿手改;`.codetrail/` 已在 .gitignore)。
 

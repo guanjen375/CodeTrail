@@ -33,7 +33,7 @@ start 提示待複審 → 人工 renew / delete。
     端的對話輸出 CodeTrail 看不到,所以欄位保留給人工判斷(CLI ``hit`` 手動
     +1),不為此加自動 parser 機制。
 
-這個模組刻意不 import config.py:它要能被 aicode preflight
+這個模組刻意不 import config.py:它要能被 aicode_opencode preflight
 (scripts/lessons_check.py)在最小依賴下載入,跟 deployment_profile.py 同理。
 """
 from __future__ import annotations
@@ -593,7 +593,7 @@ def propose_lesson(
     - 內容完全相同的重複提案不再寫一條,回報既有編號;因此任何失敗後的
       重試都是冪等的,不會產生重複規則。
     - store 落地後才 render context file;render 失敗只在回覆附警告而不
-      整筆報錯(store 其實已寫入),下次 aicode 啟動會自動重 render。
+      整筆報錯(store 其實已寫入),下次 aicode_opencode 啟動會自動重 render。
     """
     rule_error = validate_rule(rule)
     if rule_error:
@@ -631,7 +631,7 @@ def propose_lesson(
     except (LessonsError, OSError) as exc:
         render_note = (
             f"\n⚠ store 已寫入,但 render 注入檔失敗:{exc}\n"
-            "  下次 aicode 啟動會自動重試 render;請不要為此重新提案。"
+            "  下次 aicode_opencode 啟動會自動重試 render;請不要為此重新提案。"
         )
     scope_text = "本專案" if scope == "project" else "此部署的所有專案"
     return (

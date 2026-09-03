@@ -1,5 +1,5 @@
 這個 repo 是一個 **本地 RAG / Code-RAG / MCP 工具集**。終端使用者透過 OpenCode TUI
-和 `aicode` wrapper（或薄的 `aicode_web` 背景 launcher）連到這個專案，用本地 llama.cpp `llama-server` 跑模型,
+和 `aicode_opencode` wrapper（或薄的 `aicode_opencode_web` 背景 launcher）連到這個專案，用本地 llama.cpp `llama-server` 跑模型,
 分析 NDA / 內部 firmware repo。
 
 如果你是 AI coding agent（Codex / OpenCode 等）正在改這個 repo，請先把這份檔讀完。
@@ -133,7 +133,7 @@ module 層 `pytestmark` 換成單條 decorator，gate 都還是綠的。
 - 不要為了讓 lint 漂亮，刪未檢查影響的 unused import — 有些是 side-effect import。
 - 不要把 ALLOWED_COMMANDS 加 `rm` / `sudo` / `curl` / `bash`。
 - 不要把 `RUN_COMMAND_ENABLED` / `PATCH_ENABLED` 在 `config.py` 的預設改成 `True`。OpenCode runtime 若要開，必須維持在 `mcp_server.py` 這類明確啟動點。
-- 不要在 `mcp_server.py` 加新 tool 卻沒同步更新 `README.md` 工具清單 — 模型會誤用，使用者也會困惑（`aicode` 健檢會要求工具集合與文件精確一致）。使用者機器上依 README 建議建立的 `~/.config/opencode/AGENTS.md` 若列了工具清單，也要提醒一併更新。
+- 不要在 `mcp_server.py` 加新 tool 卻沒同步更新 `README.md` 工具清單 — 模型會誤用，使用者也會困惑（`aicode_opencode` 健檢會要求工具集合與文件精確一致）。使用者機器上依 README 建議建立的 `~/.config/opencode/AGENTS.md` 若列了工具清單，也要提醒一併更新。
 - 不要 `git commit` 沒被使用者確認過的修改。
 
 ---

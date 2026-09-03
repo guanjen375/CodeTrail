@@ -26,7 +26,7 @@ python3 scripts/opencode_contract_check.py --sync-agents-md
 ```
 
 同步會先備份既有檔案，再把下方唯一的 `markdown` fenced block 寫入
-`~/.config/opencode/AGENTS.md`。`aicode` 每次啟動也會檢查：
+`~/.config/opencode/AGENTS.md`。`aicode_opencode` 每次啟動也會檢查：
 
 | 狀況 | 啟動行為 |
 |---|---|
@@ -42,7 +42,7 @@ python3 scripts/opencode_contract_check.py --sync-agents-md
 可能讓模型繼續模仿同一模式。要略過舊 canary cache 一併重驗，可執行：
 
 ```bash
-AICODE_TOOL_CANARY_FORCE=1 aicode
+AICODE_TOOL_CANARY_FORCE=1 aicode_opencode
 ```
 
 這個 `--sync-agents-md` 只**寫入**全域 AGENTS 範本；同一次執行仍會唯讀回報其他 contract

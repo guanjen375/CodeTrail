@@ -283,7 +283,7 @@ def print_ctx_usage(chars: int) -> bool:
 def _default_ctx_budget() -> int:
     """internal LLM call 的預設 ctx 預算 = 主 llama-server 的真實 n_ctx。
 
-    aicode 由 server /props 取得 n_ctx 後透過 AICODE_N_CTX 帶入；未經 wrapper
+    aicode_opencode 由 server /props 取得 n_ctx 後透過 AICODE_N_CTX 帶入；未經 wrapper
     時則使用 effective deployment profile 的 main.ctx。所有舊 alias 都派生自
     這一值，因此不再需要在兩個可漂移的上限之間取 min。
     """

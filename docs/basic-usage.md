@@ -18,7 +18,7 @@ AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
-aicode
+aicode_opencode
 ```
 
 進入 TUI 前會依序看到分層健康狀態：
@@ -131,7 +131,7 @@ ASCII/CJK token 代理估算，再套各工具 safety cap；已不再是固定 1
 預設不能直接讀 `$HOME`、`Downloads` 或其他專案外路徑。要匯入外部附件，啟動時打開匯入功能：
 
 ```bash
-AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
+AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode_opencode
 ```
 
 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1` 是總開關。預設可匯入來源是 `~/Downloads` 和 `/tmp`。如果附件在其他目錄，用 `AI_CODE_IMPORT_ROOTS` 指定白名單；一旦設定就會取代預設清單：
@@ -139,7 +139,7 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 ```bash
 AI_CODE_ALLOW_EXTERNAL_IMPORT=1 \
 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/specs" \
-aicode
+aicode_opencode
 ```
 
 進入 TUI 後請模型先匯入，再分析回傳的新路徑：
@@ -274,20 +274,20 @@ permission 是 `ask`）。
 把這條記成 lesson,之後的 session 都要遵守。
 ```
 
-模型會用 `record_lesson(...)` 提案一條祈使句行為規則,**你在核准框看到內容、同意才寫入**;下個 session 起由 `aicode` 自動注入(啟動輸出有 `[lessons] N 條 active lessons 已注入 ...`)。規則 90 天到期會停止注入並在啟動時提示複審。生命週期、上限與 `python3 lessons.py list / renew / delete` 管理指令見 [docs/lessons.md](lessons.md)。
+模型會用 `record_lesson(...)` 提案一條祈使句行為規則,**你在核准框看到內容、同意才寫入**;下個 session 起由 `aicode_opencode` 自動注入(啟動輸出有 `[lessons] N 條 active lessons 已注入 ...`)。規則 90 天到期會停止注入並在啟動時提示複審。生命週期、上限與 `python3 lessons.py list / renew / delete` 管理指令見 [docs/lessons.md](lessons.md)。
 
 ---
 
 ## 7. Web 模式(瀏覽 / 續問歷史 session)
 
-§0 的 `aicode` 是 standalone TUI。如果你想用瀏覽器瀏覽歷史 session、點任一筆續問，
+§0 的 `aicode_opencode` 是 standalone TUI。如果你想用瀏覽器瀏覽歷史 session、點任一筆續問，
 或讓瀏覽器與 TUI client 連到**同一個 backend**，改用 web 模式並讓 TUI 端走
-`aicode attach`。不要在同一個專案同時另開 standalone `aicode` 與 `aicode_web`；兩個
+`aicode_opencode attach`。不要在同一個專案同時另開 standalone `aicode_opencode` 與 `aicode_opencode_web`；兩個
 backend 會共用 session 資料庫而互相干擾。
 
 web backend 會 spawn CodeTrail MCP。`set_config.sh` 會把 MCP Python 的絕對路徑寫進
-OpenCode 設定；但如果 CodeTrail 依賴只裝在 venv，`aicode` / `aicode_web` 的啟動前置
-仍應在 activate 後執行（見 [安裝、設定與啟動](setup.md)）。`aicode attach` 是純 client，
+OpenCode 設定；但如果 CodeTrail 依賴只裝在 venv，`aicode_opencode` / `aicode_opencode_web` 的啟動前置
+仍應在 activate 後執行（見 [安裝、設定與啟動](setup.md)）。`aicode_opencode attach` 是純 client，
 不跑 backend preflight，也不需要 Python 環境。
 
 ### 啟動 web backend
@@ -300,14 +300,14 @@ A 機和 B 機已登入同一個 tailnet 時,使用背景 launcher:
 
 # 再鎖定要分析的專案並啟動 web
 cd <PROJECT_TO_ANALYZE>
-aicode_web
+aicode_opencode_web
 ```
 
-如果 A 機的啟動檔放在桌面,第一行可改成 `cd ~/Desktop && ./start.sh`；標準 `set_config.sh` 產物則是 `~/start.sh`。`aicode_web` 會讀 `tailscale ip -4`,只綁 A 機的 Tailscale IPv4 與固定 port `4096`(可用 `AICODE_WEB_PORT` 覆寫)，在 tmux 背景執行，ready 後印出 B 機要開的 `http://100.x.y.z:4096/`。A 機沒有 GUI 是預期情況。
+如果 A 機的啟動檔放在桌面,第一行可改成 `cd ~/Desktop && ./start.sh`；標準 `set_config.sh` 產物則是 `~/start.sh`。`aicode_opencode_web` 會讀 `tailscale ip -4`,只綁 A 機的 Tailscale IPv4 與固定 port `4096`(可用 `AICODE_WEB_PORT` 覆寫)，在 tmux 背景執行，ready 後印出 B 機要開的 `http://100.x.y.z:4096/`。A 機沒有 GUI 是預期情況。
 
-沙箱 root 檢查、模型解析、ctx safety 與 `AI_CODE_*` 透傳全部跟 standalone TUI 一致 —— 例如要讀專案外附件一樣加 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode_web`。停止 backend 用 `aicode_web stop`。
+沙箱 root 檢查、模型解析、ctx safety 與 `AI_CODE_*` 透傳全部跟 standalone TUI 一致 —— 例如要讀專案外附件一樣加 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode_opencode_web`。停止 backend 用 `aicode_opencode_web stop`。
 
-沒用 Tailscale時,低階入口仍可用 `aicode web`(前景、預設 `127.0.0.1:4096`)或 `aicode_web --local`(背景),再從 B 機做 SSH tunnel:`ssh -L 4096:127.0.0.1:4096 <帳號>@<A機>`。完整步驟見 [README §5.4](../README.md#54-web-模式目前測試中)。
+沒用 Tailscale時,低階入口仍可用 `aicode_opencode web`(前景、預設 `127.0.0.1:4096`)或 `aicode_opencode_web --local`(背景),再從 B 機做 SSH tunnel:`ssh -L 4096:127.0.0.1:4096 <帳號>@<A機>`。完整步驟見 [README §5.4](../README.md#54-web-模式目前測試中)。
 
 首頁就是 session 清單,點任一筆即可載入該 session 繼續對話。
 
@@ -318,13 +318,13 @@ aicode_web
 另開一個終端:
 
 ```bash
-aicode attach                              # 預設接 http://127.0.0.1:4096
-aicode attach http://127.0.0.1:4096 -c     # 指定 url，並用 -c 續接上一個 session
-aicode attach -s <SESSION_ID>              # 接上指定 session
+aicode_opencode attach                              # 預設接 http://127.0.0.1:4096
+aicode_opencode attach http://127.0.0.1:4096 -c     # 指定 url，並用 -c 續接上一個 session
+aicode_opencode attach -s <SESSION_ID>              # 接上指定 session
 ```
 
 attach 端與 web 端**共用同一份 session 與狀態**:web 發問後 TUI 看得到新訊息，TUI 切 session 也會反映在 web。CodeTrail MCP 只在 backend 冷啟一次，attach 端不會再起第二個。TUI 內 `/status` 應看到 `codetrail Connected`。
 
 ### 安全注意(重要)
 
-未設 `OPENCODE_SERVER_PASSWORD` 時 OpenCode server 沒有應用層密碼。`aicode_web` 的無密碼例外非常窄:wrapper 傳入的 hostname、`tailscale ip -4` 當下值與 Tailscale `100.64.0.0/10` 必須三者吻合,且只 listen 該 virtual interface；傳輸由 Tailscale 加密、授權由 tailnet ACL 負責。普通 `aicode web` 若綁任何非 loopback 位址(`0.0.0.0` / LAN IP)或開 `--mdns`,仍會強制要求密碼。**絕不可用 `tailscale funnel`**。詳見 [安全邊界與工作節奏](security.md)。
+未設 `OPENCODE_SERVER_PASSWORD` 時 OpenCode server 沒有應用層密碼。`aicode_opencode_web` 的無密碼例外非常窄:wrapper 傳入的 hostname、`tailscale ip -4` 當下值與 Tailscale `100.64.0.0/10` 必須三者吻合,且只 listen 該 virtual interface；傳輸由 Tailscale 加密、授權由 tailnet ACL 負責。普通 `aicode_opencode web` 若綁任何非 loopback 位址(`0.0.0.0` / LAN IP)或開 `--mdns`,仍會強制要求密碼。**絕不可用 `tailscale funnel`**。詳見 [安全邊界與工作節奏](security.md)。

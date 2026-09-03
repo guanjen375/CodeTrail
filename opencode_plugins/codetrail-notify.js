@@ -443,7 +443,7 @@ async function recordIncident(entry, options = {}) {
 
 // ── toast 文案 ──────────────────────────────────────────────────────────
 const RECOVERY_HINT =
-  "重開一個 session 再問一次；仍然沒有工具呼叫就用 AICODE_TOOL_CANARY_FORCE=1 aicode 重驗。不會自動重試。";
+  "重開一個 session 再問一次；仍然沒有工具呼叫就用 AICODE_TOOL_CANARY_FORCE=1 aicode_opencode 重驗。不會自動重試。";
 
 function idleMessage(kind, detail) {
   if (kind === "client_mcp_failed") {

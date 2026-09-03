@@ -16,7 +16,7 @@ plugin 與專案設定仍要另外限制。操作責任與人工驗證原則見
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
-OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode
+OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode_opencode
 ```
 
 並保留 [README §4.3](../README.md#43-opencode-config) 範本裡的 OpenCode
@@ -27,7 +27,7 @@ permission:只允許 `codetrail_*`,把 OpenCode 內建 `bash` / `read` / `write`
 
 ## 沙箱真正保護什麼
 
-`aicode` 啟動時會把當前目錄設成 `AICODE_ROOT`。一般檔案讀寫都限制在這個根目錄；
+`aicode_opencode` 啟動時會把當前目錄設成 `AICODE_ROOT`。一般檔案讀寫都限制在這個根目錄；
 從 `$HOME` 或 `/` 啟動會直接被拒絕。兩個刻意而受限的例外是:
 
 - `import_external_file(...)` 在你顯式開啟後,可從指定來源白名單**讀取並複製**單一檔案到
@@ -50,31 +50,31 @@ OpenCode 內建的 `bash` / `read` / `write` / `edit` 不經過 CodeTrail,所以
 OpenCode 可能讀取專案內的 `opencode.json`,而專案層級 config 可能覆蓋你的全域 permission。分析不信任 repo 時,用:
 
 ```bash
-OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode
+OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode_opencode
 ```
 
 web 模式也一樣:
 
 ```bash
-OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode_web
+OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode_opencode_web
 ```
 
 這會讓 OpenCode 忽略專案層級設定,避免 repo 自帶 config 把 `bash` / `read` / `write` 等內建工具重新放開。這個 env **只**關閉 project config，不會自動清掉 OpenCode 的全域、remote/custom、inline、managed 設定或已安裝 plugin。依 [OpenCode 的 config 合併與優先順序](https://dev.opencode.ai/docs/config/)，處理機密資料前仍要用 `opencode debug config` 檢查最終設定，並盤點已安裝 plugin。
 
 兩個此模式的副作用/防線要知道:
 
-- OpenCode 此模式改從全域設定目錄解析相對 instructions,不讀專案內檔案,所以 [lessons](lessons.md) 該 session **不會注入** —— `aicode` 啟動輸出會明講,並清掉先前 render 殘留的 `.codetrail/lessons.md`,不會謊報「已注入」。(OpenCode 對這個 env 是「非空即真」,`=0` 也算開啟。)
-- 不信任 repo 可能把 `.codetrail` 換成指向專案外的 symlink/junction,誘導 lessons render 把檔案寫出沙箱;`aicode` 啟動時偵測到會直接拒絕啟動,一個 byte 都不寫。
+- OpenCode 此模式改從全域設定目錄解析相對 instructions,不讀專案內檔案,所以 [lessons](lessons.md) 該 session **不會注入** —— `aicode_opencode` 啟動輸出會明講,並清掉先前 render 殘留的 `.codetrail/lessons.md`,不會謊報「已注入」。(OpenCode 對這個 env 是「非空即真」,`=0` 也算開啟。)
+- 不信任 repo 可能把 `.codetrail` 換成指向專案外的 symlink/junction,誘導 lessons render 把檔案寫出沙箱;`aicode_opencode` 啟動時偵測到會直接拒絕啟動,一個 byte 都不寫。
 
 ---
 
 ## OpenCode direct-tool 相容閘
 
 CodeTrail 目前只支援 OpenCode `>=1.17.0,<2.0.0` 的 direct `codetrail_*` native MCP
-tools。`aicode`／`aicode web` 在產生 project wrapper、執行任何 `--fix` writer、啟動 MCP
+tools。`aicode_opencode`／`aicode_opencode web` 在產生 project wrapper、執行任何 `--fix` writer、啟動 MCP
 或模型前，先讀 `opencode --version` 與 `opencode debug config`；版本無法唯一解析、超出
 範圍，或 effective config 出現 V2-only 的 `mcp.servers`／任何 `codemode` 鍵，都會
-fail-loud。`aicode attach` 是只連既有 backend 的薄 client，不重跑 backend gate。
+fail-loud。`aicode_opencode attach` 是只連既有 backend 的薄 client，不重跑 backend gate。
 
 OpenCode V2 改用 `mcp.servers.codetrail`，而 `codemode:false`、`disabled` 與 execution
 timeout 的語意也不同。Code Mode 又會把 direct tools 收成單一 `execute`。這些都不能用
@@ -103,7 +103,7 @@ routing A/B 不足以改 permission 或宣稱模型組合 supported。完整內�
 預設不能讀專案外路徑。要匯入 `~/Downloads` 或 `/tmp` 的 log / 截圖 / spec,啟動時才打開:
 
 ```bash
-AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
+AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode_opencode
 ```
 
 若要指定來源白名單:
@@ -111,7 +111,7 @@ AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
 ```bash
 AI_CODE_ALLOW_EXTERNAL_IMPORT=1 \
 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/specs" \
-aicode
+aicode_opencode
 ```
 
 匯入後檔案會複製到專案底下 `.aicode_uploads/`。白名單應只放實際需要的最窄目錄；
@@ -134,11 +134,11 @@ aicode
 `record_lesson(...)` 是唯一會寫到 `AICODE_ROOT` 之外的工具,而且只寫一個固定路徑:`~/.config/codetrail/lessons.json`(per-deployment 的行為教訓 store,與 `deployment.json` 同層;不能被模型指到別的路徑)。它被 permission 設成 `ask`:模型只能「提案」,你會在核准框看到完整 rule 內容,核准後才落地。沒有無審核的自動寫入路徑;細節見 [docs/lessons.md](lessons.md)。
 
 升級防護：舊安裝 `git pull` 後，舊 opencode.json 的 `codetrail_*: allow` wildcard 會放行
-還沒有 ask 覆寫的新工具。direct-tool 相容閘通過後，`aicode` 才會用
+還沒有 ask 覆寫的新工具。direct-tool 相容閘通過後，`aicode_opencode` 才會用
 `scripts/opencode_contract_check.py --fix` 原子補上缺少的 ask 核准閘、lessons
 instructions，並只同步已明確 opt-in 的舊受管 build prompt reference；缺少 prompt 維持現況，
 明確自訂值與備份都保留。prompt artifact 和 config 任一步寫失敗都一起 rollback。不經
-`aicode` 直接開 `opencode` 的話，
+`aicode_opencode` 直接開 `opencode` 的話，
 請先重跑 `./set_config.sh`。
 
 tool canary 的 explicit hard gate 與 implicit diagnostic 分開使用 cache schema 2。cache 只存
@@ -200,9 +200,9 @@ web 工具、plugin 或其他 process 不會自動繼承 CodeTrail 的 endpoint 
 
 ## Web 模式曝光面
 
-`aicode web` 預設只綁 `127.0.0.1`。A/B 機跨機器使用時推薦 `aicode_web`:它每次向本機 `tailscale ip -4` 取值,只綁該 `100.64.0.0/10` virtual interface，絕不綁 `0.0.0.0`。A 機可完全沒有 GUI，B 機開 launcher 印出的 `http://100.x.y.z:4096/` 即可；HTTP 封包仍包在 Tailscale 的加密 tunnel 內。
+`aicode_opencode web` 預設只綁 `127.0.0.1`。A/B 機跨機器使用時推薦 `aicode_opencode_web`:它每次向本機 `tailscale ip -4` 取值,只綁該 `100.64.0.0/10` virtual interface，絕不綁 `0.0.0.0`。A 機可完全沒有 GUI，B 機開 launcher 印出的 `http://100.x.y.z:4096/` 即可；HTTP 封包仍包在 Tailscale 的加密 tunnel 內。
 
-`aicode_web` 沒有應用層密碼,因此 **tailnet ACL 是存取邊界**；共享 / 多人 tailnet 應限制哪些裝置或使用者能連 A 機的 4096 port。wrapper 傳入值、hostname、Tailscale CLI 當下 IP 只要有一項不一致就拒絕。普通 `aicode web` 若刻意綁 LAN IP / `0.0.0.0` 或開 `--mdns`,仍必須先設定 `OPENCODE_SERVER_PASSWORD`。
+`aicode_opencode_web` 沒有應用層密碼,因此 **tailnet ACL 是存取邊界**；共享 / 多人 tailnet 應限制哪些裝置或使用者能連 A 機的 4096 port。wrapper 傳入值、hostname、Tailscale CLI 當下 IP 只要有一項不一致就拒絕。普通 `aicode_opencode web` 若刻意綁 LAN IP / `0.0.0.0` 或開 `--mdns`,仍必須先設定 `OPENCODE_SERVER_PASSWORD`。
 
 不要用 `tailscale funnel`,因為它會把 OpenCode web backend 暴露到公網。想維持純 loopback 也可使用 SSH port-forward；這兩條都不會放寬 CodeTrail MCP sandbox。
 
@@ -210,7 +210,7 @@ web 工具、plugin 或其他 process 不會自動繼承 CodeTrail 的 endpoint 
 
 ## 快速檢查表
 
-- 從具體專案目錄跑 `aicode` / `aicode_web`,不要從 `$HOME` 或 `/`。
+- 從具體專案目錄跑 `aicode_opencode` / `aicode_opencode_web`,不要從 `$HOME` 或 `/`。
 - `/status` 看到 `codetrail Connected` 後再開始工作。
 - 確認啟動前有 `[direct-contract] PASS` 與 `MCP PASS — 19 tools + list_dir round-trip`；
   implicit 非 optimal 只代表 routing 診斷警告，explicit／direct failure 則會拒絕啟動。

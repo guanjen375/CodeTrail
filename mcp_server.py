@@ -7,7 +7,7 @@ ai_code MCP server — 把 KnowledgeBase / CodeRAG / agent_tools 包成 MCP tool
 啟動:
     AICODE_ROOT=/path/to/project python3 mcp_server.py
 
-一般使用者不要直接跑這個檔案；請從專案目錄執行 `aicode`,
+一般使用者不要直接跑這個檔案；請從專案目錄執行 `aicode_opencode`,
 由 OpenCode 透過 stdio 啟動 MCP server。
 """
 
@@ -183,7 +183,7 @@ set_sandbox_root(AICODE_ROOT, allow_external=False)
 _log(f"[MCP] AICODE_ROOT = {AICODE_ROOT}")
 
 # fail-loud: CodeTrail 不內建主聊天模型, 沒設好就直接退出, 避免 silent 跑到底
-# 才在 llama-server 那邊 404。aicode wrapper 已經做過一次解析 + export, 走到這裡
+# 才在 llama-server 那邊 404。aicode_opencode wrapper 已經做過一次解析 + export, 走到這裡
 # 還是空表示使用者繞過了 wrapper (例如手動 spawn MCP 子行程)。
 try:
     _resolved_main_model = config.require_main_model()
@@ -2944,7 +2944,7 @@ def record_lesson(
     這是「提案」:permission 設為 ask,使用者在核准對話框看到 rule 內容、
     同意後才寫入 per-deployment 的 ~/.config/codetrail/lessons.json。被拒絕
     就放下,不要換句話重試。寫入後於下一個 session 起注入 context
-    (aicode 啟動時 render 進 .codetrail/lessons.md);本 session 請直接遵守。
+    (aicode_opencode 啟動時 render 進 .codetrail/lessons.md);本 session 請直接遵守。
     每條 lesson 有 90 天 review_by,到期停止注入、待使用者複審;active 上限
     20 條,滿了會拒絕並要求人工整併。
 

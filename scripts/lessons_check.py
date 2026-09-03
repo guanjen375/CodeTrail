@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""session start 的 lessons 注入 + 複審提示(aicode preflight 用)。
+"""session start 的 lessons 注入 + 複審提示(aicode_opencode preflight 用)。
 
 做三件事:
   1. 載入 per-deployment 的 lessons store(~/.config/codetrail/lessons.json)。
@@ -11,7 +11,7 @@
   3. 已過 review_by 的 lessons 停止注入,並在這裡醒目列出待複審清單
      (renew / delete 指令)。
 
-呼叫方式 (aicode wrapper 用):
+呼叫方式 (aicode_opencode wrapper 用):
     python3 scripts/lessons_check.py --root /path/to/project
 
 讀取的環境變數:
@@ -110,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
     except lessons.LessonsError as exc:
         _print(f"lessons store 損壞,refuse to start: {exc}")
         _print(f"store 路徑: 見 ${lessons.LESSONS_FILE_ENV} 或 ~/.config/codetrail/lessons.json")
-        _print("緊急跳過(本 session 不注入): AICODE_LESSONS_SKIP=1 aicode")
+        _print("緊急跳過(本 session 不注入): AICODE_LESSONS_SKIP=1 aicode_opencode")
         return 2
 
     today = lessons.today_local()
@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             "refuse to start。"
         )
         _print("請人工整併:python3 lessons.py list 檢視,delete 或合併到剩餘條數 ≤ 上限。")
-        _print("緊急跳過(本 session 不注入): AICODE_LESSONS_SKIP=1 aicode")
+        _print("緊急跳過(本 session 不注入): AICODE_LESSONS_SKIP=1 aicode_opencode")
         return 2
 
     try:

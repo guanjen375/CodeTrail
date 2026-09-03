@@ -3,7 +3,7 @@
 
 OpenCode keeps the frontend chat budget in opencode.json as
 provider.<key>.models.<model>.limit.context. CodeTrail's own MCP/native LLM
-budget follows the main llama-server's real n_ctx. ``aicode`` transports that
+budget follows the main llama-server's real n_ctx. ``aicode_opencode`` transports that
 single value as AICODE_N_CTX and safely synchronizes this mirror before opening
 the TUI.
 """
@@ -47,7 +47,7 @@ class OpenCodeContextLimit:
 def n_ctx_from_env(env: Mapping[str, str] | None = None) -> int:
     """Resolve the main n_ctx the same way config.py does.
 
-    Without AICODE_N_CTX (standalone diagnostics, aicode's server-unreachable
+    Without AICODE_N_CTX (standalone diagnostics, aicode_opencode's server-unreachable
     path) the answer must come from the deployment profile's main.ctx — not a
     hardcoded default — or the check would contradict what set_config wrote.
     Raises ValueError (incl. ProfileError) on invalid settings; callers stay
@@ -142,7 +142,7 @@ def resolve_active_opencode_context_limit(
 ) -> OpenCodeContextLimit:
     """Return limit.context for the OpenCode model that will be active.
 
-    CLI -m/--model wins for model identity because aicode forwards it to
+    CLI -m/--model wins for model identity because aicode_opencode forwards it to
     OpenCode. Without CLI, opencode.json's top-level "model" is the active
     model. Missing config or missing limit.context is not an error here; callers
     decide whether to warn or skip.

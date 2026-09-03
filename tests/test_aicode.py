@@ -1,10 +1,10 @@
-"""`aicode` wrapper 的離線 CLI 契約:MCP wrapper 生成、舊設定自動修復、--model 轉發,
-以及 `aicode attach` / `aicode web` 子指令(存取控制與參數轉發)。
+"""`aicode_opencode` wrapper 的離線 CLI 契約:MCP wrapper 生成、舊設定自動修復、--model 轉發,
+以及 `aicode_opencode attach` / `aicode_opencode web` 子指令(存取控制與參數轉發)。
 
 合併自 tests/test_aicode_wrapper.py、tests/test_aicode_attach.py、
 tests/test_aicode_web_access.py、tests/test_aicode_web_forwarding.py(2026-09-02)。
 這四份原本都是 2026-08-20 從 test_cli.py / test_aicode_web.py 拆出來的:當時
-test_cli.py 43 條 14.07s 是全套件最慢的單檔,每條測試都真的跑一次 aicode preflight
+test_cli.py 43 條 14.07s 是全套件最慢的單檔,每條測試都真的跑一次 aicode_opencode preflight
 (約 0.4s),拆檔是為了讓分片能同時吃。行為與 assertion 未變;近似重複的案例改成
 parametrize。
 
@@ -40,10 +40,10 @@ from tests._harness import (
 
 
 def test_aicode_prepares_opencode_mcp_wrapper(tmp_path):
-    """`aicode` should create the local MCP wrapper expected by opencode.json."""
+    """`aicode_opencode` should create the local MCP wrapper expected by opencode.json."""
     require_git()
     bash = require_working_bash()
-    aicode_script = bash_compatible_path(bash, REPO_ROOT / "aicode")
+    aicode_script = bash_compatible_path(bash, REPO_ROOT / "aicode_opencode")
 
     project = tmp_path / "project"
     project.mkdir()
@@ -74,7 +74,7 @@ def test_aicode_prepares_opencode_mcp_wrapper(tmp_path):
         "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
         "PYTHONIOENCODING": "utf-8",
         "AICODE_N_CTX": OFFLINE_CTX,
-        # aicode 啟動會跑 ctx 安全閘,在 CI / 沒 GPU / inherited AICODE_MODEL
+        # aicode_opencode 啟動會跑 ctx 安全閘,在 CI / 沒 GPU / inherited AICODE_MODEL
         # 的環境下會 refuse to start。這個 smoke test 只關心 MCP wrapper
         # 生成,不該被安全閘擋下。
         "AICODE_CTX_SAFETY_DISABLE": "1",
@@ -128,7 +128,7 @@ def test_aicode_refuses_experimental_opencode_code_mode(tmp_path):
 
 
 def test_aicode_repairs_short_codetrail_timeout_before_starting_opencode(tmp_path):
-    """更新 repo 後直接跑 aicode:舊的 10 秒 timeout 要在 client 啟動前修好,
+    """更新 repo 後直接跑 aicode_opencode:舊的 10 秒 timeout 要在 client 啟動前修好,
     契約遷移(opencode_contract_check)也要接著補上寫入工具的 ask 核准閘與
     lessons instructions —— 這是舊安裝 git pull 後的無感升級路徑。"""
     config_path = tmp_path / "opencode.json"
@@ -191,7 +191,7 @@ def test_aicode_repairs_short_codetrail_timeout_before_starting_opencode(tmp_pat
     ],
 )
 def test_aicode_passes_through_model_arg(tmp_path, args, env_extra, expected):
-    """新版 aicode 不再強加 provider prefix,使用者傳什麼就轉發什麼。
+    """新版 aicode_opencode 不再強加 provider prefix,使用者傳什麼就轉發什麼。
 
     - bare:`--model bare-model` 原樣轉發。
     - custom_provider:自定 provider(例如 llamacpp/foo)原樣轉發給 OpenCode;
@@ -239,7 +239,7 @@ def test_aicode_env_and_cli_model_conflict_fails_loud(tmp_path):
 
 
 def test_direct_contract_gate_precedes_launcher_writers_and_canaries():
-    source = (REPO_ROOT / "aicode").read_text(encoding="utf-8")
+    source = (REPO_ROOT / "aicode_opencode").read_text(encoding="utf-8")
     # 這一行同時是「相容性閘」與「把量到的 OpenCode 版本交給壓縮 plugin」的
     # 唯一入口(--print-version-env)。順序契約不變:任何 writer / canary 之前。
     gate = source.index(
@@ -263,13 +263,13 @@ def test_launch_delay_is_read_as_base_ten(value, expected):
 
     `AICODE_LAUNCH_DELAY=08` 通得過 `[ "$x" -gt 0 ]`(test 用的是另一個
     parser),下一行 `$((launch_delay - 1))` 卻以 "value too great for base"
-    失敗 —— 而 aicode 是 `set -e`,於是 wrapper 在 `exec opencode` 之前就結束:
+    失敗 —— 而 aicode_opencode 是 `set -e`,於是 wrapper 在 `exec opencode` 之前就結束:
     使用者只看到倒數的第一行,然後沒有 TUI。`010` 不會爆,但倒數 8 秒。
 
-    這裡直接跑 `aicode` 裡那段正規化,不抄一份。
+    這裡直接跑 `aicode_opencode` 裡那段正規化,不抄一份。
     """
     bash = require_working_bash()
-    source = (REPO_ROOT / "aicode").read_text(encoding="utf-8")
+    source = (REPO_ROOT / "aicode_opencode").read_text(encoding="utf-8")
     start = source.index('launch_delay="${AICODE_LAUNCH_DELAY:-3}"')
     snippet = source[start:source.index("esac", start) + len("esac")]
     proc = subprocess.run(
@@ -281,9 +281,9 @@ def test_launch_delay_is_read_as_base_ten(value, expected):
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.split() == [str(expected), str(expected - 1)]
 
-# ── 原 test_aicode_attach.py:`aicode attach` 子指令,以及沒有子指令時不得誤觸 web/attach ──
+# ── 原 test_aicode_attach.py:`aicode_opencode attach` 子指令,以及沒有子指令時不得誤觸 web/attach ──
 
-# ---- aicode attach -------------------------------------------------------
+# ---- aicode_opencode attach -------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -354,7 +354,7 @@ def test_aicode_non_subcommand_first_arg_forwarded_verbatim(tmp_path):
     assert read_stub_args(args_file) == ["somedir"]
 
 
-# ── 原 test_aicode_web_access.py:aicode web 的存取控制 ──
+# ── 原 test_aicode_web_access.py:aicode_opencode web 的存取控制 ──
 
 
 @pytest.mark.parametrize(
@@ -365,7 +365,7 @@ def test_aicode_non_subcommand_first_arg_forwarded_verbatim(tmp_path):
     ],
 )
 def test_aicode_web_rejects_unsafe_root(tmp_path, aicode_root, needle):
-    """spec E.1:aicode web 從 /(root_slash)或 $HOME(home_root)啟動被拒
+    """spec E.1:aicode_opencode web 從 /(root_slash)或 $HOME(home_root)啟動被拒
     (沿用既有沙箱 root 檢查)。"""
     result, args_file = run_aicode_subcmd_with_stub(
         tmp_path, ["web"], env_extra={"AICODE_ROOT": aicode_root}
@@ -398,7 +398,7 @@ def test_aicode_web_non_local_hostname_with_password_allowed(tmp_path):
     assert contains_subsequence(args, ["--hostname", "0.0.0.0"])
 
 def test_aicode_web_verified_tailscale_ip_without_password_allowed(tmp_path):
-    """aicode_web 的窄例外:env、hostname、tailscale CLI 三者完全一致才放行。"""
+    """aicode_opencode_web 的窄例外:env、hostname、tailscale CLI 三者完全一致才放行。"""
     result, args_file = run_aicode_subcmd_with_stub(
         tmp_path,
         ["web", "--hostname", "100.100.10.20"],
@@ -460,11 +460,11 @@ def test_aicode_web_localhost_hostname_allowed_without_password(tmp_path):
     assert contains_subsequence(read_stub_args(args_file), ["--hostname", "localhost"])
 
 
-# ── 原 test_aicode_web_forwarding.py:aicode web 的參數轉發 ──
+# ── 原 test_aicode_web_forwarding.py:aicode_opencode web 的參數轉發 ──
 
 
 def test_aicode_web_default_port_and_hostname(tmp_path):
-    """`aicode web` 注入固定 port 4096 + loopback hostname,並沿用既有前置(備好 MCP launcher)。"""
+    """`aicode_opencode web` 注入固定 port 4096 + loopback hostname,並沿用既有前置(備好 MCP launcher)。"""
     result, args_file = run_aicode_subcmd_with_stub(tmp_path, ["web"])
 
     assert result.returncode == 0, f"exit={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
@@ -507,7 +507,7 @@ def test_aicode_web_missing_port_value_fails(tmp_path):
     [pytest.param(["web"], id="web"), pytest.param([], id="tui")],
 )
 def test_aicode_preflight_only_exits_before_exec(tmp_path, args):
-    """AICODE_PREFLIGHT_ONLY=1(aicode_web 前景預檢用):跑完全部前置後退出,不 exec OpenCode。
+    """AICODE_PREFLIGHT_ONLY=1(aicode_opencode_web 前景預檢用):跑完全部前置後退出,不 exec OpenCode。
     web 路徑與 standalone TUI 路徑(tui)都要在 exec 之前退出。"""
     result, args_file = run_aicode_subcmd_with_stub(
         tmp_path, args, env_extra={"AICODE_PREFLIGHT_ONLY": "1"}

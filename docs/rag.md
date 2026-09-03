@@ -11,7 +11,7 @@ CodeTrail 啟動聊天 frontend 前會硬性檢查 llama-server `:8081` (embeddi
 
 ## 重點教學
 
-啟動 aicode 進到對話之後，最常碰到兩件事：
+啟動 aicode_opencode 進到對話之後，最常碰到兩件事：
 
 1. 有一張錯誤截圖／一份韌體 binary／一段 log，想讓對話幫忙看。
 2. 有一份產品規格書／datasheet／設計手冊，想讓之後對話遇到相關問題時答得準。
@@ -62,17 +62,17 @@ tool-call 能力，不是 RAG 本身。[OpenCode 全域 AGENTS.md 範本](openco
 
 ```bash
 # 只用預設來源 (~/Downloads + /tmp)
-AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
+AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode_opencode
 
 # 保留預設 + 加一個自己的目錄
 AI_CODE_ALLOW_EXTERNAL_IMPORT=1 \
 AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot" \
-aicode
+aicode_opencode
 
 # 只開一個專用交換目錄（比放寬整個 home 安全）
 AI_CODE_ALLOW_EXTERNAL_IMPORT=1 \
 AI_CODE_IMPORT_ROOTS="$HOME/codetrail-import" \
-aicode
+aicode_opencode
 ```
 
 多個目錄用冒號分隔（跟 `$PATH` 一樣）。如果每次都用同一組設定，加進 `~/.bashrc` 就不用每次帶：
@@ -578,7 +578,7 @@ confirm_against_image 設 True。
 python3 RAG.py rebuild --kb knowledge.json spec_a.pdf --context
 
 # 查詢時使用（也是緊急關閉開關，關掉不需要重建知識庫）
-AICODE_KB_CONTEXT_USE=1 aicode
+AICODE_KB_CONTEXT_USE=1 aicode_opencode
 ```
 
 要知道的三件事：

@@ -1,9 +1,9 @@
-"""測試共用 harness：aicode wrapper / MCP server / patch runner 的重型 fixture。
+"""測試共用 harness：aicode_opencode wrapper / MCP server / patch runner 的重型 fixture。
 
 不是 test module(檔名不符 `test_*.py`),pytest 不會 collect。
 放在這裡的東西只有一個標準:同一段 setup 被兩個以上 test module 需要。
 
-`aicode` 每次啟動要連開約 10 個 python 子行程(preflight),單次約 0.37s。
+`aicode_opencode` 每次啟動要連開約 10 個 python 子行程(preflight),單次約 0.37s。
 測試無法避開那個成本,但可以避開「每條測試重新探測一次 bash / git」——
 所以 probe 一律 lru_cache 到整個 pytest 行程。
 """
@@ -31,12 +31,12 @@ OFFLINE_CTX = "65536"
 def _probe_bash() -> tuple[str | None, str]:
     """探測一次可用的 bash;回傳 (path, skip 理由)。
 
-    原本每條 aicode 測試都跑一次 `bash -lc true`(login shell,約 35ms)。
+    原本每條 aicode_opencode 測試都跑一次 `bash -lc true`(login shell,約 35ms)。
     行為完全相同,只是整個行程共用同一次探測結果。
     """
     bash = shutil.which("bash")
     if not bash:
-        return None, "bash is required for the aicode wrapper tests"
+        return None, "bash is required for the aicode_opencode wrapper tests"
     probe = subprocess.run(
         [bash, "-lc", "true"],
         capture_output=True,
@@ -56,7 +56,7 @@ def _probe_git() -> str | None:
 
 def require_git() -> None:
     if not _probe_git():
-        pytest.skip("git is required for the aicode wrapper tests")
+        pytest.skip("git is required for the aicode_opencode wrapper tests")
 
 
 def require_working_bash() -> str:
@@ -88,7 +88,7 @@ def run_aicode_with_stub(
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     require_git()
     bash = require_working_bash()
-    aicode_script = bash_compatible_path(bash, REPO_ROOT / "aicode")
+    aicode_script = bash_compatible_path(bash, REPO_ROOT / "aicode_opencode")
 
     project = tmp_path / "project"
     project.mkdir()
@@ -168,7 +168,7 @@ def contains_subsequence(items: list[str], expected: list[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# aicode web / aicode attach 子指令
+# aicode_opencode web / aicode_opencode attach 子指令
 # ---------------------------------------------------------------------------
 
 # web-capable opencode:`web --help` 印出 web 指令自己的 synopsis 行並 exit 0;
@@ -222,7 +222,7 @@ def run_aicode_subcmd_with_stub(
     set_model: bool = True,
     tailscale_ip: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
-    """跑 `aicode <args>`,用可注入的 opencode stub。回傳 (result, args_file)。
+    """跑 `aicode_opencode <args>`,用可注入的 opencode stub。回傳 (result, args_file)。
 
     跟 `run_aicode_with_stub` 不同處:預設會設好 AICODE_MODEL(web 路徑沿用模型
     解析,沒設會 fail),並允許注入 opencode stub 與 OPENCODE_SERVER_PASSWORD /
@@ -230,7 +230,7 @@ def run_aicode_subcmd_with_stub(
     """
     require_git()
     bash = require_working_bash()
-    aicode_script = bash_compatible_path(bash, REPO_ROOT / "aicode")
+    aicode_script = bash_compatible_path(bash, REPO_ROOT / "aicode_opencode")
 
     project = tmp_path / "project"
     project.mkdir()

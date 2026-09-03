@@ -2,7 +2,7 @@
 """Mine private OpenCode sessions and run evidence-first model comparisons.
 
 This is a manual, explicitly authorised eval lane.  It is not part of pytest,
-CI, ``aicode`` startup, or the checked-in NDA-safe fixtures under ``eval/``.
+CI, ``aicode_opencode`` startup, or the checked-in NDA-safe fixtures under ``eval/``.
 """
 from __future__ import annotations
 

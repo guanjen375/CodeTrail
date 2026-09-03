@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """啟動前的 ctx 容量閘:讀 llama-server 真實 n_ctx,確認 CodeTrail 使用的 n_ctx
-不會「超過」它。正常情況下 aicode 已經用 scripts/resolve_server_ctx.py 把 server
+不會「超過」它。正常情況下 aicode_opencode 已經用 scripts/resolve_server_ctx.py 把 server
 n_ctx 自動帶進 AICODE_N_CTX,所以這裡幾乎都是 requested == server、
 直接放行;這道閘真正擋的是「設定值比 server 實值還大」:requested >
 server n_ctx → UNSAFE (prompt 會被截斷) → refuse to start。
 requested <= server n_ctx 一律 SAFE 放行 ——「小於」不是安全問題,不再擋。
 
-呼叫方式 (aicode wrapper 用):
+呼叫方式 (aicode_opencode wrapper 用):
     python3 scripts/ctx_safety_check.py
 
 讀取的環境變數:
-    AICODE_MODEL                  必填;aicode wrapper 會用 resolve_main_model.py
+    AICODE_MODEL                  必填;aicode_opencode wrapper 會用 resolve_main_model.py
                                   解析好以後再 export。沒設 → 直接 fail-loud,
                                   CodeTrail 不假定任何預設主模型。
-    AICODE_N_CTX                  主模型 n_ctx;正常由 aicode 自動帶入 server 實值
+    AICODE_N_CTX                  主模型 n_ctx;正常由 aicode_opencode 自動帶入 server 實值
     AICODE_LLAMA_BASE_URL         主 llama-server URL;預設 http://localhost:8080
     AICODE_ACCEPT_CTX_RISK        =1 時即使 UNSAFE 也 exit 0 (使用者覆蓋)
     AICODE_CTX_SAFETY_DISABLE     =1 時整個檢查跳過 (除錯 / 緊急逃生)
@@ -67,7 +67,7 @@ def main() -> int:
         _print("        CodeTrail 不內建預設主模型, 無法做 ctx 安全檢查。")
         _print("        請啟動 llama-server (建議 port 8080) 並設定:")
         _print("          export AICODE_MODEL=<MODEL>  # registry name 或 GGUF 路徑")
-        _print("        或透過 aicode wrapper 自動解析 (aicode 會讀 opencode.json 主模型)。")
+        _print("        或透過 aicode_opencode wrapper 自動解析 (aicode_opencode 會讀 opencode.json 主模型)。")
         _print("        若刻意要跳過檢查 (例如 CI), 設 AICODE_CTX_SAFETY_DISABLE=1。")
         _print("refuse to start.")
         return 2
@@ -97,7 +97,7 @@ def main() -> int:
 
     # check_safety 的 SAFE 保證 requested <= server n_ctx。CodeTrail 只擋「超過」
     # (會截斷 prompt);requested < server 不是安全問題(只是沒用滿 server 容量),
-    # 一律放行。正常情況下 aicode 已把 server n_ctx 自動帶進 requested,所以這裡
+    # 一律放行。正常情況下 aicode_opencode 已把 server n_ctx 自動帶進 requested,所以這裡
     # 多半是 requested == server。
     if verdict.status == "SAFE":
         _print(

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check or repair the CodeTrail-managed contract fields in OpenCode config.
 
-舊安裝 ``git pull`` 之後,mcp_server 立刻暴露新工具、aicode 開始 render
+舊安裝 ``git pull`` 之後,mcp_server 立刻暴露新工具、aicode_opencode 開始 render
 lessons 注入檔,但全域 opencode.json 還停在舊範本,產生三個升級破口:
 
   1. permission 缺新工具的 ask 覆寫 → 舊的 ``codetrail_*: allow`` wildcard
@@ -19,7 +19,7 @@ lessons 注入檔,但全域 opencode.json 還停在舊範本,產生三個升級�
      文字裡,TUI 不會跳任何東西;模型說「我來呼叫工具」卻沒真的呼叫時也沒人
      歸因。註冊的是本 repo 的絕對路徑,所以 repo 搬家要換掉舊那一筆。
 
-``aicode`` 每次啟動用 ``--fix`` 呼叫這裡,比照 opencode_mcp_timeout_check:
+``aicode_opencode`` 每次啟動用 ``--fix`` 呼叫這裡,比照 opencode_mcp_timeout_check:
 只在既有 mcp.codetrail 設定存在時動作(那是「這份 config 由 CodeTrail 管」
 的訊號)、只補「缺少」的鍵 —— 使用者明確設過的值一律尊重、只警告 ——
 原子寫入並保留備份。要整組重建請重跑 ./set_config.sh。
@@ -90,7 +90,7 @@ NOTIFY_PLUGIN_SKIP_ENV = "AICODE_NOTIFY_PLUGIN_SKIP"
 
 # 壓縮 plugin 的註冊**不是**無條件的:它只在使用者用 ./set_config.sh 明確選了
 # codetrail / manual 時才該存在(那份選擇記在 ~/.config/codetrail/compaction.json)。
-# 沿用通知 plugin 的「缺就補」會讓切回 native 之後,下一次 aicode 啟動又把它補
+# 沿用通知 plugin 的「缺就補」會讓切回 native 之後,下一次 aicode_opencode 啟動又把它補
 # 回去 —— 使用者以為關掉了,實際上沒有。
 COMPACTION_PLUGIN_NAME = compaction_mode.PLUGIN_FILENAME
 COMPACTION_PLUGIN_PATH = compaction_mode.PLUGIN_PATH
@@ -251,7 +251,7 @@ def _handle_agents_md(args: argparse.Namespace, config_path: Path) -> int:
     """檢查 / 安裝 / 同步全域 AGENTS.md。
 
     **回傳非零只有一種情況:使用者明確下了 ``--sync-agents-md`` 而寫入失敗。**
-    漂移一律只是警告 —— ``aicode`` 對非零 rc 是硬退出,把「使用者自訂過
+    漂移一律只是警告 —— ``aicode_opencode`` 對非零 rc 是硬退出,把「使用者自訂過
     AGENTS.md」變成開不了 OpenCode 是不能接受的。
     """
     if _truthy(os.environ.get(AGENTS_MD_SKIP_ENV)):
@@ -261,11 +261,11 @@ def _handle_agents_md(args: argparse.Namespace, config_path: Path) -> int:
             AGENTS_TEMPLATE_DOC.read_text(encoding="utf-8")
         )
     # UnicodeDecodeError 繼承 ValueError 而**不是** OSError:漏接的話,
-    # 一個非 UTF-8 的檔案就會讓這支 preflight 拋例外回非零,aicode 隨即硬退出。
+    # 一個非 UTF-8 的檔案就會讓這支 preflight 拋例外回非零,aicode_opencode 隨即硬退出。
     except (OSError, UnicodeError, AgentsTemplateError) as exc:
         label = "SYNC_FAILED" if args.sync_agents_md else "UNKNOWN"
         _print(f"{label}: 讀不到全域 AGENTS.md 範本({type(exc).__name__}: {exc});跳過該項檢查")
-        # 一般 aicode --fix 啟動路徑仍不能因範本問題卡死；但使用者明確要求
+        # 一般 aicode_opencode --fix 啟動路徑仍不能因範本問題卡死；但使用者明確要求
         # --sync-agents-md 時，回 0 會製造「已同步」的假象，必須 fail-loud。
         return 2 if args.sync_agents_md else 0
 
@@ -977,7 +977,7 @@ def main(argv: list[str] | None = None) -> int:
         for item in prompt_artifact_changes:
             _print(f"MISSING: {item}")
         _print("           執行本腳本 --fix 自動補上(有備份),或重跑 ./set_config.sh。")
-        _print(f"           緊急跳過(不建議): {SKIP_ENV}=1 aicode")
+        _print(f"           緊急跳過(不建議): {SKIP_ENV}=1 aicode_opencode")
         return 2
 
     # 狀態檔與 config 必須**一起**成立,所以先寫 state、config 失敗就回滾。

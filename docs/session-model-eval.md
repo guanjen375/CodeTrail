@@ -1,7 +1,7 @@
 # 用真實 OpenCode session 比較主聊天模型
 
 這條 lane 回答的是：「哪顆本地模型比較能完成我的真實工作？」它不把任何歷史
-assistant 回答當成標準答案，也不會在 `aicode` 啟動或 CI 中自動執行。
+assistant 回答當成標準答案，也不會在 `aicode_opencode` 啟動或 CI 中自動執行。
 
 ## 資料與評分原則
 

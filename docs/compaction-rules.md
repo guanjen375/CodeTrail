@@ -33,7 +33,7 @@ CodeTrail 對 OpenCode 自動壓縮（compaction）的處理分成三種模式�
 
 `./set_config.sh` 的第 5 題 **沒有預設值**（跟其他使用者選擇題一樣，Enter 不能過關）——
 顯式選擇本身就是「授權 CodeTrail 接管這幾個欄位」的那個動作。`codetrail` 只是第一個
-選項,不是預設值——它與 `manual` 都還在測試階段(問答與 `aicode` 啟動橫幅都會標 🧪)。
+選項,不是預設值——它與 `manual` 都還在測試階段(問答與 `aicode_opencode` 啟動橫幅都會標 🧪)。
 非互動用 `--compaction-mode`；`--yes` 沒給它時沿用狀態檔記錄的既有選擇，還沒選過就
 完全不碰壓縮設定。
 
@@ -342,16 +342,16 @@ session、最後一則助理訊息出錯或被中斷、最新一則真實使用�
 
 **版本從哪裡來**：公開的 plugin / SDK API 沒有任何欄位是「目前正在跑的版本」——只有
 `Session.version`，而那是那個 session **被建立時** 寫進去的版本，升級後恢復舊 session 會
-被誤判成太舊，降級則會誤判成通過。所以版本由 `aicode` 的 preflight
+被誤判成太舊，降級則會誤判成通過。所以版本由 `aicode_opencode` 的 preflight
 （`scripts/opencode_direct_contract.py`，唯一讀得到 `opencode --version` 的地方）量好，
 用 `AICODE_OPENCODE_VERSION` 傳給 OpenCode 行程，plugin 讀它決定要不要停用。
 
 版本不足時：preflight 印一行 WARN 並記一筆 `compaction_stopped/version_unsupported` 的
 零內容 incident（`python3 scripts/doctor.py` 看得到），plugin 那端則 **完全停用自動壓縮**
-並在 TUI 跳一次錯誤 toast。`aicode` 本身照常啟動——CodeTrail 其餘功能在 1.17.0 以上都正常，
+並在 TUI 跳一次錯誤 toast。`aicode_opencode` 本身照常啟動——CodeTrail 其餘功能在 1.17.0 以上都正常，
 沒有理由因為壓縮把整個工具擋掉。
 
-代價寫清楚：**不經 `aicode`、直接跑 `opencode` 的 session 量不到版本，也就沒有這道閘**
+代價寫清楚：**不經 `aicode_opencode`、直接跑 `opencode` 的 session 量不到版本，也就沒有這道閘**
 （`AICODE_OPENCODE_VERSION` 不存在時 plugin 不做版本判斷）。這跟 CodeTrail 其他 preflight
 （direct-contract、ctx-safety、tool canary）的邊界一致：那條路徑本來就沒有任何 preflight。
 
@@ -381,7 +381,7 @@ plugin 掛在 `experimental.chat.messages.transform`（上游在每次呼叫模�
 
 1. **偏離模型官方行為**。DeepSeek-V4 的 encoder 在有 tools 時是刻意全留的，丟掉它是
    模型相依的品質賭注。`CODETRAIL_KEEP_REASONING=1`（環境變數）可以單獨關掉這一項，
-   不必連結構化壓縮一起切回 `native`。`aicode` 啟動橫幅會顯示目前在哪一邊。
+   不必連結構化壓縮一起切回 `native`。`aicode_opencode` 啟動橫幅會顯示目前在哪一邊。
 2. **每個新問題多一次 prefill**。改動歷史等於改動 prompt 前綴，下一輪的快取會在「上一輪
    第一則 assistant」處失效，要重算上一輪的非 reasoning 內容（工具輸入輸出與回答）。
    實測那段對話單輪工具輸出 400–25,000 字元，換算約 0.5–30 秒。
@@ -413,7 +413,7 @@ CodeTrail 不會去寫一個自己沒有授權紀錄的鍵（寫了就等於偷�
 還原不回去）。
 
 在那之前一切照常：壓縮照壓、不跳任何錯誤、`prune` 維持你現在的值。要納入管理就重跑
-`./set_config.sh`。`aicode` 啟動橫幅與 `python3 scripts/doctor.py` 都會把還沒接管的
+`./set_config.sh`。`aicode_opencode` 啟動橫幅與 `python3 scripts/doctor.py` 都會把還沒接管的
 受管鍵列出來。
 
 6.1 的 reasoning 處理不受這條影響——它不寫設定，載入 plugin 就生效。

@@ -1,5 +1,5 @@
 """server 啟停與 web 入口腳本:launch_servers 的啟動路徑與 rollback、check_status /
-stop_servers 的生命週期判定、aicode_web 的 start / stop / --local 守門。
+stop_servers 的生命週期判定、aicode_opencode_web 的 start / stop / --local 守門。
 
 合併自 tests/test_server_launch.py、tests/test_server_lifecycle.py、
 tests/test_web_server_scripts.py(2026-09-02)。前兩份本身又是 2026-08-20 併自
@@ -8,7 +8,7 @@ test_check_status_script / test_stop_wait。
 
 - 啟動路徑:profile → 啟動命令、失敗時的 rollback、RAG server 腳本契約。
 - 生命週期:check_status 的 PID 判定,stop_servers 的等待/升級終止。
-- aicode_web(start / stop / --local 全在同一入口):只走 --dry-run / --help /
+- aicode_opencode_web(start / stop / --local 全在同一入口):只走 --dry-run / --help /
   guard path,不需要 tmux / opencode / llama-server。
 """
 from __future__ import annotations
@@ -990,9 +990,9 @@ def test_rollback_waits_for_vram_release(tmp_path, monkeypatch):
     assert waited == [({9: "s-main:main"}, 120)]
 
 
-# ── 原 test_web_server_scripts.py:aicode_web 的 start / stop / --local 守門 ──
+# ── 原 test_web_server_scripts.py:aicode_opencode_web 的 start / stop / --local 守門 ──
 
-WEB_ENTRY = REPO_ROOT / "aicode_web"
+WEB_ENTRY = REPO_ROOT / "aicode_opencode_web"
 
 
 def _run_aicode_web(script: Path, args, cwd, env_extra=None, timeout=10):
@@ -1076,7 +1076,7 @@ def _headless_runtime_env(tmp_path: Path):
             "FAKE_TMUX_STATE": str(state),
             "FAKE_TMUX_CALLS": str(calls),
             "FAKE_TMUX_PROJECT": str(tmp_path),
-            # 這組測試只驗 tmux 包裝行為;前景 preflight 需要完整 aicode 環境,
+            # 這組測試只驗 tmux 包裝行為;前景 preflight 需要完整 aicode_opencode 環境,
             # 由 test_cli.py 的 AICODE_PREFLIGHT_ONLY 測試與下方 blocks 測試涵蓋。
             "AICODE_WEB_SKIP_PREFLIGHT": "1",
         }
@@ -1097,11 +1097,11 @@ def test_local_dry_run_resolves_project_port_session(tmp_path):
     assert "port=4096" in out
     assert "session=codetrail-web" in out
     assert "health_url=http://127.0.0.1:4096/" in out
-    # launch 應該:把 CodeTrail env 明確 export 進 pane、cd 專案、exec aicode web
+    # launch 應該:把 CodeTrail env 明確 export 進 pane、cd 專案、exec aicode_opencode web
     assert "export AICODE_WEB_PORT=4096" in out
     assert f"export AICODE_ROOT={os.path.realpath(tmp_path)}" in out
     assert "&& exec " in out
-    assert str(REPO_ROOT / "aicode") in out and "web" in out
+    assert str(REPO_ROOT / "aicode_opencode") in out and "web" in out
 
 
 def test_local_dry_run_respects_custom_port_and_session(tmp_path):
@@ -1121,7 +1121,7 @@ def test_local_dry_run_forwards_extra_args(tmp_path):
     proc = _run_aicode_web(WEB_ENTRY, ["--local", "--dry-run", "--hostname", "0.0.0.0"], cwd=tmp_path)
     assert proc.returncode == 0, proc.stderr
     launch = next(line for line in proc.stdout.splitlines() if line.startswith("launch="))
-    assert launch.rstrip().endswith("aicode web --hostname 0.0.0.0")
+    assert launch.rstrip().endswith("aicode_opencode web --hostname 0.0.0.0")
 
 
 def test_aicode_web_dry_run_binds_only_current_tailscale_ipv4(tmp_path):
@@ -1139,16 +1139,16 @@ def test_aicode_web_dry_run_binds_only_current_tailscale_ipv4(tmp_path):
     launch = next(line for line in out.splitlines() if line.startswith("launch="))
     assert "export AICODE_WEB_TAILSCALE_IP=100.100.10.20" in launch
     assert "export BROWSER=/bin/true" in launch
-    assert "aicode web --cors https://browser.example --hostname 100.100.10.20" in launch
+    assert "aicode_opencode web --cors https://browser.example --hostname 100.100.10.20" in launch
     assert "0.0.0.0" not in launch
 
 
 def test_aicode_web_readme_symlink_resolves_codetrail_checkout(tmp_path):
-    """README 安裝到 ~/.local/bin 後仍能找到 checkout 內的 scripts / aicode。"""
+    """README 安裝到 ~/.local/bin 後仍能找到 checkout 內的 scripts / aicode_opencode。"""
     fake_home = tmp_path / "home"
     installed_bin = fake_home / ".local" / "bin"
     installed_bin.mkdir(parents=True)
-    installed_entry = installed_bin / "aicode_web"
+    installed_entry = installed_bin / "aicode_opencode_web"
     installed_entry.symlink_to(WEB_ENTRY)
     project = tmp_path / "project"
     project.mkdir()
@@ -1162,7 +1162,7 @@ def test_aicode_web_readme_symlink_resolves_codetrail_checkout(tmp_path):
 
     assert proc.returncode == 0, proc.stderr
     assert f"project={project.resolve()}" in proc.stdout
-    assert f"aicode={REPO_ROOT / 'aicode'}" in proc.stdout
+    assert f"aicode_opencode={REPO_ROOT / 'aicode_opencode'}" in proc.stdout
     assert "bind_host=100.100.10.20" in proc.stdout
 
 
@@ -1310,7 +1310,7 @@ def test_refuses_home(tmp_path):
 def test_aicode_web_help_exits_zero():
     proc = _run_aicode_web(WEB_ENTRY, ["--help"], cwd=REPO_ROOT)
     assert proc.returncode == 0
-    assert "aicode_web" in proc.stdout
+    assert "aicode_opencode_web" in proc.stdout
     assert "用法" in proc.stdout
     assert "--tailscale" in proc.stdout
     assert "--local" in proc.stdout

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify CodeTrail MCP wiring and the active model's real tool-call path.
 
-``aicode`` runs this before starting OpenCode.  The protocol check is always
+``aicode_opencode`` runs this before starting OpenCode.  The protocol check is always
 live: it starts the effective ``mcp.codetrail.command``, performs
 initialize/tools/list, verifies the exact public tool contract, and calls the
 read-only ``list_dir`` tool.  A named explicit model probe is a hard gate and
@@ -191,7 +191,7 @@ def _run_process_with_heartbeat(
     """``_run_process`` with periodic progress lines while the child runs.
 
     The live model canary regularly takes tens of seconds on local hardware;
-    with zero output users assume ``aicode`` is hung.  Timeout behaviour
+    with zero output users assume ``aicode_opencode`` is hung.  Timeout behaviour
     matches ``_run_process``: raise ``subprocess.TimeoutExpired`` carrying any
     partial output collected so far.
     """
@@ -302,7 +302,7 @@ def extract_codetrail_command(
             raise CanaryError("mcp.codetrail.environment.AICODE_ROOT 無法解析") from exc
         if configured_path != root:
             raise CanaryError(
-                "mcp.codetrail.environment.AICODE_ROOT 與本次 aicode sandbox root 不同"
+                "mcp.codetrail.environment.AICODE_ROOT 與本次 aicode_opencode sandbox root 不同"
             )
 
     return McpCommand(tuple(command), dict(raw_environment))
@@ -655,7 +655,7 @@ def build_fingerprint(
         "mcp_server": _file_digest(REPO_ROOT / "mcp_server.py"),
         "project_agents": _file_digest(root / "AGENTS.md"),
         # lessons 注入檔也是模型看到的「專案規則」:內容變了要讓 model canary
-        # 快取失效(aicode 會在 canary 之前先 render 好這個檔)。
+        # 快取失效(aicode_opencode 會在 canary 之前先 render 好這個檔)。
         "project_lessons": _file_digest(root / ".codetrail" / "lessons.md"),
         "project_opencode_json": _file_digest(root / ".opencode" / "opencode.json"),
         "project_opencode_jsonc": _file_digest(root / ".opencode" / "opencode.jsonc"),
@@ -1351,7 +1351,7 @@ def run_all(
         live_reason = "server /props、opencode 版本或快取路徑不可用；本次結果不會快取"
 
     if not explicit_cached:
-        # 這一步是整個 aicode 啟動流程唯一會安靜跑數十秒以上的地方；先講清楚
+        # 這一步是整個 aicode_opencode 啟動流程唯一會安靜跑數十秒以上的地方；先講清楚
         # 原因與預期時長，執行中再配合 heartbeat，避免被誤判成當機。
         _print(f"MODEL live canary — {live_reason}")
         _print(
@@ -1394,7 +1394,7 @@ def run_all(
                 else:
                     _print(
                         "MODEL FLAKY — explicit 第二次才成功；本次允許啟動但不快取，"
-                        "下次 aicode 會再測",
+                        "下次 aicode_opencode 會再測",
                         error=True,
                     )
                 explicit_passed = True

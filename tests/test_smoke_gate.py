@@ -40,7 +40,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 # AGENTS.md §2「安全相關不要砍」的檢查點 → (守它的說明, 必須存在且帶 smoke 的 node)。
 SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     "test_aicode.py": (
-        "aicode 的 direct-MCP 契約與 experimental Code Mode fail-loud 閘",
+        "aicode_opencode 的 direct-MCP 契約與 experimental Code Mode fail-loud 閘",
         ("test_aicode_refuses_experimental_opencode_code_mode",),
     ),
     "test_set_config.py": (
@@ -139,7 +139,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     "test_opencode_plugins.py": (
         "codetrail-notify 的跨語言字面契約、唯一 export、plugin 失敗不得改動工具結果,以及註冊不得寫進被分析的 repo；"
         "壓縮 plugin:規則以 context 附加(不得取代 prompt 而丟掉 prior summary)、跨語言凍結值與狀態 digest、壓縮後的核對(空摘要／兩種競態／七欄格式漂移)、停用必須跨 OpenCode 重開保留(且只記不可信的那幾種成因)、恢復後要在使用者送出的那一刻就講(不是整輪答完之後)、不得觸發的每一種狀態、以及零內容與 fail-open；"
-        "messages.transform 只准拿掉最新一則真實使用者訊息之前的 reasoning(就地換陣列元素、不動其他 part、認不出就整段不動、絕不 reject)、`aicode` 橫幅那一行必須跟 transform 真正的閘一致(版本、狀態檔身分)、prune 是受管但非契約鍵(改了不得停用、舊狀態檔升級當天不得全部跳 config_drift)",
+        "messages.transform 只准拿掉最新一則真實使用者訊息之前的 reasoning(就地換陣列元素、不動其他 part、認不出就整段不動、絕不 reject)、`aicode_opencode` 橫幅那一行必須跟 transform 真正的閘一致(版本、狀態檔身分)、prune 是受管但非契約鍵(改了不得停用、舊狀態檔升級當天不得全部跳 config_drift)",
         (
             "test_marker_literal_is_the_frozen_contract",
             "test_notify_incident_constants_are_the_frozen_contract",

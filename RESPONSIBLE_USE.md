@@ -24,7 +24,7 @@ host operating system. Before handling confidential material:
    OpenCode built-in file, shell, and web tools when the CodeTrail sandbox is the
    required boundary.
 3. For untrusted repositories, start with
-   `OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode` so project configuration cannot
+   `OPENCODE_DISABLE_PROJECT_CONFIG=1 aicode_opencode` so project configuration cannot
    silently loosen global permissions.
 4. Review all effective model endpoints. A non-loopback endpoint means prompts or
    retrieved content can leave the current machine.

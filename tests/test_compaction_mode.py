@@ -12,14 +12,14 @@
   * 「沒有狀態檔 = 沒有接管」的 fail-closed 預設 —— 弄反的話舊安裝
     git pull 之後會突然多一個壓縮 plugin。
 
-`aicode` 啟動橫幅那一行「目前壓縮模式」(scripts/compaction_status.py)也在這裡
+`aicode_opencode` 啟動橫幅那一行「目前壓縮模式」(scripts/compaction_status.py)也在這裡
 (原 tests/test_compaction_status.py),同樣只寫會靜默失敗的東西:
 
   * **顯示的模式必須來自 runtime 用的同一份狀態**(`compaction_mode.inspect_state`)。
     印 `codetrail` 而實際上沒接管(或反過來)比不印還糟——使用者會照著錯的認知
     調整工作方式(例如以為長工具輪已經有 mid-turn 壓縮保護)。
   * **這一行是資訊,不是閘**。任何讀取問題都必須 exit 0 並退成「未接管」;讓一行
-    狀態擋住 OpenCode 啟動是本末倒置,而 `aicode` 那邊只有 `|| true` 一道保險。
+    狀態擋住 OpenCode 啟動是本末倒置,而 `aicode_opencode` 那邊只有 `|| true` 一道保險。
   * **實驗標示**。`codetrail` / `manual` 還在測試階段;標示被拿掉沒有人會收到警告,
     使用者就會以為這是穩定行為。
 """
@@ -985,7 +985,7 @@ def test_an_entry_we_added_after_a_move_is_still_ours_at_native(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# ── 原 test_compaction_status.py:aicode 啟動橫幅的「目前壓縮模式」狀態行 ──
+# ── 原 test_compaction_status.py:aicode_opencode 啟動橫幅的「目前壓縮模式」狀態行 ──
 # ---------------------------------------------------------------------------
 def _takeover(tmp_path: Path, mode: str) -> tuple[Path, dict]:
     """在 tmp HOME 放一份模式狀態檔與對應的 opencode.json,回 (config_path, env)。"""
@@ -1096,15 +1096,15 @@ def test_an_unreadable_state_never_blocks_the_banner(monkeypatch, tmp_path):
 
 
 def test_render_indents_continuation_lines_under_the_prefix():
-    """第二行以後要對齊在 `[aicode] ` 之後,否則橫幅會裂開。"""
-    out = status.render(["第一行", "第二行"], "[aicode]").splitlines()
-    assert out[0] == "[aicode] 第一行"
-    assert out[1] == " " * len("[aicode] ") + "第二行"
+    """第二行以後要對齊在 `[aicode_opencode] ` 之後,否則橫幅會裂開。"""
+    out = status.render(["第一行", "第二行"], "[aicode_opencode]").splitlines()
+    assert out[0] == "[aicode_opencode] 第一行"
+    assert out[1] == " " * len("[aicode_opencode] ") + "第二行"
 
 
 def test_aicode_prints_the_mode_without_letting_it_block_startup():
-    """靜態契約:aicode 得真的印這一行,而且不得把它變成一道閘。"""
-    source = (REPO_ROOT / "aicode").read_text(encoding="utf-8")
+    """靜態契約:aicode_opencode 得真的印這一行,而且不得把它變成一道閘。"""
+    source = (REPO_ROOT / "aicode_opencode").read_text(encoding="utf-8")
     call = source.index('"$PYBIN" "$COMPACTION_STATUS" --prefix')
     assert "|| true" in source[call:source.index("\n", call)]
     # 兩條真正的啟動路徑(standalone TUI 與 web backend)之前都要印得到;

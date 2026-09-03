@@ -185,7 +185,7 @@ def test_mode_constants_match_the_python_module():
     assert set(cm.CONTRACT_COMPACTION_KEYS) < set(cm.MANAGED_COMPACTION_KEYS)
     assert _compaction_js_literal("PRUNE_OLD_TOOL_OUTPUT") is cm.PRUNE_OLD_TOOL_OUTPUT
     assert _compaction_js_literal("KEEP_REASONING_ENV") == compaction_status.KEEP_REASONING_ENV
-    # `aicode` 橫幅要跟 transform 的版本閘看齊,兩邊得讀同一個變數名。
+    # `aicode_opencode` 橫幅要跟 transform 的版本閘看齊,兩邊得讀同一個變數名。
     assert (
         _compaction_js_literal("OPENCODE_VERSION_ENV")
         == compaction_status.OPENCODE_VERSION_ENV
@@ -974,7 +974,7 @@ def test_the_version_gate_uses_the_measured_running_version(tmp_path):
     """`Session.version` 是 session **被建立時** 的版本,不是目前跑的那個。
 
     拿它當閘會讓「在舊版建立、升級後恢復」的 session 永遠被判成太舊,反向
-    降級則誤判成通過。所以版本由 aicode preflight(唯一讀得到
+    降級則誤判成通過。所以版本由 aicode_opencode preflight(唯一讀得到
     `opencode --version` 的地方)量好之後用環境變數遞下來。
     """
     from scripts import opencode_direct_contract as direct
@@ -2284,7 +2284,7 @@ def test_an_unsupported_opencode_version_turns_the_transform_off(tmp_path):
 def test_the_status_line_says_what_the_transform_will_actually_do(
     tmp_path, name, extra_env, bind_elsewhere, stripped
 ):
-    """`aicode` 橫幅那一行不得宣稱 runtime 不會做的事。
+    """`aicode_opencode` 橫幅那一行不得宣稱 runtime 不會做的事。
 
     transform 有三道閘,`compaction_status` 原本只看其中一道
     (`CODETRAIL_KEEP_REASONING`)。版本低於下限、或狀態檔綁在另一份

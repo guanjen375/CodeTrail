@@ -1,4 +1,4 @@
-"""aicode preflight 的離線測試:scripts/doctor.py 健檢 + scripts/tool_call_canary.py。
+"""aicode_opencode preflight 的離線測試:scripts/doctor.py 健檢 + scripts/tool_call_canary.py。
 
 - 原 test_doctor.py:doctor 的核心邏輯。不依賴 llama-server / network,專注在 root safety、
   KB warning、context settings、新版 server-based check 行為。
@@ -510,7 +510,7 @@ def _server_status(n_ctx: int) -> dict:
 
 
 def test_main_server_ctx_alignment_warns_on_mismatch(monkeypatch):
-    """server n_ctx != internal ctx cap → WARN(aicode 啟動時會 hard-refuse)。"""
+    """server n_ctx != internal ctx cap → WARN(aicode_opencode 啟動時會 hard-refuse)。"""
     monkeypatch.setattr(doc, "_read_config", lambda: _FakeCfg(32768))
     r = doc.Result()
     doc.check_main_server_ctx_alignment(r, _server_status(65536))

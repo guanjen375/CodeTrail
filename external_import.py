@@ -98,7 +98,7 @@ def import_external_file(source_path: str, aicode_root: str, dest_name: Optional
     if not getattr(config, "EXTERNAL_IMPORT_ENABLED", False):
         return (
             "錯誤: 外部檔案匯入未啟用。\n"
-            "請用 AI_CODE_ALLOW_EXTERNAL_IMPORT=1 啟動 aicode；若來源不在 ~/Downloads 或 /tmp，"
+            "請用 AI_CODE_ALLOW_EXTERNAL_IMPORT=1 啟動 aicode_opencode；若來源不在 ~/Downloads 或 /tmp，"
             "再設定 AI_CODE_IMPORT_ROOTS。"
         )
 

@@ -1,4 +1,4 @@
-"""aicode preflight 對 ~/.config/opencode/opencode.json 的三道檢查與 --fix 遷移。
+"""aicode_opencode preflight 對 ~/.config/opencode/opencode.json 的三道檢查與 --fix 遷移。
 
 合併自 tests/test_opencode_contract_check.py、tests/test_opencode_ctx_check.py、
 tests/test_opencode_mcp_timeout_check.py(2026-08-20):同一份設定檔、同一種
@@ -545,7 +545,7 @@ def test_agents_md_status_distinguishes_stale_from_customisation():
 
 @pytest.mark.smoke
 def test_stale_agents_md_is_warned_but_never_blocks_startup(monkeypatch, tmp_path, capsys):
-    """★ aicode 對非零 rc 是硬退出。漂移一律只能警告 ——
+    """★ aicode_opencode 對非零 rc 是硬退出。漂移一律只能警告 ——
     把「使用者自訂過 AGENTS.md」變成開不了 OpenCode 是不能接受的。"""
     config_path = _agents_setup(monkeypatch, tmp_path, _template_doc())
     live = config_path.parent / check.AGENTS_MD_NAME
@@ -650,8 +650,8 @@ def test_agents_md_check_can_be_silenced(monkeypatch, tmp_path, capsys):
 @pytest.mark.parametrize("broken", ["template", "live"])
 def test_non_utf8_files_never_block_startup(monkeypatch, tmp_path, capsys, broken):
     """★ `UnicodeDecodeError` 繼承 `ValueError` 而**不是** `OSError` —— 漏接的話
-    一個非 UTF-8 的檔案就會讓這支 preflight 拋例外回非零,而 `aicode` 對非零 rc
-    是硬退出(aicode:273),使用者直接開不了 OpenCode。"""
+    一個非 UTF-8 的檔案就會讓這支 preflight 拋例外回非零,而 `aicode_opencode` 對非零 rc
+    是硬退出(aicode_opencode:273),使用者直接開不了 OpenCode。"""
     config_path = _agents_setup(monkeypatch, tmp_path, _template_doc())
     live = config_path.parent / check.AGENTS_MD_NAME
     if broken == "template":
@@ -670,7 +670,7 @@ def test_non_utf8_files_never_block_startup(monkeypatch, tmp_path, capsys, broke
 
 @pytest.mark.smoke
 def test_unreadable_template_degrades_to_unknown(monkeypatch, tmp_path, capsys):
-    """範本檔不見了不能讓 aicode 開不起來。"""
+    """範本檔不見了不能讓 aicode_opencode 開不起來。"""
     config_path = _agents_setup(monkeypatch, tmp_path, _template_doc())
     monkeypatch.setattr(check, "AGENTS_TEMPLATE_DOC", tmp_path / "nope.md")
 
@@ -1125,7 +1125,7 @@ def test_compaction_plugin_is_never_registered_without_a_mode_state(monkeypatch,
 
 @pytest.mark.smoke
 def test_compaction_plugin_is_not_re_added_after_switching_to_native(monkeypatch, tmp_path):
-    """切回 native 之後,下一次 aicode 啟動不得把 plugin 補回去。"""
+    """切回 native 之後,下一次 aicode_opencode 啟動不得把 plugin 補回去。"""
     import compaction_mode
 
     config_path = tmp_path / "opencode.json"

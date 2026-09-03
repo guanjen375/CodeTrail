@@ -1723,9 +1723,9 @@ DEFAULT_MAIN_BASE_URL = "http://localhost:8080"
 # 兩處各寫一份 8192 的話,改了其中一個門檻就會跟實際設定對不上。
 OPENCODE_OUTPUT_LIMIT = 8192
 
-# lessons(行為教訓)注入:aicode 每次啟動把 active lessons render 成專案內的
+# lessons(行為教訓)注入:aicode_opencode 每次啟動把 active lessons render 成專案內的
 # 這個檔案,OpenCode 以 instructions 相對路徑(相對專案 root)載入。檔案不存在
-# 時 OpenCode 視同 glob 無匹配、直接略過,所以對沒跑過 aicode 的目錄無害。
+# 時 OpenCode 視同 glob 無匹配、直接略過,所以對沒跑過 aicode_opencode 的目錄無害。
 _OPENCODE_LESSONS_INSTRUCTION = ".codetrail/lessons.md"
 
 
@@ -2996,9 +2996,9 @@ def run(args: argparse.Namespace) -> int:
     for warning in warnings:
         print(f"      ⚠ {warning}")
 
-    # deployment/registry 的 env override(文件允許的自訂路徑)只影響 aicode/doctor
+    # deployment/registry 的 env override(文件允許的自訂路徑)只影響 aicode_opencode/doctor
     # 等 runtime 讀取;本工具固定寫預設路徑,產生的 ~/start.sh 也刻意 unset 這些變數
-    # (防 .bashrc 殘留)。設了卻不提醒,使用者會拿到「aicode 與 start.sh 各讀一份」。
+    # (防 .bashrc 殘留)。設了卻不提醒,使用者會拿到「aicode_opencode 與 start.sh 各讀一份」。
     split_env = [
         key for key in ("AICODE_DEPLOYMENT_CONFIG", "AICODE_PROFILE",
                         "AICODE_MODEL_REGISTRY", "AICODE_MODEL_REGISTRY_FILE")
@@ -3008,7 +3008,7 @@ def run(args: argparse.Namespace) -> int:
         base_notes.append(
             "⚠ 偵測到環境變數 " + "、".join(split_env)
             + ":本工具只寫入預設路徑(~/.config/codetrail/*),而 ~/start.sh 啟動時會刻意"
-            " unset 這些 override——aicode/doctor 會讀你的自訂檔,~/start.sh 卻讀預設檔,"
+            " unset 這些 override——aicode_opencode/doctor 會讀你的自訂檔,~/start.sh 卻讀預設檔,"
             "兩邊將各用一份設定。建議 unset 後重跑;要用自訂檔請自行維護其內容。"
         )
 
@@ -3032,7 +3032,7 @@ def run(args: argparse.Namespace) -> int:
             "⚠ 已明確啟用實驗性 build prompt；目前 support matrix 沒有任何 arm "
             "通過完整 routing gate，這不是 supported 預設。"
         )
-    # OpenCode 與本 repo 的 config.py/aicode 都會先讀 OPENCODE_CONFIG;
+    # OpenCode 與本 repo 的 config.py/aicode_opencode 都會先讀 OPENCODE_CONFIG;
     # set_config 若寫死預設路徑,設了這個變數的使用者會拿到 PASS 但完全沒生效的設定。
     opencode_env = (os.environ.get("OPENCODE_CONFIG") or "").strip()
     if opencode_env:
@@ -3516,8 +3516,8 @@ def run(args: argparse.Namespace) -> int:
     print("\n下一步:")
     print("  ~/start.sh                        # 啟動四個 llama-server(tmux)")
     print("  ~/start.sh status                 # 確認四個 server 都 ready")
-    print("  cd <你要分析的專案> && aicode      # 進 TUI;/status 應顯示 codetrail Connected")
-    print("  cd <你要分析的專案> && aicode_web  # A 機背景 web;B 機開它印出的 Tailscale URL")
+    print("  cd <你要分析的專案> && aicode_opencode      # 進 TUI;/status 應顯示 codetrail Connected")
+    print("  cd <你要分析的專案> && aicode_opencode_web  # A 機背景 web;B 機開它印出的 Tailscale URL")
     print("  ~/start.sh stop                   # 收工:關掉全部 tmux server 視窗")
     return 1 if preview_rc != 0 else 0
 

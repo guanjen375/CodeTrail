@@ -354,7 +354,7 @@ def affected_test_files(
          node 是否還在)。
       3. 改到 repo 模組 → import 圖上所有(直接或間接)用到它的測試檔,加上文字
          上提到 `<name>.py` 的測試檔(用 subprocess 跑 script 的測試不會 import)。
-      4. 其他檔案(aicode、set_config.sh、plugin .js、文件)→ 文字上提到檔名的
+      4. 其他檔案(aicode_opencode、set_config.sh、plugin .js、文件)→ 文字上提到檔名的
          測試檔。
     任何一個改動對不到任何測試檔就回 None(fail-closed)。
     """

@@ -111,7 +111,7 @@ _LAST_WRITTEN_KEY: tuple[Any, ...] | None = None
 def state_dir() -> Path:
     """`$XDG_STATE_HOME/codetrail`,預設 `~/.local/state/codetrail`。
 
-    每次呼叫都重新讀環境變數:測試(與 `aicode` 的 per-session 隔離)靠
+    每次呼叫都重新讀環境變數:測試(與 `aicode_opencode` 的 per-session 隔離)靠
     monkeypatch `XDG_STATE_HOME`,快取住就會寫到使用者真的 state 目錄。
 
     `.strip()` 是**兩端共同的契約**,不是順手加的:T3 的 JS 端對同一個環境

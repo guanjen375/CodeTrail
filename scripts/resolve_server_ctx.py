@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""把主 llama-server 的真實 n_ctx 解析出來,印到 stdout 給 aicode wrapper 用。
+"""把主 llama-server 的真實 n_ctx 解析出來,印到 stdout 給 aicode_opencode wrapper 用。
 
 設計重點:server 啟動時的 `-c <N>` (= /props 的 n_ctx) 是 runtime 真值。
-aicode 啟動時跑這支,把讀到的值以 AICODE_N_CTX 傳給 CodeTrail，並自動同步
+aicode_opencode 啟動時跑這支,把讀到的值以 AICODE_N_CTX 傳給 CodeTrail，並自動同步
 OpenCode 的鏡像欄位；使用者不需要維護另一個 max。
 
 合約:
     stdout  只印一個整數 n_ctx;讀不到就「什麼都不印」(空字串)。
     stderr  人看的診斷訊息。
-    exit    永遠 0 —— 這是「取值器」不是「閘」,讀不到也不擋啟動(aicode 會退回
+    exit    永遠 0 —— 這是「取值器」不是「閘」,讀不到也不擋啟動(aicode_opencode 會退回
             deployment profile 的 main.ctx)。
 
 讀取的環境變數:
@@ -43,7 +43,7 @@ def main() -> int:
         )
         return 0
 
-    # 只有這一行會進 stdout;aicode 直接拿來 export。
+    # 只有這一行會進 stdout;aicode_opencode 直接拿來 export。
     print(int(server.n_ctx))
     return 0
 

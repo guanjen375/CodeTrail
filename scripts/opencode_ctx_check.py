@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check or safely sync OpenCode limit.context to the main server n_ctx.
 
-``aicode`` invokes this script with ``--fix``.  The repair changes only the
+``aicode_opencode`` invokes this script with ``--fix``.  The repair changes only the
 active local model's ``limit.context``, preserves every other JSON setting,
 writes atomically, and leaves a backup.  Check-only mode remains available to
 doctor/tests and never mutates the config.
@@ -169,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     _print("          n_ctx 不一致時,TUI 會在跟 CodeTrail 不同的 ctx 預算下工作")
     _print("          (太小會提早 compact、太大會被 server 截斷)。")
     _print("")
-    _print("          執行本腳本 --fix 可安全同步；aicode 正常啟動時會自動執行。")
+    _print("          執行本腳本 --fix 可安全同步；aicode_opencode 正常啟動時會自動執行。")
     _print("          緊急略過: AICODE_ACCEPT_CTX_RISK=1 或 AICODE_CTX_SAFETY_DISABLE=1")
     _print("")
 
