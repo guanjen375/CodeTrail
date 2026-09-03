@@ -318,6 +318,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_cancel_while_waiting_for_the_model_lock_never_sends_the_request",
             "test_a_length_cut_tool_call_is_never_executed",
             "test_a_malformed_sse_line_makes_the_answer_an_error_even_if_stop_follows",
+            "test_the_openai_stream_iterator_ignores_sse_comment_and_field_lines",
             "test_the_openai_stream_iterator_refuses_a_malformed_line",
             "test_a_malformed_stream_in_a_summary_request_reads_as_unfinished",
             "test_only_reasoning_before_the_latest_user_message_is_dropped",

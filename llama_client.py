@@ -744,8 +744,12 @@ def _iter_openai_stream(resp) -> Iterator[dict]:
     try:
         for raw in _iter_sse_lines(resp):
             line = raw.strip()
-            if line.startswith("data:"):
-                line = line[len("data:"):].strip()
+            if not line.startswith("data:"):
+                # SSE 規格:`:` 開頭是註解(llama-server 處理長 prompt 時送的 keep-alive),
+                # `event:` / `id:` / `retry:` 是欄位——都不是 payload,略過。只有 `data:` 行
+                # 才是 JSON,壞掉的 data 行才算串流損毀。
+                continue
+            line = line[len("data:"):].strip()
             if not line or line == "[DONE]":
                 continue
             try:

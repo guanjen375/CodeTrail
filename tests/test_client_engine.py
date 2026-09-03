@@ -1790,3 +1790,28 @@ def test_a_web_style_cancel_after_a_failed_turn_is_refused(engine_factory, monke
     assert not engine._armed and not engine._cancel.is_set()
     engine.clear_cancel()                                                # web 收尾 → 新回合
     assert engine.request_cancel(arm_when_idle=True).accepted is True    # 真正的 prestart 才武裝
+
+
+# ── 2026-09-04 真實使用踩到:llama-server 的 SSE keep-alive 註解行(`:`)被當成壞掉的 payload ──
+
+@pytest.mark.smoke
+def test_the_openai_stream_iterator_ignores_sse_comment_and_field_lines():
+    """SSE 規格:以 `:` 開頭的是註解(llama-server 處理長 prompt 時送 keep-alive),`event:` /
+    `id:` / `retry:` 是欄位,都不是 payload——只有 `data:` 行才是 JSON。第 4 輪的 fail-loud
+    把這些行也拿去 json.loads,第一個長 prompt 的回合就被判成「串流沒有正常結束」。"""
+
+    class _Resp:
+        def iter_lines(self):
+            yield b":"
+            yield b": keep-alive"
+            yield b"event: message"
+            yield b"id: 7"
+            yield b"retry: 3000"
+            yield b'data: {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}'
+            yield b"data: [DONE]"
+
+        def close(self):
+            return None
+
+    chunks = list(llama_client._iter_openai_stream(_Resp()))
+    assert len(chunks) == 1 and chunks[0]["choices"][0]["delta"]["content"] == "ok"
