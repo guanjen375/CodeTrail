@@ -2,10 +2,17 @@
 
 涵蓋:store 驗證 fail-loud、20 條上限拒絕、scope/review_by 過濾、
 render 注入、session start 檢查(注入 / 過期複審提示 / 壞檔拒啟動 /
-SKIP 與安全模式清除殘留 / .codetrail symlink 拒寫)、id 不重用、
-mutate 交易、propose 冪等與 render 失敗降級、管理 CLI、opencode.json
-注入欄位與 permission 契約,以及驗收要求的完整生命週期:提案(核准後
-寫入)→ 下個 session 注入 → 過期 → 停注入 + 複審提示 → renew 後恢復。
+跳過與安全模式清除殘留 / .codetrail symlink 拒寫)、id 不重用、
+mutate 交易、propose 冪等與 render 失敗降級、管理 CLI、permission 契約,
+以及驗收要求的完整生命週期:提案(核准後寫入)→ 下個 session 注入 →
+過期 → 停注入 + 複審提示 → renew 後恢復。
+
+2026-09-04:session start 檢查從 `scripts/lessons_check.py`(一支被 bash
+wrapper spawn 的 CLI,以兩個環境變數(`AICODE_LESSONS_SKIP` 與 store 的位置覆寫)
+兩個環境變數驅動)搬進 `client_preflight.render_lessons`,跑在客戶端自己的
+行程裡。兩個環境變數一起刪除:store 位置只由 HOME 推導(測試改 HOME 就夠),
+「這個 session 不注入」改成呼叫端明確傳的 `skip=True`(replay / eval 用)。
+斷言的行為沒變,只是 exit code 換成 `PreflightError`。
 
 純檔案系統操作,不需要 llama-server / OpenCode。
 """
@@ -15,9 +22,9 @@ import json
 
 import pytest
 
+import client_preflight
 import lessons
 from lessons import LessonsError
-from scripts import lessons_check
 from scripts import set_config as sc
 
 TODAY = "2026-08-11"
@@ -378,19 +385,43 @@ def test_propose_lesson_render_failure_persists_store_with_warning(tmp_path):
 # scripts/lessons_check.py:session start 注入 + 複審提示
 # ---------------------------------------------------------------------------
 
-def _run_check(tmp_path, monkeypatch, store_data=None, raw=None):
-    store = tmp_path / "store" / "lessons.json"
+def _home(tmp_path, monkeypatch):
+    """把 HOME 指到 tmp,並回 store 的路徑。**唯一**的測試接縫。"""
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    store = home / ".config" / "codetrail" / "lessons.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    return store
+
+
+def _render(root, *, skip=False):
+    """跑 preflight 的 lessons 這一步。回 (Preflight, 印出來的文字)。
+
+    `Preflight.note` 直接 print,所以呼叫端用 capsys 收 —— 與 runtime 一樣
+    (`client_preflight.run()` 把整段 tee 進畫面與對話區第一則)。
+    """
+    result = client_preflight.Preflight(root=root)
+    client_preflight.render_lessons(result, skip=skip)
+    return result
+
+
+def _run_check(tmp_path, monkeypatch, store_data=None, raw=None, skip=False):
+    """回 (root, exit_code)。`PreflightError` 對應舊 CLI 的 exit 2。"""
+    store = _home(tmp_path, monkeypatch)
     root = tmp_path / "root"
     root.mkdir(exist_ok=True)
     if store_data is not None:
         lessons.save_lessons(store, store_data)
     if raw is not None:
-        store.parent.mkdir(parents=True, exist_ok=True)
         store.write_text(raw, encoding="utf-8")
-    monkeypatch.setenv(lessons.LESSONS_FILE_ENV, str(store))
-    monkeypatch.delenv("AICODE_LESSONS_SKIP", raising=False)
-    monkeypatch.delenv("CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS", raising=False)
-    return root, lessons_check.main(["--root", str(root)])
+    try:
+        _render(root, skip=skip)
+    except client_preflight.PreflightError as exc:
+        print(f"[aicode] {exc}")
+        return root, 2
+    return root, 0
 
 
 def test_check_renders_active_and_prompts_expired(tmp_path, monkeypatch, capsys):
@@ -418,7 +449,7 @@ def test_check_writes_empty_context_when_no_lessons(tmp_path, monkeypatch, capsy
 def test_check_refuses_corrupt_store(tmp_path, monkeypatch, capsys):
     _, code = _run_check(tmp_path, monkeypatch, raw="{bad")
     assert code == 2
-    assert "refuse to start" in capsys.readouterr().out
+    assert "拒絕啟動" in capsys.readouterr().out
 
 
 def test_check_refuses_over_cap_store(tmp_path, monkeypatch, capsys):
@@ -434,22 +465,17 @@ def test_check_refuses_over_cap_store(tmp_path, monkeypatch, capsys):
     assert "超過上限" in out and "整併" in out
 
 
-def test_check_skip_env_bypasses_everything(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("AICODE_LESSONS_SKIP", "1")
-    store = tmp_path / "store" / "lessons.json"
-    store.parent.mkdir(parents=True)
-    store.write_text("{bad", encoding="utf-8")
-    monkeypatch.setenv(lessons.LESSONS_FILE_ENV, str(store))
-    root = tmp_path / "root"
-    root.mkdir()
-    assert lessons_check.main(["--root", str(root)]) == 0
+def test_check_skip_bypasses_everything(tmp_path, monkeypatch, capsys):
+    """呼叫端要求跳過 → 連壞掉的 store 都不讀,也不 render。"""
+    root, code = _run_check(tmp_path, monkeypatch, raw="{bad", skip=True)
+    assert code == 0
     assert not (root / lessons.LESSONS_CONTEXT_RELPATH).exists()
     assert "跳過" in capsys.readouterr().out
 
 
 def test_check_skip_removes_stale_render(tmp_path, monkeypatch, capsys):
-    """SKIP 不只是不 render:上個 session 的 lessons.md 也要清掉,
-    否則 OpenCode instructions 仍會把舊規則載入,「已跳過」就是謊話。"""
+    """跳過不只是不 render:上個 session 的 lessons.md 也要清掉,
+    否則客戶端仍會把舊規則接進 system prompt,「已跳過」就是謊話。"""
     data = lessons.empty_store()
     lessons.add_lesson(data, "上個 session 的規則", "global", None, today=lessons.today_local())
     root, code = _run_check(tmp_path, monkeypatch, store_data=data)
@@ -458,17 +484,21 @@ def test_check_skip_removes_stale_render(tmp_path, monkeypatch, capsys):
     assert "上個 session 的規則" in context.read_text(encoding="utf-8")
     capsys.readouterr()
 
-    monkeypatch.setenv("AICODE_LESSONS_SKIP", "1")
-    assert lessons_check.main(["--root", str(root)]) == 0
+    _render(root, skip=True)
     out = capsys.readouterr().out
     assert not context.exists()
     assert "已移除" in out
 
 
 def test_check_safe_mode_is_honest_and_removes_stale(tmp_path, monkeypatch, capsys):
-    """CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS 模式:OpenCode 從全域設定目錄解析相對
-    instructions,專案內的 lessons.md 根本不會被載入 —— 這裡必須明講不注入、
-    不動不信任的 repo(清殘留除外)、也不讀 store(壞 store 不擋安全模式)。"""
+    """安全模式(client.json 的 `project_instructions: false`):客戶端不讀專案內的
+    instructions,所以必須明講不注入、不動不信任的 repo(清殘留除外)、
+    也不讀 store(壞 store 不擋安全模式)。
+
+    2026-09-04:開關從 `CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS` 環境變數換成
+    client.json 的鍵。行為為什麼該變:它決定「被分析的 repo 能不能把文字塞進
+    system prompt」,一個殼層變數等於這道邊界隨環境漂移。
+    """
     data = lessons.empty_store()
     lessons.add_lesson(data, "殘留的規則", "global", None, today=lessons.today_local())
     root, code = _run_check(tmp_path, monkeypatch, store_data=data)
@@ -477,12 +507,11 @@ def test_check_safe_mode_is_honest_and_removes_stale(tmp_path, monkeypatch, caps
     assert context.exists()
     capsys.readouterr()
 
-    # 換成壞 store 證明安全模式不讀它;env 給 "0" 證明比照 OpenCode 的
-    # JS truthiness(非空即真,"0" 也算開啟)。
-    store = tmp_path / "store" / "lessons.json"
+    # 換成壞 store 證明安全模式不讀它。
+    store = _home(tmp_path, monkeypatch)
     store.write_text("{bad", encoding="utf-8")
-    monkeypatch.setenv("CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS", "0")
-    assert lessons_check.main(["--root", str(root)]) == 0
+    monkeypatch.setattr(client_preflight, "_project_instructions_enabled", lambda: False)
+    _render(root)
     out = capsys.readouterr().out
     assert "不注入" in out and "已移除" in out
     assert not context.exists()
@@ -495,13 +524,10 @@ def test_check_refuses_symlinked_codetrail(tmp_path, monkeypatch, capsys):
     root = tmp_path / "root"
     root.mkdir()
     (root / ".codetrail").symlink_to(outside)
-    monkeypatch.setenv(lessons.LESSONS_FILE_ENV, str(tmp_path / "store" / "lessons.json"))
-    monkeypatch.delenv("AICODE_LESSONS_SKIP", raising=False)
-    monkeypatch.delenv("CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS", raising=False)
+    _home(tmp_path, monkeypatch)
 
-    assert lessons_check.main(["--root", str(root)]) == 2
-    out = capsys.readouterr().out
-    assert "symlink" in out
+    with pytest.raises(client_preflight.PreflightError, match="symlink"):
+        _render(root)
     assert list(outside.iterdir()) == []
 
 
@@ -518,10 +544,12 @@ def test_write_context_refuses_symlinked_lessons_md(tmp_path):
 
 
 def test_check_rejects_missing_root(tmp_path, monkeypatch):
-    monkeypatch.setenv(lessons.LESSONS_FILE_ENV, str(tmp_path / "lessons.json"))
-    monkeypatch.delenv("AICODE_LESSONS_SKIP", raising=False)
-    monkeypatch.delenv("CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS", raising=False)
-    assert lessons_check.main(["--root", str(tmp_path / "nope")]) == 2
+    """render 會在 root 底下建 `.codetrail/`;root 不存在就先停下,
+    不然是在一個使用者從來沒有的路徑上憑空長出目錄樹。"""
+    _home(tmp_path, monkeypatch)
+    with pytest.raises(client_preflight.PreflightError):
+        _render(tmp_path / "nope")
+    assert not (tmp_path / "nope").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -580,12 +608,9 @@ def test_full_lifecycle_correction_to_review(tmp_path, monkeypatch, capsys):
     test_permission_template_gates_record_lesson_after_wildcard 驗證);
     propose_lesson 對應「核准之後」的落地。
     """
-    store = tmp_path / "store" / "lessons.json"
+    store = _home(tmp_path, monkeypatch)
     root = tmp_path / "root"
     root.mkdir()
-    monkeypatch.setenv(lessons.LESSONS_FILE_ENV, str(store))
-    monkeypatch.delenv("AICODE_LESSONS_SKIP", raising=False)
-    monkeypatch.delenv("CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS", raising=False)
     context = root / lessons.LESSONS_CONTEXT_RELPATH
 
     # 1. 使用者糾正 → 模型提案 → ask 核准 → 寫入
@@ -600,13 +625,13 @@ def test_full_lifecycle_correction_to_review(tmp_path, monkeypatch, capsys):
         value = "2026-11-09"  # review_by 當天,仍 active
 
     monkeypatch.setattr(lessons, "today_local", lambda: _FrozenDate.value)
-    assert lessons_check.main(["--root", str(root)]) == 0
+    _render(root)
     assert "migration 前先確認" in context.read_text(encoding="utf-8")
     assert "待人工複審" not in capsys.readouterr().out
 
     # 3. 過期(review_by 隔天):停止注入 + 複審提示,session 照常啟動
     _FrozenDate.value = "2026-11-10"
-    assert lessons_check.main(["--root", str(root)]) == 0
+    _render(root)
     out = capsys.readouterr().out
     assert "migration 前先確認" not in context.read_text(encoding="utf-8")
     assert "待人工複審" in out and "L-001" in out
@@ -615,7 +640,7 @@ def test_full_lifecycle_correction_to_review(tmp_path, monkeypatch, capsys):
     data = lessons.load_lessons(store)
     lessons.renew_lesson(data, "L-001", today="2026-11-10")
     lessons.save_lessons(store, data)
-    assert lessons_check.main(["--root", str(root)]) == 0
+    _render(root)
     assert "migration 前先確認" in context.read_text(encoding="utf-8")
 
 
@@ -641,7 +666,7 @@ def test_the_rendered_lessons_file_reaches_the_system_prompt(tmp_path, monkeypat
     import client_prompt
 
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.delenv(client_prompt.DISABLE_PROJECT_INSTRUCTIONS_ENV, raising=False)
+    monkeypatch.setattr(client_prompt, "project_instructions_enabled", lambda: True)
     root = tmp_path / "project"
     (root / ".codetrail").mkdir(parents=True)
     (root / ".codetrail" / "lessons.md").write_text(

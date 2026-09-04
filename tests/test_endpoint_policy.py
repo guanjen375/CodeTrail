@@ -29,7 +29,7 @@ pytestmark = pytest.mark.smoke
 # endpoint_policy 本體
 # ============================================================
 def test_loopback_hosts_always_allowed(monkeypatch):
-    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", False)
     for url in (
         "http://127.0.0.1:8080",
         "http://localhost:8081",
@@ -41,33 +41,35 @@ def test_loopback_hosts_always_allowed(monkeypatch):
 
 
 def test_model_role_rejects_remote_without_opt_in(monkeypatch):
-    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", False)
     with pytest.raises(endpoint_policy.EndpointPolicyError) as exc:
         endpoint_policy.ensure_allowed("http://10.0.0.5:8080", "model")
     message = str(exc.value)
-    assert "AICODE_MODEL_REMOTE_OK" in message, "錯誤訊息必須印確切 env 名"
+    assert "model_remote_ok" in message, "錯誤訊息必須印確切的 client.json 鍵名"
+    assert "client.json" in message, "而且要說出那個鍵在哪個檔"
     assert "NDA" in message, "錯誤訊息必須講明會外送什麼"
 
 
 def test_model_role_allows_remote_with_opt_in(monkeypatch):
-    monkeypatch.setenv(endpoint_policy.MODEL_REMOTE_OK_ENV, "1")
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", True)
     endpoint_policy.ensure_allowed("http://10.0.0.5:8080", "model")  # 不得 raise
 
 
-def test_kb_context_role_uses_config_flag_not_model_env(monkeypatch):
-    # model env 開著也擋:kb_context 只認 config.KB_CONTEXT_REMOTE_OK
-    monkeypatch.setenv(endpoint_policy.MODEL_REMOTE_OK_ENV, "1")
+def test_kb_context_role_uses_its_own_key_not_the_model_one(monkeypatch):
+    # model 那個開著也擋:kb_context 只認 config.KB_CONTEXT_REMOTE_OK。
+    # **兩個鍵,不是一個**:前者放行送出 prompt,後者等於整份文件離機。
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", True)
     monkeypatch.setattr(config, "KB_CONTEXT_REMOTE_OK", False)
     with pytest.raises(endpoint_policy.EndpointPolicyError) as exc:
         endpoint_policy.ensure_allowed("http://10.0.0.5:8080", "kb_context")
-    assert "AICODE_KB_CONTEXT_REMOTE_OK" in str(exc.value)
+    assert "kb_context_remote_ok" in str(exc.value)
 
     monkeypatch.setattr(config, "KB_CONTEXT_REMOTE_OK", True)
     endpoint_policy.ensure_allowed("http://10.0.0.5:8080", "kb_context")
 
 
 def test_model_role_ignores_kb_context_flag(monkeypatch):
-    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", False)
     monkeypatch.setattr(config, "KB_CONTEXT_REMOTE_OK", True)
     with pytest.raises(endpoint_policy.EndpointPolicyError):
         endpoint_policy.ensure_allowed("http://10.0.0.5:8080", "model")
@@ -178,19 +180,19 @@ def test_embed_and_rerank_reject_redirect(monkeypatch):
     ],
 )
 def test_prompt_bearing_calls_reject_remote_without_opt_in(monkeypatch, call):
-    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", False)
 
     class _Bomb:
         def __getattr__(self, name):
             raise AssertionError("policy 必須在任何 HTTP 動作之前 raise")
 
     monkeypatch.setattr(llama_client, "get_session", lambda: _Bomb())
-    with pytest.raises(endpoint_policy.EndpointPolicyError, match="AICODE_MODEL_REMOTE_OK"):
+    with pytest.raises(endpoint_policy.EndpointPolicyError, match="model_remote_ok"):
         call()
 
 
 def test_probes_log_policy_rejection_and_return_none(monkeypatch, capsys):
-    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", False)
 
     class _Bomb:
         def __getattr__(self, name):
@@ -203,7 +205,7 @@ def test_probes_log_policy_rejection_and_return_none(monkeypatch, capsys):
     assert llama_client.get_slots("http://10.9.8.7:8080") is None
 
     err = capsys.readouterr().err
-    assert err.count("AICODE_MODEL_REMOTE_OK") == 3, (
+    assert err.count("model_remote_ok") == 3, (
         "probe 吞例外回 None 前必須在 stderr 留下 policy 拒絕原因"
     )
 
@@ -216,7 +218,7 @@ def test_probe_calls_allowed_on_loopback(monkeypatch):
 
 
 def test_remote_calls_allowed_with_opt_in(monkeypatch):
-    monkeypatch.setenv(endpoint_policy.MODEL_REMOTE_OK_ENV, "1")
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", True)
     fake = _FakeSession(_FakeResponse(200, payload={"content": "hi"}))
     monkeypatch.setattr(llama_client, "get_session", lambda: fake)
     result = llama_client.native_completion(base_url="http://10.9.8.7:8080", prompt="x")
@@ -231,7 +233,7 @@ def test_rag_fetch_url_does_not_go_through_model_policy(monkeypatch):
 
     import RAG
 
-    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", False)
 
     # html2text 是 optional dep;fake 一份讓路徑走得下去(測的是 policy,不是轉換)
     class _FakeH2T:
@@ -283,7 +285,7 @@ def test_redirect_message_uses_hostname_and_redacts_credentials(monkeypatch):
     fake = _FakeSession(_FakeResponse(
         302, headers={"Location": "http://leak-user:leak-pass@evil.invalid:9999/x"}))
     monkeypatch.setattr(llama_client, "get_session", lambda: fake)
-    monkeypatch.setenv(endpoint_policy.MODEL_REMOTE_OK_ENV, "1")
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", True)
 
     with pytest.raises(RuntimeError) as exc:
         llama_client.native_completion(
@@ -298,7 +300,7 @@ def test_redirect_message_uses_hostname_and_redacts_credentials(monkeypatch):
 
 
 def test_probe_log_redacts_credentials(monkeypatch, capsys):
-    monkeypatch.setenv(endpoint_policy.MODEL_REMOTE_OK_ENV, "1")
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", True)
 
     class _Boom:
         def get(self, *a, **k):
@@ -313,7 +315,7 @@ def test_probe_log_redacts_credentials(monkeypatch, capsys):
 
 def test_policy_error_redacts_credentials_without_opt_in(monkeypatch):
     """審核二輪 #2:真正的洩漏路徑 —— 未 opt-in 時 policy 例外不得帶密碼。"""
-    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", False)
     with pytest.raises(endpoint_policy.EndpointPolicyError) as exc:
         endpoint_policy.ensure_allowed("http://user:secret@10.0.0.5:8080/v1", "model")
     message = str(exc.value)
@@ -327,7 +329,7 @@ def test_policy_error_redacts_credentials_without_opt_in(monkeypatch):
 
 
 def test_prompt_call_policy_rejection_has_no_credentials(monkeypatch):
-    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", False)
 
     class _Bomb:
         def __getattr__(self, name):
@@ -342,7 +344,7 @@ def test_prompt_call_policy_rejection_has_no_credentials(monkeypatch):
 
 def test_probe_stderr_has_no_credentials_without_opt_in(monkeypatch, capsys):
     """probe 吞 policy 例外回 None 的 stderr 也不得帶密碼(exc 本身已 redact)。"""
-    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", False)
     assert llama_client.get_health("http://user:secret@10.0.0.5:8080") is None
     err = capsys.readouterr().err
     assert "secret" not in err and "user:" not in err
@@ -373,7 +375,7 @@ def test_redact_url_survives_malformed_port_and_ipv6():
 
 
 def test_policy_error_with_malformed_port_has_no_credentials(monkeypatch):
-    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", False)
     with pytest.raises(endpoint_policy.EndpointPolicyError) as exc:
         endpoint_policy.ensure_allowed("http://user:secret@10.0.0.5:8080/v1", "model")
     assert "secret" not in str(exc.value)

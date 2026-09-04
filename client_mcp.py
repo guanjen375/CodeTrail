@@ -5,7 +5,7 @@
 為什麼不 in-process import ``mcp_server``:那份模組在 import 期就會驗 root、
 載入 KnowledgeBase、跑 model preflight,失敗時直接 ``sys.exit``;而且
 ``ingest_document`` 的 worker offload 與 progress 綁在 FastMCP 的 ``Context``
-上。所以客戶端一律以子行程啟動既有的 ``mcp_server.py``,協定與 OpenCode 走的
+上。所以客戶端一律以子行程啟動既有的 ``mcp_server.py``,協定與任何 MCP client 走的
 是同一條 stdio JSON-RPC。
 
 為什麼**不用 SDK 的 ``ClientSession``**(這是對施工計畫方向 1 字面的偏離,
@@ -45,7 +45,7 @@ stderr 政策
 --------------------------------------------------------------------
 MCP server 的 stderr 含 strict 查詢的串流回答、截圖抽取內容、命令與絕對路徑。
 預設**只保留有上限的記憶體尾端**,不落任何檔案;失敗時印給本機使用者看。
-需要原始 log 時用 ``CODETRAIL_MCP_STDERR_LOG`` 明確指定檔案,owner-only 建檔
+需要原始 log 時由呼叫端以 ``stderr_log=`` 明確指定檔案(沒有環境變數),owner-only 建檔
 並印出「含 NDA 內容」警告。
 """
 from __future__ import annotations
@@ -55,9 +55,9 @@ import errno
 import itertools
 import json
 import os
+import process_env
 import signal
 import stat
-import subprocess
 import sys
 import threading
 import time
@@ -83,10 +83,7 @@ TERMINATE_GRACE_SECONDS = 5.0
 #: 記憶體裡保留的 stderr 尾端上限(bytes)。只在失敗時印給本機使用者。
 STDERR_TAIL_BYTES = 16_384
 
-#: 明確指定 MCP stderr 落檔位置的 env。設了才落檔,且會印出 NDA 警告。
-STDERR_LOG_ENV = "CODETRAIL_MCP_STDERR_LOG"
-
-#: OpenCode 會替 MCP 工具加 ``codetrail_`` 前綴;CodeTrail 自己的客戶端不加。
+#: 有些 MCP client 會替工具加 server 名前綴(``codetrail_``);自家客戶端不加。
 FORBIDDEN_TOOL_PREFIX = "codetrail_"
 
 CLIENT_INFO = {"name": "codetrail-client", "version": "1"}
@@ -215,6 +212,18 @@ class PendingCall:
         self._client._cancel(self._call, reason)
 
 
+#: 剝除清單住在 `process_env`(MCP 那一側的 spawn 也要用);這裡 re-export。
+from process_env import STRIPPED_ENV_PREFIXES  # noqa: E402
+
+
+def child_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
+    """子行程的環境(見 `process_env.child_env`);這裡只把 fail-loud 包成 McpClientError。"""
+    try:
+        return process_env.child_env(overrides)
+    except process_env.ChildEnvError as exc:
+        raise McpClientError(str(exc)) from None
+
+
 class McpClient:
     """一個 MCP server 子行程 + 我們自己的 JSON-RPC 對話。全同步,無 event loop。"""
 
@@ -223,6 +232,11 @@ class McpClient:
         root: str | os.PathLike[str],
         *,
         argv: Sequence[str] | None = None,
+        readonly: bool = False,
+        n_ctx: int | None = None,
+        build_commands: bool = False,
+        client_config: str | os.PathLike[str] | None = None,
+        skip_aux_preflight: bool = False,
         env: Mapping[str, str] | None = None,
         cancel_grace: float = CANCEL_GRACE_SECONDS,
         terminate_grace: float = TERMINATE_GRACE_SECONDS,
@@ -231,14 +245,39 @@ class McpClient:
         on_start_progress: Callable[[float], None] | None = None,
     ) -> None:
         self.root = str(Path(root).resolve())
-        self._argv = list(argv) if argv else [sys.executable, str(SERVER_SCRIPT)]
+        #: server 的第二層。**argv,不是環境變數**:環境變數的問題是殼層裡殘留的
+        #: 同名變數(來自另一份安裝、另一個專案)可以把它翻回來,而 readonly 是
+        #: 評測邊界。建構時決定,之後唯讀。
+        self.readonly = bool(readonly)
+        self._argv = list(argv) if argv else self._server_argv(
+            readonly=self.readonly,
+            n_ctx=n_ctx,
+            build_commands=build_commands,
+            client_config=client_config,
+            skip_aux_preflight=skip_aux_preflight,
+        )
         self._env_overrides = dict(env or {})
+        # `env=` 是**覆寫**通道:呼叫端明確要求的值,套用在剝除之後。`OPENCODE_*`
+        # 在這一代沒有任何合法的覆寫用途 —— 它只會是升級機器殼層裡殘留的機密
+        # (API key、server 密碼、整份設定內容)。允許它從這裡進來,等於讓「把整份
+        # os.environ 當 overrides 遞進來」這個寫法把剛剝掉的東西原封不動加回去,
+        # 而且完全無聲。fail-loud,讓那種寫法在第一次就被打回。
+        leaked = sorted(
+            key for key in self._env_overrides if key.startswith(STRIPPED_ENV_PREFIXES)
+        )
+        if leaked:
+            raise McpClientError(
+                f"MCP 子行程的環境覆寫不得含 CodeTrail 的設定名(得到 {leaked});"
+                "剝除發生在覆寫之前,從這裡遞進去等於把剛拿掉的東西加回去 —— "
+                "而核准後的 run_command 會繼承這份環境。"
+            )
         self.cancel_grace = float(cancel_grace)
         self.terminate_grace = float(terminate_grace)
         self.start_timeout = float(start_timeout) if start_timeout is not None else None
-        self._stderr_log = (
-            stderr_log if stderr_log is not None else os.environ.get(STDERR_LOG_ENV) or None
-        )
+        # 只有**呼叫端明確指定**才落檔(而且會印 NDA 警告:MCP stderr 含查詢
+        # 原文與絕對路徑)。以前這裡認 `CODETRAIL_MCP_STDERR_LOG`;殼層裡一個
+        # 忘了 unset 的值就等於每個 session 都把那些內容寫進一個檔。
+        self._stderr_log = stderr_log or None
         self._on_start_progress = on_start_progress
 
         # 三把獨立的鎖,刻意不共用一把:
@@ -252,7 +291,10 @@ class McpClient:
         self._stderr_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._ids = itertools.count(1)
-        self._proc: subprocess.Popen | None = None
+        self._proc: process_env.Popen | None = None
+        #: 給使用者看的一次性警告要送去哪裡。``None`` = 印到 stderr。全螢幕 TUI
+        #: 會把它導成畫面上的提示行(接管畫面之後不得直接 print)。
+        self.on_notice: Callable[[str], None] | None = None
         self._reader: threading.Thread | None = None
         self._stderr_reader: threading.Thread | None = None
         self._stderr_tail: deque[bytes] = deque()
@@ -361,40 +403,63 @@ class McpClient:
             raise McpCallCancelledError(f"MCP 呼叫 {name} 已取消") from None
 
     # ---- internals ----------------------------------------------------
-    #: 不得傳給 MCP 子行程的變數。
+    #: **一律**從子行程環境剝掉的前綴。
     #:
-    #: web 密碼是給**前端**驗身用的,MCP server 完全用不到它。傳過去的話,
-    #: 核准後執行的 `run_command` / `run_lint` 子行程會繼承整份環境,專案自己的
-    #: 測試腳本只要印一次 env 就把它寫進工具結果與 session 檔。
-    SECRET_ENV_KEYS = (
-        "AICODE_WEB_PASSWORD",
-        # 升級機器上可能還留著的舊 OpenCode 變數:密碼與整份設定內容。
-        "OPENCODE_SERVER_PASSWORD",
-        "OPENCODE_CONFIG_CONTENT",
-        "OPENCODE_API_KEY",
-    )
+    #: 兩個理由。(1) 設定:CodeTrail 的設定只來自 repo 常數與 set_config 產生的
+    #: 檔案,行程之間用 argv 交接。殼層裡殘留的 `AICODE_*` / `AI_CODE_*` /
+    #: `CODETRAIL_*`(可能來自另一份安裝、另一個 branch 的文件)不得靜默蓋過
+    #: `deployment.json`,也不得把 `--readonly` 翻回來。(2) 機密:核准後執行的
+    #: `run_command` / `run_lint` 子行程會繼承整份環境,專案自己的測試腳本只要印
+    #: 一次 env 就把 `OPENCODE_API_KEY` 之類的東西寫進工具結果與 session 檔。
+    #:
+    #: 用前綴而不是名單:名單要靠「記得每一個可能出現的變數」,而升級機器的殼層裡
+    #: 留著什麼我們不知道。使用者自己的其他環境(PATH、語系、專案需要的東西)照舊
+    #: 保留 —— `run_command` 需要它們。
+    #: 模組層 `STRIPPED_ENV_PREFIXES` 的別名(既有呼叫端用的是這個名字)。
+    STRIPPED_ENV_PREFIXES = STRIPPED_ENV_PREFIXES
 
-    def _build_env(self) -> dict[str, str]:
-        env = os.environ.copy()
-        for key in self.SECRET_ENV_KEYS:
-            env.pop(key, None)
-        env.update(self._env_overrides)
-        env["AICODE_ROOT"] = self.root
-        return env
+    def _server_argv(
+        self,
+        *,
+        readonly: bool,
+        n_ctx: int | None,
+        build_commands: bool,
+        client_config: str | os.PathLike[str] | None = None,
+        skip_aux_preflight: bool = False,
+    ) -> list[str]:
+        """spawn MCP server 的完整命令。設定經由這裡交接,不經環境。
+
+        `client_config`:replay / eval 用自己那份 client.json 時,MCP 也要讀**同一份**
+        (它是獨立行程,預設讀 HOME 的檔 —— 那一份壞掉時 parent 讀對了、MCP 卻 exit 2)。
+        `skip_aux_preflight`:呼叫端已經決定跳過附屬 server 的硬閘時,每個 MCP child
+        也要跳過,否則外層跳了、child 照樣失敗。
+        """
+        argv = [sys.executable, str(SERVER_SCRIPT), "--root", self.root]
+        if readonly:
+            argv.append("--readonly")
+        if n_ctx:
+            argv.extend(["--n-ctx", str(int(n_ctx))])
+        if build_commands and not readonly:
+            argv.append("--enable-build-commands")
+        if client_config:
+            argv.extend(["--client-config", str(Path(client_config))])
+        if skip_aux_preflight:
+            argv.append("--skip-aux-preflight")
+        return argv
 
     def _spawn(self) -> None:
         with self._stderr_lock:
             self._stderr_tail = deque()
             self._stderr_bytes = 0
-        self._stderr_handle = _open_stderr_log(self._stderr_log)
+        self._stderr_handle = _open_stderr_log(self._stderr_log, self.on_notice)
         try:
-            proc = subprocess.Popen(
+            proc = process_env.popen(
                 self._argv,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdin=process_env.PIPE,
+                stdout=process_env.PIPE,
+                stderr=process_env.PIPE,
                 cwd=self.root,
-                env=self._build_env(),
+                overrides=self._env_overrides,
                 # 自成 session:終端機的 Ctrl-C(SIGINT 給前景 process group)不會
                 # 直接打到 MCP server。中斷要走 notifications/cancelled,server
                 # 才有機會收乾淨 ingest 子行程,而不是被 SIGINT 當場砍掉。
@@ -480,7 +545,7 @@ class McpClient:
             except (BrokenPipeError, ValueError, OSError) as exc:
                 raise McpUnavailableError(f"MCP stdio 已中斷: {exc}") from exc
 
-    def _read_stdout(self, proc: subprocess.Popen) -> None:
+    def _read_stdout(self, proc: process_env.Popen) -> None:
         stream = proc.stdout
         assert stream is not None
         try:
@@ -528,7 +593,7 @@ class McpClient:
                         params.get("progress"), params.get("total"), params.get("message")
                     )
 
-    def _read_stderr(self, proc: subprocess.Popen) -> None:
+    def _read_stderr(self, proc: process_env.Popen) -> None:
         stream = proc.stderr
         assert stream is not None
         handle = self._stderr_handle
@@ -636,7 +701,7 @@ class McpClient:
                 handle.close()
 
 
-def _terminate(proc: subprocess.Popen, grace: float) -> None:
+def _terminate(proc: process_env.Popen, grace: float) -> None:
     if proc.poll() is not None:
         with contextlib.suppress(Exception):
             proc.wait(timeout=grace)
@@ -646,11 +711,11 @@ def _terminate(proc: subprocess.Popen, grace: float) -> None:
     try:
         proc.wait(timeout=grace)
         return
-    except subprocess.TimeoutExpired:
+    except process_env.TimeoutExpired:
         pass
     with contextlib.suppress(ProcessLookupError, OSError):
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    with contextlib.suppress(subprocess.TimeoutExpired):
+    with contextlib.suppress(process_env.TimeoutExpired):
         proc.wait(timeout=grace)
 
 
@@ -667,7 +732,7 @@ def tool_specs(listed: Any) -> tuple[ToolSpec, ...]:
             raise McpClientError("MCP tools/list returned a tool without a name")
         if name.startswith(FORBIDDEN_TOOL_PREFIX):
             raise McpClientError(
-                f"MCP tool name unexpectedly carries the OpenCode prefix: {name!r}"
+                f"MCP tool name unexpectedly carries a client-side prefix: {name!r}"
             )
         schema = tool.get("inputSchema")
         if not isinstance(schema, Mapping):
@@ -704,32 +769,38 @@ def assert_public_catalog(specs: Sequence[ToolSpec]) -> None:
         )
 
 
-def _open_stderr_log(stderr_log: str | os.PathLike[str] | None):
-    """設了 ``CODETRAIL_MCP_STDERR_LOG`` 才落檔;owner-only 並印一行警告。"""
+def _open_stderr_log(stderr_log: str | os.PathLike[str] | None, notify=None):
+    """呼叫端明確給 ``stderr_log`` 才落檔;owner-only 並發一則警告。
+
+    ``notify`` 讓呼叫端決定警告去哪裡。預設走 stderr(headless / CLI),但全螢幕
+    TUI 接管畫面之後任何直接 stdout / stderr 都會把畫面打壞——而這個路徑會在
+    取消升級後重新 spawn MCP 時再跑一次,也就是**回合進行中**。
+    """
     if not stderr_log:
         return None
+    if notify is None:
+        def notify(message: str) -> None:
+            print(f"[mcp] {message}", file=sys.stderr, flush=True)
     path = Path(stderr_log).expanduser()
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags, 0o600)
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.EMLINK):
-            raise McpClientError(f"{STDERR_LOG_ENV} 不得指向 symlink: {path}") from exc
-        raise McpClientError(f"無法開啟 {STDERR_LOG_ENV} 指定的檔案 {path}: {exc}") from exc
+            raise McpClientError(f"MCP stderr log 不得指向 symlink: {path}") from exc
+        raise McpClientError(f"無法開啟 MCP stderr log {path}: {exc}") from exc
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
-            raise McpClientError(f"{STDERR_LOG_ENV} 必須指向普通檔案: {path}")
+            raise McpClientError(f"MCP stderr log 必須指向普通檔案: {path}")
         os.fchmod(fd, 0o600)
     except Exception:
         os.close(fd)
         raise
     handle = os.fdopen(fd, "ab", closefd=True)
-    print(
-        f"[mcp] ⚠️ MCP server stderr 會寫進 {path}(0600)。"
-        "它含查詢原文、截圖抽取內容、命令與絕對路徑 —— 等同 NDA 內容,請自行保管與清理。",
-        file=sys.stderr,
-        flush=True,
+    notify(
+        f"⚠️ MCP server stderr 會寫進 {path}(0600)。"
+        "它含查詢原文、截圖抽取內容、命令與絕對路徑 —— 等同 NDA 內容,請自行保管與清理。"
     )
     return handle
 

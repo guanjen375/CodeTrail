@@ -85,7 +85,7 @@ MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
     "run_lint": "Run the configured formatter/linter on one sandboxed path. Use fix=false for check-only; this is a separate approval from apply_patch.",
     "run_command": (
         "Run one command from the server whitelist inside AICODE_ROOT. Allowed defaults cover tests and static checks; build commands "
-        "require AI_CODE_ENABLE_BUILD_COMMANDS=1, and git is not allowed (use git_status/git_diff). timeout is an integer 1..600 seconds; "
+        "require build_commands in client.json, and git is not allowed (use git_status/git_diff). timeout is an integer 1..600 seconds; "
         "the MCP client may stop waiting earlier. Output is bounded and highlights failures."
     ),
     "analyze_file": (

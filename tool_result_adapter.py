@@ -507,6 +507,15 @@ def adapt_tool_error(
     if str(error).lstrip().startswith(ingest_notify.BUSY_PREFIX):
         next_line = ("Wait for the in-flight ingest to finish (its result comes back "
                      "to the caller), then query again; this call did not run.")
+    elif getattr(error, "readonly_refusal", False):
+        # readonly server 的拒絕不是「輸入有問題」:重試同一個呼叫永遠是同一個
+        # 結果。給「修正後重試一次」會讓模型把那一次重試白白花掉。
+        next_line = ("This server refuses state-changing tools (read-only instance); "
+                     "do not retry this call, gather evidence with read-only tools instead.")
+    elif isinstance(error, PermissionError):
+        # 一般檔案系統的 EACCES:與 readonly instance 無關,別把模型引去「放棄寫入工具」。
+        next_line = ("The filesystem denied access to that path; pick a path this project "
+                     "may read or write (or ask the user), then retry once.")
     else:
         next_line = "Correct the reported input or environment problem, then retry once."
     prefix = f"status: error\nnext: {next_line}\n"

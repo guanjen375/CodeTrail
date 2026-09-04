@@ -84,7 +84,10 @@ def check_llama_health(max_retries: int = 3, timeout: int = 10) -> bool:
     Returns:
         True 如果主 server 回 /health 200,否則 False
     """
-    base_url = os.environ.get('AICODE_LLAMA_BASE_URL', 'http://localhost:8080')
+    # 端點只來自 deployment profile(config 在 import 期解析好的那一份)。
+    import config as _cfg
+
+    base_url = _cfg.LLAMA_BASE_URL
 
     # proxy 衛生:走共用硬化 session(trust_env=False、不跟 redirect),
     # 避免 loopback health 探測被環境 proxy 帶去別的 host。
@@ -841,7 +844,7 @@ def run_evaluation(
     # CodeTrail 不內建主模型, 沒設好直接 fail-loud (require_main_model raise)。
     import config as _eval_config
     _resolved = _eval_config.require_main_model()
-    _source = "AICODE_MODEL env" if os.environ.get("AICODE_MODEL", "").strip() else "deployment profile"
+    _source = "deployment profile"
     print(f"Using model: {_resolved} (from {_source})")
     print(f"N_CTX: {_eval_config.N_CTX}")
 

@@ -18,7 +18,6 @@ import hashlib
 import inspect
 import json
 import os
-import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -330,22 +329,29 @@ async def catalog_from_stdio(
         raise CatalogError("the mcp package is required for stdio catalog capture") from exc
 
     root = root.resolve()
-    server_env = os.environ.copy()
+    # root 走 **argv**,不走環境變數:同一台機器上的殼層可能留著別份安裝的
+    # `AICODE_ROOT`,而它會決定 server 的沙箱邊界。`child_env()` 剝掉那一整組
+    # 前綴,`--root` 明確附在命令列上。
+    #
+    # **剝除在最後**:呼叫端傳進來的 `environment` / `command.environment` 有可能
+    # 本身就是一份未剝除的 `os.environ`,先套再剝才不會把剛拿掉的東西加回去。
+    import client_mcp
+
+    server_env = client_mcp.child_env()
     if environment:
         server_env.update(environment)
     server_env.update(command.environment)
-    configured_root = server_env.get("AICODE_ROOT")
-    if configured_root:
-        try:
-            if Path(configured_root).expanduser().resolve() != root:
-                raise CatalogError("effective MCP AICODE_ROOT differs from the requested evaluation root")
-        except (OSError, ValueError) as exc:
-            raise CatalogError("effective MCP AICODE_ROOT is not resolvable") from exc
-    server_env["AICODE_ROOT"] = str(root)
+    for key in list(server_env):
+        if key.startswith(client_mcp.STRIPPED_ENV_PREFIXES):
+            server_env.pop(key, None)
+
+    args = list(command.argv[1:])
+    if "--root" not in args:
+        args.extend(["--root", str(root)])
 
     params = StdioServerParameters(
         command=command.argv[0],
-        args=list(command.argv[1:]),
+        args=args,
         env=server_env,
         cwd=str(root),
     )

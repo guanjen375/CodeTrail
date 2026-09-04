@@ -25,7 +25,6 @@ import json
 import os
 import re
 import stat
-import subprocess
 import sys
 import tempfile
 import time
@@ -44,6 +43,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import client_events  # noqa: E402
+import process_env  # noqa: E402
 import client_mcp  # noqa: E402
 import client_policy  # noqa: E402
 import client_prompt  # noqa: E402
@@ -69,7 +69,6 @@ MATRIX_SCHEMA_VERSION = 2
 DEFAULT_MCP_TIMEOUT_SECONDS = 120
 DEFAULT_MODEL_TIMEOUT_SECONDS = 180
 MAX_HTTP_RESPONSE_BYTES = 4 * 1024 * 1024
-MODEL_SERVER_PREFLIGHT_SKIP_ENV = "AICODE_REQUIRED_MODELS_CHECK_SKIP"
 REQUIRED_BILINGUAL_CATEGORIES = frozenset(
     {
         "directory",
@@ -1107,7 +1106,14 @@ def client_identity(root: Path) -> str:
     try:
         import client_prompt
 
-        parts.append(client_prompt.build_system_prompt(root).digest)
+        prompt_text = client_prompt.build_system_prompt(root).text
+        # system prompt 明文含「專案根目錄(沙箱邊界): <絕對路徑>」;合成專案每次在不同的
+        # TemporaryDirectory,直接雜湊整份就是每跑一次一個新身分 —— 第一次寫進
+        # support-matrix 的 client_version,第二次在 assert_compatibility 直接炸。
+        # 身分要綁的是 prompt 的**內容**(專案 AGENTS.md / lessons / 規則),不是它住哪。
+        for marker in sorted({str(root), str(root.resolve())}, key=len, reverse=True):
+            prompt_text = prompt_text.replace(marker, "<ROOT>")
+        parts.append(text_digest(prompt_text)[:16])
     except Exception:  # noqa: BLE001
         parts.append("prompt-unavailable")
     return text_digest("|".join(parts))[:16]
@@ -1127,15 +1133,17 @@ class LocalJsonClient:
             hostname = parsed.hostname
         except ValueError as exc:
             raise EvalError("main model base URL is invalid") from exc
-        remote_ok = os.environ.get("AICODE_MODEL_REMOTE_OK", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+        # 遠端端點的同意來自 client.json 的 `model_remote_ok`(經 config)——
+        # 與 runtime 的 `endpoint_policy` 是同一個判準,不是另一份。
+        import config
+
+        remote_ok = bool(getattr(config, "MODEL_REMOTE_OK", False))
         if parsed.scheme not in ("http", "https") or not hostname or parsed.query or parsed.fragment:
             raise EvalError("main model base URL is invalid")
         if hostname not in ("localhost", "127.0.0.1", "::1") and not remote_ok:
-            raise EvalError("non-loopback model endpoint requires AICODE_MODEL_REMOTE_OK=1")
+            raise EvalError(
+                "non-loopback model endpoint requires client.json model_remote_ok=true"
+            )
         self.base_url = base_url.rstrip("/")
         if self.base_url.endswith("/v1"):
             self.base_url = self.base_url[:-3]
@@ -1211,8 +1219,11 @@ def _model_server_base_url(
     """Bind direct token/props probes to the endpoint the client will use.
 
     `config` 是空的(去 OpenCode 化之後沒有第二份 provider 設定);留著參數是為了
-    result identity 的 digest 形狀不變。真正的來源是 `AICODE_LLAMA_BASE_URL`。
+    result identity 的 digest 形狀不變。真正的來源是 **deployment profile**
+    (`config.LLAMA_BASE_URL`)—— 以前是 `AICODE_LLAMA_BASE_URL`,殼層殘留一個值
+    就會讓 15 題去打別台機器的 server,結果卻歸到本機的 identity。
     """
+    import config as _codetrail_config
 
     # `--model` 跟 `aicode -m` 一樣收 bare registry name / GGUF 路徑;舊式
     # `llamacpp/<name>` 仍接受(provider 段只用來對照 config 裡的 baseURL,沒有就是本地)。
@@ -1228,7 +1239,7 @@ def _model_server_base_url(
         raise EvalError("effective provider baseURL is invalid")
     if isinstance(configured, str) and not configured.strip():
         raise EvalError("effective provider baseURL is invalid")
-    environment_url = environment.get("AICODE_LLAMA_BASE_URL")
+    environment_url = _codetrail_config.LLAMA_BASE_URL
     configured_root = _normalise_server_root(configured) if configured else None
     environment_root = _normalise_server_root(environment_url) if environment_url else None
     if configured_root and environment_root and configured_root != environment_root:
@@ -1399,7 +1410,6 @@ def _run_client_attempt(
     project: Path,
     prompt: str,
     model: str | None,
-    environment: Mapping[str, str],
     timeout_seconds: int,
 ) -> AttemptTrace:
     # 真的跑一次 headless 客戶端,而且是**唯讀**權限:routing eval 只驗模型會
@@ -1409,29 +1419,28 @@ def _run_client_attempt(
     command = [
         sys.executable,
         str(REPO_ROOT / "codetrail_chat.py"),
+        "run",
         "--root",
         str(project),
         "--policy",
         "readonly",
     ]
-    child_env = dict(environment)
     if model:
         # 跟 canary 一樣把 --model 真的送出去:不然 15 題逐題跑的是呼叫環境
         # AICODE_MODEL 指的那顆(或直接啟動失敗),結果卻歸到指定模型的 identity。
         # 送的是正規化後的 bare name(直接執行的 codetrail_chat.py 不會像 aicode
         # wrapper 那樣剝掉 llamacpp/ 前綴)。
-        bare = _bare_model(model)
-        command.extend(["--model", bare])
-        child_env["AICODE_MODEL"] = bare
-    command.extend(["run", "--format", "json", prompt])
+        # 只走 argv。以前這裡同時設 `AICODE_MODEL`,但子行程的環境在交出去
+        # 之前已經被剝乾淨(`AICODE_*` 整組),所以那一份只會誤導讀 code 的人。
+        command.extend(["--model", _bare_model(model)])
+    command.extend(["--format", "json", prompt])
     started = time.monotonic()
     timed_out = False
     try:
-        completed = subprocess.run(
+        completed = process_env.run(
             command,
             cwd=str(project),
-            env=child_env,
-            stdin=subprocess.DEVNULL,
+            stdin=process_env.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -1439,7 +1448,7 @@ def _run_client_attempt(
         )
         stdout = completed.stdout
         harness_error = completed.returncode != 0
-    except subprocess.TimeoutExpired as exc:
+    except process_env.TimeoutExpired as exc:
         timed_out = True
         stdout_value = exc.stdout
         if isinstance(stdout_value, bytes):
@@ -1462,14 +1471,13 @@ def _delete_sessions(
     session_ids: Sequence[str],
     *,
     project: Path,
-    environment: Mapping[str, str],
-) -> bool:
+    ) -> bool:
     """headless 預設 ephemeral —— 評測的對話從來沒有落檔,沒有東西要刪。
 
     保留這個函式(永遠回 True)是為了讓報告欄位與呼叫端的形狀不變;真正的
     保證在 `codetrail_chat run` 不帶 `--persist`。
     """
-    del session_ids, project, environment
+    del session_ids, project
     return True
 
 
@@ -1504,8 +1512,7 @@ def _run_explicit_canary_gate(
             _delete_sessions(
                 evidence.session_ids,
                 project=project,
-                environment=environment,
-            )
+                )
             and sessions_ok
         )
         if evidence.success and sessions_ok:
@@ -1528,10 +1535,36 @@ def _ask_permission_contract(_config: Mapping[str, Any] | None = None) -> bool:
     """
     import client_policy
 
-    return client_policy.ASK_TOOLS == frozenset(
+    # 「保留」= 那六個寫入工具**仍然**要問;名單之後加了 `import_external_file`
+    # (總審 F1-13:exact 比對舊六項會讓 gate 永遠 False,再完美的 case 也過不了)。
+    required = frozenset(
         {"apply_patch", "run_lint", "run_command", "remove_document",
          "record_lesson", "review_figures"}
     )
+    return required <= client_policy.ASK_TOOLS
+
+
+def _server_args_for_root(command: StdioMcpCommand, project: Path) -> list[str]:
+    """catalog 的 command 已經帶 CLI 的 `--root`;合成 KB 與 cases 都要綁**合成專案**。
+
+    只在「沒有 --root 才附加」的話,MCP 仍綁 CLI root:root-canary 直接失敗,或
+    knowledge 灌進 CLI root,而 15 題 headless cases 卻在另一個 temp project 跑。
+    """
+    args = list(command.argv[1:])
+    cleaned: list[str] = []
+    i = 0
+    while i < len(args):
+        item = args[i]
+        if item == "--root":
+            i += 2
+            continue
+        if item.startswith("--root="):
+            i += 1
+            continue
+        cleaned.append(item)
+        i += 1
+    cleaned.extend(["--root", str(project)])
+    return cleaned
 
 
 async def _prepare_synthetic_knowledge(
@@ -1548,13 +1581,16 @@ async def _prepare_synthetic_knowledge(
         from mcp.client.stdio import stdio_client
     except ImportError as exc:
         raise EvalError("mcp package is required to prepare the synthetic KB") from exc
-    server_env = dict(environment)
-    server_env.update(command.environment)
-    server_env["AICODE_ROOT"] = str(project)
-    server_env["AI_CODE_COLLECT_DATA"] = "0"
+    # root 走 argv;設定走 client.json。環境裡不留任何 CodeTrail 名稱 —— 殼層的
+    # 殘留值不得決定這次評測的 sandbox 邊界或資料收集行為。
+    server_env = {
+        key: value for key, value in environment.items()
+        if not key.startswith(("AICODE_", "AI_CODE_", "CODETRAIL_", "OPENCODE_"))
+    }
+    args = _server_args_for_root(command, project)
     params = StdioServerParameters(
         command=command.argv[0],
-        args=list(command.argv[1:]),
+        args=args,
         env=server_env,
         cwd=str(project),
     )
@@ -1613,14 +1649,12 @@ async def _acquire_catalog(
     environment: Mapping[str, str],
 ) -> tuple[CatalogSnapshot, StdioMcpCommand | None]:
     if args.catalog_source == "in-process":
-        overrides = {
-            "AICODE_ROOT": str(root),
-            MODEL_SERVER_PREFLIGHT_SKIP_ENV: "1",
-            "AI_CODE_COLLECT_DATA": "0",
-        }
-        previous = {key: os.environ.get(key) for key in overrides}
+        # in-process 只是 **import** 那個模組拿工具目錄:mcp_server 被 import 時
+        # 不吃 argv、也不跑附屬 server 的硬閘(那是「啟動一個 server」的閘)。
+        # root 用 cwd —— 與 spawn 路徑的 `--root` 是同一個判準。
+        previous_cwd = os.getcwd()
         try:
-            os.environ.update(overrides)
+            os.chdir(root)
             module = importlib.import_module(args.in_process_module)
             server = getattr(module, "mcp", None)
             if server is None:
@@ -1633,22 +1667,23 @@ async def _acquire_catalog(
                 raise
             raise EvalError(f"in-process MCP catalog failed ({type(exc).__name__})") from exc
         finally:
-            for key, value in previous.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
+            os.chdir(previous_cwd)
         return catalog, None
     # 客戶端啟動 MCP server 的方式就是這一條;沒有第二份 OpenCode 設定可以抽。
     # 走 client_mcp 的常數而不是自己拼路徑,兩邊才不會各自漂移。
     command = StdioMcpCommand(
-        (sys.executable, str(client_mcp.SERVER_SCRIPT)),
-        {"AICODE_ROOT": str(root)},
+        (sys.executable, str(client_mcp.SERVER_SCRIPT), "--root", str(root)),
+        {},
     )
     if args.catalog_only:
-        command_environment = dict(command.environment)
-        command_environment[MODEL_SERVER_PREFLIGHT_SKIP_ENV] = "1"
-        command = StdioMcpCommand(command.argv, command_environment)
+        # catalog-only 明確是**零模型**模式:mcp_server 啟動時的附屬 server 硬閘
+        # 會真的去打 embedding / reranker / VL,而 catalog 抓的是
+        # initialize/tools/list 的契約位元組,跟那三個 server 無關。
+        # 走 **argv**(`--skip-aux-preflight`):`catalog_from_stdio` 交出子行程
+        # 環境之前會把 `AICODE_*` 整組剝掉,所以用環境變數傳這個意圖必然失效。
+        command = StdioMcpCommand(
+            tuple(command.argv) + ("--skip-aux-preflight",), command.environment
+        )
     catalog = await catalog_from_stdio(
         command,
         root=root,
@@ -1723,12 +1758,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     cases_data = load_cases(args.cases)
     matrix = load_support_matrix(args.support_matrix)
     row = select_matrix_row(matrix, args.matrix_row, args.arm)
-    environment = os.environ.copy()
-    if args.catalog_only:
-        # mcp_server's startup preflight normally exercises embedding/reranker/
-        # VL endpoints.  Catalog-only is explicitly a zero-model mode, and the
-        # preflight does not affect initialize/tools/list contract bytes.
-        environment[MODEL_SERVER_PREFLIGHT_SKIP_ENV] = "1"
+    environment = client_mcp.child_env()
 
     # The in-process path is the deliberately offline CI path.  The stdio path
     # now starts our own ``mcp_server.py`` through the same command the client
@@ -1767,10 +1797,25 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     assert client_version is not None
     if command is None:
         raise EvalError("model evaluation requires the effective stdio MCP catalog")
-    # 命令是我們自己組的,AICODE_ROOT 一定指向這次評測的 sandbox root;
-    # 這裡守的是「不得在評測途中打開 data flywheel」。
-    if command.environment.get("AI_CODE_COLLECT_DATA", "").lower() in ("1", "true", "yes"):
-        raise EvalError("routing eval refuses an MCP command that persists data-flywheel records")
+    # 命令是我們自己組的,`--root` 一定指向這次評測的 sandbox root;
+    # 這裡守的是「不得在評測途中打開 data flywheel」。資料收集現在是 client.json 的
+    # `collect_data`,而評測用的是使用者那一份 —— 開著的話這次評測會把合成
+    # fixture 的問答寫進去。
+    import client_config
+
+    try:
+        _settings = client_config.load_client_settings()
+    except client_config.ClientConfigError:
+        _settings = None
+    else:
+        if _settings.collect_data:
+            raise EvalError(
+                "routing eval refuses to run while client.json has collect_data enabled"
+            )
+        # 其餘的鍵要**真的套進 config**:endpoint policy 的遠端同意
+        # (`model_remote_ok`)就在裡面,不套的話一個合法的遠端部署會被自己的
+        # 客戶端擋下來,而評測回報的是「模型不會呼叫工具」。
+        client_config.apply_to_config(_settings, readonly=False)
 
     configured_model = args.model
     if not configured_model:
@@ -1790,19 +1835,6 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     caps = props.get("chat_template_caps")
     if isinstance(caps, Mapping) and caps.get("supports_tools") is False:
         raise EvalError("chat template explicitly reports supports_tools=false")
-    identity = compatibility_identity(
-        row=row,
-        arm=args.arm,
-        client_version=client_version,
-        catalog=catalog,
-        props=props,
-        effective_config=effective_config,
-        selected_model=configured_model,
-        fixture_digest=json_digest(cases_data),
-        environment=environment,
-    )
-    assert_compatibility(row, identity)
-    assert_arm_contract(matrix, args.arm, identity)
 
     token_measurement = measure_catalog_prompt_tokens(
         model=probe_model,
@@ -1818,11 +1850,27 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="codetrail-routing-eval-") as temp_dir:
         project = Path(temp_dir) / "synthetic"
         materialize_synthetic_fixture(cases_data, project)
+        # 身分要綁**實際跑 cases 的 root**的 system prompt(專案 AGENTS.md / lessons
+        # 在那裡),而且要在 client.json 套進 config 之後算 —— 上面用 CLI root 算的
+        # 那一份只對 catalog-only 有意義。
+        client_version = client_identity(project)
+        # 身分在這裡才建:上面那個 `client_version` 若只是重新指定給局部變數而
+        # `identity` 早在 block 外建好,結果、相容性斷言與 checkpoint 用的仍是 CLI root
+        # 的身分(dead assignment)。
+        identity = compatibility_identity(
+            row=row,
+            arm=args.arm,
+            client_version=client_version,
+            catalog=catalog,
+            props=props,
+            effective_config=effective_config,
+            selected_model=configured_model,
+            fixture_digest=json_digest(cases_data),
+            environment=environment,
+        )
+        assert_compatibility(row, identity)
+        assert_arm_contract(matrix, args.arm, identity)
         model_env = environment.copy()
-        model_env["AICODE_ROOT"] = str(project)
-        # Evaluation prompts/results may exist transiently in OpenCode memory,
-        # but must not enter the persistent data-flywheel JSONL.
-        model_env["AI_CODE_COLLECT_DATA"] = "0"
         await _prepare_synthetic_knowledge(
             command,
             project=project,
@@ -1844,21 +1892,18 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 project=project,
                 prompt=case["prompt"],
                 model=probe_model,
-                environment=model_env,
                 timeout_seconds=args.model_timeout,
             )
             attempts.append(first)
             sessions_deleted = _delete_sessions(
                 first.session_ids,
                 project=project,
-                environment=model_env,
-            )
+                )
             if not first.terminal:
                 second = _run_client_attempt(
                     project=project,
                     prompt=case["prompt"],
                     model=probe_model,
-                    environment=model_env,
                     timeout_seconds=args.model_timeout,
                 )
                 attempts.append(second)
@@ -1866,8 +1911,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                     _delete_sessions(
                         second.session_ids,
                         project=project,
-                        environment=model_env,
-                    )
+                        )
                     and sessions_deleted
                 )
             outcome = evaluate_attempts(case, attempts, schemas=schemas)

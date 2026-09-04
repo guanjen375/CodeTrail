@@ -271,7 +271,7 @@ def test_truncated_response_is_fail_loud(monkeypatch):
 
     detail = only_failure(results, slug="truncated").reason_details[0]
     assert "truncated" in detail
-    assert "AICODE_VL_INGEST_MAX_TOKENS" in detail, "截斷要給得出可行動的建議"
+    assert "config.VL_INGEST_MAX_TOKENS" in detail, "截斷要給得出可行動的建議"
     # 重試一次（config.FIGURE_EXTRACT_RETRIES）之後才放棄
     assert len(spy.calls) == 1 + config.FIGURE_EXTRACT_RETRIES
 
@@ -361,7 +361,7 @@ def test_truncation_without_headroom_fails_without_repeating_the_call(monkeypatc
     detail = only_failure(results, slug="truncated").reason_details[0]
     assert "truncated" in detail
     assert "8192" in detail, ("訊息要帶得出 server n_ctx / 已用預算的實際數字", detail)
-    assert "AICODE_VL_INGEST_MAX_TOKENS" in detail
+    assert "config.VL_INGEST_MAX_TOKENS" in detail
 
 
 @pytest.mark.smoke
@@ -541,7 +541,7 @@ def test_structural_conflict_keeps_neither_candidate(monkeypatch):
 @pytest.mark.smoke
 def test_capability_probe_failure_blocks_every_extraction(monkeypatch, tmp_path):
     """probe 沒過 ⇒ 零抽取、零 render、零 KB mutation，而且失敗不進快取。"""
-    monkeypatch.setenv("AICODE_FIGURE_PROBE_FILE", str(tmp_path / "probe.json"))
+    _probe_home(monkeypatch, tmp_path)
     spy = VLSpy({"figure_table": REGISTER_TABLE}, finish_reason="length")
     install_vl(monkeypatch, spy)
     monkeypatch.setattr(figure_verify, "_render_canary_png", lambda spec: b"\x89PNG-canary")
@@ -587,10 +587,23 @@ def test_retry_after_failure_also_disables_prompt_cache(monkeypatch):
 
 
 @pytest.mark.smoke
+def _probe_home(monkeypatch, tmp_path):
+    """把 HOME 指到 tmp,回 `~/.config/codetrail/figure_probe.json` 的路徑。
+
+    2026-09-04:位置覆寫 `AICODE_FIGURE_PROBE_FILE` 刪除。行為為什麼該變:
+    一個「檔案在哪」的環境變數只會讓 runtime 與診斷工具各自看到不同的檔,而
+    使用者以為它們在講同一份。測試接縫只剩 HOME。
+    """
+    home = tmp_path / "probe-home"
+    (home / ".config" / "codetrail").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home / ".config" / "codetrail" / "figure_probe.json"
+
+
 def test_probe_cache_stores_only_fingerprint_and_timestamp(monkeypatch, tmp_path):
     """快取檔只能有 fingerprint 與時戳：不存 prompt、模型輸出、base_url、專案路徑。"""
-    cache = tmp_path / "probe.json"
-    monkeypatch.setenv("AICODE_FIGURE_PROBE_FILE", str(cache))
+    cache = _probe_home(monkeypatch, tmp_path)
     monkeypatch.setattr(figure_verify, "_render_canary_png", lambda spec: b"\x89PNG-canary")
     figure_verify._PROCESS_PROBE_PASSES.clear()
 
@@ -1747,7 +1760,7 @@ def probe_responder(table_widths, *, terminal=None, truncate=(), fail=()):
 
 @pytest.fixture
 def probe_env(monkeypatch, tmp_path):
-    monkeypatch.setenv("AICODE_FIGURE_PROBE_FILE", str(tmp_path / "probe.json"))
+    _probe_home(monkeypatch, tmp_path)
     monkeypatch.setattr(figure_verify, "_render_canary_png", lambda spec: b"\x89PNG-canary")
     figure_verify._PROCESS_PROBE_PASSES.clear()
     return tmp_path / "probe.json"
@@ -1793,7 +1806,7 @@ def test_probe_lists_every_missing_capability(probe_env, monkeypatch):
         "terminal.required_fields_present", "terminal.canonicalizable",
         "terminal.validator_pass",
     ]
-    assert "AICODE_VL_INGEST_MAX_TOKENS" in str(error)
+    assert "config.VL_INGEST_MAX_TOKENS" in str(error)
 
 
 def test_probe_separates_image_rejection_from_schema_rejection(probe_env, monkeypatch):

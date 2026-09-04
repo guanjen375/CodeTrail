@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import client_compaction as cc  # noqa: E402
 import client_config  # noqa: E402
 import client_policy  # noqa: E402
-import compaction_mode  # noqa: E402
+import compaction_formula  # noqa: E402
 import config  # noqa: E402
 
 pytestmark = pytest.mark.smoke
@@ -33,7 +33,7 @@ pytestmark = pytest.mark.smoke
 def test_the_rule_text_is_the_canonical_document_verbatim():
     """規則字面值與文件不一致是靜默的:模型照舊產出摘要,只是規則換了一份。"""
     block = cc.rules_block()
-    assert block.startswith(compaction_mode.RULES_BLOCK_MARKER)
+    assert block.startswith(compaction_formula.RULES_BLOCK_MARKER)
     doc = (Path(__file__).resolve().parent.parent / "docs" / "compaction-rules.md").read_text(
         encoding="utf-8"
     )
@@ -42,14 +42,14 @@ def test_the_rule_text_is_the_canonical_document_verbatim():
 
 def test_the_seven_headings_come_from_the_document():
     headings = cc.rule_headings()
-    assert len(headings) == compaction_mode.RULE_HEADING_COUNT
+    assert len(headings) == compaction_formula.RULE_HEADING_COUNT
     assert headings[0] == "任務" and headings[-1] == "使用者偏好與限制"
 
 
 def test_the_threshold_matches_the_documented_worked_example():
     """docs/compaction-rules.md §2 的算例:131072 / 8192。
 
-    公式只有一份(`compaction_mode.derive_settings`)。客戶端另外抄一份的話,
+    公式只有一份(`compaction_formula.derive_settings`)。客戶端另外抄一份的話,
     門檻與文件、與 doctor 報的數字會各說各話。
     """
     derived = cc.derive(131072, 8192)
@@ -82,17 +82,25 @@ def test_the_output_constant_is_bounded_by_the_derivation_formula(monkeypatch):
     engine 照樣送原值,門檻卻按 32000 算 —— 門檻不再由實際輸出上限推出來,
     而且沒有任何訊息。所以這兩種值一律 fail-loud。
     """
-    assert config.CLIENT_MAX_OUTPUT_TOKENS_CAP == compaction_mode.UPSTREAM_OUTPUT_TOKEN_MAX
+    assert config.CLIENT_MAX_OUTPUT_TOKENS_CAP == compaction_formula.UPSTREAM_OUTPUT_TOKEN_MAX
     assert 0 < config.CLIENT_MAX_OUTPUT_TOKENS <= config.CLIENT_MAX_OUTPUT_TOKENS_CAP
-    for bad in ("65536", "0", "-1", "abc"):
-        proc = subprocess.run(
-            [sys.executable, "-c", "import config"],
-            cwd=str(pathlib.Path(__file__).resolve().parent.parent),
-            env={**os.environ, "AICODE_CLIENT_MAX_OUTPUT_TOKENS": bad},
-            capture_output=True, text=True,
-        )
-        assert proc.returncode != 0, bad
-        assert "AICODE_CLIENT_MAX_OUTPUT_TOKENS" in proc.stderr, bad
+    # 2026-09-04:`AICODE_CLIENT_MAX_OUTPUT_TOKENS` 刪除,這個數字是 repo 常數。
+    # 那道 import-time 檢查仍在(它擋的是「改 repo 的人改壞」),只是輸入不再
+    # 來自環境 —— 所以殼層裡的殘留值必須完全沒有作用。
+    proc = subprocess.run(
+        [sys.executable, "-c", "import config; print(config.CLIENT_MAX_OUTPUT_TOKENS)"],
+        cwd=str(pathlib.Path(__file__).resolve().parent.parent),
+        env={**os.environ, "AICODE_CLIENT_MAX_OUTPUT_TOKENS": "65536"},
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == str(config.CLIENT_MAX_OUTPUT_TOKENS)
+
+    # 而 repo 自己把它改壞時,import 必須爆(不是「送 65536、門檻按 32000 算」)。
+    source = (pathlib.Path(__file__).resolve().parent.parent / "config.py").read_text(
+        encoding="utf-8"
+    )
+    assert "CLIENT_MAX_OUTPUT_TOKENS 必須介於" in source
 
 
 def test_a_conforming_summary_passes():
@@ -228,6 +236,36 @@ def test_a_stopped_session_stays_stopped_across_restarts(tmp_path, monkeypatch):
     cc.record_stopped("20260101T000000-abcdef01", "summary_empty")
     found = cc.read_stopped()
     assert found[cc.session_hash("20260101T000000-abcdef01")] == "summary_empty"
+
+
+@pytest.mark.smoke
+def test_a_ledger_written_before_the_upgrade_still_disables_that_session(tmp_path, monkeypatch):
+    """`compaction-stopped.jsonl` 是**升級前的自己**寫的 durable safety state。
+
+    兩個世代的 CodeTrail 共用同一台機器上的同一個檔:同一個 schema、同一個
+    line 形狀,而讀取端以 session 雜湊為鍵。所以「改檔名來隔離」不行 —— 那會把
+    升級前記下的停用紀錄整批丟掉,那些 session 重開之後又會拿一份不可信的摘要
+    去壓縮。這裡直接寫一行「舊版格式」的紀錄,確認新版照樣認得。
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    directory = tmp_path / "codetrail"
+    directory.mkdir(parents=True)
+    session = "20260101T000000-abcdef01"
+    legacy = {
+        "schema": cc.STOPPED_SCHEMA,
+        "session": cc.session_hash(session),
+        "detail": "summary_format",
+        "time": 1_700_000_000,
+    }
+    other_generation = {"schema": 99, "session": cc.session_hash(session), "detail": "別人的"}
+    path = directory / cc.STOPPED_FILE
+    path.write_text(
+        json.dumps(other_generation, ensure_ascii=False) + "\n"
+        + json.dumps(legacy, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    assert cc.read_stopped()[cc.session_hash(session)] == "summary_format"
 
 
 def test_a_symlinked_ledger_is_never_written_through(tmp_path, monkeypatch):
@@ -457,7 +495,7 @@ def test_the_rules_are_appended_not_replacing_the_instructions(tmp_path, monkeyp
     engine = _FakeEngine(_conversation(4), summary=_seven_field_summary())
     _compactor(engine).compact(manual=True)
     system = engine.requests[0][0]["content"]
-    assert system.index("結構化摘要") < system.index(compaction_mode.RULES_BLOCK_MARKER)
+    assert system.index("結構化摘要") < system.index(compaction_formula.RULES_BLOCK_MARKER)
 
 
 def test_a_drifted_summary_stops_this_session(tmp_path, monkeypatch):

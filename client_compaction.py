@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""client_compaction — 結構化壓縮(從 OpenCode plugin 搬進 Python engine)。
+"""client_compaction — 結構化壓縮(從舊前端的 JS plugin 搬進 Python engine)。
 
-搬過來之後消失的東西:``idle → summarize`` 之間的兩種競態,以及 OpenCode 的
+搬過來之後消失的東西:``idle → summarize`` 之間的兩種競態,以及舊前端的
 版本閘。迴圈是我們自己的:壓縮發生在「助理答完、沒有進行中的請求」的那一刻,
 中間沒有另一個行程能插進來,所以 ``race_parent_mismatch`` /
 ``race_unanswered_user`` 由構造消失,不再需要事後偵測。
@@ -10,7 +10,7 @@
 **留下來的**是真正與模型有關的那幾條(docs/compaction-rules.md 仍是唯一來源):
   * 七條摘要規則,逐字取自文件的 ```text 區塊;
   * 狀態校正節錄(最近五個已完成回合,50/30/10/5/5 配額,零工具參數與輸出);
-  * 門檻公式(``compaction_mode.derive_settings``,與設定寫入端同一份);
+  * 門檻公式(``compaction_formula.derive_settings``,與設定寫入端同一份);
   * 事後核對:空 / 只有 reasoning / 出錯 / 七欄格式漂移;
   * 停用 ledger:跨行程保留,只記不可信的那幾種成因。
 
@@ -33,7 +33,7 @@ from typing import Any, Protocol
 
 import client_events
 import client_paths
-import compaction_mode
+import compaction_formula
 import config
 import context_budget
 import llama_client
@@ -80,7 +80,7 @@ class CompactionError(RuntimeError):
 # ============================================================
 # 門檻
 # ============================================================
-def derive(n_ctx: int, max_output: int | None = None) -> compaction_mode.DerivedSettings:
+def derive(n_ctx: int, max_output: int | None = None) -> compaction_formula.DerivedSettings:
     """用**同一條**公式推導門檻。
 
     客戶端沒有 ``limit.input``,所以走 ``usable = context - max_output`` 那一支;
@@ -88,14 +88,14 @@ def derive(n_ctx: int, max_output: int | None = None) -> compaction_mode.Derived
     ``max_tokens``、context gate 的保留額是同一個常數。
     """
     output = config.CLIENT_MAX_OUTPUT_TOKENS if max_output is None else max_output
-    return compaction_mode.derive_settings(context_limit=n_ctx, output_limit=output)
+    return compaction_formula.derive_settings(context_limit=n_ctx, output_limit=output)
 
 
-if config.CLIENT_MAX_OUTPUT_TOKENS_CAP != compaction_mode.UPSTREAM_OUTPUT_TOKEN_MAX:
+if config.CLIENT_MAX_OUTPUT_TOKENS_CAP != compaction_formula.UPSTREAM_OUTPUT_TOKEN_MAX:
     # pragma: no cover - import guard
     # 兩邊分開改就是「送 65536、門檻按 32000 算」那個 bug 的原型。
     raise RuntimeError(
-        "CLIENT_MAX_OUTPUT_TOKENS_CAP 必須等於 compaction_mode.UPSTREAM_OUTPUT_TOKEN_MAX"
+        "CLIENT_MAX_OUTPUT_TOKENS_CAP 必須等於 compaction_formula.UPSTREAM_OUTPUT_TOKEN_MAX"
     )
 
 
@@ -103,15 +103,15 @@ if config.CLIENT_MAX_OUTPUT_TOKENS_CAP != compaction_mode.UPSTREAM_OUTPUT_TOKEN_
 # 規則與節錄
 # ============================================================
 def rules_block() -> str:
-    return compaction_mode.canonical_block(compaction_mode.RULES_BLOCK_MARKER)
+    return compaction_formula.canonical_block(compaction_formula.RULES_BLOCK_MARKER)
 
 
 def reconciliation_header() -> str:
-    return compaction_mode.canonical_block(compaction_mode.RECONCILIATION_BLOCK_MARKER)
+    return compaction_formula.canonical_block(compaction_formula.RECONCILIATION_BLOCK_MARKER)
 
 
 def rule_headings() -> tuple[str, ...]:
-    return compaction_mode.rule_headings()
+    return compaction_formula.rule_headings()
 
 
 def _summary_headings(text: str) -> list[str]:
@@ -443,7 +443,7 @@ def split_for_compaction(
     messages: Sequence[Mapping[str, Any]],
     *,
     preserve_recent_tokens: int,
-    tail_turns: int = compaction_mode.TAIL_TURNS,
+    tail_turns: int = compaction_formula.TAIL_TURNS,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """切成 (要摘要的前段, 逐字保留的 tail)。
 
@@ -540,11 +540,11 @@ class Compactor:
         self.n_ctx = n_ctx
         # 推不出可用門檻不是例外狀況,是一種要**講出來**的模式:n_ctx 太小的
         # 機器上,靜靜不壓縮等於這個 session 從此不再壓縮而沒有人知道。
-        self.derived: compaction_mode.DerivedSettings | None = None
+        self.derived: compaction_formula.DerivedSettings | None = None
         self.derive_error = ""
         try:
             self.derived = derive(n_ctx, max_output_tokens)
-        except compaction_mode.CompactionModeError as exc:
+        except compaction_formula.CompactionModeError as exc:
             self.derive_error = str(exc)
         self.previous_summary = ""
         self.last_anchor: str | None = None
@@ -645,7 +645,7 @@ class Compactor:
         turn:取消的判定走 engine 同一套線性化——每一個「這次壓縮的結果就是這樣」的決定
         (early-return、換歷史、永久停用)之前先 commit_point(),之前的取消讓這裡以
         TurnCancelled 結束(歷史 / ledger 一個 byte 都不動),之後的取消一律被拒絕。
-        preflight 若在 turn 之外,web 已開始回合而 engine 還閒置,取消會被當成 prestart
+        preflight 若在 turn 之外,協調器已開始回合而 engine 還閒置,取消會被當成 prestart
         「武裝」、卻沒有任何 turn 去消費它——回了 ok 卻什麼都沒取消。"""
         scope = getattr(self.engine, "turn_scope", None)
         commit_point = getattr(self.engine, "commit_point", None)

@@ -53,7 +53,7 @@ CodeTrail 的壓縮**只在 idle 觸發**,所以它一併放棄了:
 ## 2. 觸發門檻怎麼算
 
 門檻不是固定百分比,而是從模型的 context 與 CodeTrail 自己的工具結果預算推導出來的
-(`compaction_mode.derive_settings`,客戶端經 `client_compaction.derive` 用同一份):
+(`compaction_formula.derive_settings`,客戶端經 `client_compaction.derive` 用同一份):
 
 ```text
 max_output  = min(limit.output, 32000) || 32000  # 0 退回 32000
@@ -241,7 +241,7 @@ context 漲了 88k–108k tokens,其中模型輸出 25k–50k tokens,而那幾�
 **代價,兩個,都要知道**:
 
 1. **偏離模型官方行為**。DeepSeek-V4 的 encoder 在有 tools 時是刻意全留的,丟掉它是
-   模型相依的品質賭注。`CODETRAIL_KEEP_REASONING=1`(環境變數)可以單獨關掉這一項。
+   模型相依的品質賭注。在 `~/.config/codetrail/client.json` 設 `"keep_historical_reasoning": true` 可以單獨關掉這一項。
    `aicode` 啟動橫幅會顯示目前在哪一邊。
 2. **每個新問題多一次 prefill**。改動歷史等於改動 prompt 前綴,下一輪的快取會在「上一輪
    第一則 assistant」處失效,要重算上一輪的非 reasoning 內容(工具輸入輸出與回答)。

@@ -55,8 +55,8 @@ def spawn_guard(monkeypatch) -> list:
         calls.append((args, kwargs))
         raise AssertionError("subprocess spawned by apply_patch verification")
 
-    monkeypatch.setattr("agent_tools.subprocess.run", boom)
-    monkeypatch.setattr("agent_tools.subprocess.Popen", boom)
+    monkeypatch.setattr("process_env.run", boom)
+    monkeypatch.setattr("process_env.popen", boom)
     return calls
 
 
@@ -228,7 +228,7 @@ def test_native_and_executor_docstrings_are_updated():
     }
     run_command_doc = " ".join(docs["run_command"].split())
     assert "1..600" in run_command_doc
-    assert "只在 AI_CODE_ENABLE_BUILD_COMMANDS=1" in run_command_doc
+    assert "client.json 的 build_commands" in run_command_doc
     assert "git 不在白名單" in run_command_doc
     assert "client 可能更早截止" in run_command_doc
     verify_doc = " ".join(docs["_verify_patched_files"].split())
@@ -299,7 +299,10 @@ def test_dot_h_follows_header_language_decision(monkeypatch, h_lang):
     import ast_parser
     import patch_verify
 
-    monkeypatch.setenv("AICODE_H_LANG", h_lang)
+    import config
+
+    # `h_lang` 是 client.json 的鍵(經 config),不是環境變數。
+    monkeypatch.setattr(config, "H_LANG", h_lang)
     asked: list[str] = []
     monkeypatch.setattr(ast_parser, "_try_load_tree_sitter_language",
                         lambda lang: asked.append(lang) or None)

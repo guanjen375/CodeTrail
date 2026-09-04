@@ -640,7 +640,7 @@ def _next_output_budget(previous: int, result, server_n_ctx: int | None) -> tupl
     `budget <= previous` 代表**沒有更大的預算可用**：這時再送一次就是逐字相同的
     請求，greedy 取樣必然重播同一個 `length`。呼叫端據此直接放棄那次呼叫，並把
     說明字串放進錯誤訊息——使用者要看得到「已經用了多少 / server 還剩多少」才知道
-    是該調 `AICODE_VL_INGEST_MAX_TOKENS` 還是該把 llama-server 的 `-c` 開大。
+    是該調 `config.VL_INGEST_MAX_TOKENS` 還是該把 llama-server 的 `-c` 開大。
 
     截斷是**輸出預算不夠**，不是內容不合格：唯一有意義的重試就是把預算加大。
     2026-08-24 實測 example1.pdf p3（block diagram）：2048 撞頂，6700 時只用 2161
@@ -653,7 +653,7 @@ def _next_output_budget(previous: int, result, server_n_ctx: int | None) -> tupl
         budget = min(ceiling, headroom)
         note = (f"prompt {prompt_tokens} tokens、server n_ctx {server_n_ctx}"
                 f"（保留 {VL_CTX_RESERVE_TOKENS}）→ 輸出最多還放得下 {headroom}；"
-                f"天花板 AICODE_FIGURE_VL_MAX_TOKENS_CEILING={ceiling}")
+                f"天花板 config.FIGURE_VL_MAX_TOKENS_CEILING={ceiling}")
     else:
         # 沒有實測 prompt 長度就只敢倍增，並且仍受 n_ctx 上限節制。
         budget = min(ceiling, previous * VL_BUDGET_FALLBACK_MULTIPLIER)
@@ -662,7 +662,7 @@ def _next_output_budget(previous: int, result, server_n_ctx: int | None) -> tupl
         missing = "usage.prompt_tokens" if prompt_tokens is None else "n_ctx"
         note = (f"server 沒回 {missing}，只能保守放大 "
                 f"{VL_BUDGET_FALLBACK_MULTIPLIER}×；天花板 "
-                f"AICODE_FIGURE_VL_MAX_TOKENS_CEILING={ceiling}"
+                f"config.FIGURE_VL_MAX_TOKENS_CEILING={ceiling}"
                 + (f"、server n_ctx {server_n_ctx}" if server_n_ctx is not None else ""))
     return budget, note
 
@@ -904,7 +904,7 @@ def _canary_call(*, kind: str, png: bytes, base_url: str, model: str, profile: s
     if result.truncated:
         detail.append(
             f"finish_reason={result.finish_reason!r} → 回應被截斷；"
-            "請提高 AICODE_VL_INGEST_MAX_TOKENS"
+            "請提高 config.VL_INGEST_MAX_TOKENS"
         )
         return checks, None, None, detail
     checks["response_not_truncated"] = True
@@ -1141,7 +1141,7 @@ class _SampleFailure(Exception):
 _FAILURE_HINTS = {
     "truncated": ("重試已經自動把輸出預算加到 server context 的上限仍然不夠。"
                   "把 llama-server 的 -c 開大（VL 服務），或提高 "
-                  "AICODE_VL_INGEST_MAX_TOKENS / AICODE_FIGURE_VL_MAX_TOKENS_CEILING，"
+                  "config.VL_INGEST_MAX_TOKENS / config.FIGURE_VL_MAX_TOKENS_CEILING，"
                   "再不行就讓 tile 切小一點"),
     "not_json": "server 可能沒有真的套用 grammar 約束；先跑 capability probe 確認",
     "schema": "模型輸出的鍵與 schema 不符",

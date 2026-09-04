@@ -10,19 +10,19 @@ models 三塊並把呼叫層換成 in-process(見 tests/_set_config_harness.py);
 - 原 test_set_config_models.py:模型探索與 CPU-MoE 決策 —— shard 齊全性、mmproj 配對、
   VL、n_cpu_moe;末段併自原 test_set_config_cpu_moe.py(GGUF tensor table 解析、問答契約、
   profile schema 的 in-process 單元測試)。
-- 原 test_set_config_artifacts.py:產出物、build prompt、opencode.json 合併、備份與 restore。
+- 原 test_set_config_artifacts.py:產出物、備份與 restore。
 - 原 test_set_config_compaction.py:壓縮模式題 —— 接管、還原、與不接管。這一段每條都是
   smoke(原檔是 module 層 pytestmark),會靜默失敗的東西才寫在那裡:
 
     * `--yes` 沒給 `--compaction-mode`、機器也還沒選過 → **不得** 動壓縮設定。
       弄反的話,舊安裝重跑一次 `--yes` 腳本就會突然多一個壓縮 plugin 與
       `compaction.auto=false`,而使用者沒有要求過任何這種行為。
-    * 寫進 opencode.json 的 `preserve_recent_tokens` 必須等於同一條公式對這個
+    * 寫進 client.json 的門檻必須等於同一條公式對這個
       ctx 的推導值。wizard 與 plugin 各算各的,兩邊差一點也不會有錯誤訊息 ——
       只是門檻與保留額對不上。
     * 切回 native 必須精確還原,而且只還原有 ownership 證據的值。
     * `--dry-run` 與摘要頁按 q 都不得留下狀態檔。
-    * 狀態檔記錄的是另一份 opencode.json 時不得靜默覆蓋(那是對方唯一的還原依據)。
+    * restore manifest 兩個世代共用同一個檔:含別人的目標時整份拒絕,不部分還原。
 
 flow 段的 dry-run 測試與壓縮段的 `test_dry_run_writes_nothing`(受保護 node)同名,
 改名為 `test_dry_run_writes_nothing_for_the_model_flow`。
@@ -41,7 +41,6 @@ from pathlib import Path
 import pytest
 
 import client_compaction
-import compaction_mode as cm
 from deployment_profile import (
     ProfileError,
     build_server_command,
@@ -1682,7 +1681,7 @@ def test_profile_emits_cpu_moe_for_main_and_vl_and_rejects_partial_mix(tmp_path)
             load_effective_profile(env)
 
 
-# ── 原 test_set_config_artifacts.py:產出物、opencode.json 合併、備份與 restore ──
+# ── 原 test_set_config_artifacts.py:產出物、備份與 restore ──
 
 
 
@@ -2291,45 +2290,93 @@ def test_restore_last_backup_dry_run_previews_without_touching_files(tmp_path):
 
 
 @pytest.mark.smoke
-def test_the_restore_manifest_no_longer_lists_opencode_json(tmp_path):
-    """新 manifest 不得再列 opencode.json。"""
+def test_the_restore_manifest_only_lists_this_generations_targets(tmp_path):
+    """manifest 只會列這一代會寫的四個檔。多出任何別的目標,restore 就得整份拒絕
+    (見下一條)——所以「寫的時候不會多」與「讀的時候不接受多」是同一組保證。"""
     models = _offline_fixture(tmp_path)
+    home = _home(tmp_path)
     assert run(tmp_path, *YES_TWO_GPU, "--no-preview",
                "--models-dir", str(models)).returncode == 0
     manifest = _manifest(tmp_path)
-    assert "opencode.json" not in json.dumps(manifest, ensure_ascii=False)
+    allowed = {str(item) for item in sc.main_restore_targets(home)}
+    assert set(manifest["targets"]) <= allowed, manifest["targets"]
 
 
 @pytest.mark.smoke
-def test_an_old_manifest_never_writes_back_the_users_opencode_config(tmp_path):
-    """升級前的 manifest 仍列著 opencode.json;還原它會繞過 ownership 語意。
+def test_a_manifest_written_before_the_upgrade_still_restores(tmp_path):
+    """升級承接:用**升級前**那一版寫出的 manifest,新版必須整批還原得回去。
 
-    `opencode_migrate` 是唯一還會寫使用者 OpenCode 設定的路徑,而且只還原
-    「現值仍等於 CodeTrail 寫入值」的鍵。restore 照舊 manifest 整份寫回去,
-    會把使用者現在的設定換成一份舊備份 —— 內容還是我們的,不是他的。
+    `setconfig-last-transaction.json` 兩個世代共用同一個檔名。新版換了「哪些目標
+    算數」的判準;判錯的話,升級前那一次設定的備份就再也還原不了,而使用者只會
+    看到一句「找不到 manifest」。舊 manifest 的形狀在這裡逐字重建。
     """
     models = _offline_fixture(tmp_path)
     home = _home(tmp_path)
     assert run(tmp_path, *YES_TWO_GPU, "--no-preview",
                "--models-dir", str(models)).returncode == 0
 
-    # 手工把 manifest 改回「舊世代」的形狀:多一筆 opencode.json。
-    oc = home / ".config" / "opencode" / "opencode.json"
-    oc.parent.mkdir(parents=True, exist_ok=True)
-    oc.write_text(json.dumps({"owner": "user-current"}), encoding="utf-8")
-    stale_backup = tmp_path / "opencode.json.bak-setconfig-old"
+    # 現況換成「升級後才有的內容」,備份留著升級前的。
+    codetrail = home / ".config" / "codetrail"
+    (codetrail / "models.json").write_text('{"after": 1}', encoding="utf-8")
+    backup = tmp_path / "models.json.bak-setconfig-old"
+    backup.write_text('{"before": 1}', encoding="utf-8")
+
+    manifest_path = _manifest_path(tmp_path)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "transaction": "20260101T000000-legacy",
+                "targets": {
+                    str(codetrail / "models.json"): {
+                        "existed": True,
+                        "backup": str(backup),
+                        "real": str(codetrail / "models.json"),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    proc = run(tmp_path, "--restore-last-backup")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads((codetrail / "models.json").read_text(encoding="utf-8")) == {"before": 1}
+
+
+@pytest.mark.smoke
+def test_a_manifest_with_a_foreign_target_is_refused_whole(tmp_path):
+    """`setconfig-last-transaction.json` 兩個世代共用同一個檔名、同一個形狀,而且
+    沒有寫入者標記。含任何「這一代不會寫」的目標 → **整份**拒絕、一個檔都不動。
+
+    為什麼不是「跳過那幾筆、還原其餘」:那會把不同世代的設定拼在一起,而
+    transaction 存在的理由正是不要拼裝。"""
+    models = _offline_fixture(tmp_path)
+    home = _home(tmp_path)
+    assert run(tmp_path, *YES_TWO_GPU, "--no-preview",
+               "--models-dir", str(models)).returncode == 0
+
+    # 手工把 manifest 改回「舊世代」的形狀:多一筆別人的設定。
+    foreign = home / ".config" / "opencode" / "opencode.json"
+    foreign.parent.mkdir(parents=True, exist_ok=True)
+    foreign.write_text(json.dumps({"owner": "user-current"}), encoding="utf-8")
+    stale_backup = tmp_path / "foreign.bak-setconfig-old"
     stale_backup.write_text(json.dumps({"owner": "codetrail-old"}), encoding="utf-8")
     manifest_path = _manifest_path(tmp_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["targets"][str(oc)] = {
-        "existed": True, "backup": str(stale_backup), "real": str(oc),
+    before = {
+        Path(target): Path(target).read_bytes()
+        for target in manifest["targets"] if Path(target).exists()
+    }
+    manifest["targets"][str(foreign)] = {
+        "existed": True, "backup": str(stale_backup), "real": str(foreign),
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     proc = run(tmp_path, "--restore-last-backup")
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert json.loads(oc.read_text(encoding="utf-8")) == {"owner": "user-current"}
-    assert "跳過" in proc.stdout and "opencode" in proc.stdout
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "另一個世代" in proc.stderr
+    assert json.loads(foreign.read_text(encoding="utf-8")) == {"owner": "user-current"}
+    for target, content in before.items():
+        assert target.read_bytes() == content, f"{target} 被動過了"
 
 
 # ── 原 test_set_config_restore.py:整批還原的資料安全 ──
@@ -2453,54 +2500,42 @@ def test_a_manifest_that_cannot_be_written_does_not_survive_stale(tmp_path):
             manifest.chmod(0o644)
 
 
-@pytest.mark.smoke
-def test_the_migration_never_touches_a_machine_that_never_took_over(tmp_path):
-    """沒有狀態檔、也沒有我們的 plugin 項的機器:一個 byte 都不動。"""
-    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
-    models = make_models(tmp_path)
-    home = tmp_path / "home"
-    target = home / ".config" / "opencode" / "opencode.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps({"model": "local/x"}), encoding="utf-8")
-    before = target.read_bytes()
-    result = run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models),
-                 "--compaction-mode", "codetrail")
-    assert result.returncode == 0, result.stdout
-    assert target.read_bytes() == before
 
 
 @pytest.mark.smoke
-def test_set_config_refuses_to_write_when_the_migration_state_cannot_be_judged(tmp_path):
-    """OpenCode 設定解析不了 → 判不出要不要遷移 → 一個 byte 都不寫,exit 2。
+def test_restore_refuses_to_write_client_json_through_a_symlinked_parent(tmp_path):
+    """`client.json` 的父目錄(`~/.config/codetrail`)是 symlink → 整批還原拒絕、零寫入。
 
-    降成一則 note 然後 exit 0,等於把「舊值與 plugin 項還在使用者設定裡沒人管」
-    這件事藏起來,而且 aicode 也不會再提示。
+    2026-09-04(總審 F1-3):原本這條驗的是「經 symlink 父目錄照樣以 owner-only 寫到
+    實體位置」。行為為什麼該變:runtime 的 loader 錨在 `~/.config`、逐層 O_NOFOLLOW,
+    父目錄是 symlink 時**根本不會讀**那個檔 —— restore 寫出去的是一份沒有人會讀的
+    設定,而且寫在 owner-only 錨點之外(manifest 的 `real` 指到哪就寫到哪)。
+    與 `client_paths` 的三件套契約一致:同一個檔,讀寫兩端用同一條防線。
     """
     models = _offline_fixture(tmp_path)
     home = _home(tmp_path)
-    target = home / ".config" / "opencode" / "opencode.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("{ not json", encoding="utf-8")
-    result = run(tmp_path, *YES_TWO_GPU, "--no-preview", "--skip-binary-check",
-                 "--models-dir", str(models), "--compaction-mode", "codetrail")
-    assert result.returncode == 2, result.stdout + result.stderr
-    assert "遷移狀態無法判定" in result.stderr
-    assert not _client_config(tmp_path).exists()
-    assert not (home / ".config" / "codetrail" / "deployment.json").exists()
+    assert run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models),
+               "--compaction-mode", "manual").returncode == 0
 
+    logical = _client_config(tmp_path)
+    real_dir = tmp_path / "real-config"
+    real_dir.mkdir()
+    codetrail = home / ".config" / "codetrail"
+    for item in codetrail.iterdir():
+        item.rename(real_dir / item.name)
+    codetrail.rmdir()
+    codetrail.symlink_to(real_dir)
 
-@pytest.mark.smoke
-def test_set_config_refuses_to_write_when_the_ownership_state_is_untrusted(tmp_path):
-    """ownership 狀態檔壞掉:判不出要不要遷移 → 一個 byte 都不寫,exit 2。"""
-    import compaction_mode
+    backup = tmp_path / "client.json.bak-setconfig-old"
+    backup.write_text(json.dumps({"schema": 1, "compaction_mode": "off", "permission": {}}), encoding="utf-8")
+    manifest_path = _manifest_path(tmp_path)
+    manifest_path.write_text(json.dumps({
+        "transaction": "20260101T000000-symlinked",
+        "targets": {str(logical): {"existed": True, "backup": str(backup), "real": str(real_dir / "client.json")}},
+    }), encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in real_dir.iterdir() if p.is_file()}
 
-    models = _offline_fixture(tmp_path)
-    home = _home(tmp_path)
-    state_path = compaction_mode.state_path({"HOME": str(home)})
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text("{ corrupt", encoding="utf-8")
-    result = run(tmp_path, *YES_TWO_GPU, "--no-preview", "--skip-binary-check",
-                 "--models-dir", str(models), "--compaction-mode", "codetrail")
-    assert result.returncode == 2, result.stdout + result.stderr
-    assert "遷移狀態無法判定" in result.stderr
-    assert not _client_config(tmp_path).exists()
+    proc = run(tmp_path, "--restore-last-backup")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "symlink" in proc.stdout + proc.stderr
+    assert {p.name: p.read_bytes() for p in real_dir.iterdir() if p.is_file()} == before

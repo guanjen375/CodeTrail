@@ -317,10 +317,11 @@ class ContextOverflowError(RuntimeError):
         super().__init__(overflow_message(usage))
 
 
-#: 呼叫端帶了自己的保留額(客戶端 request)時,該調的是這一個 env。
-CLIENT_RESERVE_ENV = "AICODE_CLIENT_MAX_OUTPUT_TOKENS"
+#: 呼叫端帶了自己的保留額(客戶端 request)時,溢位訊息要指名的是這一個常數。
+#: 它們是 repo 常數,不是環境變數:訊息指名的東西必須是使用者真的改得到的。
+CLIENT_RESERVE_ENV = "config.CLIENT_MAX_OUTPUT_TOKENS"
 #: 沒帶保留額(knowledge.py 的內部呼叫)時,該調的是這一個。
-INTERNAL_RESERVE_ENV = "AICODE_RESERVED_OUTPUT_TOKENS"
+INTERNAL_RESERVE_ENV = "config.RESERVED_OUTPUT_TOKENS"
 
 
 def _reserve_env_name(usage: ContextUsage) -> str:
@@ -359,8 +360,6 @@ def enforce_gate(usage: ContextUsage) -> None:
     Caller is responsible for logging the (refused) usage before re-raising
     or for converting the exception into a structured CLI / TUI error.
     """
-    if not bool(getattr(config, "CTX_GATE_ENABLED", True)):
-        return
     if usage.hard_overflow:
         usage.error_type = "ctx_overflow"
         raise ContextOverflowError(usage)

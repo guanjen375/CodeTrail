@@ -82,6 +82,16 @@ _IMAGE_MIME_TYPES = {
 }
 
 
+def get_sandbox_root() -> Optional[Path]:
+    """目前的 sandbox root(`mcp_server` 啟動時以 `--root` 定案),沒設就 None。
+
+    其他模組要交叉檢查「這個 root 是不是就是沙箱那一個」時讀這裡,**不是**讀
+    `AICODE_ROOT` 環境變數:root 已經改走 argv,而殼層裡殘留的同名變數(來自
+    別份安裝、別個專案)會讓交叉檢查拿一個完全無關的路徑當真值。
+    """
+    return _SANDBOX_ROOT
+
+
 def set_sandbox_root(root: str, allow_external: bool = True) -> None:
     """設定 sandbox 根目錄，只允許讀取此目錄內的檔案
 

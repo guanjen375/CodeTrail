@@ -5,13 +5,14 @@ ai_code MCP server — 把 KnowledgeBase / CodeRAG / agent_tools 包成 MCP tool
 讓 CodeTrail 客戶端(或任何 MCP client)可以接進來用。
 
 啟動:
-    AICODE_ROOT=/path/to/project python3 mcp_server.py
+    python3 mcp_server.py --root /path/to/project
 
 一般使用者不要直接跑這個檔案；請從專案目錄執行 `aicode`,
 由客戶端透過 stdio 啟動 MCP server。
 """
 
 import contextlib
+import process_env
 import functools
 import importlib.metadata
 import inspect
@@ -27,6 +28,96 @@ from pathlib import Path
 from typing import Annotated, Literal, Optional
 
 from pydantic import Field
+
+# ---- 啟動參數 --------------------------------------------------------------
+# 沙箱 root 與 readonly 都走 **argv**,不走環境變數:客戶端交出去的子行程環境
+# 已經把 AICODE_* / AI_CODE_* / CODETRAIL_* / OPENCODE_* 整組剝掉,所以殼層裡
+# 殘留的同名變數(可能來自另一份安裝、另一個專案)再也翻不動這兩個決定。
+# 這裡刻意用手寫 parser 而不是 argparse:整支 server 是 import 期就開始做事的,
+# 而 root 必須在 `set_sandbox_root` 之前定案。
+def _parse_server_argv(argv: list[str]) -> dict:
+    parsed = {
+        "root": None,
+        "readonly": False,
+        "n_ctx": None,
+        "build_commands": False,
+        # replay / eval 用自己那份 client.json 時,server 讀**同一份**;沒給就讀 HOME。
+        "client_config": None,
+        # 測試 / eval 的接縫。正常 runtime 不帶它 —— 缺 reranker 的 session 會在
+        # 使用者問第一個 RAG 問題時才炸,而那時他已經在對話裡了。
+        "skip_aux_preflight": False,
+    }
+
+    def fatal(message: str) -> None:
+        print(f"[MCP][FATAL] {message}", file=sys.stderr, flush=True)
+        sys.exit(2)
+
+    def take_value(name: str, raw: str | None) -> str:
+        """一個選項的值。空字串與「下一個 option」都是 fail-loud,不是預設值。
+
+        兩個都會靜默改掉安全語意:`--root=` 退回 cwd 就綁錯沙箱;
+        `--root --readonly` 把旗標吃成 root 值,於是 root 錯了、readonly 也沒了。
+        """
+        if raw is None:
+            fatal(f"{name} 需要一個值")
+        assert raw is not None
+        if not raw.strip():
+            fatal(f"{name} 的值是空的")
+        if raw.startswith("--"):
+            fatal(f"{name} 的值看起來是另一個選項({raw!r});缺值一律拒絕")
+        return raw
+
+    seen: set[str] = set()
+
+    def once(name: str) -> None:
+        """帶值的選項只准出現一次。
+
+        重複時「靜默採最後一個」會改變安全語意:`--root /safe --root /other`
+        綁的是後面那個沙箱,`--n-ctx` 重複則換掉 context gate 的上限。呼叫端
+        重複傳一定是 bug,不是意圖。
+        """
+        if name in seen:
+            fatal(f"{name} 重複出現;帶值的選項只准給一次")
+        seen.add(name)
+
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item == "--readonly":
+            parsed["readonly"] = True
+        elif item == "--enable-build-commands":
+            parsed["build_commands"] = True
+        elif item == "--skip-aux-preflight":
+            parsed["skip_aux_preflight"] = True
+        elif item in ("--root", "--n-ctx", "--client-config"):
+            once(item)
+            nxt = argv[index + 1] if index + 1 < len(argv) else None
+            key = {"--root": "root", "--n-ctx": "n_ctx", "--client-config": "client_config"}[item]
+            parsed[key] = take_value(item, nxt)
+            index += 1
+        elif item.startswith("--root="):
+            once("--root")
+            parsed["root"] = take_value("--root", item[len("--root="):])
+        elif item.startswith("--n-ctx="):
+            once("--n-ctx")
+            parsed["n_ctx"] = take_value("--n-ctx", item[len("--n-ctx="):])
+        elif item.startswith("--client-config="):
+            once("--client-config")
+            parsed["client_config"] = take_value("--client-config", item[len("--client-config="):])
+        else:
+            fatal(f"不認得的啟動參數:{item!r}")
+        index += 1
+    return parsed
+
+
+# 只有「被當成腳本執行」時才吃 argv。這個模組是 import 期就開始做事的,而
+# doctor / 測試會直接 import 它 —— 那時 `sys.argv` 是**別人的**(pytest 的檔名
+# 會被當成不認得的啟動參數而 exit 2)。
+_ARGS = _parse_server_argv(sys.argv[1:] if __name__ == "__main__" else [])
+if __name__ != "__main__":
+    # 被 import(doctor / 測試 / 工具目錄檢查)時不跑附屬 server 的硬閘:那是
+    # 「啟動一個 server」的閘,不是「載入這個模組」的閘。
+    _ARGS["skip_aux_preflight"] = True
 
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 if sys.stdout.encoding != 'utf-8':
@@ -101,16 +192,23 @@ def _run_mcp_stdio() -> None:
 from root_safety import validate_aicode_root as _validate_aicode_root
 
 AICODE_ROOT, _err = _validate_aicode_root(
-    os.environ.get("AICODE_ROOT"),
-    os.environ.get("HOME"),
-    allow_home_override=os.environ.get("AI_CODE_ALLOW_HOME_ROOT", "").lower() in ("1", "true", "yes"),
+    _ARGS["root"] or os.getcwd(), os.environ.get("HOME"), allow_home_override=False
 )
 if _err:
     _log(_err)
     sys.exit(2)
 assert AICODE_ROOT is not None  # for type checkers
 
-import config
+try:
+    import config
+except Exception as _cfg_exc:  # noqa: BLE001 - 主要是壞掉的 deployment.json
+    # `config` 在 import 期解析 deployment profile。這裡的 traceback 會經由
+    # MCP stderr 進客戶端,而客戶端只會顯示「MCP 啟動失敗」——講清楚要修哪個檔。
+    _log(
+        f"[MCP][FATAL] 設定無法載入({type(_cfg_exc).__name__}):{_cfg_exc}\n"
+        "        修好 ~/.config/codetrail/deployment.json,或重跑 ./set_config.sh。"
+    )
+    sys.exit(2)
 import code_context
 from config import KNOWLEDGE_FILE, RUN_COMMAND_TIMEOUT, RUN_COMMAND_TIMEOUT_MAX, RUN_COMMAND_TIMEOUT_MIN, BIN_ELF_VIEW_MAX_LIMIT
 from knowledge import KnowledgeBase, load_knowledge_base_strict
@@ -129,7 +227,6 @@ from utils import (
     should_use_strict_mode,
 )
 from scripts.required_model_servers_check import (
-    SKIP_ENV as REQUIRED_MODELS_SKIP_ENV,
     render_report as _render_required_model_report,
     run_checks as _run_required_model_checks,
 )
@@ -160,16 +257,48 @@ import ingest_notify
 import ingest_runtime
 
 
-# Runtime defaults: patch/run_tests 預設開,但尊重 env 顯式關閉。
-# 早期版本是無條件 force-on,使用者設 AI_CODE_PATCH=0 也會被吞掉 — 那違反
-# CodeTrail 「fail loud over silent fallback」 的原則。改成 env-aware default。
-_POLICY = resolve_runtime_policy()
+# 使用者開關來自 `~/.config/codetrail/client.json`。MCP 是獨立行程,所以它自己讀
+# 那個檔(設定的來源是檔案,不是父行程的環境)。
+#
+# **檔案不存在 = 全部預設**(「沒有設定檔 = 沒有接管」,每個預設都在 fail-closed
+# 的那一邊)。**檔案存在但不可信 = 拒絕啟動**:退成預設不是安全的一邊 ——
+# `use_container` 從 true 掉回 false 就是「使用者以為在容器裡跑」的命令改成直接
+# 在 host 上跑,而且完全無聲。客戶端那一層對同一份壞檔也是 fail-loud,兩邊要一致。
+try:
+    import client_config as _client_config
+
+    if _ARGS["client_config"]:
+        _CLIENT_SETTINGS = _client_config.load_client_settings_from(Path(_ARGS["client_config"]))
+    else:
+        _CLIENT_SETTINGS = _client_config.load_client_settings()
+except Exception as _settings_exc:  # noqa: BLE001
+    import client_config as _client_config
+
+    _log(
+        f"[MCP][FATAL] client.json 不可信({_settings_exc})。\n"
+        "        退回預設不是安全的一邊(例如 use_container 會從 true 掉回 false,\n"
+        "        於是命令改在 host 上跑而且無聲),所以拒絕啟動。\n"
+        "        修好 ~/.config/codetrail/client.json,或整個移除它(= 全部預設)。"
+    )
+    sys.exit(2)
+_client_config.apply_to_config(_CLIENT_SETTINGS, readonly=_ARGS["readonly"])
+import container_runner as _container_runner
+
+_container_runner.CONTAINER_ENABLED = config.USE_CONTAINER
+
+# Runtime defaults:patch / run_command 預設開;`--readonly` 一律關到底。
+# build 命令的來源是 client.json,但它經 **argv** 交過來(客戶端讀設定、server 收
+# 旗標)—— readonly 一律壓過它。
+_POLICY = resolve_runtime_policy(
+    readonly=_ARGS["readonly"],
+    build_commands=_ARGS["build_commands"] or _CLIENT_SETTINGS.build_commands,
+)
 config.PATCH_ENABLED = _POLICY.patch_enabled
 config.RUN_COMMAND_ENABLED = _POLICY.run_command_enabled
 
 # Build 命令(make/cmake/ninja/meson/bazel)會跑專案內的 build script,
 # 風險面比 pytest/cargo test 大。預設不掛白名單,要分析自己的專案再
-# 顯式打開 AI_CODE_ENABLE_BUILD_COMMANDS=1。
+# 由客戶端以 `--enable-build-commands` 打開(來源是 client.json)。
 # 直接 mutate config.ALLOWED_COMMANDS,agent_tools 透過 from-import 共用同一個 list 物件
 _BUILD_COMMANDS_ENABLED = _POLICY.build_commands_enabled
 _EXTRA_BUILD_COMMANDS = list(EXTRA_BUILD_COMMANDS)
@@ -180,29 +309,38 @@ if _BUILD_COMMANDS_ENABLED:
 
 set_sandbox_root(AICODE_ROOT, allow_external=False)
 
-_log(f"[MCP] AICODE_ROOT = {AICODE_ROOT}")
+_log(f"[MCP] sandbox root = {AICODE_ROOT}")
+
+# 客戶端已經觀測過主 server 的 n_ctx,用 `--n-ctx` 交過來。config 的那一份是
+# import 期的快照(而且它讀 env),兩邊不同步就是「客戶端算 131072、MCP 算 8192」
+# 這種完全無聲的錯。§3:動態值只用 `import config`。
+if _ARGS["n_ctx"]:
+    try:
+        config.set_runtime_n_ctx(int(_ARGS["n_ctx"]))
+    except (TypeError, ValueError) as _ctx_err:
+        _log(f"[MCP][FATAL] --n-ctx 不合法({_ARGS['n_ctx']!r}):{_ctx_err}")
+        sys.exit(2)
+
+if _ARGS["readonly"]:
+    # readonly 的契約是「前後 project state 不變」。context metrics 預設寫進
+    # `<root>/.codetrail/context_metrics.jsonl` —— 那也是寫入。
+    config.CTX_METRICS_ENABLED = False
+    _log("[MCP] readonly:patch / run_command / build 命令與 context metrics 全部關閉")
 
 # fail-loud: CodeTrail 不內建主聊天模型, 沒設好就直接退出, 避免 silent 跑到底
-# 才在 llama-server 那邊 404。aicode wrapper 已經做過一次解析 + export, 走到這裡
-# 還是空表示使用者繞過了 wrapper (例如手動 spawn MCP 子行程)。
+# 才在 llama-server 那邊 404。
 try:
     _resolved_main_model = config.require_main_model()
 except RuntimeError as _model_err:
     _log("[MCP][FATAL] " + str(_model_err))
     sys.exit(3)
 
-if os.environ.get("AICODE_MODEL", "").strip():
-    _log(f"[MCP] Using model: {_resolved_main_model} (from AICODE_MODEL env)")
-else:
-    _log(
-        f"[MCP] Using model: {_resolved_main_model} "
-        "(resolved from the deployment profile)"
-    )
+_log(f"[MCP] Using model: {_resolved_main_model}")
 
-if os.environ.get(REQUIRED_MODELS_SKIP_ENV, "").lower() in ("1", "true", "yes"):
+if _ARGS["skip_aux_preflight"]:
     _log(
-        f"[MCP] WARN: required model server preflight skipped via {REQUIRED_MODELS_SKIP_ENV}=1 "
-        "(test/CI only; normal runtime should keep this hard gate enabled)"
+        "[MCP] WARN: required model server preflight skipped via --skip-aux-preflight "
+        "(test / eval only; normal runtime keeps this hard gate enabled)"
     )
 else:
     _required_model_checks = _run_required_model_checks()
@@ -211,17 +349,6 @@ else:
     if not all(_check.ok for _check in _required_model_checks):
         sys.exit(3)
 
-# 舊 ctx env 只留遷移相容；正常使用只需在 set_config 設一次主 n_ctx。
-if os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX") and not os.environ.get("AICODE_N_CTX"):
-    _log(
-        "[MCP] WARN: AICODE_DYNAMIC_NUM_CTX_MAX 已 deprecated；本次仍相容讀取。"
-        "請改用 ./set_config.sh 設定主模型 n_ctx，之後不需要另設 max。"
-    )
-if os.environ.get("AICODE_NUM_CTX"):
-    _log(
-        "[MCP] WARN: AICODE_NUM_CTX 已 deprecated 且不再是獨立上限；"
-        "請移除它並用 ./set_config.sh 設定主模型 n_ctx。"
-    )
 # knowledge.json 綁 AICODE_ROOT,不依賴 cwd
 _kb_path = str(Path(AICODE_ROOT) / KNOWLEDGE_FILE)
 _log(f"[MCP] 載入 KnowledgeBase ({_kb_path}) ...")
@@ -262,25 +389,29 @@ _log("[MCP] 初始化 ToolExecutor ...")
 EXEC = ToolExecutor(AICODE_ROOT)
 
 _log(
-    f"[MCP] PATCH_ENABLED = {config.PATCH_ENABLED} (AI_CODE_PATCH), "
-    f"RUN_COMMAND_ENABLED = {config.RUN_COMMAND_ENABLED} (AI_CODE_RUN_TESTS)"
+    f"[MCP] PATCH_ENABLED = {config.PATCH_ENABLED}, "
+    f"RUN_COMMAND_ENABLED = {config.RUN_COMMAND_ENABLED}"
+    "(runtime policy;readonly session 用 --readonly 一次關掉)"
 )
 if _BUILD_COMMANDS_ENABLED:
     _log(
         f"[MCP] ALLOWED_COMMANDS 共 {len(config.ALLOWED_COMMANDS)} 條"
-        " (AI_CODE_ENABLE_BUILD_COMMANDS=1 已 append build 命令: "
+        " (--enable-build-commands 已 append build 命令: "
         f"{', '.join(_EXTRA_BUILD_COMMANDS)})"
     )
 else:
     _log(
         f"[MCP] ALLOWED_COMMANDS 共 {len(config.ALLOWED_COMMANDS)} 條 "
-        "(build 命令未掛白名單;要分析自己的專案請設 AI_CODE_ENABLE_BUILD_COMMANDS=1)"
+        "(build 命令未掛白名單;要分析自己的專案請在 client.json 開 build_commands)"
     )
 _log(f"[MCP] EXTERNAL_IMPORT_ENABLED = {config.EXTERNAL_IMPORT_ENABLED}")
-if data_flywheel.DATA_COLLECT_ENABLED:
+# 收集器綁**宣告的 root**(`--root`),不是 cwd:launcher 可能站在 checkout 目錄
+# 啟動 server,那時 cwd 與 sandbox root 不同,分區就會跟畫面講的不一樣。
+data_flywheel.get_collector(root=AICODE_ROOT)
+if data_flywheel.collect_enabled():
     _log(
-        "[MCP] DATA_COLLECT_ENABLED = True (AI_CODE_COLLECT_DATA) — "
-        f"KB-shaped tools 會 append 到 {data_flywheel.DATA_FILE}"
+        "[MCP] collect_data = True (client.json) — KB-shaped tools 會 append 到 "
+        f"{data_flywheel.data_dir(AICODE_ROOT) / data_flywheel.DATA_FILENAME}"
     )
 
 
@@ -299,9 +430,9 @@ def _record_kb_interaction(
     Plumbing tools (read_file/grep_code/...) 不呼叫這個,因為 MCP 沒有 turn
     邊界、湊不出完整 Q&A 結構,硬塞會污染訓練語料。
 
-    沒設 AI_CODE_COLLECT_DATA 時 record_interaction 自己會 no-op。
+    client.json 沒開 collect_data 時 record_interaction 自己會 no-op。
     """
-    if not data_flywheel.DATA_COLLECT_ENABLED:
+    if not data_flywheel.collect_enabled():
         return
     meta = {"mode": mode, "kb_top_score": top_score, "source": "mcp_server"}
     if extra_meta:
@@ -452,6 +583,18 @@ async def _run_offloaded(core, args, call_kwargs, ctx):
     return outcome["value"]
 
 
+class ReadonlyToolRefused(PermissionError):
+    """以 `--readonly` 啟動的 server 拒絕一個會改動 project state 的工具。
+
+    走例外而不是回字串:transport 那一層把例外轉成 `isError=True` 的結果,客戶端
+    與 eval 才能把它當錯誤處理;回一個「看起來像成功」的字串會被當成工具輸出。
+    """
+
+    #: adapter 靠這個標記給「read-only instance,不要重試」的下一步;一般檔案系統的
+    #: `PermissionError`(EACCES)不是這回事,不得被講成 readonly 拒絕。
+    readonly_refusal = True
+
+
 def _tool(*d_args, **d_kwargs):
     """@_tool() 的包裝：工具執行期間把 stdout 導到 stderr。
 
@@ -478,6 +621,17 @@ def _tool(*d_args, **d_kwargs):
 
         @functools.wraps(fn)
         def core_wrapper(*args, **kwargs):
+            if _ARGS["readonly"] and fn.__name__ not in _READ_ONLY_TOOLS:
+                # readonly 的契約是「前後 project state 不變」。只關 PATCH / RUN_COMMAND
+                # 的旗標擋得住 apply_patch 與 run_command,擋不住改 knowledge.json、
+                # figure state 與全域 lessons 的那幾個;客戶端那一層若有 bug、或別的
+                # MCP client 直接連進來,replay 邊界就沒了。判準與客戶端一致:
+                # readOnlyHint 不是 True 的工具一律拒絕(名單就是 _READ_ONLY_TOOLS)。
+                raise ReadonlyToolRefused(
+                    f"{fn.__name__} 在 readonly server 上不可用:這個 MCP instance 以 "
+                    "--readonly 啟動(評測 / 抽查 / replay),所有會改動 project state 的"
+                    "工具全部停用;改用唯讀工具取得證據。"
+                )
             busy = ingest_runtime.guard(fn.__name__)   # evidence tool 忙碌時 raise
             if busy is not None:
                 return busy
@@ -709,9 +863,9 @@ def query_knowledge_strict(
     檢查是否有 [REF] 根據。
 
     跟一般 `query_knowledge` 的差別:
-      - `query_knowledge` 只回傳 KB 上下文,要 OpenCode 的模型自己組答案;
+      - `query_knowledge` 只回傳 KB 上下文,要呼叫端的模型自己組答案;
       - `query_knowledge_strict` 在 server-side 直接呼叫主 llama-server
-        (用 `AICODE_MODEL`,不是 OpenCode 選的那顆),套用嚴格模式 prompt
+        (用 `config.MODEL` 這顆主模型,不是呼叫端選的那顆),套用嚴格模式 prompt
         並做自我檢查,然後回傳定稿答案。
 
     什麼時候用:
@@ -741,7 +895,7 @@ def query_knowledge_strict(
     「哪一頁、哪一張圖可用但待覆核」,才不會變成「查不到」的假象。
 
     注意:
-      - 這個 tool 會占用主 llama-server 的算力;OpenCode TUI 看不到中間
+      - 這個 tool 會占用主 llama-server 的算力;呼叫端看不到中間
         streaming(會被導向 stderr,只有最終定稿經 MCP 回來)。
       - llama-server 不可用時 answer 會以 "[ERROR] ..." 開頭。
     """
@@ -1070,7 +1224,7 @@ def code_rag_search(
         )
         bundle["query"] = _echo(query)
 
-        if data_flywheel.DATA_COLLECT_ENABLED:
+        if data_flywheel.collect_enabled():
             snippets = [
                 {
                     "path": item["path"],
@@ -1233,7 +1387,7 @@ def code_rag_search(
             entry['graph_status'] = graph_status
         results.append(entry)
 
-    if data_flywheel.DATA_COLLECT_ENABLED:
+    if data_flywheel.collect_enabled():
         snippets = [
             {
                 "path": r.get("path", ""),
@@ -1522,12 +1676,11 @@ def import_external_file(
 ) -> str:
     """Copy an allowed external file into AICODE_ROOT/.aicode_uploads/.
 
-    This is the controlled "upload/import"入口 for OpenCode users who have a
+    This is the controlled "upload/import"入口 for users who have a
     screenshot, PDF, log, ELF, or firmware blob outside the project. General
     tools still cannot read outside AICODE_ROOT. This tool only works when the
-    server was started with AI_CODE_ALLOW_EXTERNAL_IMPORT=1, and the source path
-    is inside an allowed import root (default: ~/Downloads and /tmp; override
-    with AI_CODE_IMPORT_ROOTS).
+    client.json has "external_import": true, and the source path
+    is inside an allowed import root (default: ~/Downloads and /tmp; override with "external_import_roots" in client.json).
 
     Args:
         path: 外部檔案路徑。支援絕對路徑或 ~ 展開。
@@ -1561,7 +1714,7 @@ def analyze_file(
                           "bind:LOCAL type:FUNC uart" / "ndx:UND" / "section:.text" 篩選,或 0x位址反查
           view="disasm"   反組譯;target=symbol 名 / 0x位址 / 0x起-0x迄(省略=entry point);limit=指令數;
                           .o/.ko 可加 "section:.init.text"。objdump 不支援該架構時會明講原因與補救
-                          (跨架構 objdump / pip install capstone / 環境變數 AICODE_OBJDUMP)
+                          (跨架構 objdump / pip install capstone / client.json 的 objdump)
           view="dwarf"    無 target → CU 列表;target=regex → 函式(位址範圍、來源檔:行)與
                           struct/union/enum/typedef 成員;target=0x位址 → 對應來源行與函式
           view="strings"  全部可讀字串(offset / section / 分類);target=regex,或 "cat:diagnostic"、
@@ -1578,7 +1731,7 @@ def analyze_file(
     view / target / limit 只對 ELF(含 ELF magic 的 .bin)有效;圖片、PDF 與非 ELF 二進位
     會忽略它們並在回覆開頭註明。
 
-    用途:OpenCode 對話中想分析錯誤截圖、firmware blob、ELF binary,
+    用途:對話中想分析錯誤截圖、firmware blob、ELF binary,
     或「只看一眼」一份 PDF(不想汙染 KB)時呼叫。
     對純文字檔(.py/.c/.md...)請改用 read_file。
 
@@ -1676,11 +1829,11 @@ def _clean_subprocess_output(text: str) -> str:
 
 
 # ---- RAG.py 子行程:逐行串流 + 有界終止 -------------------------------------
-# 舊版是 `subprocess.run(capture_output=True, timeout=600)`。`capture_output`
+# 舊版是 `process_env.run(capture_output=True, timeout=600)`。`capture_output`
 # 直到子行程結束才把 pipe 讀回來,所以逾時那一刻 TimeoutExpired 帶回的輸出等於
 # 沒有——使用者看不到 RAG.py 已經印到哪(第幾張圖、第幾頁),也無從判斷該不該
 # 改走 CLI(workflow.md §1 點名的真實 bug)。
-_INGEST_TIMEOUT_SECONDS = 600      # 與 OpenCode 範本的 660000 ms client timeout 對齊
+_INGEST_TIMEOUT_SECONDS = 600      # 與 config.MCP_CALL_TIMEOUT_SECONDS(660 秒)對齊
 _PREFLIGHT_TIMEOUT_SECONDS = 180   # preflight 零 VL / 零 embedding / 零寫入,不該吃滿 10 分鐘
 _TERMINATE_GRACE_SECONDS = 5.0
 _READER_JOIN_SECONDS = 10.0
@@ -1812,9 +1965,11 @@ def _run_rag_subprocess(cmd, *, timeout: int) -> _RagRun:
     - reader 是否卡住在**關 pipe 之前**取樣:關掉之後 reader 一定會結束,那時再看
       等於永遠看到「沒卡住」。
     """
-    import subprocess
 
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+    # 子行程環境先剝掉 CodeTrail 的設定名(與客戶端 spawn MCP 用的是同一個
+    # helper);RAG.py 的設定來源同樣只有檔案,見下面的 --client-config。
+    import client_mcp
+
     lines: list[str] = []
     reader_error: list[BaseException] = []
 
@@ -1823,16 +1978,16 @@ def _run_rag_subprocess(cmd, *, timeout: int) -> _RagRun:
     # register_child 看那份紀錄的 cancelled 旗標,已取消就地收掉並 raise。
     spawn_call = ingest_runtime.current_call()
 
-    proc = subprocess.Popen(
+    proc = process_env.popen(
         cmd,
         cwd=AICODE_ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stdout=process_env.PIPE,
+        stderr=process_env.STDOUT,
         text=True,
         encoding="utf-8",
         errors="replace",
         bufsize=1,
-        env=env,
+        overrides={"PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"},
         start_new_session=True,
     )
     # spawn 之後**立刻**記下 pgid:之後每一條失敗路徑都要能收掉這個 group。
@@ -1883,7 +2038,7 @@ def _run_rag_subprocess(cmd, *, timeout: int) -> _RagRun:
         reader.start()
         reader_started = True
         returncode = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except process_env.TimeoutExpired:
         timed_out = True
         terminated = _terminate_child(proc, pgid=pgid)
     except BaseException as exc:  # noqa: BLE001 - 統一 cleanup 後再往上拋
@@ -2176,6 +2331,10 @@ def ingest_document(
     elif resolved_mode == "chat":
         cmd += ["--chat", "-y"]
     # document / binary: 無額外 flag(走 add_document)
+    if _CLIENT_SETTINGS.present:
+        # RAG.py 是新起的行程:這個行程套用過的 client.json(objdump、遠端同意 …)
+        # 在它那邊仍是 repo 預設。把**同一份**設定檔的路徑交過去,它自己套。
+        cmd += ["--client-config", str(_CLIENT_SETTINGS.path)]
     if fresh:
         cmd += ["--fresh"]
     if preflight_only:
@@ -2300,9 +2459,9 @@ def ingest_document(
             hint = (
                 "\n\n超出上限時**沒有**任何寫入。三種處理方式:\n"
                 "  1. 把 PDF 拆成較小的檔案分批入庫;\n"
-                "  2. 調高對應上限(env,例如 AICODE_FIGURE_MAX_VL_CALLS_PER_DOC / "
-                "AICODE_FIGURE_MAX_IMAGE_TOKENS_PER_DOC / "
-                "AICODE_FIGURE_MAX_CANDIDATES_PER_DOC),上面報告會指出是哪一項;\n"
+                "  2. 調高對應上限(config.py 的常數,例如 FIGURE_MAX_VL_CALLS_PER_DOC / "
+                "FIGURE_MAX_IMAGE_TOKENS_PER_DOC / "
+                "FIGURE_MAX_CANDIDATES_PER_DOC;改它是改 repo),上面報告會指出是哪一項;\n"
                 f"  3. 在終端機直接跑(沒有 MCP 逾時):\n     {shown_cmd}"
             )
         else:
@@ -2981,7 +3140,7 @@ def run_command(
       - 預設白名單 = 測試與靜態命令:pytest / ctest / npm test / cargo test / go test;
         mypy / tsc / ruff / black / isort / eslint / clang-format 等。
       - build 命令(make / cmake / ninja / meson / bazel build)只在
-        AI_CODE_ENABLE_BUILD_COMMANDS=1 時加入白名單。
+        client.json 的 build_commands 打開時加入白名單。
       - git 不在白名單:改用 git_status / git_diff。
     apply_patch 不會自動呼叫這裡:套用後只做同 process 的 syntax check,lint / test
     要由你另行呼叫 run_lint(fix=False) / run_command,各自經過核准閘。
@@ -3024,7 +3183,7 @@ if __name__ == "__main__":
         `ingest_runtime.shutdown()` 沒收屍、`close_lease()` 沒標記退出:
         以獨立 process group 起的 RAG.py 會活下來繼續改寫 knowledge.json,
         而 lease 停在最後一次寫入,doctor 只能報 `stale`(看起來像 OOM)。
-        OpenCode 與一般 supervisor 關掉 server 用的正是 SIGTERM。
+        一般 supervisor 關掉 server 用的正是 SIGTERM。
 
         為什麼不是 `raise SystemExit` 讓 `finally` 去做:MCP 的 stdio reader 是
         一條**阻塞在 stdin 上的非 daemon 執行緒**,主協程結束之後直譯器還要等它,

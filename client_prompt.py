@@ -8,12 +8,12 @@
      字元硬上限。理由與範本一致:2026-08-24 的真實 regression 裡,一份 4,869
      字元的全域規則讓模型只反覆說「現在呼叫工具」並以 stop 結束。
   2. ``mcp_contract.MCP_INSTRUCTIONS`` —— 工具路由圖(不是第二份工具目錄)。
-  3. 專案 ``AGENTS.md`` —— 可用 env 關掉(取代 ``OPENCODE_DISABLE_PROJECT_CONFIG``)。
+  3. 專案 ``AGENTS.md`` —— 可在 client.json 用 ``project_instructions`` 關掉。
   4. ``.codetrail/lessons.md`` —— 使用者核准的行為規則。
   5. 選用的 ``~/.config/codetrail/instructions.md`` —— 有字元上限,超過 fail-loud。
 
 「實驗性 build prompt」在這個設計裡不存在:客戶端只有一份 system prompt,
-不需要另一份「取代 OpenCode build agent default」的東西。
+不需要另一份「取代前端 build agent default」的東西。
 """
 from __future__ import annotations
 
@@ -35,9 +35,6 @@ USER_INSTRUCTIONS_MAX_CHARS = 8_000
 
 #: 專案 AGENTS.md 的上限。同樣 fail-loud。
 PROJECT_INSTRUCTIONS_MAX_CHARS = 40_000
-
-#: 關閉專案內 instructions(AGENTS.md 與 lessons.md)的 env。
-DISABLE_PROJECT_INSTRUCTIONS_ENV = "CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS"
 
 USER_INSTRUCTIONS_PARTS = (".config", "codetrail", "instructions.md")
 PROJECT_AGENTS_FILENAME = "AGENTS.md"
@@ -92,14 +89,16 @@ class SystemPrompt:
         return len(self.text)
 
 
-def project_instructions_enabled(env: Mapping[str, str] | None = None) -> bool:
-    """比照 OpenCode 的 JS truthiness:**任何非空值**(含 "0")都代表關閉。
+def project_instructions_enabled() -> bool:
+    """讀被分析專案的 `AGENTS.md` 與 `.codetrail/lessons.md` 嗎?
 
-    這一條不改語意,是為了讓從 OpenCode 遷移過來的使用者不會因為
-    `CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=0` 而以為自己關掉了它。
+    來源是 client.json 的 `project_instructions`(經 `config`)。以前這是一個
+    「非空即關」的環境變數 —— 那個語意讓 `...=0` 看起來像關閉、實際是關閉,
+    正是設定不該有的形狀。現在它是一個真的 boolean。
     """
-    environ = os.environ if env is None else env
-    return not str(environ.get(DISABLE_PROJECT_INSTRUCTIONS_ENV, ""))
+    import config
+
+    return bool(getattr(config, "PROJECT_INSTRUCTIONS_ENABLED", True))
 
 
 def user_instructions_path(env: Mapping[str, str] | None = None) -> Path:
@@ -191,7 +190,7 @@ def build_system_prompt(
     _add("base_rules", "builtin", BASE_RULES.strip())
     _add("mcp_instructions", "mcp_contract", (mcp_instructions or "").strip())
 
-    if project_instructions_enabled(environ):
+    if project_instructions_enabled():
         agents = root_path / PROJECT_AGENTS_FILENAME
         _add(
             "project_agents",

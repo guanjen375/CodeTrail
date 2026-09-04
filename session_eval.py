@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Private, evidence-first evaluation helpers for OpenCode sessions.
+"""Private, evidence-first evaluation helpers for CodeTrail sessions.
 
 The historical assistant response is useful for finding failure modes, but it
 is never an oracle.  This module therefore has two deliberately separate data
@@ -138,7 +138,7 @@ def text_digest(value: str) -> str:
 
 def session_hash(session_id: str) -> str:
     if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
-        raise SessionEvalError("OpenCode export has an invalid session id")
+        raise SessionEvalError("session export has an invalid session id")
     return text_digest(session_id)[:16]
 
 
@@ -287,25 +287,25 @@ def _user_text(message: Mapping[str, Any]) -> str:
     return "\n".join(chunks).strip()
 
 
-def validate_opencode_export(value: object) -> dict[str, Any]:
+def validate_session_export(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
-        raise SessionEvalError("OpenCode export root must be an object")
+        raise SessionEvalError("session export root must be an object")
     info = value.get("info")
     messages = value.get("messages")
     if not isinstance(info, dict) or not isinstance(messages, list):
-        raise SessionEvalError("OpenCode export must contain info object and messages array")
+        raise SessionEvalError("session export must contain info object and messages array")
     session_id = info.get("id")
     session_hash(str(session_id) if isinstance(session_id, str) else "")
     if len(messages) > MAX_MESSAGES_PER_SESSION:
-        raise SessionEvalError("OpenCode export has too many messages")
+        raise SessionEvalError("session export has too many messages")
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
-            raise SessionEvalError(f"OpenCode messages[{index}] must be an object")
+            raise SessionEvalError(f"messages[{index}] must be an object")
         role = _message_role(message)
         if role not in ("user", "assistant"):
-            raise SessionEvalError(f"OpenCode messages[{index}] has unsupported role")
+            raise SessionEvalError(f"messages[{index}] has unsupported role")
         if not isinstance(message.get("parts"), list):
-            raise SessionEvalError(f"OpenCode messages[{index}].parts must be an array")
+            raise SessionEvalError(f"messages[{index}].parts must be an array")
     return value
 
 
@@ -317,7 +317,7 @@ def export_from_store(
 ) -> dict[str, Any]:
     """把 CodeTrail 自家 session store 的 JSONL 轉成 export 形狀。
 
-    以前這一格是 `opencode export`。**raw export 是來源封存**:助理回答與工具
+    **raw export 是來源封存**:助理回答與工具
     結果都保留(它們是之後人工建 verifier 用的 file/tool evidence),寫進 0600 的
     私人目錄。``sanitized=True`` 才把助理文字與工具輸出拿掉(只留工具名),給要
     分享出去的那一份。
@@ -363,7 +363,7 @@ def export_from_store(
                 parts.append(part)
             messages.append({"info": {"role": "assistant"}, "parts": parts})
         elif role == "tool":
-            # 工具結果掛在宣告它的那則 assistant 底下(OpenCode 的形狀)。
+            # 工具結果掛在宣告它的那則 assistant 底下(export 的形狀)。
             state: dict[str, Any] = {"status": record.get("tool_status") or "completed"}
             if not sanitized and isinstance(content, str):
                 state["output"] = content
@@ -407,7 +407,7 @@ def neutralize_followup(text: str) -> dict[str, Any]:
 
 
 def draft_from_export(value: object) -> dict[str, Any]:
-    export = validate_opencode_export(value)
+    export = validate_session_export(value)
     info = export["info"]
     session_id = info["id"]
     user_turns: list[dict[str, Any]] = []
@@ -423,7 +423,7 @@ def draft_from_export(value: object) -> dict[str, Any]:
             continue
         user_chars += len(text)
         if user_chars > MAX_USER_TEXT_CHARS:
-            raise SessionEvalError("OpenCode export has too much user-authored text")
+            raise SessionEvalError("session export has too much user-authored text")
         neutral = (
             {
                 "replay_text": text,
@@ -441,7 +441,7 @@ def draft_from_export(value: object) -> dict[str, Any]:
             }
         )
     if not user_turns:
-        raise SessionEvalError("OpenCode export has no non-empty user text")
+        raise SessionEvalError("session export has no non-empty user text")
     directory = info.get("directory")
     return {
         "schema_version": SCHEMA_VERSION,
@@ -460,13 +460,13 @@ def draft_from_export(value: object) -> dict[str, Any]:
 
 def mine_export_files(paths: Sequence[Path]) -> dict[str, Any]:
     if not paths:
-        raise SessionEvalError("mine requires at least one OpenCode export")
+        raise SessionEvalError("mine requires at least one session export")
     if len(paths) > MAX_SESSIONS:
         raise SessionEvalError(f"mine accepts at most {MAX_SESSIONS} sessions")
     drafts = [draft_from_export(read_json_file(path)) for path in paths]
     hashes = [draft["source"]["session_hash"] for draft in drafts]
     if len(hashes) != len(set(hashes)):
-        raise SessionEvalError("mine input contains duplicate OpenCode sessions")
+        raise SessionEvalError("mine input contains duplicate sessions")
     return {
         "schema_version": SCHEMA_VERSION,
         "source_policy": "user_text_only_assistant_excluded",

@@ -10,9 +10,13 @@
 roles:
   - "model":      llama_client 的所有 llama-server 呼叫
                   (completion / chat / embedding / reranking / props / slots / health)。
-                  opt-in env: AICODE_MODEL_REMOTE_OK
+                  opt-in:`client.json` 的 `model_remote_ok`。
   - "kb_context": Contextual Retrieval 的 chunk 脈絡生成(context_generation)。
-                  opt-in: config.KB_CONTEXT_REMOTE_OK(env AICODE_KB_CONTEXT_REMOTE_OK)
+                  opt-in:`client.json` 的 `kb_context_remote_ok`。
+
+兩個 opt-in 都**只來自 `~/.config/codetrail/client.json`**(由
+`client_config.apply_to_config()` 在啟動時推進 `config`)。以前它們是兩個環境
+變數;殼層裡一個殘留的值就等於「使用者以為 NDA 內容留在本機」而它正在離機。
 
 is_loopback_host / 錯誤語氣沿用 context_generation 既有實作;那邊改為委派這裡。
 """
@@ -66,10 +70,11 @@ def _redact_raw(url: str) -> str:
         return url
     return url[:start] + netloc.rpartition("@")[2] + url[end:]
 
-MODEL_REMOTE_OK_ENV = "AICODE_MODEL_REMOTE_OK"
-KB_CONTEXT_REMOTE_OK_ENV = "AICODE_KB_CONTEXT_REMOTE_OK"
-
-_TRUTHY = ("1", "true", "yes")
+#: 兩個 opt-in 的來源都是 `client.json`(經 `client_config.apply_to_config()`
+#: 推進 `config`)。**兩個鍵,不是一個**:前者放行送出 prompt,後者等於把整份
+#: 文件的窗送出去;合併會把前者的同意無聲擴大成後者。
+MODEL_REMOTE_OK_KEY = "model_remote_ok"
+KB_CONTEXT_REMOTE_OK_KEY = "kb_context_remote_ok"
 
 
 class EndpointPolicyError(RuntimeError):
@@ -90,7 +95,11 @@ def is_loopback_host(host: str) -> bool:
 
 
 def _model_remote_ok() -> bool:
-    return os.environ.get(MODEL_REMOTE_OK_ENV, "").lower() in _TRUTHY
+    # 動態讀 config attr(§3:動態值只用 `import config`):測試與 runtime 都
+    # 從同一個地方拿,而 client.json 的值是在啟動時被推進去的。
+    import config
+
+    return bool(getattr(config, "MODEL_REMOTE_OK", False))
 
 
 def _kb_context_remote_ok() -> bool:
@@ -107,8 +116,8 @@ def _model_error(base_url: str) -> str:
     return (
         f"模型端點 {base_url} 不是 loopback。CodeTrail 的模型呼叫會把 prompt"
         "(可能含 NDA 程式碼、文件內容與問題原文)送到該端點。"
-        f"確定要用遠端模型的話設 {MODEL_REMOTE_OK_ENV}=1;"
-        "否則把對應的 base URL 指回本機的 llama-server。"
+        "確定要用遠端模型的話,在 ~/.config/codetrail/client.json 設 "
+        f'"{MODEL_REMOTE_OK_KEY}": true;否則把對應的 base URL 指回本機的 llama-server。'
     )
 
 
@@ -117,8 +126,8 @@ def _kb_context_error(base_url: str) -> str:
         f"KB_CONTEXT_GENERATE 需要把文件內容送到 {base_url}，那不是 loopback。\n"
         "  會被送出去的東西：每個 chunk 的原文，以及它所在章節（文件太長時是整份\n"
         "  文件的摘要）——等於整份文件都會離開這台機器。\n"
-        f"  確定要這樣做的話設 {KB_CONTEXT_REMOTE_OK_ENV}=1；否則把\n"
-        "  AICODE_LLAMA_BASE_URL 指回本機的 llama-server。"
+        f'  確定要這樣做的話,在 ~/.config/codetrail/client.json 設 "{KB_CONTEXT_REMOTE_OK_KEY}": true;\n'
+        "  否則重跑 ./set_config.sh 把主模型 base URL 指回本機的 llama-server。"
     )
 
 

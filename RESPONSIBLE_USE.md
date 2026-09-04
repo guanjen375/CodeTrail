@@ -25,7 +25,7 @@ host operating system. Before handling confidential material:
    The sandbox root is the directory you launch `aicode` from.
 3. For untrusted repositories, remember that the project's `AGENTS.md` and
    `.codetrail/lessons.md` are injected into the system prompt. Read them first,
-   or start `aicode` with `CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1` so project
+   or set `"project_instructions": false` in `~/.config/codetrail/client.json` so project
    files cannot influence the agent.
 4. Review all effective model endpoints. A non-loopback endpoint means prompts or
    retrieved content can leave the current machine.

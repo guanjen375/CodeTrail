@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from enum import Enum
 from typing import Any, Protocol
 
-#: 互動模式需要人工核准的六個工具。
+#: 互動模式需要人工核准的七個工具。
 ASK_TOOLS: frozenset[str] = frozenset(
     {
         "apply_patch",
@@ -28,12 +28,21 @@ ASK_TOOLS: frozenset[str] = frozenset(
         "remove_document",
         "record_lesson",
         "review_figures",
+        # `client.json` 的 `external_import` 把授權從「單次啟動」變成**跨專案
+        # 持久**,所以實際動作要逐次確認:核准框會顯示來源與目的路徑。
+        # 開關一開就自動放行,等於使用者只能在事後從檔案系統發現模型複製了什麼。
+        "import_external_file",
     }
 )
 
+#: 這幾個工具的 ask **不是偏好,是邊界**:`client.json` 的 `permission` 可以把它們
+#: 收緊成 deny,但不得放寬成 allow。`import_external_file` 的開關授權的是「可以從
+#: 專案外複製檔案進來」這件事,每一次的來源與目的仍要人看過(plan §6 第 12 條)。
+NEVER_AUTO_ALLOWED: frozenset[str] = frozenset({"import_external_file"})
+
 #: readonly policy 必須 deny 的下限(現行八個 mutator)。
 #: 真正的判準是 ``readOnlyHint``;這份名單只是「至少這些」的測試錨點。
-MUTATING_TOOLS: frozenset[str] = ASK_TOOLS | {"ingest_document", "import_external_file"}
+MUTATING_TOOLS: frozenset[str] = ASK_TOOLS | {"ingest_document"}
 
 #: 同一輪裡同一個被拒絕的工具最多讓模型重問幾次。
 MAX_DENIED_RETRIES = 2
@@ -63,8 +72,8 @@ class InteractivePolicy:
     def decide(self, tool_name: str, *, read_only: bool, arguments: Mapping[str, Any]) -> Decision:
         if tool_name in self.ask_tools:
             return Decision.ASK
-        # 其餘一律 allow —— 包含 ingest_document / import_external_file /
-        # reload_knowledge_base 這幾個「不是唯讀但也不需要每次問」的工具。
+        # 其餘一律 allow —— 包含 ingest_document / reload_knowledge_base
+        # 這幾個「不是唯讀但也不需要每次問」的工具。
         # 這與 OpenCode 時代的權限表逐條相同(`codetrail_*: allow` 再把六個覆成
         # ask),不是放寬:改成「非唯讀就 ask」會讓一次 ingest 多跳一個核准框,
         # 那是使用者沒要求過的行為改變。
@@ -126,6 +135,10 @@ class OverridePolicy:
             # readonly policy 的 deny 是邊界,不接受放寬。
             return decision
         try:
-            return Decision(override)
+            wanted = Decision(override)
         except ValueError:
             return decision
+        if wanted is Decision.ALLOW and tool_name in NEVER_AUTO_ALLOWED:
+            # 只准收緊。放寬這一個等於 client.json 一行就拆掉「每次匯入都要人看」。
+            return decision
+        return wanted

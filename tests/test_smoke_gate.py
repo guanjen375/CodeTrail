@@ -40,28 +40,47 @@ TESTS_DIR = Path(__file__).resolve().parent
 # AGENTS.md §2「安全相關不要砍」的檢查點 → (守它的說明, 必須存在且帶 smoke 的 node)。
 SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     "test_aicode.py": (
-        "aicode 的正常路徑不得 exec 任何 opencode 二進位;web 的密碼硬規則(非 loopback / mDNS)"
-        "與經驗證的 Tailscale 例外必須擋得住 env 偽造;舊安裝的遷移只警告不寫檔",
+        "wrapper 只做四件事:定位 checkout(自己可能是 symlink)、找 python3、檢查 argv 並拒絕"
+        "沒有終端機的環境(指向 headless,不靜默降級)、exec 唯一的客戶端。使用者參數只有"
+        "-c/--continue、--session <id>、-h/--help —— run / status / sessions 這些內部入口不跑"
+        "preflight,轉發過去等於開一條略過 profile 驗證 / ctx 容量閘 / 工具健檢的第二入口。"
+        "root 一律是 cwd;殼層裡殘留的 AICODE_* / AI_CODE_* / CODETRAIL_* 對它一律無效;"
+        "缺 textual 要 fail-loud 印 pip 指令;正常路徑不得 exec 任何 opencode 二進位",
         (
-            "test_a_model_before_web_is_not_forwarded_raw",
-            "test_global_policy_before_web_stays_in_front_of_the_subcommand",
-            "test_a_global_session_before_attach_is_forwarded",
+            "test_the_only_exec_target_is_the_client_next_to_the_wrapper",
+            "test_the_wrapper_follows_its_own_symlink_to_find_the_checkout",
+            "test_the_sandbox_root_is_always_the_current_directory",
+            "test_without_a_tty_the_wrapper_refuses_and_points_at_the_headless_entry",
+            "test_a_missing_textual_fails_loud_with_the_pip_command",
+            "test_a_polluted_shell_changes_nothing",
             "test_aicode_never_execs_opencode",
-            "test_aicode_warns_about_a_pending_migration_without_blocking",
-            "test_aicode_web_non_local_hostname_without_password_refused",
-            "test_aicode_web_non_local_hostname_with_password_allowed",
-            "test_aicode_web_mdns_without_password_refused",
-            "test_aicode_web_verified_tailscale_ip_without_password_allowed",
-            "test_aicode_web_forwards_the_verified_tailscale_hostname",
-            "test_aicode_web_tailscale_exception_is_not_bypassable",
-            "test_aicode_web_rejects_unsafe_root",
-            "test_a_bad_flag_is_rejected_before_any_preflight",
-            "test_a_positional_project_directory_becomes_the_root",
-            "test_aicode_web_rejects_a_flag_the_client_does_not_have",
-            "test_root_flag_moves_the_preflight_too",
-            "test_global_options_before_attach_still_route_to_the_thin_client",
-            "test_global_options_before_web_keep_the_wrapper_gate",
-            "test_a_password_gate_cannot_be_skipped_by_putting_options_before_web",
+            "test_the_wrapper_stays_thin",
+            "test_the_wrapper_never_reads_configuration_from_the_environment",
+            "test_the_wrapper_accepts_only_the_three_user_flags",
+            "test_the_wrapper_forwards_the_three_user_flags",
+        ),
+    ),
+    "test_client_preflight.py": (
+        "preflight 的交接:每一步交給 deployment_profile / model_resolution 的環境只有 HOME"
+        "(殼層裡殘留的 AICODE_* 對這一次啟動一律無效——那是跨 branch 混用的真正機制);"
+        "aux server 的硬閘與 canary 都問 profile 的 endpoint、驗的是 repo 裡那一份客戶端;"
+        "canary 的時限 / TTL 是 repo 常數而快取位置只由 XDG_CACHE_HOME / HOME 推導;"
+        "client.json 的位置沒有覆寫變數(它決定互動 session 的工具權限);"
+        "transcript 收 stdout **與 stderr**(canary 的 WARNING 只走 stderr),"
+        "而且一定帶壓縮狀態行(自動壓縮被停用是使用者唯一會看到的地方)",
+        (
+            "test_the_profile_environment_is_home_only",
+            "test_userprofile_is_only_a_fallback_when_home_is_absent",
+            "test_a_polluted_shell_changes_neither_the_model_nor_the_endpoints",
+            "test_the_aux_server_gate_asks_the_profile_not_the_shell",
+            "test_the_canary_verifies_the_client_next_to_this_repo",
+            "test_the_canary_timeouts_and_ttl_are_repo_constants",
+            "test_the_canary_cache_has_no_location_override",
+            "test_the_client_config_path_has_no_environment_override",
+            "test_the_transcript_keeps_stderr_warnings",
+            "test_the_transcript_carries_the_compaction_status",
+            "test_every_profile_env_helper_has_the_same_home_only_shape",
+            "test_the_canary_child_environment_is_stripped",
         ),
     ),
     "test_set_config.py": (
@@ -69,7 +88,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "門檻等於 runtime 用的同一條公式、算不出門檻要 fail-loud、dry-run 不留檔;"
         "restore transaction 的整批語意(一半還原比不還原更糟、manifest 壞掉不退回逐檔、"
         "沒有備份路徑不得刪 live 檔、symlink 被改指不得覆寫別處、寫不出 manifest 不得留 stale);"
-        "restore 不得再寫使用者的 opencode.json;遷移不得碰沒接管過的機器",
+        "restore manifest 兩個世代共用同一個檔:含這一代不會寫的目標時整份拒絕、一個檔都不動",
         (
             "test_yes_without_the_flag_never_takes_over",
             "test_codetrail_mode_writes_the_chosen_mode",
@@ -82,23 +101,23 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_an_unknown_mode_is_rejected",
             "test_a_context_too_small_for_the_formula_is_fail_loud",
             "test_transaction_staging_files_are_private_from_birth",
-            "test_the_restore_manifest_no_longer_lists_opencode_json",
-            "test_an_old_manifest_never_writes_back_the_users_opencode_config",
-            "test_the_migration_never_touches_a_machine_that_never_took_over",
+            "test_the_restore_manifest_only_lists_this_generations_targets",
+            "test_a_manifest_with_a_foreign_target_is_refused_whole",
+            "test_a_manifest_written_before_the_upgrade_still_restores",
+            "test_restore_refuses_to_write_client_json_through_a_symlinked_parent",
             "test_quitting_at_the_summary_writes_nothing",
             "test_restore_reports_failure_when_a_backup_is_missing",
             "test_restore_never_deletes_a_live_file_when_the_manifest_has_no_backup",
             "test_a_corrupt_manifest_does_not_fall_back_to_per_file_backups",
             "test_restore_refuses_when_a_symlinked_config_was_repointed",
             "test_a_manifest_that_cannot_be_written_does_not_survive_stale",
-            "test_set_config_refuses_to_write_when_the_migration_state_cannot_be_judged",
-            "test_set_config_refuses_to_write_when_the_ownership_state_is_untrusted",
         ),
     ),
     "test_doctor.py": (
         "explicit hard gate 與 implicit 四態 diagnostic 必須分離;"
         "canary 的 fingerprint 必須涵蓋客戶端與 system prompt(換了就不能沿用舊判定);"
-        "canary 走的是唯讀、不落 session 的 headless run",
+        "canary 走的是唯讀、不落 session 的 headless run;缺 textual 是 FAIL 不是 WARN;"
+        "殘留的網頁 backend 只唯讀偵測",
         (
             "test_explicit_gate_and_implicit_diagnostic_are_separate",
             "test_fingerprint_covers_live_protocol_template_build_and_prompt",
@@ -106,35 +125,26 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_run_model_attempt_passes_explicit_model_and_ignores_private_output",
             "test_the_canary_runs_the_client_the_wrapper_will_actually_exec",
             "test_expected_tool_contract_matches_mcp_server",
+            "test_a_missing_textual_is_a_fail_not_a_warn",
+            "test_the_canary_cache_filename_carries_the_schema_number",
+            "test_a_leftover_web_backend_is_reported_read_only",
         ),
     ),
-    "test_compaction_mode.py": (
-        "壓縮模式的 ownership 狀態檔:owner-only 權限與 symlink 防線、digest 涵蓋 prior、綁定單一 config、以及「沒有狀態檔 = 沒有接管」的 fail-closed;受管鍵與契約鍵是兩組(prune 會寫會還原但改了不算漂移),新增受管鍵不得讓舊狀態檔失效",
+    "test_compaction_formula.py": (
+        "壓縮門檻公式是單一真值(改了就改變什麼時候壓縮、壓完留多少,而且沒有任何錯誤訊息);"
+        "摘要格式核對的七個欄位標題必須從 canonical 文件解析,不是再抄一份字面值;"
+        "狀態行顯示的模式必須來自 runtime 用的同一份設定,而且永遠不得 raise",
         (
+            "test_derive_settings_follows_the_upstream_formula",
             "test_combining_two_models_keeps_the_single_model_relationships",
-            "test_save_state_is_owner_only_and_atomic",
-            "test_save_state_refuses_a_symlink_target",
-            "test_save_state_refuses_a_symlinked_state_directory",
-            "test_load_state_is_fail_closed",
-            "test_load_state_refuses_a_world_readable_state_file",
-            "test_state_with_a_tampered_prior_is_rejected",
-            "test_state_from_another_config_is_refused",
-            "test_native_leaves_values_the_user_changed_after_takeover",
-            "test_ownership_is_json_type_strict",
-            "test_state_digest_survives_an_integral_float_in_prior",
-            "test_config_identity_needs_both_hashes",
-            "test_a_moved_repo_converges_to_exactly_one_plugin_entry",
-            "test_native_keeps_a_pre_existing_plugin_without_calling_it_drift",
-            "test_a_same_named_plugin_we_never_registered_is_not_hijacked",
-            "test_a_replaced_entry_is_not_hijacked_even_after_we_registered_once",
-            "test_switching_to_native_after_a_repo_move_removes_the_old_entry",
-            "test_a_native_baseline_is_recomputed_from_the_current_config",
-            "test_prune_is_taken_over_and_restored_but_never_called_drift",
-            "test_native_leaves_a_prune_value_the_user_set_before_takeover",
-            "test_unmanaged_keys_names_what_an_older_state_file_never_took_over",
-            "test_state_refuses_values_the_two_languages_serialise_differently",
-            "test_a_pre_existing_plugin_is_not_claimed_by_a_repo_move",
-            "test_an_entry_we_added_after_a_move_is_still_ours_at_native",
+            "test_derive_settings_refuses_a_model_too_small_for_the_contract",
+            "test_effective_max_output_matches_upstream_transform",
+            "test_tool_result_fraction_matches_the_runtime_contract",
+            "test_rule_headings_come_from_the_document",
+            "test_canonical_block_is_fail_loud_when_the_doc_drifts",
+            "test_no_client_config_reads_as_untouched",
+            "test_an_unreadable_config_never_shows_a_stale_mode",
+            "test_the_status_line_never_raises",
         ),
     ),
     "test_mcp_server.py": (
@@ -153,11 +163,24 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_mcp_server_still_wires_up_root_validation",
             "test_mcp_server_rejects_root_slash",
             "test_defaults_keep_patch_and_run_command_on",
-            "test_explicit_patch_zero_disables_patch",
-            "test_explicit_run_tests_zero_disables_run_command",
+            "test_readonly_closes_every_switch_and_ignores_the_other_inputs",
+            "test_no_environment_variable_can_turn_the_switches_back_on",
+            "test_startup_banner_reports_the_readonly_policy",
             "test_build_commands_opt_in",
             "test_git_tools_outside_a_repo_return_a_skip_notice_not_a_retryable_error",
             "test_a_broken_git_environment_is_not_reported_as_a_missing_repo",
+            "test_import_never_writes_through_a_dangling_symlink_in_the_upload_dir",
+            "test_import_reads_the_source_it_validated_not_a_swapped_one",
+            "test_a_readonly_server_refuses_every_mutator",
+            "test_the_server_accepts_an_explicit_client_config_path",
+            "test_the_rag_subprocess_receives_the_same_client_config",
+            "test_malformed_startup_argv_fails_loud",
+            "test_a_symlinked_source_lands_under_the_name_the_user_approved",
+            "test_the_approval_box_and_the_tool_agree_on_the_upload_directory",
+            "test_import_refuses_a_parent_directory_swapped_for_a_symlink_after_validation",
+            "test_a_rejected_import_does_not_leak_the_source_fd",
+            "test_import_refuses_an_allowed_root_whose_ancestor_was_swapped_for_a_symlink",
+            "test_import_traverses_an_execute_only_ancestor",
         ),
     ),
     "test_mcp_ingest.py": (
@@ -237,6 +260,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_preflight_suggestion_drops_the_mutually_exclusive_fresh_flag",
             "test_busy_exception_tells_the_model_to_wait_not_to_retry_now",
             "test_timeout_bounds_are_frozen",
+            "test_a_filesystem_permission_error_is_not_described_as_a_readonly_refusal",
         ),
     ),
     "test_mcp_lease.py": (
@@ -289,13 +313,17 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_live_roundtrip_exposes_the_real_catalog",
             "test_one_engine_process_keeps_exactly_one_mcp_instance",
             "test_closing_a_shared_client_finishes_before_a_replacement_starts",
+            "test_env_overrides_cannot_reintroduce_a_stripped_prefix",
+            "test_process_env_run_is_the_only_spawn_exit_and_never_takes_env",
+            "test_process_env_popen_class_is_not_a_raw_spawn_bypass",
+            "test_client_config_and_skip_aux_preflight_reach_the_server_argv",
         ),
     ),
     "test_client_engine.py": (
         "送出去的那一份才算數:reasoning 剝除只動 reasoning 欄位、只丟最新真實使用者訊息之前的、"
         "認不出那則訊息就整段不動;prune 只改 payload,session 檔與畫面保留原文;"
         "懸空 tool_call 必須在送出前補齊;權限 policy 的 readonly 全 deny(判準是 readOnlyHint 不是名單)、"
-        "互動的六個 ask 沒核准就不得執行且重問有上限、核准框完整顯示參數;"
+        "互動的七個 ask 沒核准就不得執行且重問有上限、核准框完整顯示參數(`import_external_file` 也在裡面:那個開關授權的是能力,不是每一次的來源與目的);"
         "只有工具結果的 text block 進模型;ingest marker 只認 ingest_document 的行首;"
         "假工具呼叫偵測不得把否定句算成宣稱;基底規則守 1,600 字元;閘對轉換後的 payload 計數",
         (
@@ -330,7 +358,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_dangling_tool_call_is_healed_before_the_next_request",
             "test_readonly_policy_denies_every_mutator",
             "test_readonly_policy_denies_a_new_tool_that_is_not_read_only",
-            "test_interactive_policy_asks_for_the_six_write_tools",
+            "test_interactive_policy_asks_for_the_seven_write_tools",
+            "test_external_import_is_gated_behind_a_per_call_approval",
             "test_a_denied_ask_never_reaches_the_mcp_server",
             "test_a_repeatedly_denied_tool_stops_asking_the_user",
             "test_the_approval_box_shows_every_argument_in_full",
@@ -366,30 +395,87 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_truncated_tool_call_stream_never_executes_half_arguments",
             "test_a_failed_new_session_keeps_the_current_conversation",
             "test_a_malformed_compaction_record_does_not_half_switch_the_session",
+            "test_the_import_approval_cannot_be_overridden_to_allow",
+            "test_the_import_approval_shows_where_the_file_will_land",
+            "test_fallback_tool_call_ids_are_unique_across_steps",
         ),
     ),
     "test_client_cli.py": (
         "事件流是 canary / routing eval / session_eval replay 的共用介面:形狀與解析器只有一份、"
         "tool-calls 的 step 不算終止、thinking 不得進事件流;headless 預設 ephemeral;"
-        "TUI 的核准框完整顯示參數,EOF 一律視為拒絕",
+        "readonly 連客戶端自己的 context metrics 也要關",
         (
             "test_a_provider_prefixed_model_is_normalised_like_the_wrapper",
-            "test_a_global_session_reaches_the_attach_command",
             "test_a_completed_tool_event_is_recognised_by_the_shared_parser",
             "test_a_denied_or_failed_tool_is_not_a_completed_call",
             "test_a_tool_calls_step_is_not_terminal_but_stop_is",
             "test_reasoning_never_reaches_the_event_stream",
             "test_the_shared_parser_reads_our_own_stream",
             "test_headless_defaults_to_ephemeral",
-            "test_the_approval_prompt_shows_the_whole_patch",
-            "test_an_eof_at_the_approval_prompt_is_a_refusal",
             "test_a_readonly_run_never_writes_context_metrics_into_the_project",
-            "test_changing_session_rebinds_without_consuming_the_stop_notice",
-            "test_new_session_resets_store_error_through_the_tui",
-            "test_a_failed_new_keeps_the_repl_and_the_current_session",
+            "test_the_server_actually_honours_readonly",
+            "test_headless_run_compacts_after_a_completed_turn_and_reports_it",
+        ),
+    ),
+    "test_client_turns.py": (
+        "回合協調器:同一個對話一次只跑一輪;取消要涵蓋 engine 自己看不到的三個狀態"
+        "(worker 還沒進 send()、阻塞在核准上、取消與收尾互相搶跑),閒置時的取消一律回 False;"
+        "慢速的 MCP 取消不得扣住協調器的鎖;核准沒回答就是拒絕、只能回答一次、非 bool 不算核准;"
+        "notice 要在終結事件之前送,失敗也要送終結事件;只有答完(finish=stop)才自動壓縮",
+        (
+            "test_cancel_wakes_a_turn_waiting_for_approval",
+            "test_cancel_counts_even_before_the_worker_enters_send",
+            "test_a_cancel_arriving_while_the_turn_is_being_started_is_not_lost",
+            "test_the_slow_mcp_cancel_does_not_hold_the_coordinator_lock",
+            "test_a_cancel_that_races_the_end_of_the_turn_never_poisons_the_next_one",
+            "test_a_cancel_while_idle_is_refused",
+            "test_an_unanswered_approval_is_a_refusal",
+            "test_an_unknown_approval_id_is_rejected",
+            "test_an_approval_can_only_be_answered_once",
+            "test_a_non_boolean_granted_is_never_an_approval",
+            "test_an_approval_registered_after_the_cancel_is_refused_immediately",
+            "test_a_cancel_after_the_answer_is_committed_is_refused",
+            "test_a_cancel_during_the_manual_compaction_preflight_is_consumed_not_lost",
+            "test_notices_are_delivered_before_the_terminal_event",
+            "test_a_turn_failure_still_sends_a_terminal_event",
+            "test_two_concurrent_turns_are_refused",
+            "test_the_durable_stop_notice_is_published_before_the_turn_starts",
+            "test_auto_compaction_only_runs_after_a_completed_answer",
+            "test_a_cancel_accepted_during_compaction_ends_with_a_cancelled_terminal",
+            "test_a_manual_compaction_is_a_turn_and_can_be_cancelled",
+            "test_a_session_change_rebinds_the_compactor_without_consuming_the_notice",
+        ),
+    ),
+    "test_client_app.py": (
+        "TUI:核准框完整顯示參數(含整份 patch)且可捲動、只認真的 bool;Esc / Ctrl-D 只拒絕"
+        "那個工具、Ctrl-C 中斷整輪(核准框開著時也一樣、送出後立刻按也生效),閒置的 Ctrl-C "
+        "不得顯示成「已中斷」,慢速 MCP 取消不得凍住畫面;回合進行中不得離開、不得換 session、"
+        "被拒的第二題不得先貼進畫面;工具展開區要顯示未裁切的 structuredContent;沒有 tty 一律"
+        "拒絕並指向 headless;輸入歷史逐字含 NDA 問題,正常退出一定要落檔、多行問題要能還原,"
+        "讀寫兩端都拒 symlink(含中間目錄)與 hard link",
+        (
+            "test_the_approval_box_shows_the_whole_patch",
+            "test_the_approval_keys_only_answer_this_one_tool",
+            "test_a_dismissed_approval_is_a_refusal",
+            "test_ctrl_c_during_a_turn_cancels_the_whole_turn",
+            "test_ctrl_c_with_the_approval_box_open_cancels_the_whole_turn",
+            "test_a_cancel_right_after_submitting_still_lands",
+            "test_ctrl_c_while_idle_needs_two_presses_and_never_claims_a_cancel",
+            "test_ctrl_c_does_not_block_the_ui_on_a_slow_mcp_cancel",
+            "test_ctrl_d_with_the_approval_box_open_only_refuses_that_tool",
+            "test_leaving_is_refused_while_a_turn_is_running",
+            "test_switching_sessions_is_refused_while_a_turn_is_running",
+            "test_a_second_question_during_a_turn_is_not_shown_and_keeps_the_input",
+            "test_a_pipe_is_refused_and_points_at_the_headless_entry",
+            "test_slash_commands_never_reach_the_model",
+            "test_thinking_only_toggles_the_display",
+            "test_a_tool_call_shows_a_summary_and_can_be_expanded",
             "test_saving_history_never_writes_through_a_hard_link",
             "test_saving_history_never_follows_a_symlink",
+            "test_a_symlinked_middle_component_is_refused",
             "test_loading_history_never_reads_through_a_symlink",
+            "test_history_is_saved_on_a_normal_exit_and_round_trips_multiline",
+            "test_a_new_session_forgets_the_old_tool_blocks",
         ),
     ),
     "test_client_store.py": (
@@ -427,6 +513,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "synthetic／出錯回合、同一錨點不重壓、摘要請求送的是 prune 後的那一份;"
         "client.json 是 owner-only 且 permission override 不得放寬 readonly",
         (
+            "test_a_ledger_written_before_the_upgrade_still_disables_that_session",
             "test_the_whole_compaction_is_one_turn_including_the_preflight",
             "test_a_cancel_accepted_before_an_invalid_summary_is_judged_does_not_stop_compaction",
             "test_a_cancel_accepted_before_a_summary_error_does_not_stop_compaction",
@@ -475,102 +562,49 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_cancelled_summary_is_not_a_durable_stop",
         ),
     ),
-    "test_client_web.py": (
-        "web 的存取邊界:沒有密碼就不准離開 loopback(而且是 server 自己擋)、Tailscale 例外要"
-        "env／CIDR／CLI 三方一致、每個端點都要密碼、cookie 不是密碼本身、密碼不得進 log、"
-        "比對是常數時間(非 ASCII 密碼也要能登入,不是 500);approval 沒回答就是拒絕、"
-        "只能回答一次、非 bool 不算核准;跨站頁面與 text/plain simple POST 不得驅動這個 "
-        "server;訂閱之前的事件要重播、失敗也要送終結事件、同一 session 不得並行;"
-        "resume 不得留下孤兒 session;mDNS 不得廣播 loopback",
-        (
-            "test_a_cancel_arriving_while_the_turn_is_being_started_is_not_lost",
-            "test_the_slow_mcp_cancel_does_not_hold_the_app_lock",
-            "test_a_web_started_with_a_session_resumes_it_by_default",
-            "test_a_cancel_during_the_manual_compaction_preflight_is_consumed_not_lost",
-            "test_a_cancel_after_the_answer_is_committed_but_before_compaction_is_refused",
-            "test_a_cancel_accepted_during_compaction_ends_with_a_cancelled_terminal",
-            "test_a_manual_compaction_can_be_cancelled_from_the_api",
-            "test_a_cancel_that_races_the_end_of_the_turn_never_poisons_the_next_one",
-            "test_a_browser_reconnect_prefers_last_event_id_over_the_url_cursor",
-            "test_a_cors_front_end_can_log_in_and_stream_with_the_returned_token",
-            "test_loopback_without_a_password_is_allowed",
-            "test_a_non_loopback_bind_without_a_password_is_refused",
-            "test_mdns_on_loopback_still_needs_a_password",
-            "test_env_alone_cannot_fake_the_tailscale_exception",
-            "test_a_lan_address_is_never_accepted_as_tailscale",
-            "test_a_verified_tailscale_address_is_the_documented_exception",
-            "test_mdns_has_no_tailscale_exception",
-            "test_every_endpoint_requires_the_password",
-            "test_the_login_cookie_is_httponly_and_not_the_password",
-            "test_the_password_never_reaches_the_log",
-            "test_password_comparison_is_constant_time",
-            "test_an_unanswered_approval_is_a_refusal",
-            "test_an_unknown_approval_id_is_rejected",
-            "test_an_approval_can_only_be_answered_once",
-            "test_a_non_boolean_granted_is_never_an_approval",
-            "test_a_cross_origin_page_cannot_drive_the_server",
-            "test_a_text_plain_simple_post_is_refused",
-            "test_a_non_ascii_password_can_log_in",
-            "test_events_published_before_the_subscription_are_replayed",
-            "test_a_turn_failure_still_sends_a_terminal_event",
-            "test_two_concurrent_turns_on_one_session_are_refused",
-            "test_the_turn_notices_reach_the_client",
-            "test_resuming_never_leaves_an_orphan_session_behind",
-            "test_an_unknown_session_id_creates_nothing",
-            "test_broadcasting_a_loopback_address_is_refused",
-            "test_the_web_password_never_reaches_the_mcp_child",
-            "test_the_streamed_deltas_never_duplicate_the_turn_text",
-            "test_manual_compaction_is_reachable_from_the_web_api",
-            "test_auto_compaction_runs_after_a_web_turn",
-            "test_attach_never_uses_an_environment_proxy",
-            "test_attach_refuses_a_cross_host_redirect",
-            "test_a_running_turn_can_be_cancelled_from_the_api",
-            "test_notices_are_delivered_before_the_terminal_event",
-            "test_a_turn_cursor_lets_the_next_subscription_skip_old_events",
-            "test_cancel_wakes_a_turn_waiting_for_approval",
-            "test_cancel_counts_even_before_the_worker_enters_send",
-            "test_auto_compaction_only_runs_after_a_completed_answer",
-            "test_the_durable_stop_notice_is_published_before_the_turn_starts",
-            "test_resuming_never_creates_a_session_file_first",
-            "test_a_rebound_host_header_is_refused_even_when_origin_matches",
-            "test_attach_follows_a_turn_from_its_cursor",
-            "test_cors_origins_are_an_explicit_allowlist",
-            "test_the_message_api_returns_the_cursor",
-            "test_host_aliases_cover_the_loopback_spellings",
-            "test_a_cancel_during_the_compaction_phase_reaches_the_engine_and_ends_with_the_turn",
-            "test_an_approval_registered_after_the_cancel_is_refused_immediately",
-            "test_wildcard_binds_do_not_restrict_the_host_header",
-            "test_a_password_protected_wildcard_bind_accepts_the_real_lan_host",
-            "test_sse_events_carry_ids_and_reconnects_resume_from_last_event_id",
-            "test_sse_carries_cors_headers_for_an_allowed_origin",
-            "test_the_browser_resume_api_loads_the_session_and_returns_a_cursor",
-            "test_a_store_error_on_resume_is_a_404_not_a_traceback",
-            "test_the_stop_notice_is_not_duplicated_in_the_post_body",
-        ),
-    ),
     "test_opencode_migrate.py": (
-        "唯一會寫使用者 OpenCode 設定的路徑:只還原現值仍等於 CodeTrail 寫入值的鍵、"
-        "只移除 path 對得上的 plugin 項、mcp.codetrail 與 permission 不動、"
-        "沒有狀態檔也沒有我們的 plugin 項的機器零寫入、狀態檔在設定寫成功之後才刪、"
-        "--check 不寫任何東西",
+        "唯一會寫使用者 OpenCode 設定的路徑(而且只有使用者手動執行時才跑):"
+        "只還原現值仍等於 CodeTrail 寫入值的鍵、只移除 path 對得上的 plugin 項、"
+        "mcp.codetrail 與 permission 不動、沒有狀態檔也沒有我們的 plugin 項的機器零寫入、"
+        "狀態檔在設定寫成功之後才刪、--check 不寫任何東西;"
+        "**別份安裝的接管不動**(狀態檔記的 plugin 路徑還在且不是本 repo → 零寫入只提示),"
+        "但本 repo 搬過家不得被誤判成別份安裝;"
+        "ownership 狀態檔本身:owner-only 權限與 symlink 防線、digest 涵蓋 prior、綁定單一 config、"
+        "「沒有狀態檔 = 沒有接管」的 fail-closed、受管鍵與契約鍵是兩組、plugin 項的認領與去重",
         (
             "test_a_machine_that_never_took_over_is_untouched",
-            "test_a_machine_without_any_opencode_config_is_untouched",
             "test_only_values_we_still_own_are_restored",
-            "test_a_value_the_user_changed_after_takeover_is_left_alone",
-            "test_only_our_plugin_entries_are_removed",
-            "test_mcp_and_permission_are_never_touched",
-            "test_a_backup_is_left_behind",
-            "test_the_state_file_is_deleted_only_after_the_config_was_written",
-            "test_check_mode_writes_nothing",
-            "test_a_state_file_for_another_config_is_refused",
-            "test_a_leftover_compaction_plugin_alone_triggers_the_migration",
             "test_a_same_named_plugin_from_elsewhere_is_still_not_ours",
-            "test_the_custom_config_path_is_honoured",
-            "test_the_config_keeps_its_permissions",
+            "test_mcp_and_permission_are_never_touched",
+            "test_check_mode_writes_nothing",
             "test_a_state_file_that_cannot_be_removed_is_fail_loud",
-            "test_an_unreadable_opencode_config_is_a_problem_not_a_no",
-            "test_an_untrusted_ownership_state_file_is_a_problem_not_a_no",
+            "test_another_installs_takeover_is_left_alone",
+            "test_a_moved_repo_is_not_mistaken_for_another_install",
+            "test_the_managed_values_come_from_the_formula",
+            "test_save_state_is_owner_only_and_atomic",
+            "test_save_state_refuses_a_symlink_target",
+            "test_save_state_refuses_a_symlinked_state_directory",
+            "test_load_state_is_fail_closed",
+            "test_load_state_refuses_a_world_readable_state_file",
+            "test_state_with_a_tampered_prior_is_rejected",
+            "test_state_from_another_config_is_refused",
+            "test_native_leaves_values_the_user_changed_after_takeover",
+            "test_ownership_is_json_type_strict",
+            "test_state_digest_survives_an_integral_float_in_prior",
+            "test_config_identity_needs_both_hashes",
+            "test_a_moved_repo_converges_to_exactly_one_plugin_entry",
+            "test_native_keeps_a_pre_existing_plugin_without_calling_it_drift",
+            "test_a_same_named_plugin_we_never_registered_is_not_hijacked",
+            "test_a_replaced_entry_is_not_hijacked_even_after_we_registered_once",
+            "test_switching_to_native_after_a_repo_move_removes_the_old_entry",
+            "test_a_native_baseline_is_recomputed_from_the_current_config",
+            "test_prune_is_taken_over_and_restored_but_never_called_drift",
+            "test_native_leaves_a_prune_value_the_user_set_before_takeover",
+            "test_unmanaged_keys_names_what_an_older_state_file_never_took_over",
+            "test_state_refuses_values_the_two_languages_serialise_differently",
+            "test_a_pre_existing_plugin_is_not_claimed_by_a_repo_move",
+            "test_an_entry_we_added_after_a_move_is_still_ours_at_native",
+            "test_an_unverifiable_foreign_takeover_is_left_alone",
         ),
     ),
     "test_deployment.py": (
@@ -582,12 +616,6 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_conflicting_opencode_json_is_not_a_conflict_any_more",
         ),
     ),
-    "test_server_scripts.py": (
-        "aicode_web 的 tmux 指令列不得帶任何密碼(新的與升級機器殘留的舊 OpenCode 變數都算)",
-        (
-            "test_aicode_web_never_exports_legacy_opencode_secrets_into_the_launch_line",
-        ),
-    ),
     "test_repo_consistency.py": (
         "使用者文件不得再教去 OpenCode 化之後不存在的旗標 / 檔案 / 腳本",
         (
@@ -596,6 +624,28 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_user_docs_must_not_teach_removed_flags_or_files",
             "test_the_opencode_plugin_stubs_are_inert",
             "test_current_cli_help_never_mentions_opencode",
+            "test_opencode_only_survives_in_the_migration_path_and_docs",
+            "test_no_module_reads_codetrail_settings_from_the_environment",
+            "test_user_docs_never_teach_a_removed_environment_knob_or_interface",
+            "test_model_facing_text_never_teaches_a_removed_environment_knob",
+            "test_doctor_no_longer_needs_a_model_prefix",
+            "test_the_docs_gate_catches_bare_mentions_and_scopes_core_names_to_their_sections",
+            "test_the_opencode_gate_checks_allowlisted_files_for_dependency_shapes",
+            "test_doctor_runs_as_a_script_from_the_repo_root",
+            "test_the_spawn_gate_bans_the_spawn_api_outside_process_env",
+            "test_the_production_spawn_gate_really_scans_the_repo",
+            "test_the_spawn_gate_resolves_os_and_asyncio_aliases",
+            "test_the_spawn_gate_closes_the_private_exits_and_keeps_every_alias",
+            "test_the_gates_also_catch_config_files_and_env_prefixed_commands",
+            "test_the_opencode_gate_scans_config_files_and_the_wrapper",
+            "test_the_gates_also_catch_ignore_entries_and_bare_assignments",
+            "test_the_gates_are_structural_not_a_list_of_spellings",
+            "test_the_docs_gate_catches_printenv_and_indirect_expansions_and_venv_is_pruned",
+            "test_the_gates_skip_git_control_files_and_catch_printenv_options",
+            "test_only_the_git_control_file_is_skipped_and_env_listings_are_caught",
+            "test_the_docs_gate_catches_grep_pipelines_with_command_and_var_prefixes",
+            "test_the_docs_gate_catches_sudo_grep_and_redirected_listings",
+            "test_the_docs_gate_catches_grep_anywhere_in_a_pipeline",
         ),
     ),
     "test_fs_sandbox.py": (
@@ -696,7 +746,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "figure_review.safe_figure_path(.codetrail/figures 邊界 + symlink + atomic write)",
         (
             "test_safe_figure_path_rejects_unsafe_components",
-            "test_safe_figure_path_requires_root_to_be_aicode_root",
+            "test_safe_figure_path_requires_root_to_be_the_sandbox_root",
             "test_symlink_at_any_layer_blocks_every_write",
             "test_hostile_document_id_stays_inside_the_boundary",
             "test_same_basename_documents_do_not_share_artifacts",
@@ -708,6 +758,15 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_document_identity_is_matched_byte_for_byte",
             "test_extraction_failure_is_stated_affirmatively",
             "test_docs_never_claim_a_single_bad_figure_blocks_the_whole_document",
+        ),
+    ),
+    "test_rag_ingest.py": (
+        "contextual retrieval 的預設 cache 位置是函式,呼叫端要真的呼叫它(不然任何模型呼叫前就 TypeError);"
+        "RAG.py 是獨立行程,client.json 的設定要它自己套(給了路徑就讀那份),壞掉一律 fail-loud",
+        (
+            "test_the_default_context_cache_root_resolves_without_an_explicit_dir",
+            "test_rag_cli_applies_the_client_config_it_is_given",
+            "test_rag_client_config_flag_is_as_strict_as_the_mcp_parser",
         ),
     ),
     "test_context_budget.py": (
@@ -722,15 +781,22 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_stripping_reasoning_lowers_the_estimate_again",
             "test_the_reserve_is_this_request_max_tokens",
             "test_an_omitted_reserve_still_uses_the_internal_default",
+            "test_the_context_gate_has_no_off_switch",
         ),
     ),
     "test_evals.py": (
         "私人 session eval 不得把歷史模型回答當 oracle、不得經 symlink 外洩 NDA、匯出的角色形狀要與"
         "validator 一致;replay 的壓縮語意由 eval 自己釘(不讀使用者的 client.json)、推不出門檻要"
         "fail-loud、多輪必須真的接得起來而單輪不落檔、gitignore 掉的三個路徑一樣算 project state;"
-        "timeout/checkpoint 不得丟資料且匿名 A/B 不得洩漏模型身分",
+        "timeout/checkpoint 不得丟資料且匿名 A/B 不得洩漏模型身分;"
+        "data flywheel 的落點在 state 目錄(0700/0600、拒 symlink,被分析的 repo 零新檔),"
+        "而且子行程的環境在交出去之前剝掉全部 CodeTrail 設定變數",
         (
             "test_every_direct_model_request_in_the_routing_eval_uses_the_normalised_model",
+            "test_the_routing_eval_child_environment_is_stripped",
+            "test_the_session_eval_candidate_model_goes_out_as_argv",
+            "test_the_collected_data_never_lands_in_the_analysed_repo",
+            "test_the_collected_data_file_is_never_read_or_rewritten_through_a_symlink",
             "test_session_eval_accepts_bare_gguf_and_legacy_models",
             "test_routing_probes_accept_the_same_model_forms_as_aicode",
             "test_the_routing_client_attempt_sends_the_requested_model",
@@ -757,6 +823,12 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_resume_checkpoint_rejects_an_inconsistent_completion_marker",
             "test_raw_export_keeps_the_original_conversation_across_a_compaction",
             "test_the_private_directory_guard_refuses_tracked_repo_paths_at_open_time",
+            "test_the_global_collector_partitions_by_the_declared_root_not_cwd",
+            "test_session_eval_forwards_skip_aux_preflight_to_the_replay_child",
+            "test_the_synthetic_kb_is_bound_to_the_synthetic_project_not_the_cli_root",
+            "test_delete_sessions_runs_without_the_removed_environment_parameter",
+            "test_the_model_identity_is_built_inside_the_synthetic_project_block",
+            "test_the_client_identity_is_stable_across_equivalent_synthetic_roots",
         ),
     ),
 }

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import os
 import shutil
 import subprocess
@@ -20,12 +21,6 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-# Wrapper 的 server n_ctx 自動偵測由 tests/test_deployment.py 單獨覆蓋。
-# 這批測試關心 CLI 轉發、root safety、設定合併與 wrapper 生成；給定明確 ctx 可避免
-# 每個 case 都對離線的 localhost:8080 重複等待同一個 HTTP timeout。
-OFFLINE_CTX = "65536"
-
 
 @functools.lru_cache(maxsize=1)
 def _probe_bash() -> tuple[str | None, str]:
@@ -85,240 +80,78 @@ def bash_compatible_path(bash: str, path: Path) -> str:
 # CodeTrail 客戶端 stub:記錄它被傳了什麼參數,不真的起 engine。
 # 這是 `AICODE_CLIENT_ENTRY` 這個 seam 的唯一用途 —— 與舊版「把假的 opencode
 # 放進 PATH」是同一種可替換面。
-CLIENT_STUB = (
-    "#!/usr/bin/env python3\n"
-    "import sys, pathlib\n"
-    # wrapper 會先用 --check-args 叫真正的 parser 驗一次參數(不跑 preflight)。
-    # 替身把這一步交給**真正的** codetrail_chat parser:接縫測試才驗得到
-    # 「打錯旗標要在 preflight 之前被打回」,而且什麼都不記。
-    "if '--check-args' in sys.argv:\n"
-    "    import codetrail_chat\n"
-    "    raise SystemExit(codetrail_chat.main(sys.argv[1:]))\n"
-    # 啟動橫幅的 `status --prefix ...` 也是純資訊呼叫:替身不記、exit 0。
-    "if sys.argv[1:2] == ['status']: raise SystemExit(0)\n"
-    "pathlib.Path('client_args.txt').write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
-)
-
-
-def write_client_stub(bin_dir: Path) -> Path:
-    stub = bin_dir / "codetrail_chat_stub.py"
-    stub.write_text(CLIENT_STUB, encoding="utf-8")
-    stub.chmod(0o700)
-    return stub
-
-
-def run_aicode_with_stub(
-    tmp_path: Path,
-    args: list[str],
-    env_extra: dict[str, str] | None = None,
-) -> tuple[subprocess.CompletedProcess[str], Path]:
-    require_git()
-    bash = require_working_bash()
-    aicode_script = bash_compatible_path(bash, REPO_ROOT / "aicode")
-
-    project = tmp_path / "project"
-    project.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
-    subdir = project / "src"
-    subdir.mkdir()
-    home = tmp_path / "home"
-    home.mkdir()
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-
-    client_stub = write_client_stub(bin_dir)
-
-    env = os.environ.copy()
-    for key in (
-        "AICODE_MODEL",
-        "AICODE_ROOT",
-        "OPENCODE_CONFIG",
-        "OPENCODE_EXPERIMENTAL",
-        "OPENCODE_EXPERIMENTAL_CODE_MODE",
-    ):
-        env.pop(key, None)
-    env.update(
-        {
-            "HOME": str(home),
-            "USERPROFILE": str(home),
-            "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
-            "PYTHONIOENCODING": "utf-8",
-            "AICODE_N_CTX": OFFLINE_CTX,
-            "AICODE_CTX_SAFETY_DISABLE": "1",
-            "AICODE_REQUIRED_MODELS_CHECK_SKIP": "1",
-            # CLI forwarding tests are offline.  The canary has dedicated
-            # mocked tests and must never contact a real model from pytest.
-            "AICODE_TOOL_CANARY_SKIP": "1",
-            "AICODE_CLIENT_ENTRY": str(client_stub),
-            # HOME 被導到 tmp,user-site 的套件(mcp 等)就不在 sys.path 上了。
-            # preflight 的每個子行程都要找得到它們。
-            "PYTHONPATH": os.pathsep.join(
-                [p for p in sys.path if p] + [os.environ.get("PYTHONPATH", "")]
-            ).rstrip(os.pathsep),
-        }
-    )
-    if env_extra:
-        env.update(env_extra)
-
-    result = subprocess.run(
-        [bash, aicode_script, *args],
-        cwd=subdir,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        stdin=subprocess.DEVNULL,
-        env=env,
-    )
-    return result, subdir / "client_args.txt"
-
-
-def read_stub_args(path: Path) -> list[str]:
-    if not path.exists():
-        return []
-    return path.read_text(encoding="utf-8").splitlines()
-
-def contains_subsequence(items: list[str], expected: list[str]) -> bool:
-    if not expected:
-        return True
-    width = len(expected)
-    return any(items[i : i + width] == expected for i in range(len(items) - width + 1))
-
-
-# ---------------------------------------------------------------------------
-# aicode web / aicode attach 子指令
-# ---------------------------------------------------------------------------
-
-def run_aicode_subcmd_with_stub(
-    tmp_path: Path,
-    args: list[str],
-    *,
-    env_extra: dict[str, str] | None = None,
-    set_model: bool = True,
-    extra_dirs: tuple[str, ...] = (),
-    tailscale_ip: str | None = None,
-) -> tuple[subprocess.CompletedProcess[str], Path]:
-    """跑 `aicode <args>`(web / attach 子指令)。回傳 (result, args_file)。
-
-    跟 `run_aicode_with_stub` 不同處:預設會設好 AICODE_MODEL(web 路徑沿用模型
-    解析,沒設會 fail),並允許注入 AICODE_WEB_PASSWORD / AICODE_WEB_PORT /
-    AICODE_ROOT 等環境變數。
-    """
-    require_git()
-    bash = require_working_bash()
-    aicode_script = bash_compatible_path(bash, REPO_ROOT / "aicode")
-
-    project = tmp_path / "project"
-    project.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
-    subdir = project / "src"
-    subdir.mkdir()
-    for name in extra_dirs:            # 給「位置參數是目錄」這類測試用
-        (subdir / name).mkdir(parents=True, exist_ok=True)
-    home = tmp_path / "home"
-    home.mkdir()
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-
-    client_stub = write_client_stub(bin_dir)
-    if tailscale_ip is not None:
-        stub_tailscale = bin_dir / "tailscale"
-        stub_tailscale.write_text(
-            "#!/usr/bin/env bash\n"
-            "if [ \"${1:-}\" = ip ] && [ \"${2:-}\" = -4 ]; then\n"
-            f"  printf '%s\\n' {tailscale_ip!r}\n"
-            "  exit 0\n"
-            "fi\n"
-            "exit 2\n",
-            encoding="utf-8",
-        )
-        stub_tailscale.chmod(0o700)
-
-    env = os.environ.copy()
-    for key in (
-        "AICODE_MODEL",
-        "AICODE_ROOT",
-        "OPENCODE_CONFIG",
-        "AICODE_WEB_PORT",
-        "AICODE_WEB_TAILSCALE_IP",
-        "AICODE_WEB_PASSWORD",
-    ):
-        env.pop(key, None)
-    env.update(
-        {
-            "HOME": str(home),
-            "USERPROFILE": str(home),
-            "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
-            "PYTHONIOENCODING": "utf-8",
-            "AICODE_N_CTX": OFFLINE_CTX,
-            "AICODE_CTX_SAFETY_DISABLE": "1",
-            "AICODE_REQUIRED_MODELS_CHECK_SKIP": "1",
-            "AICODE_TOOL_CANARY_SKIP": "1",
-            "AICODE_CLIENT_ENTRY": str(client_stub),
-            "PYTHONPATH": os.pathsep.join(
-                [p for p in sys.path if p] + [os.environ.get("PYTHONPATH", "")]
-            ).rstrip(os.pathsep),
-        }
-    )
-    if set_model:
-        env["AICODE_MODEL"] = "example-code-model:30b"
-    if env_extra:
-        for key, value in env_extra.items():
-            env[key] = str(home) if value == "__HOME__" else value
-
-    result = subprocess.run(
-        [bash, aicode_script, *args],
-        cwd=subdir,
-        capture_output=True,
-        text=True,
-        timeout=20,
-        stdin=subprocess.DEVNULL,
-        env=env,
-    )
-    return result, subdir / "client_args.txt"
-
-
-# ---------------------------------------------------------------------------
-# mcp_server.py 子行程:啟動 → 等 stderr 里程碑 → 收屍
-#
-# test_mcp_startup.py 與 test_mcp_runtime_policy.py(現在都併在 test_mcp_server.py)原本各有一份一模一樣的
-# _spawn_mcp / _terminate。
-# ---------------------------------------------------------------------------
-
 MCP_READY_MARKER = "server ready, listening on stdio"
 
 
-def spawn_mcp(tmp_root: Path, env_overrides: dict[str, str] | None = None) -> subprocess.Popen:
-    """以 tmp_root 當 AICODE_ROOT 啟動 mcp_server.py。
+def spawn_mcp(
+    tmp_root: Path,
+    env_overrides: dict[str, str] | None = None,
+    *,
+    server_args: list[str] | None = None,
+) -> subprocess.Popen:
+    """以 tmp_root 當沙箱 root 啟動 mcp_server.py。
 
-    - 指向一個必定沒人聽的 llama base URL,確保子行程不會真的去打模型。
-    - 給假的 AICODE_MODEL:mcp_server 啟動會 require_main_model(),沒設會 exit 3;
-      主模型解析本身有 tests/test_deployment.py 覆蓋。
+    root 與開關走 **argv**(`--root` / `--readonly` / `--enable-build-commands`),
+    不走環境變數 —— 那正是被測的接線。
+
+    - 設定來自 conftest 建的 tmp HOME(`deployment.json` 指向必定沒人聽的 port,
+      主模型是 `example-code-model`)。子行程繼承那個 HOME,所以它與這個行程看到
+      同一份設定 —— 不需要、也不能再用環境變數餵它。
     - 即使 env_overrides 蓋掉 HOME,也要讓子行程找得到 mcp 套件 → 顯式帶 PYTHONPATH。
     """
     env = os.environ.copy()
-    env["AICODE_ROOT"] = str(tmp_root)
     # 真的起一個 MCP server 就會真的寫一份 lease(mcp_lease.open_lease())。
     # 不把 state 目錄導到 tmp 的話,每一條 live-server 測試都會在使用者真正的
     # `~/.local/state/codetrail/mcp/` 留下檔案;被 kill 的那幾個還會留下
     # `exited: null` 的孤兒 lease,讓 doctor 之後報出根本不存在的 instance。
     env["XDG_STATE_HOME"] = str(tmp_root / ".state")
     env["PYTHONIOENCODING"] = "utf-8"
-    env["AICODE_LLAMA_BASE_URL"] = "http://127.0.0.1:65535"
-    env["AICODE_MODEL"] = "example-code-model"
-    env["AICODE_REQUIRED_MODELS_CHECK_SKIP"] = "1"
     env["PYTHONPATH"] = os.pathsep.join(
         [p for p in sys.path if p] + [env.get("PYTHONPATH", "")]
     ).rstrip(os.pathsep)
     if env_overrides:
         env.update(env_overrides)
     return subprocess.Popen(
-        [sys.executable, str(REPO_ROOT / "mcp_server.py")],
+        [sys.executable, str(REPO_ROOT / "mcp_server.py"), "--root", str(tmp_root),
+         "--skip-aux-preflight", *(server_args or [])],
         stdin=subprocess.PIPE,          # FastMCP 走 stdio,給它一個關著的 stdin
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=str(REPO_ROOT),
         env=env,
     )
+
+
+def seed_home(home: Path) -> Path:
+    """在一個 tmp HOME 裡放一份可用的 `deployment.json`。
+
+    設定只來自檔案,所以任何把 HOME 指到空目錄的測試都會讓真的起 server 的
+    子行程在 `require_main_model()` 掛掉(exit 3)——症狀是「沒有寫出 lease」
+    之類跟被測邏輯無關的斷言失敗。port 指向必定沒人聽的號碼,離線契約不變。
+    """
+    cfg_dir = home / ".config" / "codetrail"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "deployment.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "profile": "defaults",
+                "services": {
+                    "main": {
+                        "model": "example-code-model",
+                        "ctx": 65536,
+                        "port": 65535,
+                        "base_url": "http://127.0.0.1:65535",
+                    },
+                    "embedding": {"port": 65534, "base_url": "http://127.0.0.1:65534"},
+                    "reranker": {"port": 65533, "base_url": "http://127.0.0.1:65533"},
+                    "vl": {"port": 65532, "base_url": "http://127.0.0.1:65532"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return home
 
 
 def wait_for_marker(proc: subprocess.Popen, marker: str = MCP_READY_MARKER,
@@ -362,23 +195,23 @@ def terminate_proc(proc: subprocess.Popen) -> None:
 
 
 def import_mcp_module(monkeypatch, root: Path):
-    """以 root 當 AICODE_ROOT 重新 import mcp_server,回傳該模組。
+    """以 root 當沙箱 root 重新 import mcp_server,回傳該模組。
 
-    要注意的三件事:
-    1. AICODE_LLAMA_BASE_URL 指向一個關著的 port,確保 KB / CodeRAG 初始化
-       不會卡在等 llama-server。
-    2. mcp_server 的 module-level code 會 mutate config.PATCH_ENABLED /
+    要注意的四件事:
+    1. root 走 **argv**(`--root`)—— 被當成腳本執行時 mcp_server 只認它。這裡是
+       `import`,`_parse_server_argv` 拿到的是空清單,所以直接把 cwd 換過去:
+       server 的 root 判準是「argv 的 --root,否則 cwd」。
+    2. 設定來自 conftest 的 tmp HOME(`deployment.json` 的端點指向關著的 port),
+       確保 KB / CodeRAG 初始化不會卡在等 llama-server。
+    3. mcp_server 的 module-level code 會 mutate config.PATCH_ENABLED /
        RUN_COMMAND_ENABLED / ALLOWED_COMMANDS。先用 monkeypatch 釘住原值,
        teardown 自動 restore —— 否則會污染其他測試對 config 預設值的斷言。
-    3. 先把 mcp_server 從 sys.modules 拔掉才 import,確保拿到 fresh module。
+    4. 先把 mcp_server 從 sys.modules 拔掉才 import,確保拿到 fresh module。
        mcp.run() 只在 __main__ guard 裡呼叫,所以直接 import 是安全的。
     """
-    pytest.importorskip("mcp", reason="mcp 套件未安裝;OpenCode + MCP 路線才需要")
+    pytest.importorskip("mcp", reason="mcp 套件未安裝;MCP 路線才需要")
 
-    monkeypatch.setenv("AICODE_ROOT", str(root))
-    monkeypatch.setenv("AICODE_MODEL", "example-code-model:30b")
-    monkeypatch.setenv("AICODE_LLAMA_BASE_URL", "http://127.0.0.1:65535")
-    monkeypatch.setenv("AICODE_REQUIRED_MODELS_CHECK_SKIP", "1")
+    monkeypatch.chdir(root)
     # 避免無關設定干擾啟動 log
     monkeypatch.setenv("AI_CODE_PATCH", "")
     monkeypatch.setenv("AI_CODE_RUN_TESTS", "")

@@ -1122,12 +1122,32 @@ def _write_scope(tmp_path: Path, monkeypatch, root: Path, **entry) -> Path:
     return _write_raw_scope(tmp_path, monkeypatch, payload)
 
 
+def _scope_home(tmp_path: Path, monkeypatch) -> Path:
+    """把 HOME 指到 tmp,回 `~/.config/codetrail/index-scope.json` 的路徑。
+
+    2026-09-04:位置覆寫 `AICODE_INDEX_SCOPE_FILE` 刪除。行為為什麼該變:
+    一個「檔案在哪」的環境變數只會讓 runtime 與診斷工具(index_stats)各自看到
+    不同的檔,而使用者以為它們在講同一份。測試接縫只剩 HOME。
+    """
+    home = tmp_path / "scope-home"
+    (home / ".config" / "codetrail").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home / ".config" / "codetrail" / "index-scope.json"
+
+
+def _scope_home_dir(tmp_path: Path) -> Path:
+    """給子行程用的 HOME(不動這個行程的環境)。"""
+    home = tmp_path / "scope-home"
+    (home / ".config" / "codetrail").mkdir(parents=True, exist_ok=True)
+    return home
+
+
 def _write_raw_scope(tmp_path: Path, monkeypatch, payload) -> Path:
-    path = tmp_path / "index-scope.json"
+    path = _scope_home(tmp_path, monkeypatch)
     text = payload if isinstance(payload, str) else json.dumps(payload)
     path.write_text(text, encoding="utf-8")
     os.chmod(path, 0o600)
-    monkeypatch.setenv("AICODE_INDEX_SCOPE_FILE", str(path))
     return path
 
 
@@ -1389,7 +1409,7 @@ def test_allowlist_with_exclude_fails_loud(tree, tmp_path, monkeypatch):
 
 
 def test_missing_scope_file_is_normal_default(tree, tmp_path, monkeypatch):
-    monkeypatch.setenv("AICODE_INDEX_SCOPE_FILE", str(tmp_path / "nope.json"))
+    _scope_home(tmp_path, monkeypatch)  # 目錄在、檔案不在
     cfg = load_scope_config(tree)
     assert cfg.mode == "denylist" and cfg.detectors is True
     assert cfg.include == () and cfg.exclude == ()
@@ -1835,9 +1855,6 @@ def _run_stats(args, env_extra=None):
     import subprocess
 
     env = {**os.environ, **(env_extra or {})}
-    env.pop("AICODE_ROOT", None)
-    if env_extra:
-        env.update(env_extra)
     return subprocess.run(
         [sys.executable, str(REPO_ROOT / "scripts" / "index_stats.py"), *args],
         capture_output=True, text=True, timeout=120, env=env, check=False,
@@ -1845,9 +1862,15 @@ def _run_stats(args, env_extra=None):
 
 
 def test_index_stats_requires_explicit_root():
-    proc = _run_stats([])
+    """沒給 `--root` 就報錯,不猜 cwd。
+
+    2026-09-04:`AICODE_ROOT` 那條 fallback 刪除。行為為什麼該變:這支會掃一
+    整棵樹並印計數,殼層裡殘留的那一個(別份安裝、別個專案留下的)會讓它安靜
+    地掃錯樹。
+    """
+    proc = _run_stats([], env_extra={"AICODE_ROOT": "/tmp"})
     assert proc.returncode == 2
-    assert "AICODE_ROOT" in proc.stderr
+    assert "--root" in proc.stderr
 
 
 @pytest.mark.parametrize("root", ["/", "__nonexistent__"])
@@ -1895,14 +1918,14 @@ def test_index_stats_deep_counts_symbols(tree):
 
 
 def test_index_stats_reports_rule_hits(tree, tmp_path):
-    scope_file = tmp_path / "stats-scope.json"
+    home = _scope_home_dir(tmp_path)
+    scope_file = home / ".config" / "codetrail" / "index-scope.json"
     scope_file.write_text(json.dumps({
         "schema_version": 1,
         "roots": [{"root": str(tree), "exclude": ["vendor_env/**"]}],
     }), encoding="utf-8")
     os.chmod(scope_file, 0o600)
-    proc = _run_stats(["--root", str(tree)],
-                      env_extra={"AICODE_INDEX_SCOPE_FILE": str(scope_file)})
+    proc = _run_stats(["--root", str(tree)], env_extra={"HOME": str(home)})
     assert proc.returncode == 0, proc.stderr
     assert "A' dirs: 1" in proc.stdout
     assert "B1 dirs: 2" in proc.stdout
@@ -2053,7 +2076,7 @@ def test_lazy_index_shrunk_by_scope_still_builds(tmp_path, monkeypatch, clean_sc
         (root / "vendor_env" / f"v{i}.py").write_text(
             "".join(f"def vend_{i}_{j}(): pass\n" for j in range(10)), encoding="utf-8")
 
-    monkeypatch.setenv("AICODE_INDEX_SCOPE_FILE", str(tmp_path / "absent.json"))
+    _scope_home(tmp_path, monkeypatch)  # 目錄在、檔案不在
     fake_batch = lambda texts: [[1.0, 0.0]] * len(texts)  # noqa: E731
     first = code_rag.CodeRAG(str(root))
     monkeypatch.setattr(first, "_embed_texts_batched", fake_batch)
@@ -2075,20 +2098,30 @@ def test_lazy_index_shrunk_by_scope_still_builds(tmp_path, monkeypatch, clean_sc
 
 
 def test_scope_file_inside_root_never_enters_index(tree, monkeypatch):
-    """index-scope.json 放進 root 也不准進索引 ——「永不進 repo/輸出」是它的契約。"""
-    path = tree / "index-scope.json"
+    """index-scope.json 落在被掃的樹裡面也不准進索引 ——「永不進 repo/輸出」是它的契約。
+
+    2026-09-04:位置覆寫刪掉之後,那個檔只可能在 `~/.config/codetrail/`;所以
+    這條把 HOME 指到樹**裡面**來重現同一個情境(例如使用者拿家目錄底下的某個
+    專案當 root)。它的內容就是樹狀結構本身,進索引等於把 NDA 目錄名餵給模型。
+    """
+    home = tree / "fakehome"
+    scope_dir = home / ".config" / "codetrail"
+    scope_dir.mkdir(parents=True)
+    path = scope_dir / "index-scope.json"
     path.write_text(json.dumps(
         {"schema_version": 1, "roots": [{"root": str(tree), "exclude": ["nothing/**"]}]}
     ), encoding="utf-8")
     os.chmod(path, 0o600)
-    monkeypatch.setenv("AICODE_INDEX_SCOPE_FILE", str(path))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
 
+    rel = str(path.relative_to(tree))
     scope = load_index_scope(tree)
-    assert scope.should_index_file("index-scope.json") is False
-    assert "index-scope.json" not in _indexed(scope)
+    assert scope.should_index_file(rel) is False
+    assert rel not in _indexed(scope)
 
     proc = _run_stats(["--root", str(tree), "--show-paths"],
-                      env_extra={"AICODE_INDEX_SCOPE_FILE": str(path)})
+                      env_extra={"HOME": str(home)})
     assert proc.returncode == 0, proc.stderr
     assert "index-scope.json" not in proc.stdout
 
@@ -2111,7 +2144,7 @@ def test_non_regular_files_are_never_read(tmp_path):
         [sys.executable, str(REPO_ROOT / "scripts" / "index_stats.py"),
          "--root", str(root), "--deep"],
         capture_output=True, text=True, timeout=30, check=False,
-        env={**os.environ, "AICODE_INDEX_SCOPE_FILE": str(tmp_path / "absent.json")},
+        env={**os.environ, "HOME": str(_scope_home_dir(tmp_path))},
     )
     assert proc.returncode == 0, proc.stderr
     assert "indexed: 1 files" in proc.stdout
@@ -2135,21 +2168,21 @@ def test_index_stats_refuses_stale_cached_symbol_count(tmp_path, clean_scan_cach
 
 
 def test_non_utf8_scope_file_fails_as_index_scope_error(tree, tmp_path, monkeypatch):
-    path = tmp_path / "index-scope.json"
+    path = _scope_home(tmp_path, monkeypatch)
     path.write_bytes('{"schema_version":1,"roots":[]}'.encode("utf-16"))
     os.chmod(path, 0o600)
-    monkeypatch.setenv("AICODE_INDEX_SCOPE_FILE", str(path))
     with pytest.raises(IndexScopeError):
         load_scope_config(tree)
 
 
 def test_index_stats_exits_two_on_bad_scope_file(tree, tmp_path):
-    bad = tmp_path / "bad-scope.json"
+    home = _scope_home_dir(tmp_path)
+    bad = home / ".config" / "codetrail" / "index-scope.json"
     bad.write_text(json.dumps(
         {"schema_version": 1, "roots": [{"root": str(tree), "exclude": ["[z-a]/**"]}]}
     ), encoding="utf-8")
     os.chmod(bad, 0o600)
-    proc = _run_stats(["--root", str(tree)], env_extra={"AICODE_INDEX_SCOPE_FILE": str(bad)})
+    proc = _run_stats(["--root", str(tree)], env_extra={"HOME": str(home)})
     assert proc.returncode == 2, proc.stdout
     assert "[FATAL]" in proc.stderr
     assert "Traceback" not in proc.stderr
@@ -2211,9 +2244,8 @@ def test_uncompilable_pattern_error_never_leaks_pattern_content(tree, tmp_path, 
     assert exc.value.__cause__ is None
     assert exc.value.__suppress_context__ is True
 
-    scope_file = tmp_path / "index-scope.json"
     proc = _run_stats(["--root", str(tree)],
-                      env_extra={"AICODE_INDEX_SCOPE_FILE": str(scope_file)})
+                      env_extra={"HOME": str(tmp_path / "scope-home")})
     assert proc.returncode == 2
     assert secret not in proc.stdout + proc.stderr
     assert "Traceback" not in proc.stderr

@@ -16,6 +16,7 @@ RAG 知識庫建立工具（增量模式）
 """
 
 import sys
+import argparse
 import os
 import re
 import copy
@@ -677,21 +678,25 @@ def _figure_extract():
 
 
 def _figure_root(root: Optional[str]) -> Path:
-    """figure lane 的專案根：明示 root > `AICODE_ROOT` > cwd。
+    """figure lane 的專案根：明示 root > sandbox root > cwd。
 
-    明示 root 與 `AICODE_ROOT` 不一致時**立刻** fail-loud：`figure_review._resolve_root`
+    明示 root 與 sandbox root 不一致時**立刻** fail-loud：`figure_review._resolve_root`
     要求兩者解析後完全相同，若拖到寫 artifact 才失敗，中間已經呼叫過 VL、算過
-    embedding（契約 §6.5 / §12.3）。`root=None` 時取的就是 `AICODE_ROOT` 自己，
+    embedding（契約 §6.5 / §12.3）。`root=None` 時取的就是 sandbox root 自己，
     不可能衝突，所以這條只會打到「呼叫端明確傳了不同 root」的程式錯誤。
+
+    sandbox root 來自 `mcp_server --root`(argv),不是 `AICODE_ROOT` 環境變數：
+    殼層裡殘留的同名變數會讓這道交叉檢查拿別個專案的路徑當真值。
     """
-    env_text = os.environ.get("AICODE_ROOT", "").strip()
-    env_real = Path(env_text).resolve() if env_text else None
+    import media
+
+    env_real = media.get_sandbox_root()
     if root is None or not str(root).strip():
         return env_real or Path.cwd().resolve()
     explicit = Path(str(root)).resolve()
     if env_real is not None and env_real != explicit:
         raise _figure_extract().FigureReviewError(
-            f"root {explicit} 不是目前的 AICODE_ROOT {env_real}。"
+            f"root {explicit} 不是目前的 sandbox root {env_real}。"
             "review artifacts 只能寫在 sandbox root 內（契約 §6.5）；"
             "在呼叫任何 VL / embedding 之前就停下。"
         )
@@ -3065,13 +3070,13 @@ def _embed_text_cached(text: str, cache: Dict, state: Dict) -> List[float]:
     except Exception as exc:
         raise RuntimeError(
             f"embedding server unreachable at {LLAMA_EMBED_BASE_URL}: {exc}. "
-            "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+            "Check the embedding llama-server (deployment.json 的 services.embedding)."
         ) from exc
 
     if not embedding:
         raise RuntimeError(
             f"embedding server returned an empty vector at {LLAMA_EMBED_BASE_URL}. "
-            "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+            "Check the embedding llama-server (deployment.json 的 services.embedding)."
         )
 
     cache[key] = embedding
@@ -4392,12 +4397,17 @@ def rebuild_cli(argv: List[str]) -> int:
 
     parser = argparse.ArgumentParser(
         prog="RAG.py rebuild",
+        allow_abbrev=False,  # `--client-conf` 不收:與 MCP 的精確 parser 同判準
         description=(
             "把文件灌進知識庫。這是唯一會生成 chunk 脈絡（contextual retrieval）"
             "的路徑；MCP 的 ingest_document 永遠不生成。"
         ),
     )
     parser.add_argument("--kb", required=True, help="knowledge.json 路徑（不存在會建立）")
+    parser.add_argument(
+        "--client-config", default="", action=_ClientConfigOnce,
+        help="用指定的 client.json(預設 ~/.config/codetrail/client.json)",
+    )
     parser.add_argument(
         "documents", nargs="+", help="要灌的文件（pdf/md/txt/bin/elf）"
     )
@@ -4421,6 +4431,7 @@ def rebuild_cli(argv: List[str]) -> int:
     )
     parser.set_defaults(context=None)
     args = parser.parse_args(argv)
+    _apply_client_settings(args.client_config or None)
 
     if args.preflight and args.fresh:
         parser.error("--preflight 是零寫入的估算，不能同時 --fresh")
@@ -4508,12 +4519,81 @@ def _pdf_cli_error_code(exc: BaseException) -> Optional[int]:
     return None
 
 
+class _ClientConfigOnce(argparse.Action):
+    """`rebuild` 的 argparse 路徑與手寫 parser 同判準:重複 / 空值一律 exit 2(last-wins 是
+    「使用者以為套了那一份、實際套了另一份」的無聲漂移)。"""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, "_client_config_seen", False):
+            parser.error("--client-config 只能給一次")
+        if not str(values).strip():
+            parser.error("--client-config 的值不可為空")
+        setattr(namespace, "_client_config_seen", True)
+        setattr(namespace, self.dest, values)
+
+
+def _split_client_config(argv: List[str]) -> tuple[List[str], Optional[str]]:
+    """把 `--client-config <path>` 從手工 argv 裡取出來。
+
+    與 `mcp_server.py` 的 parser 同一個判準:值不可缺、不可是下一個旗標、不可空、
+    不可重複 —— 一律 exit 2。last-wins / 吃掉下一個旗標 / 空值當沒給,都是「使用者
+    以為套了那一份設定、實際套了另一份或沒套」的無聲漂移。
+    """
+    def fail(message: str) -> None:
+        print(f"[RAG] {message}", file=sys.stderr)
+        raise SystemExit(2)
+
+    rest: List[str] = []
+    path: Optional[str] = None
+    i = 0
+    while i < len(argv):
+        item = argv[i]
+        if item == "--client-config" or item.startswith("--client-config="):
+            if item == "--client-config":
+                if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+                    fail("--client-config 需要一個路徑")
+                value = argv[i + 1]
+                i += 2
+            else:
+                value = item[len("--client-config="):]
+                i += 1
+            if not value.strip():
+                fail("--client-config 的值不可為空")
+            if path is not None:
+                fail("--client-config 只能給一次")
+            path = value
+            continue
+        rest.append(item)
+        i += 1
+    return rest, path
+
+
+def _apply_client_settings(path: Optional[str]) -> None:
+    """RAG.py 是獨立行程:MCP(或使用者)套用過的 client.json 設定在這邊仍是 repo
+    預設。自己讀**同一份**檔(給了路徑就讀那份,否則 HOME 的);壞掉一律 fail-loud
+    —— 與客戶端、MCP 同一個判準,靜默退回預設就是「使用者以為在容器裡跑 /
+    用指定的 objdump」而實際不是。"""
+    import client_config
+
+    try:
+        if path:
+            settings = client_config.load_client_settings_from(Path(path))
+        else:
+            settings = client_config.load_client_settings()
+    except client_config.ClientConfigError as exc:
+        print(f"[ERROR] client.json 不可信:{exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+    client_config.apply_to_config(settings, readonly=False)
+
+
 def main(argv: List[str]) -> int:
     """`__main__` 的實際內容（抽成函式才測得到 exit code；契約 §11.4）。
 
     `add_document` 內部的 `sys.exit(1)` 照舊直接往上拋 `SystemExit`——既有行為
     一個字都沒變，只有 figure lane 的兩種例外被映射成 2 / 1。
     """
+    argv, client_config_path = _split_client_config(list(argv))
+    _apply_client_settings(client_config_path)
     preflight_only = "--preflight" in argv
     fresh = "--fresh" in argv
     auto_yes = any(arg in ("-y", "--yes") for arg in argv)

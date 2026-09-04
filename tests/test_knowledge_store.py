@@ -1434,8 +1434,8 @@ def clear_embedding_lru_caches():
 def _assert_actionable_error(exc: pytest.ExceptionInfo[RuntimeError], module) -> None:
     message = str(exc.value)
     assert module.LLAMA_EMBED_BASE_URL in message
-    assert "8081 llama-server" in message
-    assert "AICODE_LLAMA_EMBED_BASE_URL" in message
+    assert "embedding llama-server" in message
+    assert "deployment.json" in message
 
 
 def test_code_rag_query_raises_when_embedding_server_is_unreachable(monkeypatch, tmp_path):

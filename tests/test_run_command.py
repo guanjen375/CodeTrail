@@ -204,7 +204,7 @@ def test_executor_rejects_timeout_out_of_bounds(host_runner: ToolExecutor, monke
         spawned.append((args, kwargs))
         raise AssertionError("subprocess.run 不該被呼叫")
 
-    monkeypatch.setattr("agent_tools.subprocess.run", boom)
+    monkeypatch.setattr("process_env.run", boom)
     out = host_runner.run_command("pytest -q", timeout=bad)
     assert out.startswith(TIMEOUT_ERROR_TITLE), out
     assert type(bad).__name__ in out, out
@@ -213,7 +213,7 @@ def test_executor_rejects_timeout_out_of_bounds(host_runner: ToolExecutor, monke
 
 def test_timeout_error_message_is_bounded(host_runner: ToolExecutor, monkeypatch):
     monkeypatch.setattr(
-        "agent_tools.subprocess.run",
+        "process_env.run",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("不該 spawn")),
     )
     huge = "x" * 500
@@ -235,7 +235,7 @@ def test_executor_accepts_bounds_and_forwards_timeout(host_runner: ToolExecutor,
         seen.append(dict(kwargs))
         return _fake_completed()
 
-    monkeypatch.setattr("agent_tools.subprocess.run", fake_run)
+    monkeypatch.setattr("process_env.run", fake_run)
     out = host_runner.run_command("pytest -q", timeout=ok)
     assert out.startswith("=== ✓ 成功"), out
     assert [k["timeout"] for k in seen] == [ok]
@@ -285,7 +285,7 @@ def test_native_tool_description_states_whitelist_tiers_and_timeout():
     from agent_tools import _RUN_COMMAND_TOOL
 
     description = _norm(_RUN_COMMAND_TOOL["function"]["description"])
-    assert "只在 AI_CODE_ENABLE_BUILD_COMMANDS=1" in description
+    assert "client.json 的 build_commands" in description
     assert "git 不在白名單" in description
     assert "1..600" in description
     assert "client 可能更早截止" in description
@@ -300,10 +300,11 @@ def test_native_tool_description_states_whitelist_tiers_and_timeout():
 # ---------------------------------------------------------------------------
 @pytest.fixture
 def mcp_module(monkeypatch, tmp_path: Path):
-    from tests._harness import import_mcp_module
+    from tests._harness import import_mcp_module, seed_home
 
-    home = tmp_path / "home"
-    home.mkdir()
+    # HOME 指到 tmp 的同時要放一份 deployment.json:設定只來自檔案,空的 HOME
+    # 會讓 mcp_server 在 require_main_model() 掛掉(exit 3)。
+    home = seed_home(tmp_path / "home")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
@@ -367,7 +368,7 @@ def test_mcp_run_command_docstring_declares_tiers_and_timeout():
     )
     doc = _norm(ast.get_docstring(fn) or "")
     assert "1..600" in doc
-    assert "只在 AI_CODE_ENABLE_BUILD_COMMANDS=1" in doc
+    assert "client.json 的 build_commands" in doc
     assert "git 不在白名單" in doc
     assert "client 可能更早截止" in doc
     assert "timeout" in {a.arg for a in fn.args.args}
@@ -429,7 +430,7 @@ class TestRunLintMode:
 
             return R()
 
-        monkeypatch.setattr("agent_tools.subprocess.run", fake_run)
+        monkeypatch.setattr("process_env.run", fake_run)
         return calls
 
     def test_fix_true_uses_fix_commands(self, runner_and_file, monkeypatch: pytest.MonkeyPatch):
@@ -470,7 +471,7 @@ class TestRunLintMode:
         # 連 subprocess 都不應該被叫到 — 提早就拒絕
         called: list[Any] = []
         monkeypatch.setattr(
-            "agent_tools.subprocess.run",
+            "process_env.run",
             lambda *a, **kw: called.append(a) or (_ for _ in ()).throw(
                 AssertionError("不應呼叫 subprocess.run — 應該提早回錯誤")
             ),
@@ -502,10 +503,13 @@ class TestRunLintReadonlyMode:
         def fake_run(*a, **kw):
             raise AssertionError("PATCH_ENABLED=False 時不能跑 lint subprocess")
 
-        monkeypatch.setattr("agent_tools.subprocess.run", fake_run)
+        monkeypatch.setattr("process_env.run", fake_run)
 
         out = runner.run_lint("x.py", fix=True)
-        assert "AI_CODE_PATCH" in out or "唯讀" in out, out
+        # 2026-09-04:訊息不再指名一個已刪的環境變數。它現在說的是「這是
+        # readonly session」——那才是使用者能對照的事實(`--policy readonly` /
+        # `mcp_server --readonly`),而不是一個設了也沒用的名字。
+        assert "readonly" in out or "唯讀" in out, out
         # 檔案不能被動到
         assert f.read_text(encoding="utf-8") == "x = 1\n"
 
@@ -530,7 +534,7 @@ class TestRunLintReadonlyMode:
 
             return R()
 
-        monkeypatch.setattr("agent_tools.subprocess.run", fake_run)
+        monkeypatch.setattr("process_env.run", fake_run)
 
         runner.run_lint("x.py", fix=False)
         assert calls, "fix=False 在 PATCH_ENABLED=False 時應該仍能跑 check"

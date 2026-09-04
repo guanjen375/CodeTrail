@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
+import process_env
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -69,7 +69,7 @@ def query_gpu_info(
             return None
 
         def _runner(cmd: list[str]) -> str:
-            out = subprocess.run(
+            out = process_env.run(
                 cmd,
                 capture_output=True,
                 text=True,
@@ -86,7 +86,7 @@ def query_gpu_info(
             "--query-gpu=name,memory.total,memory.free",
             "--format=csv,noheader,nounits",
         ])
-    except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError):
+    except (FileNotFoundError, process_env.TimeoutExpired, RuntimeError):
         return None
 
     best: Optional[GPUInfo] = None

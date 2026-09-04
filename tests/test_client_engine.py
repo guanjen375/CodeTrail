@@ -4,7 +4,7 @@ AGENTS.md §2 的新安全檢查點集中在這裡:
   - 送出去的那一份才算數:reasoning 剝除與 prune 只改 payload,session 檔與
     畫面保留原文;認不出最新真實使用者訊息就整段不動。
   - 權限 policy:readonly 必須 deny 全部 mutator(判準是 readOnlyHint,不是
-    寫死名單);互動模式的六個 ask 工具沒核准就不得執行。
+    寫死名單);互動模式的七個 ask 工具沒核准就不得執行。
   - 只有工具結果的 text block 進模型;structuredContent 只給 UI / eval。
   - ingest marker 只認 ingest_document 的結果、只認行首。
 """
@@ -337,18 +337,24 @@ def test_readonly_policy_denies_a_new_tool_that_is_not_read_only():
     assert policy.decide("brand_new_writer", read_only=False, arguments={}) is client_policy.Decision.DENY
 
 
-def test_interactive_policy_asks_for_the_six_write_tools():
+def test_interactive_policy_asks_for_the_seven_write_tools():
+    """2026-09-04:`import_external_file` 加進 ASK_TOOLS。
+
+    行為為什麼該變:plan.txt §6 第 12 條明訂「開了之後**每一次**匯入仍然要人工
+    核准」——那個開關授權的是「可以從專案外複製檔案進來」這件事本身,不是每一
+    次的來源與目的。以前它落在「不是唯讀但也不需要每次問」那一組。
+    """
     policy = client_policy.InteractivePolicy()
     assert client_policy.ASK_TOOLS == frozenset(
-        {"apply_patch", "run_lint", "run_command", "remove_document", "record_lesson", "review_figures"}
+        {"apply_patch", "run_lint", "run_command", "remove_document", "record_lesson",
+         "review_figures", "import_external_file"}
     )
     for name in client_policy.ASK_TOOLS:
         assert policy.decide(name, read_only=False, arguments={}) is client_policy.Decision.ASK
     assert policy.decide("list_dir", read_only=True, arguments={}) is client_policy.Decision.ALLOW
-    # 其餘一律 allow —— 與 OpenCode 時代的權限表逐條相同(codetrail_*: allow 再把
-    # 六個覆成 ask)。改成「非唯讀就 ask」會讓一次 ingest 多跳一個核准框,那是
+    # 其餘一律 allow。改成「非唯讀就 ask」會讓一次 ingest 多跳一個核准框,那是
     # 使用者沒要求過的行為改變。fail-closed 的那一半在 ReadOnlyPolicy。
-    for name in ("ingest_document", "import_external_file", "reload_knowledge_base"):
+    for name in ("ingest_document", "reload_knowledge_base"):
         assert policy.decide(name, read_only=False, arguments={}) is client_policy.Decision.ALLOW
 
 
@@ -563,7 +569,7 @@ def test_the_base_rules_stay_under_the_hard_budget():
 
 def test_the_prompt_carries_mcp_instructions_and_project_files(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.delenv(client_prompt.DISABLE_PROJECT_INSTRUCTIONS_ENV, raising=False)
+    monkeypatch.setattr(client_prompt, "project_instructions_enabled", lambda: True)
     root = tmp_path / "project"
     (root / ".codetrail").mkdir(parents=True)
     (root / "AGENTS.md").write_text("PROJECT RULE", encoding="utf-8")
@@ -578,13 +584,25 @@ def test_the_prompt_carries_mcp_instructions_and_project_files(tmp_path, monkeyp
 
 
 def test_project_instructions_can_be_turned_off(tmp_path, monkeypatch):
+    """安全模式:`client.json` 的 `project_instructions: false` → 不讀專案內的指示。
+
+    2026-09-04:開關從 `CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS`(非空即關,所以
+    `...=0` 是**關閉**)換成 client.json 的一個真 boolean。行為為什麼該變:
+    它決定「被分析的 repo 能不能把文字塞進每一輪 system prompt」,那道邊界不該
+    隨殼層漂移,而且「=0 代表關」正是設定不該有的形狀。
+    """
+    import config
+
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     root = tmp_path / "project"
     (root / ".codetrail").mkdir(parents=True)
     (root / "AGENTS.md").write_text("PROJECT RULE", encoding="utf-8")
-    # OpenCode 的 JS truthiness:任何非空值(含 "0")都代表關閉。
-    monkeypatch.setenv(client_prompt.DISABLE_PROJECT_INSTRUCTIONS_ENV, "0")
+    monkeypatch.setattr(config, "PROJECT_INSTRUCTIONS_ENABLED", False)
+    monkeypatch.setenv("CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS", "")  # 殘留值無效
     assert "PROJECT RULE" not in client_prompt.build_system_prompt(root).text
+
+    monkeypatch.setattr(config, "PROJECT_INSTRUCTIONS_ENABLED", True)
+    assert "PROJECT RULE" in client_prompt.build_system_prompt(root).text
 
 
 def test_a_symlinked_instructions_directory_is_refused(tmp_path, monkeypatch):
@@ -1815,3 +1833,86 @@ def test_the_openai_stream_iterator_ignores_sse_comment_and_field_lines():
 
     chunks = list(llama_client._iter_openai_stream(_Resp()))
     assert len(chunks) == 1 and chunks[0]["choices"][0]["delta"]["content"] == "ok"
+
+
+@pytest.mark.smoke
+def test_external_import_is_gated_behind_a_per_call_approval():
+    """`import_external_file` 每一次都要人工核准。
+
+    `client.json` 的 `external_import` 把授權從「單次啟動」變成**跨專案持久**,
+    所以實際動作必須逐次確認 —— 而且核准框要顯示來源與目的路徑。少了這道閘,
+    開關一開就等於「模型可以把專案外的任何白名單檔複製進沙箱」,使用者只會在
+    事後從檔案系統發現。
+    """
+    import client_policy
+
+    assert "import_external_file" in client_policy.ASK_TOOLS
+    policy = client_policy.InteractivePolicy()
+    assert policy.decide(
+        "import_external_file", read_only=False, arguments={"path": "~/Downloads/x.png"}
+    ) is client_policy.Decision.ASK
+
+
+# ── 總審 F1-6:`import_external_file` 的核准不得被 client.json 覆寫掉 ──
+
+
+@pytest.mark.smoke
+def test_the_import_approval_cannot_be_overridden_to_allow():
+    """`permission: {"import_external_file": "allow"}` 不得把它翻成免核准。
+
+    這個工具的「每一次都問」是 plan §6 第 12 條定的邊界,不是偏好:開關授權的
+    是「可以從專案外複製檔案進來」這件事,每一次的來源與目的仍要人看過。
+    覆寫能翻它,等於 client.json 一行就把邊界拆掉。`deny` 照舊可以(關掉是收緊)。
+    """
+    import client_config
+    import client_policy
+
+    settings = client_config.ClientSettings(
+        path=Path("/nonexistent"), present=True,
+        permission={"import_external_file": "allow", "run_lint": "allow"},
+    )
+    policy = client_config.policy_for(settings, client_policy.InteractivePolicy())
+    assert policy.decide(
+        "import_external_file", read_only=False, arguments={"source_path": "x"}
+    ) is client_policy.Decision.ASK
+    # 其他 ask 工具照舊可以被放寬(那是使用者的偏好)。
+    assert policy.decide("run_lint", read_only=False, arguments={}) is client_policy.Decision.ALLOW
+    denied = client_config.policy_for(
+        client_config.ClientSettings(
+            path=Path("/nonexistent"), present=True,
+            permission={"import_external_file": "deny"},
+        ),
+        client_policy.InteractivePolicy(),
+    )
+    assert denied.decide("import_external_file", read_only=False, arguments={}) is client_policy.Decision.DENY
+
+
+@pytest.mark.smoke
+def test_the_import_approval_shows_where_the_file_will_land():
+    """核准框要讓人看得到**目的路徑**,不只是模型丟進來的參數。
+
+    實際落點是工具之後才算出來的(`.aicode_uploads/<安全化檔名>`,同名再加
+    `_N`);只顯示 `source_path` 的核准等於核准一個不知道會寫到哪的動作。
+    """
+    request = client_engine.ApprovalRequest(
+        "s", "import_external_file", {"source_path": "~/Downloads/my report (v2).pdf"}
+    )
+    text = request.render()
+    assert ".aicode_uploads/" in text
+    assert "my_report_v2.pdf" in text or "my report (v2).pdf" in text
+
+
+# ── 總審 F1-8:沒有 server 端 id 的工具呼叫,退回的 id 不得跨回合重複 ──
+
+
+@pytest.mark.smoke
+def test_fallback_tool_call_ids_are_unique_across_steps():
+    """OpenAI-compatible 串流不一定給 tool-call id。
+
+    退回 `call_<位置>` 的話,每一個 step 的第一個工具都叫 `call_0`:TUI 以 id 當
+    全域 key,第二次呼叫不建新 block,舊 block 掛著舊的工具名與參數卻顯示第二次
+    的狀態與輸出。
+    """
+    first = client_engine._finalise_tool_calls({0: {"name": "list_dir", "arguments": "{}"}})  # noqa: SLF001
+    second = client_engine._finalise_tool_calls({0: {"name": "read_file", "arguments": "{}"}})  # noqa: SLF001
+    assert first[0]["id"] != second[0]["id"]

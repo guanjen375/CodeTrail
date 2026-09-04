@@ -9,8 +9,8 @@
 - 適用於分析不信任的第三方專案
 
 使用方式：
-1. 啟用容器模式：設定環境變數 AI_CODE_USE_CONTAINER=1
-2. 或使用 CLI：--container
+- 啟用容器模式：在 ~/.config/codetrail/client.json 設 `use_container: true`（readonly session 一律關；
+  repo 預設 config.USE_CONTAINER=False；沒有環境變數也沒有 CLI 旗標）
 
 容器安全設定：
 - 網路：預設停用 (--network none)
@@ -24,20 +24,26 @@
 """
 
 import os
+import process_env
 import re
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional
 
 # 容器設定
-CONTAINER_ENABLED = os.environ.get('AI_CODE_USE_CONTAINER', '').lower() in ('1', 'true', 'yes')
-CONTAINER_ENGINE = os.environ.get('AI_CODE_CONTAINER_ENGINE', 'auto')  # 'docker', 'podman', 'auto'
-CONTAINER_IMAGE = os.environ.get('AI_CODE_CONTAINER_IMAGE', '')  # 自訂映像檔
-CONTAINER_MEMORY_LIMIT = os.environ.get('AI_CODE_CONTAINER_MEMORY', '2g')
-CONTAINER_CPU_LIMIT = os.environ.get('AI_CODE_CONTAINER_CPU', '2')
-CONTAINER_TIMEOUT = int(os.environ.get('AI_CODE_CONTAINER_TIMEOUT', '120'))
+# 開關來自 client.json(`use_container`);其餘是 repo 常數。
+CONTAINER_ENGINE = 'auto'          # 'docker' / 'podman' / 'auto'
+CONTAINER_IMAGE = ''               # 空字串 = 用內建的最小映像
+CONTAINER_MEMORY_LIMIT = '2g'
+CONTAINER_CPU_LIMIT = '2'
+CONTAINER_TIMEOUT = 120
+
+
+#: 用容器跑 run_command 嗎。預設關;`mcp_server` 啟動時從 client.json 的
+#: `use_container` 設它(readonly 一律關)。留成模組屬性而不是每次讀 config:
+#: 既有呼叫端與測試都以它為單一開關,兩個來源會漂移。
+CONTAINER_ENABLED = False
 
 # 預設容器映像檔（按語言）
 DEFAULT_IMAGES = {
@@ -54,7 +60,7 @@ def detect_container_engine() -> Optional[str]:
     """偵測可用的容器引擎"""
     for engine in ['podman', 'docker']:
         try:
-            result = subprocess.run(
+            result = process_env.run(
                 [engine, '--version'],
                 capture_output=True,
                 text=True,
@@ -62,7 +68,7 @@ def detect_container_engine() -> Optional[str]:
             )
             if result.returncode == 0:
                 return engine
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except (FileNotFoundError, process_env.TimeoutExpired):
             continue
     return None
 
@@ -228,7 +234,7 @@ def run_in_container(
     print(f"   [CONTAINER] 使用 {engine}，映像檔: {image}")
 
     try:
-        result = subprocess.run(
+        result = process_env.run(
             cmd,
             capture_output=True,
             text=True,
@@ -243,7 +249,7 @@ def run_in_container(
             'error': None
         }
 
-    except subprocess.TimeoutExpired:
+    except process_env.TimeoutExpired:
         return {
             'success': False,
             'returncode': -1,
@@ -347,7 +353,7 @@ def check_container_available() -> tuple[bool, str]:
 
     # 檢查是否能執行
     try:
-        result = subprocess.run(
+        result = process_env.run(
             [engine, 'run', '--rm', 'hello-world'],
             capture_output=True,
             text=True,
@@ -357,7 +363,7 @@ def check_container_available() -> tuple[bool, str]:
             return True, f"容器環境就緒（{engine}）"
         else:
             return False, f"{engine} 無法執行容器: {result.stderr}"
-    except subprocess.TimeoutExpired:
+    except process_env.TimeoutExpired:
         return False, f"{engine} 回應超時"
     except Exception as e:
         return False, f"{engine} 錯誤: {e}"
@@ -378,7 +384,7 @@ def pull_image(image: str) -> bool:
 
     print(f"[CONTAINER] 拉取映像檔: {image}")
     try:
-        result = subprocess.run(
+        result = process_env.run(
             [engine, 'pull', image],
             capture_output=True,
             text=True,

@@ -322,13 +322,29 @@ def test_safe_figure_path_keeps_everything_inside_the_boundary(env):
     assert fr.safe_figure_path(root) == root / ".codetrail" / "figures"
 
 
-def test_safe_figure_path_requires_root_to_be_aicode_root(env, monkeypatch, tmp_path):
+def test_safe_figure_path_requires_root_to_be_the_sandbox_root(env, monkeypatch, tmp_path):
+    """review artifacts 只能寫在 sandbox root 內(契約 §6.5)。
+
+    2026-09-04:交叉檢查的來源從 `AICODE_ROOT` 環境變數換成
+    `media.get_sandbox_root()`(`mcp_server --root` 定案的那一個)。行為為什麼
+    該變:root 已經走 argv,殼層裡殘留的同名變數(來自別份安裝、別個專案)會
+    讓這道檢查拿一個完全無關的路徑當真值 —— 於是寫得進去的與擋下來的都錯。
+    """
+    import media
+
     root, _outside = env
-    monkeypatch.setenv("AICODE_ROOT", str(tmp_path / "somewhere-else"))
-    (tmp_path / "somewhere-else").mkdir()
-    with pytest.raises(fx.FigureReviewError, match="AICODE_ROOT"):
+    elsewhere = tmp_path / "somewhere-else"
+    elsewhere.mkdir()
+    media.set_sandbox_root(str(elsewhere))
+    with pytest.raises(fx.FigureReviewError, match="sandbox root"):
         fr.safe_figure_path(root, "slug")
+
+    # 殼層裡的 AICODE_ROOT 一律無效:它既不能放行、也不能擋。
     monkeypatch.setenv("AICODE_ROOT", str(root))
+    with pytest.raises(fx.FigureReviewError, match="sandbox root"):
+        fr.safe_figure_path(root, "slug")
+
+    media.set_sandbox_root(str(root))
     assert fr.safe_figure_path(root, "slug")
 
 

@@ -1495,7 +1495,7 @@ def test_remote_endpoint_needs_explicit_opt_in(monkeypatch):
         cg.ensure_endpoint_allowed("http://10.0.0.5:8080")
 
     message = str(exc.value)
-    assert "AICODE_KB_CONTEXT_REMOTE_OK" in message
+    assert "kb_context_remote_ok" in message
     assert "整份文件" in message, "錯誤訊息必須講明會外送什麼"
 
 
@@ -2043,3 +2043,90 @@ def test_lock_refuses_a_non_regular_lock_file(tmp_path: Path):
 
     with pytest.raises(cg.ContextLockError):
         cg.SingleWriterLock(root).acquire()
+
+
+# ── 總審 F1-14:預設 cache 位置是函式,呼叫端要真的呼叫它 ──
+
+
+@pytest.mark.smoke
+def test_the_default_context_cache_root_resolves_without_an_explicit_dir(tmp_path, monkeypatch):
+    """`python3 RAG.py rebuild … --context` 不傳 cache_dir 就走預設。
+
+    `config.KB_CONTEXT_CACHE_DIR` 改成函式之後,`Path(base_dir or config.KB_CONTEXT_CACHE_DIR)`
+    收到的是 function object → 在任何模型呼叫前就 `TypeError`。測試全部顯式傳
+    `cache_dir`,所以沒有人踩到預設路徑。
+    """
+    import context_generation
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = context_generation.cache_root_for(tmp_path / "knowledge.json")
+    assert isinstance(root, Path)
+    assert str(root).startswith(str(tmp_path)), root
+
+
+# ── 總審 F1-15:RAG.py 自己套用 client.json(預設 HOME;可用 --client-config 指定)──
+
+
+@pytest.mark.smoke
+def test_rag_cli_applies_the_client_config_it_is_given(tmp_path, monkeypatch):
+    import RAG
+    import config
+
+    cfg = tmp_path / "client.json"
+    cfg.write_text(json.dumps({"schema": 1, "compaction_mode": "manual", "objdump": "/opt/bin/objdump"}), encoding="utf-8")
+    cfg.chmod(0o600)
+    tmp_path.chmod(0o700)
+    rest, path = RAG._split_client_config(["--client-config", str(cfg), "doc.pdf", "kb.json"])
+    assert rest == ["doc.pdf", "kb.json"] and path == str(cfg)
+    monkeypatch.setattr(config, "OBJDUMP", "")
+    RAG._apply_client_settings(path)
+    assert config.OBJDUMP == "/opt/bin/objdump"
+    # 壞掉的檔 fail-loud(與客戶端、MCP 同一個判準)。
+    cfg.write_text("{ not json", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        RAG._apply_client_settings(str(cfg))
+
+
+# ── 總審 NON-BLOCKER 4:RAG 的 --client-config 與 MCP parser 同等嚴格 ──
+
+
+@pytest.mark.smoke
+def test_rag_client_config_flag_is_as_strict_as_the_mcp_parser(monkeypatch):
+    """重複旗標 last-wins、把下一個旗標吃成路徑、空值當沒給 —— 都是「使用者以為
+    套了那一份設定、實際套了另一份 / 沒套」的無聲漂移。與 `mcp_server.py` 一樣 exit 2。"""
+    import RAG
+
+    for argv in (
+        ["spec.pdf", "--client-config"],
+        ["spec.pdf", "--client-config", "--fresh"],
+        ["spec.pdf", "--client-config="],
+        ["spec.pdf", "--client-config", "a.json", "--client-config", "b.json"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            RAG._split_client_config(list(argv))
+        assert exc.value.code == 2, argv
+    rest, path = RAG._split_client_config(["spec.pdf", "--client-config", "/tmp/c.json", "--fresh"])
+    assert (rest, path) == (["spec.pdf", "--fresh"], "/tmp/c.json")
+    # `rebuild` 走 argparse:同判準(重複 / 空值 exit 2),不是 last-wins。必要參數都給齊,
+    # 讓 parser 唯一可能的錯就是那個旗標;parse 之後第一步是套 client 設定,用哨兵證明
+    # 「合法的單一旗標會走到那裡、重複的不會」。
+    class Reached(Exception):
+        pass
+
+    def reached(*_a, **_k):
+        raise Reached()
+
+    monkeypatch.setattr(RAG, "_apply_client_settings", reached)
+    for argv in (
+        ["--kb", "k.json", "x.pdf", "--client-config", "a.json", "--client-config", "b.json"],
+        ["--kb", "k.json", "x.pdf", "--client-config="],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            RAG.rebuild_cli(list(argv))
+        assert exc.value.code == 2, argv
+    with pytest.raises(Reached):
+        RAG.rebuild_cli(["--kb", "k.json", "x.pdf", "--client-config", "a.json"])
+    # 縮寫(`--client-conf`)也不收:MCP 的 parser 是精確比對,這裡不該比較寬。
+    with pytest.raises(SystemExit) as exc:
+        RAG.rebuild_cli(["--kb", "k.json", "x.pdf", "--client-conf", "a.json"])
+    assert exc.value.code == 2

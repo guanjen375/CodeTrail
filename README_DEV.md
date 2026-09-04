@@ -22,7 +22,8 @@ python3 codetrail_chat.py status              # 目前的壓縮模式(aicode 橫
 python3 scripts/doctor.py --no-network        # 用機器上實際設定的模型；不要塞假 model 名
 python3 deployment_profile.py validate
 
-# 舊 OpenCode 安裝的一次性遷移(唯一會寫使用者 opencode.json 的路徑;有備份)
+# 舊 OpenCode 安裝的一次性遷移(唯一會寫使用者 opencode.json 的路徑;有備份、
+# 只有手動執行時才跑 —— set_config 不再順帶做這件事)
 python3 opencode_migrate.py
 
 # 測試入口（何時能跑見 AGENTS.md §1）
@@ -73,12 +74,11 @@ conftest／harness／pyproject／requirements／`tests/fixtures/`）就退回完
 各 shard 內耗時總和」與最慢的幾條（≥0.5s），給 §1.1 的 smoke 10 秒目標做趨勢觀察；
 **不設硬秒數閾值**，不同機器差好幾倍，拿秒數當 gate 只會製造假紅燈。
 
-核心日常入口是 CodeTrail 終端客戶端;跨機 web 另有薄 launcher(兩者共用 `aicode` 安全前置):
+使用者入口只有一個 —— CodeTrail 的終端客戶端:
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
 aicode
-aicode_web  # A/B 機已加入同一 tailnet 時
 ```
 
 ---
@@ -102,14 +102,15 @@ aicode_web  # A/B 機已加入同一 tailnet 時
 測試在 2026-09 依主題合併成 35 個檔（原本 95 個）；一個檔 = 一個被測主題，檔頭
 docstring 說明它涵蓋哪些原始檔與為什麼：
 
-- launcher / config：`test_aicode.py`（aicode wrapper、web、attach）、`test_set_config.py`
+- launcher / config：`test_aicode.py`（aicode wrapper）、`test_set_config.py`
   （set_config.sh 的問答、模型、artifacts、壓縮段）、`test_server_scripts.py`
-  （launch／stop／check_status、aicode_web）、`test_deployment.py`（deployment profile、
+  （launch／stop／check_status）、`test_deployment.py`（deployment profile、
   模型解析、GPU 與 ctx 安全、config）、`test_doctor.py`（doctor + tool-call canary）、
   `test_lessons.py`。
 - 客戶端:`test_client_mcp.py`(取消契約)、`test_client_store.py`(session 檔私密性)、
-  `test_client_engine.py`(訊息轉換 / 權限 / 工具迴圈)、`test_client_cli.py`(事件流與前端)、
-  `test_client_compaction.py`(壓縮規則與門檻)、`test_client_web.py`(存取邊界)、
+  `test_client_engine.py`(訊息轉換 / 權限 / 工具迴圈)、`test_client_cli.py`(事件流與 headless)、
+  `test_client_turns.py`(回合協調與取消)、`test_client_app.py`(TUI)、
+  `test_client_compaction.py`(壓縮規則與門檻)、
   `test_opencode_migrate.py`(舊安裝遷移)。
 - MCP / sandbox / mutation：`test_mcp_server.py`（啟動、runtime policy、工具目錄、
   JSON-RPC roundtrip、結果預算、external import）、`test_mcp_ingest.py`（ingest 子行程、
@@ -164,26 +165,27 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
   `docs/mcp-tools.md` 的固定順序
   manifest；可安裝的全域 prompt 只保留 `codetrail_*` schema anchor，禁止把完整清單搬回去。
   使用者還在用舊版固定清單時，`aicode` 會提示 `⚠ STALE`
-- 壓縮接管(`codetrail` / `manual`)**還在測試階段**:標示的單一來源是
-  `compaction_mode.EXPERIMENTAL_TAG` / `EXPERIMENTAL_NOTICE`,由 set_config 的問答與
-  摘要頁、`client_status.py`(`codetrail_chat.py status`,aicode 啟動橫幅)、`scripts/doctor.py` 與
+- 壓縮接管(`codetrail` / `manual`)**還在測試階段**:標示由 set_config 的問答與摘要頁、
+  `client_status.py`(`codetrail_chat.py status`,aicode 狀態列)、`scripts/doctor.py` 與
   `docs/compaction-rules.md` / `README.md` 共用。要拿掉「實驗中」是一次全域決定,
-  不是改其中一處——`tests/test_compaction_mode.py` 釘住問答與文件都還帶著它
+  不是改其中一處——`tests/test_set_config.py` 與 `tests/test_compaction_formula.py`
+  釘住問答與狀態行都還帶著它
 - 改壓縮的七條摘要規則或門檻公式 → `docs/compaction-rules.md` 的兩個 ```text 區塊是
   **唯一來源**，`client_compaction.py` 的
-  `RECONCILIATION_HEADER` 逐字沿用它們，門檻公式只有 `compaction_mode.derive_settings`
+  `RECONCILIATION_HEADER` 逐字沿用它們，門檻公式只有 `compaction_formula.derive_settings`
   一份實作（客戶端直接呼叫它）。文件與程式任一改了另一邊沒跟上，只會讓門檻與
   保留額對不上——沒有任何錯誤訊息。`tests/test_client_compaction.py` 逐字比對
 - 新增 `compaction.*` 受管鍵（只影響 `opencode_migrate` 還原舊安裝的範圍）→ 改
-  `compaction_mode.MANAGED_COMPACTION_KEYS`,而且**預設不要進** `CONTRACT_COMPACTION_KEYS`:契約鍵的意思是「值
+  `opencode_migrate.MANAGED_COMPACTION_KEYS`,而且**預設不要進** `CONTRACT_COMPACTION_KEYS`:契約鍵的意思是「值
   不符就停用那個 session 的自動壓縮」,只有「改了會讓壓縮失真」的鍵才配得上這個後果。
   新鍵一律不由 runtime 或 contract check 自己補寫(沒有 ownership 紀錄就切不回 native),
-  由 `compaction_mode.unmanaged_keys()` 報出來、使用者重跑 `./set_config.sh`
+  由 `opencode_migrate.unmanaged_keys()` 報出來、使用者重跑 `python3 opencode_migrate.py`
 - 舊回合 reasoning 的處理在 `client_engine.strip_historical_reasoning()`(送模型前的
   訊息轉換)。它改的是**送進模型的那一份訊息**,多砍一個欄位是靜默失真、砍到 tool
   訊息會讓 llama-server 直接報錯,所以只准動 `reasoning` 欄位、只准動最新一則真實使用者
-  訊息之前的、認不出那則訊息就整段不動;session 檔與畫面保留原文。逃生口是
-  `CODETRAIL_KEEP_REASONING=1`(`client_status.py` 與 engine 各有一份同名常數)
+  訊息之前的、認不出那則訊息就整段不動;session 檔與畫面保留原文。要關掉它是
+  `client.json` 的 `keep_historical_reasoning`(`/thinking` 只改畫面,**不得**動它
+  —— 那是兩個鍵)
 - 新增 incident kind / detail slug → `mcp_lease.py` 與 `tests/test_mcp_lease.py` 的
   凍結 tuple 必須一起改（跨語言封閉集合；一端沒跟上就把另一端寫的合法值正規化成
   `unknown`，那些事件在 doctor 的統計裡等於憑空消失）
@@ -225,7 +227,7 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
   `runtime_hybrid`(**主 gate**;直接呼叫 `code_rag.hybrid_symbol_score` 與
   `select_scored_candidates`,跑的是 production 那份 scoring 與 cutoff)、
   `rrf_experimental`(選配診斷,**不得**冒充 production hybrid)。
-  scope:`per_repo` 是主 gate lane(對齊 runtime 每次只有一個 `AICODE_ROOT`),
+  scope:`per_repo` 是主 gate lane(對齊 runtime 每次只有一個 sandbox root),
   `union` 只是 cross-repo distractor 的 stress 診斷;12k/28k context gate 走 `per_repo`。
   file metric 先依 `repo_id:path` **聚合去重**再截 k,並對**完整 `gold_files`** 計分;
   `seed_files` 另報 `seed_recall`,不取代主指標。
@@ -399,8 +401,8 @@ shape —— 改它時**不要**順手 bump `GRAPH_SCHEMA_VERSION`。
 
 cache 身分只有一份定義:`code_rag.cache_identity()`。它除了 schema / parser /
 embed-text 版本,還帶**實際的 render 預算值**(清單以 `render_budgets`
-為準,別另外記個數)—— 那些預算是 `AICODE_*` 環境變數可覆寫的,只鎖 schema
-version 的話,重啟時改一個環境變數就會靜默沿用「用另一組 render
+為準,別另外記個數)—— 那些預算是 `config.py` 的常數,只鎖 schema
+version 的話,改一個常數再重啟就會靜默沿用「用另一組 render
 算出來的」embedding。寫入端、驗證端與測試 fixture 都從 `cache_identity()` 取:各寫一份
 的失敗一樣無聲 —— 加了欄位而 fixture 沒跟上,舊 cache 被拒、那條測試改走 full rebuild,
 「還是綠的」卻不再驗它本來要驗的東西。
@@ -459,7 +461,7 @@ sibling)、不跨空行、不跨 preprocessor 或其他節點、不吃檔頭 lic
 寫成**白名單**:
 
 > **免 bump 的只有「已經列在 `cache_identity()` 的 `render_budgets` 裡的預算數值」**
-> (含 `AICODE_*` 覆寫)。其他任何會改變 render 輸出的修改 —— 欄位集合、欄位順序、
+> 。其他任何會改變 render 輸出的修改 —— 欄位集合、欄位順序、
 > label 文字、分隔方式、截斷演算法,以及**任何還沒進 `render_budgets` 的截斷數字**
 > —— 一律「bump,或先把它納入 identity」。
 
@@ -503,21 +505,23 @@ symbol 掃描。`.cfg` / `.json` / `.sh` / `.mk` 這些設定檔**仍在** symbo
 
 ## data flywheel 是什麼
 
-`data_flywheel.py` 才是互動資料收集器。它預設關閉，只有設定環境變數才會寫資料：
+`data_flywheel.py` 才是互動資料收集器。它預設關閉，只有 `client.json` 打開才會寫資料：
 
-```bash
-AI_CODE_COLLECT_DATA=1 aicode
+```json
+{ "collect_data": true }
 ```
 
-預設輸出：
+輸出位置**固定**（沒有覆寫鍵）：
 
 ```text
-data/interactions.jsonl
+~/.local/state/codetrail/data/<root 雜湊>/interactions.jsonl
 ```
 
-可用 `AI_CODE_DATA_FILE=/absolute/path/interactions.jsonl` 覆寫位置。這個變數只在
-`AI_CODE_COLLECT_DATA=1` 時有意義；自訂到 repo 外的路徑不受本 repo `.gitignore` 保護，
-檔案可能含 NDA prompt、回答與程式片段，應放在私有目錄並限制檔案權限。
+與 session 檔同一套 root 雜湊與 `client_paths` 防線：目錄 0700、檔 0600、拒 symlink
+與 hard link、dir-fd append。**絕不落進被分析的 repo** —— 以前預設是相對路徑
+`data/interactions.jsonl`，而 MCP 以被分析專案為 cwd，所以那些含 question / answer /
+程式片段的內容實際上寫在客戶的 repo 裡，還是普通的 `open(..., 'a')`。
+讀取端（eval 工具）以明確的路徑參數讀。
 
 記錄內容包含 question、answer、refs、code snippets、mode、KB score、repo commit、model tag、agent tool calls、files read。這些資料在 NDA 場景通常含敏感內容；預設的 repo 內輸出已由 `.gitignore` 排除。
 
@@ -543,7 +547,7 @@ python3 data_flywheel.py export --file data/interactions.jsonl --output data/tra
 
 | 項目 | eval | data flywheel |
 |---|---|---|
-| 會自動記錄對話 | 不會 | 會，但必須設 `AI_CODE_COLLECT_DATA=1` |
+| 會自動記錄對話 | 不會 | 會，但必須在 `client.json` 設 `"collect_data": true` |
 | 用途 | 固定題庫回歸測試 | 收集真實互動樣本 |
 | 日常使用是否需要 | 不需要 | 不需要 |
 | 是否適合成熟產品 | 適合做 regression gate | 適合做資料閉環，但要更嚴格處理隱私 |
@@ -589,7 +593,7 @@ journaled 寫入 → best-effort rollback。
 | `scripts/mcp_catalog.py`／`scripts/eval_tool_routing.py` | effective stdio catalog、privacy-safe routing classification/gates 與 frozen historical baseline replay；harness 永不自行把 matrix row 升級成 supported。 |
 
 部署 live-after 不進 CI，也不是所有開發環境必綠。受授權且相容的乾淨部署才執行
-`AICODE_TOOL_CANARY_FORCE=1 aicode` 與 routing eval 真模型 arm，記錄客戶端／MCP SDK、
+`python3 scripts/tool_call_canary.py --root <PROJECT> --force` 與 routing eval 真模型 arm，記錄客戶端／MCP SDK、
 模型／chat template／effective config、explicit 與 implicit 結果。環境不可得時逐字回報
 `not run: environment unavailable`；未授權、未跑或 gate 未通過都保持 incomplete，不能阻擋
 離線驗收，也不能宣稱 `supported`。
@@ -670,7 +674,7 @@ context_budget.log_metrics(usage)
 
 ---
 
-## gpu_safety.py / ctx_safety_check.py 設計
+## gpu_safety.py / client_preflight 的 ctx 容量閘
 
 `context_budget.py` 守的是「prompt 會不會超出 ctx 上限」(正確性);
 `gpu_safety.py` 守的是「使用者要求的 ctx 上限會不會超過 llama-server 啟動時的 `-c <N>`」
@@ -685,27 +689,30 @@ llama-server 啟動時 `-c <N>` 已經把 ctx + KV cache 鎖死,所以 doctor / 
 | 模組 / 入口 | 責任 |
 |---|---|
 | `gpu_safety.py` | 純 library:`query_gpu_info()` 跑 nvidia-smi 拿 GPU info(純診斷)、`query_server_info()` 打 llama-server `/props` 抓 `default_generation_settings.n_ctx` + `model_path`、`check_safety(requested_ctx, base_url)` 比對後包成 `SafetyVerdict`。所有 I/O 都用 hook 參數注入,測試可完全離線 mock。 |
-| `n_ctx.py` / `config.py::N_CTX` | 主模型 n_ctx 的集中解析。正常設定入口是 `set_config.sh --ctx`；runtime 以 `AICODE_N_CTX` 傳遞 server 實值。`NUM_CTX` / `DYNAMIC_NUM_CTX_MAX` 只保留程式碼相容 alias，永遠等於 `N_CTX`。舊 `AICODE_DYNAMIC_NUM_CTX_MAX` 只暫時相容讀取並警告 deprecated。 |
-| `scripts/resolve_server_ctx.py` | CLI 取值器。讀主 llama-server `/props` 拿真實 `n_ctx`，只把整數印到 stdout(讀不到就印空字串、永遠 exit 0)。`aicode` 將實值 export 成 `AICODE_N_CTX`；讀不到時回到 deployment profile 的 `services.main.ctx`。 |
-| `scripts/ctx_safety_check.py` | CLI 入口(容量閘)。讀 `AICODE_MODEL` / 主 n_ctx / `AICODE_LLAMA_BASE_URL`，呼 `gpu_safety.check_safety()`；requested `<=` server n_ctx 放行，只有 `>` 才 refuse。安全 gate、`AICODE_ACCEPT_CTX_RISK` 與 `AICODE_CTX_SAFETY_DISABLE` 仍保留。 |
+| `n_ctx.py` / `config.py::N_CTX` | 主模型 n_ctx 的界線與靜態預設。設定入口是 `set_config.sh --ctx`(寫進 deployment profile 與 server 的 `-c`)。`NUM_CTX` / `NUM_CTX_FULL_MODE` / `DYNAMIC_NUM_CTX_MAX` 只是相容 alias,永遠等於 `N_CTX` —— `config.set_runtime_n_ctx()` 是**同時**改這四個名字的唯一入口。 |
+| `client_preflight.observe_n_ctx()` | runtime 取值。先問主 server 的 `/props`(啟動時的 `-c` 是真值),問不到才退回 profile 的 `main.ctx`;結果以 **argv**(`mcp_server --n-ctx`)與 `EngineOptions` 交給每一個元件,不經環境變數。 |
+| `client_preflight.check_ctx_safety()` | 容量閘。以觀測到的 requested 呼 `gpu_safety.check_safety()`;`requested <= server n_ctx` 放行,只有 `>` 才 `PreflightError`。**沒有逃生口**:以前的 `AICODE_ACCEPT_CTX_RISK` / `AICODE_CTX_SAFETY_DISABLE` 已刪除且無替代。 |
 | `context_budget.py::_emit_runtime_offload_check_once` | runtime 觀測 hook:`[CTX] WARNING` 或 `[CTX_OVERFLOW]` 觸發時順手查一次 `/slots` + `/props`,把 server 真實 n_ctx / 忙碌 slot 數 黏在 log 後面。每個 process 只跑一次,任何錯誤靜默吞掉。 |
 
 ### 設計守則
 
-- **fail-loud,不偷偷 clamp**:`ctx_safety_check` 遇到 `UNSAFE`(requested > server)一定 print verdict + 對齊方案然後 `exit 2`,**不會為了避開 UNSAFE 自動把 requested 改小**。(這跟 aicode 啟動時「從 server 讀 n_ctx 自動設成 budget」是兩回事:後者是拿 source of truth 當預設值,不是為了掩蓋失敗而 clamp。)
+- **fail-loud,不偷偷 clamp**:`check_ctx_safety` 遇到 `UNSAFE`(requested > server)一定印出 verdict + 對齊方案然後拒絕啟動(exit 2),**不會為了避開 UNSAFE 自動把 requested 改小**。(這跟「從 server 讀 n_ctx 當 budget」是兩回事:後者是拿 source of truth 當預設值,不是為了掩蓋失敗而 clamp。)
+- **沒有關閉開關**:關掉它之後的症狀不是錯誤訊息,是 llama-server 從 prompt 前面靜默截掉 —— 使用者看到的只有「模型忘記前面說過什麼」。
 - **UNKNOWN 一律放行**:server 不可連 / `/props` 沒給 n_ctx → 只 warn 不擋。否則 CI、遠端 server、新版 server 改 schema 時會被卡住。
 - **server 是 source of truth**:不再做 KV cache 公式預測;server `-c` 就是答案。
 
-### 進階 / escape 設定
+### 沒有進階 / escape 設定
 
-| Env | 行為 | 何時用 |
-|---|---|---|
-| `AICODE_N_CTX=<N>` | 單次覆寫主 n_ctx；仍須通過 server capacity gate | 測試 / 特殊 launcher；正常使用改跑 `set_config.sh` |
-| 重跑 `set_config.sh` 並重啟 server | 更新主 n_ctx | 一般使用者唯一需要的設定方式 |
-| `AICODE_ACCEPT_CTX_RISK=1` | UNSAFE 也 exit 0,但仍印完整 verdict | 一次性實測 truncation 影響 |
-| `AICODE_CTX_SAFETY_DISABLE=1` | 整個 check 跳過,連 verdict 都不算 | CI / 自動化、緊急逃生 |
+主 n_ctx **只有一個入口**:重跑 `./set_config.sh` 設一次,再重啟 server。
+runtime 由 preflight 觀測 `/props` 的實值,以 argv 交給每一個元件。
 
-`AICODE_DYNAMIC_NUM_CTX_MAX` 與 `AICODE_NUM_CTX` 已 deprecated；不要再寫進 shell profile。
+以前這裡有四個環境變數:`AICODE_N_CTX`、`AICODE_ACCEPT_CTX_RISK`、`AICODE_CTX_SAFETY_DISABLE`,以及 deprecated 的 `AICODE_DYNAMIC_NUM_CTX_MAX` / `AICODE_NUM_CTX` —— 全部已刪除、無替代。
+它們讓「使用者以為的 n_ctx」與
+「server 真正啟動時的 `-c`」變成兩個可以漂移的數字,而漂移的症狀是 llama-server
+從 prompt 前面靜默截掉:使用者看到的是模型忘記前面說過什麼,不是一個錯誤。
+
+要跳過某個檢查 = 修那個檢查。要強制重跑 canary = 刪掉
+`~/.cache/codetrail/tool-call-canary.v3.json`(或 `--force`)。
 
 ### 沒有解的事(刻意留)
 
@@ -773,7 +780,9 @@ root 內)→ 不是實際載入的 index-scope.json → 是 regular file。
 ### index-scope.json (Layer C)
 
 `~/.config/codetrail/index-scope.json`,**永不進 repo、永不出現在任何輸出**
-(`index_stats` 連 pattern 內容都不印)。`AICODE_INDEX_SCOPE_FILE` 可覆寫路徑(測試用)。
+(`index_stats` 連 pattern 內容都不印)。位置只由 `HOME` 推導,**沒有覆寫變數**
+—— 一個「檔案在哪」的環境變數只會讓 runtime 與 `index_stats` 各自看到不同的檔,
+而使用者以為它們在講同一份。
 
 ```json
 {
@@ -800,7 +809,8 @@ root 內)→ 不是實際載入的 index-scope.json → 是 regular file。
   非絕對路徑 `root`、pattern 衛生違規(`!` / `..` 段 / 空 / NUL / 每 root >200 條 /
   單條 >512 字元)、POSIX 權限不是 owner-only(訊息附 `chmod 600`)。
 - `root` 是**選擇器,不是掃描根**:canonicalize(realpath + normcase)後與當下的
-  `AICODE_ROOT` 精確比對。沒匹配到不是錯誤,但 `index_stats` 會印 `C: no matching selector`。
+  sandbox root(`mcp_server --root`,客戶端以 cwd 決定)精確比對。沒匹配到不是錯誤,
+  但 `index_stats` 會印 `C: no matching selector`。
 - `mode`:`denylist`(預設)/ `allowlist`(只有 include 列的進索引)。
   **allowlist 下給非空 `exclude` 直接 fail-loud** —— `C.include` 優先於 `C.exclude`,
   在 allowlist 恆為死碼,靜默接受會養出錯誤心智模型。
@@ -884,24 +894,23 @@ fallback)分數是 None,MMR 退回原本的 embedding 相關度,那條路徑行�
 
 ```bash
 # 生成(唯一會生成的路徑;MCP 的 ingest_document 永遠不生成)
-AICODE_KB_CONTEXT_GENERATE=1 python3 RAG.py rebuild --kb knowledge.json spec_a.pdf
 python3 RAG.py rebuild --kb knowledge.json spec_a.pdf --context      # 旗標 > config
 python3 RAG.py rebuild --kb knowledge.json spec_a.pdf --no-context   # 這次不生成
-
-# 查詢端使用(同時是緊急 kill switch:關掉不必重建 KB)
-AICODE_KB_CONTEXT_USE=1 aicode
 ```
 
-| 環境變數 | 預設 | 作用 |
-|---|---|---|
-| `AICODE_KB_CONTEXT_GENERATE` | off | 入庫時是否生成 ctx |
-| `AICODE_KB_CONTEXT_USE` | off | 查詢時是否使用 ctx(kill switch) |
-| `AICODE_KB_CONTEXT_REMOTE_OK` | off | main URL 非 loopback 時的顯式同意 |
-| `AICODE_KB_CONTEXT_TARGET_TOKENS` | 100 | ctx 長度上限(回應後截斷) |
-| `AICODE_KB_CONTEXT_REASONING_TOKENS` | 512 | 請求端額外留給 reasoning 的額度 |
-| `AICODE_KB_CONTEXT_WINDOW_SAFETY` | 0.8 | 窗預算的 n_ctx 安全係數 |
-| `AICODE_KB_CONTEXT_MAX_ABSENT_RATIO` | 0.20 | 絕跡率超過就中止發布 |
-| `AICODE_KB_CONTEXT_CACHE_DIR` | `~/.cache/codetrail/ctx` | ctx 快取(repo 外、per-root、0700) |
+生成與查詢的開關是 `config.py` 的常數(改 repo,所有使用者一致);
+遠端同意是 `client.json` 的鍵(每個使用者自己決定要不要讓文件離機)。
+
+| 設定 | 位置 | 預設 | 作用 |
+|---|---|---|---|
+| `KB_CONTEXT_GENERATE` | `config.py` | off | 入庫時是否生成 ctx |
+| `KB_CONTEXT_USE` | `config.py` | off | 查詢時是否使用 ctx(kill switch) |
+| `kb_context_remote_ok` | `client.json` | off | main URL 非 loopback 時的顯式同意 |
+| `KB_CONTEXT_TARGET_TOKENS` | `config.py` | 100 | ctx 長度上限(回應後截斷) |
+| `KB_CONTEXT_REASONING_TOKENS` | `config.py` | 512 | 請求端額外留給 reasoning 的額度 |
+| `KB_CONTEXT_WINDOW_SAFETY` | `config.py` | 0.8 | 窗預算的 n_ctx 安全係數 |
+| `KB_CONTEXT_MAX_ABSENT_RATIO` | `config.py` | 0.20 | 絕跡率超過就中止發布 |
+| `KB_CONTEXT_CACHE_DIR` | `config.py` | `~/.cache/codetrail/ctx` | ctx 快取(repo 外、per-root、0700) |
 
 **為什麼預設關閉**:(a) standalone 的 `RAG.py` 目前只依賴 embedding server,預設開啟等於
 替既有部署新增一條 main-server 硬依賴;(b) 部署允許 main URL 指到非 loopback,預設開啟
@@ -919,7 +928,7 @@ AICODE_KB_CONTEXT_USE=1 aicode
 - KB 有 ctx 卻缺 gate 矩陣 → 拒載,不 fallback 到 contextual 向量。
 - gate 向量只留在矩陣裡,不 `.tolist()` 掛回 chunk;決策點用 `chunk_idx` 讀列。
 
-`AICODE_KB_CONTEXT_USE=0` 時查詢端完全退回 content-only:dense 讀 gate 矩陣、BM25 用
+`config.KB_CONTEXT_USE = False` 時查詢端完全退回 content-only:dense 讀 gate 矩陣、BM25 用
 content-only 索引、reranker passage 不加 ctx。**同一份 KB 上就能做乾淨的 A/B**,不需要
 第二套 KB。
 
@@ -969,12 +978,12 @@ for f in <doc1> <doc2>; do python3 /path/to/CodeTrail/RAG.py "$f" ./knowledge.js
 issue,路徑本身就是 NDA 內容。
 
 ```bash
-AICODE_ROOT=/path/to/tree python3 scripts/index_stats.py
+python3 scripts/index_stats.py --root /path/to/tree
 python3 scripts/index_stats.py --root /path/to/tree --deep        # 真的跑 AST 算符號數
 python3 scripts/index_stats.py --root /path/to/tree --show-paths  # 顯式 opt-in 才印路徑樣本
 ```
 
-root 只能來自 `--root` 或 `AICODE_ROOT`,都沒有就報錯不猜 cwd;驗證復用
+root 只能來自 `--root`,沒給就報錯不猜 cwd(掃錯樹是靜默的);驗證復用
 `root_safety.validate_aicode_root`(和 MCP server 同一份,拒絕 `/`、`$HOME`、
 不存在 / 非目錄)。root 不合法或 index-scope.json 壞掉都是乾淨的 `[FATAL]` + exit 2,
 不吐 traceback。

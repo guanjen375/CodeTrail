@@ -234,7 +234,16 @@ def test_catalog_token_probe_falls_back_symmetrically_without_usage():
     assert "tools" in templates[1]
 
 
-def test_model_probe_endpoint_must_match_effective_opencode_provider():
+def test_model_probe_endpoint_must_match_effective_opencode_provider(monkeypatch):
+    """probe 的 endpoint 綁 deployment profile;與殘留設定不符時 fail-loud。
+
+    2026-09-04:那個 endpoint 的來源從 `AICODE_LLAMA_BASE_URL` 換成
+    `config.LLAMA_BASE_URL`(deployment profile)。行為為什麼該變:殼層殘留一個
+    值會讓 15 題去打別台機器的 server,結果卻歸到本機的 identity。
+    """
+    import config as codetrail_config
+
+    monkeypatch.setattr(codetrail_config, "LLAMA_BASE_URL", "http://localhost:8080")
     config = {
         "provider": {
             "llamacpp": {
@@ -250,12 +259,26 @@ def test_model_probe_endpoint_must_match_effective_opencode_provider():
         )
         == "http://localhost:8080"
     )
+    # 殘留設定與 deployment profile 不符 → fail-loud。以前這裡的來源是
+    # `AICODE_LLAMA_BASE_URL`;現在只有 profile,所以改動 profile 那一邊。
+    monkeypatch.setattr(codetrail_config, "LLAMA_BASE_URL", "http://localhost:9090")
     with pytest.raises(routing.EvalError):
+        routing._model_server_base_url(
+            config,
+            model="llamacpp/synthetic",
+            environment={},
+        )
+
+    # 殼層裡殘留的 `AICODE_LLAMA_BASE_URL` 一律無效。
+    monkeypatch.setattr(codetrail_config, "LLAMA_BASE_URL", "http://localhost:8080")
+    assert (
         routing._model_server_base_url(
             config,
             model="llamacpp/synthetic",
             environment={"AICODE_LLAMA_BASE_URL": "http://localhost:9090"},
         )
+        == "http://localhost:8080"
+    )
 
 
 def test_bilingual_fixture_covers_all_required_intents_and_ascii_query_contract(tmp_path):
@@ -1243,16 +1266,31 @@ def test_checked_in_pipeline_identity_matches_the_current_code(artifact):
 def test_reproducibility_info_model_tag_follows_calltime_main_model(
     monkeypatch, tmp_path, aicode_model, expected_tag
 ):
-    """AICODE_MODEL 有設時 model_tag 記下 call-time 的主模型;沒設時留空字串、不得 crash。"""
+    """deployment.json 有主模型時 model_tag 記下 call-time 的那一顆;沒有就留空字串。
+
+    2026-09-04:模型來源從 `AICODE_MODEL` 換成 deployment profile 的
+    `main.model`(客戶端唯一的來源)。
+    """
+    import json as _json
+
     import data_flywheel
 
-    if aicode_model is None:
-        monkeypatch.delenv("AICODE_MODEL", raising=False)
-    else:
-        monkeypatch.setenv("AICODE_MODEL", aicode_model)
-    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("AICODE_MODEL", "shell-leftover")  # 殘留值不得被記下
+    if aicode_model is not None:
+        cfg_dir = tmp_path / ".config" / "codetrail"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        (cfg_dir / "deployment.json").write_text(
+            _json.dumps(
+                {
+                    "schema_version": 1,
+                    "profile": "defaults",
+                    "services": {"main": {"model": aicode_model}},
+                }
+            ),
+            encoding="utf-8",
+        )
 
     info = data_flywheel.get_reproducibility_info()
 
@@ -1459,7 +1497,7 @@ def test_opencode_timeout_is_a_scored_case_failure_not_a_suite_abort(
             stderr=b"private stderr",
         )
 
-    monkeypatch.setattr(session_eval_cli.subprocess, "run", time_out)
+    monkeypatch.setattr(session_eval_cli.process_env, "run", time_out)
 
     turn, session_id = session_eval_cli._run_turn(
         root=tmp_path,
@@ -1468,6 +1506,7 @@ def test_opencode_timeout_is_a_scored_case_failure_not_a_suite_abort(
         env={},
         timeout=3,
         session_id="ses_eval_timeout",
+        client_config_path=tmp_path / "client.json",
     )
 
     assert session_id == "ses_eval_timeout"
@@ -1580,7 +1619,7 @@ def test_a_multi_turn_case_actually_continues_the_conversation(monkeypatch, tmp_
     """
     commands: list[list[str]] = []
 
-    def _fake_run(command, *, cwd, env, timeout):
+    def _fake_run(command, *, cwd, env=None, timeout):
         if command and command[0] == "git":
             return subprocess.CompletedProcess(command, 1, b"", b"")
         commands.append(list(command))
@@ -1604,6 +1643,7 @@ def test_a_multi_turn_case_actually_continues_the_conversation(monkeypatch, tmp_
             "verifier": {"oracle_kind": "manual", "checks": []},
         },
         model="llamacpp/m", env={}, timeout=30, keep_sessions=False,
+        client_config_path=tmp_path / "client.json",
     )
     assert len(commands) == 2
     assert "--persist" in commands[0]
@@ -1615,7 +1655,7 @@ def test_a_single_turn_case_never_writes_a_session_file(monkeypatch, tmp_path):
     """session 檔逐字含 NDA prompt 與工具輸出。單輪不需要落檔。"""
     commands: list[list[str]] = []
 
-    def _fake_run(command, *, cwd, env, timeout):
+    def _fake_run(command, *, cwd, env=None, timeout):
         if command and command[0] == "git":
             return subprocess.CompletedProcess(command, 1, b"", b"")
         commands.append(list(command))
@@ -1637,6 +1677,7 @@ def test_a_single_turn_case_never_writes_a_session_file(monkeypatch, tmp_path):
             "verifier": {"oracle_kind": "manual", "checks": []},
         },
         model="llamacpp/m", env={}, timeout=30, keep_sessions=False,
+        client_config_path=tmp_path / "client.json",
     )
     assert "--persist" not in commands[0]
 
@@ -1678,7 +1719,7 @@ def test_the_store_export_uses_the_role_shape_the_validator_reads():
             {"type": "message", "role": "assistant", "content": "答案"},
         ],
     )
-    assert session_eval.validate_opencode_export(export) is export
+    assert session_eval.validate_session_export(export) is export
     assert export["messages"][0]["info"]["role"] == "user"
     # raw export 是來源封存:助理回答留著(之後人工建 verifier 要用的證據)。
     assert export["messages"][1]["parts"] == [{"type": "text", "text": "答案"}]
@@ -1706,7 +1747,7 @@ def test_a_sanitized_export_strips_assistant_text_and_tool_output():
     tools = [part["tool"] for message in clean["messages"] for part in message["parts"]
              if part.get("type") == "tool"]
     assert "read_file" in tools
-    assert session_eval.validate_opencode_export(clean) is clean
+    assert session_eval.validate_session_export(clean) is clean
 
 
 # ── 總審第 1 輪回修:私人產物不得落進可追蹤路徑;例外路徑也要驗 project state ──
@@ -1729,7 +1770,7 @@ def test_the_state_digest_still_runs_when_the_replay_child_blows_up(monkeypatch,
     root = tmp_path / "project"
     root.mkdir()
 
-    def _fake_run(command, *, cwd, env, timeout):
+    def _fake_run(command, *, cwd, env=None, timeout):
         if command and command[0] == "git":
             return subprocess.CompletedProcess(command, 1, b"", b"")
         (root / "knowledge.json").write_text("{}", encoding="utf-8")   # 改到現場
@@ -1744,6 +1785,7 @@ def test_the_state_digest_still_runs_when_the_replay_child_blows_up(monkeypatch,
                 "verifier": {"oracle_kind": "manual", "checks": []},
             },
             model="llamacpp/m", env={}, timeout=30, keep_sessions=False,
+            client_config_path=tmp_path / "client.json",
         )
 
 
@@ -1828,7 +1870,7 @@ def test_raw_export_keeps_the_original_conversation_across_a_compaction():
     assert any(p.get("id") == "c1" and p.get("arguments") == '{"pattern": "NDA"}' for p in tool_parts)
     clean = session_eval.export_from_store("20260101T000000-abcdef01", records, sanitized=True)
     assert '"pattern"' not in json.dumps(clean, ensure_ascii=False)
-    assert session_eval.validate_opencode_export(raw) is raw
+    assert session_eval.validate_session_export(raw) is raw
 
 
 @pytest.mark.smoke
@@ -1850,26 +1892,63 @@ def test_the_routing_client_attempt_sends_the_requested_model(monkeypatch, tmp_p
 
     def _run(command, **kwargs):
         seen["command"] = list(command)
-        seen["env"] = dict(kwargs["env"])
+        assert "env" not in kwargs  # process_env.run 自己算環境;呼叫端只能給 overrides
+        seen["env"] = dict(kwargs.get("overrides") or {})
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(routing.subprocess, "run", _run)
+    monkeypatch.setattr(routing.process_env, "run", _run)
     routing._run_client_attempt(
         project=tmp_path, prompt="which tool?", model="llamacpp/expected-model",
-        environment={"AICODE_MODEL": "different-model", "PATH": os.environ.get("PATH", "")},
         timeout_seconds=5,
     )
     command = seen["command"]
     # 送的是客戶端真正用的 bare name:直接執行的 codetrail_chat.py 不會剝 llamacpp/。
     assert command[command.index("--model") + 1] == "expected-model"
-    assert command.index("--model") < command.index("run")
-    assert seen["env"]["AICODE_MODEL"] == "expected-model"
+    # `--model` / `--root` / `--policy` 全部是 `run` 子指令的旗標:頂層 parser
+    # 已經沒有它們(使用者入口只剩 -c / --session)。
+    assert command.index("run") < command.index("--model")
+    assert command.index("run") < command.index("--root")
+    # 環境不再由呼叫端交:`process_env.run()` 自己用 child_env() 算,呼叫端只能給
+    # overrides —— 而這一層一個 override 都不給(`--model` 只走 argv)。
+    assert seen["env"] == {}
 
 
 @pytest.mark.smoke
-def test_routing_probes_accept_the_same_model_forms_as_aicode():
+def test_the_routing_eval_child_environment_is_stripped(monkeypatch):
+    """逐題 client 的環境必須先剝掉 CodeTrail 的設定變數再交出去。
+
+    真實觸發:在一個 export 過 `AICODE_MODEL` / `AICODE_LLAMA_BASE_URL` 的殼層
+    (兩份安裝共用一台機器時,另一份的 `~/start.sh` 就會)跑 routing eval。
+    子行程讀到那些值,15 題實際上跑的是另一顆模型或另一台 server,而報告
+    掛的是這次指定的 identity。
+    """
+    import client_mcp
+
+    for name in ("AICODE_MODEL", "AI_CODE_PATCH", "CODETRAIL_CLIENT_CONFIG", "OPENCODE_API_KEY"):
+        monkeypatch.setenv(name, "leftover")
+    env = client_mcp.child_env()
+    for name in ("AICODE_MODEL", "AI_CODE_PATCH", "CODETRAIL_CLIENT_CONFIG", "OPENCODE_API_KEY"):
+        assert name not in env, name
+    assert "PATH" in env, "其餘使用者環境要保留(run_command 需要)"
+
+    # production 的組法就是這一個 —— 不是 `os.environ.copy()`。
+    source = (routing.REPO_ROOT / "scripts" / "eval_tool_routing.py").read_text(encoding="utf-8")
+    assert "os.environ.copy()" not in source
+    for name in ("scripts/session_eval.py", "scripts/tool_call_canary.py"):
+        text = (routing.REPO_ROOT / name).read_text(encoding="utf-8")
+        code = "\n".join(
+            line for line in text.splitlines() if not line.lstrip().startswith("#")
+        )
+        assert "os.environ.copy()" not in code, name
+
+
+@pytest.mark.smoke
+def test_routing_probes_accept_the_same_model_forms_as_aicode(monkeypatch):
     """`--model` 收 bare registry name / GGUF 路徑(同 `aicode -m`);舊式 llamacpp/ 仍接受,
     外部 provider 拒絕。以前 bare name 在連模型前就被 provider/model 語法檢查擋掉。"""
+    import config as codetrail_config
+
+    monkeypatch.setattr(codetrail_config, "LLAMA_BASE_URL", "http://localhost:8080")
     for form in ("expected-model", "llamacpp/expected-model", "/models/foo.gguf"):
         assert routing._model_server_base_url({}, model=form, environment={}) == "http://localhost:8080"
     with pytest.raises(routing.EvalError):
@@ -1899,3 +1978,240 @@ def test_every_direct_model_request_in_the_routing_eval_uses_the_normalised_mode
     assert "model=args.model," not in region
     assert region.count("model=configured_model,") == region.count("selected_model=configured_model,")
     assert region.count("model=probe_model,") >= 4        # base_url、token probe、canary、逐題 client
+
+
+@pytest.mark.smoke
+def test_the_session_eval_candidate_model_goes_out_as_argv(tmp_path, monkeypatch):
+    """candidate 模型必須真的進 `codetrail_chat.py run` 的 argv。
+
+    真實觸發:`scripts/session_eval.py run --model <candidate>` 評一顆與
+    deployment profile 不同的模型。以前 `_run_turn` 只把它放進子行程的
+    `AICODE_MODEL`;而那個子行程的環境在交出去之前已經被剝乾淨(`AICODE_*` 整組),
+    於是客戶端退回 deployment profile 的模型 —— 同一筆 candidate 的結果其實
+    來自另一顆模型,而報告上寫的是 candidate 的名字。
+    """
+    seen: dict = {}
+
+    payload = json.dumps({"type": "session", "session_id": "ses_candidate"})
+
+    def _fake_run(command, **kwargs):
+        seen["command"] = list(command)
+        seen["env"] = dict(kwargs.get("env") or {})
+        return subprocess.CompletedProcess(command, 0, payload.encode("utf-8"), b"")
+
+    monkeypatch.setattr(session_eval_cli, "_bounded_run", _fake_run)
+    session_eval_cli._run_turn(
+        root=tmp_path,
+        prompt="q",
+        model="llamacpp/candidate-model",
+        env={"AICODE_MODEL": "shell-leftover"},
+        timeout=5,
+        session_id=None,
+        client_config_path=tmp_path / "client.json",
+    )
+
+    command = seen["command"]
+    assert command[command.index("--model") + 1] == "candidate-model"
+    assert command.index("run") < command.index("--model")
+    # readonly 第二層也走 argv(以前是四個環境變數)。
+    assert command[command.index("--policy") + 1] == "readonly"
+    # replay 自己那份 client.json 同樣走 argv,不是 `CODETRAIL_CLIENT_CONFIG`。
+    assert "--client-config" in command
+
+
+# ── data flywheel 的落點:owner-only 三件套 + 被分析 repo 零落檔 ──
+
+
+def _flywheel(tmp_path, monkeypatch):
+    import config
+    import data_flywheel
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "home" / ".local" / "state"))
+    monkeypatch.setattr(config, "COLLECT_DATA", True)
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
+    return data_flywheel, project
+
+
+@pytest.mark.smoke
+def test_the_collected_data_never_lands_in_the_analysed_repo(tmp_path, monkeypatch):
+    """收集檔落在 state 目錄,而且目錄 0700 / 檔 0600。
+
+    以前預設是相對路徑 `data/interactions.jsonl`,而 MCP 以被分析的專案為 cwd
+    —— 一份逐字含 NDA 問答、引用片段與檔案路徑的 JSONL 就長在客戶的 repo 裡,
+    用的還是普通的 `open(..., 'a')`。
+    """
+    import stat as _stat
+
+    data_flywheel, project = _flywheel(tmp_path, monkeypatch)
+    before = {p for p in project.rglob("*")}
+
+    collector = data_flywheel.DataCollector(root=str(project))
+    collector.record(question="NDA 問題", answer="NDA 答案", refs=[])
+
+    assert {p for p in project.rglob("*")} == before, "被分析的 repo 不得多出任何檔"
+    target = collector.data_file
+    assert target.is_relative_to(tmp_path / "home" / ".local" / "state")
+    assert _stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+    assert _stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert len(collector.load_interactions()) == 1
+
+
+@pytest.mark.smoke
+def test_the_collected_data_file_is_never_read_or_rewritten_through_a_symlink(
+    tmp_path, monkeypatch, capsys
+):
+    """讀取與整份重寫都要走 owner-only 防線,不是普通的 `open()`。
+
+    只有 append 走防線是不夠的:`rate_interaction` 先讀再把**整份**寫回去,
+    中間那個名字被換成 symlink 的話,NDA 問答就寫進連結目標了。
+    """
+    data_flywheel, project = _flywheel(tmp_path, monkeypatch)
+    collector = data_flywheel.DataCollector(root=str(project))
+    collector.record(question="Q", answer="A", refs=[])
+    assert len(collector.load_interactions()) == 1
+    capsys.readouterr()
+
+    victim = tmp_path / "victim.jsonl"
+    victim.write_text("", encoding="utf-8")
+    target = collector.data_file
+    target.unlink()
+    target.symlink_to(victim)
+
+    assert collector.load_interactions() == [], "讀取端必須拒絕 symlink"
+    assert "symlink" in capsys.readouterr().out, "拒絕要講出來,不是靜默回空"
+
+    # 讀不到就沒有東西可以評分 —— 重點是連結目標一個 byte 都不會被寫入。
+    collector.rate_interaction(0, 1)
+    assert victim.read_text(encoding="utf-8") == ""
+    assert target.is_symlink(), "防線不得把 symlink 換掉(那也是一種寫入)"
+
+
+@pytest.mark.smoke
+def test_the_global_collector_partitions_by_the_declared_root_not_cwd(tmp_path, monkeypatch):
+    """`mcp_server --root /project-A` 的收集檔要落在 project-A 的分區。
+
+    全域 collector 以前是無參數 `DataCollector()`,雜湊的是 `os.getcwd()`:launcher
+    站在 checkout 目錄啟動 server,所有專案的 NDA 問答就落到同一個分區,而畫面
+    宣告的是另一個位置。
+    """
+    import data_flywheel
+
+    project = tmp_path / "project-A"
+    project.mkdir()
+    elsewhere = tmp_path / "checkout"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setattr(data_flywheel, "_collector", None)
+
+    collector = data_flywheel.get_collector(root=str(project))
+    assert collector.data_file.parent == data_flywheel.data_dir(project)
+    assert collector.data_file.parent != data_flywheel.data_dir(elsewhere)
+    # 之後不帶參數取用,拿到的仍是綁那個 root 的同一個。
+    assert data_flywheel.get_collector() is collector
+
+
+@pytest.mark.smoke
+def test_session_eval_forwards_skip_aux_preflight_to_the_replay_child(tmp_path, monkeypatch):
+    seen: dict = {}
+    payload = json.dumps({"type": "session", "session_id": "ses_x"})
+
+    def _fake_run(command, **kwargs):
+        seen["command"] = list(command)
+        return subprocess.CompletedProcess(command, 0, payload.encode("utf-8"), b"")
+
+    monkeypatch.setattr(session_eval_cli, "_bounded_run", _fake_run)
+    session_eval_cli._run_turn(
+        root=tmp_path, prompt="q", model="m", env={}, timeout=5, session_id=None,
+        client_config_path=tmp_path / "client.json", skip_aux_preflight=True,
+    )
+    assert "--skip-aux-preflight" in seen["command"]
+
+
+@pytest.mark.smoke
+def test_the_synthetic_kb_is_bound_to_the_synthetic_project_not_the_cli_root(tmp_path):
+    """catalog 的 command 已經帶 CLI 的 `--root`;準備合成 KB 時必須**換成**合成專案。
+
+    只在「沒有 --root 才附加」的話,MCP 仍綁 CLI root:root-canary 直接失敗,或
+    knowledge 灌進 CLI root,而 15 題 headless cases 卻在另一個 temp project 跑。
+    """
+    command = routing.StdioMcpCommand(
+        (sys.executable, "mcp_server.py", "--root", "/cli/root", "--skip-aux-preflight"), {}
+    )
+    args = routing._server_args_for_root(command, tmp_path / "synthetic")
+    assert args.count("--root") == 1
+    assert args[args.index("--root") + 1] == str(tmp_path / "synthetic")
+    assert "--skip-aux-preflight" in args
+    equals = routing.StdioMcpCommand((sys.executable, "mcp_server.py", "--root=/cli/root"), {})
+    args2 = routing._server_args_for_root(equals, tmp_path / "synthetic")
+    assert not any(a.startswith("--root=") for a in args2)
+    assert args2[args2.index("--root") + 1] == str(tmp_path / "synthetic")
+
+
+# ── 總審 F2-5:routing eval 的身分要在合成專案建好之後算 ──
+
+
+@pytest.mark.smoke
+def test_the_model_identity_is_built_inside_the_synthetic_project_block():
+    """身分要綁**實際跑 cases 的 root**(合成專案)。temp block 裡雖然重算了
+    `client_identity(project)`,但 `identity` 早在 block 外用 CLI root 建好 ——
+    dead assignment:結果、相容性斷言與 checkpoint 用的仍是舊身分。"""
+    import ast as _ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(routing.run))
+    tree = _ast.parse(source)
+    temp_blocks = [
+        node for node in _ast.walk(tree)
+        if isinstance(node, _ast.With)
+        and any("TemporaryDirectory" in _ast.unparse(item.context_expr) for item in node.items)
+    ]
+    assert len(temp_blocks) == 1, "model eval 應該只有一個合成專案的 temp block"
+    block = temp_blocks[0]
+    inside = range(block.lineno, block.end_lineno + 1)
+    identity_assignments = [
+        node for node in _ast.walk(tree)
+        if isinstance(node, _ast.Assign)
+        and any(isinstance(t, _ast.Name) and t.id == "identity" for t in node.targets)
+    ]
+    assert identity_assignments, "找不到 identity = ..."
+    outside = [n.lineno for n in identity_assignments if n.lineno not in inside]
+    assert not outside, f"identity 在合成專案建好之前就用 CLI root 算好了(行 {outside})"
+    project_version = [
+        n for n in _ast.walk(tree)
+        if isinstance(n, _ast.Assign)
+        and any(isinstance(t, _ast.Name) and t.id == "client_version" for t in n.targets)
+        and "client_identity(project)" in _ast.unparse(n.value)
+    ]
+    assert project_version and all(n.lineno in inside for n in project_version)
+    assert min(n.lineno for n in project_version) < min(n.lineno for n in identity_assignments)
+
+
+# ── 總審 F3-3:routing identity 不得綁到每次隨機的 temp 路徑 ──
+
+
+@pytest.mark.smoke
+def test_the_client_identity_is_stable_across_equivalent_synthetic_roots(tmp_path):
+    """system prompt 明文含「專案根目錄(沙箱邊界): <絕對路徑>」;合成專案每次在不同的
+    TemporaryDirectory,直接雜湊整份 prompt 就是每跑一次一個新身分 —— 第一次寫進
+    support-matrix 的 client_version,第二次在 assert_compatibility 直接炸。"""
+    a = tmp_path / "run-aaaa" / "synthetic"
+    b = tmp_path / "run-bbbb" / "synthetic"
+    for project in (a, b):
+        project.mkdir(parents=True)
+        (project / "AGENTS.md").write_text("# synthetic\n同一份內容\n", encoding="utf-8")
+    assert routing.client_identity(a) == routing.client_identity(b)
+    (b / "AGENTS.md").write_text("# synthetic\n不同的內容\n", encoding="utf-8")
+    assert routing.client_identity(a) != routing.client_identity(b)
+
+
+# ── 總審 F13-1:拿掉參數之後 `del` 裡的殘留名字 ──
+
+
+@pytest.mark.smoke
+def test_delete_sessions_runs_without_the_removed_environment_parameter(tmp_path):
+    """`_delete_sessions` 的 `environment` 參數拿掉了,函式體裡 `del session_ids, project,
+    environment` 卻還留著 → UnboundLocalError,整個 routing eval 在第一題就中止。"""
+    assert routing._delete_sessions((), project=tmp_path) is True

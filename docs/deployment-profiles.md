@@ -26,9 +26,10 @@ launcher CLI / environment
   > safe-defaults(內建)
 ```
 
-`AICODE_DEPLOYMENT_CONFIG=/absolute/path.json` 可在測試或多帳號環境改 local override
-位置。注意:產生的 `~/start.sh` 啟動時會刻意 unset 這批 runtime override(防
-`.bashrc` 殘留覆寫),`set_config.sh` 也只寫入預設路徑——長期設定這個變數會讓
+**啟動核心**(`~/start.sh` → launcher)另有一個 `AICODE_DEPLOYMENT_CONFIG` 可在
+測試或多帳號環境改 local override 位置;客戶端與 MCP 不看它。注意:產生的
+`~/start.sh` 啟動時會刻意 unset 這批 runtime override(防 `.bashrc` 殘留覆寫),
+`set_config.sh` 也只寫入預設路徑——長期設定這個變數會讓
 aicode/doctor 與 `~/start.sh` 各讀一份設定(set_config 偵測到會警告)。它適合
 一次性測試,不適合當常駐設定。
 
@@ -138,12 +139,12 @@ llama-server」；profile 的 `base_url` 控制的是「CodeTrail 把 request �
 任何 role 的 effective `base_url` 不是 loopback 時，CodeTrail 還要求顯式設定：
 
 ```bash
-export AICODE_MODEL_REMOTE_OK=1
+# ~/.config/codetrail/client.json:{ "model_remote_ok": true }
 ```
 
 沒有這個值，completion、chat、embedding、reranking、health、props 與 slots 都會
 fail-loud。設定它只表示接受資料送到該 endpoint，不會自動提供 TLS、認證、防火牆或
-VPN。Contextual Retrieval 的生成路徑另用 `AICODE_KB_CONTEXT_REMOTE_OK=1`，兩個 opt-in
+VPN。Contextual Retrieval 的生成路徑另用 `client.json` 的 `"kb_context_remote_ok"`，兩個 opt-in
 不互通。完整威脅邊界見 [security.md](security.md)。
 
 ## GPU precedence

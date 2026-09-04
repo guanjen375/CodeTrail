@@ -5,13 +5,13 @@
 """
 
 import os
+import process_env
 import re
 import sys
 import json
 import codecs
 import fnmatch
 import shlex
-import subprocess
 import shutil
 import tempfile
 from pathlib import Path
@@ -209,8 +209,8 @@ _RUN_COMMAND_TOOL = {
         "description": (
             "執行白名單命令。預設白名單=測試/靜態命令(pytest, ctest, npm test, cargo test, "
             "go test; mypy, tsc, ruff, black, isort, eslint, clang-format);"
-            "build 命令(make/cmake/ninja/meson/bazel build)只在 AI_CODE_ENABLE_BUILD_COMMANDS=1 "
-            "時加入;git 不在白名單(用 git_status / git_diff)。"
+            "build 命令(make/cmake/ninja/meson/bazel build)只在 client.json 的 "
+            "build_commands 打開時加入;git 不在白名單(用 git_status / git_diff)。"
             "timeout 1..600 秒(server 端上限;client 可能更早截止)。"
             "apply_patch 不會自動呼叫這裡:lint / test 要另行呼叫 run_lint(fix=False) / run_command。"
         ),
@@ -645,7 +645,7 @@ class ToolExecutor:
                 cmd.append("-i")
             cmd += ["--", pattern, str(target)]
             try:
-                result = subprocess.run(
+                result = process_env.run(
                     cmd,
                     cwd=str(self.root),
                     capture_output=True,
@@ -655,7 +655,7 @@ class ToolExecutor:
                 return result.returncode, result.stdout, result.stderr
             except FileNotFoundError:
                 return 2, "", "rg not found"
-            except subprocess.TimeoutExpired:
+            except process_env.TimeoutExpired:
                 return 2, "", "rg timeout"
 
         rc, stdout, stderr = _run(False)
@@ -957,7 +957,7 @@ class ToolExecutor:
           - 測試 / 靜態命令是預設白名單(pytest / ctest / npm test / cargo test / go test;
             mypy / tsc / ruff / black / isort / eslint / clang-format 等)。
           - build 命令(make / cmake / ninja / meson / bazel build)只在
-            AI_CODE_ENABLE_BUILD_COMMANDS=1 時由 mcp_server 加入。
+            client.json 的 build_commands 打開時加入(server 收 --enable-build-commands)。
           - git 不在白名單(用 git_status / git_diff)。
         apply_patch 不再自動呼叫這裡:lint / test 由模型另行、顯式呼叫,讓各自的核准閘生效。
 
@@ -968,7 +968,7 @@ class ToolExecutor:
                      非整數(含 bool)或超出範圍在 spawn 之前拒絕,容器模式同樣受檢。
         """
         if not config.RUN_COMMAND_ENABLED:
-            return "錯誤: run_command 功能已停用（設定 AI_CODE_RUN_TESTS=1 才會啟用）"
+            return "錯誤: run_command 功能已停用（這是 readonly session;互動 session 才會啟用）"
 
         # timeout 三層契約的 executor 層:int 且 1..600(bool 不算),在 spawn 之前拒絕;
         # 回顯輸入時截到 80 字元,不把任意長字串整段回送。
@@ -994,14 +994,14 @@ class ToolExecutor:
 
         try:
             print(f"   [RUN] 執行: {command}", file=sys.stderr)
-            result = subprocess.run(
+            result = process_env.run(
                 cmd_parts,
                 shell=False,
                 cwd=str(self.root),
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                env={**os.environ, 'PYTHONIOENCODING': 'utf-8'}
+                overrides={'PYTHONIOENCODING': 'utf-8'}
             )
 
             output = ""
@@ -1017,7 +1017,7 @@ class ToolExecutor:
             status = "✓ 成功" if result.returncode == 0 else f"✗ 失敗 (exit {result.returncode})"
             return f"=== {status} ===\n{output}" if output else f"=== {status} (無輸出) ==="
 
-        except subprocess.TimeoutExpired:
+        except process_env.TimeoutExpired:
             return f"錯誤: 命令超時 ({timeout} 秒)"
         except FileNotFoundError:
             return f"錯誤: 找不到命令 '{cmd_parts[0]}'"
@@ -1148,7 +1148,7 @@ class ToolExecutor:
         rollback)→ 同 process 的 syntax 驗證(由 _verify_patched_files 決定)。
         """
         if not config.PATCH_ENABLED:
-            return "✗ apply_patch 已停用（設定 AI_CODE_PATCH=1 才會啟用）"
+            return "✗ apply_patch 已停用（這是 readonly session;互動 session 才會啟用）"
         max_files = PATCH_MAX_FILES
         max_lines = PATCH_MAX_LINES_PER_FILE
         safe = patch_engine.safe_display
@@ -1898,17 +1898,17 @@ class ToolExecutor:
         "不需要 git 檢查,直接 apply_patch;不要重試 git_status / git_diff。"
     )
 
-    def _run_git(self, args: list, timeout: int) -> subprocess.CompletedProcess:
+    def _run_git(self, args: list, timeout: int) -> process_env.CompletedProcess:
         # LC_ALL=C:下面靠 stderr 的英文 "not a git repository" 判斷非 git 專案,
         # 使用者 LANG 是中文時 git 會翻譯訊息,判斷就落空。只影響訊息語言,
         # porcelain 的路徑引號規則(core.quotePath)與 locale 無關。
-        return subprocess.run(
+        return process_env.run(
             ['git', *args],
             cwd=str(self.root),
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={**os.environ, "LC_ALL": "C"},
+            overrides={"LC_ALL": "C"},
         )
 
     # git 對兩件不同的事說同一句 "not a git repository":
@@ -1922,7 +1922,7 @@ class ToolExecutor:
     # **成功**通知:改檔前的 git 檢查被跳過,現場既有的修改完全不會被看到。
     _GIT_DISCOVERY_FAILURE = "not a git repository (or any "
 
-    def _git_failure_message(self, result: subprocess.CompletedProcess, label: str) -> str:
+    def _git_failure_message(self, result: process_env.CompletedProcess, label: str) -> str:
         """把失敗的 git 命令翻成使用者訊息:跳過通知 vs 錯誤。
 
         不能只看失敗那條命令自己的 stderr —— `git diff` 對兩種情況印的是
@@ -1981,7 +1981,7 @@ class ToolExecutor:
 
         except FileNotFoundError:
             return "錯誤: 找不到 git 命令"
-        except subprocess.TimeoutExpired:
+        except process_env.TimeoutExpired:
             return "錯誤: git status 超時"
         except Exception as e:
             return f"錯誤: {type(e).__name__}: {e}"
@@ -2023,7 +2023,7 @@ class ToolExecutor:
 
         except FileNotFoundError:
             return "錯誤: 找不到 git 命令"
-        except subprocess.TimeoutExpired:
+        except process_env.TimeoutExpired:
             return "錯誤: git diff 超時"
         except Exception as e:
             return f"錯誤: {type(e).__name__}: {e}"
@@ -2035,12 +2035,12 @@ class ToolExecutor:
         fix=False → 走 LINT_COMMANDS[ext]['check']（只回報、不改檔）；
                     若該副檔名沒提供 check 命令，回錯誤而不是回頭跑 fix。
 
-        AI_CODE_PATCH=0 完全唯讀模式: fix=True 會改檔,必須一起擋下;
+        readonly session(PATCH_ENABLED=False): fix=True 會改檔,必須一起擋下;
         check-only(fix=False) 仍允許,只回報不寫檔。
         """
         if fix and not config.PATCH_ENABLED:
             return (
-                "錯誤: run_lint(fix=True) 已停用 (AI_CODE_PATCH=0,唯讀模式)。"
+                "錯誤: run_lint(fix=True) 已停用(readonly session)。"
                 "若只要檢查,改用 fix=False 跑 check-only。"
             )
 
@@ -2072,7 +2072,7 @@ class ToolExecutor:
 
             try:
                 print(f"   [LINT] 執行: {' '.join(cmd_parts)}", file=sys.stderr)
-                result = subprocess.run(
+                result = process_env.run(
                     cmd_parts,
                     cwd=str(self.root),
                     capture_output=True,
@@ -2097,7 +2097,7 @@ class ToolExecutor:
 
             except FileNotFoundError:
                 continue
-            except subprocess.TimeoutExpired:
+            except process_env.TimeoutExpired:
                 results.append(f"✗ {cmd_parts[0]}: 超時")
                 break
             except Exception as e:

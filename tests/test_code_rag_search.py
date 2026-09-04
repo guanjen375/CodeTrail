@@ -238,7 +238,8 @@ def test_context_mode_is_not_silently_capped_at_graph_8000(mcp_module, tmp_path)
 
 def test_context_telemetry_records_metadata_but_not_evidence_text(mcp_module, monkeypatch):
     recorded = []
-    monkeypatch.setattr(mcp_module.data_flywheel, "DATA_COLLECT_ENABLED", True)
+    # collect_data 是 client.json 的鍵(經 config),不是 module 常數/環境變數。
+    monkeypatch.setattr(mcp_module.data_flywheel, "collect_enabled", lambda: True)
     monkeypatch.setattr(
         mcp_module, "_record_kb_interaction", lambda **kwargs: recorded.append(kwargs)
     )
@@ -446,9 +447,11 @@ def mcp_module_isolated(monkeypatch, tmp_path: Path):
     """同 `mcp_module`,但 HOME / USERPROFILE / XDG_CONFIG_HOME 全指向 tmp_path
     (SEAMS S-E:新測試不得讀真實 ~/.config);root 另開 `repo/`,因為
     mcp_server 會拒絕 AICODE_ROOT == $HOME。既有 fixture 不動。"""
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / ".config").mkdir()
+    from tests._harness import seed_home
+
+    # HOME 指到 tmp 的同時要放一份 deployment.json:設定只來自檔案,空的 HOME
+    # 會讓 mcp_server 在 require_main_model() 掛掉。
+    home = seed_home(tmp_path / "home")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))

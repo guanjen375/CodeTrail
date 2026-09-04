@@ -4,7 +4,7 @@ CodeTrail 是一套本地 Code-RAG / RAG / MCP 後端,**以及它自己的聊天
 模型可以在受限的專案根目錄內搜尋與讀取程式碼、查已匯入的規格文件、分析圖片與
 firmware binary、建立 patch,並只透過白名單執行驗證命令。
 
-目前的主線入口是終端客戶端 `aicode`;`aicode_web` 是跨機瀏覽器用的實驗性入口。
+使用者入口只有一個:終端客戶端 `aicode`(全螢幕 TUI)。
 **部署不需要 Node / npm / opencode-ai** —— 客戶端是純 Python,與 MCP server 走
 同一份 `requirements.txt`。CodeTrail 定位為**成熟私有部署版**，適合本機、離線、NDA / firmware /
 private repo 分析；**不打算公開發布**成 PyPI package、Docker image 或 SaaS。安全
@@ -26,12 +26,11 @@ llama-server HTTP endpoint。
 | PDF 圖片監督 | **有原生證據**的表格 / 向量文字 log 走結構化抽取，帶驗證狀態；未驗證內容被 strict 查詢排除，可人工覆核 | `ingest_document(preflight_only=…)`、`review_figures` |
 | 修改與驗證 | 兩種 patch 格式（SEARCH/REPLACE、unified diff）共用 sandbox、上限與 byte-safe 寫入：最多 5 個檔案、單檔 200 行（udiff 算 added+removed；S/R 算 payload budget = SEARCH+REPLACE 行數）；套用後只做唯讀 syntax check（三態、不回滾）；lint / test 走各自的 ask 閘；`run_command`：timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止） | `apply_patch`、`run_lint`、`run_command` |
 | 行為教訓 | 使用者核准後跨 session 注入，90 天複審 | `record_lesson` |
-| Frontend | `aicode` 為穩定主線；`aicode_web` / `aicode attach` 為選用 | shell wrappers |
+| Frontend | 唯一入口 `aicode`(全螢幕 Textual TUI) | `aicode` wrapper |
 
 > [!IMPORTANT]
 > 「本地優先」不等於無條件保證資料不離機。遠端 llama-server 端點就會改變資料
-> 邊界(所以非 loopback 端點需要顯式 opt-in);web 模式暴露到 loopback 以外時,
-> 存取邊界就是那組密碼或 tailnet ACL。
+> 邊界(所以非 loopback 端點需要顯式 opt-in)。
 > NDA 場景請保留本文件的 provider / permission 鎖定，並先讀
 > [安全邊界](docs/security.md)與 [Responsible Use](RESPONSIBLE_USE.md)。
 
@@ -52,12 +51,11 @@ reranker / VL+mmproj，預設放 `~/models`）都已完成。之後只要：
 
 ```bash
 cd <CODETRAIL_REPO>                          # 1. 進 CodeTrail repo
-chmod +x ./aicode ./aicode_web               # 2. 讓啟動指令可執行
+chmod +x ./aicode                            # 2. 讓啟動指令可執行
 mkdir -p "$HOME/.local/bin"                  # 3. 準備使用者 bin 目錄
-ln -sfn "$PWD/aicode" "$HOME/.local/bin/aicode"       # 4. 安裝 TUI 指令
-ln -sfn "$PWD/aicode_web" "$HOME/.local/bin/aicode_web" #    安裝 web 指令
+ln -sfn "$PWD/aicode" "$HOME/.local/bin/aicode"  # 4. 安裝唯一的使用者指令
 export PATH="$HOME/.local/bin:$PATH"         # 5. 讓目前這個 shell 立即看得到使用者 bin
-command -v aicode aicode_web                 #    兩者都應顯示 ~/.local/bin/...
+command -v aicode                            #    應顯示 ~/.local/bin/aicode
 ./set_config.sh                              # 6. 一鍵設定(偵測 GPU/模型 → 互動問答 → 產生所有設定檔)
 ~/start.sh                                   # 7. 啟動四個 llama-server(tmux 背景)
 ```
@@ -69,26 +67,35 @@ cd <PROJECT_TO_ANALYZE>
 aicode        # CodeTrail 終端客戶端;/tools 應列出 19 個工具
 ```
 
-想改在**另一台電腦的瀏覽器**操作(實驗性 web 模式):A/B 機加入同一個 [Tailscale](https://tailscale.com/download) tailnet 後,同樣先 `cd <PROJECT_TO_ANALYZE>`,改跑 `aicode_web`,把印出的網址貼到 B 機瀏覽器;停止用 `aicode_web stop`。沒有 Tailscale 的 SSH fallback 與細節見 §5.4。
+要從別台電腦操作就用 SSH:登入這台機器之後照樣 `cd <PROJECT_TO_ANALYZE> && aicode`。
+想讓連線斷了也不中斷,把它跑在 `tmux` 裡(`tmux new -s codetrail`,斷線後 `tmux attach -t codetrail`)。
 
 - 第 5 步的 `export` 只處理目前 shell；§1.2 會把同一條 PATH 寫進 `~/.profile`，讓重新登入後仍生效。
 - `set_config.sh` 依 main → embedding → reranker → VL 分組問答；推薦值不是硬限制，
   寫入前會顯示摘要，舊設定有備份。完整問答與非互動旗標見 §3.1。
-- TUI / web 前四個 server 都必須 ready。`~/start.sh status|stop|logs|help` 是統一管理
+- 啟動 `aicode` 前四個 server 都必須 ready。`~/start.sh status|stop|logs|help` 是統一管理
   入口；重新啟動前先 stop。完整行為見 §3.2–§3.3。
-- 四個 server 預設只綁 `127.0.0.1`。同一專案不要同時開 standalone `aicode` 與
-  `aicode_web`；TUI 要接現有 web backend 時用 `aicode attach`。安全與 web 細節分別見
-  [docs/security.md](docs/security.md)與 §5.4。
+- 四個 server 預設只綁 `127.0.0.1`。安全細節見 [docs/security.md](docs/security.md)。
 - system prompt 由客戶端自組:內建基底規則(硬上限 1,600 字元)＋ MCP 工具路由圖
   ＋ 專案 `AGENTS.md` ＋ `.codetrail/lessons.md` ＋ 選用的
   `~/.config/codetrail/instructions.md`。**不要把完整工具清單或操作手冊貼進去** ——
   工具名稱、參數與用途以本輪 tool schema 為唯一真值,重複一份只會增加每輪 prompt。
-  要關掉專案內的那兩份就設 `CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1`。
-- **從舊版(OpenCode)升級的機器**:`./set_config.sh` 會偵測 CodeTrail 曾經寫進
-  `~/.config/opencode/opencode.json` 的壓縮受管值與 plugin 項,在寫完自己的設定後
-  **接著**還原並撤銷註冊(遷移自己有備份與原子替換;只還原現值仍等於 CodeTrail
-  寫入值的鍵;判不出狀態或遷移失敗都 exit 2,不會假裝成功)。先看一眼可跑
-  `python3 opencode_migrate.py --check`。
+  要關掉專案內的那兩份,在 `~/.config/codetrail/client.json` 設
+  `"project_instructions": false`。
+- **從舊版(OpenCode 世代)升級的機器**:CodeTrail 曾經寫過幾個值進
+  `~/.config/opencode/opencode.json`(壓縮受管值與兩個 plugin 項)。現在的 runtime
+  完全不碰那份設定,所以那些值**沒有人負責**——`compaction.auto=false` 會一直生效,
+  plugin 項指向的檔一旦被刪,你在其他專案開 OpenCode 都會失敗。解除它是**手動**
+  的一次性動作(有備份;只還原現值仍等於 CodeTrail 寫入值的鍵):
+
+  ```bash
+  cd <CODETRAIL_REPO>
+  python3 opencode_migrate.py --check   # 先看一眼,零寫入
+  python3 opencode_migrate.py           # 實際執行
+  ```
+
+  `python3 scripts/doctor.py` 也會唯讀偵測並印出同一組指令。同一台機器上還有另一份
+  CodeTrail 安裝時,接管紀錄若是那一份寫的,這裡一個 byte 都不會動(訊息會指向它)。
 
 ## 特別注意(首次部署最容易踩的)
 
@@ -100,12 +107,11 @@ aicode        # CodeTrail 終端客戶端;/tools 應列出 19 個工具
 > 3. **不要從 `$HOME` 或 `/` 啟動** —— 沙箱會直接拒絕。先 `cd` 進你要分析的**具體專案目錄**再跑。
 > 4. **換模型或主 n_ctx 就重跑 `./set_config.sh` + 重啟 server。** llama-server 一啟動就鎖死一顆模型與一個 `-c`;客戶端只會跟隨它,沒有「在對話裡換模型」這回事。主 n_ctx 只填一次;`set_config.sh` 寫進 deployment / server `-c`,`aicode` 啟動時觀測 `/props` 的實值並讓 CodeTrail 的 context 預算跟著它。
 > 5. **啟動後立即 rollback,先看 server log**:`~/start.sh` 前台只會回報 process 已結束,真正根因用 `~/start.sh logs main` 查看;新 GGUF 也可能需要更新並重新 build llama.cpp。詳細判讀與修復見 [docs/troubleshooting.md](docs/troubleshooting.md)。
-> 6. **CodeTrail 沙箱鎖在「你啟動的那個資料夾」(`AICODE_ROOT`)** —— 綁在 process 上,**不會跟著你在 UI 切資料夾或切對話而移動**。web UI 那顆「切換資料夾」按鈕對 CodeTrail 無效(切過去還是只讀啟動目錄)。換專案 = 到那個目錄重新啟動一個(TUI 重開 `aicode`;web 另起一個 backend)。
-> 7. **web 模式目前是實驗性的(開發中)** —— 穩定、proven 的主力是 standalone TUI(`aicode`);跨機器 web 的簡化入口是 `aicode_web`,低階前景入口才是 `aicode web`。
-> 8. **模型只有那 19 個 MCP 工具** —— 客戶端沒有內建的 `bash` / `read` / `write`,所以沙箱邊界就是 MCP server 的邊界。外部匯入與 lessons 是兩個受限例外,見 [docs/security.md](docs/security.md)。分析不信任 repo 時,那個 repo 自帶的 `AGENTS.md` 與 `.codetrail/lessons.md` 會進 system prompt;不想要就用 `CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1 aicode`。
-> 9. **首次 MoE 對話首字會慢(可能 1–2 分鐘),別按 Esc** —— 它在 page-in expert weights,不是當掉;slot / GPU 在動就是正常。
-> 10. **NDA / 衍生資料不要 commit**:`knowledge*.json`、`knowledge_emb.npz`、`*.jsonl`、`.codetrail/`、`data/`、`.aicode_uploads/`、`.opencode/` 與 Code-RAG cache / graph DB 等已在 `.gitignore`。commit 前同時看 `git status` 與 `git diff`；`.gitignore` 擋不住被改名或複製的內容。
-> 11. **任一步 FAIL 對應的修法見 [docs/troubleshooting.md](docs/troubleshooting.md)。**
+> 6. **CodeTrail 沙箱鎖在「你啟動的那個資料夾」** —— 綁在 process 上,**不會跟著你切對話而移動**。換專案 = 到那個目錄重新開一個 `aicode`。沒有 `--root`、沒有環境變數可以改它。
+> 7. **模型只有那 19 個 MCP 工具** —— 客戶端沒有內建的 `bash` / `read` / `write`,所以沙箱邊界就是 MCP server 的邊界。外部匯入與 lessons 是兩個受限例外,見 [docs/security.md](docs/security.md)。分析不信任 repo 時,那個 repo 自帶的 `AGENTS.md` 與 `.codetrail/lessons.md` 會進 system prompt;不想要就在 `~/.config/codetrail/client.json` 設 `"project_instructions": false`。
+> 8. **首次 MoE 對話首字會慢(可能 1–2 分鐘),別按 Esc** —— 它在 page-in expert weights,不是當掉;slot / GPU 在動就是正常。
+> 9. **NDA / 衍生資料不要 commit**:`knowledge*.json`、`knowledge_emb.npz`、`*.jsonl`、`.codetrail/`、`data/`、`.aicode_uploads/` 與 Code-RAG cache / graph DB 等已在 `.gitignore`。commit 前同時看 `git status` 與 `git diff`；`.gitignore` 擋不住被改名或複製的內容。
+> 10. **任一步 FAIL 對應的修法見 [docs/troubleshooting.md](docs/troubleshooting.md)。**
 
 ---
 
@@ -142,8 +148,10 @@ CodeTrail 有自己的終端客戶端(`codetrail_chat.py`,由 `aicode` 啟動),�
 與 MCP server 共用同一份 `requirements.txt`。上一節裝 Node 只是為了其他用途,
 CodeTrail 本身不需要它。
 
-已經裝過 `opencode-ai` 的機器不必移除,但升級後請跑一次 `./set_config.sh` ——
-它會把 CodeTrail 曾經寫進你 OpenCode 設定的東西還原並撤銷註冊(見 §3.1)。
+已經裝過 `opencode-ai` 的機器不必移除,但升級後請**手動**跑一次
+`python3 opencode_migrate.py` —— 它會把 CodeTrail 曾經寫進你 OpenCode 設定的東西
+還原並撤銷 plugin 註冊(有備份;只還原現值仍等於 CodeTrail 寫入值的鍵)。
+`./set_config.sh` **不會**順帶做這件事:runtime 一個模組都不碰 OpenCode 的設定。
 
 ### 1.3 安裝 CodeTrail Python 依賴
 
@@ -342,10 +350,9 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 範本；使用者不需要取得維護者的 dotfiles。照本節執行會依自己的模型、GPU 與 Python
 產生一套相容設定，而不是複製維護者的私有路徑或 UUID。
 
-正常路徑只讀 `~/.config/codetrail/`。如果 shell 仍設著舊的
-`OPENCODE_CONFIG=/其他位置/opencode.json`，遷移工具會改讀／改寫
-那一份並在設定摘要提示；不打算使用自訂位置時，先 `unset OPENCODE_CONFIG`，避免以為改了
-預設檔但 runtime 實際讀另一份。`~/.config/opencode/` 裡其他備份或測試 JSON 不會自動載入。
+正常路徑只讀 `~/.config/codetrail/`。runtime 完全不讀 `~/.config/opencode/` —— 唯一會碰
+它的是手動執行的 `python3 opencode_migrate.py`(見「從舊版升級」),而那支工具會尊重
+`python3 opencode_migrate.py --config <path>` 指定的自訂位置。
 
 ### 3.1 `./set_config.sh` 做什麼
 
@@ -363,7 +370,7 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
    | `[4/5]` VL | 模型 → GPU → mmproj → **CPU-MoE 層數** |
    | `[5/5]` 壓縮模式 🧪 | `codetrail` / `manual` / `off`(見 [docs/compaction-rules.md](docs/compaction-rules.md);前兩者仍在測試階段) |
 
-   **`[5/5]` 壓縮模式**決定客戶端什麼時候把長對話換成一段結構化摘要。**🧪 `codetrail` / `manual` 是實驗功能(開發中、仍在測試階段):摘要規則與觸發門檻可能再變。沒有 `~/.config/codetrail/client.json` 就等於沒有接管,`git pull` 不會自己啟用。** `codetrail` 的觸發點在「助理答完、對話進 idle」之後,所以摘要不會插在你的問題前面;`manual` 用同一套規則但只在你按 `/compact` 時執行;`off` 完全不壓縮——context 滿了會是一個**可見的錯誤**,不會自動補救。三種模式都附帶兩個「一路上少放一點進 context」的措施:**舊回合的 assistant reasoning 不送進模型**(最新一則問題之後的照留;要關掉設 `CODETRAIL_KEEP_REASONING=1`)、以及**舊工具輸出剪枝**(很舊的工具結果在模型視野裡換成一行,session 檔與畫面上的原文不動)。兩者與代價見 [docs/compaction-rules.md §6](docs/compaction-rules.md)。這一題沒有預設值。**非互動**用 `--compaction-mode {codetrail,manual,off}`;`--yes` 沒給這個旗標時沿用 `client.json` 記錄的選擇,**還沒選過就完全不碰壓縮設定**。
+   **`[5/5]` 壓縮模式**決定客戶端什麼時候把長對話換成一段結構化摘要。**🧪 `codetrail` / `manual` 是實驗功能(開發中、仍在測試階段):摘要規則與觸發門檻可能再變。沒有 `~/.config/codetrail/client.json` 就等於沒有接管,`git pull` 不會自己啟用。** `codetrail` 的觸發點在「助理答完、對話進 idle」之後,所以摘要不會插在你的問題前面;`manual` 用同一套規則但只在你按 `/compact` 時執行;`off` 完全不壓縮——context 滿了會是一個**可見的錯誤**,不會自動補救。三種模式都附帶兩個「一路上少放一點進 context」的措施:**舊回合的 assistant reasoning 不送進模型**(最新一則問題之後的照留;要關掉在 `client.json` 設 `"keep_historical_reasoning": true`)、以及**舊工具輸出剪枝**(很舊的工具結果在模型視野裡換成一行,session 檔與畫面上的原文不動)。兩者與代價見 [docs/compaction-rules.md §6](docs/compaction-rules.md)。這一題沒有預設值。**非互動**用 `--compaction-mode {codetrail,manual,off}`;`--yes` 沒給這個旗標時沿用 `client.json` 記錄的選擇,**還沒選過就完全不碰壓縮設定**。
 
    **CPU-MoE 沒有 y/n 分流**:直接問「幾層 experts 留 RAM」,**`0` = 不 offload(experts 全留 GPU)**、`N` = 前 N 層留 RAM(`--n-cpu-moe N`)、輸入 **≥ 層數上限 = 全部留 RAM**(等同 `--cpu-moe`)。提示只有兩行:**數值越大 GPU 負載越低**,以及一個**推薦區間**——下界是權重剛好放得進這顆 GPU 目前 free VRAM 的層數、上界是全部移到 RAM(例如 `推薦數值:38-43`)。這個估算只算 GGUF 權重,沒有 KV cache / compute buffer / 共卡的附屬服務,所以是起點而不是保證。工具讀 GGUF tensor table 判斷:**不是 MoE(沒有 expert tensors)就不問**,並印出原因(dense 模型 offload 幾層都沒有意義)。main 與 VL 各問一次;embedding / reranker 永遠不套用。**VL 一旦套用 CPU-MoE,llama.cpp 的 `--fit` 就會失效**(它見到 tensor override 已被設定就直接放棄),所以工具會改寫 `-ngl 99 --fit off` 而不是假裝有 `--fit-target` 保護——這種情況沒有自動退讓的安全網,層數填太低會 OOM。
 
@@ -415,9 +422,9 @@ python3 opencode_migrate.py --check
 ~/start.sh --dry-run
 ```
 
-前兩條應分別顯示 profile `valid`，以及遷移工具回報「沒有需要遷移的東西」（不能有
-`MISSING` / `STALE` / `INVALID`）；dry-run 應正常列出四個 server command。三項都符合，
-就不必只因檔案日期較舊而重建。
+前兩條應分別顯示 profile `valid`，以及 `opencode_migrate.py --check` 回報「沒有需要遷移
+的東西」（那支工具零寫入；有東西要處理時它會列出來，見「從舊版升級」）；dry-run 應正常
+列出四個 server command。三項都符合，就不必只因檔案日期較舊而重建。
 
 若檢查要求補新欄位、Python / `LLAMA_BIN` 路徑已換、模型 / GPU / 主 n_ctx 要改，才重跑
 `./set_config.sh`。重跑會重新詢問硬體選擇；先記下現值或用 `~/start.sh --dry-run` 留存摘要，
@@ -496,6 +503,29 @@ tmux ls
 
 `./set_config.sh` 產生的就是本節這些檔案。手動微調、換機部署、或想理解機制時再看這節。
 
+### 4.0 設定在哪裡
+
+CodeTrail 的設定**只有三個來源,全部是檔案**。沒有第四個 —— 客戶端與 MCP server
+不從環境變數取任何設定,殼層裡殘留的 `AICODE_*` / `AI_CODE_*` / `CODETRAIL_*`
+對它們一律無效(同一台機器有兩份安裝時,那正是「以為在跑 A、實際在跑 B」的機制)。
+
+| 來源 | 位置 | 放什麼 | 誰改 |
+|---|---|---|---|
+| repo 常數 | `config.py` | 所有使用者都該一致的值:context 門檻、輸出上限、逾時、取樣參數、工具預算 | 改 repo(所有人一起變) |
+| 每台機器 | `~/.config/codetrail/deployment.json`＋`models.json` | server 與端點、GPU 擺位、主模型、n_ctx、model registry | `./set_config.sh` |
+| 每個使用者 | `~/.config/codetrail/client.json` | 壓縮模式、工具權限覆寫、下面 §4.3 那組開關 | `./set_config.sh`(或自己編輯) |
+
+行程之間一律用 **argv** 交接,不用環境變數:
+`aicode` → `codetrail_chat.py` → `mcp_server --root/--readonly/--n-ctx`。
+子行程的環境在交出去之前會把那四個前綴整組剝掉。
+
+被分析的專案裡的 `.codetrail/` **只放輸出**(`lessons.md`、metrics、cache),
+不放任何開關 —— 被分析的 repo 不可信。
+
+**唯一的例外是啟動核心**(`~/start.sh` → `scripts/launch_servers.py`):
+它的設定契約本來就是環境變數(`AICODE_MODEL`、`LLAMA_BIN`、`MAIN_GPU` 等),
+那條線沒有變,也不影響客戶端。
+
 ### 4.1 Deployment profile
 
 四個 server 共用同一份嚴格 deployment profile(單一事實來源;`aicode`、doctor、啟動前 preflight、status 與所有 launcher 都讀它)。優先序固定為:
@@ -504,20 +534,24 @@ tmux ls
 launcher CLI / env > ~/.config/codetrail/deployment.json local override > 選用 profile > 安全相容預設
 ```
 
-安全基底 `safe-defaults` 直接內建在 `deployment_profile.py`(不宣稱硬體的向下相容預設,含 port、base_url 與附屬模型預設);`set_config.sh` 產生的 `~/.config/codetrail/deployment.json` 疊在上面。要做一次性實驗設定,`AICODE_PROFILE` 可指向絕對路徑 `.json` profile(用 `"extends": "defaults"` 繼承基底),不設定時就是基底加上你的 local override。
+安全基底 `safe-defaults` 直接內建在 `deployment_profile.py`(不宣稱硬體的向下相容預設,含 port、base_url 與附屬模型預設);`set_config.sh` 產生的 `~/.config/codetrail/deployment.json` 疊在上面。要做一次性實驗設定,在 `deployment.json` 的 `profile` 欄位填一個絕對路徑 `.json` profile
+(用 `"extends": "defaults"` 繼承基底);沒填時就是基底加上你的 local override。
 
 手動啟動範例(等價於 `~/start.sh` 做的事):
 
 ```bash
 cd <CODETRAIL_REPO>
-export AICODE_MODEL=<CODE_MODEL>
-export MAIN_GPU=<主模型_GPU_UUID_或_INDEX>
-export AUX_GPU=<附屬模型_GPU_UUID_或_INDEX>   # EMBED_GPU / RERANK_GPU / VL_GPU 可個別覆寫
-
+# 以下是**啟動核心**(`~/start.sh` → launcher)的介面,它的設定契約就是環境變數。
+# 客戶端與 MCP 不讀這些:它們的設定只來自 `~/.config/codetrail/` 底下那三個檔。
+AICODE_MODEL=<CODE_MODEL> \
+MAIN_GPU=<主模型_GPU_UUID_或_INDEX> \
+AUX_GPU=<附屬模型_GPU_UUID_或_INDEX> \
 python3 scripts/launch_servers.py --scope all --dry-run   # 先看最終參數;不啟動、不連網
+                                                          # EMBED_GPU / RERANK_GPU / VL_GPU 可個別覆寫
+
 python3 scripts/launch_servers.py --scope all             # 啟動四個 tmux server,嚴格驗證 role / GPU / model / ctx / health
 python3 scripts/check_status.py --strict
-AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py
+python3 scripts/doctor.py                                 # doctor 讀 ~/.config/codetrail/ 的設定,不吃環境變數
 ```
 
 `~/.config/codetrail/deployment.json` 可持久做局部覆寫(`profile` 欄位維持 `set_config.sh` 寫入的 `defaults` 即可):
@@ -538,7 +572,7 @@ AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py
 AICODE_MODEL=<CODE_MODEL> python3 deployment_profile.py show
 ```
 
-`AICODE_RERANK_FALLBACK_POLICY` 只控制啟動後 reranker 呼叫失敗時的行為;啟動前 preflight 仍要求 reranker server ready:
+`config.RERANK_FALLBACK_POLICY`(repo 常數;改它是改 repo)只控制啟動後 reranker 呼叫失敗時的行為;啟動前 preflight 仍要求 reranker server ready:
 
 | policy | RAG 知識庫 fallback | Code RAG fallback |
 |---|---|---|
@@ -546,13 +580,13 @@ AICODE_MODEL=<CODE_MODEL> python3 deployment_profile.py show
 | `main_model` | 還原舊行為,用主聊天模型做 LLM rerank | 等同 `embedding`(Code RAG 沒有主模型 rerank 路徑) |
 | `error` | 直接報錯,不靜默降級 | 直接報錯 |
 
-預設是 `error`:專用 reranker 不可用或呼叫失敗就直接報錯。`main_model` 可能很貴:嚴格模式下每條符合條件的 RAG query 都可能觸發主模型 rerank。只有你明確接受這個成本時才設定 `AICODE_RERANK_FALLBACK_POLICY=main_model`。
+預設是 `error`:專用 reranker 不可用或呼叫失敗就直接報錯。`main_model` 可能很貴:嚴格模式下每條符合條件的 RAG query 都可能觸發主模型 rerank。只有你明確接受這個成本時才在 `client.json` 設 `"rerank_fallback_policy": "main_model"`。
 
-**遠端模型端點需要顯式 opt-in(`AICODE_MODEL_REMOTE_OK`)**:CodeTrail 對 llama-server 的所有呼叫(completion / chat / embedding / reranking / props / slots / health)在送出前都會檢查端點——loopback 無條件放行;base_url 指向非 loopback 的機器時,必須先 `export AICODE_MODEL_REMOTE_OK=1`,否則呼叫直接報錯(fail-loud,錯誤訊息會印這個 env 名)。這是刻意的安全 migration:prompt 可能含 NDA 程式碼與文件內容,不能因為 profile 填了一個遠端 IP 就靜默外送。既有的遠端部署升級後會先報錯,設一次 env 即恢復。模型流量同時不讀環境 proxy(`trust_env=False`)、不跟隨任何 HTTP redirect(3xx 一律報錯)。KB chunk 脈絡生成(Contextual Retrieval)另有獨立的 `AICODE_KB_CONTEXT_REMOTE_OK`,兩者不互通。`python3 scripts/doctor.py` 會在啟動前檢查這條(非 loopback 端點 + 未設 opt-in = FAIL)。
+**遠端模型端點需要顯式 opt-in(`client.json` 的 `model_remote_ok`)**:CodeTrail 對 llama-server 的所有呼叫(completion / chat / embedding / reranking / props / slots / health)在送出前都會檢查端點——loopback 無條件放行;base_url 指向非 loopback 的機器時,必須先在 `~/.config/codetrail/client.json` 設 `"model_remote_ok": true`,否則呼叫直接報錯(fail-loud,錯誤訊息會印那個鍵名)。這是刻意的安全預設:prompt 可能含 NDA 程式碼與文件內容,不能因為 profile 填了一個遠端 IP 就靜默外送。模型流量同時不讀環境 proxy(`trust_env=False`)、不跟隨任何 HTTP redirect(3xx 一律報錯)。KB chunk 脈絡生成(Contextual Retrieval)另有獨立的 `kb_context_remote_ok`,**兩個鍵不互通**:前者放行的是 prompt,後者等於整份文件離機。`python3 scripts/doctor.py` 會在啟動前檢查這條(非 loopback 端點 + 未 opt-in = FAIL)。
 
 ### 4.2 Model registry(短名稱 → GGUF 路徑)
 
-讓 `AICODE_MODEL=<CODE_MODEL>` 這種短名稱自動對應到實際 GGUF 路徑,不用每次打絕對路徑:
+讓 `deployment.json` 的 `main.model` 寫短名稱就能對應到實際 GGUF 路徑,不用每次打絕對路徑:
 
 ```bash
 mkdir -p ~/.config/codetrail
@@ -567,7 +601,7 @@ registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf`
 
 ### 4.3 客戶端設定(`~/.config/codetrail/client.json`)
 
-`./set_config.sh` 的第 5 題會寫這一份。它只放兩件**使用者顯式選過**的事:
+`./set_config.sh` 的第 5 題會寫這一份。它是**每個使用者**的開關集中地:
 
 ```json
 {
@@ -582,17 +616,40 @@ registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf`
   **沒有這個檔就等於沒有接管**,客戶端退成 `manual` 並在啟動橫幅講明。
 - `permission`:每個工具的核准覆寫(`allow` / `ask` / `deny`),不寫就用預設。
 
+其餘的鍵都有預設值,`set_config.sh` 不會問、也不會刪掉你自己加的:
+
+| 鍵 | 預設 | 作用 |
+|---|---|---|
+| `model_remote_ok` | `false` | 主模型端點非 loopback 時才放行送出 **prompt** |
+| `kb_context_remote_ok` | `false` | KB chunk 脈絡生成非 loopback 時才放行送出**整份文件的窗**。與上面是**兩個鍵**:資料範圍不同的同意不得合併 |
+| `external_import` / `external_import_roots` | `false` / `["~/Downloads", "/tmp"]` | 允許 `import_external_file`,以及允許的來源根目錄。開了之後每一次匯入**仍要人工核准** |
+| `build_commands` | `false` | 把 make / cmake / ninja / meson / bazel 掛進 `run_command` 白名單。它們會跑專案內的 build script = 任意程式碼執行,所以只在分析自己的專案時開 |
+| `rerank_fallback_policy` | `"error"` | reranker 掛掉時的行為(`error` / `embedding` / `main_model`) |
+| `project_instructions` | `true` | 讀不讀被分析專案的 `AGENTS.md` 與 `.codetrail/lessons.md`。分析不信任 repo 時設 `false` |
+| `objdump` | `""` | 反組譯用的 objdump 路徑(跨架構韌體時指定 binutils-`<triplet>`) |
+| `h_lang` | `"c"` | `.h` 當 C 還是 C++ 解析(`c` / `cpp`) |
+| `collect_data` | `false` | 把問答寫進 `~/.local/state/codetrail/data/<root 雜湊>/`(0700 / 0600,**絕不落進被分析的 repo**) |
+| `use_container` | `false` | 在容器裡跑 `run_command` |
+| `show_reasoning` | `false` | `/thinking` 的**初始值**,只管畫面 |
+| `keep_historical_reasoning` | `false` | 舊回合的 assistant reasoning 要不要送進模型。與上面是**兩個鍵**:`/thinking` 只改畫面,不得動這個 |
+
+未知的鍵一律 fail-loud(拼錯不會靜默失效);布林鍵只收真的 `true` / `false`
+(`"false"` 是一個非空字串,不是 false)。
+
 檔案是 0600:它決定寫入工具要不要人工核准,能被別人改就等於能繞過核准。
+位置只由 `HOME` 推導,**沒有覆寫變數** —— 一個環境變數就能把 `apply_patch`
+從 ask 翻成 allow 的話,「每次寫檔都會問」就不成立了。
 
 #### 工具權限預設
 
-唯讀工具直接執行;下面六個每次都會跳核准框,框裡**完整顯示參數**(含整份 patch):
+唯讀工具直接執行;下面七個每次都會跳核准框,框裡**完整顯示參數**(含整份 patch):
 `apply_patch`、`run_lint`、`run_command`、`remove_document`、`record_lesson`、
-`review_figures`。
+`review_figures`、`import_external_file`(框裡另外列出實際落點)。
 
 評測與啟動抽查走的是另一條 policy(`--policy readonly`):凡是 `tools/list` 沒有
 標 `readOnlyHint` 的工具一律 deny,而且 MCP server 那一層也會關掉寫入與執行
-(`AI_CODE_PATCH=0` / `AI_CODE_RUN_TESTS=0`)——兩層都在,繞過一層仍然寫不進去。
+(`mcp_server --readonly`,一個 argv 旗標)——兩層都在,繞過一層仍然寫不進去,
+而且殼層裡殘留的任何變數都翻不回來。
 
 #### MCP 呼叫的 read timeout
 
@@ -607,10 +664,10 @@ instance(server 自己的 handler 會收乾淨 ingest 子行程)。
 ### 5.1 跑 doctor 自檢
 
 ```bash
-AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py
+python3 scripts/doctor.py                                 # doctor 讀 ~/.config/codetrail/ 的設定,不吃環境變數
 ```
 
-(把 `<CODE_MODEL>` 換成你的 registry key —— `set_config.sh` 結尾的設定摘要有印,或看 `~/.config/codetrail/models.json`)
+(doctor 讀 `~/.config/codetrail/` 的 deployment / models / client 三個檔;主模型設了哪顆看 `set_config.sh` 結尾的設定摘要,或 `~/.config/codetrail/models.json`)
 
 預期結尾看到 `PASS=2x WARN=x FAIL=0`。常見可忽略的 WARN:
 
@@ -628,18 +685,24 @@ cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-`aicode` 不用帶參數:主模型會依「env `AICODE_MODEL` > `-m` 旗標 > deployment.json」解析,`set_config.sh` 已把最後一項設好。
+`aicode` 不用帶參數,而且**只接受**三個:`-c` / `--continue`(接續這個專案最近一次的
+對話)、`--session <id>`、`-h` / `--help`。沙箱 root 一律是目前目錄,主模型只來自
+`deployment.json` 的 `main.model`(`set_config.sh` 已經設好)——沒有 `-m`、沒有 `--root`、
+沒有任何環境變數可以改它。換模型 = 重跑 `./set_config.sh` 再重啟 server。
 
-啟動前置全部通過後會倒數 3 秒才進客戶端(它一接管畫面就會蓋掉前面的檢查訊息)。
-不想等就 `AICODE_LAUNCH_DELAY=0 aicode`;輸出不是終端機(導向檔案、被腳本收 stdout)時不倒數。
+啟動前置(profile 驗證、主模型、n_ctx 觀測、ctx 容量閘、lessons、附屬 server、工具健檢)
+的輸出會留在對話區第一則,所以 TUI 接管畫面之後仍然看得到。
 
 要讓模型讀專案外的附件(`~/Downloads` 的 log / 截圖 / spec)就多加一個開關:
 
-```bash
-AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
+在 `~/.config/codetrail/client.json` 設:
+
+```json
+{ "external_import": true, "external_import_roots": ["~/Downloads", "/tmp"] }
 ```
 
-來源白名單(`AI_CODE_IMPORT_ROOTS`)等細節見 [docs/basic-usage.md](docs/basic-usage.md)。第一次先照上面最短的指令跑起來就好。
+開了之後**每一次**匯入仍然要人工核准(核准框會顯示來源與目的路徑)。細節見
+[docs/basic-usage.md](docs/basic-usage.md)。第一次先照上面最短的指令跑起來就好。
 
 ### 5.3 簡單測試
 
@@ -759,39 +822,6 @@ preflight 零寫入;它會估算所有結構化候選，包含純 raster 的分�
 [docs/rag.md](docs/rag.md#只有-knowledgejson-要管)。
 
 更多操作模式(夾帶附件、注入 RAG、查 spec)見 [docs/basic-usage.md](docs/basic-usage.md);完整 19 個工具清單見 [docs/mcp-tools.md](docs/mcp-tools.md);被你糾正過的行為怎麼變成之後 session 都遵守的規則,見 [docs/lessons.md](docs/lessons.md)。
-
-### 5.4 Web 模式(目前測試中)
-
-> ⚠️ **CodeTrail 的沙箱綁在「你啟動 backend 的那個資料夾」(`AICODE_ROOT`)—— 綁在 process 上,不會跟著對話移動。** 換專案時先 `aicode_web stop`,再到新專案目錄重開。
->
-> (TUI 沒有這顆切換器,你 `cd 專案 && aicode` 在裡面開幾個對話都是鎖在同一個專案,自然不會錯亂;換專案就重開一個 `aicode`。)
-
-`aicode_web` 指令本身在 Quick Start 步驟 2–5 已隨 `aicode` 一併安裝(`command -v aicode_web` 應有輸出)。前提只有兩個:
-
-- A 機(跑模型、可只有文字終端)和 B 機(有 GUI / 瀏覽器)已安裝 [Tailscale](https://tailscale.com/download)、登入同一個 tailnet。
-- A 機已先執行 `set_config.sh` 產生的模型啟動檔:標準位置跑 `~/start.sh`；若你把它放在桌面,就在桌面目錄跑 `./start.sh`。四個 llama-server 要先 ready。
-
-之後每次只做:
-
-```bash
-# A 機
-cd <PROJECT_TO_ANALYZE>
-aicode_web
-```
-
-`aicode_web` 會自動讀取 A 機當下的 Tailscale IPv4、只把 backend 綁到該位址,先在**前景**跑一輪與 `aicode` 完全相同的 preflight(設定、主模型、server、工具健檢;有問題當場擋下,不用等背景),通過後在背景 tmux 啟動 backend,最後印出例如 `http://100.x.y.z:4096/`。A 機沒有瀏覽器完全沒關係；B 機只要把這個網址貼進瀏覽器。重跑同一個命令會沿用同專案的 backend；停止用:
-
-```bash
-aicode_web stop
-```
-
-這條路徑不綁 `0.0.0.0`、不開 LAN / 公網介面，也不需要設定 Tailscale Serve / Funnel / HTTPS 憑證。網址雖是 `http://`,封包仍在 Tailscale 的加密隧道內；存取權由 tailnet ACL 決定。共享或多人 tailnet 請確認 ACL 只允許預期的 B 機。**絕不可改用 `tailscale funnel`**，它會公開到 Internet。
-
-**沒裝 / 不想裝 Tailscale 的 fallback** —— 在 A 機從專案目錄跑 `aicode_web --local`(只綁 loopback)，B 機建立 SSH port-forward 後開 `http://127.0.0.1:4096`:
-
-```bash
-ssh -L 4096:127.0.0.1:4096 <你的帳號>@<server 位址>
-```
 
 ## 文件地圖
 

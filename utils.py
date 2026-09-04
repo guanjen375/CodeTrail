@@ -11,12 +11,13 @@ import fnmatch
 from pathlib import Path
 
 import config
+import config as _config
 import context_budget
 import llama_client
 
 from config import (
     LLAMA_BASE_URL,
-    N_CTX, NUM_CTX_FULL_MODE,
+    NUM_CTX_FULL_MODE,
     CODE_EXTENSIONS, IGNORED_DIRS, IGNORED_FILES, IGNORED_PATTERNS,
     ALLOWED_DOT_DIRS,
     STRICT_MODE, STRICT_MODE_KEYWORDS, SPEC_QUESTION_KEYWORDS,
@@ -266,9 +267,9 @@ def print_ctx_usage(chars: int) -> bool:
     Returns:
         bool: 是否超過 100%（會被截斷）
     """
-    from config import CHARS_PER_TOKEN, N_CTX
+    from config import CHARS_PER_TOKEN
     tokens = int(chars / CHARS_PER_TOKEN)
-    pct = tokens * 100 / N_CTX
+    pct = tokens * 100 / _config.N_CTX
 
     if pct >= 100:
         print(f"   [CTX] ~{tokens:,} tokens ({pct:.0f}%) ⚠️ 超出上限，將被截斷！")
@@ -283,11 +284,13 @@ def print_ctx_usage(chars: int) -> bool:
 def _default_ctx_budget() -> int:
     """internal LLM call 的預設 ctx 預算 = 主 llama-server 的真實 n_ctx。
 
-    aicode 由 server /props 取得 n_ctx 後透過 AICODE_N_CTX 帶入；未經 wrapper
-    時則使用 effective deployment profile 的 main.ctx。所有舊 alias 都派生自
-    這一值，因此不再需要在兩個可漂移的上限之間取 min。
+    **每次讀 `config.N_CTX`,不做 import 期快照**(AGENTS.md §3:動態值只用
+    `import config`)。`mcp_server` 收到 `--n-ctx <觀測值>` 之後會覆寫
+    `config.N_CTX`,而那個覆寫發生在這個模組 import 之後 —— 快照的話
+    `query_knowledge_strict` 會拿 deployment profile 的舊值當上限,於是
+    llama-server 從 prompt 前面靜默截掉。
     """
-    return N_CTX
+    return _config.N_CTX
 
 
 def call_llm(prompt: str, temperature: float = 0.2, num_ctx: int = None,
@@ -345,7 +348,7 @@ def _llm_error_message(e: Exception, model: str) -> str:
             f"[ERROR] 無法連接 llama-server ({LLAMA_BASE_URL})。\n"
             f"   1. 主 llama-server 是否啟動?(預期 port 8080)\n"
             f"   2. 防火牆 / port 是否被擋?\n"
-            f"   3. AICODE_LLAMA_BASE_URL 環境變數是否正確?\n"
+            f"   3. ~/.config/codetrail/deployment.json 的 main port / base_url 是否正確?\n"
             f"   可先執行: curl -s {LLAMA_BASE_URL}/health"
         )
     if "Timeout" in err_type or "ReadTimeout" in err_type:

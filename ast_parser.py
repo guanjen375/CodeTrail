@@ -18,6 +18,7 @@
 """
 
 import ast
+import process_env
 import os
 import re
 import shutil
@@ -1412,14 +1413,13 @@ class CtagsFallbackParser:
         if self._ctags_available is not None:
             return self._ctags_available
 
-        import subprocess
         try:
-            result = subprocess.run(
+            result = process_env.run(
                 ['ctags', '--version'],
                 capture_output=True, text=True, timeout=5
             )
             self._ctags_available = result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except (FileNotFoundError, process_env.TimeoutExpired):
             self._ctags_available = False
 
         return self._ctags_available
@@ -1430,7 +1430,6 @@ class CtagsFallbackParser:
             # Fallback 到 regex
             return self._parse_with_regex(content, filepath)
 
-        import subprocess
         import tempfile
 
         # 寫入臨時檔案
@@ -1441,7 +1440,7 @@ class CtagsFallbackParser:
                 temp_path = f.name
 
             # 執行 ctags
-            result = subprocess.run(
+            result = process_env.run(
                 ['ctags', '-f', '-', '--output-format=json', '--fields=+n+e', temp_path],
                 capture_output=True, text=True, timeout=30
             )
@@ -1682,10 +1681,12 @@ def get_parser(filepath: Path):
 def _h_header_language() -> str:
     """`.h` 的語言判定(§6.2-2):預設 C(firmware 大宗是 C header)。
 
-    env AICODE_H_LANG=c|cpp 可整體覆寫;非法值靜默回 c(header 判定不值得
+    client.json 的 `h_lang`(c|cpp)可整體覆寫;非法值靜默回 c(header 判定不值得
     fail-loud,錯了頂多少抽 C++ 特有結構)。鄰檔推斷屬 Phase B。
     """
-    value = os.environ.get("AICODE_H_LANG", "c").strip().lower()
+    import config
+
+    value = str(getattr(config, "H_LANG", "c")).strip().lower()
     return value if value in ("c", "cpp") else "c"
 
 

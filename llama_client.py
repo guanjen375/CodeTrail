@@ -34,7 +34,7 @@ _redact_url = endpoint_policy.redact_url
 def _ensure_allowed(url: str) -> None:
     """所有 llama-server 呼叫送出前的端點 policy(role="model")。
 
-    loopback 無條件放行;非 loopback 需要 AICODE_MODEL_REMOTE_OK=1,否則
+    loopback 無條件放行;非 loopback 需要 client.json 的 "model_remote_ok": true,否則
     fail-loud。做在每個 call site 而不是 session 層:session 擋不住新增
     call site 忘記掛 policy 的情況。
     """

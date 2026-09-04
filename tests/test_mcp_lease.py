@@ -55,7 +55,11 @@ def isolated_state(tmp_path, monkeypatch):
     這裡的 assert 是防呆閘:任何一次寫到使用者真的 state 目錄都是 BLOCKER。
     """
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    # HOME 指到 tmp 的同時要放一份 deployment.json:設定只來自檔案,空的 HOME
+    # 會讓真的起 server 的子行程在 require_main_model() 掛掉(exit 3)。
+    from tests._harness import seed_home
+
+    monkeypatch.setenv("HOME", str(seed_home(tmp_path / "home")))
     monkeypatch.setattr(mcp_lease, "_STATE", None, raising=False)
     monkeypatch.setattr(mcp_lease, "_LEASE_PATH", None, raising=False)
     monkeypatch.setattr(mcp_lease, "_LAST_WRITE", 0.0, raising=False)

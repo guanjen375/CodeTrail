@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
-# aicode — launch the CodeTrail chat client with $PWD as the MCP sandbox root.
+# aicode — CodeTrail 的**唯一**使用者入口。
 #
-# Usage:
-#   cd <project-to-analyze>
-#   aicode               # opens the CodeTrail terminal client here, AICODE_ROOT=$PWD
-#   aicode <args...>     # extra args are forwarded to codetrail_chat.py
-#   aicode web           # HTTP + SSE frontend on the same engine
-#   aicode attach <url>  # thin client against a running `aicode web`
+#   cd <要分析的專案>
+#   aicode                 # 在這裡開 CodeTrail 的全螢幕 TUI
+#   aicode -c              # 接續這個專案最近一次的對話
+#   aicode --session <id>  # 接續指定的對話
 #
-# Override the auto-detected root:
-#   AICODE_ROOT=/some/other/path aicode
+# 這支腳本刻意只做四件 Python 做不了或做起來很難看的事:
+#   1. 找到 CodeTrail 的 checkout(自己可能是一個 symlink);
+#   2. 找到 python3;
+#   3. 拒絕沒有終端機的環境(TUI 會接管整個畫面,pipe 過去只會得到控制碼);
+#   4. exec 客戶端。
 #
-# Designed as a one-command CLI: cd into a project, run one command, done.
-# No Node, no npm, no external TUI to install.
+# 其餘全部在 Python 裡:profile 驗證、主模型解析、n_ctx 觀測、ctx 安全閘、
+# lessons render、附屬 server 檢查、工具健檢。結果以參數交給 Engine 與 MCP,
+# **不經環境** —— 殼層裡殘留的任何 AICODE_* / AI_CODE_* / CODETRAIL_* 對這一次
+# 啟動都無效(那是跨 branch 混用的真正機制)。
+#
+# 沙箱 root 一律是 $PWD。沒有 --root、沒有位置參數、沒有 AICODE_ROOT。
 
 set -euo pipefail
 
@@ -32,7 +37,7 @@ resolve_aicode_home() {
   cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd -P
 }
 
-CODETRAIL_HOME="$(resolve_aicode_home)" || {
+CHECKOUT="$(resolve_aicode_home)" || {
   echo "[aicode] cannot resolve CodeTrail checkout path" >&2
   exit 2
 }
@@ -42,533 +47,104 @@ if command -v python3 >/dev/null 2>&1; then
 elif command -v python >/dev/null 2>&1; then
   PYBIN=python
 else
-  PYBIN=""
-fi
-
-if [ -z "$PYBIN" ]; then
   echo "[aicode] python3/python not found in PATH — CodeTrail is a Python tool." >&2
   exit 2
 fi
 
-# 客戶端進入點。可覆寫是為了測試與開發(跑 checkout 裡的另一份客戶端);
-# 這與舊版「把假的 opencode 放進 PATH」是同一種可替換面,不是新的信任邊界。
-CLIENT_ENTRY="${AICODE_CLIENT_ENTRY:-$CODETRAIL_HOME/codetrail_chat.py}"
-
-# --- 參數正規化 + 子指令路由 --------------------------------------------------
-# 先正規化、再決定子指令:`aicode --root X attach`、`aicode -m model web` 這種「全域
-# 選項在子指令前面」的寫法,子指令不是 $1。規則:
-#   * `--root X` / `--root=X` → 專案路徑(wrapper 的 preflight 也在那個 root 上跑)
-#   * `-m=val` → `-m val`;`-m VAL` / `--model VAL` / `--session VAL` / `--policy VAL`
-#     是帶值的全域選項,值不會被誤認成子指令
-#   * 第一個非旗標參數若正好是 `web` / `attach` → 子指令;若是目錄 → 專案路徑
-#     (舊行為 `aicode ./sub`;想對名為 web/attach 的子目錄開客戶端請寫 `./web`)
-#   * 子指令前面的全域選項(_GLOBALS)原樣放在子指令前面轉發;後面的(_REST)放後面
-SUBCMD=""
-_GLOBALS=()
-_REST=()
-_expect_value=""
-while [ "$#" -gt 0 ]; do
-  if [ -n "$_expect_value" ]; then
-    if [ -z "${SUBCMD:-}" ]; then _GLOBALS+=("$1"); else _REST+=("$1"); fi
-    _expect_value=""; shift; continue
-  fi
-  case "$1" in
-    --root)
-      if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
-        echo "[aicode] --root 需要一個目錄。" >&2
-        exit 2
-      fi
-      AICODE_ROOT="$2"; shift 2 ;;
-    --root=*)
-      AICODE_ROOT="${1#--root=}"; shift ;;
-    -m=*)
-      if [ -z "${SUBCMD:-}" ]; then _GLOBALS+=("-m" "${1#-m=}"); else _REST+=("-m" "${1#-m=}"); fi
-      shift ;;
-    -m|--model|--session|--policy)
-      if [ -z "${SUBCMD:-}" ]; then _GLOBALS+=("$1"); else _REST+=("$1"); fi
-      _expect_value=1; shift ;;
-    -*)
-      if [ -z "${SUBCMD:-}" ]; then _GLOBALS+=("$1"); else _REST+=("$1"); fi
-      shift ;;
-    web|attach)
-      if [ -z "${SUBCMD:-}" ]; then
-        SUBCMD="$1"; shift
-      else
-        _REST+=("$1"); shift
-      fi ;;
-    *)
-      if [ -z "${SUBCMD:-}" ] && [ -d "$1" ] && [ "${#_GLOBALS[@]}" -eq 0 ] && [ -z "${AICODE_ROOT:-}" ]; then
-        AICODE_ROOT="$1"; shift
-      elif [ -z "${SUBCMD:-}" ]; then
-        _GLOBALS+=("$1"); shift
-      else
-        _REST+=("$1"); shift
-      fi ;;
-  esac
-done
-
-if [ "${SUBCMD:-}" = "attach" ]; then
-  # attach 是純 client:不需要沙箱 root 檢查 / MCP / 模型 preflight。
-  # 不塞預設 URL 位置參數:塞了之後使用者的 `-u/--url` 永遠被它蓋掉。預設
-  # (http://127.0.0.1:${AICODE_WEB_PORT:-4096})由客戶端自己算。
-  if [ "${#_REST[@]}" -ge 1 ] && [ "${_REST[0]:0:1}" != "-" ]; then
-    echo "[aicode] attach → ${_REST[0]}" >&2
-  else
-    echo "[aicode] attach → 預設 http://127.0.0.1:${AICODE_WEB_PORT:-4096}(可用 -u/--url、-p/--port 覆寫)" >&2
-  fi
-  "$PYBIN" "$CLIENT_ENTRY" --check-args "${_GLOBALS[@]}" attach "${_REST[@]}" || exit 2
-  exec "$PYBIN" "$CLIENT_ENTRY" "${_GLOBALS[@]}" attach "${_REST[@]}"
-fi
-# web 沿用 aicode 全部既有前置(沙箱 root 檢查、ctx safety、AICODE_MODEL 解析、
-# AI_CODE_* 透傳);web 專屬處理(port/hostname、安全硬規則)在腳本結尾分支。
-# 全域選項與子指令後的參數合併成 $@,後面的迴圈(-m 解析)照舊;web 專屬迴圈只看
-# 子指令後面的 _REST,全域選項(WEB_GLOBALS)在最後 exec 時放回 `web` 前面——
-# `--policy` / `--session` 是頂層選項,放到 `web` 後面客戶端會拒收。
-# `-m/--model` 不進 WEB_GLOBALS:它已經被 resolve_main_model.py 正規化(剝掉
-# llamacpp/ 之類的前綴)寫進 AICODE_MODEL,原樣再轉發一次,客戶端會拿 raw 字串蓋掉
-# 正規化結果,web 與終端就用了兩個不同的模型名稱。
-WEB_GLOBALS=()
-_skip_value=""
-for _g in "${_GLOBALS[@]}"; do
-  if [ -n "$_skip_value" ]; then _skip_value=""; continue; fi
-  case "$_g" in
-    -m|--model) _skip_value=1 ;;
-    -m=*|--model=*) ;;
-    *) WEB_GLOBALS+=("$_g") ;;
-  esac
-done
-set -- "${_GLOBALS[@]}" "${_REST[@]}"
-
-# Allow explicit override via env, else use cwd (canonicalised).
-if [ -n "${AICODE_ROOT:-}" ]; then
-  ROOT="$AICODE_ROOT"
-else
-  ROOT="$(pwd -P)"
-fi
-
-# Resolve to absolute, canonical path (handles symlinks, ~, etc.).
-ROOT="$(cd "$ROOT" 2>/dev/null && pwd -P)" || {
-  echo "[aicode] root is not a readable directory: $ROOT" >&2
-  exit 2
-}
-
-# Refuse roots that are almost certainly a mistake — these would expose
-# the entire home / filesystem to the MCP sandbox.
-case "$ROOT" in
-  /)
-    echo "[aicode] refusing AICODE_ROOT=/ (would expose entire filesystem)" >&2
-    exit 2
-    ;;
-  "$HOME")
-    echo "[aicode] refusing AICODE_ROOT=\$HOME ($HOME)" >&2
-    echo "         cd into a specific project directory first." >&2
-    exit 2
-    ;;
-esac
-
-# AICODE_ROOT override 時,先 cd 到該 root 再做其餘所有事:preflight、canary
-# 與最後啟動的客戶端才會看到同一個專案。不 cd 的話客戶端仍以原 cwd 當專案,
-# 載入另一個目錄的 AGENTS.md 與 lessons,前面驗過的保證全部對不上。
-# ROOT == cwd(未 override)時是 no-op。
-cd "$ROOT" || {
-  echo "[aicode] cannot cd into AICODE_ROOT: $ROOT" >&2
-  exit 2
-}
-
-# 先讓真正的客戶端 parser 驗一次參數(不跑任何 preflight):打錯旗標要在這裡
-# 被打回,不是幾十秒的 canary 之後才由 argparse 以 exit 2 拒絕。
-if [ "${SUBCMD:-}" = "web" ]; then
-  "$PYBIN" "$CLIENT_ENTRY" --check-args --root "$ROOT" "${WEB_GLOBALS[@]}" web "${_REST[@]}" || exit 2
-else
-  "$PYBIN" "$CLIENT_ENTRY" --check-args --root "$ROOT" "$@" || exit 2
-fi
-
-# AICODE_COMPACTION_STATE only exists for the private compaction-quality eval,
-# which points the client at a throw-away ownership state.  A value left over in
-# the caller's shell would make the runtime read a different (or missing) state
-# than every diagnostic here does.  Strip it.
-unset AICODE_COMPACTION_STATE
-
-# Resolve the same deployment profile used by launchers, doctor, status, and
-# preflight.  NUL-delimited KEY=VALUE records are imported one-by-one; profile
-# JSON is never sourced or eval'd as shell code.  Main model stays excluded
-# here because the existing -m/--model resolver below owns CLI precedence.
-if [ -f "$CODETRAIL_HOME/deployment_profile.py" ]; then
-  if ! "$PYBIN" "$CODETRAIL_HOME/deployment_profile.py" validate >/dev/null; then
-    echo "[aicode] deployment profile validation refused to start." >&2
-    exit 2
-  fi
-  PROFILE_ENV=()
-  mapfile -d '' -t PROFILE_ENV < <(
-    "$PYBIN" "$CODETRAIL_HOME/deployment_profile.py" env --null
-  )
-  for assignment in "${PROFILE_ENV[@]}"; do
-    case "${assignment%%=*}" in
-      AICODE_LLAMA_BASE_URL|AICODE_LLAMA_EMBED_BASE_URL|AICODE_LLAMA_RERANK_BASE_URL|AICODE_LLAMA_VL_BASE_URL|AICODE_EMBED_MODEL|AICODE_RERANK_MODEL|AICODE_VL_MODEL|AICODE_VL_MMPROJ|AICODE_EFFECTIVE_PROFILE)
-        export "$assignment"
-        ;;
-      *)
-        echo "[aicode] deployment profile emitted an unsupported environment key." >&2
-        exit 2
-        ;;
-    esac
-  done
-  echo "[aicode] deployment profile=${AICODE_EFFECTIVE_PROFILE:-defaults}"
-fi
-
-# 主模型解析:env > -m/--model arg > deployment profile/local override。
-# 全部找不到、是 placeholder、或被指到外部 provider (openai/、ollama/ 等) 時,
-# resolve_main_model.py 會印 fail-loud 訊息到 stderr 並 exit 2。CodeTrail 不內建 /
-# 不 fallback 任何預設主模型 — 使用者必須先下載一顆 GGUF 並啟動 llama-server。
-if ! RESOLVED_MAIN_MODEL="$("$PYBIN" "$CODETRAIL_HOME/scripts/resolve_main_model.py" "$@")"; then
-  exit 2
-fi
-# resolve_main_model.py 已經 strip 掉 custom provider prefix, 這裡拿到的是 bare
-# model name (或 GGUF 路徑)。把它寫回 AICODE_MODEL, 讓 ctx_safety_check /
-# mcp_server / 子行程拿到同一顆。
-export AICODE_MODEL="$RESOLVED_MAIN_MODEL"
-
-# 主模型只傳遞一個 n_ctx。正常情況從 server /props 觀測實值；server 暫時不可讀時
-# 使用 deployment profile 的 main.ctx。AICODE_N_CTX 可作單次明確 override，後面的
-# safety gate 仍會確認它不超過實際 server。
-if [ -z "${AICODE_N_CTX:-}" ]; then
-  if RESOLVED_CTX="$("$PYBIN" "$CODETRAIL_HOME/scripts/resolve_server_ctx.py")" && [ -n "$RESOLVED_CTX" ]; then
-    export AICODE_N_CTX="$RESOLVED_CTX"
-    echo "[aicode] n_ctx=$RESOLVED_CTX (from main server)"
-  elif CONFIGURED_CTX="$("$PYBIN" "$CODETRAIL_HOME/deployment_profile.py" get main ctx)" && [ -n "$CONFIGURED_CTX" ]; then
-    export AICODE_N_CTX="$CONFIGURED_CTX"
-    echo "[aicode] n_ctx=$CONFIGURED_CTX (from deployment profile; server 尚無法觀測)"
-  fi
-else
-  echo "[aicode] n_ctx=${AICODE_N_CTX} (from AICODE_N_CTX)"
-fi
-if [ -n "${AICODE_DYNAMIC_NUM_CTX_MAX:-}" ]; then
-  echo "[aicode] WARNING: AICODE_DYNAMIC_NUM_CTX_MAX 已 deprecated 且不再是另一個 max；請移除。" >&2
-fi
-if [ -n "${AICODE_NUM_CTX:-}" ]; then
-  echo "[aicode] WARNING: AICODE_NUM_CTX 已 deprecated；請移除並只設定主 n_ctx。" >&2
-fi
-
-# 容量閘:確認上面決定的 CodeTrail ctx budget 不會「超過」server 真實 n_ctx
-# (超過會截斷 prompt)。正常自動跟隨時 requested == server、直接放行;會擋下的只有
-# 設定值與 server 實值不相容的情況。
-# ctx_safety_check.py 讀 server /props (預設 8080);server 沒啟動 / 不可連的 UNKNOWN
-# 情況 exit 0 只 warn,不擋 CI / 遠端。
-if [ -f "$CODETRAIL_HOME/scripts/ctx_safety_check.py" ]; then
-  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/ctx_safety_check.py"; then
-    echo "[aicode] ctx safety check refused to start (see [ctx-safety] above)." >&2
-    exit 2
-  fi
-fi
-
-if [ -f "$CODETRAIL_HOME/scripts/lessons_check.py" ]; then
-  # session start 注入 lessons(行為教訓):把 active lessons render 成
-  # $ROOT/.codetrail/lessons.md,客戶端把它接進 system prompt,
-  # 並提示已過 review_by 的待複審清單。store 損壞 / 超過上限會 fail-loud。
-  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/lessons_check.py" --root "$ROOT"; then
-    echo "[aicode] lessons check refused to start (see [lessons] above)." >&2
-    exit 2
-  fi
-fi
-
-if [ -f "$CODETRAIL_HOME/scripts/required_model_servers_check.py" ]; then
-  if ! "$PYBIN" "$CODETRAIL_HOME/scripts/required_model_servers_check.py"; then
-    echo "[aicode] required model server preflight refused to start (see [model-preflight] above)." >&2
-    exit 2
-  fi
-fi
-
-export AICODE_ROOT="$ROOT"
-echo "[aicode] AICODE_ROOT=$AICODE_ROOT"
-
-# 舊 OpenCode 安裝的遷移提示。**只偵測、只警告**:不寫檔、不擋啟動。
-# 真正的遷移由 `./set_config.sh` 接著做(它自己有備份與原子替換;失敗 exit 2)。
-if [ -f "$CODETRAIL_HOME/opencode_migrate.py" ]; then
-  MIGRATION_PROBLEM="$("$PYBIN" -c "
-import sys
-sys.path.insert(0, '$CODETRAIL_HOME')
-import opencode_migrate
-print(opencode_migrate.migration_problem())
-" 2>/dev/null || true)"
-  if [ -n "$MIGRATION_PROBLEM" ]; then
-    # 判不出「要不要遷移」不等於「不需要」:狀態檔壞掉 / 綁到別份 config /
-    # OpenCode 設定解析不了,舊值與 plugin 項可能還在那裡沒人管。
-    echo "[aicode] ⚠ 舊 OpenCode 設定的遷移狀態無法判定:$MIGRATION_PROBLEM"
-    echo "[aicode]   請跑 python3 opencode_migrate.py --check 看原因;set_config 在這種狀態下會拒絕寫入。"
-  elif "$PYBIN" -c "
-import sys
-sys.path.insert(0, '$CODETRAIL_HOME')
-import opencode_migrate
-sys.exit(0 if opencode_migrate.migration_needed() else 1)
-" 2>/dev/null; then
-    echo "[aicode] ⚠ 偵測到舊 OpenCode 安裝留下的 CodeTrail 設定(壓縮受管值 / plugin 項)。"
-    echo "[aicode]   CodeTrail 已不再啟動 OpenCode;那些值沒有人負責,plugin 路徑也可能讓"
-    echo "[aicode]   你在其他專案開 OpenCode 時失敗。請執行一次:./set_config.sh"
-    echo "[aicode]   (只還原仍有 ownership 證據的值,有備份;先看一眼可跑"
-    echo "[aicode]    python3 opencode_migrate.py --check)"
-  fi
-fi
-
-# MCP / tool-call health gate:
-#   1) 每次都直接走 initialize → tools/list → list_dir，確認 server 真正暴露
-#      完整 19-tool contract，而不是相信模型對自身工具的文字描述。
-#   2) explicit fresh headless run 必須產生 completed 的結構化 list_dir
-#      event（硬 gate，可重試一次）。通過後另跑一次未點名工具的 implicit
-#      routing 診斷；optimal/suboptimal/fail/timeout 都不擋啟動。
-#      兩條 lane 依 model/client/system-prompt/root/protocol 指紋分開快取。
-# attach 是薄 client，前面已直接 exec，不會重跑 backend canary；standalone 與
-# web backend 都會走這道 gate。`--` 後原樣交給 Python，只掃描 -m/--model，
-# 不會消耗或改寫稍後要轉發給客戶端的參數。
-TOOL_CANARY="$CODETRAIL_HOME/scripts/tool_call_canary.py"
-if [ ! -f "$TOOL_CANARY" ]; then
-  echo "[aicode] missing required tool-call canary: $TOOL_CANARY" >&2
-  exit 2
-fi
-if ! "$PYBIN" "$TOOL_CANARY" --root "$AICODE_ROOT" -- "$@"; then
-  echo "[aicode] CodeTrail tool health check refused to start (see [tool-health] above)." >&2
+CLIENT_ENTRY="$CHECKOUT/codetrail_chat.py"
+if [ ! -f "$CLIENT_ENTRY" ]; then
+  echo "[aicode] 找不到客戶端進入點:$CLIENT_ENTRY" >&2
   exit 2
 fi
 
-# 主模型的 server 與 CodeTrail budget 共用同一個 n_ctx；
-# embedding/reranker/VL 是獨立 server 的內部 ctx，不混入這個使用者設定。
-echo "[aicode] AICODE_MODEL=${AICODE_MODEL}"
-if [ -n "${AICODE_N_CTX:-}" ]; then
-  echo "[aicode] n_ctx=${AICODE_N_CTX}"
-fi
-if [ -n "${AICODE_RESERVED_OUTPUT_TOKENS:-}" ]; then
-  echo "[aicode] AICODE_RESERVED_OUTPUT_TOKENS=${AICODE_RESERVED_OUTPUT_TOKENS}"
-fi
-if [ -n "${AICODE_LLAMA_BASE_URL:-}" ]; then
-  echo "[aicode] AICODE_LLAMA_BASE_URL=${AICODE_LLAMA_BASE_URL} (主 LLM server)"
-fi
+# --help 不需要終端機,也不需要跑任何檢查。**由 wrapper 自己印**:客戶端的
+# `--help` 會列出 run / status / sessions 這些**內部**入口(canary / eval / doctor 用),
+# 而 aicode 底下它們是被拒絕的 —— 列出來只會請使用者去試一個會被打回的東西。
+for arg in "$@"; do
+  if [ "$arg" = "-h" ] || [ "$arg" = "--help" ]; then
+    cat <<EOF
+用法: aicode [-c | --continue] [--session <id>]
 
-# 目前的壓縮模式(客戶端什麼時候把長對話換成一段摘要)。選擇記在
-# ~/.config/codetrail/client.json,所以不印的話使用者整段 session 都不知道自己
-# 在用哪一個 —— codetrail / manual 還在測試階段,更該講。純讀取、fail-open:
-# `codetrail_chat.py status` 自己吞掉所有例外並永遠 exit 0,`|| true` 是第二道保險。
-# 這一行是資訊不是閘,不得擋住啟動。
-"$PYBIN" "$CLIENT_ENTRY" status --prefix '[aicode]' || true
+  cd <要分析的專案>
+  aicode                 在這裡開 CodeTrail 的全螢幕 TUI
+  aicode -c              接續這個專案最近一次的對話
+  aicode --session <id>  接續指定的對話
 
-echo "[aicode] NOTE: 主 n_ctx 只需用 ./set_config.sh 設一次；改完重啟 server。"
-echo "         CodeTrail 的 context 預算會自動跟隨。"
-echo "         Check loaded model with: curl -s \${AICODE_LLAMA_BASE_URL:-http://localhost:8080}/props"
-echo "         CodeTrail context overflow attempts are logged to .codetrail/context_metrics.jsonl"
+沙箱 root 一律是目前目錄。主模型、端點與 n_ctx 只來自
+~/.config/codetrail/{deployment,models}.json —— 換模型或 n_ctx 就重跑
+./set_config.sh 再重啟 server。權限、壓縮模式與其餘開關在
+~/.config/codetrail/client.json。
 
-echo "[aicode] TIP: 換模型請先停掉 llama-server, 換 GGUF 重啟, 再改 AICODE_MODEL 重啟 aicode。"
-echo "[aicode] TIP: 設定有疑慮時可跑 \`AICODE_MODEL=${AICODE_MODEL} python scripts/doctor.py\` 做健檢。"
-
-if [ "${SUBCMD:-}" = "web" ]; then
-  # ---- aicode web: 與終端客戶端同一個 engine 的 HTTP + SSE 前端 ------------
-  # port:讀 AICODE_WEB_PORT,否則固定 4096(刻意固定,方便 attach)。
-  # hostname:預設 127.0.0.1。使用者可在轉發 args 覆寫 --port / --hostname;
-  # 這裡解析出來以套預設、做安全檢查,其餘 args 原樣轉發。
-  WEB_PORT="${AICODE_WEB_PORT:-4096}"
-  WEB_HOSTNAME="127.0.0.1"
-  WEB_MDNS=0
-  WEB_PASSTHROUGH=()
-  # 只解析子指令後面的參數;全域選項(WEB_GLOBALS)已在上面留住,exec 時放回 web 前面。
-  set -- "${_REST[@]}"
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --port)
-        if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
-          echo "[aicode] --port 需要一個值。" >&2
-          exit 2
-        fi
-        WEB_PORT="$2"
-        shift 2
-        ;;
-      --port=*)
-        WEB_PORT="${1#--port=}"
-        if [ -z "$WEB_PORT" ]; then
-          echo "[aicode] --port 需要一個值。" >&2
-          exit 2
-        fi
-        shift
-        ;;
-      --hostname)
-        if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
-          echo "[aicode] --hostname 需要一個值。" >&2
-          exit 2
-        fi
-        WEB_HOSTNAME="$2"
-        shift 2
-        ;;
-      --hostname=*)
-        WEB_HOSTNAME="${1#--hostname=}"
-        if [ -z "$WEB_HOSTNAME" ]; then
-          echo "[aicode] --hostname 需要一個值。" >&2
-          exit 2
-        fi
-        shift
-        ;;
-      --mdns|--mdns=*)
-        # mDNS 會對區網廣播服務;視為非 loopback 暴露。任何 --mdns=<value>
-        # 都當成啟用,避免 boolean spelling 繞過密碼硬規則。
-        WEB_MDNS=1
-        WEB_PASSTHROUGH+=("$1")
-        shift
-        ;;
-      *)
-        WEB_PASSTHROUGH+=("$1")
-        shift
-        ;;
-    esac
-  done
-
-  # 安全硬規則:hostname 非 loopback,或開了 --mdns 廣播時,必須已設
-  # AICODE_WEB_PASSWORD —— 未設密碼時任何連得到的人都能讀你的專案、核准寫入
-  # 工具。**這是兩道獨立的閘**:client_web.enforce_bind_policy 在 server 端
-  # 會再擋一次,即使有人繞過這支 wrapper 直接叫 codetrail_chat.py web。
-  # 唯一例外是 aicode_web 的受限 Tailscale 路徑:hostname 必須同時等於 wrapper
-  # 傳入的 AICODE_WEB_TAILSCALE_IP、以及 tailscale CLI 當下回報的本機 IPv4,且
-  # 必須落在 Tailscale 的 100.64.0.0/10。
-  WEB_LOCAL=0
-  case "$WEB_HOSTNAME" in
-    127.0.0.1|localhost|::1)
-      WEB_LOCAL=1
-      ;;
-  esac
-
-  is_tailscale_ipv4() {
-    local ip="$1" a b c d
-    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
-    IFS=. read -r a b c d <<<"$ip"
-    (( 10#$a == 100 && 10#$b >= 64 && 10#$b <= 127 && \
-       10#$c >= 0 && 10#$c <= 255 && 10#$d >= 0 && 10#$d <= 255 ))
-  }
-
-  WEB_TAILSCALE_VERIFIED=0
-  if [ "$WEB_LOCAL" -ne 1 ] && [ "$WEB_MDNS" -ne 1 ] && \
-     [ -n "${AICODE_WEB_TAILSCALE_IP:-}" ] && \
-     [ "$WEB_HOSTNAME" = "$AICODE_WEB_TAILSCALE_IP" ] && \
-     is_tailscale_ipv4 "$WEB_HOSTNAME" && command -v tailscale >/dev/null 2>&1; then
-    while IFS= read -r current_ts_ip; do
-      if [ "$current_ts_ip" = "$WEB_HOSTNAME" ]; then
-        WEB_TAILSCALE_VERIFIED=1
-        break
-      fi
-    done < <(tailscale ip -4 2>/dev/null || true)
-  fi
-
-  if [ "$WEB_LOCAL" -ne 1 ] || [ "$WEB_MDNS" -eq 1 ]; then
-    if [ -z "${AICODE_WEB_PASSWORD:-}" ] && [ "$WEB_TAILSCALE_VERIFIED" -ne 1 ]; then
-      WEB_WHY="hostname=$WEB_HOSTNAME"
-      if [ "$WEB_MDNS" -eq 1 ]; then
-        WEB_WHY="$WEB_WHY 且開啟 --mdns 廣播"
-      fi
-      echo "[aicode] 拒絕啟動:$WEB_WHY 會把 web 介面暴露到 loopback 以外," >&2
-      echo "[aicode] 但未設定 AICODE_WEB_PASSWORD —— 未設密碼時任何連得到的人都能讀你的專案。" >&2
-      echo "[aicode] 擇一處理:" >&2
-      echo "[aicode]   1) 只在本機用:aicode web(預設 127.0.0.1、不要 --mdns)" >&2
-      echo "[aicode]   2) A/B 機已加入同一 tailnet:改用 aicode_web(只綁 Tailscale IP)" >&2
-      echo "[aicode]   3) 要對其他可信內網暴露:先 export AICODE_WEB_PASSWORD=<強密碼> 再啟動" >&2
-      echo "[aicode] 切勿把 0.0.0.0 綁到可信內網以外的網卡。" >&2
-      exit 2
-    fi
-  fi
-
-  if [ "${AICODE_PREFLIGHT_ONLY:-0}" = "1" ]; then
-    # aicode_web 的前景預檢模式:全部前置(profile、主模型、n_ctx 閘、附屬
-    # server、tool canary、bind 安全規則)已通過,到此為止、不啟動客戶端;
-    # 背景 pane 會用同一組檢查再走一次(冪等,canary 命中指紋快取)。
-    echo "[aicode] preflight-only:檢查全部通過(未啟動客戶端)。"
+要在腳本裡問一題(headless、JSON 事件流):
+  python3 $CLIENT_ENTRY run "<問題>" --format json
+EOF
     exit 0
   fi
-
-  echo "[aicode] web frontend → http://$WEB_HOSTNAME:$WEB_PORT"
-  echo "[aicode] 🧪 web 模式為實驗功能(開發中);要穩定請用終端客戶端(直接 aicode)。"
-  if [ "$WEB_TAILSCALE_VERIFIED" -eq 1 ]; then
-    echo "[aicode] 已驗證並只綁本機 Tailscale IPv4；不會 listen 在 LAN / 公網介面。"
-    echo "[aicode] 存取邊界是 tailnet ACL：只有 ACL 允許連到這台 A 機的裝置可開啟。"
-  elif [ "$WEB_LOCAL" -eq 1 ] && [ "$WEB_MDNS" -ne 1 ]; then
-    echo "[aicode] 綁 loopback。若這台是沒有桌面的 server,從你自己的電腦:"
-    echo "[aicode]   A/B 機有 Tailscale:Ctrl-C 後改跑 aicode_web(自動印 B 機網址)"
-    echo "[aicode]   ssh -N -L $WEB_PORT:127.0.0.1:$WEB_PORT <你的帳號>@<此 server>"
-    echo "[aicode]   再用本機瀏覽器開 http://127.0.0.1:$WEB_PORT。另開終端 \`aicode attach\` 可接終端介面。"
-  else
-    echo "[aicode] 已設 AICODE_WEB_PASSWORD;非 loopback 暴露請確認只在可信內網/VPN。"
-  fi
-  echo "[aicode] ⚠️ 沙箱鎖在這個專案;換專案=另起一個 backend。"
-
-  exec "$PYBIN" "$CLIENT_ENTRY" --root "$AICODE_ROOT" "${WEB_GLOBALS[@]}" web \
-    --port "$WEB_PORT" --hostname "$WEB_HOSTNAME" "${WEB_PASSTHROUGH[@]}"
-fi
-
-CLIENT_ARGS=()
-USER_PASSED_MODEL=0
-USER_MODEL_VALUE=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    -m|--model)
-      USER_PASSED_MODEL=1
-      flag="$1"
-      if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
-        echo "[aicode] $flag requires a model value." >&2
-        exit 2
-      fi
-      USER_MODEL_VALUE="$2"
-      shift 2
-      ;;
-    -m=*)
-      USER_PASSED_MODEL=1
-      val="${1#-m=}"
-      if [ -z "$val" ]; then
-        echo "[aicode] -m requires a model value." >&2
-        exit 2
-      fi
-      USER_MODEL_VALUE="$val"
-      shift
-      ;;
-    --model=*)
-      USER_PASSED_MODEL=1
-      val="${1#--model=}"
-      if [ -z "$val" ]; then
-        echo "[aicode] --model requires a model value." >&2
-        exit 2
-      fi
-      USER_MODEL_VALUE="$val"
-      shift
-      ;;
-    *)
-      CLIENT_ARGS+=("$1")
-      shift
-      ;;
-  esac
 done
 
-# -m/--model 已經被 resolve_main_model.py 解析並寫進 AICODE_MODEL(上面),
-# 客戶端只讀那一個。不再原樣轉發:客戶端沒有 provider/model 的概念,
-# 轉發過去只會變成一個它不認得的參數。
-if [ "$USER_PASSED_MODEL" -eq 1 ]; then
-  echo "[aicode] --model=$USER_MODEL_VALUE → AICODE_MODEL=${AICODE_MODEL}"
+# 使用者入口只有這三個旗標。`codetrail_chat.py` 底下還有 run / status / sessions
+# 這些**內部**入口(canary / eval / doctor 用),它們不跑 preflight —— 原樣轉發
+# argv 的話,`aicode run "..."` 就變成第二條使用者入口,而且是一條略過 profile
+# 驗證、ctx 安全閘與工具健檢的路。白名單在這裡擋掉,錯誤訊息指回真正的入口。
+i=1
+while [ "$i" -le "$#" ]; do
+  eval "arg=\${$i}"
+  case "$arg" in
+    -c|--continue) ;;
+    --session)
+      i=$((i + 1))
+      if [ "$i" -gt "$#" ]; then
+        echo "[aicode] --session 需要一個 session id。" >&2
+        exit 2
+      fi
+      eval "val=\${$i}"
+      case "$val" in
+        "" )
+          echo "[aicode] --session 的值是空的。" >&2
+          exit 2
+          ;;
+        --*)
+          echo "[aicode] --session 的值看起來是另一個選項:$val" >&2
+          exit 2
+          ;;
+      esac
+      ;;
+    --session=*)
+      if [ "${arg#--session=}" = "" ]; then
+        echo "[aicode] --session= 的值是空的。" >&2
+        echo "         空值會被靜默當成「沒有指定」而開一個新對話 —— 那不是你要的。" >&2
+        exit 2
+      fi
+      ;;
+    *)
+      echo "[aicode] 不認得的參數:$arg" >&2
+      echo "         aicode 只接受:-c/--continue、--session <id>、-h/--help。" >&2
+      echo "         沙箱 root 一律是目前目錄(cd <專案> && aicode)。" >&2
+      echo "         要在腳本裡問一題請用 headless 入口:" >&2
+      echo "           $PYBIN $CLIENT_ENTRY run \"<問題>\" --format json" >&2
+      exit 2
+      ;;
+  esac
+  i=$((i + 1))
+done
+
+# 全螢幕 TUI 需要一個真的終端機。stdin 或 stdout 被導向 / pipe 時**明確拒絕**,
+# 不靜默降級成另一種介面 —— 指向 headless 入口,讓腳本使用者拿到能用的東西。
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+  echo "[aicode] aicode 是全螢幕介面,需要一個終端機(tty)。" >&2
+  echo "         這裡的 stdin/stdout 不是終端機(被 pipe / 重導 / 在 cron 裡)。" >&2
+  echo "         要在腳本裡問一題請用 headless 入口:" >&2
+  echo "           python3 $CLIENT_ENTRY run \"<問題>\" --format json" >&2
+  exit 2
 fi
 
-if [ "${AICODE_PREFLIGHT_ONLY:-0}" = "1" ]; then
-  echo "[aicode] preflight-only:檢查全部通過(未啟動客戶端)。"
-  exit 0
+# 介面是 Textual。缺套件要在這裡 fail-loud 印出可照打的 pip 指令,不是等
+# 客戶端 import 失敗丟一段 traceback。
+if ! "$PYBIN" -c "import textual" >/dev/null 2>&1; then
+  echo "[aicode] 缺少 textual —— aicode 的終端介面靠它。" >&2
+  echo "[aicode] 修復:$PYBIN -m pip install --user \"textual>=8,<9\"" >&2
+  echo "[aicode]   (不要加 [syntax] extra:它拉的 tree-sitter 文法與本 repo 釘死的版本衝突)" >&2
+  exit 2
 fi
 
-# 客戶端一啟動就接管整個畫面,上面所有預檢/修復訊息會瞬間被蓋掉。
-# 給使用者幾秒看完再進去。倒數只在輸出是終端機時做:被導向檔案或在測試裡
-# 用 pipe 收 stdout 時直接啟動(否則每次呼叫都白等這幾秒)。
-# AICODE_LAUNCH_DELAY=0 可關掉。
-launch_delay="${AICODE_LAUNCH_DELAY:-3}"
-case "$launch_delay" in
-  ''|*[!0-9]*) launch_delay=3 ;;
-  # 全是數字還不夠:bash 算術把前導零當八進位。`08` 通得過下面的 -gt
-  # (test 用的是另一個 parser),再減一就以 "value too great for base" 失敗 ——
-  # 而這支腳本是 set -e,於是 wrapper 在 exec 之前就結束;`010` 不會爆,
-  # 但安靜地倒數 8 秒。10# 強制十進位。
-  *) launch_delay=$((10#$launch_delay)) ;;
-esac
-if [ -t 1 ] && [ "$launch_delay" -gt 0 ]; then
-  while [ "$launch_delay" -gt 0 ]; do
-    printf '\r[aicode] 檢查完成,CodeTrail %d 秒後啟動(Ctrl-C 取消)… ' "$launch_delay"
-    sleep 1
-    launch_delay=$((launch_delay - 1))
-  done
-  printf '\r[aicode] 檢查完成,CodeTrail 啟動中…                    \n'
-fi
-
-exec "$PYBIN" "$CLIENT_ENTRY" --root "$AICODE_ROOT" "${CLIENT_ARGS[@]}"
+exec "$PYBIN" "$CLIENT_ENTRY" "$@"

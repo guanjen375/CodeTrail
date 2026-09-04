@@ -11,7 +11,7 @@
 照 [README](../README.md) 的 CodeTrail 客戶端 流程完成後，先在 CodeTrail repo 裡跑：
 
 ```bash
-AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py
+python3 scripts/doctor.py
 ```
 
 `<CODE_MODEL>` 是佔位符,必須替換成 MODEL_REGISTRY 裡登記的 bare name 或 GGUF 絕對路徑;deployment profile 的 `main.model` 設好時,doctor 也能從那裡解析。`FAIL` 要先處理;`WARN` 可以依訊息判斷是否需要調整。接著切到要分析的專案根目錄:
@@ -23,8 +23,8 @@ aicode
 
 進入 TUI 前會依序看到分層健康狀態：
 
-- `[client] PASS`：客戶端進入點存在且可執行(`AICODE_CLIENT_ENTRY` 可覆寫,覆寫時
-  canary 驗的就是被覆寫的那一份)。
+- `[client] PASS`：客戶端進入點存在且可執行(就是這個 repo 裡的 `codetrail_chat.py`,
+  canary 驗的就是它,沒有覆寫)。
 - `MCP PASS — 19 tools + list_dir round-trip`：每次都 live 初始化 MCP、精確檢查 19 個名稱與
   固定順序，擷取完整 typed schemas／instructions digest，並執行一次唯讀 `list_dir`。
   schema bounds/description/budget 由同一 public contract 的 static test 驗證；routing catalog
@@ -108,7 +108,7 @@ ASCII/CJK token 代理估算，再套各工具 safety cap；已不再是固定 1
 
 ### 檔案在專案目錄內
 
-把檔案放在 `AICODE_ROOT` 底下，例如 `logs/build_fail.txt`、`screenshots/error.png`、`firmware/boot.bin`。然後在對話裡明確要求使用工具：
+把檔案放在 sandbox root(= 你執行 `aicode` 的那個目錄)底下，例如 `logs/build_fail.txt`、`screenshots/error.png`、`firmware/boot.bin`。然後在對話裡明確要求使用工具：
 
 ```text
 請用工具 read_file 讀 logs/build_fail.txt，找出最重要的錯誤訊息。
@@ -128,19 +128,22 @@ ASCII/CJK token 代理估算，再套各工具 safety cap；已不再是固定 1
 
 ### 檔案在專案目錄外
 
-預設不能直接讀 `$HOME`、`Downloads` 或其他專案外路徑。要匯入外部附件，啟動時打開匯入功能：
+預設不能直接讀 `$HOME`、`Downloads` 或其他專案外路徑。要匯入外部附件，在
+`~/.config/codetrail/client.json` 打開匯入功能：
 
-```bash
-AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
+```json
+{ "external_import": true }
 ```
 
-`AI_CODE_ALLOW_EXTERNAL_IMPORT=1` 是總開關。預設可匯入來源是 `~/Downloads` 和 `/tmp`。如果附件在其他目錄，用 `AI_CODE_IMPORT_ROOTS` 指定白名單；一旦設定就會取代預設清單：
+`external_import` 是總開關。預設可匯入來源是 `~/Downloads` 和 `/tmp`。如果附件在其他
+目錄，用 `external_import_roots` 指定白名單；一旦設定就會取代預設清單：
 
-```bash
-AI_CODE_ALLOW_EXTERNAL_IMPORT=1 \
-AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/specs" \
-aicode
+```json
+{ "external_import": true,
+  "external_import_roots": ["~/Downloads", "/tmp", "~/specs"] }
 ```
+
+開了之後**每一次**匯入仍然要人工核准（核准框顯示來源與目的路徑）。
 
 進入 TUI 後請模型先匯入，再分析回傳的新路徑：
 
@@ -275,79 +278,3 @@ permission 是 `ask`）。
 ```
 
 模型會用 `record_lesson(...)` 提案一條祈使句行為規則,**你在核准框看到內容、同意才寫入**;下個 session 起由 `aicode` 自動注入(啟動輸出有 `[lessons] N 條 active lessons 已注入 ...`)。規則 90 天到期會停止注入並在啟動時提示複審。生命週期、上限與 `python3 lessons.py list / renew / delete` 管理指令見 [docs/lessons.md](lessons.md)。
-
----
-
-## 7. Web 模式(瀏覽 / 續問歷史 session)
-
-§0 的 `aicode` 是 standalone TUI。如果你想用瀏覽器瀏覽歷史 session、點任一筆續問，
-或讓瀏覽器與 TUI client 連到**同一個 backend**，改用 web 模式並讓 TUI 端走
-`aicode attach`。不要在同一個專案同時另開 standalone `aicode` 與 `aicode_web`；兩個
-backend 會共用 session 資料庫而互相干擾。
-
-web backend 會 spawn CodeTrail MCP(用啟動它的那個 Python)。如果 CodeTrail 依賴只裝在
-venv，`aicode` / `aicode_web` 的啟動前置仍應在 activate 後執行（見
-[安裝、設定與啟動](setup.md)）。`aicode attach` 是薄 client：不跑 backend preflight、
-不起 MCP,但它是同一支 `codetrail_chat.py`,所以還是需要 Python。
-
-### 啟動 web backend
-
-A 機和 B 機已登入同一個 tailnet 時,使用背景 launcher:
-
-```bash
-# A 機先啟動四個模型 server(每次開機一次)
-~/start.sh
-
-# 再鎖定要分析的專案並啟動 web
-cd <PROJECT_TO_ANALYZE>
-aicode_web
-```
-
-如果 A 機的啟動檔放在桌面,第一行可改成 `cd ~/Desktop && ./start.sh`；標準 `set_config.sh` 產物則是 `~/start.sh`。`aicode_web` 會讀 `tailscale ip -4`,只綁 A 機的 Tailscale IPv4 與固定 port `4096`(可用 `AICODE_WEB_PORT` 覆寫)，在 tmux 背景執行，ready 後印出 B 機要開的 `http://100.x.y.z:4096/`。A 機沒有 GUI 是預期情況。
-
-沙箱 root 檢查、模型解析、ctx safety 與 `AI_CODE_*` 透傳全部跟 standalone TUI 一致 —— 例如要讀專案外附件一樣加 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode_web`。停止 backend 用 `aicode_web stop`。
-
-沒用 Tailscale時,低階入口仍可用 `aicode web`(前景、預設 `127.0.0.1:4096`)或 `aicode_web --local`(背景),再從 B 機做 SSH tunnel:`ssh -L 4096:127.0.0.1:4096 <帳號>@<A機>`。完整步驟見 [README §5.4](../README.md#54-web-模式目前測試中)。
-
-首頁是對話畫面;輸入 `/sessions` 列出這個專案已保存的對話,`/resume <id>` 接續其中一筆,
-`/compact` 立刻壓縮目前這一段。「中斷」按鈕(`POST /api/cancel`)對正在跑的回合與正在跑的
-手動壓縮都有效;瀏覽器網路短斷後 EventSource 自動重連會帶 `Last-Event-ID`,只補沒收到的
-事件,不重播已顯示的回答。全域選項放在子指令前面:`aicode --policy readonly web`、
-`aicode -m <model> web`、`aicode --session <id> web`(瀏覽器第一個對話直接接續那個 session)。
-
-自己寫前端、跑在另一個 origin 時,用 `--cors https://your.front.end`(可重複)明列允許的
-來源;有密碼時以 JSON `POST /api/login {"password": …}` 登入,回應帶 `{"token": …}`,
-SSE 用 `/api/events?session=<id>&token=<token>` 訂閱(原生 EventSource 不能帶
-Authorization 標頭;query token **只對明列的來源有效**,同來源頁面一律走 cookie)。
-
-驗證 MCP 連通:問「請用工具 list_dir 看當前目錄結構」,畫面上會出現一行
-`· list_dir → completed`,然後才是模型整理的結果。
-
-### Attach TUI 到同一個 backend
-
-另開一個終端:
-
-```bash
-aicode attach                              # 預設接 http://127.0.0.1:4096
-aicode attach http://127.0.0.1:4096 -c     # 指定 url，並用 -c 續接上一個 session
-aicode attach -s <SESSION_ID>              # 接上指定 session
-```
-
-attach 端與 web 端連的是**同一個 backend**:同一份 session 檔、同一個 MCP instance、同一把
-模型鎖。CodeTrail MCP 只在 backend 冷啟一次,attach 端不會再起第二個。attach 內可用
-`/sessions`、`/resume <id>`、`/compact`,與 web 介面同一組指令。
-
-同一個 session 一次只能有一輪在跑:web 與 attach 同時對同一段對話送出時,後到的那個會拿到
-`409`(「這個對話已經有一輪在跑」),而不是把兩輪的歷史交錯寫進同一個 session。
-
-要中斷進行中的一輪:web 介面按「中斷」、attach 按 Ctrl-C(它會對 backend 送
-`/api/cancel`,再等 backend 收尾;再按一次才真的放棄等待)。中斷不是答案:那一輪不會留下
-半句 assistant 訊息,進行中的工具呼叫會走 MCP 的取消契約收掉。
-
-### 安全注意(重要)
-
-未設 `AICODE_WEB_PASSWORD` 時 backend 沒有應用層密碼,所以**它自己**拒絕綁 loopback 以外的位址
-(不是只靠 wrapper 擋:直接叫 `codetrail_chat.py web --hostname 0.0.0.0` 一樣會被拒)。
-`aicode_web` 的無密碼例外非常窄:wrapper 傳入的 hostname、`tailscale ip -4` 當下值與 Tailscale `100.64.0.0/10` 必須三者吻合,且只 listen 該 virtual interface；傳輸由 Tailscale 加密、授權由 tailnet ACL 負責。普通 `aicode web` 若綁任何非 loopback 位址(`0.0.0.0` / LAN IP)或開 `--mdns`(對區網廣播這個
-服務),仍會強制要求密碼;`--mdns` 另外要求綁在區網可達的位址(廣播一個別人連不到的位址沒有
-意義)。設了密碼時,它不會出現在 tmux 指令列、pane scrollback 或 MCP 子行程的環境裡。**絕不可用 `tailscale funnel`**。詳見 [安全邊界與工作節奏](security.md)。

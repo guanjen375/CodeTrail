@@ -29,7 +29,6 @@ import math
 import os
 import re
 import stat
-import subprocess
 import sys
 import tempfile
 import time
@@ -46,40 +45,58 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import client_events  # noqa: E402
+import process_env  # noqa: E402
 import client_mcp  # noqa: E402
 import client_prompt  # noqa: E402
 import config as codetrail_config  # noqa: E402
 from mcp_contract import MCP_INSTRUCTIONS, PUBLIC_TOOL_NAMES, PUBLIC_TOOL_ORDER  # noqa: E402
-from model_resolution import parse_cli_model_arg_detail, resolve_main_model_from_env  # noqa: E402
+from model_resolution import resolve_main_model_from_env  # noqa: E402
 
 # 3:客戶端換掉 OpenCode,指紋輸入整組改變(不再有 opencode 設定 / 版本 /
 # build prompt;改為客戶端版本與 system prompt digest)。舊快取項不得沿用。
 CANARY_VERSION = 3
 CACHE_SCHEMA = 3
-DEFAULT_CLIENT_ENTRY = REPO_ROOT / "codetrail_chat.py"
-CLIENT_ENTRY_ENV = "AICODE_CLIENT_ENTRY"
+#: canary 要驗的**就是 wrapper 等一下會 exec 的那一個**客戶端 —— 也就是這個
+#: repo 裡的 `codetrail_chat.py`。以前這裡有一個 `AICODE_CLIENT_ENTRY` 覆寫,
+#: 目的是「wrapper 換客戶端時 canary 也跟著換」;但 wrapper 已經只 exec 自己
+#: 旁邊那一份,那個覆寫留著只剩一個效果:殼層設一個值,canary 就去驗另一份
+#: 程式,對一個 policy / system prompt / 事件契約完全不同的客戶端回報 PASS。
+CLIENT_ENTRY = REPO_ROOT / "codetrail_chat.py"
 
 
-def client_entry(env: Mapping[str, str] | None = None) -> Path:
-    """canary 要驗的**就是 wrapper 等一下會 exec 的那一個**客戶端。
-
-    `aicode` 尊重 `AICODE_CLIENT_ENTRY`;canary 寫死 repo 內的路徑的話,
-    它跑的、hash 的都是另一份程式,通過之後 wrapper 卻 exec override ——
-    對一個 policy、system prompt、事件契約完全不同的客戶端回報 PASS。
-    """
-    environ = os.environ if env is None else env
-    override = str(environ.get(CLIENT_ENTRY_ENV, "")).strip()
-    return Path(override).expanduser() if override else DEFAULT_CLIENT_ENTRY
-
-
-CLIENT_ENTRY = DEFAULT_CLIENT_ENTRY
-DEFAULT_CACHE_TTL_SECONDS = 24 * 60 * 60
-DEFAULT_MCP_TIMEOUT_SECONDS = 90
-DEFAULT_EXPLICIT_TIMEOUT_SECONDS = 120
-# Backward-compatible name for callers that previously had only one model lane.
-DEFAULT_MODEL_TIMEOUT_SECONDS = DEFAULT_EXPLICIT_TIMEOUT_SECONDS
-DEFAULT_IMPLICIT_TIMEOUT_SECONDS = 180
+def client_entry() -> Path:
+    return CLIENT_ENTRY
 MODEL_CANARY_HEARTBEAT_SECONDS = 15
+
+# 時限與快取期是 repo 常數(config.py),不是環境變數 —— 見那邊的說明。
+TOOL_CANARY_MCP_TIMEOUT_SECONDS = codetrail_config.TOOL_CANARY_MCP_TIMEOUT_SECONDS
+TOOL_CANARY_MODEL_TIMEOUT_SECONDS = codetrail_config.TOOL_CANARY_MODEL_TIMEOUT_SECONDS
+TOOL_CANARY_IMPLICIT_TIMEOUT_SECONDS = (
+    codetrail_config.TOOL_CANARY_IMPLICIT_TIMEOUT_SECONDS
+)
+TOOL_CANARY_TTL_SECONDS = codetrail_config.TOOL_CANARY_TTL_SECONDS
+
+
+def default_base_url() -> str:
+    """主 llama-server URL:deployment profile 是唯一來源。
+
+    只交 HOME(定位 `~/.config/codetrail/deployment.json`),不交整份
+    `os.environ` —— 那個模組的 env overlay 是**啟動核心**的契約,把殼層殘留的
+    `AICODE_LLAMA_BASE_URL` 交進去,canary 就會去探測別台機器的 server。
+    """
+    import deployment_profile
+
+    home = os.environ.get("HOME")
+    if home:
+        keep = {"HOME": home}
+    else:
+        # Windows fallback,而且**只有** HOME 缺席時才交。
+        profile = os.environ.get("USERPROFILE")
+        keep = {"USERPROFILE": profile} if profile else {}
+    try:
+        return deployment_profile.load_effective_profile(keep).service("main").base_url
+    except deployment_profile.ProfileError as exc:
+        raise CanaryError(f"deployment profile 無法載入:{exc}") from exc
 MAX_CACHE_ENTRIES = 32
 MAX_PROPS_BYTES = 4 * 1024 * 1024
 
@@ -155,38 +172,16 @@ def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in _TRUTHY
 
 
-def _env_int(
-    env: Mapping[str, str],
-    name: str,
-    default: int,
-    *,
-    minimum: int,
-    maximum: int,
-) -> int:
-    raw = (env.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise CanaryError(f"{name} 必須是整數，實得 {raw!r}") from exc
-    if value < minimum or value > maximum:
-        raise CanaryError(f"{name} 必須介於 {minimum}..{maximum}，實得 {value}")
-    return value
-
-
 def _run_process(
     argv: Sequence[str],
     *,
     root: Path,
-    env: Mapping[str, str],
     timeout: int,
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+) -> process_env.CompletedProcess[str]:
+    return process_env.run(
         list(argv),
         cwd=str(root),
-        env=dict(env),
-        stdin=subprocess.DEVNULL,
+        stdin=process_env.DEVNULL,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -198,24 +193,22 @@ def _run_process_with_heartbeat(
     argv: Sequence[str],
     *,
     root: Path,
-    env: Mapping[str, str],
     timeout: int,
     heartbeat: float = MODEL_CANARY_HEARTBEAT_SECONDS,
-) -> subprocess.CompletedProcess[str]:
+) -> process_env.CompletedProcess[str]:
     """``_run_process`` with periodic progress lines while the child runs.
 
     The live model canary regularly takes tens of seconds on local hardware;
     with zero output users assume ``aicode`` is hung.  Timeout behaviour
-    matches ``_run_process``: raise ``subprocess.TimeoutExpired`` carrying any
+    matches ``_run_process``: raise ``process_env.TimeoutExpired`` carrying any
     partial output collected so far.
     """
-    with subprocess.Popen(
+    with process_env.popen(
         list(argv),
         cwd=str(root),
-        env=dict(env),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdin=process_env.DEVNULL,
+        stdout=process_env.PIPE,
+        stderr=process_env.PIPE,
         text=True,
     ) as process:
         started = time.monotonic()
@@ -225,21 +218,21 @@ def _run_process_with_heartbeat(
                 if remaining <= 0:
                     process.kill()
                     stdout, stderr = process.communicate()
-                    raise subprocess.TimeoutExpired(
+                    raise process_env.TimeoutExpired(
                         list(argv), timeout, output=stdout, stderr=stderr
                     )
                 try:
                     stdout, stderr = process.communicate(
                         timeout=min(heartbeat, remaining)
                     )
-                except subprocess.TimeoutExpired:
+                except process_env.TimeoutExpired:
                     elapsed = int(time.monotonic() - started)
                     _print(
                         f"headless run 仍在執行… 已 {elapsed} 秒"
                         f"（單次上限 {timeout} 秒）"
                     )
                     continue
-                return subprocess.CompletedProcess(
+                return process_env.CompletedProcess(
                     list(argv), process.returncode, stdout, stderr
                 )
         except BaseException:
@@ -248,20 +241,20 @@ def _run_process_with_heartbeat(
 
 
 def run_protocol_roundtrip(
-    *, root: Path, env: Mapping[str, str], timeout: int
+    *, root: Path, timeout: int
 ) -> tuple[tuple[str, ...], bool, ProtocolEvidence]:
     """initialize → tools/list → list_dir,走客戶端真正用的那一條路。
 
-    以前這裡要先問 `opencode debug config` 拿 `mcp.codetrail.command`,因為
-    OpenCode 才是決定「實際會執行什麼」的那一端。現在客戶端自己 spawn
-    `mcp_server.py`,所以「實際會執行什麼」就是 `client_mcp` 裡那一行 —— 再去
-    讀一份設定只會製造另一個會漂移的來源。
+    「實際會執行什麼」就是 `client_mcp` 裡那一行 —— 再去讀一份設定只會製造
+    另一個會漂移的來源。
+
+    **不傳 env**:`McpClient` 的 `env=` 是**覆寫**通道(呼叫端明確要求的值),
+    它在剝除之後才套用。把整份 `os.environ` 從那裡灌進去,等於把剛剝掉的
+    `AICODE_* / AI_CODE_* / CODETRAIL_* / OPENCODE_*` 原封不動加回去 ——
+    包含核准後的 `run_command` 子行程會繼承的那些機密。client 本來就會繼承
+    這個行程的環境,不需要我們再遞一次。
     """
-    client = client_mcp.McpClient(
-        root,
-        env={key: str(value) for key, value in env.items()},
-        start_timeout=float(timeout),
-    )
+    client = client_mcp.McpClient(root, start_timeout=float(timeout))
     try:
         try:
             specs = client.tools()
@@ -294,15 +287,10 @@ def run_protocol_roundtrip(
         client.close()
 
 
-def run_protocol_check(
-    *,
-    root: Path,
-    env: Mapping[str, str],
-    timeout: int,
-) -> ProtocolEvidence:
+def run_protocol_check(*, root: Path, timeout: int) -> ProtocolEvidence:
     try:
         names, list_dir_error, evidence = run_protocol_roundtrip(
-            root=root, env=env, timeout=timeout
+            root=root, timeout=timeout
         )
     except CanaryError:
         raise
@@ -381,12 +369,14 @@ def _local_probe_opener() -> urllib.request.OpenerDirector:
 
 
 def fetch_main_server_props(
-    env: Mapping[str, str],
+    base_url: str,
     *,
     timeout: int = 5,
 ) -> dict[str, Any] | None:
-    base_url = (env.get("AICODE_LLAMA_BASE_URL") or "http://localhost:8080").strip()
-    url = _server_root_url(base_url) + "/props"
+    """主 server 的 `/props`。`base_url` 由呼叫端從 deployment profile 給,
+    不從環境變數猜 —— 殼層殘留一個指向別台機器的 URL,等於拿別人的
+    chat_template / n_ctx 當自己的指紋輸入。"""
+    url = _server_root_url(base_url.strip()) + "/props"
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
         with _local_probe_opener().open(request, timeout=timeout) as response:
@@ -465,10 +455,10 @@ def build_fingerprint(
         # 權限 policy 改了,模型看到的東西就不同,舊判定不得沿用。
         "client_engine": _file_digest(REPO_ROOT / "client_engine.py"),
         "client_prompt": _file_digest(REPO_ROOT / "client_prompt.py"),
-        "client_chat": _file_digest(client_entry(env)),
+        "client_chat": _file_digest(client_entry()),
         # override 的路徑本身也要進指紋:同名但指到別的 checkout 時,
         # 只 hash 內容也可能剛好相同(例如兩份都還沒改)。
-        "client_entry_path": str(client_entry(env)),
+        "client_entry_path": str(client_entry()),
         "project_agents": _file_digest(root / "AGENTS.md"),
         # lessons 注入檔也是模型看到的「專案規則」:內容變了要讓 model canary
         # 快取失效(aicode 會在 canary 之前先 render 好這個檔)。
@@ -524,17 +514,27 @@ def build_fingerprint(
     return _json_digest(payload)
 
 
+#: 快取檔名帶 schema 號。
+#:
+#: 為什麼:同一台機器上可能同時裝著兩個世代的 CodeTrail(舊的 OpenCode 世代是
+#: ``CACHE_SCHEMA=2``、這一份是 3),而它們共用 ``~/.cache/codetrail``。讀到別的
+#: schema 會被當成空快取再**整檔覆寫**,於是兩邊每次啟動都互相清空對方的紀錄,
+#: 每一次 aicode 都要重跑一次幾十秒的 live canary。檔名分開之後兩份各記各的。
+CACHE_FILENAME = f"tool-call-canary.v{CACHE_SCHEMA}.json"
+
+
 def resolve_cache_path(env: Mapping[str, str]) -> Path | None:
-    explicit = (env.get("AICODE_TOOL_CANARY_CACHE") or "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
+    """快取檔位置。只由 `XDG_CACHE_HOME` / `HOME` 推導 —— 沒有覆寫變數。
+
+    要強制重測 = 刪掉那個檔(或 `--force`),不是設一個要查文件才知道的變數。
+    """
     xdg = (env.get("XDG_CACHE_HOME") or "").strip()
     if xdg:
-        return Path(xdg).expanduser() / "codetrail" / "tool-call-canary.json"
+        return Path(xdg).expanduser() / "codetrail" / CACHE_FILENAME
     home = (env.get("HOME") or env.get("USERPROFILE") or "").strip()
     if not home:
         return None
-    return Path(home).expanduser() / ".cache" / "codetrail" / "tool-call-canary.json"
+    return Path(home).expanduser() / ".cache" / "codetrail" / CACHE_FILENAME
 
 
 _CACHE_LANES = ("explicit", "implicit")
@@ -670,7 +670,7 @@ def _live_canary_reason(
 ) -> str:
     """Explain why a live model canary is about to run (new combo vs expiry)."""
     if ttl_seconds <= 0:
-        return "AICODE_TOOL_CANARY_TTL_SECONDS=0，快取已停用"
+        return "config.TOOL_CANARY_TTL_SECONDS=0，快取已停用"
     entry = _cache_entry(path, "explicit", fingerprint)
     if entry is not None and entry.get("status") == "pass":
         checked_at = entry.get("checked_at")
@@ -884,12 +884,12 @@ def run_model_attempt(
         env=env,
     )
     try:
-        result = _run_process_with_heartbeat(command, root=root, env=env, timeout=timeout)
+        result = _run_process_with_heartbeat(command, root=root, timeout=timeout)
     except FileNotFoundError:
         return ModelEvidence(False, "找不到 python 直譯器或客戶端進入點")
     except OSError as exc:
         return ModelEvidence(False, f"headless run 無法啟動（{type(exc).__name__}）")
-    except subprocess.TimeoutExpired as exc:
+    except process_env.TimeoutExpired as exc:
         evidence = inspect_model_events(_coerce_text(exc.stdout))
         return replace(evidence, success=False, reason=f"headless run 超過 {timeout} 秒")
 
@@ -921,7 +921,8 @@ def _model_canary_command(
     del title  # ephemeral session 沒有要存的標題
     command = [
         sys.executable,
-        str(client_entry(env)),
+        str(client_entry()),
+        "run",
         "--root",
         str(root),
         "--policy",
@@ -930,7 +931,7 @@ def _model_canary_command(
     if model_override:
         # 不帶的話 canary --model 指定的模型根本沒送出去,抽查的是別顆模型。
         command.extend(["--model", model_override])
-    command.extend(["run", "--format", "json", prompt])
+    command.extend(["--format", "json", prompt])
     return command
 
 
@@ -949,12 +950,12 @@ def run_implicit_model_attempt(
         env=env,
     )
     try:
-        result = _run_process_with_heartbeat(command, root=root, env=env, timeout=timeout)
+        result = _run_process_with_heartbeat(command, root=root, timeout=timeout)
     except FileNotFoundError:
         return ImplicitEvidence(ImplicitStatus.FAIL)
     except OSError:
         return ImplicitEvidence(ImplicitStatus.FAIL)
-    except subprocess.TimeoutExpired as exc:
+    except process_env.TimeoutExpired as exc:
         partial = inspect_implicit_events(_coerce_text(exc.stdout))
         return ImplicitEvidence(ImplicitStatus.TIMEOUT, partial.session_ids)
     if result.returncode != 0:
@@ -963,39 +964,25 @@ def run_implicit_model_attempt(
     return inspect_implicit_events(result.stdout)
 
 
-def _model_selection(
-    env: Mapping[str, str], explicit: str, frontend_args: Sequence[str]
-) -> tuple[str, str]:
+def _model_selection(env: Mapping[str, str], explicit: str) -> tuple[str, str]:
     """Return (selected model for the fingerprint, model to run the probe with).
 
-    以前 active model 來自 `opencode debug config` 的 `model` 欄位;現在 `aicode`
-    已經把解析結果 export 成 `AICODE_MODEL`,客戶端讀的也是它 —— 再去猜一份
-    只會製造兩個可能不一致的答案。
+    `explicit` 是呼叫端(preflight)已經解析好的主模型 —— canary 驗的必須就是
+    等一下真的要跑的那一顆。沒給就自己從 deployment profile / models.json 解析
+    一次;`env` 只用來定位那些檔(HOME),不是設定來源。
     """
     if explicit:
         return explicit, explicit
-    parsed = parse_cli_model_arg_detail(frontend_args)
-    if parsed.error:
-        raise CanaryError(parsed.error)
-    if parsed.values:
-        selected = parsed.values[-1]
-        return selected, selected
     resolved = resolve_main_model_from_env(dict(env))
     if not resolved.ok or not resolved.model:
         raise CanaryError(
-            "找不到主模型(AICODE_MODEL / deployment profile 都沒有),且本次未傳 -m/--model"
+            "找不到主模型(deployment profile 沒有 main.model),且呼叫端未指定模型"
         )
     return resolved.model, resolved.model
 
 
-def _handle_failure(message: str, *, warn_only: bool) -> int:
+def _handle_failure(message: str) -> int:
     _print(f"FAIL — {message}", error=True)
-    if warn_only:
-        _print(
-            "AICODE_TOOL_CANARY_WARN_ONLY 已不會略過 explicit/direct gate；"
-            "只有 implicit routing 診斷不擋啟動",
-            error=True,
-        )
     _print(
         "已拒絕啟動；請修正 direct-tool / MCP / explicit tool-call 契約後重試",
         error=True,
@@ -1019,69 +1006,42 @@ def run_all(
     root: Path,
     env: Mapping[str, str],
     explicit_model: str,
-    frontend_args: Sequence[str],
+    base_url: str,
     force: bool,
 ) -> int:
-    warn_only = _truthy(env.get("AICODE_TOOL_CANARY_WARN_ONLY"))
+    """`env` 只是**檔案位置**(HOME / XDG_CACHE_HOME)與子行程要繼承的使用者環境;
+    每一個設定值(模型、endpoint、逾時、TTL)都由參數或 `config.py` 常數決定。"""
+    mcp_timeout = TOOL_CANARY_MCP_TIMEOUT_SECONDS
+    model_timeout = TOOL_CANARY_MODEL_TIMEOUT_SECONDS
+    implicit_timeout = TOOL_CANARY_IMPLICIT_TIMEOUT_SECONDS
+    ttl_seconds = TOOL_CANARY_TTL_SECONDS
     try:
-        mcp_timeout = _env_int(
-            env,
-            "AICODE_TOOL_CANARY_MCP_TIMEOUT_SECONDS",
-            DEFAULT_MCP_TIMEOUT_SECONDS,
-            minimum=10,
-            maximum=900,
-        )
-        model_timeout = _env_int(
-            env,
-            "AICODE_TOOL_CANARY_MODEL_TIMEOUT_SECONDS",
-            DEFAULT_MODEL_TIMEOUT_SECONDS,
-            minimum=30,
-            maximum=1800,
-        )
-        implicit_timeout = _env_int(
-            env,
-            "AICODE_TOOL_CANARY_IMPLICIT_TIMEOUT_SECONDS",
-            DEFAULT_IMPLICIT_TIMEOUT_SECONDS,
-            minimum=30,
-            maximum=1800,
-        )
-        ttl_seconds = _env_int(
-            env,
-            "AICODE_TOOL_CANARY_TTL_SECONDS",
-            DEFAULT_CACHE_TTL_SECONDS,
-            minimum=0,
-            maximum=30 * 24 * 60 * 60,
-        )
-        protocol_evidence = run_protocol_check(root=root, env=env, timeout=mcp_timeout)
+        protocol_evidence = run_protocol_check(root=root, timeout=mcp_timeout)
     except CanaryError as exc:
-        return _handle_failure(str(exc), warn_only=warn_only)
+        return _handle_failure(str(exc))
 
     if not isinstance(protocol_evidence, ProtocolEvidence):
         return _handle_failure(
-            "MCP protocol check 沒有回傳 live tools/instructions fingerprint evidence",
-            warn_only=warn_only,
+            "MCP protocol check 沒有回傳 live tools/instructions fingerprint evidence"
         )
     _print(f"MCP PASS — {len(EXPECTED_MCP_TOOLS)} tools + list_dir round-trip")
 
     try:
-        selected_model, model_override = _model_selection(
-            env, explicit_model, frontend_args
-        )
+        selected_model, model_override = _model_selection(env, explicit_model)
     except CanaryError as exc:
-        return _handle_failure(str(exc), warn_only=warn_only)
+        return _handle_failure(str(exc))
 
-    props = fetch_main_server_props(env)
+    props = fetch_main_server_props(base_url)
     caps = props.get("chat_template_caps") if isinstance(props, Mapping) else None
     if isinstance(caps, Mapping) and caps.get("supports_tools") is False:
         return _handle_failure(
             "llama-server /props 明確回報 chat_template_caps.supports_tools=false；"
             "未執行任何 model canary",
-            warn_only=warn_only,
         )
     cache_path = resolve_cache_path(env)
     cache_ready = props is not None and cache_path is not None
     fingerprint = ""
-    bypass_cache = force or _truthy(env.get("AICODE_TOOL_CANARY_FORCE"))
+    bypass_cache = force
     explicit_cached = False
     if cache_ready:
         assert props is not None
@@ -1093,7 +1053,7 @@ def run_all(
             protocol_evidence=protocol_evidence,
         )
         if bypass_cache:
-            live_reason = "--force／AICODE_TOOL_CANARY_FORCE 略過快取"
+            live_reason = "--force 略過快取"
         else:
             age = cached_pass_age(
                 cache_path,
@@ -1169,8 +1129,7 @@ def run_all(
         if not explicit_passed:
             return _handle_failure(
                 "MCP protocol 已通過，但 explicit 模型連續兩次未完成真實 tool call："
-                + last_reason,
-                warn_only=warn_only,
+                + last_reason
             )
 
     if cache_ready and fingerprint and not bypass_cache:
@@ -1212,40 +1171,47 @@ def run_all(
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", help="sandbox/project root；預設 AICODE_ROOT 或 cwd")
-    parser.add_argument("--model", default="", help="model override for the headless client (a registry name or GGUF path, as aicode -m)")
-    parser.add_argument("--force", action="store_true", help="ignore a valid model-canary cache")
+    parser.add_argument("--root", help="sandbox/project root；預設 cwd")
     parser.add_argument(
-        "frontend_args",
-        nargs=argparse.REMAINDER,
-        help="arguments after -- are scanned only for -m/--model",
+        "--model",
+        default="",
+        help="要驗的主模型(registry 名或 GGUF 路徑);省略就從 deployment profile 解析",
     )
+    parser.add_argument(
+        "--base-url",
+        default="",
+        help="主 llama-server URL;省略就從 deployment profile 取",
+    )
+    parser.add_argument("--force", action="store_true", help="ignore a valid model-canary cache")
     return parser.parse_args(list(argv))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
-    env = os.environ.copy()
-    if _truthy(env.get("AICODE_TOOL_CANARY_SKIP")):
-        _print("SKIP — AICODE_TOOL_CANARY_SKIP=1（MCP 與模型 canary 都未執行）")
-        return 0
+    # 子行程的環境:剝掉全部 CodeTrail 設定變數。standalone 執行時這一步特別
+    # 重要 —— preflight 那條路的呼叫端是客戶端(它自己已經不看那些變數),
+    # 但直接跑這支的人可能就站在一個污染的殼層裡。
+    env = client_mcp.child_env()
 
-    raw_root = args.root or env.get("AICODE_ROOT") or os.getcwd()
+    raw_root = args.root or os.getcwd()
     try:
         root = Path(raw_root).expanduser().resolve(strict=True)
     except (OSError, ValueError) as exc:
-        return _handle_failure(f"canary root 無法解析：{type(exc).__name__}", warn_only=False)
+        return _handle_failure(f"canary root 無法解析：{type(exc).__name__}")
     if not root.is_dir():
-        return _handle_failure("canary root 不是目錄", warn_only=False)
+        return _handle_failure("canary root 不是目錄")
 
-    frontend_args = list(args.frontend_args)
-    if frontend_args[:1] == ["--"]:
-        frontend_args = frontend_args[1:]
+    base_url = args.base_url.strip()
+    if not base_url:
+        try:
+            base_url = default_base_url()
+        except CanaryError as exc:
+            return _handle_failure(str(exc))
     return run_all(
         root=root,
         env=env,
         explicit_model=args.model.strip(),
-        frontend_args=frontend_args,
+        base_url=base_url,
         force=args.force,
     )
 

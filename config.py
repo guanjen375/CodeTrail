@@ -15,7 +15,24 @@ import n_ctx as _n_ctx
 # ============================================================
 # 多 server 架構:每個角色一個 llama-server instance。URL、模型 ID 與啟動參數
 # 一律由 deployment_profile.py 解析；env/local profile 的 precedence 也只在那裡維護。
-_DEPLOYMENT_PROFILE = _deployment_profile.load_effective_profile(_os.environ)
+def _file_env() -> dict[str, str]:
+    """交給 `deployment_profile` / `model_resolution` 的環境:**只有 HOME**。
+
+    那兩個模組的 env overlay 是啟動核心的一部分(`~/start.sh` 與 launcher 靠它),
+    所以不能改模組,只能改「交什麼給它」。交整份 `os.environ` 的話,殼層裡任何殘留
+    的 `AICODE_*` 都會蓋過 `deployment.json` —— 兩份安裝共用一台機器時,那是
+    「使用者以為在跑 A、實際在跑 B」的機制。
+    """
+    home = _os.environ.get("HOME")
+    if home:
+        return {"HOME": home}
+    # Windows fallback,而且**只有** HOME 缺席時才交:兩個都交的話,一個殘留的
+    # USERPROFILE 就多一條可以指到別的 home 的路。
+    profile = _os.environ.get("USERPROFILE")
+    return {"USERPROFILE": profile} if profile else {}
+
+
+_DEPLOYMENT_PROFILE = _deployment_profile.load_effective_profile(_file_env())
 LLAMA_BASE_URL = _DEPLOYMENT_PROFILE.service("main").base_url
 LLAMA_EMBED_BASE_URL = _DEPLOYMENT_PROFILE.service("embedding").base_url
 LLAMA_RERANK_BASE_URL = _DEPLOYMENT_PROFILE.service("reranker").base_url
@@ -38,12 +55,13 @@ LLAMA_VL_URL = f"{LLAMA_VL_BASE_URL}/v1/chat/completions"
 # llama-server 啟動時要餵 GGUF 檔案路徑,使用者不會想在 env 裡塞絕對路徑。
 # 所以維護一份 bare-name → path 的映射,使用者只要 AICODE_MODEL=<name> 即可。
 # 來源(優先序):
-#   1. AICODE_MODEL_REGISTRY        — 直接放 JSON 字串
-#   2. AICODE_MODEL_REGISTRY_FILE   — 指向一個 JSON 檔
-#   3. ~/.config/codetrail/models.json
-# 三個都找不到 → 空 dict;此時 AICODE_MODEL 直接視為 GGUF 路徑。
+# 來源:`~/.config/codetrail/models.json`(set_config 產生)。
+# 找不到 → 空 dict;此時 deployment.json 的 main.model 必須是 GGUF 絕對路徑。
+# `deployment_profile.load_model_registry` 另外認兩個環境變數
+# (`AICODE_MODEL_REGISTRY` / `_FILE`),但那是**啟動核心**與 launcher 的契約:
+# 我們交給它的是 `_file_env()`(只有 HOME),所以客戶端這一側看不到它們。
 def _load_model_registry() -> dict[str, str]:
-    return _deployment_profile.load_model_registry(_os.environ)
+    return _deployment_profile.load_model_registry(_file_env())
 
 
 MODEL_REGISTRY: dict[str, str] = _load_model_registry()
@@ -73,13 +91,12 @@ def resolve_model_path(name_or_path: str) -> str:
 # 主聊天 / 程式推導模型
 # ============================================================
 # 設計守則: CodeTrail 不內建、不推薦、不 fallback 任何固定主模型。
-# 使用者必須自己挑一顆 GGUF 模型,並透過下列任一方式告訴 CodeTrail:
+# 使用者必須自己挑一顆 GGUF 模型,並用 `./set_config.sh` 把它寫進
+# `~/.config/codetrail/deployment.json` 的 `main.model`。
 #
-#   1. AICODE_MODEL=<MODEL>                 (環境變數,最優先)
-#   2. aicode -m <MODEL> / --model <MODEL>  (CLI 旗標)
-#   3. deployment profile / local override 的 main.model
-#
-# 刻意**沒有** opencode.json fallback:CodeTrail 已經不啟動 OpenCode。
+# **只有這一個來源。** 沒有環境變數、沒有 CLI 旗標:llama-server 一啟動就鎖死
+# 一顆模型,再開一條「每次啟動可以改」的路只會讓兩邊不一致 —— 使用者以為在跑
+# A、實際在跑 B。換模型 = 重跑 set_config 再重啟 server。
 #
 # <MODEL> 可以是:
 #   - registry 裡登記的 bare name(例如 "qwen3-coder-30b")
@@ -99,10 +116,10 @@ VL_MODEL = _DEPLOYMENT_PROFILE.service("vl").model or ""
 # ingest_document 需要較完整的結構化文字供 RAG 切 chunk，因此給較大的預算。
 # timeout 是單次 HTTP read timeout；http_client 對 read timeout 不重試，避免一張圖
 # 卡住後把同一個昂貴的生成請求重送數次。
-VL_ANALYZE_MAX_TOKENS = int(_os.environ.get("AICODE_VL_ANALYZE_MAX_TOKENS", "1024"))
-VL_INGEST_MAX_TOKENS = int(_os.environ.get("AICODE_VL_INGEST_MAX_TOKENS", "2048"))
-VL_ANALYZE_TIMEOUT = int(_os.environ.get("AICODE_VL_ANALYZE_TIMEOUT", "180"))
-VL_INGEST_TIMEOUT = int(_os.environ.get("AICODE_VL_INGEST_TIMEOUT", "300"))
+VL_ANALYZE_MAX_TOKENS = 1024
+VL_INGEST_MAX_TOKENS = 2048
+VL_ANALYZE_TIMEOUT = 180
+VL_INGEST_TIMEOUT = 300
 
 # CodeTrail 客戶端對每一次 MCP 呼叫的固定 read timeout。必須略高於
 # ingest_document 的 600 秒內部上限,否則圖片匯入會在 server 還在跑的時候被
@@ -113,13 +130,13 @@ MCP_CALL_TIMEOUT_SECONDS = 660
 
 
 def _resolve_main_model() -> str:
-    """主模型來源: AICODE_MODEL > profile/local override。
+    """主模型:deployment profile 的 `main.model`。
 
     回傳 bare model name(可能是 registry key,可能是 GGUF 路徑),找不到時回空字串。
-    `aicode` wrapper 會另外處理 `-m` / `--model` CLI 旗標 (在這裡看不到),
-    它應該在啟動子行程前把 AICODE_MODEL 設好。
+    交給解析器的是 `_file_env()`(只有 HOME),所以殼層裡殘留的 `AICODE_MODEL`
+    (可能是另一份安裝的 `~/start.sh` 設的)不會蓋過設定檔。
     """
-    resolved = _model_resolution.resolve_main_model_from_env(_os.environ)
+    resolved = _model_resolution.resolve_main_model_from_env(_file_env())
     return resolved.model if resolved.ok else ""
 
 
@@ -128,7 +145,7 @@ MODEL = _resolve_main_model()
 
 def require_main_model() -> str:
     """取目前的主模型,沒設就 fail-loud。 LLM 呼叫端進入點都該先呼這個。"""
-    resolved = _model_resolution.resolve_main_model_from_env(_os.environ)
+    resolved = _model_resolution.resolve_main_model_from_env(_file_env())
     model = resolved.model if resolved.ok else ""
     if not model:
         detail = f"\n解析錯誤: {resolved.error}" if resolved.error else ""
@@ -136,13 +153,10 @@ def require_main_model() -> str:
             "CodeTrail 找不到主聊天 / 程式推導模型 (CODE_MODEL)。"
             f"{detail}\n"
             "請先下載一顆 GGUF 模型(例如從 huggingface 抓 qwen3-coder-30b 的 q4_k_m),\n"
-            "啟動 llama-server 後,任選一種方式設定模型:\n"
-            "  1) export AICODE_MODEL=<MODEL>                    (最優先)\n"
-            "  2) aicode -m <MODEL>                              (per-run CLI 旗標)\n"
-            "  3) deployment profile / local override 設 main.model\n"
-
-            "<MODEL> 可以是 MODEL_REGISTRY 裡的 bare name 或 GGUF 絕對路徑。\n"
-            "Registry 維護在 ~/.config/codetrail/models.json,或用 AICODE_MODEL_REGISTRY env。\n"
+            "啟動 llama-server 後跑 ./set_config.sh,它會把模型寫進\n"
+            "  ~/.config/codetrail/deployment.json 的 main.model。\n"
+            "<MODEL> 可以是 MODEL_REGISTRY 裡的 bare name 或 GGUF 絕對路徑;\n"
+            "registry 維護在 ~/.config/codetrail/models.json。\n"
             "CodeTrail 不會替你預設或推薦。"
         )
     return model
@@ -209,20 +223,19 @@ def require_pymupdf4llm():
 # 準確率假設——那些會讓別台機器的行為與這台不同(workflow §7)。
 # 需要調整的人改環境變數即可,不必改碼。
 class FigureConfigError(ValueError):
-    """`AICODE_FIGURE_*` 環境覆寫超出契約允許範圍。一律 fail-loud,不回退預設值。
+    """`FIGURE_*` 常數超出契約允許範圍。一律 fail-loud,不回退預設值。
 
-    為什麼不「壞值就用預設」:這一組裡有**安全語義旋鈕**。實例——
-    `AICODE_FIGURE_KIND_MARGIN=nan` 會讓 `top - second < margin` 永遠為 False
-    (NaN 的比較恆假),於是 table/terminal 分數再接近也不會進 KIND_UNKNOWN 的
-    dual pass,誤判就靜默通過;`AICODE_FIGURE_IOU_MERGE=-1` 會讓互不相交的候選
-    也被融合。靜默回退預設值會讓「我設了但沒生效」與「我設對了」看起來一樣,
-    所以壞值必須在 import 時就炸。
+    為什麼還要在常數上驗:這一組裡有**安全語義旋鈕**。實例——`FIGURE_KIND_MARGIN`
+    是 NaN 會讓 `top - second < margin` 永遠為 False(NaN 的比較恆假),於是
+    table/terminal 分數再接近也不會進 KIND_UNKNOWN 的 dual pass,誤判就靜默通過;
+    `FIGURE_IOU_MERGE = -1` 會讓互不相交的候選也被融合。改壞的那一次 import 就要爆,
+    而不是讓一份 PDF 靜默抽錯。改這些數字的人是改 repo 的人,但驗證的理由沒有變。
     """
 
 
-def _figure_num(name: str, default: str, *, cast, lo, hi=None, lo_exclusive: bool = False):
-    """解析單一 AICODE_FIGURE_* 覆寫;非有限值或超出 [lo, hi] 一律 FigureConfigError。"""
-    raw = _os.environ.get(name, default)
+def _figure_num(name: str, default, *, cast, lo, hi=None, lo_exclusive: bool = False):
+    """驗一個 FIGURE_* 常數;非有限值或超出 [lo, hi] 一律 FigureConfigError。"""
+    raw = default
     try:
         value = cast(raw)
     except (TypeError, ValueError) as exc:
@@ -238,26 +251,26 @@ def _figure_num(name: str, default: str, *, cast, lo, hi=None, lo_exclusive: boo
     return value
 
 
-def _figure_int(name: str, default: str, *, lo: int, hi: int | None = None) -> int:
+def _figure_int(name: str, default, *, lo: int, hi: int | None = None) -> int:
     return _figure_num(name, default, cast=int, lo=lo, hi=hi)
 
 
-def _figure_float(name: str, default: str, *, lo: float, hi: float,
+def _figure_float(name: str, default, *, lo: float, hi: float,
                   lo_exclusive: bool = False) -> float:
     return _figure_num(name, default, cast=float, lo=lo, hi=hi, lo_exclusive=lo_exclusive)
 
 
 FIGURE_MAX_CANDIDATES_PER_PAGE = _figure_int(
-    "AICODE_FIGURE_MAX_CANDIDATES_PER_PAGE", "12", lo=1)
+    "FIGURE_MAX_CANDIDATES_PER_PAGE", 12, lo=1)
 FIGURE_MAX_CANDIDATES_PER_DOC = _figure_int(
-    "AICODE_FIGURE_MAX_CANDIDATES_PER_DOC", "200", lo=1)
+    "FIGURE_MAX_CANDIDATES_PER_DOC", 200, lo=1)
 # 2026-08-24 從 120 提到 200:raster 的上界公式因為新增「猜錯 kind 時多一輪 diagram
 # 退路」而從 (1+R)+2T(1+R) 變成 +T(1+R)(整整多 50%)。閘沒跟著調的話,原本剛好在
 # 預算內的文件會突然被擋下——而那一輪退路正是為了讓它們**進得去**才加的。
 FIGURE_MAX_VL_CALLS_PER_DOC = _figure_int(
-    "AICODE_FIGURE_MAX_VL_CALLS_PER_DOC", "200", lo=0)
+    "FIGURE_MAX_VL_CALLS_PER_DOC", 200, lo=0)
 FIGURE_MAX_TILES_PER_CANDIDATE = _figure_int(
-    "AICODE_FIGURE_MAX_TILES_PER_CANDIDATE", "8", lo=1)
+    "FIGURE_MAX_TILES_PER_CANDIDATE", 8, lo=1)
 # 單次呼叫與整份文件的 image-token 預算。真值依 server/模型而異,preflight
 # 用 FIGURE_IMAGE_TOKEN_PATCH_PX 的 patch 估算(估算值,不是保證)。
 #
@@ -268,34 +281,34 @@ FIGURE_MAX_TILES_PER_CANDIDATE = _figure_int(
 # 51 頁 / 32 個候選是 110196。400000 仍然低於 491520,所以它還是一道真的第二
 # 防線(擋圖特別大的病態文件),只是不再對正常文件誤擊。
 FIGURE_MAX_IMAGE_TOKENS_PER_CALL = _figure_int(
-    "AICODE_FIGURE_MAX_IMAGE_TOKENS_PER_CALL", "4096", lo=1)
+    "FIGURE_MAX_IMAGE_TOKENS_PER_CALL", 4096, lo=1)
 FIGURE_MAX_IMAGE_TOKENS_PER_DOC = _figure_int(
-    "AICODE_FIGURE_MAX_IMAGE_TOKENS_PER_DOC", "400000", lo=1)
+    "FIGURE_MAX_IMAGE_TOKENS_PER_DOC", 400000, lo=1)
 FIGURE_IMAGE_TOKEN_PATCH_PX = _figure_int(
-    "AICODE_FIGURE_IMAGE_TOKEN_PATCH_PX", "28", lo=1)
+    "FIGURE_IMAGE_TOKEN_PATCH_PX", 28, lo=1)
 # 結構化 chunk 的字元預算。row/line 是不可分割原子:超過預算就多切一個
 # chunk,單一 row/line 超過就整條保留並標 oversized(絕不拆格拆列)。
 FIGURE_CHUNK_MAX_CHARS = _figure_int(
-    "AICODE_FIGURE_CHUNK_MAX_CHARS", "1200", lo=1)
+    "FIGURE_CHUNK_MAX_CHARS", 1200, lo=1)
 # render 目標:以 DPI 為起點,再依「有效 glyph 高度」與 image-token 預算調整。
 FIGURE_RENDER_TARGET_DPI = _figure_int(
-    "AICODE_FIGURE_RENDER_TARGET_DPI", "200", lo=1)
+    "FIGURE_RENDER_TARGET_DPI", 200, lo=1)
 FIGURE_RENDER_MAX_SIDE_PX = _figure_int(
-    "AICODE_FIGURE_RENDER_MAX_SIDE_PX", "2200", lo=1)
-FIGURE_MIN_GLYPH_PX = _figure_int("AICODE_FIGURE_MIN_GLYPH_PX", "12", lo=1)
-FIGURE_TILE_OVERLAP_PX = _figure_int("AICODE_FIGURE_TILE_OVERLAP_PX", "48", lo=0)
+    "FIGURE_RENDER_MAX_SIDE_PX", 2200, lo=1)
+FIGURE_MIN_GLYPH_PX = _figure_int("FIGURE_MIN_GLYPH_PX", 12, lo=1)
+FIGURE_TILE_OVERLAP_PX = _figure_int("FIGURE_TILE_OVERLAP_PX", 48, lo=0)
 # 候選融合與 kind 判定。**這兩個是安全語義旋鈕**:
 #   IOU_MERGE 必須 > 0(0 會讓只要相交就融合,-1 會讓互不相交的也融合)
 #   KIND_MARGIN 在 (0, 1](**排除 0**,理由見下方);NaN/負值會讓 dual pass 永遠不觸發
-FIGURE_IOU_MERGE = _figure_float("AICODE_FIGURE_IOU_MERGE", "0.5", lo=0.01, hi=1.0)
+FIGURE_IOU_MERGE = _figure_float("FIGURE_IOU_MERGE", 0.5, lo=0.01, hi=1.0)
 # KIND_MARGIN 的下界**排除 0**:兩處判定都是 `difference < margin`,margin 為 0 時連
 # 完全同分也不會進 KIND_UNKNOWN / kind_ambiguous,而是被任意選成 terminal——那不是
 # 「明確關閉 dual pass」,是「同分時靜默錯配」(workflow §5 table ⑨)。
-FIGURE_KIND_MARGIN = _figure_float("AICODE_FIGURE_KIND_MARGIN", "0.15",
+FIGURE_KIND_MARGIN = _figure_float("FIGURE_KIND_MARGIN", 0.15,
                                    lo=0.0, hi=1.0, lo_exclusive=True)
 # schema / validator 不合格時的重試次數(workflow §4 Step 1:重試一次仍失敗
 # → 整份 PDF 零寫入)
-FIGURE_EXTRACT_RETRIES = _figure_int("AICODE_FIGURE_EXTRACT_RETRIES", "1", lo=0, hi=5)
+FIGURE_EXTRACT_RETRIES = _figure_int("FIGURE_EXTRACT_RETRIES", 1, lo=0, hi=5)
 # 截斷(`finish_reason="length"`)之後,重試最多可以把輸出預算加到多少。
 #
 # 第一次抽取用 VL_INGEST_MAX_TOKENS(使用者設的成本上限)。截斷代表那張圖的
@@ -307,40 +320,33 @@ FIGURE_EXTRACT_RETRIES = _figure_int("AICODE_FIGURE_EXTRACT_RETRIES", "1", lo=0,
 # 讓短輸出變貴;成本只在真的需要那麼長時才發生。天花板的作用是擋住「模型陷入
 # 重複、把整個 context 生滿」的最壞情況。
 FIGURE_VL_MAX_TOKENS_CEILING = _figure_int(
-    "AICODE_FIGURE_VL_MAX_TOKENS_CEILING", "8192", lo=1)
+    "FIGURE_VL_MAX_TOKENS_CEILING", 8192, lo=1)
 # review artifacts(可能含 NDA 內容,見 docs/rag.md 的保存與清除說明)
 FIGURE_REVIEW_DIR = ".codetrail/figures"
 FIGURE_REVIEW_MAX_RUNS_PER_DOC = _figure_int(
-    "AICODE_FIGURE_REVIEW_MAX_RUNS_PER_DOC", "5", lo=1)
+    "FIGURE_REVIEW_MAX_RUNS_PER_DOC", 5, lo=1)
 # capability probe 快取(依 server/model/template fingerprint 失效)
 FIGURE_PROBE_TTL_SECONDS = _figure_int(
-    "AICODE_FIGURE_PROBE_TTL_SECONDS", "86400", lo=0)
-FIGURE_PROBE_FILE_ENV = "AICODE_FIGURE_PROBE_FILE"
-
-
+    "FIGURE_PROBE_TTL_SECONDS", 86400, lo=0)
 def FIGURE_PROBE_CACHE_FILE():
     """capability probe 快取路徑(比照 lessons store 放 ~/.config/codetrail/)。
 
-    函式而不是常數:HOME 在測試裡會被 monkeypatch,import-time 綁值會讓
-    測試寫到真實 home。
+    函式而不是常數:`HOME` 在測試裡會被改,import-time 綁值會讓測試寫到真實 home。
+    位置沒有覆寫開關 —— 測試改 `HOME` 就夠了,而一個「檔案位置」的環境變數只會
+    讓 runtime 與診斷各自看到不同的檔。
     """
-    override = _os.environ.get(FIGURE_PROBE_FILE_ENV, "").strip()
-    if override:
-        return _Path(override).expanduser()
     home = _os.environ.get("HOME") or _os.path.expanduser("~")
     return _Path(home) / ".config" / "codetrail" / "figure_probe.json"
 
 
-# 主模型只保留一個 n_ctx 概念：正常由 set_config 的 --ctx 寫入 deployment
-# profile / server -c；aicode 啟動時再從 server /props 觀測實值並以
-# AICODE_N_CTX 傳給 runtime。沒經 wrapper 時，回到 effective profile 的 main.ctx。
-_PROFILE_MAIN_CTX = _DEPLOYMENT_PROFILE.service("main").ctx or _n_ctx.DEFAULT_N_CTX
-N_CTX_RESOLUTION = _n_ctx.resolve_n_ctx(
-    _os.environ,
-    default=_PROFILE_MAIN_CTX,
-    default_source="deployment profile main.ctx",
+# 主模型只保留一個 n_ctx 概念：由 set_config 的 --ctx 寫入 deployment profile
+# 與 server 的 -c;啟動時再從 server /props 觀測實值並以
+# runtime 由 `client_preflight` 觀測 server 的 `/props` 拿實值,再以 argv 交給
+# 每一個元件(`mcp_server --n-ctx`);這裡的值是「沒有人交過來」時的靜態預設。
+N_CTX = _n_ctx.validate_n_ctx(
+    _DEPLOYMENT_PROFILE.service("main").ctx or _n_ctx.DEFAULT_N_CTX,
+    "deployment profile main.ctx",
 )
-N_CTX = N_CTX_RESOLUTION.value
 
 # 舊 production call sites / external scripts 的相容 alias。三者現在永遠是同一個
 # 主 n_ctx，不再讓 NUM_CTX 與 DYNAMIC_NUM_CTX_MAX 形成兩個可漂移的使用者設定。
@@ -361,6 +367,21 @@ DYNAMIC_NUM_CTX_MAX = N_CTX
 DYNAMIC_NUM_CTX_BUFFER = 1.3     # 預留空間給回答（調整: 1.5->1.3）
 CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
 
+
+def set_runtime_n_ctx(value: int) -> int:
+    """把觀測到的 server n_ctx 套進 runtime。`mcp_server --n-ctx` 的唯一入口。
+
+    **四個名字一起改**:`N_CTX` 與它的三個相容 alias 是在 import 期由同一個值
+    派生的,只改第一個等於留下三個仍指著 deployment profile 舊值的上限 ——
+    而症狀是 llama-server 從 prompt 前面靜默截掉,不是一個錯誤訊息。
+    """
+    global N_CTX, NUM_CTX, NUM_CTX_FULL_MODE, DYNAMIC_NUM_CTX_MAX
+    N_CTX = _n_ctx.validate_n_ctx(value, "--n-ctx")
+    NUM_CTX = N_CTX
+    NUM_CTX_FULL_MODE = N_CTX
+    DYNAMIC_NUM_CTX_MAX = N_CTX
+    return N_CTX
+
 # ============================================================
 # Context Budget / Hard Gate（P0：避免 silent truncation）
 # ============================================================
@@ -369,11 +390,10 @@ CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
 # 這些設定只影響 CodeTrail internal LLM calls;聊天客戶端的取樣值另由 client_engine 明示送出
 # (透過 openai-compatible provider)，server 端的 -c (n_ctx) 才是它真正的上限。
 #
-# - AICODE_RESERVED_OUTPUT_TOKENS: 估算時保留給模型輸出的 token 數
-# - AICODE_CTX_SOFT_THRESHOLD: 使用率超過此值時輸出 WARN
-# - AICODE_CTX_HARD_THRESHOLD: 使用率超過此值時拒絕送出
-# - AICODE_CTX_GATE_ENABLED: 設成 0 可暫時停用 gate（除錯用，不建議生產關閉）
-RESERVED_OUTPUT_TOKENS = int(_os.environ.get("AICODE_RESERVED_OUTPUT_TOKENS", "4096"))
+# RESERVED_OUTPUT_TOKENS: 估算時保留給模型輸出的 token 數
+# CTX_SOFT_THRESHOLD:     使用率超過此值時輸出 WARN
+# CTX_HARD_THRESHOLD:     使用率超過此值時拒絕送出
+RESERVED_OUTPUT_TOKENS = 4096
 
 # 客戶端(聊天迴圈)單次回覆的輸出上限。**唯一常數**:同時當
 #   1) /v1/chat/completions 送出的 max_tokens,
@@ -383,33 +403,57 @@ RESERVED_OUTPUT_TOKENS = int(_os.environ.get("AICODE_RESERVED_OUTPUT_TOKENS", "4
 # prompt 仍可能在生成途中把 ctx 撐爆並被 llama-server 從前面靜默截掉。
 # 刻意**不**沿用 RESERVED_OUTPUT_TOKENS:那是 knowledge.py 內部呼叫(短答、
 # 自我檢查)的保留額,兩者的用途與合理值都不同。
-# 上限 32000:壓縮門檻的推導公式(compaction_mode.effective_max_output)把
+# 上限 32000:壓縮門檻的推導公式(compaction_formula.effective_max_output)把
 # max_output 夾在這個數字,所以更大的值會讓「實送的 max_tokens」與「門檻推導
 # 用的 max_output」變成兩個數 —— 門檻不再由實際輸出上限推出來。0 在同一條
 # 公式裡會被翻成 32000,也不是使用者的意思。兩種都 fail-loud,不靜默改寫。
 CLIENT_MAX_OUTPUT_TOKENS_CAP = 32000
-try:
-    CLIENT_MAX_OUTPUT_TOKENS = int(_os.environ.get("AICODE_CLIENT_MAX_OUTPUT_TOKENS", "8192"))
-except ValueError as _exc:  # pragma: no cover - import guard
-    raise RuntimeError(
-        "AICODE_CLIENT_MAX_OUTPUT_TOKENS 必須是整數,得到 "
-        f"{_os.environ.get('AICODE_CLIENT_MAX_OUTPUT_TOKENS')!r}"
-    ) from _exc
+CLIENT_MAX_OUTPUT_TOKENS = 8192
+# 常數之後這仍然是 import-time 的**不變式**,不是「使用者設錯」的檢查:改這個
+# 數字的人是改 repo 的人,而三個用途必須同時成立。留著它,改壞的那一次 import
+# 就爆,而不是「送 65536、門檻按 32000 算」然後完全無聲。
 if not 0 < CLIENT_MAX_OUTPUT_TOKENS <= CLIENT_MAX_OUTPUT_TOKENS_CAP:  # pragma: no cover - import guard
     raise RuntimeError(
-        f"AICODE_CLIENT_MAX_OUTPUT_TOKENS 必須介於 1..{CLIENT_MAX_OUTPUT_TOKENS_CAP},"
+        f"CLIENT_MAX_OUTPUT_TOKENS 必須介於 1..{CLIENT_MAX_OUTPUT_TOKENS_CAP},"
         f"得到 {CLIENT_MAX_OUTPUT_TOKENS}。它同時是實送的 max_tokens、context gate 的"
         "保留額與壓縮門檻的 max_output;超出這個範圍時三者不再是同一個數字。"
     )
-CTX_SOFT_THRESHOLD = float(_os.environ.get("AICODE_CTX_SOFT_THRESHOLD", "0.80"))
-CTX_HARD_THRESHOLD = float(_os.environ.get("AICODE_CTX_HARD_THRESHOLD", "0.90"))
-CTX_GATE_ENABLED = _os.environ.get("AICODE_CTX_GATE_ENABLED", "1").lower() in ("1", "true", "yes")
+CTX_SOFT_THRESHOLD = 0.80
+CTX_HARD_THRESHOLD = 0.90
+# context gate **沒有關閉開關,連常數都沒有**。每個逃生口都是一個要查文件才知道
+# 的隱形狀態,而這一個關掉之後的症狀是「llama-server 從 prompt 前面靜默截掉」——
+# 使用者看到的是模型忘記前面說過什麼,不是一個錯誤。
 
 # Telemetry：每次 LLM call 寫一行 metadata 到 JSONL。
 # 嚴格只記 count/metadata，不寫 prompt / tool output / 檔案內容，避免 NDA 外洩。
 # 預設路徑 .codetrail/context_metrics.jsonl，已被 .gitignore 的 *.jsonl 規則涵蓋。
-CTX_METRICS_ENABLED = _os.environ.get("AICODE_CTX_METRICS_ENABLED", "1").lower() in ("1", "true", "yes")
-CTX_METRICS_PATH = _os.environ.get("AICODE_CTX_METRICS_PATH", ".codetrail/context_metrics.jsonl")
+# 預設開。readonly session 由 `mcp_server --readonly` 與客戶端各自關掉它
+# (replay 的契約是前後 project state 不變),不是環境變數。
+CTX_METRICS_ENABLED = True
+CTX_METRICS_PATH = ".codetrail/context_metrics.jsonl"
+
+# ============================================================
+# tool-call canary（scripts/tool_call_canary.py）的時限與快取期
+# ============================================================
+# 全部是 repo 常數:改這些數字是改 repo,所有使用者一致。以前它們是四個
+# `AICODE_TOOL_CANARY_*` 環境變數,加上三個逃生口(SKIP / FORCE / WARN_ONLY)
+# 與一個位置覆寫(CACHE)。逃生口一律刪除、無替代:要跳過某個檢查就是修那個
+# 檢查,要強制重測就是 `--force` 或刪掉 ~/.cache/codetrail 那個檔。
+TOOL_CANARY_MCP_TIMEOUT_SECONDS = 90
+TOOL_CANARY_MODEL_TIMEOUT_SECONDS = 120
+TOOL_CANARY_IMPLICIT_TIMEOUT_SECONDS = 180
+TOOL_CANARY_TTL_SECONDS = 24 * 60 * 60
+# import-time 不變式:改壞的那一次 import 就爆,而不是讓 canary 在啟動路徑上
+# 用一個 0 秒逾時無聲失敗。
+for _name, _value, _low, _high in (
+    ("TOOL_CANARY_MCP_TIMEOUT_SECONDS", TOOL_CANARY_MCP_TIMEOUT_SECONDS, 10, 900),
+    ("TOOL_CANARY_MODEL_TIMEOUT_SECONDS", TOOL_CANARY_MODEL_TIMEOUT_SECONDS, 30, 1800),
+    ("TOOL_CANARY_IMPLICIT_TIMEOUT_SECONDS", TOOL_CANARY_IMPLICIT_TIMEOUT_SECONDS, 30, 1800),
+    ("TOOL_CANARY_TTL_SECONDS", TOOL_CANARY_TTL_SECONDS, 0, 30 * 24 * 60 * 60),
+):  # pragma: no cover - import guard
+    if not isinstance(_value, int) or isinstance(_value, bool) or not _low <= _value <= _high:
+        raise RuntimeError(f"config.{_name} 必須是 {_low}..{_high} 的整數,得到 {_value!r}")
+del _name, _value, _low, _high
 
 MAX_TOTAL_CHARS = 200000  # 200KB，讓中小型專案使用完整模式
 
@@ -469,18 +513,30 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 # Downloads/tmp 裡的截圖、PDF、firmware blob，先透過 import_external_file
 # 複製進 AICODE_ROOT/.aicode_uploads/，再交給 read_file / analyze_file /
 # ingest_document。此入口預設關閉，避免 MCP server 任意讀本機檔案。
-EXTERNAL_IMPORT_ENABLED = _os.environ.get("AI_CODE_ALLOW_EXTERNAL_IMPORT", "").lower() in (
-    "1", "true", "yes"
-)
-EXTERNAL_IMPORT_ROOTS = [
-    p.strip()
-    for p in _os.environ.get("AI_CODE_IMPORT_ROOTS", "").split(_os.pathsep)
-    if p.strip()
-]
-EXTERNAL_IMPORT_DEST_DIR = _os.environ.get("AI_CODE_EXTERNAL_IMPORT_DIR", ".aicode_uploads")
-EXTERNAL_IMPORT_MAX_BYTES = int(
-    float(_os.environ.get("AI_CODE_EXTERNAL_IMPORT_MAX_MB", "100")) * 1024 * 1024
-)
+#: 前兩個是 **client.json 的使用者開關**(`client_config.apply_to_config()` 覆寫);
+#: 這裡的值是「沒有設定檔」時的 fail-closed 預設。後兩個是 repo 常數。
+EXTERNAL_IMPORT_ENABLED = False
+EXTERNAL_IMPORT_ROOTS: list[str] = []
+EXTERNAL_IMPORT_DEST_DIR = ".aicode_uploads"
+EXTERNAL_IMPORT_MAX_MB = 100
+EXTERNAL_IMPORT_MAX_BYTES = int(EXTERNAL_IMPORT_MAX_MB * 1024 * 1024)
+
+# ============================================================
+# client.json 的使用者開關(`client_config.apply_to_config()` 覆寫)
+# ============================================================
+# 這裡的值是「沒有設定檔」時的預設,每一個都落在 fail-closed 的那一邊。
+#: 主模型端點非 loopback 時才放行送出 prompt。
+MODEL_REMOTE_OK = False
+#: 讀被分析專案的 AGENTS.md 與 .codetrail/lessons.md。
+PROJECT_INSTRUCTIONS_ENABLED = True
+#: 反組譯用的 objdump;空字串 = 用 PATH 上的。
+OBJDUMP = ""
+#: `.h` 當成哪一種語言解析。
+H_LANG = "c"
+#: 把問答寫進資料飛輪(內容是 NDA 問答,所以預設關)。
+COLLECT_DATA = False
+#: 用容器跑 run_command。
+USE_CONTAINER = False
 EXTERNAL_IMPORT_ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | {
     ".pdf", ".md", ".txt", ".log",
     ".json", ".jsonl", ".yaml", ".yml", ".toml", ".csv",
@@ -546,7 +602,6 @@ INDEX_EGG_INFO_SUFFIX = ".egg-info"
 
 # C：部署層設定檔。永不進 repo、永不出現在任何輸出（連路徑都不印）。
 INDEX_SCOPE_SCHEMA_VERSION = 1
-INDEX_SCOPE_FILE_ENV = "AICODE_INDEX_SCOPE_FILE"
 INDEX_SCOPE_MAX_PATTERNS = 200      # 每個 root（include + exclude 合計）
 INDEX_SCOPE_MAX_PATTERN_CHARS = 512
 
@@ -593,48 +648,43 @@ EMBEDDING_MODEL = _DEPLOYMENT_PROFILE.service("embedding").model or ""
 #      把「整份文件的窗」送去遠端（NDA）。
 # KB_CONTEXT_USE 同時是緊急 kill switch：關掉之後查詢端立刻退回 content-only
 # 訊號，不需要重建 KB。
-KB_CONTEXT_GENERATE = _os.environ.get(
-    "AICODE_KB_CONTEXT_GENERATE", ""
-).lower() in ("1", "true", "yes")
-KB_CONTEXT_USE = _os.environ.get(
-    "AICODE_KB_CONTEXT_USE", ""
-).lower() in ("1", "true", "yes")
+KB_CONTEXT_GENERATE = False
+KB_CONTEXT_USE = False
 # main URL 非 loopback 時，必須顯式同意才會把文件內容送出去。
-KB_CONTEXT_REMOTE_OK = _os.environ.get(
-    "AICODE_KB_CONTEXT_REMOTE_OK", ""
-).lower() in ("1", "true", "yes")
+# **client.json 的使用者開關**(`kb_context_remote_ok`);這裡是 fail-closed 預設。
+KB_CONTEXT_REMOTE_OK = False
 
 # 生成一段 ctx 的 token 上限（送出時就明設 max_tokens，回應後截斷只是第二道）。
-KB_CONTEXT_TARGET_TOKENS = int(_os.environ.get("AICODE_KB_CONTEXT_TARGET_TOKENS", "100"))
+KB_CONTEXT_TARGET_TOKENS = 100
 # 推理模型（DeepSeek / Qwen thinking 等）會把 reasoning token 一起算進
 # max_tokens。只送 TARGET_TOKENS 的話，思考就把額度用完、content 直接是空字串
 # ——實測 21 個 chunk 有 4 個因此變成 absent。所以請求端的上限是
 # TARGET + REASONING，「50–100 token」那個契約改由回應後截斷來保證。
-KB_CONTEXT_REASONING_TOKENS = int(
-    _os.environ.get("AICODE_KB_CONTEXT_REASONING_TOKENS", "512")
-)
+KB_CONTEXT_REASONING_TOKENS = 512
 # 單次 context 呼叫的逾時（秒）。
-KB_CONTEXT_TIMEOUT = int(_os.environ.get("AICODE_KB_CONTEXT_TIMEOUT", "180"))
+KB_CONTEXT_TIMEOUT = 180
 # 窗預算的安全係數：n_ctx 乘上它之後才扣模板 / chunk / 保留輸出。
-KB_CONTEXT_WINDOW_SAFETY = float(_os.environ.get("AICODE_KB_CONTEXT_WINDOW_SAFETY", "0.8"))
+KB_CONTEXT_WINDOW_SAFETY = 0.8
 # 一批做完之後 absent 率超過這個比例就中止發布，不把低覆蓋的 KB 當成功寫出去。
-KB_CONTEXT_MAX_ABSENT_RATIO = float(
-    _os.environ.get("AICODE_KB_CONTEXT_MAX_ABSENT_RATIO", "0.20")
-)
+KB_CONTEXT_MAX_ABSENT_RATIO = 0.20
 # ctx 快取放 repo 外的 per-root user cache：改 CodeTrail 自己的 .gitignore
 # 保護不了任意 AICODE_ROOT 底下的 firmware repo。
-KB_CONTEXT_CACHE_DIR = _os.environ.get(
-    "AICODE_KB_CONTEXT_CACHE_DIR",
-    _os.path.join(_os.path.expanduser("~"), ".cache", "codetrail", "ctx"),
-)
+def KB_CONTEXT_CACHE_DIR() -> str:
+    """ctx 快取的位置。函式而不是常數:`HOME` 在測試裡會被改,import-time 綁值
+    會讓測試寫進真實 home。放 repo 外的 per-root user cache —— 改 CodeTrail 自己的
+    `.gitignore` 保護不了任意 root 底下的 firmware repo。"""
+    home = _os.environ.get("HOME") or _os.path.expanduser("~")
+    return _os.path.join(home, ".cache", "codetrail", "ctx")
 
 RERANKER_MODEL = _DEPLOYMENT_PROFILE.service("reranker").model or ""
-RERANK_FALLBACK_POLICY = _os.environ.get("AICODE_RERANK_FALLBACK_POLICY", "error").strip().lower()
-_RERANK_FALLBACK_POLICIES = {"embedding", "main_model", "error"}
-if RERANK_FALLBACK_POLICY not in _RERANK_FALLBACK_POLICIES:
+#: **client.json 的使用者開關**(`rerank_fallback_policy`);這裡是預設。
+#: 合法值由 client.json 的 loader fail-loud 驗;這條不變式擋的是 repo 自己改壞。
+RERANK_FALLBACK_POLICY = "error"
+RERANK_FALLBACK_POLICIES = ("embedding", "main_model", "error")
+if RERANK_FALLBACK_POLICY not in RERANK_FALLBACK_POLICIES:  # pragma: no cover - import guard
     raise ValueError(
-        "AICODE_RERANK_FALLBACK_POLICY must be one of "
-        f"{sorted(_RERANK_FALLBACK_POLICIES)}; got {RERANK_FALLBACK_POLICY!r}"
+        f"RERANK_FALLBACK_POLICY must be one of {list(RERANK_FALLBACK_POLICIES)};"
+        f" got {RERANK_FALLBACK_POLICY!r}"
     )
 USE_RERANKER = True
 USE_HYBRID_SEARCH = True
@@ -809,7 +859,7 @@ CODE_RAG_LAZY_EMBED_QUERY_TOP_K = 150   # 減少候選數量（優化：200->150
 # 零 os.walk、零 compute_file_hash。0 = 關閉(每次查詢都 fresh 掃描)。
 # MCP 內部的寫入工具(apply_patch / run_command / run_lint fix)會主動
 # invalidate;外部編輯器在 TTL 窗內改檔屬既知取捨(docs/mcp-tools.md)。
-CODE_RAG_REFRESH_TTL_SECONDS = int(_os.environ.get("AICODE_CODE_RAG_REFRESH_TTL", "30"))
+CODE_RAG_REFRESH_TTL_SECONDS = 30
 
 # ============================================================
 # Code RAG 的語意表示式預算(施工規格 §6 P3A)
@@ -833,12 +883,12 @@ CODE_RAG_REFRESH_TTL_SECONDS = int(_os.environ.get("AICODE_CODE_RAG_REFRESH_TTL"
 # index entry 儲存的 context 上限。這是**最上游**的截斷:它比下游任何預算小的
 # 話,下游放大都是 no-op(§3 洞 2 的原始病灶)。
 CODE_RAG_CONTEXT_STORE_MAX_CHARS = int(
-    _os.environ.get("AICODE_CODE_RAG_CONTEXT_STORE_MAX_CHARS", "1800")
+    1800
 )
 
 # index entry 儲存的 leading comment 上限。
 CODE_RAG_COMMENT_MAX_CHARS = int(
-    _os.environ.get("AICODE_CODE_RAG_COMMENT_MAX_CHARS", "400")
+    400
 )
 
 # index entry 儲存的 docstring 上限。以前寫死在 code_rag 兩處 `[:300]` ——
@@ -848,27 +898,27 @@ CODE_RAG_COMMENT_MAX_CHARS = int(
 # 注意 ast_parser 在建立 Symbol 時已經先截到 300(那一刀屬上游,歸
 # PARSER_SEMANTICS_VERSION 管):把這裡調大於上游值是 no-op。
 CODE_RAG_DOCSTRING_MAX_CHARS = int(
-    _os.environ.get("AICODE_CODE_RAG_DOCSTRING_MAX_CHARS", "300")
+    300
 )
 
 # dense embedding document text 的總預算。
 CODE_RAG_EMBED_TEXT_MAX_CHARS = int(
-    _os.environ.get("AICODE_CODE_RAG_EMBED_TEXT_MAX_CHARS", "1200")
+    1200
 )
 
 # lexical scorer 掃描的文字預算與 identifier 取樣上限。leading comment 只放在
 # 獨立欄位而 lexical lane 不掃的話,那條 lane 會完全看不到註解訊號。
 CODE_RAG_LEXICAL_SCAN_MAX_CHARS = int(
-    _os.environ.get("AICODE_CODE_RAG_LEXICAL_SCAN_MAX_CHARS", "1200")
+    1200
 )
 CODE_RAG_LEXICAL_MAX_IDENTIFIERS = int(
-    _os.environ.get("AICODE_CODE_RAG_LEXICAL_MAX_IDENTIFIERS", "80")
+    80
 )
 
 # Code RAG rerank passage 上限(chars)。cross-encoder 吃得下比 embedding 更長的
 # passage,所以預算與 embed text 分開。
 CODE_RERANK_PASSAGE_MAX_CHARS = int(
-    _os.environ.get("AICODE_CODE_RERANK_PASSAGE_MAX_CHARS", "1800")
+    1800
 )
 
 # 進 cross-encoder rerank 的候選數。曾經是兩處寫死的 top_k*3 與 min(15, top_k*3),
@@ -877,13 +927,13 @@ CODE_RERANK_PASSAGE_MAX_CHARS = int(
 # rerank 成本是 0.2s → 1.0s,而 top1 的 cross-encoder 分數從 -3.885 拉到 -1.511。
 # 這個值進 RETRIEVAL_SCORER_VERSION 的語意版本(它改變名次),不進 CodeRAG cache。
 CODE_RAG_RERANK_CANDIDATE_POOL = int(
-    _os.environ.get("AICODE_CODE_RAG_RERANK_CANDIDATE_POOL", "100")
+    100
 )
 
 # 批次 embedding 的雙預算(/v1/embeddings 嚴格契約,§5-4):
 # 單一 HTTP batch 的筆數上限與總字元上限,兩者皆過才裝得下。
-EMBED_BATCH_SIZE = int(_os.environ.get("AICODE_EMBED_BATCH_SIZE", "32"))
-EMBED_BATCH_MAX_CHARS = int(_os.environ.get("AICODE_EMBED_BATCH_MAX_CHARS", "20000"))
+EMBED_BATCH_SIZE = 32
+EMBED_BATCH_MAX_CHARS = 20000
 
 # ============================================================
 # 嚴格模式設定
@@ -907,9 +957,9 @@ STRICT_MODE_TEMPERATURE = 0.0        # 嚴格模式下溫度壓到最低
 # 注意:這只影響 CodeTrail internal calls。聊天客戶端的取樣值由 client_engine 每次
 # 請求明示送出(CHAT_TOP_P / CHAT_TOP_K / CHAT_MIN_P);不經客戶端的直接呼叫才吃 server 預設
 # (見 README §3.1 與 docs/troubleshooting.md「模型編造不存在的具體事實」)。
-CHAT_TOP_P = float(_os.environ.get("AICODE_CHAT_TOP_P", "0.95"))
-CHAT_TOP_K = int(_os.environ.get("AICODE_CHAT_TOP_K", "20"))
-CHAT_MIN_P = float(_os.environ.get("AICODE_CHAT_MIN_P", "0.0"))
+CHAT_TOP_P = 0.95
+CHAT_TOP_K = 20
+CHAT_MIN_P = 0.0
 WEAK_REF_THRESHOLD = 0.35            # REF 分數低於此值視為「太弱」（調整: 0.30->0.35）
 SKIP_LOW_CONFIDENCE_KB = True        # 是否跳過低信心度的 KB 上下文注入
 LOW_CONFIDENCE_KB_THRESHOLD = 0.30   # 低於此分數則不注入 KB context（調整: 0.25->0.30）
@@ -1022,7 +1072,9 @@ def get_answer_rules(has_binary: bool = False) -> str:
 # ⚠️ 安全警告：apply_patch 會直接修改檔案，請謹慎使用
 # 預設關閉;mcp_server.py 這個明確啟動點才會啟用。
 # 其他 runtime / 測試可透過環境變數 AI_CODE_PATCH=1 啟用。
-PATCH_ENABLED = _os.environ.get('AI_CODE_PATCH', '').lower() in ('1', 'true', 'yes')
+# 預設關:任何 import config 的離線工具都不該因為載入設定就取得寫檔能力。
+# runtime 由 `mcp_server` 的 `resolve_runtime_policy()` 明確打開(`--readonly` 一律關)。
+PATCH_ENABLED = False
 PATCH_MAX_FILES = 5              # 單次 patch 最多修改 5 個檔案
 PATCH_MAX_LINES_PER_FILE = 200   # 單一檔案最多修改 200 行
 
@@ -1073,7 +1125,7 @@ LINT_COMMANDS = {
 #
 # 預設關閉;mcp_server.py 這個明確啟動點才會啟用。
 # 其他 runtime / 測試可透過環境變數 AI_CODE_RUN_TESTS=1 啟用。
-RUN_COMMAND_ENABLED = _os.environ.get('AI_CODE_RUN_TESTS', '').lower() in ('1', 'true', 'yes')
+RUN_COMMAND_ENABLED = False
 RUN_COMMAND_TIMEOUT = 60
 # run_command 的 timeout(秒)三層契約:native tool schema、ToolExecutor 執行前 runtime
 # 驗證、mcp_server 的 Annotated[int, Field(strict=True, ge=MIN, le=MAX)] 都從這兩個常數來。

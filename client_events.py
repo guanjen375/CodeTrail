@@ -55,8 +55,8 @@ STATUS_DENIED = "denied"
 REASON_STOP = "stop"
 REASON_TOOL_CALLS = "tool-calls"
 REASON_ERROR = "error"
-#: 使用者中斷(web 的 /api/cancel、attach 的 Ctrl-C)。是終結事件:等 terminal 的
-#: 客戶端要能收工,但它不是答案,所以 on_idle 的壓縮不會接在它後面跑。
+#: 使用者中斷(TUI 的 Ctrl-C,經 client_turns 的協調器)。是終結事件:看終結
+#: 事件收工的一端要能收工,但它不是答案,所以 idle 的壓縮不會接在它後面跑。
 REASON_CANCELLED = "cancelled"
 
 class TurnCancelled(RuntimeError):
@@ -147,7 +147,7 @@ def text_delta_event(session_id: str, chunk: str) -> dict[str, Any]:
 def notice_event(session_id: str, message: str) -> dict[str, Any]:
     """`TurnResult.notices` 與壓縮結果的事件形狀。
 
-    終端 REPL 直接印這些字;web / attach 沒有它就等於 ingest 的
+    TUI 把這些字顯示成提示行;沒有它就等於 ingest 的
     ``[CODETRAIL_ACTION_REQUIRED]``、假工具呼叫警告與「這段對話沒有落檔」
     全部靜默消失。
     """
@@ -168,7 +168,7 @@ class CompletedToolCall:
 
     @property
     def bare_tool(self) -> str:
-        """歷史相容:OpenCode 會加 `codetrail_` 前綴,自家事件流不會。"""
+        """歷史相容:舊前端會加 `codetrail_` 前綴,自家事件流不會。"""
         return self.tool.split("_", 1)[1] if self.tool.startswith("codetrail_") else self.tool
 
     @property

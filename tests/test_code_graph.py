@@ -2150,17 +2150,27 @@ def test_every_node_range_is_within_file_bounds():
 # .h 語言判定(§6.2-2)與 parser status 誠實化(§6.2-4)
 # ============================================================
 @requires_ts_c_cpp_pinned
-def test_h_defaults_to_c_and_env_overrides(monkeypatch):
-    monkeypatch.delenv("AICODE_H_LANG", raising=False)
+def test_h_defaults_to_c_and_the_client_json_key_overrides(monkeypatch):
+    """`.h` 預設當 C;`client.json` 的 `h_lang` 可整體覆寫。
+
+    2026-09-04:覆寫來源從 `AICODE_H_LANG` 換成 client.json 的鍵(經
+    `client_config.apply_to_config()` 推進 `config.H_LANG`)。行為為什麼該變:
+    它決定整個 repo 的 header 用哪個 grammar 解析,那是專案層級的一次性決定,
+    不該隨殼層漂移;而且殘留值會讓同一份 repo 在兩個終端機裡解出不同結果。
+    """
+    import config
+
+    monkeypatch.setenv("AICODE_H_LANG", "cpp")  # 殘留值一律無效
+    monkeypatch.setattr(config, "H_LANG", "c")
     parser = ast_parser.get_parser(Path("x.h"))
     assert isinstance(parser, ast_parser.TreeSitterParser)
     assert parser.language_name == "c"
 
-    monkeypatch.setenv("AICODE_H_LANG", "cpp")
+    monkeypatch.setattr(config, "H_LANG", "cpp")
     parser = ast_parser.get_parser(Path("x.h"))
     assert parser.language_name == "cpp"
 
-    monkeypatch.setenv("AICODE_H_LANG", "bogus")
+    monkeypatch.setattr(config, "H_LANG", "bogus")
     parser = ast_parser.get_parser(Path("x.h"))
     assert parser.language_name == "c", "非法值回預設 c"
 

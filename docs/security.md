@@ -1,6 +1,6 @@
 # 安全邊界與工作節奏
 
-這份文件整理 CodeTrail 在 CodeTrail 客戶端 / web backend 裡的安全邊界。重點是:
+這份文件整理 CodeTrail 客戶端(`aicode`)的安全邊界。重點是:
 CodeTrail 有自己的沙箱,但它只包住 CodeTrail MCP 工具；客戶端內建工具(已不存在)、provider、
 plugin 與專案設定仍要另外限制。操作責任與人工驗證原則見
 [Responsible Use](../RESPONSIBLE_USE.md)，保固與審計界線見
@@ -16,8 +16,11 @@ plugin 與專案設定仍要另外限制。操作責任與人工驗證原則見
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
-CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1 aicode
+aicode
 ```
+
+並且先在 `~/.config/codetrail/client.json` 設 `"project_instructions": false`
+(見下面「不信任 repo 的安全模式」)。
 
 客戶端**只**暴露 CodeTrail 的 19 個 MCP 工具:沒有第二套內建的 shell / 檔案 / web 工具
 可以繞過沙箱。要更嚴的話,`~/.config/codetrail/client.json` 的 `permission` 可以把任何
@@ -27,11 +30,11 @@ CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1 aicode
 
 ## 沙箱真正保護什麼
 
-`aicode` 啟動時會把當前目錄設成 `AICODE_ROOT`。一般檔案讀寫都限制在這個根目錄；
+`aicode` 啟動時會把當前目錄設成 sandbox root(以 `mcp_server --root` 交給 MCP)。一般檔案讀寫都限制在這個根目錄；
 從 `$HOME` 或 `/` 啟動會直接被拒絕。兩個刻意而受限的例外是:
 
 - `import_external_file(...)` 在你顯式開啟後,可從指定來源白名單**讀取並複製**單一檔案到
-  `<AICODE_ROOT>/.aicode_uploads/`;後續工具仍只處理沙箱內副本。
+  `<SANDBOX_ROOT>/.aicode_uploads/`;後續工具仍只處理沙箱內副本。
 - `record_lesson(...)` 經 permission `ask` 核准後,只可寫固定的
   `~/.config/codetrail/lessons.json`,不能由模型指定其他外部路徑。
 
@@ -53,14 +56,10 @@ CodeTrail 的內建工具。互動模式下 `apply_patch` / `run_lint` / `run_co
 不信任的 repo 影響得到的是**送進模型的指示**:專案根目錄的 `AGENTS.md` 與
 `.codetrail/lessons.md` 每一輪都會進 system prompt。分析不信任 repo 時,用:
 
-```bash
-CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1 aicode
-```
+在 `~/.config/codetrail/client.json` 設:
 
-web 模式也一樣:
-
-```bash
-CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1 aicode_web
+```json
+{ "project_instructions": false }
 ```
 
 這會讓客戶端完全不讀專案內的 `AGENTS.md` 與 `.codetrail/lessons.md`。它**只**關閉專案來源;
@@ -83,7 +82,8 @@ opencode-ai,也沒有第二個 client 的版本相容閘要顧。模型看到什
 repo 裡:`client_prompt`(system prompt)、`mcp_contract`(工具目錄與 routing 指示)、
 `client_policy`(哪些工具要核准)。
 
-`aicode attach` 是只連既有 backend 的薄 client,不重跑 backend preflight。
+介面只有這一個:沒有網頁前端、沒有可以 attach 的 backend,所以也沒有「哪一端連得到
+這個對話」這個曝光面。要遠端操作就 SSH 進來,斷線不中斷就把 `aicode` 跑在 `tmux` 裡。
 
 ## system prompt 與 permission 分工
 
@@ -94,8 +94,8 @@ system prompt 由客戶端組,順序固定:內建基底規則(`client_prompt.BAS
 
 system prompt 不是 permission:它不會讓被 `deny` 的工具變成可用,也不會繞過六個 ask 工具的
 人工核准。權限的唯一來源是 `client_policy` 加上 `client.json` 的 `permission` 覆寫,
-而 readonly session 另有第二層(MCP server 自己收到 `AI_CODE_PATCH=0` /
-`AI_CODE_RUN_TESTS=0`)。
+而 readonly session 另有第二層(MCP server 自己以 `--readonly` 起 —— 一個 argv 旗標,
+`client.json` 把 `build_commands` 開起來也翻不回來)。
 
 ---
 
@@ -103,17 +103,13 @@ system prompt 不是 permission:它不會讓被 `deny` 的工具變成可用,也
 
 預設不能讀專案外路徑。要匯入 `~/Downloads` 或 `/tmp` 的 log / 截圖 / spec,啟動時才打開:
 
-```bash
-AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
+在 `~/.config/codetrail/client.json` 設:
+
+```json
+{ "external_import": true,
+  "external_import_roots": ["~/Downloads", "/tmp", "~/specs"] }
 ```
 
-若要指定來源白名單:
-
-```bash
-AI_CODE_ALLOW_EXTERNAL_IMPORT=1 \
-AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/specs" \
-aicode
-```
 
 匯入後檔案會複製到專案底下 `.aicode_uploads/`。白名單應只放實際需要的最窄目錄；
 不要加入整個 `$HOME`、憑證目錄、共享根目錄或其他無關資料樹。來源檔與沙箱內副本都要
@@ -132,12 +128,13 @@ aicode
 
 `run_command(...)` 本身還有命令白名單與 dangerous-pattern 過濾。timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），不是這個範圍的整數會在執行前被拒絕。不要把 `rm` / `sudo` / `curl` / `bash` 加進白名單;真的需要人工操作時,讓模型列出建議命令,由人自己判斷後在 shell 執行。
 
-`record_lesson(...)` 是唯一會寫到 `AICODE_ROOT` 之外的工具,而且只寫一個固定路徑:`~/.config/codetrail/lessons.json`(per-deployment 的行為教訓 store,與 `deployment.json` 同層;不能被模型指到別的路徑)。它被 permission 設成 `ask`:模型只能「提案」,你會在核准框看到完整 rule 內容,核准後才落地。沒有無審核的自動寫入路徑;細節見 [docs/lessons.md](lessons.md)。
+`record_lesson(...)` 是唯一會寫到 sandbox root 之外的工具,而且只寫一個固定路徑:`~/.config/codetrail/lessons.json`(per-deployment 的行為教訓 store,與 `deployment.json` 同層;不能被模型指到別的路徑)。它被 permission 設成 `ask`:模型只能「提案」,你會在核准框看到完整 rule 內容,核准後才落地。沒有無審核的自動寫入路徑;細節見 [docs/lessons.md](lessons.md)。
 
 升級防護：核准閘不再依賴任何外部設定檔。哪些工具要人工核准寫死在
 `client_policy.ASK_TOOLS`,所以「新加的寫入工具被舊 wildcard 靜默放行」這個問題由構造
-消失。舊安裝升級後仍請跑一次 `./set_config.sh`,它會把 CodeTrail 曾經寫進你 OpenCode
-設定的東西還原並撤銷註冊(見 [README §3.1](../README.md))。
+消失。從舊版(OpenCode 世代)升級的機器另外跑一次 `python3 opencode_migrate.py`,
+把 CodeTrail 曾經寫進那份設定的東西還原並撤銷註冊(見
+[troubleshooting](troubleshooting.md))。
 
 tool canary 的 explicit hard gate 與 implicit diagnostic 分開使用 cache schema 2。cache 只存
 fingerprint hash、lane status、檢查時間與版本，不存 prompt、專案路徑、檔名、模型輸出、
@@ -157,7 +154,6 @@ tool arguments 或 tool result；兩條 lane 不會互借另一列狀態。impli
 - `.code_rag_graph.sqlite3*`、`.code_rag_graph.lock`
 - `.codetrail/`
 - `.aicode_uploads/`
-- `.opencode/`
 
 這個 repo 的 `.gitignore` 已經忽略上述主要路徑。若你在另一個 target project 使用
 CodeTrail,也建議在那個 project 的 `.gitignore` 補上同樣項目。`.gitignore` 不能保護
@@ -173,8 +169,7 @@ CodeTrail,也建議在那個 project 的 `.gitignore` 補上同樣項目。`.git
 接上這些 credential。因此以目前支援的路徑來看，綁
 `0.0.0.0` 就等於讓可抵達該 port 的機器都能呼叫模型 API。
 
-要讓其他機器連線必須明確選擇 `./set_config.sh --allow-remote`、
-`AICODE_BIND=all-interfaces`，或 deployment.json 各 service 的
+要讓其他機器連線必須明確選擇 `./set_config.sh --allow-remote`，或 deployment.json 各 service 的
 `"bind": "all-interfaces"`，而且只該在可信內網 / VPN 使用，必要時加防火牆規則。
 如要開發 credential 支援，必須同步改 profile schema、所有 `llama_client`
 call site、doctor / preflight 與 secret redaction，不能只手動在單一 server 加旗標。
@@ -185,40 +180,25 @@ call site、doctor / preflight 與 secret redaction，不能只手動在單一 s
 
 上面講的是「誰能連進來」;這一段是「CodeTrail 自己會把 prompt 送去哪」。所有經 `llama_client` 的模型呼叫共用同一套 transport policy(`endpoint_policy.py`):
 
-- **非 loopback 端點需要顯式 opt-in**:`AICODE_LLAMA_*_BASE_URL` / deployment profile 指到別台機器時,必須 `export AICODE_MODEL_REMOTE_OK=1`,否則每個呼叫(completion / chat / embedding / reranking,連 health/props/slots 探測也一樣)都會 fail-loud,錯誤訊息印出確切 env 名。prompt 可能含 NDA 程式碼與文件內容——填一個遠端 IP 不等於同意外送。
+- **非 loopback 端點需要顯式 opt-in**:`deployment.json` 的某個 `base_url` 指到別台機器時,必須在 `~/.config/codetrail/client.json` 設 `"model_remote_ok": true`,否則每個呼叫(completion / chat / embedding / reranking,連 health/props/slots 探測也一樣)都會 fail-loud,錯誤訊息印出確切的鍵名與檔案位置。prompt 可能含 NDA 程式碼與文件內容——填一個遠端 IP 不等於同意外送。
 - **不讀環境 proxy**:共用 HTTP session `trust_env=False`,`HTTP(S)_PROXY` / `NO_PROXY` / `.netrc` 一律無視,prompt-bearing POST 不會被環境變數帶去別的 host。
 - **不跟隨 redirect**:任何 3xx 一律報錯(訊息含 status 與 Location host,絕不含 request body),拒絕把已送出的 POST 重送到別處。
-- KB chunk 脈絡生成(Contextual Retrieval)沿用獨立的 `AICODE_KB_CONTEXT_REMOTE_OK`(見 docs/rag.md);兩個 opt-in 不互通,各自守各自要外送的內容。
+- KB chunk 脈絡生成(Contextual Retrieval)有獨立的 `"kb_context_remote_ok"`(見 docs/rag.md)。**兩個鍵,不是一個**:前者放行的是 prompt,後者等於整份文件的窗離開這台機器;合併會把前者的同意無聲擴大成後者。
 - `python3 scripts/doctor.py` 啟動前就會檢查:端點非 loopback 且未設對應 opt-in → FAIL。
 
 這些規則涵蓋 CodeTrail 經 `llama_client` 發出的**所有**請求 —— 客戶端的聊天迴圈與壓縮
 摘要都走這條路,沒有第二個 provider stack 會繞過它。同一台機器上的其他 process 當然不受
 這裡管;NDA 場景仍要確認 `~/.config/codetrail/deployment.json` 的端點全是 loopback。
 
-## Web 模式曝光面
-
-`aicode web` 預設只綁 `127.0.0.1`。A/B 機跨機器使用時推薦 `aicode_web`:它每次向本機 `tailscale ip -4` 取值,只綁該 `100.64.0.0/10` virtual interface，絕不綁 `0.0.0.0`。A 機可完全沒有 GUI，B 機開 launcher 印出的 `http://100.x.y.z:4096/` 即可；HTTP 封包仍包在 Tailscale 的加密 tunnel 內。
-
-`aicode_web` 預設沒有應用層密碼,因此 **tailnet ACL 是存取邊界**；共享 / 多人 tailnet 應限制哪些裝置或使用者能連 A 機的 4096 port。wrapper 傳入值、hostname、Tailscale CLI 當下 IP 只要有一項不一致就拒絕。普通 `aicode web` 若刻意綁 LAN IP / `0.0.0.0` 或開 `--mdns`(對區網廣播這個服務),仍必須先
-設定 `AICODE_WEB_PASSWORD`,而且是 **server 自己**擋 —— 直接叫
-`codetrail_chat.py web --hostname 0.0.0.0` 一樣被拒。設了密碼時它不會出現在 tmux 指令列、
-pane scrollback,也不會傳給 MCP 子行程(核准後的 `run_command` 會繼承那份環境)。
-
-無密碼的 loopback backend 也不接受跨站請求:server 比對 `Origin`/`Referer` 與 `Host`,而且
-API 端點只收 `application/json`(`text/plain` 的 simple POST 是跨站頁面唯一免 preflight 的
-形狀)。同一個 session 一次只跑一輪,核准只能回答一次且必須是真的 boolean。
-
-不要用 `tailscale funnel`,因為它會把 web backend 暴露到公網。想維持純 loopback 也可使用 SSH port-forward；這兩條都不會放寬 CodeTrail MCP sandbox。
-
 ---
 
 ## 快速檢查表
 
-- 從具體專案目錄跑 `aicode` / `aicode_web`,不要從 `$HOME` 或 `/`。
+- 從具體專案目錄跑 `aicode`,不要從 `$HOME` 或 `/`。
 - 確認啟動前有 `MCP PASS — 19 tools + list_dir round-trip`；implicit 非 optimal 只代表
   routing 診斷警告，explicit failure 則會拒絕啟動。
-- 不信任 repo 時加 `CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1`。
+- 不信任 repo 時在 `client.json` 設 `"project_instructions": false`。
 - 要更嚴的權限時,用 `~/.config/codetrail/client.json` 的 `permission`(只能收緊)。
-- 需要外部附件才打開 `AI_CODE_ALLOW_EXTERNAL_IMPORT=1`。
+- 需要外部附件才在 `client.json` 打開 `"external_import": true`(每次匯入仍要人工核准)。
 - remote endpoint 只在明確接受資料外送時設定對應 opt-in。
 - commit 前跑 `git status` / `git diff`,確認沒有知識庫、上傳附件、jsonl 或 session 快取。

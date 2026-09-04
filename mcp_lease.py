@@ -1,6 +1,6 @@
 """MCP server 的 per-instance lease 與 incident 記錄(plan.txt §D / SEAMS §6)。
 
-**為什麼不是一個心跳檔**:canary、終端客戶端、web、headless run 各自起一個 MCP
+**為什麼不是一個心跳檔**:canary、終端客戶端、headless run 各自起一個 MCP
 子行程。四個行程寫同一個檔會互相覆寫,於是「server 還活著嗎」永遠只看得到
 最後一個寫入者,而那正是最沒有診斷價值的一份。改成一行程一份 lease
 (檔名 = 本行程一次性的 `boot_id`,不是 pid),plugin 用 `ppid == 自己的 pid`

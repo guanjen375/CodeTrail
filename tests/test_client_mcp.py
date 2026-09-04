@@ -270,7 +270,14 @@ def test_the_timeout_constant_is_read_dynamically(monkeypatch):
 
 # ------------------------------------------------------------------- stdio/env
 def test_mcp_stderr_is_not_persisted_by_default(tmp_path, monkeypatch):
-    monkeypatch.delenv(client_mcp.STDERR_LOG_ENV, raising=False)
+    """MCP stderr 預設不落檔(它含查詢原文與絕對路徑)。
+
+    2026-09-04:`CODETRAIL_MCP_STDERR_LOG` 刪除,落檔只能由呼叫端明確指定
+    (`McpClient(stderr_log=...)`)。行為為什麼該變:殼層裡一個忘了 unset 的值
+    就等於每個 session 都把 NDA 內容寫進一個檔,而使用者不會知道。
+    """
+    monkeypatch.setenv("CODETRAIL_MCP_STDERR_LOG", str(tmp_path / "leak.log"))
+    assert not hasattr(client_mcp, "STDERR_LOG_ENV")
     before = set(tmp_path.rglob("*"))
     client = _stub_client(tmp_path, STUB_SLOW_SECONDS="0")
     try:
@@ -362,11 +369,18 @@ def test_a_live_roundtrip_exposes_the_real_catalog(tmp_path):
     (tmp_path / "hello.txt").write_text("hi\n", encoding="utf-8")
     client = client_mcp.McpClient(
         tmp_path,
+        # 設定來自 conftest 建的 tmp HOME(deployment.json 指向沒人聽的 port);
+        # 附屬 server 的硬閘用 **argv** 跳過,不是環境變數 —— 子行程的環境在交
+        # 出去之前已經被剝乾淨,用環境變數傳這個意圖必然失效。
+        argv=[
+            sys.executable,
+            str(client_mcp.SERVER_SCRIPT),
+            "--root",
+            str(tmp_path),
+            "--skip-aux-preflight",
+        ],
         env={
             "XDG_STATE_HOME": str(tmp_path / ".state"),
-            "AICODE_LLAMA_BASE_URL": "http://127.0.0.1:65535",
-            "AICODE_MODEL": "example-code-model",
-            "AICODE_REQUIRED_MODELS_CHECK_SKIP": "1",
             "PYTHONIOENCODING": "utf-8",
         },
         start_timeout=120.0,
@@ -428,3 +442,85 @@ def test_closing_a_shared_client_finishes_before_a_replacement_starts(tmp_path):
         assert not _pid_alive(old_pid)
     finally:
         client_mcp.reset_shared_clients()
+
+
+# ── 總審 F1-9:override 通道不得把剝掉的前綴加回去 ──
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("name", ["AICODE_ROOT", "AI_CODE_PATCH", "CODETRAIL_CLIENT_CONFIG", "OPENCODE_API_KEY"])
+def test_env_overrides_cannot_reintroduce_a_stripped_prefix(tmp_path, name):
+    """`env=` 是覆寫通道,套在剝除**之後**;四個前綴一律 fail-loud,不是只有 OPENCODE_。
+
+    只擋 OPENCODE_ 的話,`McpClient(env={"AI_CODE_PATCH": "1"})` 就把 readonly 第二層
+    的舊入口從後門遞回去 —— 而那正是 plan §2.4 要關掉的東西。
+    """
+    with pytest.raises((client_mcp.McpClientError, ValueError)):
+        client_mcp.child_env({name: "x"})
+    with pytest.raises(client_mcp.McpClientError):
+        client_mcp.McpClient(tmp_path, env={name: "x"})
+
+
+# ── 總審 F1-10:replay 的隔離設定與 skip 意圖要以 argv 一路交到 MCP ──
+
+
+@pytest.mark.smoke
+def test_client_config_and_skip_aux_preflight_reach_the_server_argv(tmp_path):
+    """`run --client-config` 與 `--skip-aux-preflight` 不能只到客戶端。
+
+    MCP 是獨立行程,自己讀 HOME 的 client.json:replay 指定了臨時設定、而真實 HOME
+    的檔壞掉,parent 讀對了、MCP 卻 exit 2;skip 只略過外層檢查,每個 MCP child
+    仍跑硬 preflight 而失敗。兩個意圖都要在 server argv 上。
+    """
+    cfg = tmp_path / "client.json"
+    client = client_mcp.McpClient(
+        tmp_path, client_config=cfg, skip_aux_preflight=True
+    )
+    argv = client._argv  # noqa: SLF001
+    assert argv[argv.index("--client-config") + 1] == str(cfg)
+    assert "--skip-aux-preflight" in argv
+    plain = client_mcp.McpClient(tmp_path)._argv  # noqa: SLF001
+    assert "--client-config" not in plain and "--skip-aux-preflight" not in plain
+
+
+# ── 總審第 12 輪:spawn 只有一個出口 ──
+
+
+@pytest.mark.smoke
+def test_process_env_run_is_the_only_spawn_exit_and_never_takes_env(monkeypatch):
+    """`process_env.run/popen/check_output` 自己用 child_env() 算環境:殼層的 `AICODE_*` /
+    `OPENCODE_*` 一定進不去子行程,`overrides` 進得去,`env=` 一律 TypeError,帶四類前綴的
+    overrides 一律 fail-loud。靜態 gate 只需要禁「別處出現 subprocess」,不必推導 env 來源。"""
+    import sys
+
+    import process_env
+
+    monkeypatch.setenv("AICODE_MODEL", "bogus")
+    monkeypatch.setenv("OPENCODE_API_KEY", "secret")
+    probe = "import os; print(os.environ.get('AICODE_MODEL'), os.environ.get('OPENCODE_API_KEY'), os.environ.get('MARK'))"
+    out = process_env.run([sys.executable, "-c", probe], overrides={"MARK": "x"}, capture_output=True, text=True, check=True)
+    assert out.stdout.split() == ["None", "None", "x"], out.stdout
+    proc = process_env.popen([sys.executable, "-c", probe], stdout=process_env.PIPE, text=True)
+    assert proc.communicate(timeout=30)[0].split() == ["None", "None", "None"]
+    for exit_ in (process_env.run, process_env.popen, process_env.check_output):
+        with pytest.raises(TypeError):
+            exit_(["true"], env={})
+    with pytest.raises(process_env.ChildEnvError):
+        process_env.run(["true"], overrides={"AICODE_X": "1"})
+
+
+@pytest.mark.smoke
+def test_process_env_popen_class_is_not_a_raw_spawn_bypass(monkeypatch):
+    """總審 F12-2:`process_env.Popen` 若只是原始 `subprocess.Popen` 的 re-export,直接呼叫
+    就繞過 child_env(繼承整份污染殼層)。它得是會自己剝環境、不吃 `env=` 的東西。"""
+    import sys
+
+    import process_env
+
+    monkeypatch.setenv("AICODE_MODEL", "round12-leak")
+    monkeypatch.setenv("OPENCODE_API_KEY", "round12-secret")
+    probe = "import os; print(os.environ.get('AICODE_MODEL'), os.environ.get('OPENCODE_API_KEY'))"
+    proc = process_env.Popen([sys.executable, "-c", probe], stdout=process_env.PIPE, text=True)
+    assert proc.communicate(timeout=30)[0].split() == ["None", "None"]
+    with pytest.raises(TypeError):
+        process_env.Popen(["true"], env={})

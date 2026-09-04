@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""client_notify — 兩個從 OpenCode notify plugin 搬進客戶端的通知機制。
+"""client_notify — 兩個從舊前端的 notify plugin 搬進客戶端的通知機制。
 
 1. **ingest 待辦通知**:``ingest_document`` 的結果裡出現行首的
    ``[CODETRAIL_ACTION_REQUIRED]`` / ``[CODETRAIL_INGEST_FAILED]`` 時,提示
@@ -31,7 +31,7 @@ ACTION_MARKER_TOOL = "ingest_document"
 #: 「宣稱呼叫工具」只掃回覆開頭這麼多字元。
 MAX_TEXT_SCAN = 20_000
 
-#: 與 opencode_plugins/codetrail-notify.js 的 CLAIM_PATTERNS 同一組判準。
+#: 判準與舊 JS plugin 的 CLAIM_PATTERNS 相同(那份現在只是 inert stub)。
 CLAIM_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"<tool_call>", re.IGNORECASE),
     re.compile(r'"name"\s*:\s*"codetrail_'),

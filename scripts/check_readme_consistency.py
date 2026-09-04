@@ -61,7 +61,9 @@ def _read(path: Path) -> str:
 
 
 #: 標了「歷史文件」的規劃紀錄:描述的是 OpenCode 時代的施工,不是現在的使用者文件。
-_HISTORICAL_DOCS = frozenset({"tool-routing-implementation-plan.md"})
+#: 標了「歷史文件」、不參與一致性檢查的 docs。目前一個都沒有 —— 唯一那份
+#: (`tool-routing-implementation-plan.md`)已隨去 OpenCode 化刪除。
+_HISTORICAL_DOCS: frozenset[str] = frozenset()
 
 
 def _documentation_text() -> str:
@@ -217,16 +219,6 @@ def _check_code_model_placeholder_contract(readme_text: str, docs_text: str, iss
     # 使用者要在哪裡填 <CODE_MODEL>,否則第一次設定就卡住。
     if "AICODE_MODEL" not in readme_text:
         issues.append("README 必須說明主模型怎麼指定(AICODE_MODEL / deployment profile)")
-
-
-def _check_doctor_commands_have_explicit_model(docs_text: str, issues: list[str]) -> None:
-    for line in docs_text.splitlines():
-        stripped = line.strip()
-        if re.match(r"^(?:python3?|python)\s+scripts/doctor\.py(?:\s|$)", stripped):
-            issues.append(
-                "文件不可在未設定主模型時直接要求跑 doctor；請改成 "
-                "`AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py` 或移到 OpenCode JSON 設定後。"
-            )
 
 
 def _check_default_aux_models_documented(
@@ -691,7 +683,7 @@ def _check_run_command_timeout_contract(
     top = _native_tool_description(agent_tools_text, "_RUN_COMMAND_TOOL", names)
     artifact = "_RUN_COMMAND_TOOL.description"
     _require_sentence(top, f"timeout {span} 秒(server 端上限;client 可能更早截止)", artifact, issues)
-    _require_phrase(top, "AI_CODE_ENABLE_BUILD_COMMANDS=1", artifact, issues)
+    _require_phrase(top, "client.json 的 build_commands", artifact, issues)
     _require_phrase(top, "git 不在白名單", artifact, issues)
 
     for key, expected in (
@@ -766,14 +758,29 @@ _STALE_DOC_PATTERNS = (
     (r"--enable-experimental-build-prompt", "`--enable-experimental-build-prompt`(旗標已移除)"),
     (r"scripts/opencode_[a-z_]+\.py", "`scripts/opencode_*.py`(已刪除)"),
     (r"scripts/compaction_status\.py", "`scripts/compaction_status.py`(已併進 `codetrail_chat.py status`)"),
+    # 網頁前端整組移除:唯一的使用者入口是 `aicode`。troubleshooting 的「升級之後舊的
+    # web backend 還在跑」是**清理指引**,講的是怎麼把它停掉,所以那一節允許出現這些字;
+    # 這裡擋的是「教使用者去用」的寫法(命令列形狀)。
+    (r"(?m)^\s*(?:[$>]\s*)?aicode\s+web\b", "`aicode web`(網頁前端已移除)"),
+    (r"(?m)^\s*(?:[$>]\s*)?aicode\s+attach\b", "`aicode attach`(薄 client 已移除)"),
+    (r"(?m)^\s*(?:[$>]\s*)?aicode_web\b", "`aicode_web`(背景 launcher 已移除)"),
+    (r"AICODE_WEB_[A-Z_]+", "`AICODE_WEB_*`(網頁前端已移除)"),
+    # 命令形狀之外,散文也不得再教網頁前端(「或 web 介面」「web 模式下…」)。
+    # troubleshooting 的清理指引講的是「網頁前端」與「web backend」,不會命中這兩條。
+    (r"web\s*介面", "「web 介面」(網頁前端已移除)"),
+    (r"web\s*模式", "「web 模式」(網頁前端已移除)"),
+    # 設定不經環境交接:文件不得教 `export AICODE_*` 這一類寫法(照做既不生效也
+    # 不報錯)。啟動核心的變數由 tests/test_repo_consistency.py 的逐變數白名單處理;
+    # 這裡只擋最明確的「叫使用者 export」形狀。
+    (r"(?m)^\s*(?:[$>]\s*)?export\s+(?:AICODE|AI_CODE|CODETRAIL|OPENCODE)_", "`export AICODE_* / AI_CODE_* / CODETRAIL_* / OPENCODE_*`(設定只來自檔案)"),
+    (r"\bOPENCODE_[A-Z_]+\b", "`OPENCODE_*`(runtime 完全不碰 OpenCode 的設定;遷移工具用 --config)"),
 )
 
 
 def _check_no_stale_client_docs(docs_text: str, issues: list[str]) -> None:
     """使用者文件不得教已經不存在的旗標 / 檔案 / 腳本。
 
-    `docs/tool-routing-implementation-plan.md` 是標了「歷史文件」的規劃紀錄,
-    `_documentation_text()` 不含它。
+    `_documentation_text()` 掃的是 README 與 docs/ 底下的全部文件。
     """
     for pattern, label in _STALE_DOC_PATTERNS:
         if re.search(pattern, docs_text):
@@ -842,7 +849,6 @@ def check_all() -> list[str]:
 
     # 5. placeholder contract + doctor command + forbidden tokens
     _check_code_model_placeholder_contract(readme_text, docs_text, issues)
-    _check_doctor_commands_have_explicit_model(docs_text, issues)
     _check_forbidden_main_model_tokens(docs_text, issues)
 
     # 6. client MCP read-timeout contract

@@ -22,7 +22,6 @@ from scripts.check_eval_consistency import check_all as eval_check_all
 from scripts.check_readme_consistency import (
     _check_code_model_placeholder_contract,
     _check_default_aux_models_documented,
-    _check_doctor_commands_have_explicit_model,
     _check_forbidden_main_model_tokens,
     _config_int_constant,
     _config_model_values,
@@ -51,7 +50,6 @@ def test_user_facing_python_commands_use_python3():
         REPO_ROOT / "scripts" / "doctor.py",
         REPO_ROOT / "scripts" / "index_stats.py",
         REPO_ROOT / "scripts" / "kb_ab_compare.py",
-        REPO_ROOT / "scripts" / "lessons_check.py",
         REPO_ROOT / "scripts" / "run_tests.py",
         REPO_ROOT / "scripts" / "set_config.py",
     ]
@@ -141,17 +139,20 @@ def test_code_model_placeholder_contract_reports_missing_bits():
     assert any("AICODE_MODEL" in issue for issue in issues)
 
 
-def test_doctor_commands_must_have_explicit_model_on_same_line():
-    issues: list[str] = []
+@pytest.mark.smoke
+def test_doctor_no_longer_needs_a_model_prefix():
+    """`python3 scripts/doctor.py` 就是完整命令。
 
-    _check_doctor_commands_have_explicit_model(
-        "python scripts/doctor.py\n"
-        "AICODE_MODEL=<CODE_MODEL> python scripts/doctor.py\n",
-        issues,
-    )
+    2026-09-04:`_check_doctor_commands_have_explicit_model`(要求文件把 doctor
+    命令寫成 `AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py`)刪除。
+    行為為什麼該變:doctor 現在從 deployment.json 讀主模型,那個前綴既不會生效
+    也不再需要 —— 留著檢查等於強迫文件教一個沒有作用的東西。
+    """
+    from scripts import check_readme_consistency as checker
 
-    assert len(issues) == 1
-    assert "AICODE_MODEL=<CODE_MODEL>" in issues[0]
+    assert not hasattr(checker, "_check_doctor_commands_have_explicit_model")
+    doctor_source = (REPO_ROOT / "scripts" / "doctor.py").read_text(encoding="utf-8")
+    assert "AICODE_MODEL=" not in doctor_source
 
 
 def test_default_aux_models_must_be_documented():
@@ -270,7 +271,7 @@ _RUN_COMMAND_TOOL = {
     "function": {
         "name": "run_command",
         "description": (
-            "執行白名單命令。build 命令只在 AI_CODE_ENABLE_BUILD_COMMANDS=1 時加入;"
+            "執行白名單命令。build 命令只在 client.json 的 build_commands 打開時加入;"
             "git 不在白名單(用 git_status / git_diff)。"
             "timeout 1..600 秒(server 端上限;client 可能更早截止)。"
         ),
@@ -965,9 +966,9 @@ def test_the_readme_no_longer_teaches_installing_opencode():
 
 @pytest.mark.smoke
 def test_user_docs_must_not_teach_removed_flags_or_files():
-    """去 OpenCode 化之後不存在的東西(`--compaction-mode native`、舊 ownership 狀態檔、
-    已刪的 scripts/opencode_*.py、已併掉的 compaction_status.py)文件不得再教。
-    checker 要抓得到,而且現在的文件要乾淨。"""
+    """已經不存在的東西(`--compaction-mode native`、舊 ownership 狀態檔、已刪的
+    scripts/opencode_*.py、已併掉的 compaction_status.py、整組移除的網頁前端)文件不得
+    再教。checker 要抓得到,而且現在的文件要乾淨。"""
     from scripts import check_readme_consistency as checker
 
     for stale in (
@@ -975,6 +976,13 @@ def test_user_docs_must_not_teach_removed_flags_or_files():
         "模式記在 ~/.config/codetrail/compaction.json 裡",
         "python3 scripts/opencode_contract_check.py --fix",
         "python3 scripts/compaction_status.py",
+        # 網頁前端已整組移除;文件不得再教使用者去跑它。
+        "```bash\naicode web --hostname 0.0.0.0\n```",
+        "```bash\naicode attach http://127.0.0.1:4096\n```",
+        "```bash\naicode_web stop\n```",
+        "先 export AICODE_WEB_PASSWORD=<強密碼> 再啟動",
+        "用終端客戶端(直接 `aicode`)或 web 介面",
+        "web 模式下沙箱綁在啟動 backend 的目錄",
     ):
         issues: list[str] = []
         checker._check_no_stale_client_docs(stale, issues)
@@ -1182,3 +1190,1052 @@ def test_current_cli_help_never_mentions_opencode():
 
     assert "native" not in (sc.__doc__ or "")
     assert "plugin" not in (sc.__doc__ or "")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 三條靜態 gate:OpenCode 殘留、os.environ 讀取、文件教的東西
+# ═══════════════════════════════════════════════════════════════════════════
+# 為什麼是**靜態**:這三件事的失敗都是無聲的。
+#   * 多一處 opencode 依賴 = 部署又需要 Node,而測試照樣綠。
+#   * 多一處 `os.environ.get("AICODE_...")` = 殼層裡殘留的變數又能靜默蓋過
+#     `deployment.json`,而那正是兩份安裝混用時「以為在跑 A、實際在跑 B」的機制。
+#   * 文件多教一行 `export AICODE_*` = 使用者照做,然後得到一個不會生效、也不會
+#     報錯的設定。
+# allowlist 逐條寫原因;要加新的一條就得在這裡說明白。
+
+
+#: 不是 source 的目錄:VCS / 快取 / venv(README 建議在 repo 內建 `.venv`,掃進
+#: site-packages 就是誤報 + 慢)/ 本機狀態。含 `pyvenv.cfg` 的目錄一律視為 venv。
+_SKIP_DIRS = {
+    ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".eggs",
+    "node_modules", ".codetrail", ".venv", "venv", "site-packages",
+}
+#: 跳過的**檔案**(不是目錄)只有 VCS 控制檔:linked worktree 的 `.git` 是普通檔。
+_SKIP_FILES = {".git"}
+
+
+
+
+def _walk_files(root: Path, *, visited: list[str] | None = None):
+    """`os.walk` + **真剪枝**:VCS / 快取 / venv(含 `pyvenv.cfg` 的子目錄)不走進去,
+    不是走完再逐檔跳過(大型 `.venv` 那是幾萬個檔)。`visited` 給自測看走了哪些目錄。"""
+    import os as _os
+
+    for dirpath, dirnames, filenames in _os.walk(root):
+        if visited is not None:
+            visited.append(str(Path(dirpath).relative_to(root)))
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in _SKIP_DIRS and not (Path(dirpath) / d / "pyvenv.cfg").exists()
+        )
+        for name in sorted(filenames):
+            # linked worktree 的 `.git` 是**檔案**(`gitdir: …/.git/worktrees/x`):VCS 控制檔,
+            # 不是 source。**只**跳這一個名字:叫 `venv` / `node_modules` 的無副檔名 script 是 source。
+            if name in _SKIP_FILES:
+                continue
+            yield Path(dirpath) / name
+
+
+def _repo_sources(suffixes=(".py",), *, include_tests: bool = False, names=()):
+    """repo 內要掃的檔案。跳過 .git / __pycache__ / venv / 本機快取產物。
+
+    `names` 是**沒有副檔名也要掃**的檔名(`aicode` wrapper);列在裡面的 dot 檔也照掃。
+    """
+    for path in _walk_files(REPO_ROOT):
+        if not path.is_file():
+            continue
+        if path.suffix not in suffixes and path.name not in names:
+            continue
+        rel = path.relative_to(REPO_ROOT)
+        if rel.name.startswith(".") and rel.name not in names:
+            continue
+        if not include_tests and rel.parts[0] == "tests":
+            continue
+        yield path
+
+
+def _iter_text_files(root: Path, *, ignored: frozenset[Path] | set[Path] = frozenset(), _visited: list[str] | None = None):
+    """`root` 底下**所有**文字檔(檔名、副檔名不限;二進位跳過;tests/ 與 venv / 快取不掃)。
+
+    OpenCode gate 用它:「只掃某幾種副檔名」就是 `Dockerfile.dev` / `.env` / `ci.yaml`
+    這種正常檔名一個接一個漏。`ignored` 是 git 認定被忽略的檔(本機快取產物)。
+    """
+    for path in _walk_files(root, visited=_visited):
+        if not path.is_file() or path.is_symlink():
+            continue
+        rel = path.relative_to(root)
+        if rel.parts[0] == "tests" or rel in ignored:
+            continue
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in raw[:8192]:
+            continue
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        yield path
+
+
+def _git_ignored() -> set[Path]:
+    """git 認定被忽略的檔(相對 repo root):本機快取 / 狀態,不是 source。"""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+            capture_output=True, check=False, timeout=30,
+            env=__import__("process_env").child_env(),
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {Path(item.decode("utf-8", "replace")) for item in out.split(b"\0") if item}
+
+
+def _code_only(path: Path, *, keep_docstrings: bool = False) -> list[tuple[int, str]]:
+    """去掉註解(預設也去 docstring)的 (行號, 內容)。
+
+    這幾條 gate 要擋的是**程式碼裡的依賴**,不是「說明為什麼已經不依賴它」的
+    註解 —— 後者正是這次施工留下最多、也最該留下的東西。`keep_docstrings=True`
+    給模型看得到的文字那條 gate 用:MCP 工具的 docstring **就是**工具描述。
+    """
+    return _code_only_source(path.read_text(encoding="utf-8"), path.suffix, keep_docstrings=keep_docstrings)
+
+
+def _code_only_source(source: str, suffix: str, *, keep_docstrings: bool = False) -> list[tuple[int, str]]:
+    """`_code_only` 的純函式版(gate 的自測用合成內容餵它)。"""
+    skip: set[int] = set()
+    if suffix == ".py" and not keep_docstrings:
+        import ast as _ast
+
+        try:
+            tree = _ast.parse(source)
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            for node in _ast.walk(tree):
+                if not isinstance(
+                    node, (_ast.Module, _ast.ClassDef, _ast.FunctionDef, _ast.AsyncFunctionDef)
+                ):
+                    continue
+                doc = node.body[0] if node.body else None
+                if (
+                    isinstance(doc, _ast.Expr)
+                    and isinstance(doc.value, _ast.Constant)
+                    and isinstance(doc.value.value, str)
+                ):
+                    skip.update(range(doc.lineno, (doc.end_lineno or doc.lineno) + 1))
+    out = []
+    for lineno, line in enumerate(source.splitlines(), 1):
+        if lineno in skip:
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("#") or stripped.startswith("//"):
+            continue
+        out.append((lineno, line))
+    return out
+
+
+#: `opencode` 這個字允許出現的地方,以及原因。
+_OPENCODE_ALLOWLIST = {
+    # 唯一會寫使用者 opencode.json 的路徑(手動升級工具)。
+    "opencode_migrate.py": "手動升級工具本身",
+    # inert stub:使用者的 opencode.json 可能還註冊著這兩個路徑。
+    "opencode_plugins/codetrail-compaction.js": "inert stub",
+    "opencode_plugins/codetrail-notify.js": "inert stub",
+    # 唯讀偵測 / 升級提示。
+    "scripts/doctor.py": "唯讀偵測殘留安裝",
+    "scripts/set_config.py": "升級提示",
+    # 文件的升級段。
+    "README.md": "升級段",
+    "README_DEV.md": "升級段",
+    "AGENTS.md": "§2 的 stub 契約",
+    "docs/troubleshooting.md": "升級段",
+    "docs/setup.md": "升級段",
+    "docs/compaction-rules.md": "升級段",
+    "docs/security.md": "升級段",
+    "docs/mcp-tools.md": "升級段",
+    "docs/basic-usage.md": "升級段",
+    "docs/opencode-agents-template.md": "升級段",
+    # 子行程環境的**剝除**清單:`OPENCODE_*` 出現在這裡正是為了把它拿掉
+    # (核准後的 run_command 會繼承那份環境,裡面可能有升級機器殘留的機密)。
+    "process_env.py": "剝除 OPENCODE_* 的清單與 fail-loud",
+    "scripts/mcp_catalog.py": "剝除清單 + eval 保留的欄位名",
+    "scripts/eval_tool_routing.py": "剝除清單 + eval 保留的欄位名",
+    "scripts/check_readme_consistency.py": "檢查 README 不再教安裝 opencode-ai",
+    # eval 的 era 標記(純資料檔);eval/ 的 .py 走一般檢查。
+    "eval/fixtures/tool_routing/support_matrix.json": "eval 的 era 標記",
+}
+
+#: allowlist 裡的 **code 檔不是整檔豁免**:這些形狀 = runtime 依賴,在哪個檔都算違規
+#: (匯入 opencode 模組、碰 OpenCode 的設定 / plugin 路徑、呼叫 opencode 命令、
+#: 教裝 opencode-ai)。整檔豁免只給遷移工具本身與被 stub 契約另外釘住的兩個 stub。
+_OPENCODE_DEPENDENCY_SHAPES = re.compile(
+    r"(?:^|[^\w.])(?:import|from)\s+opencode"
+    r"|opencode\.json|opencode_plugins|\.config/opencode"
+    r"|which\(\s*['\"]opencode|[\[(,]\s*['\"]opencode['\" ]"
+    r"|\bnpm\b|\bnpx\b|opencode-ai",
+    re.IGNORECASE,
+)
+_OPENCODE_WHOLE_FILE = {
+    "opencode_migrate.py",
+    "opencode_plugins/codetrail-compaction.js",
+    "opencode_plugins/codetrail-notify.js",
+}
+#: 逐檔的例外形狀,附原因。
+_OPENCODE_SHAPE_EXEMPTIONS = {
+    # 唯讀偵測:import 遷移工具只為了 plan_migration()(零寫入),提示字串指向它。
+    "scripts/doctor.py": re.compile(r"import opencode_migrate|opencode_migrate\.py"),
+    # 它的字串**就是**用來抓「README 教裝 opencode-ai」的 pattern。
+    "scripts/check_readme_consistency.py": re.compile(r"opencode-ai|npm"),
+}
+
+
+def _opencode_offenders(rel: str, text: str) -> list[str]:
+    """一個檔案裡不該出現的 OpenCode 依賴(gate 的純函式半邊,自測餵合成內容)。"""
+    suffix = Path(rel).suffix
+    if rel in _OPENCODE_WHOLE_FILE:
+        return []
+    listed = rel in _OPENCODE_ALLOWLIST
+    offenders: list[str] = []
+    if listed and suffix == ".md":
+        # allowlist 裡的**文件**不是整檔豁免 —— 但判準不是「這一行有沒有升級的字眼」
+        # (那只會產生噪音),而是「有沒有教使用者去用它」:`OPENCODE_*` 變數、
+        # `opencode` 命令列形狀。散文裡提到 OpenCode(升級段、兩世代並存、eval 的
+        # era 標記)本來就該提到它的名字。
+        teach = re.compile(r"(?m)\bOPENCODE_[A-Z_]+\b|^\s*(?:[$>]\s*)?opencode\s|npm\s+install\s+-g\s+opencode")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if any(word in line for word in ("已刪除", "已移除", "不存在", "不再", "以前", "不會", "不得")):
+                continue
+            if teach.search(line):
+                offenders.append(f"{rel}:{lineno}(教使用者用 OpenCode): {line.strip()[:110]}")
+        return offenders
+    if listed and suffix not in (".py", ".js", ".sh"):
+        # 資料 / 需求檔不是整檔豁免:era 標記(`"era": "opencode"`)可以,
+        # 命令列形狀、`opencode-ai`、`npm` 一樣是依賴。
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if "opencode" in line.lower() and _OPENCODE_DEPENDENCY_SHAPES.search(line):
+                offenders.append(f"{rel}:{lineno}(allowlist 資料檔裡的依賴形狀): {line.strip()[:110]}")
+        return offenders
+    exempt = _OPENCODE_SHAPE_EXEMPTIONS.get(rel)
+    for lineno, line in _code_only_source(text, suffix):
+        # 行尾註解也放行:`x = 1  # OpenCode 時代是 ...`
+        code = line.split("#", 1)[0] if suffix == ".py" else line
+        if "opencode" not in code.lower():
+            continue  # `npm test` 之類是使用者專案的命令,與 OpenCode 無關
+        if not listed:
+            offenders.append(f"{rel}:{lineno}: {line.strip()[:120]}")
+            continue
+        if exempt is not None and exempt.search(code):
+            continue
+        if _OPENCODE_DEPENDENCY_SHAPES.search(code):
+            offenders.append(f"{rel}:{lineno}(allowlist 檔裡的 runtime 依賴形狀): {line.strip()[:110]}")
+    return offenders
+
+
+def _opencode_gate_sources():
+    """OpenCode gate 掃 repo 裡**所有**文字檔(`pyproject.toml`、`Dockerfile.dev`、`.env`、
+    `ci.yaml`、`aicode` wrapper、`.gitignore` …):列舉不靠副檔名 / 檔名清單。"""
+    return _iter_text_files(REPO_ROOT, ignored=_git_ignored())
+
+
+@pytest.mark.smoke
+def test_opencode_only_survives_in_the_migration_path_and_docs():
+    """`opencode` 只准出現在遷移路徑、inert stub、唯讀偵測與文件的升級段。
+
+    多一處 runtime 依賴 = 部署又需要 Node / opencode-ai,而所有測試照樣綠。
+    """
+    offenders: list[str] = []
+    for path in _opencode_gate_sources():
+        rel = str(path.relative_to(REPO_ROOT))
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        offenders += _opencode_offenders(rel, text)
+    assert not offenders, (
+        "opencode 只准出現在 allowlist 的檔案裡(遷移工具 / stub / 唯讀偵測 / 文件升級段)。"
+        "新增一處就得在 _OPENCODE_ALLOWLIST 說明原因:\n" + "\n".join(offenders)
+    )
+
+
+#: `os.environ` / `getenv` 允許出現的檔案,以及原因。
+#: 啟動核心(§0)的設定契約**本來就是**環境變數(`~/start.sh` export 給 launcher),
+#: 那條線不動;客戶端 / MCP 這一側只准讀「檔案位置」與行程間介面。
+_ENVIRON_ALLOWLIST = {
+    # 啟動核心:start.sh → launcher 的 env 契約,原封不動。
+    "deployment_profile.py": "啟動核心的 env overlay",
+    "deployment_status.py": "啟動核心",
+    "scripts/launch_servers.py": "啟動核心",
+    "scripts/stop_servers.py": "啟動核心",
+    "scripts/check_status.py": "啟動核心",
+    "scripts/set_config.py": "start.sh 產生器 + HOME",
+    # 開發者工具(README_DEV 要求的並行度控制),不是使用者設定。
+    "scripts/run_tests.py": "AICODE_TEST_JOBS / TAIL_ARGS",
+    # 只讀 HOME / XDG_* / PATH / PYTHONIOENCODING 這類「檔案在哪 / 行程介面」。
+    "config.py": "HOME(_file_env)",
+    "client_config.py": "HOME",
+    "client_paths.py": "HOME / XDG_STATE_HOME",
+    "client_preflight.py": "HOME(profile_env)",
+    "client_prompt.py": "HOME",
+    "client_status.py": "HOME",
+    "client_store.py": "HOME / XDG_STATE_HOME",
+    "process_env.py": "子行程環境的剝除(唯一出口)",
+    "client_mcp.py": "子行程環境的剝除(委派 process_env)",
+    "client_app.py": "TERM / COLUMNS 之類的終端介面",
+    "index_scope.py": "HOME",
+    "lessons.py": "HOME",
+    "mcp_lease.py": "XDG_STATE_HOME",
+    "data_flywheel.py": "HOME / XDG_STATE_HOME",
+    "mcp_server.py": "PYTHONIOENCODING / HOME",
+    "codetrail_chat.py": "HOME(root_safety)",
+    "root_safety.py": "HOME",
+    "container_runner.py": "PATH / HOME",
+    "http_client.py": "proxy 衛生(NO_PROXY 等)",
+    "opencode_migrate.py": "HOME / XDG_STATE_HOME",
+    "scripts/doctor.py": "HOME / PATH",
+    "scripts/index_stats.py": "HOME",
+    "scripts/tool_call_canary.py": "HOME / XDG_CACHE_HOME / 子行程環境",
+    "scripts/required_model_servers_check.py": "HOME",
+    "scripts/session_eval.py": "HOME / 子行程環境",
+    "scripts/eval_tool_routing.py": "HOME / 子行程環境",
+    "scripts/mcp_catalog.py": "子行程環境的剝除",
+    "scripts/kb_ab_compare.py": "HOME",
+    "scripts/check_eval_consistency.py": "HOME",
+    "session_eval.py": "HOME / XDG_STATE_HOME",
+    "media.py": "PATH(objdump)",
+    "agent_tools.py": "子行程環境(PYTHONIOENCODING / LC_ALL)",
+    "client_compaction.py": "HOME / XDG_STATE_HOME(ledger 位置)",
+    "client_engine.py": "HOME(system prompt 的來源檔)",
+    "external_import.py": "HOME",
+    # `AICODE_MODEL` 的解析器,同時服務 `~/start.sh` → launcher 那條路;
+    # 客戶端側交給它的是 HOME-only 的 env(config._file_env / profile_env)。
+    "model_resolution.py": "啟動核心共用的模型解析器",
+    "elf_analysis.py": "PATH(objdump)",
+    "eval/run_eval.py": "開發者 eval 工具",
+    "eval/record_semantic_vectors.py": "LLAMA_BIN(啟動核心)",
+}
+
+#: 這幾個前綴是 CodeTrail 自己的設定名。客戶端 / MCP 側**一個都不准讀**。
+_CODETRAIL_ENV_PREFIXES = ("AICODE_", "AI_CODE_", "CODETRAIL_", "OPENCODE_")
+
+
+#: 啟動核心(§0)與開發者工具:它們的 env 契約本來就是環境變數,子行程照舊繼承。
+_SPAWN_CORE = {
+    "deployment_profile.py", "deployment_status.py",
+    "scripts/launch_servers.py", "scripts/stop_servers.py", "scripts/check_status.py",
+    "scripts/set_config.py", "scripts/run_tests.py",
+    "eval/run_eval.py", "eval/record_semantic_vectors.py",
+}
+#: 「複製整份行程環境」的寫法;唯一合法的一份在 `process_env.child_env()`。
+#: (`environ = os.environ if env is None else env` 這種**讀 HOME 用的別名**不算:
+#: 它不會交給子行程;交給子行程的是 `env= / environ= / environment=` 這些關鍵字形狀。)
+#: (`dict(os.environ if env is None else env)` 這種**讀 HOME 用的副本**不算:它只拿來
+#: 找檔案位置,交給子行程時 `env=self.env` 這種 Attribute 會被 spawn 檢查擋下。)
+_ENV_COPY = re.compile(
+    r"os\.environ\.(?:copy|items)\(\)|dict\(\s*os\.environ\s*[,)]|\{\s*\*\*os\.environ"
+    r"|copy\(\s*os\.environ\b|os\.environ\s*\||\|\s*os\.environ\b|os\.environb|\breturn\s+os\.environ\b(?!\s*[.\[])"
+    r"|(?:[(,]|^)\s*(?:env|environ|environment)\s*=\s*os\.environ\s*(?:[,)]|$)"
+)
+#: 這些名字在 process_env 與啟動核心以外的 code 行**一律不得出現**。spawn 只有一個出口
+#: (`process_env.run/popen/check_output`,環境由它自己用 child_env() 算),所以 gate 不必推導
+#: env 從哪來 —— alias、cast、作用域、順序、helper 全部無關,因為沒有東西可以 alias。
+_SPAWN_API = re.compile(
+    r"\bsubprocess\b|\bpexpect\b|\bpty\b"
+    r"|\bos\.(?:exec\w*|spawn\w*|posix_spawn\w*|system|popen|fork\w*)\b"
+    r"|\basyncio\.create_subprocess_\w+"
+    r"|(?:__import__|import_module)\(\s*['\"](?:subprocess|pexpect|pty)\b"
+    r"|\bprocess_env\._\w+"  # 唯一出口的私有成員(_subprocess …)不是出口
+)
+_OS_SPAWN_NAMES = re.compile(r"^(?:exec\w*|spawn\w*|posix_spawn\w*|system|popen|fork\w*)$")
+_SPAWN_MODULES = ("subprocess", "pty", "pexpect")
+
+
+def _spawn_offenders(rel: str, source: str) -> list[str]:
+    """子行程環境沒有經 `child_env()` 的地方(gate 的純函式半邊)。
+
+    判準只有三條、都不用推導:(1) 複製整份 `os.environ`;(2) spawn API(`subprocess` /
+    `pty` / `pexpect` / `os.exec*|spawn*|system|popen|fork*` / `asyncio.create_subprocess_*`,
+    含 `from os import system`、`getattr(os, "system")`、`__import__("subprocess")`)在
+    process_env 與啟動核心以外**出現**;(3) `process_env.run/popen/check_output` 被交了 `env=`
+    (它們自己算環境,明確要加的鍵走 `overrides=`)。
+    """
+    import ast as _ast
+
+    if rel in _SPAWN_CORE or rel == "process_env.py":
+        return []
+    out: list[str] = []
+    for lineno, line in _code_only_source(source, ".py"):
+        if _ENV_COPY.search(line):
+            out.append(f"{rel}:{lineno}(複製整份 os.environ): {line.strip()[:110]}")
+        if _SPAWN_API.search(line):
+            out.append(f"{rel}:{lineno}(直接用 spawn API;只能走 process_env.run/popen/check_output): {line.strip()[:100]}")
+    try:
+        tree = _ast.parse(source)
+    except SyntaxError:
+        return out
+    # `import os as operating_system` / `import asyncio as aio`:alias 之後的 `.system` / `.create_subprocess_*`
+    # 一樣是 spawn;`from process_env import run` 之後的裸 `run(..., env=)` 才算出口被交 env。
+    module_aliases: dict[str, set[str]] = {}  # 同名多次 import 取**聯集**(最後寫入者勝出會漏)
+    exit_names: set[str] = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            for a in node.names:
+                if a.name in ("os", "asyncio") and a.asname:
+                    module_aliases.setdefault(a.asname, set()).add(a.name)
+        elif isinstance(node, _ast.ImportFrom) and node.module == "process_env":
+            exit_names.update(a.asname or a.name for a in node.names if a.name in ("run", "popen", "check_output", "Popen"))
+            for a in node.names:
+                if a.name.startswith("_") or a.name == "*":
+                    out.append(f"{rel}:{node.lineno}(from process_env import {a.name}:私有成員不是出口)")
+
+    def aliased_spawn(base: str, attr: str) -> str | None:
+        for module in module_aliases.get(base, ()):
+            if module == "os" and _OS_SPAWN_NAMES.match(attr):
+                return f"os.{attr}"
+            if module == "asyncio" and attr.startswith("create_subprocess"):
+                return f"asyncio.{attr}"
+        return None
+
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Attribute) and isinstance(node.value, _ast.Name):
+            target = aliased_spawn(node.value.id, node.attr)
+            if target:
+                out.append(f"{rel}:{node.lineno}({node.value.id}.{node.attr} 是 {target}:spawn API 只能走 process_env)")
+        if isinstance(node, _ast.ImportFrom) and node.module in ("os", "asyncio", *_SPAWN_MODULES):
+            for a in node.names:
+                if (
+                    node.module in _SPAWN_MODULES
+                    or a.name == "*"
+                    or (node.module == "os" and _OS_SPAWN_NAMES.match(a.name))
+                    or (node.module == "asyncio" and a.name.startswith("create_subprocess"))
+                ):
+                    out.append(f"{rel}:{node.lineno}(from {node.module} import {a.name}:spawn API 只能走 process_env)")
+        elif isinstance(node, _ast.Call):
+            f = node.func
+            if (
+                isinstance(f, _ast.Name) and f.id == "getattr" and len(node.args) >= 2
+                and isinstance(node.args[0], _ast.Name)
+                and isinstance(node.args[1], _ast.Constant) and isinstance(node.args[1].value, str)
+            ):
+                bases = module_aliases.get(node.args[0].id, {node.args[0].id})
+                attr = node.args[1].value
+                if any(
+                    base in _SPAWN_MODULES or (base == "os" and _OS_SPAWN_NAMES.match(attr))
+                    or (base == "asyncio" and attr.startswith("create_subprocess"))
+                    for base in bases
+                ):
+                    out.append(f"{rel}:{node.lineno}(getattr({node.args[0].id}, {attr!r}):spawn API 只能走 process_env)")
+            is_exit = (
+                isinstance(f, _ast.Attribute) and isinstance(f.value, _ast.Name) and f.value.id == "process_env"
+                and f.attr in ("run", "popen", "check_output", "Popen")
+            ) or (isinstance(f, _ast.Name) and f.id in exit_names)
+            if is_exit and any(k.arg == "env" for k in node.keywords):
+                out.append(f"{rel}:{node.lineno}(process_env 的 spawn 出口不接受 env=:環境由它自己算,要加的鍵走 overrides=)")
+    return out
+
+
+@pytest.mark.smoke
+def test_no_module_reads_codetrail_settings_from_the_environment():
+    """客戶端 / MCP 側不得從環境變數取任何 CodeTrail 設定。
+
+    真實觸發:兩份安裝共用一台機器,另一份的 `~/start.sh` export 了
+    `AICODE_MODEL` / `AICODE_LLAMA_BASE_URL` / `AICODE_N_CTX`。讀進來就是
+    「使用者以為在跑 A、實際在跑 B」,而且完全無聲。
+
+    這條掃的是**字面出現**(不是 allowlist 檔案的豁免):啟動核心那幾個檔仍然
+    要讀它們,所以它們在 `_ENVIRON_ALLOWLIST` 裡;其餘一個都不准。
+    """
+    offenders: list[str] = []
+    for path in _repo_sources():
+        rel = str(path.relative_to(REPO_ROOT))
+        if rel in _ENVIRON_ALLOWLIST:
+            continue
+        code = "\n".join(line for _, line in _code_only(path))
+        if "os.environ" in code or "getenv" in code:
+            offenders.append(f"{rel}: 讀了 os.environ / getenv(不在 allowlist 裡)")
+    assert not offenders, (
+        "新增 os.environ 讀取要嘛加進 _ENVIRON_ALLOWLIST 並寫明只讀什麼,"
+        "要嘛改走 client.json 的鍵或 config.py 常數:\n" + "\n".join(offenders)
+    )
+
+    # allowlist 內的檔案也不准讀 CodeTrail 自己的設定名(啟動核心除外)。
+    core = {
+        "deployment_profile.py",
+        "deployment_status.py",
+        "scripts/launch_servers.py",
+        "scripts/stop_servers.py",
+        "scripts/check_status.py",
+        "scripts/set_config.py",
+        "scripts/run_tests.py",
+        "eval/run_eval.py",
+        "eval/record_semantic_vectors.py",
+        # 啟動核心共用的模型解析器:它**必須**讀 AICODE_MODEL(launcher 那條路),
+        # 客戶端側靠「交什麼 env 給它」把那條路關掉,而那由
+        # tests/test_client_preflight.py 的 HOME-only 測試守。
+        "model_resolution.py",
+    }
+    # 只認**真的讀行程環境**的形狀(`os.environ` / `os.getenv`)。
+    # `environ.get(...)` 作用在呼叫端傳進來的 dict 上時,那正是 argv 交接
+    # (例如 `opencode_migrate` 的 `--config`),不是從殼層取設定。
+    reads = re.compile(
+        r"os\.(?:environ(?:\.get)?\(|getenv\()\s*[\"']("
+        + "|".join(_CODETRAIL_ENV_PREFIXES)
+        + r")"
+    )
+    leaks: list[str] = []
+    for rel in sorted(set(_ENVIRON_ALLOWLIST) - core):
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            continue
+        for lineno, line in _code_only(path):
+            if reads.search(line):
+                leaks.append(f"{rel}:{lineno}: {line.strip()[:120]}")
+    assert not leaks, (
+        "客戶端 / MCP 側讀了 CodeTrail 自己的設定變數;設定只來自 config.py 常數、"
+        "deployment.json / models.json 與 client.json,行程之間用 argv:\n" + "\n".join(leaks)
+    )
+
+    # **間接那一半:整份環境被複製給子行程 / 子行程隱式繼承。** 直接的
+    # `.get("AICODE_…")` 只是明顯的那一種;`env = os.environ.copy()` 之後把 env
+    # 遞下去,下游隨便一個 `.get()` 就把殼層的值撈回來了 —— 而且靜態上看不出來。
+    # 判準在 `_spawn_offenders`。
+    copies: list[str] = []
+    for path in _repo_sources():
+        rel = str(path.relative_to(REPO_ROOT))
+        copies += _spawn_offenders(rel, path.read_text(encoding="utf-8"))
+    assert not copies, (
+        "spawn 子行程前必須用 process_env.child_env() 剝掉 CodeTrail 的設定變數,"
+        "不能直接複製整份 os.environ、也不能隱式繼承:\n" + "\n".join(copies)
+    )
+    # 同一件事的第三種寫法:`os.environ["AICODE_…"]` 的 index access。
+    indexed = re.compile(r"os\.environ\[\s*[\"'](" + "|".join(_CODETRAIL_ENV_PREFIXES) + r")")
+    hits: list[str] = []
+    for path in _repo_sources():
+        rel = str(path.relative_to(REPO_ROOT))
+        if rel in core:
+            continue
+        for lineno, line in _code_only(path):
+            if indexed.search(line):
+                hits.append(f"{rel}:{lineno}: {line.strip()[:120]}")
+    assert not hits, "index access 也是讀環境:\n" + "\n".join(hits)
+
+
+#: 文件不得再教的**介面**:每一條都是「照做之後不會生效、也不會報錯」。
+#: (變數名不在這裡列:任何 CodeTrail 變數名都由 `_doc_offenders` 一律抓。)
+_FORBIDDEN_DOC_PATTERNS = (
+    (r"\baicode\s+web\b", "網頁前端已整組移除"),
+    (r"\baicode\s+attach\b", "attach 已移除"),
+    (r"\baicode_web\b", "背景 launcher 已移除"),
+)
+
+#: **啟動核心的變數**仍然要教(`~/start.sh` → launcher 的契約沒變)。
+#: 這是一份**逐個變數**的白名單,不是整檔豁免 —— 整檔豁免就是 docs/setup.md
+#: 整段教 `AICODE_LLAMA_*` 卻沒有人發現的原因。
+_DOC_CORE_VARIABLES = (
+    "AICODE_MODEL",       # start.sh export 給 launcher
+    "AICODE_PROFILE",
+    "AICODE_DEPLOYMENT_CONFIG",
+    "AICODE_MODEL_REGISTRY",
+    "AICODE_MODEL_REGISTRY_FILE",
+    "AICODE_N_CTX",       # launcher 的 -c 來源
+    "AICODE_MAIN_",
+    "AICODE_BIND",
+    "AICODE_NO_ROLLBACK",
+    "AICODE_STOP_TIMEOUT",
+    "AICODE_STATUS_",
+    "AICODE_TEST_",       # scripts/run_tests.py 的並行度控制
+)
+
+#: 核心變數只在這些**段落**合法(標題以此開頭;段落 = 到下一個標題為止),不是整檔。
+_DOC_CORE_SECTIONS = {
+    "README.md": ("### 3.2 啟動與停止", "### 3.3 驗活與維運", "### 4.0 設定在哪裡",
+                  "### 4.1 Deployment profile", "### 4.2 Model registry"),
+    "README_DEV.md": ("## 維護命令索引",),
+    "docs/setup.md": ("### systemd unit",),
+    "docs/deployment-profiles.md": ("## 選擇與優先序", "## Service schema"),
+}
+
+#: 文件裡合法的名字:路徑 placeholder、概念名、ingest 通知的協定標記。
+#: 它們不是環境變數,沒有人會拿去 export。
+_DOC_ALLOWED_TOKENS = (
+    "CODETRAIL_REPO", "AICODE_ROOT",
+    "CODETRAIL_ACTION_REQUIRED", "CODETRAIL_INGEST_SUMMARY", "CODETRAIL_INGEST_FAILED", "CODETRAIL_ZERO_WRITE",
+)
+
+#: 核心變數當環境前綴掛在**這些**腳本前面是契約(`AICODE_MODEL=… python3 deployment_profile.py`);
+#: 掛在別的腳本前面(`AICODE_MODEL=… python3 scripts/doctor.py`)就是在教一個沒用的東西。
+_LAUNCHER_SCRIPTS = (
+    "scripts/launch_servers.py", "scripts/stop_servers.py", "scripts/check_status.py",
+    "deployment_profile.py", "deployment_status.py", "scripts/set_config.py", "scripts/run_tests.py",
+)
+
+_DOC_REMOVAL_WORDS = ("不存在", "已移除", "已刪除", "已經沒有", "以前", "刪除、無替代")
+
+
+#: `TOKEN=value … <命令>`(含 `env` 前綴、多個指派、`\\` 續行合併後)。
+_DOC_ENV_PREFIXED = re.compile(
+    r"(?:^|[\s`$>])(?:env\s+)?((?:(?:AICODE|AI_CODE|CODETRAIL|OPENCODE)_\w+[+:?]?=\S*\s+)+)(\S[^`]*)"
+)
+#: 「當環境變數用」的形狀:`$TOKEN` / `${TOKEN}` 讀它,`TOKEN=` / `+=` / `:=` / `?=` 指派它。
+#: `env | grep X`、`set | grep X`:列出整份環境再撈名字,一樣是在讀它。
+_DOC_ENV_LISTING = re.compile(
+    # 列出整份環境之後,管線裡任何地方出現 grep 類(`| sudo -n grep`、`| tee f | grep`)
+    r"\b(?:env|set|printenv|export|declare)\b[^`]*\|[^`]*\b(?:grep|egrep|fgrep|rg|ag|awk|sed)\b"
+    r"|\b(?:env|set|printenv|export|declare)\b[^;&|`]*>\s*\S+"
+)
+_DOC_VAR_USE = re.compile(
+    r"(\$\{?[#!]?|(?:printenv|declare|typeset|export|readonly|local)\b(?:\s+-\S+)*\s+)?"
+    r"\b((?:AICODE|AI_CODE|CODETRAIL|OPENCODE)_\w+)\b(\s*[+:?.]?=(?!=))?"
+)
+_DOC_EXPORT = re.compile(r"\bexport\s+((?:AICODE|AI_CODE|CODETRAIL|OPENCODE)_\w+)")
+#: 環境前綴後面**只准**接啟動核心的命令:launcher 腳本、`~/start.sh`、`./set_config.sh`。
+_DOC_LAUNCHER_COMMAND = re.compile(
+    r"^(?:\w+=\S*\s+)*(?:python3\s+(\S+)|(?:bash\s+)?\S*(?:start\.sh|set_config\.sh)\b)"
+)
+
+
+def _doc_logical_lines(text: str):
+    """(起始行號, 內容, 是否在 code fence 內, 目前標題):`\\` 續行合併成一行看 ——
+    `AICODE_MODEL=bogus \\` 換行再接 `aicode`,逐行看就漏了。標題只認 fence 外的 `#`。"""
+    in_fence = False
+    heading = ""
+    pending: list[str] = []
+    start = 0
+    for lineno, line in enumerate(text.splitlines(), 1):
+        bare = line.strip()
+        if not pending:
+            if bare.startswith(("```", "~~~")):
+                in_fence = not in_fence
+                continue
+            if not in_fence and bare.startswith("#"):
+                heading = bare
+        if bare.endswith("\\"):
+            if not pending:
+                start = lineno
+            pending.append(re.sub(r"\\+\s*$", "", line).rstrip())
+            continue
+        if pending:
+            pending.append(line)
+            yield start, " ".join(pending), in_fence, heading
+            pending = []
+            continue
+        yield lineno, line, in_fence, heading
+    if pending:
+        yield start, " ".join(pending), in_fence, heading
+
+
+def _doc_offenders(rel: str, text: str) -> list[str]:
+    """一份文件裡「教了已經不存在的東西」的行(gate 的純函式半邊)。
+
+    判準:任何 `AICODE_*` / `AI_CODE_*` / `CODETRAIL_*` / `OPENCODE_*` 名字都算(不必有
+    `=`:「把 `AICODE_N_CTX` 設大」一樣是在教),除了:協定標記 / placeholder 的**裸提及**
+    (拿它 `export` / 當環境前綴就不是裸提及);「它已經不存在」的句子;`unset` 舊變數;
+    以及**啟動核心的變數在它的段落裡**,而且環境前綴後面接的是啟動核心自己的命令。
+    """
+    offenders: list[str] = []
+    # 白名單是**整個 token**:`AICODE_MODEL` 不得因為是 `AICODE_MODEL_REMOTE_OK` 的前綴
+    # 而放行後者。以底線結尾的項目是前綴(`AICODE_STATUS_*`)。
+    core_tokens = re.compile(
+        r"\b(?:" + "|".join(
+            re.escape(name) + (r"\w*" if name.endswith("_") else "")
+            for name in _DOC_CORE_VARIABLES
+        ) + r")\b"
+    )
+    allowed_tokens = re.compile(r"\b(?:" + "|".join(map(re.escape, _DOC_ALLOWED_TOKENS)) + r")\b")
+    any_var = re.compile(r"\b(?:AICODE|AI_CODE|CODETRAIL|OPENCODE)_\w+")
+    sections = _DOC_CORE_SECTIONS.get(rel, ())
+
+    def is_core(token: str) -> bool:
+        return core_tokens.fullmatch(token) is not None
+
+    def launcher_command(command: str) -> bool:
+        m = _DOC_LAUNCHER_COMMAND.match(command)
+        if not m:
+            return False
+        script = m.group(1)
+        return script is None or script.rstrip("`'\".,;:)。,").endswith(_LAUNCHER_SCRIPTS)
+
+    for lineno, line, _in_fence, heading in _doc_logical_lines(text):
+        bare = line.strip()
+        in_core = any(heading.startswith(prefix) for prefix in sections)
+        if any(word in line for word in _DOC_REMOVAL_WORDS) or re.match(r"^\s*(?:[$>]\s*)?unset\s", line):
+            continue
+        rest = line
+        m = _DOC_ENV_PREFIXED.search(line)
+        if m:
+            assigned = re.findall(r"((?:AICODE|AI_CODE|CODETRAIL|OPENCODE)_\w+)[+:?]?=", m.group(1))
+            command = m.group(2)
+            if not (in_core and all(is_core(t) for t in assigned) and launcher_command(command)):
+                offenders.append(
+                    f"{rel}:{lineno}: {bare[:110]} — 環境前綴 {'/'.join(assigned)} 掛在命令前面"
+                    "(客戶端 / MCP 不讀環境變數;只有啟動核心的變數接啟動核心的命令才算契約)"
+                )
+                continue
+            rest = line[: m.start(1)] + command
+        ex = _DOC_EXPORT.search(rest)
+        if ex and not (in_core and is_core(ex.group(1))):
+            offenders.append(f"{rel}:{lineno}: {bare[:110]} — export {ex.group(1)}(設定不經環境交接)")
+            continue
+        listing = _DOC_ENV_LISTING.search(rest) is not None
+        used_as_var = [
+            um.group(2)
+            for um in _DOC_VAR_USE.finditer(rest)
+            if (um.group(1) or um.group(3) or listing) and not (in_core and is_core(um.group(2)))
+        ]
+        if used_as_var:
+            offenders.append(
+                f"{rel}:{lineno}: {bare[:110]} — {used_as_var[0]} 被當環境變數讀 / 指派"
+                "(協定標記 / 概念名不是環境變數;客戶端 / MCP 不讀環境變數)"
+            )
+            continue
+        candidate = allowed_tokens.sub("", rest)
+        if in_core:
+            candidate = core_tokens.sub("", candidate)
+        hit = any_var.search(candidate)
+        if hit:
+            offenders.append(f"{rel}:{lineno}: {bare[:110]} — 文件提到 {hit.group(0)}(客戶端 / MCP 不讀環境變數)")
+            continue
+        for pattern, why in _FORBIDDEN_DOC_PATTERNS:
+            if re.search(pattern, candidate):
+                offenders.append(f"{rel}:{lineno}: {bare[:110]} — {why}")
+                break
+    return offenders
+
+
+@pytest.mark.smoke
+def test_user_docs_never_teach_a_removed_environment_knob_or_interface():
+    """文件不得教 `export AICODE_*` / `aicode web` / `attach` / `aicode_web`。
+
+    這些照做之後既不會生效也不會報錯 —— 使用者只會得到一個「設了但沒用」的
+    設定,或一個不存在的子指令。
+    """
+    offenders: list[str] = []
+    docs = list(_repo_sources(suffixes=(".md",)))
+    for path in docs:
+        offenders += _doc_offenders(str(path.relative_to(REPO_ROOT)), path.read_text(encoding="utf-8"))
+    assert not offenders, "文件教了已經不存在的東西:\n" + "\n".join(offenders)
+
+
+@pytest.mark.smoke
+def test_model_facing_text_never_teaches_a_removed_environment_knob():
+    """**模型看得到的**工具描述與錯誤訊息也不得教已刪的環境變數。
+
+    這比文件更糟:使用者會照著模型的建議去 export 一個沒有作用的變數,而模型
+    每一輪都會再建議一次。工具描述進 system prompt,錯誤訊息進工具結果。
+    """
+    offenders: list[str] = []
+    # 掃**字串常數**(含 docstring:MCP 工具的 docstring 就是工具描述),不只 `VAR=`
+    # 的形狀 —— 「請設定 AICODE_X」「見 AI_CODE_Y」一樣是在教一個不存在的東西。
+    pattern = re.compile(r"\b((?:AICODE|AI_CODE|CODETRAIL|OPENCODE)_[A-Z0-9_]+)\b")
+    core_only = {
+        "deployment_profile.py", "deployment_status.py",
+        "scripts/launch_servers.py", "scripts/stop_servers.py",
+        "scripts/check_status.py", "scripts/set_config.py",
+        "scripts/run_tests.py", "eval/run_eval.py",
+        "eval/record_semantic_vectors.py",
+        # 唯一會讀 / 寫 OpenCode 設定的遷移工具與它的 ownership 狀態欄位名。
+        "opencode_migrate.py",
+        # 文件一致性檢查器:它的字串**就是**用來抓這些名字的 pattern。
+        "scripts/check_readme_consistency.py",
+    }
+    #: 字串裡允許出現的名字:啟動核心的契約、開發者工具、以及「這個名字已經沒用」
+    #: 的說明句(訊息本身在講它被刪了)。
+    allowed = re.compile(
+        r"AICODE_TEST_|AICODE_MODEL_REGISTRY|AICODE_MODEL\b|AICODE_PROFILE\b|AICODE_DEPLOYMENT_CONFIG\b"
+        # 概念名(sandbox root 的變數名仍叫 AICODE_ROOT)與 ingest 通知的協定標記:
+        # 它們不是環境變數,不會有人拿去 export。
+        r"|AICODE_ROOT\b|CODETRAIL_ACTION_REQUIRED\b|CODETRAIL_INGEST_SUMMARY\b|CODETRAIL_INGEST_FAILED\b"
+        r"|CODETRAIL_ZERO_WRITE\b"
+    )
+    import ast as _ast
+    for path in _repo_sources():
+        rel = str(path.relative_to(REPO_ROOT))
+        if rel in core_only:
+            continue
+        try:
+            tree = _ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        for node in _ast.walk(tree):
+            if not (isinstance(node, _ast.Constant) and isinstance(node.value, str)):
+                continue
+            for match in pattern.finditer(node.value):
+                name = match.group(1)
+                if allowed.search(name):
+                    continue
+                context = node.value[max(0, match.start() - 60): match.end() + 60].replace("\n", " ")
+                if any(word in context for word in ("已刪除", "已移除", "不存在", "以前", "不再", "刪掉", "刪:", "一起刪", "剝掉", "剝除", "不得", "無效", "殘留", "蓋過", "交進去")):
+                    continue
+                offenders.append(f"{rel}:{node.lineno}: …{context.strip()[:110]}… — {name}")
+    assert not offenders, (
+        "模型看得到的文字教了已刪的環境變數;改成指名 client.json 的鍵或 "
+        "deployment.json 的欄位:\n" + "\n".join(offenders)
+    )
+
+
+# ── 總審 F1-4 / F2-1:三條 gate 各自用「會穿過去的反例」自測 ──
+
+
+@pytest.mark.smoke
+def test_the_docs_gate_catches_bare_mentions_and_scopes_core_names_to_their_sections():
+    """false-green 的三種形狀:不帶 `=` 的教學、核心變數在非核心段落、核心變數
+    當環境前綴掛在客戶端腳本前面。"""
+    assert _doc_offenders("docs/x.md", "把 `AICODE_N_CTX` 設大一點就好。\n")
+    assert _doc_offenders("docs/x.md", "設定 AICODE_FIGURE_MAX_VL_CALLS_PER_DOC 可以放寬\n")
+    assert not _doc_offenders(
+        "README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=<X> \\\npython3 scripts/launch_servers.py\n```\n"
+    )
+    assert _doc_offenders("README.md", "### 5.1 跑 doctor 自檢\n\nAICODE_MODEL=<X> python3 scripts/doctor.py\n")
+    assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\nAICODE_MODEL=<X> python3 scripts/doctor.py\n")
+    assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\n`AICODE_MODEL` 與 `AICODE_LLAMA_BASE_URL` 一起設\n")
+    assert not _doc_offenders("docs/x.md", "`AICODE_N_CTX` 已刪除、無替代。\n")
+    assert not _doc_offenders("docs/x.md", "cd <CODETRAIL_REPO> 之後看 `[CODETRAIL_ACTION_REQUIRED]` 那一段\n")
+    assert not _doc_offenders("docs/x.md", "unset AICODE_NUM_CTX  # 舊版殘留\n")
+
+
+@pytest.mark.smoke
+def test_the_opencode_gate_checks_allowlisted_files_for_dependency_shapes():
+    """allowlist 不是整檔豁免:code 檔要看形狀,非 code 檔(需求檔 / 資料)一樣要看。"""
+    assert _opencode_offenders("scripts/set_config.py", 'proc = subprocess.run(["opencode", "--version"])\n')
+    assert not _opencode_offenders("scripts/set_config.py", 'msg = "OpenCode 設定則用 python3 opencode_migrate.py"\n')
+    assert _opencode_offenders("scripts/set_config.py", "import opencode_migrate\n")
+    assert _opencode_offenders("requirements.txt", "opencode-ai>=1.0\n")
+    assert _opencode_offenders("eval/fixtures/tool_routing/support_matrix.json", '{"cmd": ["opencode", "run"]}\n')
+    assert not _opencode_offenders("eval/fixtures/tool_routing/support_matrix.json", '{"era": "opencode"}\n')
+    assert _opencode_offenders("some_new_module.py", "import opencode_migrate\n")
+
+
+
+
+@pytest.mark.smoke
+def test_doctor_runs_as_a_script_from_the_repo_root():
+    """`python3 scripts/doctor.py` 是 README 教的用法:repo 模組的 import 必須在把 repo
+    root 加進 sys.path **之後**。放錯位置 = 第一行就 ModuleNotFoundError,而 pytest
+    走 import 的路徑完全看不到(它的 sys.path 本來就含 repo root)。"""
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, "scripts/doctor.py", "--help"],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=60,
+        env=__import__("process_env").child_env(),
+    )
+    assert proc.returncode == 0, proc.stderr[-800:]
+    assert "Traceback" not in proc.stderr, proc.stderr[-800:]
+
+
+@pytest.mark.smoke
+def test_the_gates_also_catch_config_files_and_env_prefixed_commands():
+    """`.toml` 依賴、`export AICODE_ROOT=`(協定 / 概念名也不准當環境變數用)、核心段落裡 `AICODE_MODEL=bogus aicode`(環境前綴掛在非啟動核心命令前面,含 `\\` 續行)都要抓。"""
+    assert _opencode_offenders("pyproject.toml", 'dependencies = ["opencode-ai>=1"]\n')
+    assert _opencode_offenders("Makefile", "\tnpm install -g opencode-ai\n")
+    assert _doc_offenders("docs/x.md", "```bash\nexport AICODE_ROOT=/tmp\n```\n")
+    assert _doc_offenders("docs/x.md", "AICODE_ROOT=/tmp python3 mcp_server.py\n")
+    assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=bogus aicode\n```\n")
+    assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=bogus \\\\\naicode\n```\n")
+    assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nenv AICODE_MODEL=bogus python3 scripts/doctor.py\n```\n")
+    assert not _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=<X> ~/start.sh\n```\n")
+    assert not _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=<X> \\\\\nMAIN_GPU=0 \\\\\npython3 scripts/launch_servers.py --scope all\n```\n")
+    assert not _doc_offenders("docs/setup.md", "### systemd unit(永久部署)\n\nEnvironment=AICODE_MODEL=<CODE_MODEL>\n")
+
+
+@pytest.mark.smoke
+def test_the_opencode_gate_scans_config_files_and_the_wrapper():
+    """掃的檔案集合本身也是契約:`pyproject.toml` 與沒有副檔名的 `aicode` wrapper 都得在裡面。"""
+    scanned = {str(p.relative_to(REPO_ROOT)) for p in _opencode_gate_sources()}
+    assert "pyproject.toml" in scanned
+    assert "aicode" in scanned
+
+
+@pytest.mark.smoke
+def test_the_gates_also_catch_ignore_entries_and_bare_assignments():
+    """`.gitignore` 的 `.opencode/` 條目(dot 檔沒被掃)與文件裡單獨一行 `AICODE_ROOT=/tmp`(概念名當環境變數指派)都要抓;核心變數單獨一行在核心段落合法。"""
+    scanned = {str(p.relative_to(REPO_ROOT)) for p in _opencode_gate_sources()}
+    assert ".gitignore" in scanned
+    assert _opencode_offenders(".gitignore", ".opencode/\n")
+    assert _doc_offenders("docs/x.md", "```bash\nAICODE_ROOT=/tmp\n```\n")
+    assert _doc_offenders("docs/x.md", "AICODE_ROOT=/tmp\n")
+    assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\nAICODE_ROOT=/tmp\n")
+    assert not _doc_offenders(
+        "README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=<X>\npython3 scripts/launch_servers.py\n```\n"
+    )
+
+
+@pytest.mark.smoke
+def test_the_gates_are_structural_not_a_list_of_spellings(tmp_path: Path):
+    """OpenCode gate 掃**所有文字檔**(檔名不限、二進位跳過、venv / tests 不掃);docs gate 把 `$TOKEN` / `${TOKEN}` / `TOKEN+=` / `TOKEN :=` / `TOKEN ?=` 一律當環境變數用。"""
+    (tmp_path / "Dockerfile.dev").write_text("RUN npm install -g opencode-ai\n", encoding="utf-8")
+    (tmp_path / "ci.yaml").write_text("x: 1\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("A=1\n", encoding="utf-8")
+    (tmp_path / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\xff\xfe")
+    (tmp_path / ".venv" / "lib").mkdir(parents=True)
+    (tmp_path / ".venv" / "lib" / "site.py").write_text("import opencode\n", encoding="utf-8")
+    (tmp_path / "venv2").mkdir()
+    (tmp_path / "venv2" / "pyvenv.cfg").write_text("home = /usr\n", encoding="utf-8")
+    (tmp_path / "venv2" / "site.py").write_text("import opencode\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "t.py").write_text("opencode\n", encoding="utf-8")
+    scanned = {str(p.relative_to(tmp_path)) for p in _iter_text_files(tmp_path)}
+    assert {"Dockerfile.dev", "ci.yaml", ".env"} <= scanned
+    assert "logo.png" not in scanned
+    assert not any(rel.startswith((".venv", "venv2", "tests")) for rel in scanned), scanned
+    assert _opencode_offenders("Dockerfile.dev", "RUN npm install -g opencode-ai\n")
+
+
+    assert _doc_offenders("docs/x.md", "AICODE_ROOT+=/tmp aicode\n")
+    assert _doc_offenders("docs/x.md", "AICODE_ROOT := /tmp\n")
+    assert _doc_offenders("docs/x.md", "AICODE_ROOT ?= /tmp\n")
+    assert _doc_offenders("docs/x.md", "echo $AICODE_ROOT\n")
+    assert _doc_offenders("docs/x.md", "ls ${CODETRAIL_REPO}/x\n")
+    assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\nAICODE_MODEL+=x aicode\n")
+    assert not _doc_offenders("README.md", "### 4.1 Deployment profile\n\necho $AICODE_MODEL\n")
+    assert not _doc_offenders("docs/x.md", "cd <CODETRAIL_REPO> 看 `[CODETRAIL_ACTION_REQUIRED]`\n")
+
+
+@pytest.mark.smoke
+def test_the_docs_gate_catches_printenv_and_indirect_expansions_and_venv_is_pruned(tmp_path: Path):
+    """docs gate:`printenv X` / `${#X}` / `${!X}` 是讀環境變數;走訪對 venv 目錄真剪枝(不走進 `.venv/`)。"""
+    assert _doc_offenders("docs/x.md", "printenv AICODE_ROOT\n")
+    assert _doc_offenders("docs/x.md", "echo ${#AICODE_ROOT}\n")
+    assert _doc_offenders("docs/x.md", "echo ${!AICODE_ROOT}\n")
+    (tmp_path / ".venv" / "deep" / "deeper").mkdir(parents=True)
+    (tmp_path / ".venv" / "deep" / "deeper" / "x.py").write_text("opencode\n", encoding="utf-8")
+    (tmp_path / "ok.py").write_text("x = 1\n", encoding="utf-8")
+    visited: list[str] = []
+    assert [str(p.relative_to(tmp_path)) for p in _iter_text_files(tmp_path, _visited=visited)] == ["ok.py"]
+    assert not any(".venv" in d and d != ".venv" for d in visited), visited  # 沒走進 .venv 底下
+
+
+@pytest.mark.smoke
+def test_the_gates_skip_git_control_files_and_catch_printenv_options(tmp_path: Path):
+    """linked worktree 的 `.git` 是檔案(`gitdir: …`),走訪不得把它當文字檔掃;docs gate 的 `printenv -0 X` / `declare -p X` 帶選項也算。"""
+    (tmp_path / ".git").write_text("gitdir: /home/x/opencode/.git/worktrees/y\n", encoding="utf-8")
+    (tmp_path / "ok.py").write_text("x = 1\n", encoding="utf-8")
+    assert [str(p.relative_to(tmp_path)) for p in _iter_text_files(tmp_path)] == ["ok.py"]
+
+    assert _doc_offenders("docs/x.md", "printenv -0 AICODE_ROOT\n")
+    assert _doc_offenders("docs/x.md", "declare -p AICODE_ROOT\n")
+
+
+@pytest.mark.smoke
+def test_only_the_git_control_file_is_skipped_and_env_listings_are_caught(tmp_path: Path):
+    """跳過的檔案只有 `.git`(叫 `venv` / `node_modules` 的無副檔名 script 照掃、照抓 opencode);docs gate 的 `env | grep X` 也是讀。"""
+    (tmp_path / ".git").write_text("gitdir: /home/x/opencode/.git/worktrees/y\n", encoding="utf-8")
+    (tmp_path / "venv").write_text('#!/bin/sh\nexec opencode "$@"\n', encoding="utf-8")
+    (tmp_path / "node_modules").write_text("x\n", encoding="utf-8")
+    (tmp_path / "ok.py").write_text("x = 1\n", encoding="utf-8")
+    assert [str(p.relative_to(tmp_path)) for p in _iter_text_files(tmp_path)] == ["node_modules", "ok.py", "venv"]
+    assert _opencode_offenders("venv", 'exec opencode "$@"\n')
+
+    assert _doc_offenders("docs/x.md", "env | grep AICODE_ROOT\n")
+    assert _doc_offenders("docs/x.md", "set | grep -i AICODE_ROOT\n")
+
+
+@pytest.mark.smoke
+def test_the_docs_gate_catches_grep_pipelines_with_command_and_var_prefixes():
+    """docs gate:`env | command grep X`、`env | LC_ALL=C grep X`(pipe 後的 `command` / `VAR=` 前綴)也是讀環境變數。"""
+    assert _doc_offenders("docs/x.md", "env | command grep AICODE_ROOT\n")
+    assert _doc_offenders("docs/x.md", "env | LC_ALL=C grep AICODE_ROOT\n")
+
+
+@pytest.mark.smoke
+def test_the_docs_gate_catches_sudo_grep_and_redirected_listings():
+    """docs gate:`env | sudo grep X`、`env > f; grep X f`(先重導到檔)也是讀環境變數。"""
+    assert _doc_offenders("docs/x.md", "env | sudo grep AICODE_ROOT\n")
+    assert _doc_offenders("docs/x.md", "env > /tmp/e; grep AICODE_ROOT /tmp/e\n")
+
+
+@pytest.mark.smoke
+def test_the_docs_gate_catches_grep_anywhere_in_a_pipeline():
+    """docs gate:列出整份環境之後,管線裡任何地方出現 grep 類(`| sudo -n grep`、`| tee f | grep`)都算。"""
+    assert _doc_offenders("docs/x.md", "env | sudo -n grep AICODE_ROOT\n")
+    assert _doc_offenders("docs/x.md", "env | tee /tmp/e | grep AICODE_ROOT\n")
+
+
+@pytest.mark.smoke
+def test_the_spawn_gate_bans_the_spawn_api_outside_process_env():
+    """spawn 只有一個出口(`process_env.run/popen/check_output`,環境由它自己算),所以 gate
+    是一條**不用推導**的禁令:`subprocess` / `pty` / `pexpect` / `os.exec*|spawn*|system|popen|
+    fork*` / `asyncio.create_subprocess_*` 在 process_env 與啟動核心以外出現就是 offender ——
+    不管是 import、alias、cast、getattr、`__import__`、還是拿來當型別。"""
+    for snippet in (
+        "import subprocess\n",
+        "import subprocess as sp\n",
+        "from subprocess import run\n",
+        "from subprocess import *\n",
+        "from os import system\n",
+        "from os import *\n",
+        "from asyncio import create_subprocess_exec\n",
+        "import os\nos.system(cmd)\n",
+        "import os\nos.execvpe(c[0], c, e)\n",
+        "import os\nos.fork()\n",
+        "import os\nspawn = getattr(os, 'system')\n",
+        "getattr(subprocess, 'run')\n",
+        "import pty\n",
+        "import pexpect\n",
+        "asyncio.create_subprocess_exec(*argv)\n",
+        "m = __import__('subprocess')\n",
+        "import importlib\nm = importlib.import_module('subprocess')\n",
+        "x: subprocess.Popen | None = None\n",
+        "process_env.run(cmd, env=os.environ)\n",
+        "process_env.popen(cmd, env={})\n",
+        "from process_env import run\nrun(cmd, env={})\n",
+        "from process_env import Popen\nPopen(cmd, env={})\n",
+        "env = dict(os.environ)\n",
+        "env = os.environ | {'A': '1'}\n",
+    ):
+        assert _spawn_offenders("x.py", snippet), snippet
+    for snippet in (
+        "import process_env\nprocess_env.run(cmd, capture_output=True)\n",
+        "import process_env\nprocess_env.run(cmd, overrides={'LC_ALL': 'C'})\n",
+        "import process_env\nproc = process_env.popen(cmd, stdin=process_env.PIPE)\n",
+        "import process_env\ntry:\n    pass\nexcept process_env.TimeoutExpired:\n    pass\n",
+        "def home():\n    return os.environ['HOME']\n",
+        "environ = os.environ if env is None else env\n",
+        "# subprocess 在註解裡沒關係\n",
+        "def run(cmd, env=None):\n    return cmd\nrun(cmd, env={})\n",
+    ):
+        assert not _spawn_offenders("x.py", snippet), snippet
+    assert not _spawn_offenders("deployment_profile.py", "import subprocess\nsubprocess.run(cmd)\n")
+    assert not _spawn_offenders("process_env.py", "import subprocess as _subprocess\n")
+
+
+@pytest.mark.smoke
+def test_the_production_spawn_gate_really_scans_the_repo(monkeypatch, tmp_path: Path):
+    """總審 F12-1:純函式自測綠不代表正式 gate 有接上。把 `_repo_sources` 換成一個放了
+    `import subprocess` 的檔,正式 gate(`test_no_module_reads_codetrail_settings_from_the_environment`)
+    必須紅。"""
+    # 探針檔放 tmp(不碰真 repo):REPO_ROOT 與 _repo_sources 一起換掉,正式 gate 只看到它。
+    bad = tmp_path / "sneaky.py"
+    bad.write_text("import subprocess\nsubprocess.run(cmd)\n", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(sys.modules[__name__], "_repo_sources", lambda *a, **k: iter([bad]))
+    with pytest.raises(AssertionError) as excinfo:
+        test_no_module_reads_codetrail_settings_from_the_environment()
+    assert "sneaky.py" in str(excinfo.value)
+
+
+@pytest.mark.smoke
+def test_the_spawn_gate_resolves_os_and_asyncio_aliases():
+    """總審 F12-3:`import os as operating_system; operating_system.system(cmd)`、
+    `import asyncio as aio; aio.create_subprocess_exec(...)`、`getattr(operating_system, "system")`
+    都是 spawn。"""
+    assert _spawn_offenders("x.py", "import os as operating_system\noperating_system.system(cmd)\n")
+    assert _spawn_offenders("x.py", "import asyncio as aio\nasync def f():\n    await aio.create_subprocess_exec(*argv)\n")
+    assert _spawn_offenders("x.py", "import os as operating_system\nspawn = getattr(operating_system, 'system')\n")
+    assert _spawn_offenders("x.py", "import process_env\nprocess_env.Popen(cmd, env={})\n")
+    assert not _spawn_offenders("x.py", "import os as operating_system\noperating_system.path.join('a', 'b')\n")
+
+
+@pytest.mark.smoke
+def test_the_spawn_gate_closes_the_private_exits_and_keeps_every_alias():
+    """總審第 13 輪 NON-BLOCKER:`process_env` 的私有成員(`_subprocess` 這類)不是出口,
+    別的檔拿它就是繞過;alias 表同名多次 import 取聯集(`import os as x … import asyncio as x`
+    之後 `x.system` 仍是 spawn)。"""
+    assert _spawn_offenders("x.py", "from process_env import _subprocess\n_subprocess.run(cmd)\n")
+    assert _spawn_offenders("x.py", "import process_env\nprocess_env._subprocess.run(cmd)\n")
+    assert _spawn_offenders("x.py", "import os as x\nx.system(cmd)\nimport asyncio as x\n")
+    assert not _spawn_offenders("x.py", "import process_env\nprocess_env.run(cmd)\n")

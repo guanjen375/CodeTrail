@@ -307,13 +307,13 @@ def _cached_get_embedding(text: str) -> tuple:
     except Exception as exc:
         raise RuntimeError(
             f"embedding server unreachable at {LLAMA_EMBED_BASE_URL}: {exc}. "
-            "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+            "Check the embedding llama-server (deployment.json 的 services.embedding)."
         ) from exc
 
     if not emb:
         raise RuntimeError(
             f"embedding server returned an empty vector at {LLAMA_EMBED_BASE_URL}. "
-            "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+            "Check the embedding llama-server (deployment.json 的 services.embedding)."
         )
     return tuple(emb)
 
@@ -2124,7 +2124,7 @@ English:"""
             return self._rerank_with_llm(question, candidates, top_k)
         if policy == "error":
             raise RuntimeError(
-                "RAG reranker unavailable and AICODE_RERANK_FALLBACK_POLICY=error. "
+                "RAG reranker unavailable and client.json rerank_fallback_policy is \"error\". "
                 f"Reason: {reason}"
             )
         raise RuntimeError(f"Unknown RERANK_FALLBACK_POLICY: {policy!r}")

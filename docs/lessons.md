@@ -9,7 +9,7 @@
 | 內容 | 客觀知識(spec / datasheet / 手冊) | 主觀行為教訓(你糾正過的做事方式) |
 | 寫入 | `ingest_document` | `record_lesson` 提案 + 你核准(permission `ask`) |
 | 取用 | 檢索(embedding + reranker) | 全量注入(上限 20 條,不做 embedding 檢索) |
-| 位置 | `<AICODE_ROOT>/knowledge.json` | `~/.config/codetrail/lessons.json`(per-deployment,不跨部署共享) |
+| 位置 | `<SANDBOX_ROOT>/knowledge.json` | `~/.config/codetrail/lessons.json`(per-deployment,不跨部署共享) |
 
 [回到 README](../README.md)。
 
@@ -22,7 +22,7 @@
   → 模型呼叫 record_lesson 提案(rule 必須是單行祈使句行為規則)
   → permission ask:你在核准框看到 rule,核准才寫入 lessons.json
   → 下個 session:aicode 啟動時把 active lessons render 進
-    <AICODE_ROOT>/.codetrail/lessons.md,客戶端組 system prompt 時
+    <SANDBOX_ROOT>/.codetrail/lessons.md,客戶端組 system prompt 時
     連同專案 AGENTS.md 一起載入
   → 90 天後過 review_by:該條停止注入,aicode 啟動時醒目列出待複審清單
   → 你複審:renew(再延 90 天)或 delete
@@ -67,15 +67,15 @@
 
 session start(`aicode`)時:
 
-- lessons store 損壞 → **拒絕啟動**(fail-loud),修復或 `AICODE_LESSONS_SKIP=1 aicode` 緊急跳過(該 session 不注入);
+- lessons store 損壞 → **拒絕啟動**(fail-loud);修復或移除 `~/.config/codetrail/lessons.json`。沒有緊急跳過的旗標 —— 帶著壞 store 啟動會讓你以為 lessons 有生效;
 - active 超過 20(只可能手改 JSON 造成)→ 拒絕啟動,要求整併;
 - 有條目過 review_by → 照常啟動,但該條停止注入,並醒目列出待複審清單與 renew / delete 指令;
 - `.codetrail` 被 symlink/junction 指到專案外 → 拒絕啟動(沙箱寫入防線,render 一個 byte 都不寫;不信任的 repo 可能用這招把檔案導出沙箱)。
 
 跳過與安全模式(兩者都會**移除**先前 render 的 `.codetrail/lessons.md`,避免上個 session 的規則殘留又被載入):
 
-- `AICODE_LESSONS_SKIP=1`:本 session 不注入(緊急逃生口);
-- `CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1`(分析不信任 repo 的安全模式,見 [docs/security.md](security.md)):客戶端這個模式完全不讀專案內的 `AGENTS.md` 與 `.codetrail/lessons.md`,lessons **不會注入** —— `aicode` 會明講,不會謊報「已注入」。這個 env 是「非空即真」,`=0` 也算開啟。
+- 內部入口(`session_eval` 的 replay / eval)以呼叫端參數要求不注入:同一份 suite 在兩台機器上必須看到同一份指示;
+- `client.json` 的 `"project_instructions": false`(分析不信任 repo 的安全模式,見 [docs/security.md](security.md)):客戶端這個模式完全不讀專案內的 `AGENTS.md` 與 `.codetrail/lessons.md`,lessons **不會注入** —— `aicode` 會明講,不會謊報「已注入」。
 
 ## 管理指令
 
@@ -88,7 +88,7 @@ python3 lessons.py delete L-001     # 淘汰
 python3 lessons.py hit L-001        # 人工記一次命中(見下)
 ```
 
-進階:`--file` 或 `AICODE_LESSONS_FILE` 可指定 store 路徑(預設 `~/.config/codetrail/lessons.json`)。
+進階:`--file` 可指定 store 路徑(預設 `~/.config/codetrail/lessons.json`)。
 
 ## hit_count 的誠實說明
 
@@ -98,6 +98,6 @@ python3 lessons.py hit L-001        # 人工記一次命中(見下)
 
 1. `aicode` 啟動輸出應有一行 `[lessons] N 條 active lessons 已注入 .codetrail/lessons.md`。
 2. 開新 session 問模型:「目前 context 裡有哪些 CodeTrail lessons?」它應能列出編號與內容。
-3. 改用 `cat <AICODE_ROOT>/.codetrail/lessons.md` 直接看注入內容(此檔自動產生,勿手改;`.codetrail/` 已在 .gitignore)。
+3. 改用 `cat <SANDBOX_ROOT>/.codetrail/lessons.md` 直接看注入內容(此檔自動產生,勿手改;`.codetrail/` 已在 .gitignore)。
 
 注意:寫入當下的 session 其 context 已載入完成,新 lesson 於**下一個** session 才注入(tool 回覆會提醒模型本 session 先直接遵守)。

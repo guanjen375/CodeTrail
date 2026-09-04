@@ -10,7 +10,7 @@
 --------------------------------------------------------------------------
 安全模型（違反任何一條一律 `FigureReviewError`，fail-loud、零寫入）
 --------------------------------------------------------------------------
-1. `root` 解析後必須就是 `AICODE_ROOT`（環境變數有設時逐字交叉檢查）。
+1. `root` 解析後必須就是 sandbox root（`mcp_server --root` 定案的那一個；已定案時逐字交叉檢查）。
 2. 所有路徑元件只允許 `[A-Za-z0-9._-]`，且不得是 `.` / `..`；`document_id` 一律先過
    `figure_extract.document_slug()` 才會變成目錄名。
 3. **所有** I/O（開目錄、建目錄、讀、寫、rename、unlink、rmdir、flock）都走同一條
@@ -27,7 +27,7 @@
 --------------------------------------------------------------------------
 NDA：這些檔案是什麼、保存多久、怎麼清掉
 --------------------------------------------------------------------------
-`<AICODE_ROOT>/.codetrail/figures/<document_slug>/<run_id>/` 底下有：
+`<sandbox root>/.codetrail/figures/<document_slug>/<run_id>/` 底下有：
 
     manifest.json          canonical manifest（含 canonical payload 逐字內容）
     review.md              人看的摘要（含少量內容預覽）
@@ -55,7 +55,7 @@ crop 標成「實際模型輸入」，等於對「模型到底看過什麼」說
   （或 `prune_old_runs(..., keep=0, kb_path=None)` 只清未發布/失敗的）。它會刪掉整個
   `<document_slug>/` 目錄。KB 內的 chunk 不受影響；之後 `list_figures()` 會回
   `payload=None` 與 `payload_error`，人看得出「artifact 已清除」而不是靜默失真。
-- 整個專案的 review artifacts：直接刪 `<AICODE_ROOT>/.codetrail/figures/`。
+- 整個專案的 review artifacts：直接刪 `<sandbox root>/.codetrail/figures/`。
 
 --------------------------------------------------------------------------
 真相來源
@@ -273,7 +273,7 @@ def _safe_component(name, *, what: str) -> str:
 
 
 def _resolve_root(root) -> Path:
-    """root 必須是既有目錄；`AICODE_ROOT` 有設時必須逐字相符（契約 §6.5）。"""
+    """root 必須是既有目錄；sandbox root 已定案時必須逐字相符（契約 §6.5）。"""
     if isinstance(root, (str, Path)):
         text = str(root).strip()
     else:
@@ -287,7 +287,10 @@ def _resolve_root(root) -> Path:
     if not root_real.is_dir():
         raise _err(f"root 不是既有目錄: {root_real}")
 
-    env_root = os.environ.get("AICODE_ROOT", "").strip()
+    import media
+
+    sandbox = media.get_sandbox_root()
+    env_root = str(sandbox) if sandbox else ""
     if env_root:
         try:
             env_real = Path(env_root).resolve()
@@ -295,7 +298,7 @@ def _resolve_root(root) -> Path:
             env_real = None
         if env_real is not None and env_real != root_real:
             raise _err(
-                f"root {root_real} 不是目前的 AICODE_ROOT {env_real}。"
+                f"root {root_real} 不是目前的 sandbox root {env_real}。"
                 "review artifacts 只能寫在 sandbox root 內（契約 §6.5）。"
             )
     return root_real
@@ -761,7 +764,7 @@ def _parse_evidence_ref(evidence_ref) -> tuple[str, str]:
     if "\\" in evidence_ref or "\x00" in evidence_ref:
         raise _err(f"evidence_ref={evidence_ref!r} 含不允許的字元")
     if evidence_ref.startswith("/"):
-        raise _err(f"evidence_ref={evidence_ref!r} 是絕對路徑，只接受相對 AICODE_ROOT 的形狀")
+        raise _err(f"evidence_ref={evidence_ref!r} 是絕對路徑，只接受相對 sandbox root 的形狀")
     parts = evidence_ref.split("/")
     expected_len = len(_ROOT_PARTS) + 3
     if len(parts) != expected_len or tuple(parts[:len(_ROOT_PARTS)]) != _ROOT_PARTS:
@@ -1208,7 +1211,7 @@ def may_carry_over_human_verification(old_entry, new_candidate) -> bool:
                 ...
 
     `kb_chunks` 要在「刪掉同名文件的舊 chunks 之前」讀（`_commit_document_to_kb` 會
-    整批換掉）。`root` 必須是 `AICODE_ROOT`。
+    整批換掉）。`root` 必須是 sandbox root。
     """
     fx = _fx()
     if _attr(old_entry, "verification_status") != fx.VERIF_HUMAN:

@@ -392,7 +392,11 @@ class _Harness:
 def _harness(monkeypatch, tmp_path, pages, plan, results, *, variants=None) -> _Harness:
     monkeypatch.setattr(RAG, "check_pymupdf4llm",
                         lambda: types.SimpleNamespace(to_markdown=lambda *a, **k: pages))
-    monkeypatch.setenv("AICODE_ROOT", str(tmp_path))
+    import media
+
+    # root 交叉檢查讀的是 sandbox root(`mcp_server --root` 定案的那一個),
+    # 不是 `AICODE_ROOT` 環境變數 —— root 已經走 argv。
+    monkeypatch.setattr(media, "_SANDBOX_ROOT", tmp_path.resolve())
     return _Harness(monkeypatch, tmp_path).install(plan, results, variants=variants)
 
 
@@ -972,7 +976,11 @@ def test_preflight_reports_failure_instead_of_faking_success(tmp_path: Path, mon
     """PDF 解析失敗 / lane 不啟動時，`--preflight` 必須是 exit 1，不是沒有報告的 exit 0。"""
     kb_path = _kb_ready(monkeypatch, tmp_path)
     pdf = _write_pdf(tmp_path)
-    monkeypatch.setenv("AICODE_ROOT", str(tmp_path))
+    import media
+
+    # root 交叉檢查讀的是 sandbox root(`mcp_server --root` 定案的那一個),
+    # 不是 `AICODE_ROOT` 環境變數 —— root 已經走 argv。
+    monkeypatch.setattr(media, "_SANDBOX_ROOT", tmp_path.resolve())
 
     def _boom(*_a, **_k):
         raise RuntimeError("broken pdf (stub)")
@@ -1048,12 +1056,12 @@ def test_result_set_mismatch_hard_fails(tmp_path: Path, monkeypatch, mutation, n
 
 @pytest.mark.smoke
 def test_root_mismatch_fails_before_any_plan_or_vl(tmp_path: Path, monkeypatch):
-    """明示 root 與 AICODE_ROOT 不一致 → 在 plan / probe / VL 之前就停。"""
+    """明示 root 與 sandbox root 不一致 → 在 plan / probe / VL 之前就停。"""
     pdf, harness, _fid = _simple_native_case(tmp_path, monkeypatch)
     other = tmp_path.parent / "another_root"
     other.mkdir(exist_ok=True)
 
-    with pytest.raises(figure_extract.FigureReviewError, match="AICODE_ROOT"):
+    with pytest.raises(figure_extract.FigureReviewError, match="sandbox root"):
         RAG.extract_pdf_document(str(pdf), root=str(other))
 
     assert harness.plan_spy.calls == [], "root 不一致時不得先規劃候選"
@@ -2647,7 +2655,11 @@ def test_verifier_rag_and_writer_all_reject_the_same_malformed_variant(
     寬鬆，於是繞道永遠存在。verifier 那一端尤其要緊——它是**VL 呼叫之前**的檢查，
     等 RAG 或 writer 稍後才拒絕時，VL 的錢已經花掉了。
     """
-    monkeypatch.setenv("AICODE_ROOT", str(tmp_path))
+    import media
+
+    # root 交叉檢查讀的是 sandbox root(`mcp_server --root` 定案的那一個),
+    # 不是 `AICODE_ROOT` 環境變數 —— root 已經走 argv。
+    monkeypatch.setattr(media, "_SANDBOX_ROOT", tmp_path.resolve())
     pdf = _write_pdf(tmp_path)
     document_id = _document_id(pdf, tmp_path)
     fig_id = _figure_id(document_id, 1)

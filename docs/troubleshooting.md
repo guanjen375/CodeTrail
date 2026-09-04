@@ -8,7 +8,7 @@
 
 ## 快速分流
 
-這份文件按「安裝 / GPU → MCP / 模型行為 → KB → web → context → server →
+這份文件按「安裝 / GPU → MCP / 模型行為 → KB → context → server →
 patch / command」排列。內容很長時可先用頁面搜尋找下列關鍵字：
 
 | 畫面或症狀 | 先搜尋 |
@@ -17,7 +17,6 @@ patch / command」排列。內容很長時可先用頁面搜尋找下列關鍵�
 | MCP Connected 但沒有真工具呼叫 | `假工具 XML` |
 | MCP 連不上 / server 啟動就退出 | `initialize 前就退出` |
 | 圖片或 ingest 逾時 | `超時`、`image_url` |
-| web / attach 連不上 | `Tailscale`、`attach`、`port 被占用` |
 | context 啟動閘擋下 | `ctx-safety` |
 | server / RAG 異常 | `llama-server 不可連`、`embedding`、`查 spec 沒結果` |
 | 修改工具被拒 | `apply_patch`、`run_command` |
@@ -169,14 +168,22 @@ CodeTrail 已不再啟動 OpenCode。但舊版曾經把幾個值寫進你的
 - plugin 項指向本 repo 的檔案路徑。那兩個檔一旦被刪,你在**其他專案**開 OpenCode
   都會因為載不到 plugin 而起不來,而錯誤訊息不會提到 CodeTrail。
 
+解除是**手動**的一次性動作。`./set_config.sh` 已經不再順帶遷移——寫別人的設定不該
+搭在「設定我自己」這件事上,而且判不出狀態時它會擋住你設定自己的東西:
+
 ```bash
-python3 <CODETRAIL_REPO>/opencode_migrate.py --check   # 先看會做什麼(不寫檔)
-./set_config.sh                                        # 寫完自己的設定後接著遷移(失敗 exit 2)
+cd <CODETRAIL_REPO>
+python3 opencode_migrate.py --check   # 先看會做什麼(零寫入)
+python3 opencode_migrate.py           # 實際執行(有備份)
 ```
 
-遷移只還原**現值仍等於 CodeTrail 寫入值**的鍵(你自己改過的一律不動)、只移除
+只還原**現值仍等於 CodeTrail 寫入值**的鍵(你自己改過的一律不動)、只移除
 path 對得上的 plugin 項;`mcp.codetrail` 與 `permission` **不動**——`mcp_server.py`
-仍然可以被任何 MCP client 用。有備份。
+仍然可以被任何 MCP client 用。
+
+同一台機器上有**兩份** CodeTrail 時,ownership 狀態檔只有一份。它記的 plugin 路徑
+若是另一份安裝的、而那份還在,這裡會直接說明並零寫入——要解除那一份,到寫它的那個
+checkout 執行同一個指令。
 
 過渡期那兩個 plugin 檔留成 inert stub:只在 session 建立時 toast 一次「請執行遷移」,
 不掛任何其他 hook、不改任何工具結果。遷移完成後註冊項會被移除,它們就再也不會被載入。
@@ -217,7 +224,7 @@ path 對得上的 plugin 項;`mcp.codetrail` 與 `permission` **不動**——`m
 
 explicit 與 implicit 是兩條獨立 cache lane，不會互借另一列結果。fingerprint
 包含 selected/runtime identity、客戶端檔案(`client_engine` / `client_prompt` /
-`codetrail_chat`,含 `AICODE_CLIENT_ENTRY` 覆寫後的那一份)與 system prompt 的 digest、
+`codetrail_chat`)與 system prompt 的 digest、
 live tools/instructions、專案 AGENTS、lessons 與 server `/props`（含 chat template、
 capabilities、build/取樣資訊）。cache 只存 hash、lane status、檢查時間與版本，不存 prompt、
 模型輸出、tool args/result、檔名、目錄內容、session id 或專案路徑；抽查用的對話
@@ -228,22 +235,17 @@ capabilities、build/取樣資訊）。cache 只存 hash、lane status、檢查�
 可直接退出後強制重測兩條 model lane：
 
 ```bash
-AICODE_TOOL_CANARY_FORCE=1 aicode
+rm -f ~/.cache/codetrail/tool-call-canary.v3.json   # 或
+python3 <CODETRAIL_REPO>/scripts/tool_call_canary.py --root "$PWD" --force
 ```
 
-`AICODE_TOOL_CANARY_WARN_ONLY` 已**不能**略過 MCP／explicit hard gate；只有 implicit
-本來就不擋。`SKIP` 會連 MCP 與兩條模型檢查都不執行，只能做緊急救援，不能當驗收：
+**沒有略過用的環境變數。** 以前有三個(`SKIP` / `FORCE` / `WARN_ONLY`)與一個位置
+覆寫(`CACHE`),全部刪除、無替代:要跳過某個檢查 = 修那個檢查;要強制重測 = 刪那個
+快取檔或 `--force`。時限與快取期是 `config.py` 的常數(`TOOL_CANARY_*`,預設 TTL
+86400 秒),改它是改 repo,所有使用者一致。FAIL 訊息會刻意區分 MCP/catalog、
+explicit model/chat-template 與 non-blocking implicit routing，避免再把它們混為一談。
 
-```bash
-AICODE_TOOL_CANARY_SKIP=1 aicode
-```
-
-預設 cache TTL 是 86400 秒；需要更頻繁抽查可設
-`AICODE_TOOL_CANARY_TTL_SECONDS=<SECONDS>`（`0` 等同每次 live）。FAIL 訊息會刻意區分
-MCP/catalog、explicit model/chat-template 與 non-blocking implicit routing，
-避免再把它們混為一談。
-
-`AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py` 會重建 current fingerprint，只回報該列
+`python3 scripts/doctor.py --project "$PWD"` 會重建 current fingerprint，只回報該列
 的 implicit `optimal/suboptimal/fail/timeout` 與 fresh/stale；資料不足顯示 `unknown`，不會拿
 另一個模型／設定／專案的 cache row 冒充現況。
 
@@ -278,7 +280,7 @@ ingest 的待辦通知現在由客戶端自己處理(`client_notify.py`),不再�
 | 畫面說「摘要沒有照七欄格式輸出」 | 模型照了別套欄位(實測看過整份換成英文五欄)。「已確定事實 vs 未確認」的分離沒了 | 摘要沒有落地,對話可以繼續;要繼續用結構化壓縮就開新對話,同一個模型一直不遵守就改 `off` |
 | 壓縮完緊接著又壓一次 | `tail_turns = 1` 讓最新一輪逐字留著;那一輪很長時,壓完的 context 是「摘要 + 長 tail」 | 正常,不是迴圈(同一則助理訊息不會被當第二次的錨點)。把超長單輪拆小或把 `n_ctx` 調大 |
 | 畫面說「這個 n_ctx 推不出可用的壓縮門檻」 | ctx 太小,公式算出來的 threshold / tail_cap 低於下限 | 把 `n_ctx` 調大重跑 `./set_config.sh`,或把模式切成 `off` |
-| `/compact` 沒有作用 | headless `run` 沒有互動指令 | 用終端客戶端(直接 `aicode`)或 web 介面 |
+| `/compact` 沒有作用 | headless `run` 沒有互動指令 | 在 `aicode` 裡面下,不要用 `codetrail_chat.py run` |
 
 
 `codetrail_chat.py run`(headless)只輸出事件流,上面的提示不會出現。停用會留一筆
@@ -300,11 +302,11 @@ ingest 的待辦通知現在由客戶端自己處理(`client_notify.py`),不再�
 
 每個 MCP server 行程啟動時會在 `~/.local/state/codetrail/mcp/<boot_id>.json`
 (遵守 `XDG_STATE_HOME`)開一份自己的 **lease**。一份行程一個檔,不是共用一個心跳檔
-——canary、TUI、web、headless `run` 各起一個 MCP 子行程,共用一個檔只會互相覆寫。
+——canary、`aicode`、headless `run` 各起一個 MCP 子行程,共用一個檔只會互相覆寫。
 lease 裡只有 pid / ppid / 開始與更新時間 / `tools/list` 次數 / 最後一個工具名與狀態,
 **沒有**工具參數、結果、檔名或路徑,權限 0600。
 
-`AICODE_MODEL=<CODE_MODEL> python3 scripts/doctor.py` 的 `-- MCP lease / incidents --`
+`python3 scripts/doctor.py` 的 `-- MCP lease / incidents --`
 那一段會把它們攤開,四種狀態的意思是:
 
 - `live` —— pid 還在,而且該行程的啟動時刻(`/proc/<pid>/stat` 第 22 欄)與 lease
@@ -330,7 +332,7 @@ session id、沒有訊息內容、沒有路徑。doctor 印的「共 N 筆」與
 
 真的碰上時的處置順序:lease 是 `stale` → 重開 session(server 已經不在,重試沒有用);
 lease 是 `live` 而 incident 是 `promise_without_call` → 退出後
-`AICODE_TOOL_CANARY_FORCE=1 aicode` 強制重測兩條 model lane。
+刪掉 `~/.cache/codetrail/tool-call-canary.v3.json`(或跑 `python3 <CODETRAIL_REPO>/scripts/tool_call_canary.py --root "$PWD" --force`)強制重測兩條 model lane。
 
 ### 什麼情況才算「這個模型可以發布」
 
@@ -380,7 +382,7 @@ evidence text 字元，不是 tokenizer token。
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
-python3 <CODETRAIL_REPO>/codetrail_chat.py --policy readonly run --format json \
+python3 <CODETRAIL_REPO>/codetrail_chat.py run --policy readonly --format json \
   '請立即呼叫 list_dir，path="."、depth=1。必須實際呼叫工具。'
 ```
 
@@ -440,9 +442,11 @@ wc -c <PROJECT>/AGENTS.md <PROJECT>/.codetrail/lessons.md \
       ~/.config/codetrail/instructions.md 2>/dev/null
 ```
 
-要一次全部排除,用 `CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1 aicode`(不讀專案那兩份)。
+要一次全部排除,在 `~/.config/codetrail/client.json` 設 `"project_instructions": false`
+(客戶端完全不讀專案那兩份)。
 
-改完重開一個新 session,再執行 `AICODE_TOOL_CANARY_FORCE=1 aicode` 略過舊 cache。驗收時直接
+改完重開一個新 session;要強制重跑 canary 就刪掉
+`~/.cache/codetrail/tool-call-canary.v3.json`(沒有略過用的環境變數)。驗收時直接
 要求一次真實 `list_dir`;必須出現 `· list_dir → completed`,只有文字承諾不算。精簡、降溫與
 新 session 都完成後仍反覆失敗,才判定這顆模型 / template 組合的工具呼叫能力不穩,改用已量測
 支援 tool calling 的組合。不要把 `tool_choice=required` 當萬用補丁;完整 prompt A/B 中它輸出
@@ -490,7 +494,7 @@ wc -c <PROJECT>/AGENTS.md <PROJECT>/.codetrail/lessons.md \
 
 **換不換模型?** 不用。換更大 / 更高精度的模型幻覺會少一點但不會消失 —— 它一樣會編沒給它的東西。真正要調的是「來源 + 取樣 + 規則」,不是模型。
 
-> CodeTrail 自己的內部呼叫(agent loop / 全文分析 / strict 自我複查)除了 temp 0.0/0.2,也已經把 `top_p / top_k / min_p` 釘在 Qwen 建議值(`config.py` 的 `CHAT_TOP_P` / `CHAT_TOP_K` / `CHAT_MIN_P`,可用 `AICODE_CHAT_TOP_P` / `AICODE_CHAT_TOP_K` / `AICODE_CHAT_MIN_P` env 覆寫),所以即使 server 忘了帶旗標,**CodeTrail 路徑仍然是穩的**。會吃到 server 預設、需要靠上面 ② 修的,是不經客戶端的直接呼叫(例如你自己的 `curl`)。
+> CodeTrail 自己的內部呼叫(agent loop / 全文分析 / strict 自我複查)除了 temp 0.0/0.2,也已經把 `top_p / top_k / min_p` 釘在 Qwen 建議值(`config.py` 的 `CHAT_TOP_P` / `CHAT_TOP_K` / `CHAT_MIN_P`,repo 常數),所以即使 server 忘了帶旗標,**CodeTrail 路徑仍然是穩的**。會吃到 server 預設、需要靠上面 ② 修的,是不經客戶端的直接呼叫(例如你自己的 `curl`)。
 
 ### `pip install huggingface_hub` 報 `error: externally-managed-environment`
 
@@ -510,12 +514,12 @@ python3 -m pip install --user --break-system-packages -U huggingface_hub
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
-AICODE_ROOT="$PWD" AICODE_MODEL=<CODE_MODEL> \
-  python3 <CODETRAIL_REPO>/mcp_server.py
+python3 <CODETRAIL_REPO>/mcp_server.py --root "$PWD"
 ```
 
-(`<CODE_MODEL>` 用 `aicode` 啟動時印出的 bare model name;如果 CodeTrail 依賴裝在 venv,
-先 activate 再跑——客戶端是用**啟動它的那顆 Python** 去 spawn server 的。)
+(root 走 **argv**,不走環境變數 —— 客戶端也是這樣叫它的。主模型由 server 自己從
+`deployment.json` 解析。如果 CodeTrail 依賴裝在 venv,先 activate 再跑——客戶端是用
+**啟動它的那顆 Python** 去 spawn server 的。)
 
 若看到 `[MCP] server ready, listening on stdio.`,server 本身正常,按 Ctrl-C 結束。
 若它退出,最後一段 stderr 才是根因。常見分流:
@@ -524,7 +528,7 @@ AICODE_ROOT="$PWD" AICODE_MODEL=<CODE_MODEL> \
   先跑 `python3 <CODETRAIL_REPO>/scripts/required_model_servers_check.py`。
 - `ModuleNotFoundError` → 你用來啟動 `aicode` 的那顆 Python 缺依賴;用**同一顆
   Python** 安裝 `requirements.txt`,或重跑 `set_config.sh`。
-- `[FATAL] AICODE_ROOT ...` → 必須從具體 project 目錄走 `aicode`,不可把 `/` 或 `$HOME`
+- `[FATAL] sandbox root ...` → 必須從具體 project 目錄走 `aicode`,不可把 `/` 或 `$HOME`
   當 sandbox root。
 - `KnowledgeStoreError` → 既有 `knowledge.json` 與程式自管的 embeddings cache 不相容
   或不完整;依下一段處理。
@@ -600,90 +604,63 @@ python3 <CODETRAIL_REPO>/RAG.py <SOURCE_IMAGE> knowledge.json --image -y
 `knowledge.json`、`.codetrail/`（含 embeddings cache 與 figure artifacts）、embedding
 cache 與備份都可能含 NDA 衍生資料,不可 commit。
 
-### `aicode_web`: Tailscale 尚未連線 / IP 無效
+### 升級之後舊的 web backend 還在跑
 
-`aicode_web` 不猜 LAN 位址，也不 fallback 到 `0.0.0.0`。A 機必須先登入 Tailscale，且 `tailscale ip -4` 要回報一個 `100.64.0.0/10` 位址:
-
-```bash
-tailscale status
-tailscale ip -4
-```
-
-看到 `NeedsLogin` / `Stopped` 時先完成 Tailscale 登入。A、B 機都 online 後，回到**要分析的專案目錄**重跑 `aicode_web`。若使用自訂 tailnet ACL，還要允許 B 機連 A 機的 web port(預設 4096)。launcher 不會操作 Tailscale Serve / Funnel，也不需要 A 機有 GUI。
-
-### `aicode attach`: 連不上 backend
-
-`aicode attach` 是純 client,連不上通常代表 backend 沒在跑、或 url / port 不對。逐項確認:
+CodeTrail 已經沒有網頁前端(`aicode web` / `aicode attach` / `aicode_web` 都不存在了)。
+但刪掉檔案不會停掉**升級前**啟動、還掛在 tmux 裡的那個 backend —— 它會繼續占著 port
+4096、繼續持有一個 MCP 子行程與模型 slot。`aicode` 與 `python3 scripts/doctor.py`
+偵測到就會印出要下的指令(只是提示,不擋啟動):
 
 ```bash
-# 1) loopback backend 有在跑嗎?(aicode_web 模式請改用它印出的 100.x URL)
-curl -sS http://127.0.0.1:4096/ -o /dev/null -w '%{http_code}\n'   # 有回 HTTP 碼(200/401 等)代表 backend 活著
-
-# 2) port 對嗎?attach 預設接 4096;web 端若用 AICODE_WEB_PORT 換過 port,attach 也要對齊
-aicode attach http://127.0.0.1:<PORT>
+tmux ls | grep codetrail-web      # 還在的話會列出來
+tmux kill-session -t codetrail-web
+rm -f "$HOME/.local/bin/aicode_web"   # 舊的 symlink(已移除的背景 launcher)也一併清掉
 ```
 
-如果 web backend 啟動時設了 `AICODE_WEB_PASSWORD`,attach 端要用**同一個環境變數**
-(它不是 CLI 參數:打在命令列會留在 shell history 與 `ps` 輸出裡):
+之後就只剩一個入口:`cd <PROJECT_TO_ANALYZE> && aicode`。要遠端操作就 SSH 進這台機器;
+斷線不中斷把它跑在 `tmux new -s codetrail` 裡,回來 `tmux attach -t codetrail`。
+
+### 從 OpenCode 世代升級:解除舊的設定接管
+
+舊版 CodeTrail 會啟動 OpenCode,並把幾個值寫進 `~/.config/opencode/opencode.json`
+(`compaction.*` 的四個受管鍵 + 兩個 plugin 項)。現在的 runtime 完全不讀寫那份設定,
+所以那些值沒有人負責:
+
+- `compaction.auto = false` 一直生效 —— 你的 OpenCode 從此不再自動壓縮。
+- plugin 項指向這個 repo 的檔案路徑。那兩個檔被刪掉之後,你在**其他專案**開 OpenCode
+  都會因為載不到 plugin 而起不來,而錯誤訊息不會提到 CodeTrail。
+
+解除是一次性的手動動作(不再搭在 `./set_config.sh` 上——寫別人的設定不該跟著
+「設定我自己」一起發生):
 
 ```bash
-AICODE_WEB_PASSWORD=<密碼> aicode attach http://127.0.0.1:4096
+cd <CODETRAIL_REPO>
+python3 opencode_migrate.py --check   # 零寫入,只列出會做什麼
+python3 opencode_migrate.py           # 實際執行(有備份)
 ```
 
-接上之後,`/sessions` 列出這個專案已保存的對話、`/resume <id>` 接續其中一筆、
-`-c` 直接接續最近一次(`aicode attach -c`)。
+只還原**現值仍等於 CodeTrail 寫入值**的鍵:你事後手改過的值原封不動。
+`mcp.codetrail` 與 `permission` 一個字都不動。沒有狀態檔、也沒有我們的 plugin 項的
+機器:一個 byte 都不會被碰。
 
-curl 回 401 代表 backend 活著但需要密碼;完全沒回應才是 backend 沒起來、或 port / host 寫錯。
-
-### `aicode web` / `aicode_web`: port 被占用
-
-`aicode web` 刻意固定 port(預設 4096),被占用時不會自動換 port,直接報錯。先看誰占用:
-
-```bash
-ss -ltnp 'sport = :4096' 2>/dev/null || lsof -i :4096
-```
-
-兩種處理:
-
-```bash
-# A) 占用的是上一個沒關掉的 aicode web —— 直接 attach 上去就好,不必另開
-aicode attach http://127.0.0.1:4096
-
-# B) 真的要換 port(web 與 attach 都要對齊同一個)
-AICODE_WEB_PORT=4097 aicode web
-AICODE_WEB_PORT=4097 aicode attach      # 或 aicode attach http://127.0.0.1:4097
-
-# Tailscale 背景模式(會印出新 port 的 B 機 URL)
-AICODE_WEB_PORT=4097 aicode_web
-```
-
-### web UI 切了資料夾,CodeTrail 還是讀啟動時那個目錄
-
-CodeTrail 的沙箱根(`AICODE_ROOT`)是**啟動 `aicode_web` / `aicode web` 當下那個目錄**,
-backend 起來時就釘死,web 介面沒有切換它的方法。**CodeTrail web 是一個 backend 一個專案**:
-要分析另一個專案,在那個專案目錄**另起一個 backend**(換 port):
-
-```bash
-cd ~/other-project
-aicode_web stop
-aicode_web
-```
+同一台機器上有**兩份** CodeTrail(舊 checkout 與現在這一份)時,ownership 狀態檔只有
+一份。如果它記的 plugin 路徑是另一份安裝的、而那份還在,這裡會直接說明並零寫入 ——
+要解除那一份,到寫它的那個 checkout 執行同一個指令。
 
 ### 分析不信任的 repo:擋專案自帶的指示
 
 被分析的 repo 影響得到的是**送進模型的指示**:根目錄的 `AGENTS.md` 與
 `.codetrail/lessons.md` 每一輪都會進 system prompt(權限不受它們影響——那由
-`client_policy` 與 `client.json` 決定)。分析**不信任 repo** 時前面加一個 env,
-讓客戶端完全不讀專案內那兩份:
+`client_policy` 與 `client.json` 決定)。分析**不信任 repo** 時,在
+`~/.config/codetrail/client.json` 設一個鍵,讓客戶端完全不讀專案內那兩份:
 
-```bash
-CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1 aicode
-# web 也一樣:CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS=1 aicode_web
+```json
+{ "project_instructions": false }
 ```
 
 細節與實測見 [docs/security.md](security.md)。
 
-### 啟動時拒絕 `AICODE_ROOT`
+### 啟動時拒絕這個 sandbox root
 
 你可能在 `$HOME` 或 `/` 執行了 `aicode`。切到具體專案:
 
@@ -696,7 +673,7 @@ aicode
 
 主模型現在只有一個 `n_ctx`：正常在 `./set_config.sh` 輸入一次，產生 deployment 的 `services.main.ctx` 與 server `-c`。`aicode` 啟動時會讀 server `/props` 的實值,直接傳給客戶端與 MCP server;沒有第二份設定要對齊。
 
-`[ctx-safety]` 仍是必要的容量閘：如果本次 `AICODE_N_CTX`／profile 值大於 server 真正啟動的 `-c`，prompt 可能被截斷，因此會標 `UNSAFE` 並拒絕啟動。較小值不會截斷，仍可放行。
+`[ctx-safety]` 仍是必要的容量閘：如果 deployment profile 的 `services.main.ctx` 大於 server 真正啟動的 `-c`，prompt 可能被截斷，因此會標 `UNSAFE` 並拒絕啟動。較小值不會截斷，仍可放行。
 
 `UNSAFE` 輸出長這樣:
 
@@ -706,14 +683,13 @@ aicode
         ...
         建議任一處理:
           (a) 重跑 ./set_config.sh 設定主模型 n_ctx，然後重啟 server
-          (b) 或把本次 AICODE_N_CTX 設成 <= 8192
-          (c) 或重啟 llama-server 用 `-c 65536` (確認 VRAM 夠)
+          (b) 或重啟 llama-server 用 `-c 65536` (確認 VRAM 夠)
 ```
 
 一般修法就是重跑設定並重啟，讓同一個主 n_ctx 重新展開到所有 consumer：
 
 ```bash
-unset AICODE_DYNAMIC_NUM_CTX_MAX AICODE_NUM_CTX  # 清掉舊版 shell 設定(若有)
+unset AICODE_DYNAMIC_NUM_CTX_MAX AICODE_NUM_CTX  # 兩個都已刪除;清掉舊版 shell 殘留(若有)
 cd <CODETRAIL_REPO>
 ./set_config.sh                                  # 主 n_ctx 只填這一次
 ~/start.sh stop
@@ -722,25 +698,13 @@ cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-如果你確認要硬跑(例如想實測 truncation 的影響),用一次性放行:
+這道閘**沒有逃生口**:以前有兩個環境變數可以繞過它,都已刪除且無替代。
+理由是關掉它之後的症狀不是一個錯誤訊息 —— 是 llama-server 從 prompt 前面靜默截掉,
+使用者看到的只有「模型忘記前面說過什麼」。要放行就把兩個數字對齊:重跑
+`./set_config.sh` 設一次 n_ctx 再重啟 server,或用 `-c <requested>` 重啟 llama-server
+(先確認 VRAM 夠)。
 
-```bash
-AICODE_ACCEPT_CTX_RISK=1 aicode
-```
-
-如果不想再看到這個檢查(例如自動化、CI、知道自己在做什麼):
-
-```bash
-export AICODE_CTX_SAFETY_DISABLE=1
-```
-
-server 沒啟動 / 不可連時會印 `[ctx-safety] UNKNOWN` 並放行,不會擋啟動。手動驗證可以單跑:
-
-```bash
-AICODE_MODEL=<CODE_MODEL> python3 scripts/ctx_safety_check.py
-```
-
-`<CODE_MODEL>` 是佔位符,必須替換成實際模型名稱或 GGUF 路徑。
+server 沒啟動 / 不可連時會印 `ctx safety=UNKNOWN` 並放行,不會擋啟動。
 
 ### 圖片工具超時，接著連小工具也跟著超時
 
@@ -783,7 +747,7 @@ top-level `image_data` 可能被新版 llama.cpp 靜默忽略，造成模型只�
 三種處理方式:
 
 1. 把 PDF 拆成較小的檔案分批入庫(通常最省事,也讓失敗範圍變小)。
-2. 調高對應上限,例如 `AICODE_FIGURE_MAX_VL_CALLS_PER_DOC=300 aicode`。
+2. 調高 `config.py` 的對應上限(例如 `FIGURE_MAX_VL_CALLS_PER_DOC`)—— 它是 repo 常數,改它是改 repo。
    這些是**成本上限**,調高的代價是更慢、更吃資源。它們也會改變實際送進模型的東西
    (image token 上限影響解析度、tile 上限影響怎麼切、candidate 上限影響哪些框被抽),
    甚至可能超出你的 server / model 能吃的範圍 —— **不要假設調高之後結果一定一樣或更好**。
@@ -802,9 +766,9 @@ python3 RAG.py docs/datasheet.pdf knowledge.json
 仍然整份零寫入的是「剩下的圖也不能信」那幾種:VL 連不上 / 逾時、預算超限、
 capability probe 未過、來源檔中途被換掉。
 
-正常情況下你不需要做任何事:第一次抽取用 `AICODE_VL_INGEST_MAX_TOKENS`(預設 2048),
+正常情況下你不需要做任何事:第一次抽取用 `config.VL_INGEST_MAX_TOKENS`(預設 2048),
 撞頂之後那一次重試會**自動**把預算加大到 VL server 的 context 還放得下的程度
-(`n_ctx - 實際 prompt tokens - 128`),上限是 `AICODE_FIGURE_VL_MAX_TOKENS_CEILING`
+(`n_ctx - 實際 prompt tokens - 128`),上限是 `config.FIGURE_VL_MAX_TOKENS_CEILING`
 (預設 8192)。實測 `example1.pdf` p3 的 block diagram:2048 撞頂 → 自動升到 6385 →
 只用 2161 就寫完,17 個 component、33 條 relation 全部入庫。
 
@@ -816,10 +780,10 @@ server n_ctx 多少)。依序試:
 
 1. 把 **VL server 的 `-c`** 開大 —— 8192 的 context 扣掉一張 1400x900 的圖之後,
    輸出只剩約 6.4k token。這是最常見的真兇。
-2. 提高 `AICODE_FIGURE_VL_MAX_TOKENS_CEILING`(只有在 `-c` 已經很大時才會是瓶頸)。
-3. 提高 `AICODE_VL_INGEST_MAX_TOKENS`,讓**第一次**就給夠 —— 省掉那次注定撞頂的
+2. 提高 `config.FIGURE_VL_MAX_TOKENS_CEILING`(repo 常數)(只有在 `-c` 已經很大時才會是瓶頸)。
+3. 提高 `config.VL_INGEST_MAX_TOKENS`,讓**第一次**就給夠 —— 省掉那次注定撞頂的
    呼叫(一張大圖大約 60 秒)。
-4. 調小 `AICODE_FIGURE_MAX_IMAGE_TOKENS_PER_CALL` 讓圖切成多個 tile,每個 tile 的
+4. 調小 `config.FIGURE_MAX_IMAGE_TOKENS_PER_CALL` 讓圖切成多個 tile,每個 tile 的
    輸出自然變短(代價:更多次呼叫,而且跨 tile 要接合)。
 
 > 已經頂到 context 上限時**不會**再送一次相同的請求 —— 那只是多花一分鐘拿到同一個
@@ -964,21 +928,15 @@ Qwen3-Reranker 若在 8192 buffer OOM，可重跑
 CodeTrail 不內建主聊天 / 程式推導模型,沒設好 `aicode` 會 fail-loud。任選一種設定方式:
 
 ```bash
-# 0) 最省事:重跑一鍵設定,registry / deployment / client 設定一次寫齊
+# 唯一的做法:重跑一鍵設定,registry / deployment / client 設定一次寫齊
 cd <CODETRAIL_REPO> && ./set_config.sh
-
-# 1) 環境變數 (最優先)
-export AICODE_MODEL=<CODE_MODEL>
-
-# 2) per-run CLI 旗標
-aicode -m <CODE_MODEL>
-
-# 3) ~/.config/codetrail/deployment.json 設 profile + services.main.model
 ```
 
-`<CODE_MODEL>` 是 MODEL_REGISTRY 裡的 bare name 或 GGUF 絕對路徑。如果你看到「placeholder」相關錯誤,通常是值還停留在 `<CODE_MODEL>` 或 `<MODEL>` 沒換掉;看到「外部 provider prefix」錯誤代表你還在用 `ollama/foo` 那種舊寫法,改成 bare name。
+主模型**只有一個來源**:`~/.config/codetrail/deployment.json` 的 `services.main.model`。
+沒有環境變數、沒有 `-m` 旗標 —— llama-server 一啟動就鎖死一顆模型,再開一條
+「每次啟動可以改」的路只會讓兩邊不一致。換模型 = 重跑 `set_config.sh` 再重啟 server。
 
-`AICODE_MODEL` 與 `-m/--model` 同時存在時,兩者必須指向同一顆模型;名稱不同但 registry 解析到同一個 canonical GGUF 路徑時視為一致,其餘情況 fail-loud。殘留的 `~/.config/opencode/opencode.json` **不再參與解析** —— 它壞掉也不會擋住啟動,裡面的模型也不會被靜默沿用。
+`<CODE_MODEL>` 是 MODEL_REGISTRY 裡的 bare name 或 GGUF 絕對路徑。如果你看到「placeholder」相關錯誤,通常是值還停留在 `<CODE_MODEL>` 或 `<MODEL>` 沒換掉;看到「外部 provider prefix」錯誤代表你還在用 `ollama/foo` 那種舊寫法,改成 bare name。
 
 ### MODEL 解析到 GGUF 路徑但檔案不存在
 

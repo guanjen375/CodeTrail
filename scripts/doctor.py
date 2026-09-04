@@ -2,13 +2,17 @@
 """CodeTrail 安裝 / 啟動前自檢工具(preflight)。
 
 一次跑完就知道：Python 版本對不對、必要套件裝了沒、llama-server 通不通、
-模型 GGUF 路徑對不對、AICODE_ROOT 安不安全、客戶端 / MCP 入口都在不在、KB 有沒有資料。
+模型 GGUF 路徑對不對、sandbox root 安不安全、客戶端 / MCP 入口都在不在、KB 有沒有資料。
+
+設定只有三個來源,全部是檔案:repo 常數 `config.py`、
+`~/.config/codetrail/{deployment,models}.json`、`~/.config/codetrail/client.json`。
+所以這支不需要任何 `AICODE_*=` 前綴 —— 它讀的就是那三個。
 
 使用：
-    AICODE_MODEL=<MODEL> python3 scripts/doctor.py                       # 全檢
-    AICODE_MODEL=<MODEL> python3 scripts/doctor.py --profile /abs/path/profile.json
-    AICODE_MODEL=<MODEL> python3 scripts/doctor.py --project /path/proj  # 把 /path/proj 當 AICODE_ROOT 檢查
-    AICODE_MODEL=<MODEL> python3 scripts/doctor.py --no-network          # 跳過 llama-server 線上檢查（CI 用）
+    python3 scripts/doctor.py                       # 全檢
+    python3 scripts/doctor.py --profile /abs/path/profile.json
+    python3 scripts/doctor.py --project /path/proj  # 把 /path/proj 當 sandbox root 檢查
+    python3 scripts/doctor.py --no-network          # 跳過 llama-server 線上檢查（CI 用）
 
 退出碼:
     0 = 全 PASS / 只有 WARN
@@ -22,7 +26,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import time
 from datetime import datetime
@@ -37,6 +40,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import endpoint_policy  # noqa: E402
+import process_env  # noqa: E402
 from deployment_profile import (  # noqa: E402
     ProfileError,
     load_effective_profile,
@@ -100,6 +104,10 @@ def check_python(r: Result) -> None:
 _REQUIRED_PACKAGES = [
     ("mcp", "MCP server 必要 — python3 -m pip install \"mcp>=1.28,<2\""),
     ("requests", "必要 — HTTP 請求"),
+    # `aicode` 的介面就是它。缺了 wrapper 起不來,所以是 FAIL 不是 WARN。
+    # 不要裝 textual[syntax]:那個 extra 拉的 tree-sitter 文法與本 repo 釘死的
+    # tree-sitter 0.26 衝突。
+    ("textual", "aicode 的終端介面必要 — python3 -m pip install \"textual>=8,<9\"(不要加 [syntax] extra)"),
 ]
 # (import 名, 顯示名, 說明)。import 名與 pip 名不一定相同(elftools ↔ pyelftools),
 # 兩個都要講清楚，否則使用者照著 `pip install elftools` 打會裝到別的套件。
@@ -117,7 +125,7 @@ _OPTIONAL_PACKAGES = [
      "沒裝會退回 readelf 文字解析並在報告開頭明列缺失能力 — pip install pyelftools"),
     ("capstone", "capstone",
      "選用:analyze_file view=\"disasm\" 在系統 objdump 不支援該架構(ARM/RISC-V 韌體在 x86 主機)時的"
-     "純 Python 反組譯後備；也可改裝對應的 binutils-<triplet> 或設 AICODE_OBJDUMP — pip install capstone"),
+     "純 Python 反組譯後備；也可改裝對應的 binutils-<triplet> 或在 client.json 設 objdump — pip install capstone"),
 ]
 
 _MCP_REQUIREMENT = "mcp>=1.28,<2"
@@ -261,8 +269,9 @@ def check_endpoint_policy(r: Result) -> None:
     """模型端點遠端 opt-in 檢查(只看 config + env,--no-network 也跑)。
 
     Transport policy:llama_client 的每個呼叫送出前都會經
-    endpoint_policy.ensure_allowed(role="model") —— 端點非 loopback 且未設
-    AICODE_MODEL_REMOTE_OK=1 會 fail-loud。這裡把設定矛盾在啟動前抓出來。
+    endpoint_policy.ensure_allowed(role="model") —— 端點非 loopback 且
+    `client.json` 沒有 `model_remote_ok: true` 會 fail-loud。這裡把設定矛盾在
+    啟動前抓出來。
     """
     cfg = _read_config()
     if isinstance(cfg, Exception):
@@ -277,23 +286,22 @@ def check_endpoint_policy(r: Result) -> None:
             remote.append((role, endpoint_policy.redact_url(url)))
 
     if remote:
-        opted_in = os.environ.get(
-            endpoint_policy.MODEL_REMOTE_OK_ENV, ""
-        ).lower() in ("1", "true", "yes")
+        opted_in = endpoint_policy._model_remote_ok()  # noqa: SLF001 - 同一個判準
         detail = ", ".join(f"{role}={url}" for role, url in remote)
         if opted_in:
             r.warn(
                 f"非 loopback 模型端點({detail});"
-                f"{endpoint_policy.MODEL_REMOTE_OK_ENV}=1 已設,"
+                f'client.json 的 "{endpoint_policy.MODEL_REMOTE_OK_KEY}": true 已設,'
                 "prompt(可能含 NDA 內容)會送往遠端"
             )
         else:
             r.fail(
-                f"非 loopback 模型端點({detail})但未設 "
-                f"{endpoint_policy.MODEL_REMOTE_OK_ENV}=1。\n"
+                f"非 loopback 模型端點({detail})但 client.json 沒有 "
+                f'"{endpoint_policy.MODEL_REMOTE_OK_KEY}": true。\n'
                 "        所有模型呼叫(completion/embedding/reranking/health)"
                 "都會 fail-loud。\n"
-                f"        確定要用遠端模型請 export {endpoint_policy.MODEL_REMOTE_OK_ENV}=1。"
+                "        確定要用遠端模型請在 ~/.config/codetrail/client.json 設 "
+                f'"{endpoint_policy.MODEL_REMOTE_OK_KEY}": true。'
             )
     else:
         r.ok("模型端點全部是 loopback(transport policy 無需 opt-in)")
@@ -308,7 +316,8 @@ def check_endpoint_policy(r: Result) -> None:
         ):
             r.fail(
                 f"KB_CONTEXT_GENERATE 開啟且 main={endpoint_policy.redact_url(main_url)} "
-                f"非 loopback,但未設 {endpoint_policy.KB_CONTEXT_REMOTE_OK_ENV}=1;"
+                f"非 loopback,但 client.json 沒有 "
+                f'"{endpoint_policy.KB_CONTEXT_REMOTE_OK_KEY}": true;'
                 "chunk 脈絡生成會 fail-loud"
             )
 
@@ -405,13 +414,37 @@ def check_rerank_policy(r: Result, no_network: bool, server_status: dict[str, di
     r.info(f"RAG reranker: {reachability} -> RAG rerank fallback = {policy}")
     if policy == "main_model":
         r.info(
-            "AICODE_RERANK_FALLBACK_POLICY=main_model restores the old behavior: "
+            'client.json rerank_fallback_policy="main_model" restores the old behavior: '
             "strict RAG queries may call the main model for reranking."
         )
     elif policy == "embedding":
-        r.info("AICODE_RERANK_FALLBACK_POLICY=embedding keeps embedding order and does not call the main model.")
+        r.info('client.json rerank_fallback_policy="embedding" keeps embedding order and does not call the main model.')
     elif policy == "error":
-        r.info("AICODE_RERANK_FALLBACK_POLICY=error fails loudly when the dedicated reranker is unavailable.")
+        r.info('client.json rerank_fallback_policy="error" fails loudly when the dedicated reranker is unavailable.')
+
+
+#: `--profile` 指定的 deployment profile。**argv 明確指定**才有值 ——
+#: 這是「呼叫端交接」,不是「殼層裡的隱形設定」。
+_PROFILE_OVERRIDE = ""
+
+
+def _profile_env() -> dict[str, str]:
+    """交給 `deployment_profile` / `model_resolution` 的環境:HOME + `--profile`。
+
+    doctor 的工作是回報「客戶端真的會用什麼」。交整份 `os.environ` 的話,它讀到
+    的是殼層污染後的值,於是最需要 doctor 的那種情況(兩份安裝混用)它剛好報成
+    正常 —— 而客戶端自己是不看那些變數的。
+    """
+    home = os.environ.get("HOME")
+    if home:
+        env = {"HOME": home}
+    else:
+        # Windows fallback,而且**只有** HOME 缺席時才交。
+        profile = os.environ.get("USERPROFILE")
+        env = {"USERPROFILE": profile} if profile else {}
+    if _PROFILE_OVERRIDE:
+        env["AICODE_PROFILE"] = _PROFILE_OVERRIDE
+    return env
 
 
 def check_models(r: Result, server_status: dict[str, dict]) -> None:
@@ -429,7 +462,7 @@ def check_models(r: Result, server_status: dict[str, dict]) -> None:
         )
         return
 
-    resolved = resolve_main_model_from_env(os.environ)
+    resolved = resolve_main_model_from_env(_profile_env())
     suffix = f" [from {resolved.source or 'runtime'}]"
     if resolved.path:
         suffix += f" {resolved.path}"
@@ -443,16 +476,16 @@ def check_models(r: Result, server_status: dict[str, dict]) -> None:
         r.fail(
             f"MODEL={main_model}{suffix} 解析到 {expanded} 但檔案不存在。\n"
             "        在 ~/.config/codetrail/models.json 加入 name→path 映射,"
-            "或直接把 AICODE_MODEL 設成 GGUF 絕對路徑。"
+            "或重跑 ./set_config.sh 把 main.model 設成 GGUF 絕對路徑。"
         )
 
     registry = getattr(cfg, "MODEL_REGISTRY", {}) or {}
     if registry:
         r.info(f"MODEL_REGISTRY 有 {len(registry)} 個 mapping")
     else:
-        r.info("MODEL_REGISTRY 空 (AICODE_MODEL 必須是 GGUF 絕對路徑)")
+        r.info("MODEL_REGISTRY 空 (deployment.json 的 main.model 必須是 GGUF 絕對路徑)")
 
-    # 確認主 server 載入的 model_path 跟 AICODE_MODEL 對得起來
+    # 確認主 server 載入的 model_path 跟解析出的主模型對得起來
     main_srv = server_status.get("main")
     if main_srv and isinstance(main_srv.get("props"), dict):
         loaded_path = str(main_srv["props"].get("model_path") or "")
@@ -461,12 +494,12 @@ def check_models(r: Result, server_status: dict[str, dict]) -> None:
             loaded_basename = Path(loaded_path).name.lower()
             if expected_basename and expected_basename != loaded_basename:
                 r.warn(
-                    f"主 llama-server 載入的是 {loaded_basename},但 AICODE_MODEL"
+                    f"主 llama-server 載入的是 {loaded_basename},但主模型"
                     f"={main_model} 解析到 {expected_basename}。 兩邊不同 = 重啟 server"
                     " 時要記得指對 GGUF。"
                 )
             else:
-                r.ok(f"主 server 載入的 {loaded_basename} 與 AICODE_MODEL 一致")
+                r.ok(f"主 server 載入的 {loaded_basename} 與解析出的主模型一致")
 
     # 報附屬 server 載入的 model (informational)
     for role in ("embedding", "reranker", "VL"):
@@ -488,7 +521,7 @@ def check_deployment_profile(
 ) -> None:
     """Validate the effective profile and, online, its model/GPU placement."""
     try:
-        profile = load_effective_profile(os.environ)
+        profile = load_effective_profile(_profile_env())
     except ProfileError as exc:
         r.fail(f"deployment profile invalid: {exc}")
         return
@@ -519,7 +552,7 @@ def check_deployment_profile(
         if not loaded:
             continue
         try:
-            expected = resolve_model_reference(service.model, os.environ)
+            expected = resolve_model_reference(service.model, _profile_env())
         except ProfileError as exc:
             r.fail(f"profile [{role}] expected model cannot be resolved: {exc}")
             continue
@@ -545,7 +578,11 @@ def check_deployment_profile(
     inspection = inspect_deployment(
         profile,
         gpu_processes,
-        environ=os.environ,
+        # `environ` 在這裡**只**被拿去 `resolve_model_reference`(models.json 的
+        # registry 查表)。交整份 `os.environ` 的話,殼層殘留的
+        # `AICODE_MODEL_REGISTRY*` 會讓 doctor 用另一份 registry 去判「server 載入
+        # 的是不是對的 GGUF」—— 那是它最該答對的一題。
+        environ=_profile_env(),
         server_reader=server_reader,
         gpu_inventory=query_gpu_inventory(),
     )
@@ -574,14 +611,14 @@ def _npm_global_package_status(package: str) -> tuple[bool | None, str]:
         return None, "npm 不在 PATH"
 
     try:
-        proc = subprocess.run(
+        proc = process_env.run(
             [npm, "list", "-g", package, "--depth=0", "--json"],
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
         )
-    except subprocess.TimeoutExpired:
+    except process_env.TimeoutExpired:
         return None, "npm list -g timeout"
     except OSError as e:
         return None, str(e)
@@ -647,30 +684,34 @@ def check_tool_call_canary_diagnostic(
     if no_network:
         r.info("implicit routing status=unknown（--no-network 未建立 current fingerprint）")
         return
-    raw_root = project or os.environ.get("AICODE_ROOT") or ""
+    raw_root = project or ""
     if not raw_root:
-        r.info("implicit routing status=unknown（沒有 AICODE_ROOT / --project）")
+        r.info("implicit routing status=unknown（沒有 --project）")
         return
     try:
         root = Path(raw_root).expanduser().resolve(strict=True)
     except (OSError, ValueError):
         r.info("implicit routing status=unknown（root 無法解析）")
         return
-    props = tool_call_canary.fetch_main_server_props(os.environ)
+    try:
+        base_url = tool_call_canary.default_base_url()
+    except tool_call_canary.CanaryError as exc:
+        r.warn(f"implicit routing status=unknown（deployment profile 無法載入:{exc}）")
+        return
+    props = tool_call_canary.fetch_main_server_props(base_url)
     if props is None:
         r.info("implicit routing status=unknown（llama-server /props 不可用）")
         return
     try:
         protocol = tool_call_canary.run_protocol_check(
             root=root,
-            env=os.environ,
-            timeout=tool_call_canary.DEFAULT_MCP_TIMEOUT_SECONDS,
+            timeout=tool_call_canary.TOOL_CANARY_MCP_TIMEOUT_SECONDS,
         )
-        selected_model, _ = tool_call_canary._model_selection(os.environ, "", [])
+        selected_model, _ = tool_call_canary._model_selection(_profile_env(), "")
     except tool_call_canary.CanaryError as exc:
         r.warn(f"implicit routing current fingerprint 無法建立：{exc}")
         return
-    cache_path = tool_call_canary.resolve_cache_path(os.environ)
+    cache_path = tool_call_canary.resolve_cache_path(os.environ)  # HOME / XDG_CACHE_HOME
     if cache_path is None:
         r.info("implicit routing status=unknown（快取路徑不可用）")
         return
@@ -678,19 +719,10 @@ def check_tool_call_canary_diagnostic(
         root=root,
         selected_model=selected_model,
         props=props,
-        env=os.environ,
+        env=process_env.child_env(),  # 只用 HOME / XDG;剝掉設定變數
         protocol_evidence=protocol,
     )
-    raw_ttl = os.environ.get("AICODE_TOOL_CANARY_TTL_SECONDS", "").strip()
-    try:
-        ttl_seconds = (
-            int(raw_ttl)
-            if raw_ttl
-            else tool_call_canary.DEFAULT_CACHE_TTL_SECONDS
-        )
-    except ValueError:
-        r.warn("implicit routing status=unknown（canary TTL 不是整數）")
-        return
+    ttl_seconds = tool_call_canary.TOOL_CANARY_TTL_SECONDS
     report_cached_implicit_status(
         r,
         cache_path=cache_path,
@@ -719,12 +751,55 @@ def check_client_entry(r: Result) -> None:
         r.fail(f"客戶端模組缺少 {', '.join(missing)}")
 
 
+#: 網頁前端已移除。升級**之前**啟動的 backend 還會掛在這個 tmux session 裡:
+#: 刪檔不會停掉它,而它繼續占著 port、一個 MCP 子行程與模型 slot。
+LEGACY_WEB_TMUX_SESSION = "codetrail-web"
+
+
+def legacy_web_backend_hint() -> str:
+    """舊網頁 backend 還在跑的話,回一段「該下哪個指令」;沒有就回空字串。
+
+    純偵測、不動它:殺掉別人的 session 不是自檢該做的事。
+    """
+    if not shutil.which("tmux"):
+        return ""
+    try:
+        found = process_env.run(
+            ["tmux", "has-session", "-t", LEGACY_WEB_TMUX_SESSION],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).returncode == 0
+    except Exception:  # noqa: BLE001 - 偵測失敗不得變成新的失敗來源
+        return ""
+    if not found:
+        return ""
+    return (
+        f"升級前啟動的網頁 backend 還在跑(tmux session {LEGACY_WEB_TMUX_SESSION});"
+        "網頁前端已移除,它不會自己停。\n"
+        f"        停掉它:tmux kill-session -t {LEGACY_WEB_TMUX_SESSION}\n"
+        "        舊 symlink 一併移除:rm -f \"$HOME/.local/bin/aicode_web\""
+    )
+
+
+def check_legacy_web_backend(r: Result) -> None:
+    hint = legacy_web_backend_hint()
+    if hint:
+        r.warn(hint)
+    else:
+        r.ok("沒有殘留的網頁 backend")
+
+
 def check_legacy_opencode_install(r: Result) -> None:
-    """舊 OpenCode 安裝留下的 CodeTrail 設定。
+    """舊 OpenCode 安裝留下的 CodeTrail 設定。**唯讀偵測**,不修。
 
     為什麼是 doctor 的事:那些值(`compaction.auto=false`、指向本 repo 的
     plugin 路徑)現在沒有人負責。plugin 檔一旦被刪,使用者在**其他專案**開
     OpenCode 都會失敗,而錯誤訊息不會提到 CodeTrail。
+
+    修法是使用者**手動**跑一次 `python3 opencode_migrate.py` —— 那是這一份
+    安裝裡唯一還會寫使用者 OpenCode 設定的路徑。`set_config` 已經不做遷移:
+    寫別人的設定不該搭在「設定我自己」這件事上。
     """
     try:
         import opencode_migrate
@@ -733,13 +808,20 @@ def check_legacy_opencode_install(r: Result) -> None:
     except Exception as exc:  # noqa: BLE001 - 診斷不得因此中斷
         r.info(f"舊 OpenCode 設定未檢查({type(exc).__name__})")
         return
+    if plan.foreign_owner:
+        r.info(
+            "OpenCode 的接管紀錄是另一份 CodeTrail 安裝寫的"
+            f"({plan.foreign_owner} 還在);這一份不會動它。"
+        )
+        return
     if not plan.needed:
         r.ok("沒有舊 OpenCode 安裝留下的 CodeTrail 設定")
         return
     r.warn(
         "偵測到舊 OpenCode 安裝留下的 CodeTrail 設定(壓縮受管值 / plugin 項)。\n"
-        "        跑一次 ./set_config.sh 會在同一個 transaction 裡還原並撤銷註冊;\n"
-        "        先看一眼:python3 opencode_migrate.py --check"
+        "        解除(只還原仍有 ownership 證據的值,有備份):\n"
+        "          python3 opencode_migrate.py --check   # 先看一眼,零寫入\n"
+        "          python3 opencode_migrate.py           # 實際執行"
     )
 
 
@@ -758,7 +840,6 @@ def check_context_settings(r: Result) -> None:
     reserved = int(getattr(cfg, "RESERVED_OUTPUT_TOKENS", 0) or 0)
     soft = float(getattr(cfg, "CTX_SOFT_THRESHOLD", 0.80) or 0.80)
     hard = float(getattr(cfg, "CTX_HARD_THRESHOLD", 0.90) or 0.90)
-    gate_on = bool(getattr(cfg, "CTX_GATE_ENABLED", True))
     resolution = getattr(cfg, "N_CTX_RESOLUTION", None)
     source = getattr(resolution, "source", "config")
 
@@ -768,25 +849,14 @@ def check_context_settings(r: Result) -> None:
         f"每次呼叫永遠不超過主 n_ctx({main_n_ctx})，沒有另一個 max 設定"
     )
     r.info(
-        f"AICODE_RESERVED_OUTPUT_TOKENS={reserved} "
-        f"soft={int(soft*100)}% hard={int(hard*100)}% gate_on={gate_on}"
+        f"config.RESERVED_OUTPUT_TOKENS={reserved} "
+        f"soft={int(soft*100)}% hard={int(hard*100)}%"
     )
     r.info(
         "設定方式: ./set_config.sh 只填一次主 n_ctx；server -c、CodeTrail budget 與 "
         "客戶端的 context gate / 壓縮門檻都用同一值。"
     )
 
-    if os.environ.get("AICODE_DYNAMIC_NUM_CTX_MAX"):
-        r.warn(
-            "AICODE_DYNAMIC_NUM_CTX_MAX 已 deprecated；本次僅為相容而讀取。\n"
-            "        請移除它並用 ./set_config.sh 設定主 n_ctx。"
-        )
-
-    if os.environ.get("AICODE_NUM_CTX"):
-        r.warn(
-            "AICODE_NUM_CTX 已 deprecated 且不是獨立上限。\n"
-            "        請移除它並用 ./set_config.sh 設定主 n_ctx。"
-        )
 
     if hard < soft:
         r.warn(
@@ -855,49 +925,48 @@ def check_main_server_ctx_alignment(r: Result, server_status: dict[str, dict]) -
 
 
 def check_aicode_root(r: Result, project: str | None) -> None:
-    """檢查傳入的 project (或環境變數 AICODE_ROOT) 是否安全。"""
-    candidate = project or os.environ.get("AICODE_ROOT")
+    """檢查傳入的 `--project` 是否是一個安全的 sandbox root。
+
+    以前這裡也吃 `AICODE_ROOT`。root 已經改走 argv(`mcp_server --root`,由
+    客戶端以 cwd 決定),殼層裡殘留的那一個只會讓 doctor 去檢查一棵沒有人會用
+    的樹然後報 PASS。
+    """
+    candidate = project
     if not candidate:
-        r.info("未指定 --project 也沒 AICODE_ROOT — 跳過 root 檢查")
+        r.info("未指定 --project — 跳過 root 檢查")
         return
 
     try:
         resolved = Path(candidate).resolve()
     except OSError as e:
-        r.fail(f"AICODE_ROOT 無法解析: {e}")
+        r.fail(f"sandbox root 無法解析: {e}")
         return
 
     if not resolved.is_dir():
-        r.fail(f"AICODE_ROOT 不是目錄: {resolved}")
+        r.fail(f"sandbox root 不是目錄: {resolved}")
         return
 
     if resolved.parent == resolved:
-        r.fail("AICODE_ROOT=/ 會把整個檔案系統暴露給 sandbox")
+        r.fail("sandbox root=/ 會把整個檔案系統暴露給 sandbox")
         return
 
     home = os.environ.get("HOME")
-    allow_home = os.environ.get("AI_CODE_ALLOW_HOME_ROOT", "").lower() in ("1", "true", "yes")
     if home and str(resolved) == str(Path(home).resolve()):
-        if allow_home:
-            r.warn(
-                f"AICODE_ROOT=$HOME ({resolved}) — 已透過 AI_CODE_ALLOW_HOME_ROOT=1 放行，"
-                "高風險，請確認你真的知道在做什麼"
-            )
-            return
+        # `$HOME` 當 root 一律拒絕,**沒有 opt-in**:以前的
+        # `AI_CODE_ALLOW_HOME_ROOT=1` 是一個殼層裡看不見的旗標,而它放行的是
+        # 「把整個家目錄交給模型」。
         r.fail(
-            f"AICODE_ROOT=$HOME ({resolved}) — 範圍太大、容易意外洩漏個人資料。\n"
-            "        cd 到具體 project 目錄再啟動。\n"
-            "        若真的有需要 (高風險，自行承擔), 設定環境變數:\n"
-            "        AI_CODE_ALLOW_HOME_ROOT=1"
+            f"sandbox root=$HOME ({resolved}) — 範圍太大、容易意外洩漏個人資料。\n"
+            "        cd 到具體 project 目錄再啟動。"
         )
         return
 
-    r.ok(f"AICODE_ROOT 安全: {resolved}")
+    r.ok(f"sandbox root 安全: {resolved}")
 
     if (resolved / ".git").exists():
-        r.ok("AICODE_ROOT 在 git 控管下（apply_patch 出錯可 git checkout 還原）")
+        r.ok("sandbox root 在 git 控管下（apply_patch 出錯可 git checkout 還原）")
     else:
-        r.warn("AICODE_ROOT 不是 git repo — apply_patch 出錯時無法用 git checkout 還原")
+        r.warn("sandbox root 不是 git repo — apply_patch 出錯時無法用 git checkout 還原")
 
 
 def check_repo_artifacts(r: Result) -> None:
@@ -929,12 +998,9 @@ def check_knowledge_base(r: Result, project: str | None) -> None:
     cfg = _read_config()
     kb_filename = getattr(cfg, "KNOWLEDGE_FILE", "knowledge.json") if not isinstance(cfg, Exception) else "knowledge.json"
 
-    if project:
-        kb_path = Path(project) / kb_filename
-    elif os.environ.get("AICODE_ROOT"):
-        kb_path = Path(os.environ["AICODE_ROOT"]) / kb_filename
-    else:
-        kb_path = REPO_ROOT / kb_filename
+    # `--project` 或這個 checkout 自己。以前中間還有一層 `AICODE_ROOT`,
+    # 殼層殘留的那個會讓 doctor 去看別個專案的 KB 然後回報它的 chunk 數。
+    kb_path = (Path(project) if project else REPO_ROOT) / kb_filename
 
     if kb_path.is_file():
         try:
@@ -1187,17 +1253,37 @@ def main(argv: list[str] | None = None) -> int:
         prog="doctor",
         description="CodeTrail preflight check — 安裝 / 啟動前自檢",
     )
-    parser.add_argument("--project", help="把這個目錄當作 AICODE_ROOT 來檢查")
+    parser.add_argument("--project", help="把這個目錄當作 sandbox root 來檢查")
     parser.add_argument("--profile", help='選用 deployment profile("defaults" 或絕對 JSON 路徑)')
     parser.add_argument("--no-network", action="store_true",
                         help="跳過 llama-server / 模型線上檢查（CI 用）")
     args = parser.parse_args(argv)
 
     if args.profile:
-        os.environ["AICODE_PROFILE"] = args.profile
+        global _PROFILE_OVERRIDE
+        _PROFILE_OVERRIDE = args.profile
 
     print("=== CodeTrail doctor ===")
     r = Result()
+
+    # **先把 client.json 套進 config,再做任何檢查。** doctor 的工作是回報
+    # 「客戶端真的會用什麼」;不套的話,遠端端點 + `model_remote_ok: true` 的
+    # 合法部署會被報成 FAIL,非預設的 rerank policy 也會報錯的那一個。
+    # 讀不到 / 不可信時照舊往下跑(它是診斷,不是啟動閘),但要講出來。
+    try:
+        import client_config as _client_config
+
+        _settings = _client_config.load_client_settings()
+        _client_config.apply_to_config(_settings, readonly=False)
+        if _settings.present:
+            r.info(f"client.json 已套用({_settings.path})")
+        else:
+            r.info(f"沒有 {_settings.path};以下用內建預設判定")
+    except Exception as _cfg_exc:  # noqa: BLE001 - 診斷工具不得因為設定壞掉而不能跑
+        r.warn(
+            f"client.json 不可信({_cfg_exc});以下用內建預設判定 —— "
+            "客戶端本身會 fail-loud 拒絕啟動"
+        )
 
     print("\n-- runtime --")
     check_python(r)
@@ -1222,6 +1308,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n-- CodeTrail 客戶端 --")
     check_client_entry(r)
+    check_legacy_web_backend(r)
     check_legacy_opencode_install(r)
 
     print("\n-- tool-call canary cache --")
@@ -1236,7 +1323,7 @@ def main(argv: list[str] | None = None) -> int:
     check_llama_runtime(r, no_network=args.no_network, server_status=server_status)
     check_main_server_ctx_alignment(r, server_status)
 
-    print("\n-- AICODE_ROOT / project --")
+    print("\n-- sandbox root / project --")
     check_aicode_root(r, args.project)
     check_knowledge_base(r, args.project)
 

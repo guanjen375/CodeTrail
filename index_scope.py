@@ -72,7 +72,6 @@ from config import (
     INDEX_ONLY_IGNORED_DIRS,
     INDEX_PYTHON_VERSION_DIR_RE,
     INDEX_PYTHON_VERSION_PARENTS,
-    INDEX_SCOPE_FILE_ENV,
     INDEX_SCOPE_MAX_PATTERN_CHARS,
     INDEX_SCOPE_MAX_PATTERNS,
     INDEX_SCOPE_SCHEMA_VERSION,
@@ -277,9 +276,6 @@ class ScopeConfig:
 def default_scope_path(env: dict | None = None) -> Path | None:
     """index-scope.json 位置;``None`` = 連 HOME 都沒有,視同沒有這個檔。"""
     environ = env if env is not None else os.environ
-    override = (environ.get(INDEX_SCOPE_FILE_ENV) or "").strip()
-    if override:
-        return Path(override).expanduser()
     home = (environ.get("HOME") or environ.get("USERPROFILE") or "").strip()
     if not home:
         return None

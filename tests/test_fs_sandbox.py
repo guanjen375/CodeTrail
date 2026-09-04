@@ -484,14 +484,14 @@ def test_rg_is_told_to_cap_columns_itself(tmp_path, monkeypatch):
     if not shutil.which("rg"):
         pytest.skip("這台沒有 rg;此防線只適用 rg 快速路徑")
     seen: list[list[str]] = []
-    real_run = __import__("subprocess").run
+    real_run = __import__("process_env").run
 
     def spy(cmd, *a, **kw):
         if isinstance(cmd, list) and cmd and cmd[0] == "rg":
             seen.append(cmd)
         return real_run(cmd, *a, **kw)
 
-    monkeypatch.setattr("agent_tools.subprocess.run", spy)
+    monkeypatch.setattr("process_env.run", spy)
     _write_tree(tmp_path, long_line_chars=50_000)
     ToolExecutor(str(tmp_path)).grep(pattern="vec_mem_sys_base", context=3)
 

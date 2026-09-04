@@ -51,7 +51,6 @@ from pathlib import Path
 from knowledge_store import knowledge_store_lock
 
 LESSONS_SCHEMA_VERSION = 1
-LESSONS_FILE_ENV = "AICODE_LESSONS_FILE"
 LESSONS_MAX_ACTIVE = 20
 LESSONS_REVIEW_DAYS = 90
 LESSONS_RULE_MAX_CHARS = 200
@@ -77,17 +76,15 @@ class LessonsError(RuntimeError):
 
 
 def default_lessons_path(env: dict | None = None) -> Path:
-    """Store 路徑:AICODE_LESSONS_FILE 覆寫,否則 ~/.config/codetrail/lessons.json。"""
+    """Store 路徑:``~/.config/codetrail/lessons.json``。
+
+    沒有位置覆寫。一個「檔案在哪」的環境變數只會讓 runtime 與診斷工具各自看到
+    不同的檔(而使用者以為它們在講同一份);測試改 ``HOME`` 就夠了。
+    """
     environ = env if env is not None else os.environ
-    override = (environ.get(LESSONS_FILE_ENV) or "").strip()
-    if override:
-        return Path(override).expanduser()
     home = (environ.get("HOME") or environ.get("USERPROFILE") or "").strip()
     if not home:
-        raise LessonsError(
-            "無法決定 lessons.json 位置:HOME/USERPROFILE 未設,"
-            f"且 {LESSONS_FILE_ENV} 未指定。"
-        )
+        raise LessonsError("無法決定 lessons.json 位置:HOME / USERPROFILE 都沒設。")
     return Path(home) / ".config" / "codetrail" / "lessons.json"
 
 
@@ -492,7 +489,7 @@ def render_context(active: list[dict]) -> str:
     lines.append("")
     lines.append(
         f"管理:python {Path(__file__).name} list / renew / delete"
-        f"(store: {LESSONS_FILE_ENV} 或 ~/.config/codetrail/lessons.json)"
+        "(store: ~/.config/codetrail/lessons.json)"
     )
     return "\n".join(lines) + "\n"
 
@@ -553,7 +550,7 @@ def write_context_file(root: Path, active: list[dict]) -> Path:
 def remove_context_file(root: Path) -> bool:
     """移除先前 render 的注入檔,回傳是否真的有檔被移除。
 
-    AICODE_LESSONS_SKIP / CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS 的路徑用:
+    「本 session 不注入」的路徑用(client.json 的 project_instructions=false):
     不移除的話,客戶端仍會把舊檔接進 system prompt,上一個 session 的規則會在
     「已跳過」的 session 裡繼續生效。同樣先過 symlink 邊界檢查。
     """
@@ -669,7 +666,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--file",
         default=None,
-        help=f"lessons.json 路徑(預設 ${LESSONS_FILE_ENV} 或 ~/.config/codetrail/lessons.json)",
+        help="lessons.json 路徑(預設 ~/.config/codetrail/lessons.json)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

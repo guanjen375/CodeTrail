@@ -281,7 +281,9 @@ def cache_root_for(kb_path: Path, base_dir: Optional[str] = None) -> Path:
     放 repo 外：改 CodeTrail 自己的 .gitignore 保護不了任意 AICODE_ROOT 底下的
     firmware repo。目錄名是 KB 路徑的 hash，不含來源名。
     """
-    base = Path(base_dir or config.KB_CONTEXT_CACHE_DIR).expanduser()
+    # `config.KB_CONTEXT_CACHE_DIR` 是函式(HOME 在測試裡會改,不能 import 期綁值)。
+    default = config.KB_CONTEXT_CACHE_DIR
+    base = Path(base_dir or (default() if callable(default) else default)).expanduser()
     digest = hashlib.sha256(str(Path(kb_path).resolve()).encode("utf-8")).hexdigest()[:32]
     return base / digest
 

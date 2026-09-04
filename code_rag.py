@@ -283,8 +283,8 @@ def index_slice_aligns(index: list, cursor: int, symbols: list) -> bool:
 def cache_identity() -> dict:
     """持久 cache 的身分欄位 —— **單一來源**,寫入端與驗證端都從這裡取。
 
-    刻意包含**實際的預算值**而不是只有 schema 版本:這些預算是環境變數可覆寫的
-    (`AICODE_CODE_RAG_EMBED_TEXT_MAX_CHARS` 等),只鎖 schema version 的話,重啟
+    刻意包含**實際的預算值**而不是只有 schema 版本:這些預算是 `config.py` 的常數
+    (`CODE_RAG_EMBED_TEXT_MAX_CHARS` 等),只鎖 schema version 的話,重啟
     時改一個環境變數就會靜默沿用「用另一組 render 算出來的」embedding —— 沒有
     任何訊息會提醒你現在查的是舊向量。
 
@@ -388,13 +388,13 @@ def _cached_get_embedding(text: str) -> tuple:
     except Exception as exc:
         raise RuntimeError(
             f"embedding server unreachable at {LLAMA_EMBED_BASE_URL}: {exc}. "
-            "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+            "Check the embedding llama-server (deployment.json 的 services.embedding)."
         ) from exc
 
     if not emb:
         raise RuntimeError(
             f"embedding server returned an empty vector at {LLAMA_EMBED_BASE_URL}. "
-            "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+            "Check the embedding llama-server (deployment.json 的 services.embedding)."
         )
     return tuple(emb)
 
@@ -812,7 +812,7 @@ class CodeRAG:
             except Exception as exc:
                 raise RuntimeError(
                     f"embedding server unreachable at {LLAMA_EMBED_BASE_URL}: {exc}. "
-                    "Check the 8081 llama-server or AICODE_LLAMA_EMBED_BASE_URL."
+                    "Check the embedding llama-server (deployment.json 的 services.embedding)."
                 ) from exc
             for i, vec in zip(batch_indices, vectors):
                 out[i] = vec
@@ -1371,7 +1371,7 @@ class CodeRAG:
         """Fallback for Code RAG rerank. main_model is intentionally embedding here."""
         if config.RERANK_FALLBACK_POLICY == "error":
             raise RuntimeError(
-                "Code RAG reranker unavailable and AICODE_RERANK_FALLBACK_POLICY=error. "
+                "Code RAG reranker unavailable and client.json rerank_fallback_policy is \"error\". "
                 f"Reason: {reason}"
             )
         return self._fusion_candidates(candidates, top_k)

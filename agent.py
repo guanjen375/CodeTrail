@@ -9,11 +9,12 @@ import json
 from pathlib import Path
 
 import config
+import config as _config
 import context_budget
 import llama_client
 import trim as trim_module
 from config import (
-    LLAMA_BASE_URL, N_CTX,
+    LLAMA_BASE_URL,
     DYNAMIC_NUM_CTX_ENABLED, DYNAMIC_NUM_CTX_MIN,
     DYNAMIC_NUM_CTX_BUFFER, CHARS_PER_TOKEN,
     MAX_TOOL_LOOPS,
@@ -37,9 +38,13 @@ from agent_tools import ToolExecutor, get_native_tools
 # ============================================================
 _BASENAME_MAP_CACHE = {}
 def _compute_dynamic_num_ctx(messages: list) -> int:
-    """根據 messages 長度動態計算 num_ctx"""
+    """根據 messages 長度動態計算 num_ctx。
+
+    主 n_ctx **每次讀 `config.N_CTX`**,不做 import 期快照:`mcp_server` 收到
+    `--n-ctx <觀測值>` 之後會覆寫它,而那個覆寫在這個模組 import 之後才發生。
+    """
     if not DYNAMIC_NUM_CTX_ENABLED:
-        return N_CTX
+        return _config.N_CTX
 
     total_chars = 0
     for msg in messages:
@@ -56,7 +61,7 @@ def _compute_dynamic_num_ctx(messages: list) -> int:
     target_ctx = ((target_ctx + 2047) // 2048) * 2048
     # The configured main n_ctx always wins, even for intentionally small test
     # deployments below the usual dynamic floor.
-    target_ctx = min(N_CTX, max(DYNAMIC_NUM_CTX_MIN, target_ctx))
+    target_ctx = min(_config.N_CTX, max(DYNAMIC_NUM_CTX_MIN, target_ctx))
 
     return target_ctx
 
@@ -144,7 +149,7 @@ def _llama_error_message(e: Exception, model: str) -> str:
         return (
             f"[ERROR] 無法連接 llama-server ({LLAMA_BASE_URL})。\n"
             f"   1. 主 llama-server 是否啟動?(預期 port 8080)\n"
-            f"   2. AICODE_LLAMA_BASE_URL 是否指對?\n"
+            f"   2. ~/.config/codetrail/deployment.json 的 main port / base_url 是否指對?\n"
             f"   可先試: curl -s {LLAMA_BASE_URL}/health"
         )
     if "Timeout" in err_type or "ReadTimeout" in err_type:

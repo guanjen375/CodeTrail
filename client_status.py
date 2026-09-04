@@ -28,9 +28,6 @@ import argparse
 import os
 import sys
 
-#: 與 client_engine.KEEP_REASONING_ENV 逐字相同。
-KEEP_REASONING_ENV = "CODETRAIL_KEEP_REASONING"
-
 SWITCH_HINT = (
     "行為仍在調整;要完全關掉壓縮:./set_config.sh --compaction-mode off"
 )
@@ -63,22 +60,23 @@ def _threshold_lines(cc, n_ctx: int | None) -> tuple[bool | None, list[str]]:
     ]
 
 
-def _reasoning_line(env: dict) -> list[str]:
+def _reasoning_line(settings) -> list[str]:
     """舊回合的 reasoning 有沒有被丟掉——那是最大的一筆 context 差異。
 
     為什麼要印:客戶端會把「最新一則真實使用者訊息之前」的 assistant
     reasoning 從送進模型的訊息裡拿掉(每段對話省下三到五成的成長)。這偏離
     DeepSeek-V4 官方模板「有 tools 就全留」的行為,是模型相依的品質取捨——
-    使用者至少要知道自己在哪一邊,以及關掉它的那個變數叫什麼。
+    使用者至少要知道自己在哪一邊,以及要改哪個鍵。
 
-    與壓縮模式**無關**:它不寫設定,客戶端一律生效。
+    來源是 `client.json` 的 `keep_historical_reasoning`(以前是一個環境變數)。
+    與 `show_reasoning` 是**兩個**鍵:那個只管畫面,這個管送模 payload。
+    與壓縮模式**無關**:客戶端一律生效。
     """
-    raw = str(env.get(KEEP_REASONING_ENV) or "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
-        return [f"舊回合 reasoning=保留({KEEP_REASONING_ENV} 已設定)"]
+    if getattr(settings, "keep_historical_reasoning", False):
+        return ['舊回合 reasoning=保留(client.json 的 "keep_historical_reasoning": true)']
     return [
         "舊回合 reasoning=不進模型(省 context;"
-        f"要保留就設 {KEEP_REASONING_ENV}=1)"
+        '要保留就在 client.json 設 "keep_historical_reasoning": true)'
     ]
 
 
@@ -96,7 +94,7 @@ def _stopped_line(cc, env: dict) -> list[str]:
     ]
 
 
-def status_lines(env: dict | None = None) -> list[str]:
+def status_lines(env: dict | None = None, *, n_ctx: int | None = None) -> list[str]:
     """回要顯示的行(第一行是摘要,其餘是補充)。任何情況都回得出東西。"""
     values = dict(os.environ if env is None else env)
     try:
@@ -121,24 +119,32 @@ def status_lines(env: dict | None = None) -> list[str]:
         return [
             f"壓縮模式={mode}(沒有 {settings.path};CodeTrail 未接管)",
             "跑 ./set_config.sh 選一次才會有自動壓縮",
-            *_reasoning_line(values),
+            *_reasoning_line(settings),
         ]
 
     lines = [f"壓縮模式={mode} 🧪 實驗中——{label}"]
     if mode != cc.MODE_OFF:
-        n_ctx = None
-        raw_ctx = str(values.get("AICODE_N_CTX") or "").strip()
-        if raw_ctx.isdigit():
-            n_ctx = int(raw_ctx)
-        _ok, threshold_lines = _threshold_lines(cc, n_ctx)
+        # n_ctx **優先用呼叫端觀測到的真值**(preflight 讀主 server 的 /props);
+        # 沒給才退回 deployment profile 的設定值。門檻是拿這個數字推出來的,
+        # 而 Engine 用的是觀測值 —— 兩邊不同就會印出一個沒有人在用的門檻,
+        # 那正是這一行存在的反面。
+        observed = n_ctx
+        if not observed:
+            try:
+                import config as _config
+
+                observed = int(getattr(_config, "N_CTX", 0) or 0) or None
+            except Exception:  # noqa: BLE001 - 橫幅不得因為設定讀不到而消失
+                observed = None
+        _ok, threshold_lines = _threshold_lines(cc, observed)
         lines.extend(threshold_lines)
-    lines.extend(_reasoning_line(values))
+    lines.extend(_reasoning_line(settings))
     lines.extend(_stopped_line(cc, values))
     if settings.permission:
         overrides = "、".join(f"{k}={v}" for k, v in sorted(settings.permission.items()))
         lines.append(f"權限覆寫:{overrides}")
     if mode == cc.MODE_MANUAL:
-        lines.append("/compact 只在終端客戶端與 web 介面有效(headless run 不壓縮)")
+        lines.append("/compact 只在 aicode 的終端介面有效(headless run 不壓縮)")
     if mode == cc.MODE_OFF:
         lines.append("context 滿了會是一個可見的錯誤,不會自動補救")
     else:

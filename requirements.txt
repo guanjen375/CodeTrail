@@ -2,6 +2,10 @@
 
 # 核心
 requests>=2.28.0    # llama-server HTTP client
+# `aicode` 的終端介面(全螢幕 TUI)。純 Python wheel,離線機器裝得起來。
+# **不要**裝 textual[syntax]:那個 extra 拉的 tree-sitter 文法與下面釘死的
+# tree-sitter 0.26 衝突。
+textual>=8,<9
 mcp>=1.28,<2         # MCP server（現行 FastMCP import 只相容 SDK 1.x）
 numpy>=1.21.0       # RAG / MMR 向量運算
 jieba>=0.42.1       # 中文 BM25 切詞（缺少時可降級，但預設安裝確保檢索品質）

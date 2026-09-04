@@ -225,7 +225,7 @@ def test_disasm_failure_is_explained_not_omitted(elf_path: Path, monkeypatch):
                         lambda model, plan, limit: (False, "未安裝（python3 -m pip install capstone）"))
     out = media.read_elf(str(elf_path), view="disasm", target="main")
     assert "[反組譯不可用]" in out, out
-    assert "capstone" in out and "補救" in out and "AICODE_OBJDUMP" in out
+    assert "capstone" in out and "補救" in out and "objdump" in out
     # 找不到 symbol 也要講，不能空白
     missing = media.read_elf(str(elf_path), view="disasm", target="no_such_symbol")
     assert "找不到 symbol" in missing

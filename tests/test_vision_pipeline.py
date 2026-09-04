@@ -904,10 +904,12 @@ def test_vision_json_completion_enforces_model_endpoint_policy(monkeypatch):
     prompt 與圖片可能含 NDA 內容;非 loopback 端點沒 opt-in 就得在任何 HTTP
     動作之前 fail-loud。
     """
+    import config
     import endpoint_policy
     import llama_client
 
-    monkeypatch.delenv(endpoint_policy.MODEL_REMOTE_OK_ENV, raising=False)
+    # opt-in 來自 client.json 的 `model_remote_ok`(經 config),不是環境變數。
+    monkeypatch.setattr(config, "MODEL_REMOTE_OK", False)
     monkeypatch.setattr(llama_client, "get_session", lambda: _BombSession())
     with pytest.raises(endpoint_policy.EndpointPolicyError):
         llama_client.vision_json_completion(

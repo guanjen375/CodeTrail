@@ -47,7 +47,7 @@
       "era": "opencode"
     },
     "client_baseline": {
-      "description": "CodeTrail 自家客戶端的現行契約:typed schema + MCP instructions + BASE_RULES + 六個 ask 工具",
+      "description": "CodeTrail 自家客戶端的現行契約:typed schema + MCP instructions + BASE_RULES + 七個 ask 工具(含 import_external_file)",
       "era": "client",
       "contract_digest": "b11afcdc37c41deceb81deb797fa135a093ad8bb4fccb958e8978a58b743d34d"
     }

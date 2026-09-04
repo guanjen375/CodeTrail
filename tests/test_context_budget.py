@@ -173,8 +173,17 @@ def test_gate_reserved_output_pushes_over_hard_threshold(monkeypatch):
     assert usage.hard_overflow is True
 
 
-def test_gate_can_be_disabled_via_env(monkeypatch):
-    monkeypatch.setattr(config, "CTX_GATE_ENABLED", False)
+@pytest.mark.smoke
+def test_the_context_gate_has_no_off_switch(monkeypatch):
+    """context gate **沒有關閉開關**。
+
+    2026-09-04:原本這條驗的是 `CTX_GATE_ENABLED=False` 會放行超長 prompt。行為為
+    什麼該變:plan §2.4 把它列為「刪除、無替代」——關掉之後的症狀不是錯誤訊息,
+    是 llama-server 從 prompt 前面靜默截掉,使用者看到的只有「模型忘記前面說過
+    什麼」。留一個常數等於留一個 monkeypatch 就能繞過的逃生口。
+    """
+    assert not hasattr(config, "CTX_GATE_ENABLED")
+    monkeypatch.setattr(config, "CTX_GATE_ENABLED", False, raising=False)  # 殘留值無效
     monkeypatch.setattr(config, "CTX_HARD_THRESHOLD", 0.90)
     monkeypatch.setattr(config, "RESERVED_OUTPUT_TOKENS", 0)
     chars = int(950 * config.CHARS_PER_TOKEN)
@@ -183,9 +192,8 @@ def test_gate_can_be_disabled_via_env(monkeypatch):
         requested_num_ctx=1000,
         prompt="x" * chars,
     )
-    assert usage.hard_overflow is True
-    # Gate disabled ⇒ no exception even though usage says hard_overflow
-    context_budget.enforce_gate(usage)
+    with pytest.raises(context_budget.ContextOverflowError):
+        context_budget.enforce_gate(usage)
 
 
 def test_overflow_message_includes_remediation():
@@ -359,7 +367,6 @@ def test_log_writes_refused_attempt(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CTX_HARD_THRESHOLD", 0.90)
     monkeypatch.setattr(config, "CTX_SOFT_THRESHOLD", 0.80)
     monkeypatch.setattr(config, "RESERVED_OUTPUT_TOKENS", 0)
-    monkeypatch.setattr(config, "CTX_GATE_ENABLED", True)
 
     chars = int(950 * config.CHARS_PER_TOKEN)
     with pytest.raises(context_budget.ContextOverflowError):

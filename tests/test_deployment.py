@@ -8,15 +8,18 @@ tests/test_ctx_resolution.py、tests/test_llama_sampling.py、tests/test_config.
 
 - deployment profile:絕對路徑 profile 繼承 safe-defaults、優先序、惡意值拒收、命令建構。
 - deployment status:依 cmdline port 認角色、GPU / 模型 / mmproj 錯配偵測。
-- 主模型解析鏈:argv/env/deployment profile 的解析與 fail-loud、呼叫時機、必要 server 檢查
+- 主模型解析鏈:deployment profile / models.json 的解析與 fail-loud、呼叫時機、必要 server 檢查
   (opencode.json 已不在鏈上,只留「它不得再影響解析」的守門測試)
   (原本又併自 test_resolve_main_model / test_main_model_calltime /
-  test_required_model_servers_check,2026-08-20)。
+  test_required_model_servers_check,2026-08-20)。2026-09-04:`scripts/resolve_main_model.py`
+  這支 CLI 隨 wrapper 一起刪除(客戶端在自己的行程裡解析),argv 那一半的案例
+  因此消失 —— 客戶端沒有 `-m`;剩下的解析與 fail-loud 改對
+  `client_preflight.resolve_model` 與 `model_resolution` 直接驗。
 - gpu_safety:server-based ctx safety verdict + GPU info 回報。完全離線:所有
   nvidia-smi 與 llama-server HTTP 都用 hook 注入 fixture,CI 跑 --no-network 沒問題。
-- ctx_safety_check:scripts/ctx_safety_check.py 的 CLI 行為。整段是 smoke
+- ctx 容量閘:client_preflight.check_ctx_safety。整段是 smoke
   (AGENTS.md §1.1 第 1 款「真實發生過的 bug 的 regression」:ctx 安全閘),逐條標記。
-- n_ctx:config 的多來源優先序,以及 server ctx 自動偵測
+- n_ctx:界線檢查,以及 runtime 從主 server 觀測(client_preflight.observe_n_ctx)
   (原本又併自 test_n_ctx / test_resolve_server_ctx,2026-08-20)。
 - 取樣參數釘住(離線,不需要 llama-server)。背景:llama-server 啟動沒帶 sampling
   旗標時,內建預設是 temp 0.8 / top_k 40 / min_p 0.05,偏離 Qwen3-235B-A22B-Thinking-2507
@@ -54,10 +57,9 @@ from gpu_safety import (
     runtime_offload_check,
 )
 from model_resolution import normalize_main_model, resolve_main_model_from_env
-from scripts import ctx_safety_check as ctx
 from scripts import required_model_servers_check as preflight
-from scripts import resolve_main_model as rmm
-from scripts import resolve_server_ctx
+
+import client_preflight
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -715,91 +717,85 @@ def _write_alias_registry(tmp_path: Path, aliases: tuple[str, ...]) -> Path:
     return model
 
 
-@pytest.mark.parametrize(
-    ("env_model", "argv_model", "expected"),
-    [
-        pytest.param("same-model", "same-model", "same-model", id="same_model_allowed"),
-        pytest.param(
-            "foo-bar", "llamacpp/foo-bar", "foo-bar",
-            id="custom_provider_prefix_strips_to_bare",
+def _write_profile_model(tmp_path: Path, model: str) -> Path:
+    """把主模型寫進 deployment.json —— 現在**唯一**的來源。"""
+    cfg_dir = tmp_path / ".config" / "codetrail"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    path = cfg_dir / "deployment.json"
+    path.write_text(
+        json.dumps(
+            {"schema_version": 1, "profile": "defaults", "services": {"main": {"model": model}}}
         ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _resolve(tmp_path: Path):
+    """走客戶端真正的那一條:`client_preflight.resolve_model`。
+
+    它交給 `model_resolution` 的是 `profile_env()`(只有 HOME),所以這裡設好
+    HOME 就等於設好了整個解析鏈的輸入。
+    """
+    result = client_preflight.Preflight(root=tmp_path)
+    return client_preflight.resolve_model(result, profile=None)
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        pytest.param("same-model", "same-model", id="bare_model_name"),
+        pytest.param("/models/foo.gguf", "/models/foo.gguf", id="gguf_path"),
     ],
 )
-def test_env_and_argv_agree(model_resolution_env, monkeypatch, capsys, env_model, argv_model, expected):
-    """- same_model_allowed:env 與 --model 同一個 bare model → 放行。
-    - custom_provider_prefix_strips_to_bare:OpenCode 風格的 myprovider/bare 形式應該
-      strip 成 bare;strip 後與 env 一致就不算衝突。"""
-    monkeypatch.setenv("AICODE_MODEL", env_model)
-
-    assert rmm.main(["--model", argv_model]) == 0
-    assert capsys.readouterr().out.strip() == expected
-
-
-def test_env_and_argv_registry_aliases_for_same_gguf_allowed(
-    model_resolution_env, monkeypatch, tmp_path, capsys
+def test_the_main_model_comes_from_the_deployment_profile(
+    model_resolution_env, tmp_path, configured, expected
 ):
+    """deployment.json 的 `main.model` 接受的寫法:registry 名,或 GGUF 絕對路徑。
+
+    `provider/name` 這種 OpenCode 風格的寫法在 profile 這一層就被拒絕(啟動核心
+    的既有驗證);`normalize_main_model` 那一層仍然會 strip provider 前綴,因為
+    它同時服務 `~/start.sh` → launcher 那條路。
+    """
+    _write_profile_model(tmp_path, configured)
+
+    assert _resolve(tmp_path) == expected
+
+
+@pytest.mark.smoke
+def test_there_is_no_model_flag_and_no_model_environment_variable(model_resolution_env, tmp_path):
+    """換模型 = 重跑 `./set_config.sh`,不是每次啟動可以改的東西。
+
+    llama-server 一啟動就鎖死一顆模型;客戶端再收一個 `-m` 只會讓「使用者以為
+    在跑 A、實際在跑 B」。殼層裡殘留的 `AICODE_MODEL`(可能來自另一份安裝的
+    `~/start.sh`)同樣不得改變解析結果 —— 那正是跨 branch 混用的機制。
+    """
+    _write_profile_model(tmp_path, "profile-model")
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setenv("AICODE_MODEL", "shell-leftover-model")
+        assert _resolve(tmp_path) == "profile-model"
+    finally:
+        monkeypatch.undo()
+
+    import codetrail_chat
+
+    parser = codetrail_chat.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["-m", "some-model"])
+
+
+def test_registry_aliases_for_the_same_gguf_are_the_same_model(
+    model_resolution_env, tmp_path
+):
+    """兩個 alias 指到同一個 GGUF 就是同一顆模型(`main_model_references_equivalent`)。"""
+    from model_resolution import main_model_references_equivalent
+
     _write_alias_registry(tmp_path, ("old-alias", "new-alias"))
-    monkeypatch.setenv("AICODE_MODEL", "old-alias")
+    env = {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path)}
 
-    assert rmm.main(["--model", "new-alias"]) == 0
-    assert capsys.readouterr().out.strip() == "old-alias"
-
-
-def test_env_and_argv_conflict_fails(model_resolution_env, monkeypatch, capsys):
-    monkeypatch.setenv("AICODE_MODEL", "env-model")
-
-    rc = rmm.main(["--model", "cli-model"])
-
-    assert rc == 2
-    assert "different models" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize(
-    ("argv", "expected"),
-    [
-        pytest.param(["--model=llamacpp/foo-bar"], "foo-bar", id="equals_form"),
-        pytest.param(["-m", "foo-bar"], "foo-bar", id="bare_model_name"),
-        pytest.param(["-m", "/models/foo.gguf"], "/models/foo.gguf", id="gguf_path"),
-    ],
-)
-def test_argv_model_forms(model_resolution_env, capsys, argv, expected):
-    """argv 接受的主模型寫法:
-    - equals_form:`--model=provider/name`,provider 會被 strip。
-    - bare_model_name:`-m name`。
-    - gguf_path:GGUF 絕對路徑也是合法的主模型形式。"""
-    assert rmm.main(argv) == 0
-    assert capsys.readouterr().out.strip() == expected
-
-
-@pytest.mark.parametrize(
-    "argv",
-    [
-        pytest.param(["--model"], id="long_flag"),
-        pytest.param(["-m"], id="short_flag"),
-        pytest.param(["--model", "--foo"], id="value_is_another_flag"),
-    ],
-)
-def test_argv_missing_value_fails_loud(model_resolution_env, capsys, argv):
-    """--model / -m 沒帶值(long_flag / short_flag),或下一個 token 是另一個 flag
-    (value_is_another_flag)→ fail-loud,不吞。"""
-    rc = rmm.main(argv)
-
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "requires a model value" in err
-
-
-def test_argv_rejects_external_provider(model_resolution_env, capsys):
-    """openai/ ollama/ anthropic/ 等外部 provider prefix 必須拒絕。"""
-    for value, hint in [
-        ("openai/gpt-4", "openai/"),
-        ("ollama/qwen3", "ollama/"),
-        ("anthropic/claude", "anthropic/"),
-    ]:
-        rc = rmm.main(["-m", value])
-        assert rc == 2, f"應該拒絕 {value!r}"
-        err = capsys.readouterr().err
-        assert "外部 provider" in err or "provider prefix" in err
+    assert main_model_references_equivalent("old-alias", "new-alias", env=env)
+    assert not main_model_references_equivalent("old-alias", "other-model", env=env)
 
 
 def test_normalize_main_model_strips_custom_provider(model_resolution_env):
@@ -819,76 +815,90 @@ def test_normalize_main_model_rejects_known_external_providers(model_resolution_
     assert normalize_main_model("ollama/qwen3", "test").error
 
 
-def test_env_rejects_external_provider(model_resolution_env, monkeypatch, capsys):
-    monkeypatch.setenv("AICODE_MODEL", "anthropic/something")
+@pytest.mark.parametrize(
+    "configured",
+    [
+        pytest.param("openai/gpt-4", id="openai"),
+        pytest.param("ollama/qwen3", id="ollama"),
+        pytest.param("anthropic/claude", id="anthropic"),
+        pytest.param("<CODE_MODEL>", id="placeholder"),
+        pytest.param("models/foo.gguf", id="relative_path"),
+    ],
+)
+def test_an_unusable_profile_model_fails_loud(model_resolution_env, tmp_path, configured):
+    """外部 provider 與 `<CODE_MODEL>` 之類 placeholder 一律拒絕啟動,而且指名值。
 
-    rc = rmm.main([])
+    CodeTrail 只跑本地 llama-server;靜默接受一個 `openai/...` 只會在第一次
+    送出時才炸,而那時使用者已經把問題打進去了。
+    """
+    _write_profile_model(tmp_path, configured)
 
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "外部 provider" in err or "provider prefix" in err
-
-
-def test_placeholder_in_env_fails(model_resolution_env, monkeypatch, capsys):
-    monkeypatch.setenv("AICODE_MODEL", "<CODE_MODEL>")
-
-    rc = rmm.main([])
-
-    assert rc == 2
-    assert "placeholder" in capsys.readouterr().err
+    with pytest.raises(client_preflight.PreflightError) as excinfo:
+        _resolve(tmp_path)
+    assert configured in str(excinfo.value)
 
 
-def test_no_source_at_all_fails_loud(model_resolution_env, capsys):
-    rc = rmm.main([])
+def test_no_source_at_all_fails_loud(model_resolution_env, tmp_path):
+    """CodeTrail 不內建、不推薦主模型:沒設就明確拒絕,而且說要跑什麼。"""
+    with pytest.raises(client_preflight.PreflightError, match="set_config"):
+        _resolve(tmp_path)
 
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "AICODE_MODEL" in err
-    assert "opencode" not in err
+
+@pytest.mark.parametrize("configured", ["", "   "])
+def test_an_empty_profile_model_is_treated_as_unset(
+    model_resolution_env, tmp_path, configured
+):
+    _write_profile_model(tmp_path, configured)
+
+    with pytest.raises(client_preflight.PreflightError):
+        _resolve(tmp_path)
 
 
 @pytest.mark.smoke
-def test_opencode_json_is_no_longer_a_model_source(model_resolution_env, tmp_path, capsys):
+def test_opencode_json_is_no_longer_a_model_source(model_resolution_env, tmp_path):
     """`opencode.json` 已經不在主模型解析鏈上。
 
     CodeTrail 啟動的是自己的客戶端,沒有第二個 TUI 要對齊。沿用那份設定裡的
     模型等於「使用者以為在跑 A、實際在跑 B」。
     """
     _write_home_opencode(tmp_path, "llamacpp/from-json")
-    assert rmm.main([]) == 2
-    err = capsys.readouterr().err
-    assert "from-json" not in err
+
+    with pytest.raises(client_preflight.PreflightError) as excinfo:
+        _resolve(tmp_path)
+    assert "from-json" not in str(excinfo.value)
 
 
 @pytest.mark.smoke
-def test_a_broken_opencode_json_never_blocks_startup(
-    model_resolution_env, monkeypatch, tmp_path, capsys
-):
+def test_a_broken_opencode_json_never_blocks_startup(model_resolution_env, tmp_path):
     """一台根本沒在用 OpenCode 的機器,不該因為那份殘留檔壞掉而無法啟動。"""
     cfg_dir = tmp_path / ".config" / "opencode"
     cfg_dir.mkdir(parents=True)
     (cfg_dir / "opencode.json").write_text("{ not json", encoding="utf-8")
-    monkeypatch.setenv("AICODE_MODEL", "review-model")
+    _write_profile_model(tmp_path, "review-model")
 
-    assert rmm.main([]) == 0
-    assert capsys.readouterr().out.strip() == "review-model"
+    assert _resolve(tmp_path) == "review-model"
 
 
 @pytest.mark.smoke
 def test_a_conflicting_opencode_json_is_not_a_conflict_any_more(
-    model_resolution_env, monkeypatch, tmp_path, capsys
+    model_resolution_env, tmp_path
 ):
     _write_home_opencode(tmp_path, "llamacpp/from-json")
-    monkeypatch.setenv("AICODE_MODEL", "from-env")
+    _write_profile_model(tmp_path, "from-profile")
 
-    assert rmm.main([]) == 0
-    assert capsys.readouterr().out.strip() == "from-env"
+    assert _resolve(tmp_path) == "from-profile"
 
 
-def test_empty_string_treated_as_unset(model_resolution_env, monkeypatch, capsys):
-    monkeypatch.setenv("AICODE_MODEL", "   ")
+def test_a_broken_deployment_profile_fails_loud_with_its_path(
+    model_resolution_env, tmp_path
+):
+    """壞掉的 profile 不得靜默退回預設值再啟動 —— 訊息要指出是哪個檔。"""
+    cfg_dir = tmp_path / ".config" / "codetrail"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "deployment.json").write_text('{"main": {"ctx": 1}}', encoding="utf-8")
 
-    assert rmm.main([]) == 2
+    with pytest.raises(client_preflight.PreflightError, match="deployment"):
+        _resolve(tmp_path)
 
 
 # --------------------------------------------------------------------------
@@ -1274,30 +1284,35 @@ def test_runtime_status_short_when_unavailable():
     assert "無資料" in s.short()
 
 
-# ── 原 test_ctx_safety_check.py:scripts/ctx_safety_check.py 的 CLI 行為 ──
+# ── ctx 容量閘:client_preflight.check_ctx_safety ──
 # smoke:AGENTS.md §1.1 第 1 款「真實發生過的 bug 的 regression」
-# 真實 bug regression:ctx 安全閘。原檔是 module 層 pytestmark = smoke;合併後
-# 本檔其他來源不是 smoke,所以這一段每一條各自標 @pytest.mark.smoke。
+# 真實 bug regression:ctx 安全閘。原本是 scripts/ctx_safety_check.py 的 CLI
+# (以 AICODE_MODEL / AICODE_N_CTX / AICODE_CTX_SAFETY_DISABLE /
+# AICODE_ACCEPT_CTX_RISK 四個環境變數驅動,exit code 當閘)。那支 CLI 與那四個
+# 變數在 2026-09-04 一起刪除:閘移進 client_preflight,requested 來自觀測到的
+# server n_ctx,逃生口無替代(要跳過就是修那個檢查)。斷言的行為沒變 ——
+# 「requested > server 就擋住、== 或 < 放行、UNKNOWN 不擋」逐條保留。
 
 
-def _unknown_verdict(requested: int) -> SafetyVerdict:
-    return SafetyVerdict(
-        status="UNKNOWN",
-        requested_ctx=requested,
-        server_n_ctx=None,
-        model_path=None,
-        vram_total_gb=None,
-        vram_free_gb=None,
-        reason="test unknown",
-    )
+class _FakeService:
+    def __init__(self, base_url="http://localhost:8080", ctx=0):
+        self.base_url = base_url
+        self.ctx = ctx
 
 
-def _server_verdict_factory(status: str, server_n_ctx: int):
-    """回一個假 check_safety:固定 server_n_ctx,status 由呼叫端指定。
+class _FakeProfile:
+    """只提供 `service("main")` —— preflight 對 profile 的全部用法。"""
 
-    gate 是拿 env 推出的 requested 跟 verdict.server_n_ctx 比,所以這裡只要把
-    server_n_ctx 釘住,測試端用 AICODE_N_CTX 控制 requested 即可。
-    """
+    def __init__(self, base_url="http://localhost:8080", ctx=0):
+        self._main = _FakeService(base_url, ctx)
+
+    def service(self, role):
+        assert role == "main"
+        return self._main
+
+
+def _verdict_factory(status: str, server_n_ctx):
+    """回一個假 check_safety:固定 server_n_ctx,status 由呼叫端指定。"""
 
     def fake_check_safety(requested, base_url="http://localhost:8080", **_kw):
         return SafetyVerdict(
@@ -1315,268 +1330,179 @@ def _server_verdict_factory(status: str, server_n_ctx: int):
 
 
 @pytest.mark.smoke
-def test_ctx_safety_passes_when_requested_equals_server(monkeypatch, capsys):
-    """requested == server n_ctx → SAFE,放行 (exit 0)。"""
-    monkeypatch.setenv("AICODE_MODEL", "custom-model")
-    monkeypatch.setenv("AICODE_N_CTX", "65536")
-    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
-    monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
-    monkeypatch.setattr(
-        ctx.gpu_safety, "check_safety", _server_verdict_factory("SAFE", 65536)
-    )
+@pytest.mark.parametrize("requested", [65536, 32768])
+def test_ctx_gate_passes_when_requested_is_within_server_capacity(monkeypatch, requested):
+    """requested <= server n_ctx → 放行。
 
-    assert ctx.main() == 0
-    out = capsys.readouterr().out
-    assert "SAFE" in out
-    assert "<= server n_ctx=65536" in out
-
-
-@pytest.mark.smoke
-def test_ctx_safety_passes_when_requested_below_server(monkeypatch, capsys):
-    """requested < server n_ctx → SAFE,放行 (exit 0)。
-
-    「小於」不是安全問題(不截斷,只是沒用滿 server 容量),不該擋。正常情況下
-    aicode 會自動把 requested 帶成 == server,這條主要保障使用者手動設小一點時
-    不會被無謂擋住,也是把舊版 e129d48「小於就 refuse」死鎖拿掉的回歸測試。
+    「小於」不是安全問題(不截斷,只是沒用滿 server 容量),不該擋 —— 這是把舊版
+    e129d48「小於就 refuse」死鎖拿掉的回歸測試。
     """
-    monkeypatch.setenv("AICODE_MODEL", "custom-model")
-    monkeypatch.setenv("AICODE_N_CTX", "32768")
-    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
-    monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
-    monkeypatch.setattr(
-        ctx.gpu_safety, "check_safety", _server_verdict_factory("SAFE", 65536)
-    )
+    monkeypatch.setattr(gpu_safety, "check_safety", _verdict_factory("SAFE", 65536))
+    result = client_preflight.Preflight(root=Path("/tmp"))
 
-    assert ctx.main() == 0
-    out = capsys.readouterr().out
-    assert "SAFE" in out
-    assert "<= server n_ctx=65536" in out
-    assert "refuse to start" not in out
+    client_preflight.check_ctx_safety(result, _FakeProfile(), requested)
 
 
 @pytest.mark.smoke
-def test_ctx_safety_unsafe_allows_with_accept_risk(monkeypatch, capsys):
-    """requested > server n_ctx 但設了 AICODE_ACCEPT_CTX_RISK=1 → 放行 (exit 0)。"""
-    monkeypatch.setenv("AICODE_MODEL", "custom-model")
-    monkeypatch.setenv("AICODE_N_CTX", "65536")
-    monkeypatch.setenv("AICODE_ACCEPT_CTX_RISK", "1")
-    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
-    monkeypatch.setattr(
-        ctx.gpu_safety, "check_safety", _server_verdict_factory("UNSAFE", 8192)
-    )
+def test_ctx_gate_refuses_when_requested_exceeds_server(monkeypatch):
+    """requested > server n_ctx → 截斷風險,擋住啟動並說出怎麼修。"""
+    monkeypatch.setattr(gpu_safety, "check_safety", _verdict_factory("UNSAFE", 8192))
+    result = client_preflight.Preflight(root=Path("/tmp"))
 
-    assert ctx.main() == 0
-    out = capsys.readouterr().out
-    assert "UNSAFE" in out
-    assert "AICODE_ACCEPT_CTX_RISK=1 已設" in out
+    with pytest.raises(client_preflight.PreflightError) as excinfo:
+        client_preflight.check_ctx_safety(result, _FakeProfile(), 65536)
+
+    message = str(excinfo.value)
+    assert "8192" in message
+    assert "set_config.sh" in message
 
 
 @pytest.mark.smoke
-def test_ctx_safety_unsafe_when_requested_above_server(monkeypatch, capsys):
-    """requested > server n_ctx → UNSAFE (截斷風險),擋住 (exit 2)。"""
-    monkeypatch.setenv("AICODE_MODEL", "custom-model")
-    monkeypatch.setenv("AICODE_N_CTX", "65536")
-    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
-    monkeypatch.delenv("AICODE_ACCEPT_CTX_RISK", raising=False)
-    monkeypatch.setattr(
-        ctx.gpu_safety, "check_safety", _server_verdict_factory("UNSAFE", 8192)
-    )
+def test_ctx_gate_is_non_blocking_when_the_server_cannot_be_observed(monkeypatch):
+    """UNKNOWN(server 沒起來 / 沒回 /props)只警告不擋 —— 否則沒開 server 就進不去。"""
+    monkeypatch.setattr(gpu_safety, "check_safety", _verdict_factory("UNKNOWN", None))
+    result = client_preflight.Preflight(root=Path("/tmp"))
 
-    assert ctx.main() == 2
-    out = capsys.readouterr().out
-    assert "UNSAFE" in out
-    assert "8192" in out
-    assert "set_config.sh" in out
-    assert "refuse to start" in out
+    client_preflight.check_ctx_safety(result, _FakeProfile(), 65536)
 
 
 @pytest.mark.smoke
-def test_ctx_safety_fails_loud_when_env_missing(monkeypatch, capsys):
-    """CodeTrail 不內建主模型: AICODE_MODEL 未設時必須 fail-loud (exit 2)。"""
-    monkeypatch.delenv("AICODE_MODEL", raising=False)
-    monkeypatch.delenv("AICODE_N_CTX", raising=False)
-    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
+def test_the_ctx_gate_has_no_environment_escape_hatch(monkeypatch):
+    """殼層裡的舊逃生口一律無效 —— 這是「設定不來自環境變數」的守門。
 
-    called = {"hit": False}
-
-    def fake_check_safety(*args, **kwargs):
-        called["hit"] = True
-        return _unknown_verdict(0)
-
-    monkeypatch.setattr(ctx.gpu_safety, "check_safety", fake_check_safety)
-
-    assert ctx.main() == 2
-    assert called["hit"] is False, "AICODE_MODEL 未設時不該呼叫 check_safety"
-    out = capsys.readouterr().out
-    assert "AICODE_MODEL 未設" in out
-    assert "refuse to start" in out
-
-
-@pytest.mark.smoke
-def test_ctx_safety_fails_loud_on_placeholder_model(monkeypatch, capsys):
-    """值是 `<CODE_MODEL>` 之類 placeholder 也要 fail-loud。"""
-    monkeypatch.setenv("AICODE_MODEL", "<CODE_MODEL>")
-    monkeypatch.delenv("AICODE_N_CTX", raising=False)
-    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
-
-    called = {"hit": False}
-
-    def fake_check_safety(*args, **kwargs):
-        called["hit"] = True
-        return _unknown_verdict(0)
-
-    monkeypatch.setattr(ctx.gpu_safety, "check_safety", fake_check_safety)
-
-    assert ctx.main() == 2
-    assert called["hit"] is False
-    out = capsys.readouterr().out
-    assert "placeholder" in out
-
-
-@pytest.mark.smoke
-def test_ctx_safety_disable_short_circuits_even_without_model(monkeypatch, capsys):
-    """AICODE_CTX_SAFETY_DISABLE=1 時, 即使沒設 AICODE_MODEL 也 exit 0 (CI / 緊急逃生)。"""
-    monkeypatch.delenv("AICODE_MODEL", raising=False)
+    舊 CLI 認 `AICODE_CTX_SAFETY_DISABLE=1`(整個閘短路)與
+    `AICODE_ACCEPT_CTX_RISK=1`(UNSAFE 照樣放行)。兩個都刪了,所以留在殼層
+    (或 `~/.bashrc`)的殘留值不得把一個會靜默截斷 prompt 的設定放行。
+    """
     monkeypatch.setenv("AICODE_CTX_SAFETY_DISABLE", "1")
-    assert ctx.main() == 0
-    out = capsys.readouterr().out
-    assert "disabled via AICODE_CTX_SAFETY_DISABLE" in out
+    monkeypatch.setenv("AICODE_ACCEPT_CTX_RISK", "1")
+    monkeypatch.setattr(gpu_safety, "check_safety", _verdict_factory("UNSAFE", 8192))
+    result = client_preflight.Preflight(root=Path("/tmp"))
+
+    with pytest.raises(client_preflight.PreflightError):
+        client_preflight.check_ctx_safety(result, _FakeProfile(), 65536)
 
 
 @pytest.mark.smoke
-def test_ctx_safety_rejects_invalid_canonical_n_ctx(monkeypatch, capsys):
-    monkeypatch.setenv("AICODE_MODEL", "custom-model")
-    monkeypatch.setenv("AICODE_N_CTX", "not-a-number")
-    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
+def test_the_ctx_gate_asks_the_endpoint_from_the_profile_not_the_environment(monkeypatch):
+    """base_url 來自 deployment profile,不是 `AICODE_LLAMA_BASE_URL`。
 
-    assert ctx.main() == 2
-    out = capsys.readouterr().out
-    assert "AICODE_N_CTX" in out
-    assert "refuse to start" in out
-
-
-@pytest.mark.smoke
-def test_ctx_safety_uses_resolved_model_from_env(monkeypatch):
-    """新版 check_safety(requested_ctx, base_url=...) 簽名 — 不再吃 model。
-    這個 test 確認 ctx_safety_check.main 走到 gpu_safety.check_safety 並帶入正確
-    requested ctx 與 base_url。
+    舊 CLI 讀那個環境變數;殼層殘留一個指向別台機器的值,等於拿別人的 n_ctx
+    來判自己的閘。
     """
-    monkeypatch.setenv("AICODE_MODEL", "custom-model")
-    monkeypatch.setenv("AICODE_N_CTX", "65536")
-    monkeypatch.delenv("AICODE_CTX_SAFETY_DISABLE", raising=False)
-    monkeypatch.setenv("AICODE_LLAMA_BASE_URL", "http://example.test:8080")
-
+    monkeypatch.setenv("AICODE_LLAMA_BASE_URL", "http://stale-shell:9999")
     calls: dict[str, object] = {}
 
     def fake_check_safety(requested, base_url="http://localhost:8080", **_kw):
         calls["requested"] = requested
         calls["base_url"] = base_url
-        return _unknown_verdict(requested)
+        return SafetyVerdict(
+            status="UNKNOWN",
+            requested_ctx=requested,
+            server_n_ctx=None,
+            model_path=None,
+            vram_total_gb=None,
+            vram_free_gb=None,
+            reason="test unknown",
+        )
 
-    monkeypatch.setattr(ctx.gpu_safety, "check_safety", fake_check_safety)
+    monkeypatch.setattr(gpu_safety, "check_safety", fake_check_safety)
+    result = client_preflight.Preflight(root=Path("/tmp"))
 
-    assert ctx.main() == 0
-    assert calls["requested"] == ctx.n_ctx.DEFAULT_N_CTX
-    assert calls["base_url"] == "http://example.test:8080"
-
-
-# ── 原 test_ctx_resolution.py:n_ctx 的多來源優先序,以及 server ctx 自動偵測 ──
-
-
-def test_canonical_n_ctx_wins_over_legacy_values():
-    resolved = n_ctx.resolve_n_ctx(
-        {
-            "AICODE_N_CTX": "49152",
-            "AICODE_DYNAMIC_NUM_CTX_MAX": "32768",
-            "AICODE_NUM_CTX": "131072",
-        }
+    client_preflight.check_ctx_safety(
+        result, _FakeProfile(base_url="http://profile-host:8080"), 65536
     )
 
-    assert resolved.value == 49152
-    assert resolved.source == "AICODE_N_CTX"
-    assert resolved.legacy is False
+    assert calls == {"requested": 65536, "base_url": "http://profile-host:8080"}
 
 
-def test_old_dynamic_max_remains_a_compatibility_alias():
-    resolved = n_ctx.resolve_n_ctx({"AICODE_DYNAMIC_NUM_CTX_MAX": "32768"})
+# ── n_ctx:界線檢查,以及 runtime 從主 server 觀測(client_preflight.observe_n_ctx)──
+# 原 test_ctx_resolution.py。`n_ctx.resolve_n_ctx` 那條「多來源優先序」的鏈
+# (AICODE_N_CTX > AICODE_DYNAMIC_NUM_CTX_MAX > default,AICODE_NUM_CTX 不升格)
+# 已隨那些環境變數一起刪除:runtime 的 n_ctx 只有一個來源 —— 主 llama-server
+# 啟動時的 `-c`,由 preflight 觀測後以 argv 交給每一個元件。
 
-    assert resolved.value == 32768
-    assert resolved.legacy is True
+
+@pytest.mark.parametrize("value", [1, 4096, n_ctx.DEFAULT_N_CTX, n_ctx.MAX_N_CTX])
+def test_valid_n_ctx_values_pass_through(value):
+    assert n_ctx.validate_n_ctx(value) == value
 
 
-def test_stale_aicode_num_ctx_is_not_promoted_to_runtime_budget():
-    resolved = n_ctx.resolve_n_ctx(
-        {"AICODE_NUM_CTX": "131072"},
-        default=65536,
-        default_source="deployment profile main.ctx",
+@pytest.mark.parametrize("value", [0, -1, n_ctx.MAX_N_CTX + 1, True, 4096.0, "4096", None])
+def test_out_of_range_or_wrong_typed_n_ctx_fails_loud(value):
+    """不 clamp、不回退預設 —— 靜默改小就是使用者以為在用 64k 其實在用 4k。"""
+    with pytest.raises(ValueError):
+        n_ctx.validate_n_ctx(value)
+
+
+@pytest.mark.smoke
+def test_the_n_ctx_module_has_no_environment_seam():
+    """`n_ctx` 不得再讀任何環境變數。
+
+    那條鏈的症狀是 llama-server 從 prompt 前面靜默截掉(模型忘記前面說過什麼),
+    不是一個錯誤訊息,所以靜態釘住比較實在。
+    """
+    source = (REPO_ROOT / "n_ctx.py").read_text(encoding="utf-8")
+    code = "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
     )
-
-    assert resolved.value == 65536
-    assert resolved.source == "deployment profile main.ctx"
-
-
-@pytest.mark.parametrize("raw", ["0", "-1", "abc", "1048577"])
-def test_invalid_canonical_n_ctx_is_rejected(raw):
-    with pytest.raises(ValueError, match="AICODE_N_CTX"):
-        n_ctx.resolve_n_ctx({"AICODE_N_CTX": raw})
+    assert "environ" not in code
+    assert "getenv" not in code
+    assert not hasattr(n_ctx, "resolve_n_ctx")
 
 
-def test_blank_canonical_env_uses_default():
-    assert n_ctx.resolve_n_ctx({"AICODE_N_CTX": " "}).value == n_ctx.DEFAULT_N_CTX
+def test_observed_n_ctx_comes_from_the_running_server(monkeypatch):
+    monkeypatch.setattr(
+        gpu_safety,
+        "query_server_info",
+        lambda _url: gpu_safety.ServerInfo(base_url=_url, n_ctx=65536),
+    )
+    result = client_preflight.Preflight(root=Path("/tmp"))
+
+    assert client_preflight.observe_n_ctx(result, _FakeProfile(ctx=32768)) == 65536
+    assert result.n_ctx == 65536
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        pytest.param(lambda _url: None, id="no-server"),
+        pytest.param(
+            lambda _url: (_ for _ in ()).throw(OSError("offline")), id="query-raises"
+        ),
+    ],
+)
+def test_an_unobservable_server_falls_back_to_the_configured_ctx(monkeypatch, query):
+    """server 讀不到不是啟動失敗 —— 退回 deployment profile 的 main.ctx。"""
+    monkeypatch.setattr(gpu_safety, "query_server_info", query)
+    result = client_preflight.Preflight(root=Path("/tmp"))
+
+    assert client_preflight.observe_n_ctx(result, _FakeProfile(ctx=32768)) == 32768
+
+
+def test_no_server_and_no_configured_ctx_fails_loud(monkeypatch):
+    monkeypatch.setattr(gpu_safety, "query_server_info", lambda _url: None)
+    result = client_preflight.Preflight(root=Path("/tmp"))
+
+    with pytest.raises(client_preflight.PreflightError, match="main.ctx"):
+        client_preflight.observe_n_ctx(result, _FakeProfile(ctx=0))
 
 
 def test_dynamic_sizing_never_exceeds_a_small_main_n_ctx(monkeypatch):
-    import agent
+    """動態 sizing 不得超過主 n_ctx —— 而且看的是 **runtime** 的那一個。
 
-    monkeypatch.setattr(agent, "N_CTX", 1024)
+    2026-09-04:改成 monkeypatch `config.N_CTX` 而不是 `agent.N_CTX`。行為為什麼
+    該變:`mcp_server --n-ctx <觀測值>` 會在 `agent` import **之後**覆寫
+    `config.N_CTX`,所以 import 期的快照看不到它;快照的症狀是動態 sizing 用
+    deployment profile 的舊值當上限,然後 llama-server 從 prompt 前面靜默截掉。
+    """
+    import agent
+    import config
+
+    monkeypatch.setattr(config, "N_CTX", 1024)
     monkeypatch.setattr(agent, "DYNAMIC_NUM_CTX_MIN", 16384)
 
     assert agent._compute_dynamic_num_ctx([{"role": "user", "content": "hello"}]) == 1024
-
-
-# --------------------------------------------------------------------------
-# 併自 tests/test_resolve_server_ctx.py:scripts/resolve_server_ctx.py。
-# --------------------------------------------------------------------------
-def test_prints_server_n_ctx(monkeypatch, capsys):
-    server = resolve_server_ctx.gpu_safety.ServerInfo(
-        base_url="http://localhost:8080",
-        n_ctx=65536,
-    )
-    monkeypatch.setattr(
-        resolve_server_ctx.gpu_safety,
-        "query_server_info",
-        lambda _url: server,
-    )
-
-    assert resolve_server_ctx.main() == 0
-    captured = capsys.readouterr()
-    assert captured.out == "65536\n"
-    assert captured.err == ""
-
-
-def test_missing_server_is_non_blocking_and_prints_no_value(monkeypatch, capsys):
-    monkeypatch.setattr(
-        resolve_server_ctx.gpu_safety,
-        "query_server_info",
-        lambda _url: None,
-    )
-
-    assert resolve_server_ctx.main() == 0
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "無法" in captured.err
-
-
-def test_query_exception_is_non_blocking_and_prints_no_value(monkeypatch, capsys):
-    def fail(_url):
-        raise OSError("offline")
-
-    monkeypatch.setattr(resolve_server_ctx.gpu_safety, "query_server_info", fail)
-
-    assert resolve_server_ctx.main() == 0
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "offline" in captured.err
 
 
 # ── 原 test_llama_sampling.py:取樣參數釘住(llama_client / config / agent 三層)──
@@ -1689,12 +1615,22 @@ def test_config_chat_sampling_defaults(monkeypatch):
         importlib.reload(config)
 
 
-def test_config_chat_sampling_env_override(monkeypatch):
+@pytest.mark.smoke
+def test_chat_sampling_has_no_environment_override(monkeypatch):
+    """取樣值是 repo 常數,殼層改不動。
+
+    2026-09-04:原本這條驗的是 `AICODE_CHAT_TOP_K=40` 會蓋過預設。行為為什麼
+    該變:取樣值直接決定模型會不會杜撰具體事實(這整段的存在理由),而一個
+    殼層變數等於每台機器、每個 session 都可能不同,而且沒有任何地方會顯示它。
+    改 repo 常數 = 所有使用者一致。
+    """
+    monkeypatch.setenv("AICODE_CHAT_TOP_K", "40")
+    monkeypatch.setenv("AICODE_CHAT_TOP_P", "0.99")
+    monkeypatch.setenv("AICODE_CHAT_MIN_P", "0.5")
+    before = (config.CHAT_TOP_K, config.CHAT_TOP_P, config.CHAT_MIN_P)
     try:
-        with monkeypatch.context() as patch:
-            patch.setenv("AICODE_CHAT_TOP_K", "40")
-            importlib.reload(config)
-            assert config.CHAT_TOP_K == 40
+        importlib.reload(config)
+        assert (config.CHAT_TOP_K, config.CHAT_TOP_P, config.CHAT_MIN_P) == before
     finally:
         importlib.reload(config)
 
@@ -1742,15 +1678,35 @@ def test_agent_call_pins_chat_sampling(monkeypatch):
 
 
 @pytest.fixture
-def config_env(monkeypatch):
-    """Reload 測試結束後，以已還原的 process env 重建 config module。"""
-    with monkeypatch.context() as patch:
-        yield patch
+def config_home(monkeypatch, tmp_path):
+    """把 HOME 指到 tmp 再 reload `config`,結束後以真正的 HOME 重建。
+
+    2026-09-04:原本的 `config_env` 是設 `AICODE_MODEL_REGISTRY` 之類的環境變數
+    再 reload。行為為什麼該變:`config` 現在只交 HOME 給解析器,設定一律來自
+    `~/.config/codetrail/{deployment,models}.json` —— 測試的接縫因此只剩 HOME。
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    cfg_dir = tmp_path / ".config" / "codetrail"
+    cfg_dir.mkdir(parents=True)
+
+    def write(*, models: dict | None = None, main_model: str | None = None) -> None:
+        if models is not None:
+            (cfg_dir / "models.json").write_text(json.dumps(models), encoding="utf-8")
+        services = {"main": {"model": main_model}} if main_model is not None else {}
+        (cfg_dir / "deployment.json").write_text(
+            json.dumps({"schema_version": 1, "profile": "defaults", "services": services}),
+            encoding="utf-8",
+        )
+        importlib.reload(config)
+
+    yield write
+    monkeypatch.undo()
     importlib.reload(config)
 
 
 def test_model_strings_non_empty():
-    # MODEL 由 AICODE_MODEL / opencode.json 動態解析; CodeTrail 不內建預設,
+    # MODEL 由 deployment.json 的 main.model 解析; CodeTrail 不內建預設,
     # 沒設好時是 "" — 這是刻意的 fail-loud 狀態。型別仍應是 str。
     # 真實 LLM 呼叫端必須先呼 config.require_main_model() (沒設就 raise)。
     assert isinstance(config.MODEL, str)
@@ -1768,77 +1724,86 @@ def test_llama_server_urls_are_strings():
         assert v.startswith("http://") or v.startswith("https://"), f"{attr}={v!r}"
 
 
-def test_model_registry_loads_from_env(config_env):
-    """AICODE_MODEL_REGISTRY env (JSON 字串) 會被 _load_model_registry 吃進來。"""
-    config_env.setenv("AICODE_MODEL_REGISTRY", '{"foo": "/m/foo.gguf"}')
-    config_env.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
-    importlib.reload(config)
+def test_model_registry_loads_from_models_json(config_home):
+    """`~/.config/codetrail/models.json` 是 registry 的**唯一**來源。"""
+    config_home(models={"foo": "/m/foo.gguf"}, main_model="foo")
+
     assert config.MODEL_REGISTRY == {"foo": "/m/foo.gguf"}
 
 
-def test_resolve_model_path_uses_registry(config_env, tmp_path):
+@pytest.mark.smoke
+def test_the_model_registry_ignores_the_shell(config_home, monkeypatch):
+    """殼層裡的 `AICODE_MODEL_REGISTRY` 不得蓋過 models.json。
+
+    那兩個變數是**啟動核心**(`~/start.sh` → launcher)的契約,兩份安裝共用一台
+    機器時另一份會設它們;`config` 只交 HOME 給解析器,所以這一側看不到。
+    """
+    monkeypatch.setenv("AICODE_MODEL_REGISTRY", '{"shell": "/m/shell.gguf"}')
+    monkeypatch.setenv("AICODE_MODEL_REGISTRY_FILE", "/nonexistent/registry.json")
+    config_home(models={"foo": "/m/foo.gguf"}, main_model="foo")
+
+    assert config.MODEL_REGISTRY == {"foo": "/m/foo.gguf"}
+
+
+def test_resolve_model_path_uses_registry(config_home, tmp_path):
     """有 registry 命中時走 registry 路徑。"""
     gguf = tmp_path / "foo.gguf"
     gguf.write_text("not-a-real-gguf")
-    config_env.setenv("AICODE_MODEL_REGISTRY", f'{{"foo": "{gguf}"}}')
-    config_env.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
-    importlib.reload(config)
+    config_home(models={"foo": str(gguf)}, main_model="foo")
+
     assert config.resolve_model_path("foo") == str(gguf)
 
 
-def test_resolve_model_path_passthrough_for_existing_file(config_env, tmp_path):
+def test_resolve_model_path_passthrough_for_existing_file(config_home, tmp_path):
     """registry 沒命中但路徑存在 → 直接用路徑。"""
     gguf = tmp_path / "bar.gguf"
     gguf.write_text("not-a-real-gguf")
-    config_env.delenv("AICODE_MODEL_REGISTRY", raising=False)
-    config_env.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
-    importlib.reload(config)
+    config_home(models={}, main_model=str(gguf))
+
     assert config.resolve_model_path(str(gguf)) == str(gguf)
 
 
-def test_require_main_model_fails_when_unset(monkeypatch, tmp_path):
+def test_require_main_model_fails_when_unset(config_home):
     """MODEL 為空時 require_main_model 必須 raise (fail-loud, 不 fallback)。"""
-    monkeypatch.delenv("AICODE_MODEL", raising=False)
-    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    config_home(models={})
+
     with pytest.raises(RuntimeError) as exc:
         config.require_main_model()
-    assert "AICODE_MODEL" in str(exc.value)
+    assert "set_config" in str(exc.value)
 
 
-def test_require_main_model_returns_value_when_set(monkeypatch):
+def test_require_main_model_returns_value_when_set(config_home):
     """bare name 形式直接回。"""
-    monkeypatch.setenv("AICODE_MODEL", "some-model-tag")
+    config_home(models={"some-model-tag": "/m/x.gguf"}, main_model="some-model-tag")
+
     assert config.require_main_model() == "some-model-tag"
 
 
-def test_require_main_model_rejects_external_provider(monkeypatch):
-    """openai/ ollama/ anthropic/ 等外部 provider prefix 一律拒絕。"""
-    for value in ("anthropic/foo", "openai/gpt-4", "ollama/qwen3"):
-        monkeypatch.setenv("AICODE_MODEL", value)
-        with pytest.raises(RuntimeError) as exc:
-            config.require_main_model()
-        assert "外部 provider prefix" in str(exc.value) or "provider prefix" in str(exc.value)
-
-
-def test_require_main_model_strips_custom_provider(monkeypatch):
-    """custom-provider/bare 形式會 strip,只留下 bare model name。"""
-    monkeypatch.setenv("AICODE_MODEL", "myprovider/qwen3-coder-32b")
-    assert config.require_main_model() == "qwen3-coder-32b"
-
-
-def test_require_main_model_accepts_gguf_path(monkeypatch):
+def test_require_main_model_accepts_gguf_path(config_home):
     """GGUF 絕對路徑也是合法的主模型形式。"""
-    monkeypatch.setenv("AICODE_MODEL", "/models/foo.gguf")
+    config_home(models={}, main_model="/models/foo.gguf")
+
     assert config.require_main_model() == "/models/foo.gguf"
 
 
-def test_require_main_model_path_fails_when_file_missing(monkeypatch):
+@pytest.mark.smoke
+def test_require_main_model_ignores_a_polluted_shell(config_home, monkeypatch):
+    """殼層裡的 `AICODE_MODEL` 不得決定客戶端跑哪一顆模型。
+
+    兩份安裝共用一台機器時,另一份的 `~/start.sh` 會 export 它;讀進來就是
+    「使用者以為在跑 A、實際在跑 B」,而且完全無聲。
+    """
+    monkeypatch.setenv("AICODE_MODEL", "shell-leftover")
+    config_home(models={}, main_model="/models/from-profile.gguf")
+
+    assert config.require_main_model() == "/models/from-profile.gguf"
+    assert config.MODEL == "/models/from-profile.gguf"
+
+
+def test_require_main_model_path_fails_when_file_missing(config_home):
     """resolve_model_path 解到的檔不存在時必須 raise。"""
-    monkeypatch.setenv("AICODE_MODEL", "definitely-not-a-real-model")
-    monkeypatch.delenv("AICODE_MODEL_REGISTRY", raising=False)
-    monkeypatch.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
+    config_home(models={}, main_model="definitely-not-a-real-model")
+
     with pytest.raises(RuntimeError) as exc:
         config.require_main_model_path()
     assert "找不到對應的 GGUF" in str(exc.value)
@@ -1911,26 +1876,88 @@ def test_get_answer_rules_returns_string():
     assert isinstance(s2, str) and "BIN" in s2 and "ELF" in s2
 
 
-def test_rerank_fallback_policy_defaults_to_error(config_env):
-    config_env.delenv("AICODE_RERANK_FALLBACK_POLICY", raising=False)
-    importlib.reload(config)
+def test_rerank_fallback_policy_defaults_to_error():
+    """預設 fail-loud:reranker 掛了就說出來,不靜默換一種排序。"""
     assert config.RERANK_FALLBACK_POLICY == "error"
 
 
-def test_rerank_fallback_policy_rejects_unknown_value():
-    import os
-    import subprocess
-    import sys
+@pytest.mark.smoke
+def test_rerank_fallback_policy_ignores_the_shell(monkeypatch):
+    """它是 client.json 的鍵,不是環境變數。
 
-    env = {**os.environ, "AICODE_RERANK_FALLBACK_POLICY": "not-a-policy"}
-    proc = subprocess.run(
-        [sys.executable, "-c", "import config"],
-        cwd=str(REPO_ROOT),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
+    2026-09-04:原本這條驗的是 `AICODE_RERANK_FALLBACK_POLICY=not-a-policy` 會
+    讓 `import config` fail-loud。行為為什麼該變:那個變數刪了(值改由
+    `client_config.apply_to_config()` 從 client.json 推進來,未知值由那邊的
+    loader fail-loud);留著檢查等於留著那個入口。
+    """
+    monkeypatch.setenv("AICODE_RERANK_FALLBACK_POLICY", "main_model")
+    try:
+        importlib.reload(config)
+        assert config.RERANK_FALLBACK_POLICY == "error"
+    finally:
+        importlib.reload(config)
+
+
+def test_rerank_fallback_policy_rejects_unknown_value_in_client_json(tmp_path):
+    """client.json 寫了不合法的值 → loader fail-loud,不靜默退回預設。"""
+    import client_config
+
+    path = tmp_path / "client.json"
+    path.write_text(
+        json.dumps({"schema": 1, "rerank_fallback_policy": "not-a-policy"}),
+        encoding="utf-8",
     )
-    assert proc.returncode != 0
-    assert "AICODE_RERANK_FALLBACK_POLICY" in proc.stderr
+    path.chmod(0o600)
+    tmp_path.chmod(0o700)
+
+    with pytest.raises(client_config.ClientConfigError, match="rerank_fallback_policy"):
+        client_config.load_client_settings_from(path)
+
+
+
+
+# ── runtime n_ctx 的覆寫:`mcp_server --n-ctx <觀測值>` 之後,所有讀者都要看到新值 ──
+
+
+@pytest.mark.smoke
+def test_the_runtime_n_ctx_override_reaches_every_reader(monkeypatch):
+    """`config.set_runtime_n_ctx()` 必須同時改掉三個相容 alias 與所有動態讀者。
+
+    真實觸發:deployment.json 寫 `main.ctx=131072`,但 server 實際以 `-c 65536`
+    起來。preflight 觀測到 65536 並以 `--n-ctx 65536` 交給 MCP;MCP 覆寫
+    `config.N_CTX`。任何在 import 期做過快照的讀者(以前是 `utils.N_CTX` 與
+    `agent.N_CTX`,都是 `from config import N_CTX`)仍然用 131072 當上限 ——
+    症狀是 llama-server 從 prompt 前面靜默截掉,不是一個錯誤訊息。
+    """
+    import agent
+    import utils
+
+    monkeypatch.setattr(config, "N_CTX", 131072)
+    monkeypatch.setattr(config, "NUM_CTX", 131072)
+    monkeypatch.setattr(config, "NUM_CTX_FULL_MODE", 131072)
+    monkeypatch.setattr(config, "DYNAMIC_NUM_CTX_MAX", 131072)
+
+    # 刻意用一個**不等於** import 期預設(deployment profile 的 main.ctx)的值:
+    # 相等的話,做過快照的讀者也會剛好答對,這條就白測了。
+    observed = 40960
+    assert observed != n_ctx.DEFAULT_N_CTX
+    config.set_runtime_n_ctx(observed)
+
+    assert config.N_CTX == observed
+    assert config.NUM_CTX == observed
+    assert config.NUM_CTX_FULL_MODE == observed
+    assert config.DYNAMIC_NUM_CTX_MAX == observed
+    # 兩個曾經做過 import 期快照的讀者。
+    assert utils._default_ctx_budget() == observed
+    assert (
+        agent._compute_dynamic_num_ctx([{"role": "user", "content": "x" * 10}]) <= observed
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("bad", [0, -1, n_ctx.MAX_N_CTX + 1, True, "65536", None])
+def test_an_invalid_runtime_n_ctx_override_fails_loud(monkeypatch, bad):
+    """壞值不得靜默套用:MCP 拿到之後會 exit 2,而不是用一個荒謬的上限跑下去。"""
+    monkeypatch.setattr(config, "N_CTX", 65536)
+    with pytest.raises(ValueError):
+        config.set_runtime_n_ctx(bad)

@@ -65,7 +65,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 修改/驗證 | `git_diff(path=None, staged=False)` | 看修改內容，不需要用 `run_command` 跑 git；非 git 專案同樣回跳過通知 |
 | 修改/驗證 | `apply_patch(diff, dry_run=False)` | 套 SEARCH/REPLACE 或 unified diff（同一次只能一種；參數已是字串，不要包 fence），會真的寫檔；最多 5 個檔案、單檔 200 行（udiff 算 added+removed；S/R 算 payload budget = SEARCH+REPLACE 行數，不是同一種計數）；UTF-8 strict，BOM／CRLF／檔尾換行／權限原樣保留，mixed newline 與 symlink 拒絕；套用後只做唯讀 syntax check（advisory、三態、失敗不回滾）；細節見[apply_patch 的兩種格式](#apply_patch-的兩種格式) |
 | 修改/驗證 | `run_lint(path, fix=True)` | 對單一檔案跑格式化/lint；`fix=False` 走 check-only(不改檔) |
-| 修改/驗證 | `run_command(cmd, timeout=60)` | 跑白名單命令；timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），預設 60。預設白名單 = 測試／靜態命令；build 命令(make/cmake/ninja/meson/bazel)需設 `AI_CODE_ENABLE_BUILD_COMMANDS=1`；git 不在白名單（用 `git_status` / `git_diff`） |
+| 修改/驗證 | `run_command(cmd, timeout=60)` | 跑白名單命令；timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），預設 60。預設白名單 = 測試／靜態命令；build 命令(make/cmake/ninja/meson/bazel)需在 `client.json` 設 `"build_commands": true`；git 不在白名單（用 `git_status` / `git_diff`） |
 | 行為教訓 | `record_lesson(rule, scope="project")` | 你糾正模型行為後,把糾正「提案」成一條行為規則;經你核准(permission ask)寫入 lessons store,之後 session 注入 context([docs/lessons.md](lessons.md)) |
 
 ### `code_rag_search` 四種模式
@@ -101,7 +101,7 @@ graph 首次建置是顯式動作。DB 不存在或 schema 過舊時，錯誤訊
 Python、CodeTrail `code_graph.py` 絕對路徑與實際 project root 的可複製命令；手動形式為：
 
 ```bash
-<MCP_PYTHON> <CODETRAIL_REPO>/code_graph.py --root <AICODE_ROOT>
+<MCP_PYTHON> <CODETRAIL_REPO>/code_graph.py --root <SANDBOX_ROOT>
 ```
 
 舊版 DB 可用同一命令 transactionally 升級；DB 損壞則先移到不會 commit 的備份位置再建。
@@ -113,7 +113,7 @@ Code-RAG 索引預設排除 ignored、虛擬環境、`third_party` / `vendor` / 
 唯讀、離線且預設不印路徑的統計：
 
 ```bash
-python3 scripts/index_stats.py --root <AICODE_ROOT>
+python3 scripts/index_stats.py --root <SANDBOX_ROOT>
 ```
 
 部署層需要額外 include / exclude 時才使用
@@ -198,7 +198,7 @@ figure chunk 會帶所在章節與 caption（`Table 3-1 …`）。兩者只當�
 ```
 
 它在**任何 VL 呼叫、embedding 與 KB 寫入之前**算完就結束,零寫入。超過上限會直接停下並
-指出是哪一項(上限是 `config.py` 的 `FIGURE_*`,可用同名 `AICODE_FIGURE_*` env 覆寫)。
+指出是哪一項(上限是 `config.py` 的 `FIGURE_*` 常數;改它是改 repo)。
 MCP 每次工具呼叫有 client timeout,開始之後才超時等於沒有提示 —— 所以先估。
 
 preflight 涵蓋所有結構化候選，包含純 raster 的分類、雙樣本抽取與 image-token 估算。
@@ -262,7 +262,7 @@ native lane(原生表格,零 VL 呼叫)**沒有任何模型影像輸入**,它的
 |---|---|---|
 | `summary`（預設） | Key Facts（架構 / 型別 / entry 對應的 symbol / stripped / linkage / symbol 統計含 LOCAL·UND·size=0 / relocation 數 / DWARF / 記憶體估算）、ELF header、LOAD segment、`.dynamic`、`.modinfo`、entry 反組譯（失敗會列原因）、Top functions（含 LOCAL/static）、imports、relocation 統計、DWARF CU、字串分類（version / diagnostic / format / url / path / command / config） | 不用 |
 | `symbols` | 完整 symbol 表：LOCAL / GLOBAL / WEAK、UND、size=0 全列，欄位 addr / size / type / bind / section / name（C++ 名稱附 demangle） | regex（`uart`）、篩選（`bind:LOCAL type:FUNC`、`ndx:UND`、`section:.text`、`table:.dynsym`，可混用）、`0x位址` = 反查落在哪個 symbol |
-| `disasm` | 反組譯；工具依序 objdump → 跨架構 `<triplet>-objdump` → capstone；全部不行時列出每個工具的失敗原因與補救（安裝對應 binutils / `pip install capstone` / 環境變數 `AICODE_OBJDUMP`） | symbol 名、`0x位址`、`0x起-0x迄`、`0x位址+bytes`；省略 = entry point；`.o/.ko` 可加 `section:.init.text`；`limit` = 指令數（預設 48、上限 1000） |
+| `disasm` | 反組譯；工具依序 objdump → 跨架構 `<triplet>-objdump` → capstone；全部不行時列出每個工具的失敗原因與補救（安裝對應 binutils / `pip install capstone` / `client.json` 的 `"objdump"`） | symbol 名、`0x位址`、`0x起-0x迄`、`0x位址+bytes`；省略 = entry point；`.o/.ko` 可加 `section:.init.text`；`limit` = 指令數（預設 48、上限 1000） |
 | `dwarf` | 無 target：CU 列表（producer / 語言 / 位址範圍）與函式統計；regex：函式（low/high pc、來源檔:行、external/inline）＋ struct / union / class / enum / typedef 成員（offset、型別、bit field）；`0x位址`：對應來源檔:行與函式 | regex、`0x位址`、`kind:func` / `kind:type` |
 | `strings` | 全部可讀字串（ASCII 全檔 + UTF-16LE 前 4MB）含 offset、所屬 section、分類 | regex、`cat:diagnostic`（或 version / format / url / path / command / config / other）、`section:.rodata`、`min:12`、`enc:utf16` |
 | `sections` | 全部 section（type / addr / offset / size / flags / 所屬 segment）；指定 section 時給 hex dump + 字串 + 內含 symbol | section 名、`0x位址`；`limit` = dump bytes（預設 512、上限 4096） |
@@ -273,7 +273,7 @@ native lane(原生表格,零 VL 呼叫)**沒有任何模型影像輸入**,它的
 | `headers` | ELF header、全部 program headers、section→segment、notes、`.comment`、`.modinfo` | 不用 |
 
 - 解析後端：優先 **pyelftools**（`requirements.txt` 已列入）；沒裝時退回 binutils `readelf` 文字解析，報告開頭會列出這條路徑**缺失的能力**（DWARF 型別、部分函式 / 行號精度）與補救命令，不是只標一個 parser 名字。兩條路徑填同一份模型、走同一套渲染，章節與欄位一致。
-- 反組譯覆蓋：系統 `objdump` 只認得自己的架構（Ubuntu 預設 x86）；ARM / AArch64 / RISC-V / MIPS / Xtensa / ARC 韌體要裝對應的 `binutils-<triplet>`（會自動找 `arm-none-eabi-objdump` 等常見名稱）、或 `pip install capstone`（不支援 ARC / 舊版 Xtensa）、或設 `AICODE_OBJDUMP=/path/to/objdump`。找不到時報告會說是哪個架構、試過哪些工具、各自的錯誤。
+- 反組譯覆蓋：系統 `objdump` 只認得自己的架構（Ubuntu 預設 x86）；ARM / AArch64 / RISC-V / MIPS / Xtensa / ARC 韌體要裝對應的 `binutils-<triplet>`（會自動找 `arm-none-eabi-objdump` 等常見名稱）、或 `pip install capstone`（不支援 ARC / 舊版 Xtensa）、或在 `client.json` 設 `"objdump": "/path/to/objdump"`。找不到時報告會說是哪個架構、試過哪些工具、各自的錯誤。
 - `ingest_document` 對 ELF 走**長版**多視角報告（summary + 完整 symbol 表 + relocation 逐筆含 caller + DWARF CU / 函式 / 型別 + 全部分類字串 + memmap / sections / imports / dynamic），每個 view 以 `config.BIN_ELF_INGEST_MAX_CHARS`（400,000 字元）為**渲染階段的字元預算**（行容器達預算即停止收行，表格 / segment 分類這類來源都是 generator、預算用完就不再往下拉，所以各 view 在模型之外的中間資料與輸出預算成正比——模型本身的 symbol 表、字串清單、relocation 早就在記憶體裡，各有自己的安全上限；筆數上限則由「字元預算 ÷ 該 view 的最短行長」推出——symbols 一行至少 40 字元、imports 一行至少 5 字元，各自拿到不同的上限，都不可能比字元預算先到，也不會讓候選 heap / 清單長到遠超過預算能放的量），整份再以同一上限做比例分配，不受 `analyze_file` 單次 25K 的限制。沒超過上限就是完整（容器不預扣任何空間，剛好放得下的報告一個字都不少）；超過時各段**依比例截斷、各自註明**（原行數 / 字元數與該用哪個 view 分批查），不會有整段消失。`analyze_file` 的每個 view 也同樣在渲染階段以 25K 為字元預算，達到時才從尾端回收剛好夠的空間放一行說明（略過了幾行）。Cortex-M 向量表固定最多 512 筆（有向量 section 時以其大小為準）。解析層仍有安全上限並會在報告內註明：relocation 每個 section 保留前 20,000 筆（統計為全量）、DWARF 函式 30,000 個、型別 2,000 個（每個型別 256 個成員）、字串 100,000 條。
 - `target` 的 regex 只接受**正面表列的安全子集**（逐字元驗證，不是 heuristic）：字面、`.`、`[...]`、`^ $ \b`、**最上層**的 `|`（≤ 8 分支）、單一 atom 的 `* +`（合計 ≤ 1）與 `?`（合計 ≤ 3）；**不收任何群組**（`(uart|spi)_init` 請寫成 `uart_init|spi_init`——群組串接才會產生指數級的切分方式，例如 30 個連續 `(a|aa)`），也不接受 `{n,m}`、backreference、lookaround、inline flag、超過 200 字元。不在子集內的樣式會改成**字面比對**並在輸出註明原因。比對主體只看每個字串 / 名稱的前 300 個字元，所以單次比對的成本有上界（約 起點 × 分支 × 主體長 × 2^可選 ≈ 6×10⁶ 步；Python 的 `re` 沒有 timeout、不釋放 GIL，災難性回溯會卡住整個 MCP server）。另外 symbols / relocs / strings 的篩選有 20 秒預算，每一筆都檢查、零匹配也會停，逾時中止並標明結果不完整——那是「很多筆加起來太久」的保險，不是硬 timeout。
 - readelf fallback 會逐條記錄失敗的命令（timeout、非零 returncode、有輸出但解析不到），報告開頭列出，且 Key Facts 與 symbols / imports / relocs / dynamic / memmap / sections / DWARF / headers 各段都改講「讀取失敗」，不會說成「沒有 symbol / 沒有 relocation / 沒有 LOAD segment / 被 strip / 沒有 debug section」；readelf / objdump 一律以 `LC_ALL=C` 執行。
@@ -318,8 +318,8 @@ void led_toggle(void) {
 
 - 分析、解釋、推導或找原因時，先用 `code_rag_search(mode="context")` 一次取得 bounded evidence；不足才做精準 `grep_code` / `read_file`，同一 query 不重複。
 - 只想定位程式碼時，用工具 `code_rag_search` 或 `grep_code`，再用工具 `read_file`。
-- 問「誰呼叫了 X」「X 怎麼一路呼叫到 Y」時,用 `code_rag_search` 的 `mode="neighbors"`(query 放 symbol 名)/ `mode="path"`;問「這個檔直接 include 了誰」時,`mode="neighbors"` 的 query 放 repo 相對檔案路徑。回傳的關係每一步都有 `檔:行` 證據,unresolved(function pointer / macro 間接呼叫)與歧義候選(同名多定義)會明講。graph 首次建置要在終端跑一次建立命令——沒建就查 graph 模式會明確報錯,**錯誤訊息就含完整可執行的那條命令**(實際 interpreter 與絕對路徑,直接複製貼上;semantic 不受影響);建好之後查詢自動偵測檔案變更做增量更新,安裝 tree-sitter grammar 或改 `AICODE_H_LANG` 後會自動整體重建。graph 可用時先查 `neighbors`;`graph_status` 為 unavailable 時改用 `mode="context"` / `grep_code`,並把 caller coverage 標為不完整——不能因為沒看到呼叫者就推論沒有呼叫者。
-- 檔案變更偵測有一個 30 秒的快照窗(`AICODE_CODE_RAG_REFRESH_TTL`,設 0 關閉):透過 CodeTrail 工具(`apply_patch` / `run_command` / `run_lint`)寫檔會立即失效重掃;**在外部編輯器改檔**則最長 30 秒內的查詢可能還看到舊索引,屬既知取捨。
+- 問「誰呼叫了 X」「X 怎麼一路呼叫到 Y」時,用 `code_rag_search` 的 `mode="neighbors"`(query 放 symbol 名)/ `mode="path"`;問「這個檔直接 include 了誰」時,`mode="neighbors"` 的 query 放 repo 相對檔案路徑。回傳的關係每一步都有 `檔:行` 證據,unresolved(function pointer / macro 間接呼叫)與歧義候選(同名多定義)會明講。graph 首次建置要在終端跑一次建立命令——沒建就查 graph 模式會明確報錯,**錯誤訊息就含完整可執行的那條命令**(實際 interpreter 與絕對路徑,直接複製貼上;semantic 不受影響);建好之後查詢自動偵測檔案變更做增量更新,安裝 tree-sitter grammar 或改 `config.H_LANG` 後會自動整體重建。graph 可用時先查 `neighbors`;`graph_status` 為 unavailable 時改用 `mode="context"` / `grep_code`,並把 caller coverage 標為不完整——不能因為沒看到呼叫者就推論沒有呼叫者。
+- 檔案變更偵測有一個 30 秒的快照窗(`config.CODE_RAG_REFRESH_TTL_SECONDS`,設 0 關閉):透過 CodeTrail 工具(`apply_patch` / `run_command` / `run_lint`)寫檔會立即失效重掃;**在外部編輯器改檔**則最長 30 秒內的查詢可能還看到舊索引,屬既知取捨。
 - 長檔先用工具 `file_info` 看大小，再要求工具 `read_file` 分段讀。
 - 查 spec 先用工具 `query_knowledge`；數字、限制、預設值這類答錯很糟的題目，用工具 `query_knowledge_strict`。多份相似版本並存時傳 `source="檔名"`，filter 會在 top-k 前套用。
 - 外部檔案先用工具 `import_external_file`，再用工具 `analyze_file`、`ingest_document` 或 `read_file` 處理匯入後路徑。

@@ -113,7 +113,7 @@ python3 scripts/session_eval.py validate \
 runner 不會替操作者停／啟 server。先載入候選 GGUF，確認四個 llama-server ready，再跑：
 
 ```bash
-AICODE_MODEL=<BARE_MODEL> python3 scripts/session_eval.py run \
+python3 scripts/session_eval.py run \
   --suite .codetrail/session_eval/suite.json \
   --candidate-label candidate_1 \
   --model <BARE_MODEL> \
@@ -127,7 +127,7 @@ AICODE_MODEL=<BARE_MODEL> python3 scripts/session_eval.py run \
    (臨時 `client.json`:預設 `off`,`--keep-compaction` 才是 `codetrail`),不讀你的
    `~/.config/codetrail/client.json` —— 否則同一份 suite 在兩台機器上量到的不是同一件事。
 3. 客戶端走 `--policy readonly`(判準是 `readOnlyHint`,不是寫死名單),MCP server 端另設
-   `AI_CODE_PATCH=0`、`AI_CODE_RUN_TESTS=0`、`AICODE_CTX_METRICS_ENABLED=0`。
+   `mcp_server --readonly`(一個 argv 旗標,同時關掉寫入、執行、build 命令與 context metrics)。
 4. 每題前後比對 Git 狀態、diff 與 `state_paths` 內容 digest;`.codetrail/`、
    `knowledge.json`、`.aicode_uploads/` 這三個被 gitignore 的路徑**一律**納入(它們正是
    唯讀 replay 最可能被寫到的地方)。read-only replay 改到現場即失敗。

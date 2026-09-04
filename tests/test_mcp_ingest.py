@@ -578,7 +578,7 @@ def test_preflight_over_budget_is_partial_with_next_step(monkeypatch, mcp_root):
     assert next_step, out
     # 既有三種處理方式與完整報告都要留著
     assert "vl_calls_max=900" in out, out
-    assert "AICODE_FIGURE_MAX_VL_CALLS_PER_DOC" in out, out
+    assert "FIGURE_MAX_VL_CALLS_PER_DOC" in out, out
     assert "截斷中段" not in out, out
 
 
@@ -2395,7 +2395,7 @@ def test_preflight_over_budget_exit2_reports_zero_write(monkeypatch, mcp_root_st
 
     assert "vl_calls_max=900" in out, out
     assert "超出上限" in out and "零寫入" in out, out
-    assert "AICODE_FIGURE_MAX_VL_CALLS_PER_DOC" in out, out
+    assert "FIGURE_MAX_VL_CALLS_PER_DOC" in out, out
 
 
 def test_long_preflight_report_is_never_truncated(monkeypatch, mcp_root_stream):
@@ -3176,3 +3176,25 @@ def test_actionable_absence_survives_the_payload_truncation(monkeypatch):
     assert payload["absent_total"] == len(noise) + 1
     block = "\n".join(ingest_notify.render_action_block(payload))
     assert "rotated_90_text_unavailable" in block, block
+
+
+# ── 總審 NON-BLOCKER 5:只有 readonly 拒絕才講 read-only ──
+
+
+@pytest.mark.smoke
+def test_a_filesystem_permission_error_is_not_described_as_a_readonly_refusal(monkeypatch, mcp_root):
+    """一般檔案系統的 EACCES 若被講成「read-only instance,不要再用寫入工具」,模型會在
+    一個正常的 server 上放棄整類工具;readonly 拒絕靠 `ReadonlyToolRefused` 的標記辨識。"""
+    mcp = import_mcp_module(monkeypatch, mcp_root)
+    budget = tool_result_adapter.resolve_result_budget(
+        n_ctx=65536, requested_max_chars=None, safety_max_chars=200_000)
+
+    plain = tool_result_adapter.adapt_tool_error(
+        "read_file", PermissionError(13, "Permission denied", "/etc/shadow"), budget=budget)
+    text = plain.content[0].text
+    assert "read-only instance" not in text and "denied" in text, text
+
+    assert getattr(mcp.ReadonlyToolRefused, "readonly_refusal", False) is True
+    refused = tool_result_adapter.adapt_tool_error(
+        "apply_patch", mcp.ReadonlyToolRefused("readonly"), budget=budget)
+    assert "read-only instance" in refused.content[0].text

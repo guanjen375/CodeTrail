@@ -90,7 +90,9 @@ class CodeGraphError(RuntimeError):
 
 
 def _h_ext_lang() -> str:
-    value = os.environ.get("AICODE_H_LANG", "c").strip().lower()
+    import config
+
+    value = str(getattr(config, "H_LANG", "c")).strip().lower()
     return value if value in ("c", "cpp") else "c"
 
 
@@ -1570,7 +1572,7 @@ class CodeGraph:
           這是施工單 §2 的契約,不是實作偏好。
         - 檔存在但損壞 / schema 不符 → CodeGraphError(不砍不蓋)。
         - scope fingerprint 或 parser 能力指紋(tree-sitter/grammar 版本/
-          AICODE_H_LANG)變了 → full rebuild;
+          client.json 的 h_lang)變了 → full rebuild;
         - 檔案 hash 落後 → 同步增量後回答(§7.5;前提是 graph 已存在)。
         """
         db_state = self._db_state()

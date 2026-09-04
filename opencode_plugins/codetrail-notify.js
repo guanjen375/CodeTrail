@@ -17,7 +17,7 @@ export const CodetrailNotify = async ({ client }) => {
       await client.tui.showToast({
         body: {
           message:
-            "CodeTrail 已不再使用 OpenCode。請在 CodeTrail 目錄執行一次 ./set_config.sh 完成遷移" +
+            "CodeTrail 已不再使用 OpenCode。請在 CodeTrail 目錄執行一次 python3 opencode_migrate.py 完成遷移" +
             "(會取消註冊這個 plugin)。",
           variant: "warning",
         },

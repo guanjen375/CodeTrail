@@ -6,7 +6,6 @@
 路徑本身就是 NDA 內容。要看路徑樣本請顯式加 ``--show-paths``(只印終端)。
 
 用法:
-    AICODE_ROOT=/path/to/project python3 scripts/index_stats.py
     python3 scripts/index_stats.py --root /path/to/project
     python3 scripts/index_stats.py --root /path/to/project --deep
 
@@ -44,18 +43,22 @@ class RootError(Exception):
 
 
 def _resolve_root(cli_root: str | None, env: dict) -> str:
-    """root 只能來自 --root 或 AICODE_ROOT;都沒有就報錯,不猜 cwd。"""
-    raw = cli_root or env.get("AICODE_ROOT")
+    """root 只能來自 `--root`;沒給就報錯,不猜 cwd。
+
+    以前還吃 `AICODE_ROOT`。刪掉的理由:這支會掃一整棵樹並印計數,而殼層裡
+    殘留的那一個(可能是別份安裝、別個專案留下的)會讓它安靜地掃錯樹。
+    `AI_CODE_ALLOW_HOME_ROOT` 也一起刪:`$HOME` 當 root 一律拒絕,沒有 opt-in。
+    """
+    raw = cli_root
     if not raw:
         raise RootError(
-            "[FATAL] 沒有 root:請給 --root <path> 或設 AICODE_ROOT。\n"
+            "[FATAL] 沒有 root:請給 --root <path>。\n"
             "        這個工具不猜 cwd —— 猜錯會掃到不該掃的樹。"
         )
     resolved, err = validate_aicode_root(
         raw,
         env.get("HOME") or env.get("USERPROFILE"),
-        allow_home_override=(env.get("AI_CODE_ALLOW_HOME_ROOT", "").lower()
-                             in ("1", "true", "yes")),
+        allow_home_override=False,
     )
     if err:
         raise RootError(err)
@@ -132,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="index_stats.py",
         description="Code RAG 索引範圍的計數摘要(唯讀、離線、預設不印路徑)",
     )
-    parser.add_argument("--root", help="要統計的樹;不給就用 AICODE_ROOT")
+    parser.add_argument("--root", help="要統計的樹(必要)")
     parser.add_argument("--deep", action="store_true",
                         help="真的跑 AST 算符號數(有檔數/時間預算)")
     parser.add_argument("--deep-max-files", type=int, default=DEEP_MAX_FILES,

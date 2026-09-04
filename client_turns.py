@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""client_turns — 一個對話的回合協調器(不含任何 UI / HTTP)。
+
+`Engine` 自己只認得「進行中的這一輪」。真正要讓使用者按得下「中斷」,還需要
+三件 engine 看不到的事:
+
+* **回合鎖**:同一個對話一次只跑一輪。模型鎖只序列化 HTTP 呼叫,保護不到
+  session 狀態(``send()`` 先改 messages、payload 也在模型鎖之前組好)。
+* **閒置武裝**:送出之後、worker 還沒進到 ``engine.send()`` 之前的那段空窗。
+  這時 engine 看不到任何進行中的東西,``cancel()`` 會回 False,那一次點擊
+  就整個漏掉;要走 ``request_cancel(arm_when_idle=True)`` 讓 engine 預先武裝。
+* **等待核准中的取消**:worker 阻塞在核准上,沒有串流也沒有 MCP 呼叫可以關。
+  只能由這裡把 pending 核准**原子地**回成拒絕並喚醒 worker,engine 醒來看
+  旗標丟 ``TurnCancelled``(而且不會把它記成一筆 denied)。
+
+這三件事原本只有 web 的協調器做齊。前端只剩一個 TUI 之後它們仍然要成立,
+所以搬到這裡:UI 只負責顯示與收鍵,回合語意在這個模組。
+
+**取消的兩層語意**(呼叫端要分清楚):
+
+* 核准框的「拒絕」= :meth:`answer_approval` 帶 ``False``:只拒絕**這一個工具**,
+  這一輪繼續(模型會拿到 denied 的工具結果再想別的辦法)。
+* 中斷 = :meth:`cancel`:整輪結束,答案不寫進歷史,懸空的 tool_call 由
+  ``run_tool_loop`` 補上「已中斷」結果。
+"""
+from __future__ import annotations
+
+import secrets
+import threading
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+import client_engine
+import client_events
+
+#: 核准等多久沒人回答就當拒絕。UI 掛掉 / 使用者離開時 worker 不能永遠卡著。
+APPROVAL_TIMEOUT_SECONDS = 300
+
+
+@dataclass
+class ApprovalTicket:
+    """一次待回答的核准。``approval_id`` 是回答時的鑰匙(見 :meth:`TurnCoordinator.answer_approval`)。"""
+
+    approval_id: str
+    request: client_engine.ApprovalRequest
+    event: threading.Event = field(default_factory=threading.Event)
+    granted: bool = False
+
+
+class TurnCoordinator:
+    """把一輪對話跑在背景執行緒,並提供可中斷的回合邊界。
+
+    ``emit`` 收到的是 :mod:`client_events` 形狀的事件(含串流 ``text_delta``、
+    工具事件、notice 與終結的 ``step_finish``);它一律在**背景執行緒**被呼叫,
+    UI 端自己負責搬回自己的執行緒。
+    """
+
+    class Busy(RuntimeError):
+        """這個對話已經有一輪在跑。"""
+
+    def __init__(
+        self,
+        engine: client_engine.Engine,
+        *,
+        emit: Callable[[dict[str, Any]], None],
+        on_approval: Callable[[ApprovalTicket], None] | None = None,
+        on_approval_closed: Callable[[str], None] | None = None,
+        on_reasoning: Callable[[str], None] | None = None,
+        compactor: Any = None,
+        approval_timeout: float = APPROVAL_TIMEOUT_SECONDS,
+    ) -> None:
+        self.engine = engine
+        self.compactor = compactor
+        self._emit = emit
+        self._on_approval = on_approval
+        self._on_approval_closed = on_approval_closed
+        self._on_reasoning = on_reasoning
+        self._approval_timeout = approval_timeout
+        #: 保護 turn_lock 的取得、``_turn_done``、``_cancelled`` 與 pending 核准表。
+        #: 慢速動作(MCP 取消要等寬限期,最長 10 秒)一律在鎖外做。
+        self._lock = threading.Lock()
+        self._turn_lock = threading.Lock()
+        #: 這一輪(含尾端的壓縮)已經結束、只是 turn_lock 還沒放:此時的取消是
+        #: no-op,不然旗標會留到下一題。
+        self._turn_done = True
+        #: cancel() 設、begin_turn() 清。``request_approval`` 登記完 pending 之後要
+        #: 看它,否則取消落在「ASK 判定後、pending 登記前」的空窗就會等滿逾時。
+        self._cancelled = False
+        self._approvals: dict[str, ApprovalTicket] = {}
+
+    # ---- 狀態 ----------------------------------------------------------
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return self._turn_lock.locked() and not self._turn_done
+
+    @property
+    def cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+    def pending_approvals(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._approvals)
+
+    # ---- 回合邊界 ------------------------------------------------------
+    def begin_turn(self) -> None:
+        """取 turn_lock 並標「這一輪開始」——兩步在同一個臨界區內。
+
+        兩步之間收到取消的話,:meth:`cancel` 看到的是上一輪留下的
+        ``_turn_done=True``,回 False,那一次點擊就整個漏掉。
+        """
+        with self._lock:
+            if not self._turn_lock.acquire(blocking=False):
+                raise self.Busy(self.engine.session_id)
+            self._cancelled = False
+            self._turn_done = False
+
+    def finish_turn(self) -> None:
+        """一輪(訊息或手動摘要)結束:標 turn_done、清 engine 旗標、放鎖。
+
+        前兩步在同一個臨界區,跟 :meth:`cancel` 的「判定 + 設旗標」互斥:先標
+        「這一輪結束」再清旗標,取消看到 turn_done 就是 no-op,之前來不及消費的
+        旗標在這裡清掉——兩邊合起來,取消不會留到下一題。
+        """
+        with self._lock:
+            self._turn_done = True
+            clear = getattr(self.engine, "clear_cancel", None)
+            if callable(clear):
+                clear()
+        self._turn_lock.release()
+
+    def cancel(self, *, block: bool = True) -> bool:
+        """中斷進行中的那一輪。沒有在跑就回 ``False``。
+
+        接不接受由 engine 的 ``request_cancel(arm_when_idle=True)`` **原子**決定:
+        進行中且還沒決定寫定 → True;答案 / 摘要已寫定、``send()`` 已退出 → False
+        (沒有東西可取消,這一輪照原結果收尾);worker 還沒進 ``engine.send()``
+        → engine 預先武裝,這一輪一開始就會被中斷,True。
+
+        鎖裡只做快速部分(旗標 + 關串流 + 收掉 pending 核准);MCP 取消要等寬限期,
+        放在鎖裡會把這個對話的所有操作一起卡住。
+
+        ``block=False``:連鎖外的 MCP 取消也丟到背景執行緒。UI 執行緒要用這個
+        —— 那條路最長會等寬限期(10 秒)加 SIGTERM 再加重新 spawn,同步跑在
+        Textual 的 event loop 上就是整個畫面凍住,而且 worker 的
+        ``call_from_thread`` 也跟著卡在後面。
+        """
+        with self._lock:
+            if not self._turn_lock.locked() or self._turn_done:
+                return False
+            pending_call = None
+            slow_cancel = None
+            request = getattr(self.engine, "request_cancel", None)
+            if callable(request):
+                decision = request(arm_when_idle=True)
+                if not decision.accepted:
+                    return False
+                pending_call = decision.call
+                slow_cancel = getattr(self.engine, "cancel_pending", None)
+            else:  # pragma: no cover - 只有測試替身會少這個方法
+                fallback = getattr(self.engine, "cancel", None)
+                if callable(fallback):
+                    fallback()
+            self._cancelled = True
+            waiting = list(self._approvals.items())
+            self._approvals.clear()
+            for _approval_id, ticket in waiting:
+                ticket.granted = False
+        for _approval_id, ticket in waiting:
+            ticket.event.set()
+        if self._on_approval_closed is not None:
+            for approval_id, _ticket in waiting:
+                self._on_approval_closed(approval_id)
+        if callable(slow_cancel):
+            # 鎖外:同一個 pending call 物件只屬於這一輪,晚一點取消也不會誤傷下一輪
+            # (下一輪的呼叫是另一個物件;已結束的呼叫取消是 no-op)。
+            if block:
+                slow_cancel(pending_call)
+            else:
+                self._spawn(
+                    lambda: slow_cancel(pending_call),
+                    f"codetrail-cancel-{self.engine.session_id}",
+                )
+        return True
+
+    # ---- 核准 ----------------------------------------------------------
+    def request_approval(self, request: client_engine.ApprovalRequest) -> bool:
+        """engine 在 worker 執行緒裡呼叫:阻塞等 UI 回答。
+
+        沒有人回答(逾時)、被取消收掉、或回了非 bool → 都是**拒絕**。
+        """
+        approval_id = secrets.token_hex(8)
+        ticket = ApprovalTicket(approval_id, request)
+        with self._lock:
+            if self._cancelled:
+                # 取消落在 engine 決定要問、與這裡登記 pending 之間:cancel() 沒看到
+                # 這筆,所以這裡自己回拒絕(engine 醒來會看旗標,不記成 denied)。
+                return False
+            self._approvals[approval_id] = ticket
+        if self._on_approval is not None:
+            self._on_approval(ticket)
+        answered = ticket.event.wait(timeout=self._approval_timeout)
+        with self._lock:
+            still_pending = self._approvals.pop(approval_id, None) is not None
+            granted = ticket.granted
+        if still_pending and self._on_approval_closed is not None:
+            # 逾時:框還開著,要收掉。被 cancel / answer 收走的那些由對方通知。
+            self._on_approval_closed(approval_id)
+        return bool(answered and granted)
+
+    def answer_approval(self, approval_id: str, granted: Any) -> bool:
+        """回答一次核准。**只能回答一次**。
+
+        不在第一個回答就把 pending 原子移除的話,先 deny 再 grant 會讓後者覆蓋
+        前者 —— 使用者按了拒絕,工具還是執行了。``granted`` 也必須是真的 bool:
+        ``bool("false")`` 是 True。
+        """
+        if not isinstance(granted, bool):
+            return False
+        with self._lock:
+            ticket = self._approvals.pop(approval_id, None)
+            if ticket is None:
+                return False
+            ticket.granted = granted
+        ticket.event.set()
+        if self._on_approval_closed is not None:
+            self._on_approval_closed(approval_id)
+        return True
+
+    # ---- 一輪 ----------------------------------------------------------
+    def start_turn(self, text: str) -> str:
+        """送一則訊息。回傳送出**之前**要顯示的壓縮停用警告(可能是空字串)。
+
+        警告在啟動 worker 之前就取:先 send 再取的話,模型可能已經撞了 context
+        gate,使用者看到的是那個錯誤,卻不知道壓縮早就停了。
+        """
+        self.begin_turn()
+        # begin_turn 之後的任何失敗都必須把回合鎖放掉:漏掉的話這個對話從此
+        # 永遠是 busy,使用者連 Ctrl-C 都救不回來(cancel 看到 turn_done=False
+        # 但 engine 根本沒有 turn)。
+        try:
+            target = self.engine.session_id
+            notice = self._stop_notice()
+            if notice:
+                self._publish(client_events.notice_event(target, notice))
+            self._spawn(lambda: self._run_turn(text, target), f"codetrail-turn-{target}")
+        except BaseException:
+            self.finish_turn()
+            raise
+        return notice
+
+    def start_compaction(self) -> None:
+        """手動壓縮(``/compact``)。也是一輪:``cancel()`` 才打斷得了長摘要。"""
+        self.begin_turn()
+        try:
+            target = self.engine.session_id
+            self._spawn(lambda: self._run_compaction(target), f"codetrail-compact-{target}")
+        except BaseException:
+            self.finish_turn()
+            raise
+
+    def _spawn(self, body: Callable[[], None], name: str) -> None:
+        threading.Thread(target=body, name=name, daemon=True).start()
+
+    def _stop_notice(self) -> str:
+        notice = getattr(self.compactor, "pending_stop_notice", None)
+        if not callable(notice):
+            return ""
+        try:
+            return notice() or ""
+        except Exception:  # noqa: BLE001 - 警告失敗不得擋住送出
+            return ""
+
+    def _publish(self, event: Mapping[str, Any]) -> None:
+        try:
+            self._emit(dict(event))
+        except Exception:  # noqa: BLE001 - UI 收不下事件不得帶走這一輪
+            pass
+
+    def _run_turn(self, text: str, target: str) -> None:
+        # engine 送終結 `step_finish` 的時間點在 send() 回來**之前**,而 ingest 待辦 /
+        # 假工具呼叫 / 壓縮結果這些 notice 要等 send() 回來才拿得到。照原順序送,
+        # 看終結事件收工的一端會在 notice 之前離開。所以終結先扣住,notice 送完才放行。
+        held: list[dict[str, Any]] = []
+
+        def _emit(event: dict[str, Any]) -> None:
+            if client_events.is_terminal_event(event):
+                held.append(dict(event))
+                return
+            self._publish(event)
+
+        try:
+            result = self.engine.send(
+                text,
+                on_event=_emit,
+                # 沒有 on_text 的話,文字要等整個 model step 跑完才一次送出——長回答
+                # 看起來就是「卡住很久然後全部一次冒出來」。串流的那一份用 `text_delta`
+                # 標記,終結的 `text` 事件仍由 on_event 負責(事件流的契約沒有改)。
+                on_text=lambda chunk: self._publish(
+                    client_events.text_delta_event(target, chunk)
+                ),
+                on_reasoning=self._on_reasoning,
+                approve=self.request_approval,
+            )
+            for item in result.notices:
+                self._publish(client_events.notice_event(target, item))
+            self._auto_compact(target, result)
+            if self.cancelled:
+                # 壓縮階段被取消:答案已經給了,但這一輪的結果是「中斷」——cancel 回了
+                # True,終結事件就必須是 cancelled,不是 stop。
+                self._publish(client_events.notice_event(target, "答案已完成;壓縮已取消。"))
+                self._publish(
+                    client_events.step_finish_event(target, reason=client_events.REASON_CANCELLED)
+                )
+            elif held:
+                for event in held:
+                    self._publish(event)
+            else:
+                self._publish(client_events.step_finish_event(target, reason=result.finish))
+        except client_events.TurnCancelled:
+            self._publish(client_events.notice_event(target, "已中斷這一輪。"))
+            self._publish(
+                client_events.step_finish_event(target, reason=client_events.REASON_CANCELLED)
+            )
+        except Exception as exc:  # noqa: BLE001 - 一輪失敗不得帶走整個客戶端
+            self._publish(client_events.error_event(target, f"{type(exc).__name__}: {exc}"))
+            # 終結事件一定要送:只送 error 的話,等終結事件的一端會永遠停在那裡。
+            self._publish(
+                client_events.step_finish_event(target, reason=client_events.REASON_ERROR)
+            )
+        finally:
+            self.finish_turn()
+
+    def _run_compaction(self, target: str) -> None:
+        try:
+            if self.compactor is None:
+                self._publish(
+                    client_events.notice_event(target, "這個 session 沒有可用的壓縮(模式為 off)。")
+                )
+                return
+            try:
+                outcome = self.compactor.compact(manual=True)
+            except Exception as exc:  # noqa: BLE001
+                self._publish(
+                    client_events.notice_event(target, f"壓縮失敗:{type(exc).__name__}: {exc}")
+                )
+                return
+            self._publish(
+                client_events.notice_event(target, outcome.message or "(沒有可壓縮的內容)")
+            )
+        finally:
+            reason = (
+                client_events.REASON_CANCELLED if self.cancelled else client_events.REASON_STOP
+            )
+            self._publish(client_events.step_finish_event(target, reason=reason))
+            self.finish_turn()
+
+    def _auto_compact(self, target: str, result: Any) -> None:
+        if self.compactor is None:
+            return
+        # 只有真的答完(finish=stop)才壓:被截斷(length)、出錯、被中斷的那一輪
+        # 沒有可信的切點。
+        if getattr(result, "finish", None) != client_events.REASON_STOP:
+            return
+        try:
+            outcome = self.compactor.compact()
+        except Exception as exc:  # noqa: BLE001 - 壓縮失敗不得帶走這一輪
+            self._publish(
+                client_events.notice_event(target, f"壓縮失敗:{type(exc).__name__}: {exc}")
+            )
+            return
+        if outcome.status != "skipped" and outcome.message:
+            self._publish(client_events.notice_event(target, outcome.message))
+
+    # ---- session 切換 --------------------------------------------------
+    def session_changed(self) -> None:
+        """``/new`` / ``/resume`` 之後重綁壓縮器。
+
+        不重綁的話上一段的摘要會進新對話的摘要請求,上一段的停用也會把新的一段
+        停掉。這裡**不**取停用警告:那會把「每個 session 只講一次」的那一次在這裡
+        消耗掉,真正送出時就不再講了。
+        """
+        rebind = getattr(self.compactor, "rebind", None)
+        if callable(rebind):
+            rebind()

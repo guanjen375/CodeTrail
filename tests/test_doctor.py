@@ -27,30 +27,45 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # ── 原 test_doctor.py:doctor 健檢 ──
 
-def _write_opencode_config(path: Path, model: str) -> Path:
-    path.write_text(
-        json.dumps({
-            "model": model,
-            "provider": {
-                "llamacpp": {
-                    "options": {"baseURL": "http://localhost:8080/v1"},
-                    "models": {model.split("/")[-1]: {"name": model.split("/")[-1]}},
-                }
-            },
-        }),
+def _write_profile_model(home: Path, model: str) -> None:
+    """把主模型寫進 tmp HOME 的 deployment.json —— 現在**唯一**的來源。
+
+    2026-09-04:doctor 的測試從 `monkeypatch.setenv("AICODE_MODEL", ...)` 改成
+    這個。行為為什麼該變:doctor 的工作是回報「客戶端真的會用什麼」,而客戶端
+    只讀檔;doctor 若還讀環境變數,最需要它的那種情況(兩份安裝混用、殼層殘留
+    另一份的 AICODE_MODEL)它剛好報成正常。
+    """
+    cfg_dir = home / ".config" / "codetrail"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "deployment.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "profile": "defaults",
+                "services": {"main": {"model": model}},
+            }
+        ),
         encoding="utf-8",
     )
-    return path
+
+
+def _reload_config():
+    import importlib
+
+    import config
+
+    return importlib.reload(config)
+
 
 
 def test_doctor_no_network_exits_clean(monkeypatch, tmp_path):
     """沒帶 --project 時跑 --no-network 不該因為缺 KB / 網路而 FAIL,
-    只要 AICODE_MODEL 有設並且能解析到既有 GGUF 路徑。
+    只要 deployment.json 的 main.model 能解析到既有 GGUF 路徑。
     """
-    # 造一個假 GGUF 並用 AICODE_MODEL 直接指它(避開 registry / require_main_model_path 失敗)
     gguf = tmp_path / "fake.gguf"
     gguf.write_text("not a real gguf")
-    env = {**os.environ, "AICODE_MODEL": str(gguf)}
+    _write_profile_model(tmp_path, str(gguf))
+    env = {**os.environ}
     env.pop("OPENCODE_CONFIG", None)
     env["HOME"] = str(tmp_path)
     env["USERPROFILE"] = str(tmp_path)
@@ -76,26 +91,20 @@ def test_aicode_root_rejects_slash(tmp_path: Path):
     assert any("/" in m for m in r.fails)
 
 
-def test_aicode_root_fails_on_home_by_default(monkeypatch, tmp_path: Path):
+def test_aicode_root_fails_on_home(monkeypatch, tmp_path: Path):
+    """`$HOME` 當 root 一律拒絕,**沒有 opt-in**。
+
+    2026-09-04:`AI_CODE_ALLOW_HOME_ROOT=1` 那條放行路徑刪除。行為為什麼該變:
+    它是一個殼層裡看不見的旗標,而它放行的是「把整個家目錄交給模型」。
+    """
     fake_home = tmp_path / "fakehome"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
-    monkeypatch.delenv("AI_CODE_ALLOW_HOME_ROOT", raising=False)
+    monkeypatch.setenv("AI_CODE_ALLOW_HOME_ROOT", "1")  # 殘留值不得放行
     r = doc.Result()
     doc.check_aicode_root(r, str(fake_home))
     assert r.fails
     assert any("$HOME" in m or str(fake_home) in m for m in r.fails)
-
-
-def test_aicode_root_passes_home_with_override(monkeypatch, tmp_path: Path):
-    fake_home = tmp_path / "fakehome"
-    fake_home.mkdir()
-    monkeypatch.setenv("HOME", str(fake_home))
-    monkeypatch.setenv("AI_CODE_ALLOW_HOME_ROOT", "1")
-    r = doc.Result()
-    doc.check_aicode_root(r, str(fake_home))
-    assert not r.fails
-    assert r.warns
 
 
 def test_aicode_root_passes_on_normal_dir(tmp_path: Path):
@@ -170,8 +179,10 @@ def test_check_models_passes_when_gguf_exists(monkeypatch, tmp_path):
     """MODEL 指到實際存在的 GGUF 檔時應該 PASS。"""
     gguf = tmp_path / "foo.gguf"
     gguf.write_text("not a real gguf")
-    monkeypatch.setenv("AICODE_MODEL", str(gguf))
-    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    _write_profile_model(tmp_path, str(gguf))
+    monkeypatch.setattr(doc, "_read_config", _reload_config)
 
     r = doc.Result()
     doc.check_models(r, server_status={})
@@ -181,11 +192,10 @@ def test_check_models_passes_when_gguf_exists(monkeypatch, tmp_path):
 
 def test_check_models_fails_when_gguf_missing(monkeypatch, tmp_path):
     """MODEL bare name 沒有對應的 GGUF 檔時必須 FAIL。"""
-    monkeypatch.setenv("AICODE_MODEL", "definitely-not-a-real-model")
-    monkeypatch.delenv("AICODE_MODEL_REGISTRY", raising=False)
-    monkeypatch.delenv("AICODE_MODEL_REGISTRY_FILE", raising=False)
-    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    _write_profile_model(tmp_path, "definitely-not-a-real-model")
+    monkeypatch.setattr(doc, "_read_config", _reload_config)
 
     import config
     # check_models 讀的是當下 config registry；直接隔離這個依賴，避免 reload
@@ -199,11 +209,10 @@ def test_check_models_fails_when_gguf_missing(monkeypatch, tmp_path):
 
 
 def test_check_models_fails_when_main_model_unset(monkeypatch, tmp_path):
-    """config.MODEL 為空 (使用者沒設 AICODE_MODEL / opencode.json) 必須 FAIL。"""
-    monkeypatch.delenv("AICODE_MODEL", raising=False)
-    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    """config.MODEL 為空(deployment.json 沒有 main.model)必須 FAIL。"""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr(doc, "_read_config", _reload_config)
 
     r = doc.Result()
     doc.check_models(r, server_status={})
@@ -211,10 +220,13 @@ def test_check_models_fails_when_main_model_unset(monkeypatch, tmp_path):
 
 
 def test_check_models_warns_on_loaded_model_mismatch(monkeypatch, tmp_path):
-    """server 載入的 GGUF 跟 AICODE_MODEL 解析到的不同 → WARN。"""
+    """server 載入的 GGUF 跟解析出的主模型不同 → WARN。"""
     gguf = tmp_path / "actual.gguf"
     gguf.write_text("not a real gguf")
-    monkeypatch.setenv("AICODE_MODEL", str(gguf))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    _write_profile_model(tmp_path, str(gguf))
+    monkeypatch.setattr(doc, "_read_config", _reload_config)
 
     server_status = {
         "main": {
@@ -224,7 +236,7 @@ def test_check_models_warns_on_loaded_model_mismatch(monkeypatch, tmp_path):
     }
     r = doc.Result()
     doc.check_models(r, server_status=server_status)
-    assert any("AICODE_MODEL" in w and "不同" in w for w in r.warns), r.warns
+    assert any("主模型" in w and "不同" in w for w in r.warns), r.warns
 
 
 
@@ -248,28 +260,20 @@ def test_check_context_settings_does_not_fail(monkeypatch):
     assert not r.fails
 
 
-def test_check_context_settings_warns_for_deprecated_num_ctx(monkeypatch):
+def test_check_context_settings_says_nothing_about_deleted_ctx_variables(monkeypatch):
+    """舊的 ctx 環境變數連警告都不留。
+
+    2026-09-04:`AICODE_NUM_CTX` / `AICODE_DYNAMIC_NUM_CTX_MAX` 與它們的
+    deprecation 警告一起刪除(plan §2.4 D 類:「連警告一起刪,不留 alias」)。
+    行為為什麼該變:一個「已 deprecated 但仍相容讀取」的警告等於那個入口還在;
+    現在殼層裡的殘留值對 runtime 完全沒有作用,doctor 也不該暗示它有。
+    """
     monkeypatch.setenv("AICODE_NUM_CTX", "131072")
-    monkeypatch.delenv("AICODE_DYNAMIC_NUM_CTX_MAX", raising=False)
-    r = doc.Result()
-    doc.check_context_settings(r)
-    assert any("AICODE_NUM_CTX" in w and "deprecated" in w for w in r.warns)
-
-
-def test_check_context_settings_warns_for_deprecated_dynamic_max(monkeypatch):
-    monkeypatch.delenv("AICODE_NUM_CTX", raising=False)
     monkeypatch.setenv("AICODE_DYNAMIC_NUM_CTX_MAX", "65536")
     r = doc.Result()
     doc.check_context_settings(r)
-    assert any("AICODE_DYNAMIC_NUM_CTX_MAX" in w and "deprecated" in w for w in r.warns)
-
-
-def test_check_context_settings_has_no_legacy_warning_by_default(monkeypatch):
-    monkeypatch.delenv("AICODE_NUM_CTX", raising=False)
-    monkeypatch.delenv("AICODE_DYNAMIC_NUM_CTX_MAX", raising=False)
-    r = doc.Result()
-    doc.check_context_settings(r)
-    assert not any("deprecated" in w for w in r.warns)
+    assert not any("deprecated" in w for w in r.warns), r.warns
+    assert not r.fails
 
 
 def test_check_context_settings_warns_when_hard_below_soft(monkeypatch):
@@ -404,6 +408,68 @@ def test_check_packages_fails_on_pymupdf4llm_pin_mismatch(monkeypatch):
     r2 = doc.Result()
     doc.check_packages(r2)
     assert any("pymupdf4llm" in f and "版本不符" in f for f in r2.fails), (r2.fails, r2.warns)
+
+
+@pytest.mark.smoke
+def test_the_canary_cache_filename_carries_the_schema_number(tmp_path):
+    """同一台機器可能同時裝著兩個世代的 CodeTrail,而它們共用 `~/.cache/codetrail`。
+
+    讀到別的 schema 會被當成空快取再**整檔覆寫** —— 兩邊每次啟動都清空對方的紀錄,
+    每一次 aicode 都要重跑一次幾十秒的 live canary。檔名帶 schema 號才各記各的。
+    """
+    from scripts import tool_call_canary
+
+    assert str(tool_call_canary.CACHE_SCHEMA) in tool_call_canary.CACHE_FILENAME
+    for env in (
+        {"XDG_CACHE_HOME": str(tmp_path)},
+        {"HOME": str(tmp_path)},
+    ):
+        path = tool_call_canary.resolve_cache_path(env)
+        assert path is not None and path.name == tool_call_canary.CACHE_FILENAME
+    assert tool_call_canary.resolve_cache_path({}) is None
+
+
+@pytest.mark.smoke
+def test_a_missing_textual_is_a_fail_not_a_warn(monkeypatch):
+    """`aicode` 的介面就是 textual。缺了 wrapper 起不來,所以不能只是 WARN。"""
+    real_import = doc.importlib.import_module
+
+    def _fake(name, *args, **kwargs):
+        if name == "textual":
+            raise ImportError("no textual")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(doc.importlib, "import_module", _fake)
+    r = doc.Result()
+    doc.check_packages(r)
+    assert any("textual" in message for message in r.fails), (r.fails, r.warns)
+    assert not any("textual" in message for message in r.warns)
+
+
+@pytest.mark.smoke
+def test_a_leftover_web_backend_is_reported_read_only(monkeypatch):
+    """網頁前端已移除,但刪檔不會停掉升級前啟動、還掛在 tmux 裡的 backend。
+    偵測是唯讀的:doctor 不得自己去殺別人的 session。"""
+    calls: list[list[str]] = []
+
+    def _run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(doc.shutil, "which", lambda name: "/usr/bin/tmux" if name == "tmux" else None)
+    monkeypatch.setattr(doc.process_env, "run", _run)
+    r = doc.Result()
+    doc.check_legacy_web_backend(r)
+    assert any("codetrail-web" in message for message in r.warns), r.warns
+    assert calls == [["tmux", "has-session", "-t", "codetrail-web"]]
+
+    monkeypatch.setattr(
+        doc.process_env, "run",
+        lambda *_a, **_k: types.SimpleNamespace(returncode=1, stdout="", stderr=""),
+    )
+    r2 = doc.Result()
+    doc.check_legacy_web_backend(r2)
+    assert r2.warns == [] and r2.passes
 
 
 def test_require_pymupdf4llm_verifies_without_real_package(monkeypatch):
@@ -662,34 +728,6 @@ def test_lease_checks_never_fail_when_the_module_is_broken(monkeypatch, tmp_path
     assert not r.warns
 
 
-# ---------------------------------------------------------------------------
-# 壓縮模式
-# ---------------------------------------------------------------------------
-def _compaction_fixture(monkeypatch, tmp_path: Path, mode: str):
-    """在 tmp HOME 裡放一份模式狀態檔與對應的 opencode.json,回 (config_path, config)。"""
-    import compaction_mode
-
-    config_path = tmp_path / "opencode.json"
-    config: dict = {}
-    derived = (
-        compaction_mode.derive_settings(context_limit=131072, output_limit=8192)
-        if mode in compaction_mode.PLUGIN_MODES
-        else None
-    )
-    _, _, errors, state = compaction_mode.apply_mode(
-        config, mode=mode, derived=derived, prior_state=None,
-        config_path=config_path, plugin_path=compaction_mode.PLUGIN_PATH,
-    )
-    assert errors == []
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("USERPROFILE", str(tmp_path))
-    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
-    compaction_mode.save_state(
-        state, path=tmp_path / ".config" / "codetrail" / "compaction.json"
-    )
-    return config_path, config
-
-
 def test_compaction_mode_absent_state_is_informational(monkeypatch, tmp_path):
     """沒有狀態檔 = 沒有接管,不能報成問題。"""
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -767,23 +805,32 @@ def _completed_event(session_id: str = "ses_canary") -> str:
     return "\n".join(json.dumps(event) for event in events)
 
 
+#: 2026-09-04:canary 的快取位置與 endpoint 都不再是環境變數。
+#: 快取只由 `XDG_CACHE_HOME` / `HOME` 推導(要重測就刪那個檔或 `--force`),
+#: endpoint 由呼叫端從 deployment profile 交進來(`run_all(base_url=...)`)。
+CANARY_BASE_URL = "http://127.0.0.1:8080"
+
+
+def _cache_path(tmp_path: Path) -> Path:
+    return tmp_path / "cache" / "codetrail" / canary.CACHE_FILENAME
+
+
 def _patch_runtime(monkeypatch, tmp_path: Path, attempts):
     root = tmp_path / "project"
     root.mkdir()
     env = {
         "HOME": str(tmp_path / "home"),
-        "AICODE_TOOL_CANARY_CACHE": str(tmp_path / "cache.json"),
-        "AICODE_LLAMA_BASE_URL": "http://127.0.0.1:8080",
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
     }
     monkeypatch.setattr(
         canary,
         "run_protocol_check",
-        lambda root, env, timeout: canary.ProtocolEvidence("a" * 64, "b" * 64),
+        lambda root, timeout: canary.ProtocolEvidence("a" * 64, "b" * 64),
     )
     monkeypatch.setattr(
         canary,
         "fetch_main_server_props",
-        lambda env: {
+        lambda base_url: {
             "model_path": "/models/local.gguf",
             "chat_template": "tool_calls",
             "chat_template_caps": {"supports_tools": True, "supports_tool_calls": True},
@@ -792,7 +839,7 @@ def _patch_runtime(monkeypatch, tmp_path: Path, attempts):
             "default_generation_settings": {"params": {"temperature": 0.0}},
         },
     )
-    monkeypatch.setattr(canary, "_model_selection", lambda env, explicit, args: ("m", "m"))
+    monkeypatch.setattr(canary, "_model_selection", lambda env, explicit: ("m", "m"))
 
     iterator = iter(attempts)
     monkeypatch.setattr(
@@ -1009,11 +1056,11 @@ def test_successful_model_canary_is_cached_and_skips_second_call(monkeypatch, tm
         root=root,
         env=env,
         explicit_model="",
-        frontend_args=[],
+        base_url=CANARY_BASE_URL,
         force=False,
     ) == 0
 
-    cache = canary._read_cache(Path(env["AICODE_TOOL_CANARY_CACHE"]))
+    cache = canary._read_cache(_cache_path(tmp_path))
     assert [entry["status"] for entry in cache["explicit"]] == ["pass"]
     assert [entry["status"] for entry in cache["implicit"]] == ["optimal"]
 
@@ -1026,7 +1073,7 @@ def test_successful_model_canary_is_cached_and_skips_second_call(monkeypatch, tm
         root=root,
         env=env,
         explicit_model="",
-        frontend_args=[],
+        base_url=CANARY_BASE_URL,
         force=False,
     ) == 0
 
@@ -1040,11 +1087,11 @@ def test_retry_success_is_reported_flaky_and_not_cached(monkeypatch, tmp_path, c
         root=root,
         env=env,
         explicit_model="",
-        frontend_args=[],
+        base_url=CANARY_BASE_URL,
         force=False,
     ) == 0
     assert "MODEL FLAKY" in capsys.readouterr().err
-    cache = canary._read_cache(Path(env["AICODE_TOOL_CANARY_CACHE"]))
+    cache = canary._read_cache(_cache_path(tmp_path))
     assert cache["explicit"] == []
     # The lanes are independent: flaky explicit is not cached, while the
     # one-shot implicit diagnostic still records its own current status.
@@ -1063,10 +1110,12 @@ def test_two_explicit_model_failures_block_even_with_legacy_warn_only(
         root=root,
         env=env,
         explicit_model="",
-        frontend_args=[],
+        base_url=CANARY_BASE_URL,
         force=False,
     ) == 2
 
+    # 2026-09-04:`AICODE_TOOL_CANARY_WARN_ONLY` 已刪除。留著這個殘留值是為了
+    # 證明它翻不動 explicit hard gate —— 那道閘擋的是「模型不會真的呼叫工具」。
     root2 = tmp_path / "project2"
     root2.mkdir()
     env["AICODE_TOOL_CANARY_WARN_ONLY"] = "1"
@@ -1086,7 +1135,7 @@ def test_two_explicit_model_failures_block_even_with_legacy_warn_only(
         root=root2,
         env=env,
         explicit_model="",
-        frontend_args=[],
+        base_url=CANARY_BASE_URL,
         force=False,
     ) == 2
 
@@ -1097,7 +1146,7 @@ def test_run_model_attempt_passes_explicit_model_and_ignores_private_output(
 ):
     recorded: list[str] = []
 
-    def fake_run(argv, *, root, env, timeout):
+    def fake_run(argv, *, root, env=None, timeout):
         recorded.extend(argv)
         return subprocess.CompletedProcess(argv, 0, _completed_event(), "secret stderr")
 
@@ -1120,34 +1169,46 @@ def test_run_model_attempt_passes_explicit_model_and_ignores_private_output(
 
 @pytest.mark.smoke
 def test_the_canary_runs_the_client_the_wrapper_will_actually_exec(monkeypatch, tmp_path):
-    """`aicode` 尊重 `AICODE_CLIENT_ENTRY`;canary 也必須。
+    """canary 跑的就是 wrapper 會 exec 的那一份客戶端 —— 這個 repo 裡的那一份。
 
-    寫死 repo 內路徑的話,canary 跑的、hash 的都是另一份程式,通過之後
-    wrapper 卻 exec override —— 對一個 policy、system prompt、事件契約完全
-    不同的客戶端回報 PASS。
+    2026-09-04:`AICODE_CLIENT_ENTRY` 覆寫刪除。行為為什麼該變:wrapper 已經
+    只 exec 自己旁邊那一份,覆寫留著只剩一個效果 —— 殼層設一個值,canary 就去
+    跑、去 hash 另一份程式,對一個 policy / system prompt / 事件契約完全不同
+    的客戶端回報 PASS。
     """
     other = tmp_path / "other" / "codetrail_chat.py"
     other.parent.mkdir(parents=True)
     other.write_text("# another client\n", encoding="utf-8")
-    env = {"AICODE_CLIENT_ENTRY": str(other)}
+    monkeypatch.setenv("AICODE_CLIENT_ENTRY", str(other))
 
-    assert canary.client_entry(env) == other
+    assert canary.client_entry() == canary.CLIENT_ENTRY
+    assert canary.CLIENT_ENTRY == canary.REPO_ROOT / "codetrail_chat.py"
     command = canary._model_canary_command(
-        root=tmp_path, model_override="", title="t", prompt="p", env=env
+        root=tmp_path, model_override="", title="t", prompt="p", env={}
     )
-    assert str(other) in command
+    assert str(canary.CLIENT_ENTRY) in command
+    assert str(other) not in command
 
+    # 指紋涵蓋那份客戶端的內容:改了它就不能沿用舊判定。
     (tmp_path / "AGENTS.md").write_text("x", encoding="utf-8")
-    default_fp = canary.build_fingerprint(
+    before = canary.build_fingerprint(
         root=tmp_path, selected_model="m", props={}, env={}
     )
-    override_fp = canary.build_fingerprint(
-        root=tmp_path, selected_model="m", props={}, env=env
+    monkeypatch.setattr(canary, "CLIENT_ENTRY", other)
+    assert (
+        canary.build_fingerprint(root=tmp_path, selected_model="m", props={}, env={})
+        != before
     )
-    assert default_fp != override_fp
 
 
-def test_frontend_model_argument_is_forwarded_to_canary_run(monkeypatch, tmp_path):
+def test_the_explicit_model_is_forwarded_to_the_canary_run(monkeypatch, tmp_path):
+    """呼叫端(preflight)已經解析好的模型必須真的送進 headless run。
+
+    2026-09-04:以前這個模型是從 `frontend_args`(wrapper 轉發的 `-m`)掃出來
+    的。行為為什麼該變:客戶端沒有 `-m` 了,模型只來自 deployment.json,而
+    preflight 已經解析過一次 —— canary 驗的必須就是等一下真的要跑的那一顆,
+    再掃一次 argv 只會製造第二個可能不一致的答案。
+    """
     observed: list[str] = []
     success = canary.ModelEvidence(True, "ok", ("ses_cli_model",))
     root, env = _patch_runtime(monkeypatch, tmp_path, [])
@@ -1157,19 +1218,19 @@ def test_frontend_model_argument_is_forwarded_to_canary_run(monkeypatch, tmp_pat
         return success
 
     monkeypatch.setattr(canary, "run_model_attempt", record_model)
+    # `_patch_runtime` 釘死回 "m";這裡要驗的正是「呼叫端給的值會被用到」,
+    # 所以換回真的把 explicit 傳下去的那一版。
     monkeypatch.setattr(
-        canary, "_model_selection",
-        lambda env, explicit, args: canary._model_selection.__wrapped__(env, explicit, args)
-        if hasattr(canary._model_selection, "__wrapped__") else ("llamacpp/from-cli", "llamacpp/from-cli"),
+        canary, "_model_selection", lambda env, explicit: (explicit, explicit)
     )
     assert canary.run_all(
         root=root,
         env=env,
-        explicit_model="",
-        frontend_args=["--model", "llamacpp/from-cli"],
+        explicit_model="from-preflight",
+        base_url=CANARY_BASE_URL,
         force=True,
     ) == 0
-    assert observed == ["llamacpp/from-cli"]
+    assert observed == ["from-preflight"]
 
 
 def test_heartbeat_runner_reports_progress_and_captures_output(tmp_path, capsys):
@@ -1180,7 +1241,6 @@ def test_heartbeat_runner_reports_progress_and_captures_output(tmp_path, capsys)
     result = canary._run_process_with_heartbeat(
         [sys.executable, "-c", child],
         root=tmp_path,
-        env=dict(os.environ),
         timeout=30,
         heartbeat=0.03,
     )
@@ -1196,7 +1256,6 @@ def test_heartbeat_runner_timeout_preserves_partial_output(tmp_path):
         canary._run_process_with_heartbeat(
             [sys.executable, "-c", child],
             root=tmp_path,
-            env=dict(os.environ),
             timeout=0.5,
             heartbeat=0.03,
         )
@@ -1217,7 +1276,7 @@ def test_live_canary_announces_reason_for_fresh_fingerprint(
         root=root,
         env=env,
         explicit_model="",
-        frontend_args=[],
+        base_url=CANARY_BASE_URL,
         force=False,
     ) == 0
     out = capsys.readouterr().out
@@ -1235,23 +1294,24 @@ def test_live_canary_announces_reason_for_expired_cache(monkeypatch, tmp_path, c
         root=root,
         env=env,
         explicit_model="",
-        frontend_args=[],
+        base_url=CANARY_BASE_URL,
         force=False,
     ) == 0
     capsys.readouterr()
 
-    cache_path = Path(env["AICODE_TOOL_CANARY_CACHE"])
+    cache_path = _cache_path(tmp_path)
     data = json.loads(cache_path.read_text(encoding="utf-8"))
     for entry in data["explicit"]:
         entry["checked_at"] -= 7200.0
     cache_path.write_text(json.dumps(data), encoding="utf-8")
 
-    env["AICODE_TOOL_CANARY_TTL_SECONDS"] = "3600"
+    # TTL 是 repo 常數,不是環境變數:直接 patch 那個常數。
+    monkeypatch.setattr(canary, "TOOL_CANARY_TTL_SECONDS", 3600)
     assert canary.run_all(
         root=root,
         env=env,
         explicit_model="",
-        frontend_args=[],
+        base_url=CANARY_BASE_URL,
         force=False,
     ) == 0
     out = capsys.readouterr().out
@@ -1266,7 +1326,7 @@ def test_live_canary_announces_forced_cache_bypass(monkeypatch, tmp_path, capsys
         root=root,
         env=env,
         explicit_model="",
-        frontend_args=[],
+        base_url=CANARY_BASE_URL,
         force=True,
     ) == 0
     assert "略過快取" in capsys.readouterr().out
@@ -1281,17 +1341,18 @@ def test_explicit_gate_and_implicit_diagnostic_are_separate(
     """Explicit failure blocks; an implicit failure is diagnostic-only."""
     root = tmp_path / "project"
     root.mkdir()
-    env = {"AICODE_TOOL_CANARY_WARN_ONLY": "1", "AICODE_MODEL": "example-code-model"}
+    # 兩個殘留的環境變數都已刪除,擺在這裡是為了證明它們一律無效。
+    env = {"AICODE_TOOL_CANARY_WARN_ONLY": "1", "AICODE_MODEL": "shell-leftover"}
     protocol = canary.ProtocolEvidence("a" * 64, "b" * 64)
     monkeypatch.setattr(
         canary,
         "run_protocol_check",
-        lambda root, env, timeout: protocol,
+        lambda root, timeout: protocol,
     )
     monkeypatch.setattr(
         canary,
         "fetch_main_server_props",
-        lambda env: {"chat_template_caps": {"supports_tools": True}},
+        lambda base_url: {"chat_template_caps": {"supports_tools": True}},
     )
     monkeypatch.setattr(
         canary,
@@ -1309,10 +1370,10 @@ def test_explicit_gate_and_implicit_diagnostic_are_separate(
         root=root,
         env=env,
         explicit_model="",
-        frontend_args=[],
+        base_url=CANARY_BASE_URL,
         force=True,
     ) == 0
-    assert implicit_calls == [canary.DEFAULT_IMPLICIT_TIMEOUT_SECONDS]
+    assert implicit_calls == [canary.TOOL_CANARY_IMPLICIT_TIMEOUT_SECONDS]
     assert "status=fail" in capsys.readouterr().err
 
     attempts = iter(
@@ -1333,7 +1394,7 @@ def test_explicit_gate_and_implicit_diagnostic_are_separate(
         root=root,
         env=env,
         explicit_model="",
-        frontend_args=[],
+        base_url=CANARY_BASE_URL,
         force=True,
     ) == 2
 
@@ -1382,12 +1443,12 @@ def test_supports_tools_false_stops_before_any_model_attempt(monkeypatch, tmp_pa
     monkeypatch.setattr(
         canary,
         "run_protocol_check",
-        lambda root, env, timeout: canary.ProtocolEvidence("a", "b"),
+        lambda root, timeout: canary.ProtocolEvidence("a", "b"),
     )
     monkeypatch.setattr(
         canary,
         "fetch_main_server_props",
-        lambda env: {"chat_template_caps": {"supports_tools": False}},
+        lambda base_url: {"chat_template_caps": {"supports_tools": False}},
     )
     monkeypatch.setattr(
         canary,
@@ -1398,6 +1459,6 @@ def test_supports_tools_false_stops_before_any_model_attempt(monkeypatch, tmp_pa
         root=root,
         env={},
         explicit_model="",
-        frontend_args=[],
+        base_url=CANARY_BASE_URL,
         force=True,
     ) == 2

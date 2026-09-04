@@ -49,38 +49,34 @@ tool-call 能力，不是 RAG 本身。[客戶端的內建基底規則](../READM
 
 預設情況下系統不能讀專案目錄以外的東西。這是安全限制：避免分析陌生程式碼時模型意外讀到家目錄裡的 SSH key、密碼、別的專案這類敏感資料。
 
-要讓外部檔案進到對話，要設兩個 env var，這兩個分工不同，**一起設才會生效**：
+要讓外部檔案進到對話，在 `~/.config/codetrail/client.json` 設兩個鍵，分工不同、**一起設才會生效**：
 
-| Env var | 角色 | 預設 |
+| client.json 的鍵 | 角色 | 預設 |
 |---|---|---|
-| `AI_CODE_ALLOW_EXTERNAL_IMPORT=1` | **總開關**。決定外部匯入功能能不能用 | 關閉 |
-| `AI_CODE_IMPORT_ROOTS="<目錄1>:<目錄2>:..."` | **白名單**。決定哪些目錄底下的檔案可以匯入 | `~/Downloads:/tmp` |
+| `"external_import": true` | **總開關**。決定外部匯入功能能不能用 | `false` |
+| `"external_import_roots": ["<目錄1>", "<目錄2>"]` | **白名單**。決定哪些目錄底下的檔案可以匯入 | `["~/Downloads", "/tmp"]` |
 
-只打開總開關，預設白名單只有 `~/Downloads` 和 `/tmp`，其他目錄底下的檔案還是拿不到。`AI_CODE_IMPORT_ROOTS` 一旦自己設了就**完全取代**預設清單 — 要保留 Downloads/tmp 記得自己列上。
+只打開總開關，預設白名單只有 `~/Downloads` 和 `/tmp`，其他目錄底下的檔案還是拿不到。
+`external_import_roots` 一旦自己設了就**完全取代**預設清單 — 要保留 Downloads/tmp 記得自己列上。
 
 幾種常見組合：
 
-```bash
-# 只用預設來源 (~/Downloads + /tmp)
-AI_CODE_ALLOW_EXTERNAL_IMPORT=1 aicode
+```json
+// 只用預設來源 (~/Downloads + /tmp)
+{ "external_import": true }
 
-# 保留預設 + 加一個自己的目錄
-AI_CODE_ALLOW_EXTERNAL_IMPORT=1 \
-AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot" \
-aicode
+// 保留預設 + 加一個自己的目錄
+{ "external_import": true,
+  "external_import_roots": ["~/Downloads", "/tmp", "~/u-boot"] }
 
-# 只開一個專用交換目錄（比放寬整個 home 安全）
-AI_CODE_ALLOW_EXTERNAL_IMPORT=1 \
-AI_CODE_IMPORT_ROOTS="$HOME/codetrail-import" \
-aicode
+// 只開一個專用交換目錄（比放寬整個 home 安全）
+{ "external_import": true,
+  "external_import_roots": ["~/codetrail-import"] }
 ```
 
-多個目錄用冒號分隔（跟 `$PATH` 一樣）。如果每次都用同一組設定，加進 `~/.bashrc` 就不用每次帶：
-
-```bash
-export AI_CODE_ALLOW_EXTERNAL_IMPORT=1
-export AI_CODE_IMPORT_ROOTS="$HOME/Downloads:/tmp:$HOME/u-boot"
-```
+這個開關把授權從「單次啟動」變成「跨專案持久」，所以**實際動作要逐次確認**：
+開了之後，每一次 `import_external_file` 仍然會跳核准框，框裡顯示來源與目的路徑。
+白名單之外的來源一律拒絕，核准框也不會出現。
 
 開啟後，對話裡先請模型把檔案複製進專案再分析：
 
@@ -309,7 +305,7 @@ figure chunk 會帶所在章節與 caption（`Table 3-1 …` / `圖 2-4 …`）�
 ```
 
 它在**任何 VL 呼叫、embedding 與 knowledge.json 寫入之前**算完就結束。超過上限會直接停下並
-指出是哪一項;上限在 `config.py` 的 `FIGURE_*`,可用同名 `AICODE_FIGURE_*` 環境變數覆寫。
+指出是哪一項;上限在 `config.py` 的 `FIGURE_*` 常數(改它是改 repo)。
 
 > preflight 涵蓋所有結構化候選，包含純 raster 的分類、雙樣本抽取與 image-token 估算。
 > 只有未被結構化候選覆蓋的舊 picture 相容 job 不受這些上限判定；若存在，報告會另外
@@ -571,14 +567,14 @@ confirm_against_image 設 True。
 
 切碎之後每個 chunk 會失去父文件的脈絡：同一份規格書有十個「測試結果」節，任何一段脫離父章節後幾乎沒有鑑別度。這個功能會在入庫時替每個 chunk 生成一段 50–100 token 的定位文字（「本節出自 <文件> 的 <章節路徑>，說明 <主題>」），只拿去餵檢索訊號。
 
-**兩個旗標都預設關閉**，因為開啟會改變兩件事：入庫從此需要主模型（不只 embedding server），而且如果你的主模型 URL 指到別台機器，整份文件的內容就會離開這台電腦（非 loopback 需要額外設 `AICODE_KB_CONTEXT_REMOTE_OK=1` 才放行）。
+**兩個旗標都預設關閉**，因為開啟會改變兩件事：入庫從此需要主模型（不只 embedding server），而且如果你的主模型 URL 指到別台機器，整份文件的內容就會離開這台電腦（非 loopback 需要在 `client.json` 設 `"kb_context_remote_ok": true` 才放行）。
 
 ```bash
 # 生成：只有這條路徑會生成，MCP 的 ingest_document 永遠不會
 python3 RAG.py rebuild --kb knowledge.json spec_a.pdf --context
 
-# 查詢時使用（也是緊急關閉開關，關掉不需要重建知識庫）
-AICODE_KB_CONTEXT_USE=1 aicode
+# 查詢時是否使用:`config.py` 的 KB_CONTEXT_USE（也是緊急關閉開關，
+# 關掉不需要重建知識庫）
 ```
 
 要知道的三件事：

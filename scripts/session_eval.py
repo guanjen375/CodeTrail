@@ -12,7 +12,6 @@ import json
 import os
 import re
 import stat
-import subprocess
 import sys
 import tempfile
 import time
@@ -25,11 +24,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import client_compaction  # noqa: E402
+import process_env  # noqa: E402
 import client_config  # noqa: E402
-import compaction_mode  # noqa: E402
+import compaction_formula  # noqa: E402
 import deployment_profile
 import model_resolution  # noqa: E402
 import root_safety  # noqa: E402
+import client_mcp  # noqa: E402
 import session_eval  # noqa: E402
 from scripts.eval_tool_routing import (  # noqa: E402
     EvalError,
@@ -45,7 +46,7 @@ _SAFE_CANDIDATE_LABEL_RE = re.compile(r"^[a-z][a-z0-9_]{2,79}$")
 
 # Defense in depth for replay against a real private project.  The client's
 # read-only policy denies every tool the server does not annotate readOnlyHint,
-# while the MCP server separately receives AI_CODE_PATCH=0 / AI_CODE_RUN_TESTS=0.
+# while the MCP server is separately started with --readonly.
 # 這份名單是**測試釘住的下限**,不是判準:判準是 readOnlyHint,所以漏加名單的
 # 新工具一樣被 deny。名字改成裸名(客戶端沒有 `codetrail_` 前綴)。
 MUTATING_FRONTEND_TOOLS = (
@@ -77,22 +78,20 @@ def _bounded_run(
     command: Sequence[str],
     *,
     cwd: Path,
-    env: Mapping[str, str],
     timeout: int,
-) -> subprocess.CompletedProcess[bytes]:
+) -> process_env.CompletedProcess[bytes]:
     try:
-        completed = subprocess.run(
+        completed = process_env.run(
             list(command),
             cwd=str(cwd),
-            env=dict(env),
-            stdin=subprocess.DEVNULL,
+            stdin=process_env.DEVNULL,
             capture_output=True,
             timeout=timeout,
             check=False,
         )
     except FileNotFoundError as exc:
         raise session_eval.SessionEvalError(f"command is unavailable: {command[0]}") from exc
-    except subprocess.TimeoutExpired as exc:
+    except process_env.TimeoutExpired as exc:
         stdout = exc.stdout if isinstance(exc.stdout, bytes) else b""
         stderr = exc.stderr if isinstance(exc.stderr, bytes) else b""
         if len(stdout) > MAX_SUBPROCESS_OUTPUT_BYTES or len(stderr) > MAX_SUBPROCESS_OUTPUT_BYTES:
@@ -110,16 +109,19 @@ def _load_suite(path: Path) -> dict[str, Any]:
 
 
 def _export_one(session_id: str, output_dir: Path, *, sanitized: bool) -> Path:
-    """從 CodeTrail 自家 session store 匯出一個對話(不再呼叫 `opencode export`)。"""
+    """從 CodeTrail 自家 session store 匯出一個對話。"""
     import client_store
 
-    root = os.environ.get("AICODE_ROOT") or os.getcwd()
+    # export 的 root 是**目前目錄**:session store 綁 root 雜湊,而使用者是
+    # `cd <專案>` 之後跑這支的。以前這裡認 `AICODE_ROOT`,殼層裡殘留一個別的
+    # 專案的值就會去別的 store 找,然後回報「沒有這個 session」。
+    root = os.getcwd()
     store = client_store.SessionStore(root)
     try:
         records = store.read(session_id)
     except client_store.SessionStoreError as exc:
         raise session_eval.SessionEvalError(f"session 讀取失敗: {exc}") from exc
-    exported = session_eval.validate_opencode_export(
+    exported = session_eval.validate_session_export(
         session_eval.export_from_store(session_id, records, sanitized=sanitized)
     )
     name = f"{session_eval.session_hash(session_id)}.json"
@@ -202,7 +204,7 @@ def _validate_project_root(raw: str) -> Path:
 
 
 def _hash_command_state(command: Sequence[str], *, root: Path, digest: hashlib._Hash) -> None:
-    completed = _bounded_run(command, cwd=root, env=os.environ, timeout=120)
+    completed = _bounded_run(command, cwd=root, timeout=120)
     digest.update(command[1].encode("utf-8") if len(command) > 1 else b"")
     digest.update(str(completed.returncode).encode("ascii"))
     digest.update(completed.stdout)
@@ -215,7 +217,6 @@ def project_state_digest(root: Path, state_paths: Sequence[str]) -> str:
     git_probe = _bounded_run(
         ["git", "rev-parse", "--is-inside-work-tree"],
         cwd=root,
-        env=os.environ,
         timeout=30,
     )
     if git_probe.returncode == 0 and git_probe.stdout.strip() == b"true":
@@ -323,6 +324,9 @@ def replay_client_config(*, keep_compaction: bool) -> dict[str, Any]:
         # replay 是唯讀的:寫入工具在 policy 與 MCP server 兩層都已經關掉,
         # 這裡不再開任何覆寫。
         "permission": {},
+        # 專案內的 AGENTS.md / lessons 不進 replay 的 system prompt:
+        # frozen suite 的可比性要求每個 candidate 看到同一份指示。
+        "project_instructions": False,
     }
 
 
@@ -352,7 +356,7 @@ def _compaction_identity(*, keep_compaction: bool, n_ctx: Any) -> dict[str, Any]
         "mode": (
             client_compaction.MODE_CODETRAIL if keep_compaction else client_compaction.MODE_OFF
         ),
-        "rules_digest": _file_digest(compaction_mode.RULES_DOC),
+        "rules_digest": _file_digest(compaction_formula.RULES_DOC),
     }
     if not keep_compaction:
         return identity
@@ -364,7 +368,7 @@ def _compaction_identity(*, keep_compaction: bool, n_ctx: Any) -> dict[str, Any]
         )
     try:
         derived = client_compaction.derive(n_ctx)
-    except compaction_mode.CompactionModeError as exc:
+    except compaction_formula.CompactionModeError as exc:
         raise session_eval.SessionEvalError(
             f"--keep-compaction cannot derive a compaction threshold for n_ctx={n_ctx}: {exc}"
         ) from exc
@@ -374,7 +378,7 @@ def _compaction_identity(*, keep_compaction: bool, n_ctx: Any) -> dict[str, Any]
 
 
 def client_identity() -> str:
-    """跑這次 replay 的客戶端身分(以前這一格是 ``opencode --version``)。"""
+    """跑這次 replay 的客戶端身分。"""
     parts = []
     for name in ("client_engine.py", "client_prompt.py", "codetrail_chat.py"):
         try:
@@ -386,8 +390,26 @@ def client_identity() -> str:
     return session_eval.text_digest("|".join(parts))
 
 
-def _normalise_base_url(env: Mapping[str, str]) -> str:
-    base = env.get("AICODE_LLAMA_BASE_URL") or "http://localhost:8080"
+def _profile_env() -> dict[str, str]:
+    """交給 `deployment_profile` 的環境:**只有 HOME**(Windows 的 USERPROFILE)。"""
+    home = os.environ.get("HOME")
+    if home:
+        return {"HOME": home}
+    profile = os.environ.get("USERPROFILE")
+    return {"USERPROFILE": profile} if profile else {}
+
+
+def _normalise_base_url(base_url: str | None = None) -> str:
+    """candidate 模型的端點:deployment profile 是唯一來源。
+
+    參數只保留給呼叫端**明確指定**的情況(測試)。以前這裡吃一個 env dict 再讀
+    `AICODE_LLAMA_BASE_URL`,而 production 傳進來的正是一份未剝除的行程環境 ——
+    等於殼層殘留一個值就能把 fingerprint 綁到別台機器的 server,而 suite 的
+    可比性靠的就是那個 fingerprint。
+    """
+    import config as _config
+
+    base = base_url or _config.LLAMA_BASE_URL
     if not isinstance(base, str) or not base.strip():
         raise session_eval.SessionEvalError("candidate model endpoint is invalid")
     base = base.rstrip("/")
@@ -439,10 +461,13 @@ def _candidate_identity(
     keep_compaction: bool = False,
 ) -> dict[str, Any]:
     bare = bare_model(model)
+    # registry 查表只交 HOME:`env` 是要遞給子行程的那一份(已剝掉 CodeTrail
+    # 的設定名),但 `resolve_model_reference` 認得 `AICODE_MODEL_REGISTRY*`,
+    # 而那是**啟動核心**的契約 —— 這一側只該從 models.json 查。
     expected_path = Path(
-        deployment_profile.resolve_model_reference(bare, env, must_exist=True)
+        deployment_profile.resolve_model_reference(bare, _profile_env(), must_exist=True)
     )
-    client = LocalJsonClient(_normalise_base_url(env), timeout_seconds=120)
+    client = LocalJsonClient(_normalise_base_url(), timeout_seconds=120)
     props = client.get_json("/props")
     if not _same_model_artifact(expected_path, _path_from_props(props)):
         raise session_eval.SessionEvalError(
@@ -488,7 +513,6 @@ def _required_servers_preflight(env: Mapping[str, str]) -> None:
     completed = _bounded_run(
         [sys.executable, str(REPO_ROOT / "scripts" / "required_model_servers_check.py")],
         cwd=REPO_ROOT,
-        env=env,
         timeout=60,
     )
     if completed.returncode != 0:
@@ -524,10 +548,12 @@ def _run_turn(
     env: Mapping[str, str],
     timeout: int,
     session_id: str | None,
+    client_config_path: Path,
     persist: bool = False,
+    skip_aux_preflight: bool = False,
 ) -> tuple[dict[str, Any], str]:
     # read-only replay:客戶端這一層 deny 全部非唯讀工具,MCP server 那一層
-    # 再關一次(AI_CODE_PATCH=0 / AI_CODE_RUN_TESTS=0),context metrics 也關掉。
+    # 再以 `--readonly` 關一次(寫入、執行、build 命令、context metrics、資料收集)。
     #
     # 多輪 case 必須 `--persist --session`:每一輪各起一個 ephemeral 行程的話,
     # 模型完全看不到上一輪 —— 「第二輪要引用第一輪的結論」這種 case 量到的是
@@ -535,22 +561,29 @@ def _run_turn(
     command = [
         sys.executable,
         str(REPO_ROOT / "codetrail_chat.py"),
+        "run",
         "--root",
         str(root),
         "--policy",
         "readonly",
+        "--model",
+        bare_model(model),
+        "--client-config",
+        str(client_config_path),
     ]
     if persist:
+        command.append("--persist")
         if session_id:
             command.extend(["--session", session_id])
-        command.extend(["run", "--persist"])
-    else:
-        command.append("run")
+    if skip_aux_preflight:
+        # 外層跳過附屬 server 硬閘時,每個 replay child 的 MCP 也要跳過;
+        # 不然外層跳了、child 照樣在 preflight 失敗。
+        command.append("--skip-aux-preflight")
     command.extend(["--format", "json", prompt])
     started = time.monotonic()
     timed_out = False
     try:
-        completed = _bounded_run(command, cwd=root, env=env, timeout=timeout)
+        completed = _bounded_run(command, cwd=root, timeout=timeout)
         stdout_bytes = completed.stdout
         returncode = completed.returncode
     except _CommandTimedOut as exc:
@@ -633,13 +666,10 @@ def _delete_generated_session(session_id: str, *, root: Path, env: Mapping[str, 
     try:
         import client_store
 
-        previous = dict(os.environ)
-        try:
-            os.environ.update({k: v for k, v in env.items() if isinstance(v, str)})
-            client_store.SessionStore(root).delete(session_id)
-        finally:
-            os.environ.clear()
-            os.environ.update(previous)
+        # store 的位置由 HOME / XDG_STATE_HOME 推導;把 replay 的 env **傳進去**,
+        # 不是暫時換掉整個 os.environ 再還原(那條路曾是「複製整份環境」的形狀,
+        # 而且例外時會把別的執行緒看到的環境一起換掉)。
+        client_store.SessionStore(root, env=env).delete(session_id)
     except Exception:  # noqa: BLE001 - 刪不掉要回報,不是丟 traceback
         return False
     return True
@@ -652,6 +682,8 @@ def _run_case(
     env: Mapping[str, str],
     timeout: int,
     keep_sessions: bool,
+    client_config_path: Path,
+    skip_aux_preflight: bool = False,
 ) -> dict[str, Any]:
     root = _validate_project_root(case["project_root"])
     state_paths = _state_paths(case)
@@ -669,10 +701,12 @@ def _run_case(
                     root=root,
                     prompt=turn["text"],
                     model=model,
-                    env={**env, "AICODE_ROOT": str(root)},
+                    env=env,
                     timeout=timeout,
                     session_id=generated_session,
+                    client_config_path=client_config_path,
                     persist=persist,
+                    skip_aux_preflight=skip_aux_preflight,
                 )
                 turn_results.append(result)
                 if result["harness_error"] or not result["terminal"]:
@@ -786,31 +820,21 @@ def command_run(args: argparse.Namespace) -> int:
     output_path = output_dir / output_name
     keep_compaction = bool(getattr(args, "keep_compaction", False))
     bare = bare_model(args.model)
-    env = os.environ.copy()
-    env.update(
-        {
-            "AICODE_MODEL": bare,
-            "AI_CODE_COLLECT_DATA": "0",
-            "AI_CODE_PATCH": "0",
-            "AI_CODE_RUN_TESTS": "0",
-            "AICODE_LESSONS_SKIP": "1",
-            # 專案內的 AGENTS.md / lessons 不進 replay 的 system prompt:
-            # frozen suite 的可比性要求每個 candidate 看到同一份指示。
-            "CODETRAIL_DISABLE_PROJECT_INSTRUCTIONS": "1",
-            # replay 的契約是前後 project state 不變。
-            "AICODE_CTX_METRICS_ENABLED": "0",
-        }
-    )
+    # replay 的每一項設定都走 **argv** 或 replay 自己那份 client.json:
+    #   * 模型 → `run --model`
+    #   * 寫入 / 執行 / context metrics / 資料收集 → `run --policy readonly`
+    #     (它同時讓 MCP 以 `--readonly` 起、讓客戶端 `apply_to_config(readonly=True)`)
+    #   * 專案內 AGENTS.md 與 lessons → replay client.json 的 `project_instructions=false`
+    # 環境不再帶任何 CodeTrail 設定;子行程的環境在交出去之前也會被剝乾淨。
+    env = client_mcp.child_env()
     with tempfile.TemporaryDirectory(prefix="codetrail-session-eval-") as raw_temp:
         temp_dir = Path(raw_temp)
         temp_dir.chmod(0o700)
         # replay 用自己寫的 client.json,不讀使用者那一份:同一份 suite 在兩台
         # 機器上必須量到同一件事,而一台沒設過 client.json 的新部署會直接沒有
         # 壓縮(而且沒有任何欄位記得)。
-        env["CODETRAIL_CLIENT_CONFIG"] = str(
-            _write_replay_client_config(
-                temp_dir, replay_client_config(keep_compaction=keep_compaction)
-            )
+        client_config_path = _write_replay_client_config(
+            temp_dir, replay_client_config(keep_compaction=keep_compaction)
         )
         identity = _candidate_identity(
             model=args.model, env=env, keep_compaction=keep_compaction,
@@ -853,6 +877,8 @@ def command_run(args: argparse.Namespace) -> int:
                     env=env,
                     timeout=args.turn_timeout,
                     keep_sessions=args.keep_sessions,
+                    client_config_path=client_config_path,
+                    skip_aux_preflight=bool(args.skip_aux_preflight),
                 )
             )
             result = _candidate_result_payload(suite, candidate, cases)
@@ -956,7 +982,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (deployment_profile.ProfileError, ValueError) as exc:
         _print(f"FAIL — {type(exc).__name__}", error=True)
         return 2
-    except (EvalError, compaction_mode.CompactionModeError) as exc:
+    except (EvalError, compaction_formula.CompactionModeError) as exc:
         # 壓縮門檻推不出來會丟 CompactionModeError,catalog 契約會丟 EvalError。
         # 兩者都在 commit 之前安全失敗,但沒有接的話會吐 traceback 而不是既有
         # 的乾淨診斷。

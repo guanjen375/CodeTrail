@@ -1,4 +1,4 @@
-"""codetrail_chat / client_tui / client_events 的前端契約。
+"""codetrail_chat / client_events 的前端契約(headless 與事件流)。
 
 事件流是 canary、routing eval 與 session_eval replay 共用的介面,所以它的形狀
 與解析器是契約,不是實作細節:各自寫一份解析器時,同一次 run 在兩邊會得到不同
@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,6 @@ import client_mcp  # noqa: E402
 import client_policy  # noqa: E402
 import client_prompt  # noqa: E402
 import client_store  # noqa: E402
-import client_tui  # noqa: E402
 import codetrail_chat  # noqa: E402
 from mcp_contract import PUBLIC_TOOL_ORDER  # noqa: E402
 
@@ -161,7 +161,7 @@ def test_headless_defaults_to_ephemeral(tmp_path, monkeypatch, capsys):
         lambda **_k: iter([{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}]),
     )
     monkeypatch.setattr(codetrail_chat.config, "require_main_model", lambda: "m")
-    exit_code = codetrail_chat.main(["--root", str(root), "run", "hi"])
+    exit_code = codetrail_chat.main(["run", "--root", str(root), "hi"])
     assert exit_code == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
     assert [e["type"] for e in events] == ["session", "text", "step_finish"]
@@ -181,48 +181,91 @@ def test_headless_can_persist_when_asked(tmp_path, monkeypatch, capsys):
         lambda **_k: iter([{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}]),
     )
     monkeypatch.setattr(codetrail_chat.config, "require_main_model", lambda: "m")
-    codetrail_chat.main(["--root", str(root), "run", "--persist", "hi"])
+    codetrail_chat.main(["run", "--root", str(root), "--persist", "hi"])
     capsys.readouterr()
     assert len(client_store.SessionStore(root).list_sessions()) == 1
 
 
-def test_the_readonly_policy_is_selectable_from_the_cli():
+@pytest.mark.smoke
+def test_the_interactive_namespace_builds_engine_options(tmp_path):
+    """互動路徑的 namespace **沒有** `--policy`(它只掛在 `run` 上)。
+
+    紅燈長這樣:`AttributeError: 'Namespace' object has no attribute 'policy'` ——
+    而且要跑完整套 preflight(profile / 模型 / n_ctx / 附屬 server / canary)之後
+    才炸,所以任何只用手捏 namespace 的測試都看不到。這裡用**真的** parser 解出來
+    的那一個。
+    """
+    args = codetrail_chat.build_parser().parse_args(["-c"])
+    options = codetrail_chat._engine_options(
+        tmp_path, args, types.SimpleNamespace(model="m", n_ctx=8192)
+    )
+    assert options.policy.name == "interactive"
+    assert options.model == "m" and options.n_ctx == 8192
+
+
+@pytest.mark.smoke
+def test_the_readonly_policy_is_only_on_the_internal_entry():
+    """`--policy` 不再是頂層旗標:使用者入口沒有它,只有內部的 `run` 有。
+
+    留在頂層等於「互動 session 也能被要求跑 readonly」——那不是使用者需要的東西,
+    而且它會出現在 `aicode --help` 裡。
+    """
     parser = codetrail_chat.build_parser()
-    args = parser.parse_args(["--policy", "readonly", "run", "hi"])
+    args = parser.parse_args(["run", "--policy", "readonly", "hi"])
     assert codetrail_chat.POLICIES[args.policy] is client_policy.ReadOnlyPolicy
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--policy", "readonly"])
 
 
-def test_readonly_turns_off_the_servers_write_tools_as_a_second_layer():
+@pytest.mark.smoke
+def test_the_second_layer_travels_as_argv_not_environment(tmp_path):
     """第一層是客戶端的 deny;第二層是 MCP server 自己也關掉寫入與執行。
 
-    只有第一層的話,任何繞過 policy 的路徑(bug、未來的新前端)都會直接寫到
-    使用者的專案。context metrics 也要關:replay 的契約是前後 project state
-    不變,而它預設寫進 `<root>/.codetrail/`。
+    第二層走 **argv**(`--readonly`),而且子行程的環境在交出去之前把整組
+    `AICODE_* / AI_CODE_* / CODETRAIL_* / OPENCODE_*` 剝掉 —— 殼層裡殘留的
+    `AI_CODE_PATCH=1` 不得把它翻回來。
     """
-    env = codetrail_chat._server_env("readonly")
-    assert env["AI_CODE_PATCH"] == "0"
-    assert env["AI_CODE_RUN_TESTS"] == "0"
-    assert env["AI_CODE_ENABLE_BUILD_COMMANDS"] == "0"
-    assert env["AICODE_CTX_METRICS_ENABLED"] == "0"
-    assert codetrail_chat._server_env("interactive") == {}
-
-
-def test_the_server_actually_honours_the_readonly_env(tmp_path):
-    """第二層不是宣告而已:真的起一次 server,確認寫入工具被關掉。"""
     import client_mcp as mcp_module
 
+    client = mcp_module.McpClient(tmp_path, readonly=True)
+    assert client.readonly is True
+    assert client._argv[-1] == "--readonly"  # noqa: SLF001 - 同一個包
+    assert mcp_module.McpClient(tmp_path)._argv[-1] != "--readonly"  # noqa: SLF001
+
+
+@pytest.mark.smoke
+def test_the_server_actually_honours_readonly(tmp_path, monkeypatch):
+    """第二層不是宣告而已:真的起一次 server,確認寫入工具被關掉。
+
+    而且它是 **argv**:同時把舊世代那三個環境變數設成「開」,它們不得把
+    `--readonly` 翻回來(殼層裡殘留的同名變數是真實情境 —— 兩份安裝共用一台機器)。
+
+    2026-09-04(總審 F1-9):污染改放在**父行程的環境**(`monkeypatch.setenv`),
+    不再經 `env=` 覆寫通道遞進去 —— 那條通道現在對四個前綴一律 fail-loud,
+    而真實情境本來就是「殼層裡有殘留」,不是「呼叫端明確要求」。
+    """
+    import client_mcp as mcp_module
+
+    for name in ("AI_CODE_PATCH", "AI_CODE_RUN_TESTS", "AI_CODE_ENABLE_BUILD_COMMANDS"):
+        monkeypatch.setenv(name, "1")
     (tmp_path / "x.py").write_text("x = 1\n", encoding="utf-8")
     client = mcp_module.McpClient(
         tmp_path,
-        env={
-            "XDG_STATE_HOME": str(tmp_path / ".state"),
-            "AICODE_LLAMA_BASE_URL": "http://127.0.0.1:65535",
-            "AICODE_MODEL": "example-code-model",
-            "AICODE_REQUIRED_MODELS_CHECK_SKIP": "1",
-            **codetrail_chat.READONLY_SERVER_ENV,
-        },
+        readonly=True,
+        # 設定來自 conftest 建的 tmp HOME(deployment.json 指向沒人聽的 port);
+        # 附屬 server 的硬閘用 argv 跳過。
+        argv=[
+            sys.executable,
+            str(mcp_module.SERVER_SCRIPT),
+            "--root",
+            str(tmp_path),
+            "--readonly",
+            "--skip-aux-preflight",
+        ],
+        env={"XDG_STATE_HOME": str(tmp_path / ".state")},
         start_timeout=120.0,
     )
+    assert "--readonly" in client._argv  # noqa: SLF001 - 同一個包
     try:
         result = client.call(
             "apply_patch",
@@ -240,7 +283,7 @@ def test_run_with_a_session_requires_persist(tmp_path, monkeypatch):
     root.mkdir()
     with pytest.raises(SystemExit, match="--persist"):
         codetrail_chat.main(
-            ["--root", str(root), "--session", "20260101T000000-abcdef01", "run", "hi"]
+            ["run", "--root", str(root), "--session", "20260101T000000-abcdef01", "hi"]
         )
 
 
@@ -253,45 +296,10 @@ class _FakeMcpClient(_FakeMcp):
 
 
 # ============================================================
-# TUI
-# ============================================================
-def test_slash_commands_do_not_call_the_model(tmp_path, monkeypatch, capsys):
-    engine = _engine(tmp_path)
-    tui = client_tui.Tui(engine, state_dir=tmp_path / "state")
-    assert tui._command("/help") is None
-    assert tui._command("/tools") is None
-    assert tui._command("/exit") is False
-    output = capsys.readouterr().out
-    assert "list_dir" in output
-    assert "/compact" in output
-
-
-def test_the_approval_prompt_shows_the_whole_patch(tmp_path, monkeypatch, capsys):
-    engine = _engine(tmp_path)
-    tui = client_tui.Tui(engine, state_dir=tmp_path / "state")
-    patch = "--- a/x.py\n+++ b/x.py\n@@\n-old\n+new\n" * 30
-    monkeypatch.setattr("builtins.input", lambda *_a: "n")
-    granted = tui.approve(client_engine.ApprovalRequest("s", "apply_patch", {"diff": patch}))
-    assert granted is False
-    assert patch in capsys.readouterr().out
-
-
-def test_an_eof_at_the_approval_prompt_is_a_refusal(tmp_path, monkeypatch):
-    engine = _engine(tmp_path)
-    tui = client_tui.Tui(engine, state_dir=tmp_path / "state")
-
-    def _eof(*_args):
-        raise EOFError
-
-    monkeypatch.setattr("builtins.input", _eof)
-    assert tui.approve(client_engine.ApprovalRequest("s", "run_command", {})) is False
-
-
-# ============================================================
-# 總審第 1 輪回修:readonly 連客戶端自己的 metrics 也關;換 session 不消耗停用警告
+# readonly:連客戶端自己的 context metrics 也要關
 # ============================================================
 class _ReadonlyFakeMcpClient(_FakeMcpClient):
-    _env_overrides = dict(codetrail_chat.READONLY_SERVER_ENV)
+    readonly = True
 
 
 def test_a_readonly_run_never_writes_context_metrics_into_the_project(tmp_path, monkeypatch, capsys):
@@ -310,154 +318,65 @@ def test_a_readonly_run_never_writes_context_metrics_into_the_project(tmp_path, 
         lambda **_k: iter([{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}]),
     )
     monkeypatch.setattr(codetrail_chat.config, "require_main_model", lambda: "m")
-    assert codetrail_chat.main(["--root", str(root), "--policy", "readonly", "run", "hi"]) == 0
+    assert codetrail_chat.main(["run", "--root", str(root), "--policy", "readonly", "hi"]) == 0
     capsys.readouterr()
     assert not (root / ".codetrail" / "context_metrics.jsonl").exists()
     assert config.CTX_METRICS_ENABLED is False
 
 
-def test_changing_session_rebinds_without_consuming_the_stop_notice(tmp_path):
-    """`/new` / `/resume` 只重綁;「每個 session 只講一次」的停用警告留給送出當下。"""
-    engine = _engine(tmp_path)
-    calls = {"rebind": 0, "notice": 0}
-
-    def _rebind():
-        calls["rebind"] += 1
-
-    def _notice():
-        calls["notice"] += 1
-        return "已停用"
-
-    tui = client_tui.Tui(
-        engine, state_dir=tmp_path / "state", before_send=_notice, on_session_change=_rebind
-    )
-    tui._session_changed()
-    assert calls == {"rebind": 1, "notice": 0}
-
-
-def test_new_session_resets_store_error_through_the_tui(tmp_path, capsys):
-    engine = _engine(tmp_path)
-    engine.store_error = "OSError: disk full"
-    tui = client_tui.Tui(engine, state_dir=tmp_path / "state")
-    tui._command("/new")
-    assert engine.store_error is None
-
-
-# ============================================================
-# 總審第 2 輪回修:/new 失敗不得帶走 REPL;history 檔的防線
-# ============================================================
-class _FlakyStore(client_store.EphemeralSessionStore):
-    def __init__(self, root):
-        super().__init__(root)
-        self.calls = 0
-
-    def create(self, *args, **kwargs):
-        self.calls += 1
-        if self.calls > 1:
-            raise OSError("disk full")
-        return super().create(*args, **kwargs)
-
-
-def test_a_failed_new_keeps_the_repl_and_the_current_session(tmp_path, capsys):
-    engine = _engine(tmp_path, store=_FlakyStore(tmp_path))
-    engine.messages = [{"role": "user", "content": "q"}]
-    session = engine.session_id
-    tui = client_tui.Tui(engine, state_dir=tmp_path / "state")
-    assert tui._command("/new") is None
-    assert engine.session_id == session and engine.messages == [{"role": "user", "content": "q"}]
-    assert "無法開新對話" in capsys.readouterr().out
-
-
-class _FakeReadline:
-    def __init__(self, items):
-        self.items = list(items)
-
-    def get_current_history_length(self):
-        return len(self.items)
-
-    def get_history_item(self, index):
-        return self.items[index - 1]
-
-
-@pytest.mark.smoke
-def test_saving_history_never_writes_through_a_hard_link(tmp_path):
-    """舊做法先 O_TRUNC 開檔再驗 nlink:被指向的別人的檔案在拒絕之前就先被清空了。"""
-    import os
-
-    engine = _engine(tmp_path)
-    state = tmp_path / "sessions" / "hash"
-    state.mkdir(parents=True)
-    victim = tmp_path / "victim.txt"
-    victim.write_text("keep me\n", encoding="utf-8")
-    os.link(victim, state / client_tui.HISTORY_FILENAME)
-    tui = client_tui.Tui(engine, state_dir=state)
-    tui._save_history(_FakeReadline(["問過的 NDA 問題"]))
-    assert victim.read_text(encoding="utf-8") == "keep me\n"
-    written = state / client_tui.HISTORY_FILENAME
-    assert written.read_text(encoding="utf-8") == "問過的 NDA 問題\n"
-    assert written.stat().st_nlink == 1 and oct(written.stat().st_mode & 0o777) == "0o600"
-
-
-@pytest.mark.smoke
-def test_saving_history_never_follows_a_symlink(tmp_path):
-    engine = _engine(tmp_path)
-    state = tmp_path / "sessions" / "hash"
-    state.mkdir(parents=True)
-    victim = tmp_path / "victim.txt"
-    victim.write_text("keep me\n", encoding="utf-8")
-    (state / client_tui.HISTORY_FILENAME).symlink_to(victim)
-    tui = client_tui.Tui(engine, state_dir=state)
-    tui._save_history(_FakeReadline(["問過的 NDA 問題"]))
-    assert victim.read_text(encoding="utf-8") == "keep me\n"
-    assert not (state / client_tui.HISTORY_FILENAME).is_symlink()
-
-
-@pytest.mark.smoke
-def test_loading_history_never_reads_through_a_symlink(tmp_path):
-    """path-based read_history_file 會跟著 symlink 走,把別人的檔讀進歷史。"""
-    readline = pytest.importorskip("readline")
-    engine = _engine(tmp_path)
-    state = tmp_path / "sessions" / "hash"
-    state.mkdir(parents=True)
-    victim = tmp_path / "victim.txt"
-    victim.write_text("SOMEONE ELSES SECRET LINE\n", encoding="utf-8")
-    (state / client_tui.HISTORY_FILENAME).symlink_to(victim)
-    readline.clear_history()
-    client_tui.Tui(engine, state_dir=state)._setup_readline()
-    items = [readline.get_history_item(i) for i in range(1, readline.get_current_history_length() + 1)]
-    assert "SOMEONE ELSES SECRET LINE" not in items
-
-
-# ── 總審第 3 輪回修(F3-6):頂層 --session 要傳進 attach ──
-
-@pytest.mark.smoke
-def test_a_global_session_reaches_the_attach_command(monkeypatch):
-    """`codetrail_chat.py --session S attach`:頂層 --session 解析進 args.session,
-    attach 以前只讀自己的 -s,指定的 session 被靜默忽略。"""
-    seen: dict = {}
-
-    def _run(url, **kwargs):
-        seen["url"] = url
-        seen.update(kwargs)
-        return 0
-
-    import client_attach
-
-    monkeypatch.setattr(client_attach, "run", _run)
-    assert codetrail_chat.main(["--session", "S123", "attach"]) == 0
-    assert seen["session"] == "S123"
-    assert codetrail_chat.main(["--session", "S123", "attach", "-s", "S456"]) == 0
-    assert seen["session"] == "S456"          # attach 自己的 -s 優先
-
-
-# ── 總審第 4 輪回修(F4-3):--model 走跟 wrapper 同一套正規化 ──
+# ── --model 走跟 wrapper 同一套正規化 ──
 
 @pytest.mark.smoke
 def test_a_provider_prefixed_model_is_normalised_like_the_wrapper(tmp_path):
-    """`--model llamacpp/foo` 以前原樣進 EngineOptions,web 與終端就用了兩個不同的模型名稱;
-    外部 provider 一律拒絕。"""
+    """`--model llamacpp/foo` 以前原樣進 EngineOptions,wrapper 與客戶端就用了兩個不同的
+    模型名稱;外部 provider 一律拒絕。"""
     assert codetrail_chat._cli_model("llamacpp/foo") == "foo"
     assert codetrail_chat._cli_model("foo") == "foo"
     assert codetrail_chat._cli_model("  ") == ""
     with pytest.raises(SystemExit):
         codetrail_chat._cli_model("openai/gpt-4o")
+
+
+# ── 總審 F1-11:headless `run` 也要跑 idle 壓縮,並把結果放進事件流 ──
+
+
+@pytest.mark.smoke
+def test_headless_run_compacts_after_a_completed_turn_and_reports_it(tmp_path, monkeypatch, capsys):
+    """`session_eval --keep-compaction` 量的是壓縮品質;headless 不壓等於量一個
+    不存在的東西,而 identity 上還寫著 `codetrail` mode。
+
+    唯一建立 Compactor 的地方以前在互動 TUI 分支。這裡驗:headless 答完(finish=stop)
+    之後會呼叫 `Compactor.compact()`,而且事件流裡出現 `compaction` 事件。
+    """
+    import client_compaction
+    import llama_client
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    root = tmp_path / "project"
+    root.mkdir()
+    cfg = tmp_path / "client.json"
+    cfg.write_text(json.dumps({"schema": 1, "compaction_mode": "codetrail"}), encoding="utf-8")
+    cfg.chmod(0o600)
+    tmp_path.chmod(0o700)
+    monkeypatch.setattr(client_mcp, "shared_client", lambda *_a, **_k: _FakeMcpClient())
+    monkeypatch.setattr(
+        llama_client, "chat_completions",
+        lambda **_k: iter([{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}]),
+    )
+    monkeypatch.setattr(codetrail_chat.config, "require_main_model", lambda: "m")
+    calls: list[str] = []
+
+    def fake_compact(self, *, manual=False):
+        calls.append("manual" if manual else "idle")
+        return client_compaction.CompactionOutcome("compacted", "threshold", "壓縮完成")
+
+    monkeypatch.setattr(client_compaction.Compactor, "compact", fake_compact)
+    exit_code = codetrail_chat.main(
+        ["run", "--root", str(root), "--client-config", str(cfg), "hi"]
+    )
+    assert exit_code == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert calls == ["idle"], calls
+    kinds = [e["type"] for e in events]
+    assert "compaction" in kinds, kinds
+    assert kinds[-1] == "step_finish", "終結事件仍然要在最後"

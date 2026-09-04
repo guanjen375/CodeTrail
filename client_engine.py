@@ -3,7 +3,7 @@
 """client_engine — CodeTrail 聊天客戶端的引擎層。
 
 負責 session 狀態、訊息組裝、工具迴圈、權限、事件流。**不負責畫面**:
-終端 REPL、headless `run --format json` 與 web 都是這一層之上的薄前端。
+終端 TUI 與 headless `run --format json` 都是這一層之上的薄前端。
 
 三件事決定了這一層的形狀:
 
@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import os
 import threading
@@ -49,9 +50,6 @@ PRUNE_MINIMUM_TOKENS = 20_000
 PRUNE_SKIP_USER_TURNS = 2
 PRUNE_PLACEHOLDER = "[Old tool result content cleared]"
 
-#: 關掉「舊回合 reasoning 不進模型」的逃生門(沿用既有 env 名)。
-KEEP_REASONING_ENV = "CODETRAIL_KEEP_REASONING"
-
 #: 每個 MCP instance(等於每個 AICODE_ROOT / 每個 llama-server)一把模型鎖。
 #: llama-server 是單 slot;同一行程裡的每個對話各自 new 一把鎖的話,兩條對話
 #: 會同時進到那個 slot,排隊變成 server 端看不懂的等待。用 WeakKeyDictionary
@@ -74,11 +72,6 @@ _TRUTHY = ("1", "true", "yes", "on")
 
 class EngineError(RuntimeError):
     """引擎層的錯誤(設定不完整、模型端點拒絕等)。"""
-
-
-def keep_reasoning_enabled(env: Mapping[str, str] | None = None) -> bool:
-    environ = os.environ if env is None else env
-    return str(environ.get(KEEP_REASONING_ENV, "")).strip().lower() in _TRUTHY
 
 
 # ============================================================
@@ -199,7 +192,7 @@ class HistoryPersistError(RuntimeError):
 
 
 #: 這一輪被使用者中斷。類別住在 client_events(壓縮端要認得出它);這裡只是別名。
-#: 終端 REPL 的 Ctrl-C 走的是 KeyboardInterrupt;web / attach 沒有 signal 可用,所以
+#: 前景終端的 Ctrl-C 走的是 KeyboardInterrupt;TUI 在 worker 執行緒裡沒有 signal 可用,所以
 #: 另有這條協作式路徑:串流每收到一個 chunk 就看一次旗標,進行中的 MCP 呼叫則直接走
 #: client_mcp 的取消契約(notifications/cancelled → 寬限期 → SIGTERM)。
 TurnCancelled = client_events.TurnCancelled
@@ -207,7 +200,7 @@ TurnCancelled = client_events.TurnCancelled
 
 LENGTH_CUT_MESSAGE = (
     "模型的輸出被 max_tokens 切掉(finish_reason=length):這一則不完整,不會被當成答案;"
-    "被切到一半的工具呼叫也不會執行。請縮小問題或提高 AICODE_CLIENT_MAX_OUTPUT_TOKENS。"
+    "被切到一半的工具呼叫也不會執行。請縮小問題;輸出上限是 repo 常數 config.CLIENT_MAX_OUTPUT_TOKENS。"
 )
 
 TRUNCATED_STREAM_MESSAGE = (
@@ -393,6 +386,21 @@ class ApprovalRequest:
             value = self.arguments[key]
             text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
             lines.append(f"  {key} = {text}")
+        if self.tool == "import_external_file":
+            # 落點是工具之後才算的;只顯示 source_path 的核准等於核准一個不知道會
+            # 寫到哪的動作。這裡用**同一套**檔名安全化算出目的路徑;同名時工具會
+            # 加 `_N` 尾碼,所以也講明。
+            import external_import
+
+            source = str(self.arguments.get("source_path") or "")
+            explicit = self.arguments.get("dest_name")
+            explicit = explicit if isinstance(explicit, str) and explicit.strip() else None
+            try:
+                planned = external_import.planned_destination(source, explicit)
+            except ValueError as exc:
+                lines.append(f"  → 目的: 無法決定 —— {exc}")
+            else:
+                lines.append(f"  → 目的: {planned}(沙箱 root 內;同名已存在時會加 _N 尾碼)")
         return "\n".join(lines)
 
 
@@ -447,11 +455,11 @@ class Engine:
         self._turn_completed = False           # 這一輪的答案 / 摘要已經**決定寫定**(之後的取消一律拒絕)
         self._turn_seen_since_clear = False    # 自上次 clear_cancel() 起 engine 開始過 turn(不管是寫定、失敗或中斷):
                                                # 閒置期的取消一律拒絕——「閒置且沒開始過」才是 worker 還沒進 send()
-        self._armed = False                    # web 在 worker 進 send() 之前就取消:下一個 turn 一開始就中斷
+        self._armed = False                    # 協調器在 worker 進 send() 之前就取消:下一個 turn 一開始就中斷
         # 取消的線性化鎖:_in_turn / _turn_completed / _turn_seen_since_clear / _armed 與
         # 「決定寫定」(_decide_commit)都在這把鎖裡;真正的 _record()(store append + fsync)
         # 在鎖外。request_cancel() 在鎖內原子決定接受 / 拒絕 / 武裝(見它的 docstring),
-        # cancel() 與 web 的 WebApp.cancel() 都走它;clear_cancel() 是 web 的回合邊界。
+        # cancel() 與 client_turns 的協調器都走它;clear_cancel() 是協調器的回合邊界。
         # 於是取消與寫定只有兩種順序:取消先到 → 這一則不寫、以 TurnCancelled 結束;寫定先
         # 決定 → 取消拒絕。不會有「回 True 卻保留答案」或「收尾清完旗標才補設」。
         self._turn_state = threading.Lock()
@@ -514,7 +522,7 @@ class Engine:
         `docs/compaction-rules.md` 的「被清掉的工具結果進不了下一次摘要」。
         """
         working = heal_in_place(messages)
-        if not (self.options.keep_reasoning or keep_reasoning_enabled(self.env)):
+        if not self.options.keep_reasoning:
             working = strip_historical_reasoning(working)
         if self.options.prune:
             working, _pruned = prune_old_tool_outputs(working)
@@ -611,10 +619,10 @@ class Engine:
         return session_id
 
     def clear_cancel(self) -> None:
-        """web 在一輪(含尾端的壓縮)確定結束後呼叫:任何來不及消費的取消旗標都不得留到下一題。
+        """協調器在一輪(含尾端的壓縮)確定結束後呼叫:任何來不及消費的取消旗標都不得留到下一題。
 
         同時重設「這個回合裡 engine 開始過 turn」與「預先武裝」兩個閒置期狀態——它們是
-        web 回合邊界的一部分(下一個回合的真 prestart 才能再武裝)。
+        協調器回合邊界的一部分(下一個回合的真 prestart 才能再武裝)。
         """
         with self._turn_state:
             self._cancel.clear()
@@ -673,7 +681,7 @@ class Engine:
         if healed != len(working):
             summary["healed_tool_calls"] = healed - len(working)
         working = heal_in_place(working)
-        if not (self.options.keep_reasoning or keep_reasoning_enabled(self.env)):
+        if not self.options.keep_reasoning:
             before = sum(
                 1
                 for message in working
@@ -709,7 +717,7 @@ class Engine:
         approve: Callable[[ApprovalRequest], bool] | None = None,
     ) -> TurnResult:
         emit = on_event or (lambda _event: None)
-        # 旗標**不在這裡清**:web 的 cancel 可能在 worker 還沒進到 send() 之前就到,
+        # 旗標**不在這裡清**:協調器的 cancel 可能在 worker 還沒進到 send() 之前就到,
         # 開始時清掉就是 lost-cancel。改在這一輪收尾(_end_turn,計數歸零)時清。
         # resume 進來的歷史可能停在一個沒有結果的 tool_call(上次崩潰 / 中斷)。
         # 先補完再記新問題,順序才會是 assistant(tool_calls) → tool → user。
@@ -783,7 +791,7 @@ class Engine:
                 if self._cancel.is_set():
                     raise TurnCancelled("這一輪已被使用者中斷")
         except BaseException:
-            # 取消與 KeyboardInterrupt(終端 REPL)都走這裡,而且只放棄一次。
+            # 取消與 KeyboardInterrupt(headless 前景)都走這裡,而且只放棄一次。
             if done.is_set():
                 _close_quietly(box.get("stream"))   # 剛好到了:直接關,鎖照常由 with 放
             else:
@@ -808,7 +816,7 @@ class Engine:
                 self._turn_completed = False
                 self._turn_seen_since_clear = True
                 if self._armed:
-                    # web 在 worker 進來之前就取消了:這一輪一開始就是中斷。
+                    # 協調器在 worker 進來之前就取消了:這一輪一開始就是中斷。
                     self._armed = False
                     self._cancel.set()
 
@@ -825,7 +833,7 @@ class Engine:
         跟 ``request_cancel()`` 在同一把 ``_turn_state`` 鎖裡:取消先到 → 這裡看到旗標,
         以 ``TurnCancelled`` 結束、**什麼都不寫**;這裡先到 → 之後的取消一律拒絕。
         鎖裡只做決定,不做 I/O:真正的 ``_record()``(store append + fsync)在鎖外——
-        不然 web 的 app lock 會跟著等 fsync。
+        不然協調器的鎖會跟著等 fsync。
         """
         with self._turn_state:
             if self._cancel.is_set():
@@ -860,9 +868,9 @@ class Engine:
           回 ``CancelDecision(True, call)``;``call`` 是進行中的 MCP 呼叫(可能 ``None``),
           交給 ``cancel_pending()`` 在**鎖外**走完整取消契約(會等寬限期,不能在共用鎖裡做)。
         - 有進行中的 turn、但已決定寫定 → 拒絕(``accepted=False``),什麼都不動。
-        - 閒置:``arm_when_idle=False``(``cancel()``)→ 拒絕。``arm_when_idle=True``(web,它
-          自己管理回合邊界):這個 web 回合裡 engine **已經開始過** turn(答案已寫定、或 send()
-          失敗 / 中斷退出、或壓縮還沒開始)→ 拒絕——沒有東西可取消,web 會照原結果收尾;
+        - 閒置:``arm_when_idle=False``(``cancel()``)→ 拒絕。``arm_when_idle=True``(協調器,它
+          自己管理回合邊界):這個協調器回合裡 engine **已經開始過** turn(答案已寫定、或 send()
+          失敗 / 中斷退出、或壓縮還沒開始)→ 拒絕——沒有東西可取消,協調器會照原結果收尾;
           engine 自 ``clear_cancel()`` 起**還沒開始過**任何 turn(worker 還沒進 send())→ 預先
           武裝,下一個 turn 一開始就中斷,接受。
 
@@ -944,7 +952,7 @@ class Engine:
             self.heal_pending_tool_calls()
             raise
         finally:
-            # 這一輪結束才清旗標(見 send());web 只在 turn 進行中才會呼叫
+            # 這一輪結束才清旗標(見 send());協調器只在 turn 進行中才會呼叫
             # cancel(),所以不會有「沒在跑卻被取消」的旗標留到下一輪。
             self._end_turn()
 
@@ -1267,7 +1275,7 @@ class Engine:
                     approve(ApprovalRequest(self.session_id, name, dict(arguments)))
                 )
             if self._cancel.is_set():
-                # web 的 cancel 會把等待中的核准回成「拒絕」來喚醒這裡;那不是
+                # 協調器的 cancel 會把等待中的核准回成「拒絕」來喚醒這裡;那不是
                 # 使用者拒絕了這個工具,是整輪被中斷,不得記成一筆 denied。
                 raise TurnCancelled("這一輪已被使用者中斷")
             if not granted:
@@ -1306,7 +1314,7 @@ class Engine:
         """呼叫 MCP,並把進行中的呼叫登記給 ``cancel()``。
 
         ``begin_call`` + ``result()`` 而不是一步的 ``call()``:後者只有
-        KeyboardInterrupt 一條取消路徑,web / attach 那一端沒有 signal 可以送。
+        KeyboardInterrupt 一條取消路徑,TUI 的 worker 執行緒沒有 signal 可以送。
         替身 MCP(測試)沒有 ``begin_call`` 時退回 ``call()``。
         """
         begin = getattr(self.mcp, "begin_call", None)
@@ -1323,7 +1331,7 @@ class Engine:
             try:
                 return pending.result()
             except KeyboardInterrupt:
-                # 終端 REPL 的 Ctrl-C。一步式 `McpClient.call()` 會在這裡送取消;
+                # headless 前景的 Ctrl-C。一步式 `McpClient.call()` 會在這裡送取消;
                 # 改用 begin_call 之後就要自己送——不然畫面說「已中斷」,MCP 那端
                 # 的 ingest 還在寫 knowledge.json。
                 pending.cancel("user interrupt")
@@ -1380,13 +1388,19 @@ def _merge_tool_call_delta(calls: dict[int, dict[str, Any]], raw: Any) -> None:
             slot["arguments"] += arguments
 
 
+#: server 沒給 tool-call id 時的退回編號。**全行程單調遞增**,不是「這個 step 的
+#: 第幾個」:後者讓每個 step 的第一個工具都叫 `call_0`,而 TUI 以 id 當全域 key,
+#: 第二次呼叫就掛在第一次的 block 上。
+_FALLBACK_CALL_IDS = itertools.count(1)
+
+
 def _finalise_tool_calls(calls: Mapping[int, Mapping[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for position, index in enumerate(sorted(calls)):
+    for index in sorted(calls):
         slot = calls[index]
         name = slot.get("name") or ""
         raw_arguments = slot.get("arguments") or ""
-        call_id = slot.get("id") or f"call_{position}"
+        call_id = slot.get("id") or f"call_{next(_FALLBACK_CALL_IDS)}"
         arguments: dict[str, Any] = {}
         arguments_error = False
         if raw_arguments.strip():

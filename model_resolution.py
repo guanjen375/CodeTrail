@@ -9,7 +9,8 @@ is consulted lazily between AICODE_MODEL and the OpenCode-config fallback.
 CodeTrail 只跑 llama.cpp llama-server。AICODE_MODEL 可以是:
   - registry 裡登記的 bare name(例如 "qwen3-coder-30b")
   - GGUF 絕對路徑(例如 "/models/qwen3-coder-30b-q4_k_m.gguf")
-`opencode.json` 只剩遷移診斷會讀(見 opencode_migrate);它已經**不在**主模型
+`opencode.json` 完全不在這裡:讀它的是使用者手動執行的 `opencode_migrate`,
+而那份程式碼自己帶著讀取與解析。這個模組**不在**主模型
 解析鏈上。下面這段講的是那個歷史格式:`model` 欄位若是 "<provider>/<name>" 形式 (例如 OpenAI 留下的舊
 設定 "openai/gpt-4o"),會被視為非本機 provider 拒絕 — 因為我們不打外部 API。
 """
@@ -21,7 +22,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-# 留下的這份「非本機 provider」清單是給 opencode.json 設定錯誤時用的:
+# 留下的這份「非本機 provider」清單是給設定寫錯時用的:
 # 使用者可能還沿用以前 ollama/* 或 openai/* 那種寫法,讓 resolution 報得明確一點。
 EXTERNAL_PROVIDER_PREFIXES = (
     "openai/",
@@ -204,62 +205,6 @@ def parse_cli_model_arg_detail(argv: Sequence[str]) -> CliModelArg:
 
 def parse_cli_model_arg(argv: Sequence[str]) -> str:
     return parse_cli_model_arg_detail(argv).raw
-
-
-def opencode_config_candidates(env: Mapping[str, str] | None = None) -> list[Path]:
-    environ = env if env is not None else os.environ
-    explicit = (environ.get("OPENCODE_CONFIG") or "").strip()
-    if explicit:
-        return [Path(explicit).expanduser()]
-
-    home = environ.get("HOME") or environ.get("USERPROFILE")
-    if home:
-        return [Path(home) / ".config" / "opencode" / "opencode.json"]
-
-    return []
-
-
-def load_first_opencode_config(
-    env: Mapping[str, str] | None = None,
-) -> tuple[Path | None, dict | None, str]:
-    environ = env if env is not None else os.environ
-    explicit = bool((environ.get("OPENCODE_CONFIG") or "").strip())
-    for path in opencode_config_candidates(environ):
-        try:
-            if not path.is_file():
-                if explicit:
-                    return path, None, "OPENCODE_CONFIG file does not exist."
-                continue
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            return path, None, str(exc)
-        if not isinstance(data, dict):
-            return path, None, "OpenCode config root must be a JSON object."
-        return path, data, ""
-    return None, None, ""
-
-
-def resolve_opencode_main_model(
-    env: Mapping[str, str] | None = None,
-) -> ModelResolution:
-    """**只給遷移診斷用**,不在主模型解析鏈上(見 resolve_main_model_from_env)。
-
-    """
-    path, data, error = load_first_opencode_config(env)
-    if error:
-        return ModelResolution(source="opencode.json", path=path, present=True, error=error)
-    if not data:
-        return ModelResolution(source="opencode.json", path=path, present=False)
-
-    raw = data.get("model")
-    if not isinstance(raw, str):
-        return ModelResolution(source="opencode.json", path=path, present=False)
-
-    return normalize_main_model(
-        raw,
-        "opencode.json model",
-        path=path,
-    )
 
 
 def main_model_references_equivalent(

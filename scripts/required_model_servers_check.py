@@ -25,8 +25,6 @@ if str(REPO_ROOT) not in sys.path:
 import llama_client  # noqa: E402
 from deployment_profile import load_effective_profile  # noqa: E402
 
-SKIP_ENV = "AICODE_REQUIRED_MODELS_CHECK_SKIP"
-
 _TINY_PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
 
 
@@ -46,12 +44,25 @@ class ServerCheck:
     message: str
 
 
-def _truthy(value: str | None) -> bool:
-    return (value or "").strip().lower() in ("1", "true", "yes")
+def _profile_env() -> dict[str, str]:
+    """交給 `deployment_profile` 的環境:**只有 HOME**(Windows 的 USERPROFILE)。
+
+    那個模組的 env overlay 是啟動核心(`~/start.sh` → launcher)的契約,所以
+    不能改模組,只能改「交什麼給它」。交整份 `os.environ` 的話,殼層裡殘留的
+    `AICODE_LLAMA_*` 會蓋過 `deployment.json` —— 這道閘就會去 probe 別台機器的
+    server,然後以那邊的結果決定本機能不能啟動。
+    """
+    home = os.environ.get("HOME")
+    if home:
+        return {"HOME": home}
+    # Windows fallback,而且**只有** HOME 缺席時才交:兩個都交的話,一個殘留的
+    # USERPROFILE 就多一條可以指到別的 home 的路。
+    profile = os.environ.get("USERPROFILE")
+    return {"USERPROFILE": profile} if profile else {}
 
 
 def required_servers() -> tuple[RequiredServer, ...]:
-    profile = load_effective_profile(os.environ)
+    profile = load_effective_profile(_profile_env())
     embedding = profile.service("embedding")
     reranker = profile.service("reranker")
     vl = profile.service("vl")
@@ -157,21 +168,13 @@ def render_report(checks: list[ServerCheck], *, prefix: str = "[model-preflight]
             f"{prefix} refuse to start: embedding, reranker, and VL servers must all be ready."
         )
         lines.append(
-            f"{prefix} start them with '~/start.sh --scope aux' (main 也沒起就直接 ~/start.sh) or point "
-            "AICODE_LLAMA_EMBED_BASE_URL / AICODE_LLAMA_RERANK_BASE_URL / "
-            "AICODE_LLAMA_VL_BASE_URL at ready servers."
+            f"{prefix} start them with '~/start.sh --scope aux' (main 也沒起就直接 ~/start.sh),"
+            " or fix the endpoints in ~/.config/codetrail/deployment.json and rerun ./set_config.sh."
         )
     return lines
 
 
 def main() -> int:
-    if _truthy(os.environ.get(SKIP_ENV)):
-        print(
-            f"[model-preflight] skipped via {SKIP_ENV}=1 "
-            "(test/CI escape hatch; normal runtime should not set this)"
-        )
-        return 0
-
     checks = run_checks()
     for line in render_report(checks):
         print(line, flush=True)

@@ -10,7 +10,7 @@
   dynamic / dwarf / disasm / strings。`target` 指定要展開的 symbol / 位址 / section /
   regex / 篩選條件，`limit` 控制筆數；輸出一律套 hard cap，截斷訊息指出該用哪個
   view + target 縮小範圍，而不是默默砍掉。
-- 反組譯：objdump（含跨架構變體、`AICODE_OBJDUMP` 覆寫）→ capstone → 失敗時把每個
+- 反組譯：objdump（含跨架構變體、client.json 的 `objdump` 覆寫）→ capstone → 失敗時把每個
   嘗試過的工具與原因、以及可行的補救方式明文寫進報告。
 
 這個模組不做 sandbox：路徑安全由 media._safe_path / mcp_server.analyze_file 負責。
@@ -18,13 +18,13 @@
 from __future__ import annotations
 
 import bisect
+import process_env
 import heapq
 import itertools
 import os
 import re
 import shutil
 import struct
-import subprocess
 import time
 from collections import Counter, OrderedDict
 from pathlib import Path
@@ -124,19 +124,16 @@ def cmd_exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
-def _subprocess_env() -> Dict[str, str]:
-    """readelf / objdump / c++filt 的輸出是用文字 regex 解析的：固定 C locale，避免翻譯過的欄位名。"""
-    env = dict(os.environ)
-    env.update({"LC_ALL": "C", "LANG": "C", "LANGUAGE": "C"})
-    return env
+#: readelf / objdump / c++filt 的輸出是用文字 regex 解析的:固定 C locale,避免翻譯過的欄位名。
+_C_LOCALE = {"LC_ALL": "C", "LANG": "C", "LANGUAGE": "C"}
 
 
 def run_cmd(cmd: List[str], timeout: int = 30) -> Tuple[Optional[str], Optional[str]]:
     """執行命令並回傳 (stdout, error_msg)；非零 returncode 視為失敗。"""
     try:
-        result = subprocess.run(
+        result = process_env.run(
             cmd, capture_output=True, text=True, timeout=timeout,
-            encoding="utf-8", errors="replace", env=_subprocess_env(),
+            encoding="utf-8", errors="replace", overrides=_C_LOCALE,
         )
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "").strip()
@@ -144,7 +141,7 @@ def run_cmd(cmd: List[str], timeout: int = 30) -> Tuple[Optional[str], Optional[
         return result.stdout, None
     except FileNotFoundError:
         return None, "command_not_found"
-    except subprocess.TimeoutExpired:
+    except process_env.TimeoutExpired:
         return None, "timeout"
     except Exception as e:
         return None, str(e)
@@ -157,14 +154,14 @@ def _run_capture(cmd: List[str], timeout: int = 30) -> Tuple[Optional[int], str,
     returncode 仍是 0，所以反組譯層不能只看 returncode。
     """
     try:
-        result = subprocess.run(
+        result = process_env.run(
             cmd, capture_output=True, text=True, timeout=timeout,
-            encoding="utf-8", errors="replace", env=_subprocess_env(),
+            encoding="utf-8", errors="replace", overrides=_C_LOCALE,
         )
         return result.returncode, result.stdout or "", result.stderr or ""
     except FileNotFoundError:
         return None, "", "command_not_found"
-    except subprocess.TimeoutExpired:
+    except process_env.TimeoutExpired:
         return None, "", f"timeout ({timeout}s)"
     except Exception as e:
         return None, "", f"{type(e).__name__}: {e}"
@@ -2273,10 +2270,13 @@ def _py_addr_to_line(model: ElfModel, addr: int, func: Optional[Dict]) -> Option
 # ---------------------------------------------------------------------------
 
 def _objdump_candidates(machine: str) -> List[str]:
+    import config
+
     cands: List[str] = []
-    env = os.environ.get("AICODE_OBJDUMP", "").strip()
-    if env:
-        cands.append(env)
+    # 使用者在 client.json 指定的 objdump(跨架構韌體需要 binutils-<triplet>)。
+    configured = str(getattr(config, "OBJDUMP", "")).strip()
+    if configured:
+        cands.append(configured)
     cands.append("objdump")
     cands.extend(_OBJDUMP_CANDIDATES.get(machine, []))
     seen: set = set()
@@ -2500,7 +2500,7 @@ def _disasm_remedies(model: ElfModel) -> List[str]:
     out = [
         f"  補救（擇一）：安裝 {pkg}",
         "  　　　　　　或 python3 -m pip install capstone（純 Python 綁定；支援 x86 / ARM / AArch64 / RISC-V / MIPS / PPC / SPARC / m68k；不含 ARC / Xtensa 舊版）",
-        "  　　　　　　或設環境變數 AICODE_OBJDUMP=/path/to/<triplet>-objdump（MCP 重啟後生效）",
+        "  　　　　　　或在 ~/.config/codetrail/client.json 設 objdump=/path/to/<triplet>-objdump（MCP 重啟後生效）",
     ]
     return _finish(out)
 
@@ -3252,9 +3252,9 @@ def demangle_names(model: ElfModel, names: List[str]) -> Dict[str, str]:
     todo = sorted({n for n in names if n and n.startswith("_Z") and n not in cache})
     if todo and cmd_exists("c++filt"):
         try:
-            res = subprocess.run(
+            res = process_env.run(
                 ["c++filt"], input="\n".join(todo) + "\n", capture_output=True, text=True,
-                timeout=20, encoding="utf-8", errors="replace", env=_subprocess_env(),
+                timeout=20, encoding="utf-8", errors="replace", overrides=_C_LOCALE,
             )
             outs = (res.stdout or "").splitlines()
             if len(outs) == len(todo):
