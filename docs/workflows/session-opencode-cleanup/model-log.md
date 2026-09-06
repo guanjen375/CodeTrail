@@ -34,3 +34,5 @@ W1 B 完成：`04-opus-B` exit 0 / result success；init 與 assistant 均為 `c
 W1 S 與 C1 完成：兩個 CLI 均 exit 0 / result success，init 與 assistant 為 `claude-opus-5`，明傳 effort=max。handoff-S.md / handoff-C1.md 已定稿，C1 宣告 I-5/I-6 已落檔；可放行 C2/C3。S 的 4 次額外行為探查超出執行限制，完整揭露見 `execution-notes.md`，不得以 result success 遮蔽這項偏差。
 
 W2 D2 的 init 與 assistant 已確認為 `claude-opus-5`；現在啟動 C2/C3，各明傳 `--model claude-opus-5 --effort max`，三個 CLI 並行，介面以 C1 已落檔交接為準。
+
+W2 D2 完成：`04-opus-D2` exit 0 / result success，init / assistant = `claude-opus-5`，明傳 effort=max。handoff-D2.md 已定稿；README / eval 一致性與 compileall 靜態檢查通過。無 pytest、無 repo runtime 合成資料探查。C2/C3 的 init 與 assistant 也均已確認為 `claude-opus-5`，仍在實作。

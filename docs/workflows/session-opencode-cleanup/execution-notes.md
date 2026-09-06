@@ -1,6 +1,6 @@
 # 執行偏差紀錄
 
-編排者核對 Claude 原始串流後記錄，不能把未使用 pytest 稱為符合測試政策。
+本檔記錄截至 W1 交接時的執行。編排者核對 Claude 原始串流後記錄，不能把未使用 pytest 稱為符合測試政策。
 
 W1 worker S (`04-opus-S`，明傳 Opus5 MAX，回傳 `claude-opus-5`) 在兩條新 regression 的紅綠之外，額外執行了 4 個 Python heredoc，以合成資料呼叫 repo 自己的函式／widget：
 
