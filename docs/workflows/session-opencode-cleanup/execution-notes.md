@@ -22,3 +22,5 @@ W1 worker S (`04-opus-S`，明傳 Opus5 MAX，回傳 `claude-opus-5`) 在兩條�
 目前已知額外探查共 **5 次：S 的 4 次 repo runtime 探查 + Fable 的 1 次純 Python 語意探查**。Fable 兩條正式新 regression 的各一次紅、各一次綠另有完整記錄，兩條測試從紅到綠的原文 SHA-256 未變；上述額外探查不抵銷也不擴張正式驗證範圍。
 
 `fix-01.md` §4 標題稱「全部是允許的命令」不成立：其表內的純 Python class 語意探查屬上述額外執行。保留作者原交接文字供稽核，以本檔的編排者核對為準，不把那一列當成正式驗收證據。
+
+修復第 2 輪另有**範圍外記憶寫入**：Claude 在 `05-fable-fix-02` 透過兩個 Edit 更新本機 `.claude/projects/-home-david-CodeTrail/memory/` 的 `MEMORY.md` 與 `codetrail-test-role-split.md`，加入本輪測試限制說明。這不在本輪只准 troubleshooting / fix-02.md 的修改範圍。編排者已向使用者揭露，依原始串流的 old_string / new_string 精確反向替換兩次（替換前要求完整新片段恰好出現一次，拒絕 symlink／非 owner／多連結檔案），保留其他既有記憶。還原證據只含路徑與前後內容雜湊，保存在本機 `claude-memory-restoration.json`。這不是另一次測試／runtime 探查，與前述 5 次額外探查分開記錄；不宣稱 file-only 模式阻止了範圍外寫入。`fix-02b` 未發現額外記憶寫入。
