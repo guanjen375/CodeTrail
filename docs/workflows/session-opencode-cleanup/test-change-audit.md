@@ -39,3 +39,5 @@ Fable 修復第 3 輪逐項補充（第 2 輪只有文件）：
 細節與第一次 smoke 紅燈的對應見 [fix-03.md](fix-03.md)。編排者另以 smoke 當時原始碼為準比對：只有上述三個產品路徑變動，24 個 assert、各 node decorator 與測試名集合皆不變，`SAFETY_MODULES` 與所有 runtime 檔案雜湊不變。這是原始碼／AST 稽核，不是測試通過證據。
 
 最新全量 symbol 稽核共 195 筆新增／刪除／修改觀察，每筆測試名都能在工作者 handoff、fix 或本表找到；fixture／helper／import／manifest 不在 symbol 計數中，仍由各表逐項記錄。第 3 輪沒有追加測試執行，三個 smoke 紅燈仍待必要授權後重驗。
+
+最終驗證補記：使用者之後明示「那你最後smoke一次」，[第二次 smoke](smoke-02.md)的 2395 條全部通過，三個失敗隨整包轉綠；沒有另跑單 node，也沒有再改任何測試碼或斷言。此處前段的「仍待授權」是修復第 3 輪當時的狀態，不是最終結果。
