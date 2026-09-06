@@ -62,3 +62,5 @@ W3 D1 完成：`04-opus-D1` exit 0 / result success，init / assistant = `claude
 `05-fable-fix-02b` 完成：明傳 `claude-fable-5-1[1m] --effort max`；init / assistant = `claude-fable-5-1`，CLI exit 0 / result success。只有 AGENTS 一句引用與 fix-02b.md，零執行。fix-02 的完整日誌另顯示兩個範圍外記憶 Edit，已由編排者精確撤回並記入 execution-notes；作者交接所稱只改兩檔須以此核對更正。最終文件一致性 `python3 scripts/check_readme_consistency.py` exit 0；`git diff --check` exit 0。
 
 第 5 階段 ASTRA 第 3 輪已定稿：`implementation-review-03.md`，Static Active Blocker 0；B-05 fallback 與 AGENTS 引用解除。產品樹 58 路徑與 review-03 fingerprint 相符；runtime/tests 自 review-02 未變。審核者未執行測試／探查，只新增報告。編排者接續預定的唯一一次 `python3 scripts/run_tests.py -m smoke`，不執行 full。
+
+唯一預定整包 smoke 已執行：2395 selected，2392 passed / 3 failed，exit 1，見 smoke-01.md；full 0。來源 fingerprint 未變。ASTRA 靜態 0 不代表實際測試通過，目前有 3 個測試失敗需集中分析與 Fable 修復，不以基線或額外探查掩蓋。
