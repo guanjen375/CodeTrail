@@ -54,3 +54,5 @@ W3 D1 完成：`04-opus-D1` exit 0 / result success，init / assistant = `claude
 第 5 階段修復第 1 輪 `05-fable-fix-01` 已啟動：明傳 `--model claude-fable-5-1[1m] --effort max`；init 與 assistant 均回傳 `claude-fable-5-1`。請求 metadata、prompt SHA-256 與完整串流記錄於本機暫存目錄。只修實作審核的 5 項 Blocker，整包 smoke 仍未執行。
 
 第 5 階段 `05-fable-fix-01` 完成：CLI exit 0 / result success，init 與 assistant = `claude-fable-5-1`，明傳 effort=max。fix-01.md 已定稿；2 條新 regression 各一次紅與綠、紅綠原文不變；沒有 full / 整包 smoke。額外 1 次純 Python class 語意探查已揭露於 execution-notes.md，不能以 result success 或「沒有 import repo」宣稱全程合規。
+
+第 5 階段 ASTRA 第 2 輪已定稿：`implementation-review-02.md`，B-01..B-04 靜態解除，Active Blocker 1（B-05 可信讀取與後續還原未綁定）；58 個產品路徑 fingerprint 未變。未執行測試／探查。接續 Fable MAX 文件修復，本輪 CLI 只提供 Read/Glob/Grep/Write/Edit，無 Bash、Agent 或 MCP。
