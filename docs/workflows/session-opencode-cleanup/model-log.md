@@ -30,3 +30,7 @@ W1 回傳身分已核對：`04-opus-S`、`04-opus-B`、`04-opus-C1` 的 init 與
 W1 B 完成：`04-opus-B` exit 0 / result success；init 與 assistant 均為 `claude-opus-5`，effort 旗標 max。未跑 pytest，handoff-B.md 已定稿。S 的兩條原 regression 已各取得 exit 0 / 1 passed（0.91s、0.88s）。
 
 依 §4 的名稱相依關係，釋出 B 名額後先啟動 W2 D2 文件工作；C1/C2/C3 的既定介面名稱可由 final plan 使用，C2/C3 仍等待 C1 完成交接。`04-opus-D2` 明傳 `--model claude-opus-5 --effort max`。
+
+W1 S 與 C1 完成：兩個 CLI 均 exit 0 / result success，init 與 assistant 為 `claude-opus-5`，明傳 effort=max。handoff-S.md / handoff-C1.md 已定稿，C1 宣告 I-5/I-6 已落檔；可放行 C2/C3。S 的 4 次額外行為探查超出執行限制，完整揭露見 `execution-notes.md`，不得以 result success 遮蔽這項偏差。
+
+W2 D2 的 init 與 assistant 已確認為 `claude-opus-5`；現在啟動 C2/C3，各明傳 `--model claude-opus-5 --effort max`，三個 CLI 並行，介面以 C1 已落檔交接為準。
