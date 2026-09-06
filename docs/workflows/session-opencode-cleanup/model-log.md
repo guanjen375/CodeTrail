@@ -66,3 +66,7 @@ W3 D1 完成：`04-opus-D1` exit 0 / result success，init / assistant = `claude
 唯一預定整包 smoke 已執行：2395 selected，2392 passed / 3 failed，exit 1，見 smoke-01.md；full 0。來源 fingerprint 未變。ASTRA 靜態 0 不代表實際測試通過，目前有 3 個測試失敗需集中分析與 Fable 修復，不以基線或額外探查掩蓋。
 
 第 5 階段 ASTRA 第 4 輪已定稿：implementation-review-04.md，Active Blocker 3；逐項核對 smoke 原始失敗與 a1682d5。最小修復限於三份測試檔的情境 fixture／gate helper，既有 stop 欄位錯誤不擴張為本次產品修復。審核未執行測試或改碼。接續 Fable MAX 修復，僅檔案工具，並以單次 --settings 關閉 auto memory；追加測試仍未授權。
+
+第 5 階段修復第 3 輪 05-fable-fix-03 已啟動：明傳 --model claude-fable-5-1[1m] --effort max；init model=claude-fable-5-1。CLI 使用 --settings {"autoMemoryEnabled":false}（僅本次呼叫），工具限 Edit/Glob/Grep/Read/Write。只修 review04 三份測試的 fixture／gate helper，不執行測試。
+
+第 5 階段 05-fable-fix-03 完成：CLI exit 0 / result success；init / assistant 均為 claude-fable-5-1，明傳 effort=max。實際工具為 Read 28、Glob 3、Grep 18、Edit 4、Write 1；寫入僅指定三份測試與 fix-03.md，沒有命令／測試／記憶寫入。單次 autoMemoryEnabled=false 設定留在 request metadata。編排者靜態核對 24 個原斷言、decorator、來源 walker 皆相同；195 筆 test symbol 變更均有逐名交接。追加測試未執行，接續 ASTRA 第 5 輪靜態審核。

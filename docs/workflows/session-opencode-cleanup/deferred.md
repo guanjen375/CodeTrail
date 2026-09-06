@@ -1,6 +1,7 @@
 # 擱置表(deferred)
 
 - 第 3 步(最終規劃)核對:**仍為空**。八項 Blocker 全部在 `plan-final.md` §0 收斂,沒有分歧需要擱置。
+- 第 5 步截至實作審核第 4 輪：**仍為空**。沒有兩輪以上無法解決的 Claude／ASTRA 分歧；第一次 smoke 的三個失敗列在 `implementation-review-04.md` 修復，不能以擱置取代驗證。審核對照基準指出的未變動 stop 欄位問題不列成本次新 Blocker。
 - 規則:同一分歧在審核 / 修復**兩輪以上**未解才登記在這裡;不得預先把未達驗收的項目擱置;push 前告知使用者。登記後不得再被列為 BLOCKER;要重啟討論由使用者決定。
 - 身分由編排者以 JSON metadata 記入 `model-log.md`,本檔不自述。
 
