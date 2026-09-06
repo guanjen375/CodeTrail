@@ -1957,7 +1957,7 @@ def test_the_opencode_gate_scans_config_files_and_the_wrapper():
 
 
 @pytest.mark.smoke
-def test_the_handoff_markdown_exemption_is_content_only():
+def test_the_handoff_markdown_exemption_is_content_only(tmp_path):
     """`docs/workflows/**/*.md` 的豁免只給 **`.md` 的內容**,不是把目錄從走訪剪掉。
 
     交接紀錄逐字引用被移除的變數名與舊工具的命令(那正是它要記的事),當使用者
@@ -1965,11 +1965,13 @@ def test_the_handoff_markdown_exemption_is_content_only():
     `.py` / `.sh` / `.json` / `.toml` 也會一起消失在**所有** gate 的視線外 —— 那等於
     開一個「把可執行檔藏進交接目錄」的後門。所以:
       1. `_handoff_markdown` 只對 `docs/workflows/**` 的 `.md` 為真;
-      2. 真實 repo 的 `_walk_files` 仍然走進那個目錄(檔案還在集合裡);
+      2. `_walk_files` 仍然走進那個目錄(`.md` 與 `.py` 都還在集合裡)——用暫存目錄
+         搭一個 `docs/workflows/<任務>/` 來驗,不依賴真實 repo 此刻有沒有交接紀錄
+         (交接目錄做完會被刪掉,契約不能跟著消失);
       3. 同目錄的 `.py` 照樣被 OpenCode gate 與 spawn gate 判為 offender。
     """
     assert _handoff_markdown(Path("docs/workflows/x/p.md"))
-    assert _handoff_markdown(Path("docs/workflows/session-opencode-cleanup/plan-final.md"))
+    assert _handoff_markdown(Path("docs/workflows/some-task/plan-final.md"))
     assert not _handoff_markdown(Path("docs/workflows/x/tool.py"))
     assert not _handoff_markdown(Path("docs/workflows/x/ci.yaml"))
     assert not _handoff_markdown(Path("docs/workflows/x/settings.json"))
@@ -1977,12 +1979,21 @@ def test_the_handoff_markdown_exemption_is_content_only():
     assert not _handoff_markdown(Path("docs/workflows/p.md"))  # 直接放在 workflows/ 下的不算
     assert not _handoff_markdown(Path("README.md"))
 
-    walked = {str(p.relative_to(REPO_ROOT)) for p in _walk_files(REPO_ROOT)}
+    fake_root = tmp_path / "repo"
+    task_dir = fake_root / "docs" / "workflows" / "some-task"
+    task_dir.mkdir(parents=True)
+    (task_dir / "plan-final.md").write_text("# handoff\n", encoding="utf-8")
+    (task_dir / "tool.py").write_text("print('hidden')\n", encoding="utf-8")
+    (fake_root / "README.md").write_text("# user doc\n", encoding="utf-8")
+    walked = {str(p.relative_to(fake_root)) for p in _walk_files(fake_root)}
+    assert "docs/workflows/some-task/plan-final.md" in walked, (
+        "走訪不得把 docs/workflows/ 整個剪掉(那會連可執行檔一起藏起來)"
+    )
+    assert "docs/workflows/some-task/tool.py" in walked, "同目錄的可執行檔必須留在走訪集合裡"
     handoffs = sorted(p for p in walked if p.startswith("docs/workflows/") and p.endswith(".md"))
-    assert handoffs, "走訪不得把 docs/workflows/ 整個剪掉(那會連可執行檔一起藏起來)"
-    assert all(
-        _handoff_markdown(Path(rel)) for rel in handoffs
-    ), handoffs
+    assert handoffs == ["docs/workflows/some-task/plan-final.md"]
+    assert all(_handoff_markdown(Path(rel)) for rel in handoffs), handoffs
+    assert not _handoff_markdown(Path("docs/workflows/some-task/tool.py"))
 
     # 內容 gate 對同目錄的可執行檔一視同仁。
     assert _opencode_offenders("docs/workflows/x/tool.py", "import opencode_migrate\n")
