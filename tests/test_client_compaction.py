@@ -1,6 +1,6 @@
 """client_compaction / client_config 的契約。
 
-搬進 Python 之後,壓縮不再是「plugin 對 OpenCode 的膠水」,但**核對與節錄規則
+搬進 Python 之後,壓縮不再是「JS plugin 對舊世代前端的膠水」,但**核對與節錄規則
 仍然是安全層**:一次沒被抓到的空摘要 / 格式漂移,就是使用者的對話被切掉而且
 沒有人講。docs/compaction-rules.md 仍是那兩段 text 的唯一來源。
 """
@@ -82,7 +82,7 @@ def test_the_output_constant_is_bounded_by_the_derivation_formula(monkeypatch):
     engine 照樣送原值,門檻卻按 32000 算 —— 門檻不再由實際輸出上限推出來,
     而且沒有任何訊息。所以這兩種值一律 fail-loud。
     """
-    assert config.CLIENT_MAX_OUTPUT_TOKENS_CAP == compaction_formula.UPSTREAM_OUTPUT_TOKEN_MAX
+    assert config.CLIENT_MAX_OUTPUT_TOKENS_CAP == compaction_formula.OUTPUT_TOKEN_MAX
     assert 0 < config.CLIENT_MAX_OUTPUT_TOKENS <= config.CLIENT_MAX_OUTPUT_TOKENS_CAP
     # 2026-09-04:`AICODE_CLIENT_MAX_OUTPUT_TOKENS` 刪除,這個數字是 repo 常數。
     # 那道 import-time 檢查仍在(它擋的是「改 repo 的人改壞」),只是輸入不再

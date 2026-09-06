@@ -45,7 +45,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "-c/--continue、--session <id>、-h/--help —— run / status / sessions 這些內部入口不跑"
         "preflight,轉發過去等於開一條略過 profile 驗證 / ctx 容量閘 / 工具健檢的第二入口。"
         "root 一律是 cwd;殼層裡殘留的 AICODE_* / AI_CODE_* / CODETRAIL_* 對它一律無效;"
-        "缺 textual 要 fail-loud 印 pip 指令;正常路徑不得 exec 任何 opencode 二進位",
+        "缺 textual 要 fail-loud 印 pip 指令。唯一的 exec 目標由第一條釘住"
+        "(`aicode` 也在 test_repo_consistency.py 的內容 gate 掃描範圍內)",
         (
             "test_the_only_exec_target_is_the_client_next_to_the_wrapper",
             "test_the_wrapper_follows_its_own_symlink_to_find_the_checkout",
@@ -53,7 +54,6 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_without_a_tty_the_wrapper_refuses_and_points_at_the_headless_entry",
             "test_a_missing_textual_fails_loud_with_the_pip_command",
             "test_a_polluted_shell_changes_nothing",
-            "test_aicode_never_execs_opencode",
             "test_the_wrapper_stays_thin",
             "test_the_wrapper_never_reads_configuration_from_the_environment",
             "test_the_wrapper_accepts_only_the_three_user_flags",
@@ -88,8 +88,12 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "門檻等於 runtime 用的同一條公式、算不出門檻要 fail-loud、dry-run 不留檔;"
         "restore transaction 的整批語意(一半還原比不還原更糟、manifest 壞掉不退回逐檔、"
         "沒有備份路徑不得刪 live 檔、symlink 被改指不得覆寫別處、寫不出 manifest 不得留 stale);"
-        "restore manifest 兩個世代共用同一個檔:含這一代不會寫的目標時整份拒絕、一個檔都不動",
+        "restore manifest 兩個世代共用同一個檔:含這一代不會寫的目標時整份拒絕、一個檔都不動;"
+        "產生的 `~/start.sh` 不 export / 不 unset 任何變數(殼層裡的舊名字對啟動指令無效),"
+        "GPU 與 llama-server 路徑寫進 `deployment.json` 的 `services.<role>.gpu` / `llama_bin`",
         (
+            "test_generated_start_sh_ignores_legacy_shell_overrides",
+            "test_deployment_json_pins_llama_bin_and_gpus",
             "test_yes_without_the_flag_never_takes_over",
             "test_codetrail_mode_writes_the_chosen_mode",
             "test_the_written_threshold_matches_the_runtime_formula",
@@ -136,7 +140,6 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "狀態行顯示的模式必須來自 runtime 用的同一份設定,而且永遠不得 raise",
         (
             "test_derive_settings_follows_the_upstream_formula",
-            "test_combining_two_models_keeps_the_single_model_relationships",
             "test_derive_settings_refuses_a_model_too_small_for_the_contract",
             "test_effective_max_output_matches_upstream_transform",
             "test_tool_result_fraction_matches_the_runtime_contract",
@@ -325,8 +328,12 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "懸空 tool_call 必須在送出前補齊;權限 policy 的 readonly 全 deny(判準是 readOnlyHint 不是名單)、"
         "互動的七個 ask 沒核准就不得執行且重問有上限、核准框完整顯示參數(`import_external_file` 也在裡面:那個開關授權的是能力,不是每一次的來源與目的);"
         "只有工具結果的 text block 進模型;ingest marker 只認 ingest_document 的行首;"
-        "假工具呼叫偵測不得把否定句算成宣稱;基底規則守 1,600 字元;閘對轉換後的 payload 計數",
+        "假工具呼叫偵測不得把否定句算成宣稱;基底規則守 1,600 字元;閘對轉換後的 payload 計數;"
+        "`load_session` 是唯一一次受信讀取(模型歷史與畫面歷史同源),`adopt` 之前 engine 零改動,"
+        "transcript 只以標記呈現 compaction(畫面跟著模型歷史走 = 壓縮過的那段在畫面上永久消失)",
         (
+            "test_load_session_leaves_the_engine_untouched_and_adopt_switches_atomically",
+            "test_the_snapshot_model_history_is_compacted_while_the_transcript_keeps_the_originals",
             "test_a_web_style_cancel_after_a_failed_turn_is_refused",
             "test_a_cancel_during_the_max_step_wrap_up_records_nothing",
             "test_the_final_commit_persists_outside_the_turn_state_lock",
@@ -452,8 +459,22 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "不得顯示成「已中斷」,慢速 MCP 取消不得凍住畫面;回合進行中不得離開、不得換 session、"
         "被拒的第二題不得先貼進畫面;工具展開區要顯示未裁切的 structuredContent;沒有 tty 一律"
         "拒絕並指向 headless;輸入歷史逐字含 NDA 問題,正常退出一定要落檔、多行問題要能還原,"
-        "讀寫兩端都拒 symlink(含中間目錄)與 hard link",
+        "讀寫兩端都拒 symlink(含中間目錄)與 hard link;"
+        "接續 / 啟動重播必須貼出**原始記錄**(文字、reasoning、工具含未裁切的 structuredContent、"
+        "壓縮標記),工具結果按**宣告群組**配對(fallback call id 每個行程從 call_1 起算,以 id "
+        "反查會把結果貼到幾十輪前那個 block 上),重播的 block 不登記給即時事件,busy 一律拒絕換,"
+        "切換失敗要保持 session 與畫面(先換 engine 再重播 = 模型在新對話、畫面是舊那段),"
+        "`/new` 清畫面,選單的 Esc / Ctrl-C 只收選單(算成中斷或離開都是謊報)",
         (
+            "test_resume_replays_the_stored_history",
+            "test_a_session_resumed_at_startup_is_shown_on_mount",
+            "test_the_session_picker_lists_outlines_and_switches",
+            "test_escape_and_ctrl_c_only_close_the_picker",
+            "test_a_failed_switch_keeps_the_session_and_the_screen",
+            "test_replay_pairs_tool_results_by_declaration_group_not_by_id",
+            "test_replay_shows_pre_compaction_originals_and_a_summary_marker",
+            "test_replayed_tool_blocks_are_not_registered_for_live_events",
+            "test_new_clears_the_screen",
             "test_the_approval_box_shows_the_whole_patch",
             "test_the_approval_keys_only_answer_this_one_tool",
             "test_a_dismissed_approval_is_a_refusal",
@@ -482,8 +503,11 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "session 檔逐字含 NDA 內容:必須落在 state 目錄而不是被分析的 repo(相對 XDG_STATE_HOME 與"
         "專案內的 state 目錄都要擋),目錄 0700、檔案 0600、讀寫兩端都拒 symlink 與 hard link,"
         "append 不得建出沒有 header 的檔,header 必須綁這個專案與這個 session,"
-        "headless 的 ephemeral store 一個 byte 都不寫",
+        "headless 的 ephemeral store 一個 byte 都不寫;"
+        "選單的大綱只取本地**真實** user 訊息(摘要 / 工具輸出當大綱是無聲的:每段對話長得一樣),"
+        "零 LLM、零寫入",
         (
+            "test_the_outline_is_the_first_real_question_never_the_summary_or_tool_output",
             "test_a_missing_anchor_is_created_inside_the_dir_fd_walk",
             "test_containment_holds_without_proc_self_fd",
             "test_containment_is_judged_on_the_directory_actually_opened",
@@ -562,75 +586,57 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_cancelled_summary_is_not_a_durable_stop",
         ),
     ),
-    "test_opencode_migrate.py": (
-        "唯一會寫使用者 OpenCode 設定的路徑(而且只有使用者手動執行時才跑):"
-        "只還原現值仍等於 CodeTrail 寫入值的鍵、只移除 path 對得上的 plugin 項、"
-        "mcp.codetrail 與 permission 不動、沒有狀態檔也沒有我們的 plugin 項的機器零寫入、"
-        "狀態檔在設定寫成功之後才刪、--check 不寫任何東西;"
-        "**別份安裝的接管不動**(狀態檔記的 plugin 路徑還在且不是本 repo → 零寫入只提示),"
-        "但本 repo 搬過家不得被誤判成別份安裝;"
-        "ownership 狀態檔本身:owner-only 權限與 symlink 防線、digest 涵蓋 prior、綁定單一 config、"
-        "「沒有狀態檔 = 沒有接管」的 fail-closed、受管鍵與契約鍵是兩組、plugin 項的認領與去重",
-        (
-            "test_a_machine_that_never_took_over_is_untouched",
-            "test_only_values_we_still_own_are_restored",
-            "test_a_same_named_plugin_from_elsewhere_is_still_not_ours",
-            "test_mcp_and_permission_are_never_touched",
-            "test_check_mode_writes_nothing",
-            "test_a_state_file_that_cannot_be_removed_is_fail_loud",
-            "test_another_installs_takeover_is_left_alone",
-            "test_a_moved_repo_is_not_mistaken_for_another_install",
-            "test_the_managed_values_come_from_the_formula",
-            "test_save_state_is_owner_only_and_atomic",
-            "test_save_state_refuses_a_symlink_target",
-            "test_save_state_refuses_a_symlinked_state_directory",
-            "test_load_state_is_fail_closed",
-            "test_load_state_refuses_a_world_readable_state_file",
-            "test_state_with_a_tampered_prior_is_rejected",
-            "test_state_from_another_config_is_refused",
-            "test_native_leaves_values_the_user_changed_after_takeover",
-            "test_ownership_is_json_type_strict",
-            "test_state_digest_survives_an_integral_float_in_prior",
-            "test_config_identity_needs_both_hashes",
-            "test_a_moved_repo_converges_to_exactly_one_plugin_entry",
-            "test_native_keeps_a_pre_existing_plugin_without_calling_it_drift",
-            "test_a_same_named_plugin_we_never_registered_is_not_hijacked",
-            "test_a_replaced_entry_is_not_hijacked_even_after_we_registered_once",
-            "test_switching_to_native_after_a_repo_move_removes_the_old_entry",
-            "test_a_native_baseline_is_recomputed_from_the_current_config",
-            "test_prune_is_taken_over_and_restored_but_never_called_drift",
-            "test_native_leaves_a_prune_value_the_user_set_before_takeover",
-            "test_unmanaged_keys_names_what_an_older_state_file_never_took_over",
-            "test_state_refuses_values_the_two_languages_serialise_differently",
-            "test_a_pre_existing_plugin_is_not_claimed_by_a_repo_move",
-            "test_an_entry_we_added_after_a_move_is_still_ours_at_native",
-            "test_an_unverifiable_foreign_takeover_is_left_alone",
-        ),
-    ),
     "test_deployment.py": (
-        "主模型解析鏈:opencode.json 已經不在鏈上——沿用那份設定裡的模型等於「使用者以為"
-        "在跑 A、實際在跑 B」,而一份壞掉的殘留檔更不得讓沒在用 OpenCode 的機器無法啟動",
+        "啟動核心的設定只有兩個來源:`deployment.json` / `models.json` 與 argv。"
+        "殼層裡殘留的舊名字(`AICODE_MODEL`、五個 `*_GPU`、`CUDA_VISIBLE_DEVICES`、"
+        "`LLAMA_BIN`、`MODELS_DIR`、session 名)一律無效 —— 讀回來就是「使用者以為在跑 A、"
+        "實際在跑 B」,而且完全無聲;GPU 與 llama-server 路徑的優先序是 argv > 檔案 > 預設;"
+        "llama-server 真正被 exec 時的環境要剝掉四前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES`;"
+        "主模型解析器沒有環境變數那條分支(舊 opencode.json 也早就不在鏈上,而一份壞掉的"
+        "殘留檔不得讓沒在用它的機器無法啟動)",
         (
             "test_opencode_json_is_no_longer_a_model_source",
             "test_a_broken_opencode_json_never_blocks_startup",
             "test_a_conflicting_opencode_json_is_not_a_conflict_any_more",
+            "test_the_loader_ignores_every_legacy_override_variable",
+            "test_gpu_and_llama_bin_come_from_the_deployment_file_then_argv",
+            "test_the_server_environment_strips_gpu_selectors_and_llama_settings",
+            "test_the_main_model_resolver_has_no_environment_branch",
+        ),
+    ),
+    "test_server_scripts.py": (
+        "啟動核心的 pane 邊界:tmux pane 一律經 `deployment_profile.py exec`(pane 內的最終"
+        "環境由 `process_env.llama_server_env()` 算,tmux server / session 的全域環境蓋不過"
+        "`deployment.json` 指定的卡);GPU / llama-server 路徑 / session 名 / 逾時只來自"
+        "`deployment.json`、repo 常數與 argv,殼層裡的舊名字一律無效",
+        (
+            "test_the_pane_runs_the_exec_choke_point_with_the_loader_argv",
+            "test_the_exec_path_hands_llama_server_a_clean_environment",
+            "test_stop_and_status_use_argv_and_constants_not_the_shell",
         ),
     ),
     "test_repo_consistency.py": (
-        "使用者文件不得再教去 OpenCode 化之後不存在的旗標 / 檔案 / 腳本",
+        "三條靜態 gate:使用者文件不得再教這一代不存在的旗標 / 檔案 / 腳本 / 環境變數;"
+        "`opencode` 只准留在剝除清單、eval 凍結資料的欄位名與文件升級段(而升級段教那支"
+        "已刪的遷移工具時必須指名 `a1682d5`;反向檢查器的形狀例外只放行 pattern 字串,"
+        "蓋不過真正的 import);沒有任何模組從殼層取 CodeTrail 設定,"
+        "spawn 只有 `process_env` 一個出口,llama-server 唯一的 `execvpe` 用的是"
+        "`llama_server_env()`。`docs/workflows/**/*.md` 的豁免只給 `.md` 的內容 ——"
+        "同目錄的可執行檔照掃(否則就是把東西藏進交接目錄)",
         (
-            "test_the_stub_gate_rejects_initialisation_side_effects",
-            "test_the_js_comment_stripper_is_lexically_aware",
             "test_user_docs_must_not_teach_removed_flags_or_files",
-            "test_the_opencode_plugin_stubs_are_inert",
             "test_current_cli_help_never_mentions_opencode",
-            "test_opencode_only_survives_in_the_migration_path_and_docs",
+            "test_the_removed_frontend_only_survives_in_the_strip_list_history_data_and_upgrade_docs",
+            "test_the_migration_command_only_survives_in_the_pinned_upgrade_section",
+            "test_the_handoff_markdown_exemption_is_content_only",
+            "test_the_only_llama_server_exec_hands_over_the_stripped_environment",
             "test_no_module_reads_codetrail_settings_from_the_environment",
             "test_user_docs_never_teach_a_removed_environment_knob_or_interface",
             "test_model_facing_text_never_teaches_a_removed_environment_knob",
             "test_doctor_no_longer_needs_a_model_prefix",
-            "test_the_docs_gate_catches_bare_mentions_and_scopes_core_names_to_their_sections",
+            "test_the_docs_gate_catches_bare_mentions_and_env_prefixes_everywhere",
             "test_the_opencode_gate_checks_allowlisted_files_for_dependency_shapes",
+            "test_the_checker_shape_exemption_never_covers_an_executable_import",
             "test_doctor_runs_as_a_script_from_the_repo_root",
             "test_the_spawn_gate_bans_the_spawn_api_outside_process_env",
             "test_the_production_spawn_gate_really_scans_the_repo",
@@ -790,7 +796,10 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "fail-loud、多輪必須真的接得起來而單輪不落檔、gitignore 掉的三個路徑一樣算 project state;"
         "timeout/checkpoint 不得丟資料且匿名 A/B 不得洩漏模型身分;"
         "data flywheel 的落點在 state 目錄(0700/0600、拒 symlink,被分析的 repo 零新檔),"
-        "而且子行程的環境在交出去之前剝掉全部 CodeTrail 設定變數",
+        "而且子行程的環境在交出去之前剝掉全部 CodeTrail 設定變數;"
+        "凍結 baseline 的有效字元數改了鍵名之後,兩邊仍要真的在比對(讀取端少了退回舊鍵那一段,"
+        "報告照樣說「與歷史 baseline 相符」而那一格根本沒比);錄製器選定的 llama-server 用不了時"
+        "不得悄悄換成 PATH 上另一顆(manifest 宣稱的 build 出處會是別顆的)",
         (
             "test_every_direct_model_request_in_the_routing_eval_uses_the_normalised_model",
             "test_the_routing_eval_child_environment_is_stripped",
@@ -806,7 +815,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_private_writer_refuses_symlink_target",
             "test_private_writer_uses_owner_only_modes",
             "test_blind_bundle_hides_candidate_identity",
-            "test_opencode_timeout_is_a_scored_case_failure_not_a_suite_abort",
+            "test_a_replay_timeout_is_a_scored_case_failure_not_a_suite_abort",
+            "test_the_effective_chars_field_survives_its_rename_across_the_frozen_data",
+            "test_the_recorder_never_substitutes_a_path_binary_for_the_chosen_one",
             "test_resume_checkpoint_rejects_project_state_drift",
             "test_the_replay_pins_its_own_compaction_mode",
             "test_two_compaction_semantics_are_not_the_same_candidate",

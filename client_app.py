@@ -16,6 +16,11 @@
   這兩個 engine 自己看不到的狀態也涵蓋得到。
 * **不直接 print**。Textual 接管畫面之後任何 stdout / stderr 都會把畫面打壞,
   所以這裡所有輸出都是 widget;engine 的事件由背景執行緒搬進 UI 執行緒。
+* **接續一段對話就要看得到它**。`/resume`、`/session`(選單或直接指定)與啟動時
+  就接好的那條路(`aicode -c`)都重播**原始記錄**:文字、reasoning、工具呼叫
+  (含未裁切的 `structuredContent`)與壓縮標記。畫面看不到、模型看得到的話,
+  接下來每一則回答都在回應一段使用者看不見的脈絡。換不成功就 engine 與畫面
+  **都不動**;回合進行中一律拒絕換。
 
 `engine.send()` 跑在背景執行緒(協調器管),事件回到這裡才變成 widget;核准
 在那個背景執行緒裡阻塞等 UI 回答。
@@ -27,8 +32,9 @@ import os
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from rich.markdown import Markdown as RichMarkdown
 from rich.text import Text
@@ -39,7 +45,8 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Button, Collapsible, Static, TextArea
+from textual.widgets import Button, Collapsible, OptionList, Static, TextArea
+from textual.widgets.option_list import Option
 
 import client_engine
 import client_events
@@ -57,11 +64,25 @@ DOUBLE_INTERRUPT_SECONDS = 2.0
 
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
+#: 選單一次最多列幾段對話。`/sessions` 的文字清單短一點(它是貼進對話流的一則)。
+SESSION_PICKER_LIMIT = 50
+SESSION_LIST_LIMIT = 20
+
+#: 重播時,宣告了卻沒有結果的那一次呼叫。**不是**「已中斷」:那則結果是下一次
+#: 送出前才由 engine 的 heal 補上去的,現在它真的還沒有結果。
+PENDING_TOOL_STATUS = "pending"
+PENDING_TOOL_OUTPUT = "這次呼叫沒有結果;下一題送出前會標成已中斷"
+#: 找不到宣告它的呼叫(crash / 手改過的 session 檔)。顯示出來,不安靜丟掉。
+ORPHAN_TOOL_NOTE = "(找不到宣告它的呼叫)"
+#: 被標成 error 的 assistant 訊息:它不是答案,重播時要看得出來。
+INCOMPLETE_ANSWER_NOTE = "上面這一則沒有完成(被截斷或出錯),不是答案。"
+
 #: 斜線指令 → 一行說明。輸入框的補全與 `/help` 用的是**同一份**表:兩份會漂移。
 COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "這份說明"),
     ("/new", "開一個新對話"),
     ("/sessions", "列出這個專案的既有對話"),
+    ("/session", "選一個既有對話切換(/session <id> 直接指定)"),
     ("/resume", "接續一個既有對話(/resume <id>)"),
     ("/compact", "立刻壓縮目前對話"),
     ("/status", "目前模型、context、壓縮模式與 session 位置"),
@@ -96,6 +117,169 @@ def tool_summary(tool: str, arguments: Mapping[str, Any]) -> str:
     return f"{tool}({inner})"
 
 
+def local_time(stamp: Any) -> str:
+    """本地時間。UTC 會讓「我昨天那一段」對不上使用者的時鐘。"""
+    if not isinstance(stamp, (int, float)) or stamp <= 0:
+        return "(時間不明)"
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(stamp)))
+
+
+def format_tool_output(message: Mapping[str, Any]) -> str:
+    """一則 tool 訊息在展開區的完整輸出。
+
+    送進模型的那一份 text 是套過 budget 的(``tool_result_adapter``);未裁切的
+    核心留在 ``structuredContent``,而那份刻意只給 UI / eval。只顯示 text 的話,
+    使用者在畫面上看到的是節錄,而純結構化結果的工具會顯示成「沒有輸出」。
+    即時事件與重播走**同一個**函式:兩份格式化會漂移。
+    """
+    content = message.get("content")
+    parts = [content] if isinstance(content, str) and content else []
+    structured = message.get("structured")
+    if structured is not None:
+        try:
+            rendered = json.dumps(structured, ensure_ascii=False, indent=2, sort_keys=True)
+        except (TypeError, ValueError):
+            rendered = repr(structured)
+        parts.append("--- structuredContent(未裁切;只給畫面與 eval)---\n" + rendered)
+    return "\n\n".join(parts)
+
+
+# ============================================================
+# 重播:session 記錄 → 畫面條目(純資料,不碰 Textual)
+# ============================================================
+@dataclass(frozen=True)
+class HistoryEntry:
+    """要貼回畫面的一則。"""
+
+    kind: Literal[
+        "user", "summary", "assistant", "assistant_error", "reasoning", "tool", "tool_orphan"
+    ]
+    text: str = ""
+    tool: str = ""
+    call_id: str = ""
+    arguments: Mapping[str, Any] = field(default_factory=dict)
+    status: str = ""
+    output: str = ""
+    structured: Any = None
+    dropped: int = 0
+    kept: int = 0
+
+
+def _reasoning_text(message: Mapping[str, Any]) -> str:
+    for key in context_budget.REASONING_FIELDS:
+        value = message.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _call_arguments(call: Mapping[str, Any]) -> dict[str, Any]:
+    """wire 上的參數是 JSON **字串**;摘要行要的是解析過的 dict。
+
+    解不出來的(串流被切一半)也要顯示原文:摘要行寫成 `list_dir()` 的話,
+    使用者看到的是「呼叫了但沒有參數」,而真相是參數壞掉。
+    """
+    function = call.get("function")
+    raw = function.get("arguments") if isinstance(function, Mapping) else None
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"arguments": raw}
+    return parsed if isinstance(parsed, dict) else {"arguments": raw}
+
+
+def history_entries(transcript: Sequence[Mapping[str, Any]]) -> list[HistoryEntry]:
+    """把一段 transcript 攤成畫面條目。順序 = transcript 順序。
+
+    **工具結果按「宣告群組」配對,不是按 id 反查整段歷史。** 沒有 server 給的 id
+    時,fallback id 每個行程從 ``call_1`` 起算,所以同一段對話裡 `call_1` 會出現
+    很多次;以 id 反查會把新結果貼到幾十輪之前的那個 block 上。規則:每則帶
+    ``tool_calls`` 的 assistant 開一個新群組,結果只配**同群組**內還沒被回答的
+    同 id;舊群組沒被回答的永遠是 pending(它真的沒有結果);配不到任何群組的
+    結果是 orphan(顯示出來,不安靜丟掉)。壓縮標記也關掉群組:它之前的呼叫
+    在模型眼中已經不存在了。
+    """
+    entries: list[HistoryEntry] = []
+    open_calls: dict[str, int] = {}
+    for record in transcript:
+        if record.get("type") == "compaction":
+            open_calls = {}
+            summary = record.get("summary")
+            entries.append(
+                HistoryEntry(
+                    kind="summary",
+                    text=summary if isinstance(summary, str) else "",
+                    dropped=int(record.get("dropped") or 0),
+                    kept=int(record.get("kept") or 0),
+                )
+            )
+            continue
+        role = record.get("role")
+        if role == "user":
+            content = record.get("content")
+            if isinstance(content, str) and content:
+                entries.append(HistoryEntry(kind="user", text=content))
+            continue
+        if role == "assistant":
+            reasoning = _reasoning_text(record)
+            if reasoning:
+                entries.append(HistoryEntry(kind="reasoning", text=reasoning))
+            content = record.get("content")
+            if isinstance(content, str) and content:
+                errored = record.get("tool_status") == client_events.STATUS_ERROR
+                entries.append(
+                    HistoryEntry(kind="assistant_error" if errored else "assistant", text=content)
+                )
+            calls = [call for call in (record.get("tool_calls") or ()) if isinstance(call, Mapping)]
+            if calls:
+                open_calls = {}
+                for call in calls:
+                    call_id = call.get("id")
+                    call_id = call_id if isinstance(call_id, str) else ""
+                    function = call.get("function")
+                    name = function.get("name") if isinstance(function, Mapping) else ""
+                    entries.append(
+                        HistoryEntry(
+                            kind="tool",
+                            tool=name if isinstance(name, str) and name else "?",
+                            call_id=call_id,
+                            arguments=_call_arguments(call),
+                            status=PENDING_TOOL_STATUS,
+                            output=PENDING_TOOL_OUTPUT,
+                        )
+                    )
+                    if call_id:
+                        open_calls[call_id] = len(entries) - 1
+            continue
+        if role == "tool":
+            call_id = record.get("tool_call_id")
+            call_id = call_id if isinstance(call_id, str) else ""
+            index = open_calls.pop(call_id, None) if call_id else None
+            status = record.get("tool_status")
+            status = status if isinstance(status, str) and status else client_events.STATUS_COMPLETED
+            output = format_tool_output(record)
+            structured = record.get("structured")
+            if index is None:
+                name = record.get("name")
+                entries.append(
+                    HistoryEntry(
+                        kind="tool_orphan",
+                        tool=name if isinstance(name, str) and name else "?",
+                        call_id=call_id,
+                        status=status,
+                        output=output,
+                        structured=structured,
+                    )
+                )
+            else:
+                entries[index] = replace(
+                    entries[index], status=status, output=output, structured=structured
+                )
+    return entries
+
+
 # ============================================================
 # 對話流的元件
 # ============================================================
@@ -127,6 +311,10 @@ class ReasoningBlock(Static):
     def __init__(self) -> None:
         super().__init__(classes="entry reasoning")
         self._buffer = ""
+
+    @property
+    def text(self) -> str:
+        return self._buffer
 
     def append(self, token: str) -> None:
         self._buffer += token
@@ -188,6 +376,26 @@ class ToolBlock(Collapsible):
         self._body.update(Text(output or "(沒有輸出)"))
 
 
+class SummaryBlock(Collapsible):
+    """一次壓縮的標記:摘要收在裡面,計數在標題上。
+
+    **壓縮前的原文仍然逐字留在它上面。** 這個標記只講「從這裡之後,模型看到的
+    是摘要」—— 把 tail 再重繪一次的話,同一段對話在畫面上會出現兩次,而使用者
+    分不出哪一次是真的發生過的。
+    """
+
+    def __init__(self, summary: str, *, dropped: int, kept: int) -> None:
+        self._body = Static(Text(summary or "(這筆壓縮記錄裡沒有摘要正文)"), classes="tool-output")
+        super().__init__(self._body, title="", collapsed=True, classes="entry summary")
+        self.summary = summary
+        self.dropped = int(dropped)
+        self.kept = int(kept)
+        self.title = (
+            f"⇲ 壓縮摘要:先前 {self.dropped} 則已壓縮、"
+            f"{self.kept} 則逐字保留(模型只看得到摘要)"
+        )
+
+
 # ============================================================
 # 核准框
 # ============================================================
@@ -229,6 +437,59 @@ class ApprovalScreen(ModalScreen[bool]):
 
     def action_deny(self) -> None:
         self.dismiss(False)
+
+
+# ============================================================
+# 對話選單
+# ============================================================
+def session_row(info: Any, *, with_id: bool = False) -> str:
+    """選單/清單的一列。大綱來自 :func:`client_store.session_outline`(零 LLM)。"""
+    outline = str(getattr(info, "first_prompt", "") or "") or "(沒有問題內容)"
+    head = f"{info.session_id}  " if with_id else ""
+    return f"{head}{local_time(getattr(info, 'updated', 0.0))}  {getattr(info, 'turns', 0)} 輪  {outline}"
+
+
+class SessionPickerScreen(ModalScreen[str | None]):
+    """挑一段既有對話。Enter 選、Esc 取消。
+
+    Esc 與 Ctrl-C 都**只收選單**:選單開著時沒有回合在跑(`/session` 進來之前
+    已經擋過 busy),把它算成「中斷這一輪」或「離開」都是謊報。
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "取消", show=False)]
+    AUTO_FOCUS = "#picker-list"
+
+    def __init__(self, sessions: Sequence[Any]) -> None:
+        super().__init__()
+        self.sessions = list(sessions)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker"):
+            yield Static(
+                Text("選一個對話(↑/↓ 移動、Enter 接續、Esc 取消)", style="bold"), id="picker-title"
+            )
+            # 每一列都用 Text 包起來:對話的第一句話逐字來自使用者,裡面的
+            # `[...]` 不得被當成 Textual 的 markup 解讀。
+            yield OptionList(
+                *(
+                    Option(Text(session_row(info)), id=info.session_id)
+                    for info in self.sessions
+                ),
+                id="picker-list",
+            )
+
+    def on_mount(self) -> None:
+        listing = self.query_one("#picker-list", OptionList)
+        listing.focus()
+        if self.sessions:
+            listing.highlighted = 0
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self.dismiss(event.option_id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 # ============================================================
@@ -386,6 +647,10 @@ class CodeTrailApp(App[int]):
     #approval-body { height: 1fr; border: round $primary-darken-2; padding: 0 1; }
     #approval-buttons { height: auto; padding: 1 0 0 0; }
     #approval-buttons Button { margin: 0 2 0 0; }
+    #picker {
+        width: 90%; height: 80%; border: thick $primary; background: $surface; padding: 1 2;
+    }
+    #picker-list { height: 1fr; }
     """
 
     BINDINGS = [
@@ -455,6 +720,7 @@ class CodeTrailApp(App[int]):
         for line in self.banner:
             self._append(NoticeLine(line))
         self._append(NoticeLine("輸入 /help 看指令。"))
+        self._replay_startup_session()
         self.query_one("#completions", Static).display = False
         self._recount_context()
         self.set_interval(0.25, self._refresh_status)
@@ -481,6 +747,75 @@ class CodeTrailApp(App[int]):
             self._reasoning.display = self.show_reasoning
             self._append(self._reasoning)
         return self._reasoning
+
+    # ---- 重播 ----------------------------------------------------------
+    def _entry_widgets(self, entries: Sequence[HistoryEntry]) -> list[Widget]:
+        """條目 → widget。**重播出來的 ToolBlock 不登記進 ``_tools``**:那張表是給
+        即時事件用的(以 call id 當 key),塞進重播的 block 之後,新的一次呼叫會
+        更新到上一段對話的那個 block 上,而畫面上看起來像是它自己動了。
+        """
+        widgets: list[Widget] = []
+        for entry in entries:
+            if entry.kind == "user":
+                widgets.append(UserMessage(entry.text))
+            elif entry.kind == "summary":
+                widgets.append(SummaryBlock(entry.text, dropped=entry.dropped, kept=entry.kept))
+            elif entry.kind == "reasoning":
+                block = ReasoningBlock()
+                block.append(entry.text)
+                block.display = self.show_reasoning
+                widgets.append(block)
+            elif entry.kind in ("assistant", "assistant_error"):
+                block = AssistantBlock()
+                block.finish(entry.text)
+                widgets.append(block)
+                if entry.kind == "assistant_error":
+                    widgets.append(ErrorLine(INCOMPLETE_ANSWER_NOTE))
+            elif entry.kind in ("tool", "tool_orphan"):
+                block = ToolBlock(entry.tool or "?", entry.arguments, entry.status or "?")
+                block.set_output(entry.output)
+                if entry.kind == "tool_orphan":
+                    block.title = f"{block.title} {ORPHAN_TOOL_NOTE}"
+                widgets.append(block)
+        return widgets
+
+    def _mount_history(self, widgets: Sequence[Widget], *, clear: bool) -> None:
+        log = self.query_one("#log", VerticalScroll)
+        if clear:
+            log.remove_children()
+        if widgets:
+            log.mount(*widgets)
+        log.scroll_end(animate=False)
+
+    def _replay_history(
+        self, transcript: Sequence[Mapping[str, Any]], *, clear: bool
+    ) -> list[HistoryEntry]:
+        entries = history_entries(transcript)
+        self._mount_history(self._entry_widgets(entries), clear=clear)
+        return entries
+
+    def _resumed_notice(self, snapshot: Any, entries: Sequence[HistoryEntry]) -> str:
+        return (
+            f"已接續 {getattr(snapshot, 'session_id', '')}"
+            f"(畫面 {len(entries)} 則、模型歷史 {len(getattr(snapshot, 'messages', ()))} 則、"
+            f"壓縮 {int(getattr(snapshot, 'compactions', 0) or 0)} 次)"
+        )
+
+    def _replay_startup_session(self) -> None:
+        """`aicode -c` / `aicode --session <id>`:engine 在 app 建起來之前就接續好了。
+
+        重播只掛在 `/resume` 上的話,最常走的這一條路照樣是空白畫面 —— 使用者
+        看不到自己上次問過什麼,但模型接得下去。
+        """
+        snapshot = getattr(self.engine, "resumed_snapshot", None)
+        if snapshot is None or getattr(snapshot, "session_id", None) != self.engine.session_id:
+            return
+        try:
+            entries = self._replay_history(getattr(snapshot, "transcript", ()), clear=False)
+        except Exception as exc:  # noqa: BLE001 - 顯示不出來不得變成啟動失敗
+            self._append(ErrorLine(f"這段對話顯示不出來:{type(exc).__name__}: {exc}"))
+            return
+        self._append(NoticeLine(self._resumed_notice(snapshot, entries)))
 
     # ---- worker → UI ---------------------------------------------------
     def _from_worker(self, callback: Callable[..., None], *args: Any) -> None:
@@ -556,25 +891,14 @@ class CodeTrailApp(App[int]):
         block.set_output(self._tool_output(call_id))
 
     def _tool_output(self, call_id: str) -> str:
-        """展開區要的是**完整**輸出。
+        """即時事件那條路:從 engine 剛記下的那一則 tool 訊息取完整輸出。
 
-        送進模型的那一份 text 是套過 budget 的(``tool_result_adapter``);未裁切的
-        核心留在 ``structuredContent``,而那份刻意只給 UI / eval。只顯示 text 的話,
-        使用者在畫面上看到的是節錄,而純結構化結果的工具會顯示成「沒有輸出」。
+        格式化本身走 :func:`format_tool_output`(重播用的是同一個),兩份會漂移。
         """
         for message in reversed(self.engine.messages):
             if message.get("role") != "tool" or message.get("tool_call_id") != call_id:
                 continue
-            content = message.get("content")
-            parts = [content] if isinstance(content, str) and content else []
-            structured = message.get("structured")
-            if structured is not None:
-                try:
-                    rendered = json.dumps(structured, ensure_ascii=False, indent=2, sort_keys=True)
-                except (TypeError, ValueError):
-                    rendered = repr(structured)
-                parts.append("--- structuredContent(未裁切;只給畫面與 eval)---\n" + rendered)
-            return "\n\n".join(parts)
+            return format_tool_output(message)
         return ""
 
     def _on_step_finish(self, event: Mapping[str, Any]) -> None:
@@ -707,7 +1031,7 @@ class CodeTrailApp(App[int]):
     def _busy_notice(self, what: str) -> bool:
         """回合進行中就擋下這個指令並回 True。
 
-        ``/new`` 與 ``/resume`` 直接換掉 ``engine.session_id`` 與 ``messages``:
+        ``/new``、``/resume`` 與 ``/session`` 直接換掉 ``engine.session_id`` 與 ``messages``:
         在回合中做等於把還沒寫完的答案與自動壓縮落到**另一段**對話,舊對話留下
         一則沒有回答的 user,新對話多出一則沒有相鄰 user 的 assistant。
         只有 UI 執行緒會開始新回合,所以這裡的判斷不會有 idle→busy 的競態。
@@ -728,34 +1052,88 @@ class CodeTrailApp(App[int]):
         self.coordinator.session_changed()
         # 工具 block 以 call id 當 key;換了對話,舊 id 不得再被新呼叫接上。
         self._tools.clear()
+        self._assistant = None
+        self._reasoning = None
+        self._turn_started = None
+        # 畫面也要換過去:上一段對話留在畫面上的話,新對話的第一個回答會接在
+        # 別段對話的下面,而模型完全看不到那一段。
+        self._mount_history((), clear=True)
         self._append(NoticeLine(f"新對話:{self.engine.session_id}"))
         self._recount_context()
         self._refresh_status()
 
+    def _sessions(self, limit: int) -> list[Any] | None:
+        try:
+            return list(self.engine.store.list_sessions(limit=limit))
+        except Exception as exc:  # noqa: BLE001 - 讀不到清單不得帶走 UI
+            self._append(ErrorLine(f"讀不到既有對話:{type(exc).__name__}: {exc}"))
+            return None
+
     def _cmd_sessions(self, _argument: str) -> None:
-        sessions = self.engine.store.list_sessions()
+        sessions = self._sessions(SESSION_LIST_LIMIT)
+        if sessions is None:
+            return
         if not sessions:
             self._append(NoticeLine("這個專案還沒有已保存的對話。"))
             return
-        lines = [
-            f"  {info.session_id}  turns={info.turns}  {info.title}" for info in sessions[:20]
-        ]
-        self._append(NoticeLine("\n".join(lines)))
+        lines = [f"  {session_row(info, with_id=True)}" for info in sessions]
+        self._append(NoticeLine("\n".join(lines) + "\n用 /session 選一段接續。"))
+
+    def _cmd_session(self, argument: str) -> None:
+        """`/session <id>` 直接換;`/session` 開選單。"""
+        if argument:
+            self._switch_session(argument, what="/session")
+            return
+        if self._busy_notice("/session"):
+            return
+        sessions = self._sessions(SESSION_PICKER_LIMIT)
+        if sessions is None:
+            return
+        if not sessions:
+            self._append(NoticeLine("這個專案還沒有已保存的對話。"))
+            return
+        self.push_screen(SessionPickerScreen(sessions), self._picked_session)
+
+    def _picked_session(self, session_id: str | None) -> None:
+        # 取消(Esc / Ctrl-C / 收掉畫面)一律是「什麼都沒發生」。
+        if not session_id:
+            return
+        self._switch_session(session_id, what="/session")
 
     def _cmd_resume(self, argument: str) -> None:
-        if self._busy_notice("/resume"):
-            return
         if not argument:
-            self._append(NoticeLine("用法:/resume <session id>"))
+            if self._busy_notice("/resume"):
+                return
+            self._append(NoticeLine("用法:/resume <session id>,或用 /session 開選單。"))
+            return
+        self._switch_session(argument, what="/resume")
+
+    def _switch_session(self, session_id: str, *, what: str = "/session") -> None:
+        """換到另一段既有對話:engine 與畫面**要嘛一起換,要嘛都不動**。
+
+        順序是契約:先一次受信讀取(`load_session`,零狀態改動)、再把 widget 建
+        好、最後才 `adopt` 並換畫面。反過來的話,讀壞掉的 session 檔會留下「engine
+        已經換過去、畫面還是上一段」的狀態 —— 使用者對著舊畫面問下一題,而那一題
+        會被寫進另一段對話。
+        """
+        if self._busy_notice(what):
             return
         try:
-            self.engine.resume(argument)
-        except Exception as exc:  # noqa: BLE001
+            snapshot = self.engine.load_session(session_id)
+            entries = history_entries(getattr(snapshot, "transcript", ()))
+            widgets = self._entry_widgets(entries)
+        except Exception as exc:  # noqa: BLE001 - 到這裡為止 engine / 畫面都還沒動
             self._append(ErrorLine(f"無法接續:{exc}"))
             return
+        self.engine.adopt(snapshot)
         self.coordinator.session_changed()
+        # 工具 block 以 call id 當 key;換了對話,舊 id 不得再被新呼叫接上。
         self._tools.clear()
-        self._append(NoticeLine(f"已接續 {argument}({len(self.engine.messages)} 則訊息)"))
+        self._assistant = None
+        self._reasoning = None
+        self._turn_started = None
+        self._mount_history(widgets, clear=True)
+        self._append(NoticeLine(self._resumed_notice(snapshot, entries)))
         self._recount_context()
         self._refresh_status()
 
@@ -787,8 +1165,25 @@ class CodeTrailApp(App[int]):
         self._append(NoticeLine("\n".join(lines)))
 
     # ---- 鍵盤動作 ------------------------------------------------------
+    def _close_picker(self) -> bool:
+        """對話選單開著就收掉它並回 True。
+
+        選單不是一個回合、也不是一個核准:Ctrl-C 收它不算「中斷這一輪」
+        (那是謊報),Ctrl-D 收它也不算「離開」。
+        """
+        screen = self.screen
+        if not isinstance(screen, SessionPickerScreen):
+            return False
+        try:
+            screen.dismiss(None)
+        except Exception:  # noqa: BLE001 - 畫面已經不在了
+            pass
+        return True
+
     def action_interrupt(self) -> None:
-        """Ctrl-C。回合進行中 = 中斷整輪;閒置 = 連按兩次離開。"""
+        """Ctrl-C。選單開著 = 只收選單;回合進行中 = 中斷整輪;閒置 = 連按兩次離開。"""
+        if self._close_picker():
+            return
         # block=False:MCP 取消要等寬限期(10 秒)+ SIGTERM + 重新 spawn。
         # 同步跑在這裡就是整個畫面凍住,而且 worker 送事件用的
         # call_from_thread 也會排在後面一起卡住。
@@ -811,12 +1206,15 @@ class CodeTrailApp(App[int]):
 
         * 核准框開著 = EOF:**只拒絕這一個工具**,回合繼續(沿用舊 REPL 的
           「核准提示收到 EOF 就是拒絕」)。
+        * 對話選單開著:只收選單(沒有選任何一段,也沒有離開)。
         * 回合進行中:不離開。直接拆掉畫面會留下一個卡在核准上的 worker,
           而 `command_chat` 隨即關掉共用的 MCP。要停就先 Ctrl-C 中斷。
         * 閒置:存歷史然後離開。
         """
         if isinstance(self.screen, ApprovalScreen):
             self.screen.action_deny()
+            return
+        if self._close_picker():
             return
         if self._busy_notice("Ctrl-D"):
             return

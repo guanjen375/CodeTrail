@@ -7,7 +7,6 @@ import os
 import re
 import shutil
 import signal
-import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -17,7 +16,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from deployment_profile import ProfileError, load_effective_profile  # noqa: E402
+import process_env  # noqa: E402
+from deployment_profile import (  # noqa: E402
+    TMUX_SESSIONS,
+    ProfileError,
+    add_loader_arguments,
+    load_effective_profile,
+    loader_kwargs,
+)
 from deployment_status import query_gpu_processes  # noqa: E402
 
 # tmux kill-session(SIGHUP)只是「開始停止」:llama-server 退出前要先釋放
@@ -27,7 +33,15 @@ from deployment_status import query_gpu_processes  # noqa: E402
 _TERM_AFTER = 10.0  # SIGHUP 後仍存活(非退出中)→ 補 SIGTERM(graceful 路徑)
 _KILL_AFTER = 25.0  # 再不退 → SIGKILL(對已在退出路徑的 process 無害)
 _PROGRESS_EVERY = 5.0
-_DEFAULT_STOP_TIMEOUT = 120  # 大模型 teardown 常見數十秒;AICODE_STOP_TIMEOUT 可覆寫
+#: 大模型 teardown 常見數十秒;`--timeout` 可覆寫(launcher 的 rollback 直接用這個值)。
+DEFAULT_STOP_TIMEOUT = 120
+
+
+def _positive_int(value: str) -> int:
+    """argparse 的正整數:`--timeout 0` 要在解析階段就被擋下。"""
+    if not value.isdecimal() or int(value) < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    return int(value)
 
 
 def _roles(scope: str) -> tuple[str, ...]:
@@ -36,28 +50,20 @@ def _roles(scope: str) -> tuple[str, ...]:
     return ("main", "embedding", "reranker", "vl")
 
 
-def _sessions(scope: str) -> tuple[str, ...]:
-    main = os.environ.get("MAIN_SESSION") or "codetrail-main"
-    aux = os.environ.get("SESSION") or os.environ.get("AUX_SESSION") or "codetrail-rag"
+def _sessions(scope: str, args: argparse.Namespace) -> tuple[str, ...]:
+    """要關掉的 tmux session。名字是 `deployment_profile.TMUX_SESSIONS` 這個 repo 常數。
+
+    以前 aux 那格會吃殼層的泛用 `SESSION`(桌面環境很常見),於是「停止」會去
+    關一個完全無關的 session,而真正的 rag session 留著。隱藏旗標只給契約測試用。
+    """
+    main = getattr(args, "main_session", None) or TMUX_SESSIONS["main"]
+    aux = getattr(args, "aux_session", None) or TMUX_SESSIONS["aux"]
     return (aux,) if scope == "aux" else (main, aux)
-
-
-def _stop_timeout(environ: Mapping[str, str]) -> int:
-    raw = (environ.get("AICODE_STOP_TIMEOUT") or "").strip()
-    if not raw:
-        return _DEFAULT_STOP_TIMEOUT
-    if not raw.isdecimal() or int(raw) < 1:
-        print(
-            f"[!] AICODE_STOP_TIMEOUT 必須是正整數(拿到 {raw!r});改用預設 {_DEFAULT_STOP_TIMEOUT}s",
-            file=sys.stderr,
-        )
-        return _DEFAULT_STOP_TIMEOUT
-    return int(raw)
 
 
 def _pane_pids(session: str) -> dict[int, str]:
     """kill-session 之前記下 session 內每個 pane 的 process(pid → session:window)。"""
-    proc = subprocess.run(
+    proc = process_env.run(
         ["tmux", "list-panes", "-s", "-t", session, "-F", "#{pane_pid} #{window_name}"],
         capture_output=True,
         text=True,
@@ -103,7 +109,7 @@ def _gpu_compute_pids() -> set[int] | None:
     在 tracked 裡」就夠了。"""
     if not shutil.which("nvidia-smi"):
         return None
-    proc = subprocess.run(
+    proc = process_env.run(
         ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits"],
         capture_output=True,
         text=True,
@@ -117,7 +123,7 @@ def _gpu_compute_pids() -> set[int] | None:
 def _gpu_memory_line() -> str | None:
     if not shutil.which("nvidia-smi"):
         return None
-    proc = subprocess.run(
+    proc = process_env.run(
         ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
         capture_output=True,
         text=True,
@@ -191,7 +197,7 @@ def _wait_released(
 def _listener_pids(port: int) -> set[int] | None:
     if not shutil.which("ss"):
         return None
-    proc = subprocess.run(
+    proc = process_env.run(
         ["ss", "-H", "-ltnp", f"sport = :{port}"],
         capture_output=True,
         text=True,
@@ -216,18 +222,30 @@ def _is_expected_llama(pid: int, port: int) -> bool:
     return False
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Stop CodeTrail llama-server tmux sessions")
     parser.add_argument("--scope", choices=("aux", "all"), required=True)
-    parser.add_argument("--profile", help="profile name or absolute JSON profile path")
     parser.add_argument("--force", action="store_true", help="SIGTERM verified orphan llama-server listeners")
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--timeout", type=_positive_int, default=DEFAULT_STOP_TIMEOUT,
+        help=f"等 process 結束並釋放 VRAM 的上限秒數(預設 {DEFAULT_STOP_TIMEOUT})",
+    )
+    # 隱藏旗標:契約測試不能碰開發機上真的在跑的那兩個 session。
+    parser.add_argument("--main-session", help=argparse.SUPPRESS)
+    parser.add_argument("--aux-session", help=argparse.SUPPRESS)
+    # port 檢查要知道 profile 的四個 port,所以 stop 也認同一組 loader 旗標。
+    add_loader_arguments(parser)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
     # 設定檔壞掉時(手改壞 JSON、registry 失效)不能連「停止」都做不到:
     # 關 tmux session 不需要 profile,先關;之後的 port 檢查才需要 profile。
     profile = None
     profile_error: ProfileError | None = None
     try:
-        profile = load_effective_profile(profile=args.profile)
+        profile = load_effective_profile(**loader_kwargs(args))
     except ProfileError as exc:
         profile_error = exc
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -239,17 +257,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     tracked: dict[int, str] = {}
     if shutil.which("tmux"):
-        for session in _sessions(args.scope):
-            exists = subprocess.run(
+        for session in _sessions(args.scope, args):
+            exists = process_env.run(
                 ["tmux", "has-session", "-t", session],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=process_env.DEVNULL,
+                stderr=process_env.DEVNULL,
                 check=False,
             ).returncode == 0
             if exists:
                 # 先記 pane PID 再 kill:kill 之後就查不到「該等誰退出」了。
                 tracked.update(_pane_pids(session))
-                kill = subprocess.run(
+                kill = process_env.run(
                     ["tmux", "kill-session", "-t", session],
                     capture_output=True,
                     text=True,
@@ -268,7 +286,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         print("[!] tmux not found; checking profile ports only", file=sys.stderr)
 
-    timeout = _stop_timeout(os.environ)
+    timeout = args.timeout
     stuck: list[int] = []
     if tracked:
         started = time.monotonic()
@@ -278,7 +296,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 f"[!] {timeout}s 內仍未結束/未釋放 VRAM:{names} — process 可能卡在"
                 "驅動清理;用 nvidia-smi 觀察,久候不退時考慮重開機。"
-                "(等待上限可用 AICODE_STOP_TIMEOUT 調整)",
+                "(等待上限可用 --timeout 調整)",
                 file=sys.stderr,
             )
         else:

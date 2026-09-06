@@ -31,7 +31,7 @@ from pydantic import Field
 
 # ---- 啟動參數 --------------------------------------------------------------
 # 沙箱 root 與 readonly 都走 **argv**,不走環境變數:客戶端交出去的子行程環境
-# 已經把 AICODE_* / AI_CODE_* / CODETRAIL_* / OPENCODE_* 整組剝掉,所以殼層裡
+# 已經把 `process_env.STRIPPED_ENV_PREFIXES` 那幾個前綴整組剝掉,所以殼層裡
 # 殘留的同名變數(可能來自另一份安裝、另一個專案)再也翻不動這兩個決定。
 # 這裡刻意用手寫 parser 而不是 argparse:整支 server 是 import 期就開始做事的,
 # 而 root 必須在 `set_sandbox_root` 之前定案。

@@ -14,14 +14,13 @@ import n_ctx as _n_ctx
 # llama.cpp llama-server 設定
 # ============================================================
 # 多 server 架構:每個角色一個 llama-server instance。URL、模型 ID 與啟動參數
-# 一律由 deployment_profile.py 解析；env/local profile 的 precedence 也只在那裡維護。
+# 一律由 deployment_profile.py 解析；profile / local override 的 precedence 也只在那裡維護。
 def _file_env() -> dict[str, str]:
     """交給 `deployment_profile` / `model_resolution` 的環境:**只有 HOME**。
 
-    那兩個模組的 env overlay 是啟動核心的一部分(`~/start.sh` 與 launcher 靠它),
-    所以不能改模組,只能改「交什麼給它」。交整份 `os.environ` 的話,殼層裡任何殘留
-    的 `AICODE_*` 都會蓋過 `deployment.json` —— 兩份安裝共用一台機器時,那是
-    「使用者以為在跑 A、實際在跑 B」的機制。
+    那兩個模組拿 `environ` 只為了找檔案(`~/.config/codetrail/*.json`),設定值
+    一律來自檔案與 argv。交整份 `os.environ` 也不會多出一條設定路徑,但這一份
+    交得更窄:除了 HOME,沒有任何鍵能影響解析結果。
     """
     home = _os.environ.get("HOME")
     if home:
@@ -52,14 +51,11 @@ LLAMA_VL_URL = f"{LLAMA_VL_BASE_URL}/v1/chat/completions"
 # ============================================================
 # Model Registry:bare name → GGUF 絕對路徑
 # ============================================================
-# llama-server 啟動時要餵 GGUF 檔案路徑,使用者不會想在 env 裡塞絕對路徑。
-# 所以維護一份 bare-name → path 的映射,使用者只要 AICODE_MODEL=<name> 即可。
-# 來源(優先序):
+# llama-server 啟動時要餵 GGUF 檔案路徑,使用者不會想在設定裡塞絕對路徑。
+# 所以維護一份 bare-name → path 的映射,deployment.json 的 main.model 寫 bare name 即可。
 # 來源:`~/.config/codetrail/models.json`(set_config 產生)。
 # 找不到 → 空 dict;此時 deployment.json 的 main.model 必須是 GGUF 絕對路徑。
-# `deployment_profile.load_model_registry` 另外認兩個環境變數
-# (`AICODE_MODEL_REGISTRY` / `_FILE`),但那是**啟動核心**與 launcher 的契約:
-# 我們交給它的是 `_file_env()`(只有 HOME),所以客戶端這一側看不到它們。
+# 那個檔是 registry 的**唯一**來源(以前還有兩個環境變數可以指到別份 registry)。
 def _load_model_registry() -> dict[str, str]:
     return _deployment_profile.load_model_registry(_file_env())
 
@@ -133,10 +129,10 @@ def _resolve_main_model() -> str:
     """主模型:deployment profile 的 `main.model`。
 
     回傳 bare model name(可能是 registry key,可能是 GGUF 路徑),找不到時回空字串。
-    交給解析器的是 `_file_env()`(只有 HOME),所以殼層裡殘留的 `AICODE_MODEL`
-    (可能是另一份安裝的 `~/start.sh` 設的)不會蓋過設定檔。
+    來源只有 `~/.config/codetrail/deployment.json` 一個;殼層裡的殘留值(另一份
+    安裝的 `~/start.sh` 設的那些)沒有任何一個會被讀到。
     """
-    resolved = _model_resolution.resolve_main_model_from_env(_file_env())
+    resolved = _model_resolution.resolve_main_model(_file_env())
     return resolved.model if resolved.ok else ""
 
 
@@ -145,7 +141,7 @@ MODEL = _resolve_main_model()
 
 def require_main_model() -> str:
     """取目前的主模型,沒設就 fail-loud。 LLM 呼叫端進入點都該先呼這個。"""
-    resolved = _model_resolution.resolve_main_model_from_env(_file_env())
+    resolved = _model_resolution.resolve_main_model(_file_env())
     model = resolved.model if resolved.ok else ""
     if not model:
         detail = f"\n解析錯誤: {resolved.error}" if resolved.error else ""
@@ -403,10 +399,11 @@ RESERVED_OUTPUT_TOKENS = 4096
 # prompt 仍可能在生成途中把 ctx 撐爆並被 llama-server 從前面靜默截掉。
 # 刻意**不**沿用 RESERVED_OUTPUT_TOKENS:那是 knowledge.py 內部呼叫(短答、
 # 自我檢查)的保留額,兩者的用途與合理值都不同。
-# 上限 32000:壓縮門檻的推導公式(compaction_formula.effective_max_output)把
-# max_output 夾在這個數字,所以更大的值會讓「實送的 max_tokens」與「門檻推導
-# 用的 max_output」變成兩個數 —— 門檻不再由實際輸出上限推出來。0 在同一條
-# 公式裡會被翻成 32000,也不是使用者的意思。兩種都 fail-loud,不靜默改寫。
+# 上限 32000 = `compaction_formula.OUTPUT_TOKEN_MAX`:壓縮門檻的推導公式
+# (compaction_formula.effective_max_output)把 max_output 夾在這個數字,所以更大的
+# 值會讓「實送的 max_tokens」與「門檻推導用的 max_output」變成兩個數 —— 門檻不再由
+# 實際輸出上限推出來。0 在同一條公式裡會被翻成 32000,也不是使用者的意思。
+# 兩種都 fail-loud,不靜默改寫(等式本身由 client_compaction 在 import 期釘住)。
 CLIENT_MAX_OUTPUT_TOKENS_CAP = 32000
 CLIENT_MAX_OUTPUT_TOKENS = 8192
 # 常數之後這仍然是 import-time 的**不變式**,不是「使用者設錯」的檢查:改這個
@@ -435,10 +432,10 @@ CTX_METRICS_PATH = ".codetrail/context_metrics.jsonl"
 # ============================================================
 # tool-call canary（scripts/tool_call_canary.py）的時限與快取期
 # ============================================================
-# 全部是 repo 常數:改這些數字是改 repo,所有使用者一致。以前它們是四個
-# `AICODE_TOOL_CANARY_*` 環境變數,加上三個逃生口(SKIP / FORCE / WARN_ONLY)
-# 與一個位置覆寫(CACHE)。逃生口一律刪除、無替代:要跳過某個檢查就是修那個
-# 檢查,要強制重測就是 `--force` 或刪掉 ~/.cache/codetrail 那個檔。
+# 全部是 repo 常數:改這些數字是改 repo,所有使用者一致。以前它們是四個環境
+# 變數,加上三個逃生口(SKIP / FORCE / WARN_ONLY)與一個位置覆寫(CACHE)。
+# 逃生口一律刪除、無替代:要跳過某個檢查就是修那個檢查,要強制重測就是
+# `--force` 或刪掉 ~/.cache/codetrail 那個檔。
 TOOL_CANARY_MCP_TIMEOUT_SECONDS = 90
 TOOL_CANARY_MODEL_TIMEOUT_SECONDS = 120
 TOOL_CANARY_IMPLICIT_TIMEOUT_SECONDS = 180
@@ -871,9 +868,9 @@ CODE_RAG_REFRESH_TTL_SECONDS = 30
 # 這裡不再是「誠實化的 no-op 常數」:index entry 的 context 儲存上限已經獨立
 # 出來(CODE_RAG_CONTEXT_STORE_MAX_CHARS),放大 passage 才真的有效果。
 # 底下**會改變已儲存內容**的那幾個預算(context / comment / docstring / embed
-# text),實際值會進 code_rag.cache_identity() 的 render_budgets,所以改它們
-# (含用 AICODE_* 環境變數覆寫)本身就會讓舊 cache 失效,不需要手動 bump 版本
-# 常數。lexical scan 與 rerank passage 是 query-time 才用的,不影響任何 cache
+# text),實際值會進 code_rag.cache_identity() 的 render_budgets,所以改它們本身
+# 就會讓舊 cache 失效,不需要手動 bump 版本常數。
+# lexical scan 與 rerank passage 是 query-time 才用的,不影響任何 cache
 # 住的東西,所以不在裡面 —— 權威清單以 cache_identity() 為準,別在這裡數個數。
 # 反過來說:**只有列在 render_budgets 裡的預算免 bump**,其他任何會改變 render
 # 輸出的修改(欄位、順序、label、分隔、截斷演算法,以及還沒進 render_budgets 的
@@ -1071,7 +1068,6 @@ def get_answer_rules(has_binary: bool = False) -> str:
 # ============================================================
 # ⚠️ 安全警告：apply_patch 會直接修改檔案，請謹慎使用
 # 預設關閉;mcp_server.py 這個明確啟動點才會啟用。
-# 其他 runtime / 測試可透過環境變數 AI_CODE_PATCH=1 啟用。
 # 預設關:任何 import config 的離線工具都不該因為載入設定就取得寫檔能力。
 # runtime 由 `mcp_server` 的 `resolve_runtime_policy()` 明確打開(`--readonly` 一律關)。
 PATCH_ENABLED = False
@@ -1124,7 +1120,6 @@ LINT_COMMANDS = {
 # 建議：分析陌生 repo 時保持 False，只對自己的專案開啟
 #
 # 預設關閉;mcp_server.py 這個明確啟動點才會啟用。
-# 其他 runtime / 測試可透過環境變數 AI_CODE_RUN_TESTS=1 啟用。
 RUN_COMMAND_ENABLED = False
 RUN_COMMAND_TIMEOUT = 60
 # run_command 的 timeout(秒)三層契約:native tool schema、ToolExecutor 執行前 runtime

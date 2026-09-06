@@ -402,10 +402,10 @@ def _profile_env() -> dict[str, str]:
 def _normalise_base_url(base_url: str | None = None) -> str:
     """candidate 模型的端點:deployment profile 是唯一來源。
 
-    參數只保留給呼叫端**明確指定**的情況(測試)。以前這裡吃一個 env dict 再讀
-    `AICODE_LLAMA_BASE_URL`,而 production 傳進來的正是一份未剝除的行程環境 ——
-    等於殼層殘留一個值就能把 fingerprint 綁到別台機器的 server,而 suite 的
-    可比性靠的就是那個 fingerprint。
+    參數只保留給呼叫端**明確指定**的情況(測試)。以前這裡吃一個 env dict 再從
+    裡面讀端點,而 production 傳進來的正是一份未剝除的行程環境 —— 等於殼層殘留
+    一個值就能把 fingerprint 綁到別台機器的 server,而 suite 的可比性靠的就是
+    那個 fingerprint。
     """
     import config as _config
 
@@ -445,7 +445,7 @@ def bare_model(value: str) -> str:
 
     - registry bare name(`qwen3-coder-30b`)原樣;
     - GGUF 路徑(絕對 / `~` / `.gguf` 結尾)原樣——`split("/")` 會把絕對路徑砍成相對的;
-    - 舊式 `llamacpp/<bare>`(OpenCode 時代的 provider/model)剝掉前綴。
+    - 舊式 `llamacpp/<bare>`(舊世代前端的 provider/model 寫法)剝掉前綴。
     外部 provider(openai/ 等)直接拒絕:CodeTrail 只跑本地 llama-server。
     """
     resolved = model_resolution.normalize_main_model(str(value or ""), "--model")
@@ -462,8 +462,7 @@ def _candidate_identity(
 ) -> dict[str, Any]:
     bare = bare_model(model)
     # registry 查表只交 HOME:`env` 是要遞給子行程的那一份(已剝掉 CodeTrail
-    # 的設定名),但 `resolve_model_reference` 認得 `AICODE_MODEL_REGISTRY*`,
-    # 而那是**啟動核心**的契約 —— 這一側只該從 models.json 查。
+    # 的設定名),而查表要的只是「models.json 在哪」。
     expected_path = Path(
         deployment_profile.resolve_model_reference(bare, _profile_env(), must_exist=True)
     )

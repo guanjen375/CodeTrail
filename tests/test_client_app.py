@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import types
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -52,8 +53,9 @@ class _Store:
     def path(self, _session_id):
         return None
 
-    def list_sessions(self):
-        return list(self.sessions)
+    def list_sessions(self, limit=None):
+        sessions = list(self.sessions)
+        return sessions if limit is None else sessions[:limit]
 
 
 class _Spec:
@@ -62,12 +64,28 @@ class _Spec:
         self.read_only = read_only
 
 
+@dataclass(frozen=True)
+class _Snapshot:
+    """`Engine.load_session()` 回的東西:模型歷史與畫面歷史來自**同一次**讀取。
+
+    這裡只複述欄位形狀(engine 那半由 test_client_engine 守),app 只讀屬性。
+    """
+
+    session_id: str
+    messages: tuple[dict, ...] = ()
+    transcript: tuple[dict, ...] = ()
+    compactions: int = 0
+
+
 class _Engine:
     def __init__(self, store=None):
         self.store = store or _Store()
         self.session_id = "20260101T000000-abcdef01"
         self.messages: list[dict] = []
         self.store_error = None
+        #: session id → 存下來的快照(替身的「session 檔」)。
+        self.stored: dict[str, _Snapshot] = {}
+        self.resumed_snapshot: _Snapshot | None = None
         self.sent: list[str] = []
         self.cancelled = False
         self.options = types.SimpleNamespace(
@@ -93,10 +111,26 @@ class _Engine:
     def new_session(self):
         self.session_id = self.store.create()
         self.messages = []
+        self.resumed_snapshot = None
         return self.session_id
 
+    def load_session(self, session_id):
+        """只讀,不動 engine 任何狀態(換過去是 ``adopt`` 的事)。"""
+        snapshot = self.stored.get(session_id)
+        if snapshot is None:
+            raise ValueError(f"沒有這段對話:{session_id}")
+        return snapshot
+
+    def adopt(self, snapshot):
+        self.session_id = snapshot.session_id
+        self.messages = [dict(item) for item in snapshot.messages]
+        self.store_error = None
+        self.resumed_snapshot = snapshot
+
     def resume(self, session_id):
-        self.session_id = session_id
+        snapshot = self.load_session(session_id)
+        self.adopt(snapshot)
+        return snapshot
 
     def send(self, text, *, on_event=None, on_text=None, on_reasoning=None, approve=None):
         self.sent.append(text)
@@ -127,6 +161,8 @@ def _snapshot(app):
         "users": [w.message for w in kids if isinstance(w, client_app.UserMessage)],
         "assistant": [w.text for w in kids if isinstance(w, client_app.AssistantBlock)],
         "tools": [(w.title, w.output) for w in kids if isinstance(w, client_app.ToolBlock)],
+        "reasoning": [(w.text, w.display) for w in kids if isinstance(w, client_app.ReasoningBlock)],
+        "summaries": [(w.title, w.summary) for w in kids if isinstance(w, client_app.SummaryBlock)],
         "status": app.status_text,
         "completions": app.completion_text,
         "return_value": app.return_value,
@@ -553,9 +589,17 @@ def test_a_failed_new_keeps_the_app_and_the_current_session():
     assert any("無法開新對話" in message for message in seen["errors"])
 
 
-@pytest.mark.parametrize("command", ["/new", "/resume 20260101T000000-bbbbbbbb"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/new",
+        "/resume 20260101T000000-bbbbbbbb",
+        "/session",
+        "/session 20260101T000000-bbbbbbbb",
+    ],
+)
 def test_switching_sessions_is_refused_while_a_turn_is_running(command):
-    """`/new` / `/resume` 直接換掉 engine 的 session_id 與 messages:在回合中做
+    """`/new` / `/resume` / `/session` 直接換掉 engine 的 session_id 與 messages:在回合中做
     等於把還沒寫完的答案與自動壓縮落到**另一段**對話。"""
     engine = _Blocks()
 
@@ -575,6 +619,427 @@ def test_switching_sessions_is_refused_while_a_turn_is_running(command):
     session, notes = _run(body)
     assert session == "20260101T000000-abcdef01"       # 沒有被換掉
     assert any("這一輪還在跑" in note for note in notes)
+
+
+# ============================================================
+# 接續既有對話:畫面要重播那段對話
+# ============================================================
+#: 一段存下來的對話:一則問題、一則回答、一則宣告工具呼叫的 assistant,以及
+#: 那次呼叫的結果(含只給畫面與 eval 的 `structured`)。形狀就是 session 檔裡
+#: `message` 記錄去掉 `type` 之後的樣子。
+RESUMED_ID = "20260101T000000-cccccccc"
+RESUMED_TRANSCRIPT: tuple[dict, ...] = (
+    {"role": "user", "content": "bootloader 在哪一支檔?", "time": 1.0},
+    {"role": "assistant", "content": "在 boot/ 底下。", "time": 2.0},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "list_dir", "arguments": '{"path": "."}'},
+            }
+        ],
+        "time": 3.0,
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "name": "list_dir",
+        "content": "a\nb\nc",
+        "tool_status": client_events.STATUS_COMPLETED,
+        "structured": {"entries": ["a", "b", "c"], "truncated_from": 900},
+        "time": 4.0,
+    },
+)
+
+
+def _resumable(engine, session_id=RESUMED_ID):
+    """把上面那段對話放進替身的「session 檔」,回傳它的快照。"""
+    snapshot = _Snapshot(
+        session_id=session_id,
+        messages=RESUMED_TRANSCRIPT,
+        transcript=RESUMED_TRANSCRIPT,
+        compactions=0,
+    )
+    engine.stored[session_id] = snapshot
+    return snapshot
+
+
+def test_resume_replays_the_stored_history():
+    """接續一段既有對話之後,畫面上要有那段對話。
+
+    只換掉 engine 的歷史、畫面留在原地的話,使用者面對的是一個空白畫面,
+    但模型看得到整段脈絡:接下來每一則回答都在回應畫面上不存在的東西
+    (「照你剛剛說的」指的是使用者看不到的那一段),而且工具輸出、
+    reasoning 與壓縮過的部分再也沒有辦法在這個介面裡看到。
+    """
+    engine = _Engine()
+    _resumable(engine)
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            app._command(f"/resume {RESUMED_ID}")
+            await _settle(pilot)
+            return _snapshot(app)
+
+    seen = _run(body)
+    assert engine.session_id == RESUMED_ID
+    assert seen["users"] == ["bootloader 在哪一支檔?"]
+    assert seen["assistant"] == ["在 boot/ 底下。"]
+    assert len(seen["tools"]) == 1, seen["tools"]
+    title, output = seen["tools"][0]
+    assert "list_dir(path=.)" in title and "completed" in title
+    # 展開區跟 live 那條路一樣是完整輸出:content + 未裁切的 structuredContent。
+    assert "a\nb\nc" in output
+    assert "truncated_from" in output and "900" in output
+    assert any("已接續" in note and RESUMED_ID in note for note in seen["notices"])
+
+
+def test_a_session_resumed_at_startup_is_shown_on_mount():
+    """`aicode -c` / `aicode --session <id>` 在建 app 之前就接續好了。
+
+    重播只掛在 `/resume` 上的話,啟動時接續的那條路(最常用的一條)照樣是
+    空白畫面。engine 帶著 `resumed_snapshot` 進來,畫面就要把它貼出來。
+    """
+    engine = _Engine()
+    snapshot = _resumable(engine)
+    engine.adopt(snapshot)                     # `_build` 已經 resume 過
+
+    async def body():
+        app = client_app.CodeTrailApp(engine, banner=("root=/tmp",))
+        async with app.run_test() as pilot:
+            await _settle(pilot)
+            return _snapshot(app)
+
+    seen = _run(body)
+    assert seen["users"] == ["bootloader 在哪一支檔?"]
+    assert seen["assistant"] == ["在 boot/ 底下。"]
+    assert len(seen["tools"]) == 1, seen["tools"]
+    assert any("已接續" in note and RESUMED_ID in note for note in seen["notices"])
+    # banner 與 /help 提示還在:重播是加在它們之後,不是取代啟動畫面。
+    assert "root=/tmp" in seen["notices"]
+
+
+# ============================================================
+# 重播的內容契約:配對、壓縮標記、pending / orphan、與即時事件的界線
+# ============================================================
+def _info(session_id, *, updated, turns, first_prompt):
+    return client_store.SessionInfo(
+        session_id=session_id,
+        path=Path(f"/nonexistent/{session_id}.jsonl"),
+        created=updated - 60.0,
+        updated=updated,
+        title="",
+        turns=turns,
+        first_prompt=first_prompt,
+    )
+
+
+OTHER_ID = "20260101T000000-dddddddd"
+
+
+def _pickable(engine):
+    """兩段可選的對話:最近更新的那一段排前面(就是 RESUMED_TRANSCRIPT 那一段)。"""
+    _resumable(engine)
+    engine.stored[OTHER_ID] = _Snapshot(session_id=OTHER_ID)
+    engine.store.sessions = [
+        _info(RESUMED_ID, updated=1_800_000_000.0, turns=2, first_prompt="bootloader 在哪一支檔?"),
+        _info(OTHER_ID, updated=1_700_000_000.0, turns=1, first_prompt="另一段對話問過的事"),
+    ]
+
+
+def test_the_session_picker_lists_outlines_and_switches():
+    """`/session` 的選單要看得出「哪一段是哪一段」:時間、輪數、問過的第一句話。
+
+    只列 session id 的話(`20260101T000000-abcdef01`),使用者唯一能做的就是逐個
+    試接續 —— 而每試一次都會換掉 engine 的歷史。大綱是本地算的(零 LLM、零寫入)。
+    """
+    engine = _Engine()
+    _pickable(engine)
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            await _settle(pilot)
+            app._command("/session")
+            await _settle(pilot)
+            opened = isinstance(app.screen, client_app.SessionPickerScreen)
+            listing = app.screen.query_one("#picker-list")
+            rows = [
+                str(listing.get_option_at_index(index).prompt)
+                for index in range(listing.option_count)
+            ]
+            await pilot.press("enter")           # 選最上面那一段
+            await _settle(pilot)
+            return opened, rows, _snapshot(app)
+
+    opened, rows, seen = _run(body)
+    assert opened
+    assert len(rows) == 2
+    assert "bootloader 在哪一支檔?" in rows[0] and "2 輪" in rows[0]
+    assert "另一段對話問過的事" in rows[1]
+    # 選定 = 換過去而且畫面重播那一段。
+    assert engine.session_id == RESUMED_ID
+    assert seen["users"] == ["bootloader 在哪一支檔?"]
+    assert any("已接續" in note and RESUMED_ID in note for note in seen["notices"])
+
+
+def test_escape_and_ctrl_c_only_close_the_picker():
+    """選單裡的 Esc / Ctrl-C 是「不選了」,不是中斷一輪、也不是離開。
+
+    把它算成中斷會顯示成「已中斷這一輪」(閒置時根本沒有東西可中斷,那是謊報);
+    算成離開的話,Ctrl-C 收掉選單之後再按一次就直接退出程式。
+    """
+    engine = _Engine()
+    _pickable(engine)
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            await _settle(pilot)
+            app._command("/session")
+            await _settle(pilot)
+            await pilot.press("escape")
+            await _settle(pilot)
+            after_escape = isinstance(app.screen, client_app.SessionPickerScreen)
+            app._command("/session")
+            await _settle(pilot)
+            await pilot.press("ctrl+c")
+            await _settle(pilot)
+            after_ctrl_c = isinstance(app.screen, client_app.SessionPickerScreen)
+            return after_escape, after_ctrl_c, _snapshot(app)
+
+    after_escape, after_ctrl_c, seen = _run(body)
+    assert after_escape is False and after_ctrl_c is False
+    assert engine.session_id == "20260101T000000-abcdef01"      # 兩次都沒有換
+    assert seen["users"] == [] and seen["tools"] == []
+    assert not any("已中斷" in note for note in seen["notices"])
+    assert not any("再按一次" in note for note in seen["notices"])
+    assert seen["return_value"] is None                          # 也沒有離開
+
+
+def test_a_failed_switch_keeps_the_session_and_the_screen():
+    """讀不到那段對話 = 什麼都沒發生:engine、畫面、工具表、壓縮器一個都不准動。
+
+    先換 engine 再重播的話,失敗會留下「模型在新對話、畫面是舊那段」的狀態:
+    使用者對著舊畫面問下一題,那一題被寫進另一段對話,而畫面上看不出來。
+    """
+    engine = _Engine()
+    engine.messages = [{"role": "user", "content": "原本這一段"}]
+    rebinds: list[int] = []
+
+    async def body():
+        compactor = types.SimpleNamespace(
+            mode="manual", pending_stop_notice=lambda: "", rebind=lambda: rebinds.append(1)
+        )
+        app = client_app.CodeTrailApp(engine, compactor=compactor, banner=("root=/tmp",))
+        async with app.run_test() as pilot:
+            app.handle_event(
+                client_events.tool_event(
+                    engine.session_id, tool="list_dir", call_id="call-9",
+                    status=client_events.STATUS_COMPLETED, arguments={"path": "."},
+                )
+            )
+            await _settle(pilot)
+            app._command("/resume 20260101T000000-eeeeeeee")
+            await _settle(pilot)
+            return _snapshot(app), list(app._tools)
+
+    seen, tools = _run(body)
+    assert engine.session_id == "20260101T000000-abcdef01"
+    assert engine.messages == [{"role": "user", "content": "原本這一段"}]
+    assert engine.resumed_snapshot is None
+    assert rebinds == []                              # 壓縮器沒有被重綁
+    assert tools == ["call-9"]                        # 即時事件的那張表原封不動
+    assert "root=/tmp" in seen["notices"]             # 畫面沒有被清掉
+    assert len(seen["tools"]) == 1
+    assert any("無法接續" in message for message in seen["errors"])
+
+
+#: 同一個 `call_1` 出現兩次:fallback id 每個行程從 1 起算,所以同一段對話裡
+#: 重複是**正常**的。第一次的呼叫沒有結果(crash / 中斷),第二次才有。
+GROUPED_TRANSCRIPT: tuple[dict, ...] = (
+    {"role": "user", "content": "看一下目錄", "time": 1.0},
+    {
+        "role": "assistant",
+        "content": None,
+        "reasoning_content": "先列目錄",
+        "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "list_dir", "arguments": '{"path": "."}'}}
+        ],
+        "time": 2.0,
+    },
+    {"role": "user", "content": "再試一次", "time": 3.0},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path": "boot.c"}'}}
+        ],
+        "time": 4.0,
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "name": "read_file",
+        "content": "int main(void)",
+        "tool_status": client_events.STATUS_COMPLETED,
+        "structured": {"lines": 1},
+        "time": 5.0,
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_ghost",
+        "name": "grep_code",
+        "content": "沒有人宣告過我",
+        "tool_status": client_events.STATUS_ERROR,
+        "time": 6.0,
+    },
+    {"role": "assistant", "content": "半截的答案", "tool_status": client_events.STATUS_ERROR,
+     "time": 7.0},
+)
+
+
+def test_replay_pairs_tool_results_by_declaration_group_not_by_id():
+    """結果只配**宣告它的那一組**呼叫。
+
+    fallback call id 每個行程從 `call_1` 起算,同一段對話裡必然重複。以 id 反查
+    整段歷史的話,第二次呼叫的結果會貼到幾十輪之前那個 block 上 —— 使用者看到的
+    是「上一輪的工具突然自己更新了」,而真正這一次的呼叫顯示成沒有結果。舊群組
+    沒被回答的那次是真的沒有結果(pending),配不到任何群組的則要標出來。
+    """
+    engine = _Engine()
+    engine.stored[RESUMED_ID] = _Snapshot(
+        session_id=RESUMED_ID, messages=GROUPED_TRANSCRIPT, transcript=GROUPED_TRANSCRIPT
+    )
+
+    async def body():
+        app = client_app.CodeTrailApp(engine, show_reasoning=True)
+        async with app.run_test() as pilot:
+            app._command(f"/resume {RESUMED_ID}")
+            await _settle(pilot)
+            return _snapshot(app)
+
+    seen = _run(body)
+    assert [title for title, _output in seen["tools"]] == [
+        f"· list_dir(path=.) → {client_app.PENDING_TOOL_STATUS}",
+        "✓ read_file(path=boot.c) → completed",
+        f"✗ grep_code() → error {client_app.ORPHAN_TOOL_NOTE}",
+    ], seen["tools"]
+    outputs = [output for _title, output in seen["tools"]]
+    assert outputs[0] == client_app.PENDING_TOOL_OUTPUT
+    assert "int main(void)" in outputs[1] and "structuredContent" in outputs[1]
+    assert "沒有人宣告過我" in outputs[2]
+    # reasoning 也重播(`/thinking` 管它顯不顯示),被標成 error 的那一則要看得出來。
+    assert seen["reasoning"] == [("先列目錄", True)]
+    assert seen["assistant"] == ["半截的答案"]
+    assert client_app.INCOMPLETE_ANSWER_NOTE in seen["errors"]
+
+
+#: 兩次壓縮:壓縮前的原文全部留著,壓縮本身只是一個標記(tail 不重畫)。
+COMPACTED_TRANSCRIPT: tuple[dict, ...] = (
+    {"role": "user", "content": "第一題", "time": 1.0},
+    {"role": "assistant", "content": "第一答", "time": 2.0},
+    {"type": "compaction", "time": 3.0, "summary": "第一次的摘要", "dropped": 2, "kept": 1},
+    {"role": "user", "content": "第二題", "time": 4.0},
+    {"role": "assistant", "content": "第二答", "time": 5.0},
+    {"type": "compaction", "time": 6.0, "summary": "第二次的摘要", "dropped": 3, "kept": 1},
+    {"role": "user", "content": "第三題", "time": 7.0},
+)
+
+
+def test_replay_shows_pre_compaction_originals_and_a_summary_marker():
+    """壓縮過的對話:畫面留原文,標記只講「模型從這裡之後只看得到摘要」。
+
+    畫面跟著模型歷史走的話,壓縮過的那一段在畫面上就永久消失了 —— 檔案裡明明
+    還在,而使用者是靠捲回去看自己問過什麼。反過來把 tail 隨標記再畫一次,同一段
+    問答會出現兩次,使用者分不出哪一次真的發生過。
+    """
+    engine = _Engine()
+    engine.stored[RESUMED_ID] = _Snapshot(
+        session_id=RESUMED_ID,
+        messages=({"role": "user", "content": "第三題"},),
+        transcript=COMPACTED_TRANSCRIPT,
+        compactions=2,
+    )
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            app._command(f"/resume {RESUMED_ID}")
+            await _settle(pilot)
+            return _snapshot(app)
+
+    seen = _run(body)
+    assert seen["users"] == ["第一題", "第二題", "第三題"]
+    assert seen["assistant"] == ["第一答", "第二答"]
+    titles = [title for title, _summary in seen["summaries"]]
+    assert [summary for _title, summary in seen["summaries"]] == ["第一次的摘要", "第二次的摘要"]
+    assert "2 則已壓縮" in titles[0] and "1 則逐字保留" in titles[0]
+    assert "3 則已壓縮" in titles[1]
+    # notice 要講清楚兩份歷史不一樣長(模型只看得到 1 則)。
+    assert any("畫面 7 則" in note and "模型歷史 1 則" in note and "壓縮 2 次" in note
+               for note in seen["notices"]), seen["notices"]
+
+
+def test_replayed_tool_blocks_are_not_registered_for_live_events():
+    """重播出來的 block **不進** `_tools`。
+
+    那張表以 call id 當 key 給即時事件用;塞進重播的 block 之後,新的一次
+    `call_1` 會更新到上一段對話那個 block 上 —— 畫面上看起來是舊區塊自己動了,
+    而這一次真正的呼叫從頭到尾沒有出現。
+    """
+    engine = _Engine()
+    _resumable(engine)
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            app._command(f"/resume {RESUMED_ID}")
+            await _settle(pilot)
+            registered = list(app._tools)
+            app.handle_event(
+                client_events.tool_event(
+                    engine.session_id, tool="grep_code", call_id="call_1",
+                    status=client_events.STATUS_COMPLETED, arguments={"pattern": "boot"},
+                )
+            )
+            await _settle(pilot)
+            return registered, _snapshot(app)
+
+    registered, seen = _run(body)
+    assert registered == []
+    titles = [title for title, _output in seen["tools"]]
+    assert len(titles) == 2, titles
+    assert "list_dir" in titles[0] and "grep_code" in titles[1]
+
+
+def test_new_clears_the_screen():
+    """`/new` 之後畫面上不得留著上一段對話。
+
+    留著的話,新對話的第一個回答會接在另一段對話下面,而模型完全看不到那一段 ——
+    畫面顯示的脈絡與模型手上的從此不同。
+    """
+    engine = _Engine()
+    _resumable(engine)
+
+    async def body():
+        app = client_app.CodeTrailApp(engine, banner=("root=/tmp",))
+        async with app.run_test() as pilot:
+            app._command(f"/resume {RESUMED_ID}")
+            await _settle(pilot)
+            app._command("/new")
+            await _settle(pilot)
+            return _snapshot(app)
+
+    seen = _run(body)
+    assert seen["users"] == [] and seen["assistant"] == [] and seen["tools"] == []
+    assert seen["notices"] == [f"新對話:{engine.session_id}"], seen["notices"]
 
 
 def test_a_second_question_during_a_turn_is_not_shown_and_keeps_the_input():

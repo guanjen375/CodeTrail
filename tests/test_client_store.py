@@ -186,6 +186,70 @@ def test_delete_removes_only_that_session(store):
     assert [s.session_id for s in store.list_sessions()] == [second]
 
 
+def test_the_outline_is_the_first_real_question_never_the_summary_or_tool_output(store):
+    """選單那一列要顯示「使用者自己問過的第一句話」,而且**零 LLM、零寫入**。
+
+    抓錯來源是無聲的:拿壓縮注入的摘要當大綱的話,每一段被壓縮過的對話在選單上
+    都長成同一行「[先前對話摘要]…」;拿工具結果當大綱的話,選單上是一段
+    `status: ok` —— 兩種都讓使用者認不出哪一段是自己要的那一段,而畫面本身看起來
+    完全正常。為了好看去跑一次模型也不行:那是一次多餘的 NDA 內容出門機會,而且
+    session 檔是唯讀的真值,大綱不得回頭改寫它。
+    """
+    session_id = store.create()
+    long_question = "很長的問題" * 40
+    store.append_many(
+        session_id,
+        [
+            {"type": "message", "role": "user", "content": "bootloader 在哪一支檔?\n(第二行)"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "list_dir", "arguments": "{}"}},
+                    {"id": "call_2", "type": "function",
+                     "function": {"name": "read_file", "arguments": "{}"}},
+                ],
+            },
+            {"type": "message", "role": "tool", "tool_call_id": "call_1",
+             "content": "status: ok\n工具輸出不是問題"},
+            {"type": "compaction", "time": 9.0, "history": [
+                {"role": "user", "content": "[先前對話摘要]\n摘要不是問題", "synthetic": True},
+            ]},
+            {"type": "message", "role": "user", "content": "注入的摘要也不是問題", "synthetic": True},
+            {"type": "message", "role": "user", "content": long_question},
+        ],
+    )
+    before = sorted((entry.name, entry.stat().st_size, entry.stat().st_mtime_ns)
+                    for entry in store.directory.iterdir())
+
+    listed = store.list_sessions(limit=1)
+    assert [info.session_id for info in listed] == [session_id]
+    info = listed[0]
+    # 換行折成空白:選單是一列,帶著換行的問題會把版面撐開。
+    assert info.first_prompt == "bootloader 在哪一支檔? (第二行)"
+    assert info.last_prompt == long_question[: client_store.OUTLINE_MAX_CHARS - 1] + "…"
+    assert len(info.last_prompt) == client_store.OUTLINE_MAX_CHARS
+    assert info.messages == 5 and info.tool_calls == 2 and info.compactions == 1
+    assert info.turns == 3          # 既有欄位的語意不變(user 記錄的則數)
+
+    # 純函式:同一份記錄不經 store 也算得出同一個答案。
+    assert client_store.session_outline(store.read(session_id)) == {
+        "first_prompt": info.first_prompt,
+        "last_prompt": info.last_prompt,
+        "messages": 5,
+        "tool_calls": 2,
+        "compactions": 1,
+    }
+    assert client_store.session_outline([]) == {
+        "first_prompt": "", "last_prompt": "", "messages": 0, "tool_calls": 0, "compactions": 0
+    }
+    # 零寫入:列一次選單不得動到目錄或檔案(連 size / mtime 都不變)。
+    assert sorted((entry.name, entry.stat().st_size, entry.stat().st_mtime_ns)
+                  for entry in store.directory.iterdir()) == before
+
+
 def test_the_ephemeral_store_never_touches_the_filesystem(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     root = tmp_path / "project"

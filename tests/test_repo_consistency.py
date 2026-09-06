@@ -115,12 +115,12 @@ MODEL = _resolve_main_model()
 
 
 def test_code_model_placeholder_contract_passes_with_llamacpp_setup():
-    """新版範本:llama-server / GGUF 都提到、model 有 custom-provider prefix。"""
+    """新版範本:llama-server / GGUF 都提到、主模型的落點寫在 deployment.json。"""
     readme = '''
 本專案使用 llama-server 跑 GGUF 模型。
 
 ```json
-export AICODE_MODEL=<CODE_MODEL>
+deployment.json 的 main.model 填 <CODE_MODEL>
 ```
 '''
     docs = readme  # docs_text 包含 readme 本身
@@ -130,13 +130,13 @@ export AICODE_MODEL=<CODE_MODEL>
 
 
 def test_code_model_placeholder_contract_reports_missing_bits():
-    """空文件應該被報缺 placeholder / llama-server / GGUF / opencode model 範本。"""
+    """空文件應該被報缺 placeholder / llama-server / GGUF / 主模型落點。"""
     issues: list[str] = []
     _check_code_model_placeholder_contract("", "", issues)
     assert any("<CODE_MODEL>" in issue for issue in issues)
     assert any("llama-server" in issue for issue in issues)
     assert any("GGUF" in issue for issue in issues)
-    assert any("AICODE_MODEL" in issue for issue in issues)
+    assert any("main.model" in issue for issue in issues)
 
 
 @pytest.mark.smoke
@@ -967,8 +967,15 @@ def test_the_readme_no_longer_teaches_installing_opencode():
 @pytest.mark.smoke
 def test_user_docs_must_not_teach_removed_flags_or_files():
     """已經不存在的東西(`--compaction-mode native`、舊 ownership 狀態檔、已刪的
-    scripts/opencode_*.py、已併掉的 compaction_status.py、整組移除的網頁前端)文件不得
-    再教。checker 要抓得到,而且現在的文件要乾淨。"""
+    scripts/opencode_*.py 與根目錄的遷移工具、已併掉的 compaction_status.py、整組移除的
+    網頁前端、只能用檔案 / argv 交接的殼層設定形狀)文件不得再教。checker 要抓得到,
+    而且現在的文件要乾淨。
+
+    2026-09-06:整包合併掃描換成 `_check_stale_docs_per_file()`。升級段**必須**點名舊的
+    ownership 狀態檔與當年那支還原工具(否則使用者不知道要處理什麼),而那個例外是
+    **逐檔**的 —— 合併成一大坨之後只能整組放行或整組擋下,等於把 troubleshooting 的
+    例外送給所有文件。合成字串仍然不帶 `source=`,所以連例外過的那兩條也照樣要被抓到。
+    """
     from scripts import check_readme_consistency as checker
 
     for stale in (
@@ -976,6 +983,14 @@ def test_user_docs_must_not_teach_removed_flags_or_files():
         "模式記在 ~/.config/codetrail/compaction.json 裡",
         "python3 scripts/opencode_contract_check.py --fix",
         "python3 scripts/compaction_status.py",
+        # 本版不再附帶根目錄那支遷移工具(只有 troubleshooting 的 a1682d5 升級段能教)。
+        "python3 opencode_migrate.py --check",
+        # 設定只來自 deployment.json / client.json 與 argv:這幾個殼層形狀照做既不會
+        # 生效也不會報錯。
+        "export LLAMA_BIN=~/llama.cpp/build/bin/llama-server",
+        "export MODELS_DIR=~/models",
+        "AICODE_TEST_JOBS=1 python3 scripts/run_tests.py",
+        "Environment=AICODE_MODEL=<CODE_MODEL>",
         # 網頁前端已整組移除;文件不得再教使用者去跑它。
         "```bash\naicode web --hostname 0.0.0.0\n```",
         "```bash\naicode attach http://127.0.0.1:4096\n```",
@@ -988,186 +1003,11 @@ def test_user_docs_must_not_teach_removed_flags_or_files():
         checker._check_no_stale_client_docs(stale, issues)
         assert issues, stale
     issues = []
-    checker._check_no_stale_client_docs(checker._documentation_text(), issues)
+    checker._check_stale_docs_per_file(issues)
     assert issues == []
 
 
-# ── 總審第 2 輪回修:JS stub 的靜態契約;現行 CLI 不得再講 OpenCode ──
-
-@pytest.mark.smoke
-def test_the_opencode_plugin_stubs_are_inert():
-    """使用者的 opencode.json 可能還註冊著這兩個路徑(升級到跑 set_config 之間):
-    它們只能是一個 export、只掛 `event` hook、只在 session.created toast 一次,
-    不得 import / 讀檔 / 打網路 / 動工具結果。"""
-    for name in ("codetrail-compaction.js", "codetrail-notify.js"):
-        source = (REPO_ROOT / "opencode_plugins" / name).read_text(encoding="utf-8")
-        _assert_inert_stub(source, name)
-
-
-def _strip_js_comments(text: str) -> str:
-    """只拿掉**真正的**註解:逐字元走,字串 literal(`"` / `'` / 反引號,含跳脫)裡的
-    `/*`、`*/`、`//` 都不是註解。以前用 regex 直接砍 `/*...*/`,兩個字串之間的實際程式碼
-    會被錯當成註解拿掉,重建出一行完全合法的 hook。"""
-    out: list[str] = []
-    i, n = 0, len(text)
-    while i < n:
-        ch = text[i]
-        if ch in ("\"", "'", "`"):
-            quote = ch
-            j = i + 1
-            while j < n and text[j] != quote:
-                j += 2 if text[j] == "\\" else 1
-            out.append(text[i:j + 1])
-            i = j + 1
-            continue
-        if text.startswith("//", i):
-            j = text.find("\n", i)
-            i = n if j < 0 else j            # 保留換行,行結構不變
-            continue
-        if text.startswith("/*", i):
-            j = text.find("*/", i + 2)
-            i = n if j < 0 else j + 2
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
-
-
-def _assert_inert_stub(source: str, name: str) -> None:
-    """inert stub 的完整契約(靜態):
-
-    - 恰好一個 export,export 的函式主體**只能**由三樣東西組成:`let told = false;`、
-      `const tell = async () => {...};` 的定義、`return { event: ... };`——其餘任何敘述
-      (例如載入時就 `await tell()`)都是初始化副作用,不管字串計數多漂亮都不放行;
-    - 回傳物件只有 `event` 這一個 hook,且只在 `session.created` 呼叫 `tell()`;
-    - toast 恰好一次:唯一的副作用、有 told 閂、包 try/catch(fail-open);
-    - 不 import / 不讀檔 / 不打網路 / 不動工具結果 / 不排程。
-    """
-    assert source.count("export ") == 1, name
-    # 整個檔案去掉真註解之後,export 函式**以外**不得有任何東西:頂層 `throw` /
-    # `process.exit()` / `console.log()` 這種模組載入時就執行的敘述,以前完全不在 gate 的
-    # 視線內(regex 只擷取 export 本體)。
-    stripped = _strip_js_comments(source)
-    body_match = re.search(r"export const \w+ = async \(\{ client \}\) => \{\n(.*)\n\};", stripped, re.S)
-    assert body_match, (name, "export shape")
-    outside = stripped[:body_match.start()] + stripped[body_match.end():]
-    assert not outside.strip(), (name, "top-level code outside the export", outside.strip()[:80])
-    body = body_match.group(1)
-    returned = re.search(r"\n  return \{\n(.*?)\n  \};", body, re.S)
-    assert returned, name
-    hooks = re.findall(r"^\s{4}([\w.\"']+)\s*:", returned.group(1), re.M)
-    assert hooks == ["event"], (name, hooks)
-    assert "session.created" in returned.group(1), name
-    assert returned.group(1).count("tell()") == 1, (name, "tell() must be called once, inside event")
-    tell_def = re.search(r"\n  const tell = async \(\) => \{\n(.*?)\n  \};", body, re.S)
-    assert tell_def, (name, "tell definition")
-    remainder = body.replace(returned.group(0), "").replace(tell_def.group(0), "")
-    leftover = [line for line in remainder.splitlines() if line.strip()]
-    assert leftover == ["  let told = false;"], (name, "initialisation side effect", leftover)
-    # event hook 本體只能是「session.created 時 tell() 一次」,沒有別的敘述。
-    hook_lines = [line.strip() for line in returned.group(1).splitlines() if line.strip()]
-    assert hook_lines == [
-        "event: async ({ event }) => {",
-        'if (event?.type === "session.created") await tell();',
-        "},",
-    ], (name, "event hook body", hook_lines)
-    # tell() 本體白名單:閂 → try { 一次 showToast } catch {}(空)。把 showToast 的
-    # 參數物件抽掉之後,剩下的敘述必須逐行等於這個序列——多任何一行(例如
-    # `await client.session.create({})`)都是 stub 以外的副作用。
-    tell_body = tell_def.group(1)
-    call = re.search(r"await client\.tui\.showToast\((\{.*?\})\);", tell_body, re.S)
-    assert call, (name, "showToast call")
-    toast_arg = re.sub(r"\s+", "", call.group(1))
-    assert re.fullmatch(r'\{body:\{message:("[^"]*"\+?)+,?variant:"warning",?\},?\}', toast_arg), (
-        name, "toast payload must be message strings + variant only", toast_arg
-    )
-    tell_lines = [line.strip() for line in tell_body.replace(call.group(0), "await client.tui.showToast(...);").splitlines() if line.strip()]
-    assert tell_lines == [
-        "if (told) return;",
-        "told = true;",
-        "try {",
-        "await client.tui.showToast(...);",
-        "} catch {",
-        "}",
-    ], (name, "tell body", tell_lines)
-    assert source.count("showToast") == 1, name
-    assert "if (told) return;" in source and "told = true;" in source, name
-    assert source.count("try {") == 1 and "catch" in source, name
-    for forbidden in ("import ", "require(", "fetch(", "readFile", "writeFile",
-                      "tool.execute", "chat.message", "chat.params", "experimental",
-                      "child_process", "process.env", "WebSocket", "XMLHttpRequest",
-                      "eval(", "Function(", "Deno.", "Bun.", "globalThis", "setTimeout",
-                      "setInterval", "http.", "https.", "net.", "fs.", "dns."):
-        assert forbidden not in source, (name, forbidden)
-
-
-@pytest.mark.smoke
-def test_the_stub_gate_rejects_initialisation_side_effects():
-    """gate 本身要能抓到「載入時就 toast」與「多掛一個 hook」這兩種回歸——以前的
-    字串計數斷言對 `await tell();` 塞在 return 之前這種寫法照樣綠。"""
-    source = (REPO_ROOT / "opencode_plugins" / "codetrail-compaction.js").read_text(encoding="utf-8")
-    _assert_inert_stub(source, "baseline")
-    eager = source.replace("\n  return {\n", "\n  await tell();\n  return {\n", 1)
-    with pytest.raises(AssertionError):
-        _assert_inert_stub(eager, "eager-toast")
-    extra_hook = source.replace("\n  return {\n", "\n  return {\n    config: async () => {},\n", 1)
-    with pytest.raises(AssertionError):
-        _assert_inert_stub(extra_hook, "extra-hook")
-    twice = source.replace("if (event?.type === \"session.created\") await tell();",
-                           "await tell(); if (event?.type === \"session.created\") await tell();", 1)
-    with pytest.raises(AssertionError):
-        _assert_inert_stub(twice, "tell-twice")
-    # tell() 本體裡多一個副作用(第 5 輪的 mutation):外層結構完全不變,以前照樣綠。
-    inside_tell = source.replace("    told = true;\n", "    told = true;\n    await client.session.create({});\n", 1)
-    assert inside_tell != source
-    with pytest.raises(AssertionError):
-        _assert_inert_stub(inside_tell, "side-effect-inside-tell")
-    in_catch = source.replace("    } catch {\n", "    } catch {\n      await client.session.create({});\n", 1)
-    assert in_catch != source
-    with pytest.raises(AssertionError):
-        _assert_inert_stub(in_catch, "side-effect-in-catch")
-    payload = source.replace('variant: "warning",', 'variant: "warning", onClick: async () => client.session.create({}),', 1)
-    assert payload != source
-    with pytest.raises(AssertionError):
-        _assert_inert_stub(payload, "side-effect-in-toast-payload")
-    # 第 6 輪的 mutation:字串 literal 裡的 /* 與 */ 不是註解,但不懂詞法的 regex 會把兩個
-    # 字串之間的真程式碼當註解砍掉,重建出一行合法的 hook。
-    fake_comment = source.replace(
-        'if (event?.type === "session.created") await tell();',
-        'if (event?.type === "session.created/*" || client.session.create({}) || "*/") await tell();', 1,
-    )
-    assert fake_comment != source
-    with pytest.raises(AssertionError):
-        _assert_inert_stub(fake_comment, "fake-block-comment-in-strings")
-    fake_line_comment = source.replace(
-        'if (event?.type === "session.created") await tell();',
-        'if (event?.type === "session.created//") await tell(); client.session.create({});', 1,
-    )
-    assert fake_line_comment != source
-    with pytest.raises(AssertionError):
-        _assert_inert_stub(fake_line_comment, "fake-line-comment-in-string")
-    # 第 7 輪的 mutation:export **之前**的頂層敘述(載入時就執行)——以前 gate 完全看不到。
-    for label, top in (
-        ("top-level-throw", 'throw new Error("plugin disabled");\n'),
-        ("top-level-process-exit", "process.exit(23);\n"),
-        ("top-level-console", 'console.log("loaded");\n'),
-        ("top-level-after-export", None),
-    ):
-        if top is None:
-            mutated = source.rstrip("\n") + '\nconsole.log("after");\n'
-        else:
-            mutated = source.replace("export const ", top + "export const ", 1)
-        assert mutated != source, label
-        with pytest.raises(AssertionError):
-            _assert_inert_stub(mutated, label)
-
-
-@pytest.mark.smoke
-def test_the_js_comment_stripper_is_lexically_aware():
-    """`/*`、`*/`、`//` 出現在字串 literal 裡時不是註解;真註解(含跨行 block)要拿掉。"""
-    src = 'a = "x/*y"; /* real\ncomment */ b = \'p//q\'; // tail\nc = `t/*u*/`;\n'
-    assert _strip_js_comments(src) == 'a = "x/*y";  b = \'p//q\'; \nc = `t/*u*/`;\n'
-
+# ── 現行 CLI 不得再講舊世代前端 ──
 
 @pytest.mark.smoke
 def test_current_cli_help_never_mentions_opencode():
@@ -1214,6 +1054,27 @@ _SKIP_DIRS = {
 _SKIP_FILES = {".git"}
 
 
+def _handoff_markdown(rel: Path) -> bool:
+    """`docs/workflows/<任務>/*.md`:施工交接紀錄,不是使用者文件。
+
+    這兩件事都由它決定,而且**只有**這兩件事:OpenCode 內容 gate 與文件 gate 的
+    `.md` 來源選擇。交接檔逐字引用被移除的變數名、舊工具的命令與 `opencode` 這個字
+    (「哪些東西被刪掉了」正是它要記的內容),當成使用者文件掃就是永遠紅燈。
+
+    刻意**不**動 `_walk_files` / `_repo_sources()` / `_iter_text_files()`:把整個目錄
+    從走訪剪掉的話,同一個目錄底下的 `.py` / `.sh` / `.json` / `.toml`(真的會被執行
+    或被載入的東西)也會一起消失在所有 gate 的視線外 —— 那是把可執行檔藏進豁免裡。
+    豁免只給 `.md` 的**內容**。
+    """
+    parts = rel.parts
+    return (
+        rel.suffix == ".md"
+        # docs / workflows / <任務> / <檔名>:至少 4 層。3 層就是 `docs/workflows/p.md`
+        # —— 少了任務目錄那一層,那不是交接紀錄。
+        and len(parts) >= 4
+        and parts[0] == "docs"
+        and parts[1] == "workflows"
+    )
 
 
 def _walk_files(root: Path, *, visited: list[str] | None = None):
@@ -1339,74 +1200,90 @@ def _code_only_source(source: str, suffix: str, *, keep_docstrings: bool = False
 
 
 #: `opencode` 這個字允許出現的地方,以及原因。
+#: 2026-09-06:遷移工具與兩個 inert stub 已整組刪除,`scripts/doctor.py` 的唯讀偵測
+#: 與 `scripts/set_config.py` 的升級提示也不在了 —— 那幾個鍵一起拿掉,留著就是
+#: 「指到不存在的檔的豁免」,下一個人在同名檔裡寫什麼都不會被擋。
 _OPENCODE_ALLOWLIST = {
-    # 唯一會寫使用者 opencode.json 的路徑(手動升級工具)。
-    "opencode_migrate.py": "手動升級工具本身",
-    # inert stub:使用者的 opencode.json 可能還註冊著這兩個路徑。
-    "opencode_plugins/codetrail-compaction.js": "inert stub",
-    "opencode_plugins/codetrail-notify.js": "inert stub",
-    # 唯讀偵測 / 升級提示。
-    "scripts/doctor.py": "唯讀偵測殘留安裝",
-    "scripts/set_config.py": "升級提示",
-    # 文件的升級段。
-    "README.md": "升級段",
-    "README_DEV.md": "升級段",
-    "AGENTS.md": "§2 的 stub 契約",
-    "docs/troubleshooting.md": "升級段",
-    "docs/setup.md": "升級段",
-    "docs/compaction-rules.md": "升級段",
-    "docs/security.md": "升級段",
-    "docs/mcp-tools.md": "升級段",
-    "docs/basic-usage.md": "升級段",
-    "docs/opencode-agents-template.md": "升級段",
     # 子行程環境的**剝除**清單:`OPENCODE_*` 出現在這裡正是為了把它拿掉
     # (核准後的 run_command 會繼承那份環境,裡面可能有升級機器殘留的機密)。
     "process_env.py": "剝除 OPENCODE_* 的清單與 fail-loud",
-    "scripts/mcp_catalog.py": "剝除清單 + eval 保留的欄位名",
-    "scripts/eval_tool_routing.py": "剝除清單 + eval 保留的欄位名",
-    "scripts/check_readme_consistency.py": "檢查 README 不再教安裝 opencode-ai",
+    # eval 的凍結 baseline 用舊鍵名記錄有效字元數;讀取端要相容,寫入端只寫新鍵。
+    "scripts/mcp_catalog.py": "凍結資料的舊欄位名(LEGACY_EFFECTIVE_CHARS_KEY)",
+    "scripts/eval_tool_routing.py": "凍結資料的舊欄位名 + era 標記",
+    "scripts/check_readme_consistency.py": "反向檢查:文件不得再教安裝 opencode-ai / 跑遷移工具",
     # eval 的 era 標記(純資料檔);eval/ 的 .py 走一般檢查。
     "eval/fixtures/tool_routing/support_matrix.json": "eval 的 era 標記",
+    # 文件:升級段(troubleshooting)與歷史量測說明。
+    "README.md": "升級段",
+    "README_DEV.md": "歷史量測 row 的說明",
+    "AGENTS.md": "§2 / §3 對舊世代前端的說明",
+    "docs/troubleshooting.md": "a1682d5 升級段",
+    "docs/security.md": "升級段",
+    "docs/basic-usage.md": "歷史量測資料的說明",
 }
 
-#: allowlist 裡的 **code 檔不是整檔豁免**:這些形狀 = runtime 依賴,在哪個檔都算違規
-#: (匯入 opencode 模組、碰 OpenCode 的設定 / plugin 路徑、呼叫 opencode 命令、
-#: 教裝 opencode-ai)。整檔豁免只給遷移工具本身與被 stub 契約另外釘住的兩個 stub。
-_OPENCODE_DEPENDENCY_SHAPES = re.compile(
+#: allowlist 裡的 **code 檔不是整檔豁免**:這些形狀 = runtime 依賴,在哪個檔都算違規。
+#: 分兩組。**可執行**的依賴(匯入 opencode 模組、碰 OpenCode 的設定 / plugin 路徑、
+#: 呼叫 opencode 命令)—— 任何逐檔形狀例外都蓋不過:`import opencode_migrate` 出現在
+#: 反向檢查器裡一樣是 import,不是 pattern。**套件 / 教學**的形狀(`npm` / `npx` /
+#: `opencode-ai`)才是反向檢查器的字串會長的樣子,由 `_OPENCODE_SHAPE_EXEMPTIONS`
+#: 逐檔放行。這一代**沒有任何整檔豁免**:遷移工具與兩個 stub 都刪掉了。
+_OPENCODE_EXECUTABLE_SHAPES = re.compile(
     r"(?:^|[^\w.])(?:import|from)\s+opencode"
     r"|opencode\.json|opencode_plugins|\.config/opencode"
-    r"|which\(\s*['\"]opencode|[\[(,]\s*['\"]opencode['\" ]"
-    r"|\bnpm\b|\bnpx\b|opencode-ai",
+    r"|which\(\s*['\"]opencode|[\[(,]\s*['\"]opencode['\" ]",
     re.IGNORECASE,
 )
-_OPENCODE_WHOLE_FILE = {
-    "opencode_migrate.py",
-    "opencode_plugins/codetrail-compaction.js",
-    "opencode_plugins/codetrail-notify.js",
-}
-#: 逐檔的例外形狀,附原因。
+_OPENCODE_PACKAGING_SHAPES = re.compile(r"\bnpm\b|\bnpx\b|opencode-ai", re.IGNORECASE)
+#: 兩組合起來:allowlist 裡的**資料檔**用(那裡沒有形狀例外,兩組都是依賴)。
+_OPENCODE_DEPENDENCY_SHAPES = re.compile(
+    f"{_OPENCODE_EXECUTABLE_SHAPES.pattern}|{_OPENCODE_PACKAGING_SHAPES.pattern}",
+    re.IGNORECASE,
+)
+#: 逐檔的例外形狀,附原因。`.py` 現在**連註解與 docstring 都掃**(見
+#: `_opencode_offenders`),所以例外要涵蓋歷史說明用得到的字。例外只對
+#: `_OPENCODE_PACKAGING_SHAPES` 有效 —— 可執行的形狀先判、不看例外。
 _OPENCODE_SHAPE_EXEMPTIONS = {
-    # 唯讀偵測:import 遷移工具只為了 plan_migration()(零寫入),提示字串指向它。
-    "scripts/doctor.py": re.compile(r"import opencode_migrate|opencode_migrate\.py"),
-    # 它的字串**就是**用來抓「README 教裝 opencode-ai」的 pattern。
-    "scripts/check_readme_consistency.py": re.compile(r"opencode-ai|npm"),
+    # 子行程環境的剝除清單與它的說明:`OPENCODE_` 這個前綴就是被剝掉的那個。
+    "process_env.py": re.compile(r"OPENCODE_"),
+    # 凍結 baseline 的舊欄位名與 era 標記:資料是量過的,讀取端要認得舊拼法。
+    "scripts/mcp_catalog.py": re.compile(r'opencode_effective_chars|"era"'),
+    "scripts/eval_tool_routing.py": re.compile(r'opencode_effective_chars|"era"'),
+    # 它的字串**就是**用來抓「文件教裝 opencode-ai / 教跑遷移工具」的 pattern。
+    "scripts/check_readme_consistency.py": re.compile(r"opencode-ai|npm|opencode_migrate|OPENCODE_"),
 }
+#: `.md` 不得再教使用者跑那支已經不附帶的遷移工具。唯一合法的用法是升級段 ——
+#: 判準是**同一 logical line 或所在段落標題**指名 `a1682d5`(那一段講的正是
+#: 「把舊安裝路徑固定回 a1682d5 再用當時的工具」),不是「這份文件叫什麼名字」。
+_OPENCODE_MIGRATE_COMMAND = re.compile(r"^\s*(?:[$>]\s*)?python3\s+opencode_migrate\.py")
+_OPENCODE_UPGRADE_ANCHOR = "a1682d5"
 
 
 def _opencode_offenders(rel: str, text: str) -> list[str]:
-    """一個檔案裡不該出現的 OpenCode 依賴(gate 的純函式半邊,自測餵合成內容)。"""
+    """一個檔案裡不該出現的 OpenCode 依賴(gate 的純函式半邊,自測餵合成內容)。
+
+    2026-09-06 起掃**全文**(含註解與 docstring):去 OpenCode 化之後,留在註解裡的
+    「以前是這樣接 OpenCode 的」會一路漂到沒有人看得懂,而 gate 完全看不到它。
+    allowlist 的檔靠逐檔形狀例外放行歷史說明,其餘一律改字成「舊世代前端」。
+    """
     suffix = Path(rel).suffix
-    if rel in _OPENCODE_WHOLE_FILE:
-        return []
     listed = rel in _OPENCODE_ALLOWLIST
     offenders: list[str] = []
     if listed and suffix == ".md":
         # allowlist 裡的**文件**不是整檔豁免 —— 但判準不是「這一行有沒有升級的字眼」
         # (那只會產生噪音),而是「有沒有教使用者去用它」:`OPENCODE_*` 變數、
-        # `opencode` 命令列形狀。散文裡提到 OpenCode(升級段、兩世代並存、eval 的
-        # era 標記)本來就該提到它的名字。
+        # `opencode` 命令列形狀、已刪的遷移命令。散文裡提到 OpenCode(升級段、
+        # 兩世代並存、eval 的 era 標記)本來就該提到它的名字。
         teach = re.compile(r"(?m)\bOPENCODE_[A-Z_]+\b|^\s*(?:[$>]\s*)?opencode\s|npm\s+install\s+-g\s+opencode")
-        for lineno, line in enumerate(text.splitlines(), 1):
+        for lineno, line, _in_fence, heading in _doc_logical_lines(text):
+            if _OPENCODE_MIGRATE_COMMAND.search(line) and not (
+                _OPENCODE_UPGRADE_ANCHOR in line or _OPENCODE_UPGRADE_ANCHOR in heading
+            ):
+                offenders.append(
+                    f"{rel}:{lineno}(教使用者跑本版不附帶的遷移工具;只有指名 "
+                    f"{_OPENCODE_UPGRADE_ANCHOR} 的升級段能教): {line.strip()[:110]}"
+                )
+                continue
             if any(word in line for word in ("已刪除", "已移除", "不存在", "不再", "以前", "不會", "不得")):
                 continue
             if teach.search(line):
@@ -1420,30 +1297,41 @@ def _opencode_offenders(rel: str, text: str) -> list[str]:
                 offenders.append(f"{rel}:{lineno}(allowlist 資料檔裡的依賴形狀): {line.strip()[:110]}")
         return offenders
     exempt = _OPENCODE_SHAPE_EXEMPTIONS.get(rel)
-    for lineno, line in _code_only_source(text, suffix):
-        # 行尾註解也放行:`x = 1  # OpenCode 時代是 ...`
-        code = line.split("#", 1)[0] if suffix == ".py" else line
-        if "opencode" not in code.lower():
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if "opencode" not in line.lower():
             continue  # `npm test` 之類是使用者專案的命令,與 OpenCode 無關
         if not listed:
             offenders.append(f"{rel}:{lineno}: {line.strip()[:120]}")
             continue
-        if exempt is not None and exempt.search(code):
+        if _OPENCODE_EXECUTABLE_SHAPES.search(line):
+            # 可執行的依賴先判,而且不看形狀例外:例外的字(`opencode_migrate`)出現在
+            # `import` / `from … import` 裡就是 runtime 依賴,不是反向檢查的 pattern。
+            offenders.append(f"{rel}:{lineno}(allowlist 檔裡的 runtime 依賴形狀): {line.strip()[:110]}")
             continue
-        if _OPENCODE_DEPENDENCY_SHAPES.search(code):
+        if exempt is not None and exempt.search(line):
+            continue
+        if _OPENCODE_PACKAGING_SHAPES.search(line):
             offenders.append(f"{rel}:{lineno}(allowlist 檔裡的 runtime 依賴形狀): {line.strip()[:110]}")
     return offenders
 
 
 def _opencode_gate_sources():
     """OpenCode gate 掃 repo 裡**所有**文字檔(`pyproject.toml`、`Dockerfile.dev`、`.env`、
-    `ci.yaml`、`aicode` wrapper、`.gitignore` …):列舉不靠副檔名 / 檔名清單。"""
-    return _iter_text_files(REPO_ROOT, ignored=_git_ignored())
+    `ci.yaml`、`aicode` wrapper、`.gitignore` …):列舉不靠副檔名 / 檔名清單。
+
+    唯一的例外是 `docs/workflows/**/*.md` 的**內容**(見 `_handoff_markdown`):同一個
+    目錄底下的 `.py` / `.sh` / `.json` / `.toml` 照掃。
+    """
+    for path in _iter_text_files(REPO_ROOT, ignored=_git_ignored()):
+        if _handoff_markdown(path.relative_to(REPO_ROOT)):
+            continue
+        yield path
 
 
 @pytest.mark.smoke
-def test_opencode_only_survives_in_the_migration_path_and_docs():
-    """`opencode` 只准出現在遷移路徑、inert stub、唯讀偵測與文件的升級段。
+def test_the_removed_frontend_only_survives_in_the_strip_list_history_data_and_upgrade_docs():
+    """`opencode` 只准出現在四個地方:子行程環境的剝除清單、eval 凍結資料的舊欄位名 /
+    era 標記、反向檢查器的 pattern,以及文件的升級段與歷史量測說明。
 
     多一處 runtime 依賴 = 部署又需要 Node / opencode-ai,而所有測試照樣綠。
     """
@@ -1456,77 +1344,62 @@ def test_opencode_only_survives_in_the_migration_path_and_docs():
             continue
         offenders += _opencode_offenders(rel, text)
     assert not offenders, (
-        "opencode 只准出現在 allowlist 的檔案裡(遷移工具 / stub / 唯讀偵測 / 文件升級段)。"
-        "新增一處就得在 _OPENCODE_ALLOWLIST 說明原因:\n" + "\n".join(offenders)
+        "opencode 只准出現在 allowlist 的檔案裡(剝除清單 / 凍結資料的欄位名 / 反向檢查器 / "
+        "文件升級段)。新增一處就得在 _OPENCODE_ALLOWLIST 說明原因:\n" + "\n".join(offenders)
     )
 
 
 #: `os.environ` / `getenv` 允許出現的檔案,以及原因。
-#: 啟動核心(§0)的設定契約**本來就是**環境變數(`~/start.sh` export 給 launcher),
-#: 那條線不動;客戶端 / MCP 這一側只准讀「檔案位置」與行程間介面。
+#: 2026-09-06 起**沒有「啟動核心的 env 契約」這一層**:GPU / llama-server 路徑 /
+#: tmux session 名 / 逾時全部搬進 `deployment.json` 與 argv,`~/start.sh` 不 export
+#: 也不 unset。剩下的每一筆都只讀「檔案在哪 / 行程介面」(HOME / XDG_* / PATH /
+#: 寫入 PYTHONIOENCODING / 寫入 PYTEST_*)。
+#: 這份清單同時是**豁免**:指到已經零讀取的檔就是把那個檔永久放行 —— 所以同一輪
+#: 把 20 筆 stale 條目一起拿掉(含刪除的遷移工具與三個改吃 argv 的啟停腳本)。
 _ENVIRON_ALLOWLIST = {
-    # 啟動核心:start.sh → launcher 的 env 契約,原封不動。
-    "deployment_profile.py": "啟動核心的 env overlay",
-    "deployment_status.py": "啟動核心",
-    "scripts/launch_servers.py": "啟動核心",
-    "scripts/stop_servers.py": "啟動核心",
-    "scripts/check_status.py": "啟動核心",
-    "scripts/set_config.py": "start.sh 產生器 + HOME",
-    # 開發者工具(README_DEV 要求的並行度控制),不是使用者設定。
-    "scripts/run_tests.py": "AICODE_TEST_JOBS / TAIL_ARGS",
+    # loader:只有 `_home()` 一個出口讀 HOME / USERPROFILE(設定檔在哪)。
+    "deployment_profile.py": "HOME / USERPROFILE(檔案在哪)",
+    "scripts/launch_servers.py": "HOME / XDG_STATE_HOME(log 目錄)",
+    # 開發者工具:每個 shard 的子行程環境 + 寫入 PYTEST_*(並行度改吃 `--jobs`)。
+    "scripts/run_tests.py": "PYTEST_* 寫入 + 子行程環境",
     # 只讀 HOME / XDG_* / PATH / PYTHONIOENCODING 這類「檔案在哪 / 行程介面」。
     "config.py": "HOME(_file_env)",
     "client_config.py": "HOME",
-    "client_paths.py": "HOME / XDG_STATE_HOME",
     "client_preflight.py": "HOME(profile_env)",
     "client_prompt.py": "HOME",
     "client_status.py": "HOME",
     "client_store.py": "HOME / XDG_STATE_HOME",
     "process_env.py": "子行程環境的剝除(唯一出口)",
-    "client_mcp.py": "子行程環境的剝除(委派 process_env)",
-    "client_app.py": "TERM / COLUMNS 之類的終端介面",
     "index_scope.py": "HOME",
     "lessons.py": "HOME",
     "mcp_lease.py": "XDG_STATE_HOME",
-    "data_flywheel.py": "HOME / XDG_STATE_HOME",
     "mcp_server.py": "PYTHONIOENCODING / HOME",
     "codetrail_chat.py": "HOME(root_safety)",
-    "root_safety.py": "HOME",
-    "container_runner.py": "PATH / HOME",
-    "http_client.py": "proxy 衛生(NO_PROXY 等)",
-    "opencode_migrate.py": "HOME / XDG_STATE_HOME",
     "scripts/doctor.py": "HOME / PATH",
     "scripts/index_stats.py": "HOME",
     "scripts/tool_call_canary.py": "HOME / XDG_CACHE_HOME / 子行程環境",
     "scripts/required_model_servers_check.py": "HOME",
     "scripts/session_eval.py": "HOME / 子行程環境",
-    "scripts/eval_tool_routing.py": "HOME / 子行程環境",
-    "scripts/mcp_catalog.py": "子行程環境的剝除",
-    "scripts/kb_ab_compare.py": "HOME",
-    "scripts/check_eval_consistency.py": "HOME",
-    "session_eval.py": "HOME / XDG_STATE_HOME",
-    "media.py": "PATH(objdump)",
-    "agent_tools.py": "子行程環境(PYTHONIOENCODING / LC_ALL)",
     "client_compaction.py": "HOME / XDG_STATE_HOME(ledger 位置)",
     "client_engine.py": "HOME(system prompt 的來源檔)",
     "external_import.py": "HOME",
-    # `AICODE_MODEL` 的解析器,同時服務 `~/start.sh` → launcher 那條路;
-    # 客戶端側交給它的是 HOME-only 的 env(config._file_env / profile_env)。
-    "model_resolution.py": "啟動核心共用的模型解析器",
-    "elf_analysis.py": "PATH(objdump)",
-    "eval/run_eval.py": "開發者 eval 工具",
-    "eval/record_semantic_vectors.py": "LLAMA_BIN(啟動核心)",
+    "model_resolution.py": "HOME(profile 檔案在哪)",
+    "elf_analysis.py": "regex literal(`getenv` 是被比對的符號名,不是讀取)",
+    "eval/run_eval.py": "開發者 eval 工具(寫入 PYTHONIOENCODING)",
 }
 
 #: 這幾個前綴是 CodeTrail 自己的設定名。客戶端 / MCP 側**一個都不准讀**。
 _CODETRAIL_ENV_PREFIXES = ("AICODE_", "AI_CODE_", "CODETRAIL_", "OPENCODE_")
 
 
-#: 啟動核心(§0)與開發者工具:它們的 env 契約本來就是環境變數,子行程照舊繼承。
+#: 仍然自己 spawn 的四個檔,各有一個不能經 `process_env.run` 的理由:
+#: `deployment_profile.py` 是唯一 `os.execvpe` llama-server 的地方(環境由
+#: `process_env.llama_server_env()` 算,見下面那條靜態檢查);`scripts/run_tests.py`
+#: 要自己 `Popen` 每個 shard 並刻意帶完整環境 + `PYTEST_*`;兩個 eval 工具是開發者
+#: 命令(`llama-server --version` / eval 子行程)。啟停腳本與 `set_config.py` 已經
+#: 全部改走 `process_env.run`,所以它們**不在**這裡 —— 留著就是永久放行。
 _SPAWN_CORE = {
-    "deployment_profile.py", "deployment_status.py",
-    "scripts/launch_servers.py", "scripts/stop_servers.py", "scripts/check_status.py",
-    "scripts/set_config.py", "scripts/run_tests.py",
+    "deployment_profile.py", "scripts/run_tests.py",
     "eval/run_eval.py", "eval/record_semantic_vectors.py",
 }
 #: 「複製整份行程環境」的寫法;唯一合法的一份在 `process_env.child_env()`。
@@ -1645,8 +1518,11 @@ def test_no_module_reads_codetrail_settings_from_the_environment():
     `AICODE_MODEL` / `AICODE_LLAMA_BASE_URL` / `AICODE_N_CTX`。讀進來就是
     「使用者以為在跑 A、實際在跑 B」,而且完全無聲。
 
-    這條掃的是**字面出現**(不是 allowlist 檔案的豁免):啟動核心那幾個檔仍然
-    要讀它們,所以它們在 `_ENVIRON_ALLOWLIST` 裡;其餘一個都不准。
+    這條掃的是**字面出現**(不是 allowlist 檔案的豁免):`_ENVIRON_ALLOWLIST` 裡的
+    每一筆都只讀「檔案在哪 / 行程介面」,其餘一個都不准。2026-09-06 起連啟動核心
+    都沒有例外 —— GPU / 二進位路徑 / session 名 / 逾時改吃 `deployment.json` 與 argv,
+    所以下面第二段沒有 `core` 豁免:**任何**檔案讀 `AICODE_*` / `AI_CODE_*` /
+    `CODETRAIL_*` / `OPENCODE_*` 都是 offender。
     """
     offenders: list[str] = []
     for path in _repo_sources():
@@ -1661,40 +1537,23 @@ def test_no_module_reads_codetrail_settings_from_the_environment():
         "要嘛改走 client.json 的鍵或 config.py 常數:\n" + "\n".join(offenders)
     )
 
-    # allowlist 內的檔案也不准讀 CodeTrail 自己的設定名(啟動核心除外)。
-    core = {
-        "deployment_profile.py",
-        "deployment_status.py",
-        "scripts/launch_servers.py",
-        "scripts/stop_servers.py",
-        "scripts/check_status.py",
-        "scripts/set_config.py",
-        "scripts/run_tests.py",
-        "eval/run_eval.py",
-        "eval/record_semantic_vectors.py",
-        # 啟動核心共用的模型解析器:它**必須**讀 AICODE_MODEL(launcher 那條路),
-        # 客戶端側靠「交什麼 env 給它」把那條路關掉,而那由
-        # tests/test_client_preflight.py 的 HOME-only 測試守。
-        "model_resolution.py",
-    }
+    # allowlist 內的檔案也不准讀 CodeTrail 自己的設定名 —— **一個豁免都沒有**。
     # 只認**真的讀行程環境**的形狀(`os.environ` / `os.getenv`)。
-    # `environ.get(...)` 作用在呼叫端傳進來的 dict 上時,那正是 argv 交接
-    # (例如 `opencode_migrate` 的 `--config`),不是從殼層取設定。
+    # `environ.get(...)` 作用在呼叫端傳進來的 dict 上時,那是 argv / kwargs 交接
+    # (`load_effective_profile(environ=…)` 的 HOME 查表),不是從殼層取設定。
     reads = re.compile(
         r"os\.(?:environ(?:\.get)?\(|getenv\()\s*[\"']("
         + "|".join(_CODETRAIL_ENV_PREFIXES)
         + r")"
     )
     leaks: list[str] = []
-    for rel in sorted(set(_ENVIRON_ALLOWLIST) - core):
-        path = REPO_ROOT / rel
-        if not path.is_file():
-            continue
+    for path in _repo_sources():
+        rel = str(path.relative_to(REPO_ROOT))
         for lineno, line in _code_only(path):
             if reads.search(line):
                 leaks.append(f"{rel}:{lineno}: {line.strip()[:120]}")
     assert not leaks, (
-        "客戶端 / MCP 側讀了 CodeTrail 自己的設定變數;設定只來自 config.py 常數、"
+        "沒有任何檔案可以從殼層取 CodeTrail 設定;設定只來自 config.py 常數、"
         "deployment.json / models.json 與 client.json,行程之間用 argv:\n" + "\n".join(leaks)
     )
 
@@ -1715,12 +1574,44 @@ def test_no_module_reads_codetrail_settings_from_the_environment():
     hits: list[str] = []
     for path in _repo_sources():
         rel = str(path.relative_to(REPO_ROOT))
-        if rel in core:
-            continue
         for lineno, line in _code_only(path):
             if indexed.search(line):
                 hits.append(f"{rel}:{lineno}: {line.strip()[:120]}")
     assert not hits, "index access 也是讀環境:\n" + "\n".join(hits)
+
+
+@pytest.mark.smoke
+def test_the_only_llama_server_exec_hands_over_the_stripped_environment():
+    """`deployment_profile.py` 的 `exec` 是 llama-server **唯一**真正被執行的地方,
+    所以也是最終環境的唯一決定點:它的第三個參數必須是
+    `process_env.llama_server_env()`。
+
+    為什麼要靜態釘住:tmux pane 的環境 = tmux server 的全域環境 + session 環境,
+    launcher 的行程環境管不到已經在跑的 daemon。這一行改成 `os.environ` 或
+    `process_env.child_env()`,殼層裡殘留的 `CUDA_VISIBLE_DEVICES` / `LLAMA_ARG_*`
+    就會蓋掉 `deployment.json` 指定的卡與參數 —— 而且完全無聲:server 起得來、
+    status 也綠,只是跑在別張卡上。`_SPAWN_CORE` 放行了這個檔的 spawn API,
+    這一條就是那個放行的對價。
+    """
+    import ast as _ast
+
+    source = (REPO_ROOT / "deployment_profile.py").read_text(encoding="utf-8")
+    calls = [
+        node for node in _ast.walk(_ast.parse(source))
+        if isinstance(node, _ast.Call)
+        and isinstance(node.func, _ast.Attribute)
+        and node.func.attr.startswith("exec")
+        and isinstance(node.func.value, _ast.Name)
+        and node.func.value.id == "os"
+    ]
+    assert len(calls) == 1, f"deployment_profile.py 的 os.exec* 應該只有一個: {len(calls)}"
+    call = calls[0]
+    assert call.func.attr == "execvpe", _ast.unparse(call.func)
+    assert len(call.args) == 3, "execvpe(path, argv, env) 的三個參數缺一不可"
+    assert _ast.unparse(call.args[2]) == "process_env.llama_server_env()", (
+        f"pane 裡 exec llama-server 的環境必須是 process_env.llama_server_env(),"
+        f"實際是 {_ast.unparse(call.args[2])}"
+    )
 
 
 #: 文件不得再教的**介面**:每一條都是「照做之後不會生效、也不會報錯」。
@@ -1731,45 +1622,16 @@ _FORBIDDEN_DOC_PATTERNS = (
     (r"\baicode_web\b", "背景 launcher 已移除"),
 )
 
-#: **啟動核心的變數**仍然要教(`~/start.sh` → launcher 的契約沒變)。
-#: 這是一份**逐個變數**的白名單,不是整檔豁免 —— 整檔豁免就是 docs/setup.md
-#: 整段教 `AICODE_LLAMA_*` 卻沒有人發現的原因。
-_DOC_CORE_VARIABLES = (
-    "AICODE_MODEL",       # start.sh export 給 launcher
-    "AICODE_PROFILE",
-    "AICODE_DEPLOYMENT_CONFIG",
-    "AICODE_MODEL_REGISTRY",
-    "AICODE_MODEL_REGISTRY_FILE",
-    "AICODE_N_CTX",       # launcher 的 -c 來源
-    "AICODE_MAIN_",
-    "AICODE_BIND",
-    "AICODE_NO_ROLLBACK",
-    "AICODE_STOP_TIMEOUT",
-    "AICODE_STATUS_",
-    "AICODE_TEST_",       # scripts/run_tests.py 的並行度控制
-)
-
-#: 核心變數只在這些**段落**合法(標題以此開頭;段落 = 到下一個標題為止),不是整檔。
-_DOC_CORE_SECTIONS = {
-    "README.md": ("### 3.2 啟動與停止", "### 3.3 驗活與維運", "### 4.0 設定在哪裡",
-                  "### 4.1 Deployment profile", "### 4.2 Model registry"),
-    "README_DEV.md": ("## 維護命令索引",),
-    "docs/setup.md": ("### systemd unit",),
-    "docs/deployment-profiles.md": ("## 選擇與優先序", "## Service schema"),
-}
-
 #: 文件裡合法的名字:路徑 placeholder、概念名、ingest 通知的協定標記。
-#: 它們不是環境變數,沒有人會拿去 export。
+#: 它們不是環境變數,沒有人會拿去 export。**這是唯一的白名單** —— 2026-09-06 起
+#: 沒有「啟動核心的變數」這一類:GPU / 二進位路徑 / session 名 / 逾時 / 並行度全部
+#: 改吃 `deployment.json` 與 argv,所以文件裡任何 `AICODE_*` / `AI_CODE_*` /
+#: `CODETRAIL_*` / `OPENCODE_*` 名字(下面這六個概念名除外)都是在教一個沒有作用
+#: 也不會報錯的東西。逐段落 / 逐命令的例外一併移除:段落白名單就是
+#: 「docs/setup.md 整段教 `Environment=AICODE_*` 卻沒有人發現」的那條路。
 _DOC_ALLOWED_TOKENS = (
     "CODETRAIL_REPO", "AICODE_ROOT",
     "CODETRAIL_ACTION_REQUIRED", "CODETRAIL_INGEST_SUMMARY", "CODETRAIL_INGEST_FAILED", "CODETRAIL_ZERO_WRITE",
-)
-
-#: 核心變數當環境前綴掛在**這些**腳本前面是契約(`AICODE_MODEL=… python3 deployment_profile.py`);
-#: 掛在別的腳本前面(`AICODE_MODEL=… python3 scripts/doctor.py`)就是在教一個沒用的東西。
-_LAUNCHER_SCRIPTS = (
-    "scripts/launch_servers.py", "scripts/stop_servers.py", "scripts/check_status.py",
-    "deployment_profile.py", "deployment_status.py", "scripts/set_config.py", "scripts/run_tests.py",
 )
 
 _DOC_REMOVAL_WORDS = ("不存在", "已移除", "已刪除", "已經沒有", "以前", "刪除、無替代")
@@ -1791,10 +1653,6 @@ _DOC_VAR_USE = re.compile(
     r"\b((?:AICODE|AI_CODE|CODETRAIL|OPENCODE)_\w+)\b(\s*[+:?.]?=(?!=))?"
 )
 _DOC_EXPORT = re.compile(r"\bexport\s+((?:AICODE|AI_CODE|CODETRAIL|OPENCODE)_\w+)")
-#: 環境前綴後面**只准**接啟動核心的命令:launcher 腳本、`~/start.sh`、`./set_config.sh`。
-_DOC_LAUNCHER_COMMAND = re.compile(
-    r"^(?:\w+=\S*\s+)*(?:python3\s+(\S+)|(?:bash\s+)?\S*(?:start\.sh|set_config\.sh)\b)"
-)
 
 
 def _doc_logical_lines(text: str):
@@ -1832,71 +1690,49 @@ def _doc_offenders(rel: str, text: str) -> list[str]:
 
     判準:任何 `AICODE_*` / `AI_CODE_*` / `CODETRAIL_*` / `OPENCODE_*` 名字都算(不必有
     `=`:「把 `AICODE_N_CTX` 設大」一樣是在教),除了:協定標記 / placeholder 的**裸提及**
-    (拿它 `export` / 當環境前綴就不是裸提及);「它已經不存在」的句子;`unset` 舊變數;
-    以及**啟動核心的變數在它的段落裡**,而且環境前綴後面接的是啟動核心自己的命令。
+    (拿它 `export` / 當環境前綴就不是裸提及);「它已經不存在」的句子;`unset` 舊變數。
+
+    2026-09-06:段落白名單(`_DOC_CORE_SECTIONS`)、變數白名單(`_DOC_CORE_VARIABLES`)
+    與「環境前綴接啟動核心命令算契約」(`_LAUNCHER_SCRIPTS`)三個例外整組刪除 ——
+    設定不再有環境變數這一層,連 `~/start.sh` 都不 export,所以文件裡沒有一個位置
+    是「教它仍然正確」的。
     """
     offenders: list[str] = []
-    # 白名單是**整個 token**:`AICODE_MODEL` 不得因為是 `AICODE_MODEL_REMOTE_OK` 的前綴
-    # 而放行後者。以底線結尾的項目是前綴(`AICODE_STATUS_*`)。
-    core_tokens = re.compile(
-        r"\b(?:" + "|".join(
-            re.escape(name) + (r"\w*" if name.endswith("_") else "")
-            for name in _DOC_CORE_VARIABLES
-        ) + r")\b"
-    )
     allowed_tokens = re.compile(r"\b(?:" + "|".join(map(re.escape, _DOC_ALLOWED_TOKENS)) + r")\b")
     any_var = re.compile(r"\b(?:AICODE|AI_CODE|CODETRAIL|OPENCODE)_\w+")
-    sections = _DOC_CORE_SECTIONS.get(rel, ())
 
-    def is_core(token: str) -> bool:
-        return core_tokens.fullmatch(token) is not None
-
-    def launcher_command(command: str) -> bool:
-        m = _DOC_LAUNCHER_COMMAND.match(command)
-        if not m:
-            return False
-        script = m.group(1)
-        return script is None or script.rstrip("`'\".,;:)。,").endswith(_LAUNCHER_SCRIPTS)
-
-    for lineno, line, _in_fence, heading in _doc_logical_lines(text):
+    for lineno, line, _in_fence, _heading in _doc_logical_lines(text):
         bare = line.strip()
-        in_core = any(heading.startswith(prefix) for prefix in sections)
         if any(word in line for word in _DOC_REMOVAL_WORDS) or re.match(r"^\s*(?:[$>]\s*)?unset\s", line):
             continue
-        rest = line
         m = _DOC_ENV_PREFIXED.search(line)
         if m:
             assigned = re.findall(r"((?:AICODE|AI_CODE|CODETRAIL|OPENCODE)_\w+)[+:?]?=", m.group(1))
-            command = m.group(2)
-            if not (in_core and all(is_core(t) for t in assigned) and launcher_command(command)):
-                offenders.append(
-                    f"{rel}:{lineno}: {bare[:110]} — 環境前綴 {'/'.join(assigned)} 掛在命令前面"
-                    "(客戶端 / MCP 不讀環境變數;只有啟動核心的變數接啟動核心的命令才算契約)"
-                )
-                continue
-            rest = line[: m.start(1)] + command
-        ex = _DOC_EXPORT.search(rest)
-        if ex and not (in_core and is_core(ex.group(1))):
+            offenders.append(
+                f"{rel}:{lineno}: {bare[:110]} — 環境前綴 {'/'.join(assigned)} 掛在命令前面"
+                "(設定只來自 deployment.json / client.json 與 argv,沒有任何命令會讀它)"
+            )
+            continue
+        ex = _DOC_EXPORT.search(line)
+        if ex:
             offenders.append(f"{rel}:{lineno}: {bare[:110]} — export {ex.group(1)}(設定不經環境交接)")
             continue
-        listing = _DOC_ENV_LISTING.search(rest) is not None
+        listing = _DOC_ENV_LISTING.search(line) is not None
         used_as_var = [
             um.group(2)
-            for um in _DOC_VAR_USE.finditer(rest)
-            if (um.group(1) or um.group(3) or listing) and not (in_core and is_core(um.group(2)))
+            for um in _DOC_VAR_USE.finditer(line)
+            if (um.group(1) or um.group(3) or listing)
         ]
         if used_as_var:
             offenders.append(
                 f"{rel}:{lineno}: {bare[:110]} — {used_as_var[0]} 被當環境變數讀 / 指派"
-                "(協定標記 / 概念名不是環境變數;客戶端 / MCP 不讀環境變數)"
+                "(協定標記 / 概念名不是環境變數;沒有程式從殼層取設定)"
             )
             continue
-        candidate = allowed_tokens.sub("", rest)
-        if in_core:
-            candidate = core_tokens.sub("", candidate)
+        candidate = allowed_tokens.sub("", line)
         hit = any_var.search(candidate)
         if hit:
-            offenders.append(f"{rel}:{lineno}: {bare[:110]} — 文件提到 {hit.group(0)}(客戶端 / MCP 不讀環境變數)")
+            offenders.append(f"{rel}:{lineno}: {bare[:110]} — 文件提到 {hit.group(0)}(沒有程式從殼層取設定)")
             continue
         for pattern, why in _FORBIDDEN_DOC_PATTERNS:
             if re.search(pattern, candidate):
@@ -1911,9 +1747,15 @@ def test_user_docs_never_teach_a_removed_environment_knob_or_interface():
 
     這些照做之後既不會生效也不會報錯 —— 使用者只會得到一個「設了但沒用」的
     設定,或一個不存在的子指令。
+
+    `docs/workflows/**/*.md` 是施工交接紀錄不是使用者文件(見 `_handoff_markdown`):
+    它逐字引用被移除的變數名,當使用者文件掃就是永遠紅燈。同目錄的可執行檔照掃。
     """
     offenders: list[str] = []
-    docs = list(_repo_sources(suffixes=(".md",)))
+    docs = [
+        path for path in _repo_sources(suffixes=(".md",))
+        if not _handoff_markdown(path.relative_to(REPO_ROOT))
+    ]
     for path in docs:
         offenders += _doc_offenders(str(path.relative_to(REPO_ROOT)), path.read_text(encoding="utf-8"))
     assert not offenders, "文件教了已經不存在的東西:\n" + "\n".join(offenders)
@@ -1931,23 +1773,17 @@ def test_model_facing_text_never_teaches_a_removed_environment_knob():
     # 的形狀 —— 「請設定 AICODE_X」「見 AI_CODE_Y」一樣是在教一個不存在的東西。
     pattern = re.compile(r"\b((?:AICODE|AI_CODE|CODETRAIL|OPENCODE)_[A-Z0-9_]+)\b")
     core_only = {
-        "deployment_profile.py", "deployment_status.py",
-        "scripts/launch_servers.py", "scripts/stop_servers.py",
-        "scripts/check_status.py", "scripts/set_config.py",
-        "scripts/run_tests.py", "eval/run_eval.py",
-        "eval/record_semantic_vectors.py",
-        # 唯一會讀 / 寫 OpenCode 設定的遷移工具與它的 ownership 狀態欄位名。
-        "opencode_migrate.py",
-        # 文件一致性檢查器:它的字串**就是**用來抓這些名字的 pattern。
+        # 文件一致性檢查器:它的字串**就是**用來抓這些名字的 pattern。這一代只剩它
+        # 一個 —— 啟動核心那幾個腳本的設定改吃 `deployment.json` 與 argv,字串常數
+        # 裡不該再出現任何已刪的變數名。
         "scripts/check_readme_consistency.py",
     }
-    #: 字串裡允許出現的名字:啟動核心的契約、開發者工具、以及「這個名字已經沒用」
-    #: 的說明句(訊息本身在講它被刪了)。
+    #: 字串裡允許出現的名字**只剩概念名與協定標記**:sandbox root 的概念名仍叫
+    #: `AICODE_ROOT`,ingest 通知的四個標記是協定的一部分。它們不是環境變數,
+    #: 不會有人拿去 export。啟動核心的那幾個名字全部刪掉了,留著就等於允許
+    #: 模型繼續建議一個沒有作用的變數。
     allowed = re.compile(
-        r"AICODE_TEST_|AICODE_MODEL_REGISTRY|AICODE_MODEL\b|AICODE_PROFILE\b|AICODE_DEPLOYMENT_CONFIG\b"
-        # 概念名(sandbox root 的變數名仍叫 AICODE_ROOT)與 ingest 通知的協定標記:
-        # 它們不是環境變數,不會有人拿去 export。
-        r"|AICODE_ROOT\b|CODETRAIL_ACTION_REQUIRED\b|CODETRAIL_INGEST_SUMMARY\b|CODETRAIL_INGEST_FAILED\b"
+        r"AICODE_ROOT\b|CODETRAIL_ACTION_REQUIRED\b|CODETRAIL_INGEST_SUMMARY\b|CODETRAIL_INGEST_FAILED\b"
         r"|CODETRAIL_ZERO_WRITE\b"
     )
     import ast as _ast
@@ -1980,17 +1816,22 @@ def test_model_facing_text_never_teaches_a_removed_environment_knob():
 
 
 @pytest.mark.smoke
-def test_the_docs_gate_catches_bare_mentions_and_scopes_core_names_to_their_sections():
-    """false-green 的三種形狀:不帶 `=` 的教學、核心變數在非核心段落、核心變數
-    當環境前綴掛在客戶端腳本前面。"""
+def test_the_docs_gate_catches_bare_mentions_and_env_prefixes_everywhere():
+    """false-green 的形狀:不帶 `=` 的教學、環境前綴掛在任何命令前面、`export`。
+
+    2026-09-06:段落例外整組刪除,所以「核心段落 + 啟動核心命令」不再是放行條件 ——
+    同一組字串在 README 的哪一節都是 offender。原本綠的那個例子(核心段落 +
+    `scripts/launch_servers.py`)刻意留著並改成紅:段落白名單一旦被加回來,它會先變綠。
+    """
     assert _doc_offenders("docs/x.md", "把 `AICODE_N_CTX` 設大一點就好。\n")
     assert _doc_offenders("docs/x.md", "設定 AICODE_FIGURE_MAX_VL_CALLS_PER_DOC 可以放寬\n")
-    assert not _doc_offenders(
+    assert _doc_offenders(
         "README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=<X> \\\npython3 scripts/launch_servers.py\n```\n"
     )
     assert _doc_offenders("README.md", "### 5.1 跑 doctor 自檢\n\nAICODE_MODEL=<X> python3 scripts/doctor.py\n")
     assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\nAICODE_MODEL=<X> python3 scripts/doctor.py\n")
     assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\n`AICODE_MODEL` 與 `AICODE_LLAMA_BASE_URL` 一起設\n")
+    assert _doc_offenders("README_DEV.md", "## 維護命令索引\n\nAICODE_TEST_JOBS=1 python3 scripts/run_tests.py\n")
     assert not _doc_offenders("docs/x.md", "`AICODE_N_CTX` 已刪除、無替代。\n")
     assert not _doc_offenders("docs/x.md", "cd <CODETRAIL_REPO> 之後看 `[CODETRAIL_ACTION_REQUIRED]` 那一段\n")
     assert not _doc_offenders("docs/x.md", "unset AICODE_NUM_CTX  # 舊版殘留\n")
@@ -1998,14 +1839,73 @@ def test_the_docs_gate_catches_bare_mentions_and_scopes_core_names_to_their_sect
 
 @pytest.mark.smoke
 def test_the_opencode_gate_checks_allowlisted_files_for_dependency_shapes():
-    """allowlist 不是整檔豁免:code 檔要看形狀,非 code 檔(需求檔 / 資料)一樣要看。"""
-    assert _opencode_offenders("scripts/set_config.py", 'proc = subprocess.run(["opencode", "--version"])\n')
-    assert not _opencode_offenders("scripts/set_config.py", 'msg = "OpenCode 設定則用 python3 opencode_migrate.py"\n')
-    assert _opencode_offenders("scripts/set_config.py", "import opencode_migrate\n")
+    """allowlist 不是整檔豁免:code 檔要看形狀(含註解與 docstring),非 code 檔
+    (需求檔 / 資料)一樣要看;不在 allowlist 的檔連提一下都不行。"""
+    assert _opencode_offenders("process_env.py", 'proc = subprocess.run(["opencode", "--version"])\n')
+    # 形狀例外只放行它自己那一種:剝除清單的 `OPENCODE_` 前綴。
+    assert not _opencode_offenders("process_env.py", 'STRIPPED = ("AICODE_", "OPENCODE_")\n')
+    assert _opencode_offenders("process_env.py", "import opencode_migrate\n")
+    # 掃全文:註解與 docstring 裡的依賴形狀也算(以前 `_code_only_source` 看不到)。
+    assert _opencode_offenders("scripts/mcp_catalog.py", '# 以前是從 ~/.config/opencode/opencode.json 讀的\n')
+    assert not _opencode_offenders("scripts/mcp_catalog.py", 'LEGACY = "opencode_effective_chars"\n')
     assert _opencode_offenders("requirements.txt", "opencode-ai>=1.0\n")
     assert _opencode_offenders("eval/fixtures/tool_routing/support_matrix.json", '{"cmd": ["opencode", "run"]}\n')
     assert not _opencode_offenders("eval/fixtures/tool_routing/support_matrix.json", '{"era": "opencode"}\n')
     assert _opencode_offenders("some_new_module.py", "import opencode_migrate\n")
+    # 遷移工具與兩個 stub 已刪除:同名檔重新出現不再有整檔豁免。
+    assert _opencode_offenders("opencode_migrate.py", "import json  # opencode.json\n")
+    assert _opencode_offenders("opencode_plugins/codetrail-notify.js", 'export const x = "opencode.json";\n')
+
+
+@pytest.mark.smoke
+def test_the_checker_shape_exemption_never_covers_an_executable_import():
+    """`scripts/check_readme_consistency.py` 的形狀例外(`opencode_migrate` / `OPENCODE_` …)
+    是給**反向檢查的 pattern 與提示字串**用的;同一個字出現在 `import` / `from … import`
+    裡就是 runtime 依賴,任何逐檔例外都蓋不過。
+
+    少了這條,把 `import opencode_migrate` 寫進 checker 會被例外放行 —— 部署又需要那支
+    已刪的模組,而 gate 全綠。可執行的形狀(匯入、碰設定 / plugin 路徑、呼叫命令)
+    與例外分開判定;例外只剩下套件 / 教學的形狀(`npm` / `opencode-ai`)可以放行。
+    """
+    checker = "scripts/check_readme_consistency.py"
+    # 真正的 runtime 依賴:形狀例外不得放行(同一行帶著例外的字也一樣)。
+    assert _opencode_offenders(checker, "import opencode_migrate\n")
+    assert _opencode_offenders(checker, "from opencode_migrate import managed_values\n")
+    assert _opencode_offenders(checker, "import opencode_migrate as cm  # 反向檢查 OPENCODE_ 用\n")
+    assert _opencode_offenders("process_env.py", "from opencode_migrate import OPENCODE_PREFIX\n")
+    # 反向檢查器現有的合法字串:pattern、提示、逐檔例外的 key、教學反例的字面值。
+    legitimate = (
+        '    (r"(?m)^\\s*(?:[$>]\\s*)?python3\\s+opencode_migrate\\.py",\n',
+        '     "`python3 opencode_migrate.py`(本版不附帶;只有 docs/troubleshooting.md 的 a1682d5 升級段能教)"),\n',
+        '    r"(?m)^\\s*(?:[$>]\\s*)?python3\\s+opencode_migrate\\.py": frozenset({"docs/troubleshooting.md"}),\n',
+        '    (r"\\bOPENCODE_[A-Z_]+\\b", "`OPENCODE_*`(runtime 永遠不讀寫舊世代前端的設定)"),\n',
+        '    if "npm install -g opencode-ai" in readme_text:\n',
+    )
+    for line in legitimate:
+        assert not _opencode_offenders(checker, line), line
+    # 對真實檔案也成立:現行 checker 全檔零 offender。
+    assert not _opencode_offenders(checker, (REPO_ROOT / checker).read_text(encoding="utf-8"))
+
+
+@pytest.mark.smoke
+def test_the_migration_command_only_survives_in_the_pinned_upgrade_section():
+    """本版不附帶 `opencode_migrate.py`。文件唯一能教它的地方是**指名 `a1682d5`** 的
+    升級段(那一段講的正是「把舊安裝路徑固定回那個 commit 再用當時的工具」)。
+
+    判準是行內或段落標題有沒有那個 commit,不是「這份文件叫什麼名字」:少了這條,
+    任何 allowlist 文件都能貼一行 `python3 opencode_migrate.py`,而使用者照抄只會
+    得到 `No such file or directory`。
+    """
+    pinned = (
+        "### 從舊世代前端升級:用 `a1682d5` 解除舊的設定接管\n\n"
+        "```bash\npython3 opencode_migrate.py --check\n```\n"
+    )
+    assert not _opencode_offenders("docs/troubleshooting.md", pinned)
+    inline = "```bash\npython3 opencode_migrate.py --check   # a1682d5 的工具\n```\n"
+    assert not _opencode_offenders("docs/troubleshooting.md", inline)
+    loose = "### 清掉舊設定\n\n```bash\npython3 opencode_migrate.py\n```\n"
+    assert _opencode_offenders("docs/troubleshooting.md", loose)
+    assert _opencode_offenders("README.md", "```bash\n$ python3 opencode_migrate.py --check\n```\n")
 
 
 
@@ -2029,7 +1929,13 @@ def test_doctor_runs_as_a_script_from_the_repo_root():
 
 @pytest.mark.smoke
 def test_the_gates_also_catch_config_files_and_env_prefixed_commands():
-    """`.toml` 依賴、`export AICODE_ROOT=`(協定 / 概念名也不准當環境變數用)、核心段落裡 `AICODE_MODEL=bogus aicode`(環境前綴掛在非啟動核心命令前面,含 `\\` 續行)都要抓。"""
+    """`.toml` 依賴、`export AICODE_ROOT=`(協定 / 概念名也不准當環境變數用)、
+    `AICODE_MODEL=bogus aicode`(環境前綴掛在任何命令前面,含 `\\` 續行)都要抓。
+
+    2026-09-06:`~/start.sh` / launcher / systemd 的 `Environment=` 三種寫法從
+    「契約」變成 offender —— `~/start.sh` 不再 export、loader 只讀
+    `deployment.json` 與 argv,照著文件 export 只會得到一個沒有作用的殼層變數。
+    """
     assert _opencode_offenders("pyproject.toml", 'dependencies = ["opencode-ai>=1"]\n')
     assert _opencode_offenders("Makefile", "\tnpm install -g opencode-ai\n")
     assert _doc_offenders("docs/x.md", "```bash\nexport AICODE_ROOT=/tmp\n```\n")
@@ -2037,9 +1943,9 @@ def test_the_gates_also_catch_config_files_and_env_prefixed_commands():
     assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=bogus aicode\n```\n")
     assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=bogus \\\\\naicode\n```\n")
     assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nenv AICODE_MODEL=bogus python3 scripts/doctor.py\n```\n")
-    assert not _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=<X> ~/start.sh\n```\n")
-    assert not _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=<X> \\\\\nMAIN_GPU=0 \\\\\npython3 scripts/launch_servers.py --scope all\n```\n")
-    assert not _doc_offenders("docs/setup.md", "### systemd unit(永久部署)\n\nEnvironment=AICODE_MODEL=<CODE_MODEL>\n")
+    assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=<X> ~/start.sh\n```\n")
+    assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=<X> \\\\\nMAIN_GPU=0 \\\\\npython3 scripts/launch_servers.py --scope all\n```\n")
+    assert _doc_offenders("docs/setup.md", "### systemd unit(永久部署)\n\nEnvironment=AICODE_MODEL=<CODE_MODEL>\n")
 
 
 @pytest.mark.smoke
@@ -2051,15 +1957,49 @@ def test_the_opencode_gate_scans_config_files_and_the_wrapper():
 
 
 @pytest.mark.smoke
+def test_the_handoff_markdown_exemption_is_content_only():
+    """`docs/workflows/**/*.md` 的豁免只給 **`.md` 的內容**,不是把目錄從走訪剪掉。
+
+    交接紀錄逐字引用被移除的變數名與舊工具的命令(那正是它要記的事),當使用者
+    文件掃就是永遠紅燈;但把整個目錄從 `_walk_files` 剪掉的話,同一個目錄底下的
+    `.py` / `.sh` / `.json` / `.toml` 也會一起消失在**所有** gate 的視線外 —— 那等於
+    開一個「把可執行檔藏進交接目錄」的後門。所以:
+      1. `_handoff_markdown` 只對 `docs/workflows/**` 的 `.md` 為真;
+      2. 真實 repo 的 `_walk_files` 仍然走進那個目錄(檔案還在集合裡);
+      3. 同目錄的 `.py` 照樣被 OpenCode gate 與 spawn gate 判為 offender。
+    """
+    assert _handoff_markdown(Path("docs/workflows/x/p.md"))
+    assert _handoff_markdown(Path("docs/workflows/session-opencode-cleanup/plan-final.md"))
+    assert not _handoff_markdown(Path("docs/workflows/x/tool.py"))
+    assert not _handoff_markdown(Path("docs/workflows/x/ci.yaml"))
+    assert not _handoff_markdown(Path("docs/workflows/x/settings.json"))
+    assert not _handoff_markdown(Path("docs/p.md"))
+    assert not _handoff_markdown(Path("docs/workflows/p.md"))  # 直接放在 workflows/ 下的不算
+    assert not _handoff_markdown(Path("README.md"))
+
+    walked = {str(p.relative_to(REPO_ROOT)) for p in _walk_files(REPO_ROOT)}
+    handoffs = sorted(p for p in walked if p.startswith("docs/workflows/") and p.endswith(".md"))
+    assert handoffs, "走訪不得把 docs/workflows/ 整個剪掉(那會連可執行檔一起藏起來)"
+    assert all(
+        _handoff_markdown(Path(rel)) for rel in handoffs
+    ), handoffs
+
+    # 內容 gate 對同目錄的可執行檔一視同仁。
+    assert _opencode_offenders("docs/workflows/x/tool.py", "import opencode_migrate\n")
+    assert _spawn_offenders("docs/workflows/x/tool.py", "import subprocess\nsubprocess.run(cmd)\n")
+
+
+@pytest.mark.smoke
 def test_the_gates_also_catch_ignore_entries_and_bare_assignments():
-    """`.gitignore` 的 `.opencode/` 條目(dot 檔沒被掃)與文件裡單獨一行 `AICODE_ROOT=/tmp`(概念名當環境變數指派)都要抓;核心變數單獨一行在核心段落合法。"""
+    """`.gitignore` 的 `.opencode/` 條目(dot 檔沒被掃)與文件裡單獨一行
+    `AICODE_ROOT=/tmp`(概念名當環境變數指派)都要抓;單獨一行的指派在哪一節都要抓。"""
     scanned = {str(p.relative_to(REPO_ROOT)) for p in _opencode_gate_sources()}
     assert ".gitignore" in scanned
     assert _opencode_offenders(".gitignore", ".opencode/\n")
     assert _doc_offenders("docs/x.md", "```bash\nAICODE_ROOT=/tmp\n```\n")
     assert _doc_offenders("docs/x.md", "AICODE_ROOT=/tmp\n")
     assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\nAICODE_ROOT=/tmp\n")
-    assert not _doc_offenders(
+    assert _doc_offenders(
         "README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=<X>\npython3 scripts/launch_servers.py\n```\n"
     )
 
@@ -2091,7 +2031,7 @@ def test_the_gates_are_structural_not_a_list_of_spellings(tmp_path: Path):
     assert _doc_offenders("docs/x.md", "echo $AICODE_ROOT\n")
     assert _doc_offenders("docs/x.md", "ls ${CODETRAIL_REPO}/x\n")
     assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\nAICODE_MODEL+=x aicode\n")
-    assert not _doc_offenders("README.md", "### 4.1 Deployment profile\n\necho $AICODE_MODEL\n")
+    assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\necho $AICODE_MODEL\n")
     assert not _doc_offenders("docs/x.md", "cd <CODETRAIL_REPO> 看 `[CODETRAIL_ACTION_REQUIRED]`\n")
 
 

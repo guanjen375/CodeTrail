@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,8 +40,12 @@ import pytest
 
 import config
 import gpu_safety
+import model_resolution
 import n_ctx
+import process_env
 from deployment_profile import (
+    DEFAULT_LLAMA_BIN,
+    LauncherOverrides,
     ProfileError,
     build_server_command,
     load_effective_profile,
@@ -56,7 +61,7 @@ from gpu_safety import (
     query_server_info,
     runtime_offload_check,
 )
-from model_resolution import normalize_main_model, resolve_main_model_from_env
+from model_resolution import normalize_main_model, resolve_main_model
 from scripts import required_model_servers_check as preflight
 
 import client_preflight
@@ -65,7 +70,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # ── 原 test_deployment_profile.py:deployment profile 的載入、優先序與命令建構 ──
 
-PROFILE_ENV_KEYS = {
+#: 舊世代用來覆寫 deployment 設定的環境變數名。這一代 loader **一個都不讀**
+#: (以前這份清單是從 `deployment_profile.RUNTIME_OVERRIDE_ENV_KEYS` 推導的);
+#: 留成字面清單是為了讓底下那條契約測試能把它們原樣設進環境,證明真的無效。
+LEGACY_OVERRIDE_ENV_KEYS = (
     "AICODE_PROFILE",
     "AICODE_DEPLOYMENT_CONFIG",
     "AICODE_MODEL",
@@ -80,6 +88,8 @@ PROFILE_ENV_KEYS = {
     "AICODE_VL_MODEL",
     "AICODE_VL_MMPROJ",
     "AICODE_N_CTX",
+    "AICODE_BIND",
+    "AICODE_MAIN_CTX",
     "EMBED_MODEL",
     "RERANK_MODEL",
     "VL_GGUF",
@@ -93,21 +103,36 @@ PROFILE_ENV_KEYS = {
     "MAIN_CTX",
     "MAIN_BATCH",
     "MAIN_UBATCH",
-}
+    "MAIN_PORT",
+    "LLAMA_BIN",
+    "MODELS_DIR",
+    "MAIN_SESSION",
+    "AUX_SESSION",
+    "SESSION",
+)
 
 
 def _env(tmp_path: Path, **values: str) -> dict[str, str]:
-    import os
+    """交給 loader 的 `environ`:只有「檔案在哪」。
 
-    env = {key: value for key, value in os.environ.items() if key not in PROFILE_ENV_KEYS}
-    env.update({"HOME": str(tmp_path), "USERPROFILE": str(tmp_path), **values})
-    return env
+    loader 讀這份 dict 的鍵只有 HOME / USERPROFILE,所以測試不必再從
+    `os.environ` 濾掉一堆覆寫名 —— 沒有東西會去讀它們。
+    """
+    return {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path), **values}
 
 
 def _write_local(tmp_path: Path, data: dict) -> Path:
     path = tmp_path / ".config" / "codetrail" / "deployment.json"
-    path.parent.mkdir(parents=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def _write_registry(tmp_path: Path, entries: dict) -> Path:
+    """`~/.config/codetrail/models.json`:bare name → GGUF 的**唯一**來源。"""
+    path = tmp_path / ".config" / "codetrail" / "models.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(entries), encoding="utf-8")
     return path
 
 
@@ -133,7 +158,7 @@ def _write_profile(tmp_path: Path, name: str, services: dict) -> Path:
 
 def test_absolute_path_profile_inherits_builtin_safe_defaults(tmp_path):
     profile_path = _write_profile(tmp_path, "empty-target", {})
-    profile = load_effective_profile(_env(tmp_path, AICODE_PROFILE=str(profile_path)))
+    profile = load_effective_profile(_env(tmp_path), profile=str(profile_path))
 
     assert profile.selected_profile == "empty-target"
     assert profile.verification == "unverified"
@@ -147,23 +172,21 @@ def test_absolute_path_profile_inherits_builtin_safe_defaults(tmp_path):
 
 def test_named_profile_references_are_rejected(tmp_path):
     with pytest.raises(ProfileError, match="absolute JSON profile path"):
-        load_effective_profile(_env(tmp_path, AICODE_PROFILE="some-named-profile"))
+        load_effective_profile(_env(tmp_path), profile="some-named-profile")
 
 
 def test_main_model_resolution_uses_selected_profile(tmp_path):
     profile_path = _write_profile(
         tmp_path, "pinned-main", {"main": {"model": "profile-main-model"}}
     )
-    resolved = resolve_main_model_from_env(
-        _env(tmp_path, AICODE_PROFILE=str(profile_path))
-    )
+    resolved = resolve_main_model(_env(tmp_path), profile=str(profile_path))
 
     assert resolved.ok
     assert resolved.model == "profile-main-model"
     assert resolved.source.startswith("deployment profile pinned-main")
 
 
-def test_precedence_cli_env_over_local_over_profile_over_defaults(tmp_path):
+def test_precedence_cli_overrides_over_local_over_profile_over_defaults(tmp_path):
     profile_path = _write_profile(tmp_path, "local-selected", {})
     _write_local(
         tmp_path,
@@ -173,11 +196,10 @@ def test_precedence_cli_env_over_local_over_profile_over_defaults(tmp_path):
             "services": {"main": {"model": "local-main", "ctx": 32768}},
         },
     )
-    env = _env(tmp_path, AICODE_MODEL="env-main", MAIN_CTX="49152")
 
     effective = load_effective_profile(
-        env,
-        cli_env={"AICODE_MODEL": "cli-main", "MAIN_CTX": "98304"},
+        _env(tmp_path),
+        overrides=LauncherOverrides(main_model="cli-main", main_ctx=98304),
     )
 
     assert effective.selected_profile == "local-selected"
@@ -186,19 +208,11 @@ def test_precedence_cli_env_over_local_over_profile_over_defaults(tmp_path):
     assert effective.service("embedding").ctx == 8192  # inherited safe default
 
 
-def test_canonical_n_ctx_override_wins_over_legacy_main_ctx(tmp_path):
-    effective = load_effective_profile(
-        _env(tmp_path, AICODE_N_CTX="57344", MAIN_CTX="32768")
-    )
-
-    assert effective.service("main").ctx == 57344
-
-
 def test_explicit_local_override_must_exist(tmp_path):
     missing = tmp_path / "missing-deployment.json"
 
-    with pytest.raises(ProfileError, match="AICODE_DEPLOYMENT_CONFIG.*existing file"):
-        load_effective_profile(_env(tmp_path, AICODE_DEPLOYMENT_CONFIG=str(missing)))
+    with pytest.raises(ProfileError, match="deployment-config.*existing file"):
+        load_effective_profile(_env(tmp_path), deployment_config=str(missing))
 
 
 def test_absent_default_local_override_still_uses_defaults(tmp_path):
@@ -209,14 +223,13 @@ def test_absent_default_local_override_still_uses_defaults(tmp_path):
     assert effective.service("main").ctx == 65536
 
 
-def test_profile_selector_precedence_cli_then_env_then_local(tmp_path):
+def test_profile_selector_precedence_cli_then_local(tmp_path):
     local_choice = _write_profile(tmp_path, "local-choice", {})
-    env_choice = _write_profile(tmp_path, "env-choice", {})
     cli_choice = _write_profile(tmp_path, "cli-choice", {})
     _write_local(tmp_path, {"schema_version": 1, "profile": str(local_choice)})
-    env = _env(tmp_path, AICODE_PROFILE=str(env_choice))
+    env = _env(tmp_path)
 
-    assert load_effective_profile(env).selected_profile == "env-choice"
+    assert load_effective_profile(env).selected_profile == "local-choice"
     assert (
         load_effective_profile(env, profile=str(cli_choice)).selected_profile
         == "cli-choice"
@@ -276,14 +289,18 @@ def test_model_and_mmproj_resolve_from_registry_or_absolute_path(tmp_path):
     mmproj = tmp_path / "mmproj.gguf"
     for path in (main, vl, mmproj):
         path.write_bytes(b"fixture")
-    registry = {"main-key": str(main), "vl-key": str(vl), "mm-key": str(mmproj)}
-    env = _env(
+    _write_registry(tmp_path, {"main-key": str(main), "vl-key": str(vl), "mm-key": str(mmproj)})
+    _write_local(
         tmp_path,
-        AICODE_MODEL="main-key",
-        AICODE_VL_MODEL="vl-key",
-        AICODE_VL_MMPROJ="mm-key",
-        AICODE_MODEL_REGISTRY=json.dumps(registry),
+        {
+            "schema_version": 1,
+            "services": {
+                "main": {"model": "main-key"},
+                "vl": {"model": "vl-key", "mmproj": "mm-key"},
+            },
+        },
     )
+    env = _env(tmp_path)
     profile = load_effective_profile(env)
 
     assert resolve_model_reference(profile.service("main").model, env, must_exist=True) == str(main)
@@ -293,8 +310,10 @@ def test_model_and_mmproj_resolve_from_registry_or_absolute_path(tmp_path):
 
 
 def test_main_and_aux_gpu_split_and_three_aux_share_one_gpu(tmp_path):
-    env = _env(tmp_path, MAIN_GPU="GPU-H200", AUX_GPU="GPU-RTX2000ADA")
-    profile = load_effective_profile(env)
+    profile = load_effective_profile(
+        _env(tmp_path),
+        overrides=LauncherOverrides(gpus={"main": "GPU-H200", "aux": "GPU-RTX2000ADA"}),
+    )
 
     assert profile.service("main").gpu == "GPU-H200"
     assert {profile.service(role).gpu for role in ("embedding", "reranker", "vl")} == {
@@ -303,14 +322,17 @@ def test_main_and_aux_gpu_split_and_three_aux_share_one_gpu(tmp_path):
 
 
 def test_per_role_gpu_override_wins_over_aux_gpu(tmp_path):
-    env = _env(
-        tmp_path,
-        AUX_GPU="GPU-AUX",
-        EMBED_GPU="GPU-EMBED",
-        RERANK_GPU="GPU-RERANK",
-        VL_GPU="GPU-VL",
+    profile = load_effective_profile(
+        _env(tmp_path),
+        overrides=LauncherOverrides(
+            gpus={
+                "aux": "GPU-AUX",
+                "embedding": "GPU-EMBED",
+                "reranker": "GPU-RERANK",
+                "vl": "GPU-VL",
+            }
+        ),
     )
-    profile = load_effective_profile(env)
 
     assert profile.service("embedding").gpu == "GPU-EMBED"
     assert profile.service("reranker").gpu == "GPU-RERANK"
@@ -320,8 +342,11 @@ def test_per_role_gpu_override_wins_over_aux_gpu(tmp_path):
 def test_command_builder_uses_only_structured_allowlisted_arguments(tmp_path):
     model = tmp_path / "main model.gguf"
     model.write_bytes(b"fixture")
-    env = _env(tmp_path, AICODE_MODEL=str(model), MAIN_GPU="GPU-safe")
-    service = load_effective_profile(env).service("main")
+    _write_local(tmp_path, {"schema_version": 1, "services": {"main": {"model": str(model)}}})
+    env = _env(tmp_path)
+    service = load_effective_profile(
+        env, overrides=LauncherOverrides(gpus={"main": "GPU-safe"})
+    ).service("main")
 
     command = build_server_command(service, "/opt/llama-server", env, must_exist=True)
 
@@ -347,18 +372,19 @@ def test_main_auto_fit_parameters_build_expected_command(tmp_path):
             "schema_version": 1,
             "services": {
                 "main": {
+                    "model": str(model),
                     "parameters": {
                         "gpu_layers": "auto",
                         "fit": "on",
                         "fit_target": 5120,
                         "parallel": 1,
                         "jinja": True,
-                    }
+                    },
                 }
             },
         },
     )
-    env = _env(tmp_path, AICODE_MODEL=str(model))
+    env = _env(tmp_path)
     service = load_effective_profile(env).service("main")
 
     command = build_server_command(service, "/opt/llama-server", env, must_exist=True)
@@ -427,10 +453,9 @@ def test_auto_fit_parameter_validation_rejects_bad_values(tmp_path, role, parame
         tmp_path,
         {"schema_version": 1, "services": {role: {"parameters": parameters}}},
     )
-    env = _env(tmp_path, AICODE_MODEL="some-model")
 
     with pytest.raises(ProfileError, match=needle):
-        load_effective_profile(env)
+        load_effective_profile(_env(tmp_path))
 
 
 @pytest.mark.parametrize("role", ["embedding", "reranker"])
@@ -458,7 +483,7 @@ def test_cache_ram_is_rejected_for_generating_roles(tmp_path, role):
         {"schema_version": 1, "services": {role: {"parameters": {"cache_ram": 0}}}},
     )
     with pytest.raises(ProfileError, match="not allowed"):
-        load_effective_profile(_env(tmp_path, AICODE_MODEL="some-model"))
+        load_effective_profile(_env(tmp_path))
 
 
 @pytest.mark.parametrize("value", [-1, 262_145, True, 0.0, "0"])
@@ -477,7 +502,8 @@ def test_cache_ram_rejects_out_of_range_bool_and_wrong_types(tmp_path, value):
 def test_bind_defaults_to_loopback_only(tmp_path):
     model = tmp_path / "main.gguf"
     model.write_bytes(b"fixture")
-    env = _env(tmp_path, AICODE_MODEL=str(model))
+    _write_local(tmp_path, {"schema_version": 1, "services": {"main": {"model": str(model)}}})
+    env = _env(tmp_path)
     profile = load_effective_profile(env)
 
     for role in ("main", "embedding", "reranker", "vl"):
@@ -486,24 +512,22 @@ def test_bind_defaults_to_loopback_only(tmp_path):
     assert command[command.index("--host") + 1] == "127.0.0.1"
 
 
-def test_bind_all_interfaces_via_override_and_env(tmp_path):
+def test_bind_all_interfaces_via_the_deployment_file(tmp_path):
     model = tmp_path / "main.gguf"
     model.write_bytes(b"fixture")
     _write_local(
         tmp_path,
-        {"schema_version": 1, "services": {"main": {"bind": "all-interfaces"}}},
+        {
+            "schema_version": 1,
+            "services": {"main": {"model": str(model), "bind": "all-interfaces"}},
+        },
     )
-    env = _env(tmp_path, AICODE_MODEL=str(model))
+    env = _env(tmp_path)
     profile = load_effective_profile(env)
     command = build_server_command(profile.service("main"), "/opt/llama-server", env, must_exist=True)
     assert command[command.index("--host") + 1] == "0.0.0.0"
     # local override 只設了 main;其他 role 仍是安全預設
     assert profile.service("embedding").bind == "local"
-
-    env_all = _env(tmp_path, AICODE_MODEL=str(model), AICODE_BIND="all-interfaces")
-    profile_all = load_effective_profile(env_all)
-    for role in ("main", "embedding", "reranker", "vl"):
-        assert profile_all.service(role).bind == "all-interfaces"
 
 
 def test_bind_rejects_unknown_value_and_preserves_remote_host(tmp_path):
@@ -512,22 +536,175 @@ def test_bind_rejects_unknown_value_and_preserves_remote_host(tmp_path):
         {"schema_version": 1, "services": {"main": {"bind": "everywhere"}}},
     )
     with pytest.raises(ProfileError, match="bind must be local or all-interfaces"):
-        load_effective_profile(_env(tmp_path, AICODE_MODEL="some-model"))
+        load_effective_profile(_env(tmp_path))
 
     # 清掉壞 override,驗證非 loopback base_url(多機部署)不受 bind 預設影響
-    (tmp_path / ".config" / "codetrail" / "deployment.json").write_text(
-        json.dumps({"schema_version": 1, "services": {}}), encoding="utf-8"
-    )
     model = tmp_path / "main.gguf"
     model.write_bytes(b"fixture")
-    env = _env(
-        tmp_path,
-        AICODE_MODEL=str(model),
-        AICODE_LLAMA_BASE_URL="http://gpu-host:8080",
+    (tmp_path / ".config" / "codetrail" / "deployment.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "services": {
+                    "main": {"model": str(model), "base_url": "http://gpu-host:8080", "port": 8080}
+                },
+            }
+        ),
+        encoding="utf-8",
     )
+    env = _env(tmp_path)
     service = load_effective_profile(env).service("main")
     command = build_server_command(service, "/opt/llama-server", env, must_exist=True)
     assert command[command.index("--host") + 1] == "gpu-host"
+
+
+# ── 啟動核心的契約:設定只來自 deployment.json 與 argv ──
+
+
+@pytest.mark.smoke
+def test_the_loader_ignores_every_legacy_override_variable(monkeypatch, tmp_path):
+    """舊世代的每一個覆寫變數都不得再影響有效設定。
+
+    真實觸發:同一台機器上兩份安裝,另一份的 `~/start.sh` export 了 `AICODE_MODEL`
+    / `MAIN_GPU` / `LLAMA_BIN`。以前 loader 有一整層 env overlay 會吃下它們 ——
+    症狀是「使用者以為在跑 A、實際在跑 B」,而且完全無聲。名字同時設進 `os.environ`
+    與交給 loader 的 `environ` 參數:兩條路都不得有人讀。
+    """
+    model = tmp_path / "from-file.gguf"
+    model.write_bytes(b"fixture")
+    llama_bin = tmp_path / "bin" / "llama-server"
+    _write_local(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "llama_bin": str(llama_bin),
+            "services": {"main": {"model": str(model), "ctx": 32768, "gpu": "GPU-FILE"}},
+        },
+    )
+    leftovers = {name: "shell-leftover" for name in LEGACY_OVERRIDE_ENV_KEYS}
+    leftovers.update(
+        {
+            "AICODE_MODEL": "shell-model",
+            "AICODE_N_CTX": "4096",
+            "MAIN_CTX": "4096",
+            "MAIN_GPU": "GPU-SHELL",
+            "AUX_GPU": "GPU-SHELL",
+            "CUDA_VISIBLE_DEVICES": "7",
+            "LLAMA_BIN": str(tmp_path / "shell-llama-server"),
+            "MODELS_DIR": str(tmp_path / "shell-models"),
+        }
+    )
+    for name, value in leftovers.items():
+        monkeypatch.setenv(name, value)
+
+    profile = load_effective_profile(_env(tmp_path, **leftovers))
+
+    assert profile.service("main").model == str(model)
+    assert profile.service("main").ctx == 32768
+    assert profile.service("main").gpu == "GPU-FILE"
+    assert {profile.service(role).gpu for role in ("embedding", "reranker", "vl")} == {""}
+    assert profile.llama_bin == str(llama_bin)
+    assert profile.selected_profile == "defaults"
+
+
+@pytest.mark.smoke
+def test_gpu_and_llama_bin_come_from_the_deployment_file_then_argv(tmp_path):
+    """GPU 與 llama-server 路徑的來源只有兩個:`deployment.json` 與 argv。
+
+    兩者都缺席時 llama_bin 退到 `DEFAULT_LLAMA_BIN`(展開成這個 HOME 底下的絕對
+    路徑),GPU 則是「不指定」—— 不是靜默沿用繼承來的 `CUDA_VISIBLE_DEVICES`。
+    """
+    default_profile = load_effective_profile(_env(tmp_path))
+    assert default_profile.llama_bin == str(tmp_path / DEFAULT_LLAMA_BIN[2:])
+    assert [default_profile.service(role).gpu for role in ("main", "embedding", "reranker", "vl")] == [""] * 4
+
+    _write_local(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "llama_bin": str(tmp_path / "file" / "llama-server"),
+            "services": {
+                "main": {"gpu": "GPU-FILE-MAIN"},
+                "embedding": {"gpu": "GPU-FILE-EMBED"},
+            },
+        },
+    )
+    from_file = load_effective_profile(_env(tmp_path))
+    assert from_file.llama_bin == str(tmp_path / "file" / "llama-server")
+    assert from_file.service("main").gpu == "GPU-FILE-MAIN"
+    assert from_file.service("embedding").gpu == "GPU-FILE-EMBED"
+    assert from_file.service("vl").gpu == ""
+
+    from_argv = load_effective_profile(
+        _env(tmp_path),
+        overrides=LauncherOverrides(
+            llama_bin=str(tmp_path / "argv" / "llama-server"),
+            gpus={"main": "GPU-ARGV-MAIN", "aux": "GPU-ARGV-AUX"},
+        ),
+    )
+    assert from_argv.llama_bin == str(tmp_path / "argv" / "llama-server")
+    assert from_argv.service("main").gpu == "GPU-ARGV-MAIN"
+    # --aux-gpu 只套到三個附屬角色,而且蓋得過檔案裡的 embedding。
+    assert {from_argv.service(role).gpu for role in ("embedding", "reranker", "vl")} == {"GPU-ARGV-AUX"}
+
+    with pytest.raises(ProfileError, match="absolute path"):
+        load_effective_profile(
+            _env(tmp_path), overrides=LauncherOverrides(llama_bin="./llama-server")
+        )
+
+
+@pytest.mark.smoke
+def test_the_server_environment_strips_gpu_selectors_and_llama_settings(monkeypatch):
+    """llama-server 拿到的環境:CodeTrail 四前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES` 全剝掉。
+
+    llama.cpp 先套環境再套 argv,所以殼層 / tmux server 全域環境裡的 `LLAMA_ARG_*`
+    會蓋掉我們從 `deployment.json` 算出來的旗標;`CUDA_VISIBLE_DEVICES` 則會蓋掉
+    設定檔指定的卡。兩者都不留痕跡,所以邊界必須在真正 exec 的那一步。
+    """
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7")
+    monkeypatch.setenv("LLAMA_ARG_THREADS", "3")
+    monkeypatch.setenv("LLAMA_ARG_CTX_SIZE", "1024")
+    monkeypatch.setenv("AICODE_MODEL", "shell-model")
+    monkeypatch.setenv("OPENCODE_API_KEY", "secret")
+    monkeypatch.setenv("GGML_CUDA_NO_PINNED", "1")
+    monkeypatch.setenv("LLAMA_LOG_VERBOSITY", "1")
+    monkeypatch.setenv("MARK", "keep")
+
+    env = process_env.llama_server_env()
+
+    assert "CUDA_VISIBLE_DEVICES" not in env
+    assert not [key for key in env if key.startswith("LLAMA_ARG_")]
+    assert not [key for key in env if key.startswith(process_env.STRIPPED_ENV_PREFIXES)]
+    # 不是 CodeTrail 設定、也沒有 argv 等價入口的那些刻意保留。
+    assert env["GGML_CUDA_NO_PINNED"] == "1"
+    assert env["LLAMA_LOG_VERBOSITY"] == "1"
+    assert env["MARK"] == "keep"
+    assert env.get("HOME") == os.environ["HOME"]
+
+
+@pytest.mark.smoke
+def test_the_main_model_resolver_has_no_environment_branch(monkeypatch, tmp_path):
+    """主模型只有 `deployment.json` 一個來源。
+
+    以前 `resolve_main_model_from_env` 的第一格是 `AICODE_MODEL`;那條分支讓另一
+    份安裝的 `~/start.sh` 決定這一份跑哪顆模型。行為與字面兩邊都釘:殘留值同時
+    設進 `os.environ` 與交給解析器的 mapping,結果仍必須是設定檔裡那一顆。
+    """
+    _write_profile_model(tmp_path, "from-deployment-file")
+    monkeypatch.setenv("AICODE_MODEL", "shell-model")
+
+    resolved = resolve_main_model({"HOME": str(tmp_path), "AICODE_MODEL": "mapping-model"})
+
+    assert resolved.ok
+    assert resolved.model == "from-deployment-file"
+    assert resolved.source.startswith("deployment profile")
+    assert not hasattr(model_resolution, "resolve_main_model_from_env")
+    source = (REPO_ROOT / "model_resolution.py").read_text(encoding="utf-8")
+    code = "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "AICODE_MODEL" not in code
+
 
 
 # ── 原 test_deployment_status.py:依 cmdline port 認角色、GPU / 模型 / mmproj 錯配 ──
@@ -540,17 +717,23 @@ def _fixture(tmp_path: Path):
     }
     for path in paths.values():
         path.write_bytes(b"fixture")
-    env = {
-        "HOME": str(tmp_path),
-        "USERPROFILE": str(tmp_path),
-        "AICODE_MODEL": str(paths["main"]),
-        "EMBED_MODEL": str(paths["embedding"]),
-        "RERANK_MODEL": str(paths["reranker"]),
-        "VL_GGUF": str(paths["vl"]),
-        "VL_MMPROJ": str(paths["mmproj"]),
-        "MAIN_GPU": "GPU-H200",
-        "AUX_GPU": "GPU-RTX2000ADA",
-    }
+    _write_local(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "services": {
+                "main": {"model": str(paths["main"]), "gpu": "GPU-H200"},
+                "embedding": {"model": str(paths["embedding"]), "gpu": "GPU-RTX2000ADA"},
+                "reranker": {"model": str(paths["reranker"]), "gpu": "GPU-RTX2000ADA"},
+                "vl": {
+                    "model": str(paths["vl"]),
+                    "mmproj": str(paths["mmproj"]),
+                    "gpu": "GPU-RTX2000ADA",
+                },
+            },
+        },
+    )
+    env = _env(tmp_path)
     profile = load_effective_profile(env)
     gpu_for = {
         "main": "GPU-H200",
@@ -596,7 +779,6 @@ def test_status_identifies_all_roles_by_cmdline_port(tmp_path):
     inspection = inspect_deployment(
         profile,
         processes,
-        environ=env,
         cmdline_reader=lambda pid: cmdlines[pid],
         server_reader=servers,
     )
@@ -616,7 +798,6 @@ def test_status_no_network_still_validates_cmdline_without_health_failure(tmp_pa
     inspection = inspect_deployment(
         profile,
         processes,
-        environ=env,
         cmdline_reader=lambda pid: cmdlines[pid],
         server_reader=None,
     )
@@ -632,7 +813,6 @@ def test_status_detects_wrong_gpu_for_aux_role(tmp_path):
     inspection = inspect_deployment(
         profile,
         processes,
-        environ=env,
         cmdline_reader=lambda pid: cmdlines[pid],
         server_reader=servers,
     )
@@ -652,7 +832,6 @@ def test_status_detects_wrong_loaded_model(tmp_path):
     inspection = inspect_deployment(
         profile,
         processes,
-        environ=env,
         cmdline_reader=lambda pid: cmdlines[pid],
         server_reader=wrong_servers,
     )
@@ -671,7 +850,6 @@ def test_status_requires_observable_vl_mmproj(tmp_path):
     inspection = inspect_deployment(
         profile,
         processes,
-        environ=env,
         cmdline_reader=lambda pid: cmdlines[pid],
         server_reader=servers,
     )
@@ -685,10 +863,13 @@ def test_status_requires_observable_vl_mmproj(tmp_path):
 @pytest.fixture
 def model_resolution_env(monkeypatch, tmp_path):
     """原 test_model_resolution.py 的 module 級 autouse fixture(`_clean_env`):清掉
-    AICODE_MODEL / OPENCODE_CONFIG,HOME 指到 tmp_path。合併後改成顯式掛載,只給
-    來自該檔的測試;不讓它擴散到本檔其他來源的測試(它們各自有自己的 env 隔離)。"""
+    `AICODE_MODEL`、HOME 指到 tmp_path。合併後改成顯式掛載,只給來自該檔的測試;
+    不讓它擴散到本檔其他來源的測試(它們各自有自己的 env 隔離)。
+
+    2026-09-06:去掉 `OPENCODE_CONFIG` 的清理 —— 沒有任何程式讀它了,留著只會讓
+    人以為那個名字還在鏈上。`AICODE_MODEL` 的清理保留:底下有測試刻意再把它設
+    回去,證明殘留值無效。"""
     monkeypatch.delenv("AICODE_MODEL", raising=False)
-    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     yield

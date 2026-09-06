@@ -8,6 +8,11 @@
                        stdout 都在 context manager 裡隔離。
 - `run_subprocess()` — 原本的 `bash set_config.sh` 子行程。留給真的要驗跨行程行為的
                        測試(bash wrapper 本身、檔案權限、完整 --yes 產出)。
+
+兩個入口都自動帶上 `--llama-bin <tmp_path>/llama-server`(`pin_llama_bin=False`
+可關掉):設定值只走旗標與 `deployment.json`,環境變數這條路已經沒有了。
+假的 `tmux` / `nvidia-smi` / `llama-server` 一律放在 `tmp_path/bin` 與 `tmp_path`,
+測試不碰使用者真的 tmux session、真的 GPU 與真的設定檔。
 """
 from __future__ import annotations
 
@@ -22,8 +27,6 @@ import subprocess as _subprocess
 from pathlib import Path
 from unittest import mock
 
-from deployment_profile import RUNTIME_OVERRIDE_ENV_KEYS
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "set_config.sh"
 
@@ -34,12 +37,39 @@ TWO_GPUS = (
 
 GIB = 1024**3
 
-# 會影響有效設定的 env 一律引用 deployment_profile 的單一來源,只補測試自身用的鍵。
-PROFILE_ENV_KEYS = set(RUNTIME_OVERRIDE_ENV_KEYS) | {
-    "MODELS_DIR", "LLAMA_BIN",
-    "MAIN_SESSION", "AUX_SESSION", "SESSION",
-    "MAIN_HEALTH_TIMEOUT", "RAG_HEALTH_TIMEOUT",
-    "OPENCODE_CONFIG",  # set_config 會尊重它;開發機殼層若有設定不得洩漏進測試
+#: 舊世代的殼層 override:每個測試的環境都**設**這些名字(值刻意是壞的)。
+#: 以前這份清單的用途相反 —— 從 `os.environ` 濾掉它們,免得開發機的設定洩漏
+#: 進測試;現在沒有任何程式讀它們,所以清單改成「證明這些名字無效」的輸入。
+#: 名字是字面寫死的:它們在 runtime 已經沒有定義處可以引用了。
+LEGACY_SHELL_OVERRIDES = {
+    "AICODE_PROFILE": "/bogus/shell-profile.json",
+    "AICODE_DEPLOYMENT_CONFIG": "/bogus/shell-deployment.json",
+    "AICODE_MODEL": "/bogus/shell-model.gguf",
+    "AICODE_MODEL_REGISTRY": '{"bogus-key": "/bogus/shell.gguf"}',
+    "AICODE_MODEL_REGISTRY_FILE": "/bogus/shell-models.json",
+    "AICODE_LLAMA_BASE_URL": "http://127.0.0.1:19999",
+    "AICODE_N_CTX": "2048",
+    "AICODE_BIND": "all-interfaces",
+    "AICODE_MAIN_CTX": "2048",
+    "EMBED_MODEL": "/bogus/shell-embed.gguf",
+    "RERANK_MODEL": "/bogus/shell-rerank.gguf",
+    "MAIN_GPU": "GPU-shell-main",
+    "AUX_GPU": "GPU-shell-aux",
+    "EMBED_GPU": "GPU-shell-embed",
+    "RERANK_GPU": "GPU-shell-rerank",
+    "VL_GPU": "GPU-shell-vl",
+    "CUDA_VISIBLE_DEVICES": "7",
+    "MAIN_CTX": "1234",
+    "MAIN_BATCH": "64",
+    "MAIN_UBATCH": "64",
+    "MAIN_PORT": "19999",
+    "LLAMA_BIN": "/bogus/shell-llama-server",
+    "MODELS_DIR": "/bogus/shell-models",
+    "MAIN_SESSION": "shell-main-session",
+    "AUX_SESSION": "shell-aux-session",
+    "SESSION": "unrelated-desktop-session",
+    "MAIN_HEALTH_TIMEOUT": "1",
+    "RAG_HEALTH_TIMEOUT": "1",
 }
 
 # --yes 的數值旗標(使用者題沒有預設值 → 非互動一律得給)。
@@ -61,7 +91,7 @@ YES_ONE_GPU = ("--yes", "--main-model", "1", "--rerank-model", "1", *NUM_FLAGS)
 #   [2/5] embed GPU(唯一候選自動選用)
 #   [3/5] reranker 編號、reranker GPU、reranker internal buffer
 #   [4/5] VL GPU(唯一候選/唯一 mmproj 自動選用)
-#   [5/5] 壓縮模式編號(1=codetrail / 2=native / 3=manual;沒有預設值)
+#   [5/5] 壓縮模式編號(1=codetrail / 2=manual / 3=off;沒有預設值)
 #   摘要確認
 # (big-chat / vl-model 都是非 GGUF 假檔 → 無法解析 layout → 不會問 CPU-MoE。)
 STDIN_STANDARD = "1\n1\n65536\n2\n1\n2\n8192\n2\n1\n\n"
@@ -150,6 +180,24 @@ def write_fake_nvidia_smi(bin_dir: Path, output: str, exit_code: int = 0) -> Non
     executable.chmod(0o755)
 
 
+def write_fake_tmux(bin_dir: Path) -> None:
+    """PATH 前置的假 tmux:`has-session` 一律回「沒有」。
+
+    真 tmux 會讓 `running_codetrail_sessions()` 去問開發機上真的
+    `codetrail-main` / `codetrail-rag`——那兩個 session 在不在,決定了 set_config
+    最後會不會多問一句「要不要現在重啟」,測試因此變成看機器狀態。
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    executable = bin_dir / "tmux"
+    executable.write_text(
+        "#!/usr/bin/env bash\n"
+        "# 測試用:任何子命令都當作「沒有這個 session」,不真的碰使用者的 tmux。\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+
 def write_fake_llama(
     tmp_path: Path,
     help_flags: str = "--fit --cpu-moe --n-cpu-moe --reranking --mmproj --cache-ram",
@@ -187,35 +235,50 @@ def make_models(root: Path, *, with_reranker: bool = True) -> Path:
 
 
 def build_env(tmp_path: Path, *, with_llama: bool = True) -> dict[str, str]:
+    """測試環境:tmp HOME、PATH 前置假執行檔,外加整組**無效**的舊殼層 override。
+
+    環境變數只剩「檔案在哪 / 行程介面」的作用(HOME / PATH / XDG);設定值一律
+    走 `--llama-bin` 之類的旗標與 `deployment.json`。`LEGACY_SHELL_OVERRIDES` 在
+    這裡被設成壞值,任何一條測試綠燈就同時證明沒有人再讀它們。
+    """
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
-    env = {key: value for key, value in os.environ.items() if key not in PROFILE_ENV_KEYS}
+    env = dict(os.environ)
+    env.update(LEGACY_SHELL_OVERRIDES)
     env.update(
         {
             "HOME": str(home),
             "USERPROFILE": str(home),
             "PATH": f"{tmp_path / 'bin'}:{env.get('PATH', '')}",
-            "LLAMA_BIN": str(tmp_path / "llama-server"),
-            # 不存在的 session 名稱:避免「偵測到 server 運行中」誤觸開發機上真的 tmux。
-            "MAIN_SESSION": "codetrail-test-none-main",
-            "SESSION": "codetrail-test-none-rag",
         }
     )
+    write_fake_tmux(tmp_path / "bin")
     if with_llama and not (tmp_path / "llama-server").exists():
         write_fake_llama(tmp_path)
     return env
 
 
+def llama_bin_args(tmp_path: Path) -> tuple[str, ...]:
+    """每次呼叫都要指名 llama-server。
+
+    預設值是 `~/llama.cpp/build/bin/llama-server`,tmp HOME 裡沒有那一顆;以前
+    這件事靠 `LLAMA_BIN` 環境變數,現在只有旗標與 deployment.json 兩條路。
+    """
+    return ("--llama-bin", str(tmp_path / "llama-server"))
+
+
 def run_subprocess(tmp_path: Path, *args: str, stdin: str | None = None,
                    with_llama: bool = True,
+                   pin_llama_bin: bool = True,
                    env_overrides: dict[str, str] | None = None
                    ) -> subprocess.CompletedProcess:
     """原本的呼叫方式:`bash set_config.sh` 子行程。跨行程語意要被驗到時用這個。"""
     env = build_env(tmp_path, with_llama=with_llama)
     if env_overrides:
         env.update(env_overrides)
+    pinned = llama_bin_args(tmp_path) if pin_llama_bin else ()
     return subprocess.run(
-        ["bash", str(SCRIPT), "--skip-deps-check", *args],
+        ["bash", str(SCRIPT), "--skip-deps-check", *pinned, *args],
         cwd=REPO_ROOT,
         env=env,
         input=stdin,
@@ -234,6 +297,7 @@ def read_deployment(tmp_path: Path) -> dict:
 
 def run(tmp_path: Path, *args: str, stdin: str | None = None,
         with_llama: bool = True,
+        pin_llama_bin: bool = True,
         env_overrides: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """in-process 呼叫 set_config.main(),回傳與子行程同形狀的結果。
 
@@ -250,7 +314,8 @@ def run(tmp_path: Path, *args: str, stdin: str | None = None,
     env = build_env(tmp_path, with_llama=with_llama)
     if env_overrides:
         env.update(env_overrides)
-    argv = ["--skip-deps-check", *args]
+    pinned = llama_bin_args(tmp_path) if pin_llama_bin else ()
+    argv = ["--skip-deps-check", *pinned, *args]
     out, err = io.StringIO(), io.StringIO()
     pending = iter((stdin or "").splitlines())
 

@@ -15,12 +15,12 @@ models 三塊並把呼叫層換成 in-process(見 tests/_set_config_harness.py);
   smoke(原檔是 module 層 pytestmark),會靜默失敗的東西才寫在那裡:
 
     * `--yes` 沒給 `--compaction-mode`、機器也還沒選過 → **不得** 動壓縮設定。
-      弄反的話,舊安裝重跑一次 `--yes` 腳本就會突然多一個壓縮 plugin 與
-      `compaction.auto=false`,而使用者沒有要求過任何這種行為。
+      弄反的話,舊安裝重跑一次 `--yes` 腳本就會突然開始自動壓縮,而使用者
+      沒有要求過任何這種行為。
     * 寫進 client.json 的門檻必須等於同一條公式對這個
-      ctx 的推導值。wizard 與 plugin 各算各的,兩邊差一點也不會有錯誤訊息 ——
+      ctx 的推導值。wizard 與 runtime 各算各的,兩邊差一點也不會有錯誤訊息 ——
       只是門檻與保留額對不上。
-    * 切回 native 必須精確還原,而且只還原有 ownership 證據的值。
+    * 選 `off` 也要記下來(沒有 client.json = 沒有接管,客戶端退成 manual)。
     * `--dry-run` 與摘要頁按 q 都不得留下狀態檔。
     * restore manifest 兩個世代共用同一個檔:含別人的目標時整份拒絕,不部分還原。
 
@@ -58,6 +58,7 @@ from tests._set_config_harness import (
     YES_ONE_GPU,
     YES_TWO_GPU,
     build_env,
+    llama_bin_args,
     make_models,
     read_deployment,
     run,
@@ -177,7 +178,8 @@ def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
 
     home2 = tmp_path / "home2"
     proc = subprocess.run(
-        ["bash", str(SCRIPT), "--skip-deps-check", "--no-preview", "--models-dir", str(models)],
+        ["bash", str(SCRIPT), "--skip-deps-check", *llama_bin_args(tmp_path),
+         "--no-preview", "--models-dir", str(models)],
         cwd=REPO_ROOT,
         env={**build_env(tmp_path), "HOME": str(home2), "USERPROFILE": str(home2)},
         # 全部答完,摘要頁按 q → 不寫入
@@ -216,10 +218,12 @@ def test_flags_override_model_and_gpu(tmp_path):
         *NUM_FLAGS,
     )
     assert proc.returncode == 0, proc.stderr
-    content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
-    assert "export MAIN_GPU=GPU-bbbb-2000" in content
-    # aux 三顆不同卡(embed=GPU 1、rerank/vl=GPU 2)→ 逐 role export
-    assert "export EMBED_GPU=GPU-aaaa-5090" in content
+    services = read_deployment(tmp_path)["services"]
+    assert services["main"]["gpu"] == "GPU-bbbb-2000"
+    # aux 三顆各自記自己的卡(embed=GPU 1、rerank/vl=GPU 2)
+    assert services["embedding"]["gpu"] == "GPU-aaaa-5090"
+    assert services["reranker"]["gpu"] == "GPU-bbbb-2000"
+    assert services["vl"]["gpu"] == "GPU-bbbb-2000"
 
 def test_no_gpu_notifies_and_fails(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", "", exit_code=1)
@@ -243,7 +247,7 @@ def test_missing_llama_binary_fails_with_build_hint(tmp_path):
     assert proc.returncode == 2
     assert "llama-server" in proc.stderr
     assert "README §1.5" in proc.stderr
-    assert "LLAMA_BIN" in proc.stderr
+    assert "--llama-bin" in proc.stderr
 
 @pytest.mark.parametrize(
     ("help_flags", "extra_args", "expected_error", "expected_hint"),
@@ -466,9 +470,10 @@ def test_single_gpu_warns_and_shares_one_card(tmp_path):
     proc = run(tmp_path, *YES_ONE_GPU, "--no-preview", "--models-dir", str(models))
     assert proc.returncode == 0, proc.stderr
     assert "只偵測到 1 顆 GPU" in proc.stdout
-    content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
-    assert "export MAIN_GPU=GPU-solo" in content
-    assert "export AUX_GPU=GPU-solo" in content
+    services = read_deployment(tmp_path)["services"]
+    assert [services[role]["gpu"] for role in ("main", "embedding", "reranker", "vl")] == [
+        "GPU-solo"
+    ] * 4
 
 def test_dry_run_writes_nothing_for_the_model_flow(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
@@ -552,6 +557,7 @@ def test_selected_reranker_ctx_sets_context_and_physical_batch(tmp_path):
         batch=512,
         ubatch=128,
         reranker_ctx=2048,
+        llama_bin="/opt/llama-server",
     )
 
     service = sc.build_deployment_config(plan)["services"]["reranker"]
@@ -1191,6 +1197,7 @@ def _build_plan(
         batch=0,
         ubatch=0,
         reranker_ctx=8192,
+        llama_bin="/opt/llama-server",
         cpu_moe=cpu_moe,
         n_cpu_moe=n_cpu_moe,
         main_layout=layout,
@@ -1615,11 +1622,12 @@ def test_profile_emits_cpu_moe_for_main_and_vl_and_rejects_partial_mix(tmp_path)
     local_path = tmp_path / ".config" / "codetrail" / "deployment.json"
     local_path.parent.mkdir(parents=True)
     local_path.write_text(json.dumps(sc.build_deployment_config(plan)), encoding="utf-8")
-    env = {
-        "HOME": str(tmp_path),
-        "USERPROFILE": str(tmp_path),
-        "AICODE_MODEL": str(plan.main.candidate.path),
-    }
+    # 主模型走 registry:deployment.json 記的是 registry key(set_config 寫的形狀),
+    # 由 models.json 指到真正的 GGUF。以前這裡是拿環境變數把 model 換成絕對路徑。
+    (local_path.parent / "models.json").write_text(
+        json.dumps({plan.main_key: str(plan.main.candidate.path)}), encoding="utf-8"
+    )
+    env = {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path)}
 
     profile = load_effective_profile(env)
     command = build_server_command(profile.service("main"), "/opt/llama-server", env)
@@ -1748,12 +1756,31 @@ def test_allow_remote_binds_all_interfaces_with_warning(tmp_path):
     assert dry.returncode == 0, dry.stderr
     assert "main_bind_host=0.0.0.0" in dry.stdout
 
-def test_generated_start_sh_clears_legacy_env_overrides(tmp_path):
+@pytest.mark.smoke
+def test_generated_start_sh_ignores_legacy_shell_overrides(tmp_path):
+    """~/start.sh 不再設定任何殼層變數,而舊變數對啟動指令也不再有任何作用。
+
+    以前這個檔開頭 `unset` 一長串名字再 `export` 幾個權威值。那個機制只在
+    「loader 真的會讀環境」時才有意義,而它的失效方式是無聲的:同一台機器上
+    另一份安裝的 start.sh export 同名變數,使用者以為在跑 A、實際在跑 B。
+    現在設定只來自 deployment.json 與旗標,所以這裡改成兩件事都要成立:
+    產生的檔一行 export / unset 都沒有,而殼層殘留的舊名字照樣無效。
+    """
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_models(tmp_path)
     assert run(tmp_path, *YES_TWO_GPU, "--no-preview",
                 "--models-dir", str(models)).returncode == 0
 
+    content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
+    # 註解可以講「這裡不再 export」;真正被執行的行一個都不准有。
+    offenders = [
+        line for line in content.splitlines()
+        if not line.lstrip().startswith("#") and ("export" in line or "unset" in line)
+    ]
+    assert not offenders, offenders
+
+    # build_env 已經把整組舊名字設成壞值(LEGACY_SHELL_OVERRIDES),這裡再加兩個
+    # 只在舊 start.sh 的 unset 清單裡出現過的。
     env = build_env(tmp_path)
     env["EMBED_MODEL"] = "/bogus/does-not-exist.gguf"   # 模擬 .bashrc 殘留的舊 override
     env["MAIN_CTX"] = "1234"
@@ -1768,7 +1795,10 @@ def test_generated_start_sh_clears_legacy_env_overrides(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert "/bogus/does-not-exist.gguf" not in proc.stdout
+    assert "/bogus/shell-llama-server" not in proc.stdout   # LLAMA_BIN 也不再是入口
     assert "-c 65536" in proc.stdout  # 不被 MAIN_CTX=1234 蓋掉
+    # 卡片由 deployment.json 決定;殼層的 CUDA_VISIBLE_DEVICES=7 進不到指令裡。
+    assert "CUDA_VISIBLE_DEVICES=7" not in proc.stdout
 
 
 
@@ -1778,14 +1808,51 @@ def test_generated_start_sh_clears_legacy_env_overrides(tmp_path):
 
 
 def test_start_sh_pins_validated_llama_bin(tmp_path):
-    """set_config 用 LLAMA_BIN 驗證旗標 → 產生的 start.sh 必須寫死同一顆 binary,
-    否則新 shell 啟動的是另一顆(可能沒 --fit 的)llama-server。"""
+    """set_config 探測旗標用的是哪一顆 binary,deployment.json 就得記哪一顆,
+    否則啟動的是另一顆(可能沒 --fit 的)llama-server。"""
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_models(tmp_path)
     assert run(tmp_path, *YES_TWO_GPU, "--no-preview",
                 "--models-dir", str(models)).returncode == 0
-    content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
-    assert f"export LLAMA_BIN={tmp_path / 'llama-server'}" in content
+    assert read_deployment(tmp_path)["llama_bin"] == str(tmp_path / "llama-server")
+
+
+@pytest.mark.smoke
+def test_deployment_json_pins_llama_bin_and_gpus(tmp_path):
+    """GPU 與 llama-server 路徑的**唯一**落點是 deployment.json,而且重跑會沿用。
+
+    這兩個值以前住在 ~/start.sh 的 export 裡:啟動器讀得到、systemd 與別的入口
+    讀不到,而同名變數被別份安裝蓋掉時完全無聲。所以要釘三件事:
+    (1) 四個角色各自記自己的卡、頂層記 binary;(2) 沒給 --llama-bin 的重跑會沿用
+    檔案裡的值(不會靜默退回 ~/llama.cpp 的預設);(3) 產物是 loader 收得下的形狀。
+    """
+    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = make_models(tmp_path)
+    pinned = tmp_path / "custom-llama-server"
+    write_fake_llama(tmp_path)
+    shutil.copy2(tmp_path / "llama-server", pinned)
+
+    first = run(tmp_path, "--llama-bin", str(pinned), *YES_TWO_GPU, "--no-preview",
+                "--models-dir", str(models), pin_llama_bin=False)
+    assert first.returncode == 0, first.stderr + first.stdout
+    written = read_deployment(tmp_path)
+    assert written["llama_bin"] == str(pinned)
+    assert [written["services"][role]["gpu"]
+            for role in ("main", "embedding", "reranker", "vl")] == [
+        "GPU-aaaa-5090", "GPU-bbbb-2000", "GPU-bbbb-2000", "GPU-bbbb-2000",
+    ]
+
+    # 沒給旗標的重跑:預設值來自剛剛寫下的那份檔,不是內建的 ~/llama.cpp 路徑。
+    again = run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models),
+                pin_llama_bin=False)
+    assert again.returncode == 0, again.stderr + again.stdout
+    assert read_deployment(tmp_path)["llama_bin"] == str(pinned)
+
+    # loader 收得下(schema + 絕對路徑 + GPU selector 形狀),而且看到的是同一組值。
+    profile = load_effective_profile({"HOME": str(tmp_path / "home")})
+    assert profile.llama_bin == str(pinned)
+    assert profile.service("main").gpu == "GPU-aaaa-5090"
+    assert profile.service("vl").gpu == "GPU-bbbb-2000"
 
 
 
@@ -1879,49 +1946,31 @@ def test_generated_start_sh_subcommand_guard_and_logs_validation(tmp_path):
     assert never_started.returncode == 1
     assert "尚未啟動過" in never_started.stderr
 
-def test_generated_start_sh_exports_before_subcommand_dispatch(tmp_path):
-    """GPU/模型 exports 必須在 case dispatch 之前:status --strict 的 wrong-GPU
-    檢查唯一來源是這些環境變數,放在 case 之後 status 路徑會拿不到期望值。"""
-    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
-    models = make_models(tmp_path)
-    assert run(tmp_path, *YES_TWO_GPU, "--no-preview",
-                "--models-dir", str(models)).returncode == 0
-    content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
-    dispatch = content.index('case "${1:-}"')
-    assert content.index("unset ") < content.index("export AICODE_MODEL=") < dispatch
-    assert content.index("export MAIN_GPU=") < dispatch
-    assert content.index("export LLAMA_BIN=") < dispatch
+def test_restart_subprocess_env_goes_through_process_env(monkeypatch):
+    """[R] 自動重啟的 stop/start 子程序走 process_env:CodeTrail 的四個設定前綴
+    一律剝掉,其餘(PATH / 使用者自己的變數)原樣繼承。
 
-
-
-
-def test_restart_subprocess_env_is_sanitized(monkeypatch):
-    """[R] 自動重啟的 quit/start 子程序不得繼承泛用 SESSION/override env:
-    桌面環境的 SESSION 會讓 stop 殺錯無關 session、漏掉真正的 codetrail-rag。"""
+    以前這裡是 set_config 自己維護一份「要剔除的名字」清單;清單漏一個就等於
+    讓殼層決定 stop 去殺哪個 tmux session。現在剝除只有 process_env 一個出口,
+    而 session 名與設定都不再是環境變數。"""
     from scripts import set_config as sc
 
-    monkeypatch.setenv("SESSION", "unrelated-desktop-session")
-    monkeypatch.setenv("MAIN_SESSION", "custom-main")
-    monkeypatch.setenv("AUX_SESSION", "custom-aux")
-    monkeypatch.setenv("MAIN_GPU", "GPU-x")
+    monkeypatch.setenv("AICODE_MODEL", "/bogus/shell-model.gguf")
+    monkeypatch.setenv("CODETRAIL_ANYTHING", "1")
     monkeypatch.setenv("KEEP_ME", "1")
-    env = sc._sanitized_subprocess_env()
-    assert "SESSION" not in env
-    assert "MAIN_SESSION" not in env
-    assert "AUX_SESSION" not in env
-    assert "MAIN_GPU" not in env
-    assert env.get("KEEP_ME") == "1"
 
     calls = []
 
     class _Result:
         returncode = 0
 
-    def fake_run(cmd, check=False, env=None, **_kwargs):
+    def fake_run(cmd, env=None, **_kwargs):
         calls.append((list(cmd), env))
         return _Result()
 
-    monkeypatch.setattr(sc.subprocess, "run", fake_run)
+    # 換掉最底層的 subprocess.run:這樣 env 是 process_env 真的算出來的那一份
+    # (patch 掉 process_env.run 只會證明「我們自己傳了什麼」)。
+    monkeypatch.setattr(subprocess, "run", fake_run)
     rc = sc._restart_servers(Path("/fake/home/start.sh"))
     assert rc == 0
     assert len(calls) == 2
@@ -1929,23 +1978,24 @@ def test_restart_subprocess_env_is_sanitized(monkeypatch):
     assert calls[0][0][2:4] == ["--scope", "all"]
     assert calls[1][0][1] == "/fake/home/start.sh"
     for _cmd, env in calls:
-        assert env is not None
-        assert "SESSION" not in env and "MAIN_GPU" not in env
+        assert env is not None, "子行程不得隱式繼承整份殼層環境"
+        assert "AICODE_MODEL" not in env
+        assert "CODETRAIL_ANYTHING" not in env
+        assert env.get("KEEP_ME") == "1"
 
 
 
 def test_relative_models_dir_and_llama_bin_are_stored_absolute(tmp_path):
     """相對路徑立刻轉絕對:--models-dir ./models 不得走到最後 schema 驗證才爆;
-    相對 LLAMA_BIN 不得原樣寫進 ~/start.sh(換目錄執行就找不到)。"""
+    相對 --llama-bin 不得原樣寫進 deployment.json —— 真正 exec 它的是 tmux pane
+    裡的 loader,cwd 不是使用者打指令的地方(loader 對相對路徑會直接 fail-loud)。"""
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_models(tmp_path)
-    env = build_env(tmp_path)
-    env["LLAMA_BIN"] = "./llama-server"
     proc = subprocess.run(
-        ["bash", str(SCRIPT), "--skip-deps-check", *YES_TWO_GPU, "--no-preview",
-         "--models-dir", "./models"],
+        ["bash", str(SCRIPT), "--skip-deps-check", "--llama-bin", "./llama-server",
+         *YES_TWO_GPU, "--no-preview", "--models-dir", "./models"],
         cwd=tmp_path,
-        env=env,
+        env=build_env(tmp_path),
         capture_output=True,
         text=True,
         timeout=60,
@@ -1957,24 +2007,8 @@ def test_relative_models_dir_and_llama_bin_are_stored_absolute(tmp_path):
     )
     expected = str(models / "big-chat" / "big-chat-ud-q4_k_xl-00001-of-00002.gguf")
     assert registry["big-chat-ud-q4-k-xl"] == expected
-    content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
-    assert f"export LLAMA_BIN={tmp_path / 'llama-server'}" in content
-    assert "export LLAMA_BIN=./llama-server" not in content
+    assert read_deployment(tmp_path)["llama_bin"] == str(tmp_path / "llama-server")
 
-
-
-def test_deployment_env_override_split_brain_warns(tmp_path):
-    """AICODE_DEPLOYMENT_CONFIG 等 override 有設時要警告:aicode 會讀自訂檔、
-    ~/start.sh 卻刻意 unset,兩邊將各用一份設定。"""
-    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
-    models = make_models(tmp_path)
-    proc = run(
-        tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models),
-        env_overrides={"AICODE_DEPLOYMENT_CONFIG": str(tmp_path / "custom-deploy.json")},
-    )
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "偵測到環境變數 AICODE_DEPLOYMENT_CONFIG" in proc.stdout
-    assert "各用一份設定" in proc.stdout
 
 def test_logs_accepts_count_and_follow_shorthand(tmp_path):
     """logs 依說明允許省略 role:logs 3 / logs -f 都要能用;多餘參數不得靜默忽略。"""
@@ -2032,7 +2066,7 @@ def test_logs_accepts_count_and_follow_shorthand(tmp_path):
 #   * 寫進 client.json 的模式必須是使用者選的那一個,而且門檻要與 runtime 用的
 #     同一條公式對得起來 —— wizard 與 engine 各算各的,兩邊差一點也不會有錯誤。
 #   * client.json 是 0600:它決定寫入工具要不要人工核准。
-#   * 舊 OpenCode 安裝的遷移只在偵測到我們自己寫過的東西時才動別人的設定。
+#   * restore manifest 是兩個世代共用的同一個檔:含這一代不會寫的目標就整份拒絕。
 
 
 def _home(tmp_path: Path) -> Path:

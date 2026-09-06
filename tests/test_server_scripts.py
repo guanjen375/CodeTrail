@@ -11,6 +11,7 @@ test_rag_server_scripts 與 test_check_status_script / test_stop_wait。
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shlex
@@ -21,7 +22,8 @@ from pathlib import Path
 
 import pytest
 
-from deployment_profile import RUNTIME_OVERRIDE_ENV_KEYS, ServiceProfile
+import process_env
+from deployment_profile import TMUX_SESSIONS, ServiceProfile
 from scripts import launch_servers, stop_servers
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -35,40 +37,66 @@ START_AUX = ("launch_servers.py", "--scope", "aux")
 STOP_ALL = ("stop_servers.py", "--scope", "all")
 STOP_AUX = ("stop_servers.py", "--scope", "aux")
 
+#: 這些名字在這一代**沒有任何作用**。測試把它們設進子行程的殼層,是為了證明
+#: 「設了也不會生效」—— 同一台機器上另一份安裝的 `~/start.sh` export 的就是這些,
+#: 只要有一個還被讀,使用者就會「以為在跑 A、實際在跑 B」而且完全無聲。
+LEGACY_SHELL_OVERRIDES = {
+    "AICODE_PROFILE": "/shell/profile.json",
+    "AICODE_MODEL": "/shell/never-used.gguf",
+    "AICODE_DEPLOYMENT_CONFIG": "/shell/deployment.json",
+    "AICODE_MODEL_REGISTRY_FILE": "/shell/models.json",
+    "AICODE_MAIN_CTX": "111",
+    "MAIN_CTX": "222",
+    "MAIN_GPU": "SHELL-MAIN-GPU",
+    "AUX_GPU": "SHELL-AUX-GPU",
+    "EMBED_GPU": "SHELL-EMBED-GPU",
+    "RERANK_GPU": "SHELL-RERANK-GPU",
+    "VL_GPU": "SHELL-VL-GPU",
+    "CUDA_VISIBLE_DEVICES": "9",
+    "EMBED_MODEL": "/shell/embed.gguf",
+    "RERANK_MODEL": "/shell/rerank.gguf",
+    "VL_GGUF": "/shell/vl.gguf",
+    "VL_MMPROJ": "/shell/mmproj.gguf",
+    "LLAMA_BIN": "/shell/llama-server",
+    "MODELS_DIR": "/shell/models",
+    "MAIN_SESSION": "shell-main-session",
+    "SESSION": "shell-generic-session",
+    "AUX_SESSION": "shell-aux-session",
+    "MAIN_HEALTH_TIMEOUT": "1",
+    "RAG_HEALTH_TIMEOUT": "1",
+    "AICODE_NO_ROLLBACK": "1",
+    "AICODE_STOP_TIMEOUT": "1",
+    "EXPECTED_LLAMA_SERVERS": "99",
+    "AICODE_STATUS_PROC_ROOT": "/shell/proc",
+    "AICODE_STATUS_SNAPSHOT": "/shell/snapshot.json",
+    "AICODE_RERANK_FALLBACK_POLICY": "main_model",
+}
 
-def _clean_env(tmp_path: Path) -> dict[str, str]:
-    keys = {
-        "AICODE_PROFILE",
-        "AICODE_DEPLOYMENT_CONFIG",
-        "AICODE_MODEL",
-        "AICODE_MODEL_REGISTRY",
-        "AICODE_MODEL_REGISTRY_FILE",
-        "MAIN_GPU",
-        "AUX_GPU",
-        "EMBED_GPU",
-        "RERANK_GPU",
-        "VL_GPU",
-        "CUDA_VISIBLE_DEVICES",
-        "EMBED_MODEL",
-        "RERANK_MODEL",
-        "VL_GGUF",
-        "VL_MMPROJ",
+
+def _shell_env(tmp_path: Path, **extra: str) -> dict[str, str]:
+    """子行程的殼層環境:tmp HOME + 整組已經沒有作用的舊變數。"""
+    return {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "USERPROFILE": str(tmp_path),
+        **LEGACY_SHELL_OVERRIDES,
+        **extra,
     }
-    env = {key: value for key, value in os.environ.items() if key not in keys}
-    env.update(
-        {
-            "HOME": str(tmp_path),
-            "USERPROFILE": str(tmp_path),
-            "MODELS_DIR": str(tmp_path / "models"),
-            "LLAMA_BIN": str(tmp_path / "llama-server"),
-        }
-    )
-    return env
 
 
-def _run_launcher(entry: tuple[str, ...], tmp_path: Path, env_extra: dict[str, str], *args: str):
-    env = _clean_env(tmp_path)
-    env.update(env_extra)
+def _write_deployment(tmp_path: Path, services: dict | None = None, **top) -> Path:
+    """tmp HOME 的 `~/.config/codetrail/deployment.json` —— 設定的唯一來源。"""
+    path = tmp_path / ".config" / "codetrail" / "deployment.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict = {"schema_version": 1, "profile": "defaults", **top}
+    if services is not None:
+        payload["services"] = services
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _run_launcher(entry: tuple[str, ...], tmp_path: Path, *args: str):
+    env = _shell_env(tmp_path)
     script, *base_args = entry
     return subprocess.run(
         [sys.executable, str(REPO_ROOT / "scripts" / script), *base_args, *args],
@@ -76,9 +104,14 @@ def _run_launcher(entry: tuple[str, ...], tmp_path: Path, env_extra: dict[str, s
         env=env,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=15,
         check=False,
     )
+
+
+def _launch_args(*argv: str) -> argparse.Namespace:
+    """launcher 的解析結果。設定經 argv 進來,測試也照同一條路。"""
+    return launch_servers._parser().parse_args(list(argv))
 
 
 def _write_profile_fixture(tmp_path: Path, name: str) -> Path:
@@ -102,58 +135,59 @@ def _write_profile_fixture(tmp_path: Path, name: str) -> Path:
 
 
 def test_start_all_routes_main_and_all_aux_to_their_shared_gpus(tmp_path):
+    """GPU 分配只來自 argv 與 `deployment.json`;殼層裡同名的 `MAIN_GPU` /
+    `AUX_GPU` / `CUDA_VISIBLE_DEVICES` 一個都不算數。"""
     main = tmp_path / "main.gguf"
     main.write_bytes(b"fixture")
     profile_path = _write_profile_fixture(tmp_path, "gpu-split")
     proc = _run_launcher(
         START_ALL,
         tmp_path,
-        {
-            "AICODE_PROFILE": str(profile_path),
-            "AICODE_MODEL": str(main),
-            "MAIN_GPU": "GPU-H200",
-            "AUX_GPU": "GPU-RTX2000ADA",
-        },
         "--dry-run",
+        "--profile", str(profile_path),
+        "--main-model", str(main),
+        "--main-gpu", "GPU-H200",
+        "--aux-gpu", "GPU-RTX2000ADA",
     )
 
     assert proc.returncode == 0, proc.stderr
     assert "profile=gpu-split" in proc.stdout
     assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-H200") == 1
     assert proc.stdout.count("CUDA_VISIBLE_DEVICES=GPU-RTX2000ADA") == 3
+    for dead in ("SHELL-MAIN-GPU", "SHELL-AUX-GPU", "CUDA_VISIBLE_DEVICES=9"):
+        assert dead not in proc.stdout
 
 
 def test_start_main_fails_loud_when_no_main_model_is_set(tmp_path):
+    """殼層的 `AICODE_MODEL` 不是來源:沒有檔案也沒有 `--main-model` 就要失敗。"""
     proc = _run_launcher(
         START_MAIN,
         tmp_path,
-        {},
         "--dry-run",
     )
 
     assert proc.returncode != 0
     assert "main model is unset" in proc.stderr
+    assert "never-used.gguf" not in proc.stdout
 
 
-def test_legacy_aux_launcher_env_names_still_override_profile(tmp_path):
-    embed = tmp_path / "legacy-embed.gguf"
-    rerank = tmp_path / "legacy-rerank.gguf"
-    vl = tmp_path / "legacy-vl.gguf"
-    mmproj = tmp_path / "legacy-mmproj.gguf"
-    proc = _run_launcher(
-        START_AUX,
+def test_aux_models_and_gpus_come_from_the_deployment_file(tmp_path):
+    """三顆附屬模型與它們的 GPU 來自 `deployment.json`(以前是四個 `*_MODEL` /
+    三個 `*_GPU` 環境變數;那些名字現在只證明自己無效)。"""
+    embed = tmp_path / "file-embed.gguf"
+    rerank = tmp_path / "file-rerank.gguf"
+    vl = tmp_path / "file-vl.gguf"
+    mmproj = tmp_path / "file-mmproj.gguf"
+    _write_deployment(
         tmp_path,
         {
-            "EMBED_MODEL": str(embed),
-            "RERANK_MODEL": str(rerank),
-            "VL_GGUF": str(vl),
-            "VL_MMPROJ": str(mmproj),
-            "EMBED_GPU": "0",
-            "RERANK_GPU": "1",
-            "VL_GPU": "2",
+            "embedding": {"model": str(embed), "gpu": "0"},
+            "reranker": {"model": str(rerank), "gpu": "1"},
+            "vl": {"model": str(vl), "mmproj": str(mmproj), "gpu": "2"},
         },
-        "--dry-run",
     )
+
+    proc = _run_launcher(START_AUX, tmp_path, "--dry-run")
 
     assert proc.returncode == 0, proc.stderr
     for path in (embed, rerank, vl, mmproj):
@@ -161,11 +195,12 @@ def test_legacy_aux_launcher_env_names_still_override_profile(tmp_path):
     assert "CUDA_VISIBLE_DEVICES=0" in proc.stdout
     assert "CUDA_VISIBLE_DEVICES=1" in proc.stdout
     assert "CUDA_VISIBLE_DEVICES=2" in proc.stdout
+    assert "/shell/" not in proc.stdout
 
 
 def test_launcher_help_paths_are_offline(tmp_path):
     for entry in (START_MAIN, START_ALL, START_AUX, STOP_ALL, STOP_AUX):
-        proc = _run_launcher(entry, tmp_path, {}, "--help")
+        proc = _run_launcher(entry, tmp_path, "--help")
         assert proc.returncode == 0, f"{entry}: {proc.stderr}"
 
 
@@ -178,11 +213,9 @@ def test_quit_still_kills_sessions_when_deployment_config_is_broken(tmp_path):
     proc = _run_launcher(
         STOP_ALL,
         tmp_path,
-        {
-            # 不存在的 session 名:只驗證退路流程,不動開發機上真的 codetrail session
-            "MAIN_SESSION": "codetrail-test-none-main",
-            "SESSION": "codetrail-test-none-rag",
-        },
+        # 不存在的 session 名:只驗證退路流程,不動開發機上真的 codetrail session
+        "--main-session", "codetrail-test-none-main",
+        "--aux-session", "codetrail-test-none-rag",
     )
 
     assert proc.returncode == 1  # 設定仍是壞的 → 非零提醒
@@ -212,11 +245,9 @@ def test_launcher_rejects_duplicate_service_ports(tmp_path):
     proc = _run_launcher(
         START_ALL,
         tmp_path,
-        {
-            "AICODE_DEPLOYMENT_CONFIG": str(deployment),
-            "AICODE_MODEL": str(main),
-        },
         "--dry-run",
+        "--deployment-config", str(deployment),
+        "--main-model", str(main),
     )
 
     assert proc.returncode != 0
@@ -253,7 +284,7 @@ def test_legacy_vl_cpu_moe_config_gets_fit_off_and_a_warning(tmp_path):
         encoding="utf-8",
     )
 
-    proc = _run_launcher(START_AUX, tmp_path, {}, "--dry-run")
+    proc = _run_launcher(START_AUX, tmp_path, "--dry-run")
 
     assert proc.returncode == 0, proc.stderr
     vl_command = next(
@@ -291,7 +322,7 @@ def test_cpu_moe_without_explicit_fit_still_warns(tmp_path):
         tmp_path, {"gpu_layers": 99, "parallel": 1, "fit_target": 3072, "n_cpu_moe": 4}
     )
 
-    proc = _run_launcher(START_AUX, tmp_path, {}, "--dry-run")
+    proc = _run_launcher(START_AUX, tmp_path, "--dry-run")
 
     assert proc.returncode == 0, proc.stderr
     assert "fit 未設定(llama.cpp 預設即 on)" in proc.stderr
@@ -310,7 +341,7 @@ def test_set_config_shaped_cpu_moe_config_is_not_warned(tmp_path):
         tmp_path, {"gpu_layers": 99, "parallel": 1, "fit": "off", "n_cpu_moe": 4}
     )
 
-    proc = _run_launcher(START_AUX, tmp_path, {}, "--dry-run")
+    proc = _run_launcher(START_AUX, tmp_path, "--dry-run")
 
     assert proc.returncode == 0, proc.stderr
     assert "放棄 --fit" not in proc.stderr
@@ -323,7 +354,7 @@ def test_systemd_exec_path_also_warns_before_launching(tmp_path):
         tmp_path,
         {"gpu_layers": "auto", "parallel": 1, "fit": "on", "fit_target": 3072, "n_cpu_moe": 4},
     )
-    env = _clean_env(tmp_path)
+    env = _shell_env(tmp_path)
     # exec 會 os.execvpe;指到一個一定不存在的 binary,警告仍必須先印出來。
     proc = subprocess.run(
         [sys.executable, str(REPO_ROOT / "deployment_profile.py"), "exec", "vl",
@@ -369,36 +400,47 @@ def test_artifact_bytes_sums_all_shards(tmp_path):
 
 
 def test_health_timeout_scales_with_model_size():
-    assert launch_servers._health_timeout("main", {}, 0) == 300
-    assert launch_servers._health_timeout("main", {}, 100 * GIB) == 500
-    assert launch_servers._health_timeout("main", {}, 1000 * GIB) == 1800  # 上限
-    assert launch_servers._health_timeout("main", {"MAIN_HEALTH_TIMEOUT": "42"}, 10**13) == 42
-    assert launch_servers._health_timeout("embedding", {}) == 60
-    assert launch_servers._health_timeout("vl", {"RAG_HEALTH_TIMEOUT": "90"}) == 90
+    assert launch_servers._health_timeout("main", None, 0) == 300
+    assert launch_servers._health_timeout("main", None, 100 * GIB) == 500
+    assert launch_servers._health_timeout("main", None, 1000 * GIB) == 1800  # 上限
+    assert launch_servers._health_timeout("main", 42, 10**13) == 42
+    assert launch_servers._health_timeout("embedding", None) == 60
+    assert launch_servers._health_timeout("vl", 90) == 90
+    # 覆寫來自 `--health-timeout`,而且 0 / 負數在解析階段就被擋下。
+    assert _launch_args("--scope", "all").health_timeout is None
+    assert _launch_args("--scope", "all", "--health-timeout", "42").health_timeout == 42
+    with pytest.raises(SystemExit):
+        _launch_args("--scope", "all", "--health-timeout", "0")
 
 
-def test_rollback_saves_logs_and_kills_created_sessions(tmp_path, monkeypatch):
-    calls: list[list[str]] = []
+def _fake_tmux(monkeypatch, calls: list[list[str]], *, stdout: str = "") -> None:
+    """tmux 替身:每個 spawn 都經 `process_env.run`,所以換掉它就等於換掉 tmux。"""
 
     class _Result:
         returncode = 0
-        stdout = "fake server log line\n"
         stderr = ""
 
     def fake_run(cmd, **_kwargs):
         calls.append(list(cmd))
-        return _Result()
+        result = _Result()
+        result.stdout = stdout
+        return result
 
-    monkeypatch.setattr(launch_servers.subprocess, "run", fake_run)
+    monkeypatch.setattr(launch_servers.process_env, "run", fake_run)
+
+
+def test_rollback_saves_logs_and_kills_created_sessions(tmp_path, monkeypatch):
+    calls: list[list[str]] = []
+    _fake_tmux(monkeypatch, calls, stdout="fake server log line\n")
     sessions = {"main": "s-main", "aux": "s-aux"}
-    environ = {"HOME": str(tmp_path)}
+    log_dir = launch_servers._state_log_dir({"HOME": str(tmp_path)})
 
     launch_servers._rollback_started(
         RuntimeError("boom"),
         [_service("main"), _service("embedding")],
         ["s-main", "s-aux"],
         sessions,
-        environ,
+        log_dir=log_dir,
     )
 
     main_log = tmp_path / ".local" / "state" / "codetrail" / "logs" / "main.log"
@@ -412,46 +454,31 @@ def test_rollback_saves_logs_and_kills_created_sessions(tmp_path, monkeypatch):
     assert [cmd[3] for cmd in kills] == ["s-main", "s-aux"]
 
 
-def test_rollback_respects_no_rollback_env(tmp_path, monkeypatch):
+def test_rollback_respects_the_keep_on_failure_flag(tmp_path, monkeypatch):
+    """保留現場改由 `--keep-on-failure` 決定;殼層變數不再有這個開關。"""
     calls: list[list[str]] = []
-
-    def fake_run(cmd, **_kwargs):
-        calls.append(list(cmd))
-
-        class _Result:
-            returncode = 0
-            stdout = ""
-            stderr = ""
-
-        return _Result()
-
-    monkeypatch.setattr(launch_servers.subprocess, "run", fake_run)
+    _fake_tmux(monkeypatch, calls)
     launch_servers._rollback_started(
         RuntimeError("boom"),
         [_service("main")],
         ["s-main"],
         {"main": "s-main", "aux": "s-aux"},
-        {"HOME": str(tmp_path), "AICODE_NO_ROLLBACK": "1"},
+        log_dir=tmp_path / "logs",
+        keep_on_failure=True,
     )
     assert calls == []  # 保留現場:不 capture、不 kill
+    assert not (tmp_path / "logs").exists()
+    assert _launch_args("--scope", "all").keep_on_failure is False
+    assert _launch_args("--scope", "all", "--keep-on-failure").keep_on_failure is True
 
 
 def test_start_role_pipes_server_output_to_persistent_log(tmp_path, monkeypatch):
     calls: list[list[str]] = []
-
-    class _Result:
-        returncode = 0
-        stdout = ""
-        stderr = ""
-
-    def fake_run(cmd, **_kwargs):
-        calls.append(list(cmd))
-        return _Result()
-
-    monkeypatch.setattr(launch_servers.subprocess, "run", fake_run)
+    _fake_tmux(monkeypatch, calls)
     log_dir = tmp_path / "logs"
+    pane = launch_servers._pane_command("main", _launch_args("--scope", "main"))
     launch_servers._start_role(
-        _service("main"), ["llama-server", "-m", "x"], "s-main",
+        _service("main"), pane, "s-main",
         first_in_session=True, log_dir=log_dir,
     )
 
@@ -470,7 +497,9 @@ def test_start_role_pipes_server_output_to_persistent_log(tmp_path, monkeypatch)
     assert kinds.index("set-option") < kinds.index("respawn-window")
     respawn = next(cmd for cmd in calls if cmd[:2] == ["tmux", "respawn-window"])
     assert "-k" in respawn
-    assert respawn[-1] == "llama-server -m x"
+    # pane 跑的是 exec choke point,不是 llama-server 本身(B-03)。
+    assert respawn[-1] == pane
+    assert "deployment_profile.py exec main" in respawn[-1]
     session_cmd = next(cmd for cmd in calls if cmd[:2] == ["tmux", "new-session"])
     assert session_cmd[-1] == "main"  # 先開空 window,不直接帶 llama-server 指令
 
@@ -479,23 +508,34 @@ def test_rollback_noop_when_nothing_created(tmp_path, monkeypatch):
     def fake_run(cmd, **_kwargs):
         raise AssertionError(f"不應呼叫 tmux:{cmd}")
 
-    monkeypatch.setattr(launch_servers.subprocess, "run", fake_run)
+    monkeypatch.setattr(launch_servers.process_env, "run", fake_run)
     launch_servers._rollback_started(
         RuntimeError("boom"), [], [], {"main": "s-main", "aux": "s-aux"},
-        {"HOME": str(tmp_path)},
+        log_dir=tmp_path / "logs",
     )
 
 
-def _fake_profile():
+def _fake_profile(llama_bin: Path | str = "/bin/true"):
+    # class body 裡 `llama_bin = str(llama_bin)` 會把左值宣告成 class 名稱空間的名字,
+    # 右邊的查找不會回到外層函式的參數 → NameError。先在函式層綁成另一個名字。
+    binary = str(llama_bin)
+
     class _Profile:
+        llama_bin = binary
+        registry_file = None
+
         def service(self, role):
             return _service(role)
 
     return _Profile()
 
 
-def _patch_launch_scaffolding(monkeypatch, tmp_path):
-    """launch() 的離線鷹架:tmux/port/模型解析全部 stub,聚焦 session 記帳。"""
+def _patch_launch_scaffolding(monkeypatch, tmp_path, *argv: str):
+    """launch() 的離線鷹架:tmux/port/模型解析全部 stub,聚焦 session 記帳。
+
+    回傳 `(profile, args)`:設定現在只從 `deployment.json` 與 argv 進來,
+    所以 launch() 收的是解析後的 namespace,不再是一份環境。
+    """
     binary = tmp_path / "llama-server"
     binary.write_text("#!/bin/sh\n", encoding="utf-8")
     binary.chmod(0o755)
@@ -504,36 +544,30 @@ def _patch_launch_scaffolding(monkeypatch, tmp_path):
     monkeypatch.setattr(launch_servers, "_tmux_has_session", lambda _session: False)
     monkeypatch.setattr(
         launch_servers, "resolve_model_reference",
-        lambda value, _env, must_exist=True: value,
+        lambda value, environ=None, *, must_exist=False, registry_file=None: value,
     )
     monkeypatch.setattr(launch_servers, "_port_responds", lambda _service: False)
-    monkeypatch.setattr(
-        launch_servers, "_command_for",
-        lambda service, binary_path, env, must_exist=True: ["llama-server"],
-    )
-    return {"LLAMA_BIN": str(binary), "HOME": str(tmp_path)}
+    return _fake_profile(binary), _launch_args(*(argv or ("--scope", "main")))
 
 
 def test_launch_registers_session_before_start_role_failure(monkeypatch, tmp_path):
     """new-session 成功、respawn-window 才失敗的半套狀態:session 必須「先登記
     再建立」,rollback 才會清掉它;否則殘留 session 會卡住下一次啟動。"""
-    import subprocess as sp
-
-    environ = _patch_launch_scaffolding(monkeypatch, tmp_path)
+    profile, args = _patch_launch_scaffolding(monkeypatch, tmp_path)
 
     def boom(*_args, **_kwargs):
-        raise sp.CalledProcessError(1, ["tmux", "respawn-window"])
+        raise process_env.CalledProcessError(1, ["tmux", "respawn-window"])
 
     monkeypatch.setattr(launch_servers, "_start_role", boom)
     rollbacks: list[list[str]] = []
     monkeypatch.setattr(
         launch_servers, "_rollback_started",
-        lambda reason, roles, created, sessions, env: rollbacks.append(list(created)),
+        lambda reason, roles, created, sessions, **_kw: rollbacks.append(list(created)),
     )
 
     try:
-        launch_servers.launch(_fake_profile(), ["main"], environ, dry_run=False)
-    except sp.CalledProcessError:
+        launch_servers.launch(profile, ["main"], args)
+    except process_env.CalledProcessError:
         pass
     else:
         raise AssertionError("expected CalledProcessError to propagate")
@@ -542,7 +576,7 @@ def test_launch_registers_session_before_start_role_failure(monkeypatch, tmp_pat
 
 def test_launch_rolls_back_on_keyboard_interrupt(monkeypatch, tmp_path):
     """Ctrl-C(最常發生在等 health 的幾分鐘)也要走 rollback,不留殘存 session。"""
-    environ = _patch_launch_scaffolding(monkeypatch, tmp_path)
+    profile, args = _patch_launch_scaffolding(monkeypatch, tmp_path)
     monkeypatch.setattr(launch_servers, "_start_role", lambda *args, **kwargs: None)
 
     def interrupted(*_args, **_kwargs):
@@ -552,11 +586,11 @@ def test_launch_rolls_back_on_keyboard_interrupt(monkeypatch, tmp_path):
     rollbacks: list[tuple[str, list[str]]] = []
     monkeypatch.setattr(
         launch_servers, "_rollback_started",
-        lambda reason, roles, created, sessions, env: rollbacks.append((str(reason), list(created))),
+        lambda reason, roles, created, sessions, **_kw: rollbacks.append((str(reason), list(created))),
     )
 
     try:
-        launch_servers.launch(_fake_profile(), ["main"], environ, dry_run=False)
+        launch_servers.launch(profile, ["main"], args)
     except KeyboardInterrupt:
         pass
     else:
@@ -568,7 +602,7 @@ def test_launch_rolls_back_on_keyboard_interrupt(monkeypatch, tmp_path):
 def test_main_returns_130_on_keyboard_interrupt(monkeypatch, capsys):
     """CLI 收 Ctrl-C:乾淨訊息 + exit 130,不噴 traceback。"""
 
-    def interrupted(_env, profile=None):
+    def interrupted(**_kwargs):
         raise KeyboardInterrupt()
 
     monkeypatch.setattr(launch_servers, "load_effective_profile", interrupted)
@@ -579,11 +613,11 @@ def test_main_returns_130_on_keyboard_interrupt(monkeypatch, capsys):
 
 def test_ready_message_uses_absolute_status_path(monkeypatch, tmp_path, capsys):
     """啟動成功訊息的 check-status 提示必須是絕對路徑(常從 $HOME 執行)。"""
-    environ = _patch_launch_scaffolding(monkeypatch, tmp_path)
+    profile, args = _patch_launch_scaffolding(monkeypatch, tmp_path)
     monkeypatch.setattr(launch_servers, "_start_role", lambda *args, **kwargs: None)
     monkeypatch.setattr(launch_servers, "_wait_for_health", lambda *args, **kwargs: None)
 
-    launch_servers.launch(_fake_profile(), ["main"], environ, dry_run=False)
+    launch_servers.launch(profile, ["main"], args)
     out = capsys.readouterr().out
     assert "CodeTrail model servers ready." in out
     expected = Path(launch_servers.__file__).resolve().parent / "check_status.py"
@@ -602,9 +636,9 @@ def test_start_role_warns_when_pipe_pane_fails(tmp_path, monkeypatch, capsys):
 
         return _Result()
 
-    monkeypatch.setattr(launch_servers.subprocess, "run", fake_run)
+    monkeypatch.setattr(launch_servers.process_env, "run", fake_run)
     launch_servers._start_role(
-        _service("main"), ["llama-server", "-m", "x"], "s-main",
+        _service("main"), "python3 deployment_profile.py exec main", "s-main",
         first_in_session=True, log_dir=tmp_path / "logs",
     )
     err = capsys.readouterr().err
@@ -623,11 +657,11 @@ def test_start_role_warns_when_log_dir_unwritable(tmp_path, monkeypatch, capsys)
 
         return _Result()
 
-    monkeypatch.setattr(launch_servers.subprocess, "run", fake_run)
+    monkeypatch.setattr(launch_servers.process_env, "run", fake_run)
     blocker = tmp_path / "blocked"
     blocker.write_text("file, not dir", encoding="utf-8")
     launch_servers._start_role(
-        _service("main"), ["llama-server", "-m", "x"], "s-main",
+        _service("main"), "python3 deployment_profile.py exec main", "s-main",
         first_in_session=True, log_dir=blocker / "logs",
     )
     err = capsys.readouterr().err
@@ -637,44 +671,19 @@ def test_start_role_warns_when_log_dir_unwritable(tmp_path, monkeypatch, capsys)
 # --------------------------------------------------------------------------
 # 併自 tests/test_rag_server_scripts.py。
 # --------------------------------------------------------------------------
-def _isolated_env(tmp_path: Path) -> dict[str, str]:
-    """乾淨環境:不吃開發機真實的 ~/.config/codetrail 與 shell 覆寫變數。
-
-    這兩個 dry-run 測試斷言的是 profile 預設值;繼承真實 HOME 會讓
-    「本機重跑過 set_config」直接改掉測試結果(環境相依假失敗)。"""
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in set(RUNTIME_OVERRIDE_ENV_KEYS)
-    }
-    env.update({"HOME": str(tmp_path), "USERPROFILE": str(tmp_path)})
-    return env
-
-
 def test_start_rag_servers_dry_run_uses_base_url_ports(tmp_path):
-    env = {
-        **_isolated_env(tmp_path),
-        "LLAMA_BIN": str(tmp_path / "llama-server"),
-        "MODELS_DIR": str(tmp_path / "models"),
-        "AICODE_LLAMA_EMBED_BASE_URL": "http://127.0.0.1:18081",
-        "AICODE_LLAMA_RERANK_BASE_URL": "http://localhost:18082",
-        "AICODE_LLAMA_VL_BASE_URL": "http://127.0.0.1:18083",
-        "EMBED_GPU": "0",
-        "RERANK_GPU": "1",
-        "VL_GPU": "2",
-        "AICODE_RERANK_FALLBACK_POLICY": "error",
-    }
-
-    proc = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "scripts" / "launch_servers.py"),
-         "--scope", "aux", "--dry-run"],
-        cwd=str(REPO_ROOT),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
+    """port / host / GPU 全部來自 `deployment.json`(以前是三個 base_url 環境變數
+    加三個 `*_GPU`)。"""
+    _write_deployment(
+        tmp_path,
+        {
+            "embedding": {"port": 18081, "base_url": "http://127.0.0.1:18081", "gpu": "0"},
+            "reranker": {"port": 18082, "base_url": "http://localhost:18082", "gpu": "1"},
+            "vl": {"port": 18083, "base_url": "http://127.0.0.1:18083", "gpu": "2"},
+        },
     )
+
+    proc = _run_launcher(START_AUX, tmp_path, "--dry-run")
 
     assert proc.returncode == 0, proc.stderr
     assert "embed_base_url=http://127.0.0.1:18081" in proc.stdout
@@ -696,23 +705,12 @@ def test_start_rag_servers_dry_run_uses_base_url_ports(tmp_path):
     assert "CUDA_VISIBLE_DEVICES=0" in proc.stdout
     assert "CUDA_VISIBLE_DEVICES=1" in proc.stdout
     assert "CUDA_VISIBLE_DEVICES=2" in proc.stdout
+    # dry-run 不再印已刪除的 rerank fallback policy(唯一來源是 client.json)。
+    assert "rerank_fallback_policy" not in proc.stdout
 
 
 def test_start_rag_servers_noncausal_models_use_full_physical_batch(tmp_path):
-    proc = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "scripts" / "launch_servers.py"),
-         "--scope", "aux", "--dry-run"],
-        cwd=str(REPO_ROOT),
-        env={
-            **_isolated_env(tmp_path),
-            "LLAMA_BIN": str(tmp_path / "llama-server"),
-            "MODELS_DIR": str(tmp_path / "models"),
-        },
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
+    proc = _run_launcher(START_AUX, tmp_path, "--dry-run")
 
     assert proc.returncode == 0, proc.stderr
     settings = dict(
@@ -734,29 +732,38 @@ def test_start_rag_servers_noncausal_models_use_full_physical_batch(tmp_path):
 SCRIPT = REPO_ROOT / "scripts" / "check_status.py"
 
 
-def _write_fake_nvidia_smi(tmp_path: Path, output: str, exit_code: int = 0) -> None:
-    executable = tmp_path / "nvidia-smi"
-    executable.write_text(
-        "#!/usr/bin/env bash\n"
-        f"printf '%s\\n' {shlex.quote(output)}\n"
-        f"exit {exit_code}\n",
-        encoding="utf-8",
-    )
+def _write_fake_bin(directory: Path, name: str, body: str) -> Path:
+    """PATH 上的假外部命令(tmux / nvidia-smi / ss);測試絕不呼叫真的那幾支。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    executable = directory / name
+    executable.write_text(f"#!/usr/bin/env bash\n{body}\n", encoding="utf-8")
     executable.chmod(0o755)
+    return executable
+
+
+def _write_fake_nvidia_smi(tmp_path: Path, output: str, exit_code: int = 0) -> None:
+    _write_fake_bin(
+        tmp_path,
+        "nvidia-smi",
+        f"printf '%s\\n' {shlex.quote(output)}\nexit {exit_code}",
+    )
 
 
 def _run_check_status(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """PATH 前置假 nvidia-smi;`--proc-root` 指向空目錄,不去讀真的 /proc。"""
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir(exist_ok=True)
     env = {
-        **os.environ,
+        **_shell_env(tmp_path),
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
     }
     return subprocess.run(
-        [sys.executable, str(SCRIPT), *args],
+        [sys.executable, str(SCRIPT), "--proc-root", str(proc_root), *args],
         cwd=str(REPO_ROOT),
         env=env,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=15,
         check=False,
     )
 
@@ -921,11 +928,16 @@ def test_wait_released_without_nvidia_smi_waits_on_process_exit(monkeypatch):
     assert clock.now >= 3
 
 
-def test_stop_timeout_env_override_and_fallback(capsys):
-    assert stop_servers._stop_timeout({}) == 120
-    assert stop_servers._stop_timeout({"AICODE_STOP_TIMEOUT": "30"}) == 30
-    assert stop_servers._stop_timeout({"AICODE_STOP_TIMEOUT": "abc"}) == 120
-    assert "AICODE_STOP_TIMEOUT" in capsys.readouterr().err
+def test_stop_timeout_comes_from_argv_with_a_fixed_default():
+    """等 VRAM 釋放的上限只有兩個來源:`--timeout` 與 repo 常數。壞值在解析階段
+    就 fail-loud,而不是靜靜退回預設值(以前殼層給錯字串只印一行警告)。"""
+    parser = stop_servers._parser()
+    assert stop_servers.DEFAULT_STOP_TIMEOUT == 120
+    assert parser.parse_args(["--scope", "all"]).timeout == 120
+    assert parser.parse_args(["--scope", "all", "--timeout", "30"]).timeout == 30
+    for bad in ("abc", "0", "-5"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--scope", "all", "--timeout", bad])
 
 
 def test_pane_pids_parses_tmux_output(monkeypatch):
@@ -935,7 +947,7 @@ def test_pane_pids_parses_tmux_output(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(
-        stop_servers.subprocess, "run", lambda *args, **kwargs: _Result()
+        stop_servers.process_env, "run", lambda *args, **kwargs: _Result()
     )
     assert stop_servers._pane_pids("codetrail-main") == {
         481939: "codetrail-main:main",
@@ -950,7 +962,7 @@ def test_pane_pids_empty_when_session_missing(monkeypatch):
         stderr = "no such session"
 
     monkeypatch.setattr(
-        stop_servers.subprocess, "run", lambda *args, **kwargs: _Result()
+        stop_servers.process_env, "run", lambda *args, **kwargs: _Result()
     )
     assert stop_servers._pane_pids("codetrail-main") == {}
 
@@ -964,7 +976,7 @@ def test_rollback_waits_for_vram_release(tmp_path, monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(
-        launch_servers.subprocess, "run", lambda *args, **kwargs: _Result()
+        launch_servers.process_env, "run", lambda *args, **kwargs: _Result()
     )
     monkeypatch.setattr(
         stop_servers, "_pane_pids", lambda session: {9: f"{session}:main"}
@@ -982,7 +994,163 @@ def test_rollback_waits_for_vram_release(tmp_path, monkeypatch):
         [],
         ["s-main"],
         {"main": "s-main", "aux": "s-aux"},
-        {"HOME": str(tmp_path)},
+        log_dir=tmp_path / "logs",
     )
 
-    assert waited == [({9: "s-main:main"}, 120)]
+    assert waited == [({9: "s-main:main"}, stop_servers.DEFAULT_STOP_TIMEOUT)]
+    assert waited[0][1] == 120
+
+
+# --------------------------------------------------------------------------
+# B-03 的三條契約:pane 一律經 exec choke point、pane 環境乾淨、
+# stop / status 只認 argv 與 repo 常數。全部離線(假 tmux / nvidia-smi / ss /
+# llama-server + tmp HOME),不碰真的服務。
+# --------------------------------------------------------------------------
+
+@pytest.mark.smoke
+def test_the_pane_runs_the_exec_choke_point_with_the_loader_argv(monkeypatch, tmp_path):
+    """tmux pane 的環境 = tmux server 的全域環境 + session 環境,launcher 的行程
+    環境管不到已經在跑的 daemon。所以 pane 裡最後跑的必須是
+    `deployment_profile.py exec <role>`(環境由它在 pane 內算),而且 launcher 收到的
+    loader 旗標要原封不動轉過去 —— 讓 pane 自己重讀一次檔案會把 argv 覆寫弄丟。
+    """
+    profile_path = _write_profile_fixture(tmp_path, "pane-fixture")
+    llama = tmp_path / "llama-server"
+    profile, args = _patch_launch_scaffolding(
+        monkeypatch, tmp_path,
+        "--scope", "main",
+        "--profile", str(profile_path),
+        "--llama-bin", str(llama),
+        "--main-gpu", "GPU-7",
+    )
+    monkeypatch.setattr(launch_servers, "_wait_for_health", lambda *a, **k: None)
+    monkeypatch.setattr(launch_servers, "_state_log_dir", lambda *a, **k: tmp_path / "logs")
+    calls: list[list[str]] = []
+    _fake_tmux(monkeypatch, calls)
+
+    launch_servers.launch(profile, ["main"], args)
+
+    session_cmd = next(cmd for cmd in calls if cmd[:2] == ["tmux", "new-session"])
+    assert session_cmd[4] == TMUX_SESSIONS["main"]  # session 名是 repo 常數
+    respawn = next(cmd for cmd in calls if cmd[:2] == ["tmux", "respawn-window"])
+    assert respawn[-1] == shlex.join([
+        sys.executable, str(REPO_ROOT / "deployment_profile.py"), "exec", "main",
+        "--profile", str(profile_path), "--llama-bin", str(llama), "--main-gpu", "GPU-7",
+    ])
+    # pane 命令裡不得直接出現 llama-server 的 argv(那條路繞過 exec 的環境邊界)。
+    assert "-ngl" not in respawn[-1]
+    assert "CUDA_VISIBLE_DEVICES" not in respawn[-1]
+
+
+@pytest.mark.smoke
+def test_the_exec_path_hands_llama_server_a_clean_environment(tmp_path):
+    """exec 是 llama-server 唯一真正被啟動的地方,也是最終環境的唯一決定點:
+    CodeTrail 的四個前綴、llama.cpp 自己的 `LLAMA_ARG_*`、繼承來的
+    `CUDA_VISIBLE_DEVICES` 全部剝掉;GPU 只由驗證過的 `deployment.json` 值重新輸出。
+    留著任何一個,pane 拿到的就不是設定檔說的那個 server。"""
+    dump = _write_fake_bin(tmp_path, "fake-llama-server", "env")
+    models = {}
+    for role in ("main", "embedding"):
+        gguf = tmp_path / f"{role}.gguf"
+        gguf.write_bytes(b"fixture")
+        models[role] = str(gguf)
+    _write_deployment(
+        tmp_path,
+        {
+            "main": {"model": models["main"], "gpu": "GPU-FILE"},
+            "embedding": {"model": models["embedding"]},
+        },
+        llama_bin=str(dump),
+    )
+    env = _shell_env(
+        tmp_path,
+        CUDA_VISIBLE_DEVICES="7",
+        LLAMA_ARG_THREADS="3",
+        OPENCODE_API_KEY="leftover-secret",
+        AICODE_MODEL="shell-model",
+        MARK="keep",
+    )
+
+    def _exec(role: str) -> str:
+        proc = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "deployment_profile.py"), "exec", role],
+            cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+            timeout=15, check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout
+
+    main_env = _exec("main")
+    embedding_env = _exec("embedding")
+
+    assert "CUDA_VISIBLE_DEVICES=GPU-FILE" in main_env  # 檔案說的那張卡
+    assert "CUDA_VISIBLE_DEVICES=7" not in main_env      # 繼承來的那一份不算數
+    assert "CUDA_VISIBLE_DEVICES" not in embedding_env   # 沒設就是不指定
+    for leaked in ("LLAMA_ARG_THREADS", "OPENCODE_API_KEY", "AICODE_MODEL",
+                   "AICODE_PROFILE", "AICODE_DEPLOYMENT_CONFIG"):
+        assert leaked not in main_env, leaked
+        assert leaked not in embedding_env, leaked
+    # 不是 CodeTrail 設定的變數照樣傳下去(PATH / HOME / 使用者自己的東西);
+    # 這條邊界刻意小:剝掉不該剝的會讓 llama-server 突然找不到 CUDA / 動態連結庫。
+    assert "MARK=keep" in main_env
+    assert f"HOME={tmp_path}" in main_env
+
+
+@pytest.mark.smoke
+def test_stop_and_status_use_argv_and_constants_not_the_shell(tmp_path):
+    """停止與狀態的三個舊殼層開關(session 名、預期 server 數)全部失效:
+    session 名是 repo 常數,數量是 `--expected`。殼層還設著舊名字時,使用者
+    最容易踩的就是「停了但沒停到」與「檢查通過但其實少一個 server」。"""
+    bin_dir = tmp_path / "bin"
+    tmux_log = tmp_path / "tmux.log"
+    _write_fake_bin(bin_dir, "tmux", f'printf "%s\\n" "$*" >> {shlex.quote(str(tmux_log))}\nexit 1')
+    _write_fake_bin(bin_dir, "ss", "exit 0")
+
+    def _fake_nvidia_smi(rows: str) -> None:
+        """PATH 上的假 nvidia-smi:只回答 compute-apps 查詢,`rows` 就是它看到的
+        llama-server 列表;空字串 = GPU 上沒有任何 process(什麼都不印)。其餘查詢
+        (VRAM 用量、GPU 盤點)一律沒有輸出。每個階段各寫一次:GPU 上有什麼由
+        那個階段自己決定,不是整條測試共用一份。"""
+        answer = f"printf '%s\\n' {shlex.quote(rows)}" if rows else ":"
+        _write_fake_bin(
+            bin_dir, "nvidia-smi",
+            "case \"$1\" in\n"
+            "  --query-compute-apps=pid,process_name,gpu_uuid,used_gpu_memory)\n"
+            f"    {answer} ;;\n"
+            "  *) : ;;\n"
+            "esac",
+        )
+
+    env = {**_shell_env(tmp_path), "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+    def _run(script: str, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / script), *args],
+            cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+            timeout=15, check=False,
+        )
+
+    # stop 階段:GPU 上沒有任何 process。假 tmux 說兩個 session 都不存在、假 ss 說
+    # 沒有 listener,GPU 上自然也不該還掛著 llama-server;掛著的話 stop 會走進基準
+    # 就有的「孤兒 process」最終盤點分支 —— 那不是這半段(session 名的來源)要驗的。
+    _fake_nvidia_smi("")
+    stop = _run("stop_servers.py", "--scope", "all")
+    assert stop.returncode == 0, stop.stderr
+    for session in TMUX_SESSIONS.values():
+        assert f"tmux session {session!r} does not exist" in stop.stdout
+    for dead in ("shell-main-session", "shell-generic-session", "shell-aux-session"):
+        assert dead not in stop.stdout + stop.stderr
+        assert dead not in tmux_log.read_text(encoding="utf-8")
+
+    # status 階段:四個 role 都在 GPU 上 —— 「預設 4 / --expected 5」要數的就是這四筆。
+    _fake_nvidia_smi(FOUR_LLAMA_SERVERS)
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir(exist_ok=True)
+    status = _run("check_status.py", "--proc-root", str(proc_root))
+    assert status.returncode == 0, status.stderr
+    # 殼層的 EXPECTED_LLAMA_SERVERS=99 沒有作用;預設仍是四個 role。
+    assert "偵測到 4 個不同的 llama-server PID（預期至少 4）" in status.stdout
+    assert "預期至少 99" not in status.stdout + status.stderr
+
+    tightened = _run("check_status.py", "--proc-root", str(proc_root), "--expected", "5")
+    assert "只偵測到 4 個不同的 llama-server PID（預期至少 5）" in tightened.stderr

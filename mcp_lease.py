@@ -601,7 +601,7 @@ def record_incident(
 ) -> None:
     """寫一筆 incident(JSONL,0600,零內容零路徑)。失敗靜默。
 
-    **這是正式寫入端。** 以前不是:那時候唯一會寫 incident 的是 OpenCode 的
+    **這是正式寫入端。** 以前不是:那時候唯一會寫 incident 的是舊世代前端的
     JS plugin,Python 這邊只保留一份「一行 incident 長什麼樣」的可執行定義,
     所以刻意取名底線開頭。CodeTrail 自己的聊天客戶端接手之後,假工具呼叫
     (`promise_without_call`)與壓縮停用(`compaction_stopped`)都由 Python

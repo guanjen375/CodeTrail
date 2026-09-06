@@ -66,7 +66,6 @@ def test_doctor_no_network_exits_clean(monkeypatch, tmp_path):
     gguf.write_text("not a real gguf")
     _write_profile_model(tmp_path, str(gguf))
     env = {**os.environ}
-    env.pop("OPENCODE_CONFIG", None)
     env["HOME"] = str(tmp_path)
     env["USERPROFILE"] = str(tmp_path)
     # HOME 隔離會關掉真實 user-site；MCP 已是 runtime required，因此把目前
@@ -732,7 +731,6 @@ def test_compaction_mode_absent_state_is_informational(monkeypatch, tmp_path):
     """沒有狀態檔 = 沒有接管,不能報成問題。"""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
-    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     r = doc.Result()
     doc.check_compaction_mode(r)
     assert not r.fails and not r.warns
@@ -1341,8 +1339,19 @@ def test_explicit_gate_and_implicit_diagnostic_are_separate(
     """Explicit failure blocks; an implicit failure is diagnostic-only."""
     root = tmp_path / "project"
     root.mkdir()
-    # 兩個殘留的環境變數都已刪除,擺在這裡是為了證明它們一律無效。
-    env = {"AICODE_TOOL_CANARY_WARN_ONLY": "1", "AICODE_MODEL": "shell-leftover"}
+    # 主模型只有一個來源:tmp HOME 的 deployment.json。`env` 交進去的只有「檔案在哪」
+    # (HOME 定位 deployment.json、XDG_CACHE_HOME 定位 canary 快取),不碰執行者
+    # 真正的 HOME / 快取;兩次呼叫都不給 explicit_model,模型必須從這份檔解析出來。
+    home = tmp_path / "home"
+    _write_profile_model(home, "/models/from-deployment-file.gguf")
+    # 兩個殘留的環境變數都已刪除,擺在這裡是為了證明它們一律無效:`shell-leftover`
+    # 不是檔案裡的模型,而 WARN_ONLY 也不會把 explicit 失敗放行成 0。
+    env = {
+        "HOME": str(home),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        "AICODE_TOOL_CANARY_WARN_ONLY": "1",
+        "AICODE_MODEL": "shell-leftover",
+    }
     protocol = canary.ProtocolEvidence("a" * 64, "b" * 64)
     monkeypatch.setattr(
         canary,

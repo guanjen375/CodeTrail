@@ -16,7 +16,8 @@
 - **smoke** ＝ 標 `@pytest.mark.smoke` 的測試：真實發生過的 bug 的 regression ＋ 無聲失敗風險的契約檢查。
   §2 的每個安全檢查點都必須在裡面（由 `tests/test_smoke_gate.py` 靜態守住）。整包目標 10 秒內。
 - **full** ＝ 整個 `tests/`。
-- 統一入口 `python3 scripts/run_tests.py`（無參數＝full，最多 16-shard 並行；帶任何 pytest 參數＝單行程逐字轉發）：
+- 統一入口 `python3 scripts/run_tests.py`（無參數＝full，最多 16-shard 並行；帶任何 pytest 參數＝單行程逐字轉發。
+  唯一的例外是 `--jobs N`：那是 runner 自己的旗標，在判斷形狀之前就被吃掉，不會轉發給 pytest）：
   - smoke：`python3 scripts/run_tests.py -m smoke`
   - full：`python3 scripts/run_tests.py`
 
@@ -80,7 +81,8 @@
 - `client_store` 的 session 檔——對話逐字含 NDA 內容:必須落在 state 目錄而不是被分析的
   repo(相對 `XDG_STATE_HOME` 與專案內的 state 目錄都要擋)、目錄 0700、檔 0600、
   讀寫兩端都拒 symlink 與 hard link、append 不得建出沒有 header 的檔、header 綁這個
-  專案與這個 session
+  專案與這個 session;選單的大綱只取本地**真實** user 訊息(不是摘要、不是工具輸出),
+  零 LLM、零寫入
 - `client_policy` 的兩個 policy——readonly 的判準是 `tools/list` 的 `readOnlyHint`
   (**只有 JSON true 才算唯讀**;`bool("false")` 是 True),不是寫死名單,所以漏加名單的
   新工具一樣被 deny;互動模式的六個 ask 工具沒核准就不得執行,核准框**完整顯示參數**
@@ -92,7 +94,10 @@
   畫面保留原文;懸空的 tool_call 必須補在**宣告它的那則 assistant 之後**(補在尾端會排出
   `assistant(tool_calls) → user → tool` 這種不合法的相鄰順序);只有工具結果的 text block
   進模型(`structuredContent` 只給 UI / eval);多個 Engine 共用同一個 MCP instance 時
-  **共用同一把模型鎖**(llama-server 單 slot,各自 new 一把等於沒有鎖)
+  **共用同一把模型鎖**(llama-server 單 slot,各自 new 一把等於沒有鎖);
+  `load_session` 是**唯一一次受信讀取**,模型歷史(compacted)與畫面歷史(原文)同源,
+  `adopt` 之前 engine 零改動(讀取當場就換,畫面建不出來時會留下半換狀態),
+  transcript 只以標記呈現 compaction
 - `client_engine` 的協作式取消——TUI 的 Ctrl-C 經 `client_turns` 走這條。串流每收一個
   chunk 看一次旗標、進行中的 MCP 呼叫要用 `begin_call` 登記給 `cancel()` 走完整取消契約
   (一步到位的 `call()` 只有 KeyboardInterrupt 一條路);中斷**不是答案**——歷史不得多出
@@ -113,7 +118,7 @@
   兩次 lookup 之間換掉那個名字就穿過去了。讀取端**不得**順手把目錄建出來
   (「沒有設定檔 = 沒有接管」要連目錄都不留痕跡)
 - `config.CLIENT_MAX_OUTPUT_TOKENS` 是**同一個數字**:實送的 `max_tokens`、context gate 的
-  保留額、壓縮門檻推導的 `max_output`。上限綁 `compaction_formula.UPSTREAM_OUTPUT_TOKEN_MAX`
+  保留額、壓縮門檻推導的 `max_output`。上限綁 `compaction_formula.OUTPUT_TOKEN_MAX`
   (公式會把它夾在那裡、把 0 翻成它),超出範圍一律 import 時 fail-loud——不然就是
   「送 65536、門檻按 32000 算」而且完全無聲
 - `client_turns` 的回合協調——`Engine` 自己看不到三個取消狀態,少一個就是「按了沒反應」:
@@ -129,25 +134,32 @@
   (含整份 patch),截斷過的核准等於沒有核准;框內 Esc / 拒絕只拒絕**這一個工具**(回合
   繼續),Ctrl-C 中斷**整輪**(核准框開著時也一樣);沒有 tty 一律拒絕並指向 headless
   `run`(靜默降級成另一種介面比擋下來更糟);輸入歷史檔逐字含使用者問過的問題,讀寫兩端
-  都走 `client_paths` 的 owner-only 防線;Textual 接管畫面後不得有任何直接 stdout / stderr
-- `opencode_migrate` ——唯一會寫使用者 OpenCode 設定的路徑,而且**只有使用者手動執行
-  `python3 opencode_migrate.py` 時才跑**(runtime 一個模組都不 import 它;`set_config`
-  不再順帶遷移)。只還原**現值仍等於 CodeTrail 寫入值**的鍵(既有 ownership 語意)、
-  只移除 path 對得上的 plugin 項、`mcp.codetrail` 與 `permission` 不動、沒有狀態檔也沒有
-  我們的 plugin 項的機器零寫入。ownership 狀態檔那一整半(受管鍵、`apply_mode`、
-  `_restore_native`、plugin entry、`effective_drift`、owner-only 狀態檔)住在這個檔裡;
-  **別份安裝的接管不動**——狀態檔記的 plugin 路徑不是本 repo 而且那個檔還在,就零寫入
-  只提示(路徑不在 = 本 repo 搬過家,照舊走搬家那條路)
-- `compaction_formula` ——門檻公式、canonical 規則文字與 `UPSTREAM_*` 常數的單一真值。
-  它是 runtime 的那一半,**不得 import `opencode_migrate`**;`config.CLIENT_MAX_OUTPUT_TOKENS`
-  的上限 fail-loud 綁的就是這裡的 `UPSTREAM_OUTPUT_TOKEN_MAX`
+  都走 `client_paths` 的 owner-only 防線;Textual 接管畫面後不得有任何直接 stdout / stderr;
+  切換 / 啟動接續必須**重播原始記錄**(文字、工具含未裁切的 structured、reasoning、壓縮標記),
+  工具結果按**宣告群組**配對(fallback call id 每個行程從 `call_1` 起算,以 id 反查會把結果
+  貼到幾十輪前那個 block 上),busy 或核准中不得換,失敗要保持 session 與畫面,
+  重播出來的 block 不登記給即時事件
+- 啟動核心的設定來源——GPU、llama-server 路徑、tmux session 名、逾時與 rollback 只來自
+  `deployment.json`、repo 常數與 argv;`~/start.sh` **不 export 也不 unset**,只轉發 `"$@"`。
+  tmux pane 一律經 `deployment_profile.py exec <role> <loader argv>`,最終環境由
+  `process_env.llama_server_env()` 決定(四前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES`
+  剝除;GPU 只由 `build_server_command` 那個 `env CUDA_VISIBLE_DEVICES=<驗證過的值>` 前綴
+  重新輸出)。pane 環境 = tmux server 全域環境 + session 環境,launcher 管不到既有 daemon,
+  所以邊界只能放在 pane 內真正 exec 的那一步;放寬它就是「使用者以為在跑 A、實際在跑 B」
+  而且完全無聲
+- `compaction_formula` ——門檻公式、canonical 規則文字與 `OUTPUT_TOKEN_MAX` /
+  `COMPACTION_RESERVE_TOKENS` / `MIN_PRESERVE_RECENT_TOKENS` 常數的單一真值。
+  `config.CLIENT_MAX_OUTPUT_TOKENS` 的上限 fail-loud 綁的就是這裡的 `OUTPUT_TOKEN_MAX`
 - 兩份安裝並存的共用檔——`compaction-stopped.jsonl` 與 `setconfig-last-transaction.json`
   在同一台機器上被兩個世代的 CodeTrail 共用,而且**不改名**(改名等於丟掉升級前記下的
   durable safety state)。隔離靠語意:ledger 只認自己的 schema、以 session 雜湊為鍵;
   restore 只接受「目標**全部**落在這一代會寫的四個檔」的 manifest,含任何其他目標就整份
   fail-loud、一個檔都不動(不退回逐檔模式、不部分還原——半套還原會把兩個世代拼在一起)。
   tool-call canary 的快取檔名帶 schema 號,兩世代各記各的、不再互相清空。
-  main runtime 永不讀、寫、刪 `compaction.json` / `opencode.json` / 任何 opencode plugin 路徑
+  main runtime 永不讀、寫、刪 `~/.config/codetrail/compaction.json`、`~/.config/opencode/*`
+  與任何舊 plugin 路徑;舊安裝的還原只走 `docs/troubleshooting.md` 升級段的唯一做法:把原安裝
+  路徑固定回 `a1682d5`、跑它自己的工具(沒有完全手動的路徑;工具無法確認就零寫入,設定與
+  狀態檔原樣留著)
 - `kb_cache` 的 embeddings 身分驗證（逐列 chunk id / generation / 內容雜湊 / model）
   與「重建不了就 fail-loud、絕不沿用舊向量」——放寬它就是靜默錯答
 - `knowledge_store` 的文件身分驗證（`metadata["document_sources"]`）與
@@ -166,25 +178,16 @@
   suite digest、live model fingerprint、case 順序與逐題 project-state digest，單題 timeout 不得
   讓已完成結果無聲消失。原始 NDA prompt、工具輸出、candidate answer 不得寫入 checked-in
   `eval/` 或 privacy-safe aggregate
-- `opencode_migrate` 的壓縮模式 ownership 狀態檔——owner-only(目錄 0700／檔 0600、拒
-  symlink 與 symlink 父目錄、dir-fd 原子寫入)、`digest` 必須涵蓋 `prior`(還原時會被
-  寫回設定的正是它)、狀態綁定單一目標 config、以及「沒有狀態檔 = 沒有接管」的
-  fail-closed 預設。切回 native 只能還原**仍有 ownership 證據**的值(JSON 型別嚴格
-  相等),放寬任何一條就是靜默改掉或刪掉使用者的 OpenCode 設定;
-  `MANAGED_COMPACTION_KEYS`(接管/還原)與 `CONTRACT_COMPACTION_KEYS`(值不符就
-  停用自動壓縮)是兩組,不得合併——把只影響 context 用量的鍵(`prune`)併進契約集合,
-  等於為它停掉整個 session 的壓縮,而且每次新增受管鍵都會讓舊狀態檔的安裝在
-  升級當天全部跳 config_drift;新增受管鍵時 **不得**由 runtime 或 contract check
-  自己補寫(沒有 ownership 紀錄就還原不回去),只能由 `unmanaged_keys` 報出來、
-  使用者重跑 set_config
-- `opencode_plugins/*.js` 現在是**inert stub**(單一 export、零副作用、只 toast 一次
-  「請執行遷移」)。上面那些壓縮 hook 契約(規則以 context 附加、`autocontinue=false`、
-  壓縮後核對、`messages.transform` 只動歷史 reasoning、fail-open)已經整組搬進
-  `client_compaction` / `client_engine`,由 `tests/test_client_compaction.py` 與
-  `tests/test_client_engine.py` 守。stub 的契約(`tests/test_repo_consistency.py` 靜態
-  釘住):每個檔恰好一個 export、只回傳 `event` 這一個 hook、只在 `session.created`
-  toast 一次、不得有 `tool.execute*` / `chat.*` / `experimental.*` 之類的 hook、不得
-  import / require 任何模組、不得讀檔或發網路請求;不要把邏輯加回 JS 那邊。
+- 三條靜態 gate(`tests/test_repo_consistency.py`)——**內容**的豁免只有逐檔的形狀例外,
+  沒有整檔、整目錄豁免:OpenCode gate 掃全文(含註解與 docstring),`opencode` 只准留在
+  子行程環境的剝除清單、eval 凍結資料的舊欄位名 / era 標記、反向檢查器的 pattern 與文件
+  升級段(升級段教那支已刪的遷移工具時必須指名 `a1682d5`);environ gate 只放行「檔案在哪
+  / 行程介面」,**任何**檔案讀 `AICODE_*` / `AI_CODE_*` / `CODETRAIL_*` / `OPENCODE_*`
+  都是 offender;spawn 只有 `process_env` 一個出口,`_SPAWN_CORE` 的四個檔各有理由,而
+  `deployment_profile.py` 唯一的 `os.execvpe` 必須交 `process_env.llama_server_env()`。
+  `docs/workflows/**/*.md` 的豁免(`_handoff_markdown`)只給 `.md` 的**內容** ——
+  同目錄的 `.py` / `.sh` / `.json` / `.toml` 照掃,把走訪整個剪掉等於開一條「把可執行檔
+  藏進交接目錄」的後門。
 
 任何重構碰到上面這些東西，**新加測試**（開發者寫測試檔，執行依 §1.2 權責），
 不要直接刪 / weaken / 移除檢查點。
@@ -211,8 +214,10 @@ module 層 `pytestmark` 換成單條 decorator，gate 都還是綠的。
   環境變數不行的理由:同一台機器可能有兩份安裝,另一份的 `~/start.sh` export 的
   同名變數會靜默蓋過設定檔 —— 症狀是「使用者以為在跑 A、實際在跑 B」,沒有任何
   錯誤訊息。允許讀的只有「檔案在哪 / 行程介面」那幾個(`HOME`、`XDG_*`、`PATH`、
-  `PYTHONIOENCODING`)與**啟動核心**(`deployment_profile` / launcher / `set_config`
-  的 start.sh 產生器),由 `tests/test_repo_consistency.py` 的 allowlist 靜態守住。
+  寫入 `PYTHONIOENCODING`、寫入 `PYTEST_*`),由 `tests/test_repo_consistency.py`
+  的 allowlist 靜態守住。**啟動核心也沒有例外**:GPU、llama-server 路徑、tmux session
+  名、逾時、rollback 與測試並行度全部改吃 `deployment.json` 與 argv,`~/start.sh` 只
+  轉發 `"$@"`。
 - 不要 `git commit` 沒被使用者確認過的修改。
 
 ---

@@ -50,9 +50,9 @@ import client_mcp  # noqa: E402
 import client_prompt  # noqa: E402
 import config as codetrail_config  # noqa: E402
 from mcp_contract import MCP_INSTRUCTIONS, PUBLIC_TOOL_NAMES, PUBLIC_TOOL_ORDER  # noqa: E402
-from model_resolution import resolve_main_model_from_env  # noqa: E402
+from model_resolution import resolve_main_model  # noqa: E402
 
-# 3:客戶端換掉 OpenCode,指紋輸入整組改變(不再有 opencode 設定 / 版本 /
+# 3:換成自帶的客戶端之後,指紋輸入整組改變(不再有舊世代前端的設定 / 版本 /
 # build prompt;改為客戶端版本與 system prompt digest)。舊快取項不得沿用。
 CANARY_VERSION = 3
 CACHE_SCHEMA = 3
@@ -80,9 +80,9 @@ TOOL_CANARY_TTL_SECONDS = codetrail_config.TOOL_CANARY_TTL_SECONDS
 def default_base_url() -> str:
     """主 llama-server URL:deployment profile 是唯一來源。
 
-    只交 HOME(定位 `~/.config/codetrail/deployment.json`),不交整份
-    `os.environ` —— 那個模組的 env overlay 是**啟動核心**的契約,把殼層殘留的
-    `AICODE_LLAMA_BASE_URL` 交進去,canary 就會去探測別台機器的 server。
+    只交 HOME(定位 `~/.config/codetrail/deployment.json`)。那個模組拿 environ
+    只為了找檔案,設定值一律來自檔案 —— canary 探測的必須就是客戶端等一下會用的
+    那一台 server。
     """
     import deployment_profile
 
@@ -249,8 +249,8 @@ def run_protocol_roundtrip(
     另一個會漂移的來源。
 
     **不傳 env**:`McpClient` 的 `env=` 是**覆寫**通道(呼叫端明確要求的值),
-    它在剝除之後才套用。把整份 `os.environ` 從那裡灌進去,等於把剛剝掉的
-    `AICODE_* / AI_CODE_* / CODETRAIL_* / OPENCODE_*` 原封不動加回去 ——
+    它在剝除之後才套用。把整份 `os.environ` 從那裡灌進去,等於把
+    `process_env.STRIPPED_ENV_PREFIXES` 剛剝掉的那幾組原封不動加回去 ——
     包含核准後的 `run_command` 子行程會繼承的那些機密。client 本來就會繼承
     這個行程的環境,不需要我們再遞一次。
     """
@@ -410,7 +410,7 @@ def _model_file_signature(props: Mapping[str, Any]) -> dict[str, Any]:
 def _client_prompt_digest(root: Path, env: Mapping[str, str]) -> str:
     """這一輪模型真的會看到的 system prompt 的身分。
 
-    以前這一格是 OpenCode 的 build prompt 與全域 AGENTS.md;現在 system prompt
+    以前這一格是舊世代前端的 build prompt 與全域 AGENTS.md;現在 system prompt
     由客戶端自組(內建基底規則 + MCP 路由圖 + 專案 AGENTS.md + lessons +
     使用者全域指示)。任何一段變了,模型的路由行為就可能不同,舊的 canary
     判定不得沿用。
@@ -516,7 +516,7 @@ def build_fingerprint(
 
 #: 快取檔名帶 schema 號。
 #:
-#: 為什麼:同一台機器上可能同時裝著兩個世代的 CodeTrail(舊的 OpenCode 世代是
+#: 為什麼:同一台機器上可能同時裝著兩個世代的 CodeTrail(舊世代前端那一份是
 #: ``CACHE_SCHEMA=2``、這一份是 3),而它們共用 ``~/.cache/codetrail``。讀到別的
 #: schema 會被當成空快取再**整檔覆寫**,於是兩邊每次啟動都互相清空對方的紀錄,
 #: 每一次 aicode 都要重跑一次幾十秒的 live canary。檔名分開之後兩份各記各的。
@@ -973,7 +973,7 @@ def _model_selection(env: Mapping[str, str], explicit: str) -> tuple[str, str]:
     """
     if explicit:
         return explicit, explicit
-    resolved = resolve_main_model_from_env(dict(env))
+    resolved = resolve_main_model(dict(env))
     if not resolved.ok or not resolved.model:
         raise CanaryError(
             "找不到主模型(deployment profile 沒有 main.model),且呼叫端未指定模型"

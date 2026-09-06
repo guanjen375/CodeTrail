@@ -5,7 +5,7 @@ CodeTrail 是一套本地 Code-RAG / RAG / MCP 後端,**以及它自己的聊天
 firmware binary、建立 patch,並只透過白名單執行驗證命令。
 
 使用者入口只有一個:終端客戶端 `aicode`(全螢幕 TUI)。
-**部署不需要 Node / npm / opencode-ai** —— 客戶端是純 Python,與 MCP server 走
+**部署不需要 Node / npm** —— 客戶端是純 Python,與 MCP server 走
 同一份 `requirements.txt`。CodeTrail 定位為**成熟私有部署版**，適合本機、離線、NDA / firmware /
 private repo 分析；**不打算公開發布**成 PyPI package、Docker image 或 SaaS。安全
 邊界有自動測試保護，但未做公開產品級安全審計。
@@ -82,20 +82,10 @@ aicode        # CodeTrail 終端客戶端;/tools 應列出 19 個工具
   工具名稱、參數與用途以本輪 tool schema 為唯一真值,重複一份只會增加每輪 prompt。
   要關掉專案內的那兩份,在 `~/.config/codetrail/client.json` 設
   `"project_instructions": false`。
-- **從舊版(OpenCode 世代)升級的機器**:CodeTrail 曾經寫過幾個值進
-  `~/.config/opencode/opencode.json`(壓縮受管值與兩個 plugin 項)。現在的 runtime
-  完全不碰那份設定,所以那些值**沒有人負責**——`compaction.auto=false` 會一直生效,
-  plugin 項指向的檔一旦被刪,你在其他專案開 OpenCode 都會失敗。解除它是**手動**
-  的一次性動作(有備份;只還原現值仍等於 CodeTrail 寫入值的鍵):
-
-  ```bash
-  cd <CODETRAIL_REPO>
-  python3 opencode_migrate.py --check   # 先看一眼,零寫入
-  python3 opencode_migrate.py           # 實際執行
-  ```
-
-  `python3 scripts/doctor.py` 也會唯讀偵測並印出同一組指令。同一台機器上還有另一份
-  CodeTrail 安裝時,接管紀錄若是那一份寫的,這裡一個 byte 都不會動(訊息會指向它)。
+- **從舊世代前端(`a1682d5` 之前)升級的機器**:那時候的 CodeTrail 會寫幾個值進另一個
+  前端的設定檔。現在的 runtime 完全不碰它,本版也不再附帶那支還原工具,所以那些值
+  **沒有人負責**。解除是一次性的手動程序,步驟見
+  [docs/troubleshooting.md 的升級段](docs/troubleshooting.md)(標題含 `a1682d5`)。
 
 ## 特別注意(首次部署最容易踩的)
 
@@ -143,15 +133,15 @@ node -v && npm -v    # 確認是目前 Node LTS，npm 可執行
 
 ### 1.2 CodeTrail 不需要 Node / npm
 
-舊版的日常入口是 OpenCode TUI,所以要先裝 `opencode-ai`。**現在不用了**:
+舊世代的日常入口是另一個 Node 前端的 TUI,所以要先裝它。**現在不用了**:
 CodeTrail 有自己的終端客戶端(`codetrail_chat.py`,由 `aicode` 啟動),純 Python、
 與 MCP server 共用同一份 `requirements.txt`。上一節裝 Node 只是為了其他用途,
 CodeTrail 本身不需要它。
 
-已經裝過 `opencode-ai` 的機器不必移除,但升級後請**手動**跑一次
-`python3 opencode_migrate.py` —— 它會把 CodeTrail 曾經寫進你 OpenCode 設定的東西
-還原並撤銷 plugin 註冊(有備份;只還原現值仍等於 CodeTrail 寫入值的鍵)。
-`./set_config.sh` **不會**順帶做這件事:runtime 一個模組都不碰 OpenCode 的設定。
+裝過舊前端的機器不必移除它。但**升級前**的 CodeTrail 曾經寫過幾個值進那個前端的
+設定檔,本版 runtime 完全不碰、也不再附帶還原工具,所以要照
+[docs/troubleshooting.md 的升級段](docs/troubleshooting.md)手動解除一次。
+`./set_config.sh` **不會**順帶做這件事。
 
 ### 1.3 安裝 CodeTrail Python 依賴
 
@@ -220,7 +210,9 @@ nvcc --version      # 應顯示 release 13.x
 
 ### 1.5 Build llama.cpp(CUDA)
 
-固定 clone 到 `~/llama.cpp` —— launcher 預設找 `~/llama.cpp/build/bin/llama-server`(放別處要設 `LLAMA_BIN`):
+固定 clone 到 `~/llama.cpp` —— launcher 預設找 `~/llama.cpp/build/bin/llama-server`
+(放別處就在 `./set_config.sh --llama-bin <絕對路徑>` 指定,它會寫進
+`~/.config/codetrail/deployment.json` 的 `llama_bin`):
 
 ```bash
 cd ~
@@ -246,7 +238,7 @@ cmake --build build --config Release -j
 
 ## 2. 下載 GGUF
 
-模型統一放 `~/models`(`set_config.sh` 預設掃這裡;放別處用 `MODELS_DIR` 或 `--models-dir` 指定)。
+模型統一放 `~/models`(`set_config.sh` 預設掃這裡;放別處用 `./set_config.sh --models-dir <目錄>` 指定)。
 
 ### 2.1 安裝 Hugging Face CLI + Xet 加速
 
@@ -350,9 +342,8 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 範本；使用者不需要取得維護者的 dotfiles。照本節執行會依自己的模型、GPU 與 Python
 產生一套相容設定，而不是複製維護者的私有路徑或 UUID。
 
-正常路徑只讀 `~/.config/codetrail/`。runtime 完全不讀 `~/.config/opencode/` —— 唯一會碰
-它的是手動執行的 `python3 opencode_migrate.py`(見「從舊版升級」),而那支工具會尊重
-`python3 opencode_migrate.py --config <path>` 指定的自訂位置。
+正常路徑只讀 `~/.config/codetrail/`。runtime 永遠不讀、不寫、不刪舊世代前端的設定
+(見「從舊世代前端升級」那一段,程序在 [docs/troubleshooting.md](docs/troubleshooting.md))。
 
 ### 3.1 `./set_config.sh` 做什麼
 
@@ -383,9 +374,9 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 | 產物 | 內容 |
 |---|---|
 | `~/.config/codetrail/models.json` | 主模型 registry key → GGUF 路徑(合併既有內容) |
-| `~/.config/codetrail/deployment.json` | deployment profile local override:四個 role 的模型與主模型參數(全部來自你的作答);重跑時**保留你手動加的取樣參數**(temperature/top-p/…與 no_mmap),其他未涵蓋鍵會警告已捨棄 |
+| `~/.config/codetrail/deployment.json` | deployment profile local override:四個 role 的模型、GPU(`services.<role>.gpu`)、主模型參數與驗證過的 `llama_bin`(全部來自你的作答);重跑時**保留你手動加的取樣參數**(temperature/top-p/…與 no_mmap),其他未涵蓋鍵會警告已捨棄 |
 | `~/.config/codetrail/client.json` | 壓縮模式與權限覆寫（mode `0600`）；**這一題有明確答案時才寫**，沒有這個檔就等於沒有接管 |
-| `~/start.sh` | 啟動腳本:寫死你的 GPU 配置、主模型與驗證過的 `LLAMA_BIN`,呼叫 `scripts/launch_servers.py`;支援 `status` / `stop` / `logs` / `help` 子命令,打錯子命令會提示而不是誤啟動 |
+| `~/start.sh` | 啟動腳本:把子命令與旗標原樣轉給 `scripts/launch_servers.py` / `stop_servers.py` / `check_status.py`;支援 `status` / `stop` / `logs` / `help` 子命令,打錯子命令會提示而不是誤啟動。它**不 export、不 unset 任何變數** —— GPU、主模型與驗證過的 llama-server 路徑都寫在 `deployment.json` |
 | `~/.config/codetrail/setconfig-last-transaction.json` | 只記最近一次 transaction 實際包含的 runtime 檔案，供 `--restore-last-backup` 整批還原；不是另一份設定來源 |
 
 結尾會自動印出**啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準;`~/start.sh` 啟動完成的最後一行也會提醒你用 `nvidia-smi` 稍微監控 GPU/VRAM(例如 `watch -n 1 nvidia-smi`),因為 set_config 不做整體 VRAM 可行性判定,也不會拿容量估算保證一定能啟動。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
@@ -404,6 +395,10 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 - MoE：main 使用 `--cpu-moe` / `--no-cpu-moe` / `--n-cpu-moe N`；VL 使用
   `--vl-cpu-moe` / `--no-vl-cpu-moe` / `--vl-n-cpu-moe N`。`N=0` 等同不 offload。
 - 網路：`--allow-remote` 才會開放區網連線；未指定只綁 `127.0.0.1`。
+- 路徑(選填,不給就用預設):`--llama-bin <路徑>` 指定 llama-server 執行檔(會轉成
+  絕對路徑寫進 `deployment.json` 的 `llama_bin`;預設沿用該檔既有的值,再退回
+  `~/llama.cpp/build/bin/llama-server`)、`--models-dir <目錄>` 指定要掃的 GGUF 目錄
+  (預設 `~/models`)。兩個都寫進設定檔,沒有等價的環境變數。
 - 壓縮模式：`--compaction-mode {codetrail,manual,off}`。**這一項不給不會報錯**——
   沒給時沿用 `~/.config/codetrail/client.json` 記錄的既有選擇，這台機器還沒選過
   就不寫 `client.json`。理由是「沒有那個檔＝沒有接管」是安全預設：舊的 `--yes`
@@ -418,15 +413,15 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 
 ```bash
 python3 deployment_profile.py validate
-python3 opencode_migrate.py --check
 ~/start.sh --dry-run
 ```
 
-前兩條應分別顯示 profile `valid`，以及 `opencode_migrate.py --check` 回報「沒有需要遷移
-的東西」（那支工具零寫入；有東西要處理時它會列出來，見「從舊版升級」）；dry-run 應正常
-列出四個 server command。三項都符合，就不必只因檔案日期較舊而重建。
+第一條應顯示 profile `valid`;dry-run 應正常列出四個 server command。兩項都符合，就不必
+只因檔案日期較舊而重建。（**本版新增** `deployment.json` 的 `llama_bin` 與
+`services.<role>.gpu` 兩種鍵:同一台機器上如果還有更舊的 checkout 共用
+`~/.config/codetrail/`，它的 loader 會對這兩個未知鍵 fail-loud —— 那是刻意的,不是設定壞掉。）
 
-若檢查要求補新欄位、Python / `LLAMA_BIN` 路徑已換、模型 / GPU / 主 n_ctx 要改，才重跑
+若檢查要求補新欄位、Python / llama-server 路徑已換、模型 / GPU / 主 n_ctx 要改，才重跑
 `./set_config.sh`。重跑會重新詢問硬體選擇；先記下現值或用 `~/start.sh --dry-run` 留存摘要，
 不要假設它會沿用上一次答案。
 
@@ -445,7 +440,7 @@ python3 opencode_migrate.py --check
 
 - **server log 從第一個 byte 就持續寫入** `~/.local/state/codetrail/logs/<role>.log`:launcher 先開好 tmux 視窗、接上 log 管線,才把 llama-server 放進去跑,所以即使因參數或模型錯誤**秒退**,完整錯誤也已在檔案裡;視窗本身也會帶著 exit code 留在原地(remain-on-exit)供檢視,`~/start.sh logs <role>` 直接看。
 - **載入進度**:大模型載入要幾分鐘,等待期間每 15 秒回報「載入中,已等待 N 秒(process 存活)」,不會看起來像當機;health 等待上限依主模型大小自動放大。llama-server process 一死就立即失敗,不會空等 timeout。
-- **失敗自動清理**:某個 role 啟動失敗時,launcher 自動關閉本次啟動的其他服務並釋放 port,然後告訴你「修正後直接重跑 `~/start.sh`」—— 不會留下半套 tmux 讓下次啟動卡 `session already exist`(要保留現場除錯:`AICODE_NO_ROLLBACK=1`)。
+- **失敗自動清理**:某個 role 啟動失敗時,launcher 自動關閉本次啟動的其他服務並釋放 port,然後告訴你「修正後直接重跑 `~/start.sh`」—— 不會留下半套 tmux 讓下次啟動卡 `session already exist`(要保留現場除錯:`~/start.sh --keep-on-failure`)。
 - **綁定**:預設四個 server 只綁 `127.0.0.1`;`--allow-remote` 設定過的才綁 `0.0.0.0`。
 
 | 預設 port | 角色 | 必要 |
@@ -458,6 +453,16 @@ python3 opencode_migrate.py --check
 會分四個 `llama-server` 是因為它一次只能載一顆 GGUF,不同角色用不同模式(`--jinja` / `--embedding --pooling cls` / `--embedding --pooling rank --reranking` / `--mmproj`)。`aicode` / `mcp_server.py` 都會硬性檢查三顆副模型已 ready。
 
 只重啟部分角色:`~/start.sh stop --scope aux` + `~/start.sh --scope aux`(只動三顆附屬、不重載主模型),或 `~/start.sh --scope main`(只起主模型)。
+
+要調整行為就加旗標(`~/start.sh` 原樣轉發,**沒有等價的環境變數**):
+
+| 旗標 | 作用 |
+|---|---|
+| `--keep-on-failure` | 啟動失敗時不自動清理,保留現場除錯 |
+| `--health-timeout N` | 覆寫 health 等待秒數(不給就依主模型大小自動放大) |
+| `stop --timeout N` | 等 process 退出 / VRAM 釋放的秒數上限(預設 120) |
+| `status --expected N` | 預期的 llama-server 數量(預設 4);`--strict` 才用 exit code 擋 |
+| `--main-model` / `--main-gpu` / `--aux-gpu` / `--embed-gpu` / `--rerank-gpu` / `--vl-gpu` / `--llama-bin` / `--profile` | 一次性覆寫 `deployment.json` 的對應值(見 §4.1) |
 
 > **tmux 你會用到的 4 個指令**(其他都不用學):
 > - `Ctrl-b d` —— 把目前 session 放背景,回到原本 shell
@@ -505,9 +510,10 @@ tmux ls
 
 ### 4.0 設定在哪裡
 
-CodeTrail 的設定**只有三個來源,全部是檔案**。沒有第四個 —— 客戶端與 MCP server
-不從環境變數取任何設定,殼層裡殘留的 `AICODE_*` / `AI_CODE_*` / `CODETRAIL_*`
-對它們一律無效(同一台機器有兩份安裝時,那正是「以為在跑 A、實際在跑 B」的機制)。
+CodeTrail 的設定**只有三個來源,全部是檔案**。沒有第四個 —— 客戶端、MCP server
+與啟動核心都不從環境變數取任何設定,殼層裡殘留的 `AICODE_*` / `AI_CODE_*` /
+`CODETRAIL_*` 對它們一律無效(同一台機器有兩份安裝時,那正是「以為在跑 A、實際在
+跑 B」的機制)。
 
 | 來源 | 位置 | 放什麼 | 誰改 |
 |---|---|---|---|
@@ -522,16 +528,20 @@ CodeTrail 的設定**只有三個來源,全部是檔案**。沒有第四個 —�
 被分析的專案裡的 `.codetrail/` **只放輸出**(`lessons.md`、metrics、cache),
 不放任何開關 —— 被分析的 repo 不可信。
 
-**唯一的例外是啟動核心**(`~/start.sh` → `scripts/launch_servers.py`):
-它的設定契約本來就是環境變數(`AICODE_MODEL`、`LLAMA_BIN`、`MAIN_GPU` 等),
-那條線沒有變,也不影響客戶端。
+**啟動核心走的是同一條線**(`~/start.sh` → `scripts/launch_servers.py` → tmux pane):
+主模型、GPU、llama-server 路徑、tmux session 名、逾時與 rollback 都只來自
+`deployment.json`、repo 常數與**旗標**;產生的 `~/start.sh` 一行 `export` / `unset`
+都沒有。每個 pane 跑的是 `python3 deployment_profile.py exec <role> …`,由它算出
+最終環境再 `exec` llama-server:CodeTrail 的四個前綴、llama.cpp 自己的
+`LLAMA_ARG_*`,以及繼承來的 GPU 選擇一律剝掉,GPU 只由設定檔驗證過的值重新指定。
+所以 tmux server 的全域環境、`.bashrc` 或另一份安裝的殼層殘留都影響不到啟動參數。
 
 ### 4.1 Deployment profile
 
 四個 server 共用同一份嚴格 deployment profile(單一事實來源;`aicode`、doctor、啟動前 preflight、status 與所有 launcher 都讀它)。優先序固定為:
 
 ```text
-launcher CLI / env > ~/.config/codetrail/deployment.json local override > 選用 profile > 安全相容預設
+launcher 旗標 > ~/.config/codetrail/deployment.json local override > 選用 profile > 安全相容預設
 ```
 
 安全基底 `safe-defaults` 直接內建在 `deployment_profile.py`(不宣稱硬體的向下相容預設,含 port、base_url 與附屬模型預設);`set_config.sh` 產生的 `~/.config/codetrail/deployment.json` 疊在上面。要做一次性實驗設定,在 `deployment.json` 的 `profile` 欄位填一個絕對路徑 `.json` profile
@@ -541,13 +551,14 @@ launcher CLI / env > ~/.config/codetrail/deployment.json local override > 選用
 
 ```bash
 cd <CODETRAIL_REPO>
-# 以下是**啟動核心**(`~/start.sh` → launcher)的介面,它的設定契約就是環境變數。
-# 客戶端與 MCP 不讀這些:它們的設定只來自 `~/.config/codetrail/` 底下那三個檔。
-AICODE_MODEL=<CODE_MODEL> \
-MAIN_GPU=<主模型_GPU_UUID_或_INDEX> \
-AUX_GPU=<附屬模型_GPU_UUID_或_INDEX> \
+# 啟動核心的介面就是這些旗標,值的來源是 deployment.json;沒有等價的環境變數。
 python3 scripts/launch_servers.py --scope all --dry-run   # 先看最終參數;不啟動、不連網
-                                                          # EMBED_GPU / RERANK_GPU / VL_GPU 可個別覆寫
+
+# 一次性覆寫(不改設定檔):主模型與 GPU 都有自己的旗標
+python3 scripts/launch_servers.py --scope all --dry-run \
+    --main-model <CODE_MODEL> \
+    --main-gpu <主模型_GPU_UUID_或_INDEX> \
+    --aux-gpu <附屬模型_GPU_UUID_或_INDEX>   # --embed-gpu / --rerank-gpu / --vl-gpu 可個別指定
 
 python3 scripts/launch_servers.py --scope all             # 啟動四個 tmux server,嚴格驗證 role / GPU / model / ctx / health
 python3 scripts/check_status.py --strict
@@ -560,16 +571,22 @@ python3 scripts/doctor.py                                 # doctor 讀 ~/.config
 {
   "schema_version": 1,
   "profile": "defaults",
+  "llama_bin": "/absolute/path/to/llama-server",
   "services": {
-    "main": { "model": "<CODE_MODEL>" }
+    "main": { "model": "<CODE_MODEL>", "gpu": "<主模型_GPU_UUID_或_INDEX>" }
   }
 }
 ```
 
-所有 service 都有同級 `model`、`port`、`base_url`、`bind`(`local` 預設只綁 127.0.0.1 / `all-interfaces` 綁 0.0.0.0)、`gpu_role`、`ctx`、`batch`、`ubatch`、`parameters`;VL 另外有 `mmproj`。模型欄只接受 registry key 或 GGUF 絕對路徑,參數只接受 schema allowlist(含 embedding / reranker 專用的 `cache_ram` → `--cache-ram`，預設 `0`;main / vl 專用的 `cpu_moe` → `--cpu-moe` 與部分 offload 的 `n_cpu_moe` → `--n-cpu-moe`(同一 role 兩鍵互斥;embedding / reranker 一律拒絕),以及 `gpu_layers: "auto"`、`fit`、`fit_target`、`parallel`),沒有 raw shell `extra_args`;JSON 不會被 `source` / `eval`。schema 與 GPU precedence 詳見 [docs/deployment-profiles.md](docs/deployment-profiles.md)。可離線查看合併結果:
+頂層 `llama_bin` 是選填的 llama-server 執行檔絕對路徑(不填就是
+`~/llama.cpp/build/bin/llama-server`);每個 service 的 `gpu` 也是選填的 GPU selector
+(UUID 或 index,不填就不指定卡)。這兩個鍵就是舊版靠殼層變數傳的那兩件事。
+
+所有 service 都有同級 `model`、`port`、`base_url`、`bind`(`local` 預設只綁 127.0.0.1 / `all-interfaces` 綁 0.0.0.0)、`gpu_role`、`gpu`、`ctx`、`batch`、`ubatch`、`parameters`;VL 另外有 `mmproj`。模型欄只接受 registry key 或 GGUF 絕對路徑,參數只接受 schema allowlist(含 embedding / reranker 專用的 `cache_ram` → `--cache-ram`，預設 `0`;main / vl 專用的 `cpu_moe` → `--cpu-moe` 與部分 offload 的 `n_cpu_moe` → `--n-cpu-moe`(同一 role 兩鍵互斥;embedding / reranker 一律拒絕),以及 `gpu_layers: "auto"`、`fit`、`fit_target`、`parallel`),沒有 raw shell `extra_args`;JSON 不會被 `source` / `eval`。schema 與 GPU precedence 詳見 [docs/deployment-profiles.md](docs/deployment-profiles.md)。可離線查看合併結果:
 
 ```bash
-AICODE_MODEL=<CODE_MODEL> python3 deployment_profile.py show
+python3 deployment_profile.py show                        # 目前的有效設定
+python3 deployment_profile.py --main-model <CODE_MODEL> show   # 只在這一次覆寫主模型
 ```
 
 `config.RERANK_FALLBACK_POLICY`(repo 常數;改它是改 repo)只控制啟動後 reranker 呼叫失敗時的行為;啟動前 preflight 仍要求 reranker server ready:
@@ -597,7 +614,7 @@ cat > ~/.config/codetrail/models.json <<'EOF'
 EOF
 ```
 
-registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf` 路徑。多 shard 模型指向第一片即可。也可以跳過 registry 直接把 `AICODE_MODEL` 設絕對路徑,但 registry 比較好維護。附屬模型不需要 registry:`set_config.sh` 直接把絕對路徑寫進 deployment.json。
+registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf` 路徑。多 shard 模型指向第一片即可。也可以跳過 registry 直接把 `services.main.model` 寫成 GGUF 絕對路徑,但 registry 比較好維護。附屬模型不需要 registry:`set_config.sh` 直接把絕對路徑寫進 deployment.json。
 
 ### 4.3 客戶端設定(`~/.config/codetrail/client.json`)
 
@@ -693,6 +710,13 @@ aicode
 啟動前置(profile 驗證、主模型、n_ctx 觀測、ctx 容量閘、lessons、附屬 server、工具健檢)
 的輸出會留在對話區第一則,所以 TUI 接管畫面之後仍然看得到。
 
+接續舊對話時(`-c`、`--session <id>`,或在 TUI 內用 `/session`),畫面會把那一段
+**原始記錄**重播出來:你問過的話、模型的回答與 thinking、每一次工具呼叫的參數、狀態與
+結果。壓縮過的對話也一樣看得到壓縮**之前**的原文,摘要只在原文之後多一個可展開的
+標記(模型看到的仍然是壓縮後的歷史 —— 畫面與模型視野是兩件事)。TUI 內的
+`/sessions` 列出這個專案的既有對話、`/session` 開選單挑一段,細節見
+[docs/basic-usage.md](docs/basic-usage.md#7-切換與接續對話)。
+
 要讓模型讀專案外的附件(`~/Downloads` 的 log / 截圖 / spec)就多加一個開關:
 
 在 `~/.config/codetrail/client.json` 設:
@@ -712,7 +736,7 @@ aicode
 請用工具 list_dir 看當前目錄結構,挑出 entry point、主要模組和測試目錄,簡單整理。
 ```
 
-模型應該會透過 CodeTrail MCP 呼叫 `list_dir` 讀真實目錄,然後回給你整理結果。工具名是**裸名**(沒有 `codetrail_` 前綴——那是 OpenCode 加的)。
+模型應該會透過 CodeTrail MCP 呼叫 `list_dir` 讀真實目錄,然後回給你整理結果。工具名是**裸名**(沒有 `codetrail_` 前綴——那是舊世代前端加的)。
 
 第一個請求**首字延遲(TTFT)**:
 

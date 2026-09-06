@@ -8,7 +8,7 @@ context_budget — CodeTrail 內部對 llama.cpp llama-server 呼叫的 context 
 1. context overflow 是正確性問題,不是只是速度問題。所以這裡的硬性 gate 會
    直接拒絕送出超出 effective_num_ctx*hard_threshold 的 prompt。
 2. 攔 CodeTrail 自己送出去的 /completion 與 /v1/chat/completions 兩條路。
-   OpenCode TUI 直接打 llama-server,不會經過這裡。
+   直接打 llama-server 的東西(手動 curl、別的客戶端)不會經過這裡。
 3. token 估算先用 CHARS_PER_TOKEN heuristic;llama-server 回的
    tokens_evaluated / usage.prompt_tokens 會被收下來給下一次校正(下版)。
 4. telemetry 只寫 metadata(count、模型名、context 設定、速度、是否 trim 等),

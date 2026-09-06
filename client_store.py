@@ -24,7 +24,7 @@ import stat
 import time
 
 import client_paths
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,10 @@ MAX_SESSION_BYTES = 64 * 1024 * 1024
 MAX_RECORD_BYTES = 8 * 1024 * 1024
 
 _SESSION_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$")
+
+#: 大綱裡一則問題最多顯示幾個字元。選單一列要在 80 欄的 SSH 終端看得完;
+#: 超過就加 `…`,**不另存**一份縮寫(session 檔是唯讀的真值)。
+OUTLINE_MAX_CHARS = 80
 
 
 class SessionStoreError(RuntimeError):
@@ -102,10 +106,70 @@ class SessionInfo:
     updated: float
     title: str
     turns: int
+    #: 選單那一列要顯示的東西(見 :func:`session_outline`)。全部有預設值:
+    #: 既有呼叫端(headless `sessions`、`--continue`)只用得到上面六欄。
+    first_prompt: str = ""
+    last_prompt: str = ""
+    messages: int = 0
+    tool_calls: int = 0
+    compactions: int = 0
 
 
 def _store_error(message: str) -> SessionStoreError:
     return SessionStoreError(message)
+
+
+def _outline_text(value: Any) -> str:
+    """把一則訊息壓成選單看得完的一行。"""
+    if not isinstance(value, str):
+        return ""
+    folded = " ".join(value.split())
+    if len(folded) <= OUTLINE_MAX_CHARS:
+        return folded
+    return folded[: OUTLINE_MAX_CHARS - 1] + "…"
+
+
+def session_outline(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """從 session 記錄算出「這段對話長什麼樣」。
+
+    **純函式:零 LLM、零寫入。** 選單那一列不得為了好看去跑一次模型(那是一次
+    多餘的 NDA 內容出門機會,而且開一次選單要等好幾秒),也不得回頭改寫 session
+    檔 —— 那份檔是唯讀的真值。
+
+    大綱只認**使用者自己送的**訊息:壓縮注入的摘要(``synthetic``)與工具結果
+    都不是問題。拿它們當大綱的話,選單上會出現「[先前對話摘要]」開頭那一行,或
+    一段工具輸出 —— 而使用者是靠自己問過的第一句話認出這段對話的。
+    """
+    prompts: list[str] = []
+    messages = 0
+    tool_calls = 0
+    compactions = 0
+    for record in records:
+        kind = record.get("type")
+        if kind == "compaction":
+            compactions += 1
+            continue
+        if kind != "message":
+            continue
+        messages += 1
+        role = record.get("role")
+        if role == "assistant":
+            calls = record.get("tool_calls")
+            if isinstance(calls, Sequence) and not isinstance(calls, (str, bytes)):
+                tool_calls += len(calls)
+            continue
+        if role != "user" or record.get("synthetic"):
+            continue
+        text = _outline_text(record.get("content"))
+        if text:
+            prompts.append(text)
+    return {
+        "first_prompt": prompts[0] if prompts else "",
+        "last_prompt": prompts[-1] if prompts else "",
+        "messages": messages,
+        "tool_calls": tool_calls,
+        "compactions": compactions,
+    }
 
 
 def _open_private_dir(
@@ -360,9 +424,15 @@ class SessionStore:
             updated=float(updated or 0.0),
             title=str(header.get("title", "") or ""),
             turns=turns,
+            **session_outline(records),
         )
 
-    def list_sessions(self) -> list[SessionInfo]:
+    def list_sessions(self, limit: int | None = None) -> list[SessionInfo]:
+        """最近更新的排前面。``limit`` 是**排序之後**才切的(選單只顯示前幾筆)。
+
+        先切再排的話,選單上出現的是目錄順序的前 N 筆 —— 使用者最近在用的那一段
+        可能根本不在清單裡。
+        """
         if not self.directory.is_dir():
             return []
         out: list[SessionInfo] = []
@@ -377,6 +447,8 @@ class SessionStore:
             except SessionStoreError:
                 continue
         out.sort(key=lambda item: item.updated, reverse=True)
+        if limit is not None:
+            out = out[: max(0, int(limit))]
         return out
 
     def delete(self, session_id: str) -> bool:
@@ -449,7 +521,7 @@ class EphemeralSessionStore:
         except KeyError:
             raise SessionStoreError(f"session 不存在: {session_id}") from None
 
-    def list_sessions(self) -> list[SessionInfo]:
+    def list_sessions(self, limit: int | None = None) -> list[SessionInfo]:
         return []
 
     def delete(self, session_id: str) -> bool:

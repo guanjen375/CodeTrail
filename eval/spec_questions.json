@@ -4,9 +4,9 @@
     "question": "CodeTrail 預設使用哪一個主聊天 / 程式推導模型？",
     "expected": {
       "refs": ["spec", "模型"],
-      "keywords": ["不內建", "AICODE_MODEL", "CODE_MODEL"],
-      "gold_chunks": ["MODEL", "AICODE_MODEL"],
-      "gold_evidence": ["不內建", "AICODE_MODEL", "CODE_MODEL"]
+      "keywords": ["不內建", "main.model", "CODE_MODEL"],
+      "gold_chunks": ["MODEL", "deployment.json"],
+      "gold_evidence": ["不內建", "main.model", "CODE_MODEL"]
     }
   },
   {
@@ -24,7 +24,7 @@
     "question": "Patch 功能預設是開啟還是關閉的？如何啟用？",
     "expected": {
       "refs": ["spec", "patch"],
-      "keywords": ["停用", "AI_CODE_PATCH"],
+      "keywords": ["停用", "PATCH_ENABLED"],
       "gold_chunks": ["PATCH_ENABLED", "patch"],
       "gold_evidence": ["預設停用", "False"]
     }

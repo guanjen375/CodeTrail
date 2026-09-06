@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -14,7 +13,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from deployment_profile import ProfileError, ServiceProfile, load_effective_profile  # noqa: E402
+from deployment_profile import (  # noqa: E402
+    ProfileError,
+    ServiceProfile,
+    add_loader_arguments,
+    load_effective_profile,
+    loader_kwargs,
+)
 from deployment_status import (  # noqa: E402
     Inspection,
     inspect_deployment,
@@ -24,13 +29,20 @@ from deployment_status import (  # noqa: E402
 )
 
 
+def _positive_int(value: str) -> int:
+    """argparse 的正整數:`--expected 0` 要在解析階段就被擋下。"""
+    if not value.isdecimal() or int(value) < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    return int(value)
+
+
 def _snapshot_reader(path: Path) -> Callable[[ServiceProfile], tuple[dict[str, Any] | None, dict[str, Any] | None]]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise ProfileError(f"invalid AICODE_STATUS_SNAPSHOT {path}: {exc}") from exc
+        raise ProfileError(f"invalid --snapshot {path}: {exc}") from exc
     if not isinstance(data, dict) or set(data) - {"main", "embedding", "reranker", "vl"}:
-        raise ProfileError("AICODE_STATUS_SNAPSHOT must contain only main/embedding/reranker/vl objects")
+        raise ProfileError("--snapshot must contain only main/embedding/reranker/vl objects")
 
     def read(service: ServiceProfile):
         item = data.get(service.role) or {}
@@ -91,18 +103,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Identify and verify main/embedding/reranker/VL llama-server processes"
     )
     parser.add_argument("--strict", action="store_true", help="fail on missing, unhealthy, wrong-GPU, or wrong-model roles")
-    parser.add_argument("--profile", help="profile name or absolute JSON profile path")
     parser.add_argument("--no-network", action="store_true", help="skip /health and /props requests")
+    parser.add_argument(
+        "--expected", type=_positive_int, default=4,
+        help="預期至少有幾個不同的 llama-server PID(預設 4 = 四個 role)",
+    )
+    # 隱藏旗標:契約測試用來把 /proc 與 /health 換成 fixture,不碰真實機器。
+    parser.add_argument("--proc-root", help=argparse.SUPPRESS)
+    parser.add_argument("--snapshot", help=argparse.SUPPRESS)
+    add_loader_arguments(parser)
     args = parser.parse_args(argv)
     try:
-        expected_raw = os.environ.get("EXPECTED_LLAMA_SERVERS") or "4"
-        if not expected_raw.isdecimal() or int(expected_raw) < 1:
-            raise ProfileError("EXPECTED_LLAMA_SERVERS must be a positive integer")
-        expected = int(expected_raw)
-        profile = load_effective_profile(profile=args.profile)
+        expected = args.expected
+        profile = load_effective_profile(**loader_kwargs(args))
         processes, gpu_error = query_gpu_processes()
-        proc_root = Path(os.environ.get("AICODE_STATUS_PROC_ROOT") or "/proc")
-        snapshot = (os.environ.get("AICODE_STATUS_SNAPSHOT") or "").strip()
+        proc_root = Path(args.proc_root or "/proc")
+        snapshot = (args.snapshot or "").strip()
         server_reader = None
         if not args.no_network:
             server_reader = _snapshot_reader(Path(snapshot)) if snapshot else None
@@ -114,7 +130,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         inspection = inspect_deployment(
             profile,
             processes,
-            environ=os.environ,
             cmdline_reader=lambda pid: read_proc_cmdline(pid, proc_root),
             server_reader=server_reader,
             gpu_inventory=inventory,

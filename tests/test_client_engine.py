@@ -1130,6 +1130,99 @@ def test_a_failed_new_session_keeps_the_current_conversation(engine_factory):
     assert engine.messages == before and engine.session_id == session
 
 
+def test_load_session_leaves_the_engine_untouched_and_adopt_switches_atomically(engine_factory):
+    """讀一段對話**不得**動到 engine;換過去是 adopt 的一次原子動作。
+
+    畫面要先拿 transcript 把 widget 建好,建不出來就整個不換。讀取當場就換掉
+    engine 的話,失敗會留下「engine 已經在新對話、畫面還是舊那段」的狀態:使用者
+    對著舊畫面問下一題,那一題被寫進另一段對話,而畫面上完全看不出來。
+    """
+    store = client_store.SessionStore(engine_factory.root)
+    engine = engine_factory(store=store)
+    other = store.create()
+    store.append(other, {"type": "message", "role": "user", "content": "另一段的問題"})
+    store.append(other, {"type": "message", "role": "assistant", "content": "另一段的回答"})
+    engine.messages = [{"role": "user", "content": "現在這一段"}]
+    engine.store_error = "OSError: earlier"
+    current = engine.session_id
+
+    snapshot = engine.load_session(other)
+    assert engine.session_id == current
+    assert engine.messages == [{"role": "user", "content": "現在這一段"}]
+    assert engine.store_error == "OSError: earlier"
+    assert engine.resumed_snapshot is None
+    assert [m["content"] for m in snapshot.messages] == ["另一段的問題", "另一段的回答"]
+    assert [m["content"] for m in snapshot.transcript] == ["另一段的問題", "另一段的回答"]
+    assert snapshot.session_id == other and snapshot.compactions == 0
+
+    engine.adopt(snapshot)
+    assert engine.session_id == other
+    assert [m["content"] for m in engine.messages] == ["另一段的問題", "另一段的回答"]
+    # store_error 是**這個** session 的事:上一段寫不進去不代表這一段也寫不進去。
+    assert engine.store_error is None
+    assert engine.resumed_snapshot is snapshot
+    # 換上來的是複本:之後的對話不得回頭改到畫面還在用的那一份。
+    engine.messages[0]["content"] = "被改過"
+    assert snapshot.messages[0]["content"] == "另一段的問題"
+    # resume = load + adopt,而且把快照交出去(啟動時接續的畫面要重播它)。
+    assert engine.resume(other).transcript == snapshot.transcript
+
+
+def test_the_snapshot_model_history_is_compacted_while_the_transcript_keeps_the_originals(
+    engine_factory,
+):
+    """同一次讀取要產出兩份:模型看壓縮後的、畫面看壓縮前的原文。
+
+    模型那一份不尊重壓縮切點的話,重開一個壓縮過的對話會把整段原始歷史再吃回
+    context(壓縮等於白做);畫面那一份若也只剩摘要,使用者就再也調不出壓縮前
+    問過什麼、工具回了什麼 —— 而那段對話明明還在檔案裡。壓縮本身只以一個標記
+    呈現:把 tail 再畫一次的話,同一段問答在畫面上會出現兩次。
+    """
+    import client_compaction
+
+    store = client_store.SessionStore(engine_factory.root)
+    engine = engine_factory(store=store)
+    session = engine.session_id
+    originals = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    for message in originals:
+        store.append(session, {"type": "message", **message})
+    engine.messages = [dict(message) for message in originals]
+    # 真的壓一次:replace_history 寫的就是 runtime 會寫進 session 檔的那一筆。
+    engine.replace_history(
+        [
+            {
+                "role": "user",
+                "content": f"{client_compaction.SUMMARY_PREFIX}\n這段對話的摘要",
+                "synthetic": True,
+            },
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2"},
+        ]
+    )
+    store.append(session, {"type": "message", "role": "user", "content": "q3"})
+
+    snapshot = engine.load_session(session)
+    assert [m.get("content") for m in snapshot.messages] == [
+        f"{client_compaction.SUMMARY_PREFIX}\n這段對話的摘要", "q2", "a2", "q3",
+    ]
+    assert [r.get("type") or r.get("role") for r in snapshot.transcript] == [
+        "user", "assistant", "user", "assistant", "compaction", "user",
+    ]
+    marker = snapshot.transcript[4]
+    assert marker["summary"] == "這段對話的摘要"
+    # dropped = 當時的模型歷史長度 − 逐字保留的則數,與 Compactor._replace 的 len(head) 同數。
+    assert marker["dropped"] == 2 and marker["kept"] == 2
+    assert snapshot.compactions == 1
+    # tail 不重畫:q2 / a2 在畫面歷史裡各只出現一次。
+    contents = [r.get("content") for r in snapshot.transcript]
+    assert contents.count("q2") == 1 and contents.count("a2") == 1
+
+
 def test_a_malformed_compaction_record_does_not_half_switch_the_session(engine_factory):
     """id 換了、messages 還是舊對話:下一題會把舊對話寫進新 session。"""
     engine = engine_factory(store=_FlakyStore())

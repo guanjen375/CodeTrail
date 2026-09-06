@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""Strict, stdlib-only deployment profile loader for CodeTrail llama-server roles.
+"""Strict deployment profile loader for CodeTrail llama-server roles.
 
+No third-party dependency: stdlib plus `process_env`(itself stdlib-only), which
+owns the environment every child process — including the exec'd llama-server — gets.
 JSON is treated as data only.  The loader never sources or evaluates profile
 content, and server commands are built from a closed parameter allowlist.
+
+設定的來源只有兩個:`~/.config/codetrail/deployment.json`(與它選的 profile 檔)
+與 argv。這個模組**不從環境變數取任何設定** —— `environ` 參數只拿來定位檔案
+(`HOME` / `USERPROFILE`)。同一台機器上可能有兩份安裝,另一份 `~/start.sh` 設的
+同名變數會靜默蓋過設定檔,而症狀是「使用者以為在跑 A、實際在跑 B」。
 """
 from __future__ import annotations
 
@@ -12,12 +19,21 @@ import os
 import re
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
+
+import process_env
 
 ROLES = ("main", "embedding", "reranker", "vl")
+
+#: llama-server 執行檔的最後手段預設(檔案沒寫、argv 沒給時)。
+DEFAULT_LLAMA_BIN = "~/llama.cpp/build/bin/llama-server"
+
+#: tmux session 名是 repo 常數,不是設定:launcher / stop / status / set_config
+#: 必須指同一組,否則「啟動的那一份」與「停掉的那一份」會是兩個 session。
+TMUX_SESSIONS = {"main": "codetrail-main", "aux": "codetrail-rag"}
 
 _TOP_LEVEL_KEYS = {
     "schema_version",
@@ -28,7 +44,7 @@ _TOP_LEVEL_KEYS = {
     "hardware",
     "services",
 }
-_LOCAL_TOP_LEVEL_KEYS = {"schema_version", "profile", "services"}
+_LOCAL_TOP_LEVEL_KEYS = {"schema_version", "profile", "services", "llama_bin"}
 _SERVICE_KEYS = {
     "model",
     "mmproj",
@@ -36,6 +52,7 @@ _SERVICE_KEYS = {
     "base_url",
     "bind",
     "gpu_role",
+    "gpu",
     "ctx",
     "batch",
     "ubatch",
@@ -72,25 +89,6 @@ _BARE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,191}$")
 _GPU_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:,\-]{0,255}$")
 _CACHE_TYPES = {"f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}
 _VERIFICATION_VALUES = {"verified", "unverified"}
-_EXTERNAL_PROVIDER_PREFIXES = {
-    "anthropic",
-    "aws",
-    "azure",
-    "bedrock",
-    "cohere",
-    "deepseek",
-    "google",
-    "groq",
-    "mistral",
-    "mistral.ai",
-    "ollama",
-    "openai",
-    "openrouter",
-    "perplexity",
-    "together",
-    "vertex",
-    "xai",
-}
 
 # These paths preserve the old launcher layout when models.json has no entry.
 # They live here (not in config, launchers, or README), so one resolver owns them.
@@ -200,6 +198,23 @@ class ServiceProfile:
 
 
 @dataclass(frozen=True)
+class LauncherOverrides:
+    """啟動核心的 argv 覆寫。**只有這幾格**能蓋過 `deployment.json`。
+
+    以前這一層是三十幾個環境變數疊成的 overlay。改成 argv 之後,「誰覆寫了什麼」
+    在 `ps` 上看得見,而且另一份安裝的 `~/start.sh` 再也蓋不到。
+    `gpus` 的鍵是 role 名加上 `"aux"`(套到三個附屬角色裡沒有自己那格的)。
+    """
+
+    main_model: str | None = None
+    main_ctx: int | None = None
+    main_batch: int | None = None
+    main_ubatch: int | None = None
+    gpus: Mapping[str, str] = field(default_factory=dict)
+    llama_bin: str | None = None
+
+
+@dataclass(frozen=True)
 class DeploymentProfile:
     name: str
     description: str
@@ -208,6 +223,12 @@ class DeploymentProfile:
     services: dict[str, ServiceProfile]
     selected_profile: str
     local_override: Path | None
+    #: llama-server 執行檔的絕對路徑:argv > `deployment.json` 的 `llama_bin` > 預設。
+    llama_bin: str = ""
+    #: 明確指定的 registry 檔(set_config 驗證用的暫存檔);None = `~/.config/codetrail/models.json`。
+    #: 一路交到 `resolve_model_reference` / `build_server_command` / `inspect_deployment`,
+    #: 不再有第二條「從環境再查一次」的路。
+    registry_file: Path | None = None
 
     def service(self, role: str) -> ServiceProfile:
         try:
@@ -227,6 +248,29 @@ def _expanduser(value: str, where: str) -> Path:
         return Path(value).expanduser()
     except RuntimeError as exc:
         raise ProfileError(f"{where} contains an unresolvable home-directory reference") from exc
+
+
+def _validate_llama_bin(value: Any, where: str) -> str:
+    """llama-server 執行檔路徑:非空字串、可展開 `~`、**必須是絕對路徑**。
+
+    存在性不在這裡驗(loader 只驗形狀);但相對路徑一定要擋 —— pane 裡 exec 的
+    cwd 不是使用者打指令的地方,`./llama-server` 會變成「看情況指到別的東西」。
+    """
+    if not isinstance(value, str):
+        raise ProfileError(f"{where} must be an absolute path to the llama-server binary")
+    path = _expanduser(_reject_control(value.strip(), where), where)
+    if not path.is_absolute():
+        raise ProfileError(f"{where} must be an absolute path: {value!r}")
+    return str(path)
+
+
+def _validate_gpu_selector(value: Any, where: str) -> str:
+    if not isinstance(value, str):
+        raise ProfileError(f"{where} must be a GPU selector string")
+    value = value.strip()
+    if value and not _GPU_RE.fullmatch(value):
+        raise ProfileError(f"{where} contains unsupported characters: {value!r}")
+    return value
 
 
 def _json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -312,14 +356,6 @@ def _url_port(value: str, where: str) -> int:
         raise ProfileError(f"{where} contains an invalid port") from exc
 
 
-def _url_with_port(value: str, port: int) -> str:
-    parts = urlsplit(value)
-    host = parts.hostname or ""
-    if ":" in host and not host.startswith("["):
-        host = f"[{host}]"
-    return urlunsplit((parts.scheme, f"{host}:{port}", "", "", ""))
-
-
 def _validate_parameter(role: str, key: str, value: Any, where: str) -> None:
     if key not in _ROLE_PARAMETERS[role]:
         raise ProfileError(f"{where} parameter {key!r} is not allowed for role {role}")
@@ -393,6 +429,8 @@ def _validate_document(data: dict[str, Any], where: str, *, local: bool = False)
         if not isinstance(profile, str):
             raise ProfileError(f"{where}.profile must be a profile name or absolute JSON path")
         _reject_control(profile.strip(), f"{where}.profile")
+    if local and "llama_bin" in data:
+        _validate_llama_bin(data["llama_bin"], f"{where}.llama_bin")
     if not local:
         for key in ("name", "description", "verification", "hardware"):
             if key in data and not isinstance(data[key], str):
@@ -429,6 +467,8 @@ def _validate_document(data: dict[str, Any], where: str, *, local: bool = False)
             _url_port(raw["base_url"], f"{service_where}.base_url")
         if "gpu_role" in raw and raw["gpu_role"] not in {"main", "aux"}:
             raise ProfileError(f"{service_where}.gpu_role must be main or aux")
+        if "gpu" in raw:
+            _validate_gpu_selector(raw["gpu"], f"{service_where}.gpu")
         if "bind" in raw and raw["bind"] not in _BIND_VALUES:
             raise ProfileError(f"{service_where}.bind must be local or all-interfaces")
         for field, maximum in (("ctx", 1_048_576), ("batch", 1_048_576), ("ubatch", 1_048_576)):
@@ -459,7 +499,7 @@ def _profile_path(reference: str) -> Path:
     candidate = _expanduser(ref, "profile reference")
     if not candidate.is_absolute():
         raise ProfileError(
-            'AICODE_PROFILE must be "defaults" or an absolute JSON profile path'
+            'profile must be "defaults" or an absolute JSON profile path'
         )
     if candidate.suffix.lower() != ".json":
         raise ProfileError("absolute deployment profile path must end in .json")
@@ -491,143 +531,45 @@ def _load_profile_chain(reference: str, seen: set[Path] | None = None) -> tuple[
     return data, path.stem
 
 
-def local_override_path(environ: Mapping[str, str] | None = None) -> Path | None:
+def _home(env: Mapping[str, str]) -> str:
+    """`environ` 參數的唯一用途:檔案在哪。只讀 HOME(Windows 的 USERPROFILE)。"""
+    return (env.get("HOME") or env.get("USERPROFILE") or "").strip()
+
+
+def local_override_path(
+    environ: Mapping[str, str] | None = None,
+    *,
+    deployment_config: str | Path | None = None,
+) -> Path | None:
     env = environ if environ is not None else os.environ
-    explicit = (env.get("AICODE_DEPLOYMENT_CONFIG") or "").strip()
-    if explicit:
-        path = _expanduser(explicit, "AICODE_DEPLOYMENT_CONFIG")
+    if deployment_config:
+        path = _expanduser(_reject_control(str(deployment_config).strip(), "--deployment-config"), "--deployment-config")
         if not path.is_absolute():
-            raise ProfileError("AICODE_DEPLOYMENT_CONFIG must be an absolute path")
+            raise ProfileError("--deployment-config must be an absolute path")
         if path.suffix.lower() != ".json":
-            raise ProfileError("AICODE_DEPLOYMENT_CONFIG must point to a .json file")
+            raise ProfileError("--deployment-config must point to a .json file")
         return path
-    home = (env.get("HOME") or env.get("USERPROFILE") or "").strip()
+    home = _home(env)
     return Path(home) / ".config" / "codetrail" / "deployment.json" if home else None
 
 
-def _first_env(env: Mapping[str, str], *names: str) -> str | None:
-    for name in names:
-        value = (env.get(name) or "").strip()
-        if value:
-            return value
-    return None
+def _overrides_overlay(overrides: LauncherOverrides) -> dict[str, Any]:
+    """argv 覆寫 → 與 `deployment.json` 同形狀的 overlay(只有 main 這幾格)。
 
-
-def _parse_env_int(value: str, name: str) -> int:
-    if not value.isdecimal():
-        raise ProfileError(f"{name} must be a positive integer")
-    return int(value)
-
-
-def _environment_model(value: str, role: str, where: str) -> str:
-    """Keep legacy custom-provider/main-model syntax compatible.
-
-    Artifact profiles themselves only accept registry keys or absolute paths.
-    AICODE_MODEL historically also accepts ``custom-provider/key``; strip that
-    provider here exactly as the main-model resolver does, while refusing known
-    external providers.
+    值不在這裡另外驗:`_validate_effective` 會用與檔案完全相同的 schema 驗一次,
+    所以 `--main-ctx 0` 與檔案裡寫 `"ctx": 0` 得到的是同一個錯誤。
     """
-    path = _expanduser(value, where)
-    if role != "main" or path.is_absolute() or "/" not in value:
-        return value
-    provider, bare = value.split("/", 1)
-    if provider.lower() in _EXTERNAL_PROVIDER_PREFIXES:
-        raise ProfileError(f"{where} uses external provider prefix {provider!r}")
-    if not _BARE_MODEL_RE.fullmatch(provider) or not _BARE_MODEL_RE.fullmatch(bare):
-        raise ProfileError(f"{where} is not a safe custom-provider/model identifier")
-    return bare
-
-
-# role → 欄位 → 可覆寫該欄位的 env 名稱。這是 runtime override 的唯一定義處;
-# RUNTIME_OVERRIDE_ENV_KEYS 由此推導,set_config / start.sh 產生器 / 測試一律引用它,
-# 不再各自維護清單(GPT 評估 #13:清單分叉會讓 .bashrc 舊變數蓋過新設定)。
-_ENV_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
-    "main": {
-            "model": ("AICODE_MODEL",),
-            "base_url": ("AICODE_LLAMA_BASE_URL",),
-            "port": ("MAIN_PORT", "AICODE_MAIN_PORT"),
-            "bind": ("MAIN_BIND", "AICODE_BIND"),
-            # AICODE_N_CTX is the one canonical main-context override.  Keep
-            # the older role-specific names after it for launcher compatibility.
-            "ctx": ("AICODE_N_CTX", "MAIN_CTX", "AICODE_MAIN_CTX"),
-            "batch": ("MAIN_BATCH", "AICODE_MAIN_BATCH"),
-            "ubatch": ("MAIN_UBATCH", "AICODE_MAIN_UBATCH"),
-        },
-        "embedding": {
-            "model": ("EMBED_MODEL", "AICODE_EMBED_MODEL"),
-            "base_url": ("AICODE_LLAMA_EMBED_BASE_URL",),
-            "port": ("EMBED_PORT", "AICODE_EMBED_PORT"),
-            "bind": ("EMBED_BIND", "AICODE_BIND"),
-            "ctx": ("EMBED_CTX", "AICODE_EMBED_CTX"),
-            "batch": ("EMBED_BATCH", "AICODE_EMBED_BATCH"),
-            "ubatch": ("EMBED_UBATCH", "AICODE_EMBED_UBATCH"),
-        },
-        "reranker": {
-            "model": ("RERANK_MODEL", "AICODE_RERANK_MODEL"),
-            "base_url": ("AICODE_LLAMA_RERANK_BASE_URL",),
-            "port": ("RERANK_PORT", "AICODE_RERANK_PORT"),
-            "bind": ("RERANK_BIND", "AICODE_BIND"),
-            "ctx": ("RERANK_CTX", "AICODE_RERANK_CTX"),
-            "batch": ("RERANK_BATCH", "AICODE_RERANK_BATCH"),
-            "ubatch": ("RERANK_UBATCH", "AICODE_RERANK_UBATCH"),
-        },
-        "vl": {
-            "model": ("VL_GGUF", "AICODE_VL_MODEL"),
-            "mmproj": ("VL_MMPROJ", "AICODE_VL_MMPROJ"),
-            "base_url": ("AICODE_LLAMA_VL_BASE_URL",),
-            "port": ("VL_PORT", "AICODE_VL_PORT"),
-            "bind": ("VL_BIND", "AICODE_BIND"),
-            "ctx": ("VL_CTX", "AICODE_VL_CTX"),
-            "batch": ("VL_BATCH", "AICODE_VL_BATCH"),
-            "ubatch": ("VL_UBATCH", "AICODE_VL_UBATCH"),
-        },
-}
-
-# 會影響有效 deployment 設定的全部環境變數(供 set_config / start.sh / 測試清理用):
-# _ENV_FIELDS 推導的 per-role 覆寫 + profile/registry 選擇 + GPU selector。
-RUNTIME_OVERRIDE_ENV_KEYS: tuple[str, ...] = tuple(sorted(
-    {name for fields in _ENV_FIELDS.values() for names in fields.values() for name in names}
-    | {
-        "AICODE_PROFILE",
-        "AICODE_DEPLOYMENT_CONFIG",
-        "AICODE_MODEL_REGISTRY",
-        "AICODE_MODEL_REGISTRY_FILE",
-        "MAIN_GPU",
-        "AUX_GPU",
-        "EMBED_GPU",
-        "RERANK_GPU",
-        "VL_GPU",
-        "CUDA_VISIBLE_DEVICES",
-    }
-))
-
-
-def _environment_overlay(env: Mapping[str, str], current: dict[str, Any]) -> dict[str, Any]:
-    services: dict[str, Any] = {}
-    for role, fields in _ENV_FIELDS.items():
-        role_overlay: dict[str, Any] = {}
-        base_was_set = False
-        port_was_set = False
-        for field, names in fields.items():
-            value = _first_env(env, *names)
-            if value is None:
-                continue
-            if field in {"port", "ctx", "batch", "ubatch"}:
-                role_overlay[field] = _parse_env_int(value, names[0])
-            elif field == "model":
-                role_overlay[field] = _environment_model(value, role, names[0])
-            else:
-                role_overlay[field] = value
-            base_was_set = base_was_set or field == "base_url"
-            port_was_set = port_was_set or field == "port"
-        if base_was_set and not port_was_set:
-            role_overlay["port"] = _url_port(role_overlay["base_url"], f"environment {role} base_url")
-        elif port_was_set and not base_was_set:
-            old_url = str(current["services"][role]["base_url"])
-            role_overlay["base_url"] = _url_with_port(old_url, role_overlay["port"])
-        if role_overlay:
-            services[role] = role_overlay
-    return {"services": services} if services else {}
+    main: dict[str, Any] = {}
+    if overrides.main_model is not None:
+        main["model"] = overrides.main_model
+    for field_name, value in (
+        ("ctx", overrides.main_ctx),
+        ("batch", overrides.main_batch),
+        ("ubatch", overrides.main_ubatch),
+    ):
+        if value is not None:
+            main[field_name] = value
+    return {"services": {"main": main}} if main else {}
 
 
 def _validate_effective(data: dict[str, Any], where: str) -> None:
@@ -664,43 +606,58 @@ def _validate_effective(data: dict[str, Any], where: str) -> None:
             raise ProfileError(f"{where}.services.{role}.ubatch may not exceed batch")
 
 
-def _gpu_for(role: str, gpu_role: str, env: Mapping[str, str]) -> str:
-    per_role = {
-        "main": ("MAIN_GPU",),
-        "embedding": ("EMBED_GPU",),
-        "reranker": ("RERANK_GPU",),
-        "vl": ("VL_GPU",),
-    }[role]
-    shared = ("MAIN_GPU",) if gpu_role == "main" else ("AUX_GPU",)
-    value = _first_env(env, *per_role, *shared, "CUDA_VISIBLE_DEVICES") or ""
-    if value and not _GPU_RE.fullmatch(value):
-        raise ProfileError(f"GPU selector for {role} contains unsupported characters: {value!r}")
-    return value
+def _gpu_for(role: str, gpu_role: str, gpus: Mapping[str, str], configured: Any) -> str:
+    """這個角色最後要用哪張卡。優先序:`--<role>-gpu` > `--aux-gpu` > 檔案 > 不指定。
+
+    `--aux-gpu` 只套到三個附屬角色(main 有自己的 `--main-gpu`)。回空字串就是
+    「不指定」—— `build_server_command` 不會加 `env CUDA_VISIBLE_DEVICES=` 前綴,
+    而 pane 最終環境已經把繼承來的那一份剝掉了。
+    """
+    value = gpus.get(role) or (gpus.get("aux") if gpu_role == "aux" else "") or configured or ""
+    return _validate_gpu_selector(value, f"GPU selector for {role}")
+
+
+def _llama_bin(env: Mapping[str, str], local_data: Mapping[str, Any] | None, override: str | None) -> str:
+    """llama-server 執行檔:argv > `deployment.json` 的 `llama_bin` > `DEFAULT_LLAMA_BIN`。"""
+    if override:
+        return _validate_llama_bin(override, "--llama-bin")
+    configured = (local_data or {}).get("llama_bin")
+    if configured:
+        return _validate_llama_bin(configured, "deployment override llama_bin")
+    home = _home(env)
+    if home and DEFAULT_LLAMA_BIN.startswith("~/"):
+        return str(Path(home) / DEFAULT_LLAMA_BIN[2:])
+    return str(_expanduser(DEFAULT_LLAMA_BIN, "llama_bin"))
 
 
 def load_effective_profile(
     environ: Mapping[str, str] | None = None,
     *,
     profile: str | None = None,
-    cli_env: Mapping[str, str] | None = None,
+    overrides: LauncherOverrides | None = None,
+    deployment_config: str | Path | None = None,
+    model_registry_file: str | Path | None = None,
 ) -> DeploymentProfile:
-    """Load defaults < selected profile < local override < env/CLI overrides."""
-    env = dict(os.environ if environ is None else environ)
-    if cli_env:
-        env.update({key: str(value) for key, value in cli_env.items()})
+    """Load defaults < selected profile < local override < launcher argv overrides.
 
-    override_path = local_override_path(env)
-    explicit_override = bool((env.get("AICODE_DEPLOYMENT_CONFIG") or "").strip())
+    `environ` 只被讀 `HOME` / `USERPROFILE`(檔案在哪);設定值一律來自檔案與
+    `overrides`。`deployment_config` / `model_registry_file` 是 set_config 驗證暫存檔
+    用的明確路徑,不是使用者設定。
+    """
+    env = os.environ if environ is None else environ
+    overrides = overrides or LauncherOverrides()
+
+    override_path = local_override_path(env, deployment_config=deployment_config)
     local_data: dict[str, Any] | None = None
     if override_path and override_path.is_file():
         local_data = _read_json_object(override_path, "local deployment override")
         _validate_document(local_data, f"local deployment override {override_path}", local=True)
-    elif override_path and explicit_override:
+    elif override_path and deployment_config:
         raise ProfileError(
-            f"AICODE_DEPLOYMENT_CONFIG must point to an existing file: {override_path}"
+            f"--deployment-config must point to an existing file: {override_path}"
         )
 
-    selected = (profile or env.get("AICODE_PROFILE") or "").strip()
+    selected = (profile or "").strip()
     if not selected and local_data:
         selected = str(local_data.get("profile") or "").strip()
     selected = selected or "defaults"
@@ -708,7 +665,7 @@ def load_effective_profile(
     data, selected_name = _load_profile_chain(selected)
     if local_data:
         data = _merge(data, {"services": local_data.get("services", {})})
-    data = _merge(data, _environment_overlay(env, data))
+    data = _merge(data, _overrides_overlay(overrides))
     _validate_effective(data, "effective deployment profile")
 
     services: dict[str, ServiceProfile] = {}
@@ -722,7 +679,7 @@ def load_effective_profile(
             base_url=raw["base_url"].rstrip("/"),
             bind=raw.get("bind") or "local",
             gpu_role=raw["gpu_role"],
-            gpu=_gpu_for(role, raw["gpu_role"], env),
+            gpu=_gpu_for(role, raw["gpu_role"], overrides.gpus, raw.get("gpu")),
             ctx=raw["ctx"],
             batch=raw["batch"],
             ubatch=raw["ubatch"],
@@ -736,26 +693,32 @@ def load_effective_profile(
         services=services,
         selected_profile=selected_name,
         local_override=override_path if local_data else None,
+        llama_bin=_llama_bin(env, local_data, overrides.llama_bin),
+        registry_file=Path(model_registry_file) if model_registry_file else None,
     )
 
 
-def load_model_registry(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+def load_model_registry(
+    environ: Mapping[str, str] | None = None,
+    *,
+    registry_file: str | Path | None = None,
+) -> dict[str, str]:
+    """bare name → GGUF 絕對路徑。來源只有一個檔。
+
+    `registry_file` 是呼叫端明確交來的路徑(set_config 驗證用的暫存檔);沒給就是
+    `~/.config/codetrail/models.json`。以前這裡還認兩個環境變數,那讓另一份安裝
+    的殼層可以決定「這個 bare name 指到哪一顆 GGUF」。
+    """
     env = environ if environ is not None else os.environ
-    raw = (env.get("AICODE_MODEL_REGISTRY") or "").strip()
-    source = "AICODE_MODEL_REGISTRY"
-    if raw:
-        data = _decode_json(raw, source)
+    if registry_file:
+        path = _expanduser(_reject_control(str(registry_file).strip(), "--model-registry-file"), "--model-registry-file")
     else:
-        explicit = (env.get("AICODE_MODEL_REGISTRY_FILE") or "").strip()
-        if explicit:
-            path = _expanduser(explicit, "AICODE_MODEL_REGISTRY_FILE")
-        else:
-            home = (env.get("HOME") or env.get("USERPROFILE") or "").strip()
-            path = Path(home) / ".config" / "codetrail" / "models.json" if home else Path()
-        if not path or not path.is_file():
-            return {}
-        source = str(path)
-        data = _read_json_object(path, "model registry")
+        home = _home(env)
+        path = Path(home) / ".config" / "codetrail" / "models.json" if home else Path()
+    if not path or not path.is_file():
+        return {}
+    source = str(path)
+    data = _read_json_object(path, "model registry")
     if not isinstance(data, dict):
         raise ProfileError(f"model registry {source} must be a JSON object")
     registry: dict[str, str] = {}
@@ -777,9 +740,13 @@ def resolve_model_reference(
     environ: Mapping[str, str] | None = None,
     *,
     must_exist: bool = False,
+    registry_file: str | Path | None = None,
 ) -> str:
     if reference is None:
-        raise ProfileError("main model is unset; set AICODE_MODEL or a registry-backed profile model")
+        raise ProfileError(
+            "main model is unset; put a registry key or an absolute GGUF path in "
+            "deployment.json services.main.model(重跑 ./set_config.sh 也會寫好它)"
+        )
     env = environ if environ is not None else os.environ
     ref = _validate_model_reference(reference, "model reference", nullable=False)
     assert ref is not None
@@ -787,13 +754,16 @@ def resolve_model_reference(
     if expanded.is_absolute():
         path = expanded
     else:
-        registry = load_model_registry(env)
+        registry = load_model_registry(env, registry_file=registry_file)
         registered = registry.get(ref)
         if registered:
             path = Path(registered)
         elif ref in _LEGACY_MODEL_PATHS:
+            # 舊 launcher 的目錄配置。models.json 沒有這個鍵時的最後手段,
+            # 位置固定在 `~/models`(以前還有一個 MODELS_DIR 環境變數)。
             directory, filename, pattern = _LEGACY_MODEL_PATHS[ref]
-            models_dir = _expanduser(env.get("MODELS_DIR") or "~/models", "MODELS_DIR")
+            home = _home(env)
+            models_dir = Path(home) / "models" if home else _expanduser("~/models", "legacy models dir")
             base = models_dir / directory
             preferred = base / filename
             matches = sorted(base.glob(pattern)) if base.is_dir() else []
@@ -816,8 +786,8 @@ def bind_host(service: ServiceProfile) -> str:
     """loopback base_url 預設只綁 127.0.0.1;`bind: "all-interfaces"` 才綁 0.0.0.0。
 
     llama-server 沒有內建認證,綁 0.0.0.0 等於把模型 API 開放給整個網段;
-    這必須是使用者的明確選擇(deployment.json 的 bind 欄位、AICODE_BIND=all-interfaces
-    或 set_config 的 --allow-remote),不能是 localhost 的靜默轉譯。
+    這必須是使用者的明確選擇(deployment.json 的 bind 欄位,或 set_config 的
+    --allow-remote),不能是 localhost 的靜默轉譯。
     """
     host = urlsplit(service.base_url).hostname or ""
     if host == "localhost" or host.startswith("127.") or host == "::1":
@@ -887,12 +857,20 @@ def build_server_command(
     environ: Mapping[str, str] | None = None,
     *,
     must_exist: bool = False,
+    registry_file: str | Path | None = None,
 ) -> list[str]:
     """Build argv only from validated structured fields and the parameter allowlist."""
-    model_path = resolve_model_reference(service.model, environ, must_exist=must_exist)
+    model_path = resolve_model_reference(
+        service.model, environ, must_exist=must_exist, registry_file=registry_file
+    )
     command = [llama_bin, "-m", model_path]
     if service.mmproj:
-        command.extend(["--mmproj", resolve_model_reference(service.mmproj, environ, must_exist=must_exist)])
+        command.extend([
+            "--mmproj",
+            resolve_model_reference(
+                service.mmproj, environ, must_exist=must_exist, registry_file=registry_file
+            ),
+        ])
     command.extend(["--host", bind_host(service), "--port", str(service.port)])
     if service.ctx is not None:
         command.extend(["-c", str(service.ctx)])
@@ -966,12 +944,16 @@ def profile_as_dict(profile: DeploymentProfile, environ: Mapping[str, str] | Non
         if service.mmproj:
             item["mmproj"] = service.mmproj
         try:
-            item["model_path"] = resolve_model_reference(service.model, environ)
+            item["model_path"] = resolve_model_reference(
+                service.model, environ, registry_file=profile.registry_file
+            )
         except ProfileError:
             item["model_path"] = None
         if service.mmproj:
             try:
-                item["mmproj_path"] = resolve_model_reference(service.mmproj, environ)
+                item["mmproj_path"] = resolve_model_reference(
+                    service.mmproj, environ, registry_file=profile.registry_file
+                )
             except ProfileError:
                 item["mmproj_path"] = None
         services[role] = item
@@ -983,44 +965,122 @@ def profile_as_dict(profile: DeploymentProfile, environ: Mapping[str, str] | Non
         "verification": profile.verification,
         "hardware": profile.hardware,
         "local_override": str(profile.local_override) if profile.local_override else None,
+        "llama_bin": profile.llama_bin,
         "services": services,
     }
 
 
-def runtime_environment(profile: DeploymentProfile, *, include_main_model: bool = False) -> dict[str, str]:
-    services = profile.services
-    values = {
-        "AICODE_LLAMA_BASE_URL": services["main"].base_url,
-        "AICODE_LLAMA_EMBED_BASE_URL": services["embedding"].base_url,
-        "AICODE_LLAMA_RERANK_BASE_URL": services["reranker"].base_url,
-        "AICODE_LLAMA_VL_BASE_URL": services["vl"].base_url,
-        "AICODE_EMBED_MODEL": services["embedding"].model or "",
-        "AICODE_RERANK_MODEL": services["reranker"].model or "",
-        "AICODE_VL_MODEL": services["vl"].model or "",
-        "AICODE_VL_MMPROJ": services["vl"].mmproj or "",
-        "AICODE_EFFECTIVE_PROFILE": profile.selected_profile,
+#: `--<name>-gpu` → `LauncherOverrides.gpus` 的鍵。`aux` 套到三個附屬角色。
+_GPU_FLAGS = (
+    ("--main-gpu", "main_gpu", "main"),
+    ("--aux-gpu", "aux_gpu", "aux"),
+    ("--embed-gpu", "embed_gpu", "embedding"),
+    ("--rerank-gpu", "rerank_gpu", "reranker"),
+    ("--vl-gpu", "vl_gpu", "vl"),
+)
+#: `--main-<field>` → `LauncherOverrides` 的欄位。
+_MAIN_FLAGS = (
+    ("--main-model", "main_model", str),
+    ("--main-ctx", "main_ctx", int),
+    ("--main-batch", "main_batch", int),
+    ("--main-ubatch", "main_ubatch", int),
+)
+
+
+def add_loader_arguments(parser: argparse.ArgumentParser, *, suppress_defaults: bool = False) -> None:
+    """把 loader 的全部 argv 掛到一個 parser 上。
+
+    launcher / stop / status / `deployment_profile.py` 自己都用這一份 —— 旗標分叉
+    就是「launcher 用 A、status 檢查 B」。`suppress_defaults` 給子命令用:argparse
+    的 subparser 會把自己的預設值寫回同一個 namespace,不 SUPPRESS 的話
+    `--profile X exec main` 會被子命令的 `None` 蓋掉。
+    """
+    extra: dict[str, Any] = {"default": argparse.SUPPRESS} if suppress_defaults else {}
+    parser.add_argument("--profile", help='"defaults" or absolute JSON profile path', **extra)
+    # 這兩個是行程之間交暫存檔用的(set_config 驗證尚未寫入的設定),不是使用者旗標。
+    parser.add_argument("--deployment-config", help=argparse.SUPPRESS, **extra)
+    parser.add_argument("--model-registry-file", help=argparse.SUPPRESS, **extra)
+    parser.add_argument("--llama-bin", help="llama-server 執行檔(絕對路徑;預設讀 deployment.json)", **extra)
+    for flag, _dest, caster in _MAIN_FLAGS:
+        parser.add_argument(flag, type=caster, help=f"覆寫 main 的 {flag[7:]}", **extra)
+    for flag, _dest, role in _GPU_FLAGS:
+        parser.add_argument(flag, help=f"{role} 角色的 GPU selector", **extra)
+
+
+def loader_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """`add_loader_arguments` 解析出來的 namespace → `load_effective_profile` 的 kwargs。"""
+    gpus = {
+        role: str(getattr(args, dest))
+        for _flag, dest, role in _GPU_FLAGS
+        if getattr(args, dest, None)
     }
-    if include_main_model and services["main"].model:
-        values["AICODE_MODEL"] = services["main"].model or ""
-    return values
+    overrides = LauncherOverrides(
+        main_model=getattr(args, "main_model", None),
+        main_ctx=getattr(args, "main_ctx", None),
+        main_batch=getattr(args, "main_batch", None),
+        main_ubatch=getattr(args, "main_ubatch", None),
+        gpus=gpus,
+        llama_bin=getattr(args, "llama_bin", None),
+    )
+    return {
+        "profile": getattr(args, "profile", None),
+        "overrides": overrides,
+        "deployment_config": getattr(args, "deployment_config", None),
+        "model_registry_file": getattr(args, "model_registry_file", None),
+    }
+
+
+def loader_argv(args: argparse.Namespace) -> list[str]:
+    """反向:同一組值變回 argv。
+
+    launcher 要把「自己收到的設定」原封不動交給 pane 裡的 `exec`;重新讀一次檔案
+    不等價(argv 覆寫會消失),重新組一份手寫清單則會漂移。
+    """
+    out: list[str] = []
+    for flag, dest in (
+        ("--profile", "profile"),
+        ("--deployment-config", "deployment_config"),
+        ("--model-registry-file", "model_registry_file"),
+        ("--llama-bin", "llama_bin"),
+    ):
+        value = getattr(args, dest, None)
+        if value:
+            out.extend([flag, str(value)])
+    for flag, dest, _caster in _MAIN_FLAGS:
+        value = getattr(args, dest, None)
+        if value is not None:
+            out.extend([flag, str(value)])
+    for flag, dest, _role in _GPU_FLAGS:
+        value = getattr(args, dest, None)
+        if value:
+            out.extend([flag, str(value)])
+    return out
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Resolve and validate CodeTrail deployment profiles")
-    parser.add_argument("--profile", help='"defaults" or absolute JSON profile path')
+    add_loader_arguments(parser)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("show", help="print the effective profile as JSON")
-    validate = sub.add_parser("validate", help="validate profile and optionally require model files")
-    validate.add_argument("--require-files", action="store_true")
-    env_parser = sub.add_parser("env", help="emit runtime environment assignments")
-    env_parser.add_argument("--null", action="store_true", help="NUL-delimit assignments for safe shell import")
-    env_parser.add_argument("--include-main-model", action="store_true")
-    get_parser = sub.add_parser("get", help="print one effective service field")
-    get_parser.add_argument("role", choices=ROLES)
-    get_parser.add_argument("field", choices=("model", "mmproj", "port", "base_url", "bind", "gpu_role", "gpu", "ctx", "batch", "ubatch"))
-    exec_parser = sub.add_parser("exec", help="exec one role directly (for systemd or another supervisor)")
-    exec_parser.add_argument("role", choices=ROLES)
-    exec_parser.add_argument("--llama-bin", default=os.environ.get("LLAMA_BIN") or str(Path.home() / "llama.cpp" / "build" / "bin" / "llama-server"))
+    # loader 旗標同時掛在子命令上:pane 的命令是 `exec <role> <loader argv>`
+    # (角色在前,設定在後),systemd 的 ExecStart 也照這個形狀寫。
+    for name, help_text in (
+        ("show", "print the effective profile as JSON"),
+        ("validate", "validate profile and optionally require model files"),
+        ("get", "print one effective service field"),
+        ("exec", "exec one role directly (for systemd or another supervisor)"),
+    ):
+        child = sub.add_parser(name, help=help_text)
+        add_loader_arguments(child, suppress_defaults=True)
+        if name == "validate":
+            child.add_argument("--require-files", action="store_true")
+        elif name == "get":
+            child.add_argument("role", choices=ROLES)
+            child.add_argument(
+                "field",
+                choices=("model", "mmproj", "port", "base_url", "bind", "gpu_role", "gpu", "ctx", "batch", "ubatch"),
+            )
+        elif name == "exec":
+            child.add_argument("role", choices=ROLES)
     return parser
 
 
@@ -1028,24 +1088,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
-        profile = load_effective_profile(profile=args.profile)
+        kwargs = loader_kwargs(args)
+        profile = load_effective_profile(**kwargs)
         if args.command == "show":
             print(json.dumps(profile_as_dict(profile), ensure_ascii=False, indent=2, sort_keys=True))
         elif args.command == "validate":
             if args.require_files:
                 for service in profile.services.values():
-                    resolve_model_reference(service.model, must_exist=True)
+                    resolve_model_reference(
+                        service.model, must_exist=True, registry_file=profile.registry_file
+                    )
                     if service.mmproj:
-                        resolve_model_reference(service.mmproj, must_exist=True)
+                        resolve_model_reference(
+                            service.mmproj, must_exist=True, registry_file=profile.registry_file
+                        )
             print(f"profile={profile.selected_profile} verification={profile.verification} valid")
-        elif args.command == "env":
-            values = runtime_environment(profile, include_main_model=args.include_main_model)
-            separator = "\0" if args.null else "\n"
-            sys.stdout.write(separator.join(f"{key}={value}" for key, value in values.items()))
-            if args.null:
-                sys.stdout.write("\0")
-            else:
-                sys.stdout.write("\n")
         elif args.command == "get":
             value = getattr(profile.service(args.role), args.field)
             print("" if value is None else value)
@@ -1055,11 +1112,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             warn_cpu_moe_fit_conflicts([service], prefix="[deployment-profile]")
             command = build_server_command(
                 service,
-                args.llama_bin,
-                os.environ,
+                profile.llama_bin,
                 must_exist=True,
+                registry_file=profile.registry_file,
             )
-            os.execvpe(command[0], command, dict(os.environ))
+            # 這是 llama-server 唯一真正被 exec 的地方,所以也是最終環境的唯一決定點:
+            # 剝掉 CodeTrail 的四個前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES`。
+            # GPU 只由 command 前面那個 `env CUDA_VISIBLE_DEVICES=<驗證過的值>` 重新輸出。
+            os.execvpe(command[0], command, process_env.llama_server_env())
         return 0
     except (OSError, ProfileError) as exc:
         print(f"[deployment-profile] ERROR: {exc}", file=sys.stderr)

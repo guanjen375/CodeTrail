@@ -7,7 +7,7 @@
     python3 scripts/run_tests.py --changed       # 只跑「工作樹有改動」波及到的測試檔
     python3 scripts/run_tests.py --changed=main  # 加上 main..HEAD 的提交差異
     python3 scripts/run_tests.py --changed -m smoke
-    AICODE_TEST_JOBS=1 python3 scripts/run_tests.py   # 單一 pytest 行程、序列
+    python3 scripts/run_tests.py --jobs 1        # 單一 pytest 行程、序列
     python3 scripts/run_tests.py -k cli          # 其他任何參數 = 單行程逐字轉發
     python3 scripts/run_tests.py tests/test_x.py::test_y
 
@@ -112,25 +112,55 @@ def _relax_windows_pytest_tmp_acl() -> None:
     os.mkdir = mkdir
 
 
+def _validate_jobs(raw: str) -> int:
+    try:
+        jobs = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"--jobs 必須是 1..{MAX_PARALLEL_JOBS} 的整數(拿到 {raw!r})") from exc
+    if not 1 <= jobs <= MAX_PARALLEL_JOBS:
+        raise ValueError(f"--jobs 必須是 1..{MAX_PARALLEL_JOBS} 的整數(拿到 {raw!r})")
+    return jobs
+
+
+def parse_jobs(argv: Sequence[str]) -> tuple[int | None, list[str]]:
+    """把 `--jobs N` / `--jobs=N` 從 argv 抽掉,其餘原封不動往下傳。
+
+    在形狀判斷**之前**吃掉,所以 `--jobs 1 -m smoke` 仍然是「純 `-m`」那個形狀;
+    轉發模式(`-k` / node id)帶著它也不會被當成 pytest 的參數丟過去。
+    以前這個值是環境變數,同一台機器上另一份安裝的殼層設了同名變數就會靜默生效。
+    """
+    rest: list[str] = []
+    jobs: int | None = None
+    args = list(argv)
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--jobs" or arg.startswith("--jobs="):
+            if jobs is not None:
+                raise ValueError("--jobs 只能給一次")
+            if arg == "--jobs":
+                if index + 1 >= len(args):
+                    raise ValueError(f"--jobs 必須是 1..{MAX_PARALLEL_JOBS} 的整數(少了值)")
+                raw = args[index + 1]
+                index += 2
+            else:
+                raw = arg[len("--jobs="):]
+                index += 1
+            jobs = _validate_jobs(raw)
+            continue
+        rest.append(arg)
+        index += 1
+    return jobs, rest
+
+
 def _resolve_parallel_jobs(
-    environ: Mapping[str, str] | None = None,
+    jobs: int | None = None,
     *,
     cpu_count: int | None = None,
 ) -> int:
-    """決定 shard 數;顯式 env 可重現單執行緒或限縮資源。"""
-    env = os.environ if environ is None else environ
-    raw = (env.get("AICODE_TEST_JOBS") or "").strip()
-    if raw:
-        try:
-            jobs = int(raw)
-        except ValueError as exc:
-            raise ValueError(
-                f"AICODE_TEST_JOBS 必須是 1..{MAX_PARALLEL_JOBS} 的整數"
-            ) from exc
-        if not 1 <= jobs <= MAX_PARALLEL_JOBS:
-            raise ValueError(f"AICODE_TEST_JOBS 必須是 1..{MAX_PARALLEL_JOBS} 的整數")
-        return jobs
-
+    """決定 shard 數;`--jobs` 可重現單執行緒或限縮資源。"""
+    if jobs is not None:
+        return _validate_jobs(str(jobs))
     available = os.cpu_count() if cpu_count is None else cpu_count
     return max(1, min(MAX_PARALLEL_JOBS, available or 1))
 
@@ -820,13 +850,15 @@ def main(argv: list[str]) -> int:
     # 我們自己不需要任何第三方 plugin。如果未來需要,在這裡明確 enable:
     # env["PYTEST_PLUGINS"] = "pytest_xdist"
 
+    try:
+        jobs_flag, argv = parse_jobs(argv)
+        jobs = _resolve_parallel_jobs(jobs_flag)
+    except ValueError as exc:
+        print(f"[run_tests] {exc}", file=sys.stderr)
+        return 2
+
     selection = parse_selection(argv)
     if os.name != "nt" and selection is not None:
-        try:
-            jobs = _resolve_parallel_jobs(env)
-        except ValueError as exc:
-            print(f"[run_tests] {exc}", file=sys.stderr)
-            return 2
         if jobs > 1 or selection.changed:
             return _run_parallel(env, jobs, selection)
         argv = list(selection.pytest_args)

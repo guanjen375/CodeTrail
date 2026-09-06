@@ -257,11 +257,12 @@ class McpClient:
             skip_aux_preflight=skip_aux_preflight,
         )
         self._env_overrides = dict(env or {})
-        # `env=` 是**覆寫**通道:呼叫端明確要求的值,套用在剝除之後。`OPENCODE_*`
-        # 在這一代沒有任何合法的覆寫用途 —— 它只會是升級機器殼層裡殘留的機密
-        # (API key、server 密碼、整份設定內容)。允許它從這裡進來,等於讓「把整份
-        # os.environ 當 overrides 遞進來」這個寫法把剛剝掉的東西原封不動加回去,
-        # 而且完全無聲。fail-loud,讓那種寫法在第一次就被打回。
+        # `env=` 是**覆寫**通道:呼叫端明確要求的值,套用在剝除之後。被剝掉的那
+        # 幾個前綴在這一代沒有任何合法的覆寫用途 —— 舊世代前端那一組只會是升級
+        # 機器殼層裡殘留的機密(API key、server 密碼、整份設定內容)。允許它們從
+        # 這裡進來,等於讓「把整份 os.environ 當 overrides 遞進來」這個寫法把剛
+        # 剝掉的東西原封不動加回去,而且完全無聲。fail-loud,讓那種寫法在第一次
+        # 就被打回。
         leaked = sorted(
             key for key in self._env_overrides if key.startswith(STRIPPED_ENV_PREFIXES)
         )
@@ -410,7 +411,7 @@ class McpClient:
     #: `CODETRAIL_*`(可能來自另一份安裝、另一個 branch 的文件)不得靜默蓋過
     #: `deployment.json`,也不得把 `--readonly` 翻回來。(2) 機密:核准後執行的
     #: `run_command` / `run_lint` 子行程會繼承整份環境,專案自己的測試腳本只要印
-    #: 一次 env 就把 `OPENCODE_API_KEY` 之類的東西寫進工具結果與 session 檔。
+    #: 一次 env,舊世代前端留下的 API key 之類的東西就寫進工具結果與 session 檔。
     #:
     #: 用前綴而不是名單:名單要靠「記得每一個可能出現的變數」,而升級機器的殼層裡
     #: 留著什麼我們不知道。使用者自己的其他環境(PATH、語系、專案需要的東西)照舊

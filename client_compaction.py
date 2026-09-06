@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""client_compaction — 結構化壓縮(從舊前端的 JS plugin 搬進 Python engine)。
+"""client_compaction — 結構化壓縮(整組住在這裡,舊世代前端的 JS plugin 已不存在)。
 
-搬過來之後消失的東西:``idle → summarize`` 之間的兩種競態,以及舊前端的
+搬過來之後消失的東西:``idle → summarize`` 之間的兩種競態,以及舊世代前端的
 版本閘。迴圈是我們自己的:壓縮發生在「助理答完、沒有進行中的請求」的那一刻,
 中間沒有另一個行程能插進來,所以 ``race_parent_mismatch`` /
 ``race_unanswered_user`` 由構造消失,不再需要事後偵測。
@@ -91,11 +91,11 @@ def derive(n_ctx: int, max_output: int | None = None) -> compaction_formula.Deri
     return compaction_formula.derive_settings(context_limit=n_ctx, output_limit=output)
 
 
-if config.CLIENT_MAX_OUTPUT_TOKENS_CAP != compaction_formula.UPSTREAM_OUTPUT_TOKEN_MAX:
+if config.CLIENT_MAX_OUTPUT_TOKENS_CAP != compaction_formula.OUTPUT_TOKEN_MAX:
     # pragma: no cover - import guard
     # 兩邊分開改就是「送 65536、門檻按 32000 算」那個 bug 的原型。
     raise RuntimeError(
-        "CLIENT_MAX_OUTPUT_TOKENS_CAP 必須等於 compaction_formula.UPSTREAM_OUTPUT_TOKEN_MAX"
+        "CLIENT_MAX_OUTPUT_TOKENS_CAP 必須等於 compaction_formula.OUTPUT_TOKEN_MAX"
     )
 
 

@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """Shared main-model resolution helpers.
 
-This module intentionally has no dependency on config.py. It is used by
-config.py, scripts/resolve_main_model.py, and scripts/doctor.py, including
-before the aicode wrapper has exported AICODE_MODEL. The deployment profile
-is consulted lazily between AICODE_MODEL and the OpenCode-config fallback.
+This module intentionally has no dependency on config.py.  It is used by
+config.py, client_preflight.py, scripts/doctor.py and the tool-call canary,
+and it consults the deployment profile lazily.
 
-CodeTrail 只跑 llama.cpp llama-server。AICODE_MODEL 可以是:
+主模型只有一個來源:`deployment.json` 的 `services.main.model`,值可以是
   - registry 裡登記的 bare name(例如 "qwen3-coder-30b")
   - GGUF 絕對路徑(例如 "/models/qwen3-coder-30b-q4_k_m.gguf")
-`opencode.json` 完全不在這裡:讀它的是使用者手動執行的 `opencode_migrate`,
-而那份程式碼自己帶著讀取與解析。這個模組**不在**主模型
-解析鏈上。下面這段講的是那個歷史格式:`model` 欄位若是 "<provider>/<name>" 形式 (例如 OpenAI 留下的舊
-設定 "openai/gpt-4o"),會被視為非本機 provider 拒絕 — 因為我們不打外部 API。
+另外容許 "<provider>/<name>" 這種舊世代前端留下的寫法並剝掉 provider;
+已知的外部 provider(例如 "openai/gpt-4o")一律拒絕 —— 我們不打外部 API。
 """
 from __future__ import annotations
 
@@ -109,8 +106,8 @@ def normalize_main_model(
     可接受的形式:
       1. bare name           "qwen3-coder-30b"          → model = "qwen3-coder-30b"
       2. GGUF 絕對 / 相對路徑  "/models/foo.gguf" / "~/m.gguf"
-      3. custom-provider 形式 "myprovider/qwen3-coder-30b"  (OpenCode openai-compat
-         provider 設定下會這樣寫 model:) → 自動 strip 成 "qwen3-coder-30b"
+      3. custom-provider 形式 "myprovider/qwen3-coder-30b"(舊世代前端的
+         openai-compat provider 設定會這樣寫 model:)→ 自動 strip 成 "qwen3-coder-30b"
 
     拒絕:
       - placeholder ('<...>')
@@ -237,19 +234,23 @@ def main_model_references_equivalent(
     return left_path == right_path
 
 
-def resolve_main_model_from_env(
+def resolve_main_model(
     env: Mapping[str, str] | None = None,
+    *,
+    profile: str | None = None,
 ) -> ModelResolution:
+    """主模型。**只有 `deployment.json` 一個來源**。
+
+    `env` 只被 loader 讀 HOME(檔案在哪);`profile` 是 `--profile` 選的那一份。
+    以前這裡的第一格是殼層裡的模型變數:同一台機器上另一份安裝的 `~/start.sh`
+    export 了它,這一份客戶端就會靜默跑另一顆模型。
+    """
     environ = env if env is not None else os.environ
-    raw = (environ.get("AICODE_MODEL") or "").strip()
-    if raw:
-        return normalize_main_model(raw, "AICODE_MODEL")
-    # Keep this import lazy so deployment_profile.py stays independent of the
-    # OpenCode model parser and config.py can import both without a cycle.
+    # Keep this import lazy so config.py can import both modules without a cycle.
     try:
         from deployment_profile import ProfileError, load_effective_profile
 
-        deployment = load_effective_profile(environ)
+        deployment = load_effective_profile(environ, profile=profile)
     except ProfileError as exc:
         return ModelResolution(
             source="deployment profile",
@@ -262,7 +263,4 @@ def resolve_main_model_from_env(
             profile_model,
             f"deployment profile {deployment.selected_profile} main.model",
         )
-    # 沒有 opencode.json fallback:CodeTrail 已經不啟動 OpenCode,靜默沿用
-    # 那份設定裡的模型等於「使用者以為在跑 A、實際在跑 B」,而一份**壞掉**的
-    # opencode.json 還會讓一個根本沒在用 OpenCode 的安裝拒絕啟動。
     return ModelResolution(source="deployment profile", present=False)

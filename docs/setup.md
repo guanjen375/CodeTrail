@@ -60,8 +60,10 @@ README 用 tmux 是因為它**最直觀、最不依賴系統服務**。其他選
 
 ### systemd unit(永久部署)
 
-每個 server 一個 unit。不要在 unit 重抄模型與 tuning 旗標；直接讓 profile loader
-`exec` 該 role。範例 `~/.config/systemd/user/codetrail-main.service`:
+每個 server 一個 unit。不要在 unit 重抄模型、GPU 與 tuning 旗標:主模型、
+`services.<role>.gpu` 與 `llama_bin` 都在 `~/.config/codetrail/deployment.json`,
+直接讓 profile loader `exec` 該 role 就好。範例
+`~/.config/systemd/user/codetrail-main.service`:
 
 ```ini
 [Unit]
@@ -70,16 +72,20 @@ After=network.target
 
 [Service]
 Type=simple
-Environment=AICODE_MODEL=<CODE_MODEL>
-Environment=MAIN_GPU=<MAIN_GPU_UUID_OR_INDEX>
-Environment=AUX_GPU=<AUX_GPU_UUID_OR_INDEX>
-ExecStart=/usr/bin/python3 /absolute/path/to/CodeTrail/deployment_profile.py exec main --llama-bin /absolute/path/to/llama-server
+ExecStart=/usr/bin/python3 /absolute/path/to/CodeTrail/deployment_profile.py exec main
 Restart=on-failure
 RestartSec=10
 
 [Install]
 WantedBy=default.target
 ```
+
+`exec` 是 llama-server 唯一真正被啟動的地方,所以最終環境也在那裡決定:CodeTrail 自己的
+四個設定前綴、llama.cpp 的 `LLAMA_ARG_*` 與繼承來的 GPU 選擇一律剝掉,GPU 只由設定檔裡
+驗證過的值重新指定。所以**不要**用 `Environment=` 傳 CodeTrail 的設定(主模型、GPU、
+llama-server 路徑)—— 寫了不會生效,只會讓下一個人以為設定有兩個來源;要一次性換設定
+就加旗標(見下面)。系統層的變數(例如 CUDA 的 `LD_LIBRARY_PATH`)不是 CodeTrail 的
+設定,照常設即可,不會被剝掉。
 
 啟用 + 開機自啟:
 
@@ -90,8 +96,11 @@ systemctl --user status codetrail-main
 journalctl --user -u codetrail-main -f    # 看 log
 ```
 
-embedding / reranker / VL 各複製一份，只把 `exec main` 改成對應 role；所有 unit 要用
-同一組 profile/env。systemd 不會展開 `<...>` placeholder，啟用前必須換成實值。
+embedding / reranker / VL 各複製一份，只把 `exec main` 改成對應 role；所有 unit 讀的是
+同一份 `deployment.json`。要一次性換設定就在 `ExecStart` 後面加 loader 旗標(例如
+`--profile /absolute/path/experiment.json`、`--main-model <CODE_MODEL>`、
+`--llama-bin /absolute/path/to/llama-server`),它們的意義與 `~/start.sh` 完全一樣。
+systemd 不會展開 `<...>` placeholder，啟用前必須換成實值。
 
 ### screen(類 tmux)
 

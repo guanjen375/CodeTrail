@@ -47,10 +47,9 @@ class ServerCheck:
 def _profile_env() -> dict[str, str]:
     """交給 `deployment_profile` 的環境:**只有 HOME**(Windows 的 USERPROFILE)。
 
-    那個模組的 env overlay 是啟動核心(`~/start.sh` → launcher)的契約,所以
-    不能改模組,只能改「交什麼給它」。交整份 `os.environ` 的話,殼層裡殘留的
-    `AICODE_LLAMA_*` 會蓋過 `deployment.json` —— 這道閘就會去 probe 別台機器的
-    server,然後以那邊的結果決定本機能不能啟動。
+    那個模組拿 `environ` 只為了找 `~/.config/codetrail/deployment.json`;端點與
+    模型一律來自那個檔。這道閘要答的是「本機該有的 server 在不在」,交得越窄,
+    越不可能拿別台機器的結果決定本機能不能啟動。
     """
     home = os.environ.get("HOME")
     if home:

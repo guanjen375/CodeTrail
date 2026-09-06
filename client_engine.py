@@ -44,7 +44,7 @@ from client_policy import Decision, PermissionPolicy
 #: 一輪對話裡最多讓模型連續呼叫幾次工具。超過就停下來並講明。
 DEFAULT_MAX_TOOL_STEPS = 24
 
-#: 舊工具輸出剪枝(上游 `compaction.prune` 的等價實作,門檻逐字沿用)。
+#: 舊工具輸出剪枝(舊世代前端 `prune` 的等價實作,門檻逐字沿用)。
 PRUNE_PROTECT_TOKENS = 40_000
 PRUNE_MINIMUM_TOKENS = 20_000
 PRUNE_SKIP_USER_TURNS = 2
@@ -261,6 +261,45 @@ def heal_messages(messages: Sequence[Mapping[str, Any]]) -> int:
     return len(heal_in_place(messages))
 
 
+@dataclass(frozen=True)
+class SessionSnapshot:
+    """一次受信讀取的結果:**模型歷史與畫面歷史同源**。
+
+    ``messages`` 是要交給模型的那一份(尊重最後一次壓縮的切點),``transcript``
+    是要顯示給人看的那一份(壓縮前的原文逐字保留,壓縮本身只以一個標記呈現)。
+    兩份**必須來自同一次** ``store.read()``:分兩次讀的話,另一個行程在中間
+    append 的內容會讓畫面上顯示的與模型看到的不是同一段對話,而畫面上看不出來。
+    """
+
+    session_id: str
+    messages: tuple[dict[str, Any], ...] = ()
+    transcript: tuple[dict[str, Any], ...] = ()
+    compactions: int = 0
+
+
+def _compaction_summary(history: Sequence[Mapping[str, Any]]) -> str:
+    """壓縮記錄裡那份摘要的內容(認不出來就回 ``""``)。
+
+    摘要是 ``Compactor._replace`` 注入的第一則 synthetic user 訊息。認不出來時
+    **不猜**:回空字串,標記照樣顯示(壓縮確實發生過),只是沒有摘要正文可展開。
+    """
+    if not history:
+        return ""
+    first = history[0]
+    if first.get("role") != "user" or not first.get("synthetic"):
+        return ""
+    content = first.get("content")
+    if not isinstance(content, str):
+        return ""
+    # 局部 import:摘要前綴的真值在 client_compaction(complete() 也是這樣拿的)。
+    import client_compaction
+
+    prefix = client_compaction.SUMMARY_PREFIX
+    if not content.startswith(prefix):
+        return ""
+    return content[len(prefix):].strip()
+
+
 class CancelDecision(NamedTuple):
     """``request_cancel()`` 的結果:有沒有接受,以及要在鎖外取消的 MCP 呼叫(可能 None)。"""
 
@@ -443,6 +482,10 @@ class Engine:
         self.session_id = session_id or store.create()
         #: 第一次 session 落檔失敗的原因。非 None 代表這段對話只在記憶體裡。
         self.store_error: str | None = None
+        #: 最後一次 adopt() 換上來的快照(new_session 清)。啟動時就接續好的那條路
+        #: (`aicode -c` / `--session`)靠它把畫面補回來:engine 已經換過去了,
+        #: 畫面還沒有那段對話,而 TUI 是在 Engine 之後才建起來的。
+        self.resumed_snapshot: SessionSnapshot | None = None
         self._tool_specs: dict[str, client_mcp.ToolSpec] = {}
         self._openai_tools: list[dict[str, Any]] = []
         self._loaded_tools = False
@@ -615,6 +658,8 @@ class Engine:
         session_id = self.store.create()
         self.messages = []
         self.store_error = None
+        # 上一段的快照不得跟過去:留著的話,啟動重播那條路會指著另一段對話。
+        self.resumed_snapshot = None
         self.session_id = session_id
         return session_id
 
@@ -629,17 +674,23 @@ class Engine:
             self._armed = False
             self._turn_seen_since_clear = False
 
-    def resume(self, session_id: str) -> None:
-        """從 session 檔重建歷史,尊重最後一次壓縮的切點。
+    def load_session(self, session_id: str) -> SessionSnapshot:
+        """讀一段既有對話,**同時**產出模型歷史與畫面歷史。零狀態改動。
 
-        不看 compaction 記錄的話,重開一個壓縮過的對話會把整段原始歷史再吃回
-        context —— 壓縮等於白做,而且第一輪就可能撞到 gate。
+        模型歷史尊重最後一次壓縮的切點:不看 compaction 記錄的話,重開一個壓縮過
+        的對話會把整段原始歷史再吃回 context —— 壓縮等於白做,而且第一輪就可能
+        撞到 gate。畫面歷史相反:壓縮前的原文**逐字保留**(使用者要調得出當時的
+        工具輸出與問答),壓縮本身只以一個標記呈現。
+
+        兩份都從**這一次**讀取推出來,而且這裡不動 engine 任何欄位:換過去是
+        :meth:`adopt` 的事。中途失敗(compaction.history 含非 dict 的項目)因此
+        不可能留下「id 是新的、messages 是舊對話」的混合狀態 —— 下一題會把舊對話
+        寫進新 session。
         """
         records = self.store.read(session_id)
-        # 先把整段歷史重建好,**最後**才一次換 session_id / messages / store_error:
-        # 中途失敗(compaction.history 含非 dict 的項目)不得留下「id 是新的、
-        # messages 是舊對話」的混合狀態——下一題會把舊對話寫進新 session。
         history: list[dict[str, Any]] = []
+        transcript: list[dict[str, Any]] = []
+        compactions = 0
         for index, record in enumerate(records):
             kind = record.get("type")
             if kind == "compaction":
@@ -648,14 +699,52 @@ class Engine:
                     isinstance(item, Mapping) for item in restored
                 ):
                     raise ValueError(f"session {session_id} 的第 {index} 筆 compaction 記錄壞掉")
+                summary = _compaction_summary(restored)
+                kept = len(restored) - (1 if summary else 0)
+                stamp = record.get("time")
+                transcript.append(
+                    {
+                        "type": "compaction",
+                        "time": float(stamp) if isinstance(stamp, (int, float)) else 0.0,
+                        "summary": summary,
+                        # 壓縮掉幾則 = 當時的模型歷史長度減掉逐字保留的那幾則,
+                        # 與 Compactor._replace 的 len(head) 同一個數字。
+                        "dropped": max(0, len(history) - kept),
+                        "kept": kept,
+                    }
+                )
                 history = [dict(item) for item in restored]
+                compactions += 1
             elif kind == "message":
-                history.append({k: v for k, v in record.items() if k != "type"})
-        self.session_id = session_id
-        self.messages = history
+                message = {k: v for k, v in record.items() if k != "type"}
+                history.append(dict(message))
+                transcript.append(dict(message))
+        return SessionSnapshot(
+            session_id=session_id,
+            messages=tuple(history),
+            transcript=tuple(transcript),
+            compactions=compactions,
+        )
+
+    def adopt(self, snapshot: SessionSnapshot) -> None:
+        """把一份已經讀好的快照換上來(原子:要嘛全換,要嘛一個欄位都沒動)。
+
+        讀取與切換分開的理由是畫面:UI 要先拿 ``transcript`` 把 widget 建好,
+        建不出來就整個不換 —— engine 換了、畫面沒換的話,使用者面對的是上一段
+        對話,而模型看到的是另一段。
+        """
+        self.session_id = snapshot.session_id
+        self.messages = [dict(message) for message in snapshot.messages]
         # store_error 是**這個** session 的事:上一段對話寫不進去,不代表換過來
         # 的這一段也寫不進去——不重設的話,新 session 的壓縮記錄會被靜默跳過。
         self.store_error = None
+        self.resumed_snapshot = snapshot
+
+    def resume(self, session_id: str) -> SessionSnapshot:
+        """讀 + 換,並把快照回給呼叫端(啟動時接續的畫面要重播它)。"""
+        snapshot = self.load_session(session_id)
+        self.adopt(snapshot)
+        return snapshot
 
     def _record(self, message: Mapping[str, Any]) -> None:
         payload = dict(message)

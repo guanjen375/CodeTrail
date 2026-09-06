@@ -112,18 +112,40 @@ def _resolve_model_identity(base_url: str) -> dict:
     }
 
 
-def _llama_build() -> dict:
-    """llama.cpp build/revision —— 記可驗證的東西,不記本機絕對路徑。"""
-    import os
-    import shutil
+def _llama_build(llama_bin: str | None = None) -> dict:
+    """llama.cpp build/revision —— 記可驗證的東西,不記本機絕對路徑。
+
+    binary 只有兩個來源:`--llama-bin`,否則 `deployment.json` 的 `llama_bin`(loader 的
+    預設鏈)。**選定的那一顆用不了就不會換別顆**:argv 指定的不存在是使用者打錯,
+    fail-loud;檔案指定的在這台主機上不存在(server 可能跑在別的 mount / 容器)就誠實
+    記成 `revision: "unknown"` 並指名來源 —— 猜一個版本號寫進 manifest 比沒有版本號
+    更糟。這裡**不看 PATH**:PATH 上另一顆 `llama-server` 的版本會被當成指定 binary
+    的 build 寫進 manifest,而且沒有任何 drift / fallback 提示。
+    """
     import subprocess
 
-    exe = os.environ.get("LLAMA_BIN", "") or (shutil.which("llama-server") or "")
-    if not exe or not Path(exe).is_file():
-        return {
-            "revision": "unknown",
-            "reason": "llama-server not found via LLAMA_BIN or PATH",
-        }
+    import deployment_profile
+
+    if llama_bin:
+        exe = llama_bin
+        if not Path(exe).is_file():
+            raise RecordError(f"--llama-bin does not point to a file: {exe}")
+    else:
+        try:
+            exe = deployment_profile.load_effective_profile().llama_bin
+        except deployment_profile.ProfileError as exc:
+            return {"revision": "unknown", "reason": f"deployment profile unreadable: {exc}"}
+        if not exe or not Path(exe).is_file():
+            # 路徑本身不進 manifest(它通常在 HOME 底下,會被「本機絕對路徑」的閘擋下);
+            # 只在 stderr 講出是哪一顆,manifest 記來源與 unknown。
+            print(
+                f"[record] deployment.json llama_bin is not a file on this host: {exe}",
+                file=sys.stderr,
+            )
+            return {
+                "revision": "unknown",
+                "reason": "deployment.json llama_bin is not a file on this host",
+            }
     try:
         out = subprocess.run(
             [exe, "--version"], capture_output=True, text=True, timeout=20, check=False
@@ -185,12 +207,14 @@ def _validate_rows(rows: list[list[float]], label: str) -> tuple[int, str]:
     return dimension, ("l2" if normalized else "none")
 
 
-def record(argv_model: str | None) -> int:
+def record(argv_model: str | None, llama_bin: str | None = None) -> int:
     import llama_client
     from config import EMBEDDING_MODEL, LLAMA_EMBED_BASE_URL
 
     base_url = LLAMA_EMBED_BASE_URL
     model = argv_model or EMBEDDING_MODEL
+    # binary 先驗:`--llama-bin` 打錯要在連 server、花幾分鐘 embed 之前就失敗。
+    llama_cpp = _llama_build(llama_bin)
     identity = _resolve_model_identity(base_url)
 
     data = smoke.load_cases()
@@ -248,7 +272,7 @@ def record(argv_model: str | None) -> int:
         "model": {
             **identity,
             "dimension": doc_dim,
-            "llama_cpp": _llama_build(),
+            "llama_cpp": llama_cpp,
         },
         "pipeline": {
             **sr.pipeline_identity(),
@@ -315,11 +339,15 @@ def main(argv: list[str]) -> int:
         "--model", default=None,
         help="覆寫送給 /v1/embeddings 的 model 名稱(仍會對 /props 核對身分)",
     )
+    parser.add_argument(
+        "--llama-bin", default=None,
+        help="llama-server 執行檔(只用來記 build revision;預設讀 deployment.json 的 llama_bin)",
+    )
     args = parser.parse_args(argv)
     if not args.record_vectors:  # argparse required=True 已擋,留著當顯式契約
         parser.error("--record-vectors is required")
     try:
-        return record(args.model)
+        return record(args.model, args.llama_bin)
     except RecordError as exc:
         print(f"RECORD FAIL: {exc}", file=sys.stderr)
         return 1

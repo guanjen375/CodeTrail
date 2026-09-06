@@ -32,6 +32,15 @@ STDOUT = _subprocess.STDOUT
 #: 交給**任何**子行程之前要剝掉的前綴。這幾個是 CodeTrail 自己的設定名。
 STRIPPED_ENV_PREFIXES = ("AICODE_", "AI_CODE_", "CODETRAIL_", "OPENCODE_")
 
+#: llama-server 那一個子行程**額外**要剝的:llama.cpp 自己的設定入口。
+#: `common/arg.cpp` 先套環境再套 argv,142 個 `LLAMA_ARG_*` 每一個都能覆寫我們
+#: 從 `deployment.json` 算出來的旗標,而且不留痕跡。
+SERVER_STRIPPED_ENV_PREFIXES = ("LLAMA_ARG_",)
+#: GPU 選擇**不再是輸入**:`build_server_command` 會用驗證過的值重新輸出一個
+#: `env CUDA_VISIBLE_DEVICES=<gpu>` 前綴。留著繼承來的那一份,pane / tmux server
+#: 的全域環境就會蓋掉設定檔指定的卡。
+SERVER_STRIPPED_ENV_KEYS = ("CUDA_VISIBLE_DEVICES",)
+
 
 class ChildEnvError(ValueError):
     """`overrides` 想把剛剝掉的設定名從後門遞回去。"""
@@ -56,6 +65,22 @@ def child_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
                 "設定只來自檔案,行程之間用 argv。"
             )
         env.update(overrides)
+    return env
+
+
+def llama_server_env() -> dict[str, str]:
+    """`llama-server` 真正被 exec 時的環境。
+
+    `child_env()` 再剝掉 llama.cpp 自己的設定入口(`LLAMA_ARG_*`)與 GPU 選擇
+    (`CUDA_VISIBLE_DEVICES`)。tmux pane 的環境 = tmux server 的全域環境 + session
+    環境,launcher 的行程環境管不到已經在跑的 daemon —— 所以邊界只能放在 pane 內
+    真正 exec 的這一步。`PATH` / `HOME` / `LD_LIBRARY_PATH` / `GGML_*` / `LLAMA_LOG_*`
+    刻意保留:它們不是 CodeTrail 的設定,也沒有 argv 等價入口。
+    """
+    env = child_env()
+    for key in list(env):
+        if key.startswith(SERVER_STRIPPED_ENV_PREFIXES) or key in SERVER_STRIPPED_ENV_KEYS:
+            env.pop(key, None)
     return env
 
 

@@ -35,6 +35,13 @@ DIGEST_JSON_RULE = 'json.dumps(value, ensure_ascii=False, sort_keys=True, separa
 
 MINIMAL_TOKEN_MESSAGE: tuple[dict[str, str], ...] = ({"role": "user", "content": "."},)
 
+# The "effective" character count (descriptions + input schemas) is the number a
+# client actually pays for.  Frozen eval baselines were recorded under the old
+# key name and are measured data, so readers accept both spellings and writers
+# only ever emit the current one.  See :func:`effective_chars`.
+EFFECTIVE_CHARS_KEY = "catalog_effective_chars"
+LEGACY_EFFECTIVE_CHARS_KEY = "opencode_effective_chars"
+
 
 class CatalogError(RuntimeError):
     """A live catalog could not be acquired or did not have the MCP shape."""
@@ -103,9 +110,9 @@ class CatalogSnapshot:
     input_schema_chars: int
     output_schema_chars: int
     catalog_chars: int
-    #: 這一格是 OpenCode 時代量的「送進 provider 的有效字元數」。名字保留原樣
-    #: 是刻意的:frozen baseline 的 digest 涵蓋它,改名等於讓歷史那一列永遠對不上。
-    opencode_effective_chars: int
+    #: 「模型實際看得到的字元數」= description + input schema。凍結的歷史 baseline
+    #: 用舊鍵名記錄同一個數字(資料檔不重造),讀取一律走 :func:`effective_chars`。
+    catalog_effective_chars: int
     tools_digest: str
     instructions_digest: str
     canonical_tools_list_chars: int
@@ -125,7 +132,7 @@ class CatalogSnapshot:
             "input_schema_chars": self.input_schema_chars,
             "output_schema_chars": self.output_schema_chars,
             "catalog_chars": self.catalog_chars,
-            "opencode_effective_chars": self.opencode_effective_chars,
+            EFFECTIVE_CHARS_KEY: self.catalog_effective_chars,
             "instructions_chars": len(self.instructions),
             "tools_digest": self.tools_digest,
             "instructions_digest": self.instructions_digest,
@@ -154,6 +161,26 @@ class CatalogTokenMeasurement:
             "instructions_prompt_tokens": self.instructions_prompt_tokens,
             "catalog_prompt_tokens": self.catalog_prompt_tokens,
         }
+
+
+def effective_chars(summary: Mapping[str, Any]) -> int:
+    """Read the effective character count from a catalog summary of either era.
+
+    The current name wins; the frozen historical baselines only carry the legacy
+    one.  A summary that has neither is an error rather than a zero: comparing
+    two silently defaulted zeros would report "the frozen contract still holds"
+    for a measurement that was never taken.
+    """
+
+    for key in (EFFECTIVE_CHARS_KEY, LEGACY_EFFECTIVE_CHARS_KEY):
+        if key in summary:
+            value = summary[key]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise CatalogError(f"{key} must be an integer, got {type(value).__name__}")
+            return value
+    raise CatalogError(
+        f"catalog summary has no {EFFECTIVE_CHARS_KEY} (or {LEGACY_EFFECTIVE_CHARS_KEY})"
+    )
 
 
 def schema_json(value: object) -> str:
@@ -281,7 +308,7 @@ def measure_catalog(
         input_schema_chars=input_schema_chars,
         output_schema_chars=output_schema_chars,
         catalog_chars=description_chars + input_schema_chars + output_schema_chars,
-        opencode_effective_chars=description_chars + input_schema_chars,
+        catalog_effective_chars=description_chars + input_schema_chars,
         tools_digest=json_digest(canonical_tools),
         instructions_digest=text_digest(instructions),
         canonical_tools_list_chars=len(compact_canonical_json(canonical_tools)),

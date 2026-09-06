@@ -17,14 +17,9 @@ full。靜態 consistency / compile 檢查不會收集 pytest，可在相關檔�
 python3 -m compileall -q .
 python3 scripts/check_eval_consistency.py
 python3 scripts/check_readme_consistency.py
-python3 opencode_migrate.py --check                   # 舊 OpenCode 安裝殘留(只偵測,不寫檔)
 python3 codetrail_chat.py status              # 目前的壓縮模式(aicode 橫幅那一行;純讀取)
 python3 scripts/doctor.py --no-network        # 用機器上實際設定的模型；不要塞假 model 名
 python3 deployment_profile.py validate
-
-# 舊 OpenCode 安裝的一次性遷移(唯一會寫使用者 opencode.json 的路徑;有備份、
-# 只有手動執行時才跑 —— set_config 不再順帶做這件事)
-python3 opencode_migrate.py
 
 # 測試入口（何時能跑見 AGENTS.md §1）
 python3 scripts/run_tests.py -m smoke
@@ -45,7 +40,8 @@ MCP、低於 1.28 或 2.x 都列為 FAIL。
 收集交給 pytest 自己，所以並行與序列收到的永遠是同一組測試。小檔整檔留在同一個
 shard；比一個 shard 平均負載一半還重的檔才切開——以檔案為單位分片時，一個 8 秒的檔
 就是整包的牆鐘下限，而合併測試檔之後這種檔只會更多。
-資源較小或要重現序列順序時用 `AICODE_TEST_JOBS=1 python3 scripts/run_tests.py`。
+資源較小或要重現序列順序時用 `python3 scripts/run_tests.py --jobs 1`(`--jobs` 收 1..16,
+由 runner 自己吃掉,不會轉發給 pytest)。
 
 **`-m <expr>`（例如交付前的 `-m smoke`）走同一套分片**：它跟無參數一樣只是「選
 整個 `tests/` 的一個子集」，分片不改變任何一條測試的語意。collect 階段一條都沒選中
@@ -109,9 +105,8 @@ docstring 說明它涵蓋哪些原始檔與為什麼：
   `test_lessons.py`。
 - 客戶端:`test_client_mcp.py`(取消契約)、`test_client_store.py`(session 檔私密性)、
   `test_client_engine.py`(訊息轉換 / 權限 / 工具迴圈)、`test_client_cli.py`(事件流與 headless)、
-  `test_client_turns.py`(回合協調與取消)、`test_client_app.py`(TUI)、
-  `test_client_compaction.py`(壓縮規則與門檻)、
-  `test_opencode_migrate.py`(舊安裝遷移)。
+  `test_client_turns.py`(回合協調與取消)、`test_client_app.py`(TUI:含 session
+  選單與原始記錄重播)、`test_client_compaction.py`(壓縮規則與門檻)。
 - MCP / sandbox / mutation：`test_mcp_server.py`（啟動、runtime policy、工具目錄、
   JSON-RPC roundtrip、結果預算、external import）、`test_mcp_ingest.py`（ingest 子行程、
   stream、通知）、`test_mcp_lease.py`、`test_fs_sandbox.py`（read／list／grep／read_pdf 的
@@ -175,11 +170,6 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
   `RECONCILIATION_HEADER` 逐字沿用它們，門檻公式只有 `compaction_formula.derive_settings`
   一份實作（客戶端直接呼叫它）。文件與程式任一改了另一邊沒跟上，只會讓門檻與
   保留額對不上——沒有任何錯誤訊息。`tests/test_client_compaction.py` 逐字比對
-- 新增 `compaction.*` 受管鍵（只影響 `opencode_migrate` 還原舊安裝的範圍）→ 改
-  `opencode_migrate.MANAGED_COMPACTION_KEYS`,而且**預設不要進** `CONTRACT_COMPACTION_KEYS`:契約鍵的意思是「值
-  不符就停用那個 session 的自動壓縮」,只有「改了會讓壓縮失真」的鍵才配得上這個後果。
-  新鍵一律不由 runtime 或 contract check 自己補寫(沒有 ownership 紀錄就切不回 native),
-  由 `opencode_migrate.unmanaged_keys()` 報出來、使用者重跑 `python3 opencode_migrate.py`
 - 舊回合 reasoning 的處理在 `client_engine.strip_historical_reasoning()`(送模型前的
   訊息轉換)。它改的是**送進模型的那一份訊息**,多砍一個欄位是靜默失真、砍到 tool
   訊息會讓 llama-server 直接報錯,所以只准動 `reasoning` 欄位、只准動最新一則真實使用者
@@ -306,12 +296,13 @@ python3 scripts/eval_tool_routing.py --root <SYNTHETIC_ROOT> \
 # 只有這兩條會連 8081。改了 corpus / parser 語意 / render schema,或 bump 了
 # RETRIEVAL_SCORER_VERSION 之後都要重錄(pipeline 不符時 eval gate 會 FAIL,
 # tests/test_evals.py 也會紅)。
-# LLAMA_BIN 一定要設 —— 沒設的話 artifact 的 llama_cpp.revision 會靜默記成
-# "unknown",那份 checked-in fixture 就失去可驗證的 build 出處。
-LLAMA_BIN=~/llama.cpp/build/bin/llama-server \
-    python3 eval/record_semantic_vectors.py --record-vectors
-LLAMA_BIN=~/llama.cpp/build/bin/llama-server \
-    python3 eval/run_code_smoke_eval.py --record-semantic-baseline
+# `--llama-bin` 指到真的那支執行檔(預設值來自 deployment.json 的 llama_bin)。
+# 指定的檔不存在會直接失敗,**不會**改拿 PATH 上另一顆;deployment.json 那顆在這台
+# 主機上不存在時 artifact 的 llama_cpp.revision 會記成 "unknown" 並指名來源,那份
+# checked-in fixture 就失去可驗證的 build 出處。
+python3 eval/record_semantic_vectors.py --record-vectors \
+    --llama-bin ~/llama.cpp/build/bin/llama-server
+python3 eval/run_code_smoke_eval.py --record-semantic-baseline
 ```
 
 前三個命令不需要 llama-server；retrieval runner 固定回報 Recall@5、MRR、nDCG@5 與

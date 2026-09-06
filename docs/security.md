@@ -69,16 +69,16 @@ CodeTrail 的內建工具。互動模式下 `apply_patch` / `run_lint` / `run_co
 兩個此模式的副作用/防線要知道:
 
 - [lessons](lessons.md) 該 session **不會注入** —— `aicode` 啟動輸出會明講,並清掉先前
-  render 殘留的 `.codetrail/lessons.md`,不會謊報「已注入」。(這個 env 是「非空即真」,
-  `=0` 也算開啟。)
+  render 殘留的 `.codetrail/lessons.md`,不會謊報「已注入」。(這個鍵只收真的
+  `false`;`"false"` 是一個非空字串,不是 false。)
 - 不信任 repo 可能把 `.codetrail` 換成指向專案外的 symlink/junction,誘導 lessons render 把檔案寫出沙箱;`aicode` 啟動時偵測到會直接拒絕啟動,一個 byte 都不寫。
 
 ---
 
 ## 客戶端就是唯一的前端
 
-`aicode` 啟動的是 CodeTrail 自己的 `codetrail_chat.py`,不再需要 Node / npm /
-opencode-ai,也沒有第二個 client 的版本相容閘要顧。模型看到什麼由三件事決定,全部在這個
+`aicode` 啟動的是 CodeTrail 自己的 `codetrail_chat.py`,不再需要 Node / npm 與那個
+舊世代前端,也沒有第二個 client 的版本相容閘要顧。模型看到什麼由三件事決定,全部在這個
 repo 裡:`client_prompt`(system prompt)、`mcp_contract`(工具目錄與 routing 指示)、
 `client_policy`(哪些工具要核准)。
 
@@ -132,9 +132,9 @@ system prompt 不是 permission:它不會讓被 `deny` 的工具變成可用,也
 
 升級防護：核准閘不再依賴任何外部設定檔。哪些工具要人工核准寫死在
 `client_policy.ASK_TOOLS`,所以「新加的寫入工具被舊 wildcard 靜默放行」這個問題由構造
-消失。從舊版(OpenCode 世代)升級的機器另外跑一次 `python3 opencode_migrate.py`,
-把 CodeTrail 曾經寫進那份設定的東西還原並撤銷註冊(見
-[troubleshooting](troubleshooting.md))。
+消失。從舊世代前端升級的機器,另外照
+[troubleshooting 的升級段](troubleshooting.md)(標題含 `a1682d5`)手動解除一次舊的設定
+接管 —— 本版 runtime 永遠不碰那份設定,所以那些殘留值沒有人負責。
 
 tool canary 的 explicit hard gate 與 implicit diagnostic 分開使用 cache schema 2。cache 只存
 fingerprint hash、lane status、檢查時間與版本，不存 prompt、專案路徑、檔名、模型輸出、

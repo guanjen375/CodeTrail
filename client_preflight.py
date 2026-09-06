@@ -115,10 +115,9 @@ def check_deployment_profile(result: Preflight) -> Any:
 def profile_env() -> dict[str, str]:
     """交給 `deployment_profile` 的環境。
 
-    **只有 HOME**(與 Windows 的 USERPROFILE)。那個模組的 env overlay 是啟動核心
-    的一部分,`~/start.sh` 與 launcher 靠它;所以不能改模組,只能改「交什麼給它」。
-    交整份 ``os.environ`` 的話,殼層裡任何殘留的 `AICODE_*` 都會蓋過
-    ``deployment.json`` —— 那正是跨 branch 混用的根因。
+    **只有 HOME**(與 Windows 的 USERPROFILE)。那個模組拿 ``environ`` 只為了找
+    ``~/.config/codetrail/*.json``;設定值一律來自那些檔案與 argv,所以這裡交得
+    再窄也不會少一個設定來源。
     """
     home = os.environ.get("HOME")
     if home:
@@ -137,7 +136,7 @@ def resolve_model(result: Preflight, profile: Any) -> str:
     """
     import model_resolution
 
-    resolved = model_resolution.resolve_main_model_from_env(profile_env())
+    resolved = model_resolution.resolve_main_model(profile_env())
     if resolved.error:
         where = f"({resolved.path})" if resolved.path else ""
         raise PreflightError(

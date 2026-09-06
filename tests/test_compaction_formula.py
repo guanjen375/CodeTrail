@@ -2,7 +2,7 @@
 
 這裡守的是 runtime 那一半 —— 算錯只是門檻不對,壓縮照樣會發生,沒有任何錯誤訊息:
 
-  * 受管值的推導公式(`compaction_formula.derive_settings` / `combine_settings`)。
+  * 門檻與 tail 保留額的推導公式(`compaction_formula.derive_settings`)。
   * 摘要格式核對用的七個欄位標題,必須從 canonical 文件解析,不是再抄一份字面值。
   * 單次工具結果的 context 佔比要與 runtime 的那一份相同。
 
@@ -13,9 +13,6 @@
     而實際上沒接管(或反過來)比不印還糟。
   * **這一行是資訊,不是閘**。任何讀取問題都必須 exit 0 並退成「未接管」。
   * **實驗標示**。`codetrail` / `manual` 還在測試階段;標示被拿掉沒有人會收到警告。
-
-opencode.json 的 ownership 那一半(狀態檔、受管鍵、plugin 項、native 還原)在
-`tests/test_opencode_migrate.py` —— 它守的是使用者手動執行的一次性升級工具。
 """
 from __future__ import annotations
 
@@ -44,15 +41,13 @@ def _derived():
 def test_derive_settings_follows_the_upstream_formula():
     """131072 / 8192 是本機實際的 limit;數字寫死才看得出公式被改過。"""
     derived = cm.derive_settings(context_limit=131072, output_limit=8192)
-    assert derived.usable == 131072 - 8192              # overflow.ts usable()
+    assert derived.usable == 131072 - 8192              # context - maxOutput
     assert derived.tool_result_budget == 15728          # floor(131072 * 0.12)
     assert derived.headroom == 15728 + 8192
     assert derived.idle_threshold == 122880 - 23920
     assert derived.tail_cap == 98960 - 8192
     assert derived.preserve_recent_tokens == 23920
     assert derived.tail_holds_a_full_headroom_turn is True
-    # 受管值(opencode.json 的形狀)是升級工具那一半的事,見
-    # tests/test_opencode_migrate.py::test_the_managed_values_come_from_the_formula。
 
 
 def test_derive_settings_uses_limit_input_and_reserved_when_present():
@@ -83,38 +78,6 @@ def test_preserve_recent_tokens_is_capped_by_a_derived_budget_not_a_percentage()
     assert derived.preserve_recent_tokens + derived.output_limit <= derived.idle_threshold
 
 
-def test_combining_two_models_keeps_the_single_model_relationships():
-    """合併值不是逐欄取 min/max 拼出來的,同一組關係式必須仍然成立。
-
-    `limit.output` 不同時逐欄取值會讓 tail_cap 算得比實際寬:主模型 32768/8192
-    配 131072/32000 的摘要模型,一份 25K 的合法摘要就已經塞不回主模型,而
-    `compaction.auto=false` 已經把上游的自動回復關掉了。這種組合必須被拒絕。
-    """
-    live = cm.derive_settings(context_limit=65536, output_limit=8192)
-    summariser = cm.derive_settings(context_limit=1048576, output_limit=8192)
-    combined = cm.combine_settings(summariser, live)
-    assert combined.headroom == combined.tool_result_budget + combined.output_limit
-    assert combined.tail_cap == combined.idle_threshold - combined.output_limit
-    assert combined.preserve_recent_tokens == min(combined.headroom, combined.tail_cap)
-    # 壓縮完之後「摘要 + tail」仍要低於門檻 —— 摘要那一份用的是較大的 output。
-    assert (
-        combined.preserve_recent_tokens + combined.output_limit
-        <= combined.idle_threshold
-    )
-    assert combined.idle_threshold <= live.idle_threshold
-    assert combined.preserve_recent_tokens <= live.preserve_recent_tokens
-
-    # 兩個模型相同時逐欄與單一模型完全一樣。
-    assert cm.combine_settings(live, live).as_dict() == live.as_dict()
-
-    # 摘要模型的 output 大到 tail 不存在 → fail-loud,不給一個算不出來的值。
-    with pytest.raises(cm.CompactionModeError):
-        cm.combine_settings(
-            cm.derive_settings(context_limit=131072, output_limit=32000),
-            cm.derive_settings(context_limit=32768, output_limit=8192),
-        )
-
-
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -133,17 +96,17 @@ def test_derive_settings_refuses_unusable_limits(kwargs):
 def test_effective_max_output_matches_upstream_transform():
     """`min(limit.output, 32000) || 32000` —— 包含 `|| 32000` 那一段。
 
-    照抄很重要:`limit.output` 是 0 或很大時,上游算出來的有效輸出額跟
-    `limit.output` 本身完全不同,門檻也就跟著不同。
+    照這條算很重要:`limit.output` 是 0 或很大時,有效輸出額跟 `limit.output`
+    本身完全不同,門檻也就跟著不同。
     """
     assert cm.effective_max_output(8192) == 8192
-    assert cm.effective_max_output(65536) == cm.UPSTREAM_OUTPUT_TOKEN_MAX
-    assert cm.effective_max_output(0) == cm.UPSTREAM_OUTPUT_TOKEN_MAX
+    assert cm.effective_max_output(65536) == cm.OUTPUT_TOKEN_MAX
+    assert cm.effective_max_output(0) == cm.OUTPUT_TOKEN_MAX
     # 大 output 的模型:usable / reserved 都要用 cap 過的值
     derived = cm.derive_settings(context_limit=200_000, output_limit=64_000)
-    assert derived.output_limit == cm.UPSTREAM_OUTPUT_TOKEN_MAX
-    assert derived.usable == 200_000 - cm.UPSTREAM_OUTPUT_TOKEN_MAX
-    assert derived.reserved == cm.UPSTREAM_COMPACTION_BUFFER
+    assert derived.output_limit == cm.OUTPUT_TOKEN_MAX
+    assert derived.usable == 200_000 - cm.OUTPUT_TOKEN_MAX
+    assert derived.reserved == cm.COMPACTION_RESERVE_TOKENS
 
 
 @pytest.mark.parametrize(
@@ -185,7 +148,7 @@ def test_canonical_rule_block_has_exactly_seven_numbered_rules():
 def test_rule_headings_come_from_the_document(tmp_path):
     """七個欄位標題必須是從文件解析出來的,不是另外抄一份。
 
-    格式核對(plugin 的 summary_format)拿這七個去驗模型產出的摘要。抄一份的話,
+    格式核對(`client_compaction` 的 summary_format)拿這七個去驗模型產出的摘要。抄一份的話,
     改了規則卻沒改核對,合法摘要會被判成漂移、漂移摘要會被放行 —— 兩種都是靜默的。
     """
     headings = cm.rule_headings()

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +10,7 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
+import process_env
 from deployment_profile import DeploymentProfile, ProfileError, ServiceProfile, resolve_model_reference
 
 
@@ -59,7 +58,7 @@ def parse_gpu_process_csv(output: str) -> list[GpuProcess]:
 
 
 def query_gpu_processes(
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    run: Callable[..., process_env.CompletedProcess[str]] = process_env.run,
 ) -> tuple[list[GpuProcess], str]:
     try:
         proc = run(
@@ -80,7 +79,7 @@ def query_gpu_processes(
 
 
 def query_gpu_inventory(
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    run: Callable[..., process_env.CompletedProcess[str]] = process_env.run,
 ) -> dict[str, str]:
     try:
         proc = run(
@@ -181,12 +180,16 @@ def inspect_deployment(
     profile: DeploymentProfile,
     gpu_processes: Iterable[GpuProcess],
     *,
-    environ: Mapping[str, str] | None = None,
     cmdline_reader: Callable[[int], Sequence[str]] = read_proc_cmdline,
     server_reader: Callable[[ServiceProfile], tuple[dict[str, Any] | None, dict[str, Any] | None]] | None = query_server,
     gpu_inventory: Mapping[str, str] | None = None,
 ) -> Inspection:
-    env = os.environ if environ is None else environ
+    """比對「設定說要跑什麼」與「機器上真的在跑什麼」。
+
+    registry 查表跟著 `profile.registry_file` 走(呼叫端交來的那一份),不再另外
+    收一份 `environ` —— 這一層要答的正是「server 載入的是不是對的 GGUF」,
+    用第二份 registry 去判就是拿別人的答案。
+    """
     inventory = {} if gpu_inventory is None else dict(gpu_inventory)
     rows = tuple(gpu_processes)
     by_pid: dict[int, list[GpuProcess]] = {}
@@ -260,7 +263,9 @@ def inspect_deployment(
                     f"actual={','.join(sorted(actual_gpus)) or 'none'}"
                 )
         try:
-            expected_model = resolve_model_reference(service.model, env)
+            expected_model = resolve_model_reference(
+                service.model, registry_file=profile.registry_file
+            )
         except ProfileError as exc:
             issues.append(f"{role}: expected model cannot be resolved: {exc}")
         else:
@@ -273,7 +278,9 @@ def inspect_deployment(
                 )
         if service.mmproj:
             try:
-                expected_mmproj = resolve_model_reference(service.mmproj, env)
+                expected_mmproj = resolve_model_reference(
+                    service.mmproj, registry_file=profile.registry_file
+                )
             except ProfileError as exc:
                 issues.append(f"{role}: expected mmproj cannot be resolved: {exc}")
             else:

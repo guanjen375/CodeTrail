@@ -7,7 +7,8 @@
   2. 文件工具表內每個 backtick 工具名都在 mcp_server.py 裡定義
   3. config.py 的附屬模型由 deployment profile 取得，避免三處 hardcode 漂移
   4. README 必須包含「成熟私有部署版」/「不公開發布」之類產品狀態語句
-  5. README / docs 必須提到 llama-server / GGUF / <CODE_MODEL> placeholder / AICODE_MODEL
+  5. README / docs 必須提到 llama-server / GGUF / <CODE_MODEL> placeholder,而且 README
+     講得出主模型填在 deployment.json 的 main.model(設定只來自檔案,沒有環境變數)
   6. README 講的 MCP read timeout == config.MCP_CALL_TIMEOUT_SECONDS
   7. README 的權限說明 == client_policy.ASK_TOOLS
      client_policy.ASK_TOOLS(哪些工具需要人工核准)
@@ -60,9 +61,9 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.is_file() else ""
 
 
-#: 標了「歷史文件」的規劃紀錄:描述的是 OpenCode 時代的施工,不是現在的使用者文件。
+#: 標了「歷史文件」的規劃紀錄:描述的是舊世代前端時代的施工,不是現在的使用者文件。
 #: 標了「歷史文件」、不參與一致性檢查的 docs。目前一個都沒有 —— 唯一那份
-#: (`tool-routing-implementation-plan.md`)已隨去 OpenCode 化刪除。
+#: (`tool-routing-implementation-plan.md`)已隨舊前端整組移除而刪除。
 _HISTORICAL_DOCS: frozenset[str] = frozenset()
 
 
@@ -149,7 +150,7 @@ def _check_mcp_timeout_contract(
 ) -> None:
     """README 講的 MCP read timeout 必須等於 config.py 的常數。
 
-    以前這一格是寫進 opencode.json 的毫秒 timeout;現在客戶端每次呼叫用的是
+    以前這一格是寫進舊世代前端設定檔的毫秒 timeout;現在客戶端每次呼叫用的是
     `config.MCP_CALL_TIMEOUT_SECONDS`(秒)。文件寫錯的後果一樣:使用者以為
     ingest 有 660 秒,實際被更早放棄。
     """
@@ -171,8 +172,8 @@ def _check_permission_contract(
 ) -> None:
     """README 的權限表必須和 client_policy.ASK_TOOLS 完全一致。
 
-    以前這一格比對的是 opencode.json 的 permission 範本(順序也是契約,因為
-    OpenCode 是 last-matching-rule-wins)。現在權限是客戶端的 policy,順序不再
+    以前這一格比對的是舊世代前端設定檔的 permission 範本(順序也是契約,因為那個
+    前端是 last-matching-rule-wins)。現在權限是客戶端的 policy,順序不再
     有意義,但**哪些工具要人工核准**仍然是使用者看得到的契約 —— 文件少列一個,
     使用者就會以為那個工具不會問。
     """
@@ -203,7 +204,7 @@ def _check_client_entry_documented(readme_text: str, issues: list[str]) -> None:
 
 
 def _check_code_model_placeholder_contract(readme_text: str, docs_text: str, issues: list[str]) -> None:
-    """確認 README/docs 仍把 <CODE_MODEL> 當 placeholder,且有提到 llama-server / GGUF / opencode model 範本。"""
+    """確認 README/docs 仍把 <CODE_MODEL> 當 placeholder,且有提到 llama-server / GGUF / 主模型的落點。"""
     if "<CODE_MODEL>" not in docs_text:
         issues.append("README/docs 必須使用 <CODE_MODEL> placeholder 來代表主模型(不要 hardcode 真實 tag)")
 
@@ -215,10 +216,12 @@ def _check_code_model_placeholder_contract(readme_text: str, docs_text: str, iss
         if needle not in docs_text:
             issues.append(msg)
 
-    # 主模型的設定位置換成 deployment profile / registry;README 必須講得出
-    # 使用者要在哪裡填 <CODE_MODEL>,否則第一次設定就卡住。
-    if "AICODE_MODEL" not in readme_text:
-        issues.append("README 必須說明主模型怎麼指定(AICODE_MODEL / deployment profile)")
+    # 主模型的設定位置只有 deployment profile / registry(環境變數那一層已經不存在);
+    # README 必須講得出使用者要在哪裡填 <CODE_MODEL>,否則第一次設定就卡住。
+    if "main.model" not in readme_text:
+        issues.append(
+            "README 必須說明主模型怎麼指定(deployment.json 的 `main.model` + models.json registry)"
+        )
 
 
 def _check_default_aux_models_documented(
@@ -641,7 +644,7 @@ def _check_run_command_timeout_contract(
 ) -> None:
     """10. run_command timeout 的秒級 server 上限(1..600、預設 60)三層 + 四份文件一致。
 
-    與第 6 條(OpenCode client 的毫秒 timeout,`mcp.codetrail.timeout`)是兩個
+    與第 6 條(客戶端每次 MCP 呼叫的 read timeout)是兩個
     獨立契約:一個是 client 何時放棄等 server,一個是 server 願意等命令多久;
     這裡的訊息刻意不提前者的數字,避免把兩個單位混在一起。
     """
@@ -756,7 +759,17 @@ _STALE_DOC_PATTERNS = (
     (r"--compaction-mode\s+native", "`--compaction-mode native`(parser 只收 codetrail / manual / off)"),
     (r"~/\.config/codetrail/compaction\.json", "`~/.config/codetrail/compaction.json`(壓縮模式現在記在 client.json)"),
     (r"--enable-experimental-build-prompt", "`--enable-experimental-build-prompt`(旗標已移除)"),
-    (r"scripts/opencode_[a-z_]+\.py", "`scripts/opencode_*.py`(已刪除)"),
+    # 設定只來自檔案與 argv:這幾個殼層形狀照做之後既不會生效也不會報錯。
+    (r"export\s+LLAMA_BIN=", "`export LLAMA_BIN=`(llama-server 路徑寫在 deployment.json 的 `llama_bin` / `--llama-bin`)"),
+    (r"export\s+MODELS_DIR=", "`export MODELS_DIR=`(改用 `./set_config.sh --models-dir`)"),
+    (r"AICODE_TEST_JOBS=", "`AICODE_TEST_JOBS=`(改用 `scripts/run_tests.py --jobs N`)"),
+    (r"Environment=(?:AICODE_|AI_CODE_|CODETRAIL_|OPENCODE_)",
+     "systemd unit 的 `Environment=AICODE_*`(loader 只讀 deployment.json 與旗標)"),
+    (r"scripts/opencode_[a-z_]+\.py", "`scripts/opencode_*.py`(已刪除;根目錄的 opencode_migrate.py 也不再附帶)"),
+    # 本版不再附帶 `opencode_migrate.py`。只有升級段能教它(那一段講的是把舊安裝路徑
+    # 固定回 a1682d5 再用當時的工具),其他地方寫出來就是教一個不存在的檔。
+    (r"(?m)^\s*(?:[$>]\s*)?python3\s+opencode_migrate\.py",
+     "`python3 opencode_migrate.py`(本版不附帶;只有 docs/troubleshooting.md 的 a1682d5 升級段能教)"),
     (r"scripts/compaction_status\.py", "`scripts/compaction_status.py`(已併進 `codetrail_chat.py status`)"),
     # 網頁前端整組移除:唯一的使用者入口是 `aicode`。troubleshooting 的「升級之後舊的
     # web backend 還在跑」是**清理指引**,講的是怎麼把它停掉,所以那一節允許出現這些字;
@@ -773,18 +786,55 @@ _STALE_DOC_PATTERNS = (
     # 不報錯)。啟動核心的變數由 tests/test_repo_consistency.py 的逐變數白名單處理;
     # 這裡只擋最明確的「叫使用者 export」形狀。
     (r"(?m)^\s*(?:[$>]\s*)?export\s+(?:AICODE|AI_CODE|CODETRAIL|OPENCODE)_", "`export AICODE_* / AI_CODE_* / CODETRAIL_* / OPENCODE_*`(設定只來自檔案)"),
-    (r"\bOPENCODE_[A-Z_]+\b", "`OPENCODE_*`(runtime 完全不碰 OpenCode 的設定;遷移工具用 --config)"),
+    (r"\bOPENCODE_[A-Z_]+\b", "`OPENCODE_*`(runtime 永遠不讀寫舊世代前端的設定)"),
 )
 
+#: 逐檔的例外(pattern → 允許它出現的文件)。**升級段必須點名**舊世代前端留下的
+#: ownership 狀態檔與當年那支還原工具,否則使用者根本不知道要處理什麼;其他文件寫出來
+#: 就是在教一個本版不存在的東西。例外是逐檔的,所以整包合併掃描不能用 —— 那只能整組
+#: 放行或整組擋下。
+_STALE_DOC_EXEMPT_SOURCES: dict[str, frozenset[str]] = {
+    r"~/\.config/codetrail/compaction\.json": frozenset({"docs/troubleshooting.md"}),
+    r"(?m)^\s*(?:[$>]\s*)?python3\s+opencode_migrate\.py": frozenset({"docs/troubleshooting.md"}),
+}
 
-def _check_no_stale_client_docs(docs_text: str, issues: list[str]) -> None:
-    """使用者文件不得教已經不存在的旗標 / 檔案 / 腳本。
 
-    `_documentation_text()` 掃的是 README 與 docs/ 底下的全部文件。
+def _check_no_stale_client_docs(docs_text: str, issues: list[str], *, source: str = "") -> None:
+    """一份使用者文件不得教已經不存在的旗標 / 檔案 / 腳本。
+
+    `source` 是它的 repo 相對路徑;不給(合成內容自測)就是**沒有任何例外**,
+    每一條 pattern 都適用。
     """
     for pattern, label in _STALE_DOC_PATTERNS:
+        if source and source in _STALE_DOC_EXEMPT_SOURCES.get(pattern, frozenset()):
+            continue
         if re.search(pattern, docs_text):
-            issues.append(f"docs: expected no mention of {label}, observed a match for /{pattern}/")
+            issues.append(
+                f"{source or 'docs'}: expected no mention of {label}, "
+                f"observed a match for /{pattern}/"
+            )
+
+
+def _stale_doc_sources() -> list[tuple[str, str]]:
+    """(相對路徑, 內容):與 `_documentation_text()` 同一組檔,但**不合併**。"""
+    sources = [("README.md", _read(README))]
+    if DOCS_DIR.is_dir():
+        for path in sorted(DOCS_DIR.glob("*.md")):
+            if path.name in _HISTORICAL_DOCS:
+                continue
+            sources.append((path.relative_to(REPO_ROOT).as_posix(), _read(path)))
+    return sources
+
+
+def _check_stale_docs_per_file(issues: list[str]) -> None:
+    """逐檔跑 `_check_no_stale_client_docs`,套用逐檔例外。"""
+    unknown = sorted(set(_STALE_DOC_EXEMPT_SOURCES) - {p for p, _ in _STALE_DOC_PATTERNS})
+    if unknown:
+        # 例外以 pattern 字串當 key:pattern 改字而例外沒跟上時,那份文件會被擋下
+        # (fail-closed),這一行負責講出真正的原因。
+        issues.append(f"check_readme_consistency.py: 逐檔例外指到不存在的 pattern {unknown}")
+    for rel, text in _stale_doc_sources():
+        _check_no_stale_client_docs(text, issues, source=rel)
 
 
 def check_all() -> list[str]:
@@ -853,11 +903,12 @@ def check_all() -> list[str]:
 
     # 6. client MCP read-timeout contract
     _check_mcp_timeout_contract(readme_text, config_text, issues)
-    # 12. 去 OpenCode 化之後不存在的東西,文件不得再教:`--compaction-mode native`
-    #     (parser 只收 codetrail / manual / off)與 OpenCode 時代的 ownership 狀態檔。
-    _check_no_stale_client_docs(docs_text, issues)
+    # 12. 本版不存在的東西,文件不得再教:`--compaction-mode native`(parser 只收
+    #     codetrail / manual / off)、殼層設定形狀,以及舊世代前端留下的 ownership
+    #     狀態檔與還原工具(升級段例外,見 `_STALE_DOC_EXEMPT_SOURCES`)。
+    _check_stale_docs_per_file(issues)
 
-    # 7. OpenCode permission template contract (README ↔ set_config.py)
+    # 7. 人工核准的工具清單(README ↔ client_policy.ASK_TOOLS)
     _check_permission_contract(readme_text, _read(REPO_ROOT / "client_policy.py"), issues)
     _check_client_entry_documented(readme_text, issues)
 

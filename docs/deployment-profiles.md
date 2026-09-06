@@ -9,7 +9,7 @@ Python 3.10 stdlib 讀 JSON，採封閉 schema/參數 allowlist，不執行 JSON
 
 安全基底 `safe-defaults` 直接內建在 `deployment_profile.py`,不宣稱硬體;正常使用不必選
 profile,`set_config.sh` 產生的 local override 疊在基底上就是有效設定。要做一次性實驗
-設定,`AICODE_PROFILE`(或 CLI `--profile`)可指向**絕對路徑** `.json` profile,檔內可用
+設定,CLI 的 `--profile` 可指向**絕對路徑** `.json` profile,檔內可用
 `"extends": "defaults"` 繼承基底:
 
 ```bash
@@ -20,32 +20,35 @@ python3 deployment_profile.py --profile /absolute/path/to/experiment.json valida
 合併順序：
 
 ```text
-launcher CLI / environment
+launcher 旗標(--profile / --llama-bin / --main-model / --main-ctx / --<role>-gpu …)
   > ~/.config/codetrail/deployment.json local override
-  > AICODE_PROFILE 選用 profile(絕對路徑 .json,選用)
+  > --profile 選用 profile(絕對路徑 .json,選用)
   > safe-defaults(內建)
 ```
 
-**啟動核心**(`~/start.sh` → launcher)另有一個 `AICODE_DEPLOYMENT_CONFIG` 可在
-測試或多帳號環境改 local override 位置;客戶端與 MCP 不看它。注意:產生的
-`~/start.sh` 啟動時會刻意 unset 這批 runtime override(防 `.bashrc` 殘留覆寫),
-`set_config.sh` 也只寫入預設路徑——長期設定這個變數會讓
-aicode/doctor 與 `~/start.sh` 各讀一份設定(set_config 偵測到會警告)。它適合
-一次性測試,不適合當常駐設定。
+**設定沒有環境變數這一層。** loader、launcher、stop、status 與 `deployment_profile.py`
+自己都掛同一組旗標(`add_loader_arguments`),殼層裡的殘留值一律無效;`~/start.sh` 也不
+export / unset 任何東西,只把你打的旗標原樣轉下去。tmux pane 內跑的是
+`python3 deployment_profile.py exec <role> <同一組旗標>`,由它算出最終環境再 `exec`
+llama-server —— CodeTrail 的四個設定前綴、llama.cpp 自己的 `LLAMA_ARG_*` 與繼承來的
+GPU 選擇都在那一步剝掉,GPU 只由本檔驗證過的值重新指定。
 
 ## Service schema
 
 每個 role 的有效資料都有：
 
 - `model`：`models.json` key 或 GGUF 絕對路徑；main 可在基底中為 `null`，但啟動
-  main 時一定 fail-loud，直到 `AICODE_MODEL` 或 local profile 明確指定。
+  main 時一定 fail-loud，直到 local override 的 `services.main.model`(或一次性的
+  `--main-model`)明確指定。
 - `port` 與 `base_url`：必須一致；URL 只接受無 credentials/path/query 的 HTTP(S)。
 - `bind`：`local`(預設,loopback base_url 只綁 `127.0.0.1`)或 `all-interfaces`
   (綁 `0.0.0.0`,對其他機器開放 —— CodeTrail 目前產生的 server 指令未啟用
-  認證,慎用)。env 覆寫:
-  `MAIN_BIND` / `EMBED_BIND` / `RERANK_BIND` / `VL_BIND`,或 `AICODE_BIND` 一次
-  套用四個 role。非 loopback 的 base_url host 不受影響、照原樣綁定。
+  認證,慎用)。要開放就寫進 local override(或 `./set_config.sh --allow-remote`
+  一次寫好四個 role);非 loopback 的 base_url host 不受影響、照原樣綁定。
 - `gpu_role`：只能是 `main` 或 `aux`。
+- `gpu`(選填)：這個 role 要用的 GPU selector,UUID 或 `nvidia-smi` index;缺席 =
+  不指定卡。`build_server_command` 只把驗證過的值輸出成 `env CUDA_VISIBLE_DEVICES=<值>`
+  前綴,繼承來的同名變數在 `exec` 那一步已經被剝掉。
 - `ctx`、`batch`、`ubatch`：正整數或明確 `null`；`null` 代表不傳該 llama.cpp flag。
 - `parameters`：role-specific allowlist；未知 key 直接拒絕。完整清單以
   `deployment_profile.py::_ROLE_PARAMETERS` 為單一事實來源，目前是：
@@ -150,11 +153,15 @@ VPN。Contextual Retrieval 的生成路徑另用 `client.json` 的 `"kb_context_
 ## GPU precedence
 
 ```text
-main:      MAIN_GPU > CUDA_VISIBLE_DEVICES
-embedding: EMBED_GPU > AUX_GPU > CUDA_VISIBLE_DEVICES
-reranker:  RERANK_GPU > AUX_GPU > CUDA_VISIBLE_DEVICES
-VL:        VL_GPU > AUX_GPU > CUDA_VISIBLE_DEVICES
+main:      --main-gpu   > services.main.gpu      > 不指定
+embedding: --embed-gpu  > --aux-gpu > services.embedding.gpu > 不指定
+reranker:  --rerank-gpu > --aux-gpu > services.reranker.gpu  > 不指定
+VL:        --vl-gpu     > --aux-gpu > services.vl.gpu        > 不指定
 ```
+
+`--aux-gpu` 只套用到三個附屬 role(`gpu_role: "aux"`),不會影響 main。四個角色都沒有
+指定時就不輸出 `CUDA_VISIBLE_DEVICES`,由 llama.cpp 自己決定;殼層或 tmux 裡繼承來的
+同名變數不是輸入,`exec` 之前就剝掉了。
 
 GPU UUID 比 index 穩定，因為 PCI enumeration 次序可能在重開機或硬體變更後改變。
 
@@ -164,13 +171,20 @@ GPU UUID 比 index 穩定，因為 PCI enumeration 次序可能在重開機或�
 {
   "schema_version": 1,
   "profile": "defaults",
+  "llama_bin": "/absolute/path/to/llama-server",
   "services": {
     "main": {
       "model": "<CODE_MODEL>",
+      "gpu": "<MAIN_GPU_UUID_OR_INDEX>",
       "ctx": 65536
     }
   }
 }
 ```
+
+頂層 `llama_bin` 是選填的 llama-server 執行檔絕對路徑,argv 的 `--llama-bin` 優先;
+兩個都沒有時用 `~/llama.cpp/build/bin/llama-server`。**這兩個鍵(`llama_bin` 與
+`services.<role>.gpu`)是本版新增的**:共用同一份 `~/.config/codetrail/` 的舊世代
+checkout 會對未知鍵 fail-loud,那是封閉 schema 的預期行為。
 
 不要把真實 UUID、私有模型路徑或 NDA 名稱 commit 進 repo；這類值留在使用者 home config。

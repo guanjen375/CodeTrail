@@ -9,7 +9,6 @@ import re
 import shlex
 import shutil
 import socket
-import subprocess
 import sys
 import time
 from collections.abc import Mapping, Sequence
@@ -33,12 +32,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import process_env  # noqa: E402
 from deployment_profile import (  # noqa: E402
+    TMUX_SESSIONS,
     DeploymentProfile,
     ProfileError,
     ServiceProfile,
+    add_loader_arguments,
     build_server_command,
     load_effective_profile,
+    loader_argv,
+    loader_kwargs,
     resolve_model_reference,
     warn_cpu_moe_fit_conflicts,
 )
@@ -52,9 +56,10 @@ WINDOWS = {
 }
 
 
-def _positive_int(value: str, name: str) -> int:
+def _positive_int(value: str) -> int:
+    """argparse 的正整數:`--health-timeout 0` 要在解析階段就被擋下。"""
     if not value.isdecimal() or int(value) < 1:
-        raise ProfileError(f"{name} must be a positive integer")
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
     return int(value)
 
 
@@ -66,30 +71,32 @@ def _scope_roles(scope: str) -> tuple[str, ...]:
     return ("main", "embedding", "reranker", "vl")
 
 
-def _cli_environment(args: argparse.Namespace) -> dict[str, str]:
-    mapping = {
-        "main_model": "AICODE_MODEL",
-        "main_gpu": "MAIN_GPU",
-        "aux_gpu": "AUX_GPU",
-        "embed_gpu": "EMBED_GPU",
-        "rerank_gpu": "RERANK_GPU",
-        "vl_gpu": "VL_GPU",
-        "main_ctx": "MAIN_CTX",
-        "main_batch": "MAIN_BATCH",
-        "main_ubatch": "MAIN_UBATCH",
-    }
+def _sessions(args: argparse.Namespace) -> dict[str, str]:
+    """tmux session 名。真值是 `deployment_profile.TMUX_SESSIONS` 這個 repo 常數。
+
+    以前是三個環境變數(`MAIN_SESSION` / `SESSION` / `AUX_SESSION`),桌面環境裡
+    很常見的泛用 `SESSION` 會讓 stop 去關別人的 session。隱藏旗標只給測試用:
+    契約測試不能碰開發機上真的在跑的那兩個 session。
+    """
     return {
-        env_name: str(value)
-        for attr, env_name in mapping.items()
-        if (value := getattr(args, attr, None)) is not None
+        "main": getattr(args, "main_session", None) or TMUX_SESSIONS["main"],
+        "aux": getattr(args, "aux_session", None) or TMUX_SESSIONS["aux"],
     }
 
 
-def _sessions(environ: Mapping[str, str]) -> dict[str, str]:
-    return {
-        "main": environ.get("MAIN_SESSION") or "codetrail-main",
-        "aux": environ.get("SESSION") or environ.get("AUX_SESSION") or "codetrail-rag",
-    }
+def _pane_command(role: str, args: argparse.Namespace) -> str:
+    """pane 裡真正要跑的東西:`deployment_profile.py exec <role> <loader argv>`。
+
+    不直接 respawn llama-server 的理由:tmux pane 的環境 = tmux server 的全域環境
+    + session 環境,launcher 的行程環境管不到已經在跑的 daemon。把最後一步放在
+    `exec` 裡,最終環境就由 `process_env.llama_server_env()` 一個地方決定
+    (`LLAMA_ARG_*` / `CUDA_VISIBLE_DEVICES` 剝掉,GPU 只由驗證過的值重新輸出)。
+    `loader_argv` 把 launcher 收到的設定原封不動轉過去 —— 讓 pane 自己重讀一次檔案
+    並不等價(argv 覆寫會消失)。
+    """
+    return shlex.join(
+        [sys.executable, str(REPO_ROOT / "deployment_profile.py"), "exec", role, *loader_argv(args)]
+    )
 
 
 def _session_for(role: str, sessions: Mapping[str, str]) -> str:
@@ -115,13 +122,12 @@ def _artifact_bytes(path: Path) -> int:
         return 0
 
 
-def _health_timeout(role: str, environ: Mapping[str, str], artifact_bytes: int = 0) -> int:
+def _health_timeout(role: str, explicit: int | None = None, artifact_bytes: int = 0) -> int:
     """health 等待上限。main 依模型大小放大:大模型冷載入(尤其 --no-mmap)
-    正常就要好幾分鐘,固定 120s 會把「還在載入」誤判成失敗。"""
-    name = "MAIN_HEALTH_TIMEOUT" if role == "main" else "RAG_HEALTH_TIMEOUT"
-    explicit = (environ.get(name) or "").strip()
-    if explicit:
-        return _positive_int(explicit, name)
+    正常就要好幾分鐘,固定 120s 會把「還在載入」誤判成失敗。
+    `--health-timeout` 給了就是它(以前是兩個環境變數,兩份安裝會互相蓋)。"""
+    if explicit is not None:
+        return explicit
     if role != "main":
         return 60
     size_gib = artifact_bytes / (1024**3)
@@ -144,7 +150,7 @@ def _pane_state(session: str, window: str) -> tuple[bool, str]:
 
     window 開著 remain-on-exit:process 結束時 pane 標記 dead 並保留 exit code
     (畫面上也留著最後輸出可檢視);window 整個不見(被外部 kill)也視為結束。"""
-    proc = subprocess.run(
+    proc = process_env.run(
         ["tmux", "list-panes", "-t", f"{session}:{window}",
          "-F", "#{pane_dead} #{pane_dead_status}"],
         capture_output=True,
@@ -219,59 +225,58 @@ def _check_port_collisions(services: Sequence[ServiceProfile]) -> None:
 
 def _command_for(
     service: ServiceProfile,
-    llama_bin: str,
-    environ: Mapping[str, str],
+    profile: DeploymentProfile,
     *,
     must_exist: bool,
 ) -> list[str]:
-    return build_server_command(service, llama_bin, environ, must_exist=must_exist)
+    """dry-run 印的那一份:pane 裡最後真的會被 exec 的 llama-server argv。"""
+    return build_server_command(
+        service, profile.llama_bin, must_exist=must_exist, registry_file=profile.registry_file
+    )
 
 
 def _print_dry_run(
     profile: DeploymentProfile,
     roles: Sequence[str],
-    llama_bin: str,
-    environ: Mapping[str, str],
+    args: argparse.Namespace,
 ) -> None:
     print(f"profile={profile.selected_profile}")
     print(f"profile_verification={profile.verification}")
     print(f"profile_hardware={profile.hardware}")
+    print(f"llama_bin={profile.llama_bin}")
+    registry = profile.registry_file
     for role in roles:
         service = profile.service(role)
-        command = _command_for(service, llama_bin, environ, must_exist=False)
+        command = _command_for(service, profile, must_exist=False)
         prefix = {"embedding": "embed", "reranker": "rerank"}.get(role, role)
         print(f"{prefix}_base_url={service.base_url}")
         print(f"{prefix}_host={urlsplit(service.base_url).hostname or ''}")
         print(f"{prefix}_bind_host={command[command.index('--host') + 1]}")
         print(f"{prefix}_port={service.port}")
         if role == "vl":
-            print(f"vl_gguf={resolve_model_reference(service.model, environ)}")
-            print(f"vl_mmproj={resolve_model_reference(service.mmproj, environ)}")
+            print(f"vl_gguf={resolve_model_reference(service.model, registry_file=registry)}")
+            print(f"vl_mmproj={resolve_model_reference(service.mmproj, registry_file=registry)}")
         else:
-            print(f"{prefix}_model={resolve_model_reference(service.model, environ)}")
+            print(f"{prefix}_model={resolve_model_reference(service.model, registry_file=registry)}")
         print(f"{prefix}_gpu_role={service.gpu_role}")
         print(f"{prefix}_gpu={service.gpu}")
         print(f"{prefix}_command={shlex.join(command)}")
     if any(role != "main" for role in roles):
-        policy = (environ.get("AICODE_RERANK_FALLBACK_POLICY") or "error").strip().lower()
-        if policy not in {"embedding", "main_model", "error"}:
-            raise ProfileError("AICODE_RERANK_FALLBACK_POLICY must be embedding, main_model, or error")
-        print(f"rerank_fallback_policy={policy}")
-        print(f"health_timeout={_health_timeout('embedding', environ)}")
+        print(f"health_timeout={_health_timeout('embedding', args.health_timeout)}")
 
 
 def _tmux_has_session(session: str) -> bool:
-    return subprocess.run(
+    return process_env.run(
         ["tmux", "has-session", "-t", session],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=process_env.DEVNULL,
+        stderr=process_env.DEVNULL,
         check=False,
     ).returncode == 0
 
 
 def _start_role(
     service: ServiceProfile,
-    command: Sequence[str],
+    command_line: str,
     session: str,
     *,
     first_in_session: bool,
@@ -279,16 +284,15 @@ def _start_role(
 ) -> None:
     window = WINDOWS[service.role]
     target = f"{session}:{window}"
-    command_line = shlex.join(command)
     # 先開「空」window(預設 shell),掛好 remain-on-exit 與 pipe-pane 之後,
     # 才 respawn 成真正的 llama-server。這樣即使 llama-server 秒退:
     #   1. 輸出從第一個 byte 就進 log(pipe-pane 已先接上,沒有 attach race);
     #   2. pane 帶著 exit code 留在原地(remain-on-exit),不會 window 消失後什麼都抓不到。
     if first_in_session:
-        subprocess.run(["tmux", "new-session", "-d", "-s", session, "-n", window], check=True)
+        process_env.run(["tmux", "new-session", "-d", "-s", session, "-n", window], check=True)
     else:
-        subprocess.run(["tmux", "new-window", "-t", session, "-n", window], check=True)
-    subprocess.run(
+        process_env.run(["tmux", "new-window", "-t", session, "-n", window], check=True)
+    process_env.run(
         ["tmux", "set-option", "-w", "-t", target, "remain-on-exit", "on"], check=False
     )
     if log_dir is not None:
@@ -296,7 +300,7 @@ def _start_role(
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
             log_path.write_text("", encoding="utf-8")  # 每次啟動重寫該 role 的 log
-            pipe = subprocess.run(
+            pipe = process_env.run(
                 ["tmux", "pipe-pane", "-o", "-t", target,
                  f"cat >> {shlex.quote(str(log_path))}"],
                 check=False,
@@ -317,19 +321,21 @@ def _start_role(
                 f"啟動照常進行,但 ~/start.sh logs {service.role} 將看不到輸出",
                 file=sys.stderr,
             )
-    subprocess.run(["tmux", "respawn-window", "-k", "-t", target, command_line], check=True)
+    process_env.run(["tmux", "respawn-window", "-k", "-t", target, command_line], check=True)
     print(f"[+] started {service.role} server ({service.base_url}) in tmux {session}:{window}")
 
 
-def _state_log_dir(environ: Mapping[str, str]) -> Path:
-    base = (environ.get("XDG_STATE_HOME") or "").strip() or str(
-        Path(environ.get("HOME") or Path.home()) / ".local" / "state"
+def _state_log_dir(environ: Mapping[str, str] | None = None) -> Path:
+    """server log 的位置。這是「檔案在哪」,不是設定,所以仍然讀 XDG / HOME。"""
+    env = os.environ if environ is None else environ
+    base = (env.get("XDG_STATE_HOME") or "").strip() or str(
+        Path(env.get("HOME") or Path.home()) / ".local" / "state"
     )
     return Path(base) / "codetrail" / "logs"
 
 
 def _capture_window_log(session: str, window: str, dest: Path) -> bool:
-    proc = subprocess.run(
+    proc = process_env.run(
         ["tmux", "capture-pane", "-p", "-t", f"{session}:{window}", "-S", "-300"],
         capture_output=True,
         text=True,
@@ -350,19 +356,20 @@ def _rollback_started(
     started_roles: Sequence[ServiceProfile],
     created_sessions: Sequence[str],
     sessions: Mapping[str, str],
-    environ: Mapping[str, str],
+    *,
+    log_dir: Path,
+    keep_on_failure: bool = False,
 ) -> None:
     """某個 role 啟動失敗:先保存各 role 的 server log,再關掉本次建立的
     tmux sessions,讓使用者修正後可以直接重跑,不會卡在 session already exist。"""
     if not created_sessions:
         return
-    if (environ.get("AICODE_NO_ROLLBACK") or "").strip():
+    if keep_on_failure:
         print(
-            f"[!] AICODE_NO_ROLLBACK=1:保留現場不清理(tmux:{', '.join(created_sessions)})",
+            f"[!] --keep-on-failure:保留現場不清理(tmux:{', '.join(created_sessions)})",
             file=sys.stderr,
         )
         return
-    log_dir = _state_log_dir(environ)
     saved: list[str] = []
     for service in started_roles:
         dest = log_dir / f"{service.role}.log"
@@ -380,16 +387,16 @@ def _rollback_started(
     for session in created_sessions:
         pane_pids.update(stop_servers._pane_pids(session))
     for session in created_sessions:
-        subprocess.run(
+        process_env.run(
             ["tmux", "kill-session", "-t", session],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=process_env.DEVNULL,
+            stderr=process_env.DEVNULL,
             check=False,
         )
     if pane_pids:
         try:
             leftover = stop_servers._wait_released(
-                pane_pids, timeout=stop_servers._stop_timeout(environ)
+                pane_pids, timeout=stop_servers.DEFAULT_STOP_TIMEOUT
             )
         except KeyboardInterrupt:
             leftover = []
@@ -408,31 +415,35 @@ def _rollback_started(
         "修正後直接重新執行 ~/start.sh 即可。",
         file=sys.stderr,
     )
-    print("[rollback] 要保留現場除錯:AICODE_NO_ROLLBACK=1 ~/start.sh", file=sys.stderr)
+    print("[rollback] 要保留現場除錯:~/start.sh --keep-on-failure", file=sys.stderr)
 
 
 def launch(
     profile: DeploymentProfile,
     roles: Sequence[str],
-    environ: Mapping[str, str],
-    *,
-    dry_run: bool,
+    args: argparse.Namespace,
 ) -> None:
-    llama_bin = environ.get("LLAMA_BIN") or str(Path.home() / "llama.cpp" / "build" / "bin" / "llama-server")
+    """啟動這幾個 role。設定全部來自 `profile`(檔案 + argv 覆寫)與 `args`;
+    這個函式不讀任何環境變數 —— pane 的最終環境由 `deployment_profile.py exec`
+    在 pane 內決定。"""
     services = [profile.service(role) for role in roles]
     _check_port_collisions(services)
     warn_cpu_moe_fit_conflicts(services)
-    if dry_run:
-        _print_dry_run(profile, roles, llama_bin, environ)
+    if args.dry_run:
+        _print_dry_run(profile, roles, args)
         return
 
     if not shutil.which("tmux"):
         raise ProfileError("tmux is required to launch llama-server sessions")
-    binary = Path(llama_bin).expanduser()
+    binary = Path(profile.llama_bin)
     if not binary.is_file() or not os.access(binary, os.X_OK):
-        raise ProfileError(f"llama-server does not exist or is not executable: {binary}")
+        raise ProfileError(
+            f"llama-server does not exist or is not executable: {binary};"
+            "改用 --llama-bin,或重跑 ./set_config.sh 寫進 deployment.json 的 llama_bin"
+        )
 
-    sessions = _sessions(environ)
+    sessions = _sessions(args)
+    registry = profile.registry_file
     used_sessions = {_session_for(role, sessions) for role in roles}
     existing = sorted(session for session in used_sessions if _tmux_has_session(session))
     if existing:
@@ -441,13 +452,13 @@ def launch(
             "先執行 ~/start.sh stop 再重新啟動"
         )
     for service in services:
-        resolve_model_reference(service.model, environ, must_exist=True)
+        resolve_model_reference(service.model, must_exist=True, registry_file=registry)
         if service.mmproj:
-            resolve_model_reference(service.mmproj, environ, must_exist=True)
+            resolve_model_reference(service.mmproj, must_exist=True, registry_file=registry)
         if _port_responds(service):
             raise ProfileError(f"{service.role} port {service.port} is already in use ({service.base_url})")
 
-    log_dir = _state_log_dir(environ)
+    log_dir = _state_log_dir()
     print(f"[i] server log 即時寫入:{log_dir}/<role>.log(~/start.sh logs <role> 可查看)")
     started_sessions: set[str] = set()
     created_sessions: list[str] = []
@@ -455,7 +466,6 @@ def launch(
     try:
         for service in services:
             session = _session_for(service.role, sessions)
-            command = _command_for(service, str(binary), environ, must_exist=True)
             first_in_session = session not in started_sessions
             if first_in_session:
                 # 建 session 之前先登記:new-session 成功、respawn-window 才失敗的
@@ -464,23 +474,35 @@ def launch(
             started_sessions.add(session)
             started_roles.append(service)
             _start_role(
-                service, command, session,
+                service, _pane_command(service.role, args), session,
                 first_in_session=first_in_session,
                 log_dir=log_dir,
             )
             artifact = (
-                _artifact_bytes(Path(resolve_model_reference(service.model, environ)))
+                _artifact_bytes(
+                    Path(resolve_model_reference(service.model, registry_file=registry))
+                )
                 if service.role == "main"
                 else 0
             )
-            _wait_for_health(service, _health_timeout(service.role, environ, artifact), session)
-    except (ProfileError, subprocess.CalledProcessError) as exc:
-        _rollback_started(exc, started_roles, created_sessions, sessions, environ)
+            _wait_for_health(
+                service,
+                _health_timeout(service.role, args.health_timeout, artifact),
+                session,
+            )
+    except (ProfileError, process_env.CalledProcessError) as exc:
+        _rollback_started(
+            exc, started_roles, created_sessions, sessions,
+            log_dir=log_dir, keep_on_failure=args.keep_on_failure,
+        )
         raise
     except KeyboardInterrupt:
         # Ctrl-C 最常發生在等待大模型 health 的幾分鐘;同樣要清理,
-        # 不留下會卡住下一次啟動的殘存 session(保留現場:AICODE_NO_ROLLBACK=1)。
-        _rollback_started("使用者中斷(Ctrl-C)", started_roles, created_sessions, sessions, environ)
+        # 不留下會卡住下一次啟動的殘存 session(保留現場:--keep-on-failure)。
+        _rollback_started(
+            "使用者中斷(Ctrl-C)", started_roles, created_sessions, sessions,
+            log_dir=log_dir, keep_on_failure=args.keep_on_failure,
+        )
         raise
 
     print("\nCodeTrail model servers ready.")
@@ -492,30 +514,31 @@ def launch(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Launch llama-server roles from a CodeTrail profile")
     parser.add_argument("--scope", choices=("main", "aux", "all"), required=True)
-    parser.add_argument("--profile", help="profile name or absolute JSON profile path")
     parser.add_argument("--dry-run", action="store_true", help="print resolved commands without launching")
-    parser.add_argument("--main-model", help="override the main model registry key/path")
-    parser.add_argument("--main-gpu", help="override MAIN_GPU")
-    parser.add_argument("--aux-gpu", help="override AUX_GPU")
-    parser.add_argument("--embed-gpu", help="override EMBED_GPU")
-    parser.add_argument("--rerank-gpu", help="override RERANK_GPU")
-    parser.add_argument("--vl-gpu", help="override VL_GPU")
-    parser.add_argument("--main-ctx", type=int, help="override main ctx")
-    parser.add_argument("--main-batch", type=int, help="override main batch")
-    parser.add_argument("--main-ubatch", type=int, help="override main ubatch")
+    parser.add_argument(
+        "--health-timeout", type=_positive_int, default=None,
+        help="等 /health=ok 的上限秒數(預設:main 依模型大小 300..1800、附屬 60)",
+    )
+    parser.add_argument(
+        "--keep-on-failure", action="store_true",
+        help="啟動失敗時保留 tmux session 供除錯(預設會自動清乾淨)",
+    )
+    # 隱藏旗標:契約測試不能碰開發機上真的在跑的那兩個 session。
+    parser.add_argument("--main-session", help=argparse.SUPPRESS)
+    parser.add_argument("--aux-session", help=argparse.SUPPRESS)
+    # profile / llama_bin / GPU / main 覆寫全部來自 loader 那一份(launcher 與
+    # `deployment_profile.py exec` 必須認同一組旗標,否則 pane 拿到的設定會漂移)。
+    add_loader_arguments(parser)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    cli_env = _cli_environment(args)
-    env = dict(os.environ)
-    env.update(cli_env)
     try:
-        profile = load_effective_profile(env, profile=args.profile)
-        launch(profile, _scope_roles(args.scope), env, dry_run=args.dry_run)
+        profile = load_effective_profile(**loader_kwargs(args))
+        launch(profile, _scope_roles(args.scope), args)
         return 0
-    except (ProfileError, subprocess.CalledProcessError) as exc:
+    except (ProfileError, process_env.CalledProcessError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

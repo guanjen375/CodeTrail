@@ -1,5 +1,5 @@
 """eval/ 底下各 runner 的契約:tool-routing、code smoke、retrieval、semantic retrieval、
-data flywheel 與私人 session eval。整檔離線:不起 OpenCode / MCP 子行程、不連 model
+data flywheel 與私人 session eval。整檔離線:不起客戶端 / MCP 子行程、不連 model
 server、不碰網路。
 
 合併自(2026-09-02):
@@ -18,11 +18,11 @@ server、不碰網路。
     - 用 seed_files 當 gold → edit2ripple 只量到起點,系統性高估 evidence recall。
     - union lane 不把 gold 正規化成 repo_id:path → 三個 repo 的同名路徑互撞。
 * tests/test_data_flywheel.py —— reproducibility info 記的是 call-time 的主模型。
-* tests/test_session_eval.py —— 私人 OpenCode session-model eval lane 的安全契約。
+* tests/test_session_eval.py —— 私人 session-model eval lane 的安全契約。
 
 smoke 成員資格:semantic retrieval 與 session eval 兩段原本是整檔 smoke,合併後改成
-逐條 `@pytest.mark.smoke`;tool-routing 只有 result privacy 那條是 smoke;其餘三段
-不在 smoke 包。
+逐條 `@pytest.mark.smoke`;tool-routing 只有 result privacy 與凍結 baseline 的有效
+字元數那兩條是 smoke;其餘三段不在 smoke 包。
 """
 from __future__ import annotations
 
@@ -234,7 +234,7 @@ def test_catalog_token_probe_falls_back_symmetrically_without_usage():
     assert "tools" in templates[1]
 
 
-def test_model_probe_endpoint_must_match_effective_opencode_provider(monkeypatch):
+def test_model_probe_endpoint_must_match_effective_profile(monkeypatch):
     """probe 的 endpoint 綁 deployment profile;與殘留設定不符時 fail-loud。
 
     2026-09-04:那個 endpoint 的來源從 `AICODE_LLAMA_BASE_URL` 換成
@@ -559,7 +559,7 @@ def test_saved_baseline_reproduces_pre_t2_live_measurement_and_stays_measured():
     assert catalog["input_schema_chars"] == 5_044
     assert catalog["output_schema_chars"] == 2_408
     assert catalog["catalog_chars"] == 33_299
-    assert catalog["opencode_effective_chars"] == 30_891
+    assert mcp_catalog.effective_chars(catalog) == 30_891
     assert catalog["instructions_chars"] == 0
     assert len(catalog["per_tool"]) == 19
 
@@ -581,7 +581,7 @@ def test_frozen_contract_accepts_only_the_exact_saved_historical_catalog():
         input_schema_chars=saved["input_schema_chars"],
         output_schema_chars=saved["output_schema_chars"],
         catalog_chars=saved["catalog_chars"],
-        opencode_effective_chars=saved["opencode_effective_chars"],
+        catalog_effective_chars=mcp_catalog.effective_chars(saved),
         tools_digest=saved["tools_digest"],
         instructions_digest=saved["instructions_digest"],
         canonical_tools_list_chars=saved["canonical_tools_list_chars"],
@@ -615,6 +615,71 @@ def test_frozen_contract_accepts_only_the_exact_saved_historical_catalog():
             replace(snapshot, tools=tuple(reversed(snapshot.tools))),
             row,
         )
+
+
+def _snapshot_from_frozen_row(saved: dict) -> mcp_catalog.CatalogSnapshot:
+    """把凍結的 baseline 還原成一份 snapshot(與 live 抓到的形狀相同)。"""
+    return mcp_catalog.CatalogSnapshot(
+        source="synthetic_historical_stdio",
+        tools=tuple(
+            mcp_catalog.CatalogTool(item["name"], "", {}, None, {"name": item["name"]})
+            for item in saved["per_tool"]
+        ),
+        instructions="",
+        per_tool=tuple(mcp_catalog.ToolCatalogCount(**item) for item in saved["per_tool"]),
+        description_chars=saved["description_chars"],
+        input_schema_chars=saved["input_schema_chars"],
+        output_schema_chars=saved["output_schema_chars"],
+        catalog_chars=saved["catalog_chars"],
+        catalog_effective_chars=mcp_catalog.effective_chars(saved),
+        tools_digest=saved["tools_digest"],
+        instructions_digest=saved["instructions_digest"],
+        canonical_tools_list_chars=saved["canonical_tools_list_chars"],
+    )
+
+
+@pytest.mark.smoke
+def test_the_effective_chars_field_survives_its_rename_across_the_frozen_data():
+    """有效字元數改了鍵名,凍結資料沒有:兩邊必須仍然真的在比對。
+
+    live 的 `summary()` 只寫新鍵,`era: "opencode"` 的歷史列只有舊鍵。讀取端
+    少了退回舊鍵那一段的話,凍結契約會拿兩個「都不存在」的欄位互比 —— 那是
+    最危險的形狀:報告照樣說「與歷史 baseline 相符」,而那一格根本沒比。
+    所以缺兩個鍵一律 fail-loud,不得靜靜當 0。
+    """
+    matrix = routing.load_support_matrix()
+    row = matrix["rows"][0]
+    saved = row["baseline"]["catalog"]
+
+    # 凍結資料是量出來的,不重造:它仍然只有舊鍵。
+    assert row["era"] == "opencode"
+    assert mcp_catalog.LEGACY_EFFECTIVE_CHARS_KEY in saved
+    assert mcp_catalog.EFFECTIVE_CHARS_KEY not in saved
+
+    snapshot = _snapshot_from_frozen_row(saved)
+    live = snapshot.summary()
+    # 新寫入只用新鍵;舊鍵不再被產生出來。
+    assert live[mcp_catalog.EFFECTIVE_CHARS_KEY] == 30_891
+    assert mcp_catalog.LEGACY_EFFECTIVE_CHARS_KEY not in live
+    # 同一個讀取端把兩種拼法解到同一個數字。
+    assert mcp_catalog.effective_chars(live) == mcp_catalog.effective_chars(saved)
+
+    # 兩個鍵都沒有 = 沒量過,不是 0。
+    with pytest.raises(mcp_catalog.CatalogError):
+        mcp_catalog.effective_chars({"catalog_chars": 33_299})
+
+    # 值真的漂了要擋下來(這一格仍在契約裡)。
+    routing.assert_frozen_catalog_contract(snapshot, row)
+    with pytest.raises(routing.EvalError):
+        routing.assert_frozen_catalog_contract(
+            replace(snapshot, catalog_effective_chars=30_890),
+            row,
+        )
+    # 歷史列少了舊鍵 = 契約不完整,不得當成「這一格不用比」。
+    incomplete = deepcopy(row)
+    del incomplete["baseline"]["catalog"][mcp_catalog.LEGACY_EFFECTIVE_CHARS_KEY]
+    with pytest.raises(routing.EvalError):
+        routing.assert_frozen_catalog_contract(snapshot, incomplete)
 
 
 # ── 原 test_code_smoke_eval.py:code-inference smoke fixture / metric 契約 ──
@@ -1130,6 +1195,67 @@ def test_recorder_requires_explicit_opt_in():
         recorder.main([])
 
 
+def _fake_llama_server(directory: Path, revision: str) -> Path:
+    """只會 echo 版本行的假 llama-server(離線;`--version` 的輸出形狀與真的相同)。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    exe = directory / "llama-server"
+    exe.write_text(f'#!/bin/sh\necho "version: {revision}"\n', encoding="utf-8")
+    exe.chmod(0o755)
+    return exe
+
+
+def _pin_llama_bin(home: Path, llama_bin: Path) -> None:
+    """tmp HOME 的 `deployment.json` 只釘 `llama_bin`(loader 只驗形狀,不驗存在)。"""
+    config_dir = home / ".config" / "codetrail"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "deployment.json").write_text(
+        json.dumps({"schema_version": 1, "llama_bin": str(llama_bin)}), encoding="utf-8"
+    )
+
+
+@pytest.mark.smoke
+def test_the_recorder_never_substitutes_a_path_binary_for_the_chosen_one(tmp_path, monkeypatch):
+    """`--llama-bin` / `deployment.json` 選定的 binary 用不了時,manifest 的 build 出處
+    不得悄悄變成 PATH 上另一顆的版本。
+
+    無聲的那條路:指定的檔打錯 / 已移除,PATH 上還有另一個版本的 `llama-server`,
+    於是 `llama_cpp.revision` 記的是那一顆 —— 錄製者要的 binary 與 manifest 宣稱的
+    build 不同,而且沒有任何 drift / fallback 提示。argv 指定的用不了要 fail-loud
+    (使用者打錯),檔案指定的在這台主機上不存在則誠實記 `unknown` 並指名來源;
+    選定的來源用得了就記**它的**版本。全部離線:假的 llama-server 只會 echo 版本。
+    """
+    path_binary = _fake_llama_server(tmp_path / "path-bin", "4242 (badc0de)")
+    monkeypatch.setenv("PATH", str(path_binary.parent) + os.pathsep + os.environ.get("PATH", ""))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    missing = tmp_path / "intended" / "llama-server"
+    assert not missing.exists()
+
+    # ① argv 指定的不存在:回傳值若是 PATH 那顆的版本,就是無聲替換。
+    build, raised = None, ""
+    try:
+        build = recorder._llama_build(str(missing))
+    except recorder.RecordError as exc:
+        raised = str(exc)
+    assert build is None or build.get("revision") == "unknown", build
+    assert "--llama-bin" in raised, (build, raised)
+
+    # ② deployment.json 指定的不存在:一樣不得撿 PATH 那顆;誠實記 unknown 並指名來源。
+    _pin_llama_bin(home, missing)
+    build = recorder._llama_build(None)
+    assert build["revision"] == "unknown", build
+    assert "deployment.json" in build["reason"], build
+    assert "4242" not in json.dumps(build), build
+
+    # ③ 選定的來源用得了:記它的版本,不是 PATH 那顆。
+    chosen = _fake_llama_server(tmp_path / "chosen", "1234 (feedface)")
+    assert recorder._llama_build(str(chosen))["revision"] == "version: 1234 (feedface)"
+    _pin_llama_bin(home, chosen)
+    assert recorder._llama_build(None)["revision"] == "version: 1234 (feedface)"
+
+
 # ============================================================
 # gate 只能擋 blocking family
 # ============================================================
@@ -1459,7 +1585,7 @@ def test_blind_bundle_hides_candidate_identity():
 
 
 @pytest.mark.smoke
-def test_opencode_timeout_is_a_scored_case_failure_not_a_suite_abort(
+def test_a_replay_timeout_is_a_scored_case_failure_not_a_suite_abort(
     monkeypatch,
     tmp_path: Path,
 ):
@@ -1491,7 +1617,7 @@ def test_opencode_timeout_is_a_scored_case_failure_not_a_suite_abort(
 
     def time_out(*_args, **_kwargs):
         raise subprocess.TimeoutExpired(
-            cmd=["opencode", "run"],
+            cmd=["python3", "codetrail_chat.py", "run"],
             timeout=3,
             output=partial_stream,
             stderr=b"private stderr",

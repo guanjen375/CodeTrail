@@ -57,22 +57,46 @@ def test_marker_selection_keeps_the_old_contract():
 
 
 @pytest.mark.parametrize(
-    ("env", "cpu_count", "expected"),
+    ("jobs", "cpu_count", "expected"),
     [
-        ({}, 1, 1),
-        ({}, 64, run_tests.MAX_PARALLEL_JOBS),
-        ({"AICODE_TEST_JOBS": "2"}, 64, 2),
-        ({"AICODE_TEST_JOBS": " 1 "}, 64, 1),
+        (None, 1, 1),
+        (None, 64, run_tests.MAX_PARALLEL_JOBS),
+        (2, 64, 2),
+        (1, 64, 1),
     ],
 )
-def test_parallel_job_resolution(env, cpu_count, expected):
-    assert run_tests._resolve_parallel_jobs(env, cpu_count=cpu_count) == expected
+def test_parallel_job_resolution(jobs, cpu_count, expected):
+    assert run_tests._resolve_parallel_jobs(jobs, cpu_count=cpu_count) == expected
 
 
 @pytest.mark.parametrize("value", ["0", str(run_tests.MAX_PARALLEL_JOBS + 1), "many", "1.5"])
 def test_parallel_job_resolution_rejects_invalid_values(value):
-    with pytest.raises(ValueError, match="AICODE_TEST_JOBS"):
-        run_tests._resolve_parallel_jobs({"AICODE_TEST_JOBS": value}, cpu_count=64)
+    with pytest.raises(ValueError, match="--jobs"):
+        run_tests.parse_jobs(["--jobs", value])
+
+
+@pytest.mark.parametrize(("argv", "expected"), [
+    (["--jobs", "3"], (3, [])),
+    (["--jobs=3"], (3, [])),
+    (["--jobs", "1", "-m", "smoke"], (1, ["-m", "smoke"])),
+    (["-m", "smoke", "--jobs=2"], (2, ["-m", "smoke"])),
+    (["--jobs", "2", "tests/test_a.py::test_b"], (2, ["tests/test_a.py::test_b"])),
+    (["-k", "cli"], (None, ["-k", "cli"])),
+])
+def test_jobs_is_eaten_before_the_shape_is_decided(argv, expected):
+    """`--jobs` 在形狀判斷之前就被抽掉:`--jobs 1 -m smoke` 仍是「純 -m」那個
+    形狀,而轉發模式帶著它也不會被當成 pytest 的參數丟過去。"""
+    assert run_tests.parse_jobs(argv) == expected
+
+
+@pytest.mark.parametrize("argv", [
+    ["--jobs"],                      # 少了值
+    ["--jobs", "2", "--jobs", "3"],  # 給兩次:哪一個生效不該用猜的
+    ["--jobs="],
+])
+def test_jobs_rejects_ambiguous_argv(argv):
+    with pytest.raises(ValueError, match="--jobs"):
+        run_tests.parse_jobs(argv)
 
 
 # ---------------------------------------------------------------------------

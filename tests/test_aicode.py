@@ -307,15 +307,6 @@ def test_a_polluted_shell_changes_nothing(tmp_path):
 # ============================================================
 # 靜態契約
 # ============================================================
-def test_aicode_never_execs_opencode():
-    """正常路徑不得 exec 任何 opencode 二進位。"""
-    source = (REPO_ROOT / "aicode").read_text(encoding="utf-8")
-    for line in source.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("exec "):
-            assert "opencode" not in stripped, stripped
-
-
 def test_the_wrapper_stays_thin():
     """wrapper 只做那四件事。它一長回來就代表 preflight 又漏回 shell 了 ——
     而 shell 裡的那一份沒有測試、沒有型別、只能用 export 交接。"""

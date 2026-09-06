@@ -21,6 +21,7 @@ patch / command」排列。內容很長時可先用頁面搜尋找下列關鍵�
 | server / RAG 異常 | `llama-server 不可連`、`embedding`、`查 spec 沒結果` |
 | 修改工具被拒 | `apply_patch`、`run_command` |
 | 送出新問題卻先跑出一段摘要 / 壓縮停住要你重送 | `壓縮` |
+| 從舊世代前端升級,舊設定還被接管著 | `a1682d5` |
 
 ### Build llama.cpp 時 `nvcc fatal : Unsupported gpu architecture 'compute_120a'`
 
@@ -154,39 +155,6 @@ python3 deployment_profile.py validate     # 確認 schema 過
 
 代價:前期載入慢 1.5–2.5 分鐘(把整份 weights 讀進 RAM),之後 TTFT 穩定在 5–15 秒。
 RAM 不夠的就保持 mmap 接受偶爾卡頓,或換較小模型 / 調高 CPU-MoE 層數。
-
-### `aicode` 說「偵測到舊 OpenCode 安裝留下的 CodeTrail 設定」
-
-CodeTrail 已不再啟動 OpenCode。但舊版曾經把幾個值寫進你的
-`~/.config/opencode/opencode.json`:壓縮的四個受管 `compaction.*` 鍵,以及兩個
-指向本 repo 的 plugin 項。
-
-留著不管的後果不是「多幾個沒用的設定」:
-
-- `compaction.auto = false` 會一直生效——那是 CodeTrail 接管時關掉的,不還原的話
-  你的 OpenCode 從此不再自動壓縮,而且沒有人負責。
-- plugin 項指向本 repo 的檔案路徑。那兩個檔一旦被刪,你在**其他專案**開 OpenCode
-  都會因為載不到 plugin 而起不來,而錯誤訊息不會提到 CodeTrail。
-
-解除是**手動**的一次性動作。`./set_config.sh` 已經不再順帶遷移——寫別人的設定不該
-搭在「設定我自己」這件事上,而且判不出狀態時它會擋住你設定自己的東西:
-
-```bash
-cd <CODETRAIL_REPO>
-python3 opencode_migrate.py --check   # 先看會做什麼(零寫入)
-python3 opencode_migrate.py           # 實際執行(有備份)
-```
-
-只還原**現值仍等於 CodeTrail 寫入值**的鍵(你自己改過的一律不動)、只移除
-path 對得上的 plugin 項;`mcp.codetrail` 與 `permission` **不動**——`mcp_server.py`
-仍然可以被任何 MCP client 用。
-
-同一台機器上有**兩份** CodeTrail 時,ownership 狀態檔只有一份。它記的 plugin 路徑
-若是另一份安裝的、而那份還在,這裡會直接說明並零寫入——要解除那一份,到寫它的那個
-checkout 執行同一個指令。
-
-過渡期那兩個 plugin 檔留成 inert stub:只在 session 建立時 toast 一次「請執行遷移」,
-不掛任何其他 hook、不改任何工具結果。遷移完成後註冊項會被移除,它們就再也不會被載入。
 
 <a id="mcp-connected-but-no-tool-call"></a>
 ### `/tools` 列得出 19 個,但模型說沒有 CodeTrail 或只印出假工具 XML
@@ -620,32 +588,83 @@ rm -f "$HOME/.local/bin/aicode_web"   # 舊的 symlink(已移除的背景 launch
 之後就只剩一個入口:`cd <PROJECT_TO_ANALYZE> && aicode`。要遠端操作就 SSH 進這台機器;
 斷線不中斷把它跑在 `tmux new -s codetrail` 裡,回來 `tmux attach -t codetrail`。
 
-### 從 OpenCode 世代升級:解除舊的設定接管
+### 從舊世代前端升級:用 `a1682d5` 解除舊的設定接管
 
-舊版 CodeTrail 會啟動 OpenCode,並把幾個值寫進 `~/.config/opencode/opencode.json`
-(`compaction.*` 的四個受管鍵 + 兩個 plugin 項)。現在的 runtime 完全不讀寫那份設定,
-所以那些值沒有人負責:
+`a1682d5` 之前的 CodeTrail 會啟動另一個 Node 前端,並把幾個值寫進那個前端的設定檔
+`~/.config/opencode/opencode.json`(`compaction.*` 的四個受管鍵 + 兩個 plugin 項),
+接管紀錄則放在 `~/.config/codetrail/compaction.json`。**本版不再附帶那支還原工具
+(`opencode_migrate.py`)與那兩個 plugin 檔**,runtime 也永遠不讀、不寫、不刪
+`~/.config/opencode/*` 與 `~/.config/codetrail/compaction.json` —— 所以留著的那些值
+沒有人負責:
 
-- `compaction.auto = false` 一直生效 —— 你的 OpenCode 從此不再自動壓縮。
-- plugin 項指向這個 repo 的檔案路徑。那兩個檔被刪掉之後,你在**其他專案**開 OpenCode
-  都會因為載不到 plugin 而起不來,而錯誤訊息不會提到 CodeTrail。
+- `compaction.auto = false` 一直生效 —— 那個前端從此不再自動壓縮。
+- plugin 項指向某個 checkout 的檔案路徑。那兩個檔被刪掉之後,你在**其他專案**開那個
+  前端都會因為載不到 plugin 而起不來,而錯誤訊息不會提到 CodeTrail。
 
-解除是一次性的手動動作(不再搭在 `./set_config.sh` 上——寫別人的設定不該跟著
-「設定我自己」一起發生):
+**先找出「原安裝路徑」。** 看 `~/.config/opencode/opencode.json` 的 `plugin` 陣列:
+CodeTrail 註冊的項一定是 `<某個 checkout>/opencode_plugins/codetrail-notify.js` 或
+`…/codetrail-compaction.js` 的**完整路徑**,那個 checkout 就是原安裝路徑。整個陣列裡
+沒有這兩個檔名 = 這台機器沒被接管過,下面的步驟都不必做(只要確認
+`~/.config/codetrail/compaction.json` 也不存在)。
+
+**解除只有一種做法:把原安裝路徑固定回 `a1682d5`,跑它自己的工具。** `a1682d5` 是最後一個
+附帶那支工具的 commit。工具只認 `PLUGIN_DIR` = **執行它的那個 checkout** 的路徑,所以
+換個地方執行只會回報「無需變更」而殘留照樣還在。依你的情況三選一:
 
 ```bash
+# (a) 原安裝路徑就是這份 checkout
 cd <CODETRAIL_REPO>
-python3 opencode_migrate.py --check   # 零寫入,只列出會做什麼
-python3 opencode_migrate.py           # 實際執行(有備份)
+git status --porcelain                # 必須是空的,否則先收乾淨
+git checkout --detach a1682d5
+python3 opencode_migrate.py --check   # a1682d5 的工具:零寫入,只列出會做什麼
+python3 opencode_migrate.py           # a1682d5 的工具:實際執行(有備份)
+git checkout -
+
+# (b) 原安裝路徑已經不在了 —— 用 a1682d5 在**同一個路徑**重建,做完再刪掉
+git worktree add <原安裝路徑> a1682d5
+cd <原安裝路徑> && python3 opencode_migrate.py --check && python3 opencode_migrate.py   # a1682d5 的工具
+cd <CODETRAIL_REPO> && git worktree remove <原安裝路徑>
+
+# (c) 原安裝路徑是另一份還在的安裝 —— 到那份 checkout 用它自己的工具,不要在這裡跑
 ```
 
-只還原**現值仍等於 CodeTrail 寫入值**的鍵:你事後手改過的值原封不動。
-`mcp.codetrail` 與 `permission` 一個字都不動。沒有狀態檔、也沒有我們的 plugin 項的
-機器:一個 byte 都不會被碰。
+先跑 `--check` 就是演練:它零寫入,只列出會做什麼,看過再跑實際那條。它在動任何東西之前
+會自己確認四件事,任一不成立就停下來報錯、**零寫入**:
 
-同一台機器上有**兩份** CodeTrail(舊 checkout 與現在這一份)時,ownership 狀態檔只有
-一份。如果它記的 plugin 路徑是另一份安裝的、而那份還在,這裡會直接說明並零寫入 ——
-要解除那一份,到寫它的那個 checkout 執行同一個指令。
+- 狀態檔的來源可信:`~/.config/codetrail` 是真目錄、`compaction.json` 是常規檔,兩者都屬於你、
+  權限分別是 `0700` 與 `0600`。
+- 狀態檔的形狀與 `digest` 相符。digest 涵蓋 `managed.<key>.prior`,也就是還原時要寫回設定的
+  原值;對不上就是狀態檔被改過。
+- 狀態檔綁的是正在處理的這份 `opencode.json`(路徑與 realpath 兩個雜湊都要對)。
+- plugin 項不是另一份仍存在的安裝寫的。
+
+停下來的情況各有明確處置。回報「另一份安裝的接管」= 原安裝路徑不是這裡,那是情況 (c):
+到那份 checkout 用它自己的工具。回報「無法確認」、或狀態檔存在但無法信任 = 判不出原值:
+把設定與狀態檔**原樣留著**(見下面「現在不能做 git 操作時」),不要自己動手硬刪 ——
+判不出來的東西刪掉就回不來了。
+
+**沒有完全手動的路徑。** 還原的依據是狀態檔裡記下的原值,而「這份狀態檔可不可信」只能在
+讀取它的**同一次**開檔裡確認:`a1682d5` 的工具以目錄 fd 錨定 `~/.config/codetrail`、用
+`O_NOFOLLOW` 開檔、對開起來的那個 fd 驗 owner 與權限、從同一個 fd 讀出內容並驗 digest,
+再用那一次讀到的內容規劃還原。改用 `stat`、`cat` 與編輯器分成好幾步做,每一步都是重新以
+路徑找檔:先看過的與後來寫回去的不保證是同一份,中間被換成 symlink 或另一份檔案也不會有
+任何錯誤訊息。手動做不到「驗過的就是用到的」,所以本文件不提供手動核對的命令,也不提供
+逐鍵寫回原值、刪 plugin 項或刪狀態檔的步驟;不要照別處看來的片段自己拼一套。
+
+**現在不能做 git 操作時:保留設定、保留狀態檔,之後再解除。**
+
+- `~/.config/opencode/opencode.json` 的 `compaction.*`、`plugin`、`mcp.codetrail` 與 `permission`
+  一個字都不動;`~/.config/codetrail/compaction.json` 不刪、不改。狀態檔是唯一能證明
+  「哪些值本來是什麼」的東西:它的 `digest` 涵蓋原值,改過就對不上,工具會停下來,你也就
+  再也證明不了原值。
+- 留著的代價只有本節開頭那兩個症狀,而且只影響那個舊前端。本版 CodeTrail 的任何功能都不讀
+  這兩份檔,不受影響。
+- 能在原安裝路徑跑固定舊版時,回到上面的三選一;先 `--check`,再實際執行。
+
+**升級注意**:本版的 `~/.config/codetrail/deployment.json` 多了 `llama_bin` 與
+`services.<role>.gpu` 兩種鍵。同一台機器上如果還有共用 `~/.config/codetrail/` 的舊世代
+checkout,它的 loader 會對這兩個未知鍵 fail-loud(那是刻意的封閉 schema);重跑本版的
+`./set_config.sh` 也會覆寫 `~/start.sh`。兩份安裝要並存的話,舊那份也要一起升級。
 
 ### 分析不信任的 repo:擋專案自帶的指示
 
@@ -689,7 +708,6 @@ aicode
 一般修法就是重跑設定並重啟，讓同一個主 n_ctx 重新展開到所有 consumer：
 
 ```bash
-unset AICODE_DYNAMIC_NUM_CTX_MAX AICODE_NUM_CTX  # 兩個都已刪除;清掉舊版 shell 殘留(若有)
 cd <CODETRAIL_REPO>
 ./set_config.sh                                  # 主 n_ctx 只填這一次
 ~/start.sh stop
@@ -733,7 +751,7 @@ top-level `image_data` 可能被新版 llama.cpp 靜默忽略，造成模型只�
 報告超出上限時,**還沒有呼叫任何 VL、沒有算 embedding、沒有動 `knowledge.json`** —— 零寫入,
 不需要善後。報告會指出是哪一項超出:
 
-| 報告欄位 | 上限常數(env 同名加 `AICODE_` 前綴) | 預設 |
+| 報告欄位 | 上限常數(`config.py`;沒有環境變數可以覆寫) | 預設 |
 |---|---|---|
 | `candidates` | `FIGURE_MAX_CANDIDATES_PER_DOC` / `FIGURE_MAX_CANDIDATES_PER_PAGE` | 200 / 12 |
 | `tiles` | `FIGURE_MAX_TILES_PER_CANDIDATE` | 8 |

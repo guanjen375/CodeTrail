@@ -74,7 +74,7 @@ class InteractivePolicy:
             return Decision.ASK
         # 其餘一律 allow —— 包含 ingest_document / reload_knowledge_base
         # 這幾個「不是唯讀但也不需要每次問」的工具。
-        # 這與 OpenCode 時代的權限表逐條相同(`codetrail_*: allow` 再把六個覆成
+        # 這與舊世代前端的權限表逐條相同(`codetrail_*: allow` 再把六個覆成
         # ask),不是放寬:改成「非唯讀就 ask」會讓一次 ingest 多跳一個核准框,
         # 那是使用者沒要求過的行為改變。
         #

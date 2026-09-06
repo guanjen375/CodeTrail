@@ -53,7 +53,7 @@ from deployment_status import (  # noqa: E402
 )
 from model_resolution import (  # noqa: E402
     main_model_references_equivalent,
-    resolve_main_model_from_env,
+    resolve_main_model,
 )
 from scripts import tool_call_canary  # noqa: E402
 
@@ -429,22 +429,23 @@ _PROFILE_OVERRIDE = ""
 
 
 def _profile_env() -> dict[str, str]:
-    """交給 `deployment_profile` / `model_resolution` 的環境:HOME + `--profile`。
+    """交給 `deployment_profile` / `model_resolution` 的環境:**只有 HOME**。
 
-    doctor 的工作是回報「客戶端真的會用什麼」。交整份 `os.environ` 的話,它讀到
-    的是殼層污染後的值,於是最需要 doctor 的那種情況(兩份安裝混用)它剛好報成
-    正常 —— 而客戶端自己是不看那些變數的。
+    doctor 的工作是回報「客戶端真的會用什麼」,而客戶端交給 loader 的也只有 HOME。
+    `--profile` 走 `_profile_selection()` 那個 kwarg,不是塞進這份 env —— 覆寫是
+    呼叫端的交接,不是一個藏在環境裡的隱形設定。
     """
     home = os.environ.get("HOME")
     if home:
-        env = {"HOME": home}
-    else:
-        # Windows fallback,而且**只有** HOME 缺席時才交。
-        profile = os.environ.get("USERPROFILE")
-        env = {"USERPROFILE": profile} if profile else {}
-    if _PROFILE_OVERRIDE:
-        env["AICODE_PROFILE"] = _PROFILE_OVERRIDE
-    return env
+        return {"HOME": home}
+    # Windows fallback,而且**只有** HOME 缺席時才交。
+    profile = os.environ.get("USERPROFILE")
+    return {"USERPROFILE": profile} if profile else {}
+
+
+def _profile_selection() -> str | None:
+    """`--profile` 選的 deployment profile;沒指定就是 None(照設定檔)。"""
+    return _PROFILE_OVERRIDE or None
 
 
 def check_models(r: Result, server_status: dict[str, dict]) -> None:
@@ -462,7 +463,7 @@ def check_models(r: Result, server_status: dict[str, dict]) -> None:
         )
         return
 
-    resolved = resolve_main_model_from_env(_profile_env())
+    resolved = resolve_main_model(_profile_env(), profile=_profile_selection())
     suffix = f" [from {resolved.source or 'runtime'}]"
     if resolved.path:
         suffix += f" {resolved.path}"
@@ -521,7 +522,7 @@ def check_deployment_profile(
 ) -> None:
     """Validate the effective profile and, online, its model/GPU placement."""
     try:
-        profile = load_effective_profile(_profile_env())
+        profile = load_effective_profile(_profile_env(), profile=_profile_selection())
     except ProfileError as exc:
         r.fail(f"deployment profile invalid: {exc}")
         return
@@ -552,7 +553,9 @@ def check_deployment_profile(
         if not loaded:
             continue
         try:
-            expected = resolve_model_reference(service.model, _profile_env())
+            expected = resolve_model_reference(
+                service.model, _profile_env(), registry_file=profile.registry_file
+            )
         except ProfileError as exc:
             r.fail(f"profile [{role}] expected model cannot be resolved: {exc}")
             continue
@@ -578,11 +581,6 @@ def check_deployment_profile(
     inspection = inspect_deployment(
         profile,
         gpu_processes,
-        # `environ` 在這裡**只**被拿去 `resolve_model_reference`(models.json 的
-        # registry 查表)。交整份 `os.environ` 的話,殼層殘留的
-        # `AICODE_MODEL_REGISTRY*` 會讓 doctor 用另一份 registry 去判「server 載入
-        # 的是不是對的 GGUF」—— 那是它最該答對的一題。
-        environ=_profile_env(),
         server_reader=server_reader,
         gpu_inventory=query_gpu_inventory(),
     )
@@ -736,7 +734,7 @@ def check_tool_call_canary_diagnostic(
 # Context settings
 # ============================================================
 def check_client_entry(r: Result) -> None:
-    """客戶端進入點在不在。CodeTrail 不再需要 Node / npm / opencode-ai。"""
+    """客戶端進入點在不在。CodeTrail 的介面只有這一個 Python 客戶端。"""
     entry = REPO_ROOT / "codetrail_chat.py"
     if entry.is_file():
         r.ok(f"CodeTrail 客戶端進入點存在: {entry}")
@@ -788,41 +786,6 @@ def check_legacy_web_backend(r: Result) -> None:
         r.warn(hint)
     else:
         r.ok("沒有殘留的網頁 backend")
-
-
-def check_legacy_opencode_install(r: Result) -> None:
-    """舊 OpenCode 安裝留下的 CodeTrail 設定。**唯讀偵測**,不修。
-
-    為什麼是 doctor 的事:那些值(`compaction.auto=false`、指向本 repo 的
-    plugin 路徑)現在沒有人負責。plugin 檔一旦被刪,使用者在**其他專案**開
-    OpenCode 都會失敗,而錯誤訊息不會提到 CodeTrail。
-
-    修法是使用者**手動**跑一次 `python3 opencode_migrate.py` —— 那是這一份
-    安裝裡唯一還會寫使用者 OpenCode 設定的路徑。`set_config` 已經不做遷移:
-    寫別人的設定不該搭在「設定我自己」這件事上。
-    """
-    try:
-        import opencode_migrate
-
-        plan = opencode_migrate.plan_migration()
-    except Exception as exc:  # noqa: BLE001 - 診斷不得因此中斷
-        r.info(f"舊 OpenCode 設定未檢查({type(exc).__name__})")
-        return
-    if plan.foreign_owner:
-        r.info(
-            "OpenCode 的接管紀錄是另一份 CodeTrail 安裝寫的"
-            f"({plan.foreign_owner} 還在);這一份不會動它。"
-        )
-        return
-    if not plan.needed:
-        r.ok("沒有舊 OpenCode 安裝留下的 CodeTrail 設定")
-        return
-    r.warn(
-        "偵測到舊 OpenCode 安裝留下的 CodeTrail 設定(壓縮受管值 / plugin 項)。\n"
-        "        解除(只還原仍有 ownership 證據的值,有備份):\n"
-        "          python3 opencode_migrate.py --check   # 先看一眼,零寫入\n"
-        "          python3 opencode_migrate.py           # 實際執行"
-    )
 
 
 def check_context_settings(r: Result) -> None:
@@ -1309,7 +1272,6 @@ def main(argv: list[str] | None = None) -> int:
     print("\n-- CodeTrail 客戶端 --")
     check_client_entry(r)
     check_legacy_web_backend(r)
-    check_legacy_opencode_install(r)
 
     print("\n-- tool-call canary cache --")
     check_tool_call_canary_diagnostic(

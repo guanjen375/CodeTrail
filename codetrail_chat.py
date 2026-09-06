@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -83,12 +84,14 @@ def _resolve_root(raw: str | None) -> Path:
 
 
 def _cli_model(raw: str) -> str:
-    """`--model` 走跟 `aicode -m` / `AICODE_MODEL` 同一套正規化。
+    """`--model`(只掛在 headless `run` 上)與 `deployment.json` 的 `services.main.model`
+    走同一套正規化(`model_resolution.normalize_main_model`)。
 
-    wrapper 會把 `llamacpp/foo` 剝成 `foo` 再寫進 AICODE_MODEL;直接執行
-    `codetrail_chat.py --model llamacpp/foo` 以前拿到的是 raw 字串,於是 wrapper 與
-    客戶端用了兩個不同的模型名稱。外部 provider(openai/ 等)一律拒絕:
-    CodeTrail 只跑本地 llama-server。
+    以前 wrapper 與客戶端各自解析:wrapper 把 `llamacpp/foo` 剝成 `foo`,而直接執行
+    `codetrail_chat.py --model llamacpp/foo` 拿到的是 raw 字串,於是兩邊用了兩個不同的
+    模型名稱。現在主模型只有 `deployment.json` 一個來源,`--model` 是這一次的覆寫,
+    兩條路都經過同一個函式。外部 provider(openai/ 等)一律拒絕:CodeTrail 只跑本地
+    llama-server。
     """
     value = raw.strip()
     if not value:
@@ -379,7 +382,10 @@ def command_sessions(args: argparse.Namespace) -> int:
     root = _resolve_root(getattr(args, "root", None))
     store = client_store.SessionStore(root)
     for info in store.list_sessions():
-        print(f"{info.session_id}\tturns={info.turns}\t{info.title}")
+        # `title` 永遠是空的(建 session 時沒有東西可以命名它);大綱取的是使用者
+        # 自己問過的第一句話,零 LLM、零寫入(client_store.session_outline)。
+        updated = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(info.updated))
+        print(f"{info.session_id}\tturns={info.turns}\tupdated={updated}\t{info.first_prompt}")
     return 0
 
 

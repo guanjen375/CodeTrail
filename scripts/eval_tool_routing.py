@@ -49,6 +49,8 @@ import client_policy  # noqa: E402
 import client_prompt  # noqa: E402
 import model_resolution  # noqa: E402
 from scripts.mcp_catalog import (  # noqa: E402
+    EFFECTIVE_CHARS_KEY,
+    LEGACY_EFFECTIVE_CHARS_KEY,
     CatalogError,
     CatalogSnapshot,
     StdioMcpCommand,
@@ -56,6 +58,7 @@ from scripts.mcp_catalog import (  # noqa: E402
     assert_public_tool_contract,
     catalog_from_fastmcp,
     catalog_from_stdio,
+    effective_chars,
     json_digest,
     measure_catalog_prompt_tokens,
     text_digest,
@@ -370,7 +373,6 @@ _FROZEN_CATALOG_FIELDS = (
     "input_schema_chars",
     "output_schema_chars",
     "catalog_chars",
-    "opencode_effective_chars",
     "instructions_chars",
     "tools_digest",
     "instructions_digest",
@@ -380,16 +382,32 @@ _FROZEN_CATALOG_FIELDS = (
 )
 
 
+def _frozen_effective_chars_key(row: Mapping[str, Any]) -> str:
+    """Which key the frozen row must spell the effective character count with.
+
+    Rows measured before the client rewrite carry ``"era"`` and were recorded
+    with the legacy key; the field is measured data, so the matrix keeps it.
+    """
+
+    return LEGACY_EFFECTIVE_CHARS_KEY if row.get("era") == "opencode" else EFFECTIVE_CHARS_KEY
+
+
 def assert_frozen_catalog_contract(snapshot: CatalogSnapshot, row: Mapping[str, Any]) -> None:
     """Accept a historical server only when every frozen catalog field matches."""
 
     baseline = row.get("baseline")
     expected = baseline.get("catalog") if isinstance(baseline, Mapping) else None
-    if not isinstance(expected, Mapping) or any(field not in expected for field in _FROZEN_CATALOG_FIELDS):
+    required = (*_FROZEN_CATALOG_FIELDS, _frozen_effective_chars_key(row))
+    if not isinstance(expected, Mapping) or any(field not in expected for field in required):
         raise EvalError("matrix row lacks a complete frozen catalog contract")
     actual = snapshot.summary(include_per_tool=True)
     actual["tool_order"] = list(snapshot.tool_names)
     if any(actual[field] != expected[field] for field in _FROZEN_CATALOG_FIELDS):
+        raise EvalError("live catalog differs from the frozen matrix baseline contract")
+    # The live summary writes the current key, the frozen row the historical
+    # one.  Both sides resolve through the same reader so the comparison stays a
+    # comparison instead of quietly turning into "neither side had the field".
+    if effective_chars(actual) != effective_chars(expected):
         raise EvalError("live catalog differs from the frozen matrix baseline contract")
 
 
@@ -1093,7 +1111,7 @@ def write_private_result(path: Path, value: Mapping[str, Any]) -> None:
 def client_identity(root: Path) -> str:
     """跑這次評測的客戶端身分。
 
-    以前這一格是 `opencode --version` —— 那是決定「模型看到什麼、工具怎麼被
+    以前這一格是舊世代前端的版本字串 —— 那是決定「模型看到什麼、工具怎麼被
     呼叫」的那一端。現在那一端是我們自己的客戶端,所以身分換成 engine /
     prompt / 進入點三個檔的內容雜湊加上 system prompt 的 digest。
     """
@@ -1218,7 +1236,7 @@ def _model_server_base_url(
 ) -> str:
     """Bind direct token/props probes to the endpoint the client will use.
 
-    `config` 是空的(去 OpenCode 化之後沒有第二份 provider 設定);留著參數是為了
+    `config` 是空的(舊世代前端拿掉之後沒有第二份 provider 設定);留著參數是為了
     result identity 的 digest 形狀不變。真正的來源是 **deployment profile**
     (`config.LLAMA_BASE_URL`)—— 以前是 `AICODE_LLAMA_BASE_URL`,殼層殘留一個值
     就會讓 15 題去打別台機器的 server,結果卻歸到本機的 identity。
@@ -1287,7 +1305,7 @@ def compatibility_identity(
         build_digest = text_digest(str(build_info))
     else:
         build_digest = None
-    # 「這一臂的契約」= 模型實際看到的東西。OpenCode 時代那兩格是 build prompt
+    # 「這一臂的契約」= 模型實際看到的東西。舊世代前端那兩格是 build prompt
     # 與 todowrite 權限;現在那兩件事的等價物是客戶端的基底規則與 ask 工具集合
     # (`effective_config` 永遠是空的,留著它們等於把兩個常數 hash 進去)。
     arm_contract_digest = json_digest(
@@ -1298,7 +1316,7 @@ def compatibility_identity(
             "ask_tools": sorted(client_policy.ASK_TOOLS),
         }
     )
-    # 以前這一格 hash 的是 OpenCode 的全域 AGENTS.md;現在模型每一輪看到的
+    # 以前這一格 hash 的是舊世代前端的全域 AGENTS.md;現在模型每一輪看到的
     # 使用者層規則是 `~/.config/codetrail/instructions.md`,hash 它(鍵名不改,
     # result / matrix 的形狀維持;歷史 row 的值本來就對不上現行客戶端)。
     global_agents_digest = None
@@ -1330,7 +1348,7 @@ def compatibility_identity(
 
 
 def _client_rules_digest() -> str:
-    """客戶端基底規則的 digest(OpenCode 時代 build prompt 的等價物)。"""
+    """客戶端基底規則的 digest(舊世代前端 build prompt 的等價物)。"""
     return text_digest(client_prompt.BASE_RULES)
 
 
@@ -1529,7 +1547,7 @@ def _run_explicit_canary_gate(
 def _ask_permission_contract(_config: Mapping[str, Any] | None = None) -> bool:
     """六個寫入工具仍然是 ask。
 
-    以前這是讀 opencode.json 的 `permission`;現在權限是客戶端的 policy,所以
+    以前這是讀舊世代前端設定檔的 `permission`;現在權限是客戶端的 policy,所以
     契約檢查的對象換成那份 policy 本身 —— 而 eval 一律跑 readonly,連 ask 都
     不會發生。保留這個函式是為了讓報告欄位語意不變。
     """
@@ -1582,10 +1600,11 @@ async def _prepare_synthetic_knowledge(
     except ImportError as exc:
         raise EvalError("mcp package is required to prepare the synthetic KB") from exc
     # root 走 argv;設定走 client.json。環境裡不留任何 CodeTrail 名稱 —— 殼層的
-    # 殘留值不得決定這次評測的 sandbox 邊界或資料收集行為。
+    # 殘留值不得決定這次評測的 sandbox 邊界或資料收集行為。前綴清單走
+    # `process_env` 的那一份:抄一份字面值就是「那邊多剝一個、這裡沒有」。
     server_env = {
         key: value for key, value in environment.items()
-        if not key.startswith(("AICODE_", "AI_CODE_", "CODETRAIL_", "OPENCODE_"))
+        if not key.startswith(process_env.STRIPPED_ENV_PREFIXES)
     }
     args = _server_args_for_root(command, project)
     params = StdioServerParameters(
@@ -1669,7 +1688,7 @@ async def _acquire_catalog(
         finally:
             os.chdir(previous_cwd)
         return catalog, None
-    # 客戶端啟動 MCP server 的方式就是這一條;沒有第二份 OpenCode 設定可以抽。
+    # 客戶端啟動 MCP server 的方式就是這一條;沒有第二份前端設定可以抽。
     # 走 client_mcp 的常數而不是自己拼路徑,兩邊才不會各自漂移。
     command = StdioMcpCommand(
         (sys.executable, str(client_mcp.SERVER_SCRIPT), "--root", str(root)),
