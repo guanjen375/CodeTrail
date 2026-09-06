@@ -18,3 +18,9 @@ Astra 審核將透過明指 `model=gpt-6-astra`、`reasoning_effort=max` 的 Cod
 第 3 階段已啟動：請求 `claude-fable-5-1[1m] --effort max`；init 回傳 `claude-fable-5-1`，assistant 回傳 `claude-fable-5-1`；原始串流 `03-fable-final.stream.jsonl` 留在本機暫存目錄。
 
 第 3 階段完成：`03-fable-final` exit 0 / result success；init 與 assistant 皆為 `claude-fable-5-1`，明傳 `--effort max`。最終計畫 `plan-final.md` 已定稿；只改交接文件，零測試。
+
+第 4 階段以最終計畫 commit `23e8a00` 開始。W0 `04-opus-S-red` 明傳 `--model claude-opus-5 --effort max`；init 與 assistant 均回傳 `claude-opus-5`。此步僅寫新 regression、取紅，不改 runtime。
+
+W0 完成：`04-opus-S-red` exit 0 / result success；兩個新 node 各執行一次，皆 collected 1 / exit 1 / 預期重播斷言失敗。紅燈時 runtime 零 diff，證據見 `handoff-S-red.md`。
+
+W1 放行 `04-opus-S`、`04-opus-B`、`04-opus-C1` 三個獨立 Claude CLI；各明传 `--model claude-opus-5 --effort max`，分工依最終計畫。
