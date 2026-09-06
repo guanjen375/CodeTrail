@@ -60,3 +60,5 @@ W3 D1 完成：`04-opus-D1` exit 0 / result success，init / assistant = `claude
 第 5 階段 `05-fable-fix-02` 完成：明傳 `claude-fable-5-1[1m] --effort max`，init / assistant = `claude-fable-5-1`，CLI exit 0 / result success。init 工具清單只有 Edit/Glob/Grep/Read/Write，沒有 Bash/Agent/MCP；只改 troubleshooting 與 fix-02.md，零命令／測試／探查。B-05 改為固定舊版原安裝工具，移除不可靠的完全手動還原。交接另找到 AGENTS 同一條中的「手動路徑」舊措辭，延伸同一 B-05 文件消費者修復交 Fable 做文字同步，之後再凍結供 Astra 審核。
 
 `05-fable-fix-02b` 完成：明傳 `claude-fable-5-1[1m] --effort max`；init / assistant = `claude-fable-5-1`，CLI exit 0 / result success。只有 AGENTS 一句引用與 fix-02b.md，零執行。fix-02 的完整日誌另顯示兩個範圍外記憶 Edit，已由編排者精確撤回並記入 execution-notes；作者交接所稱只改兩檔須以此核對更正。最終文件一致性 `python3 scripts/check_readme_consistency.py` exit 0；`git diff --check` exit 0。
+
+第 5 階段 ASTRA 第 3 輪已定稿：`implementation-review-03.md`，Static Active Blocker 0；B-05 fallback 與 AGENTS 引用解除。產品樹 58 路徑與 review-03 fingerprint 相符；runtime/tests 自 review-02 未變。審核者未執行測試／探查，只新增報告。編排者接續預定的唯一一次 `python3 scripts/run_tests.py -m smoke`，不執行 full。
