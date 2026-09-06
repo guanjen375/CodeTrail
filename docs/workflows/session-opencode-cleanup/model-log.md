@@ -4,8 +4,10 @@
 
 | 階段 | 明確請求 model | 明確 effort | init model | assistant model | 狀態 |
 | --- | --- | --- | --- | --- | --- |
-| 1 初步規劃 | `claude-fable-5-1[1m]` | `--effort max` | `claude-fable-5-1` | `claude-fable-5-1` | 進行中 |
+| 1 初步規劃 | `claude-fable-5-1[1m]` | `--effort max` | `claude-fable-5-1` | `claude-fable-5-1` | success |
 | 實作模型可用性探測 | `claude-opus-5` | `--effort max` | `claude-opus-5` | `claude-opus-5` | success |
+
+第 2 階段已啟動 `/root/astra_review`，請求 `model=gpt-6-astra`、`reasoning_effort=max`；編排工具回傳 task name `/root/astra_review`，沒有獨立的服務端 model/effort 回報欄位。
 
 Astra 審核將透過明指 `model=gpt-6-astra`、`reasoning_effort=max` 的 Codex 子代理執行，僅允許寫審核文件，禁止改 runtime / tests。
 
