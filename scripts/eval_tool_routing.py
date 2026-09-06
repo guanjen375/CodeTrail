@@ -49,8 +49,6 @@ import client_policy  # noqa: E402
 import client_prompt  # noqa: E402
 import model_resolution  # noqa: E402
 from scripts.mcp_catalog import (  # noqa: E402
-    EFFECTIVE_CHARS_KEY,
-    LEGACY_EFFECTIVE_CHARS_KEY,
     CatalogError,
     CatalogSnapshot,
     StdioMcpCommand,
@@ -58,7 +56,6 @@ from scripts.mcp_catalog import (  # noqa: E402
     assert_public_tool_contract,
     catalog_from_fastmcp,
     catalog_from_stdio,
-    effective_chars,
     json_digest,
     measure_catalog_prompt_tokens,
     text_digest,
@@ -364,51 +361,6 @@ def select_matrix_row(matrix: Mapping[str, Any], row_id: str, arm: str) -> dict[
                 raise EvalError("requested arm is not enabled for this matrix row")
             return row
     raise EvalError("requested matrix row does not exist")
-
-
-_FROZEN_CATALOG_FIELDS = (
-    "schema_json_rule",
-    "tool_count",
-    "description_chars",
-    "input_schema_chars",
-    "output_schema_chars",
-    "catalog_chars",
-    "instructions_chars",
-    "tools_digest",
-    "instructions_digest",
-    "canonical_tools_list_chars",
-    "tool_order",
-    "per_tool",
-)
-
-
-def _frozen_effective_chars_key(row: Mapping[str, Any]) -> str:
-    """Which key the frozen row must spell the effective character count with.
-
-    Rows measured before the client rewrite carry ``"era"`` and were recorded
-    with the legacy key; the field is measured data, so the matrix keeps it.
-    """
-
-    return LEGACY_EFFECTIVE_CHARS_KEY if row.get("era") == "opencode" else EFFECTIVE_CHARS_KEY
-
-
-def assert_frozen_catalog_contract(snapshot: CatalogSnapshot, row: Mapping[str, Any]) -> None:
-    """Accept a historical server only when every frozen catalog field matches."""
-
-    baseline = row.get("baseline")
-    expected = baseline.get("catalog") if isinstance(baseline, Mapping) else None
-    required = (*_FROZEN_CATALOG_FIELDS, _frozen_effective_chars_key(row))
-    if not isinstance(expected, Mapping) or any(field not in expected for field in required):
-        raise EvalError("matrix row lacks a complete frozen catalog contract")
-    actual = snapshot.summary(include_per_tool=True)
-    actual["tool_order"] = list(snapshot.tool_names)
-    if any(actual[field] != expected[field] for field in _FROZEN_CATALOG_FIELDS):
-        raise EvalError("live catalog differs from the frozen matrix baseline contract")
-    # The live summary writes the current key, the frozen row the historical
-    # one.  Both sides resolve through the same reader so the comparison stays a
-    # comparison instead of quietly turning into "neither side had the field".
-    if effective_chars(actual) != effective_chars(expected):
-        raise EvalError("live catalog differs from the frozen matrix baseline contract")
 
 
 def materialize_synthetic_fixture(data: Mapping[str, Any], destination: Path) -> None:
@@ -1796,12 +1748,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         effective_config=effective_config,
         environment=environment,
     )
-    if getattr(args, "frozen_contract", False):
-        if args.arm != "baseline":
-            raise EvalError("--frozen-contract is valid only for the baseline arm")
-        assert_frozen_catalog_contract(catalog, row)
-    else:
-        assert_public_tool_contract(catalog)
+    assert_public_tool_contract(catalog)
 
     if args.catalog_only:
         return _catalog_result(
@@ -1975,11 +1922,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--catalog-only",
         action="store_true",
         help="capture live tools/list only; never call the model",
-    )
-    parser.add_argument(
-        "--frozen-contract",
-        action="store_true",
-        help="require an exact match to this row's saved historical baseline catalog",
     )
     parser.add_argument(
         "--catalog-source",

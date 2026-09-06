@@ -222,7 +222,7 @@ def test_the_second_layer_travels_as_argv_not_environment(tmp_path):
     """第一層是客戶端的 deny;第二層是 MCP server 自己也關掉寫入與執行。
 
     第二層走 **argv**(`--readonly`),而且子行程的環境在交出去之前把整組
-    `AICODE_* / AI_CODE_* / CODETRAIL_* / OPENCODE_*` 剝掉 —— 殼層裡殘留的
+    `AICODE_* / AI_CODE_* / CODETRAIL_*` 剝掉 —— 殼層裡殘留的
     `AI_CODE_PATCH=1` 不得把它翻回來。
     """
     import client_mcp as mcp_module
@@ -241,7 +241,7 @@ def test_the_server_actually_honours_readonly(tmp_path, monkeypatch):
     `--readonly` 翻回來(殼層裡殘留的同名變數是真實情境 —— 兩份安裝共用一台機器)。
 
     2026-09-04(總審 F1-9):污染改放在**父行程的環境**(`monkeypatch.setenv`),
-    不再經 `env=` 覆寫通道遞進去 —— 那條通道現在對四個前綴一律 fail-loud,
+    不再經 `env=` 覆寫通道遞進去 —— 那條通道現在對三個前綴一律 fail-loud,
     而真實情境本來就是「殼層裡有殘留」,不是「呼叫端明確要求」。
     """
     import client_mcp as mcp_module

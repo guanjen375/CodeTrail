@@ -85,13 +85,13 @@ def _mcp_importable() -> bool:
     return True
 
 
-# CI 沒裝 mcp 時 skip;日常 OpenCode 路線需要 mcp。
+# CI 沒裝 mcp 時 skip;CodeTrail 客戶端透過 mcp 呼叫工具。
 # 啟動閘 / runtime policy / round-trip 三個來源原本都是 module 層
 # `pytest.importorskip("mcp")`(整檔 skip)。合併後同一個檔裡多了不需要 mcp 的外部
 # 匯入測試,所以改成逐條 skipif:skip 到的仍然是原本那幾條,不多不少。
 # (工具目錄契約與結果預算走 `import_mcp_module`,它自己會 importorskip。)
 needs_mcp = pytest.mark.skipif(
-    not _mcp_importable(), reason="mcp 套件未安裝;OpenCode + MCP 路線才需要"
+    not _mcp_importable(), reason="mcp 套件未安裝;此測試需要 MCP server"
 )
 
 

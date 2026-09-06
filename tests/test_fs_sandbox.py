@@ -15,7 +15,7 @@ smoke 成員資格與合併前逐條相同:sandbox / read_file 分流 / analyze_
 ── grep_code 的輸出硬預算(原 test_grep_output_budget.py,實機事故回歸)──
 2026-08-17 實機:對 28 GB / 145,825 檔的專案不帶 path 做 grep_code,
 `MAX_GREP_RESULTS = 30` 只擋 match 筆數、不擋位元組,25 個 match 就回傳
-1,315,124,516 字元(1.32 GB)。那份字串經 MCP stdio 送給前端,OpenCode 的
+1,315,124,516 字元(1.32 GB)。那份字串經 MCP stdio 送給前端,造成
 worker thread 99% CPU 空轉 30 分鐘以上,工具呼叫永遠停在 status=running。
 
 兩層防線都要釘:

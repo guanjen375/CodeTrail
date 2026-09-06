@@ -21,7 +21,6 @@ patch / command」排列。內容很長時可先用頁面搜尋找下列關鍵�
 | server / RAG 異常 | `llama-server 不可連`、`embedding`、`查 spec 沒結果` |
 | 修改工具被拒 | `apply_patch`、`run_command` |
 | 送出新問題卻先跑出一段摘要 / 壓縮停住要你重送 | `壓縮` |
-| 從舊世代前端升級,舊設定還被接管著 | `a1682d5` |
 
 ### Build llama.cpp 時 `nvcc fatal : Unsupported gpu architecture 'compute_120a'`
 
@@ -587,84 +586,6 @@ rm -f "$HOME/.local/bin/aicode_web"   # 舊的 symlink(已移除的背景 launch
 
 之後就只剩一個入口:`cd <PROJECT_TO_ANALYZE> && aicode`。要遠端操作就 SSH 進這台機器;
 斷線不中斷把它跑在 `tmux new -s codetrail` 裡,回來 `tmux attach -t codetrail`。
-
-### 從舊世代前端升級:用 `a1682d5` 解除舊的設定接管
-
-`a1682d5` 之前的 CodeTrail 會啟動另一個 Node 前端,並把幾個值寫進那個前端的設定檔
-`~/.config/opencode/opencode.json`(`compaction.*` 的四個受管鍵 + 兩個 plugin 項),
-接管紀錄則放在 `~/.config/codetrail/compaction.json`。**本版不再附帶那支還原工具
-(`opencode_migrate.py`)與那兩個 plugin 檔**,runtime 也永遠不讀、不寫、不刪
-`~/.config/opencode/*` 與 `~/.config/codetrail/compaction.json` —— 所以留著的那些值
-沒有人負責:
-
-- `compaction.auto = false` 一直生效 —— 那個前端從此不再自動壓縮。
-- plugin 項指向某個 checkout 的檔案路徑。那兩個檔被刪掉之後,你在**其他專案**開那個
-  前端都會因為載不到 plugin 而起不來,而錯誤訊息不會提到 CodeTrail。
-
-**先找出「原安裝路徑」。** 看 `~/.config/opencode/opencode.json` 的 `plugin` 陣列:
-CodeTrail 註冊的項一定是 `<某個 checkout>/opencode_plugins/codetrail-notify.js` 或
-`…/codetrail-compaction.js` 的**完整路徑**,那個 checkout 就是原安裝路徑。整個陣列裡
-沒有這兩個檔名 = 這台機器沒被接管過,下面的步驟都不必做(只要確認
-`~/.config/codetrail/compaction.json` 也不存在)。
-
-**解除只有一種做法:把原安裝路徑固定回 `a1682d5`,跑它自己的工具。** `a1682d5` 是最後一個
-附帶那支工具的 commit。工具只認 `PLUGIN_DIR` = **執行它的那個 checkout** 的路徑,所以
-換個地方執行只會回報「無需變更」而殘留照樣還在。依你的情況三選一:
-
-```bash
-# (a) 原安裝路徑就是這份 checkout
-cd <CODETRAIL_REPO>
-git status --porcelain                # 必須是空的,否則先收乾淨
-git checkout --detach a1682d5
-python3 opencode_migrate.py --check   # a1682d5 的工具:零寫入,只列出會做什麼
-python3 opencode_migrate.py           # a1682d5 的工具:實際執行(有備份)
-git checkout -
-
-# (b) 原安裝路徑已經不在了 —— 用 a1682d5 在**同一個路徑**重建,做完再刪掉
-git worktree add <原安裝路徑> a1682d5
-cd <原安裝路徑> && python3 opencode_migrate.py --check && python3 opencode_migrate.py   # a1682d5 的工具
-cd <CODETRAIL_REPO> && git worktree remove <原安裝路徑>
-
-# (c) 原安裝路徑是另一份還在的安裝 —— 到那份 checkout 用它自己的工具,不要在這裡跑
-```
-
-先跑 `--check` 就是演練:它零寫入,只列出會做什麼,看過再跑實際那條。它在動任何東西之前
-會自己確認四件事,任一不成立就停下來報錯、**零寫入**:
-
-- 狀態檔的來源可信:`~/.config/codetrail` 是真目錄、`compaction.json` 是常規檔,兩者都屬於你、
-  權限分別是 `0700` 與 `0600`。
-- 狀態檔的形狀與 `digest` 相符。digest 涵蓋 `managed.<key>.prior`,也就是還原時要寫回設定的
-  原值;對不上就是狀態檔被改過。
-- 狀態檔綁的是正在處理的這份 `opencode.json`(路徑與 realpath 兩個雜湊都要對)。
-- plugin 項不是另一份仍存在的安裝寫的。
-
-停下來的情況各有明確處置。回報「另一份安裝的接管」= 原安裝路徑不是這裡,那是情況 (c):
-到那份 checkout 用它自己的工具。回報「無法確認」、或狀態檔存在但無法信任 = 判不出原值:
-把設定與狀態檔**原樣留著**(見下面「現在不能做 git 操作時」),不要自己動手硬刪 ——
-判不出來的東西刪掉就回不來了。
-
-**沒有完全手動的路徑。** 還原的依據是狀態檔裡記下的原值,而「這份狀態檔可不可信」只能在
-讀取它的**同一次**開檔裡確認:`a1682d5` 的工具以目錄 fd 錨定 `~/.config/codetrail`、用
-`O_NOFOLLOW` 開檔、對開起來的那個 fd 驗 owner 與權限、從同一個 fd 讀出內容並驗 digest,
-再用那一次讀到的內容規劃還原。改用 `stat`、`cat` 與編輯器分成好幾步做,每一步都是重新以
-路徑找檔:先看過的與後來寫回去的不保證是同一份,中間被換成 symlink 或另一份檔案也不會有
-任何錯誤訊息。手動做不到「驗過的就是用到的」,所以本文件不提供手動核對的命令,也不提供
-逐鍵寫回原值、刪 plugin 項或刪狀態檔的步驟;不要照別處看來的片段自己拼一套。
-
-**現在不能做 git 操作時:保留設定、保留狀態檔,之後再解除。**
-
-- `~/.config/opencode/opencode.json` 的 `compaction.*`、`plugin`、`mcp.codetrail` 與 `permission`
-  一個字都不動;`~/.config/codetrail/compaction.json` 不刪、不改。狀態檔是唯一能證明
-  「哪些值本來是什麼」的東西:它的 `digest` 涵蓋原值,改過就對不上,工具會停下來,你也就
-  再也證明不了原值。
-- 留著的代價只有本節開頭那兩個症狀,而且只影響那個舊前端。本版 CodeTrail 的任何功能都不讀
-  這兩份檔,不受影響。
-- 能在原安裝路徑跑固定舊版時,回到上面的三選一;先 `--check`,再實際執行。
-
-**升級注意**:本版的 `~/.config/codetrail/deployment.json` 多了 `llama_bin` 與
-`services.<role>.gpu` 兩種鍵。同一台機器上如果還有共用 `~/.config/codetrail/` 的舊世代
-checkout,它的 loader 會對這兩個未知鍵 fail-loud(那是刻意的封閉 schema);重跑本版的
-`./set_config.sh` 也會覆寫 `~/start.sh`。兩份安裝要並存的話,舊那份也要一起升級。
 
 ### 分析不信任的 repo:擋專案自帶的指示
 

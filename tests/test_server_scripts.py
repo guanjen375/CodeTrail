@@ -1045,7 +1045,7 @@ def test_the_pane_runs_the_exec_choke_point_with_the_loader_argv(monkeypatch, tm
 @pytest.mark.smoke
 def test_the_exec_path_hands_llama_server_a_clean_environment(tmp_path):
     """exec 是 llama-server 唯一真正被啟動的地方,也是最終環境的唯一決定點:
-    CodeTrail 的四個前綴、llama.cpp 自己的 `LLAMA_ARG_*`、繼承來的
+    CodeTrail 的三個前綴、llama.cpp 自己的 `LLAMA_ARG_*`、繼承來的
     `CUDA_VISIBLE_DEVICES` 全部剝掉;GPU 只由驗證過的 `deployment.json` 值重新輸出。
     留著任何一個,pane 拿到的就不是設定檔說的那個 server。"""
     dump = _write_fake_bin(tmp_path, "fake-llama-server", "env")
@@ -1066,7 +1066,7 @@ def test_the_exec_path_hands_llama_server_a_clean_environment(tmp_path):
         tmp_path,
         CUDA_VISIBLE_DEVICES="7",
         LLAMA_ARG_THREADS="3",
-        OPENCODE_API_KEY="leftover-secret",
+        CODETRAIL_CLIENT_CONFIG="leftover-secret",
         AICODE_MODEL="shell-model",
         MARK="keep",
     )
@@ -1086,7 +1086,7 @@ def test_the_exec_path_hands_llama_server_a_clean_environment(tmp_path):
     assert "CUDA_VISIBLE_DEVICES=GPU-FILE" in main_env  # 檔案說的那張卡
     assert "CUDA_VISIBLE_DEVICES=7" not in main_env      # 繼承來的那一份不算數
     assert "CUDA_VISIBLE_DEVICES" not in embedding_env   # 沒設就是不指定
-    for leaked in ("LLAMA_ARG_THREADS", "OPENCODE_API_KEY", "AICODE_MODEL",
+    for leaked in ("LLAMA_ARG_THREADS", "CODETRAIL_CLIENT_CONFIG", "AICODE_MODEL",
                    "AICODE_PROFILE", "AICODE_DEPLOYMENT_CONFIG"):
         assert leaked not in main_env, leaked
         assert leaked not in embedding_env, leaked

@@ -12,7 +12,7 @@
   6. README 講的 MCP read timeout == config.MCP_CALL_TIMEOUT_SECONDS
   7. README 的權限說明 == client_policy.ASK_TOOLS
      client_policy.ASK_TOOLS(哪些工具需要人工核准)
-  8. README 講得出客戶端的啟動方式,且不再教使用者安裝 opencode-ai
+  8. README 講得出客戶端的啟動方式
   9. apply_patch 上限契約:config.py 的 PATCH_MAX_FILES / PATCH_MAX_LINES_PER_FILE
      必須逐字出現在 mcp_server.apply_patch docstring、agent_tools._APPLY_PATCH_TOOL
      的 description 與 README / docs/mcp-tools.md;dry_run 七欄位(format / 檔案清單 /
@@ -194,13 +194,9 @@ def _check_permission_contract(
 
 
 def _check_client_entry_documented(readme_text: str, issues: list[str]) -> None:
-    """README 必須講客戶端進入點,而且不得再教使用者裝 opencode-ai。"""
+    """README 必須說明 CodeTrail 客戶端進入點。"""
     if "codetrail_chat.py" not in readme_text and "aicode" not in readme_text:
         issues.append("README 必須說明 CodeTrail 客戶端的啟動方式(aicode / codetrail_chat.py)")
-    if "npm install -g opencode-ai" in readme_text:
-        issues.append(
-            "README 仍在教使用者安裝 opencode-ai;CodeTrail 已不再啟動 OpenCode"
-        )
 
 
 def _check_code_model_placeholder_contract(readme_text: str, docs_text: str, issues: list[str]) -> None:
@@ -763,13 +759,8 @@ _STALE_DOC_PATTERNS = (
     (r"export\s+LLAMA_BIN=", "`export LLAMA_BIN=`(llama-server 路徑寫在 deployment.json 的 `llama_bin` / `--llama-bin`)"),
     (r"export\s+MODELS_DIR=", "`export MODELS_DIR=`(改用 `./set_config.sh --models-dir`)"),
     (r"AICODE_TEST_JOBS=", "`AICODE_TEST_JOBS=`(改用 `scripts/run_tests.py --jobs N`)"),
-    (r"Environment=(?:AICODE_|AI_CODE_|CODETRAIL_|OPENCODE_)",
+    (r"Environment=(?:AICODE_|AI_CODE_|CODETRAIL_)",
      "systemd unit 的 `Environment=AICODE_*`(loader 只讀 deployment.json 與旗標)"),
-    (r"scripts/opencode_[a-z_]+\.py", "`scripts/opencode_*.py`(已刪除;根目錄的 opencode_migrate.py 也不再附帶)"),
-    # 本版不再附帶 `opencode_migrate.py`。只有升級段能教它(那一段講的是把舊安裝路徑
-    # 固定回 a1682d5 再用當時的工具),其他地方寫出來就是教一個不存在的檔。
-    (r"(?m)^\s*(?:[$>]\s*)?python3\s+opencode_migrate\.py",
-     "`python3 opencode_migrate.py`(本版不附帶;只有 docs/troubleshooting.md 的 a1682d5 升級段能教)"),
     (r"scripts/compaction_status\.py", "`scripts/compaction_status.py`(已併進 `codetrail_chat.py status`)"),
     # 網頁前端整組移除:唯一的使用者入口是 `aicode`。troubleshooting 的「升級之後舊的
     # web backend 還在跑」是**清理指引**,講的是怎麼把它停掉,所以那一節允許出現這些字;
@@ -785,29 +776,15 @@ _STALE_DOC_PATTERNS = (
     # 設定不經環境交接:文件不得教 `export AICODE_*` 這一類寫法(照做既不生效也
     # 不報錯)。啟動核心的變數由 tests/test_repo_consistency.py 的逐變數白名單處理;
     # 這裡只擋最明確的「叫使用者 export」形狀。
-    (r"(?m)^\s*(?:[$>]\s*)?export\s+(?:AICODE|AI_CODE|CODETRAIL|OPENCODE)_", "`export AICODE_* / AI_CODE_* / CODETRAIL_* / OPENCODE_*`(設定只來自檔案)"),
-    (r"\bOPENCODE_[A-Z_]+\b", "`OPENCODE_*`(runtime 永遠不讀寫舊世代前端的設定)"),
+    (r"(?m)^\s*(?:[$>]\s*)?export\s+(?:AICODE|AI_CODE|CODETRAIL)_", "`export AICODE_* / AI_CODE_* / CODETRAIL_*`(設定只來自檔案)"),
 )
-
-#: 逐檔的例外(pattern → 允許它出現的文件)。**升級段必須點名**舊世代前端留下的
-#: ownership 狀態檔與當年那支還原工具,否則使用者根本不知道要處理什麼;其他文件寫出來
-#: 就是在教一個本版不存在的東西。例外是逐檔的,所以整包合併掃描不能用 —— 那只能整組
-#: 放行或整組擋下。
-_STALE_DOC_EXEMPT_SOURCES: dict[str, frozenset[str]] = {
-    r"~/\.config/codetrail/compaction\.json": frozenset({"docs/troubleshooting.md"}),
-    r"(?m)^\s*(?:[$>]\s*)?python3\s+opencode_migrate\.py": frozenset({"docs/troubleshooting.md"}),
-}
-
 
 def _check_no_stale_client_docs(docs_text: str, issues: list[str], *, source: str = "") -> None:
     """一份使用者文件不得教已經不存在的旗標 / 檔案 / 腳本。
 
-    `source` 是它的 repo 相對路徑;不給(合成內容自測)就是**沒有任何例外**,
-    每一條 pattern 都適用。
+    `source` 是供錯誤訊息定位的 repo 相對路徑；每一條 pattern 都適用。
     """
     for pattern, label in _STALE_DOC_PATTERNS:
-        if source and source in _STALE_DOC_EXEMPT_SOURCES.get(pattern, frozenset()):
-            continue
         if re.search(pattern, docs_text):
             issues.append(
                 f"{source or 'docs'}: expected no mention of {label}, "
@@ -827,12 +804,7 @@ def _stale_doc_sources() -> list[tuple[str, str]]:
 
 
 def _check_stale_docs_per_file(issues: list[str]) -> None:
-    """逐檔跑 `_check_no_stale_client_docs`,套用逐檔例外。"""
-    unknown = sorted(set(_STALE_DOC_EXEMPT_SOURCES) - {p for p, _ in _STALE_DOC_PATTERNS})
-    if unknown:
-        # 例外以 pattern 字串當 key:pattern 改字而例外沒跟上時,那份文件會被擋下
-        # (fail-closed),這一行負責講出真正的原因。
-        issues.append(f"check_readme_consistency.py: 逐檔例外指到不存在的 pattern {unknown}")
+    """逐檔檢查使用者文件，錯誤訊息保留來源。"""
     for rel, text in _stale_doc_sources():
         _check_no_stale_client_docs(text, issues, source=rel)
 
@@ -903,9 +875,7 @@ def check_all() -> list[str]:
 
     # 6. client MCP read-timeout contract
     _check_mcp_timeout_contract(readme_text, config_text, issues)
-    # 12. 本版不存在的東西,文件不得再教:`--compaction-mode native`(parser 只收
-    #     codetrail / manual / off)、殼層設定形狀,以及舊世代前端留下的 ownership
-    #     狀態檔與還原工具(升級段例外,見 `_STALE_DOC_EXEMPT_SOURCES`)。
+    # 12. 文件不得教不存在的壓縮模式、設定檔、腳本或殼層設定方式。
     _check_stale_docs_per_file(issues)
 
     # 7. 人工核准的工具清單(README ↔ client_policy.ASK_TOOLS)

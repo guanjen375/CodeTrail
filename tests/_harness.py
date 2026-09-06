@@ -77,9 +77,6 @@ def bash_compatible_path(bash: str, path: Path) -> str:
 
 
 
-# CodeTrail 客戶端 stub:記錄它被傳了什麼參數,不真的起 engine。
-# 這是 `AICODE_CLIENT_ENTRY` 這個 seam 的唯一用途 —— 與舊版「把假的 opencode
-# 放進 PATH」是同一種可替換面。
 MCP_READY_MARKER = "server ready, listening on stdio"
 
 

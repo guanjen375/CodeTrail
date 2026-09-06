@@ -42,9 +42,9 @@ prompt／專案 AGENTS 或 server `/props` 改變都會換 fingerprint。需要�
 
 模型看到的 system prompt 由客戶端組:內建基底規則(`client_prompt.BASE_RULES`,上限
 1,600 字元)+ MCP routing 指示 + 專案 `AGENTS.md` + `.codetrail/lessons.md` +
-`~/.config/codetrail/instructions.md`。沒有第二份 build prompt 可以設,也不需要 ——
-失敗的 routing A/B 不能當成模型支援宣告(那次量測的紀錄見
-`eval/fixtures/tool_routing/support_matrix.json` 的 opencode 世代 row)。
+`~/.config/codetrail/instructions.md`。模型支援狀態以
+`eval/fixtures/tool_routing/support_matrix.json` 的客戶端量測為準；catalog 計數不代表
+工具路由已通過驗證。
 
 ---
 

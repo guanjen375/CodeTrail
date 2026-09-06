@@ -9,7 +9,6 @@ tests/test_ctx_resolution.py、tests/test_llama_sampling.py、tests/test_config.
 - deployment profile:絕對路徑 profile 繼承 safe-defaults、優先序、惡意值拒收、命令建構。
 - deployment status:依 cmdline port 認角色、GPU / 模型 / mmproj 錯配偵測。
 - 主模型解析鏈:deployment profile / models.json 的解析與 fail-loud、呼叫時機、必要 server 檢查
-  (opencode.json 已不在鏈上,只留「它不得再影響解析」的守門測試)
   (原本又併自 test_resolve_main_model / test_main_model_calltime /
   test_required_model_servers_check,2026-08-20)。2026-09-04:`scripts/resolve_main_model.py`
   這支 CLI 隨 wrapper 一起刪除(客戶端在自己的行程裡解析),argv 那一半的案例
@@ -655,7 +654,7 @@ def test_gpu_and_llama_bin_come_from_the_deployment_file_then_argv(tmp_path):
 
 @pytest.mark.smoke
 def test_the_server_environment_strips_gpu_selectors_and_llama_settings(monkeypatch):
-    """llama-server 拿到的環境:CodeTrail 四前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES` 全剝掉。
+    """llama-server 拿到的環境:CodeTrail 三前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES` 全剝掉。
 
     llama.cpp 先套環境再套 argv,所以殼層 / tmux server 全域環境裡的 `LLAMA_ARG_*`
     會蓋掉我們從 `deployment.json` 算出來的旗標;`CUDA_VISIBLE_DEVICES` 則會蓋掉
@@ -665,7 +664,7 @@ def test_the_server_environment_strips_gpu_selectors_and_llama_settings(monkeypa
     monkeypatch.setenv("LLAMA_ARG_THREADS", "3")
     monkeypatch.setenv("LLAMA_ARG_CTX_SIZE", "1024")
     monkeypatch.setenv("AICODE_MODEL", "shell-model")
-    monkeypatch.setenv("OPENCODE_API_KEY", "secret")
+    monkeypatch.setenv("AI_CODE_PATCH", "1")
     monkeypatch.setenv("GGML_CUDA_NO_PINNED", "1")
     monkeypatch.setenv("LLAMA_LOG_VERBOSITY", "1")
     monkeypatch.setenv("MARK", "keep")
@@ -866,23 +865,13 @@ def model_resolution_env(monkeypatch, tmp_path):
     `AICODE_MODEL`、HOME 指到 tmp_path。合併後改成顯式掛載,只給來自該檔的測試;
     不讓它擴散到本檔其他來源的測試(它們各自有自己的 env 隔離)。
 
-    2026-09-06:去掉 `OPENCODE_CONFIG` 的清理 —— 沒有任何程式讀它了,留著只會讓
-    人以為那個名字還在鏈上。`AICODE_MODEL` 的清理保留:底下有測試刻意再把它設
-    回去,證明殘留值無效。"""
+    底下有測試刻意再設回 `AICODE_MODEL`,證明殼層殘留值無效。"""
     monkeypatch.delenv("AICODE_MODEL", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     yield
 
 
-def _write_home_opencode(tmp_path: Path, model: str = "llamacpp/from-json") -> Path:
-    """寫一份殘留的 OpenCode 設定。**只用來證明它不再影響解析。**
-    """
-    cfg_dir = tmp_path / ".config" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    path = cfg_dir / "opencode.json"
-    path.write_text(json.dumps({"model": model}), encoding="utf-8")
-    return path
 
 
 def _write_alias_registry(tmp_path: Path, aliases: tuple[str, ...]) -> Path:
@@ -934,7 +923,7 @@ def test_the_main_model_comes_from_the_deployment_profile(
 ):
     """deployment.json 的 `main.model` 接受的寫法:registry 名,或 GGUF 絕對路徑。
 
-    `provider/name` 這種 OpenCode 風格的寫法在 profile 這一層就被拒絕(啟動核心
+    `provider/name` 這種帶前綴的寫法在 profile 這一層就被拒絕(啟動核心
     的既有驗證);`normalize_main_model` 那一層仍然會 strip provider 前綴,因為
     它同時服務 `~/start.sh` → launcher 那條路。
     """
@@ -1035,39 +1024,10 @@ def test_an_empty_profile_model_is_treated_as_unset(
         _resolve(tmp_path)
 
 
-@pytest.mark.smoke
-def test_opencode_json_is_no_longer_a_model_source(model_resolution_env, tmp_path):
-    """`opencode.json` 已經不在主模型解析鏈上。
-
-    CodeTrail 啟動的是自己的客戶端,沒有第二個 TUI 要對齊。沿用那份設定裡的
-    模型等於「使用者以為在跑 A、實際在跑 B」。
-    """
-    _write_home_opencode(tmp_path, "llamacpp/from-json")
-
-    with pytest.raises(client_preflight.PreflightError) as excinfo:
-        _resolve(tmp_path)
-    assert "from-json" not in str(excinfo.value)
 
 
-@pytest.mark.smoke
-def test_a_broken_opencode_json_never_blocks_startup(model_resolution_env, tmp_path):
-    """一台根本沒在用 OpenCode 的機器,不該因為那份殘留檔壞掉而無法啟動。"""
-    cfg_dir = tmp_path / ".config" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.json").write_text("{ not json", encoding="utf-8")
-    _write_profile_model(tmp_path, "review-model")
-
-    assert _resolve(tmp_path) == "review-model"
 
 
-@pytest.mark.smoke
-def test_a_conflicting_opencode_json_is_not_a_conflict_any_more(
-    model_resolution_env, tmp_path
-):
-    _write_home_opencode(tmp_path, "llamacpp/from-json")
-    _write_profile_model(tmp_path, "from-profile")
-
-    assert _resolve(tmp_path) == "from-profile"
 
 
 def test_a_broken_deployment_profile_fails_loud_with_its_path(

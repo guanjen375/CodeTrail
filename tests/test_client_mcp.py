@@ -326,7 +326,7 @@ def test_an_explicit_stderr_log_refuses_a_symlink(tmp_path):
         client_mcp._open_stderr_log(link)  # noqa: SLF001
 
 
-def test_the_client_never_accepts_the_opencode_tool_prefix():
+def test_tools_list_requires_unprefixed_mcp_names():
     listed = {
         "tools": [
             {"name": "codetrail_list_dir", "inputSchema": {"type": "object"}},
@@ -448,12 +448,11 @@ def test_closing_a_shared_client_finishes_before_a_replacement_starts(tmp_path):
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("name", ["AICODE_ROOT", "AI_CODE_PATCH", "CODETRAIL_CLIENT_CONFIG", "OPENCODE_API_KEY"])
+@pytest.mark.parametrize("name", ["AICODE_ROOT", "AI_CODE_PATCH", "CODETRAIL_CLIENT_CONFIG"])
 def test_env_overrides_cannot_reintroduce_a_stripped_prefix(tmp_path, name):
-    """`env=` 是覆寫通道,套在剝除**之後**;四個前綴一律 fail-loud,不是只有 OPENCODE_。
+    """覆寫通道不得把三個 CodeTrail 設定前綴加回子行程。
 
-    只擋 OPENCODE_ 的話,`McpClient(env={"AI_CODE_PATCH": "1"})` 就把 readonly 第二層
-    的舊入口從後門遞回去 —— 而那正是 plan §2.4 要關掉的東西。
+    `McpClient(env={"AI_CODE_PATCH": "1"})` 也必須拒絕,避免繞過 readonly policy。
     """
     with pytest.raises((client_mcp.McpClientError, ValueError)):
         client_mcp.child_env({name: "x"})
@@ -489,15 +488,15 @@ def test_client_config_and_skip_aux_preflight_reach_the_server_argv(tmp_path):
 @pytest.mark.smoke
 def test_process_env_run_is_the_only_spawn_exit_and_never_takes_env(monkeypatch):
     """`process_env.run/popen/check_output` 自己用 child_env() 算環境:殼層的 `AICODE_*` /
-    `OPENCODE_*` 一定進不去子行程,`overrides` 進得去,`env=` 一律 TypeError,帶四類前綴的
+    `CODETRAIL_*` 一定進不去子行程,`overrides` 進得去,`env=` 一律 TypeError,帶三類前綴的
     overrides 一律 fail-loud。靜態 gate 只需要禁「別處出現 subprocess」,不必推導 env 來源。"""
     import sys
 
     import process_env
 
     monkeypatch.setenv("AICODE_MODEL", "bogus")
-    monkeypatch.setenv("OPENCODE_API_KEY", "secret")
-    probe = "import os; print(os.environ.get('AICODE_MODEL'), os.environ.get('OPENCODE_API_KEY'), os.environ.get('MARK'))"
+    monkeypatch.setenv("CODETRAIL_CLIENT_CONFIG", "secret")
+    probe = "import os; print(os.environ.get('AICODE_MODEL'), os.environ.get('CODETRAIL_CLIENT_CONFIG'), os.environ.get('MARK'))"
     out = process_env.run([sys.executable, "-c", probe], overrides={"MARK": "x"}, capture_output=True, text=True, check=True)
     assert out.stdout.split() == ["None", "None", "x"], out.stdout
     proc = process_env.popen([sys.executable, "-c", probe], stdout=process_env.PIPE, text=True)
@@ -518,9 +517,30 @@ def test_process_env_popen_class_is_not_a_raw_spawn_bypass(monkeypatch):
     import process_env
 
     monkeypatch.setenv("AICODE_MODEL", "round12-leak")
-    monkeypatch.setenv("OPENCODE_API_KEY", "round12-secret")
-    probe = "import os; print(os.environ.get('AICODE_MODEL'), os.environ.get('OPENCODE_API_KEY'))"
+    monkeypatch.setenv("CODETRAIL_CLIENT_CONFIG", "round12-secret")
+    probe = "import os; print(os.environ.get('AICODE_MODEL'), os.environ.get('CODETRAIL_CLIENT_CONFIG'))"
     proc = process_env.Popen([sys.executable, "-c", probe], stdout=process_env.PIPE, text=True)
     assert proc.communicate(timeout=30)[0].split() == ["None", "None"]
     with pytest.raises(TypeError):
         process_env.Popen(["true"], env={})
+
+
+@pytest.mark.smoke
+def test_child_environment_isolated_from_parent_and_previous_calls(monkeypatch):
+    """剝除與覆寫只作用於子行程副本,不得污染父行程或下一次呼叫。"""
+    import os
+    import process_env
+
+    settings = {"AICODE_MODEL": "parent-model", "AI_CODE_PATCH": "1", "CODETRAIL_CLIENT_CONFIG": "parent-config"}
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("LANG", "C")
+    child = process_env.child_env({"LANG": "C.UTF-8"})
+    assert all(name not in child for name in settings)
+    assert child["LANG"] == "C.UTF-8"
+    child.update(settings)
+    assert all(os.environ[name] == value for name, value in settings.items())
+    assert os.environ["LANG"] == "C"
+    following = process_env.child_env()
+    assert all(name not in following for name in settings)
+    assert following["LANG"] == "C"

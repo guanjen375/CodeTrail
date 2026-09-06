@@ -7,7 +7,6 @@ CodeTrail 的設定只來自檔案(`config.py` 常數、`deployment.json` / `mod
 `run_command`、`git`、`objdump`、`docker` …—— 拿到的環境都從這裡出去:繼承使用者
 環境(`run_command` 需要 PATH / LANG / SSH_AUTH_SOCK …),但剝掉全部 CodeTrail 設定
 變數。留著它們等於讓子行程從殼層取設定,而那正是「兩份安裝混用」的機制。
-`OPENCODE_*` 另有一層理由:它只會是升級機器殘留的機密(API key、密碼)。
 
 住在自己的模組是因為 MCP 那一側(`agent_tools` / `elf_analysis` /
 `container_runner`)也要 spawn,而它們不該 import 客戶端的 MCP client;
@@ -30,7 +29,7 @@ PIPE = _subprocess.PIPE
 STDOUT = _subprocess.STDOUT
 
 #: 交給**任何**子行程之前要剝掉的前綴。這幾個是 CodeTrail 自己的設定名。
-STRIPPED_ENV_PREFIXES = ("AICODE_", "AI_CODE_", "CODETRAIL_", "OPENCODE_")
+STRIPPED_ENV_PREFIXES = ("AICODE_", "AI_CODE_", "CODETRAIL_")
 
 #: llama-server 那一個子行程**額外**要剝的:llama.cpp 自己的設定入口。
 #: `common/arg.cpp` 先套環境再套 argv,142 個 `LLAMA_ARG_*` 每一個都能覆寫我們
@@ -51,7 +50,7 @@ def child_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
 
     `overrides` 是呼叫端**明確要求**的值(`LC_ALL=C`、`PYTHONIOENCODING` …),套在
     剝除之後 —— 把整份 `os.environ` 從那裡灌進去等於把剛剝掉的東西原封不動加回去,
-    所以帶那四個前綴的鍵一律 fail-loud。
+    所以帶那三個前綴的鍵一律 fail-loud。
     """
     env = os.environ.copy()
     for key in list(env):

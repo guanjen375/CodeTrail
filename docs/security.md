@@ -130,11 +130,7 @@ system prompt 不是 permission:它不會讓被 `deny` 的工具變成可用,也
 
 `record_lesson(...)` 是唯一會寫到 sandbox root 之外的工具,而且只寫一個固定路徑:`~/.config/codetrail/lessons.json`(per-deployment 的行為教訓 store,與 `deployment.json` 同層;不能被模型指到別的路徑)。它被 permission 設成 `ask`:模型只能「提案」,你會在核准框看到完整 rule 內容,核准後才落地。沒有無審核的自動寫入路徑;細節見 [docs/lessons.md](lessons.md)。
 
-升級防護：核准閘不再依賴任何外部設定檔。哪些工具要人工核准寫死在
-`client_policy.ASK_TOOLS`,所以「新加的寫入工具被舊 wildcard 靜默放行」這個問題由構造
-消失。從舊世代前端升級的機器,另外照
-[troubleshooting 的升級段](troubleshooting.md)(標題含 `a1682d5`)手動解除一次舊的設定
-接管 —— 本版 runtime 永遠不碰那份設定,所以那些殘留值沒有人負責。
+人工核准由 `client_policy.ASK_TOOLS` 與客戶端 policy 執行；核准框會顯示完整參數。
 
 tool canary 的 explicit hard gate 與 implicit diagnostic 分開使用 cache schema 2。cache 只存
 fingerprint hash、lane status、檢查時間與版本，不存 prompt、專案路徑、檔名、模型輸出、

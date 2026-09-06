@@ -78,7 +78,7 @@ if _REAL_USER_SITE:
 # 一次剝乾淨,讓測試環境與「乾淨殼層」一致。
 for _name in [
     key for key in os.environ
-    if key.startswith(("AICODE_", "AI_CODE_", "CODETRAIL_", "OPENCODE_"))
+    if key.startswith(("AICODE_", "AI_CODE_", "CODETRAIL_"))
 ]:
     os.environ.pop(_name, None)
 

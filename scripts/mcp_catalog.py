@@ -24,8 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# This deliberately keeps json.dumps' default separators.  It reproduces the
-# reviewed pre-change baseline (33,299 chars) and is part of the eval contract.
+# Default JSON separators and Unicode code-point counts define the eval contract.
 SCHEMA_JSON_RULE = "json.dumps(value, ensure_ascii=False, sort_keys=True); len() counts Unicode code points"
 
 # Digests use a compact but otherwise canonical representation.  Digest input
@@ -35,12 +34,8 @@ DIGEST_JSON_RULE = 'json.dumps(value, ensure_ascii=False, sort_keys=True, separa
 
 MINIMAL_TOKEN_MESSAGE: tuple[dict[str, str], ...] = ({"role": "user", "content": "."},)
 
-# The "effective" character count (descriptions + input schemas) is the number a
-# client actually pays for.  Frozen eval baselines were recorded under the old
-# key name and are measured data, so readers accept both spellings and writers
-# only ever emit the current one.  See :func:`effective_chars`.
+# Model-visible descriptions and input schemas share one canonical count key.
 EFFECTIVE_CHARS_KEY = "catalog_effective_chars"
-LEGACY_EFFECTIVE_CHARS_KEY = "opencode_effective_chars"
 
 
 class CatalogError(RuntimeError):
@@ -110,8 +105,7 @@ class CatalogSnapshot:
     input_schema_chars: int
     output_schema_chars: int
     catalog_chars: int
-    #: 「模型實際看得到的字元數」= description + input schema。凍結的歷史 baseline
-    #: 用舊鍵名記錄同一個數字(資料檔不重造),讀取一律走 :func:`effective_chars`。
+    #: 「模型實際看得到的字元數」= description + input schema。
     catalog_effective_chars: int
     tools_digest: str
     instructions_digest: str
@@ -163,24 +157,6 @@ class CatalogTokenMeasurement:
         }
 
 
-def effective_chars(summary: Mapping[str, Any]) -> int:
-    """Read the effective character count from a catalog summary of either era.
-
-    The current name wins; the frozen historical baselines only carry the legacy
-    one.  A summary that has neither is an error rather than a zero: comparing
-    two silently defaulted zeros would report "the frozen contract still holds"
-    for a measurement that was never taken.
-    """
-
-    for key in (EFFECTIVE_CHARS_KEY, LEGACY_EFFECTIVE_CHARS_KEY):
-        if key in summary:
-            value = summary[key]
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise CatalogError(f"{key} must be an integer, got {type(value).__name__}")
-            return value
-    raise CatalogError(
-        f"catalog summary has no {EFFECTIVE_CHARS_KEY} (or {LEGACY_EFFECTIVE_CHARS_KEY})"
-    )
 
 
 def schema_json(value: object) -> str:

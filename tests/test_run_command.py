@@ -10,7 +10,7 @@ tests/test_run_lint.py(2026-09-02)。
   三層都必須自己擋:llama.cpp 的 JSON-schema→GBNF 只支援子集,client 可能根本不套
   schema 約束,所以 executor 端的 1..600 驗證是最後一道;MCP 端的 pydantic strict
   則是 client 誤送 true / "60" / 1.0 時的獨立防線。文件寫「server 接受 1..600 秒;
-  client 可能更早截止」,不宣稱 600 秒必在 OpenCode client timeout 內。
+  client 可能更早截止」,不宣稱每次呼叫都能用滿 600 秒。
 - run_lint(fix=False) 必須走 check-only,不偷偷改檔。Review 找到的 bug:舊版
   LINT_COMMANDS 只有 fix 組命令(--fix / -w / -i / --write),agent_tools.run_lint 收了
   `fix` 參數卻完全沒用,所以 fix=False 仍會跑會改檔的命令。

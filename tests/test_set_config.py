@@ -2211,7 +2211,7 @@ def test_a_context_too_small_for_the_formula_is_fail_loud(tmp_path):
 
 
 
-# ── 產物、備份與 restore(去 OpenCode 之後的版本)──
+# ── 產物、備份與 restore──
 
 
 def test_existing_configs_are_backed_up_and_registry_merged(tmp_path):
@@ -2389,7 +2389,7 @@ def test_a_manifest_with_a_foreign_target_is_refused_whole(tmp_path):
                "--models-dir", str(models)).returncode == 0
 
     # 手工把 manifest 改回「舊世代」的形狀:多一筆別人的設定。
-    foreign = home / ".config" / "opencode" / "opencode.json"
+    foreign = home / ".config" / "unrelated-app" / "settings.json"
     foreign.parent.mkdir(parents=True, exist_ok=True)
     foreign.write_text(json.dumps({"owner": "user-current"}), encoding="utf-8")
     stale_backup = tmp_path / "foreign.bak-setconfig-old"
@@ -2414,8 +2414,8 @@ def test_a_manifest_with_a_foreign_target_is_refused_whole(tmp_path):
 
 
 # ── 原 test_set_config_restore.py:整批還原的資料安全 ──
-# 這幾條守的是 AGENTS.md §2 的 transaction 語意。去 OpenCode 化之後 manifest
-# 的目標換成 client.json / models.json / deployment.json / start.sh,但「一半
+# 這幾條守的是 AGENTS.md §2 的 transaction 語意。manifest
+# 的目標只接受 client.json / models.json / deployment.json / start.sh,但「一半
 # 還原比不還原更糟」的判斷完全沒變,所以測試跟著換目標留下來。
 
 @pytest.mark.smoke

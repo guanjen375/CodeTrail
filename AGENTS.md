@@ -1,9 +1,9 @@
 這個 repo 是一個 **本地 RAG / Code-RAG / MCP 工具集,以及它自己的聊天客戶端**。
 終端使用者透過 `aicode` wrapper 啟動 `codetrail_chat.py`(全螢幕 Textual TUI),
 用本地 llama.cpp `llama-server` 跑模型,分析 NDA / 內部 firmware repo。
-介面只有這一個:沒有網頁前端、沒有 attach。部署**不需要 Node / npm / opencode-ai**。
+介面只有這一個:沒有網頁前端、沒有 attach。部署**不需要 Node / npm**。
 
-如果你是 AI coding agent（Codex / OpenCode 等）正在改這個 repo，請先把這份檔讀完。
+如果你是 AI coding agent 正在改這個 repo，請先把這份檔讀完。
 維護命令、eval 漂移檢查見 [README_DEV.md](README_DEV.md)——那份檔是**閱讀用參考**，
 裡面的測試命令誰能執行由角色決定（見 §1）。
 
@@ -142,7 +142,7 @@
 - 啟動核心的設定來源——GPU、llama-server 路徑、tmux session 名、逾時與 rollback 只來自
   `deployment.json`、repo 常數與 argv;`~/start.sh` **不 export 也不 unset**,只轉發 `"$@"`。
   tmux pane 一律經 `deployment_profile.py exec <role> <loader argv>`,最終環境由
-  `process_env.llama_server_env()` 決定(四前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES`
+  `process_env.llama_server_env()` 決定(三前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES`
   剝除;GPU 只由 `build_server_command` 那個 `env CUDA_VISIBLE_DEVICES=<驗證過的值>` 前綴
   重新輸出)。pane 環境 = tmux server 全域環境 + session 環境,launcher 管不到既有 daemon,
   所以邊界只能放在 pane 內真正 exec 的那一步;放寬它就是「使用者以為在跑 A、實際在跑 B」
@@ -156,10 +156,6 @@
   restore 只接受「目標**全部**落在這一代會寫的四個檔」的 manifest,含任何其他目標就整份
   fail-loud、一個檔都不動(不退回逐檔模式、不部分還原——半套還原會把兩個世代拼在一起)。
   tool-call canary 的快取檔名帶 schema 號,兩世代各記各的、不再互相清空。
-  main runtime 永不讀、寫、刪 `~/.config/codetrail/compaction.json`、`~/.config/opencode/*`
-  與任何舊 plugin 路徑;舊安裝的還原只走 `docs/troubleshooting.md` 升級段的唯一做法:把原安裝
-  路徑固定回 `a1682d5`、跑它自己的工具(沒有完全手動的路徑;工具無法確認就零寫入,設定與
-  狀態檔原樣留著)
 - `kb_cache` 的 embeddings 身分驗證（逐列 chunk id / generation / 內容雜湊 / model）
   與「重建不了就 fail-loud、絕不沿用舊向量」——放寬它就是靜默錯答
 - `knowledge_store` 的文件身分驗證（`metadata["document_sources"]`）與
@@ -178,16 +174,12 @@
   suite digest、live model fingerprint、case 順序與逐題 project-state digest，單題 timeout 不得
   讓已完成結果無聲消失。原始 NDA prompt、工具輸出、candidate answer 不得寫入 checked-in
   `eval/` 或 privacy-safe aggregate
-- 三條靜態 gate(`tests/test_repo_consistency.py`)——**內容**的豁免只有逐檔的形狀例外,
-  沒有整檔、整目錄豁免:OpenCode gate 掃全文(含註解與 docstring),`opencode` 只准留在
-  子行程環境的剝除清單、eval 凍結資料的舊欄位名 / era 標記、反向檢查器的 pattern 與文件
-  升級段(升級段教那支已刪的遷移工具時必須指名 `a1682d5`);environ gate 只放行「檔案在哪
-  / 行程介面」,**任何**檔案讀 `AICODE_*` / `AI_CODE_*` / `CODETRAIL_*` / `OPENCODE_*`
-  都是 offender;spawn 只有 `process_env` 一個出口,`_SPAWN_CORE` 的四個檔各有理由,而
-  `deployment_profile.py` 唯一的 `os.execvpe` 必須交 `process_env.llama_server_env()`。
-  `docs/workflows/**/*.md` 的豁免(`_handoff_markdown`)只給 `.md` 的**內容** ——
-  同目錄的 `.py` / `.sh` / `.json` / `.toml` 照掃,把走訪整個剪掉等於開一條「把可執行檔
-  藏進交接目錄」的後門。
+- 靜態 gate(`tests/test_repo_consistency.py`)——文件不得教不存在的介面或設定；
+  environ gate 只放行「檔案在哪 / 行程介面」，任何檔案讀 `AICODE_*` / `AI_CODE_*` /
+  `CODETRAIL_*` 都是 offender。spawn 只有 `process_env` 一個出口，`_SPAWN_CORE` 的
+  四個檔各有理由；`deployment_profile.py` 唯一的 `os.execvpe` 必須交
+  `process_env.llama_server_env()`。`docs/workflows/**/*.md` 的豁免只給文件內容，
+  同目錄的程式碼仍須經過環境與 spawn 檢查，走訪不得把整個交接目錄剪掉。
 
 任何重構碰到上面這些東西，**新加測試**（開發者寫測試檔，執行依 §1.2 權責），
 不要直接刪 / weaken / 移除檢查點。

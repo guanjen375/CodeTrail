@@ -95,7 +95,7 @@ def _dead_pid() -> int:
 def test_two_instances_get_separate_leases_and_never_overwrite():
     """驗收 1:兩個 MCP instance 各一份 lease,boot_id 不同、內容互不覆寫。
 
-    canary / TUI / web / `opencode run` 會同時各起一個 MCP 子行程;舊的單一
+    canary、TUI 與 headless run 可同時各起一個 MCP 子行程;舊的單一
     心跳檔設計下,後起的那個會把前一個的狀態整份蓋掉。
     """
     mcp_lease.open_lease()
@@ -447,12 +447,8 @@ def test_incident_detail_slugs_match_the_frozen_cross_language_set():
 def test_the_incident_writer_is_the_python_one_and_session_hashing_stays_private():
     """`record_incident` 現在是**正式寫入端**;`_hash_session` 仍然是私有。
 
-    以前這條測試要求 `record_incident` **不得**是公開 API:那時唯一會寫
-    incident 的是 OpenCode 的 JS plugin,Python 這一份只是格式定義,公開它會
-    讓 rotation / privacy 那幾條測試變成在驗一條沒有人走的路徑。CodeTrail 自
-    己的聊天客戶端接手之後,假工具呼叫與壓縮停用都由 Python 偵測與記錄,所
-    以「Python 不寫 incident」這個前提本身已經不成立——繼續禁止公開名稱只會
-    逼呼叫端去碰底線開頭的函式。
+    聊天客戶端透過這個公開 API 記錄假工具呼叫與壓縮停用,所以它必須可呼叫,
+    且既有別名 `_record_incident` 必須指向同一份寫入實作。
 
     `_hash_session` 仍然保持私有:它是零內容契約的一部分,不是給呼叫端用的。
     """
@@ -846,8 +842,8 @@ def test_sigterm_still_runs_the_shutdown_cleanup(tmp_path):
 
     預設的 SIGTERM 是**直接結束行程**,`finally` 一行都不會執行 —— 於是以獨立
     process group 起的 RAG.py 活下來繼續改寫 knowledge.json,而 lease 停在最後
-    一次寫入、doctor 只能報 `stale`(看起來像 OOM)。OpenCode 與一般 supervisor
-    關掉 server 用的正是 SIGTERM,所以這條路徑必須被守住。
+    一次寫入、doctor 只能報 `stale`(看起來像 OOM)。client_mcp 在取消寬限期過後
+    用 SIGTERM 關掉 server,所以這條路徑必須被守住。
     """
     from tests import _harness
 

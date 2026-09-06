@@ -309,7 +309,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_the_stderr_tail_is_bounded",
             "test_an_explicit_stderr_log_is_owner_only",
             "test_an_explicit_stderr_log_refuses_a_symlink",
-            "test_the_client_never_accepts_the_opencode_tool_prefix",
+            "test_tools_list_requires_unprefixed_mcp_names",
             "test_the_catalog_contract_pins_order",
             "test_a_server_with_a_drifted_catalog_is_refused_at_startup",
             "test_only_the_text_blocks_reach_the_model",
@@ -317,6 +317,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_one_engine_process_keeps_exactly_one_mcp_instance",
             "test_closing_a_shared_client_finishes_before_a_replacement_starts",
             "test_env_overrides_cannot_reintroduce_a_stripped_prefix",
+            "test_child_environment_isolated_from_parent_and_previous_calls",
             "test_process_env_run_is_the_only_spawn_exit_and_never_takes_env",
             "test_process_env_popen_class_is_not_a_raw_spawn_bypass",
             "test_client_config_and_skip_aux_preflight_reach_the_server_argv",
@@ -591,13 +592,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "殼層裡殘留的舊名字(`AICODE_MODEL`、五個 `*_GPU`、`CUDA_VISIBLE_DEVICES`、"
         "`LLAMA_BIN`、`MODELS_DIR`、session 名)一律無效 —— 讀回來就是「使用者以為在跑 A、"
         "實際在跑 B」,而且完全無聲;GPU 與 llama-server 路徑的優先序是 argv > 檔案 > 預設;"
-        "llama-server 真正被 exec 時的環境要剝掉四前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES`;"
-        "主模型解析器沒有環境變數那條分支(舊 opencode.json 也早就不在鏈上,而一份壞掉的"
-        "殘留檔不得讓沒在用它的機器無法啟動)",
+        "llama-server 真正被 exec 時的環境要剝掉三前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES`;"
+        "主模型解析器沒有環境變數那條分支",
         (
-            "test_opencode_json_is_no_longer_a_model_source",
-            "test_a_broken_opencode_json_never_blocks_startup",
-            "test_a_conflicting_opencode_json_is_not_a_conflict_any_more",
             "test_the_loader_ignores_every_legacy_override_variable",
             "test_gpu_and_llama_bin_come_from_the_deployment_file_then_argv",
             "test_the_server_environment_strips_gpu_selectors_and_llama_settings",
@@ -616,18 +613,14 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_repo_consistency.py": (
-        "三條靜態 gate:使用者文件不得再教這一代不存在的旗標 / 檔案 / 腳本 / 環境變數;"
-        "`opencode` 只准留在剝除清單、eval 凍結資料的欄位名與文件升級段(而升級段教那支"
-        "已刪的遷移工具時必須指名 `a1682d5`;反向檢查器的形狀例外只放行 pattern 字串,"
-        "蓋不過真正的 import);沒有任何模組從殼層取 CodeTrail 設定,"
+        "靜態 gate:使用者文件不得教不存在的介面,沒有任何模組從殼層取 CodeTrail 設定;"
         "spawn 只有 `process_env` 一個出口,llama-server 唯一的 `execvpe` 用的是"
         "`llama_server_env()`。`docs/workflows/**/*.md` 的豁免只給 `.md` 的內容 ——"
         "同目錄的可執行檔照掃(否則就是把東西藏進交接目錄)",
         (
             "test_user_docs_must_not_teach_removed_flags_or_files",
-            "test_current_cli_help_never_mentions_opencode",
-            "test_the_removed_frontend_only_survives_in_the_strip_list_history_data_and_upgrade_docs",
-            "test_the_migration_command_only_survives_in_the_pinned_upgrade_section",
+            "test_routing_eval_docs_require_measured_client_support",
+            "test_current_cli_help_describes_the_client",
             "test_the_handoff_markdown_exemption_is_content_only",
             "test_the_only_llama_server_exec_hands_over_the_stripped_environment",
             "test_no_module_reads_codetrail_settings_from_the_environment",
@@ -635,15 +628,13 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_model_facing_text_never_teaches_a_removed_environment_knob",
             "test_doctor_no_longer_needs_a_model_prefix",
             "test_the_docs_gate_catches_bare_mentions_and_env_prefixes_everywhere",
-            "test_the_opencode_gate_checks_allowlisted_files_for_dependency_shapes",
-            "test_the_checker_shape_exemption_never_covers_an_executable_import",
             "test_doctor_runs_as_a_script_from_the_repo_root",
             "test_the_spawn_gate_bans_the_spawn_api_outside_process_env",
             "test_the_production_spawn_gate_really_scans_the_repo",
             "test_the_spawn_gate_resolves_os_and_asyncio_aliases",
             "test_the_spawn_gate_closes_the_private_exits_and_keeps_every_alias",
             "test_the_gates_also_catch_config_files_and_env_prefixed_commands",
-            "test_the_opencode_gate_scans_config_files_and_the_wrapper",
+            "test_source_scan_includes_configs_and_the_wrapper",
             "test_the_gates_also_catch_ignore_entries_and_bare_assignments",
             "test_the_gates_are_structural_not_a_list_of_spellings",
             "test_the_docs_gate_catches_printenv_and_indirect_expansions_and_venv_is_pruned",
@@ -797,12 +788,14 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "timeout/checkpoint 不得丟資料且匿名 A/B 不得洩漏模型身分;"
         "data flywheel 的落點在 state 目錄(0700/0600、拒 symlink,被分析的 repo 零新檔),"
         "而且子行程的環境在交出去之前剝掉全部 CodeTrail 設定變數;"
-        "凍結 baseline 的有效字元數改了鍵名之後,兩邊仍要真的在比對(讀取端少了退回舊鍵那一段,"
-        "報告照樣說「與歷史 baseline 相符」而那一格根本沒比);錄製器選定的 llama-server 用不了時"
+        "catalog 的模型字元成本不包含 UI schema,所有量測都要通過公開工具契約;"
+        "錄製器選定的 llama-server 用不了時"
         "不得悄悄換成 PATH 上另一顆(manifest 宣稱的 build 出處會是別顆的)",
         (
             "test_every_direct_model_request_in_the_routing_eval_uses_the_normalised_model",
             "test_the_routing_eval_child_environment_is_stripped",
+            "test_catalog_summary_keeps_input_cost_separate_from_ui_payload",
+            "test_routing_catalog_requires_the_public_tool_contract",
             "test_the_session_eval_candidate_model_goes_out_as_argv",
             "test_the_collected_data_never_lands_in_the_analysed_repo",
             "test_the_collected_data_file_is_never_read_or_rewritten_through_a_symlink",
@@ -816,7 +809,6 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_private_writer_uses_owner_only_modes",
             "test_blind_bundle_hides_candidate_identity",
             "test_a_replay_timeout_is_a_scored_case_failure_not_a_suite_abort",
-            "test_the_effective_chars_field_survives_its_rename_across_the_frozen_data",
             "test_the_recorder_never_substitutes_a_path_binary_for_the_chosen_one",
             "test_resume_checkpoint_rejects_project_state_drift",
             "test_the_replay_pins_its_own_compaction_mode",

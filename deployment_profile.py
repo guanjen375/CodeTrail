@@ -1117,7 +1117,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 registry_file=profile.registry_file,
             )
             # 這是 llama-server 唯一真正被 exec 的地方,所以也是最終環境的唯一決定點:
-            # 剝掉 CodeTrail 的四個前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES`。
+            # 剝掉 CodeTrail 的三個前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES`。
             # GPU 只由 command 前面那個 `env CUDA_VISIBLE_DEVICES=<驗證過的值>` 重新輸出。
             os.execvpe(command[0], command, process_env.llama_server_env())
         return 0

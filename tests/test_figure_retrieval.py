@@ -3372,7 +3372,7 @@ def test_strict_kb_not_loaded_still_has_the_key(monkeypatch, tmp_path):
 
 @pytest.mark.smoke
 def test_query_transport_is_compact_and_keeps_exclusion_guidance(monkeypatch, tmp_path):
-    """OpenCode text is compact while structured clients retain the core payload."""
+    """Model-visible text is compact while the UI retains the structured payload."""
     mcp = _mcp(monkeypatch, tmp_path)
     _stub_query(monkeypatch, mcp, meta={
         "refs": [{"source": "npu_spec.pdf", "page": 7}],

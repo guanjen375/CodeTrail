@@ -235,14 +235,12 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
 - `eval/fixtures/tool_routing/cases.json`：隔離 synthetic root 的 9 個檔案、1 份 KB 文件與
   15 個中英／混合 routing cases；結果只保存分類、aggregate、token/latency/compaction
   計數，不保存 prompt、assistant text、tool args/result、session id 或專案路徑。
-- `eval/fixtures/tool_routing/support_matrix.json`：OpenCode 時代的 6 個 arm（歷史 row，
-  `measured`）與客戶端時代的 `client_baseline`（`unsupported`，尚未重量）兩種 row 並存。
-  2026-08-27 寫回的逐 arm 凍結 digest、routing baseline 與 privacy-safe aggregates 只屬於
-  歷史 row；客戶端 row 還沒有任何量測，所以**沒有任何列可宣稱 supported**。harness 絕不改 matrix；gate 通過只輸出
-  `manual_status_change_required=true`，仍需人工審核後明示改狀態。特別注意：
-  `--arm` 只選擇／記錄 arm id，**不會替操作者切換 tool schema 或客戶端規則**；歷史 row 綁的
-  是當年凍結 config/artifact digest，客戶端 row 的 contract digest 綁的是 `client_prompt` 的
-  規則檔與工具 catalog，不相符就 fail-loud。
+- `eval/fixtures/tool_routing/support_matrix.json`：只保存現行客戶端的 `client_baseline`。
+  catalog 契約已量，routing 指標尚未完成量測，所以狀態維持 `unsupported`。
+  harness 絕不改 matrix；gate 通過只輸出 `manual_status_change_required=true`，
+  仍需人工審核後明示改狀態。`--arm` 只選擇／記錄 arm id，
+  **不會替操作者切換 tool schema 或客戶端規則**；contract digest 綁定
+  `client_prompt` 的規則檔與工具 catalog，不相符就 fail-loud。
 - `session_eval.py`／`scripts/session_eval.py`：明示 opt-in 的私人 session-model eval。
   session store 的匯出只負責來源封存；mined draft 排除所有歷史 assistant text，curated suite
   禁止 `expected_answer`／`gold_answer` 類欄位，只接受外部 verifier、`human_pairwise` 或
@@ -259,14 +257,9 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
   目前的模式;`effective_config_digest` 已經涵蓋這一點。
   摘要**品質**（七條規則、五輪權重、舊結論淘汰）只走這條私人 eval，不進 smoke / full——
   用 mock 驗模型輸出品質等於沒驗。
-- `scripts/mcp_catalog.py`／`scripts/eval_tool_routing.py`：runtime catalog 預設從 effective
-  stdio MCP 實跑 `initialize/tools/list`；current arm 精確對照
-  `mcp_contract.PUBLIC_TOOL_ORDER`，任何名稱或順序 drift 都 fail-loud；完整 schema 只留
-  privacy-safe count/digest，typed bounds 另由 static contract gate 驗證。
-  `--catalog-only` 強制零模型並跳過 auxiliary model preflight；歷史 baseline 只能顯式用
-  `--arm baseline --frozen-contract`，逐欄 exact match 該 row 保存的
-  order/per-tool/digest/count，不能拿 current contract 冒充歷史資料。catalog-only 結果的
-  support gate 明確是 `passed=false`，不可能靠 catalog aggregate 升級 support status。
+- `scripts/eval_tool_routing.py`：量測現行客戶端的工具路由與 live MCP catalog。
+  catalog 必須符合目前公開工具契約。catalog-only 結果的 support gate 明確是
+  `passed=false`，不可能靠 catalog aggregate 升級 support status。
   真模型 event parser 把 reasoning token／text 與 assistant text 分開；reasoning 永不參與
   promise／marker 分類，也不會被保存成 assistant output。
 - `scripts/check_eval_consistency.py`：不跑 LLM，只檢查 eval expected 是否和 `config.py` / source code 漂移。
@@ -287,11 +280,6 @@ python3 eval/run_eval.py --test-set all --verbose
 python3 scripts/eval_tool_routing.py --root <SYNTHETIC_ROOT> \
     --matrix-row <ROW_ID> --arm <ARM> \
     --output /tmp/tool-routing-catalog.json --catalog-only
-
-# 歷史 baseline replay：--frozen-contract 只能和 baseline arm 併用
-python3 scripts/eval_tool_routing.py --root <SYNTHETIC_ROOT> \
-    --matrix-row <ROW_ID> --arm baseline --frozen-contract \
-    --output /tmp/tool-routing-baseline.json --catalog-only
 
 # 只有這兩條會連 8081。改了 corpus / parser 語意 / render schema,或 bump 了
 # RETRIEVAL_SCORER_VERSION 之後都要重錄(pipeline 不符時 eval gate 會 FAIL,
@@ -316,7 +304,7 @@ config／artifact／contract digest。完整介面是：
 
 ```bash
 python3 scripts/eval_tool_routing.py --root ROOT --matrix-row ROW_ID --arm ARM \
-    --output RESULT.json [--model MODEL] [--catalog-only] [--frozen-contract]
+    --output RESULT.json [--model MODEL] [--catalog-only]
 ```
 
 `--catalog-source in-process` 是 CI/testing 隱藏選項，而且只允許搭配 `--catalog-only`；日常
@@ -325,35 +313,8 @@ message/model/`max_tokens=1`/stream，只差 tools；任何一側 usage 缺失�
 FastMCP instructions 另以對稱 apply-template/tokenize marginal delta 計入。沒有授權、沒有
 live-after 結果或 gate 未通過，都要明列未完成，不能把 `measured` 改寫成 `supported`。
 
-**這張表是 OpenCode 時代的量測。** 2026-08-27 經明示授權、在
-DeepSeek-V4-Flash UD-Q8_K_XL／Unsloth row 完成的 privacy-safe aggregate;六個 arm 都先凍結
-exact contract digest，再各跑完整 15-case fixture。去 OpenCode 化之後,`build prompt` 與
-`todowrite` 這兩個當時的變因**已經不存在**(現在的等價物是客戶端的 `BASE_RULES` 與
-`client_policy.ASK_TOOLS`),所以那六個 arm 不可能再被跑一次;matrix 裡對應的 row 是
-`...__opencode-1-18-21-historical`,標了 `era: "opencode"`。
-
-客戶端時代的 row(`...__codetrail-client` / `client_baseline` arm)目前只量了 catalog 契約,
-routing 指標**尚未**在新客戶端下重量,所以 `status` 是 `unsupported`(fail-closed)。下面
-仍是量測證據，仍不是支援宣告:
-
-| arm | catalog tokens | tool recall | evidence adoption | 主要失敗／決策 |
-|---|---:|---:|---:|---|
-| `baseline` | 13,369 | 38.5% | 69.2% | bait=1、promise=1；row-local baseline |
-| `schema_only` | 14,446 | 38.5% | 69.2% | token、recall、grounding、guards 未過 |
-| `schema_plus_mcp_instructions` | 14,585 | 46.2% | 76.9% | bait=0，但 promise=1 且 recall／grounding 未過 |
-| `schema_instructions_build_prompt` | 14,585 | 38.5% | 76.9% | promise=0，但 recall／grounding／bait 未過 |
-| `schema_instructions_build_prompt_todowrite_deny` | 14,585 | 38.5% | 76.9% | 未改善；淘汰，runtime `todowrite` 維持 `allow` |
-| `english_descriptions` | 4,280 | 38.5% | 69.2% | 只過 token gate；bait=2、promise=2 |
-
-後續完整組合中，最佳 `selected_combo_v3_stop_on_evidence` 是 4,331 catalog tokens、61.5%
-tool recall（比 baseline +23.1 個百分點），但 evidence adoption 反降至 61.5%，且 bait=2、
-promise=1，所以仍淘汰。`selected_combo_v2_exact_routes` 另有 1 個 harness-invalid case；再後面的
-strict canary 仍無法穩定產生中英文規格工具呼叫，因此停止 prompt tuning，沒有拿部分 canary
-冒充 full gate。
-
-結果是歷史 row 保持 `measured`、`supported_arm=null`，每個正式 result 都是
-`manual_status_change_required=false`，人工升級條件未觸發。所有 checked-in measurement
-都是統計與相容性 digest，不含 prompt、專案路徑、工具參數或輸出。
+目前 `client_baseline` 尚未完成 routing 量測，`status` 維持 `unsupported`，
+`supported_arm=null`。catalog 計數不能當成模型支援宣告。
 
 ### Code graph 的 C/C++ 保守解析
 

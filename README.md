@@ -82,10 +82,6 @@ aicode        # CodeTrail 終端客戶端;/tools 應列出 19 個工具
   工具名稱、參數與用途以本輪 tool schema 為唯一真值,重複一份只會增加每輪 prompt。
   要關掉專案內的那兩份,在 `~/.config/codetrail/client.json` 設
   `"project_instructions": false`。
-- **從舊世代前端(`a1682d5` 之前)升級的機器**:那時候的 CodeTrail 會寫幾個值進另一個
-  前端的設定檔。現在的 runtime 完全不碰它,本版也不再附帶那支還原工具,所以那些值
-  **沒有人負責**。解除是一次性的手動程序,步驟見
-  [docs/troubleshooting.md 的升級段](docs/troubleshooting.md)(標題含 `a1682d5`)。
 
 ## 特別注意(首次部署最容易踩的)
 
@@ -523,7 +519,7 @@ CodeTrail 的設定**只有三個來源,全部是檔案**。沒有第四個 —�
 
 行程之間一律用 **argv** 交接,不用環境變數:
 `aicode` → `codetrail_chat.py` → `mcp_server --root/--readonly/--n-ctx`。
-子行程的環境在交出去之前會把那四個前綴整組剝掉。
+子行程的環境在交出去之前會把那三個前綴整組剝掉。
 
 被分析的專案裡的 `.codetrail/` **只放輸出**(`lessons.md`、metrics、cache),
 不放任何開關 —— 被分析的 repo 不可信。
@@ -532,7 +528,7 @@ CodeTrail 的設定**只有三個來源,全部是檔案**。沒有第四個 —�
 主模型、GPU、llama-server 路徑、tmux session 名、逾時與 rollback 都只來自
 `deployment.json`、repo 常數與**旗標**;產生的 `~/start.sh` 一行 `export` / `unset`
 都沒有。每個 pane 跑的是 `python3 deployment_profile.py exec <role> …`,由它算出
-最終環境再 `exec` llama-server:CodeTrail 的四個前綴、llama.cpp 自己的
+最終環境再 `exec` llama-server:CodeTrail 的三個前綴、llama.cpp 自己的
 `LLAMA_ARG_*`,以及繼承來的 GPU 選擇一律剝掉,GPU 只由設定檔驗證過的值重新指定。
 所以 tmux server 的全域環境、`.bashrc` 或另一份安裝的殼層殘留都影響不到啟動參數。
 

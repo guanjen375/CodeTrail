@@ -49,7 +49,6 @@ SHELL_POLLUTION = {
     "CODETRAIL_CLIENT_CONFIG": "/nonexistent/other-client.json",
     "CODETRAIL_KEEP_REASONING": "1",
     "CODETRAIL_SHOW_REASONING": "1",
-    "OPENCODE_CONFIG": "/nonexistent/opencode.json",
 }
 
 
@@ -343,6 +342,6 @@ def test_the_canary_child_environment_is_stripped(monkeypatch, tmp_path):
             return type("S", (), {"base_url": "http://127.0.0.1:65535"})()
 
     client_preflight.check_tool_health(result, _Profile())
-    leaked = [k for k in seen["env"] if k.startswith(("AICODE_", "AI_CODE_", "CODETRAIL_", "OPENCODE_"))]
+    leaked = [k for k in seen["env"] if k.startswith(("AICODE_", "AI_CODE_", "CODETRAIL_"))]
     assert not leaked, leaked
     assert "PATH" in seen["env"]

@@ -14,7 +14,7 @@ wrapper spawn 的 CLI,以兩個環境變數(`AICODE_LESSONS_SKIP` 與 store 的�
 「這個 session 不注入」改成呼叫端明確傳的 `skip=True`(replay / eval 用)。
 斷言的行為沒變,只是 exit code 換成 `PreflightError`。
 
-純檔案系統操作,不需要 llama-server / OpenCode。
+純檔案系統操作,不需要啟動模型服務或聊天客戶端。
 """
 from __future__ import annotations
 
@@ -589,14 +589,6 @@ def test_cli_reports_corrupt_store(tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
-# opencode.json 契約(instructions 注入 + record_lesson permission)
-# ---------------------------------------------------------------------------
-
-
-
-
-
-# ---------------------------------------------------------------------------
 # 驗收:單條 lesson 完整生命週期
 # ---------------------------------------------------------------------------
 
@@ -604,8 +596,8 @@ def test_full_lifecycle_correction_to_review(tmp_path, monkeypatch, capsys):
     """糾正 → 提案 → (ask 核准後)寫入 → 下個 session 注入 → 過期 →
     停注入 + 複審提示 → renew 後恢復注入。
 
-    ask 核准發生在 OpenCode client 端(permission 契約已由
-    test_permission_template_gates_record_lesson_after_wildcard 驗證);
+    人工核准由 client_policy 與 client_engine 執行;本檔的
+    test_record_lesson_stays_behind_a_human_approval 守住 ASK policy,
     propose_lesson 對應「核准之後」的落地。
     """
     store = _home(tmp_path, monkeypatch)
@@ -648,8 +640,7 @@ def test_full_lifecycle_correction_to_review(tmp_path, monkeypatch, capsys):
 def test_record_lesson_stays_behind_a_human_approval():
     """`record_lesson` 寫的是**未來每一輪都會生效**的行為規則。
 
-    以前這道閘在 opencode.json 的 permission 表(`codetrail_*: allow` 之後把它
-    覆成 ask);現在它在客戶端的 policy 裡。閘掉了就是模型可以自己給自己立規則。
+    客戶端的 policy 必須要求人工核准;閘掉了就是模型可以自己給自己立規則。
     """
     import client_policy
 

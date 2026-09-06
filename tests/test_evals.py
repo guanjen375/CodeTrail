@@ -21,8 +21,7 @@ server、不碰網路。
 * tests/test_session_eval.py —— 私人 session-model eval lane 的安全契約。
 
 smoke 成員資格:semantic retrieval 與 session eval 兩段原本是整檔 smoke,合併後改成
-逐條 `@pytest.mark.smoke`;tool-routing 只有 result privacy 與凍結 baseline 的有效
-字元數那兩條是 smoke;其餘三段不在 smoke 包。
+逐條 `@pytest.mark.smoke`;tool-routing 的 result privacy、catalog 成本與公開工具契約帶 smoke。
 """
 from __future__ import annotations
 
@@ -32,7 +31,6 @@ import os
 import subprocess
 import sys
 from copy import deepcopy
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -549,137 +547,12 @@ def test_result_privacy_allows_only_metrics_and_compatibility_identity():
             routing.validate_private_result(leaked)
 
 
-def test_saved_baseline_reproduces_pre_t2_live_measurement_and_stays_measured():
-    matrix = routing.load_support_matrix()
-    row = matrix["rows"][0]
-    catalog = row["baseline"]["catalog"]
-    assert row["status"] == "measured"
-    assert catalog["tool_count"] == 19
-    assert catalog["description_chars"] == 25_847
-    assert catalog["input_schema_chars"] == 5_044
-    assert catalog["output_schema_chars"] == 2_408
-    assert catalog["catalog_chars"] == 33_299
-    assert mcp_catalog.effective_chars(catalog) == 30_891
-    assert catalog["instructions_chars"] == 0
-    assert len(catalog["per_tool"]) == 19
 
 
-def test_frozen_contract_accepts_only_the_exact_saved_historical_catalog():
-    matrix = routing.load_support_matrix()
-    row = matrix["rows"][0]
-    saved = row["baseline"]["catalog"]
-    tools = tuple(
-        mcp_catalog.CatalogTool(item["name"], "", {}, None, {"name": item["name"]})
-        for item in saved["per_tool"]
-    )
-    snapshot = mcp_catalog.CatalogSnapshot(
-        source="synthetic_historical_stdio",
-        tools=tools,
-        instructions="",
-        per_tool=tuple(mcp_catalog.ToolCatalogCount(**item) for item in saved["per_tool"]),
-        description_chars=saved["description_chars"],
-        input_schema_chars=saved["input_schema_chars"],
-        output_schema_chars=saved["output_schema_chars"],
-        catalog_chars=saved["catalog_chars"],
-        catalog_effective_chars=mcp_catalog.effective_chars(saved),
-        tools_digest=saved["tools_digest"],
-        instructions_digest=saved["instructions_digest"],
-        canonical_tools_list_chars=saved["canonical_tools_list_chars"],
-    )
-
-    parsed = routing.build_parser().parse_args(
-        [
-            "--root",
-            ".",
-            "--matrix-row",
-            row["id"],
-            "--arm",
-            "baseline",
-            "--output",
-            "synthetic-result.json",
-            "--catalog-only",
-            "--frozen-contract",
-        ]
-    )
-    assert parsed.frozen_contract is True
-    with pytest.raises(mcp_catalog.CatalogError):
-        mcp_catalog.assert_public_tool_contract(snapshot)
-    routing.assert_frozen_catalog_contract(snapshot, row)
-    with pytest.raises(routing.EvalError):
-        routing.assert_frozen_catalog_contract(
-            replace(snapshot, tools_digest="f" * 64),
-            row,
-        )
-    with pytest.raises(routing.EvalError):
-        routing.assert_frozen_catalog_contract(
-            replace(snapshot, tools=tuple(reversed(snapshot.tools))),
-            row,
-        )
 
 
-def _snapshot_from_frozen_row(saved: dict) -> mcp_catalog.CatalogSnapshot:
-    """把凍結的 baseline 還原成一份 snapshot(與 live 抓到的形狀相同)。"""
-    return mcp_catalog.CatalogSnapshot(
-        source="synthetic_historical_stdio",
-        tools=tuple(
-            mcp_catalog.CatalogTool(item["name"], "", {}, None, {"name": item["name"]})
-            for item in saved["per_tool"]
-        ),
-        instructions="",
-        per_tool=tuple(mcp_catalog.ToolCatalogCount(**item) for item in saved["per_tool"]),
-        description_chars=saved["description_chars"],
-        input_schema_chars=saved["input_schema_chars"],
-        output_schema_chars=saved["output_schema_chars"],
-        catalog_chars=saved["catalog_chars"],
-        catalog_effective_chars=mcp_catalog.effective_chars(saved),
-        tools_digest=saved["tools_digest"],
-        instructions_digest=saved["instructions_digest"],
-        canonical_tools_list_chars=saved["canonical_tools_list_chars"],
-    )
 
 
-@pytest.mark.smoke
-def test_the_effective_chars_field_survives_its_rename_across_the_frozen_data():
-    """有效字元數改了鍵名,凍結資料沒有:兩邊必須仍然真的在比對。
-
-    live 的 `summary()` 只寫新鍵,`era: "opencode"` 的歷史列只有舊鍵。讀取端
-    少了退回舊鍵那一段的話,凍結契約會拿兩個「都不存在」的欄位互比 —— 那是
-    最危險的形狀:報告照樣說「與歷史 baseline 相符」,而那一格根本沒比。
-    所以缺兩個鍵一律 fail-loud,不得靜靜當 0。
-    """
-    matrix = routing.load_support_matrix()
-    row = matrix["rows"][0]
-    saved = row["baseline"]["catalog"]
-
-    # 凍結資料是量出來的,不重造:它仍然只有舊鍵。
-    assert row["era"] == "opencode"
-    assert mcp_catalog.LEGACY_EFFECTIVE_CHARS_KEY in saved
-    assert mcp_catalog.EFFECTIVE_CHARS_KEY not in saved
-
-    snapshot = _snapshot_from_frozen_row(saved)
-    live = snapshot.summary()
-    # 新寫入只用新鍵;舊鍵不再被產生出來。
-    assert live[mcp_catalog.EFFECTIVE_CHARS_KEY] == 30_891
-    assert mcp_catalog.LEGACY_EFFECTIVE_CHARS_KEY not in live
-    # 同一個讀取端把兩種拼法解到同一個數字。
-    assert mcp_catalog.effective_chars(live) == mcp_catalog.effective_chars(saved)
-
-    # 兩個鍵都沒有 = 沒量過,不是 0。
-    with pytest.raises(mcp_catalog.CatalogError):
-        mcp_catalog.effective_chars({"catalog_chars": 33_299})
-
-    # 值真的漂了要擋下來(這一格仍在契約裡)。
-    routing.assert_frozen_catalog_contract(snapshot, row)
-    with pytest.raises(routing.EvalError):
-        routing.assert_frozen_catalog_contract(
-            replace(snapshot, catalog_effective_chars=30_890),
-            row,
-        )
-    # 歷史列少了舊鍵 = 契約不完整,不得當成「這一格不用比」。
-    incomplete = deepcopy(row)
-    del incomplete["baseline"]["catalog"][mcp_catalog.LEGACY_EFFECTIVE_CHARS_KEY]
-    with pytest.raises(routing.EvalError):
-        routing.assert_frozen_catalog_contract(snapshot, incomplete)
 
 
 # ── 原 test_code_smoke_eval.py:code-inference smoke fixture / metric 契約 ──
@@ -1699,7 +1572,7 @@ def test_resume_checkpoint_rejects_project_state_drift(monkeypatch, tmp_path: Pa
 
 
 # ── session eval 的 replay 契約(S4 審核回修)──
-# 去 OpenCode 化之後 replay 跑的是我們自己的客戶端,所以壓縮語意由 client.json
+# replay 跑的是 CodeTrail 客戶端,壓縮語意由 client.json
 # 決定、多輪要真的接得起來、而且 gitignore 掉的路徑一樣算 project state。
 
 @pytest.mark.smoke
@@ -2050,10 +1923,10 @@ def test_the_routing_eval_child_environment_is_stripped(monkeypatch):
     """
     import client_mcp
 
-    for name in ("AICODE_MODEL", "AI_CODE_PATCH", "CODETRAIL_CLIENT_CONFIG", "OPENCODE_API_KEY"):
+    for name in ("AICODE_MODEL", "AI_CODE_PATCH", "CODETRAIL_CLIENT_CONFIG"):
         monkeypatch.setenv(name, "leftover")
     env = client_mcp.child_env()
-    for name in ("AICODE_MODEL", "AI_CODE_PATCH", "CODETRAIL_CLIENT_CONFIG", "OPENCODE_API_KEY"):
+    for name in ("AICODE_MODEL", "AI_CODE_PATCH", "CODETRAIL_CLIENT_CONFIG"):
         assert name not in env, name
     assert "PATH" in env, "其餘使用者環境要保留(run_command 需要)"
 
@@ -2341,3 +2214,43 @@ def test_delete_sessions_runs_without_the_removed_environment_parameter(tmp_path
     """`_delete_sessions` 的 `environment` 參數拿掉了,函式體裡 `del session_ids, project,
     environment` 卻還留著 → UnboundLocalError,整個 routing eval 在第一題就中止。"""
     assert routing._delete_sessions((), project=tmp_path) is True
+
+
+@pytest.mark.smoke
+def test_catalog_summary_keeps_input_cost_separate_from_ui_payload():
+    """output schema 只給結構化接收端,不能被算進模型的工具字元成本。"""
+    schema = SCHEMAS["read_file"]
+    tool = {"name": "read_file", "description": "Read text.", "inputSchema": schema}
+    small = mcp_catalog.measure_catalog([tool], source="synthetic")
+    large = mcp_catalog.measure_catalog([
+        {**tool, "outputSchema": {"description": "UI detail " * 1000}}
+    ], source="synthetic")
+    expected = len(tool["description"]) + len(json.dumps(schema, ensure_ascii=False, sort_keys=True))
+    assert small.summary()["catalog_effective_chars"] == expected
+    assert large.summary()["catalog_effective_chars"] == expected
+    assert large.catalog_chars > small.catalog_chars
+
+
+@pytest.mark.smoke
+def test_routing_catalog_requires_the_public_tool_contract(monkeypatch, tmp_path):
+    """即使只擷取 catalog,缺工具也不能被報成有效的評測結果。"""
+    import asyncio
+
+    matrix = routing.load_support_matrix()
+    row = matrix["rows"][0]
+    args = routing.build_parser().parse_args([
+        "--root", str(tmp_path), "--matrix-row", row["id"],
+        "--arm", "client_baseline", "--output", str(tmp_path / "result.json"),
+        "--catalog-only", "--catalog-source", "in-process",
+    ])
+    incomplete = mcp_catalog.measure_catalog([
+        {"name": "read_file", "description": "Read text.", "inputSchema": SCHEMAS["read_file"]}
+    ], source="synthetic")
+
+    async def acquire(**kwargs):
+        return incomplete, None
+
+    monkeypatch.setattr(routing, "_acquire_catalog", acquire)
+    with pytest.raises(mcp_catalog.CatalogError):
+        asyncio.run(routing.run(args))
+    assert not args.output.exists()
