@@ -70,3 +70,5 @@ W3 D1 完成：`04-opus-D1` exit 0 / result success，init / assistant = `claude
 第 5 階段修復第 3 輪 05-fable-fix-03 已啟動：明傳 --model claude-fable-5-1[1m] --effort max；init model=claude-fable-5-1。CLI 使用 --settings {"autoMemoryEnabled":false}（僅本次呼叫），工具限 Edit/Glob/Grep/Read/Write。只修 review04 三份測試的 fixture／gate helper，不執行測試。
 
 第 5 階段 05-fable-fix-03 完成：CLI exit 0 / result success；init / assistant 均為 claude-fable-5-1，明傳 effort=max。實際工具為 Read 28、Glob 3、Grep 18、Edit 4、Write 1；寫入僅指定三份測試與 fix-03.md，沒有命令／測試／記憶寫入。單次 autoMemoryEnabled=false 設定留在 request metadata。編排者靜態核對 24 個原斷言、decorator、來源 walker 皆相同；195 筆 test symbol 變更均有逐名交接。追加測試未執行，接續 ASTRA 第 5 輪靜態審核。
+
+第 5 階段 ASTRA 第 5 輪已定稿：implementation-review-05.md，三項修法靜態接受，待改靜態缺陷 0、歷史 smoke 失敗待驗證 3；不宣稱整體 Blocker 0。獨立核對 58 個產品路徑、24 個 assert、decorator 與 walker，產品快照不變。審核只有原始碼／AST／hash，沒有測試或產品編輯。修復已可審核，下一步由編排者請求必要追加驗證同意。
