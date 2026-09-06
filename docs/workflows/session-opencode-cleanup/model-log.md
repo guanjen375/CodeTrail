@@ -44,3 +44,7 @@ W2 C3 完成：`04-opus-C3` exit 0 / result success，init / assistant = `claude
 啟動 W3 `04-opus-D1`，明傳 `--model claude-opus-5 --effort max`；僅 gate / smoke manifest / AGENTS 與自己的交接文件，禁止 pytest/函式探查。所有 worker 交接已落檔；最終 smoke 仍留到 Astra / Fable 靜態收斂後。
 
 W3 D1 的回傳身分已確認：init 與 assistant 皆為 `claude-opus-5`，request 明傳 effort=max。編排者已把 C3 漏列的 3 條測試之實際 diff 理由補入 `test-change-audit.md`；未改任何測試碼。
+
+W3 D1 完成：`04-opus-D1` exit 0 / result success，init / assistant = `claude-opus-5`，明傳 effort=max。hand-off 與 AST node 核對完成；無 pytest、無 repo runtime 合成資料探查。D1 明列一個預期 gate offender（codetrail_chat.py 的舊 docstring），未跑測試確認，也沒有放寬 gate。
+
+第 5 階段實作審核將沿用 `/root/astra_review`（建立時明傳 `model=gpt-6-astra`、`reasoning_effort=max`）；只審不改，不跑測試。審核基準程式碼 `a1682d5`，對目前完整工作樹；修復交 Fable MAX。
