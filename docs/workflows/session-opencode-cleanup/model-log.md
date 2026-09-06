@@ -42,3 +42,5 @@ W2 C2 完成：`04-opus-C2` exit 0 / result success，init / assistant = `claude
 W2 C3 完成：`04-opus-C3` exit 0 / result success，init / assistant = `claude-opus-5`，明傳 effort=max。handoff-C3.md 已定稿，無 pytest、無 repo runtime 合成資料探查。W2 全部完成。靜態 test symbol 比對找到 C3 handoff 漏列 3 個既有測試名，編排者會以實際 diff 補足交付紀錄，不忽略它们。
 
 啟動 W3 `04-opus-D1`，明傳 `--model claude-opus-5 --effort max`；僅 gate / smoke manifest / AGENTS 與自己的交接文件，禁止 pytest/函式探查。所有 worker 交接已落檔；最終 smoke 仍留到 Astra / Fable 靜態收斂後。
+
+W3 D1 的回傳身分已確認：init 與 assistant 皆為 `claude-opus-5`，request 明傳 effort=max。編排者已把 C3 漏列的 3 條測試之實際 diff 理由補入 `test-change-audit.md`；未改任何測試碼。
