@@ -64,3 +64,5 @@ W3 D1 完成：`04-opus-D1` exit 0 / result success，init / assistant = `claude
 第 5 階段 ASTRA 第 3 輪已定稿：`implementation-review-03.md`，Static Active Blocker 0；B-05 fallback 與 AGENTS 引用解除。產品樹 58 路徑與 review-03 fingerprint 相符；runtime/tests 自 review-02 未變。審核者未執行測試／探查，只新增報告。編排者接續預定的唯一一次 `python3 scripts/run_tests.py -m smoke`，不執行 full。
 
 唯一預定整包 smoke 已執行：2395 selected，2392 passed / 3 failed，exit 1，見 smoke-01.md；full 0。來源 fingerprint 未變。ASTRA 靜態 0 不代表實際測試通過，目前有 3 個測試失敗需集中分析與 Fable 修復，不以基線或額外探查掩蓋。
+
+第 5 階段 ASTRA 第 4 輪已定稿：implementation-review-04.md，Active Blocker 3；逐項核對 smoke 原始失敗與 a1682d5。最小修復限於三份測試檔的情境 fixture／gate helper，既有 stop 欄位錯誤不擴張為本次產品修復。審核未執行測試或改碼。接續 Fable MAX 修復，僅檔案工具，並以單次 --settings 關閉 auto memory；追加測試仍未授權。
