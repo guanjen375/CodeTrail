@@ -48,3 +48,5 @@ W3 D1 的回傳身分已確認：init 與 assistant 皆為 `claude-opus-5`，req
 W3 D1 完成：`04-opus-D1` exit 0 / result success，init / assistant = `claude-opus-5`，明傳 effort=max。hand-off 與 AST node 核對完成；無 pytest、無 repo runtime 合成資料探查。D1 明列一個預期 gate offender（codetrail_chat.py 的舊 docstring），未跑測試確認，也沒有放寬 gate。
 
 第 5 階段實作審核將沿用 `/root/astra_review`（建立時明傳 `model=gpt-6-astra`、`reasoning_effort=max`）；只審不改，不跑測試。審核基準程式碼 `a1682d5`，對目前完整工作樹；修復交 Fable MAX。
+
+第 5 階段 ASTRA 第 1 輪已定稿：`implementation-review-01.md`，Active Blocker 5；沿用建立時指定的 `gpt-6-astra / reasoning_effort=max`。僅新增審核文件，58 個產品路徑的 fingerprint 未變；未執行測試或 runtime 探查。接續 Fable MAX 修復。
