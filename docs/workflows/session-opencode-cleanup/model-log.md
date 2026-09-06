@@ -72,3 +72,5 @@ W3 D1 完成：`04-opus-D1` exit 0 / result success，init / assistant = `claude
 第 5 階段 05-fable-fix-03 完成：CLI exit 0 / result success；init / assistant 均為 claude-fable-5-1，明傳 effort=max。實際工具為 Read 28、Glob 3、Grep 18、Edit 4、Write 1；寫入僅指定三份測試與 fix-03.md，沒有命令／測試／記憶寫入。單次 autoMemoryEnabled=false 設定留在 request metadata。編排者靜態核對 24 個原斷言、decorator、來源 walker 皆相同；195 筆 test symbol 變更均有逐名交接。追加測試未執行，接續 ASTRA 第 5 輪靜態審核。
 
 第 5 階段 ASTRA 第 5 輪已定稿：implementation-review-05.md，三項修法靜態接受，待改靜態缺陷 0、歷史 smoke 失敗待驗證 3；不宣稱整體 Blocker 0。獨立核對 58 個產品路徑、24 個 assert、decorator 與 walker，產品快照不變。審核只有原始碼／AST／hash，沒有測試或產品編輯。修復已可審核，下一步由編排者請求必要追加驗證同意。
+
+使用者明示「那你最後smoke一次」，授權最後一次整包 smoke；編排者直接執行 python3 scripts/run_tests.py -m smoke，沒有另跑三個 node。2395 selected / 2395 passed / 0 failed / 0 errors / 0 skipped，exit 0，實際 10.391 秒，16 shards；見 smoke-02.md。產品 diff hash 與 ASTRA review05 相同，58 個產品路徑未變，full 0。接續沿用 ASTRA MAX 只做最終證據核對，禁止重跑測試或擴張到未變動碼。
