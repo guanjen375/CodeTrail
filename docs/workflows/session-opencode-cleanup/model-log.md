@@ -24,3 +24,9 @@ Astra 審核將透過明指 `model=gpt-6-astra`、`reasoning_effort=max` 的 Cod
 W0 完成：`04-opus-S-red` exit 0 / result success；兩個新 node 各執行一次，皆 collected 1 / exit 1 / 預期重播斷言失敗。紅燈時 runtime 零 diff，證據見 `handoff-S-red.md`。
 
 W1 放行 `04-opus-S`、`04-opus-B`、`04-opus-C1` 三個獨立 Claude CLI；各明传 `--model claude-opus-5 --effort max`，分工依最終計畫。
+
+W1 回傳身分已核對：`04-opus-S`、`04-opus-B`、`04-opus-C1` 的 init 與 assistant model 全部為 `claude-opus-5`；各 request.json 記錄 effort=max、prompt SHA-256 與開始時間。回傳 metadata 未另外提供 effort 欄位。
+
+W1 B 完成：`04-opus-B` exit 0 / result success；init 與 assistant 均為 `claude-opus-5`，effort 旗標 max。未跑 pytest，handoff-B.md 已定稿。S 的兩條原 regression 已各取得 exit 0 / 1 passed（0.91s、0.88s）。
+
+依 §4 的名稱相依關係，釋出 B 名額後先啟動 W2 D2 文件工作；C1/C2/C3 的既定介面名稱可由 final plan 使用，C2/C3 仍等待 C1 完成交接。`04-opus-D2` 明傳 `--model claude-opus-5 --effort max`。
