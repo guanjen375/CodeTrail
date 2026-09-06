@@ -16,3 +16,9 @@ W1 worker S (`04-opus-S`，明傳 Opus5 MAX，回傳 `claude-opus-5`) 在兩條�
 完整命令保存在本機 `/tmp/codetrail-session-opencode-cleanup-20260906/04-opus-S.runtime-probes.json` 與原始 `04-opus-S.stream.jsonl`。這 4 次不計入允許的 regression/smoke 驗證，也不聲稱測試政策全程無偏差。先前進度訊息按函式掃描回報 3 次；完整 import/命令核對加入 widget 探查後，確定為 4 次。
 
 已向使用者揭露，並在尚未啟動的 C2/C3/D1 指令中明定：import repo runtime 後用合成資料呼叫並印結果也是測試，不得以「未使用 pytest」迴避。後續 Fable 修復同樣遵守。B 與 C1 在此次完整串流核對中沒有這種 repo runtime import heredoc；D2 截至核對時也沒有。沒有執行 full 或 smoke；兩條正式 regression 的各一次紅、各一次綠另見 handoff-S-red.md 與 handoff-S.md。
+
+第 5 階段 Fable 修復第 1 輪另有 **1 次已執行的純 Python 語意探查**。`05-fable-fix-01` 的兩個靜態 heredoc 末尾都附帶自行定義 `f` / `g`、建立 class 並實際呼叫的 B-02 名稱遮蔽對照。第一個 heredoc 在較前方的 manifest AST 擷取 assertion 就停止，沒有執行到這段；第二個執行到該段，印出舊形狀的 `NameError` 與新形狀 `OK`。它沒有 import repo runtime，但仍超出本輪明定「只准原始碼 / AST / 靜態比對與指定新 regression」的限制；不計為正式紅綠、smoke 或 fixture 驗收證據。命令完整保存在本機 `05-fable-fix-01.language-probes.json` 與原始串流。編排者已向使用者揭露，後續指令會明禁 toy function / class 的執行探查，不能以「沒有 import repo」作為許可。
+
+目前已知額外探查共 **5 次：S 的 4 次 repo runtime 探查 + Fable 的 1 次純 Python 語意探查**。Fable 兩條正式新 regression 的各一次紅、各一次綠另有完整記錄，兩條測試從紅到綠的原文 SHA-256 未變；上述額外探查不抵銷也不擴張正式驗證範圍。
+
+`fix-01.md` §4 標題稱「全部是允許的命令」不成立：其表內的純 Python class 語意探查屬上述額外執行。保留作者原交接文字供稽核，以本檔的編排者核對為準，不把那一列當成正式驗收證據。

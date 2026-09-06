@@ -1,10 +1,10 @@
 # 測試變更的靜態核對與補充
 
-編排者以 `a1682d5` 的原始碼為準，對照目前測試函式（含 decorator 與函式內註解）的原始碼雜湊；沒有 import 測試模組、collect 或執行測試。原始觀察表在本機 `test-changes-W2.json`。本表已核對至 W3；Fable 修復後仍須更新。
+編排者以 `a1682d5` 的原始碼為準，對照目前測試函式（含 decorator 與函式內註解）的原始碼雜湊；沒有 import 測試模組、collect 或執行測試。原始觀察表在本機 `test-changes-W2.json`。本表已核對至 Fable 修復第 1 輪。
 
 逐條原因表：
 
-| 工作 | 明細 | W2 核對結果 |
+| 工作 | 明細 | 核對結果 |
 |---|---|---|
 | Session | [handoff-S.md](handoff-S.md)、[紅燈](handoff-S-red.md) | 變動 node 名全有記錄，fixture / import 另列 |
 | OpenCode 移除與常數 | [handoff-B.md](handoff-B.md) | 含整檔刪除的 63 條測試，變動 node 名全有記錄 |
@@ -25,3 +25,5 @@ C3 交接表漏列的 3 條，編排者已逐條看實際 diff 補足如下；�
 這是交付紀錄補足，不是刪除、放寬或改寫測試來取得綠燈。
 
 W3 核對：D1 的 `test_repo_consistency.py` 新增觀察名 5、刪除觀察名 5（內含兩條改名）、修改 10，`test_aicode.py` 刪除 1，全部能在 handoff-D1.md 找到逐條原因；`test_smoke_gate.py` 改的是 SAFETY_MODULES 資料，未改測試函式本體。
+
+Fable 修復第 1 輪：新增 `tests/test_evals.py::test_the_recorder_never_substitutes_a_path_binary_for_the_chosen_one` 與 `tests/test_repo_consistency.py::test_the_checker_shape_exemption_never_covers_an_executable_import`，兩條 smoke regression 的逐項理由、兩個 recorder helper、gate helper / 常數、`tests/test_server_scripts.py::_fake_profile` 與 manifest 資料變更全部記於 [fix-01.md](fix-01.md) §2。沒有再改其他既有測試函式；兩條新測試自紅燈到綠燈原文 SHA-256 完全相同。正式測試執行各一次紅、一次綠，原始 runner exit 由 log 的 `EXIT=1/0` 核對（Claude 使用 shell echo 記錄 exit，外層 shell 的 exit 不作 runner 結果）。
