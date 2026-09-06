@@ -23,7 +23,7 @@
 
 [擱置清單](deferred.md)仍為空。既有的 5 次額外探查及 2 個範圍外記憶 Edit 已揭露；後者已精確撤回，詳見 [execution-notes.md](execution-notes.md)，不宣稱流程全程無偏差。
 
-只有本固定路徑下的交接文件提交。58 個產品／測試／正式文件路徑仍在工作樹，未提交，沒有 push。實作基準為 `a1682d5`；完整產品 diff 可用下列唯讀命令檢視：
+使用者在驗證通過後明示授權「用 ssh key push 到 main，不用開 PR」。58 個產品／測試／正式文件路徑已原樣提交為 `7ade76aa8b4b05642d3b7e3710bde15c0e17823d`，產品 diff hash 與最後 smoke 相同；交接紀錄亦保留在本固定路徑。發佈目標為 `origin/main`，SSH 位址 `git@github.com:guanjen375/CodeTrail.git`，不開 PR。本次沒有再改產品碼或重跑測試。實作基準為 `a1682d5`；完整產品 diff 可用下列唯讀命令檢視：
 
 ```bash
 git diff a1682d5 -- . ':(exclude)docs/workflows/session-opencode-cleanup/**'

@@ -76,3 +76,5 @@ W3 D1 完成：`04-opus-D1` exit 0 / result success，init / assistant = `claude
 使用者明示「那你最後smoke一次」，授權最後一次整包 smoke；編排者直接執行 python3 scripts/run_tests.py -m smoke，沒有另跑三個 node。2395 selected / 2395 passed / 0 failed / 0 errors / 0 skipped，exit 0，實際 10.391 秒，16 shards；見 smoke-02.md。產品 diff hash 與 ASTRA review05 相同，58 個產品路徑未變，full 0。接續沿用 ASTRA MAX 只做最終證據核對，禁止重跑測試或擴張到未變動碼。
 
 第 5 階段 ASTRA 最終結果核對（第 6 輪）已定稿：implementation-review-06.md，Active Blocker 0、無分歧擱置。沿用 gpt-6-astra / reasoning_effort=max，獨立核對使用者追加授權、執行與審核 HEAD、58 個產品路徑及 stdout hash、16 份 shard 的 selected/collected/passed，2395 passed / exit 0 證據成立。只新增審核文件，沒有測試重跑或產品編輯。原定五步流程及 developer 階段 smoke-only 驗證完成；full 仍由 reviewer 執行，歷史偏差不抹除，產品修改仍未 commit/push。
+
+使用者後續明示授權直接使用 SSH key 推送 main、不開 PR。編排者核對 58 個產品路徑與最後 smoke 相同後，提交產品為 7ade76aa8b4b05642d3b7e3710bde15c0e17823d；diff SHA256 仍為 19892f4e664164159396e1bf5c3e9832510eba74cd06cb31e6413814a11a1364。SSH public-key 驗證成功，遠端 main 為動工前基準 a1682d5，可直接 fast-forward。此次是授權後的 git 發佈工作，沒有模型編輯、測試重跑或 PR 建立。
