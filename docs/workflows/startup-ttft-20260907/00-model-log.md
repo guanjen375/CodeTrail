@@ -146,7 +146,30 @@
 ## R2 首次執行中止：模型安全審查造成自動換型
 
 - CLI argv 明指 Fable 5.1 MAX，但原始 log 的 system event 回傳 `subtype=model_refusal_fallback`、`trigger=refusal`、`scope=session`、`original_model=claude-fable-5-1`、`fallback_model=claude-opus-4-8`、`api_refusal_category=cyber`、`api_refusal_explanation=null`。這是實際回傳的模型安全審查事件，不是 root 選擇替代模型，也不是一般 overload。
-- 截止中止時，assistant frames 的 `message.model` 為 Fable 46 個、Opus 4.8 16 個；這是 frame 統計，不冒稱獨立 API 請求數。沒有完成的 result/modelUsage，不能記為成功或全程 Fable。
+- 截止中止時，assistant frames 的 `message.model` 為 Fable 46 個、Opus 4.8 16 個；這是 frame 統計，不冒稱獨立 API 請求數。當時尚未取得收尾 result/modelUsage，不能記為成功或全程 Fable；稍後落地的失敗 result 見下節補記。
 - root 觀測到身分差異後，以 SIGINT 中止唯一的本任務 CLI 行程（session `c1d62eef-8f64-4a5b-a16b-e3bcbf4758de`，tool execution session 8338）。沒有 Write/Edit 呼叫、沒有 product/test 修改、沒有新測試；worktree product digest 仍為 `16bda189fe8d6d99edfd1ebc86b59a373ac2a1816389d98d5c59ab41731f9349`。上面的 memory 清理在換型前完成。
 - log 留在 private `06-fix-r2.stream.jsonl`。原 R2-B01/R2-B02 仍 active；本次沒有完成回修，不能用來宣告分歧擱置門檻已滿。
 - 下一次仍明指 Fable 5.1 MAX，以較精簡的本地程式／離線 regression 交接重試；不修改安全審查或權限設定來強制通過，也不接受別的主要模型代寫。持續核對每個 assistant frame 的 model 與 fallback system event，若再被拒絕／換型即停止該次，完整保留原因。
+
+## R2 同模型重試
+
+- 明確 argv：`CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1 claude -p --model claude-fable-5-1 --effort max --fallback-model claude-fable-5-1 --settings {"autoMemoryEnabled":false} ...`。只作用於此 CLI 行程，沒有改 repo 設定、全域 Claude 設定或模型安全審查；拒絕發生時直接保留拒絕，不再自動換型。
+- 本機 CLI 2.1.263 的 fallback 准入函式明讀 `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK`，該旗標關閉的是拒絕後換型。一般錯誤的 `--fallback-model` 也限定同一個 Fable 型號。
+- 新 log：private `06-fix-r2-retry.stream.jsonl`。init 回傳 `model=claude-fable-5-1`、version=`2.1.263`、session=`52316661-3311-4b3f-91bd-59f685fdfd25`；effort 依明確 argv，結果待完成。
+- root 回查此前 11 份完整 CLI log（初稿、Opus 身分檢核、定稿、A/B/C/D、Opus 整合、R1 lead/status/整合）：所有主 assistant frame 的 `message.model` 均與該次指定模型相同，沒有 fallback system event。先前 modelUsage 已揭露的輔助 Haiku 用量仍按原紀錄保留，這次查核不把它抹去。
+
+## R2 執行受阻的最終 metadata
+
+- 首次執行稍後落地 `result.subtype=error_during_execution`、`is_error=true`、duration_ms=`2291114`。modelUsage 如下；不能只用 init／可見 frame 省略中間計費模型。
+
+  | modelUsage key | canonicalModel | outputTokens | thinkingTokens |
+  |---|---|---:|---:|
+  | `claude-haiku-4-5-20251001` | `claude-haiku-4-5` | 24 | 0 |
+  | `claude-fable-5-1` | `claude-fable-5-1` | 64579 | 59552 |
+  | `claude-opus-5` | `claude-opus-5` | 64000 | 64000 |
+  | `claude-opus-4-8` | `claude-opus-4-8` | 25774 | 24531 |
+
+- 同模型重試回傳 `model_refusal_no_fallback`，原模型 Fable 5.1、category=`cyber`；API explanation 表示觸發其 Usage Policy 的 cyber 限制，未指出具體程式位置。模型審查仍有效，自動換型已停止。
+- 重試 process exit=`1`、`result.is_error=true`、duration_ms=`875134`；雖然 `result.subtype` 字串為 `success`，仍是失敗，不能視為成功。主 frame 為 Fable 58 個，另有一個 `<synthetic>` 錯誤 frame（不是另一個模型）。
+- 重試 modelUsage：`claude-haiku-4-5-20251001`（canonical `claude-haiku-4-5`）outputTokens=27、thinkingTokens=0；`claude-fable-5-1`（canonical 同名）outputTokens=66022、thinkingTokens=59357。沒有其他模型用量。
+- 兩次 log 均無 Write/Edit、均無測試執行；完整產品 status 和 cached/worktree digest 再核對仍一致。R2 修復未完成，下一步需要使用者決定是否改由另一個 Claude 型號接手；不再重試繞過這次模型拒絕。集中受阻交接見 `06-fix-r2-execution.md`，兩個產品 Blocker 仍未擱置。

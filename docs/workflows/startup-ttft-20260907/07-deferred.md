@@ -1,5 +1,7 @@
 # startup-ttft-20260907 — Deferred 與尚未裁定事項
 
+> **R2 執行狀態更新（root，僅流程紀錄）**：Astra 已在 `05-review-astra-r2.md` 裁定兩項 active Blocker（R2-B01／R2-B02）。Fable 5.1 MAX 兩次回修嘗試均被模型自動安全審查以 `cyber` 拒絕，沒有產品／測試修改、沒有新測試；詳見 `06-fix-r2-execution.md`。產品 digest 仍為 `16bda189fe8d6d99edfd1ebc86b59a373ac2a1816389d98d5c59ab41731f9349`。這兩項**未擱置**、也不因模型拒絕而滿足技術分歧輪數；下一步需使用者決定是否授權另一個 Claude 型號回修。下文保留 R1 原始清單，其中「待 Astra 裁定」的後續裁定以 R2 審核報告為準。full 尚未執行，任務未完成。
+
 - 撰寫者:Claude Fable 5.1(harness 自報 model ID `claude-fable-5-1`),Step 5 R1 整合者。日期 2026-09-07。
 - 對應的產品內容:base HEAD `f200f697ba54d38a102e8ef66dead652c4002e5f` + product digest `16bda189fe8d6d99edfd1ebc86b59a373ac2a1816389d98d5c59ab41731f9349`(`06-fix-r1.md` §7);產品未 commit。
 - **分類規則(照使用者的規則,不擴張)**:`03-plan-final.md` §7 寫「分歧超過兩輪才可擱置,擱置事項寫進本檔並在 push 前告知使用者」。目前是 **Step 5 的第一次回修**,任何本輪新出現的分歧都**沒有**達到擱置門檻。所以本檔分三節:§A 是原案(`03-plan-final.md` §10)本來就揭露不做的範圍,原樣帶入;§B 是本輪**待 Astra 裁定**的 plan 落差與揭露,**一項都不是正式擱置**;§C 是本輪已關閉、不再列的項目。**不宣稱需求 b 已實測改善。**
