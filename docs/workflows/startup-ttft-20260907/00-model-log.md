@@ -173,3 +173,9 @@
 - 重試 process exit=`1`、`result.is_error=true`、duration_ms=`875134`；雖然 `result.subtype` 字串為 `success`，仍是失敗，不能視為成功。主 frame 為 Fable 58 個，另有一個 `<synthetic>` 錯誤 frame（不是另一個模型）。
 - 重試 modelUsage：`claude-haiku-4-5-20251001`（canonical `claude-haiku-4-5`）outputTokens=27、thinkingTokens=0；`claude-fable-5-1`（canonical 同名）outputTokens=66022、thinkingTokens=59357。沒有其他模型用量。
 - 兩次 log 均無 Write/Edit、均無測試執行；完整產品 status 和 cached/worktree digest 再核對仍一致。R2 修復未完成，下一步需要使用者決定是否改由另一個 Claude 型號接手；不再重試繞過這次模型拒絕。集中受阻交接見 `06-fix-r2-execution.md`，兩個產品 Blocker 仍未擱置。
+
+## 使用者改派：Astra MAX 修復、Fable 5.1 MAX 審核
+
+- 使用者最新指示明確替換原角色分工；R2 修復交由 `gpt-6-astra`、reasoning_effort=`max`，Fable 5.1 MAX 接任 reviewer。不是 root 自行選擇替代模型。
+- Astra 沿用原 `/root/astra_plan_review` task 的明確 MAX 設定，該 task 現在改任 developer writer，處理 R2-B01／R2-B02；先在 `06-fix-r2.md` 記 Dependency、可寫檔案、共享 owner、工具與命令，再寫碼。
+- 原計畫驗收、單 node red-before-green 與禁止重跑 smoke/full 的開發者限制維持；之後 Fable 靜態歸零才 full。root 只維護交接與執行 metadata，不強制新增修復平行。

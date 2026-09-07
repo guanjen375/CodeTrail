@@ -1,5 +1,7 @@
 # startup-ttft-20260907 — Deferred 與尚未裁定事項
 
+> **使用者最新授權**：已改派 Astra MAX 修復、Fable 5.1 MAX 審核，替換下述「等待另一 Claude 型號授權」狀態。R2-B01／R2-B02 仍 active，接續回修中；其他原案擱置與驗收狀態不變。角色變更見 `00-intake.md`，修復交接將寫入 `06-fix-r2.md`。
+
 > **R2 執行狀態更新（root，僅流程紀錄）**：Astra 已在 `05-review-astra-r2.md` 裁定兩項 active Blocker（R2-B01／R2-B02）。Fable 5.1 MAX 兩次回修嘗試均被模型自動安全審查以 `cyber` 拒絕，沒有產品／測試修改、沒有新測試；詳見 `06-fix-r2-execution.md`。產品 digest 仍為 `16bda189fe8d6d99edfd1ebc86b59a373ac2a1816389d98d5c59ab41731f9349`。這兩項**未擱置**、也不因模型拒絕而滿足技術分歧輪數；下一步需使用者決定是否授權另一個 Claude 型號回修。下文保留 R1 原始清單，其中「待 Astra 裁定」的後續裁定以 R2 審核報告為準。full 尚未執行，任務未完成。
 
 - 撰寫者:Claude Fable 5.1(harness 自報 model ID `claude-fable-5-1`),Step 5 R1 整合者。日期 2026-09-07。

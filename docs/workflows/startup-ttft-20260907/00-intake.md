@@ -29,3 +29,7 @@
 ## 補充：修復平行的決策來源
 
 使用者詢問「所以修復平行是你做的不是我指定的，我之前都沒想過修復可平行」。root 已明確說明：將修復階段也平行化，是 root 把使用者對實作的 Dependency 平行規則延伸到修復階段的安排，並非使用者另外明示的要求。root 把修復拆分交給 Fable 5.1 MAX，由 Fable 決定實際 Dependency、介面與檔案 owner，再依其交接啟動 lane；修碼仍全部由 Claude 側執行。這個提問沒有取消正在進行的修復工作。
+
+## 最新角色調整（取代前述相關分工）
+
+使用者最新明示：「你改成 astra max 修復 fable5.1 max 審核」。自此由 Astra MAX 修復、Fable 5.1 MAX 審核，取代原先「Astra 只審不改／改碼一律 Claude」的分工限制。既有 Fable 定稿與驗收仍沿用；原始計畫和歷史審核不回寫。Astra 在修復時按 developer 測試權責執行，Fable 接任 `ROLE=REVIEWER`，先靜態審核收斂，再對同一份凍結產品執行獲准的 full。其餘 Blocker 定義、紅／綠證據、檔案交接、擱置規則與產品未獲准 commit／push 的限制均維持。
