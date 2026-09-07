@@ -92,12 +92,26 @@
 - `client_engine` 的訊息轉換——reasoning 剝除只動 reasoning 欄位、只丟最新一則**真實**
   使用者訊息之前的、認不出那則訊息就整段不動;prune 只改送模型的那一份,session 檔與
   畫面保留原文;懸空的 tool_call 必須補在**宣告它的那則 assistant 之後**(補在尾端會排出
-  `assistant(tool_calls) → user → tool` 這種不合法的相鄰順序);只有工具結果的 text block
+  `assistant(tool_calls) → user → tool` 這種不合法的相鄰順序),而且排在該群組**既有**結果
+  之後(與 `send()` 內 `heal_pending_tool_calls()` 的 append 順序一致;插在既有結果之前,
+  預熱送的 prefix 就與下一輪真的送的 payload 在群組中途分岔);只有工具結果的 text block
   進模型(`structuredContent` 只給 UI / eval);多個 Engine 共用同一個 MCP instance 時
   **共用同一把模型鎖**(llama-server 單 slot,各自 new 一把等於沒有鎖);
   `load_session` 是**唯一一次受信讀取**,模型歷史(compacted)與畫面歷史(原文)同源,
   `adopt` 之前 engine 零改動(讀取當場就換,畫面建不出來時會留下半換狀態),
-  transcript 只以標記呈現 compaction
+  transcript 只以標記呈現 compaction;`prime_prompt_cache` 是唯一沒有使用者訊息就打主
+  模型的路徑:零寫入(不進 `_begin_turn`、不 `_record`、不發事件、不動取消旗標)、只送
+  `next_turn_prefix()`(與下一輪同一套轉換)、實送 `max_tokens=1` 且 gate 保留額就是 1、
+  非 interactive policy 一律拒絕、headless 沒有呼叫點;中止(`abort_prime`)涵蓋 `/slots`
+  probe / 取得 headers 前 / 串流中,中止後不再發 POST;預熱專用 `http_cancel` transport
+  在 HTTP bytes 送出前登記 socket，headers 未到也先 shutdown 舊 HTTP 才放模型鎖，
+  不得提早放仍在飛的請求；取消後才完成的 connect 先關再拒絕送出，並行取消都等 shutdown
+  完成，不能只看到 Event 已設就放鎖。保留 TLS 驗證、無 env proxy / netrc 與不跟 redirect，
+  不改共用 session / pool。預熱 token、Event 與歷史同時登記，快回應仍看 abort；
+  session 轉換期間不准入舊歷史，create/adopt 失敗也要恢復准入且保留原 session；
+  `new_session()` / `adopt()` 中止舊預熱須一秒內 aborted、鎖已放、`priming=False`；
+  只有終結 chunk + `timings.prompt_n` 才記成 sent
+  (`incomplete` / `no_timings` 不寫 telemetry)
 - `client_engine` 的協作式取消——TUI 的 Ctrl-C 經 `client_turns` 走這條。串流每收一個
   chunk 看一次旗標、進行中的 MCP 呼叫要用 `begin_call` 登記給 `cancel()` 走完整取消契約
   (一步到位的 `call()` 只有 KeyboardInterrupt 一條路);中斷**不是答案**——歷史不得多出
@@ -129,7 +143,10 @@
   回 False(顯示成「已中斷」是謊報);慢速的 MCP 取消(等寬限期最長 10 秒)必須在協調器的
   鎖**外**做。核准:沒回答就是拒絕、只能回答一次(先 deny 再 grant 不得翻成核准)、
   只認真的 bool(`bool("false")` 是 True);同一個對話一次只跑一輪(模型鎖只序列化 HTTP
-  呼叫,保護不到 session 狀態);notice 要在終結事件之前送,失敗也要送終結事件
+  呼叫,保護不到 session 狀態);notice 要在終結事件之前送,失敗也要送終結事件;
+  `prime_in_background` 不取回合鎖、不動 `_turn_done` / `_cancelled`,取消對預熱是 no-op;
+  每一次預熱的 outcome 經 `on_prime(reason, outcome)` 回到 TUI,不分誰排的(含壓縮後協調器
+  自己排的那一次),先 `on_prime` 再 `on_done`
 - `client_app`(TUI)的畫面契約——核准框**完整且可捲動**顯示 `ApprovalRequest.render()`
   (含整份 patch),截斷過的核准等於沒有核准;框內 Esc / 拒絕只拒絕**這一個工具**(回合
   繼續),Ctrl-C 中斷**整輪**(核准框開著時也一樣);沒有 tty 一律拒絕並指向 headless
@@ -138,7 +155,9 @@
   切換 / 啟動接續必須**重播原始記錄**(文字、工具含未裁切的 structured、reasoning、壓縮標記),
   工具結果按**宣告群組**配對(fallback call id 每個行程從 `call_1` 起算,以 id 反查會把結果
   貼到幾十輪前那個 block 上),busy 或核准中不得換,失敗要保持 session 與畫面,
-  重播出來的 block 不登記給即時事件
+  重播出來的 block 不登記給即時事件;啟動橫幅只拿 `Preflight.banner_lines()`:摘要一行、
+  壓縮狀態行、警告(含 preflight 期間所有 stderr 行);進度行不進畫面,但 `Preflight.lines`
+  仍是完整 transcript
 - 啟動核心的設定來源——GPU、llama-server 路徑、tmux session 名、逾時與 rollback 只來自
   `deployment.json`、repo 常數與 argv;`~/start.sh` **不 export 也不 unset**,只轉發 `"$@"`。
   tmux pane 一律經 `deployment_profile.py exec <role> <loader argv>`,最終環境由

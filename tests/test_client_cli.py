@@ -168,6 +168,39 @@ def test_headless_defaults_to_ephemeral(tmp_path, monkeypatch, capsys):
     assert client_store.SessionStore(root).list_sessions() == []
 
 
+@pytest.mark.smoke
+def test_headless_run_never_primes_the_prompt_cache(tmp_path, monkeypatch, capsys):
+    """prompt cache 預熱是**互動 TUI** 的東西:headless `run` 一個呼叫點都沒有。
+
+    `run` 是 canary / eval_tool_routing / session_eval replay 走的路。多一個
+    「沒有使用者訊息就打主模型」的請求在這裡是三重問題:那幾條路各自會多量到
+    一次 prefill(replay 的可比性沒了)、readonly replay 的邊界本來就不該有它、
+    而且協調器只由 TUI 建,預熱在這裡連中止的人都沒有。
+
+    這裡把 `prime_prompt_cache` 換成會炸的替身(`raising=False`:它由 engine
+    那一側新增,兩邊可以各自施工),整條 `run` 跑完必須完全沒有碰到它。
+    """
+    import llama_client
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("headless run 不得預熱 prompt cache")
+
+    monkeypatch.setattr(client_engine.Engine, "prime_prompt_cache", boom, raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    root = tmp_path / "project"
+    root.mkdir()
+    monkeypatch.setattr(client_mcp, "shared_client", lambda *_a, **_k: _FakeMcpClient())
+    monkeypatch.setattr(
+        llama_client,
+        "chat_completions",
+        lambda **_k: iter([{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}]),
+    )
+    monkeypatch.setattr(codetrail_chat.config, "require_main_model", lambda: "m")
+    assert codetrail_chat.main(["run", "--root", str(root), "hi"]) == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert [e["type"] for e in events] == ["session", "text", "step_finish"]
+
+
 def test_headless_can_persist_when_asked(tmp_path, monkeypatch, capsys):
     import llama_client
 
@@ -335,6 +368,116 @@ def test_a_provider_prefixed_model_is_normalised_like_the_wrapper(tmp_path):
     assert codetrail_chat._cli_model("  ") == ""
     with pytest.raises(SystemExit):
         codetrail_chat._cli_model("openai/gpt-4o")
+
+
+# ── 需求 a:自檢通過之後,TUI 第一屏只留結果(摘要 + 壓縮狀態 + 警告)──
+
+
+def _write_deployment(home: Path, **main: object) -> Path:
+    """最小的 `deployment.json`(與 `tests/test_client_preflight.py` 同一份形狀)。"""
+    cfg_dir = home / ".config" / "codetrail"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    path = cfg_dir / "deployment.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "profile": "defaults",
+                "services": {"main": dict(main)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.smoke
+def test_the_tui_banner_after_a_passing_preflight_drops_the_progress_log_and_keeps_warnings(
+    tmp_path, monkeypatch, capsys
+):
+    """自檢**通過**之後,對話區第一屏不得是那一整段進度 LOG。
+
+    那段 LOG 的用途是「preflight 要跑幾十秒,使用者盯著畫面要看到它在動」——
+    它已經在 TUI 之前的終端畫面上逐行印出來過了。TUI 起來之後再重播一次,
+    使用者每開一次 aicode 就要先捲過十幾行自己剛剛看過的成功訊息,而真正
+    要看的兩種東西(canary 只走 stderr 的 WARNING、壓縮已被停用)混在裡面。
+
+    留下來的只有三種:一行結果摘要、壓縮狀態行、警告。失敗路徑不走這裡
+    (`PreflightError` 在 TUI 之前 exit 2,transcript 原樣留在終端)。
+    """
+    import client_config
+    import client_preflight
+
+    home = tmp_path / "home"
+    home.mkdir()
+    _write_deployment(
+        home,
+        model="/models/x.gguf",
+        ctx=4096,
+        port=65535,
+        base_url="http://127.0.0.1:65535",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    root = tmp_path / "project"
+    root.mkdir()
+
+    def fake_tool_health(result, profile):
+        # canary 的真實形狀:PASS / 心跳走 stdout,WARNING 只走 stderr。
+        print("MODEL PASS — cached", flush=True)
+        print("[tool-health] WARNING — implicit 診斷降級", file=sys.stderr, flush=True)
+
+    monkeypatch.setattr(client_preflight, "check_tool_health", fake_tool_health)
+    monkeypatch.setattr(client_preflight, "check_required_servers", lambda result: None)
+    monkeypatch.setattr(client_preflight, "check_ctx_safety", lambda *a: None)
+    monkeypatch.setattr(client_preflight, "observe_n_ctx", lambda result, profile: 4096)
+
+    # preflight 之外的 command_chat 全部替身:這條測的是「preflight 的結果
+    # 怎麼進畫面」,不是 MCP / engine / Textual。
+    monkeypatch.setattr(codetrail_chat, "_has_tty", lambda: True)
+    monkeypatch.setattr(codetrail_chat, "_resolve_root", lambda _raw: root)
+    settings = client_config.ClientSettings(path=tmp_path / "client.json")
+    monkeypatch.setattr(codetrail_chat, "_settings", lambda *_a, **_k: settings)
+    monkeypatch.setattr(client_config, "apply_to_config", lambda *_a, **_k: None)
+    engine = types.SimpleNamespace(
+        tool_specs=tuple(f"tool_{index}" for index in range(19)),
+        options=types.SimpleNamespace(policy=types.SimpleNamespace(name="interactive")),
+    )
+    monkeypatch.setattr(
+        codetrail_chat, "_build", lambda *_a, **_k: (types.SimpleNamespace(close=lambda: None), engine)
+    )
+    monkeypatch.setattr(
+        codetrail_chat, "_compactor", lambda *_a, **_k: types.SimpleNamespace(mode="manual")
+    )
+    seen: dict = {}
+
+    class _App:
+        def __init__(self, _engine, **kwargs):
+            seen.update(kwargs)
+
+        def run(self):
+            return 0
+
+    monkeypatch.setattr(codetrail_chat.client_app, "CodeTrailApp", _App)
+
+    exit_code = codetrail_chat.command_chat(codetrail_chat.build_parser().parse_args([]))
+    printed = capsys.readouterr()
+    banner = list(seen["banner"])
+
+    progress = [
+        line
+        for line in banner
+        if line.startswith(("[aicode]", "root=", "deployment profile=", "MODEL PASS"))
+    ]
+    assert not progress, f"自檢進度 LOG 進了 banner:{progress}"
+    assert banner[0].startswith("自檢通過:"), banner[0]
+    assert "tools=19" in banner[0] and "permission=interactive" in banner[0], banner[0]
+    assert "compaction=manual" in banner[0], banner[0]
+    # 只走 stderr 的 WARNING 是「這次啟動有什麼不對勁」的全部證據,必須留下。
+    assert "[tool-health] WARNING — implicit 診斷降級" in banner, banner
+    assert any("壓縮模式" in line for line in banner), banner
+    # 進度 LOG 沒有消失,只是不再重播:它已經在 TUI 之前的終端畫面上。
+    assert "[aicode] root=" in printed.out
+    assert exit_code == 0
 
 
 # ── 總審 F1-11:headless `run` 也要跑 idle 壓縮,並把結果放進事件流 ──

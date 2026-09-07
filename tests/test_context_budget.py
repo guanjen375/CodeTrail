@@ -989,3 +989,45 @@ def test_an_explicit_usage_block_still_wins_over_timings():
         usage,
     )
     assert (usage.actual_prompt_eval_count, usage.actual_eval_count) == (10, 20)
+
+
+@pytest.mark.smoke
+def test_processed_prompt_tokens_are_recorded_separately_from_the_total():
+    """「這個 prompt 有多長」與「這一次真的評估了幾個 token」是兩個數字。
+
+    `usage.prompt_tokens` 把 KV cache 命中的部分照算,`timings.prompt_n` 只算真的
+    重跑的那幾個。把後者讓給前者(只在 pec 沒值時才收)的話,兩個欄位在正常回應
+    上永遠相等,冷 / 熱 prompt cache 就再也量不到 —— 而 prompt cache 預熱有沒有用
+    正是只能由這一欄判定的。
+    """
+    both = context_budget.build_usage(source="client", requested_num_ctx=131072)
+    context_budget.parse_usage_from_response(
+        {
+            "usage": {"prompt_tokens": 20000, "completion_tokens": 3},
+            "timings": {"prompt_n": 7, "predicted_n": 3},
+        },
+        both,
+    )
+    assert both.actual_prompt_eval_count == 20000      # 既有語意不變
+    assert both.prompt_tokens_processed == 7           # 幾乎整份 prefix 命中 cache
+    assert both.to_log_dict()["prompt_tokens_processed"] == 7
+
+    # 串流的最後一個 chunk 只帶 timings(llama-server 的 /v1 串流就是這個形狀)。
+    streamed = context_budget.build_usage(source="prime", requested_num_ctx=131072)
+    context_budget.parse_usage_from_stream_chunk(
+        {
+            "choices": [{"delta": {}, "finish_reason": "length"}],
+            "timings": {"prompt_n": 4096, "predicted_n": 1},
+        },
+        streamed,
+    )
+    assert streamed.actual_prompt_eval_count == 4096
+    assert streamed.prompt_tokens_processed == 4096
+
+    # 沒有 timings 就維持 None:不假裝有資料(舊 log 的那幾列會是 null)。
+    native = context_budget.build_usage(source="client", requested_num_ctx=131072)
+    context_budget.parse_usage_from_response(
+        {"tokens_evaluated": 900, "tokens_predicted": 10}, native
+    )
+    assert native.actual_prompt_eval_count == 900
+    assert native.prompt_tokens_processed is None

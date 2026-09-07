@@ -1,5 +1,7 @@
 # startup-ttft-20260907 — Deferred 與尚未裁定事項
 
+> **發布授權（2026-09-07）**：使用者已批准產品 commit 並直接 push `main`、不開 PR，詳見 `00-intake.md` 最新段。本段所在提交收錄下述已驗收的 23 個產品／測試路徑；產品 digest 維持 `61fda568fce324d31691892f51a01aa7f17831e4e2c3815d2c0e16868dac9b4a`。沒有新增正式擱置，§A 原案十項維持，T0 仍未量測；root 已於 push 前向使用者揭露。以下未 commit／push 的描述保留為驗收當時的歷史狀態。
+
 > **最新交付狀態：程式／離線驗收完成。** Astra MAX 修復、Fable 5.1 MAX 審核；`05-review-fable-r3.md` 的靜態Blocker為0。使用者批准的精確447條前景補測全部通過（exit0），與14個完整shard的3121條合併為**3568條全通過，0失敗／錯誤／跳過、0重複／缺漏**；原full的killed記錄不回寫為成功。完整證據見`08-test-results.md`，root已獨立核對node聯集。
 >
 > 審核、兩段測試、最後產品均為同一digest：`61fda568fce324d31691892f51a01aa7f17831e4e2c3815d2c0e16868dac9b4a`。本次無新增正式擱置；§A原案十項維持。原B-4的本版測試證據缺口已補齊，原B-6涉及的46條app測試也全通過，結論限於那些斷言的覆蓋範圍；B-5文件概述未動，非Blocker。**T0實機TTFT仍未量測、仍由David依原案執行，不能宣稱真實首字改善已實證。** 產品23個路徑保持staged，未commit／push。

@@ -136,6 +136,19 @@ node 名）」，對照 [AGENTS.md §2](AGENTS.md#3-安全相關不要砍) 的�
 單條 decorator，gate 都還是綠的，而缺口是無聲的。**新增 §3 檢查點時，AGENTS.md 的條目與
 這裡的 node 清單要一起改**。
 
+prompt cache 預熱(`Engine.prime_prompt_cache` / `TurnCoordinator.prime_in_background`)
+第一版**只有契約測試,沒有 red-before-green**:它不是在修一個發生過的 bug,而是新增一條「沒有
+使用者訊息就打主模型」的路徑,要釘的是零寫入、准入順序、gate 保留額 == 實送 `max_tokens`、
+readonly / headless 永不預熱這幾件會無聲失敗的事。審核之後修掉的四個真實 bug(取得 stream
+之前中止不了、部分完成的工具群組 prefix 分岔、沒有終結 chunk 的 EOF 記成 sent、壓縮後那一次
+的結果沒回到 `/status`)則各有一條 red-before-green 的 smoke regression,同樣登記在
+`test_smoke_gate.py`。
+
+後續取消回修另有四條 red-before-green regression：headers 未回也先關連線再放鎖、
+登記後的 abort 不被快回應洗掉、取消後才排到的 worker 不送 POST、session create
+空窗不留下舊預熱。`tests/test_http_cancel.py` 另守晚回 connect、最終 TLS socket、
+共用 transport 隔離與並行取消的 shutdown 邊界；create 失敗後恢復准入也有契約。
+
 ---
 
 ## 改 config / docs / eval 時要同步檢查
@@ -576,7 +589,7 @@ llama-server 啟動時的 `-c <N>` 是唯一的 n_ctx 來源。`scripts/doctor.p
 
 ### Telemetry 隱私政策
 
-`.codetrail/context_metrics.jsonl` 每行 metadata:`model`、`source`、`requested/effective num_ctx`、估算的 input/output token、`utilization_pct`、`did_trim` + `trim_summary` (counts only)、`actual_prompt_eval_count`、`actual_eval_count`、`prompt_tokens_per_second`、`output_tokens_per_second`、`error_type`、`timestamp`。
+`.codetrail/context_metrics.jsonl` 每行 metadata:`model`、`source`、`requested/effective num_ctx`、估算的 input/output token、`utilization_pct`、`did_trim` + `trim_summary` (counts only)、`actual_prompt_eval_count`、`prompt_tokens_processed`、`actual_eval_count`、`prompt_tokens_per_second`、`output_tokens_per_second`、`error_type`、`timestamp`。
 
 **絕不寫入**: 完整 prompt、tool output、檔案內容、user question 文字。
 `trim.py` 回的 `TrimSummary.to_dict()` 也只是 count 與 action label。
@@ -623,6 +636,35 @@ context_budget.log_metrics(usage)
 如果你的 call site 也會累積 messages(像 agent loop),記得也接 `_pre_send_trim_if_needed`(或自己呼 `trim.trim_messages`)以便 soft warning 觸發時可以自動降載,而不是直接 hard refuse。低風險 / 一次性 prompt(如 RAG embedding query 之類)可以省略 trim,但**不能省略 gate**。
 
 新增主模型 call site 時,必須在送出前用 call-time `config.require_main_model()` 取值;不要使用 import-time `config.MODEL` 或 `from config import MODEL` 當 runtime model source。
+
+### prompt cache 預熱(prime)與首字延遲
+
+使用者感受到的「首字延遲」有兩段:server 算 prompt(prefill)與模型自己的 reasoning。
+第二段不在客戶端能動的範圍;第一段可以**搬時間**——歷史剛換過的那幾個時刻(TUI 就緒、
+`/new`、換 session、壓縮換掉歷史之後),用「下一輪真的會送的 prefix」先送一個
+`max_tokens=1` 的請求,把可避免的 prefill 移到使用者打字的時候。它**不會**讓硬體算得
+比較快,prefix 本來就熱的時候也沒有收益。
+
+| 符號 | 責任 |
+|---|---|
+| `config.CLIENT_PRIME_PROMPT_CACHE` | repo 常數(所有使用者一致),預熱的唯一開關。不是 `client.json` 的鍵,也沒有環境變數。 |
+| `Engine.next_turn_prefix()` | 「下一輪會送什麼」的單一來源:對現在的歷史模擬追加一則 user,走與 `payload_messages()` **同一套** heal → reasoning 剝除 → prune,再把那則佔位訊息拿掉。佔位訊息永不落檔、永不送出。下一輪真實 `send(q)` 的 payload 恆等於 `next_turn_prefix() + [user q]`——這條等式是契約測試的斷言對象,不是註解。heal 補的「已中斷」結果排在該群組**既有**結果之後(宣告順序不變),與 `send()` 內 `heal_pending_tool_calls()` 的 append 順序一致——部分完成的多工具群組(a 有結果、b 沒有)才看得出差別,插錯邊兩份 payload 就在群組中途分岔。 |
+| `Engine.prime_prompt_cache(*, reason)` | 唯一一條「沒有使用者訊息就打主模型」的路徑。零寫入(不進 `_begin_turn`、不 `_record`、不發事件、不動取消旗標),准入順序固定:常數 / 工具 / policy(在任何 I/O 之前)→ 非阻塞取模型鎖 → `_in_turn == 0` 且同一臨界區 snapshot 歷史 → `/slots` 全忙就跳過 → context gate → 送。回 `PrimeOutcome(sent, reason, processed_tokens)`,不 raise、不 print。串流只有看到終結 chunk 且拿到 `timings.prompt_n` 才記成 sent;`incomplete`(終結 chunk 之前就 EOF)/ `no_timings`(終結但沒有 `timings.prompt_n`)都不寫 telemetry,`usage.prompt_tokens` 不拿來代填。 |
+| `Engine.abort_prime()` | `new_session()` / `adopt()` 先關閉預熱准入，再呼叫它：世代號與 Event 一起作廢、關串流與 headers 前已登記的 socket，等舊預熱結束、`priming=False` 且模型鎖已放(上限 1 秒)。先 shutdown 舊 HTTP 才放鎖，不等 headers。整個 session create/adopt 期間不准入舊歷史；失敗保留原 session 並恢復准入。 |
+| `http_cancel.RequestCancellation` | 只由預熱選用的專用 requests session，GET / POST 共用同一次 cancellation；socket 在送 HTTP bytes 前登記，DNS/connect/TLS 晚回也不能補送。並行取消等 shutdown 完成，不以 Event 已設當作 HTTP 已關。保持 TLS 驗證、無 env proxy / netrc、不跟 redirect，不修改共用 session / pool；預熱不做透明重試。正常回合的 transport 與取消路徑不變。 |
+| `TurnCoordinator.prime_in_background(reason, *, on_done=None)` | 唯一的排程入口(engine 那端只負責「准不准」)。不取回合鎖、不動 `_turn_done` / `_cancelled`——預熱不是一輪,`cancel()` 對它是 no-op;`busy` 或 engine 沒有這個方法就直接回 False。協調器層的 `on_prime(reason, outcome)` 回呼(建構時給):每一次預熱(含壓縮後協調器自己排的那一次)都回到 TUI,先 `on_prime` 再 `on_done`;engine raise 時 outcome 是 None。 |
+| `ContextUsage.prompt_tokens_processed` | 只由 `timings.prompt_n` 填(server 這次**真的評估**的 token 數),與 `actual_prompt_eval_count` 語意分離:後者在 server 同時回 `usage` 與 `timings` 時取 `usage.prompt_tokens`,也就是這次輸入的**總**量。判 cache 冷熱只能看前者。 |
+
+預熱這一次的 gate 保留額與實送的 `max_tokens` **都是 1**(AGENTS.md 那條「保留額 == 實送
+`max_tokens`」在這裡照樣成立);「下一輪送得出去嗎」是**另外**用下一輪的
+`max_output_tokens`(= `config.CLIENT_MAX_OUTPUT_TOKENS`)判的一次,而且不寫 telemetry。
+落 log 的只有 `source="prime"` 這一列,它的 `reserved_output_tokens` 就是 1。
+
+**SSE 客戶端 buffering 不是首字延遲的來源,不要再修。** 已查證:`_iter_sse_lines` 走
+`resp.iter_lines()` → `iter_content()` → urllib3 的 chunked 解碼,回應是 chunked 時每個
+HTTP chunk 各自回傳,不會為了湊滿一個讀取大小而等下一個 chunk;llama-server 每個 SSE
+event 自成一個 chunk 並以空行結尾,`: ` 開頭的 keep-alive 註解行已經被略過(有契約測試
+釘住)。延遲在 server 端的 prefill 與模型的 reasoning,不在這條讀取路徑上。
 
 ---
 

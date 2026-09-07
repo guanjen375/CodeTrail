@@ -67,7 +67,10 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "canary 的時限 / TTL 是 repo 常數而快取位置只由 XDG_CACHE_HOME / HOME 推導;"
         "client.json 的位置沒有覆寫變數(它決定互動 session 的工具權限);"
         "transcript 收 stdout **與 stderr**(canary 的 WARNING 只走 stderr),"
-        "而且一定帶壓縮狀態行(自動壓縮被停用是使用者唯一會看到的地方)",
+        "而且一定帶壓縮狀態行(自動壓縮被停用是使用者唯一會看到的地方);"
+        "`banner_lines()` 是進 TUI 的那一份:摘要一行 + 壓縮狀態行 + 警告(含 preflight 期間"
+        "所有 stderr 行),進度行不得進畫面,但 `lines` 仍是完整 transcript;"
+        "`keep=True` 不得改變 `note()` 印出來的字(改了就是兩份不一致的 transcript)",
         (
             "test_the_profile_environment_is_home_only",
             "test_userprofile_is_only_a_fallback_when_home_is_absent",
@@ -79,6 +82,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_the_client_config_path_has_no_environment_override",
             "test_the_transcript_keeps_stderr_warnings",
             "test_the_transcript_carries_the_compaction_status",
+            "test_the_banner_keeps_stderr_warnings_and_compaction_status_but_drops_the_progress_log",
+            "test_keep_does_not_change_what_note_prints",
             "test_every_profile_env_helper_has_the_same_home_only_shape",
             "test_the_canary_child_environment_is_stripped",
         ),
@@ -331,7 +336,18 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "只有工具結果的 text block 進模型;ingest marker 只認 ingest_document 的行首;"
         "假工具呼叫偵測不得把否定句算成宣稱;基底規則守 1,600 字元;閘對轉換後的 payload 計數;"
         "`load_session` 是唯一一次受信讀取(模型歷史與畫面歷史同源),`adopt` 之前 engine 零改動,"
-        "transcript 只以標記呈現 compaction(畫面跟著模型歷史走 = 壓縮過的那段在畫面上永久消失)",
+        "transcript 只以標記呈現 compaction(畫面跟著模型歷史走 = 壓縮過的那段在畫面上永久消失);"
+        "`prime_prompt_cache` 是唯一沒有使用者訊息就打主模型的路徑:零寫入(不進 `_begin_turn`、"
+        "不 `_record`、不發事件、不動取消旗標)、只送 `next_turn_prefix()`(與下一輪同一套轉換,"
+        "以真實後續 `send()` 的 payload 為準)、實送 `max_tokens=1` 且 gate 保留額就是 1、"
+        "非 interactive policy 在任何 probe / request 之前就拒絕、回合已開始就讓路且不讀它的歷史、"
+        "換 session 會中止進行中的預熱並放掉模型鎖;"
+        "預熱的中止涵蓋 `/slots` probe / 取得 headers 前 / 串流中,中止後不再發 POST"
+        "(headers 前就登記 socket，先 shutdown 舊 HTTP 才放鎖，一秒內 aborted / priming=False / 鎖可取);"
+        "登記與歷史快照原子化，快速完成仍看 abort，遲到 worker 不送 POST，session 轉換空窗不准入舊歷史;"
+        "部分完成的工具群組(a 有結果、b 沒有)的預熱 prefix 必須逐字等於下一輪真的 `send()` 減最後那則 user"
+        "(補的「已中斷」結果排在該群組既有結果之後);"
+        "只有終結 chunk + `timings.prompt_n` 才記成 sent(`incomplete` / `no_timings` 不寫 telemetry)",
         (
             "test_load_session_leaves_the_engine_untouched_and_adopt_switches_atomically",
             "test_the_snapshot_model_history_is_compacted_while_the_transcript_keeps_the_originals",
@@ -406,12 +422,40 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_the_import_approval_cannot_be_overridden_to_allow",
             "test_the_import_approval_shows_where_the_file_will_land",
             "test_fallback_tool_call_ids_are_unique_across_steps",
+            "test_priming_sends_the_prefix_the_next_turn_will_send_and_records_nothing",
+            "test_priming_refuses_a_readonly_engine_before_any_probe_or_request",
+            "test_priming_yields_to_a_turn_that_already_began_and_never_reads_its_history",
+            "test_a_turn_submitted_during_priming_waits_for_the_lock_and_gets_the_primed_prefix",
+            "test_a_session_switch_aborts_an_in_flight_prime_and_frees_the_lock",
+            "test_priming_skips_only_when_no_slot_is_idle_and_never_raises_or_prints",
+            "test_priming_gates_the_one_token_it_sends_after_checking_the_next_turn_reserve",
+            "test_priming_is_invisible_to_cancel_and_leaves_the_turn_state_untouched",
+            "test_priming_matches_the_next_send_when_a_tool_group_is_only_partly_answered",
+            "test_priming_only_counts_as_sent_after_a_terminal_chunk_with_timings",
+            "test_a_session_switch_aborts_a_prime_that_has_no_stream_yet_and_never_sends_after_the_abort",
+            "test_switching_session_shuts_down_pending_headers_before_releasing_the_model_lock",
+            "test_abort_between_prime_registration_and_fast_io_cannot_be_lost",
+            "test_a_prime_http_worker_scheduled_after_abort_never_starts_the_post",
+            "test_a_prime_arriving_during_session_creation_cannot_keep_the_old_history_alive",
+            "test_failed_session_creation_does_not_disable_future_priming",
+        ),
+    ),
+    "test_http_cancel.py": (
+        "預熱專用 transport 在 HTTP bytes 前登記 socket，取消後才完成 connect 也不得發送;"
+        "TLS 最終 socket 仍受取消，保留共用 session / TLS 驗證 / 無 env proxy 與 netrc / 不跟 redirect;"
+        "並行取消都等同一次 shutdown 完成，不以 Event 已設冒充舊 HTTP 已關",
+        (
+            "test_cancellation_closes_a_late_connection_before_any_http_bytes",
+            "test_cancellation_owns_the_final_tls_socket_and_preserves_shared_transport",
+            "test_concurrent_cancellation_waits_for_the_same_socket_shutdown",
         ),
     ),
     "test_client_cli.py": (
         "事件流是 canary / routing eval / session_eval replay 的共用介面:形狀與解析器只有一份、"
         "tool-calls 的 step 不算終止、thinking 不得進事件流;headless 預設 ephemeral;"
-        "readonly 連客戶端自己的 context metrics 也要關",
+        "readonly 連客戶端自己的 context metrics 也要關;"
+        "headless `run` 沒有預熱的呼叫點(多一條就是 headless 在沒有使用者訊息時打模型);"
+        "自檢通過後進 TUI 的橫幅不重播進度 LOG(端對端,真的走 `client_preflight.run()`)",
         (
             "test_a_provider_prefixed_model_is_normalised_like_the_wrapper",
             "test_a_completed_tool_event_is_recognised_by_the_shared_parser",
@@ -423,13 +467,19 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_readonly_run_never_writes_context_metrics_into_the_project",
             "test_the_server_actually_honours_readonly",
             "test_headless_run_compacts_after_a_completed_turn_and_reports_it",
+            "test_headless_run_never_primes_the_prompt_cache",
+            "test_the_tui_banner_after_a_passing_preflight_drops_the_progress_log_and_keeps_warnings",
         ),
     ),
     "test_client_turns.py": (
         "回合協調器:同一個對話一次只跑一輪;取消要涵蓋 engine 自己看不到的三個狀態"
         "(worker 還沒進 send()、阻塞在核准上、取消與收尾互相搶跑),閒置時的取消一律回 False;"
         "慢速的 MCP 取消不得扣住協調器的鎖;核准沒回答就是拒絕、只能回答一次、非 bool 不算核准;"
-        "notice 要在終結事件之前送,失敗也要送終結事件;只有答完(finish=stop)才自動壓縮",
+        "notice 要在終結事件之前送,失敗也要送終結事件;只有答完(finish=stop)才自動壓縮;"
+        "`prime_in_background` 不取回合鎖、不動 `_turn_done` / `_cancelled`(取消對預熱是 no-op、"
+        "預熱不得讓 `busy` 變真),回合進行中不得排,壓縮換掉歷史後的那一次必須在放掉回合鎖之後;"
+        "每一次預熱(含壓縮後協調器自己排的)都經 `on_prime(reason, outcome)` 回報,先 `on_prime` 再 "
+        "`on_done`,engine raise 時 outcome 是 None 而不是不叫,回呼的例外不冒出預熱執行緒、也不互相帶走",
         (
             "test_cancel_wakes_a_turn_waiting_for_approval",
             "test_cancel_counts_even_before_the_worker_enters_send",
@@ -452,6 +502,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_cancel_accepted_during_compaction_ends_with_a_cancelled_terminal",
             "test_a_manual_compaction_is_a_turn_and_can_be_cancelled",
             "test_a_session_change_rebinds_the_compactor_without_consuming_the_notice",
+            "test_a_compaction_that_replaced_the_history_primes_after_the_turn_lock_is_released",
+            "test_priming_is_invisible_to_busy_and_cancel_and_refused_while_a_turn_runs",
+            "test_every_prime_the_coordinator_runs_reports_through_on_prime",
         ),
     ),
     "test_client_app.py": (
@@ -465,7 +518,11 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "壓縮標記),工具結果按**宣告群組**配對(fallback call id 每個行程從 call_1 起算,以 id "
         "反查會把結果貼到幾十輪前那個 block 上),重播的 block 不登記給即時事件,busy 一律拒絕換,"
         "切換失敗要保持 session 與畫面(先換 engine 再重播 = 模型在新對話、畫面是舊那段),"
-        "`/new` 清畫面,選單的 Esc / Ctrl-C 只收選單(算成中斷或離開都是謊報)",
+        "`/new` 清畫面,選單的 Esc / Ctrl-C 只收選單(算成中斷或離開都是謊報);"
+        "預熱一律經協調器排(mount / `/new` / 換 session 各一次、reason 要對),"
+        "而且**不進對話區**(它不是回合、不是答案);"
+        "`/status` 反映協調器跑的**最近一次**預熱(含壓縮後協調器自己排的那一次)的結果 / 原因 / "
+        "時間 / 觸發點(停在 mount 那一次的 sent = 使用者以為 cache 是熱的,其實這一次是 skipped)",
         (
             "test_resume_replays_the_stored_history",
             "test_a_session_resumed_at_startup_is_shown_on_mount",
@@ -498,6 +555,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_loading_history_never_reads_through_a_symlink",
             "test_history_is_saved_on_a_normal_exit_and_round_trips_multiline",
             "test_a_new_session_forgets_the_old_tool_blocks",
+            "test_the_tui_primes_on_mount_new_and_session_switch_through_the_coordinator",
+            "test_the_status_line_reports_the_latest_prime_including_the_ones_after_compaction",
         ),
     ),
     "test_client_store.py": (
@@ -769,7 +828,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     "test_context_budget.py": (
         "knowledge.py 的主模型 prompt 一律過 context gate(超長會被 server 從前面靜默截掉);"
         "客戶端的閘必須對轉換後實際送出的 payload 計數(含 assistant reasoning / reasoning_content),"
-        "保留額必須等於本次 request 實送的 max_tokens",
+        "保留額必須等於本次 request 實送的 max_tokens;"
+        "`prompt_tokens_processed`(真正評估的 token 數)只由 `timings.prompt_n` 填,"
+        "與 `actual_prompt_eval_count` 語意分離 —— 混在一起就沒有任何欄位能判 prefix 冷熱",
         (
             "test_knowledge_has_exactly_one_ungated_completion_entry",
             "test_gated_completion_refuses_overflow_without_calling_the_server",
@@ -779,6 +840,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_the_reserve_is_this_request_max_tokens",
             "test_an_omitted_reserve_still_uses_the_internal_default",
             "test_the_context_gate_has_no_off_switch",
+            "test_processed_prompt_tokens_are_recorded_separately_from_the_total",
         ),
     ),
     "test_evals.py": (

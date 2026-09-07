@@ -245,7 +245,8 @@ content 會經 SSH 加密隧道送到 GPU 主機。
    completed 的結構化 `list_dir` event;依 model / 客戶端檔案 / system prompt / project 指紋
    快取成功結果 24 小時
 9. 壓縮模式狀態行(門檻、reasoning 開關、durable 停用警告、權限覆寫)
-10. 啟動 TUI。上面每一行都留在對話區第一則,所以清屏之後仍然看得到
+10. 啟動 TUI。通過時對話區只有一行摘要 + 壓縮狀態行 + 警告(含第 7、8 項寫到 stderr 的
+    工具健檢警告);上面每一行仍完整留在 TUI 之前的終端畫面。失敗時不進 TUI,錯誤留在終端
 
 第 7 項每次啟動都實跑，不靠模型自述；第 8 項首次、快取過期或指紋變動才實跑，所以不必每次手動問「列出 19 個工具」。第 8 項實跑（本地推理，通常數十秒起）前會先印出原因與單次上限，執行中每 15 秒回報進度——不是當機。要強制重測就刪掉 `~/.cache/codetrail/tool-call-canary.v3.json`(沒有略過用的環境變數)。完整 PASS / FAIL 說明見 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)。
 

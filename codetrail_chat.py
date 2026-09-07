@@ -273,9 +273,14 @@ def command_chat(args: argparse.Namespace) -> int:
     mcp, engine = _build(root, args, persist=True, preflight=checks)
     try:
         compactor = _compactor(engine, args)
-        banner = tuple(checks.lines) + (
-            f"tools={len(engine.tool_specs)} permission={engine.options.policy.name} "
-            f"compaction={compactor.mode}",
+        # 通過之後畫面上只留「結果」:一行摘要、壓縮狀態行、警告(含 preflight
+        # 期間所有 stderr 行)。整段進度 LOG 已經在 TUI 之前的終端上逐行印過,
+        # 重播一次只是要使用者每次開 aicode 都先捲過自己剛看完的成功訊息。
+        # 失敗路徑不走這裡:`PreflightError` 在上面 exit 2,transcript 留在終端。
+        banner = checks.banner_lines(
+            tools=len(engine.tool_specs),
+            permission=engine.options.policy.name,
+            compaction=compactor.mode,
         )
         app = client_app.CodeTrailApp(
             engine,

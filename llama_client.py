@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 
 import endpoint_policy
 from http_client import get_session
+from http_cancel import RequestCancellation
 
 
 # credentials 遮蔽集中在 endpoint_policy(policy 錯誤本身也要乾淨,見該處)
@@ -284,6 +285,7 @@ def chat_completions(
     stream: bool = False,
     extra: dict | None = None,
     timeout: int = 600,
+    cancel: RequestCancellation | None = None,
 ):
     """Call llama-server /v1/chat/completions (OpenAI compat).
 
@@ -292,6 +294,9 @@ def chat_completions(
         stream=True  → 迭代器,yield 每個 delta chunk
 
     model 在 llama.cpp 是 informational(server 一啟動就鎖死一顆),仍要帶,寫進 telemetry。
+
+    cancel 只供背景預熱選用；它擁有專用 session，headers 前即可關 socket。
+    呼叫端負責在串流結束或中止後 cancel.close()；預設仍走既有共用 session。
 
     top_p / top_k / min_p 預設 None = 不送,沿用 server 啟動旗標的取樣預設;
     呼叫端(agent.py)會帶入 config.CHAT_* 把 Qwen 建議值釘住。
@@ -334,7 +339,7 @@ def chat_completions(
         _reject_forbidden_keys(extra, _CHAT_EXTRA_PROTECTED_KEYS, "chat_completions(extra=...)")
         payload.update(extra)
 
-    session = get_session()
+    session = get_session() if cancel is None else cancel.session()
     url = base_url.rstrip("/") + "/v1/chat/completions"
     _ensure_allowed(url)
 
@@ -953,12 +958,23 @@ def get_props(base_url: str, *, timeout: int = 5) -> dict | None:
         return None
 
 
-def get_slots(base_url: str, *, timeout: int = 5) -> list[dict] | None:
-    """讀 server slots:回傳每個 slot 的當前 ctx / 處理狀態。"""
-    session = get_session()
+def get_slots(
+    base_url: str, *, timeout: int = 5, quiet: bool = False,
+    cancel: RequestCancellation | None = None,
+) -> list[dict] | None:
+    """讀 server slots:回傳每個 slot 的當前 ctx / 處理狀態。
+
+    ``quiet=True``:失敗時**不**在 stderr 留那一行原因。只給 Textual 接管畫面之後
+    的呼叫端用(TUI 的 prompt-cache 預熱):那時任何直接寫 stderr 的東西都會把
+    畫面打花,而這個 probe 讀不到就是「未知」,呼叫端本來就有安全的預設行為。
+    其餘呼叫端一律維持會講話的預設 —— 把「被 policy 擋掉」偽裝成 server down
+    正是那一行要防的事。
+    cancel 與 chat_completions 的選用介面相同，由預熱擁有並收尾。
+    """
     url = base_url.rstrip("/") + "/slots"
     try:
         _ensure_allowed(url)
+        session = get_session() if cancel is None else cancel.session()
         resp = session.get(url, timeout=timeout, allow_redirects=False)
         _reject_redirect(resp, url)
         if resp.status_code != 200:
@@ -966,7 +982,8 @@ def get_slots(base_url: str, *, timeout: int = 5) -> list[dict] | None:
         data = resp.json()
         return data if isinstance(data, list) else None
     except Exception as exc:
-        _log_probe_failure("/slots", url, exc)
+        if not quiet:
+            _log_probe_failure("/slots", url, exc)
         return None
 
 

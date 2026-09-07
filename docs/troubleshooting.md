@@ -14,6 +14,7 @@ patch / command」排列。內容很長時可先用頁面搜尋找下列關鍵�
 | 畫面或症狀 | 先搜尋 |
 |---|---|
 | CUDA / build 失敗 | `compute_120a`、`sm_52`、`rollback` |
+| server 沒關過,開新對話第一個字仍要等很久 | `cache 冷熱`、`預熱` |
 | MCP Connected 但沒有真工具呼叫 | `假工具 XML` |
 | MCP 連不上 / server 啟動就退出 | `initialize 前就退出` |
 | 圖片或 ingest 逾時 | `超時`、`image_url` |
@@ -154,6 +155,128 @@ python3 deployment_profile.py validate     # 確認 schema 過
 
 代價:前期載入慢 1.5–2.5 分鐘(把整份 weights 讀進 RAM),之後 TTFT 穩定在 5–15 秒。
 RAM 不夠的就保持 mmap 接受偶爾卡頓,或換較小模型 / 調高 CPU-MoE 層數。
+
+### 開新對話首字慢:先分辨 prefill、reasoning 與 cache 冷熱
+
+server 一直開著、weights 早就載進來了,開一段新對話的第一個字還是等很久 —— 這底下不是
+同一件事。按 Enter 到第一個可見字之間有三段,狀態列會把它們分開寫:
+
+| 狀態列 | 這一段在做什麼 | 能不能縮短 |
+|---|---|---|
+| `等待首個 token` | server 在算 prompt(prefill):把這一輪送出去的 prefix 逐 token 評估進 KV cache | 只有「這份 prefix 剛算過而且還在 cache 裡」才會變快 |
+| `thinking N 段` | 模型在產生 reasoning。`show_reasoning` 預設關,所以畫面上只有 spinner 與段數 | **不能**。這是模型自己的輸出成本 |
+| `回答中` | 已經在產生你會看到的答案 | — |
+
+`/thinking` 只切換 reasoning 要不要顯示在畫面上,**不改**送給模型的東西,也不會讓 thinking
+變長或變短(「舊回合的 reasoning 進不進模型」是另一個鍵:`client.json` 的
+`keep_historical_reasoning`)。
+
+**prefill 這一段的機制。** 客戶端每一個 model step 只送**一個**
+`POST /v1/chat/completions`,而且一律帶 `cache_prompt`(客戶端硬編碼開啟,沒有設定能關)。
+所以問題從來不是「cache 有沒有開」,而是**這一輪的 prefix 還在不在 server 的 KV cache 裡**。
+每一輪送出去的最前面固定是這幾段,順序固定:
+
+| 段 | 來源 | 大小 |
+|---|---|---|
+| 內建基底規則 | 客戶端內建 | ≤ 1,600 字元(硬上限) |
+| MCP 使用說明 | 工具契約 | 小 |
+| 專案指示 | `<專案>/AGENTS.md` | ≤ 40,000 字元 |
+| lessons | `<專案>/.codetrail/lessons.md` | 通常很小 |
+| 使用者全域指示 | `~/.config/codetrail/instructions.md` | ≤ 8,000 字元 |
+| 沙箱根目錄 | 內建 | 一行 |
+| 19 個工具的 JSON schema | MCP `tools/list` | 通常是這裡面最大的一段 |
+
+同一個專案、同一份設定,這段 prefix 每次跑起來逐字相同。**改了上面任何一份檔案,或換一個
+專案目錄,prefix 就整份不一樣了。**
+
+**什麼時候它會是冷的**(下一個請求得從頭算):
+
+- server 剛啟動,或剛換過主模型
+- 你換了專案目錄(prefix 從專案指示那一段起全部不同)
+- 剛改過 `AGENTS.md` / `.codetrail/lessons.md` / `~/.config/codetrail/instructions.md`
+- 中間插進來的請求用的是別的 prefix:壓縮摘要(不帶工具 schema)、`query_knowledge` 內部
+  的查詢改寫、或另一個客戶端在用同一台 server
+
+本機這顆 build 的 llama-server 有 4 個 slot,會在**可用的** slot 之間依最長共同前綴挑一個,
+必要時淘汰最舊的那份;而且在 SWA / hybrid checkpoint 的條件下,即使前綴對得上也可能重算。
+這是本機這顆 build 的實作行為,**不是**所有版本的保證 —— 所以「server 沒關過」不等於
+「這份 prompt 已經算好了」。
+
+**客戶端會做的事:prompt cache 預熱。** TUI 就緒、`/new`、換 session,以及自動壓縮或
+`/compact` 成功換掉歷史之後,客戶端會在背景送一次「下一輪真的會送的 prefix」、
+`max_tokens=1` 的請求,把可避免的那段 prefill 搬到你還在打字的時候做。它:
+
+- 只送 prefix(下一輪的內容,減掉你還沒打的那一句),**不產生任何一則對話內容**:對話區、
+  session 檔與歷史都不會因為預熱而多出東西
+- 只在互動模式跑。readonly session(replay / canary)與 headless 的 `run` **永遠不預熱**
+- `/new` 與換 session 會中止還在飛的那一次(不管它走到哪一段;中止之後不會再送任何請求)
+- **不能**縮短 thinking,也不會讓硬體算得比較快;它只改變「這段 prefill 發生在你打字之前,
+  還是按 Enter 之後」。prefix 本來就是熱的時候,預熱等於沒感覺
+
+預熱進行中,狀態列會多一段 `prompt cache 預熱中`。這時候送出問題不會被丟掉,只是會在模型
+鎖上等預熱那一次送完(照樣可以 Ctrl-C)。`/new` 與換 session 會關閉舊預熱的連線，
+一秒內收掉預熱並放掉模型鎖；即使 server 還沒回 headers，也不必等它回應或逾時。
+代價不是零:每次預熱最多多一次 `/slots` 查詢與一個 token 的生成。
+
+**看它到底跑了沒有:** `/status` 有一行 `prompt cache 預熱=`。
+
+| 顯示 | 意思 |
+|---|---|
+| `尚未` | 這段對話還沒排過預熱 |
+| `sent <時間> 觸發=<觸發點>` | 請求送出去了 |
+| `skipped(<原因>) <時間> 觸發=<觸發點>` | 這次沒送,原因見下表 |
+| `error <時間> 觸發=<觸發點>` | 預熱那條路徑自己丟了例外(不影響對話) |
+
+這一行反映**每一次**預熱:啟動、`/new`、換 session,以及自動壓縮 / `/compact` 換掉歷史之後
+那一次;`觸發=` 告訴你是哪一種:`mount`(啟動)、`new`、`session`、`compaction`。顯示的是
+**最近跑完**的那一次。
+
+| 跳過原因 | 意思 |
+|---|---|
+| `disabled` | repo 常數 `config.CLIENT_PRIME_PROMPT_CACHE` 是 False(改它是改 repo,所有使用者一致) |
+| `tools_not_loaded` | 工具清單還沒載完 |
+| `policy` | 不是互動模式(readonly session 一律不預熱) |
+| `model_busy` / `turn_in_progress` | 有一輪正在跑,預熱讓路 |
+| `server_busy` | server 的 slot 全都在忙 |
+| `next_turn_would_overflow` / `gate` | context 閘擋下來了(該壓縮或開新對話) |
+| `incomplete` | 請求在終結 chunk 之前就結束(server 只送了 keep-alive 或幾個 delta 就關線);不算送出,不記 telemetry |
+| `no_timings` | server 的最後一個 chunk 沒有 `timings.prompt_n`,量不到重算了多少;不算送出,不記 telemetry |
+| `aborted` | 你換了 session 或開了新對話;不管中止落在哪一段,舊預熱之後不會再送任何請求 |
+| `error:<類型>` | 送出時出錯 |
+
+**要量它**:專案目錄下的 `.codetrail/context_metrics.jsonl` 每個請求一行(只有 count 與
+metadata,不含 prompt、工具輸出或檔案內容;readonly session 不寫)。判冷熱只需要四個欄位:
+
+```bash
+python3 - <<'EOF'
+import json, pathlib
+rows = [json.loads(line) for line
+        in pathlib.Path(".codetrail/context_metrics.jsonl").read_text().splitlines() if line.strip()]
+for r in rows[-30:]:
+    if r.get("source") not in ("client", "compaction", "prime"):
+        continue
+    processed = r.get("prompt_tokens_processed")
+    print(f'{r["source"]:10s} msgs={r["message_count"]:3d} '
+          f'est_in={r["estimated_input_tokens"]:6d} '
+          f'processed={processed if processed is not None else "n/a"}')
+EOF
+```
+
+- `source`:`client` 是聊天的每一步、`compaction` 是壓縮摘要、`prime` 是預熱
+- `estimated_input_tokens`:這次**送出去**的估計 token 數(整份 prefix + 歷史)
+- `prompt_tokens_processed`:server 這次**真的評估**了幾個 token。這是判冷熱唯一能看的欄位:
+  接近 `estimated_input_tokens` 就是冷的(整份重算),遠小於它就是命中了 cache。升級之前
+  寫的舊行沒有這個欄位,會顯示 `n/a`
+- `message_count`:訊息數。`prime` 那一列會比它之後那一輪的**第一個** `client` 列少一則 ——
+  少的就是你打的那一句
+
+所以「預熱到底有沒有幫上忙」的判讀是:找到 `source=prime` 那一列,再看同一段對話緊接著的
+`source=client` 那一列的 `prompt_tokens_processed`。它很小 = 預熱算好的東西真的被重用了;
+它仍然接近自己的 `estimated_input_tokens`、而且中間沒有別人的請求 = 這顆 build 在這個情境
+下不重用(checkpoint / SWA 之類),預熱在這台機器上就沒有效果。
+
+`actual_prompt_eval_count` 不能拿來判冷熱:依回應形狀,它可能是這次輸入的**總** token 數
+(server 同時回 `usage` 與 `timings` 時取 `usage`),cache 全命中時照樣是一個大數字。
 
 <a id="mcp-connected-but-no-tool-call"></a>
 ### `/tools` 列得出 19 個,但模型說沒有 CodeTrail 或只印出假工具 XML

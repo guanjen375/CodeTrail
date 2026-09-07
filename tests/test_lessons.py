@@ -400,7 +400,8 @@ def _render(root, *, skip=False):
     """跑 preflight 的 lessons 這一步。回 (Preflight, 印出來的文字)。
 
     `Preflight.note` 直接 print,所以呼叫端用 capsys 收 —— 與 runtime 一樣
-    (`client_preflight.run()` 把整段 tee 進畫面與對話區第一則)。
+    (`client_preflight.run()` 把整段 tee 進畫面與 transcript;通過之後進 TUI
+    的只有 `banner_lines()`,而過期提示是那裡的警告之一)。
     """
     result = client_preflight.Preflight(root=root)
     client_preflight.render_lessons(result, skip=skip)

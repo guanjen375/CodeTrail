@@ -684,6 +684,7 @@ class CodeTrailApp(App[int]):
             on_approval_closed=self._approval_closed_from_worker,
             on_reasoning=self._reasoning_from_worker,
             compactor=compactor,
+            on_prime=self._prime_from_worker,
         )
         self._ui_thread_id = threading.get_ident()
         self._assistant: AssistantBlock | None = None
@@ -692,6 +693,15 @@ class CodeTrailApp(App[int]):
         self._approval_screens: dict[str, ApprovalScreen] = {}
         self._turn_started: float | None = None
         self._spinner = 0
+        #: 這一輪到目前為止收到幾段 reasoning、有沒有開始吐答案。狀態列的相位只用
+        #: 這兩個**畫面自己收到的**計數,不讀 engine 的內部狀態。
+        self._reasoning_chunks = 0
+        self._answer_started = False
+        self._compacting = False
+        #: 最後一次由協調器跑完的預熱:``(時間, 觸發點, PrimeOutcome | None)``。不分是誰
+        #: 排的(mount / new / session 由這裡排,compaction 由協調器自己排),全部經
+        #: ``on_prime`` 回到這裡。只給 ``/status`` 看,不進對話區。
+        self._last_prime: tuple[float, str, Any] | None = None
         self._last_interrupt = 0.0
         self._context_tokens = 0
         self.exit_code = 0
@@ -721,6 +731,9 @@ class CodeTrailApp(App[int]):
             self._append(NoticeLine(line))
         self._append(NoticeLine("輸入 /help 看指令。"))
         self._replay_startup_session()
+        # 接續進來的那段歷史已經在 engine 裡了,下一輪的 prefix 現在就算得出來:
+        # 趁使用者還在打第一題,先把 prefill 送出去。
+        self._prime("mount")
         self.query_one("#completions", Static).display = False
         self._recount_context()
         self.set_interval(0.25, self._refresh_status)
@@ -844,14 +857,20 @@ class CodeTrailApp(App[int]):
     def _approval_closed_from_worker(self, approval_id: str) -> None:
         self._from_worker(self._close_approval, approval_id)
 
+    def _prime_from_worker(self, reason: str, outcome: Any) -> None:
+        """協調器的 ``on_prime``:每一次預熱(含壓縮後那一次)跑完都從預熱執行緒到這裡。"""
+        self._from_worker(self._note_prime, reason, outcome)
+
     # ---- 事件 ----------------------------------------------------------
     def handle_event(self, event: Mapping[str, Any]) -> None:
         kind = event.get("type")
         if kind == client_events.TYPE_TEXT_DELTA:
+            self._answer_started = True
             self._ensure_assistant().append(str(client_events.event_part(event).get("text", "")))
             self.query_one("#log", VerticalScroll).scroll_end(animate=False)
             return
         if kind == client_events.TYPE_TEXT:
+            self._answer_started = True
             text = str(client_events.event_part(event).get("text", ""))
             block = self._ensure_assistant()
             block.finish(text if not block.text else "")
@@ -912,9 +931,11 @@ class CodeTrailApp(App[int]):
             self._assistant = None
         self._reasoning = None
         self._turn_started = None
+        self._reset_phase()
         self._refresh_status()
 
     def _on_reasoning(self, token: str) -> None:
+        self._reasoning_chunks += 1
         self._ensure_reasoning().append(token)
         if self.show_reasoning:
             self.query_one("#log", VerticalScroll).scroll_end(animate=False)
@@ -987,6 +1008,7 @@ class CodeTrailApp(App[int]):
             return False
         self._append(UserMessage(text))
         self._turn_started = time.monotonic()
+        self._reset_phase()
         self._refresh_status()
         self._refresh_completions()
         return True
@@ -1050,6 +1072,8 @@ class CodeTrailApp(App[int]):
             self._append(ErrorLine(f"無法開新對話:{exc}(仍在 {self.engine.session_id})"))
             return
         self.coordinator.session_changed()
+        # 新對話的 prefix 只剩 system 段:server 那邊對它多半是冷的,先送出去。
+        self._prime("new")
         # 工具 block 以 call id 當 key;換了對話,舊 id 不得再被新呼叫接上。
         self._tools.clear()
         self._assistant = None
@@ -1127,6 +1151,9 @@ class CodeTrailApp(App[int]):
             return
         self.engine.adopt(snapshot)
         self.coordinator.session_changed()
+        # 換過去的那段歷史就是下一輪的 prefix,而它剛剛才進 engine:先送預熱,
+        # 使用者接著問的第一題就不必從頭 prefill 整段對話。
+        self._prime("session")
         # 工具 block 以 call id 當 key;換了對話,舊 id 不得再被新呼叫接上。
         self._tools.clear()
         self._assistant = None
@@ -1144,6 +1171,7 @@ class CodeTrailApp(App[int]):
             self._append(NoticeLine("這一輪還在跑;Ctrl-C 可以中斷它。"))
             return
         self._turn_started = time.monotonic()
+        self._reset_phase(compacting=True)
         self._refresh_status()
 
     def _cmd_status(self, _argument: str) -> None:
@@ -1157,6 +1185,7 @@ class CodeTrailApp(App[int]):
             f"session 檔={path if path else '(不落檔)'}",
             f"專案指示={'已載入' if self._project_instructions() else '未載入'}",
             f"舊回合 reasoning={'送模' if self.keep_historical_reasoning else '不進模型'}",
+            f"prompt cache 預熱={self._prime_status()}",
         ]
         if self.engine.store_error:
             lines.append(
@@ -1229,6 +1258,44 @@ class CodeTrailApp(App[int]):
         self._save_history()
         self.exit(self.exit_code)
 
+    # ---- 預熱 ----------------------------------------------------------
+    def _prime(self, reason: str) -> None:
+        """把「下一輪的 prefix」丟到背景先送一次。
+
+        engine 沒有這個能力(舊 engine / 替身)或回合進行中的話,協調器直接回
+        False,這裡就是 no-op。准入(policy、模型鎖、server 忙不忙、context gate)
+        全在 engine 那端;這個介面只決定**什麼時候**值得排一次:歷史剛換過、
+        server 那邊的 prompt cache 對新的 prefix 多半是冷的那幾個時刻。
+
+        預熱不是一則對話內容:它不進對話區、不進事件流,只在 ``/status`` 與
+        狀態列看得到。結果不在這裡接:協調器跑完的**每一次**預熱(含壓縮後它自己排的
+        那一次)都經 ``on_prime`` 回到 :meth:`_note_prime`。
+        """
+        self.coordinator.prime_in_background(reason)
+
+    def _note_prime(self, reason: str, outcome: Any) -> None:
+        self._last_prime = (time.time(), reason, outcome)
+
+    def _prime_status(self) -> str:
+        """``/status`` 的那一行:最近一次預熱的結果、原因、時間與觸發點。
+
+        跳過的時候要說得出**為什麼**:只寫「沒有預熱」的話,使用者看到的是
+        「第一題還是很慢」,而分不出是預熱沒發生、還是預熱沒有用。``觸發=`` 講的是
+        這一次是哪一種入口(mount / new / session / compaction):壓縮後那一次不回到
+        這裡的話,這一行會停在 mount 那一次的 ``sent``,而下一題面對的其實是冷的 cache。
+        """
+        if self._last_prime is None:
+            return "尚未"
+        stamp, reason, outcome = self._last_prime
+        when = time.strftime("%H:%M:%S", time.localtime(stamp))
+        trigger = f"觸發={reason or '?'}"
+        if outcome is None:
+            # engine 的契約是不 raise;真的丟出來就不得顯示成「送出了」。
+            return f"error {when} {trigger}"
+        if getattr(outcome, "sent", False):
+            return f"sent {when} {trigger}"
+        return f"skipped({getattr(outcome, 'reason', '') or '?'}) {when} {trigger}"
+
     # ---- 狀態列 --------------------------------------------------------
     def _recount_context(self) -> None:
         """重算「這段對話下一輪會送出去多少 context」。
@@ -1258,6 +1325,27 @@ class CodeTrailApp(App[int]):
         sections = getattr(self.engine.system_prompt, "sections", ())
         return any(section.name in ("project_agents", "lessons") for section in sections)
 
+    def _reset_phase(self, *, compacting: bool = False) -> None:
+        self._reasoning_chunks = 0
+        self._answer_started = False
+        self._compacting = compacting
+
+    def _turn_phase(self) -> str:
+        """這一輪目前在哪一段。
+
+        reasoning 模型在第一個可見字之前可能想很久(``show_reasoning`` 預設是關的,
+        畫面上只有一個 spinner),那段時間跟「卡住了」在畫面上長得一模一樣。相位只
+        看**這個介面自己收到的事件**:不讀 engine 的內部狀態,顯示不會跟真的送出去
+        的東西打架。
+        """
+        if self._compacting:
+            return "壓縮中"
+        if self._answer_started:
+            return "回答中"
+        if self._reasoning_chunks:
+            return f"thinking {self._reasoning_chunks} 段"
+        return "等待首個 token"
+
     def _refresh_status(self) -> None:
         try:
             bar = self.query_one("#status", Static)
@@ -1279,6 +1367,10 @@ class CodeTrailApp(App[int]):
             parts.insert(
                 0, f"{SPINNER_FRAMES[self._spinner]} {elapsed:.0f}s(Ctrl-C 中斷)"
             )
+            parts.insert(1, self._turn_phase())
+        if getattr(self.engine, "priming", False):
+            # 預熱握著模型鎖:這時候送出的下一題會在鎖上等它送完,狀態列要講得出來。
+            parts.append("prompt cache 預熱中")
         self.status_text = " · ".join(parts)
         bar.update(Text(self.status_text))
 

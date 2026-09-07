@@ -15,7 +15,14 @@
 * **訊息同時印出去、也留一份。** preflight 跑在 TUI 接管畫面**之前**,而且會花
   時間(canary 的 live probe 上限 120 秒、每 15 秒回報一次進度),所以照舊即時
   印到 stdout —— 只收不印的話,使用者面對的是一段沒有輸出的長時間停頓。留下來
-  的那一份給 TUI 當對話區第一則,否則清屏就把它吃掉了。
+  的那一份(``lines``)是完整 transcript,診斷用。
+
+**通過之後 TUI 只拿 :meth:`Preflight.banner_lines`**,不是整段 transcript:那段
+進度 LOG 的用途就是「跑的時候看得到它在動」,而它已經在 TUI 之前的終端畫面上
+逐行印過了。重播一次的代價是使用者每次開 aicode 都要先捲過十幾行自己剛看過的
+成功訊息,而真正要看的兩種東西 —— canary 只走 stderr 的 WARNING、「這個 session
+的自動壓縮已被停用」—— 混在裡面。所以分類在**產生訊息的地方**做:
+``note(..., keep=True)`` 標警告、``compaction_status`` 另外收進 ``status``。
 
 失敗一律 fail-loud:回一個帶 `failed` 的結果,呼叫端以非零 exit 收場。沒有
 「檢查不過就降級啟動」這條路。
@@ -49,21 +56,44 @@ class _Tee(io.TextIOBase):
 
     為什麼要「同時」:preflight 跑在 TUI **接管畫面之前**,而它會花時間
     (canary 的 live model probe 上限 120 秒、每 15 秒回報一次進度)。只收不印的話
-    使用者面對的是一個沒有任何輸出的長時間停頓 —— 那看起來就是當機。留一份是為了
-    讓 TUI 起來之後把同一段訊息放進對話區第一則(否則清屏就把它吃掉了)。
+    使用者面對的是一個沒有任何輸出的長時間停頓 —— 那看起來就是當機。留一份是
+    完整 transcript(``Preflight.lines``)。
+
+    ``on_line`` 只掛在 **stderr** 那一份上:寫到 stderr 的每一行都是警告(canary 的
+    WARNING 只走這條路),而它們必須在 TUI 起來之後還看得到。這裡以**行**為單位
+    交出去 —— 一次 ``print()`` 是兩次 ``write()``(內容 + 換行),照 write 交會把
+    同一行拆成兩則,而且尾巴會多一則空的。
     """
 
-    def __init__(self, stream: Any, sink: list[str]) -> None:
+    def __init__(self, stream: Any, sink: list[str], *, on_line: Any = None) -> None:
         self._stream = stream
         self._sink = sink
+        self._on_line = on_line
+        self._pending = ""
 
     def write(self, text: str) -> int:
         self._sink.append(text)
+        if self._on_line is not None and text:
+            self._pending += text
+            while "\n" in self._pending:
+                line, _, self._pending = self._pending.partition("\n")
+                if line.strip():
+                    self._on_line(line)
         try:
             self._stream.write(text)
         except Exception:  # noqa: BLE001 - stdout 壞掉不得帶走 preflight
             pass
         return len(text)
+
+    def drain(self) -> None:
+        """把尾端沒有換行的殘片也交給 ``on_line``。
+
+        最後一行沒有換行是真實情況(子行程被砍、寫到一半);不交出去的話,那正好
+        是「出事了」的那一行,而它會靜默消失。
+        """
+        pending, self._pending = self._pending, ""
+        if self._on_line is not None and pending.strip():
+            self._on_line(pending)
 
     def flush(self) -> None:
         try:
@@ -74,15 +104,46 @@ class _Tee(io.TextIOBase):
 
 @dataclass
 class Preflight:
-    """preflight 的結果。``lines`` 是要顯示給使用者的訊息(對話區第一則)。"""
+    """preflight 的結果。
+
+    ``lines`` 是**完整** transcript(逐字,含每一行進度),診斷用;它已經即時印在
+    TUI 之前的終端畫面上。``warnings`` / ``status`` 是同一批訊息裡「通過之後還要
+    看得到」的那些,:meth:`banner_lines` 把它們組成 TUI 的第一屏。
+    """
 
     root: Path
     model: str = ""
     n_ctx: int = 0
+    #: 完整 transcript(``run()`` 收尾時填);語意與內容 = 使用者在終端看到的那一段。
     lines: list[str] = field(default_factory=list)
+    #: 通過之後仍要進 TUI 的訊息,依實際發生順序:``note(keep=True)`` 的那幾則
+    #: (可多行,一則一個元素)與 preflight 期間寫到 stderr 的每一個非空行。
+    warnings: list[str] = field(default_factory=list)
+    #: :func:`compaction_status` 產生的每一行(逐字、順序不變)。不做二次篩選 ——
+    #: 「這個 session 的自動壓縮已被停用」就藏在那幾行裡。
+    status: list[str] = field(default_factory=list)
 
-    def note(self, message: str) -> None:
+    def note(self, message: str, *, keep: bool = False) -> None:
+        """印一則進度訊息。``keep=True`` 表示它通過之後仍要進 TUI 的第一屏。
+
+        ``keep`` **不改印出來的字**:同一則訊息在終端上長得跟以前一模一樣(不加
+        前綴、不重印)。它只決定要不要在 ``warnings`` 裡再留一份。
+        """
         print(f"[aicode] {message}", flush=True)
+        if keep:
+            self.warnings.append(message)
+
+    def banner_lines(self, *, tools: int, permission: str, compaction: str) -> tuple[str, ...]:
+        """通過之後 TUI 對話區的第一屏:一行結果摘要 + 壓縮狀態行 + 警告。
+
+        進度 LOG 不在裡面(它已經在終端畫面上,重播只是要使用者再捲一次);
+        ``lines`` 仍然是完整 transcript。
+        """
+        head = (
+            f"自檢通過:model={self.model} n_ctx={self.n_ctx} tools={tools} "
+            f"permission={permission} compaction={compaction}"
+        )
+        return (head, *self.status, *self.warnings)
 
 
 def _profile_module():
@@ -178,7 +239,11 @@ def observe_n_ctx(result: Preflight, profile: Any) -> int:
                 "  請先啟動 llama-server(~/start.sh),或重跑 ./set_config.sh 設定 ctx。"
             )
         observed = int(configured)
-        result.note(f"n_ctx={observed}(來自 deployment profile;server 尚無法觀測)")
+        # keep:退回設定值代表 server 沒回答。實際 n_ctx 與這個數字不同時,
+        # 門檻與 gate 全部是照一個猜測值算的 —— 使用者要知道自己在這一邊。
+        result.note(
+            f"n_ctx={observed}(來自 deployment profile;server 尚無法觀測)", keep=True
+        )
     result.n_ctx = observed
     return observed
 
@@ -194,7 +259,9 @@ def check_ctx_safety(result: Preflight, profile: Any, requested: int) -> None:
     base_url = profile.service("main").base_url
     verdict = gpu_safety.check_safety(requested, base_url=base_url)
     if verdict.status == "UNKNOWN":
-        result.note(f"ctx safety=UNKNOWN({verdict.reason});放行")
+        # keep:這一道閘這次沒有真的驗過。SAFE 那一行相反 —— 驗過了就沒有必要
+        # 每次啟動都佔一行。
+        result.note(f"ctx safety=UNKNOWN({verdict.reason});放行", keep=True)
         return
     if verdict.status == "SAFE":
         result.note(f"ctx safety=SAFE(requested={requested} ≤ server {verdict.server_n_ctx})")
@@ -263,10 +330,13 @@ def render_lessons(result: Preflight, *, skip: bool = False) -> None:
         # 逐條列出 id:使用者要 renew / delete 的就是這幾個,不印 id 等於叫他
         # 自己去翻 store。
         ids = "、".join(str(item.get("id", "?")) for item in expired)
+        # keep:這幾條規則**本 session 起不再生效**,而使用者要做的事(renew /
+        # delete)只有這裡講。整則一起留(兩行是一則訊息)。
         result.note(
             f"⚠ {len(expired)} 條 lessons 已過 review_by,本 session 起停止注入,"
             f"待人工複審:{ids}\n"
-            "  複審:python3 lessons.py renew <id> / delete <id>"
+            "  複審:python3 lessons.py renew <id> / delete <id>",
+            keep=True,
         )
 
 
@@ -278,7 +348,9 @@ def _drop_rendered(result: Preflight) -> None:
         if lessons.remove_context_file(result.root):
             result.note("已移除先前 render 的 .codetrail/lessons.md(避免舊規則被注入)")
     except Exception as exc:  # noqa: BLE001 - 清不掉只是警告
-        result.note(f"⚠ 無法移除舊的 .codetrail/lessons.md:{exc}")
+        # keep:清不掉那個檔 = 上一個 session 的規則還躺在 root 裡,而前一行剛
+        # 宣告過「本 session 不注入」。這兩件事不能只有一件看得到。
+        result.note(f"⚠ 無法移除舊的 .codetrail/lessons.md:{exc}", keep=True)
 
 
 def _project_instructions_enabled() -> bool:
@@ -346,6 +418,9 @@ def compaction_status(result: Preflight) -> None:
         lines = [f"壓縮模式=未知({exc})"]
     for line in lines:
         result.note(line)
+        # 全部收進 `status`,不做二次篩選:哪一行是「已被停用」要看 client_status
+        # 當下的措辭,在這裡挑等於在兩個檔之間維護同一份清單。
+        result.status.append(line)
 
 
 def legacy_web_backend_hint() -> str:
@@ -379,17 +454,21 @@ def legacy_web_backend_hint() -> str:
 def run(root: Path, *, skip_tool_health: bool = False) -> Preflight:
     """跑完整套 preflight。失敗丟 :class:`PreflightError`。
 
-    全程 tee:輸出即時進 stdout(使用者盯著的是這個),同時留一份給 TUI 當
-    對話區第一則。canary 走的是同一條 stdout,所以它的心跳一起被收下來。
+    全程 tee:輸出即時進 stdout(使用者盯著的是這個),同時留一份完整 transcript
+    (``lines``)。canary 走的是同一條 stdout,所以它的心跳一起被收下來。通過之後
+    TUI 拿的是 :meth:`Preflight.banner_lines`,不是這整段。
     """
     result = Preflight(root=Path(root))
     captured: list[str] = []
+    # stderr 也要收:canary 的 WARNING(implicit routing 降級、explicit 第二次
+    # 才成功、快取寫入失敗)只走 stderr。只收 stdout 的話,TUI 一接管畫面
+    # 那些警告就消失了,而它們正是「這次啟動有什麼不對勁」的全部證據 ——
+    # 所以它們同時逐行進 `warnings`(stdout 那一份**不**這樣做:那條路上絕大多數
+    # 是進度,要留的那幾則由 `note(keep=True)` 自己指名)。
+    errors = _Tee(sys.stderr, captured, on_line=result.warnings.append)
     try:
-        # stderr 也要收:canary 的 WARNING(implicit routing 降級、explicit 第二次
-        # 才成功、快取寫入失敗)只走 stderr。只收 stdout 的話,TUI 一接管畫面
-        # 那些警告就消失了,而它們正是「這次啟動有什麼不對勁」的全部證據。
         with contextlib.redirect_stdout(_Tee(sys.stdout, captured)), \
-                contextlib.redirect_stderr(_Tee(sys.stderr, captured)):
+                contextlib.redirect_stderr(errors):
             result.note(f"root={result.root}")
             profile = check_deployment_profile(result)
             resolve_model(result, profile)
@@ -399,10 +478,14 @@ def run(root: Path, *, skip_tool_health: bool = False) -> Preflight:
             check_required_servers(result)
             hint = legacy_web_backend_hint()
             if hint:
-                result.note(hint)
+                # keep:那個 backend 占著 port、一個 MCP 子行程與一個模型 slot,
+                # 而它不會自己停。三行是一則訊息。
+                result.note(hint, keep=True)
             if not skip_tool_health:
                 check_tool_health(result, profile)
             compaction_status(result)
     finally:
+        # 先把 stderr 尾端沒有換行的殘片交出去,再收 transcript。
+        errors.drain()
         result.lines = "".join(captured).splitlines()
     return result

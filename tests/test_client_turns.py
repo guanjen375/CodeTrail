@@ -5,6 +5,9 @@ worker 阻塞在核准上、取消與回合收尾互相搶跑。三者都真的�
 的協調器守著),介面只剩 TUI 之後仍然成立,所以搬到這裡。
 
 核准的三條也在這裡:沒回答 = 拒絕、只能回答一次、非 bool 不算核准。
+
+prompt cache 預熱的那三條也在這裡:它**不是**一輪(不進 busy、不被 cancel 認得),
+只在壓縮真的換掉歷史之後、放掉回合鎖才排,而且每一次跑完都經 ``on_prime`` 回報。
 """
 from __future__ import annotations
 
@@ -12,6 +15,7 @@ import sys
 import threading
 import time
 import traceback
+import types
 from pathlib import Path
 
 import pytest
@@ -52,6 +56,12 @@ class _Engine:
         #: (``_turn_completed``);替身不模擬這一段的話,「協調器忽略
         #: CancelDecision(False)」這種錯誤永遠測不出來。
         self.committed = False
+        #: 預熱的呼叫記錄:每一筆是 ``(reason, 當下的 coordinator.busy)``。預熱不是
+        #: 一輪,所以協調器叫它的時候 busy 必須已經是 False(測試自己指派
+        #: ``engine.coordinator``;沒指派就記 None)。
+        self.coordinator = None
+        self.primes: list[tuple[str, bool | None]] = []
+        self.priming = False
         self._notices = tuple(notices)
 
     # 真 engine 的取消介面
@@ -72,6 +82,14 @@ class _Engine:
         self.cleared += 1
         self.cancelled = False
         self.committed = False
+
+    # §4.2 的預熱入口。真 engine 零寫入、不 raise、不發事件,回一個
+    # `PrimeOutcome(sent, reason, processed_tokens)`;協調器只把它原樣交給 on_done,
+    # 不看裡面,所以這裡只複述形狀。
+    def prime_prompt_cache(self, *, reason: str = ""):
+        busy = self.coordinator.busy if self.coordinator is not None else None
+        self.primes.append((reason, busy))
+        return types.SimpleNamespace(sent=True, reason="", processed_tokens=7)
 
     def send(self, text, *, on_event=None, on_text=None, on_reasoning=None, approve=None):
         self.sent.append(text)
@@ -119,6 +137,30 @@ class _Recorder:
 def _coordinator(engine, **kwargs):
     recorder = kwargs.pop("recorder", None) or _Recorder()
     return client_turns.TurnCoordinator(engine, emit=recorder, **kwargs), recorder
+
+
+def _eventually(predicate, timeout=5.0):
+    """等背景執行緒把事情做完。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+def _joined(name, timeout=5.0):
+    """等某條 worker 執行緒真的結束。
+
+    協調器的 ``_spawn`` 不回傳 handle,只能認名字。等它結束才問「有沒有預熱」是
+    唯一不靠 sleep 的問法:``_run_turn`` 回來的時候,該排的預熱已經 spawn 出去了。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(t.name == name and t.is_alive() for t in threading.enumerate()):
+            return True
+        time.sleep(0.005)
+    return False
 
 
 # ============================================================
@@ -592,3 +634,158 @@ def test_a_session_change_rebinds_the_compactor_without_consuming_the_notice():
     coordinator, _recorder = _coordinator(_Engine(), compactor=compactor)
     coordinator.session_changed()
     assert compactor.rebinds == 1 and compactor.notices == 0
+
+
+# ============================================================
+# prompt cache 預熱
+# ============================================================
+def test_a_compaction_that_replaced_the_history_primes_after_the_turn_lock_is_released():
+    """壓縮換掉歷史之後要重新預熱,而且只能在**放掉回合鎖之後**排。
+
+    壓縮之後,下一輪要送的 prefix 已經不是剛剛送過的那一份 —— 那正是 server 端的
+    prompt cache 會落空的時刻。反過來,`skipped` / `stopped` / `failed` 沒有換掉
+    任何東西,預熱只是白打一次主模型(而且會佔著模型鎖)。
+
+    排在 `finally` 裡(回合鎖還握著)的話,預熱會在這一輪的臨界區內等模型鎖:
+    使用者的下一題連 `start_turn` 都排不進來,畫面上只看得到「這一輪還在跑」。
+    記下的 busy 就是這件事的證據。
+    """
+
+    def _primes_after(status, *, manual):
+        # 四種只差在 status(訊息刻意一樣):判準是「歷史有沒有被換掉」,不是
+        # 壓縮器講了什麼。
+        engine = _Engine()
+        coordinator, recorder = _coordinator(
+            engine, compactor=_Compactor(outcome=_Outcome(status, "已壓縮"))
+        )
+        engine.coordinator = coordinator
+        if manual:
+            coordinator.start_compaction()
+            worker = f"codetrail-compact-{engine.session_id}"
+        else:
+            coordinator.start_turn("hi")
+            worker = f"codetrail-turn-{engine.session_id}"
+        recorder.terminal()
+        assert _joined(worker), f"{worker} 沒有結束"
+        if status == "compacted":
+            assert _eventually(lambda: len(engine.primes) == 1), engine.primes
+        return list(engine.primes)
+
+    for manual in (False, True):
+        assert _primes_after("compacted", manual=manual) == [("compaction", False)]
+        for status in ("skipped", "stopped", "failed"):
+            assert _primes_after(status, manual=manual) == [], (status, manual)
+
+
+def test_priming_is_invisible_to_busy_and_cancel_and_refused_while_a_turn_runs():
+    """預熱不是一輪。
+
+    讓它算進 `busy` 的話,使用者的下一題與 `/new` 會被自己的預熱擋住;讓 `cancel()`
+    認得它的話,閒置時按 Ctrl-C 會顯示成「已中斷這一輪」——那是謊報,而且真的
+    engine 那端根本沒有回合可以中斷(預熱的中止是 `abort_prime()`,不是這裡)。
+    反過來,回合進行中不得再排一個:那一輪握著模型鎖,預熱只會多一條在鎖上等的
+    執行緒,而且它算出來的 prefix 不含這一輪還沒寫定的內容。
+    """
+    engine = _Engine()
+    coordinator, _recorder = _coordinator(engine)
+    engine.coordinator = coordinator
+
+    assert coordinator.prime_in_background("mount") is True
+    assert _eventually(lambda: engine.primes == [("mount", False)]), engine.primes
+    assert coordinator.busy is False
+    assert coordinator.cancelled is False
+    assert coordinator.cancel() is False          # 沒有回合可中斷
+    assert engine.cancelled is False              # engine 的取消旗標也沒有被動到
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _Blocks(_Engine):
+        def send(self, *_a, **_k):
+            entered.set()
+            release.wait(5)
+            return _Result()
+
+    busy_engine = _Blocks()
+    busy_coordinator, busy_recorder = _coordinator(busy_engine)
+    busy_engine.coordinator = busy_coordinator
+    busy_coordinator.start_turn("hi")
+    assert entered.wait(5)
+    assert busy_coordinator.prime_in_background("mount") is False
+    assert busy_engine.primes == []               # 連 spawn 都沒有
+    release.set()
+    busy_recorder.terminal()
+
+    class _Older:
+        """還沒有預熱能力的 engine。少了那個方法是**跳過**,不是例外。"""
+
+        session_id = "20260101T000000-00000000"
+
+    older, _older_recorder = _coordinator(_Older())
+    assert older.prime_in_background("mount") is False
+
+
+def test_every_prime_the_coordinator_runs_reports_through_on_prime(monkeypatch):
+    """協調器**每一次**真的跑完的預熱都要經建構時給的 `on_prime(reason, outcome)` 回報。
+
+    壓縮換掉歷史之後那一次是協調器自己排的,沒有每次呼叫的 `on_done`;少了這條回呼,
+    那一次的 outcome 直接被丟掉,`/status` 停在 mount 那一次的 `sent`(Astra R1-B04)。
+    順序是先 `on_prime` 再 `on_done`;engine 破了「不 raise」的契約時 outcome 是 None
+    (不是不叫);`on_prime` 自己炸掉不得帶走 `on_done`、也不得從預熱執行緒冒出來
+    (UI 收尾時搬運會以 CancelledError 這種 BaseException 結束)。
+    """
+    seen: list[tuple] = []
+    engine = _Engine()
+    coordinator, recorder = _coordinator(
+        engine,
+        compactor=_Compactor(outcome=_Outcome("compacted", "已壓縮")),
+        on_prime=lambda reason, outcome: seen.append(("prime", reason, outcome, coordinator.busy)),
+    )
+    engine.coordinator = coordinator
+
+    # 閒置時由 UI 排的那一次:on_prime 與 on_done 都到、on_prime 在前、拿到同一個 outcome。
+    assert coordinator.prime_in_background(
+        "mount", on_done=lambda outcome: seen.append(("done", outcome))
+    ) is True
+    assert _eventually(lambda: len(seen) == 2), seen
+    assert seen[0][:2] == ("prime", "mount") and seen[0][2].sent is True and seen[0][3] is False
+    assert seen[1] == ("done", seen[0][2])
+
+    # 協調器自己排的那一次(壓縮換掉歷史之後):沒有 on_done,照樣回到 on_prime,而且回合鎖已放。
+    seen.clear()
+    coordinator.start_compaction()
+    recorder.terminal()
+    assert _joined(f"codetrail-compact-{engine.session_id}")
+    assert _eventually(lambda: len(seen) == 1), seen
+    assert seen[0][:2] == ("prime", "compaction") and seen[0][2].sent is True
+    assert seen[0][3] is False and coordinator.busy is False
+    assert engine.primes == [("mount", False), ("compaction", False)]
+
+    # engine 破了「不 raise」的契約:outcome 是 None,不是不叫。
+    class _Raises(_Engine):
+        def prime_prompt_cache(self, *, reason: str = ""):
+            raise RuntimeError("boom")
+
+    reported: list[tuple] = []
+    raising, _raising_recorder = _coordinator(
+        _Raises(), on_prime=lambda reason, outcome: reported.append((reason, outcome))
+    )
+    assert raising.prime_in_background("mount") is True
+    assert _eventually(lambda: reported == [("mount", None)]), reported
+
+    # on_prime 自己炸掉(連 BaseException 都算):執行緒正常結束、on_done 照樣被叫、不冒泡。
+    class _Boom(BaseException):
+        pass
+
+    def _explodes(reason, _outcome):
+        raise _Boom(reason)
+
+    escaped: list = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: escaped.append(args))
+    done: list = []
+    exploding_engine = _Engine()
+    exploding, _exploding_recorder = _coordinator(exploding_engine, on_prime=_explodes)
+    assert exploding.prime_in_background("mount", on_done=done.append) is True
+    assert _joined(f"codetrail-prime-{exploding_engine.session_id}")
+    assert len(done) == 1 and done[0].sent is True
+    assert escaped == []

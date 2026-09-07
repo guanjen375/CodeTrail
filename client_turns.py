@@ -23,6 +23,14 @@
   這一輪繼續(模型會拿到 denied 的工具結果再想別的辦法)。
 * 中斷 = :meth:`cancel`:整輪結束,答案不寫進歷史,懸空的 tool_call 由
   ``run_tool_loop`` 補上「已中斷」結果。
+
+**預熱不是一輪**(:meth:`prime_in_background`):它不取回合鎖、不動 ``_turn_done``
+與 ``_cancelled``,所以 ``busy`` 不會因為它變成 True(那會擋掉使用者的下一題與
+``/new``),``cancel()`` 對它也是 no-op ——閒置時回 True 就是把「已中斷」顯示給一個
+根本沒有在跑的回合。真正的准入(policy、模型鎖、server 忙不忙)全在 engine 那端。
+每一次真的跑完的預熱都經建構時給的 ``on_prime(reason, outcome)`` 回到 UI,**不分是誰
+排的**:壓縮換掉歷史之後那一次是這裡自己排的、沒有每次呼叫的 ``on_done``,少了這條
+回呼那一次的結果就直接被丟掉,``/status`` 會停在上一次的 ``sent``。
 """
 from __future__ import annotations
 
@@ -70,6 +78,7 @@ class TurnCoordinator:
         on_reasoning: Callable[[str], None] | None = None,
         compactor: Any = None,
         approval_timeout: float = APPROVAL_TIMEOUT_SECONDS,
+        on_prime: Callable[[str, Any], None] | None = None,
     ) -> None:
         self.engine = engine
         self.compactor = compactor
@@ -78,6 +87,10 @@ class TurnCoordinator:
         self._on_approval_closed = on_approval_closed
         self._on_reasoning = on_reasoning
         self._approval_timeout = approval_timeout
+        #: 每一次真的跑完的預熱都回報到這裡:``on_prime(reason, outcome)``,不分是誰排的
+        #: (UI 的 mount / new / session,或壓縮換掉歷史之後這裡自己排的那一次)。在預熱
+        #: 那條背景執行緒上呼叫;engine raise 時 outcome 是 None。
+        self._on_prime = on_prime
         #: 保護 turn_lock 的取得、``_turn_done``、``_cancelled`` 與 pending 核准表。
         #: 慢速動作(MCP 取消要等寬限期,最長 10 秒)一律在鎖外做。
         self._lock = threading.Lock()
@@ -285,6 +298,7 @@ class TurnCoordinator:
         # 假工具呼叫 / 壓縮結果這些 notice 要等 send() 回來才拿得到。照原順序送,
         # 看終結事件收工的一端會在 notice 之前離開。所以終結先扣住,notice 送完才放行。
         held: list[dict[str, Any]] = []
+        compacted = False
 
         def _emit(event: dict[str, Any]) -> None:
             if client_events.is_terminal_event(event):
@@ -307,7 +321,8 @@ class TurnCoordinator:
             )
             for item in result.notices:
                 self._publish(client_events.notice_event(target, item))
-            self._auto_compact(target, result)
+            outcome = self._auto_compact(target, result)
+            compacted = getattr(outcome, "status", None) == "compacted"
             if self.cancelled:
                 # 壓縮階段被取消:答案已經給了,但這一輪的結果是「中斷」——cancel 回了
                 # True,終結事件就必須是 cancelled,不是 stop。
@@ -333,8 +348,14 @@ class TurnCoordinator:
             )
         finally:
             self.finish_turn()
+        # 壓縮換掉了歷史:下一輪要送的 prefix 已經不是剛剛送過的那一份,server 那邊
+        # 的 prompt cache 對它是冷的。排在 `finally` 裡的話,預熱會在這一輪的回合鎖
+        # **內**等模型鎖,使用者的下一題連 `start_turn` 都排不進來。
+        if compacted:
+            self.prime_in_background("compaction")
 
     def _run_compaction(self, target: str) -> None:
+        compacted = False
         try:
             if self.compactor is None:
                 self._publish(
@@ -348,6 +369,7 @@ class TurnCoordinator:
                     client_events.notice_event(target, f"壓縮失敗:{type(exc).__name__}: {exc}")
                 )
                 return
+            compacted = getattr(outcome, "status", None) == "compacted"
             self._publish(
                 client_events.notice_event(target, outcome.message or "(沒有可壓縮的內容)")
             )
@@ -357,23 +379,75 @@ class TurnCoordinator:
             )
             self._publish(client_events.step_finish_event(target, reason=reason))
             self.finish_turn()
+        if compacted:
+            self.prime_in_background("compaction")
 
-    def _auto_compact(self, target: str, result: Any) -> None:
+    def _auto_compact(self, target: str, result: Any) -> Any:
+        """自動壓縮。回傳壓縮器給的 outcome(沒壓 / 壓不成回 ``None``)。
+
+        呼叫端要靠它決定壓縮**有沒有真的換掉歷史**:換掉了才需要重新預熱。
+        """
         if self.compactor is None:
-            return
+            return None
         # 只有真的答完(finish=stop)才壓:被截斷(length)、出錯、被中斷的那一輪
         # 沒有可信的切點。
         if getattr(result, "finish", None) != client_events.REASON_STOP:
-            return
+            return None
         try:
             outcome = self.compactor.compact()
         except Exception as exc:  # noqa: BLE001 - 壓縮失敗不得帶走這一輪
             self._publish(
                 client_events.notice_event(target, f"壓縮失敗:{type(exc).__name__}: {exc}")
             )
-            return
+            return None
         if outcome.status != "skipped" and outcome.message:
             self._publish(client_events.notice_event(target, outcome.message))
+        return outcome
+
+    # ---- 預熱 ----------------------------------------------------------
+    def prime_in_background(
+        self, reason: str, *, on_done: Callable[[Any], None] | None = None
+    ) -> bool:
+        """在背景送一次 prompt cache 預熱。回傳有沒有真的排出去。
+
+        排除兩種情況:engine 沒有這個能力(舊的 engine / 測試替身)、以及**回合
+        進行中**——那一輪自己握著模型鎖,預熱只會多一個在鎖上等的執行緒,而且它
+        算出來的 prefix 不含這一輪還沒寫定的內容。
+
+        這裡刻意不碰任何回合狀態:不取 ``_turn_lock``、不動 ``_turn_done`` /
+        ``_cancelled``。預熱既不是一輪、也不是可以「中斷」的東西(engine 那端由
+        ``abort_prime()`` 在換 session 時關掉它)。
+
+        跑完之後,outcome(engine 回的 ``PrimeOutcome`` 形狀;engine raise 時是 None)
+        先交給建構時的 ``on_prime(reason, outcome)``,再交給這一次呼叫自己的 ``on_done``
+        (可選)。兩邊都在預熱那條執行緒上被呼叫、各自吞例外(UI 正在收尾時搬運會以
+        ``CancelledError`` 這種 BaseException 結束),一邊炸了另一邊照樣要到。壓縮換掉
+        歷史之後那一次是這裡自己排的、沒有 ``on_done``,只靠 ``on_prime`` 回到 UI。
+        """
+        prime = getattr(self.engine, "prime_prompt_cache", None)
+        if not callable(prime) or self.busy:
+            return False
+
+        def _body() -> None:
+            outcome = None
+            try:
+                outcome = prime(reason=reason)
+            except Exception:  # noqa: BLE001 - 預熱失敗只是少一次預熱,不得帶走任何東西
+                outcome = None
+            if self._on_prime is not None:
+                try:
+                    self._on_prime(reason, outcome)
+                except BaseException:  # noqa: BLE001 - 回呼失敗不得帶走 on_done、也不得冒出執行緒
+                    pass
+            if on_done is None:
+                return
+            try:
+                on_done(outcome)
+            except BaseException:  # noqa: BLE001 - UI 正在收尾時搬運會以 CancelledError 結束
+                pass
+
+        self._spawn(_body, f"codetrail-prime-{self.engine.session_id}")
+        return True
 
     # ---- session 切換 --------------------------------------------------
     def session_changed(self) -> None:

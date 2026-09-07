@@ -5,7 +5,7 @@
 負責 session 狀態、訊息組裝、工具迴圈、權限、事件流。**不負責畫面**:
 終端 TUI 與 headless `run --format json` 都是這一層之上的薄前端。
 
-三件事決定了這一層的形狀:
+四件事決定了這一層的形狀:
 
 1. **送出去的那一份才算數。** 模型呼叫前的 payload 會先做 reasoning 剝除與
    舊工具輸出剪枝,context gate 對**剪過之後**的那一份計數,保留額用的是這
@@ -15,6 +15,10 @@
 3. **工具結果只有 text block 進模型。** evidence 工具的 ``structuredContent``
    是另一份完整資料,重複餵給模型等於把同一份證據算兩次 context;它只給
    UI 與 eval。
+4. **預熱是零寫入的。** ``prime_prompt_cache()`` 是唯一沒有使用者訊息就打主模型
+   的路徑:它只送 ``next_turn_prefix()``(與下一輪同一套轉換)、實送 ``max_tokens=1``
+   且 gate 的保留額就是 1,不進 turn 狀態、不寫 session 檔、不發事件、不碰取消旗標,
+   非互動 policy 一律在任何 I/O 之前拒絕。
 """
 from __future__ import annotations
 
@@ -49,6 +53,18 @@ PRUNE_PROTECT_TOKENS = 40_000
 PRUNE_MINIMUM_TOKENS = 20_000
 PRUNE_SKIP_USER_TURNS = 2
 PRUNE_PLACEHOLDER = "[Old tool result content cleared]"
+
+#: prompt-cache 預熱(:meth:`Engine.prime_prompt_cache`)。
+#: telemetry 的 source 自成一類:`.codetrail/context_metrics.jsonl` 裡的 `prime` 列
+#: 不是使用者的回合,混進 `client` 會讓「這個對話問了幾次」失真。
+PRIME_SOURCE = "prime"
+#: 實送的 ``max_tokens``,**同時**是 gate 的保留額。1 是刻意的:預熱要的是 prefill,
+#: 不是輸出;兩個數字必須相同(見 config.CLIENT_MAX_OUTPUT_TOKENS 的同一個理由)。
+PRIME_MAX_TOKENS = 1
+#: `/slots` probe 的上限。預熱是背景工作,不值得讓 TUI 的啟動路徑等 5 秒。
+PRIME_SLOTS_TIMEOUT = 2
+#: 換 session 時等進行中的預熱收工的上限(見 :meth:`Engine.abort_prime`)。
+PRIME_ABORT_WAIT = 1.0
 
 #: 每個 MCP instance(等於每個 AICODE_ROOT / 每個 llama-server)一把模型鎖。
 #: llama-server 是單 slot;同一行程裡的每個對話各自 new 一把鎖的話,兩條對話
@@ -220,23 +236,30 @@ CANCELLED_TOOL_RESULT = (
 
 
 def heal_in_place(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """把每個懸空 tool_call 的「已中斷」結果插在**宣告它的那則訊息之後**。
+    """把每個懸空 tool_call 的「已中斷」結果補在**宣告它的那則訊息的群組之後**。
 
     順序是契約的一部分:OpenAI 形狀要求 tool 結果緊接在宣告它的 assistant
     訊息之後。補在整段尾端的話,resume 之後再送一則新問題就會排成
     `assistant(tool_calls) → user → tool`,chat template 可能直接拒收,
     也可能讓模型把結果配到錯的呼叫上。
+
+    群組**已有**的結果排在前面、補的排在後面(宣告順序不變):同一組 `a, b` 在
+    兩個工具之間被中斷時,`send()` 是由 ``heal_pending_tool_calls()`` 把 `tool(b)`
+    **append** 在既有 `tool(a)` 之後;這裡若插在 `tool(a)` 之前,預熱送的 prefix
+    與下一輪真的送的 payload 就在群組中途分岔 —— 兩邊都是合法歷史,prompt cache
+    卻從那個 token 起一個字也重用不到,而且完全看不出來。
     """
     answered = {
         message.get("tool_call_id")
         for message in messages
         if message.get("role") == "tool"
     }
-    out: list[dict[str, Any]] = []
-    for message in messages:
-        out.append(dict(message))
+    out: list[dict[str, Any]] = [dict(message) for message in messages]
+    insertions: list[tuple[int, list[dict[str, Any]]]] = []
+    for index, message in enumerate(out):
         if message.get("role") != "assistant":
             continue
+        healed: list[dict[str, Any]] = []
         for call in message.get("tool_calls") or ():
             if not isinstance(call, Mapping):
                 continue
@@ -245,7 +268,7 @@ def heal_in_place(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
                 continue
             function = call.get("function")
             name = function.get("name") if isinstance(function, Mapping) else ""
-            out.append(
+            healed.append(
                 {
                     "role": "tool",
                     "tool_call_id": call_id,
@@ -253,6 +276,15 @@ def heal_in_place(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
                     "content": CANCELLED_TOOL_RESULT,
                 }
             )
+        if not healed:
+            continue
+        # 跳過這一組已經有的結果,補在它們後面。
+        end = index + 1
+        while end < len(out) and out[end].get("role") == "tool":
+            end += 1
+        insertions.append((end, healed))
+    for position, healed in reversed(insertions):
+        out[position:position] = healed
     return out
 
 
@@ -307,6 +339,47 @@ class CancelDecision(NamedTuple):
     call: Any
 
 
+class PrimeOutcome(NamedTuple):
+    """一次 :meth:`Engine.prime_prompt_cache` 的結果。**不 raise、不 print**。
+
+    ``reason`` 的值域(``sent=True`` 時是空字串):
+
+    ``disabled``
+        ``config.CLIENT_PRIME_PROMPT_CACHE`` 是 False。
+    ``tools_not_loaded``
+        工具目錄還沒載入 —— prefix 少了工具 schema 就不是下一輪會送的那一份。
+    ``policy``
+        非互動 policy(readonly session 的評測邊界)。
+    ``model_busy`` / ``turn_in_progress``
+        模型鎖被別人租著 / 這個對話已經有一輪在跑。
+    ``server_busy``
+        `/slots` 讀得到而且**每個** slot 都在忙。
+    ``next_turn_would_overflow``
+        下一輪按 ``options.max_output_tokens`` 保留就會撞閘:預熱它沒有意義。
+    ``gate``
+        連 1 個 token 的保留額都過不了 context gate。
+    ``incomplete``
+        串流在終結 chunk(``finish_reason``)之前就結束了:只有 keep-alive、或送了幾個
+        delta 就 clean EOF。請求沒有完成,不記 telemetry。
+    ``no_timings``
+        有終結 chunk,但最後一個 chunk 沒有 ``timings.prompt_n``:量不到「重算了多少」,
+        不能當成功記;``usage.prompt_tokens`` 是「prompt 多長」,不拿來代填。
+    ``aborted``
+        ``abort_prime()``(換 session)把它收掉了。落在 `/slots` probe、取得 headers
+        之前、或串流中都算;中止之後**不會**再發 POST。
+    ``error:<ExcType>``
+        其餘例外的型別名。
+
+    ``processed_tokens`` 只有 ``sent=True`` 時有值,來源是
+    ``ContextUsage.prompt_tokens_processed``(`timings.prompt_n`):它是唯一能分辨
+    「本來就熱」與「真的搬了一次 prefill」的數字。
+    """
+
+    sent: bool
+    reason: str
+    processed_tokens: int | None
+
+
 class _ModelSlot:
     """共用 model lock 的租約(``with`` 用)。
 
@@ -343,6 +416,21 @@ class _ModelSlot:
             self._released = True
         self._lock.release()
         return False
+
+    @classmethod
+    def try_lease(cls, lock: threading.Lock) -> "_ModelSlot | None":
+        """非阻塞取鎖:取不到回 None(預熱用:它寧可不做,也不排隊)。
+
+        拿到的租約不進 ``with``,只用 :meth:`release` / :meth:`hand_off` /
+        :meth:`release_late`——放鎖與交給背景的規則與回合那一套完全相同。
+        """
+        if not lock.acquire(blocking=False):
+            return None
+        return cls(lock)
+
+    def release(self) -> None:
+        """正常路徑放鎖(與 ``__exit__`` 同一件事);已 ``hand_off`` 給背景就不動。"""
+        self.__exit__(None, None, None)
 
     def hand_off(self) -> None:
         with self._guard:
@@ -381,6 +469,97 @@ def _guarded(stream: Any, cancel: threading.Event):
                 raise TurnCancelled("這一輪已被使用者中斷") from exc
             raise
         yield chunk
+
+
+class _Abandonable:
+    """可放棄等待的預熱 I/O；transport 的 socket 由獨立 cancellation 收掉。
+
+    尚未排到 CPU 的 worker 先查 abort；完成得很快的 I/O 也查 abort。DNS/connect
+    若晚回，transport 在送 HTTP bytes 前還會拒絕取消的 job。settle 只清理晚到資源。
+    """
+
+    def __init__(
+        self, request: Callable[[], Any], name: str, *, abort: threading.Event
+    ) -> None:
+        self._name = name
+        self._box: dict[str, Any] = {}
+        self._done = threading.Event()
+
+        def _run() -> None:
+            try:
+                if abort.is_set():
+                    return
+                self._box["value"] = request()
+            except BaseException as exc:  # noqa: BLE001 - 原樣交回主流程
+                self._box["error"] = exc
+            finally:
+                self._done.set()
+
+        threading.Thread(target=_run, name=name, daemon=True).start()
+
+    def wait(self, abort: threading.Event, *, poll: float = 0.05) -> bool:
+        """等它完成;``abort`` 先到就回 False(結果仍會在背景到,見 :meth:`settle`)。"""
+        while not abort.is_set():
+            if self._done.wait(poll):
+                return not abort.is_set()
+            if abort.is_set():
+                return False
+        return False
+
+    def result(self) -> Any:
+        """完成後的結果;請求丟出的例外在這裡原樣重丟。"""
+        if "error" in self._box:
+            raise self._box["error"]
+        return self._box.get("value")
+
+    def settle(self, on_settled: Callable[[Any], None]) -> None:
+        """放棄之後:結果到達時(可能已經到了)**恰好一次**呼叫 ``on_settled(value)``;
+        請求失敗時 ``value`` 是 None。"""
+
+        def _run() -> None:
+            self._done.wait()
+            on_settled(self._box.get("value"))
+
+        if self._done.is_set():
+            _run()
+            return
+        threading.Thread(target=_run, name=f"{self._name}-settle", daemon=True).start()
+
+
+def _prime_chunk_is_final(chunk: Any) -> bool:
+    """這個串流 chunk 是不是終結 chunk(與 ``parse_usage_from_stream_chunk`` 同一判準)。"""
+    if not isinstance(chunk, Mapping):
+        return False
+    if chunk.get("stop"):
+        return True
+    choices = chunk.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    first = choices[0]
+    return isinstance(first, Mapping) and bool(first.get("finish_reason"))
+
+
+def _slot_is_busy(slot: Any) -> bool:
+    """llama-server 的某個 slot 現在忙不忙。**認不出來一律當閒**。
+
+    兩代欄位並存:新 build 給 ``is_processing``(bool),舊 build 給 ``state``
+    (0 = idle)。認不出的形狀當成閒,是因為這個 probe 只用來決定「要不要順手
+    預熱」—— 未知不該讓這條路徑無聲關掉(而且 4 個 slot 全忙才會跳過)。
+    """
+    if not isinstance(slot, Mapping):
+        return False
+    if slot.get("is_processing") is True:
+        return True
+    state = slot.get("state")
+    return isinstance(state, int) and state != 0
+
+
+#: 預熱 prefix 用的佔位 user 訊息標記。**永不落檔、永不送出**:它只是讓
+#: reasoning 剝除與 prune 按「下一輪」的邊界計算,算完就在 to_wire 之前拿掉。
+#: 用標記而不是物件 identity(`is`),是因為 strip_historical_reasoning 與
+#: prune_old_tool_outputs 都會 `dict(message)` 重建每一則 —— identity 一定對不上,
+#: 那樣的檢查等於沒有檢查。
+_PRIME_PLACEHOLDER_KEY = "__codetrail_prime_placeholder__"
 
 
 def to_wire(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -507,6 +686,24 @@ class Engine:
         # 決定 → 取消拒絕。不會有「回 True 卻保留答案」或「收尾清完旗標才補設」。
         self._turn_state = threading.Lock()
         self._active_call: Any = None
+        # prompt-cache 預熱(prime_prompt_cache)的狀態。**與回合狀態完全分開**:
+        # 預熱不是一輪對話,不進 _begin_turn、不碰 _cancel / _armed、也不用
+        # _active_stream —— 共用那些欄位的話,一次背景預熱會讓使用者按下的取消
+        # 落在預熱上,或讓取消旗標留給下一題。
+        self._prime_guard = threading.Lock()
+        self._prime_stream: Any = None
+        self._priming = False
+        #: 進行中那一次預熱的中止訊號與完成訊號(沒有預熱時是 None)。每次一對新 Event,
+        #: 而不是共用:共用的那個會被下一次預熱清掉,上一個等待者永遠醒不來。
+        self._prime_abort: threading.Event | None = None
+        self._prime_done: threading.Event | None = None
+        #: 預熱的世代號:abort_prime() 與換 session 都會 +1。預熱在 snapshot 歷史時記下
+        #: 當時的值,之後每個邊界(probe 回來、POST 之前、登記串流、串流結束)比一次,
+        #: 不同就是「這份歷史已經不是這段對話的」→ aborted。單靠 Event 擋不住「中止先到、
+        #: 預熱才登記」那一種:那時沒有 Event 可設,舊歷史照樣會送出去。
+        self._prime_epoch = 0
+        self._prime_request: llama_client.RequestCancellation | None = None
+        self._session_switching = 0
 
     # ---- tools ---------------------------------------------------------
     def load_tools(self) -> None:
@@ -654,14 +851,16 @@ class Engine:
 
         **先 create 成功才換狀態**:反過來的話 create 失敗(磁碟滿、權限)時
         記憶體歷史已經被清空,而使用者還停在舊 session。
+
+        先關閉預熱准入並中止進行中的預熱:那一次送的是**上一段對話**的 prefix,而且它
+        租著模型鎖 —— 不收掉的話,使用者在新對話問的第一題要排在一個已經沒有
+        用處的請求後面。
         """
-        session_id = self.store.create()
-        self.messages = []
-        self.store_error = None
-        # 上一段的快照不得跟過去:留著的話,啟動重播那條路會指著另一段對話。
-        self.resumed_snapshot = None
-        self.session_id = session_id
-        return session_id
+        with self._session_transition():
+            session_id = self.store.create()
+            # 上一段的快照不得跟過去:留著的話,啟動重播那條路會指著另一段對話。
+            self._switch_session(session_id, [], None)
+            return session_id
 
     def clear_cancel(self) -> None:
         """協調器在一輪(含尾端的壓縮)確定結束後呼叫:任何來不及消費的取消旗標都不得留到下一題。
@@ -732,13 +931,49 @@ class Engine:
         讀取與切換分開的理由是畫面:UI 要先拿 ``transcript`` 把 widget 建好,
         建不出來就整個不換 —— engine 換了、畫面沒換的話,使用者面對的是上一段
         對話,而模型看到的是另一段。
+
+        與 :meth:`new_session` 同理，先關閉准入並中止上一段對話的預熱。
         """
-        self.session_id = snapshot.session_id
-        self.messages = [dict(message) for message in snapshot.messages]
-        # store_error 是**這個** session 的事:上一段對話寫不進去,不代表換過來
-        # 的這一段也寫不進去——不重設的話,新 session 的壓縮記錄會被靜默跳過。
-        self.store_error = None
-        self.resumed_snapshot = snapshot
+        with self._session_transition():
+            # store_error 是**這個** session 的事:上一段對話寫不進去,不代表換過來
+            # 的這一段也寫不進去——不重設的話,新 session 的壓縮記錄會被靜默跳過。
+            self._switch_session(
+                snapshot.session_id, [dict(message) for message in snapshot.messages], snapshot
+            )
+
+    @contextlib.contextmanager
+    def _session_transition(self):
+        """先關預熱准入，再中止舊 job；create/adopt 失敗也一定重開准入。
+
+        準入與 history snapshot 共用 _prime_guard，封住 abort 與狀態替換間的空窗。
+        不持這把鎖等待網路或 store，也不提前替換任何 session 狀態。
+        """
+        with self._prime_guard:
+            self._session_switching += 1
+        try:
+            self.abort_prime()
+            yield
+        finally:
+            with self._prime_guard:
+                self._session_switching -= 1
+
+    def _switch_session(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        snapshot: SessionSnapshot | None,
+    ) -> None:
+        """換 session 的狀態切換,與預熱取歷史的那一步互斥。
+
+        _session_transition 在整個 create/adopt 期間關閉預熱准入；狀態與世代號
+        在同一臨界區替換，新准入只能取得完整的新歷史。
+        """
+        with self._prime_guard:
+            self._prime_epoch += 1
+            self.session_id = session_id
+            self.messages = messages
+            self.store_error = None
+            self.resumed_snapshot = snapshot
 
     def resume(self, session_id: str) -> SessionSnapshot:
         """讀 + 換,並把快照回給呼叫端(啟動時接續的畫面要重播它)。"""
@@ -794,6 +1029,288 @@ class Engine:
         payload = [{"role": "system", "content": self.system_prompt.text}]
         payload.extend(to_wire(working))
         return payload, summary
+
+    def next_turn_prefix(self) -> list[dict[str, Any]]:
+        """**下一輪**真的會送出去的那一份,少了最後那則使用者訊息。
+
+        走的是與 :meth:`payload_messages` 完全同一套轉換(heal → reasoning 剝除 →
+        prune),差別只有一個:先在尾端掛一則佔位 user 訊息,讓兩個轉換按「下一輪」
+        的邊界算,再把它拿掉。少了這則佔位訊息,算出來的是**這一輪**的邊界——
+        目前最後一則 assistant 的 reasoning 會留著、prune 少剪一筆,於是預熱送的
+        prefix 跟下一輪實際要送的不是同一串 token,prompt cache 一個字也重用不到。
+
+        因此下一次 ``send(q)`` 的 payload 恆等於 ``next_turn_prefix() + [user q]``。
+        佔位訊息**永不落檔、永不送出**(見 ``_PRIME_PLACEHOLDER_KEY``)。
+        """
+        return self._prefix_from(self.messages)
+
+    def _prefix_from(self, history: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """:meth:`next_turn_prefix` 的實作,吃一份 snapshot(預熱在鎖內取的那一份)。"""
+        working = heal_in_place(list(history))
+        working.append({"role": "user", "content": "", _PRIME_PLACEHOLDER_KEY: True})
+        if not self.options.keep_reasoning:
+            working = strip_historical_reasoning(working)
+        if self.options.prune:
+            working, _pruned = prune_old_tool_outputs(working)
+        if not working or not working[-1].get(_PRIME_PLACEHOLDER_KEY):
+            # 兩個轉換都不會重排也不會追加,所以這是不可能的。真的發生就是有人改了
+            # 轉換的形狀:寧可 fail-loud(呼叫端把它記成 error:EngineError 並跳過這次
+            # 預熱),也不要把一則內容為空的佔位 user 訊息送進模型。
+            raise EngineError("預熱 prefix 的佔位訊息不在尾端;不送出可能含佔位內容的 payload")
+        working.pop()
+        payload = [{"role": "system", "content": self.system_prompt.text}]
+        payload.extend(to_wire(working))
+        return payload
+
+    # ---- prompt cache 預熱 ---------------------------------------------
+    @property
+    def priming(self) -> bool:
+        """現在有沒有一次預熱**真的持著模型鎖在送**(給狀態列看)。"""
+        return self._priming
+
+    def prime_prompt_cache(self, *, reason: str = "") -> "PrimeOutcome":
+        """用下一輪的 prefix 送一個 ``max_tokens=1`` 的請求,把 prefill 搬到打字之前。
+
+        這是**唯一一條沒有使用者訊息就打主模型**的路徑,所以它的邊界要逐條講明:
+
+        - **零寫入**:不進 ``_begin_turn`` / ``_end_turn``、不 ``_record``、不發事件、
+          不碰 ``_cancel`` / ``_armed`` / ``_active_stream`` / ``_active_call``,也不動
+          session 檔。使用者按下的取消因此永遠落在真正的那一輪上,而不是落在一次
+          背景預熱上;``request_cancel()`` 在預熱期間照樣回「閒置」。
+        - **不 raise、不 print**:任何一步失敗都回 ``PrimeOutcome(False, reason, None)``。
+          它是背景工作,壞掉的預熱不該變成使用者看得到的錯誤;Textual 接管畫面之後
+          任何直接寫 stdout / stderr 的東西都會把畫面打花(``/slots`` 因此走
+          ``quiet=True``)。
+        - **讓路**:policy 不對就在任何 I/O 之前拒絕;模型鎖只非阻塞地取一次;取到
+          鎖之後還要確認這個對話沒有回合在跑,而且**歷史身分取自執行當下**——排程
+          當下的歷史可能已經是上一段對話了。
+        - **收得掉**:``abort_prime()``(換 session)落在 `/slots` probe、POST 等 headers、
+          串流中的任何一段，都 shutdown 專用 transport 的 socket，再放模型鎖。
+          還在 DNS/connect 的 worker 即使晚回也不能再送 HTTP bytes；不等 headers。
+        - **實送的 ``max_tokens`` 就是 gate 的保留額**(都是 ``PRIME_MAX_TOKENS``);
+          另外先用下一輪的保留額 ``options.max_output_tokens`` 試算一次:下一輪反正
+          會撞閘的話,預熱它沒有意義(這一次試算**不寫 log**,免得 telemetry 多出一
+          列從沒發生過的請求)。
+
+        ``reason``(``mount`` / ``new`` / ``session`` / ``compaction``)只是呼叫端的標記,
+        engine 刻意**不記它**——零寫入包含 telemetry 之外的一切。
+        """
+        # 以下三個判定在任何 I/O、任何鎖之前:readonly session 的「不得打模型」是
+        # 評測邊界,不能在 probe 之後才發現。
+        if not config.CLIENT_PRIME_PROMPT_CACHE:
+            return PrimeOutcome(False, "disabled", None)
+        if not self._loaded_tools:
+            return PrimeOutcome(False, "tools_not_loaded", None)
+        if self.options.policy.name != client_policy.InteractivePolicy.name:
+            # 比對的是 name 不是型別:client.json 的覆寫(OverridePolicy)沿用 base 的
+            # name,所以使用者調過權限的互動 session 仍然算互動。
+            return PrimeOutcome(False, "policy", None)
+        slot = _ModelSlot.try_lease(self.model_lock)
+        if slot is None:
+            # 非阻塞:預熱寧可不做,也不能讓一個背景工作排在使用者的問題前面。
+            return PrimeOutcome(False, "model_busy", None)
+        done = threading.Event()
+        request = llama_client.RequestCancellation()
+        abort = request.event
+        try:
+            with self._turn_state:
+                if self._in_turn > 0:
+                    return PrimeOutcome(False, "turn_in_progress", None)
+                with self._prime_guard:
+                    if self._session_switching:
+                        return PrimeOutcome(False, "aborted", None)
+                    # 登記、身分、歷史與 priming 一次完成；中止不能被稍後的 snapshot 洗掉。
+                    epoch = self._prime_epoch
+                    history = list(self.messages)
+                    self._prime_stream = None
+                    self._prime_abort = abort
+                    self._prime_done = done
+                    self._prime_request = request
+                    self._priming = True
+            try:
+                return self._prime_locked(abort, epoch, history, request)
+            except context_budget.ContextOverflowError:
+                return PrimeOutcome(False, "gate", None)
+            except Exception as exc:  # noqa: BLE001 - 背景工作的失敗不得冒到呼叫端
+                if abort.is_set() or self._prime_superseded(epoch):
+                    return PrimeOutcome(False, "aborted", None)
+                return PrimeOutcome(False, f"error:{type(exc).__name__}", None)
+        finally:
+            with self._prime_guard:
+                stream = self._prime_stream
+                self._prime_stream = None
+            # 被 abort_prime() 收掉的串流在那邊就關了(它同時把登記清成 None),
+            # 所以這裡永遠只會關到「自己還握著」的那一個:關一次,不是兩次。
+            if stream is not None:
+                _close_quietly(stream)
+            # 不能只看 event：另一個取消執行緒可能尚在 shutdown。close 等它完成，
+            # 並保證所有晚到的 connect 已永久失去送 HTTP 的資格，才可以放模型鎖。
+            request.close()
+            with self._prime_guard:
+                slot.release()
+                if self._prime_done is done:
+                    self._priming = False
+                    self._prime_done = None
+                    self._prime_abort = None
+                    self._prime_request = None
+                done.set()
+
+    def _prime_superseded(self, epoch: int) -> bool:
+        """這次預熱取歷史之後,有沒有人(``abort_prime()`` / 換 session)宣告它作廢。"""
+        with self._prime_guard:
+            return self._prime_epoch != epoch
+
+    def _prime_locked(
+        self, abort: threading.Event, epoch: int,
+        history: list[dict[str, Any]], request: llama_client.RequestCancellation,
+    ) -> "PrimeOutcome":
+        """:meth:`prime_prompt_cache` 持著模型鎖的那一段(例外由呼叫端翻成 reason)。
+
+        每個會阻塞的 I/O 都可以被 ``abort`` 打斷、每個邊界都比一次世代號:中止落在哪一段,
+        預熱就在那一段之後的第一個邊界回 ``aborted``,而且**不再發 POST**。
+        """
+        if abort.is_set() or self._prime_superseded(epoch):
+            return PrimeOutcome(False, "aborted", None)
+
+        probe = _Abandonable(
+            lambda: llama_client.get_slots(
+                self.options.base_url, timeout=PRIME_SLOTS_TIMEOUT, quiet=True, cancel=request
+            ),
+            "codetrail-prime-probe",
+            abort=abort,
+        )
+        if not probe.wait(abort):
+            # 專用 transport 由 finally shutdown，未完成的 probe 不會接著發 POST。
+            return PrimeOutcome(False, "aborted", None)
+        slots = probe.result()
+        if isinstance(slots, list) and slots and all(_slot_is_busy(slot_) for slot_ in slots):
+            # server 是多 slot 的:只有**每個** slot 都在忙才算滿。有一個閒著就照送
+            # (server 會依最長共同前綴挑 slot);讀不到 `/slots` 視為未知,也照送。
+            return PrimeOutcome(False, "server_busy", None)
+        if self._prime_superseded(epoch):
+            # 中止落在 probe 回來之後:什麼都還沒送,也不送。
+            return PrimeOutcome(False, "aborted", None)
+
+        payload = self._prefix_from(history)
+        next_turn = context_budget.build_usage(
+            source=PRIME_SOURCE,
+            requested_num_ctx=self.options.n_ctx,
+            messages=payload,
+            tools=self._openai_tools,
+            model=self.options.model,
+            reserved_output_tokens=self.options.max_output_tokens,
+        )
+        if next_turn.hard_overflow:
+            # 適用性檢查,不是這一次請求的閘:build_usage 不寫 log,telemetry 不會多
+            # 出一列從來沒送出去的請求。
+            return PrimeOutcome(False, "next_turn_would_overflow", None)
+
+        usage = context_budget.check_and_log(
+            source=PRIME_SOURCE,
+            requested_num_ctx=self.options.n_ctx,
+            messages=payload,
+            tools=self._openai_tools,
+            model=self.options.model,
+            # 保留額 == 下面實送的 max_tokens。同一個數字才是同一個閘。
+            reserved_output_tokens=PRIME_MAX_TOKENS,
+            emit=False,
+        )
+        if self._prime_superseded(epoch):
+            # 中止落在 gate 之後、POST 之前:什麼都還沒送,也不送。
+            return PrimeOutcome(False, "aborted", None)
+        post = _Abandonable(
+            lambda: llama_client.chat_completions(
+                base_url=self.options.base_url,
+                messages=payload,
+                model=self.options.model,
+                temperature=self.options.temperature,
+                top_p=config.CHAT_TOP_P,
+                top_k=config.CHAT_TOP_K,
+                min_p=config.CHAT_MIN_P,
+                tools=self._openai_tools,
+                tool_choice="auto",
+                stream=True,
+                extra={"max_tokens": PRIME_MAX_TOKENS},
+                timeout=self.options.request_timeout,
+                cancel=request,
+            ),
+            "codetrail-prime-http",
+            abort=abort,
+        )
+        if not post.wait(abort):
+            # RequestCancellation 已有 headers 前的 socket。先 shutdown 才能放鎖；
+            # 背景只收晚回資源，不再持有模型租約，也不能補發 HTTP。
+            request.cancel()
+            post.settle(_close_quietly)
+            return PrimeOutcome(False, "aborted", None)
+        stream = post.result()
+        with self._prime_guard:
+            superseded = abort.is_set() or self._prime_epoch != epoch
+            if not superseded:
+                self._prime_stream = stream
+        if superseded:
+            # abort_prime() 落在「請求回來、還沒登記」之間:當時沒有 socket 可關,
+            # 這裡自己關掉,不留一個沒人收的串流。
+            _close_quietly(stream)
+            return PrimeOutcome(False, "aborted", None)
+
+        finished = False
+        try:
+            for chunk in stream:
+                if abort.is_set() or self._prime_superseded(epoch):
+                    return PrimeOutcome(False, "aborted", None)
+                context_budget.parse_usage_from_stream_chunk(chunk, usage)
+                if _prime_chunk_is_final(chunk):
+                    finished = True
+        except Exception:  # noqa: BLE001
+            # 被關掉的 socket 也可能以 I/O 例外現身:先看世代號,那是中止不是故障。
+            if not self._prime_superseded(epoch):
+                raise
+            return PrimeOutcome(False, "aborted", None)
+        if self._prime_superseded(epoch):
+            # socket 被關掉之後看到的通常是 clean EOF(不是例外):那是中止,不是完成,
+            # 而且**不寫 log** —— 一列半途而廢的請求會讓 T0 的判讀多出假的冷 prefix。
+            return PrimeOutcome(False, "aborted", None)
+        if not finished:
+            # HTTP 200 但只有 keep-alive、或送了幾個 delta 就正常關線:OpenAIStream 對這種
+            # EOF 不丟例外。沒有終結 chunk 就不是「正常結束」,記成 sent 會生出一列
+            # prompt_tokens_processed 為空的假成功。
+            return PrimeOutcome(False, "incomplete", None)
+        if usage.prompt_tokens_processed is None:
+            # 有終結 chunk 卻沒有 timings.prompt_n:量不到「重算了多少」。usage.prompt_tokens
+            # 是 prompt 多長(cache 命中的也算),不能代填。
+            return PrimeOutcome(False, "no_timings", None)
+        with self._prime_guard:
+            if abort.is_set() or self._prime_epoch != epoch:
+                return PrimeOutcome(False, "aborted", None)
+            context_budget.log_metrics(usage)
+            return PrimeOutcome(True, "", usage.prompt_tokens_processed)
+
+    def abort_prime(self, *, wait: float = PRIME_ABORT_WAIT) -> bool:
+        """收掉進行中的預熱,回「它是不是已經結束」。沒有預熱時是 no-op(回 True)。
+
+        世代號與 Event 在同一臨界區作廢；關已登記串流，並 shutdown headers 前就
+        登記的 transport socket。遲到的 connect 在任何 HTTP bytes 之前被拒絕。
+        然後等上限 wait 秒；done 代表 priming=False、所有舊 HTTP 已關、模型鎖已放。
+        取消不碰正常回合的 _cancel / _armed。
+        """
+        with self._prime_guard:
+            self._prime_epoch += 1
+            abort = self._prime_abort
+            if abort is not None:
+                abort.set()
+            request = self._prime_request
+            stream = self._prime_stream
+            # 清掉登記:關這個串流的責任在這裡,預熱那邊的 finally 就不會再關一次。
+            self._prime_stream = None
+            done = self._prime_done
+        if stream is not None:
+            _close_quietly(stream)
+        if request is not None:
+            request.cancel()
+        if done is None:
+            return True
+        return done.wait(max(0.0, wait))
 
     # ---- one turn ------------------------------------------------------
     def send(

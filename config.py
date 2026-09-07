@@ -415,6 +415,14 @@ if not 0 < CLIENT_MAX_OUTPUT_TOKENS <= CLIENT_MAX_OUTPUT_TOKENS_CAP:  # pragma: 
         f"得到 {CLIENT_MAX_OUTPUT_TOKENS}。它同時是實送的 max_tokens、context gate 的"
         "保留額與壓縮門檻的 max_output;超出這個範圍時三者不再是同一個數字。"
     )
+
+# TUI 就緒 / `/new` / 換 session / 壓縮成功之後,用「下一輪真的會送的 prefix」送一個
+# max_tokens=1 的請求,把可避免的 prefill 搬到使用者打字之前。**只有互動 TUI 會走這條**:
+# headless `run` 沒有呼叫點,readonly session 在任何 I/O 之前就被 client_engine 拒絕。
+# 它縮短不了 reasoning 與硬體 prefill 的成本,只是把「下一輪 prefix」的那一段提前算。
+# 是 repo 常數而不是 client.json 的鍵:所有使用者一致;要關就是改這裡(見
+# `docs/troubleshooting.md` 的判讀方式)。
+CLIENT_PRIME_PROMPT_CACHE = True
 CTX_SOFT_THRESHOLD = 0.80
 CTX_HARD_THRESHOLD = 0.90
 # context gate **沒有關閉開關,連常數都沒有**。每個逃生口都是一個要查文件才知道

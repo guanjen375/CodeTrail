@@ -39,3 +39,9 @@
 root 最後詢問「是否依 Fable 最終建議，只補測這 447 條，並合併既有結果驗收？」並明示這會將原本一次 full 改為兩段結果。使用者最新回覆「好」，已批准此安排；不再等待前一個補跑問題。授權範圍為同一產品 digest 上的剩餘 447 個 node、以前景執行，與既有 3121 個完整通過 node 合併，並非重跑整包或批准產品 commit／push。
 
 root 讀保存的 node 清單發現 R3 報告 §8.6 所列八個整檔也含已完成 shard 的 node（`test_code_rag_search.py`、`test_mcp_ingest.py`、`test_repo_consistency.py` 分跨 shard）；直接跑整檔超出 447 條範圍。交 Fable 改用保存的精確 447 個 node 清單，這不改補測範圍、產品或原驗收。執行交接見 `08-test-recovery.md`。
+
+## 使用者批准產品提交並直接推送 main
+
+使用者明示「好你push到main 然後不開PR」，授權將已驗收產品及交接紀錄 commit，直接 push 到 `origin/main`，不開 PR；取代前述尚未獲准產品 commit／push 的歷史限制。root 在 fetch 後確認遠端 `main` 仍為原始 base `f200f697ba54d38a102e8ef66dead652c4002e5f`，本地既有 17 個未推送提交僅包含本次交接文件，可正常快轉推送。
+
+發布前 cached 與 worktree 產品 digest 都是 `61fda568fce324d31691892f51a01aa7f17831e4e2c3815d2c0e16868dac9b4a`，與 Fable R3 靜態審核及合併 3568 條通過的測試內容一致；本次發布零產品／測試修改，不重跑已通過的測試。root 已在 push 前告知沒有新增擱置、原案擱置項目維持，以及 T0 實機首字延遲改善仍未量測。推送採正常 `HEAD:main`，不 force；提交後核對產品 digest，推送後核對遠端 HEAD。

@@ -63,6 +63,12 @@ class ContextUsage:
     actual_eval_count: int | None = None
     prompt_tokens_per_second: float | None = None
     output_tokens_per_second: float | None = None
+    #: llama-server **這一次真的評估**的 prompt token 數(`timings.prompt_n`)。
+    #: 與 `actual_prompt_eval_count` 語意不同,不可互相代用:後者是「這個 prompt
+    #: 有多長」(OpenAI 的 `usage.prompt_tokens` 會把 KV cache 命中的部分照算),
+    #: 這一個是「有多少要重算」。冷 / 熱 prompt cache 只能由這一欄判讀 —— 只看
+    #: 前者的話,一個完全命中 cache 的請求跟一個全量重算的請求數字一模一樣。
+    prompt_tokens_processed: int | None = None
     #: 保留額是呼叫端明講的(客戶端 request),還是退回內部預設。
     #: 只影響 overflow 訊息要指哪一個 env,不進 JSONL 之外的任何判斷。
     reserve_is_explicit: bool = False
@@ -407,6 +413,12 @@ def parse_usage_from_response(data: dict, usage: ContextUsage) -> None:
             usage.actual_prompt_eval_count = int(timings["prompt_n"])
         if ec is None and isinstance(timings.get("predicted_n"), (int, float)):
             usage.actual_eval_count = int(timings["predicted_n"])
+        # `prompt_n` 是**真的被評估**的那幾個 token,永遠照收 —— 不看 pec 有沒有值。
+        # 兩者同時出現時它們本來就不是同一個數字(`usage.prompt_tokens` 20000 +
+        # `timings.prompt_n` 7 = 幾乎整份 prefix 都命中 cache),把它讓給 pec 的話,
+        # 「預熱到底有沒有被重用」就再也量不到。
+        if isinstance(timings.get("prompt_n"), (int, float)):
+            usage.prompt_tokens_processed = int(timings["prompt_n"])
         if isinstance(timings.get("prompt_per_second"), (int, float)):
             usage.prompt_tokens_per_second = float(timings["prompt_per_second"])
         if isinstance(timings.get("predicted_per_second"), (int, float)):

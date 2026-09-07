@@ -12,9 +12,11 @@
   —— 殼層裡殘留的 `AICODE_*`(兩份安裝共用一台機器時另一份的 `~/start.sh`
   會 export 它們)對這一次啟動一律無效。這是跨 branch「混用」的真正機制:
   兩個世代的 `config.py` 讀同一批名稱。
-* preflight 的輸出同時進畫面**與** transcript(TUI 一接管就清屏),而且
+* preflight 的輸出同時進畫面**與** transcript(`lines` 是逐字的完整記錄),而且
   stderr 也要收 —— canary 的 WARNING 只走 stderr。
-* 壓縮狀態行必須在 transcript 裡:「這個 session 的自動壓縮已被停用」是使用者
+* 通過之後 TUI 只拿 `banner_lines()`:一行摘要 + 壓縮狀態行 + 警告。進度 LOG
+  不重播(它已經在 TUI 之前的終端上),但也不得因此弄丟警告。
+* 壓縮狀態行必須在 banner 裡:「這個 session 的自動壓縮已被停用」是使用者
   唯一會看到的地方。
 
 ctx 容量閘與主模型解析各自的行為由 `tests/test_deployment.py` 守;lessons
@@ -284,6 +286,193 @@ def test_the_transcript_carries_the_compaction_status(monkeypatch, tmp_path):
     monkeypatch.setattr(client_status, "status_lines", boom)
     result = client_preflight.Preflight(root=tmp_path)
     client_preflight.compaction_status(result)  # fail-open:不得丟例外
+
+
+def test_the_banner_keeps_stderr_warnings_and_compaction_status_but_drops_the_progress_log(
+    monkeypatch, tmp_path
+):
+    """通過之後進 TUI 的那一屏:摘要 + 壓縮狀態 + 警告,而且**只有**這些。
+
+    兩個方向都會無聲出事:多了(整段進度 LOG 重播,使用者每次開 aicode 都先捲
+    十幾行自己剛看過的成功訊息,真正的警告混在裡面);少了(canary 只走 stderr
+    的 WARNING、「n_ctx 是猜的」、「ctx 閘這次沒驗」、「lessons 已過期不再注入」
+    消失,而那些正是「這次啟動有什麼不對勁」的全部證據)。
+
+    `lines` 是另一件事:它仍然是逐字的完整 transcript,診斷用。
+    """
+    import sys
+    import types
+
+    import client_status
+    import gpu_safety
+    import lessons
+
+    _write_deployment(
+        tmp_path,
+        model="/models/x.gguf",
+        ctx=4096,
+        port=65535,
+        base_url="http://127.0.0.1:65535",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / "project"
+    root.mkdir()
+
+    # server 讀不到 → n_ctx 退回設定值(keep);容量閘因此驗不了(keep)。
+    monkeypatch.setattr(gpu_safety, "query_server_info", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        gpu_safety,
+        "check_safety",
+        lambda *_a, **_k: types.SimpleNamespace(
+            status="UNKNOWN", reason="server 沒回答", server_n_ctx=0, detail_lines=[]
+        ),
+    )
+    # lessons 的行為由 tests/test_lessons.py 守;這裡只要那兩則訊息。
+    monkeypatch.setattr(lessons, "active_lessons", lambda *_a, **_k: [])
+    monkeypatch.setattr(lessons, "expired_lessons", lambda *_a, **_k: [{"id": 7}, {"id": 9}])
+    hint = (
+        "⚠ 升級前啟動的網頁 backend 還在跑(tmux session codetrail-web);"
+        "網頁前端已移除,它不會自己停。\n"
+        "  停掉它:tmux kill-session -t codetrail-web\n"
+        '  舊 symlink 一併移除:rm -f "$HOME/.local/bin/aicode_web"'
+    )
+    monkeypatch.setattr(client_preflight, "legacy_web_backend_hint", lambda: hint)
+
+    def fake_required(result):
+        result.note("[model-preflight] PASS embedding http://127.0.0.1:65534")
+
+    def fake_tool_health(result, profile):
+        # canary 的真實形狀:PASS / 心跳 / 診斷走 stdout,WARNING 只走 stderr。
+        print("MCP PASS — 18 tools", flush=True)
+        print("[tool-health] 還在等 live model probe(15 秒)", flush=True)
+        print("MODEL PASS — cached", flush=True)
+        print("IMPLICIT list_dir — optimal", flush=True)
+        print("[tool-health] WARNING — implicit 診斷降級", file=sys.stderr, flush=True)
+        print("[tool-health] WARNING — 快取寫入失敗", file=sys.stderr, flush=True)
+
+    monkeypatch.setattr(client_preflight, "check_required_servers", fake_required)
+    monkeypatch.setattr(client_preflight, "check_tool_health", fake_tool_health)
+
+    result = client_preflight.run(root)
+    banner = result.banner_lines(tools=18, permission="interactive", compaction="manual")
+
+    assert banner[0] == (
+        "自檢通過:model=/models/x.gguf n_ctx=4096 tools=18 "
+        "permission=interactive compaction=manual"
+    )
+    # A4:壓縮狀態行**全部**進去,順序不變(挑行等於在兩個檔之間維護同一份清單)。
+    assert result.status == client_status.status_lines(n_ctx=4096)
+    assert banner[1 : 1 + len(result.status)] == tuple(result.status)
+    assert any("壓縮模式" in line for line in result.status)
+
+    # A3:通過之後還要看得到的那些。
+    for warning in (
+        "[tool-health] WARNING — implicit 診斷降級",
+        "[tool-health] WARNING — 快取寫入失敗",
+        "n_ctx=4096(來自 deployment profile;server 尚無法觀測)",
+        "ctx safety=UNKNOWN(server 沒回答);放行",
+        hint,
+    ):
+        assert warning in banner, warning
+    # 多行訊息是**一則**:第二行是處置說明,拆開就變成兩則孤兒。
+    expired = [line for line in banner if "已過 review_by" in line]
+    assert len(expired) == 1 and expired[0].endswith(
+        "  複審:python3 lessons.py renew <id> / delete <id>"
+    ), expired
+    # 順序 = 實際發生順序:n_ctx 在 ctx safety 之前,stderr 的兩則在最後。
+    order = [banner.index(x) for x in (
+        "n_ctx=4096(來自 deployment profile;server 尚無法觀測)",
+        "ctx safety=UNKNOWN(server 沒回答);放行",
+        expired[0],
+        hint,
+        "[tool-health] WARNING — implicit 診斷降級",
+        "[tool-health] WARNING — 快取寫入失敗",
+    )]
+    assert order == sorted(order), banner
+
+    # A2:進度不重播。`[aicode]` 前綴是進度行的標記,一個都不該出現。
+    assert not [line for line in banner if line.startswith("[aicode]")], banner
+    # 逐項:成功的每一步(root / profile / 模型 / lessons / 附屬 server / canary 的
+    # PASS 與心跳)只進 transcript。`n_ctx=` 不在這張表裡 —— 退回設定值那一則是
+    # 警告,而觀測得到的那一則由下面的 `quiet` 一起驗。
+    assert not [
+        line
+        for line in banner
+        if line.startswith(
+            (
+                "root=",
+                "deployment profile=",
+                "model=",
+                "lessons:",
+                "[model-preflight]",
+                "MCP PASS",
+                "MODEL PASS",
+                "IMPLICIT ",
+                "[tool-health] 還在等",
+            )
+        )
+    ], banner
+
+    # transcript 仍然是完整的一份,而且警告只印一次(不因為要留一份就重印)。
+    joined = "\n".join(result.lines)
+    assert "MODEL PASS — cached" in joined and f"[aicode] root={root}" in joined
+    assert result.lines.count("[aicode] [tool-health] WARNING — implicit 診斷降級") == 0
+    assert result.lines.count("[tool-health] WARNING — implicit 診斷降級") == 1
+    assert joined.count("已過 review_by") == 1
+
+    # 同一個檢查點的另一邊:驗得過(SAFE)、觀測得到(來自主 server)就不必每次
+    # 啟動都佔一行 —— 它們只進 transcript。
+    profile = client_preflight.check_deployment_profile(
+        client_preflight.Preflight(root=root)
+    )
+    quiet = client_preflight.Preflight(root=root)
+    monkeypatch.setattr(
+        gpu_safety, "query_server_info", lambda *_a, **_k: types.SimpleNamespace(n_ctx=4096)
+    )
+    monkeypatch.setattr(
+        gpu_safety,
+        "check_safety",
+        lambda *_a, **_k: types.SimpleNamespace(
+            status="SAFE", reason="", server_n_ctx=4096, detail_lines=[]
+        ),
+    )
+    client_preflight.observe_n_ctx(quiet, profile)
+    client_preflight.check_ctx_safety(quiet, profile, 4096)
+    assert quiet.warnings == []
+
+    # 第五個 keep 點:清不掉舊的 render 檔(只有「不注入」那條路會走到)。
+    def cannot_remove(*_args, **_kwargs):
+        raise OSError("唯讀")
+
+    monkeypatch.setattr(lessons, "remove_context_file", cannot_remove)
+    dropped = client_preflight.Preflight(root=root)
+    client_preflight.render_lessons(dropped, skip=True)
+    assert dropped.warnings == ["⚠ 無法移除舊的 .codetrail/lessons.md:唯讀"]
+
+
+def test_keep_does_not_change_what_note_prints(tmp_path, capsys):
+    """`keep=True` 只決定「要不要再留一份」,不改印出來的字。
+
+    分類做在產生訊息的地方,最容易長歪的方向是「順手加個前綴」或「再印一次」——
+    那會讓終端上的那一段跟以前不一樣,而 transcript 是逐字的診斷素材:同一則
+    警告出現兩次,讀的人會以為它真的發生了兩次。
+    """
+    plain = client_preflight.Preflight(root=tmp_path)
+    plain.note("x")
+    without_keep = capsys.readouterr().out
+
+    kept = client_preflight.Preflight(root=tmp_path)
+    kept.note("x", keep=True)
+    with_keep = capsys.readouterr().out
+
+    assert without_keep == with_keep == "[aicode] x\n"
+    assert plain.warnings == [] and plain.status == []
+    assert kept.warnings == ["x"]
+
+    multi = client_preflight.Preflight(root=tmp_path)
+    multi.note("⚠ a\n  b", keep=True)
+    assert capsys.readouterr().out == "[aicode] ⚠ a\n  b\n"
+    assert multi.warnings == ["⚠ a\n  b"]
 
 
 def test_every_profile_env_helper_has_the_same_home_only_shape(monkeypatch, tmp_path):

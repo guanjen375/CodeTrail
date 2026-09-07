@@ -7,9 +7,12 @@ AGENTS.md §2 的新安全檢查點集中在這裡:
     寫死名單);互動模式的七個 ask 工具沒核准就不得執行。
   - 只有工具結果的 text block 進模型;structuredContent 只給 UI / eval。
   - ingest marker 只認 ingest_document 的結果、只認行首。
+  - prompt cache 預熱是唯一一條沒有使用者訊息就打主模型的路徑:送的是下一輪的
+    prefix、零寫入、非互動 policy 在任何 I/O 之前就拒絕、保留額 == 實送的 max_tokens。
 """
 from __future__ import annotations
 
+import copy
 import json
 import socket
 import sys
@@ -2009,3 +2012,1055 @@ def test_fallback_tool_call_ids_are_unique_across_steps():
     first = client_engine._finalise_tool_calls({0: {"name": "list_dir", "arguments": "{}"}})  # noqa: SLF001
     second = client_engine._finalise_tool_calls({0: {"name": "read_file", "arguments": "{}"}})  # noqa: SLF001
     assert first[0]["id"] != second[0]["id"]
+
+
+# ============================================================
+# prompt cache 預熱(prime_prompt_cache):唯一一條沒有使用者訊息就打主模型的路徑
+# ============================================================
+# 這一區守的是「新增一條打模型的路徑」帶進來的四個無聲失敗:
+#   1. 送的不是下一輪的 prefix → prompt cache 一個字也重用不到,而且完全看不出來。
+#   2. 它其實寫了東西(session 檔 / 取消旗標 / 事件)→ 使用者的取消落在背景工作上。
+#   3. readonly session 被它打了模型 → 評測邊界破掉,replay 前後的現場不再相同。
+#   4. gate 的保留額與實送的 max_tokens 不是同一個數字 → 閘等於沒有對齊。
+
+
+class _CountingStore(client_store.EphemeralSessionStore):
+    """會逐筆記下 append 的 session store:預熱的「零寫入」只能用計數證明。"""
+
+    def __init__(self, root):
+        super().__init__(root)
+        self.appended: list[dict] = []
+
+    def append(self, session_id, record):
+        self.appended.append(dict(record))
+        return super().append(session_id, record)
+
+
+class _HeldStream:
+    """每個 chunk 都要等 ``release`` 才給的串流(模擬還在 prefill 的請求)。"""
+
+    def __init__(self, release, chunks=()):
+        self.release = release
+        self._chunks = list(chunks)
+        self.closed_from: list[str] = []
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.release.wait(5)
+        if not self._chunks:
+            raise StopIteration
+        return self._chunks.pop(0)
+
+    def close(self):
+        self.closed_from.append(threading.current_thread().name)
+        self.release.set()
+
+
+def _prime_final_chunk(prompt_n=7, predicted_n=1):
+    """預熱的最後一個 chunk:max_tokens=1 ⇒ finish_reason=length,而且只帶 timings。"""
+    return {
+        "choices": [{"delta": {"content": "x"}, "finish_reason": "length"}],
+        "timings": {"prompt_n": prompt_n, "predicted_n": predicted_n},
+    }
+
+
+def _no_probe(*_args, **_kwargs):
+    raise AssertionError("這一步不該走到 /slots probe")
+
+
+def _no_request(**_kwargs):
+    raise AssertionError("這一步不該打模型")
+
+
+def _wire_call(call_id, name):
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}
+
+
+def _synthetic_history():
+    """同時踩到三個轉換的歷史:三個 user 回合、兩筆各 30k tokens 的工具輸出,
+    最後一則 assistant 帶 reasoning **而且**有一個懸空的 tool_call。
+
+    兩筆工具輸出的大小是刻意挑的:以「這一輪」的邊界算,兩筆都在保護範圍內
+    (prune 一筆都不剪);多了下一則使用者訊息之後,第一筆才會跨過門檻被剪掉。
+    預熱送錯邊界的話,這條歷史會讓兩份 payload 差一筆 30k tokens 的工具輸出。
+    """
+    big = "x" * int(30_000 * config.CHARS_PER_TOKEN)
+    return [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": None, "tool_calls": [_wire_call("c1", "read_file")]},
+        {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": big},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": None, "tool_calls": [_wire_call("c2", "grep_code")]},
+        {"role": "tool", "tool_call_id": "c2", "name": "grep_code", "content": big},
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "q3"},
+        # 懸空:宣告了 c3 卻沒有結果(上一輪被中斷)。
+        {
+            "role": "assistant",
+            "content": "a3",
+            "reasoning_content": "上一輪的 thinking",
+            "tool_calls": [_wire_call("c3", "list_dir")],
+        },
+    ]
+
+
+@pytest.mark.smoke
+def test_priming_sends_the_prefix_the_next_turn_will_send_and_records_nothing(
+    engine_factory, monkeypatch, tmp_path, capsys
+):
+    """預熱送的必須**逐字**是下一輪真的會送的那一份,而且什麼都不寫。
+
+    判準不是「同一個函式自己跟自己比」——那樣改壞轉換時兩邊會一起錯:先預熱、
+    再真的 `send("q4")`,拿**實際送出去的 payload** 來比。差一則 reasoning 或
+    差一筆被剪掉的工具輸出,prefix 就從那個 token 起全部對不上,prompt cache
+    一個字也重用不到,而且畫面上完全看不出來。
+    """
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    store = _CountingStore(engine_factory.root)
+    engine = engine_factory(store=store)
+    engine.messages = _synthetic_history()
+    before = copy.deepcopy(engine.messages)
+
+    sent: list[dict] = []
+
+    def _chat(**kwargs):
+        sent.append(kwargs)
+        if len(sent) == 1:
+            return iter([_prime_final_chunk(prompt_n=7)])
+        return iter([_text_chunk("answer", finish="stop")])
+
+    monkeypatch.setattr(llama_client, "chat_completions", _chat)
+
+    # 關掉開關 = 連 HTTP 都不該發生(這一條在任何 I/O 之前)。
+    monkeypatch.setattr(config, "CLIENT_PRIME_PROMPT_CACHE", False)
+    assert engine.prime_prompt_cache(reason="mount") == client_engine.PrimeOutcome(
+        False, "disabled", None
+    )
+    assert sent == []
+    monkeypatch.setattr(config, "CLIENT_PRIME_PROMPT_CACHE", True)
+
+    appends_before = len(store.appended)
+    outcome = engine.prime_prompt_cache(reason="mount")
+    assert outcome.sent is True and outcome.reason == ""
+    assert outcome.processed_tokens == 7          # 只來自 timings.prompt_n
+
+    prime = sent[0]
+    assert prime["stream"] is True
+    assert prime["extra"] == {"max_tokens": client_engine.PRIME_MAX_TOKENS} == {"max_tokens": 1}
+    assert prime["tools"] == engine.openai_tools() and prime["tool_choice"] == "auto"
+
+    # 零寫入:歷史逐字不變、session 檔一筆都沒多、畫面事件一個都沒有(沒有 on_event 可傳)。
+    assert engine.messages == before
+    assert len(store.appended) == appends_before
+    assert engine.priming is False
+    assert capsys.readouterr() == ("", "")
+
+    # 邊界真的是「下一輪」:這一輪的 payload 還留著第一筆工具輸出、也還留著最後一則
+    # assistant 的 reasoning;prefix 兩樣都已經照下一輪的規則處理掉了。
+    this_turn, _summary = engine.payload_messages()
+    assert this_turn[3]["content"] == before[2]["content"]
+    assert "reasoning_content" in this_turn[10]
+    assert prime["messages"][3]["content"] == client_engine.PRUNE_PLACEHOLDER
+    assert "reasoning_content" not in prime["messages"][10]     # 最後一則 assistant
+    assert prime["messages"][11]["tool_call_id"] == "c3"        # 懸空呼叫已補上結果
+    assert not any(
+        client_engine._PRIME_PLACEHOLDER_KEY in message for message in prime["messages"]
+    )
+
+    # 真的送下一題:payload 必須是 prefix + 那一則 user,一個 token 都不差。
+    result = engine.send("q4", on_event=lambda _e: None)
+    assert result.finish == client_events.REASON_STOP
+    turn = sent[1]
+    assert turn["messages"][:-1] == prime["messages"]
+    assert turn["messages"][-1] == {"role": "user", "content": "q4"}
+    for key in ("model", "temperature", "top_p", "top_k", "min_p", "tools", "tool_choice"):
+        assert prime[key] == turn[key], key
+
+    # telemetry:`prime` 自成一列,保留額就是實送的 max_tokens。
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    primed = [row for row in rows if row["source"] == client_engine.PRIME_SOURCE]
+    assert len(primed) == 1
+    assert primed[0]["reserved_output_tokens"] == 1
+    assert primed[0]["prompt_tokens_processed"] == 7
+
+
+@pytest.mark.smoke
+def test_priming_refuses_a_readonly_engine_before_any_probe_or_request(
+    engine_factory, monkeypatch, capsys
+):
+    """readonly session(canary / eval / replay)一律不得預熱,而且是在**任何 I/O 之前**。
+
+    那條邊界的意思是「這個 session 不會改變現場、也不會多打模型」;在 probe 之後
+    才發現就已經晚了 —— `/slots` 也是一次對 server 的請求。
+    """
+    store = _CountingStore(engine_factory.root)
+    engine = engine_factory(policy=client_policy.ReadOnlyPolicy(), store=store)
+    monkeypatch.setattr(llama_client, "get_slots", _no_probe)
+    monkeypatch.setattr(llama_client, "chat_completions", _no_request)
+
+    assert engine.prime_prompt_cache(reason="mount") == client_engine.PrimeOutcome(
+        False, "policy", None
+    )
+    assert store.appended == []
+    assert engine.priming is False
+    assert engine.model_lock.acquire(timeout=0.5) is True
+    engine.model_lock.release()
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.smoke
+def test_priming_yields_to_a_turn_that_already_began_and_never_reads_its_history(
+    engine_factory, monkeypatch, tmp_path, capsys
+):
+    """回合已經開始就讓路——**模型鎖是空的也一樣**。
+
+    `send()` 從寫 user 訊息就算「進行中」,那段期間模型鎖還沒被取。只看鎖的話,
+    預熱會在這個空窗擠進去,而且它 snapshot 到的歷史還沒有那則新問題:使用者
+    的第一題於是排在一份**錯的** prefix 後面。
+    """
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    blocked = threading.Event()
+    reached = threading.Event()
+
+    class _SlowStore(client_store.EphemeralSessionStore):
+        def append(self, session_id, record):
+            if record.get("role") == "user":
+                reached.set()
+                blocked.wait(5)
+            return super().append(session_id, record)
+
+    engine = engine_factory(store=_SlowStore(engine_factory.root))
+    monkeypatch.setattr(llama_client, "get_slots", _no_probe)
+    sent: list[dict] = []
+    holding = threading.Event()
+    release = threading.Event()
+
+    def _chat(**kwargs):
+        sent.append(kwargs)
+        if len(sent) == 2:
+            holding.set()
+            release.wait(5)
+        return iter([_text_chunk("answer", finish="stop")])
+
+    monkeypatch.setattr(llama_client, "chat_completions", _chat)
+    worker = threading.Thread(target=lambda: engine.send("q", on_event=lambda _e: None))
+    worker.start()
+    assert reached.wait(5)                       # 卡在寫 user 訊息,鎖還沒取
+    assert engine.prime_prompt_cache(reason="mount") == client_engine.PrimeOutcome(
+        False, "turn_in_progress", None
+    )
+    assert sent == []                            # 零 HTTP:連 /slots 都沒走到
+    assert engine.model_lock.acquire(timeout=0.5) is True   # 鎖已經放回去
+    engine.model_lock.release()
+    blocked.set()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert sent[0]["messages"][-1] == {"role": "user", "content": "q"}
+
+    # 另一半:回合已經**持著**模型鎖時,非阻塞取鎖失敗就退開(不排隊)。
+    second = threading.Thread(target=lambda: engine.send("q2", on_event=lambda _e: None))
+    second.start()
+    assert holding.wait(5)
+    assert engine.prime_prompt_cache() == client_engine.PrimeOutcome(False, "model_busy", None)
+    release.set()
+    second.join(5)
+    assert not second.is_alive()
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.smoke
+def test_a_turn_submitted_during_priming_waits_for_the_lock_and_gets_the_primed_prefix(
+    engine_factory, monkeypatch, tmp_path
+):
+    """使用者在預熱進行中送出:那一輪在模型鎖上等,**不得**與預熱重疊。
+
+    llama-server 單 slot 的序列化就在這把鎖上;重疊等於兩個請求同時排隊,而且
+    使用者那一份可能先跑完、把預熱好的 slot 換掉。等到之後,它拿到的 payload
+    必須就是 prefix + 那一則新問題。
+    """
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    engine = engine_factory()
+    engine.messages = _synthetic_history()
+    release = threading.Event()
+    held = _HeldStream(release, [_prime_final_chunk()])
+    calls: list[dict] = []
+
+    def _chat(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return held
+        return iter([_text_chunk("answer", finish="stop")])
+
+    monkeypatch.setattr(llama_client, "chat_completions", _chat)
+    outcome: dict = {}
+    primer = threading.Thread(
+        target=lambda: outcome.setdefault("prime", engine.prime_prompt_cache(reason="mount"))
+    )
+    primer.start()
+    for _ in range(200):
+        if calls:
+            break
+        time.sleep(0.01)
+    assert len(calls) == 1                       # 預熱已送出,而且還握著鎖
+
+    sender = threading.Thread(
+        target=lambda: outcome.setdefault("turn", engine.send("q", on_event=lambda _e: None))
+    )
+    sender.start()
+    time.sleep(0.3)
+    assert len(calls) == 1 and sender.is_alive()  # 使用者那一輪的請求還沒發出去
+
+    release.set()
+    primer.join(5)
+    sender.join(5)
+    assert not primer.is_alive() and not sender.is_alive()
+    assert outcome["prime"].sent is True
+    assert len(calls) == 2
+    assert calls[1]["messages"][:-1] == calls[0]["messages"]
+    assert calls[1]["messages"][-1] == {"role": "user", "content": "q"}
+
+
+@pytest.mark.smoke
+def test_a_session_switch_aborts_an_in_flight_prime_and_frees_the_lock(
+    engine_factory, monkeypatch, tmp_path
+):
+    """換 session 要把進行中的預熱收掉:它送的是**上一段對話**的 prefix,而且租著模型鎖。
+
+    不收的話,使用者在新對話問的第一題要排在一個已經沒有用處的請求後面 —— 症狀
+    是「剛換過去就卡住」,而畫面上沒有任何東西在跑。收掉的那一份不寫 telemetry:
+    一列半途而廢的請求會讓冷 / 熱的判讀多出假資料。
+    """
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    engine = engine_factory()
+
+    for switch in ("new_session", "adopt"):
+        stream = _BlockingStream()
+        monkeypatch.setattr(llama_client, "chat_completions", lambda **_kw: stream)
+        outcome: dict = {}
+        primer = threading.Thread(
+            target=lambda: outcome.setdefault("r", engine.prime_prompt_cache(reason=switch))
+        )
+        primer.start()
+        for _ in range(200):
+            if not stream._first:                # 已經在讀第二個 chunk
+                break
+            time.sleep(0.01)
+        time.sleep(0.05)
+        assert engine.priming is True, switch
+
+        started = time.monotonic()
+        if switch == "new_session":
+            engine.new_session()
+        else:
+            engine.adopt(client_engine.SessionSnapshot(session_id=engine.session_id))
+        primer.join(2)
+        assert not primer.is_alive(), switch
+        assert time.monotonic() - started < 2, switch
+        assert outcome["r"] == client_engine.PrimeOutcome(False, "aborted", None), switch
+        assert len(stream.closed_from) == 1, switch      # 關一次,不是兩次
+        assert engine.priming is False, switch
+        assert engine.model_lock.acquire(timeout=0.5) is True, switch
+        engine.model_lock.release()
+
+    # 中止過的預熱一列 telemetry 都不留。
+    log = tmp_path / "metrics.jsonl"
+    assert not log.exists() or log.read_text(encoding="utf-8").strip() == ""
+
+
+@pytest.mark.smoke
+def test_priming_skips_only_when_no_slot_is_idle_and_never_raises_or_prints(
+    engine_factory, monkeypatch, tmp_path, capsys
+):
+    """多 slot 的 server:只有**每一個** slot 都在忙才跳過;讀不到就當未知、照送。
+
+    寫成「有人在忙就不送」的話,主 server 上任何一個 KB / 壓縮請求都會讓預熱
+    永遠不發生 —— 而且是無聲的。反過來,失敗一律回 outcome:預熱是背景工作,
+    它壞掉不該變成使用者看得到的錯誤,Textual 接管畫面之後更不能寫 stderr。
+    """
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    # 先把**真的** get_slots 留下來:末段的 quiet / 預設兩次 probe 要走產品的函式,
+    # 不能還在呼叫下面那個只記 probe、回 None 的 stub(Astra R1-B01)。
+    real_get_slots = llama_client.get_slots
+    engine = engine_factory()
+    sent: list[dict] = []
+
+    def _chat(**kwargs):
+        sent.append(kwargs)
+        return iter([_prime_final_chunk()])
+
+    monkeypatch.setattr(llama_client, "chat_completions", _chat)
+    probes: list[dict] = []
+
+    def _slots_returning(value):
+        def _slots(base_url, **kwargs):
+            probes.append({"base_url": base_url, **kwargs})
+            return value
+
+        return _slots
+
+    monkeypatch.setattr(
+        llama_client,
+        "get_slots",
+        _slots_returning([{"id": 0, "is_processing": True}, {"id": 1, "state": 0}]),
+    )
+    assert engine.prime_prompt_cache().sent is True          # 一忙三閒也照送
+    assert probes[0]["quiet"] is True                        # 畫面被接管:probe 不得寫 stderr
+    assert probes[0]["timeout"] == client_engine.PRIME_SLOTS_TIMEOUT
+
+    monkeypatch.setattr(
+        llama_client,
+        "get_slots",
+        _slots_returning([{"id": 0, "is_processing": True}, {"id": 1, "state": 2}]),
+    )
+    assert engine.prime_prompt_cache() == client_engine.PrimeOutcome(False, "server_busy", None)
+
+    monkeypatch.setattr(llama_client, "get_slots", _slots_returning(None))
+    assert engine.prime_prompt_cache().sent is True          # 讀不到 = 未知 = 照送
+    assert len(sent) == 2
+
+    def _boom(**_kwargs):
+        raise RuntimeError("model down")
+
+    monkeypatch.setattr(llama_client, "chat_completions", _boom)
+    assert engine.prime_prompt_cache() == client_engine.PrimeOutcome(
+        False, "error:RuntimeError", None
+    )
+    assert engine.model_lock.acquire(timeout=0.5) is True    # 例外路徑也把鎖放回去
+    engine.model_lock.release()
+    assert engine.priming is False
+    assert capsys.readouterr() == ("", "")
+
+    # llama_client 那一端:quiet 的 probe 失敗零 stderr,預設的呼叫端仍然要留原因
+    # (把「被 policy 擋掉」偽裝成 server down 正是那一行要防的事)。兩次都走**真的**
+    # get_slots,只 mock 底層的 session。
+    class _DeadSession:
+        def get(self, *_args, **_kwargs):
+            raise RuntimeError("connection refused (stub)")
+
+    monkeypatch.setattr(llama_client, "get_slots", real_get_slots)
+    monkeypatch.setattr(llama_client, "get_session", lambda: _DeadSession())
+    assert llama_client.get_slots("http://127.0.0.1:65535", quiet=True) is None
+    assert capsys.readouterr() == ("", "")
+    assert llama_client.get_slots("http://127.0.0.1:65535") is None
+    assert "/slots probe failed" in capsys.readouterr().err
+
+
+@pytest.mark.smoke
+def test_priming_gates_the_one_token_it_sends_after_checking_the_next_turn_reserve(
+    engine_factory, monkeypatch, tmp_path
+):
+    """閘的保留額 == 實送的 max_tokens == 1;下一輪反正會溢位就根本不送。
+
+    保留額與實送的 max_tokens 不同的話,這條路徑上的閘就不是同一個閘(見
+    `config.CLIENT_MAX_OUTPUT_TOKENS` 的同一個理由)。而「下一輪會不會溢位」是
+    另一件事:它只決定這次預熱值不值得做,所以用 `build_usage` 試算、**不寫 log**
+    —— 用 `check_and_log` 的話 telemetry 會多出一列從來沒送出去的請求。
+    """
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    engine = engine_factory()
+    engine.messages = _synthetic_history()
+    sent: list[dict] = []
+
+    def _chat(**kwargs):
+        sent.append(kwargs)
+        return iter([_prime_final_chunk()])
+
+    monkeypatch.setattr(llama_client, "chat_completions", _chat)
+    gate_calls: list[dict] = []
+    real_check = context_budget.check_and_log
+
+    def _spy_check(**kwargs):
+        gate_calls.append(kwargs)
+        return real_check(**kwargs)
+
+    logged: list = []
+    real_log = context_budget.log_metrics
+
+    def _spy_log(usage):
+        logged.append(usage)
+        return real_log(usage)
+
+    monkeypatch.setattr(context_budget, "check_and_log", _spy_check)
+    monkeypatch.setattr(context_budget, "log_metrics", _spy_log)
+
+    assert engine.prime_prompt_cache().sent is True
+    assert gate_calls[-1]["source"] == client_engine.PRIME_SOURCE
+    assert gate_calls[-1]["reserved_output_tokens"] == client_engine.PRIME_MAX_TOKENS == 1
+    assert sent[-1]["extra"]["max_tokens"] == gate_calls[-1]["reserved_output_tokens"]
+    assert logged[-1].reserved_output_tokens == 1
+
+    # 把 n_ctx 調到「下一輪的保留額會溢位、這一次的 1 個 token 不會」:預熱不做。
+    prefix = engine.next_turn_prefix()
+    estimated, _chars = context_budget.estimate_tokens(
+        messages=prefix, tools=engine.openai_tools()
+    )
+    engine.options.n_ctx = int(
+        (estimated + client_engine.PRIME_MAX_TOKENS) / config.CTX_HARD_THRESHOLD
+    ) + 1
+    sent.clear()
+    gate_calls.clear()
+    logged.clear()
+    assert engine.prime_prompt_cache() == client_engine.PrimeOutcome(
+        False, "next_turn_would_overflow", None
+    )
+    assert sent == [] and logged == []
+    assert gate_calls == []          # 沒有走 check_and_log ⇒ 沒有寫下拒絕那一列
+
+
+@pytest.mark.smoke
+def test_priming_is_invisible_to_cancel_and_leaves_the_turn_state_untouched(
+    engine_factory, monkeypatch, tmp_path
+):
+    """預熱不是一輪對話:取消看不到它,回合狀態一個欄位都不動。
+
+    共用 `_cancel` / `_in_turn` / `_active_stream` 的話,使用者在預熱期間按 Ctrl-C
+    會得到「已中斷」(其實沒有東西在跑),或者旗標留到下一題把真正的問題打掉。
+    """
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    engine = engine_factory()
+    release = threading.Event()
+    held = _HeldStream(release, [_prime_final_chunk()])
+    monkeypatch.setattr(llama_client, "chat_completions", lambda **_kw: held)
+    outcome: dict = {}
+    primer = threading.Thread(
+        target=lambda: outcome.setdefault("r", engine.prime_prompt_cache(reason="mount"))
+    )
+    primer.start()
+    for _ in range(200):
+        if engine.priming:
+            break
+        time.sleep(0.01)
+    assert engine.priming is True
+
+    assert engine.request_cancel().accepted is False    # 閒置:沒有東西可取消
+    assert engine.cancel() is False
+    assert not engine._cancel.is_set()                  # 旗標不得留給下一題
+    assert engine._in_turn == 0
+    assert engine._armed is False and engine._turn_seen_since_clear is False
+    assert engine._active_stream is None and engine._active_call is None
+
+    release.set()
+    primer.join(5)
+    assert not primer.is_alive()
+    assert outcome["r"].sent is True
+
+    engine.clear_cancel()
+    monkeypatch.setattr(
+        llama_client, "chat_completions", _stream(_text_chunk("answer", finish="stop"))
+    )
+    result = engine.send("q", on_event=lambda _e: None)
+    assert result.finish == client_events.REASON_STOP
+    assert [m["role"] for m in engine.messages] == ["user", "assistant"]
+
+
+# ── Step 5 R1 回修(Astra R1-B02 / R1-B03 / R1-B05):預熱的中止邊界、部分完成的工具群組、終結判定 ──
+
+
+def _prime_threads_gone(timeout=5.0):
+    """等預熱自己開的小執行緒(probe / http / settle)全部結束。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(t.name.startswith("codetrail-prime-") for t in threading.enumerate()):
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _prime_rows(path):
+    if not path.exists():
+        return []
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return [row for row in rows if row["source"] == client_engine.PRIME_SOURCE]
+
+
+@pytest.mark.smoke
+def test_priming_matches_the_next_send_when_a_tool_group_is_only_partly_answered(
+    engine_factory, monkeypatch, tmp_path
+):
+    """同一組兩個工具呼叫之間被中斷(a 有結果、b 沒有):預熱送的 prefix 必須逐字等於
+    下一輪真的送出的 payload 減最後那則 user。
+
+    真正的 `send()` 先由 `heal_pending_tool_calls()` 把 `tool(b, 已中斷)` **append 在既有
+    `tool(a)` 之後**;預熱若把補的結果插在 assistant 之後、`tool(a)` 之前,兩份 payload 在
+    工具群組中途就分岔 —— prompt cache 從那個 token 起一個字也重用不到,而且畫面上完全
+    看不出來(兩邊都是合法的歷史)。工具結果仍必須緊接宣告它的群組。
+    """
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    store = _CountingStore(engine_factory.root)
+    engine = engine_factory(store=store)
+    engine.messages = [
+        {"role": "user", "content": "q1"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [_wire_call("a", "list_dir"), _wire_call("b", "read_file")],
+        },
+        # a 跑完了;b 宣告了卻沒有結果(上一輪在兩個工具之間被中斷)。
+        {"role": "tool", "tool_call_id": "a", "name": "list_dir", "content": "status: ok\n(a 的結果)"},
+    ]
+    before = copy.deepcopy(engine.messages)
+    sent: list[dict] = []
+
+    def _chat(**kwargs):
+        sent.append(kwargs)
+        if len(sent) == 1:
+            return iter([_prime_final_chunk(prompt_n=5)])
+        return iter([_text_chunk("answer", finish="stop")])
+
+    monkeypatch.setattr(llama_client, "chat_completions", _chat)
+
+    assert engine.prime_prompt_cache(reason="session").sent is True
+    assert engine.messages == before                 # 預熱不改寫原始歷史
+    assert store.appended == []                      # 也不落檔
+
+    result = engine.send("q2", on_event=lambda _e: None)
+    assert result.finish == client_events.REASON_STOP
+    prime, turn = sent
+    assert turn["messages"][-1] == {"role": "user", "content": "q2"}
+    assert turn["messages"][:-1] == prime["messages"]
+    # 結果緊接宣告群組、宣告順序不變:assistant → tool(a) → tool(b, 已中斷)。
+    shape = [(m["role"], m.get("tool_call_id")) for m in prime["messages"]]
+    assert shape == [
+        ("system", None), ("user", None), ("assistant", None), ("tool", "a"), ("tool", "b"),
+    ], shape
+    assert prime["messages"][4]["content"] == client_engine.CANCELLED_TOOL_RESULT
+
+
+@pytest.mark.smoke
+def test_priming_only_counts_as_sent_after_a_terminal_chunk_with_timings(
+    engine_factory, monkeypatch, tmp_path, capsys
+):
+    """沒有終結 chunk 的 clean EOF、或終結了卻沒有 `timings.prompt_n`,都不是成功的預熱。
+
+    HTTP 200 之後只收到 keep-alive、或送了幾個 delta 就正常關線,`OpenAIStream` 不會丟
+    例外;照樣記成 sent 的話,telemetry 多出一列 `prompt_tokens_processed` 為空的 `prime`、
+    `/status` 顯示 sent,而 T0 的冷 / 熱判讀從此建立在一個根本沒完成的請求上。
+    `usage.prompt_tokens` 也不得拿來代填 processed:那是「prompt 多長」,不是「重算了多少」。
+    """
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    engine = engine_factory()
+    log = tmp_path / "metrics.jsonl"
+
+    finished_without_timings = {
+        "choices": [{"delta": {"content": "x"}, "finish_reason": "length"}],
+        "usage": {"prompt_tokens": 20000, "completion_tokens": 1},
+    }
+    cases = [
+        ("empty", (), "incomplete"),                                  # 只有 keep-alive
+        ("delta_then_eof", (_text_chunk("x"),), "incomplete"),        # 非終結 delta 後正常關線
+        ("finished_without_timings", (finished_without_timings,), "no_timings"),
+    ]
+    for name, chunks, reason in cases:
+        monkeypatch.setattr(llama_client, "chat_completions", _stream(*chunks))
+        outcome = engine.prime_prompt_cache(reason="mount")
+        assert outcome == client_engine.PrimeOutcome(False, reason, None), (name, outcome)
+        assert _prime_rows(log) == [], name                           # 不生成冒充成功的列
+        assert engine.priming is False, name
+        assert engine.model_lock.acquire(timeout=0.5) is True, name
+        engine.model_lock.release()
+
+    # 正常情境不變:max_tokens=1 ⇒ finish_reason=length,最後一個 chunk 帶 timings。
+    monkeypatch.setattr(llama_client, "chat_completions", _stream(_prime_final_chunk(prompt_n=9)))
+    assert engine.prime_prompt_cache(reason="mount") == client_engine.PrimeOutcome(True, "", 9)
+    primed = _prime_rows(log)
+    assert len(primed) == 1 and primed[0]["prompt_tokens_processed"] == 9
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.smoke
+def test_a_session_switch_aborts_a_prime_that_has_no_stream_yet_and_never_sends_after_the_abort(
+    engine_factory, monkeypatch, tmp_path
+):
+    """中止要能落在 `/slots` probe、probe 回來之後、POST 已送出但 headers 未到這三段。
+
+    這三段都還沒有 stream 可關。只會關 stream 的中止在這裡等一秒就放棄,而 `new_session()` /
+    `adopt()` 不看回傳值照樣換歷史:舊預熱繼續把**上一段對話**的 prefix 送出去、`priming`
+    仍是 True、模型鎖仍被它租著 —— 新對話的預熱回 `model_busy`,使用者的第一題也排在一個
+    沒有用處的請求後面。修法不得借回合的取消旗標,也不得在舊 POST 還在飛的時候提早放鎖
+    (那會讓新對話的第一題與舊請求在 llama-server 上重疊)。
+    """
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    engine = engine_factory()
+    engine.messages = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "history"}]
+    posts: list[dict] = []
+    outcome: dict = {}
+
+    def _record_post(**kwargs):
+        posts.append(kwargs)
+        return iter([_prime_final_chunk()])
+
+    # (1) 中止落在 probe:GET 還卡著,預熱要立刻結束、放鎖(GET 不占 slot),之後不得再發 POST。
+    probing = threading.Event()
+    release_probe = threading.Event()
+
+    def _stuck_probe(*_args, **_kwargs):
+        probing.set()
+        release_probe.wait(5)
+        return None
+
+    monkeypatch.setattr(llama_client, "get_slots", _stuck_probe)
+    monkeypatch.setattr(llama_client, "chat_completions", _record_post)
+    primer = threading.Thread(
+        target=lambda: outcome.setdefault("probe", engine.prime_prompt_cache(reason="mount")),
+        daemon=True,
+    )
+    primer.start()
+    assert probing.wait(5)
+    assert engine.priming is True
+    started = time.monotonic()
+    engine.new_session()
+    primer.join(1)
+    assert not primer.is_alive()
+    assert time.monotonic() - started < 1.0                        # B7:一秒內結束
+    assert outcome["probe"] == client_engine.PrimeOutcome(False, "aborted", None)
+    assert engine.priming is False
+    assert engine.model_lock.acquire(timeout=0.5) is True          # 鎖已放
+    engine.model_lock.release()
+    release_probe.set()
+    assert _prime_threads_gone()
+    assert posts == []                                              # 中止之後沒有 POST
+
+    # (2) 中止落在 probe 回來之後、POST 之前:什麼都還沒送,不得補送。
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    real_check = context_budget.check_and_log
+
+    def _abort_at_the_gate(**kwargs):
+        usage = real_check(**kwargs)
+        engine.abort_prime(wait=0)
+        return usage
+
+    monkeypatch.setattr(context_budget, "check_and_log", _abort_at_the_gate)
+    assert engine.prime_prompt_cache(reason="mount") == client_engine.PrimeOutcome(
+        False, "aborted", None
+    )
+    assert posts == []
+    monkeypatch.setattr(context_budget, "check_and_log", real_check)
+
+    # (3) 中止落在 POST 已送出、headers 未到：transport 必須先 shutdown，B7 一秒內放鎖。
+    engine.messages = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "history"}]
+    posting = threading.Event()
+    pending_socket = _PendingHeaderSocket(engine.model_lock)
+    release_post = pending_socket.release
+    late = _BlockingStream()
+
+    def _stuck_post(**kwargs):
+        # 替身也遵守新 transport 契約：在送出之前登記可取消的 socket。
+        kwargs["cancel"].register(pending_socket)
+        posts.append(kwargs)
+        posting.set()
+        release_post.wait(5)
+        return late
+
+    monkeypatch.setattr(llama_client, "chat_completions", _stuck_post)
+    primer = threading.Thread(
+        target=lambda: outcome.setdefault("post", engine.prime_prompt_cache(reason="session")),
+        daemon=True,
+    )
+    primer.start()
+    assert posting.wait(5)
+    started = time.monotonic()
+    engine.adopt(
+        client_engine.SessionSnapshot(
+            session_id=engine.session_id, messages=({"role": "user", "content": "new"},)
+        )
+    )
+    primer.join(1)
+    assert not primer.is_alive()
+    assert time.monotonic() - started < 1.0
+    assert outcome["post"] == client_engine.PrimeOutcome(False, "aborted", None)
+    assert engine.priming is False
+    assert pending_socket.shutdown_seen.is_set()                  # 仍在飛時不得提早放鎖
+    assert pending_socket.lock_was_held_at_shutdown is True
+    assert engine.model_lock.acquire(blocking=False) is True      # HTTP 已中止，不等 headers
+    engine.model_lock.release()
+    assert _prime_threads_gone()
+    assert len(late.closed_from) == 1                               # 關一次,不是零次也不是兩次
+    assert len(posts) == 1                                          # 只有那一次;沒有補送
+
+    # (4) 換過去之後的預熱照常准入,送的是新歷史,不受舊的中止影響。
+    monkeypatch.setattr(llama_client, "chat_completions", _record_post)
+    assert engine.prime_prompt_cache(reason="session").sent is True
+    assert posts[-1]["messages"][-1] == {"role": "user", "content": "new"}
+
+    # 被中止的預熱一列 telemetry 都不留;只有 (4) 那一列。
+    assert len(_prime_rows(tmp_path / "metrics.jsonl")) == 1
+
+
+class _PendingHeaderSocket:
+    """完全離線的 socket：request bytes 收下，headers 一直等到 shutdown。"""
+
+    def __init__(self, lock):
+        self.headers = threading.Event()
+        self.shutdown_seen = threading.Event()
+        self.release = threading.Event()
+        self.sent = []
+        self.lock = lock
+        self.lock_was_held_at_shutdown = None
+
+    def settimeout(self, _timeout):
+        pass
+
+    def sendall(self, data):
+        if self.shutdown_seen.is_set():
+            raise OSError("offline socket is shut down")
+        self.sent.append(bytes(data))
+
+    def makefile(self, _mode):
+        return self
+
+    def readline(self, _limit=-1):
+        self.headers.set()
+        self.release.wait(5)
+        return b""
+
+    def shutdown(self, _how):
+        acquired = self.lock.acquire(blocking=False)
+        self.lock_was_held_at_shutdown = not acquired
+        if acquired:
+            self.lock.release()
+        self.shutdown_seen.set()
+        self.release.set()
+
+    def close(self):
+        pass
+
+
+@pytest.mark.smoke
+def test_switching_session_shuts_down_pending_headers_before_releasing_the_model_lock(
+    engine_factory, monkeypatch, tmp_path, capsys
+):
+    """R2-B01：真正走 requests/urllib3；不回 headers 也必須在 B7 的一秒內收掉。"""
+    import http_client
+    import urllib3.connection
+
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    session = http_client.create_session()
+    monkeypatch.setattr(llama_client, "get_session", lambda: session)
+    engine = engine_factory()
+    for switch in ("new", "adopt"):
+        sock = _PendingHeaderSocket(engine.model_lock)
+        monkeypatch.setattr(urllib3.connection.HTTPConnection, "_new_conn", lambda _self: sock)
+        outcome = []
+        primer = threading.Thread(target=lambda: outcome.append(engine.prime_prompt_cache()), daemon=True)
+        primer.start()
+        try:
+            assert sock.headers.wait(2), "未進入離線 headers 等待"
+            assert b"POST /v1/chat/completions " in b"".join(sock.sent)
+            started = time.monotonic()
+            if switch == "new":
+                engine.new_session()
+            else:
+                engine.adopt(client_engine.SessionSnapshot(session_id=engine.session_id))
+            primer.join(max(0, 0.9 - (time.monotonic() - started)))
+            assert not primer.is_alive()
+            assert outcome == [client_engine.PrimeOutcome(False, "aborted", None)]
+            assert engine.priming is False
+            freed = engine.model_lock.acquire(blocking=False)
+            if freed:
+                engine.model_lock.release()
+            assert freed, "B7: headers 還沒回時，模型鎖仍被舊預熱持有"
+            assert time.monotonic() - started < 1
+            assert sock.shutdown_seen.is_set(), "放鎖之前必須先 shutdown 舊 HTTP"
+            assert sock.lock_was_held_at_shutdown is True
+        finally:
+            sock.release.set()
+            primer.join(2)
+            assert _prime_threads_gone()
+    session.close()
+    assert _prime_rows(tmp_path / "metrics.jsonl") == []
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.smoke
+def test_abort_between_prime_registration_and_fast_io_cannot_be_lost(
+    engine_factory, monkeypatch, tmp_path
+):
+    """R2-B02a：登記後已取消，立即完成的 GET/POST 也不能洗掉那次 abort。"""
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    engine = engine_factory()
+    ready, resume = threading.Event(), threading.Event()
+    real_locked = engine._prime_locked
+
+    def paused_locked(*args, **kwargs):
+        ready.set()
+        resume.wait(3)
+        return real_locked(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "_prime_locked", paused_locked)
+    real_thread = threading.Thread
+
+    def immediate_io_thread(*args, **kwargs):
+        if kwargs.get("name") in {"codetrail-prime-probe", "codetrail-prime-http"}:
+            class Immediate:
+                def start(self):
+                    kwargs["target"]()
+            return Immediate()
+        return real_thread(*args, **kwargs)
+
+    monkeypatch.setattr(client_engine.threading, "Thread", immediate_io_thread)
+    posts = []
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+
+    def chat(**kwargs):
+        posts.append(kwargs)
+        return iter([_prime_final_chunk()])
+
+    monkeypatch.setattr(llama_client, "chat_completions", chat)
+    outcome = []
+    primer = real_thread(target=lambda: outcome.append(engine.prime_prompt_cache()), daemon=True)
+    primer.start()
+    try:
+        assert ready.wait(2)
+        engine.abort_prime(wait=0)
+    finally:
+        resume.set()
+        primer.join(2)
+    assert outcome == [client_engine.PrimeOutcome(False, "aborted", None)], "已取消的登記不能記成 sent"
+    assert posts == []
+    assert not primer.is_alive() and not engine.priming
+    assert _prime_rows(tmp_path / "metrics.jsonl") == []
+
+
+@pytest.mark.smoke
+def test_a_prime_http_worker_scheduled_after_abort_never_starts_the_post(
+    engine_factory, monkeypatch, tmp_path
+):
+    """R2-B02b：最後一次 epoch 檢查後、HTTP worker 開始前取消，不得晚送。"""
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    engine = engine_factory()
+    ready, resume = threading.Event(), threading.Event()
+    real_thread = threading.Thread
+
+    def delayed_http_thread(*args, **kwargs):
+        if kwargs.get("name") == "codetrail-prime-http":
+            target = kwargs["target"]
+
+            def delayed():
+                ready.set()
+                resume.wait(3)
+                target()
+
+            kwargs["target"] = delayed
+        return real_thread(*args, **kwargs)
+
+    monkeypatch.setattr(client_engine.threading, "Thread", delayed_http_thread)
+    posts = []
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+
+    def chat(**kwargs):
+        posts.append(kwargs)
+        return iter([_prime_final_chunk()])
+
+    monkeypatch.setattr(llama_client, "chat_completions", chat)
+    outcome = []
+    primer = real_thread(target=lambda: outcome.append(engine.prime_prompt_cache()), daemon=True)
+    primer.start()
+    try:
+        assert ready.wait(2)
+        engine.abort_prime()
+    finally:
+        resume.set()
+        primer.join(2)
+        assert _prime_threads_gone()
+    assert posts == [], "已取消後才排到 CPU 的 HTTP worker 仍發出舊 POST"
+    assert outcome == [client_engine.PrimeOutcome(False, "aborted", None)]
+    assert not engine.priming
+    assert engine.model_lock.acquire(blocking=False)
+    engine.model_lock.release()
+    assert _prime_rows(tmp_path / "metrics.jsonl") == []
+
+
+@pytest.mark.smoke
+def test_a_prime_arriving_during_session_creation_cannot_keep_the_old_history_alive(
+    engine_factory, monkeypatch, tmp_path
+):
+    """R2-B02c：abort 到 create 完成的空窗，晚到預熱不能仍送舊歷史。"""
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    engine = engine_factory()
+    engine.messages = [{"role": "user", "content": "old session"}]
+    ready, resume, finished = threading.Event(), threading.Event(), threading.Event()
+    real_create = engine.store.create
+
+    def paused_create():
+        ready.set()
+        resume.wait(3)
+        return real_create()
+
+    monkeypatch.setattr(engine.store, "create", paused_create)
+    stream = _BlockingStream()
+    monkeypatch.setattr(llama_client, "chat_completions", lambda **_k: stream)
+    outcome = []
+
+    def prime():
+        outcome.append(engine.prime_prompt_cache())
+        finished.set()
+
+    switcher = threading.Thread(target=engine.new_session, daemon=True)
+    primer = threading.Thread(target=prime, daemon=True)
+    switcher.start()
+    assert ready.wait(2)
+    primer.start()
+    try:
+        # 新實作會拒絕這次准入；舊實作則已讀到串流第二個 chunk。
+        deadline = time.monotonic() + 1
+        while not finished.is_set() and stream._first and time.monotonic() < deadline:
+            time.sleep(0.005)
+        resume.set()
+        switcher.join(1)
+        primer.join(0.8)
+        assert not primer.is_alive(), "session 已換，空窗內登記的舊預熱仍未被中止"
+        assert not switcher.is_alive()
+        assert outcome == [client_engine.PrimeOutcome(False, "aborted", None)]
+        assert engine.messages == []
+        assert not engine.priming
+        assert engine.model_lock.acquire(blocking=False)
+        engine.model_lock.release()
+    finally:
+        resume.set()
+        engine.abort_prime(wait=0)
+        switcher.join(2)
+        primer.join(2)
+    assert _prime_rows(tmp_path / "metrics.jsonl") == []
+
+
+@pytest.mark.smoke
+def test_failed_session_creation_does_not_disable_future_priming(engine_factory, monkeypatch, tmp_path):
+    """轉換准入閘的錯誤路徑：create 失敗保留 session，之後預熱仍可正常准入。"""
+    monkeypatch.setattr(config, "CTX_METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    engine = engine_factory(store=_FlakyStore())
+    engine.messages = [{"role": "user", "content": "unchanged"}]
+    before, session = copy.deepcopy(engine.messages), engine.session_id
+    with pytest.raises(OSError):
+        engine.new_session()
+    assert engine.messages == before and engine.session_id == session
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    posts = []
+
+    def chat(**kwargs):
+        posts.append(kwargs)
+        return iter([_prime_final_chunk()])
+
+    monkeypatch.setattr(llama_client, "chat_completions", chat)
+    assert engine.prime_prompt_cache().sent is True
+    assert posts[0]["messages"][-1] == {"role": "user", "content": "unchanged"}
+    assert engine.messages == before and engine.session_id == session

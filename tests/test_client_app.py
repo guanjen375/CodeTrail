@@ -96,6 +96,12 @@ class _Engine:
         )
         self.system_prompt = types.SimpleNamespace(sections=())
         self.tool_specs = {"list_dir": _Spec("list_dir"), "apply_patch": _Spec("apply_patch", False)}
+        #: 預熱:每一次 `prime_prompt_cache(reason=…)` 的 reason(engine 那半的准入與
+        #: 零寫入由 test_client_engine 守,這裡只記錄)。`primed` 讓測試等那條背景
+        #: 執行緒,不必靠 sleep。
+        self.primes: list[str] = []
+        self.primed = threading.Event()
+        self.priming = False
 
     def request_cancel(self, *, arm_when_idle: bool = False):
         self.cancelled = True
@@ -107,6 +113,12 @@ class _Engine:
 
     def clear_cancel(self):
         self.cancelled = False
+
+    def prime_prompt_cache(self, *, reason: str = ""):
+        self.primes.append(reason)
+        self.primed.set()
+        # 形狀同 §4.2 的 `PrimeOutcome(sent, reason, processed_tokens)`。
+        return types.SimpleNamespace(sent=True, reason="", processed_tokens=7)
 
     def new_session(self):
         self.session_id = self.store.create()
@@ -1312,3 +1324,210 @@ def test_a_new_session_forgets_the_old_tool_blocks():
     seen = _run(body)
     names = [t for t in seen["tools"]]
     assert any("read_file" in str(t) for t in names), seen["tools"]
+
+
+# ============================================================
+# prompt cache 預熱:歷史剛換過的那幾個時刻
+# ============================================================
+class _SlowPrime(_Engine):
+    """預熱期間 `priming` 為 True(真 engine 只由持著模型鎖在送的那一次設 / 清)。"""
+
+    def __init__(self, store=None):
+        super().__init__(store)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def prime_prompt_cache(self, *, reason: str = ""):
+        self.priming = True
+        self.entered.set()
+        self.release.wait(5)
+        self.priming = False                     # 先落地才通知,狀態列讀得到確定的值
+        return super().prime_prompt_cache(reason=reason)
+
+
+def test_the_tui_primes_on_mount_new_and_session_switch_through_the_coordinator():
+    """三個「歷史剛換過」的時刻要預熱:啟動、`/new`、換 session。
+
+    這幾個時刻之後,下一輪要送的 prefix 跟 server 上快取的那一份對不起來,而使用者
+    通常正在打第一題 —— 那是唯一不必等使用者的機會。預熱一律走協調器(只有它知道
+    回合有沒有在跑),而且**不進對話區**:它不是一則對話內容,貼出來只會讓使用者
+    以為自己問了什麼。回合進行中的 `/new` 本來就被擋下,那時候也不得偷排一次。
+    """
+    engine = _Engine()
+    _resumable(engine)
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            assert engine.primed.wait(5)
+            mount = list(engine.primes)
+            for _ in range(400):                 # on_done 要搬回 UI 執行緒才記得下來
+                if app._last_prime is not None:
+                    break
+                await pilot.pause()
+            noted = app._last_prime
+            engine.primed.clear()
+            app._command("/new")
+            assert engine.primed.wait(5)
+            await _settle(pilot)
+            after_new = list(engine.primes)
+            engine.primed.clear()
+            app._command(f"/session {RESUMED_ID}")
+            assert engine.primed.wait(5)
+            await _settle(pilot)
+            return mount, after_new, list(engine.primes), noted, _snapshot(app)
+
+    mount, after_new, after_switch, noted, seen = _run(body)
+    assert mount == ["mount"]
+    assert after_new == ["mount", "new"]
+    assert after_switch == ["mount", "new", "session"]
+    assert engine.session_id == RESUMED_ID
+    # outcome 經協調器的 on_prime 搬回 UI 執行緒(`/status` 才有東西可講)、記錄帶觸發點,
+    # 而對話區一個字都不多。
+    assert noted is not None and noted[1] == "mount" and noted[2].sent is True
+    assert not any("預熱" in note for note in seen["notices"])
+
+    blocked = _Blocks()
+
+    async def during_a_turn():
+        app = client_app.CodeTrailApp(blocked)
+        async with app.run_test() as pilot:
+            assert blocked.primed.wait(5)
+            app.submit("hi")
+            assert blocked.entered.wait(5)
+            app._command("/new")
+            await _settle(pilot)
+            reasons = list(blocked.primes)
+            blocked.release.set()
+            await _settle(pilot, 60)
+            return reasons
+
+    assert _run(during_a_turn) == ["mount"]
+
+    slow = _SlowPrime()
+
+    async def while_priming():
+        app = client_app.CodeTrailApp(slow)
+        async with app.run_test() as pilot:
+            assert slow.entered.wait(5)
+            app._refresh_status()
+            during = app.status_text
+            slow.release.set()
+            assert slow.primed.wait(5)
+            await _settle(pilot)
+            app._refresh_status()
+            return during, app.status_text
+
+    during, after = _run(while_priming)
+    # 預熱握著模型鎖:這時候送出的下一題會在鎖上等它,狀態列要講得出來。
+    assert "預熱" in during, during
+    assert "預熱" not in after, after
+
+
+async def _until(pilot, predicate, timeout=5.0):
+    """讓 UI 執行緒一邊跑、一邊等背景執行緒把事情做完。
+
+    worker 的每一則事件都經 ``call_from_thread`` 搬進 UI 執行緒**而且會等它跑完**;
+    在 UI 執行緒上 ``Event.wait()`` 的話 worker 永遠搬不過來。到期回 False、不 raise:
+    要不要當成失敗由呼叫端決定(有些等待在未修的產品上本來就不會發生)。
+    """
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        await pilot.pause(0.01)
+    return True
+
+
+class _PrimeOutcomes(_Engine):
+    """每一次預熱回**可區分**的 outcome:mount 送出,壓縮後那兩次各自跳過、原因不同。
+
+    `/status` 要講得出「最近一次是哪一次」,三個 outcome 得先分得開。形狀同 §4.2 的
+    `PrimeOutcome(sent, reason, processed_tokens)`,不 import 真型別。
+    """
+
+    def __init__(self, store=None):
+        super().__init__(store)
+        self.outcomes: list = []
+
+    def prime_prompt_cache(self, *, reason: str = ""):
+        if reason == "compaction":
+            nth = sum(1 for item in self.primes if item == "compaction")
+            outcome = types.SimpleNamespace(
+                sent=False,
+                reason="server_busy" if nth == 0 else "model_busy",
+                processed_tokens=None,
+            )
+        else:
+            outcome = types.SimpleNamespace(sent=True, reason="", processed_tokens=7)
+        self.outcomes.append(outcome)
+        self.primes.append(reason)
+        self.primed.set()                        # 先落地才通知,等的那一端讀得到確定的值
+        return outcome
+
+
+def test_the_status_line_reports_the_latest_prime_including_the_ones_after_compaction():
+    """`/status` 的「prompt cache 預熱」要反映**協調器跑的每一次**預熱,含壓縮後那一次。
+
+    自動壓縮與 `/compact` 換掉歷史之後,協調器自己排一次預熱;那一次的 outcome 沒有回到
+    TUI 的話,`/status` 仍顯示 mount 那一次的 `sent` 與舊時間 —— 使用者對著「sent」以為
+    cache 是熱的,實際上這一次是 skipped,而且拿不到原因。三個 outcome 刻意可區分
+    (sent / server_busy / model_busy),`觸發=` 講得出這一次是哪一種入口。預熱仍然不進
+    對話區(只有 `/status` 那幾則含它)、仍在回合鎖外(`busy` 為 False)、不動取消旗標。
+    """
+    engine = _PrimeOutcomes()
+    compactor = types.SimpleNamespace(
+        mode="codetrail",
+        pending_stop_notice=lambda: "",
+        rebind=lambda: None,
+        compact=lambda manual=False: types.SimpleNamespace(status="compacted", message="已壓縮"),
+    )
+
+    def _landed(app):
+        # TUI 手上的 outcome 就是 engine 最近一次回的那一個(只看最後一欄,不綁記錄的形狀)。
+        noted = app._last_prime
+        return noted is not None and noted[-1] is engine.outcomes[-1]
+
+    async def _status_line(app, pilot):
+        app._command("/status")
+        await _settle(pilot)
+        notice = _snapshot(app)["notices"][-1]
+        line = next(l for l in notice.splitlines() if l.startswith("prompt cache 預熱="))
+        return notice, line
+
+    async def body():
+        app = client_app.CodeTrailApp(engine, compactor=compactor)
+        async with app.run_test() as pilot:
+            assert await _until(pilot, engine.primed.is_set), "mount 沒有預熱"
+            assert await _until(pilot, lambda: _landed(app)), "mount 的 outcome 沒有搬回 UI 執行緒"
+            at_mount = await _status_line(app, pilot)
+
+            engine.primed.clear()
+            app._command("/compact")
+            assert await _until(pilot, engine.primed.is_set), "/compact 之後沒有預熱"
+            busy_while_priming = app.coordinator.busy
+            await _until(pilot, lambda: _landed(app))     # 未修的產品上不會發生;由 /status 字串判
+            after_compact = await _status_line(app, pilot)
+
+            engine.primed.clear()
+            assert app.submit("hi") is True
+            assert await _until(pilot, engine.primed.is_set), "自動壓縮之後沒有預熱"
+            await _until(pilot, lambda: _landed(app))
+            after_auto = await _status_line(app, pilot)
+            return at_mount, after_compact, after_auto, busy_while_priming, _snapshot(app)
+
+    at_mount, after_compact, after_auto, busy_while_priming, seen = _run(body)
+    assert engine.primes == ["mount", "compaction", "compaction"]
+    # B04 本體先判:壓縮後那一次的 outcome 必須回到 /status(未修的產品停在 mount 的 sent)。
+    assert "skipped(server_busy)" in after_compact[1], after_compact[1]
+    assert "skipped(model_busy)" in after_auto[1], after_auto[1]
+    # 再判每一次的觸發點與 mount 那一次。
+    assert "sent" in at_mount[1] and "觸發=mount" in at_mount[1], at_mount[1]
+    assert "觸發=compaction" in after_compact[1], after_compact[1]
+    assert "觸發=compaction" in after_auto[1], after_auto[1]
+    # 三次 /status 是對話區裡**僅有**含「預熱」的 notice:預熱本身不進對話區。
+    assert [note for note in seen["notices"] if "預熱" in note] == [
+        at_mount[0], after_compact[0], after_auto[0]
+    ]
+    assert busy_while_priming is False           # 預熱在回合鎖外
+    assert engine.cancelled is False             # 也沒有動到取消旗標
