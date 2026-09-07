@@ -194,3 +194,11 @@
 - CLI process exit 0，result=`success`、is_error=false、duration_ms=681838；Fable 可見結論為靜態 zero Blockers，full 仍在背景執行。CLI 的成功 **不是 full 成功**：它提前結束後背景 task `bml0umksx` 留 `[killed]`，完整測試與書面審核未交付。
 - modelUsage：`claude-haiku-4-5-20251001`（canonical `claude-haiku-4-5`）outputTokens=25、thinkingTokens=0；`claude-fable-5-1`（canonical 同名）outputTokens=50841、thinkingTokens=42657。沒有其他模型用量。
 - 執行記錄見 `05-review-fable-r3-execution.md`。14 完整 shard 共 3121 passed，另 2 shard 共 447 條沒有完整結果；沒有完整 full exit，不能視為通過。root 保存證據，零補跑、零產品修改；將交同型號 reviewer 補齊報告。
+
+## Fable R3 書面補齊完成
+
+- 延續同一 R3、同一 product digest，明確 argv 仍為 `--model claude-fable-5-1 --effort max --fallback-model claude-fable-5-1 --settings {"autoMemoryEnabled":false}`，並以該次 CLI 行程的 `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1` 停止拒絕後換型；沒有修改安全審查或全域設定。
+- init：`model=claude-fable-5-1`、version=`2.1.263`、session=`cfa3fe50-71e1-40e4-a32a-ba73292a2faa`；全部 113 主 frame 同型號、沒有 fallback。MAX 依 argv，init 不獨立回報有效 effort。
+- process exit 0，result=`success`、is_error=false、duration_ms=890710。modelUsage：`claude-haiku-4-5-20251001`（canonical `claude-haiku-4-5`）outputTokens=20／thinkingTokens=0；`claude-fable-5-1`（canonical 同名）outputTokens=68026／thinkingTokens=41004。沒有其他模型用量。
+- 唯一 Write 為 `05-review-fable-r3.md`，零測試、零產品改動；root 已核對工具執行記錄及產品 cached／worktree digest 仍同為 `61fda568fce324d31691892f51a01aa7f17831e4e2c3815d2c0e16868dac9b4a`。本次是補齊書面交付與必要增量核對，不冒稱再次完整重審。
+- 書面裁定：R2-B01／R2-B02 關閉，R1 四項維持關閉，靜態 Blocker 0；full 仍未完成、T0 未量測、驗收未通過，沒有新增正式 deferred。Fable 建議只補兩個未完成 shard 的 447 條，再與既有 3121 條完整證據合併；也列出經明確授權重跑一次 full 的形狀。root 已詢問 full 補跑授權，使用者尚未答覆，未啟動任何補測。

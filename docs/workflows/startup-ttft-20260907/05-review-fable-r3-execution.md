@@ -34,3 +34,7 @@ root 沒有補跑任何測試，沒有把未知失敗當基線或擱置；Fable 
 AGENTS.md §1.2 明訂「程式碼收斂後對目前 HEAD 執行一次 full」與「程式碼未變時不得重跑已通過的測試」。本版已有 3121 條完整通過證據，因此 root 不自行重跑整包；若要再執行一次 full，須取得使用者針對這次 CLI 中斷的明確補跑授權。補跑時保持原產品 digest，Fable 使用前景 Bash 等到完整結果，禁止 `run_in_background=true` 或提前結束 CLI；前後再次記錄 HEAD／index／digest。
 
 此處是測試執行未完成，沒有新的靜態產品 Blocker，沒有模型技術分歧，也不是正式 deferred。T0 實機 TTFT 仍未量測；任務尚未符合完成條件。
+
+## 書面交付已補齊（後續狀態）
+
+同型號 MAX 的 report-only CLI 已交付 `05-review-fable-r3.md`，零測試、唯一 repo 寫入為該報告。正式結論：R2 兩項關閉、靜態 Blocker 0，full 仍未完成；前後產品 digest 與上列相同。報告 §8.6 建議只補兩個未完成 shard 的 447 條，也列出再跑一次 full 的形狀；兩者都須使用者接受本次中斷後的補測安排，不能把等待當授權。root 已詢問 full 補跑授權，尚未收到答覆。模型 metadata 見 `00-model-log.md` 的書面補齊段。

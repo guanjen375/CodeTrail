@@ -1,5 +1,7 @@
 # startup-ttft-20260907 — Deferred 與尚未裁定事項
 
+> **Fable R3 正式書面交付完成**：`05-review-fable-r3.md` 已補齊，R2-B01／R2-B02 關閉、R1 四項維持關閉，靜態 Blocker 0；本次補交接零測試、產品 digest 未變。驗收仍未通過：3121 條有完整通過證據，447 條所在的兩個 shard 缺完整結果，full 無完整 exit，T0 未量測。沒有新增正式擱置。補跑安排見報告 §8.6；使用者尚未答覆 root 的補跑授權問題，未啟動補測。
+
 > **Fable R3 更新（root 執行紀錄）**：Fable 5.1 MAX 可見結論為靜態 Blocker 歸零，但它在啟動背景 full 後提前結束 CLI，該 task 被標記 `[killed]`。保存的 14 份完整 shard JUnit 合計 3121 passed，另兩個 shard 共 447 條缺完整結果；**full 未通過、任務未完成**。产品 digest 仍為 `61fda568fce324d31691892f51a01aa7f17831e4e2c3815d2c0e16868dac9b4a`。詳見 `05-review-fable-r3-execution.md`，書面審核待補齊；測試中斷不列正式擱置，T0 仍未量測。
 
 > **Astra developer R2 回修交付狀態（2026-09-07）**：R2-B01 / R2-B02 已實作修復，四條新 regression 各一次行為紅燈、一次綠燈（每次 collected 1，紅 exit 1 / 綠 exit 0）。pending headers 改為先 shutdown 專用連線再放模型鎖，未改 B7；登記／快回應／晚到 worker／session create 空窗皆有保護。兩項目前是**修復完成待 Fable 5.1 MAX 審核**，不是正式擱置，也不由 writer 自行宣告關閉。最終凍結資料與完整證據見 `06-fix-r2.md`。
