@@ -208,3 +208,12 @@
 - 使用者對最後的「只補447條並合併既有結果驗收」回覆「好」；授權已取得，不再等待答覆。root 核對精確 node 清單，發現整檔命令會重複部分已完成 node，因此交 Fable 改按原 shard-4／shard-9 的447個精確ID執行，範圍不變；見 `08-test-recovery.md`。
 - 本次 reviewer argv 明確 `--model claude-fable-5-1 --effort max --fallback-model claude-fable-5-1 --settings {"autoMemoryEnabled":false}`，保留只作用於 CLI 的 `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1`，不改模型安全審查或全域設定。只補測、合併證據及寫 `08-test-results.md`；產品凍結 digest=`61fda568fce324d31691892f51a01aa7f17831e4e2c3815d2c0e16868dac9b4a`。
 - 初始命令、前景等待要求、owner與工具均已落檔；本次 init／result／modelUsage 待實際回傳補記。
+
+## R3 獲准補測完成：同一產品合併 3568 條通過
+
+- init：`model=claude-fable-5-1`、CLI `2.1.263`、session=`0afa312d-3398-45cf-b6b7-02f14d0b0f4e`。argv 明指 `--effort max`；有效 effort 仍未由 init 獨立回報。78 個主 assistant frame 均為 Fable 5.1、無 fallback event。
+- CLI process exit 0、result=`success`、is_error=false、duration_ms=591533。modelUsage：`claude-haiku-4-5-20251001`（canonical `claude-haiku-4-5`）outputTokens=17／thinkingTokens=0；`claude-fable-5-1`（canonical 同名）outputTokens=39336／thinkingTokens=14072。沒有其他模型用量。
+- 工具記錄只有一次測試命令，精確使用 `@remaining-447.nodes.txt` 與 JUnit 輸出，`timeout=600000`、`run_in_background=false`；前景正常結束，exit 0、collected 447、447 passed in 104.93s，0 failures／errors／skips。唯一 repo 寫入為 `08-test-results.md`（初稿與實際測後核對更新各一次）；零產品／測試修改，零額外測試。
+- Fable 完整核對新舊 JUnit：新447條等於授權清單、舊14shard有3121條；交集0、聯集3568，等於原16shard的完整node集合，沒有缺漏或多出。root 另作一次純XML／node資料核對得到相同結果，沒有代跑測試。
+- 與 R3 靜態審核同一 product digest：`61fda568fce324d31691892f51a01aa7f17831e4e2c3815d2c0e16868dac9b4a`；測試前後、報告寫入後與root交接核對的cached／worktree值一致。23個產品路徑保持staged，未commit／push。
+- 結果依使用者批准記為「兩段合併3568條全部通過」；原full被killed仍是原始事實，不能改記一次full exit0。靜態Blocker0，程式／離線驗收完成；無新增正式擱置，T0實機TTFT仍未量測，詳見`08-test-results.md`與`07-deferred.md`。

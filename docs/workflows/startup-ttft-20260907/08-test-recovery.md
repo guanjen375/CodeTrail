@@ -41,3 +41,7 @@ git diff --binary f200f697ba54d38a102e8ef66dead652c4002e5f -- . ':(exclude)docs/
 補測須 collected 447（不是 exit 5／0 collected），JUnit node 集合精確等於參數檔，與既有3121條無重複且聯集覆蓋原3568個node。通過時稱「依使用者授權合併兩段結果，3568條全部通過」，不可將前次被 killed 的 full 改記為 exit0。失敗時列全部 node ID、真實 exit、內容身分，回 Astra 修；不修改／skip／xfail 測試，不擴修無關既有問題。
 
 原 T0 實機 TTFT 仍由 David 執行，未量測收益不得宣稱。產品、測試及歷史審核報告本輪不改，只有補測結果與相關交接落檔。
+
+## 執行已完成
+
+Fable 5.1 MAX 已交付 `08-test-results.md`：唯一一次前景補測 collected447、447passed、exit0（104.93秒），JUnit逐名與參數清單一致；與舊3121條無交集，聯集精確覆蓋原3568條。root已獨立以純XML／node資料核對合併結果，零代跑測試。R3靜態審核、兩段測試与最終產品digest均為上列61fda568…；程式／離線驗收完成。完整模型身分與執行metadata已補入00-model-log，T0限制與擱置現況見07-deferred。產品仍未commit／push。
