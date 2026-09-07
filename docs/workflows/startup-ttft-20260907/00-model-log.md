@@ -187,3 +187,10 @@
 - Astra 凍結 actual HEAD=`b5d2f15650a564c2969870c098b2e0eac4248b58`、index tree=`709bbe102da21b5145df4eefa0501d897f39a311`、product digest=`61fda568fce324d31691892f51a01aa7f17831e4e2c3815d2c0e16868dac9b4a`。root 獨立核對 status 與 cached／worktree digest：23 個產品路徑全部 staged，無未暫存／未追蹤產品。產品未 commit，後續交接 markdown commit 不改此 digest。
 - 接續 reviewer 明確 argv：`CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1 claude -p --model claude-fable-5-1 --effort max --fallback-model claude-fable-5-1 --settings {"autoMemoryEnabled":false} ...`。維持模型安全審查，只禁止拒絕後自動換成另一型號；不改全域設定。
 - Fable 以 `ROLE=REVIEWER` 只寫 `05-review-fable-r3.md`，先集中靜態 Blocker 審核，歸零後才執行一次 `python3 scripts/run_tests.py`。完整輸出直接存 private `full-fable-r3.txt`，前後核對同一產品 digest；本次 init／result／modelUsage 待實際回傳補記。
+
+## Fable R3 回傳與 full 中斷
+
+- init：model=`claude-fable-5-1`，version=`2.1.263`，session=`1cbd8d21-3c8a-4a1d-8e42-ebdc6e65f675`；effort 依明確 argv，init 未獨立回傳有效 effort。全部 82 主 frame 同型號，無 fallback。
+- CLI process exit 0，result=`success`、is_error=false、duration_ms=681838；Fable 可見結論為靜態 zero Blockers，full 仍在背景執行。CLI 的成功 **不是 full 成功**：它提前結束後背景 task `bml0umksx` 留 `[killed]`，完整測試與書面審核未交付。
+- modelUsage：`claude-haiku-4-5-20251001`（canonical `claude-haiku-4-5`）outputTokens=25、thinkingTokens=0；`claude-fable-5-1`（canonical 同名）outputTokens=50841、thinkingTokens=42657。沒有其他模型用量。
+- 執行記錄見 `05-review-fable-r3-execution.md`。14 完整 shard 共 3121 passed，另 2 shard 共 447 條沒有完整結果；沒有完整 full exit，不能視為通過。root 保存證據，零補跑、零產品修改；將交同型號 reviewer 補齊報告。
