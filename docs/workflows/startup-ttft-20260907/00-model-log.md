@@ -91,3 +91,13 @@
 
 - 沿用 `/root/astra_plan_review`，`gpt-6-astra`、reasoning_effort=`max`；ROLE=REVIEWER。
 - 只審 Blocker、只寫 `05-review-astra-r1.md`；本輪已有 smoke red，禁止 full 與任何測試執行。
+
+## Step 5：R1 審核完成與 Fable 回修啟動
+
+- Astra MAX 集中交付 5 項 Blocker，零產品修改、零測試；報告 `05-review-astra-r1.md` 已 commit。
+- 回修 lead argv 明確指定 `--model claude-fable-5-1 --effort max`；Fable 決定修法、先交接 Dependency 與 file owner，root 依檔案啟動可平行的 Fable MAX lane。
+
+## Step 5：R1 status 平行回修啟動
+
+- 依 Fable lead 的 `06-fix-r1-dependencies.md` READY 交接，在主工作樹啟動獨立 Fable status lane；路徑與 engine lane 互斥。
+- 明確 argv：`--model claude-fable-5-1 --effort max`；只處理 R1-B04，交付 `06-fix-r1-status.md`。
