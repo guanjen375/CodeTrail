@@ -119,3 +119,17 @@
 ## R1 CLI 自動記憶副作用
 
 - lead 在交付後額外寫入 Claude 自動 memory 的本任務筆記與 index entry（repo 外、交接 owner 清單外）。root 由當次成功的 Write/Edit 工具記錄製成精確逆向 descriptor，交後續 Fable 整合者清理；其他既有 memory 不動。後續 CLI 以 session settings 關閉 autoMemoryEnabled，仍維持 model 與 effort 明確指定。
+
+## Step 5：R1 Fable 整合啟動
+
+- 明確 argv：`--model claude-fable-5-1 --effort max --settings {"autoMemoryEnabled":false}`；只整合 gate／文件與交接、清理本任務自動 memory 副作用，不改已交付產品 body。
+- 本步零測試，四條新 regression 已各一紅一綠；B02 原 B7 的 POST 在飛子情況仍待 Astra 裁定，尚不符合正式擱置門檻。
+
+## Step 5：R1 Fable 整合結果與 R2 審核啟動
+
+- init=`claude-fable-5-1`；result=`success`；is_error=False；duration_ms=982240。
+- modelUsage `claude-haiku-4-5-20251001`：canonical=`claude-haiku-4-5`，outputTokens=27，thinkingTokens=0。
+- modelUsage `claude-fable-5-1`：canonical=`claude-fable-5-1`，outputTokens=75723，thinkingTokens=32577。
+- 產品 digest：`16bda189fe8d6d99edfd1ebc86b59a373ac2a1816389d98d5c59ab41731f9349`；21檔2630+/59-，全 staged；本步零測試。
+- 回修總報告 `06-fix-r1.md` 與 `07-deferred.md` 已落檔；Astra MAX 沿用同一reviewer task進入R2，仍只審不改。
+- memory index 已精確還原；新筆記因原descriptor取用Write輸入雜湊而與落地內容不同，未刪。root後查到CLI回傳 `memdirStamped=true`，成功Write的 RESULT.content（2383 bytes）與現檔逐字一致、userModified=false、originalFile=null。已用回傳的實際落地內容產生 `r1-memory-cleanup-final.json`，交下一個Fable精確清理該單一任務檔；不推測其他資料。
