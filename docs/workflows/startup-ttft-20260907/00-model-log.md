@@ -140,3 +140,13 @@
 - `05-review-astra-r2.md` 記錄審核當時的 HEAD `b25a551`。隨後 `75e6346` 僅提交交接 markdown；產品 digest 仍為 `16bda189fe8d6d99edfd1ebc86b59a373ac2a1816389d98d5c59ab41731f9349`，不回寫歷史審核身分。
 - R2 回修明確 argv：`--model claude-fable-5-1 --effort max --settings {"autoMemoryEnabled":false}`。審核原文直接交 Fable，修法、Dependency 與必要檔案 owner 由 Fable 落在 `06-fix-r2.md`；root 不另外強制修復平行，也不代改碼。
 - 此輪只允許自己的必要新 regression 單 node 紅／綠；不重跑 smoke、不執行 full。結束後凍結產品，交 Astra 下一輪審核。
+- R2 CLI init 回傳 `model=claude-fable-5-1`、version=`2.1.263`；effective-effort 未由 init 獨立回報，MAX 依上述明確 argv 記錄。執行結果與 modelUsage 待本次完成補入。
+- R1 memory 副作用已由 R2 Fable 精確清理：先核對 descriptor 的 SHA-256，再刪除唯一的本任務筆記；root 已核對該路徑不存在。已還原的 `MEMORY.md` index 與其他筆記未修改。此項清理關閉。
+
+## R2 首次執行中止：模型安全審查造成自動換型
+
+- CLI argv 明指 Fable 5.1 MAX，但原始 log 的 system event 回傳 `subtype=model_refusal_fallback`、`trigger=refusal`、`scope=session`、`original_model=claude-fable-5-1`、`fallback_model=claude-opus-4-8`、`api_refusal_category=cyber`、`api_refusal_explanation=null`。這是實際回傳的模型安全審查事件，不是 root 選擇替代模型，也不是一般 overload。
+- 截止中止時，assistant frames 的 `message.model` 為 Fable 46 個、Opus 4.8 16 個；這是 frame 統計，不冒稱獨立 API 請求數。沒有完成的 result/modelUsage，不能記為成功或全程 Fable。
+- root 觀測到身分差異後，以 SIGINT 中止唯一的本任務 CLI 行程（session `c1d62eef-8f64-4a5b-a16b-e3bcbf4758de`，tool execution session 8338）。沒有 Write/Edit 呼叫、沒有 product/test 修改、沒有新測試；worktree product digest 仍為 `16bda189fe8d6d99edfd1ebc86b59a373ac2a1816389d98d5c59ab41731f9349`。上面的 memory 清理在換型前完成。
+- log 留在 private `06-fix-r2.stream.jsonl`。原 R2-B01/R2-B02 仍 active；本次沒有完成回修，不能用來宣告分歧擱置門檻已滿。
+- 下一次仍明指 Fable 5.1 MAX，以較精簡的本地程式／離線 regression 交接重試；不修改安全審查或權限設定來強制通過，也不接受別的主要模型代寫。持續核對每個 assistant frame 的 model 與 fallback system event，若再被拒絕／換型即停止該次，完整保留原因。
