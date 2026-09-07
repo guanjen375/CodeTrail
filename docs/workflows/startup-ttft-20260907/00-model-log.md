@@ -179,3 +179,11 @@
 - 使用者最新指示明確替換原角色分工；R2 修復交由 `gpt-6-astra`、reasoning_effort=`max`，Fable 5.1 MAX 接任 reviewer。不是 root 自行選擇替代模型。
 - Astra 沿用原 `/root/astra_plan_review` task 的明確 MAX 設定，該 task 現在改任 developer writer，處理 R2-B01／R2-B02；先在 `06-fix-r2.md` 記 Dependency、可寫檔案、共享 owner、工具與命令，再寫碼。
 - 原計畫驗收、單 node red-before-green 與禁止重跑 smoke/full 的開發者限制維持；之後 Fable 靜態歸零才 full。root 只維護交接與執行 metadata，不強制新增修復平行。
+
+## Astra R2 修復交付、Fable R3 審核啟動
+
+- Astra writer 沿用 `/root/astra_plan_review`，`gpt-6-astra`、reasoning_effort=`max`。交付 `06-fix-r2.md`：四條新 regression 各一次行為紅燈（exit 1）與一次綠燈（exit 0），每次 collected 1；root 讀取既有完整 log 的結果，沒有代跑測試。新增安全契約只寫未跑，沒有重跑 smoke／full。
+- 兩項 Blocker 已提交修法，仍待 Fable reviewer 裁定，不由 writer 或 root 宣告關閉。compileall 與 README consistency 均 exit 0；既有測試修改與理由、私有 diff、紅綠節錄及限制見交付報告。
+- Astra 凍結 actual HEAD=`b5d2f15650a564c2969870c098b2e0eac4248b58`、index tree=`709bbe102da21b5145df4eefa0501d897f39a311`、product digest=`61fda568fce324d31691892f51a01aa7f17831e4e2c3815d2c0e16868dac9b4a`。root 獨立核對 status 與 cached／worktree digest：23 個產品路徑全部 staged，無未暫存／未追蹤產品。產品未 commit，後續交接 markdown commit 不改此 digest。
+- 接續 reviewer 明確 argv：`CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1 claude -p --model claude-fable-5-1 --effort max --fallback-model claude-fable-5-1 --settings {"autoMemoryEnabled":false} ...`。維持模型安全審查，只禁止拒絕後自動換成另一型號；不改全域設定。
+- Fable 以 `ROLE=REVIEWER` 只寫 `05-review-fable-r3.md`，先集中靜態 Blocker 審核，歸零後才執行一次 `python3 scripts/run_tests.py`。完整輸出直接存 private `full-fable-r3.txt`，前後核對同一產品 digest；本次 init／result／modelUsage 待實際回傳補記。

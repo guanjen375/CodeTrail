@@ -1,5 +1,9 @@
 # startup-ttft-20260907 — Deferred 與尚未裁定事項
 
+> **Astra developer R2 回修交付狀態（2026-09-07）**：R2-B01 / R2-B02 已實作修復，四條新 regression 各一次行為紅燈、一次綠燈（每次 collected 1，紅 exit 1 / 綠 exit 0）。pending headers 改為先 shutdown 專用連線再放模型鎖，未改 B7；登記／快回應／晚到 worker／session create 空窗皆有保護。兩項目前是**修復完成待 Fable 5.1 MAX 審核**，不是正式擱置，也不由 writer 自行宣告關閉。最終凍結資料與完整證據見 `06-fix-r2.md`。
+>
+> 本輪未再跑 smoke、未跑 full；新 transport 三個安全契約與 create 失敗重新准入契約只寫未跑。Fable 靜態 Blocker 歸零後才對同一 freeze 跑 full。原 T0 仍未量測，不宣稱 TTFT 實際收益。下文 R1 清單保留歷史事實：其中「等 headers 才放鎖」已被本次 transport 修復替換，「待 Astra 裁定」已在 R2 審核裁定並進入本次回修；沒有新增正式 deferred。
+
 > **使用者最新授權**：已改派 Astra MAX 修復、Fable 5.1 MAX 審核，替換下述「等待另一 Claude 型號授權」狀態。R2-B01／R2-B02 仍 active，接續回修中；其他原案擱置與驗收狀態不變。角色變更見 `00-intake.md`，修復交接將寫入 `06-fix-r2.md`。
 
 > **R2 執行狀態更新（root，僅流程紀錄）**：Astra 已在 `05-review-astra-r2.md` 裁定兩項 active Blocker（R2-B01／R2-B02）。Fable 5.1 MAX 兩次回修嘗試均被模型自動安全審查以 `cyber` 拒絕，沒有產品／測試修改、沒有新測試；詳見 `06-fix-r2-execution.md`。產品 digest 仍為 `16bda189fe8d6d99edfd1ebc86b59a373ac2a1816389d98d5c59ab41731f9349`。這兩項**未擱置**、也不因模型拒絕而滿足技術分歧輪數；下一步需使用者決定是否授權另一個 Claude 型號回修。下文保留 R1 原始清單，其中「待 Astra 裁定」的後續裁定以 R2 審核報告為準。full 尚未執行，任務未完成。
