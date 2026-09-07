@@ -101,3 +101,21 @@
 
 - 依 Fable lead 的 `06-fix-r1-dependencies.md` READY 交接，在主工作樹啟動獨立 Fable status lane；路徑與 engine lane 互斥。
 - 明確 argv：`--model claude-fable-5-1 --effort max`；只處理 R1-B04，交付 `06-fix-r1-status.md`。
+
+## Step 5：R1 lead 回修結果
+
+- init=`claude-fable-5-1`；result=`success`；is_error=False；duration_ms=1505136。
+- modelUsage `claude-haiku-4-5-20251001`：canonical=`claude-haiku-4-5`，outputTokens=28，thinkingTokens=0。
+- modelUsage `claude-fable-5-1`：canonical=`claude-fable-5-1`，outputTokens=114930，thinkingTokens=63629。
+- 測試：engine 三條新 regression 各一紅一綠；status 一條新 regression 一紅一綠；其餘契約未單跑，沒有重跑 smoke 或執行 full。
+
+## Step 5：R1 status 回修結果
+
+- init=`claude-fable-5-1`；result=`success`；is_error=False；duration_ms=715375。
+- modelUsage `claude-haiku-4-5-20251001`：canonical=`claude-haiku-4-5`，outputTokens=27，thinkingTokens=0。
+- modelUsage `claude-fable-5-1`：canonical=`claude-fable-5-1`，outputTokens=56200，thinkingTokens=29619。
+- 測試：engine 三條新 regression 各一紅一綠；status 一條新 regression 一紅一綠；其餘契約未單跑，沒有重跑 smoke 或執行 full。
+
+## R1 CLI 自動記憶副作用
+
+- lead 在交付後額外寫入 Claude 自動 memory 的本任務筆記與 index entry（repo 外、交接 owner 清單外）。root 由當次成功的 Write/Edit 工具記錄製成精確逆向 descriptor，交後續 Fable 整合者清理；其他既有 memory 不動。後續 CLI 以 session settings 關閉 autoMemoryEnabled，仍維持 model 與 effort 明確指定。

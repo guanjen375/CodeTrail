@@ -25,3 +25,7 @@
 - Step 1 argv：`claude -p --model claude-fable-5-1 --effort max --output-format stream-json --verbose --no-session-persistence ...`。
 - Step 1 CLI init 回傳 `model=claude-fable-5-1`、`permissionMode=acceptEdits`；最終 modelUsage 待該次執行結束記錄。
 - 原始 Claude 執行 log 放在 owner-only `/tmp/codetrail-startup-ttft-20260907/`；不將完整來源／工具輸出 log commit。repo 僅記錄核對過的身分與驗證摘要。
+
+## 補充：修復平行的決策來源
+
+使用者詢問「所以修復平行是你做的不是我指定的，我之前都沒想過修復可平行」。root 已明確說明：將修復階段也平行化，是 root 把使用者對實作的 Dependency 平行規則延伸到修復階段的安排，並非使用者另外明示的要求。root 把修復拆分交給 Fable 5.1 MAX，由 Fable 決定實際 Dependency、介面與檔案 owner，再依其交接啟動 lane；修碼仍全部由 Claude 側執行。這個提問沒有取消正在進行的修復工作。
