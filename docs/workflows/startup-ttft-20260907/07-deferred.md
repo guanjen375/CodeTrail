@@ -1,5 +1,7 @@
 # startup-ttft-20260907 — Deferred 與尚未裁定事項
 
+> **使用者已批准補測**：最新回覆「好」，授權只補未完成447條、與既有3121條合併驗收。Fable 5.1 MAX 依 `08-test-recovery.md` 前景執行；改用精確node清單，避免R3報告整檔命令重複已通過node。此時補測尚未完成，靜態Blocker維持0；T0未量測、產品未commit／push，其他歷史狀態保留為原時點紀錄。
+
 > **Fable R3 正式書面交付完成**：`05-review-fable-r3.md` 已補齊，R2-B01／R2-B02 關閉、R1 四項維持關閉，靜態 Blocker 0；本次補交接零測試、產品 digest 未變。驗收仍未通過：3121 條有完整通過證據，447 條所在的兩個 shard 缺完整結果，full 無完整 exit，T0 未量測。沒有新增正式擱置。補跑安排見報告 §8.6；使用者尚未答覆 root 的補跑授權問題，未啟動補測。
 
 > **Fable R3 更新（root 執行紀錄）**：Fable 5.1 MAX 可見結論為靜態 Blocker 歸零，但它在啟動背景 full 後提前結束 CLI，該 task 被標記 `[killed]`。保存的 14 份完整 shard JUnit 合計 3121 passed，另兩個 shard 共 447 條缺完整結果；**full 未通過、任務未完成**。产品 digest 仍為 `61fda568fce324d31691892f51a01aa7f17831e4e2c3815d2c0e16868dac9b4a`。詳見 `05-review-fable-r3-execution.md`，書面審核待補齊；測試中斷不列正式擱置，T0 仍未量測。

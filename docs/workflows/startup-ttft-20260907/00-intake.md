@@ -33,3 +33,9 @@
 ## 最新角色調整（取代前述相關分工）
 
 使用者最新明示：「你改成 astra max 修復 fable5.1 max 審核」。自此由 Astra MAX 修復、Fable 5.1 MAX 審核，取代原先「Astra 只審不改／改碼一律 Claude」的分工限制。既有 Fable 定稿與驗收仍沿用；原始計畫和歷史審核不回寫。Astra 在修復時按 developer 測試權責執行，Fable 接任 `ROLE=REVIEWER`，先靜態審核收斂，再對同一份凍結產品執行獲准的 full。其餘 Blocker 定義、紅／綠證據、檔案交接、擱置規則與產品未獲准 commit／push 的限制均維持。
+
+## 使用者批准剩餘 447 條補測並合併驗收
+
+root 最後詢問「是否依 Fable 最終建議，只補測這 447 條，並合併既有結果驗收？」並明示這會將原本一次 full 改為兩段結果。使用者最新回覆「好」，已批准此安排；不再等待前一個補跑問題。授權範圍為同一產品 digest 上的剩餘 447 個 node、以前景執行，與既有 3121 個完整通過 node 合併，並非重跑整包或批准產品 commit／push。
+
+root 讀保存的 node 清單發現 R3 報告 §8.6 所列八個整檔也含已完成 shard 的 node（`test_code_rag_search.py`、`test_mcp_ingest.py`、`test_repo_consistency.py` 分跨 shard）；直接跑整檔超出 447 條範圍。交 Fable 改用保存的精確 447 個 node 清單，這不改補測範圍、產品或原驗收。執行交接見 `08-test-recovery.md`。
