@@ -133,3 +133,10 @@
 - 產品 digest：`16bda189fe8d6d99edfd1ebc86b59a373ac2a1816389d98d5c59ab41731f9349`；21檔2630+/59-，全 staged；本步零測試。
 - 回修總報告 `06-fix-r1.md` 與 `07-deferred.md` 已落檔；Astra MAX 沿用同一reviewer task進入R2，仍只審不改。
 - memory index 已精確還原；新筆記因原descriptor取用Write輸入雜湊而與落地內容不同，未刪。root後查到CLI回傳 `memdirStamped=true`，成功Write的 RESULT.content（2383 bytes）與現檔逐字一致、userModified=false、originalFile=null。已用回傳的實際落地內容產生 `r1-memory-cleanup-final.json`，交下一個Fable精確清理該單一任務檔；不推測其他資料。
+
+## Step 5：Astra R2 完成、Fable R2 回修
+
+- Astra MAX 回報 2 項取消邊界 Blocker（R2-B01、R2-B02）；其餘四項 R1 問題靜態關閉。零產品修改、零測試，未進 full。
+- `05-review-astra-r2.md` 記錄審核當時的 HEAD `b25a551`。隨後 `75e6346` 僅提交交接 markdown；產品 digest 仍為 `16bda189fe8d6d99edfd1ebc86b59a373ac2a1816389d98d5c59ab41731f9349`，不回寫歷史審核身分。
+- R2 回修明確 argv：`--model claude-fable-5-1 --effort max --settings {"autoMemoryEnabled":false}`。審核原文直接交 Fable，修法、Dependency 與必要檔案 owner 由 Fable 落在 `06-fix-r2.md`；root 不另外強制修復平行，也不代改碼。
+- 此輪只允許自己的必要新 regression 單 node 紅／綠；不重跑 smoke、不執行 full。結束後凍結產品，交 Astra 下一輪審核。
