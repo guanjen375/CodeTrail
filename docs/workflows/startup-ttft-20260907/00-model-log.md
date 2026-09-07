@@ -28,3 +28,15 @@
 - init=`claude-opus-5`；result=`success`；回覆：Opus 5(model ID:`claude-opus-5`)。
 - modelUsage `claude-haiku-4-5-20251001`：canonical=`claude-haiku-4-5`，outputTokens=24。
 - modelUsage `claude-opus-5`：canonical=`claude-opus-5`，outputTokens=22。
+
+## Step 2 完成
+
+- Astra MAX 集中回報 10 項 Blocker（B08 僅保留 T5 時適用）；未改產品、未跑測試或 live 請求。
+
+## Step 3：最終規劃
+
+- argv 明確指定 `--model claude-fable-5-1 --effort max`；唯一寫入 `03-plan-final.md`。
+- init=`claude-fable-5-1`；result=`success`；is_error=False；duration_ms=1209129。
+- modelUsage `claude-haiku-4-5-20251001`：canonical=`claude-haiku-4-5`，outputTokens=29，thinkingTokens=0。
+- modelUsage `claude-fable-5-1`：canonical=`claude-fable-5-1`，outputTokens=87474，thinkingTokens=54841。
+- B01–B10 的處理由 Fable 寫入最終計畫；Step 5 尚需審核實際產品，不能把計畫自述處理當成產品已通過審核。
