@@ -423,6 +423,16 @@ if not 0 < CLIENT_MAX_OUTPUT_TOKENS <= CLIENT_MAX_OUTPUT_TOKENS_CAP:  # pragma: 
 # 是 repo 常數而不是 client.json 的鍵:所有使用者一致;要關就是改這裡(見
 # `docs/troubleshooting.md` 的判讀方式)。
 CLIENT_PRIME_PROMPT_CACHE = True
+
+# 客戶端每輪的搜尋收斂邊界。宣告額度包含無效/被拒呼叫,所以真正送 MCP 的次數
+# 也一定受限;近似 grep 連續沒有新來源才停,精確重複可提早收斂。
+CLIENT_STAGNANT_TOOL_STEPS = 2
+CLIENT_MAX_TOOL_CALLS_PER_TURN = 64
+for _limit_name in ("CLIENT_STAGNANT_TOOL_STEPS", "CLIENT_MAX_TOOL_CALLS_PER_TURN"):
+    _limit_value = globals()[_limit_name]
+    if type(_limit_value) is not int or _limit_value <= 0:  # pragma: no cover - import guard
+        raise RuntimeError(f"{_limit_name} 必須是正整數,得到 {_limit_value!r}")
+
 CTX_SOFT_THRESHOLD = 0.80
 CTX_HARD_THRESHOLD = 0.90
 # context gate **沒有關閉開關,連常數都沒有**。每個逃生口都是一個要查文件才知道

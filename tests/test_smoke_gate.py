@@ -328,12 +328,39 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_client_config_and_skip_aux_preflight_reach_the_server_argv",
         ),
     ),
+    "test_client_progress.py": (
+        "工具結果每次重新查證,只存有界digest;同參數變更放行,近似grep需完整同來源/範圍;"
+        "banner不洗計數,截斷/無命中/未知格式不誤併,非唯讀dispatch含error清epoch,只認JSON true",
+        (
+            "test_exact_repeats_ignore_json_key_order_but_use_the_latest_result",
+            "test_interleaved_queries_are_tracked_without_crossing_turns",
+            "test_new_evidence_anywhere_in_a_batch_prevents_stagnation",
+            "test_nearby_grep_patterns_require_two_stagnant_complete_batches",
+            "test_same_batch_near_repeats_are_not_new_evidence",
+            "test_new_results_override_near_matches_even_when_a_file_is_restored",
+            "test_different_no_hit_queries_are_not_merged",
+            "test_changed_scope_or_unknown_arguments_are_not_discarded",
+            "test_known_grep_defaults_do_not_resolve_path_spellings",
+            "test_incomplete_or_unattributed_grep_results_never_merge_patterns",
+            "test_match_counts_and_partial_metadata_are_preserved",
+            "test_python_grep_line_clipping_is_not_treated_as_complete_evidence",
+            "test_exact_repeat_banner_and_adapter_changes_do_not_wash_the_counter",
+            "test_banner_like_data_and_unrelated_status_changes_remain_evidence",
+            "test_only_literal_readonly_true_avoids_reset_after_a_dispatch",
+            "test_non_dispatched_denials_and_invalid_calls_do_not_clear_the_epoch",
+            "test_progress_resets_the_near_stagnation_run",
+            "test_retained_state_is_bounded_and_contains_only_private_content_digests",
+            "test_invalid_tracking_limits_fail_loud_instead_of_disabling_the_guard",
+        ),
+    ),
     "test_client_engine.py": (
         "送出去的那一份才算數:reasoning 剝除只動 reasoning 欄位、只丟最新真實使用者訊息之前的、"
         "認不出那則訊息就整段不動;prune 只改 payload,session 檔與畫面保留原文;"
         "懸空 tool_call 必須在送出前補齊;權限 policy 的 readonly 全 deny(判準是 readOnlyHint 不是名單)、"
         "互動的七個 ask 沒核准就不得執行且重問有上限、核准框完整顯示參數(`import_external_file` 也在裡面:那個開關授權的是能力,不是每一次的來源與目的);"
         "只有工具結果的 text block 進模型;ingest marker 只認 ingest_document 的行首;"
+        "工具停滯後只准一次 tool_choice=none 收斂,同批超額與違規呼叫全補 error 不執行;"
+        "收斂指示 gate/HTTP 同源且不污染 session/預熱,取消不寫答案,非唯讀 dispatch 失敗也清比對狀態;"
         "假工具呼叫偵測不得把否定句算成宣稱;基底規則守 1,600 字元;閘對轉換後的 payload 計數;"
         "`load_session` 是唯一一次受信讀取(模型歷史與畫面歷史同源),`adopt` 之前 engine 零改動,"
         "transcript 只以標記呈現 compaction(畫面跟著模型歷史走 = 壓縮過的那段在畫面上永久消失);"
@@ -389,6 +416,13 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_the_approval_box_shows_every_argument_in_full",
             "test_only_the_text_block_is_fed_back_to_the_model",
             "test_the_loop_stops_instead_of_spinning",
+            "test_repeated_grep_gets_one_evidence_based_final_pass",
+            "test_nearby_grep_patterns_with_the_same_sources_converge",
+            "test_convergence_refuses_all_returned_tools_and_preserves_group_order",
+            "test_tool_call_budget_completes_unexecuted_members_of_one_batch",
+            "test_progress_rechecks_changed_results_and_reads_after_partial_writes",
+            "test_failed_convergence_preserves_raw_output_without_completing_the_turn",
+            "test_convergence_cancellation_never_commits_an_answer_or_posts_again",
             "test_broken_tool_arguments_are_reported_not_executed",
             "test_only_ingest_document_is_trusted_to_emit_the_action_marker",
             "test_a_marker_in_the_middle_of_a_line_never_notifies",

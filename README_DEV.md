@@ -105,6 +105,7 @@ docstring 說明它涵蓋哪些原始檔與為什麼：
   `test_lessons.py`。
 - 客戶端:`test_client_mcp.py`(取消契約)、`test_client_store.py`(session 檔私密性)、
   `test_client_engine.py`(訊息轉換 / 權限 / 工具迴圈)、`test_client_cli.py`(事件流與 headless)、
+  `test_client_progress.py`(本輪工具證據的重複判斷與新證據保留)、
   `test_client_turns.py`(回合協調與取消)、`test_client_app.py`(TUI:含 session
   選單與原始記錄重播)、`test_client_compaction.py`(壓縮規則與門檻)。
 - MCP / sandbox / mutation：`test_mcp_server.py`（啟動、runtime policy、工具目錄、

@@ -117,6 +117,14 @@
   (一步到位的 `call()` 只有 KeyboardInterrupt 一條路);中斷**不是答案**——歷史不得多出
   assistant 訊息,懸空的 tool_call 由 `run_tool_loop` 的 heal 補上「已中斷」結果;
   中斷後仍要送終結 `step_finish(reason=cancelled)`,否則看終結事件收工的一端永遠停在那裡
+- `client_progress` / `client_engine` 的工具收斂——依本輪實際重新執行的工具結果判斷，
+  不用跨輪負快取遮蔽新證據；近似 grep 只合併同範圍、同完整來源內容的查詢，
+  不合併不同無命中、截斷或未知格式。只有 JSON true 才是唯讀，任何非唯讀 dispatch
+  （含可能部分寫入的 error）都清除舊比對狀態。收斂限一次且計入原模型步數，
+  同一份短暫指示與 tools 先 gate 再送 HTTP，實送 `tool_choice=none`，不污染歷史／預熱；
+  server 仍回工具或同批超額時一律零執行、不詢問核准、依宣告順序補全 error 結果。
+  收斂失敗／重複前言不是答案，停止訊息經 `_commit_final` 且帶 `tool_status=error`；
+  取消後不得再發收斂請求，也不得把未完成答案寫入歷史
 - `client_prompt` 的來源檔讀取——每一輪都會進 system prompt,所以父目錄被 symlink 重導
   就要 fail-loud(只驗最終檔案擋不住「把 `.codetrail` 換成 symlink」),而且用
   `O_NOFOLLOW` + `fstat` 讀,不是 path-based 檢查再 `read_text`

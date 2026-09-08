@@ -38,6 +38,7 @@ import client_events
 import client_mcp
 import client_notify
 import client_policy
+import client_progress
 import client_prompt
 import config
 import context_budget
@@ -232,6 +233,25 @@ EMPTY_ANSWER_MESSAGE = (
 CANCELLED_TOOL_RESULT = (
     "status: error\n這次呼叫被中斷,沒有結果。\n"
     "next: 需要的話重新呼叫一次;不要假設它已經執行過。"
+)
+
+CONVERGENCE_INSTRUCTION = (
+    "本輪工具查證已到收斂邊界。這一次不可呼叫任何工具,也不可承諾稍後再查。"
+    "直接針對最新真實使用者的要求,根據已回傳的證據整理答案："
+    "列出已證實的具體差異與檔案:行號或來源,分清推測及尚未確認的差異,"
+    "最後給一個能執行的下一步。沒有足夠證據就明說無法確定原因。"
+    "工具 completed 只代表工具完成,不代表問題已解決。不要只說我理解了或找到關鍵差異,"
+    "不要重問使用者已澄清的載入格式或方式,也不要捏造差異、地址、數字或引用。"
+)
+CONVERGENCE_NOTICE = "工具查證已到收斂邊界,正在整理已知證據、未確認項目與下一步。"
+CONVERGENCE_STOP_MESSAGE = (
+    "[已停止] 模型在最後一次整理時仍未形成完整答案,這一輪不再執行工具。"
+    "已取得的工具結果仍保留在對話中;目前無法據此確認原因。"
+    "下一步：選出仍未證實的一項差異,連同相關工具結果提出具體查證要求。"
+)
+UNEXECUTED_TOOL_RESULT = (
+    "status: error\n這次工具呼叫未執行：本輪已進入收斂或用完工具額度。\n"
+    "next: 直接整理已取得的證據、尚未確認的差異與一個具體下一步,不要再呼叫工具。"
 )
 
 
@@ -1578,12 +1598,26 @@ class Engine:
         denied_counts: dict[str, int] = {}
         final_text = ""
         finish = client_events.REASON_STOP
+        progress = client_progress.ToolProgress(
+            stagnant_steps=config.CLIENT_STAGNANT_TOOL_STEPS,
+            max_entries=config.CLIENT_MAX_TOOL_CALLS_PER_TURN,
+        )
+        converge = False
+        preambles: set[str] = set()
 
         while steps < self.options.max_tool_steps:
             if self._cancel.is_set():
                 raise TurnCancelled("這一輪已被使用者中斷")
+            # 已有工具步才預留最後一個模型步驟;max=1 保留原本可執行工具的語意。
+            final_pass = converge or (steps > 0 and steps == self.options.max_tool_steps - 1)
+            if final_pass:
+                on_event(client_events.notice_event(self.session_id, CONVERGENCE_NOTICE))
             steps += 1
-            step = self._one_model_step(on_text=on_text, on_reasoning=on_reasoning)
+            step = self._one_model_step(
+                on_text=on_text, on_reasoning=on_reasoning,
+                tool_choice="none" if final_pass else "auto",
+                prior_preambles=preambles,
+            )
             final_text = step["content"] or final_text
             if step["content"]:
                 on_event(client_events.text_event(self.session_id, step["content"]))
@@ -1591,7 +1625,15 @@ class Engine:
             calls = step["tool_calls"]
             if not calls:
                 finish = step["finish"] or client_events.REASON_STOP
-                if step.get("truncated"):
+                if step.get("convergence_failed"):
+                    finish = client_events.REASON_ERROR
+                    final_text = CONVERGENCE_STOP_MESSAGE
+                    self._commit_final({
+                        "role": "assistant", "content": final_text,
+                        "tool_status": client_events.STATUS_ERROR,
+                    })
+                    on_event(client_events.text_event(self.session_id, final_text))
+                elif step.get("truncated"):
                     reason = step.get("truncation_reason") or ""
                     final_text = TRUNCATED_STREAM_MESSAGE + (f"({reason})" if reason else "")
                     notices.append(final_text)
@@ -1624,6 +1666,8 @@ class Engine:
                     )
                 break
 
+            if step["content"]:
+                preambles.add(" ".join(step["content"].split()))
             on_event(
                 client_events.step_finish_event(
                     self.session_id,
@@ -1631,10 +1675,27 @@ class Engine:
                     tokens=step["tokens"],
                 )
             )
+            progress.begin_step()
             for call in calls:
+                if self._cancel.is_set():
+                    raise TurnCancelled("這一輪已被使用者中斷")
                 tool_calls += 1
-                outcome = self._run_one_tool(
-                    call, specs=specs, approve=approve, denied_counts=denied_counts
+                # server 不遵守 tool_choice=none 也不能真的執行;同批超額宣告仍須
+                # 逐條補結果,保持 assistant(tool_calls) → tools 的完整相鄰順序。
+                if final_pass or tool_calls > config.CLIENT_MAX_TOOL_CALLS_PER_TURN:
+                    outcome = self._tool_reply(
+                        call, status=client_events.STATUS_ERROR, text=UNEXECUTED_TOOL_RESULT,
+                    )
+                else:
+                    outcome = self._run_one_tool(
+                        call, specs=specs, approve=approve, denied_counts=denied_counts
+                    )
+                spec = specs.get(call["name"])
+                progress.observe(
+                    call["name"], call["arguments"], outcome["text"],
+                    status=outcome["status"],
+                    read_only=spec is not None and spec.read_only is True,
+                    dispatched=outcome["dispatched"],
                 )
                 if outcome["status"] == client_events.STATUS_DENIED:
                     denied += 1
@@ -1649,6 +1710,17 @@ class Engine:
                         arguments=call["arguments"],
                     )
                 )
+            if final_pass:
+                finish = client_events.REASON_ERROR
+                final_text = CONVERGENCE_STOP_MESSAGE
+                self._commit_final({
+                    "role": "assistant", "content": final_text,
+                    "tool_status": client_events.STATUS_ERROR,
+                })
+                on_event(client_events.text_event(self.session_id, final_text))
+                on_event(client_events.step_finish_event(self.session_id, reason=finish))
+                break
+            converge = progress.finish_step() or tool_calls >= config.CLIENT_MAX_TOOL_CALLS_PER_TURN
         else:
             finish = client_events.REASON_ERROR
             final_text = (
@@ -1688,8 +1760,14 @@ class Engine:
         *,
         on_text: Callable[[str], None] | None,
         on_reasoning: Callable[[str], None] | None,
+        tool_choice: str = "auto",
+        prior_preambles: set[str] | None = None,
     ) -> dict[str, Any]:
         payload, transform = self.payload_messages()
+        if tool_choice == "none":
+            # 只改局部 wire payload,先加指示再 gate;session、預熱 prefix 與下一輪
+            # 的 system prompt 都保持原文。tools 保留,HTTP adapter 才會實送 none。
+            payload[0] = {**payload[0], "content": payload[0]["content"] + "\n\n" + CONVERGENCE_INSTRUCTION}
         usage = context_budget.check_and_log(
             source="client",
             requested_num_ctx=self.options.n_ctx,
@@ -1721,7 +1799,7 @@ class Engine:
                     top_k=config.CHAT_TOP_K,
                     min_p=config.CHAT_MIN_P,
                     tools=self._openai_tools,
-                    tool_choice="auto",
+                    tool_choice=tool_choice,
                     stream=True,
                     extra={"max_tokens": self.options.max_output_tokens},
                     timeout=self.options.request_timeout,
@@ -1784,6 +1862,15 @@ class Engine:
         elif cut:
             calls = {}
         tool_calls = _finalise_tool_calls(calls)
+        repeated_preamble = bool(
+            tool_choice == "none" and content.strip()
+            and " ".join(content.split()) in (prior_preambles or ())
+        )
+        convergence_failed = tool_choice == "none" and (
+            truncated or cut or not content.strip() or repeated_preamble
+        )
+        if repeated_preamble:
+            finish = client_events.REASON_ERROR
 
         message: dict[str, Any] = {"role": "assistant", "content": content or None}
         if reasoning:
@@ -1795,10 +1882,11 @@ class Engine:
             # 這一則不是完整回答。不標的話它會被狀態校正節錄當成已完成回合、
             # 也會被壓縮當成錨點。
             message["tool_status"] = client_events.STATUS_ERROR
-        if tool_calls:
+        if tool_calls or convergence_failed:
             # 還有工具要跑:這不是最後一則。看一次旗標再寫(檢查與 _record 不是原子:取消
             # 若插在兩者之間,這則 tool_calls 仍會記下,run_tool_loop 的 heal 會補「已中斷」
-            # 的工具結果,歷史仍合法——它不是答案,不需要線性化)。
+            # 的工具結果,歷史仍合法——它不是答案,不需要線性化)。收斂失敗時同樣
+            # 保留原始錯誤輸出,最後的明確停止訊息由 loop 經 _commit_final 寫入。
             with self._turn_state:
                 if self._cancel.is_set():
                     raise TurnCancelled("這一輪已被使用者中斷")
@@ -1814,6 +1902,7 @@ class Engine:
             "truncated": truncated,
             "truncation_reason": protocol_error,
             "cut": cut,
+            "convergence_failed": convergence_failed,
             "finish": finish or client_events.REASON_STOP,
             "tokens": {
                 "input": usage.actual_prompt_eval_count or usage.estimated_input_tokens,
@@ -1905,6 +1994,7 @@ class Engine:
                 call,
                 status=client_events.STATUS_ERROR,
                 text=f"status: error\n{exc}\nnext: 這是 MCP 傳輸層錯誤,不是工具參數問題。",
+                dispatched=True,
             )
 
         notice = client_notify.ingest_notice(name, result.text)
@@ -1914,6 +2004,7 @@ class Engine:
             text=result.text,
             structured=result.structured,
             notice=notice.message if notice else "",
+            dispatched=True,
         )
 
     def _call_tool(self, name: str, arguments: Mapping[str, Any]) -> client_mcp.ToolCallResult:
@@ -1954,6 +2045,7 @@ class Engine:
         text: str,
         structured: Any = None,
         notice: str = "",
+        dispatched: bool = False,
     ) -> dict[str, Any]:
         self._record(
             {
@@ -1965,7 +2057,7 @@ class Engine:
                 "structured": structured,
             }
         )
-        return {"status": status, "notice": notice}
+        return {"status": status, "notice": notice, "text": text, "dispatched": dispatched}
 
 
 # ============================================================

@@ -494,6 +494,295 @@ def test_broken_tool_arguments_are_reported_not_executed(engine_factory, monkeyp
     assert "不是合法 JSON" in [m for m in engine.messages if m["role"] == "tool"][0]["content"]
 
 
+def _repeated_grep_scenario(engine_factory, monkeypatch, *, nearby_patterns=False):
+    """重現真實的搜尋空轉；結果經過正式 adapter 與帶遞增次數的 server banner。"""
+    import repeat_guard
+    import tool_result_adapter
+
+    class _Search(FakeMcp):
+        def __init__(self):
+            super().__init__()
+            self.guard = repeat_guard.RepeatGuard()
+
+        def call(self, name, arguments=None, **_kwargs):
+            args = dict(arguments or {})
+            self.calls.append((name, args))
+            body = f"=== rg '{args['pattern']}' (1 matches) ===\nsrc/loader.c:18:load_segment(image);"
+            count = self.guard.observe(name, repeat_guard.args_key((), args), body)
+            if count >= repeat_guard.BANNER_THRESHOLD:
+                body = repeat_guard.banner(name, count) + body
+            adapted = tool_result_adapter.adapt_tool_result(
+                name, body,
+                budget=tool_result_adapter.resolve_result_budget(
+                    n_ctx=131072, requested_max_chars=None, safety_max_chars=200000,
+                ),
+            )
+            return client_mcp.ToolCallResult(
+                name, adapted.content[0].text, {"private": "UI only"}, adapted.isError,
+            )
+
+    mcp = _Search()
+    engine = engine_factory(mcp=mcp)
+    requests = []
+    gates = []
+    events = []
+    summary = (
+        "已證實：src/loader.c:18 呼叫 load_segment。尚未確認：兩份 ELF 的失敗差異。"
+        "下一步：比對兩份 PT_LOAD 的位址與大小。"
+    )
+    check = context_budget.check_and_log
+
+    def _gate(**kwargs):
+        gates.append(kwargs)
+        return check(**kwargs)
+
+    def _model(**kwargs):
+        requests.append(kwargs)
+        if kwargs.get("tool_choice") == "none":
+            return iter([_text_chunk(summary, finish="stop")])
+        pattern = f"load_segment|unused_{len(requests)}" if nearby_patterns else "load_segment"
+        return iter([
+            _text_chunk("我理解了，找到關鍵差異。"),
+            _tool_chunk("grep_code", json.dumps({"pattern": pattern}),
+                        call_id=f"lookup_{len(requests)}", finish="tool_calls"),
+        ])
+
+    monkeypatch.setattr(context_budget, "check_and_log", _gate)
+    monkeypatch.setattr(llama_client, "chat_completions", _model)
+    result = engine.send("比較可執行與失敗的 ELF，列出證據、差異與下一步。", on_event=events.append)
+    return engine, mcp, requests, gates, events, summary, result
+
+
+@pytest.mark.smoke
+def test_repeated_grep_gets_one_evidence_based_final_pass(engine_factory, monkeypatch):
+    engine, mcp, requests, gates, events, summary, result = _repeated_grep_scenario(
+        engine_factory, monkeypatch,
+    )
+    assert len(mcp.calls) == 2, "相同 grep 結果不應反覆執行到 24 步耗盡"
+    assert [r["tool_choice"] for r in requests] == ["auto", "auto", "none"]
+    assert result.steps == 3 and result.text == summary and result.finish == "stop"
+    assert requests[-1]["tools"] == engine.openai_tools()
+    assert gates[-1]["messages"] is requests[-1]["messages"]
+    assert gates[-1]["tools"] is requests[-1]["tools"]
+    assert gates[-1]["reserved_output_tokens"] == requests[-1]["extra"]["max_tokens"]
+    assert "UI only" not in json.dumps(requests[-1]["messages"])
+    assert len([e for e in events if client_events.is_terminal_event(e)]) == 1
+    assert client_events.is_terminal_event(events[-1])
+    assert not client_engine.pending_tool_call_ids(engine.messages)
+    saved = list(client_store.iter_messages(engine.store.read(engine.session_id)))
+    assert any(m.get("structured") == {"private": "UI only"} for m in saved)
+    assert any("第 2 次" in str(m.get("content")) for m in saved if m["role"] == "tool")
+    assert requests[-1]["messages"][0] != requests[0]["messages"][0]
+    saved_users = [m for m in saved if m["role"] == "user"]
+    assert len(saved_users) == 1 and saved_users[0]["content"] == engine.messages[0]["content"]
+    assert not saved_users[0].get("synthetic")
+
+    # 真實使用者的下一輪可以重新查證，收斂指示沒有污染歷史或共用工具 schema。
+    expected_prefix = engine.next_turn_prefix()
+    before = len(requests)
+    engine.send("我已更新檔案，請重新比較。")
+    assert len(mcp.calls) == 4
+    assert requests[before]["tool_choice"] == "auto"
+    assert requests[before]["messages"][:-1] == expected_prefix
+    assert requests[before]["messages"][0] == requests[0]["messages"][0]
+
+
+@pytest.mark.smoke
+def test_nearby_grep_patterns_with_the_same_sources_converge(engine_factory, monkeypatch):
+    engine, mcp, requests, _gates, _events, summary, result = _repeated_grep_scenario(
+        engine_factory, monkeypatch, nearby_patterns=True,
+    )
+    assert len(mcp.calls) == 3, "微調 pattern、來源行不變不能讓停滯判斷持續重置"
+    assert len({args["pattern"] for _name, args in mcp.calls}) == 3
+    assert [r["tool_choice"] for r in requests] == ["auto", "auto", "auto", "none"]
+    assert result.text == summary and result.finish == "stop" and result.steps == 4
+    assert not client_engine.pending_tool_call_ids(engine.messages)
+
+
+@pytest.mark.smoke
+def test_convergence_refuses_all_returned_tools_and_preserves_group_order(engine_factory, monkeypatch):
+    import client_compaction
+
+    mcp = FakeMcp()
+    engine = engine_factory(mcp=mcp, max_tool_steps=2)
+    requests, events, asked = [], [], []
+
+    def model(**kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            return iter([_tool_chunk("read_file", '{"path":"loader.c"}',
+                                     call_id="source", finish="tool_calls")])
+        return iter([
+            _tool_chunk("apply_patch", '{"diff":"whole patch"}', index=0, call_id="write"),
+            _tool_chunk("run_command", '{"command":"make"}', index=1, call_id="run"),
+            _tool_chunk("grep_code", '{"pattern":"load"}', index=2, call_id="read", finish="tool_calls"),
+        ])
+
+    monkeypatch.setattr(llama_client, "chat_completions", model)
+    result = engine.send("比對來源", on_event=events.append, approve=lambda r: asked.append(r) or True)
+    assert [r["tool_choice"] for r in requests] == ["auto", "none"]
+    assert mcp.calls == [("read_file", {"path": "loader.c"})] and not asked
+    assert result.finish == "error" and result.text.startswith("[已停止]") and result.steps == 2
+    tools = [m for m in engine.messages if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in tools] == ["source", "write", "run", "read"]
+    assert all(m["tool_status"] == "error" and "未執行" in m["content"] for m in tools[1:])
+    assert [m["role"] for m in engine.messages] == [
+        "user", "assistant", "tool", "assistant", "tool", "tool", "tool", "assistant",
+    ]
+    tool_events = [e for e in events if e["type"] == client_events.TYPE_TOOL_USE]
+    assert len(tool_events) == 4
+    assert len([e for e in events if client_events.is_terminal_event(e)]) == 1
+    assert engine.messages[-1]["tool_status"] == "error"
+    assert client_compaction.completed_turns(engine.messages) == []
+    assert not client_engine.pending_tool_call_ids(engine.messages)
+
+
+@pytest.mark.smoke
+def test_tool_call_budget_completes_unexecuted_members_of_one_batch(engine_factory, monkeypatch):
+    monkeypatch.setattr(config, "CLIENT_MAX_TOOL_CALLS_PER_TURN", 2)
+    mcp = FakeMcp()
+    engine = engine_factory(mcp=mcp)
+    requests, asked, events = [], [], []
+
+    def model(**kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            return iter([
+                _tool_chunk("read_file", '{"path":"a.c"}', index=0, call_id="a"),
+                _tool_chunk("read_file", '{"path":"b.c"}', index=1, call_id="b"),
+                _tool_chunk("apply_patch", '{"diff":"full patch"}', index=2, call_id="c"),
+                _tool_chunk("read_file", '{"path":"c.c"}', index=3, call_id="d", finish="tool_calls"),
+            ])
+        return iter([_text_chunk("目前只有兩份讀取結果，尚未確認原因。下一步比對入口位址。", finish="stop")])
+
+    monkeypatch.setattr(llama_client, "chat_completions", model)
+    result = engine.send("分析差異", on_event=events.append, approve=lambda r: asked.append(r) or True)
+    assert len(mcp.calls) == 2 and not asked
+    assert [r["tool_choice"] for r in requests] == ["auto", "none"]
+    assert result.tool_calls == 4 and result.steps == 2
+    replies = [m for m in engine.messages if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in replies] == ["a", "b", "c", "d"]
+    assert [m["tool_status"] for m in replies] == ["completed", "completed", "error", "error"]
+    assert all("未執行" in m["content"] for m in replies[2:])
+    assert not client_engine.pending_tool_call_ids(engine.messages)
+    assert len([e for e in events if e["type"] == client_events.TYPE_TOOL_USE]) == 4
+
+
+@pytest.mark.smoke
+def test_progress_rechecks_changed_results_and_reads_after_partial_writes(engine_factory, monkeypatch):
+    class _Changed(FakeMcp):
+        def __init__(self):
+            super().__init__()
+            self.reads = 0
+
+        def call(self, name, arguments=None, **kwargs):
+            super().call(name, arguments, **kwargs)
+            if name == "apply_patch":
+                return client_mcp.ToolCallResult(name, "status: error\npatch 已套用,驗證失敗", None, True)
+            self.reads += 1
+            text = "old" if self.reads == 1 else "new"
+            return client_mcp.ToolCallResult(name, f"status: ok\n1 | {text}", None, False)
+
+    mcp = _Changed()
+    engine = engine_factory(mcp=mcp)
+    requests = []
+
+    def model(**kwargs):
+        requests.append(kwargs)
+        if kwargs["tool_choice"] == "none":
+            return iter([_text_chunk("修改後讀到 new；驗證仍失敗。下一步檢查驗證錯誤。", finish="stop")])
+        index = len(requests)
+        name, args = ("apply_patch", '{"diff":"patch"}') if index == 3 else ("read_file", '{"path":"a.c"}')
+        return iter([_tool_chunk(name, args, call_id=f"call_{index}", finish="tool_calls")])
+
+    monkeypatch.setattr(llama_client, "chat_completions", model)
+    result = engine.send("修改後重讀", approve=lambda _r: True)
+    assert [name for name, _args in mcp.calls] == ["read_file", "read_file", "apply_patch", "read_file", "read_file"]
+    assert [r["tool_choice"] for r in requests] == ["auto"] * 5 + ["none"]
+    assert result.finish == "stop"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("failure", ["empty", "truncated", "length", "repeated_preamble"])
+def test_failed_convergence_preserves_raw_output_without_completing_the_turn(engine_factory, monkeypatch, failure):
+    import client_compaction
+
+    engine = engine_factory(max_tool_steps=2)
+    requests, events = [], []
+    raw = "我理解了，找到關鍵差異。" if failure == "repeated_preamble" else "半段答案"
+    if failure == "empty":
+        raw = ""
+
+    def model(**kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            return iter([
+                _text_chunk("我理解了，找到關鍵差異。"),
+                _tool_chunk("read_file", '{"path":"a.c"}', call_id="a", finish="tool_calls"),
+            ])
+        finish = None if failure == "truncated" else "length" if failure == "length" else "stop"
+        return iter([_text_chunk(raw, finish=finish)])
+
+    monkeypatch.setattr(llama_client, "chat_completions", model)
+    result = engine.send("比較差異", on_event=events.append)
+    assert requests[-1]["tool_choice"] == "none" and len(requests) == 2
+    assert result.finish == "error" and result.text.startswith("[已停止]")
+    assert engine.messages[-2]["content"] == (raw or None)
+    assert engine.messages[-2]["tool_status"] == "error"
+    assert engine.messages[-1]["tool_status"] == "error"
+    assert client_compaction.completed_turns(engine.messages) == []
+    assert len([e for e in events if client_events.is_terminal_event(e)]) == 1
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("cancel_at", ["before_convergence", "streaming", "final_commit"])
+def test_convergence_cancellation_never_commits_an_answer_or_posts_again(engine_factory, monkeypatch, cancel_at):
+    import client_turns
+
+    class _CancelBefore(FakeMcp):
+        def call(self, name, arguments=None, **kwargs):
+            result = super().call(name, arguments, **kwargs)
+            if cancel_at == "before_convergence":
+                assert engine.cancel() is True
+            return result
+
+    mcp = _CancelBefore()
+    engine = engine_factory(mcp=mcp, max_tool_steps=2)
+    requests, events = [], []
+
+    def model(**kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            return iter([_tool_chunk("read_file", '{"path":"a.c"}', call_id="a", finish="tool_calls")])
+
+        def stream():
+            yield _text_chunk("尚未完成")
+            if cancel_at == "streaming":
+                assert engine.cancel() is True
+            yield _text_chunk("", finish="stop")
+
+        return stream()
+
+    monkeypatch.setattr(llama_client, "chat_completions", model)
+    commit = engine._commit_final
+
+    def cancel_before_commit(message):
+        if cancel_at == "final_commit":
+            assert engine.cancel() is True
+        commit(message)
+
+    monkeypatch.setattr(engine, "_commit_final", cancel_before_commit)
+    coordinator = client_turns.TurnCoordinator(engine, emit=events.append)
+    monkeypatch.setattr(coordinator, "_spawn", lambda body, _name: body())
+    coordinator.start_turn("比較差異")
+    assert len(requests) == (1 if cancel_at == "before_convergence" else 2)
+    assert not any(m["role"] == "assistant" and not m.get("tool_calls") for m in engine.messages)
+    assert not client_engine.pending_tool_call_ids(engine.messages)
+    terminal = [e for e in events if client_events.is_terminal_event(e)]
+    assert len(terminal) == 1 and terminal[0]["part"]["reason"] == "cancelled"
+    assert not coordinator.busy
+
+
 # ============================================================
 # 通知
 # ============================================================
