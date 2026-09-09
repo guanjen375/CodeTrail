@@ -81,6 +81,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 
 import config
+import figure_quality
 
 if os.name != "nt":
     import fcntl
@@ -799,12 +800,31 @@ _FIGURE_ENTRY_OPTIONAL = {
     "review_asset_paths": dict,
     "crop_is_model_input": bool,
     "duplicate_of": type(None),
+    "quality_grade": str,
+    "review_state": str,
+    "auto_disposition": str,
+    "quality_issues": list,
 }
 
 
 def _require(condition, message: str) -> None:
     if not condition:
         raise _err(message)
+
+
+def _entry_quality(entry: dict) -> dict:
+    """Writer and revision mirror use the same evaluator as canonical KB chunks."""
+    return figure_quality.assess_quality(
+        entry["payload"], entry["kind"], reasons=entry["reasons"],
+        evidence=entry["evidence"], extraction_status=entry["extraction_status"],
+        verification_status=entry["verification_status"],
+        human_verification=entry["human_verification"])
+
+
+def _quality_metadata(entry: dict) -> dict:
+    """Legacy reads receive conservative defaults without silently regrading content."""
+    return {name: copy.deepcopy(entry.get(name, default))
+            for name, default in figure_quality.QUALITY_DEFAULTS.items()}
 
 
 def _check_rel_path(value, *, slug: str, run_id: str, what: str, allow_empty: bool = True,
@@ -917,6 +937,17 @@ def _validate_manifest(data, *, slug: str, run_id: str,
         entry.setdefault("review_asset_paths", {})
         entry.setdefault("crop_is_model_input", False)
         entry.setdefault("duplicate_of", None)
+        for name, default in figure_quality.QUALITY_DEFAULTS.items():
+            entry.setdefault(name, copy.deepcopy(default))
+        for name, allowed in (("quality_grade", figure_quality.QUALITY_GRADES),
+                              ("review_state", figure_quality.REVIEW_STATES),
+                              ("auto_disposition", figure_quality.AUTO_DISPOSITIONS)):
+            _require(isinstance(entry[name], str) and entry[name] in allowed,
+                     f"{item}: {name}={entry[name]!r} 不合法")
+        _require(isinstance(entry["quality_issues"], list)
+                 and all(isinstance(issue, str) and issue in figure_quality.QUALITY_ISSUES
+                         for issue in entry["quality_issues"]),
+                 f"{item}: quality_issues 必須是已知品質 issue 的 list[str]")
         for name, roots in (("variant_paths", (VARIANTS_DIR,)),
                             ("review_asset_paths", (REVIEW_ASSETS_DIR,))):
             _require(isinstance(entry[name], dict), f"{item}: {name} 必須是 object")
@@ -977,6 +1008,30 @@ def _validate_manifest(data, *, slug: str, run_id: str,
                      f"{item}: 帶 human_verification 但 verification_status="
                      f"{entry['verification_status']!r}——人工確認紀錄不得掛在非 "
                      f"{fx.VERIF_HUMAN} 的 figure 上")
+            # The artifact boundary must not publish content that the KB boundary
+            # refuses as human_verified. Historical machine evidence is not current
+            # payload evidence after a fix; _apply_revision_to_entry archives it.
+            uncertainty = fx._payload_uncertainty(payload, entry["kind"]) if payload else []
+            payload_quality = figure_quality.assess_quality(
+                payload, entry["kind"], verification_status=fx.VERIF_HUMAN,
+                human_verification=human)
+            _require(payload is not None and not uncertainty
+                     and payload_quality["review_state"] == "confirmed",
+                     f"{item}: human_verified 的人工確認 payload 仍有不確定內容："
+                     + "; ".join(uncertainty))
+        if entry["review_state"] == "confirmed":
+            _require(human is not None and entry["verification_status"] == fx.VERIF_HUMAN,
+                     f"{item}: review_state=confirmed 必須有合法人工確認紀錄")
+            _require(entry["quality_grade"] in ("usable", "formatting_only")
+                     and entry["auto_disposition"] == "accept",
+                     f"{item}: 有損壞的品質狀態不得標為人工確認 confirmed")
+        if strict_new_write:
+            assessed = _entry_quality(entry)
+            _require(_quality_metadata(entry) == assessed,
+                     f"{item}: 品質 metadata 與目前 payload/evidence 不一致")
+            if human is not None:
+                _require(assessed["review_state"] == "confirmed",
+                         f"{item}: human_verified 的人工確認仍有已知內容缺陷")
 
     _validate_cross_entry_links(figures, where=where, failed=bool(data["failed"]),
                                 strict_new_write=strict_new_write)
@@ -1953,6 +2008,7 @@ def write_run_artifacts(root, *, document_id: str, run_id: str, figures, variant
         if human_verifications is not None and figure_id in human_verifications:
             entry["human_verification"] = _carry_human_verification(
                 entry, human_verifications[figure_id], figure_id)
+        entry.update(_entry_quality(entry))
 
     manifest = {
         "schema": MANIFEST_SCHEMA,
@@ -2132,6 +2188,19 @@ def _preview(entry: dict, limit: int = 3) -> list[str]:
     return [line[:120] for line in lines]
 
 
+def _source_reverification_reason(reasons: list[str]) -> str:
+    """A definite source-coverage failure needs source evidence that fix does not retain.
+
+    Use the current revision's producer reason, never an older mirror's evidence or
+    a generic warning. Editing the payload alone cannot prove the missing source is
+    present; unknown coverage and semantic review still permit human confirmation.
+    """
+    if "transcription_source_incomplete" not in reasons:
+        return ""
+    return ("目前 revision 已證實來源文字未完整抽取；fix 沒有完整來源可重新核對，"
+            "無法確認提交內容的完整性。請重新 ingest 並完成來源完整性核對後再覆核。")
+
+
 def _render_review(manifest: dict) -> str:
     """`review.md`：人工覆核用的摘要（狀態、原因、原圖路徑、修正指令、清除方式）。"""
     fx = _fx()
@@ -2141,12 +2210,16 @@ def _render_review(manifest: dict) -> str:
     # manifest 裡（下面單獨一節），所以「這張圖去哪了」查得到。
     skipped = [entry for entry in figures
                if entry["extraction_status"] == fx.EXTRACTION_SKIPPED]
+    excluded = [entry for entry in figures if entry not in skipped
+                and entry.get("auto_disposition") == "excluded"]
+    repair = [entry for entry in figures if entry not in skipped
+              and entry.get("auto_disposition") == "repair_required"]
     flagged = [entry for entry in figures
-               if entry not in skipped
-               and (entry["verification_status"] in fx.FLAGGED_VERIFICATION
-                    or entry["extraction_status"] != fx.EXTRACTION_COMPLETE)]
+               if entry not in skipped and entry not in excluded and entry not in repair
+               and entry.get("auto_disposition", "manual_review") == "manual_review"]
     trusted = [entry for entry in figures
-               if entry not in flagged and entry not in skipped]
+               if entry not in flagged and entry not in skipped
+               and entry not in excluded and entry not in repair]
 
     out = [
         f"# Figure review — {manifest['display_name']}",
@@ -2154,7 +2227,8 @@ def _render_review(manifest: dict) -> str:
         f"- document_id: `{manifest['document_id']}`",
         f"- run: `{manifest['run_id']}`（{'抽取失敗，KB 零寫入' if manifest['failed'] else '抽取成功'}）",
         f"- 產生時間: {manifest['created_at']}",
-        f"- 圖數: {len(figures)}（待覆核 {len(flagged)} / 已驗證 {len(trusted)}）",
+        f"- 圖數: {len(figures)}（待覆核 {len(flagged)} / 需修復 {len(repair)} / "
+        f"品質排除 {len(excluded)} / 已驗證 {len(trusted)}）",
         "",
         "> ⚠️ 這個目錄可能含 NDA 內容（原始頁面影像、送模型的 crop、逐字 payload）。",
         "> `.codetrail/` 已列入 `.gitignore`，不會進 git。清除方式見文末。",
@@ -2174,6 +2248,19 @@ def _render_review(manifest: dict) -> str:
             )
             if entry["extraction_status"] != fx.EXTRACTION_COMPLETE:
                 out.append(f"- 抽取狀態: **{entry['extraction_status']}**（未入庫）")
+            elif entry.get("auto_disposition") == "excluded":
+                out.append("- 抽取狀態: **complete**（品質排除，未入庫；保留完整 payload 與原圖）")
+            quality = _quality_metadata(entry)
+            out.append(f"- 品質: {quality['quality_grade']}；人工狀態: {quality['review_state']}；"
+                       f"處置: {quality['auto_disposition']}")
+            if quality["quality_issues"]:
+                out.append("- 品質問題: " + ", ".join(quality["quality_issues"]))
+            fixable_reason = _source_reverification_reason(entry["reasons"])
+            if fixable_reason:
+                out.append(f"- 下一步: {fixable_reason}")
+            elif quality["auto_disposition"] in ("repair_required", "excluded"):
+                out.append("- 下一步: 重新抽取或修正已知缺陷；保留的部分資訊仍有限制，"
+                           "不可把含缺字或衝突的內容原樣確認。")
             if entry["reasons"]:
                 out.append(f"- 原因: {', '.join(entry['reasons'])}")
             for detail in entry["reason_details"]:
@@ -2256,7 +2343,9 @@ def _render_review(manifest: dict) -> str:
                 out.append(f"  {fence}")
                 out.extend(f"  {line}" for line in preview)
                 out.append(f"  {fence}")
-            if entry["extraction_status"] == fx.EXTRACTION_COMPLETE:
+            if (entry["extraction_status"] == fx.EXTRACTION_COMPLETE
+                    and entry.get("auto_disposition") != "excluded"
+                    and not fixable_reason):
                 command = [
                     f'  review_figures(action="fix", document_id="{entry["document_id"]}",',
                     f'                 figure_id="{entry["figure_id"]}", '
@@ -2271,7 +2360,9 @@ def _render_review(manifest: dict) -> str:
                 out.append(f"  {fence}")
             out.append("")
 
-    _section("待覆核（needs_review / unverified / legacy_unverified / 抽取失敗）", flagged)
+    _section("需修復（repair_required）", repair)
+    _section("品質排除（excluded，未入庫）", excluded)
+    _section("待人工判斷（manual_review）", flagged)
     _section("已驗證（native_verified / corroborated / human_verified）", trusted)
     _section("判定不是圖面（skipped，未入庫、不需覆核）", skipped)
 
@@ -2304,6 +2395,7 @@ _IMMUTABLE_CHUNK_FIELDS = (
     # 檢索訊號（caption / 章節）：同一張圖的每個 part 一定相同，不一致代表有人只
     # 改了一半——症狀是同一張表有些 part 找得到、有些找不到。
     "figure_caption", "section", "heading_hierarchy",
+    "quality_grade", "review_state", "auto_disposition", "quality_issues",
 )
 
 # `apply_fix` 重建 chunk 時要原樣帶回去的檢索訊號。它們**不是** payload 的一部分
@@ -2328,7 +2420,9 @@ def _empty_result(document_id: str, figure_id: str) -> dict:
         "crop_is_model_input": False, "duplicate_of": None, "source_signature": None,
         "run_id": "", "chunk_count": 0,
         "part_total": 0, "human_verification": None, "in_kb": False,
-        "fixable": False, "payload_error": "", "warnings": [],
+        "fixable": False, "fixable_reason": "", "payload_error": "", "warnings": [],
+        "evidence": {},
+        **copy.deepcopy(figure_quality.QUALITY_DEFAULTS),
     }
 
 
@@ -2340,7 +2434,8 @@ def _check_group_consistency(members: list[dict], kind: str, total) -> list[str]
     problems: list[str] = []
     first = members[0]
     for name in _IMMUTABLE_CHUNK_FIELDS:
-        values = {json.dumps(member.get(name), ensure_ascii=False, sort_keys=True, default=str)
+        values = {json.dumps(member.get(name, figure_quality.QUALITY_DEFAULTS.get(name)),
+                             ensure_ascii=False, sort_keys=True, default=str)
                   for member in members}
         if len(values) != 1:
             problems.append(f"{name} 在 {len(members)} 個 chunk 之間不一致: {sorted(values)[:3]}")
@@ -2467,6 +2562,8 @@ def _entry_from_manifest_figure(entry: dict, manifest: dict, result: dict,
     result["occurrences"] = copy.deepcopy(entry["occurrences"])
     result["model_input_variant"] = entry["model_input_variant"]
     result["human_verification"] = copy.deepcopy(entry["human_verification"])
+    if entry["current_revision"] == result["revision"]:
+        result["evidence"] = copy.deepcopy(entry["evidence"])
     result["source_signature"] = copy.deepcopy(entry.get("source_signature"))
     result["duplicate_of"] = entry.get("duplicate_of")
     asset_path = entry["asset_path"] or ""
@@ -2499,7 +2596,7 @@ def _entry_from_manifest_figure(entry: dict, manifest: dict, result: dict,
 def list_figures(root, kb_chunks: list, *, document_id: str | None = None) -> list[dict]:
     """覆核清單：KB 內的 structured figure ＋ 只存在於 artifacts 的失敗 figure。
 
-    回傳 key 見契約 §11.3（凍結）＋本模組的附加欄位（`in_kb` / `fixable` /
+    回傳 key 見契約 §11.3（凍結）＋本模組的附加欄位（`in_kb` / `fixable` / `fixable_reason` /
     `payload_error` / `warnings` / `run_id` / `asset_path` / `variant_paths` /
     `review_asset_paths` / `crop_is_model_input` / `duplicate_of` /
     `source_signature` / `occurrences` / `figure_index` / `model_input_variant` /
@@ -2516,6 +2613,8 @@ def list_figures(root, kb_chunks: list, *, document_id: str | None = None) -> li
     - 同一個 figure 的 chunk 之間 metadata 不一致或 range 沒有無縫覆蓋 →
       `payload=None`、`crop_path=""`、`fixable=False` + `payload_error`。
     - payload 的 revision 與 KB revision 不精確相等 → `payload=None` + `payload_error`。
+    - KB 當前 revision 已知來源文字不完整 → `fixable=False` + `fixable_reason`；
+      fix 沒有完整來源可重核，必須重新 ingest 後覆核。
 
     抽取失敗的 figure 依契約不進 KB，所以只掃 KB 會讓它們無從覆核；因此這裡也會掃
     artifacts，把不在 KB 的 figure 以 `in_kb=False` / `fixable=False` 併進來。
@@ -2569,11 +2668,17 @@ def _kb_group_entry(root_real: Path, document_id: str, figure_id: str,
     result["model_input_variant"] = str(first.get("model_input_variant", ""))
     result["part_total"] = _as_int(first.get("part_total"), 0)
     result["occurrences"] = copy.deepcopy(first.get("occurrences") or [])
+    result.update(_quality_metadata(first))
     extraction, verification, reasons = fx.aggregate_status(members)
     result["extraction_status"] = extraction
     result["verification_status"] = verification
     result["reasons"] = reasons
     result["reason_details"] = fx.aggregate_reason_details(members)
+    fixable_reason = _source_reverification_reason(reasons)
+    result["fixable_reason"] = fixable_reason
+    if fixable_reason:
+        result["warnings"].append("source_reverification_required")
+        result["reason_details"].append(fixable_reason)
     result["display_name"] = fx.display_name_for(document_id) if "::" in document_id else ""
 
     totals = result["row_total"] if result["kind"] == fx.KIND_TABLE else result["line_total"]
@@ -2601,13 +2706,13 @@ def _kb_group_entry(root_real: Path, document_id: str, figure_id: str,
     if manifest is None:
         result["payload_error"] = f"讀不到 review artifact（{result['evidence_ref']}）：{error}"
         result["warnings"].append("artifact_unavailable")
-        result["fixable"] = True
+        result["fixable"] = not fixable_reason
         return result
     entry = next((item for item in manifest["figures"] if item["figure_id"] == figure_id), None)
     if entry is None:
         result["payload_error"] = f"manifest {result['evidence_ref']} 沒有 {figure_id}"
         result["warnings"].append("artifact_missing_figure")
-        result["fixable"] = True
+        result["fixable"] = not fixable_reason
         return result
     if entry["document_id"] != document_id:
         result["payload_error"] = "manifest 的 document_id 與 KB chunk 不符"
@@ -2622,7 +2727,7 @@ def _kb_group_entry(root_real: Path, document_id: str, figure_id: str,
         document_id=document_id, figure_id=figure_id)
     result["payload"] = payload
     result["payload_error"] = payload_error
-    result["fixable"] = True
+    result["fixable"] = not fixable_reason
     return result
 
 
@@ -2700,7 +2805,10 @@ def _artifact_only_entries(root_real: Path, document_id: str | None,
         result["row_total"] = entry["row_total"]
         result["line_total"] = entry["line_total"]
         result["payload"] = copy.deepcopy(entry["payload"])
-        result["warnings"].append("artifact_only")
+        result.update(_quality_metadata(entry))
+        result["warnings"].append(
+            "quality_excluded" if entry.get("auto_disposition") == "excluded"
+            and entry["extraction_status"] == fx.EXTRACTION_COMPLETE else "artifact_only")
         if entry["payload"] is None:
             result["payload_error"] = (
                 "抽取失敗，沒有 canonical payload（這一張不進 KB；"
@@ -2778,6 +2886,8 @@ def apply_fix(root, kb_path, *, document_id: str, figure_id: str, expected_revis
     1. `validate_payload(payload, kind)`（**第一個語義檢查**；不合格拋
        `FigureValidationError`，零寫入）。
     2. `confirm_against_image` 必須是 `True`——只提交機器轉寫不算人工對圖確認。
+       KB 當前 revision 帶 `transcription_source_incomplete` 時，fix 沒有完整來源可
+       重核，拒絕任何提交內容；必須重新 ingest 並完成來源核對後再覆核。
     3. render 衍生文字 → `rechunk(payload, kind, meta)`（注入，避免 `figure_review → RAG`
        的 import 循環）。**回傳值只當交叉檢查**：真正入庫的 chunk 由
        `figure_extract.build_figure_chunks()`（structured chunk 的唯一產生點）重建，
@@ -2863,6 +2973,10 @@ def apply_fix(root, kb_path, *, document_id: str, figure_id: str, expected_revis
     if problems:
         raise _err(f"{where}: KB 內這個 figure 的 chunk 不一致，拒絕修正：" + "；".join(problems))
 
+    fixable_reason = _source_reverification_reason(fx.aggregate_status(members)[2])
+    if fixable_reason:
+        raise _err(f"{where}: {fixable_reason}", code="source_reverification_required")
+
     source = str(first.get("source", ""))
     doc_type = str(first.get("type", "")) or "doc"
     page = _as_int(first.get("page"), 0)
@@ -2923,6 +3037,13 @@ def apply_fix(root, kb_path, *, document_id: str, figure_id: str, expected_revis
         "model_input_variant": str(first.get("model_input_variant", "")),
         "row_total": row_total,
         "line_total": line_total,
+        # The revision was explicitly confirmed above; do not infer this record from
+        # human_verified in the chunk builder. No old atom/coverage findings apply to
+        # newly corrected text.
+        "human_verification": {"revision": new_revision,
+                               "confirmed_against_image": True, "carried_over": False},
+        "evidence": {"human_correction": {"revision": new_revision,
+                                           "previous_revision": expected_revision}},
     }
     try:
         parts = rechunk(payload, kind, meta)
@@ -2950,6 +3071,8 @@ def apply_fix(root, kb_path, *, document_id: str, figure_id: str, expected_revis
         "model_input_variant": meta["model_input_variant"],
         "row_total": row_total,
         "line_total": line_total,
+        "human_verification": copy.deepcopy(meta["human_verification"]),
+        "evidence": copy.deepcopy(meta["evidence"]),
     }
     base = _chunk_index_base(chunks_snapshot, source=source, page=page,
                              exclude=excluded, count=len(parts))
@@ -3111,6 +3234,7 @@ def apply_fix(root, kb_path, *, document_id: str, figure_id: str, expected_revis
         "manifest_path": manifest_path,
         "payload_path": payload_path,
         "warnings": warnings,
+        **_quality_metadata(new_chunks[0]),
     }
 
 
@@ -3195,6 +3319,18 @@ def _apply_revision_to_entry(entry: dict, *, payload: dict, revision: int,
     entry["reason_details"] = [
         f"使用者對 revision {previous_revision} 的原圖確認並修正 → revision {revision}"
     ]
+    previous_evidence = copy.deepcopy(entry["evidence"])
+    entry["evidence"] = {
+        "human_correction": {"revision": revision, "previous_revision": previous_revision},
+        "previous_revision_evidence": previous_evidence,
+    }
+    if previous_evidence.get("lane") in ("native", "vl"):
+        entry["evidence"]["lane"] = previous_evidence["lane"]
+    # These are immutable source/model-input provenance, not assertions about the
+    # old payload. The cross-entry validator still needs them for duplicate figures.
+    for name in ("duplicate_of", "duplicate_model_input"):
+        if name in previous_evidence:
+            entry["evidence"][name] = copy.deepcopy(previous_evidence[name])
     entry["human_verification"] = {
         "revision": revision,
         "confirmed_against_image": True,
@@ -3203,6 +3339,7 @@ def _apply_revision_to_entry(entry: dict, *, payload: dict, revision: int,
         "source_signature": entry.get("source_signature"),
         "carried_over": False,
     }
+    entry.update(_entry_quality(entry))
 
 
 def _mirror_preflight(root_real: Path, *, slug: str, run_id: str, figure_id: str,

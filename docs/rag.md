@@ -189,7 +189,7 @@ tool-call 能力，不是 RAG 本身。[客戶端的內建基底規則](../READM
 最後回報目前載入幾個 chunks。
 ```
 
-`chunks` 是「切好的文件段落」。回報 0 代表沒匯入到任何內容 — 常見原因：binary 太小或全是 0xff、圖片走 VL 卻抽不出可用描述。（純圖片掃描的 PDF 不再是原因：每頁會整頁 render 交給 VL；但 VL llama-server (:8083) 沒啟動時，PDF 會**整份 ingest 失敗**而不是回報 0。preflight 超過上限也是直接結束並報告超出的項目，同樣不是回報 0。）
+`chunks` 是「切好的文件段落」。回報 0 代表沒匯入到任何內容 — 常見原因：binary 太小或全是 0xff、圖片走 VL 卻抽不出可用描述。（純掃描 PDF 會 render 後送 VL，但候選缺席、空轉錄或品質排除仍可能留下零可用內容；請查看缺席與品質紀錄。VL llama-server (:8083) 無法連線或 preflight 超限會明確失敗。）
 
 **步驟 3：查**
 
@@ -257,6 +257,15 @@ batch size 上限是 32 (REF1)。
 
 ##### 涵蓋範圍
 
+原生解析與 VL 的結果各自保留來源與失敗階段。VL server 已啟動，只代表可以呼叫 VL；
+coverage 計的是「已偵測區域」，另外列出缺席與無法讀取的原生通道，不宣稱整份 PDF OCR 完整。
+table／terminal 沒抽到內容會回退為 `prose` 逐行轉錄，不以 diagram 摘要替代；空轉錄明確失敗。
+只有可靠來源位置能提供覆蓋率的母體，缺少來源 anchor 時記 unknown，兩次模型回答一致也不算來源證明。
+
+程式碼與檔案樹有明確訊號時優先保留符號、縮排及母子關係；沒有可靠原文位置時列為缺席，
+不強行轉成表格。章節、圖目錄及表目錄只排除有頁碼參照等證據的導覽行，不污染 section、caption
+或生成的檢索脈絡。原文座標與頁碼保留，混合頁正文和檔案樹仍可檢索。舊 KB 需重新 ingest。
+
 | 情況 | 收哪些 | 拿得到什麼 |
 |---|---|---|
 | **結構化 lane 收錄** | 原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，以及夠大的純 raster / picture | raster 先分類成 table / terminal / prose / diagram；再產生 canonical JSON、逐格/逐行證據、`▯`、驗證狀態、strict gate，且可用 `review_figures` 覆核 |
@@ -274,6 +283,17 @@ figure chunk 會帶所在章節與 caption（`Table 3-1 …` / `圖 2-4 …`）�
 原位置那行 marker 在**查詢期**會被跟回去，把對應的 figure chunk 一併帶進 REF。
 
 ##### 六種驗證狀態
+
+內容品質另由 `quality_grade` 表示：`usable`（未發現缺陷且有驗證證據）、`formatting_only`
+（已證明僅排版差異）、`partial`（部分可用）、`structure_error`（重要結構錯誤）、`unusable`
+（無可用內容）、`unknown`（不足以判斷）。`review_state=confirmed` 只來自綁定目前 revision 的
+合法原圖確認紀錄，其他為 `unreviewed`。這兩個欄位不改變下表的 strict 查詢信任邊界。
+
+`auto_disposition` 決定後續處理：`accept`、`manual_review`、`repair_required` 或 `excluded`。
+已知缺字、conflict 與缺行列為需修復；重要結構錯誤／全不可讀的 figure 不入庫，原生文字及完整
+artifacts 保留。部分可用內容保留遮罩與原因，不能猜補缺字。人工確認不能把仍損壞的 payload 洗成可信。
+已由可靠來源證明轉錄缺漏的 revision（`transcription_source_incomplete`）會標 `fixable=False`，
+須重新 ingest 核對來源；現有 fix 不保留完整來源，任意補字或原樣確認都不能證明已補齊。
 
 | 狀態 | 意思 | strict 查詢用不用 |
 |---|---|---|
@@ -344,16 +364,17 @@ capability probe:端點真的吃 image content part、
 
 | `status:` | 意思 | 你要做什麼 |
 |---|---|---|
-| `ok` | 入庫完成,而且沒有任何待覆核 / 抽壞的圖 | 直接查 |
-| `partial`（正式 ingest） | 入庫完成,但有圖需要你決定 | 照結果裡 `[CODETRAIL_ACTION_REQUIRED]` 那一段做 |
+| `ok` | 入庫完成，沒有可行動的品質待辦；不保證完整 OCR | 依 REF 的驗證與品質資訊查詢 |
+| `partial`（正式 ingest） | 入庫完成，但有需修復、待判斷或缺席的內容 | 照結果裡 `[CODETRAIL_ACTION_REQUIRED]` 那一段做 |
 | `partial`（preflight 超限） | **零寫入**:一個位元組都沒進 KB,只是估算超出上限 | 照 `[CODETRAIL_ACTION_REQUIRED]` 縮小範圍或調高上限,再**重新**呼叫一次(拿掉 `preflight_only`)。結果會同時帶 `[CODETRAIL_ZERO_WRITE]` |
 | `error` | 逾時 / exit≠0 / 輸出不完整 | 依錯誤訊息排除後重跑;**不要**拿這次的結果當入庫成功 |
 
-`[CODETRAIL_ACTION_REQUIRED]` 那一段最多分四類,每類最多列 5 筆(超出會註明還有幾筆),
+`[CODETRAIL_ACTION_REQUIRED]` 那一段最多分五類,每類最多列 5 筆(超出會註明還有幾筆),
 而且每類都直接給下一步:
 
 - **待覆核**(原圖可讀) → `review_figures(action="list", document_id=...)` 看原因,對照原圖後
   `action="fix"`。
+- **需修復／品質排除**（缺字、衝突、缺行、結構錯誤）→ 修復內容或重新 ingest；不能只確認為正確。
 - **無法覆核**(payload / 原圖讀不到,例如 review artifact 被清掉) → 就地修不了,
   `remove_document(...)` 後重新 ingest。
 - **抽取失敗**(那一張不進 KB) → 接受它缺席(其餘內容已入庫),或 `remove_document(...)` 後重灌。
@@ -362,7 +383,7 @@ capability probe:端點真的吃 image content part、
   不在專案根內,搬進去再 ingest 一次才會有 figure。
 
 「偵測器判定這一塊不是結構化圖面」這類**沒有下一步**的缺席不列進這一段(完整清單在 ingest
-自己的輸出裡)。`unverified` / `legacy_unverified` 以及全部可信的情況也**不會**出現在這一段。每次入庫都印一句
+自己的輸出裡)。僅 `unverified` / `legacy_unverified`、未發現確定缺陷時，也**不會**自動列為人工待辦。每次入庫都印一句
 罐頭提示等於沒有提示:你會學會跳過它,真的有待覆核時也一起跳過。同理,這一段只算**這一次**
 的 run——artifacts 裡上一次 run 留下的失敗不會被重報一次。
 
@@ -373,7 +394,8 @@ capability probe:端點真的吃 image content part、
 ```
 
 回傳每一張的 `document_id`、`figure_id`、`revision`、頁碼與 bbox、kind、
-`extraction_status` / `verification_status`、`reasons` / `reason_details`、原圖(crop)路徑與
+`extraction_status` / `verification_status`、`quality_grade` / `review_state` / `auto_disposition`、
+`quality_issues`、`reasons` / `reason_details`、原圖(crop)路徑與
 `evidence_ref`。挑定一張後帶 `figure_id` 再 list 一次,就會附上完整的 canonical payload
 (多筆列出時不附 payload,整份表格 / log 會塞爆對話;輸出的表頭每次都會講這件事)。
 

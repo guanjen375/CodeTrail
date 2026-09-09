@@ -1370,7 +1370,7 @@ def test_raster_classified_as_table_falls_back_when_there_is_no_table(
     卻被當成 `empty_payload` 硬失敗，整份 19 頁的 PDF 因此一個字都進不了 KB。
 
     關鍵區別:純 raster 的 kind 是**我們猜的**，不是文件宣告的。猜錯的代價不該是
-    整份零寫入,而是改用 diagram（自由文字）再抽一次。原生表格（`find_tables`
+    整份零寫入,而是改用 prose 逐行轉錄，沒有來源 anchor 就標明覆蓋未知。原生表格（`find_tables`
     的幾何說「這裡有表」）回空 payload 仍然是硬失敗——那才是真的抽取壞掉。
     """
     figure_verify = pytest.importorskip("figure_verify")
@@ -1384,11 +1384,10 @@ def test_raster_classified_as_table_falls_back_when_there_is_no_table(
     script = dict(_vl_stub_script())
     script["figure_raster_kind_v1"] = json.dumps({"kind": "table"})   # 猜成 table
     script["figure_table"] = json.dumps({"columns": [], "rows": [], "footnotes": []})
-    script["figure_diagram"] = json.dumps({
-        "title": "1.1. NPX - Core control & Core status",
-        "labels": ["u-boot", "NPX firmware code"],
-        "components": [{"name": "u-boot", "desc": "branch npx-vpx"}],
-        "relations": [], "values": []})
+    transcription = ["1.1. NPX - Core control & Core status", "u-boot",
+                     "  branch npx-vpx", "NPX firmware code"]
+    script["figure_prose"] = json.dumps({"lines": [
+        {"text": text, "uncertain_spans": []} for text in transcription]})
     calls: list[str] = []
     _install_vl_stub(monkeypatch, figure_verify, calls=calls, script=script)
 
@@ -1399,11 +1398,13 @@ def test_raster_classified_as_table_falls_back_when_there_is_no_table(
 
     assert results, "猜錯 kind 不得讓整份 PDF 零寫入"
     figure = results[0]
-    assert figure.kind == fe.KIND_DIAGRAM, f"應退回 diagram，實際 {figure.kind}"
+    assert figure.kind == fe.KIND_PROSE, f"應退回逐行轉錄，實際 {figure.kind}"
     assert figure.payload, "退回之後要有可入庫的 payload"
+    assert [line["text"] for line in figure.payload["lines"]] == transcription
+    assert figure.evidence["transcription"]["coverage"] == "unknown"
     assert "raster_kind_reclassified" in figure.reasons, figure.reasons
     assert figure.verification_status != fe.VERIF_HUMAN
-    assert "figure_diagram" in calls, calls
+    assert "figure_prose" in calls and "figure_diagram" not in calls, calls
 
 
 @pytest.mark.smoke

@@ -411,36 +411,23 @@ def test_row_width_mismatch_is_fail_loud(monkeypatch):
 def test_empty_payload_never_enters_the_kb_and_falls_back_to_diagram(
     monkeypatch, kind, schema_name, text
 ):
-    """空 payload 等於宣稱「這張圖沒有內容」，**不得入庫**——這一句沒有變。
-
-    變的是後果。2026-08-24 實測:走 VL lane 的 kind 一律是**推論**出來的(原生表格
-    走 native lane，根本不呼叫 VL)。一頁純文字因為編號清單與縮排形成對齊的文字帶，
-    被 planner 判成 table，模型於是誠實地回 `columns=0, rows=0` —— 那是**正確答案**，
-    舊規則卻把它當成抽取失敗、讓整份 19 頁的 PDF 零寫入。實際文件裡這種誤判有 10 處。
-
-    `native_table` / `anchored` 都分不出「真的有表」與「判錯」，唯一知道真相的是看過
-    圖的模型本身。所以 `empty_payload` 一律當成 kind 判錯，改以 diagram(自由文字
-    schema)重抽，並在 reasons 留下 `raster_kind_reclassified`。空 payload 本身仍然
-    一個欄位都沒有進 KB。
-
-    **其餘失敗種類全部維持硬失敗**(truncated / schema / row_width / line_contract /
-    canonicalize / validator)——那些是模型確實抽到了東西但抽壞了，見
-    `test_row_width_mismatch_is_fail_loud` 與同組的其他測試。
-    """
-    spy = VLSpy({schema_name: text, "figure_diagram": json.dumps({
-        "title": "a page of prose", "labels": ["section 1.1"],
-        "components": [{"name": "section 1.1", "desc": "test procedure"}],
-        "relations": [], "values": []})})
+    """名稱保留原 regression；空 table/terminal 改為 prose 逐行轉錄，不生成摘要。"""
+    spy = VLSpy({schema_name: text, "figure_prose": terminal_json([
+        ("section 1.1", []), ("  test procedure", [])])})
     install_vl(monkeypatch, spy)
     pass_probe(monkeypatch)
 
     result = extract([candidate(kind=kind)], {4: page_evidence()})[0]
 
-    assert result.kind == figure_extract.KIND_DIAGRAM, result.kind
+    assert result.kind == figure_extract.KIND_PROSE, result.kind
     assert result.payload, "退回之後要有可入庫的 payload"
     assert "raster_kind_reclassified" in result.reasons, result.reasons
     # 空 payload 的欄位一個都沒進來
-    assert "columns" not in result.payload and "lines" not in result.payload
+    assert "columns" not in result.payload and "components" not in result.payload
+    assert [line["text"] for line in result.payload["lines"]] == [
+        "section 1.1", "  test procedure"]
+    assert result.evidence["transcription"]["coverage"] == "unknown"
+    assert "figure_diagram" not in spy.schema_names()
     assert result.verification_status in (
         figure_extract.VERIF_UNVERIFIED, figure_extract.VERIF_NEEDS_REVIEW)
 
@@ -3105,16 +3092,13 @@ def test_multi_tile_candidate_is_never_skipped_on_the_first_tile_alone(monkeypat
     一整張 register table 就這樣無聲消失。
     """
     # ★ 第一片**永遠忠實地回空**（它真的是留白 / logo），重試幾次都一樣——這才是
-    # 原始案例。上一輪這條讓兩片都回同一份非空 diagram，於是完全沒驗到
+    # 原始案例。兩片都回同一份非空 payload，就完全沒驗到
     # 「第一片空了之後還讀不讀得到第二片」。
-    blank = json.dumps({"title": "", "labels": [], "components": [],
-                        "relations": [], "values": []})
-    filled = json.dumps({"title": "register map", "labels": ["CTRL0"],
-                         "components": [{"name": "CTRL0", "desc": "0x4000_0100"}],
-                         "relations": [], "values": []})
+    blank = prose_json([])
+    filled = prose_json([("CTRL0 0x4000_0100", [])])
     spy = VLSpy({
         "figure_raster_kind_v1": raster_kind("none"),
-        "figure_diagram": lambda kw: (
+        "figure_prose": lambda kw: (
             blank if base64.b64decode(kw["image_base64"]) == b"PNG-1" else filled),
     })
     install_vl(monkeypatch, spy)
@@ -3131,12 +3115,12 @@ def test_multi_tile_candidate_is_never_skipped_on_the_first_tile_alone(monkeypat
                      {4: page_evidence()}, render=_render)[0]
 
     assert result.extraction_status == figure_extract.EXTRACTION_COMPLETE, result
-    assert result.kind == figure_extract.KIND_DIAGRAM, result.kind
-    assert [c["name"] for c in result.payload["components"]] == ["CTRL0"], (
+    assert result.kind == figure_extract.KIND_PROSE, result.kind
+    assert [line["text"] for line in result.payload["lines"]] == ["CTRL0 0x4000_0100"], (
         "第一片留白就中止的話，第二片的內容一個字都讀不到", result.payload)
-    assert spy.schema_names().count("figure_diagram") >= 2, (
+    assert spy.schema_names().count("figure_prose") >= 2, (
         "第一片空了之後仍要繼續讀第二片", spy.schema_names())
-    # 分類器回的是 none，被 policy 改判成 diagram——manifest 要說得出這件事
+    # 分類器回的是 none，被 policy 改判成 prose——manifest 要說得出這件事
     assert "raster_kind_reclassified" in result.reasons, result.reasons
     assert result.evidence["raster_classification"]["reclassified_from"] == "none", (
         result.evidence["raster_classification"])
@@ -3148,7 +3132,7 @@ def test_prose_with_an_empty_transcription_falls_back_to_diagram(monkeypatch):
 
     模糊的掃描頁、模型當下失手都會回空。解釋成 `none` 的話那一頁既不進 KB、也不進
     失敗通知，而且那條路徑還會丟掉 extractor 實際送過的其他 tile、reason detail 也
-    謊稱是分類器判的。一律走與 table / terminal 相同的 diagram 退路。
+    謊稱是分類器判的。空 prose 必須是 transcription_empty 失敗，不以 diagram 摘要掩蓋。
     """
     spy = VLSpy({
         "figure_raster_kind_v1": raster_kind("prose"),
@@ -3163,10 +3147,12 @@ def test_prose_with_an_empty_transcription_falls_back_to_diagram(monkeypatch):
 
     result = extract([candidate(kind=figure_extract.KIND_RASTER)], {4: page_evidence()})[0]
 
-    assert result.extraction_status == figure_extract.EXTRACTION_COMPLETE, result
-    assert result.kind == figure_extract.KIND_DIAGRAM, result.kind
-    assert "raster_kind_reclassified" in result.reasons, result.reasons
-    assert "figure_diagram" in spy.schema_names(), spy.schema_names()
+    assert result.extraction_status == figure_extract.EXTRACTION_FAILED, result
+    assert result.kind == figure_extract.KIND_PROSE, result.kind
+    assert result.payload is None
+    assert result.reasons == ["extraction_failed", "transcription_empty"], result.reasons
+    assert result.evidence["sent_variants"] == ["crop@200dpi"]
+    assert "figure_diagram" not in spy.schema_names(), spy.schema_names()
 
 
 @pytest.mark.smoke
@@ -3409,13 +3395,11 @@ def test_a_gap_between_kept_tiles_disables_overlap_dedup(monkeypatch):
 def test_first_audit_line_reports_what_the_classifier_actually_said(monkeypatch):
     """★ 第一條 audit 文案要講**分類器原本回什麼**，不能用被改寫過的 kind。
 
-    用改寫後的值會與下一行自己打架：「分類為 diagram」「分類器其實回 none」。
+    用改寫後的值會與下一行自己打架：「分類為 prose」「分類器其實回 none」。
     """
     spy = VLSpy({
         "figure_raster_kind_v1": raster_kind("none"),
-        "figure_diagram": json.dumps({
-            "title": "t", "labels": [], "components": [{"name": "a", "desc": "b"}],
-            "relations": [], "values": []}),
+        "figure_prose": prose_json([("a b", [])]),
     })
     install_vl(monkeypatch, spy)
     pass_probe(monkeypatch)
@@ -3431,7 +3415,7 @@ def test_first_audit_line_reports_what_the_classifier_actually_said(monkeypatch)
 
     first = result.reason_details[0]
     assert "分類為 none" in first, first
-    assert "分類為 diagram" not in first, first
+    assert "分類為 prose" not in first, first
 
 
 @pytest.mark.smoke
@@ -3453,17 +3437,15 @@ def test_send_ledger_skips_a_variant_the_budget_refused(monkeypatch):
 
 @pytest.mark.smoke
 def test_grid_variant_stays_declared_after_the_diagram_fallback(monkeypatch):
-    """★ table 走 `+grid` 之後又退回 diagram 時，`+grid` 仍是真的送過模型的影像。
+    """★ 名稱保留：table 走 `+grid` 後退回 prose，`+grid` 仍是真的送過模型的影像。
 
     `result.variants` 只講得出最後一輪抽取用的那幾份，`+grid` 因此會從 `variants/`
     被刪掉——覆核的人看不到模型實際讀的那張圖，也就查不出 grid 正規化是不是幫倒忙。
     """
     spy = VLSpy({
         "figure_raster_kind_v1": raster_kind("table"),
-        "figure_table": table_json(["Name"], []),      # 空 → 退回 diagram
-        "figure_diagram": json.dumps({
-            "title": "t", "labels": [], "components": [{"name": "a", "desc": "b"}],
-            "relations": [], "values": []}),
+        "figure_table": table_json(["Name"], []),      # 空 → 退回逐行轉錄
+        "figure_prose": prose_json([("a b", [])]),
     })
     install_vl(monkeypatch, spy)
     pass_probe(monkeypatch)
@@ -3475,7 +3457,7 @@ def test_grid_variant_stays_declared_after_the_diagram_fallback(monkeypatch):
 
     result = extract([candidate(kind=figure_extract.KIND_RASTER)], {4: page_evidence()})[0]
 
-    assert result.kind == figure_extract.KIND_DIAGRAM, result.kind
+    assert result.kind == figure_extract.KIND_PROSE, result.kind
     assert "crop@200dpi+grid" in result.variants, (
         "真的送過模型的 +grid 必須留在宣告集合裡", result.variants)
 

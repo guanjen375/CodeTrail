@@ -55,8 +55,8 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=None)` | 讀檔案內容；省略 max_chars 時依 n_ctx 配置，長檔依結果的精確 start_line 分段 |
 | 文件/外部檔案 | `import_external_file(path, dest_name=None)` | 把允許來源的外部檔案複製進 `.aicode_uploads/` |
 | 文件/外部檔案 | `analyze_file(path, view="summary", target="", limit=0)` | 用 VL 分析各類圖片、一次性抽 PDF 文字（不入 KB）、分析 ELF 或 firmware blob。ELF 預設給總覽；`view` 可切到 `symbols` / `disasm` / `dwarf` / `strings` / `sections` / `memmap` / `relocs` / `imports` / `dynamic` / `headers`，`target` 指定 symbol、0x 位址、regex 或 `key:value` 篩選，`limit` 控制筆數（上限 5000）；單次輸出上限 25,000 字元，截斷會指出該用哪個 view 縮小範圍。缺 pyelftools 時退回 readelf 文字解析並在報告開頭明列缺失能力；細節見[analyze_file 的 ELF 視角](#analyze_file-的-elf-視角) |
-| 文件/外部檔案 | `ingest_document(path, mode="auto", preflight_only=False, fresh=False)` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document`。PDF 的原生表格 / 向量文字 log 與純 raster 截圖、掃描頁、方塊圖都走結構化抽取；raster 會先分類為 table / terminal / diagram，再帶 canonical payload、證據與驗證狀態。**單張抽壞只讓那一張缺席**（其餘 figure 與全部文字 chunk 照常入庫，結果會列出是哪幾張，`review_figures(action="list")` 看得到 `in_kb=false`）；整份零寫入的是 VL 連不上／逾時、預算超限、capability probe 未過、來源檔中途被換掉這類契約破裂。`preflight_only=True` 只估成本、零寫入（僅 .pdf）。`fresh=True` 一步到位重建：清空既有 chunks、讓舊 embeddings cache 失效、只留這一份文件（同一次原子提交，失敗全回滾）。**不會為了 reset 去整批清除** `.codetrail/figures/`（ingest 本來就會寫入這一次的 run，提交後也可能依 retention 回收該文件沒被 KB 引用的舊 run — 那與 fresh 無關）。同一份文件再 ingest 時人工修正會沿用；但**被移出 KB 的其他文件之後重新 ingest 不會自動恢復人工確認**（revision 退回 1）。不可與 `preflight_only` 併用。**執行期間 server 不會被卡住**：跑在 worker thread、每 2 秒送一次零內容的 MCP progress；同一時間所有 KB 工具與第二個 ingest 會立刻回「稍後重試」（不排隊）。結果的標頭下會帶這一次 run 的待辦（`[CODETRAIL_ACTION_REQUIRED]`：needs_review / 無法修復 / 抽取失敗，各附下一步；三類都沒有就完全不印），逾時、非零 exit 或輸出不完整則帶 `[CODETRAIL_INGEST_FAILED]` 並回 `status: error` |
-| 文件/外部檔案 | `review_figures(action="list", document_id="", figure_id="", expected_revision=0, payload_json="", confirm_against_image=False)` | 覆核 PDF 結構化抽取的表格 / 終端機 log / diagram：`list` 唯讀列出 figure_id、頁碼、bbox、kind、驗證狀態、原因、原圖路徑與 canonical payload；`fix` 只收該 kind schema 的 structured payload + `expected_revision`，`confirm_against_image=True` 才升 `human_verified`。permission 設 `ask` |
+| 文件/外部檔案 | `ingest_document(path, mode="auto", preflight_only=False, fresh=False)` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document`。PDF 的原生表格 / 向量文字 log 與純 raster 截圖、掃描頁、方塊圖都走結構化抽取；raster 會先分類為 table / terminal / prose / diagram，再帶 canonical payload、證據、品質與驗證狀態。**單張抽壞只讓那一張缺席**（其餘 figure 與全部文字 chunk 照常入庫，結果會列出是哪幾張，`review_figures(action="list")` 看得到 `in_kb=false`）；整份零寫入的是 VL 連不上／逾時、預算超限、capability probe 未過、來源檔中途被換掉這類契約破裂。`preflight_only=True` 只估成本、零寫入（僅 .pdf）。`fresh=True` 一步到位重建：清空既有 chunks、讓舊 embeddings cache 失效、只留這一份文件（同一次原子提交，失敗全回滾）。**不會為了 reset 去整批清除** `.codetrail/figures/`（ingest 本來就會寫入這一次的 run，提交後也可能依 retention 回收該文件沒被 KB 引用的舊 run — 那與 fresh 無關）。同一份文件再 ingest 時人工修正會沿用；但**被移出 KB 的其他文件之後重新 ingest 不會自動恢復人工確認**（revision 退回 1）。不可與 `preflight_only` 併用。**執行期間 server 不會被卡住**：跑在 worker thread、每 2 秒送一次零內容的 MCP progress；同一時間所有 KB 工具與第二個 ingest 會立刻回「稍後重試」（不排隊）。結果的標頭下會帶這一次 run 的待辦（`[CODETRAIL_ACTION_REQUIRED]`：待人工判斷 / 需修復或品質排除 / 無法覆核 / 抽取失敗 / 可行動缺席，各附下一步；沒有待辦就完全不印），逾時、非零 exit 或輸出不完整則帶 `[CODETRAIL_INGEST_FAILED]` 並回 `status: error` |
+| 文件/外部檔案 | `review_figures(action="list", document_id="", figure_id="", expected_revision=0, payload_json="", confirm_against_image=False)` | 覆核 PDF 結構化抽取的表格 / 終端機 log / diagram：`list` 唯讀列出 figure_id、頁碼、bbox、kind、驗證狀態、品質、人工確認狀態、處置、原因、原圖路徑與 canonical payload；`fix` 只收該 kind schema 的 structured payload + `expected_revision`，`confirm_against_image=True` 才升 `human_verified`。permission 設 `ask` |
 | 文件/外部檔案 | `remove_document(source)` | 從 KB 移除過期文件 |
 | 文件/外部檔案 | `reload_knowledge_base()` | 立即載入 KB 並回報 chunk 數（查詢本身會自動偵測變更，這是「馬上確認」用） |
 | 文件/外部檔案 | `query_knowledge(question, source=None)` | 查 KB；`source` 可用 basename 限定單一 spec/manual |
@@ -148,6 +148,12 @@ outputSchema，避免同一 payload 被 SDK 重複序列化。
 
 **只有一條 lane,沒收就是缺席(重要)**
 
+結構化管線內分 `native`／`vl` 來源，摘要分別標出原生通道缺失、原生核對失敗、VL 失敗與
+文字轉錄回退。coverage 只計已偵測區域，不能當成全 PDF OCR 完整率。空表格／terminal
+回退為 `prose` 逐行轉錄；仍為空就記失敗。有可靠來源位置才算來源行的覆蓋率，否則為 unknown。
+程式碼與檔案樹優先保存逐行符號與縮排；章節／圖表目錄的確定導覽範圍不進檢索或脈絡生成，
+混合頁正文與有資訊價值的檔案樹保留。舊 KB 需重新 ingest 才套用新判斷。
+
 | 情況 | 收哪些候選 | 產出 | 有沒有 `▯` / 逐格證據 / strict gate |
 |---|---|---|---|
 | 結構化 lane 收錄 | 原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，以及夠大的純 raster / picture | raster 先分類成 table / terminal / prose / diagram；再產生 canonical JSON + 衍生文字 chunk | 有 |
@@ -163,7 +169,16 @@ figure chunk 會帶所在章節與 caption（`Table 3-1 …`）。兩者只當�
 + REF 上一行標示），不進 canonical payload。原生表格被取代後留在文字層的 marker，在查詢期
 會被跟回去，把對應的 figure chunk 一併帶進 REF。
 
-**六種 `verification_status`**(structured chunk 專屬;兩個正交欄位之一,另一個是
+品質與人工確認分开呈現：`quality_grade` 為 `usable / formatting_only / partial /
+structure_error / unusable / unknown`，`review_state` 為 `unreviewed / confirmed`。
+`auto_disposition` 分 `accept / manual_review / repair_required / excluded`：已知缺字、衝突與
+缺行列入修復，重要結構錯誤／全不可讀不作為新 figure 入庫，仍保留完整轉錄與原圖供追查。
+`fix` 必須先修掉內容損壞，再明示對照原圖確認；不得把仍有缺字的 payload 標成可信。
+若目前 revision 已由可靠來源證明轉錄缺漏（`transcription_source_incomplete`），清單會標
+`fixable=False` 並說明須重新 ingest 核對來源；現有 fix 不具完整來源，不能確認補字是否完整。
+品質不替代原有 strict gate；`usable` 也不代表完整 OCR 或已經人工確認。
+
+**六種 `verification_status`**(structured chunk 的驗證來源／信任狀態；抽取是否完成另看
 `extraction_status ∈ {complete, failed, skipped}`)
 
 | 狀態 | 意思 | strict 查詢用不用 |

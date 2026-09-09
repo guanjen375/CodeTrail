@@ -39,6 +39,87 @@ TESTS_DIR = Path(__file__).resolve().parent
 
 # AGENTS.md §2「安全相關不要砍」的檢查點 → (守它的說明, 必須存在且帶 smoke 的 node)。
 SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "test_pdf_quality_review.py": (
+        "PDF 品質判定、人工確認與內容缺陷分離；manifest/chunk 同值，legacy 可讀，"
+        "修正更新品質且保留 duplicate 來源證明",
+        (
+            "test_known_damage_is_not_presented_as_manual_judgment",
+            "test_excluded_payload_remains_available_without_old_run_warning",
+            "test_legacy_manifest_quality_defaults_remain_readable",
+            "test_fix_refreshes_quality_without_reusing_previous_evidence",
+            "test_writer_rejects_human_confirmation_of_damaged_payload",
+            "test_list_refuses_conflicting_quality_metadata",
+            "test_fix_preserves_duplicate_model_input_provenance",
+            "test_source_incomplete_revision_cannot_be_confirmed_without_reverification",
+            "test_unknown_coverage_and_semantic_review_allow_same_payload_confirmation",
+            "test_source_reverification_requirement_survives_unavailable_artifact",
+            "test_quality_uses_only_definite_producer_reason_slugs",
+            "test_quality_never_invents_human_confirmation",
+            "test_human_confirmation_cannot_launder_payload_damage",
+            "test_manifest_human_record_remains_bidirectional_and_current_revision",
+            "test_quality_requires_independent_evidence_and_proven_formatting",
+            "test_quality_transcription_coverage_requires_a_source_denominator",
+            "test_missing_artifact_does_not_become_known_empty_or_confirmed",
+            "test_legacy_chunk_quality_fields_compare_as_conservative_defaults",
+        ),
+    ),
+    "test_pdf_structure_regressions.py": (
+        "PDF code/tree 先於 table 幾何，原文無可靠位置不送 VL；navigation 不花 OCR 預算，"
+        "不得吞正文或破壞真表格／檔案樹，native_lane 仍只認真 bool",
+        (
+            "test_code_and_file_tree_override_native_table_geometry",
+            "test_code_without_pos_is_deferred_instead_of_vl",
+            "test_navigation_candidates_do_not_reserve_ocr_budget",
+            "test_fenced_heading_lines_do_not_create_sections",
+            "test_navigation_title_does_not_swallow_prose_with_trailing_numbers",
+            "test_structure_preserving_normalization_keeps_original_code_and_tree_bytes",
+            "test_navigation_spans_only_exclude_confirmed_runs_and_keep_source_offsets",
+            "test_real_table_with_one_code_or_path_cell_remains_a_table",
+            "test_code_boundary_adjacent_to_table_is_protected_without_swallowing_table",
+            "test_navigation_budget_exclusion_still_checks_native_lane_bool",
+            "test_code_without_pos_cannot_reenter_as_attached_raster",
+        ),
+    ),
+    "test_pdf_transcription_regressions.py": (
+        "PDF 空 schema 只能回退逐行轉錄，空轉錄失敗；不得丟後續 tile，"
+        "來源覆蓋率需可靠 denominator、duplicate 重算、實際 calls 受共同預算約束",
+        (
+            "test_empty_schema_uses_bounded_line_transcription",
+            "test_empty_transcription_fails_with_all_attempts_and_sent_inputs",
+            "test_first_tile_none_transcribes_later_tiles_without_a_second_sample",
+            "test_transcription_coverage_measures_source_and_rechecks_duplicate",
+            "test_repeated_raster_text_does_not_claim_source_coverage",
+            "test_fallback_transport_still_aborts_the_document_with_provenance",
+            "test_transcription_rejects_a_different_source_at_the_declared_pos",
+            "test_native_structure_transcription_preserves_bytes_without_vl",
+            "test_incomplete_native_channels_cannot_supply_a_transcription_denominator",
+            "test_known_source_structure_cannot_be_blessed_as_a_raster_table",
+            "test_duplicate_fallback_retains_attempts_and_rechecks_the_source",
+        ),
+    ),
+    "test_pdf_ingest_quality.py": (
+        "PDF 整合：已知損壞分流 repair，excluded 保留原文與 payload，"
+        "目錄不進檢索／section／caption／generated context；品質與人工確認各自可見",
+        (
+            "test_known_damage_uses_repair_in_normal_and_fallback_summary",
+            "test_pdf_navigation_keeps_source_offsets_but_not_retrieval_noise",
+            "test_navigation_rows_cannot_become_figure_captions",
+            "test_navigation_candidate_is_excluded_before_structured_dispatch",
+            "test_terminal_native_span_uses_text_after_code_reclassification",
+            "test_excluded_native_payload_keeps_raw_text_and_auditable_payload",
+            "test_unavailable_native_channels_are_visible_even_without_vl_candidates",
+            "test_human_carryover_does_not_reuse_superseded_extraction_damage",
+            "test_pdf_normalization_retains_code_and_tree_bytes",
+            "test_builder_cannot_confirm_a_glyph_damaged_header",
+            "test_human_carryover_keeps_duplicate_source_provenance",
+            "test_quality_is_separate_from_human_confirmation_in_review_and_query",
+            "test_context_generation_navigation_filter_reaches_shared_windows_and_summaries",
+            "test_failure_sources_and_detected_region_limits_survive_notification_boundary",
+            "test_review_header_retains_manual_count_without_counting_repairs",
+            "test_non_table_candidate_still_replaces_its_native_table_span",
+            "test_strict_exclusion_hint_retains_review_label_and_repair_routing",
+        ),
+    ),
     "test_aicode.py": (
         "wrapper 只做四件事:定位 checkout(自己可能是 symlink)、找 python3、檢查 argv 並拒絕"
         "沒有終端機的環境(指向 headless,不靜默降級)、exec 唯一的客戶端。使用者參數只有"

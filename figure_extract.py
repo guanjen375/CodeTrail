@@ -889,6 +889,20 @@ def aggregate_reason_details(members: list[dict]) -> list[str]:
     return _ordered_unique(details)
 
 
+def candidate_vl_kinds(candidate) -> set[str]:
+    """All schemas this candidate can dispatch, including transcription fallback."""
+    if read_native_lane(candidate):
+        return set()
+    kind = getattr(candidate, "kind", KIND_UNKNOWN)
+    if kind == KIND_RASTER:
+        return set(FIGURE_KINDS)
+    if kind == KIND_UNKNOWN:
+        return {KIND_TABLE, KIND_TERMINAL}
+    if kind in (KIND_TABLE, KIND_TERMINAL):
+        return {kind, KIND_PROSE}
+    return {kind} if kind in FIGURE_KINDS else set()
+
+
 def read_native_lane(candidate) -> bool:
     """`candidate.signals["native_lane"]` 的**唯一** reader（契約 §15.1 / §17.4）。
 
@@ -1677,7 +1691,10 @@ def _figure_view(figure, position: int) -> dict:
     與契約 §6.4 的 `FigureResult` 必須一字不差。
     """
     where = f"figures[{position}]"
-    return {name: _figure_field(figure, name, where) for name in _FIGURE_FIELDS}
+    view = {name: _figure_field(figure, name, where) for name in _FIGURE_FIELDS}
+    for name in ("evidence", "human_verification"):
+        view[name] = figure.get(name) if isinstance(figure, dict) else getattr(figure, name, None)
+    return view
 
 
 def _payload_uncertainty(payload: dict, kind: str) -> list[str]:
@@ -1850,7 +1867,8 @@ def _figure_context(context_by_figure, figure_id: str, where: str) -> dict:
 
 def build_figure_chunks(figures, *, source: str, doc_type: str,
                         next_chunk_index: dict, evidence_ref_by_figure: dict,
-                        context_by_figure: dict | None = None) -> list[dict]:
+                        context_by_figure: dict | None = None,
+                        human_verifications_by_figure: dict | None = None) -> list[dict]:
     """`FigureResult` list → KB chunk dict list（契約 §4 的形狀）。
 
     這是 structured figure chunk 的**唯一產生點**，所以三件事在這裡強制：
@@ -1891,6 +1909,9 @@ def build_figure_chunks(figures, *, source: str, doc_type: str,
     if not isinstance(evidence_ref_by_figure, dict):
         raise FigureValidationError("evidence_ref_by_figure 必須是 dict（figure_id → manifest 路徑）")
 
+    if human_verifications_by_figure is not None and not isinstance(human_verifications_by_figure, dict):
+        raise FigureValidationError("human_verifications_by_figure 必須是 dict 或 None")
+    human_records = human_verifications_by_figure or {}
     views = [_figure_view(figure, position) for position, figure in enumerate(figures)]
 
     # (1) 零部分成功：整批先掃一次
@@ -2010,6 +2031,18 @@ def build_figure_chunks(figures, *, source: str, doc_type: str,
             "page": page,
             "verification_status": status,
         }
+        from figure_quality import assess_quality
+        human = human_records.get(figure_id, view.get("human_verification"))
+        if human is not None and (not isinstance(human, dict)
+                or type(human.get("revision")) is not int or human["revision"] != view["revision"]
+                or human.get("confirmed_against_image") is not True or status != VERIF_HUMAN):
+            raise FigureValidationError(f"{where}: 人工確認紀錄未綁定目前 revision 與明示確認")
+        evidence = view.get("evidence") if isinstance(view.get("evidence"), dict) else {}
+        quality = assess_quality(payload, kind, reasons=view["reasons"], evidence=evidence,
+                                 extraction_status=view["extraction_status"],
+                                 verification_status=status, human_verification=human)
+        if status == VERIF_HUMAN and quality["auto_disposition"] in ("repair_required", "excluded"):
+            raise FigureValidationError(f"{where}: human_verified 不能包含已知缺字或結構損壞")
         try:
             parts = chunk_payload(payload, kind, meta=meta)
         except FigureError as exc:
@@ -2070,6 +2103,9 @@ def build_figure_chunks(figures, *, source: str, doc_type: str,
                 "reason_details": list(figure_details),  # 已在上面 ordered-unique 正規化
                 "evidence_ref": evidence_ref,
                 "model_input_variant": view["model_input_variant"],
+                **copy.deepcopy(quality),
+                "extraction_lane": evidence.get("lane", "unknown"),
+                "transcription": copy.deepcopy(evidence.get("transcription") or {}),
             })
         shadow[page] = base + len(parts)
 

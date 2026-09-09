@@ -191,6 +191,15 @@
   跟正常更新一字不差，查詢照樣回答但答的是別份文件
 - `knowledge._gated_completion`——knowledge.py 所有主模型 `/completion` 的唯一
   出口。繞過它等於沒有 context gate，超長 prompt 由 llama-server 從前面靜默截掉
+- PDF ingest 的品質與來源邊界——`figure_quality` 為 manifest／chunk／通知的共用判斷，
+  品質不得代替 verification 或人工確認；已知缺字／衝突必須列修復，結構錯誤／全不可讀
+  在原文替換前排除，完整 payload 與原生文字保留。人工確認綁目前 revision，不得洗掉
+  仍存在的內容損壞；更新 payload 時舊品質 evidence 歸檔，但 duplicate 來源證明保留。
+  prose 回退為逐行轉錄，空轉錄必須失敗，覆蓋率母體只能是可靠來源，不可用 VL 自證；
+  native／VL／缺席與未知通道分開，不宣稱全 PDF OCR 完成。code／file-tree 的符號與
+  縮排逐字保留；navigation 排除不得改 raw_text 座標或吞正文／檔案樹，section／caption／
+  generated context 也不得重新帶入目錄噪訊。守門測試在四個 `test_pdf_*quality*`／
+  `test_pdf_*regressions` 模組，指定節點必須登記 `tests/test_smoke_gate.py`。
 - `elf_analysis.safe_regex` / `_regex_is_safe`——`analyze_file` 的 `target` 只接受正面表列的安全
   regex 子集（不收任何群組、`|` 只在最上層且 ≤ 8 分支、`*`/`+` 合計 ≤ 1、`?` ≤ 3、不接受 `{n,m}` /
   backreference / lookaround / inline flag），其餘改字面比對；比對主體只看前 300 字元。Python `re`

@@ -563,6 +563,22 @@ def _centered_slice(text: str, center: int, budget_chars: int) -> str:
     return text[start:end]
 
 
+def _retrieval_source_text(document: ExtractedDocument) -> str:
+    """Mask navigation in model input while retaining the raw source's coordinates."""
+    text = document.raw_text
+    spans = getattr(document, "navigation_spans", ()) or ()
+    if not spans:
+        return text
+    chars = list(text)
+    for start, end in spans:
+        if type(start) is not int or type(end) is not int or not 0 <= start <= end <= len(chars):
+            raise ContextGenerationError("navigation_spans 不在原文座標內，拒絕產生脈絡")
+        for index in range(start, end):
+            if chars[index] not in "\r\n":
+                chars[index] = " "
+    return "".join(chars)
+
+
 def build_section_window(
     document: ExtractedDocument, chunk: Dict, budget_chars: int
 ) -> str:
@@ -571,11 +587,12 @@ def build_section_window(
     單一 section 就超窗時改成以 chunk 為中心截窗，並保留該節的標題行——沒有標題
     的窗對「定位」這個任務等於沒用。
     """
-    if budget_chars <= 0 or not document.raw_text:
+    raw_text = _retrieval_source_text(document)
+    if budget_chars <= 0 or not raw_text:
         return ""
     if not document.sections:
         return _centered_slice(
-            document.raw_text, int(chunk.get("char_start", 0) or 0), budget_chars
+            raw_text, int(chunk.get("char_start", 0) or 0), budget_chars
         )
 
     index = _section_index_of(document, chunk)
@@ -583,10 +600,10 @@ def build_section_window(
         index = 0
     start, end = document.sections[index].char_span
     if end - start > budget_chars:
-        heading_line = document.raw_text[start:end].split("\n", 1)[0].strip()
+        heading_line = raw_text[start:end].split("\n", 1)[0].strip()
         head = f"{heading_line}\n" if heading_line else ""
         inner = _centered_slice(
-            document.raw_text,
+            raw_text,
             int(chunk.get("char_start", start) or start),
             max(0, budget_chars - len(head)),
         )
@@ -609,7 +626,7 @@ def build_section_window(
                 grew = True
         if not grew:
             break
-    return document.raw_text[start:end]
+    return raw_text[start:end]
 
 
 def split_into_segments(text: str, budget_chars: int) -> List[Tuple[int, int]]:
@@ -817,7 +834,7 @@ class ContextGenerator:
 
     def document_summary(self, document: ExtractedDocument, budget_tokens: int) -> str:
         """階層式（map/reduce）文件摘要：每一層都在預算內。"""
-        text = document.raw_text
+        text = _retrieval_source_text(document)
         if not text:
             return ""
         budget_chars = tokens_to_chars(budget_tokens)
@@ -882,9 +899,10 @@ class ContextGenerator:
                 "把主模型的 n_ctx 調大，或縮小 chunk 設定。"
             )
 
-        doc_tokens = estimate_tokens(document.raw_text)
+        raw_text = _retrieval_source_text(document)
+        doc_tokens = estimate_tokens(raw_text)
         if doc_tokens <= budget:
-            shared_window = document.raw_text
+            shared_window = raw_text
             summary = ""
         else:
             summary = self.document_summary(document, max(128, budget // 4))

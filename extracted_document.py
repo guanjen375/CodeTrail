@@ -31,6 +31,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from document_structure import protected_text_spans
+
 # 多頁文件串接成 raw_text 時的頁間分隔。用空行而非單一換行,避免下一頁的
 # 標題行黏在上一頁末行後面(會讓 is_heading 的行判斷失準)。
 PAGE_SEPARATOR = "\n\n"
@@ -246,6 +248,7 @@ class ExtractedDocument:
 
     欄位順序刻意讓 `ExtractedDocument(raw_text, sections, chunks)` 可直接建構。
     `source` / `doc_type` / `page_spans` 是入口補上的識別資訊。
+    `navigation_spans` 排除檢索噪訊但不刪 raw_text；座標與 page_spans 同源。
     """
 
     raw_text: str
@@ -255,6 +258,8 @@ class ExtractedDocument:
     doc_type: str = "doc"
     # [(page_number, start, end), ...]，start/end 相對 raw_text
     page_spans: List[Tuple[int, int, int]] = field(default_factory=list)
+    # Confirmed navigation ranges in raw_text; source text and offsets stay intact.
+    navigation_spans: List[Tuple[int, int]] = field(default_factory=list)
 
     def section_index_for_offset(self, offset: int) -> int:
         """offset 落在第幾節;沒有任何 section 時回 -1。"""
@@ -336,7 +341,8 @@ def page_range_for_span(
 
 
 def extract_sections(
-    raw_text: str, page_spans: Optional[List[Tuple[int, int, int]]] = None
+    raw_text: str, page_spans: Optional[List[Tuple[int, int, int]]] = None,
+    *, exclude_spans=(),
 ) -> List[Section]:
     """走一遍整份文字,切出章節 span。
 
@@ -345,6 +351,8 @@ def extract_sections(
 
     文件開頭在第一個標題之前的內容會成為一個 `title=""`、`level=0` 的前言節,
     好讓「每個 chunk 都屬於某一節」成立——否則每個消費點都得特判 -1。
+    `exclude_spans` 使用 raw_text 的半開座標；其內與 code/tree/fence 內的
+    類標題行不建立 section，所有保留 section 的座標仍對應完整原文。
     """
     page_spans = list(page_spans or [])
     if not raw_text:
@@ -352,9 +360,14 @@ def extract_sections(
 
     lines = raw_text.split('\n')
     offsets = build_line_offsets(raw_text)
+    excluded = list(exclude_spans) + protected_text_spans(raw_text)
 
     heads: List[Tuple[str, int, int]] = []  # (title, level, start_offset)
     for index, line in enumerate(lines):
+        start = offsets[index]
+        end = start + len(line)
+        if any(a < end and start < b for a, b in excluded):
+            continue
         if not is_heading(line):
             continue
         title = extract_section_title(line)

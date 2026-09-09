@@ -146,6 +146,7 @@ _FIGURE_PRUNE_ATTR = "_codetrail_figure_prune"
 # 同一條資料通道：這次 ingest **有內容、但沒有進 KB** 的頁與區域（頁碼 / bbox /
 # 固定 slug，零文件內容）。缺席只在提交點的摘要裡講得清楚，抽取端是唯一知情的一端。
 _ABSENT_ATTR = "_codetrail_absent_regions"
+_PDF_COVERAGE_ATTR = "_codetrail_pdf_coverage"
 
 # ============================================================
 # 文件類型識別
@@ -321,7 +322,8 @@ def split_by_semantic_with_sections(
     max_chars: int = CHUNK_SIZE,
     overlap_chars: int = CHUNK_OVERLAP,
     include_heading: bool = INCLUDE_HEADING_IN_CONTENT,
-    pre_normalized: bool = False
+    pre_normalized: bool = False,
+    exclude_spans=(),
 ) -> List[Dict]:
     """
     語意切分：按標題/段落切，保持語意完整性，同時追蹤章節標題
@@ -347,7 +349,7 @@ def split_by_semantic_with_sections(
     if not text:
         return []
 
-    if len(text) <= max_chars:
+    if len(text) <= max_chars and not exclude_spans:
         return [{
             "content": text,
             "section": "",
@@ -358,6 +360,20 @@ def split_by_semantic_with_sections(
 
     lines = text.split('\n')
     line_offsets = build_line_offsets(text)
+    from document_structure import protected_text_spans
+    protected = protected_text_spans(text)
+    protected_lines = {i for i, start in enumerate(line_offsets)
+                       if any(a <= start < b for a, b in protected)}
+    navigation_lines = {i for i, start in enumerate(line_offsets)
+                        if any(a <= start < b for a, b in exclude_spans)}
+    heading_lines = ["" if i in protected_lines or i in navigation_lines else line
+                     for i, line in enumerate(lines)]
+
+    def strip_chunk(value):
+        return value.strip("\n") if protected else value.strip()
+
+    def is_navigation(chunk):
+        return any(a <= chunk["char_start"] and chunk["char_end"] <= b for a, b in exclude_spans)
     table_context: Dict[int, Tuple[str, str]] = {}
 
     def _table_cells(line: str) -> List[str]:
@@ -376,7 +392,8 @@ def split_by_semantic_with_sections(
     line_idx = 0
     while line_idx + 1 < len(lines):
         header_cells = _table_cells(lines[line_idx])
-        if len(header_cells) >= 3 and _is_table_separator(lines[line_idx + 1]):
+        if (line_idx not in protected_lines and len(header_cells) >= 3
+                and _is_table_separator(lines[line_idx + 1])):
             header = lines[line_idx]
             separator = lines[line_idx + 1]
             data_idx = line_idx + 2
@@ -409,19 +426,27 @@ def split_by_semantic_with_sections(
         chunks.append({
             "content": chunk_text,
             "section": current_section,
-            "heading_hierarchy": extract_heading_hierarchy(lines, hierarchy_idx),
+            "heading_hierarchy": extract_heading_hierarchy(heading_lines, hierarchy_idx),
             "char_start": char_start,
             "char_end": char_end,
         })
 
     for idx, line in enumerate(lines):
         line_len = len(line) + 1  # +1 for newline
+        if idx and ((idx in navigation_lines) != (idx - 1 in navigation_lines)):
+            if current_chunk:
+                chunk_text = strip_chunk('\n'.join(current_chunk))
+                if chunk_text.strip():
+                    _emit(chunk_text, chunk_start_idx, chunk_start_idx, idx - 1)
+            current_chunk, current_len, chunk_start_idx = [], 0, idx
+            if idx in navigation_lines:
+                current_section = ""
 
         # 遇到標題 → 先 flush 舊 chunk（用舊 section），再更新 section
-        if is_heading(line):
+        if idx not in protected_lines and idx not in navigation_lines and is_heading(line):
             # 先 flush 舊 chunk（保持舊的 section）
             if current_chunk:
-                chunk_text = '\n'.join(current_chunk).strip()
+                chunk_text = strip_chunk('\n'.join(current_chunk))
                 if chunk_text:
                     _emit(chunk_text, chunk_start_idx, chunk_start_idx, idx - 1)
 
@@ -438,7 +463,7 @@ def split_by_semantic_with_sections(
         # 空行 → 段落分界
         if not line.strip():
             if current_len > max_chars * 0.7:  # 超過 70% 就切
-                chunk_text = '\n'.join(current_chunk).strip()
+                chunk_text = strip_chunk('\n'.join(current_chunk))
                 if chunk_text:
                     _emit(chunk_text, chunk_start_idx, chunk_start_idx, idx - 1)
                 current_chunk = []
@@ -452,12 +477,12 @@ def split_by_semantic_with_sections(
         # 加入當前行會超過限制 → 切分
         if current_len + line_len > max_chars:
             if current_chunk:
-                chunk_text = '\n'.join(current_chunk).strip()
+                chunk_text = strip_chunk('\n'.join(current_chunk))
                 if chunk_text:
                     _emit(chunk_text, chunk_start_idx, chunk_start_idx, idx - 1)
 
             # 單行超長 → 按句子切
-            if line_len > max_chars:
+            if line_len > max_chars and idx not in protected_lines:
                 sub_chunks = split_long_paragraph(line, max_chars)
                 for i, sc in enumerate(sub_chunks[:-1]):
                     _emit(sc, idx, idx, idx)
@@ -478,7 +503,7 @@ def split_by_semantic_with_sections(
 
     # 處理最後的 chunk
     if current_chunk:
-        chunk_text = '\n'.join(current_chunk).strip()
+        chunk_text = strip_chunk('\n'.join(current_chunk))
         if chunk_text:
             _emit(chunk_text, chunk_start_idx, chunk_start_idx, len(lines) - 1)
 
@@ -497,6 +522,8 @@ def split_by_semantic_with_sections(
     if overlap_chars and len(chunks) > 1:
         original_contents = [c["content"] for c in chunks]
         for i in range(1, len(chunks)):
+            if is_navigation(chunks[i - 1]) or is_navigation(chunks[i]):
+                continue
             prev = original_contents[i - 1]
             tail = prev[-overlap_chars:] if prev else ""
             if tail:
@@ -763,10 +790,13 @@ def _page_captions(page_text: str, page_start: int) -> List[Dict]:
     的話，一頁的 caption 數會遠多於圖數，配對就只能整頁放棄。
     """
     found: List[Dict] = []
+    from document_structure import navigation_spans, protected_text_spans
+    excluded = navigation_spans(page_text) + protected_text_spans(page_text)
     offset = 0
     for line in page_text.split("\n"):
         stripped = line.strip()
-        if 0 < len(stripped) <= MAX_CAPTION_CHARS:
+        if (0 < len(stripped) <= MAX_CAPTION_CHARS
+                and not any(start <= offset < end for start, end in excluded)):
             for family, pattern in _CAPTION_PATTERNS:
                 match = pattern.match(line)
                 if match:
@@ -868,6 +898,7 @@ def build_structured_figure_document(
     next_chunk_index: Dict[int, int],
     evidence_ref_by_figure: Dict[str, str],
     context_by_figure: Optional[Dict[str, Dict[str, str]]] = None,
+    human_verifications_by_figure: Optional[Dict[str, Dict]] = None,
 ) -> List[Dict]:
     """structured figure chunk 的唯一入口：薄封裝 `figure_extract.build_figure_chunks`。
 
@@ -888,6 +919,7 @@ def build_structured_figure_document(
         next_chunk_index=next_chunk_index,
         evidence_ref_by_figure=evidence_ref_by_figure,
         context_by_figure=context_by_figure,
+        human_verifications_by_figure=human_verifications_by_figure,
     )
 
 
@@ -1044,11 +1076,12 @@ def _native_span(fx, candidate) -> Optional[Dict]:
     terminal 認 T3 定義的文字類（`_native_text_span` 就是從這些框挑出來的）。
     """
     native_table = getattr(candidate, "native_table", None)
-    if isinstance(native_table, dict) and native_table.get("pos") is not None:
+    if (getattr(candidate, "kind", None) == fx.KIND_TABLE
+            and isinstance(native_table, dict) and native_table.get("pos") is not None):
         return {"pos": native_table.get("pos"),
                 "markdown": native_table.get("markdown"),
                 "classes": ("table",), "kind": "native_table"}
-    if isinstance(native_table, dict):
+    if getattr(candidate, "kind", None) == fx.KIND_TABLE and isinstance(native_table, dict):
         # 有 native_table 但沒有 pos：仍然要走「不能安全取代」那條，不能當成沒有正文
         return {"pos": None, "markdown": native_table.get("markdown"),
                 "classes": ("table",), "kind": "native_table"}
@@ -1059,6 +1092,10 @@ def _native_span(fx, candidate) -> Optional[Dict]:
                 "markdown": native_text.get("markdown"),
                 "classes": ("text", "code", "table", "section-header"),
                 "kind": "native_text"}
+    if isinstance(native_table, dict):
+        # UNKNOWN／非 code terminal 也可能帶表格原文；缺 native_text 不等於沒有正文。
+        return {"pos": native_table.get("pos"), "markdown": native_table.get("markdown"),
+                "classes": ("table",), "kind": "native_table"}
     return None
 
 
@@ -1075,6 +1112,10 @@ def _structured_candidates(fx, plan) -> Tuple[List, List[Dict]]:
     accepted = (fx.KIND_TABLE, fx.KIND_TERMINAL, fx.KIND_UNKNOWN, fx.KIND_RASTER)
     for candidate in plan.candidates:
         kind = getattr(candidate, "kind", "")
+        if (getattr(candidate, "signals", None) or {}).get("content_role") == "navigation":
+            absent.append({"page": int(candidate.page), "bbox": list(candidate.bbox),
+                           "channel": "candidate", "reason": "navigation_candidate_excluded"})
+            continue
         if kind != fx.KIND_DIAGRAM and (
                 getattr(candidate, "native_table", None) is not None or kind in accepted):
             keep.append(candidate)
@@ -1668,8 +1709,16 @@ def _carry_over_human_verification(fx, filename, root_path: Path, kb_path,
             revision=revision,
             row_total=row_total,
             line_total=line_total,
-            reasons=list(figure.reasons or []) + ["human_verification_carried_over"],
-            reason_details=list(figure.reason_details or []) + [
+            reasons=["human_verification_carried_over"],
+            evidence={"lane": (figure.evidence or {}).get("lane", "unknown"),
+                      **{key: copy.deepcopy(figure.evidence[key])
+                         for key in ("duplicate_of", "duplicate_model_input")
+                         if key in (figure.evidence or {})},
+                      "human_correction": {"revision": revision, "carried_over": True},
+                      "superseded_extraction": {"evidence": copy.deepcopy(figure.evidence),
+                                                "reasons": list(figure.reasons),
+                                                "reason_details": list(figure.reason_details)}},
+            reason_details=[
                 f"{filename} figure={figure.figure_id}: 沿用第 {revision} 版人工確認"
                 "（asset_digest / 頁碼 / 正規化 bbox 全等）"],
         ))
@@ -1886,6 +1935,46 @@ def _format_failed_figures(failed: List) -> str:
     return f"[figure] 失敗 {len(failed)} 張（不進 KB）：{items}"
 
 
+def _native_unavailable_regions(plan) -> List[Dict]:
+    """Record failed native channels without putting exception text into notifications."""
+    channels: Dict[int, set] = {}
+    for page, evidence in (plan.page_evidence or {}).items():
+        channels.setdefault(int(page), set()).update(getattr(evidence, "unavailable", ()) or ())
+    for page, unavailable in ((plan.stats or {}).get("unavailable_channels") or {}).items():
+        channels.setdefault(int(page), set()).update(unavailable or ())
+    allowed = {"page_object", "page_rect", "words", "image_info", "find_tables", "drawings",
+               "drawing_clusters", "overlays", "page_boxes_geometry", "page_boxes", "rotation"}
+    entries = []
+    for page, failures in sorted(channels.items()):
+        names = {str(failure).partition(":")[0] for failure in failures}
+        for name in sorted(names):
+            channel = name if name in allowed else "unknown"
+            entry = {"page": page, "bbox": None, "channel": channel,
+                     "reason": f"native_channel_unavailable:{channel}",
+                     "lane": "native", "stage": "native_channel_unavailable"}
+            if entry not in entries:
+                entries.append(entry)
+    return entries
+
+
+def _coverage_record(detected: int, figures, absent, excluded=()) -> Dict:
+    return {"scope": "detected_regions", "detected": detected,
+            "native_processed": sum(f.extraction_status == "complete" and
+                                    (f.evidence or {}).get("lane") == "native" for f in figures),
+            "vl_processed": sum(f.extraction_status == "complete" and
+                                (f.evidence or {}).get("lane") == "vl" for f in figures),
+            "failed": sum(f.extraction_status == "failed" for f in figures),
+            "excluded": len(excluded), "absent": len(absent),
+            "unknown_channels": sum(e.get("stage") == "native_channel_unavailable" for e in absent)}
+
+
+def _assess_figure(figure, human=None) -> Dict:
+    from figure_quality import assess_quality
+    return assess_quality(figure.payload, figure.kind, reasons=figure.reasons,
+                          evidence=figure.evidence, extraction_status=figure.extraction_status,
+                          verification_status=figure.verification_status, human_verification=human)
+
+
 def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict], *,
                                 root: Optional[str], preflight_only: bool,
                                 kb_path=None, source_identity: Optional[str] = None) -> Dict:
@@ -1899,6 +1988,7 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
                 "failed_figures": [], "failed_summary": "",
                 "replacements": {}, "page_source": {},
                 "evidence_ref": {}, "guard": None, "absent": []}
+    inactive["human_verifications"] = {}
     root_path = _figure_root(root)
     source_path = Path(file_path)
     if source_identity is not None:
@@ -1986,10 +2076,15 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             print(fx.format_preflight_report(plan), flush=True)
             return {**inactive, "active": True, "preflight_only": True}
 
+        detected_count = len(plan.candidates)
+        native_unavailable = _native_unavailable_regions(plan)
         candidates, filtered_absent = _structured_candidates(fx, plan)
+        filtered_absent.extend(native_unavailable)
         if not candidates:
             # 零候選也可能是「這頁的圖全部落在 lane 之外」，缺席帳照樣要交出去。
-            return {**inactive, "absent": _absent_from_plan(plan, filtered_absent)}
+            absent = _absent_from_plan(plan, filtered_absent)
+            return {**inactive, "absent": absent,
+                    "coverage": _coverage_record(detected_count, [], absent)}
         if not plan.document_id:
             # T3 對「身分建立不了」的降級 plan 會回零候選；真走到這裡代表契約破了，
             # 而空 document_id 會一路帶到 chunk 與 artifact 目錄上。
@@ -2007,12 +2102,7 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             kinds = set()
             for candidate in vl_candidates:
                 # native lane 永遠不呼叫 VL（契約 §12.1），所以只有這些候選要 probe
-                if candidate.kind == fx.KIND_UNKNOWN:
-                    kinds |= {fx.KIND_TABLE, fx.KIND_TERMINAL}
-                elif candidate.kind == fx.KIND_RASTER:
-                    kinds |= set(fx.FIGURE_KINDS)
-                elif candidate.kind in (fx.KIND_TABLE, fx.KIND_TERMINAL):
-                    kinds.add(candidate.kind)
+                kinds |= fx.candidate_vl_kinds(candidate)
             fx.ensure_capability(
                 base_url=LLAMA_VL_BASE_URL, model=VL_MODEL, kinds=kinds)
 
@@ -2139,9 +2229,17 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             _write_failed(partial)
             raise
 
+        quality_excluded = []
+        admitted = []
+        for figure in results:
+            quality = _assess_figure(figure, human_verifications.get(figure.figure_id))
+            if quality["auto_disposition"] == "excluded":
+                quality_excluded.append(figure)
+            else:
+                admitted.append(figure)
         page_texts = _first_page_texts(pages)
         eligible, dropped, page_items = _plan_page_replacements(
-            fx, filename, plan, results, by_fid, page_texts)
+            fx, filename, plan, admitted, by_fid, page_texts)
 
         # figure_index 的最終編號要在**寫 artifact 之前**完成：manifest 記 T4 的內部
         # 序號、KB/REF 記另一套序號，覆核的人與檢索就會用到兩套
@@ -2153,7 +2251,7 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             sequence[page] = sequence.get(page, 0) + 1
             numbered_eligible.append(_dc_replace(figure, figure_index=sequence[page]))
         numbered_dropped = []
-        for figure in sorted(dropped, key=lambda f: (f.page, f.figure_index)):
+        for figure in sorted(dropped + quality_excluded, key=lambda f: (f.page, f.figure_index)):
             page = int(figure.page)
             sequence[page] = sequence.get(page, 0) + 1
             numbered_dropped.append(_dc_replace(figure, figure_index=sequence[page]))
@@ -2178,12 +2276,23 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
         _assert_source_identity(fx, filename, source_path, root_path, document_id,
                                 stage="發布 review artifact 之前")
 
+        absent = _absent_from_plan(plan, filtered_absent + [
+            {"page": int(figure.page), "bbox": list(figure.bbox), "channel": "candidate",
+             "reason": "raster_not_a_figure", "lane": "vl", "stage": "candidate_absent"}
+            for figure in numbered_skipped
+        ] + [
+            {"page": int(figure.page), "bbox": list(figure.bbox), "channel": "candidate",
+             "reason": "quality_excluded", **_diagnostic_fields({"evidence": figure.evidence})}
+            for figure in quality_excluded
+        ])
+        coverage = _coverage_record(detected_count, extracted, absent, quality_excluded)
+
         manifest = fx.write_run_artifacts(
             root_path, document_id=document_id, run_id=run_id,
             figures=(numbered_eligible + numbered_dropped + numbered_failed
                      + numbered_skipped),
             variants=rendered, failed=False,
-            preflight=plan.preflight, stats=plan.stats,
+            preflight=plan.preflight, stats={**plan.stats, "coverage": coverage},
             source_signatures=source_signatures, review_assets=review_assets,
             human_verifications=human_verifications)
         evidence_ref = fx.evidence_ref_for(document_id, run_id)
@@ -2209,6 +2318,8 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             "active": True,
             "preflight_only": False,
             "figures": numbered_eligible,
+            "human_verifications": human_verifications,
+            "coverage": coverage,
             # 不進 KB，但呼叫端要印得出「哪幾張缺席」——ingest 仍然 exit 0，
             # 使用者只從 chunk 數看不出少了什麼。
             "failed_figures": numbered_failed,
@@ -2218,12 +2329,7 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
             # 畸形 metadata 讓兩個 page dict 撞同一頁碼時才不會切錯位置
             "page_source": {page: page_texts[page] for page in replacements},
             # 有東西、卻沒有經過這條 lane 進 KB 的頁與區域（頁碼 / bbox / 固定 slug）。
-            "absent": _absent_from_plan(plan, filtered_absent + [
-                {"page": int(figure.page),
-                 "bbox": [float(v) for v in figure.bbox],
-                 "channel": "candidate", "reason": "raster_not_a_figure"}
-                for figure in numbered_skipped
-            ]),
+            "absent": absent,
             "evidence_ref": {figure.figure_id: evidence_ref for figure in numbered_eligible},
             "guard": {
                 "root": str(root_path),
@@ -2233,6 +2339,12 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
                 "human_baseline": human_baseline,
                 "wrote_run": True,
                 "run_id": str(run_id),
+                "repair": [
+                    {**_summary_item({"page": f.page, "kind": f.kind, "figure_id": f.figure_id,
+                                     "figure_index": f.figure_index, "evidence": f.evidence},
+                                    _assess_figure(f)), "reason": "quality_excluded"}
+                    for f in numbered_dropped if f.figure_id in {e.figure_id for e in quality_excluded}
+                ],
                 # 抽壞的那幾張不進 KB，所以提交點掃 KB chunks 是看不到它們的；
                 # 這裡順手記下來（零內容，只有頁碼／身分／固定 slug），提交後的
                 # 摘要才講得出「這一次少了哪幾張」。
@@ -2240,7 +2352,9 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
                     {"page": int(figure.page), "kind": str(figure.kind),
                      "figure_id": str(figure.figure_id),
                      "figure_index": int(figure.figure_index),
-                     "reason": _failure_slug(figure)}
+                     "reason": _failure_slug(figure),
+                     **_diagnostic_fields({"evidence": figure.evidence, "extraction_status": "failed",
+                                           "reasons": figure.reasons})}
                     for figure in numbered_failed
                 ],
             },
@@ -2333,6 +2447,7 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
     chunks: List[Dict] = []
     page_texts: List[str] = []
     page_spans: List[Tuple[int, int, int]] = []
+    document_navigation: List[Tuple[int, int]] = []
     # 頁碼 → 該頁文字 chunk 數；figure chunk 的 chunk_index 接在同頁文字 chunk
     # 之後，chunk id（source::pN::cM::hash）才不會與文字 chunk 共用索引空間
     text_chunk_counts: Dict[int, int] = {}
@@ -2404,20 +2519,23 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
                     "算 pos 時的那份不同，offset 不可信。整份文件零寫入。")
             raw_page_text = _apply_page_replacements(raw_page_text, pieces)
 
-        content = raw_page_text.strip()
+        content = raw_page_text.strip("\r\n")
 
-        if not content:
+        if not content.strip():
             # `pieces` 非空代表這一頁本來就有原文（pos 算得出來），不可能走到這裡；
             # 真走到就是 partition 把整頁吃掉了，退路會拿回**未經 partition** 的
             # 文字，讓被 structured chunk 收錄的表再出現一次。寧可缺席。
-            content = "" if pieces else _recover_page_text(page_num).strip()
-        if not content:
+            content = "" if pieces else _recover_page_text(page_num).strip("\r\n")
+        if not content.strip():
             continue
 
         # 先正規化再切：raw_text 必須就是 splitter 看到的那份文字，offset 才對得上
-        page_text = normalize_document_text(content)
+        from document_structure import navigation_spans, normalize_preserving_structure
+        page_text = normalize_preserving_structure(content, normalize_document_text)
         if not page_text:
             continue
+        page_navigation = navigation_spans(page_text)
+        document_navigation.extend((offset + start, offset + end) for start, end in page_navigation)
 
         # 使用帶章節的切分（根據文件類型調整 chunk 大小）
         chunk_results = split_by_semantic_with_sections(
@@ -2425,8 +2543,12 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
             max_chars=chunk_size,
             overlap_chars=chunk_overlap,
             pre_normalized=True,
+            exclude_spans=page_navigation,
         )
         for i, chunk_data in enumerate(chunk_results):
+            if any(start <= chunk_data["char_start"] and chunk_data["char_end"] <= end
+                   for start, end in page_navigation):
+                continue
             # 根據內容判斷是否為警告類型
             chunk_type = detect_content_type(chunk_data["content"], doc_type)
 
@@ -2470,11 +2592,12 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
     raw_text = PAGE_SEPARATOR.join(page_texts)
     document = ExtractedDocument(
         raw_text=raw_text,
-        sections=extract_sections(raw_text, page_spans),
+        sections=extract_sections(raw_text, page_spans, exclude_spans=document_navigation),
         chunks=chunks,
         source=filename,
         doc_type=doc_type,
         page_spans=page_spans,
+        navigation_spans=document_navigation,
     )
     # 章節對齊只作用在文字 chunk：figure chunk 的 section 來自 VL 描述自己的
     # markdown 標題（與獨立圖片入庫一致），拿 PDF 文件級章節去蓋會蓋錯座標系。
@@ -2482,6 +2605,8 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
     document.apply_section_titles()
     setattr(document, _FIGURE_PRUNE_ATTR, lane["guard"])
     setattr(document, _ABSENT_ATTR, absent)
+    if lane.get("coverage"):
+        setattr(document, _PDF_COVERAGE_ATTR, lane["coverage"])
 
     if lane["figures"]:
         before = len(document.chunks)
@@ -2496,6 +2621,7 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
             # caption / 章節在**文字 chunk 都建好之後**才算得出來：它們的座標系是
             # 文件級 raw_text 的 offset，而那份 raw_text 就是上面那個迴圈拼出來的。
             context_by_figure=_figure_retrieval_context(document, numbered),
+            human_verifications_by_figure=lane.get("human_verifications"),
         ))
         print(f"[INFO] 結構化 figure 入庫: {len(numbered)} 張 → "
               f"{len(document.chunks) - before} 個 structured chunk", flush=True)
@@ -3516,14 +3642,53 @@ _UNFIXABLE_ARTIFACT_WARNINGS = frozenset({
 })
 
 
-def _summary_item(entry: Dict) -> Dict:
+def _quality_for_entry(entry: Dict) -> Dict:
+    """One evaluator for full artifacts and metadata-only notification fallback."""
+    from figure_quality import assess_quality
+    evidence = dict(entry.get("evidence") or {})
+    if "transcription" not in evidence and entry.get("transcription"):
+        evidence["transcription"] = entry["transcription"]
+    if entry.get("payload") is None:
+        evidence.update(metadata_only=True, quality_metadata={
+            key: entry.get(key) for key in
+            ("quality_grade", "review_state", "auto_disposition", "quality_issues")},
+            fallback_text=str(entry.get("content") or ""))
+    return assess_quality(
+        entry.get("payload"), str(entry.get("kind") or entry.get("figure_kind") or ""),
+        reasons=entry.get("reasons") or (), evidence=evidence,
+        extraction_status=entry.get("extraction_status", "complete"),
+        verification_status=entry.get("verification_status", "unverified"),
+        human_verification=entry.get("human_verification"))
+
+
+def _diagnostic_fields(entry: Dict) -> Dict:
+    evidence = entry.get("evidence") or {}
+    lane = evidence.get("lane") or entry.get("extraction_lane") or "unknown"
+    lane = lane if lane in ingest_notify.LANES else "unknown"
+    fields = {"lane": lane}
+    if entry.get("extraction_status") == "failed":
+        reasons = set(entry.get("reasons") or [])
+        fields["stage"] = ("native_verify_failed" if lane == "native" else
+                           "vl_transport_failed" if lane == "vl" and "transport" in reasons else
+                           "vl_sample_failed" if lane == "vl" else "candidate_absent")
+    elif (evidence.get("transcription") or entry.get("transcription") or {}).get("fallback_kind"):
+        fields["stage"] = "transcription_fallback"
+    return fields
+
+
+def _summary_item(entry: Dict, quality: Optional[Dict] = None) -> Dict:
     """覆核清單的一列 → 摘要行的一個元素（只有身分，零內容）。"""
-    return {
+    item = {
         "page": int(entry.get("page") or 0),
         "figure_index": int(entry.get("figure_index") or 0),
         "figure_id": str(entry.get("figure_id") or ""),
         "kind": str(entry.get("kind") or ""),
+        **_diagnostic_fields(entry),
     }
+    if quality:
+        item.update(quality_grade=quality["quality_grade"], review_state=quality["review_state"],
+                    disposition=quality["auto_disposition"])
+    return item
 
 
 def _unfixable_reason(entry: Dict) -> str:
@@ -3565,17 +3730,14 @@ def _fallback_status_counts(committed_chunks) -> Dict:
 
 
 def _finish_summary_payload(payload: Dict) -> Dict:
-    """補上精確 total、把三個 list 截到協定上限。
+    """補上精確 total、把每份 list 截到協定上限。
 
     `ingest_notify.format_summary_line` 是**逐字**序列化（寫出去的就是這份 dict），
     所以「形狀完整」與「行不會無限長」都是產生端的責任：total 一定是截斷**之前**
     的精確數量，list 才是被砍過的那一段。
     """
-    for list_key, total_key in (("review", "review_total"),
-                                ("unfixable", "unfixable_total"),
-                                ("failed", "failed_total"),
-                                (ingest_notify.ABSENT_KEY,
-                                 ingest_notify.ABSENT_TOTAL_KEY)):
+    for list_key, total_key in (*ingest_notify._LIST_KEYS,
+                               (ingest_notify.ABSENT_KEY, ingest_notify.ABSENT_TOTAL_KEY)):
         items = payload.get(list_key) or []
         if list_key == ingest_notify.ABSENT_KEY:
             # 讀端要到 `render_action_block` 才過濾 actionable，所以**這裡先排**：
@@ -3591,35 +3753,29 @@ def _finish_summary_payload(payload: Dict) -> Dict:
     return payload
 
 
-def _fallback_review_items(committed_chunks) -> List[Dict]:
-    """覆核清單讀不到時，直接從已提交的 chunk 挑出待覆核的圖（以 figure 為單位）。
-
-    判不出 `fixable`，所以 `needs_review` 一律當「可覆核」列出：那一類本來就有
-    下一步（去看原圖、修正）。`unverified` / `legacy_unverified` 則**不列** ——
-    它們沒有可執行的下一步，列出來只是假警報（契約 §2.3）。
-    """
-    fx = _figure_extract()
-    # **只有 `needs_review`**。`FLAGGED_VERIFICATION` 還含 `unverified` /
-    # `legacy_unverified` —— 契約 §2.3 明訂那兩種不列、不提:它們沒有「使用者
-    # 該做什麼」可講,列出來只是把每次 ingest 都變成一則假警報,然後使用者學會
-    # 忽略整個通知。「寧可多叫」在這裡是錯的,因為多叫的那些沒有下一步。
-    needs_review = getattr(fx, "VERIF_NEEDS_REVIEW", "needs_review")
+def _fallback_review_items(committed_chunks, *, bucket: str = "review") -> List[Dict]:
+    """讀不到 artifacts 時，以相同 evaluator 分流修復／待確認；純 unverified 靜默。"""
     seen: Dict[str, Dict] = {}
     for chunk in committed_chunks or []:
         if not isinstance(chunk, dict) or not chunk.get("structured"):
             continue
-        if str(chunk.get("verification_status") or "") != needs_review:
+        quality = _quality_for_entry(chunk)
+        destination = _quality_summary_bucket(chunk, quality)
+        if destination != bucket:
             continue
         figure_id = str(chunk.get("figure_id") or "")
         if not figure_id or figure_id in seen:
             continue
-        seen[figure_id] = {
-            "page": int(chunk.get("page") or 0),
-            "figure_index": int(chunk.get("figure_index") or 0),
-            "figure_id": figure_id,
-            "kind": str(chunk.get("figure_kind") or ""),
-        }
+        seen[figure_id] = _summary_item({**chunk, "kind": chunk.get("figure_kind", "")}, quality)
     return [seen[key] for key in sorted(seen)]
+
+
+def _quality_summary_bucket(entry: Dict, quality: Dict) -> str:
+    if quality["auto_disposition"] == "repair_required" or (
+            quality["auto_disposition"] == "excluded"
+            and quality["quality_grade"] in {"partial", "structure_error", "unusable"}):
+        return "repair"
+    return "review" if entry.get("verification_status") == "needs_review" else ""
 
 
 def _ingest_summary_line(document: ExtractedDocument, committed_chunks,
@@ -3643,16 +3799,21 @@ def _ingest_summary_line(document: ExtractedDocument, committed_chunks,
         "document_id": document_id,
         "run_id": run_id,
         "status_counts": {},
-        "review": [], "unfixable": [], "failed": [],
+        "review": [], "repair": [], "unfixable": [], "failed": [],
+        "quality_counts": {}, "review_state_counts": {},
         # 缺席清單走抽取端掛上來的那一份：提交點掃 KB 是看不到「沒進 KB 的東西」的。
         ingest_notify.ABSENT_KEY: [
             {"page": int(item.get("page") or 0),
              "bbox": list(item["bbox"]) if item.get("bbox") else None,
              "channel": str(item.get("channel") or ""),
-             "reason": str(item.get("reason") or "")}
+             "reason": str(item.get("reason") or ""),
+             **{key: item[key] for key in ("lane", "stage") if key in item}}
             for item in (getattr(document, _ABSENT_ATTR, None) or [])
         ],
     }
+    coverage = getattr(document, _PDF_COVERAGE_ATTR, None)
+    if coverage:
+        payload["coverage"] = coverage
 
     entries = None
     if root and document_id:
@@ -3660,26 +3821,36 @@ def _ingest_summary_line(document: ExtractedDocument, committed_chunks,
             entries = _figure_extract().list_figures(
                 root, committed_chunks, document_id=document_id)
         except Exception as exc:  # noqa: BLE001 — KB 已提交，摘要只能降級不能失敗
-            print(f"[WARN] 讀不到覆核清單（{exc}）；本次摘要只報抽取失敗的圖。")
+            print(f"[WARN] 讀不到覆核清單（{exc}）；本次摘要改用已提交 chunk 與抽取紀錄。")
             entries = None
 
     if entries is None:
         # 退路：guard 自己記下來的失敗清單 ＋ chunk 級狀態統計。
         payload["failed"] = [dict(item) for item in (guard.get("failed") or [])]
         payload["status_counts"] = _fallback_status_counts(committed_chunks)
-        # **待覆核也要列出來**。只留 status_counts 的話，一次成功入庫、而且有
-        # needs_review 圖的 ingest 會回 `status: ok`、plugin 也不通知 —— 使用者
-        # 無聲漏掉必要的覆核，那正是這條通知鏈存在的理由。
-        # 這條路徑讀不到覆核清單，所以判不出 fixable：一律當成「可覆核」列出。
-        # 寧可多叫一次，也不要漏掉一張。
+        counted = set()
+        for chunk in committed_chunks or []:
+            if not isinstance(chunk, dict) or not chunk.get("structured"):
+                continue
+            figure_id = chunk.get("figure_id")
+            if not figure_id or figure_id in counted:
+                continue
+            counted.add(figure_id)
+            quality = _quality_for_entry(chunk)
+            for key, field in (("quality_counts", "quality_grade"), ("review_state_counts", "review_state")):
+                value = quality[field]
+                payload[key][value] = payload[key].get(value, 0) + 1
         payload["review"] = _fallback_review_items(committed_chunks)
+        payload["repair"] = [dict(item) for item in guard.get("repair", [])] + _fallback_review_items(
+            committed_chunks, bucket="repair")
         return ingest_notify.format_summary_line(_finish_summary_payload(payload))
 
     fx = _figure_extract()
     counts: Dict[str, int] = {}
     for entry in entries:
         status = str(entry.get("verification_status") or "")
-        item = _summary_item(entry)
+        quality = _quality_for_entry(entry)
+        item = _summary_item(entry, quality)
         if not entry.get("in_kb"):
             if str(entry.get("extraction_status") or "") == fx.EXTRACTION_SKIPPED:
                 # 分類器判定「不是圖面」（封面 / logo / 照片）：同樣沒進 KB，但它
@@ -3691,17 +3862,28 @@ def _ingest_summary_line(document: ExtractedDocument, committed_chunks,
             # 每次 ingest 都會重報同一批舊帳（「舊 run 零誤報」）。
             if not run_id or str(entry.get("run_id") or "") != run_id:
                 continue
+            if "quality_excluded" in (entry.get("warnings") or []):
+                item["reason"] = "quality_excluded"
+                payload["repair"].append(item)
+                continue
             item["reason"] = _failure_reason_slug(entry.get("reasons"))
             payload["failed"].append(item)
             continue
         if status:
             counts[status] = counts.get(status, 0) + 1
+        for key, field in (("quality_counts", "quality_grade"), ("review_state_counts", "review_state")):
+            value = quality[field]
+            payload[key][value] = payload[key].get(value, 0) + 1
         # **只有 `needs_review` 會進通知**（契約 §2.3）。`unverified` /
         # `legacy_unverified` 即使 artifact 壞掉也不列：它們本來就沒有「使用者
         # 該做什麼」——叫人 remove + 重灌，重灌完多半還是 unverified、artifact
         # 還是那樣，是一條**不會收斂**的指示。這也讓正常路徑與 fallback 路徑
         # 給出同一套答案（兩邊不一致比兩邊都保守更糟）。
-        if status != fx.VERIF_NEEDS_REVIEW:
+        bucket = _quality_summary_bucket(entry, quality)
+        if not bucket:
+            continue
+        if bucket == "repair":
+            payload["repair"].append(item)
             continue
         if (not entry.get("fixable") or entry.get("payload_error")
                 or entry.get("payload") is None):

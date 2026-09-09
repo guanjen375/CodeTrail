@@ -49,9 +49,24 @@ _ALL_MARKERS = (SUMMARY_PREFIX, ACTION_REQUIRED_MARKER, FAILED_MARKER,
 # payload 的 figure 身分 list ↔ 對應的精確總數欄位。
 _LIST_KEYS = (
     ("review", "review_total"),
+    ("repair", "repair_total"),
     ("unfixable", "unfixable_total"),
     ("failed", "failed_total"),
 )
+
+LANES = frozenset({"native", "vl", "unknown"})
+STAGES = frozenset({
+    "candidate_absent", "native_channel_unavailable", "native_verify_failed",
+    "vl_transport_failed", "vl_sample_failed", "transcription_fallback",
+})
+DISPOSITIONS = frozenset({"accept", "manual_review", "repair_required", "excluded"})
+QUALITY_GRADES = frozenset({"usable", "formatting_only", "partial", "structure_error",
+                            "unusable", "unknown"})
+REVIEW_STATES = frozenset({"unreviewed", "confirmed"})
+_ITEM_ENUMS = {"lane": LANES, "stage": STAGES, "disposition": DISPOSITIONS,
+               "quality_grade": QUALITY_GRADES, "review_state": REVIEW_STATES}
+_COVERAGE_COUNTS = ("detected", "native_processed", "vl_processed", "failed", "excluded",
+                    "absent", "unknown_channels")
 
 # 缺席清單（頁碼 / bbox / slug，不是 figure 身分，所以另外一份形狀）。
 ABSENT_KEY = "absent"
@@ -69,6 +84,9 @@ ACTIONABLE_ABSENT_PREFIXES = (
     "planning_error",
     "candidates_per_page",
     "candidate_build_error",
+    "native_channel_unavailable",
+    "code_block_without_pos",
+    "page_number_mismatch",
 )
 
 
@@ -124,6 +142,10 @@ def _clean_item(item: object) -> dict:
     reason = source.get("reason")
     if reason not in (None, ""):
         cleaned["reason"] = _clean_scalar(reason)
+    for name, allowed in _ITEM_ENUMS.items():
+        value = source.get(name)
+        if isinstance(value, str) and value in allowed:
+            cleaned[name] = value
     return cleaned
 
 
@@ -150,12 +172,17 @@ def _clean_absent_item(item: object) -> dict:
     if isinstance(raw, (list, tuple)) and len(raw) == 4:
         coords = [_as_float(v) for v in raw]
         bbox = coords if all(v is not None for v in coords) else None
-    return {
+    result = {
         "page": _as_int(source.get("page")),
         "bbox": bbox,
         "channel": _clean_scalar(source.get("channel", "")),
         "reason": _clean_scalar(source.get("reason", "")),
     }
+    for name in ("lane", "stage"):
+        value = source.get(name)
+        if isinstance(value, str) and value in _ITEM_ENUMS[name]:
+            result[name] = value
+    return result
 
 
 def _as_int(value: object) -> int:
@@ -192,6 +219,15 @@ def normalize_payload(payload: object) -> dict:
         for name, value in counts.items():
             # 沒有的狀態不補 0：key 只在真的出現過時存在（契約 §2.1）。
             result["status_counts"][_clean_scalar(name)] = _as_int(value)
+    for key, allowed in (("quality_counts", QUALITY_GRADES), ("review_state_counts", REVIEW_STATES)):
+        counts = source.get(key)
+        if isinstance(counts, dict):
+            result[key] = {name: max(0, _as_int(count)) for name, count in counts.items()
+                           if name in allowed}
+    coverage = source.get("coverage")
+    if isinstance(coverage, dict) and coverage.get("scope") == "detected_regions":
+        result["coverage"] = {"scope": "detected_regions", **{
+            name: max(0, _as_int(coverage.get(name))) for name in _COVERAGE_COUNTS}}
     for list_key, total_key in _LIST_KEYS:
         raw = source.get(list_key)
         items = [_clean_item(item) for item in raw] if isinstance(raw, list) else []
@@ -269,6 +305,8 @@ def _listing(items: list, total: int) -> list[str]:
             parts.append(item["kind"])
         if item.get("reason"):
             parts.append(f"({item['reason']})")
+        parts.extend(f"{name}={item[name]}" for name in ("lane", "stage", "quality_grade")
+                     if item.get(name))
         lines.append("  - " + " ".join(parts))
     remaining = total - min(len(items), MAX_LISTED_ITEMS)
     if remaining > 0:
@@ -298,10 +336,10 @@ def render_action_block(payload: dict) -> list[str]:
     （見 `ACTIONABLE_ABSENT_PREFIXES`）——完整清單在 ingest 自己的 stdout。
     """
     data = normalize_payload(payload)
-    review, unfixable, failed = data["review"], data["unfixable"], data["failed"]
+    review, repair, unfixable, failed = data["review"], data["repair"], data["unfixable"], data["failed"]
     absent = [item for item in data[ABSENT_KEY] if is_actionable_absent(item["reason"])]
-    totals = (data["review_total"], data["unfixable_total"], data["failed_total"])
-    if not (review or unfixable or failed or absent or any(totals)):
+    totals = tuple(data[total] for _key, total in _LIST_KEYS)
+    if not (review or repair or unfixable or failed or absent or any(totals)):
         return []
 
     document = data["document"] or "（未知文件）"
@@ -311,6 +349,12 @@ def render_action_block(payload: dict) -> list[str]:
     quoted = json.dumps(document, ensure_ascii=False)
     lines = [f"{ACTION_REQUIRED_MARKER} {quoted}："
              f"{sum(totals) + len(absent)} 項需要你決定"]
+    coverage = data.get("coverage")
+    if coverage:
+        lines.append(
+            f"已偵測區域 {coverage['detected']}：原生已處理 {coverage['native_processed']}、"
+            f"VL 已處理 {coverage['vl_processed']}、失敗 {coverage['failed']}、"
+            f"品質排除 {coverage['excluded']}；此計數不代表全 PDF OCR 完整。")
     # 工具名與參數名要與 mcp_server 的簽章一致：`review_figures` 吃的是
     # `document_id`（可以給 basename），`ingest_document` 吃的是**路徑**，
     # 所以這裡不編一個路徑出來——payload 只有 basename。
@@ -321,6 +365,11 @@ def render_action_block(payload: dict) -> list[str]:
                      '看原因；對照原圖確認後 review_figures(action="fix", '
                      'figure_id=..., expected_revision=..., payload_json=..., '
                      'confirm_against_image=True)')
+    if repair or data["repair_total"]:
+        lines.append(f"需修復 {data['repair_total']} 張（自動篩選已發現缺字、衝突或結構缺陷）：")
+        lines.extend(_listing(repair, data["repair_total"]))
+        lines.append('  → 可保留已抽出的可用部分；需要缺失內容時，改善來源影像或抽取設定後，'
+                     '以原本路徑重新 ingest_document(...)。仍有缺字或衝突的結果不能直接確認為可信。')
     if unfixable or data["unfixable_total"]:
         lines.append(f"無法覆核 {data['unfixable_total']} 張（payload／原圖讀不到）：")
         lines.extend(_listing(unfixable, data["unfixable_total"]))

@@ -2839,6 +2839,7 @@ def test_normal_path_also_never_lists_unverified_or_legacy(monkeypatch, tmp_path
     兩條路徑不一致比兩條都保守更糟:使用者會看到時有時無的假警報。
     """
     fx = RAG._figure_extract()
+    from tests.test_figure_ingest import _table_payload
     rows = [
         # artifact 壞掉的 unverified / legacy:都不得出現在通知裡
         {"figure_id": "u1", "page": 1, "figure_index": 1, "kind": "table",
@@ -2850,7 +2851,8 @@ def test_normal_path_also_never_lists_unverified_or_legacy(monkeypatch, tmp_path
         # 這一張才該出現
         {"figure_id": "n1", "page": 3, "figure_index": 1, "kind": "table",
          "in_kb": True, "run_id": "r", "verification_status": fx.VERIF_NEEDS_REVIEW,
-         "fixable": True, "payload": {"rows": []}},
+         "fixable": True, "payload": _table_payload(["Name", "Value"], [["READY", "1"]]),
+         "reasons": ["header_conflict"]},
     ]
     monkeypatch.setitem(fx.__dict__, "list_figures", lambda *a, **k: list(rows))
     document = ExtractedDocument(raw_text="", sections=[], chunks=[],
@@ -2968,13 +2970,15 @@ def _summary_payload_for(monkeypatch, entries, *, run_id: str,
 
 
 def test_summary_classifies_review_unfixable_and_counts(monkeypatch):
+    from tests.test_figure_ingest import _table_payload
+    readable = _table_payload(["Name", "Value"], [["READY", "1"]])
     entries = [
         {"in_kb": True, "verification_status": "native_verified", "page": 1,
          "figure_index": 1, "figure_id": "a", "kind": "table", "fixable": True,
-         "payload": {"rows": []}, "payload_error": "", "warnings": []},
+         "payload": readable, "payload_error": "", "warnings": []},
         {"in_kb": True, "verification_status": "needs_review", "page": 12,
          "figure_index": 1, "figure_id": "b", "kind": "table", "fixable": True,
-         "payload": {"rows": []}, "payload_error": "", "warnings": []},
+         "payload": readable, "payload_error": "", "warnings": [], "reasons": ["header_conflict"]},
         # flagged 但 artifact 讀不到 → 就地 fix 幫不上忙，只能 remove + 重灌
         {"in_kb": True, "verification_status": "needs_review", "page": 3,
          "figure_index": 2, "figure_id": "c", "kind": "table", "fixable": True,
@@ -2987,20 +2991,24 @@ def test_summary_classifies_review_unfixable_and_counts(monkeypatch):
     assert [item["figure_id"] for item in payload["review"]] == ["b"]
     assert payload["unfixable"] == [
         {"page": 3, "figure_index": 2, "figure_id": "c", "kind": "table",
-         "reason": "artifact_missing"}]
+         "reason": "artifact_missing", "lane": "unknown", "quality_grade": "unknown",
+         "review_state": "unreviewed", "disposition": "manual_review"}]
 
     block = ingest_notify.render_action_block(payload)
     assert block and block[0].startswith(ingest_notify.ACTION_REQUIRED_MARKER)
 
 
 def test_summary_is_silent_when_everything_is_trusted(monkeypatch):
+    from tests.test_figure_ingest import _table_payload, _evidence
+    table = _table_payload(["Name", "Value"], [["READY", "1"]])
+    terminal = {"kind": "terminal", "lines": [{"line_index": 1, "text": "READY=1", "uncertain_spans": []}]}
     entries = [
         {"in_kb": True, "verification_status": "native_verified", "page": 1,
          "figure_index": 1, "figure_id": "a", "kind": "table", "fixable": True,
-         "payload": {"rows": []}, "payload_error": "", "warnings": []},
+         "payload": table, "evidence": _evidence(table, "table"), "payload_error": "", "warnings": []},
         {"in_kb": True, "verification_status": "corroborated", "page": 2,
          "figure_index": 1, "figure_id": "b", "kind": "terminal", "fixable": True,
-         "payload": {"lines": []}, "payload_error": "", "warnings": []},
+         "payload": terminal, "evidence": _evidence(terminal, "terminal"), "payload_error": "", "warnings": []},
     ]
     payload = _summary_payload_for(monkeypatch, entries, run_id="run-2")
 

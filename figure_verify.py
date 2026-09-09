@@ -523,10 +523,13 @@ _PROMPT_BY_KIND = {
         "不要輸出列號、欄位 id 或任何合併儲存格資訊——那些由程式指派。\n"
     ),
     "terminal": (
-        "把圖中的終端機/log 畫面轉成 JSON。\n"
+        "把圖中的終端機/log、程式碼或檔案樹轉成 JSON。\n"
         "- `lines`：**一個視覺行一個元素**，不合併、不拆行、不重排；空行也要輸出 "
         "（`text` 給空字串）。保留兩段可見文字之間的空行，但視窗最上/最下的 padding、"
         "捲軸後方或最後一行之後的大塊空白不是文字行，不得據此增加首尾空行。\n"
+        "- 程式碼與檔案樹的行首縮排、tab、連續空白、行尾空白、`||`、`|`、"
+        "`├──`、`└──` 都是原文。保留母子層級與分支連線；不得把縮排改成表格欄位、"
+        "把多行合成一列，或以說明句取代程式碼/目錄樹。\n"
         "- 圖中若有多個並排 terminal pane，依**左到右**逐 pane 轉錄；每個 pane 內再由"
         "上到下。完成左 pane 後直接接右 pane，不按全圖 y 座標交錯，也不自行增加 pane"
         "分隔文字。視窗標題列、按鈕、捲軸，以及覆蓋在畫面上的彩色說明/箭頭不屬於"
@@ -542,14 +545,15 @@ _PROMPT_BY_KIND = {
         "不要輸出行號——那由程式指派。\n"
     ),
     "prose": (
-        "把圖中的整頁文章轉成 JSON。這是一頁散文/說明文字，不是終端機畫面。\n"
+        "把圖片中可見文字逐行轉成 JSON，包含文章與未能以其他 schema 抽取的文字。\n"
         "- `lines`：**一個視覺行一個元素**，由上到下、依原本的閱讀順序；不合併、"
         "不拆行、不重排、不改寫標點。段落之間的空行原樣保留（`text` 給空字串），"
         "但頁首/頁尾的大塊留白不是文字行，不得據此增加首尾空行。\n"
         "- 多欄排版依**欄**轉錄：先整條左欄由上到下，再整條右欄，不按全頁 y 座標"
         "交錯。標題、編號、項目符號、頁碼、頁首頁尾都是原文，照它們出現的位置輸出。\n"
-        "- 不要摘要、不要翻譯、不要補上原文沒有的標點或編號；表格與圖片區塊裡的"
-        "文字不在這裡輸出。\n"
+        "- 不要摘要、不要翻譯、不要補上原文沒有的標點或編號；表格或圖面內可見的"
+        "文字也要依原本行序轉錄，不推測看不見的內容。程式碼與檔案樹須保留行首縮排、"
+        "tab、連續空白、`||`、`|`、`├──`、`└──` 與母子層級，不能改成摘要或扁平清單。\n"
         "- 看不清的字元在 `text` 放 `▯`，候選寫進 `uncertain_spans` 的 "
         "`alternatives`；**不得**在正文寫成 `[不確定:A|B]` 這種形式。\n"
         "- `uncertain_spans` 的 start/end 是該行 `text` 的字元索引。\n"
@@ -577,8 +581,9 @@ _RASTER_KIND_SCHEMA = {
 _RASTER_KIND_PROMPT = (
     "只分類圖片主要資訊的表示方式，不轉錄、不摘要、不解釋。\n"
     "- table：重點是列與欄的配對，例如 register table、memory map、參數表。\n"
-    "- terminal：重點是逐行原文與順序，例如 shell/console/log、指令清單、程式碼或"
-    "白底終端截圖；不要求一定有提示符或深色背景。單行等寬的 console/status/prompt "
+    "- terminal：重點是逐行原文、順序與縮排，例如 shell/console/log、指令清單、程式碼、"
+    "檔案樹、目錄樹或白底終端截圖；code/file-tree 的母子層級與分支線不是表格欄界，"
+    "不得只因對齊而判 table。不要求一定有提示符或深色背景。單行等寬的 console/status/prompt "
     "文字條也算 terminal。圖片若幾乎只有一行文字，而那行是完整的操作指示、錯誤訊息、"
     "執行狀態或程式輸出句子，必須判成 terminal。\n"
     "- prose：整頁或整段的**文章**，例如掃描的內文頁、被轉成影像的說明段落、"
@@ -1150,6 +1155,7 @@ _FAILURE_HINTS = {
     "grid_cell_occupancy_mismatch": "模型把內容放到錯的原子欄，或用尾端空格湊欄數",
     "line_contract": "一個 line 必須恰是一個視覺行，不得含 \\n / \\r",
     "empty_payload": "空 payload 不得入庫（那等於宣稱這張圖沒有內容）",
+    "transcription_empty": "逐行轉錄仍為空；保留原圖並重新抽取，不以 diagram 摘要代替原文",
     "canonicalize": "canonicalize 失敗",
     "validator": "外部 validator 拒絕",
 }
@@ -2765,6 +2771,12 @@ def align_terminal_lines(payload: dict, candidate: Candidate,
     if pos is not None:
         text, problem = _pos_slice(raw_markdown, pos)
         if text is not None:
+            declared = signal.get("markdown") if signal is not None else None
+            if isinstance(declared, str) and declared != text:
+                raise figure_extract.FigureExtractionError(
+                    "signals['native_text'] 的原文與 PageEvidence 的 pos 切片不一致；"
+                    "不得拿不同來源當逐行 anchor（整份 PDF 零寫入）"
+                )
             channels.append(("markdown_pos", text.split("\n")))
         elif problem:
             notes.append(["markdown_pos_unavailable", f"pos 不可用：{problem}"])
@@ -2795,6 +2807,7 @@ def align_terminal_lines(payload: dict, candidate: Candidate,
     used_channels: list[str] = []
     paired_payload_lines: set[int] = set()
     line_alignment: dict[str, Any] = {}
+    transcription_source = None
 
     for name, anchor_texts in channels:
         # word baseline 產生不出空行——那是通道的表達能力限制，不是內容衝突。
@@ -2812,6 +2825,23 @@ def align_terminal_lines(payload: dict, candidate: Candidate,
             "payload_lines": len(subset_texts), "anchor_lines": len(anchor_texts),
             "empty_lines_excluded": len(payload_texts) - len(subset_texts),
         }
+        if name == "markdown_pos" and not any(
+            figure_extract.UNREADABLE_GLYPH in text or "\ufffd" in text
+            for text in anchor_texts
+        ):
+            # 分母是來源行，不是已輸出行。每一來源行必須全文相符：漏尾段即使仍
+            # 對到同一行，也不能算完整。words 無法還原空行/縮排，不能給這個分母。
+            role = (candidate_signals.get("content_role")
+                    if isinstance(candidate_signals, dict) else None)
+            same = (lambda a, b: a == b) if role in {"code", "file_tree"} else (
+                lambda a, b: figure_extract.normalize_for_compare(a)
+                == figure_extract.normalize_for_compare(b))
+            matched_source = {ai for si, ai in pairs
+                              if same(subset_texts[si], anchor_texts[ai])}
+            transcription_source = {
+                "channel": "markdown_pos", "source_lines": len(anchor_texts),
+                "matched_source_lines": len(matched_source),
+            }
         if not subset_texts:
             notes.append([f"{name}_no_comparable_lines", "這個通道沒有可比對的行"])
             continue
@@ -2886,6 +2916,7 @@ def align_terminal_lines(payload: dict, candidate: Candidate,
             "ratio": (matched / atoms_total) if atoms_total else 0.0,
         },
         "line_alignment": line_alignment,
+        "transcription_source": transcription_source,
         "blockers": blockers,
         "notes": notes,
     }
@@ -3818,6 +3849,37 @@ def _build_evidence(alignment: dict, *, native: dict | None = None,
     return evidence
 
 
+def _transcription_evidence(alignment: dict, findings: _Findings, *,
+                            attempted_kind: str, fallback_kind: str | None = None) -> dict:
+    """逐行轉錄的來源覆蓋；VL 樣本、輸出行數與 words 都不能充當完整來源。"""
+    source = alignment.get("transcription_source")
+    coverage: float | str = "unknown"
+    if source is not None:
+        coverage = source["matched_source_lines"] / source["source_lines"]
+        if coverage < 1.0:
+            findings.block(
+                "transcription_source_incomplete",
+                f"可靠來源共 {source['source_lines']} 行，只有 "
+                f"{source['matched_source_lines']} 行全文出現在轉錄；缺行或缺少行內文字，"
+                "不能把已輸出的部分當成完整來源",
+            )
+    return {
+        "attempted_kind": attempted_kind, "fallback_kind": fallback_kind,
+        "anchor": copy.deepcopy(source), "coverage": coverage,
+    }
+
+
+def _vl_failure_evidence(ctx: dict) -> dict:
+    """失敗帳也保存每次抽取的 kind、失敗原因及回退方向，不只保存最後 schema。"""
+    extra = {name: copy.deepcopy(ctx[name]) for name in (
+        "extraction_attempts", "raster_classification", "table_grid_hints",
+    ) if name in ctx}
+    context = ctx.get("transcription_context")
+    if context is not None:
+        extra["transcription"] = _transcription_evidence({}, _Findings(), **context)
+    return extra
+
+
 def _recount_coverage(records: dict, atoms_total: int, *, exclude: str) -> dict:
     """重算 anchor 覆蓋率，**排除 canonical 通道自己**。
 
@@ -3904,6 +3966,15 @@ def _build_result(candidate, kind: str, payload: dict, findings: _Findings, evid
                   *, lane: str, model_input_variant: str, variants: list[str],
                   where: str) -> FigureResult:
     _normalize_model_unreadable(payload, kind, findings)
+    signals = getattr(candidate, "signals", None)
+    content_role = signals.get("content_role") if isinstance(signals, dict) else None
+    if lane == "vl" and kind == figure_extract.KIND_TABLE and content_role in {
+        "code", "file_tree",
+    }:
+        findings.block(
+            "raster_structure_mismatch",
+            f"來源角色已確認為 {content_role}，VL 卻回傳 table；列欄無法證明原縮排與母子層級",
+        )
     if (
         kind == figure_extract.KIND_TABLE
         and not any(str(column.get("label", "")) for column in payload.get("columns", []))
@@ -3931,6 +4002,8 @@ def _build_result(candidate, kind: str, payload: dict, findings: _Findings, evid
     page = int(getattr(candidate, "page", 1) or 1)
     evidence = dict(evidence)
     evidence["lane"] = lane
+    if content_role in {"code", "file_tree", "navigation", "content"}:
+        evidence["content_role"] = content_role
     return FigureResult(
         figure_id=getattr(candidate, "figure_id", ""),
         document_id=getattr(candidate, "document_id", ""),
@@ -3954,7 +4027,7 @@ def _build_result(candidate, kind: str, payload: dict, findings: _Findings, evid
 
 
 def _failed_result(candidate, kind: str, reason: str, *, lane: str = "",
-                   sent: list[str] | None = None) -> FigureResult:
+                   sent: list[str] | None = None, extra_evidence: dict | None = None) -> FigureResult:
     """抽取失敗時可覆核的 `FigureResult`（契約 §12.2）：`payload=None`、
     `model_input_variant="failed"`、`variants=[]`。
 
@@ -3980,7 +4053,7 @@ def _failed_result(candidate, kind: str, reason: str, *, lane: str = "",
         # `lane` 要留得下來：`_failed_result` 同時服務 native lane、VL lane 與「送模
         # 之前」的 producer failure。少了它，review.md 只能從「有沒有 variant 檔」
         # 反推，而那會把 native lane 的失敗說成「走的是 VL lane」（反之亦然）。
-        evidence={"failure": reason, "lane": lane,
+        evidence={**(extra_evidence or {}), "failure": reason, "lane": lane,
                   # 真的送進模型的那幾份（`variants=[]` 說不出這件事）。
                   "sent_variants": list(sent or [])},
         occurrences=_occurrences_for(candidate, page, bbox),
@@ -4492,15 +4565,6 @@ def _lane_for(candidate) -> str:
     return "native" if figure_extract.read_native_lane(candidate) else "vl"
 
 
-def _candidate_vl_kinds(candidate) -> set[str]:
-    kind = getattr(candidate, "kind", figure_extract.KIND_UNKNOWN)
-    if kind == figure_extract.KIND_UNKNOWN:
-        return {figure_extract.KIND_TABLE, figure_extract.KIND_TERMINAL}
-    if kind == figure_extract.KIND_RASTER:
-        return set(figure_extract.FIGURE_KINDS)
-    return {kind}
-
-
 DUPLICATE_VARIANT_PREFIX = "duplicate_of:"
 
 
@@ -4675,7 +4739,7 @@ def _vl_extract(kind: str, variants, ctx: dict, *, allow_retry: bool,
     「這張圖沒有內容」才是模型真的說出來的話）。
 
     單片候選一個字都不變：`len(variants) == 1` 時直接往上拋，`empty_payload` 仍是
-    「kind 猜錯了」的訊號（`_run_vl_lane` 據以改走 diagram）。
+    「這個 schema 抽不到內容」的訊號（`_run_vl_lane` 據以改做逐行轉錄）。
     """
     payloads: list[dict] = []
     kept: list = []
@@ -4713,6 +4777,39 @@ def _vl_extract(kind: str, variants, ctx: dict, *, allow_retry: bool,
 
 def _vl_result_for_kind(candidate, evidence, kind: str, variants, ctx: dict,
                         *, allow_retry: bool, second_sample: bool) -> FigureResult:
+    """一個 logical kind attempt；失敗也留下 provenance，供回退/失敗 artifact 使用。"""
+    attempt = {"kind": kind}
+    ctx.setdefault("extraction_attempts", []).append(attempt)
+    ctx["resolved_kind"] = kind
+    try:
+        result = _extract_vl_result_for_kind(
+            candidate, evidence, kind, variants, ctx,
+            allow_retry=allow_retry, second_sample=second_sample,
+        )
+    except _SampleFailure as exc:
+        if kind == figure_extract.KIND_PROSE and exc.slug == "empty_payload":
+            exc = _SampleFailure("transcription_empty", exc.detail)
+        attempt.update(failure=exc.slug, detail=exc.detail)
+        raise exc
+    except figure_extract.FigureError as exc:
+        attempt.update(failure="producer_contract", detail=str(exc))
+        raise
+    attempt["status"] = "complete"
+    extra = dict(result.evidence)
+    extra["extraction_attempts"] = copy.deepcopy(ctx["extraction_attempts"])
+    snapshot = ctx.get("asset_snapshot")
+    if snapshot is not None:
+        snapshot["extraction_attempts"] = copy.deepcopy(ctx["extraction_attempts"])
+        if "transcription" in extra:
+            # 只快取回退事實，不快取第一頁的來源 coverage；duplicate occurrence 必須重算。
+            snapshot["transcription_context"] = {
+                key: extra["transcription"][key] for key in ("attempted_kind", "fallback_kind")
+            }
+    return replace(result, evidence=extra)
+
+
+def _extract_vl_result_for_kind(candidate, evidence, kind: str, variants, ctx: dict,
+                                *, allow_retry: bool, second_sample: bool) -> FigureResult:
     findings = _Findings()
     where = ctx["where"]
     payloads, kept, empty_tiles = _vl_extract(
@@ -4844,9 +4941,16 @@ def _vl_result_for_kind(candidate, evidence, kind: str, variants, ctx: dict,
         "raster_grid": grid_hints,
     }
 
+    extra = {"raster_grid": grid_hints} if grid_hints else {}
+    if kind in figure_extract.LINE_KINDS:
+        extra["transcription"] = _transcription_evidence(
+            alignment, findings, **ctx.get("transcription_context", {
+                "attempted_kind": kind, "fallback_kind": None,
+            }),
+        )
     evidence_dict = _build_evidence(
         alignment, repeatability=repeatability, stitch=stitch,
-        extra={"raster_grid": grid_hints} if grid_hints else None,
+        extra=extra,
     )
     return _build_result(
         candidate, kind, payload, findings, evidence_dict, lane="vl",
@@ -4921,22 +5025,27 @@ def _skipped_result(candidate, classification: dict, *, where: str,
 def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureResult:
     if kind == figure_extract.KIND_RASTER:
         classification = _classify_raster_kind(variants[0], ctx)
+        ctx["raster_classification"] = dict(classification)
         resolved = classification["kind"]
         classified_kind = resolved          # 分類器原本回的那個，之後不再改寫
+        ctx["transcription_context"] = {
+            "attempted_kind": classified_kind, "fallback_kind": None,
+        }
         policy_reclassified_from = ""
         if resolved == figure_extract.KIND_NOT_A_FIGURE and len(variants) > 1:
             # ★ 分類器**只看得到第一片**。切片的候選是大圖（高表格 / 長 log），第一片
             # 剛好是留白或 logo 就把整張圖標成缺席，而後面幾片根本不會被檢查、也不進
             # actionable 通知——那就是無聲漏內容。所以多片候選一律**不得**被跳過，
-            # 改走 diagram（自由文字退路）：多一個 chunk 遠好過整張表消失。
+            # 改走 prose 逐行轉錄；摘要不能替代後續 tile 的原文。
             print(f"  [INFO] {ctx.get('where', '')}: 第一片被判成「不是圖面」，"
-                  f"但這個候選有 {len(variants)} 片；不跳過，改以 diagram 抽取",
+                  f"但這個候選有 {len(variants)} 片；不跳過，改以 prose 逐行轉錄",
                   flush=True)
-            classification = {**classification, "kind": figure_extract.KIND_DIAGRAM,
+            classification = {**classification, "kind": figure_extract.KIND_PROSE,
                               "reclassified_from": figure_extract.KIND_NOT_A_FIGURE,
                               "reclassified_reason": "multi_tile_cannot_be_skipped"}
-            resolved = figure_extract.KIND_DIAGRAM
+            resolved = figure_extract.KIND_PROSE
             policy_reclassified_from = figure_extract.KIND_NOT_A_FIGURE
+            ctx["transcription_context"]["fallback_kind"] = resolved
         if resolved == figure_extract.KIND_NOT_A_FIGURE:
             # **分類完就停手**：不呼叫抽取、不產 payload、不佔覆核清單。
             print(f"  [INFO] {ctx.get('where', '')}: 分類為「不是圖面」，跳過抽取",
@@ -4969,7 +5078,7 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
             str(getattr(candidate, "figure_id", "") or ""), extraction_variants,
             where="grid 正規化之後")
         # 上面那條 policy 改判（多片候選不得被跳過）也算 reclassification：不接上來的話
-        # manifest 會說成「分類器直接判成 diagram」，覆核的人就查不到它其實回了 none。
+        # manifest 會說成「分類器直接判成 prose」，覆核的人就查不到它其實回了 none。
         reclassified_from = policy_reclassified_from
         try:
             result = _vl_result_for_kind(
@@ -4977,32 +5086,24 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
                 allow_retry=True,
                 # table / terminal 的逐格逐行內容要做第二樣本 disagreement；非目標 diagram
                 # 保持 unverified 單樣本，避免不相干圖片的描述差異拖垮整份 PDF。
-                second_sample=(resolved != figure_extract.KIND_DIAGRAM),
+                second_sample=(resolved != figure_extract.KIND_DIAGRAM
+                               and not policy_reclassified_from),
             )
         except _SampleFailure as exc:
-            # **kind 猜錯不等於抽取壞掉。** 純 raster 的 kind 是 image-bound 分類器
-            # 猜的，不是文件宣告的：掃描 PDF 的每一頁都是一張圖，一頁純文字被猜成
-            # table，模型回「columns=0, rows=0」其實是**正確答案**。以前這會被當成
-            # empty_payload 硬失敗，於是一次猜錯就讓整份 PDF 零寫入（2026-08-24 實際
-            # 踩到：19 頁的規格書卡在第 3 頁的一頁文字）。
-            #
-            # 猜錯的正確處置是換一種猜法：改用 diagram（自由文字 schema）再抽一次。
-            # 只有「文件自己的幾何說這裡有表」（非 raster 的 KIND_TABLE / KIND_TERMINAL）
-            # 回空 payload 才是真的抽取壞掉，那條界線不動。
-            if exc.slug != "empty_payload" or resolved == figure_extract.KIND_DIAGRAM:
+            # 空 table/terminal 只代表該 schema 抽不到內容，不能證明沒有文字。
+            # 退回逐行轉錄；prose 自己全空已轉成 transcription_empty，不再換 schema。
+            if exc.slug != "empty_payload" or resolved not in {
+                figure_extract.KIND_TABLE, figure_extract.KIND_TERMINAL,
+            }:
                 raise
-            # prose 抽不到任何一行**不是**「這不是圖面」的證據：模糊的掃描頁、模型
-            # 當下失手都會回空。把它解釋成 none 會讓一張真的有字的頁不進 KB、也不
-            # 進失敗通知，而且那條路徑還會丟掉 extractor 實際送過的其他 tile、
-            # reason detail 也會謊稱是分類器判的。一律走與 table / terminal 相同的
-            # diagram 退路：至少留得下可覆核的 payload 與完整的模型輸入紀錄。
             reclassified_from = resolved
-            resolved = figure_extract.KIND_DIAGRAM
+            resolved = figure_extract.KIND_PROSE
+            ctx["transcription_context"]["fallback_kind"] = resolved
             classification = {**classification, "kind": resolved,
                               "reclassified_from": reclassified_from,
                               "reclassified_reason": exc.slug}
             print(f"  [INFO] {ctx.get('where', '')}: 分類成 {reclassified_from} 但抽不到"
-                  f"任何內容（{exc.detail}）；改以 diagram 重抽", flush=True)
+                  f"任何內容（{exc.detail}）；改以 prose 逐行轉錄", flush=True)
             result = _vl_result_for_kind(
                 candidate, evidence, resolved, variants, ctx,
                 allow_retry=True, second_sample=False,
@@ -5012,7 +5113,7 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
         # classifier 實際看過原始 variant；table extractor 則可能看 `+grid`。兩者都是
         # 真正模型輸入，manifest 必須逐一保存，不能只宣告最後一次 extraction variant。
         # **以 send ledger 為準**。`result.variants` 只講得出最後一輪抽取用的那幾份：
-        # table 走 `+grid` 之後又因為 empty_payload 退回 diagram 時，真正送過模型的
+        # table 走 `+grid` 之後又因為 empty_payload 退回 prose 時，真正送過模型的
         # `+grid` 就不在裡面，呼叫端會把它從 `variants/` 刪掉——覆核的人於是看不到
         # 模型實際讀的那張圖。ledger 是逐次送出前登記的，不會漏也不會多。
         actual_variant_ids = _ordered_unique([
@@ -5026,10 +5127,10 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
         # 是**分類器原本回什麼**，用改寫後的值會與下一行自己打架。
         extra_details = [f"純 raster 以 image-bound schema 分類為 {classified_kind}"]
         if reclassified_from:
-            extra_reasons.append("raster_kind_reclassified")
+            extra_reasons.extend(["raster_kind_reclassified", "transcription_fallback"])
             if classification.get("reclassified_reason") == "multi_tile_cannot_be_skipped":
                 # 這條路**沒有跑過任何 none schema**：分類器只看了第一片就回 none，
-                # 是 policy（多片候選不得整張跳過）把它改判成 diagram 的。
+                # 是 policy（多片候選不得整張跳過）把它改判成 prose 的。
                 extra_details.append(
                     f"分類器只看第一片就回 {reclassified_from}（不是圖面），但這個候選"
                     f"有多片 tile——只憑第一片不得讓整張圖缺席，改以 {resolved} 抽取"
@@ -5037,7 +5138,7 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
             else:
                 extra_details.append(
                     f"先分類為 {reclassified_from}，但那個 schema 抽不到任何內容"
-                    f"（分類猜錯，不是抽取失敗）；改以 {resolved} 重抽"
+                    f"；改以 {resolved} 逐行轉錄，完整性仍須來源 anchor 核對"
                 )
         result = replace(
             result,
@@ -5052,38 +5153,36 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
         snapshot = ctx.get("asset_snapshot")
         if isinstance(snapshot, dict):
             snapshot["raster_classification"] = dict(classification)
+            if reclassified_from:
+                snapshot["notes"].append(("transcription_fallback", extra_details[-1]))
         return result
     if kind != figure_extract.KIND_UNKNOWN:
+        ctx["transcription_context"] = {"attempted_kind": kind, "fallback_kind": None}
         try:
             return _vl_result_for_kind(candidate, evidence, kind, variants, ctx,
                                        allow_retry=True, second_sample=True)
         except _SampleFailure as exc:
-            # 與上面 raster 分支同一條理由:**kind 猜錯不等於抽取壞掉**。
-            #
-            # 走到 VL lane 的 kind 一律是**推論**出來的(原生表格走 native lane,
-            # 根本不呼叫 VL)。實測案例:一頁純文字因為編號清單與縮排形成對齊的
-            # 文字帶,被 planner 判成 table 且 `anchored=True`,模型於是誠實地回
-            # 「columns=0, rows=0」——那是正確答案,卻讓整份 19 頁的 PDF 零寫入。
-            # `native_table` / `anchored` 都分不出「真的有表」與「判錯」,唯一知道
-            # 真相的是看過圖的模型本身。所以 `empty_payload` 一律當成 kind 判錯,
-            # 改用 diagram 重抽;**其餘失敗種類(truncated / schema / row_width /
-            # line_contract / canonicalize / validator)全部維持硬失敗**——那些才是
-            # 真的抽壞了,放進 KB 會變成錯的表。
-            if exc.slug != "empty_payload" or kind == figure_extract.KIND_DIAGRAM:
+            # 與 raster 相同的逐行退路；其餘失敗保持原本 FigureError/_SampleFailure 邊界。
+            if exc.slug != "empty_payload" or kind not in {
+                figure_extract.KIND_TABLE, figure_extract.KIND_TERMINAL,
+            }:
                 raise
             print(f"  [INFO] {ctx.get('where', '')}: 判成 {kind} 但模型說這裡沒有內容"
-                  f"（{exc.detail}）；視為 kind 判錯，改以 diagram 重抽", flush=True)
+                  f"（{exc.detail}）；改以 prose 逐行轉錄", flush=True)
+            ctx["transcription_context"]["fallback_kind"] = figure_extract.KIND_PROSE
             result = _vl_result_for_kind(
-                candidate, evidence, figure_extract.KIND_DIAGRAM, variants, ctx,
+                candidate, evidence, figure_extract.KIND_PROSE, variants, ctx,
                 allow_retry=True, second_sample=False)
+            detail = (f"先判為 {kind}，但那個 schema 抽不到任何內容（{exc.detail}）；"
+                      "改以 prose 逐行轉錄，完整性仍須來源 anchor 核對")
+            snapshot = ctx.get("asset_snapshot")
+            if isinstance(snapshot, dict):
+                snapshot["notes"].append(("transcription_fallback", detail))
             return replace(
                 result,
-                reasons=_ordered_unique(["raster_kind_reclassified", *result.reasons]),
-                reason_details=_ordered_unique([
-                    f"先判為 {kind}，但模型在那個 schema 下抽不到任何內容"
-                    f"（kind 判錯，不是抽取失敗）；改以 diagram 重抽",
-                    *result.reason_details,
-                ]),
+                reasons=_ordered_unique(["raster_kind_reclassified", "transcription_fallback",
+                                         *result.reasons]),
+                reason_details=_ordered_unique([detail, *result.reason_details]),
                 verification_status=figure_extract.worst_verification([
                     result.verification_status, figure_extract.VERIF_UNVERIFIED,
                 ]),
@@ -5164,7 +5263,7 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
     for position, candidate in enumerate(candidates):
         lanes[position] = _lane_for(candidate)
         if lanes[position] == "vl":
-            vl_kinds |= _candidate_vl_kinds(candidate)
+            vl_kinds |= figure_extract.candidate_vl_kinds(candidate)
 
     if vl_kinds:
         ensure_capability(base_url=vl_base_url, model=vl_model, kinds=vl_kinds)
@@ -5200,6 +5299,7 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
         # 這個候選真的送進模型的 variant（`_record_sent` 逐份登記）。抽壞時
         # `variants=[]`，只有這份帳分得出「模型看過的」與「renderer 產出但沒輪到的」。
         sent_variants: list[str] = []
+        ctx: dict = {}
         progress(f"[figure] {position + 1}/{total} p{page} kind={kind} lane={lane}")
         try:
             if lane == "native":
@@ -5272,6 +5372,14 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
                         extra["raster_classification"] = cached["raster_classification"]
                     if cached.get("raster_grid"):
                         extra["raster_grid"] = copy.deepcopy(cached["raster_grid"])
+                    if cached.get("extraction_attempts"):
+                        extra["extraction_attempts"] = copy.deepcopy(cached["extraction_attempts"])
+                    if resolved in figure_extract.LINE_KINDS:
+                        extra["transcription"] = _transcription_evidence(
+                            alignment, findings, **cached.get("transcription_context", {
+                                "attempted_kind": resolved, "fallback_kind": None,
+                            }),
+                        )
                     result = _build_result(
                         candidate, resolved, payload, findings,
                         _build_evidence(alignment,
@@ -5327,8 +5435,10 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
                 # **`results + failed`**：先前已經記下的品質失敗不得在這裡消失，
                 # 否則最終 artifact 少了那幾張，連它們實際送過的影像也會被刪掉。
                 error.results = results + failed
-                error.failed = _failed_result(candidate, kind, message, lane=lane,
-                                              sent=sent_variants)
+                error.failed = _failed_result(
+                    candidate, ctx.get("resolved_kind", kind), message, lane=lane,
+                    sent=sent_variants, extra_evidence=_vl_failure_evidence(ctx),
+                )
                 raise error from exc
             message = (
                 f"{where}: structured 抽取失敗（{exc.slug}）：{exc.detail}"
@@ -5338,7 +5448,8 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
             sequence = per_page.get(page, 0) + 1
             per_page[page] = sequence
             failed_result = replace(
-                _failed_result(candidate, kind, message, lane=lane, sent=sent_variants),
+                _failed_result(candidate, ctx.get("resolved_kind", kind), message, lane=lane,
+                               sent=sent_variants, extra_evidence=_vl_failure_evidence(ctx)),
                 figure_index=sequence,
                 reasons=["extraction_failed", exc.slug],
             )
@@ -5354,8 +5465,10 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
             # 逃出去，呼叫端只能寫出零 figure 的失敗 artifact——已經送出去的影像與
             # 當前候選一起從稽核紀錄消失。
             exc.results = results + failed
-            exc.failed = _failed_result(candidate, kind, str(exc), lane=lane,
-                                        sent=sent_variants)
+            exc.failed = _failed_result(
+                candidate, ctx.get("resolved_kind", kind), str(exc), lane=lane,
+                sent=sent_variants, extra_evidence=_vl_failure_evidence(ctx),
+            )
             raise
 
         sequence = per_page.get(page, 0) + 1

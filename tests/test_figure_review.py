@@ -2034,7 +2034,8 @@ def _reingest(root: Path, kb_path: Path, *, content: bytes, asset_digest: str,
     ref = fr.evidence_ref_for(doc_id, run_id)
     chunks = fx.build_figure_chunks([figure], source="spec.pdf", doc_type="spec",
                                     next_chunk_index={3: 0},
-                                    evidence_ref_by_figure={fig_id: ref})
+                                    evidence_ref_by_figure={fig_id: ref},
+                                    human_verifications_by_figure=human)
     text = {"source": "spec.pdf", "page": 1, "chunk_index": 0, "content": "背景說明",
             "type": "spec", "section": "", "embedding": [0.0, 1.0]}
     text["id"] = knowledge_store.chunk_id(text)
@@ -2074,6 +2075,9 @@ def test_human_verification_survives_repeated_re_ingest(env):
         assert entry["revision"] == 2, f"第 {round_number} 次 revision 退回了"
         assert entry["verification_status"] == "human_verified"
         assert entry["payload"] == corrected, f"第 {round_number} 次人工 payload 沒保住"
+        expected_quality = {"quality_grade": "usable", "review_state": "confirmed",
+                            "auto_disposition": "accept", "quality_issues": []}
+        assert {key: entry[key] for key in expected_quality} == expected_quality
         record = entry["human_verification"]
         assert record["confirmed_against_image"] is True
         assert record["carried_over"] is True
@@ -2082,6 +2086,7 @@ def test_human_verification_survives_repeated_re_ingest(env):
         manifest_entry = fr.read_manifest(root, evidence_ref=new_ref)["figures"][0]
         assert manifest_entry["human_verification"] is not None, \
             f"第 {round_number} 次沒有把 human_verification 寫進新 manifest"
+        assert {key: manifest_entry[key] for key in expected_quality} == expected_quality
         review = (root / new_ref).parent.joinpath(fr.REVIEW_NAME).read_text(encoding="utf-8")
         assert "沿用自前一次 ingest" in review
 

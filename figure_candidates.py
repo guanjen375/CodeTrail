@@ -62,6 +62,7 @@ from pathlib import Path
 from typing import Any
 
 import config
+from document_structure import classify_text_role
 
 # ── figure_extract 一律「呼叫時」才取用 ────────────────────────────────
 # 門面（figure_extract）用 PEP 562 lazy `__getattr__` re-export 本模組的名稱。即使如此，
@@ -1238,7 +1239,7 @@ def _region_sources(evidence: PageEvidence) -> list[dict]:
     - `find_tables:*`：非退化（>=2 列 >=2 欄、bbox 可讀）
     - `page_boxes:table`：bbox 校準成功 **且** `pos` 合法（審核 BLOCKER 3）
     - `drawings:ruled`：h>=3 **且** v>=2（三條裝飾線不算）
-    - `words:block`：>=3 帶，**且**（欄位對齊達 `COL_SUPPORT_MIN` 或有 terminal 版面訊號）
+    - `words:block`：>=3 帶，**且**（欄位對齊、terminal 版面或強 code/tree 訊號）
       → 一般多行散文不會升格
     """
     regions: list[dict] = []
@@ -1304,7 +1305,9 @@ def _region_sources(evidence: PageEvidence) -> list[dict]:
             or layout["ansi_lines"] >= 1
             or (_mono_score(bands) >= 0.6 and layout["loglevel_lines"] >= 1)
         )
-        if columns["col_support"] < COL_SUPPORT_MIN and not terminal_signal:
+        content_role = classify_text_role("\n".join(band["text"] for band in bands))
+        if (columns["col_support"] < COL_SUPPORT_MIN and not terminal_signal
+                and content_role not in {"code", "file_tree"}):
             continue
         regions.append({
             "channel": "words:block",
@@ -1611,6 +1614,12 @@ def _raster_candidate_items(evidence: PageEvidence, regions, *, occupied, docume
         bbox = _round_box(bbox)
         words_in = [w for w in evidence.words if _word_in(w, bbox, WORD_ASSIGN_DILATE_PT)]
         bands = _word_bands(evidence.words, bbox)
+        native_text = _native_text_span(evidence, bbox)
+        content_role = _candidate_content_role(bands, native_text)
+        structured_text = content_role in {"code", "file_tree"}
+        if structured_text and native_text is None:
+            _mark(unit, "code_block_without_pos")
+            continue
         rasters = [
             entry for entry in evidence.image_info or []
             if _as_bbox(entry.get("bbox")) and _overlaps(_as_bbox(entry["bbox"]), bbox)
@@ -1658,9 +1667,12 @@ def _raster_candidate_items(evidence: PageEvidence, regions, *, occupied, docume
         if rasters and "image_info:raster" not in channels:
             channels.append("image_info:raster")
         columns = _column_signal(bands)
+        kind = fx.KIND_TERMINAL if structured_text else fx.KIND_RASTER
+        native_lane, lane_reasons = _resolve_native_lane(
+            kind, None, native_text if structured_text else None)
         signature = _content_signature(
-            bbox, channels, fx.KIND_RASTER, words_in, columns, visual_digest,
-            [], drawing_rects, None)
+            bbox, channels, kind, words_in, columns, visual_digest,
+            [native_text["markdown"]] if structured_text else [], drawing_rects, None)
         asset_digest = (purity["digest_hex"] if purity["pure"]
                         else hashlib.sha256(signature.encode("utf-8")).hexdigest())
         signals = {
@@ -1672,11 +1684,12 @@ def _raster_candidate_items(evidence: PageEvidence, regions, *, occupied, docume
             "layout": _terminal_layout_signal(bands),
             "tokens": _token_signal(bands),
             "raster_purity": purity,
-            "raster_only": True,
-            "raster_auto": True,
-            "anchored": False,
-            "native_lane": False,
-            "native_text": None,
+            "raster_only": not structured_text,
+            "raster_auto": not structured_text,
+            "anchored": bool(bands) if structured_text else False,
+            "native_lane": native_lane,
+            "native_text": native_text if structured_text else None,
+            "content_role": content_role,
             "page_rect": list(evidence.page_rect),
             "rotation": evidence.rotation,
         }
@@ -1684,13 +1697,14 @@ def _raster_candidate_items(evidence: PageEvidence, regions, *, occupied, docume
             "page": evidence.page,
             "bbox": bbox,
             "page_rect": evidence.page_rect,
-            "kind": fx.KIND_RASTER,
+            "kind": kind,
             "kind_scores": {
                 fx.KIND_TABLE: 0.0, fx.KIND_TERMINAL: 0.0, fx.KIND_DIAGRAM: 0.0,
             },
             "signals": signals,
-            "reasons": ["kind_raster_auto", "vl_lane_raster_auto",
-                        "evidence_" + unit["channel"].replace(":", "_")]
+            "reasons": ([f"kind_terminal_{content_role}"] + lane_reasons
+                        if structured_text else ["kind_raster_auto", "vl_lane_raster_auto"])
+                       + ["evidence_" + unit["channel"].replace(":", "_")]
                        + (["raster_group_merged"] if len(unit["members"]) > 1 else []),
             "signature": signature,
             "native_table": None,
@@ -2071,6 +2085,19 @@ def _resolve_native_lane(kind: str, native_table, native_text) -> tuple[bool, li
     return False, ["vl_lane_kind_unknown"]
 
 
+def _candidate_content_role(bands, native_text) -> str:
+    """Classify the complete pos-backed region before trusting table geometry.
+
+    Word bands are only a conservative role hint when pos is absent. They never
+    become native_text: they cannot prove whitespace, blank lines or indentation.
+    A real table with one code/path cell remains a table because its complete
+    source region, including cell boundaries, is classified together.
+    """
+    text = (native_text["markdown"] if native_text is not None
+            else "\n".join(band["text"] for band in bands))
+    return classify_text_role(text)
+
+
 def _page_candidates(evidence: PageEvidence, *, document_id: str, pdf_doc,
                      stats: dict) -> list[dict]:
     """一頁的候選（尚未指派文件級 index / figure_id）。"""
@@ -2120,6 +2147,8 @@ def _page_candidates(evidence: PageEvidence, *, document_id: str, pdf_doc,
     channels_complete, missing_channels = _overlay_channels_complete(evidence)
     fx_kind_terminal = _fx().KIND_TERMINAL
     results: list[dict] = []
+    # A deferred code region must not re-enter through an attached raster box.
+    non_vl_boxes: list[tuple] = []
     for comp, attached in zip(components, attachments):
         members = [promoting[i] for i in comp] + list(attached)
         bbox = _round_box(_union_box([m["bbox"] for m in members]))
@@ -2158,10 +2187,23 @@ def _page_candidates(evidence: PageEvidence, *, document_id: str, pdf_doc,
             continue
         native_hit = bool(native_table)
         raster_only = bool(rasters and not bands and not native_table)
+        native_text = _native_text_span(evidence, bbox)
+        content_role = _candidate_content_role(bands, native_text)
+        structured_text = content_role in {"code", "file_tree"}
+        if structured_text and native_text is None:
+            deferred.append(_deferred_entry(
+                evidence.page, bbox, channels, "code_block_without_pos"))
+            non_vl_boxes.append(bbox)
+            continue
 
         scores = _score_kind(bands, columns, ruled, layout, tokens, native_hit, raster_only)
         kind, kind_reasons = _route_kind(scores)
-        terminal_signal = _has_terminal_signal(layout, bands)
+        if structured_text:
+            kind = fx_kind_terminal
+            kind_reasons = [f"kind_terminal_{content_role}"]
+            native_table = None
+            raster_only = False
+        terminal_signal = structured_text or _has_terminal_signal(layout, bands)
         table_signal = _has_table_signal(native_hit, ruled, columns, tokens, bands)
         if kind == fx_kind_terminal and not terminal_signal:
             if table_signal:
@@ -2186,7 +2228,7 @@ def _page_candidates(evidence: PageEvidence, *, document_id: str, pdf_doc,
             deferred.append(_deferred_entry(
                 evidence.page, bbox, channels, "no_positive_table_or_terminal_signal"))
             continue
-        native_text = _native_text_span(evidence, bbox) if kind == fx_kind_terminal else None
+        native_text = native_text if kind == fx_kind_terminal else None
         native_lane, lane_reasons = _resolve_native_lane(kind, native_table, native_text)
         if not kind:
             deferred.append(_deferred_entry(evidence.page, bbox, channels, kind_reasons[0]))
@@ -2251,6 +2293,7 @@ def _page_candidates(evidence: PageEvidence, *, document_id: str, pdf_doc,
             # ★ 契約 §15.1 的單一真相；preflight / RAG probe / verifier 都讀這個
             "native_lane": native_lane,
             "native_text": native_text,
+            "content_role": content_role,
             "page_rect": list(page_rect),
             "rotation": evidence.rotation,
         }
@@ -2272,7 +2315,7 @@ def _page_candidates(evidence: PageEvidence, *, document_id: str, pdf_doc,
     # 未被原生候選覆蓋的 picture / raster 形成 candidate-only 的 KIND_RASTER，
     # 後段先分類再套對應 schema；分類不出圖面的那些一律缺席，不再有自由文字退路。
     results.extend(_raster_candidate_items(
-        evidence, others, occupied=[item["bbox"] for item in results],
+        evidence, others, occupied=[item["bbox"] for item in results] + non_vl_boxes,
         document_id=document_id, pdf_doc=pdf_doc, stats=stats))
     results.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
     return results
@@ -2641,6 +2684,7 @@ def _vl_profile(candidate: Candidate) -> dict:
     | lane | 條件 | min | max |
     |---|---|---|---|
     | native | `figure_extract.read_native_lane(candidate)` 為 True | 0 | 0 |
+    | navigation | `signals.content_role == navigation`，入庫前排除 | 0 | 0 |
     | 共享（重複影像） | `signals["vl_shared_with"] is not None` | 0 | 0 |
 
     **duplicate 為什麼可以是 0**（契約 §19.3，兩邊必須同一個定義）：verifier 以
@@ -2651,7 +2695,7 @@ def _vl_profile(candidate: Candidate) -> dict:
     | VL / kind 已定 / 有 anchor | — | `T` | `2T(1+R)` |
     | VL / kind 已定 / 無 anchor | 需 disagreement detection | `2T` | `2T(1+R)` |
     | VL / KIND_UNKNOWN | dual pass 每 kind 一次、不重試、不取第二樣本 | `2T` | `2T` |
-    | VL / KIND_RASTER | 分類一次，再對勝出 kind 抽取（猜錯 kind 時改走 diagram，與第二樣本互斥） | `1`（T=1，可回 `none` 零抽取）/ `1+T` | `(1+R)+2T(1+R)` |
+    | VL / KIND_RASTER | 分類一次，再對勝出 kind 抽取（空 table/terminal 改 prose 轉錄，與第二樣本互斥） | `1`（T=1，可回 `none` 零抽取）/ `1+T` | `(1+R)+2T(1+R)` |
 
     `T` = tile 數、`R` = `config.FIGURE_EXTRACT_RETRIES`。
 
@@ -2687,7 +2731,10 @@ def _vl_profile(candidate: Candidate) -> dict:
     tiles = len(plan.get("tiles") or [])
     tokens = list(plan.get("est_tokens") or [])
     base_tokens = sum(tokens)
-    if read_native_lane(candidate):
+    native_lane = read_native_lane(candidate)
+    if candidate.signals.get("content_role") == "navigation":
+        return {"tiles": 0, "min": 0, "max": 0, "tokens_min": 0, "tokens_max": 0}
+    if native_lane:
         return {"tiles": tiles, "min": 0, "max": 0, "tokens_min": 0, "tokens_max": 0}
     # `is not None`，**不是** truthiness：舊版存的是 admitted position，代表在
     # position 0 時值是 `0` → falsy → duplicate 被算成要跑滿 VL（方向雖是高估，
@@ -2714,9 +2761,9 @@ def _vl_profile(candidate: Candidate) -> dict:
         classifier_tokens = tokens[0] if tokens else 0
         single_tile = tiles <= 1
         min_calls = 1 if single_tile else 1 + tiles
-        # 上界＝分類一次 ＋ 抽取。**第二樣本與 diagram 退路互斥**：`empty_payload`
+        # 上界＝分類一次 ＋ 抽取。**第二樣本與 prose 轉錄退路互斥**：`empty_payload`
         # 只可能從第一次 `_vl_extract` 冒出來（第二樣本的失敗被 `repeat_sample_failed`
-        # 吃掉，不會往上拋），所以「抽一次 + 第二樣本」與「抽一次 + diagram 重抽」
+        # 吃掉，不會往上拋），所以「抽一次 + 第二樣本」與「抽一次 + prose 轉錄」
         # 兩條路的成本都是 `2T(1+R)`，不是相加。舊公式多算了一個 `T(1+R)`，會讓
         # `check_preflight()` 錯擋其實在預算內的文件。
         max_calls = (1 + retries) + 2 * tiles * (1 + retries)
@@ -2963,7 +3010,8 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
                 "index": sum(1 for o in occurrences_by_digest.get(digest, [])
                              if o["page"] == item["page"]) + 1,
             })
-            if not item["signals"].get("native_lane"):
+            if (not item["signals"].get("native_lane")
+                    and item["signals"].get("content_role") != "navigation"):
                 share_representative.setdefault((digest, item["kind"]), position)
 
         candidates: list[Candidate] = []
@@ -2993,7 +3041,7 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
                 continue
             share_key = (digest, item["kind"])
             representative = share_representative.get(share_key)
-            if not signals.get("native_lane"):
+            if not signals.get("native_lane") and signals.get("content_role") != "navigation":
                 # 每個 VL lane 候選都帶同一把鍵（代表與 duplicate 都有），verifier 的
                 # cache 才對得起來；`requested_kind` 就是這裡的 `Candidate.kind`。
                 signals["vl_share_key"] = {"asset_digest": digest,
@@ -3001,7 +3049,8 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
                 signals["vl_share_role"] = (
                     "duplicate" if (representative is not None and representative != position)
                     else "representative")
-            if (not signals.get("native_lane") and representative is not None
+            if (not signals.get("native_lane") and signals.get("content_role") != "navigation"
+                    and representative is not None
                     and representative != position):
                 # ★ 直接存**代表的 figure_id**，不存 admitted position。
                 # 存索引的話代表在 position 0（最常見：第一個 occurrence 就是代表）
@@ -3026,7 +3075,8 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
         by_share: dict[tuple, list[int]] = {}
         for position, item in enumerate(admitted):
             target = position_to_candidate.get(position)
-            if target is None or item["signals"].get("native_lane"):
+            if (target is None or item["signals"].get("native_lane")
+                    or item["signals"].get("content_role") == "navigation"):
                 continue
             by_share.setdefault((item["asset_digest"], item["kind"]), []).append(target)
         for (digest, requested_kind), indices in sorted(by_share.items()):
@@ -3051,6 +3101,10 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
         per_call = int(config.FIGURE_MAX_IMAGE_TOKENS_PER_CALL)
         tile_cap = int(config.FIGURE_MAX_TILES_PER_CANDIDATE)
         for candidate in candidates:
+            if candidate.signals.get("content_role") == "navigation":
+                # The consumer excludes these before render/probe. No tile, glyph,
+                # per-image or document OCR limit is charged for retained evidence.
+                continue
             plan = candidate.signals["tile_plan"]
             n_tiles = len(plan["tiles"])
             tiles_total += n_tiles

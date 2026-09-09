@@ -6,6 +6,7 @@
 
 import re
 import json
+import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 from functools import lru_cache
@@ -135,7 +136,16 @@ _FIGURE_META_KEYS = (
     "occurrences", "row_range", "line_range", "row_total", "line_total",
     "oversized_row", "oversized_line", "part_index", "part_total",
     "extraction_status", "evidence_ref", "model_input_variant",
+    "quality_grade", "review_state", "auto_disposition", "quality_issues",
+    "extraction_lane", "transcription",
 )
+
+
+def _figure_quality_metadata(chunk: dict) -> dict:
+    """Display persisted quality independently of the existing verification gate."""
+    from figure_quality import QUALITY_DEFAULTS
+    return {name: copy.deepcopy(chunk.get(name, default))
+            for name, default in QUALITY_DEFAULTS.items()}
 
 # `RAG.PDF_TABLE_REPLACED_MARKER` 留在文字 chunk 裡的單行 marker。原生表格被
 # structured chunk 收錄之後，原位置只剩這一行，所以命中它的文字 chunk 本身**沒有
@@ -2647,6 +2657,7 @@ English:"""
             "figure_id": str(chunk.get("figure_id", "") or ""),
             "figure_kind": str(chunk.get("figure_kind", "") or chunk.get("origin", "") or ""),
             "verification_status": status,
+            **_figure_quality_metadata(chunk),
             "reasons": reasons,
             "reason_details": reason_details,
         })
@@ -2668,6 +2679,8 @@ English:"""
                 f"figure{index if index else '?'}"
                 f"（{entry.get('figure_id') or '無 figure_id'}, {entry.get('figure_kind') or '?'}）"
                 f"status={entry.get('verification_status', '?')} reasons={reasons}"
+                f" quality={entry.get('quality_grade', 'unknown')}"
+                f" disposition={entry.get('auto_disposition', 'manual_review')}"
             )
         more = (f"；另有 {len(excluded) - len(shown)} 個未列出"
                 if len(excluded) > len(shown) else "")
@@ -2675,8 +2688,8 @@ English:"""
             f"※ strict 模式已排除 {len(excluded)} 個未通過驗證的圖片 REF"
             f"（只接受 {'/'.join(sorted(TRUSTED_VERIFICATION))}）："
             + "；".join(parts) + more
-            + "。這些 page/figure 有內容但待覆核（需人工對原圖確認），"
-            "請提示使用者用 review_figures 檢視原圖，"
+            + "。請依 disposition 處理：repair_required/excluded 需要修復或重新 ingest，"
+            "manual_review（待覆核）才需人工判斷；可用 review_figures 檢視原圖，"
             "不得用它們回答數值 / register / bit range。"
         )
 
@@ -2841,6 +2854,14 @@ English:"""
         else:
             suffix = ""
         lines.append(f"  status: {status} — {label}{suffix}")
+        quality = _figure_quality_metadata(chunk)
+        lines.append(f"  quality_grade: {quality['quality_grade']}"
+                     f" review_state: {quality['review_state']}"
+                     f" auto_disposition: {quality['auto_disposition']}")
+        if quality["quality_issues"]:
+            lines.append("  quality_issues: " + " | ".join(quality["quality_issues"]))
+        if quality["auto_disposition"] in ("repair_required", "excluded"):
+            lines.append("  內容有已知缺陷；僅可使用未受影響的文字，不得猜補缺字或推論損壞結構。")
         reasons = self._figure_reasons_for(chunk, trust_map)
         if reasons:
             lines.append("  reasons: " + " | ".join(reasons))
@@ -3344,6 +3365,9 @@ English:"""
                 "figure_kind": str(c.get("figure_kind", "") or ""),
                 # figure 層級狀態（同一張圖取最差），與 REF 文字印的是同一個值
                 "verification_status": self._figure_status_for(c, trust_map),
+                **(_figure_quality_metadata(c) if is_figure else {}),
+                **({"extraction_lane": c.get("extraction_lane", "unknown"),
+                    "transcription": copy.deepcopy(c.get("transcription"))} if is_figure else {}),
                 # figure 層級聚合：只給乾淨 part 的空 reasons 等於「待覆核但不知道為什麼」
                 "reasons": self._figure_reasons_for(c, trust_map),
                 "reason_details": self._figure_reason_details_for(c, trust_map),

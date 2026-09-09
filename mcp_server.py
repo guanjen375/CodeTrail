@@ -2680,20 +2680,26 @@ def _render_figure_entry(entry: dict, *, with_payload: bool) -> str:
         f"   bbox: {entry.get('bbox', '(缺)')}",
         f"   extraction_status: {entry.get('extraction_status', '(缺)')}"
         f"   verification_status: {entry.get('verification_status', '(缺)')}",
+        f"   quality_grade: {entry.get('quality_grade', 'unknown')}"
+        f"   review_state: {entry.get('review_state', 'unreviewed')}"
+        f"   auto_disposition: {entry.get('auto_disposition', 'manual_review')}",
+        f"   quality_issues: {_fmt_list_items(entry.get('quality_issues'))}",
         f"   reasons: {_fmt_list_items(entry.get('reasons'))}",
         f"   reason_details: {_fmt_list_items(entry.get('reason_details'))}",
     ]
     if not entry.get("in_kb", True):
-        # 「不在 KB」有兩種完全不同的成因,講錯會誤導覆核的人:
-        #   a. 抽取失敗 —— 依「零部分成功」整份沒進 KB;
-        #   b. artifact_only —— 這個 run 已被較新的 ingest 取代,或該文件已從 KB 移除。
-        # 權威判準是 extraction_status(b 的 status 是 complete)。
+        # 抽取失敗、品質排除與舊 run 分別說明；complete 不代表適合入庫。
         import figure_extract as _fx
         warnings = entry.get("warnings") or []
         if entry.get("extraction_status") == _fx.EXTRACTION_FAILED:
             lines.append(
                 "   in_kb: False —— 這張**抽取失敗**,依「零部分成功」沒有進知識庫,"
                 "只留在 review artifacts 裡供你看原因。"
+            )
+        elif "quality_excluded" in warnings:
+            lines.append(
+                "   in_kb: False —— 這張因**品質排除**未進知識庫；"
+                "完整轉錄與原圖仍保存在 artifacts，原生文字保留。"
             )
         elif "artifact_only" in warnings:
             lines.append(
@@ -2704,6 +2710,8 @@ def _render_figure_entry(entry: dict, *, with_payload: bool) -> str:
             lines.append("   in_kb: False —— 這張不在知識庫裡(只存在於 review artifacts)。")
     if not entry.get("fixable", True):
         lines.append("   fixable: False —— 目前無法用 fix 修正(原因見下方 payload / warnings)。")
+    if entry.get("auto_disposition") in ("repair_required", "excluded"):
+        lines.append("   已有可確定的內容損壞，需修復或重新 ingest；人工確認不能消除缺字或結構錯誤。")
     if entry.get("warnings"):
         lines.append(f"   warnings: {_fmt_list_items(entry.get('warnings'))}")
     row_range, line_range = entry.get("row_range"), entry.get("line_range")
@@ -2920,12 +2928,15 @@ def review_figures(
             )
         flagged = sum(
             1 for e in picked
-            if e.get("verification_status") in figure_extract.FLAGGED_VERIFICATION
+            if e.get("auto_disposition", "manual_review") == "manual_review"
+            and e.get("verification_status") in figure_extract.FLAGGED_VERIFICATION
         )
+        repair = sum(e.get("auto_disposition") == "repair_required" for e in picked)
+        excluded = sum(e.get("auto_disposition") == "excluded" for e in picked)
         header_lines = [
             "=== review_figures list ===",
-            f"共 {len(picked)} 張;其中 {flagged} 張待覆核"
-            f"(needs_review / unverified / legacy_unverified)。",
+            f"共 {len(picked)} 張；{flagged} 張待覆核（待人工判斷）、{repair} 張需修復、{excluded} 張品質排除。",
+            "quality_grade 是內容品質；review_state 是人工確認狀態；verification_status 保留驗證來源。",
         ]
         if not figure_id:
             # 多筆列出時**每一次**都要講,不只在有待覆核時:使用者看不到 payload
