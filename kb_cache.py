@@ -50,11 +50,12 @@ import re
 import shutil
 import stat
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence
 
 import context_signals
+import section_index
 from knowledge_store import KnowledgeStoreError
 
 try:
@@ -67,6 +68,12 @@ except ImportError:  # pragma: no cover - 獨立執行時的預設值，與 RAG.
 # 都在 .gitignore 裡——NDA 內容不會因為換位置而外洩。
 CACHE_RELDIR = Path(".codetrail") / "cache" / "embeddings"
 CACHE_FILENAME = "embeddings.npz"
+
+SECTION_NPZ_FIELDS = (
+    "section_schema", "section_ids", "section_fingerprints",
+    "section_membership_hash", "section_content_hash", "section_count",
+    "section_embedding_dimension", "section_embeddings",
+)
 
 MSG_REBUILD = "[INFO] embeddings cache 不存在或已過期，正在依 knowledge.json 重建。"
 MSG_PURGED = "[INFO] knowledge.json 不存在，KB 視為空；已清除無主 embeddings cache。"
@@ -425,12 +432,180 @@ def purge_orphans(json_path, *, announce: bool = False) -> list[str]:
 # ==========================================================================
 @dataclass
 class Matrices:
-    """一次載入拿到的兩套矩陣（沒有 ctx 的 KB 只有 retrieval 那一套）。"""
+    """Validated chunk matrices plus a separate section recall row space."""
 
     embeddings: object
     gate_embeddings: object | None
     source: str          # "cache" | "legacy" | "rebuilt"
     path: Optional[Path]
+    # Separate rows: these must never be appended to the chunk/gate matrices.
+    # None is reserved for explicit inline/eval lane-off callers.
+    section_embeddings: object | None = None
+    section_nodes: tuple[section_index.SectionNode, ...] | None = None
+
+
+@dataclass
+class PreparedSections:
+    """Verified/recomputed section vectors, reusable across membership edits.
+
+    The model and schema bind the entire mapping; each key binds the full
+    textual input.  Figure-only membership changes deliberately keep the key.
+    This is a runtime sidecar, never a second JSON source of section text.
+    """
+
+    model: str = EMBEDDING_MODEL
+    schema: str = field(default_factory=section_index.schema_identity)
+    vectors: dict[str, tuple[float, ...]] = field(default_factory=dict)
+
+
+def merge_sections(*prepared: PreparedSections | None) -> PreparedSections:
+    """Merge already prepared rows without I/O or embedding work."""
+    result = PreparedSections()
+    for item in prepared:
+        if item is None:
+            continue
+        if not isinstance(item, PreparedSections):
+            raise KnowledgeStoreError("section vectors require a PreparedSections sidecar")
+        if item.model != EMBEDDING_MODEL or item.schema != section_index.schema_identity():
+            raise KnowledgeStoreError("prepared section model/schema does not match this runtime")
+        result.vectors.update(item.vectors)
+    return result
+
+
+def prepare_sections(chunks, *, cache_dir, reusable=None) -> PreparedSections:
+    """Prepare missing section vectors OUTSIDE the store lock.
+
+    Windows go through RAG.generate_embeddings, exactly like normal ingest,
+    preserving its existing local cache and offline test injection boundary.
+    Every window must succeed before any pooled vector is returned.
+    """
+    np = _require_numpy()
+    nodes = section_index.build_sections(chunks, chunk_ids=chunk_row_ids(chunks))
+    result = merge_sections(reusable)
+    missing = [node for node in nodes if node.fingerprint not in result.vectors]
+    if not missing:
+        return result
+    windows = []
+    counts = []
+    for node in missing:
+        parts = section_index.embedding_windows(node)
+        if not parts:
+            raise KnowledgeStoreError("section has no complete embedding windows")
+        windows.extend(parts)
+        counts.append(len(parts))
+    inputs = [(part["source"], part["section"], part["content"]) for part in windows]
+
+    import RAG
+    from knowledge_store import validate_embeddings
+
+    generated = RAG.generate_embeddings(windows, cache_dir=Path(cache_dir), with_gate=False)
+    if not isinstance(generated, list) or len(generated) != len(windows):
+        raise KnowledgeStoreError("section window embedding cardinality mismatch")
+    if any(not isinstance(part, dict) for part in generated) or inputs != [
+        (part.get("source"), part.get("section"), part.get("content")) for part in generated
+    ]:
+        raise KnowledgeStoreError("section window embedding changed its input order/content")
+    rows, _ = validate_embeddings(generated)
+    normalized = _normalized(np, rows, "section window embedding")
+    offset = 0
+    for node, count in zip(missing, counts):
+        mean = normalized[offset:offset + count].mean(axis=0)
+        norm = np.linalg.norm(mean)
+        if not np.isfinite(norm) or norm <= 0:
+            raise KnowledgeStoreError("section window pooling produced a zero/non-finite vector")
+        result.vectors[node.fingerprint] = tuple(float(value) for value in mean / norm)
+        offset += count
+    return result
+
+
+def section_fields(chunks, prepared: PreparedSections | None, *, dimension) -> dict:
+    """Build complete section NPZ fields; no I/O and no model calls."""
+    np = _require_numpy()
+    nodes = section_index.build_sections(chunks, chunk_ids=chunk_row_ids(chunks))
+    available = merge_sections(prepared)
+    if dimension is None and not chunks:
+        dimension = 0
+    if (isinstance(dimension, bool) or not isinstance(dimension, int)
+            or dimension < (1 if chunks else 0)):
+        raise KnowledgeStoreError("section matrix requires the validated chunk embedding dimension")
+    rows = []
+    for node in nodes:
+        raw = available.vectors.get(node.fingerprint)
+        if raw is None:
+            raise KnowledgeStoreError(
+                "section embedding is missing for the current text fingerprint; "
+                "prepare sections outside the store lock before saving"
+            )
+        try:
+            row = np.asarray(raw, dtype=np.float32)
+        except (TypeError, ValueError) as exc:
+            raise KnowledgeStoreError("section embedding contains non-numeric values") from exc
+        if row.shape != (dimension,) or not np.isfinite(row).all():
+            raise KnowledgeStoreError("section embedding dimension/non-finite value mismatch")
+        norm = np.linalg.norm(row)
+        if not np.isfinite(norm) or norm <= 0:
+            raise KnowledgeStoreError("section embedding has zero/non-finite norm")
+        rows.append(row / norm)
+    matrix = (np.asarray(rows, dtype=np.float32) if rows
+              else np.empty((0, dimension), dtype=np.float32))
+    return {
+        "section_schema": section_index.schema_identity(),
+        "section_ids": np.asarray([node.node_id for node in nodes], dtype=str),
+        "section_fingerprints": np.asarray([node.fingerprint for node in nodes], dtype=str),
+        "section_membership_hash": section_index.membership_hash(nodes),
+        "section_content_hash": section_index.content_hash(nodes),
+        "section_count": len(nodes),
+        "section_embedding_dimension": dimension,
+        "section_embeddings": matrix,
+    }
+
+
+def reusable_sections(matrices: Matrices) -> PreparedSections:
+    """Recover a fingerprint mapping from an already validated matrix bundle."""
+    result = PreparedSections()
+    if matrices.section_nodes is None or matrices.section_embeddings is None:
+        return result
+    if len(matrices.section_nodes) != len(matrices.section_embeddings):
+        raise KnowledgeStoreError("section node/matrix cardinality mismatch")
+    for node, row in zip(matrices.section_nodes, matrices.section_embeddings):
+        result.vectors[node.fingerprint] = tuple(float(value) for value in row)
+    return result
+
+
+def _verify_section_fields(payload: Mapping, *, chunks, dimension: int) -> Optional[str]:
+    """Return why section rows are unusable, including valid zero-node stores."""
+    missing = [key for key in SECTION_NPZ_FIELDS if key not in payload]
+    if missing:
+        return "cache 缺少 section store 欄位：" + ", ".join(missing)
+    try:
+        np = _require_numpy()
+        if str(payload["section_schema"]) != section_index.schema_identity():
+            return "section schema 不在現行白名單"
+        nodes = section_index.build_sections(chunks, chunk_ids=chunk_row_ids(chunks))
+        matrix = payload["section_embeddings"]
+        if getattr(matrix, "shape", None) != (len(nodes), dimension):
+            return "section matrix shape 與章節數／chunk embedding 維度不符"
+        if (int(payload["section_count"]) != len(nodes)
+                or int(payload["section_embedding_dimension"]) != dimension):
+            return "section matrix count/dimension metadata 不符"
+        norms = np.linalg.norm(matrix, axis=1)
+        if (not np.isfinite(matrix).all() or not np.isfinite(norms).all()
+                or not np.allclose(norms, 1.0, rtol=1e-5, atol=1e-6)):
+            return "section matrix 必須是有限的單位向量"
+        ids = np.asarray(payload["section_ids"])
+        fingerprints = np.asarray(payload["section_fingerprints"])
+        if ids.ndim != 1 or ids.tolist() != [node.node_id for node in nodes]:
+            return "逐列 section id 不符"
+        if (fingerprints.ndim != 1
+                or fingerprints.tolist() != [node.fingerprint for node in nodes]):
+            return "逐列 section textual fingerprint 不符"
+        if str(payload["section_membership_hash"]) != section_index.membership_hash(nodes):
+            return "section membership hash 不符"
+        if str(payload["section_content_hash"]) != section_index.content_hash(nodes):
+            return "section content hash 不符"
+    except Exception as exc:
+        return f"section store 格式無法驗證（{type(exc).__name__}）"
+    return None
 
 
 def _require_numpy():
@@ -472,7 +647,7 @@ def _read_npz(path) -> dict:
     np = _require_numpy()
     with np.load(path, allow_pickle=False) as data:
         available = set(getattr(data, "files", []))
-        return {
+        payload = {
             "embeddings": data["embeddings"].copy(),
             "embedding_model": str(data.get("embedding_model", "")),
             "chunk_count": int(data.get("chunk_count", 0)),
@@ -492,6 +667,9 @@ def _read_npz(path) -> dict:
             "gate_content_hash": str(data.get("gate_content_hash", "")),
             "gate_content_hash_schema": str(data.get("gate_content_hash_schema", "")),
         }
+        payload.update({name: data[name].copy() for name in SECTION_NPZ_FIELDS
+                        if name in available})
+        return payload
 
 
 def _verify(
@@ -519,7 +697,7 @@ def _verify(
     """
     embeddings = payload["embeddings"]
     total = len(chunks)
-    has_ctx = context_signals.has_any_ctx(chunks)
+    needs_gate = context_signals.needs_gate_matrix(chunks)
 
     if getattr(embeddings, "ndim", 0) != 2:
         return f"矩陣 shape 不是 2 維（{getattr(embeddings, 'shape', None)}）"
@@ -546,7 +724,7 @@ def _verify(
     # schema 永遠自驗通過，組字規則換了也察覺不到。不在白名單 ＝ 這份向量是用
     # 另一套組字算的，重建。
     schema = payload["content_hash_schema"]
-    allowed = context_signals.required_retrieval_schemas(has_ctx=has_ctx)
+    allowed = context_signals.required_retrieval_schemas(has_ctx=needs_gate)
     if schema not in allowed:
         return (f"content hash schema 不在現行白名單（cache={schema!r}, "
                 f"需要 {sorted(allowed)} 其一）")
@@ -584,13 +762,13 @@ def _verify(
     elif strict_identity:
         return "cache 沒有逐列 chunk id，只靠陣列順序配對是不安全的"
 
-    if has_ctx:
+    if needs_gate:
         # gate（content-only）矩陣是拒答 / 信心判斷的訊號來源。它證明不了自己的
         # 身分時**不准拿來決策**——但它可以從 knowledge.json 重算出來，所以答案是
         # 重建，不是要使用者去找一個他不該知道位置的 cache。
         gate = payload["embeddings_gate"]
         if gate is None:
-            return "有 ctx 的 KB，但 cache 沒有 gate（content-only）矩陣"
+            return "KB 有 ctx 或 MinerU 標題訊號，但 cache 沒有 gate（content-only）矩陣"
         if payload["gate_content_hash_schema"] != context_signals.GATE_SCHEMA:
             return (f"gate schema 不符（cache="
                     f"{payload['gate_content_hash_schema']!r}, "
@@ -606,7 +784,7 @@ def _verify(
         if gate_hash != current_gate:
             return (f"gate 內容雜湊不符（cache={gate_hash}, "
                     f"knowledge.json={current_gate}）")
-    return None
+    return _verify_section_fields(payload, chunks=chunks, dimension=embeddings.shape[1])
 
 
 def locate(json_path, chunks: Sequence[Mapping], metadata: Mapping,
@@ -663,7 +841,8 @@ def locate(json_path, chunks: Sequence[Mapping], metadata: Mapping,
 
         if path is primary:
             return Matrices(payload["embeddings"], payload["embeddings_gate"],
-                            "cache", primary), ""
+                            "cache", primary, payload["section_embeddings"],
+                            section_index.build_sections(chunks)), ""
         # 舊位置的 companion NPZ 身分驗證通過（model / generation / 有序內容雜湊 /
         # 列數 / 維度）→ 遷移進隱藏 cache 再把它收掉。它沒有逐列 chunk_ids，所以
         # 這裡刻意不說「完整驗證」；下一次 save 才會補上真正的逐列 id。
@@ -671,7 +850,8 @@ def locate(json_path, chunks: Sequence[Mapping], metadata: Mapping,
         if mutate:
             target = _migrate_legacy(json_path, payload, chunks, metadata) or path
         return Matrices(payload["embeddings"], payload["embeddings_gate"],
-                        "legacy", target), ""
+                        "legacy", target, payload["section_embeddings"],
+                        section_index.build_sections(chunks)), ""
 
     if mutate:
         # **不刪 primary**：它會被下一次成功的重建原子覆蓋掉。預先刪它會這樣壞掉——
@@ -768,6 +948,7 @@ def npz_fields(payload: Mapping, chunk_ids: Sequence[str]) -> dict:
             gate_content_hash=payload["gate_content_hash"],
             gate_content_hash_schema=payload["gate_content_hash_schema"],
         )
+    fields.update({name: payload[name] for name in SECTION_NPZ_FIELDS if name in payload})
     return fields
 
 
@@ -832,9 +1013,10 @@ def rebuild(json_path, chunks, metadata, *, reason: str = "") -> Matrices:
 
     import RAG  # late import：knowledge.py → kb_cache → RAG 不得在 import 期成環
 
-    has_ctx = context_signals.has_any_ctx(chunks)
+    needs_gate = context_signals.needs_gate_matrix(chunks)
     try:
-        RAG.generate_embeddings(list(chunks), cache_dir=json_path.parent, with_gate=has_ctx)
+        RAG.generate_embeddings(list(chunks), cache_dir=json_path.parent, with_gate=needs_gate)
+        sections = prepare_sections(chunks, cache_dir=json_path.parent)
     except KnowledgeStoreError:
         raise
     except Exception as exc:  # noqa: BLE001 — 統一成「不得沿用舊向量」的訊息
@@ -848,11 +1030,11 @@ def rebuild(json_path, chunks, metadata, *, reason: str = "") -> Matrices:
     rows, _ = validate_embeddings(list(chunks))
     matrix = _normalized(np, rows, "embedding")
     gate_matrix = None
-    if has_ctx:
+    if needs_gate:
         gate_rows, _ = validate_embeddings(list(chunks), key="embedding_gate")
         gate_matrix = _normalized(np, gate_rows, "gate embedding")
 
-    schema = (context_signals.CONTEXTUAL_INPUT_SCHEMA if has_ctx
+    schema = (context_signals.CONTEXTUAL_INPUT_SCHEMA if needs_gate
               else context_signals.CONTENT_INPUT_SCHEMA)
     payload = {
         "embeddings": matrix,
@@ -862,12 +1044,14 @@ def rebuild(json_path, chunks, metadata, *, reason: str = "") -> Matrices:
         "content_hash_schema": schema,
         "store_generation": str((metadata or {}).get("store_generation", "")),
         "gate_content_hash": (
-            _content_hash(chunks, context_signals.GATE_SCHEMA) if has_ctx else ""
+            _content_hash(chunks, context_signals.GATE_SCHEMA) if needs_gate else ""
         ),
-        "gate_content_hash_schema": context_signals.GATE_SCHEMA if has_ctx else "",
+        "gate_content_hash_schema": context_signals.GATE_SCHEMA if needs_gate else "",
     }
+    payload.update(section_fields(chunks, sections, dimension=matrix.shape[1]))
     target = _publish_rebuilt(json_path, payload, chunks, metadata)
-    return Matrices(matrix, gate_matrix, "rebuilt", target)
+    return Matrices(matrix, gate_matrix, "rebuilt", target,
+                    payload["section_embeddings"], section_index.build_sections(chunks))
 
 
 def _json_generation(json_path: Path) -> Optional[str]:

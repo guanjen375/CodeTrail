@@ -894,7 +894,11 @@ def test_default_ingest_still_appends(tmp_path: Path, monkeypatch):
 # 驗收 9 — 舊位置 companion NPZ 的遷移／淘汰
 # ==========================================================================
 def _write_legacy_pair(tmp_path: Path, chunks: list[dict], *, vectors) -> Path:
-    """舊格式：knowledge.json ＋ 同目錄的 knowledge_emb.npz（沒有 chunk_ids）。"""
+    """舊位置／無 chunk_ids；其餘身分完整，包含明示零節點的 section schema。
+
+    本組守位置遷移與核心身分。真正缺 section schema 的舊檔，另由
+    test_section_store 守住必須重建／不可重建即失敗的遷移契約。
+    """
     kb_path = tmp_path / config.KNOWLEDGE_FILE
     schema = RAG.context_signals.CONTENT_INPUT_SCHEMA
     kb_path.write_text(
@@ -906,16 +910,16 @@ def _write_legacy_pair(tmp_path: Path, chunks: list[dict], *, vectors) -> Path:
     )
     rows = np.array(vectors, dtype=np.float32)
     rows = rows / np.linalg.norm(rows, axis=1, keepdims=True)
-    np.savez_compressed(
-        _legacy_npz(tmp_path),
-        embeddings=rows,
-        embedding_model=config.EMBEDDING_MODEL,
-        embedding_dimension=rows.shape[1],
-        chunk_count=rows.shape[0],
-        content_hash=RAG.context_signals.chunks_content_hash(chunks, schema=schema),
-        content_hash_schema=schema,
-        store_generation="legacy-gen",
-    )
+    fields = kb_cache.npz_fields({
+        "embeddings": rows,
+        "embedding_model": config.EMBEDDING_MODEL,
+        "content_hash": RAG.context_signals.chunks_content_hash(chunks, schema=schema),
+        "content_hash_schema": schema,
+        "store_generation": "legacy-gen",
+        **kb_cache.section_fields(chunks, None, dimension=rows.shape[1]),
+    }, kb_cache.chunk_row_ids(chunks))
+    fields.pop("chunk_ids")  # Retain the legacy-location row-identity scenario.
+    np.savez_compressed(_legacy_npz(tmp_path), **fields)
     return kb_path
 
 
@@ -1664,6 +1668,7 @@ def test_load_knowledge_base_restores_external_npz_embeddings(tmp_path):
         content_hash=_content_hash(chunks),
         content_hash_schema=context_signals.CONTENT_INPUT_SCHEMA,
         store_generation=_GENERATION,
+        **kb_cache.section_fields(chunks, None, dimension=2),
     )
 
     kb = load_knowledge_base(kb_path)
@@ -1701,6 +1706,7 @@ def test_incremental_save_preserves_old_embeddings_from_npz(tmp_path):
         content_hash=_content_hash(old_chunks),
         content_hash_schema=context_signals.CONTENT_INPUT_SCHEMA,
         store_generation=_GENERATION,
+        **kb_cache.section_fields(old_chunks, None, dimension=2),
     )
     kb = load_knowledge_base(kb_path)
     kb["chunks"].append(
@@ -1792,6 +1798,7 @@ def _build_kb_files(tmp_path: Path, n: int = 4, dim: int = 8):
         content_hash=_content_hash(chunks),
         content_hash_schema=context_signals.CONTENT_INPUT_SCHEMA,
         store_generation=_GENERATION,
+        **kb_cache.section_fields(chunks, None, dimension=dim),
     )
     return json_path, rng
 

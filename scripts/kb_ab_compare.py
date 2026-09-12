@@ -78,6 +78,9 @@ def _load_npz_meta(json_path: Path) -> dict:
                 "rows": int(data["embeddings"].shape[0]),
                 "store_generation": str(data.get("store_generation", "")),
                 "has_gate": "embeddings_gate" in available,
+                "section_schema": str(data.get("section_schema", "")),
+                "section_count": int(data.get("section_count", 0)),
+                "section_dimension": int(data.get("section_embedding_dimension", 0)),
             }
             if meta["has_gate"]:
                 gate = data["embeddings_gate"]
@@ -147,6 +150,11 @@ def audit(label: str, json_path: Path, show_content: bool) -> dict:
                 print("                   ← 列數與 retrieval 不一致，拒載條件")
         else:
             print("  gate 矩陣      : 無")
+        if npz.get("section_schema"):
+            print(f"  section 矩陣   : {npz['section_dimension']} / {npz['section_count']}"
+                  f"  schema={npz['section_schema']}")
+        else:
+            print("  section 矩陣   : 無（舊 cache；正式載入須從 chunks 重算，不重解析 PDF）")
 
     with_heading = sum(1 for c in chunks if c.get("heading_prefix_chars"))
     with_locator = sum(1 for c in chunks if "char_start" in c and "section_index" in c)

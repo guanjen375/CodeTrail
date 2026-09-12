@@ -182,6 +182,13 @@ def _is_figure_chunk(chunk: dict) -> bool:
     return _is_structured_chunk(chunk) or chunk.get("origin") in VL_ORIGINS
 
 
+def _is_mineru_text(chunk: dict) -> bool:
+    """MinerU prose/code is unverified OCR; figure trust remains independent."""
+    return (not _is_figure_chunk(chunk)
+            and (chunk.get("origin") == "mineru_text"
+                 or chunk.get("text_lane") == "mineru"))
+
+
 def _as_int_or(value, default: int) -> int:
     """任意值 → int；轉不動就回 default（排序鍵不得因為一個壞欄位而 raise）。"""
     try:
@@ -356,6 +363,9 @@ class Candidate:
     gate_score: float = 0.0
     retrieval_bm25: float = 0.0
     gate_bm25: float = 0.0
+    # Rank contribution only: no section cosine/BM25 score is chunk evidence.
+    # Kept separately so expansion queries can retain the best section rank once.
+    section_rrf_score: float = 0.0
 
 
 @dataclass
@@ -440,6 +450,13 @@ class KnowledgeBase:
         # retrieval 矩陣（兩者組字本來就相同），不多佔一份記憶體。
         self._gate_embeddings = None
         self._has_ctx = False
+        self._needs_gate = False
+        # Section rows live outside chunk matrices and never enter chunk IDF/gates.
+        # Inline vectors and offline eval harnesses deliberately leave this lane off.
+        self._section_embeddings = None
+        self._section_nodes = ()
+        self._section_bm25 = None
+        self._section_store_state = "off (no section store)"
         # BM25 索引（預計算）：retrieval 一套、gate（content-only）一套。
         # 本專案規模下多一套 idf/doc-len 的記憶體與載入成本可忽略，換到的是
         # 「lexical 決策永遠看不到生成文字」這條硬保證。
@@ -540,9 +557,9 @@ class KnowledgeBase:
                 # 門檻、信心判斷全都吃到含生成脈絡的向量——正是雙訊號要擋的
                 # 循環 grounding。gate 向量只能來自驗過的第二組矩陣。
                 if any(chunk.get("embedding") for chunk in self.chunks):
-                    if self._has_ctx:
+                    if self._needs_gate:
                         raise KnowledgeStoreError(
-                            "this knowledge base carries generated chunk context but its "
+                            "this knowledge base carries untrusted chunk context but its "
                             f"embeddings could not be loaded from {self._emb_path}; refusing "
                             "to fall back to inline vectors (that would alias the retrieval "
                             "matrix as the decision gate). Rebuild the knowledge base."
@@ -633,11 +650,12 @@ class KnowledgeBase:
             True 載到了；False 代表沒有可用 cache（呼叫端決定重建還是 fail）。
         """
         self._has_ctx = context_signals.has_any_ctx(self.chunks)
+        self._needs_gate = context_signals.needs_gate_matrix(self.chunks)
 
         if not HAS_NUMPY:
-            if self._has_ctx:
+            if self._needs_gate:
                 raise KnowledgeStoreError(
-                    "this knowledge base carries generated chunk context, which needs "
+                    "this knowledge base carries untrusted chunk context, which needs "
                     "numpy to load its two embedding matrices; install numpy"
                 )
             return False
@@ -683,8 +701,19 @@ class KnowledgeBase:
         self._embeddings = embeddings
         self._embeddings_normalized = True  # cache 已預先正規化
         self._embedding_indices = list(range(len(self.chunks)))
-        # 沒有 ctx 的 KB：retrieval 與 gate 是同一組字算出來的，直接別名。
+        # 沒有不可信脈絡的 KB：retrieval 與 gate 同源，可直接別名。
         self._gate_embeddings = gate_embeddings if gate_embeddings is not None else embeddings
+        self._section_embeddings = matrices.section_embeddings
+        self._section_nodes = matrices.section_nodes or ()
+        self._section_store_state = (
+            f"ready ({len(self._section_nodes)} nodes)"
+            if self._section_embeddings is not None else "off (no section store)"
+        )
+        self._section_bm25 = (
+            self._build_bm25_text_index(
+                node.text for node in self._section_nodes
+            ) if BM25_ENABLED and self._section_nodes else None
+        )
 
         # P0：把 retrieval 向量掛回每個 chunk。
         # RAG 存 knowledge.json 時為了體積「不再 inline embedding」（只留 cache），
@@ -702,10 +731,11 @@ class KnowledgeBase:
         ctx 仍然能透過「誰站在第一位」間接推動門檻與 margin。真的在用 ctx 時，
         決策改看 gate 分數自己的排序。
 
-        沒有 ctx（或旗標關著）時原樣回傳：那條路徑必須與加入本功能前逐位元組
-        相同，而 RRF 順序本來就不等於 dense 分數順序。
+        章節也能改動 RRF 次序，所以有章節貢獻時同樣只按 chunk gate 排。
+        沒有 ctx／章節貢獻時保持既有排序。
         """
-        if not (self._has_ctx and use_generated_context()):
+        if not (((self._has_ctx or self._needs_gate) and use_generated_context())
+                or any(c.section_rrf_score for c in candidates)):
             return candidates
         return sorted(candidates, key=lambda c: c.gate_score, reverse=True)
 
@@ -719,13 +749,13 @@ class KnowledgeBase:
         `KB_CONTEXT_USE` 關掉時退回 gate 矩陣——旗標的契約是「關掉之後檢索與
         content-only 完全等價」,只換分數來源、不必重建 KB。
         """
-        if self._has_ctx and not use_generated_context():
+        if (self._has_ctx or self._needs_gate) and not use_generated_context():
             return self._gate_matrix()
         return self._embeddings
 
     def _selection_vector(self, chunk: dict) -> list:
         """MMR/多樣性用的向量；USE 關掉時同樣退回 gate 列。"""
-        if self._has_ctx and not use_generated_context() and HAS_NUMPY:
+        if (self._has_ctx or self._needs_gate) and not use_generated_context() and HAS_NUMPY:
             matrix = self._gate_matrix()
             index = chunk.get("chunk_idx")
             if matrix is not None and isinstance(index, int) and 0 <= index < matrix.shape[0]:
@@ -819,16 +849,20 @@ class KnowledgeBase:
     def _precompute_embeddings(self):
         """預計算並正規化 embeddings 到 numpy array（legacy：JSON inline 向量）
 
-        這條路徑會把 retrieval 矩陣別名成 gate，所以只准用在確定沒有 ctx 的 KB。
+        這條路徑會把 retrieval 矩陣別名成 gate，所以只准用在沒有不可信脈絡的 KB。
         呼叫端（_load）已經擋過一次；這裡是第二道，避免以後有人繞過去。
         """
         self._index_chunks()
-        if context_signals.has_any_ctx(self.chunks):
+        if context_signals.needs_gate_matrix(self.chunks):
             raise KnowledgeStoreError(
                 "refusing to build a gate matrix from inline vectors for a knowledge base "
-                "that carries generated chunk context; rebuild it so the NPZ has both "
+                "that carries untrusted chunk context; rebuild it so the NPZ has both "
                 "matrices"
             )
+        self._section_embeddings = None
+        self._section_nodes = ()
+        self._section_bm25 = None
+        self._section_store_state = "off (inline vectors)"
         if not HAS_NUMPY or not self.chunks:
             self._embeddings = None
             return
@@ -883,6 +917,13 @@ class KnowledgeBase:
         return self._bm25.idf if self._bm25 else None
 
     def _build_bm25_index(self, *, use_ctx: bool) -> Bm25Index:
+        """Build a chunk-only corpus; section rows must not affect its IDF."""
+        return self._build_bm25_text_index(
+            context_signals.bm25_document_text(chunk, use_ctx=use_ctx)
+            for chunk in self.chunks
+        )
+
+    def _build_bm25_text_index(self, documents) -> Bm25Index:
         """建一套 BM25 索引。
 
         BM25 公式：
@@ -895,9 +936,7 @@ class KnowledgeBase:
         doc_lens = []
         doc_freqs = defaultdict(int)
 
-        for idx, chunk in enumerate(self.chunks):
-            # 章節 + 來源 +（ctx）+ 去合成前綴的本文；組法的唯一定義在 context_signals
-            full_text = context_signals.bm25_document_text(chunk, use_ctx=use_ctx)
+        for idx, full_text in enumerate(documents):
             tokens = self._tokenize_for_bm25(full_text)
             doc_lens.append(len(tokens))
 
@@ -908,7 +947,7 @@ class KnowledgeBase:
             for term in term_set:
                 doc_freqs[term] += 1
 
-        n_docs = len(self.chunks)
+        n_docs = len(doc_lens)
         idf = {}
         for term, df in doc_freqs.items():
             # BM25 IDF 公式（加上 +1 避免負值）
@@ -924,13 +963,14 @@ class KnowledgeBase:
     def _precompute_bm25_index(self):
         """預計算 BM25 索引：retrieval 一套，gate（content-only）一套。
 
-        沒有任何 ctx 時兩套的來源文本逐位元組相同，直接別名，不重算也不多佔記憶體。
+        沒有生成 ctx 或 MinerU heading/caption 時兩套文本相同，可直接別名。
         """
         if not self.chunks:
             return
         self._bm25 = self._build_bm25_index(use_ctx=True)
         self._bm25_gate = (
-            self._build_bm25_index(use_ctx=False) if self._has_ctx else self._bm25
+            self._build_bm25_index(use_ctx=False)
+            if context_signals.needs_gate_matrix(self.chunks) else self._bm25
         )
 
     def _content_for_bm25(self, chunk: dict) -> str:
@@ -1011,7 +1051,7 @@ class KnowledgeBase:
         if not bm25 or not bm25.index or not query_tokens:
             return []
 
-        scores = [0.0] * len(self.chunks)
+        scores = [0.0] * len(bm25.doc_lens)
         k1 = BM25_K1
         b = BM25_B
         avgdl = bm25.avg_doc_len or 1.0
@@ -1444,11 +1484,19 @@ English:"""
             # normalized BM25 leader is admitted to the reranker, not trusted
             # as the final answer by itself.
             return bm25_score >= 0.75
-        haystack = " ".join([
-            str(chunk.get("source", "")),
-            str(chunk.get("section", "")),
-            self._content_for_bm25(chunk),
-        ]).lower()
+        if chunk.get("heading_source") == "mineru":
+            # A body keyword may provide a real BM25 hit while the requested
+            # number exists only in the OCR heading.  The exact-literal check
+            # must use the same trusted text as the BM25 gate in that case.
+            haystack = context_signals.bm25_document_text(chunk, use_ctx=False).lower()
+        else:
+            # Preserve the legacy source/section/body boundary (in particular,
+            # do not add native captions to exact-literal evidence here).
+            haystack = " ".join([
+                str(chunk.get("source", "")),
+                str(chunk.get("section", "")),
+                self._content_for_bm25(chunk),
+            ]).lower()
         return bool(literals & self._exact_literals(haystack))
 
     def _figure_trust_map(self, extra_chunks=()) -> dict:
@@ -1783,6 +1831,96 @@ English:"""
             allowed &= matched
         return allowed
 
+    def _section_ranks(
+        self, question: str, q_emb: list, top_k: int,
+        allowed_indices: set[int] | None,
+    ) -> list[int]:
+        """Rank logical sections independently; only their ranks leave this lane.
+
+        Section BM25 uses the full node text and its own corpus statistics.  A
+        source/type/section filter must permit a member before its node competes
+        for top-k; expansion checks the individual members again.
+        """
+        if (not RRF_ENABLED or not HAS_NUMPY or self._section_embeddings is None
+                or not self._section_nodes or top_k <= 0):
+            return []
+        eligible = {
+            i for i, node in enumerate(self._section_nodes)
+            if allowed_indices is None or any(
+                member in allowed_indices for member in node.member_indices
+            )
+        }
+        if not eligible:
+            return []
+        dense = self._matrix_scores_for(
+            sorted(eligible), q_emb, self._section_embeddings
+        )
+        dense_order = sorted(dense, key=lambda i: (-dense[i], i))[:top_k]
+        lexical = self._bm25_score(
+            self._tokenize_for_bm25(question), eligible, index=self._section_bm25
+        )[:top_k] if self._section_bm25 is not None else []
+        ranks = {}
+        for ranked in (dense_order, [i for _score, i in lexical]):
+            for rank, index in enumerate(ranked):
+                ranks[index] = ranks.get(index, 0.0) + 1.0 / (RRF_K + rank)
+        return sorted(ranks, key=lambda i: (-ranks[i], i))[:top_k]
+
+    def _expand_section_members(
+        self, candidates: list, section_ranks: list[int],
+        allowed_indices: set[int] | None,
+    ) -> None:
+        """Add every eligible original member once, with one section rank term."""
+        by_index = {candidate.chunk_idx: candidate for candidate in candidates}
+        for rank, section_index in enumerate(section_ranks):
+            node = self._section_nodes[section_index]
+            contribution = 1.0 / (RRF_K + rank)
+            for index in node.member_indices:
+                if allowed_indices is not None and index not in allowed_indices:
+                    continue
+                chunk = self.chunks[index]
+                if str(chunk.get("source", "")) != node.source:
+                    # Validated stores cannot reach this; do not leak if a future
+                    # in-memory caller constructs a mixed-source catalog.
+                    continue
+                candidate = by_index.get(index)
+                if candidate is None:
+                    candidate = Candidate(chunk_idx=index, chunk=chunk)
+                    by_index[index] = candidate
+                    candidates.append(candidate)
+                if contribution > candidate.section_rrf_score:
+                    candidate.rrf_score += contribution - candidate.section_rrf_score
+                    candidate.section_rrf_score = contribution
+
+    def _fill_section_member_scores(
+        self, candidates: list, question: str, q_emb: list,
+        query_tokens: list, allowed_indices: set[int] | None,
+    ) -> None:
+        """Compute the member's own retrieval signals before the normal gate.
+
+        A member outside either chunk recall top-k has no chunk score yet.  The
+        no-context gate shortcut may copy retrieval scores only after these have
+        been filled from original chunk rows/text, never from its section.
+        """
+        members = [c for c in candidates if c.section_rrf_score]
+        if not members:
+            return
+        dense = self._matrix_scores_for(
+            [c.chunk_idx for c in members], q_emb, self._retrieval_matrix()
+        )
+        if BM25_ENABLED and self._bm25_index:
+            lexical = dict((index, score) for score, index in self._bm25_score(
+                query_tokens, allowed_indices, index=self._ranking_bm25_index()
+            ))
+        else:
+            keywords = self._extract_keywords(question) if USE_HYBRID_SEARCH else set()
+            lexical = {
+                c.chunk_idx: self._keyword_score(keywords, c.chunk.get("content", ""))
+                for c in members
+            }
+        for candidate in members:
+            candidate.retrieval_score = dense.get(candidate.chunk_idx, 0.0)
+            candidate.retrieval_bm25 = lexical.get(candidate.chunk_idx, 0.0)
+
     def _search_once(
         self,
         question: str,
@@ -1831,7 +1969,14 @@ English:"""
                 for bm25_score, idx in bm25_ranks
             ]
 
+        section_ranks = self._section_ranks(question, q_emb, recall_k, allowed_indices)
+        self._expand_section_members(candidates, section_ranks, allowed_indices)
+        self._fill_section_member_scores(
+            candidates, question, q_emb, query_tokens, allowed_indices
+        )
         self._fill_gate_scores(candidates, q_emb, query_tokens, allowed_indices)
+        if section_ranks:
+            candidates.sort(key=lambda c: (-c.rrf_score, c.chunk_idx))
         return candidates
 
     def _fill_gate_scores(
@@ -1897,14 +2042,23 @@ English:"""
                 merged[candidate.chunk_idx] = Candidate(
                     chunk_idx=candidate.chunk_idx,
                     chunk=candidate.chunk,
-                    rrf_score=candidate.rrf_score * weight,
+                    rrf_score=(candidate.rrf_score - candidate.section_rrf_score) * weight
+                    + candidate.section_rrf_score,
                     retrieval_score=candidate.retrieval_score * weight,
                     gate_score=candidate.gate_score * weight,
                     retrieval_bm25=candidate.retrieval_bm25,
                     gate_bm25=candidate.gate_bm25,
+                    section_rrf_score=candidate.section_rrf_score,
                 )
                 continue
-            existing.rrf_score += candidate.rrf_score * weight
+            existing.rrf_score += (
+                candidate.rrf_score - candidate.section_rrf_score
+            ) * weight
+            section_contribution = max(
+                existing.section_rrf_score, candidate.section_rrf_score
+            )
+            existing.rrf_score += section_contribution - existing.section_rrf_score
+            existing.section_rrf_score = section_contribution
             existing.retrieval_score = max(
                 existing.retrieval_score, candidate.retrieval_score * weight
             )
@@ -1930,7 +2084,7 @@ English:"""
         3. 支援 numpy 向量化加速
         4. 條件式 Query Expansion
 
-        返回格式：[(rrf_score, emb_score, bm25_score, chunk), ...]
+        返回 list[Candidate]；章節只提供排名，不作為 evidence chunk。
         """
         if not self.loaded or not self.chunks:
             return []
@@ -1943,7 +2097,8 @@ English:"""
         q_emb = self._get_embedding(question)
         scores = self._search_once(question, q_emb, candidate_k, allowed_indices)
 
-        first_round = scores[:candidate_k]
+        first_round = (scores if any(c.section_rrf_score for c in scores)
+                       else scores[:candidate_k])
 
         # P1 改進：Multi-Query - 條件式啟用（候選不足/分數偏低/非數值查詢）
         if self._should_expand_query(first_round, question=question):
@@ -1968,7 +2123,12 @@ English:"""
                         allowed_indices=allowed_indices,
                     )
 
-        return scores[:candidate_k]
+        # Keep the complete expanded membership.  The query's chunk gate and
+        # reranker decide which members become evidence; this is only recall.
+        if not any(c.section_rrf_score for c in scores):
+            return scores[:candidate_k]
+        return [c for rank, c in enumerate(scores)
+                if rank < candidate_k or c.section_rrf_score]
 
     def _embedding_search_numpy(
         self, q_emb: list, top_k: int, allowed_indices: set[int] | None = None
@@ -2164,32 +2324,38 @@ English:"""
         # Input pool and output count are separate.  RERANKER_TOP_N is the
         # final query cap; the cross-encoder must see a much wider pool so a
         # rank-7..30 item can be rescued and MMR still has choices.
-        rerank_count = min(len(candidates), max(15, top_k * 3))
+        batch_size = max(15, top_k * 3)
+        rerank_count = (len(candidates) if any(c.section_rrf_score for c in candidates)
+                        else min(len(candidates), batch_size))
 
         if self._check_reranker_available():
             try:
-                items = candidates[:rerank_count]
                 # reranker 的 document 側是檢索訊號（排序），可以帶 ctx；
                 # 組法的唯一定義在 context_signals，USE 關掉時逐位元組等同舊版。
                 use_ctx = use_generated_context()
-                passages = [
-                    context_signals.reranker_passage(
-                        item.chunk, use_ctx=use_ctx, max_chars=RERANKER_PASSAGE_MAX_CHARS
+                scored = []
+                for start in range(0, rerank_count, batch_size):
+                    items = candidates[start:min(start + batch_size, rerank_count)]
+                    passages = [
+                        context_signals.reranker_passage(
+                            item.chunk, use_ctx=use_ctx,
+                            max_chars=RERANKER_PASSAGE_MAX_CHARS
+                        ) for item in items
+                    ]
+                    scores = llama_client.rerank(
+                        base_url=LLAMA_RERANK_BASE_URL,
+                        query=question,
+                        documents=passages,
+                        model=RERANKER_MODEL,
+                        timeout=60,
                     )
-                    for item in items
-                ]
-                scores = llama_client.rerank(
-                    base_url=LLAMA_RERANK_BASE_URL,
-                    query=question,
-                    documents=passages,
-                    model=RERANKER_MODEL,
-                    timeout=60,
-                )
-                if len(scores) != len(items):
-                    raise RuntimeError(
-                        f"reranker returned {len(scores)} scores for {len(items)} passages"
+                    if len(scores) != len(items):
+                        raise RuntimeError(
+                            f"reranker returned {len(scores)} scores for {len(items)} passages"
+                        )
+                    scored.extend(
+                        (float(score), item.chunk) for score, item in zip(scores, items)
                     )
-                scored = [(float(scores[i]), items[i].chunk) for i in range(len(items))]
                 scored.sort(reverse=True, key=lambda x: x[0])
                 return scored[:top_k]
 
@@ -2536,6 +2702,8 @@ English:"""
                 # origin/figure_index 在 key 裡，buffer 內必然一致，直接沿用
                 # （丟掉會讓 VL 出身標記與 figure 序號在 REF 消失）
                 "origin": c.get("origin", ""),
+                **({"text_lane": c["text_lane"]} if "text_lane" in c else {}),
+                **({"heading_source": c["heading_source"]} if "heading_source" in c else {}),
                 "figure_index": c.get("figure_index"),
                 "last_idx": chunk_idx,
                 "embedding": c_emb,
@@ -2592,7 +2760,7 @@ English:"""
             # 原文（origin 會被首個成員蓋掉，VL 揭露就消失）；不同 figure 之間
             # 同理不併，避免兩張圖的描述混成一段。
             key = (c.get("source", ""), c.get("page", 0),
-                   c.get("origin", ""), c.get("figure_index"))
+                   c.get("origin", ""), c.get("figure_index"), c.get("text_lane", ""))
             chunk_idx = c.get("chunk_index", 0)
             chunk_type = c.get("type", "doc")
             chunk_section = c.get("section", "")
@@ -2621,6 +2789,44 @@ English:"""
         _flush()
 
         return merged
+
+    def _contains_mineru_text(self, chunk: dict) -> bool:
+        """Check original members too, so a merge cannot erase OCR provenance."""
+        return _is_mineru_text(chunk) or any(
+            0 <= index < len(self.chunks) and _is_mineru_text(self.chunks[index])
+            for index in self._member_indices(chunk)
+        )
+
+    def _collect_excluded_text(self, bucket: list, chunk: dict) -> None:
+        """Record every excluded OCR page without copying its private content."""
+        originals = [
+            self.chunks[index] for index in self._member_indices(chunk)
+            if 0 <= index < len(self.chunks) and _is_mineru_text(self.chunks[index])
+        ] or [chunk]
+        for original in originals:
+            entry = {
+                "source": original.get("source", ""),
+                "page": original.get("page", 0),
+                "origin": "mineru_text",
+                "text_lane": "mineru",
+                "reason": "mineru_text_not_independently_verified",
+            }
+            if entry not in bucket:
+                bucket.append(entry)
+
+    @staticmethod
+    def _excluded_text_line(excluded: list) -> str:
+        shown = excluded[:_MAX_EXCLUDED_FIGURES_IN_HINT]
+        pages = "；".join(
+            f"{entry.get('source', '?')} p.{entry.get('page', '?')}" for entry in shown
+        )
+        more = (f"；另有 {len(excluded) - len(shown)} 頁未列出"
+                if len(excluded) > len(shown) else "")
+        return (
+            f"※ strict 模式已排除 {len(excluded)} 頁 MinerU 文字：{pages}{more}。"
+            "text_lane=mineru 的 OCR 未經獨立驗證，不得用作 strict 證據；"
+            "一般查詢可檢視其來源內容。"
+        )
 
     def _collect_excluded_figure(self, bucket: list, chunk: dict, status: str,
                                  reasons: list | None = None,
@@ -2696,18 +2902,28 @@ English:"""
     def _untrusted_only_result(self, metadata: dict, excluded: list) -> tuple:
         """strict gate 把候選清空時的回傳值。
 
-        `has_ref` 維持 False（上層拒答邏輯不變），但 model/display 仍要說出「哪些
-        page/figure 有內容、為什麼不能用」——CONTRACT §6.6 要的就是這句。沒有任何圖
-        被排除時，回傳與改動前逐位元組相同的 ("", "", metadata)。
+        `has_ref` 維持 False，但 model/display 仍須說明被排除的 figure 或 MinerU
+        文字頁碼與原因。沒有任何內容被排除時仍回 ("", "", metadata)。
         """
-        if not excluded:
+        excluded_text = metadata.get("excluded_text", [])
+        if not excluded and not excluded_text:
             return "", "", metadata
+        if not excluded:
+            return (self._excluded_text_line(excluded_text),
+                    "[REF 未驗證 OCR] " + " | ".join(
+                        f"{entry.get('source', '?')} p.{entry.get('page', '?')}"
+                        for entry in excluded_text[:_MAX_EXCLUDED_FIGURES_IN_HINT]
+                    ), metadata)
         display = "[REF 待覆核] " + " | ".join(
             f"{entry.get('source', '?')} p.{entry.get('page', '?')}"
             f"（{entry.get('verification_status', '?')}）"
             for entry in excluded[:_MAX_EXCLUDED_FIGURES_IN_HINT]
         )
-        return self._excluded_figures_line(excluded), display, metadata
+        model = self._excluded_figures_line(excluded)
+        if excluded_text:
+            model += "\n" + self._excluded_text_line(excluded_text)
+            display += f" | MinerU 未驗證文字 {len(excluded_text)} 頁"
+        return model, display, metadata
 
     @staticmethod
     def _origin_label(chunk: dict, origin: str, status: str) -> tuple:
@@ -2717,6 +2933,8 @@ English:"""
         宣稱「經視覺模型辨識」是假話；缺欄位時保守當 VL（多揭露一次不會傷害，少揭露會）。
         文案刻意保持 kind 中性：把 figure_terminal 說成「表格抽取」同樣是靜默謊報。
         """
+        if _is_mineru_text(chunk):
+            return "mineru_text（MinerU OCR，未經獨立驗證）", False
         if origin in VL_ORIGINS:
             return f"VL（{origin} 經視覺模型辨識，非原文）", True
         if origin in FIGURE_ORIGINS:
@@ -2911,7 +3129,8 @@ English:"""
         metadata 包含: has_ref, top_score, ref_count, is_high_risk
         """
         empty_metadata = {"has_ref": False, "top_score": 0.0, "ref_count": 0,
-                          "is_high_risk": False, "excluded_figures": []}
+                          "is_high_risk": False, "excluded_figures": [],
+                          "excluded_text": []}
 
         if not self.loaded or not self.chunks:
             return "", "", empty_metadata
@@ -2946,9 +3165,13 @@ English:"""
         # 名額，還會用自己的高分把 min_gate_score / margin 抬上去壓掉真正的文字 chunk。
         # 判定用 figure 層級的有效狀態（同一張圖的任一 part 待覆核 → 整張都不可信）。
         excluded_figures: list = []
+        excluded_text: list = empty_metadata["excluded_text"]
         if is_strict_mode:
             kept = []
             for candidate in candidates:
+                if self._contains_mineru_text(candidate.chunk):
+                    self._collect_excluded_text(excluded_text, candidate.chunk)
+                    continue
                 if not self._is_flagged_figure(candidate.chunk, trust_map):
                     kept.append(candidate)
                     continue
@@ -3078,6 +3301,9 @@ English:"""
         if is_strict_mode and merged_chunks:
             kept_chunks = []
             for chunk in merged_chunks:
+                if self._contains_mineru_text(chunk):
+                    self._collect_excluded_text(excluded_text, chunk)
+                    continue
                 if self._is_flagged_figure(chunk, trust_map):
                     self._collect_excluded_figure(
                         excluded_figures, chunk,
@@ -3088,7 +3314,7 @@ English:"""
                     continue
                 kept_chunks.append(chunk)
             merged_chunks = kept_chunks
-            if not merged_chunks and excluded_figures:
+            if not merged_chunks and (excluded_figures or excluded_text):
                 empty_metadata["excluded_figures"] = excluded_figures
                 return self._untrusted_only_result(empty_metadata, excluded_figures)
 
@@ -3223,6 +3449,8 @@ English:"""
                 model_lines.append(f"  type: {doc_type}")
                 if origin:
                     model_lines.append(f"  origin: {origin_label}")
+                if _is_mineru_text(chunk):
+                    model_lines.append("  text_lane: mineru（OCR 未經獨立驗證）")
                 model_lines.append(f"  source: {source}")
                 model_lines.append(f"  page: {page}")
                 figure_index = chunk.get('figure_index')
@@ -3244,6 +3472,8 @@ English:"""
                 section_hint = f" ({section})" if section else ""
                 vl_hint = "（VL 辨識）" if is_vl else ""
                 model_lines.append(f"  - REF{i}: {source} 第 {page} 頁 [{doc_type}]{vl_hint}{section_hint}")
+                if _is_mineru_text(chunk):
+                    model_lines.append("    text_lane: mineru（OCR 未經獨立驗證）")
                 if structured:
                     model_lines.extend(
                         self._structured_ref_lines(chunk, status, trunc, trust_map)
@@ -3283,6 +3513,8 @@ English:"""
             )
         if is_strict_mode and excluded_figures:
             model_lines.append(self._excluded_figures_line(excluded_figures))
+        if is_strict_mode and excluded_text:
+            model_lines.append(self._excluded_text_line(excluded_text))
 
         model_output = "\n".join(model_lines)
 
@@ -3357,6 +3589,7 @@ English:"""
                 "section": c.get("section", ""),
                 # 出身揭露：VL 產物（image/screenshot/diagram）在下游要能與原文區分
                 "origin": c.get("origin", ""),
+                **({"text_lane": "mineru"} if _is_mineru_text(c) else {}),
                 # PDF 內嵌圖的頁內序號：同頁多張圖若 VL 標題相同，少了它
                 # 下游（MCP / strict / flywheel / eval）就分不出是哪一張。
                 # 非圖 chunk 是 None。
@@ -3415,6 +3648,7 @@ English:"""
             "refs": refs,                         # 實際引用的 REF 清單
             # strict 模式被 gate 擋掉的圖（完整清單，不截斷）：page/figure/status/reasons
             "excluded_figures": excluded_figures,
+            "excluded_text": excluded_text,
             # P0-Eval: 供 eval 用的 retrieved_chunks 內容
             "retrieved_chunks": retrieved_chunks, # chunk 內容列表，用於 Layer 1 Recall 評估
             # P0 改進：Margin-based 風險判斷
@@ -3460,11 +3694,18 @@ English:"""
 
         if self._has_ctx:
             features.append("Ctx(on)" if use_generated_context() else "Ctx(off)")
+        features.append(self.section_status())
 
         feature_str = f" [{'+'.join(features)}]" if features else ""
         line = f"[KB] 知識庫: {self.path} ({doc_count} 文件, {chunk_count} 區塊){feature_str}"
         ctx_line = self.context_status()
         return f"{line}\n{ctx_line}" if ctx_line else line
+
+    def section_status(self) -> str:
+        """Expose cache/lane availability without emitting document text."""
+        if self._section_embeddings is not None and not RRF_ENABLED:
+            return "Sections(off: RRF disabled)"
+        return f"Sections({self._section_store_state})"
 
     def context_status(self) -> str:
         """chunk 脈絡的世代分布。

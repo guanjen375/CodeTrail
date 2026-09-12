@@ -838,6 +838,20 @@ preflight 零寫入;它會估算所有結構化候選，包含純 raster 的分�
 `▯` / 逐格或逐行證據，並出現在 `review_figures` 裡。完整說明見
 [docs/rag.md](docs/rag.md#pdf-內的表格與終端機畫面結構化抽取--人工覆核)。
 
+跨整節的問題現在有**章節召回**補充：每節以標題與整節正文建立一個檢索點，
+命中後把該節所有 chunks 併入候選並去重，再逐 chunk 過原本的證據門檻與本地 reranker。
+長節分窗涵蓋全文，不截掉 6000 字之後；節點分數只用於召回，不是 strict 的證據分數。
+既有 KB 由已存的 chunk 章節資料重建索引，**不用重新解析 PDF**；首次載入舊 cache
+需要本地 embedding server 重算向量。缺少原始節界的舊資料只能依保留的標題序列復原。
+
+也可明確選用**本地 MinerU 文字 lane**：把 flat `content_list.json` 放進專案，
+用 `ingest_document` 同時提供 `mineru_content_list` 與**產物生成時記錄的**
+`mineru_pdf_sha256`。程式只轉換現成產物，不啟動 MinerU；只認 `text_level` 標題，
+圖表依頁碼與 bbox 配對。表格仍由既有 structured lane 收錄，沒有唯一 owner 就報錯。
+MinerU 文字屬未獨立驗證 OCR，normal 查詢標示來源，strict 排除並回報 `excluded_text`；
+未表示頁與既有品質問題仍會揭露。參數與 CLI 用法見
+[MinerU 文字 lane](docs/mcp-tools.md#本地-mineru-文字-lane)。
+
 **知識庫只有 `knowledge.json` 一個檔要管。** 向量是它衍生出來的 cache(藏在
 `.codetrail/cache/embeddings/`),缺了會自動重建、身分對不上一律丟棄重建、重建不了就
 **中止查詢而不是拿舊向量湊合**。備份 / 複製 / 刪除知識庫只要動 `knowledge.json`;刪掉它

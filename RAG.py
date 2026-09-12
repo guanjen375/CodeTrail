@@ -324,6 +324,7 @@ def split_by_semantic_with_sections(
     include_heading: bool = INCLUDE_HEADING_IN_CONTENT,
     pre_normalized: bool = False,
     exclude_spans=(),
+    recognize_headings: bool = True,
 ) -> List[Dict]:
     """
     語意切分：按標題/段落切，保持語意完整性，同時追蹤章節標題
@@ -349,15 +350,6 @@ def split_by_semantic_with_sections(
     if not text:
         return []
 
-    if len(text) <= max_chars and not exclude_spans:
-        return [{
-            "content": text,
-            "section": "",
-            "heading_hierarchy": "",
-            "char_start": 0,
-            "char_end": len(text),
-        }]
-
     lines = text.split('\n')
     line_offsets = build_line_offsets(text)
     from document_structure import protected_text_spans
@@ -366,8 +358,21 @@ def split_by_semantic_with_sections(
                        if any(a <= start < b for a, b in protected)}
     navigation_lines = {i for i, start in enumerate(line_offsets)
                         if any(a <= start < b for a, b in exclude_spans)}
-    heading_lines = ["" if i in protected_lines or i in navigation_lines else line
+    heading_lines = ["" if not recognize_headings or i in protected_lines or i in navigation_lines else line
                      for i, line in enumerate(lines)]
+
+    # Size is not a section boundary: even a short page may contain several
+    # headings. MinerU callers already cut at their explicit text_level spans
+    # and disable heuristics so body text cannot create a second heading source.
+    if (len(text) <= max_chars and not exclude_spans
+            and not any(is_heading(line) for line in heading_lines if line)):
+        return [{
+            "content": text,
+            "section": "",
+            "heading_hierarchy": "",
+            "char_start": 0,
+            "char_end": len(text),
+        }]
 
     def strip_chunk(value):
         return value.strip("\n") if protected else value.strip()
@@ -443,7 +448,7 @@ def split_by_semantic_with_sections(
                 current_section = ""
 
         # 遇到標題 → 先 flush 舊 chunk（用舊 section），再更新 section
-        if idx not in protected_lines and idx not in navigation_lines and is_heading(line):
+        if heading_lines[idx] and is_heading(line):
             # 先 flush 舊 chunk（保持舊的 section）
             if current_chunk:
                 chunk_text = strip_chunk('\n'.join(current_chunk))
@@ -2398,13 +2403,37 @@ def extract_pdf_document(file_path: str, *, preflight_only: bool = False,
 
 def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
                                root: Optional[str],
-                               kb_path) -> ExtractedDocument:
+                               kb_path, mineru_artifact=None) -> ExtractedDocument:
     """`extract_pdf_document` 的實作。
 
     公開介面是 Gate 0 §6.7 凍結的三個參數；`kb_path` 是 re-ingest 的 human
     verification carry-over（§15.7）需要的**內部**資料通道，只給 `add_document` /
     `process_file_document` 這條路徑用，不擴張公開 signature。
     """
+    if mineru_artifact is not None:
+        import mineru_lane
+
+        requested = Path(file_path).expanduser()
+        if not requested.is_absolute():
+            requested = mineru_artifact.root / requested
+        if requested != mineru_artifact.pdf_path:
+            raise mineru_lane.MineruLaneError("MinerU artifact 與 native PDF 來源路徑不一致")
+        # Native offsets belong only to the native document. Finish that lane
+        # before independently constructing the MinerU text and geometry map.
+        mineru_lane.revalidate_artifact(mineru_artifact)
+        native = _extract_pdf_document_impl(
+            file_path, preflight_only=preflight_only, root=root, kb_path=kb_path)
+        mineru_lane.revalidate_artifact(mineru_artifact)
+        print(f"[INFO] MinerU 文字來源：{mineru_artifact.readable_page_count}/"
+              f"{mineru_artifact.page_count} 頁有可讀文字；OCR 未獨立驗證。")
+        if mineru_artifact.missing_pages:
+            print("[WARN] MinerU 產物未表示頁碼："
+                  + ", ".join(map(str, mineru_artifact.missing_pages)))
+        if preflight_only:
+            return native
+        return mineru_lane.build_document(
+            mineru_artifact, native, split_chunks=split_by_semantic_with_sections)
+
     # 延遲載入 pymupdf4llm（只有 PDF 模式需要）
     pymupdf4llm = check_pymupdf4llm()
 
@@ -2804,13 +2833,21 @@ def extract_binary(file_path: str) -> List[Dict]:
     return extract_binary_document(file_path).chunks
 
 
-def process_file_document(file_path: str, *, kb_path: Optional[str] = None) -> ExtractedDocument:
+def process_file_document(file_path: str, *, kb_path: Optional[str] = None,
+                          mineru_artifact=None) -> ExtractedDocument:
     """根據檔案類型選擇處理方式，回傳文件級單一真相
 
     `kb_path` 只給 PDF 的 structured figure lane 用：re-ingest 要先讀既有 KB 才知道
     哪些 figure 已經被人工確認過（契約 §15.7）。沒給就用專案預設的知識庫。
     """
     ext = Path(file_path).suffix.lower()
+
+    if mineru_artifact is not None:
+        if ext != ".pdf":
+            raise ValueError("MinerU 文字 lane 只適用 PDF 文件")
+        return _extract_pdf_document_impl(
+            file_path, preflight_only=False, root=None, kb_path=kb_path,
+            mineru_artifact=mineru_artifact)
 
     if ext == ".pdf":
         return _extract_pdf_document_impl(
@@ -3384,7 +3421,7 @@ def _restore_embeddings_from_npz(
             "models is forbidden."
         )
 
-    needs_gate = context_signals.has_any_ctx(chunks)
+    needs_gate = context_signals.needs_gate_matrix(chunks)
     have_retrieval = all(chunk.get("embedding") for chunk in chunks)
     have_gate = all(chunk.get("embedding_gate") for chunk in chunks)
     if have_retrieval and (have_gate or not needs_gate):
@@ -3395,7 +3432,8 @@ def _restore_embeddings_from_npz(
                 "embedding dimension metadata mismatch: "
                 f"JSON={stored_dimension}, vectors={dimension}"
             )
-        return True
+        # Writers also need the independently validated section rows. Inline
+        # chunk vectors cannot prove a section catalog; upgrade outside locks.
 
     matrices, stale = kb_cache.locate(output_path, chunks, saved_metadata,
                                      mutate=allow_rebuild)
@@ -3403,8 +3441,9 @@ def _restore_embeddings_from_npz(
         if not allow_rebuild:
             raise kb_cache.fatal(stale)
         # 重算會直接把兩套向量掛回 chunks（validate_embeddings 已驗過）
-        kb_cache.rebuild(output_path, chunks, saved_metadata, reason=stale)
-        return True
+        matrices = kb_cache.rebuild(output_path, chunks, saved_metadata, reason=stale)
+
+    kb["_section_vectors"] = kb_cache.reusable_sections(matrices)
 
     embeddings = matrices.embeddings
     gate_embeddings = matrices.gate_embeddings
@@ -3418,7 +3457,8 @@ def _restore_embeddings_from_npz(
     return True
 
 
-def save_knowledge_base(kb: Dict, output_path: Path, *, _already_locked: bool = False):
+def save_knowledge_base(kb: Dict, output_path: Path, *, _already_locked: bool = False,
+                        prepared_sections=None):
     """儲存知識庫
 
     改進：將 embeddings 完全移到 .npz，JSON 只存文字與 metadata
@@ -3426,12 +3466,12 @@ def save_knowledge_base(kb: Dict, output_path: Path, *, _already_locked: bool = 
     - 加速 JSON 解析
     - .npz 使用壓縮格式，整體儲存更有效率
 
-    KB 裡只要有任何一個 chunk 帶 ctx，就同時寫出 content-only 的 gate 矩陣，
-    retrieval schema 也跟著換成 contextual 版本。完全沒有 ctx 的 KB 走的還是
-    單一矩陣 + 舊 schema，輸出與加入 contextual retrieval 之前逐位元組相同。
+    有生成 ctx 或 MinerU 標題/caption 時，獨立保存 content-only gate 矩陣。
+    其餘 KB 保留單一 chunk 矩陣與既有 retrieval schema；兩者都在同一 NPZ
+    保存獨立的 section 召回矩陣。caller 已持鎖時只能使用準備好的節點向量。
     """
     chunks = kb.get("chunks", [])
-    needs_gate = context_signals.has_any_ctx(chunks)
+    needs_gate = context_signals.needs_gate_matrix(chunks)
 
     missing_embeddings = [chunk for chunk in chunks if not chunk.get("embedding")]
     if missing_embeddings:
@@ -3444,6 +3484,16 @@ def save_knowledge_base(kb: Dict, output_path: Path, *, _already_locked: bool = 
         if missing_gate:
             print(f"[INFO] {len(missing_gate)} 個 chunks 缺少 gate embedding，明確重算後再提交")
             generate_gate_embeddings(missing_gate, cache_dir=output_path.parent)
+
+    section_vectors = kb_cache.merge_sections(kb.get("_section_vectors"), prepared_sections)
+    if not _already_locked:
+        section_vectors = kb_cache.prepare_sections(
+            chunks, cache_dir=output_path.parent, reusable=section_vectors)
+    # In a caller's transaction this is pure validation/reuse. Missing rows
+    # fail before publishing, never start a model request under the store lock.
+    _, dimension = validate_embeddings(chunks)
+    section_payload = kb_cache.section_fields(
+        chunks, section_vectors, dimension=dimension or 0)
 
     # 更新 metadata
     kb["metadata"]["updated_at"] = datetime.now().isoformat()
@@ -3477,6 +3527,7 @@ def save_knowledge_base(kb: Dict, output_path: Path, *, _already_locked: bool = 
             gate_content_hash=gate_hash,
             gate_content_hash_schema=context_signals.GATE_SCHEMA if needs_gate else None,
             already_locked=_already_locked,
+            section_fields=section_payload,
         )
     if saved_emb_path:
         emb_size = saved_emb_path.stat().st_size / 1024 / 1024
@@ -3814,6 +3865,17 @@ def _ingest_summary_line(document: ExtractedDocument, committed_chunks,
     coverage = getattr(document, _PDF_COVERAGE_ATTR, None)
     if coverage:
         payload["coverage"] = coverage
+    mineru_summary = getattr(document, "_codetrail_mineru_summary", None)
+    replaced_figures = set()
+    if mineru_summary:
+        payload["text_lane"] = "mineru"
+        payload["mineru"] = mineru_summary
+        replaced_figures = set(mineru_summary.get("replaced_figure_ids", ()))
+    native_document = getattr(document, "_codetrail_mineru_native_document", None)
+    replaced_chunks = [
+        chunk for chunk in (native_document.chunks if native_document is not None else [])
+        if chunk.get("figure_id") in replaced_figures
+    ]
 
     entries = None
     if root and document_id:
@@ -3842,7 +3904,7 @@ def _ingest_summary_line(document: ExtractedDocument, committed_chunks,
                 payload[key][value] = payload[key].get(value, 0) + 1
         payload["review"] = _fallback_review_items(committed_chunks)
         payload["repair"] = [dict(item) for item in guard.get("repair", [])] + _fallback_review_items(
-            committed_chunks, bucket="repair")
+            [*(committed_chunks or []), *replaced_chunks], bucket="repair")
         return ingest_notify.format_summary_line(_finish_summary_payload(payload))
 
     fx = _figure_extract()
@@ -3851,6 +3913,13 @@ def _ingest_summary_line(document: ExtractedDocument, committed_chunks,
         status = str(entry.get("verification_status") or "")
         quality = _quality_for_entry(entry)
         item = _summary_item(entry, quality)
+        if entry.get("figure_id") in replaced_figures:
+            # Switching text owner cannot erase a known defect. Preserve its
+            # repair notice, without misreporting an intentional replacement
+            # as an extraction failure or independent OCR verification.
+            if _quality_summary_bucket(entry, quality) == "repair":
+                payload["repair"].append(item)
+            continue
         if not entry.get("in_kb"):
             if str(entry.get("extraction_status") or "") == fx.EXTRACTION_SKIPPED:
                 # 分類器判定「不是圖面」（封面 / logo / 照片）：同樣沒進 KB，但它
@@ -3943,6 +4012,11 @@ def _commit_document_to_kb(
         print("[WARN] 沒有提取到任何內容")
         return False
 
+    mineru_artifact = getattr(document, "_codetrail_mineru_artifact", None)
+    if mineru_artifact is not None:
+        import mineru_lane
+        mineru_lane.revalidate_artifact(mineru_artifact)
+
     print(f"[INFO] 提取 {len(new_chunks)} 個文字區塊")
 
     # chunk 級生成脈絡（預設關閉）。失敗一律往上丟：這一步失敗就不該發布，
@@ -3956,7 +4030,7 @@ def _commit_document_to_kb(
         print(report.format_summary())
 
     # 生成 embeddings
-    needs_gate = context_signals.has_any_ctx(new_chunks)
+    needs_gate = context_signals.needs_gate_matrix(new_chunks)
     print(f"[INFO] 使用 {EMBEDDING_MODEL} 生成 embeddings...")
     new_chunks = generate_embeddings(new_chunks, with_gate=needs_gate)
 
@@ -3964,6 +4038,11 @@ def _commit_document_to_kb(
     # 這裡以前有一份行內複製，兩份實作一漂移，人工 fix 換掉的 chunk 就對不上舊 id）
     for chunk in new_chunks:
         chunk['id'] = chunk_id(chunk)
+
+    prepared_sections = kb_cache.prepare_sections(
+        new_chunks, cache_dir=output_path.parent)
+    if mineru_artifact is not None:
+        mineru_lane.revalidate_artifact(mineru_artifact)
 
     # 這裡開始才碰共用狀態：整段 read-modify-write 在同一把鎖內。
     with knowledge_store_lock(output_path, exclusive=True):
@@ -4011,7 +4090,12 @@ def _commit_document_to_kb(
         record_document_identity(kb["metadata"], doc_name, source_location)
 
         # 儲存
-        save_knowledge_base(kb, output_path, _already_locked=True)
+        if mineru_artifact is not None:
+            # Recheck after waiting for the writer lock as well as after the
+            # potentially slow embedding work. A changed input is not a new KB.
+            mineru_lane.revalidate_artifact(mineru_artifact)
+        save_knowledge_base(kb, output_path, _already_locked=True,
+                            prepared_sections=prepared_sections)
         if fresh:
             print(f"[INFO] fresh ingest 已重建 KB，本文件沿用 {carried_human} 筆 "
                   "human_verified。")
@@ -4042,8 +4126,26 @@ def _commit_document_to_kb(
     return True
 
 
+def _load_mineru_input(input_file, content_list, pdf_sha256):
+    """Validate the explicit local lane before any KB/cache access."""
+    if content_list is None and pdf_sha256 is None:
+        return None
+    import mineru_lane
+
+    if (not isinstance(content_list, str) or not content_list.strip()
+            or not isinstance(pdf_sha256, str) or not pdf_sha256.strip()):
+        raise mineru_lane.MineruLaneError(
+            "MinerU 必須同時提供非空的 content_list 路徑與產生時的 PDF SHA-256")
+    if Path(input_file).suffix.lower() != ".pdf":
+        raise mineru_lane.MineruLaneError("MinerU 文字 lane 只適用單份 PDF 文件")
+    return mineru_lane.load_artifact(
+        content_list, input_file, pdf_sha256, root=_figure_root(None))
+
+
 def add_document(input_file: str, output_file: str, *, generate_context: bool = False,
-                 preflight_only: bool = False, fresh: bool = False):
+                 preflight_only: bool = False, fresh: bool = False,
+                 mineru_content_list: Optional[str] = None,
+                 mineru_pdf_sha256: Optional[str] = None):
     """將文件加入知識庫
 
     `generate_context` 只有 `rebuild` 子命令會給 True——chunk 脈絡的唯一執行路徑
@@ -4079,6 +4181,11 @@ def add_document(input_file: str, output_file: str, *, generate_context: bool = 
         print("[ERROR] --preflight 是零寫入的估算，不能同時 --fresh（那是重建 KB）")
         sys.exit(1)
 
+    mineru_artifact = _load_mineru_input(
+        input_file, mineru_content_list, mineru_pdf_sha256)
+    lane_kwargs = ({"mineru_artifact": mineru_artifact}
+                   if mineru_artifact is not None else {})
+
     if preflight_only:
         # 零寫入的保證要含「不去碰 KB」：load_knowledge_base 會建立 store lock 檔，
         # 所以 preflight 分支刻意排在它之前。
@@ -4087,18 +4194,26 @@ def add_document(input_file: str, output_file: str, *, generate_context: bool = 
             sys.exit(1)
         print(f"[INFO] 處理: {input_path.name}")
         _extract_pdf_document_impl(str(input_path), preflight_only=True,
-                                   root=None, kb_path=None)
+                                   root=None, kb_path=None, **lane_kwargs)
         print("[INFO] --preflight：只計算 figure 預算，未寫入知識庫（零寫入）。")
         return
 
     # 先驗一次：壞掉的 KB 要在付出抽取／生成成本前就 fail。真正併入用的快照
     # 是 _commit_document_to_kb 在鎖裡重新載的那一份。非 fresh 時這一步同時把
     # embeddings cache 補好（重算在鎖外做，不會卡住整個 KB）。
-    load_knowledge_base(output_path, _quiet=True, _restore_vectors=not fresh)
+    if mineru_artifact is None:
+        load_knowledge_base(output_path, _quiet=True, _restore_vectors=not fresh)
 
     # 處理新文件
     print(f"[INFO] 處理: {input_path.name}")
-    document = process_file_document(str(input_path), kb_path=output_file)
+    document = process_file_document(
+        str(input_path), kb_path=output_file, **lane_kwargs)
+    if mineru_artifact is not None:
+        # Conversion/ownership errors must not first publish a migrated cache.
+        # Once the document is complete, warm the old vectors outside the lock.
+        import mineru_lane
+        mineru_lane.revalidate_artifact(mineru_artifact)
+        load_knowledge_base(output_path, _quiet=True, _restore_vectors=not fresh)
 
     if not _commit_document_to_kb(
         document, output_file, label="文件", generate_context=generate_context,
@@ -4593,6 +4708,14 @@ def rebuild_cli(argv: List[str]) -> int:
     parser.add_argument(
         "documents", nargs="+", help="要灌的文件（pdf/md/txt/bin/elf）"
     )
+    parser.add_argument(
+        "--mineru-content-list", action=_MineruOptionOnce,
+        help="本地 MinerU flat content_list.json（限单份 PDF，須搭配 --mineru-pdf-sha256）",
+    )
+    parser.add_argument(
+        "--mineru-pdf-sha256", action=_MineruOptionOnce,
+        help="產生 MinerU 產物時的 PDF SHA-256",
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--context", dest="context", action="store_const", const=True,
@@ -4615,6 +4738,15 @@ def rebuild_cli(argv: List[str]) -> int:
     args = parser.parse_args(argv)
     _apply_client_settings(args.client_config or None)
 
+    mineru_kwargs = {}
+    if args.mineru_content_list is not None or args.mineru_pdf_sha256 is not None:
+        if not args.mineru_content_list or not args.mineru_pdf_sha256:
+            parser.error("MinerU 的兩個參數必須同時提供")
+        if len(args.documents) != 1 or Path(args.documents[0]).suffix.lower() != ".pdf":
+            parser.error("MinerU 文字 lane 只適用單份 PDF")
+        mineru_kwargs = {"mineru_content_list": args.mineru_content_list,
+                         "mineru_pdf_sha256": args.mineru_pdf_sha256}
+
     if args.preflight and args.fresh:
         parser.error("--preflight 是零寫入的估算，不能同時 --fresh")
 
@@ -4623,7 +4755,7 @@ def rebuild_cli(argv: List[str]) -> int:
         for document_path in args.documents:
             print(f"\n=== {document_path} ===")
             try:
-                add_document(document_path, args.kb, preflight_only=True)
+                add_document(document_path, args.kb, preflight_only=True, **mineru_kwargs)
             except Exception as exc:  # noqa: BLE001 — 對映契約 §11.4 的 exit code
                 code = _pdf_cli_error_code(exc)
                 if code is None:
@@ -4643,7 +4775,7 @@ def rebuild_cli(argv: List[str]) -> int:
     for document_path in args.documents:
         print(f"\n=== {document_path} ===")
         add_document(document_path, args.kb, generate_context=generate_context,
-                     fresh=fresh)
+                     fresh=fresh, **mineru_kwargs)
         fresh = False   # 只清一次，否則每一份都會把前一份洗掉
     return 0
 
@@ -4655,6 +4787,7 @@ def print_usage():
     print("  python3 RAG.py <input.pdf> <output_json> --preflight  # 只算 PDF figure 預算並印報告（零寫入）")
     print("  python3 RAG.py rebuild --kb <output_json> <input>... [--preflight|--fresh]  # 批次入庫（唯一會生成 chunk 脈絡的路徑）")
     print("  python3 RAG.py <input_file> <output_json> --fresh     # 清空既有 chunks 後只留這一份（figure artifacts 不動）")
+    print("  python3 RAG.py <input.pdf> <output_json> --mineru-content-list <content_list.json> --mineru-pdf-sha256 <SHA256>  # 本地 MinerU 文字 lane")
     print("  python3 RAG.py <screenshot> <output_json> --chat      # 聊天截圖（互動式）")
     print("  python3 RAG.py <image> <output_json> --image          # 技術圖片（互動式）")
     print("  python3 RAG.py <url> <output_json> --url              # 網頁（互動式）")
@@ -4698,6 +4831,9 @@ def _pdf_cli_error_code(exc: BaseException) -> Optional[int]:
         return 2   # 超出預算：報告已完整印出
     if isinstance(exc, PdfPreflightUnavailable):
         return 1   # 產不出報告：不得以 exit 0 假成功
+    mineru = sys.modules.get("mineru_lane")
+    if mineru is not None and isinstance(exc, mineru.MineruLaneError):
+        return 1
     return None
 
 
@@ -4712,6 +4848,44 @@ class _ClientConfigOnce(argparse.Action):
             parser.error("--client-config 的值不可為空")
         setattr(namespace, "_client_config_seen", True)
         setattr(namespace, self.dest, values)
+
+
+class _MineruOptionOnce(argparse.Action):
+    """Reject ambiguous or empty source-identity options."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, self.dest, None) is not None or not str(values).strip():
+            parser.error(f"{option_string} 只能給一次且不可為空")
+        setattr(namespace, self.dest, values)
+
+
+def _split_mineru_options(argv: List[str]) -> tuple[List[str], dict]:
+    flags = {"--mineru-content-list": "mineru_content_list",
+             "--mineru-pdf-sha256": "mineru_pdf_sha256"}
+    rest, kwargs = [], {}
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        flag, equals, value = item.partition("=")
+        if flag not in flags:
+            rest.append(item)
+            index += 1
+            continue
+        if not equals:
+            index += 1
+            value = argv[index] if index < len(argv) else ""
+            if value.startswith("--"):
+                value = ""
+        key = flags[flag]
+        if key in kwargs or not value.strip():
+            print(f"[ERROR] {flag} 只能給一次且不可為空")
+            raise SystemExit(2)
+        kwargs[key] = value
+        index += 1
+    if kwargs and len(kwargs) != 2:
+        print("[ERROR] MinerU 的兩個參數必須同時提供")
+        raise SystemExit(2)
+    return rest, kwargs
 
 
 def _split_client_config(argv: List[str]) -> tuple[List[str], Optional[str]]:
@@ -4775,6 +4949,7 @@ def main(argv: List[str]) -> int:
     一個字都沒變，只有 figure lane 的兩種例外被映射成 2 / 1。
     """
     argv, client_config_path = _split_client_config(list(argv))
+    argv, mineru_kwargs = _split_mineru_options(argv)
     _apply_client_settings(client_config_path)
     preflight_only = "--preflight" in argv
     fresh = "--fresh" in argv
@@ -4798,6 +4973,9 @@ def main(argv: List[str]) -> int:
             return 1
         if preflight_only:
             print("[ERROR] --preflight 只適用 PDF 文件模式（不支援 --chat/--image/--url）")
+            return 1
+        if mineru_kwargs:
+            print("[ERROR] MinerU 文字 lane 只適用 PDF 文件模式")
             return 1
 
         input_file = args[0]
@@ -4832,7 +5010,8 @@ def main(argv: List[str]) -> int:
     input_file = args[0]
     output_file = args[1]
     try:
-        add_document(input_file, output_file, preflight_only=preflight_only, fresh=fresh)
+        add_document(input_file, output_file, preflight_only=preflight_only, fresh=fresh,
+                     **mineru_kwargs)
     except Exception as exc:  # noqa: BLE001 — 只攔 figure lane 的兩種，其餘原樣往上拋
         code = _pdf_cli_error_code(exc)
         if code is None:

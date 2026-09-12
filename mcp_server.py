@@ -813,6 +813,7 @@ def query_knowledge(
             "has_ref": bool,
             "excluded_figures": list[dict],  # 被 gate 排除的圖(這條路徑通常是空的;
                                   #   非 strict 模式會回未驗證內容,只是帶上狀態)
+            "excluded_text": list[dict],  # 未獨立驗證 OCR 的來源、頁码與原因
             "review_hint": str,   # excluded_figures 非空時的人可讀提示(否則 "")
         }
     """
@@ -825,6 +826,7 @@ def query_knowledge(
             "top_score": 0.0,
             "has_ref": False,
             "excluded_figures": [],
+            "excluded_text": [],
             "review_hint": "",
             "error": "knowledge base not loaded",
         }
@@ -846,6 +848,7 @@ def query_knowledge(
         "top_score": top_score,
         "has_ref": meta.get("has_ref", False),
         "excluded_figures": excluded,
+        "excluded_text": meta.get("excluded_text", []),
         "review_hint": _figure_review_hint(excluded),
     }
 
@@ -886,6 +889,7 @@ def query_knowledge_strict(
                                    #     figure_kind, verification_status, reasons}, ...]
                                    #   **四條回傳路徑都有這個 key**(沒有就是空 list)
           "review_hint": str,      # excluded_figures 非空時的人可讀提示,指向 review_figures
+          "excluded_text": list[dict],  # 所有回傳路徑保留未驗證 OCR 的來源/頁碼/原因
         }
 
     圖片內容的硬閘:未通過驗證(needs_review / unverified / legacy_unverified)的
@@ -910,6 +914,7 @@ def query_knowledge_strict(
             "top_score": 0.0,
             "top_emb_score": 0.0,
             "excluded_figures": [],
+            "excluded_text": [],
             "review_hint": "",
         }
         _record_kb_interaction(
@@ -931,6 +936,7 @@ def query_knowledge_strict(
     # strict gate 排除掉的圖:**四條回傳路徑都要帶**。少任何一條,「全部候選都被
     # gate 排除」時使用者只會看到拒答,看不到「有圖可用但待覆核」(契約 §13.3)。
     excluded_figures = meta.get("excluded_figures", [])
+    excluded_text = meta.get("excluded_text", [])
     review_hint = _figure_review_hint(excluded_figures)
 
     if should_refuse_answer(question, meta):
@@ -943,6 +949,7 @@ def query_knowledge_strict(
             "top_score": top_score,
             "top_emb_score": top_emb_score,
             "excluded_figures": excluded_figures,
+            "excluded_text": excluded_text,
             "review_hint": review_hint,
         }
         _record_kb_interaction(
@@ -968,6 +975,7 @@ def query_knowledge_strict(
             "top_score": top_score,
             "top_emb_score": top_emb_score,
             "excluded_figures": excluded_figures,
+            "excluded_text": excluded_text,
             "review_hint": review_hint,
         }
         _record_kb_interaction(
@@ -996,6 +1004,7 @@ def query_knowledge_strict(
         "top_score": top_score,
         "top_emb_score": top_emb_score,
         "excluded_figures": excluded_figures,
+        "excluded_text": excluded_text,
         "review_hint": review_hint,
     }
     _record_kb_interaction(
@@ -2113,6 +2122,8 @@ def ingest_document(
     mode: Annotated[Literal["auto", "document", "image", "chat", "binary"], Field(description="Ingestion parser mode: auto, document, image, chat, or binary.")] = "auto",
     preflight_only: Annotated[bool, Field(description="For PDF only, estimate work with zero embeddings or KB writes.")] = False,
     fresh: Annotated[bool, Field(description="Atomically rebuild the KB from this file; incompatible with preflight_only.")] = False,
+    mineru_content_list: Annotated[Optional[str], Field(description="Local flat MinerU content_list.json for a PDF; requires mineru_pdf_sha256.")] = None,
+    mineru_pdf_sha256: Annotated[Optional[str], Field(description="PDF SHA-256 recorded when the MinerU artifact was generated; requires mineru_content_list.")] = None,
     ctx: Optional[Context] = None,
 ) -> str:
     """Ingest a file into the project knowledge base.
@@ -2128,6 +2139,12 @@ def ingest_document(
     一律丟棄重建、重建不了就中止查詢而**不會**拿舊向量湊合。使用者要備份 / 複製 /
     刪除知識庫,只需要動 knowledge.json;刪掉它之後,無主的向量會在下一次載入或
     ingest 時自動清掉。
+
+    MinerU 文字 lane 只接本地 flat content_list.json。兩個 mineru 參數必須同時給，
+    hash 必須是產物生成時的 PDF SHA-256；不呼叫 MinerU 或外部 OCR。文字只認
+    text_level 標題、頁碼採 page_idx+1，圖表仍走既有 structured verification。
+    產物不可信或表格沒有唯一 structured owner 時失敗，不改走 native 文字。
+    OCR 文字未獨立驗證，normal REF 會標示，strict 排除並列在 excluded_text。
 
     ── PDF 的圖:兩條 lane(範圍不同,不要混為一談)──────────────────
 
@@ -2222,6 +2239,8 @@ def ingest_document(
               預設 False ＝ 合併語意:新 basename 加入一份文件;同一來源的同
               basename 原子替換舊 chunks。不同來源的同名文件仍由身分閘拒絕。
               不能與 preflight_only 併用(後者是零寫入的估算)。
+        mineru_content_list: 沙箱內的 MinerU flat content_list.json，僅 PDF 文件模式。
+        mineru_pdf_sha256: 產生該產物時記錄的 PDF SHA-256，必須與目前 PDF 相符。
         ctx: **不是模型參數**,不出現在 JSON schema 裡(FastMCP 依型別註記自動
               注入並排除)。這個工具跑在 worker thread,由外層 async wrapper 用
               它每兩秒送一次零內容的 progress(只有秒數與已收到的行數)。
@@ -2248,6 +2267,7 @@ def ingest_document(
     doc_path = Path(path)
     if not doc_path.is_absolute():
         doc_path = Path(AICODE_ROOT) / path
+    requested_doc_path = doc_path
     doc_path = doc_path.resolve()
 
     # 使用者輸入(路徑、mode、副檔名)一旦被回顯進結果,就可能挾帶 marker:
@@ -2309,6 +2329,29 @@ def ingest_document(
     # preflight 只存在於 PDF 的結構化圖片 lane（含 raster 分類/抽取）。其他組合直接擋下 —— 不啟動子行程,
     # 也不默默降級成正式入庫(那才是最糟的:使用者以為只是估算,結果整份寫進 KB)。
     pdf_document = (resolved_mode == "document" and ext == ".pdf")
+    mineru_args = []
+    if mineru_content_list is not None or mineru_pdf_sha256 is not None:
+        if (not isinstance(mineru_content_list, str) or not mineru_content_list.strip()
+                or not isinstance(mineru_pdf_sha256, str)
+                or not re.fullmatch(r"[0-9a-fA-F]{64}", mineru_pdf_sha256)):
+            return "錯誤: MinerU 必須同時提供 content_list 路徑與產生時的 64 位 PDF SHA-256。"
+        if not pdf_document:
+            return "錯誤: MinerU 文字 lane 只支援 .pdf 的 document 模式。"
+        import media
+
+        artifact_path = Path(mineru_content_list)
+        if not artifact_path.is_absolute():
+            artifact_path = Path(AICODE_ROOT) / artifact_path
+        if (media._safe_path(str(requested_doc_path), allow_external=False,
+                             allowed_extensions={".pdf"}) is None
+                or media._safe_path(str(artifact_path), allow_external=False,
+                                    allowed_extensions={".json"}) is None):
+            return "錯誤: MinerU 的 PDF 與 content_list.json 都必須是沙箱內的檔案。"
+        # Preserve caller names: resolving a symlink here would hide it from
+        # the child's dir-fd/O_NOFOLLOW source-identity read.
+        doc_path = requested_doc_path
+        mineru_args = ["--mineru-content-list", str(artifact_path),
+                       "--mineru-pdf-sha256", mineru_pdf_sha256]
     if preflight_only and not pdf_document:
         return (
             f"錯誤: preflight_only 只支援 .pdf 的 document 模式"
@@ -2337,6 +2380,7 @@ def ingest_document(
         cmd += ["--client-config", str(_CLIENT_SETTINGS.path)]
     if fresh:
         cmd += ["--fresh"]
+    cmd += mineru_args
     if preflight_only:
         cmd += ["--preflight"]  # 契約:旗標放最後
 
@@ -2367,6 +2411,7 @@ def ingest_document(
     # 免得檔名或 RAG.py 的 log 剛好含 marker,讓 plugin 誤報、adapter 誤判。
     summary = ingest_notify.parse_summary_line(run.output)
     action_block = ingest_notify.render_action_block(summary) if summary else []
+    lane_block = ingest_notify.render_text_lane(summary) if summary else []
     out = _clean_subprocess_output(run.output)
 
     # 逾時:保留已收到的輸出,附精確可複製的 CLI 命令(shlex quoting,路徑含空白也安全)
@@ -2476,7 +2521,8 @@ def ingest_document(
         # 通知只講**這一次 run** 真的有的待辦(來源是 RAG.py 的摘要行),
         # 三類都沒有就一個字都不印 —— 舊版那句無條件的「PDF 可能帶待覆核狀態」
         # 每次都出現,等於沒有訊號,使用者也判斷不出要不要動。
-        notice = ("\n".join(action_block) + "\n") if action_block else ""
+        notices = action_block + lane_block
+        notice = ("\n".join(notices) + "\n") if notices else ""
         hint = ("\n\n下一次 query_knowledge 會自動偵測並載入新內容;"
                 "要立即載入+確認 chunk 數可呼叫 reload_knowledge_base()。")
         if getattr(config, "KB_CONTEXT_GENERATE", False):
@@ -2488,7 +2534,7 @@ def ingest_document(
                 # 用**真實的** rag_script 路徑與單行引用:一般外部專案的
                 # cwd 底下沒有 `./RAG.py`,而路徑含空白或 shell 字元時,
                 # 沒引用的命令會被拆錯、甚至執行到非預期的東西。
-                f"  {_shell_join([sys.executable, str(rag_script), 'rebuild', '--kb', str(kb_path), str(doc_path), '--context'])}"
+                f"  {_shell_join([sys.executable, str(rag_script), 'rebuild', '--kb', str(kb_path), str(doc_path), '--context', *mineru_args])}"
             )
     else:
         status = f"✗ 失敗 (exit {run.returncode})"

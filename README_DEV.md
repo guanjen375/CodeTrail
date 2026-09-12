@@ -131,6 +131,15 @@ docstring 說明它涵蓋哪些原始檔與為什麼：
 `tests/_harness.py` 與 `tests/_set_config_harness.py` 是共用 harness，不是 pytest test
 module。smoke 的安全組成由 `tests/test_smoke_gate.py` 靜態守住；不要以手動檔案清單取代。
 
+章節召回與 MinerU 的安全契約分別在 `test_section_store.py`、
+`test_section_retrieval.py`、`test_mineru_lane.py`、`test_mineru_ingest.py`。
+章節向量與 chunk/gate 向量同一 NPZ；cache schema 過期從 JSON chunks 重建，
+不得重解析 PDF 或沿用錯身分向量。窗口向量在 store lock 外準備，figure 修正只更新
+節點成員、不重算節點全文；OCR 標題的來源標記與獨立 gate 必須在修正後保留。
+離線診斷 `scripts/kb_ab_compare.py <knowledge.json>` 會列 section schema、維度與節數，
+且以正式 loader 的 `allow_rebuild=False` 判斷是否可用，不為診斷補寫 cache。
+測試用 inline embeddings 明示 `Sections(off (inline vectors))`，維持離線而不假稱已有節點。
+
 `test_smoke_gate.py` 的 `SAFETY_MODULES` 記的是「檔名 →（說明, 必須存在且帶 smoke 的
 node 名）」，對照 [AGENTS.md §2](AGENTS.md#3-安全相關不要砍) 的檢查點清單。只驗「這個檔
 至少有一個 smoke 標記」是不夠的：刪掉那條檢查點測試、或把 module 層 `pytestmark` 換成

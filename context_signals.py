@@ -66,6 +66,18 @@ def has_any_ctx(chunks: Iterable[Dict]) -> bool:
     return any(chunk_ctx(chunk) for chunk in chunks)
 
 
+def needs_gate_matrix(chunks: Iterable[Dict]) -> bool:
+    """Generated context and MinerU heading/caption text are recall signals.
+
+    OCR layout metadata must not become content-only evidence merely because
+    the KB contains no generated ``ctx`` field.
+    """
+    return any(chunk_ctx(chunk) or (
+        chunk.get("heading_source") == "mineru"
+        and (chunk.get("section") or chunk.get("figure_caption"))
+    ) for chunk in chunks)
+
+
 def required_retrieval_schemas(*, has_ctx: bool) -> frozenset:
     """目前程式接受的 retrieval schema 集合。
 
@@ -81,7 +93,7 @@ def required_retrieval_schemas(*, has_ctx: bool) -> frozenset:
 # ============================================================
 # embedding 組字
 # ============================================================
-def _prefix_lines(chunk: Dict) -> List[str]:
+def _prefix_lines(chunk: Dict, *, allow_ocr_metadata: bool = True) -> List[str]:
     """組字前綴：來源、章節、figure caption。
 
     `figure_caption`（「Table 3-1 …」）是 2026-08-30 才有的欄位，而且只有 structured
@@ -94,6 +106,8 @@ def _prefix_lines(chunk: Dict) -> List[str]:
     source = Path(str(chunk.get("source", ""))).name
     section = str(chunk.get("section", "")).strip()
     caption = str(chunk.get("figure_caption", "") or "").strip()
+    if not allow_ocr_metadata and chunk.get("heading_source") == "mineru":
+        section = caption = ""
     lines = []
     if source:
         lines.append(f"{SOURCE_TAG} {source}")
@@ -107,10 +121,10 @@ def _prefix_lines(chunk: Dict) -> List[str]:
 def gate_embedding_input(chunk: Dict) -> str:
     """content-only 組字：決策一律看這一套算出來的分數。
 
-    來源身分是檢索證據而不是事後 metadata,所以 [SOURCE]/[SECTION_METADATA]
-    留在 gate 訊號裡——它們是確定性的,不是生成物。
+    來源身分與確定性的 native 章節留在 gate。MinerU OCR 提供的章節與 caption
+    只作召回 metadata，不能提高 figure 內容的證據分數。
     """
-    parts = _prefix_lines(chunk)
+    parts = _prefix_lines(chunk, allow_ocr_metadata=False)
     parts.append(str(chunk.get("content", "")))
     return "\n".join(parts)
 
@@ -124,10 +138,9 @@ def retrieval_embedding_input(chunk: Dict, *, use_ctx: bool) -> str:
     if not use_ctx:
         return gate_embedding_input(chunk)
     ctx = chunk_ctx(chunk)
-    if not ctx:
-        return gate_embedding_input(chunk)
     parts = _prefix_lines(chunk)
-    parts.append(f"{CTX_TAG} {ctx}")
+    if ctx:
+        parts.append(f"{CTX_TAG} {ctx}")
     parts.append(str(chunk.get("content", "")))
     return "\n".join(parts)
 
@@ -192,6 +205,8 @@ def bm25_document_text(chunk: Dict, *, use_ctx: bool) -> str:
     title = str(chunk.get("section", ""))
     source = str(chunk.get("source", ""))
     caption = str(chunk.get("figure_caption", "") or "").strip()
+    if not use_ctx and chunk.get("heading_source") == "mineru":
+        title = caption = ""
     body = chunk_body(chunk)
     ctx = chunk_ctx(chunk) if use_ctx else ""
     head = f"{title} {caption}" if caption else title

@@ -3303,6 +3303,44 @@ def test_apply_fix_keeps_the_caption_and_section_retrieval_signals(env):
         "3 Control > 3.2 Registers"}
 
 
+def test_apply_fix_preserves_mineru_provenance_and_separate_gate(env):
+    """Fixing a payload must not promote an OCR heading into trusted evidence."""
+    import context_signals
+
+    root, _outside = env
+    doc_id, fig_id, _ref, kb_path = seed(
+        root, context={"caption": "OCR table caption", "section": "OCR heading",
+                       "heading_hierarchy": "OCR heading"})
+    kb = RAG.load_knowledge_base(kb_path, _quiet=True)
+    provenance = {"heading_source": "mineru", "source_sha256": "a" * 64,
+                  "content_list_sha256": "b" * 64}
+    for chunk in kb["chunks"]:
+        chunk["embedding_gate"] = [0.8, 0.6]
+        if chunk.get("structured"):
+            chunk.update(provenance)
+    RAG.save_knowledge_base(kb, kb_path)
+
+    calls = []
+
+    def captured_embed(chunks, *, with_gate=False):
+        calls.append(with_gate)
+        return embed(chunks, with_gate=with_gate)
+
+    fr.apply_fix(root, kb_path, document_id=doc_id, figure_id=fig_id,
+                 expected_revision=1, payload=table_payload(rows=CORRECTED_ROWS),
+                 kind="table", confirm_against_image=True, rechunk=rechunk,
+                 embed=captured_embed)
+    assert calls == [True]
+    after = RAG.load_knowledge_base(kb_path, _quiet=True)
+    figures = [c for c in after["chunks"] if c.get("structured")]
+    assert figures
+    for chunk in figures:
+        assert {key: chunk.get(key) for key in provenance} == provenance
+        assert "OCR heading" in context_signals.retrieval_embedding_input(chunk, use_ctx=True)
+        assert "OCR heading" not in context_signals.gate_embedding_input(chunk)
+        assert chunk["verification_status"] == "human_verified"
+
+
 @pytest.mark.smoke
 def test_apply_fix_refuses_a_malformed_retrieval_context(env):
     """★ 畸形的 caption metadata 不得被 `str()` 悄悄轉成 Python repr 寫進檢索訊號。

@@ -2395,6 +2395,7 @@ _IMMUTABLE_CHUNK_FIELDS = (
     # 檢索訊號（caption / 章節）：同一張圖的每個 part 一定相同，不一致代表有人只
     # 改了一半——症狀是同一張表有些 part 找得到、有些找不到。
     "figure_caption", "section", "heading_hierarchy",
+    "heading_source", "source_sha256", "content_list_sha256",
     "quality_grade", "review_state", "auto_disposition", "quality_issues",
 )
 
@@ -2403,6 +2404,20 @@ _IMMUTABLE_CHUNK_FIELDS = (
 # `build_figure_chunks` 會把三個欄位一起重設成空字串，向量也跟著照沒有 caption 的
 # 文本重算——使用者做了正確的事（覆核），檢索反而退步。
 _RETRIEVAL_CONTEXT_FIELDS = ("figure_caption", "section", "heading_hierarchy")
+_TEXT_SOURCE_FIELDS = ("heading_source", "source_sha256", "content_list_sha256")
+
+
+def _fix_needs_gate(chunks, positions) -> bool:
+    """A fixed payload drops generated ctx but keeps its OCR layout source."""
+    import context_signals
+
+    positions = set(positions)
+    preserved = [
+        ({key: chunk.get(key) for key in ("heading_source", "section", "figure_caption")}
+         if position in positions else chunk)
+        for position, chunk in enumerate(chunks)
+    ]
+    return context_signals.needs_gate_matrix(preserved)
 
 
 def _empty_result(document_id: str, figure_id: str) -> dict:
@@ -2990,7 +3005,7 @@ def apply_fix(root, kb_path, *, document_id: str, figure_id: str, expected_revis
 
     excluded = set(positions)
     others = [chunk for position, chunk in enumerate(chunks_snapshot) if position not in excluded]
-    needs_gate = context_signals.has_any_ctx(others)
+    needs_gate = _fix_needs_gate(chunks_snapshot, positions)
     # ★ 維度必須對「移除舊 figure **之前**的整個 KB」取——只看 others 的話，
     #   一個只有這張 figure 的 KB 會得到「維度未知」，任何維度的新向量都寫得進去
     #   （混維度＝整個矩陣靜默毀損）。validate_embeddings 同時保證 KB 自己不混維度。
@@ -3093,6 +3108,9 @@ def apply_fix(root, kb_path, *, document_id: str, figure_id: str, expected_revis
         }})
     _cross_check_parts(parts, new_chunks, kind=kind, where=where)
     for chunk in new_chunks:
+        for key in _TEXT_SOURCE_FIELDS:
+            if key in first:
+                chunk[key] = copy.deepcopy(first[key])
         chunk["id"] = knowledge_store.chunk_id(chunk)
 
     # ---- 4. embed（凍結所有非向量欄位）
@@ -3173,9 +3191,7 @@ def apply_fix(root, kb_path, *, document_id: str, figure_id: str, expected_revis
                 f"{sorted(live_revisions)}，拒絕覆寫（不做 last-write-wins）",
                 code="conflict",
             )
-        if context_signals.has_any_ctx(
-                [chunk for position, chunk in enumerate(chunks)
-                 if position not in set(live_positions)]) != needs_gate:
+        if _fix_needs_gate(chunks, live_positions) != needs_gate:
             raise _err(f"{where}: conflict — 知識庫的 gate schema 在計算期間改變了",
                        code="conflict")
 

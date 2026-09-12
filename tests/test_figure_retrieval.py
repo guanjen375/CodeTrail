@@ -53,6 +53,7 @@ import config
 import context_signals
 import figure_extract
 import figure_extract as fx
+import kb_cache
 import knowledge
 from knowledge import KnowledgeBase
 from tests._harness import import_mcp_module, tool_fn
@@ -281,8 +282,7 @@ def _write_kb(tmp_path: Path, chunks: list) -> Path:
 
     rows = np.array([c["embedding"] for c in chunks], dtype=np.float32)
     norms = np.linalg.norm(rows, axis=1, keepdims=True)
-    np.savez(
-        tmp_path / config.KNOWLEDGE_EMB_FILE,
+    payload = dict(
         embeddings=rows / np.where(norms > 0, norms, 1.0),
         embedding_model=config.EMBEDDING_MODEL,
         embedding_dimension=len(chunks[0]["embedding"]),
@@ -290,6 +290,25 @@ def _write_kb(tmp_path: Path, chunks: list) -> Path:
         content_hash=context_signals.chunks_content_hash(plain, schema=schema),
         content_hash_schema=schema,
         store_generation=generation,
+    )
+    # Persisted caches now require section rows even when all chunks are
+    # structured figures (the valid section matrix then has zero rows).
+    import RAG
+
+    dimension = len(chunks[0]["embedding"])
+
+    def embed_windows(windows, **_kwargs):
+        for window in windows:
+            window["embedding"] = [1.0] + [0.0] * (dimension - 1)
+        return windows
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(RAG, "generate_embeddings", embed_windows)
+        prepared = kb_cache.prepare_sections(plain, cache_dir=tmp_path)
+    payload.update(kb_cache.section_fields(plain, prepared, dimension=dimension))
+    np.savez(
+        tmp_path / config.KNOWLEDGE_EMB_FILE,
+        **kb_cache.npz_fields(payload, kb_cache.chunk_row_ids(plain)),
     )
     return json_path
 

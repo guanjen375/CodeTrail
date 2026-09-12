@@ -36,6 +36,7 @@ import pytest
 import code_rag
 import config
 import context_signals
+import kb_cache
 import knowledge
 import RAG
 import utils
@@ -609,8 +610,29 @@ def _write_kb(
             ),
             gate_content_hash_schema=context_signals.GATE_SCHEMA,
         )
-    np.savez_compressed(tmp_path / config.KNOWLEDGE_EMB_FILE, **payload)
+    payload.update(kb_cache.section_fields(
+        plain, _offline_sections(tmp_path, chunks),
+        dimension=len(chunks[0]["embedding"]),
+    ))
+    np.savez_compressed(
+        tmp_path / config.KNOWLEDGE_EMB_FILE,
+        **kb_cache.npz_fields(payload, kb_cache.chunk_row_ids(plain)),
+    )
     return json_path
+
+
+def _offline_sections(tmp_path: Path, chunks: list[dict]):
+    """Prepare every real section window with synthetic, local fixture vectors."""
+    dimension = len(chunks[0]["embedding"])
+
+    def embed_windows(windows, **_kwargs):
+        for window in windows:
+            window["embedding"] = [1.0] + [0.0] * (dimension - 1)
+        return windows
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(RAG, "generate_embeddings", embed_windows)
+        return kb_cache.prepare_sections(chunks, cache_dir=tmp_path)
 
 
 # ============================================================
@@ -687,7 +709,10 @@ def test_save_writes_both_matrices_under_one_generation(tmp_path: Path, monkeypa
         ],
     }
 
-    RAG.save_knowledge_base(kb, tmp_path / config.KNOWLEDGE_FILE)
+    RAG.save_knowledge_base(
+        kb, tmp_path / config.KNOWLEDGE_FILE,
+        prepared_sections=_offline_sections(tmp_path, kb["chunks"]),
+    )
 
     with np.load(_cache_npz(tmp_path), allow_pickle=False) as data:
         assert "embeddings_gate" in data.files
@@ -708,7 +733,10 @@ def test_json_never_carries_any_vector(tmp_path: Path, monkeypatch):
         "chunks": [_chunk("a", "原文", ctx=CTX_TEXT, embedding=[1.0, 0.0], gate=[0.0, 1.0])],
     }
 
-    RAG.save_knowledge_base(kb, tmp_path / config.KNOWLEDGE_FILE)
+    RAG.save_knowledge_base(
+        kb, tmp_path / config.KNOWLEDGE_FILE,
+        prepared_sections=_offline_sections(tmp_path, kb["chunks"]),
+    )
 
     payload = json.loads((tmp_path / config.KNOWLEDGE_FILE).read_text(encoding="utf-8"))
     for chunk in payload["chunks"]:
@@ -724,7 +752,10 @@ def test_kb_without_ctx_stays_single_matrix_and_legacy_schema(tmp_path: Path, mo
         "chunks": [_chunk("a", "原文", embedding=[1.0, 0.0])],
     }
 
-    RAG.save_knowledge_base(kb, tmp_path / config.KNOWLEDGE_FILE)
+    RAG.save_knowledge_base(
+        kb, tmp_path / config.KNOWLEDGE_FILE,
+        prepared_sections=_offline_sections(tmp_path, kb["chunks"]),
+    )
 
     with np.load(_cache_npz(tmp_path), allow_pickle=False) as data:
         assert "embeddings_gate" not in data.files
@@ -810,7 +841,9 @@ def test_remove_document_keeps_both_matrices_in_sync(tmp_path: Path, monkeypatch
         ],
     }
     path = tmp_path / config.KNOWLEDGE_FILE
-    RAG.save_knowledge_base(kb, path)
+    RAG.save_knowledge_base(
+        kb, path, prepared_sections=_offline_sections(tmp_path, kb["chunks"]),
+    )
 
     RAG.remove_document_from_knowledge_base(path, "drop.md")
 

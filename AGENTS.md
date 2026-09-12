@@ -185,6 +185,20 @@
   tool-call canary 的快取檔名帶 schema 號,兩世代各記各的、不再互相清空。
 - `kb_cache` 的 embeddings 身分驗證（逐列 chunk id / generation / 內容雜湊 / model）
   與「重建不了就 fail-loud、絕不沿用舊向量」——放寬它就是靜默錯答
+- `section_index` / `kb_cache` 的章節召回——節點只從持久化 chunks 重建，
+  不重解析舊 PDF；title + 全文分窗涵蓋長節尾巴，同 NPZ 的 schema／model／generation／
+  逐節身分／全文與成員 hash 全驗，缺失或重建失敗不得沿用。figure 只當展開成員，
+  修圖不改節點文字向量；新向量在 store lock 外準備。`knowledge` 展開全節後去重，
+  每個 chunk 的 section RRF 項只加一次，node 分數只能召回，不能進 gate／strict／
+  決策門檻；所有通過各自 gate 的成員都進本地 reranker，不在評分前截掉長節尾巴。
+- `mineru_lane` 的來源與 owner——成對的本地 content_list + 生成時 PDF SHA-256，
+  兩檔 sandbox／dir-fd／O_NOFOLLOW／有界普通檔讀，解析與提交前重驗；明示壞產物
+  不得改走 native。頁碼唯一轉 page_idx+1，text_level 是唯一標題來源，圖面標題
+  以 page+bbox 配對，不能套 native raw offset。文字／code／terminal 只收一份；
+  表格只用唯一已收錄的 structured owner，缺失／歧義不得靜默吞內容。code 與樹狀
+  文字逐字保留，原始 JSON／頁文與缺席／品質證據保留，不讀 img_path、不啟動 MinerU。
+  OCR 文字標示 lane，strict 排除且列 excluded_text；OCR figure 標題／caption
+  只進召回向量與 BM25，不進 gate，人工修圖後仍保留來源與獨立 gate。
 - `knowledge_store` 的文件身分驗證（`metadata["document_sources"]`）與
   `DocumentIdentityConflict`——KB 用 basename 當文件識別，所以 `a/spec.pdf` 與
   `b/spec.pdf` 是同一個身分；拿掉這道閘，後灌的那份會把前一份整份換掉，訊息

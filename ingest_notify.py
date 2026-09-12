@@ -16,6 +16,7 @@ stdout。父行程若自己去掃整個 KB 來推「這次有沒有待覆核」�
 from __future__ import annotations
 
 import json
+import re
 
 # --- 凍結的字面字串（客戶端以「精確比對」認這幾個字串）-------------
 SUMMARY_PREFIX = "[CODETRAIL_INGEST_SUMMARY]"
@@ -228,6 +229,26 @@ def normalize_payload(payload: object) -> dict:
     if isinstance(coverage, dict) and coverage.get("scope") == "detected_regions":
         result["coverage"] = {"scope": "detected_regions", **{
             name: max(0, _as_int(coverage.get(name))) for name in _COVERAGE_COUNTS}}
+    mineru = source.get("mineru")
+    if source.get("text_lane") == "mineru" and isinstance(mineru, dict):
+        page_count = max(0, _as_int(mineru.get("page_count")))
+        raw_missing = mineru.get("missing_pages", [])
+        missing = sorted({page for page in raw_missing
+                          if type(page) is int and 1 <= page <= page_count}) \
+            if isinstance(raw_missing, list) else []
+        result["text_lane"] = "mineru"
+        result["mineru"] = {
+            "page_count": page_count,
+            "readable_page_count": min(page_count, max(0, _as_int(mineru.get("readable_page_count")))),
+            "missing_pages": missing[:MAX_PAYLOAD_ITEMS],
+            "missing_total": min(page_count, max(len(missing), _as_int(mineru.get("missing_total")))),
+            # OCR cannot certify itself. No producer value can promote trust.
+            "ocr_verification": "unverified",
+        }
+        for name in ("source_sha256", "content_list_sha256"):
+            digest = mineru.get(name)
+            if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+                result["mineru"][name] = digest
     for list_key, total_key in _LIST_KEYS:
         raw = source.get(list_key)
         items = [_clean_item(item) for item in raw] if isinstance(raw, list) else []
@@ -244,6 +265,22 @@ def normalize_payload(payload: object) -> dict:
         _as_int(absent_total) if absent_total is not None else len(absent))
     result[ABSENT_KEY] = absent[:MAX_PAYLOAD_ITEMS]
     return result
+
+
+def render_text_lane(payload: dict) -> list[str]:
+    """Keep explicit OCR scope outside the truncatable subprocess progress log."""
+    data = normalize_payload(payload)
+    if data.get("text_lane") != "mineru":
+        return []
+    lane = data["mineru"]
+    lines = [f"[MinerU] 文字 lane：{lane['readable_page_count']}/{lane['page_count']} 頁有可讀文字；"
+             "OCR 未獨立驗證，strict 排除這些文字。"]
+    if lane["missing_total"]:
+        shown = lane["missing_pages"][:MAX_LISTED_ITEMS]
+        remaining = lane["missing_total"] - len(shown)
+        tail = f"（另有 {remaining} 頁未列出）" if remaining else ""
+        lines.append("[MinerU] 產物未表示頁碼：" + ", ".join(map(str, shown)) + tail)
+    return lines
 
 
 def format_summary_line(payload: dict) -> str:

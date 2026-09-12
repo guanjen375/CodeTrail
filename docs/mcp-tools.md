@@ -55,7 +55,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=None)` | 讀檔案內容；省略 max_chars 時依 n_ctx 配置，長檔依結果的精確 start_line 分段 |
 | 文件/外部檔案 | `import_external_file(path, dest_name=None)` | 把允許來源的外部檔案複製進 `.aicode_uploads/` |
 | 文件/外部檔案 | `analyze_file(path, view="summary", target="", limit=0)` | 用 VL 分析各類圖片、一次性抽 PDF 文字（不入 KB）、分析 ELF 或 firmware blob。ELF 預設給總覽；`view` 可切到 `symbols` / `disasm` / `dwarf` / `strings` / `sections` / `memmap` / `relocs` / `imports` / `dynamic` / `headers`，`target` 指定 symbol、0x 位址、regex 或 `key:value` 篩選，`limit` 控制筆數（上限 5000）；單次輸出上限 25,000 字元，截斷會指出該用哪個 view 縮小範圍。缺 pyelftools 時退回 readelf 文字解析並在報告開頭明列缺失能力；細節見[analyze_file 的 ELF 視角](#analyze_file-的-elf-視角) |
-| 文件/外部檔案 | `ingest_document(path, mode="auto", preflight_only=False, fresh=False)` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document`。PDF 的原生表格 / 向量文字 log 與純 raster 截圖、掃描頁、方塊圖都走結構化抽取；raster 會先分類為 table / terminal / prose / diagram，再帶 canonical payload、證據、品質與驗證狀態。**單張抽壞只讓那一張缺席**（其餘 figure 與全部文字 chunk 照常入庫，結果會列出是哪幾張，`review_figures(action="list")` 看得到 `in_kb=false`）；整份零寫入的是 VL 連不上／逾時、預算超限、capability probe 未過、來源檔中途被換掉這類契約破裂。`preflight_only=True` 只估成本、零寫入（僅 .pdf）。`fresh=True` 一步到位重建：清空既有 chunks、讓舊 embeddings cache 失效、只留這一份文件（同一次原子提交，失敗全回滾）。**不會為了 reset 去整批清除** `.codetrail/figures/`（ingest 本來就會寫入這一次的 run，提交後也可能依 retention 回收該文件沒被 KB 引用的舊 run — 那與 fresh 無關）。同一份文件再 ingest 時人工修正會沿用；但**被移出 KB 的其他文件之後重新 ingest 不會自動恢復人工確認**（revision 退回 1）。不可與 `preflight_only` 併用。**執行期間 server 不會被卡住**：跑在 worker thread、每 2 秒送一次零內容的 MCP progress；同一時間所有 KB 工具與第二個 ingest 會立刻回「稍後重試」（不排隊）。結果的標頭下會帶這一次 run 的待辦（`[CODETRAIL_ACTION_REQUIRED]`：待人工判斷 / 需修復或品質排除 / 無法覆核 / 抽取失敗 / 可行動缺席，各附下一步；沒有待辦就完全不印），逾時、非零 exit 或輸出不完整則帶 `[CODETRAIL_INGEST_FAILED]` 並回 `status: error` |
+| 文件/外部檔案 | `ingest_document(path, mode="auto", preflight_only=False, fresh=False, mineru_content_list=None, mineru_pdf_sha256=None)` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document`。PDF 的原生表格 / 向量文字 log 與純 raster 截圖、掃描頁、方塊圖都走結構化抽取；raster 會先分類為 table / terminal / prose / diagram，再帶 canonical payload、證據、品質與驗證狀態。**單張抽壞只讓那一張缺席**（其餘 figure 與全部文字 chunk 照常入庫，結果會列出是哪幾張，`review_figures(action="list")` 看得到 `in_kb=false`）；整份零寫入的是 VL 連不上／逾時、預算超限、capability probe 未過、來源檔中途被換掉這類契約破裂。`preflight_only=True` 只估成本、零寫入（僅 .pdf）。`fresh=True` 一步到位重建：清空既有 chunks、讓舊 embeddings cache 失效、只留這一份文件（同一次原子提交，失敗全回滾）。**不會為了 reset 去整批清除** `.codetrail/figures/`（ingest 本來就會寫入這一次的 run，提交後也可能依 retention 回收該文件沒被 KB 引用的舊 run — 那與 fresh 無關）。同一份文件再 ingest 時人工修正會沿用；但**被移出 KB 的其他文件之後重新 ingest 不會自動恢復人工確認**（revision 退回 1）。不可與 `preflight_only` 併用。**執行期間 server 不會被卡住**：跑在 worker thread、每 2 秒送一次零內容的 MCP progress；同一時間所有 KB 工具與第二個 ingest 會立刻回「稍後重試」（不排隊）。結果的標頭下會帶這一次 run 的待辦（`[CODETRAIL_ACTION_REQUIRED]`：待人工判斷 / 需修復或品質排除 / 無法覆核 / 抽取失敗 / 可行動缺席，各附下一步；沒有待辦就完全不印），逾時、非零 exit 或輸出不完整則帶 `[CODETRAIL_INGEST_FAILED]` 並回 `status: error` |
 | 文件/外部檔案 | `review_figures(action="list", document_id="", figure_id="", expected_revision=0, payload_json="", confirm_against_image=False)` | 覆核 PDF 結構化抽取的表格 / 終端機 log / diagram：`list` 唯讀列出 figure_id、頁碼、bbox、kind、驗證狀態、品質、人工確認狀態、處置、原因、原圖路徑與 canonical payload；`fix` 只收該 kind schema 的 structured payload + `expected_revision`，`confirm_against_image=True` 才升 `human_verified`。permission 設 `ask` |
 | 文件/外部檔案 | `remove_document(source)` | 從 KB 移除過期文件 |
 | 文件/外部檔案 | `reload_knowledge_base()` | 立即載入 KB 並回報 chunk 數（查詢本身會自動偵測變更，這是「馬上確認」用） |
@@ -268,6 +268,46 @@ native lane(原生表格,零 VL 呼叫)**沒有任何模型影像輸入**,它的
 實際份數可能更多。**不要拿它當 NDA 影像份數的保證**;要確定清掉就顯式刪除對應目錄並確認結果。
 手動清除方式與後果見
 [RAG、附件與知識庫操作](rag.md#pdf-內的表格與終端機畫面結構化抽取--人工覆核)。
+
+### 本地 MinerU 文字 lane
+
+已有本地 MinerU 產物時，PDF 可選用其文字閱讀順序與 `text_level` 標題。
+先在產物生成時記下 PDF SHA-256，保留對應的 flat `content_list.json`，再把兩份檔案
+放進專案沙箱。只接受官方 legacy flat list；v2 巢狀格式不猜轉換。
+
+```text
+請用 ingest_document 匯入 docs/spec.pdf，
+mineru_content_list 設 docs/mineru/content_list.json，
+mineru_pdf_sha256 設產物生成時記錄的 64 位 SHA-256。
+```
+
+CLI 同樣需要成對參數，也適用單份 PDF 的 `rebuild`：
+
+```bash
+python3 RAG.py docs/spec.pdf knowledge.json \
+  --mineru-content-list docs/mineru/content_list.json \
+  --mineru-pdf-sha256 <產物生成時記錄的SHA256>
+```
+
+可加 `--preflight` 只驗來源與估算既有 figure lane 成本，零 KB／VL／embedding 寫入。
+不提供 MinerU 參數就維持 native 文字流程；明示的產物缺漏、錯版、SHA 不符或途中換檔
+都會失敗，不自動換 lane。不讀產物裡的 `img_path`，也不啟動或下載 MinerU，沒有雲端路徑。
+
+一份文件只認 MinerU 的標題來源，頁碼為 `page_idx + 1`，缺頁保留原頁號並揭露。
+圖表的章節以 page + bbox 配對；幾何不唯一時不猜標題。文字／code／terminal 由 MinerU
+提供，既有 prose／terminal 圖面保留 artifact 與品質問題，不重複成另一份 KB 文字。
+表格和 diagram 仍由既有 structured lane 收錄；MinerU 的 HTML 表格不再另建 chunk。
+找不到唯一且已收錄的表格 owner、或正文與圖表無法安全分開時整份失敗，可省略 MinerU
+參數改用 native lane。
+
+MinerU 文字未獨立驗證。`query_knowledge` 的 REF 顯示 `text_lane=mineru`；
+`query_knowledge_strict` 排除這些文字並用 `metadata.excluded_text` 列來源、頁碼與原因。
+它不提高任何 figure 的驗證／品質，也不代表全 PDF OCR 完成。
+
+章節召回與 chunk 召回以 RRF 合併。命中節點會把整節 chunk 加入候選並去重，
+通過各自證據門檻的成員全數送進本地 reranker；最後仍受 top-k 與 REF 預算限制。
+節點分數不作 strict 證據，且不替代 chunk 層。舊 KB 的節點從現有 chunk metadata／正文
+重建，無須重解析 PDF；新 schema 的 cache 重算需本地 embedding server，失敗就停止。
 
 ### `analyze_file` 的 ELF 視角
 

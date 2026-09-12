@@ -2117,7 +2117,7 @@ def test_catalog_and_ingest_schema_are_unchanged(monkeypatch, mcp_root):
     ingest = next(tool for tool in tools if tool.name == "ingest_document")
     # ctx 是 FastMCP 注入用的,不得出現在模型看得到的 schema 裡
     assert sorted(ingest.inputSchema["properties"]) == [
-        "fresh", "mode", "path", "preflight_only",
+        "fresh", "mineru_content_list", "mineru_pdf_sha256", "mode", "path", "preflight_only",
     ]
     assert ingest.inputSchema.get("required") == ["path"]
     assert ingest.outputSchema is None

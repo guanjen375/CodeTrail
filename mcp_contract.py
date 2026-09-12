@@ -94,7 +94,8 @@ MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
     "ingest_document": (
         "Add a sandboxed document/image/binary to knowledge.json. PDF preflight_only=true estimates cost with zero KB writes; fresh=true "
-        "rebuilds the KB and cannot be combined with preflight. Query tools auto-reload after success. This call can run for minutes; "
+        "rebuilds the KB and cannot be combined with preflight. For local MinerU PDF text, provide both mineru_content_list and the "
+        "PDF digest recorded at generation in mineru_pdf_sha256; strict excludes unverified OCR text. Query tools auto-reload after success. This call can run for minutes; "
         "knowledge-base tools and a second ingest report busy until it finishes, so wait for this result instead of retrying. When the "
         "result contains [CODETRAIL_ACTION_REQUIRED], report the listed figures and their next step instead of calling it done."
     ),

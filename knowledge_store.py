@@ -294,8 +294,9 @@ def _write_npz_temp(
     gate_rows: list[list[float]] | None = None,
     gate_content_hash: str = "",
     gate_content_hash_schema: str = "",
+    section_fields: Mapping | None = None,
 ):
-    """Stage the NPZ.  Both matrices live in one file, so publishing is one rename.
+    """Stage all row spaces in one NPZ, so publishing is one rename.
 
     `embeddings` 是 retrieval 訊號(可能含生成脈絡),`embeddings_gate` 是
     content-only 的決策訊號。兩組各帶自己的 schema / hash / 維度 / 列數,
@@ -342,6 +343,10 @@ def _write_npz_temp(
             gate_content_hash=gate_content_hash,
             gate_content_hash_schema=gate_content_hash_schema,
         )
+    if section_fields is not None:
+        # Already validated against the exact JSON chunks by the public
+        # writer.  All three row spaces share this one generation/rename.
+        payload.update(section_fields)
 
     if dir_fd is not None:
         # 持有已驗證目錄 fd 的版本：staging 也一律相對操作，不留任何用路徑
@@ -559,6 +564,7 @@ def save_knowledge_store_atomic(
     legacy_companion: Path | None = None,
     gate_content_hash: str | None = None,
     gate_content_hash_schema: str | None = None,
+    section_fields: Mapping | None = None,
     already_locked: bool = False,
 ) -> tuple[Path, Path | None]:
     """Atomically publish a validated JSON/NPZ pair.
@@ -583,6 +589,10 @@ def save_knowledge_store_atomic(
     check-then-use:`.codetrail` 在檢查之後被換成指向 sandbox 外的 symlink,
     NDA 向量就寫到外面去了。持有 fd 等於釘住驗過的 inode,路徑之後怎麼換都
     影響不到這裡。沒給就走舊的 path-based 版本(其他呼叫端與測試不受影響)。
+
+    ``section_fields`` 是鎖外已準備好的章節矩陣與身分；本層只驗證、從不計算
+    embedding。None 保留直接低階 caller 明示寫舊格式的能力，載入端仍會把
+    缺 section schema 的 cache 判 stale，不會因這個 optional 參數放寬驗證。
     """
     json_path = Path(json_path)
     emb_path = json_path.parent / Path(embedding_file)
@@ -598,6 +608,16 @@ def save_knowledge_store_atomic(
                 "gate embedding dimension does not match the retrieval matrix: "
                 f"{gate_dimension} vs {dimension}"
             )
+    if section_fields is not None:
+        import kb_cache
+
+        section_fields = copy.deepcopy(dict(section_fields))
+        if set(section_fields) != set(kb_cache.SECTION_NPZ_FIELDS):
+            raise KnowledgeStoreError("section fields must contain exactly the section cache schema")
+        reason = kb_cache._verify_section_fields(
+            section_fields, chunks=chunks, dimension=dimension or 0)
+        if reason:
+            raise KnowledgeStoreError(reason)
     generation = uuid.uuid4().hex
 
     metadata = copy.deepcopy(kb.get("metadata", {}))
@@ -669,6 +689,7 @@ def save_knowledge_store_atomic(
                         gate_rows=gate_rows,
                         gate_content_hash=gate_content_hash or "",
                         gate_content_hash_schema=gate_content_hash_schema or "",
+                        section_fields=section_fields,
                     )
 
                 json_backup = _backup_link(json_path, generation)

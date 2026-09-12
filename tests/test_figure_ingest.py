@@ -1993,16 +1993,30 @@ def test_concurrent_human_fix_is_not_overwritten(tmp_path: Path, monkeypatch):
     pdf, harness, _fid = _simple_native_case(tmp_path, monkeypatch)
     kb_path, _store = _seed_human_verified_kb(
         monkeypatch, tmp_path, harness, asset_digest="asset", revision=3)
+    # Legacy inline fixtures now need the same section cache as real writers.
+    # Finish that migration before arming the concurrent-fix event: the event
+    # must happen after carry-over, not during the initial cache preparation.
+    RAG.load_knowledge_base(kb_path, _quiet=True)
     original = RAG.generate_embeddings
+    interleaved = False
 
     def _interleave(chunks, cache_dir=None, **kwargs):
-        # 另一個「行程」在我們算 embedding 時完成了 review_figures fix
-        data = json.loads(kb_path.read_text(encoding="utf-8"))
-        for chunk in data["chunks"]:
-            if chunk.get("structured"):
-                chunk["revision"] = 4
-                chunk["content"] = "更新的人工確認內容"
-        kb_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        nonlocal interleaved
+        if not interleaved:
+            interleaved = True
+            # A real figure writer atomically publishes JSON and NPZ together.
+            # A JSON-only overwrite tests corrupt-cache rejection instead of
+            # the human-revision conflict this regression is intended to guard.
+            with RAG.knowledge_store_lock(kb_path, exclusive=True):
+                data = RAG.load_knowledge_base(kb_path, _already_locked=True, _quiet=True)
+                for chunk in data["chunks"]:
+                    if chunk.get("structured"):
+                        chunk["revision"] = 4
+                        chunk["content"] = "更新的人工確認內容"
+                        chunk["id"] = RAG.chunk_id(chunk)
+                        # The offline embed_one above returns this same vector.
+                        chunk["embedding"] = [1.0, 0.0]
+                RAG.save_knowledge_base(data, kb_path, _already_locked=True)
         return original(chunks, cache_dir, **kwargs)
 
     monkeypatch.setattr(RAG, "generate_embeddings", _interleave)
