@@ -25,6 +25,7 @@ from deployment_profile import (  # noqa: E402
     loader_kwargs,
 )
 from deployment_status import query_gpu_processes  # noqa: E402
+from runtime_dependencies import DependencyError  # noqa: E402
 
 # tmux kill-session(SIGHUP)只是「開始停止」:llama-server 退出前要先釋放
 # host buffer(--no-mmap / --cpu-moe 的主模型是幾十~上百 GB),這段期間
@@ -70,13 +71,16 @@ def _pane_pids(session: str) -> dict[int, str]:
         check=False,
     )
     if proc.returncode != 0:
-        return {}
+        raise DependencyError(f"tmux list-panes 無法取得待停止的 PID: {(proc.stderr or proc.stdout).strip()}")
     tracked: dict[int, str] = {}
     for line in proc.stdout.splitlines():
         parts = line.split(maxsplit=1)
-        if parts and parts[0].isdecimal():
-            window = parts[1].strip() if len(parts) > 1 else "?"
-            tracked[int(parts[0])] = f"{session}:{window}"
+        if not parts or not parts[0].isdecimal() or int(parts[0]) <= 0:
+            raise DependencyError("tmux list-panes 的 PID 回應格式無效，無法驗證停止範圍。")
+        window = parts[1].strip() if len(parts) > 1 else "?"
+        tracked[int(parts[0])] = f"{session}:{window}"
+    if not tracked:
+        raise DependencyError("tmux list-panes 沒有回報 PID，無法驗證停止範圍。")
     return tracked
 
 
@@ -84,11 +88,15 @@ def _proc_state(pid: int) -> str:
     """'' = process 已消失;'Z' = zombie(已死待回收,收不到訊號);其他 = 存活。"""
     try:
         stat = (Path("/proc") / str(pid) / "stat").read_text()
-    except OSError:
+    except FileNotFoundError:
         return ""
+    except OSError as exc:
+        raise DependencyError(f"無法讀取 /proc/{pid}/stat，不能確認 process 已結束: {exc}") from exc
     _, _, tail = stat.rpartition(")")  # comm 可含空白/括號,取最後一個 ')' 之後
     fields = tail.split()
-    return fields[0] if fields else ""
+    if not fields or len(fields[0]) != 1 or fields[0] not in "RSDZTtXxKWPI":
+        raise DependencyError(f"/proc/{pid}/stat 格式無效，不能確認 process 已結束。")
+    return fields[0]
 
 
 def _is_llama_pid(pid: int) -> bool:
@@ -100,23 +108,26 @@ def _is_llama_pid(pid: int) -> bool:
     return bool(args) and Path(args[0]).name.startswith("llama-server")
 
 
-def _gpu_compute_pids() -> set[int] | None:
-    """nvidia-smi compute list 上的所有 PID(= VRAM 尚未釋放)。None = 查不到。
+def _gpu_compute_pids() -> set[int]:
+    """nvidia-smi compute list 上的所有 PID(= VRAM 尚未釋放)；觀測失敗即報錯。
 
     刻意不濾 process 名稱:zombie 的 /proc/<pid>/cmdline 讀不到,nvidia-smi
     的 process_name 會變空/不可辨識,按名稱過濾會把「還佔著 VRAM 的殭屍」
     誤判成已釋放(實測 GLM-5.2 的殭屍期長達 ~19s)。判斷歸屬用「pid 是否
     在 tracked 裡」就夠了。"""
     if not shutil.which("nvidia-smi"):
-        return None
-    proc = process_env.run(
-        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+        raise DependencyError("需要 nvidia-smi 才能驗證 VRAM 釋放；請安裝或修復 NVIDIA 驅動。")
+    try:
+        proc = process_env.run(
+            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+    except (OSError, process_env.TimeoutExpired) as exc:
+        raise DependencyError(f"nvidia-smi 無法驗證 VRAM 釋放: {exc}") from exc
     if proc.returncode != 0:
-        return None
+        raise DependencyError(f"nvidia-smi 無法驗證 VRAM 釋放: {proc.stderr.strip()}")
+    if any(not token.isdecimal() for token in proc.stdout.split()):
+        raise DependencyError("nvidia-smi PID 回應格式無效，無法驗證 VRAM 釋放。")
     return {int(token) for token in proc.stdout.split() if token.isdecimal()}
 
 
@@ -157,16 +168,35 @@ def _wait_released(
     deadline = start + timeout
     next_report = start + _PROGRESS_EVERY
     signalled: dict[int, set[int]] = {signal.SIGTERM: set(), signal.SIGKILL: set()}
+    if not tracked:
+        return []
     while True:
-        alive = {pid for pid in tracked if _proc_state(pid) not in ("", "Z")}
-        gpu = _gpu_compute_pids()
+        alive = set()
+        process_error = None
+        for pid in tracked:
+            try:
+                if _proc_state(pid) not in ("", "Z"):
+                    alive.add(pid)
+            except DependencyError as exc:
+                # 未知狀態不可當退出；保留待處理並繼續其他 PID 的安全清理。
+                alive.add(pid)
+                process_error = exc
+        gpu_error = None
+        try:
+            gpu = _gpu_compute_pids()
+        except DependencyError as exc:
+            gpu, gpu_error = None, exc
         holding = set(alive)
         if gpu is not None:
             holding |= {pid for pid in tracked if pid in gpu}
         if not holding:
+            if gpu is None:
+                raise gpu_error or DependencyError("nvidia-smi 無法觀測，不能確認 VRAM 已釋放。")
             return []
         now = clock()
         if now >= deadline:
+            if process_error is not None:
+                raise process_error
             return sorted(holding)
         for sig, after in ((signal.SIGTERM, _TERM_AFTER), (signal.SIGKILL, _KILL_AFTER)):
             if now - start < after:
@@ -194,15 +224,20 @@ def _wait_released(
         sleep(0.5)
 
 
-def _listener_pids(port: int) -> set[int] | None:
+def _listener_pids(port: int) -> set[int]:
     if not shutil.which("ss"):
-        return None
-    proc = process_env.run(
-        ["ss", "-H", "-ltnp", f"sport = :{port}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+        raise DependencyError("需要 ss 才能驗證 listener 已關閉；請安裝 iproute2。")
+    try:
+        proc = process_env.run(
+            ["ss", "-H", "-ltnp", f"sport = :{port}"],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+    except (OSError, process_env.TimeoutExpired) as exc:
+        raise DependencyError(f"ss 無法檢查 port {port}: {exc}；請修復 iproute2。") from exc
+    if proc.returncode != 0:
+        raise DependencyError(f"ss 無法檢查 port {port}: {proc.stderr.strip()}")
+    if any(not re.search(r"pid=([0-9]+)", line) for line in proc.stdout.splitlines() if line.strip()):
+        raise DependencyError(f"ss 沒有回報 port {port} 的 listener PID，無法確認歸屬。")
     return {int(value) for value in re.findall(r"pid=([0-9]+)", proc.stdout)}
 
 
@@ -255,27 +290,48 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
 
+    verification_failed = False
     tracked: dict[int, str] = {}
     if shutil.which("tmux"):
         for session in _sessions(args.scope, args):
-            exists = process_env.run(
-                ["tmux", "has-session", "-t", session],
-                stdout=process_env.DEVNULL,
-                stderr=process_env.DEVNULL,
-                check=False,
-            ).returncode == 0
-            if exists:
-                # 先記 pane PID 再 kill:kill 之後就查不到「該等誰退出」了。
-                tracked.update(_pane_pids(session))
-                kill = process_env.run(
-                    ["tmux", "kill-session", "-t", session],
-                    capture_output=True,
-                    text=True,
+            try:
+                probe = process_env.run(
+                    ["tmux", "has-session", "-t", session],
+                    stdout=process_env.DEVNULL,
+                    stderr=process_env.DEVNULL,
                     check=False,
                 )
+            except (OSError, process_env.TimeoutExpired) as exc:
+                verification_failed = True
+                print(f"ERROR: tmux 無法查詢 session {session!r}: {exc}；請修復 tmux。", file=sys.stderr)
+                continue
+            if probe.returncode not in (0, 1):
+                verification_failed = True
+                print(f"ERROR: tmux has-session 失敗(exit={probe.returncode})；請修復 tmux。", file=sys.stderr)
+                continue
+            exists = probe.returncode == 0
+            if exists:
+                # 先記 pane PID 再 kill:kill 之後就查不到「該等誰退出」了。
+                try:
+                    tracked.update(_pane_pids(session))
+                except (DependencyError, OSError) as exc:
+                    verification_failed = True
+                    print(f"ERROR: {exc}", file=sys.stderr)
+                try:
+                    kill = process_env.run(
+                        ["tmux", "kill-session", "-t", session],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                except (OSError, process_env.TimeoutExpired) as exc:
+                    verification_failed = True
+                    print(f"ERROR: tmux 無法停止 session {session!r}: {exc}；請修復 tmux。", file=sys.stderr)
+                    continue
                 if kill.returncode == 0:
                     print(f"[+] stopped tmux session {session!r}")
                 else:
+                    verification_failed = True
                     print(
                         f"[!] could not kill tmux session {session!r}: "
                         f"{(kill.stderr or kill.stdout).strip()}",
@@ -284,13 +340,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 print(f"[!] tmux session {session!r} does not exist")
     else:
-        print("[!] tmux not found; checking profile ports only", file=sys.stderr)
+        verification_failed = True
+        print("ERROR: tmux 不可用，無法停止指定 session；請安裝或修復 tmux。仍檢查 profile ports。", file=sys.stderr)
 
     timeout = args.timeout
     stuck: list[int] = []
     if tracked:
         started = time.monotonic()
-        stuck = _wait_released(tracked, timeout=timeout)
+        release_verified = True
+        try:
+            stuck = _wait_released(tracked, timeout=timeout)
+        except DependencyError as exc:
+            verification_failed = True
+            release_verified = False
+            print(f"ERROR: {exc}", file=sys.stderr)
         if stuck:
             names = "、".join(f"{tracked[pid]}(PID={pid})" for pid in stuck)
             print(
@@ -299,7 +362,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "(等待上限可用 --timeout 調整)",
                 file=sys.stderr,
             )
-        else:
+        elif release_verified:
             print(f"[+] llama-server 已全部結束(等待 {time.monotonic() - started:.1f}s)")
 
     # port 檢查放在等待之後:垂死中的 listener 不會再誤報「rerun with --force」。
@@ -307,9 +370,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         forced: dict[int, str] = {}
         for role in _roles(args.scope):
             service = profile.service(role)
-            pids = _listener_pids(service.port)
-            if pids is None:
-                print(f"[!] cannot inspect {role} port {service.port}: ss is not available", file=sys.stderr)
+            try:
+                pids = _listener_pids(service.port)
+                if pids is None:
+                    raise DependencyError(f"ss 無法驗證 {role} port {service.port}。")
+            except DependencyError as exc:
+                verification_failed = True
+                print(f"ERROR: {exc}", file=sys.stderr)
                 continue
             if not pids:
                 print(f"[+] {role} port {service.port} is free ({service.base_url})")
@@ -346,7 +413,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
         if forced:
             # --force 的孤兒同樣等到退出+VRAM 釋放,不然一樣「清不乾淨」。
-            stuck_forced = _wait_released(forced, timeout=timeout)
+            try:
+                stuck_forced = _wait_released(forced, timeout=timeout)
+            except DependencyError as exc:
+                verification_failed = True
+                print(f"ERROR: {exc}", file=sys.stderr)
+                stuck_forced = sorted(forced)
             if stuck_forced:
                 names = "、".join(f"{forced[pid]}(PID={pid})" for pid in stuck_forced)
                 print(f"[!] 孤兒 process {timeout}s 內仍未釋放:{names}", file=sys.stderr)
@@ -359,6 +431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.scope == "all" and shutil.which("nvidia-smi"):
         rows, gpu_error = query_gpu_processes()
         if gpu_error:
+            verification_failed = True
             print(f"[!] 無法盤點 GPU process(nvidia-smi:{gpu_error})", file=sys.stderr)
         elif rows:
             detail = "、".join(f"PID={row.pid}({row.used_gpu_memory}MiB)" for row in rows)
@@ -372,7 +445,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if stuck:
         return 1
-    return 1 if profile_error else 0
+    return 1 if profile_error or verification_failed else 0
 
 
 if __name__ == "__main__":

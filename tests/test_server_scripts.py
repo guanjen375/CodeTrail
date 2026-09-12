@@ -912,19 +912,17 @@ def test_wait_released_never_signals_reused_pid(monkeypatch):
     assert kills == []
 
 
-def test_wait_released_without_nvidia_smi_waits_on_process_exit(monkeypatch):
-    """查不到 GPU(無 nvidia-smi)→ 至少等到 process 消失。"""
+def test_wait_released_without_nvidia_smi_waits_then_reports_unverified_release(monkeypatch):
+    """繼續等待已開始的安全清理，但不能以 process 消失宣告 VRAM 已釋放。"""
+    from runtime_dependencies import DependencyError
+
     clock = _Clock()
-    monkeypatch.setattr(
-        stop_servers, "_proc_state", lambda pid: "S" if clock.now < 3 else ""
-    )
+    monkeypatch.setattr(stop_servers, "_proc_state", lambda pid: "S" if clock.now < 3 else "")
     monkeypatch.setattr(stop_servers, "_gpu_compute_pids", lambda: None)
-
-    survivors = stop_servers._wait_released(
-        {5: "codetrail-rag:rerank"}, timeout=120, clock=clock, sleep=clock.sleep
-    )
-
-    assert survivors == []
+    with pytest.raises(DependencyError, match="nvidia-smi"):
+        stop_servers._wait_released(
+            {5: "codetrail-rag:rerank"}, timeout=120, clock=clock, sleep=clock.sleep
+        )
     assert clock.now >= 3
 
 
@@ -941,9 +939,11 @@ def test_stop_timeout_comes_from_argv_with_a_fixed_default():
 
 
 def test_pane_pids_parses_tmux_output(monkeypatch):
+    from runtime_dependencies import DependencyError
+
     class _Result:
         returncode = 0
-        stdout = "481939 main\n482001 embed\nnot-a-pid x\n"
+        stdout = "481939 main\n482001 embed\n"
         stderr = ""
 
     monkeypatch.setattr(
@@ -953,9 +953,15 @@ def test_pane_pids_parses_tmux_output(monkeypatch):
         481939: "codetrail-main:main",
         482001: "codetrail-main:embed",
     }
+    # 同一份輸出若含格式錯誤，不能略過未知 pane 後宣告已掌握停止範圍。
+    _Result.stdout += "not-a-pid x\n"
+    with pytest.raises(DependencyError, match="tmux.*PID.*格式無效"):
+        stop_servers._pane_pids("codetrail-main")
 
 
-def test_pane_pids_empty_when_session_missing(monkeypatch):
+def test_pane_pids_reports_missing_session_as_unobservable(monkeypatch):
+    from runtime_dependencies import DependencyError
+
     class _Result:
         returncode = 1
         stdout = ""
@@ -964,7 +970,8 @@ def test_pane_pids_empty_when_session_missing(monkeypatch):
     monkeypatch.setattr(
         stop_servers.process_env, "run", lambda *args, **kwargs: _Result()
     )
-    assert stop_servers._pane_pids("codetrail-main") == {}
+    with pytest.raises(DependencyError, match="tmux"):
+        stop_servers._pane_pids("codetrail-main")
 
 
 def test_rollback_waits_for_vram_release(tmp_path, monkeypatch):

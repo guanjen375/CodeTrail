@@ -119,6 +119,9 @@ def _read_optional(path: Path, *, label: str, max_chars: int) -> str:
     所以:先確認**父目錄**沒有被重導(resolve 之後必須留在原地),再用
     ``O_NOFOLLOW`` 開檔、``fstat`` 驗普通檔與擁有者,最後才讀。
     """
+    from runtime_dependencies import require_safe_filesystem
+
+    require_safe_filesystem("prompt source read", owner_only=True, error_type=PromptError)
     parent = path.parent
     try:
         if parent.exists() or parent.is_symlink():
@@ -145,7 +148,7 @@ def _read_optional(path: Path, *, label: str, max_chars: int) -> str:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise PromptError(f"{label} 必須是普通檔案: {path}")
-        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        if info.st_uid != os.getuid():
             raise PromptError(f"{label} 不屬於目前使用者: {path}")
         if info.st_size > max_chars * 4 + 1024:
             raise PromptError(

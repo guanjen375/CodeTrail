@@ -779,6 +779,9 @@ def _open_stderr_log(stderr_log: str | os.PathLike[str] | None, notify=None):
     """
     if not stderr_log:
         return None
+    from runtime_dependencies import require_safe_filesystem
+
+    require_safe_filesystem("MCP stderr log", owner_only=True, error_type=McpClientError)
     if notify is None:
         def notify(message: str) -> None:
             print(f"[mcp] {message}", file=sys.stderr, flush=True)

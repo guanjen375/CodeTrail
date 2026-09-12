@@ -8,20 +8,18 @@ requests>=2.28.0    # llama-server HTTP client
 textual>=8,<9
 mcp>=1.28,<2         # MCP server（現行 FastMCP import 只相容 SDK 1.x）
 numpy>=1.21.0       # RAG / MMR 向量運算
-jieba>=0.42.1       # 中文 BM25 切詞（缺少時可降級，但預設安裝確保檢索品質）
-# C/C++ AST 解析（Code RAG symbol / graph 抽取;缺席時 c/cpp 降級 regex,
-# doctor 與 build_index 會標 regex-degraded）。釘版:grammar wheel 與
+jieba>=0.42.1       # 中文 BM25 必要分詞器；缺席時查詢報錯
+# C/C++ AST 解析（Code RAG symbol / graph 抽取；缺席或 ABI 不相容即報錯）。
+# 其他語言的必要 grammar / Universal Ctags 見 docs/dependencies.md。釘版:grammar wheel 與
 # py-tree-sitter 之間有 ABI 相容窗(0.26 = language ABI ≤15),驗證過才釘。
 tree-sitter==0.26.0
 tree-sitter-c==0.24.2
 tree-sitter-cpp==0.23.4
 # ELF 結構化解析(analyze_file / ingest_document 的 symbols / DWARF 函式·行號·型別 /
-# relocation / memmap)。純 Python、無編譯依賴。沒裝時退回 binutils readelf 文字解析,
-# 報告開頭會明列缺失能力(DWARF 型別等),doctor 會 WARN。
+# relocation / memmap)。純 Python、無編譯依賴。缺席時 ELF 操作報錯，doctor FAIL。
 pyelftools>=0.30
 
-# 可選：缺了會由各功能 graceful skip，doctor 會提示
+# 功能依賴：只在使用該功能時要求；缺少時該操作報錯，doctor 會提示
 # pip install "pymupdf4llm==1.28.0"               # RAG.py 從 PDF/MD 建知識庫(釘驗證版,上游 schema 常變動)
 # pip install html2text                            # RAG.py --url 抓網頁
-# pip install capstone                             # analyze_file view="disasm" 的純 Python 反組譯後備(objdump 不支援該架構時)
 # llama.cpp llama-server 本身要自己 build,見 docs/setup.md

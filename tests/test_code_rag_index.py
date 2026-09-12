@@ -687,6 +687,7 @@ def test_cache_identity_is_the_single_source_for_meta_and_validation():
     assert identity["schema_version"] == code_rag.CODE_RAG_CACHE_SCHEMA_VERSION
     assert identity["parser_semantics_version"] == \
         ast_parser.PARSER_SEMANTICS_VERSION
+    assert identity["parser_backend_policy"] == ast_parser.PARSER_BACKEND_POLICY
     assert identity["embed_text_schema_version"] == \
         code_rag.EMBED_TEXT_SCHEMA_VERSION
     assert identity["render_budgets"] == {

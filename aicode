@@ -44,10 +44,8 @@ CHECKOUT="$(resolve_aicode_home)" || {
 
 if command -v python3 >/dev/null 2>&1; then
   PYBIN=python3
-elif command -v python >/dev/null 2>&1; then
-  PYBIN=python
 else
-  echo "[aicode] python3/python not found in PATH — CodeTrail is a Python tool." >&2
+  echo "[aicode] python3 not found in PATH — install Python 3 and make python3 available." >&2
   exit 2
 fi
 

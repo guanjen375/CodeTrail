@@ -320,8 +320,8 @@ def _loaded_kb(monkeypatch, tmp_path: Path, chunks: list) -> KnowledgeBase:
     assert kb.loaded and kb.load_error is None, kb.load_error
     monkeypatch.setattr(kb, "_get_embedding", lambda _t: [1.0, 0.0])
     monkeypatch.setattr(kb, "_generate_multi_queries", lambda question: [question])
-    monkeypatch.setattr(kb, "_check_reranker_available", lambda: False)
-    monkeypatch.setattr(config, "RERANK_FALLBACK_POLICY", "embedding")
+    # These tests exercise original figure evidence/gates without a model call.
+    monkeypatch.setattr(knowledge, "USE_RERANKER", False)
     monkeypatch.setattr(knowledge, "USE_MMR", False)
     return kb
 

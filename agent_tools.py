@@ -10,7 +10,6 @@ import re
 import sys
 import json
 import codecs
-import fnmatch
 import shlex
 import shutil
 import tempfile
@@ -20,6 +19,7 @@ from typing import Optional
 import config
 import container_runner
 import patch_engine
+from runtime_dependencies import DependencyError, DEPENDENCY_ERROR_PREFIX
 from media import BINARY_EXTENSIONS, ELF_EXTENSIONS
 from config import (
     IMAGE_EXTENSIONS,
@@ -623,9 +623,7 @@ class ToolExecutor:
         return False
 
     def _rg_available(self) -> bool:
-        if not hasattr(self, "_has_rg"):
-            self._has_rg = shutil.which("rg") is not None
-        return self._has_rg
+        return shutil.which("rg") is not None
 
     def _grep_with_rg(self, pattern: str, target: Path, include_patterns: list,
                       context: int, use_literal: bool) -> tuple[list, int, bool] | str:
@@ -653,8 +651,8 @@ class ToolExecutor:
                     timeout=30
                 )
                 return result.returncode, result.stdout, result.stderr
-            except FileNotFoundError:
-                return 2, "", "rg not found"
+            except OSError as exc:
+                return 2, "", str(exc)
             except process_env.TimeoutExpired:
                 return 2, "", "rg timeout"
 
@@ -663,7 +661,8 @@ class ToolExecutor:
             rc, stdout, stderr = _run(True)
 
         if rc not in (0, 1):
-            return f"錯誤: rg 執行失敗 - {stderr.strip() or 'unknown'}"
+            return (f"{DEPENDENCY_ERROR_PREFIX}ripgrep (rg) 執行失敗: "
+                    f"{stderr.strip() or 'unknown'}；請安裝或修復 ripgrep。")
 
         if not stdout.strip():
             return [], 0, False
@@ -698,124 +697,34 @@ class ToolExecutor:
         if not target or not target.exists():
             return f"錯誤: 路徑不存在 '{path}'"
 
-        # ReDoS 保護：檢查危險 pattern
+        # 危險或不合法 regex 仍改字面比對；搜尋實作只有 ripgrep。
         use_literal = self._is_redos_risk(pattern)
-        if use_literal:
-            escaped = re.escape(pattern)
-            regex_cs = re.compile(escaped)
-            regex_ci = re.compile(escaped, re.IGNORECASE)
-        else:
+        if not use_literal:
             try:
-                regex_cs = re.compile(pattern)
-                regex_ci = re.compile(pattern, re.IGNORECASE)
+                re.compile(pattern)
             except re.error:
-                escaped = re.escape(pattern)
-                regex_cs = re.compile(escaped)
-                regex_ci = re.compile(escaped, re.IGNORECASE)
-
+                use_literal = True
         if include is None:
             include = GREP_DEFAULT_EXTENSIONS
-
         include_patterns = [p.strip() for p in include.split(',')]
-
-        # Fast path: ripgrep
-        if self._rg_available():
-            rg_result = self._grep_with_rg(pattern, target, include_patterns, context, use_literal)
-            if isinstance(rg_result, str):
-                return rg_result
-            results, match_count, truncated = rg_result
-            if not results:
-                return f"沒有找到 '{pattern}'"
-
-            header = f"=== rg '{pattern}' ({match_count} matches) ===\n"
-            body = "\n".join(results)
-            if truncated or match_count >= MAX_GREP_RESULTS:
-                body += (
-                    f"\n\n[CTX] rg 結果不完整(上限 MAX_GREP_RESULTS={MAX_GREP_RESULTS}、"
-                    f"MAX_GREP_OUTPUT_CHARS={MAX_GREP_OUTPUT_CHARS}、"
-                    f"單行 MAX_GREP_LINE_CHARS={MAX_GREP_LINE_CHARS})，"
-                    f"建議縮小 path/include 或用更精準的 pattern。"
-                )
-            return header + body
-
-        files = []
-        if target.is_file():
-            files = [target]
-        else:
-            for dirpath, dirnames, filenames in os.walk(target):
-                rel_dir = Path(dirpath).relative_to(target)
-                dirnames[:] = [d for d in dirnames if not should_ignore_dir(rel_dir / d)]
-
-                for fname in filenames:
-                    if any(fnmatch.fnmatch(fname, p) for p in include_patterns):
-                        fp = Path(dirpath) / fname
-                        rel_path = str(fp.relative_to(target))
-                        if not should_ignore_file(rel_path):
-                            files.append(fp)
-
-        # 先用 case-sensitive 搜尋
-        results = self._grep_with_context(files, regex_cs, context)
-
-        # 如果沒結果，用 case-insensitive 重試
-        if not results:
-            results = self._grep_with_context(files, regex_ci, context)
-
+        if not self._rg_available():
+            return f"{DEPENDENCY_ERROR_PREFIX}需要 ripgrep (rg)；請安裝 ripgrep 並確認 rg 在 PATH。"
+        rg_result = self._grep_with_rg(pattern, target, include_patterns, context, use_literal)
+        if isinstance(rg_result, str):
+            return rg_result
+        results, match_count, truncated = rg_result
         if not results:
             return f"沒有找到 '{pattern}'"
-
-        header = f"=== grep '{pattern}' ({len(results)} 結果) ===\n"
-        kept, over_budget = _collect_within_budget(results)
-        body = "\n".join(kept)
-        if over_budget:
+        header = f"=== rg '{pattern}' ({match_count} matches) ===\n"
+        body = "\n".join(results)
+        if truncated or match_count >= MAX_GREP_RESULTS:
             body += (
-                f"\n\n⚠️ [CTX] grep 輸出已達 MAX_GREP_OUTPUT_CHARS={MAX_GREP_OUTPUT_CHARS}，"
-                "結果已截斷。請縮小 path/include 或用更精準的 pattern。"
+                f"\n\n[CTX] rg 結果不完整(上限 MAX_GREP_RESULTS={MAX_GREP_RESULTS}、"
+                f"MAX_GREP_OUTPUT_CHARS={MAX_GREP_OUTPUT_CHARS}、"
+                f"單行 MAX_GREP_LINE_CHARS={MAX_GREP_LINE_CHARS})，"
+                f"建議縮小 path/include 或用更精準的 pattern。"
             )
-
-        if len(results) >= MAX_GREP_RESULTS:
-            body += f"\n\n⚠️ [CTX] grep 已達 MAX_GREP_RESULTS={MAX_GREP_RESULTS}，結果可能不完整。建議縮小 path/include 或用更精準的 pattern。"
-
         return header + body
-
-    def _safe_regex_search(self, regex, text: str, timeout_chars: int = 10000) -> bool:
-        """安全的 regex search，對超長行做截斷保護"""
-        if len(text) > timeout_chars:
-            text = text[:timeout_chars]
-        return regex.search(text) is not None
-
-    def _grep_with_context(self, files: list, regex, context: int) -> list:
-        """搜尋檔案並支援上下文顯示"""
-        results = []
-        context = min(context, 5)
-
-        for fp in files:
-            if len(results) >= MAX_GREP_RESULTS:
-                break
-            try:
-                content = fp.read_text(encoding="utf-8", errors="replace")
-                lines = content.split('\n')
-
-                for i, line in enumerate(lines):
-                    if self._safe_regex_search(regex, line):
-                        rel = fp.relative_to(self.root)
-
-                        if context > 0:
-                            start = max(0, i - context)
-                            end = min(len(lines), i + context + 1)
-                            ctx_lines = []
-                            for j in range(start, end):
-                                prefix = ">" if j == i else " "
-                                ctx_lines.append(f"{prefix}{j+1:4d}| {lines[j][:120]}")
-                            results.append(f"--- {rel}:{i+1} ---\n" + "\n".join(ctx_lines))
-                        else:
-                            results.append(f"{rel}:{i+1}: {line.strip()[:100]}")
-
-                        if len(results) >= MAX_GREP_RESULTS:
-                            break
-            except Exception:
-                continue
-
-        return results
 
     def file_info(self, path: str) -> str:
         target = self._safe_path(path)
@@ -1213,6 +1122,8 @@ class ToolExecutor:
         identity = {}
         try:
             ops = patch_engine.PathOps(self.root)
+        except DependencyError as e:
+            return f"{DEPENDENCY_ERROR_PREFIX}✗ {safe(str(e))}"
         except OSError as e:
             return f"✗ 無法開啟 sandbox root: {safe(str(e))}"
         try:
@@ -1354,6 +1265,8 @@ class ToolExecutor:
         tag = " [search_replace]" if fmt == "search_replace" else ""
         try:
             ops = patch_engine.PathOps(self.root)
+        except DependencyError as e:
+            return f"{DEPENDENCY_ERROR_PREFIX}✗ {safe(str(e))}"
         except OSError as e:
             return f"✗ 無法開啟 sandbox root: {safe(str(e))}"
         journal = patch_engine.WriteJournal(ops)
@@ -2063,51 +1976,28 @@ class ToolExecutor:
                 f"要 check-only 但目前工具鏈不支援，請改用 fix=True，或在 config.LINT_COMMANDS 補上 '{mode}' key。"
             )
 
-        results = []
+        # 每個副檔名 / mode 只有一個主命令，拒絕舊的替代工具清單。
+        if len(lint_cmds) != 1:
+            return f"錯誤: config.LINT_COMMANDS[{ext!r}][{mode!r}] 必須只設定一個主命令。"
         rel_path = str(target.relative_to(self.root))
-
-        for cmd_template in lint_cmds:
-            cmd_parts = shlex.split(cmd_template)
-            cmd_parts.append(rel_path)
-
-            try:
-                print(f"   [LINT] 執行: {' '.join(cmd_parts)}", file=sys.stderr)
-                result = process_env.run(
-                    cmd_parts,
-                    cwd=str(self.root),
-                    capture_output=True,
-                    text=True,
-                    timeout=60
-                )
-
-                tool_name = cmd_parts[0]
-                if result.returncode == 0:
-                    output = result.stdout.strip() or result.stderr.strip()
-                    if output:
-                        results.append(f"✓ {tool_name}: {output[:200]}")
-                    else:
-                        results.append(f"✓ {tool_name}: 完成")
-                    break
-                else:
-                    if "not found" in result.stderr.lower() or "not recognized" in result.stderr.lower():
-                        continue
-                    output = result.stderr.strip() or result.stdout.strip()
-                    results.append(f"⚠ {tool_name}:\n{output[:500]}")
-                    break
-
-            except FileNotFoundError:
-                continue
-            except process_env.TimeoutExpired:
-                results.append(f"✗ {cmd_parts[0]}: 超時")
-                break
-            except Exception as e:
-                results.append(f"✗ {cmd_parts[0]}: {e}")
-                break
-
-        if not results:
-            return f"錯誤: 沒有可用的 lint 工具（已嘗試: {', '.join(c.split()[0] for c in lint_cmds)}）"
-
-        return f"=== Lint {rel_path} ===\n" + '\n'.join(results)
+        cmd_parts = shlex.split(lint_cmds[0])
+        if not cmd_parts:
+            return f"錯誤: {ext} 的 {mode} 主命令是空的。"
+        tool_name = cmd_parts[0]
+        cmd_parts.append(rel_path)
+        try:
+            print(f"   [LINT] 執行: {' '.join(cmd_parts)}", file=sys.stderr)
+            result = process_env.run(
+                cmd_parts, cwd=str(self.root), capture_output=True, text=True, timeout=60
+            )
+        except (OSError, process_env.TimeoutExpired) as exc:
+            return (f"{DEPENDENCY_ERROR_PREFIX}{tool_name} 無法執行: {exc}；"
+                    f"請安裝或修復 {tool_name}。")
+        if result.returncode != 0:
+            output = result.stderr.strip() or result.stdout.strip()
+            return f"錯誤: {tool_name} 執行失敗(exit {result.returncode}):\n{output[:500]}"
+        output = result.stdout.strip() or result.stderr.strip()
+        return f"=== Lint {rel_path} ===\n✓ {tool_name}: {output[:200] if output else '完成'}"
 
     def execute(self, tool: str, args: dict) -> Optional[str]:
         if tool == "list_files":

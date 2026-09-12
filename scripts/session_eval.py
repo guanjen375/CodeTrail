@@ -331,6 +331,10 @@ def replay_client_config(*, keep_compaction: bool) -> dict[str, Any]:
 
 
 def _write_replay_client_config(directory: Path, value: Mapping[str, Any]) -> Path:
+    from runtime_dependencies import require_safe_filesystem
+
+    require_safe_filesystem("private replay config", owner_only=True,
+                            error_type=session_eval.SessionEvalError)
     path = directory / "client.json"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:

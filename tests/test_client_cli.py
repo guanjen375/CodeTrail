@@ -31,6 +31,15 @@ from mcp_contract import PUBLIC_TOOL_ORDER  # noqa: E402
 pytestmark = pytest.mark.smoke
 
 
+@pytest.fixture
+def live_main_context(monkeypatch):
+    """headless 現在也要求 live /props；測試模型使用離線容量回應。"""
+    import gpu_safety
+
+    monkeypatch.setattr(gpu_safety, "query_server_info", lambda *args:
+                        types.SimpleNamespace(n_ctx=131072))
+
+
 class _FakeMcp:
     def __init__(self):
         self.calls = []
@@ -147,7 +156,7 @@ def test_the_shared_parser_reads_our_own_stream():
 # ============================================================
 # headless
 # ============================================================
-def test_headless_defaults_to_ephemeral(tmp_path, monkeypatch, capsys):
+def test_headless_defaults_to_ephemeral(tmp_path, monkeypatch, capsys, live_main_context):
     """canary 與 eval 走這條路徑,不得在 session 清單裡留下對話。"""
     import llama_client
 
@@ -169,7 +178,7 @@ def test_headless_defaults_to_ephemeral(tmp_path, monkeypatch, capsys):
 
 
 @pytest.mark.smoke
-def test_headless_run_never_primes_the_prompt_cache(tmp_path, monkeypatch, capsys):
+def test_headless_run_never_primes_the_prompt_cache(tmp_path, monkeypatch, capsys, live_main_context):
     """prompt cache 預熱是**互動 TUI** 的東西:headless `run` 一個呼叫點都沒有。
 
     `run` 是 canary / eval_tool_routing / session_eval replay 走的路。多一個
@@ -201,7 +210,7 @@ def test_headless_run_never_primes_the_prompt_cache(tmp_path, monkeypatch, capsy
     assert [e["type"] for e in events] == ["session", "text", "step_finish"]
 
 
-def test_headless_can_persist_when_asked(tmp_path, monkeypatch, capsys):
+def test_headless_can_persist_when_asked(tmp_path, monkeypatch, capsys, live_main_context):
     import llama_client
 
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
@@ -335,7 +344,7 @@ class _ReadonlyFakeMcpClient(_FakeMcpClient):
     readonly = True
 
 
-def test_a_readonly_run_never_writes_context_metrics_into_the_project(tmp_path, monkeypatch, capsys):
+def test_a_readonly_run_never_writes_context_metrics_into_the_project(tmp_path, monkeypatch, capsys, live_main_context):
     """MCP 子行程的 metrics 由 env 關掉;寫 `<root>/.codetrail/context_metrics.jsonl` 的
     還有客戶端行程自己(engine 每一步都 log_metrics)。"""
     import config
@@ -484,7 +493,7 @@ def test_the_tui_banner_after_a_passing_preflight_drops_the_progress_log_and_kee
 
 
 @pytest.mark.smoke
-def test_headless_run_compacts_after_a_completed_turn_and_reports_it(tmp_path, monkeypatch, capsys):
+def test_headless_run_compacts_after_a_completed_turn_and_reports_it(tmp_path, monkeypatch, capsys, live_main_context):
     """`session_eval --keep-compaction` 量的是壓縮品質;headless 不壓等於量一個
     不存在的東西,而 identity 上還寫著 `codetrail` mode。
 

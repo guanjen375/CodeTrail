@@ -214,36 +214,30 @@ def resolve_model(result: Preflight, profile: Any) -> str:
     return resolved.model
 
 
-def observe_n_ctx(result: Preflight, profile: Any) -> int:
-    """主模型的 n_ctx:先問 server 的 `/props`,問不到才用 profile 的 main.ctx。
-
-    server 啟動時的 `-c <N>` 是 runtime 真值;客戶端與 MCP 都跟著它,使用者
-    不需要維護第二個數字。
-    """
+def observe_main_n_ctx(base_url: str) -> int:
+    """TUI/headless 共用的安靜觀測；沒有 live n_ctx 就拒絕呼叫模型。"""
     import gpu_safety
 
-    base_url = profile.service("main").base_url
-    observed = 0
     try:
         info = gpu_safety.query_server_info(base_url)
-    except Exception:  # noqa: BLE001 - 讀不到不是啟動失敗,退回設定值
-        info = None
-    if info is not None and getattr(info, "n_ctx", 0) and info.n_ctx > 0:
-        observed = int(info.n_ctx)
-        result.note(f"n_ctx={observed}(來自主 server)")
-    else:
-        configured = profile.service("main").ctx
-        if not configured:
-            raise PreflightError(
-                f"讀不到 {base_url}/props 的 n_ctx,deployment profile 也沒有 main.ctx。\n"
-                "  請先啟動 llama-server(~/start.sh),或重跑 ./set_config.sh 設定 ctx。"
-            )
-        observed = int(configured)
-        # keep:退回設定值代表 server 沒回答。實際 n_ctx 與這個數字不同時,
-        # 門檻與 gate 全部是照一個猜測值算的 —— 使用者要知道自己在這一邊。
-        result.note(
-            f"n_ctx={observed}(來自 deployment profile;server 尚無法觀測)", keep=True
+    except Exception as exc:
+        raise PreflightError(
+            f"無法觀測主 server /props 的 n_ctx: {type(exc).__name__}: {exc}；"
+            "請啟動或修復 llama-server 後重試。"
+        ) from exc
+    observed = getattr(info, "n_ctx", None)
+    if type(observed) is not int or observed <= 0:
+        raise PreflightError(
+            "主 server /props 沒有有效的正整數 n_ctx；"
+            "請啟動或修復 llama-server 後重試，不使用 deployment main.ctx 代替。"
         )
+    return observed
+
+
+def observe_n_ctx(result: Preflight, profile: Any) -> int:
+    """主模型 n_ctx 只取 server /props 的實值。"""
+    observed = observe_main_n_ctx(profile.service("main").base_url)
+    result.note(f"n_ctx={observed}(來自主 server)")
     result.n_ctx = observed
     return observed
 
@@ -251,7 +245,7 @@ def observe_n_ctx(result: Preflight, profile: Any) -> int:
 def check_ctx_safety(result: Preflight, profile: Any, requested: int) -> None:
     """容量閘:CodeTrail 用的 n_ctx 不得**超過** server 真實 n_ctx(超過會截斷 prompt)。
 
-    server 讀不到(UNKNOWN)一律放行只警告 —— 不能因為 server 還沒起來就擋住啟動。
+    server 讀不到(UNKNOWN)就拒絕啟動，容量不能用設定值猜測。
     小於 server 不是安全問題,只是沒用滿容量。
     """
     import gpu_safety
@@ -259,10 +253,10 @@ def check_ctx_safety(result: Preflight, profile: Any, requested: int) -> None:
     base_url = profile.service("main").base_url
     verdict = gpu_safety.check_safety(requested, base_url=base_url)
     if verdict.status == "UNKNOWN":
-        # keep:這一道閘這次沒有真的驗過。SAFE 那一行相反 —— 驗過了就沒有必要
-        # 每次啟動都佔一行。
-        result.note(f"ctx safety=UNKNOWN({verdict.reason});放行", keep=True)
-        return
+        raise PreflightError(
+            f"ctx 容量閘無法驗證主 server: {verdict.reason}；"
+            "請啟動或修復 llama-server 後重試。"
+        )
     if verdict.status == "SAFE":
         result.note(f"ctx safety=SAFE(requested={requested} ≤ server {verdict.server_n_ctx})")
         return

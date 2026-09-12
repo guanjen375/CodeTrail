@@ -218,10 +218,8 @@ def _hex_dump(data: bytes, base_offset: int = 0, width: int = 16) -> str:
 # ============================================================================
 # ELF 解析：實作在 elf_analysis.py（backend 中立模型 + 多視角報告）
 # ============================================================================
-# 這裡只留 sandbox 入口、BIN 報告的 hard cap 與相容 alias。舊的 readelf / pyelftools
-# 雙實作（_build_elf_report_native / _build_elf_report_readelf / _format_symbol_table …）
-# 已整併進 elf_analysis：兩條解析路徑填同一份模型、共用同一套渲染，缺失能力會在報告
-# 開頭明列，不再是只標 parser 名字的靜默降級。
+# 這裡只留 sandbox 入口、BIN 報告的 hard cap 與相容 alias。
+# ELF 只使用 pyelftools；缺失或故障直接回報錯誤，不產生降級報告。
 
 _scan_ascii_strings = scan_ascii_strings
 _scan_utf16le_strings = scan_utf16le_strings
@@ -521,14 +519,10 @@ def read_elf(path: str, view: str = "summary", target: str = "", limit: int = 0)
     except (TypeError, ValueError):
         limit_key = 0
 
-    cache_key = _cache_key(p, ("elf-v2", view_key, target_key, limit_key))
-    cached = _cache_get(_ELF_CACHE, cache_key)
-    if cached is not None:
-        return cached
-
     try:
+        # 中間 ElfModel 仍有快取；報告每次重建，確保目前所需 binary 也真的可用。
+        elf_analysis.require_pyelftools()
         result = _build_elf_report(p, view=view_key, target=target_key, limit=limit_key)
-        _cache_set(_ELF_CACHE, cache_key, result, _ELF_CACHE_MAX)
         return result
     except Exception as e:
         return f"[ELF 錯誤] {type(e).__name__}: {e}"
@@ -570,10 +564,6 @@ def read_binary(path: str, max_strings: int = 200, view: str = "summary", target
         limit_key = 0
 
     cache_key = _cache_key(p, ("bin-v2", max_strings, view_key, target_key, limit_key, max_chars))
-    cached = _cache_get(_BIN_CACHE, cache_key)
-    if cached is not None:
-        return cached
-
     try:
         # 讀取檔頭
         with open(p, "rb") as f:
@@ -581,6 +571,7 @@ def read_binary(path: str, max_strings: int = 200, view: str = "summary", target
 
         # 自動偵測 ELF：若是 ELF 則切換到 ELF 解析（view / target / limit 生效）
         if header.startswith(b"\x7fELF"):
+            elf_analysis.require_pyelftools()
             # 前綴也算在 max_chars 內：ELF 報告的 cap 要扣掉前綴長度，最終值才不會超過上限
             prefix = "[BIN→ELF] 偵測到 ELF magic，自動切換 ELF 解析模式:\n\n"
             cap = max(1, int(max_chars))
@@ -591,8 +582,11 @@ def read_binary(path: str, max_strings: int = 200, view: str = "summary", target
             result = prefix + body
             if len(result) > cap:   # 極小的 max_chars 連前綴都放不下：上限仍然是上限，硬切
                 result = result[:cap]
-            _cache_set(_BIN_CACHE, cache_key, result, _BIN_CACHE_MAX)
             return result
+
+        cached = _cache_get(_BIN_CACHE, cache_key)
+        if cached is not None:
+            return cached
 
         note = _elf_params_note(view_key, target_key, limit_key)
 

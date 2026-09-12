@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Annotated, Literal, Optional
 
 from pydantic import Field
+from runtime_dependencies import DependencyError
 
 # ---- 啟動參數 --------------------------------------------------------------
 # 沙箱 root 與 readonly 都走 **argv**,不走環境變數:客戶端交出去的子行程環境
@@ -1210,6 +1211,8 @@ def code_rag_search(
         graph_status = "ok"
         try:
             graph = _graph_for_query()
+        except DependencyError:
+            raise
         except Exception as exc:
             graph_status = f"unavailable: {type(exc).__name__}: {exc}"[:200]
 
@@ -1357,7 +1360,9 @@ def code_rag_search(
     if include_evidence:
         try:
             graph = _graph_for_query()
-        except Exception as exc:  # §2:semantic 不因 graph 缺席失敗
+        except DependencyError:
+            raise
+        except Exception as exc:  # 資料缺席可揭露，環境依賴錯誤必須向外傳遞
             graph = None
             graph_status = f"unavailable: {type(exc).__name__}: {exc}"[:200]
 
@@ -1390,6 +1395,8 @@ def code_rag_search(
                         _slim_edge(e)
                         for e in graph.relations_for_symbol(lookup, limit=5)
                     ]
+                except DependencyError:
+                    raise
                 except Exception as exc:
                     graph_status = f"relation lookup failed: {type(exc).__name__}"
             entry['relations'] = relations
@@ -1717,13 +1724,13 @@ def analyze_file(
         (要先在 llama-server VL port (8083) 掛載對應的 VL GGUF + mmproj)
       - PDF(.pdf) → 一次性抽各頁文字(不寫入 knowledge.json);
         內嵌圖會標註頁碼與張數但不做 VL 分析
-      - ELF(.elf/.so/.o/.axf/.out/.ko) → 結構化解析(pyelftools;缺少時退回 binutils readelf,
-        報告開頭會明列這條路徑缺失的能力)。預設 view="summary" 是總覽;要深入時用 view / target / limit:
+      - ELF(.elf/.so/.o/.axf/.out/.ko) → 結構化解析(必要 pyelftools;缺席即報錯)。
+        預設 view="summary" 是總覽;要深入時用 view / target / limit:
           view="symbols"  完整 symbol 表(含 LOCAL/static、UND、size=0);target=regex,或
                           "bind:LOCAL type:FUNC uart" / "ndx:UND" / "section:.text" 篩選,或 0x位址反查
           view="disasm"   反組譯;target=symbol 名 / 0x位址 / 0x起-0x迄(省略=entry point);limit=指令數;
                           .o/.ko 可加 "section:.init.text"。objdump 不支援該架構時會明講原因與補救
-                          (跨架構 objdump / pip install capstone / client.json 的 objdump)
+                          (安裝並在 client.json 的 objdump 指定相容架構工具；不自動換後端)
           view="dwarf"    無 target → CU 列表;target=regex → 函式(位址範圍、來源檔:行)與
                           struct/union/enum/typedef 成員;target=0x位址 → 對應來源行與函式
           view="strings"  全部可讀字串(offset / section / 分類);target=regex,或 "cat:diagnostic"、
@@ -1852,7 +1859,7 @@ _HEARTBEAT_EVERY_LINES = 50
 def _signal_group(proc, sig, pgid=None) -> None:
     """對整個 process group 送訊號(取不到 group 才退回單一行程)。
 
-    RAG.py 自己可能再開子行程(readelf / objdump 等),只 kill 直屬子行程會留下
+    RAG.py 自己可能再開子行程(objdump 等),只 kill 直屬子行程會留下
     還在敲 VL server、還可能寫 knowledge.json 的後代,而且它們持有 pipe 寫端 →
     reader thread 永遠不會結束。
 

@@ -7,28 +7,72 @@
 import re
 import json
 import copy
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from functools import lru_cache
 
 
 import config
+from runtime_dependencies import DependencyError
 
+_NUMPY_IMPORT_ERROR = None
 try:
     import numpy as np
     HAS_NUMPY = True
-except ImportError:
+except Exception as exc:  # broken binary/ABI installs are diagnosed at first use
+    np = None
     HAS_NUMPY = False
+    _NUMPY_IMPORT_ERROR = exc
 
+_JIEBA_IMPORT_ERROR = None
 try:
     import jieba
     HAS_JIEBA = True
-except ImportError:
+except Exception as exc:
+    jieba = None
     HAS_JIEBA = False
-    # 提示：jieba 對中文 BM25 搜尋精準度很重要
-    import sys
-    print("[WARN] jieba 未安裝，中文 BM25 搜尋精準度可能較低", file=sys.stderr)
-    print("       建議執行: pip install jieba", file=sys.stderr)
+    _JIEBA_IMPORT_ERROR = exc
+
+
+def _require_numpy():
+    """Keep module inspection offline; vector operations require the primary library."""
+    if not HAS_NUMPY or np is None:
+        detail = f": {_NUMPY_IMPORT_ERROR}" if _NUMPY_IMPORT_ERROR else ""
+        raise DependencyError(
+            f"RAG requires a usable numpy installation{detail}. "
+            "Install the CodeTrail requirements in this Python environment."
+        ) from _NUMPY_IMPORT_ERROR
+    return np
+
+
+def _require_jieba():
+    if not HAS_JIEBA or jieba is None or not callable(getattr(jieba, "cut", None)):
+        detail = f": {_JIEBA_IMPORT_ERROR}" if _JIEBA_IMPORT_ERROR else ""
+        raise DependencyError(
+            f"RAG lexical search requires a usable jieba installation{detail}. "
+            "Install the CodeTrail requirements in this Python environment."
+        ) from _JIEBA_IMPORT_ERROR
+    return jieba
+
+
+def _jieba_tokens(text: str) -> list:
+    tokenizer = _require_jieba()
+    try:
+        # cut() is lazy: dictionary errors can surface while iterating it.
+        return list(tokenizer.cut(text, cut_all=False))
+    except Exception as exc:
+        raise DependencyError(
+            f"RAG jieba tokenization failed: {exc}. "
+            "Repair the jieba installation and its dictionary before retrying."
+        ) from exc
+
+
+def _require_retrieval_dependencies() -> None:
+    _require_numpy()
+    if BM25_ENABLED or USE_HYBRID_SEARCH:
+        _require_jieba()
+
 
 import context_budget
 import context_signals
@@ -382,14 +426,9 @@ def _gated_completion(*, source: str, prompt: str, temperature: float,
                       timeout: int) -> str:
     """knowledge.py 內所有主模型 `/completion` 的唯一出口:先過 context gate。
 
-    README_DEV「加新的 LLM call site 時怎麼接 gate」的標準流程。這三個呼叫點
-    (query expansion / multi-query / LLM rerank)以前直接打 llama_client——它們
-    「通常不會吃滿 ctx」是真的,但 `_rerank_with_llm` 會把 15 個候選各 500 字
-    塞進 prompt,再加上使用者問題;超了之後 llama-server 是**從前面截掉**,於是
-    模型看到的是半份候選清單卻照樣回一組 DOC_n。那是靜默錯答,不是報錯。
-
-    回傳模型輸出;overflow 或呼叫失敗一律回空字串——這三個呼叫點全都是
-    best-effort 的檢索增強,呼叫端本來就有「拿不到就用原問題」的路徑。
+    Query expansion / multi-query 都從這裡過 gate，避免超長 prompt 被 server
+    從前面截掉。回傳模型輸出；傳輸、設定與協定錯誤由呼叫端直接向外回報。
+    Overflow 保留安全拒絕契約：不送 HTTP，回空字串而不新增 query。
     Gate 觸發的細節(估算 token、utilization、[CTX_OVERFLOW])已經進 telemetry
     與 stderr,不需要再把錯誤字串當成模型輸出往下傳。
     """
@@ -412,7 +451,7 @@ def _gated_completion(*, source: str, prompt: str, temperature: float,
             stream=False,
             timeout=timeout,
         )
-    except Exception as exc:  # noqa: BLE001 — 呼叫端各自有 best-effort fallback
+    except Exception as exc:
         usage.error_type = type(exc).__name__
         context_budget.log_metrics(usage)
         raise
@@ -506,6 +545,8 @@ class KnowledgeBase:
         真的在重建期間有人換掉 JSON，`source_changed()` 下一次查詢就會重載。
         """
         try:
+            kb_cache._require_openat()
+            _require_retrieval_dependencies()
             with knowledge_store_lock(Path(path), exclusive=False):
                 with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
@@ -586,7 +627,7 @@ class KnowledgeBase:
                 "bm25_enabled": BM25_ENABLED,
             }
 
-        except KnowledgeStoreError as e:
+        except (KnowledgeStoreError, DependencyError) as e:
             self.loaded = False
             self.load_error = str(e)
             self._source_stat = _LOAD_FAILED_STAT
@@ -649,16 +690,9 @@ class KnowledgeBase:
         Returns:
             True 載到了；False 代表沒有可用 cache（呼叫端決定重建還是 fail）。
         """
+        _require_numpy()
         self._has_ctx = context_signals.has_any_ctx(self.chunks)
         self._needs_gate = context_signals.needs_gate_matrix(self.chunks)
-
-        if not HAS_NUMPY:
-            if self._needs_gate:
-                raise KnowledgeStoreError(
-                    "this knowledge base carries untrusted chunk context, which needs "
-                    "numpy to load its two embedding matrices; install numpy"
-                )
-            return False
 
         matrices, stale = kb_cache.locate(
             self.path, self.chunks, getattr(self, "_loaded_metadata", {}),
@@ -679,10 +713,7 @@ class KnowledgeBase:
         """
         if not self.chunks:
             return
-        if not HAS_NUMPY:
-            raise KnowledgeStoreError(
-                "重建 embeddings cache 需要 numpy；請安裝 numpy 後重試"
-            )
+        _require_numpy()
         stale = getattr(self, "_cache_stale_reason", "") or "embeddings cache 不可用"
         if not self._allow_rebuild:
             raise kb_cache.fatal(stale)
@@ -755,7 +786,8 @@ class KnowledgeBase:
 
     def _selection_vector(self, chunk: dict) -> list:
         """MMR/多樣性用的向量；USE 關掉時同樣退回 gate 列。"""
-        if (self._has_ctx or self._needs_gate) and not use_generated_context() and HAS_NUMPY:
+        _require_numpy()
+        if (self._has_ctx or self._needs_gate) and not use_generated_context():
             matrix = self._gate_matrix()
             index = chunk.get("chunk_idx")
             if matrix is not None and isinstance(index, int) and 0 <= index < matrix.shape[0]:
@@ -802,12 +834,12 @@ class KnowledgeBase:
         聚合刻意用成員的 max，**不**拿合併後的平均向量重算——決策面那樣做等於
         讓生成脈絡回到路徑上。
         """
+        _require_numpy()
         indices = self._member_indices(chunk)
-        if indices and HAS_NUMPY and matrix is not None:
+        if indices and matrix is not None:
             scores = self._matrix_scores_for(indices, q_emb, matrix)
             return max(scores.values()) if scores else 0.0
-        # 沒有 numpy 的 legacy 路徑：那種 KB 一定沒有 ctx，inline 向量就是
-        # content-only 的訊號本身。
+        # 未建立矩陣的 legacy inline 向量就是 content-only 的訊號本身。
         embedding = chunk.get("embedding", [])
         if embedding and q_emb:
             return self._cosine_similarity(q_emb, embedding)
@@ -852,6 +884,7 @@ class KnowledgeBase:
         這條路徑會把 retrieval 矩陣別名成 gate，所以只准用在沒有不可信脈絡的 KB。
         呼叫端（_load）已經擋過一次；這裡是第二道，避免以後有人繞過去。
         """
+        _require_numpy()
         self._index_chunks()
         if context_signals.needs_gate_matrix(self.chunks):
             raise KnowledgeStoreError(
@@ -863,7 +896,7 @@ class KnowledgeBase:
         self._section_nodes = ()
         self._section_bm25 = None
         self._section_store_state = "off (inline vectors)"
-        if not HAS_NUMPY or not self.chunks:
+        if not self.chunks:
             self._embeddings = None
             return
 
@@ -1004,11 +1037,8 @@ class KnowledgeBase:
             if token.startswith('0x') and '_' in token
         ]
         # 中文 token（單字或雙字詞）
-        if HAS_JIEBA:
-            zh_tokens = [t for t in jieba.cut(text, cut_all=False)
-                         if re.search(r'[\u4e00-\u9fff]', t)]
-        else:
-            zh_tokens = re.findall(r'[\u4e00-\u9fff]{1,2}', text)
+        zh_tokens = [t for t in _jieba_tokens(text)
+                     if re.search(r'[\u4e00-\u9fff]', t)]
 
         all_tokens = en_tokens + zh_tokens
 
@@ -1199,14 +1229,9 @@ class KnowledgeBase:
                      '我', '你', '他', '她', '它', '們', '這', '那', '要', '會',
                      '能', '可以'}
         keywords = {w for w in words if len(w) > 2 and w not in stopwords}
-        if HAS_JIEBA:
-            for token in jieba.cut(text, cut_all=False):
-                if len(token) > 1 and re.search(r'[\u4e00-\u9fff]', token) and token not in stopwords:
-                    keywords.add(token)
-        else:
-            for token in re.findall(r'[\u4e00-\u9fff]{2,}', text):
-                if token not in stopwords:
-                    keywords.add(token)
+        for token in _jieba_tokens(text):
+            if len(token) > 1 and re.search(r'[\u4e00-\u9fff]', token) and token not in stopwords:
+                keywords.add(token)
         return keywords
 
     def _keyword_score(self, query_keywords: set, chunk_content: str) -> float:
@@ -1248,9 +1273,8 @@ class KnowledgeBase:
         if QUERY_PRESERVE_SYMBOLS:
             preserved_symbols = re.findall(QUERY_SYMBOL_PATTERN, question)
 
-        try:
-            # P0-3: 改進 prompt，允許中英文混合關鍵字
-            prompt = f"""從以下問題中提取 3-5 個適合用於搜尋技術文件的關鍵字。
+        # P0-3: 改進 prompt，允許中英文混合關鍵字
+        prompt = f"""從以下問題中提取 3-5 個適合用於搜尋技術文件的關鍵字。
 可以是中文或英文，保留原始的技術術語和符號名稱（如 NUM_CTX, THRESHOLD 等）。
 只輸出關鍵字，用逗號分隔，不要解釋。
 
@@ -1258,38 +1282,35 @@ class KnowledgeBase:
 
 關鍵字:"""
 
-            result = _gated_completion(
-                source="kb_query_expansion",
-                prompt=prompt,
-                temperature=0,
-                timeout=30,
-            )
+        result = _gated_completion(
+            source="kb_query_expansion",
+            prompt=prompt,
+            temperature=0,
+            timeout=30,
+        )
 
-            # 同時支援半形和全形逗號
-            raw_keywords = re.split(r'[,，]', result)
-            keywords = []
-            for kw in raw_keywords:
-                kw = kw.strip()
-                # P0-3: 放寬過濾條件，允許中文和符號
-                # 只過濾過長或空的 token
-                if kw and len(kw) <= 40:
-                    # 避免整句被當作關鍵字（超過 4 個空格分隔的詞）
-                    if len(kw.split()) <= 4:
-                        keywords.append(kw)
+        # 同時支援半形和全形逗號
+        raw_keywords = re.split(r'[,，]', result)
+        keywords = []
+        for kw in raw_keywords:
+            kw = kw.strip()
+            # P0-3: 放寬過濾條件，允許中文和符號
+            # 只過濾過長或空的 token
+            if kw and len(kw) <= 40:
+                # 避免整句被當作關鍵字（超過 4 個空格分隔的詞）
+                if len(kw.split()) <= 4:
+                    keywords.append(kw)
 
-            keywords = keywords[:5]
+        keywords = keywords[:5]
 
-            # P0-3: 確保原始符號被保留
-            for sym in preserved_symbols:
-                if sym not in keywords:
-                    keywords.append(sym)
+        # P0-3: 確保原始符號被保留
+        for sym in preserved_symbols:
+            if sym not in keywords:
+                keywords.append(sym)
 
-            if keywords:
-                expanded = f"{question} {' '.join(keywords)}"
-                return [question, expanded]
-
-        except Exception:
-            pass
+        if keywords:
+            expanded = f"{question} {' '.join(keywords)}"
+            return [question, expanded]
 
         return [question]
 
@@ -1322,14 +1343,13 @@ class KnowledgeBase:
         if QUERY_PRESERVE_SYMBOLS:
             preserved_symbols = re.findall(QUERY_SYMBOL_PATTERN, question)
 
-        try:
-            model = config.require_main_model()
+        model = config.require_main_model()
 
-            # 根據啟用的類型生成變體
-            for query_type in MULTI_QUERY_TYPES[:MULTI_QUERY_COUNT]:
-                if query_type == "key_terms":
-                    # P0-3: 改進 prompt，保留符號和允許中英文混合
-                    prompt = f"""從以下問題中提取 3-5 個最重要的技術術語，用於搜尋技術文件。
+        # 根據啟用的類型生成變體
+        for query_type in MULTI_QUERY_TYPES[:MULTI_QUERY_COUNT]:
+            if query_type == "key_terms":
+                # P0-3: 改進 prompt，保留符號和允許中英文混合
+                prompt = f"""從以下問題中提取 3-5 個最重要的技術術語，用於搜尋技術文件。
 保留原始的符號名稱（如 NUM_CTX, THRESHOLD）和技術術語。
 可以是中文或英文，只輸出術語，用逗號分隔，不要解釋。
 
@@ -1337,91 +1357,85 @@ class KnowledgeBase:
 
 術語:"""
 
-                elif query_type == "translate":
-                    # P0-3: 雙語互譯（不只是中→英）
-                    if QUERY_BILINGUAL_ENABLED:
-                        if has_chinese and not has_english:
-                            # 純中文問題 → 翻譯成英文
-                            prompt = f"""把以下中文問題翻譯成簡潔的英文搜尋查詢，保留技術術語和符號名稱。
+            elif query_type == "translate":
+                # P0-3: 雙語互譯（不只是中→英）
+                if QUERY_BILINGUAL_ENABLED:
+                    if has_chinese and not has_english:
+                        # 純中文問題 → 翻譯成英文
+                        prompt = f"""把以下中文問題翻譯成簡潔的英文搜尋查詢，保留技術術語和符號名稱。
 只輸出英文查詢，不要解釋。
 
 中文: {question}
 
 English:"""
-                        elif has_english and not has_chinese:
-                            # 純英文問題 → 翻譯成中文（增加中文文件召回）
-                            prompt = f"""把以下英文問題翻譯成簡潔的中文搜尋查詢，保留技術術語和符號名稱。
+                    elif has_english and not has_chinese:
+                        # 純英文問題 → 翻譯成中文（增加中文文件召回）
+                        prompt = f"""把以下英文問題翻譯成簡潔的中文搜尋查詢，保留技術術語和符號名稱。
 只輸出中文查詢，不要解釋。
 
 English: {question}
 
 中文:"""
-                        elif has_chinese and has_english:
-                            # 中英混合 → 生成純英文版本
-                            prompt = f"""把以下問題轉換成純英文的搜尋查詢，保留所有技術術語和符號名稱。
+                    elif has_chinese and has_english:
+                        # 中英混合 → 生成純英文版本
+                        prompt = f"""把以下問題轉換成純英文的搜尋查詢，保留所有技術術語和符號名稱。
 只輸出英文查詢，不要解釋。
 
 問題: {question}
 
 English:"""
-                        else:
-                            continue
                     else:
-                        # 原有邏輯：只有中文才翻譯
-                        if has_chinese:
-                            prompt = f"""把以下中文問題翻譯成簡潔的英文搜尋查詢，保留技術術語。
+                        continue
+                else:
+                    # 原有邏輯：只有中文才翻譯
+                    if has_chinese:
+                        prompt = f"""把以下中文問題翻譯成簡潔的英文搜尋查詢，保留技術術語。
 只輸出英文查詢，不要解釋。
 
 中文: {question}
 
 English:"""
-                        else:
-                            continue
+                    else:
+                        continue
 
-                elif query_type == "code_hint":
-                    # 猜測可能的函式名/旗標名
-                    prompt = f"""根據以下問題，猜測可能相關的程式碼元素（函式名、變數名、旗標、常數名等）。
+            elif query_type == "code_hint":
+                # 猜測可能的函式名/旗標名
+                prompt = f"""根據以下問題，猜測可能相關的程式碼元素（函式名、變數名、旗標、常數名等）。
 只輸出 3-5 個可能的程式碼元素名稱，用逗號分隔。
 
 問題: {question}
 
 程式碼元素:"""
 
+            else:
+                continue
+
+            result = _gated_completion(
+                source="kb_multi_query",
+                prompt=prompt,
+                temperature=0.3,
+                timeout=20,
+            )
+
+            if result and len(result) < 200:
+                if query_type == "translate":
+                    # P0-3: 翻譯結果直接加入，並附上原始符號
+                    translated = result
+                    for sym in preserved_symbols:
+                        if sym not in translated:
+                            translated = f"{translated} {sym}"
+                    queries.append(translated)
                 else:
-                    continue
-
-                try:
-                    result = _gated_completion(
-                        source="kb_multi_query",
-                        prompt=prompt,
-                        temperature=0.3,
-                        timeout=20,
-                    )
-                except Exception:
-                    continue
-
-                if result and len(result) < 200:
-                    if query_type == "translate":
-                        # P0-3: 翻譯結果直接加入，並附上原始符號
-                        translated = result
-                        for sym in preserved_symbols:
-                            if sym not in translated:
-                                translated = f"{translated} {sym}"
-                        queries.append(translated)
-                    else:
-                        # 組合原始問題和術語
-                        terms = [t.strip() for t in re.split(r'[,，]', result)]
-                        # P0-3: 放寬過濾，允許中英文混合和符號
-                        terms = [t for t in terms if t and len(t) <= 40 and len(t.split()) <= 3]
-                        # 確保符號被保留
-                        for sym in preserved_symbols:
-                            if sym not in terms:
-                                terms.append(sym)
-                        if terms:
-                            queries.append(f"{question} {' '.join(terms[:6])}")
-
-        except Exception:
-            pass
+                    # 組合原始問題和術語
+                    terms = [t.strip() for t in re.split(r'[,，]', result)]
+                    # P0-3: 放寬過濾，允許中英文混合和符號
+                    terms = [t for t in terms if t and len(t) <= 40 and len(t.split()) <= 3]
+                    # 確保符號被保留
+                    for sym in preserved_symbols:
+                        if sym not in terms:
+                            terms.append(sym)
+                    if terms:
+                        queries.append(f"{question} {' '.join(terms[:6])}")
 
         return queries[:MULTI_QUERY_COUNT + 1]  # 原始 + N 個變體
 
@@ -1841,9 +1855,10 @@ English:"""
         source/type/section filter must permit a member before its node competes
         for top-k; expansion checks the individual members again.
         """
-        if (not RRF_ENABLED or not HAS_NUMPY or self._section_embeddings is None
+        if (not RRF_ENABLED or self._section_embeddings is None
                 or not self._section_nodes or top_k <= 0):
             return []
+        _require_numpy()
         eligible = {
             i for i, node in enumerate(self._section_nodes)
             if allowed_indices is None or any(
@@ -1929,8 +1944,9 @@ English:"""
         allowed_indices: set[int] | None,
     ) -> list:
         """Run one dense+lexical recall pass and keep scores in RRF units."""
+        _require_retrieval_dependencies()
         recall_k = max(1, candidate_k * 2)
-        if HAS_NUMPY and self._retrieval_matrix() is not None and self._embeddings_normalized:
+        if self._retrieval_matrix() is not None and self._embeddings_normalized:
             embedding_ranks = self._embedding_search_numpy(
                 q_emb, recall_k, allowed_indices=allowed_indices
             )
@@ -2007,7 +2023,7 @@ English:"""
         indices = [c.chunk_idx for c in candidates]
         dense = (
             {} if same_dense
-            else (self._gate_scores_for(indices, q_emb) if HAS_NUMPY else {})
+            else self._gate_scores_for(indices, q_emb)
         )
         lexical = (
             {} if same_lexical
@@ -2019,8 +2035,7 @@ English:"""
             elif dense:
                 candidate.gate_score = dense.get(candidate.chunk_idx, 0.0)
             else:
-                # 沒有 numpy 的 legacy 路徑：chunk 上有 inline 向量，且這種 KB
-                # 一定沒有 ctx（ctx 是新格式），retrieval 分數就是 content-only。
+                # 沒有矩陣的 legacy inline 向量沒有 ctx，retrieval 就是 content-only。
                 candidate.gate_score = candidate.retrieval_score
             candidate.gate_bm25 = (
                 candidate.retrieval_bm25 if same_lexical
@@ -2089,6 +2104,8 @@ English:"""
         if not self.loaded or not self.chunks:
             return []
 
+        _require_retrieval_dependencies()
+
         allowed_indices = self._matching_chunk_indices(metadata_filter)
         if allowed_indices is not None and not allowed_indices:
             return []
@@ -2106,7 +2123,7 @@ English:"""
                 # 使用完整的 multi-query
                 multi_queries = self._generate_multi_queries(question)
             elif USE_QUERY_EXPANSION:
-                # Fallback: 使用簡單的 query expansion
+                # 明確停用 multi-query 時，使用已啟用的 query expansion。
                 multi_queries = self._expand_query(question, force=True)
             else:
                 multi_queries = [question]
@@ -2171,12 +2188,13 @@ English:"""
     def _embedding_search_fallback(
         self, q_emb: list, top_k: int, allowed_indices: set[int] | None = None
     ) -> list:
-        """Fallback：Python 迴圈版 embedding 搜尋
+        """未建立矩陣的 inline 向量逐列搜尋（numpy 仍是必要依賴）。
 
         返回: [(emb_score, chunk_idx), ...] 按分數降序
         """
         if top_k <= 0:
             return []
+        _require_numpy()
         import heapq
         results = []
         for idx, chunk in enumerate(self.chunks):
@@ -2284,21 +2302,6 @@ English:"""
 
         # 其他情況：gate 分數較低時，需要 rerank
         return top_gate_score < 0.5
-
-    def _rerank_fallback(self, question: str, candidates: list, top_k: int, reason: str) -> list:
-        """Apply the configured fallback after the dedicated reranker cannot be used."""
-        policy = config.RERANK_FALLBACK_POLICY
-        if policy == "embedding":
-            return [c.chunk for c in candidates[:top_k]]
-        if policy == "main_model":
-            return self._rerank_with_llm(question, candidates, top_k)
-        if policy == "error":
-            raise RuntimeError(
-                "RAG reranker unavailable and client.json rerank_fallback_policy is \"error\". "
-                f"Reason: {reason}"
-            )
-        raise RuntimeError(f"Unknown RERANK_FALLBACK_POLICY: {policy!r}")
-
     def _rerank_with_model(self, question: str, candidates: list, top_k: int,
                            is_strict_mode: bool = False) -> list:
         """重排並保留 cross-encoder 分數，回 [(score, chunk), ...]。
@@ -2308,7 +2311,7 @@ English:"""
         整份蓋掉，reranker 實際上只剩「篩候選」的作用。實測（真實 spec）：
         reranker 排第一的 chunk 被 MMR 直接降到第二、甚至剔除。
 
-        沒有走到 cross-encoder 的路徑（跳過 rerank、fallback）score 是 None，
+        依明確設定或候選條件跳過 cross-encoder 的路徑 score 是 None，
         MMR 會退回原本的 embedding 相關度。
         """
         if not candidates:
@@ -2328,94 +2331,48 @@ English:"""
         rerank_count = (len(candidates) if any(c.section_rrf_score for c in candidates)
                         else min(len(candidates), batch_size))
 
-        if self._check_reranker_available():
-            try:
-                # reranker 的 document 側是檢索訊號（排序），可以帶 ctx；
-                # 組法的唯一定義在 context_signals，USE 關掉時逐位元組等同舊版。
-                use_ctx = use_generated_context()
-                scored = []
-                for start in range(0, rerank_count, batch_size):
-                    items = candidates[start:min(start + batch_size, rerank_count)]
-                    passages = [
-                        context_signals.reranker_passage(
-                            item.chunk, use_ctx=use_ctx,
-                            max_chars=RERANKER_PASSAGE_MAX_CHARS
-                        ) for item in items
-                    ]
-                    scores = llama_client.rerank(
-                        base_url=LLAMA_RERANK_BASE_URL,
-                        query=question,
-                        documents=passages,
-                        model=RERANKER_MODEL,
-                        timeout=60,
-                    )
-                    if len(scores) != len(items):
-                        raise RuntimeError(
-                            f"reranker returned {len(scores)} scores for {len(items)} passages"
-                        )
-                    scored.extend(
-                        (float(score), item.chunk) for score, item in zip(scores, items)
-                    )
-                scored.sort(reverse=True, key=lambda x: x[0])
-                return scored[:top_k]
-
-            except Exception as exc:
-                return [(None, chunk) for chunk in self._rerank_fallback(
-                    question, candidates, top_k, f"dedicated reranker call failed: {exc}"
-                )]
-
-        return [(None, chunk) for chunk in self._rerank_fallback(
-            question, candidates, top_k, "dedicated reranker is not reachable"
-        )]
-
-    def _rerank_with_llm(self, question: str, candidates: list, top_k: int) -> list:
-        """LLM Reranking (fallback)"""
-        if not candidates:
-            return []
-
-        docs_text = ""
-        for i, candidate in enumerate(candidates[:15]):
-            chunk = candidate.chunk
-            content = chunk.get('content', '')[:500]
-            source = chunk.get('source', '?')
-            page = chunk.get('page', '?')
-            docs_text += f"\n[DOC_{i}] ({source} p.{page}):\n{content}\n"
-
-        rerank_prompt = f"""你是文件相關性評估專家。
-
-用戶問題: {question}
-
-請根據相關性排序，返回最相關的 {top_k} 個文件編號。
-格式: DOC_0, DOC_2, DOC_5（逗號分隔，最相關在前）
-
-候選文件:
-{docs_text}
-
-排序結果:"""
-
-        try:
-            result = _gated_completion(
-                source="kb_llm_rerank",
-                prompt=rerank_prompt,
-                temperature=0,
-                timeout=60,
+        if not self._check_reranker_available():
+            raise DependencyError(
+                f"RAG reranker unavailable at {LLAMA_RERANK_BASE_URL}: "
+                "dedicated reranker is not reachable. "
+                "Start the configured deployment.json services.reranker before retrying."
             )
+        try:
+            # reranker 的 document 側是檢索訊號（排序），可以帶 ctx；
+            # 組法的唯一定義在 context_signals，USE 關掉時逐位元組等同舊版。
+            use_ctx = use_generated_context()
+            scored = []
+            for start in range(0, rerank_count, batch_size):
+                items = candidates[start:min(start + batch_size, rerank_count)]
+                passages = [
+                    context_signals.reranker_passage(
+                        item.chunk, use_ctx=use_ctx,
+                        max_chars=RERANKER_PASSAGE_MAX_CHARS
+                    ) for item in items
+                ]
+                scores = llama_client.rerank(
+                    base_url=LLAMA_RERANK_BASE_URL,
+                    query=question,
+                    documents=passages,
+                    model=RERANKER_MODEL,
+                    timeout=60,
+                )
+                if len(scores) != len(items):
+                    raise RuntimeError(
+                        f"reranker returned {len(scores)} scores for {len(items)} passages"
+                    )
+                values = [float(score) for score in scores]
+                if not all(math.isfinite(score) for score in values):
+                    raise RuntimeError("reranker scores must be finite numbers")
+                scored.extend((score, item.chunk) for score, item in zip(values, items))
+            scored.sort(reverse=True, key=lambda x: x[0])
+            return scored[:top_k]
 
-            doc_indices = []
-            for match in re.finditer(r'DOC_(\d+)', result):
-                idx = int(match.group(1))
-                if idx < len(candidates) and idx not in doc_indices:
-                    doc_indices.append(idx)
-                if len(doc_indices) >= top_k:
-                    break
-
-            if doc_indices:
-                return [candidates[i].chunk for i in doc_indices]
-
-        except Exception:
-            pass
-
-        return [c.chunk for c in candidates[:top_k]]
+        except Exception as exc:
+            raise DependencyError(
+                f"RAG reranker unavailable at {LLAMA_RERANK_BASE_URL}: {exc}. "
+                "Check the configured deployment.json services.reranker and retry."
+            ) from exc
 
     @staticmethod
     def _normalized_relevance(relevance: list | None) -> list | None:
@@ -2446,17 +2403,19 @@ English:"""
         if not chunks:
             return chunks[:k]
 
+        _require_numpy()
+
         rel = self._normalized_relevance(relevance)
         if rel is not None and len(rel) != len(chunks):
             rel = None
         if rel is None and not question_emb:
             return chunks[:k]
 
-        # 嘗試使用 numpy 加速
-        if HAS_NUMPY and len(chunks) > 3:
+        # 大池用矩陣；小池保留同一公式的逐列運算。
+        if len(chunks) > 3:
             return self._mmr_select_numpy(chunks, question_emb, k, lambda_, rel)
 
-        # Fallback：原始 Python 實作
+        # 小池的逐列實作不取决於套件是否存在。
         selected = []
         selected_embs = []
         relevance_by_id = {id(c): rel[i] for i, c in enumerate(chunks)} if rel else {}
@@ -3135,6 +3094,8 @@ English:"""
         if not self.loaded or not self.chunks:
             return "", "", empty_metadata
 
+        _require_retrieval_dependencies()
+
         if source:
             metadata_filter = dict(metadata_filter or {})
             metadata_filter["source"] = source
@@ -3682,7 +3643,7 @@ English:"""
             features.append("RRF")
 
         if USE_RERANKER:
-            reranker_type = "Model" if self._check_reranker_available() else "LLM"
+            reranker_type = "Model" if self._check_reranker_available() else "unavailable"
             always_on = "+" if RERANKER_ALWAYS_ON else ""
             features.append(f"Rerank{always_on}({reranker_type})")
 

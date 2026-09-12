@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 import config
+from runtime_dependencies import DEPENDENCY_ERROR_PREFIX, DependencyError
 
 
 _MAX_QUERY_TERMS = 12
@@ -133,6 +134,8 @@ def collect_safe_lexical_hits(executor, query: str,
     for term in query_terms(query):
         pattern = "(?i)" + re.escape(term)
         output = executor.grep(pattern, path=".", include=include, context=0)
+        if isinstance(output, str) and output.startswith(DEPENDENCY_ERROR_PREFIX):
+            raise DependencyError(output[len(DEPENDENCY_ERROR_PREFIX):])
         if not isinstance(output, str) or output.startswith("錯誤:"):
             continue
         for line in output.splitlines():
@@ -572,6 +575,8 @@ def build_code_context(
             )
             candidates.extend(graph_candidates)
             uncertainties.extend(graph_uncertainties)
+        except DependencyError:
+            raise
         except Exception as exc:
             graph_status = f"degraded: {type(exc).__name__}: {exc}"[:200]
             relationship_category = "degraded"

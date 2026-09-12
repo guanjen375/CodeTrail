@@ -692,10 +692,9 @@ def KB_CONTEXT_CACHE_DIR() -> str:
     return _os.path.join(home, ".cache", "codetrail", "ctx")
 
 RERANKER_MODEL = _DEPLOYMENT_PROFILE.service("reranker").model or ""
-#: **client.json 的使用者開關**(`rerank_fallback_policy`);這裡是預設。
-#: 合法值由 client.json 的 loader fail-loud 驗;這條不變式擋的是 repo 自己改壞。
+#: 相容既有 client.json 鍵,唯一合法值 error：專用 reranker 失敗就報錯。
 RERANK_FALLBACK_POLICY = "error"
-RERANK_FALLBACK_POLICIES = ("embedding", "main_model", "error")
+RERANK_FALLBACK_POLICIES = ("error",)
 if RERANK_FALLBACK_POLICY not in RERANK_FALLBACK_POLICIES:  # pragma: no cover - import guard
     raise ValueError(
         f"RERANK_FALLBACK_POLICY must be one of {list(RERANK_FALLBACK_POLICIES)};"
@@ -1097,11 +1096,12 @@ PATCH_MAX_LINES_PER_FILE = 200   # 單一檔案最多修改 200 行
 #   fix   — 會就地修改檔案（--fix / -w / -i / --write）
 #   check — 只回報、不改檔（--check / --dry-run / -l）
 # run_lint(fix=False) 走 check；該語言沒 check 命令時拒絕（不偷偷改檔）。
+# 每組只有一條主命令；缺失或失敗直接回錯誤。
 LINT_COMMANDS = {
     # Python
     '.py': {
-        'fix':   ['ruff check --fix', 'black', 'isort'],
-        'check': ['ruff check', 'black --check', 'isort --check'],
+        'fix':   ['ruff check --fix'],
+        'check': ['ruff check'],
     },
     '.pyx': {
         'fix':   ['ruff check --fix'],
@@ -1112,16 +1112,16 @@ LINT_COMMANDS = {
         'check': ['ruff check'],
     },
     # JavaScript/TypeScript
-    '.js':  {'fix': ['eslint --fix', 'prettier --write'], 'check': ['eslint', 'prettier --check']},
-    '.jsx': {'fix': ['eslint --fix', 'prettier --write'], 'check': ['eslint', 'prettier --check']},
-    '.ts':  {'fix': ['eslint --fix', 'prettier --write'], 'check': ['eslint', 'prettier --check']},
-    '.tsx': {'fix': ['eslint --fix', 'prettier --write'], 'check': ['eslint', 'prettier --check']},
+    '.js':  {'fix': ['eslint --fix'], 'check': ['eslint']},
+    '.jsx': {'fix': ['eslint --fix'], 'check': ['eslint']},
+    '.ts':  {'fix': ['eslint --fix'], 'check': ['eslint']},
+    '.tsx': {'fix': ['eslint --fix'], 'check': ['eslint']},
     # Go
-    '.go': {'fix': ['gofmt -w', 'go vet'], 'check': ['gofmt -l', 'go vet']},
+    '.go': {'fix': ['gofmt -w'], 'check': ['gofmt -l']},
     # Rust
     '.rs': {
-        'fix':   ['rustfmt', 'cargo clippy --fix --allow-dirty'],
-        'check': ['rustfmt --check', 'cargo clippy'],
+        'fix':   ['rustfmt'],
+        'check': ['rustfmt --check'],
     },
     # C/C++
     '.c':   {'fix': ['clang-format -i'], 'check': ['clang-format --dry-run --Werror']},

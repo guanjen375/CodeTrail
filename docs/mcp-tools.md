@@ -54,7 +54,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 專案探索 | `file_info(path)` | 讀檔前先看大小，避免一次塞爆 context |
 | 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=None)` | 讀檔案內容；省略 max_chars 時依 n_ctx 配置，長檔依結果的精確 start_line 分段 |
 | 文件/外部檔案 | `import_external_file(path, dest_name=None)` | 把允許來源的外部檔案複製進 `.aicode_uploads/` |
-| 文件/外部檔案 | `analyze_file(path, view="summary", target="", limit=0)` | 用 VL 分析各類圖片、一次性抽 PDF 文字（不入 KB）、分析 ELF 或 firmware blob。ELF 預設給總覽；`view` 可切到 `symbols` / `disasm` / `dwarf` / `strings` / `sections` / `memmap` / `relocs` / `imports` / `dynamic` / `headers`，`target` 指定 symbol、0x 位址、regex 或 `key:value` 篩選，`limit` 控制筆數（上限 5000）；單次輸出上限 25,000 字元，截斷會指出該用哪個 view 縮小範圍。缺 pyelftools 時退回 readelf 文字解析並在報告開頭明列缺失能力；細節見[analyze_file 的 ELF 視角](#analyze_file-的-elf-視角) |
+| 文件/外部檔案 | `analyze_file(path, view="summary", target="", limit=0)` | 用 VL 分析各類圖片、一次性抽 PDF 文字（不入 KB）、分析 ELF 或 firmware blob。ELF 預設給總覽；`view` 可切到 `symbols` / `disasm` / `dwarf` / `strings` / `sections` / `memmap` / `relocs` / `imports` / `dynamic` / `headers`，`target` 指定 symbol、0x 位址、regex 或 `key:value` 篩選，`limit` 控制筆數（上限 5000）；單次輸出上限 25,000 字元，截斷會指出該用哪個 view 縮小範圍。缺少或無法載入 pyelftools 時直接回錯誤；細節見[analyze_file 的 ELF 視角](#analyze_file-的-elf-視角) |
 | 文件/外部檔案 | `ingest_document(path, mode="auto", preflight_only=False, fresh=False, mineru_content_list=None, mineru_pdf_sha256=None)` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document`。PDF 的原生表格 / 向量文字 log 與純 raster 截圖、掃描頁、方塊圖都走結構化抽取；raster 會先分類為 table / terminal / prose / diagram，再帶 canonical payload、證據、品質與驗證狀態。**單張抽壞只讓那一張缺席**（其餘 figure 與全部文字 chunk 照常入庫，結果會列出是哪幾張，`review_figures(action="list")` 看得到 `in_kb=false`）；整份零寫入的是 VL 連不上／逾時、預算超限、capability probe 未過、來源檔中途被換掉這類契約破裂。`preflight_only=True` 只估成本、零寫入（僅 .pdf）。`fresh=True` 一步到位重建：清空既有 chunks、讓舊 embeddings cache 失效、只留這一份文件（同一次原子提交，失敗全回滾）。**不會為了 reset 去整批清除** `.codetrail/figures/`（ingest 本來就會寫入這一次的 run，提交後也可能依 retention 回收該文件沒被 KB 引用的舊 run — 那與 fresh 無關）。同一份文件再 ingest 時人工修正會沿用；但**被移出 KB 的其他文件之後重新 ingest 不會自動恢復人工確認**（revision 退回 1）。不可與 `preflight_only` 併用。**執行期間 server 不會被卡住**：跑在 worker thread、每 2 秒送一次零內容的 MCP progress；同一時間所有 KB 工具與第二個 ingest 會立刻回「稍後重試」（不排隊）。結果的標頭下會帶這一次 run 的待辦（`[CODETRAIL_ACTION_REQUIRED]`：待人工判斷 / 需修復或品質排除 / 無法覆核 / 抽取失敗 / 可行動缺席，各附下一步；沒有待辦就完全不印），逾時、非零 exit 或輸出不完整則帶 `[CODETRAIL_INGEST_FAILED]` 並回 `status: error` |
 | 文件/外部檔案 | `review_figures(action="list", document_id="", figure_id="", expected_revision=0, payload_json="", confirm_against_image=False)` | 覆核 PDF 結構化抽取的表格 / 終端機 log / diagram：`list` 唯讀列出 figure_id、頁碼、bbox、kind、驗證狀態、品質、人工確認狀態、處置、原因、原圖路徑與 canonical payload；`fix` 只收該 kind schema 的 structured payload + `expected_revision`，`confirm_against_image=True` 才升 `human_verified`。permission 設 `ask` |
 | 文件/外部檔案 | `remove_document(source)` | 從 KB 移除過期文件 |
@@ -84,7 +84,8 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
   參與選取，實際 evidence 仍受既有 candidate 與字元 budget 約束；只有呼叫關係證據缺席，
   `graph_status` 標示原因，`uncertainties` 會列出
   `呼叫關係證據不可用（relationship evidence unavailable: graph unavailable）；未看到 caller/callee 不代表不存在`
-  （graph 查詢途中出錯時 `graph unavailable` 改為 `graph degraded`）。
+  （graph 查詢途中出錯時 `graph unavailable` 改為 `graph degraded`）。必要 parser / rg
+  依賴失敗則整次回錯誤，不適用此資料缺席處理。
 - `mode="neighbors"`：query 放 symbol 名可看 1–2 hop 關係；放 repo 相對檔案路徑
   （例如 `src/uart.c`）可看 include / import 關係。
 - `mode="path"`：query 寫 `"SRC -> DST"`，回傳最多 3 條、最長 4 hop 的最短呼叫鏈。
@@ -317,7 +318,7 @@ MinerU 文字未獨立驗證。`query_knowledge` 的 REF 顯示 `text_lane=miner
 |---|---|---|
 | `summary`（預設） | Key Facts（架構 / 型別 / entry 對應的 symbol / stripped / linkage / symbol 統計含 LOCAL·UND·size=0 / relocation 數 / DWARF / 記憶體估算）、ELF header、LOAD segment、`.dynamic`、`.modinfo`、entry 反組譯（失敗會列原因）、Top functions（含 LOCAL/static）、imports、relocation 統計、DWARF CU、字串分類（version / diagnostic / format / url / path / command / config） | 不用 |
 | `symbols` | 完整 symbol 表：LOCAL / GLOBAL / WEAK、UND、size=0 全列，欄位 addr / size / type / bind / section / name（C++ 名稱附 demangle） | regex（`uart`）、篩選（`bind:LOCAL type:FUNC`、`ndx:UND`、`section:.text`、`table:.dynsym`，可混用）、`0x位址` = 反查落在哪個 symbol |
-| `disasm` | 反組譯；工具依序 objdump → 跨架構 `<triplet>-objdump` → capstone；全部不行時列出每個工具的失敗原因與補救（安裝對應 binutils / `pip install capstone` / `client.json` 的 `"objdump"`） | symbol 名、`0x位址`、`0x起-0x迄`、`0x位址+bytes`；省略 = entry point；`.o/.ko` 可加 `section:.init.text`；`limit` = 指令數（預設 48、上限 1000） |
+| `disasm` | 反組譯；只用 `client.json` 指定的 `objdump`，未指定則用 PATH 的 `objdump`；缺席、失敗或不支援架構即報錯 | symbol 名、`0x位址`、`0x起-0x迄`、`0x位址+bytes`；省略 = entry point；`.o/.ko` 可加 `section:.init.text`；`limit` = 指令數（預設 48、上限 1000） |
 | `dwarf` | 無 target：CU 列表（producer / 語言 / 位址範圍）與函式統計；regex：函式（low/high pc、來源檔:行、external/inline）＋ struct / union / class / enum / typedef 成員（offset、型別、bit field）；`0x位址`：對應來源檔:行與函式 | regex、`0x位址`、`kind:func` / `kind:type` |
 | `strings` | 全部可讀字串（ASCII 全檔 + UTF-16LE 前 4MB）含 offset、所屬 section、分類 | regex、`cat:diagnostic`（或 version / format / url / path / command / config / other）、`section:.rodata`、`min:12`、`enc:utf16` |
 | `sections` | 全部 section（type / addr / offset / size / flags / 所屬 segment）；指定 section 時給 hex dump + 字串 + 內含 symbol | section 名、`0x位址`；`limit` = dump bytes（預設 512、上限 4096） |
@@ -327,11 +328,11 @@ MinerU 文字未獨立驗證。`query_knowledge` 的 REF 顯示 `text_lane=miner
 | `dynamic` | `.dynamic` 全部 tag（NEEDED / SONAME / RPATH / RUNPATH / FLAGS / INIT_ARRAY…） | regex |
 | `headers` | ELF header、全部 program headers、section→segment、notes、`.comment`、`.modinfo` | 不用 |
 
-- 解析後端：優先 **pyelftools**（`requirements.txt` 已列入）；沒裝時退回 binutils `readelf` 文字解析，報告開頭會列出這條路徑**缺失的能力**（DWARF 型別、部分函式 / 行號精度）與補救命令，不是只標一個 parser 名字。兩條路徑填同一份模型、走同一套渲染，章節與欄位一致。
-- 反組譯覆蓋：系統 `objdump` 只認得自己的架構（Ubuntu 預設 x86）；ARM / AArch64 / RISC-V / MIPS / Xtensa / ARC 韌體要裝對應的 `binutils-<triplet>`（會自動找 `arm-none-eabi-objdump` 等常見名稱）、或 `pip install capstone`（不支援 ARC / 舊版 Xtensa）、或在 `client.json` 設 `"objdump": "/path/to/objdump"`。找不到時報告會說是哪個架構、試過哪些工具、各自的錯誤。
+- ELF 解析只使用 **pyelftools**（`requirements.txt` 已列入），包括已存在快取的查詢。缺席或載入失敗時回錯誤，不產生較差報告。C++ mangled symbol 需要 `c++filt`；無法執行、逾時或回應格式錯誤也會報錯。
+- 跨架構反組譯需要可處理該 ELF 的 objdump。請自行安裝合適的 binutils，並在 `client.json` 設 `"objdump": "/path/to/arm-none-eabi-objdump"` 等實際路徑。程式不自動尋找其他 cross binary，也不改用 Capstone。
 - `ingest_document` 對 ELF 走**長版**多視角報告（summary + 完整 symbol 表 + relocation 逐筆含 caller + DWARF CU / 函式 / 型別 + 全部分類字串 + memmap / sections / imports / dynamic），每個 view 以 `config.BIN_ELF_INGEST_MAX_CHARS`（400,000 字元）為**渲染階段的字元預算**（行容器達預算即停止收行，表格 / segment 分類這類來源都是 generator、預算用完就不再往下拉，所以各 view 在模型之外的中間資料與輸出預算成正比——模型本身的 symbol 表、字串清單、relocation 早就在記憶體裡，各有自己的安全上限；筆數上限則由「字元預算 ÷ 該 view 的最短行長」推出——symbols 一行至少 40 字元、imports 一行至少 5 字元，各自拿到不同的上限，都不可能比字元預算先到，也不會讓候選 heap / 清單長到遠超過預算能放的量），整份再以同一上限做比例分配，不受 `analyze_file` 單次 25K 的限制。沒超過上限就是完整（容器不預扣任何空間，剛好放得下的報告一個字都不少）；超過時各段**依比例截斷、各自註明**（原行數 / 字元數與該用哪個 view 分批查），不會有整段消失。`analyze_file` 的每個 view 也同樣在渲染階段以 25K 為字元預算，達到時才從尾端回收剛好夠的空間放一行說明（略過了幾行）。Cortex-M 向量表固定最多 512 筆（有向量 section 時以其大小為準）。解析層仍有安全上限並會在報告內註明：relocation 每個 section 保留前 20,000 筆（統計為全量）、DWARF 函式 30,000 個、型別 2,000 個（每個型別 256 個成員）、字串 100,000 條。
 - `target` 的 regex 只接受**正面表列的安全子集**（逐字元驗證，不是 heuristic）：字面、`.`、`[...]`、`^ $ \b`、**最上層**的 `|`（≤ 8 分支）、單一 atom 的 `* +`（合計 ≤ 1）與 `?`（合計 ≤ 3）；**不收任何群組**（`(uart|spi)_init` 請寫成 `uart_init|spi_init`——群組串接才會產生指數級的切分方式，例如 30 個連續 `(a|aa)`），也不接受 `{n,m}`、backreference、lookaround、inline flag、超過 200 字元。不在子集內的樣式會改成**字面比對**並在輸出註明原因。比對主體只看每個字串 / 名稱的前 300 個字元，所以單次比對的成本有上界（約 起點 × 分支 × 主體長 × 2^可選 ≈ 6×10⁶ 步；Python 的 `re` 沒有 timeout、不釋放 GIL，災難性回溯會卡住整個 MCP server）。另外 symbols / relocs / strings 的篩選有 20 秒預算，每一筆都檢查、零匹配也會停，逾時中止並標明結果不完整——那是「很多筆加起來太久」的保險，不是硬 timeout。
-- readelf fallback 會逐條記錄失敗的命令（timeout、非零 returncode、有輸出但解析不到），報告開頭列出，且 Key Facts 與 symbols / imports / relocs / dynamic / memmap / sections / DWARF / headers 各段都改講「讀取失敗」，不會說成「沒有 symbol / 沒有 relocation / 沒有 LOAD segment / 被 strip / 沒有 debug section」；readelf / objdump 一律以 `LC_ALL=C` 執行。
+- `objdump` 與 `c++filt` 以 `LC_ALL=C` 執行；工具依賴錯誤會一路傳到 MCP 的 `isError` 或 ingest 失敗狀態，不會被當成「没有 symbol」或部分成功。
 - `view` / `target` / `limit` 只對 ELF 有效；對圖片、PDF、非 ELF 二進位會被忽略並在回覆開頭註明。
 
 ### apply_patch 的兩種格式
@@ -361,7 +362,7 @@ void led_toggle(void) {
 
 **上限**：最多 5 個檔案；udiff 單檔 200 行（added+removed）；S/R 單檔 payload budget = SEARCH 行數 + REPLACE 行數（同檔所有區塊合計）≤ 200——兩者不是同一種計數。
 
-**檔案安全（兩格式相同）**：既有檔以 UTF-8 strict 讀取，非 UTF-8 → 整份 patch 拒絕、零寫入；BOM、CRLF、檔尾有無換行、權限位元原樣保留；CR-only 或 mixed newline 一律拒絕；目標或路徑上有 symlink 一律拒絕。單檔寫入：既有檔 = 同目錄唯一 temp（`O_EXCL` 建立、fsync）＋ `os.replace` 原子替換（寫入前重驗 preimage 未變）；新檔 = 同目錄 temp ＋ 不覆寫發布（POSIX 用 hard link，同名檔在 preflight 後冒出就中止而不是覆蓋；檔案系統不支援 hard link 時退回 lstat 檢查＋replace，並在結果第一段明示降級）；沒有 dir_fd 的平台（Windows）退回逐層 lstat 重驗並同樣明示。多檔是「全量 preflight＋失敗時 best-effort rollback」，不是跨檔交易——第二檔 preflight 失敗時第一檔也不會被改，寫入途中失敗會盡力還原已寫入的檔案，還原不了的項目如實回報。
+**檔案安全（兩格式相同）**：既有檔以 UTF-8 strict 讀取，非 UTF-8 → 整份 patch 拒絕、零寫入；BOM、CRLF、檔尾有無換行、權限位元原樣保留；CR-only 或 mixed newline 一律拒絕；目標或路徑上有 symlink 一律拒絕。單檔寫入：既有檔 = 同目錄唯一 temp（`O_EXCL` 建立、fsync）＋ `os.replace` 原子替換（寫入前重驗 preimage 未變）；新檔 = 同目錄 temp ＋ 不覆寫發布（必須支援 hard link；同名檔在 preflight 後冒出就中止；不支援 hard link 時整批中止並回滾）；缺少 dir_fd / `O_NOFOLLOW` / `O_DIRECTORY` 的平台拒絕操作。多檔是「全量 preflight＋失敗時 best-effort rollback」，不是跨檔交易——第二檔 preflight 失敗時第一檔也不會被改，寫入途中失敗會盡力還原已寫入的檔案，還原不了的項目如實回報。
 
 **dry_run**：只做 preflight、零副作用（不建目錄、不留 temp、不跑驗證），逐檔固定回報 `format`、檔案清單、`blocks`（區塊數）、`budget`（payload 用量／上限）、`locations`（定位行）、`new_file`（是否新建）；全部通過才顯示唯一的一行 `would apply`。
 

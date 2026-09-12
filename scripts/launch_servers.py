@@ -47,6 +47,7 @@ from deployment_profile import (  # noqa: E402
     warn_cpu_moe_fit_conflicts,
 )
 from scripts import stop_servers  # noqa: E402
+from runtime_dependencies import DependencyError  # noqa: E402
 
 WINDOWS = {
     "main": "main",
@@ -385,7 +386,10 @@ def _rollback_started(
     # VRAM 會多掛數十秒;不等它結束就返回,立刻重跑會撞 port/容量誤判。
     pane_pids: dict[int, str] = {}
     for session in created_sessions:
-        pane_pids.update(stop_servers._pane_pids(session))
+        try:
+            pane_pids.update(stop_servers._pane_pids(session))
+        except (DependencyError, OSError) as exc:
+            print(f"[rollback] 無法取得待停止的 PID: {exc}", file=sys.stderr)
     for session in created_sessions:
         process_env.run(
             ["tmux", "kill-session", "-t", session],
@@ -401,6 +405,9 @@ def _rollback_started(
         except KeyboardInterrupt:
             leftover = []
             print("[rollback] 略過等待 VRAM 釋放(Ctrl-C)", file=sys.stderr)
+        except DependencyError as exc:
+            leftover = []
+            print(f"[rollback] 無法驗證 VRAM 釋放: {exc}", file=sys.stderr)
         if leftover:
             print(
                 f"[rollback] ⚠ 部分 process 尚未釋放 VRAM(PID:"

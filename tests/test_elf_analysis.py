@@ -8,15 +8,15 @@
    - 註解宣稱結構化路徑可取得 relocation，但實作根本沒解析（comment #7）
    - 反組譯失敗時整段省略、不說原因；x86 主機的 objdump 對 ARM/RISC-V/ARC 韌體全部
      拿不到反組譯卻沒有任何提示（comment #8）
-   - pyelftools 缺席時報告只標 parser 名字，不講哪些能力沒了（comment #2）
+   - pyelftools 缺席必須明確拒絕，不得產生較差報告（comment #2 與 A-only 契約）
 2. 無聲失敗風險的契約：
    - 未知 view 必須回錯誤並列出可用 view（不是默默當 summary）
    - hard cap 截斷必須帶說明（不是砍掉就算）
    - ingest_document 走長版報告（comment #11）：不能還是那份 25K 的 summary
    - analyze_file 要把 view / target / limit 傳到 ELF 路徑；非 ELF 檔案要明講已忽略
 
-全部離線：用純 Python 手工組一個最小 ET_REL x86-64 ELF，不需要 gcc；只有 fallback
-那條會呼叫 binutils readelf（缺就 skip）。
+全部離線：用純 Python 手工組最小 ELF；缺失主依賴以 monkeypatch 注入。
+跨架構反組譯回應由 fixture 提供，不假裝主機支援其他架構。
 """
 from __future__ import annotations
 
@@ -219,33 +219,25 @@ def test_relocations_are_parsed_with_caller(elf_path: Path):
 
 @pytest.mark.smoke
 def test_disasm_failure_is_explained_not_omitted(elf_path: Path, monkeypatch):
-    """comment #8：反組譯失敗以前直接省略。沒有可用的 objdump / capstone 時要說明原因與補救。"""
-    monkeypatch.setattr(elf_analysis, "_objdump_candidates", lambda machine: [])
-    monkeypatch.setattr(elf_analysis, "_capstone_disasm",
-                        lambda model, plan, limit: (False, "未安裝（python3 -m pip install capstone）"))
+    """反組譯主工具缺失必須說明原因與配置方式；不得省略或改另一個 backend。"""
+    monkeypatch.setattr(elf_analysis, "cmd_exists", lambda command: False)
     out = media.read_elf(str(elf_path), view="disasm", target="main")
-    assert "[反組譯不可用]" in out, out
-    assert "capstone" in out and "補救" in out and "objdump" in out
-    # 找不到 symbol 也要講，不能空白
+    assert out.startswith("[ELF 錯誤]"), out
+    assert "補救" in out and "objdump" in out and "client.json" in out
     missing = media.read_elf(str(elf_path), view="disasm", target="no_such_symbol")
     assert "找不到 symbol" in missing
 
 
 @pytest.mark.smoke
-def test_readelf_fallback_declares_missing_capabilities(elf_path: Path, monkeypatch):
-    """comment #2：pyelftools 缺席時只標了 parser 名字。fallback 必須明列缺失能力與補救，
-    且基本資料（LOCAL 函式、relocation）不能跟結構化路徑差一截。"""
-    if not shutil.which("readelf"):
-        pytest.skip("binutils readelf 不存在，無法驗 fallback")
+def test_missing_pyelftools_declares_required_dependency(elf_path: Path, monkeypatch):
+    """缺主解析器立即拒絕並說明修復，不能發布替代報告。"""
     monkeypatch.setattr(elf_analysis, "_HAS_PYELFTOOLS", False)
-    elf_analysis._MODEL_CACHE.clear()
-    media._ELF_CACHE.clear()
     out = media.read_elf(str(elf_path))
-    assert "readelf 文字解析" in out
-    assert "缺少以下能力" in out and "pyelftools" in out, out
-    assert "helper_static" in out and "【Relocations】" in out and "R_X86_64_PLT32" in out
-    model = elf_analysis.load_model(elf_path)
-    assert model.parser == "readelf" and model.missing
+    assert out.startswith("[ELF 錯誤]"), out
+    assert "pyelftools" in out and "pip install" in out
+    assert "helper_static" not in out and "【Relocations】" not in out
+    with pytest.raises(elf_analysis.ELFDependencyError, match="pyelftools"):
+        elf_analysis.load_model(elf_path)
 
 
 # ---------------------------------------------------------------------------
@@ -340,27 +332,13 @@ def test_ingest_keeps_relocs_without_symbol(elf_path: Path):
 
 
 @pytest.mark.smoke
-def test_readelf_fallback_reports_command_failure_not_stripped(elf_path: Path, monkeypatch):
-    """審核 #2：fallback 吞掉 readelf 失敗 → -sW 失敗被報成 fully stripped、-rW 失敗報成沒有 relocation。"""
-    if not shutil.which("readelf"):
-        pytest.skip("binutils readelf 不存在，無法驗 fallback")
+def test_missing_elf_parser_cannot_report_stripped_or_no_relocations(elf_path: Path, monkeypatch):
+    """不可觀測不等於 fully stripped 或沒有 relocation，保留原事故的錯誤結論防線。"""
     monkeypatch.setattr(elf_analysis, "_HAS_PYELFTOOLS", False)
-    real_run = elf_analysis.run_cmd
-
-    def flaky(cmd, timeout=30):
-        if cmd[0] == "readelf" and cmd[1] in ("-sW", "-rW"):
-            return None, "timeout"
-        return real_run(cmd, timeout)
-
-    monkeypatch.setattr(elf_analysis, "run_cmd", flaky)
-    elf_analysis._MODEL_CACHE.clear()
-    media._ELF_CACHE.clear()
-    out = media.read_elf(str(elf_path))
-    assert "fully stripped" not in out, out
-    assert "readelf -sW" in out and "timeout" in out
-    relocs = media.read_elf(str(elf_path), view="relocs")
-    assert "沒有 relocation section" not in relocs
-    assert "readelf -rW" in relocs and "timeout" in relocs
+    for view in ("summary", "relocs"):
+        out = media.read_elf(str(elf_path), view=view)
+        assert out.startswith("[ELF 錯誤]") and "pyelftools" in out, out
+        assert "fully stripped" not in out and "沒有 relocation section" not in out
 
 
 @pytest.mark.smoke
@@ -420,7 +398,7 @@ def test_section_dump_limit_matches_mcp_schema():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.smoke
-def test_arm_vector_table_is_bounded(tmp_path: Path):
+def test_arm_vector_table_is_bounded(tmp_path: Path, monkeypatch):
     """審核三 #1：ingest 把 10**9 當 limit 傳給 memmap，向量表會把整個 LOAD segment 讀成 IRQ。"""
     p = build_arm_exec_elf(tmp_path / "cm.elf", n_words=4000)
     media.set_sandbox_root(str(tmp_path), allow_external=False)
@@ -429,7 +407,12 @@ def test_arm_vector_table_is_bounded(tmp_path: Path):
     vt = elf_analysis.arm_vector_table(model, limit=10 ** 9)
     assert vt is not None
     assert len(vt["entries"]) <= elf_analysis._VECTOR_MAX_ENTRIES <= 512, len(vt["entries"])
+    # 測向量表的 budget，不依賴主機 objdump 是否支援 ARM。
+    monkeypatch.setattr(elf_analysis, "cmd_exists", lambda command: True)
+    monkeypatch.setattr(elf_analysis, "_run_capture", lambda *args, **kwargs:
+                        (0, " 08000100:\t00 bf\tnop\n", ""))
     doc = media.read_binary_for_ingest(str(p))
+    assert not doc.startswith("[ELF 錯誤]"), doc
     assert doc.count("IRQ") < 600, doc.count("IRQ")
 
 
@@ -493,31 +476,14 @@ def test_filter_deadline_is_checked_even_with_zero_matches(elf_path: Path, monke
 
 
 @pytest.mark.smoke
-def test_readelf_fallback_failure_propagates_to_memmap_sections_dwarf(elf_path: Path, monkeypatch):
-    """審核三 #4：failed 只被 symbols / relocs / dynamic 消費；-lW / -SW 失敗後 memmap 仍說
-    「沒有 LOAD」、sections 說「被 strip」、DWARF 說「沒有 debug section」——同一份輸出自相矛盾。"""
-    if not shutil.which("readelf"):
-        pytest.skip("binutils readelf 不存在，無法驗 fallback")
+def test_missing_elf_parser_refuses_memmap_sections_and_dwarf(elf_path: Path, monkeypatch):
+    """各 view 必須一致拒絕缺主解析器，不能捏造無 LOAD/section/debug 的結論。"""
     monkeypatch.setattr(elf_analysis, "_HAS_PYELFTOOLS", False)
-    real_run = elf_analysis.run_cmd
-
-    def flaky(cmd, timeout=30):
-        if cmd[0] == "readelf" and cmd[1] in ("-lW", "-SW"):
-            return None, "timeout"
-        return real_run(cmd, timeout)
-
-    monkeypatch.setattr(elf_analysis, "run_cmd", flaky)
-    elf_analysis._MODEL_CACHE.clear()
-    media._ELF_CACHE.clear()
-    # 斷言鎖的是「錯誤結論」那句原文；「讀取失敗（不能當成沒有…）」是正確的講法
-    memmap = media.read_elf(str(elf_path), view="memmap")
-    assert "REL 檔（.o / .ko）沒有 LOAD segment" not in memmap and "readelf -lW" in memmap, memmap
-    sections = media.read_elf(str(elf_path), view="sections")
-    assert "沒有 section header（可能被 strip 掉）" not in sections and "readelf -SW" in sections, sections
-    dwarf = media.read_elf(str(elf_path), view="dwarf")
-    assert "【DWARF】沒有 debug section" not in dwarf and "讀取失敗" in dwarf, dwarf
-    summary = media.read_elf(str(elf_path))
-    assert "DWARF    : absent" not in summary, summary
+    for view in ("summary", "memmap", "sections", "dwarf"):
+        out = media.read_elf(str(elf_path), view=view)
+        assert out.startswith("[ELF 錯誤]") and "pyelftools" in out, out
+        assert "沒有 LOAD segment" not in out
+        assert "沒有 section header" not in out and "DWARF    : absent" not in out
 
 
 @pytest.mark.smoke
@@ -567,24 +533,12 @@ def test_view_output_is_bounded_during_generation(elf_path: Path):
 
 
 @pytest.mark.smoke
-def test_readelf_sections_only_failure_does_not_fake_memmap_stats(elf_path: Path, monkeypatch):
-    """審核四 #3：只有 -SW 失敗時，memmap 用空的 sections 算出 code/rodata/data/bss 全 0。"""
-    if not shutil.which("readelf"):
-        pytest.skip("binutils readelf 不存在，無法驗 fallback")
+def test_missing_elf_parser_does_not_fake_zero_memmap_stats(elf_path: Path, monkeypatch):
+    """缺 parser 不能用空 sections 偽造 code/rodata/data/bss 全 0。"""
     monkeypatch.setattr(elf_analysis, "_HAS_PYELFTOOLS", False)
-    real_run = elf_analysis.run_cmd
-
-    def flaky(cmd, timeout=30):
-        if cmd[0] == "readelf" and cmd[1] == "-SW":
-            return None, "timeout"
-        return real_run(cmd, timeout)
-
-    monkeypatch.setattr(elf_analysis, "run_cmd", flaky)
-    elf_analysis._MODEL_CACHE.clear()
-    media._ELF_CACHE.clear()
     memmap = media.read_elf(str(elf_path), view="memmap")
-    assert "code 0 B" not in memmap, memmap
-    assert "readelf -SW" in memmap, memmap
+    assert memmap.startswith("[ELF 錯誤]") and "pyelftools" in memmap, memmap
+    assert "code 0 B" not in memmap
 
 
 @pytest.mark.smoke

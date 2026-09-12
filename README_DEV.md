@@ -539,13 +539,13 @@ journaled 寫入 → best-effort rollback。
   狀態機、path 規則、`FileSnapshot`（UTF-8 strict、BOM、LF/CRLF、mode/ino/dev）、exact+rstrip
   定位、結構化 mismatch record 與單一 renderer（整次回覆的 mismatch 預覽合計 40 行／2000 字元）、
   寫入層與 `WriteJournal`。POSIX 上以 dir_fd 錨定實作（逐層 `O_DIRECTORY|O_NOFOLLOW`、同目錄
-  temp、既有檔 `os.replace`、新檔以不覆蓋既存檔的方式發布）；沒有 dir_fd 的平台退回逐層 lstat
-  重驗，並在結果第一段明示。已驗證的行為契約（`tests/test_apply_patch.py`）：preflight 後
+  temp、既有檔 `os.replace`、新檔以 hard link 不覆蓋發布）；缺少 dir_fd / nofollow 時拒絕操作，
+  hard link 不可用時中止並回滾。已驗證的行為契約（`tests/test_apply_patch.py`）：preflight 後
   preimage 被改 → 中止並回滾（`test_preimage_changed_after_preflight_aborts_and_rolls_back`）、
   新檔目標在 preflight 後被競爭者建立 → 中止且不覆蓋
   （`test_new_target_created_by_competitor_after_preflight_aborts`）、第一檔已寫入後被第三方修改
   → rollback 保留現況並回報 conflict（`test_rollback_does_not_overwrite_third_party_modification`）、
-  dir_fd 退回路徑仍擋 symlink（`test_dirfd_fallback_reports_degraded_note_and_still_blocks_symlinks`）。
+  dir_fd 不可用時零寫入（`test_missing_dirfd_refuses_patch_and_keeps_targets_untouched`）。
   這些競態防線是以 monkeypatch 在既定時點注入變更來驗證，不是真實併發測試。
 - `patch_verify.py`：套用後的自動驗證只做同 process、無 subprocess、唯讀的 syntax check
   （`.py`/`.pyi` 用 ast；C/C++ 只在釘版 tree-sitter grammar 載入時檢查 ERROR 與零寬 MISSING
@@ -694,7 +694,7 @@ llama-server 啟動時 `-c <N>` 已經把 ctx + KV cache 鎖死,所以 doctor / 
 |---|---|
 | `gpu_safety.py` | 純 library:`query_gpu_info()` 跑 nvidia-smi 拿 GPU info(純診斷)、`query_server_info()` 打 llama-server `/props` 抓 `default_generation_settings.n_ctx` + `model_path`、`check_safety(requested_ctx, base_url)` 比對後包成 `SafetyVerdict`。所有 I/O 都用 hook 參數注入,測試可完全離線 mock。 |
 | `n_ctx.py` / `config.py::N_CTX` | 主模型 n_ctx 的界線與靜態預設。設定入口是 `set_config.sh --ctx`(寫進 deployment profile 與 server 的 `-c`)。`NUM_CTX` / `NUM_CTX_FULL_MODE` / `DYNAMIC_NUM_CTX_MAX` 只是相容 alias,永遠等於 `N_CTX` —— `config.set_runtime_n_ctx()` 是**同時**改這四個名字的唯一入口。 |
-| `client_preflight.observe_n_ctx()` | runtime 取值。先問主 server 的 `/props`(啟動時的 `-c` 是真值),問不到才退回 profile 的 `main.ctx`;結果以 **argv**(`mcp_server --n-ctx`)與 `EngineOptions` 交給每一個元件,不經環境變數。 |
+| `client_preflight.observe_n_ctx()` | TUI 與 headless `run` 都必須從主 server 的 `/props` 讀到正整數 n_ctx；失敗就拒絕啟動模型回合。相同值以 **argv**(`mcp_server --n-ctx`)與 `EngineOptions` 交給每一個元件，不經環境變數、不改用 profile 容量。 |
 | `client_preflight.check_ctx_safety()` | 容量閘。以觀測到的 requested 呼 `gpu_safety.check_safety()`;`requested <= server n_ctx` 放行,只有 `>` 才 `PreflightError`。**沒有逃生口**:以前的 `AICODE_ACCEPT_CTX_RISK` / `AICODE_CTX_SAFETY_DISABLE` 已刪除且無替代。 |
 | `context_budget.py::_emit_runtime_offload_check_once` | runtime 觀測 hook:`[CTX] WARNING` 或 `[CTX_OVERFLOW]` 觸發時順手查一次 `/slots` + `/props`,把 server 真實 n_ctx / 忙碌 slot 數 黏在 log 後面。每個 process 只跑一次,任何錯誤靜默吞掉。 |
 
@@ -721,10 +721,10 @@ runtime 由 preflight 觀測 `/props` 的實值,以 argv 交給每一個元件�
 ### 沒有解的事(刻意留)
 
 - 估算還是 `CHARS_PER_TOKEN` heuristic。`actual_prompt_eval_count` 已蒐集,之後可以做 per-model 校正,但這次不引入 tokenizer 依賴。
-- `knowledge.py` 的三個主模型 call site(query expansion / multi-query / LLM rerank)
-  已經走 `_gated_completion`,那是它們的唯一出口。**不要**再從那個檔直接呼
-  `llama_client.native_completion`——`_rerank_with_llm` 會把 15 個候選各 500 字塞進
-  prompt,超了之後 llama-server 是從前面截掉,模型看到半份清單照樣回一組 DOC_n。
+- `knowledge.py` 的兩個主模型 call site（query expansion / multi-query）都走
+  `_gated_completion`，那是它們的唯一出口。**不要**從該檔直接呼叫
+  `llama_client.native_completion`，否則超長 prompt 可能被 server 從前面截掉。
+  rerank 只使用專用 reranker，主模型 rerank 路徑已移除。
 - `code_rag.py` 與 `media.py` / `RAG.py` / `figure_verify.py` **刻意不接**這個 gate,
   理由不是「還沒做」:
   - `code_rag.py` 只打 `/embedding` 與 `/reranking`,那是另外兩台 server 的 input
@@ -883,8 +883,8 @@ CJK 沒有大小寫,所以「PASS 畫面截圖如下：」的拉丁部分是大�
 
 現在 `_rerank_with_model` 回 `[(score, chunk), ...]`,分數一路帶到 `_mmr_select` 當
 相關度(min-max 正規化到 [0,1],才跟餘弦的多樣性懲罰同量級),embedding 只負責算
-多樣性懲罰。**沒有走到 cross-encoder 的路徑**(跳過 rerank、reranker 不可用而
-fallback)分數是 None,MMR 退回原本的 embedding 相關度,那條路徑行為不變。
+多樣性懲罰。**依設定或候選內容跳過 cross-encoder** 時分數是 None，MMR 使用
+embedding 相關度。啟用的 reranker 不可用時直接報錯，不能把服務故障當成跳過。
 
 實務效果(8 題真題):`PASS 畫面截圖如下：`、章首導言這類雜訊 chunk 被換成真正的
 章節;`1.6.4 測試結果是什麼` 這種指名章節的查詢終於撈得到 1.6.4。

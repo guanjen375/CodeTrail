@@ -1431,8 +1431,8 @@ def test_runtime_status_short_when_unavailable():
 # (以 AICODE_MODEL / AICODE_N_CTX / AICODE_CTX_SAFETY_DISABLE /
 # AICODE_ACCEPT_CTX_RISK 四個環境變數驅動,exit code 當閘)。那支 CLI 與那四個
 # 變數在 2026-09-04 一起刪除:閘移進 client_preflight,requested 來自觀測到的
-# server n_ctx,逃生口無替代(要跳過就是修那個檢查)。斷言的行為沒變 ——
-# 「requested > server 就擋住、== 或 < 放行、UNKNOWN 不擋」逐條保留。
+# server n_ctx,逃生口無替代(要跳過就是修那個檢查)。容量不足仍擋住、== 或 < 放行；
+# A-only 契約另要求 UNKNOWN 拒絕啟動，不能用未知容量放行。
 
 
 class _FakeService:
@@ -1499,12 +1499,13 @@ def test_ctx_gate_refuses_when_requested_exceeds_server(monkeypatch):
 
 
 @pytest.mark.smoke
-def test_ctx_gate_is_non_blocking_when_the_server_cannot_be_observed(monkeypatch):
-    """UNKNOWN(server 沒起來 / 沒回 /props)只警告不擋 —— 否則沒開 server 就進不去。"""
+def test_ctx_gate_refuses_when_the_server_cannot_be_observed(monkeypatch):
+    """UNKNOWN 沒有容量證據，必須拒絕啟動。"""
     monkeypatch.setattr(gpu_safety, "check_safety", _verdict_factory("UNKNOWN", None))
     result = client_preflight.Preflight(root=Path("/tmp"))
 
-    client_preflight.check_ctx_safety(result, _FakeProfile(), 65536)
+    with pytest.raises(client_preflight.PreflightError, match="無法驗證"):
+        client_preflight.check_ctx_safety(result, _FakeProfile(), 65536)
 
 
 @pytest.mark.smoke
@@ -1538,13 +1539,13 @@ def test_the_ctx_gate_asks_the_endpoint_from_the_profile_not_the_environment(mon
         calls["requested"] = requested
         calls["base_url"] = base_url
         return SafetyVerdict(
-            status="UNKNOWN",
+            status="SAFE",
             requested_ctx=requested,
-            server_n_ctx=None,
+            server_n_ctx=requested,
             model_path=None,
             vram_total_gb=None,
             vram_free_gb=None,
-            reason="test unknown",
+            reason="test observed capacity",
         )
 
     monkeypatch.setattr(gpu_safety, "check_safety", fake_check_safety)
@@ -1613,19 +1614,21 @@ def test_observed_n_ctx_comes_from_the_running_server(monkeypatch):
         ),
     ],
 )
-def test_an_unobservable_server_falls_back_to_the_configured_ctx(monkeypatch, query):
-    """server 讀不到不是啟動失敗 —— 退回 deployment profile 的 main.ctx。"""
+def test_an_unobservable_server_rejects_configured_ctx_substitution(monkeypatch, query):
+    """設定值不能代替主 server 的 live 容量證據。"""
     monkeypatch.setattr(gpu_safety, "query_server_info", query)
     result = client_preflight.Preflight(root=Path("/tmp"))
 
-    assert client_preflight.observe_n_ctx(result, _FakeProfile(ctx=32768)) == 32768
+    with pytest.raises(client_preflight.PreflightError, match="n_ctx"):
+        client_preflight.observe_n_ctx(result, _FakeProfile(ctx=32768))
+    assert result.n_ctx == 0
 
 
 def test_no_server_and_no_configured_ctx_fails_loud(monkeypatch):
     monkeypatch.setattr(gpu_safety, "query_server_info", lambda _url: None)
     result = client_preflight.Preflight(root=Path("/tmp"))
 
-    with pytest.raises(client_preflight.PreflightError, match="main.ctx"):
+    with pytest.raises(client_preflight.PreflightError, match="n_ctx"):
         client_preflight.observe_n_ctx(result, _FakeProfile(ctx=0))
 
 

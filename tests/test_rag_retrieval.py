@@ -4,7 +4,7 @@
 test_contextual_signals.py 有逐條標的 smoke(拒答閘與 reranker passage 那幾條),
 另外兩份沒有 → 本檔不用 module 層 pytestmark。
 
-test_rag_rerank.py —— 重排序:rerank policy(何時呼叫、失敗如何降級)與 MMR 不得蓋掉
+test_rag_rerank.py —— 重排序:rerank policy(何時呼叫、依賴失敗必須報錯)與 MMR 不得蓋掉
 reranker 名次(它本身合併自 test_rag_rerank_policy.py 與 test_rerank_mmr_relevance.py,
 2026-08-20)。
 
@@ -42,6 +42,7 @@ import RAG
 import utils
 from knowledge import Candidate, KnowledgeBase
 from knowledge_store import KnowledgeStoreError
+from runtime_dependencies import DependencyError
 
 
 # ── 原 test_rag_rerank.py:rerank policy 與 MMR 不得蓋掉 reranker 名次 ──
@@ -69,33 +70,28 @@ def test_knowledge_rerank_policy_embedding_does_not_call_main_model(monkeypatch,
     def fail_llm(*args, **kwargs):
         raise AssertionError("main model rerank must not be called")
 
-    monkeypatch.setattr(kb, "_rerank_with_llm", fail_llm)
+    monkeypatch.setattr(knowledge, "_gated_completion", fail_llm)
 
-    out = kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True)
+    with pytest.raises(DependencyError, match="RAG reranker unavailable"):
+        kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True)
 
-    assert [chunk for _score, chunk in out] == [candidates[0].chunk, candidates[1].chunk]
 
-
-def test_knowledge_rerank_policy_main_model_calls_llm(monkeypatch, tmp_path):
+def test_knowledge_rerank_policy_main_model_rejects_missing_reranker(monkeypatch, tmp_path):
     kb = knowledge.KnowledgeBase(str(tmp_path / "missing.json"))
     candidates = _kb_candidates()
-    sentinel = [{"id": "llm"}]
     called = {"value": False}
     monkeypatch.setattr(config, "RERANK_FALLBACK_POLICY", "main_model")
     monkeypatch.setattr(kb, "_check_reranker_available", lambda: False)
 
-    def fake_llm(question, got_candidates, top_k):
+    def fake_llm(**_kwargs):
         called["value"] = True
-        assert got_candidates is candidates
-        assert top_k == 2
-        return sentinel
+        return "DOC_0, DOC_1"
 
-    monkeypatch.setattr(kb, "_rerank_with_llm", fake_llm)
+    monkeypatch.setattr(knowledge, "_gated_completion", fake_llm)
 
-    out = kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True)
-    assert [chunk for _score, chunk in out] == sentinel
-    assert called["value"] is True
-    assert called["value"] is True
+    with pytest.raises(DependencyError, match="RAG reranker unavailable"):
+        kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True)
+    assert called["value"] is False
 
 
 def test_knowledge_rerank_policy_error_raises_when_unavailable(monkeypatch, tmp_path):
@@ -103,7 +99,7 @@ def test_knowledge_rerank_policy_error_raises_when_unavailable(monkeypatch, tmp_
     monkeypatch.setattr(config, "RERANK_FALLBACK_POLICY", "error")
     monkeypatch.setattr(kb, "_check_reranker_available", lambda: False)
 
-    with pytest.raises(RuntimeError, match="RAG reranker unavailable"):
+    with pytest.raises(DependencyError, match="RAG reranker unavailable"):
         kb._rerank_with_model("question", _kb_candidates(), top_k=2, is_strict_mode=True)
 
 
@@ -117,11 +113,10 @@ def test_knowledge_rerank_policy_embedding_handles_rerank_exception(monkeypatch,
     def fail_llm(*args, **kwargs):
         raise AssertionError("main model rerank must not be called")
 
-    monkeypatch.setattr(kb, "_rerank_with_llm", fail_llm)
+    monkeypatch.setattr(knowledge, "_gated_completion", fail_llm)
 
-    out = kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True)
-
-    assert [chunk for _score, chunk in out] == [candidates[0].chunk, candidates[1].chunk]
+    with pytest.raises(DependencyError, match="RAG reranker unavailable.*boom"):
+        kb._rerank_with_model("question", candidates, top_k=2, is_strict_mode=True)
 
 
 def _code_candidates():
@@ -137,23 +132,18 @@ def test_code_rag_error_policy_raises_when_reranker_unavailable(monkeypatch, tmp
     monkeypatch.setattr(config, "RERANK_FALLBACK_POLICY", "error")
     monkeypatch.setattr(rag, "_check_reranker_available", lambda: False)
 
-    with pytest.raises(RuntimeError, match="Code RAG reranker unavailable"):
+    with pytest.raises(DependencyError, match="Code RAG reranker unavailable"):
         rag._rerank_code_candidates("question", _code_candidates(), top_k=2)
 
 
-def test_code_rag_main_model_policy_keeps_embedding_order(monkeypatch, tmp_path):
+def test_code_rag_main_model_policy_rejects_missing_reranker(monkeypatch, tmp_path):
     rag = code_rag.CodeRAG(str(tmp_path))
     candidates = _code_candidates()
     monkeypatch.setattr(config, "RERANK_FALLBACK_POLICY", "main_model")
     monkeypatch.setattr(rag, "_check_reranker_available", lambda: False)
 
-    out = rag._rerank_code_candidates("question", candidates, top_k=2)
-    # §5-1:未 rerank 走 fusion —— rerank_score 必須是 None(不是 0.0),
-    # final_score = combined,順序保持 embedding/fusion 排序。
-    assert [rc.item for rc in out] == [candidates[0][3], candidates[1][3]]
-    assert all(rc.score_source == "fusion" for rc in out)
-    assert all(rc.rerank_score is None for rc in out)
-    assert [rc.final_score for rc in out] == [candidates[0][0], candidates[1][0]]
+    with pytest.raises(DependencyError, match="Code RAG reranker unavailable"):
+        rag._rerank_code_candidates("question", candidates, top_k=2)
 
 
 # --------------------------------------------------------------------------

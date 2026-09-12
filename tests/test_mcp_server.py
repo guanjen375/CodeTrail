@@ -739,6 +739,28 @@ def _run_tool(mcp_module, name: str, arguments: dict):
 
 
 @pytest.mark.smoke
+@pytest.mark.parametrize("mode", ["context", "semantic"])
+def test_graph_dependency_failure_is_an_mcp_error(monkeypatch, tmp_path, mode):
+    """A missing parser must not become successful graph-unavailable evidence."""
+    from runtime_dependencies import DependencyError
+
+    module = import_mcp_module(monkeypatch, tmp_path)
+    monkeypatch.setattr(module.CODE_RAG, "query_ranked", lambda *a, **kw: [])
+    monkeypatch.setattr(module.CODE_RAG, "_scan_code_files", lambda: [])
+    monkeypatch.setattr(module.code_context, "collect_safe_lexical_hits", lambda *a: [])
+
+    def missing():
+        raise DependencyError("tree-sitter primary parser unavailable")
+
+    monkeypatch.setattr(module, "_graph_for_query", missing)
+    result = _run_tool(module, "code_rag_search", {
+        "query": "startup", "mode": mode, "include_evidence": True,
+    })
+    assert result.isError, _text(result)
+    assert "tree-sitter primary parser unavailable" in _text(result)
+
+
+@pytest.mark.smoke
 def test_default_budget_tracks_n_ctx(monkeypatch, tmp_path: Path):
     root = tmp_path / "project"
     root.mkdir()

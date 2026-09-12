@@ -54,12 +54,8 @@ import ingest_notify
 import kb_cache
 import llama_client
 
-# 執行期才讀的設定（旗標之類）走這個 module handle，不要 import-time 綁值；
-# 獨立執行（沒有 config.py）時是 None，getattr 的預設值會接住。
-try:
-    import config as config_module
-except ImportError:  # pragma: no cover - standalone 模式
-    config_module = None
+# 執行期設定走 module handle；安裝缺 config 時直接失敗。
+import config as config_module
 
 
 def check_pymupdf4llm():
@@ -87,22 +83,12 @@ def check_pymupdf4llm():
 # 設定
 # ============================================================
 # 改進：從 config.py 統一匯入設定，避免兩處定義不一致
-try:
-    from config import (
-        EMBEDDING_MODEL, CHUNK_SETTINGS,
-        KNOWLEDGE_EMB_FILE,
-        LLAMA_EMBED_BASE_URL, LLAMA_VL_BASE_URL,
-        VL_MODEL, VL_INGEST_MAX_TOKENS, VL_INGEST_TIMEOUT,
-    )
-except ImportError:
-    EMBEDDING_MODEL = "bge-m3"  # Fallback：獨立執行時的預設值
-    KNOWLEDGE_EMB_FILE = "knowledge_emb.npz"
-    CHUNK_SETTINGS = {'default': {'size': 1200, 'overlap': 200}}
-    LLAMA_EMBED_BASE_URL = "http://localhost:8081"
-    LLAMA_VL_BASE_URL = "http://localhost:8083"
-    VL_MODEL = "qwen3.5-9b"
-    VL_INGEST_MAX_TOKENS = 2048
-    VL_INGEST_TIMEOUT = 300
+from config import (
+    EMBEDDING_MODEL, CHUNK_SETTINGS,
+    KNOWLEDGE_EMB_FILE,
+    LLAMA_EMBED_BASE_URL, LLAMA_VL_BASE_URL,
+    VL_MODEL, VL_INGEST_MAX_TOKENS, VL_INGEST_TIMEOUT,
+)
 
 # 預設 Chunk 設定（從 CHUNK_SETTINGS 取得）
 CHUNK_SIZE = CHUNK_SETTINGS.get('default', {}).get('size', 1200)
@@ -762,7 +748,7 @@ def _bbox_iou(a, b) -> float:
 
 
 def _iou_threshold() -> float:
-    return float(getattr(config_module, "FIGURE_IOU_MERGE", 0.5))
+    return float(config_module.FIGURE_IOU_MERGE)
 
 
 # figure caption 的辨識（只認**行首**的圖表編號；行中間的「見 Table 3-1」是引用不是題名）。
@@ -2016,7 +2002,7 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
         }}
     if kb_path is None:
         # 呼叫端沒指定就用專案預設的知識庫（`mcp_server.ingest_document` 也是這一份）。
-        kb_path = root_path / getattr(config_module, "KNOWLEDGE_FILE", "knowledge.json")
+        kb_path = root_path / config_module.KNOWLEDGE_FILE
 
     def _blocked(message: str, slug: str) -> Dict:
         print(f"  [INFO] {message}", flush=True)
@@ -3263,6 +3249,9 @@ def _generate_embedding_fields(
     if not total:
         return chunks
 
+    # Required cache capabilities are checked before reuse or model requests.
+    kb_cache._require_openat()
+    kb_cache._require_numpy()
     if cache_dir is None:
         cache_dir = Path.cwd()
     cache_path = cache_dir / EMBEDDING_CACHE_FILE
@@ -3341,6 +3330,8 @@ def load_knowledge_base(
     盤點。少了這個旗標，fresh 會因為「舊 cache 壞掉」而在**清空之前**就中止——
     但 fresh 的直覺正好相反：舊向量怎樣都不重要，反正整批要換掉。
     """
+    if _restore_vectors:
+        kb_cache._require_openat()
     if output_path.exists():
         @contextlib.contextmanager
         def _maybe_lock():
@@ -3612,7 +3603,7 @@ def remove_document_from_knowledge_base(output_path: Path, source: str) -> Dict:
 def resolve_context_flag(cli_flag: Optional[bool]) -> bool:
     """CLI 旗標 > config（規格 §12 的 precedence）。"""
     if cli_flag is None:
-        return bool(getattr(config_module, "KB_CONTEXT_GENERATE", False))
+        return bool(config_module.KB_CONTEXT_GENERATE)
     return bool(cli_flag)
 
 
@@ -4011,6 +4002,9 @@ def _commit_document_to_kb(
     if not new_chunks:
         print("[WARN] 沒有提取到任何內容")
         return False
+
+    kb_cache._require_openat()
+    kb_cache._require_numpy()
 
     mineru_artifact = getattr(document, "_codetrail_mineru_artifact", None)
     if mineru_artifact is not None:
@@ -5031,7 +5025,7 @@ if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "rebuild":
         sys.exit(rebuild_cli(sys.argv[2:]))
 
-    if getattr(config_module, "KB_CONTEXT_GENERATE", False):
+    if config_module.KB_CONTEXT_GENERATE:
         print(
             "[INFO] KB_CONTEXT_GENERATE 是開的，但 chunk 脈絡只在 "
             "`python3 RAG.py rebuild --kb <kb> <doc>` 這條路徑生成；這次不生成。"

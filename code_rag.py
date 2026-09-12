@@ -22,11 +22,14 @@ from pathlib import Path
 from functools import lru_cache
 
 
+_NUMPY_IMPORT_ERROR = ""
 try:
     import numpy as np
     HAS_NUMPY = True
-except ImportError:
+except Exception as exc:
     HAS_NUMPY = False
+    np = None
+    _NUMPY_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 import config
 from config import (
@@ -40,10 +43,22 @@ from config import (
 import file_kind_policy
 import fs_safety
 import llama_client
+from runtime_dependencies import DependencyError
 from index_scope import load_index_scope, walk_index_files
 
 # 導入 AST 解析器
-from ast_parser import PARSER_SEMANTICS_VERSION, parse_file, get_parser_status
+from ast_parser import (
+    PARSER_SEMANTICS_VERSION, PARSER_BACKEND_POLICY,
+    parse_file, get_parser_status, require_parsers_for_paths,
+)
+
+
+def _require_numpy() -> None:
+    if not HAS_NUMPY or np is None:
+        raise DependencyError(
+            "Code RAG requires numpy; install the CodeTrail requirements in this Python environment."
+            + (f" {_NUMPY_IMPORT_ERROR}" if _NUMPY_IMPORT_ERROR else "")
+        )
 
 # Cache schema 版本。v2(2026-08-19):generation 欄位(generation_id/npz_md5/
 # row_count)+ index entry 的 qualified_name/backend(§5-2 與 §6.2-6 合併一次
@@ -295,6 +310,7 @@ def cache_identity() -> dict:
         "schema_version": CODE_RAG_CACHE_SCHEMA_VERSION,
         "embedding_model": EMBEDDING_MODEL,
         "parser_semantics_version": PARSER_SEMANTICS_VERSION,
+        "parser_backend_policy": PARSER_BACKEND_POLICY,
         "embed_text_schema_version": EMBED_TEXT_SCHEMA_VERSION,
         # 只列**會改變已儲存內容**的預算。lexical scan 與 rerank passage 是
         # query-time 才用的,不影響任何 cache 住的東西。
@@ -495,6 +511,7 @@ class CodeRAG:
         Returns:
             {rel_path: {"hash": str, "symbols": list, "embeddings": list}}
         """
+        _require_numpy()
         self._scope_fingerprint_ok = False
         if not self.cache_meta_file.exists():
             return {}
@@ -572,6 +589,7 @@ class CodeRAG:
         )
 
         file_cache = meta.get("file_cache", {})
+        require_parsers_for_paths(file_cache)
         # 新格式的 dense cache 不在 JSON 存向量(見 _save_cache),要從 .npz
         # 還原。舊 cache 仍夾帶 embeddings —— 原樣沿用,不必為了換格式重建。
         if npz_md5 is not None and any(
@@ -590,10 +608,7 @@ class CodeRAG:
         dict 後寫覆蓋前寫 → 263 個符號拿到別人的向量,而且筆數對得上、shape
         檢查過得了,完全無聲。npz 的列序就是 index 的序,位置對映沒有這個問題。
         """
-        if not HAS_NUMPY:
-            print("[CODE_RAG] cache 向量存在 .npz 但沒有 numpy 可讀,安全重建",
-                  file=sys.stderr)
-            return False
+        _require_numpy()
         try:
             with np.load(self.cache_emb_file) as data:
                 matrix = data["embeddings"]
@@ -652,6 +667,7 @@ class CodeRAG:
           md5 / row_count 驗出撕裂世代並安全重建。
         - 寫入失敗 raise(fail-loud),不得無聲吞掉。
         """
+        _require_numpy()
         lock_fd = fs_safety.acquire_file_lock(self.cache_lock_file, self.folder)
         try:
             # 上次 crash 可能留下 tmp 殘留;持鎖下只清自家精確前綴
@@ -661,7 +677,7 @@ class CodeRAG:
                 stale.unlink(missing_ok=True)
 
             npz_md5 = None
-            if HAS_NUMPY and self.embeddings is not None:
+            if self.embeddings is not None:
                 fd, tmp_npz = tempfile.mkstemp(
                     dir=self.folder,
                     prefix=f"{self.cache_emb_file.name}.tmp",
@@ -680,7 +696,7 @@ class CodeRAG:
                 # 與新 meta 不同世代的殘影。
                 self.cache_emb_file.unlink(missing_ok=True)
 
-            emb_dim = self.embeddings.shape[1] if HAS_NUMPY and self.embeddings is not None else None
+            emb_dim = self.embeddings.shape[1] if self.embeddings is not None else None
             # dense 模式下向量已經在 .npz 裡,再以 JSON 文字存一份是 18 倍膨脹
             # (實測同一批 330270 個向量:.npz 1.25GB vs meta JSON 22.9GB),
             # 而且載入時 json.load 的暫態峰值會衝到 100GB 以上位址空間。
@@ -735,6 +751,8 @@ class CodeRAG:
         # 使用 AST 解析器
         try:
             ast_symbols = parse_file(filepath, content)
+        except DependencyError:
+            raise
         except Exception as e:
             print(f"[CODE_RAG] AST 解析 {rel_path} 失敗: {e}", file=sys.stderr)
             ast_symbols = []
@@ -876,18 +894,18 @@ class CodeRAG:
         if not CODE_RAG_ENABLED:
             return
 
+        _require_numpy()
+        current_files = _current_files if _current_files is not None else self._scan_code_files_fresh()
+        require_parsers_for_paths(current_files)
+
         # 嘗試載入快取
         if self._load_cache():
-            current_files = _current_files or self._scan_code_files_fresh()
             self._indexed_file_hashes = {
                 rel_path: info["hash"] for rel_path, info in current_files.items()
             }
             if verbose:
                 print(f"[CODE_RAG] 載入快取: {len(self.index)} 個符號")
             return
-
-        # 掃描所有程式碼檔案
-        current_files = _current_files or self._scan_code_files_fresh()
 
         # 計算需要更新的檔案
         files_to_index = []
@@ -905,21 +923,8 @@ class CodeRAG:
         is_incremental = len(self._file_cache) > 0 and len(files_to_index) < len(current_files)
 
         if verbose:
-            # §6.2-5 能力揭露(反轉舊的「tree-sitter 在場才印」邏輯):主要語言
-            # degraded 時必須 WARN,而不是安靜地少報符號。counts/語言名 only,
-            # 永不印 NDA path。
+            # 已依實際索引語言驗過主要 parser；status 只顯示可用能力。
             parser_status = get_parser_status()
-            degraded_main = sorted(
-                lang for lang in ('c', 'cpp')
-                if parser_status['languages'].get(lang) == 'regex-degraded'
-            )
-            if degraded_main:
-                print(
-                    f"[CODE_RAG] WARN: parser degraded to regex for "
-                    f"{', '.join(degraded_main)} — 多行 signature 函式會漏抽。"
-                    "安裝: pip install tree-sitter tree-sitter-c tree-sitter-cpp",
-                    file=sys.stderr,
-                )
             ts_langs = [k for k, v in parser_status['languages'].items() if v == 'tree-sitter']
             if ts_langs:
                 print(f"[CODE_RAG] 使用 tree-sitter: {', '.join(ts_langs)}")
@@ -1010,7 +1015,7 @@ class CodeRAG:
         )
 
         # 將 embedding 轉換為 numpy array 並預先 L2 normalize
-        if HAS_NUMPY and embeddings_list and not self._lazy_embed:
+        if embeddings_list and not self._lazy_embed:
             try:
                 self._backfill_cached_embedding_gaps(embeddings_list, verbose=verbose)
             except Exception:
@@ -1167,6 +1172,7 @@ class CodeRAG:
         缺 embedding 的符號統一走 /v1/embeddings 批次(§5-4),不再逐筆
         round trip;已有 embedding 的直接沿用。
         """
+        _require_numpy()
         rows: list[list[float] | None] = [None] * len(self.index)
         missing_indices = []
         missing_texts = []
@@ -1192,7 +1198,7 @@ class CodeRAG:
             )
 
         self._sync_embeddings_to_file_cache(rows)
-        if HAS_NUMPY and rows:
+        if rows:
             matrix = np.asarray(rows, dtype=np.float32)
             norms = np.linalg.norm(matrix, axis=1, keepdims=True)
             if np.any(norms <= 0):
@@ -1310,8 +1316,9 @@ class CodeRAG:
 
     def _get_embedding_at(self, idx: int) -> list:
         """取得指定索引的 embedding（相容新舊格式）"""
+        _require_numpy()
         # 新格式：從 numpy array 取得
-        if HAS_NUMPY and self.embeddings is not None and idx < len(self.embeddings):
+        if self.embeddings is not None and idx < len(self.embeddings):
             return self.embeddings[idx].tolist()
         # 舊格式：從 index 取得
         if idx < len(self.index):
@@ -1367,14 +1374,12 @@ class CodeRAG:
             for combined, _emb, _kw, item in candidates[:top_k]
         ]
 
-    def _rerank_code_fallback(self, candidates: list, top_k: int, reason: str) -> list[RankedCandidate]:
-        """Fallback for Code RAG rerank. main_model is intentionally embedding here."""
-        if config.RERANK_FALLBACK_POLICY == "error":
-            raise RuntimeError(
-                "Code RAG reranker unavailable and client.json rerank_fallback_policy is \"error\". "
-                f"Reason: {reason}"
-            )
-        return self._fusion_candidates(candidates, top_k)
+    @staticmethod
+    def _reranker_error(reason: str) -> DependencyError:
+        return DependencyError(
+            f"Code RAG reranker unavailable at {LLAMA_RERANK_BASE_URL}: {reason}. "
+            "Check the dedicated reranker llama-server (deployment.json services.reranker)."
+        )
 
     def _rerank_code_candidates(self, question: str, candidates: list, top_k: int) -> list[RankedCandidate]:
         """使用 reranker 模型對程式碼候選進行二次排序
@@ -1447,12 +1452,9 @@ class CodeRAG:
                 return ranked[:top_k]
 
             except Exception as exc:
-                return self._rerank_code_fallback(
-                    candidates, top_k, f"dedicated reranker call failed: {exc}"
-                )
+                raise self._reranker_error(f"dedicated reranker call failed: {exc}") from exc
 
-        # Code RAG 沒有主模型 rerank 路徑;main_model policy 在這裡等同 embedding。
-        return self._rerank_code_fallback(candidates, top_k, "dedicated reranker is not reachable")
+        raise self._reranker_error("dedicated reranker is not reachable")
 
     def query(self, question: str, top_k: int = CODE_RAG_TOP_K, is_bug_fix: bool = False) -> list[dict]:
         """查詢相關程式碼位置（動態門檻 + reranker 二次排序）
@@ -1486,6 +1488,11 @@ class CodeRAG:
 
         Lazy build：第一次 query 時才建立索引，避免不需要 CodeRAG 時浪費時間
         """
+        _require_numpy()
+        # 已載入的 symbols（含零 symbol 檔案）也不能繞過主要 parser 准入。
+        required_paths = set(self._file_cache) | set(self._indexed_file_hashes or {})
+        required_paths.update(item.get("path", "") for item in self.index)
+        require_parsers_for_paths(required_paths)
         # Lazy build：第一次 query 時才建立索引
         if not self.index:
             self.build_index(verbose=True)
@@ -1542,8 +1549,8 @@ class CodeRAG:
         # 動態門檻：Bug 類問題稍微放寬
         threshold = CODE_RAG_THRESHOLD_BUG if is_bug_fix else CODE_RAG_THRESHOLD
 
-        # 使用 numpy 向量化計算 cosine similarity（如果可用）
-        if HAS_NUMPY and self.embeddings is not None and len(self.embeddings) > 0 and not self._lazy_embed:
+        # Dense 矩陣以 numpy 計分；lazy rows 的逐列計分保留在下面。
+        if self.embeddings is not None and len(self.embeddings) > 0 and not self._lazy_embed:
             q_vec = np.array(q_emb, dtype=np.float32)
 
             # 如果 embeddings 已經預先 L2 normalize，只需要 normalize query 然後做 dot product

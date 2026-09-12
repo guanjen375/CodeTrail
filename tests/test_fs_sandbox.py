@@ -481,8 +481,6 @@ def test_single_long_line_cannot_blow_up_grep_output(tmp_path):
 def test_rg_is_told_to_cap_columns_itself(tmp_path, monkeypatch):
     """--max-columns 必須真的傳給 rg —— 這是唯一能避免把 GB 級 stdout
     先讀進記憶體的防線,只在事後截斷是不夠的。"""
-    if not shutil.which("rg"):
-        pytest.skip("這台沒有 rg;此防線只適用 rg 快速路徑")
     seen: list[list[str]] = []
     real_run = __import__("process_env").run
 
@@ -503,7 +501,7 @@ def test_rg_is_told_to_cap_columns_itself(tmp_path, monkeypatch):
 
 @pytest.mark.smoke
 def test_budget_helpers_clip_line_and_stop_at_total():
-    """沒有 rg 的 Python fallback 也要受同一組預算保護。"""
+    """輸出預算 helper 必須裁單行並遵守整體字元上限。"""
     long_line = "y" * (config.MAX_GREP_LINE_CHARS * 4)
     clipped = _clip_grep_line(long_line)
     assert len(clipped) < len(long_line)

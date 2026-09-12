@@ -295,7 +295,9 @@ def _detect_python(skip_deps_check: bool, notes: list[str]) -> str:
     把絕對路徑寫進 ~/start.sh 與 MCP 的啟動命令,新 shell 不 activate venv
     也能啟動 MCP server(舊安裝流程最常踩的坑)。
     """
-    python_bin = sys.executable or "python3"
+    python_bin = sys.executable
+    if not python_bin:
+        raise SetupError("無法識別目前的 Python interpreter;請用明確的 python3 重新執行 set_config.sh")
     try:
         proc = process_env.run(
             [python_bin, "-c", "import mcp, numpy, requests"],
@@ -343,17 +345,26 @@ def _check_tmux(skip: bool, notes: list[str]) -> None:
 def _configured_llama_bin(home: Path) -> str | None:
     """既有 `deployment.json` 記的 llama-server(上一次 set_config 驗證過的那顆)。
 
-    讀不到 / 壞掉一律回 None 交給預設值:這裡只是「沒給旗標時用哪一顆」的來源,
-    真正的把關在 `check_llama_binary`(存在性 + 旗標探測)與寫入前的 schema 驗證。
+    缺檔或合法檔案未指定 llama_bin 才採預設；既有檔讀不到或壞掉就拒絕。
     """
     try:
         data = json.loads(
             (home / ".config" / "codetrail" / "deployment.json").read_text(encoding="utf-8")
         )
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return None
-    value = data.get("llama_bin") if isinstance(data, dict) else None
-    return value.strip() if isinstance(value, str) and value.strip() else None
+    except (OSError, ValueError) as exc:
+        raise SetupError("無法讀取 deployment.json;請修復既有設定或明示 --llama-bin") from exc
+    from deployment_profile import _validate_document
+
+    if not isinstance(data, dict):
+        raise SetupError("deployment.json 必須是 JSON object;請修復既有設定")
+    try:
+        _validate_document(data, "deployment.json", local=True)
+    except ProfileError as exc:
+        raise SetupError(f"deployment.json 不合法: {exc}") from exc
+    value = data.get("llama_bin")
+    return value.strip() if value is not None else None
 
 
 def _llama_bin(override: str | None, home: Path) -> Path:
@@ -1959,6 +1970,9 @@ def commit_files(targets: list[tuple[Path, str, int]], notes: list[str], dry_run
             print(f"\n--- [dry-run] 將寫入 {path}{suffix} ---\n{display}", end="")
         return
 
+    from runtime_dependencies import require_safe_filesystem
+
+    require_safe_filesystem("configuration transaction", owner_only=True, error_type=SetupError)
     private_set = {Path(os.path.abspath(str(item))) for item in private}
 
     def _is_private(path: Path) -> bool:

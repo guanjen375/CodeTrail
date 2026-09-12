@@ -45,8 +45,8 @@ MAX_BYTES = 256 * 1024
 
 PERMISSION_VALUES = ("allow", "ask", "deny")
 
-#: rerank 失敗時的退路。`error` = fail-loud(預設)。
-RERANK_FALLBACK_VALUES = ("error", "embedding", "main_model")
+#: 相容既有設定鍵,只接受拒絕降級的 error。
+RERANK_FALLBACK_VALUES = ("error",)
 
 #: `.h` 當成哪一種語言解析。
 H_LANG_VALUES = ("c", "cpp")
@@ -240,6 +240,11 @@ def _validate(value: Any, path: Path) -> dict[str, Any]:
         if key in value:
             raw = value[key]
             if raw not in allowed:
+                if key == "rerank_fallback_policy":
+                    raise ClientConfigError(
+                        f'{path} 的 rerank_fallback_policy 只接受 "error";'
+                        '請移除舊值或改成 "error",並修復專用 reranker。'
+                    )
                 raise ClientConfigError(
                     f"{path} 的 {key} 必須是 {list(allowed)} 之一,得到 {raw!r}"
                 )
@@ -341,6 +346,8 @@ def apply_to_config(settings: ClientSettings, *, readonly: bool = False) -> None
     """
     import config
 
+    if settings.rerank_fallback_policy != "error":
+        raise ClientConfigError('rerank_fallback_policy 只接受 "error";請修復專用 reranker')
     config.EXTERNAL_IMPORT_ENABLED = settings.external_import
     config.EXTERNAL_IMPORT_ROOTS = list(settings.external_import_roots)
     config.KB_CONTEXT_REMOTE_OK = settings.kb_context_remote_ok

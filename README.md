@@ -89,7 +89,7 @@ aicode        # CodeTrail 終端客戶端;/tools 應列出 19 個工具
 > 動手前掃一遍 —— 這幾點踩了通常會卡很久,或踩到 NDA / 安全:
 >
 > 1. **客戶端與 MCP server 都跑在 `aicode` 當下 PATH 的 `python3` 上。** 依賴若只裝在 venv,每次啟動前仍要 activate。重建 venv 或升級 Python 後要**重跑 `./set_config.sh`**(它會重新偵測並寫進啟動腳本)。
-> 2. **四個 llama-server 都要起**:main `8080` + embedding `8081` + reranker `8082` + VL `8083`。三顆副模型是硬性需求,缺一個啟動前 preflight 就擋下;reranker 預設不降級。見 §3。
+> 2. **四個 llama-server 都要起**:main `8080` + embedding `8081` + reranker `8082` + VL `8083`。三顆副模型是硬性需求,缺一個啟動前 preflight 就擋下;reranker 不提供降級方案。見 §3。
 > 3. **不要從 `$HOME` 或 `/` 啟動** —— 沙箱會直接拒絕。先 `cd` 進你要分析的**具體專案目錄**再跑。
 > 4. **換模型或主 n_ctx 就重跑 `./set_config.sh` + 重啟 server。** llama-server 一啟動就鎖死一顆模型與一個 `-c`;客戶端只會跟隨它,沒有「在對話裡換模型」這回事。主 n_ctx 只填一次;`set_config.sh` 寫進 deployment / server `-c`,`aicode` 啟動時觀測 `/props` 的實值並讓 CodeTrail 的 context 預算跟著它。
 > 5. **啟動後立即 rollback,先看 server log**:`~/start.sh` 前台只會回報 process 已結束,真正根因用 `~/start.sh logs main` 查看;新 GGUF 也可能需要更新並重新 build llama.cpp。詳細判讀與修復見 [docs/troubleshooting.md](docs/troubleshooting.md)。
@@ -150,7 +150,7 @@ python3 -m pip install --user --break-system-packages "pymupdf4llm==1.28.0"    #
 python3 -c "import mcp, numpy, requests; print('deps OK')"
 ```
 
-`<CODETRAIL_REPO>` 是這個 CodeTrail 的 repo 路徑,不是你要分析的專案路徑。`requirements.txt` 已含 `mcp` / `requests` / `numpy` / `pyelftools`(ELF 結構化解析;沒裝時 `analyze_file` 退回 readelf 文字解析並在報告開頭明列缺失能力),不必再單獨 `pip install mcp`。
+`<CODETRAIL_REPO>` 是這個 CodeTrail 的 repo 路徑,不是你要分析的專案路徑。`requirements.txt` 已含 `mcp` / `requests` / `numpy` / `jieba` / `pyelftools` 與 C/C++ grammar。環境缺少主要實作時，受影響操作直接報錯；完整需求與舊設定遷移見[依賴需求](docs/dependencies.md)。部署不需要 Node / npm。
 
 截至 2026-08，MCP Python SDK 2.x 已是 stable；但本 repo 的 runtime 仍使用 v1 `mcp.server.fastmcp.FastMCP`，所以 dependency 刻意固定為 `mcp>=1.28,<2`。乾淨安裝會取維護中的最新 1.x，不會誤升到不相容的 2.x；這也符合 [MCP Python SDK 官方給未遷移 v1 專案的建議](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/get-started/installation.md)。v2 遷移需另案同步處理 import、transport 與 schema，不應只移除 `<2`。若 `doctor` 報版本不符，執行 `python3 -m pip install --upgrade "mcp>=1.28,<2"`。
 
@@ -585,15 +585,9 @@ python3 deployment_profile.py show                        # 目前的有效設�
 python3 deployment_profile.py --main-model <CODE_MODEL> show   # 只在這一次覆寫主模型
 ```
 
-`config.RERANK_FALLBACK_POLICY`(repo 常數;改它是改 repo)只控制啟動後 reranker 呼叫失敗時的行為;啟動前 preflight 仍要求 reranker server ready:
+啟用 reranking 時，RAG 與 Code RAG 都只使用專用 reranker；服務缺席、逾時或回應無效即報錯。啟動前 preflight 仍要求 reranker ready。
 
-| policy | RAG 知識庫 fallback | Code RAG fallback |
-|---|---|---|
-| `embedding` | 保留 embedding / hybrid 既有排序,不呼叫主模型 | 同左 |
-| `main_model` | 還原舊行為,用主聊天模型做 LLM rerank | 等同 `embedding`(Code RAG 沒有主模型 rerank 路徑) |
-| `error` | 直接報錯,不靜默降級 | 直接報錯 |
-
-預設是 `error`:專用 reranker 不可用或呼叫失敗就直接報錯。`main_model` 可能很貴:嚴格模式下每條符合條件的 RAG query 都可能觸發主模型 rerank。只有你明確接受這個成本時才在 `client.json` 設 `"rerank_fallback_policy": "main_model"`。
+`client.json` 的 `rerank_fallback_policy` 保留相容鍵名，但唯一合法值為 `"error"`。舊值 `"embedding"` / `"main_model"` 會在設定載入時報錯，請刪除該鍵或改成 `"error"`。repo 常數 `config.RERANK_FALLBACK_POLICY` 也只接受 `error`。明確關閉 reranking 的選項，以及依候選內容決定不需 rerank 的路徑仍照常運作。
 
 **遠端模型端點需要顯式 opt-in(`client.json` 的 `model_remote_ok`)**:CodeTrail 對 llama-server 的所有呼叫(completion / chat / embedding / reranking / props / slots / health)在送出前都會檢查端點——loopback 無條件放行;base_url 指向非 loopback 的機器時,必須先在 `~/.config/codetrail/client.json` 設 `"model_remote_ok": true`,否則呼叫直接報錯(fail-loud,錯誤訊息會印那個鍵名)。這是刻意的安全預設:prompt 可能含 NDA 程式碼與文件內容,不能因為 profile 填了一個遠端 IP 就靜默外送。模型流量同時不讀環境 proxy(`trust_env=False`)、不跟隨任何 HTTP redirect(3xx 一律報錯)。KB chunk 脈絡生成(Contextual Retrieval)另有獨立的 `kb_context_remote_ok`,**兩個鍵不互通**:前者放行的是 prompt,後者等於整份文件離機。`python3 scripts/doctor.py` 會在啟動前檢查這條(非 loopback 端點 + 未 opt-in = FAIL)。
 
@@ -637,7 +631,7 @@ registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf`
 | `kb_context_remote_ok` | `false` | KB chunk 脈絡生成非 loopback 時才放行送出**整份文件的窗**。與上面是**兩個鍵**:資料範圍不同的同意不得合併 |
 | `external_import` / `external_import_roots` | `false` / `["~/Downloads", "/tmp"]` | 允許 `import_external_file`,以及允許的來源根目錄。開了之後每一次匯入**仍要人工核准** |
 | `build_commands` | `false` | 把 make / cmake / ninja / meson / bazel 掛進 `run_command` 白名單。它們會跑專案內的 build script = 任意程式碼執行,所以只在分析自己的專案時開 |
-| `rerank_fallback_policy` | `"error"` | reranker 掛掉時的行為(`error` / `embedding` / `main_model`) |
+| `rerank_fallback_policy` | `"error"` | 唯一合法值 `error`；專用 reranker 不可用即報錯 |
 | `project_instructions` | `true` | 讀不讀被分析專案的 `AGENTS.md` 與 `.codetrail/lessons.md`。分析不信任 repo 時設 `false` |
 | `objdump` | `""` | 反組譯用的 objdump 路徑(跨架構韌體時指定 binutils-`<triplet>`) |
 | `h_lang` | `"c"` | `.h` 當 C 還是 C++ 解析(`c` / `cpp`) |
@@ -777,7 +771,7 @@ test/header/config/trace lexical evidence 合併去重後裝進 bounded budget�
 graph 尚未建立或損壞時，lexical（grep / index）候選仍會參與選取，實際 evidence 仍受既有
 candidate 與字元 budget 約束；只有呼叫關係證據缺席，`graph_status` 標示原因，
 `uncertainties` 會列出 `呼叫關係證據不可用（relationship evidence unavailable: graph unavailable）；未看到 caller/callee 不代表不存在`（graph 查詢途中出錯時
-`graph unavailable` 改為 `graph degraded`），不影響整次呼叫。
+`graph unavailable` 改為 `graph degraded`）。parser / rg 等必要依賴失敗則整次回錯誤，不能當成證據缺席。
 
 所有 MCP 工具的精簡文字結果第一行固定是 `status: ok|partial|error`；只有 partial/error
 或截斷時才接可操作的 `next:`。省略結果上限時都依上述 12% 動態預算，並受各工具既有

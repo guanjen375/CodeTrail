@@ -426,12 +426,15 @@ class SingleWriterLock:
         return f"（pid {pid}）"
 
     def acquire(self) -> None:
+        from runtime_dependencies import require_safe_filesystem
+
+        require_safe_filesystem(
+            "chunk context writer lock", owner_only=True, error_type=ContextLockError)
         _ensure_private_dir(self.path.parent)
         # O_NOFOLLOW：鎖檔若是 symlink,open 會失敗而不是跟過去。沒有這一道的話,
         # 把 .writer.lock 指向任何可寫檔案,取得鎖之後的 ftruncate + 寫 PID JSON
         # 就會把那個檔案內容洗掉。
-        flags = os.O_CREAT | os.O_RDWR
-        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
         try:
             fd = os.open(self.path, flags, 0o600)
         except OSError as exc:

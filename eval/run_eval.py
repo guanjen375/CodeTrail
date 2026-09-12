@@ -599,23 +599,28 @@ def eval_bug_question(
     # 暫時啟用 run_command 和 patch（讓 agent 可以修改並測試）
     original_run_cmd = config.RUN_COMMAND_ENABLED
     original_patch = config.PATCH_ENABLED
-
-    if run_tests:
-        config.RUN_COMMAND_ENABLED = True
-        config.PATCH_ENABLED = True
-        # 如果要使用容器
-        if use_container:
-            try:
-                import container_runner
-                container_runner.CONTAINER_ENABLED = True
-            except ImportError:
-                pass
+    container = None
+    original_container = None
 
     try:
+        if run_tests and use_container:
+            try:
+                import container_runner as container
+            except ImportError as exc:
+                from runtime_dependencies import DependencyError
+
+                raise DependencyError("requested container isolation requires container_runner；請修復 CodeTrail 安裝。") from exc
+            original_container = container.CONTAINER_ENABLED
+            container.CONTAINER_ENABLED = True
+        if run_tests:
+            config.RUN_COMMAND_ENABLED = True
+            config.PATCH_ENABLED = True
         answer = run_agent(folder, case.question, code_rag=code_rag, max_loops=12)
     finally:
         config.RUN_COMMAND_ENABLED = original_run_cmd
         config.PATCH_ENABLED = original_patch
+        if container is not None and original_container is not None:
+            container.CONTAINER_ENABLED = original_container
 
     time_taken = time.time() - start_time
 

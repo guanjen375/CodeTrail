@@ -57,13 +57,19 @@ from pathlib import Path
 
 import config
 import fs_safety
+from runtime_dependencies import DependencyError
 from ast_parser import (
     CPP_LINKED_OBJECT_KINDS,
     HAS_TREE_SITTER,
     PARSER_SEMANTICS_VERSION,
+    PARSER_BACKEND_POLICY,
+    ParserDependencyError,
     Symbol,
+    _h_header_language,
     _try_load_tree_sitter_language,
     parse_file,
+    require_parsers_for_paths,
+    require_tree_sitter_parser,
 )
 
 GRAPH_SCHEMA_VERSION = 3
@@ -90,10 +96,7 @@ class CodeGraphError(RuntimeError):
 
 
 def _h_ext_lang() -> str:
-    import config
-
-    value = str(getattr(config, "H_LANG", "c")).strip().lower()
-    return value if value in ("c", "cpp") else "c"
+    return _h_header_language()
 
 
 def _lang_for(rel_path: str) -> str:
@@ -435,15 +438,15 @@ def _extract_c_relations(rel_path: str, content: str, lang: str,
       calls:    [(caller_node_id, callee_name, lineno, condition)]
       declarations: [(name, qualified_name, lineno, linkage, condition)]
     """
-    ts_lang = _try_load_tree_sitter_language(lang) if HAS_TREE_SITTER else None
-    if ts_lang is None:
-        return [], [], [], _include_guard_condition(rel_path, content)
-    from tree_sitter import Parser
-
+    parser = require_tree_sitter_parser(lang)
     try:
-        tree = Parser(ts_lang).parse(bytes(content, "utf-8"))
-    except Exception:
-        return [], [], [], _include_guard_condition(rel_path, content)
+        tree = parser.parse(bytes(content, "utf-8"))
+        root = tree.root_node
+    except Exception as exc:
+        raise ParserDependencyError(
+            f"Code graph parser unavailable for {lang}: {type(exc).__name__}: {exc}. "
+            "Check the compatible tree-sitter core and language grammar packages."
+        ) from exc
 
     includes: list[tuple[str, int, bool, str | None]] = []
     calls: list[tuple[str, str, int, str | None]] = []
@@ -524,7 +527,7 @@ def _extract_c_relations(rel_path: str, content: str, lang: str,
         for child in node.children:
             walk(child)
 
-    walk(tree.root_node)
+    walk(root)
     return includes, calls, declarations, _include_guard_condition(rel_path, content)
 
 
@@ -701,6 +704,7 @@ class CodeGraph:
             f"cpp:{_dist('tree-sitter-cpp')}:{int(cpp_ok)};"
             f"h:{_h_ext_lang()};"
             f"parser-semantics:{PARSER_SEMANTICS_VERSION};"
+            f"parser-backend-policy:{PARSER_BACKEND_POLICY};"
             "resolver:conservative-3"
         )
 
@@ -716,6 +720,8 @@ class CodeGraph:
             return None
         try:
             symbols = parse_file(filepath, content)
+        except DependencyError:
+            raise
         except Exception:
             symbols = []
 
@@ -825,6 +831,7 @@ class CodeGraph:
     def build(self, verbose: bool = False) -> None:
         """整體建置(§7.5)。首建走 staging,已存在走 in-place transaction。"""
         files = self._scan_files()
+        require_parsers_for_paths(files)
         lock_fd = fs_safety.acquire_file_lock(self.lock_file, self.root)
         try:
             # staging 殘留清理:只在持鎖時、只清自家精確前綴(§7.5)
@@ -1597,6 +1604,7 @@ class CodeGraph:
             )
 
         files = self._scan_files()
+        require_parsers_for_paths(files)
         conn = self._connect()
         try:
             row = conn.execute(
@@ -1869,6 +1877,12 @@ class CodeGraph:
         conn = self._connect()
         conn.execute("BEGIN")
         try:
+            require_parsers_for_paths(row[0] for row in conn.execute("SELECT path FROM files"))
+            row = conn.execute("SELECT parser_versions FROM index_metadata LIMIT 1").fetchone()
+            if row is None or f"parser-backend-policy:{PARSER_BACKEND_POLICY};" not in row[0]:
+                raise CodeGraphError(
+                    f"code graph parser backend policy 已更新;請執行 `{self.build_command()}` 重建"
+                )
             yield conn
         finally:
             try:

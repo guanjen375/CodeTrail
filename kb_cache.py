@@ -58,11 +58,8 @@ import context_signals
 import section_index
 from knowledge_store import KnowledgeStoreError
 
-try:
-    from config import EMBEDDING_MODEL, KNOWLEDGE_EMB_FILE
-except ImportError:  # pragma: no cover - 獨立執行時的預設值，與 RAG.py 一致
-    EMBEDDING_MODEL = "bge-m3"
-    KNOWLEDGE_EMB_FILE = "knowledge_emb.npz"
+from config import EMBEDDING_MODEL, KNOWLEDGE_EMB_FILE
+from runtime_dependencies import require_safe_filesystem
 
 # `.codetrail/` 已經是這個 repo 放衍生資料的地方（figures 在隔壁），而且整棵
 # 都在 .gitignore 裡——NDA 內容不會因為換位置而外洩。
@@ -116,13 +113,14 @@ def _checked_cache_dir(json_path) -> Path:
     從 KB 目錄逐層往下 lstat：任何一層是 symlink 或不是目錄一律 fail-loud。
     尚未存在的層直接略過——不存在的東西沒有可被替換的目標。
 
-    為什麼一定要有：這是本模組唯一會 `shutil.rmtree` 的路徑。`.codetrail` 被換成
+    為什麼一定要有：清除 cache 前必須先驗路徑。`.codetrail` 被換成
     指向 sandbox 外的 symlink 時，「刪掉 knowledge.json 之後自動清無主 cache」就
     變成遞迴刪除外部目錄；寫入端同樣會把 NDA 向量寫到外面去。
 
     最後再比一次 realpath：逐層 lstat 擋掉的是「路徑上有連結」，realpath 比對擋
     的是其他把目標搬出 KB 目錄的方式（例如 KB 目錄本身在載入期間被換掉）。
     """
+    _require_openat()
     base = Path(json_path).parent
     current = base
     for part in (*CACHE_RELDIR.parts, kb_id(json_path)):
@@ -165,6 +163,15 @@ _HAS_OPENAT = bool(
          os.link}.issubset(os.supports_dir_fd)
     and os.scandir in os.supports_fd
 )
+
+
+def _require_openat() -> None:
+    require_safe_filesystem("embeddings cache", error_type=KnowledgeStoreError)
+    if not _HAS_OPENAT:
+        raise KnowledgeStoreError(
+            "embeddings cache requires dir_fd/openat, O_NOFOLLOW and fd-safe directory traversal; "
+            "use a POSIX Python/filesystem with these capabilities"
+        )
 
 
 def _link_error(where: Path) -> KnowledgeStoreError:
@@ -213,9 +220,9 @@ def _dir_fd(json_path, names: Sequence[str], *, create: bool):
     check-then-use，中途被換成 symlink 就越界了；持有 fd 等於釘住驗過的那個 inode，
     路徑之後怎麼換都動不到我們。
 
-    平台缺 `openat` 家族（Windows）時退回 `_checked_cache_dir()` 的路徑檢查——那擋得住
-    「事先擺好的 symlink」，擋不住競態；本 repo 的 sandbox 模型以 POSIX 為準。
+    平台缺 `openat` 家族時直接拒絕操作,不改用 pathname 檢查。
     """
+    _require_openat()
     base = Path(json_path).parent
     try:
         base_fd = os.open(base, os.O_RDONLY | _O_DIRECTORY)
@@ -243,15 +250,8 @@ def _cache_dir_names(json_path) -> tuple[str, ...]:
 
 @contextlib.contextmanager
 def cache_dir_fd(json_path, *, create: bool):
-    """cache 目錄（`<kb-id>`）的 fd。缺 openat 支援時 yield None 讓呼叫端走路徑版。"""
-    if not _HAS_OPENAT:
-        if create:
-            prepare_cache_target(json_path)
-        else:
-            checked_cache_dir_exists = _checked_cache_dir(json_path)
-            del checked_cache_dir_exists
-        yield None
-        return
+    """cache 目錄（`<kb-id>`）的 fd；必要 openat 能力缺席就拒絕。"""
+    _require_openat()
     with _dir_fd(json_path, _cache_dir_names(json_path), create=create) as fd:
         yield fd
 
@@ -295,13 +295,11 @@ def checked_cache_file(json_path) -> Path:
 
 
 def prepare_cache_target(json_path) -> Path:
-    """建好 cache 目錄並回傳驗過的檔案路徑。
-
-    驗證做兩次：`mkdir` 之前擋掉「已經擺好的 symlink」，`mkdir` 之後再驗一次擋掉
-    「在這中間才被換掉」。第二次很便宜，漏掉它就等於把 NDA 向量寫到 sandbox 外。
-    """
+    """以 openat 逐層建立 cache 目錄,回傳驗過的檔案路徑。"""
     target = checked_cache_file(json_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    with cache_dir_fd(json_path, create=True) as fd:
+        if fd is None:
+            raise KnowledgeStoreError("無法建立 embeddings cache 目錄")
     return checked_cache_file(json_path)
 
 
@@ -347,23 +345,18 @@ def purge(json_path, *, announce: bool = False) -> list[str]:
     """
     removed: list[str] = []
     directory = _checked_cache_dir(json_path)   # symlink / 逃出 KB 目錄 → 不刪，直接 raise
-    if _HAS_OPENAT:
-        # 持有 `embeddings/` 的 fd 再刪 `<kb-id>`：檢查完才用路徑刪是 check-then-use，
-        # 中途 `.codetrail` 被換成外部 symlink 就會遞迴刪到 sandbox 外。
-        with _dir_fd(json_path, CACHE_RELDIR.parts, create=False) as parent_fd:
-            if parent_fd is not None:
-                name = kb_id(json_path)
-                try:
-                    os.lstat(name, dir_fd=parent_fd)
-                except FileNotFoundError:
-                    pass
-                else:
-                    _rmtree_at(parent_fd, name, directory)
-                    removed.append(str(directory))
-    elif directory.is_dir():   # pragma: no cover - 非 POSIX 的退路
-        shutil.rmtree(directory, ignore_errors=True)
-        if not directory.exists():
-            removed.append(str(directory))
+    # 持有 `embeddings/` 的 fd 再刪 `<kb-id>`：檢查完才用路徑刪是 check-then-use，
+    # 中途 `.codetrail` 被換成外部 symlink 就會遞迴刪到 sandbox 外。
+    with _dir_fd(json_path, CACHE_RELDIR.parts, create=False) as parent_fd:
+        if parent_fd is not None:
+            name = kb_id(json_path)
+            try:
+                os.lstat(name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            else:
+                _rmtree_at(parent_fd, name, directory)
+                removed.append(str(directory))
     legacy = legacy_companion(json_path)
     if legacy.is_file():
         with contextlib.suppress(OSError):
@@ -386,12 +379,7 @@ def prune_empty_dirs(json_path) -> None:
     所以在鎖外做這件事會讓正在提交的 writer 收到 ENOENT。目前只有 `purge()` 呼叫它，
     而 `purge()` 只從鎖內的 `purge_orphans()` 進來。
     """
-    if not _HAS_OPENAT:   # pragma: no cover - 非 POSIX 的退路
-        directory = _checked_cache_dir(json_path)
-        for parent in (directory, directory.parent, directory.parent.parent):
-            with contextlib.suppress(OSError):
-                parent.rmdir()
-        return
+    _require_openat()
     names = _cache_dir_names(json_path)
     for depth in range(len(names), 0, -1):
         with _dir_fd(json_path, names[:depth - 1], create=False) as parent_fd:
@@ -611,9 +599,9 @@ def _verify_section_fields(payload: Mapping, *, chunks, dimension: int) -> Optio
 def _require_numpy():
     try:
         import numpy as np
-    except ImportError as exc:  # pragma: no cover - numpy 是可選 runtime 相依
+    except Exception as exc:
         raise KnowledgeStoreError(
-            "載入 embeddings cache 需要 numpy；請安裝 numpy 後重試"
+            f"載入 embeddings cache 需要可用的 numpy；請修復或安裝 numpy 後重試 ({exc})"
         ) from exc
     return np
 
@@ -624,8 +612,7 @@ def _content_hash(chunks, schema: str) -> str:
 
 def _read_cache_npz(json_path) -> dict:
     """讀 cache 檔：整段持有目錄 fd，檔案本身以 `O_NOFOLLOW` 開。"""
-    if not _HAS_OPENAT:   # pragma: no cover - 非 POSIX 的退路
-        return _read_npz(checked_cache_file(json_path))
+    _require_openat()
     with cache_dir_fd(json_path, create=False) as dfd:
         if dfd is None:
             raise FileNotFoundError(str(cache_dir(json_path)))
@@ -636,8 +623,7 @@ def _read_cache_npz(json_path) -> dict:
 
 def _read_legacy_npz(path: Path) -> dict:
     """舊位置的 companion NPZ：以 `O_NOFOLLOW` 開，不跟著連結走。"""
-    if not _HAS_OPENAT:   # pragma: no cover - 非 POSIX 的退路
-        return _read_npz(path)
+    _require_openat()
     fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW)
     with os.fdopen(fd, "rb") as handle:
         return _read_npz(handle)
@@ -809,9 +795,11 @@ def locate(json_path, chunks: Sequence[Mapping], metadata: Mapping,
     ``mutate=False`` ＝ 連那一步都不做。離線體檢（`kb_ab_compare`）要報告的是
     **現在磁碟上的狀態**，看一眼就把它修好的話，報告講的就不是使用者手上那份 KB。
     """
+    _require_openat()
     json_path = Path(json_path)
     if not chunks:
         return None, "knowledge.json 沒有 chunk"
+    _require_numpy()
 
     primary = checked_cache_file(json_path)   # symlink / 逃出 KB 目錄 → fail-loud
     legacy = legacy_companion(json_path)
@@ -958,6 +946,7 @@ def write_npz_at(dir_fd: int, fields: Mapping, *, name: str = CACHE_FILENAME) ->
     整段只用 `dir_fd` 相對操作，所以路徑之後被換成 symlink 也影響不到我們——動到的
     永遠是開 fd 當下驗過的那個 inode。
     """
+    _require_openat()
     np = _require_numpy()
     tmp = f".{name}.tmp.{os.getpid()}.{os.urandom(6).hex()}"
     fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _O_NOFOLLOW, 0o600,
@@ -980,25 +969,11 @@ def _write_npz(json_path, payload: Mapping, *, chunk_ids: Sequence[str]) -> Path
     np = _require_numpy()
     fields = npz_fields(payload, chunk_ids)
     path = prepare_cache_target(json_path)
-    if _HAS_OPENAT:
-        with cache_dir_fd(json_path, create=True) as dfd:
-            if dfd is None:   # pragma: no cover - create=True 之後不該是 None
-                raise KnowledgeStoreError(f"無法開啟 embeddings cache 目錄: {path.parent}")
-            write_npz_at(dfd, fields)
-        return path
-    # pragma: no cover - 非 POSIX 的退路（只擋得住事先擺好的 symlink）
-    fd, raw = tempfile.mkstemp(prefix=f".{path.name}.tmp.", dir=path.parent)
-    tmp = Path(raw)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            np.savez_compressed(handle, **fields)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-        return path
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    with cache_dir_fd(json_path, create=True) as dfd:
+        if dfd is None:   # pragma: no cover - create=True guarantees an opened directory
+            raise KnowledgeStoreError(f"無法開啟 embeddings cache 目錄: {path.parent}")
+        write_npz_at(dfd, fields)
+    return path
 
 
 def rebuild(json_path, chunks, metadata, *, reason: str = "") -> Matrices:
@@ -1007,6 +982,7 @@ def rebuild(json_path, chunks, metadata, *, reason: str = "") -> Matrices:
     重算走 ``RAG.generate_embeddings``（late import 避開 import 期循環），所以
     文字→向量的增量快取、進度輸出、fail-loud 規則都與入庫路徑同一份實作。
     """
+    _require_openat()
     np = _require_numpy()
     json_path = Path(json_path)
     print(MSG_REBUILD + (f"（原因：{reason}）" if reason else ""))

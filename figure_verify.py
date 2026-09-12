@@ -436,15 +436,10 @@ def _import_pymupdf():
     try:
         import pymupdf  # noqa: PLC0415 - lazy：pymupdf 是 PDF 路徑的相依，不是本模組的
         return pymupdf
-    except ImportError:
-        pass
-    try:
-        import fitz  # noqa: PLC0415
-        return fitz
-    except ImportError as exc:
+    except Exception as exc:
         raise figure_extract.FigureCapabilityError(
             "capability probe 需要 PyMuPDF 產生 canary 圖（PDF 抽取本來就依賴它）："
-            f"{type(exc).__name__}: {exc}"
+            f"{type(exc).__name__}: {exc}。請修復 pymupdf 安裝後重試。"
         ) from exc
 
 

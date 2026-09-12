@@ -178,42 +178,67 @@ def _lock_path(json_path: Path) -> Path:
 
 @contextlib.contextmanager
 def knowledge_store_lock(json_path: Path, *, exclusive: bool) -> Iterator[None]:
-    """Lock a knowledge store across processes.
+    """Lock a knowledge store on a platform with all required safe-IO capabilities.
 
-    Unix uses flock shared/exclusive modes.  Windows' stdlib locking primitive
-    has no shared mode, so reads also take the exclusive one-byte lock there.
+    The capability guard runs before creating the lock file and currently rejects
+    standard Windows runtimes.  Supported POSIX runtimes use flock shared/exclusive
+    modes; the platform-specific locking implementations remain below the guard.
     """
-    json_path = Path(json_path)
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = _lock_path(json_path)
-    handle = open(lock_path, "a+b")
+    from runtime_dependencies import require_safe_filesystem
+
+    require_safe_filesystem("knowledge store lock", error_type=KnowledgeStoreError)
+    windows = os.name == "nt"
     try:
-        if os.name == "nt":
+        if windows:
             import msvcrt
 
-            handle.seek(0)
-            if handle.read(1) == b"":
-                handle.write(b"\0")
-                handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            if not callable(msvcrt.locking):
+                raise RuntimeError("msvcrt.locking is unavailable")
         else:
             import fcntl
 
-            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-            fcntl.flock(handle.fileno(), mode)
+            if not callable(fcntl.flock):
+                raise RuntimeError("fcntl.flock is unavailable")
+    except Exception as exc:
+        raise KnowledgeStoreError(
+            f"knowledge store locking backend is unavailable: {exc}; "
+            "repair the Python locking support before retrying"
+        ) from exc
+    json_path = Path(json_path)
+    lock_path = _lock_path(json_path)
+    try:
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+b")
+    except OSError as exc:
+        raise KnowledgeStoreError(f"cannot open the required knowledge store lock: {exc}") from exc
+    locked = False
+    try:
+        try:
+            if windows:
+                handle.seek(0)
+                if handle.read(1) == b"":
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                fcntl.flock(handle.fileno(), mode)
+        except Exception as exc:
+            raise KnowledgeStoreError(
+                f"cannot acquire the required knowledge store lock: {exc}; "
+                "use a filesystem with working process locks"
+            ) from exc
+        locked = True
         yield
     finally:
         try:
-            if os.name == "nt":
-                import msvcrt
-
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if locked:
+                if windows:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
 
@@ -594,6 +619,9 @@ def save_knowledge_store_atomic(
     embedding。None 保留直接低階 caller 明示寫舊格式的能力，載入端仍會把
     缺 section schema 的 cache 判 stale，不會因這個 optional 參數放寬驗證。
     """
+    from runtime_dependencies import require_safe_filesystem
+
+    require_safe_filesystem("knowledge store publication", error_type=KnowledgeStoreError)
     json_path = Path(json_path)
     emb_path = json_path.parent / Path(embedding_file)
     chunks = list(kb.get("chunks", []))

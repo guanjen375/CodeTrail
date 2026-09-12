@@ -3,15 +3,14 @@
 """ELF 分析：backend 中立的模型 + 多視角報告（analyze_file / ingest_document 共用）。
 
 設計：
-- `ElfModel`：pyelftools（結構化）與 readelf（文字）兩個 backend 都填同一份資料
-  結構，報告只從模型渲染，所以兩條路徑的章節與欄位一致。backend 拿不到的能力寫進
-  `model.missing`，報告開頭明列——缺 pyelftools 不再是「只標 parser 名字」的靜默降級。
+- `ElfModel` 只由 pyelftools 結構化解析產生。必要依賴缺失或解析失敗立即報錯，
+  不產生另一種解析器的部分報告。
 - 視角（view）：summary / headers / sections / memmap / symbols / imports / relocs /
   dynamic / dwarf / disasm / strings。`target` 指定要展開的 symbol / 位址 / section /
   regex / 篩選條件，`limit` 控制筆數；輸出一律套 hard cap，截斷訊息指出該用哪個
   view + target 縮小範圍，而不是默默砍掉。
-- 反組譯：objdump（含跨架構變體、client.json 的 `objdump` 覆寫）→ capstone → 失敗時把每個
-  嘗試過的工具與原因、以及可行的補救方式明文寫進報告。
+- 反組譯只使用 client.json 指定的 objdump，未指定則用 PATH objdump。
+  缺失或不支援目標架構時報錯，指引設定合適的跨架構 objdump。
 
 這個模組不做 sandbox：路徑安全由 media._safe_path / mcp_server.analyze_file 負責。
 """
@@ -36,7 +35,15 @@ from config import (
     BIN_ELF_VIEW_MAX_LIMIT,
 )
 
-# pyelftools 為結構化 backend；缺席時退回 readelf 文字解析（報告會明列缺失能力）。
+from runtime_dependencies import DependencyError
+
+
+class ELFDependencyError(DependencyError):
+    """Required ELF parser or selected binary is unavailable."""
+
+
+# 能力探測允許未安裝套件時 import；ELF 操作本身必須 require。
+_PYELFTOOLS_ERROR = ""
 try:
     import elftools as _elftools  # type: ignore
     from elftools.elf.elffile import ELFFile as _PyELFFile  # type: ignore
@@ -47,7 +54,8 @@ try:
     from elftools.elf import descriptions as _pydesc  # type: ignore
     _HAS_PYELFTOOLS = True
     _PYELFTOOLS_VERSION = str(getattr(_elftools, "__version__", "?"))
-except ImportError:  # pragma: no cover - 依環境而定
+except Exception as exc:  # pragma: no cover - 缺失或不相容的套件
+    _PYELFTOOLS_ERROR = f"{type(exc).__name__}: {exc}"
     _PyELFFile = None
     _PySymTab = None
     _PyNoteSection = None
@@ -124,7 +132,7 @@ def cmd_exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
-#: readelf / objdump / c++filt 的輸出是用文字 regex 解析的:固定 C locale,避免翻譯過的欄位名。
+#: objdump / c++filt 的輸出是用文字 regex 解析的:固定 C locale,避免翻譯過的欄位名。
 _C_LOCALE = {"LC_ALL": "C", "LANG": "C", "LANGUAGE": "C"}
 
 
@@ -168,7 +176,7 @@ def _run_capture(cmd: List[str], timeout: int = 30) -> Tuple[Optional[int], str,
 
 
 # ---------------------------------------------------------------------------
-# 架構名稱正規化（pyelftools enum / readelf 描述 → 統一 key）
+# 架構名稱正規化（pyelftools enum → 統一 key）
 # ---------------------------------------------------------------------------
 
 # 順序有意義："aarch64" / "sparc" / "loongarch" 都含 "arc"，要排在 "arc" 前面。
@@ -207,33 +215,6 @@ _FIXED_INSTR_WIDTH: Dict[str, int] = {
     "microblaze": 4, "nios2": 4, "csky": 4,
 }
 
-# 各架構常見的跨編譯 objdump 名稱（Ubuntu binutils-<triplet> / 常見 SDK）。
-_OBJDUMP_CANDIDATES: Dict[str, List[str]] = {
-    "x86_64": ["x86_64-linux-gnu-objdump"],
-    "i386": ["i686-linux-gnu-objdump", "x86_64-linux-gnu-objdump"],
-    "arm": ["arm-none-eabi-objdump", "arm-linux-gnueabihf-objdump", "arm-linux-gnueabi-objdump",
-            "armv7-linux-gnueabihf-objdump"],
-    "aarch64": ["aarch64-linux-gnu-objdump", "aarch64-none-elf-objdump", "aarch64-none-linux-gnu-objdump"],
-    "riscv": ["riscv64-unknown-elf-objdump", "riscv32-unknown-elf-objdump", "riscv-none-elf-objdump",
-              "riscv64-linux-gnu-objdump", "riscv-none-embed-objdump", "riscv64-unknown-linux-gnu-objdump"],
-    "mips": ["mips-linux-gnu-objdump", "mipsel-linux-gnu-objdump", "mips64-linux-gnuabi64-objdump",
-             "mips64el-linux-gnuabi64-objdump"],
-    "ppc": ["powerpc-linux-gnu-objdump", "powerpc-eabi-objdump"],
-    "ppc64": ["powerpc64le-linux-gnu-objdump", "powerpc64-linux-gnu-objdump"],
-    "xtensa": ["xtensa-esp32-elf-objdump", "xtensa-esp-elf-objdump", "xtensa-lx106-elf-objdump"],
-    "arc": ["arc-elf32-objdump", "arc-linux-gnu-objdump", "arc-snps-linux-gnu-objdump", "arc64-elf-objdump"],
-    "m68k": ["m68k-linux-gnu-objdump", "m68k-elf-objdump"],
-    "sh": ["sh-elf-objdump", "sh4-linux-gnu-objdump"],
-    "sparc": ["sparc64-linux-gnu-objdump", "sparc-elf-objdump"],
-    "avr": ["avr-objdump"],
-    "msp430": ["msp430-elf-objdump"],
-    "loongarch": ["loongarch64-linux-gnu-objdump"],
-    "s390": ["s390x-linux-gnu-objdump"],
-    "microblaze": ["microblaze-xilinx-elf-objdump", "microblazeel-xilinx-elf-objdump"],
-    "nios2": ["nios2-elf-objdump"],
-    "csky": ["csky-elf-objdump"],
-}
-
 _DISASM_PACKAGE_HINT: Dict[str, str] = {
     "arm": "binutils-arm-none-eabi（arm-none-eabi-objdump）或 binutils-arm-linux-gnueabihf",
     "aarch64": "binutils-aarch64-linux-gnu",
@@ -242,14 +223,14 @@ _DISASM_PACKAGE_HINT: Dict[str, str] = {
     "ppc": "binutils-powerpc-linux-gnu",
     "ppc64": "binutils-powerpc64le-linux-gnu",
     "xtensa": "ESP-IDF 工具鏈的 xtensa-esp32-elf-objdump",
-    "arc": "Synopsys ARC GNU toolchain 的 arc-elf32-objdump（capstone 不支援 ARC）",
+    "arc": "Synopsys ARC GNU toolchain 的 arc-elf32-objdump",
     "x86_64": "binutils（objdump）",
     "i386": "binutils（objdump）",
 }
 
 
 def canonical_machine(raw: object) -> Tuple[str, str]:
-    """把 e_machine（pyelftools enum 字串 / int / readelf 描述）對到統一 key 與顯示名。"""
+    """把 e_machine（pyelftools enum 字串 / int）對到統一 key 與顯示名。"""
     low = str(raw).lower()
     for sub, key, disp in _MACHINE_TABLE:
         if sub in low:
@@ -613,7 +594,7 @@ def categorize_imports(imports: List[str]) -> Dict[str, List[str]]:
 # ---------------------------------------------------------------------------
 
 class ElfModel:
-    """兩個 backend 都填這份結構；報告只從它渲染。
+    """pyelftools 填這份結構；報告只從它渲染。
 
     header   : class / endian / osabi / type / machine(key) / machine_desc / entry / flags / phnum / shnum
     segments : idx / type / offset / vaddr / paddr / filesz / memsz / flags("RWE" 三格) / align / sections
@@ -717,30 +698,6 @@ class ElfModel:
         return sec["name"] if sec and sec["name"] else ndx
 
 
-# ---------------------------------------------------------------------------
-# readelf backend（文字解析 fallback）
-# ---------------------------------------------------------------------------
-
-_RE_HDR_FIELD = re.compile(r"^([^:]+):\s+(.*)$")
-_RE_PH_ROW = re.compile(
-    r"^\s*(\S.*?)\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)"
-    r"\s+([RWE ]{1,3}?)\s+0x([0-9a-f]+)\s*$",
-    re.I,
-)
-_RE_SEC_ROW = re.compile(r"^\s*\[\s*(\d+)\]\s*(.*)$")
-_RE_SYM_ROW = re.compile(
-    r"^\s*(\d+):\s*([0-9a-fA-F]+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*(.*)$"
-)
-_RE_DYN_ROW = re.compile(r"^\s*0x([0-9a-fA-F]+)\s+\((\w+)\)\s*(.*)$")
-_RE_RELOC_HDR = re.compile(r"^Relocation section '([^']+)' at offset 0x[0-9a-fA-F]+ contains (\d+) entr")
-_RE_RELOC_ROW = re.compile(r"^\s*([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+(\S+)\s*(.*)$")
-_RE_STRDUMP_ROW = re.compile(r"^\s*\[\s*[0-9a-fA-F]+\]\s+(.*)$")
-_RE_DIE_HDR = re.compile(r"^\s*<(\d+)><([0-9a-fA-F]+)>:\s*Abbrev Number:\s*\d+\s*\((DW_TAG_\w+)\)")
-_RE_DIE_ATTR = re.compile(r"^\s*<[0-9a-fA-F]+>\s+(DW_AT_\w+)\s*:\s*(.*)$")
-_RE_CU_VERSION = re.compile(r"^\s*Version:\s*(\d+)")
-_RE_DECODED_LINE = re.compile(r"^(\S+)\s+(\d+|-)\s+(0x[0-9a-fA-F]+)")
-_RE_2HEX = re.compile(r"^[0-9a-f]{2}$")
-
 # DW_LANG 常見代碼（DWARF 2–5）；其餘顯示 lang#N。
 _DW_LANG: Dict[int, str] = {
     0x1: "C89", 0x2: "C", 0x4: "C++", 0x8: "Fortran90", 0xb: "Java", 0xc: "C99",
@@ -749,510 +706,6 @@ _DW_LANG: Dict[int, str] = {
     0x21: "C++14", 0x24: "RenderScript", 0x2a: "C++17", 0x2b: "C++20", 0x2c: "C17",
     0x8001: "Mips_Assembler", 0x8002: "Assembler",
 }
-
-
-def _parse_int(s: str) -> int:
-    s = (s or "").strip().split(",")[0].strip()
-    if not s:
-        return 0
-    tok = s.split()[0]
-    try:
-        return int(tok, 0)
-    except ValueError:
-        try:
-            return int(tok, 16)
-        except ValueError:
-            return 0
-
-
-def _clean_readelf_attr(v: str) -> str:
-    """去掉 readelf 的 `(indirect string, offset: 0x..): ` 這類前綴。"""
-    return re.sub(r"^\([^)]*\):\s*", "", (v or "").strip()).strip()
-
-
-def _lang_from_readelf(v: str) -> str:
-    m = re.search(r"\(([^)]+)\)", v)
-    if m:
-        return m.group(1).strip()
-    n = _parse_int(v)
-    return _DW_LANG.get(n, f"lang#{n}")
-
-
-def _readelf_header(model: ElfModel, txt: str) -> None:
-    fields: Dict[str, str] = {}
-    for line in txt.splitlines():
-        m = _RE_HDR_FIELD.match(line.strip())
-        if m:
-            fields[m.group(1).strip()] = m.group(2).strip()
-    cls = 64 if "64" in fields.get("Class", "") else 32
-    endian = "big" if "big" in fields.get("Data", "").lower() else "little"
-    type_raw = fields.get("Type", "")
-    machine_raw = fields.get("Machine", "")
-    key, disp = canonical_machine(machine_raw)
-    model.header = {
-        "class": cls,
-        "endian": endian,
-        "osabi": fields.get("OS/ABI", ""),
-        "type": type_raw.split()[0] if type_raw else "",
-        "type_desc": type_raw,
-        "machine": key,
-        "machine_desc": machine_raw or disp,
-        "machine_raw": machine_raw,
-        "entry": _parse_int(fields.get("Entry point address", "0")),
-        "flags": _parse_int(fields.get("Flags", "0")),
-        "phnum": _parse_int(fields.get("Number of program headers", "0")),
-        "shnum": _parse_int(fields.get("Number of section headers", "0")),
-    }
-
-
-def _readelf_segments(model: ElfModel, txt: str) -> None:
-    segs: List[Dict] = []
-    mapping: Dict[int, List[str]] = {}
-    in_ph = in_map = False
-    for line in txt.splitlines():
-        if "Program Headers:" in line:
-            in_ph, in_map = True, False
-            continue
-        if "Section to Segment mapping" in line:
-            in_ph, in_map = False, True
-            continue
-        if in_ph:
-            m = _RE_PH_ROW.match(line)
-            if not m:
-                continue
-            fl = m.group(7).upper()
-            flags = ("R" if "R" in fl else "-") + ("W" if "W" in fl else "-") + ("E" if "E" in fl else "-")
-            segs.append({
-                "idx": len(segs), "type": m.group(1).strip(),
-                "offset": int(m.group(2), 16), "vaddr": int(m.group(3), 16),
-                "paddr": int(m.group(4), 16), "filesz": int(m.group(5), 16),
-                "memsz": int(m.group(6), 16), "flags": flags,
-                "align": int(m.group(8), 16), "sections": [],
-            })
-        elif in_map:
-            m = re.match(r"^\s*(\d+)\s*(.*)$", line)
-            if m:
-                mapping[int(m.group(1))] = m.group(2).split()
-    for seg in segs:
-        seg["sections"] = mapping.get(seg["idx"], [])
-    model.segments = segs
-
-
-def _readelf_sections(model: ElfModel, txt: str) -> None:
-    secs: List[Dict] = []
-    for line in txt.splitlines():
-        m = _RE_SEC_ROW.match(line)
-        if not m:
-            continue
-        idx = int(m.group(1))
-        toks = m.group(2).split()
-        if len(toks) < 5:
-            continue
-        try:
-            al, inf, lk = int(toks[-1]), int(toks[-2]), int(toks[-3])
-        except ValueError:
-            continue
-        rest = toks[:-3]
-        # flags 欄可能是空的；ES 固定兩位小寫 hex，flags 是大寫字母（含 x/o/p 特例）
-        if len(rest) >= 5 and _RE_2HEX.match(rest[-1]):
-            flags, es, rest = "", int(rest[-1], 16), rest[:-1]
-        elif len(rest) >= 6 and _RE_2HEX.match(rest[-2]):
-            flags, es, rest = rest[-1], int(rest[-2], 16), rest[:-2]
-        else:
-            continue
-        if len(rest) < 4:
-            continue
-        try:
-            size, off, addr = int(rest[-1], 16), int(rest[-2], 16), int(rest[-3], 16)
-        except ValueError:
-            continue
-        rest = rest[:-3]
-        if len(rest) == 1:
-            name, typ = "", rest[0]
-        else:
-            name, typ = rest[0], " ".join(rest[1:])
-        secs.append({
-            "idx": idx, "name": name, "type": typ, "addr": addr, "offset": off,
-            "size": size, "flags": flags, "link": lk, "info": inf, "align": al,
-            "entsize": es, "nobits": typ == "NOBITS", "compressed": "C" in flags,
-        })
-    model.sections = secs
-
-
-def _readelf_symtabs(model: ElfModel, txt: str) -> None:
-    tables: Dict[str, List[Dict]] = {}
-    current: Optional[str] = None
-    in_data = False
-    for line in txt.splitlines():
-        s = line.strip()
-        hm = re.match(r"Symbol table '([^']+)' contains", s)
-        if hm:
-            current = hm.group(1)
-            tables.setdefault(current, [])
-            in_data = False
-            continue
-        if s.startswith("Num:"):
-            in_data = True
-            continue
-        if not in_data or current is None:
-            continue
-        m = _RE_SYM_ROW.match(line.rstrip())
-        if not m:
-            continue
-        try:
-            value = int(m.group(2), 16)
-            size = int(m.group(3), 0)   # readelf 對大 size 會印 0x 開頭的 hex
-        except ValueError:
-            continue
-        name = m.group(8).strip()
-        if "@" in name:
-            name = name.split("@", 1)[0]
-        tables[current].append({
-            "value": value, "size": size, "type": m.group(4), "bind": m.group(5),
-            "vis": m.group(6), "ndx": m.group(7), "name": name,
-        })
-    model.symtabs = tables
-
-
-def _readelf_dynamic(model: ElfModel, txt: str) -> None:
-    tags: List[Tuple[str, str]] = []
-    needed: List[str] = []
-    soname = rpath = runpath = None
-    flags_txt = flags1_txt = ""
-    init_n = fini_n = 0
-    ptr = 8 if model.header.get("class") == 64 else 4
-    for line in txt.splitlines():
-        m = _RE_DYN_ROW.match(line)
-        if not m:
-            continue
-        tag, val = m.group(2), m.group(3).strip()
-        tags.append((tag, val))
-        br = re.search(r"\[(.*)\]", val)
-        if tag == "NEEDED" and br:
-            needed.append(br.group(1))
-        elif tag == "SONAME" and br:
-            soname = br.group(1)
-        elif tag == "RPATH" and br:
-            rpath = br.group(1)
-        elif tag == "RUNPATH" and br:
-            runpath = br.group(1)
-        elif tag == "FLAGS":
-            flags_txt = val
-        elif tag == "FLAGS_1":
-            flags1_txt = val.replace("Flags:", "").strip()
-        elif tag == "INIT_ARRAYSZ":
-            init_n = _parse_int(val) // ptr
-        elif tag == "FINI_ARRAYSZ":
-            fini_n = _parse_int(val) // ptr
-    if not tags:
-        model.dynamic = None
-        return
-    model.dynamic = {
-        "tags": tags, "needed": needed, "soname": soname, "rpath": rpath, "runpath": runpath,
-        "bind_now": ("BIND_NOW" in flags_txt) or (re.search(r"\bNOW\b", flags1_txt) is not None),
-        "is_pie": re.search(r"\bPIE\b", flags1_txt) is not None,
-        "init_array_count": init_n, "fini_array_count": fini_n,
-        "flags_text": flags_txt, "flags_1_text": flags1_txt,
-    }
-
-
-def _readelf_relocs(model: ElfModel, txt: str) -> None:
-    relocs: List[Dict] = []
-    cur: Optional[Dict] = None
-    for line in txt.splitlines():
-        hm = _RE_RELOC_HDR.match(line)
-        if hm:
-            name, count = hm.group(1), int(hm.group(2))
-            sec = model.section_by_name(name)
-            applies = ""
-            if sec is not None:
-                if sec.get("info"):
-                    tgt = model.section_by_index(int(sec["info"]))
-                    applies = tgt["name"] if tgt else ""
-            else:
-                # 沒有 section 表可查時，從名稱推（.rela.text → .text）
-                applies = re.sub(r"^\.rela?(?=[._]|$)", "", name)
-            cur = {
-                "section": name, "applies_to": applies,
-                "rela": name.startswith(".rela") or (sec is not None and sec["type"] == "RELA"),
-                "count": count, "by_type": Counter(), "entries": [],
-            }
-            relocs.append(cur)
-            continue
-        if cur is None:
-            continue
-        m = _RE_RELOC_ROW.match(line)
-        if not m:
-            continue
-        try:
-            offset = int(m.group(1), 16)
-            int(m.group(2), 16)
-        except ValueError:
-            continue  # 欄位標題列（Offset / Info …）
-        typ = m.group(3)
-        rest = m.group(4).strip()
-        cur["by_type"][typ] += 1
-        if len(cur["entries"]) >= _RELOC_ENTRY_CAP:
-            model.reloc_entry_cap_hit = True
-            continue
-        sym = ""
-        addend: Optional[int] = None
-        m2 = re.match(r"^([0-9a-fA-F]{8,16})\s+(.*)$", rest)
-        if m2:
-            tail = m2.group(2).strip()
-            m3 = re.match(r"^(.*?)\s*([+-])\s*(?:0x)?([0-9a-fA-F]+)$", tail)
-            if m3 and m3.group(1).strip():
-                sym = m3.group(1).strip()
-                addend = int(m3.group(3), 16) * (-1 if m3.group(2) == "-" else 1)
-            else:
-                sym = tail
-        elif rest:
-            if re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", rest):
-                addend = int(rest, 16)
-            else:
-                sym = rest
-        if "@" in sym:
-            sym = sym.split("@", 1)[0]
-        cur["entries"].append({"offset": offset, "type": typ, "sym": sym, "addend": addend})
-    model.relocs = relocs
-
-
-def _readelf_notes(model: ElfModel, txt: str) -> None:
-    for line in txt.splitlines():
-        m = re.search(r"Displaying notes found in:\s*(\S+)", line)
-        if m:
-            model.note_names.append(m.group(1))
-    m = re.search(r"Build ID:\s*([0-9a-fA-F]+)", txt)
-    if m:
-        model.build_id = m.group(1)
-
-
-def _readelf_strdump(path: str, section: str) -> Tuple[List[str], Optional[str]]:
-    """readelf -p <section> → (字串列, 失敗原因或 None)。"""
-    out, err = run_cmd(["readelf", "-p", section, path], timeout=15)
-    if out is None:
-        return [], err or "unknown"
-    rows: List[str] = []
-    for line in out.splitlines():
-        m = _RE_STRDUMP_ROW.match(line)
-        if m:
-            rows.append(m.group(1).strip())
-    return rows, None
-
-
-def _readelf_dwarf_cus(model: ElfModel) -> List[Dict]:
-    out, err = run_cmd(
-        ["readelf", "--debug-dump=info", "--dwarf-depth=1", str(model.path)], timeout=180,
-    )
-    if out is None:
-        raise RuntimeError(f"readelf --debug-dump=info 失敗: {err}")
-    cus: List[Dict] = []
-    cur: Optional[Dict] = None
-    pending_version = 0
-    for line in out.splitlines():
-        vm = _RE_CU_VERSION.match(line)
-        if vm:
-            pending_version = int(vm.group(1))
-            continue
-        hm = _RE_DIE_HDR.match(line)
-        if hm:
-            if int(hm.group(1)) == 0 and hm.group(3) in (
-                "DW_TAG_compile_unit", "DW_TAG_partial_unit", "DW_TAG_type_unit",
-            ):
-                cur = {
-                    "offset": int(hm.group(2), 16), "version": pending_version, "name": "",
-                    "comp_dir": "", "producer": "", "language": "", "low_pc": None, "high_pc": None,
-                }
-                cus.append(cur)
-            else:
-                cur = None
-            continue
-        if cur is None:
-            continue
-        am = _RE_DIE_ATTR.match(line)
-        if not am:
-            continue
-        key, val = am.group(1), _clean_readelf_attr(am.group(2))
-        if key == "DW_AT_name":
-            cur["name"] = val
-        elif key == "DW_AT_comp_dir":
-            cur["comp_dir"] = val
-        elif key == "DW_AT_producer":
-            cur["producer"] = val
-        elif key == "DW_AT_language":
-            cur["language"] = _lang_from_readelf(val)
-        elif key == "DW_AT_low_pc":
-            cur["low_pc"] = _parse_int(val)
-        elif key == "DW_AT_high_pc":
-            cur["high_pc"] = _parse_int(val)
-    for cu in cus:
-        # readelf 不顯示 form：high_pc 若小於 low_pc 就是 offset 形式（DWARF4+ 常見）
-        if cu["low_pc"] is not None and cu["high_pc"] is not None and cu["high_pc"] < cu["low_pc"]:
-            cu["high_pc"] = cu["low_pc"] + cu["high_pc"]
-    return cus
-
-
-def _readelf_dwarf_functions(model: ElfModel) -> List[Dict]:
-    out, err = run_cmd(
-        ["readelf", "--debug-dump=info", "--dwarf-depth=2", str(model.path)], timeout=300,
-    )
-    if out is None:
-        raise RuntimeError(f"readelf --debug-dump=info 失敗: {err}")
-    funcs: List[Dict] = []
-    cu_name = ""
-    cur: Optional[Dict] = None
-    depth0_attrs: Optional[Dict] = None
-
-    def _flush() -> None:
-        nonlocal cur
-        if cur is None:
-            return
-        if cur.get("name"):
-            low, high = cur.get("low_pc"), cur.get("high_pc")
-            if low is not None and high is not None and high < low:
-                high = low + high
-            funcs.append({
-                "name": cur["name"], "low_pc": low, "high_pc": high,
-                "file": cu_name if cur.get("decl_file") in (None, 1) else f"file#{cur.get('decl_file')}",
-                "line": cur.get("decl_line"), "cu": cu_name,
-                "external": cur.get("external", False), "inline": cur.get("inline", False),
-                "declaration": cur.get("declaration", False),
-            })
-        cur = None
-
-    for line in out.splitlines():
-        hm = _RE_DIE_HDR.match(line)
-        if hm:
-            _flush()
-            depth, tag = int(hm.group(1)), hm.group(3)
-            depth0_attrs = None
-            if depth == 0:
-                depth0_attrs = {}
-                cu_name = ""
-            elif depth == 1 and tag == "DW_TAG_subprogram":
-                cur = {}
-                if len(funcs) >= _DWARF_FUNC_CAP:
-                    break
-            continue
-        am = _RE_DIE_ATTR.match(line)
-        if not am:
-            continue
-        key, val = am.group(1), _clean_readelf_attr(am.group(2))
-        if cur is not None:
-            if key == "DW_AT_name":
-                cur["name"] = val
-            elif key == "DW_AT_low_pc":
-                cur["low_pc"] = _parse_int(val)
-            elif key == "DW_AT_high_pc":
-                cur["high_pc"] = _parse_int(val)
-            elif key == "DW_AT_decl_file":
-                cur["decl_file"] = _parse_int(val)
-            elif key == "DW_AT_decl_line":
-                cur["decl_line"] = _parse_int(val)
-            elif key == "DW_AT_external":
-                cur["external"] = True
-            elif key == "DW_AT_inline":
-                cur["inline"] = _parse_int(val) in (1, 3)
-            elif key == "DW_AT_declaration":
-                cur["declaration"] = True
-        elif depth0_attrs is not None and key == "DW_AT_name":
-            cu_name = val
-    _flush()
-    return funcs
-
-
-def _readelf_dwarf_lines(model: ElfModel) -> List[Tuple[int, str, int]]:
-    """decodedline → 依位址排序的 (addr, file, line)；line=-1 是 end-of-sequence 標記。"""
-    out, err = run_cmd(
-        ["readelf", "--debug-dump=decodedline", str(model.path)], timeout=300,
-    )
-    if out is None:
-        raise RuntimeError(f"readelf --debug-dump=decodedline 失敗: {err}")
-    rows: List[Tuple[int, str, int]] = []
-    for line in out.splitlines():
-        m = _RE_DECODED_LINE.match(line)
-        if not m or m.group(1).lower() in ("file", "cu:"):
-            continue
-        ln = -1 if m.group(2) == "-" else int(m.group(2))
-        rows.append((int(m.group(3), 16), m.group(1), ln))
-    rows.sort(key=lambda r: r[0])
-    return rows
-
-
-def _load_readelf(model: ElfModel) -> None:
-    model.parser = "readelf"
-    if not cmd_exists("readelf"):
-        model.parser_detail = "無（系統缺少 binutils readelf）"
-        model.missing.append(
-            "ELF header / segments / sections / symbols / .dynamic / relocation / DWARF 全部缺失"
-            "（系統沒有 readelf，也沒有 pyelftools）；只剩字串掃描。"
-            "補救：python3 -m pip install pyelftools，或安裝 binutils"
-        )
-        model.caps = {k: False for k in ("dwarf_cus", "dwarf_functions", "dwarf_lines", "dwarf_types")}
-        return
-
-    model.parser_detail = "readelf 文字解析（fallback）"
-    p = str(model.path)
-
-    def _step(args: List[str], timeout: int, cap: str, parser, marker: Optional[str], count) -> None:
-        """跑一條 readelf、解析、驗證：失敗與「有輸出但解析不到」都記進 model.failed。"""
-        label = "readelf " + " ".join(args)
-        out, err = run_cmd(["readelf", *args, p], timeout=timeout)
-        if out is None:
-            model.failed[cap] = f"{label}: {err}"
-            model.warnings.append(
-                f"{label} 失敗（{err}）：{cap} 資料缺失——下面凡是「沒有 {cap}」的敘述都不可信"
-            )
-            return
-        try:
-            parser(model, out)
-        except Exception as e:
-            model.failed[cap] = f"{label}: 解析例外 {type(e).__name__}: {e}"
-            model.warnings.append(f"{label} 解析失敗：{model.failed[cap]}")
-            return
-        if marker and marker in out and count() == 0:
-            model.failed[cap] = f"{label}: 輸出含「{marker}」但解析不到任何項目（readelf 輸出格式可能改變）"
-            model.warnings.append(f"{label} 解析失敗：{model.failed[cap]}")
-
-    _step(["-h"], 10, "header", _readelf_header, "ELF Header", lambda: len(model.header))
-    _step(["-lW"], 15, "segments", _readelf_segments, "Program Headers:", lambda: len(model.segments))
-    _step(["-SW"], 15, "sections", _readelf_sections, "Section Headers:", lambda: len(model.sections))
-    _step(["-sW"], 60, "symbols", _readelf_symtabs, "Symbol table",
-          lambda: sum(len(v) for v in model.symtabs.values()))
-    _step(["-dW"], 15, "dynamic", _readelf_dynamic, "Dynamic section at offset",
-          lambda: len(model.dynamic["tags"]) if model.dynamic else 0)
-    _step(["-rW"], 120, "relocs", _readelf_relocs, "Relocation section", lambda: len(model.relocs))
-    _step(["-n"], 10, "notes", _readelf_notes, None, lambda: 1)
-    if model.section_by_name(".comment"):
-        rows, err = _readelf_strdump(p, ".comment")
-        if err:
-            model.failed["comment"] = f"readelf -p .comment: {err}"
-            model.warnings.append(f"readelf -p .comment 失敗（{err}）")
-        model.comment = rows
-    if model.section_by_name(".modinfo"):
-        rows, err = _readelf_strdump(p, ".modinfo")
-        if err:
-            model.failed["modinfo"] = f"readelf -p .modinfo: {err}"
-            model.warnings.append(f"readelf -p .modinfo 失敗（{err}）")
-        elif rows:
-            model.modinfo = parse_modinfo(b"\x00".join(r.encode("utf-8", "replace") for r in rows))
-
-    dbg = [s["name"] for s in model.sections if s["name"].startswith((".debug", ".zdebug"))]
-    has_info = any(n in (".debug_info", ".zdebug_info") for n in dbg)
-    model.dwarf = {"present": bool(dbg), "debug_info": has_info, "sections": dbg,
-                   "unknown": "sections" in model.failed}
-    model.caps = {
-        "dwarf_cus": has_info, "dwarf_functions": has_info,
-        "dwarf_lines": has_info, "dwarf_types": False,
-    }
-    model.missing.extend([
-        "DWARF 型別資訊（struct / union / enum 成員、typedef）— readelf 文字路徑不解析，需要 pyelftools",
-        "DWARF 函式清單只含直接掛在 CU 下、有 DW_AT_name 的 subprogram（C++ / inline / "
-        "specification 型的會漏），decl_file 只能對到 CU 主檔；位址→來源行靠 readelf decodedline 文字解析",
-        f"relocation 每個 section 只保留前 {_RELOC_ENTRY_CAP:,} 筆項目（統計仍為全量）",
-    ])
-    if not _HAS_PYELFTOOLS:
-        model.missing.append("補救：python3 -m pip install pyelftools（重啟 MCP 後生效）即可恢復完整結構化解析")
 
 
 # ---------------------------------------------------------------------------
@@ -1541,8 +994,19 @@ def is_elf_file(path: Path) -> bool:
         return False
 
 
+def require_pyelftools() -> None:
+    """在任何 ELF 快取命中之前檢查主解析器能力。"""
+    if not _HAS_PYELFTOOLS or not callable(_PyELFFile):
+        detail = f" ({_PYELFTOOLS_ERROR})" if _PYELFTOOLS_ERROR else ""
+        raise ELFDependencyError(
+            "ELF 解析需要 pyelftools；請執行 python3 -m pip install 'pyelftools>=0.30'"
+            f" 並重啟 MCP{detail}。"
+        )
+
+
 def load_model(path) -> ElfModel:
-    """解析 ELF 成 ElfModel（同一檔案同一 mtime 快取；pyelftools 失敗退回 readelf）。"""
+    """使用 pyelftools 解析；缺失或解析失敗不讀取或發布替代報告。"""
+    require_pyelftools()
     path = Path(path)
     with open(path, "rb") as f:
         magic = f.read(4)
@@ -1556,20 +1020,13 @@ def load_model(path) -> ElfModel:
         return cached
 
     model = ElfModel(path)
-    if _HAS_PYELFTOOLS:
-        try:
-            _load_pyelftools(model)
-        except Exception as e:
-            model = ElfModel(path)
-            model.warnings.append(
-                f"pyelftools 解析失敗（{type(e).__name__}: {e}），已退回 readelf 文字解析"
-            )
-            _load_readelf(model)
-    else:
-        model.warnings.append(
-            "未安裝 pyelftools（python3 -m pip install pyelftools），改用 readelf 文字解析"
-        )
-        _load_readelf(model)
+    try:
+        _load_pyelftools(model)
+    except Exception as exc:
+        raise ELFDependencyError(
+            f"pyelftools 解析失敗: {type(exc).__name__}: {exc}；"
+            "請檢查 ELF 完整性與 pyelftools 安裝。"
+        ) from exc
 
     _MODEL_CACHE[key] = model
     _MODEL_CACHE.move_to_end(key)
@@ -1815,7 +1272,7 @@ def model_strings(model: ElfModel) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# DWARF（lazy；pyelftools 結構化 / readelf 文字）
+# DWARF（lazy；pyelftools 結構化）
 # ---------------------------------------------------------------------------
 
 _CONTAINER_TAGS = {
@@ -2005,28 +1462,28 @@ def dwarf_cus(model: ElfModel) -> List[Dict]:
     cus: List[Dict] = []
     if model.caps.get("dwarf_cus"):
         try:
-            if model.parser == "pyelftools":
-                with open(model.path, "rb") as f:
-                    elf = _PyELFFile(f)
-                    if elf.has_dwarf_info():
-                        d = elf.get_dwarf_info()
-                        for cu in d.iter_CUs():
-                            top = cu.get_top_DIE()
-                            a = top.attributes
-                            name, comp_dir = _py_cu_name_dir(top)
-                            low, high = _py_pc_range(top)
-                            lang = ""
-                            if "DW_AT_language" in a and isinstance(a["DW_AT_language"].value, int):
-                                lv = int(a["DW_AT_language"].value)
-                                lang = _DW_LANG.get(lv, f"lang#{lv}")
-                            cus.append({
-                                "offset": int(cu.cu_offset), "version": int(cu["version"]),
-                                "name": name, "comp_dir": comp_dir,
-                                "producer": _decode(a["DW_AT_producer"].value) if "DW_AT_producer" in a else "",
-                                "language": lang, "low_pc": low, "high_pc": high,
-                            })
-            else:
-                cus = _readelf_dwarf_cus(model)
+            require_pyelftools()
+            with open(model.path, "rb") as f:
+                elf = _PyELFFile(f)
+                if elf.has_dwarf_info():
+                    d = elf.get_dwarf_info()
+                    for cu in d.iter_CUs():
+                        top = cu.get_top_DIE()
+                        a = top.attributes
+                        name, comp_dir = _py_cu_name_dir(top)
+                        low, high = _py_pc_range(top)
+                        lang = ""
+                        if "DW_AT_language" in a and isinstance(a["DW_AT_language"].value, int):
+                            lv = int(a["DW_AT_language"].value)
+                            lang = _DW_LANG.get(lv, f"lang#{lv}")
+                        cus.append({
+                            "offset": int(cu.cu_offset), "version": int(cu["version"]),
+                            "name": name, "comp_dir": comp_dir,
+                            "producer": _decode(a["DW_AT_producer"].value) if "DW_AT_producer" in a else "",
+                            "language": lang, "low_pc": low, "high_pc": high,
+                        })
+        except DependencyError:
+            raise
         except Exception as e:
             _dwarf_error(model, e)
             cus = []
@@ -2041,49 +1498,49 @@ def dwarf_functions(model: ElfModel) -> List[Dict]:
     funcs: List[Dict] = []
     if model.caps.get("dwarf_functions"):
         try:
-            if model.parser == "pyelftools":
-                with open(model.path, "rb") as f:
-                    elf = _PyELFFile(f)
-                    if elf.has_dwarf_info():
-                        d = elf.get_dwarf_info()
-                        for cu in d.iter_CUs():
-                            top = cu.get_top_DIE()
-                            cu_name, comp_dir = _py_cu_name_dir(top)
-                            lp = None
-                            lp_tried = False
-                            for die, _depth in _py_iter_dies(top, 3):
-                                if die.tag != "DW_TAG_subprogram":
-                                    continue
-                                name = _py_die_name(die)
-                                if not name:
-                                    continue
-                                a = die.attributes
-                                low, high = _py_pc_range(die)
-                                file_name = ""
-                                if "DW_AT_decl_file" in a and isinstance(a["DW_AT_decl_file"].value, int):
-                                    if not lp_tried:
-                                        lp_tried = True
-                                        try:
-                                            lp = d.line_program_for_CU(cu)
-                                        except Exception:
-                                            lp = None
-                                    fidx = int(a["DW_AT_decl_file"].value)
-                                    file_name = _py_lp_file(lp, fidx, comp_dir) if lp is not None else f"file#{fidx}"
-                                inl = a.get("DW_AT_inline")
-                                funcs.append({
-                                    "name": name, "low_pc": low, "high_pc": high, "file": file_name,
-                                    "line": int(a["DW_AT_decl_line"].value) if "DW_AT_decl_line" in a else None,
-                                    "cu": cu_name, "external": "DW_AT_external" in a,
-                                    "inline": bool(inl is not None and isinstance(inl.value, int) and int(inl.value) in (1, 3)),
-                                    "declaration": "DW_AT_declaration" in a,
-                                })
-                                if len(funcs) >= _DWARF_FUNC_CAP:
-                                    model._lazy["dwarf_funcs_capped"] = True
-                                    break
-                            if model._lazy.get("dwarf_funcs_capped"):
+            require_pyelftools()
+            with open(model.path, "rb") as f:
+                elf = _PyELFFile(f)
+                if elf.has_dwarf_info():
+                    d = elf.get_dwarf_info()
+                    for cu in d.iter_CUs():
+                        top = cu.get_top_DIE()
+                        cu_name, comp_dir = _py_cu_name_dir(top)
+                        lp = None
+                        lp_tried = False
+                        for die, _depth in _py_iter_dies(top, 3):
+                            if die.tag != "DW_TAG_subprogram":
+                                continue
+                            name = _py_die_name(die)
+                            if not name:
+                                continue
+                            a = die.attributes
+                            low, high = _py_pc_range(die)
+                            file_name = ""
+                            if "DW_AT_decl_file" in a and isinstance(a["DW_AT_decl_file"].value, int):
+                                if not lp_tried:
+                                    lp_tried = True
+                                    try:
+                                        lp = d.line_program_for_CU(cu)
+                                    except Exception:
+                                        lp = None
+                                fidx = int(a["DW_AT_decl_file"].value)
+                                file_name = _py_lp_file(lp, fidx, comp_dir) if lp is not None else f"file#{fidx}"
+                            inl = a.get("DW_AT_inline")
+                            funcs.append({
+                                "name": name, "low_pc": low, "high_pc": high, "file": file_name,
+                                "line": int(a["DW_AT_decl_line"].value) if "DW_AT_decl_line" in a else None,
+                                "cu": cu_name, "external": "DW_AT_external" in a,
+                                "inline": bool(inl is not None and isinstance(inl.value, int) and int(inl.value) in (1, 3)),
+                                "declaration": "DW_AT_declaration" in a,
+                            })
+                            if len(funcs) >= _DWARF_FUNC_CAP:
+                                model._lazy["dwarf_funcs_capped"] = True
                                 break
-            else:
-                funcs = _readelf_dwarf_functions(model)
+                        if model._lazy.get("dwarf_funcs_capped"):
+                            break
+        except DependencyError:
+            raise
         except Exception as e:
             _dwarf_error(model, e)
             funcs = []
@@ -2197,22 +1654,10 @@ def dwarf_addr_to_line(model: ElfModel, addr: int) -> Optional[Dict]:
             if func is None or (fn["high_pc"] - fn["low_pc"]) < (func["high_pc"] - func["low_pc"]):
                 func = fn
     try:
-        if model.parser == "pyelftools":
-            return _py_addr_to_line(model, addr, func)
-        rows = model._lazy.get("dwarf_lines")
-        if rows is None:
-            rows = _readelf_dwarf_lines(model)
-            model._lazy["dwarf_lines"] = rows
-        if not rows:
-            return None
-        addrs = [r[0] for r in rows]
-        i = bisect.bisect_right(addrs, addr) - 1
-        if i < 0:
-            return None
-        row = rows[i]
-        if row[2] < 0:
-            return None
-        return {"file": row[1], "line": row[2], "cu": "", "function": func["name"] if func else ""}
+        require_pyelftools()
+        return _py_addr_to_line(model, addr, func)
+    except DependencyError:
+        raise
     except Exception as e:
         _dwarf_error(model, e)
         return None
@@ -2266,28 +1711,15 @@ def _py_addr_to_line(model: ElfModel, addr: int, func: Optional[Dict]) -> Option
 
 
 # ---------------------------------------------------------------------------
-# 反組譯（objdump 變體 → capstone → 明講失敗原因）
+# 反組譯（只使用選定的 objdump）
 # ---------------------------------------------------------------------------
 
 def _objdump_candidates(machine: str) -> List[str]:
+    """保留既有 list 介面，但只有明確選定的一個 binary。"""
     import config
 
-    cands: List[str] = []
-    # 使用者在 client.json 指定的 objdump(跨架構韌體需要 binutils-<triplet>)。
-    configured = str(getattr(config, "OBJDUMP", "")).strip()
-    if configured:
-        cands.append(configured)
-    cands.append("objdump")
-    cands.extend(_OBJDUMP_CANDIDATES.get(machine, []))
-    seen: set = set()
-    out: List[str] = []
-    for c in cands:
-        if c in seen:
-            continue
-        seen.add(c)
-        if cmd_exists(c):
-            out.append(c)
-    return _finish(out)
+    configured = str(config.OBJDUMP).strip()
+    return [configured or "objdump"]
 
 
 def _has_mapping_symbols(model: ElfModel) -> bool:
@@ -2422,85 +1854,12 @@ def _disasm_plan(model: ElfModel, target: str, limit: int) -> Tuple[Optional[Dic
     return plan, None
 
 
-def _capstone_disasm(model: ElfModel, plan: Dict, limit: int) -> Tuple[bool, object]:
-    try:
-        import capstone as cs  # type: ignore
-    except ImportError:
-        return False, "未安裝（python3 -m pip install capstone）"
-    m = model.machine
-    cls = model.header.get("class")
-    try:
-        arch = None
-        mode = 0
-        if m == "x86_64":
-            arch, mode = cs.CS_ARCH_X86, cs.CS_MODE_64
-        elif m == "i386":
-            arch, mode = cs.CS_ARCH_X86, cs.CS_MODE_32
-        elif m == "arm":
-            arch, mode = cs.CS_ARCH_ARM, (cs.CS_MODE_THUMB if plan.get("thumb") else cs.CS_MODE_ARM)
-        elif m == "aarch64":
-            arch = getattr(cs, "CS_ARCH_AARCH64", None) or getattr(cs, "CS_ARCH_ARM64", None)
-            mode = cs.CS_MODE_ARM
-        elif m == "riscv":
-            arch = getattr(cs, "CS_ARCH_RISCV", None)
-            mode = (getattr(cs, "CS_MODE_RISCV64", 0) if cls == 64 else getattr(cs, "CS_MODE_RISCV32", 0)) | getattr(cs, "CS_MODE_RISCVC", 0)
-        elif m == "mips":
-            arch = cs.CS_ARCH_MIPS
-            mode = cs.CS_MODE_MIPS64 if cls == 64 else cs.CS_MODE_MIPS32
-        elif m in ("ppc", "ppc64"):
-            arch = cs.CS_ARCH_PPC
-            mode = cs.CS_MODE_64 if cls == 64 else cs.CS_MODE_32
-        elif m == "sparc":
-            arch, mode = cs.CS_ARCH_SPARC, 0
-        elif m == "m68k":
-            arch, mode = getattr(cs, "CS_ARCH_M68K", None), 0
-        elif m == "xtensa":
-            arch, mode = getattr(cs, "CS_ARCH_XTENSA", None), 0
-        if arch is None:
-            return False, f"capstone 不支援 {model.machine_desc}"
-        if not model.little_endian:
-            mode |= cs.CS_MODE_BIG_ENDIAN
-        md = cs.Cs(arch, mode)
-    except Exception as e:
-        return False, f"capstone 初始化失敗: {type(e).__name__}: {e}"
-
-    nbytes = max(16, plan["stop"] - plan["start"])
-    if model.is_rel:
-        sec = model.section_by_name(plan.get("section") or ".text")
-        if sec is None or sec["nobits"]:
-            return False, f"找不到 section {plan.get('section')!r} 的檔案內容"
-        if plan["start"] >= sec["size"]:
-            return False, f"offset 0x{plan['start']:x} 超出 {sec['name']} 大小 0x{sec['size']:x}"
-        data = read_file_bytes(model, sec["offset"] + plan["start"], min(nbytes, sec["size"] - plan["start"]))
-    else:
-        loc = addr_to_file_offset(model, plan["start"])
-        if loc is None:
-            return False, f"位址 {model.fmt_addr(plan['start'])} 不在任何有檔案內容的 LOAD 區段 / section"
-        off, avail = loc
-        data = read_file_bytes(model, off, min(nbytes, avail))
-    if not data:
-        return False, "讀不到位元組"
-    lines: List[str] = []
-    last = None
-    try:
-        for insn in md.disasm(data, plan["start"]):
-            lines.append(f"  {insn.address:x}:  {insn.bytes.hex(' '):<24} {insn.mnemonic} {insn.op_str}".rstrip())
-            last = insn.address + insn.size
-            if len(lines) >= limit:
-                break
-    except Exception as e:
-        return False, f"capstone 解碼失敗: {type(e).__name__}: {e}"
-    if not lines:
-        return False, "capstone 解不出指令（該位址可能不是程式碼）"
-    return True, (lines, last)
-
 
 def _disasm_remedies(model: ElfModel) -> List[str]:
     pkg = _DISASM_PACKAGE_HINT.get(model.machine, "對應架構的 binutils（<triplet>-objdump）或 binutils-multiarch")
     out = [
-        f"  補救（擇一）：安裝 {pkg}",
-        "  　　　　　　或 python3 -m pip install capstone（純 Python 綁定；支援 x86 / ARM / AArch64 / RISC-V / MIPS / PPC / SPARC / m68k；不含 ARC / Xtensa 舊版）",
-        "  　　　　　　或在 ~/.config/codetrail/client.json 設 objdump=/path/to/<triplet>-objdump（MCP 重啟後生效）",
+        f"  補救：安裝 {pkg}",
+        "  在 ~/.config/codetrail/client.json 設 objdump=/path/to/<triplet>-objdump（MCP 重啟後生效）。",
     ]
     return _finish(out)
 
@@ -2512,70 +1871,49 @@ def disassemble(model: ElfModel, target: str = "", limit: int = 0) -> Tuple[bool
     if plan is None:
         return False, [f"[反組譯無法進行] {err}"]
 
-    attempts: List[Tuple[str, str]] = []
+    tool = _objdump_candidates(model.machine)[0]
+    if not cmd_exists(tool):
+        raise ELFDependencyError(
+            f"所選 objdump 不存在或無法執行: {tool}\n" + "\n".join(_disasm_remedies(model))
+        )
     header = [f"目標: {plan['label']}" + (" (Thumb)" if plan.get("thumb") else "")]
     if model.is_rel:
         header[0] += f"  section: {plan['section']}（REL 檔位址為 section 內 offset）"
-
-    for tool in _objdump_candidates(model.machine):
-        cmd = [tool, "-d"]
-        if plan.get("thumb") and not _has_mapping_symbols(model):
-            cmd += ["-M", "force-thumb"]
-        if model.is_rel and plan.get("section"):
-            cmd += ["-j", plan["section"]]
-        use_symbol = plan["mode"] == "symbol" and not model.is_rel
-        if use_symbol:
-            cmd.append(f"--disassemble={plan['symbol']}")
-        else:
-            cmd += [f"--start-address=0x{plan['start']:x}", f"--stop-address=0x{plan['stop']:x}"]
-        cmd.append(str(model.path))
+    cmd = [tool, "-d"]
+    if plan.get("thumb") and not _has_mapping_symbols(model):
+        cmd += ["-M", "force-thumb"]
+    if model.is_rel and plan.get("section"):
+        cmd += ["-j", plan["section"]]
+    use_symbol = plan["mode"] == "symbol" and not model.is_rel
+    if use_symbol:
+        cmd.append(f"--disassemble={plan['symbol']}")
+    else:
+        cmd += [f"--start-address=0x{plan['start']:x}", f"--stop-address=0x{plan['stop']:x}"]
+    cmd.append(str(model.path))
+    rc, out, errtxt = _run_capture(cmd, timeout=30)
+    if use_symbol and rc is not None and ("unrecognized option" in errtxt or "invalid option" in errtxt):
+        # 同一 binary 的舊版選項表示法，沒有選擇另一套實作。
+        cmd = [c for c in cmd if not c.startswith("--disassemble=")]
+        cmd.insert(-1, f"--start-address=0x{plan['start']:x}")
+        cmd.insert(-1, f"--stop-address=0x{plan['stop']:x}")
         rc, out, errtxt = _run_capture(cmd, timeout=30)
-        if rc is None:
-            attempts.append((tool, errtxt))
-            continue
-        if use_symbol and ("unrecognized option" in errtxt or "invalid option" in errtxt):
-            cmd = [c for c in cmd if not c.startswith("--disassemble=")]
-            cmd.insert(-1, f"--start-address=0x{plan['start']:x}")
-            cmd.insert(-1, f"--stop-address=0x{plan['stop']:x}")
-            rc, out, errtxt = _run_capture(cmd, timeout=30)
-        lines, n, nxt = _parse_objdump_output(out, limit, start=plan["start"] if not use_symbol else None)
-        if n > 0:
-            body = [f"工具: {tool}"] + header + lines
-            if n >= limit and nxt is not None:
-                body.append(f"  … 已達 limit={limit}；續看：target=\"0x{nxt:x}\"" +
-                            (f" section:{plan['section']}" if model.is_rel else ""))
-            return True, body
-        reason = ""
-        for src in (errtxt, out):
-            for ln in src.splitlines():
-                ln = ln.strip()
-                if ln and ("can't" in ln or "cannot" in ln or "not recognized" in ln
-                           or "error" in ln.lower() or "unknown" in ln.lower()):
-                    reason = ln
-                    break
-            if reason:
-                break
-        if not reason:
-            reason = "沒有輸出任何指令（位址可能不在可執行區段，或 objdump 不支援此架構）"
-        attempts.append((tool, reason))
-
-    ok, res = _capstone_disasm(model, plan, limit)
-    if ok:
-        lines, last = res  # type: ignore[misc]
-        body = ["工具: capstone"] + header + list(lines)
-        if len(lines) >= limit and last is not None:
-            body.append(f"  … 已達 limit={limit}；續看：target=\"0x{last:x}\"" +
-                        (f" section:{plan['section']}" if model.is_rel else ""))
-        return True, body
-    attempts.append(("capstone", str(res)))
-
-    out_lines = [f"[反組譯不可用] 架構 {model.machine_desc}（{plan['label']}）"]
-    for tool, reason in attempts:
-        out_lines.append(f"  - {tool}: {reason}")
-    if not _objdump_candidates(model.machine):
-        out_lines.append("  - objdump: 系統沒有任何可用的 objdump")
-    out_lines.extend(_disasm_remedies(model))
-    return False, out_lines
+        use_symbol = False
+    if rc != 0:
+        raise ELFDependencyError(
+            f"objdump {tool} 執行失敗(exit {rc}): {errtxt.strip() or out.strip() or '無輸出'}\n"
+            + "\n".join(_disasm_remedies(model))
+        )
+    lines, n, nxt = _parse_objdump_output(out, limit, start=plan["start"] if not use_symbol else None)
+    if n == 0:
+        raise ELFDependencyError(
+            f"objdump {tool} 無法產生指令（架構 {model.machine_desc}，目標 {plan['label']}）；"
+            "請檢查目標位址與所選 binary 支援的架構。\n" + "\n".join(_disasm_remedies(model))
+        )
+    body = [f"工具: {tool}"] + header + lines
+    if n >= limit and nxt is not None:
+        body.append(f"  … 已達 limit={limit}；續看：target=\"0x{nxt:x}\"" +
+                    (f" section:{plan['section']}" if model.is_rel else ""))
+    return True, body
 
 
 # ---------------------------------------------------------------------------
@@ -3248,23 +2586,27 @@ def _entry_block(model: ElfModel, n_instr: int = 16) -> List[str]:
 
 def demangle_names(model: ElfModel, names: List[str]) -> Dict[str, str]:
     """C++ mangled 名稱（_Z…）→ 可讀名稱；用 binutils c++filt 批次處理，結果快取在 model 上。"""
+    mangled = {n for n in names if n and n.startswith("_Z")}
+    if mangled and not cmd_exists("c++filt"):
+        raise ELFDependencyError("C++ 符號需要 c++filt；請安裝 binutils 並確認 c++filt 在 PATH。")
     cache: Dict[str, str] = model._lazy.setdefault("demangle", {})  # type: ignore[assignment]
-    todo = sorted({n for n in names if n and n.startswith("_Z") and n not in cache})
-    if todo and cmd_exists("c++filt"):
-        try:
-            res = process_env.run(
-                ["c++filt"], input="\n".join(todo) + "\n", capture_output=True, text=True,
-                timeout=20, encoding="utf-8", errors="replace", overrides=_C_LOCALE,
-            )
-            outs = (res.stdout or "").splitlines()
-            if len(outs) == len(todo):
-                for n, d in zip(todo, outs):
-                    d = d.strip()
-                    cache[n] = d if d and d != n else ""
-        except Exception:
-            pass
-    for n in todo:
-        cache.setdefault(n, "")
+    todo = sorted(mangled - cache.keys())
+    if not todo:
+        return cache
+    try:
+        res = process_env.run(
+            ["c++filt"], input="\n".join(todo) + "\n", capture_output=True, text=True,
+            timeout=20, encoding="utf-8", errors="replace", overrides=_C_LOCALE,
+        )
+    except (OSError, process_env.TimeoutExpired) as exc:
+        raise ELFDependencyError(f"c++filt 執行失敗: {exc}；請修復 binutils。") from exc
+    outs = (res.stdout or "").splitlines()
+    if res.returncode != 0 or len(outs) != len(todo) or any(not value.strip() for value in outs):
+        raise ELFDependencyError(
+            f"c++filt 回應無效(exit {res.returncode}，預期 {len(todo)} 行，收到 {len(outs)} 行)；"
+            "請修復 binutils。"
+        )
+    cache.update({name: text.strip() if text.strip() != name else "" for name, text in zip(todo, outs)})
     return cache
 
 
@@ -3688,7 +3030,9 @@ def view_summary(model: ElfModel, limit: int = 0, footer: bool = True, hard_max:
     for fn in blocks:
         try:
             out.extend(fn())
-        except Exception as e:  # 單段失敗不拖垮整份報告，但要講
+        except DependencyError:
+            raise
+        except Exception as e:  # 來源資料段落錯誤保留診斷；環境依賴不可省略
             out.append(f"[WARN] 報告段落產生失敗: {type(e).__name__}: {e}")
     return _finish(out)
 
@@ -4511,6 +3855,8 @@ def build_ingest_document(path, max_chars: Optional[int] = None) -> str:
             continue
         try:
             lines = render(model, view, target, per_view, hard_max=per_view, char_budget=cap).split("\n")
+        except DependencyError:
+            raise
         except Exception as e:
             parts.append((view, hint, f"【{view}】產生失敗: {type(e).__name__}: {e}"))
             continue

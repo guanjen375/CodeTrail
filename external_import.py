@@ -137,7 +137,10 @@ def _open_dir_chain(directory: Path) -> int:
     最後一段),之後所有逐段 openat 都建立在錯的錨點上。resolve 過的路徑每一段都是
     真目錄,所以任何一段變成 symlink 就是 ELOOP —— fail-closed。
     """
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    from runtime_dependencies import require_safe_filesystem
+
+    require_safe_filesystem("external file import")
+    nofollow = os.O_NOFOLLOW
     cloexec = getattr(os, "O_CLOEXEC", 0)
     # `O_PATH`:只要 execute 權限就能當 dir-fd 往下走。`O_RDONLY` 對「只給 x 不給 r」的
     # 祖先目錄(`/srv/drop/<user>` 這種佈局)會 EACCES,而 path-based open 本來走得過。

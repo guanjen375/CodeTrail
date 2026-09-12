@@ -295,7 +295,7 @@ def test_the_banner_keeps_stderr_warnings_and_compaction_status_but_drops_the_pr
 
     兩個方向都會無聲出事:多了(整段進度 LOG 重播,使用者每次開 aicode 都先捲
     十幾行自己剛看過的成功訊息,真正的警告混在裡面);少了(canary 只走 stderr
-    的 WARNING、「n_ctx 是猜的」、「ctx 閘這次沒驗」、「lessons 已過期不再注入」
+    的 WARNING、「lessons 已過期不再注入」
     消失,而那些正是「這次啟動有什麼不對勁」的全部證據)。
 
     `lines` 是另一件事:它仍然是逐字的完整 transcript,診斷用。
@@ -318,13 +318,13 @@ def test_the_banner_keeps_stderr_warnings_and_compaction_status_but_drops_the_pr
     root = tmp_path / "project"
     root.mkdir()
 
-    # server 讀不到 → n_ctx 退回設定值(keep);容量閘因此驗不了(keep)。
-    monkeypatch.setattr(gpu_safety, "query_server_info", lambda *_a, **_k: None)
+    # 通過的 banner 需要真正可觀測的 ctx；依賴失敗由拒絕啟動測試守住。
+    monkeypatch.setattr(gpu_safety, "query_server_info", lambda *_a, **_k: types.SimpleNamespace(n_ctx=4096))
     monkeypatch.setattr(
         gpu_safety,
         "check_safety",
         lambda *_a, **_k: types.SimpleNamespace(
-            status="UNKNOWN", reason="server 沒回答", server_n_ctx=0, detail_lines=[]
+            status="SAFE", reason="", server_n_ctx=4096, detail_lines=[]
         ),
     )
     # lessons 的行為由 tests/test_lessons.py 守;這裡只要那兩則訊息。
@@ -369,8 +369,6 @@ def test_the_banner_keeps_stderr_warnings_and_compaction_status_but_drops_the_pr
     for warning in (
         "[tool-health] WARNING — implicit 診斷降級",
         "[tool-health] WARNING — 快取寫入失敗",
-        "n_ctx=4096(來自 deployment profile;server 尚無法觀測)",
-        "ctx safety=UNKNOWN(server 沒回答);放行",
         hint,
     ):
         assert warning in banner, warning
@@ -379,10 +377,8 @@ def test_the_banner_keeps_stderr_warnings_and_compaction_status_but_drops_the_pr
     assert len(expired) == 1 and expired[0].endswith(
         "  複審:python3 lessons.py renew <id> / delete <id>"
     ), expired
-    # 順序 = 實際發生順序:n_ctx 在 ctx safety 之前,stderr 的兩則在最後。
+    # 順序 = 實際發生順序:lessons、legacy hint、stderr 的兩則。
     order = [banner.index(x) for x in (
-        "n_ctx=4096(來自 deployment profile;server 尚無法觀測)",
-        "ctx safety=UNKNOWN(server 沒回答);放行",
         expired[0],
         hint,
         "[tool-health] WARNING — implicit 診斷降級",

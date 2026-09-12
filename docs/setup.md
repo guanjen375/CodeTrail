@@ -35,11 +35,15 @@ pip install "pymupdf4llm==1.28.0"    # 選用:RAG 從 PDF 建知識庫才用;釘
 ```
 
 `set_config.sh` 會把當下 venv Python 的絕對路徑寫進 deployment profile;不過
-`aicode` 本身仍會從目前 PATH 選 `python3` / `python` 執行 deployment、endpoint 與 server
+`aicode` 本身仍會從目前 PATH 選 `python3` 執行 deployment、endpoint 與 server
 preflight。因此若依賴只裝在 venv，每次跑 `set_config.sh` 或 `aicode` 前都要
 先 `source <CODETRAIL_REPO>/.venv/bin/activate`。不建議修改 venv 自己的 activate 腳本；
 可在自己的 shell 設一個明確 alias / function。重建 venv 後要再跑一次 `set_config.sh`，
 更新寫進設定檔的 Python 絕對路徑。
+
+主要套件、語言 grammar、外部工具與檔案系統能力的完整要求見[依賴需求](dependencies.md)。
+缺少依賴時必須修復環境後重試。`aicode` 不會改用 `python`；設定工具若無法辨識當前
+interpreter，或既有 `deployment.json` 格式損壞，也會直接報錯。
 
 ### `llama.cpp` 不用 GPU(純 CPU)
 

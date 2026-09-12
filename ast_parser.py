@@ -7,11 +7,10 @@
 
 支援語言：
 - Python: 使用內建 ast 模組
-- JavaScript/TypeScript: 使用 tree-sitter（若可用）或 fallback 到 regex
-- C/C++: 使用 tree-sitter（若可用）或 fallback 到 regex
-- Go/Rust: 使用 tree-sitter（若可用）或 fallback 到 regex
+- JavaScript/TypeScript、C/C++、Go/Rust: 必須使用對應 tree-sitter grammar
+- Java/Kotlin: 必須使用支援 JSON 的 Universal Ctags
 
-安裝可選依賴（提升精準度）：
+依分析語言安裝相應依賴（缺失或不相容直接報錯）：
     pip install tree-sitter tree-sitter-python tree-sitter-javascript \
                 tree-sitter-typescript tree-sitter-c tree-sitter-cpp \
                 tree-sitter-go tree-sitter-rust
@@ -25,6 +24,8 @@ import shutil
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
+
+from runtime_dependencies import DependencyError
 
 
 _CPP_EXTENSIONS = frozenset({
@@ -43,6 +44,12 @@ _CPP_EXTENSIONS = frozenset({
 # v2(P2):macro / macro_function / typedef / enum / enum_constant / global,
 #        declaration 與 definition 分離,multi-declarator 逐一產生 symbol。
 PARSER_SEMANTICS_VERSION = 4
+# 只改 backend 准入；主 parser 的抽取語意及 eval 向量身分沒有改變。
+PARSER_BACKEND_POLICY = "required-primary-v1"
+
+
+class ParserDependencyError(DependencyError):
+    """指定語言的主要 parser 缺失、不相容或無法執行。"""
 
 # C/C++ 的 stable symbol kind。寫死成常數,避免 parser / cache / graph / test
 # 各自用不同拼法(kind 字串會進持久 cache 與 graph node,拼錯是無聲的)。
@@ -82,12 +89,14 @@ _TU_SCOPE_ANCESTORS = frozenset({
     "type_definition", "declaration", "template_declaration",
 })
 
-# 嘗試導入 tree-sitter
+# 能力 probe 不能讓不使用此語言的功能 import 失敗。
+_TREE_SITTER_IMPORT_ERROR = ""
 try:
     import tree_sitter
     from tree_sitter import Language, Parser
     HAS_TREE_SITTER = True
-except ImportError:
+except Exception as exc:
+    _TREE_SITTER_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
     HAS_TREE_SITTER = False
     tree_sitter = None
     Language = None
@@ -95,6 +104,7 @@ except ImportError:
 
 # 嘗試載入各語言的 tree-sitter
 _TREE_SITTER_LANGUAGES = {}
+_TREE_SITTER_LANGUAGE_ERRORS = {}
 
 
 def _try_load_tree_sitter_language(lang_name: str):
@@ -132,11 +142,34 @@ def _try_load_tree_sitter_language(lang_name: str):
         else:
             lang = None
 
+        if lang is not None:
+            Parser(lang)  # 同 process 的 ABI probe；不能 spawn 或換 parser。
         _TREE_SITTER_LANGUAGES[lang_name] = lang
         return lang
-    except ImportError:
+    except Exception as exc:
+        _TREE_SITTER_LANGUAGE_ERRORS[lang_name] = f"{type(exc).__name__}: {exc}"
         _TREE_SITTER_LANGUAGES[lang_name] = None
         return None
+
+
+def _parser_dependency_error(lang_name: str, detail: str = "") -> ParserDependencyError:
+    package = "typescript" if lang_name == "tsx" else lang_name
+    reason = detail or _TREE_SITTER_LANGUAGE_ERRORS.get(lang_name) or _TREE_SITTER_IMPORT_ERROR
+    return ParserDependencyError(
+        f"Code parser unavailable for {lang_name}: {reason or 'tree-sitter core/grammar is not loaded'}. "
+        f"Install compatible tree-sitter and tree-sitter-{package} packages in the CodeTrail Python environment."
+    )
+
+
+def require_tree_sitter_parser(lang_name: str):
+    """取得必要 parser；probe 保留 None 介面供唯讀 advisory verifier 使用。"""
+    language = _try_load_tree_sitter_language(lang_name)
+    if not HAS_TREE_SITTER or language is None or Parser is None:
+        raise _parser_dependency_error(lang_name)
+    try:
+        return Parser(language)
+    except Exception as exc:
+        raise _parser_dependency_error(lang_name, f"{type(exc).__name__}: {exc}") from exc
 
 
 @dataclass
@@ -451,20 +484,14 @@ class TreeSitterParser:
     def __init__(self, language_name: str):
         self.language_name = language_name
         self.language = _try_load_tree_sitter_language(language_name)
-        if self.language and HAS_TREE_SITTER:
-            self.parser = Parser(self.language)
-        else:
-            self.parser = None
+        self.parser = require_tree_sitter_parser(language_name)
 
     def parse(self, content: str, filepath: Path) -> list[Symbol]:
         """解析程式碼"""
-        if not self.parser:
-            return []
-
         try:
             tree = self.parser.parse(bytes(content, 'utf-8'))
-        except Exception:
-            return []
+        except Exception as exc:
+            raise _parser_dependency_error(self.language_name, f"{type(exc).__name__}: {exc}") from exc
 
         symbols = []
         lines = content.split('\n')
@@ -1148,574 +1175,205 @@ class TreeSitterParser:
         )
 
 
-class RegexFallbackParser:
-    """Regex fallback 解析器（當 tree-sitter 不可用時）
-
-    這是從 code_rag.py 中提取的原始 regex 解析邏輯
-    """
+class GenericParser:
+    """未支援副檔名沒有 symbol 表示法；不是缺主要 parser 時的替代。"""
 
     def parse(self, content: str, filepath: Path) -> list[Symbol]:
-        """解析程式碼（使用 regex）"""
-        symbols = []
-        lines = content.split('\n')
-        ext = filepath.suffix.lower()
-
-        if ext in ('.py', '.pyx', '.pyi'):
-            symbols = self._parse_python(lines)
-        elif ext in _CPP_EXTENSIONS:
-            symbols = self._parse_cpp(lines)
-        elif ext in ('.js', '.ts', '.jsx', '.tsx'):
-            symbols = self._parse_js(lines)
-        elif ext == '.rs':
-            symbols = self._parse_rust(lines)
-        elif ext == '.go':
-            symbols = self._parse_go(lines)
-
-        sep = "::" if ext in _CPP_EXTENSIONS else "."
-        for sym in symbols:
-            sym.backend = "regex"
-            if sym.qualified_name is None:
-                if sym.type == "method" and sym.parent:
-                    sym.qualified_name = f"{sym.parent}{sep}{sym.name}"
-                else:
-                    sym.qualified_name = sym.name
-        return symbols
-
-    def _parse_python(self, lines: list) -> list[Symbol]:
-        """解析 Python"""
-        symbols = []
-        pattern = r'^(\s*)(class|def|async\s+def)\s+(\w+)'
-        pending_decorator = None
-        current_class = None
-        class_indent = -1
-
-        for i, line in enumerate(lines):
-            if re.match(r'^\s*@\w+', line):
-                pending_decorator = i
-                continue
-
-            m = re.match(pattern, line)
-            if m:
-                indent = len(m.group(1))
-                keyword = m.group(2)
-                name = m.group(3)
-
-                if keyword == 'class':
-                    current_class = name
-                    class_indent = indent
-                    sym_type = 'class'
-                    parent = None
-                else:
-                    if current_class and indent > class_indent:
-                        sym_type = 'method'
-                        parent = current_class
-                    else:
-                        sym_type = 'function'
-                        parent = None
-                        if indent <= class_indent:
-                            current_class = None
-                            class_indent = -1
-
-                start_line = pending_decorator + 1 if pending_decorator is not None else i + 1
-                end_line = self._find_block_end(lines, i)
-                context = '\n'.join(lines[start_line-1:min(start_line+14, len(lines))])
-
-                symbols.append(Symbol(
-                    name=name,
-                    type=sym_type,
-                    start_line=start_line,
-                    end_line=end_line,
-                    context=context,
-                    parent=parent
-                ))
-                pending_decorator = None
-
-        return symbols
-
-    def _parse_cpp(self, lines: list) -> list[Symbol]:
-        """解析 C/C++"""
-        symbols = []
-
-        class_pattern = r'^(?:template\s*<[^>]*>\s*)?(class|struct)\s+(\w+)'
-        namespace_pattern = r'^namespace\s+(\w+)'
-        func_pattern = r'^(?:template\s*<[^>]*>\s*)?[\w\s\*\&\<\>\[\]:,]+\s+(?:(\w+)::)?(\w+)\s*\([^;]*\)\s*(?:const|override|noexcept|final|\s)*\{'
-
-        for i, line in enumerate(lines):
-            m = re.match(namespace_pattern, line)
-            if m:
-                symbols.append(Symbol(
-                    name=m.group(1),
-                    type='namespace',
-                    start_line=i + 1,
-                    end_line=self._find_brace_end(lines, i),
-                    context='\n'.join(lines[i:min(i+15, len(lines))])
-                ))
-                continue
-
-            m = re.match(class_pattern, line)
-            if m:
-                sym_type = 'class' if m.group(1) == 'class' else 'struct'
-                symbols.append(Symbol(
-                    name=m.group(2),
-                    type=sym_type,
-                    start_line=i + 1,
-                    end_line=self._find_brace_end(lines, i),
-                    context='\n'.join(lines[i:min(i+15, len(lines))])
-                ))
-                continue
-
-            m = re.match(func_pattern, line)
-            if m:
-                func_name = m.group(2)
-                parent = m.group(1) if m.group(1) else None
-                symbols.append(Symbol(
-                    name=func_name,
-                    type='method' if parent else 'function',
-                    start_line=i + 1,
-                    end_line=self._find_brace_end(lines, i),
-                    context='\n'.join(lines[i:min(i+15, len(lines))]),
-                    parent=parent
-                ))
-
-        return symbols
-
-    def _parse_js(self, lines: list) -> list[Symbol]:
-        """解析 JavaScript/TypeScript"""
-        symbols = []
-        patterns = [
-            (r'^(?:export\s+)?(?:default\s+)?(class)\s+(\w+)', 'class'),
-            (r'^(?:export\s+)?(?:default\s+)?(async\s+)?function\s+(\w+)', 'function'),
-            (r'^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\([^)]*\)\s*=>', 'function'),
-            (r'^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?function', 'function'),
-            (r'^(?:export\s+)?(?:interface|type)\s+(\w+)', 'interface'),
-        ]
-
-        for i, line in enumerate(lines):
-            for pattern, sym_type in patterns:
-                m = re.match(pattern, line)
-                if m:
-                    name = m.group(m.lastindex)
-                    if name in ('if', 'else', 'for', 'while', 'switch', 'catch', 'try', 'finally'):
-                        continue
-                    symbols.append(Symbol(
-                        name=name,
-                        type=sym_type,
-                        start_line=i + 1,
-                        end_line=self._find_brace_end(lines, i),
-                        context='\n'.join(lines[i:min(i+15, len(lines))])
-                    ))
-                    break
-
-        return symbols
-
-    def _parse_rust(self, lines: list) -> list[Symbol]:
-        """解析 Rust"""
-        symbols = []
-        pattern = r'^(\s*)(pub\s+)?(fn|struct|enum|impl|trait|mod)\s+(\w+)'
-
-        for i, line in enumerate(lines):
-            m = re.match(pattern, line)
-            if m:
-                keyword = m.group(3)
-                name = m.group(4)
-                sym_type = {
-                    'fn': 'function',
-                    'struct': 'struct',
-                    'enum': 'enum',
-                    'impl': 'impl',
-                    'trait': 'trait',
-                    'mod': 'module'
-                }.get(keyword, 'function')
-
-                symbols.append(Symbol(
-                    name=name,
-                    type=sym_type,
-                    start_line=i + 1,
-                    end_line=self._find_brace_end(lines, i),
-                    context='\n'.join(lines[i:min(i+15, len(lines))])
-                ))
-
-        return symbols
-
-    def _parse_go(self, lines: list) -> list[Symbol]:
-        """解析 Go"""
-        symbols = []
-        func_pattern = r'^func\s+(?:\([^)]+\)\s+)?(\w+)'
-        type_pattern = r'^type\s+(\w+)'
-
-        for i, line in enumerate(lines):
-            m = re.match(func_pattern, line)
-            if m:
-                symbols.append(Symbol(
-                    name=m.group(1),
-                    type='function',
-                    start_line=i + 1,
-                    end_line=self._find_brace_end(lines, i),
-                    context='\n'.join(lines[i:min(i+15, len(lines))])
-                ))
-                continue
-
-            m = re.match(type_pattern, line)
-            if m:
-                symbols.append(Symbol(
-                    name=m.group(1),
-                    type='type',
-                    start_line=i + 1,
-                    end_line=self._find_brace_end(lines, i),
-                    context='\n'.join(lines[i:min(i+15, len(lines))])
-                ))
-
-        return symbols
-
-    def _find_block_end(self, lines: list, start: int) -> int:
-        """找 Python 縮排區塊的結尾"""
-        if start >= len(lines):
-            return start + 1
-
-        base_indent = len(lines[start]) - len(lines[start].lstrip())
-        for i in range(start + 1, len(lines)):
-            line = lines[i]
-            if not line.strip():
-                continue
-            current_indent = len(line) - len(line.lstrip())
-            if current_indent <= base_indent:
-                return i
-        return len(lines)
-
-    def _find_brace_end(self, lines: list, start: int) -> int:
-        """找大括號配對的結尾"""
-        depth = 0
-        for i in range(start, len(lines)):
-            for ch in lines[i]:
-                if ch == '{':
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0:
-                        return i + 1
-        return len(lines)
+        return []
 
 
-class CtagsFallbackParser:
-    """P0 改進：使用 ctags 解析 Java/Kotlin（當 tree-sitter 不可用時）
-
-    需要系統安裝 universal-ctags：
-    - macOS: brew install universal-ctags
-    - Ubuntu: apt install universal-ctags
-    """
+class CtagsParser:
+    """Java/Kotlin 的主要 parser：需要支援 JSON 的 Universal Ctags。"""
 
     def __init__(self, language: str):
         self.language = language
-        self._ctags_available = None
 
-    def _check_ctags_available(self) -> bool:
-        """檢查 ctags 是否可用"""
-        if self._ctags_available is not None:
-            return self._ctags_available
-
+    def require_available(self) -> None:
         try:
             result = process_env.run(
-                ['ctags', '--version'],
-                capture_output=True, text=True, timeout=5
+                ['ctags', '--version'], capture_output=True, text=True, timeout=5
             )
-            self._ctags_available = result.returncode == 0
-        except (FileNotFoundError, process_env.TimeoutExpired):
-            self._ctags_available = False
-
-        return self._ctags_available
+            if result.returncode != 0 or 'Universal Ctags' not in result.stdout:
+                raise RuntimeError('ctags must be Universal Ctags')
+            features = process_env.run(
+                ['ctags', '--list-features'], capture_output=True, text=True, timeout=5
+            )
+            if features.returncode != 0 or not any(
+                line.strip().split()[:1] == ['json'] for line in features.stdout.splitlines()
+            ):
+                raise RuntimeError('Universal Ctags JSON support is unavailable')
+            languages = process_env.run(
+                ['ctags', '--list-languages'], capture_output=True, text=True, timeout=5
+            )
+            if languages.returncode != 0 or not any(
+                line.lower().split()[:1] == [self.language]
+                and '[disabled]' not in line.lower()
+                for line in languages.stdout.splitlines()
+            ):
+                raise RuntimeError(f'Universal Ctags {self.language} parser is unavailable or disabled')
+        except Exception as exc:
+            raise ParserDependencyError(
+                f"Code parser unavailable for {self.language}: {type(exc).__name__}: {exc}. "
+                "Install Universal Ctags with JSON support and put ctags on PATH."
+            ) from exc
 
     def parse(self, content: str, filepath: Path) -> list[Symbol]:
-        """使用 ctags 解析 Java/Kotlin"""
-        if not self._check_ctags_available():
-            # Fallback 到 regex
-            return self._parse_with_regex(content, filepath)
-
+        self.require_available()
+        import json
         import tempfile
 
-        # 寫入臨時檔案
-        ext = filepath.suffix
+        temp_path = None
         try:
-            with tempfile.NamedTemporaryFile(mode='w', suffix=ext, delete=False, encoding='utf-8') as f:
-                f.write(content)
-                temp_path = f.name
-
-            # 執行 ctags
+            with tempfile.NamedTemporaryFile(mode='w', suffix=filepath.suffix,
+                                             delete=False, encoding='utf-8') as handle:
+                handle.write(content)
+                temp_path = handle.name
             result = process_env.run(
                 ['ctags', '-f', '-', '--output-format=json', '--fields=+n+e', temp_path],
                 capture_output=True, text=True, timeout=30
             )
-
             if result.returncode != 0:
-                return self._parse_with_regex(content, filepath)
-
-            # 解析 ctags JSON 輸出
-            import json
+                raise RuntimeError(f"ctags exited {result.returncode}: {result.stderr.strip()}")
             symbols = []
             lines = content.split('\n')
-
-            for line in result.stdout.strip().split('\n'):
-                if not line:
+            for line in result.stdout.splitlines():
+                if not line.strip():
                     continue
-                try:
-                    tag = json.loads(line)
-                    name = tag.get('name', '')
-                    kind = tag.get('kind', '')
-                    line_num = tag.get('line', 1)
-                    end_line = tag.get('end', line_num)
-
-                    # 映射 ctags kind 到我們的 type
-                    sym_type = self._map_kind(kind)
-                    if not sym_type:
-                        continue
-
-                    # 取得 context
-                    start_idx = line_num - 1
-                    context_end = min(start_idx + 15, len(lines))
-                    context = '\n'.join(lines[start_idx:context_end])
-
-                    # 取得 parent（class/interface）
-                    parent = tag.get('scope', None)
-                    if parent and ':' in parent:
-                        parent = parent.split(':')[-1]
-
-                    symbols.append(Symbol(
-                        name=name,
-                        type=sym_type,
-                        start_line=line_num,
-                        end_line=end_line,
-                        context=context,
-                        parent=parent
-                    ))
-                except json.JSONDecodeError:
+                tag = json.loads(line)
+                if not isinstance(tag, dict):
+                    raise ValueError('ctags output row must be a JSON object')
+                if tag.get('_type') == 'ptag':
                     continue
-
-            for sym in symbols:
-                sym.backend = "ctags"
-                if sym.qualified_name is None:
-                    if sym.type == "method" and sym.parent:
-                        sym.qualified_name = f"{sym.parent}.{sym.name}"
-                    else:
-                        sym.qualified_name = sym.name
+                kind = tag.get('kind', '')
+                sym_type = self._map_kind(kind)
+                if not sym_type:
+                    continue
+                name = tag.get('name')
+                line_num = tag.get('line')
+                end_line = tag.get('end', line_num)
+                if (not isinstance(name, str) or not name
+                        or type(line_num) is not int or type(end_line) is not int
+                        or not 1 <= line_num <= end_line <= len(lines)):
+                    raise ValueError('ctags output has invalid symbol name or source range')
+                parent = tag.get('scope')
+                if parent is not None and not isinstance(parent, str):
+                    raise ValueError('ctags scope must be a string')
+                if parent and ':' in parent:
+                    parent = parent.split(':')[-1]
+                symbols.append(Symbol(
+                    name=name, type=sym_type, start_line=line_num, end_line=end_line,
+                    context='\n'.join(lines[line_num - 1:min(line_num + 14, len(lines))]),
+                    parent=parent, backend='ctags',
+                    qualified_name=f"{parent}.{name}" if sym_type == 'method' and parent else name,
+                ))
             return symbols
-
-        except Exception:
-            return self._parse_with_regex(content, filepath)
+        except Exception as exc:
+            raise ParserDependencyError(
+                f"Code parser unavailable for {self.language}: {type(exc).__name__}: {exc}. "
+                "Check Universal Ctags JSON support and the CodeTrail temporary directory."
+            ) from exc
         finally:
-            import os
-            try:
-                os.unlink(temp_path)
-            except Exception:
-                pass
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
 
-    def _map_kind(self, kind: str) -> Optional[str]:
-        """映射 ctags kind 到 Symbol type"""
-        kind_map = {
-            'class': 'class',
-            'interface': 'interface',
-            'method': 'method',
-            'function': 'function',
-            'field': None,  # 不收錄 field
-            'variable': None,
-            'enum': 'enum',
-            'enumConstant': None,
-            'constructor': 'method',
-        }
-        return kind_map.get(kind)
+    @staticmethod
+    def _map_kind(kind: str) -> Optional[str]:
+        return {
+            'class': 'class', 'interface': 'interface', 'method': 'method',
+            'function': 'function', 'enum': 'enum', 'constructor': 'method',
+        }.get(kind)
 
-    def _parse_with_regex(self, content: str, filepath: Path) -> list[Symbol]:
-        """Regex fallback for Java/Kotlin"""
-        symbols = []
-        lines = content.split('\n')
-        ext = filepath.suffix.lower()
 
-        if ext in ('.java',):
-            symbols = self._parse_java(lines)
-        elif ext in ('.kt', '.kts'):
-            symbols = self._parse_kotlin(lines)
+_TREE_SITTER_SUFFIXES = {
+    '.js': 'javascript', '.jsx': 'javascript', '.ts': 'typescript', '.tsx': 'tsx',
+    '.c': 'c', '.cpp': 'cpp', '.cc': 'cpp', '.cxx': 'cpp',
+    '.hpp': 'cpp', '.hh': 'cpp', '.hxx': 'cpp', '.go': 'go', '.rs': 'rust',
+}
 
-        for sym in symbols:
-            sym.backend = "regex"
-            if sym.qualified_name is None:
-                if sym.type == "method" and sym.parent:
-                    sym.qualified_name = f"{sym.parent}.{sym.name}"
-                else:
-                    sym.qualified_name = sym.name
-        return symbols
 
-    def _parse_java(self, lines: list) -> list[Symbol]:
-        """解析 Java"""
-        symbols = []
-        class_pattern = r'^\s*(?:public|private|protected)?\s*(?:static)?\s*(?:final)?\s*(class|interface|enum)\s+(\w+)'
-        method_pattern = r'^\s*(?:public|private|protected)?\s*(?:static)?\s*(?:final)?\s*(?:<[^>]+>\s*)?(\w+(?:\[\])?)\s+(\w+)\s*\('
-        current_class = None
+def parser_language(filepath: Path) -> str | None:
+    """以副檔名選 parser，無依賴探測或 subprocess。"""
+    suffix = filepath.suffix.lower()
+    if suffix == '.h':
+        return _h_header_language()
+    if suffix in ('.py', '.pyx', '.pyi'):
+        return 'python'
+    if suffix in ('.java', '.kt', '.kts'):
+        return 'java' if suffix == '.java' else 'kotlin'
+    return _TREE_SITTER_SUFFIXES.get(suffix)
 
-        for i, line in enumerate(lines):
-            m = re.match(class_pattern, line)
-            if m:
-                sym_type = m.group(1)  # class, interface, or enum
-                name = m.group(2)
-                current_class = name
-                symbols.append(Symbol(
-                    name=name,
-                    type=sym_type,
-                    start_line=i + 1,
-                    end_line=self._find_brace_end(lines, i),
-                    context='\n'.join(lines[i:min(i+15, len(lines))])
-                ))
-                continue
 
-            m = re.match(method_pattern, line)
-            if m and current_class:
-                return_type = m.group(1)
-                name = m.group(2)
-                # 排除 Java 關鍵字
-                if name in ('if', 'else', 'for', 'while', 'switch', 'catch', 'try', 'new', 'return'):
-                    continue
-                symbols.append(Symbol(
-                    name=name,
-                    type='method',
-                    start_line=i + 1,
-                    end_line=self._find_brace_end(lines, i),
-                    context='\n'.join(lines[i:min(i+15, len(lines))]),
-                    parent=current_class,
-                    signature=f"{return_type} {name}(...)"
-                ))
-
-        return symbols
-
-    def _parse_kotlin(self, lines: list) -> list[Symbol]:
-        """解析 Kotlin"""
-        symbols = []
-        class_pattern = r'^\s*(?:open|data|sealed|abstract)?\s*(class|interface|object|enum\s+class)\s+(\w+)'
-        func_pattern = r'^\s*(?:private|public|internal|protected)?\s*(?:suspend)?\s*fun\s+(?:<[^>]+>\s*)?(\w+)\s*\('
-
-        current_class = None
-
-        for i, line in enumerate(lines):
-            m = re.match(class_pattern, line)
-            if m:
-                kind = m.group(1).split()[0]  # 'class', 'interface', 'object', 'enum'
-                name = m.group(2)
-                current_class = name
-                symbols.append(Symbol(
-                    name=name,
-                    type=kind if kind != 'object' else 'class',
-                    start_line=i + 1,
-                    end_line=self._find_brace_end(lines, i),
-                    context='\n'.join(lines[i:min(i+15, len(lines))])
-                ))
-                continue
-
-            m = re.match(func_pattern, line)
-            if m:
-                name = m.group(1)
-                sym_type = 'method' if current_class else 'function'
-                symbols.append(Symbol(
-                    name=name,
-                    type=sym_type,
-                    start_line=i + 1,
-                    end_line=self._find_brace_end(lines, i),
-                    context='\n'.join(lines[i:min(i+15, len(lines))]),
-                    parent=current_class
-                ))
-
-        return symbols
-
-    def _find_brace_end(self, lines: list, start: int) -> int:
-        """找大括號配對的結尾"""
-        depth = 0
-        for i in range(start, len(lines)):
-            for ch in lines[i]:
-                if ch == '{':
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0:
-                        return i + 1
-        return len(lines)
+def require_parsers_for_paths(paths) -> None:
+    """快取與建立入口以語言去重檢查，沒有該語言就不要求它的工具。"""
+    languages = {parser_language(Path(path)) for path in paths}
+    for language in sorted(lang for lang in languages if lang and lang != 'python'):
+        if language in ('java', 'kotlin'):
+            CtagsParser(language).require_available()
+        else:
+            require_tree_sitter_parser(language)
 
 
 def get_parser(filepath: Path):
-    """取得適合檔案類型的解析器
-
-    優先使用 AST/tree-sitter，fallback 到 regex/ctags
-    """
-    ext = filepath.suffix.lower()
-
-    # Python: 使用內建 ast 模組
-    if ext in ('.py', '.pyx', '.pyi'):
+    """取得該語言唯一的主要 parser；環境不正確直接拋錯。"""
+    language = parser_language(filepath)
+    if language == 'python':
         return PythonASTParser()
-
-    # Java/Kotlin: 使用 ctags fallback
-    if ext in ('.java', '.kt', '.kts'):
-        return CtagsFallbackParser('java' if ext == '.java' else 'kotlin')
-
-    # 嘗試使用 tree-sitter
-    if HAS_TREE_SITTER:
-        lang_map = {
-            '.js': 'javascript',
-            '.jsx': 'javascript',
-            '.ts': 'typescript',
-            '.tsx': 'tsx',
-            '.c': 'c',
-            '.h': _h_header_language(),
-            '.cpp': 'cpp',
-            '.cc': 'cpp',
-            '.cxx': 'cpp',
-            '.hpp': 'cpp',
-            '.hh': 'cpp',
-            '.hxx': 'cpp',
-            '.go': 'go',
-            '.rs': 'rust',
-        }
-        lang = lang_map.get(ext)
-        if lang:
-            ts_lang = _try_load_tree_sitter_language(lang)
-            if ts_lang:
-                return TreeSitterParser(lang)
-
-    # Fallback 到 regex
-    return RegexFallbackParser()
+    if language in ('java', 'kotlin'):
+        return CtagsParser(language)
+    if language is not None:
+        return TreeSitterParser(language)
+    return GenericParser()
 
 
 def _h_header_language() -> str:
     """`.h` 的語言判定(§6.2-2):預設 C(firmware 大宗是 C header)。
 
-    client.json 的 `h_lang`(c|cpp)可整體覆寫;非法值靜默回 c(header 判定不值得
-    fail-loud,錯了頂多少抽 C++ 特有結構)。鄰檔推斷屬 Phase B。
+    client.json 的 `h_lang`(c|cpp)可整體覆寫；非法設定不得換用另一個 grammar。
     """
     import config
 
     value = str(getattr(config, "H_LANG", "c")).strip().lower()
-    return value if value in ("c", "cpp") else "c"
+    if value not in ("c", "cpp"):
+        raise ParserDependencyError(
+            f"Code parser h_lang setting is invalid: {value!r}; set client.json h_lang to c or cpp."
+        )
+    return value
 
 
 def parse_file(filepath: Path, content: str) -> list[Symbol]:
     """解析檔案並提取符號"""
     parser = get_parser(filepath)
-    return parser.parse(content, filepath)
+    try:
+        return parser.parse(content, filepath)
+    except DependencyError:
+        raise
+    except Exception as exc:
+        raise ParserDependencyError(
+            f"Code parser unavailable for {parser_language(filepath) or filepath.suffix}: "
+            f"{type(exc).__name__}: {exc}. Check the primary parser and its compatible language package."
+        ) from exc
 
 
 # 提供解析器狀態資訊
 def get_parser_status() -> dict:
-    """逐語言的實際 parser backend(§6.2-4,誠實化)。
-
-    - python 恆為 "python-ast"(stdlib ast;裝不裝 tree-sitter 都一樣,
-      不得誤報 regex)。
-    - tree-sitter 語言:core + 該語言 grammar 都在才是 "tree-sitter",
-      否則 "regex-degraded"(doctor / build_index WARN / evidence 模式都吃
-      這個字串)。
-    - java/kotlin:探測 ctags 是否在 PATH → "ctags" | "regex-degraded"。
-    """
+    """逐語言能力探測；缺主要 parser 標 unavailable，實際使用會直接報錯。"""
     languages = {'python': 'python-ast'}
     for lang in ['c', 'cpp', 'javascript', 'typescript', 'tsx', 'go', 'rust']:
-        ts_lang = _try_load_tree_sitter_language(lang) if HAS_TREE_SITTER else None
-        languages[lang] = 'tree-sitter' if ts_lang else 'regex-degraded'
-    ctags_backend = 'ctags' if shutil.which('ctags') else 'regex-degraded'
-    languages['java'] = ctags_backend
-    languages['kotlin'] = ctags_backend
-
-    return {
-        'has_tree_sitter': HAS_TREE_SITTER,
-        'languages': languages,
-    }
+        try:
+            require_tree_sitter_parser(lang)
+        except ParserDependencyError:
+            languages[lang] = 'unavailable'
+        else:
+            languages[lang] = 'tree-sitter'
+    for lang in ('java', 'kotlin'):
+        languages[lang] = 'unavailable'
+        if shutil.which('ctags'):
+            try:
+                CtagsParser(lang).require_available()
+            except ParserDependencyError:
+                continue
+            languages[lang] = 'ctags'
+    return {'has_tree_sitter': HAS_TREE_SITTER, 'languages': languages}

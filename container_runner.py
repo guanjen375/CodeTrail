@@ -57,26 +57,22 @@ DEFAULT_IMAGES = {
 
 
 def detect_container_engine() -> Optional[str]:
-    """偵測可用的容器引擎"""
-    for engine in ['podman', 'docker']:
-        try:
-            result = process_env.run(
-                [engine, '--version'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if result.returncode == 0:
-                return engine
-        except (FileNotFoundError, process_env.TimeoutExpired):
-            continue
-    return None
+    """auto 只選主引擎 Podman；不可用時不選另一個引擎。"""
+    try:
+        result = process_env.run(
+            ['podman', '--version'], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, process_env.TimeoutExpired):
+        return None
+    return 'podman' if result.returncode == 0 else None
 
 
 def get_container_engine() -> Optional[str]:
     """取得容器引擎"""
     if CONTAINER_ENGINE == 'auto':
         return detect_container_engine()
+    if CONTAINER_ENGINE not in {'podman', 'docker'}:
+        return None
     return CONTAINER_ENGINE if shutil.which(CONTAINER_ENGINE) else None
 
 
@@ -171,7 +167,7 @@ def run_in_container(
             'returncode': -1,
             'stdout': '',
             'stderr': '',
-            'error': '找不到 Docker 或 Podman'
+            'error': f"所選容器引擎 {'podman' if CONTAINER_ENGINE == 'auto' else CONTAINER_ENGINE} 不可用；請安裝或修復該引擎。"
         }
 
     timeout = timeout or CONTAINER_TIMEOUT
@@ -210,13 +206,14 @@ def run_in_container(
     else:
         # Docker：使用當前用戶 ID
         try:
-            import pwd
             uid = os.getuid()
             gid = os.getgid()
             cmd.extend(['-u', f'{uid}:{gid}'])
-        except (ImportError, AttributeError):
-            # Windows 不支援 getuid
-            pass
+        except AttributeError:
+            return {
+                'success': False, 'returncode': -1, 'stdout': '', 'stderr': '',
+                'error': 'Docker 隔離執行需要 os.getuid/getgid；請使用支援 Unix 使用者身分的平台。',
+            }
 
     # 環境變數
     cmd.extend(['-e', 'PYTHONIOENCODING=utf-8'])
@@ -305,9 +302,9 @@ def run_tests_in_container(folder: str, test_command: str = None, network: bool 
             # Python：pip 會自動裝到 /tmp/venv（透過 PIP_TARGET 環境變數）
             # 不用 pip install -e .（需要寫入專案目錄），改用 pip install -r 或直接跑測試
             if (folder_path / 'requirements.txt').exists():
-                test_command = 'pip install -r requirements.txt && pytest -v 2>&1'
+                test_command = 'python -m pip install -r requirements.txt && python -m pytest -v 2>&1'
             else:
-                test_command = 'pytest -v 2>&1 || python -m pytest -v 2>&1'
+                test_command = 'python -m pytest -v 2>&1'
         elif (folder_path / 'package.json').exists():
             # Node.js：npm 會自動裝到 /tmp/node_modules（透過 npm_config_prefix）
             # 使用 --prefix 確保安裝到臨時目錄

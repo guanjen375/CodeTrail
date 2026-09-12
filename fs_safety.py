@@ -22,6 +22,8 @@ import os
 import stat
 from pathlib import Path
 
+from runtime_dependencies import require_safe_filesystem
+
 if os.name == "nt":  # pragma: no cover - 本輪不在 Windows 上驗證
     import msvcrt
 else:
@@ -44,6 +46,7 @@ def ensure_parent_within_root(path: Path, root: Path) -> None:
 
 def open_regular_file_nofollow(path: Path, *, mode: int = 0o600) -> int:
     """以 O_NOFOLLOW 開啟(必要時建立)path,驗證是 regular file,回傳 fd。"""
+    require_safe_filesystem("index artifact IO", error_type=FsSafetyError)
     path = Path(path)
     try:
         if path.is_symlink():

@@ -108,24 +108,16 @@ _REQUIRED_PACKAGES = [
     # 不要裝 textual[syntax]:那個 extra 拉的 tree-sitter 文法與本 repo 釘死的
     # tree-sitter 0.26 衝突。
     ("textual", "aicode 的終端介面必要 — python3 -m pip install \"textual>=8,<9\"(不要加 [syntax] extra)"),
+    ("numpy", "RAG / Code RAG 向量運算必要 — python3 -m pip install numpy"),
+    ("jieba", "中文 BM25 分詞必要 — python3 -m pip install jieba"),
+    ("elftools", "ELF 結構化解析必要（pip 套件名 pyelftools）— python3 -m pip install pyelftools"),
 ]
 # (import 名, 顯示名, 說明)。import 名與 pip 名不一定相同(elftools ↔ pyelftools),
 # 兩個都要講清楚，否則使用者照著 `pip install elftools` 打會裝到別的套件。
 _OPTIONAL_PACKAGES = [
-    ("numpy", "numpy", "提升 RAG/MMR 速度，非必要 — pip install numpy"),
-    ("jieba", "jieba", "中文 BM25 精準度，非必要 — pip install jieba"),
     ("pymupdf4llm", "pymupdf4llm",
      "PDF ingestion 才需要 — pip install \"pymupdf4llm==1.28.0\"(釘驗證版)"),
     ("html2text", "html2text", "RAG.py --url 抓網頁才需要 — pip install html2text"),
-    # 缺它不會壞，但 ELF 報告會退回 readelf 文字解析:DWARF 型別(struct/enum 成員)拿不到、
-    # 函式/行號精度較低。報告開頭會明列缺失能力，doctor 也要講——requirements.txt 已列入，
-    # 這裡 WARN 代表安裝沒照 requirements 走。
-    ("elftools", "pyelftools",
-     "ELF 結構化解析(analyze_file / ingest 的 symbols / DWARF / relocation / memmap)；已在 requirements.txt，"
-     "沒裝會退回 readelf 文字解析並在報告開頭明列缺失能力 — pip install pyelftools"),
-    ("capstone", "capstone",
-     "選用:analyze_file view=\"disasm\" 在系統 objdump 不支援該架構(ARM/RISC-V 韌體在 x86 主機)時的"
-     "純 Python 反組譯後備；也可改裝對應的 binutils-<triplet> 或在 client.json 設 objdump — pip install capstone"),
 ]
 
 _MCP_REQUIREMENT = "mcp>=1.28,<2"
@@ -191,11 +183,16 @@ def check_packages(r: Result) -> None:
             r.ok(f"package {name}")
         except ImportError:
             r.fail(f"package {name} 沒裝 — {hint}")
+        except Exception as exc:
+            r.fail(f"package {name} 無法載入 ({exc}) — {hint}")
     for name, shown, hint in _OPTIONAL_PACKAGES:
         try:
             importlib.import_module(name)
         except ImportError:
             r.warn(f"package {shown} 沒裝 — {hint}")
+            continue
+        except Exception as exc:
+            r.fail(f"package {shown} 無法載入 ({exc}) — {hint}")
             continue
         if name == "pymupdf4llm":
             # 釘版驗證：裝錯版比沒裝更糟（PDF 頁碼靜默全錯），所以是 FAIL 不是 WARN。
@@ -203,7 +200,7 @@ def check_packages(r: Result) -> None:
             try:
                 cfg = importlib.import_module("config")
             except Exception as e:
-                r.warn(f"package {shown} 已裝但無法驗證釘版（config 載入失敗: {e}）")
+                r.fail(f"package {shown} 已裝但無法驗證釘版（config 載入失敗: {e}）")
                 continue
             try:
                 cfg.require_pymupdf4llm()
@@ -234,12 +231,7 @@ _LLAMA_SERVERS = [
 
 
 def check_parsers(r: Result) -> None:
-    """Code RAG parser backend 能力揭露(§6.2-5;offline,--no-network 也跑)。
-
-    python 恆為 stdlib ast;c/cpp 需要 tree-sitter(缺 → regex-degraded,
-    多行 signature 函式會漏抽,graph 抽取也拿不到 C/C++ 邊)。degraded 是
-    WARN 不是 FAIL:§2 失效矩陣要求顯式降級,不報錯。
-    """
+    """檢查 C/C++ 必要 grammar，列出其他語言的可用 backend。"""
     try:
         from ast_parser import get_parser_status
     except Exception as exc:
@@ -252,17 +244,17 @@ def check_parsers(r: Result) -> None:
         "parser backends: "
         + ", ".join(f"{lang}={backend}" for lang, backend in sorted(languages.items()))
     )
-    degraded_main = sorted(
-        lang for lang in ("c", "cpp") if languages.get(lang) == "regex-degraded"
+    missing_main = sorted(
+        lang for lang in ("c", "cpp") if languages.get(lang) != "tree-sitter"
     )
-    if degraded_main:
-        r.warn(
-            f"c/cpp parser degraded to regex({', '.join(degraded_main)});"
-            "多行 signature 函式會漏抽、code graph 抽不到 C/C++ 邊。\n"
-            "        安裝: pip install tree-sitter tree-sitter-c tree-sitter-cpp"
+    if missing_main:
+        r.fail(
+            f"c/cpp parser unavailable ({', '.join(missing_main)}); Code RAG 將拒絕分析。\n"
+            "        安裝相容版本: python3 -m pip install -r requirements.txt"
         )
     else:
         r.ok("parser: python=python-ast, c/cpp=tree-sitter")
+    r.info("其他語言若顯示 unavailable，分析前須安裝對應 grammar 或 Universal Ctags；不自動改用 regex。")
 
 
 def check_endpoint_policy(r: Result) -> None:
@@ -391,13 +383,16 @@ def check_llama_servers(r: Result, no_network: bool) -> dict[str, dict]:
 
 
 def check_rerank_policy(r: Result, no_network: bool, server_status: dict[str, dict]) -> None:
-    """Print dedicated reranker reachability and the configured fallback policy."""
+    """Print dedicated reranker reachability and reject obsolete substitutes."""
     cfg = _read_config()
     if isinstance(cfg, Exception):
         r.fail(f"無法 import config.py: {cfg}")
         return
 
     policy = getattr(cfg, "RERANK_FALLBACK_POLICY", "error")
+    if policy != "error":
+        r.fail(f"rerank_fallback_policy={policy!r} 已不支援；請將 client.json 設為 \"error\"。")
+        return
     if no_network:
         reachability = "not checked (--no-network)"
     else:
@@ -411,16 +406,8 @@ def check_rerank_policy(r: Result, no_network: bool, server_status: dict[str, di
         else:
             reachability = "not reachable"
 
-    r.info(f"RAG reranker: {reachability} -> RAG rerank fallback = {policy}")
-    if policy == "main_model":
-        r.info(
-            'client.json rerank_fallback_policy="main_model" restores the old behavior: '
-            "strict RAG queries may call the main model for reranking."
-        )
-    elif policy == "embedding":
-        r.info('client.json rerank_fallback_policy="embedding" keeps embedding order and does not call the main model.')
-    elif policy == "error":
-        r.info('client.json rerank_fallback_policy="error" fails loudly when the dedicated reranker is unavailable.')
+    r.info(f"RAG reranker: {reachability} -> rerank_fallback_policy=error")
+    r.info("啟用 reranking 時只使用 dedicated reranker；缺席、逾時或回應無效一律報錯。")
 
 
 #: `--profile` 指定的 deployment profile。**argv 明確指定**才有值 ——

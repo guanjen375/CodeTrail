@@ -102,6 +102,7 @@ def _deep_symbol_count(scope, files: list[tuple[Path, str]], max_files: int,
                        timeout: float) -> tuple[int, int, bool]:
     """AST-only 計算。回傳 (symbols, parsed_files, truncated)。"""
     from ast_parser import parse_file  # 只有 --deep 才付這個 import 成本
+    from runtime_dependencies import DependencyError
 
     started = time.monotonic()
     symbols = 0
@@ -123,6 +124,8 @@ def _deep_symbol_count(scope, files: list[tuple[Path, str]], max_files: int,
                 continue
             content = filepath.read_text(encoding="utf-8", errors="replace")
             symbols += len(parse_file(filepath, content))
+        except DependencyError:
+            raise
         except (OSError, ValueError, RuntimeError):
             truncated = True
             continue

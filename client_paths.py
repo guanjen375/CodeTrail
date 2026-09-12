@@ -21,6 +21,8 @@ import stat
 from pathlib import Path
 from typing import Callable
 
+from runtime_dependencies import require_safe_filesystem
+
 DIR_MODE = 0o700
 FILE_MODE = 0o600
 
@@ -62,6 +64,7 @@ def open_private_dir(
     ——「沒有設定檔 = 沒有接管」的 fail-closed 語意要連目錄都不留痕跡。
     目錄不存在時回 ``-1``,呼叫端當成「檔案不存在」。
     """
+    require_safe_filesystem("owner-only files", owner_only=True, error_type=make_error)
     target = Path(path).expanduser()
     base = Path(anchor).expanduser() if anchor is not None else target.parent
     if not target.is_absolute() or not base.is_absolute():
@@ -103,7 +106,7 @@ def open_private_dir(
         info = os.fstat(fd)
         if not stat.S_ISDIR(info.st_mode):
             _raise(make_error, f"not a directory: {target}")
-        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        if info.st_uid != os.getuid():
             _raise(make_error, f"directory is not owned by this user: {target}")
         if create:
             os.fchmod(fd, DIR_MODE)
@@ -209,7 +212,7 @@ def _check_regular(fd: int, name: str, make_error: ErrorFactory) -> os.stat_resu
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode):
         _raise(make_error, f"not a regular file: {name}")
-    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+    if info.st_uid != os.getuid():
         _raise(make_error, f"not owned by this user: {name}")
     if info.st_nlink != 1:
         # hard link:另一個名字指向同一個 inode,權限與位置的判斷全部落空。

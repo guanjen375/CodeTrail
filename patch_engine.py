@@ -15,8 +15,8 @@ per-file plan 之後,共用這裡的 snapshot → render → journal 管線;沒�
     fail-loud(不做 majority 猜測)。
   - 真正的 I/O 不走 resolved path:固定一個 root fd,**每次** 讀 / mkdir / temp / publish /
     rollback 都從 root 沿 lexical path 逐層 ``O_DIRECTORY|O_NOFOLLOW`` 重走到 parent,並
-    比對 parent 的 dev/ino 與 preflight(或建立目錄時)記錄的一致(POSIX);沒有 dir_fd 的
-    平台退回逐層 lstat 重驗,並在結果明示降級。
+    比對 parent 的 dev/ino 與 preflight(或建立目錄時)記錄的一致;缺少 dir_fd 或
+    O_NOFOLLOW 等必要安全能力時,在任何讀寫之前拒絕操作。
   - 單檔寫入 = 同目錄唯一 temp(``O_EXCL`` 建立成功後才擁有)+ fsync + 原子發布(既有檔
     ``os.replace``;新檔 ``os.link`` 不覆蓋競態中冒出的同名檔);多檔語意 = 全量 preflight +
     失敗時 best-effort rollback,**不是**跨檔交易。
@@ -35,6 +35,8 @@ import stat
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from runtime_dependencies import DependencyError, require_safe_filesystem
 
 SR_SEARCH = "<<<<<<< SEARCH"
 SR_SEP = "======="
@@ -65,18 +67,15 @@ _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
-# POSIX:所有操作以 root fd 錨定(逐層 O_NOFOLLOW)。沒有 dir_fd 的平台退回逐層 lstat
-# 重驗(結果會明示)。測試可 monkeypatch 這個旗標模擬退回路徑。
+# 所有操作必須以 root fd 錨定(逐層 O_NOFOLLOW)。缺能力直接拒絕。
 DIRFD_ANCHORING = bool(
-    _O_NOFOLLOW and _O_DIRECTORY
+    _O_NOFOLLOW and _O_DIRECTORY and _O_NONBLOCK
     and all(
         fn in os.supports_dir_fd
         for fn in (os.open, os.mkdir, os.stat, os.rename, os.unlink, os.rmdir)
     )
 )
 
-DEGRADED_NO_DIRFD = "⚠ 本平台無 dir_fd 錨定,symlink 競態防線為逐層 lstat 重驗"
-DEGRADED_NO_LINK = "⚠ 檔案系統不支援 hard link 發布,新檔改用 lstat 檢查＋replace"
 SYMLINK_REFUSED = "目標或其路徑上有 symlink / 非目錄 component,拒絕寫入（請改用不經 symlink 的實際路徑）"
 NOT_REGULAR = "不是一般檔案（目錄 / device / fifo / socket 不可 patch）"
 
@@ -620,9 +619,9 @@ def _identity(st) -> tuple[int, int]:
 
 @dataclass
 class _Parent:
-    """一次操作內有效的 parent 目錄 handle(anchored: fd;fallback: 只有 path)。"""
+    """一次操作內有效的 parent 目錄 fd。"""
     rel_dir: str
-    fd: int | None
+    fd: int
     path: Path
     identity: tuple[int, int]
 
@@ -646,20 +645,18 @@ class PathOps:
     """從 root 逐層走訪的檔案操作;每次操作都重走 lexical path 並比對 parent 身分。"""
 
     def __init__(self, root: Path, *, anchored: bool | None = None):
+        require_safe_filesystem("apply_patch")
+        if not DIRFD_ANCHORING or anchored is False or not _O_NONBLOCK:
+            raise DependencyError(
+                "apply_patch requires dir_fd, O_NOFOLLOW, O_DIRECTORY and O_NONBLOCK; "
+                "use a POSIX Python/filesystem with these safety capabilities."
+            )
         self.root = Path(root)
-        self.anchored = DIRFD_ANCHORING if anchored is None else bool(anchored)
+        self.anchored = True
         self.notes: list[str] = []
         self._root_real = self.root.resolve()
-        self._root_fd: int | None = None
-        if self.anchored:
-            self._root_fd = os.open(str(self.root), os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC)
-        else:
-            self._note(DEGRADED_NO_DIRFD)
-
-    # ---- helpers ------------------------------------------------------
-    def _note(self, text: str) -> None:
-        if text not in self.notes:
-            self.notes.append(text)
+        self._root_fd: int | None = os.open(
+            str(self.root), os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC)
 
     def close(self) -> None:
         if self._root_fd is not None:
@@ -693,21 +690,15 @@ class PathOps:
         """走到 rel 的 parent。不存在:create=False → FileNotFoundError;create=True → 逐層
         mkdir 並記 journal。expect 給了就比對 parent (dev, ino),不同即 WriteError。"""
         dir_parts, _ = self._split(rel)
-        if self.anchored:
-            fd = self._walk_anchored(dir_parts, create=create, journal=journal)
-            try:
-                st = os.fstat(fd)
-                ident = _identity(st)
-                if expect is not None and ident != tuple(expect):
-                    raise WriteError(f"{rel}: parent 目錄身分在 preflight 後改變,中止")
-                yield _Parent("/".join(dir_parts), fd, self.root.joinpath(*dir_parts), ident)
-            finally:
-                os.close(fd)
-        else:
-            path, ident = self._walk_fallback(dir_parts, create=create, journal=journal)
+        fd = self._walk_anchored(dir_parts, create=create, journal=journal)
+        try:
+            st = os.fstat(fd)
+            ident = _identity(st)
             if expect is not None and ident != tuple(expect):
                 raise WriteError(f"{rel}: parent 目錄身分在 preflight 後改變,中止")
-            yield _Parent("/".join(dir_parts), None, path, ident)
+            yield _Parent("/".join(dir_parts), fd, self.root.joinpath(*dir_parts), ident)
+        finally:
+            os.close(fd)
 
     def _walk_anchored(self, parts: list[str], *, create: bool, journal) -> int:
         assert self._root_fd is not None
@@ -750,55 +741,15 @@ class PathOps:
             os.close(cur)
             raise
 
-    def _walk_fallback(self, parts: list[str], *, create: bool, journal) -> tuple[Path, tuple]:
-        self._note(DEGRADED_NO_DIRFD)
-        path = self.root
-        try:
-            st = os.lstat(path)
-        except OSError as exc:
-            raise WriteError(f"root 目錄無法 lstat: {exc.strerror}") from exc
-        rel = ""
-        for comp in parts:
-            rel = f"{rel}/{comp}" if rel else comp
-            parent_ident = _identity(st)
-            path = path / comp
-            try:
-                st = os.lstat(path)
-            except FileNotFoundError:
-                if not create:
-                    raise
-                self._sandbox_recheck(rel)
-                os.mkdir(path, 0o777)
-                try:
-                    st = os.lstat(path)
-                    if not stat.S_ISDIR(st.st_mode):
-                        raise WriteError(f"{rel}: 建立目錄後身分不是目錄,中止")
-                    if journal is not None:
-                        journal.record_dir(rel, parent_ident, st)
-                except BaseException:
-                    try:
-                        os.rmdir(path)
-                    except OSError:
-                        pass
-                    raise
-            if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-                raise SnapshotError(SYMLINK_REFUSED)
-        self._sandbox_recheck("/".join(parts))
-        return path, _identity(st)
-
     # ---- 單一 entry 的原子操作(相對於一次 _parent) ----------------------
     def _stat_entry(self, parent: _Parent, name: str):
         try:
-            if parent.fd is not None:
-                return os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
-            return os.lstat(parent.path / name)
+            return os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
         except FileNotFoundError:
             return None
 
     def _open(self, parent: _Parent, name: str, flags: int, mode: int = 0o666) -> int:
-        if parent.fd is not None:
-            return os.open(name, flags | _O_CLOEXEC, mode, dir_fd=parent.fd)
-        return os.open(str(parent.path / name), flags | _O_CLOEXEC, mode)
+        return os.open(name, flags | _O_CLOEXEC, mode, dir_fd=parent.fd)
 
     def _open_regular(self, parent: _Parent, name: str) -> int | None:
         """A2:先 nofollow stat 必須 S_ISREG,再 O_NONBLOCK|O_NOFOLLOW 開啟並立刻 fstat 再確認。"""
@@ -835,26 +786,17 @@ class PathOps:
         raise WriteError(f"{parent.rel_dir or '.'}: 無法建立唯一的 temp 檔（連續 {TEMP_NAME_ATTEMPTS} 次碰撞）")
 
     def _replace(self, parent: _Parent, src: str, dst: str) -> None:
-        if parent.fd is not None:
-            os.replace(src, dst, src_dir_fd=parent.fd, dst_dir_fd=parent.fd)
-            try:
-                os.fsync(parent.fd)
-            except OSError:
-                pass
-            return
-        os.replace(parent.path / src, parent.path / dst)
+        os.replace(src, dst, src_dir_fd=parent.fd, dst_dir_fd=parent.fd)
+        try:
+            os.fsync(parent.fd)
+        except OSError:
+            pass
 
     def _unlink(self, parent: _Parent, name: str) -> None:
-        if parent.fd is not None:
-            os.unlink(name, dir_fd=parent.fd)
-        else:
-            os.unlink(parent.path / name)
+        os.unlink(name, dir_fd=parent.fd)
 
     def _rmdir(self, parent: _Parent, name: str) -> None:
-        if parent.fd is not None:
-            os.rmdir(name, dir_fd=parent.fd)
-        else:
-            os.rmdir(parent.path / name)
+        os.rmdir(name, dir_fd=parent.fd)
 
     # ---- 公開:preflight 讀取 ---------------------------------------------
     def read_snapshot(self, rel: str) -> tuple:
@@ -931,39 +873,30 @@ class PathOps:
                 raise WriteError(f"{rel}: 發布後 target 身分立即被替換,中止")
 
     def write_new(self, rel: str, expect_parent: tuple, data: bytes, journal: "WriteJournal") -> None:
-        """重走 parent → temp → 原子發布且不覆蓋競態同名檔(POSIX link;否則 lstat + replace)。"""
+        """重走 parent → temp → hard link 原子發布,不覆蓋競態同名檔。"""
         _, name = self._split(rel)
         with self._parent(rel, expect=expect_parent) as parent:
             if self._stat_entry(parent, name) is not None:
                 raise WriteError(f"{rel}: 新檔在 preflight 後被其他程序建立,中止")
             entry, tst = self._fill_temp(parent, name, rel, data, None, journal, "new", written_bytes=data)
-            published = False
-            if parent.fd is not None:
-                try:
-                    os.link(entry.tmp, name, src_dir_fd=parent.fd, dst_dir_fd=parent.fd,
-                            follow_symlinks=False)
-                    published = True
-                except FileExistsError as exc:
-                    raise WriteError(f"{rel}: 新檔在 preflight 後被其他程序建立,中止") from exc
-                except OSError as exc:
-                    if exc.errno not in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV,
-                                         errno.EMLINK, errno.EACCES):
-                        raise
-                    self._note(DEGRADED_NO_LINK)
-            if published:
-                journal.commit(entry, tst)      # link 共用 temp 的 inode
-                tmp = entry.tmp
-                try:
-                    self._unlink(parent, tmp)   # A5:可檢查的清理;失敗就留著 ownership 進 rollback
-                except OSError as exc:
-                    raise WriteError(f"{rel}: 發布後無法清除 temp {tmp}: {exc.strerror}") from exc
-                entry.tmp = None
-                entry.tmp_identity = None
-            else:
-                if self._stat_entry(parent, name) is not None:
-                    raise WriteError(f"{rel}: 新檔在 preflight 後被其他程序建立,中止")
-                self._replace(parent, entry.tmp, name)
-                journal.commit(entry, tst)
+            try:
+                os.link(entry.tmp, name, src_dir_fd=parent.fd, dst_dir_fd=parent.fd,
+                        follow_symlinks=False)
+            except FileExistsError as exc:
+                raise WriteError(f"{rel}: 新檔在 preflight 後被其他程序建立,中止") from exc
+            except (OSError, NotImplementedError) as exc:
+                raise WriteError(
+                    f"{rel}: atomic no-clobber hard link 發布失敗;"
+                    "請使用支援 hard link 的檔案系統,本次寫入將 rollback"
+                ) from exc
+            journal.commit(entry, tst)      # link 共用 temp 的 inode
+            tmp = entry.tmp
+            try:
+                self._unlink(parent, tmp)
+            except OSError as exc:
+                raise WriteError(f"{rel}: 發布後無法清除 temp {tmp}: {exc.strerror}") from exc
+            entry.tmp = None
+            entry.tmp_identity = None
             after = self._stat_entry(parent, name)
             if after is None or _identity(after) != _identity(tst):
                 raise WriteError(f"{rel}: 發布後 target 身分立即被替換,中止")

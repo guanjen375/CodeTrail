@@ -63,6 +63,11 @@
 
 ## 2. 安全相關不要砍
 
+- 主要依賴不可用必須 fail-loud（需求見 `docs/dependencies.md`）：parser / NumPy / jieba /
+  rg / ELF 工具 / reranker 與已啟用 query expansion 不得自動換較差後端，快取命中也要驗；
+  依賴錯誤不得被吞成零結果或部分成功。安全 IO 缺 dir-fd / nofollow / owner 能力時
+  必須在寫入前拒絕，patch 新檔缺 atomic no-clobber hard link 須中止並回滾；
+  TUI 與 headless 回合都只接受 live n_ctx，容器隔離不可改在 host 執行。
 - `agent_tools.ToolExecutor._safe_path` — 所有檔案讀寫的 sandbox 入口
 - `media._safe_path` — 圖片/ELF/binary 的 sandbox 入口
 - `agent_tools._validate_command` — run_command 白名單 + dangerous-pattern 過濾

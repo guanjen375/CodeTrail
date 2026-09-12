@@ -116,6 +116,10 @@ def _engine_options(
     # readonly 的 metrics 由 `client_config.apply_to_config(readonly=True)` 關掉
     # (MCP 子行程那一份由 `--readonly` 關)。
     model = _cli_model(str(getattr(args, "model", "") or ""))
+    observed_ctx = (preflight.n_ctx if preflight is not None else
+                    client_preflight.observe_main_n_ctx(config.LLAMA_BASE_URL))
+    if type(observed_ctx) is not int or observed_ctx <= 0:
+        raise client_preflight.PreflightError("主 server 沒有有效的 live n_ctx，拒絕建立 Engine。")
     # preflight 已經解析過主模型與觀測過 server 的 n_ctx。用它的值,不要再讓
     # `config` 的 import-time 預設決定 —— 那是 deployment profile 的靜態值,
     # 不是 server 當下真的用的那一個。
@@ -123,7 +127,7 @@ def _engine_options(
         root=root,
         model=model or (preflight.model if preflight else "") or config.require_main_model(),
         base_url=config.LLAMA_BASE_URL,
-        n_ctx=(preflight.n_ctx if preflight else 0) or config.N_CTX,
+        n_ctx=observed_ctx,
         max_output_tokens=config.CLIENT_MAX_OUTPUT_TOKENS,
         policy=policy,
         # `client.json` 的 `keep_historical_reasoning`。不接的話那個鍵是死的,
@@ -151,10 +155,12 @@ def _build(root: Path, args: argparse.Namespace, *, persist: bool, preflight=Non
     # 使用者開關進 runtime 的**唯一**入口。readonly 之後套用而且壓過它。
     client_config.apply_to_config(settings, readonly=readonly)
     override = str(getattr(args, "client_config", "") or "").strip()
+    # headless 同樣先觀測 live ctx，且只觀測一次，再交同值給 Engine 與 MCP argv。
+    options = _engine_options(root, args, preflight)
     mcp = client_mcp.shared_client(
         root,
         readonly=readonly,
-        n_ctx=(preflight.n_ctx if preflight else 0) or None,
+        n_ctx=options.n_ctx,
         build_commands=settings.build_commands,
         # replay 用自己那份 client.json 時,MCP 也讀同一份;跳過附屬 server 硬閘的
         # 意圖同樣要交到 MCP(它是獨立行程,外層跳了它照樣會跑)。
@@ -174,7 +180,6 @@ def _build(root: Path, args: argparse.Namespace, *, persist: bool, preflight=Non
         if persist
         else client_store.EphemeralSessionStore(root)
     )
-    options = _engine_options(root, args, preflight)
     prompt = client_prompt.build_system_prompt(root)
     session_id = args.session or None
     if session_id:
@@ -452,7 +457,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return handler(args)
     except KeyboardInterrupt:
         return 130
-    except client_mcp.McpClientError as exc:
+    except (client_mcp.McpClientError, client_preflight.PreflightError) as exc:
         print(f"[codetrail] {exc}", file=sys.stderr)
         return 2
     except client_store.SessionStoreError as exc:

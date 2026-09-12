@@ -1005,7 +1005,6 @@ def test_already_applied_accepted_when_post_image_sits_on_hint(
 # ── 原 test_patch_byte_safety.py:byte-level 檔案安全(UTF-8 strict / newline / 原子替換 / rollback)──
 FORMATS = ("search_replace", "unified_diff")
 ROLLBACK_TITLE = "✗ 套用失敗；已執行 best-effort rollback"
-DEGRADED_NOTE = "⚠ 本平台無 dir_fd 錨定,symlink 競態防線為逐層 lstat 重驗"
 
 
 def edit(fmt: str, path: str, old: str, new: str) -> str:
@@ -1322,35 +1321,33 @@ def test_no_temp_litter_after_success(runner: ToolExecutor, tmp_path: Path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink containment")
-def test_dirfd_fallback_reports_degraded_note_and_still_blocks_symlinks(
+def test_missing_dirfd_refuses_patch_and_keeps_targets_untouched(
     runner: ToolExecutor, tmp_path: Path, tmp_path_factory, monkeypatch
 ):
-    # 先用公開的 S/R 行為建立 base 紅燈(anchored 路徑:成功且沒有降級警告)
+    # 支援 dir_fd 的公開 S/R 行為仍成功；能力缺席時整筆拒絕。
     target = tmp_path / "p.py"
     target.write_bytes(b"v = 1\n")
     out = runner.apply_patch(edit("search_replace", "p.py", "v = 1", "v = 2"))
     assert "✓ p.py: 已修改 1 個區塊 [search_replace]" in out, out
-    assert DEGRADED_NOTE not in out, out
     assert target.read_bytes() == b"v = 2\n"
 
-    import patch_engine  # 延後 import:base 沒有這個模組,上面的斷言已先讓 base 紅
+    import patch_engine
 
     monkeypatch.setattr(patch_engine, "DIRFD_ANCHORING", False)
     other = tmp_path / "q.py"
     other.write_bytes(b"w = 1\n")
     out = runner.apply_patch(edit("search_replace", "q.py", "w = 1", "w = 2"))
-    assert "✓ q.py: 已修改 1 個區塊 [search_replace]" in out, out
-    assert DEGRADED_NOTE in out, out
-    assert other.read_bytes() == b"w = 2\n"
+    assert "✗" in out and "dir_fd" in out, out
+    assert other.read_bytes() == b"w = 1\n"
 
-    # 退回路徑的失敗結果也要保留降級警告行
+    # 無能力時不進入內容比對。
     out = runner.apply_patch(edit("search_replace", "q.py", "nope", "x"))
-    assert "✗ q.py: SEARCH/REPLACE 區塊 1 找不到逐字匹配" in out, out
-    assert DEGRADED_NOTE in out, out
+    assert "✗" in out and "dir_fd" in out, out
 
     outside = tmp_path_factory.mktemp("outside") / "victim.py"
     outside.write_bytes(b"safe\n")
     os.symlink(outside, tmp_path / "link.py")
+    monkeypatch.setattr(patch_engine, "DIRFD_ANCHORING", True)
     out = runner.apply_patch(edit("search_replace", "link.py", "safe", "pwned"))
     assert "✗ link.py: 目標或其路徑上有 symlink" in out, out
     assert outside.read_bytes() == b"safe\n"

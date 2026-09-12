@@ -327,13 +327,14 @@ def test_check_llama_runtime_ok_when_idle():
 def test_check_rerank_policy_prints_current_policy(monkeypatch, capsys):
     import config as cfg
 
-    monkeypatch.setattr(cfg, "RERANK_FALLBACK_POLICY", "embedding")
+    monkeypatch.setattr(cfg, "RERANK_FALLBACK_POLICY", "error")
     r = doc.Result()
     doc.check_rerank_policy(r, no_network=False, server_status={})
 
     out = capsys.readouterr().out
-    assert "RAG reranker: not reachable -> RAG rerank fallback = embedding" in out
-    assert "does not call the main model" in out
+    assert "RAG reranker: not reachable -> rerank_fallback_policy=error" in out
+    assert "dedicated reranker" in out
+    assert not r.fails
 
 
 class _FakeCfg:

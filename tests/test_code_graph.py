@@ -2171,8 +2171,8 @@ def test_h_defaults_to_c_and_the_client_json_key_overrides(monkeypatch):
     assert parser.language_name == "cpp"
 
     monkeypatch.setattr(config, "H_LANG", "bogus")
-    parser = ast_parser.get_parser(Path("x.h"))
-    assert parser.language_name == "c", "非法值回預設 c"
+    with pytest.raises(ast_parser.ParserDependencyError, match="h_lang"):
+        ast_parser.get_parser(Path("x.h"))
 
 
 @requires_ts_c_cpp_pinned
@@ -2182,10 +2182,10 @@ def test_parser_status_reports_python_ast_and_ts_backends():
     assert languages["python"] == "python-ast", "python 恆為 stdlib ast,不受 tree-sitter 影響"
     assert languages["c"] == "tree-sitter"
     assert languages["cpp"] == "tree-sitter"
-    # 沒裝 grammar 的語言必須顯式標 degraded,不是報 'regex' 這種中性詞
+    # 沒裝 grammar 的語言不能再宣稱有 regex 替代；使用時必須直接報錯。
     for lang in ("go", "rust"):
-        assert languages[lang] in ("tree-sitter", "regex-degraded")
-    assert languages["java"] in ("ctags", "regex-degraded")
+        assert languages[lang] in ("tree-sitter", "unavailable")
+    assert languages["java"] in ("ctags", "unavailable")
 
 
 # ============================================================

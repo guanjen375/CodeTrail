@@ -5,6 +5,10 @@ context / graph 模式改集中在 [MCP 工具清單](mcp-tools.md#code_rag_sear
 CodeTrail 啟動聊天 frontend 前會硬性檢查 llama-server `:8081` (embedding)、
 `:8082` (reranker) 與 `:8083` (VL) 都 ready。
 
+RAG / Code RAG 的 NumPy、中文 BM25 的 jieba、所分析語言的 parser 都是該操作的必要依賴。
+專用 reranker 與已啟用的 query expansion 發生服務或協定錯誤時，查詢會報錯，不能沿用
+較差排序或默默取消擴展。依賴檢查也涵蓋快取命中；詳見[依賴需求](dependencies.md)。
+
 [回到 README](../README.md)。
 
 ---
