@@ -358,7 +358,25 @@ _log(f"[MCP] 載入 KnowledgeBase ({_kb_path}) ...")
 # 快取通常全命中;真的要重算一整份大 KB 時,initialize 會等到它算完——這是刻意的,
 # 讓 server「連上就是可查的」,而不是連上之後第一次查詢才 fatal。
 _log("[MCP]   （若 embeddings cache 不在或過期,這一步會先重建,下面會有進度）")
-KB = KnowledgeBase(_kb_path)
+# 收集器要在 KB 之前就緒:KB 載入時把它真正解析的那份 bytes 交給收集器存成該代快照
+# (data flywheel 紀錄時只認身分,不再讀磁碟——那時可能已經是別的 generation)。
+# 收集器綁**宣告的 root**(`--root`),不是 cwd:launcher 可能站在 checkout 目錄
+# 啟動 server,那時 cwd 與 sandbox root 不同,分區就會跟畫面講的不一樣。
+try:
+    data_flywheel.get_collector(root=AICODE_ROOT)
+except data_flywheel.DataCollectError as _collect_exc:
+    # 收集落點在被分析的專案之內(XDG_STATE_HOME 指進 root,含經 symlink):
+    # 與 session store 一樣拒絕啟動,不是靜默改寫位置、也不是悄悄關掉收集。
+    print(f"[MCP][FATAL] {_collect_exc}", file=sys.stderr, flush=True)
+    sys.exit(2)
+
+
+def _kb_snapshot_hook(raw: bytes, metadata: dict) -> None:
+    """KnowledgeBase 載入時的 hook:把解析的那份 bytes 存成該代快照(只存一次)。"""
+    data_flywheel.get_collector().snapshot_kb(raw, metadata)
+
+
+KB = KnowledgeBase(_kb_path, on_loaded=_kb_snapshot_hook)
 _log(f"[MCP] {KB.get_status()}")
 
 
@@ -377,7 +395,7 @@ def _ensure_kb_fresh() -> None:
         return
     _log(f"[MCP] knowledge.json 已變更,自動重新載入 ({_kb_path}) ...")
     try:
-        KB = load_knowledge_base_strict(_kb_path)
+        KB = load_knowledge_base_strict(_kb_path, on_loaded=_kb_snapshot_hook)
     except KnowledgeStoreError as e:
         _log(f"[MCP] KB 自動重載失敗,保留原記憶體 KB: {e}")
         raise
@@ -406,15 +424,6 @@ else:
         "(build 命令未掛白名單;要分析自己的專案請在 client.json 開 build_commands)"
     )
 _log(f"[MCP] EXTERNAL_IMPORT_ENABLED = {config.EXTERNAL_IMPORT_ENABLED}")
-# 收集器綁**宣告的 root**(`--root`),不是 cwd:launcher 可能站在 checkout 目錄
-# 啟動 server,那時 cwd 與 sandbox root 不同,分區就會跟畫面講的不一樣。
-try:
-    data_flywheel.get_collector(root=AICODE_ROOT)
-except data_flywheel.DataCollectError as _collect_exc:
-    # 收集落點在被分析的專案之內(XDG_STATE_HOME 指進 root,含經 symlink):
-    # 與 session store 一樣拒絕啟動,不是靜默改寫位置、也不是悄悄關掉收集。
-    print(f"[MCP][FATAL] {_collect_exc}", file=sys.stderr, flush=True)
-    sys.exit(2)
 if data_flywheel.collect_enabled():
     _log(
         "[MCP] data flywheel 開啟 — KB-shaped tools 的問答會 append 到 "
@@ -475,6 +484,9 @@ def _record_kb_failure(*, mode: str, question: str, exc: BaseException,
     只記錄、不吞例外——呼叫端接著 raise,transport 那層照舊轉成 error result;
     以前這條路完全不留紀錄,固定目錄裡就沒有服務失敗的樣本。
     """
+    if trace is None:
+        # 還沒開始檢索(KB 重載失敗之類):不拿上一題的 trace 充數,記一份最小的。
+        trace = {"schema": 1, "stage": "load", "query": {"question": question}}
     _record_kb_interaction(
         mode=mode,
         question=question,
@@ -852,7 +864,12 @@ def query_knowledge(
             "review_hint": str,   # excluded_figures 非空時的人可讀提示(否則 "")
         }
     """
-    _ensure_kb_fresh()
+    KB.last_trace = None  # 重載失敗時不得拿上一題的 trace 充數
+    try:
+        _ensure_kb_fresh()
+    except Exception as exc:
+        _record_kb_failure(mode="mcp_query_knowledge", question=question, exc=exc, trace=None)
+        raise
     if not KB.loaded:
         return {
             "text": "",
@@ -944,7 +961,13 @@ def query_knowledge_strict(
         streaming(會被導向 stderr,只有最終定稿經 MCP 回來)。
       - llama-server 不可用時 answer 會以 "[ERROR] ..." 開頭。
     """
-    _ensure_kb_fresh()
+    KB.last_trace = None  # 重載失敗時不得拿上一題的 trace 充數
+    try:
+        _ensure_kb_fresh()
+    except Exception as exc:
+        _record_kb_failure(mode="mcp_query_knowledge_strict", question=question, exc=exc,
+                           trace=None)
+        raise
     if not KB.loaded:
         result = {
             "answer": None,
@@ -1261,34 +1284,51 @@ def code_rag_search(
             item["score"] = float(rc.final_score)
             semantic_items.append(item)
 
-        graph = None
-        graph_status = "ok"
+        # semantic 之後的 lexical / graph / bundle 也是檢索的一部分:缺 rg 之類的
+        # DependencyError 以前直接交給 transport,失敗與已完成的 semantic 資訊一起消失。
+        code_trace["stage"] = "context"
         try:
-            graph = _graph_for_query()
-        except DependencyError:
-            raise
-        except Exception as exc:
-            graph_status = f"unavailable: {type(exc).__name__}: {exc}"[:200]
+            graph = None
+            graph_status = "ok"
+            try:
+                graph = _graph_for_query()
+            except DependencyError:
+                raise
+            except Exception as exc:
+                graph_status = f"unavailable: {type(exc).__name__}: {exc}"[:200]
 
-        allowed_paths = set(CODE_RAG._scan_code_files())
-        # lexical grep 證據不依賴 graph(workflow F):graph 缺席時以前這裡直接
-        # 給 [],把 context 打成 semantic-only。仍用 scoped allowed_paths,
-        # collect_safe_lexical_hits 內部再過一次 _safe_path。
-        lexical_hits = code_context.collect_safe_lexical_hits(EXEC, query, allowed_paths)
-        bundle = code_context.build_code_context(
-            query=query,
-            semantic_items=semantic_items,
-            index_items=CODE_RAG.index,
-            allowed_paths=allowed_paths,
-            read_window=lambda path, start, end: EXEC.read_file(
-                path, start_line=start, end_line=end
-            ),
-            max_chars=budget,
-            graph=graph,
-            graph_status=graph_status,
-            lexical_hits=lexical_hits,
-        )
+            allowed_paths = set(CODE_RAG._scan_code_files())
+            # lexical grep 證據不依賴 graph(workflow F):graph 缺席時以前這裡直接
+            # 給 [],把 context 打成 semantic-only。仍用 scoped allowed_paths,
+            # collect_safe_lexical_hits 內部再過一次 _safe_path。
+            lexical_hits = code_context.collect_safe_lexical_hits(EXEC, query, allowed_paths)
+            bundle = code_context.build_code_context(
+                query=query,
+                semantic_items=semantic_items,
+                index_items=CODE_RAG.index,
+                allowed_paths=allowed_paths,
+                read_window=lambda path, start, end: EXEC.read_file(
+                    path, start_line=start, end_line=end
+                ),
+                max_chars=budget,
+                graph=graph,
+                graph_status=graph_status,
+                lexical_hits=lexical_hits,
+            )
+        except Exception as exc:
+            _record_kb_failure(mode="mcp_code_rag_search", question=query, exc=exc,
+                               trace=code_trace)
+            raise
         bundle["query"] = _echo(query)
+        # 真的回傳的 evidence 可能經 lexical / graph 補進不在 semantic 候選裡的檔:
+        # 一併列給快照,並記下每段證據的位置。
+        code_trace["context_evidence"] = [
+            {"path": item.get("path"), "start_line": item.get("start_line"),
+             "end_line": item.get("end_line")}
+            for item in bundle["evidence"]
+        ]
+        CODE_RAG.trace_add_files(code_trace, [item.get("path") for item in bundle["evidence"]])
+        code_trace["stage"] = "done"
 
         if data_flywheel.collect_enabled():
             snippets = [
@@ -1420,7 +1460,10 @@ def code_rag_search(
     if include_evidence:
         try:
             graph = _graph_for_query()
-        except DependencyError:
+        except DependencyError as exc:
+            code_trace["stage"] = "relations"
+            _record_kb_failure(mode="mcp_code_rag_search", question=query, exc=exc,
+                               trace=code_trace)
             raise
         except Exception as exc:  # 資料缺席可揭露，環境依賴錯誤必須向外傳遞
             graph = None
@@ -1455,7 +1498,10 @@ def code_rag_search(
                         _slim_edge(e)
                         for e in graph.relations_for_symbol(lookup, limit=5)
                     ]
-                except DependencyError:
+                except DependencyError as exc:
+                    code_trace["stage"] = "relations"
+                    _record_kb_failure(mode="mcp_code_rag_search", question=query, exc=exc,
+                                       trace=code_trace)
                     raise
                 except Exception as exc:
                     graph_status = f"relation lookup failed: {type(exc).__name__}"
@@ -3200,7 +3246,7 @@ def reload_knowledge_base() -> str:
     """
     global KB
     try:
-        KB = load_knowledge_base_strict(_kb_path)
+        KB = load_knowledge_base_strict(_kb_path, on_loaded=_kb_snapshot_hook)
     except KnowledgeStoreError as e:
         return (
             f"[KB reload 失敗] {e}\n"

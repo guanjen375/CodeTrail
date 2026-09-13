@@ -221,15 +221,27 @@ class RankedCandidate:
 #: 候選池記到 combined 排序的前幾名。整個 index 可能上千個 symbol,全記沒有意義;
 #: 200 已遠超 rerank pool 與 top_k,「正解落在哪一段」一定看得到。
 TRACE_MAX_POOL = 200
-#: 一筆紀錄最多列幾個檔給快照(最終結果 + reranker 評過分的)。
-TRACE_MAX_FILES = 40
 
 
 def _trace_key(item: dict) -> tuple:
     return (item.get("path"), item.get("line"), item.get("symbol", ""))
 
 
-def _finish_code_trace(trace: dict, ranked: list) -> None:
+def _trace_add_files(trace: dict, paths, hashes: dict | None = None) -> None:
+    """把要快照的檔加進 trace["files"](去重;帶**索引時**的內容雜湊,快照端拿它核對
+    工作樹現在的內容是不是搜尋時那一版)。這裡不設上限:最終結果 + reranker 評過的 +
+    context evidence 三者之和有限;快照端的上限有缺席標記(blobs_truncated)。"""
+    files = trace.setdefault("files", [])
+    seen = {entry["path"] for entry in files if isinstance(entry, dict)}
+    hashes = hashes or {}
+    for path in paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        files.append({"path": path, "index_hash": hashes.get(path)})
+
+
+def _finish_code_trace(trace: dict, ranked: list, hashes: dict | None = None) -> None:
     """把最終結果標回候選池、列出最終清單與要快照的檔案。"""
     final_keys = {_trace_key(rc.item) for rc in ranked}
     for row in trace.get("pool", []):
@@ -241,12 +253,9 @@ def _finish_code_trace(trace: dict, ranked: list) -> None:
          "score_source": rc.score_source}
         for rc in ranked
     ]
-    files: list = []
-    for row in list(trace["final"]) + [r for r in trace.get("pool", []) if r.get("rerank") is not None]:
-        path = row.get("path")
-        if path and path not in files:
-            files.append(path)
-    trace["files"] = files[:TRACE_MAX_FILES]
+    paths = [row.get("path") for row in trace["final"]]
+    paths += [r.get("path") for r in trace.get("pool", []) if r.get("rerank") is not None]
+    _trace_add_files(trace, paths, hashes)
     trace["stage"] = "done"
 
 
@@ -1714,8 +1723,12 @@ class CodeRAG:
         # RankedCandidate(§5-1),絕不寫回 self.index 的持久 item。
         ranked = self._rerank_code_candidates(question, candidates_for_rerank, top_k, trace=trace)
         if trace is not None:
-            _finish_code_trace(trace, ranked)
+            _finish_code_trace(trace, ranked, self._indexed_file_hashes or {})
         return ranked
+
+    def trace_add_files(self, trace: dict, paths) -> None:
+        """把後續階段(context evidence 等)真的回傳的檔補進 trace["files"],帶索引時的雜湊。"""
+        _trace_add_files(trace, paths, self._indexed_file_hashes or {})
 
     def get_candidates_prompt(self, question: str) -> str:
         """生成給 Agent 的候選提示"""

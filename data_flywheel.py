@@ -53,17 +53,26 @@ metadata.trace（知識庫查詢；由 `knowledge.KnowledgeBase.query()` 產生�
   mmr          MMR 選了誰；pollution：污染控制前的 gate 分數與選後結果
   final        最終 REF：成員 id、來源/頁/章節、gate/retrieval 分數、截斷、前 200 字
   outcome      信心標籤、最終用的 top gate / retrieval 分數、REF 數
-  kb.snapshot  那一代 knowledge.json 的快照檔名（snapshots/ 底下，只存一次）
+  kb.snapshot  那一代 knowledge.json 的快照檔名（snapshots/ 底下，只存一次）；
+               kb.snapshot_sha256 是它的內容雜湊；存不了時 kb.snapshot_error 說明原因
+               （快照由 KB 載入時交來的 bytes 產生，紀錄時只認身分，不再讀磁碟）
 metadata.trace（code_rag_search；kind=code_rag）：
   settings     embedding / reranker 模型、門檻、rerank pool、index 大小、code tokens
   pool         combined 排序的候選池（前 200；含落選者）：path/line/symbol/type、
                emb / lexical / combined / rerank 分數、selected（過門檻）、final（最終）
-  pool_total / selected_count / rerank{applied, input_count, reason} / final / files
-  blobs        被引用原始檔的快照檔名（snapshots/blob-<sha256>，只存一次）
-服務失敗也是一筆：metadata.failed=true、error_type、error，trace 停在炸掉的那一步。
+  pool_total / selected_count / rerank{applied, input_count, reason} / final
+  files        要快照的檔（最終結果 + reranker 評過的 + context evidence），帶索引時的雜湊
+  context_evidence  context 模式真的回傳的每段證據（path / start_line / end_line）
+  blobs        rel path → {"snapshot": blob-<sha256>, "sha256", "matches_index"}（索引之後
+               檔案改過就是 false）或 {"skipped": 原因}；超過上限標 blobs_truncated / blobs_skipped
+服務失敗也是一筆：metadata.failed=true、error_type、error，trace 停在炸掉的那一步
+（load / context / relations / rerank …）。
+寫入：歸檔與 append 在收集目錄 .lock 的 flock 底下；每一次開目錄都重判「不在被分析的 repo 內」。
 攤開看：python3 data_flywheel.py trace --file <目錄>/interactions.jsonl --last 5
 """
 
+import contextlib
+import errno
 import hashlib
 import os
 import process_env
@@ -74,6 +83,11 @@ from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict, field
 from typing import Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - 沒有 flock 的平台;安全 IO 能力檢查會先擋
+    fcntl = None
 
 # 資料收集永久開啟;只有 readonly session 經 `config.COLLECT_DATA` 關掉
 # (見 `client_config.apply_to_config(readonly=True)`)。
@@ -88,7 +102,11 @@ ROTATE_BYTES = 32 * 1024 * 1024
 SNAPSHOT_DIRNAME = 'snapshots'
 KB_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
 BLOB_MAX_BYTES = 2 * 1024 * 1024
-MAX_BLOBS_PER_RECORD = 40
+#: 一筆紀錄最多快照幾個原始檔;超過的**標記**(blobs_truncated / blobs_skipped),不靜默切。
+MAX_BLOBS_PER_RECORD = 200
+#: 收集目錄的跨行程鎖:歸檔(改名現用檔)與 append 在同一把 flock 底下做。兩個 MCP 同時
+#: 服務同一專案時,沒有鎖的「看名字不存在 → rename」會把新檔蓋到先到的歸檔上。
+LOCK_FILENAME = '.lock'
 
 
 def collect_enabled() -> bool:
@@ -217,7 +235,10 @@ class DataCollector:
         self.root = (Path(root).expanduser() if root else Path(os.getcwd())).resolve()
         self.data_file = Path(data_file) if data_file else data_dir(self.root) / DATA_FILENAME
         self.enabled = collect_enabled()
-        self._snapshot_cache: dict = {}
+        # 載入時交來的 KB 快照:generation / sha256 → (檔名, sha256)。
+        self._kb_snapshots: dict = {}
+        # 驗過內容的快照:檔名 → ((ino, mtime_ns, size), sha256);同一行程內不重複整份雜湊。
+        self._verified: dict = {}
         # 落點不得在被分析的 repo 之內。SessionStore 早就擋這件事,收集器以前沒擋:
         # `XDG_STATE_HOME=/work/fw/.state` 就會在 repo 裡長出一份含查詢與文件片段的
         # JSONL,0600 擋不住擁有者自己 `git add .`。字面路徑與 realpath 都看
@@ -325,176 +346,319 @@ class DataCollector:
 
         payload = (json.dumps(asdict(interaction), ensure_ascii=False) + '\n').encode('utf-8')
         try:
-            self._rotate_if_needed(directory, anchor)
-        except Exception as e:
-            print(f"[WARN] 收集檔歸檔失敗: {e}")
-        try:
-            client_paths.append_private_line(
-                directory,
-                self.data_file.name,
-                payload,
-                _collect_error,
-                anchor=anchor,
-                guard=self._refuse_inside_root,
-            )
+            # 歸檔與 append 在同一把跨行程鎖底下:不然兩個 server 各自「看名字不存在 →
+            # rename」,後到的把新檔蓋到先到的歸檔上,整份歷史消失。
+            with self._locked(directory, anchor) as dir_fd:
+                self._rotate_if_needed(dir_fd)
+                client_paths.append_private_line(
+                    directory,
+                    self.data_file.name,
+                    payload,
+                    _collect_error,
+                    anchor=anchor,
+                    guard=self._refuse_inside_root,
+                )
         except Exception as e:
             print(f"[WARN] 資料收集失敗: {e}")
 
-    # ---- 歸檔與快照 ------------------------------------------------------
-    def _rotate_if_needed(self, directory: Path, anchor: Path) -> None:
-        """現用檔超過 ROTATE_BYTES 就改名歸檔(同目錄、同 dir fd、資料一筆不丟)。"""
+    # ---- 鎖、歸檔與快照 ----------------------------------------------------
+    @contextlib.contextmanager
+    def _locked(self, directory: Path, anchor: Path):
+        """收集目錄的跨行程排他鎖(`.lock` 上的 flock);yield 錨住目錄的 dir fd。"""
         import client_paths
 
+        if fcntl is None:
+            raise DataCollectError("收集目錄鎖不可用(沒有 fcntl.flock)")
         dir_fd = client_paths.open_private_dir(
             directory, _collect_error, anchor=anchor, guard=self._refuse_inside_root
         )
+        lock_fd = -1
         try:
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            lock_fd = os.open(LOCK_FILENAME, flags, 0o600, dir_fd=dir_fd)
+            client_paths._check_regular(lock_fd, LOCK_FILENAME, _collect_error)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
             try:
-                info = os.stat(self.data_file.name, dir_fd=dir_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                return
-            if not stat.S_ISREG(info.st_mode) or info.st_size < ROTATE_BYTES:
-                return
-            base, ext = os.path.splitext(self.data_file.name)
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            archived = f"{base}-{stamp}{ext}"
-            serial = 1
-            while True:
-                try:
-                    os.stat(archived, dir_fd=dir_fd, follow_symlinks=False)
-                except FileNotFoundError:
-                    break
-                serial += 1
-                archived = f"{base}-{stamp}-{serial}{ext}"
-            os.rename(self.data_file.name, archived, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                yield dir_fd
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
+            if lock_fd >= 0:
+                os.close(lock_fd)
             os.close(dir_fd)
 
-    @staticmethod
-    def _exists_private(directory: Path, name: str, anchor: Path) -> bool:
-        import client_paths
-
-        dir_fd = client_paths.open_private_dir(directory, _collect_error, anchor=anchor)
+    def _rotate_if_needed(self, dir_fd: int) -> None:
+        """現用檔超過 ROTATE_BYTES 就改名歸檔(同一個 dir fd、持鎖中、資料一筆不丟)。"""
         try:
-            try:
-                os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-                return True
-            except FileNotFoundError:
-                return False
-        finally:
-            os.close(dir_fd)
-
-    @staticmethod
-    def _write_once(directory: Path, name: str, payload: bytes, anchor: Path) -> None:
-        import client_paths
-
-        if DataCollector._exists_private(directory, name, anchor):
+            info = os.stat(self.data_file.name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
             return
-        client_paths.replace_private_file(directory, name, payload, _collect_error, anchor=anchor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size < ROTATE_BYTES:
+            return
+        base, ext = os.path.splitext(self.data_file.name)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archived = f"{base}-{stamp}{ext}"
+        serial = 1
+        while True:
+            try:
+                os.stat(archived, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                break
+            serial += 1
+            archived = f"{base}-{stamp}-{serial}{ext}"
+        os.rename(self.data_file.name, archived, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
 
-    @staticmethod
-    def _read_bounded(path: Path, max_bytes: int, *, nofollow: bool) -> bytes | None:
-        """讀一份普通檔(上限 max_bytes;超過或不是普通檔就回 None)。"""
-        flags = os.O_RDONLY | (getattr(os, "O_NOFOLLOW", 0) if nofollow else 0)
-        try:
-            fd = os.open(str(path), flags)
-        except OSError:
+    # -- 快照:KB 載入時交來的 bytes、紀錄時只認身分 --------------------------
+    def snapshot_kb(self, raw: bytes, metadata: dict | None) -> str | None:
+        """KnowledgeBase 載入時的 hook:把它**真正解析的那份 bytes** 存成該代的快照。
+
+        紀錄時只認身分(store_generation / sha256),不再讀磁碟——查詢用的是記憶體裡的
+        G1,紀錄前別的行程灌完 G2 的話,事後讀磁碟只會存到 G2,G1 原文永遠沒存。
+        失敗不得讓 KB 載不起來:印警告、回 None,紀錄端會在那一筆寫 snapshot_error。
+        """
+        if not self.enabled or not isinstance(raw, (bytes, bytearray)):
             return None
+        import client_store
+
+        metadata = metadata if isinstance(metadata, dict) else {}
+        sha = hashlib.sha256(raw).hexdigest()
+        generation = str(metadata.get("store_generation") or "")
+        name = f"kb-{_safe_name(generation)}.json" if generation else f"kb-{sha[:16]}.json"
         try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
-                return None
-            chunks = []
-            while True:
-                block = os.read(fd, 1024 * 1024)
-                if not block:
-                    break
-                chunks.append(block)
-            return b"".join(chunks)
+            self._ensure_snapshot(
+                self.data_file.parent / SNAPSHOT_DIRNAME, name, bytes(raw), sha,
+                client_store.state_home(),
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] KB 快照失敗: {e}")
+            return None
+        self._kb_snapshots[generation or sha] = (name, sha)
+        self._kb_snapshots[sha] = (name, sha)
+        return name
+
+    def _verify_snapshot(self, snap_dir: Path, name: str, expected_sha: str, anchor: Path) -> bool:
+        """既有快照可不可信:普通檔、owner、nlink==1、0600、非空,而且內容雜湊相符。
+
+        存在不等於可信:被換成空檔 / 目錄 / symlink / hard link 的名字都不能寫進紀錄。
+        同一行程內驗過的用 (ino, mtime_ns, size) 記住,不重複整份雜湊。
+        """
+        import client_paths
+
+        try:
+            dir_fd = client_paths.open_private_dir(
+                snap_dir, _collect_error, create=False, anchor=anchor,
+                guard=self._refuse_inside_root,
+            )
+        except (DataCollectError, OSError):
+            return False
+        if dir_fd is None or dir_fd < 0:  # create=False 遇到目錄不存在
+            return False
+        try:
+            try:
+                fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
+            except OSError:
+                return False
+            try:
+                try:
+                    info = client_paths._check_regular(fd, name, _collect_error)
+                except DataCollectError:
+                    return False
+                if stat.S_IMODE(info.st_mode) != 0o600 or info.st_size == 0:
+                    return False
+                identity = (info.st_ino, info.st_mtime_ns, info.st_size)
+                cached = self._verified.get(name)
+                if cached and cached == (identity, expected_sha):
+                    return True
+                digest = hashlib.sha256()
+                while True:
+                    block = os.read(fd, 1024 * 1024)
+                    if not block:
+                        break
+                    digest.update(block)
+                ok = digest.hexdigest() == expected_sha
+                if ok:
+                    self._verified[name] = (identity, expected_sha)
+                return ok
+            finally:
+                os.close(fd)
+        finally:
+            os.close(dir_fd)
+
+    def _ensure_snapshot(self, snap_dir: Path, name: str, payload: bytes, sha: str,
+                         anchor: Path) -> None:
+        """快照存在且可信就不動;否則(缺、壞、被換掉)原子重寫,寫完再驗一次。"""
+        import client_paths
+
+        if self._verify_snapshot(snap_dir, name, sha, anchor):
+            return
+        client_paths.replace_private_file(
+            snap_dir, name, payload, _collect_error, anchor=anchor, guard=self._refuse_inside_root
+        )
+        if not self._verify_snapshot(snap_dir, name, sha, anchor):
+            raise DataCollectError(f"快照寫入後驗證失敗: {snap_dir / name}")
+
+    def _open_under_root(self, rel: str):
+        """從 root 的 dir fd 逐層 O_NOFOLLOW 開 rel:回 (fd, None) 或 (None, 原因)。
+
+        `resolve()` 檢查完再用原始路徑 open 是 check-then-use:中間父目錄被換成
+        symlink,O_NOFOLLOW 只保護最後一段。路徑上任何一段是 symlink 就不讀,
+        即使它指向 root 之內。
+        """
+        parts = Path(rel).parts
+        if not parts or Path(rel).is_absolute() or any(p in ("..", "", ".") for p in parts):
+            return None, "outside_root"
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+
+        def _why(exc: OSError, part: str, parent_fd: int) -> str:
+            # Linux 對 symlink 目錄配 O_DIRECTORY|O_NOFOLLOW 回的是 ENOTDIR 不是 ELOOP;
+            # 用 lstat 看那一段到底是不是 symlink,不靠 errno 猜。
+            if exc.errno in (errno.ELOOP, errno.EMLINK):
+                return "symlink"
+            try:
+                info = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError:
+                return "missing"
+            return "symlink" if stat.S_ISLNK(info.st_mode) else "missing"
+
+        try:
+            fd = os.open(str(self.root), os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            return None, "missing"
+        try:
+            for part in parts[:-1]:
+                try:
+                    nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=fd)
+                except OSError as exc:
+                    return None, _why(exc, part, fd)
+                os.close(fd)
+                fd = nxt
+            try:
+                leaf = os.open(parts[-1], os.O_RDONLY | nofollow, dir_fd=fd)
+            except OSError as exc:
+                return None, _why(exc, parts[-1], fd)
+            return leaf, None
         finally:
             os.close(fd)
 
+    @staticmethod
+    def _read_all(fd: int) -> bytes:
+        chunks = []
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+        return b"".join(chunks)
+
+    @staticmethod
+    def _index_hash_of(data: bytes, info) -> str:
+        """與 code_rag.compute_file_hash 同一套判定(小檔 md5 內容、大檔 size+mtime_ns)。"""
+        try:
+            from code_rag import CONTENT_HASH_MAX_BYTES as limit
+        except Exception:  # noqa: BLE001 - CLI 沒載 code_rag 時用同一個預設
+            limit = 256 * 1024
+        if len(data) <= limit:
+            return hashlib.md5(data).hexdigest()
+        return hashlib.md5(f"{info.st_size}:{info.st_mtime_ns}".encode()).hexdigest()
+
     def _snapshot_for_trace(self, trace: dict, directory: Path, anchor: Path) -> None:
-        """依 trace 存 KB 那一代的完整內容與被引用的原始檔(各只存一次),檔名寫回 trace。"""
+        """依 trace 把 KB 那一代與被引用的原始檔對到快照(各只存一次),結果寫回 trace。"""
         snap_dir = directory / SNAPSHOT_DIRNAME
         kb = trace.get("kb")
         if isinstance(kb, dict) and kb.get("path"):
             try:
-                name = self._snapshot_kb(kb, self.root / str(kb["path"]), snap_dir, anchor)
+                name, sha = self._snapshot_kb_for_record(kb, snap_dir, anchor)
             except Exception as e:  # noqa: BLE001 - 快照失敗要寫在紀錄裡,不能吞掉也不能中斷收集
                 kb["snapshot_error"] = f"{type(e).__name__}: {e}"[:200]
             else:
-                if name:
-                    kb["snapshot"] = name
+                kb["snapshot"] = name
+                kb["snapshot_sha256"] = sha
         files = trace.get("files")
         if isinstance(files, list) and files:
             blobs = {}
-            for rel in files[:MAX_BLOBS_PER_RECORD]:
-                rel = str(rel)
+            for entry in files[:MAX_BLOBS_PER_RECORD]:
+                if isinstance(entry, dict):
+                    rel, index_hash = entry.get("path"), entry.get("index_hash")
+                else:
+                    rel, index_hash = entry, None
+                rel = str(rel or "")
+                if not rel:
+                    continue
                 try:
-                    blobs[rel] = self._snapshot_blob(rel, snap_dir, anchor)
+                    blobs[rel] = self._snapshot_blob(rel, index_hash, snap_dir, anchor)
                 except Exception as e:  # noqa: BLE001
-                    blobs[rel] = f"error:{type(e).__name__}"
+                    blobs[rel] = {"error": f"{type(e).__name__}: {e}"[:120]}
             trace["blobs"] = blobs
+            skipped = max(len(files) - MAX_BLOBS_PER_RECORD, 0)
+            if skipped:
+                trace["blobs_truncated"] = True
+                trace["blobs_skipped"] = skipped
 
-    def _snapshot_kb(self, kb: dict, kb_path: Path, snap_dir: Path, anchor: Path) -> str | None:
+    def _snapshot_kb_for_record(self, kb: dict, snap_dir: Path, anchor: Path) -> tuple:
+        """回 (快照檔名, sha256)。優先用載入時交來的那份;沒有(KB 在收集器之前載入、別的
+        行程載的)或既有快照壞了,才讀磁碟——而且只有磁碟上那份就是查詢用的那份
+        (sha256 相同;沒有 sha 的舊 trace 退回 generation 相同)才存,否則報錯不亂存。"""
         generation = str(kb.get("store_generation") or "")
-        if generation:
-            name = f"kb-{_safe_name(generation)}.json"
-            if self._exists_private(snap_dir, name, anchor):
-                return name
+        file_sha = str(kb.get("file_sha256") or "")
+        known = self._kb_snapshots.get(file_sha) or self._kb_snapshots.get(generation)
+        if known and self._verify_snapshot(snap_dir, known[0], known[1], anchor):
+            return known
+        fd, reason = self._open_under_root(str(kb["path"]))
+        if fd is None:
+            raise DataCollectError(f"{kb['path']} 讀不到({reason})")
         try:
-            info = os.stat(kb_path)
-        except OSError:
-            return None
-        cache_key = ("kb", str(kb_path), info.st_mtime_ns, info.st_size)
-        cached = self._snapshot_cache.get(cache_key)
-        if cached and self._exists_private(snap_dir, cached, anchor):
-            return cached
-        data = self._read_bounded(kb_path, KB_SNAPSHOT_MAX_BYTES, nofollow=False)
-        if data is None:
-            return None
-        actual = ""
-        try:
-            head = json.loads(data.decode("utf-8"))
-            actual = str(((head.get("metadata") or {}) if isinstance(head, dict) else {})
-                         .get("store_generation") or "")
-        except Exception:  # noqa: BLE001 - 壞 JSON 也照樣以內容雜湊存下來
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise DataCollectError(f"{kb['path']} 不是普通檔")
+            if info.st_size > KB_SNAPSHOT_MAX_BYTES:
+                raise DataCollectError(f"{kb['path']} 超過快照上限")
+            data = self._read_all(fd)
+        finally:
+            os.close(fd)
+        sha = hashlib.sha256(data).hexdigest()
+        if file_sha:
+            if sha != file_sha:
+                raise DataCollectError("查詢用的那一代已不在磁碟上(sha256 不符),無法補存快照")
+        elif generation:
             actual = ""
-        if generation and actual and actual != generation:
-            # 查詢與快照之間 KB 換代了:存的是磁碟上這一代,並標記對不上。
-            kb["snapshot_generation_mismatch"] = True
-        key = actual or generation or hashlib.sha256(data).hexdigest()[:16]
-        name = f"kb-{_safe_name(key)}.json"
-        self._write_once(snap_dir, name, data, anchor)
-        self._snapshot_cache[cache_key] = name
-        return name
+            try:
+                head = json.loads(data.decode("utf-8"))
+                actual = str(((head.get("metadata") or {}) if isinstance(head, dict) else {})
+                             .get("store_generation") or "")
+            except Exception:  # noqa: BLE001
+                actual = ""
+            if actual != generation:
+                raise DataCollectError(
+                    f"磁碟上的 store_generation={actual or '(缺)'} 與查詢用的 {generation} 不同,無法補存快照"
+                )
+        name = f"kb-{_safe_name(generation)}.json" if generation else f"kb-{sha[:16]}.json"
+        self._ensure_snapshot(snap_dir, name, data, sha, anchor)
+        self._kb_snapshots[generation or sha] = (name, sha)
+        self._kb_snapshots[sha] = (name, sha)
+        return name, sha
 
-    def _snapshot_blob(self, rel: str, snap_dir: Path, anchor: Path) -> str:
-        path = self.root / rel
+    def _snapshot_blob(self, rel: str, index_hash, snap_dir: Path, anchor: Path) -> dict:
+        """一個被引用的原始檔 → {"snapshot", "sha256", "matches_index"} 或 {"skipped": 原因}。"""
+        fd, reason = self._open_under_root(rel)
+        if fd is None:
+            return {"skipped": reason}
         try:
-            resolved = path.resolve(strict=True)
-        except OSError:
-            return "skipped:missing"
-        if resolved != self.root and self.root not in resolved.parents:
-            return "skipped:outside_root"
-        try:
-            info = os.stat(path, follow_symlinks=False)
-        except OSError:
-            return "skipped:missing"
-        if stat.S_ISLNK(info.st_mode):
-            return "skipped:symlink"
-        cache_key = ("blob", rel, info.st_mtime_ns, info.st_size)
-        cached = self._snapshot_cache.get(cache_key)
-        if cached and self._exists_private(snap_dir, cached, anchor):
-            return cached
-        data = self._read_bounded(path, BLOB_MAX_BYTES, nofollow=True)
-        if data is None:
-            return "skipped:too_large"
-        name = "blob-" + hashlib.sha256(data).hexdigest()[:32]
-        self._write_once(snap_dir, name, data, anchor)
-        self._snapshot_cache[cache_key] = name
-        return name
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return {"skipped": "not_regular"}
+            if info.st_size > BLOB_MAX_BYTES:
+                return {"skipped": "too_large"}
+            data = self._read_all(fd)
+        finally:
+            os.close(fd)
+        sha = hashlib.sha256(data).hexdigest()
+        name = "blob-" + sha[:32]
+        self._ensure_snapshot(snap_dir, name, data, sha, anchor)
+        entry = {"snapshot": name, "sha256": sha, "matches_index": None}
+        if index_hash:
+            # 索引時的內容雜湊 vs 現在讀到的:不同就代表快照不是搜尋時那一版。
+            entry["matches_index"] = self._index_hash_of(data, info) == str(index_hash)
+        return entry
 
     #: 收集檔的讀取上限。它是一行一筆的 append-only JSONL,正常不會很大;
     #: 給一個明確的上限比讓一個被換掉的巨大檔案吃光記憶體好。
@@ -726,7 +890,9 @@ def print_trace(interaction: Interaction, *, max_candidates: int = 8) -> None:
               f"min={_fmt(decision.get('min_gate_score'))} top={_fmt(decision.get('top_gate_score'))} "
               f"high_risk={decision.get('is_high_risk')}  通過 {trace.get('gate_passed_count', '?')} 個")
     rerank = trace.get("rerank") or {}
-    rerank_scores = {row.get("id"): row.get("score") for row in rerank.get("output", [])}
+    # scores = reranker 評過分的每一個(含被 output_k 切掉的);舊紀錄只有 output。
+    rerank_scores = {row.get("id"): row.get("score")
+                     for row in (rerank.get("scores") or rerank.get("output") or [])}
     candidates = trace.get("candidates") or []
     print(f"  候選 {trace.get('candidate_count', len(candidates))} 個"
           + ("(已截)" if trace.get("candidates_truncated") else "") + ":")
@@ -737,8 +903,11 @@ def print_trace(interaction: Interaction, *, max_candidates: int = 8) -> None:
               f"{c.get('source')} p.{c.get('page')}  {str(c.get('section', ''))[:40]}")
     if rerank:
         print(f"  rerank: {'跑了' if rerank.get('applied') else '沒跑'}  "
-              f"輸入 {rerank.get('input_count')} → 取 {rerank.get('output_k')}  "
-              f"effective_top_k={rerank.get('effective_top_k')}")
+              f"輸入 {rerank.get('input_count')} → 評分 {len(rerank.get('scores') or rerank.get('output') or [])} 個"
+              f" → 取 {rerank.get('output_k')}  effective_top_k={rerank.get('effective_top_k')}")
+    if trace.get("blobs"):
+        print(f"  快照: {len(trace['blobs'])} 個原始檔"
+              + ("(有略過)" if trace.get("blobs_truncated") else ""))
     mmr = trace.get("mmr") or {}
     if mmr:
         print(f"  mmr: used={mmr.get('used')} λ={_fmt(mmr.get('lambda'))} 選 {len(mmr.get('selected', []))} 個")

@@ -508,13 +508,20 @@ embedding / lexical / 融合 / rerank 分數與過門檻、最終旗標，以及
 MCP 端的 `question` 是模型送進工具的查詢字串、`answer` 只是 REF 標頭（MCP 沒有回合邊界，
 看不到使用者原話與最後的回答）；要對回整段對話，用 session 檔的時間戳與工具參數對上。
 
-同一個目錄底下的 `snapshots/`：每個 KB generation 存一份 `kb-<store_generation>.json`
-（那一代 knowledge.json 的完整內容），被引用的原始檔存成 `blob-<sha256>`，各只存一次，
-紀錄裡 `trace.kb.snapshot` / `trace.blobs` 指向它們——重灌 KB 或改了程式碼之後，舊紀錄的
-chunk id 與路徑 / 行號仍對得回當時的文字。現用檔超過 32 MiB 會先歸檔成
-`interactions-<UTC 時間>.jsonl` 再寫（一筆不丟；`stats` / `rate` / `trace` 只看現用檔，
-舊檔用 `--file` 指定）。收集落點若在被分析的 repo 之內（`XDG_STATE_HOME` 指進去，
-含經 symlink），收集器與 session store 一樣拒絕啟動。
+同一個目錄底下的 `snapshots/`：每個 KB generation 存一份 `kb-<store_generation>.json`，
+內容是 KB **載入時真正解析的那份 bytes**（`KnowledgeBase(on_loaded=…)` 交給收集器，MCP 啟動與
+自動重載都掛這個 hook；紀錄時只認 `store_generation` / `file_sha256`，不再事後讀磁碟——那時
+可能已經是別的 generation）。被引用的原始檔存成 `blob-<sha256>`；各只存一次，既有快照每次都
+重驗（普通檔、owner、nlink、0600、內容雜湊），壞了能修就修、修不了在該筆寫 `snapshot_error`，
+絕不把壞名字寫進紀錄。紀錄裡 `trace.kb.snapshot` + `snapshot_sha256`、`trace.blobs[path] =
+{snapshot, sha256, matches_index}` 指向它們（`matches_index=false` 代表索引之後檔案改過，
+快照不是搜尋時那一版）——重灌 KB 或改了程式碼之後，舊紀錄的 chunk id 與路徑 / 行號仍對得回
+當時的文字。來源檔一律從 root 的 dir fd 逐層 `O_NOFOLLOW` 讀，路徑上任何一段是 symlink 就
+略過（`skipped: symlink`）；快照的每一次開目錄都與 append 一樣重判「不在被分析的 repo 內」。
+現用檔超過 32 MiB 會先歸檔成 `interactions-<UTC 時間>.jsonl` 再寫，歸檔與 append 在收集目錄
+`.lock` 的 flock 底下（兩個 server 同時服務同一專案也不會把歸檔蓋掉；一筆不丟；`stats` /
+`rate` / `trace` 只看現用檔，舊檔用 `--file` 指定）。收集落點若在被分析的 repo 之內
+（`XDG_STATE_HOME` 指進去，含經 symlink），收集器與 session store 一樣拒絕啟動。
 
 與 session 檔同一套 root 雜湊與 `client_paths` 防線：目錄 0700、檔 0600、拒 symlink
 與 hard link、dir-fd append。**絕不落進被分析的 repo** —— 以前預設是相對路徑

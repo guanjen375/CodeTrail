@@ -294,9 +294,13 @@ def replace_private_file(
     make_error: ErrorFactory,
     *,
     anchor: Path | None = None,
+    guard: Callable[[Path], None] | None = None,
 ) -> Path:
-    """原子替換一份 owner-only 檔案,全程錨在 dir fd 上。"""
-    dir_fd = open_private_dir(directory, make_error, anchor=anchor)
+    """原子替換一份 owner-only 檔案,全程錨在 dir fd 上。
+
+    ``guard`` 同 :func:`open_private_dir`:每一次替換都拿解析後的實際位置再判一次 containment。
+    """
+    dir_fd = open_private_dir(directory, make_error, anchor=anchor, guard=guard)
     tmp_name = f".{name}.tmp.{os.getpid()}"
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)

@@ -4,6 +4,7 @@
 智能程式碼分析器 - 知識庫 (RAG)
 """
 
+import hashlib
 import re
 import json
 import copy
@@ -528,7 +529,8 @@ class KnowledgeBase:
     6. 結構化輸出格式
     """
 
-    def __init__(self, json_path: str = KNOWLEDGE_FILE, *, allow_rebuild: bool = True):
+    def __init__(self, json_path: str = KNOWLEDGE_FILE, *, allow_rebuild: bool = True,
+                 on_loaded=None):
         self.chunks = []
         self.documents = []
         self.loaded = False
@@ -545,6 +547,10 @@ class KnowledgeBase:
         # 最近一次 query() 的 trace(同一個 dict 物件,查詢中途逐步填)。半途拋例外時
         # 局部變數跟著消失,MCP 端從這裡拿走到一半的路徑記失敗樣本。
         self.last_trace = None
+        # 載入時把**真正解析的那份 bytes** 與 metadata 交給呼叫端(data flywheel 存成該代
+        # 快照)。紀錄時只認身分:sha256 放進 trace.kb.file_sha256。
+        self._on_loaded = on_loaded
+        self.loaded_sha256 = ""
         # Numpy 加速用的預計算陣列
         self._embeddings = None  # shape: (n_chunks, dim)
         self._embeddings_normalized = False
@@ -611,14 +617,28 @@ class KnowledgeBase:
             kb_cache._require_openat()
             _require_retrieval_dependencies()
             with knowledge_store_lock(Path(path), exclusive=False):
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+                with open(path, 'rb') as f:
+                    raw = f.read()
+                data = json.loads(raw)
 
             self.chunks = data.get("chunks", [])
             self._index_chunks()
             self._backfill_figure_verification()
             metadata = data.get("metadata", {})
             self._loaded_metadata = metadata
+            # 這份 bytes 就是本 instance 服務的那一代:data flywheel 的快照要存它,
+            # 不是事後再讀磁碟(那時可能已經是別的 generation)。hook 失敗不得讓 KB
+            # 載不起來——紀錄端會在那一筆寫 snapshot_error。
+            self.loaded_sha256 = hashlib.sha256(raw).hexdigest()
+            if self._on_loaded is not None:
+                try:
+                    self._on_loaded(raw, metadata)
+                except Exception as hook_exc:  # noqa: BLE001
+                    import sys as _sys
+
+                    print(f"[KB] snapshot hook failed: {type(hook_exc).__name__}: {hook_exc}",
+                          file=_sys.stderr)
+            del raw
             self.documents = metadata.get("documents", [])
 
             # 驗證 embedding model 一致性
@@ -3204,6 +3224,7 @@ English:"""
                       "strict": bool(is_strict_mode), "top_k": top_k},
             "kb": {"path": Path(str(getattr(self, "path", "") or "")).name,
                    "store_generation": str(loaded_meta.get("store_generation", "")),
+                   "file_sha256": str(getattr(self, "loaded_sha256", "") or ""),
                    "chunks": len(self.chunks)},
             "settings": self._retrieval_settings(),
             "expansion": None,
@@ -3903,14 +3924,15 @@ English:"""
         return line
 
 
-def load_knowledge_base_strict(json_path: str) -> KnowledgeBase:
+def load_knowledge_base_strict(json_path: str, *, on_loaded=None) -> KnowledgeBase:
     """建立新 KnowledgeBase;任何載入失敗都拋 KnowledgeStoreError,不回傳半殘物件。
 
     給「自動重載 / 手動 reload」的呼叫端用:呼叫端把回傳值當 candidate,
     例外時保留手上還能用的舊 KB(不要先覆蓋再發現壞掉)。
     「檔案不存在」是合法空庫,正常回傳(loaded=False、load_error=None)。
+    `on_loaded` 同 KnowledgeBase:重載的那一代也要交給快照。
     """
-    kb = KnowledgeBase(json_path)   # KnowledgeStoreError 由 _load 直接傳播
+    kb = KnowledgeBase(json_path, on_loaded=on_loaded)   # KnowledgeStoreError 由 _load 直接傳播
     if kb.load_error is not None:
         raise KnowledgeStoreError(
             f"knowledge.json 載入失敗: {kb.load_error}(path={json_path})"

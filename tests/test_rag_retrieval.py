@@ -1445,6 +1445,34 @@ def test_strict_all_excluded_records_the_stop_reason_and_the_excluded_figures(
     assert trace["strict_excluded"]["figures"][0]["verification_status"] == "needs_review"
 
 
+@pytest.mark.smoke
+def test_the_kb_hands_its_loaded_bytes_to_the_snapshot_hook(tmp_path: Path, monkeypatch):
+    """審核第三輪 B5:快照要存 KB **真正解析的那份 bytes**,不是事後再讀磁碟。KB 載入時把
+    raw bytes 與 metadata 交給 on_loaded,並把 sha256 放進 trace.kb.file_sha256。"""
+    import hashlib
+
+    monkeypatch.setattr(config, "KB_CONTEXT_USE", True)
+    chunks = [_chunk("a", "原文一夠長可以通過噪音過濾。" * 4, ctx=CTX_TEXT,
+                     embedding=[1.0, 0.0], gate=[1.0, 0.0])]
+    path = _write_kb(tmp_path, chunks, with_gate=True)
+    seen = []
+    kb = KnowledgeBase(str(path), on_loaded=lambda raw, meta: seen.append((raw, meta)))
+    _go_offline(kb, monkeypatch)
+    monkeypatch.setattr(
+        kb, "_rerank_with_model",
+        lambda _q, candidates, _k, **_kw: [(0.9, c.chunk) for c in candidates],
+    )
+
+    assert len(seen) == 1
+    raw, meta = seen[0]
+    assert raw == path.read_bytes()
+    assert meta.get("store_generation") == json.loads(raw)["metadata"].get("store_generation")
+    assert kb.loaded_sha256 == hashlib.sha256(raw).hexdigest()
+
+    _model, _display, query_meta = kb.query("CTRL 重置值是什麼")
+    assert query_meta["trace"]["kb"]["file_sha256"] == kb.loaded_sha256
+
+
 # ============================================================
 # GPT review 回歸（2026-08-18）
 # ============================================================

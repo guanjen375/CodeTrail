@@ -348,6 +348,74 @@ def test_query_knowledge_records_a_failure_sample_with_the_partial_trace(mcp_mod
     assert failure["trace"] is partial
 
 
+@pytest.mark.smoke
+def test_context_mode_records_every_returned_evidence_file_for_snapshots(mcp_module, monkeypatch):
+    """審核第三輪 B6:context 模式的 evidence 可以經 lexical / graph 補進不在 semantic 候選裡
+    的檔;trace.files 在 semantic 結束時就定案,那些真的回傳的證據就沒有快照。"""
+    recorded = []
+    monkeypatch.setattr(mcp_module.data_flywheel, "collect_enabled", lambda: True)
+    monkeypatch.setattr(
+        mcp_module, "_record_kb_interaction", lambda **kwargs: recorded.append(kwargs)
+    )
+
+    [bundle] = mcp_module.code_rag_search("entry helper", mode="context", top_k=1)
+
+    trace = recorded[-1]["extra_meta"]["trace"]
+    evidence_paths = [item["path"] for item in bundle["evidence"]]
+    assert evidence_paths, "fixture 一定有 evidence"
+    assert [entry["path"] for entry in trace["context_evidence"]] == evidence_paths
+    assert set(evidence_paths) <= {entry["path"] for entry in trace["files"]}
+
+
+@pytest.mark.smoke
+def test_a_failure_before_the_query_is_recorded_without_a_stale_trace(mcp_module, monkeypatch):
+    """審核第三輪 B7:KB 重載失敗發生在 KB.query() 之前,try/except 沒包到,一筆都不留;
+    而且 KB.last_trace 還是上一題的,不能拿來充數。"""
+    recorded = []
+    monkeypatch.setattr(mcp_module.data_flywheel, "collect_enabled", lambda: True)
+    monkeypatch.setattr(
+        mcp_module, "_record_kb_interaction", lambda **kwargs: recorded.append(kwargs)
+    )
+    mcp_module.KB.last_trace = {"stage": "done", "query": {"question": "上一題"}}
+
+    def reload_fails():
+        raise RuntimeError("knowledge.json reload failed")
+
+    monkeypatch.setattr(mcp_module, "_ensure_kb_fresh", reload_fails)
+
+    with pytest.raises(RuntimeError, match="reload failed"):
+        mcp_module.query_knowledge("這一題")
+
+    failure = recorded[-1]
+    assert failure["extra_meta"]["failed"] is True
+    assert failure["trace"]["stage"] == "load"
+    assert failure["trace"]["query"]["question"] == "這一題"
+
+
+@pytest.mark.smoke
+def test_a_context_stage_failure_after_semantic_search_is_recorded(mcp_module, monkeypatch):
+    """審核第三輪 B7:semantic 搜完之後 lexical 缺 rg 拋 DependencyError,新的 try/except
+    只包了 query_ranked;失敗與已完成的 semantic 資訊一起消失。"""
+    recorded = []
+    monkeypatch.setattr(mcp_module.data_flywheel, "collect_enabled", lambda: True)
+    monkeypatch.setattr(
+        mcp_module, "_record_kb_interaction", lambda **kwargs: recorded.append(kwargs)
+    )
+
+    def no_rg(*_args, **_kwargs):
+        raise mcp_module.DependencyError("rg is required")
+
+    monkeypatch.setattr(mcp_module.code_context, "collect_safe_lexical_hits", no_rg)
+
+    with pytest.raises(mcp_module.DependencyError, match="rg"):
+        mcp_module.code_rag_search("entry helper", mode="context")
+
+    failure = recorded[-1]
+    assert failure["extra_meta"]["failed"] is True
+    assert failure["trace"]["stage"] == "context"
+    assert failure["trace"]["pool"], "semantic 已完成的候選池要留著"
+
+
 def test_unknown_mode_is_rejected(mcp_module):
     with pytest.raises(ValueError, match="context"):
         mcp_module.code_rag_search("x", mode="bogus")

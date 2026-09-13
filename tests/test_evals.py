@@ -2207,7 +2207,8 @@ def test_the_collector_snapshots_the_kb_generation_and_referenced_files_once(tmp
     assert _json.loads(kb_snapshot.read_text(encoding="utf-8"))["chunks"][0]["content"] == "第一代"
     stored = collector.load_interactions()[-1].metadata["trace"]
     assert stored["kb"]["snapshot"] == "kb-g1.json"
-    blob_name = stored["blobs"]["src/a.c"]
+    blob = stored["blobs"]["src/a.c"]
+    blob_name = blob["snapshot"]
     assert blob_name.startswith("blob-")
     assert (snapshots / blob_name).read_text(encoding="utf-8") == "int reset(void) { return 1; }\n"
 
@@ -2250,6 +2251,209 @@ def test_the_collected_file_rotates_before_it_outgrows_the_reader(tmp_path, monk
     assert total == 6, "歸檔不得丟資料"
     for path in archived:
         assert (path.stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.smoke
+def test_rotation_and_append_hold_an_exclusive_directory_lock(tmp_path, monkeypatch):
+    """審核第三輪 B1:兩個 MCP 同時服務同一專案、現用檔都到了門檻:各自「看名字不存在 →
+    rename」之間沒有跨行程鎖,後到的 rename 會把新檔蓋到先到的歸檔上,整份歷史消失。
+    歸檔與 append 必須在同一把 flock(收集目錄的 .lock)底下做。"""
+    import fcntl
+
+    data_flywheel, project = _flywheel(tmp_path, monkeypatch)
+    monkeypatch.setattr(data_flywheel, "ROTATE_BYTES", 300)
+    collector = data_flywheel.DataCollector(root=str(project))
+    directory = collector.data_file.parent
+    observed = []
+    real_rename = os.rename
+
+    def rename_under_lock(src, dst, *args, **kwargs):
+        lock = directory / data_flywheel.LOCK_FILENAME
+        if not lock.exists():
+            observed.append("no_lock_file")
+        else:
+            fd = os.open(lock, os.O_RDWR)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    observed.append("locked")
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    observed.append("unlocked")
+            finally:
+                os.close(fd)
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(data_flywheel.os, "rename", rename_under_lock)
+    for i in range(6):
+        collector.record(question=f"Q{i}", answer="A" * 200, refs=[])
+
+    assert observed, "門檻夠低,一定歸檔過"
+    assert set(observed) == {"locked"}, observed
+    archived = sorted(directory.glob("interactions-*.jsonl"))
+    total = len(collector.load_interactions()) + sum(
+        sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+        for path in archived
+    )
+    assert total == 6
+
+
+@pytest.mark.smoke
+def test_snapshots_never_land_inside_the_repo_even_after_a_symlink_swap(tmp_path, monkeypatch):
+    """審核第三輪 B2:啟動時 XDG_STATE_HOME 的祖先 symlink 指向專案外,啟動後改指專案內。
+    快照的 open / replace 以前沒帶 guard,而且跑在歸檔與 append 之前——後面的 guard
+    再怎麼拒絕,NDA 快照與目錄已經長在 repo 裡。每一次寫入都要重判。"""
+    import config
+    import data_flywheel
+
+    monkeypatch.setattr(config, "COLLECT_DATA", True)
+    project = tmp_path / "fw"
+    project.mkdir()
+    (project / "knowledge.json").write_text(
+        json.dumps({"metadata": {"store_generation": "g1"}, "chunks": []}), encoding="utf-8"
+    )
+    (project / "a.c").write_text("int x;\n", encoding="utf-8")
+    outside = tmp_path / "state_real"
+    outside.mkdir()
+    link = tmp_path / "state_link"
+    link.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(link))
+    collector = data_flywheel.DataCollector(root=str(project))
+
+    inside = project / "inside"
+    inside.mkdir()
+    link.unlink()
+    link.symlink_to(inside, target_is_directory=True)
+
+    collector.record(
+        question="Q", answer="A",
+        metadata={"trace": {"kb": {"path": "knowledge.json", "store_generation": "g1"},
+                            "files": ["a.c"]}},
+    )
+
+    assert sorted(p.name for p in project.iterdir()) == ["a.c", "inside", "knowledge.json"]
+    assert not list(inside.iterdir()), "換指之後不得有任何東西寫進 repo"
+
+
+@pytest.mark.smoke
+def test_source_snapshots_never_follow_symlinks_anywhere_in_the_path(tmp_path, monkeypatch):
+    """審核第三輪 B3:resolve() 檢查與 os.open() 之間父目錄可以被換成 symlink,O_NOFOLLOW
+    只保護最後一段;KB 快照更是 nofollow=False。來源一律從 root 的 dir fd 逐層 O_NOFOLLOW
+    開,路徑上任何一段是 symlink 就不讀(即使指向 root 之內)。"""
+    data_flywheel, project = _flywheel(tmp_path, monkeypatch)
+    (project / "real_src").mkdir()
+    (project / "real_src" / "a.c").write_text("int a;\n", encoding="utf-8")
+    (project / "src").symlink_to(project / "real_src", target_is_directory=True)
+    (project / "other.json").write_text(
+        json.dumps({"metadata": {"store_generation": "g1"}, "chunks": []}), encoding="utf-8"
+    )
+    (project / "knowledge.json").symlink_to(project / "other.json")
+
+    collector = data_flywheel.DataCollector(root=str(project))
+    trace = {"kb": {"path": "knowledge.json", "store_generation": "g1"}, "files": ["src/a.c"]}
+    collector.record(question="Q", answer="A", metadata={"trace": trace})
+
+    stored = collector.load_interactions()[-1].metadata["trace"]
+    assert "snapshot" not in stored["kb"] and stored["kb"].get("snapshot_error")
+    blob = stored["blobs"]["src/a.c"]
+    assert isinstance(blob, dict) and blob.get("skipped") == "symlink", blob
+    snapshots = collector.data_file.parent / "snapshots"
+    assert not snapshots.exists() or not list(snapshots.iterdir())
+
+
+@pytest.mark.smoke
+def test_a_corrupted_snapshot_is_repaired_or_reported_never_trusted(tmp_path, monkeypatch):
+    """審核第三輪 B4:既有快照只驗「名字存在」。被換成空檔 / 目錄 / symlink 之後,紀錄照樣
+    指向它。存在不等於可信:要驗普通檔、owner、nlink、0600 與內容雜湊;壞了能修就修,
+    修不了就寫 snapshot_error,絕不把壞名字寫進紀錄。"""
+    import hashlib
+
+    data_flywheel, project = _flywheel(tmp_path, monkeypatch)
+    raw = json.dumps({"metadata": {"store_generation": "g1"},
+                      "chunks": [{"id": "a", "content": "第一代"}]}).encode("utf-8")
+    (project / "knowledge.json").write_bytes(raw)
+    collector = data_flywheel.DataCollector(root=str(project))
+    kb_trace = {"path": "knowledge.json", "store_generation": "g1",
+                "file_sha256": hashlib.sha256(raw).hexdigest()}
+    collector.record(question="Q1", answer="A", metadata={"trace": {"kb": dict(kb_trace)}})
+    snapshot = collector.data_file.parent / "snapshots" / "kb-g1.json"
+    assert snapshot.read_bytes() == raw
+
+    # 被截成空檔 → 修回來,而且紀錄帶內容雜湊。
+    snapshot.write_bytes(b"")
+    collector.record(question="Q2", answer="A", metadata={"trace": {"kb": dict(kb_trace)}})
+    stored = collector.load_interactions()[-1].metadata["trace"]["kb"]
+    assert stored["snapshot"] == "kb-g1.json"
+    assert stored["snapshot_sha256"] == kb_trace["file_sha256"]
+    assert snapshot.read_bytes() == raw
+
+    # 被換成目錄 → 修不了,寫 snapshot_error、不寫 snapshot。
+    snapshot.unlink()
+    snapshot.mkdir()
+    collector.record(question="Q3", answer="A", metadata={"trace": {"kb": dict(kb_trace)}})
+    stored = collector.load_interactions()[-1].metadata["trace"]["kb"]
+    assert "snapshot" not in stored and stored.get("snapshot_error")
+
+
+@pytest.mark.smoke
+def test_the_kb_snapshot_is_the_loaded_generation_not_the_disk_version(tmp_path, monkeypatch):
+    """審核第三輪 B5:查詢用的是記憶體裡的 G1,紀錄前另一個行程灌完 G2;事後讀磁碟只會存到
+    G2,G1 原文永遠沒存。快照要在**載入時**由 KB 交出它真正解析的 bytes;紀錄時只認身分。
+    原始檔快照同樣要核對索引時的內容雜湊。"""
+    import hashlib
+
+    data_flywheel, project = _flywheel(tmp_path, monkeypatch)
+    raw_g1 = json.dumps({"metadata": {"store_generation": "g1"},
+                         "chunks": [{"id": "a", "content": "第一代"}]}).encode("utf-8")
+    raw_g2 = json.dumps({"metadata": {"store_generation": "g2"},
+                         "chunks": [{"id": "a", "content": "第二代"}]}).encode("utf-8")
+    (project / "knowledge.json").write_bytes(raw_g1)
+    (project / "src").mkdir()
+    (project / "src" / "a.c").write_text("int a;\n", encoding="utf-8")
+    index_hash = hashlib.md5(b"int a;\n").hexdigest()
+
+    collector = data_flywheel.DataCollector(root=str(project))
+    assert collector.snapshot_kb(raw_g1, {"store_generation": "g1"}) == "kb-g1.json"
+    (project / "knowledge.json").write_bytes(raw_g2)  # 另一個行程灌了 G2
+
+    collector.record(question="Q", answer="A", metadata={"trace": {
+        "kb": {"path": "knowledge.json", "store_generation": "g1",
+               "file_sha256": hashlib.sha256(raw_g1).hexdigest()},
+        "files": [{"path": "src/a.c", "index_hash": index_hash}],
+    }})
+    stored = collector.load_interactions()[-1].metadata["trace"]
+    assert stored["kb"]["snapshot"] == "kb-g1.json"
+    assert stored["kb"]["snapshot_sha256"] == hashlib.sha256(raw_g1).hexdigest()
+    assert "snapshot_generation_mismatch" not in stored["kb"]
+    snapshots = collector.data_file.parent / "snapshots"
+    assert (snapshots / "kb-g1.json").read_bytes() == raw_g1
+    blob = stored["blobs"]["src/a.c"]
+    assert blob["matches_index"] is True
+    assert (snapshots / blob["snapshot"]).read_bytes() == b"int a;\n"
+
+    # 索引之後檔案被改:快照存的是現在的內容,但要標明它不是搜尋時那一版。
+    (project / "src" / "a.c").write_text("int a = 2;\n", encoding="utf-8")
+    collector.record(question="Q2", answer="A", metadata={"trace": {
+        "files": [{"path": "src/a.c", "index_hash": index_hash}]}})
+    blob = collector.load_interactions()[-1].metadata["trace"]["blobs"]["src/a.c"]
+    assert blob["matches_index"] is False
+
+
+@pytest.mark.smoke
+def test_blob_snapshots_mark_truncation_instead_of_dropping_files_silently(tmp_path, monkeypatch):
+    """審核第三輪 B6:被引用的檔超過上限時直接切掉、沒有缺席標記。要留 blobs_truncated 與
+    被略過的數量。"""
+    data_flywheel, project = _flywheel(tmp_path, monkeypatch)
+    for name in ("a.c", "b.c"):
+        (project / name).write_text(f"// {name}\n", encoding="utf-8")
+    monkeypatch.setattr(data_flywheel, "MAX_BLOBS_PER_RECORD", 1)
+    collector = data_flywheel.DataCollector(root=str(project))
+    collector.record(question="Q", answer="A", metadata={"trace": {"files": ["a.c", "b.c"]}})
+    stored = collector.load_interactions()[-1].metadata["trace"]
+    assert len(stored["blobs"]) == 1
+    assert stored["blobs_truncated"] is True and stored["blobs_skipped"] == 1
 
 
 @pytest.mark.smoke
