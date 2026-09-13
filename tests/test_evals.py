@@ -2157,6 +2157,102 @@ def test_data_collection_is_always_on_and_only_readonly_turns_it_off(tmp_path, m
 
 
 @pytest.mark.smoke
+def test_the_collector_refuses_a_state_home_inside_the_analysed_repo(tmp_path, monkeypatch):
+    """審核 BLOCKER 6:XDG_STATE_HOME 指進被分析的 repo 時,SessionStore 會拒絕,
+    DataCollector 卻照寫 —— 一份含查詢與文件片段的 JSONL 就長在 repo 裡,0600 擋不住
+    擁有者自己 `git add .`。字面路徑與 symlink 解析後的路徑都要擋。"""
+    import config
+    import data_flywheel
+
+    monkeypatch.setattr(config, "COLLECT_DATA", True)
+    project = tmp_path / "fw"
+    project.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(project / ".state"))
+    with pytest.raises(data_flywheel.DataCollectError, match="XDG_STATE_HOME"):
+        data_flywheel.DataCollector(root=str(project))
+    assert not (project / ".state").exists(), "拒絕之前不得在 repo 裡建目錄"
+
+    link = tmp_path / "link"
+    link.symlink_to(project, target_is_directory=True)
+    monkeypatch.setenv("XDG_STATE_HOME", str(link / "state"))
+    with pytest.raises(data_flywheel.DataCollectError, match="XDG_STATE_HOME"):
+        data_flywheel.DataCollector(root=str(project))
+    assert not list(project.iterdir()), "repo 裡一個檔都不能多"
+
+
+@pytest.mark.smoke
+def test_the_collector_snapshots_the_kb_generation_and_referenced_files_once(tmp_path, monkeypatch):
+    """審核 BLOCKER 5:重新 ingest 之後,舊紀錄裡的 chunk id 與路徑/行號對不回當時的
+    內容。每個 KB generation 與被引用的原始檔各存一份快照(只存一次),紀錄指向它。"""
+    import json as _json
+
+    data_flywheel, project = _flywheel(tmp_path, monkeypatch)
+    (project / "knowledge.json").write_text(
+        _json.dumps({"metadata": {"store_generation": "g1"}, "chunks": [{"id": "a", "content": "第一代"}]}),
+        encoding="utf-8",
+    )
+    (project / "src").mkdir()
+    (project / "src" / "a.c").write_text("int reset(void) { return 1; }\n", encoding="utf-8")
+
+    collector = data_flywheel.DataCollector(root=str(project))
+    trace = {"schema": 1, "kb": {"path": "knowledge.json", "store_generation": "g1"},
+             "files": ["src/a.c"]}
+    collector.record(question="Q", answer="A", metadata={"trace": trace})
+
+    snapshots = collector.data_file.parent / "snapshots"
+    kb_snapshot = snapshots / "kb-g1.json"
+    assert kb_snapshot.is_file() and (kb_snapshot.stat().st_mode & 0o777) == 0o600
+    assert _json.loads(kb_snapshot.read_text(encoding="utf-8"))["chunks"][0]["content"] == "第一代"
+    stored = collector.load_interactions()[-1].metadata["trace"]
+    assert stored["kb"]["snapshot"] == "kb-g1.json"
+    blob_name = stored["blobs"]["src/a.c"]
+    assert blob_name.startswith("blob-")
+    assert (snapshots / blob_name).read_text(encoding="utf-8") == "int reset(void) { return 1; }\n"
+
+    # 第二次同一代:不重寫(inode 與 mtime 都不變)。
+    before = kb_snapshot.stat()
+    collector.record(question="Q2", answer="A2", metadata={"trace": dict(trace)})
+    after = kb_snapshot.stat()
+    assert (before.st_ino, before.st_mtime_ns) == (after.st_ino, after.st_mtime_ns)
+
+    # KB 換代:新快照另存,舊的還在。
+    (project / "knowledge.json").write_text(
+        _json.dumps({"metadata": {"store_generation": "g2"}, "chunks": [{"id": "a", "content": "第二代"}]}),
+        encoding="utf-8",
+    )
+    collector.record(question="Q3", answer="A3",
+                     metadata={"trace": {"kb": {"path": "knowledge.json", "store_generation": "g2"}}})
+    assert (snapshots / "kb-g2.json").is_file() and kb_snapshot.is_file()
+    assert _json.loads(kb_snapshot.read_text(encoding="utf-8"))["chunks"][0]["content"] == "第一代"
+
+
+@pytest.mark.smoke
+def test_the_collected_file_rotates_before_it_outgrows_the_reader(tmp_path, monkeypatch):
+    """審核 NON-BLOCKER 7:讀取端有 64 MiB 上限,檔案長過去之後 `trace --last 1` 也只會
+    看到「沒有紀錄」。寫入端在超過門檻時先把現有檔案歸檔再 append,資料一筆不丟。"""
+    data_flywheel, project = _flywheel(tmp_path, monkeypatch)
+    monkeypatch.setattr(data_flywheel, "ROTATE_BYTES", 400)
+    collector = data_flywheel.DataCollector(root=str(project))
+    for i in range(6):
+        collector.record(question=f"Q{i}", answer="A" * 200, refs=[])
+
+    directory = collector.data_file.parent
+    archived = sorted(directory.glob("interactions-*.jsonl"))
+    assert archived, "超過門檻就要歸檔"
+    assert collector.data_file.stat().st_size < 400 + 2000
+    current = collector.load_interactions()
+    total = len(current) + sum(
+        sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+        for path in archived
+    )
+    assert total == 6, "歸檔不得丟資料"
+    for path in archived:
+        assert (path.stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.smoke
 def test_session_eval_forwards_skip_aux_preflight_to_the_replay_child(tmp_path, monkeypatch):
     seen: dict = {}
     payload = json.dumps({"type": "session", "session_id": "ses_x"})

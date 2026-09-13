@@ -253,10 +253,99 @@ def test_context_telemetry_records_metadata_but_not_evidence_text(mcp_module, mo
     assert evidence_text not in repr(payload)
     # 檢索路徑跟著 telemetry 走,但一樣只有身分與分數,沒有程式碼文字(上面那條斷言也蓋到它)。
     trace = payload["extra_meta"]["trace"]
-    assert trace["mode"] == "context" and trace["ranked"]
-    assert set(trace["ranked"][0]) == {
-        "path", "line", "symbol", "type", "combined", "rerank", "final", "score_source",
+    assert trace["mode"] == "context" and trace["pool"]
+    assert set(trace["pool"][0]) == {
+        "path", "line", "symbol", "type", "emb", "lexical", "combined",
+        "selected", "rerank", "final",
     }
+
+
+@pytest.mark.smoke
+def test_code_rag_trace_keeps_the_eliminated_pool_and_channel_scores(mcp_module, monkeypatch):
+    """審核 BLOCKER 1:只存最後 top_k 的勝出者,看不出正解是沒被召回、沒過門檻,
+    還是被 reranker 淘汰。trace 必須帶整個候選池(含落選者)、各通道分數
+    (embedding / lexical / 融合 / rerank)與 embedding / reranker 設定。"""
+    recorded = []
+    monkeypatch.setattr(mcp_module.data_flywheel, "collect_enabled", lambda: True)
+    monkeypatch.setattr(
+        mcp_module, "_record_kb_interaction", lambda **kwargs: recorded.append(kwargs)
+    )
+
+    results = mcp_module.code_rag_search("entry helper", top_k=1)
+
+    assert len(results) == 1
+    trace = recorded[-1]["extra_meta"]["trace"]
+    assert trace["stage"] == "done"
+    pool = trace["pool"]
+    assert len(pool) >= 2, "落選的候選也要在池裡"
+    assert sum(1 for row in pool if row["final"]) == 1
+    for row in pool:
+        assert {"emb", "lexical", "combined", "selected", "rerank", "final"} <= set(row)
+    assert trace["pool_total"] >= len(pool)
+    assert trace["rerank"]["applied"] is False and trace["rerank"]["reason"]
+    assert "embedding_model" in trace["settings"] and "reranker_model" in trace["settings"]
+    assert trace["settings"]["threshold"] == CODE_RAG_THRESHOLD
+    assert trace["files"], "最終結果的檔案要列出來給快照用"
+
+
+@pytest.mark.smoke
+def test_code_rag_search_records_a_failure_sample_when_retrieval_raises(mcp_module, monkeypatch):
+    """審核 BLOCKER 3:reranker timeout 這種服務失敗以前完全不留紀錄。
+    失敗也是樣本:要記問題、走到哪一步與失敗原因,而且例外照樣往外傳。"""
+    recorded = []
+    monkeypatch.setattr(mcp_module.data_flywheel, "collect_enabled", lambda: True)
+    monkeypatch.setattr(
+        mcp_module, "_record_kb_interaction", lambda **kwargs: recorded.append(kwargs)
+    )
+
+    def boom(*_args, **kwargs):
+        trace = kwargs.get("trace")
+        if trace is not None:
+            trace["stage"] = "rerank"
+        raise RuntimeError("reranker timeout")
+
+    monkeypatch.setattr(mcp_module.CODE_RAG, "query_ranked", boom)
+
+    # 直接呼叫工具函式時例外照樣往外傳(transport 那層才轉成 error result);
+    # 紀錄要在它傳出去**之前**寫好。
+    with pytest.raises(RuntimeError, match="reranker timeout"):
+        mcp_module.code_rag_search("entry helper")
+
+    assert recorded, "失敗也要留一筆"
+    failure = recorded[-1]
+    assert failure["extra_meta"]["failed"] is True
+    assert failure["extra_meta"]["error_type"] == "RuntimeError"
+    assert "reranker timeout" in failure["extra_meta"]["error"]
+    assert failure["trace"]["stage"] == "rerank", "走到哪一步要保留"
+
+
+@pytest.mark.smoke
+def test_query_knowledge_records_a_failure_sample_with_the_partial_trace(mcp_module, monkeypatch):
+    """審核 BLOCKER 3(KB 端):KB.query() 半途炸掉(例如 reranker 不可用)時,
+    要把 KB 手上那份走到一半的 trace 一起記下來。"""
+    recorded = []
+    monkeypatch.setattr(mcp_module.data_flywheel, "collect_enabled", lambda: True)
+    monkeypatch.setattr(
+        mcp_module, "_record_kb_interaction", lambda **kwargs: recorded.append(kwargs)
+    )
+    monkeypatch.setattr(mcp_module, "_ensure_kb_fresh", lambda: None)
+    monkeypatch.setattr(mcp_module.KB, "loaded", True)
+    partial = {"schema": 1, "stage": "gate", "candidates": [{"id": "x"}]}
+
+    def boom(*_args, **_kwargs):
+        mcp_module.KB.last_trace = partial
+        raise RuntimeError("RAG reranker unavailable")
+
+    monkeypatch.setattr(mcp_module.KB, "query", boom)
+
+    with pytest.raises(RuntimeError, match="reranker unavailable"):
+        mcp_module.query_knowledge("哪裡設定 reset 值")
+
+    failure = recorded[-1]
+    assert failure["mode"] == "mcp_query_knowledge"
+    assert failure["extra_meta"]["failed"] is True
+    assert failure["extra_meta"]["error_type"] == "RuntimeError"
+    assert failure["trace"] is partial
 
 
 def test_unknown_mode_is_rejected(mcp_module):

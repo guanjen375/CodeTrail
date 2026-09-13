@@ -650,7 +650,8 @@ registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf`
 `query_knowledge` / `query_knowledge_strict` / `code_rag_search` 每一次的問答都 append 到
 `~/.local/state/codetrail/data/<root 雜湊>/interactions.jsonl`(目錄 0700、檔 0600,
 **絕不落進被分析的 repo**,也不出這台機器)。每一筆都帶完整的檢索路徑:候選、各階段分數、
-gate / rerank / MMR 決策、最終 REF 與當時生效的設定,`data_flywheel.py trace` 可以攤開來看。
+gate / rerank / MMR 決策、最終 REF 與當時生效的設定,`data_flywheel.py trace` 可以攤開來看;
+同目錄的 `snapshots/` 留著每一代 KB 與被引用原始檔的內容,重灌之後舊紀錄仍對得回原文。
 要撈檔案就去那個目錄,`python3 <CODETRAIL_REPO>/data_flywheel.py where --root <專案>`
 會印出確切位置。
 唯一不寫的是 readonly 評測 session(canary / eval / replay)。舊版的 `collect_data` 鍵

@@ -212,6 +212,44 @@ class RankedCandidate:
     score_source: str  # "rerank" | "fusion"
 
 
+# ============================================================
+# 檢索路徑(trace):query_ranked(trace=dict) 會把整個候選池(含落選者)、各通道
+# 分數(embedding / lexical / 融合 / rerank)、門檻與 reranker 設定填進呼叫端給的
+# dict,供 data flywheel 記錄。不帶程式碼文字:路徑 + 行號就能回 repo 取證據,
+# 快照另由 data_flywheel 依 trace["files"] 存。
+# ============================================================
+#: 候選池記到 combined 排序的前幾名。整個 index 可能上千個 symbol,全記沒有意義;
+#: 200 已遠超 rerank pool 與 top_k,「正解落在哪一段」一定看得到。
+TRACE_MAX_POOL = 200
+#: 一筆紀錄最多列幾個檔給快照(最終結果 + reranker 評過分的)。
+TRACE_MAX_FILES = 40
+
+
+def _trace_key(item: dict) -> tuple:
+    return (item.get("path"), item.get("line"), item.get("symbol", ""))
+
+
+def _finish_code_trace(trace: dict, ranked: list) -> None:
+    """把最終結果標回候選池、列出最終清單與要快照的檔案。"""
+    final_keys = {_trace_key(rc.item) for rc in ranked}
+    for row in trace.get("pool", []):
+        if (row["path"], row["line"], row["symbol"]) in final_keys:
+            row["final"] = True
+    trace["final"] = [
+        {"path": rc.item.get("path"), "line": rc.item.get("line"),
+         "symbol": rc.item.get("symbol", ""), "final": round(float(rc.final_score), 4),
+         "score_source": rc.score_source}
+        for rc in ranked
+    ]
+    files: list = []
+    for row in list(trace["final"]) + [r for r in trace.get("pool", []) if r.get("rerank") is not None]:
+        path = row.get("path")
+        if path and path not in files:
+            files.append(path)
+    trace["files"] = files[:TRACE_MAX_FILES]
+    trace["stage"] = "done"
+
+
 # Canonical 語意欄位順序(施工規格 §6 P3A-1)。**單一來源**:dense embed text、
 # lexical scorer、reranker passage 三個消費者都從這裡投影出自己的視角。
 #
@@ -1381,7 +1419,8 @@ class CodeRAG:
             "Check the dedicated reranker llama-server (deployment.json services.reranker)."
         )
 
-    def _rerank_code_candidates(self, question: str, candidates: list, top_k: int) -> list[RankedCandidate]:
+    def _rerank_code_candidates(self, question: str, candidates: list, top_k: int,
+                                *, trace: dict | None = None) -> list[RankedCandidate]:
         """使用 reranker 模型對程式碼候選進行二次排序
 
         Args:
@@ -1395,18 +1434,29 @@ class CodeRAG:
             score_source="rerank"、final_score=rerank_score(0.0 是有效低分);
             否則 "fusion"、rerank_score=None。
         """
+        def _skip(reason: str) -> None:
+            if trace is not None:
+                trace["rerank"] = {"applied": False, "input_count": len(candidates), "reason": reason}
+
         if not candidates:
+            _skip("no_candidates")
             return []
 
         if not USE_RERANKER or len(candidates) <= top_k:
+            _skip("reranker_disabled" if not USE_RERANKER else "candidates_within_top_k")
             return self._fusion_candidates(candidates, top_k)
 
         # 條件觸發：判斷是否真的需要 rerank
         if not self._should_rerank(candidates, top_k):
+            _skip("not_needed")
             return self._fusion_candidates(candidates, top_k)
 
         # 減少 rerank 的 candidates 數量
         rerank_count = max(top_k, config.CODE_RAG_RERANK_CANDIDATE_POOL)
+        if trace is not None:
+            trace["stage"] = "rerank"
+            trace["rerank"] = {"applied": True, "input_count": min(len(candidates), rerank_count),
+                               "reason": None}
 
         if self._check_reranker_available():
             try:
@@ -1448,6 +1498,14 @@ class CodeRAG:
                     )
                     for i, score in enumerate(scores)
                 ]
+                if trace is not None:
+                    # 評過分的每一個都標回候選池(含之後被 top_k 切掉的)。
+                    by_key = {(row["path"], row["line"], row["symbol"]): row
+                              for row in trace.get("pool", [])}
+                    for rc in ranked:
+                        row = by_key.get(_trace_key(rc.item))
+                        if row is not None:
+                            row["rerank"] = round(float(rc.rerank_score), 4)
                 ranked.sort(reverse=True, key=lambda rc: rc.final_score)
                 return ranked[:top_k]
 
@@ -1483,12 +1541,17 @@ class CodeRAG:
         return results
 
     def query_ranked(self, question: str, top_k: int = CODE_RAG_TOP_K,
-                     is_bug_fix: bool = False) -> list[RankedCandidate]:
+                     is_bug_fix: bool = False, *, trace: dict | None = None) -> list[RankedCandidate]:
         """query 的完整結果(RankedCandidate;§8 evidence 模式的資料來源)。
 
         Lazy build：第一次 query 時才建立索引，避免不需要 CodeRAG 時浪費時間
+
+        `trace`:給一個 dict 就把檢索路徑填進去(候選池、各通道分數、門檻、reranker
+        設定與結果;見模組頂端的 TRACE_* 說明)。半途拋例外時已填的階段仍在呼叫端手上。
         """
         _require_numpy()
+        if trace is not None:
+            trace.update({"kind": "code_rag", "stage": "index", "pool": [], "final": [], "files": []})
         # 已載入的 symbols（含零 symbol 檔案）也不能繞過主要 parser 准入。
         required_paths = set(self._file_cache) | set(self._indexed_file_hashes or {})
         required_paths.update(item.get("path", "") for item in self.index)
@@ -1618,9 +1681,41 @@ class CodeRAG:
             code_tokens_lower=code_tokens_lower,
         )
 
+        if trace is not None:
+            selected_ids = {id(item) for _c, _e, _k, item in candidates_for_rerank}
+            trace["stage"] = "selected"
+            trace["settings"] = {
+                "embedding_model": EMBEDDING_MODEL,
+                "reranker_model": RERANKER_MODEL,
+                "use_reranker": bool(USE_RERANKER),
+                "reranker_always_on": bool(RERANKER_ALWAYS_ON),
+                "threshold": float(threshold),
+                "top_k": int(top_k),
+                "rerank_pool": int(config.CODE_RAG_RERANK_CANDIDATE_POOL),
+                "index_size": len(self.index),
+                "lazy_embed": bool(self._lazy_embed),
+                "is_short_query": bool(is_short_query),
+                "code_tokens": [str(token) for token in code_tokens][:32],
+            }
+            trace["pool_total"] = len(scores)
+            trace["selected_count"] = len(candidates_for_rerank)
+            trace["pool"] = [
+                {
+                    "path": item.get("path"), "line": item.get("line"),
+                    "symbol": item.get("symbol", ""), "type": item.get("type", ""),
+                    "emb": round(float(emb_score), 4), "lexical": round(float(kw_score), 4),
+                    "combined": round(float(combined), 4),
+                    "selected": id(item) in selected_ids, "rerank": None, "final": False,
+                }
+                for combined, emb_score, kw_score, item in scores[:TRACE_MAX_POOL]
+            ]
+
         # 使用 reranker 二次排序（條件觸發)。分數是 query-local 的
         # RankedCandidate(§5-1),絕不寫回 self.index 的持久 item。
-        return self._rerank_code_candidates(question, candidates_for_rerank, top_k)
+        ranked = self._rerank_code_candidates(question, candidates_for_rerank, top_k, trace=trace)
+        if trace is not None:
+            _finish_code_trace(trace, ranked)
+        return ranked
 
     def get_candidates_prompt(self, question: str) -> str:
         """生成給 Agent 的候選提示"""

@@ -499,10 +499,22 @@ symbol 掃描。`.cfg` / `.json` / `.sh` / `.mk` 這些設定檔**仍在** symbo
 gate 分 / BM25）、門檻與 margin 決策、通過 gate 的清單、reranker 有沒有真的跑與各分數、
 MMR 選了誰、污染控制、最終 REF（成員 id、分數、截斷、前 200 字）與信心結論；`stage` 記到
 哪一步就是在哪一步結束。同一筆也記這次生效的檢索設定與 KB 的 `store_generation`，所以改了
-RAG 之後可以拿舊紀錄的查詢重跑、逐階段比對。`code_rag_search` 的紀錄則記排序結果的
-路徑 / 行 / 符號與 combined / rerank / final 分數，不帶程式碼文字。
+RAG 之後可以拿舊紀錄的查詢重跑、逐階段比對。候選**不設上限**，reranker 評過分的每一個都
+留（`rerank.scores`），提早結束的紀錄帶 `stopped` 原因與 strict 排除的完整清單。
+`code_rag_search` 的紀錄則記整個候選池（`pool`，combined 排序前 200、含落選者）的
+embedding / lexical / 融合 / rerank 分數與過門檻、最終旗標，以及 embedding / reranker 設定，
+不帶程式碼文字。檢索途中炸掉（reranker timeout 之類）也記一筆：`metadata.failed=true`、
+`error_type`、`error`，trace 停在炸掉的那一步。
 MCP 端的 `question` 是模型送進工具的查詢字串、`answer` 只是 REF 標頭（MCP 沒有回合邊界，
 看不到使用者原話與最後的回答）；要對回整段對話，用 session 檔的時間戳與工具參數對上。
+
+同一個目錄底下的 `snapshots/`：每個 KB generation 存一份 `kb-<store_generation>.json`
+（那一代 knowledge.json 的完整內容），被引用的原始檔存成 `blob-<sha256>`，各只存一次，
+紀錄裡 `trace.kb.snapshot` / `trace.blobs` 指向它們——重灌 KB 或改了程式碼之後，舊紀錄的
+chunk id 與路徑 / 行號仍對得回當時的文字。現用檔超過 32 MiB 會先歸檔成
+`interactions-<UTC 時間>.jsonl` 再寫（一筆不丟；`stats` / `rate` / `trace` 只看現用檔，
+舊檔用 `--file` 指定）。收集落點若在被分析的 repo 之內（`XDG_STATE_HOME` 指進去，
+含經 symlink），收集器與 session store 一樣拒絕啟動。
 
 與 session 檔同一套 root 雜湊與 `client_paths` 防線：目錄 0700、檔 0600、拒 symlink
 與 hard link、dir-fd append。**絕不落進被分析的 repo** —— 以前預設是相對路徑

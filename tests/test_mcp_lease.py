@@ -857,7 +857,7 @@ def test_sigterm_still_runs_the_shutdown_cleanup(tmp_path):
     finally:
         _harness.terminate_proc(proc)
 
-    lease_dir = tmp_path / "proj" / ".state" / "codetrail" / "mcp"
+    lease_dir = _harness.state_home_for(root) / "codetrail" / "mcp"
     leases = list(lease_dir.glob("*.json")) if lease_dir.is_dir() else []
     assert leases, f"沒有寫出 lease({lease_dir})"
     record = json.loads(leases[0].read_text(encoding="utf-8"))

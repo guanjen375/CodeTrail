@@ -380,7 +380,8 @@ def test_a_live_roundtrip_exposes_the_real_catalog(tmp_path):
             "--skip-aux-preflight",
         ],
         env={
-            "XDG_STATE_HOME": str(tmp_path / ".state"),
+            # 放在 root 旁邊:data flywheel 拒絕把落點放進被分析的專案(root 就是 tmp_path)。
+            "XDG_STATE_HOME": str(tmp_path.parent / f"{tmp_path.name}.state"),
             "PYTHONIOENCODING": "utf-8",
         },
         start_timeout=120.0,

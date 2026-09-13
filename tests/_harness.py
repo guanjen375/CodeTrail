@@ -80,6 +80,15 @@ def bash_compatible_path(bash: str, path: Path) -> str:
 MCP_READY_MARKER = "server ready, listening on stdio"
 
 
+def state_home_for(tmp_root: Path) -> Path:
+    """spawn_mcp 給子行程的 `XDG_STATE_HOME`:tmp root 旁邊的 `<name>.state`。
+
+    測試要看 lease / 收集檔落在哪裡就用這個算,不要自己拼 `root / ".state"`——
+    那個位置在 root **底下**,收集器會拒絕。
+    """
+    return tmp_root.parent / f"{tmp_root.name}.state"
+
+
 def spawn_mcp(
     tmp_root: Path,
     env_overrides: dict[str, str] | None = None,
@@ -101,7 +110,9 @@ def spawn_mcp(
     # 不把 state 目錄導到 tmp 的話,每一條 live-server 測試都會在使用者真正的
     # `~/.local/state/codetrail/mcp/` 留下檔案;被 kill 的那幾個還會留下
     # `exited: null` 的孤兒 lease,讓 doctor 之後報出根本不存在的 instance。
-    env["XDG_STATE_HOME"] = str(tmp_root / ".state")
+    # state 放在 root 的**旁邊**、不放在 root 底下:data flywheel 與 session store
+    # 都拒絕把落點放進被分析的專案,放在 root 底下的 server 起不來。
+    env["XDG_STATE_HOME"] = str(state_home_for(tmp_root))
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONPATH"] = os.pathsep.join(
         [p for p in sys.path if p] + [env.get("PYTHONPATH", "")]

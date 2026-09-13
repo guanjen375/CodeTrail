@@ -418,9 +418,9 @@ class Candidate:
 # content(最終 REF 只帶前 TRACE_SNIPPET_CHARS 字);它是觀測,不參與任何決策。
 # ============================================================
 TRACE_SCHEMA = 1
-#: 每筆 trace 的候選上限。section 展開會把 membership 拉得很長;超過就截並標
-#: candidates_truncated,一筆紀錄不能因為一個長章節長成幾十 KB。
-TRACE_MAX_CANDIDATES = 30
+#: 候選**不設上限**:hybrid 召回的每一個(含 section 展開的成員)都記身分與分數。
+#: 截掉的候選事後補不回「它是沒被召回、沒過門檻、還是被 reranker 淘汰」;檔案大小
+#: 由 data_flywheel 的歸檔(ROTATE_BYTES)處理,不在這裡犧牲資料。
 TRACE_SNIPPET_CHARS = 200
 
 
@@ -539,6 +539,12 @@ class KnowledgeBase:
         self._reranker_available = None
         # _hybrid_search 最近一次的 query expansion 結果(trace 用);query() 每次先清成 None。
         self._last_expansion = None
+        # _rerank_with_model 最近一次**全部**評過分的 (score, chunk id);回傳值只留 top_k,
+        # 但 trace 要每一個(被淘汰的才是要分析的)。query() 每次先清成 None。
+        self._last_rerank_scores = None
+        # 最近一次 query() 的 trace(同一個 dict 物件,查詢中途逐步填)。半途拋例外時
+        # 局部變數跟著消失,MCP 端從這裡拿走到一半的路徑記失敗樣本。
+        self.last_trace = None
         # Numpy 加速用的預計算陣列
         self._embeddings = None  # shape: (n_chunks, dim)
         self._embeddings_normalized = False
@@ -2375,6 +2381,7 @@ English:"""
         依明確設定或候選條件跳過 cross-encoder 的路徑 score 是 None，
         MMR 會退回原本的 embedding 相關度。
         """
+        self._last_rerank_scores = None
         if not candidates:
             return []
 
@@ -2427,6 +2434,8 @@ English:"""
                     raise RuntimeError("reranker scores must be finite numbers")
                 scored.extend((score, item.chunk) for score, item in zip(values, items))
             scored.sort(reverse=True, key=lambda x: x[0])
+            # 全部評過分的都留給 trace;回傳值照舊只取 top_k。
+            self._last_rerank_scores = [(score, chunk.get("id")) for score, chunk in scored]
             return scored[:top_k]
 
         except Exception as exc:
@@ -3173,6 +3182,7 @@ English:"""
         回傳: (model_output, display_output, metadata)
         metadata 包含: has_ref, top_score, ref_count, is_high_risk
         """
+        self.last_trace = None
         empty_metadata = {"has_ref": False, "top_score": 0.0, "ref_count": 0,
                           "is_high_risk": False, "excluded_figures": [],
                           "excluded_text": []}
@@ -3198,8 +3208,10 @@ English:"""
             "settings": self._retrieval_settings(),
             "expansion": None,
             "candidates": [],
+            "stopped": None,
         }
         empty_metadata["trace"] = trace
+        self.last_trace = trace
 
         if source:
             metadata_filter = dict(metadata_filter or {})
@@ -3211,6 +3223,7 @@ English:"""
         trace["stage"] = "hybrid"
         trace["expansion"] = self._last_expansion
         if not candidates:
+            trace["stopped"] = "no_candidates"
             return "", "", empty_metadata
 
         # figure 層級的信任聚合要在**加權之前**建好：來源權重、污染控制排序、
@@ -3219,9 +3232,8 @@ English:"""
 
         # P0 改進：應用來源權重（spec/manual/api 優先）
         candidates = self._apply_source_weighting(candidates, trust_map)
-        trace["candidates"] = [_trace_candidate(c) for c in candidates[:TRACE_MAX_CANDIDATES]]
+        trace["candidates"] = [_trace_candidate(c) for c in candidates]
         trace["candidate_count"] = len(candidates)
-        trace["candidates_truncated"] = len(candidates) > TRACE_MAX_CANDIDATES
 
         # 動態門檻：短問題用較低門檻，嚴格模式用較高門檻
         query_tokens = self._estimate_tokens(question)
@@ -3238,6 +3250,15 @@ English:"""
         # 判定用 figure 層級的有效狀態（同一張圖的任一 part 待覆核 → 整張都不可信）。
         excluded_figures: list = []
         excluded_text: list = empty_metadata["excluded_text"]
+        # 排除清單直接掛進 trace(同一個 list 物件:後面第二道 gate 補進來的也會在);
+        # 每一條提早結束的 return 都經 _stop() 記原因,不然紀錄看起來像「停在 hybrid、
+        # 泛用拒答」,分不出「召回品質差」和「安全驗證刻意排除」。
+        trace["strict_excluded"] = {"figures": excluded_figures, "text": excluded_text}
+
+        def _stop(reason: str):
+            trace["stopped"] = reason
+            return self._untrusted_only_result(empty_metadata, excluded_figures)
+
         if is_strict_mode:
             kept = []
             for candidate in candidates:
@@ -3261,10 +3282,11 @@ English:"""
                     )
             candidates = kept
             empty_metadata["excluded_figures"] = excluded_figures
+            trace["stage"] = "strict"
             if not candidates:
                 # 全部被排除：後面的 _decision_order(candidates)[0] 會直接 IndexError，
                 # 這裡必須立刻返回（並且要把待覆核清單交出去）。
-                return self._untrusted_only_result(empty_metadata, excluded_figures)
+                return _stop("strict_all_excluded")
 
         # 門檻一律吃 gate（content-only）分數。排序可以被生成脈絡影響，
         # 「夠不夠格當證據」不行——那正是規格 §2 說的分數面循環 grounding：
@@ -3293,7 +3315,6 @@ English:"""
             )
         ]
         trace["stage"] = "gate"
-        trace["strict_excluded"] = {"figures": len(excluded_figures), "text": len(excluded_text)}
         trace["decision"] = {
             "base_threshold": _r4(base_threshold),
             "min_gate_score": _r4(min_gate_score),
@@ -3307,7 +3328,7 @@ English:"""
             entry["passed"] = entry["id"] in passed_ids
         trace["gate_passed_count"] = len(filtered)
         if not filtered:
-            return self._untrusted_only_result(empty_metadata, excluded_figures)
+            return _stop("gate_none_passed")
 
         # 動態 top_k：高相關度時少給，低相關度時多給（同樣看 gate）
         top_score = candidates[0].rrf_score  # RRF score，僅供 metadata 記錄
@@ -3323,6 +3344,8 @@ English:"""
             rerank_output_k = min(
                 len(filtered), max(effective_top_k * 3, RERANKER_TOP_N * 2)
             )
+        self._last_rerank_scores = None
+        trace["stage"] = "rerank"
         reranked = self._rerank_with_model(
             question,
             filtered,
@@ -3330,16 +3353,23 @@ English:"""
             is_strict_mode=is_strict_mode,
         )
         reranked_chunks = [chunk for _score, chunk in reranked]
-        trace["stage"] = "rerank"
+        output = [{"id": chunk.get("id"), "score": _r4(score)} for score, chunk in reranked]
+        # scores = reranker **評過分的每一個**(含被 output_k 切掉的);被 monkeypatch 的
+        # reranker 沒有那份清單時退回 output(至少不比以前少)。
+        all_scores = (
+            [{"id": cid, "score": _r4(score)} for score, cid in self._last_rerank_scores]
+            if self._last_rerank_scores is not None else output
+        )
         trace["rerank"] = {
             "applied": any(score is not None for score, _chunk in reranked),
             "input_count": len(filtered),
             "output_k": rerank_output_k,
             "effective_top_k": effective_top_k,
-            "output": [{"id": chunk.get("id"), "score": _r4(score)} for score, chunk in reranked],
+            "scores": all_scores,
+            "output": output,
         }
         if not reranked_chunks:
-            return self._untrusted_only_result(empty_metadata, excluded_figures)
+            return _stop("rerank_empty")
 
         if USE_MMR:
             q_emb = self._get_embedding(question)
@@ -3355,7 +3385,7 @@ English:"""
                         "selected": [chunk.get("id") for chunk in top_chunks]}
 
         if not top_chunks:
-            return self._untrusted_only_result(empty_metadata, excluded_figures)
+            return _stop("mmr_empty")
 
         # 污染風險控制有 min_score 門檻 → 決策 → 讀 gate 矩陣。
         # 以 chunk_idx 讀矩陣列，不把 gate 向量掛回 chunk（那是 n×dim 的 float list）。
@@ -3420,7 +3450,7 @@ English:"""
             merged_chunks = kept_chunks
             if not merged_chunks and (excluded_figures or excluded_text):
                 empty_metadata["excluded_figures"] = excluded_figures
-                return self._untrusted_only_result(empty_metadata, excluded_figures)
+                return _stop("strict_all_excluded_after_merge")
 
         # REF 預算下每個 structured chunk 實際顯示得到哪裡：先算，因為「連一列完整資料
         # 都放不進來」的 chunk 在 strict 不能算證據（模型看不到任何數值，卻會拿到一個
@@ -3459,7 +3489,7 @@ English:"""
             merged_chunks = kept_chunks
             if not merged_chunks and excluded_figures:
                 empty_metadata["excluded_figures"] = excluded_figures
-                return self._untrusted_only_result(empty_metadata, excluded_figures)
+                return _stop("strict_all_excluded_after_merge")
 
         # spec 優先提示只算「有效可信」的 chunk：待覆核的圖片 chunk 帶的是文件級
         # doc_type，讓它觸發「spec 類型的 REF 優先級較高」等於把未驗證內容排到前面。

@@ -1079,6 +1079,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         (
             "test_refuse_answer_rejects_explicitly_missing_identifier",
             "test_query_metadata_carries_the_retrieval_path_aligned_with_refs",
+            "test_query_trace_keeps_every_candidate_and_every_reranker_score",
+            "test_query_exposes_the_partial_trace_when_retrieval_raises",
+            "test_strict_all_excluded_records_the_stop_reason_and_the_excluded_figures",
         ),
     ),
     "test_figure_review.py": (
@@ -1147,6 +1150,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_the_collected_data_never_lands_in_the_analysed_repo",
             "test_the_collected_data_file_is_never_read_or_rewritten_through_a_symlink",
             "test_data_collection_is_always_on_and_only_readonly_turns_it_off",
+            "test_the_collector_refuses_a_state_home_inside_the_analysed_repo",
+            "test_the_collector_snapshots_the_kb_generation_and_referenced_files_once",
+            "test_the_collected_file_rotates_before_it_outgrows_the_reader",
             "test_session_eval_accepts_bare_gguf_and_legacy_models",
             "test_routing_probes_accept_the_same_model_forms_as_aicode",
             "test_the_routing_client_attempt_sends_the_requested_model",

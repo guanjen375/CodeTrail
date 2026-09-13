@@ -43,28 +43,52 @@ metadata.trace（知識庫查詢；由 `knowledge.KnowledgeBase.query()` 產生�
   settings     這次生效的檢索設定（門檻、reranker、MMR、BM25、expansion…）
   expansion    有沒有觸發 query expansion、擴寫出哪些查詢（None = 未知）
   candidates   hybrid 候選（chunk id / 來源 / 頁 / 章節 / rrf / retrieval / gate / bm25）
+  stopped      提早結束的原因：no_candidates / strict_all_excluded / gate_none_passed /
+               rerank_empty / mmr_empty / strict_all_excluded_after_merge；正常走完是 null
+  strict_excluded  strict 排除的圖與 OCR 文字（完整清單，含 status / reasons）
   decision     門檻、min_gate_score、top gate 分數與 margin 風險；candidates[].passed 標
                每個候選有沒有通過 gate，gate_passed_count 是通過的總數
-  rerank       有沒有真的跑 cross-encoder、輸入幾個、每個的分數
+  rerank       有沒有真的跑 cross-encoder、輸入幾個；scores = 評過分的**每一個**，
+               output = 取前 output_k 的那份
   mmr          MMR 選了誰；pollution：污染控制前的 gate 分數與選後結果
   final        最終 REF：成員 id、來源/頁/章節、gate/retrieval 分數、截斷、前 200 字
   outcome      信心標籤、最終用的 top gate / retrieval 分數、REF 數
-metadata.trace（code_rag_search）：ranked = 路徑/行/符號 + combined/rerank/final 分數。
+  kb.snapshot  那一代 knowledge.json 的快照檔名（snapshots/ 底下，只存一次）
+metadata.trace（code_rag_search；kind=code_rag）：
+  settings     embedding / reranker 模型、門檻、rerank pool、index 大小、code tokens
+  pool         combined 排序的候選池（前 200；含落選者）：path/line/symbol/type、
+               emb / lexical / combined / rerank 分數、selected（過門檻）、final（最終）
+  pool_total / selected_count / rerank{applied, input_count, reason} / final / files
+  blobs        被引用原始檔的快照檔名（snapshots/blob-<sha256>，只存一次）
+服務失敗也是一筆：metadata.failed=true、error_type、error，trace 停在炸掉的那一步。
 攤開看：python3 data_flywheel.py trace --file <目錄>/interactions.jsonl --last 5
 """
 
+import hashlib
 import os
 import process_env
 import json
+import stat
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, asdict, field
 from typing import Optional
 
 # 資料收集永久開啟;只有 readonly session 經 `config.COLLECT_DATA` 關掉
 # (見 `client_config.apply_to_config(readonly=True)`)。
 DATA_FILENAME = 'interactions.jsonl'
+#: 現用檔超過這個大小就先歸檔成 `interactions-<UTC 時間>.jsonl` 再 append。讀取端
+#: (`load_interactions`)有 64 MiB 上限,不歸檔的話檔案長過去之後 `trace --last 1`
+#: 也只會看到「沒有紀錄」;歸檔一筆都不丟,舊檔用 `--file` 讀。
+ROTATE_BYTES = 32 * 1024 * 1024
+#: 快照目錄(收集目錄底下):`kb-<store_generation>.json` 是那一代 knowledge.json 的
+#: 完整內容,`blob-<sha256>` 是被引用的原始檔;各只存一次。沒有它,重灌 KB 或改了
+#: 程式碼之後,舊紀錄裡的 chunk id 與路徑/行號就對不回當時的文字。
+SNAPSHOT_DIRNAME = 'snapshots'
+KB_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
+BLOB_MAX_BYTES = 2 * 1024 * 1024
+MAX_BLOBS_PER_RECORD = 40
 
 
 def collect_enabled() -> bool:
@@ -99,6 +123,11 @@ class DataCollectError(RuntimeError):
 
 def _collect_error(message: str) -> DataCollectError:
     return DataCollectError(message)
+
+
+def _safe_name(value: str) -> str:
+    """快照檔名只收 [A-Za-z0-9._-],其餘換成 _(store_generation 是 hex,正常不會動到)。"""
+    return "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in value)[:80] or "unknown"
 
 
 @dataclass
@@ -159,6 +188,16 @@ def get_reproducibility_info(folder: str = None) -> dict:
             )
             if result.returncode == 0:
                 info['repo_commit'] = result.stdout.strip()[:12]  # 只取前 12 字元
+                # 有未提交修改時,紀錄裡的路徑/行號對到的是工作樹、不是那個 commit。
+                status = process_env.run(
+                    ['git', 'status', '--porcelain', '--untracked-files=no'],
+                    cwd=folder,
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if status.returncode == 0:
+                    info['repo_dirty'] = bool(status.stdout.strip())
         except Exception:
             pass
 
@@ -175,8 +214,29 @@ class DataCollector:
         的寫法會把 NDA 問答寫到那個路徑的**父目錄**去。owner-only 的 anchor 檢查
         會擋下來(它只准寫在 state home 底下),但那是最後一道防線,不該靠它。
         """
-        self.data_file = Path(data_file) if data_file else data_dir(root) / DATA_FILENAME
+        self.root = (Path(root).expanduser() if root else Path(os.getcwd())).resolve()
+        self.data_file = Path(data_file) if data_file else data_dir(self.root) / DATA_FILENAME
         self.enabled = collect_enabled()
+        self._snapshot_cache: dict = {}
+        # 落點不得在被分析的 repo 之內。SessionStore 早就擋這件事,收集器以前沒擋:
+        # `XDG_STATE_HOME=/work/fw/.state` 就會在 repo 裡長出一份含查詢與文件片段的
+        # JSONL,0600 擋不住擁有者自己 `git add .`。字面路徑與 realpath 都看
+        # (`XDG_STATE_HOME=/tmp/link/state` 而 `/tmp/link` 指進 repo,字面上看不出來),
+        # 建構時判一次、之後每一次 append 再判一次(guard)。
+        # 收集關著(readonly session:canary / eval / replay)就不判:它一個 byte 都不寫,
+        # 拒絕啟動只會讓評測在奇怪的目錄佈局下無故失敗。
+        if self.enabled:
+            self._refuse_inside_root(self.data_file.parent)
+
+    def _refuse_inside_root(self, directory) -> None:
+        directory = Path(directory)
+        resolved = Path(os.path.realpath(str(directory)))
+        for candidate in (directory, resolved):
+            if candidate == self.root or self.root in candidate.parents:
+                raise DataCollectError(
+                    f"拒絕把收集檔放進被分析的專案: {candidate} 在 {self.root} 之內。"
+                    "請把 XDG_STATE_HOME 指到專案外面。"
+                )
 
     def _classify_question(self, question: str) -> str:
         """分類問題類型"""
@@ -235,6 +295,23 @@ class DataCollector:
         if files_read:
             repro_info['files_read'] = files_read
 
+        # 走 owner-only 防線(dir-fd 錨定、O_NOFOLLOW、fstat 驗普通檔與 nlink==1、
+        # 0600、目錄 0700)。這一行逐字含 NDA 問答、引用片段與檔案路徑,普通的
+        # `open(..., 'a')` 會跟著 symlink 走、也不管權限。
+        import client_paths
+        import client_store
+
+        directory = self.data_file.parent
+        anchor = client_store.state_home()
+
+        # 快照要在序列化**之前**做:它把快照檔名寫回 trace(kb.snapshot / blobs)。
+        trace = metadata.get("trace") if isinstance(metadata, dict) else None
+        if isinstance(trace, dict):
+            try:
+                self._snapshot_for_trace(trace, directory, anchor)
+            except Exception as e:
+                print(f"[WARN] 檢索快照失敗: {e}")
+
         interaction = Interaction(
             timestamp=datetime.now().isoformat(),
             question=question,
@@ -246,24 +323,178 @@ class DataCollector:
             reproducibility=repro_info
         )
 
-        # 走 owner-only 防線(dir-fd 錨定、O_NOFOLLOW、fstat 驗普通檔與 nlink==1、
-        # 0600、目錄 0700)。這一行逐字含 NDA 問答、引用片段與檔案路徑,普通的
-        # `open(..., 'a')` 會跟著 symlink 走、也不管權限。
-        import client_paths
-        import client_store
-
-        directory = self.data_file.parent
         payload = (json.dumps(asdict(interaction), ensure_ascii=False) + '\n').encode('utf-8')
+        try:
+            self._rotate_if_needed(directory, anchor)
+        except Exception as e:
+            print(f"[WARN] 收集檔歸檔失敗: {e}")
         try:
             client_paths.append_private_line(
                 directory,
                 self.data_file.name,
                 payload,
                 _collect_error,
-                anchor=client_store.state_home(),
+                anchor=anchor,
+                guard=self._refuse_inside_root,
             )
         except Exception as e:
             print(f"[WARN] 資料收集失敗: {e}")
+
+    # ---- 歸檔與快照 ------------------------------------------------------
+    def _rotate_if_needed(self, directory: Path, anchor: Path) -> None:
+        """現用檔超過 ROTATE_BYTES 就改名歸檔(同目錄、同 dir fd、資料一筆不丟)。"""
+        import client_paths
+
+        dir_fd = client_paths.open_private_dir(
+            directory, _collect_error, anchor=anchor, guard=self._refuse_inside_root
+        )
+        try:
+            try:
+                info = os.stat(self.data_file.name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            if not stat.S_ISREG(info.st_mode) or info.st_size < ROTATE_BYTES:
+                return
+            base, ext = os.path.splitext(self.data_file.name)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            archived = f"{base}-{stamp}{ext}"
+            serial = 1
+            while True:
+                try:
+                    os.stat(archived, dir_fd=dir_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    break
+                serial += 1
+                archived = f"{base}-{stamp}-{serial}{ext}"
+            os.rename(self.data_file.name, archived, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    @staticmethod
+    def _exists_private(directory: Path, name: str, anchor: Path) -> bool:
+        import client_paths
+
+        dir_fd = client_paths.open_private_dir(directory, _collect_error, anchor=anchor)
+        try:
+            try:
+                os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                return True
+            except FileNotFoundError:
+                return False
+        finally:
+            os.close(dir_fd)
+
+    @staticmethod
+    def _write_once(directory: Path, name: str, payload: bytes, anchor: Path) -> None:
+        import client_paths
+
+        if DataCollector._exists_private(directory, name, anchor):
+            return
+        client_paths.replace_private_file(directory, name, payload, _collect_error, anchor=anchor)
+
+    @staticmethod
+    def _read_bounded(path: Path, max_bytes: int, *, nofollow: bool) -> bytes | None:
+        """讀一份普通檔(上限 max_bytes;超過或不是普通檔就回 None)。"""
+        flags = os.O_RDONLY | (getattr(os, "O_NOFOLLOW", 0) if nofollow else 0)
+        try:
+            fd = os.open(str(path), flags)
+        except OSError:
+            return None
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
+                return None
+            chunks = []
+            while True:
+                block = os.read(fd, 1024 * 1024)
+                if not block:
+                    break
+                chunks.append(block)
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+
+    def _snapshot_for_trace(self, trace: dict, directory: Path, anchor: Path) -> None:
+        """依 trace 存 KB 那一代的完整內容與被引用的原始檔(各只存一次),檔名寫回 trace。"""
+        snap_dir = directory / SNAPSHOT_DIRNAME
+        kb = trace.get("kb")
+        if isinstance(kb, dict) and kb.get("path"):
+            try:
+                name = self._snapshot_kb(kb, self.root / str(kb["path"]), snap_dir, anchor)
+            except Exception as e:  # noqa: BLE001 - 快照失敗要寫在紀錄裡,不能吞掉也不能中斷收集
+                kb["snapshot_error"] = f"{type(e).__name__}: {e}"[:200]
+            else:
+                if name:
+                    kb["snapshot"] = name
+        files = trace.get("files")
+        if isinstance(files, list) and files:
+            blobs = {}
+            for rel in files[:MAX_BLOBS_PER_RECORD]:
+                rel = str(rel)
+                try:
+                    blobs[rel] = self._snapshot_blob(rel, snap_dir, anchor)
+                except Exception as e:  # noqa: BLE001
+                    blobs[rel] = f"error:{type(e).__name__}"
+            trace["blobs"] = blobs
+
+    def _snapshot_kb(self, kb: dict, kb_path: Path, snap_dir: Path, anchor: Path) -> str | None:
+        generation = str(kb.get("store_generation") or "")
+        if generation:
+            name = f"kb-{_safe_name(generation)}.json"
+            if self._exists_private(snap_dir, name, anchor):
+                return name
+        try:
+            info = os.stat(kb_path)
+        except OSError:
+            return None
+        cache_key = ("kb", str(kb_path), info.st_mtime_ns, info.st_size)
+        cached = self._snapshot_cache.get(cache_key)
+        if cached and self._exists_private(snap_dir, cached, anchor):
+            return cached
+        data = self._read_bounded(kb_path, KB_SNAPSHOT_MAX_BYTES, nofollow=False)
+        if data is None:
+            return None
+        actual = ""
+        try:
+            head = json.loads(data.decode("utf-8"))
+            actual = str(((head.get("metadata") or {}) if isinstance(head, dict) else {})
+                         .get("store_generation") or "")
+        except Exception:  # noqa: BLE001 - 壞 JSON 也照樣以內容雜湊存下來
+            actual = ""
+        if generation and actual and actual != generation:
+            # 查詢與快照之間 KB 換代了:存的是磁碟上這一代,並標記對不上。
+            kb["snapshot_generation_mismatch"] = True
+        key = actual or generation or hashlib.sha256(data).hexdigest()[:16]
+        name = f"kb-{_safe_name(key)}.json"
+        self._write_once(snap_dir, name, data, anchor)
+        self._snapshot_cache[cache_key] = name
+        return name
+
+    def _snapshot_blob(self, rel: str, snap_dir: Path, anchor: Path) -> str:
+        path = self.root / rel
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError:
+            return "skipped:missing"
+        if resolved != self.root and self.root not in resolved.parents:
+            return "skipped:outside_root"
+        try:
+            info = os.stat(path, follow_symlinks=False)
+        except OSError:
+            return "skipped:missing"
+        if stat.S_ISLNK(info.st_mode):
+            return "skipped:symlink"
+        cache_key = ("blob", rel, info.st_mtime_ns, info.st_size)
+        cached = self._snapshot_cache.get(cache_key)
+        if cached and self._exists_private(snap_dir, cached, anchor):
+            return cached
+        data = self._read_bounded(path, BLOB_MAX_BYTES, nofollow=True)
+        if data is None:
+            return "skipped:too_large"
+        name = "blob-" + hashlib.sha256(data).hexdigest()[:32]
+        self._write_once(snap_dir, name, data, anchor)
+        self._snapshot_cache[cache_key] = name
+        return name
 
     #: 收集檔的讀取上限。它是一行一筆的 append-only JSONL,正常不會很大;
     #: 給一個明確的上限比讓一個被換掉的巨大檔案吃光記憶體好。
@@ -458,16 +689,29 @@ def print_trace(interaction: Interaction, *, max_candidates: int = 8) -> None:
     if not trace:
         print(f"  (這筆沒有 trace)  answer: {interaction.answer[:80]}")
         return
-    if "ranked" in trace:  # code_rag_search
-        print(f"  code_rag mode={trace.get('mode')} top_k={trace.get('top_k')}")
-        for row in trace.get("ranked", [])[:max_candidates]:
-            print(f"    {_fmt(row.get('final'))}  [{row.get('score_source')}] "
-                  f"{row.get('path')}:{row.get('line')} {row.get('symbol')}  "
-                  f"combined={_fmt(row.get('combined'))} rerank={_fmt(row.get('rerank'))}")
+    if meta.get("failed"):
+        print(f"  ✗ 失敗: {meta.get('error_type')}: {meta.get('error')}  (停在 {trace.get('stage')})")
+    if trace.get("kind") == "code_rag" or "pool" in trace:  # code_rag_search
+        rerank = trace.get("rerank") or {}
+        how = "跑了" if rerank.get("applied") else f"沒跑({rerank.get('reason')})"
+        print(f"  code_rag mode={trace.get('mode')} top_k={trace.get('top_k')} stage={trace.get('stage')}  "
+              f"pool={trace.get('pool_total')} 過門檻={trace.get('selected_count')} rerank={how}")
+        for row in (trace.get("pool") or [])[:max_candidates]:
+            mark = "★" if row.get("final") else ("✓" if row.get("selected") else " ")
+            print(f"   {mark} combined={_fmt(row.get('combined'))} emb={_fmt(row.get('emb'))} "
+                  f"lex={_fmt(row.get('lexical'))} rerank={_fmt(row.get('rerank'))}  "
+                  f"{row.get('path')}:{row.get('line')} {row.get('symbol')}")
+        if trace.get("blobs"):
+            print(f"  快照: {len(trace['blobs'])} 個原始檔")
         return
     kb = trace.get("kb") or {}
     print(f"  stage={trace.get('stage')}  kb={kb.get('path')} gen={str(kb.get('store_generation', ''))[:8]} "
-          f"chunks={kb.get('chunks')}  strict={trace.get('query', {}).get('strict')}")
+          f"chunks={kb.get('chunks')}  strict={trace.get('query', {}).get('strict')}"
+          + (f"  快照={kb.get('snapshot')}" if kb.get("snapshot") else ""))
+    if trace.get("stopped"):
+        excluded = trace.get("strict_excluded") or {}
+        print(f"  ✗ 提早結束: {trace['stopped']}  "
+              f"(strict 排除 圖 {len(excluded.get('figures') or [])} / OCR 文字 {len(excluded.get('text') or [])})")
     expansion = trace.get("expansion")
     if expansion is None:
         print("  expansion: 未知")

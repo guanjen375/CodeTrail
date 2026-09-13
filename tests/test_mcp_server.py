@@ -450,10 +450,11 @@ def _server_args(project: Path) -> list[str]:
 
 def _server_env(project: Path) -> dict[str, str]:
     env = os.environ.copy()
-    # 真的起 server 就會真的寫一份 lease(mcp_lease.open_lease())。導到專案底下的
-    # tmp 目錄,測試才不會在使用者真正的 `~/.local/state/codetrail/mcp/` 留檔案
+    # 真的起 server 就會真的寫一份 lease(mcp_lease.open_lease())。導到 tmp 目錄,
+    # 測試才不會在使用者真正的 `~/.local/state/codetrail/mcp/` 留檔案
     # ——被 kill 的那幾個還會是 `exited: null` 的孤兒,讓 doctor 報出不存在的 instance。
-    env["XDG_STATE_HOME"] = str(project / ".state")
+    # 放在專案**旁邊**而不是底下:data flywheel 拒絕把落點放進被分析的專案。
+    env["XDG_STATE_HOME"] = str(project.parent / f"{project.name}.state")
     env["PYTHONIOENCODING"] = "utf-8"
     # endpoint 與主模型都來自 conftest 建的 tmp HOME 的 deployment.json
     # (指向必定沒人聽的 port),子行程繼承那個 HOME —— 不需要、也不能再用

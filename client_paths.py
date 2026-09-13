@@ -328,9 +328,14 @@ def append_private_line(
     make_error: ErrorFactory,
     *,
     anchor: Path | None = None,
+    guard: Callable[[Path], None] | None = None,
 ) -> None:
-    """對一份 owner-only 檔案 append 一行,建檔與 append 都不跟 symlink。"""
-    dir_fd = open_private_dir(directory, make_error, anchor=anchor)
+    """對一份 owner-only 檔案 append 一行,建檔與 append 都不跟 symlink。
+
+    ``guard`` 同 :func:`open_private_dir`:每一次 append 都拿解析後的實際位置再判一次
+    containment(祖先 symlink 可以在兩次 append 之間被改指)。
+    """
+    dir_fd = open_private_dir(directory, make_error, anchor=anchor, guard=guard)
     try:
         flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
         try:

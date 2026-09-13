@@ -408,7 +408,13 @@ else:
 _log(f"[MCP] EXTERNAL_IMPORT_ENABLED = {config.EXTERNAL_IMPORT_ENABLED}")
 # 收集器綁**宣告的 root**(`--root`),不是 cwd:launcher 可能站在 checkout 目錄
 # 啟動 server,那時 cwd 與 sandbox root 不同,分區就會跟畫面講的不一樣。
-data_flywheel.get_collector(root=AICODE_ROOT)
+try:
+    data_flywheel.get_collector(root=AICODE_ROOT)
+except data_flywheel.DataCollectError as _collect_exc:
+    # 收集落點在被分析的專案之內(XDG_STATE_HOME 指進 root,含經 symlink):
+    # 與 session store 一樣拒絕啟動,不是靜默改寫位置、也不是悄悄關掉收集。
+    print(f"[MCP][FATAL] {_collect_exc}", file=sys.stderr, flush=True)
+    sys.exit(2)
 if data_flywheel.collect_enabled():
     _log(
         "[MCP] data flywheel 開啟 — KB-shaped tools 的問答會 append 到 "
@@ -462,25 +468,23 @@ def _record_kb_interaction(
         _log(f"[MCP] record_interaction 失敗 ({mode}): {type(e).__name__}: {e}")
 
 
-def _code_rag_trace(ranked: list, *, mode: str, top_k: int) -> dict:
-    """code_rag_search 的檢索路徑:排序結果的身分與各階段分數,**不帶任何程式碼文字**
-    (路徑 + 行號就能回到 repo 取證據;evidence 文字進紀錄的契約在
-    tests/test_code_rag_search.py 釘住)。"""
-    rows = []
-    for rc in ranked or []:
-        item = getattr(rc, "item", None) or {}
-        rows.append({
-            "path": item.get("path"),
-            "line": item.get("line", item.get("start_line")),
-            "symbol": item.get("symbol", ""),
-            "type": item.get("type", ""),
-            "combined": (round(float(rc.combined_score), 4)
-                         if rc.combined_score is not None else None),
-            "rerank": round(float(rc.rerank_score), 4) if rc.rerank_score is not None else None,
-            "final": round(float(rc.final_score), 4),
-            "score_source": rc.score_source,
-        })
-    return {"schema": 1, "mode": mode, "top_k": top_k, "ranked": rows}
+def _record_kb_failure(*, mode: str, question: str, exc: BaseException,
+                       trace: dict | None) -> None:
+    """檢索途中炸掉(reranker timeout / 不可用 …)也是樣本:記問題、走到哪一步與失敗原因。
+
+    只記錄、不吞例外——呼叫端接著 raise,transport 那層照舊轉成 error result;
+    以前這條路完全不留紀錄,固定目錄裡就沒有服務失敗的樣本。
+    """
+    _record_kb_interaction(
+        mode=mode,
+        question=question,
+        answer=f"[ERROR:{type(exc).__name__}]",
+        refs=[],
+        top_score=0.0,
+        extra_meta={"failed": True, "error_type": type(exc).__name__,
+                    "error": str(exc)[:500]},
+        trace=trace,
+    )
 
 
 mcp = FastMCP("ai_code", instructions=MCP_INSTRUCTIONS)
@@ -861,7 +865,12 @@ def query_knowledge(
             "review_hint": "",
             "error": "knowledge base not loaded",
         }
-    text, display, meta = KB.query(question, source=source)
+    try:
+        text, display, meta = KB.query(question, source=source)
+    except Exception as exc:
+        _record_kb_failure(mode="mcp_query_knowledge", question=question, exc=exc,
+                           trace=getattr(KB, "last_trace", None))
+        raise
     refs = meta.get("refs", [])
     top_score = meta.get("top_score", 0.0)
     _record_kb_interaction(
@@ -959,9 +968,14 @@ def query_knowledge_strict(
         )
         return result
 
-    knowledge_ctx, _display, meta = KB.query(
-        question, is_strict_mode=True, source=source
-    )
+    try:
+        knowledge_ctx, _display, meta = KB.query(
+            question, is_strict_mode=True, source=source
+        )
+    except Exception as exc:
+        _record_kb_failure(mode="mcp_query_knowledge_strict", question=question, exc=exc,
+                           trace=getattr(KB, "last_trace", None))
+        raise
     refs = meta.get("refs", [])
     top_score = meta.get("top_score", 0.0)
     top_emb_score = meta.get("top_emb_score", 0.0)
@@ -1234,7 +1248,13 @@ def code_rag_search(
     if mode == "context":
         budget = code_context.validate_max_chars(max_chars)
         context_top_k = min(max(int(top_k), 1), 10)
-        ranked = CODE_RAG.query_ranked(query, top_k=context_top_k)
+        code_trace = {"schema": 2, "mode": "context", "top_k": context_top_k}
+        try:
+            ranked = CODE_RAG.query_ranked(query, top_k=context_top_k, trace=code_trace)
+        except Exception as exc:
+            _record_kb_failure(mode="mcp_code_rag_search", question=query, exc=exc,
+                               trace=code_trace)
+            raise
         semantic_items = []
         for rc in ranked:
             item = dict(rc.item)
@@ -1298,7 +1318,7 @@ def code_rag_search(
                     "uncertainty_count": len(bundle["uncertainties"]),
                     "budget_chars": bundle["budget_chars"],
                     "used_chars": bundle["used_chars"],
-                    "trace": _code_rag_trace(ranked, mode="context", top_k=context_top_k),
+                    "trace": code_trace,
                     "graph_status": bundle["graph_status"],
                 },
             )
@@ -1388,7 +1408,12 @@ def code_rag_search(
         return [_cap_graph_response(resp)]
 
     # ---- mode == "semantic" ----
-    ranked = CODE_RAG.query_ranked(query, top_k=top_k)
+    code_trace = {"schema": 2, "mode": mode, "top_k": top_k}
+    try:
+        ranked = CODE_RAG.query_ranked(query, top_k=top_k, trace=code_trace)
+    except Exception as exc:
+        _record_kb_failure(mode="mcp_code_rag_search", question=query, exc=exc, trace=code_trace)
+        raise
     results = []
     graph = None
     graph_status = "ok"
@@ -1457,7 +1482,7 @@ def code_rag_search(
             code_snippets=snippets,
             extra_meta={"top_k": top_k, "mode": mode,
                         "include_evidence": include_evidence,
-                        "trace": _code_rag_trace(ranked, mode=mode, top_k=top_k)},
+                        "trace": code_trace},
         )
     return results
 

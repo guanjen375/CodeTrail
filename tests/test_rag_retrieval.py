@@ -1353,6 +1353,96 @@ def test_query_metadata_carries_the_retrieval_path_aligned_with_refs(tmp_path: P
     _model, _display, meta = kb.query("CTRL 重置值是什麼", source="nowhere.md")
     assert meta["has_ref"] is False
     assert meta["trace"]["stage"] == "hybrid" and meta["trace"]["candidates"] == []
+    assert meta["trace"]["stopped"] == "no_candidates"
+
+
+@pytest.mark.smoke
+def test_query_trace_keeps_every_candidate_and_every_reranker_score(tmp_path: Path, monkeypatch):
+    """審核 BLOCKER 2:reranker 對全部候選評了分,trace 卻只留 output_k 個;
+    候選超過上限也只留一個 truncated 旗標。兩者都讓「被 reranker 淘汰」無法還原。"""
+    monkeypatch.setattr(config, "KB_CONTEXT_USE", True)
+    chunks = [
+        _chunk(f"c{i:02d}", f"第{i}段 暫存器 {'甲乙丙丁戊己庚辛壬癸'[i % 10]} 位址 0x{i:04x} 說明。" * 3,
+               ctx=CTX_TEXT, embedding=[1.0, 0.0], gate=[1.0, 0.0])
+        for i in range(20)
+    ]
+    path = _write_kb(tmp_path, chunks, with_gate=True)
+    kb = KnowledgeBase(str(path))
+    _go_offline(kb, monkeypatch)
+    monkeypatch.setattr(knowledge, "USE_RERANKER", True)
+    monkeypatch.setattr(knowledge, "RERANKER_ALWAYS_ON", True)
+    monkeypatch.setattr(kb, "_check_reranker_available", lambda: True)
+    monkeypatch.setattr(
+        knowledge.llama_client, "rerank",
+        lambda **kw: [float(len(kw["documents"]) - i) for i in range(len(kw["documents"]))],
+    )
+
+    _model, _display, meta = kb.query("暫存器 位址")
+
+    trace = meta["trace"]
+    assert len(trace["candidates"]) == 20, "候選一個都不能少"
+    assert "candidates_truncated" not in trace
+    rerank = trace["rerank"]
+    assert rerank["applied"] is True
+    assert len(rerank["scores"]) == 20, "reranker 評過分的每一個都要留"
+    assert len(rerank["output"]) < 20, "output 仍是取前 output_k 的那份"
+    assert {row["id"] for row in rerank["output"]} <= {row["id"] for row in rerank["scores"]}
+
+
+@pytest.mark.smoke
+def test_query_exposes_the_partial_trace_when_retrieval_raises(tmp_path: Path, monkeypatch):
+    """審核 BLOCKER 3:reranker 炸掉時 query() 拋例外,trace 跟著局部變數一起消失。
+    KB 要把走到一半的 trace 留在 `last_trace`,讓 MCP 端記失敗樣本。"""
+    monkeypatch.setattr(config, "KB_CONTEXT_USE", True)
+    chunks = [
+        _chunk("a", "原文一夠長可以通過噪音過濾。" * 4, ctx=CTX_TEXT,
+               embedding=[1.0, 0.0], gate=[1.0, 0.0]),
+    ]
+    path = _write_kb(tmp_path, chunks, with_gate=True)
+    kb = KnowledgeBase(str(path))
+    _go_offline(kb, monkeypatch)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("RAG reranker unavailable")
+
+    monkeypatch.setattr(kb, "_rerank_with_model", boom)
+
+    with pytest.raises(RuntimeError, match="reranker"):
+        kb.query("CTRL 重置值是什麼")
+
+    assert kb.last_trace is not None
+    # stage 在進 reranker **之前**就標成 rerank:炸在裡面的紀錄要直接指向 reranker,
+    # 不是讓人從「最後完成的是 gate」去推。
+    assert kb.last_trace["stage"] == "rerank"
+    assert kb.last_trace["candidates"], "炸掉之前的候選要還在"
+
+
+@pytest.mark.smoke
+def test_strict_all_excluded_records_the_stop_reason_and_the_excluded_figures(
+    tmp_path: Path, monkeypatch
+):
+    """審核 BLOCKER 4:strict 把召回的全部當成待覆核圖排除時,程式在更新 stage 之前就
+    返回,紀錄看起來像「停在 hybrid、泛用拒答」。要記停止原因與被排除的圖。"""
+    monkeypatch.setattr(config, "KB_CONTEXT_USE", True)
+    figure = _chunk("fig-a", "暫存器 CTRL 重置值 0x0001 的表格內容夠長可以通過噪音過濾。" * 3,
+                    ctx=CTX_TEXT, embedding=[1.0, 0.0], gate=[1.0, 0.0])
+    figure.update({
+        "origin": "diagram", "figure_id": "fig_a", "figure_index": 1, "figure_kind": "table",
+        "verification_status": "needs_review", "reasons": ["ocr_low_confidence"],
+        "revision": 1, "page": 3,
+    })
+    path = _write_kb(tmp_path, [figure], with_gate=True)
+    kb = KnowledgeBase(str(path))
+    _go_offline(kb, monkeypatch)
+
+    _model, _display, meta = kb.query("CTRL 重置值是什麼", is_strict_mode=True)
+
+    assert meta["has_ref"] is False
+    trace = meta["trace"]
+    assert trace["stopped"] == "strict_all_excluded"
+    assert trace["stage"] == "strict"
+    assert len(trace["strict_excluded"]["figures"]) == 1
+    assert trace["strict_excluded"]["figures"][0]["verification_status"] == "needs_review"
 
 
 # ============================================================
