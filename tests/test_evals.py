@@ -2457,6 +2457,100 @@ def test_blob_snapshots_mark_truncation_instead_of_dropping_files_silently(tmp_p
 
 
 @pytest.mark.smoke
+def test_source_snapshots_refuse_a_root_replaced_by_a_symlink(tmp_path, monkeypatch):
+    """審核第四輪 B1:root 本身被改名、原路徑換成指向專案外的 symlink,`os.open(root)` 沒有
+    O_NOFOLLOW 就從專案外開始讀,把外面的同名檔存成這個專案的快照。root 也要逐層
+    O_NOFOLLOW 開,而且要跟 init 時記下的 (dev, ino) 是同一個目錄。"""
+    data_flywheel, project = _flywheel(tmp_path, monkeypatch)
+    (project / "a.c").write_text("int inside;\n", encoding="utf-8")
+    collector = data_flywheel.DataCollector(root=str(project))
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "a.c").write_text("int OUTSIDE_SECRET;\n", encoding="utf-8")
+    project.rename(tmp_path / "project_real")
+    project.symlink_to(outside, target_is_directory=True)
+
+    collector.record(question="Q", answer="A", metadata={"trace": {"files": ["a.c"]}})
+
+    stored = collector.load_interactions()[-1].metadata["trace"]
+    blob = stored["blobs"]["a.c"]
+    assert "snapshot" not in blob, blob
+    assert blob.get("skipped") in ("symlink", "root_replaced"), blob
+    snapshots = collector.data_file.parent / "snapshots"
+    leaked = [p for p in snapshots.glob("blob-*")] if snapshots.exists() else []
+    assert not leaked, "專案外的內容不得被存成快照"
+
+
+def _run_with_timeout(fn, seconds: float):
+    import threading
+
+    done = []
+    thread = threading.Thread(target=lambda: done.append(fn()), daemon=True)
+    thread.start()
+    thread.join(seconds)
+    return (not thread.is_alive()), (done[0] if done else None)
+
+
+@pytest.mark.smoke
+def test_snapshot_verification_never_blocks_on_a_fifo(tmp_path, monkeypatch):
+    """審核第四輪 B2:既有快照被換成沒有 writer 的 FIFO,驗證用阻塞式 open() 讀它,
+    普通檔檢查在 open 返回之後才跑——MCP 初始化 / 工具呼叫就此卡死。open 之前先 lstat,
+    開檔加 O_NONBLOCK,非普通檔在 open 之前就擋掉;FIFO 要被原子替換掉、紀錄照常。"""
+    import hashlib
+
+    data_flywheel, project = _flywheel(tmp_path, monkeypatch)
+    raw = json.dumps({"metadata": {"store_generation": "g1"}, "chunks": []}).encode("utf-8")
+    (project / "knowledge.json").write_bytes(raw)
+    collector = data_flywheel.DataCollector(root=str(project))
+    kb_trace = {"path": "knowledge.json", "store_generation": "g1",
+                "file_sha256": hashlib.sha256(raw).hexdigest()}
+    collector.record(question="Q1", answer="A", metadata={"trace": {"kb": dict(kb_trace)}})
+    snapshot = collector.data_file.parent / "snapshots" / "kb-g1.json"
+    assert snapshot.read_bytes() == raw
+
+    snapshot.unlink()
+    os.mkfifo(snapshot)
+    try:
+        finished, _ = _run_with_timeout(
+            lambda: collector.record(question="Q2", answer="A",
+                                     metadata={"trace": {"kb": dict(kb_trace)}}),
+            5.0,
+        )
+    finally:
+        if snapshot.exists() and stat_is_fifo(snapshot):
+            # 萬一還卡在 open():開一個 writer 端把它放掉,測試才收得掉。
+            try:
+                fd = os.open(snapshot, os.O_WRONLY | os.O_NONBLOCK)
+                os.close(fd)
+            except OSError:
+                pass
+    assert finished, "驗證快照不得被 FIFO 卡住"
+    stored = collector.load_interactions()[-1].metadata["trace"]["kb"]
+    assert stored.get("snapshot") == "kb-g1.json" and snapshot.read_bytes() == raw
+
+    # 來源檔是 FIFO 也一樣:略過,不能卡住。
+    os.mkfifo(project / "pipe.c")
+    finished, _ = _run_with_timeout(
+        lambda: collector.record(question="Q3", answer="A",
+                                 metadata={"trace": {"files": ["pipe.c"]}}),
+        5.0,
+    )
+    assert finished, "讀來源檔不得被 FIFO 卡住"
+    blob = collector.load_interactions()[-1].metadata["trace"]["blobs"]["pipe.c"]
+    assert blob.get("skipped") == "not_regular", blob
+
+
+def stat_is_fifo(path) -> bool:
+    import stat as _stat
+
+    try:
+        return _stat.S_ISFIFO(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+@pytest.mark.smoke
 def test_session_eval_forwards_skip_aux_preflight_to_the_replay_child(tmp_path, monkeypatch):
     seen: dict = {}
     payload = json.dumps({"type": "session", "session_id": "ses_x"})

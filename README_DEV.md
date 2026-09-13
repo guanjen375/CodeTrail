@@ -516,8 +516,11 @@ MCP 端的 `question` 是模型送進工具的查詢字串、`answer` 只是 REF
 絕不把壞名字寫進紀錄。紀錄裡 `trace.kb.snapshot` + `snapshot_sha256`、`trace.blobs[path] =
 {snapshot, sha256, matches_index}` 指向它們（`matches_index=false` 代表索引之後檔案改過，
 快照不是搜尋時那一版）——重灌 KB 或改了程式碼之後，舊紀錄的 chunk id 與路徑 / 行號仍對得回
-當時的文字。來源檔一律從 root 的 dir fd 逐層 `O_NOFOLLOW` 讀，路徑上任何一段是 symlink 就
-略過（`skipped: symlink`）；快照的每一次開目錄都與 append 一樣重判「不在被分析的 repo 內」。
+當時的文字。來源檔一律從 `/` 逐層 `O_NOFOLLOW` 開到 root 再往下讀（root 的 dev/ino 必須是
+收集器 init 時那一個，被改名換成 symlink 就 `skipped: root_replaced`），路徑上任何一段是
+symlink 就略過（`skipped: symlink`）；所有開檔都先 lstat 再帶 `O_NONBLOCK`，被換成 FIFO 的
+快照或來源不會把 server 卡住（`skipped: not_regular`，快照則原子重寫）；快照的每一次開目錄都
+與 append 一樣重判「不在被分析的 repo 內」。
 現用檔超過 32 MiB 會先歸檔成 `interactions-<UTC 時間>.jsonl` 再寫，歸檔與 append 在收集目錄
 `.lock` 的 flock 底下（兩個 server 同時服務同一專案也不會把歸檔蓋掉；一筆不丟；`stats` /
 `rate` / `trace` 只看現用檔，舊檔用 `--file` 指定）。收集落點若在被分析的 repo 之內

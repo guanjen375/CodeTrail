@@ -239,6 +239,12 @@ class DataCollector:
         self._kb_snapshots: dict = {}
         # 驗過內容的快照:檔名 → ((ino, mtime_ns, size), sha256);同一行程內不重複整份雜湊。
         self._verified: dict = {}
+        # init 時 root 的身分 (dev, ino):之後 root 被改名、原路徑換成 symlink 時要拒絕讀來源。
+        try:
+            _root_stat = os.stat(self.root)
+            self._root_id = (_root_stat.st_dev, _root_stat.st_ino)
+        except OSError:
+            self._root_id = None
         # 落點不得在被分析的 repo 之內。SessionStore 早就擋這件事,收集器以前沒擋:
         # `XDG_STATE_HOME=/work/fw/.state` 就會在 repo 裡長出一份含查詢與文件片段的
         # JSONL,0600 擋不住擁有者自己 `git add .`。字面路徑與 realpath 都看
@@ -374,7 +380,7 @@ class DataCollector:
         )
         lock_fd = -1
         try:
-            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK
             lock_fd = os.open(LOCK_FILENAME, flags, 0o600, dir_fd=dir_fd)
             client_paths._check_regular(lock_fd, LOCK_FILENAME, _collect_error)
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -454,8 +460,17 @@ class DataCollector:
         if dir_fd is None or dir_fd < 0:  # create=False 遇到目錄不存在
             return False
         try:
+            # open 之前先 lstat:FIFO / 目錄 / symlink 連開都不開(沒有 writer 的 FIFO 用阻塞式
+            # open 會把整個 MCP 卡死)。open 再加 O_NONBLOCK 擋掉 lstat 與 open 之間被換掉的情況。
             try:
-                fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
+                pre = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except OSError:
+                return False
+            if not stat.S_ISREG(pre.st_mode):
+                return False
+            try:
+                fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK,
+                             dir_fd=dir_fd)
             except OSError:
                 return False
             try:
@@ -520,25 +535,56 @@ class DataCollector:
                 return "missing"
             return "symlink" if stat.S_ISLNK(info.st_mode) else "missing"
 
-        try:
-            fd = os.open(str(self.root), os.O_RDONLY | os.O_DIRECTORY)
-        except OSError:
-            return None, "missing"
+        fd, reason = self._open_root_fd()
+        if fd is None:
+            return None, reason
         try:
             for part in parts[:-1]:
                 try:
-                    nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=fd)
+                    nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | nofollow | os.O_NONBLOCK,
+                                  dir_fd=fd)
                 except OSError as exc:
                     return None, _why(exc, part, fd)
                 os.close(fd)
                 fd = nxt
             try:
-                leaf = os.open(parts[-1], os.O_RDONLY | nofollow, dir_fd=fd)
+                # O_NONBLOCK:來源是沒有 writer 的 FIFO 時 open 不得卡住;之後 fstat 會擋掉非普通檔。
+                leaf = os.open(parts[-1], os.O_RDONLY | nofollow | os.O_NONBLOCK, dir_fd=fd)
             except OSError as exc:
                 return None, _why(exc, parts[-1], fd)
             return leaf, None
         finally:
             os.close(fd)
+
+    def _open_root_fd(self):
+        """從 / 逐層 O_NOFOLLOW 開到 root,並核對是 init 時那一個目錄 (dev, ino)。
+
+        `os.open(root)` 會跟 symlink:root 本身被改名、原路徑換成指向專案外的 symlink,
+        後面的相對路徑就全部從專案外開始。init 時 root 是 resolve 過的(沒有 symlink),
+        之後任何一段變成 symlink、或身分變了,都代表被換過,拒絕。
+        """
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        parts = Path(self.root).parts
+        if not parts or not Path(self.root).is_absolute():
+            return None, "root_replaced"
+        try:
+            fd = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            return None, "missing"
+        for part in parts[1:]:
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | nofollow | os.O_NONBLOCK,
+                              dir_fd=fd)
+            except OSError as exc:
+                os.close(fd)
+                return None, ("missing" if exc.errno == errno.ENOENT else "root_replaced")
+            os.close(fd)
+            fd = nxt
+        info = os.fstat(fd)
+        if self._root_id is not None and (info.st_dev, info.st_ino) != self._root_id:
+            os.close(fd)
+            return None, "root_replaced"
+        return fd, None
 
     @staticmethod
     def _read_all(fd: int) -> bytes:

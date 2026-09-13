@@ -1160,6 +1160,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_corrupted_snapshot_is_repaired_or_reported_never_trusted",
             "test_the_kb_snapshot_is_the_loaded_generation_not_the_disk_version",
             "test_blob_snapshots_mark_truncation_instead_of_dropping_files_silently",
+            "test_source_snapshots_refuse_a_root_replaced_by_a_symlink",
+            "test_snapshot_verification_never_blocks_on_a_fifo",
             "test_session_eval_accepts_bare_gguf_and_legacy_models",
             "test_routing_probes_accept_the_same_model_forms_as_aicode",
             "test_the_routing_client_attempt_sends_the_requested_model",
