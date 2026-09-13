@@ -9,20 +9,22 @@
 - 輸出 JSONL 格式，可用於訓練 reranker 或微調模型
 
 使用方式：
-1. 自動收集：在 ~/.config/codetrail/client.json 把 collect_data 設成 true
-2. 手動評分：執行 python3 data_flywheel.py rate --file <落點>/interactions.jsonl
-   (落點見 `data_file()`;它**不在**被分析的 repo 裡)
+1. 自動收集：永久開啟，沒有開關（只有 readonly 評測 session 不寫）
+2. 找目錄：python3 data_flywheel.py where --root <專案>
+   （落點 ~/.local/state/codetrail/data/<root 雜湊>/，它**不在**被分析的 repo 裡）
+3. 手動評分：python3 data_flywheel.py rate --file <目錄>/interactions.jsonl
 
 資料格式：
 {
     "timestamp": "2024-01-01T12:00:00",
-    "question": "...",
+    "question": "...",             // MCP 端記的是模型送進工具的查詢字串（不是使用者原話）
     "question_type": "spec|code|bug|general",
-    "refs": [{"source": "...", "score": 0.5, "content": "..."}],
+    "refs": [{"source": "...", "page": 19, "section": "...", ...}],   // 最終 REF 的 metadata
     "code_snippets": [{"path": "...", "line": 123, "symbol": "..."}],
-    "answer": "...",
+    "answer": "...",               // MCP 端只有 REF 標頭（MCP 沒有回合邊界，看不到最後回答）
     "rating": null,  // 手動評分: 1=好, 0=普通, -1=差
-    "metadata": {"mode": "agent", "kb_top_score": 0.5, ...},
+    "metadata": {"mode": "mcp_query_knowledge", "kb_top_score": 0.5, ...,
+                 "trace": {...}},  // 這一次檢索的完整路徑（見下）
     "reproducibility": {
         "repo_commit": "abc123",
         "model_tag": "<CODE_MODEL>",   // 使用者設定的主模型 bare name 或 GGUF 路徑
@@ -33,6 +35,22 @@
         "files_read": ["main.py", "utils.py"]
     }
 }
+
+metadata.trace（知識庫查詢；由 `knowledge.KnowledgeBase.query()` 產生）：
+  stage        走到哪一步結束：start / hybrid / gate / rerank / mmr / merge / done
+  query        模型送進來的問題、source 過濾、strict、top_k
+  kb           knowledge.json 檔名、store_generation、chunk 數
+  settings     這次生效的檢索設定（門檻、reranker、MMR、BM25、expansion…）
+  expansion    有沒有觸發 query expansion、擴寫出哪些查詢（None = 未知）
+  candidates   hybrid 候選（chunk id / 來源 / 頁 / 章節 / rrf / retrieval / gate / bm25）
+  decision     門檻、min_gate_score、top gate 分數與 margin 風險；candidates[].passed 標
+               每個候選有沒有通過 gate，gate_passed_count 是通過的總數
+  rerank       有沒有真的跑 cross-encoder、輸入幾個、每個的分數
+  mmr          MMR 選了誰；pollution：污染控制前的 gate 分數與選後結果
+  final        最終 REF：成員 id、來源/頁/章節、gate/retrieval 分數、截斷、前 200 字
+  outcome      信心標籤、最終用的 top gate / retrieval 分數、REF 數
+metadata.trace（code_rag_search）：ranked = 路徑/行/符號 + combined/rerank/final 分數。
+攤開看：python3 data_flywheel.py trace --file <目錄>/interactions.jsonl --last 5
 """
 
 import os
@@ -44,7 +62,8 @@ from datetime import datetime
 from dataclasses import dataclass, asdict, field
 from typing import Optional
 
-# 資料收集設定。開關來自 client.json 的 `collect_data`(經 config)。
+# 資料收集永久開啟;只有 readonly session 經 `config.COLLECT_DATA` 關掉
+# (見 `client_config.apply_to_config(readonly=True)`)。
 DATA_FILENAME = 'interactions.jsonl'
 
 
@@ -421,6 +440,77 @@ def record_interaction(question: str, answer: str, **kwargs):
     get_collector().record(question, answer, **kwargs)
 
 
+def _fmt(value) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    return str(value)
+
+
+def print_trace(interaction: Interaction, *, max_candidates: int = 8) -> None:
+    """把一筆紀錄的 metadata.trace 印成人看的格式(沒有 trace 的舊紀錄只印摘要)。"""
+    meta = interaction.metadata or {}
+    trace = meta.get("trace") or {}
+    print("=" * 72)
+    print(f"{interaction.timestamp}  {meta.get('mode', '?')}")
+    print(f"  查詢: {interaction.question}")
+    if not trace:
+        print(f"  (這筆沒有 trace)  answer: {interaction.answer[:80]}")
+        return
+    if "ranked" in trace:  # code_rag_search
+        print(f"  code_rag mode={trace.get('mode')} top_k={trace.get('top_k')}")
+        for row in trace.get("ranked", [])[:max_candidates]:
+            print(f"    {_fmt(row.get('final'))}  [{row.get('score_source')}] "
+                  f"{row.get('path')}:{row.get('line')} {row.get('symbol')}  "
+                  f"combined={_fmt(row.get('combined'))} rerank={_fmt(row.get('rerank'))}")
+        return
+    kb = trace.get("kb") or {}
+    print(f"  stage={trace.get('stage')}  kb={kb.get('path')} gen={str(kb.get('store_generation', ''))[:8]} "
+          f"chunks={kb.get('chunks')}  strict={trace.get('query', {}).get('strict')}")
+    expansion = trace.get("expansion")
+    if expansion is None:
+        print("  expansion: 未知")
+    elif expansion.get("triggered"):
+        print(f"  expansion: 觸發,擴寫 {len(expansion.get('queries', []))} 條 → "
+              + " | ".join(str(q)[:60] for q in expansion.get("queries", [])))
+    else:
+        print("  expansion: 未觸發")
+    decision = trace.get("decision") or {}
+    if decision:
+        print(f"  gate: base={_fmt(decision.get('base_threshold'))} "
+              f"min={_fmt(decision.get('min_gate_score'))} top={_fmt(decision.get('top_gate_score'))} "
+              f"high_risk={decision.get('is_high_risk')}  通過 {trace.get('gate_passed_count', '?')} 個")
+    rerank = trace.get("rerank") or {}
+    rerank_scores = {row.get("id"): row.get("score") for row in rerank.get("output", [])}
+    candidates = trace.get("candidates") or []
+    print(f"  候選 {trace.get('candidate_count', len(candidates))} 個"
+          + ("(已截)" if trace.get("candidates_truncated") else "") + ":")
+    for c in candidates[:max_candidates]:
+        mark = "✓" if c.get("passed") else " "
+        print(f"   {mark} gate={_fmt(c.get('gate'))} rrf={_fmt(c.get('rrf'))} "
+              f"rerank={_fmt(rerank_scores.get(c.get('id')))}  "
+              f"{c.get('source')} p.{c.get('page')}  {str(c.get('section', ''))[:40]}")
+    if rerank:
+        print(f"  rerank: {'跑了' if rerank.get('applied') else '沒跑'}  "
+              f"輸入 {rerank.get('input_count')} → 取 {rerank.get('output_k')}  "
+              f"effective_top_k={rerank.get('effective_top_k')}")
+    mmr = trace.get("mmr") or {}
+    if mmr:
+        print(f"  mmr: used={mmr.get('used')} λ={_fmt(mmr.get('lambda'))} 選 {len(mmr.get('selected', []))} 個")
+    pollution = trace.get("pollution") or {}
+    if pollution:
+        print(f"  pollution: {pollution.get('prelim_risk')} → 留 {len(pollution.get('selected', []))} 個")
+    outcome = trace.get("outcome") or {}
+    print(f"  最終 REF {outcome.get('ref_count', len(trace.get('final', [])))} 個  "
+          f"{outcome.get('confidence_label', '')} top_gate={_fmt(outcome.get('top_gate_score_used'))}")
+    for entry in trace.get("final", []):
+        flag = " (截斷)" if entry.get("truncated") else ""
+        snippet = str(entry.get("snippet", "")).replace("\n", " ")[:80]
+        print(f"    gate={_fmt(entry.get('gate'))} {entry.get('source')} p.{entry.get('page')} "
+              f"{str(entry.get('section', ''))[:30]}{flag}  「{snippet}」")
+
+
 # CLI 介面
 def main():
     import argparse
@@ -444,6 +534,19 @@ def main():
                                help='資料檔案路徑(預設:這個 root 的收集落點)')
     export_parser.add_argument('--output', type=str, default='data/training.jsonl', help='輸出檔案')
     export_parser.add_argument('--min-rating', type=int, default=0, help='最低評分')
+
+    # where 命令:要撈檔案的人去目錄拿。root 雜湊不可讀回原路徑,所以要有地方印出來。
+    where_parser = subparsers.add_parser('where', help='印出某個專案的收集目錄')
+    where_parser.add_argument('--root', type=str, default=None,
+                              help='被分析的專案根目錄(預設:目前目錄)')
+
+    # trace 命令:把最近幾筆的檢索路徑攤開成人看的格式
+    trace_parser = subparsers.add_parser('trace', help='攤開最近幾筆紀錄的檢索路徑')
+    trace_parser.add_argument('--file', type=str, default=None,
+                              help='資料檔案路徑(預設:這個 root 的收集落點)')
+    trace_parser.add_argument('--last', type=int, default=5, help='顯示最近幾筆(預設 5)')
+    trace_parser.add_argument('--candidates', type=int, default=8,
+                              help='每筆最多列幾個候選(預設 8)')
 
     args = parser.parse_args()
 
@@ -503,6 +606,18 @@ def main():
         collector = DataCollector(data_file=args.file)
         count = collector.export_for_training(args.output, args.min_rating)
         print(f"已匯出 {count} 筆訓練資料至 {args.output}")
+
+    elif args.command == 'where':
+        print(data_dir(args.root))
+
+    elif args.command == 'trace':
+        collector = DataCollector(data_file=args.file)
+        interactions = collector.load_interactions()
+        if not interactions:
+            print("沒有紀錄")
+            return
+        for interaction in interactions[-max(args.last, 1):]:
+            print_trace(interaction, max_candidates=max(args.candidates, 0))
 
     else:
         parser.print_help()

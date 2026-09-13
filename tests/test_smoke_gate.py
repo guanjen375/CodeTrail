@@ -1074,8 +1074,12 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_rag_retrieval.py": (
-        "strict KB 拒答閘不得把同文件的強檢索誤當成使用者點名欄位的存在證據",
-        ("test_refuse_answer_rejects_explicitly_missing_identifier",),
+        "strict KB 拒答閘不得把同文件的強檢索誤當成使用者點名欄位的存在證據;"
+        "data flywheel 記的檢索路徑(metadata.trace)必須與實際回傳的 refs 逐筆對齊",
+        (
+            "test_refuse_answer_rejects_explicitly_missing_identifier",
+            "test_query_metadata_carries_the_retrieval_path_aligned_with_refs",
+        ),
     ),
     "test_figure_review.py": (
         "figure_review.safe_figure_path(.codetrail/figures 邊界 + symlink + atomic write)",
@@ -1128,7 +1132,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "validator 一致;replay 的壓縮語意由 eval 自己釘(不讀使用者的 client.json)、推不出門檻要"
         "fail-loud、多輪必須真的接得起來而單輪不落檔、gitignore 掉的三個路徑一樣算 project state;"
         "timeout/checkpoint 不得丟資料且匿名 A/B 不得洩漏模型身分;"
-        "data flywheel 的落點在 state 目錄(0700/0600、拒 symlink,被分析的 repo 零新檔),"
+        "data flywheel 永久開啟、readonly 是唯一關閉點、舊 collect_data 鍵 fail-loud,"
+        "落點在 state 目錄(0700/0600、拒 symlink,被分析的 repo 零新檔),"
         "而且子行程的環境在交出去之前剝掉全部 CodeTrail 設定變數;"
         "catalog 的模型字元成本不包含 UI schema,所有量測都要通過公開工具契約;"
         "錄製器選定的 llama-server 用不了時"
@@ -1141,6 +1146,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_the_session_eval_candidate_model_goes_out_as_argv",
             "test_the_collected_data_never_lands_in_the_analysed_repo",
             "test_the_collected_data_file_is_never_read_or_rewritten_through_a_symlink",
+            "test_data_collection_is_always_on_and_only_readonly_turns_it_off",
             "test_session_eval_accepts_bare_gguf_and_legacy_models",
             "test_routing_probes_accept_the_same_model_forms_as_aicode",
             "test_the_routing_client_attempt_sends_the_requested_model",

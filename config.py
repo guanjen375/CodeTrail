@@ -548,10 +548,15 @@ PROJECT_INSTRUCTIONS_ENABLED = True
 OBJDUMP = ""
 #: `.h` 當成哪一種語言解析。
 H_LANG = "c"
-#: 把問答寫進資料飛輪(內容是 NDA 問答,所以預設關)。
-COLLECT_DATA = False
 #: 用容器跑 run_command。
 USE_CONTAINER = False
+# ------------------------------------------------------------
+#: 資料飛輪(data_flywheel)**永久開啟**:不是 client.json 的鍵、沒有使用者開關。
+#: 落點是本機 state 目錄 `~/.local/state/codetrail/data/<root 雜湊>/`(0700 / 0600),
+#: 不進被分析的 repo、不出這台機器;要撈檔案就去那個目錄。唯一會把它關掉的是
+#: readonly session(canary / eval / replay):`client_config.apply_to_config(readonly=True)`
+#: 翻成 False,合成題目不得寫進使用者的資料。
+COLLECT_DATA = True
 EXTERNAL_IMPORT_ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | {
     ".pdf", ".md", ".txt", ".log",
     ".json", ".jsonl", ".yaml", ".yml", ".toml", ".csv",

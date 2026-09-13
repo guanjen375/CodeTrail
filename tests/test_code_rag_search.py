@@ -238,7 +238,7 @@ def test_context_mode_is_not_silently_capped_at_graph_8000(mcp_module, tmp_path)
 
 def test_context_telemetry_records_metadata_but_not_evidence_text(mcp_module, monkeypatch):
     recorded = []
-    # collect_data 是 client.json 的鍵(經 config),不是 module 常數/環境變數。
+    # 收集永久開啟(readonly 才關);這裡明確打開,不依賴同行程先前有沒有套過 readonly。
     monkeypatch.setattr(mcp_module.data_flywheel, "collect_enabled", lambda: True)
     monkeypatch.setattr(
         mcp_module, "_record_kb_interaction", lambda **kwargs: recorded.append(kwargs)
@@ -251,6 +251,12 @@ def test_context_telemetry_records_metadata_but_not_evidence_text(mcp_module, mo
                for item in payload["code_snippets"])
     evidence_text = bundle["evidence"][0]["text"]
     assert evidence_text not in repr(payload)
+    # 檢索路徑跟著 telemetry 走,但一樣只有身分與分數,沒有程式碼文字(上面那條斷言也蓋到它)。
+    trace = payload["extra_meta"]["trace"]
+    assert trace["mode"] == "context" and trace["ranked"]
+    assert set(trace["ranked"][0]) == {
+        "path", "line", "symbol", "type", "combined", "rerank", "final", "score_source",
+    }
 
 
 def test_unknown_mode_is_rejected(mcp_module):

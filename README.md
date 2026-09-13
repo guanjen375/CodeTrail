@@ -635,7 +635,6 @@ registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf`
 | `project_instructions` | `true` | 讀不讀被分析專案的 `AGENTS.md` 與 `.codetrail/lessons.md`。分析不信任 repo 時設 `false` |
 | `objdump` | `""` | 反組譯用的 objdump 路徑(跨架構韌體時指定 binutils-`<triplet>`) |
 | `h_lang` | `"c"` | `.h` 當 C 還是 C++ 解析(`c` / `cpp`) |
-| `collect_data` | `false` | 把問答寫進 `~/.local/state/codetrail/data/<root 雜湊>/`(0700 / 0600,**絕不落進被分析的 repo**) |
 | `use_container` | `false` | 在容器裡跑 `run_command` |
 | `show_reasoning` | `false` | `/thinking` 的**初始值**,只管畫面 |
 | `keep_historical_reasoning` | `false` | 舊回合的 assistant reasoning 要不要送進模型。與上面是**兩個鍵**:`/thinking` 只改畫面,不得動這個 |
@@ -646,6 +645,16 @@ registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf`
 檔案是 0600:它決定寫入工具要不要人工核准,能被別人改就等於能繞過核准。
 位置只由 `HOME` 推導,**沒有覆寫變數** —— 一個環境變數就能把 `apply_patch`
 從 ask 翻成 allow 的話,「每次寫檔都會問」就不成立了。
+
+問答資料收集(data flywheel)**不是 client.json 的鍵,永久開啟、沒有開關**:
+`query_knowledge` / `query_knowledge_strict` / `code_rag_search` 每一次的問答都 append 到
+`~/.local/state/codetrail/data/<root 雜湊>/interactions.jsonl`(目錄 0700、檔 0600,
+**絕不落進被分析的 repo**,也不出這台機器)。每一筆都帶完整的檢索路徑:候選、各階段分數、
+gate / rerank / MMR 決策、最終 REF 與當時生效的設定,`data_flywheel.py trace` 可以攤開來看。
+要撈檔案就去那個目錄,`python3 <CODETRAIL_REPO>/data_flywheel.py where --root <專案>`
+會印出確切位置。
+唯一不寫的是 readonly 評測 session(canary / eval / replay)。舊版的 `collect_data` 鍵
+留在檔裡會 fail-loud,拿掉即可。
 
 #### 工具權限預設
 

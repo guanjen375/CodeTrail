@@ -95,9 +95,6 @@ class ClientSettings:
     objdump: str = ""
     #: `.h` 當成 c 還是 cpp 解析。
     h_lang: str = "c"
-    #: 把每一次問答(含問題、答案、引用片段)寫進資料飛輪。
-    #: 內容是 NDA 問答,所以預設關;落點固定在 state 目錄,絕不進被分析的 repo。
-    collect_data: bool = False
     #: 用容器跑 run_command。
     use_container: bool = False
     #: 畫面上顯示模型的 thinking。**只管畫面**——它是 `/thinking` 的初始值。
@@ -121,7 +118,6 @@ class ClientSettings:
             "project_instructions": self.project_instructions,
             "objdump": self.objdump,
             "h_lang": self.h_lang,
-            "collect_data": self.collect_data,
             "use_container": self.use_container,
             "show_reasoning": self.show_reasoning,
             "keep_historical_reasoning": self.keep_historical_reasoning,
@@ -166,7 +162,6 @@ _BOOL_KEYS = (
     "external_import",
     "build_commands",
     "project_instructions",
-    "collect_data",
     "use_container",
     "show_reasoning",
     "keep_historical_reasoning",
@@ -186,6 +181,15 @@ KNOWN_KEYS = frozenset(
     | set(_CHOICE_KEYS)
     | set(_TEXT_KEYS)
 )
+#: 已移除的鍵 → 給使用者的說明。留在檔裡一律 fail-loud,不能只當未知鍵略過:
+#: `"collect_data": false` 被靜默忽略等於「我關了但它還在收」,與拼錯鍵是同一種無聲失敗。
+REMOVED_KEYS: dict[str, str] = {
+    "collect_data": (
+        "資料收集已改成永久開啟(只有 readonly 評測 session 不寫),沒有開關,請把這個鍵拿掉;"
+        "檔案在 ~/.local/state/codetrail/data/<root 雜湊>/interactions.jsonl,"
+        "`python3 data_flywheel.py where --root <專案>` 會印出確切目錄"
+    ),
+}
 
 
 def _bool(value: Any, key: str, path: Path) -> bool:
@@ -207,6 +211,11 @@ def _validate(value: Any, path: Path) -> dict[str, Any]:
     # 一個單純的 `!= SCHEMA` 比對。型別先驗,再比值。
     if isinstance(schema, bool) or not isinstance(schema, int) or schema != SCHEMA:
         raise ClientConfigError(f"{path} 的 schema 必須是 {SCHEMA},得到 {schema!r}")
+    removed = sorted(set(value) & set(REMOVED_KEYS))
+    if removed:
+        raise ClientConfigError(
+            f"{path} 有已移除的鍵 {removed}:" + ";".join(REMOVED_KEYS[key] for key in removed)
+        )
     unknown = sorted(set(value) - KNOWN_KEYS)
     if unknown:
         raise ClientConfigError(
@@ -356,7 +365,6 @@ def apply_to_config(settings: ClientSettings, *, readonly: bool = False) -> None
     config.PROJECT_INSTRUCTIONS_ENABLED = settings.project_instructions
     config.OBJDUMP = settings.objdump
     config.H_LANG = settings.h_lang
-    config.COLLECT_DATA = settings.collect_data
     config.USE_CONTAINER = settings.use_container
 
     if readonly:
@@ -364,6 +372,8 @@ def apply_to_config(settings: ClientSettings, *, readonly: bool = False) -> None
         # 任何東西送出這台機器。這幾條一律關到底,client.json 翻不回來。
         config.EXTERNAL_IMPORT_ENABLED = False
         config.EXTERNAL_IMPORT_ROOTS = []
+        # data flywheel 永久開啟、沒有使用者開關,所以**這裡是唯一**擋住
+        # canary / eval / replay 把合成題目寫進使用者資料的地方。
         config.COLLECT_DATA = False
         config.USE_CONTAINER = False
         config.CTX_METRICS_ENABLED = False

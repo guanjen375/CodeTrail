@@ -411,9 +411,11 @@ _log(f"[MCP] EXTERNAL_IMPORT_ENABLED = {config.EXTERNAL_IMPORT_ENABLED}")
 data_flywheel.get_collector(root=AICODE_ROOT)
 if data_flywheel.collect_enabled():
     _log(
-        "[MCP] collect_data = True (client.json) — KB-shaped tools 會 append 到 "
+        "[MCP] data flywheel 開啟 — KB-shaped tools 的問答會 append 到 "
         f"{data_flywheel.data_dir(AICODE_ROOT) / data_flywheel.DATA_FILENAME}"
     )
+else:
+    _log("[MCP] data flywheel 關閉(readonly session 不寫)")
 
 
 def _record_kb_interaction(
@@ -425,19 +427,26 @@ def _record_kb_interaction(
     top_score: float,
     code_snippets: list | None = None,
     extra_meta: dict | None = None,
+    trace: dict | None = None,
 ) -> None:
     """Append a data_flywheel Interaction for a KB-shaped MCP tool call.
+
+    `trace` 是這一次檢索的路徑(`KB.query()` 的 metadata["trace"],或
+    `_code_rag_trace()`):候選、各階段分數、gate / rerank / MMR 決策與最終 REF。
+    flywheel 存的是**過程**,不是只有結果——沒有它,「RAG 要不要改」看不出來。
 
     Plumbing tools (read_file/grep_code/...) 不呼叫這個,因為 MCP 沒有 turn
     邊界、湊不出完整 Q&A 結構,硬塞會污染訓練語料。
 
-    client.json 沒開 collect_data 時 record_interaction 自己會 no-op。
+    readonly session(`collect_enabled()` 為 False)時 record_interaction 自己會 no-op。
     """
     if not data_flywheel.collect_enabled():
         return
     meta = {"mode": mode, "kb_top_score": top_score, "source": "mcp_server"}
     if extra_meta:
         meta.update(extra_meta)
+    if trace is not None:
+        meta["trace"] = trace
     try:
         data_flywheel.record_interaction(
             question=question,
@@ -451,6 +460,27 @@ def _record_kb_interaction(
         )
     except Exception as e:
         _log(f"[MCP] record_interaction 失敗 ({mode}): {type(e).__name__}: {e}")
+
+
+def _code_rag_trace(ranked: list, *, mode: str, top_k: int) -> dict:
+    """code_rag_search 的檢索路徑:排序結果的身分與各階段分數,**不帶任何程式碼文字**
+    (路徑 + 行號就能回到 repo 取證據;evidence 文字進紀錄的契約在
+    tests/test_code_rag_search.py 釘住)。"""
+    rows = []
+    for rc in ranked or []:
+        item = getattr(rc, "item", None) or {}
+        rows.append({
+            "path": item.get("path"),
+            "line": item.get("line", item.get("start_line")),
+            "symbol": item.get("symbol", ""),
+            "type": item.get("type", ""),
+            "combined": (round(float(rc.combined_score), 4)
+                         if rc.combined_score is not None else None),
+            "rerank": round(float(rc.rerank_score), 4) if rc.rerank_score is not None else None,
+            "final": round(float(rc.final_score), 4),
+            "score_source": rc.score_source,
+        })
+    return {"schema": 1, "mode": mode, "top_k": top_k, "ranked": rows}
 
 
 mcp = FastMCP("ai_code", instructions=MCP_INSTRUCTIONS)
@@ -840,6 +870,7 @@ def query_knowledge(
         answer=display or text,
         refs=refs,
         top_score=top_score,
+        trace=meta.get("trace"),
     )
     excluded = meta.get("excluded_figures", [])
     return {
@@ -960,6 +991,7 @@ def query_knowledge_strict(
             refs=refs,
             top_score=top_score,
             extra_meta={"refused": True, "strict": True, "top_emb_score": top_emb_score},
+            trace=meta.get("trace"),
         )
         return result
 
@@ -986,6 +1018,7 @@ def query_knowledge_strict(
             refs=refs,
             top_score=top_score,
             extra_meta={"refused": False, "strict": False, "top_emb_score": top_emb_score},
+            trace=meta.get("trace"),
         )
         return result
 
@@ -1015,6 +1048,7 @@ def query_knowledge_strict(
         refs=refs,
         top_score=top_score,
         extra_meta={"refused": False, "strict": True, "top_emb_score": top_emb_score},
+        trace=meta.get("trace"),
     )
     return result
 
@@ -1264,6 +1298,7 @@ def code_rag_search(
                     "uncertainty_count": len(bundle["uncertainties"]),
                     "budget_chars": bundle["budget_chars"],
                     "used_chars": bundle["used_chars"],
+                    "trace": _code_rag_trace(ranked, mode="context", top_k=context_top_k),
                     "graph_status": bundle["graph_status"],
                 },
             )
@@ -1421,7 +1456,8 @@ def code_rag_search(
             top_score=top_score,
             code_snippets=snippets,
             extra_meta={"top_k": top_k, "mode": mode,
-                        "include_evidence": include_evidence},
+                        "include_evidence": include_evidence,
+                        "trace": _code_rag_trace(ranked, mode=mode, top_k=top_k)},
         )
     return results
 

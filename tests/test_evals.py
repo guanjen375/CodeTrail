@@ -2112,6 +2112,51 @@ def test_the_global_collector_partitions_by_the_declared_root_not_cwd(tmp_path, 
 
 
 @pytest.mark.smoke
+def test_data_collection_is_always_on_and_only_readonly_turns_it_off(tmp_path, monkeypatch):
+    """收集沒有使用者開關;readonly 是唯一的關閉點。
+
+    `collect_data` 從 client.json 移除之後,擋住 canary / eval / replay 把合成題目
+    寫進使用者資料的只剩 `apply_to_config(readonly=True)` 這一條。舊鍵留在檔裡必須
+    fail-loud:`"collect_data": false` 被靜默忽略等於「我關了但它還在收」。
+    """
+    import client_config
+    import config
+    import data_flywheel
+
+    # apply_to_config 會 mutate 全域 config;先用 monkeypatch 登記原值,teardown 還原。
+    for name in (
+        "EXTERNAL_IMPORT_ENABLED", "EXTERNAL_IMPORT_ROOTS", "KB_CONTEXT_REMOTE_OK",
+        "MODEL_REMOTE_OK", "RERANK_FALLBACK_POLICY", "PROJECT_INSTRUCTIONS_ENABLED",
+        "OBJDUMP", "H_LANG", "COLLECT_DATA", "USE_CONTAINER", "CTX_METRICS_ENABLED",
+    ):
+        if hasattr(config, name):
+            monkeypatch.setattr(config, name, getattr(config, name))
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings = client_config.load_client_settings()
+    assert not settings.present
+    assert "collect_data" not in settings.as_json()
+    assert "collect_data" not in client_config.KNOWN_KEYS
+
+    config.COLLECT_DATA = True
+    client_config.apply_to_config(settings, readonly=False)
+    assert data_flywheel.collect_enabled() is True, "一般 session 永遠收"
+    client_config.apply_to_config(settings, readonly=True)
+    assert data_flywheel.collect_enabled() is False, "readonly 一律不寫"
+
+    path = client_config.config_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"schema": client_config.SCHEMA, "compaction_mode": "manual",
+                    "collect_data": False}),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    with pytest.raises(client_config.ClientConfigError, match="collect_data"):
+        client_config.load_client_settings()
+
+
+@pytest.mark.smoke
 def test_session_eval_forwards_skip_aux_preflight_to_the_replay_child(tmp_path, monkeypatch):
     seen: dict = {}
     payload = json.dumps({"type": "session", "session_id": "ses_x"})

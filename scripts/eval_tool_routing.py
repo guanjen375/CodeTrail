@@ -1764,24 +1764,23 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     if command is None:
         raise EvalError("model evaluation requires the effective stdio MCP catalog")
     # 命令是我們自己組的,`--root` 一定指向這次評測的 sandbox root;
-    # 這裡守的是「不得在評測途中打開 data flywheel」。資料收集現在是 client.json 的
-    # `collect_data`,而評測用的是使用者那一份 —— 開著的話這次評測會把合成
-    # fixture 的問答寫進去。
+    # 這裡守的是「不得在評測途中打開 data flywheel」。資料收集是**永久開啟**的
+    # (沒有 client.json 的鍵),而評測跑的是合成 fixture 的問答,不得寫進使用者的
+    # 資料。子行程(`run --policy readonly` 與 `--readonly` 的 MCP)由 readonly
+    # 關到底;這個行程套完使用者的其餘鍵之後也一律關掉,不靠使用者先改設定。
     import client_config
+    import config as _codetrail_config
 
     try:
         _settings = client_config.load_client_settings()
     except client_config.ClientConfigError:
         _settings = None
     else:
-        if _settings.collect_data:
-            raise EvalError(
-                "routing eval refuses to run while client.json has collect_data enabled"
-            )
         # 其餘的鍵要**真的套進 config**:endpoint policy 的遠端同意
         # (`model_remote_ok`)就在裡面,不套的話一個合法的遠端部署會被自己的
         # 客戶端擋下來,而評測回報的是「模型不會呼叫工具」。
         client_config.apply_to_config(_settings, readonly=False)
+    _codetrail_config.COLLECT_DATA = False
 
     configured_model = args.model
     if not configured_model:

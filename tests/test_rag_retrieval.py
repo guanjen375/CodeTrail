@@ -1306,6 +1306,55 @@ def test_is_high_risk_is_computed_from_gate_scores(tmp_path: Path, monkeypatch):
     assert meta["is_high_risk"] is True
 
 
+@pytest.mark.smoke
+def test_query_metadata_carries_the_retrieval_path_aligned_with_refs(tmp_path: Path, monkeypatch):
+    """data flywheel 記的「尋找路徑」必須反映這一次真的發生的事。
+
+    trace.final 與 refs 逐筆對齊(同筆數、同 source/page)、候選裡找得到最終被選中的
+    chunk、每一階段都有紀錄、走到一半結束(沒有候選)也帶著 trace 回來。對不齊的
+    trace 比沒有更糟:拿它評估 RAG 會得出錯的結論,而且沒有任何錯誤訊息。
+    """
+    monkeypatch.setattr(config, "KB_CONTEXT_USE", True)
+    monkeypatch.setattr(knowledge, "MARGIN_ENABLED", True)
+    chunks = [
+        _chunk("a", "原文一夠長可以通過噪音過濾。" * 4, ctx=CTX_TEXT,
+               embedding=[1.0, 0.0], gate=[1.0, 0.0]),
+        _chunk("b", "原文二夠長可以通過噪音過濾。" * 4, ctx=CTX_TEXT, source="spec_b.md",
+               embedding=[0.0, 1.0], gate=[0.0, 1.0]),
+    ]
+    path = _write_kb(tmp_path, chunks, with_gate=True)
+    kb = KnowledgeBase(str(path))
+    _go_offline(kb, monkeypatch)
+    monkeypatch.setattr(
+        kb, "_rerank_with_model",
+        lambda _q, candidates, _k, **_kw: [(0.9, c.chunk) for c in candidates],
+    )
+
+    _model, _display, meta = kb.query("CTRL 重置值是什麼")
+
+    trace = meta["trace"]
+    assert trace["stage"] == "done"
+    assert meta["refs"], "這個 KB 一定會有 REF"
+    assert len(trace["final"]) == len(meta["refs"])
+    for entry, ref in zip(trace["final"], meta["refs"]):
+        assert (entry["source"], entry["page"]) == (ref["source"], ref["page"])
+        assert entry["ids"] and entry["snippet"]
+    candidate_ids = {c["id"] for c in trace["candidates"]}
+    assert candidate_ids >= {i for entry in trace["final"] for i in entry["ids"]}
+    assert trace["rerank"]["applied"] is True
+    assert trace["rerank"]["output"][0]["score"] == 0.9
+    assert trace["decision"]["min_gate_score"] is not None
+    assert trace["settings"]["reranker_top_n"] == knowledge.RERANKER_TOP_N
+    assert trace["kb"]["chunks"] == 2
+    # flywheel 是 json.dumps 落檔:trace 裡不得混進 numpy 標量這種 dump 不了的東西。
+    json.dumps(trace, ensure_ascii=False)
+
+    # 半途結束也帶 trace:來源過濾掉全部 chunk → 沒有候選。
+    _model, _display, meta = kb.query("CTRL 重置值是什麼", source="nowhere.md")
+    assert meta["has_ref"] is False
+    assert meta["trace"]["stage"] == "hybrid" and meta["trace"]["candidates"] == []
+
+
 # ============================================================
 # GPT review 回歸（2026-08-18）
 # ============================================================

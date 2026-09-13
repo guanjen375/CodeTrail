@@ -412,6 +412,61 @@ class Candidate:
     section_rrf_score: float = 0.0
 
 
+# ============================================================
+# 檢索路徑(trace):query() 每一階段的候選、分數與決策,掛在 metadata["trace"]
+# 給 data flywheel 記錄。只記身分(chunk id / 來源 / 頁 / 章節)與數字,不記
+# content(最終 REF 只帶前 TRACE_SNIPPET_CHARS 字);它是觀測,不參與任何決策。
+# ============================================================
+TRACE_SCHEMA = 1
+#: 每筆 trace 的候選上限。section 展開會把 membership 拉得很長;超過就截並標
+#: candidates_truncated,一筆紀錄不能因為一個長章節長成幾十 KB。
+TRACE_MAX_CANDIDATES = 30
+TRACE_SNIPPET_CHARS = 200
+
+
+def _r4(value) -> float | None:
+    """trace 用的分數:四位小數的 Python float(numpy 標量進 json.dumps 會炸),
+    None 保留 None(reranker 沒跑就是 None,不是 0)。"""
+    if value is None:
+        return None
+    try:
+        return round(float(value), 4)
+    except (TypeError, ValueError):
+        return None
+
+
+def _trace_candidate(candidate: "Candidate") -> dict:
+    """一個候選在 trace 裡的樣子:身分 + 各階段分數,不帶 content。"""
+    chunk = candidate.chunk
+    return {
+        "id": chunk.get("id"),
+        "idx": candidate.chunk_idx,
+        "source": chunk.get("source", ""),
+        "page": chunk.get("page"),
+        "section": chunk.get("section", ""),
+        "type": chunk.get("type", ""),
+        "origin": chunk.get("origin", ""),
+        "rrf": _r4(candidate.rrf_score),
+        "retrieval": _r4(candidate.retrieval_score),
+        "gate": _r4(candidate.gate_score),
+        "bm25_retrieval": _r4(candidate.retrieval_bm25),
+        "bm25_gate": _r4(candidate.gate_bm25),
+        "section_rrf": _r4(candidate.section_rrf_score),
+    }
+
+
+def _trace_member_ids(chunk: dict, all_chunks: list) -> list:
+    """一個(可能已合併的)REF chunk → 成員 chunk id 清單。"""
+    members = chunk.get("member_chunk_idx")
+    if not members:
+        return [chunk.get("id")]
+    ids = []
+    for index in members:
+        if isinstance(index, int) and 0 <= index < len(all_chunks):
+            ids.append(all_chunks[index].get("id"))
+    return ids
+
+
 @dataclass
 class Bm25Index:
     """一套 BM25 索引（inverted index + doc len + idf）。"""
@@ -482,6 +537,8 @@ class KnowledgeBase:
         self.load_error = None
         self.path = json_path
         self._reranker_available = None
+        # _hybrid_search 最近一次的 query expansion 結果(trace 用);query() 每次先清成 None。
+        self._last_expansion = None
         # Numpy 加速用的預計算陣列
         self._embeddings = None  # shape: (n_chunks, dim)
         self._embeddings_normalized = False
@@ -2110,6 +2167,7 @@ English:"""
         if allowed_indices is not None and not allowed_indices:
             return []
 
+        self._last_expansion = {"triggered": False, "queries": []}
         # 取得 query embedding
         q_emb = self._get_embedding(question)
         scores = self._search_once(question, q_emb, candidate_k, allowed_indices)
@@ -2128,6 +2186,9 @@ English:"""
             else:
                 multi_queries = [question]
 
+            self._last_expansion = {
+                "triggered": True, "queries": [str(mq) for mq in multi_queries[1:]],
+            }
             if len(multi_queries) > 1:
                 # 用額外的 queries 增強 embedding 召回
                 for mq in multi_queries[1:]:
@@ -3073,6 +3134,31 @@ English:"""
         other_chars = len(text) - chinese_chars
         return int(chinese_chars / 1.5 + other_chars / 4)
 
+    def _retrieval_settings(self) -> dict:
+        """trace 用:這次檢索實際生效的設定快照。
+
+        讀的是**這個模組層**的名字(`knowledge.RERANKER_TOP_N` 這種),不是 config
+        的;query() 用的就是這些名字,測試 monkeypatch 的也是這些名字。
+        """
+        names = (
+            "KNOWLEDGE_TOP_K", "KNOWLEDGE_CANDIDATE_K", "KNOWLEDGE_THRESHOLD",
+            "KNOWLEDGE_THRESHOLD_SHORT", "KNOWLEDGE_SHORT_QUERY_TOKENS",
+            "DYNAMIC_THRESHOLD_RATIO", "DYNAMIC_TOP_K_HIGH_SCORE", "DYNAMIC_TOP_K_MIN",
+            "DYNAMIC_TOP_K_MAX", "KNOWLEDGE_MERGE_ADJACENT", "KNOWLEDGE_MERGE_MAX_CHARS",
+            "KNOWLEDGE_CONTENT_MAX_CHARS", "EMBEDDING_MODEL", "RERANKER_MODEL",
+            "USE_RERANKER", "RERANKER_ALWAYS_ON", "RERANKER_TOP_N", "RERANKER_SKIP_THRESHOLD",
+            "USE_QUERY_EXPANSION", "MULTI_QUERY_ENABLED", "USE_MMR", "MMR_LAMBDA",
+            "BM25_ENABLED", "RRF_ENABLED", "RRF_K", "MARGIN_ENABLED", "MARGIN_MIN_GAP",
+            "MARGIN_LOW_SCORE", "STRICT_MODE_THRESHOLD", "STRICT_MODE_RERANK_REQUIRED",
+        )
+        module = globals()
+        settings = {name.lower(): module.get(name) for name in names}
+        settings["context_in_use"] = bool(
+            use_generated_context() and getattr(self, "_has_ctx", False)
+        )
+        settings["section_store"] = str(getattr(self, "_section_store_state", ""))
+        return settings
+
     def query(
         self,
         question: str,
@@ -3090,18 +3176,40 @@ English:"""
         empty_metadata = {"has_ref": False, "top_score": 0.0, "ref_count": 0,
                           "is_high_risk": False, "excluded_figures": [],
                           "excluded_text": []}
-
         if not self.loaded or not self.chunks:
             return "", "", empty_metadata
 
         _require_retrieval_dependencies()
 
+        # 檢索路徑(data flywheel 用):每一階段的候選、分數與決策。只記身分與數字,
+        # 不記 content;`stage` 記到哪一步就是在哪一步結束。從這裡起每一條 return
+        # 都帶著它。放在依賴檢查**之後**:缺 NumPy / jieba 必須以 DependencyError
+        # fail-loud,不能被這裡的任何 AttributeError 搶先(沒載入的 KB 不會被記錄,
+        # 所以上面那條 return 沒有 trace 也無妨)。
+        loaded_meta = getattr(self, "_loaded_metadata", None) or {}
+        trace: dict = {
+            "schema": TRACE_SCHEMA,
+            "stage": "start",
+            "query": {"question": question, "source_filter": source,
+                      "strict": bool(is_strict_mode), "top_k": top_k},
+            "kb": {"path": Path(str(getattr(self, "path", "") or "")).name,
+                   "store_generation": str(loaded_meta.get("store_generation", "")),
+                   "chunks": len(self.chunks)},
+            "settings": self._retrieval_settings(),
+            "expansion": None,
+            "candidates": [],
+        }
+        empty_metadata["trace"] = trace
+
         if source:
             metadata_filter = dict(metadata_filter or {})
             metadata_filter["source"] = source
+        self._last_expansion = None  # _hybrid_search 會填;被 monkeypatch 掉就保持 None(未知)
         candidates = self._hybrid_search(
             question, KNOWLEDGE_CANDIDATE_K, metadata_filter=metadata_filter
         )
+        trace["stage"] = "hybrid"
+        trace["expansion"] = self._last_expansion
         if not candidates:
             return "", "", empty_metadata
 
@@ -3111,6 +3219,9 @@ English:"""
 
         # P0 改進：應用來源權重（spec/manual/api 優先）
         candidates = self._apply_source_weighting(candidates, trust_map)
+        trace["candidates"] = [_trace_candidate(c) for c in candidates[:TRACE_MAX_CANDIDATES]]
+        trace["candidate_count"] = len(candidates)
+        trace["candidates_truncated"] = len(candidates) > TRACE_MAX_CANDIDATES
 
         # 動態門檻：短問題用較低門檻，嚴格模式用較高門檻
         query_tokens = self._estimate_tokens(question)
@@ -3181,6 +3292,20 @@ English:"""
                 question, candidate.gate_bm25, candidate.chunk
             )
         ]
+        trace["stage"] = "gate"
+        trace["strict_excluded"] = {"figures": len(excluded_figures), "text": len(excluded_text)}
+        trace["decision"] = {
+            "base_threshold": _r4(base_threshold),
+            "min_gate_score": _r4(min_gate_score),
+            "top_gate_score": _r4(top_gate_score),
+            "top_gate_id": decision_ranked[0].chunk.get("id"),
+            "is_high_risk": bool(is_high_risk),
+        }
+        # 通過 gate 的標在候選上(不另存一份 id 清單:section 展開時那份清單比候選本身還肥)。
+        passed_ids = {c.chunk.get("id") for c in filtered}
+        for entry in trace["candidates"]:
+            entry["passed"] = entry["id"] in passed_ids
+        trace["gate_passed_count"] = len(filtered)
         if not filtered:
             return self._untrusted_only_result(empty_metadata, excluded_figures)
 
@@ -3205,6 +3330,14 @@ English:"""
             is_strict_mode=is_strict_mode,
         )
         reranked_chunks = [chunk for _score, chunk in reranked]
+        trace["stage"] = "rerank"
+        trace["rerank"] = {
+            "applied": any(score is not None for score, _chunk in reranked),
+            "input_count": len(filtered),
+            "output_k": rerank_output_k,
+            "effective_top_k": effective_top_k,
+            "output": [{"id": chunk.get("id"), "score": _r4(score)} for score, chunk in reranked],
+        }
         if not reranked_chunks:
             return self._untrusted_only_result(empty_metadata, excluded_figures)
 
@@ -3217,6 +3350,9 @@ English:"""
             )
         else:
             top_chunks = reranked_chunks[:effective_top_k]
+        trace["stage"] = "mmr"
+        trace["mmr"] = {"used": bool(USE_MMR), "lambda": _r4(MMR_LAMBDA),
+                        "selected": [chunk.get("id") for chunk in top_chunks]}
 
         if not top_chunks:
             return self._untrusted_only_result(empty_metadata, excluded_figures)
@@ -3247,11 +3383,18 @@ English:"""
                 top_chunks, prelim_pollution_risk, prelim_emb_scores, trust_map
             )
 
+        trace["pollution"] = {
+            "prelim_risk": prelim_pollution_risk,
+            "prelim_gate_scores": [_r4(s) for s in prelim_emb_scores],
+            "selected": [chunk.get("id") for chunk in top_chunks],
+        }
+
         # marker → figure chunk：在合併/過濾**之前**補進來，後面的 strict gate、
         # 截斷計畫與去重才會一視同仁地作用在它身上（待覆核的圖照樣會被擋下）。
         top_chunks = self._resolve_replaced_figures(top_chunks)
 
         merged_chunks = self._merge_adjacent_chunks(top_chunks)
+        trace["stage"] = "merge"
 
         # P0 改進：去重和噪音過濾（尤其 web/OCR 來源）
         merged_chunks = self._filter_noisy_chunks(merged_chunks)
@@ -3336,6 +3479,7 @@ English:"""
         used_emb_scores = [
             self._chunk_gate_score(c, q_emb_for_score) for c in merged_chunks
         ]
+        trace_gate_scores = list(used_emb_scores)  # 與 merged_chunks 逐筆對齊(未過濾)
         used_emb_scores = [s for s in used_emb_scores if s]
         top_emb_score_used = max(used_emb_scores) if used_emb_scores else top_gate_score
         # 觀測用的檢索分數必須算在**同一組 chunk** 上，否則兩個數字不可比
@@ -3343,6 +3487,7 @@ English:"""
         used_retrieval_scores = [
             self._chunk_retrieval_score(c, q_emb_for_score) for c in merged_chunks
         ]
+        trace_retrieval_scores = list(used_retrieval_scores)
         used_retrieval_scores = [s for s in used_retrieval_scores if s]
         top_retrieval_score = (
             max(used_retrieval_scores) if used_retrieval_scores else top_emb_score_used
@@ -3574,6 +3719,33 @@ English:"""
                 "shown_range": list(trunc["shown_range"]) if trunc.get("shown_range") else None,
             })
 
+        # trace 的最終 REF:與上面 refs 用同一份 merged_chunks / ref_truncation,逐筆對齊。
+        trace["stage"] = "done"
+        trace["final"] = []
+        for index, c in enumerate(merged_chunks):
+            trunc = ref_truncation[index] if index < len(ref_truncation) else {}
+            content = str(c.get("content", ""))
+            trace["final"].append({
+                "ids": _trace_member_ids(c, self.chunks),
+                "source": c.get("source", ""),
+                "page": c.get("page", 0),
+                "section": c.get("section", ""),
+                "type": c.get("type", "doc"),
+                "gate": _r4(trace_gate_scores[index]) if index < len(trace_gate_scores) else None,
+                "retrieval": (_r4(trace_retrieval_scores[index])
+                              if index < len(trace_retrieval_scores) else None),
+                "chars": len(content),
+                "shown_chars": trunc.get("shown_chars"),
+                "truncated": bool(trunc.get("truncated")),
+                "snippet": content[:TRACE_SNIPPET_CHARS],
+            })
+        trace["outcome"] = {
+            "confidence_label": confidence_label,
+            "top_gate_score_used": _r4(top_emb_score_used),
+            "top_retrieval_score": _r4(top_retrieval_score),
+            "ref_count": len(merged_chunks),
+        }
+
         # P1 改進：計算污染指標
         unique_sources = set(c.get("source", "") for c in merged_chunks)
         score_variance = 0.0
@@ -3618,7 +3790,9 @@ English:"""
             # P1 改進：Context 污染指標
             "unique_sources": len(unique_sources),     # 引用了幾個不同來源
             "score_variance": score_variance,          # 分數變異（越大越好）
-            "context_pollution_risk": context_pollution_risk  # low/medium/high
+            "context_pollution_risk": context_pollution_risk,  # low/medium/high
+            # 檢索路徑(data flywheel 用);只有 mcp_server 的紀錄會把它存下來。
+            "trace": trace,
         }
 
         return model_output, display_output, metadata

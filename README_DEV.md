@@ -480,17 +480,29 @@ symbol 掃描。`.cfg` / `.json` / `.sh` / `.mk` 這些設定檔**仍在** symbo
 
 ## data flywheel 是什麼
 
-`data_flywheel.py` 才是互動資料收集器。它預設關閉，只有 `client.json` 打開才會寫資料：
+`data_flywheel.py` 才是互動資料收集器。它**永久開啟、沒有開關**：以前是 `client.json` 的
+`collect_data`，那個鍵已移除（留在檔裡會 fail-loud，拿掉即可）。唯一不寫的是 readonly session
+（canary / eval / replay 跑的是合成題目）：`client_config.apply_to_config(readonly=True)` 把
+`config.COLLECT_DATA` 關到底，routing eval 自己的行程也一律關，不靠使用者先改設定。
 
-```json
-{ "collect_data": true }
-```
-
-輸出位置**固定**（沒有覆寫鍵）：
+輸出位置**固定**（沒有覆寫鍵），要撈檔案就去這個目錄：
 
 ```text
 ~/.local/state/codetrail/data/<root 雜湊>/interactions.jsonl
 ```
+
+`python3 data_flywheel.py where --root <專案>` 印出某個專案的確切目錄
+（雜湊算的是 resolve 後的絕對路徑，同一個專案永遠同一個目錄）。
+
+每一筆紀錄的 `metadata.trace` 是那一次檢索的**完整路徑**，由 `KnowledgeBase.query()` 產生：
+模型送進來的查詢與 expansion 擴寫、hybrid 候選（chunk id / 來源 / 頁 / 章節 / RRF / 檢索分 /
+gate 分 / BM25）、門檻與 margin 決策、通過 gate 的清單、reranker 有沒有真的跑與各分數、
+MMR 選了誰、污染控制、最終 REF（成員 id、分數、截斷、前 200 字）與信心結論；`stage` 記到
+哪一步就是在哪一步結束。同一筆也記這次生效的檢索設定與 KB 的 `store_generation`，所以改了
+RAG 之後可以拿舊紀錄的查詢重跑、逐階段比對。`code_rag_search` 的紀錄則記排序結果的
+路徑 / 行 / 符號與 combined / rerank / final 分數，不帶程式碼文字。
+MCP 端的 `question` 是模型送進工具的查詢字串、`answer` 只是 REF 標頭（MCP 沒有回合邊界，
+看不到使用者原話與最後的回答）；要對回整段對話，用 session 檔的時間戳與工具參數對上。
 
 與 session 檔同一套 root 雜湊與 `client_paths` 防線：目錄 0700、檔 0600、拒 symlink
 與 hard link、dir-fd append。**絕不落進被分析的 repo** —— 以前預設是相對路徑
@@ -498,7 +510,7 @@ symbol 掃描。`.cfg` / `.json` / `.sh` / `.mk` 這些設定檔**仍在** symbo
 程式片段的內容實際上寫在客戶的 repo 裡，還是普通的 `open(..., 'a')`。
 讀取端（eval 工具）以明確的路徑參數讀。
 
-記錄內容包含 question、answer、refs、code snippets、mode、KB score、repo commit、model tag、agent tool calls、files read。這些資料在 NDA 場景通常含敏感內容；預設的 repo 內輸出已由 `.gitignore` 排除。
+記錄內容包含 question、answer、refs、code snippets、mode、KB score、repo commit、model tag、agent tool calls、files read。這些資料在 NDA 場景通常含敏感內容；它們只在本機 state 目錄，不進 repo、不出機器。
 
 MCP server 端只記 KB-shaped tools：
 
@@ -511,9 +523,11 @@ MCP server 端只記 KB-shaped tools：
 常用命令：
 
 ```bash
-python3 data_flywheel.py stats
-python3 data_flywheel.py rate --file data/interactions.jsonl
-python3 data_flywheel.py export --file data/interactions.jsonl --output data/training.jsonl
+python3 data_flywheel.py where  --root <專案>                      # 印出收集目錄
+python3 data_flywheel.py trace  --file <目錄>/interactions.jsonl --last 5   # 攤開最近 5 筆的檢索路徑
+python3 data_flywheel.py stats  --file <目錄>/interactions.jsonl
+python3 data_flywheel.py rate   --file <目錄>/interactions.jsonl
+python3 data_flywheel.py export --file <目錄>/interactions.jsonl --output <輸出>.jsonl
 ```
 
 ---
@@ -522,7 +536,7 @@ python3 data_flywheel.py export --file data/interactions.jsonl --output data/tra
 
 | 項目 | eval | data flywheel |
 |---|---|---|
-| 會自動記錄對話 | 不會 | 會，但必須在 `client.json` 設 `"collect_data": true` |
+| 會自動記錄對話 | 不會 | 會（永久開啟；readonly session 除外） |
 | 用途 | 固定題庫回歸測試 | 收集真實互動樣本 |
 | 日常使用是否需要 | 不需要 | 不需要 |
 | 是否適合成熟產品 | 適合做 regression gate | 適合做資料閉環，但要更嚴格處理隱私 |
