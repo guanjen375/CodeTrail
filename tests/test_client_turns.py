@@ -583,6 +583,48 @@ def test_auto_compaction_runs_after_a_completed_answer():
     assert any(e.get("message") == "已壓縮" for e in events)
 
 
+@pytest.mark.parametrize("manual", [False, True])
+def test_compaction_activity_reaches_the_ui_before_the_terminal_event(manual):
+    """手動與答案後的摘要進度都必須到 UI,且不能冒充答案或提早結束回合。"""
+    class _ActivityEngine(_Engine):
+        activity_callback = None
+
+        def set_activity_callback(self, callback):
+            self.activity_callback = callback
+
+    engine = _ActivityEngine()
+    activity = {
+        "type": "activity",
+        "sessionID": engine.session_id,
+        "part": {
+            "operation": "compact", "phase": "prompt_processing", "percent": 92,
+        },
+    }
+
+    class _ProgressCompactor(_Compactor):
+        def compact(self, *, manual=False):
+            self.calls.append(manual)
+            if engine.activity_callback is not None:
+                engine.activity_callback(activity)
+            return _Outcome("skipped", "沒有更動歷史")
+
+    compactor = _ProgressCompactor()
+    coordinator, recorder = _coordinator(engine, compactor=compactor)
+    if manual:
+        coordinator.start_compaction()
+    else:
+        coordinator.start_turn("hi")
+    events = recorder.terminal()
+    assert activity in events, "摘要的 92% 進度沒有從 engine 到達 UI"
+    assert compactor.calls == [manual]
+    assert events.index(activity) < len(events) - 1
+    assert not client_events.is_terminal_event(activity)
+    assert client_events.event_generated_text(activity) == ""
+    assert client_events.completed_tool_call(activity) is None
+    assert [client_events.event_generated_text(event) for event in events
+            if client_events.event_generated_text(event)] == ([] if manual else ["ok"])
+
+
 def test_a_cancel_accepted_during_compaction_ends_with_a_cancelled_terminal():
     """答案已經給了,但這一輪的結果是「中斷」——cancel 回了 True,終結事件就必須是 cancelled。"""
     compacting = threading.Event()

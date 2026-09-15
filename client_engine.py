@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import json
+import math
 import os
 import threading
 import time
@@ -491,6 +492,24 @@ def _guarded(stream: Any, cancel: threading.Event):
         yield chunk
 
 
+def _prompt_percent(progress: Any) -> int | None:
+    """Only server counts determine progress; processed already includes cache."""
+    if not isinstance(progress, Mapping):
+        return None
+    processed, total = progress.get("processed"), progress.get("total")
+    for value in (processed, total):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+    if total <= 0 or not 0 <= processed <= total:
+        return None
+    # Integer ratios avoid overflow and rounding an exact integer percentage down.
+    numerator, denominator = processed.as_integer_ratio()
+    total_numerator, total_denominator = total.as_integer_ratio()
+    return (100 * numerator * total_denominator) // (denominator * total_numerator)
+
+
 class _Abandonable:
     """可放棄等待的預熱 I/O；transport 的 socket 由獨立 cancellation 收掉。
 
@@ -724,6 +743,52 @@ class Engine:
         self._prime_epoch = 0
         self._prime_request: llama_client.RequestCancellation | None = None
         self._session_switching = 0
+        # UI activity is separate from persisted messages and headless events.
+        self._activity_callback: Callable[[dict[str, Any]], None] | None = None
+
+    def set_activity_callback(self, callback: Callable[[dict[str, Any]], None] | None) -> None:
+        self._activity_callback = callback
+
+    def _report_activity(
+        self, operation: str, phase: str, *, percent: int | None = None, tool: str = ""
+    ) -> None:
+        """Publish outside cancellation locks; UI failures cannot end a turn."""
+        if self._cancel.is_set():
+            raise TurnCancelled("這一輪已被使用者中斷")
+        callback = self._activity_callback
+        if callback is not None:
+            try:
+                callback(client_events.activity_event(
+                    self.session_id, operation=operation, phase=phase, percent=percent, tool=tool,
+                ))
+            except Exception:  # noqa: BLE001 - transient UI status is advisory
+                pass
+        # A synchronous UI bridge may accept Ctrl-C while this callback is waiting.
+        if self._cancel.is_set():
+            raise TurnCancelled("這一輪已被使用者中斷")
+
+    def _activity_chunks(self, stream: Any, *, operation: str):
+        """Track each request independently without changing its response chunks."""
+        generating = False
+        last_percent: Any = object()
+        for chunk in _guarded(stream, self._cancel):
+            if self._cancel.is_set():
+                raise TurnCancelled("這一輪已被使用者中斷")
+            if not generating and isinstance(chunk, Mapping):
+                choices = chunk.get("choices")
+                choice = choices[0] if isinstance(choices, list) and choices else None
+                delta = choice.get("delta") if isinstance(choice, Mapping) else None
+                if isinstance(delta, Mapping) and any(
+                    delta.get(key) for key in ("content", "reasoning_content", "tool_calls")
+                ):
+                    generating = True
+                    self._report_activity(operation, "generating")
+                elif "prompt_progress" in chunk:
+                    percent = _prompt_percent(chunk["prompt_progress"])
+                    if percent != last_percent:
+                        last_percent = percent
+                        self._report_activity(operation, "prompt_processing", percent=percent)
+            yield chunk
 
     # ---- tools ---------------------------------------------------------
     def load_tools(self) -> None:
@@ -790,25 +855,29 @@ class Engine:
 
     def complete(self, messages: Sequence[Mapping[str, Any]], *, source: str):
         """一次非工具的模型呼叫(壓縮摘要用)。走同一個 gate 與同一把鎖。"""
-        payload = [dict(message) for message in messages]
-        usage = context_budget.check_and_log(
-            source=source,
-            requested_num_ctx=self.options.n_ctx,
-            messages=payload,
-            model=self.options.model,
-            reserved_output_tokens=self.options.max_output_tokens,
-            emit=False,
-        )
+        operation = "compact" if source == "compaction" else "response"
         content: list[str] = []
         reasoning: list[str] = []
         finish = ""
         try:
             self._begin_turn()
+            self._report_activity(operation, "preparing")
+            payload = [dict(message) for message in messages]
+            usage = context_budget.check_and_log(
+                source=source,
+                requested_num_ctx=self.options.n_ctx,
+                messages=payload,
+                model=self.options.model,
+                reserved_output_tokens=self.options.max_output_tokens,
+                emit=False,
+            )
+            self._report_activity(operation, "waiting_model")
             with self._model_slot() as slot:
                 # 壓縮是同一輪的尾巴:取消若落在 run_tool_loop 結束之後、摘要開始
                 # 之前,這裡就要接住,不然摘要照常完成而旗標留到下一輪。
                 if self._cancel.is_set():
                     raise TurnCancelled("這一輪已被使用者中斷")
+                self._report_activity(operation, "waiting_response")
                 stream = self._open_stream(
                     lambda: llama_client.chat_completions(
                         base_url=self.options.base_url,
@@ -819,14 +888,14 @@ class Engine:
                         top_k=config.CHAT_TOP_K,
                         min_p=config.CHAT_MIN_P,
                         stream=True,
-                        extra={"max_tokens": self.options.max_output_tokens},
+                        extra={"max_tokens": self.options.max_output_tokens, "return_progress": True},
                         timeout=self.options.request_timeout,
                     ),
                     slot,
                 )
                 try:
                     try:
-                        for chunk in _guarded(stream, self._cancel):
+                        for chunk in self._activity_chunks(stream, operation=operation):
                             if self._cancel.is_set():
                                 raise TurnCancelled("這一輪已被使用者中斷")
                             context_budget.parse_usage_from_stream_chunk(chunk, usage)
@@ -1763,6 +1832,7 @@ class Engine:
         tool_choice: str = "auto",
         prior_preambles: set[str] | None = None,
     ) -> dict[str, Any]:
+        self._report_activity("response", "preparing")
         payload, transform = self.payload_messages()
         if tool_choice == "none":
             # 只改局部 wire payload,先加指示再 gate;session、預熱 prefix 與下一輪
@@ -1785,10 +1855,12 @@ class Engine:
         calls: dict[int, dict[str, Any]] = {}
         finish = ""
 
+        self._report_activity("response", "waiting_model")
         with self._model_slot() as slot:
             if self._cancel.is_set():
                 # 等共用 model_lock 期間被取消:拿到鎖之後不得再發請求。
                 raise TurnCancelled("這一輪已被使用者中斷")
+            self._report_activity("response", "waiting_response")
             stream = self._open_stream(
                 lambda: llama_client.chat_completions(
                     base_url=self.options.base_url,
@@ -1801,7 +1873,7 @@ class Engine:
                     tools=self._openai_tools,
                     tool_choice=tool_choice,
                     stream=True,
-                    extra={"max_tokens": self.options.max_output_tokens},
+                    extra={"max_tokens": self.options.max_output_tokens, "return_progress": True},
                     timeout=self.options.request_timeout,
                 ),
                 slot,
@@ -1809,7 +1881,7 @@ class Engine:
             protocol_error = ""
             try:
                 try:
-                    for chunk in _guarded(stream, self._cancel):
+                    for chunk in self._activity_chunks(stream, operation="response"):
                         if self._cancel.is_set():
                             raise TurnCancelled("這一輪已被使用者中斷")
                         context_budget.parse_usage_from_stream_chunk(chunk, usage)
@@ -1966,6 +2038,7 @@ class Engine:
                 )
             granted = False
             if approve is not None:
+                self._report_activity("response", "approval", tool=name)
                 granted = bool(
                     approve(ApprovalRequest(self.session_id, name, dict(arguments)))
                 )
@@ -1983,6 +2056,7 @@ class Engine:
 
         if self._cancel.is_set():
             raise TurnCancelled("這一輪已被使用者中斷")
+        self._report_activity("response", "tool", tool=name)
         try:
             result = self._call_tool(name, arguments)
         except client_mcp.McpCallCancelledError:

@@ -693,11 +693,14 @@ class CodeTrailApp(App[int]):
         self._approval_screens: dict[str, ApprovalScreen] = {}
         self._turn_started: float | None = None
         self._spinner = 0
-        #: 這一輪到目前為止收到幾段 reasoning、有沒有開始吐答案。狀態列的相位只用
-        #: 這兩個**畫面自己收到的**計數,不讀 engine 的內部狀態。
+        #: 本次模型請求收到幾段 reasoning、有沒有開始吐答案。preparing 只重置
+        #: 狀態列相位,不刪掉已顯示的 widget 或 transcript。
         self._reasoning_chunks = 0
         self._answer_started = False
         self._compacting = False
+        self._activity: dict[str, Any] | None = None
+        self._activity_generating = False
+        self._cancelling = False
         #: 最後一次由協調器跑完的預熱:``(時間, 觸發點, PrimeOutcome | None)``。不分是誰
         #: 排的(mount / new / session 由這裡排,compaction 由協調器自己排),全部經
         #: ``on_prime`` 回到這裡。只給 ``/status`` 看,不進對話區。
@@ -864,13 +867,18 @@ class CodeTrailApp(App[int]):
     # ---- 事件 ----------------------------------------------------------
     def handle_event(self, event: Mapping[str, Any]) -> None:
         kind = event.get("type")
+        if kind == client_events.TYPE_ACTIVITY:
+            self._on_activity(event)
+            return
         if kind == client_events.TYPE_TEXT_DELTA:
             self._answer_started = True
+            self._mark_generating()
             self._ensure_assistant().append(str(client_events.event_part(event).get("text", "")))
             self.query_one("#log", VerticalScroll).scroll_end(animate=False)
             return
         if kind == client_events.TYPE_TEXT:
             self._answer_started = True
+            self._mark_generating()
             text = str(client_events.event_part(event).get("text", ""))
             block = self._ensure_assistant()
             block.finish(text if not block.text else "")
@@ -884,11 +892,54 @@ class CodeTrailApp(App[int]):
             self._append(NoticeLine(str(event.get("message", ""))))
             return
         if kind == client_events.TYPE_ERROR:
+            self._turn_started = None
+            self._reset_phase()
             self._append(ErrorLine(str(event.get("message", ""))))
+            self._refresh_status()
             return
         if kind == client_events.TYPE_STEP_FINISH:
             self._on_step_finish(event)
             return
+
+    def _on_activity(self, event: Mapping[str, Any]) -> None:
+        """只收本輪的短暫活動;它不進對話區,也不重播到別段 session。"""
+        if (
+            event.get("sessionID") != self.engine.session_id
+            or self._turn_started is None
+            or not self.coordinator.busy
+            or self.coordinator.cancelled
+        ):
+            return
+        part = client_events.event_part(event)
+        operation, phase = part.get("operation"), part.get("phase")
+        if operation not in ("response", "compact") or phase not in (
+            "preparing", "waiting_model", "waiting_response", "prompt_processing",
+            "generating", "tool", "approval",
+        ):
+            return
+        if phase == "preparing":
+            self._reset_phase(compacting=operation == "compact")
+        elif phase == "prompt_processing" and self._activity_generating:
+            # 同一請求開始生成後,晚到的 prefill 進度不得蓋掉答案或摘要階段。
+            return
+        if phase == "generating":
+            self._activity_generating = True
+        activity: dict[str, Any] = {"operation": operation, "phase": phase}
+        percent = part.get("percent")
+        if phase == "prompt_processing" and type(percent) is int and 0 <= percent <= 100:
+            activity["percent"] = percent
+        tool = part.get("tool")
+        if phase in ("tool", "approval") and isinstance(tool, str) and tool:
+            activity["tool"] = tool
+        self._activity = activity
+        self._refresh_status()
+
+    def _mark_generating(self) -> None:
+        self._activity_generating = True
+        if self._activity is not None:
+            self._activity = {
+                "operation": self._activity["operation"], "phase": "generating",
+            }
 
     def _on_tool_event(self, event: Mapping[str, Any]) -> None:
         part = client_events.event_part(event)
@@ -936,6 +987,7 @@ class CodeTrailApp(App[int]):
 
     def _on_reasoning(self, token: str) -> None:
         self._reasoning_chunks += 1
+        self._mark_generating()
         self._ensure_reasoning().append(token)
         if self.show_reasoning:
             self.query_one("#log", VerticalScroll).scroll_end(animate=False)
@@ -1079,6 +1131,7 @@ class CodeTrailApp(App[int]):
         self._assistant = None
         self._reasoning = None
         self._turn_started = None
+        self._reset_phase()
         # 畫面也要換過去:上一段對話留在畫面上的話,新對話的第一個回答會接在
         # 別段對話的下面,而模型完全看不到那一段。
         self._mount_history((), clear=True)
@@ -1159,6 +1212,7 @@ class CodeTrailApp(App[int]):
         self._assistant = None
         self._reasoning = None
         self._turn_started = None
+        self._reset_phase()
         self._mount_history(widgets, clear=True)
         self._append(NoticeLine(self._resumed_notice(snapshot, entries)))
         self._recount_context()
@@ -1217,6 +1271,9 @@ class CodeTrailApp(App[int]):
         # 同步跑在這裡就是整個畫面凍住,而且 worker 送事件用的
         # call_from_thread 也會排在後面一起卡住。
         if self.coordinator.cancel(block=False):
+            self._reset_phase()
+            self._cancelling = True
+            self._refresh_status()
             return
         if self.coordinator.busy:
             # 有一輪在跑,但答案已經寫定 / 收尾中:沒有東西可取消,不得
@@ -1329,15 +1386,38 @@ class CodeTrailApp(App[int]):
         self._reasoning_chunks = 0
         self._answer_started = False
         self._compacting = compacting
+        self._activity = None
+        self._activity_generating = False
+        self._cancelling = False
 
     def _turn_phase(self) -> str:
         """這一輪目前在哪一段。
 
-        reasoning 模型在第一個可見字之前可能想很久(``show_reasoning`` 預設是關的,
-        畫面上只有一個 spinner),那段時間跟「卡住了」在畫面上長得一模一樣。相位只
-        看**這個介面自己收到的事件**:不讀 engine 的內部狀態,顯示不會跟真的送出去
-        的東西打架。
+        只顯示收到的活動與文字/reasoning;沒有可靠進度就不猜百分比。
         """
+        if self._cancelling:
+            return "中斷中"
+        if self._activity is not None:
+            operation = self._activity["operation"]
+            phase = self._activity["phase"]
+            labels = {
+                "preparing": "準備請求",
+                "waiting_model": "等待模型",
+                "waiting_response": "等待回應",
+                "prompt_processing": "prompt processing",
+                "generating": "產生摘要中" if operation == "compact" else "產生回應中",
+                "tool": "執行工具",
+                "approval": "等待核准",
+            }
+            label = labels[phase]
+            if "percent" in self._activity:
+                label += f"({self._activity['percent']}%)"
+            if "tool" in self._activity:
+                label += f" {self._activity['tool']}"
+            if operation == "compact":
+                return f"compact · {label}"
+            if phase != "generating" or not (self._answer_started or self._reasoning_chunks):
+                return label
         if self._compacting:
             return "壓縮中"
         if self._answer_started:

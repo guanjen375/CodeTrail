@@ -1169,6 +1169,275 @@ def test_the_status_bar_carries_the_session_context_and_modes():
         assert needle in status, (needle, status)
 
 
+@pytest.mark.smoke
+def test_prompt_progress_replaces_waiting_and_previous_answer_phase():
+    """真實 SSE 的 92% 要出現在等待列,下一步與答案後壓縮也不能卡在「回答中」。"""
+    engine = _Engine()
+
+    async def body():
+        app = client_app.CodeTrailApp(engine, show_reasoning=True)
+        async with app.run_test() as pilot:
+            app.coordinator.begin_turn()
+            app._turn_started = time.monotonic()
+            try:
+                statuses = []
+                for operation in ("response", "response", "compact"):
+                    app.handle_event({
+                        "type": "activity", "sessionID": engine.session_id,
+                        "part": {"operation": operation, "phase": "preparing"},
+                    })
+                    app.handle_event({
+                        "type": "activity", "sessionID": engine.session_id,
+                        "part": {
+                            "operation": operation, "phase": "prompt_processing", "percent": 92,
+                        },
+                    })
+                    app._refresh_status()
+                    statuses.append(app.status_text)
+                    if operation == "response":
+                        app._on_reasoning("先讀工具結果")
+                        app.handle_event(client_events.text_event(engine.session_id, "已讀到結果"))
+                await pilot.pause()
+                return statuses, _snapshot(app)
+            finally:
+                app.coordinator.finish_turn()
+
+    statuses, seen = _run(body)
+    assert all("prompt processing(92%)" in status for status in statuses), statuses
+    assert "compact · prompt processing(92%)" in statuses[-1], statuses[-1]
+    assert all("回答中" not in status and "thinking" not in status for status in statuses)
+    assert seen["assistant"] == ["已讀到結果", "已讀到結果"]
+    assert seen["reasoning"] == [("先讀工具結果", True), ("先讀工具結果", True)]
+    assert seen["summaries"] == []
+
+
+@pytest.mark.smoke
+def test_activity_ignores_late_progress_and_resets_each_model_request():
+    """晚到 prefill 不蓋掉生成;每步重新等候,工具與核准也不沿用舊答案相位。"""
+    engine = _Engine()
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            app.coordinator.begin_turn()
+            app._turn_started = time.monotonic()
+
+            def activity(phase, **fields):
+                app.handle_event(client_events.activity_event(
+                    engine.session_id, operation="response", phase=phase, **fields,
+                ))
+                return app._turn_phase()
+
+            try:
+                assert activity("preparing") == "準備請求"
+                assert activity("waiting_model") == "等待模型"
+                assert activity("waiting_response") == "等待回應"
+                assert activity("prompt_processing", percent=92) == "prompt processing(92%)"
+                assert activity("generating") == "產生回應中"
+                assert activity("prompt_processing", percent=100) == "產生回應中"
+                app._on_reasoning("只在原 reasoning 區塊")
+                assert activity("prompt_processing", percent=100) == "thinking 1 段"
+                app.handle_event(client_events.text_delta_event(engine.session_id, "原回答"))
+                assert activity("prompt_processing", percent=100) == "回答中"
+                assert activity("approval", tool="apply_patch") == "等待核准 apply_patch"
+                assert activity("tool", tool="list_dir") == "執行工具 list_dir"
+                assert activity("prompt_processing", percent=100) == "執行工具 list_dir"
+                assert activity("preparing") == "準備請求"
+                assert app._reasoning_chunks == 0 and app._answer_started is False
+                assert activity("waiting_response") == "等待回應"
+                for percent in (None, True, -1, 101, 92.5, float("nan"), float("inf"), "92"):
+                    assert activity("prompt_processing", percent=percent) == "prompt processing"
+                assert activity("prompt_processing", percent=0) == "prompt processing(0%)"
+                assert activity("prompt_processing", percent=100) == "prompt processing(100%)"
+                app.handle_event({"type": "activity", "sessionID": engine.session_id, "part": []})
+                assert app._turn_phase() == "prompt processing(100%)"
+                # 文字回呼本身也要移除舊百分比,即使 generating 的 UI 通知沒有送達。
+                app.handle_event(client_events.text_delta_event(engine.session_id, "續答"))
+                assert app._turn_phase() == "回答中"
+                assert app._activity == {"operation": "response", "phase": "generating"}
+                await pilot.pause()
+                seen = _snapshot(app)
+                assert seen["assistant"] == ["原回答續答"]
+                assert seen["reasoning"] == [("只在原 reasoning 區塊", False)]
+                assert seen["tools"] == []  # activity 不自行新增或更新工具內容。
+            finally:
+                app.coordinator.finish_turn()
+
+    _run(body)
+
+
+@pytest.mark.smoke
+def test_activity_is_cleared_when_a_turn_stops():
+    """終結、錯誤與接受 Ctrl-C 立即清暫態,錯 session/已結束回合不得再灌進度。"""
+    engine = _Engine()
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            for ending in ("stop", "cancelled", "error", "error_event", "interrupt"):
+                app.coordinator.begin_turn()
+                app._turn_started = time.monotonic()
+                try:
+                    for phase, percent in (("preparing", None), ("prompt_processing", 92)):
+                        app.handle_event(client_events.activity_event(
+                            engine.session_id, operation="compact", phase=phase, percent=percent,
+                        ))
+                    app.handle_event(client_events.activity_event(
+                        "another-session", operation="response", phase="preparing",
+                    ))
+                    assert app._turn_phase() == "compact · prompt processing(92%)"
+                    app.handle_event(client_events.step_finish_event(
+                        engine.session_id, reason=client_events.REASON_TOOL_CALLS,
+                    ))
+                    assert app._turn_phase() == "compact · prompt processing(92%)"
+                    if ending == "interrupt":
+                        app.action_interrupt()
+                        assert app.coordinator.cancelled
+                    elif ending == "error_event":
+                        app.handle_event(client_events.error_event(engine.session_id, "request failed"))
+                    else:
+                        app.handle_event(client_events.step_finish_event(engine.session_id, reason=ending))
+                    assert app._activity is None
+                    if ending == "interrupt":
+                        assert app._turn_started is not None
+                        assert app._turn_phase() == "中斷中"
+                        assert "中斷中" in app.status_text
+                    else:
+                        assert app._turn_started is None
+                    assert app._compacting is False
+                    # 協調器尚未放回合鎖時,UI 已收到終結也不准重新開始顯示。
+                    app.handle_event(client_events.activity_event(
+                        engine.session_id, operation="compact", phase="preparing",
+                    ))
+                    app.handle_event(client_events.activity_event(
+                        engine.session_id, operation="compact", phase="prompt_processing", percent=100,
+                    ))
+                    assert app._activity is None
+                    assert "prompt processing" not in app.status_text
+                    if ending == "interrupt":
+                        assert app._turn_phase() == "中斷中"
+                        app.handle_event(client_events.step_finish_event(
+                            engine.session_id, reason=client_events.REASON_CANCELLED,
+                        ))
+                        assert app._turn_started is None
+                        assert "中斷中" not in app.status_text
+                finally:
+                    app.coordinator.finish_turn()
+            # 只有時間戳也不算 active turn,預熱或遲到事件不得復活狀態列。
+            app._turn_started = time.monotonic()
+            app.handle_event(client_events.activity_event(
+                engine.session_id, operation="response", phase="prompt_processing", percent=92,
+            ))
+            assert app._activity is None
+            await pilot.pause()
+
+    _run(body)
+
+
+@pytest.mark.smoke
+def test_activity_is_cleared_on_new_and_resumed_sessions():
+    """session 切換清掉殘留活動,舊 session 的延遲通知不能覆蓋新回合。"""
+    engine = _Engine()
+    engine.stored[RESUMED_ID] = _Snapshot(RESUMED_ID)
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            for command in ("/new", f"/resume {RESUMED_ID}"):
+                old_session = engine.session_id
+                app.coordinator.begin_turn()
+                app._turn_started = time.monotonic()
+                try:
+                    for phase, percent in (("preparing", None), ("prompt_processing", 92)):
+                        app.handle_event(client_events.activity_event(
+                            old_session, operation="compact", phase=phase, percent=percent,
+                        ))
+                    assert app._turn_phase() == "compact · prompt processing(92%)"
+                finally:
+                    app.coordinator.finish_turn()
+                app._command(command)
+                assert app._activity is None
+                assert app._compacting is False
+                assert app._activity_generating is False
+                assert app._turn_started is None
+                assert "prompt processing" not in app.status_text
+                app.coordinator.begin_turn()
+                app._turn_started = time.monotonic()
+                try:
+                    app.handle_event(client_events.activity_event(
+                        engine.session_id, operation="response", phase="preparing",
+                    ))
+                    app.handle_event(client_events.activity_event(
+                        old_session, operation="compact", phase="prompt_processing", percent=92,
+                    ))
+                    assert app._turn_phase() == "準備請求"
+                finally:
+                    app.coordinator.finish_turn()
+            await pilot.pause()
+
+    _run(body)
+
+
+@pytest.mark.smoke
+def test_manual_compaction_activity_uses_the_worker_bridge_without_answer_output():
+    """/compact 的進度只在 UI 執行緒更新狀態,摘要生成不冒到回答或 reasoning 區。"""
+    engine = _Engine()
+    progressed, generate, generated, finish = (threading.Event() for _ in range(4))
+    ui_threads = []
+
+    async def body():
+        def compact(*, manual=False):
+            assert manual is True
+            for phase, percent in (("preparing", None), ("waiting_response", None), ("prompt_processing", 92)):
+                app._emit_from_worker(client_events.activity_event(
+                    engine.session_id, operation="compact", phase=phase, percent=percent,
+                ))
+            progressed.set()
+            assert generate.wait(5)
+            app._emit_from_worker(client_events.activity_event(
+                engine.session_id, operation="compact", phase="generating",
+            ))
+            # 摘要生成後即使還來 prefill 數字,也不能倒退回 100%。
+            app._emit_from_worker(client_events.activity_event(
+                engine.session_id, operation="compact", phase="prompt_processing", percent=100,
+            ))
+            generated.set()
+            assert finish.wait(5)
+            return types.SimpleNamespace(status="compacted", message="已壓縮")
+
+        compactor = types.SimpleNamespace(mode="codetrail", compact=compact)
+        app = client_app.CodeTrailApp(engine, compactor=compactor)
+        original_handle = app.handle_event
+
+        def handle(event):
+            if event.get("type") == "activity":
+                ui_threads.append(threading.get_ident())
+            original_handle(event)
+
+        app.handle_event = handle
+        async with app.run_test() as pilot:
+            app._command("/compact")
+            try:
+                assert await _until(pilot, progressed.is_set)
+                assert app._turn_phase() == "compact · prompt processing(92%)"
+                generate.set()
+                assert await _until(pilot, generated.is_set)
+                assert app._turn_phase() == "compact · 產生摘要中"
+                finish.set()
+                assert await _until(pilot, lambda: not app.coordinator.busy)
+                assert app._activity is None and app._turn_started is None
+                assert "compact ·" not in app.status_text
+                seen = _snapshot(app)
+                assert seen["assistant"] == [] and seen["reasoning"] == []
+                assert seen["summaries"] == [] and engine.messages == []
+                assert ui_threads and set(ui_threads) == {threading.get_ident()}
+            finally:
+                generate.set()
+                finish.set()
+
+    _run(body)
+
+
 # ============================================================
 # 輸入歷史檔:與 session store 同一組防線
 # ============================================================

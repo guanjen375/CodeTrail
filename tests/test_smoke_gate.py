@@ -39,6 +39,19 @@ TESTS_DIR = Path(__file__).resolve().parent
 
 # AGENTS.md §2「安全相關不要砍」的檢查點 → (守它的說明, 必須存在且帶 smoke 的 node)。
 SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "test_client_activity.py": (
+        "活動只取本次 SSE 的有效 prompt 進度,不重加 cache、不冒充回答或摘要、"
+        "不進 session/headless 事件與預熱;新 UI 回呼返回後仍須接住取消",
+        (
+            "test_request_prompt_progress_reaches_activity_callback",
+            "test_bad_progress_cannot_become_output_or_stall_the_response",
+            "test_activity_callback_failure_preserves_gate_payload_and_history",
+            "test_activity_callback_cancellation_prevents_request_or_more_output",
+            "test_tool_activity_cancellation_prevents_approval_and_dispatch",
+            "test_preparation_gate_failure_releases_turn_without_post",
+            "test_activity_callback_does_not_change_zero_event_prime",
+        ),
+    ),
     "test_code_dependencies.py": (
         "AST與ctags必要能力、快取後端身分、lazy向量與依賴錯誤傳遞",
         (
@@ -778,6 +791,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_two_concurrent_turns_are_refused",
             "test_the_durable_stop_notice_is_published_before_the_turn_starts",
             "test_auto_compaction_only_runs_after_a_completed_answer",
+            "test_compaction_activity_reaches_the_ui_before_the_terminal_event",
             "test_a_cancel_accepted_during_compaction_ends_with_a_cancelled_terminal",
             "test_a_manual_compaction_is_a_turn_and_can_be_cancelled",
             "test_a_session_change_rebinds_the_compactor_without_consuming_the_notice",
@@ -836,6 +850,11 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_new_session_forgets_the_old_tool_blocks",
             "test_the_tui_primes_on_mount_new_and_session_switch_through_the_coordinator",
             "test_the_status_line_reports_the_latest_prime_including_the_ones_after_compaction",
+            "test_prompt_progress_replaces_waiting_and_previous_answer_phase",
+            "test_activity_ignores_late_progress_and_resets_each_model_request",
+            "test_activity_is_cleared_when_a_turn_stops",
+            "test_activity_is_cleared_on_new_and_resumed_sessions",
+            "test_manual_compaction_activity_uses_the_worker_bridge_without_answer_output",
         ),
     ),
     "test_client_store.py": (

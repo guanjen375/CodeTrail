@@ -47,6 +47,9 @@ TYPE_ERROR = "error"
 TYPE_NOTICE = "notice"
 #: 串流中的文字片段。只給 UI;`text` 事件才是這一輪的完整文字。
 TYPE_TEXT_DELTA = "text_delta"
+#: 等待階段與 prompt 進度。只經 TUI 的活動回呼,不進 headless JSONL、session
+#: 或模型歷史;固定階段／數值／工具名以外不攜帶 prompt 或模型輸出。
+TYPE_ACTIVITY = "activity"
 
 STATUS_COMPLETED = "completed"
 STATUS_ERROR = "error"
@@ -142,6 +145,23 @@ def text_delta_event(session_id: str, chunk: str) -> dict[str, Any]:
     """串流片段。**不進 assistant_text**、不影響 terminal 判定 —— 解析器只認
     `text` 事件,所以加這個不會讓 canary / eval 看到同一段文字兩次。"""
     return {"type": TYPE_TEXT_DELTA, "sessionID": session_id, "part": {"text": chunk}}
+
+
+def activity_event(
+    session_id: str,
+    *,
+    operation: str,
+    phase: str,
+    percent: int | None = None,
+    tool: str = "",
+) -> dict[str, Any]:
+    """UI 活動資料;百分比只代表本次 prompt 已處理的 token 比例。"""
+    part: dict[str, Any] = {"operation": operation, "phase": phase}
+    if percent is not None:
+        part["percent"] = percent
+    if tool:
+        part["tool"] = tool
+    return {"type": TYPE_ACTIVITY, "sessionID": session_id, "part": part}
 
 
 def notice_event(session_id: str, message: str) -> dict[str, Any]:

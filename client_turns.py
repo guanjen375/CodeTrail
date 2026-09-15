@@ -102,6 +102,11 @@ class TurnCoordinator:
         #: 看它,否則取消落在「ASK 判定後、pending 登記前」的空窗就會等滿逾時。
         self._cancelled = False
         self._approvals: dict[str, ApprovalTicket] = {}
+        # 摘要不經 send(on_event=...),但手動／自動壓縮都要回報目前階段。
+        # 活動共用 UI bridge;不改 send 的 JSONL 事件流,也不進預熱路徑。
+        set_activity = getattr(engine, "set_activity_callback", None)
+        if callable(set_activity):
+            set_activity(self._publish)
 
     # ---- 狀態 ----------------------------------------------------------
     @property
