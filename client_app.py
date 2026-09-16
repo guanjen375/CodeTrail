@@ -31,6 +31,7 @@ import json
 import os
 import threading
 import time
+from time import monotonic as _progress_clock
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -61,6 +62,9 @@ HISTORY_MAX_BYTES = 4 * 1024 * 1024
 
 #: 閒置時連按兩次 Ctrl-C 才離開,而且要在這段時間內。
 DOUBLE_INTERRUPT_SECONDS = 2.0
+
+# Only prefill details are sampled. Answer/reasoning/tool deltas stay immediate.
+PROMPT_PROGRESS_INTERVAL_SECONDS = 10.0
 
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
@@ -780,6 +784,7 @@ class CodeTrailApp(App[int]):
         self._compacting = False
         self._activity: dict[str, Any] | None = None
         self._activity_generating = False
+        self._clear_prompt_progress()
         self._cancelling = False
         #: 最後一次由協調器跑完的預熱:``(時間, 觸發點, PrimeOutcome | None)``。不分是誰
         #: 排的(mount / new / session 由這裡排,compaction 由協調器自己排),全部經
@@ -1024,20 +1029,38 @@ class CodeTrailApp(App[int]):
         operation, phase = part.get("operation"), part.get("phase")
         if operation not in ("response", "compact") or phase not in (
             "preparing", "waiting_model", "waiting_response", "prompt_processing",
-            "generating", "tool", "approval",
+            "generating", "tool", "approval", "validating", "persisting",
         ):
+            return
+        if phase in ("validating", "persisting") and operation != "compact":
             return
         if phase == "preparing":
             self._reset_phase(compacting=operation == "compact")
         elif phase == "prompt_processing" and self._activity_generating:
             # 同一請求開始生成後,晚到的 prefill 進度不得蓋掉答案或摘要階段。
             return
-        if phase == "generating":
+        if phase in ("generating", "validating", "persisting", "tool", "approval"):
             self._activity_generating = True
         activity: dict[str, Any] = {"operation": operation, "phase": phase}
         percent = part.get("percent")
-        if phase == "prompt_processing" and type(percent) is int and 0 <= percent <= 100:
-            activity["percent"] = percent
+        if phase == "prompt_processing":
+            now = _progress_clock()
+            if self._prompt_started is None:
+                self._prompt_started = now
+            self._prompt_received = now
+            progress = client_events.prompt_progress_snapshot(part.get("progress"))
+            if progress is not None:
+                activity["progress"] = progress
+                # Compute from the same validated snapshot used for the counts.
+                activity["percent"] = 100 * progress["processed"] // progress["total"]
+            elif "progress" not in part and type(percent) is int and 0 <= percent <= 100:
+                activity["percent"] = percent
+            if "percent" not in activity:
+                # Invalid data must not leave the last trustworthy numbers visible.
+                self._prompt_display = None
+                self._prompt_sampled = None
+        else:
+            self._clear_prompt_progress()
         tool = part.get("tool")
         if phase in ("tool", "approval") and isinstance(tool, str) and tool:
             activity["tool"] = tool
@@ -1045,11 +1068,17 @@ class CodeTrailApp(App[int]):
         self._refresh_status()
 
     def _mark_generating(self) -> None:
+        changed = self._prompt_started is not None or (
+            self._activity is not None and self._activity["phase"] != "generating"
+        )
         self._activity_generating = True
+        self._clear_prompt_progress()
         if self._activity is not None:
             self._activity = {
                 "operation": self._activity["operation"], "phase": "generating",
             }
+        if changed:
+            self._refresh_status()
 
     def _on_tool_event(self, event: Mapping[str, Any]) -> None:
         part = client_events.event_part(event)
@@ -1589,7 +1618,46 @@ class CodeTrailApp(App[int]):
         self._compacting = compacting
         self._activity = None
         self._activity_generating = False
+        self._clear_prompt_progress()
         self._cancelling = False
+
+    def _clear_prompt_progress(self) -> None:
+        self._prompt_started: float | None = None
+        self._prompt_received: float | None = None
+        self._prompt_sampled: float | None = None
+        self._prompt_display: dict[str, Any] | None = None
+
+    def _prompt_phase(self) -> str:
+        """Sample the latest request's SSE counts, without doing I/O on the UI loop."""
+        now = _progress_clock()
+        if self._prompt_started is None or now - self._prompt_started < PROMPT_PROGRESS_INTERVAL_SECONDS:
+            return "等待回應"
+        if self._prompt_sampled is None or now - self._prompt_sampled >= PROMPT_PROGRESS_INTERVAL_SECONDS:
+            self._prompt_display = dict(self._activity or {})
+            self._prompt_sampled = now
+        snapshot = self._prompt_display or {}
+        label = "prompt processing"
+        if "percent" in snapshot:
+            label += f"({snapshot['percent']}%)"
+        progress = snapshot.get("progress")
+        if progress is not None:
+            processed, total = progress["processed"], progress["total"]
+            label += f" · {processed:,}/{total:,} tok"
+            cache = progress.get("cache")
+            if cache is not None:
+                label += f" · cache {cache:,}"
+            # The initial snapshot precedes the first decode batch. Its elapsed
+            # time is not a zero-speed measurement of the batch still running.
+            if cache is not None and processed > cache:
+                elapsed_ms = progress.get("time_ms", 0)
+                if elapsed_ms > 0:
+                    rate = (processed - cache) * 1000 / elapsed_ms
+                    label += f" · {rate:,.1f} tok/s · prefill {elapsed_ms / 1000:.0f}s"
+                if self._prompt_received is not None:
+                    age = now - self._prompt_received
+                    if age >= PROMPT_PROGRESS_INTERVAL_SECONDS:
+                        label += f" · 距更新 {age:.0f}s"
+        return label
 
     def _turn_phase(self) -> str:
         """這一輪目前在哪一段。
@@ -1609,10 +1677,10 @@ class CodeTrailApp(App[int]):
                 "generating": "產生摘要中" if operation == "compact" else "產生回應中",
                 "tool": "執行工具",
                 "approval": "等待核准",
+                "validating": "驗證摘要中",
+                "persisting": "儲存摘要中",
             }
-            label = labels[phase]
-            if "percent" in self._activity:
-                label += f"({self._activity['percent']}%)"
+            label = self._prompt_phase() if phase == "prompt_processing" else labels[phase]
             if "tool" in self._activity:
                 label += f" {self._activity['tool']}"
             if operation == "compact":
@@ -1642,6 +1710,7 @@ class CodeTrailApp(App[int]):
             f"專案指示={'on' if self._project_instructions() else 'off'}",
             f"舊 reasoning={'送模' if self.keep_historical_reasoning else '不送'}",
         ]
+        active_status = ""
         if self._turn_started is not None:
             self._spinner = (self._spinner + 1) % len(SPINNER_FRAMES)
             elapsed = time.monotonic() - self._turn_started
@@ -1649,6 +1718,7 @@ class CodeTrailApp(App[int]):
                 0, f"{SPINNER_FRAMES[self._spinner]} {elapsed:.0f}s(Ctrl-C 中斷)"
             )
             parts.insert(1, self._turn_phase())
+            active_status = " · ".join(parts[:2])
         if getattr(self.engine, "priming", False):
             # 預熱握著模型鎖:這時候送出的下一題會在鎖上等它送完,狀態列要講得出來。
             parts.append("prompt cache 預熱中")
@@ -1656,6 +1726,13 @@ class CodeTrailApp(App[int]):
         if pending:
             parts.append(f"待送={len(pending)}" + ("(暫停,/queue resume)" if self.coordinator.queue_paused else ""))
         self.status_text = " · ".join(parts)
+        # Keep the measured counts/rate visible at normal SSH terminal widths.
+        # Return to the original single row as soon as this prefill ends.
+        rows = 1
+        if self._prompt_display is not None and self._turn_started is not None:
+            width = max(1, (bar.size.width or self.size.width) - 2)
+            rows = min(3, max(1, (Text(active_status).cell_len + width - 1) // width))
+        bar.styles.height = rows
         bar.update(Text(self.status_text))
 
     def _refresh_completions(self) -> None:

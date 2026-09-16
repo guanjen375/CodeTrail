@@ -663,6 +663,17 @@ class Compactor:
             commit_point()
         return outcome
 
+    def _report_compaction_activity(self, phase: str) -> None:
+        """可選的畫面通知不得改變壓縮結果;Engine 的取消判定仍須傳回 compact。"""
+        try:
+            observer = getattr(self.engine, "report_compaction_activity", None)
+            if callable(observer):
+                observer(phase)
+        except client_events.TurnCancelled:
+            raise
+        except Exception:  # noqa: BLE001 - transient UI status is advisory
+            pass
+
     def _compact_in_turn(self, *, manual: bool, commit_point: Any) -> CompactionOutcome:
         if self.mode == MODE_OFF:
             return self._settle(commit_point, CompactionOutcome("skipped", "mode_off", "壓縮模式是 off,不會壓縮。"))
@@ -718,6 +729,7 @@ class Compactor:
             return self._stop("summary_error", extra=f"({type(exc).__name__})")
 
         summary = completion.text
+        self._report_compaction_activity("validating")
         detail = verify_summary(
             summary, reasoning=completion.reasoning, finish=getattr(completion, "finish", "stop")
         )
@@ -729,6 +741,8 @@ class Compactor:
 
     def _replace(self, head, tail, summary: str, anchor: Any) -> CompactionOutcome:
         dropped = len(head)
+        # 已過 commit point;通知放在落檔例外處理外,取消不得誤報成 persist_error。
+        self._report_compaction_activity("persisting")
         try:
             self.engine.replace_history(
                 [

@@ -725,6 +725,14 @@ aicode
 `/sessions` 列出這個專案的既有對話、`/session` 開選單挑一段,細節見
 [docs/basic-usage.md](docs/basic-usage.md#7-切換與接續對話)。
 
+模型處理 prompt 時,從本次請求第一個進度快照起算,前 10 秒狀態列維持「等待回應」;
+之後每 10 秒取最新快照顯示百分比、已處理/總 token 與 cache,有可信資料時再加速率及
+server 的 prefill 耗時。資料來自本次請求的 llama.cpp SSE,與 tmux 中的 llama-server
+同源;沒有資料就不估算。開始生成即切換狀態,不等下一個 10 秒刷新點。手動或自動壓縮
+帶 `compact ·` 前綴,並依序顯示產生、驗證與儲存摘要;`100%` 只代表 prompt 處理完成。
+初始快照、批次更新間隔與「距更新」的讀法見
+[等待回應與壓縮進度](docs/basic-usage.md#等待回應與壓縮進度)。
+
 要讓模型讀專案外的附件(`~/Downloads` 的 log / 截圖 / spec)就多加一個開關:
 
 在 `~/.config/codetrail/client.json` 設:

@@ -158,6 +158,41 @@ def text_delta_event(session_id: str, chunk: str) -> dict[str, Any]:
     return {"type": TYPE_TEXT_DELTA, "sessionID": session_id, "part": {"text": chunk}}
 
 
+def _prompt_progress_int(value: Any) -> int | None:
+    """Bound server metrics before converting or formatting untrusted numbers."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not 0 <= value <= 2**53 - 1:
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    return int(value)
+
+
+def prompt_progress_snapshot(value: Any) -> dict[str, int] | None:
+    """Copy only trustworthy request metrics; processed already includes cache.
+
+    Bad counts or cache invalidate the snapshot. Optional time is independent:
+    an unusable time must not discard otherwise valid token counts.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    total = _prompt_progress_int(value.get("total"))
+    processed = _prompt_progress_int(value.get("processed"))
+    if total is None or total == 0 or processed is None or processed > total:
+        return None
+    snapshot = {"processed": processed, "total": total}
+    if "cache" in value:
+        cache = _prompt_progress_int(value["cache"])
+        if cache is None or cache > processed:
+            return None
+        snapshot["cache"] = cache
+    time_ms = _prompt_progress_int(value.get("time_ms"))
+    if time_ms is not None:
+        snapshot["time_ms"] = time_ms
+    return snapshot
+
+
 def activity_event(
     session_id: str,
     *,
@@ -165,6 +200,7 @@ def activity_event(
     phase: str,
     percent: int | None = None,
     tool: str = "",
+    progress: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """UI 活動資料;百分比只代表本次 prompt 已處理的 token 比例。"""
     part: dict[str, Any] = {"operation": operation, "phase": phase}
@@ -172,6 +208,9 @@ def activity_event(
         part["percent"] = percent
     if tool:
         part["tool"] = tool
+    snapshot = prompt_progress_snapshot(progress)
+    if snapshot is not None:
+        part["progress"] = snapshot
     return {"type": TYPE_ACTIVITY, "sessionID": session_id, "part": part}
 
 

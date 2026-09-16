@@ -928,3 +928,170 @@ def test_the_whole_compaction_is_one_turn_including_the_preflight(tmp_path, monk
     assert not engine._armed                                          # 不是武裝,是進行中的 turn 被中斷
     assert outcome.status == "skipped" and outcome.detail == "cancelled"
     assert not engine._cancel.is_set()                                # 旗標隨 turn 收尾清掉
+
+
+# ============================================================
+# 壓縮階段通知:結果與持久化邊界不能被畫面 observer 改變
+# ============================================================
+@pytest.mark.smoke
+@pytest.mark.parametrize("case", ["success", "invalid_summary", "persist_error"])
+@pytest.mark.parametrize("observer_raises", [False, True])
+def test_compaction_activity_preserves_validation_and_persistence_outcomes(
+    tmp_path, monkeypatch, case, observer_raises,
+):
+    """驗證失敗不宣告儲存;儲存通知/寫入期間仍是原歷史,observer 失敗不改結果。"""
+    summary = "not the seven fields" if case == "invalid_summary" else _seven_field_summary()
+    engine = _real_engine_for_compaction(tmp_path, monkeypatch, summary)
+    compactor = cc.Compactor(engine, cc.MODE_MANUAL, n_ctx=131072)
+    before = [dict(message) for message in engine.messages]
+    stored_before = engine.store.read(engine.session_id)
+    trace = []
+    states = []
+
+    def capture_state():
+        states.append((
+            [dict(message) for message in engine.messages],
+            compactor.previous_summary, compactor.last_anchor,
+        ))
+
+    def activity(event):
+        phase = event["part"]["phase"]
+        if phase in ("validating", "persisting"):
+            trace.append(phase)
+            capture_state()
+
+    engine.set_activity_callback(activity)
+    real_report = engine.report_compaction_activity
+
+    def report(phase):
+        real_report(phase)
+        if observer_raises:
+            raise RuntimeError("observer unavailable")
+
+    monkeypatch.setattr(engine, "report_compaction_activity", report)
+    real_verify = cc.verify_summary
+
+    def verify(*args, **kwargs):
+        trace.append("verify")
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(cc, "verify_summary", verify)
+    real_append = engine.store.append
+
+    def append(session_id, record):
+        trace.append("persist")
+        capture_state()
+        if case == "persist_error":
+            raise OSError("disk full")
+        return real_append(session_id, record)
+
+    monkeypatch.setattr(engine.store, "append", append)
+    outcome = compactor.compact(manual=True)
+
+    expected = {
+        "success": ("compacted", ""),
+        "invalid_summary": ("stopped", "summary_format"),
+        "persist_error": ("failed", "persist_error"),
+    }
+    assert (outcome.status, outcome.detail) == expected[case]
+    assert trace == (["validating", "verify"] if case == "invalid_summary" else [
+        "validating", "verify", "persisting", "persist",
+    ])
+    assert states and all(state == (before, "", None) for state in states)
+    if case == "success":
+        assert compactor.previous_summary == summary and compactor.last_anchor is not None
+        assert engine.messages[0]["content"] == f"{cc.SUMMARY_PREFIX}\n{summary}"
+        assert engine.messages[1:] == before[-2:]
+        stored = engine.store.read(engine.session_id)
+        assert stored[:-1] == stored_before
+        assert stored[-1]["type"] == "compaction" and stored[-1]["history"] == engine.messages
+    else:
+        assert engine.messages == before and engine.store.read(engine.session_id) == stored_before
+        assert compactor.previous_summary == "" and compactor.last_anchor is None
+    expected_stop = "summary_format" if case == "invalid_summary" else None
+    assert compactor.stopped_detail == expected_stop
+    assert cc.read_stopped() == (
+        {cc.session_hash(engine.session_id): expected_stop} if expected_stop else {}
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("valid_summary", [False, True])
+def test_cancelling_from_compaction_validation_activity_keeps_history_and_ledger_untouched(
+    tmp_path, monkeypatch, valid_summary,
+):
+    """validating 經真正的活動 callback 接受取消時,不能繼續核對、停用或換歷史。"""
+    summary = _seven_field_summary() if valid_summary else "not the seven fields"
+    engine = _real_engine_for_compaction(tmp_path, monkeypatch, summary)
+    compactor = cc.Compactor(engine, cc.MODE_MANUAL, n_ctx=131072)
+    before = [dict(message) for message in engine.messages]
+    stored_before = engine.store.read(engine.session_id)
+    decisions, phases, verifications = [], [], []
+    real_verify = cc.verify_summary
+
+    def activity(event):
+        phase = event["part"]["phase"]
+        if phase in ("validating", "persisting"):
+            phases.append(phase)
+        if phase == "validating":
+            decisions.append(engine.cancel())
+
+    def verify(*args, **kwargs):
+        verifications.append(args)
+        return real_verify(*args, **kwargs)
+
+    engine.set_activity_callback(activity)
+    monkeypatch.setattr(cc, "verify_summary", verify)
+    outcome = compactor.compact(manual=True)
+    assert decisions == [True] and phases == ["validating"] and verifications == []
+    assert (outcome.status, outcome.detail) == ("skipped", "cancelled")
+    assert engine.messages == before and engine.store.read(engine.session_id) == stored_before
+    assert compactor.previous_summary == "" and compactor.last_anchor is None
+    assert compactor.stopped_detail is None and cc.read_stopped() == {}
+    assert not (cc.state_dir() / cc.STOPPED_FILE).exists()
+
+
+@pytest.mark.smoke
+def test_cancelling_from_compaction_persistence_activity_is_refused(tmp_path, monkeypatch):
+    """persisting 是已決定寫定之後的通知;畫面橋接收到 Ctrl-C 不得撤回已承諾的儲存。"""
+    engine = _real_engine_for_compaction(tmp_path, monkeypatch, _seven_field_summary())
+    before = [dict(message) for message in engine.messages]
+    decisions, histories = [], []
+
+    def activity(event):
+        if event["part"]["phase"] == "persisting":
+            histories.append([dict(message) for message in engine.messages])
+            decisions.append(engine.cancel())
+
+    engine.set_activity_callback(activity)
+    outcome = cc.Compactor(engine, cc.MODE_MANUAL, n_ctx=131072).compact(manual=True)
+    assert decisions == [False] and histories == [before]
+    assert outcome.status == "compacted" and engine.messages[0]["synthetic"] is True
+    stored = engine.store.read(engine.session_id)
+    assert stored[-1]["type"] == "compaction" and stored[-1]["history"] == engine.messages
+    assert cc.read_stopped() == {}
+
+
+@pytest.mark.smoke
+def test_compaction_observer_cancellation_is_not_a_persistence_error(tmp_path, monkeypatch):
+    """可選 observer 主動丟出的 TurnCancelled 也不能被落檔例外處理吞成 failed。"""
+    import client_events
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    engine = _FakeEngine(_conversation(6), summary=_seven_field_summary())
+    before = [dict(message) for message in engine.messages]
+    compactor = _compactor(engine)
+    phases = []
+
+    def activity(phase):
+        phases.append(phase)
+        if phase == "persisting":
+            raise client_events.TurnCancelled("user")
+
+    monkeypatch.setattr(engine, "report_compaction_activity", activity, raising=False)
+    outcome = compactor.compact(manual=True)
+    assert phases == ["validating", "persisting"]
+    assert (outcome.status, outcome.detail) == ("skipped", "cancelled")
+    assert engine.messages == before and engine.replaced is None
+    assert compactor.previous_summary == "" and compactor.last_anchor is None
+    assert compactor.stopped_detail is None and cc.read_stopped() == {}

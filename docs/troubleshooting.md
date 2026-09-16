@@ -165,22 +165,37 @@ server 一直開著、weights 早就載進來了,開一段新對話的第一個�
 |---|---|---|
 | `準備請求` | 客戶端在準備這一次模型請求 | — |
 | `等待模型` | 在等模型鎖,例如前一個請求或 prompt cache 預熱還沒結束 | 等前一個請求收尾 |
-| `等待回應` | 已進入本次模型請求,尚未收到可辨識的進度或輸出 | 此時無法只靠等待時間判定 server 在哪一段 |
-| `prompt processing(92%)` | server 回報本次 prompt 的處理進度;有快取時已處理數包含快取部分 | prefix 仍在 KV cache 裡時,需要重新評估的部分可能較少 |
-| `prompt processing` | server 有回報 prompt 階段,但沒有有效的百分比資料 | — |
+| `等待回應` | 已進入本次模型請求;也包含收到第一個 prompt 進度快照後、尚未滿 10 秒的等候 | 此時無法只靠等待時間判定 server 在哪一段 |
+| `prompt processing(92%)` | 收到首個進度快照滿 10 秒後,顯示本次 prompt 的最新取樣;可附已處理/總 token、cache、速率與 prefill 耗時 | prefix 仍在 KV cache 裡時,需要重新評估的部分可能較少 |
+| `prompt processing` | 已超過顯示門檻且 server 有回報 prompt 階段,但沒有可信計數 | 不估算百分比或速度 |
 | `產生回應中` | 已收到 content、reasoning 或工具呼叫的生成訊號,尚無可顯示的答案文字或 reasoning 段數 | — |
 | `thinking N 段` | 模型在產生 reasoning。`show_reasoning` 預設關,所以畫面上只有 spinner 與段數 | **不能**。這是模型自己的輸出成本 |
 | `回答中` | 已經在產生你會看到的答案 | — |
 | `執行工具 list_dir` / `等待核准 apply_patch` | 正在執行具名工具,或等待你核准該工具 | 核准框仍顯示完整參數;拒絕只影響這個工具 |
 | `compact · prompt processing(92%)` / `compact · 產生摘要中` | 手動或自動壓縮正在處理摘要 prompt,或產生摘要;其餘等待階段也帶 `compact ·` 前綴 | 百分比只代表摘要 prompt 處理進度 |
+| `compact · 驗證摘要中` / `compact · 儲存摘要中` | 摘要正在核對,或已通過核對並開始保存 | 是否成功以最後結果通知為準 |
 | `中斷中` | 已接受 Ctrl-C,正在等串流或工具取消完成 | 終結事件到達後計時與暫時狀態才清掉 |
 | `等待首個 token` / `壓縮中` | 回合剛開始,尚未收到更具體的活動通知 | 不代表已知 server 正在 prefill |
 
-百分比只取本次請求串流中有效的 `floor(100 * processed / total)`;`processed` 已包含
-cache,不再把 cache 加一次。沒有可靠數據就只顯示階段,不依經過時間、回答長度或
-`max_tokens` 推算。`100%` 代表 prompt 已處理完,答案或摘要仍可能需要時間生成;
-它也不是整段 compact 的完成率。開始生成後移除百分比,同一請求晚到的進度不會讓
-狀態倒退。工具之後的下一次模型請求會重新顯示等待階段,已顯示的回答與 reasoning 保留。
+詳細數字取自**本次請求**的 llama.cpp SSE `prompt_progress`,與 tmux 中的 llama-server
+同源,不混用其他請求的 slot 或日誌。前 10 秒整個 prompt 階段維持「等待回應」,
+之後每 10 秒取最新快照顯示。百分比只用有效的 `floor(100 * processed / total)`;
+`processed` 已包含 cache,不再把 cache 加一次。只有 cache 與 `time_ms` 可信、
+`processed > cache` 且 `time_ms > 0` 時,才顯示 `(processed-cache)/(time_ms/1000)` 的
+速率與 prefill 耗時。初始 `processed == cache` 快照即使帶正的 `time_ms`,也只顯示
+計數、cache 與百分比,不顯示 0 速率、prefill 時間或「距更新」。沒有可靠數據就只顯示
+等待/處理階段,不依經過時間、回答長度或 `max_tokens` 推算,也不估算剩餘時間。
+
+server 在初始快照後,每完成一個最多 `n_batch` token 的批次才推送一次;目前部署每批
+可花數秒到十餘秒,所以 UI 每 10 秒取樣不表示 server 保證每 10 秒更新。已收到
+`processed > cache` 的批次快照且 10 秒沒有新資料時,「距更新 Ns」只描述快照的時間,
+可能是下一批尚未完成,不表示模型停滯。`prefill Ns` 是 server 快照中的耗時,回合秒數
+是 client 的經過時間,包含的階段與更新時機不同,不應拿兩者差值判定 server 異常。
+
+`100%` 代表 prompt 已處理完,答案或摘要仍可能需要時間生成;摘要還要通過驗證與儲存,
+它不是整段 compact 的完成率。開始生成後立即移除進度數字,不等下一個 10 秒刷新點,
+同一請求晚到的進度不會讓狀態倒退。工具之後的下一次模型請求會重新計時並顯示等待
+階段,已顯示的回答與 reasoning 保留。進度僅存在當前狀態列,不寫入 session 或 headless JSON。
 
 `/thinking` 只切換 reasoning 要不要顯示在畫面上,**不改**送給模型的東西,也不會讓 thinking
 變長或變短(「舊回合的 reasoning 進不進模型」是另一個鍵:`client.json` 的

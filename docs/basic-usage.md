@@ -86,6 +86,36 @@ CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透�
 回合進行中仍可輸入訊息，選擇「排到下一輪」或「補充目前任務」。等待／送達狀態及
 查看、修改、取消操作見 [訊息排隊與途中補充](message-queue.md)。
 
+### 等待回應與壓縮進度
+
+每次模型請求從收到第一個 prompt 進度快照起算,前 10 秒整個狀態仍顯示「等待回應」。
+若此時已開始生成,就立即顯示 thinking、答案或工具活動。較久的 prefill 才展開詳細進度,
+之後每 10 秒取一次最新快照;工具執行後的下一次模型請求會重新計時。狀態列依終端寬度
+最多展開至 3 行,生成或結束時恢復 1 行。例如:
+
+```text
+prompt processing(42%) · 8,400/20,000 tok · cache 2,000 · 213.3 tok/s · prefill 30s
+```
+
+數字來自**本次請求**的 llama.cpp SSE `prompt_progress`,與 tmux 中 llama-server
+回報的處理計數同源。`processed/total` 是已處理/總 prompt token,`processed` 已含 cache,
+百分比是 `floor(100 * processed / total)`。只有 cache 與 `time_ms` 可信、
+`processed > cache` 且 `time_ms > 0` 時,才顯示 `(processed-cache)/(time_ms/1000)` 的
+速率與 `prefill` 耗時。初始 `processed == cache` 快照只顯示計數、cache 與百分比,
+即使已等了 10 秒,也不顯示 0 速率、prefill 時間或「距更新」。缺少或不可信的欄位會省略,
+沒有可靠計數就只顯示等待/處理階段,不估算百分比、速率或剩餘時間。
+
+初始快照之後,server 每完成一個最多 `n_batch` token 的批次才推送一次快照;
+目前部署每批可花數秒到十餘秒。UI 的 10 秒是取樣顯示節奏,不是 server 保證的更新頻率。
+已有 `processed > cache` 的批次快照且 10 秒沒有新資料時,會標示「距更新 Ns」;
+這只表示快照距今多久,可能是下一批尚未完成,不表示停滯。`prefill Ns` 來自 server
+快照中的耗時,回合秒數則是客戶端經過時間,兩者的起點、涵蓋階段與更新時機不同。
+
+手動 `/compact` 與自動壓縮使用同一套進度,等待與 prompt 階段帶 `compact ·` 前綴;
+接著是「產生摘要中」、「驗證摘要中」、「儲存摘要中」。`100%` 只表示摘要 prompt 已處理完,
+摘要仍須生成、通過驗證並成功儲存。最後是否成功以壓縮結果通知為準。這些進度只存在
+當前狀態列,不寫入對話、摘要或 headless JSON;結束、中斷或切換對話時清除。
+
 ### 怎麼讀工具結果
 
 每個 CodeTrail 工具的精簡文字結果第一行固定是 `status: ok|partial|error`。只有

@@ -1169,8 +1169,16 @@ def test_the_status_bar_carries_the_session_context_and_modes():
         assert needle in status, (needle, status)
 
 
+@pytest.fixture()
+def progress_clock(monkeypatch):
+    """Only the prefill display clock advances; Textual's event loop stays real."""
+    now = [0.0]
+    monkeypatch.setattr(client_app, "_progress_clock", lambda: now[0])
+    return now
+
+
 @pytest.mark.smoke
-def test_prompt_progress_replaces_waiting_and_previous_answer_phase():
+def test_prompt_progress_replaces_waiting_and_previous_answer_phase(progress_clock):
     """真實 SSE 的 92% 要出現在等待列,下一步與答案後壓縮也不能卡在「回答中」。"""
     engine = _Engine()
 
@@ -1192,6 +1200,8 @@ def test_prompt_progress_replaces_waiting_and_previous_answer_phase():
                             "operation": operation, "phase": "prompt_processing", "percent": 92,
                         },
                     })
+                    assert "prompt processing" not in app._turn_phase()
+                    progress_clock[0] += 10
                     app._refresh_status()
                     statuses.append(app.status_text)
                     if operation == "response":
@@ -1212,7 +1222,7 @@ def test_prompt_progress_replaces_waiting_and_previous_answer_phase():
 
 
 @pytest.mark.smoke
-def test_activity_ignores_late_progress_and_resets_each_model_request():
+def test_activity_ignores_late_progress_and_resets_each_model_request(progress_clock):
     """晚到 prefill 不蓋掉生成;每步重新等候,工具與核准也不沿用舊答案相位。"""
     engine = _Engine()
 
@@ -1226,6 +1236,8 @@ def test_activity_ignores_late_progress_and_resets_each_model_request():
                 app.handle_event(client_events.activity_event(
                     engine.session_id, operation="response", phase=phase, **fields,
                 ))
+                if phase == "prompt_processing":
+                    progress_clock[0] += 10
                 return app._turn_phase()
 
             try:
@@ -1267,7 +1279,7 @@ def test_activity_ignores_late_progress_and_resets_each_model_request():
 
 
 @pytest.mark.smoke
-def test_activity_is_cleared_when_a_turn_stops():
+def test_activity_is_cleared_when_a_turn_stops(progress_clock):
     """終結、錯誤與接受 Ctrl-C 立即清暫態,錯 session/已結束回合不得再灌進度。"""
     engine = _Engine()
 
@@ -1285,10 +1297,14 @@ def test_activity_is_cleared_when_a_turn_stops():
                     app.handle_event(client_events.activity_event(
                         "another-session", operation="response", phase="preparing",
                     ))
+                    progress_clock[0] += 10
+                    app._refresh_status()
                     assert app._turn_phase() == "compact · prompt processing(92%)"
                     app.handle_event(client_events.step_finish_event(
                         engine.session_id, reason=client_events.REASON_TOOL_CALLS,
                     ))
+                    progress_clock[0] += 10
+                    app._refresh_status()
                     assert app._turn_phase() == "compact · prompt processing(92%)"
                     if ending == "interrupt":
                         app.action_interrupt()
@@ -1298,6 +1314,7 @@ def test_activity_is_cleared_when_a_turn_stops():
                     else:
                         app.handle_event(client_events.step_finish_event(engine.session_id, reason=ending))
                     assert app._activity is None
+                    assert app._prompt_started is None and app._prompt_display is None
                     if ending == "interrupt":
                         assert app._turn_started is not None
                         assert app._turn_phase() == "中斷中"
@@ -1313,6 +1330,7 @@ def test_activity_is_cleared_when_a_turn_stops():
                         engine.session_id, operation="compact", phase="prompt_processing", percent=100,
                     ))
                     assert app._activity is None
+                    assert app._prompt_started is None and app._prompt_display is None
                     assert "prompt processing" not in app.status_text
                     if ending == "interrupt":
                         assert app._turn_phase() == "中斷中"
@@ -1335,7 +1353,7 @@ def test_activity_is_cleared_when_a_turn_stops():
 
 
 @pytest.mark.smoke
-def test_activity_is_cleared_on_new_and_resumed_sessions():
+def test_activity_is_cleared_on_new_and_resumed_sessions(progress_clock):
     """session 切換清掉殘留活動,舊 session 的延遲通知不能覆蓋新回合。"""
     engine = _Engine()
     engine.stored[RESUMED_ID] = _Snapshot(RESUMED_ID)
@@ -1352,11 +1370,14 @@ def test_activity_is_cleared_on_new_and_resumed_sessions():
                         app.handle_event(client_events.activity_event(
                             old_session, operation="compact", phase=phase, percent=percent,
                         ))
+                    progress_clock[0] += 10
+                    app._refresh_status()
                     assert app._turn_phase() == "compact · prompt processing(92%)"
                 finally:
                     app.coordinator.finish_turn()
                 app._command(command)
                 assert app._activity is None
+                assert app._prompt_started is None and app._prompt_display is None
                 assert app._compacting is False
                 assert app._activity_generating is False
                 assert app._turn_started is None
@@ -1379,7 +1400,7 @@ def test_activity_is_cleared_on_new_and_resumed_sessions():
 
 
 @pytest.mark.smoke
-def test_manual_compaction_activity_uses_the_worker_bridge_without_answer_output():
+def test_manual_compaction_activity_uses_the_worker_bridge_without_answer_output(progress_clock):
     """/compact 的進度只在 UI 執行緒更新狀態,摘要生成不冒到回答或 reasoning 區。"""
     engine = _Engine()
     progressed, generate, generated, finish = (threading.Event() for _ in range(4))
@@ -1419,6 +1440,9 @@ def test_manual_compaction_activity_uses_the_worker_bridge_without_answer_output
             app._command("/compact")
             try:
                 assert await _until(pilot, progressed.is_set)
+                assert app._turn_phase() == "compact · 等待回應"
+                progress_clock[0] += 10
+                app._refresh_status()
                 assert app._turn_phase() == "compact · prompt processing(92%)"
                 generate.set()
                 assert await _until(pilot, generated.is_set)
@@ -1426,6 +1450,7 @@ def test_manual_compaction_activity_uses_the_worker_bridge_without_answer_output
                 finish.set()
                 assert await _until(pilot, lambda: not app.coordinator.busy)
                 assert app._activity is None and app._turn_started is None
+                assert app._prompt_started is None and app._prompt_display is None
                 assert "compact ·" not in app.status_text
                 seen = _snapshot(app)
                 assert seen["assistant"] == [] and seen["reasoning"] == []
@@ -1434,6 +1459,139 @@ def test_manual_compaction_activity_uses_the_worker_bridge_without_answer_output
             finally:
                 generate.set()
                 finish.set()
+
+    _run(body)
+
+
+# ============================================================
+# Prefill details are sampled; all other phases remain immediate.
+# ============================================================
+@pytest.mark.parametrize("operation", ["response", "compact"])
+def test_fast_prefill_never_delays_generation_or_leaks_into_the_next_request(progress_clock, operation):
+    engine = _Engine()
+    app = client_app.CodeTrailApp(engine)
+    app.coordinator.begin_turn()
+    app._turn_started = time.monotonic()
+
+    def activity(phase, **fields):
+        app.handle_event(client_events.activity_event(
+            engine.session_id, operation=operation, phase=phase, **fields,
+        ))
+
+    try:
+        activity("preparing")
+        activity("prompt_processing", progress={"processed": 500, "total": 1000, "cache": 0, "time_ms": 500})
+        progress_clock[0] = 9.999
+        assert app._turn_phase() == ("compact · " if operation == "compact" else "") + "等待回應"
+        activity("generating")
+        expected = "compact · 產生摘要中" if operation == "compact" else "產生回應中"
+        assert app._turn_phase() == expected
+        assert app._prompt_started is None and app._prompt_display is None
+        progress_clock[0] = 30
+        activity("prompt_processing", percent=100)
+        assert app._turn_phase() == expected
+        activity("preparing")
+        activity("prompt_processing", progress={"processed": 10, "total": 200, "cache": 0, "time_ms": 100})
+        assert "等待回應" in app._turn_phase()
+        progress_clock[0] = 40
+        assert "10/200 tok" in app._turn_phase() and "500" not in app._turn_phase()
+    finally:
+        app.coordinator.finish_turn()
+
+
+def test_prompt_snapshots_use_ten_second_samples_without_inventing_initial_speed(progress_clock):
+    engine = _Engine()
+    app = client_app.CodeTrailApp(engine)
+    app.coordinator.begin_turn()
+    app._turn_started = time.monotonic()
+
+    def progress(processed, milliseconds):
+        app.handle_event(client_events.activity_event(
+            engine.session_id, operation="response", phase="prompt_processing",
+            progress={"processed": processed, "total": 1000, "cache": 200, "time_ms": milliseconds},
+        ))
+
+    try:
+        progress(200, 25)  # Server has not finished its first decode batch.
+        progress_clock[0] = 9.999
+        assert app._turn_phase() == "等待回應"
+        progress_clock[0] = 10
+        initial = app._turn_phase()
+        assert initial == "prompt processing(20%) · 200/1,000 tok · cache 200"
+        progress_clock[0] = 20
+        assert app._turn_phase() == initial  # No false zero rate/time or stall claim.
+        progress_clock[0] = 22
+        progress(600, 2000)
+        progress_clock[0] = 29.999
+        assert app._turn_phase() == initial
+        progress_clock[0] = 30
+        measured = app._turn_phase()
+        assert "600/1,000 tok" in measured and "200.0 tok/s · prefill 2s" in measured
+        assert "距更新" not in measured
+        progress_clock[0] = 41
+        assert "距更新 19s" in app._turn_phase()
+        progress_clock[0] = 42
+        progress(610, 2050)
+        assert "600/1,000 tok" in app._turn_phase() and "距更新" not in app._turn_phase()
+        progress_clock[0] = 51
+        assert "610/1,000 tok" in app._turn_phase()
+        # Corrupt telemetry cannot keep the previous good numbers on screen.
+        app.handle_event({"type": "activity", "sessionID": engine.session_id, "part": {
+            "operation": "response", "phase": "prompt_processing", "percent": 99,
+            "progress": {"processed": 610, "total": 1000, "cache": 611},
+        }})
+        assert app._turn_phase() == "prompt processing"
+    finally:
+        app.coordinator.finish_turn()
+
+
+def test_compaction_commit_phases_clear_prefill_and_reject_late_snapshots(progress_clock):
+    engine = _Engine()
+    app = client_app.CodeTrailApp(engine)
+    app.coordinator.begin_turn()
+    app._turn_started = time.monotonic()
+    try:
+        for phase, expected in (("validating", "驗證摘要中"), ("persisting", "儲存摘要中")):
+            app.handle_event(client_events.activity_event(engine.session_id, operation="compact", phase="preparing"))
+            app.handle_event(client_events.activity_event(engine.session_id, operation="compact", phase="prompt_processing", percent=80))
+            progress_clock[0] += 10
+            assert "prompt processing" in app._turn_phase()
+            app.handle_event(client_events.activity_event(engine.session_id, operation="compact", phase=phase))
+            assert app._turn_phase() == f"compact · {expected}"
+            assert app._prompt_display is None and app._prompt_started is None
+            app.handle_event(client_events.activity_event(engine.session_id, operation="compact", phase="prompt_processing", percent=100))
+            assert app._turn_phase() == f"compact · {expected}"
+    finally:
+        app.coordinator.finish_turn()
+
+
+def test_slow_prompt_metrics_remain_visible_in_a_narrow_terminal(progress_clock):
+    engine = _Engine()
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test(size=(80, 30)) as pilot:
+            app.coordinator.begin_turn()
+            app._turn_started = time.monotonic()
+            try:
+                app.handle_event(client_events.activity_event(
+                    engine.session_id, operation="compact", phase="prompt_processing",
+                    progress={"processed": 8400, "total": 20000, "cache": 2000, "time_ms": 30000},
+                ))
+                assert "prompt processing" not in app.status_text
+                progress_clock[0] = 10
+                app._refresh_status()
+                await pilot.pause()
+                bar = app.query_one("#status")
+                assert 2 <= bar.size.height <= 3
+                assert "8,400/20,000 tok" in app.status_text
+                assert "213.3 tok/s · prefill 30s" in app.status_text
+                app.handle_event(client_events.activity_event(engine.session_id, operation="compact", phase="generating"))
+                await pilot.pause()
+                assert bar.size.height == 1
+                assert "tok/s" not in app.status_text and "產生摘要中" in app.status_text
+            finally:
+                app.coordinator.finish_turn()
 
     _run(body)
 

@@ -83,12 +83,92 @@ def _tool(name="read_file"):
     }]}, "tool_calls")
 
 
+def test_activity_progress_is_private_detached_and_backward_compatible():
+    raw = {
+        "processed": 8400.0, "total": 20000.0, "cache": 2000.0, "time_ms": 30000.0,
+        "prompt": "private prompt", "slots": [{"id": 3, "prompt": "other request"}],
+        "content": "private answer",
+    }
+    expected = {"processed": 8400, "total": 20000, "cache": 2000, "time_ms": 30000}
+    snapshot = client_events.prompt_progress_snapshot(raw)
+    event = client_events.activity_event(
+        "session", operation="response", phase="prompt_processing", percent=42, progress=raw,
+    )
+    assert snapshot == expected and all(type(value) is int for value in snapshot.values())
+    assert event == {
+        "type": "activity", "sessionID": "session",
+        "part": {"operation": "response", "phase": "prompt_processing", "percent": 42, "progress": expected},
+    }
+    raw["processed"] = 1
+    snapshot["cache"] = 1
+    assert event["part"]["progress"] == expected, "Neither source nor consumer may change another snapshot"
+    assert "private" not in client_events.dumps(event) and "slots" not in client_events.dumps(event)
+    assert client_events.activity_event(
+        "session", operation="response", phase="tool", percent=50, tool="read_file",
+    )["part"] == {"operation": "response", "phase": "tool", "percent": 50, "tool": "read_file"}
+
+
+def test_optional_progress_metrics_never_invent_cache_or_time(activity_engine):
+    activity = []
+    _bind(activity_engine, activity.append)
+    chunks = [
+        _progress(800, cache=800, time_ms=7),
+        _progress(time_ms=1000), _progress(cache=800), _progress(cache=800, time_ms=1200),
+        *(_progress(cache=800, time_ms=value) for value in (
+            None, True, -1, 1.5, float("nan"), float("inf"), 2**53, 10**400,
+        )),
+    ]
+    assert list(activity_engine._activity_chunks(iter(chunks), operation="response")) == chunks
+    assert [event["part"]["progress"] for event in activity] == [
+        {"processed": 800, "total": 1000, "cache": 800, "time_ms": 7},
+        {"processed": 920, "total": 1000, "time_ms": 1000},
+        {"processed": 920, "total": 1000, "cache": 800},
+        {"processed": 920, "total": 1000, "cache": 800, "time_ms": 1200},
+        {"processed": 920, "total": 1000, "cache": 800},
+    ]
+    assert [event["part"]["percent"] for event in activity] == [80, 92, 92, 92, 92]
+
+
+def test_progress_snapshots_do_not_cross_requests_or_sessions(activity_engine):
+    engine = activity_engine
+    activity = []
+    _bind(engine, activity.append)
+    original_session = engine.session_id
+    stored = copy.deepcopy(engine.store.read(original_session))
+    original = engine.load_session(original_session)
+
+    def request(operation):
+        chunks = [_progress(200, cache=100, time_ms=500), _delta({}, "stop")]
+        assert list(engine._activity_chunks(iter(chunks), operation=operation)) == chunks
+
+    request("response")
+    request("compact")
+    new_session = engine.new_session()
+    request("response")
+    engine.adopt(original)
+    request("response")
+    assert new_session != original_session
+    assert [event["sessionID"] for event in activity] == [
+        original_session, original_session, new_session, original_session,
+    ]
+    assert [event["part"]["operation"] for event in activity] == ["response", "compact", "response", "response"]
+    assert all(event["part"]["progress"] == {
+        "processed": 200, "total": 1000, "cache": 100, "time_ms": 500,
+    } for event in activity)
+    assert engine.messages == [] and engine.store.read(original_session) == stored
+    assert not any(record.get("type") == "activity" for record in engine.store.read(new_session))
+
+
 def test_request_prompt_progress_reaches_activity_callback(activity_engine, monkeypatch):
     engine = activity_engine
     activity, events, requests, text = [], [], [], []
     _bind(engine, activity.append)
     streams = iter([
-        [_progress(cache=800), _progress(929, cache=800), _tool(), _progress(1000)],
+        [
+            _progress(cache=800, time_ms=1000), _progress(929, cache=800, time_ms=1100),
+            _progress(929, cache=800, time_ms=1200), _progress(929, cache=800, time_ms=1200),
+            _tool(), _progress(1000),
+        ],
         [_progress(cache=800), _delta({"content": "answer"}, "stop")],
         [_progress(cache=800), _delta({"content": "private summary"}, "stop")],
     ])
@@ -105,12 +185,21 @@ def test_request_prompt_progress_reaches_activity_callback(activity_engine, monk
 
     parts = [event["part"] for event in activity]
     assert [part for part in parts if part["phase"] == "prompt_processing"] == [
-        {"operation": "response", "phase": "prompt_processing", "percent": 92},
-        {"operation": "response", "phase": "prompt_processing", "percent": 92},
-        {"operation": "compact", "phase": "prompt_processing", "percent": 92},
-    ], "SSE prompt_progress must reach the UI; processed already includes cache"
+        {"operation": "response", "phase": "prompt_processing", "percent": 92,
+         "progress": {"processed": 920, "total": 1000, "cache": 800, "time_ms": 1000}},
+        {"operation": "response", "phase": "prompt_processing", "percent": 92,
+         "progress": {"processed": 929, "total": 1000, "cache": 800, "time_ms": 1100}},
+        {"operation": "response", "phase": "prompt_processing", "percent": 92,
+         "progress": {"processed": 929, "total": 1000, "cache": 800, "time_ms": 1200}},
+        {"operation": "response", "phase": "prompt_processing", "percent": 92,
+         "progress": {"processed": 920, "total": 1000, "cache": 800}},
+        {"operation": "compact", "phase": "prompt_processing", "percent": 92,
+         "progress": {"processed": 920, "total": 1000, "cache": 800}},
+    ], "Every changed SSE snapshot must reach the UI; processed already includes cache"
     request_phases = ["preparing", "waiting_model", "waiting_response", "prompt_processing", "generating"]
-    assert [part["phase"] for part in parts] == request_phases + ["tool"] + request_phases * 2
+    assert [part["phase"] for part in parts] == (
+        request_phases[:3] + ["prompt_processing"] * 3 + ["generating", "tool"] + request_phases * 2
+    )
     assert next(part for part in parts if part["phase"] == "tool")["tool"] == "read_file"
     assert all(event["type"] == "activity" and event["sessionID"] == engine.session_id for event in activity)
     assert all(request["extra"]["return_progress"] is True for request in requests)
@@ -135,10 +224,17 @@ def test_bad_progress_cannot_become_output_or_stall_the_response(activity_engine
         {"processed": 0, "total": float("nan")},
         {"processed": -1, "total": 1000}, {"processed": 0, "total": -1},
         {"processed": 1001, "total": 1000}, {"processed": 0, "total": 0},
+        {"processed": 920.5, "total": 1000}, {"processed": 920, "total": 1000.5},
+        {"processed": 920, "total": 1000, "cache": 921},
+        {"processed": 920, "total": 1000, "cache": True},
+        {"processed": 920, "total": 1000, "cache": -1},
+        {"processed": 920, "total": 1000, "cache": "800"},
+        {"processed": 920, "total": 1000, "cache": 800.5},
     ]
     chunks = [
         _progress(0), *({"prompt_progress": value} for value in invalid),
         _progress(29, 100), _progress(3.0, 4.0), _progress(920, cache=800),
+        _progress(2**53 - 1, 2**53 - 1), _progress(2**53, 2**53),
         _progress(1e308, 1e308), _progress(10**400, 10**400),
         _delta({"role": "assistant", "content": "", "reasoning_content": "", "tool_calls": []}),
         _delta({"reasoning_content": "thought"}), _progress(0),
@@ -147,9 +243,17 @@ def test_bad_progress_cannot_become_output_or_stall_the_response(activity_engine
     monkeypatch.setattr(llama_client, "chat_completions", lambda **_kwargs: iter(chunks))
     result = engine.send("question", on_event=events.append, on_text=text.append, on_reasoning=reasoning.append)
     parts = [event["part"] for event in activity]
-    assert [part.get("percent") for part in parts if part["phase"] == "prompt_processing"] == [
-        0, None, 29, 75, 92, 100,
+    progress_parts = [part for part in parts if part["phase"] == "prompt_processing"]
+    assert [part.get("percent") for part in progress_parts] == [
+        0, None, 29, 75, 92, 100, None,
     ]
+    assert [part.get("progress") for part in progress_parts] == [
+        {"processed": 0, "total": 1000}, None,
+        {"processed": 29, "total": 100}, {"processed": 3, "total": 4},
+        {"processed": 920, "total": 1000, "cache": 800},
+        {"processed": 2**53 - 1, "total": 2**53 - 1}, None,
+    ]
+    assert all("percent" not in part and "progress" not in part for part in progress_parts if part.get("percent") is None)
     assert parts[-1] == {"operation": "response", "phase": "generating"}
     assert sum(part["phase"] == "generating" for part in parts) == 1
     assert result.text == "answer" and result.finish == "stop"
@@ -230,6 +334,113 @@ class ActivityStream:
 
     def close(self):
         self.closed = True
+
+
+@pytest.mark.parametrize("operation", ["response", "compact"])
+@pytest.mark.parametrize("delta,finish", [
+    ({"content": "answer"}, None),
+    ({"reasoning_content": "thought"}, None),
+    ({"tool_calls": [{"index": 0}]}, None),
+    ({"content": "", "reasoning_content": "", "tool_calls": []}, "stop"),
+], ids=["content", "reasoning", "tool_calls", "finish_without_output"])
+def test_generation_and_finish_close_request_progress_observer(activity_engine, operation, delta, finish):
+    activity = []
+    _bind(activity_engine, activity.append)
+    closing = {**_delta(delta, finish), **_progress(999)}
+    chunks = [_progress(200), closing, _progress(1000), _progress(0)]
+    stream = ActivityStream(chunks)
+    observed = activity_engine._activity_chunks(stream, operation=operation)
+    for index, chunk in enumerate(chunks):
+        assert next(observed) is chunk, "Activity must not rewrite or buffer model output"
+        assert stream.read == index + 1
+        expected = [{
+            "operation": operation, "phase": "prompt_processing", "percent": 20,
+            "progress": {"processed": 200, "total": 1000},
+        }]
+        if index > 0 and finish is None:
+            expected.append({"operation": operation, "phase": "generating"})
+        assert [event["part"] for event in activity] == expected
+    with pytest.raises(StopIteration):
+        next(observed)
+
+
+def test_compaction_activity_is_advisory_and_phase_limited(activity_engine):
+    engine = activity_engine
+    before = copy.deepcopy(engine.messages)
+    stored = copy.deepcopy(engine.store.read(engine.session_id))
+    activity = []
+
+    def report(event):
+        activity.append(event)
+        raise RuntimeError("UI unavailable")
+
+    _bind(engine, report)
+    for phase in ("validating", "persisting"):
+        engine.report_compaction_activity(phase)
+    with pytest.raises(ValueError, match="unsupported compaction activity phase"):
+        engine.report_compaction_activity("generating")
+    assert [event["part"] for event in activity] == [
+        {"operation": "compact", "phase": "validating"},
+        {"operation": "compact", "phase": "persisting"},
+    ]
+    _bind(engine, None)
+    for phase in ("validating", "persisting"):
+        engine.report_compaction_activity(phase)
+    assert engine.messages == before and engine.store.read(engine.session_id) == stored
+    assert engine._in_turn == 0 and not engine._cancel.is_set()
+
+
+@pytest.mark.parametrize("phase,committed", [("validating", False), ("persisting", True)])
+def test_compaction_activity_preserves_cancel_commit_boundary(activity_engine, phase, committed):
+    engine = activity_engine
+    activity, accepted, locks = [], [], []
+    before = copy.deepcopy(engine.messages)
+    stored = copy.deepcopy(engine.store.read(engine.session_id))
+
+    def report(event):
+        activity.append(event)
+        for lock in (engine._turn_state, engine._active_lock):
+            acquired = lock.acquire(blocking=False)
+            locks.append(acquired)
+            if not acquired:
+                return
+            lock.release()
+        accepted.append(engine.cancel())
+        raise RuntimeError("UI closed during cancellation")
+
+    _bind(engine, report)
+    with engine.turn_scope():
+        if committed:
+            engine.commit_point()
+            engine.report_compaction_activity(phase)
+        else:
+            with pytest.raises(client_engine.TurnCancelled):
+                engine.report_compaction_activity(phase)
+            # Already accepted cancellation must also prevent another callback.
+            with pytest.raises(client_engine.TurnCancelled):
+                engine.report_compaction_activity(phase)
+    assert locks == [True, True] and accepted == [not committed]
+    assert [event["part"] for event in activity] == [{"operation": "compact", "phase": phase}]
+    assert engine.messages == before and engine.store.read(engine.session_id) == stored
+    assert engine._in_turn == 0 and not engine._cancel.is_set()
+
+
+@pytest.mark.parametrize("phase", ["preparing", "validating", "persisting"])
+def test_activity_callback_cannot_swallow_turn_cancelled(activity_engine, phase):
+    cancellation = client_engine.TurnCancelled("cancelled by observer")
+
+    def report(_event):
+        raise cancellation
+
+    _bind(activity_engine, report)
+    with activity_engine.turn_scope():
+        with pytest.raises(client_engine.TurnCancelled) as caught:
+            if phase == "preparing":
+                activity_engine._report_activity("response", phase)
+            else:
+                activity_engine.report_compaction_activity(phase)
+    assert caught.value is cancellation
+    assert activity_engine._in_turn == 0 and not activity_engine._cancel.is_set()
 
 
 @pytest.mark.parametrize("operation", ["response", "compact"])

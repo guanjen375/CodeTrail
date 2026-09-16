@@ -25,7 +25,6 @@ from __future__ import annotations
 import contextlib
 import itertools
 import json
-import math
 import os
 import threading
 import time
@@ -494,24 +493,6 @@ def _guarded(stream: Any, cancel: threading.Event):
         yield chunk
 
 
-def _prompt_percent(progress: Any) -> int | None:
-    """Only server counts determine progress; processed already includes cache."""
-    if not isinstance(progress, Mapping):
-        return None
-    processed, total = progress.get("processed"), progress.get("total")
-    for value in (processed, total):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return None
-        if isinstance(value, float) and not math.isfinite(value):
-            return None
-    if total <= 0 or not 0 <= processed <= total:
-        return None
-    # Integer ratios avoid overflow and rounding an exact integer percentage down.
-    numerator, denominator = processed.as_integer_ratio()
-    total_numerator, total_denominator = total.as_integer_ratio()
-    return (100 * numerator * total_denominator) // (denominator * total_numerator)
-
-
 class _Abandonable:
     """可放棄等待的預熱 I/O；transport 的 socket 由獨立 cancellation 收掉。
 
@@ -774,8 +755,15 @@ class Engine:
     def set_activity_callback(self, callback: Callable[[dict[str, Any]], None] | None) -> None:
         self._activity_callback = callback
 
+    def report_compaction_activity(self, phase: str) -> None:
+        """Report summary validation/storage through the cancellable UI observer."""
+        if phase not in ("validating", "persisting"):
+            raise ValueError("unsupported compaction activity phase")
+        self._report_activity("compact", phase)
+
     def _report_activity(
-        self, operation: str, phase: str, *, percent: int | None = None, tool: str = ""
+        self, operation: str, phase: str, *, percent: int | None = None, tool: str = "",
+        progress: Mapping[str, Any] | None = None,
     ) -> None:
         """Publish outside cancellation locks; UI failures cannot end a turn."""
         if self._cancel.is_set():
@@ -785,7 +773,10 @@ class Engine:
             try:
                 callback(client_events.activity_event(
                     self.session_id, operation=operation, phase=phase, percent=percent, tool=tool,
+                    progress=progress,
                 ))
+            except TurnCancelled:
+                raise
             except Exception:  # noqa: BLE001 - transient UI status is advisory
                 pass
         # A synchronous UI bridge may accept Ctrl-C while this callback is waiting.
@@ -794,25 +785,32 @@ class Engine:
 
     def _activity_chunks(self, stream: Any, *, operation: str):
         """Track each request independently without changing its response chunks."""
-        generating = False
-        last_percent: Any = object()
+        prompt_done = False
+        last_progress: Any = object()
         for chunk in _guarded(stream, self._cancel):
             if self._cancel.is_set():
                 raise TurnCancelled("這一輪已被使用者中斷")
-            if not generating and isinstance(chunk, Mapping):
+            if not prompt_done and isinstance(chunk, Mapping):
                 choices = chunk.get("choices")
                 choice = choices[0] if isinstance(choices, list) and choices else None
                 delta = choice.get("delta") if isinstance(choice, Mapping) else None
                 if isinstance(delta, Mapping) and any(
                     delta.get(key) for key in ("content", "reasoning_content", "tool_calls")
                 ):
-                    generating = True
+                    prompt_done = True
                     self._report_activity(operation, "generating")
+                elif isinstance(choice, Mapping) and choice.get("finish_reason"):
+                    # A finish without output still closes this request's observer.
+                    prompt_done = True
                 elif "prompt_progress" in chunk:
-                    percent = _prompt_percent(chunk["prompt_progress"])
-                    if percent != last_percent:
-                        last_percent = percent
-                        self._report_activity(operation, "prompt_processing", percent=percent)
+                    progress = client_events.prompt_progress_snapshot(chunk["prompt_progress"])
+                    percent = (100 * progress["processed"]) // progress["total"] if progress is not None else None
+                    state = (percent, progress)
+                    if state != last_progress:
+                        last_progress = state
+                        self._report_activity(
+                            operation, "prompt_processing", percent=percent, progress=progress,
+                        )
             yield chunk
 
     # ---- tools ---------------------------------------------------------
