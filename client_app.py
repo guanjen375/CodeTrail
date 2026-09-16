@@ -791,7 +791,8 @@ class CodeTrailApp(App[int]):
         #: ``on_prime`` 回到這裡。只給 ``/status`` 看,不進對話區。
         self._last_prime: tuple[float, str, Any] | None = None
         self._last_interrupt = 0.0
-        self._context_tokens = 0
+        self._context_tokens: int | None = None
+        self._context_count_generation = 0
         self.exit_code = 0
         #: 狀態列與補全面板目前顯示的字。widget 的 renderable 是 Textual 內部形狀,
         #: 讀它等於把介面測試綁在版本上。
@@ -819,9 +820,8 @@ class CodeTrailApp(App[int]):
             self._append(NoticeLine(line))
         self._append(NoticeLine("輸入 /help 看指令。"))
         self._replay_startup_session()
-        # 接續進來的那段歷史已經在 engine 裡了,下一輪的 prefix 現在就算得出來:
-        # 趁使用者還在打第一題,先把 prefill 送出去。
-        self._prime("mount")
+        # 接續歷史先依完整計數檢查壓縮，再預熱下一輪的 prefix。
+        self._prepare_idle("mount")
         self.query_one("#completions", Static).display = False
         self._recount_context()
         self.set_interval(0.25, self._refresh_status)
@@ -1422,9 +1422,6 @@ class CodeTrailApp(App[int]):
         self.engine.adopt(snapshot)
         self.coordinator.session_changed()
         self._queue_revisions.clear()
-        # 換過去的那段歷史就是下一輪的 prefix,而它剛剛才進 engine:先送預熱,
-        # 使用者接著問的第一題就不必從頭 prefill 整段對話。
-        self._prime("session")
         # 工具 block 以 call id 當 key;換了對話,舊 id 不得再被新呼叫接上。
         self._tools.clear()
         self._assistant = None
@@ -1433,6 +1430,7 @@ class CodeTrailApp(App[int]):
         self._reset_phase()
         self._mount_history(widgets, clear=True)
         self._append(NoticeLine(self._resumed_notice(snapshot, entries)))
+        self._prepare_idle("session")
         self._recount_context()
         self._refresh_status()
 
@@ -1560,6 +1558,16 @@ class CodeTrailApp(App[int]):
         """
         self.coordinator.prime_in_background(reason)
 
+    def _prepare_idle(self, reason: str) -> None:
+        """原始畫面已重播後，先檢查自動壓縮，再預熱可用的歷史。"""
+        try:
+            self.coordinator.prepare_idle(reason)
+        except (client_turns.TurnCoordinator.Busy, client_turns.QueueError):
+            return
+        if self.coordinator.busy:
+            self._turn_started = time.monotonic()
+            self._reset_phase(compacting=True)
+
     def _note_prime(self, reason: str, outcome: Any) -> None:
         self._last_prime = (time.time(), reason, outcome)
 
@@ -1585,25 +1593,32 @@ class CodeTrailApp(App[int]):
 
     # ---- 狀態列 --------------------------------------------------------
     def _recount_context(self) -> None:
-        """重算「這段對話下一輪會送出去多少 context」。
-
-        **不能**用 step_finish 的 `tokens.input`:llama-server 的
-        `prompt_eval_count` 在 prompt cache 命中時只算**新評估**的 token
-        —— 實測一段 5k tokens 的對話,狀態列會顯示 43。這裡用的是壓縮門檻
-        判斷的同一個估算(同一份 pruned payload),所以畫面上的數字與
-        「什麼時候會自動壓縮」是同一把尺。
-
-        只在回合結束與換 session 時算一次:它會走過整段歷史,不能綁在
-        每 0.25 秒的狀態列 tick 上。
-        """
-        try:
-            payload, _summary = self.engine.payload_messages()
-            tokens, _chars = context_budget.estimate_tokens(
-                messages=payload, tools=self.engine.openai_tools()
-            )
-        except Exception:  # noqa: BLE001 - 狀態列的一個數字不得變成新的失敗來源
+        """背景計算完整 next-turn prefix；不阻塞 UI、不採用本次重算量。"""
+        self._context_count_generation += 1
+        generation = self._context_count_generation
+        self._context_tokens = None
+        counter = getattr(self.engine, "context_tokens", None)
+        if not callable(counter):
             return
-        self._context_tokens = int(tokens)
+        identity = (self.engine.session_id, id(self.engine.messages), len(self.engine.messages))
+
+        def recount() -> None:
+            try:
+                value = counter()
+                if type(value) is not int or value < 0:
+                    value = None
+            except Exception:  # noqa: BLE001 - a display-only count can remain unknown
+                value = None
+            self._from_worker(self._accept_context_count, generation, identity, value)
+
+        threading.Thread(target=recount, name="codetrail-context-count", daemon=True).start()
+
+    def _accept_context_count(self, generation: int, identity: tuple, value: int | None) -> None:
+        current = (self.engine.session_id, id(self.engine.messages), len(self.engine.messages))
+        if generation != self._context_count_generation or identity != current:
+            return
+        self._context_tokens = value
+        self._refresh_status()
 
     def _compaction_mode(self) -> str:
         return str(getattr(self.compactor, "mode", "off"))
@@ -1703,7 +1718,7 @@ class CodeTrailApp(App[int]):
         parts = [
             self.engine.options.model,
             f"n_ctx={self.engine.options.n_ctx}",
-            f"ctx≈{self._context_tokens}/{self.engine.options.n_ctx}",
+            f"ctx={self._context_tokens if self._context_tokens is not None else '?'}/{self.engine.options.n_ctx}",
             f"session={self.engine.session_id}",
             f"權限={self.engine.options.policy.name}",
             f"壓縮={self._compaction_mode()}",

@@ -49,7 +49,7 @@ from client_policy import Decision, PermissionPolicy
 #: 一輪對話裡最多讓模型連續呼叫幾次工具。超過就停下來並講明。
 DEFAULT_MAX_TOOL_STEPS = 24
 
-#: 舊工具輸出剪枝(舊世代前端 `prune` 的等價實作,門檻逐字沿用)。
+#: 新 history epoch 的工具剪枝候選預算。一般 append 不移動切點,容量由精確 gate 守住。
 PRUNE_PROTECT_TOKENS = 40_000
 PRUNE_MINIMUM_TOKENS = 20_000
 PRUNE_SKIP_USER_TURNS = 2
@@ -171,6 +171,57 @@ def prune_old_tool_outputs(messages: Sequence[Mapping[str, Any]]) -> tuple[list[
     for index in candidates:
         out[index]["content"] = PRUNE_PLACEHOLDER
     return out, len(candidates)
+
+
+@dataclass(frozen=True)
+class _PrunedTool:
+    """A source ordinal and its original contents, independent of reused tool call IDs."""
+
+    index: int
+    content: str
+    call_id: Any
+    name: Any
+
+
+@dataclass(frozen=True)
+class _HistoryBinding:
+    """One append-only history and the pruning plan chosen when it was installed."""
+
+    messages: list[dict[str, Any]]
+    pruning: tuple[_PrunedTool, ...]
+
+
+def _bind_history(messages: Sequence[Mapping[str, Any]]) -> _HistoryBinding:
+    raw = [dict(message) for message in messages]
+    # Choose the boundary once, as the next real user turn will see it. The
+    # placeholder is local to this calculation and is never stored or sent.
+    selected, _ = prune_old_tool_outputs([*raw, {"role": "user", "content": ""}])
+    pruning = tuple(
+        _PrunedTool(index, message["content"], message.get("tool_call_id"), message.get("name"))
+        for index, message in enumerate(raw)
+        if message.get("role") == "tool"
+        and message.get("content") != PRUNE_PLACEHOLDER
+        and selected[index].get("content") == PRUNE_PLACEHOLDER
+    )
+    return _HistoryBinding(raw, pruning)
+
+
+def _apply_pruning(
+    messages: Sequence[Mapping[str, Any]], pruning: tuple[_PrunedTool, ...]
+) -> tuple[list[dict[str, Any]], int]:
+    """Apply a frozen plan before healing inserts messages and shifts positions."""
+    working = [dict(message) for message in messages]
+    applied = 0
+    for item in pruning:
+        if item.index >= len(working):
+            continue                  # A summary head is an exact source prefix.
+        message = working[item.index]
+        if (message.get("role") != "tool" or message.get("content") != item.content
+                or message.get("tool_call_id") != item.call_id or message.get("name") != item.name):
+            raise EngineError("工具剪枝計畫與原始歷史不符;不送出可能清錯內容的 payload")
+        message["content"] = PRUNE_PLACEHOLDER
+        applied += 1
+    return working, applied
 
 
 _INTERNAL_KEYS = frozenset({
@@ -577,9 +628,9 @@ def _slot_is_busy(slot: Any) -> bool:
 
 
 #: 預熱 prefix 用的佔位 user 訊息標記。**永不落檔、永不送出**:它只是讓
-#: reasoning 剝除與 prune 按「下一輪」的邊界計算,算完就在 to_wire 之前拿掉。
-#: 用標記而不是物件 identity(`is`),是因為 strip_historical_reasoning 與
-#: prune_old_tool_outputs 都會 `dict(message)` 重建每一則 —— identity 一定對不上,
+#: reasoning 剝除按「下一輪」的邊界計算,算完就在 to_wire 之前拿掉。
+#: 用標記而不是物件 identity(`is`),是因為 strip_historical_reasoning
+#: 會 `dict(message)` 重建每一則 —— identity 一定對不上,
 #: 那樣的檢查等於沒有檢查。
 _PRIME_PLACEHOLDER_KEY = "__codetrail_prime_placeholder__"
 
@@ -833,6 +884,16 @@ class Engine:
         return list(self._openai_tools)
 
     # ---- session -------------------------------------------------------
+    @property
+    def messages(self) -> list[dict[str, Any]]:
+        return self._history.messages
+
+    @messages.setter
+    def messages(self, messages: Sequence[Mapping[str, Any]]) -> None:
+        # Eager binding is essential: payload/prime must never initialise a plan,
+        # and later append operations must never move an existing pruning point.
+        self._history = _bind_history(messages)
+
     def replace_history(self, messages: Sequence[Mapping[str, Any]]) -> None:
         """壓縮之後換掉 in-memory 歷史,並把新歷史整段追加進 session 檔。
 
@@ -848,7 +909,8 @@ class Engine:
         檔(``store_error`` 已設)時例外:那段對話本來就只在記憶體裡,
         使用者也已經被警告過,壓縮不該因此被鎖死。
         """
-        new_history = [dict(message) for message in messages]
+        binding = _bind_history(messages)
+        new_history = binding.messages
         if self.store_error is None:
             try:
                 self.store.append(
@@ -858,7 +920,7 @@ class Engine:
             except Exception as exc:  # noqa: BLE001
                 self.store_error = f"{type(exc).__name__}: {exc}"
                 raise HistoryPersistError(f"{type(exc).__name__}: {exc}") from exc
-        self.messages = new_history
+        self._history = binding
 
     def prune_for_summary(
         self, messages: Sequence[Mapping[str, Any]]
@@ -869,11 +931,15 @@ class Engine:
         面前 —— 摘要請求自己撞 context gate、壓縮從此停用,而且違反
         `docs/compaction-rules.md` 的「被清掉的工具結果進不了下一次摘要」。
         """
-        working = heal_in_place(messages)
+        binding = self._history
+        if len(messages) > len(binding.messages) or list(messages) != binding.messages[:len(messages)]:
+            raise EngineError("摘要 head 必須是目前原始歷史的前段;不能猜測工具剪枝位置")
+        working = list(messages)
+        if self.options.prune:
+            working, _pruned = _apply_pruning(working, binding.pruning)
+        working = heal_in_place(working)
         if not self.options.keep_reasoning:
             working = strip_historical_reasoning(working)
-        if self.options.prune:
-            working, _pruned = prune_old_tool_outputs(working)
         return working
 
     def complete(self, messages: Sequence[Mapping[str, Any]], *, source: str):
@@ -886,12 +952,15 @@ class Engine:
             self._begin_turn()
             self._report_activity(operation, "preparing")
             payload = [dict(message) for message in messages]
+            measured = self.count_input_tokens(payload)
             usage = context_budget.check_and_log(
                 source=source,
                 requested_num_ctx=self.options.n_ctx,
                 messages=payload,
                 model=self.options.model,
                 reserved_output_tokens=self.options.max_output_tokens,
+                measured_input_tokens=measured,
+                count_method=llama_client.CHAT_TOKEN_COUNT_METHOD,
                 emit=False,
             )
             self._report_activity(operation, "waiting_model")
@@ -1080,10 +1149,11 @@ class Engine:
         _session_transition 在整個 create/adopt 期間關閉預熱准入；狀態與世代號
         在同一臨界區替換，新准入只能取得完整的新歷史。
         """
+        binding = _bind_history(messages)
         with self._prime_guard:
             self._prime_epoch += 1
             self.session_id = session_id
-            self.messages = messages
+            self._history = binding
             self.store_error = None
             self.resumed_snapshot = snapshot
 
@@ -1115,8 +1185,13 @@ class Engine:
     # ---- payload -------------------------------------------------------
     def payload_messages(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """組出這一次真的要送出去的訊息,並回報做了哪些轉換。"""
-        working = list(self.messages)
+        binding = self._history
+        working = list(binding.messages)
         summary: dict[str, Any] = {}
+        if self.options.prune:
+            working, pruned = _apply_pruning(working, binding.pruning)
+            if pruned:
+                summary["pruned_tool_results"] = pruned
         # 懸空的 tool_call 一定要在送出前補齊,而且要補在**宣告它的那則
         # assistant 訊息之後**(見 heal_pending_tool_calls)。補在整段尾端會排出
         # `assistant(tool_calls) → user → tool` 這種不合法的相鄰順序。
@@ -1141,10 +1216,6 @@ class Engine:
             # 這一次到底有沒有動過送出去的內容。
             if before != after:
                 summary["stripped_reasoning"] = before - after
-        if self.options.prune:
-            working, pruned = prune_old_tool_outputs(working)
-            if pruned:
-                summary["pruned_tool_results"] = pruned
         payload = [{"role": "system", "content": self.system_prompt.text}]
         payload.extend(to_wire(working))
         return payload, summary
@@ -1152,25 +1223,27 @@ class Engine:
     def next_turn_prefix(self) -> list[dict[str, Any]]:
         """**下一輪**真的會送出去的那一份,少了最後那則使用者訊息。
 
-        走的是與 :meth:`payload_messages` 完全同一套轉換(heal → reasoning 剝除 →
-        prune),差別只有一個:先在尾端掛一則佔位 user 訊息,讓兩個轉換按「下一輪」
-        的邊界算,再把它拿掉。少了這則佔位訊息,算出來的是**這一輪**的邊界——
-        目前最後一則 assistant 的 reasoning 會留著、prune 少剪一筆,於是預熱送的
-        prefix 跟下一輪實際要送的不是同一串 token,prompt cache 一個字也重用不到。
+        與 :meth:`payload_messages` 沿用同一份固定工具剪枝計畫,再 heal 與剝除
+        reasoning。尾端的佔位 user 訊息只讓 reasoning 按「下一輪」邊界處理,
+        不會重新挑剪枝候選。一般 append 因此不改寫已送過的舊工具內容。
 
         因此下一次 ``send(q)`` 的 payload 恆等於 ``next_turn_prefix() + [user q]``。
         佔位訊息**永不落檔、永不送出**(見 ``_PRIME_PLACEHOLDER_KEY``)。
         """
-        return self._prefix_from(self.messages)
+        binding = self._history
+        return self._prefix_from(list(binding.messages), binding.pruning)
 
-    def _prefix_from(self, history: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    def _prefix_from(
+        self, history: Sequence[Mapping[str, Any]], pruning: tuple[_PrunedTool, ...]
+    ) -> list[dict[str, Any]]:
         """:meth:`next_turn_prefix` 的實作,吃一份 snapshot(預熱在鎖內取的那一份)。"""
-        working = heal_in_place(list(history))
+        working = list(history)
+        if self.options.prune:
+            working, _pruned = _apply_pruning(working, pruning)
+        working = heal_in_place(working)
         working.append({"role": "user", "content": "", _PRIME_PLACEHOLDER_KEY: True})
         if not self.options.keep_reasoning:
             working = strip_historical_reasoning(working)
-        if self.options.prune:
-            working, _pruned = prune_old_tool_outputs(working)
         if not working or not working[-1].get(_PRIME_PLACEHOLDER_KEY):
             # 兩個轉換都不會重排也不會追加,所以這是不可能的。真的發生就是有人改了
             # 轉換的形狀:寧可 fail-loud(呼叫端把它記成 error:EngineError 並跳過這次
@@ -1180,6 +1253,67 @@ class Engine:
         payload = [{"role": "system", "content": self.system_prompt.text}]
         payload.extend(to_wire(working))
         return payload
+
+    def count_input_tokens(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
+        *,
+        extra: Mapping[str, Any] | None = None,
+        cancel: llama_client.RequestCancellation | None = None,
+    ) -> int:
+        """Freshly count the actual chat template without occupying a model slot.
+
+        Ordinary calls own a cancellable transport and observe this turn's flag;
+        prime supplies its separate transport/event, which remains open for the
+        later chat request. Waiting never prevents either cancellation path from
+        shutting down count HTTP, including a request still waiting for headers.
+        """
+        request = cancel if cancel is not None else llama_client.RequestCancellation()
+        abort = request.event if cancel is not None else self._cancel
+        body_extra = dict(extra) if extra is not None else {
+            "max_tokens": self.options.max_output_tokens, "return_progress": True,
+        }
+        try:
+            if abort.is_set():
+                raise TurnCancelled("輸入計數已被中斷")
+            count = _Abandonable(
+                lambda: llama_client.count_chat_tokens(
+                    base_url=self.options.base_url,
+                    messages=messages,
+                    model=self.options.model,
+                    temperature=self.options.temperature,
+                    top_p=config.CHAT_TOP_P,
+                    top_k=config.CHAT_TOP_K,
+                    min_p=config.CHAT_MIN_P,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    stream=True,
+                    extra=body_extra,
+                    timeout=self.options.request_timeout,
+                    cancel=request,
+                ),
+                "codetrail-prime-count" if cancel is not None else "codetrail-count",
+                abort=abort,
+            )
+            if not count.wait(abort):
+                request.cancel()
+                raise TurnCancelled("輸入計數已被中斷")
+            return count.result()
+        finally:
+            if cancel is None:
+                request.close()
+
+    def context_tokens(self, history: Sequence[Mapping[str, Any]] | None = None) -> int:
+        """Count the complete next-turn projection, including tools and template.
+
+        A candidate replacement gets precisely the eager plan that installation
+        would choose, without changing the active history or its pruning plan.
+        """
+        binding = self._history if history is None else _bind_history(history)
+        payload = self._prefix_from(list(binding.messages), binding.pruning)
+        return self.count_input_tokens(payload, tools=self.openai_tools())
 
     # ---- prompt cache 預熱 ---------------------------------------------
     @property
@@ -1240,14 +1374,16 @@ class Engine:
                         return PrimeOutcome(False, "aborted", None)
                     # 登記、身分、歷史與 priming 一次完成；中止不能被稍後的 snapshot 洗掉。
                     epoch = self._prime_epoch
-                    history = list(self.messages)
+                    binding = self._history
+                    history = list(binding.messages)
+                    pruning = binding.pruning
                     self._prime_stream = None
                     self._prime_abort = abort
                     self._prime_done = done
                     self._prime_request = request
                     self._priming = True
             try:
-                return self._prime_locked(abort, epoch, history, request)
+                return self._prime_locked(abort, epoch, history, pruning, request)
             except context_budget.ContextOverflowError:
                 return PrimeOutcome(False, "gate", None)
             except Exception as exc:  # noqa: BLE001 - 背景工作的失敗不得冒到呼叫端
@@ -1281,7 +1417,8 @@ class Engine:
 
     def _prime_locked(
         self, abort: threading.Event, epoch: int,
-        history: list[dict[str, Any]], request: llama_client.RequestCancellation,
+        history: list[dict[str, Any]], pruning: tuple[_PrunedTool, ...],
+        request: llama_client.RequestCancellation,
     ) -> "PrimeOutcome":
         """:meth:`prime_prompt_cache` 持著模型鎖的那一段(例外由呼叫端翻成 reason)。
 
@@ -1310,7 +1447,13 @@ class Engine:
             # 中止落在 probe 回來之後:什麼都還沒送,也不送。
             return PrimeOutcome(False, "aborted", None)
 
-        payload = self._prefix_from(history)
+        payload = self._prefix_from(history, pruning)
+        measured = self.count_input_tokens(
+            payload, tools=self._openai_tools,
+            extra={"max_tokens": PRIME_MAX_TOKENS}, cancel=request,
+        )
+        if abort.is_set() or self._prime_superseded(epoch):
+            return PrimeOutcome(False, "aborted", None)
         next_turn = context_budget.build_usage(
             source=PRIME_SOURCE,
             requested_num_ctx=self.options.n_ctx,
@@ -1318,6 +1461,8 @@ class Engine:
             tools=self._openai_tools,
             model=self.options.model,
             reserved_output_tokens=self.options.max_output_tokens,
+            measured_input_tokens=measured,
+            count_method=llama_client.CHAT_TOKEN_COUNT_METHOD,
         )
         if next_turn.hard_overflow:
             # 適用性檢查,不是這一次請求的閘:build_usage 不寫 log,telemetry 不會多
@@ -1332,6 +1477,8 @@ class Engine:
             model=self.options.model,
             # 保留額 == 下面實送的 max_tokens。同一個數字才是同一個閘。
             reserved_output_tokens=PRIME_MAX_TOKENS,
+            measured_input_tokens=measured,
+            count_method=llama_client.CHAT_TOKEN_COUNT_METHOD,
             emit=False,
         )
         if self._prime_superseded(epoch):
@@ -1885,6 +2032,7 @@ class Engine:
             # 只改局部 wire payload,先加指示再 gate;session、預熱 prefix 與下一輪
             # 的 system prompt 都保持原文。tools 保留,HTTP adapter 才會實送 none。
             payload[0] = {**payload[0], "content": payload[0]["content"] + "\n\n" + CONVERGENCE_INSTRUCTION}
+        measured = self.count_input_tokens(payload, tools=self._openai_tools, tool_choice=tool_choice)
         usage = context_budget.check_and_log(
             source="client",
             requested_num_ctx=self.options.n_ctx,
@@ -1892,6 +2040,8 @@ class Engine:
             tools=self._openai_tools,
             model=self.options.model,
             reserved_output_tokens=self.options.max_output_tokens,
+            measured_input_tokens=measured,
+            count_method=llama_client.CHAT_TOKEN_COUNT_METHOD,
             did_trim=bool(transform),
             trim_summary=transform,
             emit=False,
@@ -2024,7 +2174,8 @@ class Engine:
             "convergence_failed": convergence_failed,
             "finish": finish or client_events.REASON_STOP,
             "tokens": {
-                "input": usage.actual_prompt_eval_count or usage.estimated_input_tokens,
+                "input": (usage.actual_prompt_eval_count if usage.actual_prompt_eval_count is not None
+                          else usage.estimated_input_tokens),
                 "output": usage.actual_eval_count or 0,
             },
         }

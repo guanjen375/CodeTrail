@@ -16,6 +16,7 @@ CodeTrail 的每項操作只使用選定的主要實作。必要套件、工具�
 | 專用 reranking | 專用 reranker 服務。缺席、逾時、HTTP 或回應格式錯誤即報錯，不改用 embedding 排序或主模型。 |
 | 已啟用的 query expansion / multi-query | 設定正確且可用的模型服務；服務或協定失敗會傳出錯誤。模型合法地未產生額外查詢仍是有效資料結果。 |
 | TUI / headless `run` | 主 server `/props` 必須回正整數 n_ctx；同值交給 Engine 與 MCP。取不到就拒絕啟動回合，不改用設定檔估值。 |
+| 聊天容量檢查與自動壓縮 | 主 llama-server 必須支援 `/v1/chat/completions/input_tokens`，接受完整 chat payload 並回非負整數 `input_tokens`。每次容量決策重新計算 system、工具 schema、reasoning 與模板標記；端點缺席、逾時、HTTP 或格式錯誤會中止該次操作，修復服務後可重試。需升級到支援此端點的 server；不退回字元估算，也不發生成／prefill 作計數探針。 |
 | 明確要求容器隔離的評測 | `auto` 只選 Podman；若明確選 Docker，必須可讀 uid/gid 並傳入容器。缺少指定 runtime 或容器模組即報錯，不改在 host 執行。 |
 | session / 設定 / 提示來源 / cache / patch 等安全 IO | 支援 dir-fd、`O_NOFOLLOW`、`O_DIRECTORY` 的 POSIX Python；承諾 owner-only 的操作還需 uid 與權限設定能力。能力缺席時拒絕操作，讀取也不建立 state 目錄。 |
 | patch 建立新檔 | 檔案系統必須支援 atomic no-clobber hard link；失敗時清理暫存並盡力回滾整批，保留競爭者的檔案。 |

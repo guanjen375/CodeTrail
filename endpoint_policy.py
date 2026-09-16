@@ -30,7 +30,7 @@ _LOOPBACK_NAMES = frozenset({"localhost", "ip6-localhost", "ip6-loopback"})
 MODEL_ROLES = ("main", "embedding", "reranker", "vl")
 _ROLE_PATHS = {
     "main": {"", "/", "/health", "/props", "/slots", "/v1/models", "/completion",
-             "/v1/chat/completions", "/tokenize", "/detokenize"},
+             "/v1/chat/completions", "/v1/chat/completions/input_tokens", "/tokenize", "/detokenize"},
     "embedding": {"", "/", "/health", "/props", "/v1/models", "/embedding", "/v1/embeddings"},
     "reranker": {"", "/", "/health", "/props", "/v1/models", "/reranking"},
     "vl": {"", "/", "/health", "/props", "/v1/models", "/v1/chat/completions"},

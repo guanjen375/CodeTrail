@@ -59,6 +59,14 @@ class _Mcp:
 def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(context_budget, "log_metrics", lambda _usage: None)
     monkeypatch.setattr(llama_client, "chat_completions", lambda **_kwargs: iter([_answer()]))
+    # Match the offline model's existing small/oversized payload scale so the
+    # supplement gate still rejects its large input without contacting a server.
+    monkeypatch.setattr(
+        llama_client, "count_chat_tokens",
+        lambda **kwargs: context_budget.estimate_tokens(
+            messages=kwargs["messages"], tools=kwargs.get("tools"),
+        )[0],
+    )
 
     def make(*, policy=None, max_steps=4, on_approval=None, compactor=None):
         root = tmp_path / "project"

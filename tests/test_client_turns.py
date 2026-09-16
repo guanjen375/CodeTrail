@@ -27,6 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 import client_engine  # noqa: E402
 import client_events  # noqa: E402
 import client_turns  # noqa: E402
+import context_budget  # noqa: E402
 
 pytestmark = pytest.mark.smoke
 
@@ -34,6 +35,42 @@ pytestmark = pytest.mark.smoke
 # ============================================================
 # 替身
 # ============================================================
+
+def test_idle_preparation_is_cancellable_and_does_not_widen_automatic_modes(monkeypatch):
+    import client_compaction
+
+    for mode, policy in [("manual", "interactive"), ("off", "interactive"), ("codetrail", "readonly")]:
+        engine = _Engine()
+        engine.messages = [{"role": "user", "content": "old"}]
+        engine.options = types.SimpleNamespace(policy=types.SimpleNamespace(name=policy))
+        compactor = types.SimpleNamespace(mode=mode, compact=lambda: pytest.fail("unexpected automatic summary"))
+        coordinator, _ = _coordinator(engine, compactor=compactor)
+        queued = []
+        monkeypatch.setattr(coordinator, "_spawn", lambda body, name: queued.append((body, name)))
+        coordinator.prepare_idle("mount")
+        assert not coordinator.busy
+        assert all("prime" in name for _, name in queued)
+
+    engine = _Engine()
+    engine.messages = [{"role": "user", "content": "keep verbatim"}]
+    engine.options = types.SimpleNamespace(policy=types.SimpleNamespace(name="interactive"))
+
+    def compact():
+        assert engine.cancelled, "Cancellation must be armed before the worker enters compaction"
+        raise client_events.TurnCancelled("cancelled")
+
+    compactor = types.SimpleNamespace(mode=client_compaction.MODE_CODETRAIL, compact=compact)
+    coordinator, recorder = _coordinator(engine, compactor=compactor)
+    queued = []
+    monkeypatch.setattr(coordinator, "_spawn", lambda body, name: queued.append(body))
+    assert coordinator.prepare_idle("mount")
+    assert coordinator.busy and coordinator.cancel()
+    queued.pop(0)()
+    assert not coordinator.busy and not queued and not engine.primes
+    assert engine.messages == [{"role": "user", "content": "keep verbatim"}]
+    assert client_events.event_part(recorder.events[-1])["reason"] == "cancelled"
+
+
 class _Result:
     def __init__(self, notices=(), finish=client_events.REASON_STOP):
         self.notices = tuple(notices)
@@ -572,6 +609,27 @@ def test_auto_compaction_only_runs_after_a_completed_answer():
     coordinator.start_turn("hi")
     recorder.terminal()
     assert compactor.calls == []
+
+
+def test_a_context_gate_refusal_can_recover_old_history_without_retrying_tools():
+    class Overflows(_Engine):
+        def send(self, text, **_kwargs):
+            self.sent.append(text)
+            raise context_budget.ContextOverflowError(context_budget.ContextUsage(
+                effective_num_ctx=131072, estimated_input_tokens=123345,
+                reserved_output_tokens=8192, hard_overflow=True,
+            ))
+
+    engine = Overflows()
+    compactor = _Compactor(outcome=_Outcome("compacted", "歷史已壓縮"))
+    compactor.mode = "codetrail"
+    coordinator, recorder = _coordinator(engine, compactor=compactor)
+    coordinator.start_turn("pending question")
+    events = recorder.terminal()
+    assert compactor.calls == [False], "Gate refusal must not make automatic recovery unreachable"
+    assert engine.sent == ["pending question"], "Do not silently rerun a partially executed tool loop"
+    assert any("歷史已壓縮" in e.get("message", "") for e in events)
+    assert client_events.event_part(events[-1])["reason"] == client_events.REASON_ERROR
 
 
 def test_auto_compaction_runs_after_a_completed_answer():

@@ -226,6 +226,8 @@ server 在初始快照後,每完成一個最多 `n_batch` token 的批次才推�
 - 剛改過 `AGENTS.md` / `.codetrail/lessons.md` / `~/.config/codetrail/instructions.md`
 - 中間插進來的請求用的是別的 prefix:壓縮摘要(不帶工具 schema)、`query_knowledge` 內部
   的查詢改寫、或另一個客戶端在用同一台 server
+- 接續或壓縮安裝了新的模型歷史，工具輸出的剪枝計畫在這個邊界重新建立。一般追加
+  回合不再逐輪回推舊工具的切點；原始 session 與畫面仍保留完整工具內容
 
 本機這顆 build 的 llama-server 有 4 個 slot,會在**可用的** slot 之間依最長共同前綴挑一個,
 必要時淘汰最舊的那份;而且在 SWA / hybrid checkpoint 的條件下,即使前綴對得上也可能重算。
@@ -243,10 +245,17 @@ server 在初始快照後,每完成一個最多 `n_batch` token 的批次才推�
 - **不能**縮短 thinking,也不會讓硬體算得比較快;它只改變「這段 prefill 發生在你打字之前,
   還是按 Enter 之後」。prefix 本來就是熱的時候,預熱等於沒感覺
 
+接續已有歷史時，`codetrail` 自動模式會先重播原始對話，再檢查完整輸入是否超過
+壓縮門檻；需要壓縮就先完成那個可 Ctrl-C 中止的回合，之後才預熱。這段壓縮與
+零寫入的 cache 預熱分開；manual / off 不會在接續時自動摘要，readonly 也不新增
+這條無新問句的生成路徑。
+
 預熱進行中,狀態列會多一段 `prompt cache 預熱中`。這時候送出問題不會被丟掉,只是會在模型
 鎖上等預熱那一次送完(照樣可以 Ctrl-C)。`/new` 與換 session 會關閉舊預熱的連線，
 一秒內收掉預熱並放掉模型鎖；即使 server 還沒回 headers，也不必等它回應或逾時。
-代價不是零:每次預熱最多多一次 `/slots` 查詢與一個 token 的生成。
+代價不是零:每次預熱最多多一次 `/slots` 查詢、一次完整輸入計數與一個 token 的生成。
+計數走 `/v1/chat/completions/input_tokens`，使用同一個 chat 模板與正式 payload，
+不做生成或 prefill；中止也涵蓋正在等回應的計數請求。
 
 **看它到底跑了沒有:** `/status` 有一行 `prompt cache 預熱=`。
 
@@ -275,7 +284,8 @@ server 在初始快照後,每完成一個最多 `n_batch` token 的批次才推�
 | `error:<類型>` | 送出時出錯 |
 
 **要量它**:專案目錄下的 `.codetrail/context_metrics.jsonl` 每個請求一行(只有 count 與
-metadata,不含 prompt、工具輸出或檔案內容;readonly session 不寫)。判冷熱只需要四個欄位:
+metadata,不含 prompt、工具輸出或檔案內容;readonly session 不寫)。判冷熱要先分清
+完整輸入、計數來源與本次重算量:
 
 ```bash
 python3 - <<'EOF'
@@ -287,13 +297,16 @@ for r in rows[-30:]:
         continue
     processed = r.get("prompt_tokens_processed")
     print(f'{r["source"]:10s} msgs={r["message_count"]:3d} '
-          f'est_in={r["estimated_input_tokens"]:6d} '
+          f'input={r["estimated_input_tokens"]:6d} '
+          f'count={r.get("count_method", "legacy_heuristic")} '
           f'processed={processed if processed is not None else "n/a"}')
 EOF
 ```
 
 - `source`:`client` 是聊天的每一步、`compaction` 是壓縮摘要、`prime` 是預熱
-- `estimated_input_tokens`:這次**送出去**的估計 token 數(整份 prefix + 歷史)
+- `estimated_input_tokens`:保留舊欄名。`count_method=llama_cpp_chat` 時，是請求前由
+  server 精確計出的**完整輸入**，包含 system、工具 schema、歷史與模板標記，
+  cache 命中的部分也照算；`heuristic` 或缺少 `count_method` 的舊行才是字元估算
 - `prompt_tokens_processed`:server 這次**真的評估**了幾個 token。這是判冷熱唯一能看的欄位:
   接近 `estimated_input_tokens` 就是冷的(整份重算),遠小於它就是命中了 cache。升級之前
   寫的舊行沒有這個欄位,會顯示 `n/a`
@@ -305,8 +318,15 @@ EOF
 它仍然接近自己的 `estimated_input_tokens`、而且中間沒有別人的請求 = 這顆 build 在這個情境
 下不重用(checkpoint / SWA 之類),預熱在這台機器上就沒有效果。
 
-`actual_prompt_eval_count` 不能拿來判冷熱:依回應形狀,它可能是這次輸入的**總** token 數
-(server 同時回 `usage` 與 `timings` 時取 `usage`),cache 全命中時照樣是一個大數字。
+`actual_prompt_eval_count` 只記回應提供的**完整輸入**(`usage.prompt_tokens` 或 native
+完整輸入欄位)，未知時為 `null`。`timings.prompt_n` 只記進 `prompt_tokens_processed`，
+不會拿來代填完整輸入；cache 全命中時，完整量仍可能很大而重算量很小。
+
+聊天客戶端的一般回答、收斂、摘要與預熱都重新精確計數後才過 gate，不用字元比例
+或上一輪的重算量決定容量。計數端點缺失、HTTP 失敗或格式錯誤會明確失敗，
+不會退回估算後繼續生成；請確認目前設定的 llama-server 支援上述計數路由。
+狀態列的 `ctx=` 也在背景量完整下一輪輸入，未取得可信結果時顯示 `?`；切換
+session 或 history 變動後才回來的舊數字會丟棄。
 
 <a id="mcp-connected-but-no-tool-call"></a>
 ### `/tools` 列得出 21 個,但模型說沒有 CodeTrail 或只印出假工具 XML
@@ -395,13 +415,21 @@ ingest 的待辦通知現在由客戶端自己處理(`client_notify.py`),不再�
 
 | 畫面 | 意思 | 怎麼辦 |
 |---|---|---|
-| 送出新問題,畫面先跑一段摘要才回答 | 這台機器還沒選過壓縮模式(沒有 `client.json`),或選的是 `manual` | 重跑 `./set_config.sh` 選 `codetrail`,再重開 `aicode` |
-| 畫面說「壓縮產生了空摘要」/「壓縮請求出錯」 | 摘要是空的、只有 thinking、或請求掛了。摘要**沒有落地**,對話原封不動 | 這個對話的自動壓縮已停用(跨行程保留)。開一個新對話,把還看得到的問題與必要狀態重送 |
+| 接續舊對話後先跑摘要，尚未開始預熱 | `codetrail` 模式量到既有歷史已超過門檻，先壓縮再預熱 | 等壓縮完成，或 Ctrl-C 中止；原始畫面紀錄保留，manual / off 不會自動做這一步 |
+| 畫面說「壓縮產生了空摘要」或只有 thinking | 實際收到的摘要沒有可信正文，摘要**沒有落地**，原始歷史保留 | 這個對話的自動壓縮已停用且跨行程保留；開新對話，帶入必要問題與狀態 |
+| 畫面說「壓縮沒有生效」，並指出計數或模型服務錯誤 | 計數端點、HTTP 或摘要請求失敗；沒有可驗證的摘要產出，不能據此判定摘要永久不可信 | 原始歷史與壓縮狀態保留；修復模型服務後可 `/compact` 重試，自動壓縮未永久停用 |
+| 畫面說「壓縮請求出錯」且自動壓縮已停用 | 舊版本留下的 `summary_error` durable 紀錄仍受尊重 | 開新對話帶入必要狀態；升級不會清除舊停用檔 |
 | 畫面說「摘要沒有照七欄格式輸出」 | 模型照了別套欄位(實測看過整份換成英文五欄)。「已確定事實 vs 未確認」的分離沒了 | 摘要沒有落地,對話可以繼續;要繼續用結構化壓縮就開新對話,同一個模型一直不遵守就改 `off` |
+| 過 gate 後說「歷史已壓縮；這次問題尚未完成」 | 只摘要更早的已完成內容，最後問題及其後訊息逐字保留；工具迴圈沒有自動重跑 | 查看這次已完成的工具結果，再重送問題；不會把未回答的問題標成已答 |
+| 壓縮仍說單一回合或尾段超過容量 | 分批摘要也不能安全放下不可分割回合，或「摘要 + 原始 tail」仍過 gate | 原始歷史不變且可重試；可用更大的 live n_ctx 接續，或開新對話帶入必要內容 |
 | 壓縮完緊接著又壓一次 | `tail_turns = 1` 讓最新一輪逐字留著;那一輪很長時,壓完的 context 是「摘要 + 長 tail」 | 正常,不是迴圈(同一則助理訊息不會被當第二次的錨點)。把超長單輪拆小或把 `n_ctx` 調大 |
 | 畫面說「這個 n_ctx 推不出可用的壓縮門檻」 | ctx 太小,公式算出來的 threshold / tail_cap 低於下限 | 把 `n_ctx` 調大重跑 `./set_config.sh`,或把模式切成 `off` |
 | `/compact` 沒有作用 | headless `run` 沒有互動指令 | 在 `aicode` 裡面下,不要用 `codetrail_chat.py run` |
 
+過大的摘要會按完整 user-turn 分批，每批仍過精確 gate、驗證七欄格式；所有批次
+與 replacement 容量檢查完成後才一次寫入新模型歷史，中途取消或失敗不會留下
+半份摘要。未回答的單輪或沒有更早可信 head 時仍不能恢復壓縮。原始逐字紀錄
+保留，摘要不會重新帶回已剪掉的舊工具輸出。
 
 `codetrail_chat.py run`(headless)只輸出事件流,上面的提示不會出現。停用會留一筆
 `compaction_stopped` 的零內容 incident(與 MCP incident 同一個檔)——

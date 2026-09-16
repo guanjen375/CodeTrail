@@ -39,6 +39,26 @@ TESTS_DIR = Path(__file__).resolve().parent
 
 # AGENTS.md §2「安全相關不要砍」的檢查點 → (守它的說明, 必須存在且帶 smoke 的 node)。
 SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "test_chat_token_count.py": (
+        "精確計數與 chat body 同源，endpoint/取消契約 fail-closed，不洩漏 NDA 內容",
+        (
+            "test_exact_count_sends_the_same_complete_body_as_chat",
+            "test_exact_count_fails_closed_without_exposing_response_or_request_bodies",
+            "test_exact_count_owns_only_its_scoped_cancellation_transport",
+            "test_cancelled_count_cannot_publish_a_late_result_or_bypass_endpoint_policy",
+        ),
+    ),
+    "test_compaction_token_regressions.py": (
+        "完整 tokens 跨容量觸發，過大摘要分批原子提交，pending tail 原文與可重試失敗不落停用紀錄",
+        (
+            "test_plain_conversation_compacts_by_full_tokens_across_live_context_sizes",
+            "test_an_already_oversized_summary_is_batched_without_losing_turns",
+            "test_overflow_recovery_preserves_the_unanswered_turn_verbatim",
+            "test_summary_request_errors_are_retryable_without_a_durable_stop",
+            "test_a_later_batch_failure_never_installs_a_partial_summary",
+            "test_a_replacement_that_still_overflows_never_changes_history",
+        ),
+    ),
     "test_message_queue.py": (
         "排隊與本輪補充在安全工具邊界交付；取消、核准、session、失敗與pending狀態不混淆",
         (
@@ -754,6 +774,16 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "(補的「已中斷」結果排在該群組既有結果之後);"
         "只有終結 chunk + `timings.prompt_n` 才記成 sent(`incomplete` / `no_timings` 不寫 telemetry)",
         (
+            "test_appending_turns_keeps_the_existing_tool_projection_stable",
+            "test_summary_head_clones_reuse_the_full_history_pruning_plan",
+            "test_summary_projection_rejects_a_nonprefix_clone",
+            "test_pruning_plan_rejects_changed_content_at_a_bound_ordinal",
+            "test_exact_input_count_blocks_a_prompt_that_the_character_estimate_accepts",
+            "test_fresh_exact_counts_cover_the_sent_payload_and_full_input_event",
+            "test_a_count_failure_never_falls_back_to_generation",
+            "test_exact_prime_count_refuses_an_overflowing_next_turn",
+            "test_cancelling_an_exact_count_prevents_later_generation",
+            "test_candidate_context_count_uses_its_own_projection_without_installing_it",
             "test_load_session_leaves_the_engine_untouched_and_adopt_switches_atomically",
             "test_the_snapshot_model_history_is_compacted_while_the_transcript_keeps_the_originals",
             "test_a_web_style_cancel_after_a_failed_turn_is_refused",
@@ -869,6 +899,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "headless `run` 沒有預熱的呼叫點(多一條就是 headless 在沒有使用者訊息時打模型);"
         "自檢通過後進 TUI 的橫幅不重播進度 LOG(端對端,真的走 `client_preflight.run()`)",
         (
+            "test_headless_resumption_compacts_before_send_and_recovers_without_retry",
             "test_a_provider_prefixed_model_is_normalised_like_the_wrapper",
             "test_a_completed_tool_event_is_recognised_by_the_shared_parser",
             "test_a_denied_or_failed_tool_is_not_a_completed_call",
@@ -894,6 +925,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "`on_done`,engine raise 時 outcome 是 None 而不是不叫,回呼的例外不冒出預熱執行緒、也不互相帶走",
         (
             "test_cancel_wakes_a_turn_waiting_for_approval",
+            "test_idle_preparation_is_cancellable_and_does_not_widen_automatic_modes",
+            "test_a_context_gate_refusal_can_recover_old_history_without_retrying_tools",
             "test_cancel_counts_even_before_the_worker_enters_send",
             "test_a_cancel_arriving_while_the_turn_is_being_started_is_not_lost",
             "test_the_slow_mcp_cancel_does_not_hold_the_coordinator_lock",
@@ -937,6 +970,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "`/status` 反映協調器跑的**最近一次**預熱(含壓縮後協調器自己排的那一次)的結果 / 原因 / "
         "時間 / 觸發點(停在 mount 那一次的 sent = 使用者以為 cache 是熱的,其實這一次是 skipped)",
         (
+            "test_a_resumed_history_is_compacted_before_startup_prefill",
+            "test_context_display_counts_full_tokens_off_the_ui_thread_and_discards_stale_results",
             "test_resume_replays_the_stored_history",
             "test_a_session_resumed_at_startup_is_shown_on_mount",
             "test_the_session_picker_lists_outlines_and_switches",
@@ -1053,7 +1088,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_permission_override_never_widens_the_readonly_policy",
             "test_a_reasoning_only_summary_is_its_own_failure",
             "test_a_drifted_summary_stops_this_session",
-            "test_a_failed_summary_request_stops_without_touching_the_history",
+            "test_a_failed_summary_request_is_retryable_without_touching_the_history",
             "test_the_same_anchor_is_never_compacted_twice",
             "test_the_summary_request_never_carries_tool_arguments",
             "test_the_output_constant_is_bounded_by_the_derivation_formula",
@@ -1199,6 +1234,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     "test_endpoint_policy.py": (
         "prompt 與文件內容只能送到本機 endpoint",
         (
+            "test_split_chat_token_count_is_allowed_only_on_the_main_endpoint",
             "test_model_role_rejects_remote_without_opt_in",
             "test_prompt_bearing_calls_reject_remote_without_opt_in",
             "test_redirect_is_fail_loud_and_body_free",
@@ -1267,6 +1303,10 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "`prompt_tokens_processed`(真正評估的 token 數)只由 `timings.prompt_n` 填,"
         "與 `actual_prompt_eval_count` 語意分離 —— 混在一起就沒有任何欄位能判 prefix 冷熱",
         (
+            "test_measured_input_controls_the_gate_across_live_context_sizes",
+            "test_invalid_measured_input_never_becomes_an_estimate",
+            "test_processed_timings_never_replace_the_full_input_count",
+            "test_usage_only_final_chunk_keeps_full_input_and_processed_tokens_separate",
             "test_knowledge_has_exactly_one_ungated_completion_entry",
             "test_gated_completion_refuses_overflow_without_calling_the_server",
             "test_a_payload_with_reasoning_estimates_higher_than_one_without",

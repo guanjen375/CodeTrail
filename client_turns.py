@@ -41,6 +41,8 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 import client_engine
+import client_compaction
+import context_budget
 import client_events
 
 #: 核准等多久沒人回答就當拒絕。UI 掛掉 / 使用者離開時 worker 不能永遠卡著。
@@ -532,6 +534,51 @@ class TurnCoordinator:
             self.finish_turn()
             raise
 
+    def prepare_idle(self, reason: str) -> bool:
+        """接續歷史先在可取消的回合中壓縮，收尾後才交給零寫入的 prime。"""
+        policy = getattr(getattr(self.engine, "options", None), "policy", None)
+        if (
+            getattr(self.compactor, "mode", None) != client_compaction.MODE_CODETRAIL
+            or not self.engine.messages
+            or getattr(policy, "name", None) != "interactive"
+        ):
+            return self.prime_in_background(reason)
+        self.begin_turn()
+        target = self.engine.session_id
+        try:
+            self._spawn(
+                lambda: self._run_idle_preparation(target, reason),
+                f"codetrail-prepare-{target}",
+            )
+        except BaseException:
+            self.finish_turn()
+            raise
+        return True
+
+    def _run_idle_preparation(self, target: str, reason: str) -> None:
+        successful = False
+        compacted = False
+        try:
+            outcome = self.compactor.compact()
+            compacted = outcome.status == "compacted"
+            successful = outcome.status in ("compacted", "skipped") and not self.cancelled
+            if outcome.message:
+                self._publish(client_events.notice_event(target, outcome.message))
+        except client_events.TurnCancelled:
+            self._publish(client_events.notice_event(target, "壓縮已中斷，原始歷史保留。"))
+        except Exception as exc:  # noqa: BLE001 - initialization remains usable after a failed count
+            self._publish(client_events.error_event(target, f"壓縮準備失敗:{type(exc).__name__}: {exc}"))
+        finally:
+            if not successful:
+                self._pause_queue()
+            self._publish(client_events.step_finish_event(
+                target, reason=(client_events.REASON_CANCELLED if self.cancelled else
+                                client_events.REASON_STOP if successful else client_events.REASON_ERROR),
+            ))
+            self.finish_turn()
+        if successful and not self._start_next_queued(target):
+            self.prime_in_background("compaction" if compacted else reason)
+
     def _spawn(self, body: Callable[[], None], name: str) -> None:
         threading.Thread(target=body, name=name, daemon=True).start()
 
@@ -616,6 +663,21 @@ class TurnCoordinator:
             self._publish(
                 client_events.step_finish_event(target, reason=client_events.REASON_CANCELLED)
             )
+        except context_budget.ContextOverflowError as exc:
+            self._close_supplements()
+            self._restore_unsent_queue_item()
+            self._pause_queue()
+            self._publish(client_events.error_event(target, str(exc)))
+            # The refused request may follow partial tool execution. Recover the
+            # older history without retrying this loop or marking its user answered.
+            if getattr(self.compactor, "mode", None) == client_compaction.MODE_CODETRAIL:
+                outcome = self._auto_compact(target, None, overflow=True)
+                compacted = getattr(outcome, "status", None) == "compacted"
+                if compacted:
+                    self._publish(client_events.notice_event(target, "歷史已壓縮；這次問題尚未完成，請重送。"))
+            self._publish(client_events.step_finish_event(
+                target, reason=client_events.REASON_CANCELLED if self.cancelled else client_events.REASON_ERROR,
+            ))
         except Exception as exc:  # noqa: BLE001 - 一輪失敗不得帶走整個客戶端
             self._close_supplements()
             self._restore_unsent_queue_item()
@@ -678,7 +740,7 @@ class TurnCoordinator:
         if compacted:
             self.prime_in_background("compaction")
 
-    def _auto_compact(self, target: str, result: Any) -> Any:
+    def _auto_compact(self, target: str, result: Any, *, overflow: bool = False) -> Any:
         """自動壓縮。回傳壓縮器給的 outcome(沒壓 / 壓不成回 ``None``)。
 
         呼叫端要靠它決定壓縮**有沒有真的換掉歷史**:換掉了才需要重新預熱。
@@ -687,7 +749,7 @@ class TurnCoordinator:
             return None
         # 只有真的答完(finish=stop)才壓:被截斷(length)、出錯、被中斷的那一輪
         # 沒有可信的切點。
-        if getattr(result, "finish", None) != client_events.REASON_STOP:
+        if not overflow and getattr(result, "finish", None) != client_events.REASON_STOP:
             return None
         try:
             outcome = self.compactor.compact()

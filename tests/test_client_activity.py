@@ -47,6 +47,14 @@ def activity_engine(tmp_path, monkeypatch):
     root = tmp_path / "project"
     root.mkdir()
     monkeypatch.setattr(context_budget, "log_metrics", lambda *_args, **_kwargs: None)
+    # This fixture's model is offline; keep its synthetic budget scale while
+    # exercising the real engine's activity, gate and cancellation boundaries.
+    monkeypatch.setattr(
+        llama_client, "count_chat_tokens",
+        lambda **kwargs: context_budget.estimate_tokens(
+            messages=kwargs["messages"], tools=kwargs.get("tools"),
+        )[0],
+    )
     engine = client_engine.Engine(
         client_engine.EngineOptions(
             root=root, model="activity-model", base_url="http://127.0.0.1:65535",

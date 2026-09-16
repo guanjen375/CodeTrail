@@ -442,6 +442,13 @@ class _FakeEngine:
     def openai_tools(self):
         return []
 
+    def count_input_tokens(self, messages, **_kwargs):
+        # Offline token-service double; production must use the server tokenizer.
+        return cc.context_budget.estimate_tokens(messages=list(messages))[0]
+
+    def context_tokens(self, history=None):
+        return self.count_input_tokens(self.messages if history is None else history)
+
     def replace_history(self, messages):
         self.replaced = [dict(m) for m in messages]
         self.messages = [dict(m) for m in messages]
@@ -519,12 +526,13 @@ def test_a_reasoning_only_summary_is_its_own_failure(tmp_path, monkeypatch):
     assert outcome.detail == "summary_reasoning_only"
 
 
-def test_a_failed_summary_request_stops_without_touching_the_history(tmp_path, monkeypatch):
+def test_a_failed_summary_request_is_retryable_without_touching_the_history(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     engine = _FakeEngine(_conversation(4), fail=RuntimeError("boom"))
     outcome = _compactor(engine).compact(manual=True)
-    assert outcome.status == "stopped" and outcome.detail == "summary_error"
+    assert outcome.status == "failed" and outcome.detail == "request_error"
     assert engine.replaced is None
+    assert cc.read_stopped() == {}
 
 
 def test_manual_compact_goes_through_the_same_verification(tmp_path, monkeypatch):
@@ -811,6 +819,11 @@ def _real_engine_for_compaction(tmp_path, monkeypatch, summary):
         system_prompt=client_prompt.SystemPrompt(text="SYSTEM"),
     )
     engine.messages = _conversation(6)
+    monkeypatch.setattr(engine, "openai_tools", lambda: [])
+    monkeypatch.setattr(
+        llama_client, "count_chat_tokens",
+        lambda **kw: cc.context_budget.estimate_tokens(messages=kw["messages"], tools=kw.get("tools"))[0],
+    )
     monkeypatch.setattr(
         llama_client, "chat_completions",
         lambda **_kw: iter([{"choices": [{"delta": {"content": summary}, "finish_reason": "stop"}]}]),

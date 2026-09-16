@@ -25,6 +25,28 @@ import llama_client  # noqa: E402
 pytestmark = pytest.mark.smoke
 
 
+def test_split_chat_token_count_is_allowed_only_on_the_main_endpoint(monkeypatch):
+    grants = {
+        "main": "http://10.0.0.1:8080", "embedding": "http://10.0.0.1:8081",
+        "reranker": "http://10.0.0.1:8082", "vl": "http://10.0.0.1:8083",
+    }
+    monkeypatch.setattr(config, "DEPLOYMENT_MODE", "client")
+    monkeypatch.setattr(config, "MODEL_ENDPOINTS", grants)
+    for role, attribute in (("main", "LLAMA_BASE_URL"), ("embedding", "LLAMA_EMBED_BASE_URL"),
+                            ("reranker", "LLAMA_RERANK_BASE_URL"), ("vl", "LLAMA_VL_BASE_URL")):
+        monkeypatch.setattr(config, attribute, grants[role])
+    path = "/v1/chat/completions/input_tokens"
+    endpoint_policy.ensure_allowed(grants["main"] + path, "main")
+    endpoint_policy.ensure_allowed(grants["main"] + path, "model")
+    for role in ("embedding", "reranker", "vl"):
+        with pytest.raises(endpoint_policy.EndpointPolicyError):
+            endpoint_policy.ensure_allowed(grants[role] + path, role)
+        with pytest.raises(endpoint_policy.EndpointPolicyError):
+            endpoint_policy.ensure_allowed(grants[role] + path, "model")
+    with pytest.raises(endpoint_policy.EndpointPolicyError):
+        endpoint_policy.ensure_allowed("http://10.0.0.2:8080" + path, "main")
+
+
 # ============================================================
 # endpoint_policy 本體
 # ============================================================

@@ -112,6 +112,14 @@ def _tool_chunk(name, arguments, index=0, call_id="call_1", finish=None):
 @pytest.fixture()
 def engine_factory(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    # Existing engine contracts use offline model doubles. Only tests of the
+    # measured count contract below override this local counter with exact data.
+    monkeypatch.setattr(
+        llama_client, "count_chat_tokens",
+        lambda **kwargs: context_budget.estimate_tokens(
+            messages=kwargs["messages"], tools=kwargs.get("tools"),
+        )[0],
+    )
     root = tmp_path / "project"
     root.mkdir()
 
@@ -212,6 +220,251 @@ def test_a_short_history_is_never_pruned():
     ]
     pruned, count = client_engine.prune_old_tool_outputs(messages)
     assert count == 0 and pruned[1]["content"] == "small"
+
+
+def _projection_turn(number, *, tool_content=None):
+    messages = [{"role": "user", "content": f"question {number}"}]
+    if tool_content is not None:
+        # Fallback IDs repeat after restarting the client; they are not identities.
+        messages.extend([
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "call_1", "type": "function",
+                             "function": {"name": "read_file", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "name": "read_file",
+             "content": tool_content},
+        ])
+    messages.append({"role": "assistant", "content": f"answer {number}"})
+    return messages
+
+
+def test_appending_turns_keeps_the_existing_tool_projection_stable(engine_factory, monkeypatch):
+    """A new turn must not clear another old result and invalidate the cached prefix."""
+    monkeypatch.setattr(client_engine, "PRUNE_PROTECT_TOKENS", 40)
+    monkeypatch.setattr(client_engine, "PRUNE_MINIMUM_TOKENS", 20)
+    engine = engine_factory()
+    size = int(30 * config.CHARS_PER_TOKEN)
+    original = sum((_projection_turn(i, tool_content=str(i) * size) for i in range(3)), [])
+    engine.messages = copy.deepcopy(original)
+    before = engine.next_turn_prefix()
+    assert [m.get("content") for m in before if m.get("role") == "tool"] == [
+        client_engine.PRUNE_PLACEHOLDER, "1" * size, "2" * size,
+    ]
+
+    for message in _projection_turn(3, tool_content="3" * size):
+        engine._record(message)
+    after = engine.next_turn_prefix()
+    assert after[:len(before)] == before
+    assert engine.messages[:len(original)] == original
+    assert [m.get("content") for m in after if m.get("role") == "tool"][-1] == "3" * size
+
+
+def test_summary_head_clones_reuse_the_full_history_pruning_plan(engine_factory, monkeypatch):
+    """Removing the retained tail must not revive an output already cleared for chat."""
+    monkeypatch.setattr(client_engine, "PRUNE_PROTECT_TOKENS", 40)
+    monkeypatch.setattr(client_engine, "PRUNE_MINIMUM_TOKENS", 20)
+    engine = engine_factory()
+    huge = "private-tool-evidence " * 20
+    engine.messages = (_projection_turn(1, tool_content=huge)
+                       + _projection_turn(2) + _projection_turn(3))
+    original = copy.deepcopy(engine.messages)
+    payload, _ = engine.payload_messages()
+    assert huge not in json.dumps(payload)
+    head = [dict(message) for message in engine.messages[:-2]]
+    summary_head = engine.prune_for_summary(head)
+    assert [m["content"] for m in summary_head if m.get("role") == "tool"] == [
+        client_engine.PRUNE_PLACEHOLDER,
+    ]
+    assert engine.messages == original and head == original[:-2]
+
+
+def test_summary_projection_rejects_a_nonprefix_clone(engine_factory):
+    """A copied suffix cannot be mistaken for the source ordinals of a summary head."""
+    engine = engine_factory()
+    engine.messages = _projection_turn(1, tool_content="first") + _projection_turn(2, tool_content="second")
+    with pytest.raises(client_engine.EngineError):
+        engine.prune_for_summary([dict(message) for message in engine.messages[4:]])
+
+
+def test_pruning_plan_rejects_changed_content_at_a_bound_ordinal(engine_factory, monkeypatch):
+    """A fixed ordinal must never silently clear a different tool result."""
+    monkeypatch.setattr(client_engine, "PRUNE_PROTECT_TOKENS", 40)
+    monkeypatch.setattr(client_engine, "PRUNE_MINIMUM_TOKENS", 20)
+    engine = engine_factory()
+    engine.messages = (_projection_turn(1, tool_content="old evidence " * 30)
+                       + _projection_turn(2) + _projection_turn(3))
+    assert engine.next_turn_prefix()[3]["content"] == client_engine.PRUNE_PLACEHOLDER
+    engine.messages[2]["content"] = "replacement evidence with the same call_1"
+    with pytest.raises(client_engine.EngineError):
+        engine.next_turn_prefix()
+
+
+@pytest.mark.parametrize("request_kind", ["turn", "convergence", "summary"])
+def test_exact_input_count_blocks_a_prompt_that_the_character_estimate_accepts(
+    engine_factory, monkeypatch, request_kind,
+):
+    """Every real generation path gates the complete measured template input."""
+    engine = engine_factory(max_output_tokens=1000)
+    engine.options.n_ctx = 10000
+    measured = []
+    generated = []
+
+    def count(**kwargs):
+        measured.append(kwargs)
+        return 9500
+
+    def chat(**kwargs):
+        generated.append(kwargs)
+        return iter([_text_chunk("answer", finish="stop")])
+
+    monkeypatch.setattr(llama_client, "count_chat_tokens", count, raising=False)
+    monkeypatch.setattr(llama_client, "chat_completions", chat)
+    with pytest.raises(context_budget.ContextOverflowError) as caught:
+        if request_kind == "turn":
+            engine.send("短問題")
+        elif request_kind == "convergence":
+            with engine.turn_scope():
+                engine._one_model_step(on_text=None, on_reasoning=None, tool_choice="none")
+        else:
+            engine.complete([{"role": "user", "content": "short summary input"}], source="compaction")
+    assert caught.value.usage.estimated_input_tokens == 9500
+    assert len(measured) == 1 and generated == []
+    assert measured[0]["timeout"] == engine.options.request_timeout
+    assert measured[0]["extra"]["max_tokens"] == engine.options.max_output_tokens
+    assert measured[0]["stream"] is True
+    if request_kind == "convergence":
+        assert measured[0]["tool_choice"] == "none"
+        assert client_engine.CONVERGENCE_INSTRUCTION in measured[0]["messages"][0]["content"]
+
+
+def test_fresh_exact_counts_cover_the_sent_payload_and_full_input_event(engine_factory, monkeypatch):
+    """Processed prompt_n is not complete context, and the next request is recounted."""
+    engine = engine_factory()
+    measured, generated, events = [], [], []
+    counts = iter([4321, 5432])
+
+    def count(**kwargs):
+        measured.append(copy.deepcopy({k: v for k, v in kwargs.items() if k != "cancel"}))
+        return next(counts)
+
+    def chat(**kwargs):
+        generated.append(kwargs)
+        chunk = _text_chunk("answer", finish="stop")
+        chunk["timings"] = {"prompt_n": 7, "predicted_n": 1}
+        return iter([chunk])
+
+    monkeypatch.setattr(llama_client, "count_chat_tokens", count, raising=False)
+    monkeypatch.setattr(llama_client, "chat_completions", chat)
+    engine.send("first", on_event=events.append)
+    engine.send("second", on_event=events.append)
+    assert len(measured) == len(generated) == 2
+    for counted, sent in zip(measured, generated):
+        assert counted == sent
+    finished = [event for event in events if client_events.is_terminal_event(event)]
+    assert [client_events.event_part(event)["tokens"]["input"] for event in finished] == [4321, 5432]
+
+
+def test_a_count_failure_never_falls_back_to_generation(engine_factory, monkeypatch):
+    engine = engine_factory()
+    generated = []
+
+    def count(**_kwargs):
+        raise RuntimeError("exact counter unavailable")
+
+    def chat(**kwargs):
+        generated.append(kwargs)
+        return iter([_text_chunk("must not answer", finish="stop")])
+
+    monkeypatch.setattr(llama_client, "count_chat_tokens", count, raising=False)
+    monkeypatch.setattr(llama_client, "chat_completions", chat)
+    with pytest.raises(RuntimeError, match="exact counter unavailable"):
+        engine.send("question")
+    assert generated == []
+    assert [message["role"] for message in engine.messages] == ["user"]
+
+
+def test_exact_prime_count_refuses_an_overflowing_next_turn(engine_factory, monkeypatch):
+    engine = engine_factory(max_output_tokens=1000)
+    engine.options.n_ctx = 10000
+    generated = []
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    monkeypatch.setattr(llama_client, "count_chat_tokens", lambda **_kwargs: 9500, raising=False)
+    monkeypatch.setattr(llama_client, "chat_completions",
+                        lambda **kwargs: generated.append(kwargs) or iter([_prime_final_chunk()]))
+    assert engine.prime_prompt_cache() == client_engine.PrimeOutcome(False, "next_turn_would_overflow", None)
+    assert generated == []
+
+
+@pytest.mark.parametrize("prime", [False, True])
+def test_cancelling_an_exact_count_prevents_later_generation(engine_factory, monkeypatch, prime):
+    """Count HTTP waits are cancellable, including the prime's one-second abort boundary."""
+    engine = engine_factory()
+    started, release, done = threading.Event(), threading.Event(), threading.Event()
+    requests, generated, results = [], [], []
+
+    def count(**kwargs):
+        requests.append(kwargs)
+        started.set()
+        release.wait(3)
+        return 100
+
+    def chat(**kwargs):
+        generated.append(kwargs)
+        return iter([_prime_final_chunk()] if prime else [_text_chunk("answer", finish="stop")])
+
+    def run():
+        try:
+            results.append(engine.prime_prompt_cache() if prime else engine.send("question"))
+        except BaseException as exc:
+            results.append(exc)
+        finally:
+            done.set()
+
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    monkeypatch.setattr(llama_client, "count_chat_tokens", count, raising=False)
+    monkeypatch.setattr(llama_client, "chat_completions", chat)
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert started.wait(0.5), "the measured count must precede every generation"
+        began = time.monotonic()
+        if prime:
+            engine.abort_prime()
+        else:
+            assert engine.cancel() is True
+        assert done.wait(0.5)
+        assert time.monotonic() - began < 1
+        assert requests[0]["cancel"].event.is_set()
+        assert generated == []
+        assert engine.priming is False
+        assert engine.model_lock.acquire(blocking=False)
+        engine.model_lock.release()
+        if prime:
+            assert results == [client_engine.PrimeOutcome(False, "aborted", None)]
+        else:
+            assert isinstance(results[0], client_engine.TurnCancelled)
+    finally:
+        release.set()
+        worker.join(timeout=1)
+
+
+def test_candidate_context_count_uses_its_own_projection_without_installing_it(engine_factory, monkeypatch):
+    """Compaction validates exactly the history it would install without changing the active epoch."""
+    monkeypatch.setattr(client_engine, "PRUNE_PROTECT_TOKENS", 40)
+    monkeypatch.setattr(client_engine, "PRUNE_MINIMUM_TOKENS", 20)
+    engine = engine_factory()
+    engine.messages = _projection_turn(0)
+    before = copy.deepcopy(engine.messages)
+    candidate = (_projection_turn(1, tool_content="old evidence " * 30)
+                 + _projection_turn(2) + _projection_turn(3))
+    counted = []
+    monkeypatch.setattr(llama_client, "count_chat_tokens",
+                        lambda **kwargs: counted.append(kwargs) or 777, raising=False)
+    assert engine.context_tokens(history=candidate) == 777
+    assert engine.messages == before
+    engine.replace_history(candidate)
+    assert counted[0]["messages"] == engine.next_turn_prefix()
+    assert engine.context_tokens() == 777
+    assert len(counted) == 2
 
 
 def test_the_transforms_never_touch_the_session_file(engine_factory, monkeypatch, tmp_path):
@@ -2371,9 +2624,8 @@ def _synthetic_history():
     """同時踩到三個轉換的歷史:三個 user 回合、兩筆各 30k tokens 的工具輸出,
     最後一則 assistant 帶 reasoning **而且**有一個懸空的 tool_call。
 
-    兩筆工具輸出的大小是刻意挑的:以「這一輪」的邊界算,兩筆都在保護範圍內
-    (prune 一筆都不剪);多了下一則使用者訊息之後,第一筆才會跨過門檻被剪掉。
-    預熱送錯邊界的話,這條歷史會讓兩份 payload 差一筆 30k tokens 的工具輸出。
+    兩筆工具輸出的大小是刻意挑的:建立 history epoch 時按下一輪的邊界挑候選,
+    第一筆會被剪掉。此後 payload 與預熱都沿用同一份計畫,不能隨 append 移動切點。
     """
     big = "x" * int(30_000 * config.CHARS_PER_TOKEN)
     return [
@@ -2448,10 +2700,10 @@ def test_priming_sends_the_prefix_the_next_turn_will_send_and_records_nothing(
     assert engine.priming is False
     assert capsys.readouterr() == ("", "")
 
-    # 邊界真的是「下一輪」:這一輪的 payload 還留著第一筆工具輸出、也還留著最後一則
-    # assistant 的 reasoning;prefix 兩樣都已經照下一輪的規則處理掉了。
+    # 工具剪枝固定於 epoch,兩份 payload 必須一致;只有最後一則 assistant 的
+    # reasoning 仍按真實/下一輪 user 邊界決定,不能改掉這條既有模板契約。
     this_turn, _summary = engine.payload_messages()
-    assert this_turn[3]["content"] == before[2]["content"]
+    assert this_turn[3]["content"] == client_engine.PRUNE_PLACEHOLDER
     assert "reasoning_content" in this_turn[10]
     assert prime["messages"][3]["content"] == client_engine.PRUNE_PLACEHOLDER
     assert "reasoning_content" not in prime["messages"][10]     # 最後一則 assistant

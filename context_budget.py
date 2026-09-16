@@ -9,8 +9,8 @@ context_budget — CodeTrail 內部對 llama.cpp llama-server 呼叫的 context 
    直接拒絕送出超出 effective_num_ctx*hard_threshold 的 prompt。
 2. 攔 CodeTrail 自己送出去的 /completion 與 /v1/chat/completions 兩條路。
    直接打 llama-server 的東西(手動 curl、別的客戶端)不會經過這裡。
-3. token 估算先用 CHARS_PER_TOKEN heuristic;llama-server 回的
-   tokens_evaluated / usage.prompt_tokens 會被收下來給下一次校正(下版)。
+3. 客戶端以 llama-server 精確計數的完整輸入作容量決策;既有內部呼叫仍可用
+   CHARS_PER_TOKEN heuristic。回應完整輸入與本次重算量分開記錄,不混用校正。
 4. telemetry 只寫 metadata(count、模型名、context 設定、速度、是否 trim 等),
    絕不寫 prompt / tool output / 檔案內容,以防 NDA / private repo 外洩。
 """
@@ -46,6 +46,8 @@ class ContextUsage:
     dynamic_ctx_min: int = 0
     dynamic_ctx_max: int = 0
     estimated_input_tokens: int = 0
+    # Retain the legacy count field name; this identifies its actual source.
+    count_method: str = "heuristic"
     reserved_output_tokens: int = 0
     estimated_total_tokens: int = 0
     utilization_pct: float = 0.0  # estimated_total / effective_num_ctx
@@ -244,14 +246,27 @@ def build_usage(
     did_trim: bool = False,
     trim_summary: dict[str, Any] | None = None,
     reserved_output_tokens: int | None = None,
+    measured_input_tokens: int | None = None,
+    count_method: str | None = None,
 ) -> ContextUsage:
     """Compute a ContextUsage snapshot for a pending request.
 
     `requested_num_ctx` 是 CodeTrail dynamic_ctx 計算後想用的上限。
     llama-server 不接受 per-call num_ctx — 它的真實 ctx 在 server 啟動時
     用 `-c N` 鎖死,這裡的 requested 只是 CodeTrail 自己 budget 用的相對值。
-    gate 仍照 requested == effective 算,跟模型實際 ctx 是否對齊由 doctor 報。
+    gate 仍照 requested == effective 算;客戶端傳入 live n_ctx 與該次完整精確輸入。
+    沒有 measured_input_tokens 的既有內部呼叫才保留 heuristic。
     """
+    if measured_input_tokens is not None:
+        if type(measured_input_tokens) is not int or measured_input_tokens < 0:
+            raise ValueError("measured_input_tokens must be a non-negative integer")
+        method = "measured" if count_method is None else count_method
+        if method not in ("measured", "llama_cpp_chat"):
+            raise ValueError("count_method must identify measured input tokens")
+    else:
+        if count_method not in (None, "heuristic"):
+            raise ValueError("count_method requires measured_input_tokens")
+        method = "heuristic"
     msg_chars = 0
     msg_count = 0
     tool_count = 0
@@ -263,7 +278,10 @@ def build_usage(
     total_chars = prompt_chars + msg_chars + tools_chars
 
     cpt = _chars_per_token()
-    est_in = int(total_chars / max(cpt, 0.1))
+    est_in = (
+        int(total_chars / max(cpt, 0.1))
+        if measured_input_tokens is None else measured_input_tokens
+    )
     # 保留額 = **這一次 request 實送的 max_tokens**。呼叫端沒有帶(knowledge.py
     # 那類內部呼叫)才退回 config.RESERVED_OUTPUT_TOKENS。兩個常數不得混用:
     # 客戶端送 8192 卻只保留 4096 的話,閘會放行一個生成到一半就撐爆的 prompt。
@@ -292,6 +310,7 @@ def build_usage(
         # now comes from the one resolved main N_CTX.
         dynamic_ctx_max=int(getattr(config, "N_CTX", 0) or 0),
         estimated_input_tokens=est_in,
+        count_method=method,
         reserved_output_tokens=reserved,
         reserve_is_explicit=reserve_is_explicit,
         estimated_total_tokens=est_total,
@@ -406,11 +425,8 @@ def parse_usage_from_response(data: dict, usage: ContextUsage) -> None:
 
     timings = data.get("timings")
     if isinstance(timings, dict):
-        # llama-server 的 /v1/chat/completions 串流最後一個 chunk 只帶 `timings`,
-        # 沒有 `usage`。不把 prompt_n / predicted_n 收下來的話,事件流與 eval 的
-        # token 統計永遠是 0 —— 看起來像「這一輪沒有輸出」。
-        if pec is None and isinstance(timings.get("prompt_n"), (int, float)):
-            usage.actual_prompt_eval_count = int(timings["prompt_n"])
+        # 沒有 usage 的串流尾塊仍能提供輸出量,但 prompt_n 只有本次重算量。
+        # 完整輸入未知時維持 None;請求前的 measured count 另存於 estimated_input_tokens。
         if ec is None and isinstance(timings.get("predicted_n"), (int, float)):
             usage.actual_eval_count = int(timings["predicted_n"])
         # `prompt_n` 是**真的被評估**的那幾個 token,永遠照收 —— 不看 pec 有沒有值。
@@ -431,6 +447,7 @@ def parse_usage_from_stream_chunk(chunk: dict, usage: ContextUsage) -> None:
     最後一個 chunk 在不同 endpoint 上的訊號不同:
       - native /completion        → `stop: true`
       - /v1/chat/completions      → `choices[0].finish_reason` 非 null
+      - OpenAI usage 尾塊         → `choices: []` 與 `usage` object
     """
     if not isinstance(chunk, dict):
         return
@@ -440,6 +457,8 @@ def parse_usage_from_stream_chunk(chunk: dict, usage: ContextUsage) -> None:
         if isinstance(choices, list) and choices:
             if choices[0].get("finish_reason"):
                 is_final = True
+        elif choices == [] and isinstance(chunk.get("usage"), dict):
+            is_final = True
     if not is_final:
         return
     parse_usage_from_response(chunk, usage)
@@ -580,6 +599,8 @@ def check_and_log(
     did_trim: bool = False,
     trim_summary: dict[str, Any] | None = None,
     reserved_output_tokens: int | None = None,
+    measured_input_tokens: int | None = None,
+    count_method: str | None = None,
     emit: bool = True,
 ) -> ContextUsage:
     """Compute usage, enforce the hard gate, emit CLI lines, log to JSONL.
@@ -598,6 +619,8 @@ def check_and_log(
         did_trim=did_trim,
         trim_summary=trim_summary,
         reserved_output_tokens=reserved_output_tokens,
+        measured_input_tokens=measured_input_tokens,
+        count_method=count_method,
     )
     if emit:
         emit_pre_call_lines(usage)

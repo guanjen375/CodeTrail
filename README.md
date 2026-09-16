@@ -624,7 +624,7 @@ registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf`
 }
 ```
 
-- `compaction_mode`:`codetrail`(助理答完、對話進 idle 之後自動壓縮)/
+- `compaction_mode`:`codetrail`(助理答完或接續歷史時，依完整 token 數檢查自動壓縮)/
   `manual`(只有你按 `/compact`)/ `off`(完全不壓縮;context 滿了會是可見的錯誤)。
   **沒有這個檔就等於沒有接管**,客戶端退成 `manual` 並在啟動橫幅講明。
 - `permission`:每個工具的核准覆寫(`allow` / `ask` / `deny`),不寫就用預設。
@@ -724,6 +724,10 @@ aicode
 標記(模型看到的仍然是壓縮後的歷史 —— 畫面與模型視野是兩件事)。TUI 內的
 `/sessions` 列出這個專案的既有對話、`/session` 開選單挑一段,細節見
 [docs/basic-usage.md](docs/basic-usage.md#7-切換與接續對話)。
+
+自動壓縮與 context gate 使用本機模型的完整 token 計數，包含快取中的輸入；不以本輪重新
+prefill 的數量判斷容量。門檻依 live `n_ctx` 推導，32K～1M 都使用同一公式。接續時先檢查
+壓縮，再預熱快取；普通追加回合不再持續改寫歷史前段的工具剪枝位置。
 
 模型處理 prompt 時,從本次請求第一個進度快照起算,前 10 秒狀態列維持「等待回應」;
 之後每 10 秒取最新快照顯示百分比、已處理/總 token 與 cache,有可信資料時再加速率及

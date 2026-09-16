@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import socket
 import sys
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ from urllib.parse import urlparse
 
 import endpoint_policy
 from http_client import get_session
-from http_cancel import RequestCancellation
+from http_cancel import RequestCancellation, RequestCancelled
 
 
 # credentials 遮蔽集中在 endpoint_policy(policy 錯誤本身也要乾淨,見該處)
@@ -271,6 +272,136 @@ def _reject_forbidden_keys(mapping: dict, forbidden: frozenset, label: str) -> N
         )
 
 
+def _build_chat_payload(
+    *,
+    messages: list[dict],
+    model: str = "",
+    temperature: float = 0.2,
+    top_p: float | None = None,
+    top_k: int | None = None,
+    min_p: float | None = None,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict = "auto",
+    stream: bool = False,
+    extra: dict | None = None,
+) -> dict[str, Any]:
+    """Build the identical chat body for generation and exact input counting.
+
+    Template controls in ``extra`` are part of the prompt, as are tools and
+    reasoning. Counting only the messages would omit that rendered content.
+    Callers retain the same wire messages and arguments between count and send.
+    """
+    payload: dict[str, Any] = {
+        "model": model or "local",
+        "messages": messages,
+        "temperature": temperature,
+        "stream": stream,
+        "cache_prompt": True,
+    }
+    if top_p is not None:
+        payload["top_p"] = top_p
+    if top_k is not None:
+        payload["top_k"] = top_k
+    if min_p is not None:
+        payload["min_p"] = min_p
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice
+    extra = _dict_arg_snapshot(extra, "chat_completions(extra=...)")
+    if extra:
+        _reject_forbidden_keys(extra, _CHAT_EXTRA_PROTECTED_KEYS, "chat_completions(extra=...)")
+        payload.update(extra)
+    return payload
+
+
+CHAT_TOKEN_COUNT_METHOD = "llama_cpp_chat"
+
+
+class ChatTokenCountError(RuntimeError):
+    """The server did not provide an authoritative complete chat input count."""
+
+
+def count_chat_tokens(
+    *,
+    base_url: str,
+    messages: list[dict],
+    model: str = "",
+    temperature: float = 0.2,
+    top_p: float | None = None,
+    top_k: int | None = None,
+    min_p: float | None = None,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict = "auto",
+    stream: bool = False,
+    extra: dict | None = None,
+    timeout: float = 30,
+    cancel: RequestCancellation | None = None,
+) -> int:
+    """Count the full rendered chat input without generation or prefill.
+
+    The native endpoint uses the same chat parser, template and special-token
+    handling as ``chat_completions``. No unavailable or malformed count falls
+    back to a character estimate. Every call is fresh; nothing is cached.
+
+    A caller-supplied cancellation owns its session (including background
+    priming); otherwise this call creates and closes a dedicated transport.
+    All transport/response failures omit request and response bodies, since a
+    server parser error may echo the entire conversation.
+    """
+    try:
+        valid_timeout = (
+            not isinstance(timeout, bool) and isinstance(timeout, (int, float))
+            and timeout > 0 and math.isfinite(timeout)
+        )
+    except OverflowError:
+        valid_timeout = False
+    if not valid_timeout:
+        raise ValueError("chat token count timeout must be a finite positive number")
+    payload = _build_chat_payload(
+        messages=messages, model=model, temperature=temperature,
+        top_p=top_p, top_k=top_k, min_p=min_p, tools=tools,
+        tool_choice=tool_choice, stream=stream, extra=extra,
+    )
+    url = base_url.rstrip("/") + "/v1/chat/completions/input_tokens"
+    _ensure_allowed(url)
+    request = cancel if cancel is not None else RequestCancellation()
+    response = None
+    try:
+        request.check()
+        response = request.session().post(
+            url, json=payload, timeout=timeout, allow_redirects=False,
+        )
+        request.check()
+        _reject_redirect(response, url)
+        response.raise_for_status()
+        data = response.json()
+        request.check()
+        count = data.get("input_tokens") if isinstance(data, dict) else None
+        if type(count) is not int or count < 0:
+            raise ChatTokenCountError(
+                "llama-server chat token count response requires a non-negative integer input_tokens"
+            )
+        return count
+    except RequestCancelled:
+        raise
+    except Exception as exc:
+        if request.event.is_set():
+            raise RequestCancelled("chat token count cancelled") from None
+        if isinstance(exc, ChatTokenCountError):
+            raise
+        status = getattr(response, "status_code", None)
+        detail = f"HTTP {status}" if type(status) is int and status >= 300 else type(exc).__name__
+        raise ChatTokenCountError(
+            f"llama-server chat token counting failed ({detail}); exact input count unavailable"
+        ) from None
+    finally:
+        if response is not None:
+            with contextlib.suppress(Exception):
+                response.close()
+        if cancel is None:
+            request.close()
+
+
 def chat_completions(
     *,
     base_url: str,
@@ -316,28 +447,11 @@ def chat_completions(
       - 這一層刻意比 vision_json_completion(sampler_overrides=...) 寬鬆,原因見
         本區塊開頭的「payload 覆寫政策」註解。
     """
-    payload: dict[str, Any] = {
-        "model": model or "local",
-        "messages": messages,
-        "temperature": temperature,
-        "stream": stream,
-        "cache_prompt": True,
-    }
-    # top_p / top_k / min_p:None 表示「不送,沿用 server 啟動旗標的取樣預設值」。
-    if top_p is not None:
-        payload["top_p"] = top_p
-    if top_k is not None:
-        payload["top_k"] = top_k
-    if min_p is not None:
-        payload["min_p"] = min_p
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = tool_choice
-    # snapshot 後,下面的檢查與 update() 讀的是同一份純 dict(見 _dict_arg_snapshot)。
-    extra = _dict_arg_snapshot(extra, "chat_completions(extra=...)")
-    if extra:
-        _reject_forbidden_keys(extra, _CHAT_EXTRA_PROTECTED_KEYS, "chat_completions(extra=...)")
-        payload.update(extra)
+    payload = _build_chat_payload(
+        messages=messages, model=model, temperature=temperature,
+        top_p=top_p, top_k=top_k, min_p=min_p, tools=tools,
+        tool_choice=tool_choice, stream=stream, extra=extra,
+    )
 
     session = get_session() if cancel is None else cancel.session()
     url = base_url.rstrip("/") + "/v1/chat/completions"

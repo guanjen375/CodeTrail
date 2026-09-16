@@ -365,7 +365,9 @@ DYNAMIC_NUM_CTX_ENABLED = True
 DYNAMIC_NUM_CTX_MIN = 16384      # 最小 16K
 DYNAMIC_NUM_CTX_MAX = N_CTX
 DYNAMIC_NUM_CTX_BUFFER = 1.3     # 預留空間給回答（調整: 1.5->1.3）
-CHARS_PER_TOKEN = 3.5            # 估算 token 的字元數
+# 僅供既有內部 heuristic 與剪枝候選預算;聊天客戶端的容量與壓縮門檻使用
+# 主 server 的完整 chat token 實測值,不以這個字元比率作決策。
+CHARS_PER_TOKEN = 3.5
 
 
 def set_runtime_n_ctx(value: int) -> int:
@@ -386,9 +388,9 @@ def set_runtime_n_ctx(value: int) -> int:
 # Context Budget / Hard Gate（P0：避免 silent truncation）
 # ============================================================
 # CodeTrail 自己呼叫 llama-server native /completion 與 /v1/chat/completions 時，
-# 必須在送出前估算 prompt token 數、保留輸出空間，並在超過硬上限時拒絕送出。
-# 這些設定只影響 CodeTrail internal LLM calls;聊天客戶端的取樣值另由 client_engine 明示送出
-# (透過 openai-compatible provider)，server 端的 -c (n_ctx) 才是它真正的上限。
+# 必須在送出前計算 prompt token 數、保留輸出空間，並在超過硬上限時拒絕送出。
+# 聊天客戶端使用主 server 精確計數;既有內部呼叫保留 heuristic。
+# server 端的 -c (n_ctx) 才是真正容量,客戶端必須使用 live n_ctx。
 #
 # RESERVED_OUTPUT_TOKENS: 估算時保留給模型輸出的 token 數
 # CTX_SOFT_THRESHOLD:     使用率超過此值時輸出 WARN

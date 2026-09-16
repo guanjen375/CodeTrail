@@ -52,6 +52,7 @@ try:
     import client_prompt  # noqa: E402
     import client_store  # noqa: E402
     import config  # noqa: E402
+    import context_budget  # noqa: E402
     import root_safety  # noqa: E402
 except _deployment_profile.ProfileError as _profile_exc:  # noqa: E402
     # `config` 在 **import 期**就解析 deployment profile(端點、模型、n_ctx 都從
@@ -339,8 +340,18 @@ def command_run(args: argparse.Namespace) -> int:
                 engine.session_id, root=str(root), model=engine.options.model
             )
         )
+        if engine.messages and engine.options.policy.name == "interactive":
+            _headless_compact(engine, compactor, None, emit, prepare=True)
         try:
             result = engine.send(args.prompt, on_event=emit_or_hold)
+        except context_budget.ContextOverflowError as exc:
+            emit(client_events.error_event(engine.session_id, str(exc)))
+            outcome = _headless_compact(engine, compactor, None, emit, prepare=True)
+            if getattr(outcome, "status", None) == "compacted":
+                emit(client_events.notice_event(engine.session_id, "歷史已壓縮；這次問題尚未完成，請重送。"))
+            # Recovery must never rerun a loop that may already have executed tools.
+            emit(client_events.step_finish_event(engine.session_id, reason=client_events.REASON_ERROR))
+            return 1
         except Exception as exc:  # noqa: BLE001 - headless 以事件回報,不丟 traceback
             for event in held:
                 emit(event)
@@ -357,8 +368,8 @@ def command_run(args: argparse.Namespace) -> int:
         mcp.close()
 
 
-def _headless_compact(engine, compactor, result, emit) -> None:
-    if compactor is None or getattr(result, "finish", None) != client_events.REASON_STOP:
+def _headless_compact(engine, compactor, result, emit, *, prepare=False):
+    if compactor is None or (not prepare and getattr(result, "finish", None) != client_events.REASON_STOP):
         return
     if compactor.mode != client_compaction.MODE_CODETRAIL:
         return  # manual 只在使用者按 /compact 時壓;off 完全不壓
@@ -368,12 +379,13 @@ def _headless_compact(engine, compactor, result, emit) -> None:
         emit(client_events.notice_event(engine.session_id, f"壓縮失敗:{type(exc).__name__}: {exc}"))
         return
     if outcome.status == "skipped":
-        return  # 門檻未到:沒有發生壓縮,不記成一筆
+        return outcome  # 門檻未到:沒有發生壓縮,不記成一筆
     emit(
         client_events.compaction_event(
             engine.session_id, status=outcome.status, detail=outcome.message or outcome.detail
         )
     )
+    return outcome
 
 
 def command_status(args: argparse.Namespace) -> int:

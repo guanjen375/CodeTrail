@@ -31,6 +31,17 @@ from mcp_contract import PUBLIC_TOOL_ORDER  # noqa: E402
 pytestmark = pytest.mark.smoke
 
 
+@pytest.fixture(autouse=True)
+def offline_chat_counter(monkeypatch):
+    import context_budget
+    import llama_client
+
+    monkeypatch.setattr(
+        llama_client, "count_chat_tokens",
+        lambda **kw: context_budget.estimate_tokens(messages=kw["messages"], tools=kw.get("tools"))[0],
+    )
+
+
 @pytest.fixture
 def live_main_context(monkeypatch):
     """headless 現在也要求 live /props；測試模型使用離線容量回應。"""
@@ -532,3 +543,47 @@ def test_headless_run_compacts_after_a_completed_turn_and_reports_it(tmp_path, m
     kinds = [e["type"] for e in events]
     assert "compaction" in kinds, kinds
     assert kinds[-1] == "step_finish", "終結事件仍然要在最後"
+
+
+@pytest.mark.parametrize("overflow", [False, True])
+def test_headless_resumption_compacts_before_send_and_recovers_without_retry(
+    tmp_path, monkeypatch, capsys, overflow,
+):
+    import client_compaction
+    import context_budget
+
+    calls = []
+    engine = types.SimpleNamespace(
+        session_id="20260916T120000-aabbccdd",
+        messages=[{"role": "user", "content": "old"}, {"role": "assistant", "content": "answer"}],
+        options=types.SimpleNamespace(model="test", policy=client_policy.InteractivePolicy()),
+    )
+
+    def send(prompt, **kwargs):
+        calls.append("send")
+        if overflow:
+            raise context_budget.ContextOverflowError(context_budget.build_usage(
+                source="client", requested_num_ctx=32768, reserved_output_tokens=8192,
+                measured_input_tokens=30000,
+            ))
+        kwargs["on_event"](client_events.step_finish_event(engine.session_id, reason="stop"))
+        return types.SimpleNamespace(finish="stop")
+
+    def compact(**kwargs):
+        calls.append("compact")
+        return client_compaction.CompactionOutcome("compacted", "threshold", "壓縮完成")
+
+    engine.send = send
+    compactor = types.SimpleNamespace(mode=client_compaction.MODE_CODETRAIL, compact=compact)
+    monkeypatch.setattr(codetrail_chat, "_build", lambda *a, **kw: (
+        types.SimpleNamespace(close=lambda: None), engine,
+    ))
+    monkeypatch.setattr(codetrail_chat, "_compactor", lambda *a: compactor)
+    args = codetrail_chat.build_parser().parse_args(["run", "hi", "--root", str(tmp_path)])
+    assert codetrail_chat.command_run(args) == (1 if overflow else 0)
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert calls == ["compact", "send", "compact"]
+    assert events[-1]["type"] == "step_finish"
+    if overflow:
+        assert client_events.event_part(events[-1])["reason"] == "error"
+        assert sum(event["type"] == "compaction" for event in events) == 2

@@ -77,6 +77,12 @@ class CompactionError(RuntimeError):
     """壓縮設定或規則文件不合契約。"""
 
 
+class _UntrustedSummary(CompactionError):
+    def __init__(self, detail: str):
+        self.detail = detail
+        super().__init__(detail)
+
+
 # ============================================================
 # 門檻
 # ============================================================
@@ -495,6 +501,10 @@ class EngineLike(Protocol):
 
     def openai_tools(self) -> list[dict[str, Any]]: ...
 
+    def context_tokens(self, history: Sequence[Mapping[str, Any]] | None = None) -> int: ...
+
+    def count_input_tokens(self, messages: Sequence[Mapping[str, Any]], **kwargs: Any) -> int: ...
+
     def replace_history(self, messages: Sequence[Mapping[str, Any]]) -> None: ...
 
     def complete(self, messages: Sequence[Mapping[str, Any]], *, source: str) -> "Completion": ...
@@ -591,11 +601,39 @@ class Compactor:
         return self.derived is not None
 
     def estimated_tokens(self) -> int:
-        payload, _ = self.engine.payload_messages()
-        tokens, _chars = context_budget.estimate_tokens(
-            messages=payload, tools=self.engine.openai_tools()
+        """完整下一輪 prefix 的實測 tokens；保留方法名給既有呼叫端。"""
+        return self.engine.context_tokens()
+
+    def _usage(self, tokens: int) -> context_budget.ContextUsage:
+        return context_budget.build_usage(
+            source="compaction",
+            requested_num_ctx=self.n_ctx,
+            reserved_output_tokens=self.derived.output_limit,
+            measured_input_tokens=tokens,
+            count_method=llama_client.CHAT_TOKEN_COUNT_METHOD,
         )
-        return tokens
+
+    def _recovery_anchor(self, tokens: int | None = None) -> str | None:
+        """過大待答回合只留在 tail；只能摘要更早的可信回合。"""
+        if last_user_answered(self.engine.messages):
+            return None
+        starts = sum(
+            message.get("role") == "user" and not message.get("synthetic")
+            for message in self.engine.messages
+        )
+        if starts <= compaction_formula.TAIL_TURNS:
+            return None
+        head, _tail = split_for_compaction(
+            self.engine.messages, preserve_recent_tokens=self.derived.preserve_recent_tokens
+        )
+        if not any(is_completed_answer(message) for message in head):
+            return None
+        if not self._usage(self.estimated_tokens() if tokens is None else tokens).hard_overflow:
+            return None
+        # A former anchor may still be in this head after a new unanswered turn.
+        # Bind recovery to the actual head's content, never its changing index.
+        identity = json.dumps(head, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return "recovery:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
     def anchor(self) -> str | None:
         """這一次要用哪一則助理訊息當切點,回它的**身分**。
@@ -629,13 +667,17 @@ class Compactor:
         anchor = self.anchor()
         if anchor is None:
             return False, "no_answer"
+        tokens = None
         if not last_user_answered(self.engine.messages):
-            return False, "unanswered"
+            tokens = self.estimated_tokens()
+            anchor = self._recovery_anchor(tokens)
+            if anchor is None:
+                return False, "unanswered"
         if anchor == self.last_anchor:
             # 壓縮之後那則助理訊息的 token 數不會變小,不擋就會每次 idle 都
             # 再壓一次,而且每一次都「成功」。
             return False, "same_anchor"
-        if self.estimated_tokens() <= self.derived.idle_threshold:
+        if (self.estimated_tokens() if tokens is None else tokens) <= self.derived.idle_threshold:
             return False, "below_threshold"
         return True, "over_threshold"
 
@@ -695,17 +737,17 @@ class Compactor:
                 return self._settle(commit_point, CompactionOutcome("skipped", reason))
 
         anchor = self.anchor()
-        # manual 只跳過門檻與 same-anchor 兩條;「有沒有可信的切點」manual 也要守:
-        # crash 後 resume 到只剩一則 pending user 的歷史再按 /compact,會把還沒
-        # 回答的問題摘掉。
+        # manual 也要有可信切點；過大待答回合只能逐字留在 tail，不能被摘要。
         if anchor is None:
             return self._settle(commit_point, CompactionOutcome(
                 "skipped", "no_answer", "還沒有已完成的回合,沒有可信的壓縮切點。"
             ))
         if not last_user_answered(self.engine.messages):
-            return self._settle(commit_point, CompactionOutcome(
-                "skipped", "unanswered", "最後一則問題還沒有回答,不壓縮(壓了會把它摘掉)。"
-            ))
+            anchor = self._recovery_anchor()
+            if anchor is None:
+                return self._settle(commit_point, CompactionOutcome(
+                    "skipped", "unanswered", "最後一則問題還沒有回答,沒有可安全壓縮的過大歷史。"
+                ))
         head, tail = split_for_compaction(
             self.engine.messages, preserve_recent_tokens=self.derived.preserve_recent_tokens
         )
@@ -719,24 +761,30 @@ class Compactor:
 
         try:
             completion = self._summarise(summary_head)
+            replacement = [
+                {"role": "user", "content": f"{SUMMARY_PREFIX}\n{completion.text}", "synthetic": True}
+            ] + tail
+            # A huge verbatim tail can leave even a valid summary over capacity.
+            # Check the exact projection that replace_history will install.
+            context_budget.enforce_gate(self._usage(self.engine.context_tokens(history=replacement)))
         except client_events.TurnCancelled:
             raise
-        except Exception as exc:  # noqa: BLE001 - 任何失敗都走同一條停用路徑
-            # 「永久停用」也是一個要寫定的決定:已接受的取消先於它就以中斷結束,
-            # ledger 不寫(取消回了 True,持久狀態就不能再改)。
+        except _UntrustedSummary as exc:
             if callable(commit_point):
                 commit_point()
-            return self._stop("summary_error", extra=f"({type(exc).__name__})")
+            return self._stop(exc.detail)
+        except Exception as exc:  # noqa: BLE001 - 沒有摘要產出不能推論為永久不可信
+            detail = "context_overflow" if isinstance(exc, context_budget.ContextOverflowError) else "request_error"
+            return self._settle(commit_point, CompactionOutcome(
+                "failed", detail,
+                f"壓縮沒有生效({type(exc).__name__})，原始歷史保留，自動壓縮未停用。"
+                + ("單一回合或保留的尾段仍超過容量，請減少這一輪的內容。" if detail == "context_overflow"
+                   else "請確認模型服務與 token 計數端點後重試。"),
+            ))
 
         summary = completion.text
-        self._report_compaction_activity("validating")
-        detail = verify_summary(
-            summary, reasoning=completion.reasoning, finish=getattr(completion, "finish", "stop")
-        )
         if callable(commit_point):
             commit_point()          # 換歷史或停用,兩種都是寫定;之前的取消要算數
-        if detail is not None:
-            return self._stop(detail)
         return self._replace(head, tail, summary, anchor)
 
     def _replace(self, head, tail, summary: str, anchor: Any) -> CompactionOutcome:
@@ -776,14 +824,44 @@ class Compactor:
         )
 
     def _summarise(self, head: Sequence[Mapping[str, Any]]) -> Completion:
-        messages = build_summary_messages(
-            head,
-            previous_summary=self.previous_summary,
-            system_prompt="",
-        )
-        # 摘要請求走**同一個** context gate 與同一把模型鎖(engine.complete
-        # 負責):摘要器那一端一樣會被 llama-server 從前面靜默截掉。
-        return self.engine.complete(messages, source="compaction")
+        # Only split between complete real user turns. A synthetic previous
+        # summary can form the first unit; no user/tool evidence is truncated.
+        starts = [0] + [
+            index for index, message in enumerate(head)
+            if index and message.get("role") == "user" and not message.get("synthetic")
+        ]
+        stops = starts[1:] + [len(head)]
+        position = 0
+        batch_limit = len(starts)
+        previous = self.previous_summary
+        completion = None
+        while position < len(starts):
+            size = min(batch_limit, len(starts) - position)
+            while True:
+                batch = head[starts[position]:stops[position + size - 1]]
+                messages = build_summary_messages(batch, previous_summary=previous, system_prompt="")
+                usage = self._usage(self.engine.count_input_tokens(messages))
+                if not usage.hard_overflow:
+                    break
+                if size == 1:
+                    context_budget.enforce_gate(usage)
+                size = (size + 1) // 2
+            # Do not repeatedly probe the entire remaining history (quadratic
+            # for long sessions). Later batches retain this proven unit limit.
+            batch_limit = size
+            completion = self.engine.complete(messages, source="compaction")
+            self._report_compaction_activity("validating")
+            detail = verify_summary(
+                completion.text, reasoning=completion.reasoning,
+                finish=getattr(completion, "finish", "stop"),
+            )
+            if detail is not None:
+                raise _UntrustedSummary(detail)
+            previous = completion.text
+            position += size
+        if completion is None:
+            raise CompactionError("沒有可摘要的歷史")
+        return completion
 
     def _stop(self, detail: str, *, extra: str = "") -> CompactionOutcome:
         self.stopped_detail = detail

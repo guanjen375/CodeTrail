@@ -618,29 +618,43 @@ journaled 寫入 → best-effort rollback。
 
 ## context_budget.py / trim.py 設計
 
-CodeTrail 自己對 llama-server `/completion` 與 `/v1/chat/completions` 發送的每一
-個 prompt 都會先經過 `context_budget` 的「估算 → soft warn → hard refuse →
-telemetry」流程。客戶端走的是同一條 `/v1/chat/completions`,而且經過同一個 gate
-(`@ai-sdk/openai-compatible`),**不會** 經過這個模組,所以它的 context 仍然要靠
-llama-server 啟動時的 `-c <N>` 是唯一的 n_ctx 來源。`scripts/doctor.py`
+CodeTrail 對主模型 `/completion` 與 `/v1/chat/completions` 發送的 prompt
+會先經過 `context_budget` 的容量檢查、hard gate 與 telemetry。聊天客戶端每次
+一般回答、工具收斂、壓縮摘要與 cache 預熱，都先把正式請求的完整 chat payload
+交給 `/v1/chat/completions/input_tokens`；它與生成共用 chat body builder，包含
+system、tools、tool choice、reasoning、工具呼叫與模板標記。每次 gate 使用新的精確
+計數，保留額等於該次實送 `max_tokens`；不快取前一輪計數、不用 `timings.prompt_n`
+校正，也不以生成試探容量。計數端點缺失、格式錯誤或 HTTP 失敗會明確拒絕請求，
+不退回字元估算。既有 native 內部呼叫才保留 `CHARS_PER_TOKEN` heuristic。
+
+主模型的容量取自 live llama-server；server 啟動時的 `-c <N>` 決定它的 n_ctx。
+`scripts/doctor.py`
 只掃描、絕不寫檔；正常 `aicode` preflight 則會針對 active model 原子同步這個鏡像欄位並留備份。
 
 ### 模組分工
 
 | 模組 | 責任 |
 |---|---|
-| `context_budget.py` | token 估算(prompt / messages parts / tools schema)、`ContextUsage` dataclass、hard gate (`enforce_gate` → `ContextOverflowError`)、llama-server usage metrics 解析(支援 native `tokens_evaluated/tokens_predicted` 與 OpenAI `usage{}`,streaming + non-streaming)、JSONL telemetry。**不寫 prompt / 檔案內容** 進 log,只寫 count + metadata。 |
+| `context_budget.py` | 接收 `measured_input_tokens` 與 `count_method` 的完整輸入計數；既有內部呼叫可用 prompt / messages / tools 的 heuristic。提供 `ContextUsage`、hard gate (`enforce_gate` → `ContextOverflowError`)、native / OpenAI usage 解析與 JSONL telemetry。**不寫 prompt / 檔案內容**，只寫 count + metadata。 |
 | `code_context.py` | `code_rag_search(mode="context")` 的 deterministic 程式證據選取/overlap merge/content dedupe/字元裝箱。它不是 LLM context hard gate；source I/O 由呼叫端注入既有 `ToolExecutor.grep/read_file`，本模組不裸讀檔。明示 `max_chars` 的合法範圍固定為 `2000..30000`；MCP 省略時由 transport wrapper 依 call-time `n_ctx` 的 12% 配置（direct core 才保留歷史 12,000 fallback）。`used_chars` 只加總 `evidence[].text`；candidate cap、graph traversal cap 與 character budget 各自如實標示，uncertainties 去重且有顯式上限。 |
 | `trim.py` | 對 `role=tool` 訊息做 priority-aware trim,加入明確 `[CTX_TRIMMED]` / `[TOOL_SUMMARY]` 標記。`role=system` / `role=user` 訊息**完全不動**(REF metadata 因此被保留)。run_command 保留 tail + error line;read_file 保留 header + window;舊輪 tool output 摘要成 deterministic facts(file:line 錨點、error 行)。 |
 | `context_signals.py` | **檢索訊號的唯一定義**:embedding 組字(retrieval 含 ctx / gate 只看原文)、schema 名稱與 required 對照、內容雜湊、BM25 來源文本、reranker passage。寫入端(`RAG.py`)與載入端(`knowledge.py`)一律 import 這裡——以前兩邊各寫一份同樣的字串,差一個字就變成「內容雜湊不一致」。 |
 | `context_generation.py` | chunk 級生成脈絡的產生器:窗策略(整份 / 階層式摘要 + target-centered section window)、prompt 版本、輸出衛生、write-through 快取與指紋、per-KB single-writer 鎖、覆蓋率閘、**專用的受限 HTTP client**(`trust_env=False`、拒絕 3xx、host 必須是 loopback)。 |
 | `extracted_document.py` | 文件結構原語與 `ExtractedDocument`(raw_text / sections / chunks)。章節偵測、表格正規化、章節層級、行 offset 都在這裡;RAG.py 只 re-export。**章節與頁碼的單一真相**:chunk 的 `section` / `section_index` / `char_span` 一律由文件級走訪決定,不再由 splitter 的 page-local 追蹤加呼叫端 `last_section` 繼承拼湊。 |
-| `llama_client.py` | 對 llama-server 4 個端點的薄 HTTP wrapper:`/completion` / `/v1/chat/completions` / `/embedding` / `/reranking` / `/props` / `/slots` / `/health`。stream / non-stream 雙模式,native / OpenAI usage 萃取統一接口。 |
+| `llama_client.py` | llama-server HTTP wrapper:`/completion` / `/v1/chat/completions` / `/v1/chat/completions/input_tokens` / `/embedding` / `/reranking` / `/props` / `/slots` / `/health`。`count_chat_tokens` 與正式 chat 共用 body builder，只接受非 bool 的非負整數 `input_tokens`，不生成、不 prefill。 |
 | `utils.py` / `agent.py` 內呼叫點 | 在送 server 前 `context_budget.build_usage(...)` → 觸發 soft 時 `_pre_send_trim_if_needed(...)` → `enforce_gate(...)` → 走 `llama_client.native_completion(...)` 或 `chat_completions(...)` → `parse_usage_from_response(...)` → `log_metrics(...)`。 |
 
 ### Telemetry 隱私政策
 
-`.codetrail/context_metrics.jsonl` 每行 metadata:`model`、`source`、`requested/effective num_ctx`、估算的 input/output token、`utilization_pct`、`did_trim` + `trim_summary` (counts only)、`actual_prompt_eval_count`、`prompt_tokens_processed`、`actual_eval_count`、`prompt_tokens_per_second`、`output_tokens_per_second`、`error_type`、`timestamp`。
+`.codetrail/context_metrics.jsonl` 每行 metadata:`model`、`source`、`requested/effective num_ctx`、輸入 token 數與輸出保留額、`count_method`、`utilization_pct`、`did_trim` + `trim_summary` (counts only)、`actual_prompt_eval_count`、`prompt_tokens_processed`、`actual_eval_count`、`prompt_tokens_per_second`、`output_tokens_per_second`、`error_type`、`timestamp`。
+
+`estimated_input_tokens` 保留舊欄名；`count_method="llama_cpp_chat"` 時，值是請求前
+由 server 精確計出的**完整輸入**，包含 cache 可重用部分。`heuristic` 或沒有
+`count_method` 的舊紀錄才是字元估算。`actual_prompt_eval_count` 只收回應中的完整
+輸入量(`usage.prompt_tokens` 或 native 完整輸入欄位)，未知時為 `null`；
+`timings.prompt_n` **只**填 `prompt_tokens_processed`，不得拿來代填完整輸入。
+TUI 的 context 數字也在 worker 量完整 next-turn projection，session 或 history
+已改變的晚到結果會丟棄，尚未量到時顯示 `?`。
 
 **絕不寫入**: 完整 prompt、tool output、檔案內容、user question 文字。
 `trim.py` 回的 `TrimSummary.to_dict()` 也只是 count 與 action label。
@@ -652,7 +666,10 @@ llama-server 啟動時的 `-c <N>` 是唯一的 n_ctx 來源。`scripts/doctor.p
 
 ### 加新的 LLM call site 時怎麼接 gate
 
-任何新增的 `llama_client.native_completion(...)` 或 `chat_completions(...)`,**送出前** 都要:
+任何新增的生成 call site，送出前都要過 gate。聊天客戶端應沿用
+`Engine.count_input_tokens()`，把同一份 payload 的結果以 `measured_input_tokens`
+及 `count_method=llama_client.CHAT_TOKEN_COUNT_METHOD` 交給 `check_and_log()`，
+保留額明帶實送的 `max_tokens`。下例是既有 native 內部呼叫的接法：
 
 ```python
 import context_budget
@@ -684,7 +701,10 @@ context_budget.emit_post_call_line(usage)
 context_budget.log_metrics(usage)
 ```
 
-如果你的 call site 也會累積 messages(像 agent loop),記得也接 `_pre_send_trim_if_needed`(或自己呼 `trim.trim_messages`)以便 soft warning 觸發時可以自動降載,而不是直接 hard refuse。低風險 / 一次性 prompt(如 RAG embedding query 之類)可以省略 trim,但**不能省略 gate**。
+既有內部 agent loop 可沿用 `_pre_send_trim_if_needed` / `trim.trim_messages` 的
+soft-warning 處理；聊天 Engine 使用固定 history plan 與明確壓縮邊界，不在每輪
+重新挑剪枝候選。一次性主模型 prompt 可以省略 trim，不能省略 gate；embedding
+與 reranking 的專用容量邊界見下文。
 
 新增主模型 call site 時,必須在送出前用 call-time `config.require_main_model()` 取值;不要使用 import-time `config.MODEL` 或 `from config import MODEL` 當 runtime model source。
 
@@ -696,20 +716,42 @@ context_budget.log_metrics(usage)
 `max_tokens=1` 的請求,把可避免的 prefill 移到使用者打字的時候。它**不會**讓硬體算得
 比較快,prefix 本來就熱的時候也沒有收益。
 
+工具結果的 pruning plan 在安裝一份完整 history 時建立一次(new / adopt /
+replace)，以原始訊息位置與內容綁定；一般 append 不移動剪枝切點。套用順序是
+固定 plan → heal → reasoning 剝除，原始 session 與畫面不改。摘要 head 即使是
+複製的 dict，也必須是原始 history 的前段，並沿用同一份 plan；不能對 head 重新
+挑候選而復活已剪工具。新對話在壓縮前由精確容量門檻控管累積內容。
+
+`codetrail` 模式接續歷史時，TUI 先完成原始 transcript 重播，再由
+`TurnCoordinator.prepare_idle` 取得回合鎖，在背景檢查門檻並視需要壓縮。這是
+獨立且可 Ctrl-C 取消的回合；收尾之後才排零寫入的 prime。manual / off 不會
+因此自動摘要，readonly 不新增這條無新問句的生成路徑。
+
 | 符號 | 責任 |
 |---|---|
 | `config.CLIENT_PRIME_PROMPT_CACHE` | repo 常數(所有使用者一致),預熱的唯一開關。不是 `client.json` 的鍵,也沒有環境變數。 |
-| `Engine.next_turn_prefix()` | 「下一輪會送什麼」的單一來源:對現在的歷史模擬追加一則 user,走與 `payload_messages()` **同一套** heal → reasoning 剝除 → prune,再把那則佔位訊息拿掉。佔位訊息永不落檔、永不送出。下一輪真實 `send(q)` 的 payload 恆等於 `next_turn_prefix() + [user q]`——這條等式是契約測試的斷言對象,不是註解。heal 補的「已中斷」結果排在該群組**既有**結果之後(宣告順序不變),與 `send()` 內 `heal_pending_tool_calls()` 的 append 順序一致——部分完成的多工具群組(a 有結果、b 沒有)才看得出差別,插錯邊兩份 payload 就在群組中途分岔。 |
-| `Engine.prime_prompt_cache(*, reason)` | 唯一一條「沒有使用者訊息就打主模型」的路徑。零寫入(不進 `_begin_turn`、不 `_record`、不發事件、不動取消旗標),准入順序固定:常數 / 工具 / policy(在任何 I/O 之前)→ 非阻塞取模型鎖 → `_in_turn == 0` 且同一臨界區 snapshot 歷史 → `/slots` 全忙就跳過 → context gate → 送。回 `PrimeOutcome(sent, reason, processed_tokens)`,不 raise、不 print。串流只有看到終結 chunk 且拿到 `timings.prompt_n` 才記成 sent;`incomplete`(終結 chunk 之前就 EOF)/ `no_timings`(終結但沒有 `timings.prompt_n`)都不寫 telemetry,`usage.prompt_tokens` 不拿來代填。 |
+| `Engine.next_turn_prefix()` | 「下一輪會送什麼」的單一來源:沿用 `payload_messages()` 的固定 pruning plan，再 heal，並以佔位 user 決定 reasoning 剝除邊界。佔位訊息永不落檔、永不送出。沒有中間壓縮或 session 切換時，下一輪 `send(q)` 的 payload 恆等於 `next_turn_prefix() + [user q]`。heal 補的「已中斷」結果排在該群組既有結果之後，與 `send()` 的 append 順序一致。 |
+| `Engine.prime_prompt_cache(*, reason)` | cache 預熱唯一打主模型的路徑，沒有新使用者訊息也可執行。零寫入(不進 `_begin_turn`、不 `_record`、不發事件、不動取消旗標)，順序為常數 / 工具 / policy → 非阻塞取模型鎖 → 同一臨界區快照 history 與 plan → `/slots` → 精確計數與 gate → 送。回 `PrimeOutcome(sent, reason, processed_tokens)`，不 raise、不 print。只有終結 chunk 且有 `timings.prompt_n` 才記 sent；`incomplete` / `no_timings` 不寫 telemetry，完整 `usage.prompt_tokens` 不代填重算量。 |
 | `Engine.abort_prime()` | `new_session()` / `adopt()` 先關閉預熱准入，再呼叫它：世代號與 Event 一起作廢、關串流與 headers 前已登記的 socket，等舊預熱結束、`priming=False` 且模型鎖已放(上限 1 秒)。先 shutdown 舊 HTTP 才放鎖，不等 headers。整個 session create/adopt 期間不准入舊歷史；失敗保留原 session 並恢復准入。 |
-| `http_cancel.RequestCancellation` | 只由預熱選用的專用 requests session，GET / POST 共用同一次 cancellation；socket 在送 HTTP bytes 前登記，DNS/connect/TLS 晚回也不能補送。並行取消等 shutdown 完成，不以 Event 已設當作 HTTP 已關。保持 TLS 驗證、無 env proxy / netrc、不跟 redirect，不修改共用 session / pool；預熱不做透明重試。正常回合的 transport 與取消路徑不變。 |
+| `http_cancel.RequestCancellation` | 預熱與精確計數使用的專用 requests transport。預熱的 `/slots`、計數與 chat 共用其獨立 cancellation；一般回合的計數另建專屬 transport。socket 在送 HTTP bytes 前登記，DNS/connect/TLS 晚回也不能補送。並行取消等 shutdown 完成；保持 TLS 驗證、無 env proxy / netrc、不跟 redirect，不修改共用 session / pool。 |
+| `TurnCoordinator.prepare_idle(reason)` | 接續後的獨立準備入口。自動模式先取得回合鎖並執行可取消壓縮，失敗或取消不排 prime；成功收尾、釋放回合鎖後才交給預熱排程。 |
 | `TurnCoordinator.prime_in_background(reason, *, on_done=None)` | 唯一的排程入口(engine 那端只負責「准不准」)。不取回合鎖、不動 `_turn_done` / `_cancelled`——預熱不是一輪,`cancel()` 對它是 no-op;`busy` 或 engine 沒有這個方法就直接回 False。協調器層的 `on_prime(reason, outcome)` 回呼(建構時給):每一次預熱(含壓縮後協調器自己排的那一次)都回到 TUI,先 `on_prime` 再 `on_done`;engine raise 時 outcome 是 None。 |
-| `ContextUsage.prompt_tokens_processed` | 只由 `timings.prompt_n` 填(server 這次**真的評估**的 token 數),與 `actual_prompt_eval_count` 語意分離:後者在 server 同時回 `usage` 與 `timings` 時取 `usage.prompt_tokens`,也就是這次輸入的**總**量。判 cache 冷熱只能看前者。 |
+| `ContextUsage.prompt_tokens_processed` | 只由 `timings.prompt_n` 填本次重算量。`actual_prompt_eval_count` 只接受回應中的完整輸入量，未知維持 `null`；容量 gate 使用請求前的精確計數。判 cache 冷熱要比較重算量與完整輸入。 |
 
 預熱這一次的 gate 保留額與實送的 `max_tokens` **都是 1**(AGENTS.md 那條「保留額 == 實送
 `max_tokens`」在這裡照樣成立);「下一輪送得出去嗎」是**另外**用下一輪的
 `max_output_tokens`(= `config.CLIENT_MAX_OUTPUT_TOKENS`)判的一次,而且不寫 telemetry。
 落 log 的只有 `source="prime"` 這一列,它的 `reserved_output_tokens` 就是 1。
+
+過大的摘要按完整 user-turn 邊界分批，每批都精確 gate 並驗證七欄格式；中間
+摘要只留記憶體，全部成功且「摘要 + 原始 tail」通過容量檢查後才一次落檔、換
+history。單一不可分割回合仍過大、計數端點失敗或傳輸錯誤都可重試，不寫新的
+永久停用紀錄；真正收到空摘要、reasoning-only、格式漂移或截斷產出才停用。
+舊 ledger 的 `summary_error` 仍受尊重。
+
+過 gate 的未回答回合，只有存在更早可信已完成 head 時才可恢復：最後真實 user
+及其後訊息逐字保留在 tail，只摘要 head。工具迴圈不會自動重跑；成功後仍明確
+指出原問題未完成，讓使用者重送。只有未回答單輪或沒有安全 head 時仍拒絕壓縮。
 
 **SSE 客戶端 buffering 不是首字延遲的來源,不要再修。** 已查證:`_iter_sse_lines` 走
 `resp.iter_lines()` → `iter_content()` → urllib3 的 chunked 解碼,回應是 chunked 時每個
@@ -761,7 +803,7 @@ runtime 由 preflight 觀測 `/props` 的實值,以 argv 交給每一個元件�
 
 ### 沒有解的事(刻意留)
 
-- 估算還是 `CHARS_PER_TOKEN` heuristic。`actual_prompt_eval_count` 已蒐集,之後可以做 per-model 校正,但這次不引入 tokenizer 依賴。
+- 既有 native 內部呼叫與剪枝候選預算仍使用 `CHARS_PER_TOKEN` heuristic；聊天客戶端的容量決策已改用 live chat 計數端點，不以字元或 cache 重算量代替。
 - `knowledge.py` 的兩個主模型 call site（query expansion / multi-query）都走
   `_gated_completion`，那是它們的唯一出口。**不要**從該檔直接呼叫
   `llama_client.native_completion`，否則超長 prompt 可能被 server 從前面截掉。

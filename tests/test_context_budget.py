@@ -962,10 +962,10 @@ def test_an_omitted_reserve_still_uses_the_internal_default(monkeypatch):
     assert usage.reserved_output_tokens == 4096
 
 
-def test_streaming_timings_fill_in_the_token_counts():
+def test_streaming_timings_fill_only_processed_input_and_output_counts():
     """llama-server 的串流最後一個 chunk 只帶 `timings`,沒有 `usage`。
 
-    不收它的話,事件流與 eval 的 token 統計永遠是 0。
+    它能告訴我們重算了多少與輸出了多少,不能冒充完整輸入。
     """
     usage = context_budget.build_usage(source="client", requested_num_ctx=32768)
     context_budget.parse_usage_from_stream_chunk(
@@ -975,7 +975,8 @@ def test_streaming_timings_fill_in_the_token_counts():
         },
         usage,
     )
-    assert usage.actual_prompt_eval_count == 303
+    assert usage.actual_prompt_eval_count is None
+    assert usage.prompt_tokens_processed == 303
     assert usage.actual_eval_count == 83
 
 
@@ -1021,7 +1022,7 @@ def test_processed_prompt_tokens_are_recorded_separately_from_the_total():
         },
         streamed,
     )
-    assert streamed.actual_prompt_eval_count == 4096
+    assert streamed.actual_prompt_eval_count is None
     assert streamed.prompt_tokens_processed == 4096
 
     # 沒有 timings 就維持 None:不假裝有資料(舊 log 的那幾列會是 null)。
@@ -1031,3 +1032,90 @@ def test_processed_prompt_tokens_are_recorded_separately_from_the_total():
     )
     assert native.actual_prompt_eval_count == 900
     assert native.prompt_tokens_processed is None
+
+
+@pytest.mark.smoke
+def test_measured_input_controls_the_gate_across_live_context_sizes(monkeypatch):
+    """A short-looking payload may contain a full rendered prompt near any gate."""
+    import math
+
+    monkeypatch.setattr(config, "CTX_SOFT_THRESHOLD", 0.8)
+    monkeypatch.setattr(config, "CTX_HARD_THRESHOLD", 0.9)
+    monkeypatch.setattr(context_budget, "log_metrics", lambda usage: None)
+    for capacity in (32768, 65536, 98304, 131072, 262144, 524288, 1024000, 1048576):
+        boundary = math.ceil(capacity * 0.9)
+        for reserve in (1024, 8192):
+            for delta in (-1, 0, 1):
+                measured = boundary - reserve + delta
+                arguments = dict(
+                    source="client", requested_num_ctx=capacity,
+                    messages=[{"role": "user", "content": "synthetic short text"}],
+                    reserved_output_tokens=reserve, measured_input_tokens=measured,
+                    count_method="llama_cpp_chat",
+                )
+                usage = context_budget.build_usage(**arguments)
+                assert usage.estimated_input_tokens == measured
+                assert usage.estimated_total_tokens == measured + reserve
+                assert usage.hard_overflow is (delta >= 0)
+                assert usage.actual_prompt_eval_count is None
+                assert usage.to_log_dict()["count_method"] == "llama_cpp_chat"
+                if delta >= 0:
+                    with pytest.raises(context_budget.ContextOverflowError):
+                        context_budget.check_and_log(**arguments, emit=False)
+                else:
+                    assert context_budget.check_and_log(
+                        **arguments, emit=False
+                    ).estimated_input_tokens == measured
+
+
+@pytest.mark.smoke
+def test_invalid_measured_input_never_becomes_an_estimate():
+    for measured in (True, False, -1, 1.5, "10"):
+        with pytest.raises(ValueError, match="measured_input_tokens"):
+            context_budget.build_usage(
+                source="client", requested_num_ctx=32768,
+                measured_input_tokens=measured, count_method="llama_cpp_chat",
+            )
+    zero = context_budget.build_usage(
+        source="client", requested_num_ctx=32768,
+        measured_input_tokens=0, count_method="llama_cpp_chat",
+    )
+    assert zero.estimated_input_tokens == 0
+    with pytest.raises(ValueError, match="count_method"):
+        context_budget.build_usage(
+            source="client", requested_num_ctx=32768, count_method="llama_cpp_chat"
+        )
+
+
+@pytest.mark.smoke
+def test_processed_timings_never_replace_the_full_input_count():
+    """A warm prefix can process seven tokens while the full prompt stays large."""
+    usage = context_budget.ContextUsage(estimated_input_tokens=25000)
+    context_budget.parse_usage_from_stream_chunk(
+        {"choices": [{"delta": {}, "finish_reason": "stop"}],
+         "timings": {"prompt_n": 7, "predicted_n": 3}},
+        usage,
+    )
+    assert usage.actual_prompt_eval_count is None
+    assert usage.estimated_input_tokens == 25000
+    assert usage.prompt_tokens_processed == 7
+    assert usage.actual_eval_count == 3
+    context_budget.parse_usage_from_response(
+        {"usage": {"prompt_tokens": 25000, "completion_tokens": 3}}, usage
+    )
+    context_budget.parse_usage_from_response({"timings": {"prompt_n": 2}}, usage)
+    assert usage.actual_prompt_eval_count == 25000
+    assert usage.prompt_tokens_processed == 2
+
+
+@pytest.mark.smoke
+def test_usage_only_final_chunk_keeps_full_input_and_processed_tokens_separate():
+    """OpenAI's legal empty-choices usage trailer must not disappear."""
+    usage = context_budget.ContextUsage(prompt_tokens_processed=7)
+    context_budget.parse_usage_from_stream_chunk(
+        {"choices": [], "usage": {"prompt_tokens": 25000, "completion_tokens": 3}},
+        usage,
+    )
+    assert usage.actual_prompt_eval_count == 25000
+    assert usage.actual_eval_count == 3
+    assert usage.prompt_tokens_processed == 7

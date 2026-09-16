@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import client_app  # noqa: E402
+import client_compaction  # noqa: E402
 import client_engine  # noqa: E402
 import client_events  # noqa: E402
 import client_store  # noqa: E402
@@ -1159,7 +1160,7 @@ def test_the_status_bar_carries_the_session_context_and_modes():
     for needle in (
         "test-model",
         "n_ctx=8192",
-        "ctx≈",
+        "ctx=",
         engine.session_id,
         "權限=interactive",
         "壓縮=codetrail",
@@ -1958,3 +1959,84 @@ def test_the_status_line_reports_the_latest_prime_including_the_ones_after_compa
     ]
     assert busy_while_priming is False           # 預熱在回合鎖外
     assert engine.cancelled is False             # 也沒有動到取消旗標
+
+
+def test_a_resumed_history_is_compacted_before_startup_prefill():
+    """A resumed long conversation must not start a nine-minute prime first."""
+    engine = _Engine()
+    engine.messages = [
+        {"role": "user", "content": "earlier question"},
+        {"role": "assistant", "content": "earlier answer"},
+        {"role": "user", "content": "latest question"},
+        {"role": "assistant", "content": "latest answer"},
+    ]
+    order = []
+    original_prime = engine.prime_prompt_cache
+
+    def prime(*, reason):
+        order.append(("prime", len(engine.messages)))
+        return original_prime(reason=reason)
+
+    engine.prime_prompt_cache = prime
+
+    class Compactor:
+        mode = "codetrail"
+
+        def compact(self, *, manual=False, **_kwargs):
+            assert manual is False
+            assert app.coordinator.busy
+            order.append(("compact", len(engine.messages)))
+            engine.messages = [{"role": "user", "content": "summary", "synthetic": True}]
+            return client_compaction.CompactionOutcome("compacted", message="history compacted")
+
+    app = client_app.CodeTrailApp(engine, compactor=Compactor())
+
+    async def body():
+        async with app.run_test() as pilot:
+            assert await _until(pilot, engine.primed.is_set)
+            assert order == [("compact", 4), ("prime", 1)]
+
+    _run(body)
+
+
+def test_context_display_counts_full_tokens_off_the_ui_thread_and_discards_stale_results():
+    engine = _Engine()
+    entered = threading.Event()
+    release = threading.Event()
+    first_done = threading.Event()
+    worker_threads = []
+    calls = []
+
+    def count(history=None):
+        calls.append(engine.session_id)
+        worker_threads.append(threading.get_ident())
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(3)
+            first_done.set()
+            return 123345
+        return 4567
+
+    engine.context_tokens = count
+    # The old heuristic sees a tiny payload despite a large true token count.
+    engine.payload_messages = lambda: ([{"role": "user", "content": "字元估算低估"}], {})
+    engine.openai_tools = lambda: []
+    app = client_app.CodeTrailApp(engine)
+
+    async def body():
+        try:
+            async with app.run_test() as pilot:
+                assert await _until(pilot, entered.is_set, timeout=1)
+                assert worker_threads[0] != threading.get_ident()
+                engine.session_id = "20260916T130000-deadbeef"
+                engine.messages = [{"role": "user", "content": "different history"}]
+                app._recount_context()
+                assert await _until(pilot, lambda: app._context_tokens == 4567)
+                release.set()
+                assert await _until(pilot, first_done.is_set)
+                await pilot.pause()
+                assert app._context_tokens == 4567, "Late count from the previous history must be discarded"
+        finally:
+            release.set()
+
+    _run(body)
