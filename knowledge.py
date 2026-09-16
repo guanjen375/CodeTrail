@@ -228,7 +228,7 @@ def _is_figure_chunk(chunk: dict) -> bool:
 
 
 def _is_mineru_text(chunk: dict) -> bool:
-    """MinerU prose/code is unverified OCR; figure trust remains independent."""
+    """MinerU prose/code retains its OCR origin after human review."""
     return (not _is_figure_chunk(chunk)
             and (chunk.get("origin") == "mineru_text"
                  or chunk.get("text_lane") == "mineru"))
@@ -1700,6 +1700,8 @@ English:"""
         weight = SOURCE_TYPE_WEIGHTS.get(chunk_type, SOURCE_TYPE_WEIGHTS['default'])
         if _is_structured_chunk(chunk) and self._is_flagged_figure(chunk, trust_map):
             weight = min(weight, SOURCE_TYPE_WEIGHTS.get('diagram', 0.8))
+        if self._contains_mineru_text(chunk) and not self._text_eligibility(chunk)["eligible"]:
+            weight = min(weight, SOURCE_TYPE_WEIGHTS.get('diagram', 0.8))
         return weight
 
     def _apply_source_weighting(self, candidates: list, trust_map: dict | None = None) -> list:
@@ -2799,7 +2801,7 @@ English:"""
             # bbox 全部蒸發，狀態還會被第一個成員蓋掉（違反 §3「聚合取最差」）。
             # 這裡先 flush 掉手上的 buffer、再把**原物件**放回輸出，所以它仍待在
             # (source, page, chunk_index) 的排序位置上——不搬到尾端，REF 編號不變。
-            if _is_structured_chunk(c):
+            if _is_structured_chunk(c) or _is_mineru_text(c):
                 _flush()
                 merged.append(c)
                 continue
@@ -2846,6 +2848,51 @@ English:"""
             for index in self._member_indices(chunk)
         )
 
+    def _text_eligibility(self, chunk: dict) -> dict:
+        """Check every original member; a verified neighbor cannot vouch for OCR."""
+        import text_review
+        members = [self.chunks[index] for index in self._member_indices(chunk)
+                   if 0 <= index < len(self.chunks)]
+        originals = [member for member in members if _is_mineru_text(member)]
+        if not originals and _is_mineru_text(chunk):
+            originals = [chunk]
+        if not originals:
+            return {"eligible": True, "reason": "native_text"}
+        path = getattr(self, "path", None)
+        root = Path(path).absolute().parent if path else None
+        cache = getattr(self, "_text_source_cache", None)
+        if cache is None:
+            cache = self._text_source_cache = {}
+        for original in originals:
+            result = text_review.eligibility(original, root=root, cache=cache)
+            if not result["eligible"]:
+                return result
+        if members and not chunk.get("text_id"):
+            expected = "\n".join(str(member.get("content", "")) for member in members)
+            if chunk.get("content") != expected:
+                return {"eligible": False, "reason": "merged_text_content_changed"}
+        if chunk.get("text_id"):
+            return text_review.eligibility(chunk, root=root, cache=cache)
+        return {"eligible": True, "reason": "human_verified_members"}
+
+    def _text_ref_metadata(self, chunk: dict) -> dict:
+        if not self._contains_mineru_text(chunk):
+            return {}
+        verdict = self._text_eligibility(chunk)
+        return {"text_lane": "mineru", "text_id": chunk.get("text_id", ""),
+                "text_revision": chunk.get("text_revision", 0),
+                "text_content_sha256": chunk.get("text_content_sha256", ""),
+                "text_verification_status": "human_verified" if verdict["eligible"] else "unverified",
+                "text_review_reason": verdict["reason"]}
+
+    def _text_ref_label(self, chunk: dict) -> str:
+        metadata = self._text_ref_metadata(chunk)
+        verdict = metadata.get("text_verification_status", "unverified")
+        label = "OCR 人工覆核，內容/來源版本有效" if verdict == "human_verified" else "OCR 未經獨立驗證"
+        return (f"text_lane: mineru（{label}） text_id={metadata.get('text_id', '')} "
+                f"text_revision={metadata.get('text_revision', 0)} "
+                f"reason={metadata.get('text_review_reason', '')}")
+
     def _collect_excluded_text(self, bucket: list, chunk: dict) -> None:
         """Record every excluded OCR page without copying its private content."""
         originals = [
@@ -2853,6 +2900,9 @@ English:"""
             if 0 <= index < len(self.chunks) and _is_mineru_text(self.chunks[index])
         ] or [chunk]
         for original in originals:
+            verdict = self._text_eligibility(original)
+            if verdict["eligible"]:
+                continue
             entry = {
                 "source": original.get("source", ""),
                 "page": original.get("page", 0),
@@ -2860,6 +2910,10 @@ English:"""
                 "text_lane": "mineru",
                 "reason": "mineru_text_not_independently_verified",
             }
+            if original.get("text_id"):
+                entry.update(text_id=original["text_id"], text_revision=original.get("text_revision", 0),
+                             text_content_sha256=original.get("text_content_sha256", ""),
+                             reason=verdict["reason"])
             if entry not in bucket:
                 bucket.append(entry)
 
@@ -2867,14 +2921,16 @@ English:"""
     def _excluded_text_line(excluded: list) -> str:
         shown = excluded[:_MAX_EXCLUDED_FIGURES_IN_HINT]
         pages = "；".join(
-            f"{entry.get('source', '?')} p.{entry.get('page', '?')}" for entry in shown
+            f"{entry.get('source', '?')} p.{entry.get('page', '?')}"
+            + (f" text_id={entry['text_id']} rev={entry.get('text_revision', 0)}" if entry.get("text_id") else "")
+            for entry in shown
         )
         more = (f"；另有 {len(excluded) - len(shown)} 頁未列出"
                 if len(excluded) > len(shown) else "")
         return (
-            f"※ strict 模式已排除 {len(excluded)} 頁 MinerU 文字：{pages}{more}。"
-            "text_lane=mineru 的 OCR 未經獨立驗證，不得用作 strict 證據；"
-            "一般查詢可檢視其來源內容。"
+            f"※ strict 模式已排除 {len(excluded)} 段 MinerU 文字：{pages}{more}。"
+            "這些 OCR 未經獨立驗證，或既有覆核因內容／來源版本失效，不得用作 strict 證據；"
+            "使用 review_text list/show 對來源覆核。"
         )
 
     def _collect_excluded_figure(self, bucket: list, chunk: dict, status: str,
@@ -3210,6 +3266,9 @@ English:"""
             return "", "", empty_metadata
 
         _require_retrieval_dependencies()
+        # Source/artifact hashes are shared only within this query; a later
+        # request must observe a file changed since the previous REF.
+        self._text_source_cache = {}
 
         # 檢索路徑(data flywheel 用):每一階段的候選、分數與決策。只記身分與數字,
         # 不記 content;`stage` 記到哪一步就是在哪一步結束。從這裡起每一條 return
@@ -3283,7 +3342,7 @@ English:"""
         if is_strict_mode:
             kept = []
             for candidate in candidates:
-                if self._contains_mineru_text(candidate.chunk):
+                if self._contains_mineru_text(candidate.chunk) and not self._text_eligibility(candidate.chunk)["eligible"]:
                     self._collect_excluded_text(excluded_text, candidate.chunk)
                     continue
                 if not self._is_flagged_figure(candidate.chunk, trust_map):
@@ -3456,7 +3515,7 @@ English:"""
         if is_strict_mode and merged_chunks:
             kept_chunks = []
             for chunk in merged_chunks:
-                if self._contains_mineru_text(chunk):
+                if self._contains_mineru_text(chunk) and not self._text_eligibility(chunk)["eligible"]:
                     self._collect_excluded_text(excluded_text, chunk)
                     continue
                 if self._is_flagged_figure(chunk, trust_map):
@@ -3516,6 +3575,7 @@ English:"""
         # doc_type，讓它觸發「spec 類型的 REF 優先級較高」等於把未驗證內容排到前面。
         has_spec = any(
             chunk.get('type') == 'spec' and not self._is_flagged_figure(chunk, trust_map)
+            and self._text_eligibility(chunk)["eligible"]
             and not _shows_no_row(chunk)
             for chunk in merged_chunks
         )
@@ -3586,6 +3646,8 @@ English:"""
                 structured_ref_used = True
             if status and status not in TRUSTED_VERIFICATION:
                 flagged_sources.add(source)
+            if self._contains_mineru_text(chunk) and not self._text_eligibility(chunk)["eligible"]:
+                flagged_sources.add(source)
 
             if KNOWLEDGE_INCLUDE_CONTENT:
                 content = chunk.get('content', '')
@@ -3607,7 +3669,7 @@ English:"""
                 if origin:
                     model_lines.append(f"  origin: {origin_label}")
                 if _is_mineru_text(chunk):
-                    model_lines.append("  text_lane: mineru（OCR 未經獨立驗證）")
+                    model_lines.append("  " + self._text_ref_label(chunk))
                 model_lines.append(f"  source: {source}")
                 model_lines.append(f"  page: {page}")
                 figure_index = chunk.get('figure_index')
@@ -3630,7 +3692,7 @@ English:"""
                 vl_hint = "（VL 辨識）" if is_vl else ""
                 model_lines.append(f"  - REF{i}: {source} 第 {page} 頁 [{doc_type}]{vl_hint}{section_hint}")
                 if _is_mineru_text(chunk):
-                    model_lines.append("    text_lane: mineru（OCR 未經獨立驗證）")
+                    model_lines.append("    " + self._text_ref_label(chunk))
                 if structured:
                     model_lines.extend(
                         self._structured_ref_lines(chunk, status, trunc, trust_map)
@@ -3724,6 +3786,7 @@ English:"""
         has_authoritative_chunk = any(
             chunk.get('type') in authoritative_types
             and not self._is_flagged_figure(chunk, trust_map)
+            and self._text_eligibility(chunk)["eligible"]
             and not _shows_no_row(chunk)
             for chunk in merged_chunks
         )
@@ -3746,7 +3809,7 @@ English:"""
                 "section": c.get("section", ""),
                 # 出身揭露：VL 產物（image/screenshot/diagram）在下游要能與原文區分
                 "origin": c.get("origin", ""),
-                **({"text_lane": "mineru"} if _is_mineru_text(c) else {}),
+                **self._text_ref_metadata(c),
                 # PDF 內嵌圖的頁內序號：同頁多張圖若 VL 標題相同，少了它
                 # 下游（MCP / strict / flywheel / eval）就分不出是哪一張。
                 # 非圖 chunk 是 None。

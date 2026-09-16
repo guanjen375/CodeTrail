@@ -433,6 +433,8 @@ def launch(
     """啟動這幾個 role。設定全部來自 `profile`(檔案 + argv 覆寫)與 `args`;
     這個函式不讀任何環境變數 —— pane 的最終環境由 `deployment_profile.py exec`
     在 pane 內決定。"""
+    if profile.mode == "client":
+        raise ProfileError("client mode does not launch models; run the launcher on A")
     services = [profile.service(role) for role in roles]
     _check_port_collisions(services)
     warn_cpu_moe_fit_conflicts(services)

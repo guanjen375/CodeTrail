@@ -29,6 +29,7 @@ import client_config  # noqa: E402
 import compaction_formula  # noqa: E402
 import deployment_profile
 import model_resolution  # noqa: E402
+from model_identity import ModelIdentityError  # noqa: E402
 import root_safety  # noqa: E402
 import client_mcp  # noqa: E402
 import session_eval  # noqa: E402
@@ -307,7 +308,7 @@ def _file_digest(path: Path) -> str:
 
 
 def replay_client_config(*, keep_compaction: bool) -> dict[str, Any]:
-    """replay 用的 ``client.json``。**不讀使用者的那一份。**
+    """Replay settings freeze behavior and inherit only trusted transport authorization.
 
     frozen suite 的可比性要求每個 candidate 在同一組壓縮語意下跑。讀使用者的
     設定等於「同一份 suite 在兩台機器上量到不同東西」;而一台從來沒設過
@@ -316,7 +317,7 @@ def replay_client_config(*, keep_compaction: bool) -> dict[str, Any]:
     * 預設 ``off``:一般 replay 量的是模型本身,不是壓縮。
     * ``--keep-compaction``:唯一以壓縮為主題的那個 suite,用 ``codetrail``。
     """
-    return {
+    value = {
         "schema": client_config.SCHEMA,
         "compaction_mode": (
             client_compaction.MODE_CODETRAIL if keep_compaction else client_compaction.MODE_OFF
@@ -328,6 +329,16 @@ def replay_client_config(*, keep_compaction: bool) -> dict[str, Any]:
         # frozen suite 的可比性要求每個 candidate 看到同一份指示。
         "project_instructions": False,
     }
+    # Only transport authorization is inherited from the trusted owner-only
+    # settings. Evaluation semantics/permissions remain frozen above.
+    settings = client_config.load_client_settings()
+    if settings.model_endpoints:
+        value["model_endpoints"] = dict(settings.model_endpoints)
+    if settings.model_remote_ok:
+        value["model_remote_ok"] = True
+    if settings.kb_context_remote_ok:
+        value["kb_context_remote_ok"] = True
+    return value
 
 
 def _write_replay_client_config(directory: Path, value: Mapping[str, Any]) -> Path:
@@ -467,21 +478,32 @@ def _candidate_identity(
     bare = bare_model(model)
     # registry 查表只交 HOME:`env` 是要遞給子行程的那一份(已剝掉 CodeTrail
     # 的設定名),而查表要的只是「models.json 在哪」。
-    expected_path = Path(
-        deployment_profile.resolve_model_reference(bare, _profile_env(), must_exist=True)
-    )
+    profile = deployment_profile.load_effective_profile(_profile_env())
+    expected_path = None
+    if profile.mode == "client":
+        if bare != profile.service("main").model:
+            raise session_eval.SessionEvalError("selected candidate differs from the client deployment model ID")
+    else:
+        expected_path = Path(deployment_profile.resolve_model_reference(bare, _profile_env(), must_exist=True))
     client = LocalJsonClient(_normalise_base_url(), timeout_seconds=120)
     props = client.get_json("/props")
-    if not _same_model_artifact(expected_path, _path_from_props(props)):
+    if expected_path is not None and not _same_model_artifact(expected_path, _path_from_props(props)):
         raise session_eval.SessionEvalError(
             "loaded llama-server artifact does not match the selected candidate model"
         )
     settings = props.get("default_generation_settings")
     settings = settings if isinstance(settings, Mapping) else {}
     build_info = props.get("build_info")
+    from model_identity import capture_model_identity, capture_model_identities, artifact_digest
+    runtime_identity = (capture_model_identity("main", profile=profile, props=props)
+                        if profile.mode == "client" else None)
+    auxiliary_identities = (capture_model_identities(("embedding", "reranker", "vl"), profile=profile)
+                           if profile.mode == "client" else {})
     identity = {
         "selected_model": model,
-        "artifact_digest": session_eval.text_digest(str(expected_path.resolve(strict=False))),
+        "artifact_digest": artifact_digest(expected_path) if expected_path is not None else None,
+        "runtime_identity": runtime_identity,
+        "auxiliary_identities": auxiliary_identities,
         "chat_template_digest": (
             session_eval.text_digest(props["chat_template"])
             if isinstance(props.get("chat_template"), str)
@@ -813,6 +835,7 @@ def _resume_cases(
 
 
 def command_run(args: argparse.Namespace) -> int:
+    client_config.apply_to_config(client_config.load_client_settings(), readonly=True)
     suite = _load_suite(args.suite)
     if not _SAFE_CANDIDATE_LABEL_RE.fullmatch(args.candidate_label):
         raise session_eval.SessionEvalError(
@@ -833,7 +856,7 @@ def command_run(args: argparse.Namespace) -> int:
     with tempfile.TemporaryDirectory(prefix="codetrail-session-eval-") as raw_temp:
         temp_dir = Path(raw_temp)
         temp_dir.chmod(0o700)
-        # replay 用自己寫的 client.json,不讀使用者那一份:同一份 suite 在兩台
+        # replay 用自己寫的 client.json,只繼承使用者的端點授權:同一份 suite 在兩台
         # 機器上必須量到同一件事,而一台沒設過 client.json 的新部署會直接沒有
         # 壓縮(而且沒有任何欄位記得)。
         client_config_path = _write_replay_client_config(
@@ -985,7 +1008,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (deployment_profile.ProfileError, ValueError) as exc:
         _print(f"FAIL — {type(exc).__name__}", error=True)
         return 2
-    except (EvalError, compaction_formula.CompactionModeError) as exc:
+    except (EvalError, compaction_formula.CompactionModeError, ModelIdentityError,
+            client_config.ClientConfigError) as exc:
         # 壓縮門檻推不出來會丟 CompactionModeError,catalog 契約會丟 EvalError。
         # 兩者都在 commit 之前安全失敗,但沒有接的話會吐 traceback 而不是既有
         # 的乾淨診斷。

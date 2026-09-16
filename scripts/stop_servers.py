@@ -281,6 +281,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     profile_error: ProfileError | None = None
     try:
         profile = load_effective_profile(**loader_kwargs(args))
+        if profile.mode == "client":
+            print("client mode: no local model processes managed; stop services on A")
+            return 0
     except ProfileError as exc:
         profile_error = exc
         print(f"ERROR: {exc}", file=sys.stderr)

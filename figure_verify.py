@@ -5222,7 +5222,8 @@ def _run_vl_lane(candidate, evidence, kind: str, variants, ctx: dict) -> FigureR
 
 def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_base_url,
                              vl_model, render_variants, record_generated_variant=None,
-                             on_progress=None) -> list[FigureResult]:
+                             on_progress=None, checkpoint=None,
+                             checkpoint_variants=None, on_restored_variant=None) -> list[FigureResult]:
     """把 `FigurePlan` 的候選變成 `FigureResult` list（契約 §6.4）。
 
     native lane（有原生文字/幾何）零 VL；VL lane 只用在沒有原生文字的候選。
@@ -5253,11 +5254,21 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
     )
     evidence_by_page = page_evidence or getattr(plan, "page_evidence", {}) or {}
 
+    restored = {}
+    if checkpoint is not None:
+        if not callable(checkpoint_variants) or not callable(on_restored_variant):
+            raise figure_extract.FigureExtractionError("checkpoint requires exact model-input save/restore callbacks")
+        checkpoint.prepare_figures(candidates)
+        for candidate in candidates:
+            saved = checkpoint.restore_figure(candidate)
+            if saved is not None:
+                restored[candidate.figure_id] = saved
+
     lanes: dict[int, str] = {}
     vl_kinds: set[str] = set()
     for position, candidate in enumerate(candidates):
         lanes[position] = _lane_for(candidate)
-        if lanes[position] == "vl":
+        if lanes[position] == "vl" and candidate.figure_id not in restored:
             vl_kinds |= figure_extract.candidate_vl_kinds(candidate)
 
     if vl_kinds:
@@ -5289,6 +5300,21 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
             error.results = results + failed
             error.failed = _failed_result(candidate, kind, str(error), lane=lanes[position])
             raise error
+
+        saved = restored.get(candidate.figure_id)
+        if saved is not None:
+            result, variants = saved
+            for variant in variants:
+                on_restored_variant(variant)
+            sequence = per_page.get(page, 0) + 1
+            per_page[page] = sequence
+            result = replace(result, figure_index=sequence)
+            (failed if result.extraction_status == figure_extract.EXTRACTION_FAILED else results).append(result)
+            progress(f"[figure] reused {position + 1}/{total} p{page} figure={candidate.figure_id}")
+            continue
+
+        if checkpoint is not None:
+            checkpoint.start("figure/" + candidate.figure_id, checkpoint.figure_key(candidate), page=page)
 
         lane = lanes[position]
         # 這個候選真的送進模型的 variant（`_record_sent` 逐份登記）。抽壞時
@@ -5434,6 +5460,9 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
                     candidate, ctx.get("resolved_kind", kind), message, lane=lane,
                     sent=sent_variants, extra_evidence=_vl_failure_evidence(ctx),
                 )
+                if checkpoint is not None:
+                    checkpoint.fail("figure/" + candidate.figure_id,
+                                    checkpoint.figure_key(candidate), message, page=page)
                 raise error from exc
             message = (
                 f"{where}: structured 抽取失敗（{exc.slug}）：{exc.detail}"
@@ -5449,6 +5478,8 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
                 reasons=["extraction_failed", exc.slug],
             )
             failed.append(failed_result)
+            if checkpoint is not None:
+                checkpoint.save_figure(candidate, failed_result, checkpoint_variants(failed_result))
             # kind 印 `_failed_result` 正規化過的那個（raster 是候選階段的暫時分類，
             # manifest 與 lane 摘要都記正規化後的 kind——三處說法要一致）。
             progress(f"[figure] 失敗 p{page} kind={failed_result.kind} "
@@ -5464,11 +5495,17 @@ def extract_document_figures(plan: FigurePlan, *, pdf_doc, page_evidence, vl_bas
                 candidate, ctx.get("resolved_kind", kind), str(exc), lane=lane,
                 sent=sent_variants, extra_evidence=_vl_failure_evidence(ctx),
             )
+            if checkpoint is not None:
+                checkpoint.fail("figure/" + candidate.figure_id,
+                                checkpoint.figure_key(candidate), str(exc), page=page)
             raise
 
         sequence = per_page.get(page, 0) + 1
         per_page[page] = sequence
-        results.append(replace(result, figure_index=sequence))
+        result = replace(result, figure_index=sequence)
+        results.append(result)
+        if checkpoint is not None:
+            checkpoint.save_figure(candidate, result, checkpoint_variants(result))
 
     # 只吃 complete 的：跨頁接續要拿得到 payload 才判得了「這是上一張的續表」。
     results = _repair_cross_page_table_continuations(results, candidates)

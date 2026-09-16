@@ -45,7 +45,9 @@
     專案根剛好放了 pyvenv.cfg 或叫 site-packages,整棵樹被剪掉是最糟的誤殺
     (設計原則:寧可漏排,不可誤殺)。committed 的 Layer A 同樣只作用在
     相對路徑上,不看 root 自己的名字 —— 這裡與之一致。
-  * **A 命中不可用 C.include 救回**(見上)。
+  * **A 命中不可用 C.include 救回**(見上)。選定 build context 的唯一例外是
+    manifest 精確路徑/hash 准入的 generated header；walk 另行逐檔取用，
+    不進入被硬剪除的 build/，也不改 grep/list_dir 的全域規則。
   * grep_code / list_dir 走的是另一條路,完全不受本模組影響。
 """
 from __future__ import annotations
@@ -499,8 +501,11 @@ class IndexScope:
     TRAVERSE_ONLY = TRAVERSE_ONLY
     INDEX = INDEX
 
-    def __init__(self, root: str | Path, config: ScopeConfig | None = None):
+    def __init__(self, root: str | Path, config: ScopeConfig | None = None, *, build_context=None):
         self.root = Path(root).resolve()
+        self.build_context = build_context if build_context is not None and build_context.restricts_files else None
+        if self.build_context is not None and self.build_context.root != self.root:
+            raise IndexScopeError("build context belongs to another root")
         self.config = config if config is not None else ScopeConfig()
         self.mode = self.config.mode
         self.detectors = self.config.detectors
@@ -737,6 +742,8 @@ class IndexScope:
         normalized = self._norm(rel)
         if not normalized:
             return False
+        if self.build_context is not None and not self.build_context.allows_file(normalized):
+            return False
 
         # --- hard gates ---
         # 純字串規則先跑、碰檔案系統的後跑:語意上全是 AND,順序只影響 syscall 成本。
@@ -749,12 +756,26 @@ class IndexScope:
             return False                                   # committed code_rag 行為
         # 成員資格走 FileKindPolicy(§6 P3B):suffix 或 basename 規則其一成立。
         # Makefile / Kconfig 沒有副檔名,只看 suffix 會永遠搜不到。
-        if not file_kind_policy.is_indexable(name):
+        selected_code = (self.build_context is not None and
+                         self.build_context.parser_language(normalized) in ("c", "cpp"))
+        if not file_kind_policy.is_indexable(name) and not selected_code:
             return False
         if should_ignore_file(normalized):
             return False
         parent = normalized.rpartition("/")[0]
-        if parent and should_ignore_dir(Path(parent)):
+        admitted = False
+        if self.build_context is not None and normalized in self.build_context.admitted_files:
+            # B6: only exact manifest/hash-bound generated headers may bypass
+            # build/. Other ignored directories and dot paths remain hard gates.
+            parts = Path(parent).parts
+            without_build = [part for part in parts if part.lower() != "build"]
+            admitted = (
+                "build" in {part.lower() for part in parts}
+                and not any(part.startswith(".") for part in parts)
+                and not (without_build and should_ignore_dir(Path(*without_build)))
+                and self.build_context.admits_generated(normalized)
+            )
+        if parent and should_ignore_dir(Path(parent)) and not admitted:
             return False                                   # Layer A,不可救回
 
         resolved = self._resolve_inside(normalized)
@@ -764,6 +785,9 @@ class IndexScope:
             return False        # index-scope.json 自己:永不進索引、永不進輸出
         if not resolved.is_file():
             return False        # 只認 regular file:FIFO/socket/device 讀下去會永久阻塞
+
+        if admitted:
+            return True
 
         # --- scope 鏈 ---
         for regex in self._include_res:
@@ -800,6 +824,8 @@ class IndexScope:
             "index_artifacts": sorted(INDEX_ARTIFACT_FILES),
             "low_priority_patterns": list(LOW_PRIORITY_PATTERNS),
         }
+        if self.build_context is not None:
+            snapshot["build_context"] = self.build_context.fingerprint
         canonical = json.dumps(
             snapshot, sort_keys=True, ensure_ascii=False, separators=(",", ":")
         )
@@ -813,6 +839,7 @@ def walk_index_files(scope: IndexScope):
     建索引與 scripts/index_stats.py 共用這一份,避免兩邊的成員資格漂移。
     """
     scope.reset_walk_state()
+    yielded = set()
     for dirpath, dirnames, filenames in os.walk(scope.root, followlinks=False):
         rel_dir = scope.rel_dir(dirpath)
         if rel_dir is None:            # 理論上不會發生;真的發生就當作逃逸
@@ -822,9 +849,16 @@ def walk_index_files(scope: IndexScope):
         for filename in filenames:
             rel_path = f"{rel_dir}/{filename}" if rel_dir else filename
             if scope.should_index_file(rel_path):
+                yielded.add(rel_path)
                 yield Path(dirpath) / filename, rel_path
+    # Do not traverse ignored build directories. Open only individually admitted
+    # generated paths; arbitrary sibling files never reach the scanner.
+    if scope.build_context is not None:
+        for rel_path in sorted(scope.build_context.admitted_files):
+            if rel_path not in yielded and scope.should_index_file(rel_path):
+                yield scope.root / rel_path, rel_path
 
 
-def load_index_scope(root: str | Path, env: dict | None = None) -> IndexScope:
+def load_index_scope(root: str | Path, env: dict | None = None, *, build_context=None) -> IndexScope:
     """一般入口:讀設定 + 建引擎。檔案不存在就是預設行為,不會 fail。"""
-    return IndexScope(root, load_scope_config(root, env=env))
+    return IndexScope(root, load_scope_config(root, env=env), build_context=build_context)

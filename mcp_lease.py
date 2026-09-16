@@ -7,7 +7,7 @@
 認領當前 instance。
 
 **fail-open 是這個模組的第一原則**:lease 寫不了、目錄建不了、磁碟滿了,
-19 個工具都必須照常運作。所有 public 函式自己吞例外;診斷用的
+公開工具都必須照常運作。所有 public 函式自己吞例外;診斷用的
 `read_*` / `classify_*` / `incident_stats` 回空值或 `"unknown"`,不 raise。
 
 **零內容零路徑**:lease 與 incident 只放工具名、狀態 slug、時間與計數。

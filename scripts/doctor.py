@@ -270,6 +270,20 @@ def check_endpoint_policy(r: Result) -> None:
         return
     from urllib.parse import urlparse
 
+    if getattr(cfg, "DEPLOYMENT_MODE", "local") == "client" or getattr(cfg, "MODEL_ENDPOINTS", {}):
+        for attr, role, _ in _LLAMA_SERVERS:
+            try:
+                endpoint_policy.ensure_allowed(getattr(cfg, attr), role.lower(), split=True)
+                r.ok(f"{role}: exact client.json endpoint authorization ({getattr(cfg, attr)})")
+            except endpoint_policy.EndpointPolicyError as exc:
+                r.fail(str(exc))
+        if getattr(cfg, "KB_CONTEXT_GENERATE", False):
+            try:
+                endpoint_policy.ensure_allowed(cfg.LLAMA_BASE_URL, "kb_context", split=True)
+            except endpoint_policy.EndpointPolicyError as exc:
+                r.fail(str(exc))
+        return
+
     remote = []
     for attr, role, _ in _LLAMA_SERVERS:
         url = getattr(cfg, attr, "") or ""
@@ -440,6 +454,9 @@ def check_models(r: Result, server_status: dict[str, dict]) -> None:
     cfg = _read_config()
     if isinstance(cfg, Exception):
         return
+    if getattr(cfg, "DEPLOYMENT_MODE", "local") == "client":
+        r.info("client topology: model artifacts and GPU placement belong to A; live identities checked below")
+        return
 
     try:
         main_model = cfg.require_main_model()
@@ -518,6 +535,27 @@ def check_deployment_profile(
         f"deployment profile={profile.selected_profile} "
         f"verification={profile.verification} hardware={profile.hardware}"
     )
+    if profile.mode == "client":
+        r.info("topology=client (B); four model services on A")
+        for role, service in profile.services.items():
+            r.info(f"[{role}] endpoint={service.base_url} model={service.model}")
+        if no_network:
+            r.info("remote identity/capabilities not checked (--no-network)")
+            return
+        from model_identity import capture_model_identity, ModelIdentityError
+        for role in profile.services:
+            record = server_status.get(role) or server_status.get(role.upper()) or {}
+            props = record.get("props")
+            try:
+                if not isinstance(props, dict):
+                    raise ModelIdentityError(f"{role}: live /props unavailable")
+                identity = capture_model_identity(role, profile=profile, props=props)
+                r.ok(f"{role}: live identity={identity['fingerprint'][:16]} "
+                     f"kind={identity['identity_kind']} n_ctx={identity['live']['n_ctx']} "
+                     f"capabilities={props.get('chat_template_caps') or props.get('modalities') or 'unknown'}")
+            except (ModelIdentityError, endpoint_policy.EndpointPolicyError) as exc:
+                r.fail(str(exc))
+        return
     if profile.verification != "verified":
         r.warn(f"deployment profile {profile.selected_profile} 尚未標記為 verified")
     for role in ("main", "embedding", "reranker", "vl"):
@@ -783,6 +821,9 @@ def check_context_settings(r: Result) -> None:
     cfg = _read_config()
     if isinstance(cfg, Exception):
         return
+    if getattr(cfg, "DEPLOYMENT_MODE", "local") == "client":
+        r.info("client context capacity comes from live main /props; no configured ctx can replace it")
+        return
 
     main_n_ctx = int(getattr(cfg, "N_CTX", getattr(cfg, "NUM_CTX", 0)) or 0)
     dyn_on = bool(getattr(cfg, "DYNAMIC_NUM_CTX_ENABLED", False))
@@ -862,6 +903,9 @@ def check_main_server_ctx_alignment(r: Result, server_status: dict[str, dict]) -
     if isinstance(cfg, Exception):
         return
     internal_ctx_cap = int(getattr(cfg, "N_CTX", getattr(cfg, "NUM_CTX", 0)) or 0)
+    if getattr(cfg, "DEPLOYMENT_MODE", "local") == "client":
+        r.ok(f"main live n_ctx={n_ctx}; client preflight uses this observed capacity")
+        return
     if not internal_ctx_cap:
         return
 

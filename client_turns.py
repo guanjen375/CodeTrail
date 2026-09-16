@@ -37,7 +37,7 @@ from __future__ import annotations
 import secrets
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 import client_engine
@@ -45,6 +45,27 @@ import client_events
 
 #: 核准等多久沒人回答就當拒絕。UI 掛掉 / 使用者離開時 worker 不能永遠卡著。
 APPROVAL_TIMEOUT_SECONDS = 300
+MAX_QUEUE_ITEMS = 32
+MAX_QUEUE_TEXT_BYTES = 64 * 1024
+MAX_QUEUE_BYTES = 256 * 1024
+PENDING_QUEUE_STATES = frozenset({"waiting", "deferred", "delivering"})
+
+
+class QueueError(ValueError):
+    """The local input was not accepted; keep its editable draft."""
+
+
+@dataclass(frozen=True)
+class QueuedMessage:
+    id: str
+    text: str
+    mode: str
+    session_id: str
+    turn_id: str
+    status: str = "waiting"
+    reason: str = ""
+    revision: int = 1
+    delivered_turn_id: str = ""
 
 
 @dataclass
@@ -61,8 +82,8 @@ class TurnCoordinator:
     """把一輪對話跑在背景執行緒,並提供可中斷的回合邊界。
 
     ``emit`` 收到的是 :mod:`client_events` 形狀的事件(含串流 ``text_delta``、
-    工具事件、notice 與終結的 ``step_finish``);它一律在**背景執行緒**被呼叫,
-    UI 端自己負責搬回自己的執行緒。
+    工具事件、notice 與終結的 ``step_finish``)。回合事件在背景執行緒,
+    佇列操作的收據也可能來自 UI 執行緒;UI bridge 負責辨識並搬運。
     """
 
     class Busy(RuntimeError):
@@ -102,11 +123,20 @@ class TurnCoordinator:
         #: 看它,否則取消落在「ASK 判定後、pending 登記前」的空窗就會等滿逾時。
         self._cancelled = False
         self._approvals: dict[str, ApprovalTicket] = {}
+        self._queue: list[QueuedMessage] = []
+        self._queue_sequence = 0
+        self._queue_paused = False
+        self._turn_id = ""
+        self._accepting_supplements = False
+        self._active_queue_id = ""
         # 摘要不經 send(on_event=...),但手動／自動壓縮都要回報目前階段。
         # 活動共用 UI bridge;不改 send 的 JSONL 事件流,也不進預熱路徑。
         set_activity = getattr(engine, "set_activity_callback", None)
         if callable(set_activity):
             set_activity(self._publish)
+        set_supplements = getattr(engine, "set_supplement_callback", None)
+        if callable(set_supplements):
+            set_supplements(self._deliver_supplements)
 
     # ---- 狀態 ----------------------------------------------------------
     @property
@@ -123,6 +153,211 @@ class TurnCoordinator:
         with self._lock:
             return tuple(self._approvals)
 
+    @property
+    def turn_id(self) -> str:
+        with self._lock:
+            return self._turn_id
+
+    @property
+    def queue_paused(self) -> bool:
+        with self._lock:
+            return self._queue_paused
+
+    def queue_snapshot(self, *, pending_only: bool = False) -> tuple[QueuedMessage, ...]:
+        """Immutable local view. Inspection cannot start a turn or contact a model."""
+        with self._lock:
+            return tuple(item for item in self._queue
+                         if item.session_id == self.engine.session_id
+                         and (not pending_only or item.status in PENDING_QUEUE_STATES))
+
+    def assert_session_change_allowed(self) -> None:
+        with self._lock:
+            if self._turn_lock.locked() or self._approvals:
+                raise self.Busy(self.engine.session_id)
+            if any(item.status in PENDING_QUEUE_STATES for item in self._queue):
+                raise QueueError("還有未送訊息;先用 /queue list 查看、/queue resume 繼續或 /queue cancel <id> 取消。")
+
+    @staticmethod
+    def _validate_queue_text(text: str) -> None:
+        if not isinstance(text, str) or not text.strip():
+            raise QueueError("訊息不能為空。")
+        if len(text.encode("utf-8")) > MAX_QUEUE_TEXT_BYTES:
+            raise QueueError(f"單則排隊訊息不可超過 {MAX_QUEUE_TEXT_BYTES} bytes。")
+
+    def _queue_event(self, item: QueuedMessage) -> None:
+        self._publish(client_events.queue_event(item.session_id, asdict(item)))
+
+    def _replace_queued_locked(self, item: QueuedMessage, **changes: Any) -> QueuedMessage:
+        updated = replace(item, revision=item.revision + 1, **changes)
+        self._queue[self._queue.index(item)] = updated
+        return updated
+
+    def enqueue(
+        self, text: str, *, mode: str = "queue", session_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> QueuedMessage:
+        """Accept an explicit choice without interrupting HTTP, tools or approval.
+
+        A modal may return after the original turn ended. Its captured turn ID
+        prevents a supplement from silently steering a later queued task.
+        """
+        self._validate_queue_text(text)
+        if mode not in ("queue", "supplement"):
+            raise QueueError("mode 必須是 queue 或 supplement。")
+        with self._lock:
+            target = self.engine.session_id
+            if session_id is not None and session_id != target:
+                raise QueueError("對話已切換,訊息未送出;請在原對話重新確認。")
+            pending = [item for item in self._queue if item.status in PENDING_QUEUE_STATES]
+            size = sum(len(item.text.encode("utf-8")) for item in pending)
+            if len(pending) >= MAX_QUEUE_ITEMS or size + len(text.encode("utf-8")) > MAX_QUEUE_BYTES:
+                raise QueueError("待送佇列已滿;先取消或送出其中的訊息。")
+            # Retain a bounded local receipt history, evicting only settled items.
+            while (len(self._queue) >= MAX_QUEUE_ITEMS or
+                   sum(len(item.text.encode("utf-8")) for item in self._queue)
+                   + len(text.encode("utf-8")) > MAX_QUEUE_BYTES):
+                settled = next(item for item in self._queue if item.status not in PENDING_QUEUE_STATES)
+                self._queue.remove(settled)
+            active = self._turn_lock.locked() and not self._turn_done
+            bound_turn = self._turn_id if turn_id is None else turn_id
+            can_supplement = (active and self._accepting_supplements and not self._cancelled
+                              and bound_turn == self._turn_id
+                              and callable(getattr(self.engine, "record_supplement", None)))
+            status = "deferred" if mode == "supplement" and not can_supplement else "waiting"
+            reason = "本輪已無安全送入點,保留到下一輪。" if status == "deferred" else ""
+            if not active:
+                self._queue_paused = True
+                reason = "待下一輪;使用 /queue resume 開始。"
+            self._queue_sequence += 1
+            item = QueuedMessage(f"q{self._queue_sequence:06d}", text, mode, target,
+                                 bound_turn, status=status, reason=reason)
+            self._queue.append(item)
+        self._queue_event(item)
+        return item
+
+    def edit_queued(self, message_id: str, text: str) -> QueuedMessage:
+        self._validate_queue_text(text)
+        with self._lock:
+            item = next((item for item in self._queue if item.id == message_id), None)
+            if item is None or item.status not in ("waiting", "deferred"):
+                raise QueueError("只有 waiting/deferred 訊息可以修改。")
+            size = sum(len(entry.text.encode("utf-8")) for entry in self._queue if entry != item)
+            if size + len(text.encode("utf-8")) > MAX_QUEUE_BYTES:
+                raise QueueError("修改後超過佇列大小上限。")
+            item = self._replace_queued_locked(item, text=text)
+        self._queue_event(item)
+        return item
+
+    def cancel_queued(self, message_id: str) -> QueuedMessage:
+        with self._lock:
+            item = next((item for item in self._queue if item.id == message_id), None)
+            if item is None or item.status not in ("waiting", "deferred"):
+                raise QueueError("訊息已送達或正在接收,不能取消;Ctrl-C 可中斷目前回合。")
+            item = self._replace_queued_locked(item, status="cancelled", reason="使用者取消待送訊息。")
+        self._queue_event(item)
+        return item
+
+    def _deliver_supplements(self) -> None:
+        # Snapshot this boundary's batch. Inputs arriving while fsync/UI callbacks
+        # run wait for another model boundary; an endless producer cannot stall it.
+        with self._lock:
+            if self._cancelled or not self._accepting_supplements:
+                return
+            ids = [item.id for item in self._queue
+                   if item.mode == "supplement" and item.status == "waiting"
+                   and item.session_id == self.engine.session_id and item.turn_id == self._turn_id]
+        for message_id in ids:
+            with self._lock:
+                item = next((entry for entry in self._queue if entry.id == message_id), None)
+                if self._cancelled or not self._accepting_supplements:
+                    return
+                if item is None or item.status != "waiting":
+                    continue
+                item = self._replace_queued_locked(item, status="delivering")
+            accepted = self.engine.record_supplement(item.text, queue_id=item.id)
+            with self._lock:
+                current = next(entry for entry in self._queue if entry.id == item.id)
+                item = self._replace_queued_locked(
+                    current, status="delivered" if accepted else "deferred",
+                    delivered_turn_id=self._turn_id if accepted else "",
+                    reason="已納入本輪歷史。" if accepted else "本輪未接收,保留到下一輪。",
+                )
+            self._queue_event(item)
+            if not accepted:
+                return
+
+    def _close_supplements(self) -> None:
+        with self._lock:
+            self._accepting_supplements = False
+            changed = []
+            for item in list(self._queue):
+                if (item.mode == "supplement" and item.status in ("waiting", "delivering")
+                        and item.turn_id == self._turn_id):
+                    changed.append(self._replace_queued_locked(
+                        item, status="deferred", reason="未納入本輪,保留到下一輪。"))
+        for item in changed:
+            self._queue_event(item)
+
+    def _pause_queue(self) -> None:
+        with self._lock:
+            self._queue_paused = True
+        if self.queue_snapshot(pending_only=True):
+            self._publish(client_events.notice_event(
+                self.engine.session_id, "本輪未成功收尾;待送訊息已保留並暫停。用 /queue resume 明示繼續。"))
+
+    def _queue_user_recorded(self, message_id: str) -> None:
+        with self._lock:
+            item = next(item for item in self._queue if item.id == message_id)
+            item = self._replace_queued_locked(item, status="delivered", reason="已納入下一輪歷史。",
+                                               delivered_turn_id=self._turn_id)
+        self._queue_event(item)
+
+    def resume_queue(self) -> bool:
+        """Explicitly resume retained inputs; inspecting/editing never resumes."""
+        with self._lock:
+            if self._turn_lock.locked():
+                raise self.Busy(self.engine.session_id)
+            self._queue_paused = False
+        return self._start_next_queued(self.engine.session_id)
+
+    def _start_next_queued(self, target: str) -> bool:
+        with self._lock:
+            if self._queue_paused or self._turn_lock.locked() or self.engine.session_id != target:
+                return False
+            item = next((item for item in self._queue
+                         if item.session_id == target and item.status in ("waiting", "deferred")), None)
+            if item is None:
+                return False
+            self._turn_lock.acquire()
+            self._cancelled = False
+            self._turn_done = False
+            self._turn_id = secrets.token_hex(8)
+            self._accepting_supplements = True
+            self._active_queue_id = item.id
+            item = self._replace_queued_locked(item, status="delivering", reason="正在接收至下一輪。")
+        self._queue_event(item)
+        try:
+            notice = self._stop_notice()
+            if notice:
+                self._publish(client_events.notice_event(target, notice))
+            self._spawn(lambda: self._run_turn(item.text, target), f"codetrail-turn-{target}")
+        except Exception as exc:
+            self._restore_unsent_queue_item()
+            self._pause_queue()
+            self.finish_turn()
+            self._publish(client_events.error_event(target, f"待送回合無法啟動:{type(exc).__name__}: {exc}"))
+            self._publish(client_events.step_finish_event(target, reason=client_events.REASON_ERROR))
+            return False
+        return True
+
+    def _restore_unsent_queue_item(self) -> None:
+        with self._lock:
+            item = next((item for item in self._queue if item.id == self._active_queue_id), None)
+            if item is None or item.status != "delivering":
+                return
+            item = self._replace_queued_locked(item, status="deferred", reason="回合未接收,保留待送。")
+        self._queue_event(item)
+
     # ---- 回合邊界 ------------------------------------------------------
     def begin_turn(self) -> None:
         """取 turn_lock 並標「這一輪開始」——兩步在同一個臨界區內。
@@ -131,10 +366,18 @@ class TurnCoordinator:
         ``_turn_done=True``,回 False,那一次點擊就整個漏掉。
         """
         with self._lock:
+            if self._turn_lock.locked():
+                raise self.Busy(self.engine.session_id)
+            if any(item.status in PENDING_QUEUE_STATES for item in self._queue):
+                raise QueueError("還有待送訊息;使用 /queue resume、/queue add 或 /queue cancel。")
             if not self._turn_lock.acquire(blocking=False):
                 raise self.Busy(self.engine.session_id)
             self._cancelled = False
             self._turn_done = False
+            self._turn_id = secrets.token_hex(8)
+            self._active_queue_id = ""
+            self._queue_paused = False
+            self._accepting_supplements = False
 
     def finish_turn(self) -> None:
         """一輪(訊息或手動摘要)結束:標 turn_done、清 engine 旗標、放鎖。
@@ -145,6 +388,8 @@ class TurnCoordinator:
         """
         with self._lock:
             self._turn_done = True
+            self._accepting_supplements = False
+            self._active_queue_id = ""
             clear = getattr(self.engine, "clear_cancel", None)
             if callable(clear):
                 clear()
@@ -183,6 +428,7 @@ class TurnCoordinator:
                 if callable(fallback):
                     fallback()
             self._cancelled = True
+            self._queue_paused = True
             waiting = list(self._approvals.items())
             self._approvals.clear()
             for _approval_id, ticket in waiting:
@@ -260,12 +506,16 @@ class TurnCoordinator:
         # 永遠是 busy,使用者連 Ctrl-C 都救不回來(cancel 看到 turn_done=False
         # 但 engine 根本沒有 turn)。
         try:
+            with self._lock:
+                self._accepting_supplements = True
             target = self.engine.session_id
             notice = self._stop_notice()
             if notice:
                 self._publish(client_events.notice_event(target, notice))
             self._spawn(lambda: self._run_turn(text, target), f"codetrail-turn-{target}")
         except BaseException:
+            self._close_supplements()
+            self._pause_queue()
             self.finish_turn()
             raise
         return notice
@@ -277,6 +527,8 @@ class TurnCoordinator:
             target = self.engine.session_id
             self._spawn(lambda: self._run_compaction(target), f"codetrail-compact-{target}")
         except BaseException:
+            self._close_supplements()
+            self._pause_queue()
             self.finish_turn()
             raise
 
@@ -304,6 +556,7 @@ class TurnCoordinator:
         # 看終結事件收工的一端會在 notice 之前離開。所以終結先扣住,notice 送完才放行。
         held: list[dict[str, Any]] = []
         compacted = False
+        successful = False
 
         def _emit(event: dict[str, Any]) -> None:
             if client_events.is_terminal_event(event):
@@ -312,6 +565,12 @@ class TurnCoordinator:
             self._publish(event)
 
         try:
+            extra: dict[str, Any] = {}
+            if self._active_queue_id:
+                if self.cancelled:
+                    raise client_events.TurnCancelled("回合開始前已中斷")
+                message_id = self._active_queue_id
+                extra["on_user_recorded"] = lambda: self._queue_user_recorded(message_id)
             result = self.engine.send(
                 text,
                 on_event=_emit,
@@ -323,7 +582,9 @@ class TurnCoordinator:
                 ),
                 on_reasoning=self._on_reasoning,
                 approve=self.request_approval,
+                **extra,
             )
+            self._close_supplements()
             for item in result.notices:
                 self._publish(client_events.notice_event(target, item))
             outcome = self._auto_compact(target, result)
@@ -332,58 +593,88 @@ class TurnCoordinator:
                 # 壓縮階段被取消:答案已經給了,但這一輪的結果是「中斷」——cancel 回了
                 # True,終結事件就必須是 cancelled,不是 stop。
                 self._publish(client_events.notice_event(target, "答案已完成;壓縮已取消。"))
+                self._pause_queue()
                 self._publish(
                     client_events.step_finish_event(target, reason=client_events.REASON_CANCELLED)
                 )
             elif held:
+                successful = result.finish == client_events.REASON_STOP
+                if not successful:
+                    self._pause_queue()
                 for event in held:
                     self._publish(event)
             else:
+                successful = result.finish == client_events.REASON_STOP
+                if not successful:
+                    self._pause_queue()
                 self._publish(client_events.step_finish_event(target, reason=result.finish))
         except client_events.TurnCancelled:
+            self._close_supplements()
+            self._restore_unsent_queue_item()
+            self._pause_queue()
             self._publish(client_events.notice_event(target, "已中斷這一輪。"))
             self._publish(
                 client_events.step_finish_event(target, reason=client_events.REASON_CANCELLED)
             )
         except Exception as exc:  # noqa: BLE001 - 一輪失敗不得帶走整個客戶端
+            self._close_supplements()
+            self._restore_unsent_queue_item()
+            self._pause_queue()
             self._publish(client_events.error_event(target, f"{type(exc).__name__}: {exc}"))
             # 終結事件一定要送:只送 error 的話,等終結事件的一端會永遠停在那裡。
             self._publish(
                 client_events.step_finish_event(target, reason=client_events.REASON_ERROR)
             )
         finally:
+            # Includes late input submitted by the terminal-event UI callback.
+            self._close_supplements()
             self.finish_turn()
         # 壓縮換掉了歷史:下一輪要送的 prefix 已經不是剛剛送過的那一份,server 那邊
         # 的 prompt cache 對它是冷的。排在 `finally` 裡的話,預熱會在這一輪的回合鎖
         # **內**等模型鎖,使用者的下一題連 `start_turn` 都排不進來。
+        if successful and self._start_next_queued(target):
+            return
         if compacted:
             self.prime_in_background("compaction")
 
     def _run_compaction(self, target: str) -> None:
         compacted = False
+        successful = True
         try:
             if self.compactor is None:
                 self._publish(
                     client_events.notice_event(target, "這個 session 沒有可用的壓縮(模式為 off)。")
                 )
+                self._pause_queue()
                 return
             try:
                 outcome = self.compactor.compact(manual=True)
             except Exception as exc:  # noqa: BLE001
+                successful = False
+                self._pause_queue()
                 self._publish(
                     client_events.notice_event(target, f"壓縮失敗:{type(exc).__name__}: {exc}")
                 )
                 return
             compacted = getattr(outcome, "status", None) == "compacted"
+            if getattr(outcome, "status", None) not in ("compacted", "skipped"):
+                successful = False
+                self._pause_queue()
             self._publish(
                 client_events.notice_event(target, outcome.message or "(沒有可壓縮的內容)")
             )
         finally:
+            self._close_supplements()
             reason = (
                 client_events.REASON_CANCELLED if self.cancelled else client_events.REASON_STOP
             )
+            if self.cancelled:
+                successful = False
+                self._pause_queue()
             self._publish(client_events.step_finish_event(target, reason=reason))
             self.finish_turn()
+        if successful and self._start_next_queued(target):
+            return
         if compacted:
             self.prime_in_background("compaction")
 
@@ -401,12 +692,15 @@ class TurnCoordinator:
         try:
             outcome = self.compactor.compact()
         except Exception as exc:  # noqa: BLE001 - 壓縮失敗不得帶走這一輪
+            self._pause_queue()
             self._publish(
                 client_events.notice_event(target, f"壓縮失敗:{type(exc).__name__}: {exc}")
             )
             return None
         if outcome.status != "skipped" and outcome.message:
             self._publish(client_events.notice_event(target, outcome.message))
+        if outcome.status not in ("compacted", "skipped"):
+            self._pause_queue()
         return outcome
 
     # ---- 預熱 ----------------------------------------------------------
@@ -462,6 +756,11 @@ class TurnCoordinator:
         停掉。這裡**不**取停用警告:那會把「每個 session 只講一次」的那一次在這裡
         消耗掉,真正送出時就不再講了。
         """
+        self.assert_session_change_allowed()
+        with self._lock:
+            self._queue.clear()
+            self._turn_id = ""
+            self._queue_paused = False
         rebind = getattr(self.compactor, "rebind", None)
         if callable(rebind):
             rebind()

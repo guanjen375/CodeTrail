@@ -35,7 +35,14 @@ GPU 選擇都在那一步剝掉,GPU 只由本檔驗證過的值重新指定。
 
 ## Service schema
 
-每個 role 的有效資料都有：
+最上層 `mode` 接受 `local`（省略時的預設）、`model-host`（A）及 `client`（B）。
+以下 GPU／模型檔／啟動參數屬於本機模型主機設定；client 使用四角色的 `base_url`、
+`port`、版本化 `model`／`identity_alias`，不需本機 GGUF、mmproj、GPU 或 llama-server。
+`identity_alias` 在 model-host 由權重與 projector 的完整 SHA-256 產生並傳給 `--alias`。
+client 的目的地仍須獨立通過 owner-only `client.json.model_endpoints`；profile 不授權連線。
+設定、匯出與驗證流程見 [A／B 分離部署](split-deployment.md)。
+
+`local`／`model-host` 的每個 role 使用以下資料；`client` 的設定請依上方分離部署指南：
 
 - `model`：`models.json` key 或 GGUF 絕對路徑；main 可在基底中為 `null`，但啟動
   main 時一定 fail-loud，直到 local override 的 `services.main.model`(或一次性的

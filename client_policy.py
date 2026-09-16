@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from enum import Enum
 from typing import Any, Protocol
 
-#: 互動模式需要人工核准的七個工具。
+#: 互動模式需要人工核准的工具。
 ASK_TOOLS: frozenset[str] = frozenset(
     {
         "apply_patch",
@@ -28,6 +28,7 @@ ASK_TOOLS: frozenset[str] = frozenset(
         "remove_document",
         "record_lesson",
         "review_figures",
+        "review_text",
         # `client.json` 的 `external_import` 把授權從「單次啟動」變成**跨專案
         # 持久**,所以實際動作要逐次確認:核准框會顯示來源與目的路徑。
         # 開關一開就自動放行,等於使用者只能在事後從檔案系統發現模型複製了什麼。
@@ -40,7 +41,7 @@ ASK_TOOLS: frozenset[str] = frozenset(
 #: 專案外複製檔案進來」這件事,每一次的來源與目的仍要人看過(plan §6 第 12 條)。
 NEVER_AUTO_ALLOWED: frozenset[str] = frozenset({"import_external_file"})
 
-#: readonly policy 必須 deny 的下限(現行八個 mutator)。
+#: readonly policy 必須 deny 的 mutator 下限。
 #: 真正的判準是 ``readOnlyHint``;這份名單只是「至少這些」的測試錨點。
 MUTATING_TOOLS: frozenset[str] = ASK_TOOLS | {"ingest_document"}
 

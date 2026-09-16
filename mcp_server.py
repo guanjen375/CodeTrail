@@ -512,7 +512,7 @@ _RESULT_SAFETY_MAX_CHARS = {
 _DEFAULT_RESULT_SAFETY_MAX_CHARS = 200_000
 _READ_ONLY_TOOLS = frozenset({
     "list_dir", "read_file", "grep_code", "code_rag_search", "file_info",
-    "query_knowledge", "query_knowledge_strict", "git_status", "git_diff",
+    "query_knowledge", "query_knowledge_strict", "query_table", "git_status", "git_diff",
     "analyze_file",
 })
 
@@ -1090,6 +1090,48 @@ def query_knowledge_strict(
     return result
 
 
+@_tool()
+def query_table(
+    document_id: Annotated[str, Field(description="Document ID or source basename; empty searches all eligible tables.")] = "",
+    figure_id: Annotated[str, Field(description="Exact table figure ID; empty searches within the document filter.")] = "",
+    register: Annotated[str, Field(description="Exact register name; no fuzzy matching or inferred aliases.")] = "",
+    address: Annotated[str, Field(description="Exact numeric address, decimal or explicit 0x; no inferred base/offset.")] = "",
+    row: Annotated[Optional[int], Field(ge=1, description="Optional one-based data row index.")] = None,
+    column: Annotated[str, Field(description="Exact column label or one-based column index as a string.")] = "",
+    register_column: Annotated[str, Field(description="Explicit register selector column label/index when needed to avoid ambiguity.")] = "",
+    address_column: Annotated[str, Field(description="Explicit address selector column label/index when needed to avoid ambiguity.")] = "",
+) -> dict:
+    """Read literal canonical cells with current verification and source evidence."""
+    import table_lookup
+    return table_lookup.query_table(
+        AICODE_ROOT, document_id=document_id, figure_id=figure_id,
+        register=register, address=address, row=row, column=column,
+        register_column=register_column, address_column=address_column,
+    )
+
+
+@_tool()
+def review_text(
+    action: Annotated[Literal["list", "show", "correct", "confirm", "revoke"], Field(description="List/show OCR text, correct content, confirm a reviewed revision, or revoke confirmation.")] = "list",
+    source: Annotated[str, Field(description="Source document basename; optional for list.")] = "",
+    text_id: Annotated[str, Field(description="Stable OCR paragraph ID from list/show; required for revision changes.")] = "",
+    expected_revision: Annotated[int, Field(ge=0, description="Current revision from show; positive and required for changes.")] = 0,
+    expected_sha256: Annotated[str, Field(description="Current content SHA-256 from show; required for changes.")] = "",
+    text: Annotated[str, Field(description="Corrected paragraph text for action=correct; correction does not confirm it.")] = "",
+    confirm_against_source: Annotated[bool, Field(description="True only after inspecting the source for the exact current revision.")] = False,
+) -> str:
+    """Review version-bound OCR text; writes require interactive approval."""
+    import text_review
+    try:
+        return text_review.review_text(
+            AICODE_ROOT, action=action, source=source, text_id=text_id,
+            expected_revision=expected_revision, expected_sha256=expected_sha256,
+            text=text, confirm_against_source=confirm_against_source,
+        )
+    except (ValueError, RuntimeError, OSError) as exc:
+        return f"錯誤: {type(exc).__name__}: {exc}"
+
+
 _CODE_GRAPH = None
 
 
@@ -1183,8 +1225,27 @@ def _slim_edge(edge: dict) -> dict:
         "confidence": edge.get("confidence"),
         "resolution_basis": edge.get("resolution_basis"),
         "condition": edge.get("condition"),
+        "build_state": edge.get("build_state", "unknown"),
         "resolved": edge.get("resolved", edge.get("dst_id") is not None),
     }
+
+
+def _build_summary(context) -> dict:
+    """Keep target uncertainty ahead of evidence without exhausting its budget."""
+    summary = context.summary()
+    unknowns = summary.get("unknowns", [])
+    targets = summary.get("available_targets", [])
+    summary["unknowns"] = [str(item)[:240] for item in unknowns[:5]]
+    summary["unknowns_truncated"] = (
+        summary.get("unknowns_truncated", False) or len(unknowns) > 5
+        or any(len(str(item)) > 240 for item in unknowns[:5])
+    )
+    summary["available_targets"] = [str(item)[:80] for item in targets[:8]]
+    summary["available_target_count"] = len(targets)
+    summary["available_targets_truncated"] = len(targets) > 8 or any(
+        len(str(item)) > 80 for item in targets[:8]
+    )
+    return summary
 
 
 @_tool()
@@ -1195,6 +1256,7 @@ def code_rag_search(
                     hops: Annotated[int, Field(ge=1, le=2, description="Neighbor traversal depth; integer 1..2.")] = 1,
                     include_evidence: Annotated[bool, Field(description="Include score components and graph relations in semantic results.")] = False,
                     max_chars: Annotated[Optional[int], Field(ge=2000, le=30000, description="Optional context evidence character cap; integer 2000..30000; omitted uses 12% of n_ctx.")] = None,
+                    build_target: Annotated[str, Field(max_length=200, description="Imported build target to scope all modes; empty means target applicability is unknown.")] = "",
                     ) -> list[dict]:
     """Find code locations, or traverse the code graph (calls/includes), inside AICODE_ROOT.
 
@@ -1233,7 +1295,9 @@ def code_rag_search(
         hops: neighbors 模式的跳數(1–2,預設 1)。
         include_evidence: semantic 模式加開 score_components / backend /
                confidence / relations(graph 1-hop,≤5 條/筆)/ graph_status。
-               預設 False = 回傳 shape 與既往完全一致。
+               預設 False 不附詳細評分；build_context 與 build_state 一律保留。
+        build_target: scripts/import_build_context.py 匯入的 target 名稱。未指定時
+               保留全專案搜尋，明示 target unknown；指定不存在的 target 會失敗。
         max_chars: context 模式 evidence text 的字元 budget，固定合法範圍
                2000..30000；MCP 省略時依 n_ctx 12%，direct core 仍用 12000。
 
@@ -1268,12 +1332,34 @@ def code_rag_search(
             f"mode 必須是 semantic|neighbors|path|context,收到 {mode!r}"
         )
 
+    import build_context as _build_context
+    if not isinstance(build_target, str) or len(build_target) > 200:
+        raise ValueError("build_target must be a string up to 200 characters")
+    selected_context = _build_context.load_build_context(AICODE_ROOT, build_target or None)
+    build_summary = _build_summary(selected_context)
+    selected = selected_context.restricts_files
+    code_rag = CODE_RAG.for_build_context(selected_context) if selected else CODE_RAG
+    context_kwargs = {"build_context": selected_context} if selected else {}
+
+    def graph_for_query():
+        if not selected:
+            return _graph_for_query()
+        graph = _get_code_graph().for_build_context(selected_context)
+        graph.ensure_fresh()
+        return graph
+
+    def finish_response(result):
+        selected_context.assert_fresh()
+        for entry in result:
+            entry["build_context"] = build_summary
+        return result
+
     if mode == "context":
         budget = code_context.validate_max_chars(max_chars)
         context_top_k = min(max(int(top_k), 1), 10)
         code_trace = {"schema": 2, "mode": "context", "top_k": context_top_k}
         try:
-            ranked = CODE_RAG.query_ranked(query, top_k=context_top_k, trace=code_trace)
+            ranked = code_rag.query_ranked(query, top_k=context_top_k, trace=code_trace)
         except Exception as exc:
             _record_kb_failure(mode="mcp_code_rag_search", question=query, exc=exc,
                                trace=code_trace)
@@ -1291,21 +1377,21 @@ def code_rag_search(
             graph = None
             graph_status = "ok"
             try:
-                graph = _graph_for_query()
+                graph = graph_for_query()
             except DependencyError:
                 raise
             except Exception as exc:
                 graph_status = f"unavailable: {type(exc).__name__}: {exc}"[:200]
 
-            allowed_paths = set(CODE_RAG._scan_code_files())
+            allowed_paths = set(code_rag._scan_code_files())
             # lexical grep 證據不依賴 graph(workflow F):graph 缺席時以前這裡直接
             # 給 [],把 context 打成 semantic-only。仍用 scoped allowed_paths,
             # collect_safe_lexical_hits 內部再過一次 _safe_path。
-            lexical_hits = code_context.collect_safe_lexical_hits(EXEC, query, allowed_paths)
+            lexical_hits = code_context.collect_safe_lexical_hits(EXEC, query, allowed_paths, **context_kwargs)
             bundle = code_context.build_code_context(
                 query=query,
                 semantic_items=semantic_items,
-                index_items=CODE_RAG.index,
+                index_items=code_rag.index,
                 allowed_paths=allowed_paths,
                 read_window=lambda path, start, end: EXEC.read_file(
                     path, start_line=start, end_line=end
@@ -1314,6 +1400,7 @@ def code_rag_search(
                 graph=graph,
                 graph_status=graph_status,
                 lexical_hits=lexical_hits,
+                **context_kwargs,
             )
         except Exception as exc:
             _record_kb_failure(mode="mcp_code_rag_search", question=query, exc=exc,
@@ -1327,7 +1414,7 @@ def code_rag_search(
              "end_line": item.get("end_line")}
             for item in bundle["evidence"]
         ]
-        CODE_RAG.trace_add_files(code_trace, [item.get("path") for item in bundle["evidence"]])
+        code_rag.trace_add_files(code_trace, [item.get("path") for item in bundle["evidence"]])
         code_trace["stage"] = "done"
 
         if data_flywheel.collect_enabled():
@@ -1362,10 +1449,10 @@ def code_rag_search(
                     "graph_status": bundle["graph_status"],
                 },
             )
-        return [bundle]
+        return finish_response([bundle])
 
     if mode == "neighbors":
-        graph = _graph_for_query()
+        graph = graph_for_query()
         anchors = graph.find_nodes(query.strip())[:3]
         if not anchors:
             # file anchor(審核 #5):「這個檔 include 誰」走 files 表,
@@ -1383,7 +1470,7 @@ def code_rag_search(
                     "graph_status": "ok",
                     "truncated": result["truncated"],
                 }
-                return [_cap_graph_response(resp)]
+                return [_cap_graph_response(finish_response([resp])[0])]
             hints = graph.suggest_names(query.strip())
             raise RuntimeError(
                 f"neighbors: 找不到 symbol 或檔案 {query.strip()!r}"
@@ -1412,21 +1499,22 @@ def code_rag_search(
             "anchors": [
                 {"id": a["id"], "name": a["name"], "qualified_name": a["qualified_name"],
                  "path": a["path"], "line": a["start_line"], "backend": a["backend"],
-                 "linkage": a["linkage"], "condition": a["condition"]}
+                 "linkage": a["linkage"], "condition": a["condition"],
+                 "build_state": a.get("build_state", "unknown")}
                 for a in anchors
             ],
             "nodes": [
                 {"name": n["name"], "qualified_name": n["qualified_name"],
                  "kind": n["kind"], "path": n["path"], "line": n["start_line"],
                  "backend": n["backend"], "linkage": n["linkage"],
-                 "condition": n["condition"]}
+                 "condition": n["condition"], "build_state": n.get("build_state", "unknown")}
                 for n in nodes
             ],
             "edges": edges,
             "graph_status": "ok",
             "truncated": truncated,
         }
-        return [_cap_graph_response(resp)]
+        return [_cap_graph_response(finish_response([resp])[0])]
 
     if mode == "path":
         src, sep, dst = query.partition("->")
@@ -1436,7 +1524,7 @@ def code_rag_search(
                 'mode="path" 的 query 必須是 "SRC -> DST"(兩端 symbol 名),'
                 f"收到 {query!r}"
             )
-        graph = _graph_for_query()
+        graph = graph_for_query()
         paths = graph.shortest_evidence_paths({src}, {dst}, max_hops=4, limit=3)
         resp = {
             "mode": "path",
@@ -1445,12 +1533,12 @@ def code_rag_search(
             "paths": [[_slim_edge(e) for e in path] for path in paths],
             "graph_status": "ok",
         }
-        return [_cap_graph_response(resp)]
+        return [_cap_graph_response(finish_response([resp])[0])]
 
     # ---- mode == "semantic" ----
     code_trace = {"schema": 2, "mode": mode, "top_k": top_k}
     try:
-        ranked = CODE_RAG.query_ranked(query, top_k=top_k, trace=code_trace)
+        ranked = code_rag.query_ranked(query, top_k=top_k, trace=code_trace)
     except Exception as exc:
         _record_kb_failure(mode="mcp_code_rag_search", question=query, exc=exc, trace=code_trace)
         raise
@@ -1459,7 +1547,7 @@ def code_rag_search(
     graph_status = "ok"
     if include_evidence:
         try:
-            graph = _graph_for_query()
+            graph = graph_for_query()
         except DependencyError as exc:
             code_trace["stage"] = "relations"
             _record_kb_failure(mode="mcp_code_rag_search", question=query, exc=exc,
@@ -1477,6 +1565,7 @@ def code_rag_search(
             'type': item['type'],
             'line': item['line'],
             'score': round(rc.final_score, 3),
+            'build_state': item.get('build_state', 'unknown'),
         }
         if 'end_line' in item:
             entry['end_line'] = item['end_line']
@@ -1489,7 +1578,7 @@ def code_rag_search(
                 'score_source': rc.score_source,
             }
             entry['backend'] = item.get('backend', 'unknown')
-            entry['confidence'] = 'exact'
+            entry['confidence'] = 'unknown' if entry['build_state'] == 'unknown' else 'exact'
             relations: list[dict] = []
             if graph is not None:
                 try:
@@ -1530,7 +1619,7 @@ def code_rag_search(
                         "include_evidence": include_evidence,
                         "trace": code_trace},
         )
-    return results
+    return finish_response(results or [{"mode": "semantic", "results": []}])
 
 
 @_tool()
@@ -1819,9 +1908,14 @@ def import_external_file(
 @_tool()
 def analyze_file(
     path: Annotated[str, Field(description="Repository-relative image, PDF, ELF, or firmware path.")],
-    view: Annotated[Literal["summary", "headers", "sections", "memmap", "symbols", "imports", "relocs", "dynamic", "dwarf", "disasm", "strings"], Field(description="ELF analysis view; ignored for non-ELF inputs.")] = "summary",
+    view: Annotated[Literal["summary", "headers", "sections", "memmap", "symbols", "imports", "relocs", "dynamic", "dwarf", "disasm", "strings", "consistency"], Field(description="ELF analysis view. consistency compares supplied linker/preload/memory evidence.")] = "summary",
     target: Annotated[str, Field(description="Optional ELF symbol, address, safe regex, or key:value filter.")] = "",
     limit: Annotated[int, Field(ge=0, le=BIN_ELF_VIEW_MAX_LIMIT, description="View-specific row/instruction/byte cap; 0 uses the view default.")] = 0,
+    linker_map: Annotated[str, Field(description="For consistency: sandbox-relative GNU/MetaWare linker map.")] = "",
+    linker_script: Annotated[str, Field(description="For consistency: sandbox-relative linker MEMORY/SECTIONS script.")] = "",
+    preload_log: Annotated[str, Field(description="For consistency: sandbox-relative preload records or recognized load log.")] = "",
+    dram_config: Annotated[str, Field(description="For consistency: sandbox-relative memory region JSON or MEMORY declarations.")] = "",
+    map_format: Annotated[Literal["auto", "gnu", "metaware"], Field(description="Linker map grammar; auto requires a recognized header.")] = "auto",
 ) -> str:
     """Analyze a non-text file (image / PDF / ELF / binary firmware) inside AICODE_ROOT.
 
@@ -1888,6 +1982,21 @@ def analyze_file(
     view_key = (view or "summary").strip().lower()
     target_key = (target or "").strip()
     limit_key = int(limit or 0)
+    if view_key == "consistency":
+        import memory_consistency
+
+        if target_key or limit_key:
+            return '錯誤: view="consistency" 不接受 target/limit；請以各 evidence 路徑限定核對範圍。'
+        try:
+            report = memory_consistency.analyze(
+                root, path, linker_map=linker_map, linker_script=linker_script,
+                preload_log=preload_log, dram_config=dram_config, map_format=map_format,
+            )
+            return memory_consistency.render(report)
+        except memory_consistency.MemoryEvidenceError as exc:
+            return f"錯誤: 記憶體一致性核對未完成: {exc}"
+    if linker_map or linker_script or preload_log or dram_config or map_format != "auto":
+        return '錯誤: linker_map/linker_script/preload_log/dram_config/map_format 需要 view="consistency"'
     params_given = view_key != "summary" or bool(target_key) or bool(limit_key)
     ignored_note = (
         "[注意] view / target / limit 只對 ELF(含 ELF magic 的 .bin)有效,此檔案類型已忽略這些參數。\n\n"
@@ -2238,6 +2347,10 @@ def ingest_document(
     fresh: Annotated[bool, Field(description="Atomically rebuild the KB from this file; incompatible with preflight_only.")] = False,
     mineru_content_list: Annotated[Optional[str], Field(description="Local flat MinerU content_list.json for a PDF; requires mineru_pdf_sha256.")] = None,
     mineru_pdf_sha256: Annotated[Optional[str], Field(description="PDF SHA-256 recorded when the MinerU artifact was generated; requires mineru_content_list.")] = None,
+    resume: Annotated[bool, Field(description="Reuse content- and model-validated ingestion checkpoints; false reprocesses the document.")] = True,
+    redo_pages: Annotated[Optional[list[int]], Field(description="One-based PDF pages to re-extract; requires a matching checkpoint and resume=true.")] = None,
+    redo_figures: Annotated[Optional[list[str]], Field(description="Exact figure IDs to re-extract; mutually exclusive with redo_pages/retry_failed.")] = None,
+    retry_failed: Annotated[bool, Field(description="Reprocess failed/missing units only; requires a matching checkpoint and resume=true.")] = False,
     ctx: Optional[Context] = None,
 ) -> str:
     """Ingest a file into the project knowledge base.
@@ -2258,7 +2371,8 @@ def ingest_document(
     hash 必須是產物生成時的 PDF SHA-256；不呼叫 MinerU 或外部 OCR。文字只認
     text_level 標題、頁碼採 page_idx+1，圖表仍走既有 structured verification。
     產物不可信或表格沒有唯一 structured owner 時失敗，不改走 native 文字。
-    OCR 文字未獨立驗證，normal REF 會標示，strict 排除並列在 excluded_text。
+    OCR 文字預設未驗證，normal REF 會標示，strict 排除並列在 excluded_text；
+    review_text 對照來源確認目前版本且通過品質／來源檢查後，才可進 strict。
 
     ── PDF 的圖:兩條 lane(範圍不同,不要混為一談)──────────────────
 
@@ -2355,6 +2469,11 @@ def ingest_document(
               不能與 preflight_only 併用(後者是零寫入的估算)。
         mineru_content_list: 沙箱內的 MinerU flat content_list.json，僅 PDF 文件模式。
         mineru_pdf_sha256: 產生該產物時記錄的 PDF SHA-256，必須與目前 PDF 相符。
+        resume: 預設重用通過來源、模型與抽取設定檢查的 checkpoint；False 重抽全文。
+        redo_pages: 指定 PDF 頁碼（1 起算）；仍重組並原子提交完整文件。
+        redo_figures: 指定 figure_id，未指定單元沿用有效結果。
+        retry_failed: 只重跑失敗／缺席項目。三種選擇互斥，不能搭 fresh、
+              preflight_only 或 resume=False；圖片入口只能做整份 resume。
         ctx: **不是模型參數**,不出現在 JSON schema 裡(FastMCP 依型別註記自動
               注入並排除)。這個工具跑在 worker thread,由外層 async wrapper 用
               它每兩秒送一次零內容的 progress(只有秒數與已收到的行數)。
@@ -2373,6 +2492,13 @@ def ingest_document(
         `[CODETRAIL_INGEST_FAILED]`,由 adapter 判成 error。
         ingest 期間所有 KB 類工具與第二個 ingest 會立刻收到 busy,不排隊。
     """
+    # Keep this API bound in the execution validator: maxItems=10000 expands
+    # past llama.cpp's finite GBNF repetition limit and rejects every chat call,
+    # even when the model intends to use a completely different tool.
+    for selector in (redo_pages, redo_figures):
+        if isinstance(selector, (list, tuple)) and len(selector) > 10000:
+            return "錯誤: 每個 redo selector 最多接受 10000 項。"
+
     # RAG.py 跟 mcp_server.py 同一個 repo(ai_code),不是在 AICODE_ROOT
     rag_script = Path(__file__).parent / "RAG.py"
     if not rag_script.exists():
@@ -2479,10 +2605,21 @@ def ingest_document(
             "      先用 preflight_only=True 看成本,確認後再單獨呼叫 fresh=True。"
         )
 
+    from ingest_checkpoint import CheckpointError, ResumeOptions
+    try:
+        options = ResumeOptions.validate(
+            resume=resume, redo_pages=redo_pages, redo_figures=redo_figures,
+            retry_failed=retry_failed, fresh=fresh, preflight_only=preflight_only,
+        )
+        if options.selective and not pdf_document:
+            raise CheckpointError("selective redo requires a PDF document")
+    except CheckpointError as exc:
+        return f"錯誤: {exc}"
+
     kb_path = Path(AICODE_ROOT) / KNOWLEDGE_FILE
 
     # 組 CLI args
-    cmd = [sys.executable, str(rag_script), str(doc_path), str(kb_path)]
+    cmd = [sys.executable, str(rag_script), str(requested_doc_path), str(kb_path)]
     if resolved_mode == "image":
         cmd += ["--image", "-y"]
     elif resolved_mode == "chat":
@@ -2494,6 +2631,14 @@ def ingest_document(
         cmd += ["--client-config", str(_CLIENT_SETTINGS.path)]
     if fresh:
         cmd += ["--fresh"]
+    if not options.resume:
+        cmd += ["--no-resume"]
+    if options.redo_pages:
+        cmd += ["--redo-pages", ",".join(map(str, options.redo_pages))]
+    if options.redo_figures:
+        cmd += ["--redo-figures", ",".join(options.redo_figures)]
+    if options.retry_failed:
+        cmd += ["--retry-failed"]
     cmd += mineru_args
     if preflight_only:
         cmd += ["--preflight"]  # 契約:旗標放最後

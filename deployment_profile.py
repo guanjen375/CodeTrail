@@ -36,6 +36,7 @@ DEFAULT_LLAMA_BIN = "~/llama.cpp/build/bin/llama-server"
 TMUX_SESSIONS = {"main": "codetrail-main", "aux": "codetrail-rag"}
 
 _TOP_LEVEL_KEYS = {
+    "mode",
     "schema_version",
     "name",
     "extends",
@@ -44,8 +45,10 @@ _TOP_LEVEL_KEYS = {
     "hardware",
     "services",
 }
-_LOCAL_TOP_LEVEL_KEYS = {"schema_version", "profile", "services", "llama_bin"}
+_LOCAL_TOP_LEVEL_KEYS = {"schema_version", "profile", "services", "llama_bin", "mode"}
+DEPLOYMENT_MODES = ("local", "model-host", "client")
 _SERVICE_KEYS = {
+    "identity_alias",
     "model",
     "mmproj",
     "port",
@@ -195,6 +198,8 @@ class ServiceProfile:
     # 安全預設:loopback base_url 只綁 127.0.0.1;要對其他機器開放必須
     # 明確設 "all-interfaces"(舊版一律轉 0.0.0.0,對剛接觸專案者是暗坑)。
     bind: str = "local"
+    identity_alias: str | None = None
+    deployment_mode: str = "local"
 
 
 @dataclass(frozen=True)
@@ -229,6 +234,7 @@ class DeploymentProfile:
     #: 一路交到 `resolve_model_reference` / `build_server_command` / `inspect_deployment`,
     #: 不再有第二條「從環境再查一次」的路。
     registry_file: Path | None = None
+    mode: str = "local"
 
     def service(self, role: str) -> ServiceProfile:
         try:
@@ -424,6 +430,10 @@ def _validate_document(data: dict[str, Any], where: str, *, local: bool = False)
     _unknown_keys(data, _LOCAL_TOP_LEVEL_KEYS if local else _TOP_LEVEL_KEYS, where)
     if data.get("schema_version") != 1:
         raise ProfileError(f"{where}.schema_version must equal 1")
+    if data.get("mode", "local") not in DEPLOYMENT_MODES:
+        raise ProfileError(f"{where}.mode must be local, model-host, or client")
+    if data.get("mode") == "client" and "llama_bin" in data:
+        raise ProfileError(f"{where}: client mode has no llama_bin")
     if local and "profile" in data:
         profile = data["profile"]
         if not isinstance(profile, str):
@@ -453,6 +463,10 @@ def _validate_document(data: dict[str, Any], where: str, *, local: bool = False)
         if not isinstance(raw, dict):
             raise ProfileError(f"{service_where} must be an object")
         _unknown_keys(raw, _SERVICE_KEYS, service_where)
+        if "identity_alias" in raw:
+            alias = raw["identity_alias"]
+            if not isinstance(alias, str) or not _BARE_MODEL_RE.fullmatch(alias):
+                raise ProfileError(f"{service_where}.identity_alias must be a versioned bare model ID")
         if "model" in raw:
             _validate_model_reference(raw["model"], f"{service_where}.model", nullable=role == "main")
         if "mmproj" in raw:
@@ -527,7 +541,10 @@ def _load_profile_chain(reference: str, seen: set[Path] | None = None) -> tuple[
     parent = data.get("extends")
     if parent:
         parent_data, _ = _load_profile_chain(parent, visited)
-        return _merge(parent_data, {k: v for k, v in data.items() if k != "extends"}), path.stem
+        merged = _merge(parent_data, {k: v for k, v in data.items() if k != "extends"})
+        if data.get("mode") == "client":
+            merged["services"] = data["services"]
+        return merged, path.stem
     return data, path.stem
 
 
@@ -583,6 +600,16 @@ def _validate_effective(data: dict[str, Any], where: str) -> None:
         raise ProfileError(f"{where} is missing service role(s): {', '.join(missing)}")
     for role in ROLES:
         raw = services[role]
+        if data.get("mode") == "client":
+            _unknown_keys(raw, {"base_url", "model", "identity_alias"}, f"{where}.services.{role}")
+            if not raw.get("model") or raw.get("model") != raw.get("identity_alias"):
+                raise ProfileError(f"{where}.services.{role}: model must equal the versioned identity_alias")
+            from endpoint_policy import canonical_direct_base_url, EndpointPolicyError
+            try:
+                canonical_direct_base_url(raw.get("base_url"))
+            except EndpointPolicyError as exc:
+                raise ProfileError(f"{where}.services.{role}: {exc}") from exc
+            continue
         missing = sorted({"model", "port", "base_url", "gpu_role", "ctx", "batch", "ubatch", "parameters"} - set(raw))
         if missing:
             raise ProfileError(f"{where}.services.{role} is missing field(s): {', '.join(missing)}")
@@ -664,13 +691,29 @@ def load_effective_profile(
 
     data, selected_name = _load_profile_chain(selected)
     if local_data:
-        data = _merge(data, {"services": local_data.get("services", {})})
-    data = _merge(data, _overrides_overlay(overrides))
+        mode = local_data.get("mode", data.get("mode", "local"))
+        if mode == "client":
+            data = dict(data, mode=mode, services=local_data.get("services", {}))
+        else:
+            data = _merge(data, {"mode": mode, "services": local_data.get("services", {})})
+    mode = data.get("mode", "local")
+    if mode == "client":
+        if _overrides_overlay(overrides) or overrides.llama_bin or overrides.gpus:
+            raise ProfileError("client mode does not accept launcher overrides")
+    else:
+        data = _merge(data, _overrides_overlay(overrides))
     _validate_effective(data, "effective deployment profile")
 
     services: dict[str, ServiceProfile] = {}
     for role in ROLES:
         raw = data["services"][role]
+        if mode == "client":
+            services[role] = ServiceProfile(
+                role=role, model=raw["model"], base_url=raw["base_url"].rstrip("/"),
+                port=_url_port(raw["base_url"], role), gpu_role="", gpu="",
+                ctx=None, batch=None, ubatch=None, parameters={},
+                identity_alias=raw["identity_alias"], deployment_mode=mode)
+            continue
         services[role] = ServiceProfile(
             role=role,
             model=raw["model"],
@@ -684,6 +727,7 @@ def load_effective_profile(
             batch=raw["batch"],
             ubatch=raw["ubatch"],
             parameters=dict(raw["parameters"]),
+            identity_alias=raw.get("identity_alias"), deployment_mode=mode,
         )
     return DeploymentProfile(
         name=str(data["name"]),
@@ -693,8 +737,9 @@ def load_effective_profile(
         services=services,
         selected_profile=selected_name,
         local_override=override_path if local_data else None,
-        llama_bin=_llama_bin(env, local_data, overrides.llama_bin),
+        llama_bin="" if mode == "client" else _llama_bin(env, local_data, overrides.llama_bin),
         registry_file=Path(model_registry_file) if model_registry_file else None,
+        mode=mode,
     )
 
 
@@ -860,10 +905,23 @@ def build_server_command(
     registry_file: str | Path | None = None,
 ) -> list[str]:
     """Build argv only from validated structured fields and the parameter allowlist."""
+    if service.deployment_mode == "client":
+        raise ProfileError("client mode cannot start a local model; start the four services on A")
     model_path = resolve_model_reference(
         service.model, environ, must_exist=must_exist, registry_file=registry_file
     )
     command = [llama_bin, "-m", model_path]
+    if service.identity_alias:
+        if must_exist and re.fullmatch(rf"ct-{service.role}-[0-9a-f]{{64}}", service.identity_alias):
+            from model_identity import versioned_alias, ModelIdentityError
+            projector = resolve_model_reference(service.mmproj, environ, must_exist=True,
+                                                registry_file=registry_file) if service.mmproj else None
+            try:
+                if service.identity_alias != versioned_alias(service.role, model_path, projector):
+                    raise ProfileError("model weights changed: regenerate model-host configuration and B manifest")
+            except ModelIdentityError as exc:
+                raise ProfileError(str(exc)) from exc
+        command.extend(["--alias", service.identity_alias])
     if service.mmproj:
         command.extend([
             "--mmproj",
@@ -929,6 +987,10 @@ def build_server_command(
 def profile_as_dict(profile: DeploymentProfile, environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     services: dict[str, Any] = {}
     for role, service in profile.services.items():
+        if profile.mode == "client":
+            services[role] = {"model": service.model, "base_url": service.base_url,
+                              "identity_alias": service.identity_alias}
+            continue
         item = {
             "model": service.model,
             "port": service.port,
@@ -940,6 +1002,7 @@ def profile_as_dict(profile: DeploymentProfile, environ: Mapping[str, str] | Non
             "batch": service.batch,
             "ubatch": service.ubatch,
             "parameters": service.parameters,
+            "identity_alias": service.identity_alias,
         }
         if service.mmproj:
             item["mmproj"] = service.mmproj
@@ -959,6 +1022,7 @@ def profile_as_dict(profile: DeploymentProfile, environ: Mapping[str, str] | Non
         services[role] = item
     return {
         "schema_version": 1,
+        "mode": profile.mode,
         "name": profile.name,
         "selected_profile": profile.selected_profile,
         "description": profile.description,
@@ -968,6 +1032,28 @@ def profile_as_dict(profile: DeploymentProfile, environ: Mapping[str, str] | Non
         "llama_bin": profile.llama_bin,
         "services": services,
     }
+
+
+def export_client_profile(profile: DeploymentProfile, server_url: str) -> dict[str, Any]:
+    """Export destinations/aliases only. Importing on B must separately authorize them."""
+    from endpoint_policy import canonical_direct_base_url
+    from urllib.parse import urlunsplit
+    if profile.mode == "client":
+        raise ProfileError("export-client must run against the model host profile")
+    try:
+        address = urlsplit(canonical_direct_base_url(server_url))
+    except RuntimeError as exc:
+        raise ProfileError(str(exc)) from exc
+    host = f"[{address.hostname}]" if ":" in address.hostname else address.hostname
+    services = {}
+    for role, service in profile.services.items():
+        if not service.identity_alias:
+            raise ProfileError(f"{role}: missing versioned identity_alias; run set_config --mode model-host")
+        services[role] = {
+            "model": service.identity_alias, "identity_alias": service.identity_alias,
+            "base_url": urlunsplit((address.scheme, f"{host}:{service.port}", "", "", "")),
+        }
+    return {"schema_version": 1, "mode": "client", "services": services}
 
 
 #: `--<name>-gpu` → `LauncherOverrides.gpus` 的鍵。`aux` 套到三個附屬角色。
@@ -1068,6 +1154,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ("validate", "validate profile and optionally require model files"),
         ("get", "print one effective service field"),
         ("exec", "exec one role directly (for systemd or another supervisor)"),
+        ("export-client", "print B destinations and versioned model IDs (no authorization)"),
     ):
         child = sub.add_parser(name, help=help_text)
         add_loader_arguments(child, suppress_defaults=True)
@@ -1081,6 +1168,8 @@ def _build_parser() -> argparse.ArgumentParser:
             )
         elif name == "exec":
             child.add_argument("role", choices=ROLES)
+        elif name == "export-client":
+            child.add_argument("--server-url", required=True, help="A literal private IP URL; role ports come from the profile")
     return parser
 
 
@@ -1092,8 +1181,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile = load_effective_profile(**kwargs)
         if args.command == "show":
             print(json.dumps(profile_as_dict(profile), ensure_ascii=False, indent=2, sort_keys=True))
+        elif args.command == "export-client":
+            print(json.dumps(export_client_profile(profile, args.server_url), ensure_ascii=False, indent=2))
         elif args.command == "validate":
-            if args.require_files:
+            if args.require_files and profile.mode != "client":
                 for service in profile.services.values():
                     resolve_model_reference(
                         service.model, must_exist=True, registry_file=profile.registry_file

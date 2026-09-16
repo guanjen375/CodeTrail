@@ -101,6 +101,15 @@ def _render_excluded(excluded: object, hint: object = "") -> str:
     return "\n".join(lines)
 
 
+def _render_excluded_text(payload: dict[str, Any]) -> str:
+    excluded = payload.get("excluded_text")
+    if not isinstance(excluded, list) or not excluded:
+        return ""
+    return "\n".join([
+        "excluded_text: " + _json(item) for item in excluded
+    ] + ["review: use review_text(action=\"list\") to inspect the current OCR revisions."])
+
+
 def _render_query_knowledge(payload: dict[str, Any]) -> str:
     if payload.get("error"):
         return str(payload["error"])
@@ -112,6 +121,7 @@ def _render_query_knowledge(payload: dict[str, Any]) -> str:
     parts = [part for part in (
         _render_refs(payload.get("refs")),
         _render_excluded(payload.get("excluded_figures"), payload.get("review_hint")),
+        _render_excluded_text(payload),
         primary,
     ) if part]
     return "\n".join(parts) or "No matching knowledge-base evidence."
@@ -125,9 +135,57 @@ def _render_query_knowledge_strict(payload: dict[str, Any]) -> str:
     parts = [part for part in (
         _render_refs(payload.get("refs")),
         _render_excluded(payload.get("excluded_figures"), payload.get("review_hint")),
+        _render_excluded_text(payload),
         primary,
     ) if part]
     return "\n".join(parts)
+
+
+def _render_query_table(payload: dict[str, Any]) -> str:
+    # Each cell and its provenance form a single JSON line. The common line-safe
+    # budget fitter must drop a whole cell, never leave a shortened literal value.
+    lines = [f"table_status: {payload.get('status', 'unknown')}",
+             f"has_ref: {_json(payload.get('has_ref', False))}"]
+    for key in ("reason", "ambiguous", "truncated", "match_count", "excluded_count", "error"):
+        if key in payload:
+            lines.append(f"{key}: {_json(payload[key])}")
+    for item in payload.get("excluded", []):
+        lines.append("excluded: " + _json(item))
+    for item in payload.get("matches", []):
+        lines.append("cell: " + _json(item))
+    return "\n".join(lines)
+
+
+def _render_review_text(payload: str) -> str:
+    # The review API uses a JSON text protocol. Keep its failure status visible
+    # and its CAS locator ahead of potentially large OCR/history values.
+    try:
+        result = json.loads(payload)
+    except (ValueError, TypeError):
+        return payload  # Busy and preflight errors retain their existing protocol.
+    if not isinstance(result, dict):
+        return payload
+    if result.get("status") == "error":
+        return "錯誤: " + str(result.get("reason") or "OCR review failed")
+    bulk_keys = ("original_ocr", "text", "corrected_text", "text_locator",
+                 "confirmation", "quality_issues", "history")
+    lines = ["review_status: " + _json(result.get("status", "unknown")),
+             "action: " + _json(result.get("action", ""))]
+    units = result.get("units", [result])
+    if not isinstance(units, list):
+        return payload
+    lines.append(f"units: {len(units)}")
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        metadata = {key: value for key, value in unit.items()
+                    if key not in bulk_keys and key not in {"status", "action"}}
+        lines.append("unit: " + _json(metadata))
+        for key in bulk_keys:
+            if key in unit:
+                # A whole value fits or is omitted, never a shortened correction.
+                lines.append(f"{key}: " + _json(unit[key]))
+    return "\n".join(lines)
 
 
 def _render_code_rag(payload: object) -> str:
@@ -152,7 +210,7 @@ def _render_code_rag(payload: object) -> str:
         if len(payload) > 1:
             lines.append(f"result: {index}/{len(payload)}")
         for key in (
-            "mode", "query", "src", "dst", "graph_status", "truncated",
+            "mode", "build_context", "build_state", "query", "src", "dst", "graph_status", "truncated",
             "budget_chars", "used_chars", "error",
         ):
             if key in item:
@@ -186,6 +244,9 @@ def _render_code_rag(payload: object) -> str:
             continue
 
         if mode == "semantic":
+            if item.get("results") == [] and "path" not in item:
+                lines.append("results: 0")
+                continue
             path = item.get("path", "?")
             line = item.get("line", "?")
             lines.append(
@@ -207,6 +268,10 @@ def _render_code_rag(payload: object) -> str:
 
 
 def _render_payload(tool_name: str, payload: object) -> str:
+    if tool_name == "review_text" and isinstance(payload, str):
+        return _render_review_text(payload)
+    if tool_name == "query_table" and isinstance(payload, dict):
+        return _render_query_table(payload)
     if tool_name == "query_knowledge" and isinstance(payload, dict):
         return _render_query_knowledge(payload)
     if tool_name == "query_knowledge_strict" and isinstance(payload, dict):
@@ -270,7 +335,7 @@ _PARTIAL_MARKERS: dict[str, tuple[str, ...]] = {
     "git_diff": ("\n... [略過 ", "\n... [截斷 "),
     "run_lint": ("\n... [略過 ", "\n... [截斷 "),
     "run_command": ("\n... [略過 ", "\n... [截斷 "),
-    "analyze_file": ("\n...[截斷中段 ",),
+    "analyze_file": ("\n...[截斷中段 ", "\n[Truncated: conflict/unknown totals"),
     "ingest_document": ("\n...[截斷中段 ", "✗ 輸出不完整"),
     "review_figures": ("\n\n…還有 ",),
 }
@@ -278,6 +343,11 @@ _PARTIAL_MARKERS: dict[str, tuple[str, ...]] = {
 
 def _status_for(tool_name: str, payload: object, body: str) -> tuple[str, str | None]:
     lower = body.lower()
+    if tool_name == "query_table" and isinstance(payload, dict) and payload.get("status") == "error":
+        return "error", "Correct the reported table selector or source problem before retrying."
+    if tool_name == "analyze_file" and body.startswith("Memory consistency: "):
+        if body.startswith(("Memory consistency: unknown;", "Memory consistency: conflict;")):
+            return "partial", "Inspect the reported ranges and sources; resolve conflicts or supply missing evidence before declaring consistency."
     if body.startswith("⚠ [重複呼叫偵測]"):
         return "partial", "Do not repeat the same call; use the existing result or change tool/path/pattern."
     # ingest 的成敗看的是子行程留下的 marker，不是前綴：一次 exit 0 的 ingest 也

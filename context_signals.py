@@ -125,7 +125,16 @@ def gate_embedding_input(chunk: Dict) -> str:
     只作召回 metadata，不能提高 figure 內容的證據分數。
     """
     parts = _prefix_lines(chunk, allow_ocr_metadata=False)
-    parts.append(str(chunk.get("content", "")))
+    content = str(chunk.get("content", ""))
+    if (not chunk.get("structured") and
+            (chunk.get("origin") == "mineru_text" or chunk.get("text_lane") == "mineru")):
+        # Heading metadata is not part of the human-reviewed OCR body. Its
+        # generated prefix remains a recall signal, never a decision signal.
+        prefix_chars = chunk.get("heading_prefix_chars", 0)
+        if type(prefix_chars) is not int or not 0 <= prefix_chars <= len(content):
+            raise ValueError("invalid OCR heading/body boundary in gate input")
+        content = content[prefix_chars:]
+    parts.append(content)
     return "\n".join(parts)
 
 

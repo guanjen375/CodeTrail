@@ -25,11 +25,11 @@ FAILED_MARKER = "[CODETRAIL_INGEST_FAILED]"
 # busy 回覆的固定開頭。放在這個純模組裡，是為了讓 adapter 不必 import runtime
 # 狀態模組就認得它 —— 兩端共用同一個字面字串，不是各自寫一份。
 BUSY_PREFIX = "稍後重試:"
-# **只有這四個**工具會回 busy 字串（evidence tool 走 exception，不回字串）。
+# **只有以下工具**會回 busy 字串（evidence tool 走 exception，不回字串）。
 # 不限定工具名的話，一個檔名叫 `稍後重試:…` 的 `file_info` 會被說成「沒有執行、
 # 請稍後重試」—— 它其實成功了。
 BUSY_TOOL_NAMES = frozenset({
-    "reload_knowledge_base", "remove_document", "review_figures", "ingest_document",
+    "reload_knowledge_base", "remove_document", "review_figures", "review_text", "ingest_document",
 })
 # preflight（`--preflight`）是**零寫入**的估算。它超出上限時同樣是「要你決定」，
 # 但下一步跟正式 ingest 完全不同：正式 ingest 的內容已經在 KB 裡了，preflight

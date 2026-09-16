@@ -128,6 +128,11 @@ docstring 說明它涵蓋哪些原始檔與為什麼：
 - repo infrastructure：`test_repo_consistency.py`（含 scripts `--help`）、
   `test_test_runner.py`、`test_smoke_gate.py`。
 
+分離部署、入庫續跑、記憶體核對、表格／OCR 覆核、build target 與訊息佇列的安全契約，
+分別在 `test_split_deployment.py`、`test_ingest_resume.py`、`test_memory_consistency.py`、
+`test_text_table_review.py`、`test_build_context.py`、`test_message_queue.py`；跨功能契約在
+`test_feature_integration.py`。這些節點同樣由 smoke manifest 守住。
+
 `tests/_harness.py` 與 `tests/_set_config_harness.py` 是共用 harness，不是 pytest test
 module。smoke 的安全組成由 `tests/test_smoke_gate.py` 靜態守住；不要以手動檔案清單取代。
 
@@ -598,8 +603,8 @@ journaled 寫入 → best-effort rollback。
 
 | 模組／入口 | 契約 |
 |---|---|
-| `mcp_contract.py` | `PUBLIC_TOOL_ORDER` 是 live 19-tool 名稱與順序唯一來源；同檔也定義 bounded FastMCP instructions 與 evidence-tool 集合。 |
-| `tool_result_adapter.py` | 每個 tool call 都產生單一 compact text block；首行 `status: ok|partial|error`，需要修復／續讀時才有 `next:`。省略 `max_chars` 時以 call-time `config.N_CTX` 的 12% token proxy 配置，明示過大值標 `context_risk`；三個 evidence tool 保留未改 core structured payload。 |
+| `mcp_contract.py` | `PUBLIC_TOOL_ORDER` 是 live 21-tool 名稱與順序唯一來源；同檔也定義 bounded FastMCP instructions 與 evidence-tool 集合。 |
+| `tool_result_adapter.py` | 每個 tool call 都產生單一 compact text block；首行 `status: ok|partial|error`，需要修復／續讀時才有 `next:`。省略 `max_chars` 時以 call-time `config.N_CTX` 的 12% token proxy 配置，明示過大值標 `context_risk`；evidence tools 保留 core structured payload。 |
 | `scripts/tool_call_canary.py` | live MCP protocol；explicit 點名工具 hard gate（retry 一次）；implicit 未點名工具單次診斷，四態 `optimal/suboptimal/fail/timeout` 不擋啟動。schema 2 分離 cache lane 只存 hash/status/time/version；`supports_tools=false` 在 model attempt 前 fail。 |
 | `scripts/mcp_catalog.py`／`scripts/eval_tool_routing.py` | effective stdio catalog、privacy-safe routing classification/gates 與 frozen historical baseline replay；harness 永不自行把 matrix row 升級成 supported。 |
 

@@ -1103,20 +1103,16 @@ class LocalJsonClient:
             hostname = parsed.hostname
         except ValueError as exc:
             raise EvalError("main model base URL is invalid") from exc
-        # 遠端端點的同意來自 client.json 的 `model_remote_ok`(經 config)——
-        # 與 runtime 的 `endpoint_policy` 是同一個判準,不是另一份。
-        import config
-
-        remote_ok = bool(getattr(config, "MODEL_REMOTE_OK", False))
+        import endpoint_policy
         if parsed.scheme not in ("http", "https") or not hostname or parsed.query or parsed.fragment:
             raise EvalError("main model base URL is invalid")
-        if hostname not in ("localhost", "127.0.0.1", "::1") and not remote_ok:
-            raise EvalError(
-                "non-loopback model endpoint requires client.json model_remote_ok=true"
-            )
         self.base_url = base_url.rstrip("/")
         if self.base_url.endswith("/v1"):
             self.base_url = self.base_url[:-3]
+        try:
+            endpoint_policy.ensure_allowed(self.base_url, "main")
+        except endpoint_policy.EndpointPolicyError as exc:
+            raise EvalError(str(exc)) from exc
         self.timeout_seconds = timeout_seconds
         self.opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}),
@@ -1135,6 +1131,11 @@ class LocalJsonClient:
         path: str,
         body: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
+        import endpoint_policy
+        try:
+            endpoint_policy.ensure_allowed(self.base_url + path, "main")
+        except endpoint_policy.EndpointPolicyError as exc:
+            raise EvalError(str(exc)) from exc
         data = None
         headers = {"Accept": "application/json"}
         if body is not None:
@@ -1232,6 +1233,11 @@ def compatibility_identity(
     expected = row.get("compatibility")
     expected = expected if isinstance(expected, Mapping) else {}
     props = props or {}
+    import config as _runtime_config
+    remote_identity = None
+    if _runtime_config.DEPLOYMENT_MODE == "client" and props:
+        from model_identity import capture_model_identity
+        remote_identity = capture_model_identity("main", props=dict(props))
     template = props.get("chat_template")
     caps = props.get("chat_template_caps")
     build_info = props.get("build_info")
@@ -1282,6 +1288,8 @@ def compatibility_identity(
         "template_family": expected.get("template_family"),
         "selected_model_digest": text_digest(selected_model) if selected_model else None,
         "runtime_model_digest": (text_digest(runtime_model) if isinstance(runtime_model, str) else None),
+        "remote_model_fingerprint": remote_identity["fingerprint"] if remote_identity else None,
+        "remote_model_identity_kind": remote_identity["identity_kind"] if remote_identity else None,
         "chat_template_digest": text_digest(template) if isinstance(template, str) else None,
         "chat_template_caps": dict(caps) if isinstance(caps, Mapping) else None,
         "chat_template_caps_digest": json_digest(caps) if isinstance(caps, Mapping) else None,
@@ -1509,7 +1517,7 @@ def _ask_permission_contract(_config: Mapping[str, Any] | None = None) -> bool:
     # (總審 F1-13:exact 比對舊六項會讓 gate 永遠 False,再完美的 case 也過不了)。
     required = frozenset(
         {"apply_patch", "run_lint", "run_command", "remove_document",
-         "record_lesson", "review_figures"}
+         "record_lesson", "review_figures", "review_text"}
     )
     return required <= client_policy.ASK_TOOLS
 
@@ -1773,8 +1781,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
 
     try:
         _settings = client_config.load_client_settings()
-    except client_config.ClientConfigError:
-        _settings = None
+    except client_config.ClientConfigError as exc:
+        raise EvalError(f"client transport authorization is not trusted: {exc}") from exc
     else:
         # 其餘的鍵要**真的套進 config**:endpoint policy 的遠端同意
         # (`model_remote_ok`)就在裡面,不套的話一個合法的遠端部署會被自己的
@@ -1797,6 +1805,14 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     client = LocalJsonClient(base_url, timeout_seconds=args.model_timeout)
     props = client.get_json("/props")
+    if _codetrail_config.DEPLOYMENT_MODE == "client":
+        from model_identity import capture_model_identity, ModelIdentityError
+        try:
+            actual_identity = capture_model_identity("main", props=props)
+        except ModelIdentityError as exc:
+            raise EvalError(str(exc)) from exc
+        if probe_model != actual_identity["model_id"]:
+            raise EvalError("selected model differs from the live client deployment identity")
     caps = props.get("chat_template_caps")
     if isinstance(caps, Mapping) and caps.get("supports_tools") is False:
         raise EvalError("chat template explicitly reports supports_tools=false")

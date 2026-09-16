@@ -117,7 +117,7 @@ def query_terms(query: str) -> list[str]:
 
 
 def collect_safe_lexical_hits(executor, query: str,
-                              allowed_paths: Iterable[str]) -> list[dict]:
+                              allowed_paths: Iterable[str], *, build_context=None) -> list[dict]:
     """Collect structured grep hits without bypassing ``ToolExecutor`` safety.
 
     ``allowed_paths`` must come from CodeRAG's scoped scanner.  A grep result is
@@ -125,6 +125,30 @@ def collect_safe_lexical_hits(executor, query: str,
     to one of those scoped paths.  No match text is returned or persisted.
     """
     allowed = {str(path).replace("\\", "/") for path in allowed_paths}
+    if build_context is not None and build_context.restricts_files:
+        # Whole-project grep is capped before this function sees the hits, and
+        # intentionally ignores build/. Search the already trusted selected
+        # snapshot so inactive code cannot consume the lexical candidate budget.
+        build_context.assert_fresh()
+        terms = query_terms(query)
+        hits = []
+        for path in sorted(allowed):
+            if not build_context.allows_file(path):
+                continue
+            target = executor._safe_path(path)
+            if target is None or target != build_context.root / path:
+                continue
+            for line, text in enumerate(build_context.read_source(path).splitlines(), 1):
+                if build_context.state_for(path, line) == "inactive":
+                    continue
+                matched = [term for term in terms if re.search(re.escape(term), text, re.I)]
+                if matched:
+                    hits.append({"path": path, "line": line, "terms": matched})
+                    if len(hits) >= _MAX_LEXICAL_HITS:
+                        build_context.assert_fresh()
+                        return hits
+        build_context.assert_fresh()
+        return hits
     suffixes = sorted({Path(path).suffix.lower() for path in allowed if Path(path).suffix})
     if not allowed or not suffixes:
         return []
@@ -531,6 +555,7 @@ def build_code_context(
     graph=None,
     graph_status: str = "ok",
     lexical_hits: Iterable[dict] = (),
+    build_context=None,
 ) -> dict:
     """Build the exact public context response object.
 
@@ -539,6 +564,12 @@ def build_code_context(
     """
     budget = validate_max_chars(max_chars)
     allowed = {str(path).replace("\\", "/") for path in allowed_paths}
+    if build_context is not None:
+        build_context.assert_fresh()
+        allowed = {path for path in allowed if build_context.allows_file(path)}
+        index_items = [item for item in index_items if build_context.allows_item(item)]
+        semantic_items = [item for item in semantic_items if build_context.allows_item(item)]
+        lexical_hits = [item for item in lexical_hits if build_context.allows_item(item)]
     normalized_items = [_normalize_item(item) for item in index_items]
 
     seeds: list[dict] = []
@@ -560,6 +591,9 @@ def build_code_context(
 
     candidates = list(seed_candidates)
     uncertainties: list[dict] = []
+    if build_context is not None:
+        uncertainties.extend({"target": build_context.target or "build target", "reason": reason}
+                             for reason in build_context.summary()["unknowns"])
     graph_status = str(graph_status)
     relationship_category = None
     if graph is None:
@@ -590,6 +624,9 @@ def build_code_context(
         # 放最前面:_dedupe_uncertainties 的上限裁尾,這條必須永遠留著。
         uncertainties.insert(0, relationship_unavailable_uncertainty(relationship_category))
 
+    if build_context is not None:
+        candidates = [candidate for candidate in candidates if build_context.state_for(
+            candidate.path, candidate.anchor_line) != "inactive"]
     ranked = rank_with_file_diversity(merge_candidate_ranges(candidates))
     discarded = ranked[_MAX_CANDIDATES:]
     ranked = ranked[:_MAX_CANDIDATES]
@@ -606,6 +643,8 @@ def build_code_context(
 
     for candidate in ranked:
         text = read_window(candidate.path, candidate.start_line, candidate.end_line)
+        if build_context is not None and isinstance(text, str):
+            text = build_context.filter_window(candidate.path, text)
         if not isinstance(text, str) or text.startswith("錯誤:"):
             uncertainties.append({
                 "target": f"{candidate.path}:{candidate.start_line}",
@@ -621,6 +660,8 @@ def build_code_context(
             if target_lines < span:
                 selected = _shrink_candidate(candidate, target_lines)
                 text = read_window(selected.path, selected.start_line, selected.end_line)
+                if build_context is not None and isinstance(text, str):
+                    text = build_context.filter_window(selected.path, text)
                 truncated = True
         if not isinstance(text, str) or text.startswith("錯誤:"):
             uncertainties.append({
@@ -654,6 +695,11 @@ def build_code_context(
             "reason": "; ".join(selected.reasons),
             "text": text,
         })
+        if build_context is not None:
+            states = {build_context.state_for(selected.path, int(match[1]))
+                      for line in text.splitlines()
+                      if (match := re.match(r"\s*(\d+)\s*\|", line))}
+            evidence[-1]["build_state"] = "active" if states == {"active"} else "unknown"
         used_chars += len(text)
 
     if candidate_limit_reasons:
@@ -676,7 +722,7 @@ def build_code_context(
             "reason": f"character budget omitted evidence types: {summary}",
         })
 
-    return {
+    result = {
         "query": str(query),
         "evidence": evidence,
         "uncertainties": _dedupe_uncertainties(uncertainties),
@@ -686,3 +732,7 @@ def build_code_context(
         "budget_chars": budget,
         "used_chars": used_chars,
     }
+    if build_context is not None:
+        build_context.assert_fresh()
+        result["build_context"] = build_context.summary()
+    return result

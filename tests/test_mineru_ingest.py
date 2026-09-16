@@ -75,9 +75,13 @@ def test_mineru_preflight_never_opens_kb_or_converts_text(tmp_path, monkeypatch)
 
 
 def test_mineru_conversion_failure_precedes_cache_migration(tmp_path, monkeypatch):
+    import media
+
     pdf = tmp_path / "spec.pdf"
     pdf.write_bytes(b"fixture")
-    monkeypatch.setattr(RAG, "_load_mineru_input", lambda *a: object())
+    monkeypatch.setattr(media, "_SANDBOX_ROOT", tmp_path.resolve())
+    artifact = SimpleNamespace(content_list_sha256="a" * 64)
+    monkeypatch.setattr(RAG, "_load_mineru_input", lambda *a: artifact)
     monkeypatch.setattr(RAG, "load_knowledge_base", _forbidden)
 
     def reject(*args, **kwargs):
@@ -87,7 +91,12 @@ def test_mineru_conversion_failure_precedes_cache_migration(tmp_path, monkeypatc
     with pytest.raises(mineru_lane.MineruLaneError, match="no unique owner"):
         RAG.add_document(str(pdf), str(tmp_path / "knowledge.json"),
                          mineru_content_list="content_list.json", mineru_pdf_sha256="a" * 64)
-    assert set(tmp_path.iterdir()) == {pdf}
+    # 失敗進度可以持久化；live KB、figures、cache 仍完全不得建立。
+    private_root = tmp_path / ".codetrail"
+    assert set(tmp_path.iterdir()) == {pdf, private_root}
+    assert set(private_root.iterdir()) == {private_root / "ingest"}
+    checkpoint = private_root / "ingest"
+    assert checkpoint.is_dir() and checkpoint.stat().st_mode & 0o077 == 0
 
 
 @pytest.mark.parametrize("fail_on", [1, 2, 3])

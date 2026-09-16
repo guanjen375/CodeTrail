@@ -74,6 +74,8 @@ class ClientSettings:
     permission: dict[str, str] = field(default_factory=dict)
     #: 主模型端點非 loopback 時,才放行送出 prompt。
     model_remote_ok: bool = False
+    #: Exact per-role authorization. Deployment URLs themselves grant nothing.
+    model_endpoints: dict[str, str] = field(default_factory=dict)
     #: KB chunk 脈絡生成非 loopback 時,才放行送出**整份文件的窗**。
     #: 與上面那個是**兩個**鍵:資料範圍不同(prompt vs 整份文件),合併會把前者的
     #: 同意無聲擴大成後者。
@@ -110,6 +112,7 @@ class ClientSettings:
             "compaction_mode": self.compaction_mode,
             "permission": dict(self.permission),
             "model_remote_ok": self.model_remote_ok,
+            "model_endpoints": dict(self.model_endpoints),
             "kb_context_remote_ok": self.kb_context_remote_ok,
             "external_import": self.external_import,
             "external_import_roots": list(self.external_import_roots),
@@ -176,7 +179,7 @@ _TEXT_KEYS = ("objdump",)
 #: 全部合法鍵。**未知鍵 fail-loud** —— 寫錯鍵名靜默忽略,就是「我設了但沒生效」
 #: 與「我設對了」長得一模一樣。
 KNOWN_KEYS = frozenset(
-    {"schema", "compaction_mode", "permission", "external_import_roots"}
+    {"schema", "compaction_mode", "permission", "external_import_roots", "model_endpoints"}
     | set(_BOOL_KEYS)
     | set(_CHOICE_KEYS)
     | set(_TEXT_KEYS)
@@ -241,6 +244,12 @@ def _validate(value: Any, path: Path) -> dict[str, Any]:
         permission[tool] = decision
 
     fields: dict[str, Any] = {"compaction_mode": mode, "permission": permission}
+    if "model_endpoints" in value:
+        from endpoint_policy import validate_model_endpoints, EndpointPolicyError
+        try:
+            fields["model_endpoints"] = validate_model_endpoints(value["model_endpoints"])
+        except EndpointPolicyError as exc:
+            raise ClientConfigError(f"{path}: {exc}") from exc
     defaults = ClientSettings(path=path)
     for key in _BOOL_KEYS:
         if key in value:
@@ -361,6 +370,7 @@ def apply_to_config(settings: ClientSettings, *, readonly: bool = False) -> None
     config.EXTERNAL_IMPORT_ROOTS = list(settings.external_import_roots)
     config.KB_CONTEXT_REMOTE_OK = settings.kb_context_remote_ok
     config.MODEL_REMOTE_OK = settings.model_remote_ok
+    config.MODEL_ENDPOINTS = dict(settings.model_endpoints)
     config.RERANK_FALLBACK_POLICY = settings.rerank_fallback_policy
     config.PROJECT_INSTRUCTIONS_ENABLED = settings.project_instructions
     config.OBJDUMP = settings.objdump

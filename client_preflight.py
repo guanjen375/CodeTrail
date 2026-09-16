@@ -170,6 +170,12 @@ def check_deployment_profile(result: Preflight) -> Any:
         f"deployment profile={profile.selected_profile or 'defaults'}"
         f" verification={profile.verification}"
     )
+    result.note(f"deployment topology={profile.mode}")
+    if profile.mode == "client":
+        import endpoint_policy
+        for role, service in profile.services.items():
+            endpoint_policy.ensure_allowed(service.base_url, role, split=True)
+            result.note(f"{role} endpoint={service.base_url} model={service.model}")
     return profile
 
 
@@ -194,6 +200,8 @@ def resolve_model(result: Preflight, profile: Any) -> str:
 
     換模型 = 重跑 `./set_config.sh`:llama-server 一啟動就鎖死一顆模型,
     「在對話裡換模型」這回事不存在,留一個旗標只會讓兩邊不一致。
+    ``profile=None`` 仍由目前部署檔解析模式,不可把省略參數當成本機模式
+    而跳過分離部署的 live identity 驗證。
     """
     import model_resolution
 
@@ -209,7 +217,20 @@ def resolve_model(result: Preflight, profile: Any) -> str:
             "deployment profile 沒有 main.model。CodeTrail 不內建、不推薦主模型:\n"
             "  請先下載一顆 GGUF、啟動 llama-server,再跑 ./set_config.sh。"
         )
+    if profile is None:
+        deployment_profile = _profile_module()
+        try:
+            profile = deployment_profile.load_effective_profile(profile_env())
+        except deployment_profile.ProfileError as exc:
+            raise PreflightError(f"deployment profile 無法載入:{exc}") from exc
     result.model = resolved.model
+    if profile.mode == "client":
+        from model_identity import capture_model_identity, ModelIdentityError
+        try:
+            identity = capture_model_identity("main", profile=profile)
+        except ModelIdentityError as exc:
+            raise PreflightError(str(exc)) from exc
+        result.note(f"main live identity={identity['fingerprint'][:16]} ({identity['identity_kind']})")
     result.note(f"model={resolved.model}")
     return resolved.model
 
@@ -470,7 +491,7 @@ def run(root: Path, *, skip_tool_health: bool = False) -> Preflight:
             check_ctx_safety(result, profile, requested)
             render_lessons(result)
             check_required_servers(result)
-            hint = legacy_web_backend_hint()
+            hint = "" if profile.mode == "client" else legacy_web_backend_hint()
             if hint:
                 # keep:那個 backend 占著 port、一個 MCP 子行程與一個模型 slot,
                 # 而它不會自己停。三行是一則訊息。

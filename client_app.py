@@ -85,6 +85,8 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("/session", "選一個既有對話切換(/session <id> 直接指定)"),
     ("/resume", "接續一個既有對話(/resume <id>)"),
     ("/compact", "立刻壓縮目前對話"),
+    ("/queue", "待送訊息:list / add / edit / cancel / resume"),
+    ("/supplement", "補充目前任務(/supplement <文字>,安全點才送入)"),
     ("/status", "目前模型、context、壓縮模式與 session 位置"),
     ("/tools", "本輪暴露的工具(裸名,依 tools/list 順序)"),
     ("/thinking", "切換是否顯示模型的 thinking"),
@@ -94,6 +96,7 @@ COMMANDS: tuple[tuple[str, str], ...] = (
 HELP_TAIL = (
     "其他輸入一律當成問題送給模型。\n"
     "Enter 送出、Alt+Enter 換行、↑/↓ 翻輸入歷史。\n"
+    "忙碌時 Enter 選擇排到下一輪或補充目前任務;未送訊息用 /queue 查看。\n"
     "回合進行中 Ctrl-C 中斷整輪;閒置時連按兩次 Ctrl-C 或 Ctrl-D 離開。"
 )
 
@@ -404,13 +407,15 @@ class ApprovalScreen(ModalScreen[bool]):
 
     BINDINGS = [
         Binding("escape", "deny", "拒絕", show=False),
-        Binding("y", "allow", "允許", show=False),
-        Binding("n", "deny", "拒絕", show=False),
+        Binding("y", "allow_key", "允許", show=False),
+        Binding("n", "deny_key", "拒絕", show=False),
     ]
 
-    def __init__(self, ticket: client_turns.ApprovalTicket) -> None:
+    def __init__(self, ticket: client_turns.ApprovalTicket, *, turn_id: str = "") -> None:
         super().__init__()
         self.ticket = ticket
+        self.turn_id = turn_id
+        self._editing_message = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="approval"):
@@ -424,13 +429,54 @@ class ApprovalScreen(ModalScreen[bool]):
             with Horizontal(id="approval-buttons"):
                 yield Button("允許 (y)", id="approval-allow", variant="success")
                 yield Button("拒絕 (n / Esc)", id="approval-deny", variant="error")
+                yield Button("加入訊息", id="approval-message")
+            with Vertical(id="approval-message-box"):
+                yield TextArea(id="approval-message-text")
+                with Horizontal(id="approval-message-actions"):
+                    yield Button("排到下一輪", id="approval-queue")
+                    yield Button("補充目前任務", id="approval-supplement")
             yield Static(
                 Text("Esc 只拒絕這個工具,這一輪繼續;Ctrl-C 中斷整輪。", style="dim"),
                 id="approval-hint",
             )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "approval-allow")
+        button = event.button.id
+        if button == "approval-message":
+            self._editing_message = True
+            self.query_one("#approval-message-box").display = True
+            self.query_one("#approval-message-text", TextArea).focus()
+            return
+        if button in ("approval-queue", "approval-supplement"):
+            editor = self.query_one("#approval-message-text", TextArea)
+            try:
+                self.app.coordinator.enqueue(
+                    editor.text, mode="supplement" if button == "approval-supplement" else "queue",
+                    session_id=self.ticket.request.session_id, turn_id=self.turn_id,
+                )
+            except client_turns.QueueError as exc:
+                self.app._append(NoticeLine(str(exc)))
+                return
+            self.app.query_one("#prompt", PromptInput).remember(editor.text)
+            editor.text = ""
+            self.query_one("#approval-message-box").display = False
+            self._editing_message = False
+            self.query_one("#approval-deny", Button).focus()
+            return
+        if button in ("approval-allow", "approval-deny"):
+            self.dismiss(button == "approval-allow")
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        # Typing y/n in the message editor must never answer a tool approval.
+        if action in ("allow_key", "deny_key"):
+            return not self._editing_message
+        return True
+
+    def action_allow_key(self) -> None:
+        self.action_allow()
+
+    def action_deny_key(self) -> None:
+        self.action_deny()
 
     def action_allow(self) -> None:
         self.dismiss(True)
@@ -487,6 +533,31 @@ class SessionPickerScreen(ModalScreen[str | None]):
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         event.stop()
         self.dismiss(event.option_id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class QueueChoiceScreen(ModalScreen[str | None]):
+    """Choose an input's meaning explicitly, without stopping current work."""
+
+    BINDINGS = [Binding("escape", "cancel", "保留草稿", show=False)]
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.text = text
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="queue-choice"):
+            yield Static(Text("這一輪還在跑,這則訊息要如何處理？", style="bold"))
+            with VerticalScroll(id="queue-choice-body"):
+                yield Static(Text(self.text))
+            yield Button("排到下一輪", id="queue-next", variant="primary")
+            yield Button("補充目前任務", id="queue-supplement")
+            yield Static(Text("補充只在下一模型步驟前送入;本輪已收尾時保留到下一輪。Esc 保留草稿。"))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss("supplement" if event.button.id == "queue-supplement" else "queue")
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -647,10 +718,18 @@ class CodeTrailApp(App[int]):
     #approval-body { height: 1fr; border: round $primary-darken-2; padding: 0 1; }
     #approval-buttons { height: auto; padding: 1 0 0 0; }
     #approval-buttons Button { margin: 0 2 0 0; }
+    #approval-message-box { display: none; height: 7; }
+    #approval-message-text { height: 4; }
+    #approval-message-actions { height: 3; }
     #picker {
         width: 90%; height: 80%; border: thick $primary; background: $surface; padding: 1 2;
     }
     #picker-list { height: 1fr; }
+    #queue-choice {
+        width: 85%; height: 80%; border: thick $primary; background: $surface; padding: 1 2;
+    }
+    #queue-choice-body { height: 1fr; }
+    #queue-choice Button { margin-top: 1; width: 100%; }
     """
 
     BINDINGS = [
@@ -691,6 +770,7 @@ class CodeTrailApp(App[int]):
         self._reasoning: ReasoningBlock | None = None
         self._tools: dict[str, ToolBlock] = {}
         self._approval_screens: dict[str, ApprovalScreen] = {}
+        self._queue_revisions: dict[str, int] = {}
         self._turn_started: float | None = None
         self._spinner = 0
         #: 本次模型請求收到幾段 reasoning、有沒有開始吐答案。preparing 只重置
@@ -867,6 +947,9 @@ class CodeTrailApp(App[int]):
     # ---- 事件 ----------------------------------------------------------
     def handle_event(self, event: Mapping[str, Any]) -> None:
         kind = event.get("type")
+        if kind == client_events.TYPE_QUEUE:
+            self._on_queue_event(event)
+            return
         if kind == client_events.TYPE_ACTIVITY:
             self._on_activity(event)
             return
@@ -900,6 +983,33 @@ class CodeTrailApp(App[int]):
         if kind == client_events.TYPE_STEP_FINISH:
             self._on_step_finish(event)
             return
+
+    def _on_queue_event(self, event: Mapping[str, Any]) -> None:
+        if event.get("sessionID") != self.engine.session_id:
+            return
+        part = client_events.event_part(event)
+        message_id = str(part.get("id", ""))
+        revision = part.get("revision")
+        if not isinstance(revision, int) or revision <= self._queue_revisions.get(message_id, 0):
+            return
+        self._queue_revisions[message_id] = revision
+        # The coordinator keeps only a bounded receipt history; so does the UI.
+        retained = {item.id for item in self.coordinator.queue_snapshot()}
+        self._queue_revisions = {key: value for key, value in self._queue_revisions.items() if key in retained}
+        status = str(part.get("status", ""))
+        if status == "delivered":
+            self._append(UserMessage(str(part.get("text", ""))))
+            self._assistant = None
+            self._reasoning = None
+        elif status == "delivering" and part.get("id"):
+            self._turn_started = time.monotonic()
+            self._reset_phase()
+        labels = {"waiting": "等待送入", "deferred": "待下一輪", "delivering": "接收中",
+                  "delivered": "已送達歷史", "cancelled": "已取消"}
+        mode = "補充" if part.get("mode") == "supplement" else "排隊"
+        self._append(NoticeLine(
+            f"{message_id} {mode}:{labels.get(status, status)}。{part.get('reason', '')}"))
+        self._refresh_status()
 
     def _on_activity(self, event: Mapping[str, Any]) -> None:
         """只收本輪的短暫活動;它不進對話區,也不重播到別段 session。"""
@@ -994,11 +1104,24 @@ class CodeTrailApp(App[int]):
 
     # ---- 核准 ----------------------------------------------------------
     def _show_approval(self, ticket: client_turns.ApprovalTicket) -> None:
-        screen = ApprovalScreen(ticket)
+        screen = ApprovalScreen(ticket, turn_id=self.coordinator.turn_id)
         self._approval_screens[ticket.approval_id] = screen
 
         def _answered(granted: bool | None) -> None:
             self._approval_screens.pop(ticket.approval_id, None)
+            # A timeout/cancel may close approval while its message draft is
+            # still being edited. Preserve that unsent text without sending it.
+            try:
+                draft = screen.query_one("#approval-message-text", TextArea).text
+                if draft.strip():
+                    prompt = self.query_one("#prompt", PromptInput)
+                    if not prompt.text.strip():
+                        prompt.text = draft
+                    else:
+                        prompt.remember(draft)
+                        self._append(NoticeLine("核准框中的未送草稿已保留在輸入歷史。"))
+            except Exception:  # noqa: BLE001 - the screen may already be unmounted
+                pass
             # 只認真的 bool。dismiss 沒帶值(畫面被收掉)一律當拒絕。
             self.coordinator.answer_approval(ticket.approval_id, granted is True)
 
@@ -1028,8 +1151,11 @@ class CodeTrailApp(App[int]):
         if not text:
             return
         if text.startswith("/"):
-            self._consume_prompt(prompt, message.text)
-            self._command(text)
+            if text.split(maxsplit=1)[0].lower() not in ("/queue", "/supplement"):
+                self._consume_prompt(prompt, message.text)
+                self._command(text)
+            elif self._command(text):
+                self._consume_prompt(prompt, message.text)
             return
         # 送不出去(這一輪還在跑)時輸入框要**留著**原文:清掉再顯示一則其實沒送出的
         # 問題,使用者只能自己重打。
@@ -1051,7 +1177,7 @@ class CodeTrailApp(App[int]):
         try:
             self.coordinator.start_turn(text)
         except client_turns.TurnCoordinator.Busy:
-            self._append(NoticeLine("這一輪還在跑;Ctrl-C 可以中斷它。"))
+            self._choose_message_mode(text)
             self._refresh_completions()
             return False
         except Exception as exc:  # noqa: BLE001 - 送不出去不得帶走 UI
@@ -1065,16 +1191,71 @@ class CodeTrailApp(App[int]):
         self._refresh_completions()
         return True
 
+    def _choose_message_mode(self, text: str) -> None:
+        target, turn_id = self.engine.session_id, self.coordinator.turn_id
+
+        def _chosen(mode: str | None) -> None:
+            if mode is None:
+                return
+            try:
+                self.coordinator.enqueue(text, mode=mode, session_id=target, turn_id=turn_id)
+            except (client_turns.QueueError, client_turns.TurnCoordinator.Busy) as exc:
+                self._append(NoticeLine(str(exc)))
+                return
+            prompt = self.query_one("#prompt", PromptInput)
+            if prompt.text.strip() == text:
+                self._consume_prompt(prompt, prompt.text)
+            else:
+                prompt.remember(text)
+            self._refresh_completions()
+
+        self.push_screen(QueueChoiceScreen(text), _chosen)
+
     # ---- 指令 ----------------------------------------------------------
-    def _command(self, line: str) -> None:
+    def _command(self, line: str) -> bool:
         name, _, argument = line[1:].partition(" ")
         name = name.strip().lower()
         argument = argument.strip()
         handler = getattr(self, f"_cmd_{name}", None)
         if handler is None:
             self._append(NoticeLine(f"未知指令 /{name};/help 看清單。"))
-            return
-        handler(argument)
+            return True
+        return handler(argument) is not False
+
+    def _cmd_queue(self, argument: str) -> bool:
+        action, _, rest = argument.partition(" ")
+        action = action or "list"
+        try:
+            if action == "list":
+                entries = self.coordinator.queue_snapshot()
+                lines = [f"{item.id} [{item.status}] {item.mode} session={item.session_id} "
+                         f"turn={item.turn_id or '-'}\n{item.text}\n{item.reason}" for item in entries]
+                state = "暫停; /queue resume 繼續" if self.coordinator.queue_paused else "依序等待"
+                self._append(NoticeLine(f"待送佇列:{state}\n" + ("\n\n".join(lines) or "(沒有項目)")))
+            elif action == "add":
+                self.coordinator.enqueue(rest, mode="queue")
+            elif action == "edit":
+                message_id, _, text = rest.partition(" ")
+                self.coordinator.edit_queued(message_id, text)
+            elif action == "cancel":
+                self.coordinator.cancel_queued(rest.strip())
+            elif action == "resume":
+                if not self.coordinator.resume_queue():
+                    self._append(NoticeLine("沒有可繼續的待送訊息。"))
+            else:
+                raise client_turns.QueueError("用法:/queue list | add <文字> | edit <id> <文字> | cancel <id> | resume")
+        except (client_turns.QueueError, client_turns.TurnCoordinator.Busy) as exc:
+            self._append(NoticeLine(str(exc) or "回合忙碌中,請等本輪結束再 resume。"))
+            return False
+        return True
+
+    def _cmd_supplement(self, argument: str) -> bool:
+        try:
+            self.coordinator.enqueue(argument, mode="supplement")
+        except client_turns.QueueError as exc:
+            self._append(NoticeLine(str(exc)))
+            return False
+        return True
 
     def _cmd_help(self, _argument: str) -> None:
         lines = [f"  {name:<11}{description}" for name, description in COMMANDS]
@@ -1108,12 +1289,18 @@ class CodeTrailApp(App[int]):
         ``/new``、``/resume`` 與 ``/session`` 直接換掉 ``engine.session_id`` 與 ``messages``:
         在回合中做等於把還沒寫完的答案與自動壓縮落到**另一段**對話,舊對話留下
         一則沒有回答的 user,新對話多出一則沒有相鄰 user 的 assistant。
-        只有 UI 執行緒會開始新回合,所以這裡的判斷不會有 idle→busy 的競態。
+        排隊 worker 也會開始新回合,所以閒置時仍須檢查 pending 佇列:
+        有待送項目就不准切换;沒有項目時背景也沒有可啟動的下一輪。
         """
-        if not self.coordinator.busy:
-            return False
-        self._append(NoticeLine(f"這一輪還在跑,{what} 要等它結束;Ctrl-C 可以中斷它。"))
-        return True
+        if self.coordinator.busy:
+            self._append(NoticeLine(f"這一輪還在跑,{what} 要等它結束;Ctrl-C 可以中斷它。"))
+            return True
+        try:
+            self.coordinator.assert_session_change_allowed()
+        except (client_turns.QueueError, client_turns.TurnCoordinator.Busy) as exc:
+            self._append(NoticeLine(f"{what}: {exc}"))
+            return True
+        return False
 
     def _cmd_new(self, _argument: str) -> None:
         if self._busy_notice("/new"):
@@ -1124,6 +1311,7 @@ class CodeTrailApp(App[int]):
             self._append(ErrorLine(f"無法開新對話:{exc}(仍在 {self.engine.session_id})"))
             return
         self.coordinator.session_changed()
+        self._queue_revisions.clear()
         # 新對話的 prefix 只剩 system 段:server 那邊對它多半是冷的,先送出去。
         self._prime("new")
         # 工具 block 以 call id 當 key;換了對話,舊 id 不得再被新呼叫接上。
@@ -1204,6 +1392,7 @@ class CodeTrailApp(App[int]):
             return
         self.engine.adopt(snapshot)
         self.coordinator.session_changed()
+        self._queue_revisions.clear()
         # 換過去的那段歷史就是下一輪的 prefix,而它剛剛才進 engine:先送預熱,
         # 使用者接著問的第一題就不必從頭 prefill 整段對話。
         self._prime("session")
@@ -1224,6 +1413,9 @@ class CodeTrailApp(App[int]):
         except client_turns.TurnCoordinator.Busy:
             self._append(NoticeLine("這一輪還在跑;Ctrl-C 可以中斷它。"))
             return
+        except client_turns.QueueError as exc:
+            self._append(NoticeLine(str(exc)))
+            return
         self._turn_started = time.monotonic()
         self._reset_phase(compacting=True)
         self._refresh_status()
@@ -1240,6 +1432,8 @@ class CodeTrailApp(App[int]):
             f"專案指示={'已載入' if self._project_instructions() else '未載入'}",
             f"舊回合 reasoning={'送模' if self.keep_historical_reasoning else '不進模型'}",
             f"prompt cache 預熱={self._prime_status()}",
+            f"待送訊息={len(self.coordinator.queue_snapshot(pending_only=True))}"
+            f"({'暫停, /queue resume' if self.coordinator.queue_paused else '依序等待'})",
         ]
         if self.engine.store_error:
             lines.append(
@@ -1267,6 +1461,8 @@ class CodeTrailApp(App[int]):
         """Ctrl-C。選單開著 = 只收選單;回合進行中 = 中斷整輪;閒置 = 連按兩次離開。"""
         if self._close_picker():
             return
+        if isinstance(self.screen, QueueChoiceScreen):
+            self.screen.dismiss(None)
         # block=False:MCP 取消要等寬限期(10 秒)+ SIGTERM + 重新 spawn。
         # 同步跑在這裡就是整個畫面凍住,而且 worker 送事件用的
         # call_from_thread 也會排在後面一起卡住。
@@ -1300,6 +1496,9 @@ class CodeTrailApp(App[int]):
         if isinstance(self.screen, ApprovalScreen):
             self.screen.action_deny()
             return
+        if isinstance(self.screen, QueueChoiceScreen):
+            self.screen.dismiss(None)
+            return
         if self._close_picker():
             return
         if self._busy_notice("Ctrl-D"):
@@ -1312,6 +1511,8 @@ class CodeTrailApp(App[int]):
         `App.on_unmount` 靠不住 —— Textual 拆畫面時子 widget 已經先移除,
         `query_one("#prompt")` 會失敗,於是正常退出的路徑一個 byte 都沒寫。
         """
+        if self._busy_notice("離開"):
+            return
         self._save_history()
         self.exit(self.exit_code)
 
@@ -1451,6 +1652,9 @@ class CodeTrailApp(App[int]):
         if getattr(self.engine, "priming", False):
             # 預熱握著模型鎖:這時候送出的下一題會在鎖上等它送完,狀態列要講得出來。
             parts.append("prompt cache 預熱中")
+        pending = self.coordinator.queue_snapshot(pending_only=True)
+        if pending:
+            parts.append(f"待送={len(pending)}" + ("(暫停,/queue resume)" if self.coordinator.queue_paused else ""))
         self.status_text = " · ".join(parts)
         bar.update(Text(self.status_text))
 

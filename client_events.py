@@ -50,6 +50,8 @@ TYPE_TEXT_DELTA = "text_delta"
 #: 等待階段與 prompt 進度。只經 TUI 的活動回呼,不進 headless JSONL、session
 #: 或模型歷史;固定階段／數值／工具名以外不攜帶 prompt 或模型輸出。
 TYPE_ACTIVITY = "activity"
+# Local TUI queue state. This is neither assistant output nor a terminal event.
+TYPE_QUEUE = "message_queue"
 
 STATUS_COMPLETED = "completed"
 STATUS_ERROR = "error"
@@ -95,6 +97,15 @@ def text_event(session_id: str, text: str) -> dict[str, Any]:
         "sessionID": session_id,
         "part": {"type": "text", "text": text},
     }
+
+
+def queue_event(session_id: str, item: Mapping[str, Any]) -> dict[str, Any]:
+    """A local input's state; only delivered items carry their accepted text."""
+    part = dict(item)
+    part["type"] = "message-queue"
+    if part.get("status") != "delivered":
+        part.pop("text", None)
+    return {"type": TYPE_QUEUE, "sessionID": session_id, "part": part}
 
 
 def tool_event(

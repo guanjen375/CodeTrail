@@ -22,7 +22,7 @@ aicode
 並且先在 `~/.config/codetrail/client.json` 設 `"project_instructions": false`
 (見下面「不信任 repo 的安全模式」)。
 
-客戶端**只**暴露 CodeTrail 的 19 個 MCP 工具:沒有第二套內建的 shell / 檔案 / web 工具
+客戶端**只**暴露 CodeTrail 的 21 個 MCP 工具:沒有第二套內建的 shell / 檔案 / web 工具
 可以繞過沙箱。要更嚴的話,`~/.config/codetrail/client.json` 的 `permission` 可以把任何
 工具改成 `ask` 或 `deny`(只能收緊,不能放寬 readonly policy)。
 
@@ -46,8 +46,17 @@ aicode
 
 模型能呼叫的就只有上面這些:客戶端把 `tools/list` 的結果原樣交給模型,沒有另一組不經過
 CodeTrail 的內建工具。互動模式下 `apply_patch` / `run_lint` / `run_command` /
-`remove_document` / `record_lesson` / `review_figures` 六個必須人工核准,核准框**完整顯示
+`remove_document` / `record_lesson` / `review_figures` / `review_text` / `import_external_file` 八個必須人工核准,核准框**完整顯示
 參數**(含整份 patch)。
+
+`query_table` 是唯讀證據工具；`review_text` 因包含修改與確認操作而採 ask，readonly server
+會拒絕。入庫進行中兩者都回 busy，避免查到正在替換的版本。OCR 確認綁內容與來源身分，
+新內容不能沿用舊確認。checkpoint 保存在 repo 的私有 `.codetrail/ingest/`，不受 figure
+retention 刪除影響；其中含文件內容，應按知識庫相同方式管理存取。
+
+A／B 模式的四個目的地必須另獲 owner-only `client.json` 精確授權；不使用第三方 provider、
+環境 proxy／netrc 或 HTTP redirect。KB 脈絡生成另受 `kb_context_remote_ok` 控制。
+網路隔離與 A 只允許 B 連線的 ACL 仍由部署者設定，見 [分離部署](split-deployment.md)。
 
 ---
 
@@ -92,7 +101,7 @@ system prompt 由客戶端組,順序固定:內建基底規則(`client_prompt.BAS
 `~/.config/codetrail/instructions.md`。每一個來源檔都以 `O_NOFOLLOW` + `fstat` 讀,而且
 **父目錄**被 symlink 重導就 fail-loud —— 只驗最終檔案擋不住「把 `.codetrail` 換成 symlink」。
 
-system prompt 不是 permission:它不會讓被 `deny` 的工具變成可用,也不會繞過六個 ask 工具的
+system prompt 不是 permission:它不會讓被 `deny` 的工具變成可用,也不會繞過八個 ask 工具的
 人工核准。權限的唯一來源是 `client_policy` 加上 `client.json` 的 `permission` 覆寫,
 而 readonly session 另有第二層(MCP server 自己以 `--readonly` 起 —— 一個 argv 旗標,
 `client.json` 把 `build_commands` 開起來也翻不回來)。
@@ -191,7 +200,7 @@ call site、doctor / preflight 與 secret redaction，不能只手動在單一 s
 ## 快速檢查表
 
 - 從具體專案目錄跑 `aicode`,不要從 `$HOME` 或 `/`。
-- 確認啟動前有 `MCP PASS — 19 tools + list_dir round-trip`；implicit 非 optimal 只代表
+- 確認啟動前有 `MCP PASS — 21 tools + list_dir round-trip`；implicit 非 optimal 只代表
   routing 診斷警告，explicit failure 則會拒絕啟動。
 - 不信任 repo 時在 `client.json` 設 `"project_instructions": false`。
 - 要更嚴的權限時,用 `~/.config/codetrail/client.json` 的 `permission`(只能收緊)。

@@ -174,7 +174,9 @@ def prune_old_tool_outputs(messages: Sequence[Mapping[str, Any]]) -> tuple[list[
     return out, len(candidates)
 
 
-_INTERNAL_KEYS = frozenset({"time", "tool_status", "synthetic", "structured", "call_index"})
+_INTERNAL_KEYS = frozenset({
+    "time", "tool_status", "synthetic", "structured", "call_index", "queue_id", "delivery_mode",
+})
 
 
 def pending_tool_call_ids(messages: Sequence[Mapping[str, Any]]) -> list[tuple[str, str]]:
@@ -745,6 +747,29 @@ class Engine:
         self._session_switching = 0
         # UI activity is separate from persisted messages and headless events.
         self._activity_callback: Callable[[dict[str, Any]], None] | None = None
+        # Only the interactive coordinator installs this. It is never consulted
+        # by compaction, prime, or the headless client.
+        self._supplement_callback: Callable[[], None] | None = None
+        self._supplement_thread: int | None = None
+
+    def set_supplement_callback(self, callback: Callable[[], None] | None) -> None:
+        self._supplement_callback = callback
+
+    def record_supplement(self, text: str, *, queue_id: str) -> bool:
+        """Accept a real user message at the loop's model boundary.
+
+        Admission and cancellation share the turn lock; disk I/O remains outside
+        that lock. True means accepted into history, not that HTTP has completed.
+        """
+        if self._supplement_thread != threading.get_ident():
+            raise RuntimeError("supplements are only accepted at a model-step boundary")
+        if pending_tool_call_ids(self.messages):
+            raise RuntimeError("cannot insert a user message inside a tool-call group")
+        return self._record(
+            {"role": "user", "content": text, "queue_id": queue_id,
+             "delivery_mode": "supplement"},
+            require_active=True,
+        )
 
     def set_activity_callback(self, callback: Callable[[dict[str, Any]], None] | None) -> None:
         self._activity_callback = callback
@@ -1070,10 +1095,16 @@ class Engine:
         self.adopt(snapshot)
         return snapshot
 
-    def _record(self, message: Mapping[str, Any]) -> None:
+    def _record(self, message: Mapping[str, Any], *, require_active: bool = False) -> bool:
         payload = dict(message)
         payload.setdefault("time", time.time())
-        self.messages.append(payload)
+        if require_active:
+            with self._turn_state:
+                if self._cancel.is_set() or self._in_turn == 0 or self._turn_completed:
+                    return False
+                self.messages.append(payload)
+        else:
+            self.messages.append(payload)
         try:
             self.store.append(self.session_id, {"type": "message", **payload})
         except Exception as exc:  # noqa: BLE001
@@ -1081,6 +1112,7 @@ class Engine:
             # 在記憶體裡,使用者照常問下去,重開之後整段消失而且從來沒有警告。
             if self.store_error is None:
                 self.store_error = f"{type(exc).__name__}: {exc}"
+        return True
 
     # ---- payload -------------------------------------------------------
     def payload_messages(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1410,6 +1442,7 @@ class Engine:
         on_text: Callable[[str], None] | None = None,
         on_reasoning: Callable[[str], None] | None = None,
         approve: Callable[[ApprovalRequest], bool] | None = None,
+        on_user_recorded: Callable[[], None] | None = None,
     ) -> TurnResult:
         emit = on_event or (lambda _event: None)
         # 旗標**不在這裡清**:協調器的 cancel 可能在 worker 還沒進到 send() 之前就到,
@@ -1421,7 +1454,13 @@ class Engine:
         self._begin_turn()
         try:
             self.heal_pending_tool_calls()
-            self._record({"role": "user", "content": text})
+            accepted = self._record(
+                {"role": "user", "content": text}, require_active=on_user_recorded is not None,
+            )
+            if not accepted:
+                raise TurnCancelled("待送訊息尚未接收,這一輪已被中斷")
+            if on_user_recorded is not None:
+                on_user_recorded()
             return self.run_tool_loop(
                 on_event=emit, on_text=on_text, on_reasoning=on_reasoning, approve=approve
             )
@@ -1675,6 +1714,16 @@ class Engine:
         preambles: set[str] = set()
 
         while steps < self.options.max_tool_steps:
+            if self._cancel.is_set():
+                raise TurnCancelled("這一輪已被使用者中斷")
+            # The previous iteration has recorded every result in the declared
+            # tool group. Never poll while HTTP, a tool, or approval is in flight.
+            if self._supplement_callback is not None:
+                self._supplement_thread = threading.get_ident()
+                try:
+                    self._supplement_callback()
+                finally:
+                    self._supplement_thread = None
             if self._cancel.is_set():
                 raise TurnCancelled("這一輪已被使用者中斷")
             # 已有工具步才預留最後一個模型步驟;max=1 保留原本可執行工具的語意。

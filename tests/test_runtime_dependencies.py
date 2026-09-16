@@ -345,7 +345,7 @@ def test_stop_proc_permission_failure_is_not_process_exit(monkeypatch):
 def test_stop_tmux_execution_failure_keeps_port_cleanup_and_returns_nonzero(monkeypatch, failed_command):
     from scripts import stop_servers
 
-    profile = types.SimpleNamespace(service=lambda role:
+    profile = types.SimpleNamespace(mode="local", service=lambda role:
                                     types.SimpleNamespace(port=8080, base_url="http://localhost:8080"))
     monkeypatch.setattr(stop_servers, "load_effective_profile", lambda **kwargs: profile)
     monkeypatch.setattr(stop_servers.shutil, "which", lambda name: "/usr/bin/tmux" if name == "tmux" else None)

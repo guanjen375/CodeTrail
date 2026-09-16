@@ -350,7 +350,7 @@ def test_interactive_policy_asks_for_the_seven_write_tools():
     policy = client_policy.InteractivePolicy()
     assert client_policy.ASK_TOOLS == frozenset(
         {"apply_patch", "run_lint", "run_command", "remove_document", "record_lesson",
-         "review_figures", "import_external_file"}
+         "review_figures", "review_text", "import_external_file"}
     )
     for name in client_policy.ASK_TOOLS:
         assert policy.decide(name, read_only=False, arguments={}) is client_policy.Decision.ASK

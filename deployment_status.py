@@ -153,6 +153,9 @@ _LOCAL_PROBE_OPENER = build_opener(ProxyHandler({}), _NoRedirectHandler())
 
 def query_server(service: ServiceProfile) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     def get(path: str) -> dict[str, Any] | None:
+        import endpoint_policy
+        endpoint_policy.ensure_allowed(f"{service.base_url}{path}", service.role,
+                                       split=service.deployment_mode == "client")
         try:
             with _LOCAL_PROBE_OPENER.open(f"{service.base_url}{path}", timeout=0.75) as response:  # noqa: S310
                 data = json.loads(response.read().decode("utf-8"))
@@ -190,6 +193,31 @@ def inspect_deployment(
     收一份 `environ` —— 這一層要答的正是「server 載入的是不是對的 GGUF」,
     用第二份 registry 去判就是拿別人的答案。
     """
+    if profile.mode == "client":
+        observations = {}
+        issues = []
+        warnings = []
+        from model_identity import capture_model_identity, ModelIdentityError
+        for role, service in profile.services.items():
+            health, props = server_reader(service) if server_reader else (None, None)
+            status = str((health or {}).get("status", "unreachable")) if server_reader else "not-checked"
+            observations[role] = ServiceObservation(
+                role=role, pid=None, gpu_uuids=(), model=str((props or {}).get("model_alias", "")),
+                mmproj="", n_ctx=_props_n_ctx(props or {}), health=status, port=service.port, cmdline=())
+            if server_reader:
+                if status != "ok":
+                    issues.append(f"{role}: health={status}")
+                try:
+                    if not isinstance(props, dict):
+                        raise ModelIdentityError("live /props unavailable")
+                    capture_model_identity(role, profile=profile, props=props)
+                except ModelIdentityError as exc:
+                    issues.append(str(exc))
+                if role == "main" and _props_n_ctx(props or {}) is None:
+                    issues.append("main: live n_ctx unavailable")
+            else:
+                warnings.append(f"{role}: remote live identity/capabilities not checked")
+        return Inspection(observations, (), (), tuple(issues), tuple(warnings))
     inventory = {} if gpu_inventory is None else dict(gpu_inventory)
     rows = tuple(gpu_processes)
     by_pid: dict[int, list[GpuProcess]] = {}

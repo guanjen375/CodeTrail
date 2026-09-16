@@ -139,6 +139,10 @@ def check_server(server: RequiredServer) -> ServerCheck:
         return ServerCheck(server.role, server.url, False, detail)
 
     try:
+        profile = load_effective_profile(_profile_env())
+        if profile.mode == "client":
+            from model_identity import capture_model_identity
+            capture_model_identity(server.role.lower(), profile=profile)
         if server.role == "embedding":
             detail = _check_embedding(server)
         elif server.role == "reranker":
@@ -166,14 +170,20 @@ def render_report(checks: list[ServerCheck], *, prefix: str = "[model-preflight]
         lines.append(
             f"{prefix} refuse to start: embedding, reranker, and VL servers must all be ready."
         )
-        lines.append(
-            f"{prefix} start them with '~/start.sh --scope aux' (main 也沒起就直接 ~/start.sh),"
-            " or fix the endpoints in ~/.config/codetrail/deployment.json and rerun ./set_config.sh."
-        )
+        import config
+        if config.DEPLOYMENT_MODE == "client":
+            lines.append(f"{prefix} repair/start model services on A; check B client.json endpoint authorization and live aliases.")
+        else:
+            lines.append(
+                f"{prefix} start them with '~/start.sh --scope aux' (main 也沒起就直接 ~/start.sh),"
+                " or fix the endpoints in ~/.config/codetrail/deployment.json and rerun ./set_config.sh."
+            )
     return lines
 
 
 def main() -> int:
+    import client_config
+    client_config.apply_to_config(client_config.load_client_settings(), readonly=True)
     checks = run_checks()
     for line in render_report(checks):
         print(line, flush=True)

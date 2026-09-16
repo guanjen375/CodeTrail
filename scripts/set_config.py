@@ -2649,6 +2649,12 @@ def _parser() -> argparse.ArgumentParser:
         description="CodeTrail 一鍵設定:偵測 GPU/模型 → 互動問答(只驗證輸入範圍,"
                     "不用估算擋輸入)→ 產生設定檔與 ~/start.sh",
     )
+    parser.add_argument("--mode", dest="deployment_mode", choices=("local", "model-host", "client"), default="local")
+    parser.add_argument("--endpoint-manifest", type=Path, help="client mode: A export-client JSON; review before authorizing")
+    parser.add_argument("--kb-context-remote-ok", action="store_true", default=None,
+                        help="client mode: independently authorize sending document windows to main")
+    for role in ("main", "embed", "rerank", "vl"):
+        parser.add_argument(f"--{role}-url", help=f"client mode: literal private IP URL for {role}")
     parser.add_argument("--models-dir", help="模型目錄(未指定時用 ~/models)")
     parser.add_argument(
         "--llama-bin",
@@ -2771,10 +2777,82 @@ def _print_summary_page(plan: Plan, python_bin: str,
         print(f"  {note if note.startswith('⚠') else '- ' + note}")
 
 
+def configure_client(args: argparse.Namespace, home: Path) -> int:
+    """B setup: no GPU, model files, tmux, server binary, or network probes."""
+    import endpoint_policy
+    launcher_fields = ("llama_bin", "models_dir", "main_gpu", "embed_gpu", "rerank_gpu", "vl_gpu",
+                       "ctx", "reranker_ctx", "threads", "vl_mmproj", "cpu_moe", "n_cpu_moe",
+                       "vl_cpu_moe", "vl_n_cpu_moe")
+    incompatible = [key for key in launcher_fields if getattr(args, key, None) is not None]
+    if incompatible or args.allow_remote:
+        raise SetupError("client mode does not accept local launcher options: " + ", ".join(incompatible or ["allow_remote"]))
+    roles = {"main": "main", "embedding": "embed", "reranker": "rerank", "vl": "vl"}
+    if args.endpoint_manifest:
+        if any(getattr(args, f"{flag}_url", None) or getattr(args, f"{flag}_model", None)
+               for flag in roles.values()):
+            raise SetupError("--endpoint-manifest cannot be combined with role URL/model flags")
+        try:
+            # Strict profile parser rejects duplicate/unknown keys as well.
+            manifest = load_effective_profile(deployment_config=args.endpoint_manifest)
+        except ProfileError as exc:
+            raise SetupError(str(exc)) from exc
+        if manifest.mode != "client":
+            raise SetupError("endpoint manifest must have mode=client")
+        services = {role: {"base_url": service.base_url, "model": service.model,
+                           "identity_alias": service.identity_alias}
+                    for role, service in manifest.services.items()}
+    else:
+        services = {}
+        for role, flag in roles.items():
+            url = getattr(args, f"{flag}_url", None)
+            model = getattr(args, f"{flag}_model", None)
+            if not url or not model:
+                raise SetupError(f"client mode requires --{flag}-url and --{flag}-model (A versioned alias)")
+            services[role] = {"base_url": url, "model": model, "identity_alias": model}
+    try:
+        grants = endpoint_policy.validate_model_endpoints({r: s["base_url"] for r, s in services.items()})
+    except endpoint_policy.EndpointPolicyError as exc:
+        raise SetupError(str(exc)) from exc
+    for role in roles:
+        services[role]["base_url"] = grants[role]
+    deployment = {"schema_version": 1, "mode": "client", "services": services}
+    deployment_json = json.dumps(deployment, ensure_ascii=False, indent=2) + "\n"
+    validate_payloads(deployment_json, "{}\n")
+    previous = client_config.load_client_settings({"HOME": str(home)})
+    settings = replace(previous, present=True, model_endpoints=grants,
+                       model_remote_ok=False,
+                       compaction_mode=args.compaction_mode or previous.compaction_mode,
+                       kb_context_remote_ok=(previous.kb_context_remote_ok if args.kb_context_remote_ok is None
+                                             else args.kb_context_remote_ok))
+    client_value = settings.as_json()
+    client_config._validate(client_value, settings.path)
+    print("Client deployment B: aicode / MCP / repository / build stay on B")
+    print("Authorize the following exact destinations in owner-only client.json:")
+    print(deployment_json, end="")
+    print(f"Independent document-window authorization: {settings.kb_context_remote_ok}")
+    if not args.yes and not args.dry_run:
+        if input("Authorize these endpoints and write configuration? [y/N] ").strip().lower() != "y":
+            return 0
+    notes: list[str] = []
+    commit_files([
+        (home / ".config/codetrail/deployment.json", deployment_json, 0o644),
+        (settings.path, json.dumps(client_value, ensure_ascii=False, indent=2) + "\n", 0o600),
+    ], notes, args.dry_run, home=home, private=(settings.path,))
+    for note in notes:
+        print(note)
+    print("Start models on A; on B run aicode or python3 scripts/doctor.py.")
+    return 0
+
+
 def run(args: argparse.Namespace) -> int:
     home = Path(os.path.abspath(os.path.expanduser("~")))
     if args.restore_last_backup:
         return restore_last_backup(home, dry_run=args.dry_run)
+    if getattr(args, "deployment_mode", "local") == "client":
+        return configure_client(args, home)
+    if (getattr(args, "endpoint_manifest", None) or getattr(args, "kb_context_remote_ok", None) is not None
+            or any(getattr(args, f"{r}_url", None) for r in ("main", "embed", "rerank", "vl"))):
+        raise SetupError("endpoint URL/manifest flags require --mode client")
 
     # 旗標的早期友善驗證(choose_int 也會擋;這裡在做任何偵測前先給清楚訊息)。
     if args.ctx is not None and not MIN_MAIN_CTX <= args.ctx <= MAX_MAIN_CTX:
@@ -2835,6 +2913,10 @@ def run(args: argparse.Namespace) -> int:
     except client_config.ClientConfigError as exc:
         base_notes.append(f"⚠ {exc}(這次會當成還沒選過壓縮模式)")
         prior_client_settings = client_config.ClientSettings(path=client_config_path)
+    leaving_client = bool(prior_client_settings.model_endpoints)
+    if leaving_client:
+        prior_client_settings = replace(prior_client_settings, model_endpoints={}, model_remote_ok=False)
+        base_notes.append("Switching to local/model-host: remove the previous B endpoint grants; local loopback remains allowed.")
 
     start_path = home / "start.sh"
     if start_path.exists():
@@ -3045,6 +3127,14 @@ def run(args: argparse.Namespace) -> int:
         registry_json = json.dumps(registry, ensure_ascii=False, indent=2) + "\n"
         deployment_config = build_deployment_config(plan)
         merge_existing_deployment(deployment_config, codetrail_dir / "deployment.json", notes)
+        deployment_config["mode"] = getattr(args, "deployment_mode", "local")
+        if deployment_config["mode"] == "model-host":
+            from model_identity import versioned_alias
+            for role, selection in (("main", plan.main), ("embedding", plan.embedding),
+                                    ("reranker", plan.reranker), ("vl", plan.vl)):
+                deployment_config["services"][role]["identity_alias"] = versioned_alias(
+                    role, selection.candidate.path, selection.mmproj)
+            notes.append("A versioned aliases bind artifact hashes; restart after changing weights, then export-client for B.")
         # CPU-MoE + mmap 的首次推論延遲:必須看「合併後真的要寫入」的參數,
         # 否則使用者手動設的 no_mmap(由 merge 帶回)會被誤報成沒設。
         warn_cpu_moe_without_no_mmap(
@@ -3066,6 +3156,8 @@ def run(args: argparse.Namespace) -> int:
         chosen_mode = choose_compaction_mode(
             args.compaction_mode, assume_yes=args.yes, prior_mode=prior_mode
         )
+        if chosen_mode is None and leaving_client:
+            chosen_mode = prior_client_settings.compaction_mode
         derived = None
         client_settings_json = None
         if chosen_mode is None:
@@ -3206,7 +3298,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         return run(args)
-    except SetupError as exc:
+    except (SetupError, client_config.ClientConfigError) as exc:
         print(f"\n[set_config] {exc}", file=sys.stderr)
         return 2
     except compaction_formula.CompactionModeError as exc:

@@ -15,6 +15,9 @@ private repo 分析；**不打算公開發布**成 PyPI package、Docker image �
 很慢。CodeTrail 的 internal LLM、embedding、reranker 與 VL 呼叫都走設定中的
 llama-server HTTP endpoint。
 
+四類模型與工作環境分開時，請用 [A／B 分離部署](docs/split-deployment.md)：
+A 執行模型；B 執行 aicode、MCP、編輯與 build，不需要 GPU 或模型檔。
+
 ## 現有能力與邊界
 
 | 能力 | 現況 | 主要入口 |
@@ -41,6 +44,9 @@ llama-server HTTP endpoint。
 
 ## 🚀 Quick Start(7 步設定完成)
 
+以下是單機 `local` 部署流程。兩台主機請依 [分離部署指南](docs/split-deployment.md)
+分別設定 A 的 `model-host` 與 B 的 `client`，模型安裝與啟動只在 A 進行。
+
 先分清楚兩個路徑：`<CODETRAIL_REPO>` 是本 repo，安裝、設定與 server 管理都在這裡；
 `<PROJECT_TO_ANALYZE>` 是要分析的 firmware / NDA / private repo，最後才在那裡啟動
 `aicode`。命令以 Ubuntu / Debian shell 為主；Windows 建議使用 WSL2 或遠端 Linux GPU
@@ -64,7 +70,7 @@ command -v aicode                            #    應顯示 ~/.local/bin/aicode
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
-aicode        # CodeTrail 終端客戶端;/tools 應列出 19 個工具
+aicode        # CodeTrail 終端客戶端;/tools 應列出 21 個工具
 ```
 
 要從別台電腦操作就用 SSH:登入這台機器之後照樣 `cd <PROJECT_TO_ANALYZE> && aicode`。
@@ -94,7 +100,7 @@ aicode        # CodeTrail 終端客戶端;/tools 應列出 19 個工具
 > 4. **換模型或主 n_ctx 就重跑 `./set_config.sh` + 重啟 server。** llama-server 一啟動就鎖死一顆模型與一個 `-c`;客戶端只會跟隨它,沒有「在對話裡換模型」這回事。主 n_ctx 只填一次;`set_config.sh` 寫進 deployment / server `-c`,`aicode` 啟動時觀測 `/props` 的實值並讓 CodeTrail 的 context 預算跟著它。
 > 5. **啟動後立即 rollback,先看 server log**:`~/start.sh` 前台只會回報 process 已結束,真正根因用 `~/start.sh logs main` 查看;新 GGUF 也可能需要更新並重新 build llama.cpp。詳細判讀與修復見 [docs/troubleshooting.md](docs/troubleshooting.md)。
 > 6. **CodeTrail 沙箱鎖在「你啟動的那個資料夾」** —— 綁在 process 上,**不會跟著你切對話而移動**。換專案 = 到那個目錄重新開一個 `aicode`。沒有 `--root`、沒有環境變數可以改它。
-> 7. **模型只有那 19 個 MCP 工具** —— 客戶端沒有內建的 `bash` / `read` / `write`,所以沙箱邊界就是 MCP server 的邊界。外部匯入與 lessons 是兩個受限例外,見 [docs/security.md](docs/security.md)。分析不信任 repo 時,那個 repo 自帶的 `AGENTS.md` 與 `.codetrail/lessons.md` 會進 system prompt;不想要就在 `~/.config/codetrail/client.json` 設 `"project_instructions": false`。
+> 7. **模型只有那 21 個 MCP 工具** —— 客戶端沒有內建的 `bash` / `read` / `write`,所以沙箱邊界就是 MCP server 的邊界。外部匯入與 lessons 是兩個受限例外,見 [docs/security.md](docs/security.md)。分析不信任 repo 時,那個 repo 自帶的 `AGENTS.md` 與 `.codetrail/lessons.md` 會進 system prompt;不想要就在 `~/.config/codetrail/client.json` 設 `"project_instructions": false`。
 > 8. **首次 MoE 對話首字會慢(可能 1–2 分鐘),別按 Esc** —— 它在 page-in expert weights,不是當掉;slot / GPU 在動就是正常。
 > 9. **NDA / 衍生資料不要 commit**:`knowledge*.json`、`knowledge_emb.npz`、`*.jsonl`、`.codetrail/`、`data/`、`.aicode_uploads/` 與 Code-RAG cache / graph DB 等已在 `.gitignore`。commit 前同時看 `git status` 與 `git diff`；`.gitignore` 擋不住被改名或複製的內容。
 > 10. **任一步 FAIL 對應的修法見 [docs/troubleshooting.md](docs/troubleshooting.md)。**
@@ -659,9 +665,9 @@ gate / rerank / MMR 決策、最終 REF 與當時生效的設定,`data_flywheel.
 
 #### 工具權限預設
 
-唯讀工具直接執行;下面七個每次都會跳核准框,框裡**完整顯示參數**(含整份 patch):
+唯讀工具直接執行;下面八個每次都會跳核准框,框裡**完整顯示參數**(含整份 patch):
 `apply_patch`、`run_lint`、`run_command`、`remove_document`、`record_lesson`、
-`review_figures`、`import_external_file`(框裡另外列出實際落點)。
+`review_figures`、`review_text`、`import_external_file`(框裡另外列出實際落點)。
 
 評測與啟動抽查走的是另一條 policy(`--policy readonly`):凡是 `tools/list` 沒有
 標 `readOnlyHint` 的工具一律 deny,而且 MCP server 那一層也會關掉寫入與執行
@@ -747,7 +753,7 @@ aicode
 
 要改成 `--no-mmap`,是在 `~/.config/codetrail/deployment.json` 的 `services.<main|vl>.parameters` 加 `"no_mmap": true`(不是手動改 llama-server 指令 —— argv 每次由 deployment 重新產生)。CodeTrail **不替你決定**這一項,但套了 CPU-MoE 卻沒設時 `set_config.sh` 會警告,而且重跑會保留你的設定。詳見 [docs/troubleshooting.md](docs/troubleshooting.md)。
 
-如果想驗證 MCP transport 有沒有連上:客戶端輸入 `/tools`,應列出 19 個工具。**列得出來只代表 MCP 子行程完成連線,不代表模型在這一輪真的發出 tool call。** 真正執行時畫面上會有一行 `· list_dir(path=.) → completed`;若模型只印出 `<list_dir .../>` 再用文字宣稱成功,那是假工具呼叫 —— 客戶端會偵測到並提示一次,細節照 [troubleshooting 的分層檢查](docs/troubleshooting.md#mcp-connected-but-no-tool-call)處理。
+如果想驗證 MCP transport 有沒有連上:客戶端輸入 `/tools`,應列出 21 個工具。**列得出來只代表 MCP 子行程完成連線,不代表模型在這一輪真的發出 tool call。** 真正執行時畫面上會有一行 `· list_dir(path=.) → completed`;若模型只印出 `<list_dir .../>` 再用文字宣稱成功,那是假工具呼叫 —— 客戶端會偵測到並提示一次,細節照 [troubleshooting 的分層檢查](docs/troubleshooting.md#mcp-connected-but-no-tool-call)處理。
 
 要做「分析、解釋、推導、找原因」時，優先用同一個既有工具的 bounded context 模式：
 
@@ -852,7 +858,8 @@ preflight 零寫入;它會估算所有結構化候選，包含純 raster 的分�
 用 `ingest_document` 同時提供 `mineru_content_list` 與**產物生成時記錄的**
 `mineru_pdf_sha256`。程式只轉換現成產物，不啟動 MinerU；只認 `text_level` 標題，
 圖表依頁碼與 bbox 配對。表格仍由既有 structured lane 收錄，沒有唯一 owner 就報錯。
-MinerU 文字屬未獨立驗證 OCR，normal 查詢標示來源，strict 排除並回報 `excluded_text`；
+MinerU 文字預設屬未驗證 OCR，normal 查詢標示來源，strict 排除並回報 `excluded_text`；
+用 `review_text` 校字並對照來源確認目前版本後，只有來源、內容版本與品質皆有效的段落可進 strict。
 未表示頁與既有品質問題仍會揭露。參數與 CLI 用法見
 [MinerU 文字 lane](docs/mcp-tools.md#本地-mineru-文字-lane)。
 
@@ -865,7 +872,7 @@ MinerU 文字屬未獨立驗證 OCR，normal 查詢標示來源，strict 排除�
 **被移出 KB 的其他文件之後重新 ingest 不會自動恢復人工確認**。細節見
 [docs/rag.md](docs/rag.md#只有-knowledgejson-要管)。
 
-更多操作模式(夾帶附件、注入 RAG、查 spec)見 [docs/basic-usage.md](docs/basic-usage.md);完整 19 個工具清單見 [docs/mcp-tools.md](docs/mcp-tools.md);被你糾正過的行為怎麼變成之後 session 都遵守的規則,見 [docs/lessons.md](docs/lessons.md)。
+更多操作模式(夾帶附件、注入 RAG、查 spec)見 [docs/basic-usage.md](docs/basic-usage.md);完整 21 個工具清單見 [docs/mcp-tools.md](docs/mcp-tools.md);被你糾正過的行為怎麼變成之後 session 都遵守的規則,見 [docs/lessons.md](docs/lessons.md)。
 
 ## 文件地圖
 
@@ -873,9 +880,15 @@ MinerU 文字屬未獨立驗證 OCR，normal 查詢標示來源，strict 排除�
 |---|---|
 | [docs/setup.md](docs/setup.md) | 替代安裝方式、進階配置、換機部署 reference |
 | [docs/deployment-profiles.md](docs/deployment-profiles.md) | profile schema、precedence、GPU override 與 local override |
+| [docs/split-deployment.md](docs/split-deployment.md) | A 跑四類模型、B 跑 aicode／MCP／build；端點授權、模型身分、診斷與評測 |
 | [docs/basic-usage.md](docs/basic-usage.md) | TUI 內常用操作:正常對話、夾帶附件、RAG 注入、最小驗收流程 |
+| [docs/message-queue.md](docs/message-queue.md) | 排到下一輪或補充目前任務；查看、修改、取消、送達狀態與安全步驟 |
 | [docs/rag.md](docs/rag.md) | 讀檔、匯入附件(PDF / 圖片經 VL)、建立知識庫、圖片+RAG 一起用、查 spec |
-| [docs/mcp-tools.md](docs/mcp-tools.md) | CodeTrail 暴露的 19 個 MCP 工具與使用原則 |
+| [docs/ingest-resume.md](docs/ingest-resume.md) | 中斷續跑、指定頁面／圖表／失敗項目重做、快取有效性與缺漏報告 |
+| [docs/text-and-table-review.md](docs/text-and-table-review.md) | `query_table` 精確查值、`review_text` 正文校字與版本確認、strict 採用條件 |
+| [docs/memory-consistency.md](docs/memory-consistency.md) | ELF、GNU／MetaWare map、linker script、preload 與 DRAM 區間核對；缺資料標未知 |
+| [docs/build-context.md](docs/build-context.md) | 匯入編譯資料；依 target、巨集、include 與 generated headers 搜尋及分析關係 |
+| [docs/mcp-tools.md](docs/mcp-tools.md) | CodeTrail 暴露的 21 個 MCP 工具與使用原則 |
 | [docs/lessons.md](docs/lessons.md) | lessons(行為教訓):糾正 → 提案 → 核准 → 注入 → 過期複審的完整生命週期與管理指令 |
 | [docs/security.md](docs/security.md) | 沙箱邊界、工具權限、外部匯入與 NDA 資料注意事項 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | `/status` / `/mcp`、ctx-safety、server 不可連、Blackwell CUDA、MoE 首字慢 |

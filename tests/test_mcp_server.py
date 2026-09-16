@@ -418,12 +418,12 @@ def test_live_catalog_is_bounded_typed_and_ordered(monkeypatch, tmp_path: Path):
     ]
     assert by_name["analyze_file"].inputSchema["properties"]["view"]["enum"] == [
         "summary", "headers", "sections", "memmap", "symbols", "imports",
-        "relocs", "dynamic", "dwarf", "disasm", "strings",
+        "relocs", "dynamic", "dwarf", "disasm", "strings", "consistency",
     ]
     timeout = by_name["run_command"].inputSchema["properties"]["timeout"]
     assert (timeout["minimum"], timeout["maximum"]) == (1, 600)
 
-    evidence = {"code_rag_search", "query_knowledge", "query_knowledge_strict"}
+    evidence = {"code_rag_search", "query_knowledge", "query_knowledge_strict", "query_table"}
     for tool in tools:
         if tool.name not in evidence:
             assert tool.outputSchema is None, tool.name
@@ -534,7 +534,8 @@ def test_mcp_protocol_roundtrip(tmp_path: Path):
         asyncio.wait_for(_roundtrip(project), timeout=60)
     )
 
-    assert len(names) == 19
+    assert names == set(PUBLIC_TOOL_ORDER)
+    assert len(names) == 21
     for expected in ("query_knowledge", "list_dir", "read_file", "grep_code"):
         assert expected in names, f"工具 {expected} 沒註冊成功；實得 {sorted(names)}"
     max_chars_schema = code_search_schema["properties"]["max_chars"]
@@ -1299,6 +1300,7 @@ def test_import_reads_the_source_it_validated_not_a_swapped_one(
         ("remove_document", {"source": "spec.pdf"}),
         ("ingest_document", {"path": "spec.pdf"}),
         ("review_figures", {"action": "fix", "document_id": "d", "figure_id": "f", "fix": {}}),
+        ("review_text", {"action": "confirm", "source": "spec.pdf", "text_id": "t"}),
         ("import_external_file", {"source_path": "/tmp/x.pdf"}),
     ],
 )

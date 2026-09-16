@@ -23,6 +23,7 @@ import copy
 import json
 import hashlib
 import contextlib
+import contextvars
 from dataclasses import replace as _dc_replace
 from pathlib import Path
 from datetime import datetime
@@ -51,11 +52,30 @@ from knowledge_store import (
 
 import context_signals
 import ingest_notify
+import ingest_checkpoint
 import kb_cache
 import llama_client
+import model_identity
 
 # 執行期設定走 module handle；安裝缺 config 時直接失敗。
 import config as config_module
+
+_FRESH_EMBEDDINGS = contextvars.ContextVar("codetrail_fresh_embeddings", default=False)
+
+
+@contextlib.contextmanager
+def fresh_embedding_scope():
+    """Review transactions never reuse old name-only per-text cache entries."""
+    token = _FRESH_EMBEDDINGS.set(True)
+    try:
+        yield
+    finally:
+        _FRESH_EMBEDDINGS.reset(token)
+
+
+def _ingest_source_name(file_path):
+    checkpoint = ingest_checkpoint.current_job()
+    return checkpoint.source_reference.name if checkpoint is not None else Path(file_path).name
 
 
 def check_pymupdf4llm():
@@ -2071,6 +2091,9 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
         native_unavailable = _native_unavailable_regions(plan)
         candidates, filtered_absent = _structured_candidates(fx, plan)
         filtered_absent.extend(native_unavailable)
+        checkpoint = ingest_checkpoint.current_job()
+        if checkpoint is not None:
+            checkpoint.prepare_figures(candidates)
         if not candidates:
             # 零候選也可能是「這頁的圖全部落在 lane 之外」，缺席帳照樣要交出去。
             absent = _absent_from_plan(plan, filtered_absent)
@@ -2089,7 +2112,8 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
         vl_candidates = [c for c in candidates if not fx.read_native_lane(c)]
         needs_vl = bool(vl_candidates) and int(
             (plan.preflight or {}).get("vl_calls_max", 0) or 0) > 0
-        if needs_vl:
+        checkpoint = ingest_checkpoint.current_job()
+        if needs_vl and checkpoint is None:
             kinds = set()
             for candidate in vl_candidates:
                 # native lane 永遠不呼叫 VL（契約 §12.1），所以只有這些候選要 probe
@@ -2170,7 +2194,10 @@ def _run_structured_figure_lane(file_path: str, filename: str, pages: List[Dict]
                 plan, pdf_doc=pdf_doc, page_evidence=plan.page_evidence,
                 vl_base_url=LLAMA_VL_BASE_URL, vl_model=VL_MODEL,
                 render_variants=_record, record_generated_variant=_record_generated,
-                on_progress=_progress))
+                on_progress=_progress,
+                **({"checkpoint": checkpoint,
+                    "checkpoint_variants": lambda result: _model_input_variants(rendered, [result]),
+                    "on_restored_variant": _remember} if checkpoint is not None else {})))
             # 品質失敗的那幾張（`extraction_status=failed`）**不進 KB**，但要留在同一份
             # `failed:false` 的 manifest 裡供覆核。從這裡開始只有 complete 的往下走：
             # chunk、page partition、覆核影像、人工確認沿用都只對得起有 payload 的結果。
@@ -2423,15 +2450,22 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
     # 延遲載入 pymupdf4llm（只有 PDF 模式需要）
     pymupdf4llm = check_pymupdf4llm()
 
-    filename = Path(file_path).name
+    filename = _ingest_source_name(file_path)
 
     # 解析文字之前先釘住來源身分：`to_markdown()` 與後面 planner 建 document_id
     # 之間換檔的話，文字 chunk 與 structured figure 會來自兩個版本（TOCTOU）。
     source_identity = _source_identity_snapshot(_figure_root(root), file_path)
 
+    checkpoint = ingest_checkpoint.current_job()
     try:
-        pages = pymupdf4llm.to_markdown(file_path, page_chunks=True, write_images=False)
+        pages = (_checkpoint_pdf_pages(file_path, pymupdf4llm, checkpoint)
+                 if checkpoint is not None and not preflight_only else
+                 pymupdf4llm.to_markdown(file_path, page_chunks=True, write_images=False))
     except Exception as e:
+        if checkpoint is not None:
+            # Completed pages are durable; parsing failure must not become a
+            # successful partial document on the next invocation.
+            raise
         if preflight_only:
             # regular ingest 維持「警告後回空 document」；preflight 不行——
             # 沒有報告卻 exit 0 會讓使用者以為預算沒問題
@@ -2487,6 +2521,15 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
 
     def _recover_page_text(page_number: int) -> str:
         """markdown 交白卷的頁的正文退路；抽不出來就記進 absent 帳（不 raise）。"""
+        recovery_key = None
+        if checkpoint is not None:
+            recovery_key = checkpoint.key("page_recovery", {"page": page_number})
+            recovered = checkpoint.get(f"page_recovery/{page_number}", recovery_key,
+                                       force=page_number in checkpoint.force_pages)
+            if recovered is not None:
+                if not isinstance(recovered, str):
+                    raise ingest_checkpoint.CheckpointError("invalid cached rotated-page text")
+                return recovered
         probe = _lazy_open(probe_doc, _open_pdf_document, "旋轉頁偵測")
         if not probe:
             return ""
@@ -2515,6 +2558,8 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
             return ""
         print(f"  [INFO] {filename}: 第 {page_number} 頁旋轉 {rotation}°，"
               "上游 markdown 為空；已把 /Rotate 歸零後重抽正文", flush=True)
+        if checkpoint is not None:
+            checkpoint.put(f"page_recovery/{page_number}", recovery_key, recovered, page=page_number)
         return recovered
 
     for page_info in pages:
@@ -2543,6 +2588,10 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
             content = "" if pieces else _recover_page_text(page_num).strip("\r\n")
         if not content.strip():
             continue
+        if checkpoint is not None and page_info.get("_checkpoint_missing"):
+            page_info["_checkpoint_missing"] = False
+            checkpoint.put(f"page/{page_num}", checkpoint.key("native_page", {"page": page_num}),
+                           page_info, page=page_num, reasons=["native_text_recovered"])
 
         # 先正規化再切：raw_text 必須就是 splitter 看到的那份文字，offset 才對得上
         from document_structure import navigation_spans, normalize_preserving_structure
@@ -2620,6 +2669,16 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
     document.apply_section_titles()
     setattr(document, _FIGURE_PRUNE_ATTR, lane["guard"])
     setattr(document, _ABSENT_ATTR, absent)
+    if checkpoint is not None:
+        represented = [_pdf_page_number(page.get("metadata")) for page in pages]
+        expected = list(range(1, checkpoint.state["page_count"] + 1))
+        if represented != expected:
+            raise ingest_checkpoint.CheckpointError("full PDF page inventory was not reconstructed")
+        document._codetrail_source_pages = represented
+        for page in pages:
+            if page.get("_checkpoint_missing"):
+                absent.append({"page": _pdf_page_number(page.get("metadata")), "bbox": None,
+                               "channel": "text", "reason": "native_text_empty_or_unavailable"})
     if lane.get("coverage"):
         setattr(document, _PDF_COVERAGE_ATTR, lane["coverage"])
 
@@ -2658,6 +2717,44 @@ def extract_pdf(file_path: str) -> List[Dict]:
 # ============================================================
 # PDF 逐頁抽取的輔助
 # ============================================================
+def _checkpoint_pdf_pages(file_path, parser, checkpoint):
+    pdf = _open_pdf_document(file_path)
+    try:
+        count = pdf.page_count
+    finally:
+        pdf.close()
+    checkpoint.pages(count)
+    pages = []
+    for page in range(1, count + 1):
+        name = f"page/{page}"
+        fingerprint = checkpoint.key("native_page", {"page": page})
+        saved = checkpoint.get(name, fingerprint, force=checkpoint.page_forced(page))
+        if saved is None:
+            checkpoint.start(name, fingerprint, page=page)
+            try:
+                extracted = parser.to_markdown(file_path, pages=[page - 1],
+                                               page_chunks=True, write_images=False)
+                if not isinstance(extracted, list) or len(extracted) > 1:
+                    raise ingest_checkpoint.CheckpointError("single-page parser returned an invalid page inventory")
+                saved = extracted[0] if extracted else {"metadata": {"page_number": page}, "text": ""}
+                if not isinstance(saved, dict) or _pdf_page_number(saved.get("metadata")) != page:
+                    raise ingest_checkpoint.CheckpointError("native page metadata does not match its selected source page")
+                saved = ingest_checkpoint.json_safe(saved)
+                if not str(saved.get("text") or "").strip():
+                    saved["_checkpoint_missing"] = True
+                checkpoint.put(name, fingerprint, saved, page=page,
+                               state="missing" if saved.get("_checkpoint_missing") else "succeeded",
+                               reasons=["native_text_empty_or_unavailable"] if saved.get("_checkpoint_missing") else [])
+            except Exception as exc:
+                checkpoint.fail(name, fingerprint, exc, page=page)
+                raise
+        if not isinstance(saved, dict) or _pdf_page_number(saved.get("metadata")) != page:
+            raise ingest_checkpoint.CheckpointError("cached native page has the wrong page locator")
+        pages.append(saved)
+        print(f"[page] {page}/{count} {'reused' if name in checkpoint.reused else 'extracted'}", flush=True)
+    return pages
+
+
 def _pdf_page_number(meta: Optional[Dict]) -> int:
     """pymupdf4llm 頁碼相容 helper（唯一定義）。
 
@@ -2736,7 +2833,7 @@ def _open_pdf_document(file_path: str):
 
 def extract_text_file_document(file_path: str) -> ExtractedDocument:
     """提取純文字檔案（md, txt），包含文件類型和章節"""
-    filename = Path(file_path).name
+    filename = _ingest_source_name(file_path)
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -2777,7 +2874,7 @@ def extract_binary_document(file_path: str) -> ExtractedDocument:
     含 caller + DWARF 函式 / 型別 + 全部分類字串，上限 config.BIN_ELF_INGEST_MAX_CHARS），
     不受 analyze_file 單次 25K 的限制。報告裡 【...】 章節標記會被轉成 ## 標題，方便語意切分。
     """
-    filename = Path(file_path).name
+    filename = _ingest_source_name(file_path)
     # 延遲載入 media（其他模式不需要）
     try:
         from media import read_binary_for_ingest, set_sandbox_root
@@ -2826,7 +2923,7 @@ def process_file_document(file_path: str, *, kb_path: Optional[str] = None,
     `kb_path` 只給 PDF 的 structured figure lane 用：re-ingest 要先讀既有 KB 才知道
     哪些 figure 已經被人工確認過（契約 §15.7）。沒給就用專案預設的知識庫。
     """
-    ext = Path(file_path).suffix.lower()
+    ext = Path(_ingest_source_name(file_path)).suffix.lower()
 
     if mineru_artifact is not None:
         if ext != ".pdf":
@@ -2839,11 +2936,44 @@ def process_file_document(file_path: str, *, kb_path: Optional[str] = None,
         return _extract_pdf_document_impl(
             file_path, preflight_only=False, root=None, kb_path=kb_path)
     elif ext in {".md", ".txt"}:
-        return extract_text_file_document(file_path)
+        return _checkpoint_document(file_path, extract_text_file_document)
     elif ext in BINARY_EXTENSIONS or ext in ELF_EXTENSIONS:
-        return extract_binary_document(file_path)
+        # ELF dependencies must remain fail-loud even on an extraction hit.
+        import elf_analysis
+        if elf_analysis.is_elf_file(Path(file_path)):
+            elf_analysis.require_pyelftools()
+        return _checkpoint_document(file_path, extract_binary_document)
     else:
         return ExtractedDocument(raw_text="", source=Path(file_path).name)
+
+
+def _checkpoint_document(file_path, extract, *, role=None):
+    checkpoint = ingest_checkpoint.current_job()
+    if checkpoint is None:
+        return extract(file_path)
+    import dataclasses
+    key = checkpoint.key("document_extraction", {"name": _ingest_source_name(file_path),
+                         "extractor": extract.__name__}, role=role)
+    payload = checkpoint.get("document/extraction", key)
+    if payload is None:
+        checkpoint.start("document/extraction", key)
+        try:
+            document = extract(file_path)
+            if not document.chunks:
+                raise ingest_checkpoint.CheckpointError("document extraction returned no content")
+            payload = dataclasses.asdict(document)
+            checkpoint.put("document/extraction", key, payload)
+        except Exception as exc:
+            checkpoint.fail("document/extraction", key, exc)
+            raise
+        return document
+    from extracted_document import Section
+    try:
+        value = dict(payload)
+        value["sections"] = [Section(**section) for section in value["sections"]]
+        return ExtractedDocument(**value)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ingest_checkpoint.CheckpointError(f"invalid cached document: {exc}") from exc
 
 
 def process_file(file_path: str) -> List[Dict]:
@@ -2864,7 +2994,7 @@ def extract_chat_from_screenshot(image_path: str) -> str:
         image_data = base64.b64encode(f.read()).decode('utf-8')
 
     # 取得副檔名
-    ext = Path(image_path).suffix.lower()
+    ext = Path(_ingest_source_name(image_path)).suffix.lower()
 
     # 提示詞：要求 VL 模型提取並整理聊天內容
     # 增加「原始摘錄」層，降低幻覺風險
@@ -2945,14 +3075,14 @@ def process_chat_screenshot_document(image_path: str) -> ExtractedDocument:
     content = extract_chat_from_screenshot(image_path)
 
     if not content:
-        return ExtractedDocument(raw_text="", source=f"chat_{Path(image_path).name}")
+        return ExtractedDocument(raw_text="", source=f"chat_{_ingest_source_name(image_path)}")
 
     print(f"[INFO] 提取完成，內容長度: {len(content)} 字元")
     print("-" * 40)
     print(content[:500] + "..." if len(content) > 500 else content)
     print("-" * 40)
 
-    return build_chat_document(Path(image_path).name, content)
+    return build_chat_document(_ingest_source_name(image_path), content)
 
 
 def process_chat_screenshot(image_path: str) -> List[Dict]:
@@ -3058,7 +3188,7 @@ def extract_info_from_image(image_path: str) -> str:
 
     try:
         return _describe_technical_image_base64(
-            image_data, IMAGE_MIME_TYPES[Path(image_path).suffix.lower()]
+            image_data, IMAGE_MIME_TYPES[Path(_ingest_source_name(image_path)).suffix.lower()]
         )
     except Exception as e:
         print(f"[ERROR] VL 模型處理失敗: {e}")
@@ -3084,14 +3214,14 @@ def process_technical_image_document(image_path: str) -> ExtractedDocument:
     content = extract_info_from_image(image_path)
 
     if not content:
-        return ExtractedDocument(raw_text="", source=f"image_{Path(image_path).name}")
+        return ExtractedDocument(raw_text="", source=f"image_{_ingest_source_name(image_path)}")
 
     print(f"[INFO] 提取完成，內容長度: {len(content)} 字元")
     print("-" * 40)
     print(content[:500] + "..." if len(content) > 500 else content)
     print("-" * 40)
 
-    return build_image_document(Path(image_path).name, content)
+    return build_image_document(_ingest_source_name(image_path), content)
 
 
 def process_technical_image(image_path: str) -> List[Dict]:
@@ -3202,9 +3332,19 @@ def _embed_text_cached(text: str, cache: Dict, state: Dict) -> List[float]:
     快取 key 是「實際送出的字串」的雜湊，所以 retrieval（含 ctx）與 gate
     （純內容）兩種組字自然分屬不同 key，不會互相污染。
     """
+    checkpoint = ingest_checkpoint.current_job()
+    if checkpoint is not None:
+        fingerprint = checkpoint.key("embedding", {"text": text}, role="embedding")
+        name = "embedding/" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+        cached = checkpoint.get(name, fingerprint)
+        if cached is not None:
+            _validate_checkpoint_vector(cached)
+            state["hits"] += 1
+            return cached
+        checkpoint.start(name, fingerprint)
     key = _content_hash(text)
     # 舊版可能留下空向量，空值視為 miss 並重新請求。
-    cached = cache.get(key)
+    cached = cache.get(key) if checkpoint is None else None
     if cached:
         state["hits"] += 1
         return cached
@@ -3228,9 +3368,20 @@ def _embed_text_cached(text: str, cache: Dict, state: Dict) -> List[float]:
             "Check the embedding llama-server (deployment.json 的 services.embedding)."
         )
 
+    if checkpoint is not None:
+        _validate_checkpoint_vector(embedding)
+        checkpoint.put(name, fingerprint, embedding)
+
     cache[key] = embedding
     state["updated"] = True
     return embedding
+
+
+def _validate_checkpoint_vector(vector):
+    import math
+    if (not isinstance(vector, list) or not vector
+            or any(type(value) not in (int, float) or not math.isfinite(value) for value in vector)):
+        raise ingest_checkpoint.CheckpointError("invalid checkpoint embedding vector")
 
 
 def _generate_embedding_fields(
@@ -3255,7 +3406,8 @@ def _generate_embedding_fields(
     if cache_dir is None:
         cache_dir = Path.cwd()
     cache_path = cache_dir / EMBEDDING_CACHE_FILE
-    cache = _load_embedding_cache(cache_path)
+    checkpoint = ingest_checkpoint.current_job()
+    cache = _load_embedding_cache(cache_path) if checkpoint is None and not _FRESH_EMBEDDINGS.get() else {}
     state = {"hits": 0, "updated": False}
 
     for i, chunk in enumerate(chunks):
@@ -3276,7 +3428,7 @@ def _generate_embedding_fields(
                 chunk['embedding_gate'] = _embed_text_cached(gate_text, cache, state)
 
     # 儲存更新後的快取
-    if state["updated"]:
+    if state["updated"] and checkpoint is None and not _FRESH_EMBEDDINGS.get():
         _save_embedding_cache(cache_path, cache)
         print(f"\n  [INFO] Embedding 快取已更新 ({len(cache)} 項)")
     elif state["hits"] > 0:
@@ -3632,6 +3784,27 @@ def human_revision_baseline(chunks, source: str) -> Dict[str, int]:
     return baseline
 
 
+def text_revision_baseline(chunks, source: str) -> Dict:
+    """OCR revision/hash CAS shared with review_text and checkpoint provenance.
+
+    All original members participate, including unconfirmed text. A new
+    correction, confirmation, revocation or rechunk cannot be hidden by an old
+    checkpoint. T4 may provide text_id; legacy OCR has a stable locator fallback.
+    """
+    baseline = {}
+    for chunk in chunks or []:
+        if not isinstance(chunk, dict) or chunk.get("source") != source:
+            continue
+        if chunk.get("text_lane") != "mineru" and chunk.get("origin") != "mineru_text" and not chunk.get("text_id"):
+            continue
+        locator = str(chunk.get("text_id") or chunk.get("id") or
+                      f"{chunk.get('page', 0)}:{chunk.get('chunk_index', 0)}")
+        value = {key: item for key, item in chunk.items()
+                 if key not in {"embedding", "embedding_gate", "ctx"}}
+        baseline.setdefault(locator, []).append(ingest_checkpoint.digest(value))
+    return {key: sorted(values) for key, values in sorted(baseline.items())}
+
+
 def _assert_figure_guard(guard: Optional[Dict], kb: Dict) -> None:
     """exclusive lock 內的最後一道：來源身分與人工修正基線都還成立嗎？
 
@@ -3655,6 +3828,12 @@ def _assert_figure_guard(guard: Optional[Dict], kb: Dict) -> None:
     if source_path and expected_id:
         _assert_source_identity(fx, str(guard.get("source")), source_path, guard["root"],
                                 expected_id, stage="提交前")
+
+    if "text_baseline" in guard:
+        actual = text_revision_baseline(kb.get("chunks"), guard.get("source"))
+        if actual != guard["text_baseline"]:
+            raise ingest_checkpoint.CheckpointError(
+                "OCR text changed during ingestion (correction/confirmation/revocation); refusing to overwrite newer review")
 
     baseline = guard.get("human_baseline")
     if baseline is None:
@@ -3998,6 +4177,12 @@ def _commit_document_to_kb(
     回傳 False 代表沒有內容可入庫（呼叫端決定 exit 還是 return）。
     """
     output_path = Path(output_file)
+    checkpoint = ingest_checkpoint.current_job()
+    if checkpoint is not None:
+        checkpoint.assert_valid()
+        if checkpoint.state["page_count"]:
+            if getattr(document, "_codetrail_source_pages", None) != list(range(1, checkpoint.state["page_count"] + 1)):
+                raise ingest_checkpoint.CheckpointError("partial PDF document cannot be committed")
     new_chunks = document.chunks
     if not new_chunks:
         print("[WARN] 沒有提取到任何內容")
@@ -4017,15 +4202,25 @@ def _commit_document_to_kb(
     # 覆蓋率不足也一樣——寧可整批不進 KB，也不要寫出半套脈絡的知識庫。
     if generate_context:
         import context_generation
-
-        report = context_generation.generate_document_context(
-            document, kb_path=output_path
-        )
+        if checkpoint is not None:
+            # generation_fingerprint includes this actual identity while a job
+            # is active. Keep the existing private context cache location.
+            identity = checkpoint.model_identity("main")
+            context_key = checkpoint.key("context", {"raw_text": document.raw_text,
+                                                       "chunks": [c.get("content", "") for c in new_chunks]}, role="main")
+            checkpoint.start("document/context", context_key)
+        report = context_generation.generate_document_context(document, kb_path=output_path)
         print(report.format_summary())
+        if checkpoint is not None:
+            checkpoint.put("document/context", context_key,
+                           {"chunks": len(new_chunks), "actual_model": identity["fingerprint"]})
 
     # 生成 embeddings
     needs_gate = context_signals.needs_gate_matrix(new_chunks)
     print(f"[INFO] 使用 {EMBEDDING_MODEL} 生成 embeddings...")
+    if checkpoint is not None:
+        embedding_stage_key = checkpoint.key("document_embedding", [c.get("content", "") for c in new_chunks])
+        checkpoint.start("document/embedding", embedding_stage_key)
     new_chunks = generate_embeddings(new_chunks, with_gate=needs_gate)
 
     # 為每個 chunk 生成唯一 ID（格式的唯一定義在 knowledge_store.chunk_id；
@@ -4035,6 +4230,11 @@ def _commit_document_to_kb(
 
     prepared_sections = kb_cache.prepare_sections(
         new_chunks, cache_dir=output_path.parent)
+    if checkpoint is not None:
+        checkpoint.validate_models()
+        checkpoint.put("document/embedding", embedding_stage_key, {"chunks": len(new_chunks)})
+        commit_key = checkpoint.key("commit", [chunk["id"] for chunk in new_chunks])
+        checkpoint.start("document/commit", commit_key)
     if mineru_artifact is not None:
         mineru_lane.revalidate_artifact(mineru_artifact)
 
@@ -4088,6 +4288,8 @@ def _commit_document_to_kb(
             # Recheck after waiting for the writer lock as well as after the
             # potentially slow embedding work. A changed input is not a new KB.
             mineru_lane.revalidate_artifact(mineru_artifact)
+        if checkpoint is not None:
+            checkpoint.assert_valid()
         save_knowledge_base(kb, output_path, _already_locked=True,
                             prepared_sections=prepared_sections)
         if fresh:
@@ -4100,6 +4302,12 @@ def _commit_document_to_kb(
 
     # KB-aware prune 一律在 store lock 釋放之後：prune 自己要重讀 KB，在鎖內呼叫
     # 會自鎖。失敗只警告——KB 已經成功提交，舊 run 目錄留著只是佔空間。
+    if checkpoint is not None:
+        try:
+            checkpoint.put("document/commit", commit_key,
+                           {"generation": kb.get("metadata", {}).get("generation", ""), "chunks": len(new_chunks)})
+        except Exception as exc:
+            print(f"[WARN] KB 已提交，但 checkpoint commit 記錄未更新：{exc}", flush=True)
     if figure_guard and figure_guard.get("wrote_run"):
         try:
             _figure_extract().prune_old_runs(
@@ -4139,7 +4347,9 @@ def _load_mineru_input(input_file, content_list, pdf_sha256):
 def add_document(input_file: str, output_file: str, *, generate_context: bool = False,
                  preflight_only: bool = False, fresh: bool = False,
                  mineru_content_list: Optional[str] = None,
-                 mineru_pdf_sha256: Optional[str] = None):
+                 mineru_pdf_sha256: Optional[str] = None,
+                 resume: bool = True, redo_pages=None, redo_figures=None,
+                 retry_failed: bool = False):
     """將文件加入知識庫
 
     `generate_context` 只有 `rebuild` 子命令會給 True——chunk 脈絡的唯一執行路徑
@@ -4157,6 +4367,11 @@ def add_document(input_file: str, output_file: str, *, generate_context: bool = 
     """
     input_path = Path(input_file)
     output_path = Path(output_file)
+    options = ingest_checkpoint.ResumeOptions.validate(
+        resume=resume, redo_pages=redo_pages, redo_figures=redo_figures,
+        retry_failed=retry_failed, fresh=fresh, preflight_only=preflight_only)
+    if options.selective and input_path.suffix.lower() != ".pdf":
+        raise ingest_checkpoint.CheckpointError("page/figure selective redo applies only to PDFs")
 
     # 檢查輸入檔案
     if not input_path.exists():
@@ -4192,29 +4407,79 @@ def add_document(input_file: str, output_file: str, *, generate_context: bool = 
         print("[INFO] --preflight：只計算 figure 預算，未寫入知識庫（零寫入）。")
         return
 
-    # 先驗一次：壞掉的 KB 要在付出抽取／生成成本前就 fail。真正併入用的快照
-    # 是 _commit_document_to_kb 在鎖裡重新載的那一份。非 fresh 時這一步同時把
-    # embeddings cache 補好（重算在鎖外做，不會卡住整個 KB）。
-    if mineru_artifact is None:
+    import media
+    checkpoint_root = media.get_sandbox_root() or output_path.resolve().parent
+    if not _path_within(input_path.resolve(), Path(checkpoint_root).resolve()):
+        if mineru_artifact is not None or options.selective:
+            raise ingest_checkpoint.CheckpointError("external CLI source cannot use MinerU or selective checkpoint redo")
+        # Explicit CLI sources retain native extraction. MCP and MinerU retain
+        # their own sandbox checks; figure admission still rejects this path.
+        print("[INFO] 外部 CLI 來源：native ingest，不支援 checkpoint/resume；完整重做此文件。")
         load_knowledge_base(output_path, _quiet=True, _restore_vectors=not fresh)
-
-    # 處理新文件
-    print(f"[INFO] 處理: {input_path.name}")
-    document = process_file_document(
-        str(input_path), kb_path=output_file, **lane_kwargs)
-    if mineru_artifact is not None:
-        # Conversion/ownership errors must not first publish a migrated cache.
-        # Once the document is complete, warm the old vectors outside the lock.
-        import mineru_lane
-        mineru_lane.revalidate_artifact(mineru_artifact)
-        load_knowledge_base(output_path, _quiet=True, _restore_vectors=not fresh)
-
-    if not _commit_document_to_kb(
-        document, output_file, label="文件", generate_context=generate_context,
-        figure_guard=getattr(document, _FIGURE_PRUNE_ATTR, None), fresh=fresh,
-        source_location=_file_location(input_path),
-    ):
-        sys.exit(1)
+        document = process_file_document(str(input_path.resolve()), kb_path=output_file)
+        document.source = input_path.name
+        for chunk in document.chunks:
+            chunk["source"] = input_path.name
+        _commit_document_to_kb(document, output_file, label="文件", fresh=fresh,
+                               generate_context=generate_context,
+                               figure_guard=getattr(document, _FIGURE_PRUNE_ATTR, None),
+                               source_location=_file_location(input_path))
+        return
+    # Capture review provenance before extraction, not from an old checkpoint.
+    baseline_kb = (load_knowledge_base(output_path, _quiet=True, _restore_vectors=False)
+                   if output_path.exists() else {"chunks": []})
+    baseline_chunks = baseline_kb.get("chunks", [])
+    figure_baseline = human_revision_baseline(baseline_chunks, input_path.name)
+    text_baseline = text_revision_baseline(baseline_chunks, input_path.name)
+    job = ingest_checkpoint.IngestJob(
+        checkpoint_root, input_path, options=options,
+        artifact_sha256=mineru_artifact.content_list_sha256 if mineru_artifact is not None else "")
+    with job:
+        job.record_revision_baseline(figure_baseline, text_baseline)
+        # Validate old KB and required dependencies before any cached evidence
+        # can be submitted. All model-bound caches still validate live identity.
+        if mineru_artifact is None:
+            load_knowledge_base(output_path, _quiet=True, _restore_vectors=not fresh)
+        print(f"[INFO] 處理: {input_path.name}")
+        job.assert_valid()
+        document = process_file_document(str(job.source_path), kb_path=output_file, **lane_kwargs)
+        if input_path.suffix.lower() == ".pdf":
+            job.put("document/extraction", job.key("pdf_assembly"),
+                    {"pages": getattr(document, "_codetrail_source_pages", []),
+                     "chunks": len(document.chunks),
+                     "figures": sorted({c.get("figure_id") for c in document.chunks if c.get("figure_id")})})
+        if mineru_artifact is not None:
+            import mineru_lane
+            mineru_lane.revalidate_artifact(mineru_artifact)
+            load_knowledge_base(output_path, _quiet=True, _restore_vectors=not fresh)
+        # Figure carry-over reads the live KB. The earlier baseline also catches
+        # a review committed while native pages or cached figures were replayed.
+        guard = dict(getattr(document, _FIGURE_PRUNE_ATTR, None) or {})
+        guard.update({"source": input_path.name, "human_baseline": figure_baseline,
+                      "text_baseline": text_baseline})
+        setattr(document, _FIGURE_PRUNE_ATTR, guard)
+        document._codetrail_ingest_baseline_chunks = baseline_chunks
+        if mineru_artifact is not None:
+            import text_review
+            text_review.carry_over(document, baseline_chunks)
+            review_summary = document._codetrail_text_review_summary
+            print(f"[INFO] OCR 文字覆核：沿用 {len(review_summary['carried'])}、"
+                  f"失效 {len(review_summary['invalidated'])}、待覆核 {len(review_summary['pending'])} 段；"
+                  "review_text list/show 可定位。")
+            job.put("document/text_review", job.key("text_review", text_baseline), review_summary,
+                    state="needs_review" if review_summary["pending"] else "succeeded",
+                    reasons=review_summary["pending"])
+        if not _commit_document_to_kb(
+            document, output_file, label="文件", generate_context=generate_context,
+            figure_guard=guard, fresh=fresh, source_location=_file_location(input_path),
+        ):
+            raise ingest_checkpoint.CheckpointError("no complete document content to commit")
+        # The KB is already committed. A report failure must not claim rollback.
+        try:
+            job.complete(summary=_ingest_summary_line(document, document.chunks, guard))
+            print(job.format_report(), flush=True)
+        except Exception as exc:
+            print(f"[WARN] KB 已提交，checkpoint 完成報告未更新：{exc}", flush=True)
 
 # ============================================================
 # 互動式確認函式
@@ -4296,7 +4561,8 @@ def _add_chat_content_to_kb(image_path: Path, content: str, output_file: str,
                            source_location=_file_location(image_path))
 
 
-def add_chat_screenshot(image_file: str, output_file: str, *, fresh: bool = False):
+def add_chat_screenshot(image_file: str, output_file: str, *, fresh: bool = False,
+                        resume: bool = True):
     """將聊天截圖加入知識庫（相容舊 API，直接入庫不詢問）"""
     image_path = Path(image_file)
     output_path = Path(output_file)
@@ -4311,16 +4577,8 @@ def add_chat_screenshot(image_file: str, output_file: str, *, fresh: bool = Fals
         print(f"        支援: {', '.join(IMAGE_EXTENSIONS)}")
         sys.exit(1)
 
-    # 先驗一次：壞掉的 KB 要在付出 VL 成本前就 fail
-    load_knowledge_base(output_path, _quiet=True)
-
-    # 處理截圖
-    print(f"[INFO] 處理: {image_path.name}")
-    document = process_chat_screenshot_document(str(image_path))
-
-    if not _commit_document_to_kb(document, output_file, label="截圖知識", fresh=fresh,
-                                  source_location=_file_location(image_path)):
-        sys.exit(1)
+    _add_vl_document(image_path, output_path, process_chat_screenshot_document,
+                     label="截圖知識", fresh=fresh, resume=resume)
 
 
 # ============================================================
@@ -4648,7 +4906,8 @@ def _add_image_content_to_kb(image_path: Path, content: str, output_file: str):
                            source_location=_file_location(image_path))
 
 
-def add_technical_image(image_file: str, output_file: str, *, fresh: bool = False):
+def add_technical_image(image_file: str, output_file: str, *, fresh: bool = False,
+                       resume: bool = True):
     """將技術圖片加入知識庫（相容舊 API，直接入庫不詢問）"""
     image_path = Path(image_file)
     output_path = Path(output_file)
@@ -4663,16 +4922,27 @@ def add_technical_image(image_file: str, output_file: str, *, fresh: bool = Fals
         print(f"        支援: {', '.join(IMAGE_EXTENSIONS)}")
         sys.exit(1)
 
-    # 先驗一次：壞掉的 KB 要在付出 VL 成本前就 fail
-    load_knowledge_base(output_path, _quiet=True)
+    _add_vl_document(image_path, output_path, process_technical_image_document,
+                     label="圖片知識", fresh=fresh, resume=resume)
 
-    # 處理圖片
-    print(f"[INFO] 處理: {image_path.name}")
-    document = process_technical_image_document(str(image_path))
 
-    if not _commit_document_to_kb(document, output_file, label="圖片知識", fresh=fresh,
-                                  source_location=_file_location(image_path)):
-        sys.exit(1)
+def _add_vl_document(image_path, output_path, extract, *, label, fresh, resume):
+    import media
+    options = ingest_checkpoint.ResumeOptions.validate(resume=resume, fresh=fresh)
+    root = media.get_sandbox_root() or output_path.resolve().parent
+    with ingest_checkpoint.IngestJob(root, image_path, options=options) as job:
+        load_knowledge_base(output_path, _quiet=True, _restore_vectors=not fresh)
+        print(f"[INFO] 處理: {image_path.name}")
+        job.assert_valid()
+        document = _checkpoint_document(str(job.source_path), extract, role="vl")
+        if not _commit_document_to_kb(document, str(output_path), label=label, fresh=fresh,
+                                     source_location=_file_location(image_path)):
+            raise ingest_checkpoint.CheckpointError("image extraction returned no complete content")
+        try:
+            job.complete()
+            print(job.format_report(), flush=True)
+        except Exception as exc:
+            print(f"[WARN] KB 已提交，checkpoint 完成報告未更新：{exc}", flush=True)
 
 
 # ============================================================
@@ -4728,9 +4998,21 @@ def rebuild_cli(argv: List[str]) -> int:
         help=("先清空既有 chunks 再灌（第一份文件生效，之後照常合併；同一來源 basename 更新）；"
               "embeddings cache 隨新 generation 自動失效，.codetrail/figures/ 不動"),
     )
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument("--resume", dest="resume", action="store_true", default=True)
+    resume_group.add_argument("--no-resume", dest="resume", action="store_false")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--redo-pages", type=ingest_checkpoint.parse_pages)
+    selection.add_argument("--redo-figures", type=lambda value: value.split(","))
+    selection.add_argument("--retry-failed", action="store_true")
     parser.set_defaults(context=None)
     args = parser.parse_args(argv)
     _apply_client_settings(args.client_config or None)
+    resume_kwargs = {"resume": args.resume, "redo_pages": args.redo_pages,
+                     "redo_figures": args.redo_figures, "retry_failed": args.retry_failed}
+    ingest_checkpoint.ResumeOptions.validate(**resume_kwargs, fresh=args.fresh, preflight_only=args.preflight)
+    if (args.redo_pages or args.redo_figures or args.retry_failed) and len(args.documents) != 1:
+        parser.error("selective redo requires exactly one PDF")
 
     mineru_kwargs = {}
     if args.mineru_content_list is not None or args.mineru_pdf_sha256 is not None:
@@ -4749,7 +5031,7 @@ def rebuild_cli(argv: List[str]) -> int:
         for document_path in args.documents:
             print(f"\n=== {document_path} ===")
             try:
-                add_document(document_path, args.kb, preflight_only=True, **mineru_kwargs)
+                add_document(document_path, args.kb, preflight_only=True, **mineru_kwargs, **resume_kwargs)
             except Exception as exc:  # noqa: BLE001 — 對映契約 §11.4 的 exit code
                 code = _pdf_cli_error_code(exc)
                 if code is None:
@@ -4769,7 +5051,7 @@ def rebuild_cli(argv: List[str]) -> int:
     for document_path in args.documents:
         print(f"\n=== {document_path} ===")
         add_document(document_path, args.kb, generate_context=generate_context,
-                     fresh=fresh, **mineru_kwargs)
+                     fresh=fresh, **mineru_kwargs, **resume_kwargs)
         fresh = False   # 只清一次，否則每一份都會把前一份洗掉
     return 0
 
@@ -4782,6 +5064,10 @@ def print_usage():
     print("  python3 RAG.py rebuild --kb <output_json> <input>... [--preflight|--fresh]  # 批次入庫（唯一會生成 chunk 脈絡的路徑）")
     print("  python3 RAG.py <input_file> <output_json> --fresh     # 清空既有 chunks 後只留這一份（figure artifacts 不動）")
     print("  python3 RAG.py <input.pdf> <output_json> --mineru-content-list <content_list.json> --mineru-pdf-sha256 <SHA256>  # 本地 MinerU 文字 lane")
+    print("  python3 RAG.py <input.pdf> <output_json> --redo-pages 1,3-5  # 復用其餘頁，完整文件提交")
+    print("  python3 RAG.py <input.pdf> <output_json> --redo-figures fig_<id>[,fig_<id>] | --retry-failed")
+    print("  python3 RAG.py ingest-status <input_file> [--root <project>]  # 唯讀持久進度，不呼叫模型")
+    print("  預設 --resume 復用有效checkpoint；--no-resume 重做全文。局部重做不可搭 --fresh/--preflight。")
     print("  python3 RAG.py <screenshot> <output_json> --chat      # 聊天截圖（互動式）")
     print("  python3 RAG.py <image> <output_json> --image          # 技術圖片（互動式）")
     print("  python3 RAG.py <url> <output_json> --url              # 網頁（互動式）")
@@ -4936,14 +5222,56 @@ def _apply_client_settings(path: Optional[str]) -> None:
     client_config.apply_to_config(settings, readonly=False)
 
 
+def _split_resume_options(argv):
+    flags = {"--resume": "resume", "--no-resume": "resume",
+             "--redo-pages": "redo_pages", "--redo-figures": "redo_figures",
+             "--retry-failed": "retry_failed"}
+    rest, values = [], {}
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        flag, separator, inline = item.partition("=")
+        if flag not in flags:
+            rest.append(item)
+            index += 1
+            continue
+        key = flags[flag]
+        if key in values:
+            raise ingest_checkpoint.CheckpointError(f"{flag} may be specified only once")
+        if flag in {"--resume", "--no-resume", "--retry-failed"}:
+            if separator:
+                raise ingest_checkpoint.CheckpointError(f"{flag} does not accept a value")
+            values[key] = flag != "--no-resume"
+        else:
+            if not separator:
+                index += 1
+                inline = argv[index] if index < len(argv) else ""
+            if not inline or inline.startswith("--"):
+                raise ingest_checkpoint.CheckpointError(f"{flag} requires a nonempty value")
+            values[key] = ingest_checkpoint.parse_pages(inline) if key == "redo_pages" else inline.split(",")
+        index += 1
+    ingest_checkpoint.ResumeOptions.validate(**values,
+        fresh="--fresh" in rest, preflight_only="--preflight" in rest)
+    return rest, values
+
+
 def main(argv: List[str]) -> int:
     """`__main__` 的實際內容（抽成函式才測得到 exit code；契約 §11.4）。
 
     `add_document` 內部的 `sys.exit(1)` 照舊直接往上拋 `SystemExit`——既有行為
     一個字都沒變，只有 figure lane 的兩種例外被映射成 2 / 1。
     """
+    if argv and argv[0] == "ingest-status":
+        parser = argparse.ArgumentParser(prog="RAG.py ingest-status", allow_abbrev=False)
+        parser.add_argument("source")
+        parser.add_argument("--root", default=None)
+        status_args = parser.parse_args(argv[1:])
+        root = _figure_root(status_args.root)
+        print(json.dumps(ingest_checkpoint.read_status(root, status_args.source), ensure_ascii=False, indent=2))
+        return 0
     argv, client_config_path = _split_client_config(list(argv))
     argv, mineru_kwargs = _split_mineru_options(argv)
+    argv, resume_kwargs = _split_resume_options(argv)
     _apply_client_settings(client_config_path)
     preflight_only = "--preflight" in argv
     fresh = "--fresh" in argv
@@ -4971,6 +5299,12 @@ def main(argv: List[str]) -> int:
         if mineru_kwargs:
             print("[ERROR] MinerU 文字 lane 只適用 PDF 文件模式")
             return 1
+        if any(resume_kwargs.get(key) for key in ("redo_pages", "redo_figures", "retry_failed")):
+            print("[ERROR] page/figure selective redo applies only to PDFs")
+            return 1
+        if resume_kwargs and (last_arg == "--url" or not auto_yes):
+            print("[ERROR] explicit resume options require file ingestion or --chat/--image -y")
+            return 1
 
         input_file = args[0]
         output_file = args[1]
@@ -4982,12 +5316,12 @@ def main(argv: List[str]) -> int:
 
         if mode == "--chat":
             if auto_yes:
-                add_chat_screenshot(input_file, output_file, fresh=fresh)
+                add_chat_screenshot(input_file, output_file, fresh=fresh, **resume_kwargs)
             else:
                 interactive_chat_screenshot(input_file, output_file)
         elif mode == "--image":
             if auto_yes:
-                add_technical_image(input_file, output_file, fresh=fresh)
+                add_technical_image(input_file, output_file, fresh=fresh, **resume_kwargs)
             else:
                 interactive_technical_image(input_file, output_file)
         elif mode == "--url":
@@ -5005,7 +5339,7 @@ def main(argv: List[str]) -> int:
     output_file = args[1]
     try:
         add_document(input_file, output_file, preflight_only=preflight_only, fresh=fresh,
-                     **mineru_kwargs)
+                     **mineru_kwargs, **resume_kwargs)
     except Exception as exc:  # noqa: BLE001 — 只攔 figure lane 的兩種，其餘原樣往上拋
         code = _pdf_cli_error_code(exc)
         if code is None:
@@ -5021,20 +5355,20 @@ if __name__ == "__main__":
         print_usage()
         sys.exit(0)
 
-    # rebuild 子命令走自己的 argparse，不進下面的手工 parser
-    if len(sys.argv) >= 2 and sys.argv[1] == "rebuild":
-        sys.exit(rebuild_cli(sys.argv[2:]))
-
-    if config_module.KB_CONTEXT_GENERATE:
-        print(
-            "[INFO] KB_CONTEXT_GENERATE 是開的，但 chunk 脈絡只在 "
-            "`python3 RAG.py rebuild --kb <kb> <doc>` 這條路徑生成；這次不生成。"
-        )
-
     try:
+        # rebuild 與一般／圖片入庫共用可行動錯誤的 CLI 邊界。
+        if len(sys.argv) >= 2 and sys.argv[1] == "rebuild":
+            sys.exit(rebuild_cli(sys.argv[2:]))
+
+        if config_module.KB_CONTEXT_GENERATE:
+            print(
+                "[INFO] KB_CONTEXT_GENERATE 是開的，但 chunk 脈絡只在 "
+                "`python3 RAG.py rebuild --kb <kb> <doc>` 這條路徑生成；這次不生成。"
+            )
+
         sys.exit(main(sys.argv[1:]))
-    except DocumentIdentityConflict as exc:
-        # 這是使用者要處理的狀況（撞名），不是程式壞掉。MCP 的 ingest_document
-        # 會把這段 stdout 原樣轉給模型看，traceback 只會蓋掉真正該讀的三個選項。
+    except (DocumentIdentityConflict, ingest_checkpoint.CheckpointError,
+            model_identity.ModelIdentityError) as exc:
+        # 撞名、checkpoint 與模型身分問題需保留修復指引；MCP 會轉送這行。
         print(f"[ERROR] {exc}")
         sys.exit(1)

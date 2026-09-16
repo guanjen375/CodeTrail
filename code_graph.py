@@ -535,15 +535,27 @@ def _extract_c_relations(rel_path: str, content: str, lang: str,
 # CodeGraph
 # ============================================================
 class CodeGraph:
-    def __init__(self, root: str):
+    def __init__(self, root: str, *, build_context=None):
         self.root = Path(root).resolve()
+        self.build_context = build_context if build_context is not None and build_context.restricts_files else None
         self.db_file = self.root / config.CODE_RAG_GRAPH_FILE
         self.lock_file = self.root / config.CODE_RAG_GRAPH_LOCK_FILE
+        if self.build_context is not None:
+            suffix = ".build-" + hashlib.sha256(self.build_context.target.encode()).hexdigest()[:20]
+            self.db_file = self.db_file.with_name(self.db_file.name + suffix)
+            self.lock_file = self.lock_file.with_name(self.lock_file.name + suffix)
         # 掃描復用 code_rag 的 scope + TTL 快照(§5-3 共用;同 key 同快照,
         # invalidate_scan_cache 同步失效兩邊)。
         import code_rag as _code_rag
 
-        self._scanner = _code_rag.CodeRAG(str(self.root))
+        self._scanner = (_code_rag.CodeRAG(str(self.root), build_context=self.build_context)
+                         if self.build_context is not None else _code_rag.CodeRAG(str(self.root)))
+
+    def for_build_context(self, context):
+        if not context.restricts_files:
+            return self
+        context.assert_fresh()
+        return CodeGraph(str(self.root), build_context=context)
 
     def build_command(self) -> str:
         """可直接複製執行的建圖命令(GPT 審核三輪 #3)。
@@ -555,11 +567,14 @@ class CodeGraph:
         """
         import shlex
 
-        return (
+        command = (
             f"{shlex.quote(sys.executable)} "
             f"{shlex.quote(str(Path(__file__).resolve()))} "
             f"--root {shlex.quote(str(self.root))}"
         )
+        if self.build_context is not None:
+            command += f" --build-target {shlex.quote(self.build_context.target)}"
+        return command
 
     # -------- 掃描 --------
     def _scan_files(self) -> dict:
@@ -715,17 +730,21 @@ class CodeGraph:
         raw_relations 的 resolve(跨檔)在 build/增量彙整時做。
         """
         try:
-            content = filepath.read_text(encoding="utf-8", errors="replace")
+            content = (self.build_context.read_source(rel_path) if self.build_context is not None
+                       else filepath.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             return None
+        if self.build_context is not None:
+            content = self.build_context.mask_source(rel_path, content)
         try:
-            symbols = parse_file(filepath, content)
+            symbols = (parse_file(filepath, content, build_context=self.build_context)
+                       if self.build_context is not None else parse_file(filepath, content))
         except DependencyError:
             raise
         except Exception:
             symbols = []
 
-        lang = _lang_for(rel_path)
+        lang = (self.build_context.parser_language(rel_path) if self.build_context is not None else None) or _lang_for(rel_path)
         backend = symbols[0].backend if symbols else "none"
         id_pairs = _assign_node_ids(rel_path, lang, symbols)
 
@@ -746,7 +765,9 @@ class CodeGraph:
             if sym.backend != "tree-sitter":
                 return "unknown"
             linkage = sym.linkage or "external"
-            if linkage == "internal" and Path(rel_path).suffix.lower() in _HEADER_EXTENSIONS:
+            is_header = (Path(rel_path).suffix.lower() in _HEADER_EXTENSIONS or
+                         (self.build_context is not None and rel_path not in self.build_context.source_paths))
+            if linkage == "internal" and is_header:
                 signature = sym.signature or sym.context or ""
                 if re.search(r"\b(?:inline|__inline|__inline__)\b", signature):
                     return "header_inline"
@@ -757,9 +778,11 @@ class CodeGraph:
                 nid, rel_path, sym.type, sym.name,
                 sym.qualified_name or sym.name,
                 sym.start_line, sym.end_line,
-                sym.backend or "unknown", "exact",
+                sym.backend or "unknown", (
+                    "unknown" if self.build_context is not None and
+                    self.build_context.state_for(rel_path, sym.start_line) != "active" else "exact"),
                 graph_linkage(sym),
-                sym.condition,
+                None if self.build_context is not None and self.build_context.state_for(rel_path, sym.start_line) == "active" else sym.condition,
             )
             for nid, sym in id_pairs
         ]
@@ -783,6 +806,22 @@ class CodeGraph:
                 (caller, name, lineno, "name", condition)
                 for caller, name, lineno, condition in calls_c
             ]
+
+        if self.build_context is not None:
+            context = self.build_context
+            # Reconstruction includes macro-expanded and driver-forced includes,
+            # which are absent from a raw tree-sitter include traversal.
+            includes = sorted({(record["raw"], record["line"], record.get("angle", False),
+                                None if record["state"] == "active" else "<unknown build include>")
+                               for record in context.include_records if record["path"] == rel_path},
+                              key=lambda value: (value[1], value[0], str(value[3])))
+            calls = [(caller, name, line, kind, None if context.state_for(rel_path, line) == "active" else condition)
+                     for caller, name, line, kind, condition in calls
+                     if context.state_for(rel_path, line) != "inactive"]
+            declarations = [(name, qualified, line, linkage,
+                             None if context.state_for(rel_path, line) == "active" else condition)
+                            for name, qualified, line, linkage, condition in declarations
+                            if context.state_for(rel_path, line) != "inactive"]
 
         file_row = (rel_path, file_hash, lang, backend)
         return file_row, node_rows, {
@@ -831,7 +870,8 @@ class CodeGraph:
     def build(self, verbose: bool = False) -> None:
         """整體建置(§7.5)。首建走 staging,已存在走 in-place transaction。"""
         files = self._scan_files()
-        require_parsers_for_paths(files)
+        require_parsers_for_paths(files, **({"build_context": self.build_context}
+                                          if self.build_context is not None else {}))
         lock_fd = fs_safety.acquire_file_lock(self.lock_file, self.root)
         try:
             # staging 殘留清理:只在持鎖時、只清自家精確前綴(§7.5)
@@ -857,6 +897,8 @@ class CodeGraph:
             file_rows.append(file_row)
             node_rows.extend(nodes)
             per_file_relations[rel_path] = relations
+        if self.build_context is not None:
+            self.build_context.assert_fresh()
         return file_rows, node_rows, per_file_relations
 
     def _edge_rows(self, file_rows, node_rows, per_file_relations,
@@ -924,10 +966,13 @@ class CodeGraph:
                         "defines", rel_path, row[5], row[7], "exact",
                         "definition", row[10],
                     ))
-            lang = _lang_for(rel_path)
+            lang = (self.build_context.parser_language(rel_path) if self.build_context is not None else None) or _lang_for(rel_path)
             edge_backend = "python-ast" if lang == "python" else "tree-sitter"
             for raw, lineno, is_angle, include_condition in relations["includes"]:
-                if is_angle:
+                if self.build_context is not None:
+                    candidates = [path for path in self.build_context.include_targets(rel_path, lineno, raw)
+                                  if path in all_files]
+                elif is_angle:
                     # A bare <stdint.h> does not identify the repo's
                     # include-search path.  A unique vendored shim with that
                     # basename must not impersonate the compiler/system header.
@@ -964,11 +1009,12 @@ class CodeGraph:
                     edges.append((
                         "file", rel_path, "file", candidates[0], None, None,
                         "includes", rel_path, lineno, edge_backend, "resolved",
-                        "unique_repo_angle_include" if is_angle else "unique_quote_include",
+                        "compiler_forced_include" if self.build_context is not None and lineno == 0
+                        else "unique_repo_angle_include" if is_angle else "unique_quote_include",
                         include_condition,
                     ))
                 elif not candidates:
-                    if not is_angle:  # angle zero-match = system/external，不製造噪音邊
+                    if not is_angle or self.build_context is not None:
                         edges.append((
                             "file", rel_path, None, None, raw, None,
                             "includes", rel_path, lineno, edge_backend, "syntactic",
@@ -1247,7 +1293,7 @@ class CodeGraph:
                 )
 
         for rel_path, relations in per_file_relations.items():
-            lang = _lang_for(rel_path)
+            lang = (self.build_context.parser_language(rel_path) if self.build_context is not None else None) or _lang_for(rel_path)
             backend = "python-ast" if lang == "python" else "tree-sitter"
             for caller_id, name, lineno, kind, call_condition in relations["calls"]:
                 if caller_id not in node_by_id:
@@ -1430,6 +1476,30 @@ class CodeGraph:
                     add_unresolved(
                         caller_id, name, rel_path, lineno, backend, call_condition
                     )
+        if self.build_context is not None:
+            checked = []
+            for edge in edges:
+                state = self.build_context.state_for(edge[7], edge[8])
+                if edge[6] == "includes":
+                    state = self.build_context.include_state(edge[7], edge[8], edge[3])
+                if edge[3] is None or edge[5] is not None or edge[10] not in CONFIRMED_EDGE_CONFIDENCE:
+                    state = "unknown"
+                target = node_by_id.get(edge[3]) if edge[2] == "symbol" else None
+                if target is not None:
+                    target_state = self.build_context.state_for(target[1], target[5])
+                    if target_state == "inactive":
+                        continue
+                    if target_state != "active":
+                        state = "unknown"
+                if state == "inactive":
+                    continue
+                if state != "active":
+                    mutable = list(edge)
+                    mutable[10] = "unknown"
+                    mutable[11] = "build_target_unknown:" + str(edge[11])
+                    edge = tuple(mutable)
+                checked.append(edge)
+            edges = checked
         return edges
 
     _INSERT_FILE = "INSERT INTO files(path, content_hash, lang, backend) VALUES (?,?,?,?)"
@@ -1604,7 +1674,8 @@ class CodeGraph:
             )
 
         files = self._scan_files()
-        require_parsers_for_paths(files)
+        require_parsers_for_paths(files, **({"build_context": self.build_context}
+                                          if self.build_context is not None else {}))
         conn = self._connect()
         try:
             row = conn.execute(
@@ -1861,6 +1932,8 @@ class CodeGraph:
     # Traversal API(§7.4;內部,不開新 MCP tool)
     # ============================================================
     def _require_ready(self):
+        if self.build_context is not None:
+            self.build_context.assert_fresh()
         if not self._db_ready():
             raise CodeGraphError(
                 "code graph 不存在或不可讀;semantic 查詢不受影響,"
@@ -1877,13 +1950,20 @@ class CodeGraph:
         conn = self._connect()
         conn.execute("BEGIN")
         try:
-            require_parsers_for_paths(row[0] for row in conn.execute("SELECT path FROM files"))
+            require_parsers_for_paths((row[0] for row in conn.execute("SELECT path FROM files")),
+                                     **({"build_context": self.build_context} if self.build_context is not None else {}))
             row = conn.execute("SELECT parser_versions FROM index_metadata LIMIT 1").fetchone()
             if row is None or f"parser-backend-policy:{PARSER_BACKEND_POLICY};" not in row[0]:
                 raise CodeGraphError(
                     f"code graph parser backend policy 已更新;請執行 `{self.build_command()}` 重建"
                 )
+            if self.build_context is not None:
+                identity = conn.execute("SELECT scope_fingerprint FROM index_metadata LIMIT 1").fetchone()
+                if identity is None or identity[0] != self._scanner.scope.fingerprint:
+                    raise CodeGraphError("build context graph is stale; call ensure_fresh before querying")
             yield conn
+            if self.build_context is not None:
+                self.build_context.assert_fresh()
         finally:
             try:
                 conn.rollback()
@@ -1922,14 +2002,16 @@ class CodeGraph:
                            conn=conn)
         return rows[0][0] if rows else None
 
-    @staticmethod
-    def _node_dict(r) -> dict:
-        return {
+    def _node_dict(self, r) -> dict:
+        node = {
             "id": r[0], "path": r[1], "kind": r[2], "name": r[3],
             "qualified_name": r[4], "start_line": r[5], "end_line": r[6],
             "backend": r[7], "confidence": r[8],
             "linkage": r[9], "condition": r[10],
         }
+        if self.build_context is not None:
+            node["build_state"] = self.build_context.state_for(r[1], r[5])
+        return node
 
     def _edge_dict(self, r, name_cache: dict,
                    conn: sqlite3.Connection | None = None) -> dict:
@@ -1937,7 +2019,7 @@ class CodeGraph:
         dst_name = (
             self._id_name(r[3], name_cache, conn) if (r[2] == "symbol" and r[3]) else r[3]
         )
-        return {
+        edge = {
             "src_kind": r[0], "src_id": r[1], "src_name": src_name,
             "dst_kind": r[2], "dst_id": r[3], "dst_name": dst_name,
             "unresolved_target": r[4], "ambiguity_group": r[5],
@@ -1948,6 +2030,13 @@ class CodeGraph:
             # 只是候選之一,不得呈現成確定關係(審核 #3)。
             "resolved": r[3] is not None and r[5] is None,
         }
+        if self.build_context is not None:
+            edge["build_state"] = ("unknown" if r[10] == "unknown" else
+                                   self.build_context.include_state(r[7], r[8], r[3]) if r[6] == "includes"
+                                   else self.build_context.state_for(r[7], r[8]))
+            if edge["build_state"] != "active":
+                edge["resolved"] = False
+        return edge
 
     _EDGE_COLS = ("src_kind, src_id, dst_kind, dst_id, unresolved_target,"
                   " ambiguity_group, type, evidence_path, evidence_line,"
@@ -1967,7 +2056,10 @@ class CodeGraph:
         DB 被外部竄改塞進 scope 外路徑時,查詢端把它濾掉,不把 root 外
         (或已被 scope 排除)的路徑外洩到回答裡。刻意不耦合 media._safe_path。
         """
-        return self._scanner.scope.should_index_file(edge.get("evidence_path", ""))
+        path = edge.get("evidence_path", "")
+        return (self._scanner.scope.should_index_file(path) and
+                (self.build_context is None or self.build_context.state_for(
+                    path, edge.get("evidence_line", 1)) != "inactive"))
 
     def neighbors(self, node_id: str, edge_types: tuple = ("calls",),
                   direction: str = "both", hops: int = 1, limit: int = 50) -> dict:
@@ -2204,12 +2296,21 @@ def _cli(argv: list[str]) -> int:
 
     parser = argparse.ArgumentParser(description="Build the CodeTrail code graph")
     parser.add_argument("--root", required=True, help="專案根目錄(AICODE_ROOT)")
+    parser.add_argument("--build-target", help="Explicit imported compilation profile")
     args = parser.parse_args(argv)
     root = Path(args.root).resolve()
     if not root.is_dir():
         print(f"[CODE_GRAPH] root 不是目錄: {root}", file=sys.stderr)
         return 2
-    graph = CodeGraph(str(root))
+    if args.build_target:
+        from build_context import load_build_context
+        context = load_build_context(root, args.build_target)
+        if not context.restricts_files:
+            print("[CODE_GRAPH] build metadata unavailable; import the target first", file=sys.stderr)
+            return 2
+        graph = CodeGraph(str(root), build_context=context)
+    else:
+        graph = CodeGraph(str(root))
     graph.build(verbose=True)
     with graph._read_snapshot() as conn:
         nodes = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]

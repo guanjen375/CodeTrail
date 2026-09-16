@@ -214,10 +214,20 @@ def model_identity(base_url: str, session=None) -> Dict:
     try:
         props = _request_json(session, "GET", base_url.rstrip("/") + "/props", timeout=10)
     except ContextGenerationError:
+        if config.DEPLOYMENT_MODE == "client":
+            raise
         props = {}
     finally:
         if owns_session:
             session.close()
+
+    if config.DEPLOYMENT_MODE == "client":
+        from model_identity import capture_model_identity, ModelIdentityError
+        try:
+            identity = capture_model_identity("main", props=props)
+        except ModelIdentityError as exc:
+            raise ContextGenerationError(str(exc)) from exc
+        return {**identity, "n_ctx": identity["live"]["n_ctx"]}
 
     settings = props.get("default_generation_settings") or {}
     identity = {
@@ -268,6 +278,13 @@ def generation_fingerprint(
         "identity": identity,
         "extra": extra or {},
     }
+    # Ingestion checkpoints require a content-bound local model identity (or a
+    # verified, versioned runtime alias on split deployments). Preserve the
+    # existing cache path and non-ingest compatibility; only strengthen the key.
+    import ingest_checkpoint
+    checkpoint = ingest_checkpoint.current_job()
+    if checkpoint is not None:
+        payload["ingest_model_fingerprint"] = checkpoint.model_identity("main")["fingerprint"]
     blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 

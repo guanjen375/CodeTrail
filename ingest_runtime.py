@@ -61,19 +61,22 @@ class IngestBusyError(RuntimeError):
 BUSY_TOOLS: frozenset[str] = frozenset({
     "query_knowledge",
     "query_knowledge_strict",
+    "query_table",
     "reload_knowledge_base",
     "remove_document",
     "review_figures",
+    "review_text",
     "ingest_document",
 })
 
-# 這兩個是 evidence tool：忙碌時 raise，不回字串。
+# evidence tools：忙碌時 raise，不回字串。
 EVIDENCE_BUSY_TOOLS: frozenset[str] = frozenset({
     "query_knowledge",
     "query_knowledge_strict",
+    "query_table",
 })
 
-# 會回 busy **字串**的就是其餘那四個。adapter 靠 `ingest_notify.BUSY_TOOL_NAMES`
+# 會回 busy **字串**的就是其餘工具。adapter 靠 `ingest_notify.BUSY_TOOL_NAMES`
 # 判斷「這段文字算不算 busy」，兩邊漂移的後果是：多了會把成功結果誤報成未執行，
 # 少了會讓 busy 落成 `status: ok`。所以在 import 時就對齊，不留給測試發現。
 if BUSY_TOOLS - EVIDENCE_BUSY_TOOLS != set(ingest_notify.BUSY_TOOL_NAMES):

@@ -27,6 +27,16 @@ import os
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 _LOOPBACK_NAMES = frozenset({"localhost", "ip6-localhost", "ip6-loopback"})
+MODEL_ROLES = ("main", "embedding", "reranker", "vl")
+_ROLE_PATHS = {
+    "main": {"", "/", "/health", "/props", "/slots", "/v1/models", "/completion",
+             "/v1/chat/completions", "/tokenize", "/detokenize"},
+    "embedding": {"", "/", "/health", "/props", "/v1/models", "/embedding", "/v1/embeddings"},
+    "reranker": {"", "/", "/health", "/props", "/v1/models", "/reranking"},
+    "vl": {"", "/", "/health", "/props", "/v1/models", "/v1/chat/completions"},
+}
+for _paths in _ROLE_PATHS.values():
+    _paths.add("/slots")
 
 
 def redact_url(url: str) -> str:
@@ -79,6 +89,71 @@ KB_CONTEXT_REMOTE_OK_KEY = "kb_context_remote_ok"
 
 class EndpointPolicyError(RuntimeError):
     """非 loopback 端點且沒有對應 opt-in。呼叫端可轉譯成自己的錯誤型別。"""
+
+
+def _url_parts(url: str):
+    try:
+        if not isinstance(url, str) or not url or any(ord(c) < 33 or ord(c) == 127 for c in url):
+            raise ValueError("invalid URL characters")
+        parts = urlsplit(url)
+        if (parts.scheme not in {"http", "https"} or not parts.hostname or
+                parts.username is not None or parts.password is not None or parts.query or parts.fragment):
+            raise ValueError("invalid URL components")
+        port = parts.port if parts.port is not None else (443 if parts.scheme == "https" else 80)
+        if not 1 <= port <= 65535:
+            raise ValueError("invalid port")
+        return parts, port
+    except (ValueError, TypeError) as exc:
+        raise EndpointPolicyError("model endpoint must be an http(s) URL without credentials, query or fragment") from exc
+
+
+def canonical_direct_base_url(url: str) -> str:
+    """Native llama-server root on a literal private/loopback unicast IP.
+
+    No hostname resolution or URL path rewriting can change this destination.
+    The application policy is not a replacement for the A/B network ACL.
+    """
+    parts, port = _url_parts(url)
+    try:
+        address = ipaddress.ip_address(parts.hostname)
+    except ValueError as exc:
+        raise EndpointPolicyError("split model endpoint requires a literal private IP address") from exc
+    if ("%" in parts.hostname or address.is_unspecified or address.is_multicast or
+            not (address.is_private or address.is_loopback) or
+            (address.is_reserved and not address.is_loopback) or parts.path not in {"", "/"}):
+        raise EndpointPolicyError("split model endpoint must be a private unicast IP and native server root")
+    host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    return f"{parts.scheme}://{host}:{port}"
+
+
+def validate_model_endpoints(value) -> dict[str, str]:
+    if not isinstance(value, dict) or (value and set(value) != set(MODEL_ROLES)):
+        raise EndpointPolicyError("model_endpoints must be empty or name all four model roles")
+    result = {role: canonical_direct_base_url(url) for role, url in value.items()}
+    if len(set(result.values())) != len(result):
+        raise EndpointPolicyError("the four model roles require distinct model endpoints")
+    return result
+
+
+def _ensure_split(url: str, role: str) -> None:
+    import config
+
+    grants = validate_model_endpoints(getattr(config, "MODEL_ENDPOINTS", {}))
+    if not grants:
+        raise EndpointPolicyError("client deployment requires owner-only client.json model_endpoints for all four roles")
+    parts, _ = _url_parts(url)
+    origin = canonical_direct_base_url(urlunsplit((parts.scheme, parts.netloc, "", "", "")))
+    configured = {"main": config.LLAMA_BASE_URL, "embedding": config.LLAMA_EMBED_BASE_URL,
+                  "reranker": config.LLAMA_RERANK_BASE_URL, "vl": config.LLAMA_VL_BASE_URL}
+    candidates = ("main",) if role == "kb_context" else ((role,) if role in MODEL_ROLES else MODEL_ROLES)
+    matches = [name for name in candidates
+               if grants.get(name) == origin
+               and (role in MODEL_ROLES or canonical_direct_base_url(configured[name]) == origin)
+               and parts.path in _ROLE_PATHS[name]]
+    if not matches:
+        raise EndpointPolicyError(f"{role} endpoint is not authorized by client.json model_endpoints")
+    if role == "kb_context" and not _kb_context_remote_ok():
+        raise EndpointPolicyError(_kb_context_error(redact_url(url)))
 
 
 def is_loopback_host(host: str) -> bool:
@@ -137,12 +212,20 @@ _ROLES = {
 }
 
 
-def ensure_allowed(url: str, role: str) -> None:
+def ensure_allowed(url: str, role: str, *, split: bool = False) -> None:
     """url 的 host 非 loopback 且該 role 未 opt-in 時 raise EndpointPolicyError。
 
     錯誤訊息內的 URL 一律先 redact_url:policy 錯誤會被印出與往上拋,
     不得帶出 URL 內嵌的 credentials。
     """
+    import config
+    if role not in {*_ROLES, *MODEL_ROLES}:
+        raise ValueError(f"unknown endpoint role: {role!r}")
+    if split or getattr(config, "DEPLOYMENT_MODE", "local") == "client" or getattr(config, "MODEL_ENDPOINTS", {}):
+        _ensure_split(url, role)
+        return
+    if role in MODEL_ROLES:
+        role = "model"
     try:
         allowed_fn, error_fn = _ROLES[role]
     except KeyError:

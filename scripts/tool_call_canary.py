@@ -377,6 +377,8 @@ def fetch_main_server_props(
     不從環境變數猜 —— 殼層殘留一個指向別台機器的 URL,等於拿別人的
     chat_template / n_ctx 當自己的指紋輸入。"""
     url = _server_root_url(base_url.strip()) + "/props"
+    import endpoint_policy
+    endpoint_policy.ensure_allowed(url, "main")
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
         with _local_probe_opener().open(request, timeout=timeout) as response:
@@ -393,6 +395,10 @@ def fetch_main_server_props(
 
 
 def _model_file_signature(props: Mapping[str, Any]) -> dict[str, Any]:
+    import config
+    if config.DEPLOYMENT_MODE == "client":
+        from model_identity import capture_model_identity
+        return capture_model_identity("main", props=dict(props))
     model_path = props.get("model_path")
     if not isinstance(model_path, str) or not model_path:
         return {"path": "unknown"}
@@ -1031,7 +1037,16 @@ def run_all(
     except CanaryError as exc:
         return _handle_failure(str(exc))
 
-    props = fetch_main_server_props(base_url)
+    try:
+        props = fetch_main_server_props(base_url)
+        import config
+        if config.DEPLOYMENT_MODE == "client":
+            from model_identity import capture_model_identity
+            if not isinstance(props, dict):
+                return _handle_failure("client topology requires live main identity before model canary")
+            capture_model_identity("main", props=props)
+    except RuntimeError as exc:
+        return _handle_failure(str(exc))
     caps = props.get("chat_template_caps") if isinstance(props, Mapping) else None
     if isinstance(caps, Mapping) and caps.get("supports_tools") is False:
         return _handle_failure(
@@ -1188,6 +1203,8 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
+    import client_config
+    client_config.apply_to_config(client_config.load_client_settings(), readonly=True)
     # 子行程的環境:剝掉全部 CodeTrail 設定變數。standalone 執行時這一步特別
     # 重要 —— preflight 那條路的呼叫端是客戶端(它自己已經不看那些變數),
     # 但直接跑這支的人可能就站在一個污染的殼層裡。

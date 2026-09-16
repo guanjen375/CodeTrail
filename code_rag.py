@@ -474,12 +474,16 @@ class CodeRAG:
     - embedding 使用 numpy .npz 二進位格式（壓縮率高）
     """
 
-    def __init__(self, folder: str):
+    def __init__(self, folder: str, *, build_context=None):
         self.folder = Path(folder).resolve()
+        self.build_context = build_context if build_context is not None and build_context.restricts_files else None
         # 索引範圍引擎(Layer C 設定不存在時就是預設行為,不會 fail)
-        self.scope = load_index_scope(self.folder)
+        self.scope = (load_index_scope(self.folder, build_context=self.build_context)
+                      if self.build_context is not None else load_index_scope(self.folder))
         # 快取檔案
         cache_base = CODE_RAG_CACHE_FILE.replace('.json', '')
+        if self.build_context is not None:
+            cache_base += ".build-" + hashlib.sha256(self.build_context.target.encode()).hexdigest()[:20]
         self.cache_meta_file = self.folder / f"{cache_base}_meta.json"
         self.cache_emb_file = self.folder / f"{cache_base}_emb.npz"
         # 單一 writer 鎖(§5-2);建立走 fs_safety 的 symlink 防線
@@ -494,11 +498,21 @@ class CodeRAG:
         # 快取裡的 scope_fingerprint 是否與現在的規則一致(見 _load_file_cache)
         self._scope_fingerprint_ok = False
 
+    def for_build_context(self, context):
+        """Independent query view; never mutate the process-wide default target."""
+        if not context.restricts_files:
+            return self
+        context.assert_fresh()
+        return CodeRAG(str(self.folder), build_context=context)
+
     # 保留成 class attribute:既有測試與呼叫端都靠它。
     _CONTENT_HASH_MAX_BYTES = CONTENT_HASH_MAX_BYTES
 
     def _compute_file_hash(self, filepath: Path) -> str:
         """計算單一檔案的 hash（用於增量快取驗證）。見 compute_file_hash。"""
+        if self.build_context is not None:
+            rel = filepath.relative_to(self.folder).as_posix()
+            return self.build_context.dependencies.get(rel) or ""
         return compute_file_hash(filepath, self._CONTENT_HASH_MAX_BYTES)
 
     def _scan_code_files(self, *, force_refresh: bool = False) -> dict:
@@ -514,6 +528,8 @@ class CodeRAG:
         invalidate_scan_cache() 之後才 fresh 掃描。
         """
         ttl = int(getattr(config, "CODE_RAG_REFRESH_TTL_SECONDS", 30))
+        if self.build_context is not None:
+            self.build_context.assert_fresh()
         cache_key = (str(self.folder), self.scope.fingerprint)
         if not force_refresh and ttl > 0:
             cached = _INDEX_SCAN_CACHE.get(cache_key)
@@ -529,7 +545,9 @@ class CodeRAG:
         result = {}
         for filepath, rel_path in walk_index_files(self.scope):
             # §5-5:無 parser 的檔案不入 symbol 掃描(grep/list_dir 不受影響)
-            if not file_kind_policy.enters_symbol_scan(rel_path):
+            selected_code = (self.build_context is not None and
+                             self.build_context.parser_language(rel_path) in ("c", "cpp"))
+            if not file_kind_policy.enters_symbol_scan(rel_path) and not selected_code:
                 continue
             file_hash = self._compute_file_hash(filepath)
             if file_hash:
@@ -590,6 +608,12 @@ class CodeRAG:
                   file=sys.stderr)
             return {}
 
+        expected_build = self.build_context.fingerprint if self.build_context is not None else None
+        if meta.get("build_context_fingerprint") != expected_build:
+            # Header/macro changes can alter symbols even with unchanged source
+            # bytes. Per-file cache reuse is unsafe across this boundary.
+            return {}
+
         # 版本消費矩陣(§6 P2-5):parser semantics 決定 symbol 集合、embed-text
         # schema 與 render 預算決定向量內容。增量重建只比 file_hash,這些一動舊
         # cache 就是錯的,而且錯得無聲 —— 必須在這裡擋掉。
@@ -636,7 +660,8 @@ class CodeRAG:
         )
 
         file_cache = meta.get("file_cache", {})
-        require_parsers_for_paths(file_cache)
+        require_parsers_for_paths(file_cache, **({"build_context": self.build_context}
+                                               if self.build_context is not None else {}))
         # 新格式的 dense cache 不在 JSON 存向量(見 _save_cache),要從 .npz
         # 還原。舊 cache 仍夾帶 embeddings —— 原樣沿用,不必為了換格式重建。
         if npz_md5 is not None and any(
@@ -715,6 +740,8 @@ class CodeRAG:
         - 寫入失敗 raise(fail-loud),不得無聲吞掉。
         """
         _require_numpy()
+        if self.build_context is not None:
+            self.build_context.assert_fresh()
         lock_fd = fs_safety.acquire_file_lock(self.cache_lock_file, self.folder)
         try:
             # 上次 crash 可能留下 tmp 殘留;持鎖下只清自家精確前綴
@@ -761,6 +788,7 @@ class CodeRAG:
                 **cache_identity(),
                 "generation_id": uuid.uuid4().hex,
                 "scope_fingerprint": self.scope.fingerprint,
+                "build_context_fingerprint": self.build_context.fingerprint if self.build_context is not None else None,
                 "embedding_dim": emb_dim,
                 "npz_md5": npz_md5,
                 "row_count": len(self.index),
@@ -797,7 +825,8 @@ class CodeRAG:
 
         # 使用 AST 解析器
         try:
-            ast_symbols = parse_file(filepath, content)
+            ast_symbols = (parse_file(filepath, content, build_context=self.build_context)
+                           if self.build_context is not None else parse_file(filepath, content))
         except DependencyError:
             raise
         except Exception as e:
@@ -821,6 +850,8 @@ class CodeRAG:
                 'qualified_name': sym.qualified_name or sym.name,
                 'backend': sym.backend or 'unknown',
             }
+            if self.build_context is not None:
+                symbol_dict['build_state'] = self.build_context.state_for(rel_path, sym.start_line)
             # 如果有 parent（method 屬於某個 class），記錄下來
             if sym.parent:
                 symbol_dict['parent'] = sym.parent
@@ -897,7 +928,8 @@ class CodeRAG:
     def _index_single_file(self, filepath: Path, rel_path: str,
                            compute_embeddings: bool = True) -> tuple:
         """索引單一檔案，返回 (symbols, embeddings)"""
-        content = filepath.read_text(encoding='utf-8', errors='replace')
+        content = (self.build_context.read_source(rel_path) if self.build_context is not None
+                   else filepath.read_text(encoding='utf-8', errors='replace'))
         symbols = self._extract_symbols(filepath, content)
 
         file_symbols = []
@@ -927,7 +959,7 @@ class CodeRAG:
                 index_entry['docstring'] = sym['docstring'][:config.CODE_RAG_DOCSTRING_MAX_CHARS]
             if 'type_hints' in sym and sym['type_hints']:
                 index_entry['type_hints'] = sym['type_hints']
-            for field in ('comments', 'linkage', 'condition', 'storage_class'):
+            for field in ('comments', 'linkage', 'condition', 'storage_class', 'build_state'):
                 if sym.get(field):
                     index_entry[field] = sym[field]
 
@@ -943,7 +975,8 @@ class CodeRAG:
 
         _require_numpy()
         current_files = _current_files if _current_files is not None else self._scan_code_files_fresh()
-        require_parsers_for_paths(current_files)
+        require_parsers_for_paths(current_files, **({"build_context": self.build_context}
+                                                  if self.build_context is not None else {}))
 
         # 嘗試載入快取
         if self._load_cache():
@@ -1546,6 +1579,8 @@ class CodeRAG:
                 result_item['end_line'] = item['end_line']
             if 'parent' in item:
                 result_item['parent'] = item['parent']
+            if self.build_context is not None:
+                result_item['build_state'] = item.get('build_state', 'unknown')
             results.append(result_item)
         return results
 
@@ -1559,12 +1594,15 @@ class CodeRAG:
         設定與結果;見模組頂端的 TRACE_* 說明)。半途拋例外時已填的階段仍在呼叫端手上。
         """
         _require_numpy()
+        if self.build_context is not None:
+            self.build_context.assert_fresh()
         if trace is not None:
             trace.update({"kind": "code_rag", "stage": "index", "pool": [], "final": [], "files": []})
         # 已載入的 symbols（含零 symbol 檔案）也不能繞過主要 parser 准入。
         required_paths = set(self._file_cache) | set(self._indexed_file_hashes or {})
         required_paths.update(item.get("path", "") for item in self.index)
-        require_parsers_for_paths(required_paths)
+        require_parsers_for_paths(required_paths, **({"build_context": self.build_context}
+                                                   if self.build_context is not None else {}))
         # Lazy build：第一次 query 時才建立索引
         if not self.index:
             self.build_index(verbose=True)
@@ -1722,6 +1760,8 @@ class CodeRAG:
         # 使用 reranker 二次排序（條件觸發)。分數是 query-local 的
         # RankedCandidate(§5-1),絕不寫回 self.index 的持久 item。
         ranked = self._rerank_code_candidates(question, candidates_for_rerank, top_k, trace=trace)
+        if self.build_context is not None:
+            self.build_context.assert_fresh()
         if trace is not None:
             _finish_code_trace(trace, ranked, self._indexed_file_hashes or {})
         return ranked

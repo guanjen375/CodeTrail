@@ -671,6 +671,11 @@ def build_document(artifact: MineruArtifact, native_document: ExtractedDocument,
                                            "source_char_start": block.char_start,
                                            "source_char_end": block.char_end} for block in selected],
                     })
+                    import text_review
+                    text_review.initialize_chunk(
+                        document.chunks[-1],
+                        source_path=artifact.pdf_path.relative_to(artifact.root).as_posix(),
+                        artifact_path=artifact.content_list_path.relative_to(artifact.root).as_posix())
 
     for chunk in retained_figures:
         page = chunk.get("page")

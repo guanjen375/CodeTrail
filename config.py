@@ -32,6 +32,8 @@ def _file_env() -> dict[str, str]:
 
 
 _DEPLOYMENT_PROFILE = _deployment_profile.load_effective_profile(_file_env())
+DEPLOYMENT_MODE = _DEPLOYMENT_PROFILE.mode
+MODEL_ENDPOINTS: dict[str, str] = {}  # only owner-only client.json may authorize endpoints
 LLAMA_BASE_URL = _DEPLOYMENT_PROFILE.service("main").base_url
 LLAMA_EMBED_BASE_URL = _DEPLOYMENT_PROFILE.service("embedding").base_url
 LLAMA_RERANK_BASE_URL = _DEPLOYMENT_PROFILE.service("reranker").base_url
@@ -57,6 +59,8 @@ LLAMA_VL_URL = f"{LLAMA_VL_BASE_URL}/v1/chat/completions"
 # 找不到 → 空 dict;此時 deployment.json 的 main.model 必須是 GGUF 絕對路徑。
 # 那個檔是 registry 的**唯一**來源(以前還有兩個環境變數可以指到別份 registry)。
 def _load_model_registry() -> dict[str, str]:
+    if DEPLOYMENT_MODE == "client":
+        return {}
     return _deployment_profile.load_model_registry(_file_env())
 
 

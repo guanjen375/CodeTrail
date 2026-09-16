@@ -663,19 +663,20 @@ def test_busy_gate_covers_exactly_the_kb_tools(monkeypatch, mcp_root):
     mcp = import_mcp_module(monkeypatch, mcp_root)
     assert ingest_runtime.BUSY_TOOLS == frozenset({
         "query_knowledge", "query_knowledge_strict", "reload_knowledge_base",
-        "remove_document", "review_figures", "ingest_document",
+        "query_table", "remove_document", "review_figures", "review_text", "ingest_document",
     })
     assert "code_rag_search" not in ingest_runtime.BUSY_TOOLS
 
     with ingest_runtime.begin("ingest_document (test)"):
         # evidence tool:raise,讓 adapter 產生符合 outputSchema 的 structured error
-        for name in ("query_knowledge", "query_knowledge_strict"):
+        for name in ("query_knowledge", "query_knowledge_strict", "query_table"):
             with pytest.raises(ingest_runtime.IngestBusyError):
                 tool_fn(mcp, name)("問題")
         # 其餘四個回字串,而且讀起來是「稍後重試」不是「失敗」
         assert tool_fn(mcp, "reload_knowledge_base")().startswith("稍後重試")
         assert tool_fn(mcp, "remove_document")("spec.pdf").startswith("稍後重試")
         assert tool_fn(mcp, "review_figures")().startswith("稍後重試")
+        assert tool_fn(mcp, "review_text")().startswith("稍後重試")
         second = tool_fn(mcp, "ingest_document")("spec.pdf")
         assert second.startswith("稍後重試"), second
         assert not second.startswith("錯誤"), second
@@ -2118,6 +2119,7 @@ def test_catalog_and_ingest_schema_are_unchanged(monkeypatch, mcp_root):
     # ctx 是 FastMCP 注入用的,不得出現在模型看得到的 schema 裡
     assert sorted(ingest.inputSchema["properties"]) == [
         "fresh", "mineru_content_list", "mineru_pdf_sha256", "mode", "path", "preflight_only",
+        "redo_figures", "redo_pages", "resume", "retry_failed",
     ]
     assert ingest.inputSchema.get("required") == ["path"]
     assert ingest.outputSchema is None

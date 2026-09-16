@@ -11,6 +11,7 @@ PUBLIC_TOOL_ORDER: tuple[str, ...] = (
     "file_info",
     "query_knowledge",
     "query_knowledge_strict",
+    "query_table",
     "git_status",
     "git_diff",
     "apply_patch",
@@ -21,6 +22,7 @@ PUBLIC_TOOL_ORDER: tuple[str, ...] = (
     "remove_document",
     "reload_knowledge_base",
     "review_figures",
+    "review_text",
     "import_external_file",
     "record_lesson",
 )
@@ -33,14 +35,14 @@ if len(PUBLIC_TOOL_NAMES) != len(PUBLIC_TOOL_ORDER):  # pragma: no cover - impor
 
 # The client injects this text into the model-visible system prompt. Keep it a
 # routing map, not a second copy of every tool description.
-MCP_INSTRUCTIONS = """Use CodeTrail for facts about the current project or indexed documents. Locate unknown code with code_rag_search, exact text with grep_code, known files with read_file, directories with list_dir, and indexed specs with query_knowledge; use query_knowledge_strict for high-risk numeric constraints. In git repos, inspect git_status/git_diff before apply_patch; a non-git root gets a skip notice. Use analyze_file for images, PDF spot checks, ELF, or firmware. Query independent evidence in parallel, then answer from returned source/file:line evidence. If evidence is absent, say so and do not guess. Plain text, XML, or promises are not tool calls; rely only on completed structured tool results."""
+MCP_INSTRUCTIONS = """Use CodeTrail for project facts. Locate code with code_rag_search (build_target scopes compilation), text with grep_code, files with read_file, directories with list_dir. Query specs with query_knowledge, high-risk constraints with query_knowledge_strict, exact table cells with query_table. In git repos inspect git_status/git_diff before apply_patch; non-git skip notices need no retry. Use analyze_file for images, PDF, ELF, or memory consistency. Query independent evidence in parallel and cite source/file:line. Missing or unverified evidence remains unknown. Plain text, XML, or promises are not tool calls; rely on completed structured results."""
 
 if len(MCP_INSTRUCTIONS) > 700:  # pragma: no cover - import guard
     raise RuntimeError("MCP_INSTRUCTIONS exceeds the 700-character contract")
 
 
 EVIDENCE_TOOL_NAMES: frozenset[str] = frozenset(
-    {"code_rag_search", "query_knowledge", "query_knowledge_strict"}
+    {"code_rag_search", "query_knowledge", "query_knowledge_strict", "query_table"}
 )
 
 
@@ -60,7 +62,8 @@ MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
     "code_rag_search": (
         "Locate code by intent or traverse confirmed graph evidence. semantic finds symbols; neighbors takes a symbol or relative "
         "file; path takes 'SRC -> DST'; context builds bounded evidence. For Chinese questions, keep the query mostly ASCII English "
-        "and include distinctive identifiers. Returns path:line evidence plus explicit uncertainties/truncation."
+        "and include distinctive identifiers. Select imported build_target for compilation scope; otherwise target is unknown. "
+        "Returns path:line evidence plus uncertainties/truncation."
     ),
     "file_info": "Inspect size/type metadata for one sandboxed path before deciding how to read or analyze it.",
     "query_knowledge": (
@@ -69,7 +72,11 @@ MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
     "query_knowledge_strict": (
         "Answer high-risk numeric/spec constraints through the server-side grounding and refusal gate. Use query_knowledge for normal "
-        "document lookup. Respect refused=true and review excluded_figures before asserting a value."
+        "document lookup. Respect refused=true and review excluded_figures/excluded_text before asserting a value."
+    ),
+    "query_table": (
+        "Read exact verified canonical table cells by register, address, or one-based row/column. "
+        "Returns literal values with sources. Ambiguous, missing, damaged or unverified cells remain unknown; no model calls."
     ),
     "git_status": "Return the repository worktree status. Call before edits in a git project so user changes are preserved; a non-git root returns a skip notice, not an error.",
     "git_diff": "Return current repository diffs, optionally for one path or staged changes. Use before and after apply_patch in a git project; a non-git root returns a skip notice.",
@@ -90,20 +97,26 @@ MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
     "analyze_file": (
         "Inspect a sandboxed image, PDF spot-check, ELF, or firmware/binary without ingesting it. For ELF choose a closed-set view and "
-        "narrow target/limit when partial; use read_file for plain text."
+        "narrow target/limit when partial. consistency compares ELF with linker_map/linker_script/preload_log/dram_config; "
+        "missing evidence remains unknown. Use read_file for plain text."
     ),
     "ingest_document": (
-        "Add a sandboxed document/image/binary to knowledge.json. PDF preflight_only=true estimates cost with zero KB writes; fresh=true "
-        "rebuilds the KB and cannot be combined with preflight. For local MinerU PDF text, provide both mineru_content_list and the "
-        "PDF digest recorded at generation in mineru_pdf_sha256; strict excludes unverified OCR text. Query tools auto-reload after success. This call can run for minutes; "
-        "knowledge-base tools and a second ingest report busy until it finishes, so wait for this result instead of retrying. When the "
-        "result contains [CODETRAIL_ACTION_REQUIRED], report the listed figures and their next step instead of calling it done."
+        "Ingest a sandboxed file into knowledge.json. PDF preflight_only estimates cost without writes; fresh rebuilds the KB. "
+        "MinerU needs mineru_content_list plus its generation-time PDF SHA-256; strict excludes unverified OCR. "
+        "Queries auto-reload after success. Ingest can take minutes: KB tools report busy until completion; wait, do not retry. "
+        "Report [CODETRAIL_ACTION_REQUIRED] items and next steps. resume reuses validated checkpoints. "
+        "redo_pages/redo_figures/retry_failed are mutually exclusive PDF selectors, require resume, and cannot combine with "
+        "fresh/preflight. Unselected valid content is preserved; fresh and preflight cannot combine."
     ),
     "remove_document": "Remove every knowledge-base chunk for one source basename; query tools auto-reload afterward.",
     "reload_knowledge_base": "Force immediate fail-loud reload of knowledge.json and report status; normal queries already auto-reload.",
     "review_figures": (
         "List or fix structured PDF figures. action=list is read-only; action=fix requires figure_id, current expected_revision, canonical "
         "payload JSON, and confirm_against_image=true after human inspection. Conflicts and invalid payloads write nothing."
+    ),
+    "review_text": (
+        "List/show OCR or correct/confirm/revoke a revision. Changes require expected_revision and expected_sha256. "
+        "Correction does not confirm; set confirm_against_source only after source inspection. Strict accepts current verified, undamaged text."
     ),
     "import_external_file": "Copy an explicitly allowed external file into the sandbox, then use the returned relative path with analyze_file or ingest_document.",
     "record_lesson": (

@@ -363,6 +363,9 @@ def main(argv: list[str] | None = None) -> int:
                         help=("查詢時要不要吃 chunk 的生成脈絡。both = 同一份 KB 兩種旗標"
                               "各跑一次（單 KB A/B，不需要第二套 KB）"))
     args = parser.parse_args(argv)
+    if args.questions:
+        import client_config
+        client_config.apply_to_config(client_config.load_client_settings(), readonly=True)
 
     for path in filter(None, (args.kb, args.other_kb)):
         if not path.is_file():

@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import ast
 import builtins
+import contextvars
+import hashlib
 import json
 import subprocess
 import sys
@@ -1520,6 +1522,15 @@ def test_concurrent_ingest_is_not_lost(tmp_path: Path, monkeypatch):
     """
     monkeypatch.chdir(tmp_path)   # embedding 快取不要落到 repo
     monkeypatch.setattr(RAG.llama_client, "embed_one", lambda **_kw: [1.0, 0.0])
+    import media
+    import model_identity
+
+    monkeypatch.setattr(media, "_SANDBOX_ROOT", tmp_path.resolve())
+    monkeypatch.setattr(model_identity, "capture_model_identity", lambda role, **_kw: {
+        "schema": 1, "role": role, "model_id": "concurrent-ingest-fixture",
+        "identity_kind": "synthetic_fixture",
+        "fingerprint": hashlib.sha256(f"concurrent-ingest-fixture:{role}".encode()).hexdigest(),
+    })
     kb_path = tmp_path / config.KNOWLEDGE_FILE
 
     def _doc(name: str, body: str) -> Path:
@@ -1540,7 +1551,8 @@ def test_concurrent_ingest_is_not_lost(tmp_path: Path, monkeypatch):
         # 第二份還在算 embedding 時，另一個「行程」把第三份灌進同一個 KB
         if not interleaved["done"]:
             interleaved["done"] = True
-            RAG.add_document(str(third), str(kb_path))
+            # 獨立 writer 不繼承第一個 writer 的 checkpoint ContextVar。
+            contextvars.Context().run(RAG.add_document, str(third), str(kb_path))
         return original(chunks, cache_dir, **kwargs)
 
     monkeypatch.setattr(RAG, "generate_embeddings", interleave)

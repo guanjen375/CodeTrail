@@ -399,8 +399,11 @@ def test_remove_aborts_if_vectors_are_missing_and_leaves_json_unchanged(
 
 # ── 原 test_kb_document_identity.py:KB 文件身分——同 basename、不同來源檔一律 fail-loud ──
 @pytest.fixture
-def offline_embeddings(monkeypatch):
+def offline_embeddings(monkeypatch, tmp_path):
     """把 embedding 換成固定向量:入庫流程完整跑,只是不連 server。"""
+    import media
+
+    monkeypatch.setattr(media, "_SANDBOX_ROOT", tmp_path.resolve())
     def fake(chunks, *args, **kwargs):
         for chunk in chunks or []:
             chunk["embedding"] = [1.0, 0.0]
@@ -589,8 +592,18 @@ def _vec(text: str) -> list[float]:
     return [1.0 + digest[0] % 7, 1.0 + digest[1] % 7]
 
 
-def _stub_embed(monkeypatch) -> list[str]:
-    """打樁 embedding server，並記錄實際被送出去的字串。"""
+def _stub_embed(monkeypatch, *, root: Path | None = None) -> list[str]:
+    """打樁 embedding 與模型身分，並記錄實際被送出去的字串。"""
+    import media
+    import model_identity
+
+    if root is not None:
+        monkeypatch.setattr(media, "_SANDBOX_ROOT", root.resolve())
+    monkeypatch.setattr(model_identity, "capture_model_identity", lambda role, **_kw: {
+        "schema": 1, "role": role, "model_id": "knowledge-store-fixture",
+        "identity_kind": "synthetic_fixture",
+        "fingerprint": hashlib.sha256(f"knowledge-store-fixture:{role}".encode()).hexdigest(),
+    })
     sent: list[str] = []
 
     def fake_embed_one(*, content, **_kw):
@@ -665,7 +678,7 @@ def _vectors(kb_path: Path) -> list[list[float]]:
 # 驗收 1 — 空 KB fresh ingest 之後查得到
 # ==========================================================================
 def test_fresh_ingest_into_an_empty_kb_is_immediately_queryable(tmp_path: Path, monkeypatch):
-    _stub_embed(monkeypatch)
+    _stub_embed(monkeypatch, root=tmp_path)
     doc = tmp_path / "spec.md"
     doc.write_text("# Reset\n\nCTRL0 register address 0x1000 and reset value 32.\n",
                    encoding="utf-8")
@@ -813,7 +826,7 @@ def _figure_artifact(tmp_path: Path) -> Path:
 def test_fresh_mode_replaces_chunks_and_never_touches_figure_artifacts(
     tmp_path: Path, monkeypatch
 ):
-    _stub_embed(monkeypatch)
+    _stub_embed(monkeypatch, root=tmp_path)
     kb_path = tmp_path / config.KNOWLEDGE_FILE
     first = tmp_path / "first.md"
     first.write_text("first document body about register 0x1000\n", encoding="utf-8")
@@ -838,7 +851,7 @@ def test_fresh_mode_replaces_chunks_and_never_touches_figure_artifacts(
 def test_failed_fresh_ingest_leaves_the_previous_kb_and_cache_consistent(
     tmp_path: Path, monkeypatch
 ):
-    _stub_embed(monkeypatch)
+    _stub_embed(monkeypatch, root=tmp_path)
     kb_path = tmp_path / config.KNOWLEDGE_FILE
     first = tmp_path / "first.md"
     first.write_text("first document body about register 0x1000\n", encoding="utf-8")
@@ -875,7 +888,7 @@ def test_failed_fresh_ingest_leaves_the_previous_kb_and_cache_consistent(
 # 驗收 8 — 預設 ingest 語意不變（append）
 # ==========================================================================
 def test_default_ingest_still_appends(tmp_path: Path, monkeypatch):
-    _stub_embed(monkeypatch)
+    _stub_embed(monkeypatch, root=tmp_path)
     kb_path = tmp_path / config.KNOWLEDGE_FILE
     first = tmp_path / "first.md"
     first.write_text("first document body about register 0x1000\n", encoding="utf-8")
@@ -984,7 +997,7 @@ def test_two_kbs_in_one_directory_keep_separate_caches(tmp_path: Path, monkeypat
 def test_ingest_after_an_external_json_deletion_starts_from_an_empty_kb(
     tmp_path: Path, monkeypatch
 ):
-    _stub_embed(monkeypatch)
+    _stub_embed(monkeypatch, root=tmp_path)
     kb_path = tmp_path / config.KNOWLEDGE_FILE
     first = tmp_path / "first.md"
     first.write_text("first document body about register 0x1000\n", encoding="utf-8")
@@ -1053,7 +1066,7 @@ def test_writing_the_cache_refuses_a_symlinked_path(tmp_path: Path, monkeypatch)
 def test_fresh_ingest_works_even_when_the_old_cache_is_unusable(
     tmp_path: Path, monkeypatch
 ):
-    _stub_embed(monkeypatch)
+    _stub_embed(monkeypatch, root=tmp_path)
     kb_path = tmp_path / config.KNOWLEDGE_FILE
     first = tmp_path / "first.md"
     first.write_text("first document body about register 0x1000\n", encoding="utf-8")

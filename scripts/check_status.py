@@ -116,6 +116,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         expected = args.expected
         profile = load_effective_profile(**loader_kwargs(args))
+        if profile.mode == "client":
+            import client_config
+            import endpoint_policy
+            from deployment_status import query_server
+            client_config.apply_to_config(client_config.load_client_settings(), readonly=True)
+            for role, service in profile.services.items():
+                endpoint_policy.ensure_allowed(service.base_url, role, split=True)
+            snapshots = {}
+            source = _snapshot_reader(Path(args.snapshot)) if args.snapshot else query_server
+            def reader(service):
+                health, props = source(service)
+                snapshots[service.role] = props or {}
+                return health, props
+            inspection = inspect_deployment(profile, [], server_reader=None if args.no_network else reader)
+            print("[PROFILE] topology=client: model services on A; no local GPU/PID checks")
+            for role, observation in inspection.observations.items():
+                props = snapshots.get(role, {})
+                print(f"[ROLE] {role} endpoint={profile.service(role).base_url} "
+                      f"model={observation.model or 'unverified'} health={observation.health} "
+                      f"n_ctx={observation.n_ctx or 'unknown'} "
+                      f"capabilities={props.get('chat_template_caps') or props.get('modalities') or 'unknown'}")
+            for issue in inspection.issues:
+                print(f"[FAIL] {issue}", file=sys.stderr)
+            for warning in inspection.warnings:
+                print(f"[WARN] {warning}", file=sys.stderr)
+            return 1 if args.strict and (inspection.issues or args.no_network) else 0
         processes, gpu_error = query_gpu_processes()
         proc_root = Path(args.proc_root or "/proc")
         snapshot = (args.snapshot or "").strip()
@@ -146,7 +172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1 if failed else 0
         print("[INFO] report-only mode: exit 0；自動化檢查請使用 --strict")
         return 0
-    except ProfileError as exc:
+    except (ProfileError, RuntimeError) as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
         if args.strict:
             return 2

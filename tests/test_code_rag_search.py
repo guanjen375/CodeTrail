@@ -67,14 +67,13 @@ from repeat_guard import BANNER_THRESHOLD, RepeatGuard, args_key, banner  # noqa
 
 # ── 原 test_code_rag_search_contract.py:code_rag_search 的回傳契約(§8)與 graph 缺席行為 ──
 
-# 預設 shape 的 key 契約(§8.1):必含 5 鍵;end_line/parent 僅在 item 具備時
-# 出現;不得多任何新 key。
-REQUIRED_KEYS = {"path", "symbol", "type", "line", "score"}
+# 預設結果保留位置／分數並明示 build applicability；未選target不得假稱正在編譯。
+REQUIRED_KEYS = {"path", "symbol", "type", "line", "score", "build_context", "build_state"}
 OPTIONAL_KEYS = {"end_line", "parent"}
 EVIDENCE_KEYS = {"score_components", "backend", "confidence", "relations", "graph_status"}
 CONTEXT_KEYS = {
     "query", "evidence", "uncertainties", "seeds", "graph_status", "truncated",
-    "budget_chars", "used_chars",
+    "budget_chars", "used_chars", "build_context",
 }
 
 

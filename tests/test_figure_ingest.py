@@ -2,7 +2,8 @@
 
 守的是「靜默錯配 / 靜默改寫 / KB 半更新」那一類:原 page markdown 表被 structured
 chunk 取代之後不得留下第二份、`pos` 不可信時不得亂切正文、抽取失敗與預算超限
-一律零寫入、structured chunk 的 content 不得經過通用 normalize 與 splitter。
+不得發布 KB / 向量、structured chunk 的 content 不得經過通用 normalize 與 splitter。
+一般 ingest 可留下私有 checkpoint；明示 preflight 仍須完全零寫入。
 
 與 `tests/test_rag_ingest.py` 的分工:那一份守 PDF 逐頁抽取（頁碼、旋轉頁正文、
 「沒被 structured lane 收錄就是缺席」的列帳）;這一份守 structured lane 自己的契約。
@@ -327,7 +328,7 @@ class _Harness:
     def _set(self, name, value):
         self.monkeypatch.setattr(figure_extract, name, value, raising=False)
 
-    def install(self, plan, results, *, variants=None):
+    def install(self, plan, results, *, page_count, variants=None):
         variants = variants if variants is not None else []
         self.plan_spy = _Spy(result=plan)
 
@@ -374,6 +375,17 @@ class _Harness:
             outer.calls.append(((plan_arg,), kwargs))
             if outer.raises is not None:
                 raise outer.raises
+            # Resume delegates the probe to the extractor, which knows which
+            # candidates still need inference. This whole-extractor double
+            # must keep that boundary before rendering any fresh VL input.
+            if kwargs.get("checkpoint") is not None:
+                vl_kinds = set()
+                for candidate in plan_arg.candidates:
+                    if not figure_extract.read_native_lane(candidate):
+                        vl_kinds.update(figure_extract.candidate_vl_kinds(candidate))
+                if vl_kinds:
+                    self.ensure_capability(base_url=kwargs["vl_base_url"],
+                                           model=kwargs["vl_model"], kinds=vl_kinds)
             # T4 的 VL lane 一定先呼叫 render_variants 才送模型；native lane 零 VL、
             # 完全不 render。替身照做，`rendered`（實際模型輸入）才會是真的。
             render = kwargs.get("render_variants")
@@ -385,25 +397,42 @@ class _Harness:
         self._set("extract_document_figures", _extract)
         self.monkeypatch.setattr(
             RAG, "_open_pdf_document",
-            lambda _path: types.SimpleNamespace(page_count=99, close=lambda: None))
+            lambda _path: types.SimpleNamespace(page_count=page_count, close=lambda: None))
         return self
 
 
 def _harness(monkeypatch, tmp_path, pages, plan, results, *, variants=None) -> _Harness:
+    def to_markdown(_path, **kwargs):
+        selected = kwargs.get("pages")
+        return copy.deepcopy(pages if selected is None else [pages[index] for index in selected])
+
     monkeypatch.setattr(RAG, "check_pymupdf4llm",
-                        lambda: types.SimpleNamespace(to_markdown=lambda *a, **k: pages))
+                        lambda: types.SimpleNamespace(to_markdown=to_markdown))
     import media
 
     # root 交叉檢查讀的是 sandbox root(`mcp_server --root` 定案的那一個),
     # 不是 `AICODE_ROOT` 環境變數 —— root 已經走 argv。
     monkeypatch.setattr(media, "_SANDBOX_ROOT", tmp_path.resolve())
-    return _Harness(monkeypatch, tmp_path).install(plan, results, variants=variants)
+    return _Harness(monkeypatch, tmp_path).install(
+        plan, results, page_count=len(pages), variants=variants)
+
+
+def _offline_embedding(monkeypatch):
+    """固定向量與實際模型身分一起打樁，checkpoint 不得探測外部端點。"""
+    import model_identity
+
+    monkeypatch.setattr(RAG.llama_client, "embed_one", lambda **_kw: [1.0, 0.0])
+    monkeypatch.setattr(model_identity, "capture_model_identity", lambda role, **_kw: {
+        "schema": 1, "role": role, "model_id": "figure-ingest-fixture",
+        "identity_kind": "synthetic_fixture",
+        "fingerprint": hashlib.sha256(f"figure-ingest-fixture:{role}".encode()).hexdigest(),
+    })
 
 
 def _kb_ready(monkeypatch, tmp_path: Path) -> Path:
     """可寫入的 knowledge.json + 打樁的 embedding 端點。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(RAG.llama_client, "embed_one", lambda **_kw: [1.0, 0.0])
+    _offline_embedding(monkeypatch)
     kb_path = tmp_path / "knowledge.json"
     kb_path.write_text(json.dumps({
         "metadata": {"embedding_model": RAG.EMBEDDING_MODEL, "documents": [],
@@ -413,19 +442,29 @@ def _kb_ready(monkeypatch, tmp_path: Path) -> Path:
     return kb_path
 
 
-def _dir_snapshot(path: Path) -> list:
-    """整棵目錄的 (相對路徑, 大小)——零寫入要連 NPZ / embedding cache / .codetrail 都不長出來。
+def _dir_snapshot(path: Path, *, allow_checkpoint: bool = False) -> list:
+    """整棵目錄的 (相對路徑, 大小)，預設連 .codetrail 都不得長出來。
 
-    唯一豁免是 KB 的 store lock(``.knowledge.json.lock``):``add_document`` 在**任何 figure
+    KB 的 store lock(``.knowledge.json.lock``) 不算發布:``add_document`` 在**任何 figure
     工作之前**先驗一次 KB(「壞掉的 KB 要在付出抽取成本前就 fail」),那一步經
     ``knowledge_store_lock`` 必然建出 0 byte 的鎖檔。它不是 KB mutation,也不帶任何內容;
     把它算進零寫入斷言只會讓斷言與既有行為打架,而不是抓到真的寫入。
+
+    一般 ingest 失敗可明示允許私有 checkpoint；只豁免 .codetrail/ingest 子樹與
+    共用父目錄本身，figures / cache 及其全部檔案仍逐一列入。
     """
     # 鎖檔名由 knowledge_store._lock_path 決定:`.<json 檔名>.lock`
     lock_names = {f".{item.name}.lock" for item in path.rglob("*.json")} | {".knowledge.json.lock"}
-    return sorted((str(item.relative_to(path)), item.stat().st_size if item.is_file() else -1)
-                  for item in path.rglob("*")
-                  if item.name not in lock_names)
+    result = []
+    for item in path.rglob("*"):
+        relative = item.relative_to(path)
+        if item.name in lock_names:
+            continue
+        if allow_checkpoint and (relative == Path(".codetrail")
+                                 or relative.parts[:2] == (".codetrail", "ingest")):
+            continue
+        result.append((str(relative), item.stat().st_size if item.is_file() else -1))
+    return sorted(result)
 
 
 def _kb_chunks(kb_path: Path) -> list:
@@ -921,7 +960,7 @@ def test_preflight_over_budget_makes_zero_vl_zero_embedding_zero_write(
     kb_path = _kb_ready(monkeypatch, tmp_path)
     before = kb_path.read_bytes()
     pdf, harness, _fid = _simple_native_case(tmp_path, monkeypatch)
-    tree = _dir_snapshot(tmp_path)
+    tree = _dir_snapshot(tmp_path, allow_checkpoint=True)
     harness.check_preflight = _Spy(
         raises=figure_extract.FigureBudgetError("candidates 300 > 200 (stub)"))
     monkeypatch.setattr(figure_extract, "check_preflight", harness.check_preflight,
@@ -944,7 +983,8 @@ def test_preflight_over_budget_makes_zero_vl_zero_embedding_zero_write(
     assert "python3 RAG.py" in str(exc.value) and "--preflight" in str(exc.value)
     assert "python3 RAG.py" in out and "--preflight" in out
     assert "[PREFLIGHT] fake report" in out, "超出預算也要把完整報告印出來"
-    assert _dir_snapshot(tmp_path) == tree, "超出預算不得長出 NPZ / cache / lock 檔"
+    assert _dir_snapshot(tmp_path, allow_checkpoint=True) == tree, (
+        "超出預算只可留私有 checkpoint，不得發布 KB / NPZ / cache / figures")
 
 
 @pytest.mark.smoke
@@ -1531,7 +1571,7 @@ def test_reingest_keeps_the_human_fix_across_repeated_runs(tmp_path: Path, monke
     抓不到——人工修正會在第二次 re-ingest 才被丟掉。
     """
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(RAG.llama_client, "embed_one", lambda **_kw: [1.0, 0.0])
+    _offline_embedding(monkeypatch)
     pdf, harness, _fid = _simple_native_case(tmp_path, monkeypatch)
     kb_path, _store = _seed_human_verified_kb(
         monkeypatch, tmp_path, harness, asset_digest="asset", revision=3)
@@ -1569,7 +1609,7 @@ def test_reingest_drops_the_human_fix_when_the_source_pixels_changed(
 ):
     """來源像素改變 → fail-closed 不沿用，revision 從 1 起並記錄原因。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(RAG.llama_client, "embed_one", lambda **_kw: [1.0, 0.0])
+    _offline_embedding(monkeypatch)
     pdf, harness, _fid = _simple_native_case(tmp_path, monkeypatch)
     kb_path, _store = _seed_human_verified_kb(
         monkeypatch, tmp_path, harness, asset_digest="OTHER_PIXELS", revision=3)
@@ -1592,7 +1632,7 @@ def test_reingest_drops_the_human_fix_when_the_source_pixels_changed(
 def test_stale_human_record_revision_is_not_carried_over(tmp_path: Path, monkeypatch):
     """紀錄自報的 revision 與 KB 不同（artifact 落後）→ 誠實不沿用，不是硬寫下去。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(RAG.llama_client, "embed_one", lambda **_kw: [1.0, 0.0])
+    _offline_embedding(monkeypatch)
     pdf, harness, _fid = _simple_native_case(tmp_path, monkeypatch)
     kb_path, store = _seed_human_verified_kb(
         monkeypatch, tmp_path, harness, asset_digest="asset", revision=3)
@@ -1989,7 +2029,7 @@ def test_source_changed_before_commit_blocks_the_write(tmp_path: Path, monkeypat
 def test_concurrent_human_fix_is_not_overwritten(tmp_path: Path, monkeypatch):
     """carry-over 在鎖外讀 revision 3，別人先提交 revision 4 → 我們必須放棄，不是蓋掉。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(RAG.llama_client, "embed_one", lambda **_kw: [1.0, 0.0])
+    _offline_embedding(monkeypatch)
     pdf, harness, _fid = _simple_native_case(tmp_path, monkeypatch)
     kb_path, _store = _seed_human_verified_kb(
         monkeypatch, tmp_path, harness, asset_digest="asset", revision=3)
@@ -2039,7 +2079,7 @@ def test_unusable_human_evidence_is_reported_not_silently_dropped(
 ):
     """KB 說有人工確認、但 artifact 讀不回來 → 要說原因，不是靜默降級。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(RAG.llama_client, "embed_one", lambda **_kw: [1.0, 0.0])
+    _offline_embedding(monkeypatch)
     pdf, harness, _fid = _simple_native_case(tmp_path, monkeypatch)
     kb_path, store = _seed_human_verified_kb(
         monkeypatch, tmp_path, harness, asset_digest="asset", revision=3)
@@ -2171,7 +2211,7 @@ def test_carry_over_survives_the_real_artifact_store(tmp_path: Path, monkeypatch
     這條走的是契約指定的 persistence code path——manifest 真的被寫出來、真的被讀回去。
     """
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(RAG.llama_client, "embed_one", lambda **_kw: [1.0, 0.0])
+    _offline_embedding(monkeypatch)
     pdf, harness, _fid = _simple_native_case(tmp_path, monkeypatch)
     figure_review = _use_real_artifact_store(monkeypatch)
     kb_path = tmp_path / "knowledge.json"
@@ -2212,7 +2252,7 @@ def test_changed_pixels_are_not_carried_over_through_the_real_store(
 ):
     """真 store 上的另一半：來源像素改變 → fail-closed，不沿用。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(RAG.llama_client, "embed_one", lambda **_kw: [1.0, 0.0])
+    _offline_embedding(monkeypatch)
     pdf, harness, _fid = _simple_native_case(tmp_path, monkeypatch)
     figure_review = _use_real_artifact_store(monkeypatch)
     kb_path = tmp_path / "knowledge.json"

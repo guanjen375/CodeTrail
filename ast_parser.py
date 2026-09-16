@@ -1306,9 +1306,10 @@ def parser_language(filepath: Path) -> str | None:
     return _TREE_SITTER_SUFFIXES.get(suffix)
 
 
-def require_parsers_for_paths(paths) -> None:
+def require_parsers_for_paths(paths, *, build_context=None) -> None:
     """快取與建立入口以語言去重檢查，沒有該語言就不要求它的工具。"""
-    languages = {parser_language(Path(path)) for path in paths}
+    languages = {(build_context.parser_language(str(path)) if build_context is not None else None)
+                 or parser_language(Path(path)) for path in paths}
     for language in sorted(lang for lang in languages if lang and lang != 'python'):
         if language in ('java', 'kotlin'):
             CtagsParser(language).require_available()
@@ -1343,11 +1344,20 @@ def _h_header_language() -> str:
     return value
 
 
-def parse_file(filepath: Path, content: str) -> list[Symbol]:
+def parse_file(filepath: Path, content: str, *, build_context=None) -> list[Symbol]:
     """解析檔案並提取符號"""
-    parser = get_parser(filepath)
+    rel_path = None
+    if build_context is not None and build_context.restricts_files:
+        rel_path = filepath.relative_to(build_context.root).as_posix()
+        content = build_context.mask_source(rel_path, content)
+    language = build_context.parser_language(rel_path) if rel_path is not None else None
+    parser = TreeSitterParser(language) if language in ("c", "cpp") else get_parser(filepath)
     try:
-        return parser.parse(content, filepath)
+        symbols = parser.parse(content, filepath)
+        if rel_path is not None:
+            symbols = [symbol for symbol in symbols
+                       if build_context.state_for(rel_path, symbol.start_line) != "inactive"]
+        return symbols
     except DependencyError:
         raise
     except Exception as exc:

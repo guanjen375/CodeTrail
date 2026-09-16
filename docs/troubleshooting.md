@@ -199,7 +199,7 @@ cache,不再把 cache 加一次。沒有可靠數據就只顯示階段,不依經
 | lessons | `<專案>/.codetrail/lessons.md` | 通常很小 |
 | 使用者全域指示 | `~/.config/codetrail/instructions.md` | ≤ 8,000 字元 |
 | 沙箱根目錄 | 內建 | 一行 |
-| 19 個工具的 JSON schema | MCP `tools/list` | 通常是這裡面最大的一段 |
+| 21 個工具的 JSON schema | MCP `tools/list` | 通常是這裡面最大的一段 |
 
 同一個專案、同一份設定,這段 prefix 每次跑起來逐字相同。**改了上面任何一份檔案,或換一個
 專案目錄,prefix 就整份不一樣了。**
@@ -294,11 +294,11 @@ EOF
 (server 同時回 `usage` 與 `timings` 時取 `usage`),cache 全命中時照樣是一個大數字。
 
 <a id="mcp-connected-but-no-tool-call"></a>
-### `/tools` 列得出 19 個,但模型說沒有 CodeTrail 或只印出假工具 XML
+### `/tools` 列得出 21 個,但模型說沒有 CodeTrail 或只印出假工具 XML
 
 **典型症狀**:
 
-- `/tools` 明明列得出 19 個工具,模型卻回答「沒有 CodeTrail 工具」。
+- `/tools` 明明列得出 21 個工具,模型卻回答「沒有 CodeTrail 工具」。
 - 明確要求 `list_dir(path=".", depth=1)` 後,模型只輸出 `<list_dir path="." depth="1"/>`,接著用自然語言宣稱「已成功取得目錄」,畫面上沒有 `· list_dir → completed`、也沒有真實目錄內容。
 - 模型每輪都回答「我現在呼叫」「讓我直接使用工具」，但訊息隨即結束；使用者催促後只換句話重複，始終沒有工具卡。
 
@@ -311,10 +311,10 @@ EOF
 | 本輪實際執行 | 模型真的發出結構化 tool call,client 執行後把結果送回模型 | TUI 的 `· <工具> → completed`,或 JSON event 的 `type: "tool_use"`、`part.state.status: "completed"` |
 
 `aicode` 把 transport、explicit hard gate 與 implicit diagnostic 分開，不需要
-每次先叫模型背 19 個名字：
+每次先叫模型背 21 個名字：
 
-- `MCP PASS — 19 tools + list_dir round-trip`：每次啟動都另起一個 MCP server 子行程，完成
-  `initialize`、依固定順序精確比對 19 個名稱，擷取完整 typed schemas／instructions digest，
+- `MCP PASS — 21 tools + list_dir round-trip`：每次啟動都另起一個 MCP server 子行程，完成
+  `initialize`、依固定順序精確比對 21 個名稱，擷取完整 typed schemas／instructions digest，
   再執行無副作用的 `list_dir(path=".", depth=1)`。這層完全不問 LLM；schema 的
   bounds/description/budget 由 static contract 驗證，routing catalog 另保存逐工具
   counts/digests 與 token measurement。

@@ -129,94 +129,15 @@ disown
 
 ## 多機部署:CodeTrail 與 GPU 主機分開
 
-CodeTrail repo 跑在你工作機(CPU 即可),llama-server 跑在另一台 GPU 主機。CodeTrail 透過 HTTP 呼叫對方的 8080 / 8081 / 8082 / 8083。
+使用 [A／B 分離部署指南](split-deployment.md)完成設定與驗證：
 
-先在 GPU 主機照 [README §3](../README.md)(`./set_config.sh` + `~/start.sh`)建立四個
-server。主 server 的 `-c` 決定主 n_ctx(`set_config.sh` 沒有預設值,由你輸入)；
-CodeTrail 會讀 server 實值，`aicode` 也會把它傳給客戶端當 context gate 與壓縮門檻的
-依據。連線方式選下面其中一種，不要混用。
+- A 使用 `model-host`，執行 main、embedding、reranker、VL 四類模型，產生版本化模型身分並匯出 client manifest。
+- B 使用 `client`，執行 aicode、MCP、編輯、build、KB 與評測；安裝 Python 依賴及工作所需工具即可，不需要 GPU、GGUF、mmproj、tmux 或 llama-server。
+- B 匯入 manifest 時逐一授權四個精確端點；`deployment.json` 指定目的地，owner-only `client.json.model_endpoints` 控制允許連線的範圍。KB 脈絡生成另需明確授權。
 
-### 路徑 A:可信 VPN / 內網直連
-
-GPU 主機必須明確開放監聽：執行 `./set_config.sh --allow-remote`，或在 deployment.json
-各 service 設 `"bind": "all-interfaces"`；完整設定見
-[deployment-profiles.md](deployment-profiles.md)。
-
-工作機端**改設定檔,不是環境變數** —— 客戶端與 MCP 不從環境取任何設定。
-在 `~/.config/codetrail/deployment.json` 把四個 `base_url` 指到 GPU 主機:
-
-```json
-{
-  "schema_version": 1,
-  "profile": "defaults",
-  "services": {
-    "main":      {"base_url": "http://<GPU_HOST>:8080", "port": 8080, "model": "<CODE_MODEL>"},
-    "embedding": {"base_url": "http://<GPU_HOST>:8081", "port": 8081},
-    "reranker":  {"base_url": "http://<GPU_HOST>:8082", "port": 8082},
-    "vl":        {"base_url": "http://<GPU_HOST>:8083", "port": 8083}
-  }
-}
-```
-
-再在 `~/.config/codetrail/client.json` 明確同意把 prompt 送出這台機器:
-
-```json
-{ "schema": 1, "model_remote_ok": true }
-```
-
-然後 `cd <PROJECT> && aicode`。沒有那個同意鍵時每一個模型呼叫都會 fail-loud ——
-prompt 可能含 NDA 內容,填一個遠端 IP 不等於同意外送。
-
-(不用另設 ctx max —— `aicode` 會讀 `deployment.json` 的 `main.base_url` 指到的遠端 server `/props`,把主 `n_ctx` 以 argv 交給客戶端與 MCP server。)
-
-遠端 endpoint **只**由 deployment profile 的 `main.base_url` 決定;`n_ctx` 在每次 `aicode` 啟動時從該 server 的 `/props` 讀,不需要另外抄一份。
-
-`client.json` 的 `"model_remote_ok": true` 是必要的明確同意：沒有它，CodeTrail 對非 loopback endpoint 的
-health / props / completion / embedding / reranking 呼叫都會 fail-loud。這個 opt-in 不會提供
-加密或認證，只表示你接受 prompt / retrieved content 送到該 endpoint。
-
-**安全提醒**:CodeTrail 產生的 llama-server 指令未啟用認證，等於任何能連到
-GPU 主機 8080–8083 的人都能使用模型。上游雖有 `--api-key` 與 TLS 選項，
-CodeTrail 目前的 profile 與內部 HTTP client 並未支援傳遞這些 credential，不要只在
-server 端手動加 key 後就假設四條 CodeTrail 呼叫路徑仍可用。**只能指向可信
-內網 / VPN 主機**，不要暴露公網。Profile URL 也不接受內嵌 credentials。
-
-### 路徑 B:SSH tunnel(建議)
-
-GPU 主機保持預設 loopback 綁定，**不要**加 `--allow-remote`。在工作機建立 tunnel；
-這裡刻意用 18080–18083 當本機埠，避免撞到本機既有 server:
-
-```bash
-ssh -N \
-  -L 18080:127.0.0.1:8080 \
-  -L 18081:127.0.0.1:8081 \
-  -L 18082:127.0.0.1:8082 \
-  -L 18083:127.0.0.1:8083 \
-  user@<GPU_HOST>
-```
-
-保持 tunnel terminal 開著，另開一個 terminal 啟動:
-
-同樣改 `~/.config/codetrail/deployment.json`(tunnel 的本機 port),然後 `aicode`:
-
-```json
-{
-  "schema_version": 1,
-  "profile": "defaults",
-  "services": {
-    "main":      {"base_url": "http://127.0.0.1:18080", "port": 18080, "model": "<CODE_MODEL>"},
-    "embedding": {"base_url": "http://127.0.0.1:18081", "port": 18081},
-    "reranker":  {"base_url": "http://127.0.0.1:18082", "port": 18082},
-    "vl":        {"base_url": "http://127.0.0.1:18083", "port": 18083}
-  }
-}
-```
-
-端點是 loopback(tunnel 這一端),所以不需要 `model_remote_ok`。
-
-同時把 deployment profile 的 `main.base_url` 設為 `http://127.0.0.1:18080`。有效 endpoint
-仍是工作機 loopback，所以這條路徑不需要在 client.json 開 `model_remote_ok`；prompt 與 retrieved
-content 會經 SSH 加密隧道送到 GPU 主機。
+直連 IP、port、防火牆 ACL、模型更新與診斷均依該指南操作。只修改 `base_url` 或沿用舊版
+`model_remote_ok`，不足以完成 `client` 模式的端點授權及 live 模型身分驗證。
+主 n_ctx 每次從 A 的 `/props` 讀取，B 無須另外設定或維護模型檔路徑。
 
 ---
 
@@ -236,14 +157,15 @@ content 會經 SSH 加密隧道送到 GPU 主機。
 
 1. 沙箱根 = 目前目錄。`/` 與 `$HOME` 一律拒絕,沒有 opt-in
 2. 驗證 deployment profile(壞掉不得靜默退回預設值再啟動)
-3. 解析主模型:只從 `deployment.json` 的 `main.model` 與 `models.json`。
-   沒有 `-m`、沒有環境變數 —— 換模型 = 重跑 `./set_config.sh`
+3. 依 deployment mode 解析主模型：local／model-host 使用 `main.model` 與 `models.json`；
+   client 核對 A 公開的版本 alias，不讀 B 本機權重。沒有 `-m` 或環境變數覆寫；
+   換模型需重新設定，分離部署另須更新 B 的 manifest
 4. 讀主 llama-server `/props` 取得真實 `n_ctx`,再跑 ctx capacity gate
    (`requested > server n_ctx` 就拒絕啟動,**沒有逃生口**)
 5. 把 active [lessons(行為教訓)](lessons.md) render 進 `.codetrail/lessons.md`,並提示已過
    `review_by` 的待複審清單
 6. 對三個 aux server 跑 hard preflight
-7. 直接起一次 MCP server 做 `initialize → tools/list → list_dir`,確認完整 19-tool contract
+7. 直接起一次 MCP server 做 `initialize → tools/list → list_dir`,確認完整 21-tool contract
    與唯讀工具派發都正常
 8. 用 fresh `codetrail_chat.py run --policy readonly --format json` 驗 active model 真的產生
    completed 的結構化 `list_dir` event;依 model / 客戶端檔案 / system prompt / project 指紋
@@ -252,7 +174,7 @@ content 會經 SSH 加密隧道送到 GPU 主機。
 10. 啟動 TUI。通過時對話區只有一行摘要 + 壓縮狀態行 + 警告(含第 7、8 項寫到 stderr 的
     工具健檢警告);上面每一行仍完整留在 TUI 之前的終端畫面。失敗時不進 TUI,錯誤留在終端
 
-第 7 項每次啟動都實跑，不靠模型自述；第 8 項首次、快取過期或指紋變動才實跑，所以不必每次手動問「列出 19 個工具」。第 8 項實跑（本地推理，通常數十秒起）前會先印出原因與單次上限，執行中每 15 秒回報進度——不是當機。要強制重測就刪掉 `~/.cache/codetrail/tool-call-canary.v3.json`(沒有略過用的環境變數)。完整 PASS / FAIL 說明見 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)。
+第 7 項每次啟動都實跑，不靠模型自述；第 8 項首次、快取過期或指紋變動才實跑，所以不必每次手動問「列出 21 個工具」。第 8 項實跑（本地推理，通常數十秒起）前會先印出原因與單次上限，執行中每 15 秒回報進度——不是當機。要強制重測就刪掉 `~/.cache/codetrail/tool-call-canary.v3.json`(沒有略過用的環境變數)。完整 PASS / FAIL 說明見 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)。
 
 ---
 

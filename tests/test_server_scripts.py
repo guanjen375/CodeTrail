@@ -523,6 +523,7 @@ def _fake_profile(llama_bin: Path | str = "/bin/true"):
     class _Profile:
         llama_bin = binary
         registry_file = None
+        mode = "local"
 
         def service(self, role):
             return _service(role)

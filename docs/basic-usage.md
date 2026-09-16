@@ -14,7 +14,8 @@
 python3 scripts/doctor.py
 ```
 
-`<CODE_MODEL>` 是佔位符,必須替換成 MODEL_REGISTRY 裡登記的 bare name 或 GGUF 絕對路徑;deployment profile 的 `main.model` 設好時,doctor 也能從那裡解析。`FAIL` 要先處理;`WARN` 可以依訊息判斷是否需要調整。接著切到要分析的專案根目錄:
+doctor 依目前 deployment profile 檢查；[分離部署](split-deployment.md)的 B 端不需要本機 GGUF。
+`FAIL` 要先處理；`WARN` 可以依訊息判斷是否需要調整。接著切到要分析的專案根目錄：
 
 ```bash
 cd <PROJECT_TO_ANALYZE>
@@ -25,7 +26,7 @@ aicode
 
 - `[client] PASS`：客戶端進入點存在且可執行(就是這個 repo 裡的 `codetrail_chat.py`,
   canary 驗的就是它,沒有覆寫)。
-- `MCP PASS — 19 tools + list_dir round-trip`：每次都 live 初始化 MCP、精確檢查 19 個名稱與
+- `MCP PASS — 21 tools + list_dir round-trip`：每次都 live 初始化 MCP、精確檢查 21 個名稱與
   固定順序，擷取完整 typed schemas／instructions digest，並執行一次唯讀 `list_dir`。
   schema bounds/description/budget 由同一 public contract 的 static test 驗證；routing catalog
   另保存逐工具 counts/digests 與 token measurement。
@@ -81,6 +82,9 @@ CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透�
 | 高風險規格數字 | `請用 query_knowledge_strict 查最大值，證據不足就拒答。` |
 
 完整工具清單見 [MCP 工具清單](mcp-tools.md)。
+
+回合進行中仍可輸入訊息，選擇「排到下一輪」或「補充目前任務」。等待／送達狀態及
+查看、修改、取消操作見 [訊息排隊與途中補充](message-queue.md)。
 
 ### 怎麼讀工具結果
 
