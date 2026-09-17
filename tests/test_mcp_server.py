@@ -833,6 +833,32 @@ def test_code_rag_fastmcp_path_wraps_core_and_injects_dynamic_default(
     assert large.structuredContent["result"][0]["budget_chars"] > small_budget
 
 
+@pytest.mark.smoke
+@pytest.mark.parametrize("tool_name", ["analyze_file", "run_command"])
+def test_elf_tool_failures_are_mcp_errors(monkeypatch, tmp_path, tool_name):
+    """Live MetaWare session displayed failed objdump/elfdump calls as completed."""
+    mcp_module = import_mcp_module(monkeypatch, tmp_path)
+    if tool_name == "analyze_file":
+        (tmp_path / "firmware.elf").write_bytes(b"\x7fELF")
+        body = "[ELF 錯誤] ELFDependencyError: objdump cannot disassemble this architecture"
+        monkeypatch.setattr(mcp_module, "read_elf", lambda *_a, **_kw: body)
+        arguments = {"path": "firmware.elf"}
+    else:
+        body = "=== ✗ 失敗 (exit 1) ===\n[elfdump] Unknown option '-'"
+        monkeypatch.setattr(mcp_module.EXEC, "run_command", lambda *_a, **_kw: body)
+        arguments = {"cmd": "elfdump --help"}
+
+    result = _run_tool(mcp_module, tool_name, arguments)
+    assert result.isError is True, _content_text(result)
+    assert _content_text(result).startswith("status: error\n")
+    assert body in _content_text(result)
+    # The same words inside a successful result are data, not failure markers.
+    budget = ResultBudget(2_000, 6_000, explicit=False, context_risk=False)
+    success = adapt_tool_result(tool_name, "=== ✓ 成功 ===\n" + body, budget=budget)
+    assert success.isError is False
+    assert success.content[0].text.startswith("status: ok\n")
+
+
 def test_success_content_words_do_not_forge_error_or_partial_status():
     budget = ResultBudget(2_000, 6_000, explicit=False, context_risk=False)
     info = adapt_tool_result("file_info", "error.log: 檔案, 1 行, 9 字元", budget=budget)

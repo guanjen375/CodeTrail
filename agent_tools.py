@@ -787,11 +787,28 @@ class ToolExecutor:
 
         if target.is_file():
             try:
-                content = target.read_text(encoding="utf-8", errors="replace")
-                lines = content.count('\n') + 1
-                chars = len(content)
-            except Exception:
-                lines, chars = "N/A", target.stat().st_size
+                size = target.stat().st_size
+                ext = target.suffix.lower()
+                encoding = None
+                if ext not in _NONTEXT_EXTENSIONS and ext != ".pdf":
+                    with target.open("rb") as source:
+                        encoding, _ = _sniff_text_encoding(source.read(8192))
+                if encoding is None:
+                    guidance = (
+                        "請用 analyze_file 解析。" if ext in _ANALYZABLE_EXTENSIONS
+                        else "請先轉成支援的文字、PDF 或圖片格式再分析。"
+                    )
+                    return f"{path}: 檔案, 二進位/非文字, {size:,} bytes；{guidance}"
+
+                # Match read_file's encoding decision. Binary bytes must never
+                # become fictitious text counts that misroute the next call.
+                lines, chars = 1, 0
+                with target.open("r", encoding=encoding, errors="replace") as source:
+                    for chunk in iter(lambda: source.read(65536), ""):
+                        lines += chunk.count('\n')
+                        chars += len(chunk)
+            except Exception as exc:
+                return f"錯誤: 無法讀取 '{path}' 的檔案資訊: {exc}"
 
             return f"{path}: 檔案, {lines} 行, {chars:,} 字元"
         else:

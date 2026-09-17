@@ -134,6 +134,35 @@ def test_media_safe_path_blocks_external_when_disabled(sandbox: Path, tmp_path_f
 # 併自 tests/test_read_file_gating.py:read_file 的內容型別分流。
 # --------------------------------------------------------------------------
 @pytest.mark.smoke
+@pytest.mark.parametrize(
+    "name, payload, analyzable",
+    [
+        ("firmware.elf", b"\x7fELF\x01\x01\x00\xff\n" * 32, True),
+        ("firmware.out", b"\x7fELF\x01\x01\x00\xff\n" * 32, True),
+        ("firmware.dat", b"\xff" * 32, True),
+        ("spec.pdf", b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n", True),
+        ("archive.zip", b"PK\x03\x04\x00\xff", False),
+    ],
+    ids=["elf", "elf-out", "binary-dat", "pdf", "unsupported-zip"],
+)
+def test_file_info_does_not_describe_binary_as_text(tmp_path, name, payload, analyzable):
+    """Live ARC session: fictitious ELF line counts sent the model to read_file."""
+    (tmp_path / name).write_bytes(payload)
+    ex = ToolExecutor(str(tmp_path))
+
+    out = ex.file_info(name)
+
+    assert "二進位/非文字" in out, out
+    assert f"{len(payload):,} bytes" in out, out
+    assert " 行" not in out and " 字元" not in out, out
+    assert ("請用 analyze_file" in out) is analyzable, out
+    # The shared content check must still recognize ordinary Unicode text.
+    for encoding in ("utf-8", "utf-16"):
+        (tmp_path / "notes.txt").write_text("hello 世界\n", encoding=encoding)
+        assert ex.file_info("notes.txt") == "notes.txt: 檔案, 2 行, 9 字元"
+
+
+@pytest.mark.smoke
 def test_read_file_rejects_pdf_with_guidance(tmp_path: Path):
     (tmp_path / "spec.pdf").write_bytes(b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n")
     ex = ToolExecutor(str(tmp_path))

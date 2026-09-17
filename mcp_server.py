@@ -1849,14 +1849,16 @@ def file_info(
 ) -> str:
     """Get quick metadata about a file or directory inside AICODE_ROOT.
 
-    用來在 read_file 之前先衡量檔案大小、判斷要不要分段讀。對目錄會回報底下
-    遞迴的檔案數。輸出格式是一行文字,適合塞進 prompt。
+    用來在 read_file 之前先衡量檔案大小、判斷要不要分段讀。二進位/非文字
+    回報 bytes，不計算文字行數；支援的格式導向 analyze_file。對目錄會回報
+    底下遞迴的檔案數。輸出格式是一行文字,適合塞進 prompt。
 
     Args:
         path: 相對於 AICODE_ROOT 的路徑。
 
     Returns:
-        檔案:`<path>: 檔案, <lines> 行, <chars> 字元`
+        文字:`<path>: 檔案, <lines> 行, <chars> 字元`
+        非文字:`<path>: 檔案, 二進位/非文字, <size> bytes` 與解析方式
         目錄:`<path>: 目錄, <n> 個檔案`
     """
     return EXEC.file_info(path)

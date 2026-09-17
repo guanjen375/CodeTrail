@@ -51,7 +51,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 專案探索 | `list_dir(path=".", depth=2)` | 看目錄樹，不要叫模型跑 `ls` |
 | 專案探索 | `code_rag_search(query, top_k=5, mode="semantic", hops=1, include_evidence=False, max_chars=None, build_target="")` | 依語意定位 symbol、建立 bounded evidence，或查 call/include graph；省略 max_chars 時 transport 依 n_ctx 配置，四種模式與保守解析契約見下節 |
 | 專案探索 | `grep_code(pattern, path=".", include=None, context=0)` | 搜錯誤訊息、函式名、設定名；複雜 regex 會退回字面搜尋，並有 30 筆 match、單行 500 字元與整體 200,000 字元的硬上限，截斷會明示標記 |
-| 專案探索 | `file_info(path)` | 讀檔前先看大小，避免一次塞爆 context |
+| 專案探索 | `file_info(path)` | 文字回報行數與字元數；二進位/非文字回報 bytes，支援的格式導向 `analyze_file` |
 | 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=None)` | 讀檔案內容；省略 max_chars 時依 n_ctx 配置，長檔依結果的精確 start_line 分段 |
 | 文件/外部檔案 | `import_external_file(path, dest_name=None)` | 把允許來源的外部檔案複製進 `.aicode_uploads/` |
 | 文件/外部檔案 | `analyze_file(path, view="summary", target="", limit=0)` | 用 VL 分析各類圖片、一次性抽 PDF 文字（不入 KB）、分析 ELF 或 firmware blob。ELF 預設給總覽；`view` 可切到 `symbols` / `disasm` / `dwarf` / `strings` / `sections` / `memmap` / `relocs` / `imports` / `dynamic` / `headers`；另有多來源核對 `consistency`（見[記憶體一致性](memory-consistency.md)）。一般視角的 `target` 指定 symbol、0x 位址、regex 或 `key:value` 篩選，`limit` 控制筆數（上限 5000）；單次輸出上限 25,000 字元，截斷會指出該用哪個 view 縮小範圍。缺少或無法載入 pyelftools 時直接回錯誤；細節見[analyze_file 的 ELF 視角](#analyze_file-的-elf-視角) |
@@ -153,6 +153,10 @@ dram_config=..., map_format="auto")` 提供多來源記憶體核對。所有附�
 path、include、pattern 或 depth。`list_dir` 超過字元上限時先逐層降低 depth，回傳較淺層的
 完整清單並標 partial（淺層檔案不會被截掉）；降到 depth 0 仍超過才截字元。錯誤的修復方式一定存在文字 block，不能只放在
 `structuredContent`。
+
+`analyze_file` 回傳的 `[ELF 錯誤]`（例如缺少依賴或 objdump 失敗）與
+`run_command` 的非零 exit，都回報 `status: error` 與 MCP `isError=true`，
+TUI 顯示 error。成功輸出的正文即使含有錯誤字樣，也不會因此被判定為工具失敗。
 
 未明示 `max_chars` 時，結果 token 代理預算是目前 `n_ctx` 的 12%，估算固定為
 `ceil(ASCII 字元數 / 3) + ceil(非 ASCII 字元數 × 1.5)`。明示值仍受工具既有安全上限

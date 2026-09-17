@@ -741,6 +741,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "而 GIT_DIR/.git 壞掉時必須是錯誤(誤報成「沒有倉庫」等於放行模型跳過改檔前的 git 檢查)",
         (
             "test_graph_dependency_failure_is_an_mcp_error",
+            "test_elf_tool_failures_are_mcp_errors",
             "test_live_catalog_is_bounded_typed_and_ordered",
             "test_default_budget_tracks_n_ctx",
             "test_rejects_empty_root",
@@ -1359,6 +1360,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_media_safe_path_requires_root",
             "test_media_safe_path_blocks_external_when_disabled",
             "test_analyze_file_blocks_dotdot_escape",
+            "test_file_info_does_not_describe_binary_as_text",
         ),
     ),
     "test_elf_analysis.py": (
