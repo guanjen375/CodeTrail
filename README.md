@@ -574,6 +574,7 @@ registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf`
 | `kb_context_remote_ok` | `false` | KB chunk 脈絡生成非 loopback 時才放行送出**整份文件的窗**。與上面是**兩個鍵**:資料範圍不同的同意不得合併 |
 | `external_import` / `external_import_roots` | `false` / `["~/Downloads", "/tmp"]` | 允許 `import_external_file`,以及允許的來源根目錄。開了之後每一次匯入**仍要人工核准** |
 | `build_commands` | `false` | 把 make / cmake / ninja / meson / bazel 掛進 `run_command` 白名單。它們會跑專案內的 build script = 任意程式碼執行,所以只在分析自己的專案時開 |
+| `extra_allowed_commands` | `[]` | 額外授權 PATH 上的裸命令名稱，例如 `["nsim", "mdb"]`；TUI 用 `/allow` 編輯。保留既有工具核准、readonly 與參數檢查 |
 | `rerank_fallback_policy` | `"error"` | 唯一合法值 `error`；專用 reranker 不可用即報錯 |
 | `project_instructions` | `true` | 讀不讀被分析專案的 `AGENTS.md` 與 `.codetrail/lessons.md`。分析不信任 repo 時設 `false` |
 | `objdump` | `""` | 反組譯用的 objdump 路徑(跨架構韌體時指定 binutils-`<triplet>`) |
@@ -584,6 +585,28 @@ registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf`
 
 未知的鍵一律 fail-loud(拼錯不會靜默失效);布林鍵只收真的 `true` / `false`
 (`"false"` 是一個非空字串,不是 false)。
+
+在 TUI 管理自己的工具鏈：
+
+```text
+/allow
+/allow add nsim mdb
+/allow remove nsim
+```
+
+`/allow`（或 `/allow list`）列出儲存清單；新增／移除一次接受多個名稱，整批驗證後
+才寫入，其他設定保留。加入已存在的名稱、移除不存在的名稱不會重寫檔案。
+清單最多 128 項，每項最多 128 字元，只收 ASCII 英數字／底線開頭，其後可有
+英數字、底線、點、加號、減號。不能填路徑、命令參數、glob 或 shell 片段，JSON
+清單也不能重複；程式須在啟動 `aicode` 時的 PATH 上（容器模式則須在容器內可用）。
+`rm`／`sudo`／`curl`／`bash`、已保留的 shell／執行包裝器與通用執行器、`git`、
+內建命令及 build 命令名稱不能用此鍵重新授權；build 仍用 `build_commands`，git
+仍用專用工具。新增授權不會改 `permission.run_command`，預設每次執行仍要核准。
+
+設定在**下一次 MCP 行程啟動**載入；請重新啟動 `aicode`。取消逾時後的自動重新
+啟動也會載入新值，既有 MCP 不會熱載入。`/allow` 不送模型；忙碌、核准中、審查中
+或 readonly 模式只能列出清單，不能修改。沒有設定檔時列出清單不會建檔；首次新增
+沿用 `manual` 壓縮預設。
 
 檔案是 0600:它決定寫入工具要不要人工核准,能被別人改就等於能繞過核准。
 位置只由 `HOME` 推導,**沒有覆寫變數** —— 一個環境變數就能把 `apply_patch`

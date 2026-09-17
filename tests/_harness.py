@@ -212,7 +212,7 @@ def import_mcp_module(monkeypatch, root: Path):
     2. 設定來自 conftest 的 tmp HOME(`deployment.json` 的端點指向關著的 port),
        確保 KB / CodeRAG 初始化不會卡在等 llama-server。
     3. mcp_server 的 module-level code 會 mutate config.PATCH_ENABLED /
-       RUN_COMMAND_ENABLED / ALLOWED_COMMANDS。先用 monkeypatch 釘住原值,
+       RUN_COMMAND_ENABLED / ALLOWED_COMMANDS / EXTRA_ALLOWED_COMMANDS。先用 monkeypatch 釘住原值,
        teardown 自動 restore —— 否則會污染其他測試對 config 預設值的斷言。
     4. 先把 mcp_server 從 sys.modules 拔掉才 import,確保拿到 fresh module。
        mcp.run() 只在 __main__ guard 裡呼叫,所以直接 import 是安全的。
@@ -230,6 +230,7 @@ def import_mcp_module(monkeypatch, root: Path):
     monkeypatch.setattr(_config, "PATCH_ENABLED", _config.PATCH_ENABLED)
     monkeypatch.setattr(_config, "RUN_COMMAND_ENABLED", _config.RUN_COMMAND_ENABLED)
     monkeypatch.setattr(_config, "ALLOWED_COMMANDS", list(_config.ALLOWED_COMMANDS))
+    monkeypatch.setattr(_config, "EXTRA_ALLOWED_COMMANDS", list(_config.EXTRA_ALLOWED_COMMANDS))
 
     sys.modules.pop("mcp_server", None)
     import mcp_server  # type: ignore

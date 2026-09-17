@@ -35,6 +35,7 @@ from typing import Any
 import client_compaction
 import client_paths
 import client_policy
+from command_allowlist import validate_extra_allowed_commands
 
 SCHEMA = 1
 CONFIG_PARTS = (".config", "codetrail", "client.json")
@@ -88,6 +89,8 @@ class ClientSettings:
     #: 把 make / cmake / ninja / meson / bazel 掛進 run_command 白名單。
     #: 它們會跑專案內的 build script = 任意程式碼執行,所以只在分析自己的專案時開。
     build_commands: bool = False
+    #: 使用者信任的 PATH executable 名稱;不放寬內建命令或 shell 的限制。
+    extra_allowed_commands: list[str] = field(default_factory=list)
     #: reranker 掛掉時的行為。
     rerank_fallback_policy: str = "error"
     #: 讀被分析專案的 `AGENTS.md` 與 `.codetrail/lessons.md`。分析不信任的 repo
@@ -117,6 +120,7 @@ class ClientSettings:
             "external_import": self.external_import,
             "external_import_roots": list(self.external_import_roots),
             "build_commands": self.build_commands,
+            "extra_allowed_commands": list(self.extra_allowed_commands),
             "rerank_fallback_policy": self.rerank_fallback_policy,
             "project_instructions": self.project_instructions,
             "objdump": self.objdump,
@@ -179,7 +183,8 @@ _TEXT_KEYS = ("objdump",)
 #: 全部合法鍵。**未知鍵 fail-loud** —— 寫錯鍵名靜默忽略,就是「我設了但沒生效」
 #: 與「我設對了」長得一模一樣。
 KNOWN_KEYS = frozenset(
-    {"schema", "compaction_mode", "permission", "external_import_roots", "model_endpoints"}
+    {"schema", "compaction_mode", "permission", "external_import_roots", "model_endpoints",
+     "extra_allowed_commands"}
     | set(_BOOL_KEYS)
     | set(_CHOICE_KEYS)
     | set(_TEXT_KEYS)
@@ -204,6 +209,13 @@ def _bool(value: Any, key: str, path: Path) -> bool:
     if not isinstance(value, bool):
         raise ClientConfigError(f"{path} 的 {key} 必須是 true / false,得到 {value!r}")
     return value
+
+
+def _extra_commands(value: object, path: Path) -> list[str]:
+    try:
+        return validate_extra_allowed_commands(value)
+    except ValueError as exc:
+        raise ClientConfigError(f"{path}: {exc}") from exc
 
 
 def _validate(value: Any, path: Path) -> dict[str, Any]:
@@ -243,7 +255,11 @@ def _validate(value: Any, path: Path) -> dict[str, Any]:
             )
         permission[tool] = decision
 
-    fields: dict[str, Any] = {"compaction_mode": mode, "permission": permission}
+    fields: dict[str, Any] = {
+        "compaction_mode": mode,
+        "permission": permission,
+        "extra_allowed_commands": _extra_commands(value.get("extra_allowed_commands", []), path),
+    }
     if "model_endpoints" in value:
         from endpoint_policy import validate_model_endpoints, EndpointPolicyError
         try:
@@ -343,13 +359,55 @@ def save_client_settings(
     換成 symlink」,而這個檔決定寫入工具要不要人工核准。
     """
     path = config_path(env)
-    payload = (
-        json.dumps(settings.as_json(), ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-    ).encode("utf-8")
+    # as_json 會複製 list,所以先驗原始值,避免把錯給的字串拆成逐字元白名單。
+    _extra_commands(settings.extra_allowed_commands, path)
+    try:
+        value = settings.as_json()
+        _validate(value, path)
+        payload = (
+            json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ClientConfigError(f"{path} 無法序列化成合法 client.json: {exc}") from exc
+    if len(payload) > MAX_BYTES:
+        raise ClientConfigError(f"{path} exceeds {MAX_BYTES} bytes")
     # anchor 在 `~/.config`:`codetrail/` 那一層是我們的,不跟 symlink。
     return client_paths.replace_private_file(
         path.parent, path.name, payload, _error, anchor=path.parent.parent
     )
+
+
+def update_extra_allowed_commands(
+    action: str,
+    commands: list[str],
+    env: Mapping[str, str] | None = None,
+) -> tuple[ClientSettings, bool]:
+    """Validate one batch, then edit the latest settings with one atomic save.
+
+    Existing additions and absent removals are no-ops. Runtime is unchanged until
+    the next MCP startup; other settings, including manual compaction, are retained.
+    """
+    if action not in ("add", "remove"):
+        raise ClientConfigError("/allow 動作只接受 add / remove")
+    names = _extra_commands(commands, config_path(env))
+    if not names:
+        raise ClientConfigError(f"/allow {action} 至少需要一個 executable 名稱")
+
+    settings = load_client_settings(env)
+    existing = settings.extra_allowed_commands
+    selected = set(names)
+    if action == "add":
+        current = set(existing)
+        updated = existing + [name for name in names if name not in current]
+    else:
+        updated = [name for name in existing if name not in selected]
+    updated = _extra_commands(updated, settings.path)
+    if updated == existing:
+        return settings, False
+
+    changed = replace(settings, present=True, extra_allowed_commands=updated)
+    save_client_settings(changed, env)
+    return changed, True
 
 
 def apply_to_config(settings: ClientSettings, *, readonly: bool = False) -> None:
@@ -366,6 +424,8 @@ def apply_to_config(settings: ClientSettings, *, readonly: bool = False) -> None
 
     if settings.rerank_fallback_policy != "error":
         raise ClientConfigError('rerank_fallback_policy 只接受 "error";請修復專用 reranker')
+    # 所有 runtime mutation 之前就要驗;錯的清單不能留下半套已套用的設定。
+    extra_commands = _extra_commands(settings.extra_allowed_commands, settings.path)
     config.EXTERNAL_IMPORT_ENABLED = settings.external_import
     config.EXTERNAL_IMPORT_ROOTS = list(settings.external_import_roots)
     config.KB_CONTEXT_REMOTE_OK = settings.kb_context_remote_ok
@@ -376,6 +436,7 @@ def apply_to_config(settings: ClientSettings, *, readonly: bool = False) -> None
     config.OBJDUMP = settings.objdump
     config.H_LANG = settings.h_lang
     config.USE_CONTAINER = settings.use_container
+    config.EXTRA_ALLOWED_COMMANDS = [] if readonly else extra_commands
 
     if readonly:
         # replay / canary 的契約是「前後 project state 不變」,而且它們不得把

@@ -39,6 +39,48 @@ TESTS_DIR = Path(__file__).resolve().parent
 
 # AGENTS.md §2「安全相關不要砍」的檢查點 → (守它的說明, 必須存在且帶 smoke 的 node)。
 SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "test_client_allow_ui.py": (
+        "/allow 的本地設定操作不得送模型或改 runtime；忙碌／核准／審查／readonly 拒絕修改，"
+        "壞值與寫入失敗必須可見，列出清單零寫入並說明 MCP 啟動生效時點",
+        (
+            "test_allow_list_reads_fresh_settings_without_writes_or_model_history",
+            "test_allow_updates_preserve_other_settings_runtime_and_idle_queue",
+            "test_allow_active_or_readonly_sessions_reject_mutation_but_allow_list",
+            "test_allow_invalid_requests_never_partially_write_settings",
+            "test_allow_invalid_settings_remain_visible_and_unchanged",
+            "test_allow_save_oserror_is_visible_without_success_or_runtime_changes",
+        ),
+    ),
+    "test_client_allow_config.py": (
+        "client.json 額外命令 fail-closed、保留命令不可擴權、批次驗證與 owner-only 持久化；"
+        "重套與 readonly 清除授權，無效設定不得半套改變 runtime",
+        (
+            "test_missing_extra_commands_fail_closed_without_creating_config",
+            "test_extra_commands_roundtrip_preserves_other_settings",
+            "test_extra_commands_loader_rejects_unsafe_or_ambiguous_values",
+            "test_extra_commands_never_widen_reserved_executable_roots",
+            "test_allow_edits_read_latest_settings_and_noops_do_not_write",
+            "test_allow_invalid_batch_is_rejected_before_reading_or_writing",
+            "test_allow_rejects_oversized_result_without_partial_save",
+            "test_save_validates_all_values_and_byte_budget_before_any_write",
+            "test_allow_edits_keep_owner_only_link_defenses",
+            "test_allow_refuses_invalid_existing_settings_without_overwriting_them",
+            "test_apply_extra_commands_replaces_copies_and_clears_for_readonly",
+            "test_invalid_extra_commands_do_not_partially_apply_runtime",
+        ),
+    ),
+    "test_extra_commands.py": (
+        "使用者命令授權必須抵達實際 MCP／executor；設定替換與 readonly 不殘留授權，"
+        "額外命令仍受精確名稱、參數、timeout、核准與容器防線保護",
+        (
+            "test_user_toolchain_commands_load_and_run_without_repo_edit",
+            "test_extra_commands_are_replaced_and_readonly_clears_authorization",
+            "test_extra_commands_keep_exact_names_and_argument_guards",
+            "test_extra_commands_do_not_change_tool_permission_or_execution_gates",
+            "test_extra_commands_never_fall_back_from_container_to_host",
+            "test_explicit_client_config_reaches_live_mcp_and_readonly_still_denies",
+        ),
+    ),
     "test_review_source.py": (
         "review 的 Git 路由/helper 隔離、index/attrs/EOL 正規化、no-follow 有界來源、"
         "完整 coverage 與 HEAD/index/worktree 快照驗證，取消必回收 Git 行程",

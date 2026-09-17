@@ -300,7 +300,7 @@ config.RUN_COMMAND_ENABLED = _POLICY.run_command_enabled
 # Build 命令(make/cmake/ninja/meson/bazel)會跑專案內的 build script,
 # 風險面比 pytest/cargo test 大。預設不掛白名單,要分析自己的專案再
 # 由客戶端以 `--enable-build-commands` 打開(來源是 client.json)。
-# 直接 mutate config.ALLOWED_COMMANDS,agent_tools 透過 from-import 共用同一個 list 物件
+# agent_tools 每次讀 config.ALLOWED_COMMANDS；使用者 extras 由 apply_to_config 獨立套用。
 _BUILD_COMMANDS_ENABLED = _POLICY.build_commands_enabled
 _EXTRA_BUILD_COMMANDS = list(EXTRA_BUILD_COMMANDS)
 if _BUILD_COMMANDS_ENABLED:
@@ -423,6 +423,7 @@ else:
         f"[MCP] ALLOWED_COMMANDS 共 {len(config.ALLOWED_COMMANDS)} 條 "
         "(build 命令未掛白名單;要分析自己的專案請在 client.json 開 build_commands)"
     )
+_log(f"[MCP] EXTRA_ALLOWED_COMMANDS 共 {len(config.EXTRA_ALLOWED_COMMANDS)} 條 (client.json;readonly 清空)")
 _log(f"[MCP] EXTERNAL_IMPORT_ENABLED = {config.EXTERNAL_IMPORT_ENABLED}")
 if data_flywheel.collect_enabled():
     _log(
@@ -3452,12 +3453,13 @@ def run_command(
 ) -> str:
     """Run a whitelisted command inside AICODE_ROOT (server-side timeout 1..600 s).
 
-    白名單(config.ALLOWED_COMMANDS)分三段:
+    白名單(config.ALLOWED_COMMANDS + config.EXTRA_ALLOWED_COMMANDS):
       - 預設白名單 = 測試與靜態命令:pytest / ctest / npm test / cargo test / go test;
         mypy / tsc / ruff / black / isort / eslint / clang-format 等。
       - build 命令(make / cmake / ninja / meson / bazel build)只在
         client.json 的 build_commands 打開時加入白名單。
       - git 不在白名單:改用 git_status / git_diff。
+      - client.json 的 extra_allowed_commands 額外放行 PATH 上的裸命令名稱。
     apply_patch 不會自動呼叫這裡:套用後只做同 process 的 syntax check,lint / test
     要由你另行呼叫 run_lint(fix=False) / run_command,各自經過核准閘。
     輸出超長會 smart-truncate(優先保留含 FAIL/ERROR/Traceback 的段落)。

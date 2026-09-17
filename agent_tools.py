@@ -30,7 +30,6 @@ from config import (
     RUN_COMMAND_TIMEOUT, RUN_COMMAND_MAX_OUTPUT,
     RUN_COMMAND_TIMEOUT_MIN, RUN_COMMAND_TIMEOUT_MAX,
     RUN_COMMAND_TAIL_RATIO, RUN_COMMAND_ERROR_PATTERNS,
-    ALLOWED_COMMANDS,
     PATCH_MAX_FILES, PATCH_MAX_LINES_PER_FILE,
     LINT_COMMANDS,
 )
@@ -211,6 +210,7 @@ _RUN_COMMAND_TOOL = {
             "go test; mypy, tsc, ruff, black, isort, eslint, clang-format);"
             "build 命令(make/cmake/ninja/meson/bazel build)只在 client.json 的 "
             "build_commands 打開時加入;git 不在白名單(用 git_status / git_diff)。"
+            "client.json 的 extra_allowed_commands 可另授權 PATH 上的裸命令名稱。"
             "timeout 1..600 秒(server 端上限;client 可能更早截止)。"
             "apply_patch 不會自動呼叫這裡:lint / test 要另行呼叫 run_lint(fix=False) / run_command。"
         ),
@@ -832,17 +832,22 @@ class ToolExecutor:
         if not cmd_parts:
             return False, "錯誤: 空命令", []
 
-        # 驗證命令是否在白名單中
+        # 動態授權不可持有 from-import 快照；extras 已由 client_config 驗為裸名稱。
+        # 同一套逐 token 比對：單 token 項只放行完全相同的 argv[0]。
+        allowed_commands = [*config.ALLOWED_COMMANDS, *config.EXTRA_ALLOWED_COMMANDS]
         is_allowed = False
-        for allowed in ALLOWED_COMMANDS:
+        for allowed in allowed_commands:
             allowed_parts = shlex.split(allowed)
             if cmd_parts[:len(allowed_parts)] == allowed_parts:
                 is_allowed = True
                 break
 
         if not is_allowed:
-            allowed_list = ', '.join(ALLOWED_COMMANDS[:8])
-            return False, f"錯誤: 不允許的命令。\n允許的命令前綴: {allowed_list}...", []
+            allowed_list = ', '.join(allowed_commands[:8])
+            return False, (
+                f"錯誤: 不允許的命令。\n允許的命令前綴: {allowed_list}...\n"
+                "自訂工具可由使用者在 /allow 或 client.json 的 extra_allowed_commands 授權。"
+            ), []
 
         # 額外安全檢查：危險字元
         dangerous_patterns = ['$(', '`', '&&', '||', ';', '|', '>', '<']
@@ -862,12 +867,13 @@ class ToolExecutor:
     def run_command(self, command: str, timeout: int = RUN_COMMAND_TIMEOUT) -> str:
         """執行白名單內的測試 / 靜態分析命令(build 命令需 opt-in)。
 
-        白名單(config.ALLOWED_COMMANDS)分三段:
+        白名單(config.ALLOWED_COMMANDS + config.EXTRA_ALLOWED_COMMANDS):
           - 測試 / 靜態命令是預設白名單(pytest / ctest / npm test / cargo test / go test;
             mypy / tsc / ruff / black / isort / eslint / clang-format 等)。
           - build 命令(make / cmake / ninja / meson / bazel build)只在
             client.json 的 build_commands 打開時加入(server 收 --enable-build-commands)。
           - git 不在白名單(用 git_status / git_diff)。
+          - client.json 的 extra_allowed_commands 額外放行 PATH 上的裸命令名稱。
         apply_patch 不再自動呼叫這裡:lint / test 由模型另行、顯式呼叫,讓各自的核准閘生效。
 
         Args:

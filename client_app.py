@@ -49,6 +49,7 @@ from textual.widget import Widget
 from textual.widgets import Button, Collapsible, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
+import client_config
 import client_engine
 import client_events
 import client_paths
@@ -85,6 +86,7 @@ INCOMPLETE_ANSWER_NOTE = "上面這一則沒有完成(被截斷或出錯),不是
 #: 斜線指令 → 一行說明。輸入框的補全與 `/help` 用的是**同一份**表:兩份會漂移。
 COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "這份說明"),
+    ("/allow", "額外命令清單:list / add <名稱>... / remove <名稱>..."),
     ("/new", "開一個新對話"),
     ("/sessions", "列出這個專案的既有對話"),
     ("/session", "選一個既有對話切換(/session <id> 直接指定)"),
@@ -104,6 +106,12 @@ HELP_TAIL = (
     "Enter 送出、Alt+Enter 換行、↑/↓ 翻輸入歷史。\n"
     "忙碌時 Enter 選擇排到下一輪或補充目前任務;未送訊息用 /queue 查看。\n"
     "回合進行中 Ctrl-C 中斷整輪;閒置時連按兩次 Ctrl-C 或 Ctrl-D 離開。"
+)
+
+ALLOW_USAGE = "用法:/allow [list] | /allow add <名稱>... | /allow remove <名稱>..."
+ALLOW_STARTUP_NOTE = (
+    "下一次 MCP 啟動生效；請重新啟動 aicode。"
+    "取消逾時後的自動重新啟動也會載入。"
 )
 
 
@@ -1370,6 +1378,57 @@ class CodeTrailApp(App[int]):
     def _cmd_help(self, _argument: str) -> None:
         lines = [f"  {name:<11}{description}" for name, description in COMMANDS]
         self._append(NoticeLine("指令:\n" + "\n".join(lines) + "\n" + HELP_TAIL))
+
+    def _cmd_allow(self, argument: str) -> None:
+        """只管理磁碟設定;執行中的 MCP 與聊天 policy 都不在這裡改。"""
+        parts = argument.split()
+        action = parts[0] if parts else "list"
+        commands = parts[1:]
+        if (
+            action not in ("list", "add", "remove")
+            or (action == "list" and commands)
+            or (action != "list" and not commands)
+        ):
+            self._append(ErrorLine(ALLOW_USAGE))
+            return
+        if action != "list":
+            if self.engine.options.policy.name == "readonly":
+                self._append(ErrorLine("唯讀模式只允許 /allow list，不能修改額外命令清單。"))
+                return
+            # 佇列中有待送訊息不影響設定;只擋目前正在進行的工作。
+            if (
+                self.coordinator.busy
+                or self.coordinator.pending_approvals()
+                or self.coordinator.reviewing
+            ):
+                self._append(ErrorLine(
+                    "回合、核准或審查進行中，不能修改額外命令清單；仍可用 /allow list 查看。"
+                ))
+                return
+        try:
+            if action == "list":
+                settings = client_config.load_client_settings()
+                status = ""
+            else:
+                settings, changed = client_config.update_extra_allowed_commands(action, commands)
+                if changed:
+                    status = "已儲存額外命令清單。"
+                elif action == "add":
+                    status = "未變更：指定命令都已在清單中，未寫入設定檔。"
+                else:
+                    status = "未變更：指定命令都不在清單中，未寫入設定檔。"
+        except (client_config.ClientConfigError, OSError) as exc:
+            self._append(ErrorLine(f"/allow: {exc}"))
+            return
+        names = "\n".join(f"  {name}" for name in settings.extra_allowed_commands)
+        lines = [status] if status else []
+        lines.extend((
+            "額外命令（已儲存，不代表目前 MCP 已載入）:\n" + (names or "  (沒有額外命令)"),
+            f"設定檔:{settings.path}" + ("" if settings.present else " (尚未建立)"),
+            ALLOW_USAGE,
+            ALLOW_STARTUP_NOTE,
+        ))
+        self._append(NoticeLine("\n".join(lines)))
 
     def _cmd_exit(self, _argument: str) -> None:
         if self._review_screen is not None:

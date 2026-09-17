@@ -1150,6 +1150,9 @@ LINT_COMMANDS = {
 #
 # 預設關閉;mcp_server.py 這個明確啟動點才會啟用。
 RUN_COMMAND_ENABLED = False
+# 使用者額外授權的裸 executable 名稱；client_config.apply_to_config 每次替換。
+# 與內建前綴分開，重讀設定或 readonly 不得殘留上一份授權。
+EXTRA_ALLOWED_COMMANDS: list[str] = []
 RUN_COMMAND_TIMEOUT = 60
 # run_command 的 timeout(秒)三層契約:native tool schema、ToolExecutor 執行前 runtime
 # 驗證、mcp_server 的 Annotated[int, Field(strict=True, ge=MIN, le=MAX)] 都從這兩個常數來。

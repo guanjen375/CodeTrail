@@ -137,6 +137,17 @@ system prompt 不是 permission:它不會讓被 `deny` 的工具變成可用,也
 
 `run_command(...)` 本身還有命令白名單與 dangerous-pattern 過濾。timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），不是這個範圍的整數會在執行前被拒絕。不要把 `rm` / `sudo` / `curl` / `bash` 加進白名單;真的需要人工操作時,讓模型列出建議命令,由人自己判斷後在 shell 執行。
 
+個人工具鏈以 `client.json` 的 `extra_allowed_commands` 額外授權，例如 `["nsim", "mdb"]`；
+TUI 的 `/allow add`／`/allow remove` 只編輯這個鍵，不改工具層 `permission`。
+只收 PATH 上的裸 executable 名稱，拒絕路徑、參數、shell 片段與保留命令名稱；
+內建及 build 命令不能藉此擴大，`rm`／`sudo`／`curl`／`bash` 也不能加入。
+設定讀寫沿用 owner-only 防線，壞值、未知鍵與過大的設定在寫入前拒絕。
+下一次 MCP 啟動（重啟 `aicode` 或取消逾時後的自動重新啟動）才載入；readonly
+一律清空額外授權且停用執行。新增命令仍經既有危險字元、路徑規則、timeout 與容器閘。
+授權代表你信任該程式可執行程式碼；工作目錄不是 OS sandbox，既有路徑規則也不會
+辨識每個工具的私有旗標（例如 `-tcf=/abs/x.tcf`）。使用容器時工具須在容器內可用，
+不可用會報錯，不會改到 host 執行。
+
 `record_lesson(...)` 是唯一會寫到 sandbox root 之外的工具,而且只寫一個固定路徑:`~/.config/codetrail/lessons.json`(per-deployment 的行為教訓 store,與 `deployment.json` 同層;不能被模型指到別的路徑)。它被 permission 設成 `ask`:模型只能「提案」,你會在核准框看到完整 rule 內容,核准後才落地。沒有無審核的自動寫入路徑;細節見 [docs/lessons.md](lessons.md)。
 
 人工核准由 `client_policy.ASK_TOOLS` 與客戶端 policy 執行；核准框會顯示完整參數。
