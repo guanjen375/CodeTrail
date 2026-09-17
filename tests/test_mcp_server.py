@@ -1590,3 +1590,32 @@ def test_import_traverses_an_execute_only_ancestor(tmp_path: Path, monkeypatch: 
         gate.chmod(0o755)
     assert "✓" in out, out
     assert (root / ".aicode_uploads" / "spec.pdf").read_bytes() == b"%PDF-spec"
+
+
+@pytest.mark.smoke
+def test_list_dir_over_budget_keeps_shallow_entries_instead_of_cutting_root_files(
+    mcp_module_factory, tmp_path,
+):
+    """Reported session: metaware root depth=2 was 29,486 chars; the 20,000-char head cut
+    dropped every root-level file (listed after all expanded directories), so the model
+    searched four more rounds for `example_20260917.elf` that sat at the root.
+    """
+    module = mcp_module_factory()
+    root = tmp_path / "proj"
+    for package in range(40):
+        for index in range(5):
+            (root / "a_big" / f"pkg_{package:02d}").mkdir(parents=True, exist_ok=True)
+            (root / "a_big" / f"pkg_{package:02d}" / f"source_file_{index}.c").write_text("x")
+    (root / "example_20260917.elf").write_bytes(b"\x7fELF")
+    assert len(module.EXEC.list_files(path=".", depth=2)) > 2_000
+    depth1 = module.EXEC.list_files(path=".", depth=1)
+    assert len(depth1) <= 2_000
+
+    listed = module.list_dir.fn(path=".", depth=2, max_chars=2_000)
+    assert "[FILE] example_20260917.elf" in listed, listed[-300:]
+    assert listed.startswith(depth1 + "\n\n... [MCP wrapper 截斷"), listed[-300:]
+    assert "depth=1" in listed
+
+    depth0 = module.EXEC.list_files(path=".", depth=0)
+    tiny = module.list_dir.fn(path=".", depth=2, max_chars=10)
+    assert tiny.startswith(depth0[:10] + "\n\n... [MCP wrapper 截斷"), tiny

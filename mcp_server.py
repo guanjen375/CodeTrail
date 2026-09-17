@@ -1751,12 +1751,25 @@ def list_dir(
     """
     if max_chars is None:
         max_chars = 20_000
+    depth = min(depth, config.MAX_LIST_DEPTH)
     out = EXEC.list_files(path=path, depth=depth)
+    original_len, shown_depth = len(out), depth
+    # 樹先展開子目錄、最後才列本層檔案，從尾端截字元會先丟掉較淺層：metaware 根目錄
+    # depth=2 有 29,486 字元，根目錄的 ELF 被截掉，模型改去子目錄找了四輪。
+    # 所以先逐層降 depth 讓淺層完整，降到 0 仍超過才截字元。
+    while len(out) > max_chars and shown_depth > 0:
+        shown_depth -= 1
+        out = EXEC.list_files(path=path, depth=shown_depth)
     if len(out) > max_chars:
-        original_len = len(out)
         out = out[:max_chars] + (
-            f"\n\n... [MCP wrapper 截斷,原始 {original_len} 字元] ..."
-            "\n[HINT] 縮小 path 或 depth 後重查。"
+            f"\n\n... [MCP wrapper 截斷,depth={shown_depth} 仍有 {len(out)} 字元] ..."
+            "\n[HINT] 縮小 path 後重查。"
+        )
+    elif shown_depth != depth:
+        out += (
+            f"\n\n... [MCP wrapper 截斷,depth={depth} 原始 {original_len} 字元超過上限 {max_chars}；"
+            f"已改列 depth={shown_depth} 的完整清單] ..."
+            "\n[HINT] 要看更深層，對子目錄再呼叫 list_dir。"
         )
     return out
 

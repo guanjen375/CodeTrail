@@ -150,7 +150,8 @@ dram_config=..., map_format="auto")` 提供多來源記憶體核對。所有附�
 客戶端只把每次工具結果唯一的那個精簡文字 block 送進模型。第一行固定是
 `status: ok|partial|error`；只有 partial、error 或截斷結果才在第二行給可操作的 `next:`。
 `read_file` 的 next 會給實際下一個 `start_line`，`grep_code`／`list_dir` 的 next 會要求縮小
-path、include、pattern 或 depth。錯誤的修復方式一定存在文字 block，不能只放在
+path、include、pattern 或 depth。`list_dir` 超過字元上限時先逐層降低 depth，回傳較淺層的
+完整清單並標 partial（淺層檔案不會被截掉）；降到 depth 0 仍超過才截字元。錯誤的修復方式一定存在文字 block，不能只放在
 `structuredContent`。
 
 未明示 `max_chars` 時，結果 token 代理預算是目前 `n_ctx` 的 12%，估算固定為
