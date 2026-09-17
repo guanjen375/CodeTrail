@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import threading
 import time
 from time import monotonic as _progress_clock
@@ -56,6 +57,7 @@ import client_paths
 import client_review
 import client_store
 import client_turns
+import command_allowlist
 import context_budget
 
 HISTORY_FILENAME = "tui_history"
@@ -86,7 +88,7 @@ INCOMPLETE_ANSWER_NOTE = "上面這一則沒有完成(被截斷或出錯),不是
 #: 斜線指令 → 一行說明。輸入框的補全與 `/help` 用的是**同一份**表:兩份會漂移。
 COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "這份說明"),
-    ("/allow", "額外命令清單:list / add <名稱>... / remove <名稱>..."),
+    ("/allow", "命令白名單:list / add <絕對目錄>"),
     ("/new", "開一個新對話"),
     ("/sessions", "列出這個專案的既有對話"),
     ("/session", "選一個既有對話切換(/session <id> 直接指定)"),
@@ -108,11 +110,66 @@ HELP_TAIL = (
     "回合進行中 Ctrl-C 中斷整輪;閒置時連按兩次 Ctrl-C 或 Ctrl-D 離開。"
 )
 
-ALLOW_USAGE = "用法:/allow [list] | /allow add <名稱>... | /allow remove <名稱>..."
-ALLOW_STARTUP_NOTE = (
-    "下一次 MCP 啟動生效；請重新啟動 aicode。"
-    "取消逾時後的自動重新啟動也會載入。"
-)
+ALLOW_USAGE = "用法:/allow [list] | /allow add <絕對目錄>（含空白請加引號）"
+
+
+def format_allow_list(settings: client_config.ClientSettings, policy: object) -> str:
+    """列出本次讀取及檢查結果；runtime 狀態只認 MCP 已完成 handshake 的快照。"""
+    valid_policy = (
+        isinstance(policy, dict)
+        and type(policy.get("schema")) is int
+        and policy["schema"] == 1
+        and all(type(policy.get(key)) is bool
+                for key in ("run_command_enabled", "readonly", "use_container"))
+        and all(isinstance(policy.get(key), list)
+                and all(isinstance(value, str) and value.strip() for value in policy[key])
+                for key in ("builtin_prefixes", "build_prefixes"))
+    )
+    lines: list[str] = []
+    if valid_policy:
+        lines.append(
+            f"目前 MCP:run_command={'啟用' if policy['run_command_enabled'] else '停用'}；"
+            f"readonly={'是' if policy['readonly'] else '否'}；"
+            f"執行位置={'容器' if policy['use_container'] else '本機'}"
+        )
+        if policy["readonly"] or not policy["run_command_enabled"]:
+            lines.append("目前 MCP 不允許執行 run_command。")
+        if policy["use_container"]:
+            lines.append("容器模式：目錄授權工具不可使用，不會改到本機執行。")
+        for title, key in (("內建前綴", "builtin_prefixes"), ("已啟用 build 前綴", "build_prefixes")):
+            lines.append(title + ":\n" + ("\n".join(f"  {item}" for item in policy[key]) or "  (沒有)"))
+    else:
+        lines.append("MCP 未回報目前 run_command 白名單；以下僅列已儲存授權。")
+
+    names = "\n".join(f"  {name}" for name in settings.extra_allowed_commands)
+    lines.append("額外命令（legacy／PATH）:\n" + (names or "  (沒有額外命令)"))
+    inspection = command_allowlist.inspect_command_directories(
+        settings.extra_allowed_command_dirs, extra_commands=settings.extra_allowed_commands,
+    )
+    lines.append("工具目錄（已儲存；本次檢查的授權工具）:")
+    if not settings.extra_allowed_command_dirs:
+        lines.append("  (沒有工具目錄)")
+    commands_by_directory: dict[str, list[str]] = {}
+    for name, path in sorted(inspection.commands.items()):
+        commands_by_directory.setdefault(os.path.dirname(path), []).append(name)
+    for directory in settings.extra_allowed_command_dirs:
+        lines.append(f"  {directory}")
+        names = commands_by_directory.get(directory, [])
+        lines.extend(f"    {name}" for name in names)
+        if not names:
+            lines.append("    (沒有授權工具)")
+        excluded = inspection.excluded.get(directory, {})
+        if excluded:
+            lines.append("    排除：" + "；".join(f"{reason} {count} 項" for reason, count in sorted(excluded.items())))
+        if directory in inspection.errors:
+            lines.append(f"    錯誤：{inspection.errors[directory]}")
+    if inspection.errors:
+        lines.append("授權解析失敗；目前所有 run_command 都將拒絕執行。")
+    lines.extend((
+        f"設定檔:{settings.path}" + ("" if settings.present else " (尚未建立)"),
+        ALLOW_USAGE,
+    ))
+    return "\n".join(lines)
 
 
 class HistoryError(RuntimeError):
@@ -1380,20 +1437,24 @@ class CodeTrailApp(App[int]):
         self._append(NoticeLine("指令:\n" + "\n".join(lines) + "\n" + HELP_TAIL))
 
     def _cmd_allow(self, argument: str) -> None:
-        """只管理磁碟設定;執行中的 MCP 與聊天 policy 都不在這裡改。"""
-        parts = argument.split()
+        """本地新增工具目錄；MCP 每次執行重新讀取授權，聊天 policy 保持原樣。"""
+        try:
+            parts = shlex.split(argument)
+        except ValueError:
+            self._append(ErrorLine(ALLOW_USAGE))
+            return
         action = parts[0] if parts else "list"
-        commands = parts[1:]
+        directories = parts[1:]
         if (
-            action not in ("list", "add", "remove")
-            or (action == "list" and commands)
-            or (action != "list" and not commands)
+            action not in ("list", "add")
+            or (action == "list" and directories)
+            or (action == "add" and len(directories) != 1)
         ):
             self._append(ErrorLine(ALLOW_USAGE))
             return
         if action != "list":
             if self.engine.options.policy.name == "readonly":
-                self._append(ErrorLine("唯讀模式只允許 /allow list，不能修改額外命令清單。"))
+                self._append(ErrorLine("唯讀模式只允許 /allow list，不能修改命令白名單。"))
                 return
             # 佇列中有待送訊息不影響設定;只擋目前正在進行的工作。
             if (
@@ -1402,7 +1463,7 @@ class CodeTrailApp(App[int]):
                 or self.coordinator.reviewing
             ):
                 self._append(ErrorLine(
-                    "回合、核准或審查進行中，不能修改額外命令清單；仍可用 /allow list 查看。"
+                    "回合、核准或審查進行中，不能修改命令白名單；仍可用 /allow list 查看。"
                 ))
                 return
         try:
@@ -1410,25 +1471,19 @@ class CodeTrailApp(App[int]):
                 settings = client_config.load_client_settings()
                 status = ""
             else:
-                settings, changed = client_config.update_extra_allowed_commands(action, commands)
+                settings, changed = client_config.add_allowed_command_directory(directories[0])
                 if changed:
-                    status = "已儲存額外命令清單。"
-                elif action == "add":
-                    status = "未變更：指定命令都已在清單中，未寫入設定檔。"
+                    status = "已加入；目前 session 後續命令立即生效。"
                 else:
-                    status = "未變更：指定命令都不在清單中，未寫入設定檔。"
-        except (client_config.ClientConfigError, OSError) as exc:
+                    status = "未變更：目錄已在清單中，未寫入設定檔。"
+            # 純快取 property；不可讀 engine.tool_specs 的舊快照，也不可呼叫會
+            # start() 的 mcp.tools()，list 必須在死亡／重啟中的 MCP 上仍然零副作用。
+            policy = getattr(getattr(self.engine, "mcp", None), "command_policy", {})
+            listing = format_allow_list(settings, policy)
+        except (client_config.ClientConfigError, OSError, ValueError) as exc:
             self._append(ErrorLine(f"/allow: {exc}"))
             return
-        names = "\n".join(f"  {name}" for name in settings.extra_allowed_commands)
-        lines = [status] if status else []
-        lines.extend((
-            "額外命令（已儲存，不代表目前 MCP 已載入）:\n" + (names or "  (沒有額外命令)"),
-            f"設定檔:{settings.path}" + ("" if settings.present else " (尚未建立)"),
-            ALLOW_USAGE,
-            ALLOW_STARTUP_NOTE,
-        ))
-        self._append(NoticeLine("\n".join(lines)))
+        self._append(NoticeLine((status + "\n" if status else "") + listing))
 
     def _cmd_exit(self, _argument: str) -> None:
         if self._review_screen is not None:

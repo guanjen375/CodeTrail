@@ -39,9 +39,53 @@ TESTS_DIR = Path(__file__).resolve().parent
 
 # AGENTS.md §2「安全相關不要砍」的檢查點 → (守它的說明, 必須存在且帶 smoke 的 node)。
 SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "test_allow_directory_regression.py": (
+        "/allow add 目錄必須寫入 client.json，讓同一 MCP instance 立即執行該目錄工具；"
+        "list 顯示內建與目錄授權，管理操作不進模型歷史",
+        (
+            "test_allow_add_directory_reaches_running_mcp_without_restart",
+        ),
+    ),
+    "test_allow_directory_runtime.py": (
+        "目錄授權即時重讀固定設定來源，只替換經驗證的 executable；不得沿用舊授權或 PATH，"
+        "保留 readonly／核准／參數／timeout／容器閘，MCP 快照僅供零副作用列清單",
+        (
+            "test_directory_executor_uses_fresh_settings_and_absolute_argv_without_path_fallback",
+            "test_directory_executor_revalidates_and_fails_closed_without_cached_mapping",
+            "test_directory_executor_keeps_bare_names_dangerous_patterns_and_path_containment",
+            "test_directory_executor_does_not_load_before_disabled_or_timeout_gates",
+            "test_direct_directory_executor_uses_only_config_and_keeps_permission_and_readonly",
+            "test_directory_executor_refuses_container_without_host_or_legacy_semantic_changes",
+            "test_live_mcp_reloads_only_allow_from_selected_source_and_keeps_runtime_policy",
+            "test_mcp_default_allow_loader_pins_startup_path_without_mutating_runtime",
+            "test_command_policy_metadata_is_optional_strict_and_never_changes_model_or_readonly",
+            "test_command_policy_cache_does_not_start_request_write_or_wait_on_lifecycle_lock",
+            "test_command_policy_snapshot_updates_on_handshake_and_normal_respawn",
+        ),
+    ),
+    "test_command_allowlist_dirs.py": (
+        "目錄授權只收有界安全讀取的 executable；schema 不碰現場、拒絕 symlink／不可信 owner、"
+        "重名／身分漂移／缺安全能力均 fail-closed，失效後不得沿用舊映射",
+        (
+            "test_directory_syntax_normalization_never_touches_filesystem",
+            "test_directory_inspection_accepts_tools_and_excludes_untrusted_entries",
+            "test_directory_inspection_rejects_malformed_or_unbounded_elf_headers",
+            "test_directory_inspection_allows_group_write_and_root_owned_sticky_ancestor",
+            "test_directory_inspection_enforces_owner_and_world_write_boundaries",
+            "test_directory_inspection_excludes_foreign_owned_candidate",
+            "test_directory_inspection_never_follows_directory_symlinks",
+            "test_directory_inspection_reports_conflicts_without_selecting_a_winner",
+            "test_directory_inspection_never_reuses_mapping_after_installation_becomes_invalid",
+            "test_directory_inspection_enumeration_is_bounded_and_never_partial_success",
+            "test_directory_inspection_reads_at_most_the_header_budget",
+            "test_directory_inspection_fifo_swap_is_nonblocking_and_fails_closed",
+            "test_directory_inspection_revalidates_identity_and_reports_read_failures",
+            "test_directory_inspection_missing_safety_capability_fails_before_open",
+        ),
+    ),
     "test_client_allow_ui.py": (
         "/allow 的本地設定操作不得送模型或改 runtime；忙碌／核准／審查／readonly 拒絕修改，"
-        "壞值與寫入失敗必須可見，列出清單零寫入並說明 MCP 啟動生效時點",
+        "壞值與寫入失敗必須可見，列出清單零寫入並說明目前 session 後續命令立即生效",
         (
             "test_allow_list_reads_fresh_settings_without_writes_or_model_history",
             "test_allow_updates_preserve_other_settings_runtime_and_idle_queue",
@@ -49,6 +93,10 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_allow_invalid_requests_never_partially_write_settings",
             "test_allow_invalid_settings_remain_visible_and_unchanged",
             "test_allow_save_oserror_is_visible_without_success_or_runtime_changes",
+            "test_allow_missing_or_invalid_mcp_policy_never_guesses_effective_whitelist",
+            "test_allow_list_marks_runtime_execution_restrictions",
+            "test_allow_directory_failure_is_visible_and_disables_the_whole_resolved_list",
+            "test_allow_inspection_oserror_is_visible_without_side_effects",
         ),
     ),
     "test_client_allow_config.py": (
@@ -67,6 +115,14 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_allow_refuses_invalid_existing_settings_without_overwriting_them",
             "test_apply_extra_commands_replaces_copies_and_clears_for_readonly",
             "test_invalid_extra_commands_do_not_partially_apply_runtime",
+            "test_allow_directory_settings_remain_editable_when_installation_is_missing",
+            "test_allow_directory_loader_rejects_unsafe_or_duplicate_paths",
+            "test_allow_invalid_directory_syntax_never_partially_applies_runtime",
+            "test_allow_directory_add_preserves_latest_settings_and_duplicate_is_read_only",
+            "test_allow_directory_add_validates_whole_union_before_any_write",
+            "test_allow_directory_bad_candidate_does_not_create_settings",
+            "test_allow_directory_limit_is_checked_before_save_or_inspection",
+            "test_allow_directory_save_failure_is_a_visible_config_error",
         ),
     ),
     "test_extra_commands.py": (

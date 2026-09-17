@@ -23,6 +23,7 @@ def runtime(monkeypatch):
         if name.isupper():
             monkeypatch.setattr(config, name, value)
     monkeypatch.setattr(config, "EXTRA_ALLOWED_COMMANDS", [], raising=False)
+    monkeypatch.setattr(config, "EXTRA_ALLOWED_COMMAND_DIRS", [])
     monkeypatch.setattr(config, "RUN_COMMAND_ENABLED", True)
     monkeypatch.setattr(container_runner, "CONTAINER_ENABLED", False)
 
@@ -146,8 +147,14 @@ def test_explicit_client_config_reaches_live_mcp_and_readonly_still_denies(tmp_p
     directory = tmp_path / "settings"
     directory.mkdir(mode=0o700)
     path = directory / "client.json"
+    tool_dir = tmp_path / "tools"
+    tool_dir.mkdir(mode=0o700)
+    tool = tool_dir / "arc-readonly-probe"
+    tool.write_text("#!/bin/sh\nprintf '%s\\n' directory-authorized\n", encoding="utf-8")
+    tool.chmod(0o700)
     path.write_text(json.dumps({
         "schema": 1, "compaction_mode": "manual", "extra_allowed_commands": ["true"],
+        "extra_allowed_command_dirs": [str(tool_dir)],
     }), encoding="utf-8")
     path.chmod(0o600)
     root = tmp_path / "project"
@@ -161,12 +168,19 @@ def test_explicit_client_config_reaches_live_mcp_and_readonly_still_denies(tmp_p
         # This is the descriptor actually exposed through tools/list.
         spec = next(item for item in client.tools() if item.name == "run_command")
         assert "extra_allowed_commands" in spec.description
-        result = client.call("run_command", {"cmd": "true"})
-        if readonly:
-            assert result.is_error or "已停用" in result.text or "readonly" in result.text
-            assert "成功" not in result.text
-        else:
-            assert not result.is_error and "成功" in result.text
+        assert "extra_allowed_command_dirs" in spec.description
+        assert spec.command_policy == client.command_policy
+        assert client.command_policy["readonly"] is readonly
+        assert client.command_policy["run_command_enabled"] is (not readonly)
+        assert client.command_policy["build_prefixes"] == []
+        for command in ("true", tool.name):
+            result = client.call("run_command", {"cmd": command})
+            if readonly:
+                assert result.is_error or "已停用" in result.text or "readonly" in result.text
+                assert "成功" not in result.text
+            else:
+                assert not result.is_error and "成功" in result.text
+        if not readonly:
             rejected = client.call("run_command", {"cmd": "false"})
             assert "不允許的命令" in rejected.text
     finally:

@@ -231,6 +231,7 @@ def import_mcp_module(monkeypatch, root: Path):
     monkeypatch.setattr(_config, "RUN_COMMAND_ENABLED", _config.RUN_COMMAND_ENABLED)
     monkeypatch.setattr(_config, "ALLOWED_COMMANDS", list(_config.ALLOWED_COMMANDS))
     monkeypatch.setattr(_config, "EXTRA_ALLOWED_COMMANDS", list(_config.EXTRA_ALLOWED_COMMANDS))
+    monkeypatch.setattr(_config, "EXTRA_ALLOWED_COMMAND_DIRS", list(_config.EXTRA_ALLOWED_COMMAND_DIRS))
 
     sys.modules.pop("mcp_server", None)
     import mcp_server  # type: ignore

@@ -35,7 +35,11 @@ from typing import Any
 import client_compaction
 import client_paths
 import client_policy
-from command_allowlist import validate_extra_allowed_commands
+from command_allowlist import (
+    inspect_command_directories,
+    validate_extra_allowed_command_dirs,
+    validate_extra_allowed_commands,
+)
 
 SCHEMA = 1
 CONFIG_PARTS = (".config", "codetrail", "client.json")
@@ -91,6 +95,8 @@ class ClientSettings:
     build_commands: bool = False
     #: 使用者信任的 PATH executable 名稱;不放寬內建命令或 shell 的限制。
     extra_allowed_commands: list[str] = field(default_factory=list)
+    #: 使用者信任的工具安裝目錄;每次 list/run 重新檢查直接子項。
+    extra_allowed_command_dirs: list[str] = field(default_factory=list)
     #: reranker 掛掉時的行為。
     rerank_fallback_policy: str = "error"
     #: 讀被分析專案的 `AGENTS.md` 與 `.codetrail/lessons.md`。分析不信任的 repo
@@ -121,6 +127,7 @@ class ClientSettings:
             "external_import_roots": list(self.external_import_roots),
             "build_commands": self.build_commands,
             "extra_allowed_commands": list(self.extra_allowed_commands),
+            "extra_allowed_command_dirs": list(self.extra_allowed_command_dirs),
             "rerank_fallback_policy": self.rerank_fallback_policy,
             "project_instructions": self.project_instructions,
             "objdump": self.objdump,
@@ -184,7 +191,7 @@ _TEXT_KEYS = ("objdump",)
 #: 與「我設對了」長得一模一樣。
 KNOWN_KEYS = frozenset(
     {"schema", "compaction_mode", "permission", "external_import_roots", "model_endpoints",
-     "extra_allowed_commands"}
+     "extra_allowed_commands", "extra_allowed_command_dirs"}
     | set(_BOOL_KEYS)
     | set(_CHOICE_KEYS)
     | set(_TEXT_KEYS)
@@ -214,6 +221,13 @@ def _bool(value: Any, key: str, path: Path) -> bool:
 def _extra_commands(value: object, path: Path) -> list[str]:
     try:
         return validate_extra_allowed_commands(value)
+    except ValueError as exc:
+        raise ClientConfigError(f"{path}: {exc}") from exc
+
+
+def _extra_command_dirs(value: object, path: Path) -> list[str]:
+    try:
+        return validate_extra_allowed_command_dirs(value)
     except ValueError as exc:
         raise ClientConfigError(f"{path}: {exc}") from exc
 
@@ -259,6 +273,7 @@ def _validate(value: Any, path: Path) -> dict[str, Any]:
         "compaction_mode": mode,
         "permission": permission,
         "extra_allowed_commands": _extra_commands(value.get("extra_allowed_commands", []), path),
+        "extra_allowed_command_dirs": _extra_command_dirs(value.get("extra_allowed_command_dirs", []), path),
     }
     if "model_endpoints" in value:
         from endpoint_policy import validate_model_endpoints, EndpointPolicyError
@@ -361,8 +376,10 @@ def save_client_settings(
     path = config_path(env)
     # as_json 會複製 list,所以先驗原始值,避免把錯給的字串拆成逐字元白名單。
     _extra_commands(settings.extra_allowed_commands, path)
+    extra_dirs = _extra_command_dirs(settings.extra_allowed_command_dirs, path)
     try:
         value = settings.as_json()
+        value["extra_allowed_command_dirs"] = extra_dirs
         _validate(value, path)
         payload = (
             json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
@@ -384,8 +401,8 @@ def update_extra_allowed_commands(
 ) -> tuple[ClientSettings, bool]:
     """Validate one batch, then edit the latest settings with one atomic save.
 
-    Existing additions and absent removals are no-ops. Runtime is unchanged until
-    the next MCP startup; other settings, including manual compaction, are retained.
+    Existing additions and absent removals are no-ops. Subsequent MCP commands
+    read the saved authorizations; other settings and permission stay unchanged.
     """
     if action not in ("add", "remove"):
         raise ClientConfigError("/allow 動作只接受 add / remove")
@@ -410,6 +427,37 @@ def update_extra_allowed_commands(
     return changed, True
 
 
+def add_allowed_command_directory(
+    path: str, env: Mapping[str, str] | None = None,
+) -> tuple[ClientSettings, bool]:
+    """Inspect the complete current grant before atomically adding one directory.
+
+    A repeated addition still checks the current files and conflicts, but never
+    writes on success. This helper changes only the stored directory list.
+    """
+    settings = load_client_settings(env)
+    candidate = _extra_command_dirs([path], settings.path)[0]
+    existing = settings.extra_allowed_command_dirs
+    updated = _extra_command_dirs(
+        existing if candidate in existing else [*existing, candidate], settings.path,
+    )
+    try:
+        inspection = inspect_command_directories(updated, extra_commands=settings.extra_allowed_commands)
+    except ValueError as exc:
+        raise ClientConfigError(f"{settings.path}: {exc}") from exc
+    if inspection.errors:
+        failures = "; ".join(f"{directory}: {message}" for directory, message in inspection.errors.items())
+        raise ClientConfigError(f"工具目錄授權失敗: {failures}")
+    if updated == existing:
+        return settings, False
+    changed = replace(settings, present=True, extra_allowed_command_dirs=updated)
+    try:
+        save_client_settings(changed, env)
+    except OSError as exc:
+        raise ClientConfigError(f"無法儲存 {settings.path}: {exc}") from exc
+    return changed, True
+
+
 def apply_to_config(settings: ClientSettings, *, readonly: bool = False) -> None:
     """把使用者開關推進 runtime。**這是唯一一個入口。**
 
@@ -426,6 +474,7 @@ def apply_to_config(settings: ClientSettings, *, readonly: bool = False) -> None
         raise ClientConfigError('rerank_fallback_policy 只接受 "error";請修復專用 reranker')
     # 所有 runtime mutation 之前就要驗;錯的清單不能留下半套已套用的設定。
     extra_commands = _extra_commands(settings.extra_allowed_commands, settings.path)
+    extra_dirs = _extra_command_dirs(settings.extra_allowed_command_dirs, settings.path)
     config.EXTERNAL_IMPORT_ENABLED = settings.external_import
     config.EXTERNAL_IMPORT_ROOTS = list(settings.external_import_roots)
     config.KB_CONTEXT_REMOTE_OK = settings.kb_context_remote_ok
@@ -437,6 +486,7 @@ def apply_to_config(settings: ClientSettings, *, readonly: bool = False) -> None
     config.H_LANG = settings.h_lang
     config.USE_CONTAINER = settings.use_container
     config.EXTRA_ALLOWED_COMMANDS = [] if readonly else extra_commands
+    config.EXTRA_ALLOWED_COMMAND_DIRS = [] if readonly else extra_dirs
 
     if readonly:
         # replay / canary 的契約是「前後 project state 不變」,而且它們不得把

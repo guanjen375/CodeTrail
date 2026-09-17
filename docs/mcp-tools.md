@@ -67,7 +67,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 修改/驗證 | `git_diff(path=None, staged=False)` | 看修改內容，不需要用 `run_command` 跑 git；非 git 專案同樣回跳過通知 |
 | 修改/驗證 | `apply_patch(diff, dry_run=False)` | 套 SEARCH/REPLACE 或 unified diff（同一次只能一種；參數已是字串，不要包 fence），會真的寫檔；最多 5 個檔案、單檔 200 行（udiff 算 added+removed；S/R 算 payload budget = SEARCH+REPLACE 行數，不是同一種計數）；UTF-8 strict，BOM／CRLF／檔尾換行／權限原樣保留，mixed newline 與 symlink 拒絕；套用後只做唯讀 syntax check（advisory、三態、失敗不回滾）；細節見[apply_patch 的兩種格式](#apply_patch-的兩種格式) |
 | 修改/驗證 | `run_lint(path, fix=True)` | 對單一檔案跑格式化/lint；`fix=False` 走 check-only(不改檔) |
-| 修改/驗證 | `run_command(cmd, timeout=60)` | 跑白名單命令；timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），預設 60。預設白名單 = 測試／靜態命令；build 命令(make/cmake/ninja/meson/bazel)需在 `client.json` 設 `"build_commands": true`；`extra_allowed_commands` 可額外授權 PATH 上的裸命令名稱，TUI 用 `/allow` 編輯，下一次 MCP 啟動載入；既有核准、readonly 與參數檢查仍適用；git 不在白名單（用 `git_status` / `git_diff`） |
+| 修改/驗證 | `run_command(cmd, timeout=60)` | 跑白名單中的裸命令；timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），預設 60。預設為測試／靜態命令；build 命令(make/cmake/ninja/meson/bazel)需在 `client.json` 設 `"build_commands": true`。`/allow list` 查看，`/allow add <絕對目錄>` 驗證後寫入 `extra_allowed_command_dirs`，同 session 後續命令立即生效；相容既有 `extra_allowed_commands` PATH 名稱設定。每次重讀授權並驗目錄，失效或重名即拒絕；容器不能執行本機目錄工具。既有核准、readonly 與參數檢查仍適用；git 用 `git_status` / `git_diff` |
 | 行為教訓 | `record_lesson(rule, scope="project")` | 你糾正模型行為後,把糾正「提案」成一條行為規則;經你核准(permission ask)寫入 lessons store,之後 session 注入 context([docs/lessons.md](lessons.md)) |
 
 ### `code_rag_search` 四種模式

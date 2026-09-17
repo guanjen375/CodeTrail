@@ -71,6 +71,12 @@
 - `agent_tools.ToolExecutor._safe_path` — 所有檔案讀寫的 sandbox 入口
 - `media._safe_path` — 圖片/ELF/binary 的 sandbox 入口
 - `agent_tools._validate_command` — run_command 白名單 + dangerous-pattern 過濾
+- `/allow` 的目錄授權 — add 驗證後只寫 `client.json`，同 MCP 的後續命令重讀兩個
+  allow 欄位；不重套其他設定、不改 PATH、不把目錄名稱當裸命令授權。目錄／工具以
+  dir-fd / nofollow 有界驗證，解析失敗不得沿用舊授權；只替換已驗證工具的 argv[0]，
+  參數 sandbox、核准、readonly、timeout 與容器防線保留，容器不可退回 host。
+  設定 schema 只驗語法，失效工具目錄不得讓客戶端無法啟動；list 只讀設定與當前
+  MCP 的快照，不為列清單 spawn 或送請求，未知／失效／不可執行狀態必須明列。
 - `apply_patch` 的「context／SEARCH 必須逐字匹配（S/R 絕不用相似度代套）」、「max files / max lines
   （udiff added+removed；S/R payload budget）」邏輯；`patch_engine` 的 byte-safe 寫入（UTF-8 strict、
   BOM/CRLF 保留、symlink／dir-fd 防線、best-effort rollback）；`patch_verify` 的「驗證層不得 spawn

@@ -1153,6 +1153,8 @@ RUN_COMMAND_ENABLED = False
 # 使用者額外授權的裸 executable 名稱；client_config.apply_to_config 每次替換。
 # 與內建前綴分開，重讀設定或 readonly 不得殘留上一份授權。
 EXTRA_ALLOWED_COMMANDS: list[str] = []
+# 工具安裝目錄授權；只在 list/run 時安全檢查現場，不影響其他設定載入。
+EXTRA_ALLOWED_COMMAND_DIRS: list[str] = []
 RUN_COMMAND_TIMEOUT = 60
 # run_command 的 timeout(秒)三層契約:native tool schema、ToolExecutor 執行前 runtime
 # 驗證、mcp_server 的 Annotated[int, Field(strict=True, ge=MIN, le=MAX)] 都從這兩個常數來。

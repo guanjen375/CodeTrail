@@ -62,7 +62,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -131,6 +131,7 @@ class ToolSpec:
     description: str
     input_schema: dict[str, Any]
     read_only: bool
+    command_policy: dict[str, Any] = field(default_factory=dict, compare=False, hash=False)
 
     def as_openai_tool(self) -> dict[str, Any]:
         """轉成 llama-server ``/v1/chat/completions`` 吃的 function tool。"""
@@ -313,6 +314,9 @@ class McpClient:
         self._stderr_handle = None
         self._pending: dict[int, _Call] = {}
         self._tools: tuple[ToolSpec, ...] = ()
+        # 原子替換、從不原地修改；綁定完成 handshake 的 process 身分。
+        # list 只讀這份 snapshot，不取可能等 spawn / handshake 的生命週期鎖。
+        self._command_policy_snapshot: tuple[process_env.Popen, dict[str, Any]] | None = None
         self._closed = False
         self._generation = 0
 
@@ -377,6 +381,22 @@ class McpClient:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def command_policy(self) -> dict[str, Any]:
+        """目前存活且完成握手的 instance 所回報的 policy；純快取、零請求。"""
+        snapshot = self._command_policy_snapshot
+        if snapshot is None or self._closed or not self._startup_complete:
+            return {}
+        proc, policy = snapshot
+        if self._proc is not proc or proc.poll() is not None:
+            return {}
+        result = _command_policy(policy)
+        # 複製期間若有 teardown / respawn，不把舊 instance 的資料當目前狀態。
+        if (self._command_policy_snapshot is not snapshot or self._proc is not proc
+                or self._closed or not self._startup_complete):
+            return {}
+        return result
 
     def tools(self) -> tuple[ToolSpec, ...]:
         self.start()
@@ -481,6 +501,7 @@ class McpClient:
             if self._start_aborted.is_set() or self._closed:
                 raise McpCallCancelledError("MCP startup cancelled")
             self._startup_complete = False
+            self._command_policy_snapshot = None
         with self._stderr_lock:
             self._stderr_tail = deque()
             self._stderr_bytes = 0
@@ -546,6 +567,10 @@ class McpClient:
         specs = tool_specs(listed)
         assert_public_catalog(specs)
         self._tools = specs
+        policy = next((spec.command_policy for spec in specs if spec.name == "run_command"), {})
+        self._command_policy_snapshot = (
+            (self._proc, _command_policy(policy)) if self._proc is not None else None
+        )
 
     def _request(self, method: str, params: Mapping[str, Any], *, timeout: float, label: str) -> Any:
         with self._pending_lock:
@@ -719,6 +744,7 @@ class McpClient:
                     self._spawn()
 
     def _teardown(self, reason: str) -> None:
+        self._command_policy_snapshot = None
         proc = self._proc
         self._proc = None
         if proc is not None:
@@ -778,6 +804,26 @@ def _terminate(proc: process_env.Popen, grace: float) -> None:
         proc.wait(timeout=grace)
 
 
+def _command_policy(value: Any) -> dict[str, Any]:
+    """Optional server metadata: malformed or older catalogs remain usable."""
+    if not isinstance(value, Mapping) or type(value.get("schema")) is not int or value["schema"] != 1:
+        return {}
+    result: dict[str, Any] = {"schema": 1}
+    for key in ("builtin_prefixes", "build_prefixes"):
+        prefixes = value.get(key)
+        if not isinstance(prefixes, list) or any(
+            not isinstance(prefix, str) or not prefix.strip() for prefix in prefixes
+        ):
+            return {}
+        result[key] = list(prefixes)
+    for key in ("run_command_enabled", "readonly", "use_container"):
+        flag = value.get(key)
+        if type(flag) is not bool:
+            return {}
+        result[key] = flag
+    return result
+
+
 def tool_specs(listed: Any) -> tuple[ToolSpec, ...]:
     tools = listed.get("tools") if isinstance(listed, Mapping) else None
     if not isinstance(tools, list):
@@ -808,6 +854,10 @@ def tool_specs(listed: Any) -> tuple[ToolSpec, ...]:
                 description=description if isinstance(description, str) else "",
                 input_schema=dict(schema),
                 read_only=read_only,
+                command_policy=(
+                    _command_policy(annotations.get("codetrailCommandPolicy"))
+                    if name == "run_command" and isinstance(annotations, Mapping) else {}
+                ),
             )
         )
     return tuple(specs)

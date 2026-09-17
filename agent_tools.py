@@ -14,9 +14,10 @@ import shlex
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import config
+import command_allowlist
 import container_runner
 import patch_engine
 from runtime_dependencies import DependencyError, DEPENDENCY_ERROR_PREFIX
@@ -211,6 +212,9 @@ _RUN_COMMAND_TOOL = {
             "build 命令(make/cmake/ninja/meson/bazel build)只在 client.json 的 "
             "build_commands 打開時加入;git 不在白名單(用 git_status / git_diff)。"
             "client.json 的 extra_allowed_commands 可另授權 PATH 上的裸命令名稱。"
+            "/allow add <絕對目錄> 授權 extra_allowed_command_dirs；後續命令立即重驗，"
+            "以裸工具名呼叫已驗證絕對路徑，不改 PATH；目錄工具在容器模式拒絕。"
+            "授權不改既有人工核准。"
             "timeout 1..600 秒(server 端上限;client 可能更早截止)。"
             "apply_patch 不會自動呼叫這裡:lint / test 要另行呼叫 run_lint(fix=False) / run_command。"
         ),
@@ -449,8 +453,12 @@ def _collect_within_budget(lines) -> tuple[list, bool]:
 
 
 class ToolExecutor:
-    def __init__(self, root: str):
+    def __init__(
+        self, root: str, *,
+        command_settings_loader: Callable[[], tuple[list[str], list[str]]] | None = None,
+    ):
         self.root = Path(root).resolve()
+        self._command_settings_loader = command_settings_loader
 
     def _safe_path(self, path: str) -> Optional[Path]:
         try:
@@ -822,6 +830,26 @@ class ToolExecutor:
         Returns:
             (is_valid, error_message, cmd_parts)
         """
+        # MCP 注入的 loader 每次重讀同一份設定，只取兩個 allow 欄位。
+        # direct executor 則仍只看 config；不偷讀 HOME，也不保存舊授權 mapping。
+        try:
+            if self._command_settings_loader is None:
+                extra_names, directories = (
+                    config.EXTRA_ALLOWED_COMMANDS, config.EXTRA_ALLOWED_COMMAND_DIRS,
+                )
+            else:
+                extra_names, directories = self._command_settings_loader()
+            extra_names = command_allowlist.validate_extra_allowed_commands(extra_names)
+            directories = command_allowlist.validate_extra_allowed_command_dirs(directories)
+            inspection = command_allowlist.inspect_command_directories(
+                directories, extra_commands=extra_names,
+            )
+        except Exception as exc:
+            return False, f"錯誤: 無法讀取或驗證 run_command 授權: {exc}", []
+        if inspection.errors:
+            errors = "；".join(f"{path}: {reason}" for path, reason in inspection.errors.items())
+            return False, f"錯誤: run_command 目錄授權解析失敗: {errors}", []
+
         command = command.strip()
 
         try:
@@ -832,9 +860,9 @@ class ToolExecutor:
         if not cmd_parts:
             return False, "錯誤: 空命令", []
 
-        # 動態授權不可持有 from-import 快照；extras 已由 client_config 驗為裸名稱。
+        # 動態授權不可持有 from-import 快照；名稱與目錄 mapping 都來自本次驗證。
         # 同一套逐 token 比對：單 token 項只放行完全相同的 argv[0]。
-        allowed_commands = [*config.ALLOWED_COMMANDS, *config.EXTRA_ALLOWED_COMMANDS]
+        allowed_commands = [*config.ALLOWED_COMMANDS, *extra_names, *inspection.commands]
         is_allowed = False
         for allowed in allowed_commands:
             allowed_parts = shlex.split(allowed)
@@ -846,7 +874,8 @@ class ToolExecutor:
             allowed_list = ', '.join(allowed_commands[:8])
             return False, (
                 f"錯誤: 不允許的命令。\n允許的命令前綴: {allowed_list}...\n"
-                "自訂工具可由使用者在 /allow 或 client.json 的 extra_allowed_commands 授權。"
+                "自訂工具可由使用者以 /allow add <絕對目錄> 授權；"
+                "既有 client.json 的 extra_allowed_commands 裸名稱仍相容。"
             ), []
 
         # 額外安全檢查：危險字元
@@ -862,18 +891,25 @@ class ToolExecutor:
         if not ok:
             return False, f"錯誤: {why}（命令參數必須指向 AICODE_ROOT 內的路徑）", []
 
+        # 只替換通過所有裸 argv 檢查的 argv[0]，其餘參數仍限 sandbox。
+        # 不改 PATH、不以 basename 重試，也不改成 /proc/self/fd 的執行路徑。
+        if cmd_parts[0] in inspection.commands:
+            cmd_parts[0] = inspection.commands[cmd_parts[0]]
         return True, "", cmd_parts
 
     def run_command(self, command: str, timeout: int = RUN_COMMAND_TIMEOUT) -> str:
         """執行白名單內的測試 / 靜態分析命令(build 命令需 opt-in)。
 
-        白名單(config.ALLOWED_COMMANDS + config.EXTRA_ALLOWED_COMMANDS):
+        白名單(內建前綴、legacy extra_allowed_commands 與授權目錄工具):
           - 測試 / 靜態命令是預設白名單(pytest / ctest / npm test / cargo test / go test;
             mypy / tsc / ruff / black / isort / eslint / clang-format 等)。
           - build 命令(make / cmake / ninja / meson / bazel build)只在
             client.json 的 build_commands 打開時加入(server 收 --enable-build-commands)。
           - git 不在白名單(用 git_status / git_diff)。
           - client.json 的 extra_allowed_commands 額外放行 PATH 上的裸命令名稱。
+          - /allow add <絕對目錄> 的 extra_allowed_command_dirs 每次重驗，
+            同一 MCP 後續命令立即生效；以裸工具名呼叫，執行已驗證絕對路徑。
+            目錄授權不改人工核准，host 目錄工具在容器模式明確拒絕。
         apply_patch 不再自動呼叫這裡:lint / test 由模型另行、顯式呼叫,讓各自的核准閘生效。
 
         Args:
@@ -905,6 +941,11 @@ class ToolExecutor:
 
         # 容器化執行模式
         if container_runner.CONTAINER_ENABLED:
+            if os.path.isabs(cmd_parts[0]):
+                return (
+                    "錯誤: 目錄授權工具無法在容器模式執行；host 工具目錄未掛入容器，"
+                    "不會改到 host 執行。"
+                )
             return self._run_command_in_container(command, timeout)
 
         try:

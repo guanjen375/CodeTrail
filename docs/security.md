@@ -137,16 +137,36 @@ system prompt 不是 permission:它不會讓被 `deny` 的工具變成可用,也
 
 `run_command(...)` 本身還有命令白名單與 dangerous-pattern 過濾。timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），不是這個範圍的整數會在執行前被拒絕。不要把 `rm` / `sudo` / `curl` / `bash` 加進白名單;真的需要人工操作時,讓模型列出建議命令,由人自己判斷後在 shell 執行。
 
-個人工具鏈以 `client.json` 的 `extra_allowed_commands` 額外授權，例如 `["nsim", "mdb"]`；
-TUI 的 `/allow add`／`/allow remove` 只編輯這個鍵，不改工具層 `permission`。
-只收 PATH 上的裸 executable 名稱，拒絕路徑、參數、shell 片段與保留命令名稱；
-內建及 build 命令不能藉此擴大，`rm`／`sudo`／`curl`／`bash` 也不能加入。
-設定讀寫沿用 owner-only 防線，壞值、未知鍵與過大的設定在寫入前拒絕。
-下一次 MCP 啟動（重啟 `aicode` 或取消逾時後的自動重新啟動）才載入；readonly
-一律清空額外授權且停用執行。新增命令仍經既有危險字元、路徑規則、timeout 與容器閘。
+個人工具鏈在 TUI 用 `/allow list` 查看，用 `/allow add <絕對目錄>` 新增；一次只收
+一個目錄，空白可加引號。驗證後只更新 `client.json` 的 `extra_allowed_command_dirs`，
+不改工具層 `permission`，不另問確認；重複加入仍驗證現場且不寫檔。兩個額外授權欄位
+在每次 `run_command` 重新讀取，同一 session 後續命令立即生效，不重啟 MCP。
+只熱載入授權，不套用其他 runtime 設定。設定讀寫沿用 owner-only 防線；壞值、
+未知鍵或不安全檔案會拒絕執行，不回退到上一次授權。
+
+工具目錄從 `/` 逐層以 dir-fd／`O_NOFOLLOW` 驗證，拒絕 symlink。祖先只接受 root
+或目前 uid 擁有，且不得 world-writable（root-owned sticky 祖先如 `/tmp` 除外）；
+最終目錄必須由目前 uid 擁有且不得 world-writable。允許 group-write，這是對
+使用者信任的安裝位置授權，並不隔離同群組使用者。最多 32 個目錄，各有界枚舉
+4096 個直接子項，不遞迴。候選須是目前 uid 擁有、非 symlink、非 world-writable、
+帶 owner execute bit 的普通檔，且名稱通過既有規則。最多讀檔頭 64 KiB，只收
+`#!` 腳本、可核對的 ELF `ET_EXEC` 或帶 `PT_INTERP` 的 `ET_DYN`；依內容判斷，
+一般資料與共享函式庫不算工具。保留命令、內建／build 根名稱與不合格項目列排除。
+
+每次 list／執行都重驗目錄、檔案及身分，不承諾固定 binary hash。零合格工具、
+目錄失效或與其他目錄／legacy 名稱衝突都是明確錯誤：add 不寫檔，該次所有
+`run_command` 都不執行。list 即使有部分結果，也會明示整體解析失敗；MCP 未回報
+白名單時不拿本地設定猜測。授權工具仍可能缺動態 linker、架構支援或 license。
+
+既有 `extra_allowed_commands` JSON 相容，例如 `["nsim", "mdb"]`，只授權 PATH
+裸 executable 名稱。目錄工具也以裸名稱呼叫，實際執行使用已驗證絕對路徑，
+不改 PATH、不接受絕對 argv[0] 或 `./tool`。保留名稱（含 `rm`／`sudo`／`curl`／
+`bash`）、內建與 build 參數限制不能藉任一欄位擴大。readonly 一律清空額外授權
+且停用執行；原有工具核准、危險字元、資料路徑規則與 timeout 仍適用。
+
 授權代表你信任該程式可執行程式碼；工作目錄不是 OS sandbox，既有路徑規則也不會
-辨識每個工具的私有旗標（例如 `-tcf=/abs/x.tcf`）。使用容器時工具須在容器內可用，
-不可用會報錯，不會改到 host 執行。
+辨識每個工具的私有旗標（例如 `-tcf=/abs/x.tcf`）。容器模式不掛入本機工具目錄，
+目錄授權工具一律拒絕；legacy PATH 命令須在容器內可用，不會改到 host 執行。
 
 `record_lesson(...)` 是唯一會寫到 sandbox root 之外的工具,而且只寫一個固定路徑:`~/.config/codetrail/lessons.json`(per-deployment 的行為教訓 store,與 `deployment.json` 同層;不能被模型指到別的路徑)。它被 permission 設成 `ask`:模型只能「提案」,你會在核准框看到完整 rule 內容,核准後才落地。沒有無審核的自動寫入路徑;細節見 [docs/lessons.md](lessons.md)。
 
