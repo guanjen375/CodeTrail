@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import io
 import os
 import signal
 import sys
@@ -32,6 +33,124 @@ import config  # noqa: E402
 from mcp_contract import PUBLIC_TOOL_ORDER  # noqa: E402
 
 pytestmark = pytest.mark.smoke
+
+
+class _ReviewStartupProc:
+    """Offline process double; signals release the blocked handshake contract."""
+
+    pid = 99999991
+
+    def __init__(self):
+        self.stdin = io.BytesIO()
+        self.stdout = io.BytesIO()
+        self.stderr = io.BytesIO()
+        self.exited = threading.Event()
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -signal.SIGTERM
+        self.exited.set()
+
+    def wait(self, timeout):
+        if not self.exited.wait(timeout):
+            raise client_mcp.process_env.TimeoutExpired("stub", timeout)
+        return self.returncode
+
+
+@pytest.mark.parametrize("phase", ["before_spawn", "during_spawn", "handshake"])
+def test_abort_review_start_cancels_without_lifecycle_lock_or_late_process(tmp_path, monkeypatch, phase):
+    proc = _ReviewStartupProc()
+    spawn_entered, allow_spawn, handshake_entered = threading.Event(), threading.Event(), threading.Event()
+    spawns, errors, sent = [], [], []
+
+    def popen(argv, **kwargs):
+        spawns.append((argv, kwargs))
+        spawn_entered.set()
+        if phase == "during_spawn":
+            assert allow_spawn.wait(2)
+        return proc
+
+    def killpg(pid, sig):
+        assert pid == proc.pid and sig == signal.SIGKILL
+        proc.returncode = -sig
+        proc.exited.set()
+
+    monkeypatch.setattr(client_mcp.process_env, "popen", popen)
+    monkeypatch.setattr(client_mcp.os, "killpg", killpg)
+    client = client_mcp.McpClient(tmp_path, readonly=True, n_ctx=32768, build_commands=True,
+                                  restart_on_cancel=False)
+    interactive = client_mcp.McpClient(tmp_path)
+    monkeypatch.setattr(client, "_read_stdout", lambda proc: None)
+    monkeypatch.setattr(client, "_read_stderr", lambda proc: None)
+    send = client._send
+    def observe_send(message):
+        sent.append(message)
+        send(message)
+        handshake_entered.set()
+    monkeypatch.setattr(client, "_send", observe_send)
+
+    def start():
+        try:
+            client.start()
+        except client_mcp.McpClientError as exc:
+            errors.append(exc)
+
+    if phase == "before_spawn":
+        assert client.abort_start()
+    worker = threading.Thread(target=start)
+    worker.start()
+    try:
+        if phase != "before_spawn":
+            assert (spawn_entered if phase == "during_spawn" else handshake_entered).wait(2)
+            began = time.monotonic()
+            assert client.abort_start()
+            assert time.monotonic() - began < 0.2, "abort_start waited for the lifecycle lock"
+        allow_spawn.set()
+        worker.join(0.8)
+        assert not worker.is_alive(), "cancelled handshake retained the lifecycle lock"
+        assert errors and client.closed and client.pid is None
+        assert not interactive.closed and interactive.pid is None
+        assert client_mcp.call_timeout_seconds() == config.MCP_CALL_TIMEOUT_SECONDS
+        assert client._lock.acquire(blocking=False)
+        client._lock.release()
+        if phase == "before_spawn":
+            assert not spawns
+        else:
+            assert proc.exited.is_set()
+            argv = spawns[0][0]
+            assert "--readonly" in argv and "--enable-build-commands" not in argv
+            assert argv[argv.index("--n-ctx") + 1] == "32768"
+        if phase != "handshake":
+            assert not sent, "late process initialized after cancellation"
+        with pytest.raises(client_mcp.McpUnavailableError):
+            client.start()
+        assert len(spawns) <= 1
+    finally:
+        allow_spawn.set()
+        client.abort_start()
+        worker.join(2)
+        client.close()
+        interactive.close()
+
+
+def test_private_review_cancel_escalation_cannot_respawn_or_close_interactive(tmp_path, monkeypatch):
+    review = client_mcp.McpClient(tmp_path, readonly=True, restart_on_cancel=False)
+    interactive = client_mcp.McpClient(tmp_path)
+    review._proc = _ReviewStartupProc()
+    interactive._proc = _ReviewStartupProc()
+    review._startup_complete = interactive._startup_complete = True
+    original_proc = interactive._proc
+    monkeypatch.setattr(review, "_spawn", lambda: pytest.fail("cancelled review respawned"))
+    assert not review.abort_start(), "startup-only abort must not bypass live tool cancellation"
+    review._escalate("review cancelled")
+    assert review.closed and review.pid is None
+    assert interactive._proc is original_proc and original_proc.poll() is None and not interactive.closed
+    with pytest.raises(client_mcp.McpUnavailableError):
+        review.begin_call("read_file", {})
+    interactive.close()
 
 STUB = Path(__file__).resolve().parent / "fixtures" / "stub_mcp_server.py"
 SLOW = "ingest_document"

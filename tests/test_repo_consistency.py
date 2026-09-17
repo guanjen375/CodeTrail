@@ -20,6 +20,7 @@ import pytest
 
 from scripts.check_eval_consistency import check_all as eval_check_all
 from scripts.check_readme_consistency import (
+    REMOVED_DAILY_CLI_PATTERNS,
     _check_code_model_placeholder_contract,
     _check_default_aux_models_documented,
     _check_forbidden_main_model_tokens,
@@ -950,6 +951,49 @@ def test_user_docs_must_not_teach_removed_flags_or_files():
     assert issues == []
 
 
+@pytest.mark.smoke
+def test_removed_daily_cli_commands_are_rejected_by_both_doc_gates():
+    """Removing public argv must also remove the instructions that send users there."""
+    from scripts import check_readme_consistency as checker
+
+    removed = (
+        "~/start.sh status --strict", "~/start.sh logs main",
+        "~/start.sh help", "~/start.sh quit", "~/start.sh --dry-run",
+        "~/start.sh --scope aux", "~/start.sh --keep-on-failure",
+        "~/start.sh stop --force", "aicode -c", "aicode --session abc",
+        "./set_config.sh --yes", "scripts/codetrail-host.sh --help",
+        "scripts/codetrail-device.sh --mode client",
+    )
+    for command in removed:
+        issues: list[str] = []
+        checker._check_no_stale_client_docs(command, issues)
+        assert issues, command
+        assert _doc_offenders("docs/example.md", command), command
+    for command in (
+        "~/start.sh", "~/start.sh stop", "aicode", "./set_config.sh",
+        "scripts/codetrail-host.sh", "scripts/codetrail-device.sh",
+        "python3 scripts/set_config.py --yes",
+        "python3 scripts/launch_servers.py --scope all --dry-run",
+        "python3 scripts/check_status.py --strict",
+    ):
+        issues = []
+        checker._check_no_stale_client_docs(command, issues)
+        assert issues == [], (command, issues)
+        assert _doc_offenders("docs/example.md", command) == [], command
+
+
+@pytest.mark.smoke
+def test_runtime_repair_hints_use_supported_daily_or_maintenance_commands():
+    """Fail-loud errors must point at commands accepted by the new wrappers."""
+    offenders = []
+    for path in _repo_sources(suffixes=(".py", ".sh"), names=("aicode",)):
+        source = path.read_text(encoding="utf-8")
+        for number, line in enumerate(source.splitlines(), 1):
+            if any(re.search(pattern, line) for pattern, _ in REMOVED_DAILY_CLI_PATTERNS):
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}")
+    assert offenders == [], "\n".join(offenders)
+
+
 # ── 現行 CLI 使用客戶端的介面與用語 ──
 
 @pytest.mark.smoke
@@ -1405,6 +1449,7 @@ def test_the_only_llama_server_exec_hands_over_the_stripped_environment():
 #: 文件不得再教的**介面**:每一條都是「照做之後不會生效、也不會報錯」。
 #: (變數名不在這裡列:任何 CodeTrail 變數名都由 `_doc_offenders` 一律抓。)
 _FORBIDDEN_DOC_PATTERNS = (
+    *REMOVED_DAILY_CLI_PATTERNS,
     (r"\baicode\s+web\b", "網頁前端已整組移除"),
     (r"\baicode\s+attach\b", "attach 已移除"),
     (r"\baicode_web\b", "背景 launcher 已移除"),

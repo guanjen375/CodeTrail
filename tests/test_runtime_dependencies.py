@@ -313,7 +313,7 @@ def test_aicode_requires_python3_even_when_python_is_available(tmp_path):
         (binary_dir / command).symlink_to(shutil.which(command))
     (binary_dir / "python").write_text("#!/bin/sh\nexit 0\n")
     (binary_dir / "python").chmod(0o755)
-    result = subprocess.run([require_working_bash(), str(REPO_ROOT / "aicode"), "--help"],
+    result = subprocess.run([require_working_bash(), str(REPO_ROOT / "aicode")],
                             env={**os.environ, "PATH": str(binary_dir)},
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 2, result.stderr

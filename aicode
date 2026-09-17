@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# aicode — CodeTrail 的**唯一**使用者入口。
+# aicode — CodeTrail 的全螢幕聊天入口，無參數。
 #
 #   cd <要分析的專案>
 #   aicode                 # 在這裡開 CodeTrail 的全螢幕 TUI
-#   aicode -c              # 接續這個專案最近一次的對話
-#   aicode --session <id>  # 接續指定的對話
+#   接續對話請在 TUI 使用 /session 或 /resume。
 #
 # 這支腳本刻意只做四件 Python 做不了或做起來很難看的事:
 #   1. 找到 CodeTrail 的 checkout(自己可能是一個 symlink);
@@ -20,6 +19,12 @@
 # 沙箱 root 一律是 $PWD。沒有 --root、沒有位置參數、沒有 AICODE_ROOT。
 
 set -euo pipefail
+
+if [ "$#" -ne 0 ]; then
+  echo "[aicode] 不接受參數。用法:cd <專案> && aicode" >&2
+  echo "         接續對話請在 TUI 使用 /session 或 /resume。" >&2
+  exit 2
+fi
 
 resolve_aicode_home() {
   local source="${BASH_SOURCE[0]}"
@@ -55,77 +60,6 @@ if [ ! -f "$CLIENT_ENTRY" ]; then
   exit 2
 fi
 
-# --help 不需要終端機,也不需要跑任何檢查。**由 wrapper 自己印**:客戶端的
-# `--help` 會列出 run / status / sessions 這些**內部**入口(canary / eval / doctor 用),
-# 而 aicode 底下它們是被拒絕的 —— 列出來只會請使用者去試一個會被打回的東西。
-for arg in "$@"; do
-  if [ "$arg" = "-h" ] || [ "$arg" = "--help" ]; then
-    cat <<EOF
-用法: aicode [-c | --continue] [--session <id>]
-
-  cd <要分析的專案>
-  aicode                 在這裡開 CodeTrail 的全螢幕 TUI
-  aicode -c              接續這個專案最近一次的對話
-  aicode --session <id>  接續指定的對話
-
-沙箱 root 一律是目前目錄。主模型、端點與 n_ctx 只來自
-~/.config/codetrail/{deployment,models}.json —— 換模型或 n_ctx 就重跑
-./set_config.sh 再重啟 server。權限、壓縮模式與其餘開關在
-~/.config/codetrail/client.json。
-
-要在腳本裡問一題(headless、JSON 事件流):
-  python3 $CLIENT_ENTRY run "<問題>" --format json
-EOF
-    exit 0
-  fi
-done
-
-# 使用者入口只有這三個旗標。`codetrail_chat.py` 底下還有 run / status / sessions
-# 這些**內部**入口(canary / eval / doctor 用),它們不跑 preflight —— 原樣轉發
-# argv 的話,`aicode run "..."` 就變成第二條使用者入口,而且是一條略過 profile
-# 驗證、ctx 安全閘與工具健檢的路。白名單在這裡擋掉,錯誤訊息指回真正的入口。
-i=1
-while [ "$i" -le "$#" ]; do
-  eval "arg=\${$i}"
-  case "$arg" in
-    -c|--continue) ;;
-    --session)
-      i=$((i + 1))
-      if [ "$i" -gt "$#" ]; then
-        echo "[aicode] --session 需要一個 session id。" >&2
-        exit 2
-      fi
-      eval "val=\${$i}"
-      case "$val" in
-        "" )
-          echo "[aicode] --session 的值是空的。" >&2
-          exit 2
-          ;;
-        --*)
-          echo "[aicode] --session 的值看起來是另一個選項:$val" >&2
-          exit 2
-          ;;
-      esac
-      ;;
-    --session=*)
-      if [ "${arg#--session=}" = "" ]; then
-        echo "[aicode] --session= 的值是空的。" >&2
-        echo "         空值會被靜默當成「沒有指定」而開一個新對話 —— 那不是你要的。" >&2
-        exit 2
-      fi
-      ;;
-    *)
-      echo "[aicode] 不認得的參數:$arg" >&2
-      echo "         aicode 只接受:-c/--continue、--session <id>、-h/--help。" >&2
-      echo "         沙箱 root 一律是目前目錄(cd <專案> && aicode)。" >&2
-      echo "         要在腳本裡問一題請用 headless 入口:" >&2
-      echo "           $PYBIN $CLIENT_ENTRY run \"<問題>\" --format json" >&2
-      exit 2
-      ;;
-  esac
-  i=$((i + 1))
-done
-
 # 全螢幕 TUI 需要一個真的終端機。stdin 或 stdout 被導向 / pipe 時**明確拒絕**,
 # 不靜默降級成另一種介面 —— 指向 headless 入口,讓腳本使用者拿到能用的東西。
 if [ ! -t 0 ] || [ ! -t 1 ]; then
@@ -145,4 +79,4 @@ if ! "$PYBIN" -c "import textual" >/dev/null 2>&1; then
   exit 2
 fi
 
-exec "$PYBIN" "$CLIENT_ENTRY" "$@"
+exec "$PYBIN" "$CLIENT_ENTRY"

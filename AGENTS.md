@@ -88,6 +88,18 @@
   讀寫兩端都拒 symlink 與 hard link、append 不得建出沒有 header 的檔、header 綁這個
   專案與這個 session;選單的大綱只取本地**真實** user 訊息(不是摘要、不是工具輸出),
   零 LLM、零寫入
+- `/review` 的來源與執行——Git 環境隔離，不執行 repository filter / hook / fsmonitor；
+  文字換行屬性不得製造假的整檔變更，未知轉換、二進位、超限與未完成必須明列。
+  repo 來源採有界 dir-fd / nofollow 讀取，發布前重驗快照；外部全域 Git 設定可解析
+  dotfiles symlink，但仍須有界普通檔讀取、核對連結與目標身分，不得先交給 Git
+  路徑查詢讀取未驗證的使用者全域設定／include。空的未初始化 submodule 只有在安全枚舉
+  確認空且 HEAD/index gitlink 相同時可略過，內容與指標漂移必須偵測。
+  finding 只接受該次檔案、真實行號、changed hunk 與逐字證據，格式錯誤不得當成
+  零問題。審查使用獨立
+  `--readonly` MCP、真正 JSON true 的工具註記及同一份 schema / dispatch allowlist，
+  與聊天共用模型鎖；不改聊天歷史或全域設定，不寫 context metrics。取消涵蓋
+  MCP 建立前、spawn / handshake、每檔交接與工具呼叫，收尾必須釋放回合鎖，
+  不得終止原聊天 MCP 或在取消後發下一個模型請求。
 - `client_policy` 的兩個 policy——readonly 的判準是 `tools/list` 的 `readOnlyHint`
   (**只有 JSON true 才算唯讀**;`bool("false")` 是 True),不是寫死名單,所以漏加名單的
   新工具一樣被 deny;互動模式的六個 ask 工具沒核准就不得執行,核准框**完整顯示參數**
@@ -172,7 +184,9 @@
   壓縮狀態行、警告(含 preflight 期間所有 stderr 行);進度行不進畫面,但 `Preflight.lines`
   仍是完整 transcript
 - 啟動核心的設定來源——GPU、llama-server 路徑、tmux session 名、逾時與 rollback 只來自
-  `deployment.json`、repo 常數與 argv;`~/start.sh` **不 export 也不 unset**,只轉發 `"$@"`。
+  `deployment.json`、repo 常數與 argv;`~/start.sh` **不 export 也不 unset**，只接受
+  無參數啟動或單一 `stop`，以固定 argv 呼叫啟動／停止核心；其他日常入口同樣
+  在副作用前拒絕使用者參數。
   tmux pane 一律經 `deployment_profile.py exec <role> <loader argv>`,最終環境由
   `process_env.llama_server_env()` 決定(三前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES`
   剝除;GPU 只由 `build_server_command` 那個 `env CUDA_VISIBLE_DEVICES=<驗證過的值>` 前綴
@@ -263,8 +277,8 @@ module 層 `pytestmark` 換成單條 decorator，gate 都還是綠的。
   錯誤訊息。允許讀的只有「檔案在哪 / 行程介面」那幾個(`HOME`、`XDG_*`、`PATH`、
   寫入 `PYTHONIOENCODING`、寫入 `PYTEST_*`),由 `tests/test_repo_consistency.py`
   的 allowlist 靜態守住。**啟動核心也沒有例外**:GPU、llama-server 路徑、tmux session
-  名、逾時、rollback 與測試並行度全部改吃 `deployment.json` 與 argv,`~/start.sh` 只
-  轉發 `"$@"`。
+  名、逾時、rollback 與測試並行度全部改吃 `deployment.json` 與內部 argv；日常 shell
+  入口不再接受參數，`~/start.sh` 僅保留無參數啟動與 `stop`。
 - 不要 `git commit` 沒被使用者確認過的修改。
 
 ---

@@ -662,6 +662,9 @@ class EngineOptions:
     prune: bool = True
     policy: PermissionPolicy = field(default_factory=client_policy.InteractivePolicy)
     request_timeout: int = 600
+    tool_allowlist: frozenset[str] | None = None
+    metrics_enabled: bool = True
+    cancellable_requests: bool = False
 
 
 @dataclass
@@ -735,7 +738,7 @@ class Engine:
         #: 第一次 session 落檔失敗的原因。非 None 代表這段對話只在記憶體裡。
         self.store_error: str | None = None
         #: 最後一次 adopt() 換上來的快照(new_session 清)。啟動時就接續好的那條路
-        #: (`aicode -c` / `--session`)靠它把畫面補回來:engine 已經換過去了,
+        #: (Python 入口的 `--session`)靠它把畫面補回來:engine 已經換過去了,
         #: 畫面還沒有那段對話,而 TUI 是在 Engine 之後才建起來的。
         self.resumed_snapshot: SessionSnapshot | None = None
         self._tool_specs: dict[str, client_mcp.ToolSpec] = {}
@@ -746,6 +749,7 @@ class Engine:
         self._cancel = threading.Event()
         self._active_lock = threading.Lock()
         self._active_stream: Any = None
+        self._active_request: llama_client.RequestCancellation | None = None
         self._in_turn = 0                      # 進行中的 send() / complete() / turn_scope 數(可巢狀)
         self._turn_completed = False           # 這一輪的答案 / 摘要已經**決定寫定**(之後的取消一律拒絕)
         self._turn_seen_since_clear = False    # 自上次 clear_cancel() 起 engine 開始過 turn(不管是寫定、失敗或中斷):
@@ -868,6 +872,13 @@ class Engine:
     def load_tools(self) -> None:
         specs = self.mcp.tools()
         client_mcp.assert_public_catalog(specs)
+        if self.options.tool_allowlist is not None:
+            unknown = self.options.tool_allowlist.difference(spec.name for spec in specs)
+            if unknown:
+                raise EngineError(f"工具 allowlist 不在完整 catalog 中: {sorted(unknown)}")
+            specs = tuple(spec for spec in specs if spec.name in self.options.tool_allowlist)
+        if self.options.tool_allowlist is not None and self.options.policy.name == "readonly":
+            specs = tuple(spec for spec in specs if spec.read_only is True)
         self._tool_specs = {spec.name: spec for spec in specs}
         self._openai_tools = [spec.as_openai_tool() for spec in specs]
         self._loaded_tools = True
@@ -882,6 +893,22 @@ class Engine:
         if not self._loaded_tools:
             self.load_tools()
         return list(self._openai_tools)
+
+    def _log_metrics(self, usage: Any) -> None:
+        # An ephemeral readonly engine shares runtime settings with the writable
+        # chat. Its privacy boundary must not mutate the process-wide config.
+        if self.options.metrics_enabled and self.options.policy.name != "readonly":
+            context_budget.log_metrics(usage)
+
+    def _check_context(self, **kwargs: Any) -> Any:
+        if self.options.metrics_enabled and self.options.policy.name != "readonly":
+            return context_budget.check_and_log(**kwargs)
+        # check_and_log logs refused attempts too. Build the identical usage
+        # and enforce the same gate without touching process-global settings.
+        kwargs.pop("emit", None)
+        usage = context_budget.build_usage(**kwargs)
+        context_budget.enforce_gate(usage)
+        return usage
 
     # ---- session -------------------------------------------------------
     @property
@@ -953,7 +980,7 @@ class Engine:
             self._report_activity(operation, "preparing")
             payload = [dict(message) for message in messages]
             measured = self.count_input_tokens(payload)
-            usage = context_budget.check_and_log(
+            usage = self._check_context(
                 source=source,
                 requested_num_ctx=self.options.n_ctx,
                 messages=payload,
@@ -964,7 +991,7 @@ class Engine:
                 emit=False,
             )
             self._report_activity(operation, "waiting_model")
-            with self._model_slot() as slot:
+            with self._model_slot() as slot, self._request_transport() as request_cancel:
                 # 壓縮是同一輪的尾巴:取消若落在 run_tool_loop 結束之後、摘要開始
                 # 之前,這裡就要接住,不然摘要照常完成而旗標留到下一輪。
                 if self._cancel.is_set():
@@ -982,8 +1009,10 @@ class Engine:
                         stream=True,
                         extra={"max_tokens": self.options.max_output_tokens, "return_progress": True},
                         timeout=self.options.request_timeout,
+                        **({"cancel": request_cancel} if request_cancel is not None else {}),
                     ),
                     slot,
+                    cancellation=request_cancel,
                 )
                 try:
                     try:
@@ -1021,7 +1050,7 @@ class Engine:
         finally:
             # 摘要是這一輪的最後一步:結束時清旗標,取消才不會留到下一題。
             self._end_turn()
-        context_budget.log_metrics(usage)
+        self._log_metrics(usage)
         import client_compaction
 
         # 沒有 finish_reason 的串流是被截斷的(transport 中途斷、缺 [DONE]),不是 stop。
@@ -1469,7 +1498,7 @@ class Engine:
             # 出一列從來沒送出去的請求。
             return PrimeOutcome(False, "next_turn_would_overflow", None)
 
-        usage = context_budget.check_and_log(
+        usage = self._check_context(
             source=PRIME_SOURCE,
             requested_num_ctx=self.options.n_ctx,
             messages=payload,
@@ -1549,7 +1578,7 @@ class Engine:
         with self._prime_guard:
             if abort.is_set() or self._prime_epoch != epoch:
                 return PrimeOutcome(False, "aborted", None)
-            context_budget.log_metrics(usage)
+            self._log_metrics(usage)
             return PrimeOutcome(True, "", usage.prompt_tokens_processed)
 
     def abort_prime(self, *, wait: float = PRIME_ABORT_WAIT) -> bool:
@@ -1618,7 +1647,29 @@ class Engine:
         在 model lock 上排隊,不會跟一個還在 llama-server queue 裡的舊請求重疊。"""
         return _ModelSlot(self.model_lock, self._cancel)
 
-    def _open_stream(self, request: Callable[[], Any], slot: "_ModelSlot | None" = None) -> Any:
+    @contextlib.contextmanager
+    def _request_transport(self):
+        """Optional private transport; close all sockets before releasing the slot."""
+        if not self.options.cancellable_requests:
+            yield None
+            return
+        request = llama_client.RequestCancellation()
+        with self._active_lock:
+            self._active_request = request
+        try:
+            if self._cancel.is_set():
+                raise TurnCancelled("這一輪已被使用者中斷")
+            yield request
+        finally:
+            request.close()
+            with self._active_lock:
+                if self._active_request is request:
+                    self._active_request = None
+
+    def _open_stream(
+        self, request: Callable[[], Any], slot: "_ModelSlot | None" = None,
+        *, cancellation: llama_client.RequestCancellation | None = None,
+    ) -> Any:
         """發出串流請求並登記成 active stream——**等 response headers 期間也能取消**。
 
         `requests` 在拿到 headers 之前沒有任何可以關的東西(socket 藏在 adapter 裡),
@@ -1645,7 +1696,7 @@ class Engine:
         def _settle_abandoned() -> None:
             # 恰好執行一次:關掉(可能已經到了的)串流,然後才把 model lock 交還。
             _close_quietly(box.get("stream"))
-            if slot is not None:
+            if slot is not None and cancellation is None:
                 slot.release_late()
 
         def _abandon() -> None:
@@ -1653,7 +1704,12 @@ class Engine:
             if abandoned:
                 return
             abandoned = True
-            if slot is not None:
+            if cancellation is not None:
+                # cancel waits for socket shutdown and rejects late connects.
+                # No HTTP request can remain live, so the caller can release
+                # its slot after the transport context closes its session.
+                cancellation.cancel()
+            elif slot is not None:
                 slot.hand_off()
             if done.is_set():
                 _settle_abandoned()
@@ -1769,6 +1825,9 @@ class Engine:
             with self._active_lock:
                 call = self._active_call
                 stream = self._active_stream
+                request = self._active_request
+        if request is not None:
+            request.cancel()
         if stream is not None:
             _close_quietly(stream)
         return CancelDecision(True, call)
@@ -2033,7 +2092,7 @@ class Engine:
             # 的 system prompt 都保持原文。tools 保留,HTTP adapter 才會實送 none。
             payload[0] = {**payload[0], "content": payload[0]["content"] + "\n\n" + CONVERGENCE_INSTRUCTION}
         measured = self.count_input_tokens(payload, tools=self._openai_tools, tool_choice=tool_choice)
-        usage = context_budget.check_and_log(
+        usage = self._check_context(
             source="client",
             requested_num_ctx=self.options.n_ctx,
             messages=payload,
@@ -2053,7 +2112,7 @@ class Engine:
         finish = ""
 
         self._report_activity("response", "waiting_model")
-        with self._model_slot() as slot:
+        with self._model_slot() as slot, self._request_transport() as request_cancel:
             if self._cancel.is_set():
                 # 等共用 model_lock 期間被取消:拿到鎖之後不得再發請求。
                 raise TurnCancelled("這一輪已被使用者中斷")
@@ -2072,8 +2131,10 @@ class Engine:
                     stream=True,
                     extra={"max_tokens": self.options.max_output_tokens, "return_progress": True},
                     timeout=self.options.request_timeout,
+                    **({"cancel": request_cancel} if request_cancel is not None else {}),
                 ),
                 slot,
+                cancellation=request_cancel,
             )
             protocol_error = ""
             try:
@@ -2116,7 +2177,7 @@ class Engine:
         if self._cancel.is_set():
             # 取消端關掉 socket 之後這裡看到的是 clean EOF:那是中斷,不是 transport 截斷。
             raise TurnCancelled("這一輪已被使用者中斷")
-        context_budget.log_metrics(usage)
+        self._log_metrics(usage)
         content = "".join(content_parts)
         reasoning = "".join(reasoning_parts)
         # 沒有 finish_reason 就結束 = transport 截斷(clean EOF、缺 [DONE]、終結 chunk
@@ -2191,6 +2252,11 @@ class Engine:
     ) -> dict[str, Any]:
         name = call["name"]
         arguments = call["arguments"]
+        if self.options.tool_allowlist is not None and name not in self.options.tool_allowlist:
+            return self._tool_reply(
+                call, status=client_events.STATUS_DENIED,
+                text=f"status: denied\n{name} 不在本輪允許的工具集合。",
+            )
         spec = specs.get(name)
         if spec is None:
             return self._tool_reply(
@@ -2211,6 +2277,11 @@ class Engine:
                 ),
             )
 
+        if self.options.policy.name == "readonly" and spec.read_only is not True:
+            return self._tool_reply(
+                call, status=client_events.STATUS_DENIED,
+                text=client_policy.denial_message(name, self.options.policy.name),
+            )
         decision = self.options.policy.decide(
             name, read_only=spec.read_only, arguments=arguments
         )

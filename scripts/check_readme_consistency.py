@@ -751,13 +751,26 @@ _PRODUCT_STATUS_PHRASES = [
 ]
 
 
+# Shared with the source gate: public wrappers no longer forward arguments.
+# Keep labels free of executable examples so runtime help cannot teach them again.
+REMOVED_DAILY_CLI_PATTERNS = (
+    (r"\bstart\.sh[ \t]+(?:status|logs|help|quit|--?[\w-]+)\b",
+     "啟動 wrapper 僅接受無參數啟動或單一 stop"),
+    (r"\bstart\.sh[ \t]+stop[ \t]+--?[\w-]+",
+     "停止 wrapper 不接受額外參數"),
+    (r"\b(?:aicode|set_config\.sh|codetrail-(?:host|device)\.sh)[ \t]+--?[\w-]+",
+     "日常入口不接受旗標；維護 argv 請使用內部 Python 入口"),
+)
+
+
 _STALE_DOC_PATTERNS = (
+    *REMOVED_DAILY_CLI_PATTERNS,
     (r"--compaction-mode\s+native", "`--compaction-mode native`(parser 只收 codetrail / manual / off)"),
     (r"~/\.config/codetrail/compaction\.json", "`~/.config/codetrail/compaction.json`(壓縮模式現在記在 client.json)"),
     (r"--enable-experimental-build-prompt", "`--enable-experimental-build-prompt`(旗標已移除)"),
     # 設定只來自檔案與 argv:這幾個殼層形狀照做之後既不會生效也不會報錯。
     (r"export\s+LLAMA_BIN=", "`export LLAMA_BIN=`(llama-server 路徑寫在 deployment.json 的 `llama_bin` / `--llama-bin`)"),
-    (r"export\s+MODELS_DIR=", "`export MODELS_DIR=`(改用 `./set_config.sh --models-dir`)"),
+    (r"export\s+MODELS_DIR=", "`export MODELS_DIR=`(改用設定精靈或內部設定腳本的 models-dir 參數)"),
     (r"AICODE_TEST_JOBS=", "`AICODE_TEST_JOBS=`(改用 `scripts/run_tests.py --jobs N`)"),
     (r"Environment=(?:AICODE_|AI_CODE_|CODETRAIL_)",
      "systemd unit 的 `Environment=AICODE_*`(loader 只讀 deployment.json 與旗標)"),

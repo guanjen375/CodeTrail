@@ -131,6 +131,7 @@ class TurnCoordinator:
         self._turn_id = ""
         self._accepting_supplements = False
         self._active_queue_id = ""
+        self._review_job: Any = None
         # 摘要不經 send(on_event=...),但手動／自動壓縮都要回報目前階段。
         # 活動共用 UI bridge;不改 send 的 JSONL 事件流,也不進預熱路徑。
         set_activity = getattr(engine, "set_activity_callback", None)
@@ -150,6 +151,11 @@ class TurnCoordinator:
     def cancelled(self) -> bool:
         with self._lock:
             return self._cancelled
+
+    @property
+    def reviewing(self) -> bool:
+        with self._lock:
+            return self._review_job is not None and not self._turn_done
 
     def pending_approvals(self) -> tuple[str, ...]:
         with self._lock:
@@ -208,6 +214,8 @@ class TurnCoordinator:
             raise QueueError("mode 必須是 queue 或 supplement。")
         with self._lock:
             target = self.engine.session_id
+            if self._review_job is not None and mode == "supplement":
+                raise QueueError("工作區審查不接收補充；原文仍可編輯，或使用 /queue add 保留到聊天。")
             if session_id is not None and session_id != target:
                 raise QueueError("對話已切換,訊息未送出;請在原對話重新確認。")
             pending = [item for item in self._queue if item.status in PENDING_QUEUE_STATES]
@@ -227,7 +235,7 @@ class TurnCoordinator:
                               and callable(getattr(self.engine, "record_supplement", None)))
             status = "deferred" if mode == "supplement" and not can_supplement else "waiting"
             reason = "本輪已無安全送入點,保留到下一輪。" if status == "deferred" else ""
-            if not active:
+            if not active or self._review_job is not None:
                 self._queue_paused = True
                 reason = "待下一輪;使用 /queue resume 開始。"
             self._queue_sequence += 1
@@ -361,14 +369,14 @@ class TurnCoordinator:
         self._queue_event(item)
 
     # ---- 回合邊界 ------------------------------------------------------
-    def begin_turn(self) -> None:
+    def begin_turn(self, *, review_job: Any = None) -> None:
         """取 turn_lock 並標「這一輪開始」——兩步在同一個臨界區內。
 
         兩步之間收到取消的話,:meth:`cancel` 看到的是上一輪留下的
         ``_turn_done=True``,回 False,那一次點擊就整個漏掉。
         """
         with self._lock:
-            if self._turn_lock.locked():
+            if self._turn_lock.locked() or self._approvals:
                 raise self.Busy(self.engine.session_id)
             if any(item.status in PENDING_QUEUE_STATES for item in self._queue):
                 raise QueueError("還有待送訊息;使用 /queue resume、/queue add 或 /queue cancel。")
@@ -380,6 +388,7 @@ class TurnCoordinator:
             self._active_queue_id = ""
             self._queue_paused = False
             self._accepting_supplements = False
+            self._review_job = review_job
 
     def finish_turn(self) -> None:
         """一輪(訊息或手動摘要)結束:標 turn_done、清 engine 旗標、放鎖。
@@ -392,12 +401,14 @@ class TurnCoordinator:
             self._turn_done = True
             self._accepting_supplements = False
             self._active_queue_id = ""
-            clear = getattr(self.engine, "clear_cancel", None)
-            if callable(clear):
-                clear()
+            if self._review_job is None:
+                clear = getattr(self.engine, "clear_cancel", None)
+                if callable(clear):
+                    clear()
+            self._review_job = None
         self._turn_lock.release()
 
-    def cancel(self, *, block: bool = True) -> bool:
+    def cancel(self, *, block: bool = True, review_id: str | None = None) -> bool:
         """中斷進行中的那一輪。沒有在跑就回 ``False``。
 
         接不接受由 engine 的 ``request_cancel(arm_when_idle=True)`` **原子**決定:
@@ -416,15 +427,18 @@ class TurnCoordinator:
         with self._lock:
             if not self._turn_lock.locked() or self._turn_done:
                 return False
+            if review_id is not None and (self._review_job is None or self._turn_id != review_id):
+                return False
             pending_call = None
             slow_cancel = None
-            request = getattr(self.engine, "request_cancel", None)
+            active_engine = self._review_job if self._review_job is not None else self.engine
+            request = getattr(active_engine, "request_cancel", None)
             if callable(request):
                 decision = request(arm_when_idle=True)
                 if not decision.accepted:
                     return False
                 pending_call = decision.call
-                slow_cancel = getattr(self.engine, "cancel_pending", None)
+                slow_cancel = getattr(active_engine, "cancel_pending", None)
             else:  # pragma: no cover - 只有測試替身會少這個方法
                 fallback = getattr(self.engine, "cancel", None)
                 if callable(fallback):
@@ -533,6 +547,50 @@ class TurnCoordinator:
             self._pause_queue()
             self.finish_turn()
             raise
+
+    def start_review(self, job: Any) -> str:
+        """Reserve the shared turn and register cancel before scheduling work."""
+        self.begin_turn(review_job=job)
+        target, turn_id = self.engine.session_id, self.turn_id
+        try:
+            self._spawn(lambda: self._run_review(job, target, turn_id), f"codetrail-review-{target}")
+        except BaseException:
+            job.request_cancel()
+            self.finish_turn()
+            raise
+        return turn_id
+
+    def _run_review(self, job: Any, target: str, turn_id: str) -> None:
+        import client_review
+
+        def progress(message: str) -> None:
+            self._publish({"type": "review_progress", "sessionID": target,
+                           "reviewID": turn_id, "message": message})
+
+        try:
+            outcome = job.run(progress)
+        except Exception as exc:
+            outcome = client_review.ReviewOutcome(
+                client_events.REASON_ERROR, "incomplete", detail=f"{type(exc).__name__}: {exc}",
+            )
+        # Serialize the final decision with coordinator.cancel, including the
+        # window after verify_snapshot and before publishing the final report.
+        with self._lock:
+            outcome = job.finish(outcome)
+            self._turn_done = True
+            if any(item.status in PENDING_QUEUE_STATES for item in self._queue):
+                self._queue_paused = True
+        self.finish_turn()
+        try:
+            report = outcome.render()
+        except Exception as exc:
+            report = f"審查結果無法呈現：{type(exc).__name__}: {exc}\n未寫入聊天歷史。"
+            if outcome.reason != client_events.REASON_CANCELLED:
+                outcome = replace(outcome, reason=client_events.REASON_ERROR, state="incomplete")
+        event = client_events.step_finish_event(target, reason=outcome.reason)
+        event.update(reviewID=turn_id, review_report=report, review_state=outcome.state)
+        self._publish(event)
+        # No queue drain, prime or compaction is allowed on this branch.
 
     def prepare_idle(self, reason: str) -> bool:
         """接續歷史先在可取消的回合中壓縮，收尾後才交給零寫入的 prime。"""

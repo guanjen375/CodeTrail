@@ -77,10 +77,12 @@ aicode        # CodeTrail 終端客戶端;/tools 應列出 21 個工具
 想讓連線斷了也不中斷,把它跑在 `tmux` 裡(`tmux new -s codetrail`,斷線後 `tmux attach -t codetrail`)。
 
 - 第 5 步的 `export` 只處理目前 shell；§1.2 會把同一條 PATH 寫進 `~/.profile`，讓重新登入後仍生效。
-- `set_config.sh` 依 main → embedding → reranker → VL 分組問答；推薦值不是硬限制，
-  寫入前會顯示摘要，舊設定有備份。完整問答與非互動旗標見 §3.1。
-- 啟動 `aicode` 前四個 server 都必須 ready。`~/start.sh status|stop|logs|help` 是統一管理
-  入口；重新啟動前先 stop。完整行為見 §3.2–§3.3。
+- `set_config.sh` 先選部署角色或還原操作；local / model-host 再依 main → embedding → reranker → VL 分組問答。推薦值不是硬限制，
+  寫入前會顯示摘要，舊設定有備份。完整問答見 §3.1；A/B 雙機操作見 [分離部署](docs/split-deployment.md)。
+- 啟動 `aicode` 前四個 server 都必須 ready。`~/start.sh` 啟動、`~/start.sh stop` 停止；
+  監看使用 `nvidia-smi` 或 `tmux attach -t codetrail-main`。完整行為見 §3.2–§3.3。
+- 在 TUI 輸入 `/review` 可唯讀審查目前工作區的變更，結果含檔案位置、證據與覆蓋狀態。
+  使用方式與範圍見 [程式碼審查](docs/code-review.md)。
 - 四個 server 預設只綁 `127.0.0.1`。安全細節見 [docs/security.md](docs/security.md)。
 - system prompt 由客戶端自組:內建基底規則(硬上限 1,600 字元)＋ MCP 工具路由圖
   ＋ 專案 `AGENTS.md` ＋ `.codetrail/lessons.md` ＋ 選用的
@@ -98,7 +100,7 @@ aicode        # CodeTrail 終端客戶端;/tools 應列出 21 個工具
 > 2. **四個 llama-server 都要起**:main `8080` + embedding `8081` + reranker `8082` + VL `8083`。三顆副模型是硬性需求,缺一個啟動前 preflight 就擋下;reranker 不提供降級方案。見 §3。
 > 3. **不要從 `$HOME` 或 `/` 啟動** —— 沙箱會直接拒絕。先 `cd` 進你要分析的**具體專案目錄**再跑。
 > 4. **換模型或主 n_ctx 就重跑 `./set_config.sh` + 重啟 server。** llama-server 一啟動就鎖死一顆模型與一個 `-c`;客戶端只會跟隨它,沒有「在對話裡換模型」這回事。主 n_ctx 只填一次;`set_config.sh` 寫進 deployment / server `-c`,`aicode` 啟動時觀測 `/props` 的實值並讓 CodeTrail 的 context 預算跟著它。
-> 5. **啟動後立即 rollback,先看 server log**:`~/start.sh` 前台只會回報 process 已結束,真正根因用 `~/start.sh logs main` 查看;新 GGUF 也可能需要更新並重新 build llama.cpp。詳細判讀與修復見 [docs/troubleshooting.md](docs/troubleshooting.md)。
+> 5. **啟動後立即 rollback,先看 server log**:`~/start.sh` 前台只會回報 process 已結束,真正根因用 `tail -n 120 ~/.local/state/codetrail/logs/main.log` 查看;新 GGUF 也可能需要更新並重新 build llama.cpp。詳細判讀與修復見 [docs/troubleshooting.md](docs/troubleshooting.md)。
 > 6. **CodeTrail 沙箱鎖在「你啟動的那個資料夾」** —— 綁在 process 上,**不會跟著你切對話而移動**。換專案 = 到那個目錄重新開一個 `aicode`。沒有 `--root`、沒有環境變數可以改它。
 > 7. **模型只有那 21 個 MCP 工具** —— 客戶端沒有內建的 `bash` / `read` / `write`,所以沙箱邊界就是 MCP server 的邊界。外部匯入與 lessons 是兩個受限例外,見 [docs/security.md](docs/security.md)。分析不信任 repo 時,那個 repo 自帶的 `AGENTS.md` 與 `.codetrail/lessons.md` 會進 system prompt;不想要就在 `~/.config/codetrail/client.json` 設 `"project_instructions": false`。
 > 8. **首次 MoE 對話首字會慢(可能 1–2 分鐘),別按 Esc** —— 它在 page-in expert weights,不是當掉;slot / GPU 在動就是正常。
@@ -213,7 +215,7 @@ nvcc --version      # 應顯示 release 13.x
 ### 1.5 Build llama.cpp(CUDA)
 
 固定 clone 到 `~/llama.cpp` —— launcher 預設找 `~/llama.cpp/build/bin/llama-server`
-(放別處就在 `./set_config.sh --llama-bin <絕對路徑>` 指定,它會寫進
+(放別處就在 `./set_config.sh` 的執行檔路徑問答指定,它會寫進
 `~/.config/codetrail/deployment.json` 的 `llama_bin`):
 
 ```bash
@@ -240,7 +242,7 @@ cmake --build build --config Release -j
 
 ## 2. 下載 GGUF
 
-模型統一放 `~/models`(`set_config.sh` 預設掃這裡;放別處用 `./set_config.sh --models-dir <目錄>` 指定)。
+模型統一放 `~/models`(`set_config.sh` 預設掃這裡；放別處可在模型目錄問答指定)。
 
 ### 2.1 安裝 Hugging Face CLI + Xet 加速
 
@@ -349,7 +351,13 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 
 ### 3.1 `./set_config.sh` 做什麼
 
-**純問答式設定**:每一題由你作答,工具不提供預設值,也**不用估算擋你的輸入**——它只驗證輸入在畫面列出的合法範圍(例如選項只有 1/2 卻輸入 3 會重問),以及做結構性檢查(binary 旗標、模型齊全性、schema)。部分數值題會附一句方向(越大越吃什麼)與**推薦值 / 推薦區間**,但推薦不是限制;只要仍在合法輸入範圍內,推薦區間外也照樣接受。VRAM 塞不塞得下仍以啟動後 `nvidia-smi` 實測為準。在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`,它會依序:
+無參數執行後先顯示角色選單：重設目前角色、local、model-host（A）、client（B）、
+還原最近一次設定交易，以及顯示 A 的 endpoint manifest。
+以下模型與 GPU 問答適用於 local / model-host；client 只確認遠端端點與授權，
+不要求本機 GPU、GGUF、tmux 或 llama-server。A/B 的直接入口見[分離部署](docs/split-deployment.md)。
+
+接著先問模型目錄與 llama-server 執行檔位置，Enter 使用畫面列出的路徑。
+**純問答式設定**：模型參數與壓縮模式由你選擇，也**不用估算擋你的輸入**——它只驗證輸入在畫面列出的合法範圍(例如選項只有 1/2 卻輸入 3 會重問)，以及做結構性檢查(binary 旗標、模型齊全性、schema)。部分數值題會附一句方向(越大越吃什麼)與**推薦值 / 推薦區間**，但推薦不是限制；只要仍在合法輸入範圍內，推薦區間外也照樣接受。VRAM 塞不塞得下仍以啟動後 `nvidia-smi` 實測為準。在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`，它會依序：
 
 1. **前置檢查**:Python 依賴(mcp/numpy/requests)、`tmux`、`nvidia-smi`、`llama-server` 是否存在且支援必要旗標(`--reranking` / `--mmproj` / `--fit` / `--cache-ram`;CPU-MoE 另需 `--cpu-moe` / `--n-cpu-moe`)。缺什麼直接在這一步就擋下並給**可複製的修復指令**(裝哪個套件、跑哪行 build),不會讓你答完所有問題才發現要重來;`llama-server` 因動態庫(如 CUDA lib)跑不起來時,會轉述原始錯誤並指向 `LD_LIBRARY_PATH`,不會誤報成「不支援旗標」。
 2. **偵測**:GPU 種類/VRAM、`~/models` 的 GGUF 自動分類成主聊天 / embedding / reranker / VL+mmproj 四類;多 shard 自動聚合並**驗證齊全性**(缺片直接列出檔名)。有 mmproj 的 VL 模型不會被排進 main 清單前面;四類缺一即在初步判定硬停。
@@ -363,59 +371,35 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
    | `[4/5]` VL | 模型 → GPU → mmproj → **CPU-MoE 層數** |
    | `[5/5]` 壓縮模式 🧪 | `codetrail` / `manual` / `off`(見 [docs/compaction-rules.md](docs/compaction-rules.md);前兩者仍在測試階段) |
 
-   **`[5/5]` 壓縮模式**決定客戶端什麼時候把長對話換成一段結構化摘要。**🧪 `codetrail` / `manual` 是實驗功能(開發中、仍在測試階段):摘要規則與觸發門檻可能再變。沒有 `~/.config/codetrail/client.json` 就等於沒有接管,`git pull` 不會自己啟用。** `codetrail` 的觸發點在「助理答完、對話進 idle」之後,所以摘要不會插在你的問題前面;`manual` 用同一套規則但只在你按 `/compact` 時執行;`off` 完全不壓縮——context 滿了會是一個**可見的錯誤**,不會自動補救。三種模式都附帶兩個「一路上少放一點進 context」的措施:**舊回合的 assistant reasoning 不送進模型**(最新一則問題之後的照留;要關掉在 `client.json` 設 `"keep_historical_reasoning": true`)、以及**舊工具輸出剪枝**(很舊的工具結果在模型視野裡換成一行,session 檔與畫面上的原文不動)。兩者與代價見 [docs/compaction-rules.md §6](docs/compaction-rules.md)。這一題沒有預設值。**非互動**用 `--compaction-mode {codetrail,manual,off}`;`--yes` 沒給這個旗標時沿用 `client.json` 記錄的選擇,**還沒選過就完全不碰壓縮設定**。
+   **`[5/5]` 壓縮模式**決定客戶端什麼時候把長對話換成一段結構化摘要。**🧪 `codetrail` / `manual` 是實驗功能(開發中、仍在測試階段):摘要規則與觸發門檻可能再變。沒有 `~/.config/codetrail/client.json` 就等於沒有接管,`git pull` 不會自己啟用。** `codetrail` 的觸發點在「助理答完、對話進 idle」之後,所以摘要不會插在你的問題前面;`manual` 用同一套規則但只在你按 `/compact` 時執行;`off` 完全不壓縮——context 滿了會是一個**可見的錯誤**,不會自動補救。三種模式都附帶兩個「一路上少放一點進 context」的措施:**舊回合的 assistant reasoning 不送進模型**(最新一則問題之後的照留;要關掉在 `client.json` 設 `"keep_historical_reasoning": true`)、以及**舊工具輸出剪枝**(很舊的工具結果在模型視野裡換成一行,session 檔與畫面上的原文不動)。兩者與代價見 [docs/compaction-rules.md §6](docs/compaction-rules.md)。這一題沒有預設值。維護自動化的壓縮參數見 [README_DEV.md](README_DEV.md#內部設定與啟動介面)。
 
    **CPU-MoE 沒有 y/n 分流**:直接問「幾層 experts 留 RAM」,**`0` = 不 offload(experts 全留 GPU)**、`N` = 前 N 層留 RAM(`--n-cpu-moe N`)、輸入 **≥ 層數上限 = 全部留 RAM**(等同 `--cpu-moe`)。提示只有兩行:**數值越大 GPU 負載越低**,以及一個**推薦區間**——下界是權重剛好放得進這顆 GPU 目前 free VRAM 的層數、上界是全部移到 RAM(例如 `推薦數值:38-43`)。這個估算只算 GGUF 權重,沒有 KV cache / compute buffer / 共卡的附屬服務,所以是起點而不是保證。工具讀 GGUF tensor table 判斷:**不是 MoE(沒有 expert tensors)就不問**,並印出原因(dense 模型 offload 幾層都沒有意義)。main 與 VL 各問一次;embedding / reranker 永遠不套用。**VL 一旦套用 CPU-MoE,llama.cpp 的 `--fit` 就會失效**(它見到 tensor override 已被設定就直接放棄),所以工具會改寫 `-ngl 99 --fit off` 而不是假裝有 `--fit-target` 保護——這種情況沒有自動退讓的安全網,層數填太低會 OOM。
 
-   `threads` **從頭到尾不問**——大部分人也不知道該填多少,所以預設就是 auto:不寫 `-t`,由 llama.cpp 自己偵測(hybrid CPU 只算 P-core,否則用實體核心數、排除 HT siblings),比工具自己數邏輯 CPU 準。真的要釘死才用進階旗標 `--threads N`。工具只驗證輸入範圍(上下限顯示成 `1024-1048576` 這種形式),**推薦值不會擋你**;三個附屬服務固定單 slot,最後啟動的 VL 用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用自動配置。答完顯示**設定摘要一頁**:按 **Enter 寫入**;**q** 離開不寫檔。
+   `threads` **從頭到尾不問**——大部分人也不知道該填多少,所以預設就是 auto:不寫 `-t`,由 llama.cpp 自己偵測(hybrid CPU 只算 P-core,否則用實體核心數、排除 HT siblings),比工具自己數邏輯 CPU 準。需要釘住時可在 deployment 的 main parameters 設定 `threads`。工具只驗證輸入範圍(上下限顯示成 `1024-1048576` 這種形式),**推薦值不會擋你**;三個附屬服務固定單 slot,最後啟動的 VL 用 `-ngl auto --fit on --fit-target 3072` 依 embedding/reranker 的實際占用自動配置。答完顯示**設定摘要一頁**:按 **Enter 寫入**;**q** 離開不寫檔。
 4. **產生四個 runtime 檔案與一個還原 manifest**（選了壓縮模式時再多一份 owner-only 的
    壓縮狀態檔；runtime 檔採 transaction 寫入：要嘛
    全套完成、要嘛完全不動；既有檔自動備份 `*.bak-setconfig-<時間戳>`，
-   `--restore-last-backup` 可整批還原）：
+   設定選單的還原操作可整批還原）：
 
 | 產物 | 內容 |
 |---|---|
 | `~/.config/codetrail/models.json` | 主模型 registry key → GGUF 路徑(合併既有內容) |
 | `~/.config/codetrail/deployment.json` | deployment profile local override:四個 role 的模型、GPU(`services.<role>.gpu`)、主模型參數與驗證過的 `llama_bin`(全部來自你的作答);重跑時**保留你手動加的取樣參數**(temperature/top-p/…與 no_mmap),其他未涵蓋鍵會警告已捨棄 |
 | `~/.config/codetrail/client.json` | 壓縮模式與權限覆寫（mode `0600`）；**這一題有明確答案時才寫**，沒有這個檔就等於沒有接管 |
-| `~/start.sh` | 啟動腳本:把子命令與旗標原樣轉給 `scripts/launch_servers.py` / `stop_servers.py` / `check_status.py`;支援 `status` / `stop` / `logs` / `help` 子命令,打錯子命令會提示而不是誤啟動。它**不 export、不 unset 任何變數** —— GPU、主模型與驗證過的 llama-server 路徑都寫在 `deployment.json` |
-| `~/.config/codetrail/setconfig-last-transaction.json` | 只記最近一次 transaction 實際包含的 runtime 檔案，供 `--restore-last-backup` 整批還原；不是另一份設定來源 |
+| `~/start.sh` | 無參數啟動四個服務；單一 `stop` 停止。其他參數在啟動前拒絕。它**不 export、不 unset 任何變數**；GPU、主模型與 llama-server 路徑都來自 `deployment.json` |
+| `~/.config/codetrail/setconfig-last-transaction.json` | 只記最近一次 transaction 實際包含的 runtime 檔案，供設定選單的還原操作整批還原；不是另一份設定來源 |
 
-結尾會自動印出**啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `~/start.sh --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準;`~/start.sh` 啟動完成的最後一行也會提醒你用 `nvidia-smi` 稍微監控 GPU/VRAM(例如 `watch -n 1 nvidia-smi`),因為 set_config 不做整體 VRAM 可行性判定,也不會拿容量估算保證一定能啟動。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
+結尾會自動印出**啟動參數**(四個 server 各自完整的 `llama-server` 指令,即 `python3 scripts/launch_servers.py --scope all --dry-run` 的輸出),並標明目前只完成「第 1 層:設定檔驗證」—— 模型能否真的載入,以 `~/start.sh` 實際啟動為準;`~/start.sh` 啟動完成的最後一行也會提醒你用 `nvidia-smi` 稍微監控 GPU/VRAM(例如 `watch -n 1 nvidia-smi`),因為 set_config 不做整體 VRAM 可行性判定,也不會拿容量估算保證一定能啟動。若偵測到 CodeTrail server 正在執行,會提醒(並可選擇自動)重啟才生效。
 
-非互動用法(自動化 / 重跑)是 `./set_config.sh --yes`。它會跳過提問與確認頁，
-但**所有使用者選擇題的值必須由旗標提供，缺哪個就報錯**（`--compaction-mode`
-是唯一的例外，見下方最後一項）：
-
-- 模型 / GPU：`--main-model` / `--main-gpu`、`--embed-model` / `--embed-gpu`、
-  `--rerank-model` / `--rerank-gpu`、`--vl-model` / `--vl-gpu`。模型與 GPU 的編號
-  **都從 1 起算**(GPU 編號 = `nvidia-smi` index + 1;互動選單與每張卡的描述行都會
-  印出對應的 nvidia-smi index)。VL 配對不唯一時再給 `--vl-mmproj`；單一候選、單卡或
-  唯一 mmproj 會自動選用。
-- 數值：`--ctx` 與 `--rerank-ctx`。`--threads` 是非必要的進階旗標；不給就是
-  auto，不寫 `-t`。
-- MoE：main 使用 `--cpu-moe` / `--no-cpu-moe` / `--n-cpu-moe N`；VL 使用
-  `--vl-cpu-moe` / `--no-vl-cpu-moe` / `--vl-n-cpu-moe N`。`N=0` 等同不 offload。
-- 網路：`--allow-remote` 才會開放區網連線；未指定只綁 `127.0.0.1`。
-- 路徑(選填,不給就用預設):`--llama-bin <路徑>` 指定 llama-server 執行檔(會轉成
-  絕對路徑寫進 `deployment.json` 的 `llama_bin`;預設沿用該檔既有的值,再退回
-  `~/llama.cpp/build/bin/llama-server`)、`--models-dir <目錄>` 指定要掃的 GGUF 目錄
-  (預設 `~/models`)。兩個都寫進設定檔,沒有等價的環境變數。
-- 壓縮模式：`--compaction-mode {codetrail,manual,off}`。**這一項不給不會報錯**——
-  沒給時沿用 `~/.config/codetrail/client.json` 記錄的既有選擇，這台機器還沒選過
-  就不寫 `client.json`。理由是「沒有那個檔＝沒有接管」是安全預設：舊的 `--yes`
-  自動化腳本重跑一次，不該因此突然開啟自動壓縮。
-
-重跑**不沿用舊選擇**（唯一例外是上面那條 `--compaction-mode`，它沿用狀態檔記錄的
-模式）；其餘每次設定都來自本次作答 / 旗標。只有你手動加進 `deployment.json` 的取樣
-參數與 port / base_url 會保留。完整旗標見 `./set_config.sh --help`。
+日常設定直接執行 `./set_config.sh`，依選單與問答操作。維護腳本與自動化旗標保留在
+[README_DEV.md](README_DEV.md#內部設定與啟動介面)；公開 shell 入口不接受參數。
 
 既有安裝在 `git pull` 後不會直接覆寫 home dotfiles。要確認舊 local state 仍與新版 repo
 相容，先在 `<CODETRAIL_REPO>` 跑以下唯讀檢查：
 
 ```bash
 python3 deployment_profile.py validate
-~/start.sh --dry-run
+python3 scripts/launch_servers.py --scope all --dry-run
 ```
 
 第一條應顯示 profile `valid`;dry-run 應正常列出四個 server command。兩項都符合，就不必
@@ -424,26 +408,24 @@ python3 deployment_profile.py validate
 `~/.config/codetrail/`，它的 loader 會對這兩個未知鍵 fail-loud —— 那是刻意的,不是設定壞掉。）
 
 若檢查要求補新欄位、Python / llama-server 路徑已換、模型 / GPU / 主 n_ctx 要改，才重跑
-`./set_config.sh`。重跑會重新詢問硬體選擇；先記下現值或用 `~/start.sh --dry-run` 留存摘要，
+`./set_config.sh`。重跑會重新詢問硬體選擇；先記下現值或用 `python3 scripts/launch_servers.py --scope all --dry-run` 留存摘要，
 不要假設它會沿用上一次答案。
 
 ### 3.2 啟動與停止
 
 ```bash
-~/start.sh              # 啟動 main + embedding + reranker + VL(各自 tmux 視窗,驗 /health 才算 ready)
-~/start.sh --dry-run    # 只印出將執行的四條 llama-server 指令,不啟動
-~/start.sh status       # 檢查四個 server 狀態(= scripts/check_status.py)
-~/start.sh stop         # 關閉全部並等到 VRAM 釋放完畢(主模型 + 三附屬模型;= scripts/stop_servers.py)
-~/start.sh logs vl      # 看該 role 的 server log(加 -f 持續追蹤,如 logs main -f)
-~/start.sh help         # 子命令說明(打錯子命令會提示,不會誤觸啟動)
+~/start.sh                          # 啟動四個服務，health 通過才算 ready
+~/start.sh stop                     # 全部停止並等待 process / VRAM 釋放
+nvidia-smi                         # 觀察 GPU / VRAM
+tmux attach -t codetrail-main       # 查看主模型的 tmux 畫面
 ```
 
 啟動時的行為(對剛接觸專案者友善):
 
-- **server log 從第一個 byte 就持續寫入** `~/.local/state/codetrail/logs/<role>.log`:launcher 先開好 tmux 視窗、接上 log 管線,才把 llama-server 放進去跑,所以即使因參數或模型錯誤**秒退**,完整錯誤也已在檔案裡;視窗本身也會帶著 exit code 留在原地(remain-on-exit)供檢視,`~/start.sh logs <role>` 直接看。
+- **server log 從第一個 byte 就持續寫入** `~/.local/state/codetrail/logs/<role>.log`:launcher 先開好 tmux 視窗、接上 log 管線,才把 llama-server 放進去跑,所以即使因參數或模型錯誤**秒退**,完整錯誤也已在檔案裡;視窗本身也會帶著 exit code 留在原地(remain-on-exit)供檢視,`tail -n 120 ~/.local/state/codetrail/logs/<role>.log` 直接看。
 - **載入進度**:大模型載入要幾分鐘,等待期間每 15 秒回報「載入中,已等待 N 秒(process 存活)」,不會看起來像當機;health 等待上限依主模型大小自動放大。llama-server process 一死就立即失敗,不會空等 timeout。
-- **失敗自動清理**:某個 role 啟動失敗時,launcher 自動關閉本次啟動的其他服務並釋放 port,然後告訴你「修正後直接重跑 `~/start.sh`」—— 不會留下半套 tmux 讓下次啟動卡 `session already exist`(要保留現場除錯:`~/start.sh --keep-on-failure`)。
-- **綁定**:預設四個 server 只綁 `127.0.0.1`;`--allow-remote` 設定過的才綁 `0.0.0.0`。
+- **失敗自動清理**:某個 role 啟動失敗時,launcher 自動關閉本次啟動的其他服務並釋放 port,然後告訴你「修正後直接重跑 `~/start.sh`」—— 不會留下半套 tmux 讓下次啟動卡 `session already exist`(要保留現場除錯:`python3 scripts/launch_servers.py --scope all --keep-on-failure`)。
+- **綁定**:預設四個 server 只綁 `127.0.0.1`;在 host 設定中明確同意開放區網後才綁 `0.0.0.0`。
 
 | 預設 port | 角色 | 必要 |
 |---|---|---|
@@ -454,55 +436,10 @@ python3 deployment_profile.py validate
 
 會分四個 `llama-server` 是因為它一次只能載一顆 GGUF,不同角色用不同模式(`--jinja` / `--embedding --pooling cls` / `--embedding --pooling rank --reranking` / `--mmproj`)。`aicode` / `mcp_server.py` 都會硬性檢查三顆副模型已 ready。
 
-只重啟部分角色:`~/start.sh stop --scope aux` + `~/start.sh --scope aux`(只動三顆附屬、不重載主模型),或 `~/start.sh --scope main`(只起主模型)。
-
-要調整行為就加旗標(`~/start.sh` 原樣轉發,**沒有等價的環境變數**):
-
-| 旗標 | 作用 |
-|---|---|
-| `--keep-on-failure` | 啟動失敗時不自動清理,保留現場除錯 |
-| `--health-timeout N` | 覆寫 health 等待秒數(不給就依主模型大小自動放大) |
-| `stop --timeout N` | 等 process 退出 / VRAM 釋放的秒數上限(預設 120) |
-| `status --expected N` | 預期的 llama-server 數量(預設 4);`--strict` 才用 exit code 擋 |
-| `--main-model` / `--main-gpu` / `--aux-gpu` / `--embed-gpu` / `--rerank-gpu` / `--vl-gpu` / `--llama-bin` / `--profile` | 一次性覆寫 `deployment.json` 的對應值(見 §4.1) |
-
-> **tmux 你會用到的 4 個指令**(其他都不用學):
-> - `Ctrl-b d` —— 把目前 session 放背景,回到原本 shell
-> - `tmux ls` —— 列出所有背景 session
-> - `tmux a -t <名字>` —— 接回去看某個 session 的即時 log
-> - `Ctrl-b n` —— 同 session 內切換 window(RAG session 內含 embed / rerank / vl 三個 window)
->
-> (關 server 不用學 tmux 指令,直接 `~/start.sh stop`。)
-
-### 3.3 驗活與維運
-
-照上面流程跑下來會有 **2 個 tmux session**(main 自己一個、三顆附屬合在一個):
-
-```bash
-tmux ls
-# 應該看到:
-#   codetrail-main: 1 windows (created ...)
-#   codetrail-rag:  3 windows (created ...)    ← 內含 embed + rerank + vl 三個 window
-```
-
-查看四個 role 是否都正確跑在指定 GPU 上:
-
-```bash
-~/start.sh status
-
-# CI / 自動化需要用 exit code 擋下時:
-~/start.sh status --strict
-```
-
-`~/start.sh status` 會把 `nvidia-smi` PID 與 `/proc/<PID>/cmdline` 的 `--port` 對上有效 profile,逐 role 顯示 PID、GPU UUID、model、`n_ctx`、health。預設 report-only,即使異常仍 exit 0;`--strict` 遇到缺 service、錯 GPU、錯 model、錯 ctx 或 unhealthy 就失敗。
-
-之後要關掉全部:
-
-```bash
-~/start.sh stop
-```
-
-偵錯時要看 server log(平常不用):`tmux a -t codetrail-main` 或 `tmux a -t codetrail-rag`(rag 內按 `Ctrl-b n` 切 embed/rerank/vl window,看完 `Ctrl-b d` 退出)。
+`~/start.sh` 只接受上述兩種操作。變更模型、GPU、context 或部署角色時執行
+`./set_config.sh`；A 開服務、B 操作專案則用
+[`scripts/codetrail-host.sh` / `scripts/codetrail-device.sh`](docs/split-deployment.md)。
+部分角色重啟與啟動診斷留在 [README_DEV.md](README_DEV.md#內部設定與啟動介面)。
 
 ---
 
@@ -708,8 +645,8 @@ cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-`aicode` 不用帶參數,而且**只接受**三個:`-c` / `--continue`(接續這個專案最近一次的
-對話)、`--session <id>`、`-h` / `--help`。沙箱 root 一律是目前目錄,主模型只來自
+`aicode` 不接受參數。接續既有對話請進 TUI 後用 `/session` 選單；`/help` 顯示指令。
+沙箱 root 一律是目前目錄,主模型只來自
 `deployment.json` 的 `main.model`(`set_config.sh` 已經設好)——沒有 `-m`、沒有 `--root`、
 沒有任何環境變數可以改它。換模型 = 重跑 `./set_config.sh` 再重啟 server。
 
@@ -718,7 +655,7 @@ aicode
 的完整輸出留在 TUI 接管畫面**之前**的終端,往上捲就看得到。**失敗**時 `aicode` 不會進 TUI,
 錯誤原樣留在終端。
 
-接續舊對話時(`-c`、`--session <id>`,或在 TUI 內用 `/session`),畫面會把那一段
+在 TUI 內用 `/session` 接續舊對話時,畫面會把那一段
 **原始記錄**重播出來:你問過的話、模型的回答與 thinking、每一次工具呼叫的參數、狀態與
 結果。壓縮過的對話也一樣看得到壓縮**之前**的原文,摘要只在原文之後多一個可展開的
 標記(模型看到的仍然是壓縮後的歷史 —— 畫面與模型視野是兩件事)。TUI 內的

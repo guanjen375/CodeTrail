@@ -17,7 +17,7 @@
 * **不直接 print**。Textual 接管畫面之後任何 stdout / stderr 都會把畫面打壞,
   所以這裡所有輸出都是 widget;engine 的事件由背景執行緒搬進 UI 執行緒。
 * **接續一段對話就要看得到它**。`/resume`、`/session`(選單或直接指定)與啟動時
-  就接好的那條路(`aicode -c`)都重播**原始記錄**:文字、reasoning、工具呼叫
+  就接好的 Python 維護入口都重播**原始記錄**:文字、reasoning、工具呼叫
   (含未裁切的 `structuredContent`)與壓縮標記。畫面看不到、模型看得到的話,
   接下來每一則回答都在回應一段使用者看不見的脈絡。換不成功就 engine 與畫面
   **都不動**;回合進行中一律拒絕換。
@@ -52,6 +52,7 @@ from textual.widgets.option_list import Option
 import client_engine
 import client_events
 import client_paths
+import client_review
 import client_store
 import client_turns
 import context_budget
@@ -89,6 +90,7 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("/session", "選一個既有對話切換(/session <id> 直接指定)"),
     ("/resume", "接續一個既有對話(/resume <id>)"),
     ("/compact", "立刻壓縮目前對話"),
+    ("/review", "審查 HEAD 到工作目錄的淨變更，含新增檔案；不寫聊天歷史"),
     ("/queue", "待送訊息:list / add / edit / cancel / resume"),
     ("/supplement", "補充目前任務(/supplement <文字>,安全點才送入)"),
     ("/status", "目前模型、context、壓縮模式與 session 位置"),
@@ -542,6 +544,69 @@ class SessionPickerScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class ReviewScreen(ModalScreen[bool]):
+    """One scrollable, ephemeral report; raw model drafts never enter here."""
+
+    BINDINGS = [Binding("escape", "close_review", "關閉審查", show=False)]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.review_id = ""
+        self.running = True
+        self.close_when_done = False
+        self.leave_when_done = False
+        self.report = ""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="review"):
+            yield Static(Text("工作區審查", style="bold"))
+            yield Static(Text("HEAD 到目前工作目錄的淨變更，包含新增檔案。\n本次結果未寫入聊天歷史。"))
+            yield Static(Text("準備審查…"), id="review-progress")
+            with VerticalScroll(id="review-body"):
+                yield Static(Text(""), id="review-report")
+            yield Button("中斷並關閉", id="review-close", variant="primary")
+
+    def on_mount(self) -> None:
+        self.app._start_review(self)
+
+    def accept_event(self, event: Mapping[str, Any]) -> None:
+        if self.review_id and event.get("reviewID") != self.review_id:
+            return
+        if event.get("type") == "review_progress":
+            self.query_one("#review-progress", Static).update(Text(str(event.get("message", ""))))
+            return
+        if not client_events.is_terminal_event(event):
+            return
+        self.running = False
+        self.report = str(event.get("review_report", ""))
+        state = str(event.get("review_state", "incomplete"))
+        self.query_one("#review-progress", Static).update(Text(f"審查狀態：{state}"))
+        self.query_one("#review-report", Static).update(Text(self.report))
+        self.query_one("#review-close", Button).label = "關閉"
+        if self.close_when_done:
+            self.dismiss(self.leave_when_done)
+
+    def request_close(self, *, leave: bool = False) -> None:
+        self.leave_when_done = self.leave_when_done or leave
+        if not self.running:
+            self.dismiss(self.leave_when_done)
+            return
+        self.close_when_done = True
+        self.app.coordinator.cancel(block=False, review_id=self.review_id)
+        self.query_one("#review-progress", Static).update(Text("正在中斷審查並關閉唯讀 MCP…"))
+
+    def action_close_review(self) -> None:
+        self.request_close()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.request_close()
+
+    def on_unmount(self) -> None:
+        if self.running:
+            self.app.coordinator.cancel(block=False, review_id=self.review_id)
+
+
 class QueueChoiceScreen(ModalScreen[str | None]):
     """Choose an input's meaning explicitly, without stopping current work."""
 
@@ -734,6 +799,13 @@ class CodeTrailApp(App[int]):
     }
     #queue-choice-body { height: 1fr; }
     #queue-choice Button { margin-top: 1; width: 100%; }
+    #review {
+        width: 95%; height: 95%; border: thick $primary; background: $surface; padding: 1 2;
+    }
+    #review-progress { height: auto; max-height: 8; color: $text-muted; }
+    #review-body { height: 1fr; border: round $primary-darken-2; padding: 0 1; }
+    #review-report { height: auto; }
+    #review-close { margin-top: 1; }
     """
 
     BINDINGS = [
@@ -774,6 +846,7 @@ class CodeTrailApp(App[int]):
         self._reasoning: ReasoningBlock | None = None
         self._tools: dict[str, ToolBlock] = {}
         self._approval_screens: dict[str, ApprovalScreen] = {}
+        self._review_screen: ReviewScreen | None = None
         self._queue_revisions: dict[str, int] = {}
         self._turn_started: float | None = None
         self._spinner = 0
@@ -903,7 +976,7 @@ class CodeTrailApp(App[int]):
         )
 
     def _replay_startup_session(self) -> None:
-        """`aicode -c` / `aicode --session <id>`:engine 在 app 建起來之前就接續好了。
+        """Python 維護入口選定 session：engine 在 app 建起來之前就接續好了。
 
         重播只掛在 `/resume` 上的話,最常走的這一條路照樣是空白畫面 —— 使用者
         看不到自己上次問過什麼,但模型接得下去。
@@ -951,6 +1024,11 @@ class CodeTrailApp(App[int]):
 
     # ---- 事件 ----------------------------------------------------------
     def handle_event(self, event: Mapping[str, Any]) -> None:
+        if event.get("reviewID") is not None:
+            if self._review_screen is not None:
+                self._review_screen.accept_event(event)
+            self._refresh_status()
+            return
         kind = event.get("type")
         if kind == client_events.TYPE_QUEUE:
             self._on_queue_event(event)
@@ -1206,6 +1284,9 @@ class CodeTrailApp(App[int]):
         try:
             self.coordinator.start_turn(text)
         except client_turns.TurnCoordinator.Busy:
+            if self.coordinator.reviewing:
+                self._append(NoticeLine("工作區審查進行中；輸入保留在草稿，可用 /queue add 保留到聊天。"))
+                return False
             self._choose_message_mode(text)
             self._refresh_completions()
             return False
@@ -1291,6 +1372,9 @@ class CodeTrailApp(App[int]):
         self._append(NoticeLine("指令:\n" + "\n".join(lines) + "\n" + HELP_TAIL))
 
     def _cmd_exit(self, _argument: str) -> None:
+        if self._review_screen is not None:
+            self._review_screen.request_close(leave=True)
+            return
         if self._busy_notice("/exit"):
             return
         self._leave()
@@ -1447,6 +1531,36 @@ class CodeTrailApp(App[int]):
         self._reset_phase(compacting=True)
         self._refresh_status()
 
+    def _cmd_review(self, argument: str) -> None:
+        if argument:
+            self._append(NoticeLine("/review 不接受參數；範圍是目前工作目錄的淨變更。"))
+            return
+        if self._busy_notice("/review"):
+            return
+        if self._review_screen is not None:
+            return
+        screen = ReviewScreen()
+        self._review_screen = screen
+        self.push_screen(screen, self._review_closed)
+
+    def _start_review(self, screen: ReviewScreen) -> None:
+        try:
+            job = client_review.ReviewJob(self.engine)
+            screen.review_id = self.coordinator.start_review(job)
+        except Exception as exc:
+            screen.running = False
+            screen.report = f"審查未啟動：{type(exc).__name__}: {exc}"
+            screen.query_one("#review-progress", Static).update(Text(screen.report))
+            screen.query_one("#review-close", Button).label = "關閉"
+        self._refresh_status()
+
+    def _review_closed(self, leave: bool) -> None:
+        self._review_screen = None
+        self._refresh_status()
+        self.query_one("#prompt", PromptInput).focus()
+        if leave:
+            self._leave()
+
     def _cmd_status(self, _argument: str) -> None:
         path = self.engine.store.path(self.engine.session_id)
         lines = [
@@ -1486,6 +1600,12 @@ class CodeTrailApp(App[int]):
 
     def action_interrupt(self) -> None:
         """Ctrl-C。選單開著 = 只收選單;回合進行中 = 中斷整輪;閒置 = 連按兩次離開。"""
+        if self._review_screen is not None:
+            if not self._review_screen.running:
+                self._review_screen.request_close()
+            elif self.coordinator.cancel(block=False, review_id=self._review_screen.review_id):
+                self._review_screen.query_one("#review-progress", Static).update(Text("正在中斷審查…"))
+            return
         if self._close_picker():
             return
         if isinstance(self.screen, QueueChoiceScreen):
@@ -1520,6 +1640,9 @@ class CodeTrailApp(App[int]):
           而 `command_chat` 隨即關掉共用的 MCP。要停就先 Ctrl-C 中斷。
         * 閒置:存歷史然後離開。
         """
+        if self._review_screen is not None:
+            self._review_screen.request_close(leave=True)
+            return
         if isinstance(self.screen, ApprovalScreen):
             self.screen.action_deny()
             return

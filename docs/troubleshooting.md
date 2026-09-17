@@ -80,7 +80,7 @@ server 是預期行為,不代表錯誤紀錄也消失了。
 `~/.local/state/codetrail/logs/main.log`。最簡單的讀法是:
 
 ```bash
-~/start.sh logs main
+tail -n 120 ~/.local/state/codetrail/logs/main.log
 ```
 
 不要只憑前台的 generic rollback 訊息就重裝 CUDA、重抓模型或刪 tmux session;
@@ -95,7 +95,7 @@ llama_model_load: error loading model: unknown model architecture: '<architectur
 實際執行的 binary 與版本:
 
 ```bash
-~/start.sh --dry-run | grep 'llama-server'
+python3 scripts/launch_servers.py --scope all --dry-run | grep 'llama-server'
 ~/llama.cpp/build/bin/llama-server --version
 git -C ~/llama.cpp log -1 --oneline
 ```
@@ -146,7 +146,7 @@ python3 deployment_profile.py validate     # 確認 schema 過
 # 改 main 的:整組重啟
 ~/start.sh stop && ~/start.sh
 # 只改 vl 的:不必動主模型,重啟三顆附屬即可
-~/start.sh stop --scope aux && ~/start.sh --scope aux
+python3 scripts/stop_servers.py --scope aux && python3 scripts/launch_servers.py --scope aux
 ```
 
 **main 與 vl 都適用** —— VL 一旦套用 CPU-MoE(`--vl-n-cpu-moe` / `--vl-cpu-moe`)就會踩到同一個坑。
@@ -410,7 +410,7 @@ ingest 的待辦通知現在由客戶端自己處理(`client_notify.py`),不再�
 三種模式的完整說明、門檻公式與取捨在 [compaction-rules.md](compaction-rules.md)。
 
 **`codetrail` / `manual` 還在測試階段**(兩處顯示都會標 🧪):行為與受管值可能再變。
-遇到下表以外的怪狀況,先 `./set_config.sh --compaction-mode off` 關掉自動壓縮再回報
+遇到下表以外的怪狀況，先執行 `./set_config.sh`，在壓縮模式問答選擇 `off` 再回報
 ——`off` 不會動你的對話,只是不再自動摘要;context 滿了會是一個可見的錯誤。
 
 | 畫面 | 意思 | 怎麼辦 |
@@ -1058,14 +1058,14 @@ reranker 的 buffer 則是設定時的必答題(互動輸入或 `--rerank-ctx`),
 套到它的 `-c/-b/-ub`。重啟三顆附屬 server 套用:
 
 ```bash
-~/start.sh stop --scope aux
-~/start.sh --scope aux
+python3 scripts/stop_servers.py --scope aux
+python3 scripts/launch_servers.py --scope aux
 ```
 
 若是手動啟動 embedding / reranker，也要讓 `-b`、`-ub` 至少容納最長輸入；
 llama.cpp 的 embedding/reranking server 會要求單一輸入序列放得進 physical batch。
 Qwen3-Reranker 若在 8192 buffer OOM，可重跑
-`./set_config.sh --rerank-ctx 2048`(互動時在 reranker 那一組直接輸入 2048);
+`./set_config.sh`，在 reranker 那一組直接輸入 2048；
 輸入原本就小於 2048 時不會因縮小上限而降低排序精準度。
 
 ### `aicode` 拒絕啟動,訊息說「主模型未設定」

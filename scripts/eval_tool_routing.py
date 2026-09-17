@@ -1196,7 +1196,7 @@ def _model_server_base_url(
     """
     import config as _codetrail_config
 
-    # `--model` 跟 `aicode -m` 一樣收 bare registry name / GGUF 路徑;舊式
+    # `--model` 收 bare registry name / GGUF 路徑，供 headless 評測使用；舊式
     # `llamacpp/<name>` 仍接受(provider 段只用來對照 config 裡的 baseURL,沒有就是本地)。
     _bare_model(model)                       # 外部 provider 在這裡就拒絕
     provider_name, separator, _model_name = model.partition("/")
@@ -1932,7 +1932,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--matrix-row", required=True)
     parser.add_argument("--arm", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--model", help="model override for the headless client (a registry name or GGUF path, as aicode -m)")
+    parser.add_argument("--model", help="model override for the headless client (a registry name or GGUF path)")
     parser.add_argument(
         "--catalog-only",
         action="store_true",

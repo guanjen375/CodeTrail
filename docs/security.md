@@ -174,8 +174,8 @@ CodeTrail,也建議在那個 project 的 `.gitignore` 補上同樣項目。`.git
 接上這些 credential。因此以目前支援的路徑來看，綁
 `0.0.0.0` 就等於讓可抵達該 port 的機器都能呼叫模型 API。
 
-要讓其他機器連線必須明確選擇 `./set_config.sh --allow-remote`，或 deployment.json 各 service 的
-`"bind": "all-interfaces"`，而且只該在可信內網 / VPN 使用，必要時加防火牆規則。
+要讓其他機器連線，必須在 host 設定精靈中明確同意開放區網（見[分離部署](split-deployment.md)），
+或在 deployment.json 各 service 設定 `"bind": "all-interfaces"`，而且只該在可信內網 / VPN 使用，必要時加防火牆規則。
 如要開發 credential 支援，必須同步改 profile schema、所有 `llama_client`
 call site、doctor / preflight 與 secret redaction，不能只手動在單一 server 加旗標。
 [上游 server 選項](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)

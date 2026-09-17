@@ -39,6 +39,84 @@ TESTS_DIR = Path(__file__).resolve().parent
 
 # AGENTS.md §2「安全相關不要砍」的檢查點 → (守它的說明, 必須存在且帶 smoke 的 node)。
 SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "test_review_source.py": (
+        "review 的 Git 路由/helper 隔離、index/attrs/EOL 正規化、no-follow 有界來源、"
+        "完整 coverage 與 HEAD/index/worktree 快照驗證，取消必回收 Git 行程",
+        (
+            "test_review_git_ignores_ambient_routing_and_external_helpers",
+            "test_review_eol_normalization_does_not_invent_changed_lines",
+            "test_review_auto_text_preserves_a_crlf_index",
+            "test_review_global_autocrlf_is_read_without_enabling_helpers",
+            "test_review_unknown_global_sources_fail_loud",
+            "test_review_unsupported_transforms_are_explicit_coverage_gaps",
+            "test_review_index_only_changes_and_unborn_head_are_not_clean_repo_claims",
+            "test_review_unmerged_index_aborts_collection",
+            "test_review_rejects_unsafe_source_paths_without_reading_targets",
+            "test_review_parent_replacement_is_detected_before_publication",
+            "test_review_binary_large_and_collection_limits_never_become_complete",
+            "test_review_snapshot_rejects_source_drift",
+            "test_review_supports_linked_worktree_but_refuses_parent_scope",
+            "test_review_cancel_before_collection_never_spawns",
+            "test_review_git_bounds_reap_the_process",
+            "test_review_unchanged_unsupported_entries_do_not_create_coverage_gaps",
+            "test_review_clean_submodule_is_not_selected_but_dirty_content_is",
+            "test_review_clean_repository_scan_does_not_spend_selected_payload_budget",
+            "test_review_untracked_nested_repository_is_an_explicit_gap_not_a_collection_error",
+            "test_review_global_config_precedence_matches_git_normalized_changed_lines",
+            "test_review_raw_equal_head_still_honors_index_eol_normalization",
+            "test_review_uninitialized_empty_submodule_is_not_a_coverage_gap",
+            "test_review_global_config_symlinks_preserve_git_semantics",
+            "test_review_global_config_symlink_drift_is_rejected",
+            "test_review_global_config_symlink_targets_remain_bounded_and_nonexecuting",
+            "test_review_empty_global_attributes_path_disables_default_file",
+        ),
+    ),
+    "test_review_core.py": (
+        "review finding 必須完整 JSON、精確檔名/side/hunk 行號及逐字 evidence；"
+        "來源資料不成為指令，缺口/錯誤不可宣告為完整零問題",
+        (
+            "test_review_response_rejects_malformed_or_partial_json",
+            "test_review_finding_rejects_fabricated_identity_anchor_or_evidence",
+            "test_review_deleted_code_requires_exact_old_side_evidence",
+            "test_review_evidence_preserves_indentation_bom_and_lf_line_mapping",
+            "test_review_report_keeps_all_coverage_gaps_visible",
+            "test_review_renderer_revalidates_manufactured_findings",
+            "test_review_prompt_keeps_untrusted_full_source_as_data",
+        ),
+    ),
+    "test_client_review.py": (
+        "review 的隔離 readonly MCP、受限 JSON true 工具、共享模型鎖與精確 gate；"
+        "草稿不外洩、無歷史或 metrics 寫入，來源至 HTTP/工具/發布全程可取消",
+        (
+            "test_review_isolated_mcp_ephemeral_history_shared_lock_and_exact_gate",
+            "test_review_allowlist_and_json_true_guard_schema_and_dispatch",
+            "test_review_overflow_refuses_model_request_without_metrics_or_truncation",
+            "test_review_invalid_or_tool_failed_draft_is_never_published",
+            "test_review_cancellation_covers_worker_source_file_and_publish_gaps",
+            "test_review_cancels_stream_and_pending_tool_without_next_file",
+            "test_review_queue_rejects_start_and_stale_snapshot_suppresses_findings",
+            "test_review_cancels_headers_and_late_connect_before_releasing_model_slot",
+        ),
+    ),
+    "test_deployment_entrypoints.py": (
+        "日常入口零參數且固定 dispatch；host 明確 LAN 同意與 live 身分，device 四端點與"
+        "KB 分別授權、交易失敗不留半套、啟動仍保留原專案 cwd",
+        (
+            "test_public_entrypoints_reject_argv_before_python_or_writes",
+            "test_deployment_wrappers_follow_symlinks_and_keep_cwd",
+            "test_start_wrapper_only_dispatches_empty_or_exact_stop",
+            "test_device_displays_four_destinations_and_separate_kb_consent",
+            "test_device_without_affirmative_endpoint_consent_never_writes_or_starts",
+            "test_client_setup_invalid_manifest_and_failed_transaction_leave_no_partial_configuration",
+            "test_existing_device_uses_aicode_without_setup_or_local_model_probes",
+            "test_existing_host_checks_live_readiness_without_reconfiguration_or_restart",
+            "test_unready_existing_host_is_fail_loud_and_never_restarted",
+            "test_absent_host_services_launch_once_then_require_live_readiness",
+            "test_host_lan_requires_explicit_consent_and_exports_without_extra_transaction_target",
+            "test_role_menu_routes_client_and_restore_without_gpu_setup",
+            "test_host_rejects_unusable_transfer_address_before_setup",
+        ),
+    ),
     "test_chat_token_count.py": (
         "精確計數與 chat body 同源，endpoint/取消契約 fail-closed，不洩漏 NDA 內容",
         (
@@ -438,8 +516,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     ),
     "test_aicode.py": (
         "wrapper 只做四件事:定位 checkout(自己可能是 symlink)、找 python3、檢查 argv 並拒絕"
-        "沒有終端機的環境(指向 headless,不靜默降級)、exec 唯一的客戶端。使用者參數只有"
-        "-c/--continue、--session <id>、-h/--help —— run / status / sessions 這些內部入口不跑"
+        "沒有終端機的環境(指向 headless,不靜默降級)、exec 唯一的客戶端。日常入口拒絕"
+        "所有使用者參數，接續移到 TUI 選單 —— run / status / sessions 這些內部入口不跑"
         "preflight,轉發過去等於開一條略過 profile 驗證 / ctx 容量閘 / 工具健檢的第二入口。"
         "root 一律是 cwd;殼層裡殘留的 AICODE_* / AI_CODE_* / CODETRAIL_* 對它一律無效;"
         "缺 textual 要 fail-loud 印 pip 指令。唯一的 exec 目標由第一條釘住"
@@ -453,8 +531,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_polluted_shell_changes_nothing",
             "test_the_wrapper_stays_thin",
             "test_the_wrapper_never_reads_configuration_from_the_environment",
-            "test_the_wrapper_accepts_only_the_three_user_flags",
-            "test_the_wrapper_forwards_the_three_user_flags",
+            "test_the_wrapper_rejects_all_user_arguments",
+            "test_the_wrapper_never_forwards_session_arguments",
         ),
     ),
     "test_client_preflight.py": (
@@ -495,6 +573,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "GPU 與 llama-server 路徑寫進 `deployment.json` 的 `services.<role>.gpu` / `llama_bin`",
         (
             "test_generated_start_sh_ignores_legacy_shell_overrides",
+            "test_generated_start_sh_rejects_removed_commands_before_dispatch",
+            "test_removed_log_shorthands_never_dispatch_tail",
             "test_deployment_json_pins_llama_bin_and_gpus",
             "test_yes_without_the_flag_never_takes_over",
             "test_codetrail_mode_writes_the_chosen_mode",
@@ -700,6 +780,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "所有進行中的呼叫回成 error 再重新 spawn;每次呼叫的 read timeout 固定不得由呼叫端放寬;"
         "工具目錄在啟動時就驗;MCP stderr 預設不落檔且尾端有上限;同一 root 只有一個 instance",
         (
+            "test_abort_review_start_cancels_without_lifecycle_lock_or_late_process",
+            "test_private_review_cancel_escalation_cannot_respawn_or_close_interactive",
             "test_the_sdk_never_sends_cancelled_on_its_own",
             "test_a_client_timeout_sends_cancelled_with_the_real_request_id",
             "test_an_interrupt_cancels_the_in_flight_call",
@@ -970,6 +1052,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "`/status` 反映協調器跑的**最近一次**預熱(含壓縮後協調器自己排的那一次)的結果 / 原因 / "
         "時間 / 觸發點(停在 mount 那一次的 sent = 使用者以為 cache 是熱的,其實這一次是 skipped)",
         (
+            "test_review_modal_blocks_chat_session_changes_and_closes_through_cancel",
             "test_a_resumed_history_is_compacted_before_startup_prefill",
             "test_context_display_counts_full_tokens_off_the_ui_thread_and_discards_stale_results",
             "test_resume_replays_the_stored_history",
@@ -1139,6 +1222,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "同目錄的可執行檔照掃(否則就是把東西藏進交接目錄)",
         (
             "test_user_docs_must_not_teach_removed_flags_or_files",
+            "test_removed_daily_cli_commands_are_rejected_by_both_doc_gates",
+            "test_runtime_repair_hints_use_supported_daily_or_maintenance_commands",
             "test_routing_eval_docs_require_measured_client_support",
             "test_current_cli_help_describes_the_client",
             "test_the_handoff_markdown_exemption_is_content_only",

@@ -12,7 +12,7 @@
 契約(兩條,都是刻意的):
 
   * **純讀取**。這裡不寫任何檔、不修任何設定。要改模式只有
-    `./set_config.sh --compaction-mode ...` 一條路。
+    執行 `./set_config.sh`，在互動設定中選擇壓縮模式。
   * **永遠 exit 0、永不 raise**。這是啟動橫幅的一段資訊,不是閘。讀不到設定
     檔就退成「未接管(manual)」——讓一行資訊擋住客戶端啟動是本末倒置。
 
@@ -29,7 +29,7 @@ import os
 import sys
 
 SWITCH_HINT = (
-    "行為仍在調整;要完全關掉壓縮:./set_config.sh --compaction-mode off"
+    "行為仍在調整;要完全關掉壓縮:執行 ./set_config.sh，在壓縮模式選 off"
 )
 
 MODE_LABELS = {

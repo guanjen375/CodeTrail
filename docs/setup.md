@@ -103,7 +103,7 @@ journalctl --user -u codetrail-main -f    # 看 log
 embedding / reranker / VL 各複製一份，只把 `exec main` 改成對應 role；所有 unit 讀的是
 同一份 `deployment.json`。要一次性換設定就在 `ExecStart` 後面加 loader 旗標(例如
 `--profile /absolute/path/experiment.json`、`--main-model <CODE_MODEL>`、
-`--llama-bin /absolute/path/to/llama-server`),它們的意義與 `~/start.sh` 完全一樣。
+`--llama-bin /absolute/path/to/llama-server`)，與內部 Python launcher 使用同一個 loader。
 systemd 不會展開 `<...>` placeholder，啟用前必須換成實值。
 
 ### screen(類 tmux)
@@ -261,7 +261,7 @@ systemd:`systemctl --user stop codetrail-{main,embed,rerank,vl}`
 ### 看 server 狀態
 
 ```bash
-~/start.sh status --strict
+python3 scripts/check_status.py --strict
 
 # 主 server 載入的是哪顆 GGUF、ctx 多少?
 curl -s http://localhost:8080/props | python3 -m json.tool | head -20
@@ -292,7 +292,7 @@ llama-server 端的 `-c <N>` 也是啟動旗標,改完要重啟 server,不能熱
 觸發門檻與受管值都可能再變。
 
 **壓縮模式同理**:`~/.config/codetrail/client.json`(0600)的 `compaction_mode` 在客戶端
-**啟動時** 讀,所以 `./set_config.sh --compaction-mode ...` 之後必須退出再重開。
+**啟動時** 讀，所以執行 `./set_config.sh`、在問答中修改壓縮模式後，必須退出再重開。
 沒有這個檔 = 沒有接管:模式退成 `manual`,啟動橫幅會講明。三種模式的取捨見
 [compaction-rules.md](compaction-rules.md)。
 

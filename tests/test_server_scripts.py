@@ -644,7 +644,8 @@ def test_start_role_warns_when_pipe_pane_fails(tmp_path, monkeypatch, capsys):
     )
     err = capsys.readouterr().err
     assert "pipe-pane" in err
-    assert "logs main 將看不到輸出" in err
+    assert "main.log 將看不到輸出" in err
+    assert "tmux attach -t s-main" in err
 
 
 def test_start_role_warns_when_log_dir_unwritable(tmp_path, monkeypatch, capsys):

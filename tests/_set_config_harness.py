@@ -6,8 +6,7 @@
 兩個入口,回傳同一種 `subprocess.CompletedProcess`,測試主體不必知道走哪條:
 - `run()`            — in-process 直呼 `scripts.set_config.main(argv)`,env / stdin /
                        stdout 都在 context manager 裡隔離。
-- `run_subprocess()` — 原本的 `bash set_config.sh` 子行程。留給真的要驗跨行程行為的
-                       測試(bash wrapper 本身、檔案權限、完整 --yes 產出)。
+- `run_subprocess()` — `python3 scripts/set_config.py` 維護子行程，驗檔案權限與完整 --yes 產出。
 
 兩個入口都自動帶上 `--llama-bin <tmp_path>/llama-server`(`pin_llama_bin=False`
 可關掉):設定值只走旗標與 `deployment.json`,環境變數這條路已經沒有了。
@@ -23,12 +22,13 @@ import os
 import shlex
 import struct
 import subprocess
+import sys
 import subprocess as _subprocess
 from pathlib import Path
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRIPT = REPO_ROOT / "set_config.sh"
+SCRIPT = REPO_ROOT / "scripts" / "set_config.py"
 
 TWO_GPUS = (
     "0, NVIDIA GeForce RTX 5090, 32607, 30000, GPU-aaaa-5090\n"
@@ -272,13 +272,13 @@ def run_subprocess(tmp_path: Path, *args: str, stdin: str | None = None,
                    pin_llama_bin: bool = True,
                    env_overrides: dict[str, str] | None = None
                    ) -> subprocess.CompletedProcess:
-    """原本的呼叫方式:`bash set_config.sh` 子行程。跨行程語意要被驗到時用這個。"""
+    """維護 Python 子行程；跨行程語意仍須驗到，日常 shell 不轉發旗標。"""
     env = build_env(tmp_path, with_llama=with_llama)
     if env_overrides:
         env.update(env_overrides)
     pinned = llama_bin_args(tmp_path) if pin_llama_bin else ()
     return subprocess.run(
-        ["bash", str(SCRIPT), "--skip-deps-check", *pinned, *args],
+        [sys.executable, str(SCRIPT), "--skip-deps-check", *pinned, *args],
         cwd=REPO_ROOT,
         env=env,
         input=stdin,

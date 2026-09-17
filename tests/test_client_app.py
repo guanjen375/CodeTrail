@@ -159,6 +159,63 @@ def _run(body):
     return asyncio.run(body())
 
 
+def test_review_modal_blocks_chat_session_changes_and_closes_through_cancel(monkeypatch):
+    import client_review
+
+    engine = _Engine()
+    entered = threading.Event()
+    held = []
+    real_job = client_review.ReviewJob
+
+    class Job(real_job):
+        def run(self, progress):
+            entered.set()
+            progress("收集變更中")
+            assert self._cancelled.wait(3)
+            return client_review.ReviewOutcome("cancelled", "cancelled", detail="cancelled")
+
+    monkeypatch.setattr(client_review, "ReviewJob", Job)
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            app._cmd_review("")
+            for _ in range(30):
+                await pilot.pause()
+                if entered.is_set():
+                    break
+            assert entered.is_set() and isinstance(app.screen, client_app.ReviewScreen)
+            review = app.screen
+            assert app.coordinator.reviewing and app.coordinator.busy
+            app._cmd_new("")
+            app._cmd_compact("")
+            app._cmd_session("another-session")
+            assert engine.store.created == 0 and engine.sent == [] and engine.messages == []
+            assert not app.submit("retain my draft") and engine.sent == []
+            assert not isinstance(app.screen, client_app.QueueChoiceScreen)
+            assert not list(app.query(client_app.AssistantBlock)), "review drafts entered the chat"
+            assert review.query_one("#review-body", client_app.VerticalScroll)
+            await pilot.press("escape")
+            for _ in range(30):
+                await pilot.pause()
+                if not app.coordinator.busy and not isinstance(app.screen, client_app.ReviewScreen):
+                    break
+            assert not app.coordinator.busy and not app.coordinator.reviewing
+            assert not isinstance(app.screen, client_app.ReviewScreen)
+            assert engine.messages == [] and not engine.cancelled
+            assert engine.primes == ["mount"], "review scheduled another prime"
+            assert app.submit("normal chat after review")
+            for _ in range(30):
+                await pilot.pause()
+                if not app.coordinator.busy:
+                    break
+            assert engine.sent == ["normal chat after review"]
+            held.append(review.report)
+
+    _run(body)
+    assert held and "未寫入聊天歷史" in held[0]
+
+
 async def _settle(pilot, times=25):
     for _ in range(times):
         await pilot.pause()

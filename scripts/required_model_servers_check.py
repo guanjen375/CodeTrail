@@ -175,7 +175,8 @@ def render_report(checks: list[ServerCheck], *, prefix: str = "[model-preflight]
             lines.append(f"{prefix} repair/start model services on A; check B client.json endpoint authorization and live aliases.")
         else:
             lines.append(
-                f"{prefix} start them with '~/start.sh --scope aux' (main 也沒起就直接 ~/start.sh),"
+                f"{prefix} start them with 'python3 {REPO_ROOT / 'scripts/launch_servers.py'} --scope aux' "
+                "(main 也沒起就直接 ~/start.sh),"
                 " or fix the endpoints in ~/.config/codetrail/deployment.json and rerun ./set_config.sh."
             )
     return lines

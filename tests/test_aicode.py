@@ -29,14 +29,10 @@ from tests._harness import REPO_ROOT, require_working_bash
 
 pytestmark = pytest.mark.smoke
 
-#: 替身客戶端:把 argv 與 cwd 寫進檔案就結束。`--help` 也要回一段話,
-#: 這樣 wrapper 的 --help 早退路徑才驗得到。
+#: 替身客戶端：把 argv 與 cwd 寫進檔案就結束。
 CLIENT_STUB = """#!/usr/bin/env python3
 import os, pathlib, sys
 
-if "--help" in sys.argv[1:]:
-    print("stub client help")
-    raise SystemExit(0)
 pathlib.Path(os.environ["AICODE_TEST_RECORD"]).write_text(
     "\\n".join([os.getcwd(), *sys.argv[1:]]), encoding="utf-8"
 )
@@ -115,16 +111,14 @@ def test_the_only_exec_target_is_the_client_next_to_the_wrapper(tmp_path):
     assert _recorded(record) == [str(project)]
 
 
-def test_user_flags_are_forwarded_verbatim(tmp_path):
+def test_user_flags_are_rejected_before_the_client(tmp_path):
     wrapper, record = _install(tmp_path)
     project = tmp_path / "project"
     project.mkdir()
     result = _run(wrapper, ["-c", "--session", "20260101T000000-abcdef01"],
                   cwd=project, record=record)
-    assert result.returncode == 0, result.stderr
-    assert _recorded(record) == [
-        str(project), "-c", "--session", "20260101T000000-abcdef01"
-    ]
+    assert result.returncode == 2, result.stderr
+    assert not record.exists()
 
 
 def test_the_wrapper_follows_its_own_symlink_to_find_the_checkout(tmp_path):
@@ -155,36 +149,28 @@ def test_the_sandbox_root_is_always_the_current_directory(tmp_path):
 # ============================================================
 # 拒絕沒有終端機的環境
 # ============================================================
-@pytest.mark.parametrize("args", [[], ["-c"]])
-def test_without_a_tty_the_wrapper_refuses_and_points_at_the_headless_entry(tmp_path, args):
+def test_without_a_tty_the_wrapper_refuses_and_points_at_the_headless_entry(tmp_path):
     """TUI 會接管整個畫面;pipe 過去只會得到一團控制碼。明確拒絕,不靜默降級。"""
     wrapper, record = _install(tmp_path)
     project = tmp_path / "project"
     project.mkdir()
-    result = _run(wrapper, args, cwd=project, record=record, tty=False)
+    result = _run(wrapper, [], cwd=project, record=record, tty=False)
     assert result.returncode == 2, result.stdout + result.stderr
     assert "tty" in result.stderr
     assert "run" in result.stderr and "--format json" in result.stderr
     assert not record.exists(), "拒絕之後不得 exec 客戶端"
 
 
-def test_help_works_without_a_tty(tmp_path):
-    """`aicode --help` 要能在 pipe 裡用(裝完之後第一件事常常是它),而且**由 wrapper 自己印**。
-
-    2026-09-04:以前它 `exec` 客戶端的 `--help`。行為為什麼該變:客戶端的 help 會
-    列出 `run` / `status` / `sessions` 這些**內部**入口(canary / eval / doctor 用),
-    而 wrapper 現在會拒絕它們 —— 列出來只是請使用者去試一個會被打回的東西。
-    """
+def test_help_is_rejected_without_starting_the_client(tmp_path):
+    """日常入口的任何 argv 都拒絕；help 也不能繞過固定路由。"""
     wrapper, record = _install(tmp_path)
     project = tmp_path / "project"
     project.mkdir()
     result = _run(wrapper, ["--help"], cwd=project, record=record, tty=False)
-    assert result.returncode == 0, result.stderr
-    assert "aicode [-c | --continue] [--session <id>]" in result.stdout
-    # 使用者 help 不得提到內部入口。
-    for internal in ("status", "sessions", "--policy", "--persist", "--client-config"):
-        assert internal not in result.stdout, internal
-    assert not record.exists(), "--help 不得 exec 客戶端"
+    assert result.returncode == 2, result.stderr
+    assert "不接受參數" in result.stderr
+    assert "/session" in result.stderr and "/resume" in result.stderr
+    assert not record.exists()
 
 
 @pytest.mark.smoke
@@ -201,13 +187,8 @@ def test_help_works_without_a_tty(tmp_path):
         pytest.param(["/tmp/somewhere"], id="positional_directory"),
     ],
 )
-def test_the_wrapper_accepts_only_the_three_user_flags(tmp_path, argv):
-    """`aicode` 只收 `-c/--continue`、`--session <id>`、`-h/--help`。
-
-    `codetrail_chat.py` 底下還有 run / status / sessions 這些內部入口,它們**不跑
-    preflight**(profile 驗證、ctx 容量閘、工具健檢都在那裡)。原樣轉發 argv 的話,
-    `aicode run "..."` 就成了第二條使用者入口,而且是略過那些閘的一條。
-    """
+def test_the_wrapper_rejects_all_user_arguments(tmp_path, argv):
+    """內部命令／設定旗標不能經公開 wrapper 繞過正常 preflight。"""
     wrapper, record = _install(tmp_path)
     project = tmp_path / "project"
     project.mkdir()
@@ -227,15 +208,18 @@ def test_the_wrapper_accepts_only_the_three_user_flags(tmp_path, argv):
         pytest.param([], id="no_flags"),
     ],
 )
-def test_the_wrapper_forwards_the_three_user_flags(tmp_path, argv):
-    """白名單內的參數要原樣轉發給客戶端。"""
+def test_the_wrapper_never_forwards_session_arguments(tmp_path, argv):
+    """接續對話移至 TUI；只有零 argv 能啟動正常客戶端。"""
     wrapper, record = _install(tmp_path)
     project = tmp_path / "project"
     project.mkdir()
     result = _run(wrapper, argv, cwd=project, record=record, tty=True)
-    assert result.returncode == 0, result.stderr
-    recorded = record.read_text(encoding="utf-8").splitlines()
-    assert recorded[1:] == argv, recorded
+    if argv:
+        assert result.returncode == 2, result.stderr
+        assert not record.exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        assert _recorded(record) == [str(project)]
 
 
 # ============================================================
@@ -283,13 +267,13 @@ def test_a_polluted_shell_changes_nothing(tmp_path):
     project.mkdir()
     other.mkdir()
 
-    clean = _run(wrapper, ["-c"], cwd=project, record=record)
+    clean = _run(wrapper, [], cwd=project, record=record)
     assert clean.returncode == 0, clean.stderr
     baseline = record.read_bytes()
     record.unlink()
 
     polluted = _run(
-        wrapper, ["-c"], cwd=project, record=record,
+        wrapper, [], cwd=project, record=record,
         env_extra={
             "AICODE_ROOT": str(other),
             "AICODE_MODEL": "some-other-model",

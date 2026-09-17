@@ -318,12 +318,7 @@ permission 是 `ask`）。
 ## 7. 切換與接續對話
 
 對話是**每個專案**各自保存的(session 檔在 state 目錄,不在被分析的 repo 裡)。回到同一個
-專案時有兩種入口:啟動時帶旗標,或進 TUI 之後用指令。
-
-```bash
-aicode -c                  # 接續這個專案最近一次的對話
-aicode --session <id>      # 接續指定的一段
-```
+專案時直接執行 `aicode`，再由 TUI 選單接續；shell 入口不接受參數。
 
 ```text
 /sessions        列出這個專案的既有對話(最多 20 筆):id、最後更新時間、輪數、第一句話
@@ -357,3 +352,9 @@ session 檔算出來的純文字,**不會呼叫模型、也不會回寫 session 
 cd <PROJECT_TO_ANALYZE>
 python3 <CODETRAIL_REPO>/codetrail_chat.py sessions
 ```
+
+## 8. 審查目前變更
+
+在 Git repo 根目錄開啟 `aicode`，輸入 `/review`。結果在可捲動的獨立畫面呈現，
+列出問題位置、證據與覆蓋缺口；Ctrl-C 可取消。不改程式碼、不寫聊天歷史。
+範圍與限制見 [工作區程式碼審查](code-review.md)。

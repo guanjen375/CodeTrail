@@ -28,7 +28,8 @@ launcher 旗標(--profile / --llama-bin / --main-model / --main-ctx / --<role>-g
 
 **設定沒有環境變數這一層。** loader、launcher、stop、status 與 `deployment_profile.py`
 自己都掛同一組旗標(`add_loader_arguments`),殼層裡的殘留值一律無效;`~/start.sh` 也不
-export / unset 任何東西,只把你打的旗標原樣轉下去。tmux pane 內跑的是
+export / unset 任何東西；它只接受無參數啟動與單一 `stop`，以固定 argv 呼叫核心。
+上述覆寫旗標保留在內部 Python 維護介面。tmux pane 內跑的是
 `python3 deployment_profile.py exec <role> <同一組旗標>`,由它算出最終環境再 `exec`
 llama-server —— CodeTrail 的四個設定前綴、llama.cpp 自己的 `LLAMA_ARG_*` 與繼承來的
 GPU 選擇都在那一步剝掉,GPU 只由本檔驗證過的值重新指定。
@@ -50,7 +51,7 @@ client 的目的地仍須獨立通過 owner-only `client.json.model_endpoints`�
 - `port` 與 `base_url`：必須一致；URL 只接受無 credentials/path/query 的 HTTP(S)。
 - `bind`：`local`(預設,loopback base_url 只綁 `127.0.0.1`)或 `all-interfaces`
   (綁 `0.0.0.0`,對其他機器開放 —— CodeTrail 目前產生的 server 指令未啟用
-  認證,慎用)。要開放就寫進 local override(或 `./set_config.sh --allow-remote`
+  認證,慎用)。要開放就寫進 local override(或 `python3 scripts/set_config.py --allow-remote`
   一次寫好四個 role);非 loopback 的 base_url host 不受影響、照原樣綁定。
 - `gpu_role`：只能是 `main` 或 `aux`。
 - `gpu`(選填)：這個 role 要用的 GPU selector,UUID 或 `nvidia-smi` index;缺席 =
@@ -117,7 +118,7 @@ client 的目的地仍須獨立通過 owner-only `client.json.model_endpoints`�
   已將 `--no-mmap` 標為 deprecated，建議未來轉向 `--load-mode`。CodeTrail 仍保留
   `no_mmap` 來相容目前驗證過的 build；上游若移除旗標，要同步遷移 profile
   schema、launcher、preflight 與文件，不要只在 JSON 自行改鍵名。
-- main 的 `threads`(→ `-t`)**從來不是設定時的問題**,只有 `set_config.sh --threads N`
+- main 的 `threads`(→ `-t`)**從來不是設定時的問題**,只有 `python3 scripts/set_config.py --threads N`
   明確指定時才會寫入。未指定 = auto:不傳 `-t`,llama.cpp 的預設 `-1` 會自己偵測
   (x86_64 Linux 上 hybrid CPU 只算 P-core,否則用實體核心數、排除 HT siblings),
   比工具自己數邏輯 CPU 準。
@@ -142,7 +143,7 @@ Qwen3 是 causal 架構,除 compute buffer 外還有 KV cache,所以增幅遠高
 
 ## 遠端 endpoint 的雙重同意
 
-`bind: "all-interfaces"` / `./set_config.sh --allow-remote` 控制的是「其他機器能不能連進
+`bind: "all-interfaces"` / `python3 scripts/set_config.py --allow-remote` 控制的是「其他機器能不能連進
 llama-server」；profile 的 `base_url` 控制的是「CodeTrail 把 request 送去哪」。這是兩個
 不同方向的資料邊界。
 

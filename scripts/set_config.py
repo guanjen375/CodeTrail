@@ -36,8 +36,8 @@ nvidia-smi 稍微監控)。
                                            綁的 GPU 與 llama-server 路徑)
      - ~/.config/codetrail/client.json     壓縮模式與權限覆寫(0600;
                                            這一題有明確答案時才寫)
-     - ~/start.sh                          啟動腳本(支援 status / stop / logs 子命令;
-                                           純轉發,不設定任何殼層變數)
+     - ~/start.sh                          啟動腳本(無參數啟動或單一 stop;
+                                           不設定任何殼層環境變數)
   7. 安全預設:llama-server 只綁 127.0.0.1;要讓其他機器連線必須明確
      `--allow-remote`(或 deployment.json 的 bind: "all-interfaces")。
 
@@ -392,7 +392,7 @@ def check_llama_binary(binary: Path, skip: bool, notes: list[str]) -> dict[str, 
             "    git clone https://github.com/ggerganov/llama.cpp ~/llama.cpp\n"
             "    cd ~/llama.cpp && cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF && "
             "cmake --build build --config Release -j\n"
-            "  放在別處的話:./set_config.sh --llama-bin /path/to/llama-server"
+            "  放在別處的話:python3 scripts/set_config.py --llama-bin /path/to/llama-server"
         )
         if skip:
             notes.append("⚠ 已用 --skip-binary-check 跳過 llama-server 檢查(假設為支援 --fit 的新版)。")
@@ -974,7 +974,7 @@ def _input(prompt: str) -> str:
     except EOFError as exc:
         raise SetupError(
             "無互動輸入環境。請加 --yes 並用旗標提供所有必要值"
-            "(--main-model/--ctx/...),見 ./set_config.sh --help。"
+            "(--main-model/--ctx/...),見 python3 scripts/set_config.py --help。"
         ) from exc
 
 
@@ -1211,7 +1211,7 @@ def choose_compaction_mode(
     print("觸發點在「助理答完、對話進 idle」之後,所以摘要不會插在你的問題前面。")
     print("🧪 實驗功能(開發中、仍在測試階段):摘要規則與門檻可能再變。")
     print("  完全不想要自動壓縮就選 off;之後隨時可以用"
-          " ./set_config.sh --compaction-mode off 改回來。")
+          " python3 scripts/set_config.py --compaction-mode off 改回來。")
     if prior_mode is not None:
         print(f"目前記錄的選擇:{prior_mode}")
     labels = {
@@ -1705,7 +1705,7 @@ def merge_existing_deployment(config: dict, existing_path: Path, notes: list[str
         if old_service.get("bind") == "all-interfaces" and "bind" not in new_service:
             notes.append(
                 "⚠ 既有設定開放區網連線(bind: all-interfaces),本次未加 --allow-remote"
-                " → 回到僅本機 127.0.0.1。要維持開放請重跑 ./set_config.sh --allow-remote。"
+                " → 回到僅本機 127.0.0.1。要維持開放請重跑 python3 scripts/set_config.py --allow-remote。"
             )
 
 
@@ -1747,132 +1747,49 @@ def _threads_description(plan: Plan) -> str:
     return "auto(不傳 -t;llama.cpp 自動取實體/P-core 數)"
 
 
-def build_start_sh(plan: Plan) -> str:
-    gpu_lines = "\n".join(f"#   {gpu.describe()}" for gpu in plan.gpus)
-    offload = _offload_description(plan)
-    bind_note = (
-        "0.0.0.0(--allow-remote:區網其他機器可連線,llama-server 無認證,務必只在可信網段)"
-        if plan.allow_remote
-        else "127.0.0.1(僅本機;要開放其他機器 → 重跑 ./set_config.sh --allow-remote)"
-    )
-    stop_py = shlex.quote(str(REPO_ROOT / "scripts" / "stop_servers.py"))
-    status_py = shlex.quote(str(REPO_ROOT / "scripts" / "check_status.py"))
-    launch_py = shlex.quote(str(REPO_ROOT / "scripts" / "launch_servers.py"))
+def render_start_wrapper(repo_root: Path = REPO_ROOT) -> str:
+    """Render the installed wrapper without probing hardware or reading settings."""
+    root = Path(repo_root)
+    stop_py = shlex.quote(str(root / "scripts" / "stop_servers.py"))
+    launch_py = shlex.quote(str(root / "scripts" / "launch_servers.py"))
     return f"""#!/usr/bin/env bash
-# {GENERATED_MARKER} — {time.strftime("%Y-%m-%d %H:%M:%S")}
-# 重新設定:cd {REPO_ROOT} && ./set_config.sh
-#
-# 偵測到的 GPU:
-{gpu_lines}
-#
-# 配置(模型 @ GPU 編號,1 起算,與上面偵測清單一致):
-#   main      = {plan.main_key} @ GPU {plan.main.gpu.choice}
-#   embedding = {plan.embedding.candidate.path.name} @ GPU {plan.embedding.gpu.choice}
-#   reranker  = {plan.reranker.candidate.path.name} @ GPU {plan.reranker.gpu.choice} (internal buffer={plan.reranker_ctx})
-#   vl        = {plan.vl.candidate.path.name} @ GPU {plan.vl.gpu.choice}
-#
-# 啟動參數(全部來自你在 set_config 的作答):ctx={plan.ctx}, threads={_threads_description(plan)}, {offload}
-#   reranker:-c/-b/-ub {plan.reranker_ctx};附屬服務:-np {AUX_PARALLEL}
-#   VL:{_vl_offload_description(plan)}
-#   綁定:{bind_note}
-#   完整參數(含每個角色綁哪張卡與 llama-server 路徑)在
-#   ~/.config/codetrail/deployment.json;實際指令預覽:~/start.sh --dry-run
-#   本檔不設定任何殼層變數:設定只來自那份 JSON 與旗標,轉發給下面三個腳本。
-#
-# 子命令:
-#   ~/start.sh                     啟動四個 llama-server(tmux 背景)
-#   ~/start.sh status [--strict]   檢查四個 server 狀態(= scripts/check_status.py)
-#   ~/start.sh stop [--force]      全部停止,等到 process 退出、VRAM 釋放完畢才返回(= scripts/stop_servers.py)
-#   ~/start.sh logs [role] [行數|-f] 看 server log(role 可省略,預設 main;啟動起即時寫入)
-#   ~/start.sh help                顯示子命令說明
+# {GENERATED_MARKER}
+# 無參數啟動四個模型；唯一子命令 stop 停止四個模型。
+# 設定由 deployment.json 與 repo 常數決定。
 set -euo pipefail
-
-# 這個檔只轉發:模型、每個角色的 GPU、llama-server 路徑與 tmux session 名
-# 都在 ~/.config/codetrail/deployment.json 與 repo 常數裡,launch / stop /
-# status 三條路各自去讀同一份。殼層變數不再參與 —— 同一台機器上兩份安裝的
-# start.sh 設同名變數時,「使用者以為在跑 A、實際在跑 B」是沒有訊息的。
-
-case "${{1:-}}" in
-  status)
-    shift
-    exec python3 {status_py} "$@"
-    ;;
-  stop|quit)
-    # --scope 預設 all;後面使用者旗標可覆寫(argparse last-wins),
-    # 例:~/start.sh stop --scope aux 只停三顆附屬、不動主模型。
-    shift
-    exec python3 {stop_py} --scope all "$@"
-    ;;
-  logs)
-    if [ "$#" -gt 3 ]; then
-      echo "logs 參數過多(用法:~/start.sh logs [role] [行數|-f];role 可省略,預設 main)" >&2
-      exit 2
-    fi
-    role="${{2:-main}}"
-    tail_spec="${{3:-}}"
-    case "$role" in
-      main|embedding|reranker|vl) ;;
-      *)
-        # 允許省略 role:logs -f / logs 200 → role 用預設 main。
-        if [ -n "$tail_spec" ]; then
-          echo "未知 role:$role(可用:main / embedding / reranker / vl)" >&2
-          exit 2
-        fi
-        case "$role" in
-          -f|f) tail_spec="$role"; role=main ;;
-          *[!0-9]*)
-            echo "未知 role:$role(可用:main / embedding / reranker / vl)" >&2
-            exit 2
-            ;;
-          *) tail_spec="$role"; role=main ;;
-        esac
-        ;;
-    esac
-    log_file="${{XDG_STATE_HOME:-$HOME/.local/state}}/codetrail/logs/$role.log"
-    if [ ! -f "$log_file" ]; then
-      echo "找不到 $log_file — 該 role 尚未啟動過(先執行 ~/start.sh)" >&2
-      exit 1
-    fi
-    if [ "$tail_spec" = "-f" ] || [ "$tail_spec" = "f" ]; then
-      exec tail -f "$log_file"
-    fi
-    exec tail -n "${{tail_spec:-120}}" "$log_file"
-    ;;
-  help|-h|--help)
-    cat <<'START_SH_USAGE'
-用法:~/start.sh [子命令|啟動器旗標]
-  (無參數)                 啟動四個 llama-server(tmux 背景)
-  --dry-run                只印出將執行的四條 llama-server 指令(其餘旗標見 python3 scripts/launch_servers.py --help)
-  --scope aux|main         只啟動部分角色(aux=三顆附屬、main=主模型;stop --scope aux 同理只停附屬)
-  status [--strict]        檢查四個 server 狀態
-  stop [--force]           全部停止並等到 VRAM 釋放完畢(--force 連孤兒 llama-server 一併處理)
-  logs [role] [行數|-f]     看 server log(role 可省略,預設 main;-f 持續追蹤)
-  help                     顯示本說明
-START_SH_USAGE
-    echo "重新設定:cd {REPO_ROOT} && ./set_config.sh"
-    exit 0
-    ;;
-  ""|-*)
-    ;;  # 無參數 → 啟動;旗標(如 --dry-run / --scope)→ 轉交 launch_servers.py
-  *)
-    echo "未知子命令:$1(可用:status / stop / logs / help;啟動器旗標如 --dry-run / --scope 會轉交 launch_servers.py)" >&2
-    exit 2
-    ;;
-esac
-
+if [ "$#" -eq 1 ] && [ "$1" = "stop" ]; then
+  exec python3 {stop_py} --scope all
+fi
+if [ "$#" -ne 0 ]; then
+  echo "[start.sh] 只接受無參數啟動，或單一 stop。" >&2
+  exit 2
+fi
 rc=0
-python3 {launch_py} --scope all "$@" || rc=$?
+python3 {launch_py} --scope all || rc=$?
 if [ "$rc" -eq 0 ]; then
-  case " $* " in
-    *" --dry-run "*) ;;  # 純預覽沒有真的啟動,不需要監控提醒
-    *)
-      echo ""
-      echo "[start.sh] 提醒:set_config 的 VRAM 數字只是粗估(未計 KV cache/compute buffer),請用 nvidia-smi 稍微監控 GPU/VRAM 使用狀況(例如:watch -n 1 nvidia-smi);異常時用 ~/start.sh logs <role> 查原因。"
-      ;;
-  esac
+  echo "[start.sh] 請用 watch -n 1 nvidia-smi 稍微監控 GPU/VRAM；用 tmux attach -t {TMUX_SESSIONS['main']} 查看模型輸出。"
 fi
 exit "$rc"
 """
+
+
+def build_start_sh(plan: Plan) -> str:
+    gpu_lines = "\n".join(f"#   {gpu.describe()}" for gpu in plan.gpus)
+    bind_note = "0.0.0.0（已明確授權 LAN）" if plan.allow_remote else "127.0.0.1（僅本機）"
+    metadata = f"""# 偵測到的 GPU:
+{gpu_lines}
+# main={plan.main_key} @ GPU {plan.main.gpu.choice}; ctx={plan.ctx}
+# embedding={plan.embedding.candidate.path.name} @ GPU {plan.embedding.gpu.choice}
+# reranker={plan.reranker.candidate.path.name} @ GPU {plan.reranker.gpu.choice}; buffer={plan.reranker_ctx}
+# vl={plan.vl.candidate.path.name} @ GPU {plan.vl.gpu.choice}
+# threads={_threads_description(plan)}; {_offload_description(plan)}
+# VL: {_vl_offload_description(plan)}; 綁定: {bind_note}
+"""
+    return render_start_wrapper().replace(
+        f"# {GENERATED_MARKER}\n",
+        f"# {GENERATED_MARKER} — {time.strftime('%Y-%m-%d %H:%M:%S')}\n{metadata}",
+        1,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2592,7 +2509,7 @@ def preview_start_commands(codetrail_dir: Path) -> int:
             timeout=120,
         )
     except process_env.TimeoutExpired:
-        print("⚠ 啟動參數預覽逾時(120 秒);設定檔已寫入,可直接用 ~/start.sh --dry-run 重試預覽。",
+        print("⚠ 啟動參數預覽逾時(120 秒);設定檔已寫入,可直接用 python3 scripts/launch_servers.py --scope all --dry-run 重試預覽。",
               file=sys.stderr)
         return 1
     print("\n=== 推薦啟動參數(~/start.sh 實際會執行的指令)===")
@@ -2646,7 +2563,7 @@ def _n_cpu_moe_arg(raw: str) -> int:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="CodeTrail 一鍵設定:偵測 GPU/模型 → 互動問答(只驗證輸入範圍,"
+        description="CodeTrail 維護介面；日常設定請執行無參數 set_config.sh。偵測 GPU/模型 → 互動問答(只驗證輸入範圍,"
                     "不用估算擋輸入)→ 產生設定檔與 ~/start.sh",
     )
     parser.add_argument("--mode", dest="deployment_mode", choices=("local", "model-host", "client"), default="local")
@@ -2764,7 +2681,7 @@ def _print_summary_page(plan: Plan, python_bin: str,
         print(f"  壓縮模式  : {compaction_choice}")
         if compaction_choice != client_compaction.MODE_OFF:
             print("              🧪 實驗功能(開發中);"
-                  "隨時可用 ./set_config.sh --compaction-mode off 關掉")
+                  "隨時可用 python3 scripts/set_config.py --compaction-mode off 關掉")
         if compaction_derived is not None:
             print(f"              idle 門檻={compaction_derived.idle_threshold} tokens、"
                   f"tail 保留={compaction_derived.preserve_recent_tokens} tokens")
@@ -2787,6 +2704,16 @@ def configure_client(args: argparse.Namespace, home: Path) -> int:
     if incompatible or args.allow_remote:
         raise SetupError("client mode does not accept local launcher options: " + ", ".join(incompatible or ["allow_remote"]))
     roles = {"main": "main", "embedding": "embed", "reranker": "rerank", "vl": "vl"}
+    supplied_roles = any(getattr(args, f"{flag}_{field}", None)
+                         for flag in roles.values() for field in ("url", "model"))
+    if not args.yes and not args.endpoint_manifest and not supplied_roles:
+        manifest_path = _input("A 提供的 endpoint manifest 本地路徑（Enter 改為逐角色輸入）: ").strip()
+        if manifest_path:
+            args.endpoint_manifest = Path(manifest_path).expanduser()
+        else:
+            for role, flag in roles.items():
+                setattr(args, f"{flag}_url", _input(f"{role} 完整 URL（literal private IP）: ").strip())
+                setattr(args, f"{flag}_model", _input(f"{role} 版本 identity alias: ").strip())
     if args.endpoint_manifest:
         if any(getattr(args, f"{flag}_url", None) or getattr(args, f"{flag}_model", None)
                for flag in roles.values()):
@@ -2819,19 +2746,25 @@ def configure_client(args: argparse.Namespace, home: Path) -> int:
     deployment_json = json.dumps(deployment, ensure_ascii=False, indent=2) + "\n"
     validate_payloads(deployment_json, "{}\n")
     previous = client_config.load_client_settings({"HOME": str(home)})
+    print("Client deployment B: aicode / MCP / repository / build stay on B")
+    print("模型呼叫會將問題、程式碼與工具內容送到以下四個精確目的地及版本 alias：")
+    print(deployment_json, end="")
+    kb_authorized = (previous.kb_context_remote_ok if args.kb_context_remote_ok is None
+                     else args.kb_context_remote_ok)
+    if not args.yes and args.kb_context_remote_ok is None:
+        print("KB 脈絡生成會另外把文件 chunk 與章節內容送到 main；這是獨立授權。")
+        kb_authorized = _input_optional("另行允許 KB 文件內容離開 B？[y/N] ").strip().lower() in {"y", "yes"}
     settings = replace(previous, present=True, model_endpoints=grants,
                        model_remote_ok=False,
                        compaction_mode=args.compaction_mode or previous.compaction_mode,
-                       kb_context_remote_ok=(previous.kb_context_remote_ok if args.kb_context_remote_ok is None
-                                             else args.kb_context_remote_ok))
+                       kb_context_remote_ok=kb_authorized)
     client_value = settings.as_json()
     client_config._validate(client_value, settings.path)
-    print("Client deployment B: aicode / MCP / repository / build stay on B")
     print("Authorize the following exact destinations in owner-only client.json:")
-    print(deployment_json, end="")
     print(f"Independent document-window authorization: {settings.kb_context_remote_ok}")
     if not args.yes and not args.dry_run:
-        if input("Authorize these endpoints and write configuration? [y/N] ").strip().lower() != "y":
+        if _input_optional("Authorize these endpoints and write configuration? [y/N] ").strip().lower() not in {"y", "yes"}:
+            print("未授權；未寫入設定。")
             return 0
     notes: list[str] = []
     commit_files([
@@ -2840,7 +2773,7 @@ def configure_client(args: argparse.Namespace, home: Path) -> int:
     ], notes, args.dry_run, home=home, private=(settings.path,))
     for note in notes:
         print(note)
-    print("Start models on A; on B run aicode or python3 scripts/doctor.py.")
+    print("設定已驗證；尚未驗證 live 服務。啟動 aicode 時會核對四個模型身分與 live n_ctx。")
     return 0
 
 
@@ -3014,7 +2947,7 @@ def run(args: argparse.Namespace) -> int:
         if threads is None:
             notes.append(
                 "主模型 threads 用 auto(不傳 -t):llama.cpp 會自動取實體核心數"
-                "(hybrid CPU 只算 P-core)。要釘死才用 ./set_config.sh --threads N。"
+                "(hybrid CPU 只算 P-core)。要釘死才用 python3 scripts/set_config.py --threads N。"
             )
         elif cores and threads > cores:
             notes.append(f"⚠ --threads {threads} 超過偵測到的核心數({cores}),通常反而較慢。")
@@ -3256,14 +3189,14 @@ def run(args: argparse.Namespace) -> int:
     else:
         print("[PASS] 第 1 層:設定檔已寫入並通過 schema 驗證(備份:*.bak-setconfig-*)")
         print("[待執行] 第 2 層:實際啟動與模型載入 → ~/start.sh(成功與否以此為準)")
-        print("[待執行] 第 3 層:啟動後健檢 → ~/start.sh status(嚴格模式加 --strict)")
+        print("[待執行] 第 3 層:啟動後健檢 → python3 scripts/check_status.py --strict")
         print("          與 python3 scripts/doctor.py(主模型讀 deployment.json)")
 
     preview_rc = 0
     if not args.dry_run and not args.no_preview:
         preview_rc = preview_start_commands(codetrail_dir)
 
-    if not args.dry_run:
+    if not args.dry_run and getattr(args, "offer_restart", True):
         running = running_codetrail_sessions()
         if running:
             print(f"\n⚠ 偵測到 CodeTrail server 正在執行(tmux:{', '.join(running)});"
@@ -3281,7 +3214,7 @@ def run(args: argparse.Namespace) -> int:
 
     print("\n下一步:")
     print("  ~/start.sh                        # 啟動四個 llama-server(tmux)")
-    print("  ~/start.sh status                 # 確認四個 server 都 ready")
+    print("  python3 scripts/check_status.py --strict  # 確認四個 server 都 ready")
     print("  cd <你要分析的專案> && aicode      # 進 TUI;/status 應顯示 codetrail Connected")
     print("  ~/start.sh stop                   # 收工:關掉全部 tmux server 視窗")
     return 1 if preview_rc != 0 else 0
@@ -3295,6 +3228,10 @@ def main(argv: list[str] | None = None) -> int:
                 stream.reconfigure(errors="replace")
             except (OSError, ValueError):
                 pass
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        from scripts import deployment_entry
+        return deployment_entry.main(["configure"])
     args = _parser().parse_args(argv)
     try:
         return run(args)

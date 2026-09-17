@@ -185,7 +185,7 @@ def _wait_for_health(service: ServiceProfile, timeout: int, session: str) -> Non
         if dead:
             raise ProfileError(
                 f"{service.role} 的 llama-server {reason};模型載入失敗或參數錯誤。"
-                f"完整錯誤:~/start.sh logs {service.role}"
+                f"完整錯誤:tmux attach -t {shlex.quote(session)}"
             )
         now = time.monotonic()
         if now >= next_report:
@@ -312,14 +312,16 @@ def _start_role(
                 detail = (pipe.stderr or pipe.stdout).strip() or f"exit {pipe.returncode}"
                 print(
                     f"[!] ⚠ 無法為 {service.role} 接上 tmux pipe-pane({detail});"
-                    f"啟動照常進行,但 ~/start.sh logs {service.role} 將看不到輸出",
+                    f"啟動照常進行,但 {log_path} 將看不到輸出；"
+                    f"可用 tmux attach -t {shlex.quote(session)} 查看",
                     file=sys.stderr,
                 )
         except OSError as exc:
             # log 寫不進去不該擋啟動,但也不能無聲吞掉,否則使用者以為 logs 可用。
             print(
                 f"[!] ⚠ 無法建立 {service.role} 的 log 檔({exc});"
-                f"啟動照常進行,但 ~/start.sh logs {service.role} 將看不到輸出",
+                f"啟動照常進行,但 {log_path} 將看不到輸出；"
+                f"可用 tmux attach -t {shlex.quote(session)} 查看",
                 file=sys.stderr,
             )
     process_env.run(["tmux", "respawn-window", "-k", "-t", target, command_line], check=True)
@@ -422,7 +424,8 @@ def _rollback_started(
         "修正後直接重新執行 ~/start.sh 即可。",
         file=sys.stderr,
     )
-    print("[rollback] 要保留現場除錯:~/start.sh --keep-on-failure", file=sys.stderr)
+    launcher = shlex.quote(str(Path(__file__).resolve()))
+    print(f"[rollback] 要保留現場除錯:python3 {launcher} --scope all --keep-on-failure", file=sys.stderr)
 
 
 def launch(
@@ -468,7 +471,8 @@ def launch(
             raise ProfileError(f"{service.role} port {service.port} is already in use ({service.base_url})")
 
     log_dir = _state_log_dir()
-    print(f"[i] server log 即時寫入:{log_dir}/<role>.log(~/start.sh logs <role> 可查看)")
+    print(f"[i] server log 即時寫入:{log_dir}/<role>.log；"
+          f"主模型:tail -f {shlex.quote(str(log_dir / 'main.log'))}")
     started_sessions: set[str] = set()
     created_sessions: list[str] = []
     started_roles: list[ServiceProfile] = []

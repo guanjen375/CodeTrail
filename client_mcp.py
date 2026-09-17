@@ -243,12 +243,15 @@ class McpClient:
         start_timeout: float | None = None,
         stderr_log: str | os.PathLike[str] | None = None,
         on_start_progress: Callable[[float], None] | None = None,
+        restart_on_cancel: bool = True,
     ) -> None:
         self.root = str(Path(root).resolve())
         #: server 的第二層。**argv,不是環境變數**:環境變數的問題是殼層裡殘留的
         #: 同名變數(來自另一份安裝、另一個專案)可以把它翻回來,而 readonly 是
         #: 評測邊界。建構時決定,之後唯讀。
         self.readonly = bool(readonly)
+        self.client_config = client_config
+        self.skip_aux_preflight = bool(skip_aux_preflight)
         self._argv = list(argv) if argv else self._server_argv(
             readonly=self.readonly,
             n_ctx=n_ctx,
@@ -280,6 +283,7 @@ class McpClient:
         # 忘了 unset 的值就等於每個 session 都把那些內容寫進一個檔。
         self._stderr_log = stderr_log or None
         self._on_start_progress = on_start_progress
+        self._restart_on_cancel = restart_on_cancel
 
         # 三把獨立的鎖,刻意不共用一把:
         #   _lock         生命週期(_proc / _closed / _generation / _tools)
@@ -288,6 +292,12 @@ class McpClient:
         # 共用一把的話,`start()` 持著鎖等 initialize 回應,而回應正是由 reader
         # 執行緒送進來的 —— 它一取同一把鎖就死鎖,整個啟動停在那裡。
         self._lock = threading.RLock()
+        # Startup cancellation cannot acquire _lock: start holds it throughout
+        # Popen and the handshake. This short lock only publishes the new proc
+        # and the permanent abort decision, never waits for process or pipe I/O.
+        self._start_guard = threading.Lock()
+        self._start_aborted = threading.Event()
+        self._startup_complete = False
         self._pending_lock = threading.Lock()
         self._stderr_lock = threading.Lock()
         self._write_lock = threading.Lock()
@@ -320,6 +330,24 @@ class McpClient:
         with self._lock:
             self._closed = True
             self._teardown("client closed")
+
+    def abort_start(self) -> bool:
+        """Permanently cancel this client's startup without waiting for its lock.
+
+        Safe before start(), during Popen(), and while initialize/tools/list is
+        waiting. A process returned after cancellation is disposed by _spawn
+        before any handshake. An already initialized instance is unaffected.
+        """
+        with self._start_guard:
+            if self._startup_complete:
+                return False
+            self._start_aborted.set()
+            self._closed = True
+            proc = self._proc
+        self._fail_pending(McpCallCancelledError("MCP startup cancelled"))
+        if proc is not None:
+            _kill_startup(proc)
+        return True
 
     def __enter__(self) -> "McpClient":
         self.start()
@@ -449,6 +477,10 @@ class McpClient:
         return argv
 
     def _spawn(self) -> None:
+        with self._start_guard:
+            if self._start_aborted.is_set() or self._closed:
+                raise McpCallCancelledError("MCP startup cancelled")
+            self._startup_complete = False
         with self._stderr_lock:
             self._stderr_tail = deque()
             self._stderr_bytes = 0
@@ -469,7 +501,13 @@ class McpClient:
         except OSError as exc:
             self._close_stderr_handle()
             raise McpUnavailableError(f"無法啟動 MCP server: {exc}") from exc
-        self._proc = proc
+        with self._start_guard:
+            self._proc = proc
+            aborted = self._start_aborted.is_set()
+        if aborted:
+            _kill_startup(proc)
+            self._teardown("startup cancelled")
+            raise McpCallCancelledError("MCP startup cancelled")
         self._reader = threading.Thread(
             target=self._read_stdout, args=(proc,), name="codetrail-mcp-stdout", daemon=True
         )
@@ -480,6 +518,10 @@ class McpClient:
         self._stderr_reader.start()
         try:
             self._handshake()
+            with self._start_guard:
+                if self._start_aborted.is_set():
+                    raise McpCallCancelledError("MCP startup cancelled")
+                self._startup_complete = True
         except BaseException:
             tail = self.stderr_tail()
             self._teardown("startup failed")
@@ -535,6 +577,8 @@ class McpClient:
         return call.result
 
     def _send(self, message: Mapping[str, Any]) -> None:
+        if self._start_aborted.is_set():
+            raise McpCallCancelledError("MCP startup cancelled")
         payload = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
         proc = self._proc
         if proc is None or proc.stdin is None or proc.poll() is not None:
@@ -668,7 +712,9 @@ class McpClient:
             if self._proc is None:
                 return
             self._teardown(reason)
-            if not self._closed:
+            if not self._restart_on_cancel:
+                self._closed = True
+            if not self._closed and self._restart_on_cancel:
                 with contextlib.suppress(McpClientError):
                     self._spawn()
 
@@ -676,7 +722,8 @@ class McpClient:
         proc = self._proc
         self._proc = None
         if proc is not None:
-            _terminate(proc, self.terminate_grace)
+            grace = min(self.terminate_grace, 0.1) if self._start_aborted.is_set() else self.terminate_grace
+            _terminate(proc, grace)
             for pipe in (proc.stdin, proc.stdout, proc.stderr):
                 with contextlib.suppress(Exception):
                     if pipe is not None:
@@ -700,6 +747,17 @@ class McpClient:
         if handle is not None:
             with contextlib.suppress(Exception):
                 handle.close()
+
+
+def _kill_startup(proc: process_env.Popen) -> None:
+    """Startup has no accepted tools to unwind; stop its private process group.
+
+    No wait here: abort_start is also called on the TUI thread. The startup
+    worker owns wait()/pipe cleanup, including processes published late.
+    """
+    if proc.poll() is None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
 
 
 def _terminate(proc: process_env.Popen, grace: float) -> None:

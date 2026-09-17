@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CodeTrail 只有**一個**主模型 n_ctx。這裡是它的界線與預設。
 
-使用者設一次(`set_config.sh --ctx`,寫進 `deployment.json` 與 server 的 `-c`)。
+使用者在 `set_config.sh` 問答設一次，寫進 `deployment.json` 與 server 的 `-c`。
 runtime 由 `client_preflight` 觀測主 llama-server 的 `/props` 拿實值,再以 argv
 (`mcp_server --n-ctx`)與 `EngineOptions` 交給每一個元件 —— 不經環境變數。
 

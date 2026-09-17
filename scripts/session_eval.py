@@ -965,7 +965,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="replay one curated suite against the currently loaded model")
     run.add_argument("--suite", type=Path, required=True)
     run.add_argument("--candidate-label", required=True, help="private stable label used only in sealed results")
-    run.add_argument("--model", required=True, help="model as aicode -m takes it: registry name or GGUF path (legacy llamacpp/<name> is accepted and stripped); the value is kept verbatim in the result identity")
+    run.add_argument("--model", required=True, help="model for headless replay: registry name or GGUF path (legacy llamacpp/<name> is accepted and stripped); the value is kept verbatim in the result identity")
     run.add_argument("--output-dir", type=Path, default=DEFAULT_PRIVATE_DIR / "runs")
     run.add_argument("--turn-timeout", type=int, default=DEFAULT_TURN_TIMEOUT)
     run.add_argument("--skip-aux-preflight", action="store_true", help="only for suites that cannot call RAG/VL")

@@ -36,6 +36,7 @@ import shutil
 import stat
 import struct
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -178,7 +179,7 @@ def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
 
     home2 = tmp_path / "home2"
     proc = subprocess.run(
-        ["bash", str(SCRIPT), "--skip-deps-check", *llama_bin_args(tmp_path),
+        [sys.executable, str(SCRIPT), "--skip-deps-check", *llama_bin_args(tmp_path),
          "--no-preview", "--models-dir", str(models)],
         cwd=REPO_ROOT,
         env={**build_env(tmp_path), "HOME": str(home2), "USERPROFILE": str(home2)},
@@ -1694,14 +1695,14 @@ def test_profile_emits_cpu_moe_for_main_and_vl_and_rejects_partial_mix(tmp_path)
 
 
 
-def test_generated_start_sh_dry_run_pins_gpus_and_binds_loopback(tmp_path):
+def test_maintenance_dry_run_pins_gpus_and_binds_loopback(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_models(tmp_path)
     assert run(tmp_path, *YES_TWO_GPU, "--no-preview",
                 "--models-dir", str(models)).returncode == 0
 
     proc = subprocess.run(
-        ["bash", str(tmp_path / "home" / "start.sh"), "--dry-run"],
+        [sys.executable, str(REPO_ROOT / "scripts/launch_servers.py"), "--scope", "all", "--dry-run"],
         env=build_env(tmp_path),
         capture_output=True,
         text=True,
@@ -1728,10 +1729,11 @@ def test_generated_start_sh_ends_with_nvidia_smi_reminder(tmp_path):
     content = (tmp_path / "home" / "start.sh").read_text(encoding="utf-8")
     assert "watch -n 1 nvidia-smi" in content
     assert "稍微監控" in content
-    # 提醒在啟動流程之後、只在成功(rc=0)且非 --dry-run 時印出
-    assert 'launch_servers.py --scope all "$@" || rc=$?' in content
-    assert '*" --dry-run "*' in content
-    assert content.index('launch_servers.py --scope all "$@"') < content.index("稍微監控")
+    # 只有零 argv 啟動，提醒在 launch 成功後才顯示。
+    assert 'launch_servers.py --scope all || rc=$?' in content
+    assert 'if [ "$rc" -eq 0 ]' in content
+    assert '"$@"' not in content
+    assert content.index("launch_servers.py --scope all") < content.index("稍微監控")
 
 def test_allow_remote_binds_all_interfaces_with_warning(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
@@ -1746,7 +1748,7 @@ def test_allow_remote_binds_all_interfaces_with_warning(tmp_path):
         assert deployment["services"][role]["bind"] == "all-interfaces"
 
     dry = subprocess.run(
-        ["bash", str(tmp_path / "home" / "start.sh"), "--dry-run"],
+        [sys.executable, str(REPO_ROOT / "scripts/launch_servers.py"), "--scope", "all", "--dry-run"],
         env=build_env(tmp_path),
         capture_output=True,
         text=True,
@@ -1786,7 +1788,7 @@ def test_generated_start_sh_ignores_legacy_shell_overrides(tmp_path):
     env["MAIN_CTX"] = "1234"
     env["AICODE_N_CTX"] = "2048"
     proc = subprocess.run(
-        ["bash", str(tmp_path / "home" / "start.sh"), "--dry-run"],
+        [sys.executable, str(REPO_ROOT / "scripts/launch_servers.py"), "--scope", "all", "--dry-run"],
         env=env,
         capture_output=True,
         text=True,
@@ -1912,39 +1914,21 @@ def test_rerun_preserves_hand_added_sampling_params_and_warns_on_dropped(tmp_pat
     assert "n_cpu_moe" not in parameters
     assert "custom_flag" not in parameters
 
-def test_generated_start_sh_subcommand_guard_and_logs_validation(tmp_path):
+@pytest.mark.smoke
+def test_generated_start_sh_rejects_removed_commands_before_dispatch(tmp_path):
+    """舊 status/logs/help 及所有 flags 必須在啟動前拒絕，不能變成啟動。"""
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_models(tmp_path)
     assert run(tmp_path, *YES_TWO_GPU, "--no-preview",
-                "--models-dir", str(models)).returncode == 0
+               "--models-dir", str(models)).returncode == 0
     start = tmp_path / "home" / "start.sh"
+    for args in (("help",), ("stauts",), ("logs", "gpu"), ("logs", "main"),
+                 ("status",), ("--dry-run",), ("stop", "--force"), ("",)):
+        proc = subprocess.run(["bash", str(start), *args], env=build_env(tmp_path),
+                              capture_output=True, text=True, timeout=30, check=False)
+        assert proc.returncode == 2, (args, proc.stdout, proc.stderr)
+        assert "只接受無參數啟動" in proc.stderr
 
-    def run_start(*args: str):
-        return subprocess.run(
-            ["bash", str(start), *args],
-            env=build_env(tmp_path),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-
-    helped = run_start("help")
-    assert helped.returncode == 0, helped.stderr
-    assert "用法" in helped.stdout
-    assert "logs [role]" in helped.stdout
-
-    typo = run_start("stauts")  # 拼錯不得直接進入啟動流程
-    assert typo.returncode == 2
-    assert "未知子命令" in typo.stderr
-
-    bad_role = run_start("logs", "gpu")
-    assert bad_role.returncode == 2
-    assert "未知 role" in bad_role.stderr
-
-    never_started = run_start("logs", "main")
-    assert never_started.returncode == 1
-    assert "尚未啟動過" in never_started.stderr
 
 def test_restart_subprocess_env_goes_through_process_env(monkeypatch):
     """[R] 自動重啟的 stop/start 子程序走 process_env:CodeTrail 的四個設定前綴
@@ -1992,7 +1976,7 @@ def test_relative_models_dir_and_llama_bin_are_stored_absolute(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_models(tmp_path)
     proc = subprocess.run(
-        ["bash", str(SCRIPT), "--skip-deps-check", "--llama-bin", "./llama-server",
+        [sys.executable, str(SCRIPT), "--skip-deps-check", "--llama-bin", "./llama-server",
          *YES_TWO_GPU, "--no-preview", "--models-dir", "./models"],
         cwd=tmp_path,
         env=build_env(tmp_path),
@@ -2010,51 +1994,23 @@ def test_relative_models_dir_and_llama_bin_are_stored_absolute(tmp_path):
     assert read_deployment(tmp_path)["llama_bin"] == str(tmp_path / "llama-server")
 
 
-def test_logs_accepts_count_and_follow_shorthand(tmp_path):
-    """logs 依說明允許省略 role:logs 3 / logs -f 都要能用;多餘參數不得靜默忽略。"""
-    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
-    models = make_models(tmp_path)
-    assert run(tmp_path, *YES_TWO_GPU, "--no-preview",
-                "--models-dir", str(models)).returncode == 0
-    home = tmp_path / "home"
-    start = home / "start.sh"
-    state = home / ".local" / "state"
-    log_dir = state / "codetrail" / "logs"
-    log_dir.mkdir(parents=True)
-    (log_dir / "main.log").write_text("line1\nline2\n", encoding="utf-8")
-    env = build_env(tmp_path)
-    env["XDG_STATE_HOME"] = str(state)
-
-    def run_start(*args: str, timeout: float = 30):
-        return subprocess.run(
-            ["bash", str(start), *args],
-            env=env, capture_output=True, text=True, timeout=timeout, check=False,
-        )
-
-    shorthand = run_start("logs", "3")   # 省略 role,數字當行數
-    assert shorthand.returncode == 0, shorthand.stderr
-    assert "line2" in shorthand.stdout
-
-    extra = run_start("logs", "main", "5", "x")
-    assert extra.returncode == 2
-    assert "參數過多" in extra.stderr
-
-    still_bad = run_start("logs", "gpu")  # 未知 role 仍要拒絕
-    assert still_bad.returncode == 2
-    assert "未知 role" in still_bad.stderr
-
-    tail_args = tmp_path / "tail_args.txt"
-    fake_tail = tmp_path / "bin" / "tail"
-    fake_tail.write_text(
-        "#!/usr/bin/env bash\n"
-        "printf '%s\\n' \"$@\" > \"$AICODE_TEST_TAIL_ARGS\"\n",
-        encoding="utf-8",
-    )
+@pytest.mark.smoke
+def test_removed_log_shorthands_never_dispatch_tail(tmp_path):
+    """舊 log 簡寫連同額外參數都拒絕，不得默默忽略或呼叫 tail。"""
+    start = tmp_path / "start.sh"
+    start.write_text(sc.render_start_wrapper(), encoding="utf-8")
+    marker = tmp_path / "tail-record"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake_tail = bindir / "tail"
+    fake_tail.write_text(f'#!/usr/bin/env bash\necho called > "{marker}"\n', encoding="utf-8")
     fake_tail.chmod(0o700)
-    env["AICODE_TEST_TAIL_ARGS"] = str(tail_args)
-    follow = run_start("logs", "-f")
-    assert follow.returncode == 0, follow.stderr
-    assert tail_args.read_text(encoding="utf-8").splitlines()[0] == "-f"
+    env = dict(os.environ, PATH=f"{bindir}:{os.environ.get('PATH', '')}")
+    for args in (("logs", "3"), ("logs", "-f"), ("logs", "main", "5", "x"), ("logs", "gpu")):
+        proc = subprocess.run(["bash", str(start), *args], env=env, capture_output=True,
+                              text=True, timeout=30, check=False)
+        assert proc.returncode == 2, (args, proc.stderr)
+    assert not marker.exists()
 
 
 # ── 壓縮模式與 client.json(每條都是 smoke) ──

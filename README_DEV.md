@@ -93,6 +93,54 @@ aicode
 
 ---
 
+## 內部設定與啟動介面
+
+日常入口 `aicode`、`set_config.sh`、`scripts/codetrail-host.sh`、
+`scripts/codetrail-device.sh` 均無參數；`~/start.sh` 只接受空 argv 與單一 `stop`。
+下列 Python argv 供維護、自動化與離線測試 harness 使用，不由 shell wrapper 透傳。
+
+內部非互動設定入口是 `python3 scripts/set_config.py --yes`。它會跳過提問與確認頁，
+但**所有使用者選擇題的值必須由旗標提供，缺哪個就報錯**（`--compaction-mode`
+是唯一的例外，見下方最後一項）：
+
+- 模型 / GPU：`--main-model` / `--main-gpu`、`--embed-model` / `--embed-gpu`、
+  `--rerank-model` / `--rerank-gpu`、`--vl-model` / `--vl-gpu`。模型與 GPU 的編號
+  **都從 1 起算**(GPU 編號 = `nvidia-smi` index + 1;互動選單與每張卡的描述行都會
+  印出對應的 nvidia-smi index)。VL 配對不唯一時再給 `--vl-mmproj`；單一候選、單卡或
+  唯一 mmproj 會自動選用。
+- 數值：`--ctx` 與 `--rerank-ctx`。`--threads` 是非必要的進階旗標；不給就是
+  auto，不寫 `-t`。
+- MoE：main 使用 `--cpu-moe` / `--no-cpu-moe` / `--n-cpu-moe N`；VL 使用
+  `--vl-cpu-moe` / `--no-vl-cpu-moe` / `--vl-n-cpu-moe N`。`N=0` 等同不 offload。
+- 網路：`--allow-remote` 才會開放區網連線；未指定只綁 `127.0.0.1`。
+- 路徑(選填,不給就用預設):`--llama-bin <路徑>` 指定 llama-server 執行檔(會轉成
+  絕對路徑寫進 `deployment.json` 的 `llama_bin`;預設沿用該檔既有的值,再退回
+  `~/llama.cpp/build/bin/llama-server`)、`--models-dir <目錄>` 指定要掃的 GGUF 目錄
+  (預設 `~/models`)。兩個都寫進設定檔,沒有等價的環境變數。
+- 壓縮模式：`--compaction-mode {codetrail,manual,off}`。**這一項不給不會報錯**——
+  沒給時沿用 `~/.config/codetrail/client.json` 記錄的既有選擇，這台機器還沒選過
+  就不寫 `client.json`。理由是「沒有那個檔＝沒有接管」是安全預設：舊的 `--yes`
+  自動化腳本重跑一次，不該因此突然開啟自動壓縮。
+
+重跑**不沿用舊選擇**（唯一例外是上面那條 `--compaction-mode`，它沿用狀態檔記錄的
+模式）；其餘每次設定都來自本次作答 / 旗標。只有你手動加進 `deployment.json` 的取樣
+參數與 port / base_url 會保留。完整旗標見 `python3 scripts/set_config.py --help`。
+
+```bash
+python3 scripts/set_config.py --help
+python3 scripts/launch_servers.py --scope all --dry-run
+python3 scripts/check_status.py --strict
+python3 scripts/stop_servers.py --scope aux
+python3 scripts/launch_servers.py --scope aux
+python3 scripts/launch_servers.py --scope all --keep-on-failure
+```
+
+`--health-timeout N` 屬於 launcher；`--timeout N` 屬於 stop。所有值仍由
+部署檔、repo 常數或明示 argv 決定，不讀 shell 的模型設定。
+測試 harness 直接呼叫 `scripts/set_config.py`，避免將舊公開旗標重新放回 wrapper。
+
+---
+
 ## 測試指南
 
 測試在 2026-09 依主題合併成 35 個檔（原本 95 個）；一個檔 = 一個被測主題，檔頭
@@ -776,7 +824,7 @@ llama-server 啟動時 `-c <N>` 已經把 ctx + KV cache 鎖死,所以 doctor / 
 | 模組 / 入口 | 責任 |
 |---|---|
 | `gpu_safety.py` | 純 library:`query_gpu_info()` 跑 nvidia-smi 拿 GPU info(純診斷)、`query_server_info()` 打 llama-server `/props` 抓 `default_generation_settings.n_ctx` + `model_path`、`check_safety(requested_ctx, base_url)` 比對後包成 `SafetyVerdict`。所有 I/O 都用 hook 參數注入,測試可完全離線 mock。 |
-| `n_ctx.py` / `config.py::N_CTX` | 主模型 n_ctx 的界線與靜態預設。設定入口是 `set_config.sh --ctx`(寫進 deployment profile 與 server 的 `-c`)。`NUM_CTX` / `NUM_CTX_FULL_MODE` / `DYNAMIC_NUM_CTX_MAX` 只是相容 alias,永遠等於 `N_CTX` —— `config.set_runtime_n_ctx()` 是**同時**改這四個名字的唯一入口。 |
+| `n_ctx.py` / `config.py::N_CTX` | 主模型 n_ctx 的界線與靜態預設。設定入口是 `python3 scripts/set_config.py --ctx`(寫進 deployment profile 與 server 的 `-c`)。`NUM_CTX` / `NUM_CTX_FULL_MODE` / `DYNAMIC_NUM_CTX_MAX` 只是相容 alias,永遠等於 `N_CTX` —— `config.set_runtime_n_ctx()` 是**同時**改這四個名字的唯一入口。 |
 | `client_preflight.observe_n_ctx()` | TUI 與 headless `run` 都必須從主 server 的 `/props` 讀到正整數 n_ctx；失敗就拒絕啟動模型回合。相同值以 **argv**(`mcp_server --n-ctx`)與 `EngineOptions` 交給每一個元件，不經環境變數、不改用 profile 容量。 |
 | `client_preflight.check_ctx_safety()` | 容量閘。以觀測到的 requested 呼 `gpu_safety.check_safety()`;`requested <= server n_ctx` 放行,只有 `>` 才 `PreflightError`。**沒有逃生口**:以前的 `AICODE_ACCEPT_CTX_RISK` / `AICODE_CTX_SAFETY_DISABLE` 已刪除且無替代。 |
 | `context_budget.py::_emit_runtime_offload_check_once` | runtime 觀測 hook:`[CTX] WARNING` 或 `[CTX_OVERFLOW]` 觸發時順手查一次 `/slots` + `/props`,把 server 真實 n_ctx / 忙碌 slot 數 黏在 log 後面。每個 process 只跑一次,任何錯誤靜默吞掉。 |

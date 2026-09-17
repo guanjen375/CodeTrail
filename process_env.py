@@ -15,7 +15,10 @@ CodeTrail 的設定只來自檔案(`config.py` 常數、`deployment.json` / `mod
 from __future__ import annotations
 
 import os
+import selectors
 import subprocess as _subprocess
+import time
+from collections.abc import Callable, Sequence
 from typing import Any, Mapping
 
 #: 呼叫端需要的 subprocess 型別 / 常數從這裡拿(`process_env.PIPE`、`process_env.TimeoutExpired` …),
@@ -125,3 +128,198 @@ def check_output(args, *, overrides: Mapping[str, str] | None = None, **kwargs: 
     """`subprocess.check_output` 的唯一入口:環境永遠是 `child_env(overrides)`。"""
     _reject_env(kwargs)
     return _subprocess.check_output(args, env=child_env(overrides), **kwargs)
+
+
+class ReviewGitError(RuntimeError):
+    """A review plumbing command exceeded its bounds or could not run safely."""
+
+
+class ReviewGitCancelled(ReviewGitError):
+    """A review plumbing command was cancelled and reaped."""
+
+
+def review_git_env() -> dict[str, str]:
+    """Isolate review's raw Git plumbing without changing ordinary child processes."""
+    env = {key: value for key, value in child_env().items() if not key.startswith("GIT_")}
+    env.update({
+        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.devnull, "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0",
+        "GIT_NO_LAZY_FETCH": "1", "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_PAGER": "cat", "LC_ALL": "C",
+    })
+    return env
+
+
+def review_git_default_ignore() -> str:
+    """The standard per-user ignore location, used only for a bounded safe read."""
+    env = child_env()
+    base = env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME", ""), ".config")
+    if not os.path.isabs(base):
+        raise ReviewGitError("Git user configuration requires an absolute HOME/XDG_CONFIG_HOME")
+    return os.path.join(base, "git", "ignore")
+
+
+def review_git_global_config_paths() -> tuple[str, str]:
+    """Git's default user paths, without asking Git to read their contents first.
+
+    git_global_config_paths() reads XDG config before ~/.gitconfig. Ambient
+    GIT_CONFIG_* overrides remain excluded from review's source selection.
+    """
+    env = child_env()
+    user_home = env.get("HOME", "")
+    config_base = env.get("XDG_CONFIG_HOME") or os.path.join(user_home, ".config")
+    if not os.path.isabs(user_home) or not os.path.isabs(config_base):
+        raise ReviewGitError("Git user configuration requires an absolute HOME/XDG_CONFIG_HOME")
+    return os.path.join(config_base, "git", "config"), os.path.join(user_home, ".gitconfig")
+
+
+def review_git_default_attributes() -> str:
+    """Default user attributes path; configured overrides are parsed by the caller."""
+    config_path, _ = review_git_global_config_paths()
+    return os.path.join(os.path.dirname(config_path), "attributes")
+
+
+def review_git_expand_config_path(value: str, root: str) -> str:
+    """Expand only Git's ordinary ~/ and relative config paths; reject ~otheruser."""
+    if value.startswith("~/"):
+        base = child_env().get("HOME", "")
+        if not os.path.isabs(base):
+            raise ReviewGitError("Git configuration requires an absolute HOME")
+        return os.path.join(base, value[2:])
+    if value.startswith("~") or value.startswith("%(prefix)"):
+        raise ReviewGitError("unsupported Git configuration path expansion")
+    return os.path.abspath(os.path.join(root, value))
+
+
+def review_git(
+    args: Sequence[str], *, cwd: str, git_dir: str, work_tree: str,
+    cancelled: Callable[[], bool], timeout: float, max_output: int,
+    input_bytes: bytes = b"",
+    common_dir: str | None = None, pass_fds: tuple[int, ...] = (),
+) -> CompletedProcess:
+    """Run bounded read-only plumbing; drain both pipes and reap on every exit.
+
+    No diff/status/filter commands are accepted. Callers supply only validated
+    object IDs or NUL-delimited path data. Local config remains available for
+    text normalization, but executable helpers and ambient Git routing do not.
+    """
+    if not args or not all(isinstance(arg, str) for arg in args):
+        raise ReviewGitError("review requires string plumbing arguments")
+    command = tuple(args)
+    fixed = {
+        ("rev-parse", "--verify", "--quiet", "HEAD"),
+        ("symbolic-ref", "--quiet", "HEAD"),
+        ("ls-files", "--stage", "-z"),
+        ("ls-files", "--others", "--exclude-standard", "-z"),
+        ("config", "--null", "--list", "--includes"),
+        ("config", "--null", "--local", "--list", "--includes"),
+        ("config", "--null", "--file", "-", "--list", "--no-includes"),
+        ("check-attr", "-z", "--stdin", "text", "eol", "filter", "ident", "working-tree-encoding"),
+    }
+    path_query = command in {("var", "GIT_CONFIG_SYSTEM"), ("var", "GIT_ATTR_SYSTEM")}
+    oid = bool(command and len(command[-1]) in (40, 64) and all(char in "0123456789abcdef" for char in command[-1]))
+    variable = (
+        len(command) == 4 and command[:3] == ("ls-tree", "-rz", "--full-tree") and oid
+    ) or (
+        len(command) == 3 and command[:2] in (("cat-file", "-s"), ("cat-file", "blob")) and oid
+    ) or (
+        len(command) == 4 and command[:3] == ("show-ref", "--verify", "--quiet")
+        and command[-1].startswith("refs/heads/") and not any(char in command[-1] for char in "\0\r\n")
+    )
+    if command not in fixed and not variable and not path_query:
+        raise ReviewGitError("review requires a fixed read-only Git plumbing command")
+    if timeout <= 0 or max_output <= 0 or len(input_bytes) > max_output:
+        raise ReviewGitError("invalid review Git resource bounds")
+    if cancelled():
+        raise ReviewGitCancelled("review cancelled before Git start")
+    argv = [
+        "git", "--no-pager", "--no-optional-locks", "--literal-pathspecs",
+        f"--git-dir={git_dir}", f"--work-tree={work_tree}",
+        "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull,
+        "-c", "core.pager=cat", "-c", "protocol.allow=never",
+        "-c", "protocol.file.allow=never", "-c", "protocol.http.allow=never",
+        "-c", "protocol.https.allow=never", "-c", "protocol.ssh.allow=never",
+        "-c", "protocol.git.allow=never", "-c", "protocol.ext.allow=never",
+    ]
+    if not path_query:
+        argv.extend(("-c", "core.attributesFile=" + os.devnull, "-c", "core.excludesFile=" + os.devnull))
+    argv.extend(args)
+    env = review_git_env()
+    if command == ("var", "GIT_CONFIG_SYSTEM"):
+        # Git has no path-only query for its compiled system config location:
+        # `var` parses system config before returning it. Keep that existing
+        # discovery bounded and keep user-global config disabled throughout.
+        # Removing these two keys only is necessary for the compiled path to
+        # remain visible. Repository metadata is prevalidated by the caller.
+        env.pop("GIT_CONFIG_SYSTEM", None)
+        env.pop("GIT_CONFIG_NOSYSTEM", None)
+    elif command == ("var", "GIT_ATTR_SYSTEM"):
+        # Attribute discovery needs only this switch; both configuration scopes
+        # remain isolated. User paths are obtained without spawning Git at all.
+        env.pop("GIT_ATTR_NOSYSTEM", None)
+    if common_dir is not None:
+        env["GIT_COMMON_DIR"] = common_dir
+    proc = _subprocess.Popen(argv, cwd=cwd, env=env, stdin=PIPE,
+                             stdout=PIPE, stderr=PIPE, close_fds=True, pass_fds=pass_fds)
+    selector = selectors.DefaultSelector()
+    stdout, stderr = bytearray(), bytearray()
+    deadline = time.monotonic() + timeout
+    offset = 0
+    try:
+        for pipe, kind in ((proc.stdout, "out"), (proc.stderr, "err")):
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ, kind)
+        if input_bytes:
+            os.set_blocking(proc.stdin.fileno(), False)
+            selector.register(proc.stdin, selectors.EVENT_WRITE, "in")
+        else:
+            proc.stdin.close()
+        while selector.get_map():
+            if cancelled():
+                raise ReviewGitCancelled("review cancelled during Git collection")
+            if time.monotonic() >= deadline:
+                raise ReviewGitError("review Git collection timed out")
+            for key, _ in selector.select(min(0.05, max(0, deadline - time.monotonic()))):
+                if key.data == "in":
+                    try:
+                        offset += os.write(key.fd, input_bytes[offset:offset + 65536])
+                    except BlockingIOError:
+                        continue
+                    except BrokenPipeError:
+                        offset = len(input_bytes)
+                    if offset == len(input_bytes):
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                    continue
+                try:
+                    chunk = os.read(key.fd, 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                else:
+                    (stdout if key.data == "out" else stderr).extend(chunk)
+                    if len(stdout) + len(stderr) > max_output:
+                        raise ReviewGitError("review Git output exceeds the collection limit")
+        while proc.poll() is None:
+            if cancelled():
+                raise ReviewGitCancelled("review cancelled while waiting for Git")
+            if time.monotonic() >= deadline:
+                raise ReviewGitError("review Git collection timed out")
+            try:
+                proc.wait(timeout=min(0.05, max(0.001, deadline - time.monotonic())))
+            except TimeoutExpired:
+                pass
+        if cancelled():
+            raise ReviewGitCancelled("review cancelled after Git collection")
+        return CompletedProcess(argv, proc.returncode, bytes(stdout), bytes(stderr))
+    finally:
+        selector.close()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None and not pipe.closed:
+                pipe.close()
