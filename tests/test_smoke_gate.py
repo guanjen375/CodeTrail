@@ -41,9 +41,11 @@ TESTS_DIR = Path(__file__).resolve().parent
 SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     "test_allow_directory_regression.py": (
         "/allow add 目錄必須寫入 client.json，讓同一 MCP instance 立即執行該目錄工具；"
-        "list 顯示內建與目錄授權，管理操作不進模型歷史",
+        "list 顯示內建與目錄授權，管理操作不進模型歷史；帶路徑或 shell 語法的呼叫仍拒絕且不 spawn，"
+        "但拒絕訊息指回裸名稱並列出已授權工具",
         (
             "test_allow_add_directory_reaches_running_mcp_without_restart",
+            "test_rejected_tool_path_names_bare_tool_grants_and_shell_limits",
         ),
     ),
     "test_allow_directory_runtime.py": (

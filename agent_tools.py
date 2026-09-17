@@ -452,6 +452,52 @@ def _collect_within_budget(lines) -> tuple[list, bool]:
     return out, False
 
 
+# run_command 以 shell=False 執行；拒絕提示與危險字元檢查共用同一份清單。
+_SHELL_PATTERNS = ('$(', '`', '&&', '||', ';', '|', '>', '<')
+_NO_SHELL_HINT = (
+    "run_command 不經 shell：不支援 " + "、".join(_SHELL_PATTERNS)
+    + " 等語法；請用工具自己的參數限制輸出。"
+)
+MAX_GRANTED_LISTING_CHARS = 2000
+
+
+def _command_rejection(cmd_parts: list, extra_names: list, directory_commands: dict) -> str:
+    """拒絕訊息只給修正方向：帶路徑的授權工具指回裸名稱，但不以路徑或 basename 放行。
+
+    實際 session:/allow add 之後模型仍送 `MetaWare/arc/bin/llvm-objdump ... | head`,
+    舊訊息只列前 8 個內建前綴，模型便回報「白名單仍不允許」。
+    """
+    builtins = list(config.ALLOWED_COMMANDS)
+    granted = sorted({*extra_names, *directory_commands})
+    lines = ["錯誤: 不允許的命令。"]
+    base = cmd_parts[0].rsplit("/", 1)[-1]
+    known = {*granted, *(entry.split()[0] for entry in builtins if entry.split())}
+    if "/" in cmd_parts[0] and base in known:
+        lines.append(f"命令不可帶路徑：請改用裸名稱 {base} 呼叫（server 只執行已驗證的授權路徑）。")
+    if any(pattern in part for part in cmd_parts for pattern in _SHELL_PATTERNS):
+        lines.append(_NO_SHELL_HINT)
+    if granted:
+        shown, used = [], 0
+        for name in granted:
+            if used + len(name) + 2 > MAX_GRANTED_LISTING_CHARS:
+                break
+            shown.append(name)
+            used += len(name) + 2
+        hidden = len(granted) - len(shown)
+        lines.append(
+            "已授權工具（以裸名稱呼叫）: " + ", ".join(shown)
+            + (f" …（共 {len(granted)} 個，{hidden} 個未列出）" if hidden else "")
+        )
+    lines.append(
+        "允許的命令前綴: " + ", ".join(builtins[:8]) + ("..." if len(builtins) > 8 else "")
+    )
+    lines.append(
+        "自訂工具可由使用者以 /allow add <絕對目錄> 授權；"
+        "既有 client.json 的 extra_allowed_commands 裸名稱仍相容。"
+    )
+    return "\n".join(lines)
+
+
 class ToolExecutor:
     def __init__(
         self, root: str, *,
@@ -871,19 +917,13 @@ class ToolExecutor:
                 break
 
         if not is_allowed:
-            allowed_list = ', '.join(allowed_commands[:8])
-            return False, (
-                f"錯誤: 不允許的命令。\n允許的命令前綴: {allowed_list}...\n"
-                "自訂工具可由使用者以 /allow add <絕對目錄> 授權；"
-                "既有 client.json 的 extra_allowed_commands 裸名稱仍相容。"
-            ), []
+            return False, _command_rejection(cmd_parts, extra_names, inspection.commands), []
 
         # 額外安全檢查：危險字元
-        dangerous_patterns = ['$(', '`', '&&', '||', ';', '|', '>', '<']
         for part in cmd_parts:
-            for pattern in dangerous_patterns:
+            for pattern in _SHELL_PATTERNS:
                 if pattern in part:
-                    return False, f"錯誤: 參數包含不允許的字元 '{pattern}'", []
+                    return False, f"錯誤: 參數包含不允許的字元 '{pattern}'\n{_NO_SHELL_HINT}", []
 
         # Path containment：白名單命令的參數不能逃出 AICODE_ROOT。
         # 阻擋 `pytest /tmp/x.py`、`make -C /tmp`、`cmake --build /abs/build` 之類。
