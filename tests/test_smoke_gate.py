@@ -253,10 +253,33 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_approval_message_editor_never_answers_the_tool_and_preserves_unsent_draft",
         ),
     ),
+    "test_strict_query_language.py": (
+        "顯式 strict 不因語言降級；英文數值略過擴寫但仍守 content-only/verification 閘與依賴失敗",
+        (
+            "test_english_numeric_query_skips_expansion_without_hiding_dependency_failure",
+            "test_explicit_strict_answers_verified_evidence_when_automatic_grounding_is_off",
+            "test_explicit_strict_refuses_unverified_weak_or_missing_evidence",
+            "test_english_numeric_lexical_recall_still_requires_verification_and_grounding",
+        ),
+    ),
+    "test_pdf_real_regressions.py": (
+        "圖面候選缺席不可冒稱正文缺席；表格空白列須有幾何及無墨跡證據、未知與真漏列仍拒絕",
+        (
+            "test_deferred_native_prose_is_not_reported_missing",
+            "test_pdf_absence_guidance_uses_exposed_tool",
+            "test_native_table_blank_anchor_rows_do_not_require_repair",
+            "test_nonempty_or_unknown_anchor_rows_still_block_verification",
+            "test_recovered_cross_page_header_keeps_source_row_mapping",
+            "test_table_grid_rules_are_distinguished_from_vector_content",
+            "test_blank_row_mapping_preserves_rowspan_source_identity",
+            "test_table_harvest_keeps_unknown_cells_and_summary_uses_committed_text",
+        ),
+    ),
     "test_text_table_review.py": (
         "可信表格literal與OCR覆核版本、來源、CAS、strict/section合併邊界不可失真",
         (
             "test_exact_table_lookup_never_loads_models_and_preserves_literal_provenance",
+            "test_table_document_alias_resolves_current_source_without_widening",
             "test_table_lookup_never_returns_ambiguous_or_unverified_values",
             "test_evidence_reader_rejects_unsafe_metadata",
             "test_text_confirmation_is_bound_to_content_source_and_quality",
@@ -329,6 +352,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "public工具的target、literal value、OCR未知證據與readOnly/ASK/busy邊界不能在adapter丟失",
         (
             "test_exact_table_budget_never_exposes_a_shortened_cell_value",
+            "test_table_scope_and_recovery_reach_model_text_without_widening",
             "test_text_review_json_error_is_not_reported_as_success",
             "test_ocr_exclusion_and_build_unknown_reach_the_model_text_lane",
             "test_every_public_code_mode_uses_the_selected_build_context",
@@ -706,6 +730,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "殘留的網頁 backend 只唯讀偵測",
         (
             "test_explicit_gate_and_implicit_diagnostic_are_separate",
+            "test_canary_timeout_is_unverified_not_a_proven_contract_failure",
             "test_fingerprint_covers_live_protocol_template_build_and_prompt",
             "test_fingerprint_changes_with_project_instructions",
             "test_run_model_attempt_passes_explicit_model_and_ignores_private_output",
@@ -968,6 +993,10 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_cancelling_an_exact_count_prevents_later_generation",
             "test_candidate_context_count_uses_its_own_projection_without_installing_it",
             "test_load_session_leaves_the_engine_untouched_and_adopt_switches_atomically",
+            "test_cancelled_turn_survives_resume_summary_and_export",
+            "test_cancelled_supplements_are_terminal_for_compaction",
+            "test_cancellation_record_failure_is_visible_and_never_creates_an_answer",
+            "test_invalid_cancellation_record_cannot_half_switch_a_session",
             "test_the_snapshot_model_history_is_compacted_while_the_transcript_keeps_the_originals",
             "test_a_web_style_cancel_after_a_failed_turn_is_refused",
             "test_a_cancel_during_the_max_step_wrap_up_records_nothing",
@@ -1518,6 +1547,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "不得悄悄換成 PATH 上另一顆(manifest 宣稱的 build 出處會是別顆的)",
         (
             "test_every_direct_model_request_in_the_routing_eval_uses_the_normalised_model",
+            "test_build_target_trace_snapshots_use_index_hash_identity",
             "test_the_routing_eval_child_environment_is_stripped",
             "test_catalog_summary_keeps_input_cost_separate_from_ui_payload",
             "test_routing_catalog_requires_the_public_tool_contract",

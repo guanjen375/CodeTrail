@@ -217,17 +217,20 @@ def test_mineru_exclusion_survives_every_mcp_query_return(tmp_path, monkeypatch,
                  "text_lane": "mineru", "reason": "mineru_text_not_independently_verified"}]
     metadata = {"refs": [], "top_score": 0.0, "top_emb_score": 0.0,
                 "has_ref": False, "excluded_figures": [], "excluded_text": excluded}
+    context = "" if route == "no_context" else "reference"
     monkeypatch.setattr(mcp, "KB", SimpleNamespace(
-        loaded=route != "not_loaded", query=lambda *a, **kw: ("reference", "", metadata)))
+        loaded=route != "not_loaded", query=lambda *a, **kw: (context, "", metadata)))
     monkeypatch.setattr(mcp, "_ensure_kb_fresh", lambda: None)
     monkeypatch.setattr(mcp, "_record_kb_interaction", lambda **kw: None)
-    monkeypatch.setattr(mcp, "should_refuse_answer", lambda *a: route == "refused")
+    monkeypatch.setattr(mcp, "should_refuse_answer", lambda *a, **kw: route == "refused")
     monkeypatch.setattr(mcp, "needs_grounding", lambda *a: (True, "numeric"))
-    monkeypatch.setattr(mcp, "should_use_strict_mode", lambda *a: route == "answered")
     monkeypatch.setattr(mcp, "answer_with_self_check", lambda *a, **kw: "answer")
     result = tool_fn(mcp, "query_knowledge" if route == "normal" else
                      "query_knowledge_strict")("question")
     assert result["excluded_text"] == ([] if route == "not_loaded" else excluded)
+    if route == "no_context":
+        assert result["reason"] == "no_kb_ctx"
+        assert result["refused"] is True
 
 
 def test_mineru_preloaded_artifact_cannot_bind_another_same_named_pdf(tmp_path, monkeypatch):

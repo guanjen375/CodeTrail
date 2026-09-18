@@ -226,7 +226,7 @@ class HistoryEntry:
     """要貼回畫面的一則。"""
 
     kind: Literal[
-        "user", "summary", "assistant", "assistant_error", "reasoning", "tool", "tool_orphan"
+        "user", "summary", "assistant", "assistant_error", "reasoning", "tool", "tool_orphan", "cancelled"
     ]
     text: str = ""
     tool: str = ""
@@ -278,6 +278,10 @@ def history_entries(transcript: Sequence[Mapping[str, Any]]) -> list[HistoryEntr
     entries: list[HistoryEntry] = []
     open_calls: dict[str, int] = {}
     for record in transcript:
+        if record.get("type") == "turn_cancelled":
+            open_calls = {}
+            entries.append(HistoryEntry(kind="cancelled", text="這一輪已取消；原始訊息保留。"))
+            continue
         if record.get("type") == "compaction":
             open_calls = {}
             summary = record.get("summary")
@@ -997,6 +1001,8 @@ class CodeTrailApp(App[int]):
         for entry in entries:
             if entry.kind == "user":
                 widgets.append(UserMessage(entry.text))
+            elif entry.kind == "cancelled":
+                widgets.append(ErrorLine(entry.text))
             elif entry.kind == "summary":
                 widgets.append(SummaryBlock(entry.text, dropped=entry.dropped, kept=entry.kept))
             elif entry.kind == "reasoning":

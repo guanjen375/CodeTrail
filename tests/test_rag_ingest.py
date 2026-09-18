@@ -260,7 +260,9 @@ def test_mixed_pdf_text_chunks_unchanged_and_pictures_are_absent(monkeypatch, ca
     assert not _figure_chunks(document.chunks), "沒有自由文字 lane 了"
     absent = getattr(document, RAG._ABSENT_ATTR, None)
     assert any(item["page"] == 2 for item in absent or []), absent
-    assert "沒有進知識庫" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "結構化圖面沒有進知識庫" in out
+    assert "查詢時不會出現" not in out, "原生正文已保留，圖面缺席不能宣稱正文查不到"
 
 
 # ============================================================
@@ -325,7 +327,8 @@ def test_real_pymupdf4llm_contract(tmp_path: Path, capsys, monkeypatch):
         "偵測不到圖表示 page_boxes schema 又變了")
     assert all(str(item["reason"]).startswith("structured_lane_inactive")
                for item in absent), absent
-    assert "沒有進知識庫" in out
+    assert "結構化圖面沒有進知識庫" in out
+    assert "查詢時不會出現" not in out, "圖面 lane 停用不代表原生正文缺席"
     assert "[WARN]" not in out
 
 
@@ -818,7 +821,8 @@ def test_structured_lane_absence_is_reported_not_described(tmp_path: Path, capsy
     assert any(item["page"] == 1 and
                str(item["reason"]).startswith("structured_lane_inactive")
                for item in absent), absent
-    assert "沒有進知識庫" in out, out
+    assert "結構化圖面沒有進知識庫" in out, out
+    assert "查詢時不會出現" not in out, "圖面缺席帳不能否認已抽出的 native 正文"
 
 
 @pytest.mark.smoke

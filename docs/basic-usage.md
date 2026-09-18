@@ -35,6 +35,9 @@ aicode
 - `IMPLICIT ... status=optimal|suboptimal|fail|timeout`：未點名工具的自主 routing 診斷。
   `optimal` 是理想結果，其餘三態會警告，但四態都不擋啟動。
 
+explicit 逾時仍拒絕啟動，但只表示時限內未完成驗證，不能據此判定工具契約損壞。
+先檢查模型忙碌、單 slot 等待或處理緩慢；implicit 的 `timeout` 同樣表示診斷未完成。
+
 explicit 與 implicit 使用分離的 cache lane；模型／設定／live catalog／客戶端檔案／system
 prompt／專案 AGENTS 或 server `/props` 改變都會換 fingerprint。需要讀專案外附件時看「夾帶附件」；
 若 TUI 內後續某一輪仍異常，再用 `/status`(模型、context、壓縮模式與 session 位置)與
@@ -228,7 +231,7 @@ ASCII/CJK token 代理估算，再套各工具 safety cap；已不再是固定 1
 
 PDF 裡的**表格 / 終端機畫面**（datasheet、register map、log）多的話，先估成本再入庫，
 最後覆核。preflight 是零寫入的，而且涵蓋所有會被送出去的候選（沒被收成候選的區域不會
-被送，改在「不會進 KB 的頁 / 區域」那一段逐筆列出）：
+被送，改在「預計未收為結構化圖面的頁 / 區域」那一段逐筆列出）：
 
 ```text
 請用工具 ingest_document 匯入 docs/datasheet.pdf，preflight_only 設 True，

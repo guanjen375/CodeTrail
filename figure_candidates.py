@@ -696,7 +696,8 @@ def _table_entry(table, strategy: str, ordinal: int) -> dict:
 
     extract_raw = None
     try:
-        extract_raw = [[("" if v is None else str(v)) for v in row] for row in table.extract()]
+        # None is an unknown/merged cell, not evidence of an empty separator row.
+        extract_raw = [[(None if v is None else str(v)) for v in row] for row in table.extract()]
     except Exception as exc:  # noqa: BLE001
         errors.append(f"extract:{_slug(exc)}")
 
@@ -762,6 +763,48 @@ def _harvest_image_info(page) -> list[dict]:
     return entries
 
 
+def _drawing_ink_evidence(drawings: list) -> list[dict]:
+    """Preserve stroke primitives so a verifier can distinguish grid rules from ink.
+
+    An unsupported/filled path retains its entire bbox as possible content. Bounds
+    alone cannot prove that a rectangular path contains only table borders.
+    """
+    result = []
+    for drawing in drawings:
+        if not isinstance(drawing, dict):
+            result.append({"bbox": None, "segments": []})
+            continue
+        box = _rect_of(drawing.get("rect"), thin=True)
+        segments = []
+        width = _finite(drawing.get("width", 1))
+        items = drawing.get("items")
+        supported = (drawing.get("fill") is None and drawing.get("color") is not None
+                     and width is not None and 0 <= width <= RULED_LINE_MAX_THICK_PT
+                     and isinstance(items, (list, tuple)) and 0 < len(items) <= MAX_RAW_DRAWINGS_PER_PAGE)
+        if supported:
+            try:
+                for item in items:
+                    if item[0] == "l":
+                        start, end = tuple(item[1]), tuple(item[2])
+                        values = (*start, *end)
+                        if len(values) != 4 or any(_finite(v) is None for v in values):
+                            raise ValueError("invalid line")
+                        segments.append(list(values))
+                    elif item[0] == "re":
+                        rect = _rect_of(item[1], thin=True)
+                        if rect is None:
+                            raise ValueError("invalid rectangle")
+                        x0, y0, x1, y1 = rect
+                        segments.extend([[x0, y0, x1, y0], [x1, y0, x1, y1],
+                                         [x1, y1, x0, y1], [x0, y1, x0, y0]])
+                    else:
+                        raise ValueError("non-rule path")
+            except (IndexError, TypeError, ValueError):
+                segments = []
+        result.append({"bbox": list(box) if box is not None else None, "segments": segments})
+    return result
+
+
 def _harvest_overlays(page, unavailable: list[str]) -> dict:
     """annotation / widget 幾何——純 raster 判定必須排除它們。
 
@@ -819,6 +862,7 @@ def harvest_page_evidence(page_info: dict, *, pdf_doc=None, page_index: int | No
     tables: dict[str, list] = {name: [] for name in _TABLE_STRATEGIES}
     clusters: list[tuple] = []
     drawing_rects: list[tuple] = []
+    drawing_ink = None
     overlays: dict = {"annots": [], "widgets": []}
     page_rect: tuple = (0.0, 0.0, 0.0, 0.0)
     rotation = 0
@@ -864,6 +908,7 @@ def harvest_page_evidence(page_info: dict, *, pdf_doc=None, page_index: int | No
             unavailable.append("drawings:too_many_items")
             raw_drawings = None
         if raw_drawings is not None:
+            drawing_ink = _drawing_ink_evidence(raw_drawings)
             drawing_rects = [
                 box for box in (_rect_of(d.get("rect"), thin=True)
                                 for d in raw_drawings if isinstance(d, dict))
@@ -887,6 +932,8 @@ def harvest_page_evidence(page_info: dict, *, pdf_doc=None, page_index: int | No
                 unavailable.append("find_tables:empty_on_rotated_page")
 
     overlays["drawing_rects"] = drawing_rects
+    if drawing_ink is not None:
+        overlays["drawing_ink"] = drawing_ink
 
     fallback: dict = {}
     text_chars = len(raw_markdown.strip())
@@ -3145,10 +3192,11 @@ def plan_document_figures(file_path: str, pages: list[dict], *, root: str | Path
 
         # ── 缺席帳（`deferred_regions` 只是 planner 的 disposition，不是交接保證）──
         # 2026-08-30 之後 structured lane 是**唯一**的圖面 lane：沒被收成候選的區域
-        # 就是不會進 KB。所以「夠大、又沒有任何 admitted 候選覆蓋」的 defer 一律列帳，
+        # 就是不會以 figure 收錄（不代表 native 正文缺席）。「夠大、又沒有任何
+        # admitted 候選覆蓋」的 defer 一律列帳，
         # 不再只看 `image_info:raster`（那個窄口徑是 legacy lane 只讀 page_boxes 時代的
         # 產物）。`unconsumed_raster` 保留原本的窄口徑語義供既有報告/測試使用，
-        # `absent_regions` 才是「這一份 PDF 少了什麼」的完整清單。
+        # `absent_regions` 保留圖面 admission 的完整清單，不能當作正文覆蓋證明。
         admitted_boxes: dict[int, list] = {}
         for candidate in candidates:
             admitted_boxes.setdefault(candidate.page, []).append(candidate.bbox)
@@ -3292,8 +3340,8 @@ def format_preflight_report(plan: FigurePlan) -> str:
         lines.append(f"  未收為候選的區域：{len(deferred)}（{detail}）")
     absent = stats.get("absent_regions") or []
     if absent:
-        # structured lane 是唯一的圖面 lane，所以這一段就是「這份 PDF 會少掉什麼」。
-        lines.append(f"  不會進 KB 的頁 / 區域（缺席）：{len(absent)}")
+        lines.append(f"  預計未收為結構化圖面的頁 / 區域：{len(absent)}"
+                     "（尚未入庫；原生正文是否收錄未知，不能由候選缺席推論）")
         for entry in absent:
             where = f"bbox={entry['bbox']}" if entry.get("bbox") else "整頁"
             lines.append(f"    第 {entry['page']} 頁 {where}"

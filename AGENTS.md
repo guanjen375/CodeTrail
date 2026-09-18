@@ -139,6 +139,9 @@
   chunk 看一次旗標、進行中的 MCP 呼叫要用 `begin_call` 登記給 `cancel()` 走完整取消契約
   (一步到位的 `call()` 只有 KeyboardInterrupt 一條路);中斷**不是答案**——歷史不得多出
   assistant 訊息,懸空的 tool_call 由 `run_tool_loop` 的 heal 補上「已中斷」結果;
+  取消狀態以 append-only 記錄綁定真實 user 的穩定身分（含已接收 supplement），
+  原文不變；送模／預熱／摘要共用取消表示，重播與私人評測不得丟失狀態。
+  已取消回合屬已結束，未標記的未答回合仍保護；取消不是摘要器可恢復的待辦；
   中斷後仍要送終結 `step_finish(reason=cancelled)`,否則看終結事件收工的一端永遠停在那裡
 - `client_progress` / `client_engine` 的工具收斂——依本輪實際重新執行的工具結果判斷，
   不用跨輪負快取遮蔽新證據；近似 grep 只合併同範圍、同完整來源內容的查詢，

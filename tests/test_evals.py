@@ -2442,6 +2442,72 @@ def test_the_kb_snapshot_is_the_loaded_generation_not_the_disk_version(tmp_path,
 
 
 @pytest.mark.smoke
+def test_build_target_trace_snapshots_use_index_hash_identity(tmp_path, monkeypatch):
+    """Real target traces compared SHA-256 to legacy MD5 and marked unchanged files stale."""
+    import hashlib
+    from types import SimpleNamespace
+    import code_rag
+
+    data_flywheel, project = _flywheel(tmp_path, monkeypatch)
+    monkeypatch.setattr(code_rag, "USE_RERANKER", False)
+    collector = data_flywheel.DataCollector(root=str(project))
+    source = project / "boot.py"
+    extra = project / "config.py"
+    for target in (True, False):
+        for large in (False, True):
+            original = b"def boot_init():\n    return 37\n"
+            if large:
+                original += b"# filler\n" * (code_rag.CONTENT_HASH_MAX_BYTES // 9 + 1)
+            source.write_bytes(original)
+            extra.write_bytes(b"QA_DELAY_MS = 37\n")
+            rag = code_rag.CodeRAG(str(project))
+            if target:
+                rag.build_context = SimpleNamespace(
+                    dependencies={p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                                  for p in (source, extra)},
+                    assert_fresh=lambda: None, parser_language=lambda _path: "python")
+            rag._indexed_file_hashes = {p.name: rag._compute_file_hash(p) for p in (source, extra)}
+            rag.index = [{"path": source.name, "line": 1, "symbol": "boot_init", "type": "function",
+                          "embedding": [1.0, 0.0]}]
+            monkeypatch.setattr(rag, "_refresh_if_stale", lambda: None)
+            monkeypatch.setattr(rag, "_get_embedding", lambda _text: [1.0, 0.0])
+            expected_algorithm = "sha256" if target else "code_rag_md5_v1"
+            for mode in ("semantic", "context"):
+                trace = {"mode": mode}
+                assert rag.query_ranked("boot_init", trace=trace)
+                if mode == "context":
+                    rag.trace_add_files(trace, [extra.name])
+                collector.record(question="delay", answer="evidence", metadata={"trace": trace})
+                stored = collector.load_interactions()[-1].metadata["trace"]
+                assert all(blob["matches_index"] is True for blob in stored["blobs"].values()), stored
+                assert {item["index_hash_algorithm"] for item in trace["files"]} == {expected_algorithm}
+
+                # Earlier records have no algorithm field, for either index type.
+                legacy = {"files": [{"path": item["path"], "index_hash": item["index_hash"]}
+                                    for item in trace["files"]]}
+                collector.record(question="legacy", answer="evidence", metadata={"trace": legacy})
+                blobs = collector.load_interactions()[-1].metadata["trace"]["blobs"]
+                assert all(blob["matches_index"] is True for blob in blobs.values())
+
+            # A changed snapshot must still be reported stale for both schemes and sizes.
+            source.write_bytes(original + b"# changed\n")
+            collector.record(question="changed", answer="evidence", metadata={"trace": trace})
+            blob = collector.load_interactions()[-1].metadata["trace"]["blobs"][source.name]
+            assert blob["matches_index"] is False
+
+    # An explicit unknown algorithm cannot fall back to a coincidentally matching digest.
+    for digest, algorithm in ((hashlib.sha256(source.read_bytes()).hexdigest(), "unknown-v2"),
+                              ("not-a-digest", None), ("a" * 32, "sha256")):
+        entry = {"path": source.name, "index_hash": digest}
+        if algorithm is not None:
+            entry["index_hash_algorithm"] = algorithm
+        collector.record(question="unknown", answer="evidence", metadata={"trace": {"files": [entry]}})
+        blob = collector.load_interactions()[-1].metadata["trace"]["blobs"][source.name]
+        assert blob["matches_index"] is None and blob["index_hash_error"]
+        assert blob["snapshot"] and blob["sha256"]
+
+
+@pytest.mark.smoke
 def test_blob_snapshots_mark_truncation_instead_of_dropping_files_silently(tmp_path, monkeypatch):
     """審核第三輪 B6:被引用的檔超過上限時直接切掉、沒有缺席標記。要留 blobs_truncated 與
     被略過的數量。"""

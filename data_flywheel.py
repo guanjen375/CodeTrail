@@ -62,6 +62,7 @@ metadata.trace（code_rag_search；kind=code_rag）：
                emb / lexical / combined / rerank 分數、selected（過門檻）、final（最終）
   pool_total / selected_count / rerank{applied, input_count, reason} / final
   files        要快照的檔（最終結果 + reranker 評過的 + context evidence），帶索引時的雜湊
+               與 index_hash_algorithm（target 用 sha256；一般索引用 code_rag_md5_v1）
   context_evidence  context 模式真的回傳的每段證據（path / start_line / end_line）
   blobs        rel path → {"snapshot": blob-<sha256>, "sha256", "matches_index"}（索引之後
                檔案改過就是 false）或 {"skipped": 原因}；超過上限標 blobs_truncated / blobs_skipped
@@ -77,6 +78,7 @@ import hashlib
 import os
 import process_env
 import json
+import re
 import stat
 import time
 from pathlib import Path
@@ -597,8 +599,12 @@ class DataCollector:
         return b"".join(chunks)
 
     @staticmethod
-    def _index_hash_of(data: bytes, info) -> str:
-        """與 code_rag.compute_file_hash 同一套判定(小檔 md5 內容、大檔 size+mtime_ns)。"""
+    def _index_hash_of(data: bytes, info, algorithm: str = "code_rag_md5_v1") -> str:
+        """Use the indexed scheme: target SHA-256 or legacy small-content/large-stat MD5."""
+        if algorithm == "sha256":
+            return hashlib.sha256(data).hexdigest()
+        if algorithm != "code_rag_md5_v1":
+            raise DataCollectError(f"unsupported index hash algorithm: {algorithm!r}")
         try:
             from code_rag import CONTENT_HASH_MAX_BYTES as limit
         except Exception:  # noqa: BLE001 - CLI 沒載 code_rag 時用同一個預設
@@ -625,13 +631,16 @@ class DataCollector:
             for entry in files[:MAX_BLOBS_PER_RECORD]:
                 if isinstance(entry, dict):
                     rel, index_hash = entry.get("path"), entry.get("index_hash")
+                    hash_algorithm = entry.get("index_hash_algorithm")
                 else:
                     rel, index_hash = entry, None
+                    hash_algorithm = None
                 rel = str(rel or "")
                 if not rel:
                     continue
                 try:
-                    blobs[rel] = self._snapshot_blob(rel, index_hash, snap_dir, anchor)
+                    blobs[rel] = self._snapshot_blob(rel, index_hash, snap_dir, anchor,
+                                                     hash_algorithm=hash_algorithm)
                 except Exception as e:  # noqa: BLE001
                     blobs[rel] = {"error": f"{type(e).__name__}: {e}"[:120]}
             trace["blobs"] = blobs
@@ -683,7 +692,8 @@ class DataCollector:
         self._kb_snapshots[sha] = (name, sha)
         return name, sha
 
-    def _snapshot_blob(self, rel: str, index_hash, snap_dir: Path, anchor: Path) -> dict:
+    def _snapshot_blob(self, rel: str, index_hash, snap_dir: Path, anchor: Path, *,
+                       hash_algorithm: str | None = None) -> dict:
         """一個被引用的原始檔 → {"snapshot", "sha256", "matches_index"} 或 {"skipped": 原因}。"""
         fd, reason = self._open_under_root(rel)
         if fd is None:
@@ -702,8 +712,21 @@ class DataCollector:
         self._ensure_snapshot(snap_dir, name, data, sha, anchor)
         entry = {"snapshot": name, "sha256": sha, "matches_index": None}
         if index_hash:
-            # 索引時的內容雜湊 vs 現在讀到的:不同就代表快照不是搜尋時那一版。
-            entry["matches_index"] = self._index_hash_of(data, info) == str(index_hash)
+            # Old traces carried only the digest. Its exact width distinguishes
+            # the two supported schemes; an explicit unknown scheme never falls back.
+            try:
+                if not isinstance(index_hash, str) or not re.fullmatch(r"[0-9a-fA-F]+", index_hash):
+                    raise DataCollectError("invalid index hash digest")
+                if hash_algorithm is None:
+                    hash_algorithm = {32: "code_rag_md5_v1", 64: "sha256"}.get(len(index_hash))
+                widths = {"code_rag_md5_v1": 32, "sha256": 64}
+                if not isinstance(hash_algorithm, str) or hash_algorithm not in widths:
+                    raise DataCollectError(f"unsupported index hash algorithm: {hash_algorithm!r}")
+                if len(index_hash) != widths[hash_algorithm]:
+                    raise DataCollectError("index hash digest does not match its declared algorithm")
+                entry["matches_index"] = self._index_hash_of(data, info, hash_algorithm) == index_hash.lower()
+            except DataCollectError as exc:
+                entry["index_hash_error"] = str(exc)[:120]
         return entry
 
     #: 收集檔的讀取上限。它是一行一筆的 append-only JSONL,正常不會很大;

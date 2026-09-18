@@ -66,10 +66,36 @@ def _trust_reason(entry):
     return ""
 
 
+def _document_candidates(chunks, selector):
+    """Resolve literal aliases only from the current KB, never retained artifacts."""
+    if not selector:
+        # No document was resolved. The scope's all_eligible_tables / figure
+        # selector describes this call without dumping every KB source into it.
+        return [], "all_documents"
+    documents = {}
+    for chunk in chunks:
+        document = chunk.get("document_id")
+        if not isinstance(document, str) or not document:
+            continue
+        aliases = documents.setdefault(document, {document.rsplit("::", 1)[0],
+                                                  figure_extract.display_name_for(document)})
+        source = chunk.get("source")
+        if isinstance(source, str) and source:
+            aliases.add(source)
+    if selector in documents:
+        return [selector], "exact"
+    candidates = sorted(document for document, aliases in documents.items() if selector in aliases)
+    resolution = "alias" if len(candidates) == 1 else "ambiguous" if candidates else "not_found"
+    return candidates, resolution
+
+
 def query_table(root, *, document_id="", figure_id="", register="", address="",
                 row=None, column="", register_column="", address_column=""):
+    scope = {"requested_document_id": document_id, "requested_figure_id": figure_id,
+             "resolved_document_ids": [], "candidate_document_ids": [],
+             "document_resolution": "unresolved", "all_eligible_tables": not (document_id or figure_id)}
     result = {"has_ref": False, "status": "not_found", "reason": "no matching verified table row",
-              "matches": [], "ambiguous": False, "excluded": []}
+              "matches": [], "ambiguous": False, "excluded": [], "scope": scope}
     try:
         if any(not isinstance(value, str) for value in
                (document_id, figure_id, register, address, column, register_column, address_column)):
@@ -84,13 +110,27 @@ def query_table(root, *, document_id="", figure_id="", register="", address="",
         if address and numeric is None:
             raise ValueError("address requires an explicit decimal or 0x hexadecimal integer; offsets/expressions are not inferred")
         kb = evidence_store.snapshot(root)
-        entries = figure_review.list_figures(root, kb["chunks"], document_id=document_id or None)
+        documents, resolution = _document_candidates(kb["chunks"], document_id)
+        scope["document_resolution"] = resolution
+        if document_id and len(documents) != 1:
+            scope["candidate_document_ids"] = documents
+            result.update(status="ambiguous" if documents else "not_found", ambiguous=bool(documents),
+                          reason="document_scope_ambiguous" if documents else "document_scope_not_found")
+            return result
+        scope["resolved_document_ids"] = documents
+        entries = figure_review.list_figures(root, kb["chunks"], document_id=documents[0] if document_id else None)
+        if figure_id:
+            entries = [entry for entry in entries if entry.get("figure_id") == figure_id]
+            if not document_id:
+                scope["resolved_document_ids"] = sorted({entry["document_id"] for entry in entries
+                                                         if entry.get("in_kb") is True and entry.get("document_id")})
+            if not entries:
+                result["reason"] = "figure_scope_not_found"
+                return result
         matching_rows = []
         uncertain = False
         ambiguous = False
         for entry in entries:
-            if figure_id and entry.get("figure_id") != figure_id:
-                continue
             if entry.get("kind") != "table":
                 continue
             reason = _trust_reason(entry)

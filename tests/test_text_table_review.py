@@ -90,6 +90,72 @@ def test_exact_table_lookup_never_loads_models_and_preserves_literal_provenance(
     assert not (tmp_path / ".knowledge.json.lock").exists()
 
 
+def test_table_document_alias_resolves_current_source_without_widening(tmp_path, monkeypatch):
+    """The public basename contract must resolve a current ID, never widen a failed scope."""
+    table = _table()
+    table["document_id"] = "qa/docs/spec.pdf::0123456789abcdef"
+    stale = copy.deepcopy(table)
+    stale.update(document_id="qa/docs/spec.pdf::fedcba9876543210", in_kb=False)
+    other = copy.deepcopy(table)
+    other.update(document_id="qa/other.pdf::1111111111111111", source="other.pdf",
+                 figure_id="fig_" + "b" * 16)
+    entries = [table, stale, other]
+    calls = []
+
+    def current(*tables):
+        _kb(tmp_path, [{"source": item["source"], "document_id": item["document_id"],
+                        "structured": True, "figure_id": item["figure_id"]} for item in tables])
+
+    def figures(root, chunks, *, document_id=None):
+        calls.append(document_id)
+        return [item for item in entries if document_id is None or item["document_id"] == document_id]
+
+    current(table, other)
+    monkeypatch.setattr(table_lookup.figure_review, "list_figures", figures)
+    for selector in ("spec.pdf", "qa/docs/spec.pdf", table["document_id"]):
+        result = table_lookup.query_table(tmp_path, document_id=selector, figure_id=table["figure_id"],
+                                          register="CTRL", column="Reset")
+        assert result["status"] == "ok" and result["matches"][0]["value"] == "0x0001", result
+        assert result["matches"][0]["document_id"] == table["document_id"]
+        assert calls[-1] == table["document_id"]
+
+    # A valid figure elsewhere cannot rescue an unknown/stale document selector.
+    for selector in ("missing.pdf", stale["document_id"], " spec.pdf"):
+        before = len(calls)
+        result = table_lookup.query_table(tmp_path, document_id=selector, figure_id=table["figure_id"],
+                                          register="CTRL", column="Reset")
+        assert result["status"] == "not_found" and result["reason"] == "document_scope_not_found", result
+        assert not result["has_ref"] and result["matches"] == []
+        assert len(calls) == before, "an unresolved scope must not scan all figure artifacts"
+
+    result = table_lookup.query_table(tmp_path, document_id="spec.pdf", figure_id=other["figure_id"],
+                                      register="CTRL", column="Reset")
+    assert result["reason"] == "figure_scope_not_found" and result["matches"] == []
+    assert calls[-1] == table["document_id"]
+
+    # Two currently indexed IDs sharing a basename require an explicit selection.
+    collision = copy.deepcopy(table)
+    collision.update(document_id="another/spec.pdf::2222222222222222", figure_id="fig_" + "c" * 16)
+    entries.append(collision)
+    current(table, other, collision)
+    before = len(calls)
+    result = table_lookup.query_table(tmp_path, document_id="spec.pdf", register="CTRL", column="Reset")
+    assert result["status"] == "ambiguous" and result["reason"] == "document_scope_ambiguous", result
+    assert result["matches"] == [] and result["ambiguous"] is True
+    assert result["scope"]["candidate_document_ids"] == sorted((table["document_id"], collision["document_id"]))
+    assert len(calls) == before
+    exact = table_lookup.query_table(tmp_path, document_id=table["document_id"], register="CTRL", column="Reset")
+    assert exact["status"] == "ok", exact
+
+    # Names are literal metadata, including legitimate leading/trailing whitespace.
+    spaced = copy.deepcopy(table)
+    spaced.update(source=" spec\n.pdf ", document_id="qa/docs/ spec\n.pdf ::3333333333333333")
+    entries[:] = [spaced]
+    current(spaced)
+    result = table_lookup.query_table(tmp_path, document_id=spaced["source"], register="CTRL", column="Reset")
+    assert result["status"] == "ok" and result["matches"][0]["source"] == spaced["source"]
+
+
 @pytest.mark.parametrize("defect", ["duplicate_row", "duplicate_column", "inherited", "unreadable", "conflict", "revision", "unverified"])
 def test_table_lookup_never_returns_ambiguous_or_unverified_values(tmp_path, monkeypatch, defect):
     _kb(tmp_path)

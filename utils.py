@@ -608,9 +608,14 @@ def _explicitly_missing_identifier_lacks_evidence(
     return False
 
 
-def should_refuse_answer(question: str, kb_metadata: dict) -> bool:
+def should_refuse_answer(
+    question: str, kb_metadata: dict, *, require_grounding: bool = False,
+) -> bool:
     """
-    判斷是否應該拒絕回答（REF 太弱且是 spec 問題）
+    判斷是否應該拒絕回答（REF 太弱且是 spec 問題或已明示要求 grounding）。
+
+    require_grounding 由顯式 strict 工具傳入；不能因題目語言或自動分類
+    沒命中而跳過證據檢查。未傳入時保留原有 automatic spec 判準。
 
     改進：
     - spec 問題只看 embedding score（或 rerank score），不看 hybrid
@@ -624,10 +629,9 @@ def should_refuse_answer(question: str, kb_metadata: dict) -> bool:
     Candidate.gate_score。
     """
     if not kb_metadata:
-        return False
+        return require_grounding
 
-    is_spec = is_spec_question(question)
-    if not is_spec:
+    if not require_grounding and not is_spec_question(question):
         return False
 
     has_ref = kb_metadata.get("has_ref", False)

@@ -225,7 +225,6 @@ from utils import (
     answer_with_self_check,
     needs_grounding,
     should_refuse_answer,
-    should_use_strict_mode,
 )
 from scripts.required_model_servers_check import (
     render_report as _render_required_model_report,
@@ -948,10 +947,10 @@ def query_knowledge_strict(
 ) -> dict:
     """Strict-mode KB query: server-side LLM with refuse + 2-stage self-check.
 
-    這是 server-side 嚴格模式(answer_with_self_check) — 把
-    `should_refuse_answer` + `should_use_strict_mode` + 兩階段自我檢查打包成
-    一個工具。用於規格/數值/限制類問題,要求模型只用 KB 內容回答,並逐句
-    檢查是否有 [REF] 根據。
+    這是 server-side 嚴格模式(answer_with_self_check) —
+    把強制 `should_refuse_answer` + 兩階段自我檢查打包成一個工具。
+    選用本工具就是顯式要求 strict，不受自動題型/語言分類降級。
+    用於規格/數值/限制類問題,要求模型只用 KB 內容回答,並逐句檢查 [REF] 根據。
 
     跟一般 `query_knowledge` 的差別:
       - `query_knowledge` 只回傳 KB 上下文,要呼叫端的模型自己組答案;
@@ -1038,7 +1037,7 @@ def query_knowledge_strict(
     excluded_text = meta.get("excluded_text", [])
     review_hint = _figure_review_hint(excluded_figures)
 
-    if should_refuse_answer(question, meta):
+    if should_refuse_answer(question, meta, require_grounding=True):
         result = {
             "answer": None,
             "refused": True,
@@ -1062,15 +1061,12 @@ def query_knowledge_strict(
         )
         return result
 
-    grounding_needed, reason = needs_grounding(question)
-    use_strict = should_use_strict_mode(question, knowledge_ctx, meta)
-
-    if not use_strict or not knowledge_ctx:
+    if not knowledge_ctx:
         result = {
             "answer": None,
-            "refused": False,
-            "strict": False,
-            "reason": "not_a_grounding_question" if not grounding_needed else "no_kb_ctx",
+            "refused": True,
+            "strict": True,
+            "reason": "no_kb_ctx",
             "refs": refs,
             "top_score": top_score,
             "top_emb_score": top_emb_score,
@@ -1081,14 +1077,18 @@ def query_knowledge_strict(
         _record_kb_interaction(
             mode="mcp_query_knowledge_strict",
             question=question,
-            answer=f"[SKIPPED_STRICT:{result['reason']}]",
+            answer=f"[REFUSED:{result['reason']}]",
             refs=refs,
             top_score=top_score,
-            extra_meta={"refused": False, "strict": False, "top_emb_score": top_emb_score},
+            extra_meta={"refused": True, "strict": True, "top_emb_score": top_emb_score},
             trace=meta.get("trace"),
         )
         return result
 
+    # Automatic detection only supplies a diagnostic reason. Explicit strict
+    # intent already selected the retrieval and refusal gates above.
+    grounding_needed, grounding_reason = needs_grounding(question)
+    reason = grounding_reason if grounding_needed else "explicit_strict"
     base_ctx = f"專案路徑: {AICODE_ROOT}"
     _log(f"[MCP] query_knowledge_strict: strict mode on (reason={reason})")
     # answer_with_self_check 會 stream 到 stdout — MCP stdio 不能讓它污染協定

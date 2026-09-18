@@ -1003,12 +1003,14 @@ SPEC_QUESTION_KEYWORDS = [
 # 取代原本的關鍵字觸發，改用特徵偵測
 NEEDS_GROUNDING_ENABLED = True  # 啟用 needs_grounding 偵測器（取代純關鍵字）
 
-# 數值詢問模式（需要證據的問句特徵）
+# 數值詢問模式：grounding 與檢索的 numeric fast path 共用，避免語言分歧。
 GROUNDING_NUMERIC_PATTERNS = [
     r'多少', r'幾[個條筆次]?', r'幾分鐘', r'多大', r'多長', r'多久',
     r'最[大小多少高低]', r'上限', r'下限', r'門檻', r'閾值',
     r'\d+\s*[KMGT]?B?', r'\d+%',  # 數字+單位
     r'default|預設|預設值', r'限制[是為]?',
+    r'\bhow\s+(?:many|much|long)\b',
+    r'\b(?:max(?:imum)?|min(?:imum)?|upper\s+limit|lower\s+limit)\b',
 ]
 
 # 規格/標準詢問模式

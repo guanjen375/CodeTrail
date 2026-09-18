@@ -146,7 +146,7 @@ def _render_query_table(payload: dict[str, Any]) -> str:
     # budget fitter must drop a whole cell, never leave a shortened literal value.
     lines = [f"table_status: {payload.get('status', 'unknown')}",
              f"has_ref: {_json(payload.get('has_ref', False))}"]
-    for key in ("reason", "ambiguous", "truncated", "match_count", "excluded_count", "error"):
+    for key in ("scope", "reason", "ambiguous", "truncated", "match_count", "excluded_count", "error"):
         if key in payload:
             lines.append(f"{key}: {_json(payload[key])}")
     for item in payload.get("excluded", []):
@@ -343,8 +343,15 @@ _PARTIAL_MARKERS: dict[str, tuple[str, ...]] = {
 
 def _status_for(tool_name: str, payload: object, body: str) -> tuple[str, str | None]:
     lower = body.lower()
-    if tool_name == "query_table" and isinstance(payload, dict) and payload.get("status") == "error":
-        return "error", "Correct the reported table selector or source problem before retrying."
+    if tool_name == "query_table" and isinstance(payload, dict):
+        scope = payload.get("scope") or {}
+        scoped = isinstance(scope, dict) and (scope.get("requested_document_id") or scope.get("requested_figure_id"))
+        if scoped and (payload.get("has_ref") is False or payload.get("status") == "error"):
+            return ("error" if payload.get("status") == "error" else "partial",
+                    "Keep the requested document_id and figure_id scope; verify the current document ID, "
+                    "figure and review status before retrying. Do not broaden to another source or infer a value.")
+        if payload.get("status") == "error":
+            return "error", "Correct the reported table selector or source problem before retrying."
     if tool_name == "analyze_file" and body.startswith("Memory consistency: "):
         if body.startswith(("Memory consistency: unknown;", "Memory consistency: conflict;")):
             return "partial", "Inspect the reported ranges and sources; resolve conflicts or supply missing evidence before declaring consistency."

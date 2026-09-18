@@ -1523,23 +1523,15 @@ English:"""
         return queries[:MULTI_QUERY_COUNT + 1]  # 原始 + N 個變體
 
     def _is_numeric_query(self, question: str) -> bool:
-        """判斷是否為數值查詢（含數字/最大/預設等）
+        """以 grounding 共用的中英文規則判斷數值查詢。
 
-        這類查詢通常有精確答案，不適合 query expansion 避免 drift
+        這類查詢通常有精確答案，跳過 expansion 避免 drift。lexical 命中
+        仍只允許候選進 reranker，不能替代 verification 或最終拒答閘。
         """
-        numeric_patterns = [
-            r'\d+',           # 任何數字
-            r'最[大小]',       # 最大/最小
-            r'[上下]限',       # 上限/下限
-            r'預設',          # 預設值
-            r'default',       # default
-            r'多少',          # 多少
-            r'幾[個條筆次]',   # 幾個/幾條
-        ]
-        for pattern in numeric_patterns:
-            if re.search(pattern, question, re.IGNORECASE):
-                return True
-        return False
+        return any(
+            re.search(pattern, question, re.IGNORECASE)
+            for pattern in config.GROUNDING_NUMERIC_PATTERNS
+        )
 
     def _exact_literals(self, text: str) -> set[str]:
         """Extract values whose exact spelling is evidence (hex, decimal, version-like).

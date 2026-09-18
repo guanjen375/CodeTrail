@@ -82,6 +82,7 @@ ACTIONABLE_ABSENT_PREFIXES = (
     "structured_lane_inactive",
     "rotated_",
     "page_text_recovery_failed",
+    "native_text_empty_or_unavailable",
     "planning_error",
     "candidates_per_page",
     "candidate_build_error",
@@ -183,6 +184,8 @@ def _clean_absent_item(item: object) -> dict:
         value = source.get(name)
         if isinstance(value, str) and value in _ITEM_ENUMS[name]:
             result[name] = value
+    if source.get("native_text_status") == "page_chunks_present":
+        result["native_text_status"] = "page_chunks_present"
     return result
 
 
@@ -351,13 +354,25 @@ def _listing(items: list, total: int) -> list[str]:
     return lines
 
 
+def absent_scope_label(item: dict) -> str:
+    """Figure admission and native text availability are independent facts."""
+    if item.get("channel") == "text":
+        return "原生正文未能讀取（未建立文字 chunk；不代表該頁沒有內容）"
+    native = ("本頁已有文字 chunk（不代表此區域全文覆蓋）"
+              if item.get("native_text_status") == "page_chunks_present"
+              else "原生正文是否收錄未知")
+    if str(item.get("reason", "")).startswith("native_channel_unavailable"):
+        return "原生證據通道不可用（圖面覆蓋未知）；" + native
+    return "結構化圖面沒有進知識庫；" + native
+
+
 def _absent_listing(items: list) -> list[str]:
     """缺席清單的逐筆行（頁碼 / bbox / slug，零文件內容）。"""
     lines = []
     for item in items[:MAX_LISTED_ITEMS]:
         where = f"bbox={[round(v, 1) for v in item['bbox']]}" if item["bbox"] else "整頁"
         page = f"p{item['page']}" if item["page"] else "整份文件"
-        lines.append(f"  - {page} {where} ({item['reason']})")
+        lines.append(f"  - {page} {where} ({item['reason']})：{absent_scope_label(item)}")
     remaining = len(items) - min(len(items), MAX_LISTED_ITEMS)
     if remaining > 0:
         lines.append(f"  …還有 {remaining} 筆")
@@ -418,11 +433,10 @@ def render_action_block(payload: dict) -> list[str]:
         lines.append('  → 接受這一張缺席（其餘內容已入庫），或 remove_document'
                      f'({quoted}) 之後用原本的路徑重灌')
     if absent:
-        # 缺席的內容在查詢時是**完全不存在**的：不說出來，使用者問了得到「查無資料」
-        # 只會以為文件裡沒寫。這裡只列動得了手的那幾筆（完整清單在 ingest stdout）。
-        lines.append(f"未進知識庫 {len(absent)} 個頁 / 區域（查詢時不會出現）：")
+        lines.append(f"圖面未收錄／原生文字未讀取 {len(absent)} 個頁 / 區域"
+                     "（依下列來源分開判定）：")
         lines.extend(_absent_listing(absent))
-        lines.append('  → 需要那幾頁的內容就用 read_pdf(path, pages="…") 直接讀原頁；'
+        lines.append('  → 需要核對來源時用 analyze_file(path=原本的PDF路徑) 讀取 PDF；'
                      'structured_lane_inactive 代表整條圖面 lane 沒跑（檔案不在專案根內），'
                      '把 PDF 放進專案根再 ingest_document(...) 一次才會有 figure')
     return lines

@@ -273,8 +273,8 @@ table／terminal 沒抽到內容會回退為 `prose` 逐行轉錄，不以 diagr
 | 情況 | 收哪些 | 拿得到什麼 |
 |---|---|---|
 | **結構化 lane 收錄** | 原生 markdown 表格、`find_tables` 幾何、框線格、對齊文字帶、向量文字 log，以及夠大的純 raster / picture | raster 先分類成 table / terminal / prose / diagram；再產生 canonical JSON、逐格/逐行證據、`▯`、驗證狀態、strict gate，且可用 `review_figures` 覆核 |
-| **判定不是圖面** | 封面、logo、商標、裝飾線條、產品照片、單純的 GUI 圖示 | 零 VL 抽取、零 chunk；只留在 review artifact 的「判定不是圖面」一節與 ingest 的缺席清單 |
-| **lane 沒收** | 沒有結構性證據的區域、超出上限被丟掉的候選、整頁 abstain 的頁 | **不入庫**；ingest 輸出與摘要列出頁碼、bbox 與原因。需要那幾頁就用 `read_pdf(path, pages="…")` 直接看原檔 |
+| **判定不是圖面** | 封面、logo、商標、裝飾線條、產品照片、單純的 GUI 圖示 | 零 VL 抽取、不產生 figure chunk；判定紀錄留在 review artifact 與 ingest 的缺席清單，原生正文由文字 lane 處理 |
+| **lane 沒收** | 沒有結構性證據的區域、超出上限被丟掉的候選、整頁 abstain 的頁 | **未收為 structured figure**；不代表原生正文缺席。ingest 列出頁碼、bbox、原因及文字通道狀態；需核對來源時用 `analyze_file(path="原本的PDF路徑")` |
 
 掃描版 datasheet 的表格與手機拍的終端機畫面現在會成為 structured figure；因為通常沒有
 獨立原生證據，狀態仍多半是 `unverified` / `needs_review`，`query_knowledge_strict` 會擋下，
@@ -382,9 +382,10 @@ capability probe:端點真的吃 image content part、
 - **無法覆核**(payload / 原圖讀不到,例如 review artifact 被清掉) → 就地修不了,
   `remove_document(...)` 後重新 ingest。
 - **抽取失敗**(那一張不進 KB) → 接受它缺席(其餘內容已入庫),或 `remove_document(...)` 後重灌。
-- **未進知識庫**(整條 lane 沒跑、旋轉頁正文抽不出來、預算把候選丟掉) → 那些內容查詢時
-  完全不存在,用 `read_pdf(path, pages="…")` 直接讀原頁;`structured_lane_inactive` 代表檔案
-  不在專案根內,搬進去再 ingest 一次才會有 figure。
+- **圖面未收錄／原生文字未讀取** → 圖面候選未形成或超出預算，只表示未收為 structured
+  figure，不能推論原生正文沒有入庫。文字通道確實失敗才列「原生文字未讀取」，未知則明列
+  未知；用 `analyze_file(path="原本的PDF路徑")` 核對來源。`structured_lane_inactive` 表示
+  圖面 lane 未執行，依結果原因處理來源路徑後重新 ingest。
 
 「偵測器判定這一塊不是結構化圖面」這類**沒有下一步**的缺席不列進這一段(完整清單在 ingest
 自己的輸出裡)。僅 `unverified` / `legacy_unverified`、未發現確定缺陷時，也**不會**自動列為人工待辦。每次入庫都印一句
@@ -494,6 +495,10 @@ confirm_against_image 設 True。
 
 - `query_knowledge`：把找到的文件段落丟給對話模型，模型自己組答案。
 - `query_knowledge_strict`：在背後跑兩階段檢查 — 先看找到的內容是不是真的足以回答；確認後再驗證最終答案每一句話都有對應的 `REF` 出處；任何一句沒對到的會被刪掉，證據真的太弱就直接回「拒答」而不是亂編。
+
+明示呼叫 strict 就使用嚴格證據閘，不會因中英文題型分類而退回非 strict。
+例如 `Warm reset delay is how many ms?` 與中文同義題都走數值查詢路徑，省略容易漂移的
+query expansion；未確認 OCR 仍列於 `excluded_text`，不能用來回答數值。
 
 多份相似 spec 同時存在時可限定文件，例如
 `query_knowledge("reset value", source="npu_core_rev_b.md")`；`source` 用 basename 精確比對，

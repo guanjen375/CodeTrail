@@ -51,6 +51,37 @@ class SessionStoreError(RuntimeError):
     """session 檔的位置、權限或內容不合契約。"""
 
 
+def apply_turn_cancellation(
+    messages: Sequence[Mapping[str, Any]], record: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Apply an append-only cancellation to its exact real-user messages.
+
+    Content and ordering stay intact. IDs survive compaction and do not depend
+    on transcript positions, which differ from the compacted model history.
+    """
+    ids = record.get("message_ids")
+    if (type(record.get("schema")) is not int or record.get("schema") != 1
+            or not isinstance(ids, list) or not ids
+            or any(not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{32}", item)
+                   for item in ids) or len(set(ids)) != len(ids)):
+        raise SessionStoreError("invalid turn_cancelled record")
+    wanted = set(ids)
+    found: set[str] = set()
+    result = []
+    for message in messages:
+        item = dict(message)
+        identity = item.get("message_id")
+        if isinstance(identity, str) and identity in wanted:
+            if (identity in found or item.get("role") != "user" or item.get("synthetic")):
+                raise SessionStoreError("turn_cancelled target is not a unique real user message")
+            found.add(identity)
+            item["turn_status"] = "cancelled"
+        result.append(item)
+    if found != wanted:
+        raise SessionStoreError("turn_cancelled target is missing from session history")
+    return result
+
+
 def root_hash(root: str | os.PathLike[str]) -> str:
     """把 AICODE_ROOT 對應到一個穩定、不可讀回原路徑的目錄名。"""
     resolved = str(Path(root).expanduser().resolve())

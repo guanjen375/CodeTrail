@@ -143,6 +143,7 @@ class ModelEvidence:
     reason: str
     session_ids: tuple[str, ...] = ()
     saw_tool_calls_finish: bool = False
+    failure_kind: str = ""
 
 
 class ImplicitStatus(str, Enum):
@@ -897,7 +898,8 @@ def run_model_attempt(
         return ModelEvidence(False, f"headless run 無法啟動（{type(exc).__name__}）")
     except process_env.TimeoutExpired as exc:
         evidence = inspect_model_events(_coerce_text(exc.stdout))
-        return replace(evidence, success=False, reason=f"headless run 超過 {timeout} 秒")
+        return replace(evidence, success=False, reason=f"headless run 超過 {timeout} 秒",
+                       failure_kind="timeout")
 
     evidence = inspect_model_events(result.stdout)
     if result.returncode != 0:
@@ -987,10 +989,12 @@ def _model_selection(env: Mapping[str, str], explicit: str) -> tuple[str, str]:
     return resolved.model, resolved.model
 
 
-def _handle_failure(message: str) -> int:
+def _handle_failure(message: str, *, timed_out: bool = False) -> int:
     _print(f"FAIL — {message}", error=True)
     _print(
-        "已拒絕啟動；請修正 direct-tool / MCP / explicit tool-call 契約後重試",
+        ("已拒絕啟動：explicit 模型在時限內未完成驗證，不能據此判定工具契約損壞。"
+         "請檢查模型是否忙碌、單 slot 排程等待或處理緩慢，待服務可用後重試。"
+         if timed_out else "已拒絕啟動；請修正 direct-tool / MCP / explicit tool-call 契約後重試"),
         error=True,
     )
     return 2
@@ -1000,6 +1004,12 @@ def _report_implicit(status_value: ImplicitStatus, *, cached: bool) -> None:
     source = "cached" if cached else "live"
     if status_value is ImplicitStatus.OPTIMAL:
         _print(f"IMPLICIT {source} — status=optimal（自主選到根目錄列舉）")
+        return
+    if status_value is ImplicitStatus.TIMEOUT:
+        _print(
+            f"IMPLICIT WARN — status=timeout（{source}；時限內未完成診斷，不等於 routing 失敗；不擋啟動）",
+            error=True,
+        )
         return
     _print(
         f"IMPLICIT WARN — status={status_value.value}（{source}；不擋啟動）",
@@ -1101,6 +1111,7 @@ def run_all(
             f"{MODEL_CANARY_HEARTBEAT_SECONDS} 秒回報進度，不是當機。"
         )
         last_reason = "未知錯誤"
+        timed_out = False
         explicit_passed = False
         for attempt in (1, 2):
             evidence = run_model_attempt(
@@ -1138,13 +1149,15 @@ def run_all(
                 break
 
             last_reason = evidence.reason
+            timed_out = timed_out or evidence.failure_kind == "timeout"
             if attempt == 1:
                 _print(f"MODEL RETRY — 第一次失敗：{last_reason}", error=True)
 
         if not explicit_passed:
             return _handle_failure(
                 "MCP protocol 已通過，但 explicit 模型連續兩次未完成真實 tool call："
-                + last_reason
+                + last_reason,
+                timed_out=timed_out,
             )
 
     if cache_ready and fingerprint and not bypass_cache:

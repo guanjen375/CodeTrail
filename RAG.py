@@ -1116,8 +1116,8 @@ def _structured_candidates(fx, plan) -> Tuple[List, List[Dict]]:
     `KIND_RASTER` 是 candidate-only：必須先由 VL 的受限分類 schema 解成 table /
     terminal / diagram / prose，結果才可入庫。
 
-    structured lane 是**唯一**的圖面 lane（2026-08-30），所以這裡濾掉的候選就是
-    「不會進 KB」——每一個都要留下頁碼、bbox 與原因，否則它就是無聲缺席。
+    structured lane 是**唯一**的圖面 lane（2026-08-30），濾掉的候選不會以 figure
+    收錄；原生正文另走文字 lane。每筆保留頁碼、bbox 與原因，不從圖面缺席推論正文。
     """
     keep, absent = [], []
     accepted = (fx.KIND_TABLE, fx.KIND_TERMINAL, fx.KIND_UNKNOWN, fx.KIND_RASTER)
@@ -1177,25 +1177,22 @@ MAX_LISTED_ABSENT = 10
 
 
 def format_absent_regions(filename: str, absent: List[Dict]) -> str:
-    """「這一次有東西沒進 KB」的人類可讀區塊；沒有就回空字串。
-
-    ingest 仍然 exit 0，使用者只從 chunk 數看不出少了什麼；而缺席的內容在查詢時
-    是**完全不存在**的，不說出來就會變成「問了得到查無資料、以為文件裡沒寫」。
-    只列頁碼、bbox 與固定 slug——一個字的文件內容都不含（NDA）。
-    """
+    """保留圖面缺席帳，分開說明文字來源；不由圖面分類推論正文是否入庫。"""
     if not absent:
         return ""
-    lines = [f"[INFO] {filename}: {len(absent)} 個頁 / 區域沒有進知識庫"
-             "（查詢時不會出現，需要就用 read_pdf 直接看原頁）"]
+    lines = [f"[INFO] {filename}: {len(absent)} 個圖面未收錄／原生文字未讀取紀錄"
+             "（圖面候選未形成不代表原生正文缺席）"]
     for entry in absent[:MAX_LISTED_ABSENT]:
         bbox = entry.get("bbox")
         where = f"bbox={[round(float(v), 1) for v in bbox]}" if bbox else "整頁"
         page = int(entry.get("page") or 0)
         location = f"第 {page} 頁" if page else "整份文件"
-        lines.append(f"  - {location} {where} reason={entry.get('reason', '')}")
+        lines.append(f"  - {location} {where} reason={entry.get('reason', '')}："
+                     + ingest_notify.absent_scope_label(entry))
     remaining = len(absent) - min(len(absent), MAX_LISTED_ABSENT)
     if remaining > 0:
         lines.append(f"  …還有 {remaining} 筆（完整清單見 preflight 報告）")
+    lines.append("  → 需要核對來源時用 analyze_file(path=原本的PDF路徑) 讀取 PDF。")
     return "\n".join(lines)
 
 
@@ -2396,7 +2393,8 @@ def extract_pdf_document(file_path: str, *, preflight_only: bool = False,
     canonical JSON payload 與 `origin="figure_*"`。schema / validator 失敗一律
     `FigureExtractionError`，**不降級成自由文字**（workflow §7）。
 
-    structured lane 沒收的頁與區域就是**缺席**：不入庫、不做自由文字描述，改由
+    structured lane 沒收的頁與區域只代表**圖面缺席**，不推論原生正文是否入庫；
+    不做自由文字描述，改由
     `format_absent_regions()` 與 ingest 摘要逐筆列出頁碼、bbox 與原因。以前那條
     legacy 自由文字 lane（`origin="diagram"`）已經移除——它沒有 ▯、沒有 review
     artifact、沒有 evidence_ref，事後從 KB 與摘要都看不出「這段是看圖說故事」。
@@ -2502,7 +2500,7 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
     text_chunk_counts: Dict[int, int] = {}
     offset = 0  # 下一頁在 raw_text 中的起點
     pending_replacements = dict(lane["replacements"])
-    # 這次 ingest **有內容、但沒有進 KB** 的頁與區域。提交點的摘要靠它講「少了什麼」。
+    # 圖面 admission 與 native text failure 共用傳輸帳，通知必須分開說明來源。
     absent: List[Dict] = list(lane["absent"])
     # 旋轉頁正文退路的兩個懶開 handle（`None` 未開、`False` 開不起來）：
     #   probe_doc  — 路徑開檔，只讀 `page.rotation`（便宜；空白頁很常見）
@@ -2667,6 +2665,12 @@ def _extract_pdf_document_impl(file_path: str, *, preflight_only: bool,
     # markdown 標題（與獨立圖片入庫一致），拿 PDF 文件級章節去蓋會蓋錯座標系。
     document.assign_section_indices()
     document.apply_section_titles()
+    native_text_pages = {chunk.get("page") for chunk in document.chunks
+                         if not chunk.get("structured") and chunk.get("content", "").strip()}
+    absent = [{**entry, **({"native_text_status": "page_chunks_present"}
+                           if entry.get("page") in native_text_pages
+                           and entry.get("channel") != "text" else {})}
+              for entry in absent]
     setattr(document, _FIGURE_PRUNE_ATTR, lane["guard"])
     setattr(document, _ABSENT_ATTR, absent)
     if checkpoint is not None:
@@ -4014,6 +4018,10 @@ def _ingest_summary_line(document: ExtractedDocument, committed_chunks,
     root = str(guard.get("root") or "")
     document_id = str(guard.get("document_id") or "")
     run_id = str(guard.get("run_id") or "")
+    native_text_pages = {chunk.get("page") for chunk in committed_chunks or []
+                         if isinstance(chunk, dict) and chunk.get("source") == document.source
+                         and not chunk.get("structured") and chunk.get("text_lane") != "mineru"
+                         and chunk.get("content", "").strip()}
     payload: Dict = {
         "schema": ingest_notify.SUMMARY_SCHEMA,
         "document": document.source,
@@ -4028,7 +4036,9 @@ def _ingest_summary_line(document: ExtractedDocument, committed_chunks,
              "bbox": list(item["bbox"]) if item.get("bbox") else None,
              "channel": str(item.get("channel") or ""),
              "reason": str(item.get("reason") or ""),
-             **{key: item[key] for key in ("lane", "stage") if key in item}}
+             **{key: item[key] for key in ("lane", "stage") if key in item},
+             **({"native_text_status": "page_chunks_present"}
+                if item.get("page") in native_text_pages and item.get("channel") != "text" else {})}
             for item in (getattr(document, _ABSENT_ATTR, None) or [])
         ],
     }

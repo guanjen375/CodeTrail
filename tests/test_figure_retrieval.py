@@ -3266,10 +3266,10 @@ _EXCLUDED = [{
 }]
 
 
-def _stub_query(monkeypatch, mcp, *, meta):
+def _stub_query(monkeypatch, mcp, *, meta, context="ctx"):
     class _KB(_FakeKB):
         def query(self, question, is_strict_mode=False, source=None):
-            return ("ctx", "display", meta)
+            return (context, "display", meta)
     monkeypatch.setattr(mcp, "KB", _KB())
 
 
@@ -3300,29 +3300,31 @@ def test_query_knowledge_not_loaded_still_has_the_key(monkeypatch, tmp_path):
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("refuse, grounding, strict, expected_reason", [
-    (True, True, True, "weak_ref_for_spec_question"),
-    (False, False, False, "not_a_grounding_question"),
-    (False, True, True, "spec_number"),
+@pytest.mark.parametrize("refuse, grounding, context, expected_reason", [
+    (True, True, "ctx", "weak_ref_for_spec_question"),
+    (False, False, "", "no_kb_ctx"),
+    (False, False, "ctx", "explicit_strict"),
+    (False, True, "ctx", "spec_number"),
 ])
 def test_strict_return_paths_all_carry_excluded_figures(
-    monkeypatch, tmp_path, refuse, grounding, strict, expected_reason
+    monkeypatch, tmp_path, refuse, grounding, context, expected_reason
 ):
-    """全部候選都被 gate 排除時,拒答/跳過/成功三條路都要說得出「哪張圖待覆核」。"""
+    """拒答、缺 context 與顯式 strict 成功都要說得出「哪張圖待覆核」。"""
     mcp = _mcp(monkeypatch, tmp_path)
     _stub_query(monkeypatch, mcp, meta={
         "refs": [], "top_score": 0.4, "top_emb_score": 0.3,
         "excluded_figures": _EXCLUDED,
-    })
-    monkeypatch.setattr(mcp, "should_refuse_answer", lambda q, m: refuse)
+    }, context=context)
+    monkeypatch.setattr(mcp, "should_refuse_answer", lambda q, m, **kw: refuse)
     monkeypatch.setattr(mcp, "needs_grounding", lambda q: (grounding, "spec_number"))
-    monkeypatch.setattr(mcp, "should_use_strict_mode", lambda q, c, m: strict)
     monkeypatch.setattr(mcp, "answer_with_self_check",
                         lambda q, b, k, binary_ctx="": "答案")
 
     result = mcp.query_knowledge_strict("reset assert 最小時間")
 
     assert result["reason"] == expected_reason, result
+    assert result["refused"] is (refuse or not context), result
+    assert result["strict"] is True, result
     assert result["excluded_figures"] == _EXCLUDED, result
     assert "review_figures" in result["review_hint"], result
     assert "待覆核" in result["review_hint"], result

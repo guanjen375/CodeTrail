@@ -62,7 +62,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 文件/外部檔案 | `remove_document(source)` | 從 KB 移除過期文件 |
 | 文件/外部檔案 | `reload_knowledge_base()` | 立即載入 KB 並回報 chunk 數（查詢本身會自動偵測變更，這是「馬上確認」用） |
 | 文件/外部檔案 | `query_knowledge(question, source=None)` | 查 KB；`source` 可用 basename 限定單一 spec/manual |
-| 文件/外部檔案 | `query_knowledge_strict(question, source=None)` | 查高風險規格題，弱證據會拒答；可限定文件 |
+| 文件/外部檔案 | `query_knowledge_strict(question, source=None)` | 選用即強制嚴格證據檢查，不因語言分類降級；弱證據拒答，可限定文件 |
 | 修改/驗證 | `git_status()` | 看工作樹目前有沒有改動；非 git 專案回固定的跳過通知（`status: ok`，不是錯誤、不用重試） |
 | 修改/驗證 | `git_diff(path=None, staged=False)` | 看修改內容，不需要用 `run_command` 跑 git；非 git 專案同樣回跳過通知 |
 | 修改/驗證 | `apply_patch(diff, dry_run=False)` | 套 SEARCH/REPLACE 或 unified diff（同一次只能一種；參數已是字串，不要包 fence），會真的寫檔；最多 5 個檔案、單檔 200 行（udiff 算 added+removed；S/R 算 payload budget = SEARCH+REPLACE 行數，不是同一種計數）；UTF-8 strict，BOM／CRLF／檔尾換行／權限原樣保留，mixed newline 與 symlink 拒絕；套用後只做唯讀 syntax check（advisory、三態、失敗不回滾）；細節見[apply_patch 的兩種格式](#apply_patch-的兩種格式) |
@@ -245,7 +245,7 @@ structure_error / unusable / unknown`，`review_state` 為 `unreviewed / confirm
 MCP 每次工具呼叫有 client timeout,開始之後才超時等於沒有提示 —— 所以先估。
 
 preflight 涵蓋所有結構化候選，包含純 raster 的分類、雙樣本抽取與 image-token 估算。
-沒被收成候選的區域不進預算——它們根本不會被送出去，報告改在「不會進 KB 的頁 / 區域」
+沒被收成候選的區域不進預算——它們根本不會被送出去，報告改在「預計未收為結構化圖面的頁 / 區域」
 那一段逐筆列出。
 
 **抽壞的那一張缺席**:結構化 lane 的 schema / validator / row width / line contract /
@@ -415,6 +415,6 @@ void led_toggle(void) {
 - 工具 `record_lesson` 只在「你糾正了模型的做事方式」之後用;工具報錯或答案錯誤不是觸發條件。寫入需要你核准,細節與管理指令見 [docs/lessons.md](lessons.md)。
 - 圖很多的 PDF 先用 `ingest_document(path, preflight_only=True)` 估成本（零寫入），再決定要不要在 MCP 裡跑或改走 CLI。
 - REF 標「待覆核」的圖片內容不得當成規格數值的定論；`query_knowledge_strict` 的 `excluded_figures` 就是被 gate 擋下、但確實存在的圖，照實轉述頁碼與原因。**structured figure（`excluded_figures` 帶 `figure_id`）能用 `review_figures` 覆核**（`fix` 會改 KB，permission 是 `ask`）；新 ingest 的純 raster 也屬 structured figure。只有舊 KB 的 legacy VL chunk 沒有 canonical payload，不能在這裡覆核。被分類器判定「不是
-圖面」的（封面、logo）不會進 KB、也不進覆核清單，它們只出現在 ingest 的缺席清單裡。
+圖面」的（封面、logo）不會收為 figure，也不進覆核清單；此紀錄不能推論同區域的原生正文缺席。
 
 ---

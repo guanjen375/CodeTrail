@@ -50,6 +50,7 @@ import copy
 import difflib
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -2111,6 +2112,157 @@ def _geometry_cells(candidate) -> list[list] | None:
     return cells
 
 
+def _proof_box(value, *, thin=False):
+    """Unlike the permissive alignment helper, absence proofs reject bad geometry."""
+    try:
+        values = tuple(value)
+    except TypeError:
+        return None
+    if len(values) != 4 or any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+        return None
+    x0, y0, x1, y1 = values
+    if x1 < x0 or y1 < y0 or (not thin and (x1 == x0 or y1 == y0)):
+        return None
+    return values
+
+
+def _touches(a, b):
+    return a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3]
+
+
+def _row_has_only_table_rules(band, candidate_box, overlays) -> bool:
+    ink = overlays.get("drawing_ink")
+    if not isinstance(ink, list):
+        # Old evidence with no primitive snapshot is sufficient only when the
+        # explicitly harvested drawing channel is empty.
+        return overlays.get("drawing_rects") == []
+    paths = []
+    rules = {"h": {}, "v": {}}
+    for path in ink:
+        box = _proof_box(path.get("bbox"), thin=True) if isinstance(path, dict) else None
+        if box is None:
+            return False
+        segments = path.get("segments")
+        parsed = []
+        if isinstance(segments, list):
+            for segment in segments:
+                if not isinstance(segment, (list, tuple)) or len(segment) != 4 or any(
+                        type(v) not in (int, float) or not math.isfinite(v) for v in segment):
+                    return False
+                x0, y0, x1, y1 = segment
+                axis = "h" if y0 == y1 and x0 != x1 else "v" if x0 == x1 and y0 != y1 else ""
+                at = y0 if axis == "h" else x0
+                extent = sorted((x0, x1) if axis == "h" else (y0, y1))
+                parsed.append((axis, at, extent, (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))))
+                if axis:
+                    rules[axis].setdefault(at, []).append(extent)
+        paths.append((box, parsed))
+
+    def covers(extents, low, high):
+        end = low
+        for start, stop in sorted(extents):
+            if stop < low or start > high:
+                continue
+            if start > end + 0.5:
+                return False
+            end = max(end, stop)
+        return end >= high - 0.5
+
+    # A border is a connected straight rule spanning the table, including a
+    # grid assembled from individual cell rectangles. A small vector icon is
+    # not a border merely because its bbox happens to be rectangular.
+    complete = {axis: {at for at, spans in groups.items() if covers(
+        spans, candidate_box[0 if axis == "h" else 1], candidate_box[2 if axis == "h" else 3])}
+        for axis, groups in rules.items()}
+    framed = all(any(abs(at - edge) <= 0.5 for at in complete[axis])
+                 for axis, edges in (("h", (candidate_box[1], candidate_box[3])),
+                                     ("v", (candidate_box[0], candidate_box[2])))
+                 for edge in edges)
+    for box, segments in paths:
+        if not _touches(box, band):
+            continue
+        if not segments or not framed:
+            return False
+        for axis, at, _extent, segment_box in segments:
+            if _touches(segment_box, band) and (not axis or at not in complete[axis]):
+                return False
+    return True
+
+
+def _proven_blank_table_row(row_cells, candidate, evidence) -> bool:
+    unavailable = getattr(evidence, "unavailable", ()) or ()
+    if any(str(reason).split(":", 1)[0] in {"words", "image_info", "drawings", "annots", "widgets"}
+           for reason in unavailable):
+        return False
+    boxes = [_proof_box(cell) for cell in row_cells]
+    candidate_box = _proof_box(getattr(candidate, "bbox", None))
+    if not boxes or any(box is None for box in boxes) or candidate_box is None:
+        return False
+    top, bottom = boxes[0][1], boxes[0][3]
+    if any(box[1] != top or box[3] != bottom for box in boxes):
+        return False    # Spanning cells cannot establish an empty row band.
+    if any(left[2] != right[0] for left, right in zip(boxes, boxes[1:])):
+        return False    # Gaps or overlapping columns leave unaccounted source area.
+    left, right = min(box[0] for box in boxes), max(box[2] for box in boxes)
+    if not (candidate_box[0] <= left < right <= candidate_box[2]
+            and candidate_box[1] <= top < bottom <= candidate_box[3]):
+        return False
+    # Text-strategy cells often stop at the last glyph, while a raster/icon can
+    # occupy the remaining width of the actual table row.
+    band = (candidate_box[0], top, candidate_box[2], bottom)
+    words = getattr(evidence, "words", None)
+    images = getattr(evidence, "image_info", None)
+    overlays = getattr(evidence, "overlays", None)
+    if not isinstance(words, (list, tuple)) or not isinstance(images, list) or not isinstance(overlays, dict):
+        return False
+    for word in words:
+        box = _proof_box(word[:4]) if isinstance(word, (list, tuple)) else None
+        if box is None or _contains_center(band, box, CELL_ASSIGN_PAD_PT):
+            return False
+    for info in images:
+        box = _proof_box(info.get("bbox")) if isinstance(info, dict) else None
+        if box is None or _touches(box, band):
+            return False
+    for name in ("annots", "widgets"):
+        for raw in overlays.get(name, ()):
+            box = _proof_box(raw, thin=True)
+            if box is None or _touches(box, band):
+                return False
+    return _row_has_only_table_rules(band, candidate_box, overlays)
+
+
+def _normalise_table_rows(grid, geometry, candidate, evidence):
+    """Keep source indices and raw rows; discard only independently proven blanks."""
+    raw_rows = [list(row) for row in grid["rows"]]
+    cells = geometry.get("cells") if isinstance(geometry, dict) else None
+    extracted = geometry.get("extract_raw") if isinstance(geometry, dict) else None
+    dropped = []
+    if (isinstance(cells, list) and isinstance(extracted, list)
+            and len(cells) == len(extracted) == len(raw_rows) + 1):
+        width = len(grid["header"])
+        for source_index, row in enumerate(raw_rows, 1):
+            observed = extracted[source_index]
+            if (isinstance(observed, list) and isinstance(cells[source_index], list)
+                    and len(row) == len(observed) == len(cells[source_index]) == width
+                    and all(isinstance(value, str) and not value.strip() for value in (*row, *observed))
+                    and _proven_blank_table_row(cells[source_index], candidate, evidence)):
+                dropped.append(source_index)
+    row_map = [i for i in range(1, len(raw_rows) + 1) if i not in dropped]
+    result = {**grid, "rows": [raw_rows[i - 1] for i in row_map],
+              "raw_grid": {"header": list(grid["header"]), "rows": raw_rows},
+              "row_map": row_map, "blank_rows_dropped": dropped}
+    if isinstance(cells, list) and len(cells) == len(raw_rows) + 1:
+        result["geometry_cells"] = [cells[0], *(cells[i] for i in row_map)]
+    return result
+
+
+def _effective_geometry_cells(candidate, channels):
+    for name, grid in channels:
+        if name == "words_geometry" and "geometry_cells" in grid:
+            return grid["geometry_cells"]
+    return _geometry_cells(candidate)
+
+
 def _grid_from_geometry(cells, words) -> dict | None:
     """用 geometry 的每格 bbox 去撿 word，組成 grid。
 
@@ -2266,7 +2418,7 @@ def _entry_grid(entry, *, where: str = "") -> dict | None:
     if not isinstance(rows, list) or not rows:
         return None
     cleaned = [
-        ["" if cell is None else str(cell) for cell in row]
+        [None if cell is None else str(cell) for cell in row]
         for row in rows if isinstance(row, list)
     ]
     if not cleaned:
@@ -2515,7 +2667,8 @@ def _table_channels(n_cols: int, candidate, evidence, findings_notes: list):
     if words and geometry_cells:
         grid = _grid_from_geometry(geometry_cells, words)
         if grid is not None:
-            channels.append(("words_geometry", grid))
+            channels.append(("words_geometry", _normalise_table_rows(
+                grid, native.get("geometry"), candidate, evidence)))
     elif words:
         rows = _group_words_into_rows(words)
         width = n_cols
@@ -2555,11 +2708,14 @@ def _table_channels(n_cols: int, candidate, evidence, findings_notes: list):
                      "find_tables().extract() 已知會把 0x4000_0100 切成 '0x4000 0100\\n_'，"
                      "只當 evidence，永不 canonical"]
                 )
-            channels.append((name, grid))
+            channels.append((name, _normalise_table_rows(
+                grid, _table_entry_geometry(entry), candidate, evidence)))
     elif problem and problem != "no_tables_channel":
         # 「這一頁根本沒有 find_tables 通道」不是異常，不值得污染 reasons[]
         # （reasons 會進 KB 與 REF 顯示）；對不上或分不清才要記。
         findings_notes.append(["native_table_entry_unavailable", problem])
+    channels = [(name, grid if "row_map" in grid else _normalise_table_rows(
+        grid, None, candidate, evidence)) for name, grid in channels]
     return channels, words, unreliable
 
 
@@ -2601,7 +2757,9 @@ def align_table_cells(payload: dict, candidate: Candidate,
         pairs, strategy = _align_sequences(payload_rows, anchor_keys)
         row_alignment[name] = {
             "strategy": strategy, "pairs": len(pairs),
-            "payload_rows": len(payload_rows), "anchor_rows": len(anchor_keys),
+            "payload_rows": len(payload_rows), "anchor_rows": len(grid["raw_grid"]["rows"]),
+            "effective_anchor_rows": len(anchor_keys), "raw_grid": grid["raw_grid"],
+            "row_map": list(grid["row_map"]), "blank_rows_dropped": list(grid["blank_rows_dropped"]),
         }
         if not pairs:
             blockers.append([
@@ -3374,7 +3532,7 @@ def _pick_canonical_channel(channels):
     return None, None
 
 
-def _apply_rowspan_filldown(payload: dict, candidate, findings: _Findings) -> dict:
+def _apply_rowspan_filldown(payload: dict, candidate, findings: _Findings, *, channels=()) -> dict:
     """依 **cell geometry** 做 fill-down。這是本輪唯一被允許的 rowspan 證據來源。
 
     契約 §6.4 原本還列了「兩個獨立 extractor 對 span 一致」，但在目前的 schema 與
@@ -3386,14 +3544,14 @@ def _apply_rowspan_filldown(payload: dict, candidate, findings: _Findings) -> di
     **沒有證據的空格保持空**——「保留 / 未實作 / 不適用」本來就該是空。
     """
     conflicts: dict[str, dict] = {}
-    cells = _geometry_cells(candidate)
+    cells = _effective_geometry_cells(candidate, channels)
     rows = payload["rows"]
     if not cells or not rows:
         return conflicts
     offset = 1 if len(cells) == len(rows) + 1 else 0
-    if len(cells) - offset < len(rows):
+    if len(cells) - offset != len(rows):
         findings.note("rowspan_geometry_unusable", "geometry 的列數與 payload 對不上，不做 fill-down")
-        return
+        return conflicts
 
     n_cols = len(payload["columns"])
     for col in range(n_cols):
@@ -3508,7 +3666,7 @@ def _native_checks(payload, channels, candidate, alignment, *,
     counts = {len(grid["rows"]) for _name, grid in channels}
     checks["row_count_agreement"] = len(counts) == 1 and counts.pop() == len(payload["rows"])
 
-    cells = _geometry_cells(candidate)
+    cells = _effective_geometry_cells(candidate, channels)
     if cells:
         widths = {len(row) for row in cells}
         checks["cell_geometry"] = (
@@ -3579,7 +3737,7 @@ def verify_native_table(candidate: Candidate, evidence: PageEvidence) -> FigureR
     payload = _grid_to_table_payload(canonical_grid, where=where)
     # fill-down 必須在對齊**之前**：inherited 的格不參與 anchor 比對（見
     # align_table_cells 內的說明），順序反了會把正確的 rowspan 打成 conflict。
-    span_conflicts = _apply_rowspan_filldown(payload, candidate, findings)
+    span_conflicts = _apply_rowspan_filldown(payload, candidate, findings, channels=channels)
     alignment = align_table_cells(payload, candidate, evidence)
     # rowspan 的正面矛盾也是 cell 級 evidence，要進 anchor 統計與 manifest。
     alignment.setdefault("cells", {}).update(span_conflicts)
@@ -3618,7 +3776,9 @@ def verify_native_table(candidate: Candidate, evidence: PageEvidence) -> FigureR
         "canonical_channel": canonical_name,
         "checks": checks,
         "channel_grids": {
-            name: {"rows": len(grid["rows"]), "cols": len(grid["header"])}
+            name: {"rows": len(grid["rows"]), "cols": len(grid["header"]),
+                   "raw_rows": len(grid["raw_grid"]["rows"]), "row_map": list(grid["row_map"]),
+                   "blank_rows_dropped": list(grid["blank_rows_dropped"])}
             for name, grid in channels
         },
     })
@@ -4412,15 +4572,21 @@ def _shift_table_evidence_for_recovered_row(evidence: dict, labels: list[str], *
     for row in (updated.get("row_alignment") or {}).values():
         if not isinstance(row, dict):
             continue
-        for key in ("pairs", "payload_rows", "anchor_rows"):
+        for key in ("pairs", "payload_rows", "anchor_rows", "effective_anchor_rows"):
             if isinstance(row.get(key), int):
                 row[key] += 1
+        if isinstance(row.get("row_map"), list):
+            row["row_map"].insert(0, 0)  # source row 0 is the recovered original header
 
     native = dict(updated.get("native") or {})
     grids = copy.deepcopy(native.get("channel_grids") or {})
     for grid in grids.values():
-        if isinstance(grid, dict) and isinstance(grid.get("rows"), int):
-            grid["rows"] += 1
+        if isinstance(grid, dict):
+            for key in ("rows", "raw_rows"):
+                if isinstance(grid.get(key), int):
+                    grid[key] += 1
+            if isinstance(grid.get("row_map"), list):
+                grid["row_map"].insert(0, 0)
     native["channel_grids"] = grids
     native["cross_page_continuation"] = {
         "from_figure_id": previous.figure_id,

@@ -26,6 +26,7 @@ import contextlib
 import itertools
 import json
 import os
+import secrets
 import threading
 import time
 import weakref
@@ -40,6 +41,7 @@ import client_notify
 import client_policy
 import client_progress
 import client_prompt
+import client_store
 import config
 import context_budget
 import llama_client
@@ -226,6 +228,7 @@ def _apply_pruning(
 
 _INTERNAL_KEYS = frozenset({
     "time", "tool_status", "synthetic", "structured", "call_index", "queue_id", "delivery_mode",
+    "message_id", "turn_status", "cancellation_projected",
 })
 
 
@@ -358,6 +361,19 @@ def heal_in_place(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
         insertions.append((end, healed))
     for position, healed in reversed(insertions):
         out[position:position] = healed
+    # All three projections (live, prime and summary) come through here after
+    # pruning. The local status stays attached to the original user message;
+    # neither the persisted text nor the displayed transcript is rewritten.
+    for message in out:
+        if (message.get("role") == "user" and not message.get("synthetic")
+                and message.get("turn_status") == "cancelled"
+                and not message.get("cancellation_projected")):
+            message["content"] = (
+                "[CodeTrail 回合狀態：此要求已取消，僅保留作歷史；"
+                "不得繼續或列入待辦，除非使用者重新要求。]\n"
+                + str(message.get("content") or "")
+            )
+            message["cancellation_projected"] = True
     return out
 
 
@@ -1128,6 +1144,10 @@ class Engine:
                 message = {k: v for k, v in record.items() if k != "type"}
                 history.append(dict(message))
                 transcript.append(dict(message))
+            elif kind == "turn_cancelled":
+                history = client_store.apply_turn_cancellation(history, record)
+                transcript = client_store.apply_turn_cancellation(transcript, record)
+                transcript.append({"type": "turn_cancelled", "time": record.get("time")})
         return SessionSnapshot(
             session_id=session_id,
             messages=tuple(history),
@@ -1195,6 +1215,8 @@ class Engine:
     def _record(self, message: Mapping[str, Any], *, require_active: bool = False) -> bool:
         payload = dict(message)
         payload.setdefault("time", time.time())
+        if payload.get("role") == "user" and not payload.get("synthetic"):
+            payload.setdefault("message_id", secrets.token_hex(16))
         if require_active:
             with self._turn_state:
                 if self._cancel.is_set() or self._in_turn == 0 or self._turn_completed:
@@ -1210,6 +1232,21 @@ class Engine:
             if self.store_error is None:
                 self.store_error = f"{type(exc).__name__}: {exc}"
         return True
+
+    def _record_turn_cancellation(self, start: int) -> None:
+        ids = [message["message_id"] for message in self.messages[start:]
+               if message.get("role") == "user" and not message.get("synthetic")]
+        if not ids:
+            return
+        record = {"type": "turn_cancelled", "schema": 1,
+                  "time": time.time(), "message_ids": ids}
+        updated = client_store.apply_turn_cancellation(self.messages, record)
+        try:
+            self.store.append(self.session_id, record)
+        except Exception as exc:  # noqa: BLE001 - retain the live state and report persistence loss
+            if self.store_error is None:
+                self.store_error = f"{type(exc).__name__}: {exc}"
+        self.messages[:] = updated
 
     # ---- payload -------------------------------------------------------
     def payload_messages(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1626,8 +1663,10 @@ class Engine:
         # 從這裡開始就算「進行中」:寫 user 訊息(store append 可能慢)期間的 cancel() 也要算數,
         # 不然一個已經改動 session 歷史的 send() 被當成閒置,取消無效、模型請求照發。
         self._begin_turn()
+        start = len(self.messages)
         try:
             self.heal_pending_tool_calls()
+            start = len(self.messages)
             accepted = self._record(
                 {"role": "user", "content": text}, require_active=on_user_recorded is not None,
             )
@@ -1638,6 +1677,14 @@ class Engine:
             return self.run_tool_loop(
                 on_event=emit, on_text=on_text, on_reasoning=on_reasoning, approve=approve
             )
+        except (TurnCancelled, KeyboardInterrupt):
+            self._record_turn_cancellation(start)
+            if self.store_error is not None:
+                emit(client_events.notice_event(
+                    self.session_id,
+                    f"⚠ 取消狀態未能完整落檔({self.store_error})；重開可能失去取消標記。",
+                ))
+            raise
         finally:
             self._end_turn()
 

@@ -325,14 +325,18 @@ def export_from_store(
     「歷史助理回答不得當 oracle」是**挖掘層**(``draft_from_export`` 只讀 user
     text)與 suite schema 的契約,不是靠匯出時把證據丟掉來達成。
     """
-    messages: list[dict[str, Any]] = []
+    import client_store
+
+    # Keep the original text as evidence, but do not mine cancelled inputs into
+    # new replay tasks. Compaction never replaces this raw export transcript.
+    raw_messages: list[dict[str, Any]] = []
     for record in records:
-        if record.get("type") == "compaction":
-            # append-only 檔裡原始對話都還在;compaction 記錄只是「送模型的那一份」
-            # 從哪裡起算。來源封存要的是原始對話,所以這筆略過、**不**清掉前段。
-            continue
-        if record.get("type") != "message":
-            continue
+        if record.get("type") == "message":
+            raw_messages.append(dict(record))
+        elif record.get("type") == "turn_cancelled":
+            raw_messages = client_store.apply_turn_cancellation(raw_messages, record)
+    messages: list[dict[str, Any]] = []
+    for record in raw_messages:
         role = record.get("role")
         content = record.get("content")
         if role == "user":
@@ -343,7 +347,9 @@ def export_from_store(
             messages.append(
                 {
                     "info": {"role": "user"},
-                    "parts": [{"type": "text", "text": content if isinstance(content, str) else ""}],
+                    "parts": [{"type": "text", "text": content if isinstance(content, str) else "",
+                               **({"ignored": True, "turn_status": "cancelled"}
+                                  if record.get("turn_status") == "cancelled" else {})}],
                 }
             )
         elif role == "assistant":

@@ -1384,6 +1384,149 @@ def test_cancel_stops_the_model_stream_without_recording_an_answer(engine_factor
     assert engine.messages[-1]["role"] == "user"
 
 
+def test_cancelled_turn_survives_resume_summary_and_export(engine_factory, monkeypatch):
+    """A cancelled request must not silently become an active task after reload."""
+    import client_app
+    import client_compaction as cc
+    import session_eval
+
+    engine = engine_factory()
+    original = "Generate a long firmware debugging checklist."
+
+    def cancelled(**_kwargs):
+        assert engine.cancel() is True
+        yield _text_chunk("unfinished")
+
+    monkeypatch.setattr(llama_client, "chat_completions", cancelled)
+    with pytest.raises(client_engine.TurnCancelled):
+        engine.send(original)
+    records = engine.store.read(engine.session_id)
+    assert any(record.get("type") == "turn_cancelled" for record in records), (
+        "cancellation vanished from the append-only session"
+    )
+    assert not any(message["role"] == "assistant" for message in engine.messages)
+    assert engine.messages[0]["content"] == original
+    snapshot = engine.load_session(engine.session_id)
+    engine.adopt(snapshot)
+    assert engine.messages[0]["turn_status"] == "cancelled"
+    assert cc.last_user_answered(engine.messages) is True
+    assert cc.completed_turns(engine.messages) == []
+    prefix = engine.next_turn_prefix()
+    assert "已取消" in prefix[-1]["content"]
+    assert original in prefix[-1]["content"]
+    assert all("message_id" not in message and "turn_status" not in message
+               for message in prefix)
+    captured = []
+
+    def answer(**kwargs):
+        captured.append(kwargs["messages"])
+        yield _text_chunk("done", finish="stop")
+
+    monkeypatch.setattr(llama_client, "chat_completions", answer)
+    engine.send("Only answer done.")
+    assert captured[0] == prefix + [{"role": "user", "content": "Only answer done."}]
+    summary = cc.build_summary_messages(engine.prune_for_summary(engine.messages))
+    assert "已取消" in summary[-1]["content"]
+    assert original in summary[-1]["content"]
+    assert [turn.question for turn in cc.completed_turns(engine.messages)] == ["Only answer done."]
+    entries = client_app.history_entries(snapshot.transcript)
+    assert any(entry.kind == "cancelled" for entry in entries)
+    assert [entry.text for entry in entries if entry.kind == "user"] == [original]
+    assert client_store.session_outline(records)["messages"] == 1
+    assert client_store.session_outline(records)["first_prompt"] == original
+    exported = session_eval.export_from_store(engine.session_id, records)
+    assert exported["messages"][0]["parts"][0]["text"] == original
+    assert exported["messages"][0]["parts"][0]["ignored"] is True
+    assert session_eval._user_text(exported["messages"][0]) == ""
+
+
+def test_cancelled_supplements_are_terminal_for_compaction(engine_factory, monkeypatch):
+    """Cancellation settles every accepted input in the turn, without an answer."""
+    import client_compaction as cc
+
+    engine = engine_factory()
+    accepted = []
+
+    def supplement():
+        accepted.append(engine.record_supplement("Also cover interrupts.", queue_id="q000001"))
+
+    engine.set_supplement_callback(supplement)
+
+    def cancelled(**_kwargs):
+        engine.cancel()
+        yield _text_chunk("unfinished")
+
+    monkeypatch.setattr(llama_client, "chat_completions", cancelled)
+    with pytest.raises(client_engine.TurnCancelled):
+        engine.send("Generate a long checklist.")
+    assert accepted == [True]
+    assert all(message.get("turn_status") == "cancelled" for message in engine.messages)
+    compactor = cc.Compactor(engine, mode=cc.MODE_CODETRAIL, n_ctx=131072, env=engine.env)
+    monkeypatch.setattr(compactor, "estimated_tokens", lambda: compactor.derived.idle_threshold + 1)
+    assert compactor.should_compact() == (True, "over_threshold")
+    assert compactor._recovery_anchor(10**9) is None
+    anchor = compactor.anchor()
+    assert anchor is not None
+    compactor.last_anchor = anchor
+    assert compactor.should_compact() == (False, "same_anchor")
+    # Unmarked old sessions retain the pending-user contract; no retroactive guessing.
+    engine.messages = [{"role": "user", "content": "unanswered"}]
+    assert cc.last_user_answered(engine.messages) is False
+
+
+def test_cancellation_record_failure_is_visible_and_never_creates_an_answer(
+    engine_factory, monkeypatch,
+):
+    """The new durable state may fail to persist, but must never fail silently."""
+    engine = engine_factory()
+    append = engine.store.append
+
+    def reject_marker(session_id, record):
+        if record.get("type") == "turn_cancelled":
+            raise OSError("disk full")
+        append(session_id, record)
+
+    monkeypatch.setattr(engine.store, "append", reject_marker)
+
+    def cancelled(**_kwargs):
+        engine.cancel()
+        yield _text_chunk("partial")
+
+    monkeypatch.setattr(llama_client, "chat_completions", cancelled)
+    events = []
+    with pytest.raises(client_engine.TurnCancelled):
+        engine.send("cancel me", on_event=events.append)
+    assert engine.messages[0]["turn_status"] == "cancelled"
+    assert not any(message["role"] == "assistant" for message in engine.messages)
+    assert engine.store_error and "disk full" in engine.store_error
+    assert any(event.get("type") == "notice" and "取消" in str(event) for event in events)
+    # Never manufacture a durable marker after a failed write.
+    assert "turn_status" not in engine.load_session(engine.session_id).messages[0]
+
+
+@pytest.mark.parametrize("corrupt", ["missing", "duplicate", "synthetic", "bool_schema"])
+def test_invalid_cancellation_record_cannot_half_switch_a_session(engine_factory, corrupt):
+    engine = engine_factory()
+    engine._record({"role": "user", "content": "original"})
+    identity = engine.messages[0]["message_id"]
+    record = {"type": "turn_cancelled", "schema": 1, "message_ids": [identity]}
+    if corrupt == "missing":
+        record["message_ids"] = ["0" * 32]
+    elif corrupt == "duplicate":
+        record["message_ids"].append(identity)
+    elif corrupt == "synthetic":
+        engine.store.append(engine.session_id, {"type": "message", "role": "user",
+                            "content": "summary", "synthetic": True, "message_id": "1" * 32})
+        record["message_ids"] = ["1" * 32]
+    else:
+        record["schema"] = True
+    engine.store.append(engine.session_id, record)
+    before = copy.deepcopy(engine.messages)
+    with pytest.raises(client_store.SessionStoreError):
+        engine.load_session(engine.session_id)
+    assert engine.messages == before
+
+
 def test_cancel_reaches_an_active_mcp_call_and_heals_the_history(engine_factory, monkeypatch):
     """進行中的 MCP 呼叫要走 client_mcp 的取消契約,不是等它自己跑完。
 

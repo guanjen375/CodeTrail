@@ -173,12 +173,14 @@ def is_completed_answer(message: Mapping[str, Any]) -> bool:
 
 
 def last_user_answered(messages: Sequence[Mapping[str, Any]]) -> bool:
-    """最後一則**真實**使用者訊息有沒有被完整回答。沒有使用者訊息算已回答。"""
+    """最後一則真實使用者訊息是否已結束（完整回答或明確取消）。"""
     last_user = None
     for index, message in enumerate(messages):
         if message.get("role") == "user" and not message.get("synthetic"):
             last_user = index
     if last_user is None:
+        return True
+    if messages[last_user].get("turn_status") == "cancelled":
         return True
     return any(is_completed_answer(message) for message in messages[last_user + 1:])
 
@@ -203,7 +205,7 @@ def completed_turns(messages: Sequence[Mapping[str, Any]]) -> list[Turn]:
     for message in messages:
         role = message.get("role")
         if role == "user":
-            if message.get("synthetic"):
+            if message.get("synthetic") or message.get("turn_status") == "cancelled":
                 pending = None
                 continue
             pending = str(message.get("content") or "")
@@ -400,6 +402,7 @@ def build_summary_messages(
     """組出摘要請求。七條規則**附加**在指示之後,前一份摘要一定要進去。"""
     instructions = [
         "你的任務是把下面這段對話壓縮成一份結構化摘要,讓另一個助理可以只憑摘要接手。",
+        "標記已取消的要求已結束，不能放入任務或下一步；保留已取得的事實，不得自行恢復要求。",
         "",
         rules_block(),
     ]
@@ -432,7 +435,8 @@ def serialise_history(history: Sequence[Mapping[str, Any]]) -> str:
         role = message.get("role")
         content = message.get("content")
         if role == "user":
-            lines.append(f"[使用者] {content}")
+            label = "已取消的使用者要求" if message.get("turn_status") == "cancelled" else "使用者"
+            lines.append(f"[{label}] {content}")
         elif role == "assistant":
             if isinstance(content, str) and content.strip():
                 lines.append(f"[助理] {content}")
@@ -636,13 +640,20 @@ class Compactor:
         return "recovery:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
     def anchor(self) -> str | None:
-        """這一次要用哪一則助理訊息當切點,回它的**身分**。
+        """回傳最新完成答案或明確取消回合的穩定身分。
 
         身分不能用位置:壓縮之後索引全變了,同一則助理訊息會被當成新的錨點,
         於是每次 idle 都再壓一次,而且每一次都「成功」。優先用 engine 給的
         穩定 id,沒有就用 (時間, 內容雜湊)。
         """
         for message in reversed(self.engine.messages):
+            if (message.get("role") == "user" and not message.get("synthetic")
+                    and message.get("turn_status") == "cancelled"):
+                identity = json.dumps(
+                    {key: message.get(key) for key in ("message_id", "time", "content", "turn_status")},
+                    ensure_ascii=False, sort_keys=True,
+                )
+                return "cancelled:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
             if message.get("role") != "assistant" or message.get("tool_calls"):
                 continue
             if not is_completed_answer(message):

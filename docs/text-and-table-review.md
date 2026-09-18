@@ -14,6 +14,12 @@ query_table(figure_id="fig_<16-hex>", row=3, column="2")
 
 至少提供 `row`、`register` 或 `address` 之一；可用 `document_id`、`figure_id` 限定範圍。`row` 是 canonical 的 1-based `row_index`，不含表頭。`column`／`register_column`／`address_column` 接受完整欄名或 1-based 正整數字串；數字字串一律視為序號。未填 `column` 會回傳唯一符合列的全部格子。
 
+`document_id` 接受目前 KB 的完整 ID、來源 basename（如 `registers.pdf`），或 ID 中的精確
+相對路徑。先比對完整 ID，別名必須唯一；找不到回 `document_scope_not_found`，歧義回
+`document_scope_ambiguous` 與候選 ID，不會自動改查全庫。另指定 `figure_id` 時取兩者交集。
+歷史 artifacts 不參與別名解析。結果的 `scope` 同時出現在文字與 structured payload，記錄
+原始 document／figure、解析結果與 `all_eligible_tables`；重試仍須保留使用者指定的範圍。
+
 register 名稱逐字、區分大小寫比對，不做模糊搜尋。地址僅正規化十進位數字或 `0x` 十六進位整數，因此 `0x004000` 可匹配 `16384`；不推導 base + offset、不解析範圍或運算式。原始值不改寫。
 
 未指定 selector 欄時，只接受唯一完整表頭：register 欄為 `Register`、`Register Name`、`Name`、`寄存器`、`暫存器`、`名稱`；地址欄為 `Address`、`Register Address`、`Addr`、`地址`、`位址`。此表頭辨識忽略頭尾空白及大小寫。無法唯一辨識時須明示 selector 欄，不能在任意數字格猜地址。

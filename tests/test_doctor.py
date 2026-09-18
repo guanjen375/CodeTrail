@@ -875,6 +875,33 @@ def test_structured_completed_tool_event_passes():
     assert evidence.saw_tool_calls_finish is True
 
 
+@pytest.mark.smoke
+@pytest.mark.parametrize("partial", ["", _completed_event()], ids=["no_events", "partial_tool"])
+def test_canary_timeout_is_unverified_not_a_proven_contract_failure(
+    monkeypatch, tmp_path, capsys, partial,
+):
+    """A busy/slow live model must not be diagnosed as a broken tool contract."""
+    attempt = canary.run_model_attempt
+    root, env = _patch_runtime(monkeypatch, tmp_path, [])
+
+    def timeout(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"], output=partial)
+
+    monkeypatch.setattr(canary, "_run_process_with_heartbeat", timeout)
+    monkeypatch.setattr(canary, "run_model_attempt", attempt)
+    evidence = attempt(root=root, env=env, model_override="m", timeout=120)
+    assert evidence.success is False
+    assert getattr(evidence, "failure_kind", None) == "timeout"
+    assert canary.run_all(root=root, env=env, explicit_model="m",
+                          base_url=CANARY_BASE_URL, force=True) == 2
+    error = capsys.readouterr().err
+    assert "未完成驗證" in error
+    assert "忙碌" in error and "契約損壞" in error
+    assert "請修正 direct-tool / MCP / explicit tool-call 契約" not in error
+    assert "private-project-file.c" not in error
+    assert not _cache_path(tmp_path).exists()
+
+
 def test_fake_xml_and_success_prose_do_not_count_as_tool_use():
     output = json.dumps(
         {

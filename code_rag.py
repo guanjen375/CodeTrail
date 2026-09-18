@@ -227,7 +227,8 @@ def _trace_key(item: dict) -> tuple:
     return (item.get("path"), item.get("line"), item.get("symbol", ""))
 
 
-def _trace_add_files(trace: dict, paths, hashes: dict | None = None) -> None:
+def _trace_add_files(trace: dict, paths, hashes: dict | None = None, *,
+                     hash_algorithm: str = "code_rag_md5_v1") -> None:
     """把要快照的檔加進 trace["files"](去重;帶**索引時**的內容雜湊,快照端拿它核對
     工作樹現在的內容是不是搜尋時那一版)。這裡不設上限:最終結果 + reranker 評過的 +
     context evidence 三者之和有限;快照端的上限有缺席標記(blobs_truncated)。"""
@@ -238,10 +239,12 @@ def _trace_add_files(trace: dict, paths, hashes: dict | None = None) -> None:
         if not path or path in seen:
             continue
         seen.add(path)
-        files.append({"path": path, "index_hash": hashes.get(path)})
+        files.append({"path": path, "index_hash": hashes.get(path),
+                      "index_hash_algorithm": hash_algorithm})
 
 
-def _finish_code_trace(trace: dict, ranked: list, hashes: dict | None = None) -> None:
+def _finish_code_trace(trace: dict, ranked: list, hashes: dict | None = None, *,
+                       hash_algorithm: str = "code_rag_md5_v1") -> None:
     """把最終結果標回候選池、列出最終清單與要快照的檔案。"""
     final_keys = {_trace_key(rc.item) for rc in ranked}
     for row in trace.get("pool", []):
@@ -255,7 +258,7 @@ def _finish_code_trace(trace: dict, ranked: list, hashes: dict | None = None) ->
     ]
     paths = [row.get("path") for row in trace["final"]]
     paths += [r.get("path") for r in trace.get("pool", []) if r.get("rerank") is not None]
-    _trace_add_files(trace, paths, hashes)
+    _trace_add_files(trace, paths, hashes, hash_algorithm=hash_algorithm)
     trace["stage"] = "done"
 
 
@@ -1763,12 +1766,14 @@ class CodeRAG:
         if self.build_context is not None:
             self.build_context.assert_fresh()
         if trace is not None:
-            _finish_code_trace(trace, ranked, self._indexed_file_hashes or {})
+            _finish_code_trace(trace, ranked, self._indexed_file_hashes or {},
+                               hash_algorithm="sha256" if self.build_context is not None else "code_rag_md5_v1")
         return ranked
 
     def trace_add_files(self, trace: dict, paths) -> None:
         """把後續階段(context evidence 等)真的回傳的檔補進 trace["files"],帶索引時的雜湊。"""
-        _trace_add_files(trace, paths, self._indexed_file_hashes or {})
+        _trace_add_files(trace, paths, self._indexed_file_hashes or {},
+                         hash_algorithm="sha256" if self.build_context is not None else "code_rag_md5_v1")
 
     def get_candidates_prompt(self, question: str) -> str:
         """生成給 Agent 的候選提示"""

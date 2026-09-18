@@ -41,6 +41,44 @@ def test_exact_table_budget_never_exposes_a_shortened_cell_value():
     assert result.structuredContent == payload
 
 
+def test_table_scope_and_recovery_reach_model_text_without_widening(tmp_path, monkeypatch):
+    """A scoped miss formerly instructed the model to switch to another indexed source."""
+    import table_lookup
+
+    document = "qa/docs/spec.pdf::0123456789abcdef"
+    figure = "fig_" + "a" * 16
+    monkeypatch.setattr(table_lookup.evidence_store, "snapshot", lambda _root: {
+        "metadata": {}, "chunks": [{"source": "spec.pdf", "document_id": document}]})
+    monkeypatch.setattr(table_lookup.figure_review, "list_figures", lambda *a, **k: [])
+    budget = ResultBudget(4000, 16000, False, False)
+    for wanted_document, wanted_figure in (("spec.pdf", figure), ("", figure), ("spec.pdf", "")):
+        payload = table_lookup.query_table(tmp_path, document_id=wanted_document,
+                                           figure_id=wanted_figure, register="CTRL", column="Reset")
+        result = adapt_tool_result("query_table", payload, budget=budget)
+        text = result.content[0].text
+        assert "Use another indexed source" not in text, text
+        assert "Keep the requested document_id and figure_id scope" in text
+        assert "scope: " in text and '"all_eligible_tables":false' in text
+        assert payload["scope"]["requested_document_id"] == wanted_document
+        assert payload["scope"]["requested_figure_id"] == wanted_figure
+        assert result.structuredContent["scope"] == payload["scope"]
+        if wanted_document:
+            assert payload["scope"]["resolved_document_ids"] == [document]
+            assert document in text
+
+    # Even a successful all-table match must reveal the missing source filters.
+    payload = table_lookup.query_table(tmp_path, register="CTRL", column="Reset")
+    assert payload["scope"]["all_eligible_tables"] is True
+    assert payload["scope"]["resolved_document_ids"] == []
+    payload.update(status="ok", has_ref=True, matches=[{"document_id": document, "figure_id": figure,
+                                                       "value": "0x0001"}])
+    result = adapt_tool_result("query_table", payload, budget=budget)
+    assert '"all_eligible_tables":true' in result.content[0].text
+    assert '"requested_figure_id":""' in result.content[0].text
+    assert result.structuredContent["scope"]["requested_document_id"] == ""
+    assert result.content[0].text.index("scope:") < result.content[0].text.index("cell:")
+
+
 def test_ocr_exclusion_and_build_unknown_reach_the_model_text_lane():
     budget = ResultBudget(4000, 16000, False, False)
     excluded = {"source": "spec.pdf", "page": 3, "text_id": "ocr_a", "reason": "unreviewed"}

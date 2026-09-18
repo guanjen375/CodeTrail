@@ -357,6 +357,8 @@ session 或 history 變動後才回來的舊數字會丟棄。
   `list_dir`，只接受 JSON stream 裡 completed 的結構化 `tool_use`。純文字／XML
   和模型自行宣稱成功都不算。首次失敗 retry 一次；第二次才成功印 `MODEL FLAKY`、本次
   放行但不快取；連續兩次失敗 exit 2。
+  逾時會另列「時限內未完成驗證」：MCP PASS 仍有效，但模型忙碌、單 slot 排程與處理速度
+  尚未排除，不能直接歸因工具契約損壞。explicit 必須真正通過才能啟動，沒有逾時放行。
 - `IMPLICIT live diagnostic ...` 之後只會是 `status=optimal|suboptimal|fail|timeout`。
   這一輪 prompt 不含工具名，只跑一次：exact completed root `list_dir` 是 `optimal`；選到
   其他 allowlisted CodeTrail 唯讀工具是 `suboptimal`；沒有合格 call 是 `fail`；超時是
@@ -886,7 +888,7 @@ top-level `image_data` 可能被新版 llama.cpp 靜默忽略，造成模型只�
 | `image_tokens_est` | `FIGURE_MAX_IMAGE_TOKENS_PER_DOC` / `FIGURE_MAX_IMAGE_TOKENS_PER_CALL` | 400000 / 4096 |
 
 > 這些欄位涵蓋所有結構化候選，包含純 raster 的分類、雙樣本抽取與 image-token 估算。
-> 沒被收成候選的區域不進預算——它們不會被送出去，報告改在「不會進 KB 的頁 / 區域」
+> 沒被收成候選的區域不進預算——它們不會被送出去，報告改在「預計未收為結構化圖面的頁 / 區域」
 > 那一段逐筆列出頁碼、bbox 與原因。
 
 三種處理方式:
