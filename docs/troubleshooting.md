@@ -169,7 +169,7 @@ server 一直開著、weights 早就載進來了,開一段新對話的第一個�
 | `prompt processing(92%)` | 收到首個進度快照滿 10 秒後,顯示本次 prompt 的最新取樣;可附已處理/總 token、cache、速率與 prefill 耗時 | prefix 仍在 KV cache 裡時,需要重新評估的部分可能較少 |
 | `prompt processing` | 已超過顯示門檻且 server 有回報 prompt 階段,但沒有可信計數 | 不估算百分比或速度 |
 | `產生回應中` | 已收到 content、reasoning 或工具呼叫的生成訊號,尚無可顯示的答案文字或 reasoning 段數 | — |
-| `thinking N 段` | 模型在產生 reasoning。`show_reasoning` 預設關,所以畫面上只有 spinner 與段數 | **不能**。這是模型自己的輸出成本 |
+| `thinking N 段` | 模型在產生 reasoning，對話區同時顯示紅字「思考中」；`show_reasoning` 只控制本文顯示 | 後續回合可在閒置時用 `/think off` 關閉生成 |
 | `回答中` | 已經在產生你會看到的答案 | — |
 | `執行工具 list_dir` / `等待核准 apply_patch` | 正在執行具名工具,或等待你核准該工具 | 核准框仍顯示完整參數;拒絕只影響這個工具 |
 | `compact · prompt processing(92%)` / `compact · 產生摘要中` | 手動或自動壓縮正在處理摘要 prompt,或產生摘要;其餘等待階段也帶 `compact ·` 前綴 | 百分比只代表摘要 prompt 處理進度 |
@@ -197,9 +197,16 @@ server 在初始快照後,每完成一個最多 `n_batch` token 的批次才推�
 同一請求晚到的進度不會讓狀態倒退。工具之後的下一次模型請求會重新計時並顯示等待
 階段,已顯示的回答與 reasoning 保留。進度僅存在當前狀態列,不寫入 session 或 headless JSON。
 
-`/thinking` 只切換 reasoning 要不要顯示在畫面上,**不改**送給模型的東西,也不會讓 thinking
-變長或變短(「舊回合的 reasoning 進不進模型」是另一個鍵:`client.json` 的
-`keep_historical_reasoning`)。
+`/think` 控制主聊天是否生成 reasoning，預設 off；`/think on` / `/think off` 可明確設定，
+狀態列顯示 `think=on|off`。回合、核准或審查進行中不能變更。`client.json` 的
+`show_reasoning` 只管 reasoning 本文與重播顯示，`keep_historical_reasoning` 才控制
+舊回合 reasoning 是否送回模型，三者互不代用。「思考中」只在實際收到 reasoning 時出現，
+開始回答、工具活動或回合收尾時消失，不會存進對話歷史。
+
+若 `/think on` 提示模型未確認支援，請重跑 `set_config.sh`，讓它檢查主模型 GGUF 的
+chat template 並寫入 `services.main.thinking_kwarg`。未偵測到控制鍵、值為 `null` 或
+舊設定缺少此欄位時都不能開啟；off 仍明確關閉兩個模板參數，不依賴模型的預設值。
+摘要、審查、canary、RAG 等內部生成也固定 off。
 
 **prefill 這一段的機制。** 客戶端每一個 model step 只送**一個**
 `POST /v1/chat/completions`,而且一律帶 `cache_prompt`(客戶端硬編碼開啟,沒有設定能關)。
@@ -234,19 +241,21 @@ server 在初始快照後,每完成一個最多 `n_batch` token 的批次才推�
 這是本機這顆 build 的實作行為,**不是**所有版本的保證 —— 所以「server 沒關過」不等於
 「這份 prompt 已經算好了」。
 
-**客戶端會做的事:prompt cache 預熱。** TUI 就緒、`/new`、換 session,以及自動壓縮或
-`/compact` 成功換掉歷史之後,客戶端會在背景送一次「下一輪真的會送的 prefix」、
+**客戶端會做的事:prompt cache 預熱。** 主聊天 thinking 關閉時，TUI 就緒、`/new`、換 session,
+以及自動壓縮或 `/compact` 成功換掉歷史之後，客戶端會在背景送一次「下一輪真的會送的 prefix」、
 `max_tokens=1` 的請求,把可避免的那段 prefill 搬到你還在打字的時候做。它:
 
 - 只送 prefix(下一輪的內容,減掉你還沒打的那一句),**不產生任何一則對話內容**:對話區、
-  session 檔與歷史都不會因為預熱而多出東西
+  session 檔與歷史都不會因為預熱而多出東西；空白啟動也可預熱，首次送出問題建立
+  session 時保留這份相同的 prefix
 - 只在互動模式跑。readonly session(replay / canary)與 headless 的 `run` **永遠不預熱**
+- 預熱固定關閉 thinking；`/think on` 會停止舊預熱並跳過之後的預熱
 - `/new` 與換 session 會中止還在飛的那一次(不管它走到哪一段;中止之後不會再送任何請求)
 - **不能**縮短 thinking,也不會讓硬體算得比較快;它只改變「這段 prefill 發生在你打字之前,
   還是按 Enter 之後」。prefix 本來就是熱的時候,預熱等於沒感覺
 
 接續已有歷史時，`codetrail` 自動模式會先重播原始對話，再檢查完整輸入是否超過
-壓縮門檻；需要壓縮就先完成那個可 Ctrl-C 中止的回合，之後才預熱。這段壓縮與
+壓縮門檻；需要壓縮就先完成那個可 Ctrl-C 中止的回合，thinking 關閉時再預熱。這段壓縮與
 零寫入的 cache 預熱分開；manual / off 不會在接續時自動摘要，readonly 也不新增
 這條無新問句的生成路徑。
 
@@ -273,6 +282,7 @@ server 在初始快照後,每完成一個最多 `n_batch` token 的批次才推�
 | 跳過原因 | 意思 |
 |---|---|
 | `disabled` | repo 常數 `config.CLIENT_PRIME_PROMPT_CACHE` 是 False(改它是改 repo,所有使用者一致) |
+| `thinking` | 主聊天 thinking 已開啟；內部預熱固定 off，因此跳過 |
 | `tools_not_loaded` | 工具清單還沒載完 |
 | `policy` | 不是互動模式(readonly session 一律不預熱) |
 | `model_busy` / `turn_in_progress` | 有一輪正在跑,預熱讓路 |
@@ -280,7 +290,7 @@ server 在初始快照後,每完成一個最多 `n_batch` token 的批次才推�
 | `next_turn_would_overflow` / `gate` | context 閘擋下來了(該壓縮或開新對話) |
 | `incomplete` | 請求在終結 chunk 之前就結束(server 只送了 keep-alive 或幾個 delta 就關線);不算送出,不記 telemetry |
 | `no_timings` | server 的最後一個 chunk 沒有 `timings.prompt_n`,量不到重算了多少;不算送出,不記 telemetry |
-| `aborted` | 你換了 session 或開了新對話;不管中止落在哪一段,舊預熱之後不會再送任何請求 |
+| `aborted` | 你換了 session、開了新對話或切換 thinking；不管中止落在哪一段，舊預熱之後不會再送任何請求 |
 | `error:<類型>` | 送出時出錯 |
 
 **要量它**:專案目錄下的 `.codetrail/context_metrics.jsonl` 每個請求一行(只有 count 與
@@ -407,7 +417,7 @@ ingest 的待辦通知現在由客戶端自己處理(`client_notify.py`),不再�
 
 ### 送出新問題卻先跑出一段摘要,或壓縮停住要你重送
 
-先確認你選了哪個壓縮模式:`aicode` 啟動橫幅有一行 `[aicode] 壓縮模式=...`,
+先確認你選了哪個壓縮模式：TUI 的 `/status` 保留 `[aicode] 壓縮模式=...` 啟動診斷，
 `python3 scripts/doctor.py` 的 `-- 壓縮模式 --` 一段則會再印出有效設定跟它一不一致。
 三種模式的完整說明、門檻公式與取捨在 [compaction-rules.md](compaction-rules.md)。
 

@@ -390,12 +390,14 @@ def build_chat_probe_payload(
     tools: Sequence[Mapping[str, Any]] | None,
 ) -> dict[str, Any]:
     """Build one side of the frozen same-message, one-token A/B probe."""
+    import llama_client
 
     payload: dict[str, Any] = {
         "model": model,
         "messages": [dict(message) for message in MINIMAL_TOKEN_MESSAGE],
         "max_tokens": 1,
         "stream": False,
+        "chat_template_kwargs": llama_client.thinking_template_kwargs(),
     }
     if tools is not None:
         payload["tools"] = [dict(tool) for tool in tools]
@@ -432,6 +434,7 @@ def _apply_template_payload(probe: Mapping[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "messages": probe["messages"],
         "add_generation_prompt": True,
+        "chat_template_kwargs": probe["chat_template_kwargs"],
     }
     if "tools" in probe:
         payload["tools"] = probe["tools"]
@@ -467,10 +470,13 @@ def _measure_instructions_prompt_tokens(
 
     if not instructions:
         return 0
+    import llama_client
+
     plain_payload = {
         "messages": [dict(message) for message in MINIMAL_TOKEN_MESSAGE],
         "tools": [dict(tool) for tool in tools],
         "add_generation_prompt": True,
+        "chat_template_kwargs": llama_client.thinking_template_kwargs(),
     }
     instructed_payload = {
         "messages": [
@@ -479,6 +485,7 @@ def _measure_instructions_prompt_tokens(
         ],
         "tools": [dict(tool) for tool in tools],
         "add_generation_prompt": True,
+        "chat_template_kwargs": llama_client.thinking_template_kwargs(),
     }
     plain_template = post_json("/apply-template", plain_payload)
     instructed_template = post_json("/apply-template", instructed_payload)

@@ -49,6 +49,7 @@ _LOCAL_TOP_LEVEL_KEYS = {"schema_version", "profile", "services", "llama_bin", "
 DEPLOYMENT_MODES = ("local", "model-host", "client")
 _SERVICE_KEYS = {
     "identity_alias",
+    "thinking_kwarg",
     "model",
     "mmproj",
     "port",
@@ -124,6 +125,7 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
     "services": {
         "main": {
             "model": None,
+            "thinking_kwarg": None,
             "port": 8080,
             "base_url": "http://localhost:8080",
             "gpu_role": "main",
@@ -200,6 +202,8 @@ class ServiceProfile:
     bind: str = "local"
     identity_alias: str | None = None
     deployment_mode: str = "local"
+    # GGUF chat-template capability, not the current chat's generation setting.
+    thinking_kwarg: str | None = None
 
 
 @dataclass(frozen=True)
@@ -463,6 +467,13 @@ def _validate_document(data: dict[str, Any], where: str, *, local: bool = False)
         if not isinstance(raw, dict):
             raise ProfileError(f"{service_where} must be an object")
         _unknown_keys(raw, _SERVICE_KEYS, service_where)
+        if "thinking_kwarg" in raw:
+            if role != "main":
+                raise ProfileError(f"{service_where}.thinking_kwarg is only allowed for main")
+            if raw["thinking_kwarg"] not in (None, "enable_thinking", "thinking"):
+                raise ProfileError(
+                    f"{service_where}.thinking_kwarg must be null, enable_thinking, or thinking"
+                )
         if "identity_alias" in raw:
             alias = raw["identity_alias"]
             if not isinstance(alias, str) or not _BARE_MODEL_RE.fullmatch(alias):
@@ -500,6 +511,12 @@ def _validate_document(data: dict[str, Any], where: str, *, local: bool = False)
                 )
 def _merge(base: dict[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
     merged = dict(base)
+    # A capability belongs to the selected artifact. A model-only override must
+    # not inherit the previous model's supported switch from a base profile.
+    if ("thinking_kwarg" in merged and "model" in overlay
+            and overlay["model"] != merged.get("model")
+            and "thinking_kwarg" not in overlay):
+        merged["thinking_kwarg"] = None
     for key, value in overlay.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _merge(merged[key], value)
@@ -601,7 +618,10 @@ def _validate_effective(data: dict[str, Any], where: str) -> None:
     for role in ROLES:
         raw = services[role]
         if data.get("mode") == "client":
-            _unknown_keys(raw, {"base_url", "model", "identity_alias"}, f"{where}.services.{role}")
+            allowed = {"base_url", "model", "identity_alias"}
+            if role == "main":
+                allowed.add("thinking_kwarg")
+            _unknown_keys(raw, allowed, f"{where}.services.{role}")
             if not raw.get("model") or raw.get("model") != raw.get("identity_alias"):
                 raise ProfileError(f"{where}.services.{role}: model must equal the versioned identity_alias")
             from endpoint_policy import canonical_direct_base_url, EndpointPolicyError
@@ -712,7 +732,8 @@ def load_effective_profile(
                 role=role, model=raw["model"], base_url=raw["base_url"].rstrip("/"),
                 port=_url_port(raw["base_url"], role), gpu_role="", gpu="",
                 ctx=None, batch=None, ubatch=None, parameters={},
-                identity_alias=raw["identity_alias"], deployment_mode=mode)
+                identity_alias=raw["identity_alias"], deployment_mode=mode,
+                thinking_kwarg=raw.get("thinking_kwarg"))
             continue
         services[role] = ServiceProfile(
             role=role,
@@ -728,6 +749,7 @@ def load_effective_profile(
             ubatch=raw["ubatch"],
             parameters=dict(raw["parameters"]),
             identity_alias=raw.get("identity_alias"), deployment_mode=mode,
+            thinking_kwarg=raw.get("thinking_kwarg"),
         )
     return DeploymentProfile(
         name=str(data["name"]),
@@ -990,6 +1012,8 @@ def profile_as_dict(profile: DeploymentProfile, environ: Mapping[str, str] | Non
         if profile.mode == "client":
             services[role] = {"model": service.model, "base_url": service.base_url,
                               "identity_alias": service.identity_alias}
+            if role == "main":
+                services[role]["thinking_kwarg"] = service.thinking_kwarg
             continue
         item = {
             "model": service.model,
@@ -1004,6 +1028,8 @@ def profile_as_dict(profile: DeploymentProfile, environ: Mapping[str, str] | Non
             "parameters": service.parameters,
             "identity_alias": service.identity_alias,
         }
+        if role == "main":
+            item["thinking_kwarg"] = service.thinking_kwarg
         if service.mmproj:
             item["mmproj"] = service.mmproj
         try:
@@ -1035,7 +1061,7 @@ def profile_as_dict(profile: DeploymentProfile, environ: Mapping[str, str] | Non
 
 
 def export_client_profile(profile: DeploymentProfile, server_url: str) -> dict[str, Any]:
-    """Export destinations/aliases only. Importing on B must separately authorize them."""
+    """Export destinations, aliases and capability; B separately authorizes endpoints."""
     from endpoint_policy import canonical_direct_base_url
     from urllib.parse import urlunsplit
     if profile.mode == "client":
@@ -1053,6 +1079,8 @@ def export_client_profile(profile: DeploymentProfile, server_url: str) -> dict[s
             "model": service.identity_alias, "identity_alias": service.identity_alias,
             "base_url": urlunsplit((address.scheme, f"{host}:{service.port}", "", "", "")),
         }
+        if role == "main":
+            services[role]["thinking_kwarg"] = service.thinking_kwarg
     return {"schema_version": 1, "mode": "client", "services": services}
 
 

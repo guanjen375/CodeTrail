@@ -8,7 +8,7 @@
 > **`off` 不在實驗範圍內。** 那條路徑就是「完全不壓縮」:context 滿了會是一個
 > **可見的錯誤**,不會自動補救。**沒有
 > `~/.config/codetrail/client.json` 就等於沒有接管**——`git pull` 之後不會有
-> 任何東西自己啟用,客戶端會退成 `manual` 並在啟動橫幅講明。
+> 任何東西自己啟用，客戶端會退成 `manual`，可在 `/status` 查看。
 
 CodeTrail 客戶端對長對話的處理分成三種模式,由 `./set_config.sh` 顯式選擇並記錄
 在 owner-only 的 `~/.config/codetrail/client.json`。
@@ -262,7 +262,7 @@ context 漲了 88k–108k tokens,其中模型輸出 25k–50k tokens,而那幾�
 
 1. **偏離模型官方行為**。DeepSeek-V4 的 encoder 在有 tools 時是刻意全留的,丟掉它是
    模型相依的品質賭注。在 `~/.config/codetrail/client.json` 設 `"keep_historical_reasoning": true` 可以單獨關掉這一項。
-   `aicode` 啟動橫幅會顯示目前在哪一邊。
+   TUI 的 `/status` 會顯示目前在哪一邊。
 2. **每個新問題多一次 prefill**。改動歷史等於改動 prompt 前綴,下一輪的快取會在「上一輪
    第一則 assistant」處失效,要重算上一輪的非 reasoning 內容(工具輸入輸出與回答)。
    實測那段對話單輪工具輸出 400–25,000 字元,換算約 0.5–30 秒。

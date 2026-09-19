@@ -3,7 +3,7 @@
 #
 #   cd <要分析的專案>
 #   aicode                 # 在這裡開 CodeTrail 的全螢幕 TUI
-#   接續對話請在 TUI 使用 /session 或 /resume。
+#   接續對話請在 TUI 使用 /session 或 /session <id>。
 #
 # 這支腳本刻意只做四件 Python 做不了或做起來很難看的事:
 #   1. 找到 CodeTrail 的 checkout(自己可能是一個 symlink);
@@ -22,7 +22,7 @@ set -euo pipefail
 
 if [ "$#" -ne 0 ]; then
   echo "[aicode] 不接受參數。用法:cd <專案> && aicode" >&2
-  echo "         接續對話請在 TUI 使用 /session 或 /resume。" >&2
+  echo "         接續對話請在 TUI 使用 /session 或 /session <id>。" >&2
   exit 2
 fi
 

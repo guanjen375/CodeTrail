@@ -221,7 +221,7 @@ def test_vision_completion_uses_current_llamacpp_image_url_api(monkeypatch):
     assert call["timeout"] == 45
     body = call["json"]
     assert body["max_tokens"] == 321
-    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert body["chat_template_kwargs"] == {"enable_thinking": False, "thinking": False}
     assert "image_data" not in body
     parts = body["messages"][0]["content"]
     assert parts[0] == {"type": "text", "text": "忠實分析圖片"}
@@ -324,11 +324,10 @@ def test_http_client_does_not_retry_generation_read_timeouts():
 # T1 ① 舊 vision lane:不帶 structured output 的 payload 逐鍵不變
 # ============================================================
 def test_vision_completion_payload_is_key_for_key_unchanged(monkeypatch):
-    """workflow §5「tool / runtime contract ①」:舊 payload 逐鍵一致。
+    """workflow §5「tool / runtime contract ①」:影像契約逐鍵一致。
 
     這條刻意把整個 body 寫死(含 temperature=0.1 / top_p=0.95 / top_k=40 這些預設值)。
-    少一鍵、多一鍵、任何值變了都會紅燈 —— 那就是刻意的 contract change,要先過使用者,
-    不能靠 refactor 順手改掉。
+    Thinking 關閉同時釘住 parser 與模板；其餘影像與取樣契約保持逐鍵檢查。
     """
     import llama_client
 
@@ -367,7 +366,7 @@ def test_vision_completion_payload_is_key_for_key_unchanged(monkeypatch):
         "top_p": 0.95,
         "top_k": 40,
         "max_tokens": 321,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": False, "thinking": False},
     }
     call = session.calls[0]
     body = call["json"]
@@ -415,7 +414,7 @@ def test_vision_json_completion_payload_is_key_for_key_exact(monkeypatch):
         "top_k": 1,
         "max_tokens": 128,
         "response_format": rf_before,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": False, "thinking": False},
     }
     call = session.calls[0]
     body = call["json"]
@@ -520,7 +519,7 @@ def test_vision_json_completion_forwards_every_whitelisted_sampler_key(monkeypat
     assert body["max_tokens"] == 128
     assert body["response_format"] == rf
     assert body["cache_prompt"] is True
-    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert body["chat_template_kwargs"] == {"enable_thinking": False, "thinking": False}
 
 
 @pytest.mark.parametrize("key", sorted(_CONTRACT_VISION_JSON_PROTECTED_KEYS))

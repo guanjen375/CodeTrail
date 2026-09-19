@@ -23,7 +23,7 @@ assistant 回答當成標準答案，也不會在 `aicode` 啟動或 CI 中自�
 
 ## 1. 匯出選定 session
 
-session id 可由 `aicode` 的 `/sessions`、`codetrail_chat.py sessions` 或
+session id 可由 `aicode` 的 `/session` 選單、`codetrail_chat.py sessions` 或
 `python3 scripts/session_eval.py` 的輸出取得。匯出是明示動作,只讀你點名的那幾個
 session 檔,不會掃整個 session 目錄:
 

@@ -94,6 +94,8 @@ class _Engine:
             n_ctx=8192,
             max_output_tokens=4096,
             policy=types.SimpleNamespace(name="interactive"),
+            thinking=False,
+            thinking_kwarg="thinking",
         )
         self.system_prompt = types.SimpleNamespace(sections=())
         self.tool_specs = {"list_dir": _Spec("list_dir"), "apply_patch": _Spec("apply_patch", False)}
@@ -125,6 +127,20 @@ class _Engine:
         self.session_id = self.store.create()
         self.messages = []
         self.resumed_snapshot = None
+        return self.session_id
+
+    @property
+    def thinking_supported(self):
+        return self.options.thinking_kwarg in ("thinking", "enable_thinking")
+
+    def set_thinking(self, enabled):
+        changed = self.options.thinking != enabled
+        self.options.thinking = enabled
+        return changed
+
+    def bind_new_session(self):
+        if not self.session_id:
+            self.session_id = self.store.create()
         return self.session_id
 
     def load_session(self, session_id):
@@ -663,13 +679,12 @@ def test_a_failed_new_keeps_the_app_and_the_current_session():
     "command",
     [
         "/new",
-        "/resume 20260101T000000-bbbbbbbb",
         "/session",
         "/session 20260101T000000-bbbbbbbb",
     ],
 )
 def test_switching_sessions_is_refused_while_a_turn_is_running(command):
-    """`/new` / `/resume` / `/session` 直接換掉 engine 的 session_id 與 messages:在回合中做
+    """`/new` / `/session` 直接換掉 engine 的 session_id 與 messages:在回合中做
     等於把還沒寫完的答案與自動壓縮落到**另一段**對話。"""
     engine = _Blocks()
 
@@ -751,7 +766,7 @@ def test_resume_replays_the_stored_history():
     async def body():
         app = client_app.CodeTrailApp(engine)
         async with app.run_test() as pilot:
-            app._command(f"/resume {RESUMED_ID}")
+            app._command(f"/session {RESUMED_ID}")
             await _settle(pilot)
             return _snapshot(app)
 
@@ -769,9 +784,9 @@ def test_resume_replays_the_stored_history():
 
 
 def test_a_session_resumed_at_startup_is_shown_on_mount():
-    """`aicode -c` / `aicode --session <id>` 在建 app 之前就接續好了。
+    """Python 維護入口的 `--continue` / `--session <id>` 在建 app 之前就接續好了。
 
-    重播只掛在 `/resume` 上的話,啟動時接續的那條路(最常用的一條)照樣是
+    重播只掛在 `/session` 上的話,啟動時接續的那條路(最常用的一條)照樣是
     空白畫面。engine 帶著 `resumed_snapshot` 進來,畫面就要把它貼出來。
     """
     engine = _Engine()
@@ -789,8 +804,8 @@ def test_a_session_resumed_at_startup_is_shown_on_mount():
     assert seen["assistant"] == ["在 boot/ 底下。"]
     assert len(seen["tools"]) == 1, seen["tools"]
     assert any("已接續" in note and RESUMED_ID in note for note in seen["notices"])
-    # banner 與 /help 提示還在:重播是加在它們之後,不是取代啟動畫面。
-    assert "root=/tmp" in seen["notices"]
+    # 明示接續仍重播原文；啟動診斷只在 /status，沒有歡迎提示。
+    assert "root=/tmp" not in seen["notices"]
 
 
 # ============================================================
@@ -907,6 +922,7 @@ def test_a_failed_switch_keeps_the_session_and_the_screen():
         )
         app = client_app.CodeTrailApp(engine, compactor=compactor, banner=("root=/tmp",))
         async with app.run_test() as pilot:
+            app._append(client_app.NoticeLine("existing runtime notice"))
             app.handle_event(
                 client_events.tool_event(
                     engine.session_id, tool="list_dir", call_id="call-9",
@@ -914,7 +930,7 @@ def test_a_failed_switch_keeps_the_session_and_the_screen():
                 )
             )
             await _settle(pilot)
-            app._command("/resume 20260101T000000-eeeeeeee")
+            app._command("/session 20260101T000000-eeeeeeee")
             await _settle(pilot)
             return _snapshot(app), list(app._tools)
 
@@ -924,7 +940,7 @@ def test_a_failed_switch_keeps_the_session_and_the_screen():
     assert engine.resumed_snapshot is None
     assert rebinds == []                              # 壓縮器沒有被重綁
     assert tools == ["call-9"]                        # 即時事件的那張表原封不動
-    assert "root=/tmp" in seen["notices"]             # 畫面沒有被清掉
+    assert "existing runtime notice" in seen["notices"]  # 畫面沒有被清掉
     assert len(seen["tools"]) == 1
     assert any("無法接續" in message for message in seen["errors"])
 
@@ -991,7 +1007,7 @@ def test_replay_pairs_tool_results_by_declaration_group_not_by_id():
     async def body():
         app = client_app.CodeTrailApp(engine, show_reasoning=True)
         async with app.run_test() as pilot:
-            app._command(f"/resume {RESUMED_ID}")
+            app._command(f"/session {RESUMED_ID}")
             await _settle(pilot)
             return _snapshot(app)
 
@@ -1005,7 +1021,7 @@ def test_replay_pairs_tool_results_by_declaration_group_not_by_id():
     assert outputs[0] == client_app.PENDING_TOOL_OUTPUT
     assert "int main(void)" in outputs[1] and "structuredContent" in outputs[1]
     assert "沒有人宣告過我" in outputs[2]
-    # reasoning 也重播(`/thinking` 管它顯不顯示),被標成 error 的那一則要看得出來。
+    # reasoning 也重播(show_reasoning 管它顯不顯示),被標成 error 的那一則要看得出來。
     assert seen["reasoning"] == [("先列目錄", True)]
     assert seen["assistant"] == ["半截的答案"]
     assert client_app.INCOMPLETE_ANSWER_NOTE in seen["errors"]
@@ -1041,7 +1057,7 @@ def test_replay_shows_pre_compaction_originals_and_a_summary_marker():
     async def body():
         app = client_app.CodeTrailApp(engine)
         async with app.run_test() as pilot:
-            app._command(f"/resume {RESUMED_ID}")
+            app._command(f"/session {RESUMED_ID}")
             await _settle(pilot)
             return _snapshot(app)
 
@@ -1070,7 +1086,7 @@ def test_replayed_tool_blocks_are_not_registered_for_live_events():
     async def body():
         app = client_app.CodeTrailApp(engine)
         async with app.run_test() as pilot:
-            app._command(f"/resume {RESUMED_ID}")
+            app._command(f"/session {RESUMED_ID}")
             await _settle(pilot)
             registered = list(app._tools)
             app.handle_event(
@@ -1101,7 +1117,7 @@ def test_new_clears_the_screen():
     async def body():
         app = client_app.CodeTrailApp(engine, banner=("root=/tmp",))
         async with app.run_test() as pilot:
-            app._command(f"/resume {RESUMED_ID}")
+            app._command(f"/session {RESUMED_ID}")
             await _settle(pilot)
             app._command("/new")
             await _settle(pilot)
@@ -1155,25 +1171,168 @@ def test_slash_commands_never_reach_the_model():
     assert "/compact" in notes and "未知指令" in notes
 
 
-def test_thinking_only_toggles_the_display():
-    """`/thinking` 只切換畫面。送模 payload 與摘要輸入是另一個設定,狀態列的值不變。"""
+@pytest.mark.parametrize("show_reasoning", [False, True])
+def test_show_reasoning_is_display_only_and_think_preserves_history(show_reasoning):
+    """顯示、歷史保留與本輪 thinking 三個設定不得互相覆寫。"""
     engine = _Engine()
+    engine.messages = [{"role": "assistant", "content": "answer", "reasoning_content": "original"}]
+    original = [dict(message) for message in engine.messages]
 
     async def body():
-        app = client_app.CodeTrailApp(engine, keep_historical_reasoning=True)
+        app = client_app.CodeTrailApp(
+            engine, show_reasoning=show_reasoning, keep_historical_reasoning=True,
+        )
         async with app.run_test() as pilot:
             app._on_reasoning("想一下")
             await _settle(pilot)
-            before = app.status_text
-            hidden = [w.display for w in app.query(client_app.ReasoningBlock)]
-            app._command("/thinking")
+            assert [w.display for w in app.query(client_app.ReasoningBlock)] == [show_reasoning]
+            app._command("/think on")
+            assert engine.options.thinking is True
+            assert "think=on" in app.status_text
+            app._command("/think off")
+            assert engine.options.thinking is False
+            assert "think=off" in app.status_text
+            app._command("/think")
+            assert engine.options.thinking is True
+            for command in ("/thinking", "/sessions", "/resume some-id"):
+                app._command(command)
             await _settle(pilot)
-            shown = [w.display for w in app.query(client_app.ReasoningBlock)]
-            return app.status_text, before, hidden, shown
+            assert [w.display for w in app.query(client_app.ReasoningBlock)] == [show_reasoning]
+            assert app.show_reasoning is show_reasoning
+            assert app.keep_historical_reasoning is True
+            assert engine.messages == original
+            assert engine.store.created == 0 and engine.sent == []
+            assert sum("未知指令" in note for note in _snapshot(app)["notices"]) == 3
 
-    after, before, hidden, shown = _run(body)
-    assert hidden == [False] and shown == [True]
-    assert "舊 reasoning=送模" in before and "舊 reasoning=送模" in after
+    _run(body)
+
+
+def test_blank_startup_retains_diagnostics_for_status_without_creating_session():
+    """隱藏啟動訊息不能丟失警告，查狀態也不能製造空白 session。"""
+    engine = _Engine()
+    engine.session_id = ""
+    engine.system_prompt = types.SimpleNamespace(
+        sections=(types.SimpleNamespace(name="project_agents", source="AGENTS.md", chars=10),)
+    )
+
+    def path(session_id):
+        assert session_id, "未建立 session 時不得呼叫 store.path"
+        return None
+
+    engine.store.path = path
+    diagnostics = ("自檢通過", "壓縮模式=manual", "WARN: retained warning")
+
+    async def body():
+        app = client_app.CodeTrailApp(engine, banner=diagnostics)
+        async with app.run_test() as pilot:
+            assert engine.primed.wait(5)
+            app._append_notice("WARN: asynchronous startup warning")
+            await _settle(pilot)
+            assert list(app.query_one("#log").children) == []
+            assert engine.primes == ["mount"]
+            assert engine.session_id == "" and engine.store.created == 0
+            assert "think=off" in app.status_text and "尚未建立" in app.status_text
+            app._command("/status")
+            await _settle(pilot)
+            notes = "\n".join(_snapshot(app)["notices"])
+            assert all(line in notes for line in diagnostics)
+            assert "asynchronous startup warning" in notes
+            assert "專案指示=已載入" in notes
+            for command in ("/session", "/compact", "/queue add queued", "/queue resume"):
+                app._command(command)
+            assert engine.session_id == "" and engine.store.created == 0
+            assert engine.sent == [] and not app.coordinator.busy
+            assert app.coordinator.queue_snapshot() == ()
+
+    _run(body)
+
+
+def test_failed_first_session_creation_keeps_the_draft_and_releases_the_turn():
+    engine = _Engine()
+    engine.session_id = ""
+
+    def cannot_create():
+        raise OSError("disk full")
+
+    engine.store.create = cannot_create
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            prompt = app.query_one("#prompt", client_app.PromptInput)
+            prompt.text = "first question"
+            await pilot.press("enter")
+            await _settle(pilot)
+            assert prompt.text == "first question"
+            assert not app.coordinator.busy
+            assert engine.session_id == "" and engine.sent == [] and engine.messages == []
+            assert _snapshot(app)["users"] == []
+            assert any("disk full" in message for message in _snapshot(app)["errors"])
+            # 可重試，不留下半建立或永久 busy 的狀態。
+            engine.store.create = lambda: RESUMED_ID
+            await pilot.press("enter")
+            await _settle(pilot, 60)
+            assert engine.session_id == RESUMED_ID and engine.sent == ["first question"]
+            assert _snapshot(app)["users"] == ["first question"]
+            assert prompt.text == ""
+
+    _run(body)
+
+
+def test_think_rejects_unsupported_models_and_changes_during_a_turn():
+    engine = _Blocks()
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            engine.options.thinking_kwarg = None
+            for command in ("/think", "/think on", "/think off"):
+                app._command(command)
+            await _settle(pilot)
+            assert engine.options.thinking is False
+            assert sum("尚未偵測" in note for note in _snapshot(app)["notices"]) == 3
+            engine.options.thinking_kwarg = "thinking"
+            app.submit("hi")
+            assert engine.entered.wait(5)
+            try:
+                app._command("/think on")
+                assert engine.options.thinking is False
+                assert "think=off" in app.status_text
+            finally:
+                engine.release.set()
+            await _settle(pilot, 60)
+
+    _run(body)
+
+
+def test_live_thinking_indicator_is_visible_without_reasoning_and_cleared_at_boundaries():
+    """沒有 reasoning 本文時仍有紅字活動，答案/工具/取消後不得殘留。"""
+    engine = _Engine()
+
+    async def body():
+        app = client_app.CodeTrailApp(engine, show_reasoning=False)
+        async with app.run_test() as pilot:
+            events = (
+                client_events.text_delta_event(engine.session_id, "answer"),
+                client_events.tool_event(engine.session_id, tool="list_dir", call_id="call-1",
+                                         status=client_events.STATUS_COMPLETED),
+                client_events.error_event(engine.session_id, "failed"),
+                client_events.step_finish_event(engine.session_id, reason=client_events.REASON_CANCELLED),
+            )
+            for event in events:
+                app._on_reasoning("reason")
+                await _settle(pilot)
+                indicator = app._thinking_indicator
+                assert indicator is not None and indicator.display
+                assert "思考中" in str(indicator.content)
+                assert all(not block.display for block in app.query(client_app.ReasoningBlock))
+                app.handle_event(event)
+                await _settle(pilot)
+                assert app._thinking_indicator is None
+                assert not list(app.query(".thinking-indicator"))
+            assert engine.messages == [] and engine.store.created == 0
+
+    _run(body)
 
 
 def test_typing_a_slash_offers_completions():
@@ -1193,7 +1352,8 @@ def test_typing_a_slash_offers_completions():
 
     visible, text, completed = _run(body)
     assert visible is True
-    assert "/compact" in text and "/thinking" in text
+    assert "/compact" in text and "/think" in text
+    assert all(command not in text for command in ("/thinking", "/sessions", "/resume"))
     assert completed == "/help"
 
 
@@ -1219,12 +1379,11 @@ def test_the_status_bar_carries_the_session_context_and_modes():
         "n_ctx=8192",
         "ctx=",
         engine.session_id,
-        "權限=interactive",
         "壓縮=codetrail",
-        "專案指示=on",
-        "舊 reasoning=不送",
+        "think=off",
     ):
         assert needle in status, (needle, status)
+    assert all(label not in status for label in ("權限=", "專案指示=", "舊 reasoning="))
 
 
 @pytest.fixture()
@@ -1419,7 +1578,7 @@ def test_activity_is_cleared_on_new_and_resumed_sessions(progress_clock):
     async def body():
         app = client_app.CodeTrailApp(engine)
         async with app.run_test() as pilot:
-            for command in ("/new", f"/resume {RESUMED_ID}"):
+            for command in ("/new", f"/session {RESUMED_ID}"):
                 old_session = engine.session_id
                 app.coordinator.begin_turn()
                 app._turn_started = time.monotonic()

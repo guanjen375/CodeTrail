@@ -316,7 +316,10 @@ def test_activity_callback_failure_preserves_gate_payload_and_history(activity_e
     assert gates[0]["messages"] == requests[0]["messages"]
     assert gates[0]["reserved_output_tokens"] == requests[0]["extra"]["max_tokens"] == 137
     assert gates[0]["requested_num_ctx"] == engine.options.n_ctx
-    assert requests[0]["extra"] == {"max_tokens": 137, "return_progress": True}
+    assert requests[0]["extra"] == {
+        "max_tokens": 137, "return_progress": True,
+        "chat_template_kwargs": {"enable_thinking": False, "thinking": False},
+    }
     assert [event["part"]["phase"] for event in activity] == [
         "preparing", "waiting_model", "waiting_response", "prompt_processing", "generating",
     ]
@@ -572,7 +575,10 @@ def test_activity_callback_does_not_change_zero_event_prime(activity_engine, mon
     outcome = engine.prime_prompt_cache(reason="mount")
     assert outcome == client_engine.PrimeOutcome(True, "", 12)
     assert activity == []
-    assert requests[0]["extra"] == {"max_tokens": 1}
+    assert requests[0]["extra"] == {
+        "max_tokens": 1,
+        "chat_template_kwargs": {"enable_thinking": False, "thinking": False},
+    }
     assert requests[0]["messages"] == engine.next_turn_prefix()
     assert engine.messages == before and engine.store.read(engine.session_id) == stored
     assert engine._in_turn == 0 and not engine._cancel.is_set() and not engine.priming

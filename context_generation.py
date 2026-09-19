@@ -41,6 +41,7 @@ import config
 import context_budget
 import endpoint_policy
 import figure_extract
+import llama_client
 from extracted_document import ExtractedDocument
 
 # ============================================================
@@ -758,7 +759,7 @@ class ContextGenerator:
         # 鎖只是傳進來讓生命週期看得出來；互斥由 flock 保證，不需要心跳。
         self._lock = lock
         self.max_ctx_tokens = int(getattr(config, "KB_CONTEXT_TARGET_TOKENS", 100))
-        # 請求端的上限要蓋住 reasoning，回應端才有東西可截。
+        # 保留既有輸出安全餘量；thinking 由每次 payload 明確關閉。
         self.request_max_tokens = self.max_ctx_tokens + int(
             getattr(config, "KB_CONTEXT_REASONING_TOKENS", 512)
         )
@@ -771,6 +772,7 @@ class ContextGenerator:
             "max_tokens": self.request_max_tokens,
             "ctx_target_tokens": self.max_ctx_tokens,
             "cache_prompt": True,
+            "chat_template_kwargs": llama_client.thinking_template_kwargs(),
         }
 
     def _call(self, messages: List[Dict], *, max_tokens: int) -> Tuple[str, str]:
@@ -793,6 +795,7 @@ class ContextGenerator:
             "max_tokens": max_tokens,
             "stream": False,
             "cache_prompt": True,
+            "chat_template_kwargs": llama_client.thinking_template_kwargs(),
         }
         data = _request_json(
             self.session,
@@ -824,13 +827,15 @@ class ContextGenerator:
         max_words = max(80, min(400, budget_tokens // 3))
         prompt = SUMMARY_PROMPT_V1.format(segment=segment, max_words=max_words)
         messages = [{"role": "user", "content": prompt}]
-        # 指紋要記**實際送出的**參數。之前記的是 budget_tokens，但請求端另外加了
-        # reasoning 額度——調大 reasoning budget 之後仍會命中舊摘要，等於改了生成
-        # 參數卻沒有失效。
+        # 指紋要記**實際送出的**參數，包含既有輸出餘量與明確的 thinking 關閉值。
+        # 只記 budget_tokens 會沿用生成參數不同的舊摘要。
         request_tokens = budget_tokens + int(
             getattr(config, "KB_CONTEXT_REASONING_TOKENS", 512)
         )
-        params = {"temperature": 0, "max_tokens": request_tokens, "budget_tokens": budget_tokens}
+        params = {
+            "temperature": 0, "max_tokens": request_tokens, "budget_tokens": budget_tokens,
+            "chat_template_kwargs": llama_client.thinking_template_kwargs(),
+        }
         fingerprint = generation_fingerprint(
             messages=messages, params=params, identity=self.identity,
             kind="summary", extra=extra,

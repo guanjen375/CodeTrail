@@ -239,6 +239,30 @@ def test_headless_can_persist_when_asked(tmp_path, monkeypatch, capsys, live_mai
     assert len(client_store.SessionStore(root).list_sessions()) == 1
 
 
+def test_interactive_build_defers_disk_session_until_first_binding(tmp_path, monkeypatch):
+    """真實 Engine/SessionStore 整合：啟動零 session，首次綁定有可信 header。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    root = tmp_path / "project"
+    root.mkdir()
+    monkeypatch.setattr(client_mcp, "shared_client", lambda *_a, **_k: _FakeMcpClient())
+    monkeypatch.setattr(codetrail_chat.config, "MAIN_THINKING_KWARG", "thinking")
+    args = codetrail_chat.build_parser().parse_args([])
+    checks = types.SimpleNamespace(model="m", n_ctx=131072)
+    mcp, engine = codetrail_chat._build(root, args, persist=True, preflight=checks, defer_session=True)
+    try:
+        assert engine.session_id == "" and engine.messages == []
+        assert engine.store.list_sessions() == [] and not engine.store.directory.exists()
+        assert engine.options.thinking is False and engine.thinking_supported
+        session_id = engine.bind_new_session()
+        assert engine.bind_new_session() == session_id
+        records = engine.store.read(session_id)
+        assert len(records) == 1 and records[0]["type"] == "header"
+        assert len(engine.store.list_sessions()) == 1
+    finally:
+        mcp.close()
+
+
 @pytest.mark.smoke
 def test_the_interactive_namespace_builds_engine_options(tmp_path):
     """互動路徑的 namespace **沒有** `--policy`(它只掛在 `run` 上)。
@@ -412,18 +436,13 @@ def _write_deployment(home: Path, **main: object) -> Path:
 
 
 @pytest.mark.smoke
-def test_the_tui_banner_after_a_passing_preflight_drops_the_progress_log_and_keeps_warnings(
+def test_startup_diagnostics_keep_warnings_for_status_and_defer_session_creation(
     tmp_path, monkeypatch, capsys
 ):
-    """自檢**通過**之後,對話區第一屏不得是那一整段進度 LOG。
+    """TUI 收到完整啟動診斷供 /status 使用，建 engine 時明確延後 session 建立。
 
-    那段 LOG 的用途是「preflight 要跑幾十秒,使用者盯著畫面要看到它在動」——
-    它已經在 TUI 之前的終端畫面上逐行印出來過了。TUI 起來之後再重播一次,
-    使用者每開一次 aicode 就要先捲過十幾行自己剛剛看過的成功訊息,而真正
-    要看的兩種東西(canary 只走 stderr 的 WARNING、壓縮已被停用)混在裡面。
-
-    留下來的只有三種:一行結果摘要、壓縮狀態行、警告。失敗路徑不走這裡
-    (`PreflightError` 在 TUI 之前 exit 2,transcript 原樣留在終端)。
+    診斷保留摘要、壓縮狀態及 stderr 警告，初始對話區為空由 app 契約守住。
+    preflight 失敗仍在 TUI 之前 exit 2，transcript 原樣留在終端。
     """
     import client_config
     import client_preflight
@@ -462,9 +481,13 @@ def test_the_tui_banner_after_a_passing_preflight_drops_the_progress_log_and_kee
         tool_specs=tuple(f"tool_{index}" for index in range(19)),
         options=types.SimpleNamespace(policy=types.SimpleNamespace(name="interactive")),
     )
-    monkeypatch.setattr(
-        codetrail_chat, "_build", lambda *_a, **_k: (types.SimpleNamespace(close=lambda: None), engine)
-    )
+    build_options = {}
+
+    def build(*_args, **kwargs):
+        build_options.update(kwargs)
+        return types.SimpleNamespace(close=lambda: None), engine
+
+    monkeypatch.setattr(codetrail_chat, "_build", build)
     monkeypatch.setattr(
         codetrail_chat, "_compactor", lambda *_a, **_k: types.SimpleNamespace(mode="manual")
     )
@@ -497,6 +520,7 @@ def test_the_tui_banner_after_a_passing_preflight_drops_the_progress_log_and_kee
     assert any("壓縮模式" in line for line in banner), banner
     # 進度 LOG 沒有消失,只是不再重播:它已經在 TUI 之前的終端畫面上。
     assert "[aicode] root=" in printed.out
+    assert build_options["defer_session"] is True
     assert exit_code == 0
 
 

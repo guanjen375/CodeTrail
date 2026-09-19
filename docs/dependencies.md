@@ -5,6 +5,7 @@ CodeTrail 的每項操作只使用選定的主要實作。必要套件、工具�
 | 操作 | 必要實作與修復方式 |
 |---|---|
 | 啟動 `aicode` | PATH 的 `python3` 與 `requirements.txt`。只安裝名為 `python` 的執行檔不足以啟動。部署不需要 Node / npm。 |
+| `set_config` 偵測主模型 thinking 控制 | Jinja2；安裝 `requirements.txt`。只解析所選 GGUF 的模板 AST，不執行模板；缺少 parser 直接拒絕設定，不改用文字比對。無法確認模板能力時明列不支援，並寫入 `thinking_kwarg: null`。 |
 | RAG / Code RAG 向量運算、MMR、KB ingest | NumPy；安裝 `requirements.txt`。缺少或壞掉的套件不會被當成 cache 損壞，也不改用另一套運算。 |
 | 中文 BM25 | jieba；安裝 `requirements.txt`。不改用逐字分詞。 |
 | Python / C / C++ 解析 | Python 用 stdlib `ast`；C/C++ 用 requirements 釘版的 tree-sitter 與 grammar，缺席或 ABI 不相容即報錯。 |

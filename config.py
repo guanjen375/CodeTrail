@@ -141,6 +141,9 @@ def _resolve_main_model() -> str:
 
 
 MODEL = _resolve_main_model()
+# Detected from the selected GGUF template by set_config; absent/legacy means
+# unknown support. Per-chat /think state never changes this deployment metadata.
+MAIN_THINKING_KWARG = _DEPLOYMENT_PROFILE.service("main").thinking_kwarg
 
 
 def require_main_model() -> str:

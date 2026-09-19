@@ -169,7 +169,8 @@ def test_help_is_rejected_without_starting_the_client(tmp_path):
     result = _run(wrapper, ["--help"], cwd=project, record=record, tty=False)
     assert result.returncode == 2, result.stderr
     assert "不接受參數" in result.stderr
-    assert "/session" in result.stderr and "/resume" in result.stderr
+    assert "/session" in result.stderr and "/session <id>" in result.stderr
+    assert "/resume" not in result.stderr and "/sessions" not in result.stderr
     assert not record.exists()
 
 

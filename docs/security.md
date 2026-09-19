@@ -77,7 +77,7 @@ A／B 模式的四個目的地必須另獲 owner-only `client.json` 精確授權
 
 兩個此模式的副作用/防線要知道:
 
-- [lessons](lessons.md) 該 session **不會注入** —— `aicode` 啟動輸出會明講,並清掉先前
+- [lessons](lessons.md) 該 session **不會注入** —— TUI 接管前的終端會明講，並清掉先前
   render 殘留的 `.codetrail/lessons.md`,不會謊報「已注入」。(這個鍵只收真的
   `false`;`"false"` 是一個非空字串,不是 false。)
 - 不信任 repo 可能把 `.codetrail` 換成指向專案外的 symlink/junction,誘導 lessons render 把檔案寫出沙箱;`aicode` 啟動時偵測到會直接拒絕啟動,一個 byte 都不寫。

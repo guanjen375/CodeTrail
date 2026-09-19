@@ -681,6 +681,8 @@ class EngineOptions:
     tool_allowlist: frozenset[str] | None = None
     metrics_enabled: bool = True
     cancellable_requests: bool = False
+    thinking: bool = False
+    thinking_kwarg: str | None = None
 
 
 @dataclass
@@ -734,11 +736,16 @@ class Engine:
         mcp: client_mcp.McpClient,
         store: Any,
         session_id: str | None = None,
+        defer_session: bool = False,
         system_prompt: client_prompt.SystemPrompt | None = None,
         model_lock: threading.Lock | None = None,
         env: Mapping[str, str] | None = None,
     ) -> None:
         self.options = options
+        if type(options.thinking) is not bool:
+            raise EngineError("thinking 必須是 bool")
+        if options.thinking and not self.thinking_supported:
+            raise EngineError("目前模型沒有已確認的 thinking 支援，無法啟用。")
         self.mcp = mcp
         self.store = store
         self.env = dict(os.environ if env is None else env)
@@ -749,8 +756,9 @@ class Engine:
         # 共用一把鎖,排隊發生在這裡而不是在 server 的請求佇列裡。
         # 預設**依 mcp 取**,不是各自 new 一把 —— 後者等於沒有鎖。
         self.model_lock = model_lock or model_lock_for(mcp)
+        self._session_lock = threading.RLock()
         self.messages: list[dict[str, Any]] = []
-        self.session_id = session_id or store.create()
+        self.session_id = session_id or ("" if defer_session else store.create())
         #: 第一次 session 落檔失敗的原因。非 None 代表這段對話只在記憶體裡。
         self.store_error: str | None = None
         #: 最後一次 adopt() 換上來的快照(new_session 清)。啟動時就接續好的那條路
@@ -804,6 +812,36 @@ class Engine:
         self._supplement_callback: Callable[[], None] | None = None
         self._supplement_thread: int | None = None
 
+    @property
+    def thinking_supported(self) -> bool:
+        return self.options.thinking_kwarg in ("enable_thinking", "thinking")
+
+    def set_thinking(self, enabled: bool) -> bool:
+        """Change the next chat request's mode only after old prefill has stopped."""
+        if type(enabled) is not bool:
+            raise EngineError("thinking 必須是 bool")
+        if enabled and not self.thinking_supported:
+            raise EngineError("目前模型沒有已確認的 thinking 支援，無法啟用。")
+        # Prime registers under this same lock, and its I/O/finalizer never
+        # acquires it. Waiting here therefore bars both new turns and new prime
+        # registrations until the old transport is closed and its slot released.
+        with self._turn_state:
+            if self._in_turn:
+                raise EngineError("回合進行中無法變更 thinking。")
+            if self.options.thinking == enabled:
+                return False
+            if not self.abort_prime():
+                raise EngineError("預熱尚未結束，thinking 未變更。")
+            self.options.thinking = enabled
+            return True
+
+    def _chat_extra(self, *, thinking: bool = False) -> dict[str, Any]:
+        return {
+            "max_tokens": self.options.max_output_tokens,
+            "return_progress": True,
+            "chat_template_kwargs": llama_client.thinking_template_kwargs(thinking),
+        }
+
     def set_supplement_callback(self, callback: Callable[[], None] | None) -> None:
         self._supplement_callback = callback
 
@@ -813,6 +851,7 @@ class Engine:
         Admission and cancellation share the turn lock; disk I/O remains outside
         that lock. True means accepted into history, not that HTTP has completed.
         """
+        self._require_bound_session()
         if self._supplement_thread != threading.get_ident():
             raise RuntimeError("supplements are only accepted at a model-step boundary")
         if pending_tool_call_ids(self.messages):
@@ -952,6 +991,7 @@ class Engine:
         檔(``store_error`` 已設)時例外:那段對話本來就只在記憶體裡,
         使用者也已經被警告過,壓縮不該因此被鎖死。
         """
+        self._require_bound_session()
         binding = _bind_history(messages)
         new_history = binding.messages
         if self.store_error is None:
@@ -995,7 +1035,8 @@ class Engine:
             self._begin_turn()
             self._report_activity(operation, "preparing")
             payload = [dict(message) for message in messages]
-            measured = self.count_input_tokens(payload)
+            extra = self._chat_extra()
+            measured = self.count_input_tokens(payload, extra=extra)
             usage = self._check_context(
                 source=source,
                 requested_num_ctx=self.options.n_ctx,
@@ -1023,7 +1064,7 @@ class Engine:
                         top_k=config.CHAT_TOP_K,
                         min_p=config.CHAT_MIN_P,
                         stream=True,
-                        extra={"max_tokens": self.options.max_output_tokens, "return_progress": True},
+                        extra=extra,
                         timeout=self.options.request_timeout,
                         **({"cancel": request_cancel} if request_cancel is not None else {}),
                     ),
@@ -1071,6 +1112,26 @@ class Engine:
 
         # 沒有 finish_reason 的串流是被截斷的(transport 中途斷、缺 [DONE]),不是 stop。
         return client_compaction.Completion("".join(content), "".join(reasoning), finish or "")
+
+    def _require_bound_session(self) -> None:
+        if not self.session_id:
+            raise EngineError("尚未建立對話；請先綁定新 session 再寫入訊息。")
+
+    def bind_new_session(self) -> str:
+        """Bind the first real turn without changing or aborting its empty prefix.
+
+        Creation is idempotent and serialized with explicit session switches.
+        No ID is exposed until store.create succeeds; an unbound engine carrying
+        history is invalid and must never turn into a memory-only conversation.
+        """
+        with self._session_lock:
+            if self.session_id:
+                return self.session_id
+            if self.messages:
+                raise EngineError("未綁定的對話含有歷史，拒絕建立 session。")
+            session_id = self.store.create()
+            self.session_id = session_id
+            return session_id
 
     def new_session(self) -> str:
         """開一個新對話(TUI 的 /new)。
@@ -1178,14 +1239,15 @@ class Engine:
         準入與 history snapshot 共用 _prime_guard，封住 abort 與狀態替換間的空窗。
         不持這把鎖等待網路或 store，也不提前替換任何 session 狀態。
         """
-        with self._prime_guard:
-            self._session_switching += 1
-        try:
-            self.abort_prime()
-            yield
-        finally:
+        with self._session_lock:
             with self._prime_guard:
-                self._session_switching -= 1
+                self._session_switching += 1
+            try:
+                self.abort_prime()
+                yield
+            finally:
+                with self._prime_guard:
+                    self._session_switching -= 1
 
     def _switch_session(
         self,
@@ -1213,6 +1275,7 @@ class Engine:
         return snapshot
 
     def _record(self, message: Mapping[str, Any], *, require_active: bool = False) -> bool:
+        self._require_bound_session()
         payload = dict(message)
         payload.setdefault("time", time.time())
         if payload.get("role") == "user" and not payload.get("synthetic"):
@@ -1234,6 +1297,7 @@ class Engine:
         return True
 
     def _record_turn_cancellation(self, start: int) -> None:
+        self._require_bound_session()
         ids = [message["message_id"] for message in self.messages[start:]
                if message.get("role") == "user" and not message.get("synthetic")]
         if not ids:
@@ -1338,9 +1402,12 @@ class Engine:
         """
         request = cancel if cancel is not None else llama_client.RequestCancellation()
         abort = request.event if cancel is not None else self._cancel
-        body_extra = dict(extra) if extra is not None else {
-            "max_tokens": self.options.max_output_tokens, "return_progress": True,
-        }
+        # A model step shares this exact dict with generation. The transport
+        # snapshots it before rendering; do not re-read mutable options here.
+        if extra is None:
+            body_extra = self._chat_extra()
+        else:
+            body_extra = extra if isinstance(extra, dict) else dict(extra)
         try:
             if abort.is_set():
                 raise TurnCancelled("輸入計數已被中斷")
@@ -1379,7 +1446,10 @@ class Engine:
         """
         binding = self._history if history is None else _bind_history(history)
         payload = self._prefix_from(list(binding.messages), binding.pruning)
-        return self.count_input_tokens(payload, tools=self.openai_tools())
+        return self.count_input_tokens(
+            payload, tools=self.openai_tools(),
+            extra=self._chat_extra(thinking=self.options.thinking),
+        )
 
     # ---- prompt cache 預熱 ---------------------------------------------
     @property
@@ -1414,10 +1484,12 @@ class Engine:
         ``reason``(``mount`` / ``new`` / ``session`` / ``compaction``)只是呼叫端的標記,
         engine 刻意**不記它**——零寫入包含 telemetry 之外的一切。
         """
-        # 以下三個判定在任何 I/O、任何鎖之前:readonly session 的「不得打模型」是
+        # 以下判定在任何 I/O、任何鎖之前:readonly session 的「不得打模型」是
         # 評測邊界,不能在 probe 之後才發現。
         if not config.CLIENT_PRIME_PROMPT_CACHE:
             return PrimeOutcome(False, "disabled", None)
+        if self.options.thinking:
+            return PrimeOutcome(False, "thinking", None)
         if not self._loaded_tools:
             return PrimeOutcome(False, "tools_not_loaded", None)
         if self.options.policy.name != client_policy.InteractivePolicy.name:
@@ -1435,6 +1507,8 @@ class Engine:
             with self._turn_state:
                 if self._in_turn > 0:
                     return PrimeOutcome(False, "turn_in_progress", None)
+                if self.options.thinking:
+                    return PrimeOutcome(False, "thinking", None)
                 with self._prime_guard:
                     if self._session_switching:
                         return PrimeOutcome(False, "aborted", None)
@@ -1514,9 +1588,13 @@ class Engine:
             return PrimeOutcome(False, "aborted", None)
 
         payload = self._prefix_from(history, pruning)
+        extra = {
+            "max_tokens": PRIME_MAX_TOKENS,
+            "chat_template_kwargs": llama_client.thinking_template_kwargs(),
+        }
         measured = self.count_input_tokens(
             payload, tools=self._openai_tools,
-            extra={"max_tokens": PRIME_MAX_TOKENS}, cancel=request,
+            extra=extra, cancel=request,
         )
         if abort.is_set() or self._prime_superseded(epoch):
             return PrimeOutcome(False, "aborted", None)
@@ -1562,7 +1640,7 @@ class Engine:
                 tools=self._openai_tools,
                 tool_choice="auto",
                 stream=True,
-                extra={"max_tokens": PRIME_MAX_TOKENS},
+                extra=extra,
                 timeout=self.options.request_timeout,
                 cancel=request,
             ),
@@ -1655,6 +1733,7 @@ class Engine:
         approve: Callable[[ApprovalRequest], bool] | None = None,
         on_user_recorded: Callable[[], None] | None = None,
     ) -> TurnResult:
+        self._require_bound_session()
         emit = on_event or (lambda _event: None)
         # 旗標**不在這裡清**:協調器的 cancel 可能在 worker 還沒進到 send() 之前就到,
         # 開始時清掉就是 lost-cancel。改在這一輪收尾(_end_turn,計數歸零)時清。
@@ -1905,6 +1984,7 @@ class Engine:
 
     def heal_pending_tool_calls(self) -> int:
         """把懸空的 tool_call 補上「已中斷」結果並寫進 session 檔。"""
+        self._require_bound_session()
         pending = pending_tool_call_ids(self.messages)
         for call_id, name in pending:
             self._record(
@@ -1926,6 +2006,7 @@ class Engine:
         on_reasoning: Callable[[str], None] | None = None,
         approve: Callable[[ApprovalRequest], bool] | None = None,
     ) -> TurnResult:
+        self._require_bound_session()
         try:
             self._begin_turn()
             return self._run_tool_loop(
@@ -2138,7 +2219,10 @@ class Engine:
             # 只改局部 wire payload,先加指示再 gate;session、預熱 prefix 與下一輪
             # 的 system prompt 都保持原文。tools 保留,HTTP adapter 才會實送 none。
             payload[0] = {**payload[0], "content": payload[0]["content"] + "\n\n" + CONVERGENCE_INSTRUCTION}
-        measured = self.count_input_tokens(payload, tools=self._openai_tools, tool_choice=tool_choice)
+        extra = self._chat_extra(thinking=self.options.thinking)
+        measured = self.count_input_tokens(
+            payload, tools=self._openai_tools, tool_choice=tool_choice, extra=extra,
+        )
         usage = self._check_context(
             source="client",
             requested_num_ctx=self.options.n_ctx,
@@ -2176,7 +2260,7 @@ class Engine:
                     tools=self._openai_tools,
                     tool_choice=tool_choice,
                     stream=True,
-                    extra={"max_tokens": self.options.max_output_tokens, "return_progress": True},
+                    extra=extra,
                     timeout=self.options.request_timeout,
                     **({"cancel": request_cancel} if request_cancel is not None else {}),
                 ),

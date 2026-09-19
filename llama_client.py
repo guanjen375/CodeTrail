@@ -272,6 +272,18 @@ def _reject_forbidden_keys(mapping: dict, forbidden: frozenset, label: str) -> N
         )
 
 
+def thinking_template_kwargs(enabled: bool = False) -> dict[str, bool]:
+    """Keep llama.cpp's reasoning parser and the selected Jinja template aligned.
+
+    The parser reads ``enable_thinking`` even when a model's template uses
+    ``thinking``. Sending both explicitly also overrides a server's default-on
+    mode for internal requests and models with unknown capability metadata.
+    """
+    if type(enabled) is not bool:
+        raise TypeError("thinking must be a bool")
+    return {"enable_thinking": enabled, "thinking": enabled}
+
+
 def _build_chat_payload(
     *,
     messages: list[dict],
@@ -297,6 +309,7 @@ def _build_chat_payload(
         "temperature": temperature,
         "stream": stream,
         "cache_prompt": True,
+        "chat_template_kwargs": thinking_template_kwargs(),
     }
     if top_p is not None:
         payload["top_p"] = top_p
@@ -587,7 +600,7 @@ def vision_completion(
         extra={
             "max_tokens": max_tokens,
             # Qwen VL 的 thinking 對忠實轉錄沒有幫助，反而會消耗輸出預算。
-            "chat_template_kwargs": {"enable_thinking": False},
+            "chat_template_kwargs": thinking_template_kwargs(),
         },
     )
 
@@ -834,7 +847,7 @@ def vision_json_completion(
         # 這裡覆寫成呼叫端指定的值(第二次取樣要 False 才算獨立佐證)。
         "cache_prompt": cache_prompt,
         # thinking 會把 reasoning 吐進 content,直接毀掉「content 是純 JSON」的契約。
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": thinking_template_kwargs(),
     }
     extra.update(overrides)
 

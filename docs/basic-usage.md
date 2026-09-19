@@ -22,7 +22,9 @@ cd <PROJECT_TO_ANALYZE>
 aicode
 ```
 
-進入 TUI 前會依序看到分層健康狀態：
+正常進入 TUI 時對話區是空白的，啟動摘要、壓縮狀態與所有 WARN 都保留在 `/status`。
+逐項健康檢查與進度仍留在 TUI 接管前的終端。
+健康檢查失敗仍會在終端明確報錯並拒絕進入 TUI。分層健康狀態如下：
 
 - `[client] PASS`：客戶端進入點存在且可執行(就是這個 repo 裡的 `codetrail_chat.py`,
   canary 驗的就是它,沒有覆寫)。
@@ -88,6 +90,28 @@ CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透�
 
 回合進行中仍可輸入訊息，選擇「排到下一輪」或「補充目前任務」。等待／送達狀態及
 查看、修改、取消操作見 [訊息排隊與途中補充](message-queue.md)。
+
+### 主聊天 thinking
+
+每次啟動預設 `think=off`。在沒有回合、核准或審查進行時使用：
+
+```text
+/think           切換主聊天 thinking
+/think on        開啟
+/think off       關閉
+```
+
+狀態列顯示 `think=on|off`，這個選擇不寫入 `client.json`。`set_config.sh` 必須先從
+主模型的 chat template 偵測出 thinking 控制鍵，才能開啟；未確認支援或沿用缺少能力
+欄位的舊部署設定時會明確拒絕，可重跑設定後重新啟動客戶端。
+
+實際收到 reasoning 時，對話區顯示紅字「思考中」；開始回答或工具活動，以及完成、
+出錯或取消時會清掉這個暫時標記。`client.json` 的 `show_reasoning`(預設 `false`)
+只控制 reasoning 本文與歷史重播是否顯示，不改生成開關。舊 reasoning 是否送回模型
+仍由另一個鍵 `keep_historical_reasoning` 決定。
+
+摘要、審查、RAG 與其他內部生成一律關閉 thinking。主聊天開啟 thinking 時不做
+prompt cache 預熱；詳細延遲與快取診斷見 [常見問題](troubleshooting.md)。
 
 ### 等待回應與壓縮進度
 
@@ -314,7 +338,7 @@ permission 是 `ask`）。
 把這條記成 lesson,之後的 session 都要遵守。
 ```
 
-模型會用 `record_lesson(...)` 提案一條祈使句行為規則,**你在核准框看到內容、同意才寫入**;下個 session 起由 `aicode` 自動注入(啟動輸出有 `[lessons] N 條 active lessons 已注入 ...`)。規則 90 天到期會停止注入並在啟動時提示複審。生命週期、上限與 `python3 lessons.py list / renew / delete` 管理指令見 [docs/lessons.md](lessons.md)。
+模型會用 `record_lesson(...)` 提案一條祈使句行為規則,**你在核准框看到內容、同意才寫入**;下個 session 起由 `aicode` 自動注入(TUI 接管前的終端有 `[lessons] N 條 active lessons 已注入 ...`)。規則 90 天到期會停止注入，待複審警告也保留在 `/status`。生命週期、上限與 `python3 lessons.py list / renew / delete` 管理指令見 [docs/lessons.md](lessons.md)。
 
 ---
 
@@ -323,11 +347,12 @@ permission 是 `ask`）。
 對話是**每個專案**各自保存的(session 檔在 state 目錄,不在被分析的 repo 裡)。回到同一個
 專案時直接執行 `aicode`，再由 TUI 選單接續；shell 入口不接受參數。
 
+啟動只顯示空白畫面，不建立 session。`/new` 或直接送出第一則問題時才建立新對話；
+先查看 `/status`、挑選歷史或直接退出，都不會留下空白 session 檔。
+
 ```text
-/sessions        列出這個專案的既有對話(最多 20 筆):id、最後更新時間、輪數、第一句話
 /session         開選單挑一段(最多 50 筆;↑/↓ 移動、Enter 接續、Esc 取消)
 /session <id>    不開選單,直接換到那一段
-/resume <id>     同上(舊指令,行為一樣)
 /new             開一段新對話
 ```
 
@@ -344,7 +369,7 @@ session 檔算出來的純文字,**不會呼叫模型、也不會回寫 session 
   歷史 —— 兩者刻意不一樣,notice 那一行會同時報「畫面 N 則、模型歷史 M 則、壓縮 K 次」。
 - **當時沒有拿到結果的工具呼叫**會標成待處理並寫明「這次呼叫沒有結果」,不會假裝有
   結果;真的被你 Ctrl-C 中斷的那一次,結果是下一題送出前才補上「已中斷」的。
-- `/thinking` 對重播出來的 thinking 一樣有效(它只管畫面顯示)。
+- `client.json` 的 `show_reasoning` 也控制重播的 reasoning 本文；`/think` 不改歷史內容。
 - 這一輪還在跑的時候不會換(會告訴你「要等它結束;Ctrl-C 可以中斷它」);讀不到那段
   對話時也**什麼都不動** —— 畫面與模型歷史仍然是原來那一段,不會換到一半。
 

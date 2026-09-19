@@ -729,11 +729,69 @@ def test_a_manual_compaction_is_a_turn_and_can_be_cancelled():
 
 
 def test_a_session_change_rebinds_the_compactor_without_consuming_the_notice():
-    """`/new` / `/resume` 只重綁;「每個 session 只講一次」的警告留給送出當下。"""
+    """`/new` / `/session` 只重綁;「每個 session 只講一次」的警告留給送出當下。"""
     compactor = _Compactor(notice="已停用")
     coordinator, _recorder = _coordinator(_Engine(), compactor=compactor)
     coordinator.session_changed()
     assert compactor.rebinds == 1 and compactor.notices == 0
+
+
+def test_first_turn_binds_before_worker_target_and_rebinds_without_aborting_prime(monkeypatch):
+    engine = _Engine()
+    engine.session_id = ""
+    calls = []
+    compactor = _Compactor()
+    coordinator, recorder = _coordinator(engine, compactor=compactor)
+
+    def bind():
+        assert coordinator.busy
+        calls.append("bind")
+        engine.session_id = "20260919T120000-abcdef01"
+
+    engine.bind_new_session = bind
+    engine.new_session = lambda: pytest.fail("首次綁定不得以 /new 打掉 mount 預熱")
+    scheduled = []
+    monkeypatch.setattr(coordinator, "_spawn", lambda body, name: scheduled.append((body, name)))
+    coordinator.start_turn("first")
+    assert calls == ["bind"] and compactor.rebinds == 1
+    assert scheduled[0][1] == f"codetrail-turn-{engine.session_id}"
+    scheduled.pop(0)[0]()
+    assert engine.sent == ["first"] and not coordinator.busy
+    assert all(event["sessionID"] == engine.session_id for event in recorder.events)
+    coordinator.start_turn("second")
+    scheduled.pop(0)[0]()
+    assert calls == ["bind"] and compactor.rebinds == 1
+
+
+def test_unbound_queue_and_compaction_cannot_dispatch_or_create_a_session(monkeypatch):
+    engine = _Engine()
+    engine.session_id = ""
+    coordinator, recorder = _coordinator(engine)
+    engine.bind_new_session = lambda: pytest.fail("只有直接送出第一則訊息才能首次綁定")
+    monkeypatch.setattr(coordinator, "_spawn", lambda *_args: pytest.fail("unbound request dispatched"))
+    for operation in (lambda: coordinator.enqueue("queued"), coordinator.resume_queue,
+                      coordinator.start_compaction):
+        with pytest.raises(client_turns.QueueError, match="尚未建立"):
+            operation()
+    assert coordinator.queue_snapshot() == () and recorder.events == []
+    assert engine.session_id == "" and engine.sent == [] and not coordinator.busy
+
+
+def test_first_binding_failure_releases_turn_without_publishing_an_empty_session(monkeypatch):
+    engine = _Engine()
+    engine.session_id = ""
+    coordinator, recorder = _coordinator(engine)
+
+    def bind():
+        raise OSError("create failed")
+
+    engine.bind_new_session = bind
+    monkeypatch.setattr(coordinator, "_spawn", lambda *_args: pytest.fail("creation failed before spawn"))
+    with pytest.raises(OSError, match="create failed"):
+        coordinator.start_turn("first")
+    assert not coordinator.busy and not coordinator.cancelled
+    assert engine.session_id == "" and engine.sent == []
+    assert recorder.events == [] and coordinator.cancel() is False
 
 
 # ============================================================

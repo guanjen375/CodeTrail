@@ -570,7 +570,7 @@ class Compactor:
     def rebind(self) -> None:
         """重新綁到 engine **目前**的 session。
 
-        `/new` 與 `/resume` 只換 engine 的 session_id 與 messages,Compactor
+        `/new` 與 `/session` 只換 engine 的 session_id 與 messages,Compactor
         是同一個物件。不重綁的話:上一段對話的 `previous_summary` 會被送進
         新對話的摘要請求(NDA 內容跨 session 外洩),`last_anchor` 會擋掉新
         對話第一次該做的壓縮,而上一段的停用狀態會把新的一段也停掉 ——

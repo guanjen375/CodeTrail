@@ -123,7 +123,7 @@ def engine_factory(tmp_path, monkeypatch):
     root = tmp_path / "project"
     root.mkdir()
 
-    def _make(*, mcp=None, policy=None, store=None, **option_kwargs):
+    def _make(*, mcp=None, policy=None, store=None, defer_session=False, **option_kwargs):
         options = client_engine.EngineOptions(
             root=root,
             model="test-model",
@@ -137,6 +137,7 @@ def engine_factory(tmp_path, monkeypatch):
             mcp=mcp or FakeMcp(),
             store=store or client_store.EphemeralSessionStore(root),
             system_prompt=client_prompt.SystemPrompt(text="SYSTEM"),
+            defer_session=defer_session,
         )
         engine.load_tools()
         return engine
@@ -2834,7 +2835,11 @@ def test_priming_sends_the_prefix_the_next_turn_will_send_and_records_nothing(
 
     prime = sent[0]
     assert prime["stream"] is True
-    assert prime["extra"] == {"max_tokens": client_engine.PRIME_MAX_TOKENS} == {"max_tokens": 1}
+    assert prime["extra"] == {
+        "max_tokens": client_engine.PRIME_MAX_TOKENS,
+        "chat_template_kwargs": {"enable_thinking": False, "thinking": False},
+    }
+    assert prime["extra"]["max_tokens"] == 1
     assert prime["tools"] == engine.openai_tools() and prime["tool_choice"] == "auto"
 
     # 零寫入:歷史逐字不變、session 檔一筆都沒多、畫面事件一個都沒有(沒有 on_event 可傳)。
@@ -3748,3 +3753,231 @@ def test_failed_session_creation_does_not_disable_future_priming(engine_factory,
     assert engine.prime_prompt_cache().sent is True
     assert posts[0]["messages"][-1] == {"role": "user", "content": "unchanged"}
     assert engine.messages == before and engine.session_id == session
+
+
+@pytest.mark.parametrize("key, enabled", [
+    (None, False), ("enable_thinking", False), ("enable_thinking", True),
+    ("thinking", False), ("thinking", True),
+])
+def test_chat_thinking_count_and_generation_share_one_snapshot(engine_factory, monkeypatch, key, enabled):
+    """Both llama parser and Jinja controls must match the counted chat step."""
+    engine = engine_factory(thinking_kwarg=key, thinking=enabled, metrics_enabled=False)
+    engine.messages = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer", "reasoning_content": "old reasoning"},
+    ]
+    original = copy.deepcopy(engine.messages)
+    counted, generated = [], []
+
+    def count(**kwargs):
+        counted.append(kwargs)
+        with pytest.raises(client_engine.EngineError, match="進行中|支援"):
+            engine.set_thinking(not enabled)
+        return 100
+
+    def chat(**kwargs):
+        generated.append(kwargs)
+        return iter([_text_chunk("answer", finish="stop")])
+
+    monkeypatch.setattr(llama_client, "count_chat_tokens", count)
+    monkeypatch.setattr(llama_client, "chat_completions", chat)
+    assert engine.send("new question").text == "answer"
+    assert len(counted) == len(generated) == 1
+    assert counted[0]["extra"] is generated[0]["extra"]
+    assert generated[0]["extra"]["chat_template_kwargs"] == {
+        "enable_thinking": enabled, "thinking": enabled,
+    }
+    assert counted[0]["messages"] == generated[0]["messages"]
+    assert "reasoning_content" not in generated[0]["messages"][2]
+    assert engine.messages[:2] == original
+
+
+def test_compaction_is_explicitly_off_while_chat_context_count_tracks_thinking(engine_factory, monkeypatch):
+    engine = engine_factory(thinking_kwarg="thinking", thinking=True, metrics_enabled=False)
+    counted, generated = [], []
+
+    def count(**kwargs):
+        counted.append(kwargs)
+        return 100
+
+    def chat(**kwargs):
+        generated.append(kwargs)
+        return iter([_text_chunk("summary", finish="stop")])
+
+    monkeypatch.setattr(llama_client, "count_chat_tokens", count)
+    monkeypatch.setattr(llama_client, "chat_completions", chat)
+    monkeypatch.setattr(llama_client, "get_slots", _no_probe)
+    monkeypatch.setattr(config, "CLIENT_PRIME_PROMPT_CACHE", True)
+    assert engine.prime_prompt_cache() == client_engine.PrimeOutcome(False, "thinking", None)
+    assert counted == generated == []
+    assert engine.complete([{"role": "user", "content": "summarize"}], source="compaction").text == "summary"
+    assert counted[0]["extra"] is generated[0]["extra"]
+    assert generated[0]["extra"]["chat_template_kwargs"] == {
+        "enable_thinking": False, "thinking": False,
+    }
+    engine.count_input_tokens([{"role": "user", "content": "summary budget"}])
+    engine.context_tokens()
+    assert counted[-2]["extra"]["chat_template_kwargs"] == {
+        "enable_thinking": False, "thinking": False,
+    }
+    assert counted[-1]["extra"]["chat_template_kwargs"] == {
+        "enable_thinking": True, "thinking": True,
+    }
+    assert engine.options.thinking is True and engine.messages == []
+
+
+def test_thinking_changes_require_support_idle_state_and_completed_prime_shutdown(engine_factory, monkeypatch):
+    engine = engine_factory(thinking_kwarg="thinking", metrics_enabled=False)
+    engine.messages = [{"role": "user", "content": "unchanged"}]
+    history, binding = copy.deepcopy(engine.messages), engine._history
+    release, ready = threading.Event(), threading.Event()
+    stream = _HeldStream(release, [_prime_final_chunk()])
+    outcomes, sent = [], []
+
+    def chat(**kwargs):
+        sent.append(kwargs)
+        ready.set()
+        return stream
+
+    monkeypatch.setattr(config, "CLIENT_PRIME_PROMPT_CACHE", True)
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    monkeypatch.setattr(llama_client, "chat_completions", chat)
+    primer = threading.Thread(target=lambda: outcomes.append(engine.prime_prompt_cache()), daemon=True)
+    primer.start()
+    try:
+        assert ready.wait(2)
+        assert engine.set_thinking(True) is True
+        primer.join(1)
+        assert not primer.is_alive() and not engine.priming
+        assert outcomes == [client_engine.PrimeOutcome(False, "aborted", None)]
+        assert engine.model_lock.acquire(blocking=False)
+        engine.model_lock.release()
+        assert engine.options.thinking is True
+        assert sent[0]["extra"]["chat_template_kwargs"] == {"enable_thinking": False, "thinking": False}
+        assert engine.prime_prompt_cache().reason == "thinking" and len(sent) == 1
+        assert engine.messages == history and engine._history is binding
+        assert engine.set_thinking(True) is False
+        with engine.turn_scope():
+            with pytest.raises(client_engine.EngineError, match="進行中"):
+                engine.set_thinking(False)
+        assert engine.options.thinking is True
+        with monkeypatch.context() as scoped:
+            scoped.setattr(engine, "abort_prime", lambda: False)
+            with pytest.raises(client_engine.EngineError, match="未變更"):
+                engine.set_thinking(False)
+        assert engine.options.thinking is True
+        assert engine.set_thinking(False) is True
+        for invalid in ("false", 1, None):
+            with pytest.raises(client_engine.EngineError, match="bool"):
+                engine.set_thinking(invalid)
+        unknown = engine_factory(metrics_enabled=False)
+        with pytest.raises(client_engine.EngineError, match="支援"):
+            unknown.set_thinking(True)
+        assert not unknown.thinking_supported and unknown.options.thinking is False
+    finally:
+        release.set()
+        engine.abort_prime(wait=0)
+        primer.join(2)
+
+
+class _AdmissionStore(_CountingStore):
+    def __init__(self, root):
+        super().__init__(root)
+        self.creates = 0
+        self.fail_create = False
+
+    def create(self, **kwargs):
+        self.creates += 1
+        if self.fail_create:
+            raise OSError("synthetic create failure")
+        return super().create(**kwargs)
+
+
+@pytest.mark.parametrize("operation", ["send", "record", "supplement", "replace", "heal", "loop"])
+def test_unbound_engine_rejects_every_history_writer_before_memory_or_store_changes(engine_factory, monkeypatch, operation):
+    store = _AdmissionStore(engine_factory.root)
+    engine = engine_factory(store=store, defer_session=True)
+    binding, epoch = engine._history, engine._prime_epoch
+    monkeypatch.setattr(llama_client, "chat_completions", _no_request)
+    writers = {
+        "send": lambda: engine.send("first question"),
+        "record": lambda: engine._record({"role": "user", "content": "first question"}),
+        "supplement": lambda: engine.record_supplement("first question", queue_id="queued"),
+        "replace": lambda: engine.replace_history([{"role": "assistant", "content": "summary"}]),
+        "heal": engine.heal_pending_tool_calls,
+        "loop": lambda: engine.run_tool_loop(on_event=lambda event: pytest.fail(str(event))),
+    }
+    with pytest.raises(client_engine.EngineError, match="尚未建立"):
+        writers[operation]()
+    assert engine.session_id == "" and engine.messages == []
+    assert engine._history is binding and engine._prime_epoch == epoch
+    assert store.creates == 0 and store.appended == []
+    assert engine.store_error is None and engine._in_turn == 0
+
+
+def test_first_session_binding_is_atomic_idempotent_and_rejects_unbound_history(engine_factory):
+    store = _AdmissionStore(engine_factory.root)
+    engine = engine_factory(store=store, defer_session=True)
+    binding, epoch = engine._history, engine._prime_epoch
+    store.fail_create = True
+    with pytest.raises(OSError, match="synthetic create"):
+        engine.bind_new_session()
+    assert engine.session_id == "" and engine._history is binding and engine.messages == []
+    assert engine._prime_epoch == epoch and engine.store_error is None
+    assert store.creates == 1 and store.appended == []
+    store.fail_create = False
+    session = engine.bind_new_session()
+    assert session and engine.bind_new_session() == session
+    assert store.creates == 2 and store.appended == []
+    assert engine._history is binding and engine._prime_epoch == epoch
+    invalid = engine_factory(store=store, defer_session=True)
+    invalid.messages = [{"role": "user", "content": "must not silently adopt"}]
+    with pytest.raises(client_engine.EngineError, match="含有歷史"):
+        invalid.bind_new_session()
+    assert invalid.session_id == "" and store.creates == 2
+
+
+def test_binding_the_first_session_preserves_the_active_zero_write_mount_prime(engine_factory, monkeypatch):
+    store = _AdmissionStore(engine_factory.root)
+    engine = engine_factory(store=store, defer_session=True, metrics_enabled=False)
+    binding, epoch = engine._history, engine._prime_epoch
+    ready, release = threading.Event(), threading.Event()
+    stream = _HeldStream(release, [_prime_final_chunk()])
+    outcomes, sent, counted = [], [], []
+
+    def chat(**kwargs):
+        sent.append(kwargs)
+        if len(sent) == 1:
+            ready.set()
+            return stream
+        return iter([_text_chunk("first answer", finish="stop")])
+
+    def count(**kwargs):
+        counted.append(kwargs)
+        return 100
+
+    monkeypatch.setattr(config, "CLIENT_PRIME_PROMPT_CACHE", True)
+    monkeypatch.setattr(llama_client, "get_slots", lambda *_a, **_k: None)
+    monkeypatch.setattr(llama_client, "chat_completions", chat)
+    monkeypatch.setattr(llama_client, "count_chat_tokens", count)
+    primer = threading.Thread(target=lambda: outcomes.append(engine.prime_prompt_cache(reason="mount")), daemon=True)
+    primer.start()
+    try:
+        assert ready.wait(2)
+        assert engine.session_id == "" and store.creates == 0 and store.appended == []
+        session = engine.bind_new_session()
+        assert engine.bind_new_session() == session and store.creates == 1
+        assert engine.priming and engine._prime_epoch == epoch and not release.is_set()
+        assert engine._history is binding and engine.messages == [] and store.appended == []
+        release.set()
+        primer.join(1)
+        assert not primer.is_alive() and outcomes[0].sent is True
+        assert counted[0]["extra"] is sent[0]["extra"]
+        assert sent[0]["extra"]["chat_template_kwargs"] == {"enable_thinking": False, "thinking": False}
+        assert engine.send("first question").text == "first answer"
+        assert sent[1]["messages"][:-1] == sent[0]["messages"]
+        assert store.creates == 1 and len(store.appended) == 2
+    finally:
+        release.set()
+        engine.abort_prime(wait=0)
+        primer.join(2)

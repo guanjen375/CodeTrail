@@ -39,6 +39,29 @@ TESTS_DIR = Path(__file__).resolve().parent
 
 # AGENTS.md §2「安全相關不要砍」的檢查點 → (守它的說明, 必須存在且帶 smoke 的 node)。
 SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "test_thinking_deployment.py": (
+        "thinking capability 只來自選定 GGUF 真實模板的外部控制；兩鍵 alias 可辨識、"
+        "缺 parser 拒絕且有界讀取；換模型不沿用舊能力，split export/import 保留能力",
+        (
+            "test_setup_detects_only_external_template_switches",
+            "test_setup_accepts_deepseek_alias_and_checks_both_selected_variants",
+            "test_setup_bounds_template_metadata_and_requires_the_real_parser",
+            "test_reconfigure_replaces_stale_thinking_capability",
+            "test_thinking_capability_survives_split_export_and_import",
+            "test_legacy_and_changed_model_profiles_do_not_inherit_capability",
+            "test_thinking_capability_schema_rejects_noncanonical_values",
+        ),
+    ),
+    "test_internal_thinking.py": (
+        "所有內部 chat 生成與模板計數都明確同步關閉 enable_thinking/thinking；"
+        "context generation 與 canary cache 身分包含模式，不能沿用舊思考輸出",
+        (
+            "test_chunk_and_summary_requests_disable_thinking_and_invalidate_older_cached_modes",
+            "test_legacy_agent_requests_explicitly_disable_thinking",
+            "test_catalog_probe_generation_and_template_counts_share_explicit_off_mode",
+            "test_canary_fingerprint_includes_the_explicit_internal_off_mode",
+        ),
+    ),
     "test_allow_directory_regression.py": (
         "/allow add 目錄必須寫入 client.json，讓同一 MCP instance 立即執行該目錄工具；"
         "list 顯示內建與目錄授權，管理操作不進模型歷史；帶路徑或 shell 語法的呼叫仍拒絕且不 spawn，"
@@ -188,6 +211,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "review 的隔離 readonly MCP、受限 JSON true 工具、共享模型鎖與精確 gate；"
         "草稿不外洩、無歷史或 metrics 寫入，來源至 HTTP/工具/發布全程可取消",
         (
+            "test_review_forces_thinking_off_without_changing_the_interactive_mode",
             "test_review_isolated_mcp_ephemeral_history_shared_lock_and_exact_gate",
             "test_review_allowlist_and_json_true_guard_schema_and_dispatch",
             "test_review_overflow_refuses_model_request_without_metrics_or_truncation",
@@ -220,6 +244,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     "test_chat_token_count.py": (
         "精確計數與 chat body 同源，endpoint/取消契約 fail-closed，不洩漏 NDA 內容",
         (
+            "test_chat_wire_thinking_defaults_off_and_keeps_parser_and_template_controls_together",
+            "test_native_completion_does_not_claim_chat_template_thinking_control",
             "test_exact_count_sends_the_same_complete_body_as_chat",
             "test_exact_count_fails_closed_without_exposing_response_or_request_bodies",
             "test_exact_count_owns_only_its_scoped_cancellation_transport",
@@ -982,6 +1008,12 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "(補的「已中斷」結果排在該群組既有結果之後);"
         "只有終結 chunk + `timings.prompt_n` 才記成 sent(`incomplete` / `no_timings` 不寫 telemetry)",
         (
+            "test_chat_thinking_count_and_generation_share_one_snapshot",
+            "test_compaction_is_explicitly_off_while_chat_context_count_tracks_thinking",
+            "test_thinking_changes_require_support_idle_state_and_completed_prime_shutdown",
+            "test_unbound_engine_rejects_every_history_writer_before_memory_or_store_changes",
+            "test_first_session_binding_is_atomic_idempotent_and_rejects_unbound_history",
+            "test_binding_the_first_session_preserves_the_active_zero_write_mount_prime",
             "test_appending_turns_keeps_the_existing_tool_projection_stable",
             "test_summary_head_clones_reuse_the_full_history_pruning_plan",
             "test_summary_projection_rejects_a_nonprefix_clone",
@@ -1123,7 +1155,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_the_server_actually_honours_readonly",
             "test_headless_run_compacts_after_a_completed_turn_and_reports_it",
             "test_headless_run_never_primes_the_prompt_cache",
-            "test_the_tui_banner_after_a_passing_preflight_drops_the_progress_log_and_keeps_warnings",
+            "test_startup_diagnostics_keep_warnings_for_status_and_defer_session_creation",
+            "test_interactive_build_defers_disk_session_until_first_binding",
         ),
     ),
     "test_client_turns.py": (
@@ -1160,6 +1193,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_cancel_accepted_during_compaction_ends_with_a_cancelled_terminal",
             "test_a_manual_compaction_is_a_turn_and_can_be_cancelled",
             "test_a_session_change_rebinds_the_compactor_without_consuming_the_notice",
+            "test_first_turn_binds_before_worker_target_and_rebinds_without_aborting_prime",
+            "test_unbound_queue_and_compaction_cannot_dispatch_or_create_a_session",
+            "test_first_binding_failure_releases_turn_without_publishing_an_empty_session",
             "test_a_compaction_that_replaced_the_history_primes_after_the_turn_lock_is_released",
             "test_priming_is_invisible_to_busy_and_cancel_and_refused_while_a_turn_runs",
             "test_every_prime_the_coordinator_runs_reports_through_on_prime",
@@ -1208,7 +1244,11 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_second_question_during_a_turn_is_not_shown_and_keeps_the_input",
             "test_a_pipe_is_refused_and_points_at_the_headless_entry",
             "test_slash_commands_never_reach_the_model",
-            "test_thinking_only_toggles_the_display",
+            "test_show_reasoning_is_display_only_and_think_preserves_history",
+            "test_blank_startup_retains_diagnostics_for_status_without_creating_session",
+            "test_failed_first_session_creation_keeps_the_draft_and_releases_the_turn",
+            "test_think_rejects_unsupported_models_and_changes_during_a_turn",
+            "test_live_thinking_indicator_is_visible_without_reasoning_and_cleared_at_boundaries",
             "test_a_tool_call_shows_a_summary_and_can_be_expanded",
             "test_saving_history_never_writes_through_a_hard_link",
             "test_saving_history_never_follows_a_symlink",

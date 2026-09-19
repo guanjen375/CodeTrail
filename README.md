@@ -528,6 +528,10 @@ python3 deployment_profile.py show                        # 目前的有效設�
 python3 deployment_profile.py --main-model <CODE_MODEL> show   # 只在這一次覆寫主模型
 ```
 
+`set_config.sh` 會讀主模型 GGUF 的 chat template，將偵測到的 thinking 控制鍵寫入
+`services.main.thinking_kwarg`(`enable_thinking` / `thinking` / `null`)。無法確認支援或
+舊設定沒有這個欄位時，TUI 會拒絕 `/think on`；關閉時仍明確送出 off，不採用模型預設值。
+
 啟用 reranking 時，RAG 與 Code RAG 都只使用專用 reranker；服務缺席、逾時或回應無效即報錯。啟動前 preflight 仍要求 reranker ready。
 
 `client.json` 的 `rerank_fallback_policy` 保留相容鍵名，但唯一合法值為 `"error"`。舊值 `"embedding"` / `"main_model"` 會在設定載入時報錯，請刪除該鍵或改成 `"error"`。repo 常數 `config.RERANK_FALLBACK_POLICY` 也只接受 `error`。明確關閉 reranking 的選項，以及依候選內容決定不需 rerank 的路徑仍照常運作。
@@ -563,7 +567,7 @@ registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf`
 
 - `compaction_mode`:`codetrail`(助理答完或接續歷史時，依完整 token 數檢查自動壓縮)/
   `manual`(只有你按 `/compact`)/ `off`(完全不壓縮;context 滿了會是可見的錯誤)。
-  **沒有這個檔就等於沒有接管**,客戶端退成 `manual` 並在啟動橫幅講明。
+  **沒有這個檔就等於沒有接管**,客戶端退成 `manual`，可由 `/status` 查看。
 - `permission`:每個工具的核准覆寫(`allow` / `ask` / `deny`),不寫就用預設。
 
 其餘的鍵都有預設值,`set_config.sh` 不會問、也不會刪掉你自己加的:
@@ -581,8 +585,8 @@ registry value 也可寫 `~`,loader 會展開並要求它解析成絕對 `.gguf`
 | `objdump` | `""` | 反組譯用的 objdump 路徑(跨架構韌體時指定 binutils-`<triplet>`) |
 | `h_lang` | `"c"` | `.h` 當 C 還是 C++ 解析(`c` / `cpp`) |
 | `use_container` | `false` | 在容器裡跑 `run_command` |
-| `show_reasoning` | `false` | `/thinking` 的**初始值**,只管畫面 |
-| `keep_historical_reasoning` | `false` | 舊回合的 assistant reasoning 要不要送進模型。與上面是**兩個鍵**:`/thinking` 只改畫面,不得動這個 |
+| `show_reasoning` | `false` | 顯示即時與重播的 reasoning 本文；只管畫面，不控制生成 |
+| `keep_historical_reasoning` | `false` | 舊回合的 assistant reasoning 要不要送進模型；與畫面顯示及 `/think` 的生成開關各自獨立 |
 
 未知的鍵一律 fail-loud(拼錯不會靜默失效);布林鍵只收真的 `true` / `false`
 (`"false"` 是一個非空字串,不是 false)。
@@ -685,20 +689,30 @@ aicode
 沒有任何環境變數可以改它。換模型 = 重跑 `./set_config.sh` 再重啟 server。
 
 啟動前置(profile 驗證、主模型、n_ctx 觀測、ctx 容量閘、lessons、附屬 server、工具健檢)
-**通過**時,對話區只留一行摘要、壓縮狀態行與警告(含工具健檢寫到 stderr 的行);逐項進度
-的完整輸出留在 TUI 接管畫面**之前**的終端,往上捲就看得到。**失敗**時 `aicode` 不會進 TUI,
-錯誤原樣留在終端。
+**通過**時，TUI 對話區完全空白，不放啟動摘要、說明或 WARN；啟動摘要、壓縮狀態與
+所有警告保留在 `/status`。逐項進度的完整輸出仍留在 TUI 接管前的終端。
+**失敗**時 `aicode` 不會進 TUI，錯誤原樣留在終端。
+
+啟動不建立 session 檔。按 `/new` 或直接送出第一則問題時才建立；用 `/session` 接續歷史
+也不會先留下空白對話。尚未建立對話時，`/queue add` 與 `/queue resume` 會提示先用
+`/new` 或直接輸入問題。
 
 在 TUI 內用 `/session` 接續舊對話時,畫面會把那一段
 **原始記錄**重播出來:你問過的話、模型的回答與 thinking、每一次工具呼叫的參數、狀態與
 結果。壓縮過的對話也一樣看得到壓縮**之前**的原文,摘要只在原文之後多一個可展開的
 標記(模型看到的仍然是壓縮後的歷史 —— 畫面與模型視野是兩件事)。TUI 內的
-`/sessions` 列出這個專案的既有對話、`/session` 開選單挑一段,細節見
+`/session` 開選單挑一段，`/session <id>` 直接接續指定對話，細節見
 [docs/basic-usage.md](docs/basic-usage.md#7-切換與接續對話)。
+
+主聊天 thinking 每次啟動預設關閉。`/think` 切換，`/think on` / `/think off` 明確設定，
+狀態列顯示 `think=on|off`；專案指示狀態可在 `/status` 查看。實際收到 reasoning 時，
+對話區以紅字「思考中」標示，reasoning 本文是否顯示由 `client.json` 的 `show_reasoning`
+決定。摘要、審查、RAG 等內部生成一律關閉 thinking；主聊天開啟時不做 prompt cache 預熱。
 
 自動壓縮與 context gate 使用本機模型的完整 token 計數，包含快取中的輸入；不以本輪重新
 prefill 的數量判斷容量。門檻依 live `n_ctx` 推導，32K～1M 都使用同一公式。接續時先檢查
-壓縮，再預熱快取；普通追加回合不再持續改寫歷史前段的工具剪枝位置。
+壓縮，thinking 關閉時再預熱快取。空白啟動仍可做不建立 session 的預熱，首次送出問題
+綁定 session 時保留它；普通追加回合不再持續改寫歷史前段的工具剪枝位置。
 
 模型處理 prompt 時,從本次請求第一個進度快照起算,前 10 秒狀態列維持「等待回應」;
 之後每 10 秒取最新快照顯示百分比、已處理/總 token 與 cache,有可信資料時再加速率及

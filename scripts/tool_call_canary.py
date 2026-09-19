@@ -48,6 +48,7 @@ import client_events  # noqa: E402
 import process_env  # noqa: E402
 import client_mcp  # noqa: E402
 import client_prompt  # noqa: E402
+import llama_client  # noqa: E402
 import config as codetrail_config  # noqa: E402
 from mcp_contract import MCP_INSTRUCTIONS, PUBLIC_TOOL_NAMES, PUBLIC_TOOL_ORDER  # noqa: E402
 from model_resolution import resolve_main_model  # noqa: E402
@@ -508,6 +509,7 @@ def build_fingerprint(
         "canary_version": CANARY_VERSION,
         "root": str(root),
         "selected_model": selected_model,
+        "chat_template_kwargs": llama_client.thinking_template_kwargs(),
         # 模型真的會看到的 system prompt 的身分(取代舊的 build prompt /
         # 全域 AGENTS.md 兩格)。
         "system_prompt_digest": _client_prompt_digest(root, env),

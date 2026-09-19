@@ -16,7 +16,7 @@
   這兩個 engine 自己看不到的狀態也涵蓋得到。
 * **不直接 print**。Textual 接管畫面之後任何 stdout / stderr 都會把畫面打壞,
   所以這裡所有輸出都是 widget;engine 的事件由背景執行緒搬進 UI 執行緒。
-* **接續一段對話就要看得到它**。`/resume`、`/session`(選單或直接指定)與啟動時
+* **接續一段對話就要看得到它**。`/session`(選單或直接指定)與啟動時
   就接好的 Python 維護入口都重播**原始記錄**:文字、reasoning、工具呼叫
   (含未裁切的 `structuredContent`)與壓縮標記。畫面看不到、模型看得到的話,
   接下來每一則回答都在回應一段使用者看不見的脈絡。換不成功就 engine 與畫面
@@ -72,9 +72,8 @@ PROMPT_PROGRESS_INTERVAL_SECONDS = 10.0
 
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-#: 選單一次最多列幾段對話。`/sessions` 的文字清單短一點(它是貼進對話流的一則)。
+#: 選單一次最多列幾段對話。
 SESSION_PICKER_LIMIT = 50
-SESSION_LIST_LIMIT = 20
 
 #: 重播時,宣告了卻沒有結果的那一次呼叫。**不是**「已中斷」:那則結果是下一次
 #: 送出前才由 engine 的 heal 補上去的,現在它真的還沒有結果。
@@ -90,16 +89,14 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "這份說明"),
     ("/allow", "命令白名單:list / add <絕對目錄>"),
     ("/new", "開一個新對話"),
-    ("/sessions", "列出這個專案的既有對話"),
     ("/session", "選一個既有對話切換(/session <id> 直接指定)"),
-    ("/resume", "接續一個既有對話(/resume <id>)"),
     ("/compact", "立刻壓縮目前對話"),
     ("/review", "審查 HEAD 到工作目錄的淨變更，含新增檔案；不寫聊天歷史"),
     ("/queue", "待送訊息:list / add / edit / cancel / resume"),
     ("/supplement", "補充目前任務(/supplement <文字>,安全點才送入)"),
     ("/status", "目前模型、context、壓縮模式與 session 位置"),
     ("/tools", "本輪暴露的工具(裸名,依 tools/list 順序)"),
-    ("/thinking", "切換是否顯示模型的 thinking"),
+    ("/think", "切換主模型思考(/think on|off，預設 off)"),
     ("/exit", "離開"),
 )
 
@@ -384,7 +381,7 @@ class ErrorLine(Static):
 
 
 class ReasoningBlock(Static):
-    """模型的 thinking。``/thinking`` 只切換它的顯示,不影響送模內容。"""
+    """模型的 reasoning 本文，顯示由 client.json 的 show_reasoning 決定。"""
 
     def __init__(self) -> None:
         super().__init__(classes="entry reasoning")
@@ -898,6 +895,9 @@ class CodeTrailApp(App[int]):
         self.engine = engine
         self.compactor = compactor
         self.banner = tuple(banner)
+        # 啟動資訊只在 /status 查閱；初始對話區連 WARN 也不重播。
+        self._startup_diagnostics = list(self.banner)
+        self._user_interacted = False
         self.state_dir = state_dir
         self.show_reasoning = bool(show_reasoning)
         self.keep_historical_reasoning = bool(keep_historical_reasoning)
@@ -913,6 +913,7 @@ class CodeTrailApp(App[int]):
         self._ui_thread_id = threading.get_ident()
         self._assistant: AssistantBlock | None = None
         self._reasoning: ReasoningBlock | None = None
+        self._thinking_indicator: Static | None = None
         self._tools: dict[str, ToolBlock] = {}
         self._approval_screens: dict[str, ApprovalScreen] = {}
         self._review_screen: ReviewScreen | None = None
@@ -958,9 +959,6 @@ class CodeTrailApp(App[int]):
         prompt = self.query_one("#prompt", PromptInput)
         prompt.load_history(self._read_history())
         prompt.focus()
-        for line in self.banner:
-            self._append(NoticeLine(line))
-        self._append(NoticeLine("輸入 /help 看指令。"))
         self._replay_startup_session()
         # 接續歷史先依完整計數檢查壓縮，再預熱下一輪的 prefix。
         self._prepare_idle("mount")
@@ -976,7 +974,21 @@ class CodeTrailApp(App[int]):
         log.scroll_end(animate=False)
 
     def _append_notice(self, message: str) -> None:
+        if not self._user_interacted:
+            self._startup_diagnostics.append(message)
+            return
         self._append(NoticeLine(message))
+
+    def _show_thinking(self) -> None:
+        if self._thinking_indicator is None:
+            self._thinking_indicator = Static(Text("思考中", style="bold red"), classes="thinking-indicator")
+            self._append(self._thinking_indicator)
+
+    def _clear_thinking(self) -> None:
+        if self._thinking_indicator is not None:
+            self._thinking_indicator.display = False
+            self._thinking_indicator.remove()
+            self._thinking_indicator = None
 
     def _ensure_assistant(self) -> AssistantBlock:
         if self._assistant is None:
@@ -1049,7 +1061,7 @@ class CodeTrailApp(App[int]):
     def _replay_startup_session(self) -> None:
         """Python 維護入口選定 session：engine 在 app 建起來之前就接續好了。
 
-        重播只掛在 `/resume` 上的話,最常走的這一條路照樣是空白畫面 —— 使用者
+        重播只掛在 `/session` 上的話,這一條路仍然會是空白畫面 —— 使用者
         看不到自己上次問過什麼,但模型接得下去。
         """
         snapshot = getattr(self.engine, "resumed_snapshot", None)
@@ -1108,12 +1120,14 @@ class CodeTrailApp(App[int]):
             self._on_activity(event)
             return
         if kind == client_events.TYPE_TEXT_DELTA:
+            self._clear_thinking()
             self._answer_started = True
             self._mark_generating()
             self._ensure_assistant().append(str(client_events.event_part(event).get("text", "")))
             self.query_one("#log", VerticalScroll).scroll_end(animate=False)
             return
         if kind == client_events.TYPE_TEXT:
+            self._clear_thinking()
             self._answer_started = True
             self._mark_generating()
             text = str(client_events.event_part(event).get("text", ""))
@@ -1126,7 +1140,7 @@ class CodeTrailApp(App[int]):
             self._on_tool_event(event)
             return
         if kind == client_events.TYPE_NOTICE:
-            self._append(NoticeLine(str(event.get("message", ""))))
+            self._append_notice(str(event.get("message", "")))
             return
         if kind == client_events.TYPE_ERROR:
             self._turn_started = None
@@ -1190,6 +1204,8 @@ class CodeTrailApp(App[int]):
             return
         if phase in ("generating", "validating", "persisting", "tool", "approval"):
             self._activity_generating = True
+        if operation == "compact" or phase in ("tool", "approval"):
+            self._clear_thinking()
         activity: dict[str, Any] = {"operation": operation, "phase": phase}
         percent = part.get("percent")
         if phase == "prompt_processing":
@@ -1230,6 +1246,7 @@ class CodeTrailApp(App[int]):
             self._refresh_status()
 
     def _on_tool_event(self, event: Mapping[str, Any]) -> None:
+        self._clear_thinking()
         part = client_events.event_part(event)
         state = part.get("state") or {}
         call_id = str(part.get("callID", ""))
@@ -1274,11 +1291,13 @@ class CodeTrailApp(App[int]):
         self._refresh_status()
 
     def _on_reasoning(self, token: str) -> None:
+        if not token:
+            return
         self._reasoning_chunks += 1
         self._mark_generating()
+        self._show_thinking()
         self._ensure_reasoning().append(token)
-        if self.show_reasoning:
-            self.query_one("#log", VerticalScroll).scroll_end(animate=False)
+        self.query_one("#log", VerticalScroll).scroll_end(animate=False)
 
     # ---- 核准 ----------------------------------------------------------
     def _show_approval(self, ticket: client_turns.ApprovalTicket) -> None:
@@ -1352,6 +1371,7 @@ class CodeTrailApp(App[int]):
         **先取回合鎖再貼 UserMessage**:反過來的話被 ``Busy`` 拒絕的那一則已經
         顯示在對話區,畫面上就有一則模型從來沒看過的問題。
         """
+        self._user_interacted = True
         try:
             self.coordinator.start_turn(text)
         except client_turns.TurnCoordinator.Busy:
@@ -1394,6 +1414,7 @@ class CodeTrailApp(App[int]):
 
     # ---- 指令 ----------------------------------------------------------
     def _command(self, line: str) -> bool:
+        self._user_interacted = True
         name, _, argument = line[1:].partition(" ")
         name = name.strip().lower()
         argument = argument.strip()
@@ -1501,12 +1522,27 @@ class CodeTrailApp(App[int]):
 
     _cmd_quit = _cmd_exit
 
-    def _cmd_thinking(self, _argument: str) -> None:
-        """只切換**畫面**。送模 payload 與摘要輸入不受影響(那是另一個設定)。"""
-        self.show_reasoning = not self.show_reasoning
-        for widget in self.query(ReasoningBlock):
-            widget.display = self.show_reasoning
-        self._append(NoticeLine(f"thinking 顯示:{'開' if self.show_reasoning else '關'}"))
+    def _cmd_think(self, argument: str) -> None:
+        value = argument.lower()
+        if value not in ("", "on", "off"):
+            self._append(NoticeLine("用法:/think [on|off]；不帶參數切換。"))
+            return
+        if self._busy_notice("/think"):
+            return
+        if not self.engine.thinking_supported:
+            self._append(NoticeLine("此模型尚未偵測到 thinking 控制支援；請重新執行 set_config 偵測。"))
+            return
+        enabled = not self.engine.options.thinking if not value else value == "on"
+        try:
+            changed = self.engine.set_thinking(enabled)
+        except Exception as exc:  # noqa: BLE001 - 中止預熱失敗時保留原模式
+            self._append(ErrorLine(f"無法切換 thinking:{exc}"))
+            return
+        if changed:
+            self._last_prime = None
+            self._recount_context()
+            self._prime("think")
+        self._append(NoticeLine(f"think={'on' if self.engine.options.thinking else 'off'}"))
         self._refresh_status()
 
     def _cmd_tools(self, _argument: str) -> None:
@@ -1519,7 +1555,7 @@ class CodeTrailApp(App[int]):
     def _busy_notice(self, what: str) -> bool:
         """回合進行中就擋下這個指令並回 True。
 
-        ``/new``、``/resume`` 與 ``/session`` 直接換掉 ``engine.session_id`` 與 ``messages``:
+        ``/new`` 與 ``/session`` 直接換掉 ``engine.session_id`` 與 ``messages``:
         在回合中做等於把還沒寫完的答案與自動壓縮落到**另一段**對話,舊對話留下
         一則沒有回答的 user,新對話多出一則沒有相鄰 user 的 assistant。
         排隊 worker 也會開始新回合,所以閒置時仍須檢查 pending 佇列:
@@ -1567,16 +1603,6 @@ class CodeTrailApp(App[int]):
             self._append(ErrorLine(f"讀不到既有對話:{type(exc).__name__}: {exc}"))
             return None
 
-    def _cmd_sessions(self, _argument: str) -> None:
-        sessions = self._sessions(SESSION_LIST_LIMIT)
-        if sessions is None:
-            return
-        if not sessions:
-            self._append(NoticeLine("這個專案還沒有已保存的對話。"))
-            return
-        lines = [f"  {session_row(info, with_id=True)}" for info in sessions]
-        self._append(NoticeLine("\n".join(lines) + "\n用 /session 選一段接續。"))
-
     def _cmd_session(self, argument: str) -> None:
         """`/session <id>` 直接換;`/session` 開選單。"""
         if argument:
@@ -1597,14 +1623,6 @@ class CodeTrailApp(App[int]):
         if not session_id:
             return
         self._switch_session(session_id, what="/session")
-
-    def _cmd_resume(self, argument: str) -> None:
-        if not argument:
-            if self._busy_notice("/resume"):
-                return
-            self._append(NoticeLine("用法:/resume <session id>,或用 /session 開選單。"))
-            return
-        self._switch_session(argument, what="/resume")
 
     def _switch_session(self, session_id: str, *, what: str = "/session") -> None:
         """換到另一段既有對話:engine 與畫面**要嘛一起換,要嘛都不動**。
@@ -1682,14 +1700,15 @@ class CodeTrailApp(App[int]):
             self._leave()
 
     def _cmd_status(self, _argument: str) -> None:
-        path = self.engine.store.path(self.engine.session_id)
+        path = self.engine.store.path(self.engine.session_id) if self.engine.session_id else None
         lines = [
             f"model={self.engine.options.model}",
             f"n_ctx={self.engine.options.n_ctx} max_output={self.engine.options.max_output_tokens}",
             f"tools={len(self.engine.tool_specs)} permission={self.engine.options.policy.name}",
             f"壓縮模式={self._compaction_mode()}",
-            f"session={self.engine.session_id}",
-            f"session 檔={path if path else '(不落檔)'}",
+            f"session={self.engine.session_id or '(尚未建立)'}",
+            f"session 檔={path if path else '(不落檔)' if self.engine.session_id else '(尚未建立)'}",
+            f"think={'on' if self.engine.options.thinking else 'off'}",
             f"專案指示={'已載入' if self._project_instructions() else '未載入'}",
             f"舊回合 reasoning={'送模' if self.keep_historical_reasoning else '不進模型'}",
             f"prompt cache 預熱={self._prime_status()}",
@@ -1700,6 +1719,8 @@ class CodeTrailApp(App[int]):
             lines.append(
                 f"⚠ session 落檔失敗({self.engine.store_error});這段對話只在記憶體裡。"
             )
+        if self._startup_diagnostics:
+            lines.extend(("啟動診斷:", *self._startup_diagnostics))
         self._append(NoticeLine("\n".join(lines)))
 
     # ---- 鍵盤動作 ------------------------------------------------------
@@ -1871,6 +1892,7 @@ class CodeTrailApp(App[int]):
         return any(section.name in ("project_agents", "lessons") for section in sections)
 
     def _reset_phase(self, *, compacting: bool = False) -> None:
+        self._clear_thinking()
         self._reasoning_chunks = 0
         self._answer_started = False
         self._compacting = compacting
@@ -1962,11 +1984,9 @@ class CodeTrailApp(App[int]):
             self.engine.options.model,
             f"n_ctx={self.engine.options.n_ctx}",
             f"ctx={self._context_tokens if self._context_tokens is not None else '?'}/{self.engine.options.n_ctx}",
-            f"session={self.engine.session_id}",
-            f"權限={self.engine.options.policy.name}",
+            f"session={self.engine.session_id or '(尚未建立)'}",
             f"壓縮={self._compaction_mode()}",
-            f"專案指示={'on' if self._project_instructions() else 'off'}",
-            f"舊 reasoning={'送模' if self.keep_historical_reasoning else '不送'}",
+            f"think={'on' if self.engine.options.thinking else 'off'}",
         ]
         active_status = ""
         if self._turn_started is not None:

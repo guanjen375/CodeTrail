@@ -135,6 +135,7 @@ def _engine_options(
         # 而狀態行會照著它印「舊回合 reasoning=保留」—— 一個做不到的承諾。
         # 與 `show_reasoning` 是**兩個**鍵:那個只管畫面。
         keep_reasoning=_settings(args).keep_historical_reasoning,
+        thinking_kwarg=config.MAIN_THINKING_KWARG,
     )
 
 
@@ -150,7 +151,10 @@ def _settings(args: argparse.Namespace | None = None) -> client_config.ClientSet
         raise SystemExit(f"[codetrail] {exc}") from None
 
 
-def _build(root: Path, args: argparse.Namespace, *, persist: bool, preflight=None):
+def _build(
+    root: Path, args: argparse.Namespace, *, persist: bool, preflight=None,
+    defer_session: bool = False,
+):
     readonly = getattr(args, "policy", "interactive") == "readonly"
     settings = _settings(args)
     # 使用者開關進 runtime 的**唯一**入口。readonly 之後套用而且壓過它。
@@ -186,7 +190,8 @@ def _build(root: Path, args: argparse.Namespace, *, persist: bool, preflight=Non
     if session_id:
         client_store.validate_session_id(session_id)
     engine = client_engine.Engine(
-        options, mcp=mcp, store=store, session_id=session_id, system_prompt=prompt
+        options, mcp=mcp, store=store, session_id=session_id, system_prompt=prompt,
+        defer_session=defer_session,
     )
     if session_id:
         # resume 之前不得先 create:那會留下一個空白的孤兒 session 檔。
@@ -198,7 +203,7 @@ def _build(root: Path, args: argparse.Namespace, *, persist: bool, preflight=Non
 def _initial_session(root: Path, args: argparse.Namespace) -> str | None:
     """`--session <id>` 直接指定;`--continue` 取這個專案最近一次的對話。
 
-    兩個都沒給就回 None(開新對話)。`--continue` 在沒有任何舊對話時也回 None ——
+    兩個都沒給就回 None(尚未建立對話)。`--continue` 在沒有任何舊對話時也回 None ——
     那不是錯誤,第一次進一個專案本來就沒有東西可以接。
     """
     raw = getattr(args, "session", None)
@@ -215,7 +220,7 @@ def _initial_session(root: Path, args: argparse.Namespace) -> str | None:
     try:
         sessions = client_store.SessionStore(root).list_sessions()
     except Exception as exc:  # noqa: BLE001 - 接不到就開新的,但要講
-        print(f"[aicode] 讀不到既有對話({exc});開一個新的。", file=sys.stderr)
+        print(f"[aicode] 讀不到既有對話({exc});輸入第一則訊息時再建立對話。", file=sys.stderr)
         return None
     return sessions[0].session_id if sessions else None
 
@@ -276,12 +281,11 @@ def command_chat(args: argparse.Namespace) -> int:
     except client_preflight.PreflightError as exc:
         print(f"[aicode] {exc}", file=sys.stderr)
         return 2
-    mcp, engine = _build(root, args, persist=True, preflight=checks)
+    mcp, engine = _build(root, args, persist=True, preflight=checks, defer_session=True)
     try:
         compactor = _compactor(engine, args)
-        # 通過之後畫面上只留「結果」:一行摘要、壓縮狀態行、警告(含 preflight
-        # 期間所有 stderr 行)。整段進度 LOG 已經在 TUI 之前的終端上逐行印過,
-        # 重播一次只是要使用者每次開 aicode 都先捲過自己剛看完的成功訊息。
+        # 啟動對話區保持空白。摘要、壓縮狀態與所有 stderr 警告留給 /status，
+        # 完整 preflight transcript 仍在接管畫面前的終端上。
         # 失敗路徑不走這裡:`PreflightError` 在上面 exit 2,transcript 留在終端。
         banner = checks.banner_lines(
             tools=len(engine.tool_specs),
@@ -293,7 +297,7 @@ def command_chat(args: argparse.Namespace) -> int:
             compactor=compactor,
             banner=banner,
             state_dir=client_store.sessions_dir(root),
-            # **兩個鍵**:前者只管畫面(`/thinking` 的初始值),後者只管送模
+            # **兩個鍵**:前者只管 reasoning 本文顯示,後者只管送模
             # payload 與摘要輸入。合併之後純 UI 操作會改變模型看到的 context。
             show_reasoning=settings.show_reasoning,
             keep_historical_reasoning=settings.keep_historical_reasoning,

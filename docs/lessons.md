@@ -96,7 +96,7 @@ python3 lessons.py hit L-001        # 人工記一次命中(見下)
 
 ## 驗證注入有生效
 
-1. `aicode` 啟動輸出應有一行 `[lessons] N 條 active lessons 已注入 .codetrail/lessons.md`。
+1. TUI 接管前的終端應有一行 `[lessons] N 條 active lessons 已注入 .codetrail/lessons.md`；待複審警告保留在 `/status`。
 2. 開新 session 問模型:「目前 context 裡有哪些 CodeTrail lessons?」它應能列出編號與內容。
 3. 改用 `cat <SANDBOX_ROOT>/.codetrail/lessons.md` 直接看注入內容(此檔自動產生,勿手改;`.codetrail/` 已在 .gitignore)。
 

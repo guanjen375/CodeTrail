@@ -214,6 +214,8 @@ class TurnCoordinator:
             raise QueueError("mode 必須是 queue 或 supplement。")
         with self._lock:
             target = self.engine.session_id
+            if not target:
+                raise QueueError("尚未建立對話；先用 /new 或直接輸入第一則訊息。")
             if self._review_job is not None and mode == "supplement":
                 raise QueueError("工作區審查不接收補充；原文仍可編輯，或使用 /queue add 保留到聊天。")
             if session_id is not None and session_id != target:
@@ -325,6 +327,8 @@ class TurnCoordinator:
     def resume_queue(self) -> bool:
         """Explicitly resume retained inputs; inspecting/editing never resumes."""
         with self._lock:
+            if not self.engine.session_id:
+                raise QueueError("尚未建立對話；先用 /new 或直接輸入第一則訊息。")
             if self._turn_lock.locked():
                 raise self.Busy(self.engine.session_id)
             self._queue_paused = False
@@ -332,7 +336,7 @@ class TurnCoordinator:
 
     def _start_next_queued(self, target: str) -> bool:
         with self._lock:
-            if self._queue_paused or self._turn_lock.locked() or self.engine.session_id != target:
+            if not target or self._queue_paused or self._turn_lock.locked() or self.engine.session_id != target:
                 return False
             item = next((item for item in self._queue
                          if item.session_id == target and item.status in ("waiting", "deferred")), None)
@@ -517,11 +521,20 @@ class TurnCoordinator:
         警告在啟動 worker 之前就取:先 send 再取的話,模型可能已經撞了 context
         gate,使用者看到的是那個錯誤,卻不知道壓縮早就停了。
         """
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("訊息不得為空。")
         self.begin_turn()
         # begin_turn 之後的任何失敗都必須把回合鎖放掉:漏掉的話這個對話從此
         # 永遠是 busy,使用者連 Ctrl-C 都救不回來(cancel 看到 turn_done=False
         # 但 engine 根本沒有 turn)。
         try:
+            if not self.engine.session_id:
+                # 先取得回合，再建立 session；不能讓 worker/佇列先綁到空 ID。
+                # 純首次綁定保留 mount 的零寫入預熱，不等同 /new。
+                self.engine.bind_new_session()
+                rebind = getattr(self.compactor, "rebind", None)
+                if callable(rebind):
+                    rebind()
             with self._lock:
                 self._accepting_supplements = True
             target = self.engine.session_id
@@ -538,6 +551,8 @@ class TurnCoordinator:
 
     def start_compaction(self) -> None:
         """手動壓縮(``/compact``)。也是一輪:``cancel()`` 才打斷得了長摘要。"""
+        if not self.engine.session_id:
+            raise QueueError("尚未建立對話，沒有可壓縮的內容。")
         self.begin_turn()
         try:
             target = self.engine.session_id
@@ -870,7 +885,7 @@ class TurnCoordinator:
 
     # ---- session 切換 --------------------------------------------------
     def session_changed(self) -> None:
-        """``/new`` / ``/resume`` 之後重綁壓縮器。
+        """``/new`` / ``/session`` 之後重綁壓縮器。
 
         不重綁的話上一段的摘要會進新對話的摘要請求,上一段的停用也會把新的一段
         停掉。這裡**不**取停用警告:那會把「每個 session 只講一次」的那一次在這裡

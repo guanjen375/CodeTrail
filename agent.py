@@ -230,6 +230,7 @@ def call_llm_with_tools(messages: list, temperature: float = 0.0) -> dict:
             tools=tools,
             tool_choice="auto",
             stream=False,
+            extra={"chat_template_kwargs": llama_client.thinking_template_kwargs()},
             timeout=600,
         )
 
@@ -305,6 +306,7 @@ def call_llm_with_tools_stream(messages: list, temperature: float = 0.0) -> str:
             tools=tools,
             tool_choice="auto",
             stream=True,
+            extra={"chat_template_kwargs": llama_client.thinking_template_kwargs()},
             timeout=600,
         )
 

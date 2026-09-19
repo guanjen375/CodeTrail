@@ -104,6 +104,35 @@ def test_exact_count_sends_the_same_complete_body_as_chat(monkeypatch):
     assert response.closed
 
 
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_chat_wire_thinking_defaults_off_and_keeps_parser_and_template_controls_together(monkeypatch, enabled):
+    response = _Response({"input_tokens": 5, "choices": [{"message": {"content": "ok"}}]})
+    session = _Session(response)
+    _install_session(monkeypatch, session)
+    arguments = {
+        "base_url": "http://127.0.0.1:65535",
+        "messages": [{"role": "user", "content": "synthetic"}],
+    }
+    if enabled is not None:
+        arguments["extra"] = {"chat_template_kwargs": llama_client.thinking_template_kwargs(enabled)}
+    assert llama_client.count_chat_tokens(**arguments) == 5
+    llama_client.chat_completions(**arguments)
+    counted, generated = [call[1]["json"] for call in session.calls]
+    assert counted == generated
+    assert generated["chat_template_kwargs"] == {
+        "enable_thinking": enabled is True, "thinking": enabled is True,
+    }
+
+
+def test_native_completion_does_not_claim_chat_template_thinking_control(monkeypatch):
+    session = _Session(_Response({"content": "native"}))
+    _install_session(monkeypatch, session)
+    llama_client.native_completion(base_url="http://127.0.0.1:65535", prompt="plain native prompt")
+    url, request = session.calls[0]
+    assert url.endswith("/completion") and request["json"]["prompt"] == "plain native prompt"
+    assert "chat_template_kwargs" not in request["json"]
+
+
 def test_exact_count_fails_closed_without_exposing_response_or_request_bodies(monkeypatch):
     """Malformed/failed counts may never become a heuristic or expose payloads."""
     marker = "synthetic-response-body-should-stay-private"

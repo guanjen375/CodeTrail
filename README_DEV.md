@@ -250,8 +250,8 @@ smoke 涵蓋；`ROLE=REVIEWER` 則在程式碼收斂後由 full 涵蓋。不要�
   訊息轉換)。它改的是**送進模型的那一份訊息**,多砍一個欄位是靜默失真、砍到 tool
   訊息會讓 llama-server 直接報錯,所以只准動 `reasoning` 欄位、只准動最新一則真實使用者
   訊息之前的、認不出那則訊息就整段不動;session 檔與畫面保留原文。要關掉它是
-  `client.json` 的 `keep_historical_reasoning`(`/thinking` 只改畫面,**不得**動它
-  —— 那是兩個鍵)
+  `client.json` 的 `keep_historical_reasoning`。`show_reasoning` 只改畫面，`/think`
+  只改主聊天生成；兩者都不得修改歷史或 reasoning 剝除規則
 - 新增 incident kind / detail slug → `mcp_lease.py` 與 `tests/test_mcp_lease.py` 的
   凍結 tuple 必須一起改（跨語言封閉集合；一端沒跟上就把另一端寫的合法值正規化成
   `unknown`，那些事件在 doctor 的統計裡等於憑空消失）
@@ -678,6 +678,16 @@ system、tools、tool choice、reasoning、工具呼叫與模板標記。每次 
 校正，也不以生成試探容量。計數端點缺失、格式錯誤或 HTTP 失敗會明確拒絕請求，
 不退回字元估算。既有 native 內部呼叫才保留 `CHARS_PER_TOKEN` heuristic。
 
+主聊天 thinking 由 `EngineOptions.thinking` 控制，預設 `False`；支援依據是
+deployment 的 `services.main.thinking_kwarg`，經 `config.MAIN_THINKING_KWARG` 明確
+傳給 engine。舊設定缺欄位或偵測結果為 `None` 時不得開啟。`/think` 是目前客戶端的
+選擇，不改全域 config、不寫 `client.json`，也不改 session 歷史與 pruning。
+`llama_client.thinking_template_kwargs()` 一律同值填入 `enable_thinking` 與 `thinking`
+兩個布林鍵，讓 llama.cpp parser 與 Jinja 一致；off 也必須明送兩個 `False`。
+每個 model step 快照一次，精確計數與正式生成共用同一份 extra。
+摘要、review、prime、canary、RAG 脈絡生成與其他內部 chat 呼叫固定 off，不繼承互動端
+的 thinking。脈絡生成的 fingerprint 也包含這份 off 參數，避免沿用舊生成快取。
+
 主模型的容量取自 live llama-server；server 啟動時的 `-c <N>` 決定它的 n_ctx。
 `scripts/doctor.py`
 只掃描、絕不寫檔；正常 `aicode` preflight 則會針對 active model 原子同步這個鏡像欄位並留備份。
@@ -704,7 +714,7 @@ system、tools、tool choice、reasoning、工具呼叫與模板標記。每次 
 `count_method` 的舊紀錄才是字元估算。`actual_prompt_eval_count` 只收回應中的完整
 輸入量(`usage.prompt_tokens` 或 native 完整輸入欄位)，未知時為 `null`；
 `timings.prompt_n` **只**填 `prompt_tokens_processed`，不得拿來代填完整輸入。
-TUI 的 context 數字也在 worker 量完整 next-turn projection，session 或 history
+TUI 的 context 數字也在 worker 量完整 next-turn projection，session、history 或 thinking
 已改變的晚到結果會丟棄，尚未量到時顯示 `?`。
 
 **絕不寫入**: 完整 prompt、tool output、檔案內容、user question 文字。
@@ -758,14 +768,28 @@ soft-warning 處理；聊天 Engine 使用固定 history plan 與明確壓縮邊
 與 reranking 的專用容量邊界見下文。
 
 新增主模型 call site 時,必須在送出前用 call-time `config.require_main_model()` 取值;不要使用 import-time `config.MODEL` 或 `from config import MODEL` 當 runtime model source。
+新增內部 chat call site 也必須使用同一份 thinking-off kwargs，並讓計數與生成一致；
+native `/completion` 不套 chat template，不能把聊天模板參數誤當成 native 開關。
 
 ### prompt cache 預熱(prime)與首字延遲
 
 使用者感受到的「首字延遲」有兩段:server 算 prompt(prefill)與模型自己的 reasoning。
-第二段不在客戶端能動的範圍;第一段可以**搬時間**——歷史剛換過的那幾個時刻(TUI 就緒、
+主聊天是否生成 reasoning 由 `/think` 控制；預熱只把第一段**搬時間**——歷史剛換過的那幾個時刻(TUI 就緒、
 `/new`、換 session、壓縮換掉歷史之後),用「下一輪真的會送的 prefix」先送一個
 `max_tokens=1` 的請求,把可避免的 prefill 移到使用者打字的時候。它**不會**讓硬體算得
-比較快,prefix 本來就熱的時候也沒有收益。
+比較快,prefix 本來就熱的時候也沒有收益。prime 是內部請求，固定 thinking off；
+主聊天 thinking on 時跳過 prime。切換 thinking 必須先中止舊 prime，再變更模式與
+作廢 context 計數／預熱狀態；忙碌回合、審查與核准期間不准切換。
+
+互動 `_build` 使用 `Engine(defer_session=True)`，未綁定時 `session_id` 是空字串，
+不建立 store entry。TUI mount 仍可對空歷史做零寫入的 prefix 預熱；首次直接送出問題時，
+`TurnCoordinator.start_turn()` 在 `begin_turn()` 後、綁定目標與 spawn worker 前同步呼叫
+`Engine.bind_new_session()`，成功後 rebind compactor。它只在未綁定且歷史為空時建立，
+成功才安裝 session id，不動 history／prime epoch，也不 abort 同一份 prefix 的預熱。
+建立失敗保留空白狀態與輸入草稿。未綁定的 engine 寫入、送出與歷史替換必須先拒絕，
+不能把空 id 的落檔錯誤吞成記憶體對話；`/queue add` 與 `/queue resume` 也必須拒絕。
+`/new` 與歷史 adopt 保留原有轉換／中止契約。一般直接建構 engine、headless 及維護用
+`--session` / `--continue` 保留既有入口語意；明示接續不先建空白孤兒 session。
 
 工具結果的 pruning plan 在安裝一份完整 history 時建立一次(new / adopt /
 replace)，以原始訊息位置與內容綁定；一般 append 不移動剪枝切點。套用順序是
@@ -775,17 +799,17 @@ replace)，以原始訊息位置與內容綁定；一般 append 不移動剪枝�
 
 `codetrail` 模式接續歷史時，TUI 先完成原始 transcript 重播，再由
 `TurnCoordinator.prepare_idle` 取得回合鎖，在背景檢查門檻並視需要壓縮。這是
-獨立且可 Ctrl-C 取消的回合；收尾之後才排零寫入的 prime。manual / off 不會
-因此自動摘要，readonly 不新增這條無新問句的生成路徑。
+獨立且可 Ctrl-C 取消的回合；收尾之後且 thinking off 才排零寫入的 prime。manual / off
+不會因此自動摘要，readonly 不新增這條無新問句的生成路徑。未綁定的空白狀態不做摘要。
 
 | 符號 | 責任 |
 |---|---|
-| `config.CLIENT_PRIME_PROMPT_CACHE` | repo 常數(所有使用者一致),預熱的唯一開關。不是 `client.json` 的鍵,也沒有環境變數。 |
+| `config.CLIENT_PRIME_PROMPT_CACHE` | repo 常數(所有使用者一致)，預熱的 repo 開關。不是 `client.json` 的鍵，也沒有環境變數；仍須通過 policy、thinking 等准入檢查。 |
 | `Engine.next_turn_prefix()` | 「下一輪會送什麼」的單一來源:沿用 `payload_messages()` 的固定 pruning plan，再 heal，並以佔位 user 決定 reasoning 剝除邊界。佔位訊息永不落檔、永不送出。沒有中間壓縮或 session 切換時，下一輪 `send(q)` 的 payload 恆等於 `next_turn_prefix() + [user q]`。heal 補的「已中斷」結果排在該群組既有結果之後，與 `send()` 的 append 順序一致。 |
-| `Engine.prime_prompt_cache(*, reason)` | cache 預熱唯一打主模型的路徑，沒有新使用者訊息也可執行。零寫入(不進 `_begin_turn`、不 `_record`、不發事件、不動取消旗標)，順序為常數 / 工具 / policy → 非阻塞取模型鎖 → 同一臨界區快照 history 與 plan → `/slots` → 精確計數與 gate → 送。回 `PrimeOutcome(sent, reason, processed_tokens)`，不 raise、不 print。只有終結 chunk 且有 `timings.prompt_n` 才記 sent；`incomplete` / `no_timings` 不寫 telemetry，完整 `usage.prompt_tokens` 不代填重算量。 |
-| `Engine.abort_prime()` | `new_session()` / `adopt()` 先關閉預熱准入，再呼叫它：世代號與 Event 一起作廢、關串流與 headers 前已登記的 socket，等舊預熱結束、`priming=False` 且模型鎖已放(上限 1 秒)。先 shutdown 舊 HTTP 才放鎖，不等 headers。整個 session create/adopt 期間不准入舊歷史；失敗保留原 session 並恢復准入。 |
+| `Engine.prime_prompt_cache(*, reason)` | cache 預熱唯一打主模型的路徑，沒有新使用者訊息或 session 也可執行。零寫入(不建立 session、不進 `_begin_turn`、不 `_record`、不發事件、不動取消旗標)，thinking on 時拒絕准入；其餘順序為常數 / 工具 / policy → 非阻塞取模型鎖 → 同一臨界區快照 history 與 plan → `/slots` → 精確計數與 gate → 送。回 `PrimeOutcome(sent, reason, processed_tokens)`，不 raise、不 print。只有終結 chunk 且有 `timings.prompt_n` 才記 sent；`incomplete` / `no_timings` 不寫 telemetry，完整 `usage.prompt_tokens` 不代填重算量。 |
+| `Engine.abort_prime()` | `new_session()` / `adopt()` 先關閉預熱准入，再呼叫它：世代號與 Event 一起作廢、關串流與 headers 前已登記的 socket，等舊預熱結束、`priming=False` 且模型鎖已放(上限 1 秒)。先 shutdown 舊 HTTP 才放鎖，不等 headers。整個 `/new` create/adopt 期間不准入舊歷史；失敗保留原 session 並恢復准入。首次 `bind_new_session()` 保留同一份 prefix，不走這條中止路徑。 |
 | `http_cancel.RequestCancellation` | 預熱與精確計數使用的專用 requests transport。預熱的 `/slots`、計數與 chat 共用其獨立 cancellation；一般回合的計數另建專屬 transport。socket 在送 HTTP bytes 前登記，DNS/connect/TLS 晚回也不能補送。並行取消等 shutdown 完成；保持 TLS 驗證、無 env proxy / netrc、不跟 redirect，不修改共用 session / pool。 |
-| `TurnCoordinator.prepare_idle(reason)` | 接續後的獨立準備入口。自動模式先取得回合鎖並執行可取消壓縮，失敗或取消不排 prime；成功收尾、釋放回合鎖後才交給預熱排程。 |
+| `TurnCoordinator.prepare_idle(reason)` | 接續後的獨立準備入口。自動模式先取得回合鎖並執行可取消壓縮，失敗或取消不排 prime；成功收尾、釋放回合鎖後才交給預熱排程。未綁定時跳過壓縮，仍可排 mount prime。 |
 | `TurnCoordinator.prime_in_background(reason, *, on_done=None)` | 唯一的排程入口(engine 那端只負責「准不准」)。不取回合鎖、不動 `_turn_done` / `_cancelled`——預熱不是一輪,`cancel()` 對它是 no-op;`busy` 或 engine 沒有這個方法就直接回 False。協調器層的 `on_prime(reason, outcome)` 回呼(建構時給):每一次預熱(含壓縮後協調器自己排的那一次)都回到 TUI,先 `on_prime` 再 `on_done`;engine raise 時 outcome 是 None。 |
 | `ContextUsage.prompt_tokens_processed` | 只由 `timings.prompt_n` 填本次重算量。`actual_prompt_eval_count` 只接受回應中的完整輸入量，未知維持 `null`；容量 gate 使用請求前的精確計數。判 cache 冷熱要比較重算量與完整輸入。 |
 

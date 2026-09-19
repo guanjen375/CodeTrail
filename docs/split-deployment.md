@@ -19,7 +19,7 @@ literal 私有 IPv4（服務綁定 `0.0.0.0`），供產生四個角色的端點
 已運作的服務先核對狀態，不為了再次執行腳本而盲目重啟。
 
 依終端顯示的方式保存完整 client manifest，透過組織允許的方式移到 B。
-manifest 只含目的地與模型版本 ID，不含 GPU、本機模型路徑或任何授權。
+manifest 含目的地、模型版本 ID 與主模型的 `thinking_kwarg` 能力，不含 GPU、本機模型路徑或任何授權。
 四個 port 來自 A 的 deployment profile。A 的防火牆應只允許 B 的來源位址連線；
 程式端白名單不能代替網路 ACL。原生 HTTP 不提供加密，需使用組織管理的安全直連網路，
 或已正確配置憑證的 HTTPS endpoint；TLS 驗證不會關閉。
@@ -28,6 +28,9 @@ model-host 設定會串流計算每個 GGUF（含所有 shard）及 VL projector
 建立 `identity_alias`，透過 llama-server `--alias` 提供 live `model_alias`。
 這會讀取完整模型檔，耗時取決於模型大小與磁碟。換權重、shard 或 projector 後，
 用 `./set_config.sh` 重新設定、重啟 A 並重新交接 B 設定；啟動會拒絕與 alias 不符的權重。
+主模型的 thinking 能力也會依新 GGUF chat template 重新偵測；B 匯入 manifest 時保留它。
+沒有能力欄位的舊 manifest 或逐角色手動輸入的設定視為未知，`/think on` 不可用，
+所有請求仍明確送出 off。這不是 B 的永久聊天偏好。
 
 監看與停止沿用直接命令：
 

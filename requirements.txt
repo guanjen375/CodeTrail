@@ -2,6 +2,7 @@
 
 # 核心
 requests>=2.28.0    # llama-server HTTP client
+Jinja2>=3.1,<4      # set_config parses GGUF chat-template capabilities without rendering
 # `aicode` 的終端介面(全螢幕 TUI)。純 Python wheel,離線機器裝得起來。
 # **不要**裝 textual[syntax]:那個 extra 拉的 tree-sitter 文法與下面釘死的
 # tree-sitter 0.26 衝突。

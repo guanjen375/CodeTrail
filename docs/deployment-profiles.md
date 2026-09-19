@@ -38,7 +38,7 @@ GPU 選擇都在那一步剝掉,GPU 只由本檔驗證過的值重新指定。
 
 最上層 `mode` 接受 `local`（省略時的預設）、`model-host`（A）及 `client`（B）。
 以下 GPU／模型檔／啟動參數屬於本機模型主機設定；client 使用四角色的 `base_url`、
-`port`、版本化 `model`／`identity_alias`，不需本機 GGUF、mmproj、GPU 或 llama-server。
+版本化 `model`／`identity_alias` 與 main 的 `thinking_kwarg`，不需本機 GGUF、mmproj、GPU 或 llama-server。
 `identity_alias` 在 model-host 由權重與 projector 的完整 SHA-256 產生並傳給 `--alias`。
 client 的目的地仍須獨立通過 owner-only `client.json.model_endpoints`；profile 不授權連線。
 設定、匯出與驗證流程見 [A／B 分離部署](split-deployment.md)。
@@ -48,6 +48,16 @@ client 的目的地仍須獨立通過 owner-only `client.json.model_endpoints`�
 - `model`：`models.json` key 或 GGUF 絕對路徑；main 可在基底中為 `null`，但啟動
   main 時一定 fail-loud，直到 local override 的 `services.main.model`(或一次性的
   `--main-model`)明確指定。
+- `thinking_kwarg`（只有 main）：`null`、`"enable_thinking"` 或 `"thinking"`。
+  `set_config.sh` 有界讀取選中 GGUF 的 `tokenizer.chat_template` 與 `tool_use` variant，
+  用 Jinja2 只解析 AST，不執行模板，不靠模型名稱、註解或文字猜測。只有可確認的
+  外部布林開關才寫入名稱；DeepSeek 的 `thinking`／`enable_thinking` fallback alias
+  可被辨識。缺失、未知或無法解析的模板寫 `null` 並列出原因，舊設定省略此欄也視為
+  未知，不能開啟 `/think on`。重跑設定重新偵測並覆寫舊值；模型覆寫未提供新能力時
+  不繼承上一顆模型的值。分離部署會將這欄隨 manifest 傳到 B。
+  這欄是模型能力，不是聊天開關；每次聊天預設 off。客戶端送出的
+  `chat_template_kwargs` 會將兩個名稱設成同一個 JSON boolean，讓 llama.cpp 的 parser
+  與模板使用相同模式；內部生成固定 off。
 - `port` 與 `base_url`：必須一致；URL 只接受無 credentials/path/query 的 HTTP(S)。
 - `bind`：`local`(預設,loopback base_url 只綁 `127.0.0.1`)或 `all-interfaces`
   (綁 `0.0.0.0`,對其他機器開放 —— CodeTrail 目前產生的 server 指令未啟用

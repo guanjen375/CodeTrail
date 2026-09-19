@@ -93,7 +93,10 @@
   repo(相對 `XDG_STATE_HOME` 與專案內的 state 目錄都要擋)、目錄 0700、檔 0600、
   讀寫兩端都拒 symlink 與 hard link、append 不得建出沒有 header 的檔、header 綁這個
   專案與這個 session;選單的大綱只取本地**真實** user 訊息(不是摘要、不是工具輸出),
-  零 LLM、零寫入
+  零 LLM、零寫入。互動啟動保持未綁定，只有 `/new` 或第一則直接送出的問題才建新檔；
+  `/session` 採用歷史不得先建空白孤兒檔，維護 `--session` / `--continue` 仍保留。
+  未綁定時 `/queue add` 與 `/queue resume` 必須先拒絕，提示 `/new` 或直接輸入；engine 的寫入／送出／
+  歷史替換必須在改記憶體前 fail-loud，不得把空 id 的落檔失敗吞成記憶體對話。
 - `/review` 的來源與執行——Git 環境隔離，不執行 repository filter / hook / fsmonitor；
   文字換行屬性不得製造假的整檔變更，未知轉換、二進位、超限與未完成必須明列。
   repo 來源採有界 dir-fd / nofollow 讀取，發布前重驗快照；外部全域 Git 設定可解析
@@ -125,7 +128,9 @@
   transcript 只以標記呈現 compaction;`prime_prompt_cache` 是唯一沒有使用者訊息就打主
   模型的路徑:零寫入(不進 `_begin_turn`、不 `_record`、不發事件、不動取消旗標)、只送
   `next_turn_prefix()`(與下一輪同一套轉換)、實送 `max_tokens=1` 且 gate 保留額就是 1、
-  非 interactive policy 一律拒絕、headless 沒有呼叫點;中止(`abort_prime`)涵蓋 `/slots`
+  非 interactive policy 一律拒絕、headless 沒有呼叫點；未綁定 mount 仍可對空歷史預熱，
+  不建立 session；首次 `bind_new_session()` 只在 create 成功後綁 id，不改 history／epoch，
+  不 abort 相同 prefix 的預熱，失敗保留空白狀態與草稿；中止(`abort_prime`)涵蓋 `/slots`
   probe / 取得 headers 前 / 串流中,中止後不再發 POST;預熱專用 `http_cancel` transport
   在 HTTP bytes 送出前登記 socket，headers 未到也先 shutdown 舊 HTTP 才放模型鎖，
   不得提早放仍在飛的請求；取消後才完成的 connect 先關再拒絕送出，並行取消都等 shutdown
@@ -135,6 +140,14 @@
   `new_session()` / `adopt()` 中止舊預熱須一秒內 aborted、鎖已放、`priming=False`；
   只有終結 chunk + `timings.prompt_n` 才記成 sent
   (`incomplete` / `no_timings` 不寫 telemetry)
+- 主聊天 thinking——每次啟動預設 off，只以 `/think` / `/think on|off` 變更，不寫
+  `client.json`、不改全域 config、歷史或 pruning。支援能力來自 set_config 對主模型
+  GGUF chat template 的實際偵測，寫入 `services.main.thinking_kwarg`；未知／舊設定
+  不得開啟。每個 model step 的計數與生成共用同一份快照 kwargs，`enable_thinking`
+  與 `thinking` 兩個布林值必須一致，off 也要明送兩個 false。摘要／review／prime／
+  canary／RAG 等內部 chat 生成固定 off，不繼承互動旗標；think on 跳過 prime。
+  切換前中止舊 prime，切換後作廢計數與預熱狀態；回合、核准或審查中不得切換。
+  `show_reasoning` 只控制即時／重播的本文顯示，不能影響生成或歷史 reasoning 剝除。
 - `client_engine` 的協作式取消——TUI 的 Ctrl-C 經 `client_turns` 走這條。串流每收一個
   chunk 看一次旗標、進行中的 MCP 呼叫要用 `begin_call` 登記給 `cancel()` 走完整取消契約
   (一步到位的 `call()` 只有 KeyboardInterrupt 一條路);中斷**不是答案**——歷史不得多出
@@ -189,9 +202,13 @@
   切換 / 啟動接續必須**重播原始記錄**(文字、工具含未裁切的 structured、reasoning、壓縮標記),
   工具結果按**宣告群組**配對(fallback call id 每個行程從 `call_1` 起算,以 id 反查會把結果
   貼到幾十輪前那個 block 上),busy 或核准中不得換,失敗要保持 session 與畫面,
-  重播出來的 block 不登記給即時事件;啟動橫幅只拿 `Preflight.banner_lines()`:摘要一行、
-  壓縮狀態行、警告(含 preflight 期間所有 stderr 行);進度行不進畫面,但 `Preflight.lines`
-  仍是完整 transcript
+  重播出來的 block 不登記給即時事件；正常啟動對話區完全空白，不掛摘要／說明／WARN，
+  `Preflight.banner_lines()` 的摘要、壓縮狀態與所有警告(含 preflight stderr)完整保留給
+  `/status`；逐項進度仍留在 TUI 前終端，`Preflight.lines` 保留完整 transcript，
+  preflight 失敗仍在進 TUI 前 fail-loud。
+  狀態列用 `think=on|off`，不放權限／專案指示／舊 reasoning 指示，`/status` 仍列專案
+  指示。實際 reasoning 的紅字「思考中」是暫時畫面元素，與 `show_reasoning` 本文顯示
+  獨立，回答／工具／完成／錯誤／取消時清除，不得落入 session 或事件內容。
 - 啟動核心的設定來源——GPU、llama-server 路徑、tmux session 名、逾時與 rollback 只來自
   `deployment.json`、repo 常數與 argv;`~/start.sh` **不 export 也不 unset**，只接受
   無參數啟動或單一 `stop`，以固定 argv 呼叫啟動／停止核心；其他日常入口同樣

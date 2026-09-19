@@ -147,7 +147,7 @@ disown
 
 1. 找到 CodeTrail 的 checkout(它自己可能是一個 symlink)
 2. 找到 `python3`
-3. 檢查 argv(只接受 `-c` / `--continue`、`--session <id>`、`-h` / `--help`)、
+3. 拒絕所有使用者參數、
    拒絕沒有終端機的環境(TUI 會接管整個畫面,pipe 過去只會得到控制碼)、
    確認 `textual` 裝了
 4. `exec` 唯一的客戶端 `codetrail_chat.py`
@@ -170,11 +170,20 @@ disown
 8. 用 fresh `codetrail_chat.py run --policy readonly --format json` 驗 active model 真的產生
    completed 的結構化 `list_dir` event;依 model / 客戶端檔案 / system prompt / project 指紋
    快取成功結果 24 小時
-9. 壓縮模式狀態行(門檻、reasoning 開關、durable 停用警告、權限覆寫)
-10. 啟動 TUI。通過時對話區只有一行摘要 + 壓縮狀態行 + 警告(含第 7、8 項寫到 stderr 的
-    工具健檢警告);上面每一行仍完整留在 TUI 之前的終端畫面。失敗時不進 TUI,錯誤留在終端
+9. 記錄壓縮模式診斷(門檻、歷史 reasoning 設定、durable 停用警告、權限覆寫)
+10. 啟動 TUI。正常啟動的對話區完全空白，摘要、說明與 WARN 都不放進去；啟動摘要、
+    壓縮狀態與所有警告(含第 7、8 項寫到 stderr 的工具健檢警告)保留在 `/status`。
+    逐項進度的完整輸出仍留在 TUI 前終端。失敗時不進 TUI，錯誤留在終端
 
-第 7 項每次啟動都實跑，不靠模型自述；第 8 項首次、快取過期或指紋變動才實跑，所以不必每次手動問「列出 21 個工具」。第 8 項實跑（本地推理，通常數十秒起）前會先印出原因與單次上限，執行中每 15 秒回報進度——不是當機。要強制重測就刪掉 `~/.cache/codetrail/tool-call-canary.v3.json`(沒有略過用的環境變數)。完整 PASS / FAIL 說明見 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)。
+第 7 項每次啟動都實跑，不靠模型自述；第 8 項首次、快取過期或指紋變動才實跑，所以不必每次手動問「列出 21 個工具」。第 8 項實跑（本地推理，通常數十秒起）前會先印出原因與單次上限，執行中每 15 秒回報進度；這些完整記錄留在 TUI 前終端。要強制重測就刪掉 `~/.cache/codetrail/tool-call-canary.v3.json`(沒有略過用的環境變數)。完整 PASS / FAIL 說明見 [troubleshooting](troubleshooting.md#mcp-connected-but-no-tool-call)。
+
+一般 `aicode` 啟動不建立 session，只有 `/new` 或第一則直接送出的問題才建立；
+`/session` 選單與 `/session <id>` 接續既有對話。維護用 Python 入口的 `--session` /
+`--continue` 仍可明示載入歷史，不會先建一個空白 session。
+
+`set_config.sh` 會從主模型 GGUF 的 chat template 偵測 thinking 控制鍵並寫入
+`services.main.thinking_kwarg`。主聊天每次啟動預設 off，偵測確認支援後才能用 `/think on`
+開啟；舊設定缺少能力欄位時需重跑設定。`show_reasoning` 仍是 `client.json` 的純顯示設定。
 
 ---
 
@@ -293,7 +302,7 @@ llama-server 端的 `-c <N>` 也是啟動旗標,改完要重啟 server,不能熱
 
 **壓縮模式同理**:`~/.config/codetrail/client.json`(0600)的 `compaction_mode` 在客戶端
 **啟動時** 讀，所以執行 `./set_config.sh`、在問答中修改壓縮模式後，必須退出再重開。
-沒有這個檔 = 沒有接管:模式退成 `manual`,啟動橫幅會講明。三種模式的取捨見
+沒有這個檔 = 沒有接管：模式退成 `manual`，`/status` 會列出有效設定。三種模式的取捨見
 [compaction-rules.md](compaction-rules.md)。
 
 想加一份跨專案通用的自訂規則,寫進 `~/.config/codetrail/instructions.md` —— 客戶端每一輪

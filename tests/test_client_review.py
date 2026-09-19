@@ -161,6 +161,21 @@ def test_review_isolated_mcp_ephemeral_history_shared_lock_and_exact_gate(review
     assert all("findings" not in update for update in progress)
 
 
+def test_review_forces_thinking_off_without_changing_the_interactive_mode(review_setup):
+    main, _snapshot, _clients, counts, requests = review_setup
+    main.options.thinking_kwarg = "thinking"
+    main.set_thinking(True)
+    original = copy.deepcopy(main.messages)
+    outcome, _progress = _run_job(main)
+    assert outcome.reason == "stop" and counts and requests
+    assert main.options.thinking is True and main.messages == original
+    for count, request in zip(counts, requests, strict=True):
+        assert count["extra"] is request["extra"]
+        assert request["extra"]["chat_template_kwargs"] == {
+            "enable_thinking": False, "thinking": False,
+        }
+
+
 @pytest.mark.parametrize("hint", [False, "false", "true", 1, None])
 def test_review_allowlist_and_json_true_guard_schema_and_dispatch(review_setup, hint):
     main, *_ = review_setup

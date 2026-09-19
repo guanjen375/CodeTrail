@@ -108,6 +108,7 @@ class ReviewJob:
             metrics_enabled=False,
             cancellable_requests=True,
             prune=False,
+            thinking=False,
         )
         engine = client_engine.Engine(
             options,

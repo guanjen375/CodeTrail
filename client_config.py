@@ -108,7 +108,7 @@ class ClientSettings:
     h_lang: str = "c"
     #: 用容器跑 run_command。
     use_container: bool = False
-    #: 畫面上顯示模型的 thinking。**只管畫面**——它是 `/thinking` 的初始值。
+    #: 顯示模型的 reasoning 本文。**只管畫面**，與 `/think` 生成開關獨立。
     show_reasoning: bool = False
     #: 舊回合的 reasoning 要不要送進模型。**只管送模 payload 與摘要輸入**。
     #: 與上面那個是**兩個**鍵:合併之後純 UI 操作會改變模型看到的 context,
