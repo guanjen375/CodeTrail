@@ -39,6 +39,61 @@ TESTS_DIR = Path(__file__).resolve().parent
 
 # AGENTS.md §2「安全相關不要砍」的檢查點 → (守它的說明, 必須存在且帶 smoke 的 node)。
 SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "test_dspark_deployment.py": (
+        "DSpark 僅由 main 完整設定產生 argv，換模型清除舊配對；相依性與分片缺失必須拒絕，"
+        "probe 與 exec 共用乾淨環境，未取得 live slots 啟用證據不得宣告 ready",
+        (
+            "test_dspark_rejects_incomplete_or_unsafe_configuration",
+            "test_dspark_is_main_only_and_absent_from_client_manifest",
+            "test_dspark_merge_and_model_override_cannot_reuse_stale_pairing",
+            "test_dspark_argv_is_explicit_and_off_never_probes",
+            "test_dspark_dry_run_stays_offline_with_missing_dependencies",
+            "test_dspark_requires_the_complete_first_shard_before_binary_probe",
+            "test_require_files_includes_dspark_without_probing_binary",
+            "test_dspark_help_probe_uses_sanitized_server_environment",
+            "test_dspark_help_probe_rejects_substring_capabilities",
+            "test_dspark_server_environment_rejects_override_escape_hatches",
+            "test_dspark_runtime_failure_precedes_session_creation",
+            "test_dspark_inactive_slots_after_health_roll_back_before_ready",
+            "test_dspark_exec_cli_fails_cleanly_before_server_exec",
+            "test_dspark_model_host_launch_rejects_stale_draft_alias",
+        ),
+    ),
+    "test_dspark_setup.py": (
+        "DSpark 選單需既有主模型與明確確認，僅交易更新 deployment；關閉不依賴 draft／binary，"
+        "重設時固定原 draft 身分、換主模型清除配對，分類不得混入 draft，host ready 需 live 證據",
+        (
+            "test_menu_dspark_requires_existing_local_main_without_probes_or_writes",
+            "test_dspark_on_confirms_and_transacts_only_deployment_with_host_identity",
+            "test_dspark_cancel_or_missing_explicit_consent_writes_nothing",
+            "test_dspark_enable_validation_failure_cannot_commit",
+            "test_dspark_off_works_without_draft_binary_or_gpu_and_refreshes_host_alias",
+            "test_dspark_declining_validated_enable_does_not_hash_or_write",
+            "test_dspark_transaction_failure_retains_prior_deployment",
+            "test_reconfigure_carries_dspark_only_for_same_resolved_main_artifact",
+            "test_reconfigure_freezes_draft_artifact_before_registry_key_can_be_rebound",
+            "test_dspark_drafts_are_excluded_before_main_and_mmproj_classification",
+            "test_dspark_discovery_bounds_metadata_and_keeps_unreadable_candidates",
+            "test_host_readiness_rejects_unverified_dspark_activation",
+            "test_host_readiness_requires_all_live_slots_only_when_dspark_enabled",
+        ),
+    ),
+    "test_dspark_identity_status.py": (
+        "DSpark 身分綁定 target、draft 各分片與 token 上限；strict 狀態核對完整 argv 與"
+        "每個 slot 的 JSON true，關閉殘留與未知啟用證據均列問題，離線檢查不得連網",
+        (
+            "test_dspark_alias_binds_draft_shards_count_and_target_without_changing_off",
+            "test_dspark_fingerprint_hashes_configured_draft_without_slots_or_off_drift",
+            "test_dspark_activation_requires_json_true_on_every_nonempty_slot",
+            "test_dspark_slots_probe_preserves_endpoint_policy_and_timeout",
+            "test_dspark_slots_transport_ignores_proxy_netrc_redirect_and_keeps_tls",
+            "test_dspark_status_requires_type_full_draft_path_count_and_live_slots",
+            "test_dspark_status_records_unavailable_or_false_slots_as_issues",
+            "test_dspark_status_off_rejects_leftover_arguments_without_slots_probe",
+            "test_dspark_status_no_network_never_reads_slots_and_reports_unverified",
+            "test_dspark_status_snapshot_is_offline_and_requires_explicit_slot_evidence",
+        ),
+    ),
     "test_thinking_deployment.py": (
         "thinking capability 只來自選定 GGUF 真實模板的外部控制；兩鍵 alias 可辨識、"
         "缺 parser 拒絕且有界讀取；換模型不沿用舊能力，split export/import 保留能力",

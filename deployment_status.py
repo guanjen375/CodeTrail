@@ -146,8 +146,8 @@ class _NoRedirectHandler(HTTPRedirectHandler):
         return None
 
 
-# proxy 衛生:/health /props 是 loopback 探測,不得被環境 HTTP(S)_PROXY 帶去
-# 別的 host。ProxyHandler({}) = 無視環境 proxy。
+# /health /props /slots 不得被環境 HTTP(S)_PROXY 帶去別的 host。
+# urllib 不讀 netrc;保留 HTTPS 預設憑證驗證,不安裝 auth handler,拒絕 redirect。
 _LOCAL_PROBE_OPENER = build_opener(ProxyHandler({}), _NoRedirectHandler())
 
 
@@ -166,6 +166,58 @@ def query_server(service: ServiceProfile) -> tuple[dict[str, Any] | None, dict[s
     return get("/health"), get("/props")
 
 
+def query_slots(service: ServiceProfile) -> list[Any] | None:
+    """Read activation evidence without prompts, redirects, proxies or netrc."""
+    import endpoint_policy
+    endpoint_policy.ensure_allowed(f"{service.base_url}/slots", service.role,
+                                   split=service.deployment_mode == "client")
+    try:
+        with _LOCAL_PROBE_OPENER.open(f"{service.base_url}/slots", timeout=0.75) as response:  # noqa: S310
+            data = json.loads(response.read().decode("utf-8"))
+    except (OSError, URLError, ValueError):
+        return None
+    return data if isinstance(data, list) else None
+
+
+def dspark_slots_issue(service: ServiceProfile, slots: Any) -> str:
+    """An enabled deployment requires JSON true on every observed slot."""
+    if service.dspark is None:
+        return ""
+    if not isinstance(slots, list) or not slots:
+        return f"{service.role}: DSpark activation unverified: /slots must be a nonempty list"
+    for index, slot in enumerate(slots):
+        if not isinstance(slot, dict) or slot.get("speculative") is not True:
+            return (f"{service.role}: DSpark activation unverified: "
+                    f"/slots[{index}].speculative must be JSON true")
+    return ""
+
+
+def require_dspark_active(service: ServiceProfile) -> None:
+    """Fail before readiness if llama-server silently disabled configured DSpark."""
+    if service.dspark is None:
+        return
+    try:
+        slots = query_slots(service)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ProfileError(f"{service.role}: DSpark /slots verification failed: {exc}") from exc
+    issue = dspark_slots_issue(service, slots)
+    if issue:
+        raise ProfileError(issue)
+
+
+def _dspark_live_issue(
+    service: ServiceProfile,
+    reader: Callable[[ServiceProfile], Any] | None,
+) -> str:
+    if service.dspark is None:
+        return ""
+    try:
+        slots = reader(service) if reader is not None else None
+    except (OSError, ValueError, RuntimeError) as exc:
+        return f"{service.role}: DSpark /slots verification failed: {exc}"
+    return dspark_slots_issue(service, slots)
+
+
 def _expected_gpu_set(selector: str, inventory: Mapping[str, str]) -> set[str]:
     expected: set[str] = set()
     for item in (part.strip() for part in selector.split(",")):
@@ -179,12 +231,63 @@ def _basename(value: str) -> str:
     return Path(value).name.lower() if value else ""
 
 
+def _option_values(args: Sequence[str], *names: str) -> tuple[str, ...]:
+    """Keep duplicates and missing values observable instead of trusting the first."""
+    values = []
+    for index, arg in enumerate(args):
+        name, separator, value = arg.partition("=")
+        if name in names:
+            values.append(value if separator else (args[index + 1] if index + 1 < len(args) else ""))
+    return tuple(values)
+
+
+def _dspark_cmdline_issues(
+    service: ServiceProfile, args: Sequence[str], *, registry_file: Path | None,
+) -> list[str]:
+    spec_types = _option_values(args, "--spec-type")
+    drafts = _option_values(args, "--spec-draft-model", "-md", "--model-draft")
+    counts = _option_values(args, "--spec-draft-n-max")
+    if service.dspark is None:
+        # Include old draft aliases: an already running process may predate the
+        # current launcher. Explicit --spec-type none alone remains valid off.
+        short_draft = {"-md", "-td", "-tbd", "-cd", "-Cd", "-Crd", "-Cbd", "-Crbd",
+                       "-ctkd", "-ctvd", "-otd", "-cmoed", "-ncmoed", "-devd", "-ngld"}
+        names = [arg.partition("=")[0] for arg in args if arg.startswith("-")]
+        leftover = [name for name in names if name in short_draft or (
+            name != "--spec-type" and (
+                name.startswith(("--spec-", "--no-spec-", "--draft")) or name.endswith("-draft")))]
+        if leftover or spec_types not in ((), ("none",)):
+            return [f"{service.role}: DSpark is off but speculative/draft arguments remain in cmdline"]
+        return []
+
+    issues = []
+    if spec_types != ("draft-dspark",):
+        issues.append(f"{service.role}: DSpark --spec-type mismatch; expected exactly draft-dspark")
+    if counts != (str(service.dspark.draft_n_max),):
+        issues.append(f"{service.role}: DSpark --spec-draft-n-max mismatch; "
+                      f"expected {service.dspark.draft_n_max}")
+    try:
+        expected = resolve_model_reference(service.dspark.draft_model, registry_file=registry_file)
+    except ProfileError as exc:
+        issues.append(f"{service.role}: expected DSpark draft cannot be resolved: {exc}")
+    else:
+        try:
+            matches = (len(drafts) == 1 and Path(drafts[0]).is_absolute()
+                       and Path(drafts[0]).resolve() == Path(expected))
+        except (OSError, RuntimeError, ValueError):
+            matches = False
+        if not matches:
+            issues.append(f"{service.role}: DSpark draft path mismatch; expected {expected}")
+    return issues
+
+
 def inspect_deployment(
     profile: DeploymentProfile,
     gpu_processes: Iterable[GpuProcess],
     *,
     cmdline_reader: Callable[[int], Sequence[str]] = read_proc_cmdline,
     server_reader: Callable[[ServiceProfile], tuple[dict[str, Any] | None, dict[str, Any] | None]] | None = query_server,
+    slots_reader: Callable[[ServiceProfile], Any] | None = query_slots,
     gpu_inventory: Mapping[str, str] | None = None,
 ) -> Inspection:
     """比對「設定說要跑什麼」與「機器上真的在跑什麼」。
@@ -192,6 +295,8 @@ def inspect_deployment(
     registry 查表跟著 `profile.registry_file` 走(呼叫端交來的那一份),不再另外
     收一份 `environ` —— 這一層要答的正是「server 載入的是不是對的 GGUF」,
     用第二份 registry 去判就是拿別人的答案。
+    `server_reader=None` 禁止所有網路探測;離線 snapshot 需顯式提供自己的
+    `slots_reader`(可為 None),未提供 DSpark 啟用證據就列 issue。
     """
     if profile.mode == "client":
         observations = {}
@@ -217,6 +322,9 @@ def inspect_deployment(
                     issues.append("main: live n_ctx unavailable")
             else:
                 warnings.append(f"{role}: remote live identity/capabilities not checked")
+            issue = _dspark_live_issue(service, slots_reader if server_reader is not None else None)
+            if issue:
+                issues.append(issue)
         return Inspection(observations, (), (), tuple(issues), tuple(warnings))
     inventory = {} if gpu_inventory is None else dict(gpu_inventory)
     rows = tuple(gpu_processes)
@@ -282,6 +390,10 @@ def inspect_deployment(
             continue
         if server_reader is not None and health != "ok":
             issues.append(f"{role}: health={health}")
+        issues.extend(_dspark_cmdline_issues(service, args, registry_file=profile.registry_file))
+        issue = _dspark_live_issue(service, slots_reader if server_reader is not None else None)
+        if issue:
+            issues.append(issue)
         if service.gpu:
             expected_gpus = _expected_gpu_set(service.gpu, inventory)
             actual_gpus = set(gpu_uuids)

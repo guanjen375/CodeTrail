@@ -48,6 +48,8 @@ from deployment_profile import (  # noqa: E402
 )
 from scripts import stop_servers  # noqa: E402
 from runtime_dependencies import DependencyError  # noqa: E402
+from dspark_runtime import validate_dspark_runtime  # noqa: E402
+from deployment_status import require_dspark_active  # noqa: E402
 
 WINDOWS = {
     "main": "main",
@@ -467,6 +469,7 @@ def launch(
         resolve_model_reference(service.model, must_exist=True, registry_file=registry)
         if service.mmproj:
             resolve_model_reference(service.mmproj, must_exist=True, registry_file=registry)
+        validate_dspark_runtime(service, profile.llama_bin, registry_file=registry)
         if _port_responds(service):
             raise ProfileError(f"{service.role} port {service.port} is already in use ({service.base_url})")
 
@@ -503,6 +506,9 @@ def launch(
                 _health_timeout(service.role, args.health_timeout, artifact),
                 session,
             )
+            # /health and /props are not proof that a requested draft survived
+            # model loading. Upstream may disable speculation without failing.
+            require_dspark_active(service)
     except (ProfileError, process_env.CalledProcessError) as exc:
         _rollback_started(
             exc, started_roles, created_sessions, sessions,
@@ -521,7 +527,7 @@ def launch(
     print("\nCodeTrail model servers ready.")
     # 絕對路徑:這行常被從 $HOME 執行的 ~/start.sh 帶出來,相對路徑會找不到。
     status_py = Path(__file__).resolve().parent / "check_status.py"
-    print(f"  python3 {shlex.quote(str(status_py))} --strict")
+    print(f"  選用維護診斷:python3 {shlex.quote(str(status_py))} --strict")
 
 
 def _parser() -> argparse.ArgumentParser:

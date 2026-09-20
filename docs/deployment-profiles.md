@@ -43,6 +43,13 @@ GPU 選擇都在那一步剝掉,GPU 只由本檔驗證過的值重新指定。
 client 的目的地仍須獨立通過 owner-only `client.json.model_endpoints`；profile 不授權連線。
 設定、匯出與驗證流程見 [A／B 分離部署](split-deployment.md)。
 
+主模型另有選用的 `services.main.dspark`：省略或 `null` 為關閉，開啟時為
+`{"draft_model": "/absolute/path/to/draft.gguf", "draft_n_max": 3}`。
+這是 service 層的設定，不是 `parameters` 的任意旗標；只允許 local/model-host 的
+main，draft 支援既有 registry key，token 上限為 1–64 的整數。設定物件整值替換，
+更換主模型而未明示新配對時會清除它。日常操作使用 `set_config.sh` 選單 7；
+相依檢查、重啟與 live 驗證詳見 [DSpark](dspark.md)。
+
 `local`／`model-host` 的每個 role 使用以下資料；`client` 的設定請依上方分離部署指南：
 
 - `model`：`models.json` key 或 GGUF 絕對路徑；main 可在基底中為 `null`，但啟動

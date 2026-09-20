@@ -99,6 +99,11 @@ aicode
 `scripts/codetrail-device.sh` 均無參數；`~/start.sh` 只接受空 argv 與單一 `stop`。
 下列 Python argv 供維護、自動化與離線測試 harness 使用，不由 shell wrapper 透傳。
 
+DSpark 由無參數 `./set_config.sh` 的選單 7 控制，不新增日常 CLI 旗標。
+它只改 `deployment.json` 的 `services.main.dspark`；shape、draft 相依性與 live
+驗證見 [DSpark](docs/dspark.md)。測試使用合成 GGUF、假 binary 與 HTTP fixtures，
+不依賴真實 DSpark draft 或硬體。日常 wrapper 的零參數契約與內部維護 argv 分開保留。
+
 內部非互動設定入口是 `python3 scripts/set_config.py --yes`。它會跳過提問與確認頁，
 但**所有使用者選擇題的值必須由旗標提供，缺哪個就報錯**（`--compaction-mode`
 是唯一的例外，見下方最後一項）：
@@ -151,6 +156,9 @@ docstring 說明它涵蓋哪些原始檔與為什麼：
   （launch／stop／check_status）、`test_deployment.py`（deployment profile、
   模型解析、GPU 與 ctx 安全、config）、`test_doctor.py`（doctor + tool-call canary）、
   `test_lessons.py`。
+- DSpark：`test_dspark_deployment.py`（schema、argv、啟動相依性與回滾）、
+  `test_dspark_setup.py`（選單、交易、draft 分類與模型切換）、
+  `test_dspark_identity_status.py`（draft 身分、實際 process 與 slots、離線邊界）。
 - 客戶端:`test_client_mcp.py`(取消契約)、`test_client_store.py`(session 檔私密性)、
   `test_client_engine.py`(訊息轉換 / 權限 / 工具迴圈)、`test_client_cli.py`(事件流與 headless)、
   `test_client_progress.py`(本輪工具證據的重複判斷與新證據保留)、

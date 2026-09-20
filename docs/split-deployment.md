@@ -32,6 +32,10 @@ model-host 設定會串流計算每個 GGUF（含所有 shard）及 VL projector
 沒有能力欄位的舊 manifest 或逐角色手動輸入的設定視為未知，`/think on` 不可用，
 所有請求仍明確送出 off。這不是 B 的永久聊天偏好。
 
+[DSpark 推測解碼](dspark.md) 的開關在 A 的 `set_config.sh` 選單 7；B 不設定本地
+draft。A 開啟、關閉或換 draft 後，重啟服務，再以選單 6 匯出新的 manifest 交給 B
+重新匯入，因為 main 的版本 alias 會改變。manifest 不攜帶 A 的 draft 檔案路徑。
+
 監看與停止沿用直接命令：
 
 ```sh

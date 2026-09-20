@@ -352,9 +352,13 @@ llama.cpp 的模型載入預設是 `--load-mode auto`;裝置支援 mmap 時會�
 ### 3.1 `./set_config.sh` 做什麼
 
 無參數執行後先顯示角色選單：重設目前角色、local、model-host（A）、client（B）、
-還原最近一次設定交易，以及顯示 A 的 endpoint manifest。
+還原最近一次設定交易、顯示 A 的 endpoint manifest，以及 **DSpark 推測解碼開關**。
 以下模型與 GPU 問答適用於 local / model-host；client 只確認遠端端點與授權，
 不要求本機 GPU、GGUF、tmux 或 llama-server。A/B 的直接入口見[分離部署](docs/split-deployment.md)。
+
+DSpark 預設關閉。完成主模型設定後，在同一選單選 **7** 即可開啟或關閉；開啟時指定
+配對的本地 draft GGUF，確認保存後以 `~/start.sh stop`、`~/start.sh` 重啟。
+這項操作不重選 GPU 或改部署角色；詳見 [DSpark 設定與驗證](docs/dspark.md)。
 
 接著先問模型目錄與 llama-server 執行檔位置，Enter 使用畫面列出的路徑。
 **純問答式設定**：模型參數與壓縮模式由你選擇，也**不用估算擋你的輸入**——它只驗證輸入在畫面列出的合法範圍(例如選項只有 1/2 卻輸入 3 會重問)，以及做結構性檢查(binary 旗標、模型齊全性、schema)。部分數值題會附一句方向(越大越吃什麼)與**推薦值 / 推薦區間**，但推薦不是限制；只要仍在合法輸入範圍內，推薦區間外也照樣接受。VRAM 塞不塞得下仍以啟動後 `nvidia-smi` 實測為準。在 `<CODETRAIL_REPO>` 執行 `./set_config.sh`，它會依序：

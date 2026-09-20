@@ -67,9 +67,11 @@ if str(REPO_ROOT) not in sys.path:
 from deployment_profile import (  # noqa: E402
     _BARE_MODEL_RE,  # registry key 合法性的唯一定義處(避免本檔複製一份造成分叉)
     DEFAULT_LLAMA_BIN,
+    DSparkConfig,
     TMUX_SESSIONS,
     ProfileError,
     load_effective_profile,
+    resolve_model_reference,
 )
 import client_compaction  # noqa: E402
 import client_config  # noqa: E402
@@ -673,16 +675,17 @@ def _consume_gguf_value(handle, value_type: int, path: Path, *, capture: bool = 
 class _BoundedMetadataReader:
     """Reuse GGUF value traversal with bounds on bytes and parser operations."""
 
-    def __init__(self, handle, path: Path):
+    def __init__(self, handle, path: Path, *, max_bytes: int = 128 * MIB,
+                 max_operations: int = 2_000_000):
         self.handle = handle
         self.path = path
-        self.limit = min(os.fstat(handle.fileno()).st_size, 128 * MIB)
-        self.operations = 2_000_000
+        self.limit = min(os.fstat(handle.fileno()).st_size, max_bytes)
+        self.operations = max_operations
 
     def _check(self, size: int) -> None:
         self.operations -= 1
         if self.operations < 0 or size < 0 or self.handle.tell() + size > self.limit:
-            raise SetupError(f"GGUF chat-template metadata 截斷或超過有界讀取上限:{self.path.name}")
+            raise SetupError(f"GGUF metadata 截斷或超過有界讀取上限:{self.path.name}")
 
     def read(self, size: int) -> bytes:
         self._check(size)
@@ -755,6 +758,37 @@ def inspect_main_thinking_kwarg(candidate: ModelCandidate, notes: list[str]) -> 
     detected = keys.get("tool_use", keys["default"])
     notes.append(f"主模型 GGUF chat template 已偵測 thinking_kwarg={detected}；聊天預設 off。")
     return detected
+
+
+def _is_dspark_draft(path: Path) -> bool:
+    """Exclude only proven dflash drafts; unavailable metadata keeps old discovery.
+
+    Both Qwen and DeepSeek DSpark drafts use general.architecture=dflash. This
+    classifies the artifact, never proves a target/draft pairing. The discovery
+    pass must not parse tensor tables or fail because an unrelated GGUF is bad.
+    """
+    try:
+        with path.open("rb") as raw:
+            handle = _BoundedMetadataReader(
+                raw, path, max_bytes=4 * MIB, max_operations=50_000,
+            )
+            if _gguf_exact(handle, 4, path) != b"GGUF" or _gguf_u32(handle, path) not in {2, 3}:
+                return False
+            _gguf_u64(handle, path)  # tensor count; no tensor traversal
+            count = _gguf_u64(handle, path)
+            if count > 10_000:
+                return False
+            for _ in range(count):
+                key = _gguf_string(handle, path, capture=True, max_bytes=4096)
+                value_type = _gguf_u32(handle, path)
+                if key == "general.architecture":
+                    if value_type != 8:
+                        return False
+                    return _gguf_string(handle, path, capture=True, max_bytes=64) == "dflash"
+                _consume_gguf_value(handle, value_type, path)
+    except (OSError, SetupError):
+        return False
+    return False
 
 
 def _inspect_gguf_file(path: Path) -> ModelLayout:
@@ -916,6 +950,12 @@ def scan_models(
         issues = _shard_issues(candidate.path)
         if issues:
             broken.append(f"{candidate.path.parent.name}/{candidate.path.name}:" + ";".join(issues))
+            continue
+        # Exclude before mainlike_per_dir: a dedicated draft beside VL weights
+        # must not turn a unique projector pairing into a mixed-directory guess.
+        if _is_dspark_draft(candidate.path):
+            if notes is not None:
+                notes.append(f"略過 DSpark draft 候選（general.architecture=dflash）：{candidate.path}")
             continue
         raw_candidates.append(candidate)
 
@@ -1673,6 +1713,7 @@ def build_deployment_config(plan: Plan) -> dict:
         "main": {
             "model": plan.main_key,
             "thinking_kwarg": inspect_main_thinking_kwarg(plan.main.candidate, plan.notes),
+            "dspark": None,
             "gpu": plan.main.gpu.selector,
             "ctx": plan.ctx,
             "batch": plan.batch,
@@ -1736,7 +1777,8 @@ _PRESERVED_KEYS_BY_ROLE = {
 }
 
 
-def merge_existing_deployment(config: dict, existing_path: Path, notes: list[str]) -> None:
+def merge_existing_deployment(config: dict, existing_path: Path, notes: list[str], *,
+                              main_model_path: Path | None = None) -> None:
     """重跑時不清掉使用者手動加進 deployment.json 的東西。
 
     本工具的 note 就教人「取樣參數自行加進 services.main.parameters」——那麼重跑
@@ -1751,9 +1793,12 @@ def merge_existing_deployment(config: dict, existing_path: Path, notes: list[str
     except ValueError:
         notes.append(f"⚠ 既有 {existing_path.name} 無法解析,將整份重建(原檔已備份)。")
         return
-    if not isinstance(existing, dict) or not isinstance(existing.get("services"), dict):
+    if not isinstance(existing, dict):
         return
-    old_services = existing["services"]
+    _preserve_dspark_pairing(config, existing_path, notes, main_model_path=main_model_path)
+    old_services = existing.get("services", {})
+    if not isinstance(old_services, dict):
+        return
     for role, new_service in config["services"].items():
         old_service = old_services.get(role)
         if not isinstance(old_service, dict):
@@ -1794,8 +1839,46 @@ def merge_existing_deployment(config: dict, existing_path: Path, notes: list[str
         if old_service.get("bind") == "all-interfaces" and "bind" not in new_service:
             notes.append(
                 "⚠ 既有設定開放區網連線(bind: all-interfaces),本次未加 --allow-remote"
-                " → 回到僅本機 127.0.0.1。要維持開放請重跑 python3 scripts/set_config.py --allow-remote。"
+                " → 回到僅本機 127.0.0.1。要維持開放請重跑 ./set_config.sh，選 model-host 並明確允許 LAN。"
             )
+
+
+def _preserve_dspark_pairing(config: dict, existing_path: Path, notes: list[str], *,
+                             main_model_path: Path | None) -> None:
+    """A draft pairing follows the resolved main artifact, never its registry key."""
+    main = config.get("services", {}).get("main")
+    if not isinstance(main, dict):
+        return
+    main["dspark"] = None
+    registry_file = existing_path.with_name("models.json")
+    try:
+        previous = load_effective_profile(
+            deployment_config=existing_path, model_registry_file=registry_file,
+        ).service("main")
+    except ProfileError as exc:
+        notes.append(f"⚠ 既有 DSpark 配對無法核對，這次設為 off；需用 ./set_config.sh 選單 7 重新設定：{exc}")
+        return
+    if previous.dspark is None:
+        return
+    try:
+        old_path = Path(resolve_model_reference(previous.model, registry_file=registry_file))
+        new_path = (main_model_path.resolve() if main_model_path is not None else Path(
+            resolve_model_reference(main.get("model"), registry_file=registry_file)
+        ))
+        draft_path = resolve_model_reference(previous.dspark.draft_model, registry_file=registry_file)
+    except (OSError, RuntimeError, ProfileError) as exc:
+        notes.append(f"⚠ 主模型檔案無法核對，已關閉原 DSpark 配對；請用 ./set_config.sh 選單 7 重新設定：{exc}")
+        return
+    if old_path != new_path:
+        notes.append("主模型已更換，已關閉原 DSpark 配對；請用 ./set_config.sh 選單 7 選擇匹配新主模型的 draft。")
+        return
+    main["dspark"] = {
+        # The new main registry key can replace an old draft key. Freeze the
+        # resolved prior draft, so registry regeneration cannot silently re-pair.
+        "draft_model": draft_path,
+        "draft_n_max": previous.dspark.draft_n_max,
+    }
+    notes.append(f"主模型檔案未變，保留 DSpark 配對：{draft_path}（draft_n_max={previous.dspark.draft_n_max}）。")
 
 
 #: 客戶端 lessons 注入檔(由 `aicode` 的 preflight render,客戶端接進 system prompt)。
@@ -2783,6 +2866,148 @@ def _print_summary_page(plan: Plan, python_bin: str,
         print(f"  {note if note.startswith('⚠') else '- ' + note}")
 
 
+def configure_dspark(home: Path) -> int:
+    """Dedicated local switch: preserve the deployment and transact only its file."""
+    global _COMMITTED
+    _COMMITTED = False
+    deployment_path = home / ".config" / "codetrail" / "deployment.json"
+    registry_file = deployment_path.with_name("models.json")
+    if not deployment_path.exists() and not deployment_path.is_symlink():
+        print("DSpark 需要既有主模型設定；請先用 ./set_config.sh 設定 local 或 model-host。")
+        return 0
+    try:
+        original = deployment_path.read_text(encoding="utf-8")
+        profile = load_effective_profile(
+            {"HOME": str(home)}, deployment_config=deployment_path,
+            model_registry_file=registry_file,
+        )
+    except (OSError, UnicodeError, ProfileError) as exc:
+        raise SetupError(f"DSpark 需要有效的主模型設定；請先用 ./set_config.sh 修正 local 或 model-host：{exc}") from exc
+    if profile.mode == "client":
+        print("目前是 client（工作機 B）；DSpark 請在模型主機 A 執行 ./set_config.sh 選單 7 設定。")
+        return 0
+    main = profile.service("main")
+    try:
+        main_path = resolve_model_reference(
+            main.model, {"HOME": str(home)}, registry_file=registry_file,
+        )
+    except ProfileError as exc:
+        raise SetupError(f"DSpark 需要既有主模型；請先用 ./set_config.sh 完成主模型設定：{exc}") from exc
+
+    print(f"\nDSpark 推測解碼（目前角色：{profile.mode}；目前狀態：{'on' if main.dspark else 'off'}）")
+    print(f"主模型：{main_path}")
+    if main.dspark:
+        print(f"目前 draft：{main.dspark.draft_model}；draft_n_max={main.dspark.draft_n_max}")
+    while True:
+        choice = _input_optional("DSpark [on/off/q]: ", "q").strip().lower()
+        if choice == "q":
+            print("已離開；未寫入設定。")
+            return 0
+        if choice in {"on", "off"}:
+            break
+        print("請明確輸入 on、off 或 q。")
+
+    desired: DSparkConfig | None = None
+    if choice == "on":
+        from dspark_runtime import validate_dspark_runtime
+
+        print("請提供為這份主模型訓練的匹配 DSpark draft GGUF；檔名與 architecture 不能證明配對相容。")
+        print("只使用本地檔案，不下載模型；實際配對與 speculative 啟用狀態會在 ~/start.sh 載入時驗證。")
+        prior_path = ""
+        if main.dspark:
+            try:
+                prior_path = resolve_model_reference(
+                    main.dspark.draft_model, {"HOME": str(home)}, registry_file=registry_file,
+                )
+            except ProfileError:
+                pass  # A stale registry entry must not prevent choosing a replacement.
+        default_note = f" [Enter={prior_path}]" if prior_path else ""
+        while True:
+            raw = _input_optional(f"匹配的本地 draft GGUF 絕對路徑{default_note}（q=離開）: ", "q").strip()
+            if raw.lower() == "q":
+                print("已離開；未寫入設定。")
+                return 0
+            selected = raw or prior_path
+            try:
+                draft_path = Path(selected).expanduser()
+            except (OSError, RuntimeError, ValueError):
+                print("無法解析 draft 路徑；請提供本地 .gguf 絕對路徑。")
+                continue
+            if selected and draft_path.is_absolute() and draft_path.suffix.lower() == ".gguf":
+                break
+            print("請提供本地 .gguf 絕對路徑。")
+        print("draft_n_max 是每次最多提出的 draft token 數，預設 3；server 可能依訓練 block size 夾限。")
+        while True:
+            raw = _input_optional("draft_n_max [1-64, Enter=3]（q=離開）: ", "q").strip()
+            if raw.lower() == "q":
+                print("已離開；未寫入設定。")
+                return 0
+            if not raw:
+                draft_n_max = 3
+                break
+            if len(raw) <= 2 and raw.isdecimal() and 1 <= int(raw) <= 64:
+                draft_n_max = int(raw)
+                break
+            print("請輸入 1-64 的整數。")
+        desired = DSparkConfig(str(draft_path), draft_n_max)
+        try:
+            resolve_model_reference(main.model, {"HOME": str(home)}, must_exist=True,
+                                    registry_file=registry_file)
+            validate_dspark_runtime(replace(main, dspark=desired), profile.llama_bin,
+                                    registry_file=registry_file)
+        except ProfileError as exc:
+            raise SetupError(f"DSpark 尚未通過啟用檢查，未寫入設定：{exc}") from exc
+
+    print("\n=== DSpark 設定確認 ===")
+    print(f"主模型：{main_path}\nDSpark：{choice}")
+    if desired:
+        print(f"draft：{desired.draft_model}\ndraft_n_max：{desired.draft_n_max}")
+    print(f"本次只更新：{deployment_path}（保留其餘設定；可用選單 5 還原本次交易）")
+    if profile.mode == "model-host":
+        print("A 的 main identity alias 會重新計算權重 SHA-256；關閉時也要雜湊主模型，可能需要幾分鐘。")
+        print("完成後請在 A 用選單 6 重新匯出 endpoint manifest，再到 B 重新匯入。")
+    if _input_optional("確認寫入 DSpark 設定？[y/N] ").strip().lower() not in {"y", "yes"}:
+        print("未確認；未寫入設定。")
+        return 0
+
+    document = json.loads(original)
+    changed_main = document.setdefault("services", {}).setdefault("main", {})
+    changed_main["dspark"] = (None if desired is None else {
+        "draft_model": desired.draft_model, "draft_n_max": desired.draft_n_max,
+    })
+    if profile.mode == "model-host":
+        from model_identity import ModelIdentityError, versioned_alias
+
+        print("正在計算 main identity alias 的權重雜湊…")
+        try:
+            changed_main["identity_alias"] = versioned_alias(
+                "main", main_path, dspark=desired, registry_file=registry_file,
+            )
+        except (OSError, ValueError, ModelIdentityError) as exc:
+            raise SetupError(f"無法計算主模型身分，未寫入設定：{exc}") from exc
+    content = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+    staged = _staging_file(content, "dspark")
+    try:
+        load_effective_profile(
+            {"HOME": str(home)}, deployment_config=staged, model_registry_file=registry_file,
+        )
+    except ProfileError as exc:
+        raise SetupError(f"DSpark 設定未通過驗證，未寫入設定：{exc}") from exc
+    finally:
+        staged.unlink(missing_ok=True)
+    if deployment_path.read_text(encoding="utf-8") != original:
+        raise SetupError("deployment.json 在確認期間已變更；本次未覆寫，請重新執行 ./set_config.sh 選單 7。")
+    notes: list[str] = []
+    commit_files([(deployment_path, content, 0o644)], notes, False, home=home)
+    for note in notes:
+        print(note)
+    print(f"DSpark 已設定為 {choice}；尚未重啟。請執行新產生的 ~/start.sh stop，再執行 ~/start.sh 套用。")
+    if profile.mode == "model-host":
+        print("請在 A 執行 ./set_config.sh 選單 6 重新匯出 endpoint manifest，並在 B 重新匯入。")
+    print("啟動後進入 aicode，以 /status 查看狀態。")
+    return 0
+
+
 def configure_client(args: argparse.Namespace, home: Path) -> int:
     """B setup: no GPU, model files, tmux, server binary, or network probes."""
     import endpoint_policy
@@ -3150,15 +3375,24 @@ def run(args: argparse.Namespace) -> int:
         registry = build_models_registry(plan, codetrail_dir / "models.json", notes)
         registry_json = json.dumps(registry, ensure_ascii=False, indent=2) + "\n"
         deployment_config = build_deployment_config(plan)
-        merge_existing_deployment(deployment_config, codetrail_dir / "deployment.json", notes)
+        merge_existing_deployment(deployment_config, codetrail_dir / "deployment.json", notes,
+                                  main_model_path=plan.main.candidate.path)
         deployment_config["mode"] = getattr(args, "deployment_mode", "local")
         if deployment_config["mode"] == "model-host":
-            from model_identity import versioned_alias
-            for role, selection in (("main", plan.main), ("embedding", plan.embedding),
-                                    ("reranker", plan.reranker), ("vl", plan.vl)):
-                deployment_config["services"][role]["identity_alias"] = versioned_alias(
-                    role, selection.candidate.path, selection.mmproj)
-            notes.append("A versioned aliases bind artifact hashes; restart after changing weights, then export-client for B.")
+            from model_identity import ModelIdentityError, versioned_alias
+            main_dspark = deployment_config["services"]["main"]["dspark"]
+            print("正在計算 A 的模型權重 SHA-256 identity aliases；大模型可能需要幾分鐘…")
+            try:
+                for role, selection in (("main", plan.main), ("embedding", plan.embedding),
+                                        ("reranker", plan.reranker), ("vl", plan.vl)):
+                    deployment_config["services"][role]["identity_alias"] = versioned_alias(
+                        role, selection.candidate.path, selection.mmproj,
+                        dspark=DSparkConfig(**main_dspark) if role == "main" and main_dspark else None,
+                        registry_file=codetrail_dir / "models.json",
+                    )
+            except ModelIdentityError as exc:
+                raise SetupError(f"模型權重身分無法核對，未寫入設定：{exc}") from exc
+            notes.append("A 的版本 alias 綁定權重身分；重啟後請用 ./set_config.sh 選單 6 匯出 manifest，再到 B 重新匯入。")
         # CPU-MoE + mmap 的首次推論延遲:必須看「合併後真的要寫入」的參數,
         # 否則使用者手動設的 no_mmap(由 merge 帶回)會被誤報成沒設。
         warn_cpu_moe_without_no_mmap(
@@ -3280,8 +3514,7 @@ def run(args: argparse.Namespace) -> int:
     else:
         print("[PASS] 第 1 層:設定檔已寫入並通過 schema 驗證(備份:*.bak-setconfig-*)")
         print("[待執行] 第 2 層:實際啟動與模型載入 → ~/start.sh(成功與否以此為準)")
-        print("[待執行] 第 3 層:啟動後健檢 → python3 scripts/check_status.py --strict")
-        print("          與 python3 scripts/doctor.py(主模型讀 deployment.json)")
+        print("[待執行] 第 3 層:啟動 aicode，以 /status 查看連線與模型狀態")
 
     preview_rc = 0
     if not args.dry_run and not args.no_preview:
@@ -3305,7 +3538,6 @@ def run(args: argparse.Namespace) -> int:
 
     print("\n下一步:")
     print("  ~/start.sh                        # 啟動四個 llama-server(tmux)")
-    print("  python3 scripts/check_status.py --strict  # 確認四個 server 都 ready")
     print("  cd <你要分析的專案> && aicode      # 進 TUI;/status 應顯示 codetrail Connected")
     print("  ~/start.sh stop                   # 收工:關掉全部 tmux server 視窗")
     return 1 if preview_rc != 0 else 0

@@ -50,6 +50,7 @@ DEPLOYMENT_MODES = ("local", "model-host", "client")
 _SERVICE_KEYS = {
     "identity_alias",
     "thinking_kwarg",
+    "dspark",
     "model",
     "mmproj",
     "port",
@@ -126,6 +127,7 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
         "main": {
             "model": None,
             "thinking_kwarg": None,
+            "dspark": None,
             "port": 8080,
             "base_url": "http://localhost:8080",
             "gpu_role": "main",
@@ -185,6 +187,20 @@ class ProfileError(ValueError):
 
 
 @dataclass(frozen=True)
+class DSparkConfig:
+    """A trained target-specific local draft; None on the service means off."""
+
+    draft_model: str
+    draft_n_max: int = 3
+
+    def __post_init__(self) -> None:
+        _validate_model_reference(self.draft_model, "dspark.draft_model", nullable=False)
+        if (type(self.draft_n_max) is not int
+                or not 1 <= self.draft_n_max <= 64):
+            raise ProfileError("dspark.draft_n_max must be an integer in 1..64")
+
+
+@dataclass(frozen=True)
 class ServiceProfile:
     role: str
     model: str | None
@@ -204,6 +220,7 @@ class ServiceProfile:
     deployment_mode: str = "local"
     # GGUF chat-template capability, not the current chat's generation setting.
     thinking_kwarg: str | None = None
+    dspark: DSparkConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -467,6 +484,21 @@ def _validate_document(data: dict[str, Any], where: str, *, local: bool = False)
         if not isinstance(raw, dict):
             raise ProfileError(f"{service_where} must be an object")
         _unknown_keys(raw, _SERVICE_KEYS, service_where)
+        if "dspark" in raw:
+            if role != "main":
+                raise ProfileError(f"{service_where}.dspark is only allowed for main")
+            if data.get("mode") == "client":
+                raise ProfileError(f"{service_where}: client mode has no local dspark configuration")
+            draft = raw["dspark"]
+            if draft is not None:
+                if not isinstance(draft, dict):
+                    raise ProfileError(f"{service_where}.dspark must be null or an object")
+                _unknown_keys(draft, {"draft_model", "draft_n_max"}, f"{service_where}.dspark")
+                if set(draft) != {"draft_model", "draft_n_max"}:
+                    raise ProfileError(
+                        f"{service_where}.dspark requires draft_model and draft_n_max"
+                    )
+                DSparkConfig(**draft)
         if "thinking_kwarg" in raw:
             if role != "main":
                 raise ProfileError(f"{service_where}.thinking_kwarg is only allowed for main")
@@ -511,14 +543,15 @@ def _validate_document(data: dict[str, Any], where: str, *, local: bool = False)
                 )
 def _merge(base: dict[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
     merged = dict(base)
-    # A capability belongs to the selected artifact. A model-only override must
-    # not inherit the previous model's supported switch from a base profile.
-    if ("thinking_kwarg" in merged and "model" in overlay
-            and overlay["model"] != merged.get("model")
-            and "thinking_kwarg" not in overlay):
-        merged["thinking_kwarg"] = None
+    # Capability and draft pairing both belong to the selected main artifact.
+    if "model" in overlay and overlay["model"] != merged.get("model"):
+        for key in ("thinking_kwarg", "dspark"):
+            if key in merged and key not in overlay:
+                merged[key] = None
     for key, value in overlay.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+        # A replacement draft must carry its own complete settings. Inheriting
+        # half of the previous pairing would silently change the requested run.
+        if key != "dspark" and isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _merge(merged[key], value)
         else:
             merged[key] = value
@@ -750,6 +783,7 @@ def load_effective_profile(
             parameters=dict(raw["parameters"]),
             identity_alias=raw.get("identity_alias"), deployment_mode=mode,
             thinking_kwarg=raw.get("thinking_kwarg"),
+            dspark=DSparkConfig(**raw["dspark"]) if raw.get("dspark") is not None else None,
         )
     return DeploymentProfile(
         name=str(data["name"]),
@@ -939,7 +973,10 @@ def build_server_command(
             projector = resolve_model_reference(service.mmproj, environ, must_exist=True,
                                                 registry_file=registry_file) if service.mmproj else None
             try:
-                if service.identity_alias != versioned_alias(service.role, model_path, projector):
+                if service.identity_alias != versioned_alias(
+                    service.role, model_path, projector, dspark=service.dspark,
+                    registry_file=registry_file,
+                ):
                     raise ProfileError("model weights changed: regenerate model-host configuration and B manifest")
             except ModelIdentityError as exc:
                 raise ProfileError(str(exc)) from exc
@@ -950,6 +987,16 @@ def build_server_command(
             resolve_model_reference(
                 service.mmproj, environ, must_exist=must_exist, registry_file=registry_file
             ),
+        ])
+    if service.dspark is not None:
+        from dspark_runtime import resolve_dspark_draft
+        command.extend([
+            "--spec-type", "draft-dspark",
+            "--spec-draft-model", resolve_dspark_draft(
+                service, must_exist=must_exist, registry_file=registry_file,
+                environ=environ,
+            ),
+            "--spec-draft-n-max", str(service.dspark.draft_n_max),
         ])
     command.extend(["--host", bind_host(service), "--port", str(service.port)])
     if service.ctx is not None:
@@ -1030,6 +1077,11 @@ def profile_as_dict(profile: DeploymentProfile, environ: Mapping[str, str] | Non
         }
         if role == "main":
             item["thinking_kwarg"] = service.thinking_kwarg
+            item["dspark"] = (
+                {"draft_model": service.dspark.draft_model,
+                 "draft_n_max": service.dspark.draft_n_max}
+                if service.dspark is not None else None
+            )
         if service.mmproj:
             item["mmproj"] = service.mmproj
         try:
@@ -1202,6 +1254,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Running this file as __main__ and importing a shared runtime helper can
+    # load its canonical module too. Catch that one specific ProfileError as
+    # well; dependency failures must stay a clean CLI error, never reach exec.
+    from deployment_profile import ProfileError as RuntimeProfileError
+
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
@@ -1221,6 +1278,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         resolve_model_reference(
                             service.mmproj, must_exist=True, registry_file=profile.registry_file
                         )
+                    if service.dspark is not None:
+                        from dspark_runtime import resolve_dspark_draft
+                        resolve_dspark_draft(
+                            service, must_exist=True, registry_file=profile.registry_file
+                        )
             print(f"profile={profile.selected_profile} verification={profile.verification} valid")
         elif args.command == "get":
             value = getattr(profile.service(args.role), args.field)
@@ -1229,6 +1291,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             service = profile.service(args.role)
             # systemd 之類的 supervisor 只會走這裡:少了這行就等於靜默矯正。
             warn_cpu_moe_fit_conflicts([service], prefix="[deployment-profile]")
+            from dspark_runtime import validate_dspark_runtime
+            validate_dspark_runtime(service, profile.llama_bin, registry_file=profile.registry_file)
             command = build_server_command(
                 service,
                 profile.llama_bin,
@@ -1240,7 +1304,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # GPU 只由 command 前面那個 `env CUDA_VISIBLE_DEVICES=<驗證過的值>` 重新輸出。
             os.execvpe(command[0], command, process_env.llama_server_env())
         return 0
-    except (OSError, ProfileError) as exc:
+    except (OSError, ProfileError, RuntimeProfileError) as exc:
         print(f"[deployment-profile] ERROR: {exc}", file=sys.stderr)
         return 2
 

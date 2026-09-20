@@ -36,7 +36,10 @@ def _positive_int(value: str) -> int:
     return int(value)
 
 
-def _snapshot_reader(path: Path) -> Callable[[ServiceProfile], tuple[dict[str, Any] | None, dict[str, Any] | None]]:
+def _snapshot_readers(path: Path) -> tuple[
+    Callable[[ServiceProfile], tuple[dict[str, Any] | None, dict[str, Any] | None]],
+    Callable[[ServiceProfile], Any],
+]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -44,10 +47,14 @@ def _snapshot_reader(path: Path) -> Callable[[ServiceProfile], tuple[dict[str, A
     if not isinstance(data, dict) or set(data) - {"main", "embedding", "reranker", "vl"}:
         raise ProfileError("--snapshot must contain only main/embedding/reranker/vl objects")
 
-    def read(service: ServiceProfile):
+    def item_for(service: ServiceProfile):
         item = data.get(service.role) or {}
-        if not isinstance(item, dict) or set(item) - {"health", "props"}:
+        if not isinstance(item, dict) or set(item) - {"health", "props", "slots"}:
             raise ProfileError(f"status snapshot role {service.role} has invalid fields")
+        return item
+
+    def read(service: ServiceProfile):
+        item = item_for(service)
         health = item.get("health")
         props = item.get("props")
         if health is not None and not isinstance(health, dict):
@@ -56,7 +63,17 @@ def _snapshot_reader(path: Path) -> Callable[[ServiceProfile], tuple[dict[str, A
             raise ProfileError(f"status snapshot {service.role}.props must be an object or null")
         return health, props
 
-    return read
+    def read_slots(service: ServiceProfile):
+        # Missing or malformed evidence belongs to the same fail-closed runtime
+        # validator as live /slots; never fall through to a network request.
+        return item_for(service).get("slots")
+
+    return read, read_slots
+
+
+def _snapshot_reader(path: Path) -> Callable[[ServiceProfile], tuple[dict[str, Any] | None, dict[str, Any] | None]]:
+    """Keep the health/props reader contract for existing diagnostic callers."""
+    return _snapshot_readers(path)[0]
 
 
 def _render(inspection: Inspection, expected_count: int) -> None:
@@ -103,7 +120,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Identify and verify main/embedding/reranker/VL llama-server processes"
     )
     parser.add_argument("--strict", action="store_true", help="fail on missing, unhealthy, wrong-GPU, or wrong-model roles")
-    parser.add_argument("--no-network", action="store_true", help="skip /health and /props requests")
+    parser.add_argument("--no-network", action="store_true", help="skip /health, /props and /slots requests")
     parser.add_argument(
         "--expected", type=_positive_int, default=4,
         help="預期至少有幾個不同的 llama-server PID(預設 4 = 四個 role)",
@@ -119,17 +136,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         if profile.mode == "client":
             import client_config
             import endpoint_policy
-            from deployment_status import query_server
+            from deployment_status import query_server, query_slots
             client_config.apply_to_config(client_config.load_client_settings(), readonly=True)
             for role, service in profile.services.items():
                 endpoint_policy.ensure_allowed(service.base_url, role, split=True)
             snapshots = {}
-            source = _snapshot_reader(Path(args.snapshot)) if args.snapshot else query_server
+            source, slots_reader = (_snapshot_readers(Path(args.snapshot)) if args.snapshot
+                                    else (query_server, query_slots))
             def reader(service):
                 health, props = source(service)
                 snapshots[service.role] = props or {}
                 return health, props
-            inspection = inspect_deployment(profile, [], server_reader=None if args.no_network else reader)
+            inspection = inspect_deployment(profile, [], server_reader=None if args.no_network else reader,
+                                            slots_reader=slots_reader)
             print("[PROFILE] topology=client: model services on A; no local GPU/PID checks")
             for role, observation in inspection.observations.items():
                 props = snapshots.get(role, {})
@@ -146,18 +165,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         proc_root = Path(args.proc_root or "/proc")
         snapshot = (args.snapshot or "").strip()
         server_reader = None
+        slots_reader = None
         if not args.no_network:
-            server_reader = _snapshot_reader(Path(snapshot)) if snapshot else None
-            if not snapshot:
-                from deployment_status import query_server
+            if snapshot:
+                server_reader, slots_reader = _snapshot_readers(Path(snapshot))
+            else:
+                from deployment_status import query_server, query_slots
 
                 server_reader = query_server
+                slots_reader = query_slots
         inventory = query_gpu_inventory() if any(service.gpu for service in profile.services.values()) else {}
         inspection = inspect_deployment(
             profile,
             processes,
             cmdline_reader=lambda pid: read_proc_cmdline(pid, proc_root),
             server_reader=server_reader,
+            slots_reader=slots_reader,
             gpu_inventory=inventory,
         )
         if gpu_error:

@@ -219,6 +219,13 @@
   重新輸出)。pane 環境 = tmux server 全域環境 + session 環境,launcher 管不到既有 daemon,
   所以邊界只能放在 pane 內真正 exec 的那一步;放寬它就是「使用者以為在跑 A、實際在跑 B」
   而且完全無聲
+- DSpark 推測解碼——`set_config` 的獨立開關只管理 main；省略／null 為 off，啟用時
+  draft 路徑與 token 上限走封閉 schema 與驗證過的 argv，不讀環境、不自動下載或降級。
+  換主模型不得沿用舊 draft 配對；draft 內容／設定必須進模型身分。已啟用的相依性
+  缺失要在啟動前拒絕；health OK 不代表 DSpark 成功，launcher、host readiness 與
+  strict status 都須檢查非空 `/slots`，每個 slot 的 `speculative` 只接受 JSON true。
+  失敗走既有 rollback，未知不能算 ready；離線／snapshot 檢查不得偷偷發 live 請求。
+  關閉不得要求 draft 或 probe binary/GPU；維持原交易／還原白名單與零參數 wrapper。
 - `compaction_formula` ——門檻公式、canonical 規則文字與 `OUTPUT_TOKEN_MAX` /
   `COMPACTION_RESERVE_TOKENS` / `MIN_PRESERVE_RECENT_TOKENS` 常數的單一真值。
   `config.CLIENT_MAX_OUTPUT_TOKENS` 的上限 fail-loud 綁的就是這裡的 `OUTPUT_TOKEN_MAX`

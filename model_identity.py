@@ -58,10 +58,28 @@ def artifact_digest(path: str | Path) -> str:
                     for i in range(1, count + 1)])
 
 
-def versioned_alias(role: str, path: str | Path, mmproj: str | Path | None = None) -> str:
+def _configured_dspark_identity(dspark: deployment_profile.DSparkConfig,
+                                *, registry_file: str | Path | None = None) -> dict:
+    """Configured draft identity, not evidence of live speculative activation."""
+    try:
+        draft = deployment_profile.resolve_model_reference(
+            dspark.draft_model, registry_file=registry_file, must_exist=True)
+    except deployment_profile.ProfileError as exc:
+        raise ModelIdentityError(f"cannot verify DSpark draft artifact: {exc}") from exc
+    return {"spec_type": "draft-dspark", "draft_artifact_sha256": artifact_digest(draft),
+            "draft_n_max": dspark.draft_n_max}
+
+
+def versioned_alias(role: str, path: str | Path, mmproj: str | Path | None = None,
+                    *, dspark: deployment_profile.DSparkConfig | None = None,
+                    registry_file: str | Path | None = None) -> str:
     digest = artifact_digest(path)
     if mmproj:
         digest = _digest([digest, artifact_digest(mmproj)])
+    if dspark is not None:
+        if role != "main":
+            raise ModelIdentityError("DSpark identity is supported only for the main service")
+        digest = _digest([digest, _configured_dspark_identity(dspark, registry_file=registry_file)])
     return f"ct-{role}-{digest}"
 
 
@@ -70,6 +88,8 @@ def _capture_model_identity(role: str, *, profile=None, props=None) -> dict:
 
     ``props`` is an already observed live /props object (diagnostic callers).
     It is never persisted or accepted from deployment/client configuration.
+    A configured DSpark draft contributes its local artifact identity only;
+    /props does not establish whether speculative decoding is active.
     """
     profile = profile or deployment_profile.load_effective_profile()
     service = profile.service(role)
@@ -90,6 +110,7 @@ def _capture_model_identity(role: str, *, profile=None, props=None) -> dict:
         raise ModelIdentityError(f"{role}: live model_path missing; identity not verified")
     artifact = None
     projector = None
+    configured_dspark = None
     if profile.mode == "client":
         expected = service.identity_alias
         if not expected or alias != expected or service.model != expected:
@@ -108,6 +129,9 @@ def _capture_model_identity(role: str, *, profile=None, props=None) -> dict:
         if service.mmproj:
             projector = artifact_digest(deployment_profile.resolve_model_reference(
                 service.mmproj, registry_file=profile.registry_file, must_exist=True))
+        if service.dspark is not None:
+            configured_dspark = _configured_dspark_identity(
+                service.dspark, registry_file=profile.registry_file)
         if service.identity_alias and alias != service.identity_alias:
             raise ModelIdentityError(f"{role}: live model_alias differs from deployment identity_alias")
         kind = "local-artifact-sha256"
@@ -126,6 +150,8 @@ def _capture_model_identity(role: str, *, profile=None, props=None) -> dict:
                 "identity_kind": kind, "artifact_sha256": artifact,
                 "projector_sha256": projector, "identity_alias": service.identity_alias,
                 "endpoint": service.base_url, "live": live}
+    if configured_dspark is not None:
+        identity["configured_dspark"] = configured_dspark
     identity["fingerprint"] = _digest(identity)
     return identity
 

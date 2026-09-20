@@ -20,7 +20,7 @@ import client_config
 import endpoint_policy
 import process_env
 from deployment_profile import (
-    ROLES, TMUX_SESSIONS, DeploymentProfile, ProfileError,
+    ROLES, DeploymentProfile, ProfileError,
     export_client_profile, load_effective_profile,
 )
 from scripts import set_config
@@ -96,10 +96,17 @@ def configure_menu(home: Path) -> int:
         print(f"目前 deployment 設定無效：{exc}")
         profile = None
     current = profile.mode if profile else None
+    if profile is None:
+        dspark_state = "尚未設定"
+    elif profile.mode == "client":
+        dspark_state = "由 A 管理"
+    else:
+        dspark_state = "on" if profile.service("main").dspark else "off"
     print(f"CodeTrail 設定（目前角色：{current or '尚未設定'}）")
     print("  1. 重設目前角色\n  2. local：模型與工作區在本機\n"
           "  3. model-host：模型主機 A\n  4. client：工作機 B\n"
-          "  5. 還原最近一次設定交易\n  6. 顯示 A 的 endpoint manifest\n  q. 離開")
+          "  5. 還原最近一次設定交易\n  6. 顯示 A 的 endpoint manifest\n"
+          f"  7. DSpark 推測解碼開關（目前：{dspark_state}）\n  q. 離開")
     while True:
         choice = set_config._input("選擇: ").strip().lower()
         if choice == "q":
@@ -113,6 +120,8 @@ def configure_menu(home: Path) -> int:
                 raise set_config.SetupError("尚無有效 model-host 設定；請先設定模型主機 A。")
             _print_manifest(profile, _host_url())
             return 0
+        if choice == "7":
+            return set_config.configure_dspark(home)
         role = {"1": current, "2": "local", "3": "model-host", "4": "client"}.get(choice)
         if role:
             result = _configure_role(role, offer_restart=True)
@@ -150,7 +159,7 @@ def _existing_for_role(home: Path, role: str) -> DeploymentProfile | None:
 
 def _host_readiness(profile: DeploymentProfile) -> tuple[bool, bool, list[str]]:
     """Read only the existing transport; no cached or configured n_ctx is ready."""
-    from deployment_status import query_server
+    from deployment_status import query_server, require_dspark_active
     reachable = False
     issues = []
     for role in ROLES:
@@ -167,6 +176,10 @@ def _host_readiness(profile: DeploymentProfile) -> tuple[bool, bool, list[str]]:
                         (settings.get("n_ctx") if isinstance(settings, dict) else None))
             if type(live_ctx) is not int or live_ctx <= 0 or live_ctx != service.ctx:
                 issues.append("main: live n_ctx 不可用或與設定不同")
+            try:
+                require_dspark_active(service)
+            except ProfileError as exc:
+                issues.append(f"main: {exc}")
     return not issues, reachable, issues
 
 
@@ -174,15 +187,13 @@ def _ensure_host_ready(profile: DeploymentProfile) -> int:
     from scripts import launch_servers
     ready, reachable, issues = _host_readiness(profile)
     if ready:
-        print("四個模型已 ready，live alias 與主模型 n_ctx 已核對。")
+        print("四個模型已 ready，live alias、主模型 n_ctx 與已啟用的 DSpark 狀態已核對。")
         return 0
     sessions = set_config.running_codetrail_sessions()
     if reachable or sessions:
         raise set_config.SetupError(
             "既有模型尚未通過 ready 檢查：" + "; ".join(issues) +
-            f"。請執行 python3 {REPO_ROOT / 'scripts/check_status.py'} --strict，"
-            f"或 tmux attach -t {TMUX_SESSIONS['main']} 檢查；"
-            "若要套用新設定，請自行停止後再啟動。")
+            "。請用 ./set_config.sh 確認設定，再執行 ~/start.sh stop 與 ~/start.sh 套用。")
     code = launch_servers.main(["--scope", "all"])
     if code:
         return code

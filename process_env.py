@@ -94,10 +94,22 @@ def _reject_env(kwargs: dict[str, Any]) -> None:
         )
 
 
-def run(args, *, overrides: Mapping[str, str] | None = None, **kwargs: Any) -> _subprocess.CompletedProcess:
-    """`subprocess.run` 的唯一入口:環境永遠是 `child_env(overrides)`。"""
+def run(
+    args, *, overrides: Mapping[str, str] | None = None,
+    server_env: bool = False, **kwargs: Any,
+) -> _subprocess.CompletedProcess:
+    """Spawn with the shared child environment, or the stricter llama-server one.
+
+    Server capability probes need exactly the environment used by the final
+    exec. They cannot add overrides that reintroduce stripped server settings.
+    """
     _reject_env(kwargs)
-    return _subprocess.run(args, env=child_env(overrides), **kwargs)
+    if type(server_env) is not bool:
+        raise TypeError("process_env.run server_env must be boolean")
+    if server_env and overrides is not None:
+        raise TypeError("process_env.run server_env does not accept overrides")
+    env = llama_server_env() if server_env else child_env(overrides)
+    return _subprocess.run(args, env=env, **kwargs)
 
 
 class Popen(_subprocess.Popen):
