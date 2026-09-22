@@ -75,6 +75,10 @@ aicode        # CodeTrail 終端客戶端;/tools 應列出 21 個工具
 
 要從別台電腦操作就用 SSH:登入這台機器之後照樣 `cd <PROJECT_TO_ANALYZE> && aicode`。
 想讓連線斷了也不中斷,把它跑在 `tmux` 裡(`tmux new -s codetrail`,斷線後 `tmux attach -t codetrail`)。
+對話可用滑鼠拖選；閒置主畫面按 **Ctrl+C** 複製，回合進行中請用 **F2** 複製，
+此時 Ctrl+C 仍會中斷。完整快捷鍵見[選取、複製與中斷](docs/basic-usage.md#選取複製與中斷)。
+SSH 複製到本機需要客戶端終端支援並允許 OSC 52；tmux 設定與貼上驗證見
+[剪貼簿排查](docs/troubleshooting.md#clipboard-ssh-tmux)。
 
 - 第 5 步的 `export` 只處理目前 shell；§1.2 會把同一條 PATH 寫進 `~/.profile`，讓重新登入後仍生效。
 - `set_config.sh` 先選部署角色或還原操作；local / model-host 再依 main → embedding → reranker → VL 分組問答。推薦值不是硬限制，

@@ -463,6 +463,108 @@ def test_ctrl_c_while_idle_needs_two_presses_and_never_claims_a_cancel():
     assert returned == 0
 
 
+def test_idle_ctrl_c_copies_screen_or_prompt_selection_without_arming_exit(monkeypatch):
+    """已選文字的 Ctrl-C 要複製，不能沿用上一按的離開計時或清空剪貼簿。"""
+    import base64
+
+    from textual.selection import SELECT_ALL
+    from textual.widgets.text_area import Selection
+
+    engine = _Engine()
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            await pilot.press("ctrl+c")  # 先武裝一次離開，再於期限內選取。
+            assert app._last_interrupt > 0
+            prompt = app.query_one("#prompt", client_app.PromptInput)
+            prompt.text = "draft selected"
+            prompt.selection = Selection((0, 0), (0, 5))
+            reply = client_app.Static(client_app.Text("selected reply 中文"))
+            await app.query_one("#log").mount(reply)
+            app.screen.selections = {reply: SELECT_ALL}
+            writes = []
+            monkeypatch.setattr(app._driver, "write", writes.append)
+
+            await pilot.press("ctrl+c")
+            assert app.clipboard == "selected reply 中文"
+            assert app._last_interrupt == 0.0
+            assert app.return_value is None
+            encoded = base64.b64encode(app.clipboard.encode()).decode()
+            assert f"\x1b]52;c;{encoded}\a" in writes
+
+            app.screen.clear_selection()
+            await pilot.press("ctrl+c")
+            assert app.clipboard == "draft"
+            assert app._last_interrupt == 0.0
+            assert prompt.text == "draft selected"
+            prompt.move_cursor(prompt.document.end)
+            await pilot.press("f2")  # 空選取不得把已有的剪貼簿清掉。
+            assert app.clipboard == "draft"
+            await pilot.press("ctrl+c")
+            assert app.return_value is None  # 複製不是第一次「準備離開」。
+            assert engine.messages == [] and engine.sent == []
+
+    _run(body)
+
+
+def test_copy_during_a_turn_preserves_ctrl_c_cancellation():
+    """專用複製不動回合；即使仍有選取，Ctrl-C 也必須中斷進行中的回合。"""
+    from textual.selection import SELECT_ALL
+
+    engine = _Blocks()
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            app.submit("hi")
+            assert engine.entered.wait(5)
+            try:
+                reply = client_app.Static(client_app.Text("in progress 中文"))
+                await app.query_one("#log").mount(reply)
+                app.screen.selections = {reply: SELECT_ALL}
+                await pilot.press("f2")
+                assert app.clipboard == "in progress 中文"
+                assert app.coordinator.busy and not engine.cancelled
+                await pilot.press("ctrl+c")
+                assert engine.cancelled
+            finally:
+                engine.release.set()
+            await _settle(pilot)
+            assert "已中斷這一輪。" in _snapshot(app)["notices"]
+
+    _run(body)
+
+
+def test_copy_in_approval_never_grants_or_cancels_but_ctrl_c_still_cancels():
+    """框內複製完整參數不等於核准；選取不能吃掉 Ctrl-C 的整輪取消。"""
+    from textual.selection import SELECT_ALL
+
+    engine = _AsksApproval()
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test() as pilot:
+            app.submit("改一下")
+            screen = await _wait_for_approval(app, pilot)
+            detail = screen.query_one("#approval-detail")
+            screen.selections = {detail: SELECT_ALL}
+            await pilot.press("f2")
+            # Screen selection strips the final newline; all rendered approval
+            # parameters must otherwise survive byte for byte, not just a prefix.
+            assert app.clipboard == screen.ticket.request.render().rstrip("\n")
+            assert app.screen is screen
+            assert app.coordinator.busy and not engine.cancelled
+            assert engine.granted == []
+            await pilot.press("ctrl+c")
+            await _settle(pilot)
+            assert engine.granted == [False]
+            assert not engine.finished.is_set()
+            assert "已中斷這一輪。" in _snapshot(app)["notices"]
+
+    _run(body)
+
+
 def test_ctrl_d_with_the_approval_box_open_only_refuses_that_tool():
     """框內 EOF = 拒絕**這一個工具**,回合繼續(沿用舊 REPL 的核准提示語意)。
     直接拆掉畫面會留下一個卡在核准上的 worker,而呼叫端隨即關掉共用的 MCP。"""

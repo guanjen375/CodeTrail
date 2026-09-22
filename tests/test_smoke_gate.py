@@ -1256,6 +1256,11 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_every_prime_the_coordinator_runs_reports_through_on_prime",
         ),
     ),
+    "test_client_app_selection.py": (
+        "完成／重播回答仍可拖選；掛載前與掛載中完成不得遺失文字，舊串流選取須移除，"
+        "顯示 Markdown 不自動開啟回答中的連結",
+        ("test_finished_and_replayed_assistant_text_is_mouse_selectable",),
+    ),
     "test_client_app.py": (
         "TUI:核准框完整顯示參數(含整份 patch)且可捲動、只認真的 bool;Esc / Ctrl-D 只拒絕"
         "那個工具、Ctrl-C 中斷整輪(核准框開著時也一樣、送出後立刻按也生效),閒置的 Ctrl-C "
@@ -1292,6 +1297,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_ctrl_c_with_the_approval_box_open_cancels_the_whole_turn",
             "test_a_cancel_right_after_submitting_still_lands",
             "test_ctrl_c_while_idle_needs_two_presses_and_never_claims_a_cancel",
+            "test_idle_ctrl_c_copies_screen_or_prompt_selection_without_arming_exit",
+            "test_copy_during_a_turn_preserves_ctrl_c_cancellation",
+            "test_copy_in_approval_never_grants_or_cancels_but_ctrl_c_still_cancels",
             "test_ctrl_c_does_not_block_the_ui_on_a_slow_mcp_cancel",
             "test_ctrl_d_with_the_approval_box_open_only_refuses_that_tool",
             "test_leaving_is_refused_while_a_turn_is_running",

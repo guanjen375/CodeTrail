@@ -38,7 +38,6 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
-from rich.markdown import Markdown as RichMarkdown
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
@@ -47,7 +46,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Button, Collapsible, OptionList, Static, TextArea
+from textual.widgets import Button, Collapsible, Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 import client_config
@@ -64,7 +63,7 @@ HISTORY_FILENAME = "tui_history"
 HISTORY_MAX_LINES = 1000
 HISTORY_MAX_BYTES = 4 * 1024 * 1024
 
-#: 閒置時連按兩次 Ctrl-C 才離開,而且要在這段時間內。
+#: 閒置且沒有選取時連按兩次 Ctrl-C 才離開,而且要在這段時間內。
 DOUBLE_INTERRUPT_SECONDS = 2.0
 
 # Only prefill details are sampled. Answer/reasoning/tool deltas stay immediate.
@@ -104,7 +103,9 @@ HELP_TAIL = (
     "其他輸入一律當成問題送給模型。\n"
     "Enter 送出、Alt+Enter 換行、↑/↓ 翻輸入歷史。\n"
     "忙碌時 Enter 選擇排到下一輪或補充目前任務;未送訊息用 /queue 查看。\n"
-    "回合進行中 Ctrl-C 中斷整輪;閒置時連按兩次 Ctrl-C 或 Ctrl-D 離開。"
+    "滑鼠拖曳選取後按 F2 複製;閒置主畫面也可用 Ctrl-C 複製選取。\n"
+    "回合／核准／審查中 Ctrl-C 仍中斷整輪;閒置且沒有選取時連按兩次 Ctrl-C 或 Ctrl-D 離開。\n"
+    "複製需終端允許 OSC 52;有用 tmux 時需 set -s set-clipboard on，並支援 Ms。"
 )
 
 ALLOW_USAGE = "用法:/allow [list] | /allow add <絕對目錄>（含空白請加引號）"
@@ -396,17 +397,33 @@ class ReasoningBlock(Static):
         self.update(Text(self._buffer, style="dim"))
 
 
-class AssistantBlock(Static):
+class AssistantBlock(Vertical):
     """助理的一則回答。
 
     串流期間用純文字更新(每個 token 重新解析 Markdown 太貴,而且半個程式碼
-    區塊會一直重排);這一則收完之後換成算好的 Markdown(含程式碼上色)。
+    區塊會一直重排);收完後用原生 Markdown，讓完成與重播的回答仍可選取。
+    """
+
+    DEFAULT_CSS = """
+    AssistantBlock { height: auto; }
+    AssistantBlock > Markdown { padding: 0; }
     """
 
     def __init__(self) -> None:
         super().__init__(classes="entry assistant")
         self._buffer = ""
         self._finished = False
+        self._stream = Static(Text(""))
+        self._markdown: Markdown | None = None
+
+    def compose(self) -> ComposeResult:
+        if self._finished:
+            # Replay finishes before mount. Markdown's own Mount initializes
+            # from this constructor value; an earlier update() would be lost.
+            self._markdown = Markdown(self._buffer, open_links=False)
+            yield self._markdown
+        else:
+            yield self._stream
 
     @property
     def text(self) -> str:
@@ -416,13 +433,24 @@ class AssistantBlock(Static):
         if self._finished:
             return
         self._buffer += token
-        self.update(Text(self._buffer))
+        self._stream.update(Text(self._buffer))
 
     def finish(self, text: str = "") -> None:
+        previous_text = self._buffer
         if text:
             self._buffer = text
+        if self._finished and self._buffer == previous_text:
+            return
         self._finished = True
-        self.update(RichMarkdown(self._buffer) if self._buffer else Text(""))
+        previous = self._markdown if self._markdown is not None else self._stream
+        # Children attach before the parent's Mount event completes, so this
+        # also covers finish() between compose() and is_mounted becoming true.
+        if previous.is_attached:
+            self._markdown = Markdown(self._buffer, open_links=False)
+            self.mount(self._markdown, before=previous)
+            # Hidden widgets still contribute to an existing Screen selection.
+            # Detach the old text so copying cannot retrieve an invisible stream.
+            previous.remove()
 
 
 class ToolBlock(Collapsible):
@@ -875,9 +903,10 @@ class CodeTrailApp(App[int]):
     """
 
     BINDINGS = [
-        # priority:輸入框自己把 ctrl+c 綁成「複製」、ctrl+d 綁成「刪字元」,
-        # 不搶在前面的話中斷與離開都按不到。
+        # priority 保留忙碌／核准時的中斷；閒置才由 action_interrupt 分流複製。
+        # F2 在 modal 中也可複製，不占用 TextArea 的 Ctrl-Y redo。
         Binding("ctrl+c", "interrupt", "中斷", priority=True, show=False),
+        Binding("f2", "copy_selection", "複製選取", priority=True, show=False),
         Binding("ctrl+d", "leave", "離開", priority=True, show=False),
     ]
 
@@ -1739,8 +1768,25 @@ class CodeTrailApp(App[int]):
             pass
         return True
 
+    def _copy_selection(self) -> bool:
+        """只複製目前畫面的選取，不改回合、核准或對話歷史。"""
+        text = self.screen.get_selected_text()
+        if not text and isinstance(self.screen.focused, TextArea):
+            text = self.screen.focused.selected_text
+        if not text:
+            return False
+        self.copy_to_clipboard(text)
+        self._last_interrupt = 0.0
+        self.notify("已送出複製請求；若貼不上，請確認終端 OSC 52／tmux 設定。", timeout=3)
+        return True
+
+    def action_copy_selection(self) -> None:
+        """F2 在忙碌／核准中也只複製，沒有選取不得清空剪貼簿。"""
+        if not self._copy_selection():
+            self.notify("請先用滑鼠拖曳選取文字，或選取輸入框文字。", timeout=3)
+
     def action_interrupt(self) -> None:
-        """Ctrl-C。選單開著 = 只收選單;回合進行中 = 中斷整輪;閒置 = 連按兩次離開。"""
+        """Ctrl-C：保留取消／收選單；閒置有選取則複製，否則連按兩次離開。"""
         if self._review_screen is not None:
             if not self._review_screen.running:
                 self._review_screen.request_close()
@@ -1763,6 +1809,8 @@ class CodeTrailApp(App[int]):
             # 有一輪在跑,但答案已經寫定 / 收尾中:沒有東西可取消,不得
             # 顯示成「已中斷」。
             self._append(NoticeLine("這一輪已經收尾,沒有可中斷的內容。"))
+            return
+        if not isinstance(self.screen, ModalScreen) and self._copy_selection():
             return
         now = time.monotonic()
         if now - self._last_interrupt <= DOUBLE_INTERRUPT_SECONDS:

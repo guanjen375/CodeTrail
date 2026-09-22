@@ -17,6 +17,7 @@ patch / command」排列。內容很長時可先用頁面搜尋找下列關鍵�
 | server 沒關過,開新對話第一個字仍要等很久 | `cache 冷熱`、`預熱` |
 | MCP Connected 但沒有真工具呼叫 | `假工具 XML` |
 | MCP 連不上 / server 啟動就退出 | `initialize 前就退出` |
+| 對話已反白，複製後本機仍貼不上 | [SSH／tmux／OSC 52](#clipboard-ssh-tmux) |
 | 圖片或 ingest 逾時 | `超時`、`image_url` |
 | context 啟動閘擋下 | `ctx-safety` |
 | server / RAG 異常 | `llama-server 不可連`、`embedding`、`查 spec 沒結果` |
@@ -400,6 +401,66 @@ explicit model/chat-template 與 non-blocking implicit routing，避免再把它
 `python3 scripts/doctor.py --project "$PWD"` 會重建 current fingerprint，只回報該列
 的 implicit `optimal/suboptimal/fail/timeout` 與 fresh/stale；資料不足顯示 `unknown`，不會拿
 另一個模型／設定／專案的 cache row 冒充現況。
+
+<a id="clipboard-ssh-tmux"></a>
+
+### SSH／tmux：已選取文字，但本機貼不上
+
+先用滑鼠拖選，再按 **F2**；閒置主畫面也可按 **Ctrl+C**。回合、核准或審查進行中，
+Ctrl+C 仍是中斷。完整按鍵行為見[選取、複製與中斷](basic-usage.md#選取複製與中斷)。
+
+CodeTrail 透過 Textual 向終端送出 OSC 52 複製請求，SSH 另一端的終端決定是否寫入
+本機剪貼簿；「已送出複製請求」不代表已確認本機貼上成功。請在你用來連線的終端
+設定中確認 OSC 52／應用程式寫入剪貼簿的支援與權限。這條路徑不需要在遠端安裝
+`xclip`、`pbcopy`，也不需要 X11 forwarding。[Textual 複製介面](https://textual.textualize.io/api/app/#textual.app.App.copy_to_clipboard)
+有終端相容性限制；請以下面的實際貼上結果確認。
+
+**先驗證直接 SSH。** 開一個未進 tmux 的 SSH shell，在 TUI 外執行固定無敏感內容的
+probe。每次 probe 前先在本機複製另一段文字（例如 `before-probe`），避免把上一次
+殘留的內容誤認成這次成功；執行後在本機文字編輯器貼上，應得到 `codetrail-clipboard-check`：
+
+```bash
+printf '\033]52;c;Y29kZXRyYWlsLWNsaXBib2FyZC1jaGVjaw==\a'
+```
+
+如果直接 SSH 就貼不上，先處理客戶端終端的支援／權限。只有把 `aicode` 跑在 tmux
+裡才需要下面的設定。進 tmux 後，先在本機複製 `before-probe`，再於 tmux shell 執行
+同一個 probe，最後回本機貼上比對。外面成功、裡面失敗時，在該 tmux session 檢查：
+
+```bash
+tmux show -s set-clipboard
+tmux info | rg 'Ms:'
+```
+
+`set-clipboard` 必須是 `on`，`external` 會阻擋 tmux 內部應用程式的複製請求。
+可在遠端 `~/.tmux.conf` 加入以下設定；目前的 tmux server 可用
+`tmux set -s set-clipboard on` 套用同一選項：
+
+```tmux
+set -s set-clipboard on
+```
+
+`Ms` 應顯示 escape sequence。若為 `[missing]`，先回到 **tmux 外**的 SSH shell
+查看實際終端名稱：
+
+```bash
+printf '%s\n' "$TERM"
+```
+
+只有在直接 SSH 的 probe 已確認該終端支援 OSC 52 時，才於 `~/.tmux.conf` 補上
+下列 tmux 3.2+ 設定，將 `OUTER_TERM` 換成剛查到的完整名稱；不要用 tmux 內的
+`TERM`，也不要用 `*` 宣告所有終端都支援：
+
+```tmux
+set -as terminal-features ',OUTER_TERM:clipboard'
+```
+
+這項能力設定請在既有對話／服務可結束、重新啟動 tmux server 後，再檢查 `Ms` 並
+重做內部 probe。舊版或巢狀 tmux 的設定見 [tmux 官方剪貼簿文件](https://github.com/tmux/tmux/wiki/Clipboard)。
+
+終端不支援或不允許 OSC 52 時，可改用該終端的原生滑鼠選取與複製功能。TUI 會接收
+滑鼠事件，終端可能要求按住修飾鍵才啟用原生選取；修飾鍵及複製快捷鍵依終端設定，
+沒有通用的一組按法。
 
 ### TUI 跳出 CodeTrail 的 toast(待處理項目 / 沒有真的呼叫工具)
 
