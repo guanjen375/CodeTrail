@@ -71,7 +71,8 @@ cmake --build build --config Release -j
 ~/llama.cpp/build/bin/llama-server --version
 ```
 
-預設使用 `~/llama.cpp/build/bin/llama-server`；放在其他位置可在設定精靈指定。
+預設使用 `~/llama.cpp/build/bin/llama-server`；已有設定時沿用保存的執行檔路徑。
+其他位置可在 `./scripts/configure-advanced.sh` 選「local」後指定。
 CodeTrail 會檢查必要的 server 能力，包含 chat token 計數、reranking 與多模態能力；
 缺少時會報錯並要求更新 build。
 
@@ -79,7 +80,8 @@ CodeTrail 會檢查必要的 server 能力，包含 chat token 計數、rerankin
 
 ## 準備四類 GGUF 模型
 
-模型預設放 `~/models`，也可在設定精靈改目錄。主聊天模型以 `<CODE_MODEL>` 表示，
+模型預設放 `~/models`；其他目錄可在 `./scripts/configure-advanced.sh` 選「local」後指定。
+主聊天模型以 `<CODE_MODEL>` 表示，
 請自行準備支援工具呼叫且硬體能負擔的 GGUF；本專案不指定唯一主模型。
 多 shard 模型必須下載完整，精靈會以第一片為入口並檢查缺片。
 
@@ -118,7 +120,8 @@ source .venv/bin/activate
 ./set_config.sh
 ```
 
-直接進入本機設定，依序選主聊天、embedding、reranker、VL 的模型與 GPU，再選必要容量
+精靈直接掃描 `~/models`，並沿用保存的 llama-server 路徑或上述預設，不再詢問這兩個位置。
+接著依序選主聊天、embedding、reranker、VL 的模型與 GPU，再選必要容量
 參數。單一候選可自動選用；多個候選由使用者決定。主模型問 n_ctx；MoE 模型另問
 留在 RAM 的 expert 層數；reranker 的 internal buffer 與主 n_ctx 分開設定。
 四個服務固定單 slot，主聊天與內部工作共用模型鎖。
@@ -178,8 +181,9 @@ tmux attach -t codetrail-main
 ```
 
 要看到真正的工具呼叫卡、結果及模型回答；模型只印 XML 或聲稱「已讀取」不算執行。
-滑鼠拖選文字後按預設 **F2** 複製；`/copykey f3` 更換並保存，`/copykey reset` 回 F2。
-頁尾常駐目前複製鍵；回合進行中 **Ctrl+C** 仍中斷。SSH／tmux 的剪貼簿排查見
+用滑鼠左鍵拖選文字，放開即自動複製，不需按鍵。
+手動複製鍵仍可使用，詳見[選取與複製](docs/usage.md#copy)；回合進行中 **Ctrl+C** 仍中斷。
+SSH／tmux 的剪貼簿排查見
 [開發與維運](developer.md#clipboard-ssh-tmux)。
 
 離開 TUI 可用 `/exit` 或閒置時 Ctrl+D，再停止服務：

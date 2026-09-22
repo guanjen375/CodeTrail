@@ -62,12 +62,13 @@ def _print_manifest(profile: DeploymentProfile, server_url: str) -> None:
     print("=== manifest 結束；B 仍須逐角色確認授權，並在啟動時驗證 live 服務 ===")
 
 
-def _configure_role(role: str, *, offer_restart: bool, prompt_compaction: bool = True) -> SetupResult:
+def _configure_role(role: str, *, offer_restart: bool, prompt_compaction: bool = True,
+                    prompt_paths: bool = True) -> SetupResult:
     args = set_config._parser().parse_args(["--mode", role])
     args.offer_restart = offer_restart
     args.prompt_compaction = prompt_compaction
     server_url = None
-    if role != "client":
+    if role != "client" and prompt_paths:
         home = Path.home().absolute()
         default_models = home / "models"
         try:
@@ -140,13 +141,22 @@ def configure_local(home: Path) -> int:
     try:
         previous = _load_profile(home)
     except ProfileError as exc:
-        print(f"目前 deployment 設定無效，將重建本機設定：{exc}")
-        previous = None
+        raise set_config.SetupError(
+            f"目前 deployment 設定無效：{exc}\n"
+            "請執行 ./scripts/configure-advanced.sh，選項 2（local），確認路徑後重建本機設定。"
+        ) from exc
     if previous is not None and previous.mode != "local":
         print(f"目前角色是 {previous.mode}；這次改為 local：模型與工作區在本機。")
         print("確認寫入後會移除先前 B 的端點授權，四個模型使用本機端點；取消不寫入。")
         print("A/B 分離部署、交易還原及 manifest 請用 ./scripts/configure-advanced.sh。")
-    return _configure_role("local", offer_restart=True, prompt_compaction=False).code
+    try:
+        return _configure_role("local", offer_restart=True, prompt_compaction=False,
+                               prompt_paths=False).code
+    except set_config.SetupError as exc:
+        raise set_config.SetupError(
+            f"{exc}\n"
+            "如需自訂路徑或修復本機設定，請執行 ./scripts/configure-advanced.sh，選項 2（local）。"
+        ) from exc
 
 
 def _existing_for_role(home: Path, role: str) -> DeploymentProfile | None:

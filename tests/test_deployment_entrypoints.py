@@ -178,12 +178,227 @@ def test_daily_local_route_warns_conversion_and_keeps_cancelled_settings(tmp_pat
                         routed.append((role, kwargs)) or entry.SetupResult(0, False))
     monkeypatch.setattr(entry, "configure_menu", lambda *_a: pytest.fail("daily setup asked for a role"))
     assert entry.main(["configure"]) == 0
-    assert routed == [("local", {"offer_restart": True, "prompt_compaction": False})]
+    assert routed == [("local", {"offer_restart": True, "prompt_compaction": False,
+                                 "prompt_paths": False})]
     assert {path: path.read_bytes() for path in home.rglob("*") if path.is_file()} == before
     output = capsys.readouterr().out
     assert "目前角色是 client" in output
     assert "移除先前 B 的端點授權" in output and "取消不寫入" in output
     assert "configure-advanced.sh" in output
+
+
+def _local_setup_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(home / ".local/state"))
+    monkeypatch.setattr(set_config, "_COMMITTED", False)
+
+    def python_check(skip, _notes):
+        assert skip is False
+        return sys.executable
+
+    def tmux_check(skip, _notes):
+        assert skip is False
+
+    monkeypatch.setattr(set_config, "_detect_python", python_check)
+    monkeypatch.setattr(set_config, "_check_tmux", tmux_check)
+    monkeypatch.setattr(set_config, "commit_files", lambda *_a, **_k:
+                        pytest.fail("failed or cancelled daily setup attempted a transaction"))
+    return home
+
+
+def _local_deployment(home, **overrides):
+    path = home / ".config/codetrail/deployment.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"schema_version": 1, "mode": "local", **overrides}))
+    return path
+
+
+def _home_snapshot(home):
+    return {path.relative_to(home): (path.stat().st_mode, path.read_bytes() if path.is_file() else None)
+            for path in home.rglob("*")}
+
+
+@pytest.mark.parametrize("profile_kind", ["absent", "without-binary", "saved-binary"])
+def test_daily_local_uses_canonical_paths_and_cancellation_preserves_files(
+    tmp_path, monkeypatch, profile_kind,
+):
+    home = _local_setup_home(tmp_path, monkeypatch)
+    expected_binary = home / "llama.cpp/build/bin/llama-server"
+    if profile_kind == "saved-binary":
+        expected_binary = home / "custom build/bin/llama-server"
+        _local_deployment(home, llama_bin=str(expected_binary))
+    elif profile_kind == "without-binary":
+        _local_deployment(home)
+    before = _home_snapshot(home)
+    checked, scanned, prompts = [], [], []
+    original_run = set_config.run
+
+    def run(args):
+        assert args.models_dir is None and args.llama_bin is None
+        assert args.prompt_compaction is False and args.offer_restart is True
+        return original_run(args)
+
+    def check_binary(binary, skip, _notes):
+        assert skip is False
+        checked.append(binary)
+        return {"fit": True, "cache_ram": True}
+
+    def scan(directory, *, notes):
+        scanned.append(directory)
+        candidate = set_config.ModelCandidate(directory / "synthetic.gguf", 1 << 30, 1)
+        # Two main candidates reach the real model-choice prompt before reading weights.
+        return {role: [candidate, candidate] if role == "main" else [candidate]
+                for role in ("main", "embedding", "reranker", "vl")}, []
+
+    def cancel(prompt):
+        prompts.append(prompt)
+        assert "請輸入編號" in prompt
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(set_config, "run", run)
+    monkeypatch.setattr(set_config, "check_llama_binary", check_binary)
+    monkeypatch.setattr(set_config, "detect_gpus", lambda: [
+        set_config.Gpu(0, "synthetic", 16384, 16384, "GPU-synthetic")])
+    monkeypatch.setattr(set_config, "scan_models", scan)
+    monkeypatch.setattr(set_config, "_input", cancel)
+    assert entry.main(["configure"]) == 130
+    assert checked == [expected_binary]
+    assert scanned == [home / "models"]
+    assert len(prompts) == 1
+    assert set_config._COMMITTED is False
+    assert _home_snapshot(home) == before
+
+
+@pytest.mark.parametrize("failure", ["invalid-json", "non-object", "unknown-key", "bad-binary", "unreadable"])
+def test_daily_local_invalid_deployment_fails_with_recovery_hint_without_writes(
+    tmp_path, monkeypatch, capsys, failure,
+):
+    home = _local_setup_home(tmp_path, monkeypatch)
+    path = _local_deployment(home)
+    if failure == "invalid-json":
+        path.write_text("{broken")
+    elif failure == "non-object":
+        path.write_text("[]")
+    elif failure == "unknown-key":
+        _local_deployment(home, unsupported=True)
+    elif failure == "bad-binary":
+        _local_deployment(home, llama_bin="relative/llama-server")
+    else:
+        original_read = Path.read_text
+
+        def unreadable(source, *args, **kwargs):
+            if source == path:
+                raise PermissionError("synthetic deployment read failure")
+            return original_read(source, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", unreadable)
+    before = _home_snapshot(home)
+    monkeypatch.setattr(set_config, "run", lambda *_a, **_k:
+                        pytest.fail("untrusted deployment entered daily setup"))
+    monkeypatch.setattr(set_config, "_input", lambda *_a:
+                        pytest.fail("untrusted deployment asked a daily setup question"))
+    assert entry.main(["configure"]) == 2
+    output = capsys.readouterr()
+    assert "目前 deployment 設定無效" in output.err
+    assert "./scripts/configure-advanced.sh" in output.err and "選項 2（local）" in output.err
+    assert "將重建" not in output.out + output.err
+    assert _home_snapshot(home) == before
+    assert set_config._COMMITTED is False
+
+
+@pytest.mark.parametrize("failure", ["missing", "not-executable", "missing-required-flag"])
+def test_daily_local_rejects_invalid_saved_binary_without_fallback_or_writes(
+    tmp_path, monkeypatch, capsys, failure,
+):
+    home = _local_setup_home(tmp_path, monkeypatch)
+    binary = home / "custom/bin/llama-server"
+    _local_deployment(home, llama_bin=str(binary))
+    default_binary = home / "llama.cpp/build/bin/llama-server"
+    default_binary.parent.mkdir(parents=True)
+    default_binary.write_text("available default must not replace the saved binary")
+    default_binary.chmod(0o700)
+    if failure != "missing":
+        binary.parent.mkdir(parents=True)
+        binary.write_text("synthetic binary; execution is mocked")
+        binary.chmod(0o600 if failure == "not-executable" else 0o700)
+    before = _home_snapshot(home)
+    calls = []
+
+    def help_probe(argv, **kwargs):
+        assert argv == [str(binary), "--help"]
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="--mmproj --fit --cache-ram", stderr="")
+
+    monkeypatch.setattr(set_config.process_env, "run", help_probe)
+    monkeypatch.setattr(set_config, "detect_gpus", lambda:
+                        pytest.fail("invalid saved binary reached GPU/model setup"))
+    monkeypatch.setattr(set_config, "_input", lambda *_a:
+                        pytest.fail("invalid saved binary asked a daily setup question"))
+    assert entry.main(["configure"]) == 2
+    output = capsys.readouterr().err
+    assert "./scripts/configure-advanced.sh" in output and "選項 2（local）" in output
+    if failure == "missing-required-flag":
+        assert "--reranking" in output and "不支援" in output
+        assert calls == [[str(binary), "--help"]]
+    else:
+        assert f"找不到可執行的 llama-server:{binary}" in output
+        assert "python3 scripts/set_config.py --llama-bin" in output
+        assert calls == []
+    assert _home_snapshot(home) == before
+    assert set_config._COMMITTED is False
+
+
+@pytest.mark.parametrize("models_present", [False, True])
+def test_daily_local_missing_models_fail_before_questions_or_writes(
+    tmp_path, monkeypatch, capsys, models_present,
+):
+    home = _local_setup_home(tmp_path, monkeypatch)
+    if models_present:
+        (home / "models").mkdir()
+    before = _home_snapshot(home)
+    monkeypatch.setattr(set_config, "check_llama_binary", lambda *_a:
+                        {"fit": True, "cache_ram": True})
+    monkeypatch.setattr(set_config, "detect_gpus", lambda: [
+        set_config.Gpu(0, "synthetic", 16384, 16384, "GPU-synthetic")])
+    monkeypatch.setattr(set_config, "_input", lambda *_a:
+                        pytest.fail("missing models reached a setup question"))
+    assert entry.main(["configure"]) == 2
+    output = capsys.readouterr().err
+    assert str(home / "models") in output
+    assert ("沒有任何 .gguf" if models_present else "找不到模型目錄") in output
+    assert "./scripts/configure-advanced.sh" in output and "選項 2（local）" in output
+    assert _home_snapshot(home) == before
+    assert set_config._COMMITTED is False
+
+
+def test_advanced_local_keeps_explicit_path_recovery_for_invalid_deployment(
+    tmp_path, monkeypatch, capsys,
+):
+    home = _local_setup_home(tmp_path, monkeypatch)
+    path = _local_deployment(home)
+    path.write_text("{broken")
+    before = _home_snapshot(home)
+    prompts, calls = [], []
+    _answers(monkeypatch, ["2", "/custom/models", "/custom/llama-server"], prompts.append)
+
+    def configure(args):
+        assert args.deployment_mode == "local" and args.prompt_compaction is True
+        assert args.models_dir == "/custom/models"
+        # The explicit answer can recover even while the saved document is invalid.
+        assert set_config._llama_bin(args.llama_bin, home) == Path("/custom/llama-server")
+        calls.append(args.llama_bin)
+        return 0
+
+    monkeypatch.setattr(set_config, "run", configure)
+    assert entry.main(["advanced"]) == 0
+    assert calls == ["/custom/llama-server"]
+    assert any("模型目錄" in prompt for prompt in prompts)
+    assert any("llama-server 執行檔" in prompt for prompt in prompts)
+    assert "請在下一題重新指定" in capsys.readouterr().out
+    assert _home_snapshot(home) == before
+    assert set_config._COMMITTED is False
 
 
 @pytest.mark.parametrize("kb_answer,kb_allowed", [("", False), ("n", False), ("y", True)])

@@ -212,7 +212,10 @@
 - `/copykey`——只接受不與 Textual 整條 binding chain 衝突的明列功能鍵；預設 F2，
   reset 回 F2。呼叫時重讀 owner-only client.json，只更新 copy_key，不覆蓋剛新增的 allow；
   保存成功才換鍵，失敗 UI 與舊鍵不變；舊鍵失效，忙碌／modal 仍可複製，Ctrl-C 取消不變。
-  頁尾常駐目前複製鍵與 /copykey 提示；無選取不清空剪貼簿，OSC52 不冒稱貼上成功。
+  滑鼠左鍵選取完成即自動複製，不顯示常駐提示或成功通知；手動複製鍵保留相容性。
+  自動複製須在元件完成選取後，以同一手勢／當前畫面／有效來源驗證；輸入框只取該
+  手勢的 editor，不取其他草稿或被遮住的畫面；程式更新、重播與捲動條不得觸發。
+  無選取不清空剪貼簿，OSC52 不冒稱貼上成功。
 - 啟動核心的設定來源——GPU、llama-server 路徑、tmux session 名、逾時與 rollback 只來自
   `deployment.json`、repo 常數與 argv;`~/start.sh` **不 export 也不 unset**，只接受
   無參數啟動或單一 `stop`，以固定 argv 呼叫啟動／停止核心；其他日常入口同樣

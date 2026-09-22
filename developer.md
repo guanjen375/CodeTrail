@@ -434,6 +434,11 @@ checkout 會對未知鍵 fail-loud,那是封閉 schema 的預期行為。
 `scripts/codetrail-device.sh`、`scripts/configure-advanced.sh` 均無參數；`~/start.sh` 只接受空 argv 與單一 `stop`。
 下列 Python argv 供維護、自動化與離線測試 harness 使用，不由 shell wrapper 透傳。
 
+日常 `./set_config.sh` 不詢問模型目錄與 binary 路徑：掃描 `~/models`，沿用
+`deployment.json` 的 `llama_bin`，未指定才用 `~/llama.cpp/build/bin/llama-server`。
+需要其他位置或修復不合法的 deployment 設定時，執行 `./scripts/configure-advanced.sh`
+並選 `2. local`，即可指定路徑並在確認後重建；日常入口遇到不可信設定會明確報錯。
+
 內部非互動設定入口是 `python3 scripts/set_config.py --yes`。它會跳過提問與確認頁，
 但**所有使用者選擇題的值必須由旗標提供，缺哪個就報錯**（保留值與 DSpark 的例外見下方）：
 
@@ -785,6 +790,8 @@ Session 與輸入歷史含完整問題及回答，落在專案外的 state 目�
 採用歷史的唯一可信讀取同時供模型歷史與原始畫面，失敗保留舊 session。
 `/copykey` 保存前重讀設定，只改 `copy_key`；合法鍵以明列集合檢查整條 Textual binding chain。
 動態派發不累加舊綁定，忙碌／modal 可複製，Ctrl-C 的取消仍獨立。
+滑鼠左鍵選取完成後自動複製，只接受仍有效的手勢來源畫面／輸入框；程式更新、重播、
+捲動條或被遮住的選取不能觸發。複製不顯示常駐提示或成功通知，手動複製鍵仍可使用。
 
 MCP SDK 不會在 read timeout／task cancel 自動送取消通知，客戶端自行配發 request id。
 Ctrl-C 與固定 660 秒 read timeout 都送取消；寬限期過則 SIGTERM 該 instance，所有進行中
@@ -1914,11 +1921,12 @@ explicit model/chat-template 與 non-blocking implicit routing，避免再把它
 
 ### SSH／tmux：已選取但本機貼不上
 
-先用滑鼠拖選，再按頁尾顯示的複製鍵（預設 **F2**，`/copykey` 可更換）；閒置主畫面也可按 **Ctrl+C**。回合、核准或審查進行中，
-Ctrl+C 仍是中斷。完整按鍵行為見[選取、複製與中斷](docs/usage.md#copy)。
+用滑鼠左鍵拖選，放開就會送出複製請求，不需按鍵。需要再次送出時，也可按手動複製鍵
+（預設 **F2**，`/copykey` 可更換）；閒置主畫面另可按 **Ctrl+C**。回合、核准或審查進行中，
+Ctrl+C 仍是中斷。完整操作見[選取、複製與中斷](docs/usage.md#copy)。
 
 CodeTrail 透過 Textual 向終端送出 OSC 52 複製請求，SSH 另一端的終端決定是否寫入
-本機剪貼簿；「已送出複製請求」不代表已確認本機貼上成功。請在你用來連線的終端
+本機剪貼簿，請以實際貼上結果確認。請在你用來連線的終端
 設定中確認 OSC 52／應用程式寫入剪貼簿的支援與權限。這條路徑不需要在遠端安裝
 `xclip`、`pbcopy`，也不需要 X11 forwarding。[Textual 複製介面](https://textual.textualize.io/api/app/#textual.app.App.copy_to_clipboard)
 有終端相容性限制；請以下面的實際貼上結果確認。

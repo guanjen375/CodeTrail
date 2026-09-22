@@ -219,14 +219,14 @@ def test_copy_key_owner_only_failures_preserve_file_and_active_key(ui, tmp_path,
     error = ui.dispatch("/copykey f4")
     assert isinstance(error, client_app.ErrorLine) and "/copykey" in error.message
     assert "目前仍使用 F3" in error.message and "已儲存" not in error.message
-    assert ui.app.copy_key == "f3" and "F3" in ui.app.copy_hint_text
+    assert ui.app.copy_key == "f3"
     assert preserved.read_bytes() == original
     assert preserved.stat().st_ino == before.st_ino
     assert preserved.stat().st_mtime_ns == before.st_mtime_ns
 
 
 def test_copy_key_switch_removes_old_dispatch_and_failed_save_keeps_previous_key(tmp_path, monkeypatch):
-    """真實按鍵分派、OSC52 與常駐提示必須一起切換，失敗時一起維持舊狀態。"""
+    """手動備用鍵與 OSC52 仍即時切換；改鍵不能重新掛出已移除的複製提示列。"""
     monkeypatch.setenv("HOME", str(tmp_path))
     engine = _Engine()
 
@@ -234,15 +234,13 @@ def test_copy_key_switch_removes_old_dispatch_and_failed_save_keeps_previous_key
         app = client_app.CodeTrailApp(engine)
         async with app.run_test(size=(100, 25)) as pilot:
             prompt = app.query_one("#prompt", client_app.PromptInput)
-            hint = app.query_one("#copy-hint", Static)
-            assert "拖曳選取" in hint.content.plain and "F2" in hint.content.plain
-            assert "/copykey" in hint.content.plain and hint.display and hint.region.height > 0
+            assert not app.query("#copy-hint")
             bindings = {key: list(values) for key, values in app._bindings.key_to_bindings.items()}
             writes = []
             monkeypatch.setattr(app._driver, "write", writes.append)
             for old, requested, new in (("f2", "F3", "f3"), ("f3", "f4", "f4"), ("f4", "reset", "f2")):
                 app._command(f"/copykey {requested}")
-                assert app.copy_key == new and new.upper() in hint.content.plain
+                assert app.copy_key == new and not app.query("#copy-hint")
                 assert client_config.load_client_settings().copy_key == new
                 prompt.text = "draft 中文"
                 prompt.selection = Selection((0, 0), (0, 8))
@@ -266,7 +264,7 @@ def test_copy_key_switch_removes_old_dispatch_and_failed_save_keeps_previous_key
                     raise OSError("disk write failed")
                 guard.setattr(client_config, "save_client_settings", cannot_write)
                 app._command("/copykey f5")
-                assert app.copy_key == "f2" and "F2" in hint.content.plain
+                assert app.copy_key == "f2" and not app.query("#copy-hint")
                 prompt.selection = Selection((0, 0), (0, 8))
                 app.copy_to_clipboard("unchanged")
                 await pilot.press("f5")

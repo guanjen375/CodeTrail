@@ -280,13 +280,19 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     ),
     "test_deployment_entrypoints.py": (
         "日常入口零參數且固定 dispatch；host 明確 LAN 同意與 live 身分，device 四端點與"
-        "KB 分別授權、交易失敗不留半套、啟動仍保留原專案 cwd",
+        "KB 分別授權、交易失敗不留半套、啟動仍保留原專案 cwd；日常預設保留保存 binary，"
+        "無效來源與取消不寫設定，附加修復入口仍可明確指定路徑",
         (
             "test_public_entrypoints_reject_argv_before_python_or_writes",
             "test_deployment_wrappers_follow_symlinks_and_keep_cwd",
             "test_start_wrapper_only_dispatches_empty_or_exact_stop",
             "test_start_wrapper_pins_source_identity_and_quotes_checkout_paths",
             "test_daily_local_route_warns_conversion_and_keeps_cancelled_settings",
+            "test_daily_local_uses_canonical_paths_and_cancellation_preserves_files",
+            "test_daily_local_invalid_deployment_fails_with_recovery_hint_without_writes",
+            "test_daily_local_rejects_invalid_saved_binary_without_fallback_or_writes",
+            "test_daily_local_missing_models_fail_before_questions_or_writes",
+            "test_advanced_local_keeps_explicit_path_recovery_for_invalid_deployment",
             "test_device_displays_four_destinations_and_separate_kb_consent",
             "test_device_without_affirmative_endpoint_consent_never_writes_or_starts",
             "test_client_setup_invalid_manifest_and_failed_transaction_leave_no_partial_configuration",
@@ -1284,6 +1290,25 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_copy_key_owner_only_failures_preserve_file_and_active_key",
             "test_copy_key_switch_removes_old_dispatch_and_failed_save_keeps_previous_key",
             "test_copy_key_changed_key_works_during_turn_and_modal_without_stealing_ctrl_c",
+        ),
+    ),
+    "test_client_auto_copy.py": (
+        "自動複製只接受完成的真實左鍵手勢，等目標 MouseUp／Click handler 完成才讀取；"
+        "保留 native 捲動與容器選取，排除舊事件、失效畫面、隱藏文字、控制操作與其他草稿，"
+        "每次手勢只送一次非空 OSC52；放開後移動不得漏複製，既有 Textual 8 安裝仍可使用，"
+        "複製不顯示提示，核准／取消／session 不受影響",
+        (
+            "test_auto_copy_raw_drag_preserves_text_and_sends_one_request_per_gesture",
+            "test_auto_copy_double_and_triple_click_follow_target_handler",
+            "test_auto_copy_container_drag_uses_final_native_selection_after_scroll",
+            "test_auto_copy_ignores_non_selection_events_and_lost_mouse_moves",
+            "test_auto_copy_control_gestures_do_not_copy_existing_selection",
+            "test_auto_copy_reads_only_originating_editor_without_focus_fallback",
+            "test_auto_copy_invalidated_source_cannot_finish_old_gesture",
+            "test_auto_copy_old_queued_bubbles_cannot_finish_new_gesture",
+            "test_auto_copy_during_turn_and_approval_preserves_session_and_controls",
+            "test_auto_copy_supports_legacy_textual8_without_selectstart_import",
+            "test_auto_copy_released_gesture_survives_queued_hover_key_and_paste",
         ),
     ),
     "test_client_app_selection.py": (

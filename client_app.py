@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """client_app — `aicode` 的全螢幕終端介面(Textual)。
 
-版面刻意只有**一條對話流**、底部輸入框、狀態列與複製提示。沒有側欄、沒有
+版面刻意只有**一條對話流**、底部輸入框與狀態列。沒有側欄、沒有
 分頁——這個工具的使用情境是 SSH 進一台機器問一個 repo,多出來的每一塊都是
 要維護的東西。
 
@@ -43,8 +43,9 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.geometry import Offset
 from textual.message import Message
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
 from textual.widgets import Button, Collapsible, Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
@@ -104,7 +105,8 @@ HELP_TAIL = (
     "其他輸入一律當成問題送給模型。\n"
     "Enter 送出、Alt+Enter 換行、↑/↓ 翻輸入歷史。\n"
     "忙碌時 Enter 選擇排到下一輪或補充目前任務;未送訊息用 /queue 查看。\n"
-    "滑鼠拖曳選取後按 {copy_key} 複製（/copykey 修改）;閒置主畫面也可用 Ctrl-C 複製選取。\n"
+    "滑鼠左鍵拖曳選取，放開即複製；雙擊／三擊完成文字選取也會複製，並保留反白。\n"
+    "手動備用鍵：{copy_key}（/copykey 修改）；閒置主畫面也可用 Ctrl-C 複製選取。\n"
     "回合／核准／審查中 Ctrl-C 仍中斷整輪;閒置且沒有選取時連按兩次 Ctrl-C 或 Ctrl-D 離開。\n"
     "複製需終端允許 OSC 52;有用 tmux 時需 set -s set-clipboard on，並支援 Ms。"
 )
@@ -860,6 +862,21 @@ class PromptInput(TextArea):
 # ============================================================
 # App
 # ============================================================
+@dataclass
+class _CopyGesture:
+    """Only a raw left-button gesture may authorize an automatic clipboard write."""
+
+    screen: Screen
+    source: Widget
+    session_id: str
+    start: Offset
+    container_start: bool = False
+    moved: bool = False
+    release: events.MouseUp | None = None
+    release_started: float = 0.0
+    release_finished: float = 0.0
+
+
 class CodeTrailApp(App[int]):
     """`aicode` 的介面。"""
 
@@ -876,7 +893,6 @@ class CodeTrailApp(App[int]):
     #completions { height: auto; max-height: 8; padding: 0 1; color: $text-muted; }
     #prompt { height: auto; max-height: 10; border: round $primary; }
     #status { height: 1; padding: 0 1; background: $panel; color: $text-muted; }
-    #copy-hint { height: auto; padding: 0 1; color: $text-muted; }
     #approval {
         width: 90%; height: 80%; border: thick $warning; background: $surface; padding: 1 2;
     }
@@ -932,6 +948,7 @@ class CodeTrailApp(App[int]):
         self.show_reasoning = bool(show_reasoning)
         self.keep_historical_reasoning = bool(keep_historical_reasoning)
         self.copy_key = client_config.validate_copy_key(copy_key)
+        self._copy_gesture: _CopyGesture | None = None
         self.coordinator = client_turns.TurnCoordinator(
             engine,
             emit=self._emit_from_worker,
@@ -979,11 +996,132 @@ class CodeTrailApp(App[int]):
         yield Static("", id="completions")
         yield PromptInput(id="prompt")
         yield Static("", id="status")
-        yield Static(Text(self.copy_hint_text), id="copy-hint")
 
-    @property
-    def copy_hint_text(self) -> str:
-        return f"滑鼠拖曳選取後按 {self.copy_key.upper()} 複製 · /copykey 修改"
+    def _discard_auto_copy(self, _screen: Screen | None = None) -> None:
+        self._copy_gesture = None
+
+    def _copy_source_visible(self, widget: Widget, screen: Screen) -> bool:
+        # Screen.get_selected_text() only checks attachment; hidden old streams
+        # and collapsed children can otherwise still contribute invisible text.
+        return (
+            screen is self.screen
+            and widget.is_attached
+            and widget.screen is screen
+            and all(node.display and node.visible and not node._pruning
+                    for node in widget.ancestors_with_self if isinstance(node, Widget))
+        )
+
+    def _copy_gesture_current(self, gesture: _CopyGesture) -> bool:
+        return (
+            gesture is self._copy_gesture
+            and gesture.session_id == self.engine.session_id
+            and self._copy_source_visible(gesture.source, gesture.screen)
+        )
+
+    async def on_event(self, event: events.Event) -> None:
+        raw = not event.is_forwarded
+        if raw and isinstance(event, (events.Key, events.Paste)):
+            if self._copy_gesture is not None and self._copy_gesture.release is None:
+                self._discard_auto_copy()
+        if raw and isinstance(event, events.MouseDown):
+            self._discard_auto_copy()
+            screen = self.screen
+            source, _offset = screen.get_widget_and_offset_at(event.x, event.y)
+            if (event.button == 1 and self.mouse_captured is None
+                    and self.ALLOW_SELECT and screen.allow_select
+                    and source is not None and source.allow_select
+                    and self._copy_source_visible(source, screen)):
+                # The public API clears both the old selection and its native
+                # start/end on every supported Textual 8 version. A blank start
+                # or a lost MouseMove can no longer reuse an earlier selection.
+                screen.clear_selection()
+                self._copy_gesture = _CopyGesture(
+                    screen, source, self.engine.session_id, event.screen_offset,
+                    container_start=_offset is None,
+                )
+
+        gesture = self._copy_gesture
+        if raw and isinstance(event, events.MouseEvent) and gesture is not None:
+            if not self._copy_gesture_current(gesture):
+                self._discard_auto_copy()
+            elif isinstance(event, events.MouseUp):
+                if event.button != 1 or gesture.release is not None:
+                    self._discard_auto_copy()
+                else:
+                    gesture.release = event
+                    # Textual clones events while forwarding; raw event.time may
+                    # predate several queued gestures. Use its own clock around
+                    # this dispatch to identify only this release and its Click.
+                    gesture.release_started = events.Event().time
+            elif (isinstance(event, events.MouseMove) and event.button != 1
+                    and gesture.release is None):
+                self._discard_auto_copy()
+
+        # Dispatch exactly once. A raw release merely queues widget handlers;
+        # the clipboard write belongs to their later bubbled MouseUp / Click.
+        await super().on_event(event)
+
+        if raw and gesture is not None and self._copy_gesture_current(gesture):
+            if isinstance(event, events.MouseUp) and gesture.release is event:
+                gesture.release_finished = events.Event().time
+            elif (isinstance(event, events.MouseMove) and gesture.release is None
+                    and event.screen_offset != gesture.start):
+                # Read the final native selection only after the target handler.
+                # Auto-scroll may still extend it without another MouseMove.
+                gesture.moved = True
+
+    def _copy_release_matches(self, event: events.MouseEvent) -> bool:
+        gesture = self._copy_gesture
+        return bool(
+            gesture is not None and self._copy_gesture_current(gesture)
+            and event.is_forwarded and event.button == 1
+            and gesture.release is not None
+            and event.screen_offset == gesture.release.screen_offset
+            and (event is gesture.release
+                 or gesture.release_started <= event.time <= gesture.release_finished)
+        )
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if not self._copy_release_matches(event):
+            return
+        gesture = self._copy_gesture
+        assert gesture is not None and gesture.release is not None
+        if gesture.moved:
+            self._copy_after_gesture(gesture, dragged=True)
+            self._discard_auto_copy()
+        elif gesture.release.screen_offset != gesture.start:
+            self._discard_auto_copy()
+        # Same-position releases wait for Click: double/triple selection has
+        # not happened yet. A refresh callback cannot order that widget task.
+
+    def on_click(self, event: events.Click) -> None:
+        if not self._copy_release_matches(event):
+            return
+        gesture = self._copy_gesture
+        assert gesture is not None
+        if event.chain >= 2 and event.widget is gesture.source:
+            self._copy_after_gesture(gesture, dragged=False)
+        self._discard_auto_copy()
+
+    def _copy_after_gesture(self, gesture: _CopyGesture, *, dragged: bool) -> None:
+        if isinstance(gesture.source, TextArea):
+            # Never use a focused editor or a Screen selection as a fallback.
+            text = gesture.source.selected_text
+        else:
+            selections = gesture.screen.selections
+            if gesture.source not in selections and not (
+                dragged and gesture.container_start
+                and any(gesture.source in widget.ancestors for widget in selections)
+            ):
+                return
+            parts: list[str] = []
+            for widget, selection in selections.items():
+                if (widget.allow_select and self._copy_source_visible(widget, gesture.screen)
+                        and (selected := widget.get_selection(selection)) is not None):
+                    parts.extend(selected)
+            text = "".join(parts).rstrip("\n")
+        if text:
+            self._send_copy_request(text)
 
     async def _check_bindings(self, key: str, priority: bool = False) -> bool:
         # Textual 在把按鍵送往 focused widget／modal 前，先檢查 App priority。
@@ -995,6 +1133,7 @@ class CodeTrailApp(App[int]):
 
     def on_mount(self) -> None:
         self._ui_thread_id = threading.get_ident()
+        self.screen_change_signal.subscribe(self, self._discard_auto_copy, immediate=True)
         # MCP 的一次性警告(例如 stderr 落檔的 NDA 提醒)不得直接印:畫面已經被
         # 接管。重新 spawn 會在回合進行中再跑一次,所以要走搬運到 UI 執行緒那條路。
         mcp = getattr(self.engine, "mcp", None)
@@ -1083,6 +1222,7 @@ class CodeTrailApp(App[int]):
     def _mount_history(self, widgets: Sequence[Widget], *, clear: bool) -> None:
         log = self.query_one("#log", VerticalScroll)
         if clear:
+            self._discard_auto_copy()
             log.remove_children()
         if widgets:
             log.mount(*widgets)
@@ -1526,8 +1666,6 @@ class CodeTrailApp(App[int]):
             self._append(ErrorLine(f"/copykey: {exc}；目前仍使用 {self.copy_key.upper()}。"))
             return
         self.copy_key = settings.copy_key
-        if self.is_running:
-            self.query_one("#copy-hint", Static).update(Text(self.copy_hint_text))
         saved = f"已儲存至 {settings.path}" if changed else "設定未變更，未寫入檔案"
         self._append(NoticeLine(f"複製鍵：{self.copy_key.upper()}；立即生效。{saved}。"))
 
@@ -1814,10 +1952,12 @@ class CodeTrailApp(App[int]):
             text = self.screen.focused.selected_text
         if not text:
             return False
+        self._send_copy_request(text)
+        return True
+
+    def _send_copy_request(self, text: str) -> None:
         self.copy_to_clipboard(text)
         self._last_interrupt = 0.0
-        self.notify("已送出複製請求；若貼不上，請確認終端 OSC 52／tmux 設定。", timeout=3)
-        return True
 
     def action_copy_selection(self) -> None:
         """專用按鍵在忙碌／核准中也只複製，沒有選取不得清空剪貼簿。"""
