@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """client_app — `aicode` 的全螢幕終端介面(Textual)。
 
-版面刻意只有三塊:**一條對話流**、底部輸入框、一行狀態列。沒有側欄、沒有
+版面刻意只有**一條對話流**、底部輸入框、狀態列與複製提示。沒有側欄、沒有
 分頁——這個工具的使用情境是 SSH 進一台機器問一個 repo,多出來的每一塊都是
 要維護的東西。
 
@@ -87,6 +87,7 @@ INCOMPLETE_ANSWER_NOTE = "上面這一則沒有完成(被截斷或出錯),不是
 COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "這份說明"),
     ("/allow", "命令白名單:list / add <絕對目錄>"),
+    ("/copykey", "複製快捷鍵:/copykey <按鍵>，reset 回預設 F2"),
     ("/new", "開一個新對話"),
     ("/session", "選一個既有對話切換(/session <id> 直接指定)"),
     ("/compact", "立刻壓縮目前對話"),
@@ -103,7 +104,7 @@ HELP_TAIL = (
     "其他輸入一律當成問題送給模型。\n"
     "Enter 送出、Alt+Enter 換行、↑/↓ 翻輸入歷史。\n"
     "忙碌時 Enter 選擇排到下一輪或補充目前任務;未送訊息用 /queue 查看。\n"
-    "滑鼠拖曳選取後按 F2 複製;閒置主畫面也可用 Ctrl-C 複製選取。\n"
+    "滑鼠拖曳選取後按 {copy_key} 複製（/copykey 修改）;閒置主畫面也可用 Ctrl-C 複製選取。\n"
     "回合／核准／審查中 Ctrl-C 仍中斷整輪;閒置且沒有選取時連按兩次 Ctrl-C 或 Ctrl-D 離開。\n"
     "複製需終端允許 OSC 52;有用 tmux 時需 set -s set-clipboard on，並支援 Ms。"
 )
@@ -875,6 +876,7 @@ class CodeTrailApp(App[int]):
     #completions { height: auto; max-height: 8; padding: 0 1; color: $text-muted; }
     #prompt { height: auto; max-height: 10; border: round $primary; }
     #status { height: 1; padding: 0 1; background: $panel; color: $text-muted; }
+    #copy-hint { height: auto; padding: 0 1; color: $text-muted; }
     #approval {
         width: 90%; height: 80%; border: thick $warning; background: $surface; padding: 1 2;
     }
@@ -904,9 +906,7 @@ class CodeTrailApp(App[int]):
 
     BINDINGS = [
         # priority 保留忙碌／核准時的中斷；閒置才由 action_interrupt 分流複製。
-        # F2 在 modal 中也可複製，不占用 TextArea 的 Ctrl-Y redo。
         Binding("ctrl+c", "interrupt", "中斷", priority=True, show=False),
-        Binding("f2", "copy_selection", "複製選取", priority=True, show=False),
         Binding("ctrl+d", "leave", "離開", priority=True, show=False),
     ]
 
@@ -919,6 +919,7 @@ class CodeTrailApp(App[int]):
         state_dir: Path | None = None,
         show_reasoning: bool = False,
         keep_historical_reasoning: bool = False,
+        copy_key: str = client_config.DEFAULT_COPY_KEY,
     ) -> None:
         super().__init__()
         self.engine = engine
@@ -930,6 +931,7 @@ class CodeTrailApp(App[int]):
         self.state_dir = state_dir
         self.show_reasoning = bool(show_reasoning)
         self.keep_historical_reasoning = bool(keep_historical_reasoning)
+        self.copy_key = client_config.validate_copy_key(copy_key)
         self.coordinator = client_turns.TurnCoordinator(
             engine,
             emit=self._emit_from_worker,
@@ -977,6 +979,19 @@ class CodeTrailApp(App[int]):
         yield Static("", id="completions")
         yield PromptInput(id="prompt")
         yield Static("", id="status")
+        yield Static(Text(self.copy_hint_text), id="copy-hint")
+
+    @property
+    def copy_hint_text(self) -> str:
+        return f"滑鼠拖曳選取後按 {self.copy_key.upper()} 複製 · /copykey 修改"
+
+    async def _check_bindings(self, key: str, priority: bool = False) -> bool:
+        # Textual 在把按鍵送往 focused widget／modal 前，先檢查 App priority。
+        # 單一動態分派不呼叫 bind()，因此改鍵不會累加舊綁定或吃掉 Ctrl-C。
+        if priority and key == self.copy_key:
+            self.action_copy_selection()
+            return True
+        return await super()._check_bindings(key, priority=priority)
 
     def on_mount(self) -> None:
         self._ui_thread_id = threading.get_ident()
@@ -1490,7 +1505,31 @@ class CodeTrailApp(App[int]):
 
     def _cmd_help(self, _argument: str) -> None:
         lines = [f"  {name:<11}{description}" for name, description in COMMANDS]
-        self._append(NoticeLine("指令:\n" + "\n".join(lines) + "\n" + HELP_TAIL))
+        tail = HELP_TAIL.format(copy_key=self.copy_key.upper())
+        self._append(NoticeLine("指令:\n" + "\n".join(lines) + "\n" + tail))
+
+    def _cmd_copykey(self, argument: str) -> None:
+        """即時更換純 UI 按鍵；寫檔失敗時不改目前分派或提示。"""
+        if not argument:
+            allowed = " / ".join(key.upper() for key in client_config.COPY_KEY_VALUES)
+            self._append(NoticeLine(
+                f"目前複製鍵：{self.copy_key.upper()}。\n"
+                f"用法：/copykey <按鍵> | /copykey reset（預設 F2）；可用：{allowed}。"
+            ))
+            return
+        key = argument.lower()
+        if key == "reset":
+            key = client_config.DEFAULT_COPY_KEY
+        try:
+            settings, changed = client_config.update_copy_key(key)
+        except (client_config.ClientConfigError, OSError) as exc:
+            self._append(ErrorLine(f"/copykey: {exc}；目前仍使用 {self.copy_key.upper()}。"))
+            return
+        self.copy_key = settings.copy_key
+        if self.is_running:
+            self.query_one("#copy-hint", Static).update(Text(self.copy_hint_text))
+        saved = f"已儲存至 {settings.path}" if changed else "設定未變更，未寫入檔案"
+        self._append(NoticeLine(f"複製鍵：{self.copy_key.upper()}；立即生效。{saved}。"))
 
     def _cmd_allow(self, argument: str) -> None:
         """本地新增工具目錄；MCP 每次執行重新讀取授權，聊天 policy 保持原樣。"""
@@ -1781,7 +1820,7 @@ class CodeTrailApp(App[int]):
         return True
 
     def action_copy_selection(self) -> None:
-        """F2 在忙碌／核准中也只複製，沒有選取不得清空剪貼簿。"""
+        """專用按鍵在忙碌／核准中也只複製，沒有選取不得清空剪貼簿。"""
         if not self._copy_selection():
             self.notify("請先用滑鼠拖曳選取文字，或選取輸入框文字。", timeout=3)
 

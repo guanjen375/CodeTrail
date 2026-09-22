@@ -324,7 +324,7 @@ FIGURE_EXTRACT_RETRIES = _figure_int("FIGURE_EXTRACT_RETRIES", 1, lo=0, hi=5)
 # 重複、把整個 context 生滿」的最壞情況。
 FIGURE_VL_MAX_TOKENS_CEILING = _figure_int(
     "FIGURE_VL_MAX_TOKENS_CEILING", 8192, lo=1)
-# review artifacts(可能含 NDA 內容,見 docs/rag.md 的保存與清除說明)
+# review artifacts(可能含 NDA 內容,見 developer.md#review-artifacts 的保存與清除說明)
 FIGURE_REVIEW_DIR = ".codetrail/figures"
 FIGURE_REVIEW_MAX_RUNS_PER_DOC = _figure_int(
     "FIGURE_REVIEW_MAX_RUNS_PER_DOC", 5, lo=1)
@@ -430,7 +430,7 @@ if not 0 < CLIENT_MAX_OUTPUT_TOKENS <= CLIENT_MAX_OUTPUT_TOKENS_CAP:  # pragma: 
 # headless `run` 沒有呼叫點,readonly session 在任何 I/O 之前就被 client_engine 拒絕。
 # 它縮短不了 reasoning 與硬體 prefill 的成本,只是把「下一輪 prefix」的那一段提前算。
 # 是 repo 常數而不是 client.json 的鍵:所有使用者一致;要關就是改這裡(見
-# `docs/troubleshooting.md` 的判讀方式)。
+# `developer.md#troubleshooting` 的判讀方式)。
 CLIENT_PRIME_PROMPT_CACHE = True
 
 # 客戶端每輪的搜尋收斂邊界。宣告額度包含無效/被拒呼叫,所以真正送 MCP 的次數
@@ -984,7 +984,7 @@ STRICT_MODE_TEMPERATURE = 0.0        # 嚴格模式下溫度壓到最低
 #
 # 注意:這只影響 CodeTrail internal calls。聊天客戶端的取樣值由 client_engine 每次
 # 請求明示送出(CHAT_TOP_P / CHAT_TOP_K / CHAT_MIN_P);不經客戶端的直接呼叫才吃 server 預設
-# (見 README §3.1 與 docs/troubleshooting.md「模型編造不存在的具體事實」)。
+# (見 README.md#configure 與 developer.md#model-grounding「模型編造不存在的具體事實」)。
 CHAT_TOP_P = 0.95
 CHAT_TOP_K = 20
 CHAT_MIN_P = 0.0

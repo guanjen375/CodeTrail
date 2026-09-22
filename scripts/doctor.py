@@ -1139,7 +1139,7 @@ def check_incidents(r: Result) -> None:
             "(最近 7 天沒有新的)"
         )
     elif recent:
-        r.warn(f"{line} — 看 docs/troubleshooting.md「MCP lease 與 incident」判斷是哪一層脫落")
+        r.warn(f"{line} — 看 developer.md#mcp-incidents「MCP lease 與 incident」判斷是哪一層脫落")
     else:
         r.info(f"{line}")
 
@@ -1181,12 +1181,16 @@ def check_compaction_mode(r: Result, project: Path | None = None) -> None:
     try:
         settings = client_config.load_client_settings()
     except Exception as exc:  # noqa: BLE001
-        r.fail(f"client.json 不可信:{exc};重跑 ./set_config.sh 重新選一次")
+        r.fail(
+            f"client.json 不可信:{exc};請先修復擁有者、權限、連結或 JSON 格式問題，"
+            '再將 "compaction_mode" 設為 "codetrail"、"manual" 或 "off"；重啟 aicode 後生效。'
+        )
         return
     if not settings.present:
         r.info(
             f"壓縮模式:未設定(沒有 {settings.path};客戶端退成 manual)。"
-            "要自動壓縮請重跑 ./set_config.sh"
+            '壓縮設定在 client.json 的 "compaction_mode"：自動壓縮設 "codetrail"、'
+            '手動設 "manual"、關閉設 "off"；設定方式見 docs/compaction-rules.md，重啟 aicode 後生效。'
         )
         return
     mode = settings.compaction_mode

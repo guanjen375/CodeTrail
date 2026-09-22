@@ -73,6 +73,69 @@ def test_no_readme_drift():
     assert not issues, "README/docs drift:\n" + "\n".join(f"  - {i}" for i in issues)
 
 
+@pytest.mark.smoke
+def test_documentation_sources_include_all_primary_and_runtime_documents(monkeypatch):
+    """搬到根目錄的維運文件仍受合併及逐檔 gate 保護，不能因搬檔漏掃。"""
+    from scripts import check_readme_consistency as checker
+
+    required = {
+        "README.md", "developer.md", "docs/usage.md", "docs/mcp-tools.md",
+        "docs/compaction-rules.md",
+    }
+    sources = dict(checker._stale_doc_sources())
+    assert required <= sources.keys()
+    assert all((REPO_ROOT / name).is_file() and sources[name] for name in required)
+
+    original_read = checker._read
+    markers = {REPO_ROOT / name: f"documentation-source:{name}" for name in required}
+
+    def tagged_read(path):
+        text = original_read(path)
+        marker = markers.get(path)
+        if marker is not None:
+            text += "\n" + marker
+        if path == checker.DEVELOPER:
+            text += "\n--compaction-mode native\n"
+        return text
+
+    monkeypatch.setattr(checker, "_read", tagged_read)
+    combined = checker._documentation_text()
+    assert all(marker in combined for marker in markers.values())
+    issues = []
+    checker._check_stale_docs_per_file(issues)
+    assert any(issue.startswith("developer.md:") and "compaction-mode" in issue for issue in issues)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("section", ["security", "troubleshooting"])
+def test_developer_contract_sections_are_checked_independently(monkeypatch, section):
+    """相同 timeout 句在另一章完整存在，也不能掩蓋本章的否定或章名缺失。"""
+    from scripts import check_readme_consistency as checker
+
+    text = checker._read(checker.DEVELOPER)
+    heading = checker.SECURITY_HEADING if section == "security" else checker.TROUBLESHOOTING_HEADING
+    artifact = checker.SECURITY_ARTIFACT if section == "security" else checker.TROUBLESHOOTING_ARTIFACT
+    other_heading = checker.TROUBLESHOOTING_HEADING if section == "security" else checker.SECURITY_HEADING
+    scoped = checker._markdown_section(text, heading)
+    other = checker._markdown_section(text, other_heading)
+    assert scoped is not None and other is not None and scoped != other
+    assert _TIMEOUT_SENTENCE in scoped and _TIMEOUT_SENTENCE in other
+    original_read = checker._read
+
+    for replacement in (
+        scoped.replace(_TIMEOUT_SENTENCE, "不保證 " + _TIMEOUT_SENTENCE),
+        scoped.replace(heading, heading + "（章名漂移）", 1),
+        scoped + "\n" + scoped,
+    ):
+        changed = text.replace(scoped, replacement, 1)
+        monkeypatch.setattr(
+            checker, "_read",
+            lambda path, changed=changed: changed if path == checker.DEVELOPER else original_read(path),
+        )
+        issues = checker.check_all()
+        assert issues and all(issue.startswith(artifact + ":") for issue in issues), issues
+
+
 def test_mcp_tool_names_extraction_works_on_a_known_pattern():
     sample = """
 @mcp.tool()
@@ -519,10 +582,10 @@ def test_apply_patch_limits_contract_passes_when_every_surface_agrees():
          "udiff 單檔 payload budget = SEARCH 行數 + REPLACE 行數（同檔所有區塊合計）≤ 200；S/R 單檔 200 行（added+removed）", "docs/mcp-tools.md"),
         ("mcp_tools_doc", "；S/R 單檔 payload budget = SEARCH 行數 + REPLACE 行數（同檔所有區塊合計）≤ 200", "", "docs/mcp-tools.md"),
         ("mcp_tools_doc", "全部通過才顯示唯一的一行 `would apply`", "不保證 `would apply`", "docs/mcp-tools.md dry_run"),
-        # docs/troubleshooting.md
-        ("troubleshooting", "#### unified diff 被拒絕", "#### diff 被拒絕", "docs/troubleshooting.md"),
-        ("troubleshooting", "整份 patch 拒絕、零寫入", "只拒絕該檔", "docs/troubleshooting.md"),
-        ("troubleshooting", "一次改超過 5 個檔案或單檔 200 行也會被拒", "一次改超過 5 個檔案或單檔 999 行也會被拒", "docs/troubleshooting.md"),
+        # developer.md#troubleshooting
+        ("troubleshooting", "#### unified diff 被拒絕", "#### diff 被拒絕", "developer.md#troubleshooting"),
+        ("troubleshooting", "整份 patch 拒絕、零寫入", "只拒絕該檔", "developer.md#troubleshooting"),
+        ("troubleshooting", "一次改超過 5 個檔案或單檔 200 行也會被拒", "一次改超過 5 個檔案或單檔 999 行也會被拒", "developer.md#troubleshooting"),
     ],
 )
 def test_apply_patch_limits_contract_reports_the_single_drifting_surface(surface, before, after, artifact):
@@ -549,8 +612,8 @@ def test_run_command_timeout_contract_passes_when_every_surface_agrees():
         ("agent_tools", 'f"超時秒數,{RUN_COMMAND_TIMEOUT_MIN}..{RUN_COMMAND_TIMEOUT_MAX},"', 'f"超時秒數,"', "_RUN_COMMAND_TOOL.timeout.description"),
         ("readme", _TIMEOUT_SENTENCE, "timeout：server 不接受 1..600 秒", "README.md"),
         ("mcp_tools_doc", _TIMEOUT_SENTENCE, "timeout 只接受整數 1..900 秒（server 端上限；client 可能更早截止）", "docs/mcp-tools.md"),
-        ("security", _TIMEOUT_SENTENCE, "server 不接受 1..600 秒", "docs/security.md"),
-        ("troubleshooting", "。" + _TIMEOUT_SENTENCE, "。我們不能保證 " + _TIMEOUT_SENTENCE, "docs/troubleshooting.md"),
+        ("security", _TIMEOUT_SENTENCE, "server 不接受 1..600 秒", "developer.md#security"),
+        ("troubleshooting", "。" + _TIMEOUT_SENTENCE, "。我們不能保證 " + _TIMEOUT_SENTENCE, "developer.md#troubleshooting"),
     ],
 )
 def test_run_command_timeout_contract_reports_the_single_drifting_surface(surface, before, after, artifact):
@@ -586,8 +649,8 @@ def test_verification_layer_claims_pass_and_tolerate_correct_negations():
         ("agent_tools", "\"套用後只做唯讀 syntax check(advisory,不回滾);", "\"不能保證套用後只做唯讀 syntax check(advisory,不回滾);", "_APPLY_PATCH_TOOL.description"),
         ("mcp_tools_doc", "。apply_patch 不會自動執行 lint / typecheck / test", "。不能保證 apply_patch 不會自動執行 lint / typecheck / test", "docs/mcp-tools.md"),
         ("mcp_tools_doc", "apply_patch 不會自動執行 lint / typecheck / test", "apply_patch 會自動執行 lint / typecheck / test", "docs/mcp-tools.md"),
-        ("security", "這是**三個不同的 ask**", "並不是三個不同的 ask", "docs/security.md"),
-        ("troubleshooting", "「驗證不完整」或「驗證未通過」**不是拒絕**", "「驗證不完整」或「驗證未通過」**是拒絕**", "docs/troubleshooting.md"),
+        ("security", "這是**三個不同的 ask**", "並不是三個不同的 ask", "developer.md#security"),
+        ("troubleshooting", "「驗證不完整」或「驗證未通過」**不是拒絕**", "「驗證不完整」或「驗證未通過」**是拒絕**", "developer.md#troubleshooting"),
     ],
 )
 def test_verification_layer_claims_report_each_reversed_contract(surface, before, after, artifact):
@@ -661,7 +724,7 @@ _PREFIX_NEGATION_CASES = [
     ("limits", "agent_tools", '"dry_run=true 時只做 preflight,', '"不保證 dry_run=true 時只做 preflight,', "_APPLY_PATCH_TOOL.description dry_run"),
     ("limits", "agent_tools", '"若為 true,只做 preflight 並逐檔回報', '"若為 true,不保證只做 preflight 並逐檔回報', "_APPLY_PATCH_TOOL.dry_run.description"),
     ("limits", "mcp_tools_doc", "零副作用，逐檔固定回報 `format`", "零副作用，不保證逐檔固定回報 `format`", "docs/mcp-tools.md dry_run"),
-    ("limits", "troubleshooting", "——這些都是整份 patch 拒絕、零寫入", "——並非這些都是整份 patch 拒絕、零寫入", "docs/troubleshooting.md"),
+    ("limits", "troubleshooting", "——這些都是整份 patch 拒絕、零寫入", "——並非這些都是整份 patch 拒絕、零寫入", "developer.md#troubleshooting"),
     ("verification", "mcp", "失敗**不回滾**", "並非失敗**不回滾**", "mcp_server.apply_patch docstring"),
     ("verification", "mcp", "結果會明說「patch 已套用、未回滾」", "結果不會明說「patch 已套用、未回滾」", "mcp_server.apply_patch docstring"),
     ("verification", "mcp", "——請另行呼叫 `run_lint(fix=False)`", "——不必遵守「請另行呼叫 `run_lint(fix=False)`」", "mcp_server.apply_patch docstring"),
@@ -708,10 +771,14 @@ def test_public_tool_order_and_the_base_rules_budget():
 @pytest.mark.smoke
 def test_result_budget_and_status_lane_docs_match_the_runtime_contract():
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    basic = (REPO_ROOT / "docs/basic-usage.md").read_text(encoding="utf-8")
-    troubleshooting = (REPO_ROOT / "docs/troubleshooting.md").read_text(
-        encoding="utf-8"
+    basic = (REPO_ROOT / "docs/usage.md").read_text(encoding="utf-8")
+    from scripts import check_readme_consistency as checker
+
+    troubleshooting = checker._markdown_section(
+        (REPO_ROOT / "developer.md").read_text(encoding="utf-8"),
+        checker.TROUBLESHOOTING_HEADING,
     )
+    assert troubleshooting is not None
     mcp_doc = (REPO_ROOT / "docs/mcp-tools.md").read_text(encoding="utf-8")
     joined = "\n".join((readme, basic, troubleshooting, mcp_doc))
 
@@ -719,7 +786,7 @@ def test_result_budget_and_status_lane_docs_match_the_runtime_contract():
     assert "status: ok|partial|error" in basic
     assert "status: ok|partial|error" in mcp_doc
     assert "n_ctx" in joined and "12%" in joined and "context_risk" in joined
-    assert "call-time `config.N_CTX`" in (REPO_ROOT / "README_DEV.md").read_text(
+    assert "call-time `config.N_CTX`" in (REPO_ROOT / "developer.md").read_text(
         encoding="utf-8"
     )
     assert not re.search(
@@ -734,7 +801,7 @@ def test_result_budget_and_status_lane_docs_match_the_runtime_contract():
 @pytest.mark.smoke
 def test_routing_eval_docs_require_measured_client_support():
     """現行客戶端未量到 routing 指標前,文件與 matrix 都不得宣稱支援。"""
-    developer = (REPO_ROOT / "README_DEV.md").read_text(encoding="utf-8")
+    developer = (REPO_ROOT / "developer.md").read_text(encoding="utf-8")
     matrix = json.loads((REPO_ROOT / "eval/fixtures/tool_routing/support_matrix.json").read_text(encoding="utf-8"))
     for contract in ("--catalog-only", "--catalog-source in-process", "manual_status_change_required=true",
                      "不能把 `measured` 改寫成 `supported`", "`--arm` 只選擇／記錄 arm id",
@@ -963,6 +1030,7 @@ def test_removed_daily_cli_commands_are_rejected_by_both_doc_gates():
         "~/start.sh stop --force", "aicode -c", "aicode --session abc",
         "./set_config.sh --yes", "scripts/codetrail-host.sh --help",
         "scripts/codetrail-device.sh --mode client",
+        "scripts/configure-advanced.sh --restore",
     )
     for command in removed:
         issues: list[str] = []
@@ -972,6 +1040,7 @@ def test_removed_daily_cli_commands_are_rejected_by_both_doc_gates():
     for command in (
         "~/start.sh", "~/start.sh stop", "aicode", "./set_config.sh",
         "scripts/codetrail-host.sh", "scripts/codetrail-device.sh",
+        "scripts/configure-advanced.sh",
         "python3 scripts/set_config.py --yes",
         "python3 scripts/launch_servers.py --scope all --dry-run",
         "python3 scripts/check_status.py --strict",
@@ -1461,7 +1530,7 @@ _FORBIDDEN_DOC_PATTERNS = (
 #: 改吃 `deployment.json` 與 argv,所以文件裡任何 `AICODE_*` / `AI_CODE_*` /
 #: `CODETRAIL_*` 名字(下面這六個概念名除外)都是在教一個沒有作用
 #: 也不會報錯的東西。逐段落 / 逐命令的例外一併移除:段落白名單就是
-#: 「docs/setup.md 整段教 `Environment=AICODE_*` 卻沒有人發現」的那條路。
+#: 「部署章節整段教 `Environment=AICODE_*` 卻沒有人發現」的那條路。
 _DOC_ALLOWED_TOKENS = (
     "CODETRAIL_REPO", "AICODE_ROOT",
     "CODETRAIL_ACTION_REQUIRED", "CODETRAIL_INGEST_SUMMARY", "CODETRAIL_INGEST_FAILED", "CODETRAIL_ZERO_WRITE",
@@ -1664,7 +1733,7 @@ def test_the_docs_gate_catches_bare_mentions_and_env_prefixes_everywhere():
     assert _doc_offenders("README.md", "### 5.1 跑 doctor 自檢\n\nAICODE_MODEL=<X> python3 scripts/doctor.py\n")
     assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\nAICODE_MODEL=<X> python3 scripts/doctor.py\n")
     assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\n`AICODE_MODEL` 與 `AICODE_LLAMA_BASE_URL` 一起設\n")
-    assert _doc_offenders("README_DEV.md", "## 維護命令索引\n\nAICODE_TEST_JOBS=1 python3 scripts/run_tests.py\n")
+    assert _doc_offenders("developer.md", "## 維護命令索引\n\nAICODE_TEST_JOBS=1 python3 scripts/run_tests.py\n")
     assert not _doc_offenders("docs/x.md", "`AICODE_N_CTX` 已刪除、無替代。\n")
     assert not _doc_offenders("docs/x.md", "cd <CODETRAIL_REPO> 之後看 `[CODETRAIL_ACTION_REQUIRED]` 那一段\n")
     assert not _doc_offenders("docs/x.md", "unset AICODE_NUM_CTX  # 舊版殘留\n")
@@ -1711,14 +1780,18 @@ def test_the_gates_also_catch_config_files_and_env_prefixed_commands():
     assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nenv AICODE_MODEL=bogus python3 scripts/doctor.py\n```\n")
     assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=<X> ~/start.sh\n```\n")
     assert _doc_offenders("README.md", "### 4.1 Deployment profile\n\n```bash\nAICODE_MODEL=<X> \\\\\nMAIN_GPU=0 \\\\\npython3 scripts/launch_servers.py --scope all\n```\n")
-    assert _doc_offenders("docs/setup.md", "### systemd unit(永久部署)\n\nEnvironment=AICODE_MODEL=<CODE_MODEL>\n")
+    assert _doc_offenders("developer.md", "### systemd unit(永久部署)\n\nEnvironment=AICODE_MODEL=<CODE_MODEL>\n")
 
 
 @pytest.mark.smoke
 def test_source_scan_includes_configs_and_the_wrapper():
     """來源走訪必須涵蓋設定檔及無副檔名的 wrapper。"""
     scanned = {str(p.relative_to(REPO_ROOT)) for p in _iter_text_files(REPO_ROOT, ignored=_git_ignored())}
-    assert {"pyproject.toml", "aicode", ".gitignore"} <= scanned
+    assert {
+        "pyproject.toml", "aicode", ".gitignore", "scripts/configure-advanced.sh",
+        "README.md", "developer.md", "docs/usage.md", "docs/mcp-tools.md",
+        "docs/compaction-rules.md",
+    } <= scanned
 
 
 @pytest.mark.smoke

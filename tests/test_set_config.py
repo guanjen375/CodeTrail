@@ -141,7 +141,7 @@ def test_interactive_flow_answers_everything_and_validates_ranges(tmp_path):
 
     # main 先按 Enter(無效)再輸入 3(超出 1-2,無效)才輸入 1;
     # main GPU 先輸入 5(不存在)再輸入 1;其餘照標準作答。
-    stdin = "\n3\n1\n5\n1\n65536\n2\n1\n2\n8192\n2\n1\n\n"
+    stdin = "\n3\n1\n5\n1\n65536\noff\n2\n1\n2\n8192\n2\n1\n\n"
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models), stdin=stdin)
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "【主聊天模型】 — 偵測到的候選" in proc.stdout
@@ -184,7 +184,7 @@ def test_summary_confirm_enter_writes_and_q_aborts(tmp_path):
         cwd=REPO_ROOT,
         env={**build_env(tmp_path), "HOME": str(home2), "USERPROFILE": str(home2)},
         # 全部答完,摘要頁按 q → 不寫入
-        input="1\n1\n65536\n2\n1\n2\n8192\n2\n1\nq\n",
+        input="1\n1\n65536\noff\n2\n1\n2\n8192\n2\n1\nq\n",
         capture_output=True,
         text=True,
         timeout=60,
@@ -201,7 +201,7 @@ def test_summary_invalid_input_reprompts_instead_of_aborting(tmp_path):
     models = make_models(tmp_path)
     proc = run(
         tmp_path, "--no-preview", "--models-dir", str(models),
-        stdin="1\n1\n65536\n2\n1\n2\n8192\n2\n1\nzz\nq\n",
+        stdin="1\n1\n65536\noff\n2\n1\n2\n8192\n2\n1\nzz\nq\n",
     )
     assert proc.returncode == 0, proc.stderr
     assert "無效輸入 'zz'" in proc.stdout
@@ -247,7 +247,7 @@ def test_missing_llama_binary_fails_with_build_hint(tmp_path):
     proc = run(tmp_path, "--yes", "--models-dir", str(models), with_llama=False)
     assert proc.returncode == 2
     assert "llama-server" in proc.stderr
-    assert "README §1.5" in proc.stderr
+    assert "developer.md#dependencies" in proc.stderr
     assert "--llama-bin" in proc.stderr
 
 @pytest.mark.parametrize(
@@ -422,7 +422,7 @@ def test_interactive_main_ctx_rejects_above_maximum(tmp_path):
     write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
     models = make_models(tmp_path)
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n1\n9999999\n65536\n2\n1\n2\n8192\n2\n1\n\n")
+                stdin="1\n1\n9999999\n65536\noff\n2\n1\n2\n8192\n2\n1\n\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "無效輸入:請輸入 1024-1048576 的整數" in proc.stdout
     assert read_deployment(tmp_path)["services"]["main"]["ctx"] == 65536
@@ -909,7 +909,7 @@ def test_interactive_prompt_accepts_typed_n_cpu_moe(tmp_path):
     # main、main GPU(選 2 = 15000 MiB free)、ctx、CPU-MoE 層數先 abc(無效)再 3、
     # embed GPU、reranker、reranker GPU、reranker ctx、VL GPU、摘要確認。
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n2\n65536\nabc\n3\n2\n1\n2\n8192\n2\n1\n\n")
+                stdin="1\n2\n65536\nabc\n3\noff\n2\n1\n2\n8192\n2\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "主聊天模型 CPU-MoE 留在 RAM 的層數(0-1024)" in proc.stdout
@@ -930,7 +930,7 @@ def test_interactive_n_cpu_moe_over_max_index_means_full_cpu_moe(tmp_path):
     models = moe_models_needing_cpu_moe(tmp_path)
 
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n1\n65536\n42\n2\n1\n2\n8192\n2\n1\n\n")
+                stdin="1\n1\n65536\n42\noff\n2\n1\n2\n8192\n2\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "推薦數值:" in proc.stdout
@@ -944,7 +944,7 @@ def test_interactive_cpu_moe_zero_means_no_offload(tmp_path):
     models = moe_models_needing_cpu_moe(tmp_path)
 
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n1\n65536\n0\n2\n1\n2\n8192\n2\n1\n\n")
+                stdin="1\n1\n65536\n0\noff\n2\n1\n2\n8192\n2\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "0 = 不 offload" in proc.stdout
@@ -961,7 +961,7 @@ def test_build_without_n_cpu_moe_support_degrades_to_full_cpu_moe(tmp_path):
     models = moe_models_needing_cpu_moe(tmp_path)
 
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n1\n65536\n3\n2\n1\n2\n8192\n2\n1\n\n")
+                stdin="1\n1\n65536\n3\noff\n2\n1\n2\n8192\n2\n1\n\n")
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "不支援 --n-cpu-moe" in proc.stdout
@@ -1040,7 +1040,7 @@ def test_flat_dir_vl_pairing_asks_explicitly_in_interactive(tmp_path):
     # main(3 候選選 1)、main GPU、ctx、embed GPU、reranker 唯一自動、reranker GPU、
     # reranker ctx、VL 明確選 [2] media-large、VL GPU、摘要確認。
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-                stdin="1\n1\n65536\n2\n2\n8192\n2\n2\n1\n\n")
+                stdin="1\n1\n65536\noff\n2\n2\n8192\n2\n2\n1\n\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "【VL 模型】 — 偵測到的候選" in proc.stdout
     deployment = read_deployment(tmp_path)
@@ -1930,6 +1930,20 @@ def test_generated_start_sh_rejects_removed_commands_before_dispatch(tmp_path):
         assert "只接受無參數啟動" in proc.stderr
 
 
+@pytest.mark.smoke
+def test_restart_stop_failure_never_launches_or_claims_stopped(monkeypatch, capsys):
+    calls = []
+
+    def run_core(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 9)
+
+    monkeypatch.setattr(sc.process_env, "run", run_core)
+    assert sc._restart_servers() == 9
+    assert calls == [[sys.executable, str(REPO_ROOT / "scripts/stop_servers.py"), "--scope", "all"]]
+    assert "已停止" not in capsys.readouterr().out
+
+
 def test_restart_subprocess_env_goes_through_process_env(monkeypatch):
     """[R] 自動重啟的 stop/start 子程序走 process_env:CodeTrail 的四個設定前綴
     一律剝掉,其餘(PATH / 使用者自己的變數)原樣繼承。
@@ -2233,6 +2247,191 @@ def test_rerun_keeps_hand_edited_port_and_base_url(tmp_path):
 
 
 @pytest.mark.smoke
+def test_client_to_local_resets_remote_endpoints_and_revokes_grants(tmp_path):
+    """Returning from B must probe and call the local services after setup."""
+    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = make_models(tmp_path)
+    manifest = tmp_path / "endpoints.json"
+    manifest.write_text(json.dumps({
+        "schema_version": 1, "mode": "client",
+        "services": {
+            role: {"model": f"ct-{role}-v1", "identity_alias": f"ct-{role}-v1",
+                   "base_url": f"http://10.20.30.40:{8080 + index}"}
+            for index, role in enumerate(("main", "embedding", "reranker", "vl"))
+        },
+    }))
+    prepared = run(tmp_path, "--mode", "client", "--yes", "--endpoint-manifest",
+                   str(manifest), pin_llama_bin=False)
+    assert prepared.returncode == 0, prepared.stderr
+
+    result = run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models))
+    assert result.returncode == 0, result.stderr + result.stdout
+    home = tmp_path / "home"
+    profile = load_effective_profile({"HOME": str(home)})
+    assert [service.base_url for service in profile.services.values()] == [
+        f"http://localhost:{8080 + index}" for index in range(4)
+    ]
+    settings = sc.client_config.load_client_settings({"HOME": str(home)})
+    assert settings.model_endpoints == {}
+    assert settings.model_remote_ok is False
+
+
+@pytest.mark.smoke
+def test_reconfigure_keeps_main_single_slot_contract(tmp_path):
+    """Rebuilding a single-slot deployment must never drop the main -np 1."""
+    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = make_models(tmp_path)
+    home = tmp_path / "home"
+    path = home / ".config/codetrail/deployment.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"schema_version": 1, "services": {
+        "main": {"parameters": {"parallel": 1}},
+    }}))
+
+    result = run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models))
+    assert result.returncode == 0, result.stderr + result.stdout
+    main = read_deployment(tmp_path)["services"]["main"]
+    assert main["parameters"].get("parallel") == 1
+    service = load_effective_profile({"HOME": str(home)}).service("main")
+    command = build_server_command(service, "/opt/llama-server", {"HOME": str(home)})
+    assert command[command.index("-np") + 1] == "1"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("choice", [None, "off", "keep"])
+def test_main_dspark_final_answer_controls_pairing_and_host_identity(tmp_path, choice):
+    import model_identity
+
+    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = make_models(tmp_path)
+    write_fake_llama(tmp_path, "--fit --cpu-moe --n-cpu-moe --reranking --mmproj --cache-ram "
+                              "--spec-type --spec-draft-model --spec-draft-n-max draft-dspark")
+    assert run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models)).returncode == 0
+    home = tmp_path / "home"
+    path = home / ".config/codetrail/deployment.json"
+    previous = json.loads(path.read_text())
+    draft = tmp_path / "prior-draft.gguf"
+    draft.write_bytes(b"local draft fixture")
+    previous["services"]["main"]["dspark"] = {"draft_model": str(draft), "draft_n_max": 5}
+    path.write_text(json.dumps(previous))
+    if choice != "keep":
+        draft.unlink()  # Off must neither resolve nor hash missing draft weights.
+    flags = [] if choice is None else ["--dspark", choice]
+    result = run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models),
+                 "--mode", "model-host", *flags)
+    assert result.returncode == 0, result.stderr + result.stdout
+    service = load_effective_profile({"HOME": str(home)}).service("main")
+    expected = sc.DSparkConfig(str(draft), 5) if choice == "keep" else None
+    assert service.dspark == expected
+    main_path = sc.resolve_model_reference(service.model, registry_file=path.with_name("models.json"))
+    assert service.identity_alias == model_identity.versioned_alias("main", main_path, dspark=expected)
+
+
+@pytest.mark.smoke
+def test_dspark_flags_reject_restore_and_client_before_side_effects(tmp_path, monkeypatch):
+    effects = []
+    monkeypatch.setattr(sc, "restore_last_backup", lambda *_a, **_k: effects.append("restore") or 0)
+    monkeypatch.setattr(sc, "commit_files", lambda *_a, **_k: effects.append("commit"))
+    monkeypatch.setattr(sc, "detect_gpus", lambda: effects.append("GPU"))
+    for operation in (["--restore-last-backup"], ["--mode", "client"]):
+        for flags in (["--dspark", "off"], ["--dspark", "on"], ["--dspark", "keep"],
+                      ["--dspark-draft", str(tmp_path / "draft.gguf")], ["--dspark-draft-n-max", "3"]):
+            args = sc._parser().parse_args([*operation, *flags])
+            with pytest.raises(sc.SetupError, match="DSpark|dspark"):
+                sc.run(args)
+    assert effects == []
+
+
+@pytest.mark.smoke
+def test_main_dspark_enable_commits_with_all_setup_outputs(tmp_path, monkeypatch):
+    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = make_models(tmp_path)
+    draft = tmp_path / "matched-draft.gguf"
+    draft.write_bytes(b"local draft fixture")
+    write_fake_llama(tmp_path, "--fit --cpu-moe --n-cpu-moe --reranking --mmproj --cache-ram "
+                              "--spec-type --spec-draft-model --spec-draft-n-max draft-dspark")
+    transactions = []
+    original_commit = sc.commit_files
+
+    def commit(targets, notes, dry_run, **kwargs):
+        transactions.append([path.name for path, _content, _mode in targets])
+        return original_commit(targets, notes, dry_run, **kwargs)
+
+    monkeypatch.setattr(sc, "commit_files", commit)
+    flags = [flag for flag in YES_TWO_GPU if flag != "--yes"]
+    result = run(tmp_path, *flags, "--no-preview", "--models-dir", str(models),
+                 "--compaction-mode", "off", stdin=f"on\n{draft}\n4\n\n")
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert transactions == [["models.json", "deployment.json", "start.sh", "client.json"]]
+    assert result.stdout.count("[Enter] 採用並寫入") == 1
+    assert read_deployment(tmp_path)["services"]["main"]["dspark"] == {
+        "draft_model": str(draft), "draft_n_max": 4,
+    }
+    manifest = json.loads(sc._manifest_path(tmp_path / "home").read_text())
+    assert {Path(path).name for path in manifest["targets"]} == set(transactions[0])
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("cancel_stage", ["dependencies", "summary"])
+def test_main_dspark_failure_or_cancel_leaves_all_prior_files_untouched(tmp_path, cancel_stage):
+    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = make_models(tmp_path)
+    assert run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models),
+               "--compaction-mode", "off").returncode == 0
+    home = tmp_path / "home"
+    before = {path: path.read_bytes() for path in home.rglob("*") if path.is_file()}
+    draft = tmp_path / "matched-draft.gguf"
+    draft.write_bytes(b"local draft fixture")
+    if cancel_stage == "summary":
+        write_fake_llama(tmp_path, "--fit --cpu-moe --n-cpu-moe --reranking --mmproj --cache-ram "
+                                  "--spec-type --spec-draft-model --spec-draft-n-max draft-dspark")
+    flags = [flag for flag in YES_TWO_GPU if flag != "--yes"]
+    result = run(tmp_path, *flags, "--no-preview", "--models-dir", str(models),
+                 "--compaction-mode", "off", "--dspark", "on", "--dspark-draft", str(draft),
+                 "--dspark-draft-n-max", "3", stdin="q\n")
+    assert result.returncode == (2 if cancel_stage == "dependencies" else 0), result.stderr + result.stdout
+    if cancel_stage == "dependencies":
+        assert "DSpark requires llama-server support" in result.stderr
+    assert {path: path.read_bytes() for path in home.rglob("*") if path.is_file()} == before
+    assert sc._COMMITTED is False
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("existing_client", [False, True])
+def test_daily_setup_preserves_compaction_without_creating_missing_client_config(tmp_path, monkeypatch, existing_client):
+    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = make_models(tmp_path)
+    if existing_client:
+        assert run(tmp_path, *YES_TWO_GPU, "--no-preview", "--models-dir", str(models),
+                   "--compaction-mode", "off").returncode == 0
+    environment = build_env(tmp_path)
+    for key in ("HOME", "PATH"):
+        monkeypatch.setenv(key, environment[key])
+    home = tmp_path / "home"
+    client_path = home / ".config/codetrail/client.json"
+    before = client_path.read_bytes() if existing_client else None
+    flags = [flag for flag in YES_TWO_GPU if flag != "--yes"]
+    args = sc._parser().parse_args([
+        *flags, "--skip-deps-check", *llama_bin_args(tmp_path), "--no-preview",
+        "--models-dir", str(models), "--dspark", "off",
+    ])
+    args.prompt_compaction = False
+    prompts = []
+
+    def confirm(prompt):
+        prompts.append(prompt)
+        return ""
+
+    monkeypatch.setattr("builtins.input", confirm)
+    assert sc.run(args) == 0
+    assert len(prompts) == 1 and "採用並寫入" in prompts[0]
+    if existing_client:
+        assert client_path.read_bytes() == before
+    else:
+        assert not client_path.exists()
+
+
+@pytest.mark.smoke
 def test_transaction_staging_files_are_private_from_birth(monkeypatch, tmp_path):
     """含使用者選擇的 config 在 chmod 前也不得以 umask 決定的寬鬆 mode 存在。"""
     creation_modes: list[int] = []
@@ -2378,7 +2577,7 @@ def test_a_manifest_with_a_foreign_target_is_refused_whole(tmp_path):
 def test_quitting_at_the_summary_writes_nothing(tmp_path):
     models = _offline_fixture(tmp_path)
     proc = run(tmp_path, "--no-preview", "--models-dir", str(models),
-               stdin="1\n1\n65536\n2\n1\n2\n8192\n2\n1\nq\n")
+               stdin="1\n1\n65536\noff\n2\n1\n2\n8192\n2\n1\nq\n")
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "未寫入任何檔案" in proc.stdout
     assert not (_home(tmp_path) / ".config").exists()

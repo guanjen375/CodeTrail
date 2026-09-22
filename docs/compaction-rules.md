@@ -10,8 +10,10 @@
 > `~/.config/codetrail/client.json` 就等於沒有接管**——`git pull` 之後不會有
 > 任何東西自己啟用，客戶端會退成 `manual`，可在 `/status` 查看。
 
-CodeTrail 客戶端對長對話的處理分成三種模式,由 `./set_config.sh` 顯式選擇並記錄
-在 owner-only 的 `~/.config/codetrail/client.json`。
+CodeTrail 客戶端對長對話的處理分成三種模式，顯式選擇後記錄在 owner-only 的
+`~/.config/codetrail/client.json`。日常 `./set_config.sh` 保留既有選擇；尚無設定檔時，
+不因設定模型而建立它。所有部署角色都可在 `client.json` 修改 `compaction_mode`，
+保留其他欄位，並重開 `aicode`。設定檔格式與權限見[客戶端設定](../developer.md#客戶端設定)。
 
 ---
 
@@ -23,10 +25,11 @@ CodeTrail 客戶端對長對話的處理分成三種模式,由 `./set_config.sh`
 | `manual` 🧪 實驗中 | 只有你自己按 `/compact` 時 |
 | `off` | 完全不壓縮 |
 
-`./set_config.sh` 的第 5 題 **沒有預設值**(跟其他使用者選擇題一樣,Enter 不能過關)——
-顯式選擇本身就是「授權 CodeTrail 管這件事」的那個動作。非互動用
-`--compaction-mode`;`--yes` 沒給它時沿用設定檔記錄的既有選擇,還沒選過就完全
-不碰壓縮設定。
+本機或 model-host 的進階完整設定也會詢問壓縮模式，該題 **沒有預設值**，Enter
+不能過關；client B 的互動設定則只沿用模式。若同時用
+[維護 Python 介面](../developer.md#maintenance-cli)設定部署，可加
+`--compaction-mode off` 等明示模式；這不是只修改壓縮的獨立命令。`--yes` 沒給模式時
+沿用設定檔記錄的既有選擇，還沒選過就完全不碰壓縮設定。
 
 模式在**客戶端啟動時**讀一次,所以切換之後要重開 `aicode` 才生效。
 
@@ -289,5 +292,5 @@ context 漲了 88k–108k tokens,其中模型輸出 25k–50k tokens,而那幾�
 
 ## 7. 相關
 
-- 症狀排查:[troubleshooting.md](troubleshooting.md)
-- 安裝與設定流程:[setup.md](setup.md)
+- 症狀排查:[開發與維運](../developer.md#troubleshooting)
+- 安裝與設定流程:[開發與維運](../developer.md#advanced-deployment)

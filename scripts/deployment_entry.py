@@ -62,9 +62,10 @@ def _print_manifest(profile: DeploymentProfile, server_url: str) -> None:
     print("=== manifest 結束；B 仍須逐角色確認授權，並在啟動時驗證 live 服務 ===")
 
 
-def _configure_role(role: str, *, offer_restart: bool) -> SetupResult:
+def _configure_role(role: str, *, offer_restart: bool, prompt_compaction: bool = True) -> SetupResult:
     args = set_config._parser().parse_args(["--mode", role])
     args.offer_restart = offer_restart
+    args.prompt_compaction = prompt_compaction
     server_url = None
     if role != "client":
         home = Path.home().absolute()
@@ -102,7 +103,7 @@ def configure_menu(home: Path) -> int:
         dspark_state = "由 A 管理"
     else:
         dspark_state = "on" if profile.service("main").dspark else "off"
-    print(f"CodeTrail 設定（目前角色：{current or '尚未設定'}）")
+    print(f"CodeTrail 附加設定（目前角色：{current or '尚未設定'}）")
     print("  1. 重設目前角色\n  2. local：模型與工作區在本機\n"
           "  3. model-host：模型主機 A\n  4. client：工作機 B\n"
           "  5. 還原最近一次設定交易\n  6. 顯示 A 的 endpoint manifest\n"
@@ -132,6 +133,20 @@ def configure_menu(home: Path) -> int:
                 _print_manifest(written, result.server_url)
             return result.code
         print("請選擇有效角色；尚未設定時不能選重設目前角色。")
+
+
+def configure_local(home: Path) -> int:
+    """The daily setup always creates a local deployment, with one final consent."""
+    try:
+        previous = _load_profile(home)
+    except ProfileError as exc:
+        print(f"目前 deployment 設定無效，將重建本機設定：{exc}")
+        previous = None
+    if previous is not None and previous.mode != "local":
+        print(f"目前角色是 {previous.mode}；這次改為 local：模型與工作區在本機。")
+        print("確認寫入後會移除先前 B 的端點授權，四個模型使用本機端點；取消不寫入。")
+        print("A/B 分離部署、交易還原及 manifest 請用 ./scripts/configure-advanced.sh。")
+    return _configure_role("local", offer_restart=True, prompt_compaction=False).code
 
 
 def _existing_for_role(home: Path, role: str) -> DeploymentProfile | None:
@@ -193,7 +208,7 @@ def _ensure_host_ready(profile: DeploymentProfile) -> int:
     if reachable or sessions:
         raise set_config.SetupError(
             "既有模型尚未通過 ready 檢查：" + "; ".join(issues) +
-            "。請用 ./set_config.sh 確認設定，再執行 ~/start.sh stop 與 ~/start.sh 套用。")
+            "。請用 ./scripts/configure-advanced.sh 確認模型主機設定，再執行 ~/start.sh stop 與 ~/start.sh 套用。")
     code = launch_servers.main(["--scope", "all"])
     if code:
         return code
@@ -237,12 +252,13 @@ def device(home: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if len(args) != 1 or args[0] not in {"configure", "host", "device"}:
+    if len(args) != 1 or args[0] not in {"configure", "advanced", "host", "device"}:
         print("部署入口只供無參數 wrappers 的固定角色 dispatch。", file=sys.stderr)
         return 2
     try:
         home = Path.home().absolute()
-        return {"configure": configure_menu, "host": host, "device": device}[args[0]](home)
+        return {"configure": configure_local, "advanced": configure_menu,
+                "host": host, "device": device}[args[0]](home)
     except (set_config.SetupError, client_config.ClientConfigError, ProfileError,
             endpoint_policy.EndpointPolicyError, set_config.compaction_formula.CompactionModeError,
             OSError) as exc:

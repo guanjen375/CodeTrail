@@ -56,6 +56,11 @@ RERANK_FALLBACK_VALUES = ("error",)
 #: `.h` 當成哪一種語言解析。
 H_LANG_VALUES = ("c", "cpp")
 
+#: TUI 的專用複製鍵。F6/F7 屬於 TextArea 選取，其他既有快捷鍵不開放覆寫。
+#: 實際 App/Screen/widget 繼承綁定由 test_client_copy_key 的契約逐一核對。
+DEFAULT_COPY_KEY = "f2"
+COPY_KEY_VALUES = ("f1", "f2", "f3", "f4", "f5", "f8", "f9", "f10", "f11", "f12")
+
 
 class ClientConfigError(RuntimeError):
     """client.json 的位置、權限或內容不合契約。"""
@@ -114,6 +119,8 @@ class ClientSettings:
     #: 與上面那個是**兩個**鍵:合併之後純 UI 操作會改變模型看到的 context,
     #: 而且「顯示但不送」與「送但不顯示」這兩種組合至少會有一種變成不可能。
     keep_historical_reasoning: bool = False
+    #: 複製目前畫面／輸入框選取；只管 TUI，不改模型或工具權限。
+    copy_key: str = DEFAULT_COPY_KEY
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -135,6 +142,7 @@ class ClientSettings:
             "use_container": self.use_container,
             "show_reasoning": self.show_reasoning,
             "keep_historical_reasoning": self.keep_historical_reasoning,
+            "copy_key": self.copy_key,
         }
 
     def with_compaction(self, mode: str) -> "ClientSettings":
@@ -151,7 +159,9 @@ class ClientSettings:
         if not self.present:
             return (
                 f"壓縮模式 manual(沒有 {self.path});沒有設定檔就等於沒有接管 —— "
-                "要自動壓縮請跑 ./set_config.sh。"
+                '要自動壓縮請在 client.json 設 "compaction_mode": "codetrail"'
+                '（"manual" 為手動，"off" 為關閉）；設定方式見 docs/compaction-rules.md，'
+                "重啟 aicode 後生效。"
             )
         return f"壓縮模式 {self.compaction_mode}(來自 {self.path})"
 
@@ -184,6 +194,7 @@ _BOOL_KEYS = (
 _CHOICE_KEYS = {
     "rerank_fallback_policy": RERANK_FALLBACK_VALUES,
     "h_lang": H_LANG_VALUES,
+    "copy_key": COPY_KEY_VALUES,
 }
 #: 自由字串的鍵。
 _TEXT_KEYS = ("objdump",)
@@ -392,6 +403,34 @@ def save_client_settings(
     return client_paths.replace_private_file(
         path.parent, path.name, payload, _error, anchor=path.parent.parent
     )
+
+
+def validate_copy_key(value: object) -> str:
+    """只接受沒有占用既有操作的 canonical Textual 功能鍵名稱。"""
+    if not isinstance(value, str) or value not in COPY_KEY_VALUES:
+        allowed = " / ".join(key.upper() for key in COPY_KEY_VALUES)
+        raise ClientConfigError(f"copy_key 只接受 {allowed}，得到 {value!r}")
+    return value
+
+
+def update_copy_key(
+    key: str, env: Mapping[str, str] | None = None,
+) -> tuple[ClientSettings, bool]:
+    """重讀目前設定後只換 copy_key，成功落檔才把新設定交回 TUI。
+
+    不採用啟動時的快照：同一段 session 的 /allow add 可能剛新增授權。
+    預設鍵且沒有設定檔時維持零寫入，其他設定不套回目前的 runtime。
+    """
+    key = validate_copy_key(key)
+    settings = load_client_settings(env)
+    if settings.copy_key == key:
+        return settings, False
+    changed = replace(settings, present=True, copy_key=key)
+    try:
+        save_client_settings(changed, env)
+    except OSError as exc:
+        raise ClientConfigError(f"無法儲存 {settings.path}: {exc}") from exc
+    return changed, True
 
 
 def update_extra_allowed_commands(

@@ -11,8 +11,8 @@
 
 契約(兩條,都是刻意的):
 
-  * **純讀取**。這裡不寫任何檔、不修任何設定。要改模式只有
-    執行 `./set_config.sh`，在互動設定中選擇壓縮模式。
+  * **純讀取**。這裡不寫任何檔、不修任何設定。要改模式請設定
+    `client.json` 的 `compaction_mode` 為 `codetrail` / `manual` / `off`，重啟 aicode 生效。
   * **永遠 exit 0、永不 raise**。這是啟動橫幅的一段資訊,不是閘。讀不到設定
     檔就退成「未接管(manual)」——讓一行資訊擋住客戶端啟動是本末倒置。
 
@@ -29,7 +29,8 @@ import os
 import sys
 
 SWITCH_HINT = (
-    "行為仍在調整;要完全關掉壓縮:執行 ./set_config.sh，在壓縮模式選 off"
+    "行為仍在調整;要完全關掉壓縮:將 ~/.config/codetrail/client.json 的 "
+    '"compaction_mode" 設為 "off"，重啟 aicode 後生效。'
 )
 
 MODE_LABELS = {
@@ -110,7 +111,8 @@ def status_lines(env: dict | None = None, *, n_ctx: int | None = None) -> list[s
         # 這種情況 runtime 也起不來——照實說,不要顯示上一次的選擇。
         return [
             f"壓縮模式=未知(client.json 不可信:{exc})",
-            "重跑 ./set_config.sh 可以重新選擇壓縮模式",
+            "請先修復 client.json 的擁有者、權限、連結或 JSON 格式問題，"
+            '再將 "compaction_mode" 設為 "codetrail"、"manual" 或 "off"；重啟 aicode 後生效。',
         ]
 
     mode = settings.compaction_mode
@@ -118,7 +120,8 @@ def status_lines(env: dict | None = None, *, n_ctx: int | None = None) -> list[s
     if not settings.present:
         return [
             f"壓縮模式={mode}(沒有 {settings.path};CodeTrail 未接管)",
-            "跑 ./set_config.sh 選一次才會有自動壓縮",
+            '壓縮設定在 client.json 的 "compaction_mode"：自動壓縮設 "codetrail"、'
+            '手動設 "manual"、關閉設 "off"；設定方式見 docs/compaction-rules.md，重啟 aicode 後生效。',
             *_reasoning_line(settings),
         ]
 

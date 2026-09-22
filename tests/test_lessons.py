@@ -654,7 +654,7 @@ def test_record_lesson_stays_behind_a_human_approval():
 
 @pytest.mark.smoke
 def test_the_rendered_lessons_file_reaches_the_system_prompt(tmp_path, monkeypatch):
-    """docs/lessons.md 的三步驗證:render 出來的檔要真的進 system prompt。"""
+    """docs/usage.md#lessons 的三步驗證:render 出來的檔要真的進 system prompt。"""
     import client_prompt
 
     monkeypatch.setenv("HOME", str(tmp_path / "home"))

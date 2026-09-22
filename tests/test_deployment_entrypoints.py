@@ -62,7 +62,8 @@ def _answers(monkeypatch, values, observe=None):
     monkeypatch.setattr("builtins.input", answer)
 
 
-@pytest.mark.parametrize("wrapper", ["aicode", "set_config.sh", "scripts/codetrail-host.sh", "scripts/codetrail-device.sh"])
+@pytest.mark.parametrize("wrapper", ["aicode", "set_config.sh", "scripts/configure-advanced.sh",
+                                     "scripts/codetrail-host.sh", "scripts/codetrail-device.sh"])
 def test_public_entrypoints_reject_argv_before_python_or_writes(tmp_path, wrapper):
     home = tmp_path / "home"
     home.mkdir()
@@ -83,6 +84,7 @@ def test_public_entrypoints_reject_argv_before_python_or_writes(tmp_path, wrappe
 
 
 @pytest.mark.parametrize("wrapper,role", [("set_config.sh", "configure"),
+                                          ("scripts/configure-advanced.sh", "advanced"),
                                           ("scripts/codetrail-host.sh", "host"),
                                           ("scripts/codetrail-device.sh", "device")])
 def test_deployment_wrappers_follow_symlinks_and_keep_cwd(tmp_path, wrapper, role):
@@ -127,6 +129,9 @@ def test_start_wrapper_only_dispatches_empty_or_exact_stop(tmp_path):
     for argv in ([], ["stop"]):
         result = subprocess.run(["bash", str(wrapper), *argv], capture_output=True, text=True, timeout=10)
         assert result.returncode == 0, result.stderr
+        assert f"[start.sh] checkout: {checkout}" in result.stdout
+        assert "[start.sh] generated: " in result.stdout
+        assert "[start.sh] version: unknown" in result.stdout
     assert [json.loads(line) for line in record.read_text().splitlines()] == [
         ["launch_servers.py", ["--scope", "all"]], ["stop_servers.py", ["--scope", "all"]],
     ]
@@ -134,7 +139,51 @@ def test_start_wrapper_only_dispatches_empty_or_exact_stop(tmp_path):
     for argv in (["stop", "--force"], ["quit"], ["--help"], ["--dry-run"], ["status"], ["logs"], [""]):
         result = subprocess.run(["bash", str(wrapper), *argv], capture_output=True, text=True, timeout=10)
         assert result.returncode == 2, (argv, result.stderr)
+        assert "[start.sh] checkout:" not in result.stdout
     assert record.read_bytes() == before
+
+
+def test_start_wrapper_pins_source_identity_and_quotes_checkout_paths(tmp_path):
+    checkout = tmp_path / "checkout ' $(touch injected)"
+    scripts = checkout / "scripts"
+    scripts.mkdir(parents=True)
+    metadata = checkout / ".git"
+    (metadata / "refs/heads").mkdir(parents=True)
+    commit = "abcde01234" * 4
+    (metadata / "HEAD").write_text("ref: refs/heads/main\n")
+    (metadata / "refs/heads/main").write_text(commit + "\n")
+    for name in ("launch_servers.py", "stop_servers.py"):
+        (scripts / name).write_text("print('fixed core')\n")
+    source = set_config.render_start_wrapper(checkout)
+    (metadata / "refs/heads/main").write_text("f" * 40 + "\n")
+    wrapper = tmp_path / "start.sh"
+    wrapper.write_text(source)
+    for args in ([], ["stop"]):
+        result = subprocess.run(["bash", str(wrapper), *args], cwd=tmp_path,
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        assert f"checkout: {checkout}" in result.stdout
+        assert f"version: {commit}" in result.stdout
+        assert result.stdout.index("version:") < result.stdout.index("fixed core")
+    assert not (tmp_path / "injected").exists()
+
+
+def test_daily_local_route_warns_conversion_and_keeps_cancelled_settings(tmp_path, monkeypatch, capsys):
+    home, _project, manifest = _device_home(tmp_path, monkeypatch)
+    args = set_config._parser().parse_args(["--mode", "client", "--yes", "--endpoint-manifest", str(manifest)])
+    assert set_config.configure_client(args, home) == 0
+    before = {path: path.read_bytes() for path in home.rglob("*") if path.is_file()}
+    routed = []
+    monkeypatch.setattr(entry, "_configure_role", lambda role, **kwargs:
+                        routed.append((role, kwargs)) or entry.SetupResult(0, False))
+    monkeypatch.setattr(entry, "configure_menu", lambda *_a: pytest.fail("daily setup asked for a role"))
+    assert entry.main(["configure"]) == 0
+    assert routed == [("local", {"offer_restart": True, "prompt_compaction": False})]
+    assert {path: path.read_bytes() for path in home.rglob("*") if path.is_file()} == before
+    output = capsys.readouterr().out
+    assert "目前角色是 client" in output
+    assert "移除先前 B 的端點授權" in output and "取消不寫入" in output
+    assert "configure-advanced.sh" in output
 
 
 @pytest.mark.parametrize("kb_answer,kb_allowed", [("", False), ("n", False), ("y", True)])

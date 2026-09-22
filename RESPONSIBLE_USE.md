@@ -32,7 +32,7 @@ host operating system. Before handling confidential material:
 5. Import the minimum necessary files. Do not whitelist an entire home directory
    or a broad shared mount when a narrow source directory will work.
 
-See [docs/security.md](docs/security.md) for the concrete controls and their
+See [Security boundaries](developer.md#security) for the concrete controls and their
 limitations.
 
 ## Protect inputs and derived artifacts

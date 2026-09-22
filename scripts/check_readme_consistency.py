@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""README / docs ↔ mcp_server.py / config.py 一致性檢查。
+"""README / developer / docs ↔ mcp_server.py / config.py 一致性檢查。
 
 不解析 markdown,只用 regex 抓出使用者文件上需要對齊的事實,
 和原始碼比對:
   1. mcp_server.py 內 @mcp.tool() 的工具數 == 文件提到的「N 個工具」
   2. 文件工具表內每個 backtick 工具名都在 mcp_server.py 裡定義
   3. config.py 的附屬模型由 deployment profile 取得，避免三處 hardcode 漂移
-  4. README 必須包含「成熟私有部署版」/「不公開發布」之類產品狀態語句
-  5. README / docs 必須提到 llama-server / GGUF / <CODE_MODEL> placeholder,而且 README
+  4. README 必須說明公開原始碼專案定位
+  5. README / developer / docs 必須提到 llama-server / GGUF / <CODE_MODEL> placeholder,而且 README
      講得出主模型填在 deployment.json 的 main.model(設定只來自檔案,沒有環境變數)
   6. README 講的 MCP read timeout == config.MCP_CALL_TIMEOUT_SECONDS
   7. README 的權限說明 == client_policy.ASK_TOOLS
@@ -22,7 +22,7 @@
      read timeout 是兩個獨立契約):config.py 的 RUN_COMMAND_TIMEOUT{,_MIN,_MAX}
      ↔ mcp_server.run_command 的 Annotated/Field 簽名與 docstring、
      agent_tools._RUN_COMMAND_TOOL 的 description 與 timeout schema、README /
-     docs/mcp-tools.md / docs/security.md / docs/troubleshooting.md(各鎖完整肯定句)
+     docs/mcp-tools.md / developer.md 的安全與故障排解章節(各鎖完整肯定句)
  11. 驗證分層宣稱:apply_patch 只做同 process 的 syntax check、lint / test 顯式呼叫、
      三個不同的 ask、troubleshooting「驗證不完整／未通過不是拒絕」;契約句要以句首形式出現
      (擋「不能保證…」這類前綴否定);完整的舊肯定句(自動跑 lint / 所有驗證通過)不得殘留
@@ -41,14 +41,17 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 README = REPO_ROOT / "README.md"
+DEVELOPER = REPO_ROOT / "developer.md"
 DOCS_DIR = REPO_ROOT / "docs"
 MCP = REPO_ROOT / "mcp_server.py"
 CONFIG = REPO_ROOT / "config.py"
 SET_CONFIG = REPO_ROOT / "scripts" / "set_config.py"
 AGENT_TOOLS = REPO_ROOT / "agent_tools.py"
 MCP_TOOLS_DOC = DOCS_DIR / "mcp-tools.md"
-SECURITY_DOC = DOCS_DIR / "security.md"
-TROUBLESHOOTING_DOC = DOCS_DIR / "troubleshooting.md"
+SECURITY_HEADING = "## 安全邊界"
+TROUBLESHOOTING_HEADING = "## 故障排解"
+SECURITY_ARTIFACT = "developer.md#security"
+TROUBLESHOOTING_ARTIFACT = "developer.md#troubleshooting"
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -68,14 +71,41 @@ _HISTORICAL_DOCS: frozenset[str] = frozenset()
 
 
 def _documentation_text() -> str:
-    """合併 README 與 docs/*.md，讓細節搬到 docs 後仍能做 drift check。"""
-    parts = [_read(README)]
-    if DOCS_DIR.is_dir():
-        for path in sorted(DOCS_DIR.glob("*.md")):
-            if path.name in _HISTORICAL_DOCS:
-                continue
-            parts.append(_read(path))
-    return "\n\n".join(parts)
+    """所有現行使用者文件共用來源集合，搬到根目錄也必須接受 drift check。"""
+    return "\n\n".join(text for _, text in _stale_doc_sources())
+
+
+def _markdown_section(text: str, heading: str) -> str | None:
+    """取唯一的完整 Markdown 章節；同／較高階標題結束，fence 內標題不算。
+
+    安全與故障排解各自是獨立 surface，另一章的同句契約不能補足本章缺失。
+    缺失或重複章名都回 None，交由既有逐句 gate fail-loud。
+    """
+    level = len(heading) - len(heading.lstrip("#"))
+    sections: list[str] = []
+    current: list[str] | None = None
+    fence: str | None = None
+    for line in text.splitlines():
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if marker:
+            value = marker.group(1)
+            if fence is None:
+                fence = value
+            elif value[0] == fence[0] and len(value) >= len(fence):
+                fence = None
+        elif fence is None:
+            found = re.match(r"^(#{1,6})[ \t]+", line)
+            if found and len(found.group(1)) <= level:
+                if current is not None:
+                    sections.append("\n".join(current))
+                    current = None
+                if line.rstrip() == heading:
+                    current = []
+        if current is not None:
+            current.append(line)
+    if current is not None:
+        sections.append("\n".join(current))
+    return sections[0] if len(sections) == 1 else None
 
 
 def _mcp_tool_names(mcp_text: str) -> list[str]:
@@ -542,7 +572,7 @@ def _check_apply_patch_limits_contract(
     config_text: str,
     readme_text: str,
     mcp_tools_text: str,
-    troubleshooting_text: str,
+    troubleshooting_text: str | None,
     issues: list[str],
 ) -> None:
     """9. apply_patch 的 5 / 200 上限(兩種計數各自鎖句)、兩種格式、dry_run 七欄位。"""
@@ -621,7 +651,7 @@ def _check_apply_patch_limits_contract(
         "`locations`（定位行）、`new_file`（是否新建）；全部通過才顯示唯一的一行 `would apply`",
         artifact + " dry_run", issues,
     )
-    artifact = "docs/troubleshooting.md"
+    artifact = TROUBLESHOOTING_ARTIFACT
     _require_sentence(troubleshooting_text, "#### SEARCH/REPLACE 被拒絕", artifact, issues)
     _require_sentence(troubleshooting_text, "#### unified diff 被拒絕", artifact, issues)
     _require_sentence(troubleshooting_text, "這些都是整份 patch 拒絕、零寫入", artifact, issues)
@@ -634,8 +664,8 @@ def _check_run_command_timeout_contract(
     config_text: str,
     readme_text: str,
     mcp_tools_text: str,
-    security_text: str,
-    troubleshooting_text: str,
+    security_text: str | None,
+    troubleshooting_text: str | None,
     issues: list[str],
 ) -> None:
     """10. run_command timeout 的秒級 server 上限(1..600、預設 60)三層 + 四份文件一致。
@@ -702,16 +732,16 @@ def _check_run_command_timeout_contract(
 
     _require_sentence(readme_text, doc_sentence, "README.md", issues)
     _require_sentence(mcp_tools_text, doc_sentence, "docs/mcp-tools.md", issues)
-    _require_sentence(security_text, doc_sentence, "docs/security.md", issues)
-    _require_sentence(troubleshooting_text, doc_sentence, "docs/troubleshooting.md", issues)
+    _require_sentence(security_text, doc_sentence, SECURITY_ARTIFACT, issues)
+    _require_sentence(troubleshooting_text, doc_sentence, TROUBLESHOOTING_ARTIFACT, issues)
 
 
 def _check_verification_layer_claims(
     mcp_text: str,
     agent_tools_text: str,
     mcp_tools_text: str,
-    security_text: str,
-    troubleshooting_text: str,
+    security_text: str | None,
+    troubleshooting_text: str | None,
     issues: list[str],
 ) -> None:
     """11. 驗證分層:每個 surface 鎖完整肯定式契約句(句首形式);只拒絕完整的舊肯定句。"""
@@ -735,20 +765,14 @@ def _check_verification_layer_claims(
     _require_sentence(mcp_tools_text, "apply_patch 不會自動執行 lint / typecheck / test", artifact, issues)
     for stale in _OLD_AUTO_VERIFY_CLAIMS:
         _forbid_phrase(mcp_tools_text, stale, artifact, issues)
-    _require_sentence(security_text, "這是**三個不同的 ask**", "docs/security.md", issues)
+    _require_sentence(security_text, "這是**三個不同的 ask**", SECURITY_ARTIFACT, issues)
     _require_sentence(
         troubleshooting_text, "「驗證不完整」或「驗證未通過」**不是拒絕**",
-        "docs/troubleshooting.md", issues,
+        TROUBLESHOOTING_ARTIFACT, issues,
     )
 
 
-_PRODUCT_STATUS_PHRASES = [
-    "成熟私有部署版",
-    "不打算公開發布",
-    "不公開發布",
-    "未做公開",
-    "公開產品級安全審計",
-]
+_PRODUCT_STATUS_PHRASES = ["公開原始碼專案"]
 
 
 # Shared with the source gate: public wrappers no longer forward arguments.
@@ -758,7 +782,7 @@ REMOVED_DAILY_CLI_PATTERNS = (
      "啟動 wrapper 僅接受無參數啟動或單一 stop"),
     (r"\bstart\.sh[ \t]+stop[ \t]+--?[\w-]+",
      "停止 wrapper 不接受額外參數"),
-    (r"\b(?:aicode|set_config\.sh|codetrail-(?:host|device)\.sh)[ \t]+--?[\w-]+",
+    (r"\b(?:aicode|set_config\.sh|configure-advanced\.sh|codetrail-(?:host|device)\.sh)[ \t]+--?[\w-]+",
      "日常入口不接受旗標；維護 argv 請使用內部 Python 入口"),
 )
 
@@ -807,7 +831,7 @@ def _check_no_stale_client_docs(docs_text: str, issues: list[str], *, source: st
 
 def _stale_doc_sources() -> list[tuple[str, str]]:
     """(相對路徑, 內容):與 `_documentation_text()` 同一組檔,但**不合併**。"""
-    sources = [("README.md", _read(README))]
+    sources = [("README.md", _read(README)), ("developer.md", _read(DEVELOPER))]
     if DOCS_DIR.is_dir():
         for path in sorted(DOCS_DIR.glob("*.md")):
             if path.name in _HISTORICAL_DOCS:
@@ -827,6 +851,8 @@ def check_all() -> list[str]:
 
     if not README.is_file():
         return ["README.md 不存在"]
+    if not DEVELOPER.is_file():
+        return ["developer.md 不存在"]
     if not MCP.is_file():
         return ["mcp_server.py 不存在"]
 
@@ -836,8 +862,9 @@ def check_all() -> list[str]:
     config_text = _read(CONFIG)
     agent_tools_text = _read(AGENT_TOOLS)
     mcp_tools_text = _read(MCP_TOOLS_DOC)
-    security_text = _read(SECURITY_DOC)
-    troubleshooting_text = _read(TROUBLESHOOTING_DOC)
+    developer_text = _read(DEVELOPER)
+    security_text = _markdown_section(developer_text, SECURITY_HEADING)
+    troubleshooting_text = _markdown_section(developer_text, TROUBLESHOOTING_HEADING)
 
     # 1. tool count and shared public catalog. Definitions need not be in
     # registration order: mcp_server queues them and consumes this constant.
@@ -916,7 +943,7 @@ def check_all() -> list[str]:
 def main() -> int:
     issues = check_all()
     if not issues:
-        print("[readme-consistency] OK — README/docs ↔ mcp_server.py / config.py 一致")
+        print("[readme-consistency] OK — README/developer/docs ↔ mcp_server.py / config.py 一致")
         return 0
     print(f"[readme-consistency] 發現 {len(issues)} 個 drift：")
     for it in issues:

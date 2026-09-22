@@ -70,6 +70,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_dspark_off_works_without_draft_binary_or_gpu_and_refreshes_host_alias",
             "test_dspark_declining_validated_enable_does_not_hash_or_write",
             "test_dspark_transaction_failure_retains_prior_deployment",
+            "test_dspark_apply_requires_explicit_restart_and_propagates_failure",
             "test_reconfigure_carries_dspark_only_for_same_resolved_main_artifact",
             "test_reconfigure_freezes_draft_artifact_before_registry_key_can_be_rebound",
             "test_dspark_drafts_are_excluded_before_main_and_mmproj_classification",
@@ -284,6 +285,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_public_entrypoints_reject_argv_before_python_or_writes",
             "test_deployment_wrappers_follow_symlinks_and_keep_cwd",
             "test_start_wrapper_only_dispatches_empty_or_exact_stop",
+            "test_start_wrapper_pins_source_identity_and_quotes_checkout_paths",
+            "test_daily_local_route_warns_conversion_and_keeps_cancelled_settings",
             "test_device_displays_four_destinations_and_separate_kb_consent",
             "test_device_without_affirmative_endpoint_consent_never_writes_or_starts",
             "test_client_setup_invalid_manifest_and_failed_transaction_leave_no_partial_configuration",
@@ -399,6 +402,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_split_endpoint_rejects_indirection_and_credentials",
             "test_split_identity_never_reads_remote_model_paths",
             "test_model_host_alias_and_export_bind_all_shards_and_projector",
+            "test_missing_host_alias_points_to_advanced_setup",
             "test_split_http_ignores_proxy_and_refuses_redirect",
             "test_eval_replay_inherits_only_trusted_transport_authorization",
             "test_split_eval_transport_uses_same_endpoint_policy",
@@ -775,12 +779,21 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "沒有備份路徑不得刪 live 檔、symlink 被改指不得覆寫別處、寫不出 manifest 不得留 stale);"
         "restore manifest 兩個世代共用同一個檔:含這一代不會寫的目標時整份拒絕、一個檔都不動;"
         "產生的 `~/start.sh` 不 export / 不 unset 任何變數(殼層裡的舊名字對啟動指令無效),"
-        "GPU 與 llama-server 路徑寫進 `deployment.json` 的 `services.<role>.gpu` / `llama_bin`",
+        "GPU 與 llama-server 路徑寫進 `deployment.json` 的 `services.<role>.gpu` / `llama_bin`;"
+        "切回本機不得沿用 B 的遠端端點或授權，主聊天重設仍固定單一 slot",
         (
             "test_generated_start_sh_ignores_legacy_shell_overrides",
             "test_generated_start_sh_rejects_removed_commands_before_dispatch",
             "test_removed_log_shorthands_never_dispatch_tail",
             "test_deployment_json_pins_llama_bin_and_gpus",
+            "test_client_to_local_resets_remote_endpoints_and_revokes_grants",
+            "test_reconfigure_keeps_main_single_slot_contract",
+            "test_restart_stop_failure_never_launches_or_claims_stopped",
+            "test_main_dspark_final_answer_controls_pairing_and_host_identity",
+            "test_dspark_flags_reject_restore_and_client_before_side_effects",
+            "test_main_dspark_enable_commits_with_all_setup_outputs",
+            "test_main_dspark_failure_or_cancel_leaves_all_prior_files_untouched",
+            "test_daily_setup_preserves_compaction_without_creating_missing_client_config",
             "test_yes_without_the_flag_never_takes_over",
             "test_codetrail_mode_writes_the_chosen_mode",
             "test_the_written_threshold_matches_the_runtime_formula",
@@ -811,6 +824,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "殘留的網頁 backend 只唯讀偵測",
         (
             "test_explicit_gate_and_implicit_diagnostic_are_separate",
+            "test_compaction_repair_hints_use_available_settings_route",
             "test_canary_timeout_is_unverified_not_a_proven_contract_failure",
             "test_fingerprint_covers_live_protocol_template_build_and_prompt",
             "test_fingerprint_changes_with_project_instructions",
@@ -834,6 +848,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_rule_headings_come_from_the_document",
             "test_canonical_block_is_fail_loud_when_the_doc_drifts",
             "test_no_client_config_reads_as_untouched",
+            "test_compaction_hints_do_not_route_to_daily_model_setup",
             "test_an_unreadable_config_never_shows_a_stale_mode",
             "test_the_status_line_never_raises",
         ),
@@ -1256,6 +1271,21 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_every_prime_the_coordinator_runs_reports_through_on_prime",
         ),
     ),
+    "test_client_copy_key.py": (
+        "複製鍵與既有繼承按鍵不衝突；設定當場重讀並透過 owner-only IO 儲存，"
+        "不得覆寫新授權、讀取不得建檔、失敗保留原鍵；更換後舊鍵失效，"
+        "忙碌與 modal 仍可複製且 Ctrl-C 繼續中斷",
+        (
+            "test_copy_key_choices_do_not_collide_with_any_binding_chain",
+            "test_copy_key_defaults_and_read_only_commands_do_not_create_config",
+            "test_copy_key_startup_passes_saved_setting_explicitly",
+            "test_copy_key_edits_preserve_fresh_allow_settings_and_private_modes",
+            "test_copy_key_invalid_settings_and_commands_fail_without_writing",
+            "test_copy_key_owner_only_failures_preserve_file_and_active_key",
+            "test_copy_key_switch_removes_old_dispatch_and_failed_save_keeps_previous_key",
+            "test_copy_key_changed_key_works_during_turn_and_modal_without_stealing_ctrl_c",
+        ),
+    ),
     "test_client_app_selection.py": (
         "完成／重播回答仍可拖選；掛載前與掛載中完成不得遺失文字，舊串流選取須移除，"
         "顯示 Markdown 不自動開啟回答中的連結",
@@ -1454,6 +1484,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "`llama_server_env()`。`docs/workflows/**/*.md` 的豁免只給 `.md` 的內容 ——"
         "同目錄的可執行檔照掃(否則就是把東西藏進交接目錄)",
         (
+            "test_documentation_sources_include_all_primary_and_runtime_documents",
+            "test_developer_contract_sections_are_checked_independently",
             "test_user_docs_must_not_teach_removed_flags_or_files",
             "test_removed_daily_cli_commands_are_rejected_by_both_doc_gates",
             "test_runtime_repair_hints_use_supported_daily_or_maintenance_commands",

@@ -96,11 +96,11 @@ def test_menu_dspark_requires_existing_local_main_without_probes_or_writes(
     monkeypatch.setattr(dspark_runtime, "validate_dspark_runtime", lambda *_a, **_k: pytest.fail("unconfigured/B setup probed draft"))
     monkeypatch.setattr(entry, "_configure_role", lambda *_a, **_k: pytest.fail("menu 7 changed deployment role"))
     _answers(monkeypatch, ["7"])
-    assert entry.main(["configure"]) == (2 if state in {"invalid", "unset"} else 0)
+    assert entry.main(["advanced"]) == (2 if state in {"invalid", "unset"} else 0)
     assert _snapshot(home) == before
     output = capsys.readouterr()
     assert "7. DSpark 推測解碼開關" in output.out
-    assert "set_config.sh" in output.out + output.err
+    assert ("configure-advanced.sh" if state == "client" else "set_config.sh") in output.out + output.err
     if state == "client":
         assert "模型主機 A" in output.out
         assert "由 A 管理" in output.out
@@ -142,7 +142,7 @@ def test_dspark_on_confirms_and_transacts_only_deployment_with_host_identity(
     assert "尚未重啟" in output and "~/start.sh stop" in output
     if mode == "model-host":
         assert output.index("可能需要幾分鐘") < output.index("正在計算 main identity")
-        assert "選單 6" in output and "B 重新匯入" in output
+        assert "configure-advanced.sh 選項 6" in output and "B 重新匯入" in output
     # Single-target DSpark commits must remain restorable through the existing boundary.
     assert set_config.restore_last_backup(home) == 0
     assert path.read_bytes() == before[".config/codetrail/deployment.json"]
@@ -197,7 +197,7 @@ def test_dspark_off_works_without_draft_binary_or_gpu_and_refreshes_host_alias(
     output = capsys.readouterr().out
     if mode == "model-host":
         assert "關閉時也要雜湊主模型" in output
-        assert "選單 6" in output and "B 重新匯入" in output
+        assert "configure-advanced.sh 選項 6" in output and "B 重新匯入" in output
 
 
 def test_dspark_declining_validated_enable_does_not_hash_or_write(tmp_path, monkeypatch):
@@ -253,12 +253,15 @@ def test_reconfigure_carries_dspark_only_for_same_resolved_main_artifact(tmp_pat
                                     "services": document["services"]}))
         document = {"schema_version": 1, "profile": str(base)}
     path.write_text(json.dumps(document))
-    updated = {"services": {"main": {"model": "selected-key", "parameters": {}}}}
+    updated = {"services": {"main": {"model": "selected-key", "parameters": {}, "dspark": None}}}
     notes = []
+    candidate = set_config._previous_dspark_pairing(path, notes, main_model_path=selected)
     set_config.merge_existing_deployment(updated, path, notes, main_model_path=selected)
-    expected = {"draft_model": str(draft), "draft_n_max": 5} if same else None
-    assert updated["services"]["main"]["dspark"] == expected
-    assert any(("保留 DSpark" if same else "已關閉原 DSpark") in note for note in notes)
+    expected = deployment.DSparkConfig(str(draft), 5) if same else None
+    assert candidate == expected
+    assert updated["services"]["main"]["dspark"] is None
+    if not same:
+        assert any("不能沿用原 DSpark" in note for note in notes)
 
 
 def test_reconfigure_freezes_draft_artifact_before_registry_key_can_be_rebound(tmp_path):
@@ -269,11 +272,29 @@ def test_reconfigure_freezes_draft_artifact_before_registry_key_can_be_rebound(t
     path.write_text(json.dumps(document))
     registry_path = path.with_name("models.json")
     registry_path.write_text(json.dumps({"old-main-key": str(main), "new-main-key": str(draft)}))
-    updated = {"services": {"main": {"model": "new-main-key", "parameters": {}}}}
-    set_config.merge_existing_deployment(updated, path, [], main_model_path=main)
+    candidate = set_config._previous_dspark_pairing(path, [], main_model_path=main)
+    assert candidate is not None
     registry_path.write_text(json.dumps({"old-main-key": str(main), "new-main-key": str(main)}))
-    preserved = updated["services"]["main"]["dspark"]["draft_model"]
+    preserved = candidate.draft_model
     assert deployment.resolve_model_reference(preserved, registry_file=registry_path) == str(draft)
+
+
+@pytest.mark.parametrize("answer,code", [("", 0), ("s", 0), ("r", 0), ("r", 7)])
+def test_dspark_apply_requires_explicit_restart_and_propagates_failure(tmp_path, monkeypatch, answer, code):
+    home = tmp_path / "home"
+    path, _main, _draft, _document = _write_deployment(home, enabled=True)
+    calls = []
+
+    def restart():
+        assert set_config._COMMITTED is True
+        assert json.loads(path.read_text())["services"]["main"]["dspark"] is None
+        calls.append(True)
+        return code
+
+    monkeypatch.setattr(set_config, "_restart_servers", restart)
+    _answers(monkeypatch, ["off", "y", answer])
+    assert set_config.configure_dspark(home) == (code if answer == "r" else 0)
+    assert calls == ([True] if answer == "r" else [])
 
 
 def _gguf_string(value):

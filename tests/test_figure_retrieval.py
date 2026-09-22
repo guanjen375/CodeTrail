@@ -2952,8 +2952,8 @@ def test_docs_never_claim_a_single_bad_figure_blocks_the_whole_document():
         "圖片分析失敗,ingest 會整份中止",
         "圖片分析失敗，ingest 會整份中止",
     )
-    for name in ("README.md", "docs/mcp-tools.md", "docs/rag.md",
-                 "docs/troubleshooting.md"):
+    for name in ("README.md", "docs/mcp-tools.md", "docs/usage.md",
+                 "developer.md"):
         text = (repo / name).read_text(encoding="utf-8")
         for phrase in forbidden:
             assert phrase not in text, (name, phrase)
@@ -2962,7 +2962,7 @@ def test_docs_never_claim_a_single_bad_figure_blocks_the_whole_document():
     # 反面文案命中 —— 那正是這條測試要擋的講法。
     affirmative = ("那一張缺席", "只讓那一張缺席", "那幾張缺席")
     negated = ("不會缺席", "不缺席", "沒有缺席")
-    for name in ("docs/mcp-tools.md", "docs/rag.md", "docs/troubleshooting.md"):
+    for name in ("docs/mcp-tools.md", "docs/usage.md", "developer.md"):
         text = (repo / name).read_text(encoding="utf-8")
         assert any(phrase in text for phrase in affirmative), name
         for phrase in negated:

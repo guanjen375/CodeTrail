@@ -11,7 +11,7 @@ mcp>=1.28,<2         # MCP server（現行 FastMCP import 只相容 SDK 1.x）
 numpy>=1.21.0       # RAG / MMR 向量運算
 jieba>=0.42.1       # 中文 BM25 必要分詞器；缺席時查詢報錯
 # C/C++ AST 解析（Code RAG symbol / graph 抽取；缺席或 ABI 不相容即報錯）。
-# 其他語言的必要 grammar / Universal Ctags 見 docs/dependencies.md。釘版:grammar wheel 與
+# 其他語言的必要 grammar / Universal Ctags 見 developer.md#dependencies。釘版:grammar wheel 與
 # py-tree-sitter 之間有 ABI 相容窗(0.26 = language ABI ≤15),驗證過才釘。
 tree-sitter==0.26.0
 tree-sitter-c==0.24.2
@@ -23,4 +23,4 @@ pyelftools>=0.30
 # 功能依賴：只在使用該功能時要求；缺少時該操作報錯，doctor 會提示
 # pip install "pymupdf4llm==1.28.0"               # RAG.py 從 PDF/MD 建知識庫(釘驗證版,上游 schema 常變動)
 # pip install html2text                            # RAG.py --url 抓網頁
-# llama.cpp llama-server 本身要自己 build,見 docs/setup.md
+# llama.cpp llama-server 本身要自己 build,見 README.md

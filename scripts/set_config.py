@@ -13,8 +13,9 @@ nvidia-smi 稍微監控)。
   2. 偵測:GPU 種類/VRAM、~/models 的 GGUF 自動分類(main / embedding /
      reranker / VL+mmproj);多 shard 聚合並驗證齊全性(缺片直接列出)。
   3. 背景初步判定:GPU 數與四類模型是否齊全,缺什麼通知什麼。
-  4. 互動問答,一個角色問完才進下一個(每組先列出偵測結果再提問):
-       [1/5] 主聊天模型 → 模型、GPU、ctx、CPU-MoE 層數
+  4. 互動問答,一個角色問完才進下一個(下列為內部完整精靈;
+     ./set_config.sh 日常入口只問四組模型,沿用既有壓縮模式):
+       [1/5] 主聊天模型 → 模型、GPU、ctx、CPU-MoE 層數、DSpark
        [2/5] embedding  → 模型、GPU
        [3/5] reranker   → 模型、GPU、internal buffer(ctx)
        [4/5] VL         → 模型、GPU、mmproj、CPU-MoE 層數
@@ -29,7 +30,8 @@ nvidia-smi 稍微監控)。
      threads 不再是問題:未給 --threads 就不寫 -t,交給 llama.cpp 自己的預設。
      最後顯示摘要一頁(Enter 寫入 / q 離開)。
   5. 非互動:`--yes` 跳過提問與確認,但所有使用者選擇題的值必須由旗標提供
-     (--main-model / --ctx / --rerank-ctx / ...),缺哪個就明確報錯。
+     (--main-model / --ctx / --rerank-ctx / ...),缺哪個就明確報錯;
+     DSpark 省略為 off,沿用配對需明示 --dspark keep。
   6. 產物(先寫 staging、全部就緒才原子替換;既有檔備份 *.bak-setconfig-*):
      - ~/.config/codetrail/models.json     主模型 registry(合併既有)
      - ~/.config/codetrail/deployment.json deployment local override(含每個角色
@@ -41,6 +43,7 @@ nvidia-smi 稍微監控)。
   7. 安全預設:llama-server 只綁 127.0.0.1;要讓其他機器連線必須明確
      `--allow-remote`(或 deployment.json 的 bind: "all-interfaces")。
 
+附加入口 ./scripts/configure-advanced.sh 提供 A/B、manifest、交易還原與獨立 DSpark。
 `--restore-last-backup` 可把該次 transaction 的產物還原到最近一次備份。
 GGUF chat template 只用 Jinja2 建 AST、不執行內容；產物經 deployment_profile 的封閉 schema 驗證。
 """
@@ -59,6 +62,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from urllib.parse import urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -77,6 +81,7 @@ import client_compaction  # noqa: E402
 import client_config  # noqa: E402
 import client_paths  # noqa: E402
 import compaction_formula  # noqa: E402
+import endpoint_policy  # noqa: E402
 import process_env  # noqa: E402
 import template_capabilities  # noqa: E402
 GIB = 1024**3
@@ -269,6 +274,7 @@ class Plan:
     vl_cpu_moe: bool = False
     vl_n_cpu_moe: int | None = None
     vl_layout: ModelLayout | None = None
+    dspark: DSparkConfig | None = None
     allow_remote: bool = False
     parameters: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
@@ -391,7 +397,7 @@ def check_llama_binary(binary: Path, skip: bool, notes: list[str]) -> dict[str, 
     if not binary.is_file() or not os.access(binary, os.X_OK):
         message = (
             f"[FAIL] 找不到可執行的 llama-server:{binary}\n"
-            "  尚未 build 的話照 README §1.5:\n"
+            "  尚未 build 的話照 developer.md#dependencies:\n"
             "    git clone https://github.com/ggerganov/llama.cpp ~/llama.cpp\n"
             "    cd ~/llama.cpp && cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF && "
             "cmake --build build --config Release -j\n"
@@ -437,7 +443,7 @@ def check_llama_binary(binary: Path, skip: bool, notes: list[str]) -> dict[str, 
             f"    {detail or '(無輸出)'}\n"
             "  這通常不是旗標支援問題,而是執行環境問題:\n"
             "  - 動態庫找不到(例如 libcudart / libcublas):把 CUDA lib 目錄加進 LD_LIBRARY_PATH\n"
-            "  - binary 損壞或架構不符:重新 build llama.cpp(README §1.5)\n"
+            "  - binary 損壞或架構不符:重新 build llama.cpp(developer.md#dependencies)\n"
             f"  修好後先在終端執行 {binary} --help 確認,再重跑 ./set_config.sh"
         )
         if skip:
@@ -450,7 +456,7 @@ def check_llama_binary(binary: Path, skip: bool, notes: list[str]) -> dict[str, 
         message = (
             f"[FAIL] 這個 llama-server 不支援 {' / '.join(missing)}"
             "(reranker / VL 角色必要)。\n"
-            "  修復:更新並重新 build llama.cpp(README §1.5):\n"
+            "  修復:更新並重新 build llama.cpp(developer.md#dependencies):\n"
             "    cd ~/llama.cpp && git pull && rm -rf build && "
             "cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF && cmake --build build --config Release -j"
         )
@@ -472,7 +478,7 @@ def check_llama_binary(binary: Path, skip: bool, notes: list[str]) -> dict[str, 
             "[FAIL] embedding / reranker 的安全預設需要 llama-server --cache-ram，"
             "才能以 --cache-ram 0 停用不可重用、會累積 RAM 的 prompt cache；"
             "這個 build 不支援該旗標。\n"
-            "  修復:更新並重新 build llama.cpp(README §1.5)，再重跑 ./set_config.sh"
+            "  修復:更新並重新 build llama.cpp(developer.md#dependencies)，再重跑 ./set_config.sh"
         )
         if skip:
             notes.append("⚠ 已跳過 --cache-ram 檢查(假設為支援該旗標的新版)。")
@@ -485,7 +491,7 @@ def check_llama_binary(binary: Path, skip: bool, notes: list[str]) -> dict[str, 
         message = (
             "[FAIL] 安全的 VL placement 需要 llama-server --fit,才能在 embedding/reranker"
             " 啟動後保留推論用 VRAM;這個 build 不支援 --fit。\n"
-            "  修復:更新並重新 build llama.cpp(README §1.5):\n"
+            "  修復:更新並重新 build llama.cpp(developer.md#dependencies):\n"
             "    cd ~/llama.cpp && git pull && rm -rf build && "
             "cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF && cmake --build build --config Release -j"
         )
@@ -507,7 +513,7 @@ def detect_gpus() -> list[Gpu]:
     if not smi:
         raise SetupError(
             "偵測失敗:找不到 nvidia-smi。請確認 NVIDIA 驅動已安裝,"
-            "且 nvidia-smi 在 PATH 上(README §1)。"
+            "且 nvidia-smi 在 PATH 上(developer.md#dependencies)。"
         )
     try:
         proc = process_env.run(
@@ -912,14 +918,14 @@ def scan_models(
     if not models_dir.is_dir():
         raise SetupError(
             f"偵測失敗:找不到模型目錄 {models_dir}。"
-            "請先依 README §2 下載 GGUF,或用 --models-dir 指定位置。"
+            "請先依 README.md#models 下載 GGUF,或用 --models-dir 指定位置。"
         )
     try:
         ggufs = sorted(p for p in models_dir.rglob("*.gguf") if p.is_file())
     except PermissionError as exc:
         raise SetupError(f"偵測失敗:模型目錄無法讀取(權限不足):{exc}") from exc
     if not ggufs:
-        raise SetupError(f"偵測失敗:{models_dir} 內沒有任何 .gguf 模型檔(README §2)。")
+        raise SetupError(f"偵測失敗:{models_dir} 內沒有任何 .gguf 模型檔(README.md#models)。")
 
     mmprojs = [p for p in ggufs if "mmproj" in p.name.lower()]
     seen: set[Path] = set()
@@ -975,7 +981,7 @@ def scan_models(
         haystack = _haystack(candidate)
         sibling_mmproj = sorted(
             (mp for mp in mmprojs if mp.parent == candidate.path.parent),
-            # 偏好 f16 mmproj(README §2.4 的預設下載)。
+            # 偏好 f16 mmproj(README.md#models 的預設下載)。
             key=lambda mp: (0 if "f16" in mp.name.lower() else 1, mp.name),
         )
         if "rerank" in haystack:
@@ -999,7 +1005,7 @@ def scan_models(
                     )
                 )
                 if not ambiguous:
-                    # 一目錄一模型(README §2 慣例)→ mmproj 配對明確:
+                    # 一目錄一模型(README.md#models 慣例)→ mmproj 配對明確:
                     # 標記 vl_paired,排序永遠在非 VL 之後,不會被自動選成 main。
                     candidate = ModelCandidate(
                         path=candidate.path,
@@ -1016,7 +1022,7 @@ def scan_models(
             notes.append(
                 f"⚠ {directory} 內有多顆模型與 mmproj 混放,無法確定 mmproj 屬於哪顆模型:"
                 "這些模型不會被自動視為 VL 專用。建議每顆模型一個目錄、"
-                "mmproj 與它的 VL 模型放同一目錄(README §2.4)。"
+                "mmproj 與它的 VL 模型放同一目錄(README.md#models)。"
             )
 
     for role, entries in candidates.items():
@@ -1068,7 +1074,7 @@ def precheck(gpus: list[Gpu], candidates: dict[str, list[ModelCandidate]],
             detail = "\n以下模型因不完整被剔除(修復後重跑):\n  - " + "\n  - ".join(broken)
         raise SetupError(
             "初步判定不通過:~/models 缺少必要模型類別 → " + "、".join(lacking)
-            + "。下載方式見 README §2;四類模型都是硬性需求。" + detail
+            + "。下載方式見 README.md#models;四類模型都是硬性需求。" + detail
         )
     for report in broken:
         warnings.append(f"模型不完整已剔除:{report}(重新執行原本的 hf download 即可補齊)")
@@ -1397,7 +1403,7 @@ def choose_cpu_moe_layers(
             raise SetupError(
                 f"{role_label}:全 CPU-MoE 需要 llama-server 的 --cpu-moe,"
                 "但目前 build 不支援。\n"
-                f"  修復:更新並重新 build llama.cpp(README §1.5),或改用 {none_flag}。"
+                f"  修復:更新並重新 build llama.cpp(developer.md#dependencies),或改用 {none_flag}。"
             )
         return True, None
     if n_cpu_moe_override is not None:
@@ -1412,14 +1418,14 @@ def choose_cpu_moe_layers(
                 raise SetupError(
                     f"{role_label}:{n_flag} {n_cpu_moe_override} ≥ 層數上限 {ceiling}"
                     " 等同全 CPU-MoE,但這個 build 不支援 --cpu-moe。\n"
-                    "  修復:更新並重新 build llama.cpp(README §1.5)。"
+                    "  修復:更新並重新 build llama.cpp(developer.md#dependencies)。"
                 )
             return True, None
         if not caps.get("n_cpu_moe", False):
             raise SetupError(
                 f"{role_label}:{n_flag} 需要 llama-server 支援 --n-cpu-moe,"
                 "但目前 build 沒有這個旗標。\n"
-                f"  修復:更新並重新 build llama.cpp(README §1.5),或改用 {all_flag}。"
+                f"  修復:更新並重新 build llama.cpp(developer.md#dependencies),或改用 {all_flag}。"
             )
         return True, n_cpu_moe_override
 
@@ -1447,7 +1453,7 @@ def choose_cpu_moe_layers(
         notes.append(
             f"⚠ {role_label}是 MoE,但這個 llama-server build 不支援 --cpu-moe/"
             "--n-cpu-moe → 不套用 CPU-MoE。更新並重新 build llama.cpp"
-            "(README §1.5)後重跑可啟用。"
+            "(developer.md#dependencies)後重跑可啟用。"
         )
         return False, None
     if assume_yes:
@@ -1501,7 +1507,7 @@ def resolve_vl_mmproj(
     if not choices:
         raise SetupError(
             f"VL 模型 {vl_cand.path.name} 同目錄找不到 mmproj *.gguf;"
-            "VL 模型與它的 mmproj 必須放在同一目錄(README §2.4),"
+            "VL 模型與它的 mmproj 必須放在同一目錄(README.md#models),"
             "或用 --vl-mmproj 明確指定。"
         )
     if len(choices) == 1:
@@ -1536,6 +1542,7 @@ def build_main_parameters(candidate: ModelCandidate, ctx: int, threads: int | No
     threads 不是互動題:只有 --threads 才會寫 -t,否則交給 llama.cpp 自己的預設。
     """
     parameters: dict = {
+        "parallel": 1,
         "jinja": True,
         "flash_attention": "on",
         "cache_type_k": "q8_0",
@@ -1595,7 +1602,7 @@ def _warn_unverified_aux(plan: Plan) -> None:
             plan.notes.append(
                 f"⚠ {selection.role} 選了未經維護者驗證的模型 {selection.candidate.path.name}:"
                 "server 可能正常啟動,但 pooling / reranking / 圖片分析行為不保證正確"
-                "(維護者驗證組合見 README §2.3–§2.4)。"
+                "(維護者驗證組合見 README.md#models)。"
             )
 
 
@@ -1655,7 +1662,7 @@ def warn_cpu_moe_without_no_mmap(role_label: str, service_key: str, cpu_moe: boo
     """CPU-MoE + mmap 是 llama.cpp 會自己警告的組合,不能靜默放過。
 
     experts 留在 RAM 但檔案仍走 mmap 時,權重是「第一次推論才從 SSD 逐頁載入」,
-    首次回應可能慢到分鐘級(docs/troubleshooting.md 有記載)。本工具不替使用者
+    首次回應可能慢到分鐘級(developer.md#troubleshooting 有記載)。本工具不替使用者
     決定 no_mmap(那是使用者領域、代價是啟動時要把整份權重讀進 RAM),
     但要把選項講清楚。
     """
@@ -1713,7 +1720,10 @@ def build_deployment_config(plan: Plan) -> dict:
         "main": {
             "model": plan.main_key,
             "thinking_kwarg": inspect_main_thinking_kwarg(plan.main.candidate, plan.notes),
-            "dspark": None,
+            "dspark": (None if plan.dspark is None else {
+                "draft_model": plan.dspark.draft_model,
+                "draft_n_max": plan.dspark.draft_n_max,
+            }),
             "gpu": plan.main.gpu.selector,
             "ctx": plan.ctx,
             "batch": plan.batch,
@@ -1795,7 +1805,6 @@ def merge_existing_deployment(config: dict, existing_path: Path, notes: list[str
         return
     if not isinstance(existing, dict):
         return
-    _preserve_dspark_pairing(config, existing_path, notes, main_model_path=main_model_path)
     old_services = existing.get("services", {})
     if not isinstance(old_services, dict):
         return
@@ -1803,12 +1812,20 @@ def merge_existing_deployment(config: dict, existing_path: Path, notes: list[str
         old_service = old_services.get(role)
         if not isinstance(old_service, dict):
             continue
-        # port/base_url 屬使用者領域(本工具從不產生這兩鍵)→ 手動改過就原樣保留,
-        # 不能重跑一次就靜默退回預設 port。
-        carried = [
-            key for key in ("port", "base_url")
-            if key in old_service and key not in new_service
-        ]
+        # 本機 listener 只繼承本機自訂端點；B 的 port/base_url 是 A 的目的地，
+        # 不能變成本機 readiness / aicode 的目的地。
+        try:
+            old_url = old_service.get("base_url")
+            local_endpoint = old_url is None or endpoint_policy.is_loopback_host(
+                urlsplit(old_url).hostname or ""
+            )
+        except (TypeError, ValueError):
+            local_endpoint = False
+        keep_endpoint = existing.get("mode") != "client" and local_endpoint
+        carried = [key for key in ("port", "base_url")
+                   if keep_endpoint and key in old_service and key not in new_service]
+        if not keep_endpoint and any(key in old_service for key in ("port", "base_url")):
+            notes.append(f"services.{role} 已移除先前遠端 port/base_url；改用本機 loopback 端點。")
         for key in carried:
             new_service[key] = old_service[key]
         if carried:
@@ -1839,46 +1856,105 @@ def merge_existing_deployment(config: dict, existing_path: Path, notes: list[str
         if old_service.get("bind") == "all-interfaces" and "bind" not in new_service:
             notes.append(
                 "⚠ 既有設定開放區網連線(bind: all-interfaces),本次未加 --allow-remote"
-                " → 回到僅本機 127.0.0.1。要維持開放請重跑 ./set_config.sh，選 model-host 並明確允許 LAN。"
+                " → 回到僅本機 127.0.0.1。要維持開放請用 ./scripts/configure-advanced.sh 選項 3，明確允許 LAN。"
             )
 
 
-def _preserve_dspark_pairing(config: dict, existing_path: Path, notes: list[str], *,
-                             main_model_path: Path | None) -> None:
-    """A draft pairing follows the resolved main artifact, never its registry key."""
-    main = config.get("services", {}).get("main")
-    if not isinstance(main, dict):
-        return
-    main["dspark"] = None
+def _previous_dspark_pairing(existing_path: Path, notes: list[str], *,
+                             main_model_path: Path) -> DSparkConfig | None:
+    """Return an eligible prior choice without changing the user's new answer."""
+    if not existing_path.exists() and not existing_path.is_symlink():
+        return None
     registry_file = existing_path.with_name("models.json")
     try:
         previous = load_effective_profile(
             deployment_config=existing_path, model_registry_file=registry_file,
         ).service("main")
     except ProfileError as exc:
-        notes.append(f"⚠ 既有 DSpark 配對無法核對，這次設為 off；需用 ./set_config.sh 選單 7 重新設定：{exc}")
-        return
+        notes.append(f"⚠ 既有 DSpark 配對無法核對，不能沿用；本次請選 off 或重新指定 draft：{exc}")
+        return None
     if previous.dspark is None:
-        return
+        return None
     try:
         old_path = Path(resolve_model_reference(previous.model, registry_file=registry_file))
-        new_path = (main_model_path.resolve() if main_model_path is not None else Path(
-            resolve_model_reference(main.get("model"), registry_file=registry_file)
-        ))
+        new_path = main_model_path.resolve()
         draft_path = resolve_model_reference(previous.dspark.draft_model, registry_file=registry_file)
     except (OSError, RuntimeError, ProfileError) as exc:
-        notes.append(f"⚠ 主模型檔案無法核對，已關閉原 DSpark 配對；請用 ./set_config.sh 選單 7 重新設定：{exc}")
-        return
+        notes.append(f"⚠ 主模型檔案無法核對，不能沿用 DSpark 配對；本次請選 off 或重新指定 draft：{exc}")
+        return None
     if old_path != new_path:
-        notes.append("主模型已更換，已關閉原 DSpark 配對；請用 ./set_config.sh 選單 7 選擇匹配新主模型的 draft。")
-        return
-    main["dspark"] = {
-        # The new main registry key can replace an old draft key. Freeze the
-        # resolved prior draft, so registry regeneration cannot silently re-pair.
-        "draft_model": draft_path,
-        "draft_n_max": previous.dspark.draft_n_max,
-    }
-    notes.append(f"主模型檔案未變，保留 DSpark 配對：{draft_path}（draft_n_max={previous.dspark.draft_n_max}）。")
+        notes.append("主模型已更換，不能沿用原 DSpark 配對；啟用時需選擇匹配新主模型的 draft。")
+        return None
+    # Freeze the resolved draft before registry regeneration can reuse its key.
+    return DSparkConfig(draft_path, previous.dspark.draft_n_max)
+
+
+def choose_main_dspark(args: argparse.Namespace, main_path: Path,
+                       existing_path: Path, notes: list[str]) -> DSparkConfig | None:
+    """DSpark has one authoritative choice; unattended omission is always off."""
+    choice = args.dspark
+    previous = None
+    if choice == "keep" or (choice is None and not args.yes):
+        previous = _previous_dspark_pairing(existing_path, notes, main_model_path=main_path)
+    if choice is None and args.yes:
+        choice = "off"
+    if choice is None:
+        print("DSpark 推測解碼：預設 off；啟用需要與主模型匹配的本地 draft。")
+        if previous is not None:
+            print(f"可明示沿用：{previous.draft_model}（draft_n_max={previous.draft_n_max}）。")
+        options = "off/on/keep/q" if previous is not None else "off/on/q"
+        while True:
+            choice = _input_optional(f"DSpark [{options}, Enter=off]: ", "q").strip().lower() or "off"
+            if choice == "q":
+                raise KeyboardInterrupt
+            if choice in {"off", "on"} or (choice == "keep" and previous is not None):
+                break
+            print(f"請輸入 {options}；Enter 關閉 DSpark。")
+    if choice == "off":
+        return None
+    if choice == "keep":
+        if previous is None:
+            raise SetupError("--dspark keep 需要與本次主模型檔案相同且可核對的既有配對；請選 off 或 on。")
+        notes.append("已明示沿用原 DSpark 配對；啟用前仍會驗證 draft 與 llama-server。")
+        return previous
+    print("請提供為這份主模型訓練的匹配 DSpark draft GGUF；只使用本地檔案，不下載模型。")
+    print("檔名不能證明配對相容；啟動器會驗證載入與 live /slots 的 speculative 狀態。")
+    raw_path = args.dspark_draft
+    while True:
+        if raw_path is None:
+            if args.yes:
+                raise SetupError("--dspark on 需要 --dspark-draft 指定本地 .gguf 絕對路徑。")
+            raw_path = _input_optional("匹配的本地 draft GGUF 絕對路徑（q=離開）: ", "q").strip()
+            if raw_path.lower() == "q":
+                raise KeyboardInterrupt
+        try:
+            draft_path = Path(raw_path).expanduser()
+            valid = bool(raw_path) and draft_path.is_absolute() and draft_path.suffix.lower() == ".gguf"
+        except (OSError, RuntimeError, ValueError):
+            valid = False
+        if valid:
+            break
+        if args.dspark_draft is not None:
+            raise SetupError("--dspark-draft 必須是本地 .gguf 絕對路徑。")
+        print("請提供本地 .gguf 絕對路徑。")
+        raw_path = None
+    draft_n_max = args.dspark_draft_n_max
+    if draft_n_max is None:
+        if args.yes:
+            draft_n_max = 3
+        else:
+            while True:
+                raw = _input_optional("draft_n_max [1-64, Enter=3]（q=離開）: ", "q").strip()
+                if raw.lower() == "q":
+                    raise KeyboardInterrupt
+                if not raw:
+                    draft_n_max = 3
+                    break
+                if len(raw) <= 2 and raw.isdecimal() and 1 <= int(raw) <= 64:
+                    draft_n_max = int(raw)
+                    break
+                print("請輸入 1-64 的整數。")
+    return DSparkConfig(str(draft_path), draft_n_max)
 
 
 #: 客戶端 lessons 注入檔(由 `aicode` 的 preflight render,客戶端接進 system prompt)。
@@ -1919,22 +1995,80 @@ def _threads_description(plan: Plan) -> str:
     return "auto(不傳 -t;llama.cpp 自動取實體/P-core 數)"
 
 
+def _checkout_version(repo_root: Path) -> str:
+    """Read the checkout's commit without running Git or trusting shell routing."""
+    def read(path: Path, limit: int = 4096) -> str:
+        if not path.is_file():
+            raise ValueError("Git metadata is not a regular file")
+        with path.open("r", encoding="utf-8") as stream:
+            text = stream.read(limit + 1)
+        if len(text) > limit:
+            raise ValueError("Git metadata exceeds version display bounds")
+        return text.strip()
+
+    try:
+        metadata = repo_root / ".git"
+        if not metadata.is_dir():
+            marker = read(metadata)
+            if not marker.startswith("gitdir: "):
+                return "unknown"
+            metadata = (repo_root / marker.removeprefix("gitdir: ")).resolve()
+        head = read(metadata / "HEAD")
+        if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", head):
+            return head.lower()
+        if not head.startswith("ref: refs/"):
+            return "unknown"
+        reference = head.removeprefix("ref: ")
+        if ".." in reference or not re.fullmatch(r"refs/[A-Za-z0-9._/-]+", reference):
+            return "unknown"
+        directories = [metadata]
+        if (metadata / "commondir").is_file():
+            directories.append((metadata / read(metadata / "commondir")).resolve())
+        for directory in directories:
+            loose = directory / reference
+            if loose.is_file():
+                commit = read(loose)
+                if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit):
+                    return commit.lower()
+            packed = directory / "packed-refs"
+            if packed.is_file():
+                for line in read(packed, 8 * MIB).splitlines():
+                    fields = line.split()
+                    if (len(fields) == 2 and fields[1] == reference
+                            and re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", fields[0])):
+                        return fields[0].lower()
+    except (OSError, UnicodeError, ValueError, RuntimeError):
+        pass
+    return "unknown"
+
+
 def render_start_wrapper(repo_root: Path = REPO_ROOT) -> str:
     """Render the installed wrapper without probing hardware or reading settings."""
-    root = Path(repo_root)
+    root = Path(repo_root).resolve()
+    generated_at = time.strftime("%Y-%m-%d %H:%M:%S %z")
+    version = _checkout_version(root)
+    banner = " ".join(shlex.quote(line) for line in (
+        f"[start.sh] checkout: {root}",
+        f"[start.sh] generated: {generated_at}",
+        f"[start.sh] version: {version}",
+    ))
     stop_py = shlex.quote(str(root / "scripts" / "stop_servers.py"))
     launch_py = shlex.quote(str(root / "scripts" / "launch_servers.py"))
     return f"""#!/usr/bin/env bash
 # {GENERATED_MARKER}
+# checkout: {json.dumps(str(root), ensure_ascii=False)}
+# generated: {generated_at}
+# version: {version}
 # 無參數啟動四個模型；唯一子命令 stop 停止四個模型。
 # 設定由 deployment.json 與 repo 常數決定。
 set -euo pipefail
-if [ "$#" -eq 1 ] && [ "$1" = "stop" ]; then
-  exec python3 {stop_py} --scope all
-fi
-if [ "$#" -ne 0 ]; then
+if [ "$#" -gt 1 ] || {{ [ "$#" -eq 1 ] && [ "$1" != "stop" ]; }}; then
   echo "[start.sh] 只接受無參數啟動，或單一 stop。" >&2
   exit 2
+fi
+printf '%s\\n' {banner}
+if [ "$#" -eq 1 ]; then
+  exec python3 {stop_py} --scope all
 fi
 rc=0
 python3 {launch_py} --scope all || rc=$?
@@ -1959,7 +2093,7 @@ def build_start_sh(plan: Plan) -> str:
 """
     return render_start_wrapper().replace(
         f"# {GENERATED_MARKER}\n",
-        f"# {GENERATED_MARKER} — {time.strftime('%Y-%m-%d %H:%M:%S')}\n{metadata}",
+        f"# {GENERATED_MARKER}\n{metadata}",
         1,
     )
 
@@ -2416,7 +2550,7 @@ def restore_last_backup(home: Path, dry_run: bool = False) -> int:
                     "共用這個檔)。整份拒絕還原,一個檔都沒有動 —— 半套還原會把不同世代"
                     "的設定拼在一起。\n"
                     "  要還原那一份,請用寫它的那個 checkout 的 set_config;"
-                    "舊世代前端留下的設定看 docs/troubleshooting.md 的升級段。",
+                    "舊世代前端留下的設定看 developer.md#troubleshooting 的升級段。",
                     file=sys.stderr,
                 )
                 return 2
@@ -2616,19 +2750,24 @@ def restore_last_backup(home: Path, dry_run: bool = False) -> int:
 # 驗證、預覽、運行中偵測
 # ---------------------------------------------------------------------------
 
-def _restart_servers(start_path: Path) -> int:
+def _restart_servers(start_path: Path | None = None) -> int:
     """[R] 自動重啟:先 stop 再 start。
 
     兩個子行程的環境都由 `process_env` 算(CodeTrail 的四個設定前綴一律剝掉):
     stop 與 start 要對得上同一組 tmux session 名與同一份設定,而那些現在只來自
     `deployment_profile` 的常數與 `deployment.json`,殼層插不進來。
     """
-    process_env.run(
+    stopped = process_env.run(
         [sys.executable, str(REPO_ROOT / "scripts" / "stop_servers.py"), "--scope", "all"],
         check=False,
     )
+    if stopped.returncode != 0:
+        print("  停止舊 server 失敗；尚未啟動新設定。", file=sys.stderr)
+        return stopped.returncode
     print("  已停止舊 server;開始啟動新設定(載入大模型需要幾分鐘)…")
-    return process_env.run(["bash", str(start_path)], check=False).returncode
+    command = (["bash", str(start_path)] if start_path is not None else
+               [sys.executable, str(REPO_ROOT / "scripts" / "launch_servers.py"), "--scope", "all"])
+    return process_env.run(command, check=False).returncode
 
 
 def _staging_file(content: str, label: str) -> Path:
@@ -2652,10 +2791,17 @@ def validate_payloads(deployment_json: str, registry_json: str) -> None:
     deployment_path = _staging_file(deployment_json, "deployment")
     registry_path = _staging_file(registry_json, "models")
     try:
-        load_effective_profile(
+        profile = load_effective_profile(
             deployment_config=str(deployment_path),
             model_registry_file=str(registry_path),
         )
+        if profile.service("main").dspark is not None:
+            from dspark_runtime import validate_dspark_runtime
+
+            resolve_model_reference(profile.service("main").model, must_exist=True,
+                                    registry_file=registry_path)
+            validate_dspark_runtime(profile.service("main"), profile.llama_bin,
+                                    registry_file=registry_path)
     except ProfileError as exc:
         raise SetupError(f"產生的設定未通過 deployment profile 驗證(未寫入任何檔案):{exc}") from exc
     finally:
@@ -2791,6 +2937,11 @@ def _parser() -> argparse.ArgumentParser:
             "--yes 沒給這個旗標時沿用既有選擇,還沒選過就完全不碰壓縮設定。"
         ),
     )
+    parser.add_argument("--dspark", choices=("off", "on", "keep"),
+                        help="主模型 DSpark：off 關閉、on 指定本地 draft、keep 明示沿用相同主模型配對；--yes 省略為 off")
+    parser.add_argument("--dspark-draft", help="--dspark on 的本地 draft .gguf 絕對路徑")
+    parser.add_argument("--dspark-draft-n-max", type=int,
+                        help="--dspark on 每次最多提出的 token 數，1-64，省略為 3")
     parser.add_argument("--dry-run", action="store_true", help="只顯示會寫入的內容,不動任何檔案")
     parser.add_argument("--allow-remote", action="store_true",
                         help="讓區網其他機器可連線模型 API(未指定只綁 127.0.0.1;llama-server 無認證,慎用)")
@@ -2844,6 +2995,10 @@ def _print_summary_page(plan: Plan, python_bin: str,
           f" → GPU {plan.vl.gpu.choice}")
     print(f"              {_vl_offload_description(plan)}")
     print(f"  主模型參數: ctx={plan.ctx}、threads={_threads_description(plan)}、{offload}")
+    if plan.dspark is None:
+        print("  DSpark    : off")
+    else:
+        print(f"  DSpark    : on；draft={plan.dspark.draft_model}；draft_n_max={plan.dspark.draft_n_max}")
     bind = "0.0.0.0(區網可連,無認證!)" if plan.allow_remote else "127.0.0.1(僅本機)"
     print(f"  綁定      : {bind}")
     print(f"  MCP Python: {python_bin}")
@@ -2873,7 +3028,8 @@ def configure_dspark(home: Path) -> int:
     deployment_path = home / ".config" / "codetrail" / "deployment.json"
     registry_file = deployment_path.with_name("models.json")
     if not deployment_path.exists() and not deployment_path.is_symlink():
-        print("DSpark 需要既有主模型設定；請先用 ./set_config.sh 設定 local 或 model-host。")
+        print("DSpark 需要既有主模型設定；請先用 ./set_config.sh 設定本機主模型，"
+              "或用 ./scripts/configure-advanced.sh 選項 3 設定模型主機 A。")
         return 0
     try:
         original = deployment_path.read_text(encoding="utf-8")
@@ -2882,9 +3038,10 @@ def configure_dspark(home: Path) -> int:
             model_registry_file=registry_file,
         )
     except (OSError, UnicodeError, ProfileError) as exc:
-        raise SetupError(f"DSpark 需要有效的主模型設定；請先用 ./set_config.sh 修正 local 或 model-host：{exc}") from exc
+        raise SetupError("DSpark 需要有效的主模型設定；請用 ./set_config.sh 修正本機設定，"
+                         f"模型主機 A 則用 ./scripts/configure-advanced.sh 選項 3：{exc}") from exc
     if profile.mode == "client":
-        print("目前是 client（工作機 B）；DSpark 請在模型主機 A 執行 ./set_config.sh 選單 7 設定。")
+        print("目前是 client（工作機 B）；DSpark 請在模型主機 A 執行 ./scripts/configure-advanced.sh 選項 7 設定。")
         return 0
     main = profile.service("main")
     try:
@@ -2892,7 +3049,9 @@ def configure_dspark(home: Path) -> int:
             main.model, {"HOME": str(home)}, registry_file=registry_file,
         )
     except ProfileError as exc:
-        raise SetupError(f"DSpark 需要既有主模型；請先用 ./set_config.sh 完成主模型設定：{exc}") from exc
+        setup_entry = ("./scripts/configure-advanced.sh 選項 3" if profile.mode == "model-host"
+                       else "./set_config.sh")
+        raise SetupError(f"DSpark 需要既有主模型；請先用 {setup_entry} 完成主模型設定：{exc}") from exc
 
     print(f"\nDSpark 推測解碼（目前角色：{profile.mode}；目前狀態：{'on' if main.dspark else 'off'}）")
     print(f"主模型：{main_path}")
@@ -2962,10 +3121,10 @@ def configure_dspark(home: Path) -> int:
     print(f"主模型：{main_path}\nDSpark：{choice}")
     if desired:
         print(f"draft：{desired.draft_model}\ndraft_n_max：{desired.draft_n_max}")
-    print(f"本次只更新：{deployment_path}（保留其餘設定；可用選單 5 還原本次交易）")
+    print(f"本次只更新：{deployment_path}（保留其餘設定；可用 ./scripts/configure-advanced.sh 選項 5 還原本次交易）")
     if profile.mode == "model-host":
         print("A 的 main identity alias 會重新計算權重 SHA-256；關閉時也要雜湊主模型，可能需要幾分鐘。")
-        print("完成後請在 A 用選單 6 重新匯出 endpoint manifest，再到 B 重新匯入。")
+        print("完成後請在 A 用 ./scripts/configure-advanced.sh 選項 6 重新匯出 endpoint manifest，再到 B 重新匯入。")
     if _input_optional("確認寫入 DSpark 設定？[y/N] ").strip().lower() not in {"y", "yes"}:
         print("未確認；未寫入設定。")
         return 0
@@ -2996,14 +3155,23 @@ def configure_dspark(home: Path) -> int:
     finally:
         staged.unlink(missing_ok=True)
     if deployment_path.read_text(encoding="utf-8") != original:
-        raise SetupError("deployment.json 在確認期間已變更；本次未覆寫，請重新執行 ./set_config.sh 選單 7。")
+        raise SetupError("deployment.json 在確認期間已變更；本次未覆寫，請重新執行 ./scripts/configure-advanced.sh 選項 7。")
     notes: list[str] = []
     commit_files([(deployment_path, content, 0o644)], notes, False, home=home)
     for note in notes:
         print(note)
-    print(f"DSpark 已設定為 {choice}；尚未重啟。請執行新產生的 ~/start.sh stop，再執行 ~/start.sh 套用。")
+    print(f"DSpark 已設定為 {choice}；尚未重啟。")
     if profile.mode == "model-host":
-        print("請在 A 執行 ./set_config.sh 選單 6 重新匯出 endpoint manifest，並在 B 重新匯入。")
+        print("請在 A 執行 ./scripts/configure-advanced.sh 選項 6 重新匯出 endpoint manifest，並在 B 重新匯入。")
+    answer = _input_optional("[R] 現在套用並重啟四個模型 / [S] 稍後（Enter=S）: ", "s").strip().lower()
+    if answer == "r":
+        # Use this checkout's fixed cores; an older installation's start.sh is
+        # not part of this single-file transaction.
+        code = _restart_servers()
+        if code != 0:
+            return code
+    else:
+        print("稍後執行 ~/start.sh stop，再執行 ~/start.sh 套用。")
     print("啟動後進入 aicode，以 /status 查看狀態。")
     return 0
 
@@ -3013,7 +3181,7 @@ def configure_client(args: argparse.Namespace, home: Path) -> int:
     import endpoint_policy
     launcher_fields = ("llama_bin", "models_dir", "main_gpu", "embed_gpu", "rerank_gpu", "vl_gpu",
                        "ctx", "reranker_ctx", "threads", "vl_mmproj", "cpu_moe", "n_cpu_moe",
-                       "vl_cpu_moe", "vl_n_cpu_moe")
+                       "vl_cpu_moe", "vl_n_cpu_moe", "dspark", "dspark_draft", "dspark_draft_n_max")
     incompatible = [key for key in launcher_fields if getattr(args, key, None) is not None]
     if incompatible or args.allow_remote:
         raise SetupError("client mode does not accept local launcher options: " + ", ".join(incompatible or ["allow_remote"]))
@@ -3095,6 +3263,10 @@ def configure_client(args: argparse.Namespace, home: Path) -> int:
 
 def run(args: argparse.Namespace) -> int:
     home = Path(os.path.abspath(os.path.expanduser("~")))
+    explicit_dspark = any(getattr(args, name, None) is not None
+                          for name in ("dspark", "dspark_draft", "dspark_draft_n_max"))
+    if explicit_dspark and (args.restore_last_backup or getattr(args, "deployment_mode", "local") == "client"):
+        raise SetupError("DSpark 旗標只適用本機主模型設定，不能與 client 或 --restore-last-backup 合用。")
     if args.restore_last_backup:
         return restore_last_backup(home, dry_run=args.dry_run)
     if getattr(args, "deployment_mode", "local") == "client":
@@ -3102,6 +3274,10 @@ def run(args: argparse.Namespace) -> int:
     if (getattr(args, "endpoint_manifest", None) or getattr(args, "kb_context_remote_ok", None) is not None
             or any(getattr(args, f"{r}_url", None) for r in ("main", "embed", "rerank", "vl"))):
         raise SetupError("endpoint URL/manifest flags require --mode client")
+    if (args.dspark_draft is not None or args.dspark_draft_n_max is not None) and args.dspark != "on":
+        raise SetupError("--dspark-draft / --dspark-draft-n-max 只能搭配 --dspark on。")
+    if args.dspark_draft_n_max is not None and not 1 <= args.dspark_draft_n_max <= 64:
+        raise SetupError("--dspark-draft-n-max 必須在 1-64。")
 
     # 旗標的早期友善驗證(choose_int 也會擋;這裡在做任何偵測前先給清楚訊息)。
     if args.ctx is not None and not MIN_MAIN_CTX <= args.ctx <= MAX_MAIN_CTX:
@@ -3162,10 +3338,10 @@ def run(args: argparse.Namespace) -> int:
     except client_config.ClientConfigError as exc:
         base_notes.append(f"⚠ {exc}(這次會當成還沒選過壓縮模式)")
         prior_client_settings = client_config.ClientSettings(path=client_config_path)
-    leaving_client = bool(prior_client_settings.model_endpoints)
+    leaving_client = bool(prior_client_settings.model_endpoints or prior_client_settings.model_remote_ok)
     if leaving_client:
         prior_client_settings = replace(prior_client_settings, model_endpoints={}, model_remote_ok=False)
-        base_notes.append("Switching to local/model-host: remove the previous B endpoint grants; local loopback remains allowed.")
+        base_notes.append("改為 local/model-host：移除先前 B 的端點授權；模型使用本機 loopback 端點。")
 
     start_path = home / "start.sh"
     if start_path.exists():
@@ -3181,7 +3357,8 @@ def run(args: argparse.Namespace) -> int:
     def _section(step: int, title: str) -> None:
         """一個角色一組:先印標題,再問這個角色的所有題目(--yes 不需要分組。)"""
         if not args.yes:
-            print(f"\n=== [{step}/5] {title} ===")
+            total = 5 if getattr(args, "prompt_compaction", True) else 4
+            print(f"\n=== [{step}/{total}] {title} ===")
 
     def _layout_of(candidate: ModelCandidate, role_label: str,
                    notes: list[str]) -> ModelLayout | None:
@@ -3218,13 +3395,13 @@ def run(args: argparse.Namespace) -> int:
                         break
                     if raw in {"n", "no"}:
                         raise SetupError(
-                            "已取消:請先下載一顆主聊天模型(README §2.2)再重跑 ./set_config.sh。"
+                            "已取消:請先下載一顆主聊天模型(README.md#models)再重跑 ./set_config.sh。"
                         )
                     print("  請輸入 y 或 n。")
             notes.append(
                 f"⚠ 沒有非 VL 的主聊天模型候選,已把 VL 模型 {main_cand.path.name} 同時當 main"
                 "(VL service 會再載一份)。工具呼叫品質視該模型而定;"
-                "建議另外下載一顆主聊天模型(README §2.2)。"
+                "建議另外下載一顆主聊天模型(README.md#models)。"
                 "若這其實是一般聊天模型,把同目錄的 mmproj 移到 VL 模型自己的目錄後重跑即可。"
             )
 
@@ -3254,6 +3431,8 @@ def run(args: argparse.Namespace) -> int:
             notes=notes,
             gpu=main_gpu,
         )
+        dspark_choice = choose_main_dspark(args, main_cand.path,
+                                           codetrail_dir / "deployment.json", notes)
 
         # threads 從頭到尾不問:預設 auto(不傳 -t)。llama.cpp 的 -t 預設 -1 會
         # 自己偵測 hybrid CPU / 實體核心,比本工具數 os.cpu_count() 準;
@@ -3333,6 +3512,7 @@ def run(args: argparse.Namespace) -> int:
             vl_cpu_moe=vl_cpu_moe,
             vl_n_cpu_moe=vl_n_cpu_moe,
             vl_layout=vl_layout,
+            dspark=dspark_choice,
             allow_remote=allow_remote,
             parameters={},
             notes=notes,
@@ -3375,9 +3555,9 @@ def run(args: argparse.Namespace) -> int:
         registry = build_models_registry(plan, codetrail_dir / "models.json", notes)
         registry_json = json.dumps(registry, ensure_ascii=False, indent=2) + "\n"
         deployment_config = build_deployment_config(plan)
+        deployment_config["mode"] = getattr(args, "deployment_mode", "local")
         merge_existing_deployment(deployment_config, codetrail_dir / "deployment.json", notes,
                                   main_model_path=plan.main.candidate.path)
-        deployment_config["mode"] = getattr(args, "deployment_mode", "local")
         if deployment_config["mode"] == "model-host":
             from model_identity import ModelIdentityError, versioned_alias
             main_dspark = deployment_config["services"]["main"]["dspark"]
@@ -3392,7 +3572,7 @@ def run(args: argparse.Namespace) -> int:
                     )
             except ModelIdentityError as exc:
                 raise SetupError(f"模型權重身分無法核對，未寫入設定：{exc}") from exc
-            notes.append("A 的版本 alias 綁定權重身分；重啟後請用 ./set_config.sh 選單 6 匯出 manifest，再到 B 重新匯入。")
+            notes.append("A 的版本 alias 綁定權重身分；重啟後請用 ./scripts/configure-advanced.sh 選項 6 匯出 manifest，再到 B 重新匯入。")
         # CPU-MoE + mmap 的首次推論延遲:必須看「合併後真的要寫入」的參數,
         # 否則使用者手動設的 no_mmap(由 merge 帶回)會被誤報成沒設。
         warn_cpu_moe_without_no_mmap(
@@ -3405,14 +3585,17 @@ def run(args: argparse.Namespace) -> int:
         )
         deployment_json = json.dumps(deployment_config, ensure_ascii=False, indent=2) + "\n"
         # ---- [5/5] 壓縮模式 ----
-        _section(5, "壓縮模式")
+        if getattr(args, "prompt_compaction", True):
+            _section(5, "壓縮模式")
         prior_mode = (
             prior_client_settings.compaction_mode
             if prior_client_settings.present
             else None
         )
         chosen_mode = choose_compaction_mode(
-            args.compaction_mode, assume_yes=args.yes, prior_mode=prior_mode
+            args.compaction_mode,
+            assume_yes=args.yes or not getattr(args, "prompt_compaction", True),
+            prior_mode=prior_mode,
         )
         if chosen_mode is None and leaving_client:
             chosen_mode = prior_client_settings.compaction_mode
@@ -3420,7 +3603,7 @@ def run(args: argparse.Namespace) -> int:
         client_settings_json = None
         if chosen_mode is None:
             notes.append(
-                "壓縮模式:這次不碰(--yes 沒給 --compaction-mode,而且還沒選過)。"
+                "壓縮模式:這次不碰(未指定 --compaction-mode,而且還沒選過)。"
                 "沒有 client.json 就等於沒有接管,客戶端會退成 manual。"
             )
         else:

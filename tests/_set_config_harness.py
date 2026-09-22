@@ -87,14 +87,14 @@ YES_TWO_GPU = (
 YES_ONE_GPU = ("--yes", "--main-model", "1", "--rerank-model", "1", *NUM_FLAGS)
 
 # 標準 fixture 的互動作答順序(一個角色問完才換下一個):
-#   [1/5] main 編號、main GPU(編號 1 起算:1=5090、2=2000 Ada)、主模型 ctx
+#   [1/5] main 編號、main GPU(編號 1 起算:1=5090、2=2000 Ada)、主模型 ctx、DSpark(off)
 #   [2/5] embed GPU(唯一候選自動選用)
 #   [3/5] reranker 編號、reranker GPU、reranker internal buffer
 #   [4/5] VL GPU(唯一候選/唯一 mmproj 自動選用)
 #   [5/5] 壓縮模式編號(1=codetrail / 2=manual / 3=off;沒有預設值)
 #   摘要確認
 # (big-chat / vl-model 都是非 GGUF 假檔 → 無法解析 layout → 不會問 CPU-MoE。)
-STDIN_STANDARD = "1\n1\n65536\n2\n1\n2\n8192\n2\n1\n\n"
+STDIN_STANDARD = "1\n1\n65536\noff\n2\n1\n2\n8192\n2\n1\n\n"
 
 
 def sparse(path: Path, size: int) -> None:

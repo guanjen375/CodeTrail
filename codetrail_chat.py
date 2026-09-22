@@ -301,6 +301,7 @@ def command_chat(args: argparse.Namespace) -> int:
             # payload 與摘要輸入。合併之後純 UI 操作會改變模型看到的 context。
             show_reasoning=settings.show_reasoning,
             keep_historical_reasoning=settings.keep_historical_reasoning,
+            copy_key=settings.copy_key,
         )
         return int(app.run() or 0)
     finally:

@@ -737,6 +737,45 @@ def test_compaction_mode_absent_state_is_informational(monkeypatch, tmp_path):
     assert not r.fails and not r.warns
 
 
+@pytest.mark.smoke
+def test_compaction_repair_hints_use_available_settings_route(monkeypatch, tmp_path, capsys):
+    """Repair advice must work after daily setup stops asking about compaction."""
+    import client_config
+
+    outputs = []
+    for state in ("absent", "bad-permissions", "bad-json"):
+        home = tmp_path / state
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        path = client_config.config_path()
+        if state != "absent":
+            path.parent.mkdir(parents=True, mode=0o700)
+            path.write_text(
+                "{" if state == "bad-json" else '{"schema": 1, "compaction_mode": "codetrail"}',
+                encoding="utf-8",
+            )
+            path.chmod(0o644 if state == "bad-permissions" else 0o600)
+            before = (path.read_bytes(), path.stat().st_mode)
+        result = doc.Result()
+        doc.check_compaction_mode(result)
+        outputs.append((state, capsys.readouterr().out))
+        if state == "absent":
+            assert not result.fails and not result.warns
+            assert not path.parent.exists(), "doctor must not take over missing settings"
+        else:
+            assert result.fails
+            assert (path.read_bytes(), path.stat().st_mode) == before
+
+    for state, output in outputs:
+        assert "set_config.sh" not in output, (state, output)
+        assert "client.json" in output and "compaction_mode" in output, (state, output)
+        assert all(f'"{mode}"' in output for mode in ("codetrail", "manual", "off")), output
+        assert "重啟 aicode" in output, (state, output)
+        if state != "absent":
+            assert "先修復" in output and "權限" in output and "格式" in output, (state, output)
+
+
 
 
 

@@ -3206,7 +3206,7 @@ def review_figures(
     (AICODE_ROOT 邊界 + 逐層 parent realpath + 拒絕既有 symlink + O_NOFOLLOW 原子寫入)。
     目錄是 `<AICODE_ROOT>/.codetrail/figures/<document_slug>/<run_id>/`,裡面有原圖與
     **實際送模型的每個 variant**,**可能含 NDA 內容**;`.gitignore` 已含 `.codetrail/`,
-    不要 commit。清除方式與後果見 docs/rag.md 與 docs/setup.md。
+    不要 commit。清除方式與後果見 docs/usage.md#knowledge-maintenance 與 developer.md#review-artifacts。
 
     Args:
         action: "list"(預設,唯讀)或 "fix"(寫入 KB)。其他值直接回錯誤。

@@ -209,6 +209,46 @@ def test_no_client_config_reads_as_untouched(tmp_path):
 
 
 @pytest.mark.smoke
+def test_compaction_hints_do_not_route_to_daily_model_setup(tmp_path):
+    """The model-only daily wizard cannot change compaction for any deployment role."""
+    import client_config
+
+    outputs = []
+    for state in ("codetrail", "manual", "absent", "bad-permissions", "bad-json"):
+        home = tmp_path / state
+        home.mkdir()
+        env = {"HOME": str(home)}
+        path = client_config.config_path(env)
+        if state != "absent":
+            path.parent.mkdir(parents=True, mode=0o700)
+            path.write_text(
+                "{" if state == "bad-json" else json.dumps({
+                    "schema": 1,
+                    "compaction_mode": state if state in {"codetrail", "manual"} else "codetrail",
+                }),
+                encoding="utf-8",
+            )
+            path.chmod(0o644 if state == "bad-permissions" else 0o600)
+            before = (path.read_bytes(), path.stat().st_mode)
+        outputs.append((state, "\n".join(status.status_lines(env, n_ctx=131072))))
+        if state == "absent":
+            outputs.append(("banner", client_config.load_client_settings(env).banner()))
+            assert not path.parent.exists(), "read-only hints must not take over missing settings"
+        else:
+            assert (path.read_bytes(), path.stat().st_mode) == before
+
+    for state, output in outputs:
+        assert "set_config.sh" not in output, (state, output)
+        assert "client.json" in output and "compaction_mode" in output, (state, output)
+        assert "重啟 aicode" in output, (state, output)
+        assert '"off"' in output, (state, output)
+        if state not in {"codetrail", "manual"}:
+            assert '"codetrail"' in output and '"manual"' in output, (state, output)
+        if state.startswith("bad-"):
+            assert "先修復" in output and "權限" in output and "格式" in output, (state, output)
+
+
+@pytest.mark.smoke
 def test_a_takeover_shows_the_mode_and_the_experimental_tag(tmp_path):
     import client_config
 

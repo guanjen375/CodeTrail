@@ -17,7 +17,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 
 你不用手動寫 JSON 或自己呼 API。這些工具會出現在 frontend 的 MCP 工具列表裡；日常用法是在對話中直接要求模型「用工具 `<工具名>` 做某件事」。多數情況只講工具名就夠了，模型會自己補預設參數；需要指定檔案、行號、搜尋範圍時，再把那些條件寫進自然語言。
 
-判斷有沒有真的執行,要看畫面上的 `· <工具> → completed` 或結構化 `tool_use` event,不要看模型如何描述自己的工具清單。`/tools` 列得出來只證明 MCP transport 已連線;模型輸出 `<list_dir .../>` 之類純文字後自行宣稱成功,仍是假呼叫。完整診斷見 [列得出工具但沒有實際 tool call](troubleshooting.md#mcp-connected-but-no-tool-call)。
+判斷有沒有真的執行,要看畫面上的 `· <工具> → completed` 或結構化 `tool_use` event,不要看模型如何描述自己的工具清單。`/tools` 列得出來只證明 MCP transport 已連線;模型輸出 `<list_dir .../>` 之類純文字後自行宣稱成功,仍是假呼叫。完整診斷見 [列得出工具但沒有實際 tool call](../developer.md#mcp-connected-but-no-tool-call)。
 
 ### 最常用講法
 
@@ -54,11 +54,11 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 專案探索 | `file_info(path)` | 文字回報行數與字元數；二進位/非文字回報 bytes，支援的格式導向 `analyze_file` |
 | 專案探索 | `read_file(path, start_line=1, end_line=None, max_chars=None)` | 讀檔案內容；省略 max_chars 時依 n_ctx 配置，長檔依結果的精確 start_line 分段 |
 | 文件/外部檔案 | `import_external_file(path, dest_name=None)` | 把允許來源的外部檔案複製進 `.aicode_uploads/` |
-| 文件/外部檔案 | `analyze_file(path, view="summary", target="", limit=0)` | 用 VL 分析各類圖片、一次性抽 PDF 文字（不入 KB）、分析 ELF 或 firmware blob。ELF 預設給總覽；`view` 可切到 `symbols` / `disasm` / `dwarf` / `strings` / `sections` / `memmap` / `relocs` / `imports` / `dynamic` / `headers`；另有多來源核對 `consistency`（見[記憶體一致性](memory-consistency.md)）。一般視角的 `target` 指定 symbol、0x 位址、regex 或 `key:value` 篩選，`limit` 控制筆數（上限 5000）；單次輸出上限 25,000 字元，截斷會指出該用哪個 view 縮小範圍。缺少或無法載入 pyelftools 時直接回錯誤；細節見[analyze_file 的 ELF 視角](#analyze_file-的-elf-視角) |
+| 文件/外部檔案 | `analyze_file(path, view="summary", target="", limit=0)` | 用 VL 分析各類圖片、一次性抽 PDF 文字（不入 KB）、分析 ELF 或 firmware blob。ELF 預設給總覽；`view` 可切到 `symbols` / `disasm` / `dwarf` / `strings` / `sections` / `memmap` / `relocs` / `imports` / `dynamic` / `headers`；另有多來源核對 `consistency`（見[記憶體一致性](usage.md#memory-consistency)）。一般視角的 `target` 指定 symbol、0x 位址、regex 或 `key:value` 篩選，`limit` 控制筆數（上限 5000）；單次輸出上限 25,000 字元，截斷會指出該用哪個 view 縮小範圍。缺少或無法載入 pyelftools 時直接回錯誤；細節見[analyze_file 的 ELF 視角](#analyze_file-的-elf-視角) |
 | 文件/外部檔案 | `ingest_document(path, mode="auto", preflight_only=False, fresh=False, mineru_content_list=None, mineru_pdf_sha256=None, resume=True, redo_pages=None, redo_figures=None, retry_failed=False)` | 把 PDF / MD / TXT / 圖片(png/jpg/...) / binary(bin/elf/...) 匯入 `knowledge.json`；`mode` 預設依副檔名自動選，可顯式 `image` / `chat` / `binary` / `document`。PDF 的原生表格 / 向量文字 log 與純 raster 截圖、掃描頁、方塊圖都走結構化抽取；raster 會先分類為 table / terminal / prose / diagram，再帶 canonical payload、證據、品質與驗證狀態。**單張抽壞只讓那一張缺席**（其餘 figure 與全部文字 chunk 照常入庫，結果會列出是哪幾張，`review_figures(action="list")` 看得到 `in_kb=false`）；整份零 KB 寫入的是 VL 連不上／逾時、預算超限、capability probe 未過、來源檔中途被換掉這類契約破裂。`preflight_only=True` 只估成本、零寫入（僅 .pdf）。`fresh=True` 一步到位重建：清空既有 chunks、讓舊 embeddings cache 失效、只留這一份文件（同一次原子提交，失敗全回滾）。**不會為了 reset 去整批清除** `.codetrail/figures/`（ingest 本來就會寫入這一次的 run，提交後也可能依 retention 回收該文件沒被 KB 引用的舊 run — 那與 fresh 無關）。同一份文件再 ingest 時人工修正會沿用；但**被移出 KB 的其他文件之後重新 ingest 不會自動恢復人工確認**（revision 退回 1）。不可與 `preflight_only` 併用。**執行期間 server 不會被卡住**：跑在 worker thread、每 2 秒送一次零內容的 MCP progress；同一時間所有 KB 工具與第二個 ingest 會立刻回「稍後重試」（不排隊）。結果的標頭下會帶這一次 run 的待辦（`[CODETRAIL_ACTION_REQUIRED]`：待人工判斷 / 需修復或品質排除 / 無法覆核 / 抽取失敗 / 可行動缺席，各附下一步；沒有待辦就完全不印），逾時、非零 exit 或輸出不完整則帶 `[CODETRAIL_INGEST_FAILED]` 並回 `status: error` |
 | 文件/外部檔案 | `review_figures(action="list", document_id="", figure_id="", expected_revision=0, payload_json="", confirm_against_image=False)` | 覆核 PDF 結構化抽取的表格 / 終端機 log / diagram：`list` 唯讀列出 figure_id、頁碼、bbox、kind、驗證狀態、品質、人工確認狀態、處置、原因、原圖路徑與 canonical payload；`fix` 只收該 kind schema 的 structured payload + `expected_revision`，`confirm_against_image=True` 才升 `human_verified`。permission 設 `ask` |
-| 文件/外部檔案 | `query_table(document_id="", figure_id="", register="", address="", row=None, column="", register_column="", address_column="")` | 按 register／位址／列欄精確查目前可信表格，附來源與版本；歧義不選第一筆，詳見 [表格查值](text-and-table-review.md) |
-| 文件/外部檔案 | `review_text(action="list", source="", text_id="", expected_revision=0, expected_sha256="", text="", confirm_against_source=False)` | OCR 正文的 list／show／correct／confirm／revoke；修改綁版本與雜湊，permission 設 ask，詳見 [正文覆核](text-and-table-review.md) |
+| 文件/外部檔案 | `query_table(document_id="", figure_id="", register="", address="", row=None, column="", register_column="", address_column="")` | 按 register／位址／列欄精確查目前可信表格，附來源與版本；歧義不選第一筆，詳見 [表格查值](usage.md#text-table-review) |
+| 文件/外部檔案 | `review_text(action="list", source="", text_id="", expected_revision=0, expected_sha256="", text="", confirm_against_source=False)` | OCR 正文的 list／show／correct／confirm／revoke；修改綁版本與雜湊，permission 設 ask，詳見 [正文覆核](usage.md#text-table-review) |
 | 文件/外部檔案 | `remove_document(source)` | 從 KB 移除過期文件 |
 | 文件/外部檔案 | `reload_knowledge_base()` | 立即載入 KB 並回報 chunk 數（查詢本身會自動偵測變更，這是「馬上確認」用） |
 | 文件/外部檔案 | `query_knowledge(question, source=None)` | 查 KB；`source` 可用 basename 限定單一 spec/manual |
@@ -68,7 +68,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 修改/驗證 | `apply_patch(diff, dry_run=False)` | 套 SEARCH/REPLACE 或 unified diff（同一次只能一種；參數已是字串，不要包 fence），會真的寫檔；最多 5 個檔案、單檔 200 行（udiff 算 added+removed；S/R 算 payload budget = SEARCH+REPLACE 行數，不是同一種計數）；UTF-8 strict，BOM／CRLF／檔尾換行／權限原樣保留，mixed newline 與 symlink 拒絕；套用後只做唯讀 syntax check（advisory、三態、失敗不回滾）；細節見[apply_patch 的兩種格式](#apply_patch-的兩種格式) |
 | 修改/驗證 | `run_lint(path, fix=True)` | 對單一檔案跑格式化/lint；`fix=False` 走 check-only(不改檔) |
 | 修改/驗證 | `run_command(cmd, timeout=60)` | 跑白名單中的裸命令；timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），預設 60。預設為測試／靜態命令；build 命令(make/cmake/ninja/meson/bazel)需在 `client.json` 設 `"build_commands": true`。`/allow list` 查看，`/allow add <絕對目錄>` 驗證後寫入 `extra_allowed_command_dirs`，同 session 後續命令立即生效；相容既有 `extra_allowed_commands` PATH 名稱設定。每次重讀授權並驗目錄，失效或重名即拒絕；容器不能執行本機目錄工具。既有核准、readonly 與參數檢查仍適用；git 用 `git_status` / `git_diff` |
-| 行為教訓 | `record_lesson(rule, scope="project")` | 你糾正模型行為後,把糾正「提案」成一條行為規則;經你核准(permission ask)寫入 lessons store,之後 session 注入 context([docs/lessons.md](lessons.md)) |
+| 行為教訓 | `record_lesson(rule, scope="project")` | 你糾正模型行為後,把糾正「提案」成一條行為規則;經你核准(permission ask)寫入 lessons store,之後 session 注入 context([使用指南](usage.md#lessons)) |
 
 ### `code_rag_search` 四種模式
 
@@ -76,7 +76,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 巨集與條件分支。回傳 `build_context`（target／fingerprint／未知原因）與 `build_state`。
 未選 target 保留全 repo 搜尋並標 unknown；不存在的 target 直接報錯。沒有命中時會回
 `[{"mode":"semantic","results":[],"build_context":...}]`，避免漏掉未知狀態。
-匯入與 generated headers 的精確准入見 [build-context.md](build-context.md)。
+匯入與 generated headers 的精確准入見 [使用指南](usage.md#build-context)。
 
 - `mode="semantic"`：用自然語言找 function / class / method / macro / typedef / enum /
   translation-unit / namespace-scope global。`include_evidence=True` 時加上分數組成、
@@ -127,7 +127,7 @@ python3 scripts/index_stats.py --root <SANDBOX_ROOT>
 
 部署層需要額外 include / exclude 時才使用
 `~/.config/codetrail/index-scope.json`；schema 與 matcher 細節見
-[README_DEV 的索引範圍章節](../README_DEV.md#索引範圍-index-scope)。這份檔不得放進
+[開發與維運](../developer.md#index-scope)。這份檔不得放進
 target repo，必須維持 owner-only 權限（POSIX `chmod 600`）；pattern 本身可能洩漏 NDA
 目錄結構。
 
@@ -136,14 +136,14 @@ target repo，必須維持 owner-only 權限（POSIX `chmod 600`）；pattern �
 `ingest_document` 新增 `resume=True`、`redo_pages=None`、`redo_figures=None`、
 `retry_failed=False`。三種選擇式重做互斥且只用於 PDF，不能搭配 fresh、preflight 或
 resume=False。頁碼從 1 起算，figure 使用精確 ID；重做後仍提交完整文件。
-來源、模型或設定不相符時不會沿用舊結果，詳見 [ingest-resume.md](ingest-resume.md)。
+來源、模型或設定不相符時不會沿用舊結果，詳見 [使用指南](usage.md#ingest-resume)。
 
 `query_table` 與 `review_text` 都受 ingest busy 閘保護；前者唯讀且不呼叫模型，後者採人工
-ask 並由 readonly server 拒絕。細節見 [text-and-table-review.md](text-and-table-review.md)。
+ask 並由 readonly server 拒絕。細節見 [使用指南](usage.md#text-table-review)。
 
 `analyze_file(view="consistency", linker_map=..., linker_script=..., preload_log=...,
 dram_config=..., map_format="auto")` 提供多來源記憶體核對。所有附加路徑都須在沙箱，
-格式、缺失證據與精確區間見 [memory-consistency.md](memory-consistency.md)。
+格式、缺失證據與精確區間見 [使用指南](usage.md#memory-consistency)。
 
 ### 結果文字與預算契約
 
@@ -295,7 +295,7 @@ native lane(原生表格,零 VL 呼叫)**沒有任何模型影像輸入**,它的
 被 KB `evidence_ref` 引用、`created_at` 判讀不出來或清理失敗的 run 一律 fail-closed 保留,
 實際份數可能更多。**不要拿它當 NDA 影像份數的保證**;要確定清掉就顯式刪除對應目錄並確認結果。
 手動清除方式與後果見
-[RAG、附件與知識庫操作](rag.md#pdf-內的表格與終端機畫面結構化抽取--人工覆核)。
+[RAG、附件與知識庫操作](usage.md#pdf-review)。
 
 ### 本地 MinerU 文字 lane
 
@@ -331,7 +331,7 @@ python3 RAG.py docs/spec.pdf knowledge.json \
 MinerU 文字預設未獨立驗證。`query_knowledge` 的 REF 顯示 `text_lane=mineru`；
 `query_knowledge_strict` 排除未符合驗證條件的段落，以 `metadata.excluded_text` 列來源、
 頁碼與原因。經 `review_text` 對照來源確認後，只有目前內容、來源版本與品質均有效的
-段落可進 strict；校字本身不等於確認。詳見 [正文覆核](text-and-table-review.md)。
+段落可進 strict；校字本身不等於確認。詳見 [正文覆核](usage.md#text-table-review)。
 這不提高任何 figure 的驗證／品質，也不代表全 PDF OCR 完成。
 
 章節召回與 chunk 召回以 RRF 合併。命中節點會把整節 chunk 加入候選並去重，
@@ -356,7 +356,7 @@ MinerU 文字預設未獨立驗證。`query_knowledge` 的 REF 顯示 `text_lane
 | `imports` | 外部 symbol（`.dynsym` UND；`.o/.ko` 用 `.symtab` UND）依 API 家族分類，附 relocation 引用次數 | regex |
 | `dynamic` | `.dynamic` 全部 tag（NEEDED / SONAME / RPATH / RUNPATH / FLAGS / INIT_ARRAY…） | regex |
 | `headers` | ELF header、全部 program headers、section→segment、notes、`.comment`、`.modinfo` | 不用 |
-| `consistency` | 核對 ELF、GNU／MetaWare linker map／script、preload 與 DRAM 配置，附確切區間與來源證據；格式及參數見 [記憶體一致性](memory-consistency.md) | 不接受 `target`／`limit`，使用 `linker_map`／`linker_script`／`preload_log`／`dram_config` 限定證據 |
+| `consistency` | 核對 ELF、GNU／MetaWare linker map／script、preload 與 DRAM 配置，附確切區間與來源證據；格式及參數見 [記憶體一致性](usage.md#memory-consistency) | 不接受 `target`／`limit`，使用 `linker_map`／`linker_script`／`preload_log`／`dram_config` 限定證據 |
 
 - ELF 解析只使用 **pyelftools**（`requirements.txt` 已列入），包括已存在快取的查詢。缺席或載入失敗時回錯誤，不產生較差報告。C++ mangled symbol 需要 `c++filt`；無法執行、逾時或回應格式錯誤也會報錯。
 - 跨架構反組譯需要可處理該 ELF 的 objdump。請自行安裝合適的 binutils，並在 `client.json` 設 `"objdump": "/path/to/arm-none-eabi-objdump"` 等實際路徑。程式不自動尋找其他 cross binary，也不改用 Capstone。
@@ -412,7 +412,7 @@ void led_toggle(void) {
 - 新增或刪除文件後查詢會自動載入變更；要立即確認 chunk 數可用工具 `reload_knowledge_base`。
 - git 專案改檔前先看工具 `git_status` / `git_diff`（非 git 專案會回跳過通知，直接改檔）；改檔用工具 `apply_patch`（SEARCH/REPLACE 或 unified diff 二擇一，先 `dry_run` 預覽）。
 - `apply_patch`（寫檔）、`run_lint(fix=True)`（格式化）、`run_command`（執行命令）是三個不同的 ask，各自需要你核准。apply_patch 不會自動執行 lint / typecheck / test；需要改檔或執行專案腳本時才允許。
-- 工具 `record_lesson` 只在「你糾正了模型的做事方式」之後用;工具報錯或答案錯誤不是觸發條件。寫入需要你核准,細節與管理指令見 [docs/lessons.md](lessons.md)。
+- 工具 `record_lesson` 只在「你糾正了模型的做事方式」之後用;工具報錯或答案錯誤不是觸發條件。寫入需要你核准,細節與管理指令見 [使用指南](usage.md#lessons)。
 - 圖很多的 PDF 先用 `ingest_document(path, preflight_only=True)` 估成本（零寫入），再決定要不要在 MCP 裡跑或改走 CLI。
 - REF 標「待覆核」的圖片內容不得當成規格數值的定論；`query_knowledge_strict` 的 `excluded_figures` 就是被 gate 擋下、但確實存在的圖，照實轉述頁碼與原因。**structured figure（`excluded_figures` 帶 `figure_id`）能用 `review_figures` 覆核**（`fix` 會改 KB，permission 是 `ask`）；新 ingest 的純 raster 也屬 structured figure。只有舊 KB 的 legacy VL chunk 沒有 canonical payload，不能在這裡覆核。被分類器判定「不是
 圖面」的（封面、logo）不會收為 figure，也不進覆核清單；此紀錄不能推論同區域的原生正文缺席。

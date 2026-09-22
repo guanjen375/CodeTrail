@@ -1126,7 +1126,10 @@ def export_client_profile(profile: DeploymentProfile, server_url: str) -> dict[s
     services = {}
     for role, service in profile.services.items():
         if not service.identity_alias:
-            raise ProfileError(f"{role}: missing versioned identity_alias; run set_config.sh and choose model-host")
+            raise ProfileError(
+                f"{role}: missing versioned identity_alias; "
+                "run scripts/configure-advanced.sh and choose model-host A"
+            )
         services[role] = {
             "model": service.identity_alias, "identity_alias": service.identity_alias,
             "base_url": urlunsplit((address.scheme, f"{host}:{service.port}", "", "", "")),

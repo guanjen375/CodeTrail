@@ -4,7 +4,7 @@
 介面只有這一個:沒有網頁前端、沒有 attach。部署**不需要 Node / npm**。
 
 如果你是 AI coding agent 正在改這個 repo，請先把這份檔讀完。
-維護命令、eval 漂移檢查見 [README_DEV.md](README_DEV.md)——那份檔是**閱讀用參考**，
+維護命令、eval 漂移檢查見 [開發與維運](developer.md)——那份檔是**閱讀用參考**，
 裡面的測試命令誰能執行由角色決定（見 §1）。
 
 ---
@@ -63,7 +63,7 @@
 
 ## 2. 安全相關不要砍
 
-- 主要依賴不可用必須 fail-loud（需求見 `docs/dependencies.md`）：parser / NumPy / jieba /
+- 主要依賴不可用必須 fail-loud（需求見 `developer.md#dependencies`）：parser / NumPy / jieba /
   rg / ELF 工具 / reranker 與已啟用 query expansion 不得自動換較差後端，快取命中也要驗；
   依賴錯誤不得被吞成零結果或部分成功。安全 IO 缺 dir-fd / nofollow / owner 能力時
   必須在寫入前拒絕，patch 新檔缺 atomic no-clobber hard link 須中止並回滾；
@@ -209,23 +209,32 @@
   狀態列用 `think=on|off`，不放權限／專案指示／舊 reasoning 指示，`/status` 仍列專案
   指示。實際 reasoning 的紅字「思考中」是暫時畫面元素，與 `show_reasoning` 本文顯示
   獨立，回答／工具／完成／錯誤／取消時清除，不得落入 session 或事件內容。
+- `/copykey`——只接受不與 Textual 整條 binding chain 衝突的明列功能鍵；預設 F2，
+  reset 回 F2。呼叫時重讀 owner-only client.json，只更新 copy_key，不覆蓋剛新增的 allow；
+  保存成功才換鍵，失敗 UI 與舊鍵不變；舊鍵失效，忙碌／modal 仍可複製，Ctrl-C 取消不變。
+  頁尾常駐目前複製鍵與 /copykey 提示；無選取不清空剪貼簿，OSC52 不冒稱貼上成功。
 - 啟動核心的設定來源——GPU、llama-server 路徑、tmux session 名、逾時與 rollback 只來自
   `deployment.json`、repo 常數與 argv;`~/start.sh` **不 export 也不 unset**，只接受
   無參數啟動或單一 `stop`，以固定 argv 呼叫啟動／停止核心；其他日常入口同樣
-  在副作用前拒絕使用者參數。
+  在副作用前拒絕使用者參數；configure-advanced.sh 同樣零參數。start wrapper 在
+  start／stop 顯示產生它的 checkout、時間與版本，不因 cwd 改變來源。
   tmux pane 一律經 `deployment_profile.py exec <role> <loader argv>`,最終環境由
   `process_env.llama_server_env()` 決定(三前綴 + `LLAMA_ARG_*` + `CUDA_VISIBLE_DEVICES`
   剝除;GPU 只由 `build_server_command` 那個 `env CUDA_VISIBLE_DEVICES=<驗證過的值>` 前綴
   重新輸出)。pane 環境 = tmux server 全域環境 + session 環境,launcher 管不到既有 daemon,
   所以邊界只能放在 pane 內真正 exec 的那一步;放寬它就是「使用者以為在跑 A、實際在跑 B」
   而且完全無聲
-- DSpark 推測解碼——`set_config` 的獨立開關只管理 main；省略／null 為 off，啟用時
+- DSpark 推測解碼——本機 `set_config` 主模型精靈同交易設定，附加入口保留獨立調整，
+  都只管理 main；最後明示答案是唯一權威，舊配對只作相同 resolved 主模型的 keep 候選；
+  非互動未指定為 off，主模型最終配對定案後才算 host alias。省略／null 為 off，啟用時
   draft 路徑與 token 上限走封閉 schema 與驗證過的 argv，不讀環境、不自動下載或降級。
   換主模型不得沿用舊 draft 配對；draft 內容／設定必須進模型身分。已啟用的相依性
   缺失要在啟動前拒絕；health OK 不代表 DSpark 成功，launcher、host readiness 與
   strict status 都須檢查非空 `/slots`，每個 slot 的 `speculative` 只接受 JSON true。
   失敗走既有 rollback，未知不能算 ready；離線／snapshot 檢查不得偷偷發 live 請求。
-  關閉不得要求 draft 或 probe binary/GPU；維持原交易／還原白名單與零參數 wrapper。
+  關閉不得要求 draft 或 probe binary/GPU；獨立保存後提供立即套用／重啟或稍後。
+  維持原交易／還原白名單與零參數 wrapper；本機設定保留既有壓縮選擇，
+  未有 client.json 不因設定模型建檔；轉出 client 清除端點授權且不沿用遠端 URL／port，main 固定 parallel=1。
 - `compaction_formula` ——門檻公式、canonical 規則文字與 `OUTPUT_TOKEN_MAX` /
   `COMPACTION_RESERVE_TOKENS` / `MIN_PRESERVE_RECENT_TOKENS` 常數的單一真值。
   `config.CLIENT_MAX_OUTPUT_TOKENS` 的上限 fail-loud 綁的就是這裡的 `OUTPUT_TOKEN_MAX`
@@ -277,6 +286,9 @@
   讓已完成結果無聲消失。原始 NDA prompt、工具輸出、candidate answer 不得寫入 checked-in
   `eval/` 或 privacy-safe aggregate
 - 靜態 gate(`tests/test_repo_consistency.py`)——文件不得教不存在的介面或設定；
+  README.md、developer.md、docs/usage.md、docs/mcp-tools.md 與 runtime compaction-rules
+  必須在合併及逐檔來源集合；developer 的安全／故障排解各取完整獨立章節逐句核對，
+  不得用整檔同一句兼代兩處；
   environ gate 只放行「檔案在哪 / 行程介面」，任何檔案讀 `AICODE_*` / `AI_CODE_*` /
   `CODETRAIL_*` 都是 offender。spawn 只有 `process_env` 一個出口，`_SPAWN_CORE` 的
   四個檔各有理由；`deployment_profile.py` 唯一的 `os.execvpe` 必須交

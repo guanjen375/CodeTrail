@@ -225,6 +225,22 @@ def test_model_host_alias_and_export_bind_all_shards_and_projector(tmp_path):
     assert command[command.index("--alias") + 1] == "ct-main-v1"
 
 
+@pytest.mark.smoke
+def test_missing_host_alias_points_to_advanced_setup(tmp_path):
+    """The daily local wizard can no longer select the model-host role or repair its alias."""
+    from dataclasses import replace
+
+    profile = deployment.load_effective_profile({"HOME": str(tmp_path)})
+    host = replace(profile, mode="model-host")
+    with pytest.raises(deployment.ProfileError, match="missing versioned identity_alias") as caught:
+        deployment.export_client_profile(host, "http://10.20.30.40")
+    message = str(caught.value)
+    assert "scripts/configure-advanced.sh" in message, message
+    assert "model-host A" in message, message
+    assert "set_config.sh" not in message, message
+    assert not (tmp_path / ".config").exists()
+
+
 def test_split_http_ignores_proxy_and_refuses_redirect(monkeypatch):
     _authorize(monkeypatch)
     monkeypatch.setenv("HTTP_PROXY", "http://thirdparty.invalid:1234")
