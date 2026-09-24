@@ -21,6 +21,10 @@
   (含未裁切的 `structuredContent`)與壓縮標記。畫面看不到、模型看得到的話,
   接下來每一則回答都在回應一段使用者看不見的脈絡。換不成功就 engine 與畫面
   **都不動**;回合進行中一律拒絕換。
+* **主題只改呈現**(`/theme`,註冊表在 :mod:`client_theme`)。內容、事件與 session 每個
+  主題都一樣;codex 的「› 」「• 」「└ 」是 ThemeGlyph,不進選取。複製結果只有工具卡
+  標題列(三擊全選會帶到)依主題寫法不同。default 的外觀、狀態列文字與選取範圍(含三擊)
+  與加入主題前相同。
 
 `engine.send()` 跑在背景執行緒(協調器管),事件回到這裡才變成 widget;核准
 在那個背景執行緒裡阻塞等 UI 回答。
@@ -56,6 +60,7 @@ import client_events
 import client_paths
 import client_review
 import client_store
+import client_theme
 import client_turns
 import command_allowlist
 import context_budget
@@ -89,6 +94,8 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "這份說明"),
     ("/allow", "命令白名單:list / add <絕對目錄>"),
     ("/copykey", "複製快捷鍵:/copykey <按鍵>，reset 回預設 F2"),
+    ("/theme", "介面主題:選單即時預覽，/theme <"
+               + "|".join(client_config.THEME_VALUES) + "> 直接切換"),
     ("/new", "開一個新對話"),
     ("/session", "選一個既有對話切換(/session <id> 直接指定)"),
     ("/compact", "立刻壓縮目前對話"),
@@ -187,9 +194,12 @@ def short(value: Any, limit: int = 60) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def argument_summary(arguments: Mapping[str, Any]) -> str:
+    return ", ".join(f"{key}={short(arguments[key])}" for key in sorted(arguments))
+
+
 def tool_summary(tool: str, arguments: Mapping[str, Any]) -> str:
-    inner = ", ".join(f"{key}={short(arguments[key])}" for key in sorted(arguments))
-    return f"{tool}({inner})"
+    return f"{tool}({argument_summary(arguments)})"
 
 
 def local_time(stamp: Any) -> str:
@@ -362,12 +372,40 @@ def history_entries(transcript: Sequence[Mapping[str, Any]]) -> list[HistoryEntr
 # ============================================================
 # 對話流的元件
 # ============================================================
-class UserMessage(Static):
-    """使用者送出的那一則。"""
+class _UserBody(Static):
+    """使用者訊息本文。
+
+    三擊用的是 ``select_container``(最近一個「可捲動」祖先,而 Textual 把任何有子項的
+    容器都算可捲動)。本文包在 :class:`UserMessage` 裡面之後,不改的話三擊只會選到這一則;
+    改版前 UserMessage 本身就是 Static,三擊選的是整個對話區。沿用包裝容器外層的那一個。
+    """
+
+    @property
+    def select_container(self) -> Widget:
+        parent = self.parent
+        if isinstance(parent, Widget):
+            return parent.select_container
+        return super().select_container
+
+
+class UserMessage(Vertical):
+    """使用者送出的那一則。
+
+    主題的前綴符號(codex 的「› 」)是 :class:`client_theme.ThemeGlyph`,不在本文裡:
+    複製與選取只拿得到使用者真的打的字。粗體與顏色由 CSS 給(`.entry.user`)。
+    """
+
+    DEFAULT_CSS = """
+    UserMessage { height: auto; }
+    """
 
     def __init__(self, text: str) -> None:
-        super().__init__(Text(text, style="bold"), classes="entry user")
+        super().__init__(classes="entry user")
         self.message = text
+
+    def compose(self) -> ComposeResult:
+        yield client_theme.ThemeGlyph("user")
+        yield _UserBody(Text(self.message), classes="user-body")
 
 
 class NoticeLine(Static):
@@ -420,6 +458,8 @@ class AssistantBlock(Vertical):
         self._markdown: Markdown | None = None
 
     def compose(self) -> ComposeResult:
+        # 主題前綴(codex 的「• 」)dock 在左邊;它不參與選取,不改回答文字。
+        yield client_theme.ThemeGlyph("assistant")
         if self._finished:
             # Replay finishes before mount. Markdown's own Mount initializes
             # from this constructor value; an earlier update() would be lost.
@@ -456,26 +496,83 @@ class AssistantBlock(Vertical):
             previous.remove()
 
 
-class ToolBlock(Collapsible):
-    """一次工具呼叫:一行摘要,展開看完整輸出。"""
+#: 工具狀態 → CSS class 後綴(`-status-<後綴>`)。狀態字串來自事件與 session 檔,
+#: 不一定是合法的 CSS 名稱,所以只認得這幾個,其他一律 other。
+_TOOL_STATUS_CLASSES = {
+    client_events.STATUS_COMPLETED: "completed",
+    client_events.STATUS_ERROR: "error",
+    client_events.STATUS_DENIED: "denied",
+    PENDING_TOOL_STATUS: "pending",
+}
 
-    def __init__(self, tool: str, arguments: Mapping[str, Any], status: str) -> None:
+
+class ToolBlock(Collapsible):
+    """一次工具呼叫:一行摘要,展開看完整輸出。
+
+    標題只由 :meth:`_render_title` 依目前主題產生(orphan 註記也是它的參數,不得在外面
+    串接字串):default 是「✓ tool(args) → status」,codex 是「• Called tool(args)」。
+    主題換了由 App 呼叫 :meth:`apply_spec`;之後才 mount 的在 on_mount 自己套。
+    """
+
+    def __init__(
+        self, tool: str, arguments: Mapping[str, Any], status: str, *, orphan: bool = False
+    ) -> None:
         self._body = Static(Text(""), classes="tool-output")
-        super().__init__(self._body, title="", collapsed=True, classes="entry tool")
+        # 展開內容前的「└ 」(codex);default 下隱藏,不佔位、不進選取。
+        super().__init__(
+            client_theme.ThemeGlyph("tree"), self._body, title="", collapsed=True, classes="entry tool"
+        )
         self.tool = tool
         self.arguments = dict(arguments)
         self.output = ""
+        self.orphan = orphan
+        self._chrome = client_theme.CHROME_CLASSIC
+        #: CollapsibleTitle 目前的 symbol；初值是 Collapsible 的預設（default 主題不必重畫）。
+        self._symbols: tuple[str, str] = ("▶", "▼")
         self.set_status(status)
 
     def set_status(self, status: str) -> None:
         self.status = status
+        suffix = _TOOL_STATUS_CLASSES.get(status, "other")
+        self.remove_class(*(f"-status-{name}" for name in (*_TOOL_STATUS_CLASSES.values(), "other")))
+        self.add_class(f"-status-{suffix}")
+        self._render_title()
+
+    def apply_spec(self, spec: client_theme.ThemeSpec) -> None:
+        # 版面沒變就不重畫標題:重播幾千張工具卡時,每張都重設一次標題是白做工。
+        if spec.chrome != self._chrome:
+            self._chrome = spec.chrome
+            self._render_title()
+        symbols = tuple(spec.tool_symbols)
+        if symbols == self._symbols:
+            return
+        try:
+            title = self.query_one("CollapsibleTitle")
+        except Exception:  # noqa: BLE001 - 還沒 compose:on_mount 會再套一次
+            return
+        self._symbols = symbols
+        title.collapsed_symbol, title.expanded_symbol = symbols
+        # 標題字沒變時 Textual 不會重畫 symbol;強制跑一次 label 的 watcher。
+        title.mutate_reactive(type(title).label)
+
+    def on_mount(self) -> None:
+        self.apply_spec(client_theme.spec_for(self.app.theme))
+
+    def _render_title(self) -> None:
+        if self._chrome == client_theme.CHROME_CODEX:
+            self.title = client_theme.codex_tool_title(
+                self.tool, argument_summary(self.arguments), self.status,
+                orphan_note=ORPHAN_TOOL_NOTE if self.orphan else "",
+            )
+            return
         marks = {
             client_events.STATUS_COMPLETED: "✓",
             client_events.STATUS_ERROR: "✗",
             client_events.STATUS_DENIED: "⊘",
         }
-        mark = marks.get(status, "·")
-        self.title = f"{mark} {tool_summary(self.tool, self.arguments)} → {status}"
+        mark = marks.get(self.status, "·")
+        title = f"{mark} {tool_summary(self.tool, self.arguments)} → {self.status}"
+        self.title = f"{title} {ORPHAN_TOOL_NOTE}" if self.orphan else title
 
     def set_output(self, output: str) -> None:
         self.output = output
@@ -632,6 +729,58 @@ class SessionPickerScreen(ModalScreen[str | None]):
         listing.focus()
         if self.sessions:
             listing.highlighted = 0
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self.dismiss(event.option_id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ThemePickerScreen(ModalScreen[str | None]):
+    """挑介面主題:↑/↓ 即時預覽,Enter 保存,Esc 還原(同 Codex 的 /theme)。
+
+    預覽只換 App.theme、不寫檔;保存與還原都在開它的 App 的 dismiss 回呼裡做。
+    Esc、Ctrl-C、Ctrl-D 都只收選單:沒有選任何主題,算成中斷或離開都是謊報。
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "取消", show=False)]
+    AUTO_FOCUS = "#theme-picker-list"
+
+    def __init__(self, current: str) -> None:
+        super().__init__()
+        self.current = current
+
+    def _row(self, index: int, spec: client_theme.ThemeSpec) -> Text:
+        row = Text(f"{index}. {spec.label}")
+        if spec.name == self.current:
+            row.append("（目前）")
+        row.append(f"  {spec.description}", style="dim")
+        return row
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="theme-picker"):
+            yield Static(Text("選擇介面主題", style="bold"), id="theme-picker-title")
+            yield Static(Text("↑/↓ 即時預覽；Enter 保存；Esc 還原", style="dim"), id="theme-picker-hint")
+            yield OptionList(
+                *(
+                    Option(self._row(index, spec), id=spec.name)
+                    for index, spec in enumerate(client_theme.THEMES.values(), start=1)
+                ),
+                id="theme-picker-list",
+            )
+
+    def on_mount(self) -> None:
+        listing = self.query_one("#theme-picker-list", OptionList)
+        listing.focus()
+        names = list(client_theme.THEMES)
+        listing.highlighted = names.index(self.current) if self.current in names else 0
+
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        event.stop()
+        if event.option_id:
+            self.app._preview_theme(event.option_id)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         event.stop()
@@ -880,19 +1029,33 @@ class _CopyGesture:
 class CodeTrailApp(App[int]):
     """`aicode` 的介面。"""
 
+    #: Textual 的 Ctrl+P 指令面板會列出 Textual 全部內建主題,選了只改記憶體、不保存,
+    #: 而且是 client_theme 註冊表以外的名字。主題只能經 /theme 換。
+    ENABLE_COMMAND_PALETTE = False
+
+    # 這一段是 default 主題(原本的外觀);其他主題的 `.-theme-<name>` 規則全在
+    # client_theme.THEME_CSS,串在最後。
     CSS = """
     Screen { layout: vertical; }
     #log { height: 1fr; padding: 0 1; }
     .entry { margin: 0 0 1 0; }
-    .entry.user { color: $accent; }
+    .entry.user { color: $accent; text-style: bold; }
     .entry.notice { color: $warning; }
     .entry.error { color: $error; }
     .entry.reasoning { color: $text-muted; }
     .entry.tool { margin: 0 0 1 0; }
     .tool-output { color: $text-muted; }
     #completions { height: auto; max-height: 8; padding: 0 1; color: $text-muted; }
-    #prompt { height: auto; max-height: 10; border: round $primary; }
+    #activity { display: none; height: auto; max-height: 3; }
+    #composer { height: auto; }
+    #prompt { width: 1fr; height: auto; max-height: 10; border: round $primary; }
     #status { height: 1; padding: 0 1; background: $panel; color: $text-muted; }
+    ThemePickerScreen { align: center middle; }
+    #theme-picker {
+        width: 80%; max-width: 100; height: auto; max-height: 80%;
+        border: thick $primary; background: $surface; padding: 1 2;
+    }
+    #theme-picker-list { height: auto; max-height: 12; margin-top: 1; }
     #approval {
         width: 90%; height: 80%; border: thick $warning; background: $surface; padding: 1 2;
     }
@@ -918,7 +1081,7 @@ class CodeTrailApp(App[int]):
     #review-body { height: 1fr; border: round $primary-darken-2; padding: 0 1; }
     #review-report { height: auto; }
     #review-close { margin-top: 1; }
-    """
+    """ + client_theme.THEME_CSS
 
     BINDINGS = [
         # priority 保留忙碌／核准時的中斷；閒置才由 action_interrupt 分流複製。
@@ -936,6 +1099,7 @@ class CodeTrailApp(App[int]):
         show_reasoning: bool = False,
         keep_historical_reasoning: bool = False,
         copy_key: str = client_config.DEFAULT_COPY_KEY,
+        theme: str = client_config.DEFAULT_THEME,
     ) -> None:
         super().__init__()
         self.engine = engine
@@ -989,13 +1153,66 @@ class CodeTrailApp(App[int]):
         #: 讀它等於把介面測試綁在版本上。
         self.status_text = ""
         self.completion_text = ""
+        #: codex 主題輸入框上方活動列的字;閒置或 classic 版面時是 ""。
+        self.activity_text = ""
+        # 主題最後設定:watch_theme 會用到上面的狀態。名字只接受 client.json 的合法值;
+        # 與 Textual 目前的初值同名時(例如殼層有同名的 TEXTUAL_THEME)賦值不會觸發
+        # watcher,-theme-<name> class 與 ANSI filter 都不會套上 —— 改用 mutate_reactive
+        # 強制跑一次。不讀、也不改任何環境變數。
+        target = client_config.validate_theme(theme)
+        for spec in client_theme.THEMES.values():
+            self.register_theme(spec.textual)
+        if self.theme == target:
+            self.mutate_reactive(App.theme)
+        else:
+            self.theme = target
 
     # ---- 版面 ----------------------------------------------------------
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="log")
         yield Static("", id="completions")
-        yield PromptInput(id="prompt")
+        # 只有 codex 版面用:回合中的階段與秒數,在輸入框上方(Codex 的 status indicator)。
+        yield Static("", id="activity")
+        with Horizontal(id="composer"):
+            yield client_theme.ThemeGlyph("composer")
+            yield PromptInput(id="prompt")
         yield Static("", id="status")
+
+    # ---- 主題 ----------------------------------------------------------
+    def watch_theme(self, _old: str, new: str) -> None:
+        """主題套用的唯一入口(預覽、保存、還原、啟動都走這裡)。
+
+        Textual 8.2.5 起,自己的 _watch_theme 已經換好 -theme- class 與 ANSI filter;
+        requirements 允許的 8.0–8.2.4 兩樣都不做(而且每次把 ansi_color 設回 False),
+        所以 class 與 ansi_color 在這裡補,新版重設一次是 no-op。其餘是 CSS 做不到的:
+        裝飾符號、工具卡標題與 symbol、輸入框提示字、狀態列與補全的版面。
+        之後才 mount 的 widget 在自己的 on_mount 讀目前主題。
+        """
+        spec = client_theme.spec_for(new)
+        stale = [item for item in self.classes if item.startswith("-theme-") and item != f"-theme-{new}"]
+        self.remove_class(*stale)
+        self.add_class(f"-theme-{new}")
+        if not client_theme.NATIVE_ANSI_THEMES:
+            self.ansi_color = spec.ansi
+        if not self.screen_stack:
+            return  # 建構中:畫面還沒建,mount 時各自套用
+        for screen in self.screen_stack:
+            for glyph in screen.query(client_theme.ThemeGlyph):
+                glyph.apply(spec)
+            for block in screen.query(ToolBlock):
+                block.apply_spec(spec)
+        try:
+            prompt = self.query_one("#prompt", PromptInput)
+        except Exception:  # noqa: BLE001 - 主畫面還沒 compose
+            return
+        prompt.placeholder = spec.placeholder
+        self._refresh_status()
+        self._refresh_completions()
+
+    def _preview_theme(self, name: str) -> None:
+        """主題選單移動反白:只換畫面,不寫檔。只接受註冊表內的名字。"""
+        if name in client_theme.THEMES:
+            self.theme = name
 
     def _discard_auto_copy(self, _screen: Screen | None = None) -> None:
         self._copy_gesture = None
@@ -1142,6 +1359,8 @@ class CodeTrailApp(App[int]):
         prompt = self.query_one("#prompt", PromptInput)
         prompt.load_history(self._read_history())
         prompt.focus()
+        # 啟動時的主題在建構時就設好了,那時還沒有輸入框;之後的切換由 watch_theme 管。
+        prompt.placeholder = client_theme.spec_for(self.theme).placeholder
         self._replay_startup_session()
         # 接續歷史先依完整計數檢查壓縮，再預熱下一輪的 prefix。
         self._prepare_idle("mount")
@@ -1212,10 +1431,11 @@ class CodeTrailApp(App[int]):
                 if entry.kind == "assistant_error":
                     widgets.append(ErrorLine(INCOMPLETE_ANSWER_NOTE))
             elif entry.kind in ("tool", "tool_orphan"):
-                block = ToolBlock(entry.tool or "?", entry.arguments, entry.status or "?")
+                block = ToolBlock(
+                    entry.tool or "?", entry.arguments, entry.status or "?",
+                    orphan=entry.kind == "tool_orphan",
+                )
                 block.set_output(entry.output)
-                if entry.kind == "tool_orphan":
-                    block.title = f"{block.title} {ORPHAN_TOOL_NOTE}"
                 widgets.append(block)
         return widgets
 
@@ -1669,6 +1889,46 @@ class CodeTrailApp(App[int]):
         saved = f"已儲存至 {settings.path}" if changed else "設定未變更，未寫入檔案"
         self._append(NoticeLine(f"複製鍵：{self.copy_key.upper()}；立即生效。{saved}。"))
 
+    def _cmd_theme(self, argument: str) -> None:
+        """`/theme` 開選單即時預覽;`/theme <名稱>` 直接切換。兩者都先保存、成功才算數。
+
+        回合、核准、審查進行中一律拒絕(同 Codex 的 /theme 與這裡的 /think):選單的
+        Esc／Ctrl-C 只收選單,與「中斷這一輪」不能在同一個時刻搶同一個按鍵。
+        """
+        if (
+            self.coordinator.busy
+            or self.coordinator.pending_approvals()
+            or self.coordinator.reviewing
+        ):
+            self._append(NoticeLine("回合、核准或審查進行中，不能切換主題。"))
+            return
+        if argument:
+            self._save_theme(argument.lower(), restore=self.theme)
+            return
+        origin = self.theme
+        self.push_screen(
+            ThemePickerScreen(origin), lambda name: self._picked_theme(name, origin)
+        )
+
+    def _picked_theme(self, name: str | None, origin: str) -> None:
+        # 取消(Esc / Ctrl-C / Ctrl-D / 畫面被收掉)= 回到開選單前的主題,零寫入。
+        if not name:
+            self._preview_theme(origin)
+            return
+        self._save_theme(name, restore=origin)
+
+    def _save_theme(self, name: str, *, restore: str) -> None:
+        """重讀 client.json 後只改 theme;寫入成功才套用,失敗畫面回到 ``restore``。"""
+        try:
+            settings, changed = client_config.update_theme(name)
+        except (client_config.ClientConfigError, OSError) as exc:
+            self._preview_theme(restore)
+            self._append(ErrorLine(f"/theme: {exc}；目前仍使用 {self.theme}。"))
+            return
+        self.theme = settings.theme
+        saved = f"已儲存至 {settings.path}" if changed else "設定未變更，未寫入檔案"
+        self._append(NoticeLine(f"主題：{settings.theme}；{saved}。"))
+
     def _cmd_allow(self, argument: str) -> None:
         """本地新增工具目錄；MCP 每次執行重新讀取授權，聊天 policy 保持原樣。"""
         try:
@@ -1915,6 +2175,7 @@ class CodeTrailApp(App[int]):
             f"session={self.engine.session_id or '(尚未建立)'}",
             f"session 檔={path if path else '(不落檔)' if self.engine.session_id else '(尚未建立)'}",
             f"think={'on' if self.engine.options.thinking else 'off'}",
+            f"主題={self.theme}",
             f"專案指示={'已載入' if self._project_instructions() else '未載入'}",
             f"舊回合 reasoning={'送模' if self.keep_historical_reasoning else '不進模型'}",
             f"prompt cache 預熱={self._prime_status()}",
@@ -1931,13 +2192,13 @@ class CodeTrailApp(App[int]):
 
     # ---- 鍵盤動作 ------------------------------------------------------
     def _close_picker(self) -> bool:
-        """對話選單開著就收掉它並回 True。
+        """對話選單或主題選單開著就收掉它並回 True(主題選單收掉 = 還原開啟前的主題)。
 
         選單不是一個回合、也不是一個核准:Ctrl-C 收它不算「中斷這一輪」
         (那是謊報),Ctrl-D 收它也不算「離開」。
         """
         screen = self.screen
-        if not isinstance(screen, SessionPickerScreen):
+        if not isinstance(screen, (SessionPickerScreen, ThemePickerScreen)):
             return False
         try:
             screen.dismiss(None)
@@ -1972,8 +2233,11 @@ class CodeTrailApp(App[int]):
             elif self.coordinator.cancel(block=False, review_id=self._review_screen.review_id):
                 self._review_screen.query_one("#review-progress", Static).update(Text("正在中斷審查…"))
             return
+        picker = self.screen
         if self._close_picker():
-            return
+            # 主題選單開著期間,佇列可能已讓下一輪開始:收掉選單後中斷照舊,不得吞掉。
+            if not (isinstance(picker, ThemePickerScreen) and self.coordinator.busy):
+                return
         if isinstance(self.screen, QueueChoiceScreen):
             self.screen.dismiss(None)
         # block=False:MCP 取消要等寬限期(10 秒)+ SIGTERM + 重新 spawn。
@@ -2215,22 +2479,31 @@ class CodeTrailApp(App[int]):
             f"壓縮={self._compaction_mode()}",
             f"think={'on' if self.engine.options.thinking else 'off'}",
         ]
-        active_status = ""
+        #: 回合中才有:spinner 與秒數、目前階段。classic 插在最前面;codex 移到活動列。
+        active: list[str] = []
+        phase = ""
+        elapsed = 0.0
         if self._turn_started is not None:
             self._spinner = (self._spinner + 1) % len(SPINNER_FRAMES)
             elapsed = time.monotonic() - self._turn_started
-            parts.insert(
-                0, f"{SPINNER_FRAMES[self._spinner]} {elapsed:.0f}s(Ctrl-C 中斷)"
-            )
-            parts.insert(1, self._turn_phase())
-            active_status = " · ".join(parts[:2])
+            phase = self._turn_phase()
+            active = [f"{SPINNER_FRAMES[self._spinner]} {elapsed:.0f}s(Ctrl-C 中斷)", phase]
         if getattr(self.engine, "priming", False):
             # 預熱握著模型鎖:這時候送出的下一題會在鎖上等它送完,狀態列要講得出來。
             parts.append("prompt cache 預熱中")
         pending = self.coordinator.queue_snapshot(pending_only=True)
         if pending:
             parts.append(f"待送={len(pending)}" + ("(暫停,/queue resume)" if self.coordinator.queue_paused else ""))
-        self.status_text = " · ".join(parts)
+        if client_theme.spec_for(self.theme).chrome == client_theme.CHROME_CODEX:
+            # Codex:階段與秒數在輸入框上方的活動列;footer 是其餘同一組資訊,單列。
+            self._show_activity(client_theme.activity_line(phase, elapsed) if active else None)
+            self.status_text = " · ".join(parts)
+            bar.styles.height = 1
+            bar.update(Text(self.status_text))
+            return
+        self._show_activity(None)
+        active_status = " · ".join(active)
+        self.status_text = " · ".join(active + parts)
         # Keep the measured counts/rate visible at normal SSH terminal widths.
         # Return to the original single row as soon as this prefill ends.
         rows = 1
@@ -2240,6 +2513,18 @@ class CodeTrailApp(App[int]):
         bar.styles.height = rows
         bar.update(Text(self.status_text))
 
+    def _show_activity(self, line: Text | None) -> None:
+        """codex 活動列:有字就顯示(CSS 只在 codex 讓 `-active` 顯示),None 就收起並清空。"""
+        try:
+            activity = self.query_one("#activity", Static)
+        except Exception:  # noqa: BLE001 - 還沒 mount
+            return
+        if line is None and not self.activity_text and not activity.has_class("-active"):
+            return
+        self.activity_text = line.plain if line is not None else ""
+        activity.set_class(line is not None, "-active")
+        activity.update(line if line is not None else Text(""))
+
     def _refresh_completions(self) -> None:
         prompt = self.query_one("#prompt", PromptInput)
         panel = self.query_one("#completions", Static)
@@ -2248,15 +2533,22 @@ class CodeTrailApp(App[int]):
             self.completion_text = ""
             panel.display = False
             panel.update(Text(""))
+            panel.screen.set_class(False, "-completions-open")
             return
         descriptions = dict(COMMANDS)
-        lines = []
+        rows: list[tuple[str, str]] = []
         for index, name in enumerate(prompt.completions):
             mark = "›" if index == prompt.completion_index else " "
-            lines.append(f"{mark} {name:<11}{descriptions.get(name, '')}")
-        self.completion_text = "\n".join(lines)
-        panel.update(Text(self.completion_text))
+            rows.append((f"{mark} {name:<11}", descriptions.get(name, "")))
+        # 兩個主題的純文字相同;codex 只多了上色(選中 cyan bold、說明 dim)。
+        self.completion_text = "\n".join(head + description for head, description in rows)
+        if client_theme.spec_for(self.theme).chrome == client_theme.CHROME_CODEX:
+            panel.update(client_theme.codex_completion_lines(rows, prompt.completion_index))
+        else:
+            panel.update(Text(self.completion_text))
         panel.display = True
+        # codex 把補全放在輸入框下方,開著時暫代 footer(Codex 的 slash popup)。
+        panel.screen.set_class(True, "-completions-open")
 
     # ---- 輸入歷史 ------------------------------------------------------
     def _history_path(self) -> Path | None:

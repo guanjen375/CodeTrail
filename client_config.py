@@ -61,6 +61,11 @@ H_LANG_VALUES = ("c", "cpp")
 DEFAULT_COPY_KEY = "f2"
 COPY_KEY_VALUES = ("f1", "f2", "f3", "f4", "f5", "f8", "f9", "f10", "f11", "f12")
 
+#: TUI 介面主題。只管畫面，不改模型、工具或對話內容；名稱與順序必須等於
+#: client_theme.THEMES（那邊載入時核對，不一致就 fail-loud）。
+DEFAULT_THEME = "default"
+THEME_VALUES = ("default", "codex")
+
 
 class ClientConfigError(RuntimeError):
     """client.json 的位置、權限或內容不合契約。"""
@@ -121,6 +126,8 @@ class ClientSettings:
     keep_historical_reasoning: bool = False
     #: 複製目前畫面／輸入框選取；只管 TUI，不改模型或工具權限。
     copy_key: str = DEFAULT_COPY_KEY
+    #: TUI 介面主題；`/theme` 確認後才寫入。只管畫面，不改模型、工具或對話內容。
+    theme: str = DEFAULT_THEME
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -143,6 +150,7 @@ class ClientSettings:
             "show_reasoning": self.show_reasoning,
             "keep_historical_reasoning": self.keep_historical_reasoning,
             "copy_key": self.copy_key,
+            "theme": self.theme,
         }
 
     def with_compaction(self, mode: str) -> "ClientSettings":
@@ -195,6 +203,7 @@ _CHOICE_KEYS = {
     "rerank_fallback_policy": RERANK_FALLBACK_VALUES,
     "h_lang": H_LANG_VALUES,
     "copy_key": COPY_KEY_VALUES,
+    "theme": THEME_VALUES,
 }
 #: 自由字串的鍵。
 _TEXT_KEYS = ("objdump",)
@@ -426,6 +435,34 @@ def update_copy_key(
     if settings.copy_key == key:
         return settings, False
     changed = replace(settings, present=True, copy_key=key)
+    try:
+        save_client_settings(changed, env)
+    except OSError as exc:
+        raise ClientConfigError(f"無法儲存 {settings.path}: {exc}") from exc
+    return changed, True
+
+
+def validate_theme(value: object) -> str:
+    """只接受明列的主題名稱；大小寫不同或未知名稱都不猜。"""
+    if not isinstance(value, str) or value not in THEME_VALUES:
+        allowed = " / ".join(THEME_VALUES)
+        raise ClientConfigError(f"theme 只接受 {allowed}，得到 {value!r}")
+    return value
+
+
+def update_theme(
+    name: str, env: Mapping[str, str] | None = None,
+) -> tuple[ClientSettings, bool]:
+    """重讀目前設定後只換 theme，成功落檔才把新設定交回 TUI。
+
+    與 update_copy_key 同一套：不採用啟動時的快照（同一段 session 的 /allow add、
+    /copykey 可能剛寫入），預設主題且沒有設定檔時維持零寫入，其他設定不套回 runtime。
+    """
+    name = validate_theme(name)
+    settings = load_client_settings(env)
+    if settings.theme == name:
+        return settings, False
+    changed = replace(settings, present=True, theme=name)
     try:
         save_client_settings(changed, env)
     except OSError as exc:

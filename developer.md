@@ -209,6 +209,7 @@ python3 scripts/launch_servers.py --scope all --dry-run
 | `compaction_mode` | 未接管時 `manual`；可選 `codetrail`／`manual`／`off`，前兩者仍實驗中 |
 | `permission` | `{}`；逐工具 `allow`／`ask`／`deny`，不能放寬 readonly |
 | `copy_key` | `f2`；TUI `/copykey` 當場更新並持久化，可用鍵見[使用指南](docs/usage.md#copy) |
+| `theme` | `default`；可選 `default`／`codex`，TUI `/theme` 預覽後保存，見[使用指南](docs/usage.md#theme) |
 | `model_remote_ok` | `false`；local／model-host 的非 loopback 模型流量需明示同意 |
 | `model_endpoints` | client 模式四角色的精確端點授權，由匯入流程建立；不能由上一鍵繞過 |
 | `kb_context_remote_ok` | `false`；Contextual Retrieval 文件窗外送的獨立同意 |
@@ -224,7 +225,7 @@ python3 scripts/launch_servers.py --scope all --dry-run
 | `show_reasoning` | `false`；只控制 reasoning 本文顯示與重播 |
 | `keep_historical_reasoning` | `false`；是否將舊 reasoning 送回模型，與 `/think` 獨立 |
 
-多數設定在啟動時讀取，改完需重開客戶端；`/copykey` 與 `/allow` 是明確的局部即時更新。
+多數設定在啟動時讀取，改完需重開客戶端；`/copykey`、`/theme` 與 `/allow` 是明確的局部即時更新。
 它們呼叫時重讀 client.json，只改自己的欄位，不覆蓋彼此剛保存的設定。
 `collect_data` 已移除且不能出現在 client.json；資料飛輪的保存政策見[下文](#data-flywheel)。
 <a id="deployment-profiles"></a>
@@ -783,12 +784,15 @@ call site、doctor / preflight 與 secret redaction，不能只手動在單一 s
 - remote endpoint 只在明確接受資料外送時設定對應 opt-in。
 - commit 前跑 `git status` / `git diff`,確認沒有知識庫、上傳附件、jsonl 或 session 快取。
 
-### Session、複製鍵與取消
+### Session、複製鍵、主題與取消
 
 Session 與輸入歷史含完整問題及回答，落在專案外的 state 目錄，目錄 0700、檔 0600，
 讀寫都驗普通檔／owner／單 hard link 並以 dir-fd／nofollow 錨定。啟動不先建空 session；
 採用歷史的唯一可信讀取同時供模型歷史與原始畫面，失敗保留舊 session。
 `/copykey` 保存前重讀設定，只改 `copy_key`；合法鍵以明列集合檢查整條 Textual binding chain。
+`/theme` 同樣保存前重讀、只改 `theme`，保存成功才套用；選單預覽只改畫面不寫檔，
+Esc／Ctrl+C／Ctrl+D 還原；回合、核准、審查中拒絕。主題只改呈現，Textual 指令面板已停用，
+主題只能是 `client_config.THEME_VALUES` 裡的名稱。
 動態派發不累加舊綁定，忙碌／modal 可複製，Ctrl-C 的取消仍獨立。
 滑鼠左鍵選取完成後自動複製，只接受仍有效的手勢來源畫面／輸入框；程式更新、重播、
 捲動條或被遮住的選取不能觸發。複製不顯示常駐提示或成功通知，手動複製鍵仍可使用。
@@ -833,6 +837,12 @@ python3 scripts/run_tests.py
 - 壓縮規則與門檻從 `compaction_formula`／compaction-rules 的 canonical 文字取得，不能另抄一份。
 - 新 incident kind/detail 必須同步封閉 slug 集合與契約測試；模型／render／parser 改動核對 cache 身分。
 - repo 設定不新增環境讀取；spawn 經 `process_env`，pane 最終 exec 使用 `llama_server_env()`。
+- 新增介面主題：名稱加進 `client_config.THEME_VALUES`，外觀在 `client_theme.THEMES` 加一筆
+  `ThemeSpec`，兩者順序必須一致（載入時核對）。ANSI 主題要在 variables 定義
+  `ansi-background`／`ansi-foreground`；`.-theme-<名稱>` 規則只能寫在 `client_theme.THEME_CSS`
+  （App 層 CSS，寫在 widget 的 DEFAULT_CSS 不會生效）。裝飾符號用 `ThemeGlyph`，不能寫進內容文字。
+  Textual 8.2.5 前沒有 `Theme(ansi=…)` 與 `-theme-<名稱>` class，由 `CodeTrailApp.watch_theme`
+  補上 class 與 `ansi_color`；requirements 允許的 Textual 8 各版都要能啟動。
 
 ### 啟動與客戶端分工
 
@@ -2011,7 +2021,7 @@ set -as terminal-features ',OUTER_TERM:clipboard'
 `compaction_stopped` 的零內容 incident(與 MCP incident 同一個檔)——
 `python3 scripts/doctor.py` 會統計並印出最近幾筆的 `kind/detail`。
 
-**壓縮設定改了要重開客戶端才生效**；`/allow` 與 `/copykey` 的局部即時更新不包含壓縮模式。
+**壓縮設定改了要重開客戶端才生效**；`/allow`、`/copykey` 與 `/theme` 的局部即時更新不包含壓縮模式。
 <a id="mcp-incidents"></a>
 
 ### MCP lease 與 incident

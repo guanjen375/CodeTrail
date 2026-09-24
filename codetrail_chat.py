@@ -302,6 +302,7 @@ def command_chat(args: argparse.Namespace) -> int:
             show_reasoning=settings.show_reasoning,
             keep_historical_reasoning=settings.keep_historical_reasoning,
             copy_key=settings.copy_key,
+            theme=settings.theme,
         )
         return int(app.run() or 0)
     finally:

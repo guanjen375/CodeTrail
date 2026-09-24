@@ -1292,6 +1292,37 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_copy_key_changed_key_works_during_turn_and_modal_without_stealing_ctrl_c",
         ),
     ),
+    "test_client_theme_config.py": (
+        "主題設定只接受明列名稱；更新時重讀 owner-only client.json、只改 theme、不覆寫剛存的"
+        " allow／copy_key，讀取與相同值零寫入，非法值與 symlink／hard link fail-loud，"
+        "重開時明確帶入保存的主題",
+        (
+            "test_theme_defaults_and_reads_never_create_config",
+            "test_theme_update_rereads_and_preserves_fresh_settings_and_private_modes",
+            "test_theme_invalid_values_fail_loud_without_writing",
+            "test_theme_owner_only_failures_preserve_the_file",
+            "test_theme_startup_passes_saved_setting_explicitly",
+        ),
+    ),
+    "test_client_theme_ui.py": (
+        "主題註冊表與設定同一份名單，任一主題可在執行期互切不崩，Textual 預設同名時啟動仍完整套用；"
+        "/theme 先存後套、失敗不變，選單預覽零寫入、Esc／Ctrl-C／Ctrl-D 還原，回合與核准中拒絕；"
+        "default 的選取範圍（含三擊）不變、裝飾符號不進選取與剪貼簿；兩主題狀態資訊一致；"
+        "指令面板不能繞過註冊表；切換不動 engine／session／即時工具卡；requirements 允許的"
+        "Textual 8（含沒有 Theme(ansi=…) 的 8.0–8.2.4）能啟動並套用主題 class 與終端原生色",
+        (
+            "test_theme_registry_matches_config_and_every_theme_switches_at_runtime",
+            "test_theme_startup_applies_even_when_textual_default_has_the_same_name",
+            "test_theme_command_saves_before_applying_and_failures_keep_the_screen",
+            "test_theme_picker_previews_restores_and_only_enter_persists",
+            "test_theme_changes_are_refused_while_work_is_running",
+            "test_theme_dom_keeps_default_selection_scope_and_excludes_decorations",
+            "test_status_information_is_the_same_in_both_themes",
+            "test_the_command_palette_cannot_bypass_the_theme_registry",
+            "test_theme_switch_leaves_engine_session_and_live_blocks_intact",
+            "test_themes_work_on_textual_releases_without_native_ansi_themes",
+        ),
+    ),
     "test_client_auto_copy.py": (
         "自動複製只接受完成的真實左鍵手勢，等目標 MouseUp／Click handler 完成才讀取；"
         "保留 native 捲動與容器選取，排除舊事件、失效畫面、隱藏文字、控制操作與其他草稿，"

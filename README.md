@@ -183,6 +183,7 @@ tmux attach -t codetrail-main
 要看到真正的工具呼叫卡、結果及模型回答；模型只印 XML 或聲稱「已讀取」不算執行。
 用滑鼠左鍵拖選文字，放開即自動複製，不需按鍵。
 手動複製鍵仍可使用，詳見[選取與複製](docs/usage.md#copy)；回合進行中 **Ctrl+C** 仍中斷。
+`/theme` 切換介面主題（`default` 或仿 Codex CLI 的 `codex`），選擇會保存，詳見[介面主題](docs/usage.md#theme)。
 SSH／tmux 的剪貼簿排查見
 [開發與維運](developer.md#clipboard-ssh-tmux)。
 

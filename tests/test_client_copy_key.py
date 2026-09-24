@@ -60,7 +60,7 @@ def test_copy_key_choices_do_not_collide_with_any_binding_chain():
         Collapsible, Static, Markdown,
         client_app.VerticalScroll, client_app.CodeTrailApp, client_app.PromptInput,
         client_app.ApprovalScreen, client_app.SessionPickerScreen,
-        client_app.QueueChoiceScreen, client_app.ReviewScreen,
+        client_app.QueueChoiceScreen, client_app.ReviewScreen, client_app.ThemePickerScreen,
     )
     for cls in classes:
         assert not choices.intersection(cls._merged_bindings.key_to_bindings), cls.__name__

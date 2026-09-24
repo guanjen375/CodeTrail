@@ -207,7 +207,8 @@
   `/status`；逐項進度仍留在 TUI 前終端，`Preflight.lines` 保留完整 transcript，
   preflight 失敗仍在進 TUI 前 fail-loud。
   狀態列用 `think=on|off`，不放權限／專案指示／舊 reasoning 指示，`/status` 仍列專案
-  指示。實際 reasoning 的紅字「思考中」是暫時畫面元素，與 `show_reasoning` 本文顯示
+  指示；codex 主題把回合秒數與階段移到輸入框上方的活動列，其餘狀態資訊兩主題相同。
+  實際 reasoning 的紅字「思考中」是暫時畫面元素，與 `show_reasoning` 本文顯示
   獨立，回答／工具／完成／錯誤／取消時清除，不得落入 session 或事件內容。
 - `/copykey`——只接受不與 Textual 整條 binding chain 衝突的明列功能鍵；預設 F2，
   reset 回 F2。呼叫時重讀 owner-only client.json，只更新 copy_key，不覆蓋剛新增的 allow；
@@ -216,6 +217,15 @@
   自動複製須在元件完成選取後，以同一手勢／當前畫面／有效來源驗證；輸入框只取該
   手勢的 editor，不取其他草稿或被遮住的畫面；程式更新、重播與捲動條不得觸發。
   無選取不清空剪貼簿，OSC52 不冒稱貼上成功。
+- `/theme`——只接受 `client_config.THEME_VALUES` 明列的主題，`client_theme.THEMES` 必須與它
+  同一份名單（模組載入時 fail-loud）。呼叫時重讀 owner-only client.json，只更新 theme，
+  不覆蓋剛新增的 allow／copy_key；保存成功才套用，失敗 UI 與舊主題不變；選單預覽不寫檔，
+  Esc／Ctrl-C／Ctrl-D 還原且不算中斷或離開（選單開著期間若已有回合，Ctrl-C 仍中斷整輪）；
+  回合、核准、審查中拒絕。啟動時即使 Textual 預設主題與設定同名，也要完整套用主題
+  class 與 ANSI filter，不得讀或改環境變數；requirements 允許的 Textual 8 各版都要能啟動
+  （8.2.5 前沒有 `Theme(ansi=…)`，主題 class 與 `ansi_color` 由 App 補上）。主題只改呈現：兩主題資訊一致，裝飾符號
+  （ThemeGlyph）不得進入選取與剪貼簿，default 的外觀與選取範圍（含三擊）不變；
+  Textual 指令面板停用，不得繞過註冊表換成未登記的主題。
 - 啟動核心的設定來源——GPU、llama-server 路徑、tmux session 名、逾時與 rollback 只來自
   `deployment.json`、repo 常數與 argv;`~/start.sh` **不 export 也不 unset**，只接受
   無參數啟動或單一 `stop`，以固定 argv 呼叫啟動／停止核心；其他日常入口同樣
