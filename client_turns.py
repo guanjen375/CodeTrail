@@ -40,6 +40,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
+import client_attachments
 import client_engine
 import client_compaction
 import context_budget
@@ -51,6 +52,11 @@ MAX_QUEUE_ITEMS = 32
 MAX_QUEUE_TEXT_BYTES = 64 * 1024
 MAX_QUEUE_BYTES = 256 * 1024
 PENDING_QUEUE_STATES = frozenset({"waiting", "deferred", "delivering"})
+#: 補充訊息只以文字送入進行中的回合,沒有附件階段;含 @ 路徑就拒收(純字串判斷,
+#: UI 執行緒零檔案系統存取),草稿留在輸入框。
+SUPPLEMENT_ATTACHMENT_MESSAGE = (
+    "補充訊息不處理 @ 附件；含附件請選「排到下一輪」或等本輪結束後送出。"
+)
 
 
 class QueueError(ValueError):
@@ -212,6 +218,8 @@ class TurnCoordinator:
         self._validate_queue_text(text)
         if mode not in ("queue", "supplement"):
             raise QueueError("mode 必須是 queue 或 supplement。")
+        if mode == "supplement" and client_attachments.path_mentions(text):
+            raise QueueError(SUPPLEMENT_ATTACHMENT_MESSAGE)
         with self._lock:
             target = self.engine.session_id
             if not target:
@@ -253,6 +261,8 @@ class TurnCoordinator:
             item = next((item for item in self._queue if item.id == message_id), None)
             if item is None or item.status not in ("waiting", "deferred"):
                 raise QueueError("只有 waiting/deferred 訊息可以修改。")
+            if item.mode == "supplement" and client_attachments.path_mentions(text):
+                raise QueueError(SUPPLEMENT_ATTACHMENT_MESSAGE)
             size = sum(len(entry.text.encode("utf-8")) for entry in self._queue if entry != item)
             if size + len(text.encode("utf-8")) > MAX_QUEUE_BYTES:
                 raise QueueError("修改後超過佇列大小上限。")
@@ -691,6 +701,15 @@ class TurnCoordinator:
                     raise client_events.TurnCancelled("回合開始前已中斷")
                 message_id = self._active_queue_id
                 extra["on_user_recorded"] = lambda: self._queue_user_recorded(message_id)
+            # @ 附件在送達這一刻、在 worker 執行緒解析(佇列項目也是送達時才解析)。
+            # 只有真的有附件才帶 kwarg:沒有附件時 send() 的呼叫形狀與以前完全相同。
+            root = getattr(getattr(self.engine, "options", None), "root", None)
+            resolution = client_attachments.resolve(text, root)
+            skipped = client_attachments.skipped_notice(resolution)
+            if skipped:
+                self._publish(client_events.notice_event(target, skipped))
+            if resolution.attachments:
+                extra["attachments"] = resolution.attachments
             result = self.engine.send(
                 text,
                 on_event=_emit,

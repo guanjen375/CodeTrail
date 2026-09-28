@@ -71,12 +71,17 @@
 - `agent_tools.ToolExecutor._safe_path` — 所有檔案讀寫的 sandbox 入口
 - `media._safe_path` — 圖片/ELF/binary 的 sandbox 入口
 - `agent_tools._validate_command` — run_command 白名單 + dangerous-pattern 過濾
-- `/allow` 的目錄授權 — add 驗證後只寫 `client.json`，同 MCP 的後續命令重讀兩個
-  allow 欄位；不重套其他設定、不改 PATH、不把目錄名稱當裸命令授權。目錄／工具以
-  dir-fd / nofollow 有界驗證，解析失敗不得沿用舊授權；只替換已驗證工具的 argv[0]，
-  參數 sandbox、核准、readonly、timeout 與容器防線保留，容器不可退回 host。
-  設定 schema 只驗語法，失效工具目錄不得讓客戶端無法啟動；list 只讀設定與當前
-  MCP 的快照，不為列清單 spawn 或送請求，未知／失效／不可執行狀態必須明列。
+- `run_command` 的專案內執行檔——不需要任何授權指令：argv[0] 含 `/` 時只接受專案 root
+  內的檔案（`command_allowlist.resolve_project_executable`）。純字串拒絕（`..`、`~`、控制
+  字元、結尾 `/`、正規化後不在 root 內）先於任何檔案系統存取；接著 shell 字元與參數的
+  路徑範圍檢查照舊；最後自 `/` 逐層 dir-fd／`O_NOFOLLOW` 驗證，任一層 symlink、owner／
+  world-writable 不合、缺 owner execute、非 ELF 可執行檔或 `#!` 腳本、與保留／內建／build
+  命令同名一律拒絕；檔頭有界讀取、FIFO 不阻塞、檢查期間身分漂移 fail-closed，發布前重走
+  整條鏈，每次呼叫重驗、不快取。只把 argv[0] 換成驗證過的絕對路徑；參數 sandbox、核准、
+  readonly、timeout 與容器防線保留，容器模式拒絕且不退回 host。裸名只走內建白名單，
+  不查 PATH 授權；client.json 殘留的舊鍵（`extra_allowed_commands`、
+  `extra_allowed_command_dirs`、`copy_key`）只被忽略並在 `/status` 明列，不得讓客戶端
+  無法啟動，也不得重新授權任何命令。
 - `apply_patch` 的「context／SEARCH 必須逐字匹配（S/R 絕不用相似度代套）」、「max files / max lines
   （udiff added+removed；S/R payload budget）」邏輯；`patch_engine` 的 byte-safe 寫入（UTF-8 strict、
   BOM/CRLF 保留、symlink／dir-fd 防線、best-effort rollback）；`patch_verify` 的「驗證層不得 spawn
@@ -210,16 +215,28 @@
   指示；codex 主題把回合秒數與階段移到輸入框上方的活動列，其餘狀態資訊兩主題相同。
   實際 reasoning 的紅字「思考中」是暫時畫面元素，與 `show_reasoning` 本文顯示
   獨立，回答／工具／完成／錯誤／取消時清除，不得落入 session 或事件內容。
-- `/copykey`——只接受不與 Textual 整條 binding chain 衝突的明列功能鍵；預設 F2，
-  reset 回 F2。呼叫時重讀 owner-only client.json，只更新 copy_key，不覆蓋剛新增的 allow；
-  保存成功才換鍵，失敗 UI 與舊鍵不變；舊鍵失效，忙碌／modal 仍可複製，Ctrl-C 取消不變。
-  滑鼠左鍵選取完成即自動複製，不顯示常駐提示或成功通知；手動複製鍵保留相容性。
+- 滑鼠自動複製——滑鼠左鍵選取完成即自動複製，不顯示常駐提示或成功通知。
   自動複製須在元件完成選取後，以同一手勢／當前畫面／有效來源驗證；輸入框只取該
   手勢的 editor，不取其他草稿或被遮住的畫面；程式更新、重播與捲動條不得觸發。
-  無選取不清空剪貼簿，OSC52 不冒稱貼上成功。
+  無選取不清空剪貼簿，OSC52 不冒稱貼上成功。沒有手動複製鍵（`/copykey`、F2 與
+  `copy_key` 已移除）；閒置主畫面 Ctrl-C 有選取才複製，回合／核准／審查中 Ctrl-C 仍中斷
+  整輪，複製不等於核准。
+- TUI 的 `@` 附件——只附加專案 root 內的普通檔：字串層先拒 `~`、`..`、專案外路徑（零 FS），
+  其餘自 `/` 逐層 `O_NOFOLLOW`、葉節點 `stat(dir_fd, follow_symlinks=False)`，任一層或葉節點
+  是 symlink、目錄或特殊檔都不附加；單則最多檢查 16 個 `@`、附加 5 個。圖片／PDF／ELF／binary
+  走 `analyze_file`，其他走 `read_file`（`client_attachments.ANALYZE_FILE_EXTENSIONS` 與
+  server 的 analyze_file 分流由 smoke 契約釘成一致）。engine 在第一個模型請求前記一則宣告它們的 synthetic
+  assistant tool_calls（`attachment` 標記在 `_INTERNAL_KEYS`，不送模型）再逐一走
+  `_run_one_tool`：同一套 policy／permission 覆寫、核准（本輪與模型迴圈共用拒絕重問上限）、
+  readonly 只認 JSON true、`begin_call` 取消與 heal；中斷不發模型請求、不留答案。附件不計入
+  工具步數與收斂觀察；只有真的有附件才傳 `attachments` kwarg（既有替身與呼叫端形狀不變）。
+  補充訊息（`enqueue`／`edit_queued` 的 supplement）以純字串拒絕 `@路徑`；專案外檔案不自動
+  匯入（沿用 `import_external_file` 的開關＋逐次核准）。補全只在已驗證目錄 fd 上 `scandir`、
+  有界、跳過 symlink；補全與預覽的檔案系統工作在背景 worker，UI 執行緒零 FS、過期結果丟棄，
+  零寫入。headless `run` 用同一套解析，session replay 的客戶端身分含 `client_attachments.py`。
 - `/theme`——只接受 `client_config.THEME_VALUES` 明列的主題，`client_theme.THEMES` 必須與它
   同一份名單（模組載入時 fail-loud）。呼叫時重讀 owner-only client.json，只更新 theme，
-  不覆蓋剛新增的 allow／copy_key；保存成功才套用，失敗 UI 與舊主題不變；選單預覽不寫檔，
+  不覆蓋其他剛保存的鍵；保存成功才套用，失敗 UI 與舊主題不變；選單預覽不寫檔，
   Esc／Ctrl-C／Ctrl-D 還原且不算中斷或離開（選單開著期間若已有回合，Ctrl-C 仍中斷整輪）；
   回合、核准、審查中拒絕。啟動時即使 Textual 預設主題與設定同名，也要完整套用主題
   class 與 ANSI filter，不得讀或改環境變數；requirements 允許的 Textual 8 各版都要能啟動

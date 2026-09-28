@@ -1,21 +1,22 @@
-"""Validate command authorizations and inspect trusted tool directories safely."""
+"""Validate project-local executables for run_command safely.
+
+run_command 的 argv[0] 含 "/" 時視為專案內工具：只接受 AICODE_ROOT 之內、自 `/` 逐層
+以 dir-fd／O_NOFOLLOW 驗證過的可執行檔。不需要任何授權指令或設定；每次呼叫都重驗、
+不快取。純字串驗證（..、~、控制字元、專案外路徑）一律在任何檔案系統存取之前完成。
+"""
 from __future__ import annotations
 
 import os
 import re
 import stat
 import struct
-from dataclasses import dataclass
 
 import config
 from runtime_policy import EXTRA_BUILD_COMMANDS
 
 
-MAX_EXTRA_COMMANDS = 128
 MAX_COMMAND_NAME_CHARS = 128
-MAX_EXTRA_COMMAND_DIRS = 32
-MAX_COMMAND_DIRECTORY_CHARS = 4096
-MAX_DIRECTORY_ENTRIES = 4096
+MAX_COMMAND_PATH_CHARS = 4096
 MAX_EXECUTABLE_HEADER_BYTES = 64 * 1024
 _EXECUTABLE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*")
 _PATH_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
@@ -30,89 +31,58 @@ _STAT_FUNCTION = os.stat
 _SCANDIR_FUNCTION = os.scandir
 
 
-def _name_rejection(name: str, build_roots: set[str], builtin_roots: set[str]) -> str:
-    if len(name) > MAX_COMMAND_NAME_CHARS:
-        return f"名稱至多 {MAX_COMMAND_NAME_CHARS} 字元"
-    if not _EXECUTABLE_NAME.fullmatch(name):
-        return (
-            "必須是裸 executable 名稱 ([A-Za-z0-9_][A-Za-z0-9_.+-]*),"
-            "不可含路徑、空白或 shell 字元"
-        )
-    if name == "git":
-        return "是保留命令;請使用專用 Git 工具"
-    if name in _RESERVED_EXECUTABLES:
-        return "是禁止擴大的保留命令或通用執行器"
-    if name in build_roots:
-        return "是 build 命令;請使用 build_commands 設定"
-    if name in builtin_roots:
-        return "已由內建白名單管理,不可擴大其參數範圍"
-    return ""
-
-
-def validate_extra_allowed_commands(value: object) -> list[str]:
-    """Return a fresh validated list; reject paths, shell syntax and reserved roots.
-
-    Names need not be installed yet. This only validates authorization; execution
-    still resolves the exact executable through PATH with the existing safeguards.
-    """
-    if not isinstance(value, list):
-        raise ValueError("extra_allowed_commands 必須是 executable 名稱的字串陣列")
-    if len(value) > MAX_EXTRA_COMMANDS:
-        raise ValueError(f"extra_allowed_commands 至多 {MAX_EXTRA_COMMANDS} 項")
-
-    build_roots = {command.split()[0] for command in EXTRA_BUILD_COMMANDS}
-    builtin_roots = {command.split()[0] for command in config.ALLOWED_COMMANDS}
-    result: list[str] = []
-    seen: set[str] = set()
-    for index, name in enumerate(value):
-        label = f"extra_allowed_commands[{index}]={name!r}"
-        if not isinstance(name, str):
-            raise ValueError(f"{label} 必須是字串")
-        reason = _name_rejection(name, build_roots, builtin_roots)
-        if reason:
-            raise ValueError(f"{label} {reason}")
-        if name in seen:
-            raise ValueError(f"{label} 重複;每個 executable 名稱只能列一次")
-        seen.add(name)
-        result.append(name)
-    return result
-
-
-def validate_extra_allowed_command_dirs(value: object) -> list[str]:
-    """Normalize absolute paths lexically, without touching the filesystem."""
-    if not isinstance(value, list):
-        raise ValueError("extra_allowed_command_dirs 必須是絕對目錄路徑的字串陣列")
-    if len(value) > MAX_EXTRA_COMMAND_DIRS:
-        raise ValueError(f"extra_allowed_command_dirs 至多 {MAX_EXTRA_COMMAND_DIRS} 項")
-    result: list[str] = []
-    seen: set[str] = set()
-    for index, path in enumerate(value):
-        label = f"extra_allowed_command_dirs[{index}]={path!r}"
-        if not isinstance(path, str) or not path or not path.startswith("/"):
-            raise ValueError(f"{label} 必須是非空絕對路徑")
-        if len(path) > MAX_COMMAND_DIRECTORY_CHARS:
-            raise ValueError(f"{label} 至多 {MAX_COMMAND_DIRECTORY_CHARS} 字元")
-        if _PATH_CONTROL.search(path):
-            raise ValueError(f"{label} 不可含 NUL、控制字元或無效 Unicode")
-        # CodeTrail executes on POSIX; a repeated leading slash names the same
-        # root here. Canonicalize it too, so aliases cannot duplicate a grant.
-        normalized = os.path.normpath("/" + path.lstrip("/"))
-        if normalized in seen:
-            raise ValueError(f"{label} 正規化後重複;每個目錄只能列一次")
-        seen.add(normalized)
-        result.append(normalized)
-    return result
-
-
-@dataclass(frozen=True)
-class DirectoryInspection:
-    commands: dict[str, str]
-    excluded: dict[str, dict[str, int]]
-    errors: dict[str, str]
+class ProjectCommandError(ValueError):
+    """argv[0] 不是可執行的專案內工具；訊息可直接回給模型。"""
 
 
 class _DirectoryError(RuntimeError):
     pass
+
+
+def _name_rejection(name: str, build_roots: set[str], builtin_roots: set[str]) -> str:
+    if len(name) > MAX_COMMAND_NAME_CHARS:
+        return f"檔名至多 {MAX_COMMAND_NAME_CHARS} 字元"
+    if not _EXECUTABLE_NAME.fullmatch(name):
+        return "檔名必須符合 [A-Za-z0-9_][A-Za-z0-9_.+-]*，不可含空白或 shell 字元"
+    if name == "git":
+        return "與保留命令 git 同名；請使用 git_status／git_diff"
+    if name in _RESERVED_EXECUTABLES:
+        return "與保留命令或通用執行器同名，不可執行"
+    if name in build_roots:
+        return "與 build 命令同名；build 請在 client.json 開 build_commands 後以裸名呼叫"
+    if name in builtin_roots:
+        return "與內建白名單命令同名；請以裸名呼叫內建命令，不能用專案內同名檔擴大參數範圍"
+    return ""
+
+
+def project_executable_candidate(root: str | os.PathLike[str], argv0: str) -> str:
+    """純字串驗證 argv[0]，回傳正規化後的絕對路徑；不做任何檔案系統存取。
+
+    相對路徑以 root 為基準（run_command 的 cwd 也是 root），絕對路徑必須在 root 之下。
+    """
+    if not isinstance(argv0, str) or "/" not in argv0:
+        raise ProjectCommandError("不是路徑形式的專案內工具")
+    if len(argv0) > MAX_COMMAND_PATH_CHARS:
+        raise ProjectCommandError(f"路徑至多 {MAX_COMMAND_PATH_CHARS} 字元")
+    if _PATH_CONTROL.search(argv0):
+        raise ProjectCommandError("路徑不可含 NUL、控制字元或無效 Unicode")
+    if argv0.startswith("~"):
+        raise ProjectCommandError("不展開 ~；請用專案相對路徑")
+    if argv0.endswith("/"):
+        raise ProjectCommandError("路徑必須指向檔案，不能以 / 結尾")
+    if any(part == ".." for part in argv0.split("/")):
+        raise ProjectCommandError("路徑不可含 ..")
+    base = os.fspath(root)
+    if not isinstance(base, str) or not os.path.isabs(base):
+        raise ProjectCommandError("專案 root 必須是絕對路徑")
+    base = os.path.normpath("/" + base.lstrip("/"))
+    joined = argv0 if argv0.startswith("/") else base + "/" + argv0
+    # 只做字面正規化：不 resolve、不 realpath，專案外路徑在這裡就拒絕。
+    candidate = os.path.normpath("/" + joined.lstrip("/"))
+    prefix = base if base.endswith("/") else base + "/"
+    if candidate == base or not candidate.startswith(prefix):
+        raise ProjectCommandError("不在專案內（只能執行專案 root 內的檔案）")
+    return candidate
 
 
 def _require_directory_io() -> None:
@@ -127,7 +97,7 @@ def _require_directory_io() -> None:
     if not callable(getattr(os, "getuid", None)):
         missing.append("getuid")
     if missing:
-        raise _DirectoryError("工具目錄安全檢查需要 " + ", ".join(missing))
+        raise _DirectoryError("專案內工具安全檢查需要 " + ", ".join(missing))
 
 
 def _directory_identity(info: os.stat_result) -> tuple[int, ...]:
@@ -143,12 +113,12 @@ def _file_identity(info: os.stat_result) -> tuple[int, ...]:
 
 def _validate_directory(info: os.stat_result, path: str, uid: int, *, final: bool) -> None:
     if not stat.S_ISDIR(info.st_mode):
-        raise _DirectoryError(f"{path} 不是目錄或是 symlink")
+        raise _DirectoryError(f"{path} 不是目錄或是 symlink；不跟隨連結")
     if info.st_uid not in ({uid} if final else {0, uid}):
-        raise _DirectoryError(f"{path} 的 owner 不符合工具目錄信任規則")
+        raise _DirectoryError(f"{path} 的 owner 不符合專案內工具信任規則")
     if info.st_mode & stat.S_IWOTH:
         if final or info.st_uid != 0 or not info.st_mode & stat.S_ISVTX:
-            raise _DirectoryError(f"{path} 是 world-writable;拒絕授權")
+            raise _DirectoryError(f"{path} 是 world-writable；拒絕執行其中的工具")
 
 
 def _open_directory(path: str, uid: int) -> tuple[int, tuple[tuple[int, ...], ...]]:
@@ -228,128 +198,83 @@ def _format_rejection(data: bytes, file_size: int) -> str:
     return ""
 
 
-def _inspect_directory(path: str, uid: int) -> tuple[dict[str, str], dict[str, int]]:
-    fd, chain = _open_directory(path, uid)
+def _inspect_leaf(fd: int, name: str, uid: int) -> tuple[int, ...]:
+    """Bounded, no-follow inspection of one entry; returns its verified identity."""
+    info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    if stat.S_ISLNK(info.st_mode):
+        raise _DirectoryError(f"{name} 是 symlink；不跟隨連結")
+    if stat.S_ISDIR(info.st_mode):
+        raise _DirectoryError(f"{name} 是目錄")
+    if not stat.S_ISREG(info.st_mode):
+        raise _DirectoryError(f"{name} 不是普通檔")
+    if info.st_uid != uid:
+        raise _DirectoryError(f"{name} 不是目前使用者擁有")
+    if not info.st_mode & stat.S_IXUSR:
+        raise _DirectoryError(f"{name} 缺 owner execute 權限")
+    if info.st_mode & stat.S_IWOTH:
+        raise _DirectoryError(f"{name} 是 world-writable 檔案")
+    # O_NONBLOCK prevents a regular file swapped for a FIFO between stat/open
+    # from hanging the synchronous MCP server.
+    leaf = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
     try:
-        before = os.fstat(fd)
-        names: list[str] = []
-        with os.scandir(fd) as entries:
-            for entry in entries:
-                if len(names) >= MAX_DIRECTORY_ENTRIES:
-                    raise _DirectoryError(f"工具目錄超過 {MAX_DIRECTORY_ENTRIES} 項;未完整檢查")
-                names.append(entry.name)
-        commands: dict[str, str] = {}
-        excluded: dict[str, int] = {}
-        identities: dict[str, tuple[int, ...]] = {}
-        build_roots = {command.split()[0] for command in EXTRA_BUILD_COMMANDS}
-        builtin_roots = {command.split()[0] for command in config.ALLOWED_COMMANDS}
-        for name in sorted(names):
-            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-            reason = _name_rejection(name, build_roots, builtin_roots)
-            if not reason:
-                if stat.S_ISLNK(info.st_mode):
-                    reason = "symlink"
-                elif stat.S_ISDIR(info.st_mode):
-                    reason = "子目錄"
-                elif not stat.S_ISREG(info.st_mode):
-                    reason = "非普通檔"
-                elif info.st_uid != uid:
-                    reason = "非目前使用者擁有"
-                elif not info.st_mode & stat.S_IXUSR:
-                    reason = "缺 owner execute 權限"
-                elif info.st_mode & stat.S_IWOTH:
-                    reason = "world-writable 檔案"
-            if not reason:
-                # O_NONBLOCK prevents a regular file swapped for a FIFO between
-                # stat/open from hanging the synchronous MCP server.
-                leaf = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-                try:
-                    opened = os.fstat(leaf)
-                    if not stat.S_ISREG(opened.st_mode) or _file_identity(opened) != _file_identity(info):
-                        raise _DirectoryError(f"{name} 在開啟時身分變動")
-                    remaining = min(opened.st_size, MAX_EXECUTABLE_HEADER_BYTES)
-                    blocks: list[bytes] = []
-                    while remaining:
-                        block = os.read(leaf, remaining)
-                        if not block:
-                            raise _DirectoryError(f"{name} 檔頭讀取不完整")
-                        blocks.append(block)
-                        remaining -= len(block)
-                    named = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                    if (_file_identity(os.fstat(leaf)) != _file_identity(opened)
-                            or _file_identity(named) != _file_identity(opened)):
-                        raise _DirectoryError(f"{name} 在讀取時身分或內容變動")
-                    reason = _format_rejection(b"".join(blocks), opened.st_size)
-                finally:
-                    os.close(leaf)
-            if reason:
-                excluded[reason] = excluded.get(reason, 0) + 1
-            else:
-                commands[name] = os.path.join(path, name)
-                identities[name] = _file_identity(info)
-        for name, identity in identities.items():
-            if _file_identity(os.stat(name, dir_fd=fd, follow_symlinks=False)) != identity:
-                raise _DirectoryError(f"{name} 在目錄檢查期間變動")
-        if _file_identity(os.fstat(fd)) != _file_identity(before):
-            raise _DirectoryError("工具目錄在檢查期間變動;未完整檢查")
+        opened = os.fstat(leaf)
+        if not stat.S_ISREG(opened.st_mode) or _file_identity(opened) != _file_identity(info):
+            raise _DirectoryError(f"{name} 在開啟時身分變動")
+        remaining = min(opened.st_size, MAX_EXECUTABLE_HEADER_BYTES)
+        blocks: list[bytes] = []
+        while remaining:
+            block = os.read(leaf, remaining)
+            if not block:
+                raise _DirectoryError(f"{name} 檔頭讀取不完整")
+            blocks.append(block)
+            remaining -= len(block)
+        named = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if (_file_identity(os.fstat(leaf)) != _file_identity(opened)
+                or _file_identity(named) != _file_identity(opened)):
+            raise _DirectoryError(f"{name} 在讀取時身分或內容變動")
+        reason = _format_rejection(b"".join(blocks), opened.st_size)
+        if reason:
+            raise _DirectoryError(f"{name}：{reason}")
+    finally:
+        os.close(leaf)
+    return _file_identity(info)
+
+
+def resolve_project_executable(root: str | os.PathLike[str], argv0: str) -> str:
+    """回傳已驗證的專案內可執行檔絕對路徑；任何不符都 raise ProjectCommandError。
+
+    純字串驗證與檔名規則先完成；之後自 `/` 逐層 O_DIRECTORY|O_NOFOLLOW 走到檔案所在目錄，
+    葉節點不跟 symlink、有界讀檔頭，發布前再走一次整條鏈核對身分。不快取任何結果。
+    """
+    candidate = project_executable_candidate(root, argv0)
+    parent, name = os.path.split(candidate)
+    build_roots = {command.split()[0] for command in EXTRA_BUILD_COMMANDS}
+    builtin_roots = {command.split()[0] for command in config.ALLOWED_COMMANDS}
+    reason = _name_rejection(name, build_roots, builtin_roots)
+    if reason:
+        raise ProjectCommandError(f"{name} {reason}")
+    try:
+        _require_directory_io()
+        uid = os.getuid()
+        fd, chain = _open_directory(parent, uid)
+        try:
+            identity = _inspect_leaf(fd, name, uid)
+        finally:
+            os.close(fd)
         # The result is an absolute pathname, so re-open the full chain before
         # publishing it. An anchored fd alone could now name a detached tree.
-        fresh, fresh_chain = _open_directory(path, uid)
+        fresh, fresh_chain = _open_directory(parent, uid)
         try:
-            if fresh_chain != chain or _file_identity(os.fstat(fresh)) != _file_identity(before):
-                raise _DirectoryError("工具目錄路徑在檢查期間身分變動")
+            if fresh_chain != chain:
+                raise _DirectoryError("專案內工具路徑在檢查期間身分變動")
+            if _file_identity(os.stat(name, dir_fd=fresh, follow_symlinks=False)) != identity:
+                raise _DirectoryError(f"{name} 在檢查期間變動")
         finally:
             os.close(fresh)
-        return commands, dict(sorted(excluded.items()))
-    finally:
-        os.close(fd)
-
-
-def inspect_command_directories(
-    directories: list[str], *, extra_commands: list[str] | None = None,
-) -> DirectoryInspection:
-    """Return this inspection only; any error invalidates the complete grant.
-
-    Filesystem failures remain visible to list/add/run instead of preventing
-    unrelated settings edits or startup. No subprocess, PATH lookup or write is
-    performed, and no result is cached between calls.
-    """
-    paths = validate_extra_allowed_command_dirs(directories)
-    extras = set(validate_extra_allowed_commands([] if extra_commands is None else extra_commands))
-    commands: dict[str, str] = {}
-    excluded: dict[str, dict[str, int]] = {}
-    errors: dict[str, str] = {}
-    owners: dict[str, str] = {}
-    conflicted: set[str] = set()
-
-    def error(path: str, message: str) -> None:
-        errors[path] = errors[path] + "; " + message if path in errors else message
-
-    for path in paths:
-        excluded[path] = {}
-        try:
-            _require_directory_io()
-            found, excluded[path] = _inspect_directory(path, os.getuid())
-        except (OSError, UnicodeError, NotImplementedError, _DirectoryError) as exc:
-            error(path, f"工具目錄不可用: {exc}")
-            continue
-        if not found:
-            error(path, "工具目錄沒有合格的授權工具")
-        for name, executable in found.items():
-            if name in extras:
-                error(path, f"工具 {name!r} 與 legacy extra_allowed_commands 名稱衝突")
-                conflicted.add(name)
-            if name in owners:
-                previous = owners[name]
-                message = f"工具 {name!r} 在 {previous} 與 {path} 名稱衝突"
-                error(previous, message)
-                error(path, message)
-                conflicted.add(name)
-            else:
-                owners[name] = path
-            if name not in conflicted:
-                commands[name] = executable
-            else:
-                commands.pop(name, None)
-    return DirectoryInspection(dict(sorted(commands.items())), excluded,
-                               {path: errors[path] for path in paths if path in errors})
+    except _DirectoryError as exc:
+        raise ProjectCommandError(str(exc)) from exc
+    except OSError as exc:
+        raise ProjectCommandError(f"找不到或無法檢查（{exc.strerror or exc}）") from exc
+    except (UnicodeError, NotImplementedError, ValueError) as exc:
+        raise ProjectCommandError(f"無法檢查（{exc}）") from exc
+    return candidate

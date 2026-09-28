@@ -1019,6 +1019,53 @@ def test_user_docs_must_not_teach_removed_flags_or_files():
 
 
 @pytest.mark.smoke
+def test_user_docs_never_teach_removed_allow_or_copykey():
+    """命令目錄授權與手動複製鍵整組移除:文件與 /help 不得再教它們。
+
+    專案內工具改以專案相對路徑直接呼叫、複製改成滑鼠選取放開即複製。照舊文件打
+    `/allow add …` 或在 client.json 寫 `"copy_key": …` 既不生效也不報錯(舊鍵只被
+    忽略),所以要在文件 gate 擋下。點名舊鍵「已停用、會被忽略」的說明仍然合法。
+    """
+    from scripts import check_readme_consistency as checker
+
+    for stale in (
+        "/allow list",
+        "```text\n/allow add /opt/toolchain/bin\n```",
+        "先用 `/allow` 授權再執行",
+        "/copykey f3",
+        "按 `/copykey reset` 回預設",
+        '{ "copy_key": "f3" }',
+        '"extra_allowed_command_dirs": ["/opt/toolchain/bin"]',
+        '"extra_allowed_commands" : ["nsim"]',
+    ):
+        issues: list[str] = []
+        checker._check_no_stale_client_docs(stale, issues)
+        assert issues, stale
+    for legitimate in (
+        "舊的 `copy_key`、`extra_allowed_commands`、`extra_allowed_command_dirs` 只被忽略。",
+        "set_config 的 --allow-remote 旗標與 allowlist 規則",
+        "路徑 docs/allowed/list.md",
+    ):
+        issues = []
+        checker._check_no_stale_client_docs(legitimate, issues)
+        assert issues == [], (legitimate, issues)
+    issues = []
+    checker._check_stale_docs_per_file(issues)
+    assert issues == [], issues
+
+    import client_app
+
+    names = [name for name, _ in client_app.COMMANDS]
+    assert "/allow" not in names and "/copykey" not in names, names
+    help_text = "\n".join(
+        [f"{name} {description}" for name, description in client_app.COMMANDS]
+        + [str(client_app.HELP_TAIL)]
+    )
+    for removed in ("/allow", "/copykey", "copy_key"):
+        assert removed not in help_text, removed
+
+
+@pytest.mark.smoke
 def test_removed_daily_cli_commands_are_rejected_by_both_doc_gates():
     """Removing public argv must also remove the instructions that send users there."""
     from scripts import check_readme_consistency as checker

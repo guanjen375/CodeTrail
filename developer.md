@@ -208,15 +208,12 @@ python3 scripts/launch_servers.py --scope all --dry-run
 |---|---|
 | `compaction_mode` | 未接管時 `manual`；可選 `codetrail`／`manual`／`off`，前兩者仍實驗中 |
 | `permission` | `{}`；逐工具 `allow`／`ask`／`deny`，不能放寬 readonly |
-| `copy_key` | `f2`；TUI `/copykey` 當場更新並持久化，可用鍵見[使用指南](docs/usage.md#copy) |
 | `theme` | `default`；可選 `default`／`codex`，TUI `/theme` 預覽後保存，見[使用指南](docs/usage.md#theme) |
 | `model_remote_ok` | `false`；local／model-host 的非 loopback 模型流量需明示同意 |
 | `model_endpoints` | client 模式四角色的精確端點授權，由匯入流程建立；不能由上一鍵繞過 |
 | `kb_context_remote_ok` | `false`；Contextual Retrieval 文件窗外送的獨立同意 |
 | `external_import`／`external_import_roots` | `false`／`["~/Downloads","/tmp"]`；每次匯入仍核准 |
 | `build_commands` | `false`；明示開啟 make／cmake／ninja／meson／bazel，意味可能執行專案程式 |
-| `extra_allowed_commands` | `[]`；相容 PATH 裸命令授權 |
-| `extra_allowed_command_dirs` | `[]`；`/allow add` 管理的本機工具目錄 |
 | `rerank_fallback_policy` | 唯一值 `"error"`；舊 `embedding`／`main_model` 值要移除或改正 |
 | `project_instructions` | `true`；是否讀專案 `AGENTS.md`／`.codetrail/lessons.md` |
 | `objdump` | `""` 選 PATH objdump；跨架構時指定適合的執行檔 |
@@ -225,9 +222,13 @@ python3 scripts/launch_servers.py --scope all --dry-run
 | `show_reasoning` | `false`；只控制 reasoning 本文顯示與重播 |
 | `keep_historical_reasoning` | `false`；是否將舊 reasoning 送回模型，與 `/think` 獨立 |
 
-多數設定在啟動時讀取，改完需重開客戶端；`/copykey`、`/theme` 與 `/allow` 是明確的局部即時更新。
-它們呼叫時重讀 client.json，只改自己的欄位，不覆蓋彼此剛保存的設定。
+多數設定在啟動時讀取，改完需重開客戶端；`/theme` 是唯一的局部即時更新。
+它呼叫時重讀 client.json，只改 `theme`，不覆蓋其他剛保存的設定。
 `collect_data` 已移除且不能出現在 client.json；資料飛輪的保存政策見[下文](#data-flywheel)。
+舊版留下的 `copy_key`、`extra_allowed_commands`、`extra_allowed_command_dirs` 已停用：載入時
+只忽略（不驗值、不授權任何命令、不當成未知鍵），`/status` 的啟動診斷會列出提示；
+下一次保存設定（`/theme`、設定精靈或交易還原後的寫入）時自動移除，也可以手動刪除。
+手動複製鍵已由滑鼠自動複製取代；專案內工具以專案相對路徑直接呼叫，見[下文](#security)。
 <a id="deployment-profiles"></a>
 
 ### Deployment profile schema
@@ -682,36 +683,31 @@ system prompt 不是 permission:它不會讓被 `deny` 的工具變成可用,也
 
 `run_command(...)` 本身還有命令白名單與 dangerous-pattern 過濾。timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），不是這個範圍的整數會在執行前被拒絕。不要把 `rm` / `sudo` / `curl` / `bash` 加進白名單;真的需要人工操作時,讓模型列出建議命令,由人自己判斷後在 shell 執行。
 
-個人工具鏈在 TUI 用 `/allow list` 查看，用 `/allow add <絕對目錄>` 新增；一次只收
-一個目錄，空白可加引號。驗證後只更新 `client.json` 的 `extra_allowed_command_dirs`，
-不改工具層 `permission`，不另問確認；重複加入仍驗證現場且不寫檔。兩個額外授權欄位
-在每次 `run_command` 重新讀取，同一 session 後續命令立即生效，不重啟 MCP。
-只熱載入授權，不套用其他 runtime 設定。設定讀寫沿用 owner-only 防線；壞值、
-未知鍵或不安全檔案會拒絕執行，不回退到上一次授權。
+專案內的工具（例如 `MetaWare/arc/bin/llvm-objdump`、`./scripts/check.sh`）不需要任何授權指令或
+設定：`run_command` 的 argv[0] 含 `/` 時，一律視為專案內執行檔，以專案相對路徑（或專案 root 內的
+絕對路徑）呼叫。裸名稱只比對內建白名單，PATH 上其他命令不能執行，也沒有另外授權 PATH 名稱的設定。
 
-工具目錄從 `/` 逐層以 dir-fd／`O_NOFOLLOW` 驗證，拒絕 symlink。祖先只接受 root
-或目前 uid 擁有，且不得 world-writable（root-owned sticky 祖先如 `/tmp` 除外）；
-最終目錄必須由目前 uid 擁有且不得 world-writable。允許 group-write，這是對
-使用者信任的安裝位置授權，並不隔離同群組使用者。最多 32 個目錄，各有界枚舉
-4096 個直接子項，不遞迴。候選須是目前 uid 擁有、非 symlink、非 world-writable、
-帶 owner execute bit 的普通檔，且名稱通過既有規則。最多讀檔頭 64 KiB，只收
-`#!` 腳本、可核對的 ELF `ET_EXEC` 或帶 `PT_INTERP` 的 `ET_DYN`；依內容判斷，
-一般資料與共享函式庫不算工具。保留命令、內建／build 根名稱與不合格項目列排除。
+驗證分兩段。先做純字串檢查：長度、控制字元、`~`、結尾 `/`、任何 `..` 元件，以及正規化後是否
+嚴格位於專案 root 內；不合格的路徑在任何檔案系統存取之前就拒絕。接著 `_SHELL_PATTERNS` 與參數
+的路徑範圍檢查照舊（參數仍不能逃出專案 root）。最後才碰檔案系統：從 `/` 逐層以 dir-fd／
+`O_NOFOLLOW` 開到檔案所在目錄，拒絕任何一層 symlink。祖先只接受 root 或目前 uid 擁有，且不得
+world-writable（root-owned sticky 祖先如 `/tmp` 除外）；檔案所在目錄必須由目前 uid 擁有且不得
+world-writable。允許 group-write，這代表信任你自己的專案目錄，並不隔離同群組使用者。檔案須是目前
+uid 擁有、非 symlink、非 world-writable、帶 owner execute bit 的普通檔；最多讀檔頭 64 KiB，只收
+`#!` 腳本、可核對的 ELF `ET_EXEC` 或帶 `PT_INTERP` 的 `ET_DYN`，一般資料與共享函式庫不算工具。
+檔名與保留命令（含 `rm`／`sudo`／`curl`／`bash`）、內建白名單或 build 命令同名時一律拒絕，
+不能用專案內同名檔擴大內建命令的參數範圍。開檔用 `O_NONBLOCK`（被換成 FIFO 也不會卡住 MCP），
+檢查期間身分漂移即拒絕，發布前再從 `/` 走一次整條鏈核對身分。
 
-每次 list／執行都重驗目錄、檔案及身分，不承諾固定 binary hash。零合格工具、
-目錄失效或與其他目錄／legacy 名稱衝突都是明確錯誤：add 不寫檔，該次所有
-`run_command` 都不執行。list 即使有部分結果，也會明示整體解析失敗；MCP 未回報
-白名單時不拿本地設定猜測。授權工具仍可能缺動態 linker、架構支援或 license。
+每次呼叫都重新驗證、不快取，也不承諾固定 binary hash；只把 argv[0] 換成驗證過的絕對路徑，
+不改 PATH、不以 basename 重試。readonly 停用執行；原有工具核准、危險字元、參數路徑規則與
+timeout 仍適用。專案內工具仍可能缺動態 linker、架構支援或 license。
 
-既有 `extra_allowed_commands` JSON 相容，例如 `["nsim", "mdb"]`，只授權 PATH
-裸 executable 名稱。目錄工具也以裸名稱呼叫，實際執行使用已驗證絕對路徑，
-不改 PATH、不接受絕對 argv[0] 或 `./tool`。保留名稱（含 `rm`／`sudo`／`curl`／
-`bash`）、內建與 build 參數限制不能藉任一欄位擴大。readonly 一律清空額外授權
-且停用執行；原有工具核准、危險字元、資料路徑規則與 timeout 仍適用。
-
-授權代表你信任該程式可執行程式碼；工作目錄不是 OS sandbox，既有路徑規則也不會
-辨識每個工具的私有旗標（例如 `-tcf=/abs/x.tcf`）。容器模式不掛入本機工具目錄，
-目錄授權工具一律拒絕；legacy PATH 命令須在容器內可用，不會改到 host 執行。
+核准一次專案內工具的 `run_command`，就代表你信任該檔案的程式碼可執行；工作目錄不是 OS sandbox，
+既有路徑規則也不會辨識每個工具的私有旗標（例如 `-tcf=/abs/x.tcf`）。分析不信任的 repo 時，
+先確認檔案內容，或在 `client.json` 的 `permission` 把 `run_command` 設為 `deny`。容器模式不執行
+專案內工具，也不會改到 host 執行。舊版的目錄授權指令已移除；client.json 裡殘留的
+`extra_allowed_command_dirs`、`extra_allowed_commands` 只被忽略，不會授權任何命令。
 
 `record_lesson(...)` 是唯一會寫到 sandbox root 之外的工具,而且只寫一個固定路徑:`~/.config/codetrail/lessons.json`(per-deployment 的行為教訓 store,與 `deployment.json` 同層;不能被模型指到別的路徑)。它被 permission 設成 `ask`:模型只能「提案」,你會在核准框看到完整 rule 內容,核准後才落地。沒有無審核的自動寫入路徑;細節見 [使用指南](docs/usage.md#lessons)。
 
@@ -784,18 +780,35 @@ call site、doctor / preflight 與 secret redaction，不能只手動在單一 s
 - remote endpoint 只在明確接受資料外送時設定對應 opt-in。
 - commit 前跑 `git status` / `git diff`,確認沒有知識庫、上傳附件、jsonl 或 session 快取。
 
-### Session、複製鍵、主題與取消
+### Session、複製、主題與取消
 
 Session 與輸入歷史含完整問題及回答，落在專案外的 state 目錄，目錄 0700、檔 0600，
 讀寫都驗普通檔／owner／單 hard link 並以 dir-fd／nofollow 錨定。啟動不先建空 session；
 採用歷史的唯一可信讀取同時供模型歷史與原始畫面，失敗保留舊 session。
-`/copykey` 保存前重讀設定，只改 `copy_key`；合法鍵以明列集合檢查整條 Textual binding chain。
-`/theme` 同樣保存前重讀、只改 `theme`，保存成功才套用；選單預覽只改畫面不寫檔，
+`/theme` 保存前重讀設定、只改 `theme`，保存成功才套用；選單預覽只改畫面不寫檔，
 Esc／Ctrl+C／Ctrl+D 還原；回合、核准、審查中拒絕。主題只改呈現，Textual 指令面板已停用，
 主題只能是 `client_config.THEME_VALUES` 裡的名稱。
-動態派發不累加舊綁定，忙碌／modal 可複製，Ctrl-C 的取消仍獨立。
-滑鼠左鍵選取完成後自動複製，只接受仍有效的手勢來源畫面／輸入框；程式更新、重播、
-捲動條或被遮住的選取不能觸發。複製不顯示常駐提示或成功通知，手動複製鍵仍可使用。
+沒有手動複製鍵：滑鼠左鍵選取完成後自動複製，只接受仍有效的手勢來源畫面／輸入框；程式更新、
+重播、捲動條或被遮住的選取不能觸發。複製不顯示常駐提示或成功通知；忙碌或 modal 中也能以滑鼠
+選取複製，閒置主畫面的 Ctrl-C 有選取時才複製，回合、核准與審查中的 Ctrl-C 取消仍獨立。
+
+### `@` 附件
+
+客戶端只判定訊息裡哪些 `@` 是附件，讀內容的是 MCP 的 `analyze_file`／`read_file`，server 的
+sandbox 仍會重驗路徑。判定分兩段：字串層先拒 `~`、`..` 與專案外路徑（不做任何 stat）；
+檔案系統層從 `/` 沿專案 root 與父目錄逐層 `O_NOFOLLOW` 開啟，葉節點以
+`stat(dir_fd, follow_symlinks=False)` 判斷，任何一層或葉節點是 symlink、目錄或特殊檔都不附加。
+缺 dir-fd／nofollow 能力時附件整個停用。單則最多檢查 16 個 `@`、附加 5 個；程式碼區塊與
+行內程式碼裡的 `@` 不算。路由只看字面副檔名（symlink 不附加，字面路徑就是實體檔）：圖片、PDF、ELF 與
+firmware binary 走 `analyze_file`，其他走 `read_file`。補全只在已驗證的目錄 fd 上 `scandir`，
+有界、跳過 symlink；補全、附件預覽這些檔案系統工作在背景 worker 執行，不在 UI 執行緒，
+結果過期就丟棄。補充訊息的防呆是純字串判斷。
+
+engine 在第一個模型請求之前，以一則宣告它們的 assistant tool_calls（session 檔帶 `attachment`
+標記，不送模型）加上逐一的工具結果呈現附件，工具走與模型呼叫相同的 policy、`permission` 覆寫、
+核准（本輪共用拒絕重問上限）、readonly、取消與 MCP 錯誤處理；中斷時先補「已中斷」結果，
+不發任何模型請求。附件不計入工具步數與收斂判斷。`codetrail_chat.py run` 以同一套規則處理
+`@`，只在真的有附件時才把它們交給 engine；session replay 的客戶端身分包含 `client_attachments.py`。
 
 MCP SDK 不會在 read timeout／task cancel 自動送取消通知，客戶端自行配發 request id。
 Ctrl-C 與固定 660 秒 read timeout 都送取消；寬限期過則 SIGTERM 該 instance，所有進行中
@@ -1931,8 +1944,8 @@ explicit model/chat-template 與 non-blocking implicit routing，避免再把它
 
 ### SSH／tmux：已選取但本機貼不上
 
-用滑鼠左鍵拖選，放開就會送出複製請求，不需按鍵。需要再次送出時，也可按手動複製鍵
-（預設 **F2**，`/copykey` 可更換）；閒置主畫面另可按 **Ctrl+C**。回合、核准或審查進行中，
+用滑鼠左鍵拖選，放開就會送出複製請求，不需按鍵；需要再次送出時重新選取即可。
+閒置主畫面有選取時也可按 **Ctrl+C**。回合、核准或審查進行中，
 Ctrl+C 仍是中斷。完整操作見[選取、複製與中斷](docs/usage.md#copy)。
 
 CodeTrail 透過 Textual 向終端送出 OSC 52 複製請求，SSH 另一端的終端決定是否寫入
@@ -2021,7 +2034,7 @@ set -as terminal-features ',OUTER_TERM:clipboard'
 `compaction_stopped` 的零內容 incident(與 MCP incident 同一個檔)——
 `python3 scripts/doctor.py` 會統計並印出最近幾筆的 `kind/detail`。
 
-**壓縮設定改了要重開客戶端才生效**；`/allow`、`/copykey` 與 `/theme` 的局部即時更新不包含壓縮模式。
+**壓縮設定改了要重開客戶端才生效**；`/theme` 的局部即時更新不包含壓縮模式。
 <a id="mcp-incidents"></a>
 
 ### MCP lease 與 incident

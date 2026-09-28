@@ -35,11 +35,6 @@ from typing import Any
 import client_compaction
 import client_paths
 import client_policy
-from command_allowlist import (
-    inspect_command_directories,
-    validate_extra_allowed_command_dirs,
-    validate_extra_allowed_commands,
-)
 
 SCHEMA = 1
 CONFIG_PARTS = (".config", "codetrail", "client.json")
@@ -55,11 +50,6 @@ RERANK_FALLBACK_VALUES = ("error",)
 
 #: `.h` 當成哪一種語言解析。
 H_LANG_VALUES = ("c", "cpp")
-
-#: TUI 的專用複製鍵。F6/F7 屬於 TextArea 選取，其他既有快捷鍵不開放覆寫。
-#: 實際 App/Screen/widget 繼承綁定由 test_client_copy_key 的契約逐一核對。
-DEFAULT_COPY_KEY = "f2"
-COPY_KEY_VALUES = ("f1", "f2", "f3", "f4", "f5", "f8", "f9", "f10", "f11", "f12")
 
 #: TUI 介面主題。只管畫面，不改模型、工具或對話內容；名稱與順序必須等於
 #: client_theme.THEMES（那邊載入時核對，不一致就 fail-loud）。
@@ -103,10 +93,6 @@ class ClientSettings:
     #: 把 make / cmake / ninja / meson / bazel 掛進 run_command 白名單。
     #: 它們會跑專案內的 build script = 任意程式碼執行,所以只在分析自己的專案時開。
     build_commands: bool = False
-    #: 使用者信任的 PATH executable 名稱;不放寬內建命令或 shell 的限制。
-    extra_allowed_commands: list[str] = field(default_factory=list)
-    #: 使用者信任的工具安裝目錄;每次 list/run 重新檢查直接子項。
-    extra_allowed_command_dirs: list[str] = field(default_factory=list)
     #: reranker 掛掉時的行為。
     rerank_fallback_policy: str = "error"
     #: 讀被分析專案的 `AGENTS.md` 與 `.codetrail/lessons.md`。分析不信任的 repo
@@ -124,10 +110,11 @@ class ClientSettings:
     #: 與上面那個是**兩個**鍵:合併之後純 UI 操作會改變模型看到的 context,
     #: 而且「顯示但不送」與「送但不顯示」這兩種組合至少會有一種變成不可能。
     keep_historical_reasoning: bool = False
-    #: 複製目前畫面／輸入框選取；只管 TUI，不改模型或工具權限。
-    copy_key: str = DEFAULT_COPY_KEY
     #: TUI 介面主題；`/theme` 確認後才寫入。只管畫面，不改模型、工具或對話內容。
     theme: str = DEFAULT_THEME
+    #: 檔案裡出現過、已停用的舊鍵（排序；見 OBSOLETE_KEYS）。只供 /status 提示，
+    #: 不進 as_json —— 下一次保存就自然移除，而且不授權、不改變任何行為。
+    obsolete_keys: tuple[str, ...] = ()
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -140,8 +127,6 @@ class ClientSettings:
             "external_import": self.external_import,
             "external_import_roots": list(self.external_import_roots),
             "build_commands": self.build_commands,
-            "extra_allowed_commands": list(self.extra_allowed_commands),
-            "extra_allowed_command_dirs": list(self.extra_allowed_command_dirs),
             "rerank_fallback_policy": self.rerank_fallback_policy,
             "project_instructions": self.project_instructions,
             "objdump": self.objdump,
@@ -149,7 +134,6 @@ class ClientSettings:
             "use_container": self.use_container,
             "show_reasoning": self.show_reasoning,
             "keep_historical_reasoning": self.keep_historical_reasoning,
-            "copy_key": self.copy_key,
             "theme": self.theme,
         }
 
@@ -172,6 +156,24 @@ class ClientSettings:
                 "重啟 aicode 後生效。"
             )
         return f"壓縮模式 {self.compaction_mode}(來自 {self.path})"
+
+    def legacy_notice(self) -> tuple[str, ...]:
+        """檔案裡還有已停用的舊鍵時給 /status 的一行說明;沒有就是空 tuple。
+
+        舊鍵只被忽略(不授權、不改行為),所以這裡是提示,不是錯誤。
+        """
+        if not self.obsolete_keys:
+            return ()
+        reasons: list[str] = []
+        for key in self.obsolete_keys:
+            reason = OBSOLETE_KEYS[key]
+            if reason not in reasons:
+                reasons.append(reason)
+        return (
+            f"client.json 的 {'、'.join(self.obsolete_keys)} 已停用並忽略："
+            + "；".join(reasons)
+            + "。下次保存設定時會自動移除，也可手動刪除。",
+        )
 
 
 def config_path(env: Mapping[str, str] | None = None) -> Path:
@@ -202,7 +204,6 @@ _BOOL_KEYS = (
 _CHOICE_KEYS = {
     "rerank_fallback_policy": RERANK_FALLBACK_VALUES,
     "h_lang": H_LANG_VALUES,
-    "copy_key": COPY_KEY_VALUES,
     "theme": THEME_VALUES,
 }
 #: 自由字串的鍵。
@@ -210,8 +211,7 @@ _TEXT_KEYS = ("objdump",)
 #: 全部合法鍵。**未知鍵 fail-loud** —— 寫錯鍵名靜默忽略,就是「我設了但沒生效」
 #: 與「我設對了」長得一模一樣。
 KNOWN_KEYS = frozenset(
-    {"schema", "compaction_mode", "permission", "external_import_roots", "model_endpoints",
-     "extra_allowed_commands", "extra_allowed_command_dirs"}
+    {"schema", "compaction_mode", "permission", "external_import_roots", "model_endpoints"}
     | set(_BOOL_KEYS)
     | set(_CHOICE_KEYS)
     | set(_TEXT_KEYS)
@@ -225,6 +225,17 @@ REMOVED_KEYS: dict[str, str] = {
         "`python3 data_flywheel.py where --root <專案>` 會印出確切目錄"
     ),
 }
+#: 已停用、但**容忍**的舊鍵 → 停用說明。與 REMOVED_KEYS 相反:值一律忽略、不驗、不授權,
+#: 也不算未知鍵。理由:c629ca9 之後存過的每一份 client.json 都有 copy_key,fail-loud 會讓
+#: 所有既有安裝(含 MCP server 啟動時的 FATAL 分支)起不來;而忽略它們不放寬任何邊界 ——
+#: 複製鍵功能已移除,run_command 的專案內執行檔規則與設定無關。載入時記在
+#: ClientSettings.obsolete_keys 供 /status 提示,下一次保存時不再寫出。
+_PROJECT_TOOLS_REASON = "專案內執行檔以專案相對路徑直接呼叫，不再需要授權"
+OBSOLETE_KEYS: dict[str, str] = {
+    "copy_key": "手動複製鍵已移除（滑鼠選取放開即複製）",
+    "extra_allowed_commands": _PROJECT_TOOLS_REASON,
+    "extra_allowed_command_dirs": _PROJECT_TOOLS_REASON,
+}
 
 
 def _bool(value: Any, key: str, path: Path) -> bool:
@@ -236,20 +247,6 @@ def _bool(value: Any, key: str, path: Path) -> bool:
     if not isinstance(value, bool):
         raise ClientConfigError(f"{path} 的 {key} 必須是 true / false,得到 {value!r}")
     return value
-
-
-def _extra_commands(value: object, path: Path) -> list[str]:
-    try:
-        return validate_extra_allowed_commands(value)
-    except ValueError as exc:
-        raise ClientConfigError(f"{path}: {exc}") from exc
-
-
-def _extra_command_dirs(value: object, path: Path) -> list[str]:
-    try:
-        return validate_extra_allowed_command_dirs(value)
-    except ValueError as exc:
-        raise ClientConfigError(f"{path}: {exc}") from exc
 
 
 def _validate(value: Any, path: Path) -> dict[str, Any]:
@@ -265,7 +262,7 @@ def _validate(value: Any, path: Path) -> dict[str, Any]:
         raise ClientConfigError(
             f"{path} 有已移除的鍵 {removed}:" + ";".join(REMOVED_KEYS[key] for key in removed)
         )
-    unknown = sorted(set(value) - KNOWN_KEYS)
+    unknown = sorted(set(value) - KNOWN_KEYS - set(OBSOLETE_KEYS))
     if unknown:
         raise ClientConfigError(
             f"{path} 有不認得的鍵 {unknown};合法鍵:{sorted(KNOWN_KEYS)}。"
@@ -292,8 +289,8 @@ def _validate(value: Any, path: Path) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "compaction_mode": mode,
         "permission": permission,
-        "extra_allowed_commands": _extra_commands(value.get("extra_allowed_commands", []), path),
-        "extra_allowed_command_dirs": _extra_command_dirs(value.get("extra_allowed_command_dirs", []), path),
+        # 舊鍵的值不看:只記出現過哪些,給 /status 提示(見 OBSOLETE_KEYS)。
+        "obsolete_keys": tuple(sorted(set(value) & set(OBSOLETE_KEYS))),
     }
     if "model_endpoints" in value:
         from endpoint_policy import validate_model_endpoints, EndpointPolicyError
@@ -394,12 +391,8 @@ def save_client_settings(
     換成 symlink」,而這個檔決定寫入工具要不要人工核准。
     """
     path = config_path(env)
-    # as_json 會複製 list,所以先驗原始值,避免把錯給的字串拆成逐字元白名單。
-    _extra_commands(settings.extra_allowed_commands, path)
-    extra_dirs = _extra_command_dirs(settings.extra_allowed_command_dirs, path)
     try:
         value = settings.as_json()
-        value["extra_allowed_command_dirs"] = extra_dirs
         _validate(value, path)
         payload = (
             json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
@@ -412,34 +405,6 @@ def save_client_settings(
     return client_paths.replace_private_file(
         path.parent, path.name, payload, _error, anchor=path.parent.parent
     )
-
-
-def validate_copy_key(value: object) -> str:
-    """只接受沒有占用既有操作的 canonical Textual 功能鍵名稱。"""
-    if not isinstance(value, str) or value not in COPY_KEY_VALUES:
-        allowed = " / ".join(key.upper() for key in COPY_KEY_VALUES)
-        raise ClientConfigError(f"copy_key 只接受 {allowed}，得到 {value!r}")
-    return value
-
-
-def update_copy_key(
-    key: str, env: Mapping[str, str] | None = None,
-) -> tuple[ClientSettings, bool]:
-    """重讀目前設定後只換 copy_key，成功落檔才把新設定交回 TUI。
-
-    不採用啟動時的快照：同一段 session 的 /allow add 可能剛新增授權。
-    預設鍵且沒有設定檔時維持零寫入，其他設定不套回目前的 runtime。
-    """
-    key = validate_copy_key(key)
-    settings = load_client_settings(env)
-    if settings.copy_key == key:
-        return settings, False
-    changed = replace(settings, present=True, copy_key=key)
-    try:
-        save_client_settings(changed, env)
-    except OSError as exc:
-        raise ClientConfigError(f"無法儲存 {settings.path}: {exc}") from exc
-    return changed, True
 
 
 def validate_theme(value: object) -> str:
@@ -455,78 +420,15 @@ def update_theme(
 ) -> tuple[ClientSettings, bool]:
     """重讀目前設定後只換 theme，成功落檔才把新設定交回 TUI。
 
-    與 update_copy_key 同一套：不採用啟動時的快照（同一段 session 的 /allow add、
-    /copykey 可能剛寫入），預設主題且沒有設定檔時維持零寫入，其他設定不套回 runtime。
+    不採用啟動時的快照：啟動之後其他寫入者（例如 set_config）可能已經改過 client.json。
+    預設主題且沒有設定檔時維持零寫入，其他設定不套回 runtime。
     """
     name = validate_theme(name)
     settings = load_client_settings(env)
     if settings.theme == name:
         return settings, False
-    changed = replace(settings, present=True, theme=name)
-    try:
-        save_client_settings(changed, env)
-    except OSError as exc:
-        raise ClientConfigError(f"無法儲存 {settings.path}: {exc}") from exc
-    return changed, True
-
-
-def update_extra_allowed_commands(
-    action: str,
-    commands: list[str],
-    env: Mapping[str, str] | None = None,
-) -> tuple[ClientSettings, bool]:
-    """Validate one batch, then edit the latest settings with one atomic save.
-
-    Existing additions and absent removals are no-ops. Subsequent MCP commands
-    read the saved authorizations; other settings and permission stay unchanged.
-    """
-    if action not in ("add", "remove"):
-        raise ClientConfigError("/allow 動作只接受 add / remove")
-    names = _extra_commands(commands, config_path(env))
-    if not names:
-        raise ClientConfigError(f"/allow {action} 至少需要一個 executable 名稱")
-
-    settings = load_client_settings(env)
-    existing = settings.extra_allowed_commands
-    selected = set(names)
-    if action == "add":
-        current = set(existing)
-        updated = existing + [name for name in names if name not in current]
-    else:
-        updated = [name for name in existing if name not in selected]
-    updated = _extra_commands(updated, settings.path)
-    if updated == existing:
-        return settings, False
-
-    changed = replace(settings, present=True, extra_allowed_commands=updated)
-    save_client_settings(changed, env)
-    return changed, True
-
-
-def add_allowed_command_directory(
-    path: str, env: Mapping[str, str] | None = None,
-) -> tuple[ClientSettings, bool]:
-    """Inspect the complete current grant before atomically adding one directory.
-
-    A repeated addition still checks the current files and conflicts, but never
-    writes on success. This helper changes only the stored directory list.
-    """
-    settings = load_client_settings(env)
-    candidate = _extra_command_dirs([path], settings.path)[0]
-    existing = settings.extra_allowed_command_dirs
-    updated = _extra_command_dirs(
-        existing if candidate in existing else [*existing, candidate], settings.path,
-    )
-    try:
-        inspection = inspect_command_directories(updated, extra_commands=settings.extra_allowed_commands)
-    except ValueError as exc:
-        raise ClientConfigError(f"{settings.path}: {exc}") from exc
-    if inspection.errors:
-        failures = "; ".join(f"{directory}: {message}" for directory, message in inspection.errors.items())
-        raise ClientConfigError(f"工具目錄授權失敗: {failures}")
-    if updated == existing:
-        return settings, False
-    changed = replace(settings, present=True, extra_allowed_command_dirs=updated)
+    # 保存時舊鍵不會寫出:回傳值要與落檔後的內容一致。
+    changed = replace(settings, present=True, theme=name, obsolete_keys=())
     try:
         save_client_settings(changed, env)
     except OSError as exc:
@@ -546,11 +448,9 @@ def apply_to_config(settings: ClientSettings, *, readonly: bool = False) -> None
     """
     import config
 
+    # 所有 runtime mutation 之前就要驗;錯的值不能留下半套已套用的設定。
     if settings.rerank_fallback_policy != "error":
         raise ClientConfigError('rerank_fallback_policy 只接受 "error";請修復專用 reranker')
-    # 所有 runtime mutation 之前就要驗;錯的清單不能留下半套已套用的設定。
-    extra_commands = _extra_commands(settings.extra_allowed_commands, settings.path)
-    extra_dirs = _extra_command_dirs(settings.extra_allowed_command_dirs, settings.path)
     config.EXTERNAL_IMPORT_ENABLED = settings.external_import
     config.EXTERNAL_IMPORT_ROOTS = list(settings.external_import_roots)
     config.KB_CONTEXT_REMOTE_OK = settings.kb_context_remote_ok
@@ -561,8 +461,6 @@ def apply_to_config(settings: ClientSettings, *, readonly: bool = False) -> None
     config.OBJDUMP = settings.objdump
     config.H_LANG = settings.h_lang
     config.USE_CONTAINER = settings.use_container
-    config.EXTRA_ALLOWED_COMMANDS = [] if readonly else extra_commands
-    config.EXTRA_ALLOWED_COMMAND_DIRS = [] if readonly else extra_dirs
 
     if readonly:
         # replay / canary 的契約是「前後 project state 不變」,而且它們不得把

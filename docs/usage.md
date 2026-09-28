@@ -5,7 +5,7 @@
 部署、設定、資料保存政策與故障排解見 [開發與維運](../developer.md)。
 
 - [聊天與工具結果](#chat)、[選取與複製](#copy)、[介面主題](#theme)、[thinking](#thinking)
-- [歷史對話](#sessions)、[排隊與補充](#queue)、[工作區審查](#review)
+- [歷史對話](#sessions)、[排隊與補充](#queue)、[工作區審查](#review)、[執行專案內工具](#project-tools)
 - [附件](#attachments)、[知識入庫與查詢](#rag)、[PDF 圖面覆核](#pdf-review)
 - [表格與 OCR](#text-table-review)、[入庫續跑](#ingest-resume)、[KB 維護](#knowledge-maintenance)
 - [行為 lessons](#lessons)、[build target](#build-context)、[記憶體配置核對](#memory-consistency)
@@ -22,6 +22,7 @@ aicode
 正常啟動對話區空白，啟動摘要、壓縮模式與全部 WARN 在 `/status`。
 健康檢查失敗會在終端報錯並拒絕進入 TUI。`/tools` 查看 21 個 MCP 工具，
 `/help` 查看互動指令。首次直接送出問題或 `/new` 才建立 session。
+訊息裡用 `@相對路徑` 可以夾帶專案內的檔案，Tab 補全路徑，詳見[夾帶附件](#attachments)。
 
 CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透過 MCP 工具按需讀檔、搜尋、查 RAG。
 
@@ -69,7 +70,6 @@ CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透�
 | 操作與情境 | 行為 |
 |---|---|
 | **滑鼠左鍵拖曳選取後放開** | 自動複製本次選取；主畫面、輸入框、核准框與審查中的文字都可用，不會中斷、核准或關閉畫面 |
-| **手動複製鍵（預設 F2）** | 再次複製目前畫面的選取文字；忙碌、核准框或其他選單開著時也可用 |
 | **Ctrl+C**，閒置主畫面有選取 | 複製；優先取對話區選取，其次取目前焦點輸入框的選取 |
 | **Ctrl+C**，閒置主畫面沒有選取 | 連按兩次離開 |
 | **Ctrl+C**，回合／核准／審查進行中 | 中斷目前回合或審查；有選取文字也一樣。對話選單開著時則只收選單 |
@@ -78,17 +78,11 @@ CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透�
 
 滑鼠自動複製只取本次手勢所在畫面的選取；選取輸入框時只取該輸入框，不會取被彈出視窗
 遮住的對話或其他草稿。普通點擊、捲動條、右鍵與程式更新文字不觸發自動複製。
-手動複製鍵優先取目前畫面的文字選取，其次取目前焦點輸入框的選取。
-複製後保留反白，可再次選取或按手動複製鍵重新複製；要用 Ctrl+C 離開，先取消選取。
+沒有專用的複製按鍵：回合、核准或審查進行中請用滑鼠選取複製（放開即複製）；
+閒置主畫面的 Ctrl+C 優先取目前畫面的文字選取，其次取目前焦點輸入框的選取。
+複製後保留反白，可再次選取重新複製；要用 Ctrl+C 離開，先取消選取。
 沒有選取時不清空剪貼簿。複製操作不顯示成功通知，請在本機貼上確認內容；
 SSH、tmux 與終端支援的設定見[剪貼簿排查](../developer.md#clipboard-ssh-tmux)。
-
-
-需要手動複製時，用 `/copykey` 查看目前鍵與可用鍵，`/copykey f3` 立即改成 F3，`/copykey reset` 回 F2。
-允許 **F1、F2、F3、F4、F5、F8、F9、F10、F11、F12**；F6／F7 保留給輸入框選取，
-Ctrl／Alt 組合與其他既有操作鍵不接受。新設定保存到 owner-only `client.json` 的 `copy_key`，
-重新啟動仍生效；更新成功後舊鍵不再複製，寫入失敗則維持原鍵。
-更換手動複製鍵不影響滑鼠自動複製與 Ctrl+C 中斷。
 
 <a id="theme"></a>
 
@@ -241,8 +235,10 @@ python3 <CODETRAIL_REPO>/codetrail_chat.py sessions
 
 `aicode` 閒置時照常送出問題。回合忙碌時按 Enter，會先讓你選擇：
 
-- **排到下一輪**：目前回合成功收尾後，依加入順序逐則開始新回合。
+- **排到下一輪**：目前回合成功收尾後，依加入順序逐則開始新回合。訊息裡的 `@路徑` 在真正送出時才讀取。
 - **補充目前任務**：等整批工具結果都寫好，在下一次模型請求前加入原文。正在進行的 HTTP、工具寫入和核准保持原有流程。
+  補充不處理附件：含 `@路徑` 的補充會被拒絕並保留草稿（`/supplement` 與修改補充項目的 `/queue edit`
+  也一樣），請改排到下一輪。
 
 剛啟動時尚未建立 session。`/queue add` 與 `/queue resume` 會提示先用 `/new` 或直接
 輸入第一則問題，不會為了排隊先建立空白對話。接續 `/session` 選定的歷史後也可使用佇列。
@@ -325,32 +321,75 @@ Git LFS 或 filter 已轉換的工作區內容，若無法與 HEAD/index 核對�
 會列為未知轉換缺口，不執行外部轉換程式。
 全域 Git 設定支援 dotfiles 常見的檔案或父目錄 symlink，讀取仍有大小與時間上限，
 並核對連結與目標是否改變；這項支援不放寬 repo 來源的 no-follow 防線。
-<a id="allow"></a>
+<a id="project-tools"></a>
 
-## 授權本機工具目錄
+## 執行專案內工具
+
+`run_command` 除了內建的測試／靜態命令（`pytest`、`ruff` 等）以外，也能直接執行專案內的工具，
+不需要任何授權指令或設定：在命令裡用專案相對路徑呼叫即可。
 
 ```text
-/allow list
-/allow add /absolute/path/to/toolchain/bin
+請用 run_command 執行 MetaWare/arc/bin/llvm-objdump -d build/app.elf
+請用 run_command 執行 ./scripts/check_board.sh
 ```
 
-`/allow` 等同 list，只讀設定與目前 MCP 的快照，不送模型或建立設定檔。add 一次接受
-一個絕對目錄，含空白可加引號；驗證後只更新 `extra_allowed_command_dirs`，同 session
-後續命令立即採用。忙碌、核准、審查與 readonly 期間只能列清單。
+- 路徑以你執行 `aicode` 的專案根目錄為基準（工作目錄也是它）；專案內的絕對路徑同樣可用。
+  含 `..`、`~`、控制字元或位於專案外的路徑，在任何檔案存取之前就拒絕。
+- 每次呼叫都重新驗證：從 `/` 逐層檢查且不跟符號連結；檔案與所在目錄須由你擁有且不得
+  world-writable；檔案須帶 owner execute 權限，內容是 ELF 可執行檔或 `#!` 腳本。
+  與保留命令（例如 `bash`、`rm`）、內建命令或 build 命令同名的檔案一律不執行。
+- 裸名稱只比對內建白名單，PATH 上的其他命令不能執行；專案內的工具請加路徑，例如 `./configure`。
+- 不經 shell：`|`、`>`、`&&` 等語法一律拒絕，請用工具自己的參數限制輸出。
+- 每次執行仍會跳出核准框；核准就代表同意執行該檔案的程式碼。分析不信任的 repo 時先確認檔案內容，
+  或在 `client.json` 的 `permission` 把 `run_command` 設為 `deny`。參數路徑範圍、timeout 與
+  readonly 限制照舊。
+- 容器模式（`use_container`）不執行專案內工具，也不會改到本機執行。
 
-每次都重驗目錄和工具，拒絕 symlink、無效權限、空目錄及重名；失效不能沿用舊清單。
-模型用裸名稱呼叫，既有核准、參數 sandbox、timeout 與 readonly 防線仍保留。
-容器不掛入本機工具目錄，也不退回 host 執行。詳細信任邊界見
+舊版的目錄授權指令已經移除。`client.json` 若還留著 `extra_allowed_command_dirs`、
+`extra_allowed_commands` 或 `copy_key` 這些舊鍵，啟動時只會忽略並在 `/status` 列出提示，
+下次保存設定時自動移除；它們不會授權任何命令。詳細信任邊界見
 [安全邊界](../developer.md#security)。
 <a id="attachments"></a>
 
 ## 夾帶附件
 
-附件有兩種情況：檔案已經在專案目錄內，或檔案還在專案外。
+### 在訊息裡用 `@` 夾帶
 
-### 檔案在專案目錄內
+檔案在專案目錄內（sandbox root，也就是你執行 `aicode` 的那個目錄）時，直接在訊息裡寫
+`@相對路徑`：
 
-把檔案放在 sandbox root(= 你執行 `aicode` 的那個目錄)底下，例如 `logs/build_fail.txt`、`screenshots/error.png`、`firmware/boot.bin`。然後在對話裡明確要求使用工具：
+```text
+@screenshots/error.png 畫面上的錯誤是什麼？
+請比對 @docs/spec.pdf 與 @build/app.elf 的記憶體配置。
+@"logs/build fail.txt" 最重要的錯誤是哪一行？
+```
+
+- 輸入 `@` 之後按 Tab 補全專案內的路徑（目錄以 `/` 結尾，可以繼續補全）；路徑含空白時寫成
+  `@"路徑"`，補全會自動加上引號。補全區同步列出這則訊息會附加哪些檔案、交給哪個工具，
+  以及哪些 `@` 不會附加與原因。
+- 送出後客戶端先用既有工具讀附件，再請模型回答：
+
+  | 副檔名 | 工具 |
+  |---|---|
+  | PNG／JPG／JPEG／GIF／WebP | `analyze_file`（經 VL 看圖） |
+  | PDF | `analyze_file`（一次性抽文字，不入庫） |
+  | ELF／SO／O／AXF／OUT／KO | `analyze_file`（ELF 總覽） |
+  | BIN／DAT／RAW／FW／IMG／ROM／HEX | `analyze_file`（hex、字串與 magic） |
+  | 其他 | `read_file`（純文字；二進位檔會回報無法讀取與改用的工具） |
+
+  結果以工具卡顯示在你的訊息下方，與模型自己呼叫工具相同：`permission` 設定、核准框與
+  Ctrl+C 中斷都適用；較舊的工具輸出之後照常會被裁掉以節省 context。
+- 單則最多附加 5 個檔案、檢查 16 個 `@`；同一個檔案寫兩次只附加一次。
+- 只附加專案內的一般檔：專案外路徑、`~`、`..`、目錄與符號連結都不附加。看起來像路徑卻不能
+  附加的 `@`（例如找不到檔案）照原文送出，畫面上會說明原因。程式碼區塊與行內程式碼
+  裡的 `@`、email，以及緊接在英數字後面的 `@` 都不算附件。
+- 回合進行中排到下一輪的訊息，在真正送出時才讀附件；「補充目前任務」不處理附件，含 `@路徑` 的
+  補充會被拒絕並保留草稿，請改排到下一輪。
+- 附件只進目前對話，不會建立可反覆查詢的知識庫；要反覆查詢請改用下節的 `ingest_document(...)`。
+
+### 請模型直接呼叫工具
+
+也可以在對話裡明確要求使用工具，例如需要指定 ELF 的 `view`／`target` 時：
 
 ```text
 請用工具 read_file 讀 logs/build_fail.txt，找出最重要的錯誤訊息。
@@ -370,8 +409,8 @@ Git LFS 或 filter 已轉換的工作區內容，若無法與 HEAD/index 核對�
 
 ### 檔案在專案目錄外
 
-預設不能直接讀 `$HOME`、`Downloads` 或其他專案外路徑。要匯入外部附件，在
-`~/.config/codetrail/client.json` 打開匯入功能：
+`@` 只附加專案內的檔案；預設也不能直接讀 `$HOME`、`Downloads` 或其他專案外路徑。
+要匯入外部附件，在 `~/.config/codetrail/client.json` 打開匯入功能：
 
 ```json
 { "external_import": true }
@@ -394,7 +433,7 @@ Git LFS 或 filter 已轉換的工作區內容，若無法與 HEAD/index 核對�
 再用 read_file 讀回傳的新路徑，整理最重要的錯誤。
 ```
 
-匯入後的檔案會複製到專案底下 `.aicode_uploads/`，原始檔不會被修改。更多副檔名、白名單與圖片/binary 細節見 [RAG、附件與知識庫操作](#rag)。
+匯入後的檔案會複製到專案底下 `.aicode_uploads/`，原始檔不會被修改；之後也可以在訊息裡用 `@.aicode_uploads/<檔名>` 夾帶。更多副檔名、白名單與圖片/binary 細節見 [RAG、附件與知識庫操作](#rag)。
 
 如果外部 PDF / spec / 截圖圖片也要注入 RAG，先 `import_external_file`，再把回傳的 `.aicode_uploads/...` 路徑交給 `ingest_document`（圖片會自動走 VL）；完整串接範例見 [RAG、附件與知識庫操作](#attachments)。
 <a id="rag"></a>

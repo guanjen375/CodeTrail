@@ -499,19 +499,36 @@ def test_idle_ctrl_c_copies_screen_or_prompt_selection_without_arming_exit(monke
             assert app._last_interrupt == 0.0
             assert prompt.text == "draft selected"
             prompt.move_cursor(prompt.document.end)
-            await pilot.press("f2")  # 空選取不得把已有的剪貼簿清掉。
-            assert app.clipboard == "draft"
+            # 空選取的 Ctrl-C 不得把已有的剪貼簿清掉;它只是第一次「準備離開」
+            # (複製不算那一次),所以 app 沒有結束。手動複製鍵已移除,不再有別的鍵。
             await pilot.press("ctrl+c")
-            assert app.return_value is None  # 複製不是第一次「準備離開」。
+            assert app.clipboard == "draft"
+            assert app._last_interrupt > 0
+            assert app.return_value is None
             assert engine.messages == [] and engine.sent == []
 
     _run(body)
 
 
-def test_copy_during_a_turn_preserves_ctrl_c_cancellation():
-    """專用複製不動回合；即使仍有選取，Ctrl-C 也必須中斷進行中的回合。"""
-    from textual.selection import SELECT_ALL
+async def _raw_mouse(app, pilot, event_type, point):
+    """經 App.on_event 的真實滑鼠路徑(Pilot.mouse_* 會繞過自動複製的手勢判斷)。"""
+    event = event_type(None, point[0], point[1], 0, 0, 1, False, False, False)
+    assert app.post_message(event)
+    await pilot.pause()
 
+
+async def _triple_click(app, pilot, widget):
+    """三擊 = 選取整個捲動容器;放開時自動複製(手動複製鍵已移除)。"""
+    from textual import events
+
+    point = (widget.content_region.x, widget.content_region.y)
+    for _chain in range(3):
+        await _raw_mouse(app, pilot, events.MouseDown, point)
+        await _raw_mouse(app, pilot, events.MouseUp, point)
+
+
+def test_copy_during_a_turn_preserves_ctrl_c_cancellation():
+    """滑鼠選取自動複製不動回合；即使仍有選取，Ctrl-C 也必須中斷進行中的回合。"""
     engine = _Blocks()
 
     async def body():
@@ -522,9 +539,10 @@ def test_copy_during_a_turn_preserves_ctrl_c_cancellation():
             try:
                 reply = client_app.Static(client_app.Text("in progress 中文"))
                 await app.query_one("#log").mount(reply)
-                app.screen.selections = {reply: SELECT_ALL}
-                await pilot.press("f2")
-                assert app.clipboard == "in progress 中文"
+                await pilot.pause()
+                await _triple_click(app, pilot, reply)
+                assert "in progress 中文" in app.clipboard
+                assert app.screen.get_selected_text(), "複製後保留反白"
                 assert app.coordinator.busy and not engine.cancelled
                 await pilot.press("ctrl+c")
                 assert engine.cancelled
@@ -538,8 +556,6 @@ def test_copy_during_a_turn_preserves_ctrl_c_cancellation():
 
 def test_copy_in_approval_never_grants_or_cancels_but_ctrl_c_still_cancels():
     """框內複製完整參數不等於核准；選取不能吃掉 Ctrl-C 的整輪取消。"""
-    from textual.selection import SELECT_ALL
-
     engine = _AsksApproval()
 
     async def body():
@@ -548,8 +564,7 @@ def test_copy_in_approval_never_grants_or_cancels_but_ctrl_c_still_cancels():
             app.submit("改一下")
             screen = await _wait_for_approval(app, pilot)
             detail = screen.query_one("#approval-detail")
-            screen.selections = {detail: SELECT_ALL}
-            await pilot.press("f2")
+            await _triple_click(app, pilot, detail)
             # Screen selection strips the final newline; all rendered approval
             # parameters must otherwise survive byte for byte, not just a prefix.
             assert app.clipboard == screen.ticket.request.render().rstrip("\n")

@@ -814,6 +814,15 @@ _STALE_DOC_PATTERNS = (
     # 不報錯)。啟動核心的變數由 tests/test_repo_consistency.py 的逐變數白名單處理;
     # 這裡只擋最明確的「叫使用者 export」形狀。
     (r"(?m)^\s*(?:[$>]\s*)?export\s+(?:AICODE|AI_CODE|CODETRAIL)_", "`export AICODE_* / AI_CODE_* / CODETRAIL_*`(設定只來自檔案)"),
+    # 命令目錄授權與手動複製鍵已整組移除:專案內工具以專案相對路徑直接呼叫,複製靠滑鼠
+    # 選取放開即複製。client.json 殘留的舊鍵只被忽略(文件可以點名它們已停用),
+    # 但不得再教指令或 JSON 設定寫法 —— 照做既不生效也不報錯。
+    (r"(?<![\w-])/allow\b", "`/allow`(已移除;專案內工具以專案相對路徑直接呼叫)"),
+    (r"/copykey\b", "`/copykey`(已移除;滑鼠選取放開即複製)"),
+    (r'"copy_key"\s*:', "client.json 的 `copy_key` 設定寫法(手動複製鍵已移除,舊鍵只被忽略)"),
+    (r'"extra_allowed_command(?:_dir)?s"\s*:',
+     "client.json 的 `extra_allowed_commands`／`extra_allowed_command_dirs` 設定寫法"
+     "(命令授權已移除,舊鍵只被忽略)"),
 )
 
 def _check_no_stale_client_docs(docs_text: str, issues: list[str], *, source: str = "") -> None:

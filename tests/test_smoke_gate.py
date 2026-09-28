@@ -118,104 +118,42 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_canary_fingerprint_includes_the_explicit_internal_off_mode",
         ),
     ),
-    "test_allow_directory_regression.py": (
-        "/allow add 目錄必須寫入 client.json，讓同一 MCP instance 立即執行該目錄工具；"
-        "list 顯示內建與目錄授權，管理操作不進模型歷史；帶路徑或 shell 語法的呼叫仍拒絕且不 spawn，"
-        "但拒絕訊息指回裸名稱並列出已授權工具",
+    "test_project_commands.py": (
+        "run_command 的專案內執行檔：argv[0] 含 / 才走專案內驗證，純字串拒絕（..、~、控制字元、"
+        "專案外）先於任何檔案系統存取；自 / 逐層 dir-fd／O_NOFOLLOW，任一層 symlink、owner／"
+        "world-writable 不合、缺 owner execute、非 ELF 可執行檔或 #! 腳本、與保留／內建／build 同名"
+        "一律拒絕；檔頭有界、FIFO 不阻塞、身分漂移與缺安全能力 fail-closed、每次重驗不快取；只換 "
+        "argv[0]，shell 字元／參數 containment／timeout／停用閘照舊，容器不退回 host；裸名沒有 PATH "
+        "退路；live MCP 不需設定即可執行、readonly 拒絕；模型可見描述不再教授權指令",
         (
-            "test_allow_add_directory_reaches_running_mcp_without_restart",
-            "test_rejected_tool_path_names_bare_tool_grants_and_shell_limits",
+            "test_project_executable_resolves_inside_root_and_runs_by_validated_path",
+            "test_rejected_project_paths_never_touch_the_filesystem",
+            "test_project_executable_never_follows_symlinks",
+            "test_project_executable_enforces_owner_mode_and_format",
+            "test_project_executable_rejects_reserved_builtin_and_build_names",
+            "test_project_executable_header_read_is_bounded_and_fifo_or_drift_fails_closed",
+            "test_project_executable_missing_safety_capability_fails_before_open",
+            "test_project_command_keeps_shell_containment_timeout_and_disabled_gates",
+            "test_project_command_revalidates_every_call_without_cache",
+            "test_project_command_in_container_is_refused_without_host_fallback",
+            "test_regression_model_path_with_pipe_gets_no_shell_hint_and_never_spawns",
+            "test_live_mcp_runs_project_tool_without_settings_and_readonly_denies",
+            "test_run_command_descriptions_teach_project_paths_not_allow",
         ),
     ),
-    "test_allow_directory_runtime.py": (
-        "目錄授權即時重讀固定設定來源，只替換經驗證的 executable；不得沿用舊授權或 PATH，"
-        "保留 readonly／核准／參數／timeout／容器閘，MCP 快照僅供零副作用列清單",
+    "test_client_legacy_settings.py": (
+        "client.json 已停用的 copy_key／extra_allowed_commands／extra_allowed_command_dirs 只被忽略："
+        "載入不 fail、不授權任何命令、不寫回 runtime，下一次 owner-only 保存自然移除；未知鍵、"
+        "已移除鍵（collect_data）、schema 與 owner-only 防線不因此放寬；client_mcp 不再解析命令 "
+        "policy 快照；保存前驗全部值與 byte budget、壞的既有檔不被覆寫、無效設定不得半套套用 runtime",
         (
-            "test_directory_executor_uses_fresh_settings_and_absolute_argv_without_path_fallback",
-            "test_directory_executor_revalidates_and_fails_closed_without_cached_mapping",
-            "test_directory_executor_keeps_bare_names_dangerous_patterns_and_path_containment",
-            "test_directory_executor_does_not_load_before_disabled_or_timeout_gates",
-            "test_direct_directory_executor_uses_only_config_and_keeps_permission_and_readonly",
-            "test_directory_executor_refuses_container_without_host_or_legacy_semantic_changes",
-            "test_live_mcp_reloads_only_allow_from_selected_source_and_keeps_runtime_policy",
-            "test_mcp_default_allow_loader_pins_startup_path_without_mutating_runtime",
-            "test_command_policy_metadata_is_optional_strict_and_never_changes_model_or_readonly",
-            "test_command_policy_cache_does_not_start_request_write_or_wait_on_lifecycle_lock",
-            "test_command_policy_snapshot_updates_on_handshake_and_normal_respawn",
-        ),
-    ),
-    "test_command_allowlist_dirs.py": (
-        "目錄授權只收有界安全讀取的 executable；schema 不碰現場、拒絕 symlink／不可信 owner、"
-        "重名／身分漂移／缺安全能力均 fail-closed，失效後不得沿用舊映射",
-        (
-            "test_directory_syntax_normalization_never_touches_filesystem",
-            "test_directory_inspection_accepts_tools_and_excludes_untrusted_entries",
-            "test_directory_inspection_rejects_malformed_or_unbounded_elf_headers",
-            "test_directory_inspection_allows_group_write_and_root_owned_sticky_ancestor",
-            "test_directory_inspection_enforces_owner_and_world_write_boundaries",
-            "test_directory_inspection_excludes_foreign_owned_candidate",
-            "test_directory_inspection_never_follows_directory_symlinks",
-            "test_directory_inspection_reports_conflicts_without_selecting_a_winner",
-            "test_directory_inspection_never_reuses_mapping_after_installation_becomes_invalid",
-            "test_directory_inspection_enumeration_is_bounded_and_never_partial_success",
-            "test_directory_inspection_reads_at_most_the_header_budget",
-            "test_directory_inspection_fifo_swap_is_nonblocking_and_fails_closed",
-            "test_directory_inspection_revalidates_identity_and_reports_read_failures",
-            "test_directory_inspection_missing_safety_capability_fails_before_open",
-        ),
-    ),
-    "test_client_allow_ui.py": (
-        "/allow 的本地設定操作不得送模型或改 runtime；忙碌／核准／審查／readonly 拒絕修改，"
-        "壞值與寫入失敗必須可見，列出清單零寫入並說明目前 session 後續命令立即生效",
-        (
-            "test_allow_list_reads_fresh_settings_without_writes_or_model_history",
-            "test_allow_updates_preserve_other_settings_runtime_and_idle_queue",
-            "test_allow_active_or_readonly_sessions_reject_mutation_but_allow_list",
-            "test_allow_invalid_requests_never_partially_write_settings",
-            "test_allow_invalid_settings_remain_visible_and_unchanged",
-            "test_allow_save_oserror_is_visible_without_success_or_runtime_changes",
-            "test_allow_missing_or_invalid_mcp_policy_never_guesses_effective_whitelist",
-            "test_allow_list_marks_runtime_execution_restrictions",
-            "test_allow_directory_failure_is_visible_and_disables_the_whole_resolved_list",
-            "test_allow_inspection_oserror_is_visible_without_side_effects",
-        ),
-    ),
-    "test_client_allow_config.py": (
-        "client.json 額外命令 fail-closed、保留命令不可擴權、批次驗證與 owner-only 持久化；"
-        "重套與 readonly 清除授權，無效設定不得半套改變 runtime",
-        (
-            "test_missing_extra_commands_fail_closed_without_creating_config",
-            "test_extra_commands_roundtrip_preserves_other_settings",
-            "test_extra_commands_loader_rejects_unsafe_or_ambiguous_values",
-            "test_extra_commands_never_widen_reserved_executable_roots",
-            "test_allow_edits_read_latest_settings_and_noops_do_not_write",
-            "test_allow_invalid_batch_is_rejected_before_reading_or_writing",
-            "test_allow_rejects_oversized_result_without_partial_save",
+            "test_obsolete_copy_and_allow_keys_load_without_granting_anything",
+            "test_obsolete_keys_are_dropped_by_the_next_owner_only_save",
+            "test_obsolete_keys_do_not_relax_unknown_removed_schema_or_owner_checks",
+            "test_client_catalog_no_longer_parses_command_policy",
             "test_save_validates_all_values_and_byte_budget_before_any_write",
-            "test_allow_edits_keep_owner_only_link_defenses",
-            "test_allow_refuses_invalid_existing_settings_without_overwriting_them",
-            "test_apply_extra_commands_replaces_copies_and_clears_for_readonly",
-            "test_invalid_extra_commands_do_not_partially_apply_runtime",
-            "test_allow_directory_settings_remain_editable_when_installation_is_missing",
-            "test_allow_directory_loader_rejects_unsafe_or_duplicate_paths",
-            "test_allow_invalid_directory_syntax_never_partially_applies_runtime",
-            "test_allow_directory_add_preserves_latest_settings_and_duplicate_is_read_only",
-            "test_allow_directory_add_validates_whole_union_before_any_write",
-            "test_allow_directory_bad_candidate_does_not_create_settings",
-            "test_allow_directory_limit_is_checked_before_save_or_inspection",
-            "test_allow_directory_save_failure_is_a_visible_config_error",
-        ),
-    ),
-    "test_extra_commands.py": (
-        "使用者命令授權必須抵達實際 MCP／executor；設定替換與 readonly 不殘留授權，"
-        "額外命令仍受精確名稱、參數、timeout、核准與容器防線保護",
-        (
-            "test_user_toolchain_commands_load_and_run_without_repo_edit",
-            "test_extra_commands_are_replaced_and_readonly_clears_authorization",
-            "test_extra_commands_keep_exact_names_and_argument_guards",
-            "test_extra_commands_do_not_change_tool_permission_or_execution_gates",
-            "test_extra_commands_never_fall_back_from_container_to_host",
-            "test_explicit_client_config_reaches_live_mcp_and_readonly_still_denies",
+            "test_theme_editor_refuses_invalid_existing_settings_without_overwriting_them",
+            "test_invalid_settings_do_not_partially_apply_runtime",
         ),
     ),
     "test_review_source.py": (
@@ -1277,24 +1215,50 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_every_prime_the_coordinator_runs_reports_through_on_prime",
         ),
     ),
-    "test_client_copy_key.py": (
-        "複製鍵與既有繼承按鍵不衝突；設定當場重讀並透過 owner-only IO 儲存，"
-        "不得覆寫新授權、讀取不得建檔、失敗保留原鍵；更換後舊鍵失效，"
-        "忙碌與 modal 仍可複製且 Ctrl-C 繼續中斷",
+    "test_client_attachments.py": (
+        "TUI 的 @ 附件：字串層先拒 ~／..／專案外（零 FS），其餘逐層 O_NOFOLLOW，symlink／目錄／特殊檔"
+        "不附加；單則檢查 16 個 @、附加 5 個、去重；補全只在已驗證目錄 fd 上 scandir、檢查後換址也"
+        "不列專案外名稱，插入文字（含空白加引號）回解析仍指向同一檔；路由與 analyze_file 分流一致；"
+        "engine 在第一個模型請求前記 synthetic tool_calls（標記不送模）並走同一套 policy／readonly／"
+        "allowlist／核准，拒絕重問上限與模型迴圈共用，中斷先 heal 且不發模型請求；重播按宣告群組"
+        "配對；協調器送達時才解析、補充訊息純字串拒絕 @ 路徑；session replay 身分含附件模組",
         (
-            "test_copy_key_choices_do_not_collide_with_any_binding_chain",
-            "test_copy_key_defaults_and_read_only_commands_do_not_create_config",
-            "test_copy_key_startup_passes_saved_setting_explicitly",
-            "test_copy_key_edits_preserve_fresh_allow_settings_and_private_modes",
-            "test_copy_key_invalid_settings_and_commands_fail_without_writing",
-            "test_copy_key_owner_only_failures_preserve_file_and_active_key",
-            "test_copy_key_switch_removes_old_dispatch_and_failed_save_keeps_previous_key",
-            "test_copy_key_changed_key_works_during_turn_and_modal_without_stealing_ctrl_c",
+            "test_attachment_mentions_parse_quotes_boundaries_and_code_spans",
+            "test_attachment_resolution_uses_nofollow_walk_inside_project_only",
+            "test_attachment_resolution_bounds_mentions_limit_and_duplicates",
+            "test_attachment_completion_scans_verified_directory_fd_and_skips_links",
+            "test_attachment_completion_items_round_trip_to_the_same_file",
+            "test_attachment_routing_matches_analyze_file_dispatch",
+            "test_engine_records_attachment_calls_before_the_first_model_request",
+            "test_attachment_calls_follow_permission_readonly_and_allowlist_policy",
+            "test_attachment_denials_share_the_turn_retry_limit_with_the_model_loop",
+            "test_cancel_during_attachment_heals_and_never_requests_the_model",
+            "test_replay_pairs_attachment_results_with_their_declared_group",
+            "test_coordinator_resolves_at_delivery_and_supplements_refuse_path_mentions_without_io",
+            "test_session_eval_identity_includes_attachment_resolution",
+        ),
+    ),
+    "test_client_attachment_ui.py": (
+        "TUI：/allow、/copykey 已移除（未知指令、零副作用，/help 不列），原手動複製鍵不再複製、"
+        "閒置 Ctrl-C 仍複製選取；@ 補全與附件預覽在背景 worker 執行、UI 執行緒零 FS、過期結果丟棄，"
+        "補全只取代游標所在 token 並為含空白的路徑加引號，@ token 上補全未回來時 Tab 不移焦點；"
+        "含 @ 路徑的補充保留草稿；/status 啟動診斷列出 client.json 舊鍵；headless run 以同一套解析"
+        "把附件交給 engine",
+        (
+            "test_removed_allow_and_copykey_commands_are_unknown_without_side_effects",
+            "test_help_lists_attachments_and_no_removed_commands",
+            "test_former_copy_key_does_not_copy_and_idle_ctrl_c_still_copies",
+            "test_attachment_preview_runs_off_the_ui_thread_and_drops_stale_results",
+            "test_at_completion_replaces_only_the_token_and_quotes_spaces",
+            "test_tab_on_pending_at_token_keeps_focus",
+            "test_supplement_choice_with_path_mentions_keeps_the_draft",
+            "test_startup_diagnostics_report_obsolete_client_keys",
+            "test_headless_run_passes_resolved_attachments_to_the_engine",
         ),
     ),
     "test_client_theme_config.py": (
-        "主題設定只接受明列名稱；更新時重讀 owner-only client.json、只改 theme、不覆寫剛存的"
-        " allow／copy_key，讀取與相同值零寫入，非法值與 symlink／hard link fail-loud，"
+        "主題設定只接受明列名稱；更新時重讀 owner-only client.json、只改 theme、不覆寫其他剛存的"
+        "鍵，讀取與相同值零寫入，非法值與 symlink／hard link fail-loud，"
         "重開時明確帶入保存的主題",
         (
             "test_theme_defaults_and_reads_never_create_config",
@@ -1543,6 +1507,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_documentation_sources_include_all_primary_and_runtime_documents",
             "test_developer_contract_sections_are_checked_independently",
             "test_user_docs_must_not_teach_removed_flags_or_files",
+            "test_user_docs_never_teach_removed_allow_or_copykey",
             "test_removed_daily_cli_commands_are_rejected_by_both_doc_gates",
             "test_runtime_repair_hints_use_supported_daily_or_maintenance_commands",
             "test_routing_eval_docs_require_measured_client_support",
@@ -1593,8 +1558,8 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "test_run_command.py": (
-        "agent_tools._validate_command(白名單 + dangerous pattern)；"
-        "run_command timeout 1..600 的 executor 與 MCP 兩層邊界",
+        "agent_tools._validate_command(白名單 + dangerous pattern；裸名只走內建白名單、"
+        "路徑命令走專案內執行檔驗證)；run_command timeout 1..600 的 executor 與 MCP 兩層邊界",
         (
             "test_run_command_disabled_blocks",
             "test_validate_rejects_non_whitelisted",

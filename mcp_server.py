@@ -283,22 +283,6 @@ except Exception as _settings_exc:  # noqa: BLE001
     sys.exit(2)
 _client_config.apply_to_config(_CLIENT_SETTINGS, readonly=_ARGS["readonly"])
 
-# 標準來源仍容許缺檔，但 HOME 的選擇在啟動時固定，熱載入不重選位置。
-# 明示 --client-config 則連缺檔也必須拒絕。兩路都沿 client_paths owner-only IO。
-_COMMAND_SETTINGS_PATH = _CLIENT_SETTINGS.path
-_COMMAND_SETTINGS_EXPLICIT = bool(_ARGS["client_config"])
-_COMMAND_SETTINGS_HOME = {"HOME": str(_COMMAND_SETTINGS_PATH.parent.parent.parent)}
-
-
-def _load_command_settings() -> tuple[list[str], list[str]]:
-    if _COMMAND_SETTINGS_EXPLICIT:
-        settings = _client_config.load_client_settings_from(_COMMAND_SETTINGS_PATH)
-    else:
-        settings = _client_config.load_client_settings(_COMMAND_SETTINGS_HOME)
-    # 只消費當次 allow 設定；不 apply_to_config，不熱改 permission/container/build。
-    return list(settings.extra_allowed_commands), list(settings.extra_allowed_command_dirs)
-
-
 import container_runner as _container_runner
 
 _container_runner.CONTAINER_ENABLED = config.USE_CONTAINER
@@ -316,8 +300,7 @@ config.RUN_COMMAND_ENABLED = _POLICY.run_command_enabled
 # Build 命令(make/cmake/ninja/meson/bazel)會跑專案內的 build script,
 # 風險面比 pytest/cargo test 大。預設不掛白名單,要分析自己的專案再
 # 由客戶端以 `--enable-build-commands` 打開(來源是 client.json)。
-# agent_tools 每次讀 config.ALLOWED_COMMANDS；使用者 allow 設定由 loader 即時重讀。
-_BUILTIN_COMMAND_PREFIXES = list(config.ALLOWED_COMMANDS)
+# agent_tools 每次讀 config.ALLOWED_COMMANDS；專案內工具以路徑呼叫、每次驗證，沒有授權設定。
 _BUILD_COMMANDS_ENABLED = _POLICY.build_commands_enabled
 _EXTRA_BUILD_COMMANDS = list(EXTRA_BUILD_COMMANDS)
 if _BUILD_COMMANDS_ENABLED:
@@ -422,7 +405,7 @@ _log("[MCP] 初始化 CodeRAG (lazy index — 第一次 code_rag_search 才建�
 CODE_RAG = CodeRAG(AICODE_ROOT)
 
 _log("[MCP] 初始化 ToolExecutor ...")
-EXEC = ToolExecutor(AICODE_ROOT, command_settings_loader=_load_command_settings)
+EXEC = ToolExecutor(AICODE_ROOT)
 
 _log(
     f"[MCP] PATCH_ENABLED = {config.PATCH_ENABLED}, "
@@ -440,8 +423,7 @@ else:
         f"[MCP] ALLOWED_COMMANDS 共 {len(config.ALLOWED_COMMANDS)} 條 "
         "(build 命令未掛白名單;要分析自己的專案請在 client.json 開 build_commands)"
     )
-_log(f"[MCP] EXTRA_ALLOWED_COMMANDS 共 {len(config.EXTRA_ALLOWED_COMMANDS)} 條 (client.json;readonly 清空)")
-_log(f"[MCP] EXTRA_ALLOWED_COMMAND_DIRS 共 {len(config.EXTRA_ALLOWED_COMMAND_DIRS)} 個 (每次 run_command 重讀與驗證)")
+_log("[MCP] run_command 專案內執行檔：以專案相對路徑呼叫，每次重驗")
 _log(f"[MCP] EXTERNAL_IMPORT_ENABLED = {config.EXTERNAL_IMPORT_ENABLED}")
 if data_flywheel.collect_enabled():
     _log(
@@ -772,24 +754,14 @@ def _tool(*d_args, **d_kwargs):
         register_kwargs = dict(d_kwargs)
         register_kwargs.setdefault("description", MODEL_TOOL_DESCRIPTIONS[name])
         read_only = name in _READ_ONLY_TOOLS
-        annotation_fields = {
-            "readOnlyHint": read_only,
-            "destructiveHint": not read_only,
-            "idempotentHint": read_only,
-            "openWorldHint": False,
-        }
-        if name == "run_command":
-            annotation_fields["codetrailCommandPolicy"] = {
-                "schema": 1,
-                "builtin_prefixes": list(_BUILTIN_COMMAND_PREFIXES),
-                "build_prefixes": list(_EXTRA_BUILD_COMMANDS) if _BUILD_COMMANDS_ENABLED else [],
-                "run_command_enabled": config.RUN_COMMAND_ENABLED,
-                "readonly": _ARGS["readonly"],
-                "use_container": _container_runner.CONTAINER_ENABLED,
-            }
         register_kwargs.setdefault(
             "annotations",
-            ToolAnnotations(**annotation_fields),
+            ToolAnnotations(
+                readOnlyHint=read_only,
+                destructiveHint=not read_only,
+                idempotentHint=read_only,
+                openWorldHint=False,
+            ),
         )
         if name not in EVIDENCE_TOOL_NAMES:
             register_kwargs.setdefault("structured_output", False)
@@ -3489,24 +3461,26 @@ def record_lesson(
 
 @_tool()
 def run_command(
-    cmd: Annotated[str, Field(description="Complete command whose executable and arguments must pass the whitelist policy.")],
+    cmd: Annotated[str, Field(description="Whitelisted bare command or project-relative tool path, plus arguments.")],
     timeout: Annotated[
         int, Field(strict=True, ge=RUN_COMMAND_TIMEOUT_MIN, le=RUN_COMMAND_TIMEOUT_MAX,
                    description="Server timeout in seconds; strict integer 1..600; client may stop earlier.")
     ] = RUN_COMMAND_TIMEOUT,
 ) -> str:
-    """Run a whitelisted command inside AICODE_ROOT (server-side timeout 1..600 s).
+    """Run a whitelisted command or a project-local tool inside AICODE_ROOT (server-side timeout 1..600 s).
 
-    白名單(內建前綴、legacy extra_allowed_commands 與授權目錄工具):
+    裸名(argv[0] 不含 "/")只比對內建白名單:
       - 預設白名單 = 測試與靜態命令:pytest / ctest / npm test / cargo test / go test;
         mypy / tsc / ruff / black / isort / eslint / clang-format 等。
       - build 命令(make / cmake / ninja / meson / bazel build)只在
         client.json 的 build_commands 打開時加入白名單。
       - git 不在白名單:改用 git_status / git_diff。
-      - client.json 的 extra_allowed_commands 額外放行 PATH 上的裸命令名稱。
-      - /allow add <絕對目錄> 儲存 extra_allowed_command_dirs，後續命令立即
-        重讀與重驗，將裸工具名解析為已驗證絕對路徑，不修改 PATH。
-        目錄授權不改人工核准；host 目錄工具在容器模式明確拒絕。
+    專案內工具以專案相對路徑呼叫(例如 tools/bin/x 或 ./build.sh),不需要任何授權:
+      - 每次呼叫都自 `/` 逐層 dir-fd／O_NOFOLLOW 重新驗證,不跟 symlink;須為目前使用者
+        擁有、帶 owner execute 的 ELF 可執行檔或 #! 腳本;與保留、內建或 build 命令同名者拒絕。
+      - `..`、`~`、控制字元與專案外路徑在任何檔案系統存取之前就拒絕。
+      - 只把 argv[0] 換成驗證過的絕對路徑;不經 shell,參數仍受路徑範圍檢查。
+      - 容器模式不執行專案內工具,也不會改到本機執行。人工核准不變。
     apply_patch 不會自動呼叫這裡:套用後只做同 process 的 syntax check,lint / test
     要由你另行呼叫 run_lint(fix=False) / run_command,各自經過核准閘。
     輸出超長會 smart-truncate(優先保留含 FAIL/ERROR/Traceback 的段落)。

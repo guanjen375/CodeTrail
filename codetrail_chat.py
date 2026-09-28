@@ -42,6 +42,7 @@ import deployment_profile as _deployment_profile  # noqa: E402
 
 try:
     import client_app  # noqa: E402
+    import client_attachments  # noqa: E402
     import client_compaction  # noqa: E402
     import client_config  # noqa: E402
     import client_engine  # noqa: E402
@@ -287,10 +288,15 @@ def command_chat(args: argparse.Namespace) -> int:
         # 啟動對話區保持空白。摘要、壓縮狀態與所有 stderr 警告留給 /status，
         # 完整 preflight transcript 仍在接管畫面前的終端上。
         # 失敗路徑不走這裡:`PreflightError` 在上面 exit 2,transcript 留在終端。
-        banner = checks.banner_lines(
-            tools=len(engine.tool_specs),
-            permission=engine.options.policy.name,
-            compaction=compactor.mode,
+        banner = (
+            *checks.banner_lines(
+                tools=len(engine.tool_specs),
+                permission=engine.options.policy.name,
+                compaction=compactor.mode,
+            ),
+            # client.json 殘留已停用的舊鍵(copy_key、extra_allowed_*):只忽略、不擋啟動,
+            # 在 /status 的啟動診斷明列,使用者才知道可以刪掉。
+            *settings.legacy_notice(),
         )
         app = client_app.CodeTrailApp(
             engine,
@@ -301,7 +307,6 @@ def command_chat(args: argparse.Namespace) -> int:
             # payload 與摘要輸入。合併之後純 UI 操作會改變模型看到的 context。
             show_reasoning=settings.show_reasoning,
             keep_historical_reasoning=settings.keep_historical_reasoning,
-            copy_key=settings.copy_key,
             theme=settings.theme,
         )
         return int(app.run() or 0)
@@ -348,8 +353,15 @@ def command_run(args: argparse.Namespace) -> int:
         )
         if engine.messages and engine.options.policy.name == "interactive":
             _headless_compact(engine, compactor, None, emit, prepare=True)
+        # @ 附件與 TUI 同一套解析(session replay 才忠實):只有真的有附件才帶 kwarg,
+        # 沒有附件時 send() 的呼叫形狀與以前完全相同。
+        resolution = client_attachments.resolve(args.prompt, root)
+        skipped = client_attachments.skipped_notice(resolution)
+        if skipped:
+            emit(client_events.notice_event(engine.session_id, skipped))
+        extra = {"attachments": resolution.attachments} if resolution.attachments else {}
         try:
-            result = engine.send(args.prompt, on_event=emit_or_hold)
+            result = engine.send(args.prompt, on_event=emit_or_hold, **extra)
         except context_budget.ContextOverflowError as exc:
             emit(client_events.error_event(engine.session_id, str(exc)))
             outcome = _headless_compact(engine, compactor, None, emit, prepare=True)

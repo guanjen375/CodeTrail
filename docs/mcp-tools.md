@@ -33,6 +33,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 查不能答錯的規格數字 | 請用工具 `query_knowledge_strict` 查 reset assert 最小時間，證據不夠就拒答。 | `query_knowledge_strict(...)` |
 | 看專案外的截圖/PDF/log | 請先用工具 `import_external_file` 匯入 `~/Downloads/error.png`，再分析回傳的新路徑。 | `import_external_file(...)` |
 | 看圖片、PDF、ELF、firmware | 請用工具 `analyze_file` 分析 `.aicode_uploads/error.png`（或 `docs/spec.pdf`），做通用 VL 圖片分析、PDF 一次性抽文字或 binary 分析。 | `analyze_file(...)` |
+| 夾帶專案內的檔案 | 在訊息裡寫 `@shots/error.png 這是什麼錯誤？`（路徑含空白用 `@"路徑"`）；送出前客戶端自動呼叫 `analyze_file`（圖片、PDF、ELF、binary）或 `read_file`（其他檔案），結果以工具卡顯示，詳見[夾帶附件](usage.md#attachments)。 | `analyze_file(...)`、`read_file(...)` |
 | 深入看一個 ELF | 請用工具 `analyze_file` 分析 `build/app.elf`，`view` 設 "symbols"、`target` 設 "uart"（或 `view` 設 "disasm"、`target` 設 "Reset_Handler"；`view` 設 "dwarf"、`target` 設 "0x08001234"）。 | `analyze_file(path, view="symbols", target="uart")` |
 | 把文件/圖片/binary 加進 KB | 請用工具 `ingest_document` 匯入 `docs/spec.pdf`（或 `arch.png`、`firmware.bin`）。之後查詢會自動載入；想立即確認 chunk 數再補 `reload_knowledge_base`。 | `ingest_document(...)`、`reload_knowledge_base()` |
 | 圖很多的 PDF，先估成本 | 請用工具 `ingest_document` 對 `docs/datasheet.pdf` 設 `preflight_only=True`，回報候選數、VL 呼叫次數與是否超過上限。 | `ingest_document(path, preflight_only=True)` |
@@ -67,7 +68,7 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 修改/驗證 | `git_diff(path=None, staged=False)` | 看修改內容，不需要用 `run_command` 跑 git；非 git 專案同樣回跳過通知 |
 | 修改/驗證 | `apply_patch(diff, dry_run=False)` | 套 SEARCH/REPLACE 或 unified diff（同一次只能一種；參數已是字串，不要包 fence），會真的寫檔；最多 5 個檔案、單檔 200 行（udiff 算 added+removed；S/R 算 payload budget = SEARCH+REPLACE 行數，不是同一種計數）；UTF-8 strict，BOM／CRLF／檔尾換行／權限原樣保留，mixed newline 與 symlink 拒絕；套用後只做唯讀 syntax check（advisory、三態、失敗不回滾）；細節見[apply_patch 的兩種格式](#apply_patch-的兩種格式) |
 | 修改/驗證 | `run_lint(path, fix=True)` | 對單一檔案跑格式化/lint；`fix=False` 走 check-only(不改檔) |
-| 修改/驗證 | `run_command(cmd, timeout=60)` | 跑白名單中的裸命令；timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），預設 60。預設為測試／靜態命令；build 命令(make/cmake/ninja/meson/bazel)需在 `client.json` 設 `"build_commands": true`。`/allow list` 查看，`/allow add <絕對目錄>` 驗證後寫入 `extra_allowed_command_dirs`，同 session 後續命令立即生效；相容既有 `extra_allowed_commands` PATH 名稱設定。每次重讀授權並驗目錄，失效或重名即拒絕；容器不能執行本機目錄工具。既有核准、readonly 與參數檢查仍適用；git 用 `git_status` / `git_diff` |
+| 修改/驗證 | `run_command(cmd, timeout=60)` | 跑內建白名單的裸命令，或以專案相對路徑執行專案內工具（例如 `tools/bin/x`、`./build.sh`，不需要任何授權指令）；timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止），預設 60。裸名只比對內建白名單：預設為測試／靜態命令；build 命令(make/cmake/ninja/meson/bazel)需在 `client.json` 設 `"build_commands": true`；PATH 上其他命令不可執行。專案內工具每次呼叫都重新驗證：`..`、`~`、控制字元與專案外路徑在任何檔案存取前拒絕；自 `/` 逐層不跟 symlink；檔案與所在目錄須由目前使用者擁有、不得 world-writable；須帶 owner execute，且是 ELF 可執行檔或 `#!` 腳本；與保留、內建或 build 命令同名者拒絕；只把 argv[0] 換成驗證過的絕對路徑。不經 shell；容器模式不執行專案內工具，也不改到本機執行。既有核准、readonly 與參數路徑檢查仍適用；git 用 `git_status` / `git_diff` |
 | 行為教訓 | `record_lesson(rule, scope="project")` | 你糾正模型行為後,把糾正「提案」成一條行為規則;經你核准(permission ask)寫入 lessons store,之後 session 注入 context([使用指南](usage.md#lessons)) |
 
 ### `code_rag_search` 四種模式

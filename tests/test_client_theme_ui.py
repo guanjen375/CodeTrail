@@ -319,12 +319,10 @@ def test_theme_dom_keeps_default_selection_scope_and_excludes_decorations(monkey
                 await _mouse(app, pilot, events.MouseUp, point)
             assert copies == [_USER_TEXT, _ALL_TEXT]
             assert app.screen.get_selected_text() == _ALL_TEXT
-            # 手動複製鍵與閒置 Ctrl-C 讀同一份選取,裝飾符號不得混進來。
-            await pilot.press(app.copy_key)
-            await _settle(pilot)
+            # 閒置 Ctrl-C 讀同一份選取,裝飾符號不得混進來(手動複製鍵已移除)。
             await pilot.press("ctrl+c")
             await _settle(pilot)
-            assert copies[2:] == [_ALL_TEXT, _ALL_TEXT]
+            assert copies[2:] == [_ALL_TEXT]
             assert not any("再按一次" in note for note in _lines(app, client_app.NoticeLine))
             # 拖選本文兩行:使用者自己的縮排保留,「› 」不在裡面。
             await _drag(app, pilot, _point(body_widget), _point(body_widget, 6, 1))

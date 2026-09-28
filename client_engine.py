@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import client_attachments
 import client_events
 import client_mcp
 import client_notify
@@ -228,7 +229,7 @@ def _apply_pruning(
 
 _INTERNAL_KEYS = frozenset({
     "time", "tool_status", "synthetic", "structured", "call_index", "queue_id", "delivery_mode",
-    "message_id", "turn_status", "cancellation_projected",
+    "message_id", "turn_status", "cancellation_projected", "attachment",
 })
 
 
@@ -1732,9 +1733,12 @@ class Engine:
         on_reasoning: Callable[[str], None] | None = None,
         approve: Callable[[ApprovalRequest], bool] | None = None,
         on_user_recorded: Callable[[], None] | None = None,
+        attachments: Sequence[client_attachments.Attachment] = (),
     ) -> TurnResult:
         self._require_bound_session()
         emit = on_event or (lambda _event: None)
+        # 本輪唯一一份拒絕計數:附件階段與模型工具迴圈共用,重問上限才是「整輪」的。
+        denied_counts: dict[str, int] = {}
         # 旗標**不在這裡清**:協調器的 cancel 可能在 worker 還沒進到 send() 之前就到,
         # 開始時清掉就是 lost-cancel。改在這一輪收尾(_end_turn,計數歸零)時清。
         # resume 進來的歷史可能停在一個沒有結果的 tool_call(上次崩潰 / 中斷)。
@@ -1753,8 +1757,13 @@ class Engine:
                 raise TurnCancelled("待送訊息尚未接收,這一輪已被中斷")
             if on_user_recorded is not None:
                 on_user_recorded()
+            if attachments:
+                self._run_attachments(
+                    attachments, on_event=emit, approve=approve, denied_counts=denied_counts,
+                )
             return self.run_tool_loop(
-                on_event=emit, on_text=on_text, on_reasoning=on_reasoning, approve=approve
+                on_event=emit, on_text=on_text, on_reasoning=on_reasoning, approve=approve,
+                denied_counts=denied_counts,
             )
         except (TurnCancelled, KeyboardInterrupt):
             self._record_turn_cancellation(start)
@@ -2005,12 +2014,14 @@ class Engine:
         on_text: Callable[[str], None] | None = None,
         on_reasoning: Callable[[str], None] | None = None,
         approve: Callable[[ApprovalRequest], bool] | None = None,
+        denied_counts: dict[str, int] | None = None,
     ) -> TurnResult:
         self._require_bound_session()
         try:
             self._begin_turn()
             return self._run_tool_loop(
-                on_event=on_event, on_text=on_text, on_reasoning=on_reasoning, approve=approve
+                on_event=on_event, on_text=on_text, on_reasoning=on_reasoning, approve=approve,
+                denied_counts=denied_counts,
             )
         except BaseException:
             # 中斷 / 例外都要把懸空呼叫收乾淨,否則下一輪的 payload 帶著一個
@@ -2029,13 +2040,15 @@ class Engine:
         on_text: Callable[[str], None] | None = None,
         on_reasoning: Callable[[str], None] | None = None,
         approve: Callable[[ApprovalRequest], bool] | None = None,
+        denied_counts: dict[str, int] | None = None,
     ) -> TurnResult:
         specs = self.tool_specs
         steps = 0
         tool_calls = 0
         denied = 0
         notices: list[str] = []
-        denied_counts: dict[str, int] = {}
+        # send() 傳入本輪共用的那一份(附件階段的拒絕也算數);其他呼叫端每次新的一份。
+        denied_counts = {} if denied_counts is None else denied_counts
         final_text = ""
         finish = client_events.REASON_STOP
         progress = client_progress.ToolProgress(
@@ -2373,6 +2386,56 @@ class Engine:
         }
 
     # ---- tools ---------------------------------------------------------
+    def _run_attachments(
+        self,
+        attachments: Sequence[client_attachments.Attachment],
+        *,
+        on_event: Callable[[dict[str, Any]], None],
+        approve: Callable[[ApprovalRequest], bool] | None,
+        denied_counts: dict[str, int],
+    ) -> None:
+        """使用者 ``@`` 附件:第一個模型步驟之前,用**同一條**工具路徑讀進歷史。
+
+        記成一則宣告它們的 assistant tool_calls(``attachment`` 標記只留在 session 檔,
+        ``_INTERNAL_KEYS`` 不送模型),再逐一走 ``_run_one_tool``:allowlist、readonly 只認
+        JSON true、policy／permission 覆寫、核准與本輪共用的重問上限、``begin_call`` 取消、
+        MCP 錯誤,全部與模型自己呼叫時相同。順序永遠是 user → assistant(tool_calls) →
+        tool…,之後才是模型步驟;中途中斷先 heal 懸空呼叫再往外丟,不發任何模型請求。
+        附件不計入 ``TurnResult.tool_calls``、步數或收斂觀察。
+        """
+        calls = client_attachments.tool_calls(attachments)
+        try:
+            with self._turn_state:
+                if self._cancel.is_set():
+                    raise TurnCancelled("這一輪已被使用者中斷")
+            self._record(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [call["wire"] for call in calls],
+                    "attachment": True,
+                }
+            )
+            specs = self.tool_specs
+            for call in calls:
+                if self._cancel.is_set():
+                    raise TurnCancelled("這一輪已被使用者中斷")
+                outcome = self._run_one_tool(
+                    call, specs=specs, approve=approve, denied_counts=denied_counts,
+                )
+                on_event(
+                    client_events.tool_event(
+                        self.session_id,
+                        tool=call["name"],
+                        call_id=call["id"],
+                        status=outcome["status"],
+                        arguments=call["arguments"],
+                    )
+                )
+        except BaseException:
+            self.heal_pending_tool_calls()
+            raise
+
     def _run_one_tool(
         self,
         call: Mapping[str, Any],

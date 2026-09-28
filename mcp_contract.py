@@ -91,10 +91,11 @@ MODEL_TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
     "run_lint": "Run the configured formatter/linter on one sandboxed path. Use fix=false for check-only; this is a separate approval from apply_patch.",
     "run_command": (
-        "Run one bare command from the server whitelist inside AICODE_ROOT (tests/static checks; build needs build_commands "
-        "in client.json; git uses git_status/git_diff). Each call reloads extra_allowed_commands (PATH names) and revalidates "
-        "extra_allowed_command_dirs (user-trusted host tool dirs; invalid grants deny; not in containers). Bare names only; "
-        "approval and argument checks apply. timeout: integer 1..600 s; client may stop earlier. Output bounded, failures highlighted."
+        "Run one whitelisted bare command in AICODE_ROOT (tests/static checks; build needs build_commands in client.json; "
+        "git uses git_status/git_diff), or a project tool by its project-relative path (e.g. tools/bin/x); no authorization. "
+        "Revalidated per call: no symlinks, user-owned executable ELF or #! script, reserved/builtin/build names refused; "
+        "containers never run project tools. No shell; approval and argument checks apply. timeout: integer 1..600 s; "
+        "client may stop earlier."
     ),
     "analyze_file": (
         "Inspect a sandboxed image, PDF spot-check, ELF, or firmware/binary without ingesting it. For ELF choose a closed-set view and "

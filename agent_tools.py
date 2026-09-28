@@ -14,7 +14,7 @@ import shlex
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 import config
 import command_allowlist
@@ -207,14 +207,14 @@ _RUN_COMMAND_TOOL = {
     "function": {
         "name": "run_command",
         "description": (
-            "執行白名單命令。預設白名單=測試/靜態命令(pytest, ctest, npm test, cargo test, "
+            "執行白名單命令或專案內工具。預設白名單=測試/靜態命令(pytest, ctest, npm test, cargo test, "
             "go test; mypy, tsc, ruff, black, isort, eslint, clang-format);"
             "build 命令(make/cmake/ninja/meson/bazel build)只在 client.json 的 "
             "build_commands 打開時加入;git 不在白名單(用 git_status / git_diff)。"
-            "client.json 的 extra_allowed_commands 可另授權 PATH 上的裸命令名稱。"
-            "/allow add <絕對目錄> 授權 extra_allowed_command_dirs；後續命令立即重驗，"
-            "以裸工具名呼叫已驗證絕對路徑，不改 PATH；目錄工具在容器模式拒絕。"
-            "授權不改既有人工核准。"
+            "專案內工具以專案相對路徑呼叫(例如 tools/bin/x 或 ./build.sh),不需要任何授權;"
+            "每次呼叫都重新驗證:不跟 symlink,須為目前使用者擁有、可執行的 ELF 或 #! 腳本,"
+            "與保留、內建或 build 命令同名者拒絕;容器模式不執行專案內工具。"
+            "不經 shell;既有人工核准與參數路徑檢查照舊。"
             "timeout 1..600 秒(server 端上限;client 可能更早截止)。"
             "apply_patch 不會自動呼叫這裡:lint / test 要另行呼叫 run_lint(fix=False) / run_command。"
         ),
@@ -458,53 +458,44 @@ _NO_SHELL_HINT = (
     "run_command 不經 shell：不支援 " + "、".join(_SHELL_PATTERNS)
     + " 等語法；請用工具自己的參數限制輸出。"
 )
-MAX_GRANTED_LISTING_CHARS = 2000
+PROJECT_TOOL_HINT = (
+    "專案內工具請用專案相對路徑呼叫（例如 tools/bin/x 或 ./build.sh）；不經 shell；"
+    "PATH 上其他命令不可執行。"
+)
 
 
-def _command_rejection(cmd_parts: list, extra_names: list, directory_commands: dict) -> str:
-    """拒絕訊息只給修正方向：帶路徑的授權工具指回裸名稱，但不以路徑或 basename 放行。
+def _has_shell_pattern(cmd_parts: list) -> bool:
+    return any(pattern in part for part in cmd_parts for pattern in _SHELL_PATTERNS)
 
-    實際 session:/allow add 之後模型仍送 `MetaWare/arc/bin/llvm-objdump ... | head`,
-    舊訊息只列前 8 個內建前綴，模型便回報「白名單仍不允許」。
+
+def _command_rejection(cmd_parts: list) -> str:
+    """裸名不在內建白名單時的拒絕訊息：只給修正方向，不以 basename 或 PATH 放行。
+
+    實際 session:模型送 `MetaWare/arc/bin/llvm-objdump ... | head`;帶路徑的專案內工具
+    走專案內執行檔驗證,這裡只處理裸名,並把「改用專案相對路徑」與「不經 shell」講明。
     """
     builtins = list(config.ALLOWED_COMMANDS)
-    granted = sorted({*extra_names, *directory_commands})
     lines = ["錯誤: 不允許的命令。"]
-    base = cmd_parts[0].rsplit("/", 1)[-1]
-    known = {*granted, *(entry.split()[0] for entry in builtins if entry.split())}
-    if "/" in cmd_parts[0] and base in known:
-        lines.append(f"命令不可帶路徑：請改用裸名稱 {base} 呼叫（server 只執行已驗證的授權路徑）。")
-    if any(pattern in part for part in cmd_parts for pattern in _SHELL_PATTERNS):
+    if _has_shell_pattern(cmd_parts):
         lines.append(_NO_SHELL_HINT)
-    if granted:
-        shown, used = [], 0
-        for name in granted:
-            if used + len(name) + 2 > MAX_GRANTED_LISTING_CHARS:
-                break
-            shown.append(name)
-            used += len(name) + 2
-        hidden = len(granted) - len(shown)
-        lines.append(
-            "已授權工具（以裸名稱呼叫）: " + ", ".join(shown)
-            + (f" …（共 {len(granted)} 個，{hidden} 個未列出）" if hidden else "")
-        )
     lines.append(
         "允許的命令前綴: " + ", ".join(builtins[:8]) + ("..." if len(builtins) > 8 else "")
     )
-    lines.append(
-        "自訂工具可由使用者以 /allow add <絕對目錄> 授權；"
-        "既有 client.json 的 extra_allowed_commands 裸名稱仍相容。"
-    )
+    lines.append(PROJECT_TOOL_HINT)
+    return "\n".join(lines)
+
+
+def _project_command_rejection(cmd_parts: list, reason: str) -> str:
+    lines = [f"錯誤: 專案內工具不可執行：{reason}"]
+    if _has_shell_pattern(cmd_parts):
+        lines.append(_NO_SHELL_HINT)
+    lines.append(PROJECT_TOOL_HINT)
     return "\n".join(lines)
 
 
 class ToolExecutor:
-    def __init__(
-        self, root: str, *,
-        command_settings_loader: Callable[[], tuple[list[str], list[str]]] | None = None,
-    ):
+    def __init__(self, root: str):
         self.root = Path(root).resolve()
-        self._command_settings_loader = command_settings_loader
 
     def _safe_path(self, path: str) -> Optional[Path]:
         try:
@@ -888,31 +879,20 @@ class ToolExecutor:
         return True, ""
 
     def _validate_command(self, command: str) -> tuple[bool, str, list]:
-        """驗證命令是否安全且在白名單中
+        """驗證命令是否安全且在白名單中。
+
+        順序固定:能以純字串擋掉的,一律在任何檔案系統存取之前擋掉。
+          1. shlex 切詞、空命令。
+          2. argv[0] 含 "/" → 專案內執行檔的純字串驗證(..、~、控制字元、專案外路徑;
+             不 resolve、不 stat);否則逐 token 比對內建白名單 config.ALLOWED_COMMANDS。
+          3. 危險字元(所有 token)。
+          4. 參數的 path containment(cmd_parts[1:];argv[0] 由第 2／5 步負責)。
+          5. argv[0] 含 "/" → 自 `/` 逐層 dir-fd／O_NOFOLLOW 驗證,只把 argv[0] 換成
+             驗證過的絕對路徑;其餘參數原樣交給 process_env。
 
         Returns:
             (is_valid, error_message, cmd_parts)
         """
-        # MCP 注入的 loader 每次重讀同一份設定，只取兩個 allow 欄位。
-        # direct executor 則仍只看 config；不偷讀 HOME，也不保存舊授權 mapping。
-        try:
-            if self._command_settings_loader is None:
-                extra_names, directories = (
-                    config.EXTRA_ALLOWED_COMMANDS, config.EXTRA_ALLOWED_COMMAND_DIRS,
-                )
-            else:
-                extra_names, directories = self._command_settings_loader()
-            extra_names = command_allowlist.validate_extra_allowed_commands(extra_names)
-            directories = command_allowlist.validate_extra_allowed_command_dirs(directories)
-            inspection = command_allowlist.inspect_command_directories(
-                directories, extra_commands=extra_names,
-            )
-        except Exception as exc:
-            return False, f"錯誤: 無法讀取或驗證 run_command 授權: {exc}", []
-        if inspection.errors:
-            errors = "；".join(f"{path}: {reason}" for path, reason in inspection.errors.items())
-            return False, f"錯誤: run_command 目錄授權解析失敗: {errors}", []
-
         command = command.strip()
 
         try:
@@ -923,18 +903,24 @@ class ToolExecutor:
         if not cmd_parts:
             return False, "錯誤: 空命令", []
 
-        # 動態授權不可持有 from-import 快照；名稱與目錄 mapping 都來自本次驗證。
-        # 同一套逐 token 比對：單 token 項只放行完全相同的 argv[0]。
-        allowed_commands = [*config.ALLOWED_COMMANDS, *extra_names, *inspection.commands]
-        is_allowed = False
-        for allowed in allowed_commands:
-            allowed_parts = shlex.split(allowed)
-            if cmd_parts[:len(allowed_parts)] == allowed_parts:
-                is_allowed = True
-                break
-
-        if not is_allowed:
-            return False, _command_rejection(cmd_parts, extra_names, inspection.commands), []
+        executable = cmd_parts[0]
+        project_tool = "/" in executable
+        if project_tool:
+            try:
+                command_allowlist.project_executable_candidate(self.root, executable)
+            except command_allowlist.ProjectCommandError as exc:
+                return False, _project_command_rejection(cmd_parts, str(exc)), []
+        else:
+            # 動態值只讀 config.ALLOWED_COMMANDS(build_commands 開啟時由 MCP 啟動點
+            # 附加);不持有 from-import 快照。單 token 項只放行完全相同的 argv[0]。
+            is_allowed = False
+            for allowed in config.ALLOWED_COMMANDS:
+                allowed_parts = shlex.split(allowed)
+                if cmd_parts[:len(allowed_parts)] == allowed_parts:
+                    is_allowed = True
+                    break
+            if not is_allowed:
+                return False, _command_rejection(cmd_parts), []
 
         # 額外安全檢查：危險字元
         for part in cmd_parts:
@@ -942,31 +928,33 @@ class ToolExecutor:
                 if pattern in part:
                     return False, f"錯誤: 參數包含不允許的字元 '{pattern}'\n{_NO_SHELL_HINT}", []
 
-        # Path containment：白名單命令的參數不能逃出 AICODE_ROOT。
+        # Path containment：命令的參數不能逃出 AICODE_ROOT。
         # 阻擋 `pytest /tmp/x.py`、`make -C /tmp`、`cmake --build /abs/build` 之類。
-        ok, why = self._check_path_containment(cmd_parts)
+        ok, why = self._check_path_containment(cmd_parts[1:])
         if not ok:
             return False, f"錯誤: {why}（命令參數必須指向 AICODE_ROOT 內的路徑）", []
 
-        # 只替換通過所有裸 argv 檢查的 argv[0]，其餘參數仍限 sandbox。
-        # 不改 PATH、不以 basename 重試，也不改成 /proc/self/fd 的執行路徑。
-        if cmd_parts[0] in inspection.commands:
-            cmd_parts[0] = inspection.commands[cmd_parts[0]]
+        # 只替換通過所有檢查的 argv[0];每次呼叫都重驗,不快取、不跟 symlink、不查 PATH。
+        if project_tool:
+            try:
+                cmd_parts[0] = command_allowlist.resolve_project_executable(self.root, executable)
+            except command_allowlist.ProjectCommandError as exc:
+                return False, _project_command_rejection(cmd_parts, str(exc)), []
         return True, "", cmd_parts
 
     def run_command(self, command: str, timeout: int = RUN_COMMAND_TIMEOUT) -> str:
-        """執行白名單內的測試 / 靜態分析命令(build 命令需 opt-in)。
+        """執行白名單內的測試 / 靜態分析命令(build 命令需 opt-in),或專案內工具。
 
-        白名單(內建前綴、legacy extra_allowed_commands 與授權目錄工具):
+        裸名(argv[0] 不含 "/")只比對內建白名單:
           - 測試 / 靜態命令是預設白名單(pytest / ctest / npm test / cargo test / go test;
             mypy / tsc / ruff / black / isort / eslint / clang-format 等)。
           - build 命令(make / cmake / ninja / meson / bazel build)只在
             client.json 的 build_commands 打開時加入(server 收 --enable-build-commands)。
           - git 不在白名單(用 git_status / git_diff)。
-          - client.json 的 extra_allowed_commands 額外放行 PATH 上的裸命令名稱。
-          - /allow add <絕對目錄> 的 extra_allowed_command_dirs 每次重驗，
-            同一 MCP 後續命令立即生效；以裸工具名呼叫，執行已驗證絕對路徑。
-            目錄授權不改人工核准，host 目錄工具在容器模式明確拒絕。
+        專案內工具(argv[0] 含 "/",以專案相對路徑或 root 內絕對路徑呼叫)不需要授權:
+        每次呼叫都自 `/` 逐層 dir-fd／O_NOFOLLOW 驗證(不跟 symlink、目前使用者擁有、
+        owner execute、ELF 可執行檔或 #! 腳本、保留／內建／build 同名拒絕),只把 argv[0]
+        換成驗證過的絕對路徑;容器模式一律拒絕、不退回 host。人工核准不變。
         apply_patch 不再自動呼叫這裡:lint / test 由模型另行、顯式呼叫,讓各自的核准閘生效。
 
         Args:
@@ -999,10 +987,7 @@ class ToolExecutor:
         # 容器化執行模式
         if container_runner.CONTAINER_ENABLED:
             if os.path.isabs(cmd_parts[0]):
-                return (
-                    "錯誤: 目錄授權工具無法在容器模式執行；host 工具目錄未掛入容器，"
-                    "不會改到 host 執行。"
-                )
+                return "錯誤: 容器模式不執行專案內工具；不會改到本機執行。"
             return self._run_command_in_container(command, timeout)
 
         try:

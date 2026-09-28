@@ -393,9 +393,13 @@ def _compaction_identity(*, keep_compaction: bool, n_ctx: Any) -> dict[str, Any]
 
 
 def client_identity() -> str:
-    """跑這次 replay 的客戶端身分。"""
+    """跑這次 replay 的客戶端身分。
+
+    ``client_attachments.py`` 決定一則使用者文字裡哪些 ``@路徑`` 會先以工具讀進歷史,
+    也是 replay 行為的一部分。
+    """
     parts = []
-    for name in ("client_engine.py", "client_prompt.py", "codetrail_chat.py"):
+    for name in ("client_engine.py", "client_prompt.py", "codetrail_chat.py", "client_attachments.py"):
         try:
             parts.append(
                 session_eval.text_digest((REPO_ROOT / name).read_text(encoding="utf-8"))

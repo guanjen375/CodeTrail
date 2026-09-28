@@ -181,8 +181,8 @@ tmux attach -t codetrail-main
 ```
 
 要看到真正的工具呼叫卡、結果及模型回答；模型只印 XML 或聲稱「已讀取」不算執行。
-用滑鼠左鍵拖選文字，放開即自動複製，不需按鍵。
-手動複製鍵仍可使用，詳見[選取與複製](docs/usage.md#copy)；回合進行中 **Ctrl+C** 仍中斷。
+用滑鼠左鍵拖選文字，放開即自動複製，不需按鍵；閒置時有選取也可按 **Ctrl+C** 複製，
+詳見[選取與複製](docs/usage.md#copy)；回合進行中 **Ctrl+C** 仍中斷。
 `/theme` 切換介面主題（`default` 或仿 Codex CLI 的 `codex`），選擇會保存，詳見[介面主題](docs/usage.md#theme)。
 SSH／tmux 的剪貼簿排查見
 [開發與維運](developer.md#clipboard-ssh-tmux)。
@@ -200,7 +200,17 @@ SSH／tmux 的剪貼簿排查見
 
 ## 附件、VL 與知識注入
 
-檔案已在專案內時，在對話指定相對路徑：
+檔案已在專案內時，直接在訊息裡用 `@相對路徑` 夾帶（Tab 補全；路徑含空白寫成 `@"路徑"`）：
+
+```text
+@screenshots/error.png 畫面上的錯誤是什麼？
+@build/firmware.elf 列出 UART 相關的 symbol。
+```
+
+送出時客戶端先用既有工具讀附件：圖片、PDF、ELF 與 firmware binary 走 `analyze_file`（圖片經 VL），
+其他檔案走 `read_file`；結果以工具卡顯示後模型才回答。單則最多 5 個附件，只收專案內的一般檔
+（符號連結、目錄與專案外路徑不附加），詳見[夾帶附件](docs/usage.md#attachments)。
+也可以在對話指定工具與相對路徑：
 
 ```text
 請用 read_file 讀 logs/build.log，找出第一個失敗。
@@ -242,6 +252,8 @@ VL 服務、來源身分或文件級契約失敗則整份中止。未驗證圖�
 `apply_patch` 接受 SEARCH/REPLACE、unified diff。最多 5 個檔案、單檔 200 行（udiff 算 added+removed；S/R 算 payload budget = SEARCH+REPLACE 行數）。
 套用後只做唯讀 syntax check，lint／test 必須分別呼叫並核准。
 `run_command`：timeout 只接受整數 1..600 秒（server 端上限；client 可能更早截止）。
+裸名只跑內建白名單；專案內工具以專案相對路徑呼叫（例如 `tools/bin/x`），不需要任何授權指令，
+每次仍驗證並需核准，詳見[執行專案內工具](docs/usage.md#project-tools)。
 每次 MCP 呼叫固定 read timeout 為 **660 秒**；到期會取消工具，寬限期過則重啟該 MCP instance。
 
 工具文字結果以 `status: ok|partial|error` 開頭。`partial` 與 `next:` 表示需續讀或修復；

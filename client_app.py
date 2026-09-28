@@ -21,6 +21,9 @@
   (含未裁切的 `structuredContent`)與壓縮標記。畫面看不到、模型看得到的話,
   接下來每一則回答都在回應一段使用者看不見的脈絡。換不成功就 engine 與畫面
   **都不動**;回合進行中一律拒絕換。
+* **@ 附件的預覽不碰 UI 執行緒**。路徑補全與附件摘要要讀檔案系統(慢速掛載會卡住),
+  所以由單一背景 worker 算、只收最新一筆;UI 執行緒只做純字串判斷。附件本身在送達
+  那一刻由協調器解析、engine 以既有 MCP 工具讀取(:mod:`client_attachments`)。
 * **主題只改呈現**(`/theme`,註冊表在 :mod:`client_theme`)。內容、事件與 session 每個
   主題都一樣;codex 的「› 」「• 」「└ 」是 ThemeGlyph,不進選取。複製結果只有工具卡
   標題列(三擊全選會帶到)依主題寫法不同。default 的外觀、狀態列文字與選取範圍(含三擊)
@@ -32,8 +35,6 @@
 from __future__ import annotations
 
 import json
-import os
-import shlex
 import threading
 import time
 from time import monotonic as _progress_clock
@@ -54,6 +55,7 @@ from textual.widget import Widget
 from textual.widgets import Button, Collapsible, Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
+import client_attachments
 import client_config
 import client_engine
 import client_events
@@ -62,7 +64,6 @@ import client_review
 import client_store
 import client_theme
 import client_turns
-import command_allowlist
 import context_budget
 
 HISTORY_FILENAME = "tui_history"
@@ -92,8 +93,6 @@ INCOMPLETE_ANSWER_NOTE = "上面這一則沒有完成(被截斷或出錯),不是
 #: 斜線指令 → 一行說明。輸入框的補全與 `/help` 用的是**同一份**表:兩份會漂移。
 COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "這份說明"),
-    ("/allow", "命令白名單:list / add <絕對目錄>"),
-    ("/copykey", "複製快捷鍵:/copykey <按鍵>，reset 回預設 F2"),
     ("/theme", "介面主題:選單即時預覽，/theme <"
                + "|".join(client_config.THEME_VALUES) + "> 直接切換"),
     ("/new", "開一個新對話"),
@@ -110,74 +109,16 @@ COMMANDS: tuple[tuple[str, str], ...] = (
 
 HELP_TAIL = (
     "其他輸入一律當成問題送給模型。\n"
+    "@路徑 夾帶專案內檔案（Tab 補全；含空白用 @\"路徑\"）：圖片／PDF／ELF／binary 經 analyze_file"
+    "（圖片走 VL），其他文字檔經 read_file；"
+    f"單則最多 {client_attachments.MAX_ATTACHMENTS} 個附件，補充訊息不處理附件。\n"
     "Enter 送出、Alt+Enter 換行、↑/↓ 翻輸入歷史。\n"
     "忙碌時 Enter 選擇排到下一輪或補充目前任務;未送訊息用 /queue 查看。\n"
     "滑鼠左鍵拖曳選取，放開即複製；雙擊／三擊完成文字選取也會複製，並保留反白。\n"
-    "手動備用鍵：{copy_key}（/copykey 修改）；閒置主畫面也可用 Ctrl-C 複製選取。\n"
+    "閒置主畫面也可用 Ctrl-C 複製選取。\n"
     "回合／核准／審查中 Ctrl-C 仍中斷整輪;閒置且沒有選取時連按兩次 Ctrl-C 或 Ctrl-D 離開。\n"
     "複製需終端允許 OSC 52;有用 tmux 時需 set -s set-clipboard on，並支援 Ms。"
 )
-
-ALLOW_USAGE = "用法:/allow [list] | /allow add <絕對目錄>（含空白請加引號）"
-
-
-def format_allow_list(settings: client_config.ClientSettings, policy: object) -> str:
-    """列出本次讀取及檢查結果；runtime 狀態只認 MCP 已完成 handshake 的快照。"""
-    valid_policy = (
-        isinstance(policy, dict)
-        and type(policy.get("schema")) is int
-        and policy["schema"] == 1
-        and all(type(policy.get(key)) is bool
-                for key in ("run_command_enabled", "readonly", "use_container"))
-        and all(isinstance(policy.get(key), list)
-                and all(isinstance(value, str) and value.strip() for value in policy[key])
-                for key in ("builtin_prefixes", "build_prefixes"))
-    )
-    lines: list[str] = []
-    if valid_policy:
-        lines.append(
-            f"目前 MCP:run_command={'啟用' if policy['run_command_enabled'] else '停用'}；"
-            f"readonly={'是' if policy['readonly'] else '否'}；"
-            f"執行位置={'容器' if policy['use_container'] else '本機'}"
-        )
-        if policy["readonly"] or not policy["run_command_enabled"]:
-            lines.append("目前 MCP 不允許執行 run_command。")
-        if policy["use_container"]:
-            lines.append("容器模式：目錄授權工具不可使用，不會改到本機執行。")
-        for title, key in (("內建前綴", "builtin_prefixes"), ("已啟用 build 前綴", "build_prefixes")):
-            lines.append(title + ":\n" + ("\n".join(f"  {item}" for item in policy[key]) or "  (沒有)"))
-    else:
-        lines.append("MCP 未回報目前 run_command 白名單；以下僅列已儲存授權。")
-
-    names = "\n".join(f"  {name}" for name in settings.extra_allowed_commands)
-    lines.append("額外命令（legacy／PATH）:\n" + (names or "  (沒有額外命令)"))
-    inspection = command_allowlist.inspect_command_directories(
-        settings.extra_allowed_command_dirs, extra_commands=settings.extra_allowed_commands,
-    )
-    lines.append("工具目錄（已儲存；本次檢查的授權工具）:")
-    if not settings.extra_allowed_command_dirs:
-        lines.append("  (沒有工具目錄)")
-    commands_by_directory: dict[str, list[str]] = {}
-    for name, path in sorted(inspection.commands.items()):
-        commands_by_directory.setdefault(os.path.dirname(path), []).append(name)
-    for directory in settings.extra_allowed_command_dirs:
-        lines.append(f"  {directory}")
-        names = commands_by_directory.get(directory, [])
-        lines.extend(f"    {name}" for name in names)
-        if not names:
-            lines.append("    (沒有授權工具)")
-        excluded = inspection.excluded.get(directory, {})
-        if excluded:
-            lines.append("    排除：" + "；".join(f"{reason} {count} 項" for reason, count in sorted(excluded.items())))
-        if directory in inspection.errors:
-            lines.append(f"    錯誤：{inspection.errors[directory]}")
-    if inspection.errors:
-        lines.append("授權解析失敗；目前所有 run_command 都將拒絕執行。")
-    lines.extend((
-        f"設定檔:{settings.path}" + ("" if settings.present else " (尚未建立)"),
-        ALLOW_USAGE,
-    ))
-    return "\n".join(lines)
 
 
 class HistoryError(RuntimeError):
@@ -881,8 +822,30 @@ class QueueChoiceScreen(ModalScreen[str | None]):
 # ============================================================
 # 輸入框
 # ============================================================
+def _at_attachment_token(text: str, cursor: int) -> bool:
+    """游標是否停在一個 ``@`` token 的尾端(純字串判斷,不碰檔案系統)。
+
+    路徑補全在背景算;還沒回來時按 Tab 不得把焦點移出輸入框 —— 使用者正在打路徑。
+    寧可多吞幾次 Tab(例如 ``user@host`` 結尾),也不能在打路徑時丟掉焦點。
+    """
+    if not 0 <= cursor <= len(text):
+        return False
+    if cursor < len(text) and not text[cursor].isspace():
+        return False
+    line = text[text.rfind("\n", 0, cursor) + 1:cursor]
+    quote = line.rfind('@"')
+    if quote >= 0 and '"' not in line[quote + 2:]:
+        return True
+    segment = line[max(line.rfind(" "), line.rfind("\t"), line.rfind("\u3000")) + 1:]
+    return "@" in segment
+
+
 class PromptInput(TextArea):
-    """底部輸入框:Enter 送出、Alt+Enter 換行、↑/↓ 翻歷史、``/`` 出現補全。"""
+    """底部輸入框:Enter 送出、Alt+Enter 換行、↑/↓ 翻歷史、``/`` 指令補全、``@`` 路徑補全。
+
+    路徑補全與附件摘要由 App 的背景 worker 算好再交回來(:class:`_AttachmentPreview`);
+    這裡只保存「那一份結果屬於哪一個 (文字, 游標)」,文字或游標一變就不再套用它。
+    """
 
     class Submitted(Message):
         def __init__(self, text: str) -> None:
@@ -901,7 +864,14 @@ class PromptInput(TextArea):
         self._draft = ""
         #: 補全清單目前反白第幾個(None = 沒有補全)。
         self.completion_index: int | None = None
+        #: 補全要插入的文字與對應說明;``completion_kind`` 是 "command"／"path"／""。
         self.completions: list[str] = []
+        self.completion_details: list[str] = []
+        self.completion_kind = ""
+        #: 附件的專案 root(App 在 mount 時給;None = 附件 UI 停用)。
+        self.attachment_root: Any = None
+        self._path_completion: client_attachments.Completion | None = None
+        self._path_key: tuple[str, int] | None = None
 
     def load_history(self, lines: Sequence[str]) -> None:
         self.input_history = [line for line in lines if line.strip()][-HISTORY_MAX_LINES:]
@@ -918,12 +888,35 @@ class PromptInput(TextArea):
         self._history_index = None
 
     # -- 補全 ------------------------------------------------------------
+    def cursor_index(self) -> int:
+        """游標在 ``self.text`` 裡的字元位置。"""
+        return self.document.get_index_from_location(self.cursor_location)
+
+    def set_path_completion(
+        self, completion: client_attachments.Completion | None, key: tuple[str, int] | None,
+    ) -> None:
+        """背景算好的路徑補全;``key`` 是算它時的 (文字, 游標)。"""
+        self._path_completion = completion
+        self._path_key = key if completion is not None else None
+
     def refresh_completions(self) -> None:
         text = self.text
+        names: list[str] = []
+        details: list[str] = []
+        kind = ""
         if text.startswith("/") and "\n" not in text and " " not in text:
-            self.completions = [name for name, _ in COMMANDS if name.startswith(text)]
-        else:
-            self.completions = []
+            descriptions = dict(COMMANDS)
+            names = [name for name, _ in COMMANDS if name.startswith(text)]
+            details = [descriptions[name] for name in names]
+            kind = "command"
+        elif self._path_completion is not None and self._path_key == (text, self.cursor_index()):
+            # 只套用「這一份文字、這一個游標」算出來的結果:過期的 span 會換掉錯的字。
+            names = [inserted for inserted, _ in self._path_completion.items]
+            details = [description for _, description in self._path_completion.items]
+            kind = "path"
+        self.completions = names
+        self.completion_details = details
+        self.completion_kind = kind if names else ""
         if not self.completions:
             self.completion_index = None
         elif self.completion_index is None or self.completion_index >= len(self.completions):
@@ -932,8 +925,17 @@ class PromptInput(TextArea):
     def _apply_completion(self) -> None:
         if not self.completions or self.completion_index is None:
             return
-        self.text = self.completions[self.completion_index]
-        self.move_cursor(self.document.end)
+        chosen = self.completions[self.completion_index]
+        completion = self._path_completion
+        if self.completion_kind == "path" and completion is not None:
+            # 只換掉游標所在的那個 @token;前後的字原樣保留。
+            text = self.text
+            self.text = text[:completion.start] + chosen + text[completion.end:]
+            self.move_cursor(self.document.get_location_from_index(completion.start + len(chosen)))
+        else:
+            self.text = chosen
+            self.move_cursor(self.document.end)
+        self.set_path_completion(None, None)
         self.refresh_completions()
         self.post_message(self.Changed(self.text))
 
@@ -955,6 +957,12 @@ class PromptInput(TextArea):
             event.prevent_default()
             event.stop()
             self._apply_completion()
+            return
+        if (key == "tab" and self.attachment_root is not None
+                and _at_attachment_token(self.text, self.cursor_index())):
+            # 路徑補全還在背景算:吞掉這一次 Tab,焦點留在輸入框(補全出來再按一次)。
+            event.prevent_default()
+            event.stop()
             return
         if key in ("up", "down") and self.completions:
             event.prevent_default()
@@ -1024,6 +1032,74 @@ class _CopyGesture:
     release: events.MouseUp | None = None
     release_started: float = 0.0
     release_finished: float = 0.0
+
+
+class _AttachmentPreview:
+    """``@`` 路徑補全與附件摘要的背景計算:一條 daemon 執行緒,只算最新一筆請求。
+
+    ``client_attachments.resolve()``／``completions()`` 會碰檔案系統(慢速掛載可能卡住),
+    所以不在 UI 執行緒跑(AGENTS.md §2「TUI 的 @ 附件」):輸入、畫面與 Ctrl-C 不得跟著停。
+    新請求只覆寫槽位,不排隊、不堆執行緒;結果以 thread-safe、不阻塞的 ``post_message``
+    交回,過期的由 App 丟掉。閒置一段時間 worker 自己結束,下一筆請求再起一條。
+    worker 不 print、不寫檔。
+    """
+
+    IDLE_EXIT_SECONDS = 30.0
+
+    class Ready(Message, namespace="attachment_preview"):
+        """一筆預覽結果(App 的 ``on_attachment_preview_ready``)。"""
+
+        def __init__(
+            self, generation: int, text: str, cursor: int,
+            completion: client_attachments.Completion | None, summary: tuple[str, ...],
+        ) -> None:
+            super().__init__()
+            self.generation = generation
+            self.text = text
+            self.cursor = cursor
+            self.completion = completion
+            self.summary = summary
+
+    def __init__(self, target: App[Any]) -> None:
+        self._target = target
+        self._condition = threading.Condition()
+        self._pending: tuple[int, str, int, Any] | None = None
+        self._thread: threading.Thread | None = None
+        self._idle = threading.Event()
+        self._idle.set()
+
+    def request(self, generation: int, text: str, cursor: int, root: Any) -> None:
+        with self._condition:
+            self._pending = (generation, text, cursor, root)
+            self._idle.clear()
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="codetrail-attachment-preview", daemon=True,
+                )
+                self._thread.start()
+            self._condition.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                if self._pending is None:
+                    self._idle.set()
+                    self._condition.wait(self.IDLE_EXIT_SECONDS)
+                    if self._pending is None:
+                        self._thread = None
+                        return
+                generation, text, cursor, root = self._pending
+                self._pending = None
+            try:
+                completion = client_attachments.completions(text, cursor, root)
+                summary = client_attachments.describe(client_attachments.resolve(text, root))
+            except Exception:  # noqa: BLE001 - 預覽壞掉只是少一份提示,不得帶走 UI
+                completion, summary = None, ()
+            self._target.post_message(self.Ready(generation, text, cursor, completion, summary))
+
+    def settle(self, timeout: float) -> bool:
+        """測試等待用:最新一筆請求已算完並交回(已排進 UI 佇列)。"""
+        return self._idle.wait(timeout)
 
 
 class CodeTrailApp(App[int]):
@@ -1098,7 +1174,6 @@ class CodeTrailApp(App[int]):
         state_dir: Path | None = None,
         show_reasoning: bool = False,
         keep_historical_reasoning: bool = False,
-        copy_key: str = client_config.DEFAULT_COPY_KEY,
         theme: str = client_config.DEFAULT_THEME,
     ) -> None:
         super().__init__()
@@ -1111,8 +1186,13 @@ class CodeTrailApp(App[int]):
         self.state_dir = state_dir
         self.show_reasoning = bool(show_reasoning)
         self.keep_historical_reasoning = bool(keep_historical_reasoning)
-        self.copy_key = client_config.validate_copy_key(copy_key)
         self._copy_gesture: _CopyGesture | None = None
+        #: @ 預覽(補全＋附件摘要)在背景算;這裡記「最新一筆請求」與畫面上那份摘要。
+        self._attachment_preview = _AttachmentPreview(self)
+        self._attachment_generation = 0
+        self._attachment_request: tuple[str, int] | None = None
+        self._attachment_waiting = False
+        self._attachment_summary: tuple[str, ...] = ()
         self.coordinator = client_turns.TurnCoordinator(
             engine,
             emit=self._emit_from_worker,
@@ -1340,14 +1420,6 @@ class CodeTrailApp(App[int]):
         if text:
             self._send_copy_request(text)
 
-    async def _check_bindings(self, key: str, priority: bool = False) -> bool:
-        # Textual 在把按鍵送往 focused widget／modal 前，先檢查 App priority。
-        # 單一動態分派不呼叫 bind()，因此改鍵不會累加舊綁定或吃掉 Ctrl-C。
-        if priority and key == self.copy_key:
-            self.action_copy_selection()
-            return True
-        return await super()._check_bindings(key, priority=priority)
-
     def on_mount(self) -> None:
         self._ui_thread_id = threading.get_ident()
         self.screen_change_signal.subscribe(self, self._discard_auto_copy, immediate=True)
@@ -1358,6 +1430,8 @@ class CodeTrailApp(App[int]):
             mcp.on_notice = lambda message: self._from_worker(self._append_notice, message)
         prompt = self.query_one("#prompt", PromptInput)
         prompt.load_history(self._read_history())
+        # 替身 engine 沒有 root → None → @ 附件 UI 完全停用(不起 worker、不碰檔案系統)。
+        prompt.attachment_root = getattr(getattr(self.engine, "options", None), "root", None)
         prompt.focus()
         # 啟動時的主題在建構時就設好了,那時還沒有輸入框;之後的切換由 watch_theme 管。
         prompt.placeholder = client_theme.spec_for(self.theme).placeholder
@@ -1865,29 +1939,7 @@ class CodeTrailApp(App[int]):
 
     def _cmd_help(self, _argument: str) -> None:
         lines = [f"  {name:<11}{description}" for name, description in COMMANDS]
-        tail = HELP_TAIL.format(copy_key=self.copy_key.upper())
-        self._append(NoticeLine("指令:\n" + "\n".join(lines) + "\n" + tail))
-
-    def _cmd_copykey(self, argument: str) -> None:
-        """即時更換純 UI 按鍵；寫檔失敗時不改目前分派或提示。"""
-        if not argument:
-            allowed = " / ".join(key.upper() for key in client_config.COPY_KEY_VALUES)
-            self._append(NoticeLine(
-                f"目前複製鍵：{self.copy_key.upper()}。\n"
-                f"用法：/copykey <按鍵> | /copykey reset（預設 F2）；可用：{allowed}。"
-            ))
-            return
-        key = argument.lower()
-        if key == "reset":
-            key = client_config.DEFAULT_COPY_KEY
-        try:
-            settings, changed = client_config.update_copy_key(key)
-        except (client_config.ClientConfigError, OSError) as exc:
-            self._append(ErrorLine(f"/copykey: {exc}；目前仍使用 {self.copy_key.upper()}。"))
-            return
-        self.copy_key = settings.copy_key
-        saved = f"已儲存至 {settings.path}" if changed else "設定未變更，未寫入檔案"
-        self._append(NoticeLine(f"複製鍵：{self.copy_key.upper()}；立即生效。{saved}。"))
+        self._append(NoticeLine("指令:\n" + "\n".join(lines) + "\n" + HELP_TAIL))
 
     def _cmd_theme(self, argument: str) -> None:
         """`/theme` 開選單即時預覽;`/theme <名稱>` 直接切換。兩者都先保存、成功才算數。
@@ -1928,55 +1980,6 @@ class CodeTrailApp(App[int]):
         self.theme = settings.theme
         saved = f"已儲存至 {settings.path}" if changed else "設定未變更，未寫入檔案"
         self._append(NoticeLine(f"主題：{settings.theme}；{saved}。"))
-
-    def _cmd_allow(self, argument: str) -> None:
-        """本地新增工具目錄；MCP 每次執行重新讀取授權，聊天 policy 保持原樣。"""
-        try:
-            parts = shlex.split(argument)
-        except ValueError:
-            self._append(ErrorLine(ALLOW_USAGE))
-            return
-        action = parts[0] if parts else "list"
-        directories = parts[1:]
-        if (
-            action not in ("list", "add")
-            or (action == "list" and directories)
-            or (action == "add" and len(directories) != 1)
-        ):
-            self._append(ErrorLine(ALLOW_USAGE))
-            return
-        if action != "list":
-            if self.engine.options.policy.name == "readonly":
-                self._append(ErrorLine("唯讀模式只允許 /allow list，不能修改命令白名單。"))
-                return
-            # 佇列中有待送訊息不影響設定;只擋目前正在進行的工作。
-            if (
-                self.coordinator.busy
-                or self.coordinator.pending_approvals()
-                or self.coordinator.reviewing
-            ):
-                self._append(ErrorLine(
-                    "回合、核准或審查進行中，不能修改命令白名單；仍可用 /allow list 查看。"
-                ))
-                return
-        try:
-            if action == "list":
-                settings = client_config.load_client_settings()
-                status = ""
-            else:
-                settings, changed = client_config.add_allowed_command_directory(directories[0])
-                if changed:
-                    status = "已加入；目前 session 後續命令立即生效。"
-                else:
-                    status = "未變更：目錄已在清單中，未寫入設定檔。"
-            # 純快取 property；不可讀 engine.tool_specs 的舊快照，也不可呼叫會
-            # start() 的 mcp.tools()，list 必須在死亡／重啟中的 MCP 上仍然零副作用。
-            policy = getattr(getattr(self.engine, "mcp", None), "command_policy", {})
-            listing = format_allow_list(settings, policy)
-        except (client_config.ClientConfigError, OSError, ValueError) as exc:
-            self._append(ErrorLine(f"/allow: {exc}"))
-            return
-        self._append(NoticeLine((status + "\n" if status else "") + listing))
 
     def _cmd_exit(self, _argument: str) -> None:
         if self._review_screen is not None:
@@ -2219,11 +2222,6 @@ class CodeTrailApp(App[int]):
     def _send_copy_request(self, text: str) -> None:
         self.copy_to_clipboard(text)
         self._last_interrupt = 0.0
-
-    def action_copy_selection(self) -> None:
-        """專用按鍵在忙碌／核准中也只複製，沒有選取不得清空剪貼簿。"""
-        if not self._copy_selection():
-            self.notify("請先用滑鼠拖曳選取文字，或選取輸入框文字。", timeout=3)
 
     def action_interrupt(self) -> None:
         """Ctrl-C：保留取消／收選單；閒置有選取則複製，否則連按兩次離開。"""
@@ -2527,24 +2525,75 @@ class CodeTrailApp(App[int]):
 
     def _refresh_completions(self) -> None:
         prompt = self.query_one("#prompt", PromptInput)
-        panel = self.query_one("#completions", Static)
         prompt.refresh_completions()
-        if not prompt.completions:
+        if self._request_attachment_preview(prompt) and not prompt.completions:
+            # 新的 @ 預覽還在背景算:畫面先留著上一次的結果,不讓每一鍵都閃一下。
+            # 過期的路徑補全已從 prompt.completions 拿掉,Tab／↑↓ 不會套到它。
+            return
+        self._render_completions(prompt)
+
+    def _request_attachment_preview(self, prompt: PromptInput) -> bool:
+        """把 @ 補全與附件摘要排給背景 worker;回傳 True = 目前這一筆還沒回來。
+
+        UI 執行緒不呼叫任何會碰檔案系統的 client_attachments 函式(AGENTS.md §2)。
+        """
+        root = prompt.attachment_root
+        text = prompt.text
+        if root is None or "@" not in text:
+            self._attachment_request = None
+            self._attachment_waiting = False
+            self._attachment_summary = ()
+            prompt.set_path_completion(None, None)
+            return False
+        request = (text, prompt.cursor_index())
+        if request != self._attachment_request:
+            self._attachment_request = request
+            self._attachment_generation += 1
+            self._attachment_waiting = True
+            self._attachment_preview.request(self._attachment_generation, text, request[1], root)
+        return self._attachment_waiting
+
+    def on_attachment_preview_ready(self, message: _AttachmentPreview.Ready) -> None:
+        """只收最新一筆、而且文字與游標都沒變過的結果;其餘一律丟掉。"""
+        if message.generation != self._attachment_generation:
+            return
+        try:
+            prompt = self.query_one("#prompt", PromptInput)
+        except Exception:  # noqa: BLE001 - 畫面已經拆掉或被選單蓋住
+            return
+        if (prompt.text, prompt.cursor_index()) != (message.text, message.cursor):
+            return
+        self._attachment_waiting = False
+        self._attachment_summary = tuple(message.summary)
+        prompt.set_path_completion(message.completion, (message.text, message.cursor))
+        prompt.refresh_completions()
+        self._render_completions(prompt)
+
+    def _render_completions(self, prompt: PromptInput) -> None:
+        panel = self.query_one("#completions", Static)
+        summary = () if prompt.completions else self._attachment_summary
+        if not prompt.completions and not summary:
             self.completion_text = ""
             panel.display = False
             panel.update(Text(""))
             panel.screen.set_class(False, "-completions-open")
             return
-        descriptions = dict(COMMANDS)
-        rows: list[tuple[str, str]] = []
-        for index, name in enumerate(prompt.completions):
-            mark = "›" if index == prompt.completion_index else " "
-            rows.append((f"{mark} {name:<11}", descriptions.get(name, "")))
-        # 兩個主題的純文字相同;codex 只多了上色(選中 cyan bold、說明 dim)。
-        self.completion_text = "\n".join(head + description for head, description in rows)
-        if client_theme.spec_for(self.theme).chrome == client_theme.CHROME_CODEX:
-            panel.update(client_theme.codex_completion_lines(rows, prompt.completion_index))
+        if prompt.completions:
+            rows: list[tuple[str, str]] = []
+            for index, name in enumerate(prompt.completions):
+                mark = "›" if index == prompt.completion_index else " "
+                detail = (prompt.completion_details[index]
+                          if index < len(prompt.completion_details) else "")
+                rows.append((f"{mark} {name:<11}", detail))
+            # 兩個主題的純文字相同;codex 只多了上色(選中 cyan bold、說明 dim)。
+            self.completion_text = "\n".join(head + description for head, description in rows)
+            if client_theme.spec_for(self.theme).chrome == client_theme.CHROME_CODEX:
+                panel.update(client_theme.codex_completion_lines(rows, prompt.completion_index))
+            else:
+                panel.update(Text(self.completion_text))
         else:
+            # 附件摘要:不可導航、不接管按鍵;兩個主題同一份純文字。
+            self.completion_text = "\n".join(summary)
             panel.update(Text(self.completion_text))
         panel.display = True
         # codex 把補全放在輸入框下方,開著時暫代 footer(Codex 的 slash popup)。

@@ -58,21 +58,19 @@ def test_theme_defaults_and_reads_never_create_config(home):
     assert _fingerprint(home.path) == before
 
 
-def test_theme_update_rereads_and_preserves_fresh_settings_and_private_modes(home, tmp_path):
-    """同一段 session 先 /allow add、/copykey 才 /theme,不能用啟動快照蓋掉剛存的設定。"""
+def test_theme_update_rereads_and_preserves_fresh_settings_and_private_modes(home):
+    """啟動後其他寫入者(set_config、手動編輯)剛存的設定,不能被 /theme 用啟動快照蓋掉。"""
     client_config.save_client_settings(client_config.ClientSettings(
         path=home.path, permission={"run_command": "ask"}, compaction_mode="off",
-        project_instructions=False, extra_allowed_commands=["nsim"],
-        keep_historical_reasoning=True, show_reasoning=True,
+        project_instructions=False, keep_historical_reasoning=True, show_reasoning=True,
     ))
-    directory = tmp_path / "tool chain" / "bin"
-    directory.mkdir(parents=True, mode=0o700)
-    executable = directory / "arc-probe"
-    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    executable.chmod(0o700)
-    _, added = client_config.add_allowed_command_directory(str(directory))
-    _, keyed = client_config.update_copy_key("f3")
-    assert added and keyed
+    # TUI 啟動之後,另一個寫入者改了別的鍵;/theme 必須以這一份為準。
+    client_config.save_client_settings(replace(
+        client_config.load_client_settings(),
+        permission={"run_command": "deny", "apply_patch": "ask"}, build_commands=True,
+        external_import=True, external_import_roots=["/tmp/imports"],
+        h_lang="cpp", objdump="arc-elf32-objdump",
+    ))
     latest = client_config.load_client_settings()
 
     changed, written = client_config.update_theme("codex")
@@ -89,14 +87,17 @@ def test_theme_update_rereads_and_preserves_fresh_settings_and_private_modes(hom
     assert written is False and again.as_json() == expected
     assert _fingerprint(home.path) == before
 
-    # 其他寫入者(set_config 的壓縮模式、/allow、/copykey)都不得把 theme 丟回預設。
+    # 其他寫入者(set_config 的壓縮模式、權限覆寫)都不得把 theme 丟回預設。
     client_config.save_client_settings(client_config.load_client_settings().with_compaction("manual"))
-    client_config.update_extra_allowed_commands("add", ["mdb"])
-    client_config.update_copy_key("f4")
+    client_config.save_client_settings(replace(
+        client_config.load_client_settings(), permission={"read_file": "deny"},
+    ))
     final = client_config.load_client_settings()
     assert final.theme == "codex"
-    assert final.extra_allowed_command_dirs == [str(directory)]
-    assert final.extra_allowed_commands == ["nsim", "mdb"] and final.copy_key == "f4"
+    assert final.compaction_mode == "manual" and final.permission == {"read_file": "deny"}
+    assert final.build_commands is True and final.h_lang == "cpp"
+    assert final.objdump == "arc-elf32-objdump" and final.external_import_roots == ["/tmp/imports"]
+    assert final.project_instructions is False and final.keep_historical_reasoning is True
 
 
 def test_theme_invalid_values_fail_loud_without_writing(home):
