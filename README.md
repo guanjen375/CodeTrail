@@ -196,6 +196,28 @@ SSH／tmux 的剪貼簿排查見
 `set_config.sh`、`aicode` 與附加 shell 入口都不接受參數；`~/start.sh` 只接受無參數啟動
 或單一 `stop`。更換模型、GPU、n_ctx 或 Python 後重跑設定並重啟。
 
+<a id="slow"></a>
+
+### 回答很慢或打字卡
+
+先看主模型的解碼速度：`main.log` 裡的 `tg = … t/s`。已知有兩個原因：
+
+- **主模型的 CPU threads 佔滿了每一顆 CPU。** llama.cpp 的 `-t` 預設是實體核心數。
+  VM 把 vCPU 攤平（`lscpu` 顯示 `Thread(s) per core: 1`）或關掉 SMT 時，
+  實體核心數就等於**全部** CPU。主模型每一步都要等所有 thread 同步，
+  只要 aicode、MCP 工具或 SSH 佔住一顆 CPU，解碼就會慢 5–10 倍
+  （實測 60 vCPU：13–21 t/s 掉到 2.1 t/s）。
+  `set_config.sh` 遇到這種 CPU 拓撲時，會自動把 `-t` 設成 CPU 數的一半；
+  看得到 SMT 的機器照舊交給 llama.cpp 決定。
+  - 舊設定：重跑 `./set_config.sh` 即可。
+  - 要指定其他值：`python3 scripts/set_config.py --threads N`。
+  - 確認：`python3 scripts/launch_servers.py --scope all --dry-run` 顯示的主模型指令要帶 `-t`。
+  - 生效：`~/start.sh stop`，再執行 `~/start.sh`。
+- **舊版 TUI 接回長對話時很吃 CPU。** 2026-09-22 到 2026-09-29 之間的版本有這個問題：
+  用 `/session` 接回幾百則的對話後，狀態列、每個按鍵、每個串流 token 都會重排整個畫面，
+  TUI 因此佔住一顆 CPU。結果是打字延遲，也會觸發上一個原因。
+  更新到之後的版本、重開 `aicode` 即可；新對話不受影響。
+
 <a id="rag"></a>
 
 ## 附件、VL 與知識注入

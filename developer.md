@@ -366,10 +366,18 @@ main，draft 支援既有 registry key，token 上限為 1–64 的整數。設�
   已將 `--no-mmap` 標為 deprecated，建議未來轉向 `--load-mode`。CodeTrail 仍保留
   `no_mmap` 來相容目前驗證過的 build；上游若移除旗標，要同步遷移 profile
   schema、launcher、preflight 與文件，不要只在 JSON 自行改鍵名。
-- main 的 `threads`(→ `-t`)**從來不是設定時的問題**,只有 `python3 scripts/set_config.py --threads N`
-  明確指定時才會寫入。未指定 = auto:不傳 `-t`,llama.cpp 的預設 `-1` 會自己偵測
-  (x86_64 Linux 上 hybrid CPU 只算 P-core,否則用實體核心數、排除 HT siblings),
-  比工具自己數邏輯 CPU 準。
+- main 的 `threads`(→ `-t`)**不是設定時的問題**。`python3 scripts/set_config.py --threads N`
+  明確指定就寫 N;未指定時 `set_config.sh` 用與 llama.cpp 相同的算法讀
+  `/sys/devices/system/cpu/cpu*/topology/thread_siblings`:
+  - 看得到 SMT sibling 或 hybrid CPU(實體核心數 < 邏輯 CPU 數):不傳 `-t`,交給 llama.cpp
+    的預設 `-1`(x86_64 Linux 上 hybrid CPU 只算 P-core,否則用實體核心數、排除 HT siblings),
+    其餘 CPU 本來就留給 aicode、MCP 工具與系統。
+  - 看不到(每顆 CPU 自成一核:VM 把 vCPU 攤平、或關掉 SMT):llama.cpp 的預設就是**全部**
+    CPU,而 main 的每一步都要等所有 thread 同步,別的程式佔住任何一顆就讓整批空等
+    (實測 60 thread / 60 vCPU:13–21 t/s 掉到 2.1 t/s)。這時寫 CPU 數的一半(4 顆以下全用),
+    等同 llama.cpp 自己在看不到拓撲時的保守預設。
+  `threads` 屬 set_config 管理的鍵:手動加的值重跑 `set_config.sh` 會重算,要固定請用
+  `--threads N`。症狀與排查見 [README](README.md#slow)。
 - VL 的 `mmproj`：同樣只接受 registry key 或 GGUF 絕對路徑。
 
 safe-defaults 的 reranker 是 `bge-reranker-v2-m3` Q8_0,保留
@@ -450,7 +458,7 @@ checkout 會對未知鍵 fail-loud,那是封閉 schema 的預期行為。
   印出對應的 nvidia-smi index)。VL 配對不唯一時再給 `--vl-mmproj`；單一候選、單卡或
   唯一 mmproj 會自動選用。
 - 數值：`--ctx` 與 `--rerank-ctx`。`--threads` 是非必要的進階旗標；不給就是
-  auto，不寫 `-t`。
+  auto（看得到 SMT 不寫 `-t`，看不到就寫 CPU 數一半，規則見上方 `threads`）。
 - MoE：main 使用 `--cpu-moe` / `--no-cpu-moe` / `--n-cpu-moe N`；VL 使用
   `--vl-cpu-moe` / `--no-vl-cpu-moe` / `--vl-n-cpu-moe N`。`N=0` 等同不 offload。
 - 網路：`--allow-remote` 才會開放區網連線；未指定只綁 `127.0.0.1`。

@@ -295,10 +295,30 @@ def read_deployment(tmp_path: Path) -> dict:
     )
 
 
+def fake_cpu_sysfs(root: Path, siblings: list[str]) -> Path:
+    """假的 `/sys/devices/system/cpu`:第 i 個字串是 cpu{i} 的 topology/thread_siblings。"""
+    for index, mask in enumerate(siblings):
+        topology = root / f"cpu{index}" / "topology"
+        topology.mkdir(parents=True, exist_ok=True)
+        (topology / "thread_siblings").write_text(mask + "\n", encoding="ascii")
+    return root
+
+
+def smt_cpu_sysfs(root: Path, cores: int) -> Path:
+    """每顆實體核心兩個 SMT thread(cpu 2k 與 2k+1 同一個 sibling mask)。"""
+    return fake_cpu_sysfs(root, [format(3 << (2 * (i // 2)), "x") for i in range(cores * 2)])
+
+
+def flat_cpu_sysfs(root: Path, cpus: int) -> Path:
+    """每顆 CPU 自成一個核心、看不到 SMT sibling(VM 攤平 vCPU 就是這樣)。"""
+    return fake_cpu_sysfs(root, [format(1 << i, "x") for i in range(cpus)])
+
+
 def run(tmp_path: Path, *args: str, stdin: str | None = None,
         with_llama: bool = True,
         pin_llama_bin: bool = True,
-        env_overrides: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        env_overrides: dict[str, str] | None = None,
+        cpu_sysfs: Path | None = None) -> subprocess.CompletedProcess:
     """in-process 呼叫 set_config.main(),回傳與子行程同形狀的結果。
 
     對齊子行程的四件事:
@@ -308,9 +328,16 @@ def run(tmp_path: Path, *args: str, stdin: str | None = None,
     3. stdout / stderr 各自收到獨立 StringIO。
     4. `_COMMITTED` 是 set_config 唯一的 module-level 可變狀態,每次呼叫前歸零,
        避免同一個 pytest 行程裡前一條測試的 transaction 狀態外洩。
+
+    CPU 拓撲(決定 main 的 `-t`)不讀跑測試那台機器的 /sys:預設是 8 核 16 thread 的
+    SMT 機器(auto = 不寫 -t);要測別的拓撲就傳 `cpu_sysfs`。
     """
     from scripts import set_config as sc
 
+    if cpu_sysfs is None:
+        cpu_sysfs = tmp_path / "fake-sysfs-cpu"
+        if not cpu_sysfs.exists():
+            smt_cpu_sysfs(cpu_sysfs, 8)
     env = build_env(tmp_path, with_llama=with_llama)
     if env_overrides:
         env.update(env_overrides)
@@ -329,6 +356,7 @@ def run(tmp_path: Path, *args: str, stdin: str | None = None,
     sc._COMMITTED = False
     with mock.patch.dict(os.environ, env, clear=True), \
             mock.patch("builtins.input", fake_input), \
+            mock.patch.object(sc, "CPU_SYSFS", cpu_sysfs, create=True), \
             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         try:
             code = sc.main(argv)

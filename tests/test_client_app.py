@@ -2373,3 +2373,71 @@ def test_context_display_counts_full_tokens_off_the_ui_thread_and_discards_stale
             release.set()
 
     _run(body)
+
+
+def test_long_transcript_idle_keys_and_stream_do_not_relayout_whole_screen(monkeypatch):
+    """Regression(2026-09-29):Static.update() 預設 layout=True,會把整個畫面重新排版。
+
+    接回一段 575 則的對話時畫面有 6,154 個 widget,一次排版約 75 ms;狀態列每 0.25 秒、
+    每按一個鍵、每串流一個 token 都觸發一次 → 閒置 30% CPU、每鍵 0.6 秒、每 token
+    316 ms CPU,而且那顆被佔住的 CPU 讓吃滿全部核心的 llama-server 解碼崩到 3 t/s。
+    尺寸沒變就只能重畫,高度真的變了(多一行)才准排版。
+    """
+    from textual.widget import Widget
+
+    engine = _Engine()
+    transcript = []
+    for index in range(8):
+        transcript.append({"type": "message", "role": "user", "content": f"問題 {index}"})
+        transcript.append({
+            "type": "message", "role": "assistant",
+            "content": f"## 回答 {index}\n\n- 第一點\n- 第二點\n\n```c\nint x = {index};\n```\n",
+        })
+    engine.resumed_snapshot = _Snapshot(
+        session_id=engine.session_id, messages=(), transcript=tuple(transcript)
+    )
+    requests: list[str] = []
+    original_refresh = Widget.refresh
+
+    def spy(self, *regions, repaint=True, layout=False, recompose=False):
+        if layout:
+            requests.append(type(self).__name__)
+        return original_refresh(self, *regions, repaint=repaint, layout=layout, recompose=recompose)
+
+    async def body():
+        app = client_app.CodeTrailApp(engine)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await _settle(pilot, 5)
+            monkeypatch.setattr(Widget, "refresh", spy)
+
+            app._refresh_status()
+            await pilot.pause()
+            assert requests == [], f"閒置的狀態列更新排版了整個畫面: {requests}"
+
+            await pilot.press("a", "b", "c")
+            await pilot.pause()
+            assert requests == [], f"一般打字排版了整個畫面: {requests}"
+
+            stream = app._ensure_assistant()
+            stream.append("第一行")
+            await _settle(pilot, 3)
+            requests.clear()
+            stream.append(",同一行")
+            await pilot.pause()
+            assert requests == [], f"沒有換行的 token 排版了整個畫面: {requests}"
+            height = stream.size.height
+            stream.append("\n第二行")
+            await _settle(pilot, 3)
+            assert requests, "多一行卻沒有排版:新的一行會被裁掉"
+            assert stream.size.height == height + 1
+
+            requests.clear()
+            hidden = app._ensure_reasoning()
+            await _settle(pilot, 3)
+            assert not hidden.display
+            requests.clear()
+            hidden.append("看不見的 reasoning\n再一行")
+            await pilot.pause()
+            assert requests == [], f"隱藏的 reasoning 排版了整個畫面: {requests}"
+
+    _run(body)

@@ -27,7 +27,8 @@ nvidia-smi 稍微監控)。
      只有一個候選(或一顆 GPU)時自動選用;其餘必答。
      模型與 GPU 的選單編號都從 1 起算(GPU 編號 = nvidia-smi index + 1,
      每張卡的描述行仍會印出 nvidia-smi index 供對照)。
-     threads 不再是問題:未給 --threads 就不寫 -t,交給 llama.cpp 自己的預設。
+     threads 不是問題:未給 --threads 時看 CPU 拓撲 —— 看得到 SMT / hybrid 就不寫 -t
+     (llama.cpp 只取實體核心或 P-core);看不到(VM 常見)就寫 CPU 數的一半。
      最後顯示摘要一頁(Enter 寫入 / q 離開)。
   5. 非互動:`--yes` 跳過提問與確認,但所有使用者選擇題的值必須由旗標提供
      (--main-model / --ctx / --rerank-ctx / ...),缺哪個就明確報錯;
@@ -97,6 +98,8 @@ MAX_RERANKER_CTX = 1_048_576
 VERIFIED_RERANKER_CTX = 8192
 MAX_THREADS = 1024
 MAX_N_CPU_MOE = 1024
+#: 決定 main `-t` 用的 CPU 拓撲來源(與 llama.cpp 讀同一處);測試換成假的目錄樹。
+CPU_SYSFS = Path("/sys/devices/system/cpu")
 
 
 def _range(minimum: int, maximum: int) -> str:
@@ -261,9 +264,11 @@ class Plan:
     #: 這次驗證過的 llama-server 絕對路徑;會寫進 deployment.json 的頂層 `llama_bin`。
     #: 沒有預設值:忘了帶就在建構當下爆,而不是寫出一份指向別顆 binary 的設定。
     llama_bin: str
-    # 主模型 CPU threads(-t):不再是互動題,只有 --threads 才會有值;
-    # None = 不寫 -t,交給 llama.cpp 自己的預設(實體核心數)。
+    # 主模型 CPU threads(-t):不是互動題。--threads 或 auto_main_threads() 的值;
+    # None = 不寫 -t,交給 llama.cpp 自己的預設(實體核心數 / P-core)。
     threads: int | None = None
+    # threads 是依 CPU 拓撲自動決定的(不是 --threads 指定),摘要據此說明來由。
+    threads_auto: bool = False
     cpu_moe: bool = False
     # 部分 CPU-MoE 檔位(僅 CPU-MoE 模式有意義):使用者輸入的值
     # (互動題或 --n-cpu-moe 旗標);None = 全部 experts 放 RAM(--cpu-moe)。
@@ -1539,7 +1544,8 @@ def build_main_parameters(candidate: ModelCandidate, ctx: int, threads: int | No
     """依使用者選定的模式組裝主模型參數;不改寫使用者的作答,一律 -ngl 99。
 
     VRAM 放不放得下由使用者以啟動後 nvidia-smi 實測確認(~/start.sh 結尾會提醒)。
-    threads 不是互動題:只有 --threads 才會寫 -t,否則交給 llama.cpp 自己的預設。
+    threads 不是互動題:--threads 或 auto_main_threads() 有值才寫 -t,
+    None 就交給 llama.cpp 自己的預設。
     """
     parameters: dict = {
         "parallel": 1,
@@ -1982,17 +1988,53 @@ def _vl_offload_description(plan: Plan) -> str:
     return f"-ngl auto --fit on --fit-target {VL_FIT_TARGET_MIB}"
 
 
-def _threads_description(plan: Plan) -> str:
-    """threads 從來不是問題:預設刻意留給 llama.cpp 的 -t auto。
+def detect_cpu_topology(root: Path | None = None) -> tuple[int, int] | None:
+    """(邏輯 CPU 數, llama.cpp 眼中的實體核心數);sysfs 讀不到就 None。
 
-    llama.cpp 的 -t 預設是 -1 → common_cpu_get_num_math():x86_64 Linux 上會
-    偵測 hybrid CPU 並只算 P-core,否則用實體核心數(排除 HT siblings)。
-    這比本工具自己數 os.cpu_count()(含 HT / E-core)準,所以不自作聰明寫死。
+    與 llama.cpp `common_cpu_get_num_physical_cores()` 同一個算法:從 cpu0 起逐一讀
+    `topology/thread_siblings`,讀到第一個不存在的為止;不同的 sibling 字串數 = 實體核心數。
     """
+    root = CPU_SYSFS if root is None else root
+    siblings: set[str] = set()
+    logical = 0
+    while True:
+        try:
+            mask = (root / f"cpu{logical}" / "topology" / "thread_siblings").read_text(
+                encoding="ascii"
+            ).strip()
+        except (OSError, UnicodeDecodeError):
+            break
+        siblings.add(mask)
+        logical += 1
+    return (logical, len(siblings)) if logical else None
+
+
+def auto_main_threads(topology: tuple[int, int] | None) -> int | None:
+    """沒給 --threads 時 main 的 `-t`;None = 不傳,交給 llama.cpp。
+
+    llama.cpp 的預設 `-t` 是實體核心數(hybrid CPU 只算 P-core)。看得到 SMT sibling
+    或 E-core 時,它本來就只用一部分 CPU,其餘留給 aicode、MCP 工具與系統 —— 不動。
+    看不到(每顆 CPU 自成一核:VM 把 vCPU 攤平、或關掉 SMT)時預設就是**全部** CPU;
+    main 的每一步都要等所有 thread 同步,只要別的程式佔住一顆,那條 thread 被擠掉,
+    整批一起等(實測 60 thread / 60 vCPU:13–21 t/s → 2.1 t/s)。這時改用一半
+    (4 顆以下全用),等同 llama.cpp 自己在看不到拓撲時的保守預設。
+    """
+    if topology is None:
+        return None
+    logical, physical = topology
+    if physical < logical:
+        return None
+    return logical if logical <= 4 else logical // 2
+
+
+def _threads_description(plan: Plan) -> str:
+    """摘要與 start.sh 註解裡的 threads:講清楚值從哪裡來。"""
     threads = plan.parameters.get("threads")
-    if threads is not None:
-        return f"{threads}(--threads 指定)"
-    return "auto(不傳 -t;llama.cpp 自動取實體/P-core 數)"
+    if threads is None:
+        return "auto(不傳 -t;llama.cpp 取實體核心/P-core,其餘 CPU 留給 aicode 與 MCP)"
+    if plan.threads_auto:
+        return f"{threads}(自動:看不到 SMT,取 CPU 數一半,留一半給 aicode 與 MCP)"
+    return f"{threads}(--threads 指定)"
 
 
 def _checkout_version(repo_root: Path) -> str:
@@ -2971,7 +3013,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--threads", type=int,
         help=f"進階:釘住主模型 CPU threads(-t),{_range(1, MAX_THREADS)};"
-             "從來不是互動題,未指定 = auto(不傳 -t,由 llama.cpp 自動取實體/P-core 數)",
+             "不是互動題。未指定時看得到 SMT/hybrid 就不傳 -t(llama.cpp 取實體/P-core 數),"
+             "看不到(VM 常見)就用 CPU 數一半,留一半給 aicode 與 MCP",
     )
     parser.add_argument("--no-preview", action="store_true", help="結尾不跑啟動參數預覽(launch_servers.py --dry-run)")
     return parser
@@ -3434,16 +3477,28 @@ def run(args: argparse.Namespace) -> int:
         dspark_choice = choose_main_dspark(args, main_cand.path,
                                            codetrail_dir / "deployment.json", notes)
 
-        # threads 從頭到尾不問:預設 auto(不傳 -t)。llama.cpp 的 -t 預設 -1 會
-        # 自己偵測 hybrid CPU / 實體核心,比本工具數 os.cpu_count() 準;
+        # threads 從頭到尾不問。llama.cpp 的 -t 預設 -1 會自己偵測 hybrid CPU / 實體核心,
+        # 比本工具數 os.cpu_count() 準 —— 除非它會吃滿每一顆 CPU(auto_main_threads)。
         # 真的要釘死才用 --threads(進階旗標)。
         threads = args.threads
+        threads_auto = False
         cores = os.cpu_count() or 0
         if threads is None:
-            notes.append(
-                "主模型 threads 用 auto(不傳 -t):llama.cpp 會自動取實體核心數"
-                "(hybrid CPU 只算 P-core)。要釘死才用 python3 scripts/set_config.py --threads N。"
-            )
+            topology = detect_cpu_topology()
+            threads = auto_main_threads(topology)
+            threads_auto = threads is not None
+            if threads is None:
+                notes.append(
+                    "主模型 threads 用 auto(不傳 -t):llama.cpp 會自動取實體核心數"
+                    "(hybrid CPU 只算 P-core),其餘 CPU 留給 aicode 與 MCP。"
+                    "要釘死才用 python3 scripts/set_config.py --threads N。"
+                )
+            else:
+                notes.append(
+                    f"主模型 threads = {threads}(-t):這台看不到 SMT(每顆 CPU 自成一核,VM 常見),"
+                    f"llama.cpp 預設會用滿全部 {topology[0]} 顆;只要 aicode 或 MCP 工具佔住一顆,"
+                    "解碼就會掉 5–10 倍,所以只用一半。要改用 python3 scripts/set_config.py --threads N。"
+                )
         elif cores and threads > cores:
             notes.append(f"⚠ --threads {threads} 超過偵測到的核心數({cores}),通常反而較慢。")
 
@@ -3502,6 +3557,7 @@ def run(args: argparse.Namespace) -> int:
             main_key=sanitize_registry_key(main_cand.path),
             ctx=ctx,
             threads=threads,
+            threads_auto=threads_auto,
             batch=0,
             ubatch=0,
             reranker_ctx=reranker_ctx,

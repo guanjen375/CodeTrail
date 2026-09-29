@@ -313,6 +313,30 @@ def history_entries(transcript: Sequence[Mapping[str, Any]]) -> list[HistoryEntr
 # ============================================================
 # 對話流的元件
 # ============================================================
+def _update_static(widget: Static, content: Any) -> None:
+    """換掉 Static 的內容,但只有高度真的變了才重新排版。
+
+    `Static.update()` 預設 `layout=True`,而 Textual 的排版一次走遍**整個畫面**的
+    widget。完成的回答是原生 Markdown(每段、每個清單項目、每格表格各一個 widget),
+    接回一段幾百則的對話就是上千個 widget、一次排版幾十毫秒;狀態列每 0.25 秒、
+    每個鍵、每個串流 token 各排一次,TUI 就佔住一整顆 CPU(打字延遲、而且拖慢同機的
+    llama-server)。還沒掛上或隱藏中的 widget 沒有版面可變;其餘用 Textual 自己的
+    `get_content_height()` 比對換字前後的高度,一樣就只重畫這一個 widget。
+    """
+    if not widget.is_mounted or not widget.display:
+        widget.update(content, layout=False)
+        return
+    width = widget.content_size.width
+    if not width:
+        widget.update(content)
+        return
+    container, viewport = widget.container_size, widget.app.size
+    before = widget.get_content_height(container, viewport, width)
+    widget.update(content, layout=False)
+    if widget.get_content_height(container, viewport, width) != before:
+        widget.refresh(layout=True)
+
+
 class _UserBody(Static):
     """使用者訊息本文。
 
@@ -376,7 +400,7 @@ class ReasoningBlock(Static):
 
     def append(self, token: str) -> None:
         self._buffer += token
-        self.update(Text(self._buffer, style="dim"))
+        _update_static(self, Text(self._buffer, style="dim"))
 
 
 class AssistantBlock(Vertical):
@@ -417,7 +441,7 @@ class AssistantBlock(Vertical):
         if self._finished:
             return
         self._buffer += token
-        self._stream.update(Text(self._buffer))
+        _update_static(self._stream, Text(self._buffer))
 
     def finish(self, text: str = "") -> None:
         previous_text = self._buffer
@@ -1232,6 +1256,8 @@ class CodeTrailApp(App[int]):
         #: 狀態列與補全面板目前顯示的字。widget 的 renderable 是 Textual 內部形狀,
         #: 讀它等於把介面測試綁在版本上。
         self.status_text = ""
+        #: 狀態列上一次真的畫出去的字;沒變就不碰 widget(`_paint_status`)。
+        self._painted_status: str | None = None
         self.completion_text = ""
         #: codex 主題輸入框上方活動列的字;閒置或 classic 版面時是 ""。
         self.activity_text = ""
@@ -2496,8 +2522,7 @@ class CodeTrailApp(App[int]):
             # Codex:階段與秒數在輸入框上方的活動列;footer 是其餘同一組資訊,單列。
             self._show_activity(client_theme.activity_line(phase, elapsed) if active else None)
             self.status_text = " · ".join(parts)
-            bar.styles.height = 1
-            bar.update(Text(self.status_text))
+            self._paint_status(bar, 1)
             return
         self._show_activity(None)
         active_status = " · ".join(active)
@@ -2508,8 +2533,18 @@ class CodeTrailApp(App[int]):
         if self._prompt_display is not None and self._turn_started is not None:
             width = max(1, (bar.size.width or self.size.width) - 2)
             rows = min(3, max(1, (Text(active_status).cell_len + width - 1) // width))
+        self._paint_status(bar, rows)
+
+    def _paint_status(self, bar: Static, rows: int) -> None:
+        """狀態列的高度只由 `rows` 決定:列數變了 Textual 自己排版,文字變了只重畫這一列。
+
+        這裡每 0.25 秒跑一次;照 `Static.update()` 的預設(layout=True)會每次重排整個
+        畫面(見 `_update_static`),閒置的長對話就一直佔著 CPU。
+        """
         bar.styles.height = rows
-        bar.update(Text(self.status_text))
+        if self._painted_status != self.status_text:
+            self._painted_status = self.status_text
+            bar.update(Text(self.status_text), layout=False)
 
     def _show_activity(self, line: Text | None) -> None:
         """codex 活動列:有字就顯示(CSS 只在 codex 讓 `-active` 顯示),None 就收起並清空。"""
@@ -2521,7 +2556,7 @@ class CodeTrailApp(App[int]):
             return
         self.activity_text = line.plain if line is not None else ""
         activity.set_class(line is not None, "-active")
-        activity.update(line if line is not None else Text(""))
+        _update_static(activity, line if line is not None else Text(""))
 
     def _refresh_completions(self) -> None:
         prompt = self.query_one("#prompt", PromptInput)
@@ -2575,7 +2610,7 @@ class CodeTrailApp(App[int]):
         if not prompt.completions and not summary:
             self.completion_text = ""
             panel.display = False
-            panel.update(Text(""))
+            _update_static(panel, Text(""))
             panel.screen.set_class(False, "-completions-open")
             return
         if prompt.completions:
@@ -2588,13 +2623,13 @@ class CodeTrailApp(App[int]):
             # 兩個主題的純文字相同;codex 只多了上色(選中 cyan bold、說明 dim)。
             self.completion_text = "\n".join(head + description for head, description in rows)
             if client_theme.spec_for(self.theme).chrome == client_theme.CHROME_CODEX:
-                panel.update(client_theme.codex_completion_lines(rows, prompt.completion_index))
+                _update_static(panel, client_theme.codex_completion_lines(rows, prompt.completion_index))
             else:
-                panel.update(Text(self.completion_text))
+                _update_static(panel, Text(self.completion_text))
         else:
             # 附件摘要:不可導航、不接管按鍵;兩個主題同一份純文字。
             self.completion_text = "\n".join(summary)
-            panel.update(Text(self.completion_text))
+            _update_static(panel, Text(self.completion_text))
         panel.display = True
         # codex 把補全放在輸入框下方,開著時暫代 footer(Codex 的 slash popup)。
         panel.screen.set_class(True, "-completions-open")

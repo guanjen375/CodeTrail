@@ -59,6 +59,7 @@ from tests._set_config_harness import (
     YES_ONE_GPU,
     YES_TWO_GPU,
     build_env,
+    flat_cpu_sysfs,
     llama_bin_args,
     make_models,
     read_deployment,
@@ -66,6 +67,7 @@ from tests._set_config_harness import (
     sparse,
     sparse_dense_gguf,
     sparse_layered_moe_gguf,
+    smt_cpu_sysfs,
     sparse_moe_gguf,
     write_fake_llama,
     write_fake_nvidia_smi,
@@ -2224,6 +2226,36 @@ def test_rerun_has_no_carryover_current_answers_win(tmp_path):
     # 這次沒給 --threads → 舊值不沿用,直接不寫 -t
     assert "threads" not in deployment["services"]["main"]["parameters"]
     assert deployment["services"]["reranker"]["ctx"] == 8192
+
+
+@pytest.mark.smoke
+def test_auto_threads_leave_half_the_cpus_when_llama_cpp_would_take_them_all(tmp_path):
+    """Regression(2026-09-29):VM 把 vCPU 攤平成各自獨立的核心(sysfs 看不到 SMT
+    sibling),llama.cpp 的預設 `-t` 就等於全部 CPU。60 條 thread 佔滿 60 顆 vCPU 時,
+    只要別的程式(aicode 本身、MCP 工具、SSH)佔住一顆,每一步都要等那條被擠掉的
+    thread,main 解碼從 13–21 t/s 掉到 2.1 t/s。看得到 SMT / hybrid 時 llama.cpp 只取
+    實體核心或 P-core,本來就留了 CPU,維持不寫 -t。
+    """
+    write_fake_nvidia_smi(tmp_path / "bin", TWO_GPUS)
+    models = make_models(tmp_path)
+    args = (*YES_TWO_GPU, "--no-preview", "--models-dir", str(models))
+
+    flat = run(tmp_path, *args, cpu_sysfs=flat_cpu_sysfs(tmp_path / "flat", 24))
+    assert flat.returncode == 0, flat.stderr + flat.stdout
+    assert read_deployment(tmp_path)["services"]["main"]["parameters"].get("threads") == 12
+    assert "threads=12" in flat.stdout
+
+    smt = run(tmp_path, *args, cpu_sysfs=smt_cpu_sysfs(tmp_path / "smt", 16))
+    assert smt.returncode == 0, smt.stderr + smt.stdout
+    assert "threads" not in read_deployment(tmp_path)["services"]["main"]["parameters"]
+
+    tiny = run(tmp_path, *args, cpu_sysfs=flat_cpu_sysfs(tmp_path / "tiny", 4))
+    assert tiny.returncode == 0, tiny.stderr + tiny.stdout
+    assert read_deployment(tmp_path)["services"]["main"]["parameters"].get("threads") == 4
+
+    pinned = run(tmp_path, *args, "--threads", "20", cpu_sysfs=flat_cpu_sysfs(tmp_path / "flat", 24))
+    assert pinned.returncode == 0, pinned.stderr + pinned.stdout
+    assert read_deployment(tmp_path)["services"]["main"]["parameters"]["threads"] == 20
 
 
 def test_rerun_keeps_hand_edited_port_and_base_url(tmp_path):
