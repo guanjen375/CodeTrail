@@ -22,7 +22,9 @@ aicode
 正常啟動對話區空白，啟動摘要、壓縮模式與全部 WARN 在 `/status`。
 健康檢查失敗會在終端報錯並拒絕進入 TUI。`/tools` 查看 21 個 MCP 工具，
 `/help` 查看互動指令。首次直接送出問題或 `/new` 才建立 session。
-訊息裡用 `@相對路徑` 可以夾帶專案內的檔案，Tab 補全路徑，詳見[夾帶附件](#attachments)。
+訊息裡用 `@` 夾帶檔案：`@` 後面打檔名的一部分即可搜尋整個專案，Tab 補全路徑；把檔案拖進終端機
+或貼上路徑也會自動改寫成 `@`。專案外的截圖與下載檔用 `@~/Downloads/…`（先 `/import on`），
+詳見[夾帶附件](#attachments)。
 
 CodeTrail 的使用方式不是把整個 repo 貼進對話，而是讓模型透過 MCP 工具按需讀檔、搜尋、查 RAG。
 
@@ -355,8 +357,8 @@ Git LFS 或 filter 已轉換的工作區內容，若無法與 HEAD/index 核對�
 
 ### 在訊息裡用 `@` 夾帶
 
-檔案在專案目錄內（sandbox root，也就是你執行 `aicode` 的那個目錄）時，直接在訊息裡寫
-`@相對路徑`：
+輸入框的提示字就寫著它：在訊息裡寫 `@` 加上路徑或檔名。檔案在專案目錄內（sandbox root，
+也就是你執行 `aicode` 的那個目錄）時，直接寫 `@相對路徑`：
 
 ```text
 @screenshots/error.png 畫面上的錯誤是什麼？
@@ -364,9 +366,16 @@ Git LFS 或 filter 已轉換的工作區內容，若無法與 HEAD/index 核對�
 @"logs/build fail.txt" 最重要的錯誤是哪一行？
 ```
 
+- **不必記目錄**：`@` 後面直接打檔名的一部分（至少 2 個字、不含 `/`），補全區會在專案根目錄
+  的符合項目之後，列出整個專案裡檔名含這些字的檔案（檔名開頭相符、目錄較淺的排前面），Tab 套用。
+  搜尋跳過隱藏目錄與符號連結，每次最多看 20000 個目錄項、12 層；超大 repo 請先打目錄前綴縮小範圍。
 - 輸入 `@` 之後按 Tab 補全專案內的路徑（目錄以 `/` 結尾，可以繼續補全）；路徑含空白時寫成
   `@"路徑"`，補全會自動加上引號。補全區同步列出這則訊息會附加哪些檔案、交給哪個工具，
   以及哪些 `@` 不會附加與原因。
+- **拖放或貼上路徑**：把檔案拖進終端機，或貼上一段只有檔案路徑的文字（終端機常見的 `'…'` 引號、
+  `\ ` 跳脫與 `file://` 都認得，最多 5 個），輸入框會自動改寫成 `@` 語法：專案內的改成相對路徑，
+  家目錄底下的改成 `~/…`。貼上的內容混有其他文字，或是輸入框還空著時貼上 `/status` 這類斜線指令，
+  都照原樣貼上。改寫結果和打字一樣可以再編輯。
 - 送出後客戶端先用既有工具讀附件，再請模型回答：
 
   | 副檔名 | 工具 |
@@ -380,9 +389,10 @@ Git LFS 或 filter 已轉換的工作區內容，若無法與 HEAD/index 核對�
   結果以工具卡顯示在你的訊息下方，與模型自己呼叫工具相同：`permission` 設定、核准框與
   Ctrl+C 中斷都適用；較舊的工具輸出之後照常會被裁掉以節省 context。
 - 單則最多附加 5 個檔案、檢查 16 個 `@`；同一個檔案寫兩次只附加一次。
-- 只附加專案內的一般檔：專案外路徑、`~`、`..`、目錄與符號連結都不附加。看起來像路徑卻不能
-  附加的 `@`（例如找不到檔案）照原文送出，畫面上會說明原因。程式碼區塊與行內程式碼
-  裡的 `@`、email，以及緊接在英數字後面的 `@` 都不算附件。
+- 專案內只附加一般檔：`..`、目錄與符號連結都不附加；專案外的檔案見
+  [檔案在專案目錄外](#external-attachments)。看起來像路徑卻不能附加的 `@`（例如找不到檔案）
+  照原文送出，畫面上會說明原因。程式碼區塊與行內程式碼裡的 `@`、email，以及緊接在英數字後面
+  的 `@` 都不算附件。
 - 回合進行中排到下一輪的訊息，在真正送出時才讀附件；「補充目前任務」不處理附件，含 `@路徑` 的
   補充會被拒絕並保留草稿，請改排到下一輪。
 - 附件只進目前對話，不會建立可反覆查詢的知識庫；要反覆查詢請改用下節的 `ingest_document(...)`。
@@ -407,35 +417,57 @@ Git LFS 或 filter 已轉換的工作區內容，若無法與 HEAD/index 核對�
 
 `read_file(...)` 適合文字；`analyze_file(...)` 適合圖片、PDF（一次性抽文字）、ELF、firmware binary。這些操作只把附件帶進目前對話，不會建立可長期查詢的知識庫。想讓圖片或附件之後反覆查，改用下節的 `ingest_document(...)`（圖片會自動走 VL 看圖再進 RAG）。
 
-### 檔案在專案目錄外
+<a id="external-attachments"></a>
 
-`@` 只附加專案內的檔案；預設也不能直接讀 `$HOME`、`Downloads` 或其他專案外路徑。
-要匯入外部附件，在 `~/.config/codetrail/client.json` 打開匯入功能：
+### 檔案在專案目錄外（截圖、下載檔）
 
-```json
-{ "external_import": true }
+`@~/Downloads/截圖.png`、`@/tmp/build.log` 這種專案外的檔案也能直接夾帶，但要先開啟外部匯入。
+預設是關的：沒開之前，專案外的 `@` 不會讀任何檔案，補全區會說明怎麼開。在 TUI 裡輸入：
+
+```text
+/import          顯示外部匯入狀態（本次執行與 client.json 各是開或關）
+/import on       開啟；client.json 還沒有來源目錄時設為 ~/Downloads 與 /tmp
+/import off      關閉（來源目錄清單保留）
 ```
 
-`external_import` 是總開關。預設可匯入來源是 `~/Downloads` 和 `/tmp`。如果附件在其他
-目錄，用 `external_import_roots` 指定白名單；一旦設定就會取代預設清單：
+`/import on`、`/import off` 只改 owner-only `client.json` 的 `external_import`（必要時補
+`external_import_roots`），**重開 `aicode` 後才生效**；回合、核准或審查進行中不能切換。
+也可以直接編輯 `~/.config/codetrail/client.json`。`external_import_roots` 必須列出來源目錄，
+只寫 `{ "external_import": true }` 而沒有來源目錄，`aicode` 會拒絕啟動：
 
 ```json
 { "external_import": true,
   "external_import_roots": ["~/Downloads", "/tmp", "~/specs"] }
 ```
 
-開了之後**每一次**匯入仍然要人工核准（核准框顯示來源與目的路徑）。
+開啟之後：
 
-進入 TUI 後請模型先匯入，再分析回傳的新路徑：
+- 輸入 `@~/` 或 `@/` 會先列出來源目錄；進到來源目錄後，依修改時間**新到舊**列出可匯入的檔案
+  （剛下載、剛截的圖在最上面），Tab 套用。
+- 送出時**每一個**專案外附件都會先跳出 `import_external_file` 核准框，完整顯示來源路徑與
+  專案內的落點（`.aicode_uploads/<安全化檔名>`，同名加 `_N`）。核准後檔案複製進專案，
+  客戶端再用 `analyze_file`／`read_file` 讀那份副本；拒絕就不讀，訊息照原文送出。原始檔不會被修改。
+- 只收來源目錄內的一般檔（不跟符號連結）、單檔 100 MB 以內，副檔名限：
+  PNG／JPG／JPEG／GIF／WebP、PDF、MD／TXT／LOG、JSON／JSONL／YAML／YML／TOML／CSV、
+  ELF／SO／O／AXF／OUT／KO、BIN／DAT／RAW／FW／IMG／ROM／HEX。原始碼這類檔案請直接複製進專案。
+- 同一個外部檔每附加一次就再複製一份；已匯入的副本可以直接用 `@.aicode_uploads/<檔名>` 夾帶。
+  `.aicode_uploads/` 可能含 NDA 內容，不要 commit。
+
+**用 SSH 連到這台主機時**，你本機的截圖不在這台主機上：先把檔案傳到這台主機的來源目錄
+（例如 `scp 截圖.png <主機>:~/Downloads/`），再在 `aicode` 裡用 `@~/Downloads/` 選它。
+拖放本機檔案得到的是你本機的路徑（例如 Windows 的 `C:\…`），補全區會說明它無法附加的原因。
+
+也可以請模型自己匯入，再分析回傳的新路徑（同樣要先開啟外部匯入、每次核准）：
 
 ```text
 請用工具 import_external_file 匯入 ~/Downloads/error.log，
 再用 read_file 讀回傳的新路徑，整理最重要的錯誤。
 ```
 
-匯入後的檔案會複製到專案底下 `.aicode_uploads/`，原始檔不會被修改；之後也可以在訊息裡用 `@.aicode_uploads/<檔名>` 夾帶。更多副檔名、白名單與圖片/binary 細節見 [RAG、附件與知識庫操作](#rag)。
-
-如果外部 PDF / spec / 截圖圖片也要注入 RAG，先 `import_external_file`，再把回傳的 `.aicode_uploads/...` 路徑交給 `ingest_document`（圖片會自動走 VL）；完整串接範例見 [RAG、附件與知識庫操作](#attachments)。
+更多副檔名、白名單與圖片/binary 細節見 [RAG、附件與知識庫操作](#rag)。
+如果外部 PDF / spec / 截圖圖片也要注入 RAG，先匯入（`@` 夾帶一次或 `import_external_file`），
+再把 `.aicode_uploads/...` 路徑交給 `ingest_document`（圖片會自動走 VL）；完整串接範例見
+[RAG、附件與知識庫操作](#attachments)。
 <a id="rag"></a>
 
 ## 知識入庫與查詢

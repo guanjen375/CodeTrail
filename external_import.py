@@ -9,6 +9,7 @@ read_file/analyze_file/ingest_document 這些 sandbox 工具處理。
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 import stat as _stat
 from pathlib import Path
@@ -18,6 +19,18 @@ import config
 
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+#: 落點檔名要保留的「合理副檔名」。
+_SAFE_SUFFIX_RE = re.compile(r"\.[A-Za-z0-9]{1,16}")
+#: 安全化檔名的最大長度(_legacy_safe_name／_safe_dest_name 都截在這裡)。
+_MAX_SAFE_NAME = 160
+#: 同名時 `_next_available_name` 最多試到的 `_N`。
+_MAX_TAKEN_INDEX = 999
+#: 工具實際可能落下的最長檔名 = 安全化上限 + 最長的 `_N`。imported_path 必須全收:
+#: 只收 160 字的話,同一個長檔名第二次附加(落成 `…_1.txt`)會匯入成功卻無聲地不讀。
+_MAX_LANDED_NAME = _MAX_SAFE_NAME + len(f"_{_MAX_TAKEN_INDEX}")
+#: 成功結果裡的落點行(見 import_external_file 的回傳文字);imported_path 只認這一行。
+_IMPORTED_LINE_RE = re.compile(r"^已匯入: (?P<path>[^\n]+) \([0-9][0-9,]* bytes\)$", re.M)
+_LANDED_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,%d}" % _MAX_LANDED_NAME)
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -63,14 +76,30 @@ def safe_dest_name(name: str) -> str:
     return _safe_dest_name(name)
 
 
-def _safe_dest_name(name: str) -> str:
+def _legacy_safe_name(name: str) -> str:
     cleaned = _SAFE_NAME_RE.sub("_", name.strip())
     cleaned = cleaned.strip("._")
     if not cleaned:
         cleaned = "upload"
     if cleaned.startswith("."):
         cleaned = "upload_" + cleaned.lstrip(".")
-    return cleaned[:160]
+    return cleaned[:_MAX_SAFE_NAME]
+
+
+def _safe_dest_name(name: str) -> str:
+    """安全化之後**保留副檔名**。
+
+    舊規則整串替換再 strip,主檔名全是非 ASCII 時(「截圖.png」)會剩下「png」——副檔名
+    沒了,analyze_file 依副檔名分流就認不出它。舊結果已經保留合理副檔名時原樣回傳
+    (所有現行檔名的落點不變);只有舊結果弄丟副檔名時,才把主檔名與副檔名分開處理。
+    """
+    legacy = _legacy_safe_name(name)
+    base = name.strip()
+    suffix = Path(base).suffix
+    if not _SAFE_SUFFIX_RE.fullmatch(suffix) or legacy.endswith(suffix):
+        return legacy
+    stem = _SAFE_NAME_RE.sub("_", base[: -len(suffix)]).strip("._") or "upload"
+    return stem[: _MAX_SAFE_NAME - len(suffix)] + suffix
 
 
 def _name_is_taken(dir_fd: int, name: str) -> bool:
@@ -90,11 +119,11 @@ def _next_available_name(dir_fd: int, filename: str) -> str:
 
     suffix = candidate.suffix
     stem = candidate.stem or "upload"
-    for idx in range(1, 1000):
+    for idx in range(1, _MAX_TAKEN_INDEX + 1):
         name = f"{stem}_{idx}{suffix}"
         if not _name_is_taken(dir_fd, name):
             return name
-    raise OSError("目的目錄同名檔案過多(>999),請先清理 .aicode_uploads")
+    raise OSError(f"目的目錄同名檔案過多(>{_MAX_TAKEN_INDEX}),請先清理 .aicode_uploads")
 
 
 def _validate_dest_name(dest_name: Optional[str]) -> tuple[str | None, str | None]:
@@ -126,6 +155,32 @@ def planned_destination(source_path: str, dest_name: Optional[str] = None) -> st
     raw = (source_path or "").strip().strip('"').strip("'")
     base = explicit or Path(raw).expanduser().name
     return f"{_dest_dir_name()}/{_safe_dest_name(base)}"
+
+
+def imported_path(text: str) -> str | None:
+    """從 import_external_file 的成功結果取出落點(AICODE_ROOT 相對),取不到就 None。
+
+    格式與下面 import_external_file 的回傳文字同一處維護:**恰好一行**
+    「已匯入: <dest_dir>/<安全檔名> (<n> bytes)」。零行(失敗、「已在 AICODE_ROOT 內」)、
+    多行、落在 dest_dir 以外或檔名不是安全化形狀,一律 None —— 呼叫端寧可不追加讀取,
+    也不能讀錯檔。客戶端 @ 附件用它決定第二段讀哪個檔。
+    """
+    if not isinstance(text, str):
+        return None
+    matches = list(_IMPORTED_LINE_RE.finditer(text))
+    if len(matches) != 1:
+        return None
+    relative = matches[0].group("path")
+    dest = posixpath.normpath(_dest_dir_name())
+    if dest in ("", ".", "/") or dest.startswith(("/", "../")) or dest == "..":
+        return None
+    prefix = dest + "/"
+    if not relative.startswith(prefix):
+        return None
+    name = relative[len(prefix):]
+    if not _LANDED_NAME_RE.fullmatch(name) or name.startswith("."):
+        return None
+    return relative
 
 
 def _open_dir_chain(directory: Path) -> int:
@@ -321,6 +376,7 @@ def import_external_file(source_path: str, aicode_root: str, dest_name: Optional
 
     dest = dest_dir / landed
     rel = dest.relative_to(root).as_posix()
+    # 「已匯入:」這一行是 imported_path() 解析的格式(@ 附件的第二段讀取靠它);改格式要同步改那裡。
     return (
         "=== import_external_file ✓ ===\n"
         f"來源: {src}\n"

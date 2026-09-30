@@ -47,6 +47,9 @@ def _parse_server_argv(argv: list[str]) -> dict:
         # 測試 / eval 的接縫。正常 runtime 不帶它 —— 缺 reranker 的 session 會在
         # 使用者問第一個 RAG 問題時才炸,而那時他已經在對話裡了。
         "skip_aux_preflight": False,
+        # 外部匯入的來源根:客戶端**啟動時**讀 client.json 後逐一交過來(可重複)。
+        # 沒有這個旗標 = 外部匯入關閉(見下方 apply_to_config 之後的覆寫)。
+        "external_import_roots": [],
     }
 
     def fatal(message: str) -> None:
@@ -67,6 +70,15 @@ def _parse_server_argv(argv: list[str]) -> dict:
         if raw.startswith("--"):
             fatal(f"{name} 的值看起來是另一個選項({raw!r});缺值一律拒絕")
         return raw
+
+    def import_root(raw: str | None) -> None:
+        """`--external-import-root` 可以重複(一個根一次);值的檢查與其他帶值選項相同,
+        另外拒絕控制字元。保留順序、重複的根只記一次。"""
+        value = take_value("--external-import-root", raw)
+        if any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value):
+            fatal(f"--external-import-root 的值含控制字元({value!r})")
+        if value not in parsed["external_import_roots"]:
+            parsed["external_import_roots"].append(value)
 
     seen: set[str] = set()
 
@@ -105,10 +117,22 @@ def _parse_server_argv(argv: list[str]) -> dict:
         elif item.startswith("--client-config="):
             once("--client-config")
             parsed["client_config"] = take_value("--client-config", item[len("--client-config="):])
+        elif item == "--external-import-root":
+            import_root(argv[index + 1] if index + 1 < len(argv) else None)
+            index += 1
+        elif item.startswith("--external-import-root="):
+            import_root(item[len("--external-import-root="):])
         else:
             fatal(f"不認得的啟動參數:{item!r}")
         index += 1
     return parsed
+
+
+def _external_import_roots_from_argv(args: dict) -> list[str]:
+    """外部匯入的來源根只認 argv(客戶端啟動時的快照);readonly 一律沒有。"""
+    if args.get("readonly"):
+        return []
+    return list(args.get("external_import_roots") or [])
 
 
 # 只有「被當成腳本執行」時才吃 argv。這個模組是 import 期就開始做事的,而
@@ -282,6 +306,13 @@ except Exception as _settings_exc:  # noqa: BLE001
     )
     sys.exit(2)
 _client_config.apply_to_config(_CLIENT_SETTINGS, readonly=_ARGS["readonly"])
+# 外部匯入的授權是**客戶端啟動時的快照**(argv `--external-import-root`),不是這個
+# 行程自己讀到的 client.json。理由:MCP 會在取消逾時後被重建,重建時讀到的是**當下**
+# 的檔案 —— 使用者在 TUI 用 /import 改過之後(說好重開 aicode 才生效),server 就會
+# 比客戶端的附件預覽、/status 先一步開或關,兩邊對「這次執行能不能匯入」各說各話。
+# 客戶端建構 McpClient 時固定 argv,重建沿用同一份;沒有旗標 = 關,readonly 一律關。
+config.EXTERNAL_IMPORT_ROOTS = _external_import_roots_from_argv(_ARGS)
+config.EXTERNAL_IMPORT_ENABLED = bool(config.EXTERNAL_IMPORT_ROOTS)
 
 import container_runner as _container_runner
 
@@ -1908,8 +1939,11 @@ def import_external_file(
     This is the controlled "upload/import"入口 for users who have a
     screenshot, PDF, log, ELF, or firmware blob outside the project. General
     tools still cannot read outside AICODE_ROOT. This tool only works when the
-    client.json has "external_import": true, and the source path
-    is inside an allowed import root (default: ~/Downloads and /tmp; override with "external_import_roots" in client.json).
+    client started this server with `--external-import-root <root>` (one per
+    root, taken from client.json's "external_import" / "external_import_roots"
+    when aicode started; respawns reuse the same argv), and the source path is
+    inside one of those roots. Without the flag, or under --readonly, it is off.
+    (這段 docstring 不進模型可見的工具目錄;模型看到的是 MODEL_TOOL_DESCRIPTIONS。)
 
     Args:
         path: 外部檔案路徑。支援絕對路徑或 ~ 展開。

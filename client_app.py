@@ -21,13 +21,17 @@
   (含未裁切的 `structuredContent`)與壓縮標記。畫面看不到、模型看得到的話,
   接下來每一則回答都在回應一段使用者看不見的脈絡。換不成功就 engine 與畫面
   **都不動**;回合進行中一律拒絕換。
-* **@ 附件的預覽不碰 UI 執行緒**。路徑補全與附件摘要要讀檔案系統(慢速掛載會卡住),
-  所以由單一背景 worker 算、只收最新一筆;UI 執行緒只做純字串判斷。附件本身在送達
-  那一刻由協調器解析、engine 以既有 MCP 工具讀取(:mod:`client_attachments`)。
+* **@ 附件的預覽不碰 UI 執行緒**。路徑補全(含檔名搜尋與專案外來源列舉)與附件摘要要讀
+  檔案系統(慢速掛載會卡住),所以由單一背景 worker 算、只收最新一筆;UI 執行緒只做純字串
+  判斷。附件本身在送達那一刻由協調器解析、engine 以既有 MCP 工具讀取
+  (:mod:`client_attachments`)。專案外範圍是啟動時的快照(``engine.options.attachment_scope``)。
+* **貼上只插一次**。整段都是路徑的貼上(終端機拖放檔案)以純字串改寫成 ``@`` 語法;
+  ``PromptInput._on_paste`` 一律 ``prevent_default``,自己插入,TextArea 的 handler
+  不會再插第二次。輸入框開頭貼上斜線指令(``/status``、``/import on``)原樣保留。
 * **主題只改呈現**(`/theme`,註冊表在 :mod:`client_theme`)。內容、事件與 session 每個
   主題都一樣;codex 的「› 」「• 」「└ 」是 ThemeGlyph,不進選取。複製結果只有工具卡
-  標題列(三擊全選會帶到)依主題寫法不同。default 的外觀、狀態列文字與選取範圍(含三擊)
-  與加入主題前相同。
+  標題列(三擊全選會帶到)依主題寫法不同。default 的外觀(輸入框提示字除外:它教使用者
+  @ 夾帶檔案)、狀態列文字與選取範圍(含三擊)與加入主題前相同。
 
 `engine.send()` 跑在背景執行緒(協調器管),事件回到這裡才變成 widget;核准
 在那個背景執行緒裡阻塞等 UI 回答。
@@ -102,16 +106,26 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("/queue", "待送訊息:list / add / edit / cancel / resume"),
     ("/supplement", "補充目前任務(/supplement <文字>,安全點才送入)"),
     ("/status", "目前模型、context、壓縮模式與 session 位置"),
+    ("/import", "專案外檔案匯入:/import 看狀態，/import on|off 寫入設定、重開 aicode 後生效"),
     ("/tools", "本輪暴露的工具(裸名,依 tools/list 順序)"),
     ("/think", "切換主模型思考(/think on|off，預設 off)"),
     ("/exit", "離開"),
 )
 
+#: `/import` 的用法。開關只寫 client.json:本次執行的附件範圍與 MCP 授權是啟動時的快照。
+IMPORT_USAGE = (
+    "用法：/import 看狀態；/import on|off 寫入 client.json 的外部匯入開關"
+    "（重開 aicode 後生效；每次匯入仍需核准）。"
+)
+
 HELP_TAIL = (
     "其他輸入一律當成問題送給模型。\n"
-    "@路徑 夾帶專案內檔案（Tab 補全；含空白用 @\"路徑\"）：圖片／PDF／ELF／binary 經 analyze_file"
-    "（圖片走 VL），其他文字檔經 read_file；"
+    "@路徑 夾帶檔案：@ 後打檔名即可搜尋整個專案，Tab 補全；含空白用 @\"路徑\"；"
+    "把檔案拖進終端機或貼上路徑會自動轉成 @。\n"
+    "圖片／PDF／ELF／binary 經 analyze_file（圖片走 VL），其他文字檔經 read_file；"
     f"單則最多 {client_attachments.MAX_ATTACHMENTS} 個附件，補充訊息不處理附件。\n"
+    "專案外檔案（@~/Downloads/…、@/tmp/…）：先 /import on 並重開 aicode，每次匯入仍需核准；"
+    "SSH 連線時先把檔案傳到這台主機（例如 ~/Downloads）。\n"
     "Enter 送出、Alt+Enter 換行、↑/↓ 翻輸入歷史。\n"
     "忙碌時 Enter 選擇排到下一輪或補充目前任務;未送訊息用 /queue 查看。\n"
     "滑鼠左鍵拖曳選取，放開即複製；雙擊／三擊完成文字選取也會複製，並保留反白。\n"
@@ -864,11 +878,27 @@ def _at_attachment_token(text: str, cursor: int) -> bool:
     return "@" in segment
 
 
+def _pasted_command(app: Any, before: str, pasted: str) -> bool:
+    """輸入框開頭貼上的是已註冊的斜線指令(含 /quit 這類別名)→ 原樣保留、不改寫成 @。
+
+    `/status`、`/import on` 字面上也是「以 / 開頭的路徑」;改寫成 `@/status` 就從指令
+    變成送給模型的問題。判準與送出時的分派相同:App 上有 ``_cmd_<name>``。
+    """
+    if before.strip():
+        return False
+    stripped = pasted.strip()
+    if not stripped.startswith("/"):
+        return False
+    name = stripped.split(maxsplit=1)[0][1:].lower()
+    return bool(name) and callable(getattr(app, f"_cmd_{name}", None))
+
+
 class PromptInput(TextArea):
     """底部輸入框:Enter 送出、Alt+Enter 換行、↑/↓ 翻歷史、``/`` 指令補全、``@`` 路徑補全。
 
     路徑補全與附件摘要由 App 的背景 worker 算好再交回來(:class:`_AttachmentPreview`);
     這裡只保存「那一份結果屬於哪一個 (文字, 游標)」,文字或游標一變就不再套用它。
+    整段都是路徑的貼上(拖放檔案)改寫成 ``@`` 語法(純字串,見 :meth:`_on_paste`)。
     """
 
     class Submitted(Message):
@@ -894,6 +924,8 @@ class PromptInput(TextArea):
         self.completion_kind = ""
         #: 附件的專案 root(App 在 mount 時給;None = 附件 UI 停用)。
         self.attachment_root: Any = None
+        #: 專案外附件範圍(啟動時的快照,App 在 mount 時給;None = 替身,不傳 external=)。
+        self.attachment_scope: Any = None
         self._path_completion: client_attachments.Completion | None = None
         self._path_key: tuple[str, int] | None = None
 
@@ -1010,6 +1042,41 @@ class PromptInput(TextArea):
         self.refresh_completions()
         self.post_message(self.Changed(self.text))
 
+    # -- 貼上 ------------------------------------------------------------
+    async def _on_paste(self, event: events.Paste) -> None:
+        """終端機的 bracketed paste。整段都是路徑(拖放檔案)時改寫成 @ 附件語法。
+
+        Textual 依 MRO 逐類呼叫 ``_on_paste`` 直到 ``prevent_default``,而
+        ``TextArea._on_paste`` 自己不擋 —— 不擋的話同一段貼上會被插兩次。所以這裡
+        **一律** prevent_default,再用與 TextArea 相同的方式自己插入一次(不 stop,
+        與 TextArea 相同)。改寫是純字串(:func:`client_attachments.paste_mentions`),
+        不碰檔案系統;會不會真的附加由背景 worker 的預覽說明。輸入框開頭貼上的
+        斜線指令原樣保留,送出時仍是指令(:func:`_pasted_command`)。
+        """
+        event.prevent_default()
+        if self.read_only:
+            return
+        text = event.text
+        start = min(self.selection.start, self.selection.end)
+        before = self.text[: self.document.get_index_from_location(start)]
+        if self.attachment_root is not None and not _pasted_command(self.app, before, text):
+            try:
+                converted = client_attachments.paste_mentions(
+                    text,
+                    before=before[-1:],
+                    root=self.attachment_root,
+                    home=getattr(self.attachment_scope, "home", None),
+                )
+            except Exception:  # noqa: BLE001 - 改寫失敗只是不改寫;例外帶走 App 會連草稿一起丟
+                converted = None
+            if converted is not None:
+                text = converted
+        if result := self._replace_via_keyboard(text, *self.selection):
+            self.move_cursor(result.end_location)
+            self.focus()
+        self.refresh_completions()
+        self.post_message(self.Changed(self.text))
+
     def _at_first_line(self) -> bool:
         return self.cursor_location[0] == 0
 
@@ -1087,14 +1154,17 @@ class _AttachmentPreview:
     def __init__(self, target: App[Any]) -> None:
         self._target = target
         self._condition = threading.Condition()
-        self._pending: tuple[int, str, int, Any] | None = None
+        self._pending: tuple[int, str, int, Any, Any] | None = None
         self._thread: threading.Thread | None = None
         self._idle = threading.Event()
         self._idle.set()
 
-    def request(self, generation: int, text: str, cursor: int, root: Any) -> None:
+    def request(
+        self, generation: int, text: str, cursor: int, root: Any, scope: Any = None,
+    ) -> None:
+        """``scope`` 是專案外附件範圍(啟動時的快照);None = 替身,不傳 external=。"""
         with self._condition:
-            self._pending = (generation, text, cursor, root)
+            self._pending = (generation, text, cursor, root, scope)
             self._idle.clear()
             if self._thread is None:
                 self._thread = threading.Thread(
@@ -1112,11 +1182,15 @@ class _AttachmentPreview:
                     if self._pending is None:
                         self._thread = None
                         return
-                generation, text, cursor, root = self._pending
+                generation, text, cursor, root, scope = self._pending
                 self._pending = None
+            # 只有真的有範圍才帶 external=:既有替身(兩個位置參數的 resolve)呼叫形狀不變。
+            scope_kwargs = {"external": scope} if scope is not None else {}
             try:
-                completion = client_attachments.completions(text, cursor, root)
-                summary = client_attachments.describe(client_attachments.resolve(text, root))
+                completion = client_attachments.completions(text, cursor, root, **scope_kwargs)
+                summary = client_attachments.describe(
+                    client_attachments.resolve(text, root, **scope_kwargs)
+                )
             except Exception:  # noqa: BLE001 - 預覽壞掉只是少一份提示,不得帶走 UI
                 completion, summary = None, ()
             self._target.post_message(self.Ready(generation, text, cursor, completion, summary))
@@ -1457,7 +1531,10 @@ class CodeTrailApp(App[int]):
         prompt = self.query_one("#prompt", PromptInput)
         prompt.load_history(self._read_history())
         # 替身 engine 沒有 root → None → @ 附件 UI 完全停用(不起 worker、不碰檔案系統)。
-        prompt.attachment_root = getattr(getattr(self.engine, "options", None), "root", None)
+        options = getattr(self.engine, "options", None)
+        prompt.attachment_root = getattr(options, "root", None)
+        # 專案外附件範圍是啟動時的快照;替身沒有它 → None → 預覽不傳 external=。
+        prompt.attachment_scope = getattr(options, "attachment_scope", None)
         prompt.focus()
         # 啟動時的主題在建構時就設好了,那時還沒有輸入框;之後的切換由 watch_theme 管。
         prompt.placeholder = client_theme.spec_for(self.theme).placeholder
@@ -2007,6 +2084,75 @@ class CodeTrailApp(App[int]):
         saved = f"已儲存至 {settings.path}" if changed else "設定未變更，未寫入檔案"
         self._append(NoticeLine(f"主題：{settings.theme}；{saved}。"))
 
+    # ---- 專案外匯入 ----------------------------------------------------
+    def _external_scope(self) -> Any:
+        """本次執行的專案外附件範圍(啟動時的快照);替身沒有 → None。"""
+        return getattr(getattr(self.engine, "options", None), "attachment_scope", None)
+
+    @staticmethod
+    def _describe_import(enabled: bool, roots: Sequence[str]) -> str:
+        if not enabled:
+            return "關"
+        return "開（" + "、".join(roots) + "）" if roots else "開"
+
+    def _external_import_status(self) -> str:
+        """`/status` 與 `/import` 的「本次執行」那一格:取自 scope,不讀設定檔。"""
+        scope = self._external_scope()
+        if scope is not None and scope.enabled:
+            return self._describe_import(True, tuple(scope.roots))
+        return "關（/import on 開啟）"
+
+    def _cmd_import(self, argument: str) -> None:
+        """`/import` 看專案外匯入狀態;`/import on|off` 只改 client.json 的外部匯入鍵。
+
+        本次執行的附件範圍與 MCP 的匯入授權都是**啟動時的快照**(MCP 經 argv 拿到,
+        取消逾時後重建也沿用),所以這裡不改 runtime config、不重啟 MCP、不改 scope ——
+        一律重開 aicode 後生效,而且每一次匯入仍要人工核准。回合、核准、審查進行中
+        拒絕寫入(同 /theme)。
+        """
+        value = argument.lower()
+        if value not in ("", "on", "off"):
+            self._append(NoticeLine(IMPORT_USAGE))
+            return
+        runtime = self._external_import_status()
+        if not value:
+            try:
+                settings = client_config.load_client_settings()
+            except (client_config.ClientConfigError, OSError) as exc:
+                self._append(ErrorLine(f"/import: {exc}"))
+                return
+            saved = self._describe_import(settings.external_import, settings.external_import_roots)
+            lines = [f"外部匯入：本次執行 {runtime}；client.json {saved}（{settings.path}）"]
+            scope = self._external_scope()
+            current = (bool(scope is not None and scope.enabled),
+                       tuple(scope.roots) if scope is not None and scope.enabled else ())
+            wanted = (settings.external_import,
+                      tuple(dict.fromkeys(settings.external_import_roots))
+                      if settings.external_import else ())
+            if current != wanted:
+                lines.append("client.json 與本次執行不同：重開 aicode 後生效。")
+            lines.append(IMPORT_USAGE)
+            self._append(NoticeLine("\n".join(lines)))
+            return
+        if (
+            self.coordinator.busy
+            or self.coordinator.pending_approvals()
+            or self.coordinator.reviewing
+        ):
+            self._append(NoticeLine("回合、核准或審查進行中，不能變更外部匯入設定。"))
+            return
+        try:
+            settings, changed = client_config.update_external_import(value == "on")
+        except (client_config.ClientConfigError, OSError) as exc:
+            self._append(ErrorLine(f"/import: {exc}"))
+            return
+        state = self._describe_import(settings.external_import, settings.external_import_roots)
+        saved = f"已儲存至 {settings.path}" if changed else "設定未變更，未寫入檔案"
+        self._append(NoticeLine(
+            f"外部匯入（client.json）：{state}；{saved}。重開 aicode 後生效；每次匯入仍需核准。"
+            f"本次執行：{runtime}。"
+        ))
+
     def _cmd_exit(self, _argument: str) -> None:
         if self._review_screen is not None:
             self._review_screen.request_close(leave=True)
@@ -2210,6 +2356,7 @@ class CodeTrailApp(App[int]):
             f"prompt cache 預熱={self._prime_status()}",
             f"待送訊息={len(self.coordinator.queue_snapshot(pending_only=True))}"
             f"({'暫停, /queue resume' if self.coordinator.queue_paused else '依序等待'})",
+            f"外部匯入={self._external_import_status()}",
         ]
         if self.engine.store_error:
             lines.append(
@@ -2585,7 +2732,9 @@ class CodeTrailApp(App[int]):
             self._attachment_request = request
             self._attachment_generation += 1
             self._attachment_waiting = True
-            self._attachment_preview.request(self._attachment_generation, text, request[1], root)
+            self._attachment_preview.request(
+                self._attachment_generation, text, request[1], root, prompt.attachment_scope,
+            )
         return self._attachment_waiting
 
     def on_attachment_preview_ready(self, message: _AttachmentPreview.Ready) -> None:

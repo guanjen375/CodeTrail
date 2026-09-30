@@ -1,8 +1,13 @@
-"""TUI／headless 的 ``@`` 附件:只讀專案內普通檔、走同一條工具路徑、取消與重播都成立。
+"""TUI／headless 的 ``@`` 附件:只讀專案內普通檔(專案外經匯入)、走同一條工具路徑、取消與重播都成立。
 
 AGENTS.md §2「TUI 的 @ 附件」的檢查點:
   - 字串層先拒 ``~``／``..``／專案外(零檔案系統存取);其餘自 ``/`` 逐層 ``O_NOFOLLOW``,
     任何一層或葉節點是 symlink 都不附加;補全只在已驗證的目錄 fd 上 scandir。
+  - 專案外只在外部匯入開啟、字面落在來源根內時才碰檔案系統(關閉／根外／``..``／``~user``／
+    Windows 路徑／不支援的副檔名都零 FS);根以 realpath 解析後逐層 nofollow,實體在專案內
+    就轉成專案內附件、不匯入。
+  - 檔名搜尋從持有的 root fd 逐層 nofollow 重開子目錄,走訪中換成 symlink 也不列專案外名稱,
+    有界;外部來源只列根內的目錄與可匯入的檔,新到舊。貼上改寫是純字串。
   - 補全插入的文字必須解析回同一個檔案(含空白的路徑用引號)。
   - engine 以 synthetic assistant tool_calls 記錄附件,沿用 policy／核准(本輪共用重問上限)／
     readonly／allowlist／取消／heal;``attachment`` 標記不送模型。
@@ -396,6 +401,378 @@ def test_attachment_routing_matches_analyze_file_dispatch():
     assert client_attachments.route("fw/boot.bin") == ("analyze_file", "binary")
     for name in ("src/main.c", "README.md", "Makefile", "logs/run.txt", "a.docx", "archive.tar.gz"):
         assert client_attachments.route(name) == ("read_file", "text"), name
+
+
+# ============================================================
+# 專案外、檔名搜尋、來源列舉、貼上
+# ============================================================
+def _external_scope(home, roots, *, enabled=True, max_bytes=0):
+    """與 codetrail_chat 同一個建構函式;副檔名白名單就是 server 匯入用的那一份。"""
+    return client_attachments.external_scope(
+        enabled=enabled, roots=roots, home=None if home is None else str(home),
+        max_bytes=max_bytes, extensions=config.EXTERNAL_IMPORT_ALLOWED_EXTENSIONS,
+    )
+
+
+def test_external_mentions_touch_the_filesystem_only_inside_enabled_import_roots(tmp_path, monkeypatch):
+    base = Path(os.path.realpath(tmp_path))
+    root, outside = _project(base)
+    home = base / "home"
+    downloads = home / "Downloads"
+    (downloads / "sub").mkdir(parents=True)
+    (downloads / "shot 1.png").write_bytes(b"\x89PNG shot")
+    (downloads / "notes.log").write_text("log", encoding="utf-8")
+    (downloads / "sub" / "deep.pdf").write_bytes(b"%PDF deep")
+    (downloads / "big.bin").write_bytes(b"x" * 64)
+    (downloads / "code.c").write_text("int x;\n", encoding="utf-8")
+    (downloads / "dir.png").mkdir()
+    (downloads / "link.png").symlink_to(downloads / "shot 1.png")
+    (downloads / "linkdir").symlink_to(outside)
+    os.mkfifo(downloads / "pipe.png")
+    # 來源根本身是 symlink,解析後落在專案內(P3):要變成專案內附件,不是匯入。
+    drop = base / "drop"
+    drop.symlink_to(root / "docs")
+    scope = _external_scope(home, ["~/Downloads", str(drop)], max_bytes=32)
+    windows = '@"C:\\Users\\me\\shot.png"'
+
+    # 字串層就拒絕的一律零 FS:沒有範圍、外部匯入關閉、根外、..、~user、Windows 路徑、
+    # 不支援的副檔名、等於來源根本身。
+    with monkeypatch.context() as guard:
+        _forbid_filesystem(guard)
+        legacy = client_attachments.resolve(f"@~/Downloads/notes.log @{outside}/a.png", root)
+        off = client_attachments.resolve(
+            f"@~/Downloads/notes.log @{outside}/secret.txt", root,
+            external=_external_scope(home, ["~/Downloads"], enabled=False),
+        )
+        rejected = client_attachments.resolve(
+            f"@{outside}/a.png @~/Downloads/../x.png @~someone/x.png {windows} "
+            "@~/Downloads/code.c @~/Downloads",
+            root, external=scope,
+        )
+    assert legacy.attachments == off.attachments == rejected.attachments == ()
+    assert [item.reason for item in legacy.skipped] == ["只支援專案內路徑", client_attachments._OUTSIDE]
+    assert [item.reason for item in off.skipped] == [
+        "專案外檔案：外部匯入未開啟（/import on 後重開 aicode；每次匯入仍需核准）",
+    ] * 2
+    assert [item.reason for item in rejected.skipped] == [
+        f"不在外部匯入來源（~/Downloads、{drop}）；若是你本機的檔案，請先傳到這台主機的來源目錄",
+        client_attachments._OUTSIDE,
+        "只支援 ~/ 開頭",
+        "Windows 路徑：aicode 讀的是這台主機上的檔案，請先傳到這台主機（例如 ~/Downloads）",
+        "外部匯入不支援此副檔名",
+        "目錄不附加",
+    ]
+    # 缺 dir-fd／nofollow 能力:落在根內的也不碰檔案系統。
+    with monkeypatch.context() as guard:
+        guard.setattr(os, "supports_dir_fd", set())
+        _forbid_filesystem(guard)
+        incapable = client_attachments.resolve("@~/Downloads/notes.log", root, external=scope)
+    assert incapable.attachments == ()
+    assert [item.reason for item in incapable.skipped] == [client_attachments._INCAPABLE]
+
+    # 根內:自解析後的根逐層 nofollow 驗到葉節點;symlink／目錄／特殊檔／超過上限／找不到不附加;
+    # 同一個檔(~ 與絕對寫法)只附加一次。
+    resolution = client_attachments.resolve(
+        '看 @"~/Downloads/shot 1.png" @~/Downloads/notes.log @~/Downloads/sub/deep.pdf '
+        f"@{home}/Downloads/notes.log @~/Downloads/link.png @~/Downloads/linkdir/a.png "
+        "@~/Downloads/pipe.png @~/Downloads/dir.png @~/Downloads/big.bin @~/Downloads/missing.png",
+        root, external=scope,
+    )
+    assert resolution.attachments == (
+        Attachment(f"{home}/Downloads/shot 1.png", "import_external_file", "image", "~/Downloads/shot 1.png"),
+        Attachment(f"{home}/Downloads/notes.log", "import_external_file", "text", "~/Downloads/notes.log"),
+        Attachment(f"{home}/Downloads/sub/deep.pdf", "import_external_file", "pdf", "~/Downloads/sub/deep.pdf"),
+    )
+    assert all(item.external for item in resolution.attachments)
+    assert {item.raw: item.reason for item in resolution.skipped} == {
+        "@~/Downloads/link.png": "符號連結不附加",
+        "@~/Downloads/linkdir/a.png": "路徑含符號連結或非目錄，不附加",
+        "@~/Downloads/pipe.png": "不是一般檔案",
+        "@~/Downloads/dir.png": "目錄不附加",
+        "@~/Downloads/big.bin": "超過匯入上限 32 bytes",
+        "@~/Downloads/missing.png": "找不到或無法讀取",
+    }
+    assert client_attachments.describe(resolution)[0] == (
+        "附件 ~/Downloads/shot 1.png → 匯入後 analyze_file（圖片；匯入需核准）"
+    )
+    call = client_attachments.tool_calls(resolution.attachments[:1])[0]
+    assert call["name"] == client_attachments.IMPORT_TOOL == "import_external_file"
+    assert call["arguments"] == {"path": f"{home}/Downloads/shot 1.png"}
+    # 匯入成功後的讀取依落點副檔名路由,display 沿用使用者寫法。
+    assert client_attachments.follow_up(resolution.attachments[0], ".aicode_uploads/shot_1.png") == Attachment(
+        ".aicode_uploads/shot_1.png", "analyze_file", "image", "~/Downloads/shot 1.png",
+    )
+    # 逐層開啟:從 / 起、沿「解析後」的來源根一段一段 O_NOFOLLOW|O_DIRECTORY。
+    resolved_downloads = os.path.realpath(downloads)
+    opened: list[tuple[str, int, int | None]] = []
+    real_open = os.open
+
+    def recording_open(path, flags, mode=0o777, *, dir_fd=None):
+        opened.append((path, flags, dir_fd))
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    walked = client_attachments.resolve("@~/Downloads/sub/deep.pdf", root, external=scope)
+    monkeypatch.undo()
+    assert [item.path for item in walked.attachments] == [f"{home}/Downloads/sub/deep.pdf"]
+    assert opened[0][0] == "/" and opened[0][2] is None
+    steps = opened[1:]
+    assert [name for name, _, _ in steps] == [*[part for part in resolved_downloads.split("/") if part], "sub"]
+    assert all("/" not in name and fd is not None for name, _, fd in steps)
+    assert all(flags & os.O_NOFOLLOW and flags & os.O_DIRECTORY for _, flags, _ in steps)
+
+    # ~/ 展開後落在專案內 → 專案內附件(外部匯入關閉也一樣)。
+    inner = client_attachments.resolve(
+        "@~/project/notes.txt @~/project/docs/a.png", root,
+        external=_external_scope(base, [], enabled=False),
+    )
+    assert inner.attachments == (
+        Attachment("notes.txt", "read_file", "text"),
+        Attachment("docs/a.png", "analyze_file", "image"),
+    )
+    # 來源根解析後在專案內(P3):專案內附件、不發匯入;與直接寫的同一檔只附加一次。
+    moved = client_attachments.resolve(f"@{drop}/a.png @docs/a.png", root, external=scope)
+    assert moved.attachments == (Attachment("docs/a.png", "analyze_file", "image"),)
+    assert moved.skipped == ()
+
+
+def test_project_name_search_walks_verified_fds_without_following_links(tmp_path, monkeypatch):
+    base = Path(os.path.realpath(tmp_path))
+    root, outside = _project(base)
+    deep = root / "fw" / "drivers" / "uart"
+    deep.mkdir(parents=True)
+    (deep / "uart_timeout.png").write_bytes(b"\x89PNG")
+    (deep / "Uart.c").write_text("int uart;\n", encoding="utf-8")
+    (root / "fw" / "UART-notes.txt").write_text("notes", encoding="utf-8")
+    (root / "fw" / "my_uart.log").write_text("log", encoding="utf-8")
+    (root / "fw" / ".uart_dot.txt").write_text("dot", encoding="utf-8")
+    (root / ".hidden").mkdir()
+    (root / ".hidden" / ".uart_in_hidden.txt").write_text("hidden", encoding="utf-8")
+    (outside / "uart_outside.txt").write_text("outside", encoding="utf-8")
+    (root / "linkdir").symlink_to(outside)
+    (root / "fw" / "uart_link.png").symlink_to(deep / "uart_timeout.png")
+    os.mkfifo(root / "fw" / "uart.fifo")
+
+    # 巢狀命中:前綴相符優先 → 深度 → 長度;隱藏、symlink、特殊檔、專案外都不列。
+    found = client_attachments.completions("@uart", 5, root)
+    assert found is not None and (found.start, found.end) == (0, 5)
+    assert found.items == (
+        ("@fw/UART-notes.txt", "read_file · 文字"),
+        ("@fw/drivers/uart/Uart.c", "read_file · 文字"),
+        ("@fw/drivers/uart/uart_timeout.png", "analyze_file · 圖片"),
+        ("@fw/my_uart.log", "read_file · 文字"),
+    )
+    for inserted, expected in zip((item for item, _ in found.items),
+                                  ("fw/UART-notes.txt", "fw/drivers/uart/Uart.c",
+                                   "fw/drivers/uart/uart_timeout.png", "fw/my_uart.log")):
+        resolution = client_attachments.resolve("看 " + inserted + " 這是什麼", root)
+        assert [item.path for item in resolution.attachments] == [expected], inserted
+    # 一個字不搜;只命中目錄時清單與加入搜尋之前相同;limit 照舊。
+    assert client_attachments.completions("@u", 2, root) is None
+    doc = client_attachments.completions("@doc", 4, root)
+    assert doc is not None and doc.items == (("@docs/", "目錄"),)
+    limited = client_attachments.completions("@uart", 5, root, limit=2)
+    assert limited is not None and [item for item, _ in limited.items] == [
+        "@fw/UART-notes.txt", "@fw/drivers/uart/Uart.c",
+    ]
+    # 查詢字以 . 開頭才列隱藏檔;隱藏目錄一律不進去。
+    dotted = client_attachments.completions("@.uart", 6, root)
+    assert dotted is not None and dotted.items == (("@fw/.uart_dot.txt", "read_file · 文字"),)
+    # 深度與掃描量有上限。
+    monkeypatch.setattr(client_attachments, "MAX_SEARCH_DEPTH", 1)
+    shallow = client_attachments.completions("@uart", 5, root)
+    monkeypatch.setattr(client_attachments, "MAX_SEARCH_DEPTH", 12)
+    assert shallow is not None and [item for item, _ in shallow.items] == ["@fw/UART-notes.txt", "@fw/my_uart.log"]
+    real_scandir = os.scandir
+    scans: list[object] = []
+
+    def counting_scandir(target):
+        scans.append(target)
+        return real_scandir(target)
+
+    monkeypatch.setattr(client_attachments, "MAX_SEARCH_SCAN", 1)
+    monkeypatch.setattr(os, "scandir", counting_scandir)
+    assert client_attachments.completions("@uart", 5, root) is None
+    monkeypatch.undo()
+    assert len(scans) == 2, scans  # root 一層清單 + 搜尋掃到第一個目錄項就停
+    assert all(isinstance(target, int) for target in scans)
+
+    # 走訪中把已排進佇列的子目錄換成指向專案外的 symlink:逐層 nofollow 重開時就停在那一層,
+    # 不會列出專案外的名稱。
+    swapped: list[str] = []
+
+    class _Listed:
+        def __init__(self, entries):
+            self._entries = entries
+
+        def __enter__(self):
+            return iter(self._entries)
+
+        def __exit__(self, *_exc):
+            return False
+
+    def swapping_scandir(target):
+        if (isinstance(target, int) and not swapped
+                and os.readlink(f"/proc/self/fd/{target}") == str(root / "fw")):
+            with real_scandir(target) as iterator:
+                entries = list(iterator)
+            os.rename(root / "fw" / "drivers", root / "fw" / "drivers.real")
+            os.symlink(outside, root / "fw" / "drivers")
+            swapped.append("fw")
+            return _Listed(entries)
+        return real_scandir(target)
+
+    monkeypatch.setattr(os, "scandir", swapping_scandir)
+    after = client_attachments.completions("@uart", 5, root)
+    monkeypatch.undo()
+    assert swapped == ["fw"]
+    assert after is not None and [item for item, _ in after.items] == ["@fw/UART-notes.txt", "@fw/my_uart.log"]
+    assert all("outside" not in item for item, _ in after.items)
+
+
+def test_external_completion_lists_only_import_roots_newest_first(tmp_path, monkeypatch):
+    base = Path(os.path.realpath(tmp_path))
+    root, outside = _project(base)
+    home = base / "home"
+    downloads = home / "Downloads"
+    downloads.mkdir(parents=True)
+    shots_real = base / "shots-real"
+    shots_real.mkdir()
+    (shots_real / "boot.log").write_text("boot", encoding="utf-8")
+    (home / "shots").symlink_to(shots_real)  # 來源根本身是 symlink:與 server 的 resolve 同義
+    now = 1_800_000_000.0
+    monkeypatch.setattr(client_attachments, "_now", lambda: now)
+    screenshot = "螢幕擷取畫面 2026-09-30 101500.png"
+    for name, data, age in (
+        (screenshot, b"\x89PNG", 120), ("report.pdf", b"%PDF", 2 * 3600),
+        ("old.log", b"old", 3 * 86400), ("code.c", b"int x;", 0), (".secret.png", b"\x89PNG", 0),
+    ):
+        (downloads / name).write_bytes(data)
+        os.utime(downloads / name, (now - age, now - age))
+    (downloads / "sub").mkdir()
+    os.utime(downloads / "sub", (now - 86400, now - 86400))
+    (downloads / "link.png").symlink_to(downloads / "report.pdf")
+    (downloads / "linkdir").symlink_to(outside)
+    os.mkfifo(downloads / "pipe.png")
+    missing_root = base / "drop-missing"
+    scope = _external_scope(home, ["~/Downloads", "~/shots", str(missing_root)])
+
+    # 還沒進入來源根:只列根本身(純字串,零 FS),寫法跟著使用者打的 ~ 或 /。
+    with monkeypatch.context() as guard:
+        _forbid_filesystem(guard)
+        roots_tilde = client_attachments.completions("@~/D", 4, root, external=scope)
+        roots_all = client_attachments.completions("@~/", 3, root, external=scope)
+        roots_abs = client_attachments.completions("@/", 2, root, external=scope)
+        # 沒有範圍、外部匯入關閉、沒有 home、含 ..:None,零 FS。
+        off = _external_scope(home, ["~/Downloads"], enabled=False)
+        no_home = _external_scope(None, ["~/Downloads"])
+        for text in ("@~/Downloads/", "@/tmp/", "@~/"):
+            assert client_attachments.completions(text, len(text), root) is None, text
+            assert client_attachments.completions(text, len(text), root, external=off) is None, text
+        assert client_attachments.completions("@~/Downloads/", 13, root, external=no_home) is None
+        assert client_attachments.completions("@~/Downloads/../", 16, root, external=scope) is None
+    assert roots_tilde is not None and (roots_tilde.start, roots_tilde.end) == (0, 4)
+    assert roots_tilde.items == (("@~/Downloads/", "外部匯入來源"),)
+    assert roots_all is not None and [item for item, _ in roots_all.items] == ["@~/Downloads/", "@~/shots/"]
+    assert roots_abs is not None and [item for item, _ in roots_abs.items] == [
+        f"@{home}/Downloads/", f"@{home}/shots/", f"@{missing_root}/",
+    ]
+
+    # 根內:只列目錄與可匯入的檔,新到舊;symlink、隱藏、特殊檔、不支援的副檔名都不列。
+    text = "@~/Downloads/"
+    listed = client_attachments.completions(text, len(text), root, external=scope)
+    assert listed is not None and (listed.start, listed.end) == (0, len(text))
+    assert listed.items == (
+        (f'@"~/Downloads/{screenshot}"', "匯入後 analyze_file · 圖片 · 2 分鐘前"),
+        ("@~/Downloads/report.pdf", "匯入後 analyze_file · PDF · 2 小時前"),
+        ("@~/Downloads/sub/", "目錄"),
+        ("@~/Downloads/old.log", "匯入後 read_file · 文字 · 3 天前"),
+    )
+    narrowed = client_attachments.completions("@~/Downloads/re", 15, root, external=scope)
+    assert narrowed is not None and narrowed.items == (
+        ("@~/Downloads/report.pdf", "匯入後 analyze_file · PDF · 2 小時前"),
+    )
+    typed = f"@{home}/Downloads/o"
+    absolute = client_attachments.completions(typed, len(typed), root, external=scope)
+    assert absolute is not None and [item for item, _ in absolute.items] == [f"@{home}/Downloads/old.log"]
+    # 插入的文字解析回同一個專案外附件。
+    chosen = listed.items[0][0]
+    resolution = client_attachments.resolve("看 " + chosen + " 說什麼", root, external=scope)
+    assert resolution.attachments == (
+        Attachment(f"{home}/Downloads/{screenshot}", "import_external_file", "image", f"~/Downloads/{screenshot}"),
+    )
+    # 來源根是 symlink:列解析後的目錄內容,插入文字仍用使用者的寫法。
+    shots = client_attachments.completions("@~/shots/", 9, root, external=scope)
+    assert shots is not None and [item for item, _ in shots.items] == ["@~/shots/boot.log"]
+    # 根內的 symlink 目錄:逐層 nofollow 開不進去。
+    linked = "@~/Downloads/linkdir/"
+    assert client_attachments.completions(linked, len(linked), root, external=scope) is None
+
+
+def test_pasted_paths_become_mentions_without_filesystem_access(monkeypatch):
+    root, home = "/work/fw", "/home/tester"
+    scope = client_attachments.external_scope(
+        enabled=True, roots=["~/Downloads"], home=home, max_bytes=0,
+        extensions=config.EXTERNAL_IMPORT_ALLOWED_EXTENSIONS,
+    )
+    with monkeypatch.context() as guard:
+        _forbid_filesystem(guard)
+
+        def convert(pasted, before=""):
+            return client_attachments.paste_mentions(pasted, before=before, root=root, home=home)
+
+        # 終端機拖放的各種形狀:單引號(VTE)、反斜線跳脫(iTerm2)、file://、多檔、
+        # 不加引號含空白(Alacritty)、Windows 路徑。專案內寫成相對、home 內寫成 ~/。
+        for pasted, expected in {
+            "'/home/tester/Downloads/shot 1.png' ": '@"~/Downloads/shot 1.png" ',
+            "/tmp/a\\ b.log ": '@"/tmp/a b.log" ',
+            "file:///tmp/%E6%88%AA%E5%9C%96.png\r\n": "@/tmp/截圖.png ",
+            "file://localhost/tmp/x.pdf": "@/tmp/x.pdf ",
+            "'/tmp/a.png' '/tmp/b c.pdf'": '@/tmp/a.png @"/tmp/b c.pdf" ',
+            "/work/fw/docs/a.png": "@docs/a.png ",
+            "/home/tester/Downloads/Screenshot from 2026.png": '@"~/Downloads/Screenshot from 2026.png" ',
+            "/work/fw/../etc/x.png": "@/work/fw/../etc/x.png ",
+            "~/Downloads/x.png": "@~/Downloads/x.png ",
+            '"C:\\Users\\me\\a b.png"': '@"C:\\Users\\me\\a b.png" ',
+            "C:\\x.png D:/y.pdf": '@"C:\\x.png" @"D:/y.pdf" ',
+        }.items():
+            assert convert(pasted) == expected, pasted
+        # 混有其他文字、超過 5 段、含引號／反引號／控制字元、超長、空白、別台主機的 file://、
+        # 解不開的百分比編碼、相對路徑、引號沒關:原樣貼上。
+        for pasted in (
+            "看這張 /tmp/a.png", "/tmp is full, what now?", "/var/log/syslog has errors",
+            " ".join(f"/tmp/{index}.png" for index in range(6)),
+            "'/tmp/a\"b.png'", "/tmp/a`b.png", "/tmp/a\x07.png", "/" + "a" * 5000,
+            "", "   \n ", "file://otherhost/tmp/x.png", "file:///tmp/%FF.png", "docs/a.png",
+            "'/tmp/unterminated",
+        ):
+            assert convert(pasted) is None, pasted
+        # 插入點前一字元:@ → 不再加 @;" → 不改寫;英數 → 先補空白;中文與空白 → 不補。
+        assert convert("/tmp/a.png", before="@") == "/tmp/a.png "
+        assert convert("'/tmp/b c.png'", before="@") == '"/tmp/b c.png" '
+        assert convert("/tmp/a.png", before='"') is None
+        assert convert("/tmp/a.png", before="x") == " @/tmp/a.png "
+        assert convert("/tmp/a.png", before="看") == "@/tmp/a.png "
+        assert convert("/tmp/a.png", before=" ") == "@/tmp/a.png "
+        # 改寫結果解析回同一批路徑;Windows 路徑在字串層就說明原因。
+        text = "看 " + convert("'/tmp/a.png' '/tmp/b c.pdf' /work/fw/docs/x.txt")
+        assert [m.path for m in client_attachments.find_mentions(text)] == [
+            "/tmp/a.png", "/tmp/b c.pdf", "docs/x.txt",
+        ]
+        windows = client_attachments.resolve(convert('"C:\\Users\\me\\a b.png"'), root, external=scope)
+    assert windows.attachments == ()
+    assert [item.reason for item in windows.skipped] == [client_attachments._WINDOWS]
+
+
+def test_a_malformed_file_uri_paste_is_left_verbatim():
+    """`file://[bad/…` 讓 urlsplit 丟 ValueError;改寫必須回 None(原樣貼上),不得把例外丟給
+    輸入框 —— 那會讓整個 TUI 以 exit 1 退出、草稿遺失(審核 R1-2)。純字串、零 FS。"""
+    for text in (
+        "file://[bad/tmp/x.png",
+        "'file://[bad/x.png' '/tmp/y.png'",
+        "file://[::1/tmp/x.png",
+    ):
+        assert client_attachments.paste_mentions(text) is None, text
 
 
 # ============================================================

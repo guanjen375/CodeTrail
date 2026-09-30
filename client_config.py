@@ -56,6 +56,10 @@ H_LANG_VALUES = ("c", "cpp")
 DEFAULT_THEME = "default"
 THEME_VALUES = ("default", "codex")
 
+#: TUI `/import on` 開啟外部匯入、而檔案裡還沒有任何來源根時補上的預設
+#: （與 external_import._default_import_roots 的清單相同）。
+DEFAULT_EXTERNAL_IMPORT_ROOTS: tuple[str, ...] = ("~/Downloads", "/tmp")
+
 
 class ClientConfigError(RuntimeError):
     """client.json 的位置、權限或內容不合契約。"""
@@ -429,6 +433,37 @@ def update_theme(
         return settings, False
     # 保存時舊鍵不會寫出:回傳值要與落檔後的內容一致。
     changed = replace(settings, present=True, theme=name, obsolete_keys=())
+    try:
+        save_client_settings(changed, env)
+    except OSError as exc:
+        raise ClientConfigError(f"無法儲存 {settings.path}: {exc}") from exc
+    return changed, True
+
+
+def update_external_import(
+    enabled: bool, env: Mapping[str, str] | None = None,
+) -> tuple[ClientSettings, bool]:
+    """TUI `/import on|off`：重讀目前設定後只改 external_import，成功落檔才回傳新設定。
+
+    同 :func:`update_theme`：不採用啟動時的快照（其他寫入者可能已經改過 client.json）。
+    開啟而檔裡沒有任何來源根時補上 :data:`DEFAULT_EXTERNAL_IMPORT_ROOTS`（開了卻沒有根
+    會被 _validate 拒絕）；其餘來源根原樣保留。值相同（含沒有設定檔時關閉）零寫入。
+    **不套回 runtime**：客戶端的附件範圍與 MCP 的匯入授權都是啟動時的快照
+    （MCP 經 argv 拿到），重開 aicode 後才生效。
+    """
+    if type(enabled) is not bool:
+        raise ClientConfigError(f"external_import 必須是 true 或 false,得到 {enabled!r}")
+    settings = load_client_settings(env)
+    roots = list(settings.external_import_roots)
+    if enabled and not roots:
+        roots = list(DEFAULT_EXTERNAL_IMPORT_ROOTS)
+    if settings.external_import == enabled and roots == list(settings.external_import_roots):
+        return settings, False
+    # 保存時舊鍵不會寫出:回傳值要與落檔後的內容一致。
+    changed = replace(
+        settings, present=True, external_import=enabled,
+        external_import_roots=roots, obsolete_keys=(),
+    )
     try:
         save_client_settings(changed, env)
     except OSError as exc:

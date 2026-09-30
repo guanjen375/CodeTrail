@@ -435,7 +435,7 @@ def test_theme_switch_leaves_engine_session_and_live_blocks_intact(private_home)
             await _settle(pilot)
             assert block.title == classic
             assert (title.collapsed_symbol, title.expanded_symbol) == ("▶", "▼")
-            assert prompt.placeholder == ""
+            assert prompt.placeholder == client_theme.THEMES["default"].placeholder
             after = (
                 engine.session_id, list(engine.messages), list(engine.sent), list(engine.primes),
                 engine.store.created, app.coordinator.busy,

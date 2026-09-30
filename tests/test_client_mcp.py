@@ -602,6 +602,45 @@ def test_client_config_and_skip_aux_preflight_reach_the_server_argv(tmp_path):
     assert "--client-config" not in plain and "--skip-aux-preflight" not in plain
 
 
+@pytest.mark.smoke
+def test_external_import_roots_travel_as_argv_and_survive_a_respawn(tmp_path, monkeypatch):
+    """外部匯入的來源根是**客戶端啟動時**的快照,一個根一個 `--external-import-root`。
+
+    server 只認 argv(不再採用自己讀到的 client.json);取消逾時後的重建必須沿用同一份
+    argv —— 否則使用者用 /import 改過 client.json、說好重開 aicode 才生效,重建出來的
+    server 卻先一步開或關。readonly 一律不帶。
+    """
+    roots = ("~/Downloads", "/tmp")
+    client = client_mcp.McpClient(
+        tmp_path, build_commands=True, client_config=tmp_path / "c.json",
+        external_import_roots=roots,
+    )
+    argv = list(client._argv)  # noqa: SLF001
+    flagged = [argv[index + 1] for index, item in enumerate(argv) if item == "--external-import-root"]
+    assert flagged == list(roots)
+    assert (argv.index("--enable-build-commands") < argv.index("--external-import-root")
+            < argv.index("--client-config"))
+    assert client.external_import_roots == roots
+    readonly = client_mcp.McpClient(tmp_path, readonly=True, external_import_roots=roots)
+    assert "--external-import-root" not in readonly._argv  # noqa: SLF001
+    assert readonly._argv[-1] == "--readonly"  # noqa: SLF001
+    assert readonly.external_import_roots == ()
+    assert "--external-import-root" not in client_mcp.McpClient(tmp_path)._argv  # noqa: SLF001
+
+    spawned: list[list[str]] = []
+
+    def fake_popen(command, **_kwargs):
+        spawned.append(list(command))
+        raise OSError("tests never spawn a real server here")
+
+    monkeypatch.setattr(client_mcp.process_env, "popen", fake_popen)
+    client._proc = _ReviewStartupProc()  # noqa: SLF001
+    client._startup_complete = True  # noqa: SLF001
+    client._escalate("cancellation grace expired")  # noqa: SLF001
+    assert spawned == [argv], "取消逾時的重建必須沿用建構時的同一份 argv"
+    client.close()
+
+
 # ── 總審第 12 輪:spawn 只有一個出口 ──
 
 

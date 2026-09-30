@@ -31,9 +31,9 @@ live `tools/list` 的順序是公開契約：`list_dir`、`read_file`、`grep_co
 | 讀一個已知檔案 | 請用工具 `file_info` 看 `src/main.py` 大小，再用工具 `read_file` 讀前 120 行。 | `file_info(...)`、`read_file(...)` |
 | 查已匯入的 spec | 請用工具 `query_knowledge` 查 reset timing 限制，回答要附 REF。 | `query_knowledge(...)` |
 | 查不能答錯的規格數字 | 請用工具 `query_knowledge_strict` 查 reset assert 最小時間，證據不夠就拒答。 | `query_knowledge_strict(...)` |
-| 看專案外的截圖/PDF/log | 請先用工具 `import_external_file` 匯入 `~/Downloads/error.png`，再分析回傳的新路徑。 | `import_external_file(...)` |
+| 看專案外的截圖/PDF/log | 先 `/import on` 並重開 `aicode`，再在訊息裡寫 `@~/Downloads/error.png 這是什麼錯誤？`；核准匯入後客戶端自動分析 `.aicode_uploads/` 裡的副本，詳見[檔案在專案目錄外](usage.md#external-attachments)。也可以請先用工具 `import_external_file` 匯入 `~/Downloads/error.png`，再分析回傳的新路徑。 | `import_external_file(...)`、`analyze_file(...)` |
 | 看圖片、PDF、ELF、firmware | 請用工具 `analyze_file` 分析 `.aicode_uploads/error.png`（或 `docs/spec.pdf`），做通用 VL 圖片分析、PDF 一次性抽文字或 binary 分析。 | `analyze_file(...)` |
-| 夾帶專案內的檔案 | 在訊息裡寫 `@shots/error.png 這是什麼錯誤？`（路徑含空白用 `@"路徑"`）；送出前客戶端自動呼叫 `analyze_file`（圖片、PDF、ELF、binary）或 `read_file`（其他檔案），結果以工具卡顯示，詳見[夾帶附件](usage.md#attachments)。 | `analyze_file(...)`、`read_file(...)` |
+| 夾帶專案內的檔案 | 在訊息裡寫 `@shots/error.png 這是什麼錯誤？`（路徑含空白用 `@"路徑"`；`@` 後面打檔名可搜尋整個專案，拖放或貼上路徑也會自動改寫）；送出前客戶端自動呼叫 `analyze_file`（圖片、PDF、ELF、binary）或 `read_file`（其他檔案），結果以工具卡顯示，詳見[夾帶附件](usage.md#attachments)。 | `analyze_file(...)`、`read_file(...)` |
 | 深入看一個 ELF | 請用工具 `analyze_file` 分析 `build/app.elf`，`view` 設 "symbols"、`target` 設 "uart"（或 `view` 設 "disasm"、`target` 設 "Reset_Handler"；`view` 設 "dwarf"、`target` 設 "0x08001234"）。 | `analyze_file(path, view="symbols", target="uart")` |
 | 把文件/圖片/binary 加進 KB | 請用工具 `ingest_document` 匯入 `docs/spec.pdf`（或 `arch.png`、`firmware.bin`）。之後查詢會自動載入；想立即確認 chunk 數再補 `reload_knowledge_base`。 | `ingest_document(...)`、`reload_knowledge_base()` |
 | 圖很多的 PDF，先估成本 | 請用工具 `ingest_document` 對 `docs/datasheet.pdf` 設 `preflight_only=True`，回報候選數、VL 呼叫次數與是否超過上限。 | `ingest_document(path, preflight_only=True)` |

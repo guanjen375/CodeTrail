@@ -703,8 +703,12 @@ class TurnCoordinator:
                 extra["on_user_recorded"] = lambda: self._queue_user_recorded(message_id)
             # @ 附件在送達這一刻、在 worker 執行緒解析(佇列項目也是送達時才解析)。
             # 只有真的有附件才帶 kwarg:沒有附件時 send() 的呼叫形狀與以前完全相同。
-            root = getattr(getattr(self.engine, "options", None), "root", None)
-            resolution = client_attachments.resolve(text, root)
+            # 專案外範圍(啟動時的快照)同樣取自 engine;替身沒有它就不傳 external=。
+            options = getattr(self.engine, "options", None)
+            root = getattr(options, "root", None)
+            scope = getattr(options, "attachment_scope", None)
+            scope_kwargs = {"external": scope} if scope is not None else {}
+            resolution = client_attachments.resolve(text, root, **scope_kwargs)
             skipped = client_attachments.skipped_notice(resolution)
             if skipped:
                 self._publish(client_events.notice_event(target, skipped))

@@ -684,6 +684,8 @@ class EngineOptions:
     cancellable_requests: bool = False
     thinking: bool = False
     thinking_kwarg: str | None = None
+    #: 專案外 @ 附件的範圍(啟動時由 apply_to_config 之後的設定產生;None = 只收專案內)。
+    attachment_scope: client_attachments.ExternalScope | None = None
 
 
 @dataclass
@@ -700,12 +702,13 @@ class ApprovalRequest:
             text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
             lines.append(f"  {key} = {text}")
         if self.tool == "import_external_file":
-            # 落點是工具之後才算的;只顯示 source_path 的核准等於核准一個不知道會
-            # 寫到哪的動作。這裡用**同一套**檔名安全化算出目的路徑;同名時工具會
-            # 加 `_N` 尾碼,所以也講明。
+            # 落點是工具之後才算的;只顯示來源的核准等於核准一個不知道會寫到哪的
+            # 動作。這裡用**同一套**檔名安全化算出目的路徑;同名時工具會加 `_N`
+            # 尾碼,所以也講明。來源參數是 server 真正收的 `path`(以前讀不存在的
+            # `source_path`,落點永遠被算成 `.aicode_uploads/upload`)。
             import external_import
 
-            source = str(self.arguments.get("source_path") or "")
+            source = str(self.arguments.get("path") or "")
             explicit = self.arguments.get("dest_name")
             explicit = explicit if isinstance(explicit, str) and explicit.strip() else None
             try:
@@ -2402,39 +2405,81 @@ class Engine:
         MCP 錯誤,全部與模型自己呼叫時相同。順序永遠是 user → assistant(tool_calls) →
         tool…,之後才是模型步驟;中途中斷先 heal 懸空呼叫再往外丟,不發任何模型請求。
         附件不計入 ``TurnResult.tool_calls``、步數或收斂觀察。
+
+        專案外附件分兩段:第 1 組照使用者順序宣告全部附件(專案外的是
+        ``import_external_file``,核准框逐次確認);匯入真的完成、而且結果裡取得到落點的,
+        才再記**第 2 則** assistant tool_calls 讀 ``.aicode_uploads/`` 裡的那一份。落點要等
+        server 寫完才知道(同名加 ``_N``),所以不能在第 1 組就宣告。拒絕、錯誤、取不到
+        落點都不追加 —— 模型仍看得到匯入結果。
         """
-        calls = client_attachments.tool_calls(attachments)
+        import external_import
+
         try:
-            with self._turn_state:
-                if self._cancel.is_set():
-                    raise TurnCancelled("這一輪已被使用者中斷")
-            self._record(
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [call["wire"] for call in calls],
-                    "attachment": True,
-                }
+            outcomes = self._run_attachment_group(
+                attachments, on_event=on_event, approve=approve, denied_counts=denied_counts,
             )
-            specs = self.tool_specs
-            for call in calls:
-                if self._cancel.is_set():
-                    raise TurnCancelled("這一輪已被使用者中斷")
-                outcome = self._run_one_tool(
-                    call, specs=specs, approve=approve, denied_counts=denied_counts,
-                )
-                on_event(
-                    client_events.tool_event(
-                        self.session_id,
-                        tool=call["name"],
-                        call_id=call["id"],
-                        status=outcome["status"],
-                        arguments=call["arguments"],
-                    )
+            follow_ups: list[client_attachments.Attachment] = []
+            for attachment, outcome in zip(attachments, outcomes):
+                if (
+                    not attachment.external
+                    or outcome["status"] != client_events.STATUS_COMPLETED
+                    or not outcome.get("dispatched")
+                ):
+                    continue
+                landed = external_import.imported_path(outcome["text"])
+                if landed is not None:
+                    follow_ups.append(client_attachments.follow_up(attachment, landed))
+            if follow_ups:
+                self._run_attachment_group(
+                    follow_ups, on_event=on_event, approve=approve, denied_counts=denied_counts,
                 )
         except BaseException:
             self.heal_pending_tool_calls()
             raise
+
+    def _run_attachment_group(
+        self,
+        attachments: Sequence[client_attachments.Attachment],
+        *,
+        on_event: Callable[[dict[str, Any]], None],
+        approve: Callable[[ApprovalRequest], bool] | None,
+        denied_counts: dict[str, int],
+    ) -> list[dict[str, Any]]:
+        """記一則宣告這組附件的 assistant tool_calls,再逐一執行;回傳每個呼叫的結果。
+
+        例外(含取消)直接往外丟,由 ``_run_attachments`` 統一 heal。
+        """
+        calls = client_attachments.tool_calls(attachments)
+        with self._turn_state:
+            if self._cancel.is_set():
+                raise TurnCancelled("這一輪已被使用者中斷")
+        self._record(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [call["wire"] for call in calls],
+                "attachment": True,
+            }
+        )
+        specs = self.tool_specs
+        outcomes: list[dict[str, Any]] = []
+        for call in calls:
+            if self._cancel.is_set():
+                raise TurnCancelled("這一輪已被使用者中斷")
+            outcome = self._run_one_tool(
+                call, specs=specs, approve=approve, denied_counts=denied_counts,
+            )
+            on_event(
+                client_events.tool_event(
+                    self.session_id,
+                    tool=call["name"],
+                    call_id=call["id"],
+                    status=outcome["status"],
+                    arguments=call["arguments"],
+                )
+            )
+            outcomes.append(outcome)
+        return outcomes
 
     def _run_one_tool(
         self,

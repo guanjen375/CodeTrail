@@ -221,19 +221,38 @@
   無選取不清空剪貼簿，OSC52 不冒稱貼上成功。沒有手動複製鍵（`/copykey`、F2 與
   `copy_key` 已移除）；閒置主畫面 Ctrl-C 有選取才複製，回合／核准／審查中 Ctrl-C 仍中斷
   整輪，複製不等於核准。
-- TUI 的 `@` 附件——只附加專案 root 內的普通檔：字串層先拒 `~`、`..`、專案外路徑（零 FS），
-  其餘自 `/` 逐層 `O_NOFOLLOW`、葉節點 `stat(dir_fd, follow_symlinks=False)`，任一層或葉節點
-  是 symlink、目錄或特殊檔都不附加；單則最多檢查 16 個 `@`、附加 5 個。圖片／PDF／ELF／binary
-  走 `analyze_file`，其他走 `read_file`（`client_attachments.ANALYZE_FILE_EXTENSIONS` 與
-  server 的 analyze_file 分流由 smoke 契約釘成一致）。engine 在第一個模型請求前記一則宣告它們的 synthetic
-  assistant tool_calls（`attachment` 標記在 `_INTERNAL_KEYS`，不送模型）再逐一走
-  `_run_one_tool`：同一套 policy／permission 覆寫、核准（本輪與模型迴圈共用拒絕重問上限）、
-  readonly 只認 JSON true、`begin_call` 取消與 heal；中斷不發模型請求、不留答案。附件不計入
-  工具步數與收斂觀察；只有真的有附件才傳 `attachments` kwarg（既有替身與呼叫端形狀不變）。
-  補充訊息（`enqueue`／`edit_queued` 的 supplement）以純字串拒絕 `@路徑`；專案外檔案不自動
-  匯入（沿用 `import_external_file` 的開關＋逐次核准）。補全只在已驗證目錄 fd 上 `scandir`、
-  有界、跳過 symlink；補全與預覽的檔案系統工作在背景 worker，UI 執行緒零 FS、過期結果丟棄，
-  零寫入。headless `run` 用同一套解析，session replay 的客戶端身分含 `client_attachments.py`。
+- TUI 的 `@` 附件——專案內只附加 root 內的普通檔：字串層先拒 `..`、控制字元、`~user`、
+  （有啟動 scope 時）Windows 路徑，以及外部匯入未開啟（或沒有啟動 scope）時的 `~`／專案外路徑
+  （零 FS；沒有 scope 的呼叫端與加入專案外附件前逐字相同）；`~/` 只以啟動 scope 的 HOME 展開，
+  展開後落在 root 內就是專案內路徑。其餘自 `/` 逐層 `O_NOFOLLOW`、葉節點
+  `stat(dir_fd, follow_symlinks=False)`，任一層或葉節點是 symlink、目錄或特殊檔都不附加；單則最多
+  檢查 16 個 `@`、附加 5 個（專案外合計在內）。圖片／PDF／ELF／binary 走 `analyze_file`，其他走
+  `read_file`（`client_attachments.ANALYZE_FILE_EXTENSIONS` 與 server 的 analyze_file 分流由
+  smoke 契約釘成一致）。專案外（`~/…`、絕對路徑）只有在本次執行外部匯入開啟、副檔名在
+  `config.EXTERNAL_IMPORT_ALLOWED_EXTENSIONS`、且 `~` 展開＋normpath 後字面落在 `external_import_roots`
+  內才碰 FS：來源根以 realpath 解析後自 `/` 逐層 `O_NOFOLLOW` 驗到葉節點，只 stat 不讀內容，
+  symlink／目錄／特殊檔／超過匯入上限不附加；實體落在專案 root 內就轉成專案內附件、不發匯入。
+  engine 在第一個模型請求前記一則宣告它們的 synthetic assistant tool_calls（`attachment` 標記在
+  `_INTERNAL_KEYS`，不送模型）再逐一走 `_run_one_tool`：同一套 policy／permission 覆寫、核准
+  （本輪與模型迴圈共用拒絕重問上限）、readonly 只認 JSON true、`begin_call` 取消與 heal。專案外附件
+  在這一組是 synthetic `import_external_file`（`NEVER_AUTO_ALLOWED`，每次核准；核准框以 server 真正的
+  `path` 參數算落點，安全化檔名保留合理副檔名），只有 completed 且 `external_import.imported_path`
+  從唯一一行「已匯入」取到 `.aicode_uploads/` 落點，才記第二則 synthetic tool_calls 以
+  analyze_file／read_file 讀那份副本；拒絕、錯誤、取不到落點一律不追加。每組開始前檢查取消，
+  中斷先 heal、不發模型請求、不留答案。附件不計入工具步數與收斂觀察；只有真的有附件才傳
+  `attachments` kwarg、只有啟動 scope 存在才傳 `external=`（既有替身與呼叫端形狀不變）。
+  補充訊息（`enqueue`／`edit_queued` 的 supplement）以純字串拒絕 `@路徑`。專案外檔案不自動
+  匯入：外部匯入的開關與來源根只由客戶端啟動時的快照經 argv `--external-import-root` 交給 MCP
+  （取消逾時的重建沿用同一份 argv；沒有旗標＝關，readonly 一律關），server 不採用自己讀到的
+  client.json 這兩個鍵；`/import on|off` 只重讀並改寫 owner-only client.json 的 `external_import`
+  （開啟且沒有來源時補 `~/Downloads`、`/tmp`），不改 runtime、不改 scope、不重啟 MCP，重開 aicode
+  才生效，回合／核准／審查中拒絕。補全只在已驗證目錄 fd 上 `scandir`、有界、跳過 symlink：檔名
+  搜尋（token 無 `/`、至少 2 字）從持有的 root fd 逐層 `O_NOFOLLOW` 重開每個子目錄做 BFS，跳過
+  隱藏、symlink 與特殊檔，上限 20000 個目錄項、深度 12；專案外只列來源根內的目錄與可匯入檔，
+  依修改時間新到舊。補全與預覽的檔案系統工作在背景 worker，UI 執行緒零 FS、過期結果丟棄，零寫入。
+  貼上由 `PromptInput._on_paste` 一律 `prevent_default` 後自己插入一次：整段只有路徑（最多 5 段）時
+  以純字串改寫成 `@` 語法，插入點前全空白且第一個 token 是已註冊斜線指令就原樣貼上。
+  headless `run` 用同一套解析，session replay 的客戶端身分含 `client_attachments.py`。
 - `/theme`——只接受 `client_config.THEME_VALUES` 明列的主題，`client_theme.THEMES` 必須與它
   同一份名單（模組載入時 fail-loud）。呼叫時重讀 owner-only client.json，只更新 theme，
   不覆蓋其他剛保存的鍵；保存成功才套用，失敗 UI 與舊主題不變；選單預覽不寫檔，
@@ -241,7 +260,7 @@
   回合、核准、審查中拒絕。啟動時即使 Textual 預設主題與設定同名，也要完整套用主題
   class 與 ANSI filter，不得讀或改環境變數；requirements 允許的 Textual 8 各版都要能啟動
   （8.2.5 前沒有 `Theme(ansi=…)`，主題 class 與 `ansi_color` 由 App 補上）。主題只改呈現：兩主題資訊一致，裝飾符號
-  （ThemeGlyph）不得進入選取與剪貼簿，default 的外觀與選取範圍（含三擊）不變；
+  （ThemeGlyph）不得進入選取與剪貼簿，default 的外觀（輸入框提示字除外）與選取範圍（含三擊）不變；
   Textual 指令面板停用，不得繞過註冊表換成未登記的主題。
 - 啟動核心的設定來源——GPU、llama-server 路徑、tmux session 名、逾時與 rollback 只來自
   `deployment.json`、repo 常數與 argv;`~/start.sh` **不 export 也不 unset**，只接受

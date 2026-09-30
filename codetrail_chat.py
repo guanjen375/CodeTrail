@@ -106,6 +106,22 @@ def _cli_model(raw: str) -> str:
     return resolved.model
 
 
+def _attachment_scope() -> client_attachments.ExternalScope:
+    """專案外 @ 附件的範圍:**唯一產生點**。
+
+    讀的是 apply_to_config 之後的 runtime 值(readonly 已經把外部匯入關掉)與 HOME
+    (只拿來展開 `~`,不是設定來源)。TUI 預覽、協調器、headless 與交給 MCP 的
+    `--external-import-root` 全部從這一份來,重開 aicode 之前不會變。
+    """
+    return client_attachments.external_scope(
+        enabled=bool(config.EXTERNAL_IMPORT_ENABLED),
+        roots=tuple(config.EXTERNAL_IMPORT_ROOTS),
+        home=os.environ.get("HOME"),
+        max_bytes=int(config.EXTERNAL_IMPORT_MAX_BYTES),
+        extensions=config.EXTERNAL_IMPORT_ALLOWED_EXTENSIONS,
+    )
+
+
 def _engine_options(
     root: Path, args: argparse.Namespace, preflight=None
 ) -> client_engine.EngineOptions:
@@ -137,6 +153,7 @@ def _engine_options(
         # 與 `show_reasoning` 是**兩個**鍵:那個只管畫面。
         keep_reasoning=_settings(args).keep_historical_reasoning,
         thinking_kwarg=config.MAIN_THINKING_KWARG,
+        attachment_scope=_attachment_scope(),
     )
 
 
@@ -163,6 +180,7 @@ def _build(
     override = str(getattr(args, "client_config", "") or "").strip()
     # headless 同樣先觀測 live ctx，且只觀測一次，再交同值給 Engine 與 MCP argv。
     options = _engine_options(root, args, preflight)
+    scope = options.attachment_scope
     mcp = client_mcp.shared_client(
         root,
         readonly=readonly,
@@ -172,6 +190,9 @@ def _build(
         # 意圖同樣要交到 MCP(它是獨立行程,外層跳了它照樣會跑)。
         client_config=override or None,
         skip_aux_preflight=bool(getattr(args, "skip_aux_preflight", False)),
+        # 外部匯入的授權是**啟動時的快照**,與附件範圍同一份:MCP 取消逾時後重建時
+        # 會重讀 client.json,若由 server 自己讀,`/import` 改過之後兩邊就不一致。
+        external_import_roots=scope.roots if scope is not None and scope.enabled else (),
     )
     if readonly and not mcp.readonly:
         # shared_client 只在第一次建立時決定 argv。同一個行程若先起過互動 client,
@@ -354,8 +375,11 @@ def command_run(args: argparse.Namespace) -> int:
         if engine.messages and engine.options.policy.name == "interactive":
             _headless_compact(engine, compactor, None, emit, prepare=True)
         # @ 附件與 TUI 同一套解析(session replay 才忠實):只有真的有附件才帶 kwarg,
-        # 沒有附件時 send() 的呼叫形狀與以前完全相同。
-        resolution = client_attachments.resolve(args.prompt, root)
+        # 沒有附件時 send() 的呼叫形狀與以前完全相同。專案外範圍取自 engine 的那一份;
+        # 替身沒有它就不傳 external=(呼叫形狀不變)。
+        scope = getattr(getattr(engine, "options", None), "attachment_scope", None)
+        scope_kwargs = {"external": scope} if scope is not None else {}
+        resolution = client_attachments.resolve(args.prompt, root, **scope_kwargs)
         skipped = client_attachments.skipped_notice(resolution)
         if skipped:
             emit(client_events.notice_event(engine.session_id, skipped))

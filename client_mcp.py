@@ -237,6 +237,7 @@ class McpClient:
         build_commands: bool = False,
         client_config: str | os.PathLike[str] | None = None,
         skip_aux_preflight: bool = False,
+        external_import_roots: Sequence[str] = (),
         env: Mapping[str, str] | None = None,
         cancel_grace: float = CANCEL_GRACE_SECONDS,
         terminate_grace: float = TERMINATE_GRACE_SECONDS,
@@ -252,12 +253,19 @@ class McpClient:
         self.readonly = bool(readonly)
         self.client_config = client_config
         self.skip_aux_preflight = bool(skip_aux_preflight)
+        #: 外部匯入的來源根:**這個 client 建構時**的快照。argv 建構後固定,取消逾時的
+        #: 重建(_escalate → _spawn)沿用同一份 —— server 不會在重建時改讀當下的
+        #: client.json,/import 改的設定要等下次啟動才同時對客戶端與 server 生效。
+        self.external_import_roots = () if self.readonly else tuple(
+            str(root) for root in external_import_roots
+        )
         self._argv = list(argv) if argv else self._server_argv(
             readonly=self.readonly,
             n_ctx=n_ctx,
             build_commands=build_commands,
             client_config=client_config,
             skip_aux_preflight=skip_aux_preflight,
+            external_import_roots=self.external_import_roots,
         )
         self._env_overrides = dict(env or {})
         # `env=` 是**覆寫**通道:呼叫端明確要求的值,套用在剝除之後。被剝掉的那
@@ -455,6 +463,7 @@ class McpClient:
         build_commands: bool,
         client_config: str | os.PathLike[str] | None = None,
         skip_aux_preflight: bool = False,
+        external_import_roots: Sequence[str] = (),
     ) -> list[str]:
         """spawn MCP server 的完整命令。設定經由這裡交接,不經環境。
 
@@ -462,6 +471,8 @@ class McpClient:
         (它是獨立行程,預設讀 HOME 的檔 —— 那一份壞掉時 parent 讀對了、MCP 卻 exit 2)。
         `skip_aux_preflight`:呼叫端已經決定跳過附屬 server 的硬閘時,每個 MCP child
         也要跳過,否則外層跳了、child 照樣失敗。
+        `external_import_roots`:外部匯入的來源根,一個根一個 `--external-import-root`。
+        server 只認這裡交過去的(沒有 = 關),readonly 一律不帶。
         """
         argv = [sys.executable, str(SERVER_SCRIPT), "--root", self.root]
         if readonly:
@@ -470,6 +481,9 @@ class McpClient:
             argv.extend(["--n-ctx", str(int(n_ctx))])
         if build_commands and not readonly:
             argv.append("--enable-build-commands")
+        if not readonly:
+            for root in external_import_roots:
+                argv.extend(["--external-import-root", str(root)])
         if client_config:
             argv.extend(["--client-config", str(Path(client_config))])
         if skip_aux_preflight:

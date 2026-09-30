@@ -2674,14 +2674,180 @@ def test_the_import_approval_shows_where_the_file_will_land():
     """核准框要讓人看得到**目的路徑**,不只是模型丟進來的參數。
 
     實際落點是工具之後才算出來的(`.aicode_uploads/<安全化檔名>`,同名再加
-    `_N`);只顯示 `source_path` 的核准等於核准一個不知道會寫到哪的動作。
+    `_N`);只顯示來源 `path` 的核准等於核准一個不知道會寫到哪的動作。
+    (以前這裡用不存在的 `source_path` 鍵,而「或」的第二個條件被參數回顯那一行滿足,
+    所以落點其實一直被算成 `.aicode_uploads/upload` 也沒被抓到。)
     """
     request = client_engine.ApprovalRequest(
-        "s", "import_external_file", {"source_path": "~/Downloads/my report (v2).pdf"}
+        "s", "import_external_file", {"path": "~/Downloads/my report (v2).pdf"}
     )
     text = request.render()
-    assert ".aicode_uploads/" in text
-    assert "my_report_v2.pdf" in text or "my report (v2).pdf" in text
+    assert "→ 目的: .aicode_uploads/my_report_v2_.pdf" in text, text
+
+
+def _import_result(landed: str, *, source: str = "/home/u/Downloads/shot.png") -> str:
+    """import_external_file 成功時(經 adapter 加上 status 行)的文字。"""
+    return (
+        "status: ok\n=== import_external_file ✓ ===\n"
+        f"來源: {source}\n已匯入: {landed} (9 bytes)\n\n下一步:\n"
+        f"- 圖片 / ELF / firmware: analyze_file('{landed}')"
+    )
+
+
+@pytest.mark.smoke
+def test_external_attachment_imports_with_approval_then_reads_the_landed_copy(
+    engine_factory, monkeypatch
+):
+    """專案外 @ 附件:第 1 組 synthetic import_external_file(逐次核准,核准框算的是真落點),
+    匯入完成才記**第 2 則** synthetic tool_calls 讀 `.aicode_uploads/` 裡那一份 —— 落點由
+    server 寫完才知道(同名加 `_N`),所以只能事後從結果取。拒絕、錯誤、取不到落點都不追加;
+    匯入途中取消先 heal、不發任何模型請求。兩組都帶 attachment 標記,標記不送模型。"""
+    import client_attachments
+
+    source = "/home/u/Downloads/shot.png"
+    external = client_attachments.Attachment(
+        source, "import_external_file", "image", display="~/Downloads/shot.png",
+    )
+    local = client_attachments.Attachment("docs/n.txt", "read_file", "text")
+    seen: list[list[dict]] = []
+
+    def model(**kwargs):
+        seen.append(copy.deepcopy(kwargs["messages"]))
+        return iter([_text_chunk("答案", "stop")])
+
+    monkeypatch.setattr(llama_client, "chat_completions", model)
+    asked: list[client_engine.ApprovalRequest] = []
+
+    def grant(request):
+        asked.append(request)
+        return True
+
+    landed = client_mcp.ToolCallResult(
+        "import_external_file", _import_result(".aicode_uploads/shot_1.png"), None, False,
+    )
+    mcp = FakeMcp(results={"import_external_file": landed})
+    engine = engine_factory(mcp=mcp)
+    events: list[dict] = []
+    result = engine.send(
+        "看 @~/Downloads/shot.png 與 @docs/n.txt", on_event=events.append, approve=grant,
+        attachments=(external, local),
+    )
+    assert mcp.calls == [
+        ("import_external_file", {"path": source}),
+        ("read_file", {"path": "docs/n.txt"}),
+        ("analyze_file", {"path": ".aicode_uploads/shot_1.png"}),
+    ]
+    assert [(request.tool, request.arguments) for request in asked] == [
+        ("import_external_file", {"path": source}),
+    ]
+    assert "→ 目的: .aicode_uploads/shot.png" in asked[0].render()
+    assert [m["role"] for m in engine.messages] == [
+        "user", "assistant", "tool", "tool", "assistant", "tool", "assistant",
+    ]
+    first, second = engine.messages[1], engine.messages[4]
+    assert first["attachment"] is True and second["attachment"] is True
+    assert [call["function"]["name"] for call in first["tool_calls"]] == [
+        "import_external_file", "read_file",
+    ]
+    assert [json.loads(call["function"]["arguments"]) for call in second["tool_calls"]] == [
+        {"path": ".aicode_uploads/shot_1.png"},
+    ]
+    ids = [call["id"] for call in first["tool_calls"]] + [call["id"] for call in second["tool_calls"]]
+    assert len(set(ids)) == 3 and all(call_id.startswith("attach_") for call_id in ids)
+    assert [m["tool_call_id"] for m in engine.messages if m["role"] == "tool"] == ids
+    assert [m["tool_status"] for m in engine.messages if m["role"] == "tool"] == ["completed"] * 3
+    tool_events = [e for e in events if e["type"] == client_events.TYPE_TOOL_USE]
+    assert [client_events.event_part(e)["callID"] for e in tool_events] == ids
+    # 第一個模型請求就帶著兩組與讀取結果;標記只留在 session 檔。
+    assert len(seen) == 1
+    assert [m["role"] for m in seen[0][-6:]] == ["user", "assistant", "tool", "tool", "assistant", "tool"]
+    assert all("attachment" not in message for message in seen[0])
+    assert "analyze_file result" in json.dumps(seen[0], ensure_ascii=False)
+    stored = [record for record in engine.store.read(engine.session_id)
+              if record.get("role") == "assistant" and record.get("tool_calls")]
+    assert [record["attachment"] for record in stored] == [True, True]
+    assert (result.tool_calls, result.steps, result.finish) == (0, 1, client_events.REASON_STOP)
+
+    # 拒絕匯入:沒有第 2 組、MCP 一次都沒被呼叫;這一輪照常回答。
+    refused: list[client_engine.ApprovalRequest] = []
+    mcp = FakeMcp(results={"import_external_file": landed})
+    engine = engine_factory(mcp=mcp)
+    engine.send("看 @~/Downloads/shot.png", on_event=lambda _e: None,
+                approve=lambda request: refused.append(request) or False, attachments=(external,))
+    assert mcp.calls == [] and len(refused) == 1
+    assert [m["role"] for m in engine.messages] == ["user", "assistant", "tool", "assistant"]
+    assert engine.messages[2]["tool_status"] == client_events.STATUS_DENIED
+    # 匯入失敗(開關沒開)與「已在專案內」(沒有「已匯入」那一行):都不追加讀取。
+    for text, is_error in (
+        ("status: error\n錯誤: 外部檔案匯入未啟用。", True),
+        ("status: ok\n檔案已在 AICODE_ROOT 內，不需要匯入。\n可直接使用: docs/shot.png", False),
+    ):
+        mcp = FakeMcp(results={"import_external_file": client_mcp.ToolCallResult(
+            "import_external_file", text, None, is_error,
+        )})
+        engine = engine_factory(mcp=mcp)
+        engine.send("看 @~/Downloads/shot.png", on_event=lambda _e: None, approve=grant,
+                    attachments=(external,))
+        assert [name for name, _ in mcp.calls] == ["import_external_file"], text
+        assert [m["role"] for m in engine.messages] == ["user", "assistant", "tool", "assistant"], text
+
+    # 匯入進行中取消:先 heal 懸空呼叫,不記第 2 組,不發模型請求。
+    class _Pending:
+        def __init__(self):
+            self.event = threading.Event()
+            self.cancelled = False
+
+        def result(self):
+            self.event.wait(5)
+            raise client_mcp.McpCallCancelledError("cancelled")
+
+        def cancel(self, reason=""):
+            self.cancelled = True
+            self.event.set()
+
+    class _BlockingMcp(FakeMcp):
+        def __init__(self):
+            super().__init__()
+            self.pending: list[_Pending] = []
+
+        def begin_call(self, name, arguments=None, **_kwargs):
+            self.calls.append((name, dict(arguments or {})))
+            pending = _Pending()
+            self.pending.append(pending)
+            return pending
+
+    def no_model(**_kwargs):
+        raise AssertionError("匯入被中斷之後不得再發模型請求")
+
+    monkeypatch.setattr(llama_client, "chat_completions", no_model)
+    blocking = _BlockingMcp()
+    engine = engine_factory(mcp=blocking)
+    outcome: dict[str, object] = {}
+
+    def run():
+        try:
+            engine.send("看 @~/Downloads/shot.png", on_event=lambda _e: None, approve=grant,
+                        attachments=(external,))
+        except client_engine.TurnCancelled:
+            outcome["cancelled"] = True
+        except Exception as exc:  # noqa: BLE001
+            outcome["error"] = repr(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    for _ in range(500):
+        if blocking.pending:
+            break
+        threading.Event().wait(0.01)
+    assert blocking.pending, "import call never started"
+    assert engine.cancel() is True
+    worker.join(5)
+    assert outcome == {"cancelled": True}
+    assert blocking.pending[0].cancelled is True and len(blocking.pending) == 1
+    assert [m["role"] for m in engine.messages] == ["user", "assistant", "tool"]
+    assert engine.messages[2]["content"] == client_engine.CANCELLED_TOOL_RESULT
+    assert client_engine.pending_tool_call_ids(engine.messages) == []
+    assert engine.messages[0]["turn_status"] == "cancelled"
 
 
 # ── 總審 F1-8:沒有 server 端 id 的工具呼叫,退回的 id 不得跨回合重複 ──

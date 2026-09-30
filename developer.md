@@ -212,7 +212,7 @@ python3 scripts/launch_servers.py --scope all --dry-run
 | `model_remote_ok` | `false`；local／model-host 的非 loopback 模型流量需明示同意 |
 | `model_endpoints` | client 模式四角色的精確端點授權，由匯入流程建立；不能由上一鍵繞過 |
 | `kb_context_remote_ok` | `false`；Contextual Retrieval 文件窗外送的獨立同意 |
-| `external_import`／`external_import_roots` | `false`／`["~/Downloads","/tmp"]`；每次匯入仍核准 |
+| `external_import`／`external_import_roots` | `false`／`[]`；開啟時來源目錄必填（TUI `/import on` 會補 `["~/Downloads","/tmp"]`），重開生效；每次匯入仍核准，見[使用指南](docs/usage.md#external-attachments) |
 | `build_commands` | `false`；明示開啟 make／cmake／ninja／meson／bazel，意味可能執行專案程式 |
 | `rerank_fallback_policy` | 唯一值 `"error"`；舊 `embedding`／`main_model` 值要移除或改正 |
 | `project_instructions` | `true`；是否讀專案 `AGENTS.md`／`.codetrail/lessons.md` |
@@ -224,10 +224,12 @@ python3 scripts/launch_servers.py --scope all --dry-run
 
 多數設定在啟動時讀取，改完需重開客戶端；`/theme` 是唯一的局部即時更新。
 它呼叫時重讀 client.json，只改 `theme`，不覆蓋其他剛保存的設定。
+`/import on|off` 同樣重讀後只改 `external_import`（開啟而沒有來源目錄時補預設來源），
+但不即時套用：客戶端的附件判定與 MCP 的匯入開關都沿用啟動時的設定，重開 `aicode` 才生效。
 `collect_data` 已移除且不能出現在 client.json；資料飛輪的保存政策見[下文](#data-flywheel)。
 舊版留下的 `copy_key`、`extra_allowed_commands`、`extra_allowed_command_dirs` 已停用：載入時
 只忽略（不驗值、不授權任何命令、不當成未知鍵），`/status` 的啟動診斷會列出提示；
-下一次保存設定（`/theme`、設定精靈或交易還原後的寫入）時自動移除，也可以手動刪除。
+下一次保存設定（`/theme`、`/import`、設定精靈或交易還原後的寫入）時自動移除，也可以手動刪除。
 手動複製鍵已由滑鼠自動複製取代；專案內工具以專案相對路徑直接呼叫，見[下文](#security)。
 <a id="deployment-profiles"></a>
 
@@ -616,7 +618,11 @@ aicode
 從 `$HOME` 或 `/` 啟動會直接被拒絕。兩個刻意而受限的例外是:
 
 - `import_external_file(...)` 在你顯式開啟後,可從指定來源白名單**讀取並複製**單一檔案到
-  `<SANDBOX_ROOT>/.aicode_uploads/`;後續工具仍只處理沙箱內副本。
+  `<SANDBOX_ROOT>/.aicode_uploads/`;後續工具仍只處理沙箱內副本。開關與來源白名單是客戶端
+  啟動時從 `client.json` 取得的快照,以 argv `--external-import-root`(每個來源一次)交給 MCP;
+  取消逾時後重建的 MCP 沿用同一份 argv,readonly 一律關。MCP 不採用自己讀到的 client.json
+  這兩個鍵,所以 `/import` 或手動改檔都要重開 `aicode` 才生效。TUI 的 `@` 專案外附件走同一個
+  工具與同一個核准框。
 - `record_lesson(...)` 經 permission `ask` 核准後,只可寫固定的
   `~/.config/codetrail/lessons.json`,不能由模型指定其他外部路徑。
 
@@ -784,7 +790,8 @@ call site、doctor / preflight 與 secret redaction，不能只手動在單一 s
   routing 診斷警告，explicit failure 則會拒絕啟動。
 - 不信任 repo 時在 `client.json` 設 `"project_instructions": false`。
 - 要更嚴的權限時,用 `~/.config/codetrail/client.json` 的 `permission`(只能收緊)。
-- 需要外部附件才在 `client.json` 打開 `"external_import": true`(每次匯入仍要人工核准)。
+- 需要外部附件才用 `/import on`(或在 `client.json` 設 `external_import` 與 `external_import_roots`)
+  並重開 `aicode`;每次匯入仍要人工核准。
 - remote endpoint 只在明確接受資料外送時設定對應 opt-in。
 - commit 前跑 `git status` / `git diff`,確認沒有知識庫、上傳附件、jsonl 或 session 快取。
 
@@ -802,21 +809,37 @@ Esc／Ctrl+C／Ctrl+D 還原；回合、核准、審查中拒絕。主題只改�
 
 ### `@` 附件
 
-客戶端只判定訊息裡哪些 `@` 是附件，讀內容的是 MCP 的 `analyze_file`／`read_file`，server 的
-sandbox 仍會重驗路徑。判定分兩段：字串層先拒 `~`、`..` 與專案外路徑（不做任何 stat）；
+客戶端只判定訊息裡哪些 `@` 是附件，讀內容的是 MCP 的 `analyze_file`／`read_file`（專案外則先
+`import_external_file`），server 的 sandbox 與匯入檢查仍會重驗。判定分兩段：字串層先拒 `..`、
+控制字元、Windows 路徑與 `~user`，外部匯入未開啟時連 `~` 與專案外路徑也在這裡拒絕（不做任何 stat）；
+`~/` 以啟動時的 HOME 展開，展開後落在專案 root 內就當專案內路徑。
 檔案系統層從 `/` 沿專案 root 與父目錄逐層 `O_NOFOLLOW` 開啟，葉節點以
 `stat(dir_fd, follow_symlinks=False)` 判斷，任何一層或葉節點是 symlink、目錄或特殊檔都不附加。
 缺 dir-fd／nofollow 能力時附件整個停用。單則最多檢查 16 個 `@`、附加 5 個；程式碼區塊與
 行內程式碼裡的 `@` 不算。路由只看字面副檔名（symlink 不附加，字面路徑就是實體檔）：圖片、PDF、ELF 與
-firmware binary 走 `analyze_file`，其他走 `read_file`。補全只在已驗證的目錄 fd 上 `scandir`，
-有界、跳過 symlink；補全、附件預覽這些檔案系統工作在背景 worker 執行，不在 UI 執行緒，
-結果過期就丟棄。補充訊息的防呆是純字串判斷。
+firmware binary 走 `analyze_file`，其他走 `read_file`。
+
+專案外路徑只有在本次執行的外部匯入開啟、副檔名在匯入白名單、而且字面（`~` 展開＋正規化後）
+落在 `external_import_roots` 內時才碰檔案系統：來源根以 realpath 解析後逐層 `O_NOFOLLOW` 驗到葉節點，
+只 stat、不讀內容，symlink、目錄、特殊檔與超過匯入上限（100 MB）都不附加；實體落在專案內就改成
+專案內附件。送出時 engine 先以 synthetic `import_external_file` 逐次核准匯入（核准框以 server 真正的
+`path` 參數算出落點），只有成功而且能從結果唯一一行「已匯入」取到 `.aicode_uploads/` 落點，才記第二則
+synthetic tool_calls 讀那份副本；拒絕、錯誤或取不到落點都不追加。開關與來源根是啟動快照（見
+[沙箱真正保護什麼](#security)），`/import on|off` 只改 client.json，重開後才生效。
+
+補全只在已驗證的目錄 fd 上 `scandir`，有界、跳過 symlink：`@` 後面沒有 `/` 的兩字以上查詢另做
+檔名搜尋，從持有的 root fd 逐層 `O_NOFOLLOW` 重開每個子目錄做 BFS，跳過隱藏與特殊檔，上限 20000 個
+目錄項、深度 12；專案外只列來源根內的目錄與可匯入檔，依修改時間新到舊。補全、附件預覽這些檔案系統
+工作在背景 worker 執行，不在 UI 執行緒，結果過期就丟棄。貼上由輸入框自己插入一次：整段只有路徑
+（最多 5 段）時以純字串改寫成 `@` 語法，插入點前沒有文字且第一個 token 是斜線指令時原樣貼上。
+補充訊息的防呆是純字串判斷。
 
 engine 在第一個模型請求之前，以一則宣告它們的 assistant tool_calls（session 檔帶 `attachment`
-標記，不送模型）加上逐一的工具結果呈現附件，工具走與模型呼叫相同的 policy、`permission` 覆寫、
-核准（本輪共用拒絕重問上限）、readonly、取消與 MCP 錯誤處理；中斷時先補「已中斷」結果，
-不發任何模型請求。附件不計入工具步數與收斂判斷。`codetrail_chat.py run` 以同一套規則處理
-`@`，只在真的有附件時才把它們交給 engine；session replay 的客戶端身分包含 `client_attachments.py`。
+標記，不送模型）加上逐一的工具結果呈現附件，專案外附件的讀取是匯入成功後的第二則；工具走與模型
+呼叫相同的 policy、`permission` 覆寫、核准（本輪共用拒絕重問上限）、readonly、取消與 MCP 錯誤處理；
+中斷時先補「已中斷」結果，不發任何模型請求。附件不計入工具步數與收斂判斷。`codetrail_chat.py run`
+以同一套規則處理 `@`，只在真的有附件時才把它們交給 engine（沒有核准者，專案外的匯入一律被拒）；
+session replay 的客戶端身分包含 `client_attachments.py`。
 
 MCP SDK 不會在 read timeout／task cancel 自動送取消通知，客戶端自行配發 request id。
 Ctrl-C 與固定 660 秒 read timeout 都送取消；寬限期過則 SIGTERM 該 instance，所有進行中

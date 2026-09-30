@@ -103,7 +103,8 @@ _DEFAULT = ThemeSpec(
     chrome=CHROME_CLASSIC,
     glyphs=_NO_GLYPHS,
     tool_symbols=("▶", "▼"),
-    placeholder="",
+    # 唯一刻意與加入主題前不同的地方：空白輸入框教使用者 @ 夾帶檔案（原本是空白）。
+    placeholder="輸入問題；@ 夾帶檔案（打檔名可搜尋、可貼上路徑），/ 看指令",
 )
 
 # Codex styles.md：前景／背景一律用終端自己的預設色；只用 ANSI cyan（提示、選取、狀態）、
@@ -177,7 +178,7 @@ _CODEX = ThemeSpec(
         "composer": ("› ", "bold"),
     }),
     tool_symbols=("•", "•"),
-    placeholder="向 CodeTrail 提問，或輸入 / 使用指令",
+    placeholder="向 CodeTrail 提問，@ 夾帶檔案，或輸入 / 使用指令",
 )
 
 THEMES: Mapping[str, ThemeSpec] = MappingProxyType({spec.name: spec for spec in (_DEFAULT, _CODEX)})

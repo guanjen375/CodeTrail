@@ -222,7 +222,8 @@ SSH／tmux 的剪貼簿排查見
 
 ## 附件、VL 與知識注入
 
-檔案已在專案內時，直接在訊息裡用 `@相對路徑` 夾帶（Tab 補全；路徑含空白寫成 `@"路徑"`）：
+在訊息裡用 `@` 夾帶檔案（輸入框提示字就寫著）：`@相對路徑`，或 `@` 後面打檔名的一部分搜尋整個專案，
+Tab 補全（路徑含空白寫成 `@"路徑"`）；把檔案拖進終端機或貼上路徑，也會自動改寫成 `@`：
 
 ```text
 @screenshots/error.png 畫面上的錯誤是什麼？
@@ -230,8 +231,8 @@ SSH／tmux 的剪貼簿排查見
 ```
 
 送出時客戶端先用既有工具讀附件：圖片、PDF、ELF 與 firmware binary 走 `analyze_file`（圖片經 VL），
-其他檔案走 `read_file`；結果以工具卡顯示後模型才回答。單則最多 5 個附件，只收專案內的一般檔
-（符號連結、目錄與專案外路徑不附加），詳見[夾帶附件](docs/usage.md#attachments)。
+其他檔案走 `read_file`；結果以工具卡顯示後模型才回答。單則最多 5 個附件，專案內只收一般檔
+（符號連結與目錄不附加），詳見[夾帶附件](docs/usage.md#attachments)。
 也可以在對話指定工具與相對路徑：
 
 ```text
@@ -252,8 +253,10 @@ SSH／tmux 的剪貼簿排查見
 入庫後看 `review_figures` 的狀態與原因。單張抽壞只讓那一張缺席，其餘有效內容可以入庫；
 VL 服務、來源身分或文件級契約失敗則整份中止。未驗證圖面不能供 strict 回答數值。
 
-外部檔案先在 `client.json` 開啟 `external_import`，再請模型用 `import_external_file`
-匯入並核准來源／目的；之後使用回傳的 `.aicode_uploads/...` 路徑。
+專案外的截圖、下載檔用 `@~/Downloads/…` 夾帶：先在 TUI 輸入 `/import on` 並重開 `aicode`
+（或在 `client.json` 設 `external_import` 與 `external_import_roots`）。之後每個專案外附件都會跳出
+`import_external_file` 核准框顯示來源與落點，核准後複製進 `.aicode_uploads/` 再讀。用 SSH 連線時，
+先把本機檔案傳到這台主機的來源目錄。也可以請模型用 `import_external_file` 匯入後使用回傳路徑。
 詳細白名單、表格查值、OCR 覆核、續跑與移除文件見[使用指南](docs/usage.md#attachments)。
 `knowledge.json`、上傳副本、review artifacts 與 session 可能含 NDA 內容，不要 commit。
 

@@ -1327,7 +1327,7 @@ def test_import_reads_the_source_it_validated_not_a_swapped_one(
         ("ingest_document", {"path": "spec.pdf"}),
         ("review_figures", {"action": "fix", "document_id": "d", "figure_id": "f", "fix": {}}),
         ("review_text", {"action": "confirm", "source": "spec.pdf", "text_id": "t"}),
-        ("import_external_file", {"source_path": "/tmp/x.pdf"}),
+        ("import_external_file", {"path": "/tmp/x.pdf"}),
     ],
 )
 @pytest.mark.smoke
@@ -1420,7 +1420,7 @@ def test_the_rag_subprocess_receives_the_same_client_config(mcp_module_factory, 
 def test_a_symlinked_source_lands_under_the_name_the_user_approved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """核准框用模型給的 `source_path` 的 basename 算落點;工具若改用 resolve 之後的
+    """核准框用模型給的 `path` 的 basename 算落點;工具若改用 resolve 之後的
     `src.name`,使用者核准的是 `alias.pdf`、實際寫進去的是 `real.pdf`。"""
     import client_engine
 
@@ -1435,7 +1435,7 @@ def test_a_symlinked_source_lands_under_the_name_the_user_approved(
     _enable_import(monkeypatch, downloads)
 
     shown = client_engine.ApprovalRequest(
-        "s", "import_external_file", {"source_path": str(alias)}
+        "s", "import_external_file", {"path": str(alias)}
     ).render()
     out = import_external_file(str(alias), str(root))
 
@@ -1463,13 +1463,231 @@ def test_the_approval_box_and_the_tool_agree_on_the_upload_directory(
     monkeypatch.setattr(config, "EXTERNAL_IMPORT_DEST_DIR", "incoming")
 
     shown = client_engine.ApprovalRequest(
-        "s", "import_external_file", {"source_path": str(spec)}
+        "s", "import_external_file", {"path": str(spec)}
     ).render()
     out = import_external_file(str(spec), str(root))
 
     assert "✓" in out, out
     assert (root / "incoming" / "spec.pdf").is_file()
     assert "incoming/spec.pdf" in shown and ".aicode_uploads" not in shown, shown
+
+
+def _import_tool_parameters() -> list[str]:
+    """server 上 import_external_file 的參數名(靜態解析,不 import 會在 import 期啟動的 mcp_server)。"""
+    import ast
+
+    tree = ast.parse((REPO_ROOT / "mcp_server.py").read_text(encoding="utf-8"))
+    tool = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "import_external_file"
+    )
+    return [argument.arg for argument in tool.args.args]
+
+
+@pytest.mark.smoke
+def test_the_approval_box_reads_the_real_import_argument_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """核准框的「→ 目的」要用 server 真正收到的那個參數算。
+
+    import_external_file 的來源參數叫 `path`;核准框以前讀不存在的 `source_path`,模型
+    (以及 @ 附件)每一次真實呼叫的落點都被算成 `.aicode_uploads/upload` —— 使用者核准的
+    不是真的落點。參數名直接取自 server 的函式定義,之後改名也會被這條抓到。
+    """
+    import client_engine
+
+    parameters = _import_tool_parameters()
+    assert parameters[0] == "path" and "source_path" not in parameters, parameters
+    root = tmp_path / "project"
+    root.mkdir()
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    spec = downloads / "spec.pdf"
+    spec.write_bytes(b"%PDF-spec")
+    _enable_import(monkeypatch, downloads)
+
+    shown = client_engine.ApprovalRequest(
+        "s", "import_external_file", {parameters[0]: str(spec)}
+    ).render()
+    out = import_external_file(str(spec), str(root))
+
+    assert "已匯入: .aicode_uploads/spec.pdf" in out, out
+    assert "→ 目的: .aicode_uploads/spec.pdf" in shown, shown
+
+
+@pytest.mark.smoke
+def test_import_keeps_the_extension_of_non_ascii_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """檔名安全化不得吃掉副檔名:「截圖.png」以前落成 `.aicode_uploads/png`,之後
+    analyze_file 依副檔名分流就認不出它是圖片。核准框與工具算的落點仍要一致,
+    原本就保留副檔名的 ASCII 檔名結果不變。"""
+    import client_engine
+    import external_import
+
+    root = tmp_path / "project"
+    root.mkdir()
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    shot = downloads / "截圖.png"
+    shot.write_bytes(b"\x89PNG shot")
+    _enable_import(monkeypatch, downloads)
+
+    shown = client_engine.ApprovalRequest(
+        "s", "import_external_file", {_import_tool_parameters()[0]: str(shot)}
+    ).render()
+    out = import_external_file(str(shot), str(root))
+
+    assert "已匯入: .aicode_uploads/upload.png" in out, out
+    assert (root / ".aicode_uploads" / "upload.png").read_bytes() == b"\x89PNG shot"
+    assert "→ 目的: .aicode_uploads/upload.png" in shown, shown
+    for name, expected in (
+        ("error.png", "error.png"), ("my file.PNG", "my_file.PNG"), ("a.tar.gz", "a.tar.gz"),
+        ("weird name!.pdf", "weird_name_.pdf"), ("螢幕擷取畫面 2026-09-30 101500.png", "2026-09-30_101500.png"),
+        (".bashrc", "bashrc"), ("noext", "noext"),
+    ):
+        assert external_import.safe_dest_name(name) == expected, name
+
+
+@pytest.mark.smoke
+def test_imported_path_parses_the_real_import_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """@ 附件的第二段讀取(analyze_file／read_file 讀匯入後的副本)靠 imported_path 從
+    **真正的**匯入結果取落點。同名時工具會加 `_N`,所以落點只能事後從結果讀;格式一漂移,
+    這條就該紅,而不是讓客戶端讀到別的檔或無聲地少讀一個附件。"""
+    import external_import
+
+    root = tmp_path / "project"
+    root.mkdir()
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    shot = downloads / "shot.png"
+    shot.write_bytes(b"\x89PNG shot")
+    _enable_import(monkeypatch, downloads)
+
+    first = import_external_file(str(shot), str(root))
+    second = import_external_file(str(shot), str(root))
+    assert external_import.imported_path(first) == ".aicode_uploads/shot.png", first
+    assert external_import.imported_path(second) == ".aicode_uploads/shot_1.png", second
+    assert (root / ".aicode_uploads" / "shot_1.png").read_bytes() == b"\x89PNG shot"
+    # 客戶端拿到的是 adapter 加過 status 行的文字。
+    assert external_import.imported_path("status: ok\n" + second) == ".aicode_uploads/shot_1.png"
+
+    inside = root / "local.png"
+    inside.write_bytes(b"\x89PNG local")
+    already = import_external_file(str(inside), str(root))
+    assert "已在 AICODE_ROOT 內" in already, already
+    for text in (
+        already,
+        first + "\n" + second,  # 兩行「已匯入」:不猜是哪一個
+        "錯誤: 外部檔案匯入未啟用。",
+        "已匯入: other/shot.png (9 bytes)",
+        "已匯入: .aicode_uploads/../shot.png (9 bytes)",
+        "已匯入: .aicode_uploads/sub/shot.png (9 bytes)",
+        "已匯入: .aicode_uploads/.hidden (9 bytes)",
+        "已匯入: .aicode_uploads/a b.png (9 bytes)",
+        "已匯入: .aicode_uploads/shot.png (9 bytes) 之後還有字",
+        "說明: 已匯入: .aicode_uploads/shot.png (9 bytes)",
+        "",
+        None,
+        42,
+    ):
+        assert external_import.imported_path(text) is None, text
+
+    # 目的目錄是 config.EXTERNAL_IMPORT_DEST_DIR,不是寫死的 .aicode_uploads。
+    monkeypatch.setattr(config, "EXTERNAL_IMPORT_DEST_DIR", "incoming")
+    moved = import_external_file(str(shot), str(root))
+    assert external_import.imported_path(moved) == "incoming/shot.png", moved
+    assert external_import.imported_path(second) is None
+
+
+@pytest.mark.smoke
+def test_imported_path_accepts_every_name_the_import_can_land(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """安全化檔名最長 160 字,同名時工具再加 `_N`(最多 `_999`)。imported_path 只收 160 字的話,
+    同一個長檔名的外部檔第二次附加 —— 匯入成功、副本也在 —— 第二段讀取卻無聲地不做(審核 R1-1)。"""
+    import external_import
+
+    root = tmp_path / "project"
+    root.mkdir()
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    long_name = "a" * 156 + ".txt"
+    source = downloads / long_name
+    source.write_text("long\n", encoding="utf-8")
+    _enable_import(monkeypatch, downloads)
+
+    first = import_external_file(str(source), str(root))
+    second = import_external_file(str(source), str(root))
+    landed = "a" * 156 + "_1.txt"
+    assert (root / ".aicode_uploads" / landed).is_file(), second
+    assert external_import.imported_path(first) == ".aicode_uploads/" + long_name, first
+    assert external_import.imported_path(second) == ".aicode_uploads/" + landed, second
+    longest = "a" * 156 + "_999.txt"
+    assert external_import.imported_path(
+        f"已匯入: .aicode_uploads/{longest} (5 bytes)"
+    ) == ".aicode_uploads/" + longest
+
+
+@pytest.mark.smoke
+def test_external_import_authority_comes_only_from_the_client_argv(
+    mcp_module_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """外部匯入的開關與來源根只認客戶端啟動時交過來的 argv,不是 server 自己讀到的 client.json。
+
+    MCP 會在取消逾時後被重建,重建時讀到的是當下的檔案:使用者用 /import 改了設定、說好
+    重開 aicode 才生效,server 卻先一步開(或關)了,與客戶端的附件預覽、/status 各說各話。
+    """
+    parsed = _parse([
+        "--root", "/tmp/x",
+        "--external-import-root", "~/Downloads",
+        "--external-import-root=/tmp",
+        "--external-import-root", "~/Downloads",
+    ])
+    assert parsed["external_import_roots"] == ["~/Downloads", "/tmp"]
+    assert _parse(["--root", "/tmp/x"])["external_import_roots"] == []
+    for bad in (
+        ["--external-import-root"],
+        ["--external-import-root="],
+        ["--external-import-root", "--readonly"],
+        ["--external-import-root", "   "],
+        ["--external-import-root", "/tmp/a\nb"],
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            _parse(bad)
+        assert excinfo.value.code == 2, bad
+
+    # client.json 開著外部匯入,但啟動時沒有帶 argv → server 仍然是關。
+    home = tmp_path / "home"
+    cfg = home / ".config" / "codetrail" / "client.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    cfg.write_text(json.dumps({
+        "schema": 1, "compaction_mode": "manual",
+        "external_import": True, "external_import_roots": [str(downloads)],
+    }), encoding="utf-8")
+    cfg.chmod(0o600)
+    monkeypatch.setattr(config, "EXTERNAL_IMPORT_ENABLED", config.EXTERNAL_IMPORT_ENABLED)
+    monkeypatch.setattr(config, "EXTERNAL_IMPORT_ROOTS", list(config.EXTERNAL_IMPORT_ROOTS))
+    module = mcp_module_factory()
+    assert module._CLIENT_SETTINGS.external_import is True  # noqa: SLF001 - 檔案確實開著
+    assert module.config.EXTERNAL_IMPORT_ENABLED is False
+    assert module.config.EXTERNAL_IMPORT_ROOTS == []
+    (downloads / "x.png").write_bytes(b"\x89PNG")
+    out = module.import_external_file.fn(path=str(downloads / "x.png"))
+    assert "未啟用" in out, out
+    assert not (tmp_path / "proj" / ".aicode_uploads").exists()
+
+    # argv 帶了才開;readonly 一律關(不管 argv 帶什麼)。
+    roots = module._external_import_roots_from_argv  # noqa: SLF001
+    assert roots({"readonly": False, "external_import_roots": [str(downloads), "/tmp"]}) == [
+        str(downloads), "/tmp",
+    ]
+    assert roots({"readonly": True, "external_import_roots": [str(downloads)]}) == []
+    assert roots({"readonly": False, "external_import_roots": []}) == []
 
 
 # ── 總審 F2-3:來源的父目錄在驗證之後被換成 symlink ──

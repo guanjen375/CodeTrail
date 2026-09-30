@@ -803,7 +803,10 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "mcp_server 啟動時的 AICODE_ROOT 驗證與 set_sandbox_root；"
         "PATCH_ENABLED / RUN_COMMAND_ENABLED / build 命令預設；"
         "git 工具的兩種結果不得互換——真的沒有倉庫回跳過通知(不是 retryable error)，"
-        "而 GIT_DIR/.git 壞掉時必須是錯誤(誤報成「沒有倉庫」等於放行模型跳過改檔前的 git 檢查)",
+        "而 GIT_DIR/.git 壞掉時必須是錯誤(誤報成「沒有倉庫」等於放行模型跳過改檔前的 git 檢查)；"
+        "外部匯入:核准框以 server 真正的 path 參數算落點、非 ASCII 檔名的落點保留副檔名、"
+        "imported_path 只認真實匯入結果裡唯一一行「已匯入」、授權只來自客戶端 argv "
+        "`--external-import-root`(server 不採用自己讀到的 client.json 這兩個鍵,readonly 一律關)",
         (
             "test_graph_dependency_failure_is_an_mcp_error",
             "test_elf_tool_failures_are_mcp_errors",
@@ -833,6 +836,11 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_rejected_import_does_not_leak_the_source_fd",
             "test_import_refuses_an_allowed_root_whose_ancestor_was_swapped_for_a_symlink",
             "test_import_traverses_an_execute_only_ancestor",
+            "test_the_approval_box_reads_the_real_import_argument_name",
+            "test_import_keeps_the_extension_of_non_ascii_names",
+            "test_imported_path_parses_the_real_import_result",
+            "test_imported_path_accepts_every_name_the_import_can_land",
+            "test_external_import_authority_comes_only_from_the_client_argv",
         ),
     ),
     "test_mcp_ingest.py": (
@@ -944,7 +952,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "客戶端自己配發 request id 並在 Ctrl-C 與 timeout 兩種情況都送出取消、取消真的讓 server 收掉"
         "它的子行程 process group、並行呼叫不得綁錯 id、寬限期過仍無回應就 SIGTERM 該 instance 並讓"
         "所有進行中的呼叫回成 error 再重新 spawn;每次呼叫的 read timeout 固定不得由呼叫端放寬;"
-        "工具目錄在啟動時就驗;MCP stderr 預設不落檔且尾端有上限;同一 root 只有一個 instance",
+        "工具目錄在啟動時就驗;MCP stderr 預設不落檔且尾端有上限;同一 root 只有一個 instance;"
+        "外部匯入的來源根只以建構時固定的 argv `--external-import-root` 交給 server(readonly 不帶),"
+        "取消逾時的重建沿用同一份 argv",
         (
             "test_abort_review_start_cancels_without_lifecycle_lock_or_late_process",
             "test_private_review_cancel_escalation_cannot_respawn_or_close_interactive",
@@ -972,6 +982,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_process_env_run_is_the_only_spawn_exit_and_never_takes_env",
             "test_process_env_popen_class_is_not_a_raw_spawn_bypass",
             "test_client_config_and_skip_aux_preflight_reach_the_server_argv",
+            "test_external_import_roots_travel_as_argv_and_survive_a_respawn",
         ),
     ),
     "test_client_progress.py": (
@@ -1020,7 +1031,9 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "登記與歷史快照原子化，快速完成仍看 abort，遲到 worker 不送 POST，session 轉換空窗不准入舊歷史;"
         "部分完成的工具群組(a 有結果、b 沒有)的預熱 prefix 必須逐字等於下一輪真的 `send()` 減最後那則 user"
         "(補的「已中斷」結果排在該群組既有結果之後);"
-        "只有終結 chunk + `timings.prompt_n` 才記成 sent(`incomplete` / `no_timings` 不寫 telemetry)",
+        "只有終結 chunk + `timings.prompt_n` 才記成 sent(`incomplete` / `no_timings` 不寫 telemetry);"
+        "專案外 @ 附件先以 synthetic import_external_file 逐次核准(核准框收到 path 與真落點),"
+        "只有匯入完成才以第二則 synthetic tool_calls 讀落點,拒絕／錯誤不追加,匯入中取消先 heal、零模型請求",
         (
             "test_chat_thinking_count_and_generation_share_one_snapshot",
             "test_compaction_is_explicitly_off_while_chat_context_count_tracks_thinking",
@@ -1138,6 +1151,7 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_a_prime_http_worker_scheduled_after_abort_never_starts_the_post",
             "test_a_prime_arriving_during_session_creation_cannot_keep_the_old_history_alive",
             "test_failed_session_creation_does_not_disable_future_priming",
+            "test_external_attachment_imports_with_approval_then_reads_the_landed_copy",
         ),
     ),
     "test_http_cancel.py": (
@@ -1221,7 +1235,11 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "不列專案外名稱，插入文字（含空白加引號）回解析仍指向同一檔；路由與 analyze_file 分流一致；"
         "engine 在第一個模型請求前記 synthetic tool_calls（標記不送模）並走同一套 policy／readonly／"
         "allowlist／核准，拒絕重問上限與模型迴圈共用，中斷先 heal 且不發模型請求；重播按宣告群組"
-        "配對；協調器送達時才解析、補充訊息純字串拒絕 @ 路徑；session replay 身分含附件模組",
+        "配對；協調器送達時才解析、補充訊息純字串拒絕 @ 路徑；session replay 身分含附件模組；"
+        "專案外 @ 只在外部匯入開啟、副檔名可匯入且字面落在來源根內才碰 FS（其餘零 FS），"
+        "自解析後的根逐層 nofollow，實體在專案內就轉專案內附件；檔名搜尋從 root fd 逐層 nofollow "
+        "有界走訪、走訪中換址也不列專案外名稱；來源列舉只列來源根內可匯入檔、新到舊；"
+        "貼上路徑改寫成 @ 是純字串、零 FS",
         (
             "test_attachment_mentions_parse_quotes_boundaries_and_code_spans",
             "test_attachment_resolution_uses_nofollow_walk_inside_project_only",
@@ -1236,6 +1254,11 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_replay_pairs_attachment_results_with_their_declared_group",
             "test_coordinator_resolves_at_delivery_and_supplements_refuse_path_mentions_without_io",
             "test_session_eval_identity_includes_attachment_resolution",
+            "test_external_mentions_touch_the_filesystem_only_inside_enabled_import_roots",
+            "test_project_name_search_walks_verified_fds_without_following_links",
+            "test_external_completion_lists_only_import_roots_newest_first",
+            "test_pasted_paths_become_mentions_without_filesystem_access",
+            "test_a_malformed_file_uri_paste_is_left_verbatim",
         ),
     ),
     "test_client_attachment_ui.py": (
@@ -1243,7 +1266,10 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
         "閒置 Ctrl-C 仍複製選取；@ 補全與附件預覽在背景 worker 執行、UI 執行緒零 FS、過期結果丟棄，"
         "補全只取代游標所在 token 並為含空白的路徑加引號，@ token 上補全未回來時 Tab 不移焦點；"
         "含 @ 路徑的補充保留草稿；/status 啟動診斷列出 client.json 舊鍵；headless run 以同一套解析"
-        "把附件交給 engine",
+        "把附件交給 engine；貼上只插入一次、只有整段是路徑才改寫成 @、空輸入框貼上斜線指令照原樣且仍執行指令；"
+        "兩主題提示字、/help、/status 教附件與外部匯入；/import 重讀後只改匯入鍵、owner-only、"
+        "不改 runtime、忙碌拒絕；啟動 scope 只在存在時才交給預覽、協調器與 headless，"
+        "並以同一份值帶進 MCP argv",
         (
             "test_removed_allow_and_copykey_commands_are_unknown_without_side_effects",
             "test_help_lists_attachments_and_no_removed_commands",
@@ -1254,6 +1280,11 @@ SAFETY_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
             "test_supplement_choice_with_path_mentions_keeps_the_draft",
             "test_startup_diagnostics_report_obsolete_client_keys",
             "test_headless_run_passes_resolved_attachments_to_the_engine",
+            "test_paste_of_dropped_paths_inserts_mentions_once_and_refreshes_the_preview",
+            "test_a_paste_the_rewriter_cannot_parse_keeps_the_app_running",
+            "test_placeholder_help_and_status_teach_attachments_and_external_import",
+            "test_import_command_saves_only_the_import_keys_and_needs_a_restart",
+            "test_the_external_scope_reaches_preview_turns_and_headless_only_when_present",
         ),
     ),
     "test_client_theme_config.py": (
